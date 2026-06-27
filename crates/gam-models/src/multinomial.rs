@@ -592,6 +592,11 @@ pub fn fit_penalized_multinomial(
             fisher_w_override,
             max_iter,
             tol,
+            // #1587: production multinomial still uses the per-class Diagonal
+            // metric pending the REML per-class→per-term λ re-key that the
+            // reference-symmetric Centered metric requires (shared λ). The
+            // Centered engine path + its invariance proof land first.
+            class_penalty_metric: crate::penalized_vector_glm::ClassPenaltyMetric::Diagonal,
         },
         &likelihood,
         "fit_penalized_multinomial",

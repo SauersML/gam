@@ -104,6 +104,32 @@ const OBJECTIVE_DECREASE_SLACK: f64 = 1.0e-12;
 /// identified subspace rather than a premature step-norm stall.
 const OPTIMALITY_GRAD_FRACTION: f64 = 1.0e-6;
 
+/// Class-space metric of the replicated smoothing penalty (#1587).
+///
+/// * `Diagonal` — the historical `diag_a(λ_a) ⊗ S`: each active output's
+///   coefficient block is penalised independently. Correct for genuinely
+///   independent outputs (independent-binomial columns), but for a *softmax*
+///   multinomial it penalises the reference-anchored log-odds contrasts
+///   `η_a = log(p_a/p_ref)`, so the fit is NOT invariant to the arbitrary
+///   reference-class choice (#1587).
+/// * `Centered` — the reference-symmetric `λ · ((I_{M} − J_{M}/K) ⊗ S)` with a
+///   single shared `λ` (= `lambdas[0]`; the caller must pass uniform `lambdas`)
+///   and `K = M + 1`. This is exactly the symmetric CLR penalty
+///   `Σ_{k=0}^{K-1} β̃_kᵀ S β̃_k` (with `Σ_k β̃_k = 0`) written in the active-class
+///   (ALR) gauge — invariant to which class is the baseline (the multinomial
+///   analogue of #1549's `G^{1/2}` Aitchison whitening). Couples the class
+///   blocks via the `−(λ/K)·S` off-diagonals; the engine already factors a
+///   class-coupled Hessian (the softmax Fisher block is dense), so this is a
+///   penalty-assembly change only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClassPenaltyMetric {
+    /// Independent per-output penalty `diag_a(λ_a) ⊗ S` (historical default).
+    #[default]
+    Diagonal,
+    /// Reference-symmetric centered penalty `λ·((I − J/K) ⊗ S)`, `K = M + 1`.
+    Centered,
+}
+
 /// Inputs to [`fit_penalized_vector_glm`].
 ///
 /// `M` (the number of active outputs / linear-predictor columns) is taken from
@@ -132,6 +158,11 @@ pub struct PenalizedVectorGlmInputs<'a> {
     pub max_iter: usize,
     /// Relative-step convergence tolerance; recommend 1e-7.
     pub tol: f64,
+    /// Class-space metric of the replicated penalty (#1587). `Diagonal`
+    /// preserves the historical independent-per-output penalty; `Centered`
+    /// selects the reference-symmetric softmax penalty (requires uniform
+    /// `lambdas`). See [`ClassPenaltyMetric`].
+    pub class_penalty_metric: ClassPenaltyMetric,
 }
 
 /// Outputs of [`fit_penalized_vector_glm`].
@@ -158,26 +189,74 @@ fn weighted_penalty_sum(
     beta: &Array2<f64>,
     penalty: ArrayView2<'_, f64>,
     lambdas: ArrayView1<'_, f64>,
+    metric: ClassPenaltyMetric,
 ) -> f64 {
     let (p, m) = beta.dim();
-    let mut pen = 0.0_f64;
-    for a in 0..m {
-        let la = lambdas[a];
-        if la == 0.0 {
-            continue;
-        }
-        let beta_col = beta.column(a);
-        let mut quad = 0.0_f64;
-        for i in 0..p {
-            let mut s_beta_i = 0.0_f64;
-            for j in 0..p {
-                s_beta_i += penalty[[i, j]] * beta_col[j];
+    match metric {
+        ClassPenaltyMetric::Diagonal => {
+            let mut pen = 0.0_f64;
+            for a in 0..m {
+                let la = lambdas[a];
+                if la == 0.0 {
+                    continue;
+                }
+                let beta_col = beta.column(a);
+                let mut quad = 0.0_f64;
+                for i in 0..p {
+                    let mut s_beta_i = 0.0_f64;
+                    for j in 0..p {
+                        s_beta_i += penalty[[i, j]] * beta_col[j];
+                    }
+                    quad += beta_col[i] * s_beta_i;
+                }
+                pen += 0.5 * la * quad;
             }
-            quad += beta_col[i] * s_beta_i;
+            pen
         }
-        pen += 0.5 * la * quad;
+        // Centered (#1587): ½·λ·[ Σ_a β_aᵀSβ_a − (1/K)·gᵀSg ], g = Σ_a β_a,
+        // K = M + 1. Equals the symmetric CLR penalty Σ_k β̃_kᵀSβ̃_k (Σβ̃=0) in
+        // the active-class gauge — reference-invariant. Shared λ = lambdas[0].
+        ClassPenaltyMetric::Centered => {
+            if m == 0 {
+                return 0.0;
+            }
+            let lam = lambdas[0];
+            if lam == 0.0 {
+                return 0.0;
+            }
+            let k = (m + 1) as f64;
+            // g = Σ_a β_a (the active-class coefficient sum, a p-vector).
+            let mut g = vec![0.0_f64; p];
+            for a in 0..m {
+                let col = beta.column(a);
+                for i in 0..p {
+                    g[i] += col[i];
+                }
+            }
+            // Σ_a β_aᵀSβ_a.
+            let mut sum_quad = 0.0_f64;
+            for a in 0..m {
+                let col = beta.column(a);
+                for i in 0..p {
+                    let mut s_beta_i = 0.0_f64;
+                    for j in 0..p {
+                        s_beta_i += penalty[[i, j]] * col[j];
+                    }
+                    sum_quad += col[i] * s_beta_i;
+                }
+            }
+            // gᵀSg.
+            let mut g_quad = 0.0_f64;
+            for i in 0..p {
+                let mut s_g_i = 0.0_f64;
+                for j in 0..p {
+                    s_g_i += penalty[[i, j]] * g[j];
+                }
+                g_quad += g[i] * s_g_i;
+            }
+            0.5 * lam * (sum_quad - g_quad / k)
+        }
     }
-    pen
 }
 
 /// Fit a penalized vector-response GLM at fixed `λ` via damped Newton.
@@ -202,6 +281,7 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
         fisher_w_override,
         max_iter,
         tol,
+        class_penalty_metric,
     } = inputs;
 
     // ────────────────────────────── shape checks ──────────────────────────
@@ -289,7 +369,7 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
     let evaluate_objective = |beta_trial: &Array2<f64>, eta_scratch: &mut Array2<f64>| -> f64 {
         recompute_eta(beta_trial, eta_scratch);
         let ll = likelihood.log_lik(eta_scratch.view(), y);
-        let pen = weighted_penalty_sum(beta_trial, penalty, lambdas);
+        let pen = weighted_penalty_sum(beta_trial, penalty, lambdas, class_penalty_metric);
         -ll + pen
     };
 
@@ -322,23 +402,47 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
                 hessian.dim()
             );
         }
-        for a in 0..m {
-            let la = lambdas[a];
-            if la == 0.0 {
-                continue;
-            }
-            let base = a * p;
-            for i in 0..p {
-                for j in 0..p {
-                    hessian[[base + i, base + j]] += la * penalty[[i, j]];
+        match class_penalty_metric {
+            ClassPenaltyMetric::Diagonal => {
+                for a in 0..m {
+                    let la = lambdas[a];
+                    if la == 0.0 {
+                        continue;
+                    }
+                    let base = a * p;
+                    for i in 0..p {
+                        for j in 0..p {
+                            hessian[[base + i, base + j]] += la * penalty[[i, j]];
+                        }
+                    }
                 }
             }
+            // Centered (#1587): H_{ab} += λ·(δ_ab − 1/K)·S, K = M+1, shared
+            // λ = lambdas[0] — couples every class pair via the −(λ/K)·S
+            // off-diagonals. Reference-invariant softmax penalty.
+            ClassPenaltyMetric::Centered if m > 0 && lambdas[0] != 0.0 => {
+                let lam = lambdas[0];
+                let inv_k = 1.0 / ((m + 1) as f64);
+                for a in 0..m {
+                    for b in 0..m {
+                        let coef = lam * (if a == b { 1.0 } else { 0.0 } - inv_k);
+                        let (ba, bb) = (a * p, b * p);
+                        for i in 0..p {
+                            for j in 0..p {
+                                hessian[[ba + i, bb + j]] += coef * penalty[[i, j]];
+                            }
+                        }
+                    }
+                }
+            }
+            ClassPenaltyMetric::Centered => {}
         }
 
-        // Penalized gradient: g_a = Xᵀ r_{·,a} + λ_a S β_a. Written into the
-        // reused `grad_flat` buffer; the loop below assigns every entry (`=`,
-        // not `+=`) before the penalty `+=` and before any read, so no
-        // re-zeroing of the reused buffer is needed.
+        // Penalized gradient: g_a = Xᵀ r_{·,a} + (penalty gradient). For the
+        // Diagonal metric that is `λ_a S β_a`; for Centered it is the
+        // reference-symmetric `λ S (β_a − β̄)`, β̄ = (1/K) Σ_b β_b (#1587).
+        // Written into the reused `grad_flat` buffer; the loop below assigns
+        // every entry (`=`) before the penalty `+=`, so no re-zeroing is needed.
         for a in 0..m {
             for i in 0..p {
                 let mut acc = 0.0_f64;
@@ -348,19 +452,50 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
                 grad_flat[a * p + i] = acc;
             }
         }
-        for a in 0..m {
-            let la = lambdas[a];
-            if la == 0.0 {
-                continue;
-            }
-            let beta_col = beta.column(a);
-            for i in 0..p {
-                let mut s_beta_i = 0.0_f64;
-                for j in 0..p {
-                    s_beta_i += penalty[[i, j]] * beta_col[j];
+        match class_penalty_metric {
+            ClassPenaltyMetric::Diagonal => {
+                for a in 0..m {
+                    let la = lambdas[a];
+                    if la == 0.0 {
+                        continue;
+                    }
+                    let beta_col = beta.column(a);
+                    for i in 0..p {
+                        let mut s_beta_i = 0.0_f64;
+                        for j in 0..p {
+                            s_beta_i += penalty[[i, j]] * beta_col[j];
+                        }
+                        grad_flat[a * p + i] += la * s_beta_i;
+                    }
                 }
-                grad_flat[a * p + i] += la * s_beta_i;
             }
+            ClassPenaltyMetric::Centered if m > 0 && lambdas[0] != 0.0 => {
+                let lam = lambdas[0];
+                let inv_k = 1.0 / ((m + 1) as f64);
+                // β̄ = (1/K) Σ_b β_b.
+                let mut bbar = vec![0.0_f64; p];
+                for b in 0..m {
+                    let col = beta.column(b);
+                    for i in 0..p {
+                        bbar[i] += col[i];
+                    }
+                }
+                for v in bbar.iter_mut() {
+                    *v *= inv_k;
+                }
+                for a in 0..m {
+                    let beta_col = beta.column(a);
+                    for i in 0..p {
+                        // (S (β_a − β̄))_i.
+                        let mut s_centered_i = 0.0_f64;
+                        for j in 0..p {
+                            s_centered_i += penalty[[i, j]] * (beta_col[j] - bbar[j]);
+                        }
+                        grad_flat[a * p + i] += lam * s_centered_i;
+                    }
+                }
+            }
+            ClassPenaltyMetric::Centered => {}
         }
 
         // δ = − H^{-1} · grad, solved through an adaptive Levenberg–Marquardt
@@ -532,7 +667,7 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
     // ──────────────────────────── post-process ────────────────────────────
     recompute_eta(&beta, &mut eta);
     let log_likelihood = likelihood.log_lik(eta.view(), y);
-    let penalty_term = weighted_penalty_sum(&beta, penalty, lambdas);
+    let penalty_term = weighted_penalty_sum(&beta, penalty, lambdas, class_penalty_metric);
 
     Ok(PenalizedVectorGlmOutputs {
         coefficients: beta,
@@ -563,9 +698,74 @@ mod parity_tests {
     //!      from-scratch single-column penalized logistic Newton solve column
     //!      for column (the row-diagonal block must decouple exactly).
 
+    use super::{ClassPenaltyMetric, weighted_penalty_sum};
     use crate::binomial_multi::{BinomialMultiFitInputs, fit_penalized_binomial_multi};
     use crate::multinomial::{MultinomialFitInputs, fit_penalized_multinomial};
     use ndarray::{Array1, Array2};
+
+    /// #1587: the `Centered` class-penalty metric is invariant to the arbitrary
+    /// reference-class choice. Penalizing the `K−1` ALR contrasts under ANY of
+    /// the `K` baselines yields the same value (the symmetric CLR penalty
+    /// `Σ_k β̃_kᵀSβ̃_k`), whereas the historical `Diagonal` metric does not — that
+    /// non-invariance is exactly the #1587 defect. Pure-algebra check on the
+    /// penalty form (no fit), so it pins the engine foundation the production
+    /// wiring (REML per-term λ re-key) will build on.
+    #[test]
+    fn centered_penalty_is_reference_class_invariant_1587() {
+        // K = 3 classes, p = 2 coefficients; symmetric PSD penalty S.
+        let s = ndarray::array![[2.0_f64, 0.5], [0.5, 1.0]];
+        // A CLR (sum-to-zero) coefficient set: β̃_0 + β̃_1 + β̃_2 = 0.
+        let bt = [[1.0_f64, 0.5], [-0.3, 0.2], [-0.7, -0.7]];
+        for j in 0..2 {
+            let colsum: f64 = (0..3).map(|k| bt[k][j]).sum();
+            assert!(colsum.abs() < 1e-12, "test CLR set must sum to zero");
+        }
+        // Direct symmetric penalty Σ_k β̃_kᵀ S β̃_k.
+        let mut symmetric = 0.0_f64;
+        for k in 0..3 {
+            for i in 0..2 {
+                for j in 0..2 {
+                    symmetric += bt[k][i] * s[[i, j]] * bt[k][j];
+                }
+            }
+        }
+        let lambdas = Array1::from(vec![1.0_f64, 1.0]);
+        let mut centered_vals = Vec::new();
+        let mut diagonal_vals = Vec::new();
+        // For each reference class r, the two ALR contrasts are β̃_a − β̃_r (a≠r).
+        for r in 0..3 {
+            let others: Vec<usize> = (0..3).filter(|&k| k != r).collect();
+            let mut beta = Array2::<f64>::zeros((2, 2));
+            for (a, &o) in others.iter().enumerate() {
+                for i in 0..2 {
+                    beta[[i, a]] = bt[o][i] - bt[r][i];
+                }
+            }
+            let c =
+                weighted_penalty_sum(&beta, s.view(), lambdas.view(), ClassPenaltyMetric::Centered);
+            let d =
+                weighted_penalty_sum(&beta, s.view(), lambdas.view(), ClassPenaltyMetric::Diagonal);
+            assert!(
+                (c - 0.5 * symmetric).abs() < 1e-12,
+                "ref {r}: Centered penalty {c} must equal ½·symmetric {}",
+                0.5 * symmetric
+            );
+            centered_vals.push(c);
+            diagonal_vals.push(d);
+        }
+        let cspread = centered_vals.iter().cloned().fold(f64::MIN, f64::max)
+            - centered_vals.iter().cloned().fold(f64::MAX, f64::min);
+        assert!(
+            cspread < 1e-12,
+            "Centered must be reference-invariant; got {centered_vals:?}"
+        );
+        let dspread = diagonal_vals.iter().cloned().fold(f64::MIN, f64::max)
+            - diagonal_vals.iter().cloned().fold(f64::MAX, f64::min);
+        assert!(
+            dspread > 1e-6,
+            "Diagonal is the non-invariant #1587 path; references must disagree, got {diagonal_vals:?}"
+        );
+    }
 
     fn sigmoid(eta: f64) -> f64 {
         if eta >= 0.0 {

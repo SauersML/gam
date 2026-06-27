@@ -316,6 +316,10 @@ pub fn fit_penalized_binomial_multi(
             fisher_w_override,
             max_iter,
             tol,
+            // Independent-binomial columns ARE genuinely independent outputs, so
+            // the per-output Diagonal penalty is correct here (the #1587 Centered
+            // metric is softmax-specific — there is no shared reference class).
+            class_penalty_metric: crate::penalized_vector_glm::ClassPenaltyMetric::Diagonal,
         },
         &likelihood,
         "fit_penalized_binomial_multi",
