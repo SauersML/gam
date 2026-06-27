@@ -237,17 +237,21 @@ pub fn solve_arrow_newton_step_fused_force(
             reason: "ridge is NaN".to_string(),
         });
     }
-    if crate::gpu_kernels::arrow_schur_nvrtc::plan_fused_launch(sys.rows.len(), sys.d, sys.k)
-        .is_none()
-    {
-        return Err(ArrowSchurGpuFailure::Unavailable);
-    }
     #[cfg(not(target_os = "linux"))]
     {
+        // No NVRTC toolchain off linux: the fused path is unconditionally
+        // unavailable, so the shape-admission probe (`plan_fused_launch`) is
+        // never needed here and is compiled only for linux + tests.
+        let _ = sys;
         Err(ArrowSchurGpuFailure::Unavailable)
     }
     #[cfg(target_os = "linux")]
     {
+        if crate::gpu_kernels::arrow_schur_nvrtc::plan_fused_launch(sys.rows.len(), sys.d, sys.k)
+            .is_none()
+        {
+            return Err(ArrowSchurGpuFailure::Unavailable);
+        }
         cuda::solve_fused(sys, ridge_t, ridge_beta)
     }
 }

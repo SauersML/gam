@@ -41,6 +41,11 @@
 //! `bump = scale · ε^½ · 1024` to `ridge_t` and re-launches, the same Ceres-
 //! style geometric escalation the CPU path already implements.
 
+// `ArrowSchurSystem` is referenced only by the linux-gated `system_admits_fused_path`
+// dispatch helper and by the `cfg(test)` CPU parity harness (`test_support`). Gating
+// the import to match keeps it from reading as an unused import on the non-linux
+// release builds (mac/windows), where neither consumer is compiled.
+#[cfg(any(target_os = "linux", test))]
 use crate::arrow_schur::ArrowSchurSystem;
 
 /// Fused-kernel dispatch admission. Returns `true` when the workload shape
@@ -350,6 +355,13 @@ void arrow_schur_back_sub_pgroup(
 
 /// Compile-time-readable summary of one launch. The host bench uses this to
 /// pick a CTA size and to allocate the per-block partials buffer.
+// The plan's fields are consumed only by the linux-gated `mod cuda` launch site
+// (CTA sizing + per-block partials allocation) and by the cross-platform planning
+// unit tests. Gating struct + constructor to match keeps the fields from reading
+// as never-read dead code on the non-linux release builds, where the sole caller
+// (`solve_arrow_newton_step_fused_force`) returns `Unavailable` without ever
+// inspecting a plan.
+#[cfg(any(target_os = "linux", test))]
 #[derive(Clone, Copy, Debug)]
 pub struct FusedLaunchPlan {
     pub p_max: usize,
@@ -363,6 +375,7 @@ pub struct FusedLaunchPlan {
 /// Plan one fused launch from the static `(n, p, r)` triple. Returns `None`
 /// when the workload exceeds the kernel's `P_MAX` ceiling or when `r` cannot
 /// be ceiled into a template width.
+#[cfg(any(target_os = "linux", test))]
 #[inline]
 #[must_use]
 pub fn plan_fused_launch(n: usize, p: usize, r: usize) -> Option<FusedLaunchPlan> {
