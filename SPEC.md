@@ -13,3 +13,4 @@
 - In general, the default should allow a configuration which recovers the null (empirical Bayes-like). Users must opt-in to overfitting potential, not the other way around.
 - Large, massive changes must be made if that would improve the code--it's not something to be avoided.
 - XFAIL pattern on tests is never allowed. A failing test should always indicate problematic behavior.
+- The goal of this project is never to copy existing reference implementations.
