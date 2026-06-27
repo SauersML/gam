@@ -227,6 +227,7 @@ fn pack_block(
 /// drive the fused kernel at small shapes the heuristic would otherwise
 /// route through the cuSOLVER/cuBLAS Layer A+B+C path.
 #[doc(hidden)]
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))] // `sys` is consumed only by the linux branch
 pub fn solve_arrow_newton_step_fused_force(
     sys: &ArrowSchurSystem,
     ridge_t: f64,
@@ -240,9 +241,9 @@ pub fn solve_arrow_newton_step_fused_force(
     #[cfg(not(target_os = "linux"))]
     {
         // No NVRTC toolchain off linux: the fused path is unconditionally
-        // unavailable, so the shape-admission probe (`plan_fused_launch`) is
-        // never needed here and is compiled only for linux + tests.
-        drop(sys);
+        // unavailable. `sys` is consumed only by the linux branch below; the
+        // fn-level cfg_attr allows it to read as unused here without a banned
+        // `let _` binding or a no-op `drop` of the reference.
         Err(ArrowSchurGpuFailure::Unavailable)
     }
     #[cfg(target_os = "linux")]

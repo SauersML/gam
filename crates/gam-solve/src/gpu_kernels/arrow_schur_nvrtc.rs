@@ -88,6 +88,7 @@ pub fn fused_path_admitted(n: usize, p: usize, r: usize) -> bool {
 /// doubles = 24.5 KiB. Volta's 96 KiB shared memory per SM gives us three
 /// concurrent blocks per SM at that ceiling, matching the bench-tuned launch
 /// configuration in math block 3 §8.
+#[cfg(target_os = "linux")] // only the linux fused planner/admission code + its CI tests consume this
 pub const MAX_FUSED_P: usize = 32;
 
 /// Compile-time `R` (= border width `K`) widths the NVRTC fused kernel is
@@ -123,11 +124,13 @@ pub const MAX_FUSED_P: usize = 32;
 /// small-border micro-optimization, and the residency win this issue measures
 /// (`ResidentArrowFrame`) is realized on the unfused device path, independent
 /// of the fused kernel's `R` ceiling.
+#[cfg(target_os = "linux")] // only the linux fused planner (ceil_to_template_r) + its CI tests consume this
 pub const FUSED_R_TEMPLATES: &[usize] = &[4, 5, 6, 8, 10, 12, 16, 20, 24, 32];
 
 /// Smallest entry in `FUSED_R_TEMPLATES` that is ≥ `r`. Used both by the
 /// kernel selector and the `(P, R)` cache key so two systems with the same
 /// `(P, ceil_r)` share one compiled module.
+#[cfg(target_os = "linux")] // consumers (fused planner/admission + CI tests) are all linux-gated
 #[inline]
 #[must_use]
 pub fn ceil_to_template_r(r: usize) -> Option<usize> {
@@ -784,6 +787,7 @@ mod tests {
     use super::*;
     use super::test_support::*;
 
+    #[cfg(target_os = "linux")] // exercises `ceil_to_template_r`, gated to its linux home (CI tests run on linux)
     #[test]
     fn ceil_to_template_picks_smallest_admissible() {
         assert_eq!(ceil_to_template_r(1), Some(4));
