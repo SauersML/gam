@@ -234,7 +234,23 @@ pub use solver::estimate::reml::per_atom_efs::{
 pub use solver::{
     estimate, gaussian_reml, mixture_link, pirls, progress_log, seeding, topology_selector,
 };
-pub use terms::{basis, construction, smooth, term_builder};
+pub use terms::{basis, construction, term_builder};
+
+/// `gam::smooth` — the smooth-term public surface.
+///
+/// The basis/term-spec machinery lives in `gam_terms::smooth`; the
+/// term-collection **design builders** (`build_term_collection_design` and the
+/// joint variants) were relocated to `gam_models::fit_orchestration::drivers`
+/// in the #1521 carve. Re-export both here so the long-standing public path
+/// `gam::smooth::build_term_collection_design` — used by the design/predict call
+/// sites and ~300 integration tests — keeps resolving after the move.
+pub mod smooth {
+    pub use crate::terms::smooth::*;
+    pub use gam_models::fit_orchestration::drivers::{
+        build_term_collection_design, build_term_collection_designs_and_freeze_joint,
+        build_term_collection_designs_joint,
+    };
+}
 
 pub use families::custom_family;
 pub use families::gamlss;

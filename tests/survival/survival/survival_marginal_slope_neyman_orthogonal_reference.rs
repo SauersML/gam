@@ -43,7 +43,7 @@
 //! make code pass.
 
 use gam::families::survival::marginal_slope::SurvivalMarginalSlopeFitResult;
-use gam::terms::smooth::build_term_collection_design;
+use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::rmse;
 use gam::transformation_normal::TransformationNormalConfig;
 use gam::{

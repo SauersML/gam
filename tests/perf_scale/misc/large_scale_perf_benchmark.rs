@@ -16,7 +16,7 @@ use gam::smooth::{
     ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability,
     TensorBSplineSpec, TermCollectionSpec,
 };
-use gam::terms::smooth::build_term_collection_design;
+use gam::smooth::build_term_collection_design;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };

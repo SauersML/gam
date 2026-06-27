@@ -11,7 +11,7 @@ use gam::basis::{
 use gam::smooth::{
     LinearTermSpec, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec,
 };
-use gam::terms::smooth::build_term_collection_design;
+use gam::smooth::build_term_collection_design;
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;

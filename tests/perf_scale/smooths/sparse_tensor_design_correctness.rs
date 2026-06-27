@@ -26,7 +26,7 @@ use gam::smooth::{
     ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability,
     TensorBSplineSpec, TermCollectionSpec,
 };
-use gam::terms::smooth::build_term_collection_design;
+use gam::smooth::build_term_collection_design;
 use ndarray::{Array1, Array2};
 use rand::SeedableRng;
 use rand::rngs::StdRng;

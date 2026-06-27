@@ -57,7 +57,7 @@
 
 use gam::families::bms::BernoulliMarginalSlopeFitResult;
 use gam::families::marginal_slope_orthogonal::{influence_block_design, score_influence_jacobian};
-use gam::terms::smooth::build_term_collection_design;
+use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, dml_partial_linear_reference, rmse};
 use gam::transformation_normal::TransformationNormalConfig;
 use gam::{

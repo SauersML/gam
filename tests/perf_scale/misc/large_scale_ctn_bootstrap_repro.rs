@@ -16,7 +16,7 @@ use gam::basis::{
     SpatialIdentifiability,
 };
 use gam::smooth::{ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec};
-use gam::terms::smooth::build_term_collection_design;
+use gam::smooth::build_term_collection_design;
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
