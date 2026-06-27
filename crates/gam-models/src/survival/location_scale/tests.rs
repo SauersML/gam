@@ -6426,7 +6426,14 @@ fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
     });
 
     // A small monotone wiggle basis; degree/knots chosen for a few columns.
-    let knots = array![-2.0, -1.0, 0.0, 1.0, 2.0];
+    // Degree-3 clamped knot vector: the I-spline derivative path integrates a
+    // degree-3 B-spline, whose `validate_knots_for_degree` floor is `2*(3+1)=8`
+    // knots, so the previous 5-knot vector aborted this oracle in fixture setup
+    // (the basis builder returned `Insufficient knots for degree 3 spline`). The
+    // clamp endpoints (-2.5, 3.2) bracket every `q0_exit`/`q0_entry` index above
+    // so the warp basis is evaluated strictly inside its support. (Mirrors the
+    // clamped 8-knot pattern the other wiggle gate tests in this file use.)
+    let knots = array![-2.5, -2.5, -2.5, -2.5, 3.2, 3.2, 3.2, 3.2];
     let degree = 3usize;
     let xwiggle =
         survival_wiggle_basis_with_options(q0_exit.view(), &knots, degree, BasisOptions::value())
