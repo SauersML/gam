@@ -86,6 +86,19 @@ pub const KANTOROVICH_THRESHOLD: f64 = 0.5;
 /// short batches inside an outer atom-level fan-out stay sequential.
 pub(crate) const ENCODE_BATCH_PARALLEL_ROW_MIN: usize = 256;
 
+/// Minimum frame alignment `‖Uₖᵀd‖/‖d‖ ∈ [0,1]` the best LSH-gathered atom must
+/// have for an index-routed encode to be TRUSTED (#1026). The in-atom Kantorovich
+/// certificate attests Newton convergence *within* the chosen atom; it does NOT
+/// attest that the LSH gather found the globally-correct atom. Because alignment
+/// is capped at 1, a HIGH best-alignment leaves no room for a materially-better
+/// ungathered atom (the gather is trustworthy), whereas a LOW best-alignment means
+/// the true best atom was likely missed by LSH recall. Rows whose best gathered
+/// atom aligns below this are flagged uncertified and routed to the exact
+/// full-scan fallback — closing the silent-mis-routing hole where a non-empty but
+/// wrong gather certified against a suboptimal atom. Erring toward flagging only
+/// ever adds exact-fallback work (correct, slower); it never certifies a mis-route.
+pub(crate) const CANDIDATE_ROUTING_MIN_ALIGNMENT: f64 = 0.5;
+
 /// A chart region on an atom's latent coordinate: a center `t_c` plus a
 /// certified in-chart radius. Over the ball `‖t − t_c‖ ≤ radius` the jet sup
 /// bounds returned by [`BasisHessianLipschitz`] hold, so the Kantorovich
@@ -1695,6 +1708,17 @@ impl EncodeAtlas {
                             // No LSH candidate: flag for the exact fallback.
                             return Ok(None);
                         };
+                        // Routing-confidence gate (#1026): the in-atom certificate
+                        // attests convergence WITHIN best_atom, not that best_atom is
+                        // the globally-correct atom. A non-empty but low-alignment
+                        // gather likely missed the true best atom (LSH recall < 1) —
+                        // flag it for the exact fallback rather than silently
+                        // certifying a mis-route. See CANDIDATE_ROUTING_MIN_ALIGNMENT.
+                        if sketch.alignment(best_atom, targets.row(row))
+                            < CANDIDATE_ROUTING_MIN_ALIGNMENT
+                        {
+                            return Ok(None);
+                        }
                         let atom = atoms.get(best_atom).ok_or_else(|| {
                             format!(
                                 "certified_encode_with_index: proposed atom {best_atom} out of range"
@@ -1794,6 +1818,15 @@ impl EncodeAtlas {
                         let Some(&best_atom) = proposal.proposed.first() else {
                             return Ok(None);
                         };
+                        // Routing-confidence gate (#1026): flag low-alignment gathers
+                        // for the exact fallback so a missed-true-best LSH route is
+                        // never silently certified. See CANDIDATE_ROUTING_MIN_ALIGNMENT
+                        // and certified_encode_with_index for the full rationale.
+                        if sketch.alignment(best_atom, targets.row(row))
+                            < CANDIDATE_ROUTING_MIN_ALIGNMENT
+                        {
+                            return Ok(None);
+                        }
                         let atom = atoms.get(best_atom).ok_or_else(|| {
                             format!(
                                 "amortized_encode_with_index: proposed atom {best_atom} out of range"
