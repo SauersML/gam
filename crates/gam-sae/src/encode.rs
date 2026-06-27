@@ -99,16 +99,6 @@ pub(crate) const ENCODE_BATCH_PARALLEL_ROW_MIN: usize = 256;
 /// ever adds exact-fallback work (correct, slower); it never certifies a mis-route.
 pub(crate) const CANDIDATE_ROUTING_MIN_ALIGNMENT: f64 = 0.5;
 
-/// Bounded plain-Newton warm-up steps the certified encoder takes from an
-/// uncertified chart-center start to navigate INTO the Kantorovich basin before
-/// flagging the row for the exact fallback (#1154/#1026). The Kantorovich
-/// quantity `h = β·η·L` scales with amplitude through `L`, so at unit amplitude a
-/// chart-center start can be positive-definite yet have `h > ½`; a few Newton
-/// steps reach an iterate where `h ≤ ½` and the encode is certified-exact from
-/// there. Bounded so a genuinely non-convergent row still falls back quickly; each
-/// step is one grad/Hessian eval plus a `d×d` solve (`d` = latent dim).
-pub(crate) const SAE_ENCODE_BASIN_WARMUP_STEPS: usize = 8;
-
 /// A chart region on an atom's latent coordinate: a center `t_c` plus a
 /// certified in-chart radius. Over the ball `‖t − t_c‖ ≤ radius` the jet sup
 /// bounds returned by [`BasisHessianLipschitz`] hold, so the Kantorovich
@@ -1091,14 +1081,20 @@ fn refine_certified_start(
 /// distilled start can sit OUTSIDE the certified ball (`h > ½`). Rather than
 /// flagging it uncertified immediately — which made the encoder certify ZERO
 /// held-out rows at amplitude 1.0 and fall back to the exact solve for everything —
-/// take up to [`SAE_ENCODE_BASIN_WARMUP_STEPS`] plain Newton steps toward the root,
-/// re-certifying at each iterate. The certificate at the landing point is a full
-/// Kantorovich guarantee from there (`h ≤ ½` ⇒ Newton converges to the in-ball
-/// root), so this only ever WIDENS the certified set; it never certifies a
-/// non-convergent start. An indefinite Hessian (`β`/`η` non-finite — at/past a
-/// basin boundary) is not steppable, so we stop and return `None` (flag). On
-/// success the start is then refined `newton_steps` further by
-/// [`refine_certified_start`].
+/// take plain Newton steps toward the root, re-certifying at each iterate, while
+/// the Kantorovich quantity `h = β·η·L` keeps CONTRACTING toward the ½ bound. The
+/// certificate at the landing point is a full Kantorovich guarantee from there
+/// (`h ≤ ½` ⇒ Newton converges to the in-ball root), so this only ever WIDENS the
+/// certified set; it never certifies a non-convergent start.
+///
+/// Termination is the natural Newton stopping rule — there is no arbitrary step
+/// budget. The warm-up stops and flags for the exact fallback when either the start
+/// is not steppable (indefinite / non-finite Hessian — at or past a basin boundary)
+/// or a step fails to reduce `h` (the iterate is not approaching a certifiable
+/// in-chart root: its root lies outside this chart's valid Lipschitz region, or the
+/// start was past the basin — empirically the rows that miss *plateau*, so more
+/// steps cannot help; the lever there is denser charts, not more iterations). On
+/// success the start is refined `newton_steps` further by [`refine_certified_start`].
 fn certify_with_basin_warmup(
     atom: &SaeManifoldAtom,
     evaluator: &dyn SaeBasisEvaluator,
@@ -1112,19 +1108,23 @@ fn certify_with_basin_warmup(
     let mut t = t_start;
     let (mut cert, mut delta) =
         row_certificate(atom, evaluator, t.view(), x, amplitude, lipschitz, ridge)?;
-    let mut warmups = 0usize;
     while !cert.certified() {
-        if warmups >= SAE_ENCODE_BASIN_WARMUP_STEPS
-            || !(cert.beta.is_finite() && cert.eta.is_finite())
-        {
+        // Not steppable (indefinite / non-finite Hessian): flag.
+        if !(cert.h.is_finite() && cert.beta.is_finite() && cert.eta.is_finite()) {
             return Ok(None);
         }
+        let prev_h = cert.h;
         t = &t + &delta;
         let (next_cert, next_delta) =
             row_certificate(atom, evaluator, t.view(), x, amplitude, lipschitz, ridge)?;
         cert = next_cert;
         delta = next_delta;
-        warmups += 1;
+        // The warm-up only helps while h keeps contracting toward ½. Once a step
+        // fails to reduce it, the iterate is not converging to a certifiable in-chart
+        // root — flag for the exact fallback (no arbitrary step budget).
+        if !cert.h.is_finite() || cert.h >= prev_h {
+            return Ok(None);
+        }
     }
     refine_certified_start(
         atom,

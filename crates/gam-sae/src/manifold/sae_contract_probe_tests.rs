@@ -698,10 +698,11 @@ fn amortized_warm_start_matches_or_beats_cold_inner_solve_on_known_manifold() {
 /// faithfulness test (`cotrained_criterion_folds_…`) certified because its fitted
 /// softmax masses are < 1 (smaller L ⇒ `h ≤ ½`).
 ///
-/// The fix (`certify_with_basin_warmup`, encode.rs) restores the bounded Newton
-/// "basin warm-up" a prior hardening had removed: from an uncertified-but-PD start,
-/// take up to `SAE_ENCODE_BASIN_WARMUP_STEPS` plain Newton steps INTO the
-/// Kantorovich basin, re-certifying at each iterate. The certificate at the landing
+/// The fix (`certify_with_basin_warmup`, encode.rs) restores the Newton "basin
+/// warm-up" a prior hardening had removed: from an uncertified-but-PD start, take
+/// plain Newton steps INTO the Kantorovich basin while `h` keeps contracting toward
+/// ½ (the natural Newton stopping rule — no step budget), re-certifying at each
+/// iterate. The certificate at the landing
 /// point is a full guarantee from there (`h ≤ ½` ⇒ Newton converges to the in-ball
 /// root), so this widens the certified reach to unit amplitude WITHOUT weakening
 /// the bound. The held-out `certified` count is now strictly positive (asserted
