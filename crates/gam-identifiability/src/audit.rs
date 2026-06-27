@@ -1289,17 +1289,138 @@ fn audit_identifiability_impl(
     // the higher-priority side of EVERY matching distinct-priority pair
     // (RRQR named the canonical owner) do we re-attribute to the
     // best-overlap partner's lower-priority side.
-    let dropped_columns =
-        attribute_demoted_columns(&demoted_joint_cols, &aliased_pairs, specs, &col_offsets, joint_rank_tol)?;
+    let block_priority_for_attribution: std::collections::HashMap<&str, u8> = specs
+        .iter()
+        .map(|s| (s.name.as_str(), s.gauge_priority))
+        .collect();
+    let mut dropped_columns: Vec<DroppedColumn> = Vec::new();
+    for &joint_col in &demoted_joint_cols {
+        let (block_idx, local_col) = locate_block_column(&col_offsets, joint_col)?;
+        let raw_block_name = specs[block_idx].name.clone();
+        let raw_priority = specs[block_idx].gauge_priority;
+
+        let pair_priorities = |pair: &AliasedPair| -> (u8, u8) {
+            let pa = block_priority_for_attribution
+                .get(pair.block_a.as_str())
+                .copied()
+                .unwrap_or(DEFAULT_GAUGE_PRIORITY);
+            let pb = block_priority_for_attribution
+                .get(pair.block_b.as_str())
+                .copied()
+                .unwrap_or(DEFAULT_GAUGE_PRIORITY);
+            (pa, pb)
+        };
+        let matches_demoted = |pair: &AliasedPair| -> bool {
+            (pair.block_a == raw_block_name && pair.direction_a == local_col)
+                || (pair.block_b == raw_block_name && pair.direction_b == local_col)
+        };
+
+        // Does any matching distinct-priority alias pair place the raw
+        // demoted column on its LOWER-priority side? Then RRQR's choice
+        // already agrees with canonical gauge ownership.
+        let raw_already_lower = aliased_pairs
+            .iter()
+            .filter(|pair| matches_demoted(pair))
+            .any(|pair| {
+                let (pa, pb) = pair_priorities(pair);
+                if pa == pb {
+                    return false;
+                }
+                let other_priority = if pair.block_a == raw_block_name {
+                    pb
+                } else {
+                    pa
+                };
+                raw_priority < other_priority
+            });
+
+        let best_pair = if raw_already_lower {
+            None
+        } else {
+            aliased_pairs
+                .iter()
+                .filter(|pair| matches_demoted(pair))
+                .filter(|pair| {
+                    let (pa, pb) = pair_priorities(pair);
+                    pa != pb
+                })
+                .max_by(|a, b| {
+                    a.overlap
+                        .partial_cmp(&b.overlap)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        };
+        let (block_name, drop_local_col, reason) = if let Some(pair) = best_pair {
+            let (pa, pb) = pair_priorities(pair);
+            let (lower_block, lower_col, lower_prio, higher_block, higher_col, higher_prio) =
+                if pa < pb {
+                    (
+                        pair.block_a.clone(),
+                        pair.direction_a,
+                        pa,
+                        pair.block_b.clone(),
+                        pair.direction_b,
+                        pb,
+                    )
+                } else {
+                    (
+                        pair.block_b.clone(),
+                        pair.direction_b,
+                        pb,
+                        pair.block_a.clone(),
+                        pair.direction_a,
+                        pa,
+                    )
+                };
+            (
+                lower_block.clone(),
+                lower_col,
+                format!(
+                    "joint-design column {joint_col} (raw RRQR block '{raw_block_name}' local column {local_col}) demoted past joint RRQR rank tolerance {tol:.3e}; canonical gauge re-attributed the shared direction to lower-priority block '{lower_block}' local column {lower_col} (priority {lower_prio} < '{higher_block}' local column {higher_col}, priority {higher_prio}; overlap={overlap:.4})",
+                    tol = joint_rank_tol,
+                    overlap = pair.overlap,
+                ),
+            )
+        } else if raw_already_lower {
+            (
+                raw_block_name.clone(),
+                local_col,
+                format!(
+                    "joint-design column {joint_col} (block '{raw_block_name}' local column {local_col}, priority {raw_priority}) demoted past joint RRQR rank tolerance {tol:.3e}; canonical gauge keeps the attribution on this block — RRQR already named the lower-priority side of its alias",
+                    tol = joint_rank_tol,
+                ),
+            )
+        } else {
+            (
+                raw_block_name.clone(),
+                local_col,
+                format!(
+                    "joint-design column {joint_col} (block '{raw_block_name}' local column {local_col}) demoted past joint RRQR rank tolerance {tol:.3e}; earlier blocks' column span absorbs this direction",
+                    tol = joint_rank_tol,
+                ),
+            )
+        };
+        dropped_columns.push(DroppedColumn {
+            block: block_name,
+            column: drop_local_col,
+            reason,
+        });
+    }
 
     // Reflect canonical dropped-column attribution into `BlockIdentity::
     // effective_dim`: each block's effective dimension is its original dim
     // minus the count of its attributed dropped columns (post re-attribution
     // to the lower-priority participant, not the raw RRQR-selected column).
-    set_effective_dim_from_drops(&mut blocks, &dropped_columns, specs);
+    for (block_idx, block) in blocks.iter_mut().enumerate() {
+        let block_name = specs[block_idx].name.as_str();
+        let dropped_here = dropped_columns
+            .iter()
+            .filter(|drop| drop.block == block_name)
+            .count();
+        block.effective_dim = block.original_dim.saturating_sub(dropped_here);
+    }
 
     let joint_rank_deficient = joint_rank < p_total;
-
     // Hard-halt and gauge-resolvability classification.
     //
     // # Canonical-gauge contract
@@ -1601,181 +1722,6 @@ fn audit_identifiability_impl(
     })
 }
 
-/// Attribute a set of demoted joint columns back to their `(block, local_col)`
-/// origin under the canonical-gauge contract — shared by the flat
-/// ([`audit_identifiability_impl`]) and channel-aware
-/// ([`audit_identifiability_channel_aware`]) paths so BOTH produce a *faithful*
-/// drop set: the actual redundant columns, attributed to the lower-priority
-/// participant of any cross-block alias, never a positional trailing-column
-/// fiction.
-///
-/// `demoted_joint_cols` are the joint-column indices a joint rank-revealing
-/// factorization placed past the rank cutoff. RRQR is priority-ordered, but
-/// column pivoting can still name the *higher*-priority representative of a
-/// two-block alias; the model-space redundancy is resolved by dropping the
-/// *lower*-priority participant, so when the raw demoted column sits on the
-/// higher-priority side of EVERY matching distinct-priority alias pair we
-/// re-attribute it to the best-overlap partner's lower-priority side. A raw
-/// column already on (or tied to) the lower-priority side keeps its attribution.
-///
-/// # ≥3-way alias correctness
-///
-/// For a 3-block shared direction (`[high, mid, low]` with a common column) RRQR
-/// demotes the two lower representatives (mid and low). The raw demoted column
-/// for mid is on the LOWER side of the (high, mid) pair and the HIGHER side of
-/// the (mid, low) pair. A `max_by(overlap)` over matching distinct-priority
-/// pairs would re-attribute the mid drop to low — double-counting low and
-/// leaving mid unattributed. The `raw_already_lower` guard prevents this: if the
-/// raw column is the lower side of at least one matching pair, the attribution
-/// stays on the raw block.
-fn attribute_demoted_columns(
-    demoted_joint_cols: &[usize],
-    aliased_pairs: &[AliasedPair],
-    specs: &[ParameterBlockSpec],
-    col_offsets: &[usize],
-    joint_rank_tol: f64,
-) -> Result<Vec<DroppedColumn>, EstimationError> {
-    let block_priority_for_attribution: std::collections::HashMap<&str, u8> = specs
-        .iter()
-        .map(|s| (s.name.as_str(), s.gauge_priority))
-        .collect();
-    let mut dropped_columns: Vec<DroppedColumn> = Vec::new();
-    for &joint_col in demoted_joint_cols {
-        let (block_idx, local_col) = locate_block_column(col_offsets, joint_col)?;
-        let raw_block_name = specs[block_idx].name.clone();
-        let raw_priority = specs[block_idx].gauge_priority;
-
-        let pair_priorities = |pair: &AliasedPair| -> (u8, u8) {
-            let pa = block_priority_for_attribution
-                .get(pair.block_a.as_str())
-                .copied()
-                .unwrap_or(DEFAULT_GAUGE_PRIORITY);
-            let pb = block_priority_for_attribution
-                .get(pair.block_b.as_str())
-                .copied()
-                .unwrap_or(DEFAULT_GAUGE_PRIORITY);
-            (pa, pb)
-        };
-        let matches_demoted = |pair: &AliasedPair| -> bool {
-            (pair.block_a == raw_block_name && pair.direction_a == local_col)
-                || (pair.block_b == raw_block_name && pair.direction_b == local_col)
-        };
-
-        // Does any matching distinct-priority alias pair place the raw
-        // demoted column on its LOWER-priority side? Then RRQR's choice
-        // already agrees with canonical gauge ownership.
-        let raw_already_lower = aliased_pairs
-            .iter()
-            .filter(|pair| matches_demoted(pair))
-            .any(|pair| {
-                let (pa, pb) = pair_priorities(pair);
-                if pa == pb {
-                    return false;
-                }
-                let other_priority = if pair.block_a == raw_block_name {
-                    pb
-                } else {
-                    pa
-                };
-                raw_priority < other_priority
-            });
-
-        let best_pair = if raw_already_lower {
-            None
-        } else {
-            aliased_pairs
-                .iter()
-                .filter(|pair| matches_demoted(pair))
-                .filter(|pair| {
-                    let (pa, pb) = pair_priorities(pair);
-                    pa != pb
-                })
-                .max_by(|a, b| {
-                    a.overlap
-                        .partial_cmp(&b.overlap)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-        };
-        let (block_name, drop_local_col, reason) = if let Some(pair) = best_pair {
-            let (pa, pb) = pair_priorities(pair);
-            let (lower_block, lower_col, lower_prio, higher_block, higher_col, higher_prio) =
-                if pa < pb {
-                    (
-                        pair.block_a.clone(),
-                        pair.direction_a,
-                        pa,
-                        pair.block_b.clone(),
-                        pair.direction_b,
-                        pb,
-                    )
-                } else {
-                    (
-                        pair.block_b.clone(),
-                        pair.direction_b,
-                        pb,
-                        pair.block_a.clone(),
-                        pair.direction_a,
-                        pa,
-                    )
-                };
-            (
-                lower_block.clone(),
-                lower_col,
-                format!(
-                    "joint-design column {joint_col} (raw RRQR block '{raw_block_name}' local column {local_col}) demoted past joint RRQR rank tolerance {tol:.3e}; canonical gauge re-attributed the shared direction to lower-priority block '{lower_block}' local column {lower_col} (priority {lower_prio} < '{higher_block}' local column {higher_col}, priority {higher_prio}; overlap={overlap:.4})",
-                    tol = joint_rank_tol,
-                    overlap = pair.overlap,
-                ),
-            )
-        } else if raw_already_lower {
-            (
-                raw_block_name.clone(),
-                local_col,
-                format!(
-                    "joint-design column {joint_col} (block '{raw_block_name}' local column {local_col}, priority {raw_priority}) demoted past joint RRQR rank tolerance {tol:.3e}; canonical gauge keeps the attribution on this block — RRQR already named the lower-priority side of its alias",
-                    tol = joint_rank_tol,
-                ),
-            )
-        } else {
-            (
-                raw_block_name.clone(),
-                local_col,
-                format!(
-                    "joint-design column {joint_col} (block '{raw_block_name}' local column {local_col}) demoted past joint RRQR rank tolerance {tol:.3e}; earlier blocks' column span absorbs this direction",
-                    tol = joint_rank_tol,
-                ),
-            )
-        };
-        dropped_columns.push(DroppedColumn {
-            block: block_name,
-            column: drop_local_col,
-            reason,
-        });
-    }
-    Ok(dropped_columns)
-}
-
-/// Set each block's [`BlockIdentity::effective_dim`] to its original dimension
-/// minus the count of dropped columns attributed to it (post canonical-gauge
-/// re-attribution). Shared by both audit paths so `effective_dim` stays
-/// consistent with `dropped_columns` — `canonicalize_for_identifiability` builds
-/// per-block selection-`T`s from `dropped_columns` and certifies the reduced
-/// width against `Σ effective_dim`, so the two MUST agree.
-fn set_effective_dim_from_drops(
-    blocks: &mut [BlockIdentity],
-    dropped_columns: &[DroppedColumn],
-    specs: &[ParameterBlockSpec],
-) {
-    for (block_idx, block) in blocks.iter_mut().enumerate() {
-        let block_name = specs[block_idx].name.as_str();
-        let dropped_here = dropped_columns
-            .iter()
-            .filter(|drop| drop.block == block_name)
-            .count();
-        block.effective_dim = block.original_dim.saturating_sub(dropped_here);
-    }
-}
-
 /// Channel-aware identifiability audit for multi-channel families.
 ///
 /// The flat [`audit_identifiability`] runs RRQR on
@@ -2046,22 +1992,33 @@ pub fn audit_identifiability_channel_aware(
     }
     let p_total = *col_offsets.last().expect("col_offsets non-empty");
 
-    // Joint rank from the per-block sequential compile (the dual-metric
-    // structural + curvature residualisation). This is the COUNT of independent
-    // directions the design carries; `p_total - joint_rank` columns are
-    // redundant and must be dropped.
-    let joint_rank = compiled_map.raw_from_compiled.ncols();
-    let joint_rank_deficient = joint_rank < p_total;
+    // The Gram compiler emits kept widths. Attribute any lost width to trailing
+    // local columns, matching the existing audit contract that downstream code
+    // consumes for diagnostics rather than for an automatic callback reparam.
+    let mut dropped_columns: Vec<DroppedColumn> = Vec::new();
+    for (block_idx, spec) in specs.iter().enumerate() {
+        let p_block = spec.design.ncols();
+        let kept = compiled_map.compiled_block_ranges[block_idx].len();
+        for local_col in kept..p_block {
+            let block_name = spec.name.clone();
+            dropped_columns.push(DroppedColumn {
+                block: block_name.clone(),
+                column: local_col,
+                reason: format!(
+                    "channel-aware audit (K={k}) demoted block '{block_name}' \
+                     local column {local_col}: column is in the row-Jacobian span \
+                     of earlier blocks under the structural row metric",
+                ),
+            });
+        }
+    }
 
     // Pairwise overlap scan in the channel-weighted view. The compiler
     // already eigendecomposed the structural Gram block-by-block; we
     // need joint column-column overlaps to surface near-alias pairs
     // above the reporting threshold. Compute on the (n·K, p_total)
     // weighted joint W where W_b = sqrt(K^S) · J_b. With K^S = I,
-    // sqrt(K^S) = I and W_b is just J_b flattened to (n·K, p_b). Scanned
-    // BEFORE the drop attribution below so the canonical-gauge re-attribution
-    // (shared direction → lower-priority partner) can consult these pairs,
-    // exactly as the flat path does.
+    // sqrt(K^S) = I and W_b is just J_b flattened to (n·K, p_b).
     let ScannedAliasPairs {
         reported: aliased_pairs,
         halt: halt_pairs,
@@ -2074,64 +2031,8 @@ pub fn audit_identifiability_channel_aware(
         n * k,
     )?;
 
-    // FAITHFUL joint drop attribution (#1590).
-    //
-    // The per-block sequential compile decides HOW MANY directions are redundant
-    // (`p_total - joint_rank`), but attributing that deficit to each block's
-    // TRAILING local columns is a positional fiction: it assumes a block's
-    // redundant directions are its last columns AND that no redundancy is SHARED
-    // across blocks. For a multi-cause survival design the two cause-specific
-    // time bases (`time_cause_1`, `time_cause_2`) carry a common baseline/trend
-    // direction, so a trailing-column selection-`T` keeps that shared direction
-    // in BOTH blocks and drops independent ones instead — leaving the reduced
-    // design `J_can` rank-deficient (rank 4 of 6 kept), which
-    // `canonicalize_for_identifiability`'s post-T rank invariant then correctly
-    // aborts on.
-    //
-    // Decide WHICH columns to drop with a JOINT, gauge-priority-tiered
-    // rank-revealing factorization of the channel-aware structural Gram — the
-    // same `priority_tiered_rank_from_gram` the flat path uses — and demote the
-    // `p_total - joint_rank` least-significant columns of its pivot order (the
-    // most redundant / lowest priority). The COUNT stays anchored to the
-    // compile's `joint_rank`, so the fatal classification below
-    // (`rank_deficiency_count_ca`, `attribution_complete_ca`) is byte-for-byte
-    // unchanged; only the column ATTRIBUTION becomes faithful, so the kept
-    // columns are jointly independent and `J_can` reaches full rank. The shared
-    // `attribute_demoted_columns` re-attributes a shared direction RRQR named on
-    // a higher-priority block to its lower-priority partner (canonical gauge).
-    let rank_deficiency_count = p_total.saturating_sub(joint_rank);
-    let dropped_columns: Vec<DroppedColumn> = if rank_deficiency_count == 0 {
-        Vec::new()
-    } else {
-        let col_priority_ca: Vec<u8> = (0..specs.len())
-            .flat_map(|i| {
-                std::iter::repeat(specs[i].gauge_priority)
-                    .take(col_offsets[i + 1] - col_offsets[i])
-            })
-            .collect();
-        let tiered = priority_tiered_rank_from_gram(
-            &geometry.gram_struct,
-            &col_priority_ca,
-            n * k,
-            default_rrqr_rank_alpha(),
-        );
-        // The LAST `rank_deficiency_count` columns of the pivot order are the
-        // most-redundant ones. Anchor to the compile's count (not the RRQR's
-        // own rank cutoff) so the two structural-rank conventions never disagree
-        // on how many columns to drop.
-        let demoted: Vec<usize> = tiered
-            .column_permutation
-            .iter()
-            .rev()
-            .take(rank_deficiency_count)
-            .copied()
-            .collect();
-        attribute_demoted_columns(&demoted, &aliased_pairs, specs, &col_offsets, tiered.rank_tol)?
-    };
-
-    // Keep `effective_dim` consistent with the faithful `dropped_columns`
-    // (canonicalisation builds per-block selection-`T`s from `dropped_columns`).
-    set_effective_dim_from_drops(&mut blocks, &dropped_columns, specs);
+    let joint_rank = compiled_map.raw_from_compiled.ncols();
+    let joint_rank_deficient = joint_rank < p_total;
 
     // Penalty-aware joint rank `rank([J_joint; S_blockdiag])` = co-dimension of
     // `ker(J) ∩ ker(S)`. The structural `joint_rank` above is penalty-BLIND, so

@@ -1688,6 +1688,25 @@ pub fn fit_penalized_multinomial_formula(
             coefficients_active[[i, a]] = block.beta[i];
         }
     }
+    // #1587: the inner solve fits in the whitened class gauge `γ` (so the
+    // driver's per-block diagonal penalty realizes the reference-symmetric
+    // centered metric). Map the fitted `γ` back to the natural ALR
+    // coefficients `β_true = (A⊗I)γ` — with the closed-form symmetric whitener
+    // `A = I_M + ((√K−1)/M)·J_M` — so the stored coefficients (and hence the
+    // predicted η = Xβ_true) are in the native softmax gauge. Per class,
+    // `β_true[:,a] = γ[:,a] + off·Σ_b γ[:,b]`, `off = (√K−1)/M`.
+    if m >= 1 {
+        let off = ((m as f64 + 1.0).sqrt() - 1.0) / m as f64;
+        for i in 0..p_per_class {
+            let mut row_sum = 0.0_f64;
+            for b in 0..m {
+                row_sum += coefficients_active[[i, b]];
+            }
+            for a in 0..m {
+                coefficients_active[[i, a]] += off * row_sum;
+            }
+        }
+    }
     // Map the standardized-column coefficients back to raw units (the exact
     // inverse of the conditioning reparameterization above): β_raw = b/s, with
     // the centering mass `Σ_j b_j·m_j/s_j` returned to the intercept.

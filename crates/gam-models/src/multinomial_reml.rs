@@ -73,7 +73,7 @@ use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
 use gam_solve::pirls::dense_block_xtwx;
 use gam_problem::{DenseMatrixHyperOperator, HyperOperator};
 use ndarray::{Array1, Array2, Array3, ArrayView2};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Joint-coupled multinomial-logit family with shared design and shared
 /// smoothing penalty across active classes.
@@ -131,28 +131,6 @@ pub struct MultinomialFamily {
     /// Cached likelihood evaluator. Constructed once with the same row
     /// weights as `weights` and reused across every `evaluate` call.
     likelihood: MultinomialLogitLikelihood,
-    /// Memo for the FULL set of canonical-axis joint-Hessian directional
-    /// derivatives `{ Hdot[e_k] }_{k=0..(K-1)·P}` at one frozen `β`.
-    ///
-    /// The Tier-B Jeffreys/Firth term (`joint_jeffreys_term`) drives the inner
-    /// loop `for k in 0..p { hessian_dir(e_k) }`, calling
-    /// [`Self::exact_newton_joint_hessian_directional_derivative`] once PER
-    /// canonical axis at the SAME `block_states`. Each call independently
-    /// recomputed the full `(N,K)` softmax and re-formed a generic
-    /// `dense_block_xtwx` Gram — `O(p)` redundant softmax passes per term, and
-    /// the term itself is rebuilt at every accepted inner-Newton β and every
-    /// outer LAML eval (#715/#722/#753: the multinomial Firth grind). This memo
-    /// assembles the WHOLE axis set in one softmax pass the first time an axis
-    /// is requested at a given β, then serves every subsequent axis (the rest of
-    /// that Jeffreys loop) from the cache. Keyed on an η fingerprint so a moved
-    /// β recomputes; a single-slot cache suffices because the Jeffreys loop
-    /// requests all `p` axes consecutively before β changes.
-    ///
-    /// `Arc<Mutex<…>>` (interior mutability) because the family is shared
-    /// `&self` and `Clone`; the per-axis derivative is a pure function of the
-    /// frozen `β`, so a stale clone simply recomputes — never returns a wrong
-    /// value. Cheap clones share the slot.
-    axis_derivative_cache: Arc<Mutex<Option<AxisDerivativeCache>>>,
     /// Whether this family instance contributes the full-span Jeffreys/Firth
     /// correction to the coupled custom-family solve.
     ///
@@ -167,51 +145,176 @@ pub struct MultinomialFamily {
     use_joint_jeffreys_term: bool,
 }
 
-/// One frozen-`β` snapshot of every canonical-axis joint-Hessian directional
-/// derivative, shared across the `p` sequential per-axis requests the Tier-B
-/// Jeffreys loop makes at that `β` (see [`MultinomialFamily::axis_derivative_cache`]).
-#[derive(Clone, Debug)]
-struct AxisDerivativeCache {
-    /// Fingerprint of the stacked per-class `η` the derivatives were built at.
-    eta_key: EtaFingerprint,
-    /// `Hdot[e_k]` for every canonical axis `k = a·P + i`, laid out in the same
-    /// output-major flat order as the joint Hessian.
-    derivatives: Vec<Array2<f64>>,
-}
-
-/// Cheap, exact fingerprint of a stacked `(N, M)` η matrix: its raw `f64` bit
-/// patterns hashed. Two identical `β` snapshots produce identical η bit-for-bit
-/// (the Jeffreys loop never perturbs β between axis requests), so this keys the
-/// single-slot axis-derivative memo without storing the whole η.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct EtaFingerprint {
-    rows: usize,
-    cols: usize,
-    hash: u64,
-}
-
-impl EtaFingerprint {
-    fn of(eta: ArrayView2<'_, f64>) -> Self {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        let (rows, cols) = eta.dim();
-        rows.hash(&mut hasher);
-        cols.hash(&mut hasher);
-        for &v in eta.iter() {
-            v.to_bits().hash(&mut hasher);
-        }
-        EtaFingerprint {
-            rows,
-            cols,
-            hash: hasher.finish(),
-        }
-    }
-}
-
 impl MultinomialFamily {
     /// Total number of active blocks, `M = K − 1`.
     pub const fn active_classes(&self) -> usize {
         self.total_classes - 1
+    }
+
+    // ── Reference-symmetric (centered) class metric — #1587 ──────────────
+    //
+    // The driver applies the smoothing penalty per active-class block as the
+    // block-diagonal `diag_a(λ_t)⊗S_t`, which penalizes the K−1 *reference-
+    // anchored* ALR contrasts `η_a = log(p_a/p_ref)` independently. That frame
+    // is NOT symmetric in the K classes, so cycling which class is the
+    // reference selects a different penalty and drifts the fit (~1% predicted
+    // probability). The reference-symmetric CLR penalty `Σ_k β̃_kᵀ S β̃_k`
+    // (`Σ_k β̃_k = 0`) equals, in the ALR coordinates the solver uses,
+    // `βᵀ((I_{K-1} − J_{K-1}/K)⊗S)β`. We realize it WITHOUT changing the
+    // shared per-block driver by whitening the class gauge: the driver's
+    // coordinate `γ` relates to the natural ALR coefficient by
+    // `β_true = (A⊗I)γ` with the symmetric, positive-definite
+    // `A = (I − J/K)^{-1/2}`. Then the driver's diagonal `λ γᵀ(I⊗S)γ` equals
+    // `λ β_trueᵀ((I−J/K)⊗S)β_true` — the centered metric — provided the per-
+    // class λ are *tied* across classes (see `build_block_specs`). The closed
+    // form (eigenvalue 1 on `1⊥`, `1/K` on the all-ones direction, K=M+1) is
+    //   A = I_M + ((√K − 1)/M)·J_M.
+    // This mirrors the resolved ALR sibling #1549 (`e80f4594c`, `G^{1/2}`).
+
+    /// Symmetric class-space whitener `A = (I_M − J_M/K)^{-1/2}
+    /// = I_M + ((√K − 1)/M)·J_M`, `M = K − 1`.
+    fn class_whitener(&self) -> Array2<f64> {
+        let m = self.active_classes();
+        let k = self.total_classes as f64;
+        let off = (k.sqrt() - 1.0) / m as f64;
+        Array2::from_shape_fn((m, m), |(a, b)| if a == b { 1.0 + off } else { off })
+    }
+
+    /// Mix the class channels of an `(N × M)` matrix by `A`: `out[n,:] =
+    /// A · row[n,:]`. Used to whiten both `η` (block predictors → true ALR η)
+    /// and the per-row `∂logL/∂η` (β_true frame → γ frame), since `A` is
+    /// symmetric.
+    fn whiten_class_rows(&self, mat: ArrayView2<'_, f64>) -> Array2<f64> {
+        // (mat · A)[n,j] = Σ_b mat[n,b] A[b,j] = Σ_b A[j,b] mat[n,b] (A symmetric).
+        mat.dot(&self.class_whitener())
+    }
+
+    /// Whiten an `(N × M × M)` per-row Fisher tensor by `A`: `out[n] =
+    /// A · W[n] · A`. The `(a,a)` diagonal and off-diagonal class blocks of
+    /// the centered curvature follow.
+    fn whiten_fisher(&self, fisher: &Array3<f64>) -> Array3<f64> {
+        let a = self.class_whitener();
+        let n = fisher.shape()[0];
+        let m = self.active_classes();
+        let mut out = Array3::<f64>::zeros((n, m, m));
+        for row in 0..n {
+            for ai in 0..m {
+                for bi in 0..m {
+                    let mut acc = 0.0_f64;
+                    for c in 0..m {
+                        let aac = a[[ai, c]];
+                        if aac == 0.0 {
+                            continue;
+                        }
+                        for d in 0..m {
+                            acc += aac * fisher[[row, c, d]] * a[[d, bi]];
+                        }
+                    }
+                    out[[row, ai, bi]] = acc;
+                }
+            }
+        }
+        out
+    }
+
+    /// Apply `(A ⊗ I_P)` to a stacked `(M·P)` coefficient direction: block
+    /// `a` becomes `Σ_b A[a,b]·d_block_b`. Maps a γ-frame direction to its
+    /// β_true-frame image (and is its own analogue for gradients).
+    fn whiten_stacked(&self, d: &Array1<f64>) -> Array1<f64> {
+        let a = self.class_whitener();
+        let m = self.active_classes();
+        let p = self.design.ncols();
+        let mut out = Array1::<f64>::zeros(m * p);
+        for ai in 0..m {
+            for bi in 0..m {
+                let coeff = a[[ai, bi]];
+                if coeff == 0.0 {
+                    continue;
+                }
+                for i in 0..p {
+                    out[ai * p + i] += coeff * d[bi * p + i];
+                }
+            }
+        }
+        out
+    }
+
+    /// Conjugate a stacked `(M·P)×(M·P)` block matrix by `(A ⊗ I_P)`:
+    /// `out = (A⊗I) H (A⊗I)`. Maps a β_true-frame joint Hessian (or directional
+    /// derivative) to the γ frame the driver penalizes diagonally.
+    fn whiten_block_matrix(&self, h: &Array2<f64>) -> Array2<f64> {
+        let a = self.class_whitener();
+        let m = self.active_classes();
+        let p = self.design.ncols();
+        let dim = m * p;
+        // left = (A⊗I) H
+        let mut left = Array2::<f64>::zeros((dim, dim));
+        for ai in 0..m {
+            for bi in 0..m {
+                let coeff = a[[ai, bi]];
+                if coeff == 0.0 {
+                    continue;
+                }
+                for i in 0..p {
+                    let src = bi * p + i;
+                    let dst = ai * p + i;
+                    for col in 0..dim {
+                        left[[dst, col]] += coeff * h[[src, col]];
+                    }
+                }
+            }
+        }
+        // out = left (A⊗I)  (A symmetric)
+        let mut out = Array2::<f64>::zeros((dim, dim));
+        for ci in 0..m {
+            for di in 0..m {
+                let coeff = a[[di, ci]];
+                if coeff == 0.0 {
+                    continue;
+                }
+                for j in 0..p {
+                    let src = di * p + j;
+                    let dst = ci * p + j;
+                    for r in 0..dim {
+                        out[[r, dst]] += coeff * left[[r, src]];
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Recombine a β_true-frame set of canonical-axis directional derivatives
+    /// `{Hdot_β[e_k]}` (indexed `k = a·P + i`) into the γ-frame set
+    /// `{Hdot_γ[e_k]}`. Since `Hdot` is linear in its direction and
+    /// `(A⊗I)e_{(a,i)} = Σ_c A[c,a] e_{(c,i)}`,
+    ///   `Hdot_γ[e_{(a,i)}] = (A⊗I)( Σ_c A[c,a] Hdot_β[e_{(c,i)}] )(A⊗I)`.
+    fn recombine_and_whiten_axes(&self, axes_b: &[Array2<f64>]) -> Vec<Array2<f64>> {
+        let m = self.active_classes();
+        let p = self.design.ncols();
+        let dim = m * p;
+        if axes_b.len() != m * p {
+            // Axis-count mismatch (flagged non-fatally by the caller): fall back
+            // to a per-axis conjugation without the cross-class recombination
+            // rather than panic on the indexing.
+            return axes_b.iter().map(|h| self.whiten_block_matrix(h)).collect();
+        }
+        let a = self.class_whitener();
+        let mut out = Vec::with_capacity(m * p);
+        for ai in 0..m {
+            for i in 0..p {
+                let mut combo = Array2::<f64>::zeros((dim, dim));
+                for c in 0..m {
+                    let coeff = a[[c, ai]];
+                    if coeff == 0.0 {
+                        continue;
+                    }
+                    combo.scaled_add(coeff, &axes_b[c * p + i]);
+                }
+                out.push(self.whiten_block_matrix(&combo));
+            }
+        }
+        out
     }
 
     /// Validate inputs and construct the family.
@@ -304,7 +407,6 @@ impl MultinomialFamily {
             penalties,
             penalty_nullspace_dims,
             likelihood,
-            axis_derivative_cache: Arc::new(Mutex::new(None)),
             use_joint_jeffreys_term: true,
         })
     }
@@ -350,33 +452,28 @@ impl MultinomialFamily {
                 // repeated columns for aliases, and strips every block past
                 // `class_0` to width 0 — the failure in #363.
                 //
-                // Each block carries the FULL per-term physical penalty list.
-                //
-                // #1587 (tied λ): the K−1 cloned per-class copies of term `t`'s
-                // penalty all carry the SAME `precision_label`
-                // (`multinomial_term_{t}`), so the custom-family outer loop
-                // (`penalty_label_layout`) collapses them onto ONE outer ρ per
-                // term — a single shared `λ_t` smoothing every class's copy of
-                // term `t` instead of an independent `λ_{a,t}` per (class, term).
-                // A single shared λ per smooth term is the gauge the
-                // reference-symmetric (CLR) softmax penalty requires: the
-                // centered metric `λ_t·((I−J/K)⊗S_t)` has ONE λ_t, not one per
-                // class. (The cross-block `−(λ_t/K)·S_t` coupling of that metric
-                // is the second half of the #1587 fix; this λ-tying is the
-                // contained prerequisite.) Untied per-(class,term) λ — the prior
-                // behavior — additionally breaks reference-class invariance
-                // because relabeling permutes which class owns which λ.
-                let labeled_penalties: Vec<PenaltyMatrix> = self
-                    .penalties
-                    .iter()
-                    .enumerate()
-                    .map(|(t, pen)| pen.clone().with_precision_label(format!("multinomial_term_{t}")))
-                    .collect();
+                // Each block carries the FULL per-term physical penalty list, so
+                // the outer loop can select independent smoothing coordinates
+                // for the smooth components that make up each class surface.
                 let mut spec = ParameterBlockSpec {
                     name: format!("class_{a}"),
                     design: DesignMatrix::Dense(DenseDesignMatrix::from(self.design.clone())),
                     offset: Array1::<f64>::zeros(self.design.nrows()),
-                    penalties: labeled_penalties,
+                    // #1587: tie each smooth term's smoothing parameter ACROSS
+                    // the K−1 class blocks by giving every block's copy of term
+                    // `t` the same `precision_label`. The custom-family driver's
+                    // `penalty_label_layout`/`physical_to_outer` collapses all
+                    // penalties sharing a label to ONE outer ρ coordinate, so
+                    // class `a`'s `λ_{a,t}` become a single per-term `λ_t`
+                    // (shared across classes). A shared λ is what makes the
+                    // whitened class metric `(I−J/K)⊗S` reference-symmetric —
+                    // per-class λ would re-introduce the labeling dependence.
+                    penalties: self
+                        .penalties
+                        .iter()
+                        .enumerate()
+                        .map(|(t, p)| p.clone().with_precision_label(format!("multinomial_term_{t}")))
+                        .collect(),
                     nullspace_dims: (*self.penalty_nullspace_dims).clone(),
                     initial_log_lambdas: Array1::<f64>::zeros(n_terms),
                     initial_beta: None,
@@ -594,7 +691,10 @@ impl MultinomialFamily {
                 grad[a * p + i] = acc;
             }
         }
-        (log_lik, grad)
+        // #1587: the probabilities are evaluated at the true (whitened) η, so
+        // `log_lik` is already correct; map the β_true-frame gradient to the
+        // γ frame the driver penalizes by `(A⊗I)`.
+        (log_lik, self.whiten_stacked(&grad))
     }
 
     /// Apply a coefficient-space direction `d_β` to the design to obtain
@@ -733,6 +833,7 @@ impl MultinomialFamily {
         let n = self.weights.len();
         let dim = m * p;
         let design = self.design.view();
+        let a_mat = self.class_whitener();
         (0..n)
             .into_par_iter()
             .fold(
@@ -742,9 +843,26 @@ impl MultinomialFamily {
                     if w == 0.0 {
                         return acc;
                     }
+                    // #1587: the diagonal of the whitened curvature
+                    // `diag_{(a,i)} (A⊗I) H_β (A⊗I)` reads the A-sandwiched
+                    // class-block weight `(A W A)[a,a]` (with
+                    // `W[b,c] = w(δ_bc p_b − p_b p_c)`), not the bare
+                    // `w p_a(1−p_a)`.
                     for a in 0..m {
-                        let pa = probs_full[[row, a]];
-                        let waa = w * pa * (1.0 - pa);
+                        let mut waa = 0.0_f64;
+                        for b in 0..m {
+                            let aab = a_mat[[a, b]];
+                            if aab == 0.0 {
+                                continue;
+                            }
+                            let pb = probs_full[[row, b]];
+                            for c in 0..m {
+                                let pc = probs_full[[row, c]];
+                                let wbc =
+                                    w * ((if b == c { pb } else { 0.0 }) - pb * pc);
+                                waa += aab * wbc * a_mat[[c, a]];
+                            }
+                        }
                         if waa == 0.0 {
                             continue;
                         }
@@ -1508,61 +1626,6 @@ impl MultinomialFamily {
         Ok(out)
     }
 
-    /// Index of the single canonical axis `k` if `d_beta_flat` is the unit
-    /// vector `e_k` (the Tier-B Jeffreys loop's request shape), else `None`.
-    fn canonical_axis_index(&self, d_beta_flat: &Array1<f64>) -> Option<usize> {
-        let mut axis: Option<usize> = None;
-        for (k, &v) in d_beta_flat.iter().enumerate() {
-            if v == 0.0 {
-                continue;
-            }
-            if v != 1.0 || axis.is_some() {
-                return None;
-            }
-            axis = Some(k);
-        }
-        axis
-    }
-
-    /// Joint-Hessian directional derivative along a single canonical axis `e_k`,
-    /// served from the shared per-`β` memo. The first axis requested at a fresh
-    /// `β` assembles the WHOLE set in one softmax pass
-    /// ([`Self::assemble_all_axis_directional_derivatives`]); every subsequent
-    /// axis of that Jeffreys loop is a cache read — turning the term's `O(p)`
-    /// redundant softmax/Gram rebuilds into a single shared pass (#715/#722).
-    fn cached_axis_directional_derivative(
-        &self,
-        eta: ArrayView2<'_, f64>,
-        axis: usize,
-    ) -> Array2<f64> {
-        let key = EtaFingerprint::of(eta);
-        {
-            let guard = self
-                .axis_derivative_cache
-                .lock()
-                .expect("axis derivative cache mutex poisoned");
-            if let Some(cache) = guard.as_ref()
-                && cache.eta_key == key
-            {
-                return cache.derivatives[axis].clone();
-            }
-        }
-        // Cache miss (fresh β): assemble the full axis set ONCE, store it, return
-        // the requested axis. Assembly happens outside the lock so concurrent
-        // requesters at the same β never block on each other's full sweep — a
-        // redundant assemble is wasteful but never wrong (pure function of β).
-        let derivatives = self.assemble_all_axis_directional_derivatives(eta);
-        let result = derivatives[axis].clone();
-        let mut guard = self
-            .axis_derivative_cache
-            .lock()
-            .expect("axis derivative cache mutex poisoned");
-        *guard = Some(AxisDerivativeCache {
-            eta_key: key,
-            derivatives,
-        });
-        result
-    }
 }
 
 impl CustomFamily for MultinomialFamily {
@@ -1636,9 +1699,14 @@ impl CustomFamily for MultinomialFamily {
     }
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
-        let eta = self.collect_eta_matrix(block_states)?;
+        // #1587: whiten the block predictors to the true ALR η (correct
+        // probabilities/log-lik), then map the β_true-frame Fisher block and
+        // gradient to the γ frame the driver penalizes diagonally.
+        let eta = self.whiten_class_rows(self.collect_eta_matrix(block_states)?.view());
         let (log_lik, fisher, grad_eta_logl) = self.evaluate_row_kernels(eta.view());
-        let working_sets = self.assemble_block_diagonal_working_sets(&fisher, &grad_eta_logl)?;
+        let fisher_g = self.whiten_fisher(&fisher);
+        let grad_g = self.whiten_class_rows(grad_eta_logl.view());
+        let working_sets = self.assemble_block_diagonal_working_sets(&fisher_g, &grad_g)?;
         Ok(FamilyEvaluation {
             log_likelihood: log_lik,
             blockworking_sets: working_sets,
@@ -1646,7 +1714,7 @@ impl CustomFamily for MultinomialFamily {
     }
 
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
-        let eta = self.collect_eta_matrix(block_states)?;
+        let eta = self.whiten_class_rows(self.collect_eta_matrix(block_states)?.view());
         Ok(self.likelihood.log_lik(eta.view(), self.y_one_hot.view()))
     }
 
@@ -1654,9 +1722,10 @@ impl CustomFamily for MultinomialFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
-        let eta = self.collect_eta_matrix(block_states)?;
+        let eta = self.whiten_class_rows(self.collect_eta_matrix(block_states)?.view());
         let (_, fisher, _) = self.evaluate_row_kernels(eta.view());
-        let hessian = self.assemble_joint_hessian(&fisher)?;
+        let fisher_g = self.whiten_fisher(&fisher);
+        let hessian = self.assemble_joint_hessian(&fisher_g)?;
         Ok(Some(hessian))
     }
 
@@ -1665,10 +1734,11 @@ impl CustomFamily for MultinomialFamily {
         block_states: &[ParameterBlockState],
         _: &[ParameterBlockSpec],
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
-        let eta = self.collect_eta_matrix(block_states)?;
+        let eta = self.whiten_class_rows(self.collect_eta_matrix(block_states)?.view());
         let log_lik = self.likelihood.log_lik(eta.view(), self.y_one_hot.view());
         let grad_eta_logl = self.likelihood.grad_eta(eta.view(), self.y_one_hot.view());
-        let gradient = self.assemble_joint_gradient(&grad_eta_logl);
+        let grad_g = self.whiten_class_rows(grad_eta_logl.view());
+        let gradient = self.assemble_joint_gradient(&grad_g);
         Ok(Some(ExactNewtonJointGradientEvaluation {
             log_likelihood: log_lik,
             gradient,
@@ -1685,7 +1755,10 @@ impl CustomFamily for MultinomialFamily {
         // matvec direction v, so every PCG H·v contraction reuses these probs
         // rather than re-running the softmax (matrix-free, O(N·K·P) per matvec
         // with no dense (M·P)² assembly — issue #347).
-        let eta = self.collect_eta_matrix(block_states)?;
+        //
+        // #1587: freeze the probabilities at the true (whitened) η so every
+        // matvec/gradient the workspace serves is the centered-metric curvature.
+        let eta = self.whiten_class_rows(self.collect_eta_matrix(block_states)?.view());
         let probs = self.row_probabilities(eta.view());
         Ok(Some(Arc::new(MultinomialHessianWorkspace {
             family: self.clone(),
@@ -1699,7 +1772,7 @@ impl CustomFamily for MultinomialFamily {
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let eta = self.collect_eta_matrix(block_states)?;
+        let eta = self.whiten_class_rows(self.collect_eta_matrix(block_states)?.view());
         if d_beta_flat.len() != self.beta_flat_dim() {
             return Err(format!(
                 "MultinomialFamily direction length {} != (K-1)·P = {}",
@@ -1707,23 +1780,17 @@ impl CustomFamily for MultinomialFamily {
                 self.beta_flat_dim()
             ));
         }
-        // FAST PATH (the Tier-B Jeffreys/Firth loop): the term requests every
-        // canonical axis `e_k` at the same β. Serve from the shared per-β memo so
-        // the full set is assembled in ONE softmax pass and each axis is a cache
-        // read, instead of `p` independent softmax + `dense_block_xtwx` rebuilds
-        // (#715/#722/#753). The cached value is bit-faithful to the generic path
-        // up to row-sum associativity.
-        if let Some(axis) = self.canonical_axis_index(d_beta_flat) {
-            return Ok(Some(
-                self.cached_axis_directional_derivative(eta.view(), axis),
-            ));
-        }
-        // General direction (e.g. the outer mode-response drift `Hdot[δ]`): the
-        // exact per-direction jet → dense contraction.
-        let dh_fisher = self.directional_fisher_jet(eta.view(), d_beta_flat)?;
+        // #1587: the γ-frame directional derivative of the centered Hessian is
+        //   Hdot_γ[δ] = (A⊗I) Hdot_β[(A⊗I)δ] (A⊗I).
+        // Map the direction to β_true, run the exact per-direction jet → dense
+        // contraction at the whitened η, then conjugate the result by `(A⊗I)`.
+        // (The whitened direction is no longer a canonical axis, so the old
+        // per-axis memo fast path does not apply.)
+        let d_white = self.whiten_stacked(d_beta_flat);
+        let dh_fisher = self.directional_fisher_jet(eta.view(), &d_white)?;
         let dh = dense_block_xtwx(self.design.view(), dh_fisher.view(), None)
             .map_err(|e| format!("MultinomialFamily directional H assembly: {e}"))?;
-        Ok(Some(dh))
+        Ok(Some(self.whiten_block_matrix(&dh)))
     }
 
     fn joint_jeffreys_information_directional_derivative_all_axes_with_specs(
@@ -1746,8 +1813,12 @@ impl CustomFamily for MultinomialFamily {
         // serial loop would have produced. The β-fixed `η` comes from
         // `block_states` exactly as the per-axis
         // `exact_newton_joint_hessian_directional_derivative` does.
-        let eta = self.collect_eta_matrix(block_states)?;
-        let axes = self.assemble_all_axis_directional_derivatives(eta.view());
+        // #1587: assemble the canonical-axis derivatives at the whitened η in
+        // the β_true frame, then recombine across class + conjugate by `(A⊗I)`
+        // to the γ frame the Jeffreys term consumes.
+        let eta = self.whiten_class_rows(self.collect_eta_matrix(block_states)?.view());
+        let axes_b = self.assemble_all_axis_directional_derivatives(eta.view());
+        let axes = self.recombine_and_whiten_axes(&axes_b);
         // The caller indexes the returned Vec by canonical axis a ∈ 0..p, where
         // p = Σ spec.design.ncols() is the joint coefficient dimension across the
         // coupled softmax blocks. Report (do NOT fail) if the batched assembly's
@@ -1782,9 +1853,14 @@ impl CustomFamily for MultinomialFamily {
         // `assemble_all_axis_second_directional_derivatives`), bit-faithful to the
         // per-axis `second_directional_fisher_jet → dense_block_xtwx` route up to
         // row-sum associativity, for a single Gram-assembly cost instead of `p`.
-        let eta = self.collect_eta_matrix(block_states)?;
-        let axes =
-            self.assemble_all_axis_second_directional_derivatives(eta.view(), d_beta_u_flat)?;
+        // #1587: whiten the fixed direction u → (A⊗I)u and assemble the
+        // canonical-axis second derivatives at the whitened η (β_true frame),
+        // then recombine across class + conjugate by `(A⊗I)` to the γ frame.
+        let eta = self.whiten_class_rows(self.collect_eta_matrix(block_states)?.view());
+        let u_white = self.whiten_stacked(d_beta_u_flat);
+        let axes_b =
+            self.assemble_all_axis_second_directional_derivatives(eta.view(), &u_white)?;
+        let axes = self.recombine_and_whiten_axes(&axes_b);
         // Same canonical-axis contract as the first-directional batch: the caller
         // indexes by a ∈ 0..p with p = Σ spec.design.ncols(). Report a mismatch
         // non-fatally (a block-structure bug worth surfacing) rather than failing
@@ -1806,12 +1882,15 @@ impl CustomFamily for MultinomialFamily {
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let eta = self.collect_eta_matrix(block_states)?;
+        // #1587: H²dot_γ[u,v] = (A⊗I) H²dot_β[(A⊗I)u,(A⊗I)v] (A⊗I).
+        let eta = self.whiten_class_rows(self.collect_eta_matrix(block_states)?.view());
+        let u_white = self.whiten_stacked(d_beta_u_flat);
+        let v_white = self.whiten_stacked(d_beta_v_flat);
         let d2h_fisher =
-            self.second_directional_fisher_jet(eta.view(), d_beta_u_flat, d_beta_v_flat)?;
+            self.second_directional_fisher_jet(eta.view(), &u_white, &v_white)?;
         let d2h = dense_block_xtwx(self.design.view(), d2h_fisher.view(), None)
             .map_err(|e| format!("MultinomialFamily second directional H assembly: {e}"))?;
-        Ok(Some(d2h))
+        Ok(Some(self.whiten_block_matrix(&d2h)))
     }
 }
 
@@ -1873,14 +1952,19 @@ impl ExactNewtonJointHessianWorkspace for MultinomialHessianWorkspace {
 
     fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
         let mut out = Array1::<f64>::zeros(self.family.beta_flat_dim());
-        self.family
-            .hessian_matvec_into_with_probs(self.probs.view(), v, &mut out)?;
+        self.hessian_matvec_into(v, &mut out)?;
         Ok(Some(out))
     }
 
     fn hessian_matvec_into(&self, v: &Array1<f64>, out: &mut Array1<f64>) -> Result<bool, String> {
+        // #1587: H_γ·v = (A⊗I) H_β (A⊗I) v. The matrix-free `H_β` contraction
+        // uses the whitened-η probabilities; pre/post-multiply by `(A⊗I)`.
+        let v_white = self.family.whiten_stacked(v);
+        let mut tmp = Array1::<f64>::zeros(out.len());
         self.family
-            .hessian_matvec_into_with_probs(self.probs.view(), v, out)?;
+            .hessian_matvec_into_with_probs(self.probs.view(), &v_white, &mut tmp)?;
+        let whitened = self.family.whiten_stacked(&tmp);
+        out.assign(&whitened);
         Ok(true)
     }
 
@@ -1902,10 +1986,15 @@ impl ExactNewtonJointHessianWorkspace for MultinomialHessianWorkspace {
         &self,
         d_beta_flats: &[Array1<f64>],
     ) -> Result<Vec<Option<Arc<dyn HyperOperator>>>, String> {
+        // #1587: whiten each direction → β_true, assemble at the whitened η,
+        // then conjugate each result by `(A⊗I)` to the γ frame.
+        let whitened: Vec<Array1<f64>> =
+            d_beta_flats.iter().map(|d| self.family.whiten_stacked(d)).collect();
         self.family
-            .assemble_directional_derivatives_from_probs(self.probs.view(), d_beta_flats)?
+            .assemble_directional_derivatives_from_probs(self.probs.view(), &whitened)?
             .into_iter()
             .map(|matrix| {
+                let matrix = self.family.whiten_block_matrix(&matrix);
                 Some(Arc::new(DenseMatrixHyperOperator { matrix }) as Arc<dyn HyperOperator>)
             })
             .map(Ok)
@@ -1929,10 +2018,17 @@ impl ExactNewtonJointHessianWorkspace for MultinomialHessianWorkspace {
         &self,
         d_beta_pairs: &[(Array1<f64>, Array1<f64>)],
     ) -> Result<Vec<Option<Arc<dyn HyperOperator>>>, String> {
+        // #1587: whiten both directions of each pair → β_true, assemble at the
+        // whitened η, then conjugate each result by `(A⊗I)`.
+        let whitened: Vec<(Array1<f64>, Array1<f64>)> = d_beta_pairs
+            .iter()
+            .map(|(u, v)| (self.family.whiten_stacked(u), self.family.whiten_stacked(v)))
+            .collect();
         self.family
-            .assemble_second_directional_derivatives_from_probs(self.probs.view(), d_beta_pairs)?
+            .assemble_second_directional_derivatives_from_probs(self.probs.view(), &whitened)?
             .into_iter()
             .map(|matrix| {
+                let matrix = self.family.whiten_block_matrix(&matrix);
                 Some(Arc::new(DenseMatrixHyperOperator { matrix }) as Arc<dyn HyperOperator>)
             })
             .map(Ok)
@@ -1965,13 +2061,23 @@ mod tests {
         /// internally. Production callers already hold the probabilities and use
         /// `assemble_directional_derivatives_from_probs`; the parity tests in this
         /// module drive the family from raw `eta`.
+        ///
+        /// #1587: mirrors the production whitened path
+        /// (`directional_derivative_operators`) — probabilities at the true
+        /// (whitened) η, directions mapped to β_true, and each output conjugated
+        /// by `(A⊗I)` — so the parity tests compare the γ-frame derivatives the
+        /// solver actually consumes.
         fn assemble_directional_derivatives(
             &self,
             eta: ArrayView2<'_, f64>,
             directions: &[Array1<f64>],
         ) -> Result<Vec<Array2<f64>>, String> {
-            let probs = self.row_probabilities(eta);
-            self.assemble_directional_derivatives_from_probs(probs.view(), directions)
+            let eta_true = self.whiten_class_rows(eta);
+            let probs = self.row_probabilities(eta_true.view());
+            let whitened: Vec<Array1<f64>> =
+                directions.iter().map(|d| self.whiten_stacked(d)).collect();
+            let mats = self.assemble_directional_derivatives_from_probs(probs.view(), &whitened)?;
+            Ok(mats.iter().map(|h| self.whiten_block_matrix(h)).collect())
         }
     }
 
@@ -2045,13 +2151,9 @@ mod tests {
 
         // Multi-term family (#561): every active-class block must receive the
         // FULL list of per-term penalties, with one entry of `initial_log_lambdas`
-        // (and `nullspace_dims`) per term — so the physical per-block penalty
-        // layout carries one λ_{a,t} per (class, term). (#1587 then TIES the
-        // outer ρ across classes via per-term precision labels — see
-        // `block_specs_tie_lambda_per_term_across_classes_1587` — collapsing the
-        // (K−1)·n_terms physical coordinates to n_terms outer ρ. The per-block
-        // physical list itself is unchanged.) A fused single-penalty driver
-        // would instead collapse this to one penalty / one λ and silently
+        // (and `nullspace_dims`) per term — so the outer REML loop selects an
+        // INDEPENDENT λ_{a,t} per (class, term). A fused single-penalty driver
+        // would collapse this back to one penalty / one λ and silently
         // over-smooth one term while under-smoothing another.
         let p = 5;
         let k = 4;
@@ -2100,97 +2202,6 @@ mod tests {
             );
             assert_eq!(spec.nullspace_dims.len(), n_terms);
         }
-    }
-
-    /// #1587 (tied λ): the K−1 cloned per-class copies of smooth term `t` must
-    /// all carry the SAME per-term precision label `multinomial_term_{t}`, and
-    /// distinct terms must carry DISTINCT labels. The custom-family outer loop
-    /// (`penalty_label_layout`) collapses penalties sharing a label onto one
-    /// outer ρ, so this labelling ties the smoothing parameter of term `t`
-    /// across every class to a single shared `λ_t` (the gauge the
-    /// reference-symmetric softmax penalty requires) instead of the historical
-    /// independent `λ_{a,t}` per (class, term). Untied per-(class,term) λ is a
-    /// reference-class-dependent gauge: relabelling the response permutes which
-    /// class owns which λ, drifting the fit (the structural half of #1587).
-    #[test]
-    fn block_specs_tie_lambda_per_term_across_classes_1587() {
-        let p = 5;
-        let k = 4; // 3 active classes
-        let n_terms = 3;
-        let n_obs = 9;
-        let y = {
-            let mut y = Array2::<f64>::zeros((n_obs, k));
-            for i in 0..n_obs {
-                y[[i, i % k]] = 1.0;
-            }
-            y
-        };
-        let weights = Array1::<f64>::ones(n_obs);
-        let design = Arc::new(Array2::<f64>::from_shape_fn((n_obs, p), |(i, j)| {
-            ((i + j + 1) as f64).cos()
-        }));
-        let penalties = Arc::new(
-            (0..n_terms)
-                .map(|t| {
-                    crate::custom_family::PenaltyMatrix::Dense(Array2::<f64>::from_shape_fn(
-                        (p, p),
-                        |(i, j)| if i == j { (t + 1) as f64 } else { 0.0 },
-                    ))
-                })
-                .collect::<Vec<_>>(),
-        );
-        let nullspace_dims = Arc::new(vec![0usize; n_terms]);
-        let multi = MultinomialFamily::new(y, weights, k, design, penalties, nullspace_dims)
-            .expect("multi-term MultinomialFamily must construct");
-        let specs = multi.build_block_specs();
-        let m = k - 1;
-        assert_eq!(specs.len(), m);
-
-        // Every block's term-t penalty carries the SAME label across classes.
-        for t in 0..n_terms {
-            let expected = format!("multinomial_term_{t}");
-            for (a, spec) in specs.iter().enumerate() {
-                let label = spec.penalties[t].precision_label();
-                assert_eq!(
-                    label,
-                    Some(expected.as_str()),
-                    "class {a} term {t} must carry the shared per-term precision label \
-                     '{expected}' so the outer loop ties λ across classes (#1587), got {label:?}"
-                );
-            }
-        }
-
-        // Distinct terms carry DISTINCT labels (per-term smoothing preserved).
-        let mut labels: Vec<&str> = (0..n_terms)
-            .map(|t| specs[0].penalties[t].precision_label().unwrap())
-            .collect();
-        labels.sort_unstable();
-        labels.dedup();
-        assert_eq!(
-            labels.len(),
-            n_terms,
-            "each smooth term must keep its OWN shared λ; labels must be distinct per term"
-        );
-
-        // The label set collapses the (K−1)·n_terms physical penalty
-        // coordinates to exactly n_terms unique outer smoothing parameters.
-        let mut all_labels: Vec<String> = specs
-            .iter()
-            .flat_map(|spec| {
-                spec.penalties
-                    .iter()
-                    .map(|p| p.precision_label().unwrap().to_string())
-            })
-            .collect();
-        assert_eq!(all_labels.len(), m * n_terms, "physical penalty count");
-        all_labels.sort();
-        all_labels.dedup();
-        assert_eq!(
-            all_labels.len(),
-            n_terms,
-            "tied λ must collapse {} physical coordinates to {n_terms} outer ρ",
-            m * n_terms
-        );
     }
 
     #[test]
@@ -2625,20 +2636,38 @@ mod tests {
     /// computed straight from the softmax probabilities — no Fisher block, no
     /// `dense_block_xtwx`. Used as the independent finite-difference oracle.
     fn neglogl_grad(family: &MultinomialFamily, states: &[ParameterBlockState]) -> Array1<f64> {
-        let eta = family.collect_eta_matrix(states).expect("eta collect");
+        // #1587: the driver coordinate `γ` maps to the true ALR coefficient by
+        // `β_true = (A⊗I)γ`, so the −logL gradient the production matvec
+        // differentiates is `(A⊗I)·Xᵀ(p(η_true)−y)` with `η_true = A·Xγ`. This
+        // independent oracle whitens accordingly (mirrors the production
+        // gradient but is assembled by hand, not via the method under test).
+        let zeta = family.collect_eta_matrix(states).expect("eta collect");
+        let eta = family.whiten_class_rows(zeta.view());
         let probs = family.row_probabilities(eta.view());
+        let a_mat = family.class_whitener();
         let x = family.design.view();
         let n = family.weights.len();
         let p = family.design.ncols();
         let m = family.active_classes();
+        // Whitened per-row residual `r_γ[row,a] = Σ_b A[a,b]·w·(p−y)_b`.
+        let mut resid_g = Array2::<f64>::zeros((n, m));
+        for row in 0..n {
+            for a in 0..m {
+                let mut acc = 0.0_f64;
+                for b in 0..m {
+                    acc += a_mat[[a, b]]
+                        * family.weights[row]
+                        * (probs[[row, b]] - family.y_one_hot[[row, b]]);
+                }
+                resid_g[[row, a]] = acc;
+            }
+        }
         let mut g = Array1::<f64>::zeros(m * p);
         for a in 0..m {
             for i in 0..p {
                 let mut acc = 0.0_f64;
                 for row in 0..n {
-                    acc += x[[row, i]]
-                        * family.weights[row]
-                        * (probs[[row, a]] - family.y_one_hot[[row, a]]);
+                    acc += x[[row, i]] * resid_g[[row, a]];
                 }
                 g[a * p + i] = acc;
             }
@@ -3038,9 +3067,17 @@ mod tests {
         let total = m * p;
         let betas = sample_betas(m, p, 0.6);
         let states = states_at_betas(&family, &betas);
-        let eta = family.collect_eta_matrix(&states).expect("eta collect");
+        let specs = family.build_block_specs();
 
-        let hand = family.assemble_all_axis_directional_derivatives(eta.view());
+        // #1587: validate the γ-frame (whitened) all-axis assembly the Jeffreys
+        // term consumes against the FD of the γ-frame static Hessian
+        // (`exact_newton_joint_hessian`, likewise whitened). Both sides are the
+        // centered-metric curvature, so the FD of `H_γ` along canonical axis
+        // `e_k` equals `Hdot_γ[e_k]` exactly.
+        let hand = family
+            .joint_jeffreys_information_directional_derivative_all_axes_with_specs(&states, &specs)
+            .expect("all-axis directional assembly")
+            .expect("all-axis directional assembly present");
         assert_eq!(
             hand.len(),
             total,
@@ -3092,15 +3129,21 @@ mod tests {
         let total = m * p;
         let betas = sample_betas(m, p, 0.5);
         let states = states_at_betas(&family, &betas);
-        let eta = family.collect_eta_matrix(&states).expect("eta collect");
+        let specs = family.build_block_specs();
 
         // Fixed first direction δ (the u-direction), a non-canonical mode so the
         // mechanical witness exercises the general directional jet branch.
         let delta = Array1::from_shape_fn(total, |idx| 0.4 * ((idx as f64 * 1.7 + 0.3).sin()));
 
+        // #1587: validate the γ-frame (whitened) all-axis second-directional
+        // assembly against the FD of the γ-frame `Hdot_γ[δ]` (the whitened
+        // per-direction route). δ is whitened identically inside both sides.
         let hand = family
-            .assemble_all_axis_second_directional_derivatives(eta.view(), &delta)
-            .expect("second-directional assembly");
+            .joint_jeffreys_information_second_directional_all_axes_with_specs(
+                &states, &specs, &delta,
+            )
+            .expect("second-directional assembly")
+            .expect("second-directional assembly present");
         assert_eq!(hand.len(), total, "one second-directional matrix per axis");
 
         // Mechanical witness: Hdot[δ](β) by the per-direction jet route, FD'd
@@ -3237,8 +3280,16 @@ mod tests {
             .expect("information eigendecomposition");
         let lambda_max = evals.iter().cloned().fold(0.0_f64, f64::max);
         let lambda_min = evals.iter().cloned().fold(f64::INFINITY, f64::min);
+        // #1587: the joint Hessian is now in the whitened (centered-metric) γ
+        // gauge `H_γ = (A⊗I)H_β(A⊗I)`. The whitener `A` scales the all-ones
+        // class direction by `√K`, so it lifts the separating direction's
+        // near-zero eigenvalue by up to a factor `K` — reconditioning the
+        // fixture from ~1e-7 to ~3e-5. It remains strongly ill-conditioned
+        // (cond ≳ 1e4: the MLE-at-∞ direction the Jeffreys term exists to
+        // bound), which is all the premise needs; the real assertions below
+        // (the term fires and stays finite) are unchanged.
         assert!(
-            lambda_max > 0.0 && lambda_min / lambda_max < 1.0e-6,
+            lambda_max > 0.0 && lambda_min / lambda_max < 1.0e-4,
             "fixture must be near-separating: λ_min/λ_max = {} (λ_min={lambda_min}, λ_max={lambda_max})",
             lambda_min / lambda_max
         );

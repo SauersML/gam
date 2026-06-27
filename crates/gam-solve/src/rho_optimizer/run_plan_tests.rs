@@ -74,11 +74,7 @@ fn rho_uncertainty_diagnostic_does_not_change_outer_solution() {
         .with_hessian(DeclaredHessianForm::Either)
         .with_initial_rho(array![1.5])
         .with_seed_config(seed_config)
-        .with_problem_size(8, 3)
-        // The PSIS rho-uncertainty diagnostic is opt-in (default off, #1575).
-        // This test proves the diagnostic, WHEN RUN, does not perturb the
-        // converged outer solution, so it must enable it explicitly.
-        .with_rho_uncertainty_diagnostic(true);
+        .with_problem_size(8, 3);
     let config = problem.config();
 
     let mut without_diagnostic = problem.build_objective(
@@ -3813,7 +3809,6 @@ fn effective_seed_budget_caps_expensive_solver_retries() {
             4,
             Solver::Efs,
             gam_problem::SeedRiskProfile::GeneralizedLinear,
-            false,
         ),
         1
     );
@@ -3822,7 +3817,6 @@ fn effective_seed_budget_caps_expensive_solver_retries() {
             4,
             Solver::HybridEfs,
             gam_problem::SeedRiskProfile::Survival,
-            false,
         ),
         1
     );
@@ -3831,7 +3825,6 @@ fn effective_seed_budget_caps_expensive_solver_retries() {
             3,
             Solver::Arc,
             gam_problem::SeedRiskProfile::GeneralizedLinear,
-            true,
         ),
         2
     );
@@ -3840,7 +3833,6 @@ fn effective_seed_budget_caps_expensive_solver_retries() {
             1,
             Solver::Arc,
             gam_problem::SeedRiskProfile::GeneralizedLinear,
-            true,
         ),
         2
     );
@@ -3849,7 +3841,6 @@ fn effective_seed_budget_caps_expensive_solver_retries() {
             3,
             Solver::Arc,
             gam_problem::SeedRiskProfile::Survival,
-            false,
         ),
         1
     );
@@ -3858,7 +3849,6 @@ fn effective_seed_budget_caps_expensive_solver_retries() {
             3,
             Solver::Bfgs,
             gam_problem::SeedRiskProfile::Survival,
-            false,
         ),
         3
     );

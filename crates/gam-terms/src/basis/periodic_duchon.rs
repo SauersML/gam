@@ -952,7 +952,6 @@ pub(crate) fn build_duchon_basis_mixed_periodicity(
     centers: Array2<f64>,
     periodic_per_axis: &[bool],
     periods: &[f64],
-    _workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
     let d = data.ncols();
     if d == 0 {
@@ -1217,14 +1216,7 @@ pub fn build_duchon_basis_mixed_periodicity_auto(
         periodic_spec.periodic = Some(vec![Some(resolved_periods[0])]);
         return build_periodic_duchon_basis_1d(data, &periodic_spec, centers, &mut workspace);
     }
-    build_duchon_basis_mixed_periodicity(
-        data,
-        spec,
-        centers,
-        periodic_per_axis,
-        &resolved_periods,
-        &mut workspace,
-    )
+    build_duchon_basis_mixed_periodicity(data, spec, centers, periodic_per_axis, &resolved_periods)
 }
 
 /// The magic *request-layer* default `(nullspace_order, power)` for a

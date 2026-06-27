@@ -114,22 +114,6 @@ pub(crate) struct OuterConfig {
     /// reach the same λ̂ and the same fitted surface. `None` (or an identity
     /// permutation) leaves the legacy native-order path byte-for-byte unchanged.
     pub(crate) rho_canonical_keys: Option<Vec<u64>>,
-    /// Opt-in for the post-fit PSIS smoothing-parameter heavy-tail diagnostic
-    /// (#1575). When `true`, [`compute_rho_uncertainty_diagnostic`] runs the
-    /// full importance-sampling probe — `sample_count + 1` exact profiled-
-    /// criterion evaluations (each a full n-sized inner P-IRLS solve) at
-    /// Laplace-proposal draws around θ̂. The diagnostic is a pure influence
-    /// flag (`k_hat`): it does not affect β, λ, the EDF, the covariance, or any
-    /// prediction, and its result is not consumed anywhere in the fit path.
-    /// Running it unconditionally made every fit pay ~33 surplus full-n solves
-    /// after the optimizer had already converged — the dominant share of the
-    /// binomial/Poisson REML "100× slower than mgcv" outer work (#1575), and a
-    /// cost mgcv never pays (it reports smoothing uncertainty analytically from
-    /// the Hessian already in hand). Defaulted `false`: the cheap, load-bearing
-    /// exact-Hessian-at-θ̂ stash for BFGS warm-start caching still runs; only the
-    /// unused importance-sampling loop is skipped. A caller that genuinely wants
-    /// the heavy-tail flag opts in explicitly.
-    pub(crate) rho_uncertainty_diagnostic_enabled: bool,
 }
 
 impl Default for OuterConfig {
@@ -159,7 +143,6 @@ impl Default for OuterConfig {
             warm_start_cache_hit: false,
             warm_start_outer_hessian: None,
             rho_canonical_keys: None,
-            rho_uncertainty_diagnostic_enabled: false,
         }
     }
 }
@@ -205,7 +188,6 @@ pub struct OuterProblem {
     rho_uncertainty_problem_size: crate::rho_uncertainty::RhoUncertaintyProblemSize,
     continuation_prewarm: bool,
     rho_canonical_keys: Option<Vec<u64>>,
-    rho_uncertainty_diagnostic_enabled: bool,
 }
 
 impl OuterProblem {
@@ -241,15 +223,7 @@ impl OuterProblem {
                 crate::rho_uncertainty::RhoUncertaintyProblemSize::default(),
             continuation_prewarm: true,
             rho_canonical_keys: None,
-            rho_uncertainty_diagnostic_enabled: false,
         }
-    }
-
-    /// Opt in to the post-fit PSIS smoothing-parameter heavy-tail diagnostic
-    /// (default off, #1575). See [`OuterConfig::rho_uncertainty_diagnostic_enabled`].
-    pub fn with_rho_uncertainty_diagnostic(mut self, enabled: bool) -> Self {
-        self.rho_uncertainty_diagnostic_enabled = enabled;
-        self
     }
 
     /// Supply per-ρ-coordinate structural keys (native/formula order) so the
@@ -522,7 +496,6 @@ impl OuterProblem {
             cache_session: self.cache_session.clone(),
             cache_mirror_sessions: self.cache_mirror_sessions.clone(),
             rho_uncertainty_problem_size: self.rho_uncertainty_problem_size,
-            rho_uncertainty_diagnostic_enabled: self.rho_uncertainty_diagnostic_enabled,
             // Cold by construction. The persistent-cache resume path in `run`
             // flips this to `true` only after a warm-start cache *hit* installs
             // a near-optimal seed; every other entry point keeps the cold-start
@@ -1307,25 +1280,6 @@ pub(crate) fn compute_rho_uncertainty_diagnostic(
     // exact-Newton / ARC paths (which DO populate `final_hessian`) are untouched.
     if result.final_hessian.is_none() && hessian.iter().all(|v| v.is_finite()) {
         result.final_hessian = Some(hessian.clone());
-    }
-    // The exact outer Hessian at θ̂ has now been materialized and stashed into
-    // `result.final_hessian` above (the cheap, load-bearing side effect that lets
-    // the persistent cache carry converged curvature for the next fit's BFGS
-    // warm-start). The PSIS importance-sampling probe below is a separate, purely
-    // informational heavy-tail diagnostic that costs `sample_count + 1` full-n
-    // criterion solves and whose `k_hat` result is not consumed anywhere in the
-    // fit path. Skip it unless explicitly opted in (#1575): running it on every
-    // fit added the dominant share of the post-convergence outer work behind the
-    // binomial/Poisson REML "100× slower than mgcv" report. Returning here (after
-    // the Hessian stash, before the proposal-draw bindings) keeps every probed
-    // binding confined to the opted-in path so no unused-variable warning trips
-    // the `deny(warnings)` gate.
-    if !config.rho_uncertainty_diagnostic_enabled {
-        return crate::rho_uncertainty::RhoUncertaintyDiagnostic::skipped(
-            "PSIS smoothing-parameter heavy-tail diagnostic is opt-in (default off, #1575); \
-             enable via OuterProblem::with_rho_uncertainty_diagnostic",
-            0,
-        );
     }
     let mut hessian_rho = Array2::<f64>::zeros((rho_dim, rho_dim));
     for row in 0..rho_dim {

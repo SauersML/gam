@@ -9,5 +9,6 @@ mod gaussian_sparse_xtwx_cache_correctness;
 mod gaussian_xtwx_cache_correctness;
 mod magic_family_auto_poisson_count;
 mod multinomial_edf_per_class_not_overcounted;
+mod multinomial_fit_reference_class_invariant_1587;
 mod multinomial_lambda_labels_match_lambda_blocks;
 mod multinomial_reml_deviance_reuse_issue_348;

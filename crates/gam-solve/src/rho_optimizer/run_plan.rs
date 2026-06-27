@@ -221,12 +221,10 @@ pub(crate) fn run_outer_with_plan(
         )));
     }
 
-    let screening_enabled = config.screening_cap.is_some();
     let seed_budget = effective_seed_budget(
         config.seed_config.seed_budget,
         the_plan.solver,
         config.seed_config.risk_profile,
-        screening_enabled,
     )
     .min(seeds.len());
     let explicit_initial_rho_owns_single_seed_budget = config.initial_rho.is_some()

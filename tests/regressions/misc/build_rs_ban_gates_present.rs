@@ -32,6 +32,10 @@ pub(crate) fn required_ban_gates() -> Vec<String> {
         format!("scan_for_{}{}", "owed_", "work_prose"),
         // Per-line discarded-binding scanner (comment-stripped line scan).
         format!("scan_for_{}", "let_underscore"),
+        // Function-parameter parser must skip `pub(crate)` / `pub(super)` /
+        // `pub(in ...)` visibility parens before checking parameter names.
+        format!("find_{}_param_open", "fn"),
+        format!("find_{}_param_open(&sig_text)", "fn"),
         // Fuzzy comment-block cue detector.
         format!("comment_block_has_{}{}", "defer", "ral_cue"),
         // Self-tampering guard: forbids disabling or neutering the gates.

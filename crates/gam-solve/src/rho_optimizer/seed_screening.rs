@@ -136,7 +136,6 @@ pub(crate) fn effective_seed_budget(
     requested_budget: usize,
     solver: Solver,
     risk_profile: gam_problem::SeedRiskProfile,
-    _screening_enabled: bool,
 ) -> usize {
     let requested_budget = requested_budget.max(1);
     match (solver, risk_profile) {

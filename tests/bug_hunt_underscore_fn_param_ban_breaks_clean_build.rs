@@ -297,3 +297,19 @@ fn reml_contract_cached_methods_have_no_underscore_params() {
     assert_fn_has_no_underscore_param("src/reml_contracts.rs", "trace_projected_factor_cached");
     assert_fn_has_no_underscore_param("src/reml_contracts.rs", "projected_matrix_cached");
 }
+
+#[test]
+fn mixed_periodicity_duchon_builder_has_no_underscore_param() {
+    assert_fn_has_no_underscore_param(
+        "crates/gam-terms/src/basis/periodic_duchon.rs",
+        "build_duchon_basis_mixed_periodicity",
+    );
+}
+
+#[test]
+fn effective_seed_budget_has_no_underscore_param() {
+    assert_fn_has_no_underscore_param(
+        "crates/gam-solve/src/rho_optimizer/seed_screening.rs",
+        "effective_seed_budget",
+    );
+}

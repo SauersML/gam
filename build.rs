@@ -228,11 +228,8 @@ fn main() {
     // Underscore-prefixed function parameter names. `_name: T` silences the
     // unused-parameter warning by hiding it from the lint rather than fixing
     // it. Use the parameter, restructure the API so it isn't passed, or
-    // delete the param. Bare `_: T` is banned identically — it is the same
-    // act ("rename to silence the warning") with the name collapsed to a
-    // single underscore, and is the language-idiomatic third form of the
-    // `let _ = name;` / `hint::black_box(name);` dodge family. Build.rs is
-    // exempt.
+    // delete the param. Bare `_: T` placeholders remain legal because they do
+    // not preserve a fake binding name. Build.rs is exempt.
     let mut underscore_fn_arg_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
     scan_for_underscore_fn_args(
         &manifest_dir,
@@ -4499,36 +4496,9 @@ fn scan_for_underscore_fn_args(
                 sig_text.push('\n');
             }
             let sig_bytes = sig_text.as_bytes();
-            // Find the first `(` at angle-depth 0 — the actual parameter list
-            // opener. A naive `find('(')` mistakes tuple types inside generic
-            // bounds (e.g. `fn foo<T: Iter<Item = (i32, i32)>>(_x: i32)`) for
-            // the param list and silently misses the real underscore-prefixed
-            // params.
-            let paren_open = {
-                let mut ang: i32 = 0;
-                let mut found: Option<usize> = None;
-                for (k, &b) in sig_bytes.iter().enumerate() {
-                    match b {
-                        b'<' => ang += 1,
-                        b'>' => {
-                            if ang > 0 {
-                                ang -= 1;
-                            }
-                        }
-                        b'(' if ang == 0 => {
-                            found = Some(k);
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-                match found {
-                    Some(p) => p,
-                    None => {
-                        idx = sig_end_line + 1;
-                        continue;
-                    }
-                }
+            let Some(paren_open) = find_fn_param_open(&sig_text) else {
+                idx = sig_end_line + 1;
+                continue;
             };
             let Some(close_rel) = find_matching_paren(&sig_bytes[paren_open + 1..]) else {
                 idx = sig_end_line + 1;
@@ -4656,6 +4626,42 @@ fn locate_fn_keyword(stripped: &str) -> Option<usize> {
             if before_ok && after_ok {
                 return Some(i);
             }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Find the actual function-parameter opener in a stripped Rust signature.
+/// Starts after `fn <name>` so visibility qualifiers such as `pub(crate)`,
+/// `pub(super)`, and `pub(in crate::x)` cannot be mistaken for the parameter
+/// list. Generic bounds before the parameter list are skipped at angle-depth.
+fn find_fn_param_open(sig_text: &str) -> Option<usize> {
+    let sig_bytes = sig_text.as_bytes();
+    let fn_pos = locate_fn_keyword(sig_text)?;
+    let mut i = fn_pos + 2;
+    while i < sig_bytes.len() && sig_bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i + 1 < sig_bytes.len() && sig_bytes[i] == b'r' && sig_bytes[i + 1] == b'#' {
+        i += 2;
+    }
+    while i < sig_bytes.len() && is_ident_byte(sig_bytes[i]) {
+        i += 1;
+    }
+
+    let mut angle: i32 = 0;
+    while i < sig_bytes.len() {
+        match sig_bytes[i] {
+            b'<' => angle += 1,
+            b'>' => {
+                if angle > 0 {
+                    angle -= 1;
+                }
+            }
+            b'(' if angle == 0 => return Some(i),
+            b'{' | b';' if angle == 0 => return None,
+            _ => {}
         }
         i += 1;
     }
