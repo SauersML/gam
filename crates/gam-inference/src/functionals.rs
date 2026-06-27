@@ -1,6 +1,6 @@
-use crate::faer_ndarray::FaerCholesky;
-use crate::model_types::EstimationError;
-use crate::solver::sensitivity::FitSensitivity;
+use gam_linalg::faer_ndarray::FaerCholesky;
+use gam_solve::model_types::EstimationError;
+use gam_solve::sensitivity::FitSensitivity;
 use faer::Side;
 use ndarray::{Array1, ArrayView1, ArrayView2};
 
@@ -56,7 +56,7 @@ pub fn average_derivative_gaussian_identity_with_sensitivity(
     validate_average_derivative_input(input)?;
     let p = input.beta.len();
     if sensitivity.dim() != p {
-        crate::bail_invalid_estim!(
+        gam_problem::bail_invalid_estim!(
             "average-derivative functional sensitivity dimension {} must equal beta length {p}",
             sensitivity.dim()
         );
@@ -73,7 +73,7 @@ pub fn average_derivative_gaussian_identity_with_sensitivity(
     let theta_plugin = a_theta.dot(&input.beta);
     let riesz = sensitivity.apply(&a_theta);
     if riesz.iter().any(|value| !value.is_finite()) {
-        crate::bail_invalid_estim!(
+        gam_problem::bail_invalid_estim!(
             "average-derivative functional H^-1 gradient solve produced non-finite values"
         );
     }
@@ -100,7 +100,7 @@ pub fn average_derivative_gaussian_identity_with_sensitivity(
         || !se.is_finite()
         || !penalty_bias.is_finite()
     {
-        crate::bail_invalid_estim!("average-derivative functional produced non-finite estimate");
+        gam_problem::bail_invalid_estim!("average-derivative functional produced non-finite estimate");
     }
 
     Ok(FunctionalEstimate {
@@ -122,33 +122,33 @@ fn validate_average_derivative_input(
     let n = input.design.nrows();
     let p = input.design.ncols();
     if n == 0 || p == 0 {
-        crate::bail_invalid_estim!(
+        gam_problem::bail_invalid_estim!(
             "average-derivative functional requires non-empty design, got {n}x{p}"
         );
     }
     if input.derivative_design.nrows() != n || input.derivative_design.ncols() != p {
-        crate::bail_invalid_estim!(
+        gam_problem::bail_invalid_estim!(
             "average-derivative derivative design shape {}x{} must match design {n}x{p}",
             input.derivative_design.nrows(),
             input.derivative_design.ncols()
         );
     }
     if input.y.len() != n || input.mu.len() != n {
-        crate::bail_invalid_estim!(
+        gam_problem::bail_invalid_estim!(
             "average-derivative y/mu lengths must equal design rows {n}, got y={} mu={}",
             input.y.len(),
             input.mu.len()
         );
     }
     if input.beta.len() != p || input.penalty_beta.len() != p {
-        crate::bail_invalid_estim!(
+        gam_problem::bail_invalid_estim!(
             "average-derivative beta/penalty_beta lengths must equal design columns {p}, got beta={} penalty_beta={}",
             input.beta.len(),
             input.penalty_beta.len()
         );
     }
     if input.penalty.nrows() != p || input.penalty.ncols() != p {
-        crate::bail_invalid_estim!(
+        gam_problem::bail_invalid_estim!(
             "average-derivative penalty matrix shape {}x{} must be square in design columns {p}",
             input.penalty.nrows(),
             input.penalty.ncols()
@@ -165,7 +165,7 @@ fn validate_average_derivative_input(
         || input.penalty.iter().any(|value| !value.is_finite())
         || input.penalty_beta.iter().any(|value| !value.is_finite())
     {
-        crate::bail_invalid_estim!(
+        gam_problem::bail_invalid_estim!(
             "average-derivative functional requires finite design, derivative design, response, fit, and penalty-gradient inputs"
         );
     }

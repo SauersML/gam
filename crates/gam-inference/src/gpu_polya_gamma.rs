@@ -227,12 +227,12 @@ impl XorwowState {
 //
 // The CPU oracle for parity tests has to *use the same RNG bytes as the
 // device kernel*, so it drives the shared Devroye core
-// (`crate::inference::polya_gamma_core`) through the bit-exact `XorwowState`
+// (`crate::polya_gamma_core`) through the bit-exact `XorwowState`
 // rather than through the production `rand::Rng` adapter. The math (Devroye
 // 1986; PSW 2013) is the single shared implementation — there is no second
 // copy of the tail mass / series / inverse-Gaussian helpers to drift.
 
-use crate::inference::polya_gamma_core::{PgRng, draw_pg1};
+use crate::polya_gamma_core::{PgRng, draw_pg1};
 use std::f64::consts::{FRAC_PI_2, PI};
 
 /// `XorwowState` is the randomness source for the bit-exact GPU oracle. Wiring
@@ -420,10 +420,10 @@ pub fn pg_saddlepoint_cpu_oracle(state: &mut XorwowState, b: u32, tilt: f64) -> 
 // ────────────────────────────────────────────────────────────────────────
 
 // The closed-form `PG(b, c)` moments live once on the inference side
-// (`crate::inference::pg_moments`) so the deterministic evidence path can use
+// (`crate::pg_moments`) so the deterministic evidence path can use
 // them without depending on this GPU module; re-export keeps the device oracle
 // and the host evidence code on a single source of truth.
-pub use crate::inference::pg_moments::{pg_mean, pg_variance};
+pub use crate::pg_moments::{pg_mean, pg_variance};
 
 /// Lyapunov-CLT closed-form draw for `b > NORMAL_MIN_B`. Truncated at
 /// zero because PG support is `(0, +∞)`.
@@ -647,7 +647,7 @@ mod linux_cuda {
     /// advance, and the unit/exp/normal draw helpers. The Devroye constants
     /// and the sampler body that follow are appended at compile time by
     /// [`ptx_source`], with the numeric constants rendered from the shared
-    /// Rust [`crate::inference::polya_gamma_core::constants`] so no device
+    /// Rust [`crate::polya_gamma_core::constants`] so no device
     /// literal is hand-typed.
     ///
     /// All arithmetic is in `double`; the device transcendentals (`exp`,
@@ -969,7 +969,7 @@ extern "C" __global__ void normal_kernel(
     /// Assemble the full NVRTC source: the prelude, then the Devroye `#define`
     /// constants rendered from the shared Rust core, then the sampler body and
     /// kernels. Rendering the `#define` block from
-    /// [`crate::inference::polya_gamma_core::render_cuda_constants`] is what
+    /// [`crate::polya_gamma_core::render_cuda_constants`] is what
     /// parity-locks every device constant to its host value (issue #414) — the
     /// kernel and the CPU oracle cannot disagree on a numeric literal because
     /// there is exactly one source for those literals.
@@ -979,7 +979,7 @@ extern "C" __global__ void normal_kernel(
         src.push_str(
             "\n// ── Devroye PG(1, c) constants (rendered from Rust core) ──────────────\n",
         );
-        src.push_str(&crate::inference::polya_gamma_core::render_cuda_constants());
+        src.push_str(&crate::polya_gamma_core::render_cuda_constants());
         src.push_str(PTX_SOURCE_BODY);
         src
     }
@@ -1472,7 +1472,7 @@ mod tests {
         // distribution (both implement Devroye with the corrected right-tail
         // coefficient). 5 000 samples each at three tilts; KS critical value
         // at α = 0.01.
-        use crate::inference::polya_gamma::PolyaGamma;
+        use crate::polya_gamma::PolyaGamma;
         use rand::{SeedableRng, rngs::StdRng};
         let pg = PolyaGamma::new();
         for &c in &[0.0_f64, 1.5, 4.0] {
@@ -1818,7 +1818,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn cuda_source_uses_rendered_constants_only() {
-        let rendered = crate::inference::polya_gamma_core::render_cuda_constants();
+        let rendered = crate::polya_gamma_core::render_cuda_constants();
         let assembled = linux_cuda::ptx_source();
         assert!(
             assembled.contains(rendered.trim_end()),

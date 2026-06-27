@@ -24,21 +24,21 @@
 //! sharing across chains without duplication when general-mcmc clones the target.
 
 use faer::Side;
-use gam::construction::CanonicalPenalty;
-use gam::estimate::reml::FirthDenseOperator;
-use gam::estimate::reml::penalty_logdet::PenaltyPseudologdet;
-use gam::estimate::{
+use gam_terms::construction::CanonicalPenalty;
+use gam_solve::estimate::reml::FirthDenseOperator;
+use gam_solve::estimate::reml::penalty_logdet::PenaltyPseudologdet;
+use gam_solve::estimate::{
     EstimationError, UnifiedFitResult, validate_explicit_dense_hessian_for_whitening,
 };
-use gam::faer_ndarray::{FaerCholesky, FaerEigh, fast_ata_into, fast_atv, fast_av_into};
-use gam::families::wiggle::monotone_wiggle_basis_with_derivative_order;
-use gam::inference::gpu_polya_gamma::{PgSeed, PolyaGammaBatchInput};
-use gam::linalg::triangular::back_substitution_lower_transpose_guarded_into;
-use gam::matrix::DesignMatrix;
-use gam::solver::mixture_link::{
+use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh, fast_ata_into, fast_atv, fast_av_into};
+use gam_models::wiggle::monotone_wiggle_basis_with_derivative_order;
+use crate::gpu_polya_gamma::{PgSeed, PolyaGammaBatchInput};
+use gam_linalg::triangular::back_substitution_lower_transpose_guarded_into;
+use gam_linalg::matrix::DesignMatrix;
+use gam_solve::mixture_link::{
     InverseLinkKernel, LinkParamPartials, inverse_link_jet_for_inverse_link, softmax_last_fixedzero,
 };
-use gam::types::{
+use gam_problem::types::{
     InverseLink, LikelihoodSpec, ResponseFamily, RhoPrior, StandardLink, is_valid_tweedie_power,
 };
 use general_mcmc::generic_hmc::HamiltonianTarget;
@@ -449,7 +449,7 @@ struct SharedData {
     /// even though `φ ≠ 1`, because Gamma's dispersion already lives inside the
     /// working weight (the `shape` factor in `gamma_log_logp_and_grad`). See
     /// `inference::dispersion_cov` for the ownership invariants.
-    dispersion: gam::model_types::Dispersion,
+    dispersion: gam_solve::model_types::Dispersion,
     /// Number of samples
     n_samples: usize,
     /// Number of coefficients
@@ -521,7 +521,7 @@ impl NutsFamily {
 
     /// Coefficient-covariance scale for the whitened NUTS target — the
     /// NUTS-family counterpart of
-    /// [`gam::types::GlmLikelihoodSpec::coefficient_covariance_scale`] (#679).
+    /// [`gam_problem::types::GlmLikelihoodSpec::coefficient_covariance_scale`] (#679).
     ///
     /// The sampler must reproduce the posterior `N(mode, Vb)` with
     /// `Vb = scale · H⁻¹`, where `H = XᵀWX + S_λ` is the stored penalized
@@ -625,7 +625,7 @@ impl NutsPosterior {
         hessian: ArrayView2<f64>,
         nuts_family: NutsFamily,
         gamma_shape: f64,
-        dispersion: gam::model_types::Dispersion,
+        dispersion: gam_solve::model_types::Dispersion,
         firth_enabled: bool,
     ) -> Result<Self, String> {
         let n_samples = x.nrows();
@@ -761,7 +761,7 @@ impl NutsPosterior {
         let beta = self.data.mode.as_ref() + &self.chol.dot(z);
 
         // === Step 2: Compute η = X @ β (+ offset) ===
-        let mut eta = gam::faer_ndarray::fast_av(self.data.x.as_ref(), &beta);
+        let mut eta = gam_linalg::faer_ndarray::fast_av(self.data.x.as_ref(), &beta);
         if let Some(offset) = self.data.offset.as_ref() {
             eta += offset.as_ref();
         }
@@ -1321,9 +1321,9 @@ fn logit_logp_and_grad_into(
             let eta_i = eta[i];
             let y_i = data.y[i];
             let w_i = data.weights[i];
-            let mu = gam::linalg::utils::stable_logistic(eta_i);
+            let mu = gam_linalg::utils::stable_logistic(eta_i);
             *slot = w_i * (y_i - mu);
-            w_i * (y_i * eta_i - gam::linalg::utils::stable_softplus(eta_i))
+            w_i * (y_i * eta_i - gam_linalg::utils::stable_softplus(eta_i))
         })
         .sum();
 
@@ -1382,12 +1382,12 @@ fn probit_logp_and_grad_into(
 #[inline]
 fn cloglog_bernoulli_logp_and_residual(eta: f64, y: f64) -> Result<(f64, f64), EstimationError> {
     if !(eta.is_finite() && (-700.0..=700.0).contains(&eta)) {
-        gam::bail_invalid_estim!("cloglog eta must be finite and within [-700, 700]; got {eta}");
+        gam_problem::bail_invalid_estim!("cloglog eta must be finite and within [-700, 700]; got {eta}");
     }
     let exp_eta = eta.exp();
     // log_mu = log(1 - exp(-exp_eta)); exp_eta > 0 on the guarded domain, so this is
     // exactly the canonical cancellation-free log1mexp (single source of truth).
-    let log_mu = gam::inference::probability::log1mexp_positive(exp_eta);
+    let log_mu = crate::probability::log1mexp_positive(exp_eta);
     let log_one_minus_mu = -exp_eta;
     let grad_log_mu = (eta - exp_eta - log_mu).exp();
     let ll_i = y * log_mu + (1.0 - y) * log_one_minus_mu;
@@ -1653,14 +1653,14 @@ mod tests {
         run_joint_beta_rho_sampling, run_logit_polya_gamma_gibbs,
         run_nuts_sampling_flattened_family,
     };
-    use gam::construction::CanonicalPenalty;
-    use gam::estimate::{
+    use gam_terms::construction::CanonicalPenalty;
+    use gam_solve::estimate::{
         BlockRole, FitGeometry, FitInference, FittedBlock, FittedLinkState, UnifiedFitResult,
         UnifiedFitResultParts,
     };
-    use gam::families::survival::{PenaltyBlocks, SurvivalMonotonicityPenalty, SurvivalSpec};
-    use gam::matrix::DesignMatrix;
-    use gam::types::{
+    use gam_models::survival::{PenaltyBlocks, SurvivalMonotonicityPenalty, SurvivalSpec};
+    use gam_linalg::matrix::DesignMatrix;
+    use gam_problem::types::{
         InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, LogLikelihoodNormalization,
         ResponseFamily, RhoPrior, StandardLink,
     };
@@ -1733,7 +1733,7 @@ mod tests {
             fitted_link: FittedLinkState::Standard(None),
             geometry,
             block_states: Vec::new(),
-            pirls_status: gam::pirls::PirlsStatus::Converged,
+            pirls_status: gam_solve::pirls::PirlsStatus::Converged,
             max_abs_eta: 0.0,
             constraint_kkt: None,
             artifacts: Default::default(),
@@ -1761,7 +1761,7 @@ mod tests {
                 working_weights: array![1.0, 1.0, 1.0],
                 working_response: array![0.0, 0.1, -0.2],
                 reparam_qs: None,
-                dispersion: gam::estimate::Dispersion::Known(1.0),
+                dispersion: gam_solve::estimate::Dispersion::Known(1.0),
                 beta_covariance: None,
                 beta_standard_errors: None,
                 beta_covariance_corrected: None,
@@ -1791,7 +1791,7 @@ mod tests {
             explicit.view(),
             NutsFamily::Gaussian,
             1.0,
-            gam::estimate::Dispersion::Known(1.0),
+            gam_solve::estimate::Dispersion::Known(1.0),
             false,
         )
         .expect("HMC target whitens with upstream Hessian");
@@ -1861,7 +1861,7 @@ mod tests {
             fitted_link: FittedLinkState::Standard(None),
             geometry: None,
             block_states: Vec::new(),
-            pirls_status: gam::pirls::PirlsStatus::Converged,
+            pirls_status: gam_solve::pirls::PirlsStatus::Converged,
             max_abs_eta: 0.0,
             constraint_kkt: None,
             artifacts: Default::default(),
@@ -1879,15 +1879,15 @@ mod tests {
 
     #[test]
     fn log1pexp_is_finite_for_extreme_eta() {
-        assert!(gam::linalg::utils::stable_softplus(1000.0).is_finite());
-        assert!(gam::linalg::utils::stable_softplus(-1000.0).is_finite());
-        assert!((gam::linalg::utils::stable_softplus(-1000.0) - 0.0).abs() < 1e-12);
+        assert!(gam_linalg::utils::stable_softplus(1000.0).is_finite());
+        assert!(gam_linalg::utils::stable_softplus(-1000.0).is_finite());
+        assert!((gam_linalg::utils::stable_softplus(-1000.0) - 0.0).abs() < 1e-12);
     }
 
     #[test]
     fn sigmoid_stable_behaves_at_extremes() {
-        let hi = gam::linalg::utils::stable_logistic(1000.0);
-        let lo = gam::linalg::utils::stable_logistic(-1000.0);
+        let hi = gam_linalg::utils::stable_logistic(1000.0);
+        let lo = gam_linalg::utils::stable_logistic(-1000.0);
         assert!((1.0 - 1e-12..=1.0).contains(&hi));
         assert!((0.0..=1e-12).contains(&lo));
     }
@@ -2028,7 +2028,7 @@ mod tests {
             hessian.view(),
             NutsFamily::BinomialLogit,
             1.0,
-            gam::estimate::Dispersion::Known(1.0),
+            gam_solve::estimate::Dispersion::Known(1.0),
             true,
         )
         .expect("posterior");
@@ -2077,7 +2077,7 @@ mod tests {
             mode: Arc::new(Array1::zeros(1)),
             offset: None,
             gamma_shape: shape,
-            dispersion: gam::estimate::Dispersion::Known(1.0),
+            dispersion: gam_solve::estimate::Dispersion::Known(1.0),
             n_samples: x.nrows(),
             dim: x.ncols(),
         };
@@ -2161,7 +2161,7 @@ mod tests {
             hessian.view(),
             NutsFamily::GammaLog,
             shape,
-            gam::estimate::Dispersion::Estimated(1.0 / shape),
+            gam_solve::estimate::Dispersion::Estimated(1.0 / shape),
             false,
         )
         .expect("GammaLog NUTS target builds");
@@ -2228,7 +2228,7 @@ mod tests {
             hessian.view(),
             NutsFamily::GammaLog,
             shape,
-            gam::estimate::Dispersion::Estimated(1.0 / shape),
+            gam_solve::estimate::Dispersion::Estimated(1.0 / shape),
             false,
         )
         .expect("GammaLog NUTS target builds");
@@ -2269,7 +2269,7 @@ mod tests {
             mode: Arc::new(Array1::zeros(x.ncols())),
             offset: None,
             gamma_shape: 1.0,
-            dispersion: gam::estimate::Dispersion::Known(1.0),
+            dispersion: gam_solve::estimate::Dispersion::Known(1.0),
             n_samples: x.nrows(),
             dim: x.ncols(),
         };
@@ -2338,7 +2338,7 @@ mod tests {
                 mode: mode.view(),
                 hessian: non_spd_hessian.view(),
                 gamma_shape: None,
-                dispersion: gam::model_types::Dispersion::Known(1.0),
+                dispersion: gam_solve::model_types::Dispersion::Known(1.0),
                 firth_bias_reduction: false,
                 offset: None,
             }),
@@ -2380,7 +2380,7 @@ mod tests {
                 mode: mode.view(),
                 hessian: non_spdhessian.view(),
                 gamma_shape: None,
-                dispersion: gam::estimate::Dispersion::Known(1.0),
+                dispersion: gam_solve::estimate::Dispersion::Known(1.0),
                 firth_bias_reduction: false,
                 offset: None,
             }),
@@ -2420,7 +2420,7 @@ mod tests {
                 mode: mode.view(),
                 hessian: non_spdhessian.view(),
                 gamma_shape: None,
-                dispersion: gam::estimate::Dispersion::Known(1.0),
+                dispersion: gam_solve::estimate::Dispersion::Known(1.0),
                 firth_bias_reduction: false,
                 offset: None,
             }),
@@ -2465,7 +2465,7 @@ mod tests {
                 mode: mode.view(),
                 hessian: hessian.view(),
                 gamma_shape: None,
-                dispersion: gam::estimate::Dispersion::Known(1.0),
+                dispersion: gam_solve::estimate::Dispersion::Known(1.0),
                 firth_bias_reduction: true,
                 offset: None,
             }),
@@ -2508,7 +2508,7 @@ mod tests {
             hessian.view(),
             NutsFamily::Gaussian,
             1.0,
-            gam::estimate::Dispersion::Known(1.0),
+            gam_solve::estimate::Dispersion::Known(1.0),
             false,
             None,
             &cfg,
@@ -2554,7 +2554,7 @@ mod tests {
                 hessian.view(),
                 NutsFamily::Gaussian,
                 1.0,
-                gam::estimate::Dispersion::Known(1.0),
+                gam_solve::estimate::Dispersion::Known(1.0),
                 false,
                 None,
                 &cfg,
@@ -2687,7 +2687,7 @@ mod tests {
             hessian.view(),
             NutsFamily::Gaussian,
             1.0,
-            gam::estimate::Dispersion::Known(1.0),
+            gam_solve::estimate::Dispersion::Known(1.0),
             false,
             None,
             &zero_chain_cfg,
@@ -2714,7 +2714,7 @@ mod tests {
             hessian.view(),
             NutsFamily::Gaussian,
             1.0,
-            gam::estimate::Dispersion::Known(1.0),
+            gam_solve::estimate::Dispersion::Known(1.0),
             false,
             None,
             &single_chain_cfg,
@@ -2892,7 +2892,7 @@ mod tests {
         let y = array![1.0, 0.0];
         let weights = array![1.0, 1.0];
         let eta = array![0.3, -0.2];
-        let sas_state = gam::mixture_link::state_from_sasspec(gam::types::SasLinkSpec {
+        let sas_state = gam_solve::mixture_link::state_from_sasspec(gam_problem::types::SasLinkSpec {
             initial_epsilon: 0.4,
             initial_log_delta: -0.2,
         })
@@ -2904,7 +2904,7 @@ mod tests {
             mode: Arc::new(Array1::zeros(1)),
             offset: None,
             gamma_shape: 1.0,
-            dispersion: gam::estimate::Dispersion::Known(1.0),
+            dispersion: gam_solve::estimate::Dispersion::Known(1.0),
             n_samples: 2,
             dim: 1,
         };
@@ -2946,14 +2946,14 @@ mod tests {
 
         let (base_max, base_vals) = laplace_directional_cubic_diagnostic(
             &h,
-            &DesignMatrix::Dense(gam::matrix::DenseDesignMatrix::from(x)),
+            &DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x)),
             &c,
             true,
         )
         .expect("base diagnostic");
         let (rot_max, rot_vals) = laplace_directional_cubic_diagnostic(
             &h_rot,
-            &DesignMatrix::Dense(gam::matrix::DenseDesignMatrix::from(x_rot)),
+            &DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x_rot)),
             &c,
             true,
         )
@@ -2981,7 +2981,7 @@ mod tests {
     /// between the two code paths.
     #[test]
     fn joint_hmc_penalty_logdet_agrees_with_reml_path() {
-        use gam::estimate::reml::penalty_logdet::PenaltyPseudologdet;
+        use gam_solve::estimate::reml::penalty_logdet::PenaltyPseudologdet;
 
         // Two overlapping 3x3 penalties with non-trivial lambdas.
         let root_1 = array![[1.0, 0.5, 0.0], [0.0, 0.8, 0.3]];
@@ -3072,7 +3072,7 @@ mod tests {
             mode: Arc::new(Array1::zeros(1)),
             offset: None,
             gamma_shape: 1.0,
-            dispersion: gam::estimate::Dispersion::Known(1.0),
+            dispersion: gam_solve::estimate::Dispersion::Known(1.0),
             n_samples: 2,
             dim: 1,
         };
@@ -3117,7 +3117,7 @@ mod tests {
 
         // SAS/BetaLogistic/Mixture must succeed with their real link state,
         // NOT be remapped to logit.
-        let sas_state = gam::mixture_link::state_from_sasspec(gam::types::SasLinkSpec {
+        let sas_state = gam_solve::mixture_link::state_from_sasspec(gam_problem::types::SasLinkSpec {
             initial_epsilon: 0.0,
             initial_log_delta: 0.0,
         })
@@ -3130,7 +3130,7 @@ mod tests {
             LikelihoodSpec {
                 response: ResponseFamily::Binomial,
                 link: InverseLink::BetaLogistic(
-                    gam::mixture_link::state_from_sasspec(gam::types::SasLinkSpec {
+                    gam_solve::mixture_link::state_from_sasspec(gam_problem::types::SasLinkSpec {
                         initial_epsilon: 0.0,
                         initial_log_delta: 0.0,
                     })
@@ -3181,7 +3181,7 @@ mod tests {
 
         let (max_val, eigenvector_vals) = laplace_directional_cubic_diagnostic(
             &h,
-            &DesignMatrix::Dense(gam::matrix::DenseDesignMatrix::from(x)),
+            &DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x)),
             &c,
             true,
         )
@@ -3351,7 +3351,7 @@ mod tests {
     impl MatvecBlock {
         fn s_of(&self, t: &Array1<f64>) -> Array1<f64> {
             let delta = self.v_b.dot(t);
-            gam::faer_ndarray::fast_av(&self.x, &delta)
+            gam_linalg::faer_ndarray::fast_av(&self.x, &delta)
         }
         // A smooth, finite, family-like excess + per-row score built from `s`.
         fn excess_and_ngs(&self, s: &Array1<f64>) -> (f64, Array1<f64>) {
@@ -3403,8 +3403,8 @@ mod tests {
                 return out;
             }
             // Batched: Δ = V_b·T then S = X·Δ as two GEMMs, then per-column.
-            let delta_all = gam::faer_ndarray::fast_ab(&self.v_b, draws);
-            let s_all = gam::faer_ndarray::fast_ab(&self.x, &delta_all);
+            let delta_all = gam_linalg::faer_ndarray::fast_ab(&self.v_b, draws);
+            let s_all = gam_linalg::faer_ndarray::fast_ab(&self.x, &delta_all);
             (0..draws.ncols())
                 .map(|c| {
                     let (e, ngs) = self.excess_and_ngs(&s_all.column(c).to_owned());
@@ -4023,7 +4023,7 @@ pub(crate) fn validate_nuts_config(config: &NutsConfig) -> Result<(), HmcError> 
 
 #[inline]
 fn splitmix64(x: u64) -> u64 {
-    gam::linalg::utils::splitmix64_hash(x)
+    gam_linalg::utils::splitmix64_hash(x)
 }
 
 #[inline]
@@ -4057,7 +4057,7 @@ fn draw_logit_pg1_omega(
         }
         .into());
     }
-    let draws = gam::inference::gpu_polya_gamma::draw_batch(PolyaGammaBatchInput {
+    let draws = crate::gpu_polya_gamma::draw_batch(PolyaGammaBatchInput {
         shapes,
         tilts,
         seed: PgSeed(seed),
@@ -4490,7 +4490,7 @@ pub fn run_logit_polya_gamma_gibbs(
         }
 
         for iter in 0..n_iter {
-            eta.assign(&gam::faer_ndarray::fast_av(&x, &beta));
+            eta.assign(&gam_linalg::faer_ndarray::fast_av(&x, &beta));
             draw_logit_pg1_omega(
                 pg_shapes.view(),
                 eta.view(),
@@ -4652,7 +4652,7 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
         }
 
         for iter in 0..n_iter {
-            eta.assign(&gam::faer_ndarray::fast_av(&x, &beta));
+            eta.assign(&gam_linalg::faer_ndarray::fast_av(&x, &beta));
             draw_logit_pg1_omega(
                 pg_shapes.view(),
                 eta.view(),
@@ -4757,7 +4757,7 @@ pub(crate) fn run_nuts_sampling(
     hessian: ArrayView2<f64>,
     nuts_family: NutsFamily,
     gamma_shape: f64,
-    dispersion: gam::model_types::Dispersion,
+    dispersion: gam_solve::model_types::Dispersion,
     firth_bias_reduction: bool,
     offset: Option<ArrayView1<f64>>,
     config: &NutsConfig,
@@ -5137,7 +5137,7 @@ pub struct GlmFlatInputs<'a> {
     /// for Gaussian / Gamma it carries the estimated `phi` so that the
     /// sampler targets the φ-scaled posterior covariance `Vb = φ·H⁻¹`.
     /// See `inference::dispersion_cov` for the ownership invariants.
-    pub dispersion: gam::model_types::Dispersion,
+    pub dispersion: gam_solve::model_types::Dispersion,
     pub firth_bias_reduction: bool,
     /// Fixed additive offset on the linear predictor (η = Xβ + offset), or
     /// `None` for an offset-free fit. Carried so posterior sampling targets the
@@ -5164,9 +5164,9 @@ pub struct SurvivalFlatInputs<'a> {
 /// Flattened numeric inputs for Royston-Parmar NUTS sampling.
 pub struct SurvivalNutsInputs<'a> {
     pub flat: SurvivalFlatInputs<'a>,
-    pub penalties: gam::families::survival::PenaltyBlocks,
-    pub monotonicity: gam::families::survival::SurvivalMonotonicityPenalty,
-    pub spec: gam::families::survival::SurvivalSpec,
+    pub penalties: gam_models::survival::PenaltyBlocks,
+    pub monotonicity: gam_models::survival::SurvivalMonotonicityPenalty,
+    pub spec: gam_models::survival::SurvivalSpec,
     pub structurally_monotonic: bool,
     pub structural_time_columns: usize,
     pub mode: ArrayView1<'a, f64>,
@@ -5661,7 +5661,7 @@ impl LinkWigglePosterior {
         }
         (
             basis.clone(),
-            u + &gam::faer_ndarray::fast_av(&basis, theta),
+            u + &gam_linalg::faer_ndarray::fast_av(&basis, theta),
         )
     }
 
@@ -5685,7 +5685,7 @@ impl LinkWigglePosterior {
         if b_prime_constrained.ncols() != theta.len() {
             return g;
         }
-        let dwiggle_dz = gam::faer_ndarray::fast_av(&b_prime_constrained, theta);
+        let dwiggle_dz = gam_linalg::faer_ndarray::fast_av(&b_prime_constrained, theta);
         ndarray::Zip::from(&mut g)
             .and(&dwiggle_dz)
             .par_for_each(|gi, &dw| *gi = 1.0 + dw / rw);
@@ -5706,7 +5706,7 @@ impl LinkWigglePosterior {
         let theta = q.slice(ndarray::s![self.p_base..]).to_owned();
 
         // Compute η = q₀ + B(q₀)·θ where q₀ = X·β
-        let u = gam::faer_ndarray::fast_av(self.x.as_ref(), &beta);
+        let u = gam_linalg::faer_ndarray::fast_av(self.x.as_ref(), &beta);
         let (bwiggle, eta) = self.evaluate_link(&u, &theta);
 
         // Log-likelihood and residuals via family dispatch
@@ -5729,8 +5729,8 @@ impl LinkWigglePosterior {
                 for i in 0..self.n_samples {
                     let eta_i = eta[i];
                     let (y_i, w_i) = (self.y[i], self.weights[i]);
-                    ll_acc += w_i * (y_i * eta_i - gam::linalg::utils::stable_softplus(eta_i));
-                    let mu = gam::linalg::utils::stable_logistic(eta_i);
+                    ll_acc += w_i * (y_i * eta_i - gam_linalg::utils::stable_softplus(eta_i));
+                    let mu = gam_linalg::utils::stable_logistic(eta_i);
                     residual[i] = w_i * (y_i - mu);
                 }
                 ll = ll_acc;
@@ -6694,7 +6694,7 @@ struct JointBetaRhoPosterior {
     /// LAML-converged adaptive inverse-link parameters (used only to initialize chains)
     link_param_mode: Array1<f64>,
     /// Canonical penalties in the transformed basis.
-    penalty_canonical: Vec<gam::construction::CanonicalPenalty>,
+    penalty_canonical: Vec<gam_terms::construction::CanonicalPenalty>,
     /// Fixed prior on rho used by the sampled target.
     rho_prior: RhoPrior,
     /// LAML-converged ρ (used only to initialize chains)
@@ -6719,7 +6719,7 @@ impl JointBetaRhoPosterior {
         weights: ArrayView1<f64>,
         mode: ArrayView1<f64>,
         hessian: ArrayView2<f64>,
-        penalty_canonical: Vec<gam::construction::CanonicalPenalty>,
+        penalty_canonical: Vec<gam_terms::construction::CanonicalPenalty>,
         rho_mode: ArrayView1<f64>,
         likelihood: LikelihoodSpec,
         gamma_shape: Option<f64>,
@@ -6828,7 +6828,7 @@ impl JointBetaRhoPosterior {
             // dispersion enters via the per-family scale parameter, not
             // via the whitening transform here. `Known(1.0)` matches the
             // pre-refactor behaviour for this code path.
-            dispersion: gam::model_types::Dispersion::Known(1.0),
+            dispersion: gam_solve::model_types::Dispersion::Known(1.0),
             n_samples,
             dim: n_beta,
         };
@@ -6889,7 +6889,7 @@ impl JointBetaRhoPosterior {
                     ));
                 }
                 Ok(InverseLink::Sas(
-                    gam::solver::mixture_link::sas_link_state_from_raw(
+                    gam_solve::mixture_link::sas_link_state_from_raw(
                         link_params[0],
                         link_params[1],
                     )?,
@@ -6901,7 +6901,7 @@ impl JointBetaRhoPosterior {
                         "Beta-Logistic link parameters must be finite with length 2".to_string()
                     );
                 }
-                Ok(InverseLink::BetaLogistic(gam::types::SasLinkState {
+                Ok(InverseLink::BetaLogistic(gam_problem::types::SasLinkState {
                     epsilon: link_params[0],
                     log_delta: link_params[1],
                     delta: link_params[1].exp(),
@@ -6909,7 +6909,7 @@ impl JointBetaRhoPosterior {
             }
             InverseLink::Mixture(state) => {
                 let rho = link_params.to_owned();
-                Ok(InverseLink::Mixture(gam::types::MixtureLinkState {
+                Ok(InverseLink::Mixture(gam_problem::types::MixtureLinkState {
                     components: state.components.clone(),
                     pi: softmax_last_fixedzero(&rho),
                     rho,
@@ -6965,7 +6965,7 @@ impl JointBetaRhoPosterior {
         let beta = self.data.mode.as_ref() + &self.chol.dot(&z);
 
         // η = X β
-        let eta = gam::faer_ndarray::fast_av(self.data.x.as_ref(), &beta);
+        let eta = gam_linalg::faer_ndarray::fast_av(self.data.x.as_ref(), &beta);
 
         // ---- Log-likelihood ℓ(y|β) and ∇_β ℓ ----
         let step_likelihood = LikelihoodSpec {
@@ -7030,7 +7030,7 @@ impl JointBetaRhoPosterior {
             let r = &cp.col_range;
             let beta_block = beta.slice(ndarray::s![r.start..r.end]);
             let rank_k = cp.rank();
-            gam::faer_ndarray::fast_av_view_into(
+            gam_linalg::faer_ndarray::fast_av_view_into(
                 &cp.root,
                 &beta_block,
                 r_beta_scratch.slice_mut(ndarray::s![..rank_k]),
@@ -7186,7 +7186,7 @@ impl JointBetaRhoPosterior {
         let grad_beta = &grad_ll_beta - &s_beta;
 
         // Combined gradient: [∇_z; ∇_ρ; ∇_link]
-        gam::faer_ndarray::fast_av_view_into(
+        gam_linalg::faer_ndarray::fast_av_view_into(
             &self.chol_t,
             &grad_beta,
             out_grad.slice_mut(ndarray::s![..n_beta]),
@@ -7385,7 +7385,7 @@ pub fn run_joint_beta_rho_sampling(
 
 mod survival_hmc {
     use super::*;
-    use gam::families::survival::{
+    use gam_models::survival::{
         PenaltyBlocks, SurvivalEngineInputs, SurvivalMonotonicityPenalty, SurvivalSpec,
         WorkingModelSurvival,
     };
@@ -7456,7 +7456,7 @@ mod survival_hmc {
                     monotonicity_constraint_rows: None,
                     monotonicity_constraint_offsets: None,
                 },
-                Some(gam::families::survival::SurvivalBaselineOffsets {
+                Some(gam_models::survival::SurvivalBaselineOffsets {
                     eta_entry: off_eta_entry.view(),
                     eta_exit: off_eta_exit.view(),
                     derivative_exit: off_deriv_exit.view(),
@@ -7614,9 +7614,9 @@ mod survival_hmc {
 /// Engine-facing flattened survival NUTS entrypoint.
 pub fn run_survival_nuts_sampling_flattened<'a>(
     flat: SurvivalFlatInputs<'a>,
-    penalties: gam::families::survival::PenaltyBlocks,
-    monotonicity: gam::families::survival::SurvivalMonotonicityPenalty,
-    spec: gam::families::survival::SurvivalSpec,
+    penalties: gam_models::survival::PenaltyBlocks,
+    monotonicity: gam_models::survival::SurvivalMonotonicityPenalty,
+    spec: gam_models::survival::SurvivalSpec,
     structurally_monotonic: bool,
     structural_time_columns: usize,
     mode: ArrayView1<'a, f64>,

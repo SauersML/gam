@@ -1,0 +1,39 @@
+[package]
+name = "gam-inference"
+version = "0.3.126"
+edition = "2024"
+rust-version = "1.93"
+description = "Posterior sampling, HMC/NUTS, Polya-Gamma, and inference diagnostics for the gam engine"
+license = "AGPL-3.0-or-later"
+
+[lints.rust]
+warnings = "deny"
+
+[dependencies]
+gam-data = { path = "../gam-data", version = "=0.3.126" }
+gam-math = { path = "../gam-math", version = "=0.3.126" }
+gam-linalg = { path = "../gam-linalg", version = "=0.3.126" }
+gam-problem = { path = "../gam-problem", version = "=0.3.126" }
+gam-gpu = { path = "../gam-gpu", version = "=0.3.126" }
+gam-terms = { path = "../gam-terms", version = "=0.3.126" }
+gam-solve = { path = "../gam-solve", version = "=0.3.126" }
+gam-models = { path = "../gam-models", version = "=0.3.126" }
+gam-sae = { path = "../gam-sae", version = "=0.3.126" }
+ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
+rayon = "1.12.0"
+rand = "0.10.1"
+rand_distr = "0.6.0"
+faer = "0.24.0"
+statrs = "0.18.0"
+libm = "0.2.16"
+log = "0.4.29"
+serde = { version = "1.0.228", features = ["derive"] }
+wide = "0.7"
+
+[dependencies.general-mcmc]
+package = "general-mcmc"
+version = "0.9"
+default-features = false
+
+[dev-dependencies]
+approx = "0.5.1"

@@ -1,0 +1,73 @@
+/// Computes the Kronecker product A ⊗ B for penalty matrix construction.
+/// This is used to create tensor product penalties that enforce smoothness
+/// in multiple dimensions for interaction terms.
+pub fn kronecker_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
+    let (arows, a_cols) = a.dim();
+    let (brows, b_cols) = b.dim();
+    if arows == 0 || a_cols == 0 || brows == 0 || b_cols == 0 {
+        return Array2::zeros((arows * brows, a_cols * b_cols));
+    }
+    let mut result = Array2::zeros((arows * brows, a_cols * b_cols));
+
+    result
+        .axis_chunks_iter_mut(Axis(0), brows)
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(i, mut row_block)| {
+            let arow = a.row(i);
+            let col_chunks = row_block.axis_chunks_iter_mut(Axis(1), b_cols);
+            for (j, mut block) in col_chunks.into_iter().enumerate() {
+                let aval = arow[j];
+                if aval == 0.0 {
+                    continue;
+                }
+                for (dest, &src) in block.iter_mut().zip(b.iter()) {
+                    *dest = aval * src;
+                }
+            }
+        });
+
+    result
+}
+
+/// Result of the stable reparameterization algorithm from Wood (2011) Appendix B
+#[derive(Clone)]
+pub struct ReparamResult {
+    /// Penalty matrix in TRANSFORMED coefficient coordinates.
+    ///
+    /// This must be compatible with `beta_transformed` and `X_transformed = X * Qs`.
+    pub s_transformed: Array2<f64>,
+    /// Log-determinant of the penalty matrix (stable computation)
+    pub log_det: f64,
+    /// First derivatives of log-determinant w.r.t. log-smoothing parameters
+    pub det1: Array1<f64>,
+    /// Orthogonal transformation matrix Qs
+    pub qs: Array2<f64>,
+    /// Canonical penalties in the TRANSFORMED coordinate frame.
+    /// The single source of truth for penalty roots in the transformed frame.
+    /// Downstream consumers use these for block-local `PenaltyCoordinate`
+    /// construction, TK correction, and ext-coord paths.
+    pub canonical_transformed: Vec<CanonicalPenalty>,
+    /// Lambda-dependent penalty square root in TRANSFORMED coordinates (rank x p matrix).
+    /// This is used for applying the actual penalty in the least squares solve.
+    pub e_transformed: Array2<f64>,
+    /// Truncated eigenvectors (p × m where m = p - structural_rank).
+    ///
+    /// Coordinate frame note:
+    /// - This matrix is stored in the TRANSFORMED coefficient frame (post-`Qs`),
+    ///   i.e. it is compatible with `canonical_transformed`, `beta_transformed`,
+    ///   and transformed Hessians without additional coordinate mapping.
+    ///
+    /// These vectors span the structural null space used by positive-part
+    /// log-determinant conventions.
+    pub u_truncated: Array2<f64>,
+    /// The rho-independent shrinkage ridge magnitude that was added to each
+    /// eigenvalue of the penalized block. Zero means no shrinkage was applied.
+    pub penalty_shrinkage_ridge: f64,
+}
+
+// ---------------------------------------------------------------------------
+// Kronecker factor decomposition primitives
+// ---------------------------------------------------------------------------
+
+/// Per-factor decomposition result for Kronecker penalties.

@@ -2,7 +2,7 @@
 //! and the saved score-warp deviation runtime it carries.
 //!
 //! These exercise gam-crate types ([`BernoulliMarginalSlopePredictor`], the
-//! [`crate::families::bms`] deviation runtimes, and [`SavedCompiledFlexBlock`])
+//! [`gam_models::bms`] deviation runtimes, and [`SavedCompiledFlexBlock`])
 //! through crate-internal (`pub(crate)`) seams —
 //! [`BernoulliMarginalSlopePredictor::probit_frailty_scale`],
 //! [`build_score_warp_deviation_block_from_seed`], and
@@ -13,21 +13,21 @@
 //! genuinely gam-predict tests (its `point_state`/interval wrappers) stay in
 //! `gam-predict`.
 
-use crate::families::bms::{
+use gam_models::bms::{
     EmpiricalZGrid, LatentMeasureKind, empirical_intercept_from_marginal,
 };
-use crate::inference::model::{SavedCompiledFlexBlock, SavedLatentZNormalization};
-use crate::inference::predict_io::{BernoulliMarginalSlopePredictor, PredictInput};
-use crate::matrix::DesignMatrix;
+use crate::model::{SavedCompiledFlexBlock, SavedLatentZNormalization};
+use crate::predict_io::{BernoulliMarginalSlopePredictor, PredictInput};
+use gam_linalg::matrix::DesignMatrix;
 use crate::probability::normal_cdf;
-use crate::types::InverseLink;
+use gam_problem::types::InverseLink;
 use ndarray::{Array1, Array2, array};
 
 fn saved_runtime_from_deviation_runtime(
-    runtime: &crate::families::bms::DeviationRuntime,
+    runtime: &gam_models::bms::DeviationRuntime,
 ) -> SavedCompiledFlexBlock {
     SavedCompiledFlexBlock {
-        kernel: crate::families::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL.to_string(),
+        kernel: gam_models::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL.to_string(),
         breakpoints: runtime.breakpoints().to_vec(),
         basis_dim: runtime.basis_dim(),
         span_c0: runtime
@@ -58,9 +58,9 @@ fn saved_runtime_from_deviation_runtime(
 #[test]
 fn bernoulli_marginal_slope_predictor_rejects_structurally_invalid_or_unknown_runtime_kernel() {
     let seed = array![-1.5, -0.2, 0.6, 1.4];
-    let prepared = crate::families::bms::build_score_warp_deviation_block_from_seed(
+    let prepared = gam_models::bms::build_score_warp_deviation_block_from_seed(
         &seed,
-        &crate::families::bms::DeviationBlockConfig {
+        &gam_models::bms::DeviationBlockConfig {
             degree: 3,
             num_internal_knots: 3,
             ..Default::default()
@@ -73,7 +73,7 @@ fn bernoulli_marginal_slope_predictor_rejects_structurally_invalid_or_unknown_ru
         beta_logslope: array![1.6],
         beta_score_warp: Some(array![0.7, -0.4]),
         beta_link_dev: None,
-        base_link: InverseLink::Standard(crate::types::StandardLink::Probit),
+        base_link: InverseLink::Standard(gam_problem::types::StandardLink::Probit),
         z_column: "z".to_string(),
         latent_z_normalization: SavedLatentZNormalization { mean: 0.0, sd: 1.0 },
         latent_measure: LatentMeasureKind::StandardNormal,
@@ -98,9 +98,9 @@ fn bernoulli_marginal_slope_predictor_rejects_structurally_invalid_or_unknown_ru
         .unwrap_err();
     assert!(err.to_string().contains("DenestedCubicTransport"));
 
-    let err = crate::families::bms::build_score_warp_deviation_block_from_seed(
+    let err = gam_models::bms::build_score_warp_deviation_block_from_seed(
         &seed,
-        &crate::families::bms::DeviationBlockConfig {
+        &gam_models::bms::DeviationBlockConfig {
             degree: 2,
             num_internal_knots: 3,
             ..Default::default()
@@ -121,9 +121,9 @@ fn bernoulli_marginal_slope_predictor_rejects_structurally_invalid_or_unknown_ru
 #[test]
 fn saved_anchored_deviation_runtime_local_cubic_reconstructs_values() {
     let seed = array![-2.0, -0.75, 0.0, 1.0, 3.0];
-    let prepared = crate::families::bms::build_score_warp_deviation_block_from_seed(
+    let prepared = gam_models::bms::build_score_warp_deviation_block_from_seed(
         &seed,
-        &crate::families::bms::DeviationBlockConfig {
+        &gam_models::bms::DeviationBlockConfig {
             num_internal_knots: 4,
             ..Default::default()
         },
@@ -167,13 +167,13 @@ fn saved_anchored_deviation_runtime_local_cubic_reconstructs_values() {
 
 #[test]
 fn saved_anchored_deviation_runtime_design_with_anchor_rows_applies_residual() {
-    use crate::families::bms::deviation_runtime::ParametricAnchorBlock;
-    use crate::inference::model::{SavedAnchorComponent, SavedAnchorKind};
+    use gam_models::bms::deviation_runtime::ParametricAnchorBlock;
+    use crate::model::{SavedAnchorComponent, SavedAnchorKind};
 
     let seed = array![-2.0, -0.75, 0.0, 1.0, 3.0];
-    let prepared = crate::families::bms::build_score_warp_deviation_block_from_seed(
+    let prepared = gam_models::bms::build_score_warp_deviation_block_from_seed(
         &seed,
-        &crate::families::bms::DeviationBlockConfig {
+        &gam_models::bms::DeviationBlockConfig {
             num_internal_knots: 4,
             ..Default::default()
         },
@@ -253,7 +253,7 @@ fn bernoulli_marginal_slope_rigid_gaussian_frailty_uses_scaled_closed_form() {
         beta_logslope: array![-0.4],
         beta_score_warp: None,
         beta_link_dev: None,
-        base_link: InverseLink::Standard(crate::types::StandardLink::Probit),
+        base_link: InverseLink::Standard(gam_problem::types::StandardLink::Probit),
         z_column: "z".to_string(),
         latent_z_normalization: SavedLatentZNormalization { mean: 0.0, sd: 1.0 },
         latent_measure: LatentMeasureKind::StandardNormal,
@@ -315,7 +315,7 @@ fn bernoulli_marginal_slope_predictor_uses_local_empirical_latent_law() {
         beta_logslope: array![0.9],
         beta_score_warp: None,
         beta_link_dev: None,
-        base_link: InverseLink::Standard(crate::types::StandardLink::Probit),
+        base_link: InverseLink::Standard(gam_problem::types::StandardLink::Probit),
         z_column: "z".to_string(),
         latent_z_normalization: SavedLatentZNormalization { mean: 0.0, sd: 1.0 },
         latent_measure: LatentMeasureKind::LocalEmpirical {
@@ -376,7 +376,7 @@ fn bernoulli_marginal_slope_predictor_rejects_nonprobit_base_link_scale() {
         beta_logslope: array![-0.4],
         beta_score_warp: None,
         beta_link_dev: None,
-        base_link: InverseLink::Standard(crate::types::StandardLink::Logit),
+        base_link: InverseLink::Standard(gam_problem::types::StandardLink::Logit),
         z_column: "z".to_string(),
         latent_z_normalization: SavedLatentZNormalization { mean: 0.0, sd: 1.0 },
         latent_measure: LatentMeasureKind::StandardNormal,
@@ -408,9 +408,9 @@ fn bernoulli_marginal_slope_predictor_rejects_nonprobit_base_link_scale() {
 #[test]
 fn saved_anchored_deviation_runtime_basis_cubic_matches_basis_column() {
     let seed = array![-2.0, -0.75, 0.0, 1.0, 3.0];
-    let prepared = crate::families::bms::build_score_warp_deviation_block_from_seed(
+    let prepared = gam_models::bms::build_score_warp_deviation_block_from_seed(
         &seed,
-        &crate::families::bms::DeviationBlockConfig {
+        &gam_models::bms::DeviationBlockConfig {
             num_internal_knots: 4,
             ..Default::default()
         },

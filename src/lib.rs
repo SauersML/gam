@@ -103,13 +103,13 @@ pub fn init_parallelism() {
         // call THROUGH them without a back-edge into the inference SCC. First
         // writer wins; ignore the boxed-value `Err` of a redundant re-init.
         drop(gam_problem::laplace_sampler_contract::set_laplace_marginal_sampler(Box::new(
-            crate::inference::hmc_io::HmcIoLaplaceMarginalSampler,
+            gam_inference::hmc_io::HmcIoLaplaceMarginalSampler,
         )));
         drop(gam_problem::laplace_sampler_contract::set_gaussian_mode_posterior_sampler(
-            Box::new(crate::inference::hmc_io::HmcIoGaussianModePosteriorSampler),
+            Box::new(gam_inference::hmc_io::HmcIoGaussianModePosteriorSampler),
         ));
         drop(gam_problem::rho_posterior::set_rho_posterior_escalator(Box::new(
-            crate::inference::rho_posterior::HmcIoRhoPosteriorEscalator,
+            gam_inference::rho_posterior::HmcIoRhoPosteriorEscalator,
         )));
         // Ignore the error returned when the global pool was already built by
         // an earlier caller: we cannot resize an existing pool, and the only
@@ -132,12 +132,12 @@ mod gpu_dispatch_registration_tests {
     }
 }
 
-pub mod config_resolve;
+pub use gam_config as config_resolve;
 pub use gam_models as families;
 pub use gam_geometry as geometry;
 pub use gam_gpu as gpu;
 pub use gam_identifiability as identifiability;
-pub mod inference;
+pub use gam_inference as inference;
 pub use gam_linalg as linalg;
 pub mod model_types;
 /// Lower-layer outer-iteration row-subsampling/chunking primitives (RowSet,
@@ -149,7 +149,7 @@ pub mod outer_subsample;
 /// re-exported here so existing `crate::psis` / `gam::psis` callers (including
 /// `inference::{rho_posterior, model_comparison}`) resolve it downward.
 pub use gam_solve::psis;
-pub mod report;
+pub use gam_report as report;
 /// Lower-layer ρ-uncertainty (PSIS-on-ρ) diagnostic. Depends only on the
 /// lower-layer `psis`; descended into `gam-solve` (#1521) and re-exported here
 /// so the public `gam::rho_uncertainty` path is preserved.

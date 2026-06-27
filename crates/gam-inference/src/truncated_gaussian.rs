@@ -57,11 +57,11 @@
 use ndarray::{Array1, Array2};
 use rand::SeedableRng;
 
-use crate::faer_ndarray::FaerCholesky;
-use crate::linalg::triangular::{
+use gam_linalg::faer_ndarray::FaerCholesky;
+use gam_linalg::triangular::{
     back_substitution_lower_transpose_guarded_into, forward_substitution_lower_matrix,
 };
-use crate::pirls::LinearInequalityConstraints;
+use gam_solve::pirls::LinearInequalityConstraints;
 
 /// Quarter-period travel time between velocity refreshes. With no active wall,
 /// `z(π/2) = v₀`, so consecutive draws decorrelate completely.
@@ -90,7 +90,7 @@ const MAX_BOUNCES_BASE: usize = 256;
 /// * `penalized_hessian` — the *unscaled* penalised Hessian `H` (no φ).
 /// * `sqrt_phi` — `√φ` (dispersion square root); `1.0` for fixed-scale
 ///   families (Binomial / Poisson). Scales the posterior covariance to
-///   `φ·H⁻¹`, exactly as [`crate::inference::sample::laplace_gaussian_fallback`].
+///   `φ·H⁻¹`, exactly as [`crate::sample::laplace_gaussian_fallback`].
 /// * `constraints` — `A` (`m × p`) and `b` (`m`), meaning `A β ≥ b`.
 pub fn sample_truncated_gaussian_posterior(
     mode: &Array1<f64>,

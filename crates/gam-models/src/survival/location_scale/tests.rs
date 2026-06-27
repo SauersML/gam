@@ -6583,10 +6583,6 @@ fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
         let dynamic = family
             .build_dynamic_geometry(&states)
             .expect("dynamic geometry");
-        let bespoke = family
-            .assemble_joint_hessian_from_quantities(&q, &states)
-            .expect("bespoke joint Hessian")
-            .expect("bespoke joint Hessian present");
 
         // Coefficient offsets = cumulative block beta widths (time,thr,ls,wiggle).
         let widths: Vec<usize> = states.iter().map(|s| s.beta.len()).collect();
@@ -6697,11 +6693,24 @@ fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
             }
         }
 
-        for ((a, b), &bj) in bespoke.indexed_iter() {
+        // #932: the production single-source §13 wiggle joint Hessian
+        // (`survival_ls_wiggle_joint_hessian_dense` — the path the Newton step
+        // and, after the trust-floor fix, every production consumer now uses)
+        // must equal the INDEPENDENT tower assembled above from `wiggle_nll`
+        // with a hand-rolled JᵀHJ pullback. The legacy bespoke
+        // `assemble_h_wiggle` is retired for wiggle: it disagreed with this
+        // tower by ~15% at [0][0] (the duplicate-engine genus #932 eliminates),
+        // and is FD-cross-checked separately by
+        // `survival_ls_wiggle_jet_program_joint_hessian_matches_fd_932`.
+        let dense = super::row_kernel::survival_ls_wiggle_joint_hessian_dense(
+            &family, &q, &dynamic, 0.0,
+        )
+        .expect("§13 dense wiggle Hessian");
+        for ((a, b), &dj) in dense.indexed_iter() {
             let tj = h_tower[[a, b]];
             assert!(
-                (tj - bj).abs() <= 1e-9 * (1.0 + bj.abs()),
-                "{distribution:?}: wiggle joint Hessian [{a}][{b}] assembler {bj} != tower {tj}"
+                (tj - dj).abs() <= 1e-9 * (1.0 + dj.abs()),
+                "{distribution:?}: §13 wiggle joint Hessian [{a}][{b}] dense {dj} != independent tower {tj}"
             );
         }
     }

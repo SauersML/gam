@@ -1,8 +1,8 @@
 //! Per-point sparse atom codes for multi-manifold reconstruction.
 //!
 //! This module owns the storage of per-observation soft assignments over a
-//! library of `K` candidate manifold-atoms (see [`crate::atom_selection`]
-//! for the surrounding selection layer). The two key types are:
+//! library of `K` candidate manifold-atoms (see [`crate::assignment::SaeAssignment`]
+//! for the surrounding selection/gate layer). The two key types are:
 //!
 //! * [`BitVec`] — a minimal dependency-free bitset used to record the *active
 //!   support* `S_n ⊆ {0, …, K−1}` of each observation. We avoid pulling in
@@ -26,9 +26,9 @@
 //!
 //! Each [`SparseAtomCode`] is the per-row ext-coordinate block for observation `n`
 //! restricted to the `K` atoms. Combined with the per-atom on-manifold
-//! coordinate `t_{n,k} ∈ ℝ^{d_k}` (held in
-//! [`crate::atom_selection::AtomLibrary`]'s per-atom
-//! `LatentCoordValues`), the row-local ext-coordinate vector is
+//! coordinate `t_{n,k} ∈ ℝ^{d_k}` (held in the per-atom latent-coordinate
+//! blocks of [`crate::assignment::SaeAssignment`]), the row-local
+//! ext-coordinate vector is
 //!
 //! ```text
 //!   ext_n  =  ( a_{n,1..K}  ;  t_{n,1,·}  ;  …  ;  t_{n,K,·} )
@@ -130,14 +130,14 @@ impl BitVec {
 /// * `active_mask.len() == weights.len() == K`.
 /// * For any `k` with `active_mask.get(k) == false`, the value `weights[k]`
 ///   is a nuisance — it must not influence reconstruction. Selection
-///   strategies that lower a weight to zero (e.g. [`crate::atom_selection::AtomSelectionStrategy`]'s
-///   `L1Relaxed` after thresholding) are responsible for clearing the
+///   strategies that lower a weight to zero (e.g. an L¹-relaxed gate after
+///   thresholding) are responsible for clearing the
 ///   corresponding mask bit *and* zeroing `weights[k]`.
 ///
 /// We do not require `weights[k] >= 0`; some strategies (entropic softmax,
 /// TopK projection) keep the simplex, while others (L¹-relaxed) only enforce
 /// non-negativity at the active-set step. The owning
-/// [`crate::atom_selection::AtomSelectionStrategy`] documents which
+/// gate/selection layer ([`crate::assignment::SaeAssignment`]) documents which
 /// invariant it maintains.
 #[derive(Debug, Clone)]
 pub struct SparseAtomCode {

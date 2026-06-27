@@ -24,7 +24,7 @@
 //!    Gaussian proposal's quadratic cancels to the whitened norm, giving
 //!    `log w_m = −criterion(ρ_m) + criterion(ρ̂) + ½‖z_m‖²` (the `criterion(ρ̂)`
 //!    shift makes the weights self-normalized and finite).
-//! 4. Pareto-smooth the weights ([`crate::psis`]) and read the
+//! 4. Pareto-smooth the weights ([`gam_solve::psis`]) and read the
 //!    Zhang–Stephens tail shape `k̂`. `k̂ < 0.5` ⇒ the plug-in + first-order
 //!    correction answer is **certified** adequate; `0.5 ≤ k̂ ≤ 0.7` ⇒ usable as
 //!    a self-normalized importance correction; `k̂ > 0.7` ⇒ the Laplace proposal
@@ -34,9 +34,9 @@
 //! splitmix64 + Box–Muller stream, so the same fit yields the same `k̂` every
 //! run.
 
-use crate::estimate::EstimationError;
-use crate::psis::pareto_smooth_weights;
-use crate::solver::rho_optimizer::OuterObjective;
+use gam_solve::estimate::EstimationError;
+use gam_solve::psis::pareto_smooth_weights;
+use gam_solve::rho_optimizer::OuterObjective;
 use ndarray::{Array1, Array2};
 
 // The `ρ`-posterior certificate/escalation DATA types were contract-downed to
@@ -144,7 +144,7 @@ impl DetNormal {
         Self { state: seed }
     }
     fn uniform(&mut self) -> f64 {
-        let z = crate::linalg::utils::splitmix64(&mut self.state);
+        let z = gam_linalg::utils::splitmix64(&mut self.state);
         (((z >> 11) as f64) + 0.5) / ((1u64 << 53) as f64)
     }
     fn normal(&mut self) -> f64 {
@@ -262,7 +262,7 @@ pub fn rho_hessian_from_profiled_exact_gradient(
             hessian[[i, j]] = (gp[i] - gm[i]) / (2.0 * step);
         }
     }
-    crate::matrix::symmetrize_in_place(&mut hessian);
+    gam_linalg::matrix::symmetrize_in_place(&mut hessian);
     Ok(hessian)
 }
 
@@ -650,14 +650,14 @@ where
     F: FnMut(&Array1<f64>) -> Option<(f64, Array1<f64>)> + Send,
 {
     let k = rho_hat.len();
-    let config = crate::inference::hmc_io::NutsConfig {
+    let config = crate::hmc_io::NutsConfig {
         n_samples: n_samples.max(4),
         nwarmup: (n_samples / 2).max(RHO_POSTERIOR_NUTS_WARMUP_FLOOR),
         n_chains: 2,
         target_accept: 0.9,
         seed,
     };
-    let result = crate::inference::hmc_io::run_rho_criterion_nuts(
+    let result = crate::hmc_io::run_rho_criterion_nuts(
         rho_hat.view(),
         outer_hessian.view(),
         criterion_and_grad,
@@ -786,7 +786,7 @@ where
     let l_inv = whitening_factor_from_outer_hessian(outer_hessian)?;
     let m = n_samples
         .unwrap_or(DEFAULT_M)
-        .max(2 * crate::psis::MIN_TAIL_COUNT);
+        .max(2 * gam_solve::psis::MIN_TAIL_COUNT);
 
     let mut rng = DetNormal::new(CERTIFICATE_SEED);
     let mut raw_weights: Vec<f64> = Vec::with_capacity(m);

@@ -26,10 +26,10 @@
 //! Both channels are *corroboration*: they ride alongside the evidence headline
 //! a race already produces, never replacing it.
 
-use crate::estimate::UnifiedFitResult;
-use crate::inference::alo::AloDiagnostics;
-use crate::psis::pareto_smooth_weights;
-use crate::types::{GlmLikelihoodSpec, LikelihoodSpec};
+use gam_solve::estimate::UnifiedFitResult;
+use crate::alo::AloDiagnostics;
+use gam_solve::psis::pareto_smooth_weights;
+use gam_problem::types::{GlmLikelihoodSpec, LikelihoodSpec};
 use ndarray::{Array1, ArrayView1, ArrayView2};
 
 /// ALO predictive-accuracy summary at zero refit cost.
@@ -361,10 +361,10 @@ pub fn alo_elpd_from_family(
     eta_loo: ArrayView1<'_, f64>,
     prior_weights: ArrayView1<'_, f64>,
     spec: &LikelihoodSpec,
-    scale: crate::types::LikelihoodScaleMetadata,
+    scale: gam_problem::types::LikelihoodScaleMetadata,
 ) -> Option<AloElpd> {
-    use crate::families::family_runtime::{FamilyStrategy, strategy_for_spec};
-    use crate::pirls::pointwise_loglikelihood;
+    use gam_models::family_runtime::{FamilyStrategy, strategy_for_spec};
+    use gam_solve::pirls::pointwise_loglikelihood;
 
     let n = y.len();
     if eta_hat.len() != n || eta_loo.len() != n || prior_weights.len() != n || n == 0 {
@@ -398,10 +398,10 @@ fn full_loglikelihood_at_eta(
     eta_hat: ArrayView1<'_, f64>,
     prior_weights: ArrayView1<'_, f64>,
     spec: &LikelihoodSpec,
-    scale: crate::types::LikelihoodScaleMetadata,
+    scale: gam_problem::types::LikelihoodScaleMetadata,
 ) -> Option<f64> {
-    use crate::families::family_runtime::{FamilyStrategy, strategy_for_spec};
-    use crate::pirls::calculate_loglikelihood;
+    use gam_models::family_runtime::{FamilyStrategy, strategy_for_spec};
+    use gam_solve::pirls::calculate_loglikelihood;
 
     let n = y.len();
     if eta_hat.len() != n || prior_weights.len() != n || n == 0 {
@@ -428,10 +428,10 @@ fn full_loglikelihood_at_eta(
 /// returned unchanged.
 fn reporting_scale(
     spec: &LikelihoodSpec,
-    scale: &crate::types::LikelihoodScaleMetadata,
+    scale: &gam_problem::types::LikelihoodScaleMetadata,
     phi: f64,
-) -> crate::types::LikelihoodScaleMetadata {
-    use crate::types::{LikelihoodScaleMetadata, ResponseFamily};
+) -> gam_problem::types::LikelihoodScaleMetadata {
+    use gam_problem::types::{LikelihoodScaleMetadata, ResponseFamily};
     match spec.response {
         ResponseFamily::Gaussian => match scale.fixed_phi() {
             Some(p) if p.is_finite() && p > 0.0 => LikelihoodScaleMetadata::FixedDispersion { phi: p },
@@ -450,9 +450,9 @@ fn reporting_scale(
 /// from data; Poisson and Binomial carry φ ≡ 1 and add none.
 fn scale_parameter_count(
     spec: &LikelihoodSpec,
-    scale: &crate::types::LikelihoodScaleMetadata,
+    scale: &gam_problem::types::LikelihoodScaleMetadata,
 ) -> f64 {
-    use crate::types::{LikelihoodScaleMetadata, ResponseFamily};
+    use gam_problem::types::{LikelihoodScaleMetadata, ResponseFamily};
     let estimated = match spec.response {
         ResponseFamily::Gaussian => {
             !matches!(scale, LikelihoodScaleMetadata::FixedDispersion { .. })

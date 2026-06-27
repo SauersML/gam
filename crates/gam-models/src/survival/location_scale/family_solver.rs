@@ -2252,8 +2252,24 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         // is the SAME quantity the generic driver whitens by.
         let log_scale = self.hessian_deriv_log_rescale(block_states);
         let q = self.collect_joint_quantities_rescaled(block_states, log_scale)?;
-        let Some(h_joint) = self.assemble_joint_hessian_from_quantities(&q, block_states)? else {
-            return Ok(None);
+        // #932: link-wiggle families must take the SAME single-source §13 warp
+        // joint Hessian the Newton step uses (`survival_ls_wiggle_joint_hessian_dense`),
+        // NOT the bespoke `assemble_joint_hessian_from_quantities`. The bespoke
+        // wiggle path (`assemble_h_wiggle`) is a legacy duplicate engine that
+        // disagrees with the FD-verified §13 program (the duplicate-derivative
+        // genus #932 eliminates); flooring the trust metric off a Hessian
+        // inconsistent with the actual curvature starves the wrong coordinates.
+        // Non-wiggle families keep the bespoke assembler, which is oracle-pinned
+        // equal to the §13 RowKernel single source
+        // (`survival_ls_row_kernel_matches_bespoke_assembly`).
+        let h_joint = if self.x_link_wiggle.is_some() {
+            let dynamic = self.build_dynamic_geometry(block_states)?;
+            super::row_kernel::survival_ls_wiggle_joint_hessian_dense(self, &q, &dynamic, log_scale)?
+        } else {
+            match self.assemble_joint_hessian_from_quantities(&q, block_states)? {
+                Some(h) => h,
+                None => return Ok(None),
+            }
         };
         if h_joint.nrows() != p_total {
             return Ok(None);

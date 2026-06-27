@@ -1,6 +1,6 @@
-use crate::estimate::EstimationError;
-use crate::mixture_link::inverse_link_jet_for_family_public;
-use crate::types::LikelihoodSpec;
+use gam_problem::types::LikelihoodSpec;
+use gam_solve::estimate::EstimationError;
+use gam_solve::mixture_link::inverse_link_jet_for_family_public;
 use ndarray::{Array1, ArrayView1};
 use statrs::function::beta::{beta_reg, inv_beta_reg};
 use statrs::function::erf::erfc;
@@ -873,8 +873,8 @@ pub fn try_inverse_link_array(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mixture_link::{state_from_sasspec, state_fromspec};
-    use crate::types::{
+    use gam_solve::mixture_link::{state_from_sasspec, state_fromspec};
+    use gam_problem::types::{
         InverseLink, LinkComponent, MixtureLinkSpec, ResponseFamily, SasLinkSpec, StandardLink,
     };
     use ndarray::array;

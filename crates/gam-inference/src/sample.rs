@@ -20,37 +20,37 @@ use super::hmc_io::{
     run_nuts_sampling_flattened_family, run_survival_nuts_sampling_flattened, validate_nuts_config,
 };
 pub use super::hmc_io::{NutsConfig, NutsResult};
-use crate::basis::create_difference_penalty_matrix;
-use crate::estimate::{BlockRole, UnifiedFitResult, validate_all_finite};
-use crate::faer_ndarray::FaerCholesky;
-use crate::families::survival::construction::{
+use gam_terms::basis::create_difference_penalty_matrix;
+use gam_solve::estimate::{BlockRole, UnifiedFitResult, validate_all_finite};
+use gam_linalg::faer_ndarray::FaerCholesky;
+use gam_models::survival::construction::{
     SurvivalLikelihoodMode, add_survival_time_derivative_guard_offset, build_survival_time_basis,
     build_survival_time_offsets_for_likelihood, center_survival_time_designs_at_anchor,
     evaluate_survival_time_basis_row, normalize_survival_time_pair,
     resolved_survival_time_basis_config_from_build, survival_derivative_guard_for_likelihood,
 };
-use crate::families::survival::predict::{
+use gam_models::survival::predict::{
     fit_result_from_saved_model_for_prediction, require_saved_survival_likelihood_mode,
     resolve_saved_survival_time_columns, resolve_termspec_for_prediction,
     saved_baseline_timewiggle_components, saved_survival_runtime_baseline_config,
 };
-use crate::families::survival::royston_parmar::{self, RoystonParmarInputs};
-use crate::families::survival::{
+use gam_models::survival::royston_parmar::{self, RoystonParmarInputs};
+use gam_models::survival::{
     PenaltyBlock, PenaltyBlocks, SurvivalMonotonicityPenalty, SurvivalSpec,
 };
-use crate::families::wiggle::{
+use gam_models::wiggle::{
     append_selected_wiggle_penalty_orders, buildwiggle_block_input_from_knots,
     split_wiggle_penalty_orders,
 };
-use crate::inference::formula_dsl::{LinkWiggleFormulaSpec, parse_formula};
-use crate::inference::model::{
+use crate::formula_dsl::{LinkWiggleFormulaSpec, parse_formula};
+use crate::model::{
     FittedModel as SavedModel, PredictModelClass, load_survival_time_basis_config_from_model,
 };
-use crate::linalg::triangular::back_substitution_lower_transpose_guarded_into;
-use crate::terms::smooth::build_term_collection_design;
-use crate::smooth::{LinearCoefficientGeometry, weighted_blockwise_penalty_sum};
-use crate::term_builder::resolve_role_col;
-use crate::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
+use gam_linalg::triangular::back_substitution_lower_transpose_guarded_into;
+use gam_terms::smooth::build_term_collection_design;
+use gam_terms::smooth::{LinearCoefficientGeometry, weighted_blockwise_penalty_sum};
+use gam_terms::term_builder::resolve_role_col;
+use gam_problem::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 
 /// Reconstruct the `LinkWiggleFormulaSpec` from a saved model's
 /// baseline-time-wiggle runtime, returning `None` when the model has no
@@ -175,7 +175,7 @@ fn family_noise_parameter(fit: &UnifiedFitResult, likelihood: &LikelihoodSpec) -
 /// families are left untouched.
 fn refresh_negbin_theta_for_sampling(
     likelihood: &mut LikelihoodSpec,
-    scale: crate::types::LikelihoodScaleMetadata,
+    scale: gam_problem::types::LikelihoodScaleMetadata,
 ) {
     if let ResponseFamily::NegativeBinomial { theta, .. } = &mut likelihood.response {
         if let Some(theta_hat) = scale.negbin_theta() {
@@ -199,7 +199,7 @@ const DEFAULT_RECONSTRUCTED_SMOOTH_LAMBDA: f64 = 1e-2;
 
 #[inline]
 const fn splitmix64(x: u64) -> u64 {
-    crate::linalg::utils::splitmix64_hash(x)
+    gam_linalg::utils::splitmix64_hash(x)
 }
 
 #[inline]
@@ -437,7 +437,7 @@ fn sample_standard(
         }) || ts
             .smooth_terms
             .iter()
-            .any(|term| !matches!(term.shape, crate::smooth::ShapeConstraint::None))
+            .any(|term| !matches!(term.shape, gam_terms::smooth::ShapeConstraint::None))
     });
     if likelihood.is_gaussian_identity() && !needs_constraint_aware_sampler {
         return laplace_gaussian_fallback(model, cfg, "standard gaussian posterior");
@@ -513,13 +513,13 @@ fn sample_standard(
         // `intercept_range.end + j` of the model's coefficient vector. Bounds
         // are on the original (user/data) scale, which is also the scale the
         // saved beta and penalized Hessian live on.
-        let bounded_columns: Vec<crate::families::fit_orchestration::drivers::BoundedSampleColumn> = spec
+        let bounded_columns: Vec<gam_models::fit_orchestration::drivers::BoundedSampleColumn> = spec
             .linear_terms
             .iter()
             .enumerate()
             .filter_map(|(j, term)| match term.coefficient_geometry {
                 LinearCoefficientGeometry::Bounded { min, max, .. } => {
-                    Some(crate::families::fit_orchestration::drivers::BoundedSampleColumn {
+                    Some(gam_models::fit_orchestration::drivers::BoundedSampleColumn {
                         col_idx: design.intercept_range.end + j,
                         min,
                         max,
@@ -632,7 +632,7 @@ fn sample_standard(
 fn sample_standard_bounded(
     model: &SavedModel,
     cfg: &NutsConfig,
-    bounded_columns: &[crate::families::fit_orchestration::drivers::BoundedSampleColumn],
+    bounded_columns: &[gam_models::fit_orchestration::drivers::BoundedSampleColumn],
 ) -> Result<NutsResult, String> {
     validate_nuts_config(cfg).map_err(String::from)?;
     let fit = fit_result_from_saved_model_for_prediction(model)?;
@@ -658,7 +658,7 @@ fn sample_standard_bounded(
     // (gam#1514); the truncated-constraint path does the analogous √φ lift.
     let sqrt_cov_scale = fit.coefficient_covariance_scale().max(0.0).sqrt();
     let n_total = cfg.n_samples.saturating_mul(cfg.n_chains);
-    let samples = crate::families::fit_orchestration::drivers::sample_bounded_latent_posterior_internal(
+    let samples = gam_models::fit_orchestration::drivers::sample_bounded_latent_posterior_internal(
         &mode,
         user_hessian,
         bounded_columns,
@@ -693,13 +693,13 @@ fn sample_standard_bounded(
 /// posterior; for a non-Gaussian GLM it is the constraint-respecting Laplace
 /// approximation — the same modelling choice the `bounded()` term makes. The
 /// draws are produced by exact reflective Hamiltonian Monte Carlo
-/// ([`crate::inference::truncated_gaussian`]), so every draw is feasible and
+/// ([`crate::truncated_gaussian`]), so every draw is feasible and
 /// successive draws are essentially independent (`rhat ≈ 1`, matching the other
 /// Laplace posterior paths).
 fn sample_standard_truncated(
     model: &SavedModel,
     cfg: &NutsConfig,
-    constraints: &crate::pirls::LinearInequalityConstraints,
+    constraints: &gam_solve::pirls::LinearInequalityConstraints,
 ) -> Result<NutsResult, String> {
     validate_nuts_config(cfg).map_err(String::from)?;
     let fit = fit_result_from_saved_model_for_prediction(model)?;
@@ -723,7 +723,7 @@ fn sample_standard_truncated(
         use gam_problem::dispersion_cov::DispersionExt as _;
         fit.dispersion().unwrap_or_default().sqrt_phi()
     };
-    let samples = crate::inference::truncated_gaussian::sample_truncated_gaussian_posterior(
+    let samples = crate::truncated_gaussian::sample_truncated_gaussian_posterior(
         &mode,
         &penalized_hessian,
         sqrt_phi,
@@ -1112,9 +1112,9 @@ fn sample_survival(
             .map_err(|e| format!("baseline-timewiggle penalty reconstruction failed: {e}"))?;
         for (widx, s) in block.penalties.iter().enumerate() {
             let s = match s {
-                crate::estimate::PenaltySpec::Block { local, .. } => local,
-                crate::estimate::PenaltySpec::Dense(m)
-                | crate::estimate::PenaltySpec::DenseWithMean { matrix: m, .. } => m,
+                gam_solve::estimate::PenaltySpec::Block { local, .. } => local,
+                gam_solve::estimate::PenaltySpec::Dense(m)
+                | gam_solve::estimate::PenaltySpec::DenseWithMean { matrix: m, .. } => m,
             };
             if s.nrows() == exit_w.ncols() && s.ncols() == exit_w.ncols() {
                 penalty_blocks.push(PenaltyBlock {
@@ -1244,7 +1244,7 @@ fn sample_survival(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::LikelihoodScaleMetadata;
+    use gam_problem::types::LikelihoodScaleMetadata;
 
     /// #1463: the NB NUTS path must sample at the fit's jointly-estimated
     /// `theta_hat`, not the construction seed `theta = 1.0`. The seed only seeds

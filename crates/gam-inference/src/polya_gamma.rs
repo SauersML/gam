@@ -9,10 +9,10 @@
 //
 // The Devroye sampler math (tail mass, truncated inverse-Gaussian branches,
 // alternating-series coefficient, and the draw loop) lives once in
-// [`crate::inference::polya_gamma_core`]; this module is the production
+// [`crate::polya_gamma_core`]; this module is the production
 // adapter that drives that core from any [`rand::Rng`].
 
-use crate::inference::polya_gamma_core::{PgRng, draw_pg1};
+use crate::polya_gamma_core::{PgRng, draw_pg1};
 use rand::{Rng, RngExt};
 use rand_distr::{Distribution, Exp as RandExp, Normal as RandNormal};
 

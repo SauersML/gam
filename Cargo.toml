@@ -47,6 +47,9 @@ members = [
     "crates/gam-model-kernels",
     "crates/gam-custom-family",
     "crates/gam-models",
+    "crates/gam-inference",
+    "crates/gam-report",
+    "crates/gam-config",
     "crates/gam-sae",
     "crates/gam-cli",
     "crates/gam-math",
@@ -103,6 +106,9 @@ gam-identifiability = { path = "crates/gam-identifiability", version = "=0.3.126
 gam-terms = { path = "crates/gam-terms", version = "=0.3.126" }
 gam-solve = { path = "crates/gam-solve", version = "=0.3.126" }
 gam-models = { path = "crates/gam-models", version = "=0.3.126" }
+gam-inference = { path = "crates/gam-inference", version = "=0.3.126" }
+gam-report = { path = "crates/gam-report", version = "=0.3.126" }
+gam-config = { path = "crates/gam-config", version = "=0.3.126" }
 gam-sae = { path = "crates/gam-sae", version = "=0.3.126" }
 # Shared test-support helpers (FD harness, fixtures, reference-tool + CLI
 # harnesses) carved into their own crate under #1521 so the workspace's other

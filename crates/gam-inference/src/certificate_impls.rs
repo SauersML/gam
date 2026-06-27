@@ -2,7 +2,7 @@
 //!
 //! The `impl Certificate for …` blocks that once lived here were relocated into
 //! their types' home crates to satisfy the coherence orphan rule (task #1521):
-//! the [`Certificate`](crate::inference::certificates::Certificate) trait now
+//! the [`Certificate`](crate::certificates::Certificate) trait now
 //! lives in the neutral `gam-problem` crate, so each impl must be defined where
 //! the implemented type is owned. The gam-solve-owned certificates
 //! (`CriterionCertificate`, `CoresetCertificate`, `LogdetEnclosure`,
@@ -15,6 +15,6 @@
 //! The two margin-resolution helpers (`coreset_race_verdict`,
 //! `enclosure_margin_verdict`) descended into `gam-solve` alongside the
 //! gam-solve impls; they are re-exported here so existing
-//! `crate::inference::certificate_impls::*` paths resolve unchanged.
+//! `crate::certificate_impls::*` paths resolve unchanged.
 
 pub use gam_solve::inference::certificate_impls::{coreset_race_verdict, enclosure_margin_verdict};

@@ -1,6 +1,5 @@
 pub mod assignment;
 pub mod atom_codes;
-pub mod atom_selection;
 pub mod basis;
 pub mod candidate_index;
 pub mod certificate_impls;
