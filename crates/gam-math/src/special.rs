@@ -18,11 +18,32 @@ pub fn binomial_coefficient_f64(n: usize, k: usize) -> f64 {
         return 1.0;
     }
     let k_eff = k.min(n - k);
-    let mut out = 1.0;
+    // Carry the recurrence in u128, not f64. At step `j` the running product
+    // equals the integer `C(n, j)`, which is always divisible by the next
+    // denominator `(j + 1)` (the partial product of `(j+1)` consecutive
+    // integers `(n−j)…(n)` is divisible by `(j+1)!`), so each integer division
+    // is exact and no rounding accumulates. The earlier all-`f64` recurrence
+    // divided in floating point, where `(n−j)/(j+1)` is generally inexact, and
+    // the drift pushed results off the true integer well below `2^53`
+    // (e.g. `C(54,24)` came back one short). Converting the exact `u128` at the
+    // end is bit-exact for every value at or below `2^53`.
+    let mut num: u128 = 1;
     for j in 0..k_eff {
-        out *= (n - j) as f64 / (j + 1) as f64;
+        match num.checked_mul((n - j) as u128) {
+            Some(scaled) => num = scaled / (j as u128 + 1),
+            None => {
+                // The true coefficient overflows u128 — astronomically above
+                // `2^53`, where the exactness contract no longer applies.
+                // Finish the (now necessarily inexact) recurrence in f64.
+                let mut out = num as f64;
+                for jj in j..k_eff {
+                    out = out * (n - jj) as f64 / (jj + 1) as f64;
+                }
+                return out;
+            }
+        }
     }
-    out
+    num as f64
 }
 
 #[inline]
