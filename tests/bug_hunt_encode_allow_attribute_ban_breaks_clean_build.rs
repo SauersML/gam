@@ -83,8 +83,10 @@ fn rust_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
         }
         // build.rs names the attribute syntax as part of the scanner's own
         // contract and is exempt (build.rs:scan_for_banned_allow).
-        if path.strip_prefix(root).map(|r| r.as_os_str() == OsStr::new("build.rs")) == Ok(true) {
-            continue;
+        if let Ok(rel) = path.strip_prefix(root) {
+            if rel == Path::new("build.rs") {
+                continue;
+            }
         }
         out.push(path);
     }
