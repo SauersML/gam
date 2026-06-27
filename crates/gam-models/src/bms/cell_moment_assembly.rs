@@ -383,10 +383,11 @@ impl BernoulliMarginalSlopeFamily {
         measure_weights: &[f64],
     ) -> Result<[[[f64; 2]; 2]; 2], String> {
         // #932 (doc §11, §14.3): the uncontracted third tensor is the `.t3`
-        // channel of the SAME single-source row jet, evaluated at the packed
-        // `Tower4<2>` (nilpotency 4 → 4 lift grades). No hand intercept-third
-        // formulas; the grid intercept rides through the filtered lift.
-        let jet = self.empirical_rigid_row_nll_jet::<gam_math::jet_tower::Tower4<2>>(
+        // channel of the SAME single-source row jet, evaluated at `Tower3<2>`.
+        // Keep the previous four finite-precision lift passes for bit identity
+        // with the old `Tower4<2>` path, but do not build a fourth tensor for a
+        // consumer that never reads it.
+        let jet = self.empirical_rigid_row_nll_jet::<gam_math::jet_tower::Tower3<2>>(
             row,
             marginal,
             slope,
@@ -1822,9 +1823,10 @@ impl BernoulliMarginalSlopeFamily {
         // `w_i == 1.0`, so we skip the dense O(n) weight vector entirely (it
         // is otherwise re-allocated and zero-filled on every outer eval over
         // n≈3e5 rows) and the per-row scaling becomes a no-op.
-        let row_weights = options.outer_score_subsample.as_ref().map(|_| {
-            crate::marginal_slope_shared::outer_row_weights_by_index(options, n)
-        });
+        let row_weights = options
+            .outer_score_subsample
+            .as_ref()
+            .map(|_| crate::marginal_slope_shared::outer_row_weights_by_index(options, n));
         let (objective_psi, score_psi, acc) = chunked_row_reduction(
             row_iter.as_slice(),
             || {
@@ -1895,9 +1897,10 @@ impl BernoulliMarginalSlopeFamily {
         let row_iter = outer_row_indices(options, n).to_vec();
         // Full-data path carries `w_i == 1.0` for every row, so skip the dense
         // O(n) HT-weight vector (see `sigma_exact_joint_psi_terms_with_options`).
-        let row_weights = options.outer_score_subsample.as_ref().map(|_| {
-            crate::marginal_slope_shared::outer_row_weights_by_index(options, n)
-        });
+        let row_weights = options
+            .outer_score_subsample
+            .as_ref()
+            .map(|_| crate::marginal_slope_shared::outer_row_weights_by_index(options, n));
         let (objective_psi_psi, score_psi_psi, acc) = chunked_row_reduction(
             row_iter.as_slice(),
             || {
@@ -1980,9 +1983,10 @@ impl BernoulliMarginalSlopeFamily {
         let row_iter = outer_row_indices(options, n).to_vec();
         // Full-data path carries `w_i == 1.0` for every row, so skip the dense
         // O(n) HT-weight vector (see `sigma_exact_joint_psi_terms_with_options`).
-        let row_weights = options.outer_score_subsample.as_ref().map(|_| {
-            crate::marginal_slope_shared::outer_row_weights_by_index(options, n)
-        });
+        let row_weights = options
+            .outer_score_subsample
+            .as_ref()
+            .map(|_| crate::marginal_slope_shared::outer_row_weights_by_index(options, n));
         // Sigma scale jets and the zero primary direction are constant across
         // rows; resolve once outside the fold. The shared
         // `directional_obj_grad_hess` sweep differentiates *through* the fixed
@@ -2988,9 +2992,9 @@ mod empirical_rigid_jet_oracle_tests {
         let n = y.len();
         let policy = gam_runtime::resource::ResourcePolicy::default_library();
         let dummy = || {
-            DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros((
-                n, 1,
-            ))))
+            DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros(
+                (n, 1),
+            )))
         };
         BernoulliMarginalSlopeFamily {
             y: Arc::new(Array1::from_vec(y)),
@@ -3591,9 +3595,9 @@ mod empirical_flex_jet_oracle_tests {
         let n = 1usize;
         let policy = gam_runtime::resource::ResourcePolicy::default_library();
         let dummy = || {
-            DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros((
-                n, 1,
-            ))))
+            DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros(
+                (n, 1),
+            )))
         };
         let family = BernoulliMarginalSlopeFamily {
             y: Arc::new(Array1::from_vec(vec![1.0])),
