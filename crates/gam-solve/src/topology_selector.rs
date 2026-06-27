@@ -1632,7 +1632,7 @@ mod tests {
         (0..candidate.len)
             .into_par_iter()
             .map(|i| {
-                let x = candidate.seed ^ ((i as u64 + 1) * 0x9e37_79b9_7f4a_7c15);
+                let x = candidate.seed ^ (i as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
                 x.rotate_left((i % 31) as u32)
                     .wrapping_mul(0xbf58_476d_1ce4_e5b9)
             })
