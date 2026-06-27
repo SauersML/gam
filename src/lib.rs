@@ -246,9 +246,12 @@ pub use terms::{basis, construction, term_builder};
 /// sites and ~300 integration tests — keeps resolving after the move.
 pub mod smooth {
     pub use crate::terms::smooth::*;
+    // `build_term_collection_design` is re-exported by the `crate::terms::smooth`
+    // glob above (it now lives in `gam_terms::smooth::term_design`). Only the two
+    // joint builders stayed in `gam_models::fit_orchestration::drivers`, so those
+    // are the ones re-exported from there.
     pub use gam_models::fit_orchestration::drivers::{
-        build_term_collection_design, build_term_collection_designs_and_freeze_joint,
-        build_term_collection_designs_joint,
+        build_term_collection_designs_and_freeze_joint, build_term_collection_designs_joint,
     };
 }
 
