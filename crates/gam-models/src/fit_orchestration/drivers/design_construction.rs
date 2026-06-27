@@ -7758,13 +7758,6 @@ pub(crate) fn spatial_length_scale_term_indices(spec: &TermCollectionSpec) -> Ve
 /// through it merely spends ~80 outer iters chasing a stalled ARC at the
 /// user's chosen ρ. Skipping straight to the rho-only path avoids that
 /// waste and respects the user's explicit kernel-scale input.
-pub fn all_spatial_terms_kappa_fixed(spec: &TermCollectionSpec) -> bool {
-    spec.smooth_terms.iter().enumerate().all(|(idx, _)| {
-        !spatial_term_supports_hyper_optimization(spec, idx)
-            || spatial_term_has_locked_kappa(spec, idx)
-    })
-}
-
 fn fit_score(fit: &UnifiedFitResult) -> f64 {
     if fit.reml_score.is_finite() {
         return fit.reml_score;

@@ -13,9 +13,25 @@
 //! `build_analytic_penalty_registry_from_json`; the accepted descriptor kinds
 //! include `"nested_prefix"` for `NestedPrefixPenalty`.
 
-mod ffi_prelude;
+// Concern modules are grouped into a submodule tree on disk (issue #1521
+// navigability carve): `ffi/` (foundation prelude/errors + literal/JSON
+// helpers), `inference/` (inference instruments + benchmark scoring),
+// `io/` (summary render, competing-risks decode, survival-surface I/O),
+// `sklearn/` (sklearn-compat metadata), and `manifold/` (manifold
+// descriptor `#[pyclass]`es alongside the geometry/posterior entrypoint
+// fragments). The five large engine-entrypoint files are `include!`d at the
+// crate root (textually flat), so they share one namespace and the
+// `#[pymodule] _rust` registration in `manifold/geometry_ffi.rs` lives at the
+// crate root.
+mod ffi;
 
-mod ffi_errors;
+mod inference;
+
+mod io;
+
+mod sklearn;
+
+mod manifold;
 
 // Re-export the foundation modules at the crate root. The concern modules
 // (and the `#[pyfunction]`s in the included fragments) reach the exception
@@ -23,29 +39,25 @@ mod ffi_errors;
 // names (`crate::py_value_error`, `crate::GamError`, `crate::PyObject`, …), so
 // the boundary error contract and the shared engine alias each live in exactly
 // one place.
-pub(crate) use ffi_errors::*;
-pub(crate) use ffi_prelude::*;
+pub(crate) use ffi::ffi_errors::*;
+pub(crate) use ffi::ffi_prelude::*;
 
-mod benchmark_scores;
+// Re-export every concern module at the crate root under its historical flat
+// name. The `include!`-fragment entrypoint code is textually inlined at the
+// crate root and reaches these modules by bare name (`benchmark_scores::…`,
+// `crate::finite_safe_json::…`, `inference_instruments::register`, …); the flat
+// re-export keeps every such path resolving while the source files live in the
+// grouped subdirectories above. The Rust module paths now also exist in their
+// canonical grouped form (`crate::ffi::finite_safe_json`, …); the Python
+// surface is unchanged.
+pub(crate) use ffi::{ffi_errors, ffi_prelude, finite_safe_json, python_literal};
+pub(crate) use inference::{benchmark_scores, inference_instruments};
+pub(crate) use io::{competing_risks_decode, summary_render, survival_surface_io};
+pub(crate) use manifold::manifold_pyclasses;
+pub(crate) use sklearn::sklearn_metadata;
 
-mod competing_risks_decode;
-
-mod inference_instruments;
-
-mod manifold_pyclasses;
-
-mod python_literal;
-
-mod sklearn_metadata;
-
-mod summary_render;
-
-mod survival_surface_io;
-
-mod finite_safe_json;
-
-include!("model_ffi.rs");
-include!("latent_basis_and_sae_ffi.rs");
-include!("reml_latent_fit_ffi.rs");
-include!("geometry_ffi.rs");
-include!("manifold_and_posterior_ffi.rs");
+include!("model/model_ffi.rs");
+include!("latent/latent_basis_and_sae_ffi.rs");
+include!("latent/reml_latent_fit_ffi.rs");
+include!("manifold/geometry_ffi.rs");
+include!("manifold/manifold_and_posterior_ffi.rs");

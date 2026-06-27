@@ -7,6 +7,7 @@ rust-version = "1.93"
 [lints.rust]
 warnings = "deny"
 
+
 [dependencies]
 crossterm = "0.29.0"
 dyn-stack = "0.13.2"

@@ -4465,19 +4465,6 @@ fn set_single_term_spatial_aniso_log_scales(
 /// marginal smooth direction trades off against the log-slope into a
 /// separation-scale runaway (#1116). A single Gaussian surface has no such
 /// coupling and keeps ℓ learnable. Returns the number of terms frozen.
-pub fn freeze_measure_jet_length_scale_learning(spec: &mut TermCollectionSpec) -> usize {
-    let mut frozen = 0;
-    for term in spec.smooth_terms.iter_mut() {
-        if let SmoothBasisSpec::MeasureJet { spec: mj, .. } = &mut term.basis
-            && mj.learn_length_scale
-        {
-            mj.learn_length_scale = false;
-            frozen += 1;
-        }
-    }
-    frozen
-}
-
 /// The signed sectional curvature κ of a constant-curvature smooth at
 /// `term_idx`, or `None` if that term is not a `curv(...)` smooth. After a fit
 /// with κ-optimization enabled this reads the **fitted κ̂** out of the resolved

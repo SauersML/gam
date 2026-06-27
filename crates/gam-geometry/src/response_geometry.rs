@@ -13,7 +13,7 @@
 //!
 //! Every primitive here delegates to the canonical landed math
 //! ([`RiemannianManifold::exp_map`]/[`log_map`](RiemannianManifold::log_map) and
-//! the Poincaré [`exp_map`](crate::poincare::exp_map)/[`log_map`](crate::poincare::log_map));
+//! the Poincaré [`exp_map`](crate::manifolds::poincare::exp_map)/[`log_map`](crate::manifolds::poincare::log_map));
 //! the only new code is the batched row loop, the base-point dimension wiring,
 //! and a generic Riemannian Karcher (Fréchet) mean shared by all four. There is
 //! no separate per-manifold mean: the SPD safeguarded Karcher iteration is
@@ -23,7 +23,7 @@
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
-use crate::constant_curvature::ConstantCurvature;
+use crate::manifolds::constant_curvature::ConstantCurvature;
 use crate::manifold::{
     GEOMETRY_EPS, RiemannianManifold, flatten, from_flat, jacobi_symmetric, spectral_map_symmetric,
     sym,
@@ -315,7 +315,7 @@ impl ResponseManifold {
     ) -> GeometryResult<Array1<f64>> {
         match self {
             Self::Poincare { curvature, .. } => {
-                crate::poincare::log_map(base, value, *curvature)
+                crate::manifolds::poincare::log_map(base, value, *curvature)
             }
             // ConstantCurvature implements RiemannianManifold::log_map directly.
             Self::ConstantCurvature { .. }
@@ -336,7 +336,7 @@ impl ResponseManifold {
     ) -> GeometryResult<Array1<f64>> {
         match self {
             Self::Poincare { curvature, .. } => {
-                crate::poincare::exp_map(base, tangent, *curvature)
+                crate::manifolds::poincare::exp_map(base, tangent, *curvature)
             }
             Self::ConstantCurvature { .. }
             | Self::Spd { .. }
@@ -421,7 +421,7 @@ impl ResponseManifold {
     ) -> GeometryResult<f64> {
         match self {
             Self::Poincare { curvature, .. } => {
-                let lam = crate::poincare::conformal_factor(base, *curvature)?;
+                let lam = crate::manifolds::poincare::conformal_factor(base, *curvature)?;
                 Ok(lam * lam * v.iter().map(|x| x * x).sum::<f64>())
             }
             Self::ConstantCurvature { .. }
@@ -675,7 +675,7 @@ pub fn dispatch_exp_map(
 /// `ξ = Σ_i w_i log_P(X_i)` (`= −½ grad V`), a unit Karcher step `exp_P(t·ξ)`
 /// with Armijo backtracking plus a round-off cushion, a best-iterate stall
 /// guard, and the metric-norm stationarity test `‖ξ‖_P ≤ tol`. The SPD-specific
-/// version in [`crate::spd::spd_frechet_mean`] remains for the affine
+/// version in [`crate::manifolds::spd::spd_frechet_mean`] remains for the affine
 /// inverse it caches per step; this generic form pays a metric-tensor solve but
 /// covers all four geometries uniformly.
 pub fn response_frechet_mean(

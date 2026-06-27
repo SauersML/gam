@@ -75,7 +75,7 @@
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
-use super::manifold::{GEOMETRY_EPS, GeometryError, GeometryResult, RiemannianManifold};
+use crate::manifold::{GEOMETRY_EPS, GeometryError, GeometryResult, RiemannianManifold};
 use gam_math::jet_tower::Tower4;
 
 /// Branch threshold for the `C`/`S` series in `u = κt²`. The series terms

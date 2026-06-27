@@ -3171,6 +3171,19 @@ pub fn measure_jet_learns_length_scale(mj: &crate::basis::MeasureJetBasisSpec) -
     mj.learn_length_scale
 }
 
+pub fn freeze_measure_jet_length_scale_learning(spec: &mut TermCollectionSpec) -> usize {
+    let mut frozen = 0;
+    for term in spec.smooth_terms.iter_mut() {
+        if let SmoothBasisSpec::MeasureJet { spec: mj, .. } = &mut term.basis
+            && mj.learn_length_scale
+        {
+            mj.learn_length_scale = false;
+            frozen += 1;
+        }
+    }
+    frozen
+}
+
 /// Measure-jet ψ dial boxes. The dials are NOT log-kernel-scales, so the
 /// κ-window machinery never applies: `α` spans density-weighted (0) through
 /// past-Coifman–Lafon (>1) normalization, and `lnτ` covers the ridge from
@@ -3455,6 +3468,13 @@ pub fn set_single_term_constant_curvature_kappa(
 pub fn spatial_term_has_locked_kappa(spec: &TermCollectionSpec, term_idx: usize) -> bool {
     get_spatial_length_scale(spec, term_idx).is_some()
         && !spatial_term_uses_per_axis_psi(spec, term_idx)
+}
+
+pub fn all_spatial_terms_kappa_fixed(spec: &TermCollectionSpec) -> bool {
+    spec.smooth_terms.iter().enumerate().all(|(idx, _)| {
+        !spatial_term_supports_hyper_optimization(spec, idx)
+            || spatial_term_has_locked_kappa(spec, idx)
+    })
 }
 
 pub fn spatial_identifiability_policy(termspec: &SmoothTermSpec) -> Option<&SpatialIdentifiability> {

@@ -5,7 +5,7 @@ use crate::manifold::{
     from_flat, identity, inverse, jacobi_symmetric, projected_standard_basis_tangent, qr_thin,
     thin_svd_gram,
 };
-use crate::sphere::SphereManifold;
+use crate::manifolds::sphere::SphereManifold;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrassmannManifold {
@@ -42,7 +42,7 @@ impl GrassmannManifold {
     /// two share the same geodesics, exponential, logarithm, parallel
     /// transport, and (constant `+1`) sectional curvature, so we reuse the
     /// [`SphereManifold`] formulas — exactly as `St(n, 1)` does in
-    /// [`StiefelManifold`](crate::stiefel::StiefelManifold). This is
+    /// [`StiefelManifold`](crate::manifolds::stiefel::StiefelManifold). This is
     /// essential at the principal-angle-`π/2` cut-locus boundary, where the
     /// `(YᵀZ)⁻¹` form used by the general-`k` `log_map` is singular but the
     /// sphere logarithm (denominator `1 + Y·Z`) is well defined, so e.g.

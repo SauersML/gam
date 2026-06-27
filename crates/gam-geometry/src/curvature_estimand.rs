@@ -50,7 +50,7 @@
 
 use ndarray::{Array1, ArrayView1};
 
-use super::constant_curvature::{ConstantCurvature, log_map_kappa_jet};
+use crate::manifolds::constant_curvature::{ConstantCurvature, log_map_kappa_jet};
 use super::manifold::GeometryResult;
 
 use super::closure_family::inv_std_normal;

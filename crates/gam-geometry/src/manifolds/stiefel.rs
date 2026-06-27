@@ -4,7 +4,7 @@ use crate::manifold::{
     GeometryError, GeometryResult, RiemannianManifold, check_len, flatten, from_flat, identity,
     matrix_exp, qr_thin, sym, tangent_basis_metric_orthonormal,
 };
-use crate::sphere::SphereManifold;
+use crate::manifolds::sphere::SphereManifold;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StiefelManifold {

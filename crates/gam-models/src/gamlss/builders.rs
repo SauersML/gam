@@ -1428,8 +1428,8 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
     // fast path in `optimize_spatial_length_scale_exact_joint`.
     let mut effective_kappa_options = kappa_options.clone();
     if effective_kappa_options.enabled
-        && crate::fit_orchestration::drivers::all_spatial_terms_kappa_fixed(&mean_bootspec)
-        && crate::fit_orchestration::drivers::all_spatial_terms_kappa_fixed(&noise_bootspec)
+        && gam_terms::smooth::all_spatial_terms_kappa_fixed(&mean_bootspec)
+        && gam_terms::smooth::all_spatial_terms_kappa_fixed(&noise_bootspec)
     {
         log::info!(
             "[GAMLSS spatial] disabling κ/ψ optimization: every spatial term in \

@@ -1672,9 +1672,9 @@ pub fn fit_bernoulli_marginal_slope_terms(
     // restores. ℓ-learning stays on for single-surface (e.g. Gaussian) fits,
     // where there is no marginal/log-slope coupling to destabilize.
     let mjs_frozen_marginal =
-        crate::fit_orchestration::drivers::freeze_measure_jet_length_scale_learning(&mut spec.marginalspec);
+        gam_terms::smooth::freeze_measure_jet_length_scale_learning(&mut spec.marginalspec);
     let mjs_frozen_logslope =
-        crate::fit_orchestration::drivers::freeze_measure_jet_length_scale_learning(&mut spec.logslopespec);
+        gam_terms::smooth::freeze_measure_jet_length_scale_learning(&mut spec.logslopespec);
     if mjs_frozen_marginal + mjs_frozen_logslope > 0 {
         log::info!(
             "[BMS spatial] froze measure-jet length-scale learning on {} marginal + {} log-slope \
@@ -1693,8 +1693,8 @@ pub fn fit_bernoulli_marginal_slope_terms(
     // at the box corner and never recovers), then falls through to the
     // ρ-only "custom family" path which is what we wanted all along.
     // Short-circuit straight to the ρ-only path.
-    let kappa_locked_marginal = crate::fit_orchestration::drivers::all_spatial_terms_kappa_fixed(&spec.marginalspec);
-    let kappa_locked_logslope = crate::fit_orchestration::drivers::all_spatial_terms_kappa_fixed(&spec.logslopespec);
+    let kappa_locked_marginal = gam_terms::smooth::all_spatial_terms_kappa_fixed(&spec.marginalspec);
+    let kappa_locked_logslope = gam_terms::smooth::all_spatial_terms_kappa_fixed(&spec.logslopespec);
     if effective_kappa_options.enabled && kappa_locked_marginal && kappa_locked_logslope {
         log::info!(
             "[BMS spatial] disabling κ/ψ optimization: every spatial term has an \
