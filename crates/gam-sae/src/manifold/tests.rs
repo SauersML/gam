@@ -10002,8 +10002,8 @@ pub(crate) fn arrow_schur_assembly_is_faer_parallelism_invariant_1557() {
     let n = 128usize;
     let p = 32usize;
     let k = 8usize;
-    let m = 5usize; // periodic basis size (M = 2*harmonics+1 for harmonics=2)
-    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(2).unwrap());
+    let m = 5usize; // periodic basis width (odd; M = 2*harmonics+1 for harmonics=2)
+    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(m).unwrap());
 
     // Distinct per-atom latent coordinates and decoders so every (gt, htt,
     // htbeta) block carries nontrivial, atom-specific structure.
