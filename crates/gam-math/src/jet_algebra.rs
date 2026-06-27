@@ -33,6 +33,37 @@
 //!   `h[i][k]`).
 //! * For a bitmask coefficient `mask`, the set bits are the slots; a
 //!   sub-group of bits is itself a sub-mask read straight out of `coeffs`.
+//!
+//! # Performance: the combinatorics is precomputed, not re-walked (#1151 perf)
+//!
+//! The subset enumeration (Leibniz) and the set-partition enumeration (Faà di
+//! Bruno) over `m` slots are *fixed combinatorial objects*: they depend only
+//! on the slot count `m`, never on the actual derivative values. The hot per-row
+//! jet path nevertheless calls these walkers millions of times, and the original
+//! kernel rebuilt that structure from scratch on every call — the Faà di Bruno
+//! walk via a recursive `&mut dyn FnMut` "assign each element to a block"
+//! enumeration whose leaf and every block read went through a vtable that never
+//! inlined, plus a freshly cleared [`SlotBuf`] per block; the Leibniz walk via a
+//! per-bit branch building two [`SlotBuf`]s for every one of the `2^m` subsets.
+//!
+//! Both structures are now built ONCE per slot-count `m` (lazily, into a
+//! process-wide cache keyed by `m ∈ 0..=8`) and stored as flat, packed bitmask
+//! tables. The walkers iterate those tables with straight-line loops — no
+//! recursion, no `&mut dyn FnMut` dispatch, no per-call structure rebuild — so
+//! the only work left on the hot path is the actual arithmetic (the closure
+//! reads of derivatives and their products/sums). The emission order of the
+//! cached tables is, by construction, the EXACT order the former recursive /
+//! branch walkers produced (the table builder runs that same enumeration once),
+//! so every product is left-associated identically and every channel's sum
+//! accumulates in the same order: the result is `to_bits`-identical to the
+//! former walkers, only with the combinatorial bookkeeping amortised away.
+
+use std::sync::OnceLock;
+
+/// The largest slot-count the packed-table caches cover, plus one. A slot list
+/// is built in a [`SlotBuf`] (capacity 8), so `m ≤ 8` always holds on every
+/// path that reaches these walkers; the caches are indexed directly by `m`.
+const MAX_SLOTS: usize = 8;
 
 /// Walk the Leibniz product rule for an output of `m` differentiation slots.
 ///
@@ -43,6 +74,18 @@
 ///
 /// `m` is small (≤ 4 for the tower, ≤ 8 for the directional jet); the
 /// `2^m` subset walk is the exact rule, not a truncation.
+///
+/// # Performance
+///
+/// The `(subset, complement)` index split for each of the `2^m` subsets depends
+/// only on `m`, so it is computed once per `m` (see [`subset_split_table`]) and
+/// cached as packed bit lists. Per call this loop only maps those cached indices
+/// through `positions` and invokes the two closures — no per-bit branch, no
+/// per-subset structure rebuild. BIT-IDENTICAL to the former branch walker:
+/// subsets are enumerated in the same `sub = 0..2^m` order (subset bit `b` ↔
+/// position `b`), the subset/complement position lists are in the same
+/// increasing-bit order, and the running `total` starts at `0.0` so a
+/// signed-zero leading product collapses to `+0.0` identically.
 #[inline]
 pub(crate) fn leibniz_product<L, R>(positions: &[usize], mut left: L, mut right: R) -> f64
 where
@@ -51,21 +94,21 @@ where
 {
     let m = positions.len();
     assert!(
-        m <= usize::BITS as usize,
+        m <= MAX_SLOTS,
         "too many differentiation slots for subset enumeration"
     );
+    let table = subset_split_table(m);
     let mut subset = SlotBuf::new();
     let mut complement = SlotBuf::new();
     let mut total = 0.0;
-    for sub in 0u32..(1u32 << m) {
-        subset.clear();
-        complement.clear();
-        for (bit, &pos) in positions.iter().enumerate() {
-            if sub & (1u32 << bit) != 0 {
-                subset.push(pos);
-            } else {
-                complement.push(pos);
-            }
+    for split in table {
+        subset.len = 0;
+        for &bit in split.subset.as_slice() {
+            subset.push(positions[bit]);
+        }
+        complement.len = 0;
+        for &bit in split.complement.as_slice() {
+            complement.push(positions[bit]);
         }
         total += left(subset.as_slice()) * right(complement.as_slice());
     }
@@ -79,6 +122,19 @@ where
 /// derivative of the inner expression for a block's position list. Returns the
 /// summed output coefficient. Blocks of order ≥ `derivs.len()` are skipped
 /// (their `f^{(r)}` is beyond the truncation), matching both legacy paths.
+///
+/// # Performance
+///
+/// The set partitions of `m` slots depend only on `m`, so the full partition
+/// list is built once per `m` (see [`partition_table`]) and cached as packed
+/// per-block bitmasks. This walk iterates that flat table directly — no
+/// recursive enumeration, no `&mut dyn FnMut` leaf dispatch, no per-block
+/// [`SlotBuf`] churn beyond translating a block's bitmask to labelled positions.
+/// BIT-IDENTICAL to the former recursive walker: partitions are emitted in the
+/// same order, each partition's blocks are in the same first-appearance order,
+/// each block's positions are in the same increasing order, every block product
+/// is left-associated from `derivs[order]`, and the channel `total` starts at
+/// `0.0` (signed-zero products collapse to `+0.0` identically).
 #[inline]
 pub fn faa_di_bruno<F>(positions: &[usize], derivs: &[f64], mut inner: F) -> f64
 where
@@ -88,23 +144,29 @@ where
     if m == 0 {
         return derivs[0];
     }
+    let table = partition_table(m);
     let mut total = 0.0;
-    for_each_partition(m, &mut |blocks: &[SlotBuf]| {
-        let order = blocks.len();
+    let mut labelled = SlotBuf::new();
+    for part in table {
+        let order = part.n_blocks as usize;
         if order >= derivs.len() {
-            return;
+            continue;
         }
         let mut prod = derivs[order];
-        for block in blocks {
-            // Translate block positions to their axis labels for `inner`.
-            let mut labelled = SlotBuf::new();
-            for &p in block.as_slice() {
-                labelled.push(positions[p]);
+        for &block_mask in &part.blocks[..order] {
+            // Translate the block's element-index bitmask to axis labels for
+            // `inner`, in increasing element order (the walker's block order).
+            labelled.len = 0;
+            let mut bits = block_mask;
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                labelled.push(positions[bit]);
+                bits &= bits - 1;
             }
             prod *= inner(labelled.as_slice());
         }
         total += prod;
-    });
+    }
     total
 }
 
@@ -157,10 +219,6 @@ impl SlotBuf {
         }
     }
     #[inline]
-    fn clear(&mut self) {
-        self.len = 0;
-    }
-    #[inline]
     fn push(&mut self, v: usize) {
         self.data[self.len] = v;
         self.len += 1;
@@ -178,35 +236,101 @@ impl SlotBuf {
     }
 }
 
-/// Invoke `f` once per set-partition of positions `0..m`, passing the blocks
-/// as slot lists. Recursive "assign each element to an existing or new block"
-/// enumeration — allocation-free via the fixed-capacity [`SlotBuf`].
-fn for_each_partition(m: usize, f: &mut dyn FnMut(&[SlotBuf])) {
-    let mut blocks: [SlotBuf; 8] = [SlotBuf::new(); 8];
-    recurse(0, m, &mut blocks, 0, f);
+// ───────────────────────── precomputed combinatorial tables ─────────────────
+//
+// Both tables are keyed by slot-count `m ∈ 0..=MAX_SLOTS` and built lazily on
+// first use of that `m`. The build enumerations are the SAME recursions / loops
+// the walkers formerly ran inline, so the cached emission order is identical and
+// the walkers stay `to_bits`-exact. After the first call for a given `m` the hot
+// path does zero structural work.
+
+/// One subset of an `m`-slot Leibniz product: the bit indices `0..m` that fall
+/// in the subset `T`, and those in its complement `S∖T`, each in increasing
+/// order. Mirrors the former per-bit branch (`sub & (1<<bit) != 0`).
+#[derive(Clone)]
+struct SubsetSplit {
+    subset: SlotBuf,
+    complement: SlotBuf,
 }
 
-fn recurse(
+/// One set-partition of `m` slots: each block stored as a bitmask over the
+/// element indices `0..m`, in the blocks' first-appearance order (the order the
+/// former recursion appended them). `n_blocks` is the partition's order `|π|`.
+#[derive(Clone, Copy)]
+struct PackedPartition {
+    blocks: [u8; MAX_SLOTS],
+    n_blocks: u8,
+}
+
+static SUBSET_TABLES: [OnceLock<Vec<SubsetSplit>>; MAX_SLOTS + 1] =
+    [const { OnceLock::new() }; MAX_SLOTS + 1];
+static PARTITION_TABLES: [OnceLock<Vec<PackedPartition>>; MAX_SLOTS + 1] =
+    [const { OnceLock::new() }; MAX_SLOTS + 1];
+
+/// The cached `(subset, complement)` index splits for `m` slots, in the former
+/// `sub = 0..2^m` enumeration order (subset bit `b` ↔ position `b`).
+#[inline]
+fn subset_split_table(m: usize) -> &'static [SubsetSplit] {
+    SUBSET_TABLES[m].get_or_init(|| {
+        let mut out = Vec::with_capacity(1usize << m);
+        for sub in 0u32..(1u32 << m) {
+            let mut subset = SlotBuf::new();
+            let mut complement = SlotBuf::new();
+            for bit in 0..m {
+                if sub & (1u32 << bit) != 0 {
+                    subset.push(bit);
+                } else {
+                    complement.push(bit);
+                }
+            }
+            out.push(SubsetSplit { subset, complement });
+        }
+        out
+    })
+}
+
+/// The cached set-partition list for `m` slots, in the former recursive
+/// "assign each element to an existing or new block" emission order.
+#[inline]
+fn partition_table(m: usize) -> &'static [PackedPartition] {
+    PARTITION_TABLES[m].get_or_init(|| {
+        let mut out = Vec::new();
+        let mut blocks = [0u8; MAX_SLOTS];
+        build_partitions(0, m, &mut blocks, 0, &mut out);
+        out
+    })
+}
+
+/// Enumerate the set-partitions of `0..m` exactly as the former `recurse` did:
+/// element `elem` is placed into each existing block (in block order) before a
+/// fresh block is opened with it alone. Records each completed partition's
+/// block bitmasks in first-appearance order. Runs once per `m`.
+fn build_partitions(
     elem: usize,
     m: usize,
-    blocks: &mut [SlotBuf; 8],
+    blocks: &mut [u8; MAX_SLOTS],
     n_blocks: usize,
-    f: &mut dyn FnMut(&[SlotBuf]),
+    out: &mut Vec<PackedPartition>,
 ) {
     if elem == m {
-        f(&blocks[..n_blocks]);
+        let mut packed = PackedPartition {
+            blocks: [0u8; MAX_SLOTS],
+            n_blocks: n_blocks as u8,
+        };
+        packed.blocks[..n_blocks].copy_from_slice(&blocks[..n_blocks]);
+        out.push(packed);
         return;
     }
+    let bit = 1u8 << elem;
     // Place `elem` into each existing block.
     for b in 0..n_blocks {
-        blocks[b].push(elem);
-        recurse(elem + 1, m, blocks, n_blocks, f);
-        blocks[b].len -= 1;
+        blocks[b] |= bit;
+        build_partitions(elem + 1, m, blocks, n_blocks, out);
+        blocks[b] &= !bit;
     }
     // Or open a new block with `elem` alone.
-    blocks[n_blocks].clear();
-    blocks[n_blocks].push(elem);
-    recurse(elem + 1, m, blocks, n_blocks + 1, f);
+    blocks[n_blocks] = bit;
+    build_partitions(elem + 1, m, blocks, n_blocks + 1, out);
 }
 
 #[cfg(test)]
