@@ -870,7 +870,7 @@ impl IsometryPenalty {
     /// Cost per row: `O(p · r · d)` for the `M_n` build (single pass over
     /// `U_n` and `J_n`) plus `O(r · d²)` for `M_n^T M_n`. The `p × p` weight
     /// `W_n` is never materialized.
-    pub(crate) fn pullback_metric(&self, latent_dim: usize) -> Option<Array2<f64>> {
+    pub fn pullback_metric(&self, latent_dim: usize) -> Option<Array2<f64>> {
         let Some(jac) = self.jacobian_cache() else {
             self.missing_cache_default("pullback_metric", "jacobian_cache is None");
             return None;

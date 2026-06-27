@@ -10,7 +10,8 @@ use super::tests::{
     warmstart_test_objective_with_evaluator,
 };
 use super::*;
-use gam_terms::{AssignmentMode, LatentManifold, SaeAssignment};
+use crate::assignment::{AssignmentMode, SaeAssignment};
+use gam_terms::latent::LatentManifold;
 use approx::assert_abs_diff_eq;
 use ndarray::array;
 use std::sync::Arc;
