@@ -39,7 +39,7 @@ use gam_solve::estimate::{
 
 use gam_solve::estimate::reml::DirectionalHyperParam;
 
-use crate::family_runtime::strategy_for_spec;
+use crate::family_runtime::{FamilyStrategy, strategy_for_spec};
 
 use gam_solve::mixture_link::{
     logit_inverse_link_jet5, state_from_beta_logisticspec, state_from_sasspec, state_fromspec,

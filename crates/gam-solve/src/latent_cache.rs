@@ -537,7 +537,7 @@ pub struct ComputedLatentDesign {
 
 pub struct LatentDesignLookup<'a> {
     pub cached: &'a CachedDesign,
-    pub(crate) entry_id: u64,
+    pub entry_id: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -695,11 +695,11 @@ impl LatentDesignCache {
         }
     }
 
-    pub(crate) fn invalidate(&mut self) {
+    pub fn invalidate(&mut self) {
         self.entries.clear();
     }
 
-    pub(crate) fn invalidate_all(&mut self) {
+    pub fn invalidate_all(&mut self) {
         self.entries.clear();
         self.clock = self.clock.wrapping_add(1);
         self.iteration = self.iteration.wrapping_add(1);

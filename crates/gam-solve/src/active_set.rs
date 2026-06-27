@@ -517,7 +517,7 @@ pub(crate) fn interior_seed_margin() -> f64 {
 /// `point` — it inherits whatever curvature `point` already carries. Returns
 /// `None` if the constraints are malformed or the active-set QP cannot certify a
 /// feasible solution, so callers can fall back.
-pub(crate) fn project_point_strictly_into_feasible_cone(
+pub fn project_point_strictly_into_feasible_cone(
     point: &Array1<f64>,
     constraints: &LinearInequalityConstraints,
 ) -> Option<Array1<f64>> {
@@ -1624,7 +1624,7 @@ pub(crate) fn solve_newton_direction_with_linear_constraints(
     )
 }
 
-pub(crate) fn solve_quadratic_with_linear_constraints(
+pub fn solve_quadratic_with_linear_constraints(
     hessian: &Array2<f64>,
     rhs: &Array1<f64>,
     beta_start: &Array1<f64>,

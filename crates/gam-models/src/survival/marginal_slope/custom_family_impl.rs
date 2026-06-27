@@ -279,7 +279,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
             // mask uniformly through the Horvitz–Thompson weights on each
             // `WeightedOuterRow`.
             let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
-            let rows = crate::row_kernel::RowSet::from_options(options, self.n);
+            let rows = crate::row_kernel::row_set_from_options(options, self.n);
             return Ok(Some(Arc::new(RowKernelHessianWorkspace::with_rows(
                 kern, rows,
             )?)));

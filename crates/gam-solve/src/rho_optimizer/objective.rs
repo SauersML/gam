@@ -529,7 +529,7 @@ pub(crate) fn classify_cache_entry_for_outer(
     }
 }
 
-pub(crate) fn cache_entry_would_help_outer(
+pub fn cache_entry_would_help_outer(
     loaded: &gam_runtime::warm_start::LoadedEntry,
     expected_rho_dim: usize,
 ) -> bool {

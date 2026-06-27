@@ -23,7 +23,7 @@
 /// the m=4 smooth contribution to collapse to ~0. When `max_ev == 0`
 /// (no positive modes) the threshold collapses to 0 too, which is the
 /// only correct answer.
-pub(crate) fn positive_eigenvalue_threshold(eigenvalues: &[f64]) -> f64 {
+pub fn positive_eigenvalue_threshold(eigenvalues: &[f64]) -> f64 {
     let p = eigenvalues.len();
     let max_ev = eigenvalues
         .iter()

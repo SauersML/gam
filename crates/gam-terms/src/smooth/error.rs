@@ -44,7 +44,7 @@ impl From<BlockCountMismatch> for SmoothError {
 
 impl SmoothError {
     #[inline]
-    pub(super) fn invalid_config(reason: impl Into<String>) -> Self {
+    pub fn invalid_config(reason: impl Into<String>) -> Self {
         SmoothError::InvalidConfig {
             reason: reason.into(),
         }
@@ -56,7 +56,7 @@ impl SmoothError {
         }
     }
     #[inline]
-    pub(super) fn invalid_index(reason: impl Into<String>) -> Self {
+    pub fn invalid_index(reason: impl Into<String>) -> Self {
         SmoothError::InvalidIndex {
             reason: reason.into(),
         }

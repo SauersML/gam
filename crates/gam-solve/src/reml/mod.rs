@@ -4027,7 +4027,7 @@ impl DirectionalHyperParam {
         self
     }
 
-    pub(crate) fn with_penaltysecond_component_provider(
+    pub fn with_penaltysecond_component_provider(
         mut self,
         provider: std::sync::Arc<
             dyn Fn(usize) -> Result<Option<Vec<PenaltyDerivativeComponent>>, EstimationError>
@@ -4040,7 +4040,7 @@ impl DirectionalHyperParam {
         self
     }
 
-    pub(crate) fn with_penaltysecond_partner_indices(mut self, partners: Vec<usize>) -> Self {
+    pub fn with_penaltysecond_partner_indices(mut self, partners: Vec<usize>) -> Self {
         self.penaltysecond_partner_indices = Some(std::sync::Arc::from(partners));
         self
     }

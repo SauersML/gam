@@ -489,11 +489,11 @@ impl LatentCoordDesignDerivative {
         self.provider.latent_dim()
     }
 
-    pub(crate) fn n_axes(&self) -> usize {
+    pub fn n_axes(&self) -> usize {
         self.provider.n_axes()
     }
 
-    pub(crate) fn p_out(&self) -> usize {
+    pub fn p_out(&self) -> usize {
         self.provider.p_out()
     }
 }

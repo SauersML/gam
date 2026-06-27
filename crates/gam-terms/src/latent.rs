@@ -991,7 +991,7 @@ impl LatentCoordValues {
         )
     }
 
-    pub(crate) fn from_flat_with_manifold_and_retraction_and_id(
+    pub fn from_flat_with_manifold_and_retraction_and_id(
         values: Array1<f64>,
         n_obs: usize,
         latent_dim: usize,

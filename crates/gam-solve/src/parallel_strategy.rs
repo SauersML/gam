@@ -4,4 +4,4 @@
 //! The pool is process infrastructure; each numerical kernel still owns the
 //! decision of how much parallelism is useful for its arithmetic shape.
 
-pub(crate) use gam_linalg::parallel::row_reduction_chunk_rows;
+pub use gam_linalg::parallel::{row_reduction_chunk_count, row_reduction_chunk_rows};

@@ -751,7 +751,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             // assembly function honour it uniformly via the Horvitz–Thompson
             // weights carried on each `WeightedOuterRow`.
             let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
-            let rows = crate::row_kernel::RowSet::from_options(options, self.y.len());
+            let rows = crate::row_kernel::row_set_from_options(options, self.y.len());
             Ok(Some(Arc::new(RowKernelHessianWorkspace::with_rows(
                 kern, rows,
             )?)))

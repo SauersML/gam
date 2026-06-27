@@ -1,4 +1,4 @@
-pub(crate) mod active_set;
+pub mod active_set;
 pub mod arrow_schur;
 pub mod continuation_path;
 pub mod cross_node;
@@ -25,7 +25,7 @@ pub mod measure_jet_gram_cache;
 pub mod mixture_link;
 pub(crate) mod objective_base;
 pub mod orthogonal_reparam;
-pub(crate) mod parallel_strategy;
+pub mod parallel_strategy;
 pub mod persistent_warm_start;
 pub mod pirls;
 pub(crate) mod priority_selection;

@@ -3397,7 +3397,7 @@ impl<'d> SpatialJointContext<'d> {
             theta,
             self.rho_dim,
             hyper_dirs,
-            warm_beta.as_ref().map(|b| b.view()),
+            warm_beta.as_ref().map(|b: &Array1<f64>| b.view()),
             if allow_second_order {
                 order
             } else {
@@ -3439,7 +3439,7 @@ impl<'d> SpatialJointContext<'d> {
             theta,
             self.rho_dim,
             hyper_dirs,
-            warm_beta.as_ref().map(|b| b.view()),
+            warm_beta.as_ref().map(|b: &Array1<f64>| b.view()),
             design_revision,
         )
     }
@@ -3581,7 +3581,7 @@ impl<'d> SpatialJointContext<'d> {
                 design.linear_constraints.clone(),
                 theta,
                 self.rho_dim,
-                warm_beta.as_ref().map(|b| b.view()),
+                warm_beta.as_ref().map(|b: &Array1<f64>| b.view()),
                 cost_label,
                 design_revision,
             )

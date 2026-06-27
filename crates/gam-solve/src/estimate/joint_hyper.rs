@@ -305,7 +305,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     /// installed onto the inner REML surface inside `prepare_eval_state` and
     /// then cleared; passing `None` clears any previously staged Gram so a stale
     /// previous-ψ Gram is never consumed.
-    pub(crate) fn stage_glm_first_step_gram(&mut self, gram: Option<Array2<f64>>) {
+    pub fn stage_glm_first_step_gram(&mut self, gram: Option<Array2<f64>>) {
         self.pending_glm_first_step_gram = gram.map(std::sync::Arc::new);
     }
 
@@ -319,7 +319,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     /// Hessian curvature `B_j` always stays the exact n-dependent slab. Passing
     /// `None` clears any previously staged pair so a stale previous-ψ
     /// derivative is never consumed.
-    pub(crate) fn stage_glm_psi_gram_deriv(&mut self, deriv: Option<(Array2<f64>, Array1<f64>)>) {
+    pub fn stage_glm_psi_gram_deriv(&mut self, deriv: Option<(Array2<f64>, Array1<f64>)>) {
         self.pending_glm_psi_gram_deriv = deriv.map(std::sync::Arc::new);
     }
 
@@ -432,7 +432,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     }
 
     /// True when the n-free penalty re-key lane is enabled for this fit.
-    pub(crate) fn supports_nfree_penalty_rekey(&self) -> bool {
+    pub fn supports_nfree_penalty_rekey(&self) -> bool {
         self.supports_nfree_penalty_rekey
     }
 
@@ -447,7 +447,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     /// reference surface; the slow path clears it (the freshly realized penalty
     /// is used instead). Passing `None` clears any previously staged surface so a
     /// stale previous-ψ `S` is never consumed.
-    pub(crate) fn stage_fast_path_penalty(
+    pub fn stage_fast_path_penalty(
         &mut self,
         penalty: Option<(Vec<gam_terms::construction::CanonicalPenalty>, Vec<usize>)>,
     ) {
@@ -471,7 +471,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     /// Returns the certified tensor (caller owns it, e.g. to re-use the
     /// per-trial weight-drift guard), or `None` when no Chebyshev rung certifies
     /// — the caller then keeps the exact per-trial PIRLS rebuild.
-    pub(crate) fn build_frozen_glm_gram_tensor(
+    pub fn build_frozen_glm_gram_tensor(
         &self,
         mut eval_raw_design: impl FnMut(f64) -> Result<DesignMatrix, String>,
         frozen_w: ArrayView1<'_, f64>,
@@ -498,7 +498,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     /// caller's per-trial n×k ∂X/∂ψ slab is redundant (#1033). For the
     /// sufficient-statistic kappa search this covers the full optimizer window;
     /// otherwise the caller does not arm the n-free outer loop.
-    pub(crate) fn psi_gram_tensor_covers_gradient(&self, psi: f64) -> bool {
+    pub fn psi_gram_tensor_covers_gradient(&self, psi: f64) -> bool {
         self.psi_gram_tensor
             .as_ref()
             .is_some_and(|t| t.contains_for_gradient(psi))
@@ -513,7 +513,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     /// the stale realized design is never read for its rows on the inner Gaussian
     /// PLS fast path. Strictly narrower-or-equal callers also gate on
     /// `psi_gram_tensor_covers_gradient` for the gradient channel.
-    pub(crate) fn psi_gram_tensor_covers(&self, psi: f64) -> bool {
+    pub fn psi_gram_tensor_covers(&self, psi: f64) -> bool {
         self.psi_gram_tensor
             .as_ref()
             .is_some_and(|t| t.contains(psi))
@@ -536,7 +536,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     /// psi)` against the pinning ψ recorded at the last slow-path reset. Without a
     /// recorded pinning ψ (no reset yet) the skip is refused. Value coverage alone
     /// is NOT sufficient — this is the load-bearing #1264 soundness gate.
-    pub(crate) fn psi_gram_tensor_covers_skip(&self, psi: f64) -> bool {
+    pub fn psi_gram_tensor_covers_skip(&self, psi: f64) -> bool {
         let Some(tensor) = self.psi_gram_tensor.as_ref() else {
             return false;
         };
@@ -559,7 +559,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     /// unrelated miss. The fast path re-keys the Gaussian Gram and `S(ψ)` from
     /// k-space statistics, so it intentionally reuses this pinned surface rather
     /// than requiring equality with the current realizer revision (#1033).
-    pub(crate) fn nfree_fast_path_revision(&self) -> Option<u64> {
+    pub fn nfree_fast_path_revision(&self) -> Option<u64> {
         self.last_canonical_revision
     }
 
@@ -572,7 +572,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     /// warm-start successive outer evaluations instead of cold-starting PIRLS
     /// from zero every iteration — especially important for GLM families (Poisson,
     /// NB, Binomial) that cannot use the Gaussian Gram tensor n-free shortcut.
-    pub(crate) fn current_beta(&self) -> Option<Array1<f64>> {
+    pub fn current_beta(&self) -> Option<Array1<f64>> {
         self.reml_state.current_original_basis_beta()
     }
 

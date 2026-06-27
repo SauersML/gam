@@ -71,6 +71,10 @@ pub(crate) use run::*;
 // Re-export the outer-problem driver at `pub` (not just `pub(crate)`) so the
 // gam-pyffi crate can construct it directly for the SAE joint-fit FFI path.
 pub use run::OuterProblem;
+// Re-export the outer-loop result struct at `pub` (the blanket `run` re-export
+// above is `pub(crate)`) so the lifted gam-models fit-orchestration driver can
+// name `gam_solve::rho_optimizer::OuterResult` (#1521).
+pub use run::OuterResult;
 pub(crate) use run_plan::*;
 // Re-export the outer wall-clock deadline arming at `pub` (the blanket
 // `run_plan` re-export above is `pub(crate)`) so the gam-pyffi SAE fit entry can

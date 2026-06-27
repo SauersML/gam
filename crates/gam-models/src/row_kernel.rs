@@ -154,25 +154,28 @@ fn cache_build_block_count(n_rows: usize, chunk_rows: usize) -> usize {
 // can name it without the `Subsample` field reaching up into `solver`. The
 // family-specific `from_options` constructor below stays here because it reads
 // `custom_family::BlockwiseFitOptions`.
-impl RowSet {
-    /// Build a `RowSet` directly from the outer-only subsample carried on
-    /// `BlockwiseFitOptions`. When `outer_score_subsample` is `None` this
-    /// returns `RowSet::All` with the caller-supplied `n_total`.
-    ///
-    /// `n_total` is the full data row count; it is recorded as `n_full`
-    /// on the `Subsample` variant so downstream row-set consumers can validate
-    /// Horvitz-Thompson weights against the population size.
-    pub fn from_options(
-        opts: &crate::custom_family::BlockwiseFitOptions,
-        n_total: usize,
-    ) -> Self {
-        match opts.outer_score_subsample.as_ref() {
-            None => Self::All,
-            Some(s) => Self::Subsample {
-                rows: Arc::clone(&s.rows),
-                n_full: n_total,
-            },
-        }
+/// Build a [`RowSet`] directly from the outer-only subsample carried on
+/// `BlockwiseFitOptions`. When `outer_score_subsample` is `None` this
+/// returns `RowSet::All` with the caller-supplied `n_total`.
+///
+/// `n_total` is the full data row count; it is recorded as `n_full`
+/// on the `Subsample` variant so downstream row-set consumers can validate
+/// Horvitz-Thompson weights against the population size.
+///
+/// A free function (not an inherent method on `RowSet`) because `RowSet` now
+/// lives in the lower `gam-problem` crate (#1135) and the orphan rule forbids
+/// an inherent `impl` on a foreign type; the family-specific
+/// `BlockwiseFitOptions` constructor stays in gam-models (#1521).
+pub fn row_set_from_options(
+    opts: &crate::custom_family::BlockwiseFitOptions,
+    n_total: usize,
+) -> RowSet {
+    match opts.outer_score_subsample.as_ref() {
+        None => RowSet::All,
+        Some(s) => RowSet::Subsample {
+            rows: Arc::clone(&s.rows),
+            n_full: n_total,
+        },
     }
 }
 

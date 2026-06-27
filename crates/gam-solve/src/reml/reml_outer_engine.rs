@@ -167,7 +167,10 @@ pub(crate) use dense_linalg::{
     design_matrix_transpose_apply_view_into, trace_matrix_product,
 };
 pub(crate) use dense_projection::{dense_projected_matrix, dense_trace_projected_factor};
-pub(crate) use pseudo_logdet::{exact_pseudo_logdet, positive_eigenvalue_threshold};
+pub(crate) use pseudo_logdet::exact_pseudo_logdet;
+// Re-exported at `pub` (#1521) so the lifted gam-models bms deviation-runtime
+// driver can call `gam_solve::estimate::reml::reml_outer_engine::positive_eigenvalue_threshold`.
+pub use pseudo_logdet::positive_eigenvalue_threshold;
 
 // ─────────────────────────────────────────────────────────────────────────
 // Concern submodules. Each is a single, self-contained concern; cross-module
