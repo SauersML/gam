@@ -9,12 +9,11 @@
 // `gam_solve::*`, basis/term machinery as `gam_terms::*`).
 use gam_terms::basis::{
     BasisError, BasisMetadata, BasisPsiDerivativeResult, BasisPsiSecondDerivativeResult,
-    BasisWorkspace, CenterStrategy, ConstantCurvatureBasisSpec, MaternIdentifiability, PenaltyInfo,
-    PenaltySource, build_bspline_basis_1d, build_constant_curvature_basis_kappa_derivatives,
+    BasisWorkspace, CenterStrategy, MaternIdentifiability, PenaltyInfo, PenaltySource,
+    build_constant_curvature_basis_kappa_derivatives,
     build_matern_basis_log_kappa_aniso_derivatives, build_matern_basis_log_kappa_derivatives,
     build_matern_collocation_operator_matrices, build_measure_jet_basis_psi_derivatives,
     build_thin_plate_basis_log_kappa_derivatives, estimate_penalty_nullity, initial_aniso_contrasts,
-    select_centers_by_strategy,
 };
 
 use gam_custom_family::{
@@ -38,7 +37,7 @@ use gam_solve::estimate::reml::DirectionalHyperParam;
 // by families + pyffi resolves unchanged.
 pub use gam_terms::smooth::freeze_term_collection_from_design;
 
-use crate::family_runtime::strategy_for_spec;
+use crate::family_runtime::{FamilyStrategy, strategy_for_spec};
 
 use gam_solve::mixture_link::{
     logit_inverse_link_jet5, state_from_beta_logisticspec, state_from_sasspec, state_fromspec,
@@ -61,12 +60,11 @@ use gam_spec::{
 
 use gam_terms::smooth::input_standardization::{
     apply_input_standardization, compensate_length_scale_for_standardization,
-    compensate_optional_length_scale_for_standardization, compute_spatial_input_scales,
+    compensate_optional_length_scale_for_standardization,
 };
 
 use gam_terms::smooth::penalty_priors::{
-    realize_coefficient_groups, realize_keyed_penalty_block_gamma_priors,
-    realize_penalty_block_gamma_priors,
+    realize_keyed_penalty_block_gamma_priors, realize_penalty_block_gamma_priors,
 };
 
 use gam_terms::smooth::shape_constraints::{
