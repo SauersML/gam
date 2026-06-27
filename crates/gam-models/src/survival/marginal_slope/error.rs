@@ -57,7 +57,7 @@ impl std::fmt::Display for JointPreflightBlock {
     }
 }
 
-crate::impl_reason_error_boilerplate! {
+impl_reason_error_boilerplate! {
     SurvivalMarginalSlopeError {
         InvalidInput,
         IncompatibleDimensions,

@@ -355,7 +355,7 @@ pub(crate) fn scale_dense_rows(
     coeffs: &Array1<f64>,
 ) -> Result<Array2<f64>, SurvivalLocationScaleError> {
     if mat.nrows() != coeffs.len() {
-        crate::bail_dim_sls!(
+        bail_dim_sls!(
             "row scaling dimension mismatch: matrix has {} rows but coeffs have {} entries",
             mat.nrows(),
             coeffs.len()

@@ -6,13 +6,13 @@ pub(crate) fn validate_cov_block(
     b: &ParameterBlockInput,
 ) -> Result<(), SurvivalLocationScaleError> {
     if b.design.nrows() != n {
-        crate::bail_dim_sls!(
+        bail_dim_sls!(
             "{name} design row mismatch: got {}, expected {n}",
             b.design.nrows()
         );
     }
     if b.offset.len() != n {
-        crate::bail_dim_sls!(
+        bail_dim_sls!(
             "{name} offset length mismatch: got {}, expected {n}",
             b.offset.len()
         );
@@ -21,7 +21,7 @@ pub(crate) fn validate_cov_block(
     if let Some(beta0) = &b.initial_beta
         && beta0.len() != p
     {
-        crate::bail_dim_sls!(
+        bail_dim_sls!(
             "{name} initial_beta length mismatch: got {}, expected {p}",
             beta0.len()
         );
@@ -30,7 +30,7 @@ pub(crate) fn validate_cov_block(
     if let Some(rho0) = &b.initial_log_lambdas
         && rho0.len() != k
     {
-        crate::bail_dim_sls!(
+        bail_dim_sls!(
             "{name} initial_log_lambdas length mismatch: got {}, expected {k}",
             rho0.len()
         );
@@ -44,7 +44,7 @@ pub(crate) fn validate_cov_block(
                     || local.nrows() != col_range.len()
                     || local.ncols() != col_range.len()
                 {
-                    crate::bail_dim_sls!(
+                    bail_dim_sls!(
                         "{name} penalty {idx} block shape mismatch: col_range={}..{}, local={}x{}, total_dim={p}",
                         col_range.start,
                         col_range.end,
@@ -57,7 +57,7 @@ pub(crate) fn validate_cov_block(
             | gam_terms::penalty_spec::PenaltySpec::DenseWithMean { matrix: m, .. } => {
                 let (r, c) = m.dim();
                 if r != p || c != p {
-                    crate::bail_dim_sls!("{name} penalty {idx} must be {p}x{p}, got {r}x{c}");
+                    bail_dim_sls!("{name} penalty {idx} must be {p}x{p}, got {r}x{c}");
                 }
             }
         }
@@ -74,26 +74,26 @@ pub(crate) fn validate_cov_block_kind(
         CovariateBlockKind::Static(b) => validate_cov_block(name, n, b),
         CovariateBlockKind::TimeVarying(tv) => {
             if tv.design_covariates.nrows() != n {
-                crate::bail_dim_sls!(
+                bail_dim_sls!(
                     "{name} time-varying covariate design row mismatch: got {}, expected {n}",
                     tv.design_covariates.nrows()
                 );
             }
             if tv.time_basis_entry.nrows() != n || tv.time_basis_exit.nrows() != n {
-                crate::bail_dim_sls!(
+                bail_dim_sls!(
                     "{name} time-varying time basis row mismatch: entry={}, exit={}, expected {n}",
                     tv.time_basis_entry.nrows(),
                     tv.time_basis_exit.nrows()
                 );
             }
             if tv.time_basis_derivative_exit.nrows() != n {
-                crate::bail_dim_sls!(
+                bail_dim_sls!(
                     "{name} time-varying derivative basis row mismatch: got {}, expected {n}",
                     tv.time_basis_derivative_exit.nrows()
                 );
             }
             if tv.offset.len() != n {
-                crate::bail_dim_sls!(
+                bail_dim_sls!(
                     "{name} time-varying offset length mismatch: got {}, expected {n}",
                     tv.offset.len()
                 );
@@ -101,14 +101,14 @@ pub(crate) fn validate_cov_block_kind(
             let p_cov = tv.design_covariates.ncols();
             let p_time = tv.time_basis_exit.ncols();
             if tv.time_basis_entry.ncols() != p_time {
-                crate::bail_dim_sls!(
+                bail_dim_sls!(
                     "{name} time-varying time basis column mismatch: entry={}, exit={}",
                     tv.time_basis_entry.ncols(),
                     p_time
                 );
             }
             if tv.time_basis_derivative_exit.ncols() != p_time {
-                crate::bail_dim_sls!(
+                bail_dim_sls!(
                     "{name} time-varying derivative basis column mismatch: derivative={}, exit={}",
                     tv.time_basis_derivative_exit.ncols(),
                     p_time
@@ -119,7 +119,7 @@ pub(crate) fn validate_cov_block_kind(
             if let Some(beta0) = &tv.initial_beta
                 && beta0.len() != p_tensor
             {
-                crate::bail_dim_sls!(
+                bail_dim_sls!(
                     "{name} time-varying initial_beta length mismatch: got {}, expected {p_tensor}",
                     beta0.len()
                 );
@@ -127,7 +127,7 @@ pub(crate) fn validate_cov_block_kind(
             if let Some(rho0) = &tv.initial_log_lambdas
                 && rho0.len() != k
             {
-                crate::bail_dim_sls!(
+                bail_dim_sls!(
                     "{name} time-varying initial_log_lambdas length mismatch: got {}, expected {k}",
                     rho0.len()
                 );
@@ -135,7 +135,7 @@ pub(crate) fn validate_cov_block_kind(
             for (idx, s) in tv.penalties.iter().enumerate() {
                 let (r, c) = s.shape();
                 if r != p_tensor || c != p_tensor {
-                    crate::bail_dim_sls!(
+                    bail_dim_sls!(
                         "{name} time-varying penalty {idx} must be {p_tensor}x{p_tensor}, got {r}x{c}"
                     );
                 }

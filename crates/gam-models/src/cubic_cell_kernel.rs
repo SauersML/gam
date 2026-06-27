@@ -31,7 +31,7 @@ pub enum CubicCellKernelError {
     BivariateNormalDomain { reason: String },
 }
 
-crate::impl_reason_error_boilerplate! {
+impl_reason_error_boilerplate! {
     CubicCellKernelError {
         InvalidInterval,
         InvalidCellShape,

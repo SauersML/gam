@@ -1,6 +1,6 @@
 // Declarative `bail_*` / error-boilerplate macros whose target error enums live
 // in this crate. `#[macro_export]` places them at the crate root so the
-// `crate::bail_invalid_surv!` / `crate::impl_reason_error_boilerplate!` call sites
+// `bail_invalid_surv!` / `impl_reason_error_boilerplate!` call sites
 // across the relocated families resolve unchanged.
 mod macros;
 

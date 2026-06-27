@@ -40,7 +40,7 @@ pub enum TransformationNormalError {
     NumericalFailure { reason: String },
 }
 
-crate::impl_reason_error_boilerplate! {
+impl_reason_error_boilerplate! {
     TransformationNormalError {
         InvalidInput,
         DesignDegenerate,

@@ -29,7 +29,7 @@ pub enum ScaleDesignError {
     SvdFailed { reason: String },
 }
 
-crate::impl_reason_error_boilerplate! {
+impl_reason_error_boilerplate! {
     ScaleDesignError {
         InvalidWeights,
         IncompatibleDimensions,

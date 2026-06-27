@@ -778,7 +778,7 @@ impl TransformationNormalFamily {
     ) -> Result<Self, TransformationNormalError> {
         let n = self.weights.len();
         if mask.len() != n {
-            crate::bail_invalid_tnorm!(
+            bail_invalid_tnorm!(
                 "outer-score subsample mask length {} != n={}",
                 mask.len(),
                 n
@@ -788,7 +788,7 @@ impl TransformationNormalFamily {
         for i in 0..n {
             let m = mask[i];
             if !m.is_finite() || m < 0.0 {
-                crate::bail_invalid_tnorm!(
+                bail_invalid_tnorm!(
                     "outer-score subsample mask[{i}] = {m} is invalid (must be finite and >= 0)"
                 );
             }

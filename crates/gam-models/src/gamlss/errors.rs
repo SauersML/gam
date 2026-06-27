@@ -34,7 +34,7 @@ pub enum GamlssError {
     NumericalFailure { reason: String },
 }
 
-crate::impl_reason_error_boilerplate! {
+impl_reason_error_boilerplate! {
     GamlssError {
         DimensionMismatch,
         InvalidInput,

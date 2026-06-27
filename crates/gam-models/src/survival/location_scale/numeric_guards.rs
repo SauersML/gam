@@ -94,7 +94,7 @@ pub(super) fn safe_hadamard_product(
     rhs: &Array1<f64>,
 ) -> Result<Array1<f64>, SurvivalLocationScaleError> {
     if lhs.len() != rhs.len() {
-        crate::bail_dim_sls!(
+        bail_dim_sls!(
             "safe_hadamard_product length mismatch: lhs has {}, rhs has {}",
             lhs.len(),
             rhs.len()
@@ -116,7 +116,7 @@ pub(super) fn safe_linear_combo2_arrays(
     d: &Array1<f64>,
 ) -> Result<Array1<f64>, SurvivalLocationScaleError> {
     if a.len() != b.len() || a.len() != c.len() || a.len() != d.len() {
-        crate::bail_dim_sls!(
+        bail_dim_sls!(
             "safe_linear_combo2_arrays length mismatch: a={}, b={}, c={}, d={}",
             a.len(),
             b.len(),

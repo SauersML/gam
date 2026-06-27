@@ -118,7 +118,7 @@ pub(crate) fn validate_survival_location_scale_spec(
         });
     }
     if spec.age_entry.len() != n || spec.age_exit.len() != n || spec.weights.len() != n {
-        crate::bail_dim_sls!("fit_survival_location_scale: top-level input size mismatch");
+        bail_dim_sls!("fit_survival_location_scale: top-level input size mismatch");
     }
     if !(spec.tol.is_finite() && spec.tol > 0.0) {
         return Err(SurvivalLocationScaleError::InvalidConfiguration {
@@ -958,7 +958,7 @@ pub(crate) fn validatewiggle_block(
     b: &LinkWiggleBlockInput,
 ) -> Result<(), SurvivalLocationScaleError> {
     if b.design.nrows() != n {
-        crate::bail_dim_sls!(
+        bail_dim_sls!(
             "linkwiggle_block design row mismatch: got {}, expected {n}",
             b.design.nrows()
         );
@@ -976,7 +976,7 @@ pub(crate) fn validatewiggle_block(
     if let Some(beta0) = &b.initial_beta
         && beta0.len() != p
     {
-        crate::bail_dim_sls!(
+        bail_dim_sls!(
             "linkwiggle_block initial_beta length mismatch: got {}, expected {p}",
             beta0.len()
         );
@@ -999,7 +999,7 @@ pub(crate) fn validatewiggle_block(
     if let Some(rho0) = &b.initial_log_lambdas
         && rho0.len() != k
     {
-        crate::bail_dim_sls!(
+        bail_dim_sls!(
             "linkwiggle_block initial_log_lambdas length mismatch: got {}, expected {k}",
             rho0.len()
         );
@@ -1013,7 +1013,7 @@ pub(crate) fn validatewiggle_block(
                     || local.nrows() != col_range.len()
                     || local.ncols() != col_range.len()
                 {
-                    crate::bail_dim_sls!(
+                    bail_dim_sls!(
                         "linkwiggle_block penalty {idx} block shape mismatch: col_range={}..{}, local={}x{}, total_dim={p}",
                         col_range.start,
                         col_range.end,
@@ -1026,7 +1026,7 @@ pub(crate) fn validatewiggle_block(
             | gam_terms::penalty_spec::PenaltySpec::DenseWithMean { matrix: m, .. } => {
                 let (r, c) = m.dim();
                 if r != p || c != p {
-                    crate::bail_dim_sls!(
+                    bail_dim_sls!(
                         "linkwiggle_block penalty {idx} must be {p}x{p}, got {r}x{c}"
                     );
                 }
@@ -1049,11 +1049,11 @@ pub(crate) fn validate_time_block(
         || b.offset_exit.len() != n
         || b.derivative_offset_exit.len() != n
     {
-        crate::bail_dim_sls!("time_block input size mismatch");
+        bail_dim_sls!("time_block input size mismatch");
     }
     let p = b.design_exit.ncols();
     if b.design_entry.ncols() != p || b.design_derivative_exit.ncols() != p {
-        crate::bail_dim_sls!("time_block design column mismatch across entry/exit/derivative");
+        bail_dim_sls!("time_block design column mismatch across entry/exit/derivative");
     }
     if !b.time_monotonicity.is_coordinate_cone() {
         return Err(SurvivalLocationScaleError::InvalidConfiguration {
@@ -1072,7 +1072,7 @@ pub(crate) fn validate_time_block(
     if let Some(beta0) = &b.initial_beta
         && beta0.len() != p
     {
-        crate::bail_dim_sls!(
+        bail_dim_sls!(
             "time_block initial_beta length mismatch: got {}, expected {p}",
             beta0.len()
         );
@@ -1081,7 +1081,7 @@ pub(crate) fn validate_time_block(
     if let Some(rho0) = &b.initial_log_lambdas
         && rho0.len() != k
     {
-        crate::bail_dim_sls!(
+        bail_dim_sls!(
             "time_block initial_log_lambdas length mismatch: got {}, expected {k}",
             rho0.len()
         );
@@ -1089,7 +1089,7 @@ pub(crate) fn validate_time_block(
     for (idx, s) in b.penalties.iter().enumerate() {
         let (r, c) = s.dim();
         if r != p || c != p {
-            crate::bail_dim_sls!("time_block penalty {idx} must be {p}x{p}, got {r}x{c}");
+            bail_dim_sls!("time_block penalty {idx} must be {p}x{p}, got {r}x{c}");
         }
     }
     Ok(())

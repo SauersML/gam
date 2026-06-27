@@ -263,7 +263,7 @@ fn validate_cause_specific_block(
     let n = block.event_target.len();
     let p = block.x_exit.ncols();
     if n == 0 || p == 0 {
-        crate::bail_invalid_surv!("empty event vector or coefficient block");
+        bail_invalid_surv!("empty event vector or coefficient block");
     }
     if block.age_entry.len() != n
         || block.age_exit.len() != n
@@ -308,7 +308,7 @@ fn validate_cause_specific_block(
         || !block.derivative_floor.is_finite()
         || block.derivative_floor < 0.0
     {
-        crate::bail_invalid_surv!("non-finite input");
+        bail_invalid_surv!("non-finite input");
     }
     Ok(())
 }
@@ -340,7 +340,7 @@ fn evaluate_cause_specific_block(
             continue;
         }
         if block.age_exit[i] < block.age_entry[i] {
-            crate::bail_invalid_surv!("age_exit < age_entry at row {i}");
+            bail_invalid_surv!("age_exit < age_entry at row {i}");
         }
         let has_entry = block.age_entry[i] > ENTRY_AT_ORIGIN_THRESHOLD;
         let h_exit = eta_exit[i].exp();

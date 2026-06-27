@@ -116,7 +116,7 @@ pub enum FittedModelError {
     InvalidInput { reason: String },
 }
 
-crate::impl_reason_error_boilerplate! {
+impl_reason_error_boilerplate! {
     FittedModelError {
         SchemaMismatch,
         PayloadCorrupt,

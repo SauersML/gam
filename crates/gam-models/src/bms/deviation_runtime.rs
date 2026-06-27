@@ -69,7 +69,7 @@ pub enum DeviationRuntimeError {
     NumericalFailure { reason: String },
 }
 
-crate::impl_reason_error_boilerplate! {
+impl_reason_error_boilerplate! {
     DeviationRuntimeError {
         InvalidInput,
         DimensionMismatch,

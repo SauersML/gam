@@ -33,7 +33,7 @@ pub enum LognormalKernelError {
     InvalidSpec { reason: String },
 }
 
-crate::impl_reason_error_boilerplate! {
+impl_reason_error_boilerplate! {
     LognormalKernelError {
         InvalidSpec,
     }

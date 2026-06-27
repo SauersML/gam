@@ -76,7 +76,7 @@ pub enum LatentSurvivalError {
     UnsupportedConfiguration { reason: String },
 }
 
-crate::impl_reason_error_boilerplate! {
+impl_reason_error_boilerplate! {
     LatentSurvivalError {
         InvalidFrailty,
         InvalidDataset,
