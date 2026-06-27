@@ -4,6 +4,6 @@
 //! pulled in verbatim; every item they reference resolves through the parent
 //! module's re-exports (`use super::*`).
 
-include!("../../../tests/src_modules/smooths/smooth_design_assembly_constraint_tests.rs");
-include!("../../../tests/src_modules/smooths/smooth_adaptive_bounded_duchon_tests.rs");
-include!("../../../tests/src_modules/smooths/smooth_matern_nfree_rekey_topology_tests.rs");
+include!("../../../../tests/src_modules/smooths/smooth_design_assembly_constraint_tests.rs");
+include!("../../../../tests/src_modules/smooths/smooth_adaptive_bounded_duchon_tests.rs");
+include!("../../../../tests/src_modules/smooths/smooth_matern_nfree_rekey_topology_tests.rs");
