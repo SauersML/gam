@@ -1524,11 +1524,6 @@ impl ResidualCascadeDesign {
         self.core.m
     }
 
-    /// Number of stored nonzeros in the CSR design.
-    pub fn num_nonzeros(&self) -> usize {
-        self.core.vals.len()
-    }
-
     /// Total centers across all levels.
     pub fn num_centers(&self) -> usize {
         self.core.m - self.core.nullity()
@@ -1545,16 +1540,6 @@ impl ResidualCascadeDesign {
                     .collect()
             })
             .collect()
-    }
-
-    /// Support radius δ_l of one level, in scaled coordinates.
-    pub fn support_radius(&self, level: usize) -> f64 {
-        self.core.levels[level].delta
-    }
-
-    /// Prior precision weight `d_l = 4^{l(s−d/2)}` of one level.
-    pub fn level_weight(&self, level: usize) -> f64 {
-        self.core.levels[level].weight
     }
 
     /// Sparse basis row at a raw point, as (column, value) pairs sorted by
