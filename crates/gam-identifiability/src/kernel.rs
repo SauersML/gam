@@ -4,7 +4,7 @@
 //! Jacobian sparsity, and manifold-SAE anchor coverage. Rust, Python, and CLI
 //! layers turn those facts into user-facing reports.
 
-use ndarray::{Array2, ArrayView1, ArrayView2, Axis};
+use ndarray::{Array2, ArrayView2, Axis};
 
 /// Maximum sweeps for the cyclic-by-largest-pivot Jacobi eigensolver.
 ///
@@ -455,19 +455,6 @@ pub fn concat_decoder_blocks(blocks: &[ArrayView2<f64>]) -> Result<Array2<f64>, 
         }
     }
     Ok(out)
-}
-
-/// Convenience: drop the leading `(N, P, K)` axis and reshape into the
-/// `(N*P, K)` form expected by [`jacobian_sparsity_metrics`]. Used from the
-/// pyfunction boundary when only a `(P, K)` linear decoder is supplied.
-pub fn jacobian_view_from_linear(decoder_pk: ArrayView2<f64>) -> Array2<f64> {
-    decoder_pk.to_owned()
-}
-
-/// Number of non-finite entries in a 1-D view. Used by callers that pre-extract
-/// a single aux column.
-pub fn count_nonfinite_1d(v: ArrayView1<f64>) -> usize {
-    v.iter().filter(|x| !x.is_finite()).count()
 }
 
 #[cfg(test)]
