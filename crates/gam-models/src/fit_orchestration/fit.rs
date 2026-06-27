@@ -1645,12 +1645,29 @@ fn cause_specific_survival_rho_prior(
     let mut priors = Vec::<gam_problem::RhoPrior>::with_capacity(cause_count * penalty_count);
     for cause in 0..cause_count {
         for penalty_idx in 0..penalty_count {
-            let label = format!(
+            // A label may address a single (cause, penalty) block exactly via
+            // `cause_specific_survival_cause_{c}_penalty_{idx}`, or broadcast one
+            // prior onto penalty `idx` across EVERY cause via the cause-agnostic
+            // `cause_specific_survival_penalty_{idx}`. The broadcast form is the
+            // documented, ergonomic spelling for "apply the same shrinkage to
+            // this penalty in all cause-specific hazards" (and the one the
+            // survival-API regression + #1161 contracts use); it was silently
+            // dropped when the penalty blocks were split per cause. An explicit
+            // per-cause label takes precedence over the broadcast for the block
+            // it names.
+            let per_cause = format!(
                 "cause_specific_survival_cause_{}_penalty_{penalty_idx}",
                 cause + 1
             );
-            if let Some((shape, rate)) = keyed.get(&label) {
-                consumed.push(label);
+            let broadcast = format!("cause_specific_survival_penalty_{penalty_idx}");
+            if let Some((shape, rate)) = keyed.get(&per_cause) {
+                consumed.push(per_cause);
+                priors.push(gam_problem::RhoPrior::GammaPrecision {
+                    shape: *shape,
+                    rate: *rate,
+                });
+            } else if let Some((shape, rate)) = keyed.get(&broadcast) {
+                consumed.push(broadcast);
                 priors.push(gam_problem::RhoPrior::GammaPrecision {
                     shape: *shape,
                     rate: *rate,
@@ -1672,6 +1689,10 @@ fn cause_specific_survival_rho_prior(
                     format!("cause_specific_survival_cause_{}_penalty_{idx}", cause + 1)
                 })
             })
+            .chain(
+                (0..penalty_count)
+                    .map(|idx| format!("cause_specific_survival_penalty_{idx}")),
+            )
             .collect::<Vec<_>>()
             .join(", ");
         return Err(WorkflowError::InvalidConfig {
@@ -2956,4 +2977,85 @@ pub(crate) fn crossfit_score_calibration(
     })?;
 
     Ok(Some(CrossFitScoreCalibration { z_oof, jac_oof }))
+}
+
+#[cfg(test)]
+mod cause_specific_survival_rho_prior_tests {
+    use super::cause_specific_survival_rho_prior;
+    use gam_problem::RhoPrior;
+
+    fn gamma(block: &RhoPrior) -> Option<(f64, f64)> {
+        match block {
+            RhoPrior::GammaPrecision { shape, rate } => Some((*shape, *rate)),
+            _ => None,
+        }
+    }
+
+    /// Regression for the competing-risks penalty-label contract (#1161 and the
+    /// in-CI `test_joint_competing_risks_survival_is_reachable_from_fit`): the
+    /// documented cause-agnostic label `cause_specific_survival_penalty_{idx}`
+    /// must apply its Gamma precision prior to penalty `idx` across EVERY cause.
+    /// Before the fix this label was rejected as "unknown" because only the
+    /// per-cause `cause_specific_survival_cause_{c}_penalty_{idx}` spelling was
+    /// matched once the penalty blocks were split per cause.
+    #[test]
+    fn cause_agnostic_label_broadcasts_to_every_cause() {
+        let priors = vec![("cause_specific_survival_penalty_0".to_string(), 2.0, 1.0)];
+        let result = cause_specific_survival_rho_prior(2, 1, &priors)
+            .expect("cause-agnostic broadcast label must be accepted");
+        let RhoPrior::Independent(blocks) = result else {
+            panic!("expected an Independent rho prior, got {result:?}");
+        };
+        assert_eq!(blocks.len(), 2, "two causes x one penalty = two blocks");
+        for block in &blocks {
+            assert_eq!(
+                gamma(block),
+                Some((2.0, 1.0)),
+                "every cause's penalty-0 block must carry the broadcast Gamma prior",
+            );
+        }
+    }
+
+    /// An explicit per-cause label wins over the broadcast for the block it
+    /// names; the broadcast still fills the remaining causes.
+    #[test]
+    fn explicit_per_cause_label_overrides_broadcast() {
+        let priors = vec![
+            ("cause_specific_survival_penalty_0".to_string(), 2.0, 1.0),
+            (
+                "cause_specific_survival_cause_2_penalty_0".to_string(),
+                5.0,
+                3.0,
+            ),
+        ];
+        let result = cause_specific_survival_rho_prior(2, 1, &priors)
+            .expect("mixed explicit + broadcast labels must be accepted");
+        let RhoPrior::Independent(blocks) = result else {
+            panic!("expected an Independent rho prior, got {result:?}");
+        };
+        assert_eq!(
+            gamma(&blocks[0]),
+            Some((2.0, 1.0)),
+            "cause 1 falls back to the broadcast prior",
+        );
+        assert_eq!(
+            gamma(&blocks[1]),
+            Some((5.0, 3.0)),
+            "cause 2 takes its explicit per-cause override",
+        );
+    }
+
+    /// A label that matches neither the per-cause nor the broadcast spelling is
+    /// still a hard error (the contract is not loosened to silently ignore
+    /// typos).
+    #[test]
+    fn genuinely_unknown_label_still_errors() {
+        let priors = vec![("not_a_real_block".to_string(), 2.0, 1.0)];
+        let err = cause_specific_survival_rho_prior(2, 1, &priors)
+            .expect_err("an unrelated label must still be rejected");
+        assert!(
+            err.contains("unknown Gamma precision hyperprior penalty block label"),
+            "error should name the unknown-label contract, got: {err}",
+        );
+    }
 }
