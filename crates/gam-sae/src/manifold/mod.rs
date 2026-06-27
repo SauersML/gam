@@ -124,6 +124,7 @@ mod arrow_solver;
 mod atom;
 mod certificate;
 mod construction;
+mod construction_cache_refresh;
 mod fit_drivers;
 mod kronecker;
 mod loss;
@@ -141,6 +142,9 @@ mod term;
 mod tests;
 
 #[cfg(test)]
+mod tests_parallelism_invariance_1557;
+
+#[cfg(test)]
 mod tests_olmo;
 
 #[cfg(test)]
@@ -153,6 +157,7 @@ pub use arrow_solver::*;
 pub use atom::*;
 pub use certificate::*;
 pub use construction::*;
+pub use construction_cache_refresh::*;
 pub(crate) use kronecker::*;
 pub use loss::*;
 pub use outer_objective::*;
