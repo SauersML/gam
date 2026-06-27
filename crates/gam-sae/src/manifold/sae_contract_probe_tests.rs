@@ -1009,6 +1009,56 @@ fn sae_1026_curved_beats_linear_reconstruction_through_solver() {
     );
 }
 
+/// #1026 — FULL encode+decode held-out recovery for a curved atom (the coverage
+/// gap the frontier test leaves: it seeds curved test coords from truth). Held-out
+/// on-manifold circle points are ENCODED from `z_test` alone through the production
+/// `certified_encode` path (the path the basin-warmup fix repaired), then DECODED
+/// with the frozen decoder and scored. Demonstrates end-to-end that the encoder
+/// recovers fresh curved points AND now CERTIFIES them at unit amplitude (0 before
+/// the fix). Fast (no fit needed — a known circle atom isolates the encode pipeline).
+#[test]
+fn sae_1026_full_encode_decode_heldout_curved_certifies() {
+    let n = 48usize; let p = 4usize;
+    let coords = Array2::from_shape_fn((n,1), |(r,_)| (r as f64 + 0.5)/n as f64);
+    let (phi, jet) = periodic_basis(&coords);
+    let m = phi.ncols();
+    let decoder = Array2::from_shape_fn((m,p), |(b,c)| (1.0/(1.0+b as f64))*((b as f64+1.0)*(c as f64+1.0)).cos());
+    let atom = SaeManifoldAtom::new("circle", SaeAtomBasisKind::Periodic, 1, phi, jet,
+        decoder.clone(), Array2::<f64>::eye(m)).unwrap()
+        .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        Array2::<f64>::zeros((n,1)), vec![coords.clone()],
+        vec![LatentManifold::Circle{period:1.0}], AssignmentMode::softmax(1.0)).unwrap();
+    let term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+    // Held-out, on-manifold circle points at FRESH angles, encoded from z alone.
+    let n_test = 32usize;
+    let theta_test = Array2::from_shape_fn((n_test,1), |(r,_)| (r as f64 + 0.25)/n_test as f64);
+    let (phi_test, _) = periodic_basis(&theta_test);
+    let z_test = phi_test.dot(&decoder);
+    let amps = Array1::<f64>::ones(n_test);
+    let mut norm_bound = 0.0_f64;
+    for r in 0..n_test { norm_bound = norm_bound.max(z_test.row(r).dot(&z_test.row(r)).sqrt()); }
+    let atlas = crate::encode::EncodeAtlas::build(&term.atoms, &[1.0], norm_bound,
+        crate::encode::AtlasConfig::default()).expect("atlas builds");
+    let mut recon = Array2::<f64>::zeros((n_test, p));
+    let mut certified = 0usize;
+    for r in 0..n_test {
+        let (coord, cert) = atlas.certified_encode_row(&term.atoms[0], 0, z_test.row(r), amps[r])
+            .expect("held-out encode runs");
+        if cert.certified() { certified += 1; }
+        let cc = Array2::from_shape_fn((1,1), |_| coord[0]);
+        let (phi_enc, _) = periodic_basis(&cc);
+        let rr = phi_enc.dot(&decoder);
+        for c in 0..p { recon[[r,c]] = rr[[0,c]]; }
+    }
+    let ev = reconstruction_explained_variance(z_test.view(), recon.view()).unwrap();
+    eprintln!("FULL_ENCODE_DECODE heldout EV={ev:.4} certified={certified}/{n_test}");
+    assert!(ev > 0.95,
+        "full encode+decode must recover on-manifold held-out curved points (EV={ev})");
+    assert!(certified > 0,
+        "basin-warmup fix must certify held-out curved encodes at unit amplitude (got {certified})");
+}
+
 /// #1026 — K=2 superposition recovery through the REAL solver, and the p ≥ 2K
 /// admissibility boundary. Two superposed circles fit by two periodic atoms via
 /// the production joint inner solve (`run_joint_fit_arrow_schur`). When the ambient
