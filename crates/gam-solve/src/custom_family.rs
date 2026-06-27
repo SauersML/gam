@@ -126,7 +126,7 @@ pub(crate) use penalty_labels::*;
 // each item's visibility so the 18 `pub` symbols surface as
 // `gam_solve::custom_family::*` (and thence `crate::custom_family::*` in
 // gam-models via the facade glob).
-pub use psi_design::*;
+pub use self::psi_design::*;
 pub use psi_hyper::*;
 pub use warm_start::*;
 
