@@ -307,7 +307,15 @@ pub fn pointwise_loglikelihood_omitting_constants(
             .map(|i| {
                 let mui_c = mu[i].max(MU_FLOOR);
                 let log_term = if y[i] > 0.0 { y[i] * mui_c.ln() } else { 0.0 };
-                priorweights[i] * (log_term - mui_c)
+                // Carry the `- ln Γ(y+1)` count normalizer so the per-row value is
+                // the true Poisson log *mass* (≤ 0), matching the NegativeBinomial
+                // arm (which already subtracts `ln_gamma(yi + 1.0)`). Without it the
+                // reported PSIS-LOO elpd and conditional AIC drop `Σ ln(y!)`, which
+                // flips their sign and makes Poisson incomparable to NB on identical
+                // data (#1581, #1582). The term is constant in β/ρ, so it shifts the
+                // outer objective by a constant and leaves the gradient/Hessian and
+                // the optimum unchanged — exactly as it already does for NB.
+                priorweights[i] * (log_term - mui_c - ln_gamma(y[i] + 1.0))
             })
             .collect(),
         ResponseFamily::Tweedie { p } => {
@@ -424,7 +432,13 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
             .map(|i| {
                 let mui_c = mu[i].max(MU_FLOOR);
                 let log_term = if y[i] > 0.0 { y[i] * mui_c.ln() } else { 0.0 };
-                priorweights[i] * (log_term - mui_c)
+                // Carry the `- ln Γ(y+1)` count normalizer (see the matching note in
+                // `pointwise_loglikelihood_omitting_constants`): it makes the scalar
+                // `log_likelihood` — and therefore the reported conditional AIC — the
+                // true Poisson log-likelihood, consistent with the NegativeBinomial
+                // arm, and is constant in β/ρ so the REML/LAML optimum is unchanged
+                // (#1581, #1582).
+                priorweights[i] * (log_term - mui_c - ln_gamma(y[i] + 1.0))
             })
             .sum(),
         ResponseFamily::Tweedie { p } => {
@@ -732,3 +746,67 @@ pub fn calculate_loglikelihood(
 // module never estimates a covariance internally.
 //
 // Composition with the existing signed-Gram API:
+
+#[cfg(test)]
+mod count_normalizer_regression_tests {
+    use super::*;
+    use gam_spec::{InverseLink, LikelihoodSpec, StandardLink};
+
+    fn poisson_log_spec() -> GlmLikelihoodSpec {
+        GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Poisson,
+            InverseLink::Standard(StandardLink::Log),
+        ))
+    }
+
+    /// Regression for #1581 / #1582: the Poisson per-row kernel must carry the
+    /// `- ln Γ(y+1)` count normalizer. Without it, the reported PSIS-LOO `elpd`
+    /// and conditional `AIC` drop `Σ ln(y!)`, which flips the elpd to an
+    /// impossible positive value (a log probability *mass* must be ≤ 0) and
+    /// makes a Poisson fit incomparable to an equivalent Negative-Binomial fit
+    /// (whose arm already subtracts `ln_gamma(yi + 1.0)`).
+    #[test]
+    fn poisson_loglikelihood_carries_count_normalizer() {
+        let spec = poisson_log_spec();
+        let y = Array1::from_vec(vec![0.0, 1.0, 2.0, 5.0, 3.0]);
+        let mu = Array1::from_vec(vec![0.8, 1.2, 2.5, 4.0, 3.1]);
+        let w = Array1::from_elem(y.len(), 1.0);
+
+        // Closed-form Poisson log-likelihood WITH the count normalizer.
+        let expected: f64 = (0..y.len())
+            .map(|i| {
+                let log_term = if y[i] > 0.0 { y[i] * mu[i].ln() } else { 0.0 };
+                log_term - mu[i] - ln_gamma(y[i] + 1.0)
+            })
+            .sum();
+
+        let got =
+            calculate_loglikelihood_omitting_constants(y.view(), &mu, &spec, w.view());
+        assert!(
+            (got - expected).abs() < 1e-9,
+            "scalar Poisson log-likelihood must include -lnΓ(y+1): got {got}, expected {expected}"
+        );
+
+        // Pointwise must agree with the scalar reduction, and every per-row value
+        // must be a log probability mass ≤ 0. The constant-dropped form is
+        // positive here (e.g. y=5, mu=4 → 5·ln4 − 4 = +2.93), so this row-wise
+        // bound fails before the fix and holds after it.
+        let pw = pointwise_loglikelihood_omitting_constants(y.view(), &mu, &spec, w.view());
+        assert!((pw.sum() - got).abs() < 1e-9, "pointwise sum must equal the scalar reduction");
+        for (i, v) in pw.iter().enumerate() {
+            assert!(*v <= 1e-9, "Poisson row {i} log-mass must be ≤ 0, got {v}");
+        }
+
+        // The fix is exactly `Σ lnΓ(y+1)` below the old constant-dropped form,
+        // and the test data exercises a non-trivial (> 1 nat) normalizer.
+        let dropped: f64 = (0..y.len())
+            .map(|i| {
+                let log_term = if y[i] > 0.0 { y[i] * mu[i].ln() } else { 0.0 };
+                log_term - mu[i]
+            })
+            .sum();
+        let normalizer: f64 = (0..y.len()).map(|i| ln_gamma(y[i] + 1.0)).sum();
+        assert!(normalizer > 1.0, "test data must exercise a non-trivial normalizer");
+        assert!((dropped - got - normalizer).abs() < 1e-9);
+    }
+}
