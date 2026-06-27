@@ -35,6 +35,19 @@ pub(crate) const SAE_HOST_MEMORY_RESERVE_FLOOR_BYTES: usize = 256 * 1024 * 1024;
 /// the real budget — it can genuinely OOM — so this floor only ever relaxes the
 /// streaming fallback, never admits a full-batch in-core solve.
 pub(crate) const SAE_MIN_STREAMING_BUDGET_FLOOR_BYTES: usize = 64 * 1024 * 1024;
+
+/// Absolute size below which a *direct* (dense, full-batch) plan is always
+/// admissible provided it fits the reported available memory, regardless of the
+/// headroom-reserved in-core budget. The budget subtracts a flat `max(available/8,
+/// 256 MiB)` reserve so a LARGE allocation is never sized at ~100% of available
+/// and OOMs; but on a memory-starved box (available below the 256 MiB floor) that
+/// reserve underflows the budget to ~0, which then rejects even a trivially-small
+/// dense plan (e.g. an 18 KiB K=1 toy fit) — and `reml_criterion` has no streaming
+/// fallback for the direct logdet, so it hard-errors instead of running. A dense
+/// plan at or below this size cannot meaningfully OOM a box that reports at least
+/// this much available, so admitting it can never reintroduce the OOM the reserve
+/// guards against; it only removes the spurious starved-box rejection (#1026).
+pub(crate) const SAE_DIRECT_ALWAYS_ADMIT_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SaeStreamingPlan {
     pub streaming: bool,
@@ -100,7 +113,17 @@ pub(crate) fn sae_streaming_plan_from_budget(
                 .saturating_mul(SAE_BYTES_PER_F64)
                 .saturating_mul(SAE_MATRIX_FREE_VECTOR_WORKSPACE_MULTIPLIER),
         );
-    let direct_admitted = direct_peak_bytes <= in_core_budget_bytes;
+    // Admit the direct plan when it fits the headroom-reserved budget, OR when its
+    // footprint is small in absolute terms (≤ 16 MiB) and fits the reported
+    // available memory. The second clause fixes the starved-box spurious rejection
+    // (#1026): when `in_core_budget_bytes` underflows to ~0 (available below the
+    // 256 MiB reserve floor) a trivially-small dense plan would otherwise be
+    // refused and hard-error in `reml_criterion` (no direct-logdet streaming
+    // fallback). It only ever admits plans too small to OOM, so large plans stay
+    // gated on the real budget and still stream.
+    let direct_fits_tiny = direct_peak_bytes <= SAE_DIRECT_ALWAYS_ADMIT_BYTES
+        && direct_peak_bytes <= host_available_bytes;
+    let direct_admitted = direct_peak_bytes <= in_core_budget_bytes || direct_fits_tiny;
     // The matrix-free streaming plan is the bounded-memory fallback: its peak is
     // the chunk window plus the row-cross and border-vector workspace, not the
     // full batch. Admit it against the larger of the in-core budget and an
@@ -436,6 +459,55 @@ mod host_in_core_budget_tests {
         assert!(
             !plan.direct_admitted || plan.estimated_direct_peak_bytes <= budget,
             "a plan exceeding the usable budget must not be direct-admitted"
+        );
+    }
+
+    /// #1026 regression: on a memory-starved box the in-core budget underflows to
+    /// 0, but a trivially-small dense plan (e.g. a K=1 toy fit) must STILL be
+    /// direct-admitted — otherwise `reml_criterion` hard-errors with "cost-only
+    /// streaming route is required" for a working set of a few KiB. Conversely a
+    /// large plan at budget 0 must still NOT be admitted (it streams).
+    #[test]
+    fn tiny_plan_admits_when_budget_collapsed_but_large_plan_streams() {
+        // Budget collapsed to 0 (the starved-box / underflowed-reserve regime),
+        // yet the box still reports a modest amount of available memory.
+        let budget = 0usize;
+        let avail = 200 * 1024 * 1024usize; // 200 MiB available, < 256 MiB floor.
+
+        // Tiny plan: the #1026 toy shape n=120, p=2, K=1 (one M=3 atom) — a few
+        // KiB working set, far below the 16 MiB always-admit size.
+        let tiny = sae_streaming_plan_from_budget(
+            120, 3, 1, 1, 6, budget, SAE_CPU_L2_CACHE_BYTES, avail,
+        );
+        assert!(
+            tiny.estimated_direct_peak_bytes <= SAE_DIRECT_ALWAYS_ADMIT_BYTES,
+            "toy plan should be far below the always-admit size, got {} bytes",
+            tiny.estimated_direct_peak_bytes
+        );
+        assert!(
+            tiny.direct_admitted,
+            "a tiny dense plan ({} bytes) that fits the {avail}-byte available memory \
+             must be direct-admitted even when the in-core budget collapsed to 0",
+            tiny.estimated_direct_peak_bytes
+        );
+        assert!(
+            !tiny.streaming,
+            "a direct-admitted tiny plan must run in-core, not stream"
+        );
+
+        // Large plan at the same collapsed budget must still NOT be direct-admitted
+        // (its peak exceeds both the budget and the 16 MiB always-admit size).
+        let large = sae_streaming_plan_from_budget(
+            10_000, 4_096, 8, 8, 64, budget, SAE_CPU_L2_CACHE_BYTES, avail,
+        );
+        assert!(
+            large.estimated_direct_peak_bytes > SAE_DIRECT_ALWAYS_ADMIT_BYTES,
+            "large plan must exceed the always-admit size"
+        );
+        assert!(
+            !large.direct_admitted,
+            "a large dense plan must stay gated on the (collapsed) budget and stream, \
+             not be admitted by the tiny-plan relaxation"
         );
     }
 }
