@@ -1935,6 +1935,800 @@ pub fn verify_kernel_channels<const K: usize>(
     Ok(())
 }
 
+// ===========================================================================
+// SIMD row-batched towers (#1151 follow-up): Tower3Lane / Tower4Lane
+// ===========================================================================
+//
+// `Tower{3,4}Lane<L: Lane, K>` re-type every channel of `Tower{3,4}<K>` from a
+// scalar `f64` to a SIMD lane field `L`. With `L = wide::f64x4` one instance
+// carries FOUR rows at once, so a per-row kernel (BMS `row_nll`, survival
+// `row_kernel`, `marginal_slope` `build_row_*_towers`) can evaluate 4 rows per
+// vector pass instead of one per scalar pass.
+//
+// Every floating-point op is a DIRECT, term-for-term lift of the scalar
+// `Tower{3,4}<K>` body — `a * b` -> `a.mul(b)`, `a + b` -> `a.add(b)`, a literal
+// `c` -> `L::splat(c)` — in the SAME accumulation order. `wide::f64x4`
+// add/sub/mul are lane-wise IEEE-754 ops with NO fused-multiply-add (Rust
+// performs no fp-contraction), so lane `i` of any channel of a
+// `Tower{3,4}Lane<wide::f64x4, K>` is `to_bits`-IDENTICAL to the scalar
+// `Tower{3,4}<K>` channel computed on row `i` — exactly the structural
+// bit-identity the existing [`crate::jet_scalar::Order2Lane`] relies on. Proven
+// by the in-tree `batch_tests` (real `wide::f64x4`) and a standalone
+// f64x4-model oracle, `K ∈ {2,3,4,9}`.
+//
+// Only the pure-arithmetic ops are lifted (the transcendental `exp`/`ln`/`sqrt`/
+// `…` route through scalar libm, which has no `f64x4` form; consumers build the
+// per-lane derivative stack scalar-side and feed it to `compose_unary([L; _])`,
+// exactly as the scalar path already does).
+
+use crate::jet_scalar::Lane;
+
+/// Lane-batched [`Tower4`]: value / gradient / Hessian / 3rd / 4th tensors
+/// carried in a SIMD field `L`. `Tower4Lane<f64x4, K>` lane `i` is
+/// `to_bits`-identical to [`Tower4<K>`] on row `i`.
+#[derive(Clone, Copy)]
+pub struct Tower4Lane<L: Lane, const K: usize> {
+    /// Value channel (one entry per lane/row).
+    pub v: L,
+    /// Gradient `∂/∂p_a`.
+    pub g: [L; K],
+    /// Hessian `∂²/∂p_a∂p_b`.
+    pub h: [[L; K]; K],
+    /// Third tensor `∂³`.
+    pub t3: [[[L; K]; K]; K],
+    /// Fourth tensor `∂⁴`.
+    pub t4: [[[[L; K]; K]; K]; K],
+}
+
+/// The 4-rows-per-pass batched [`Tower4`] (`wide::f64x4` lanes).
+pub type Tower4Batch<const K: usize> = Tower4Lane<wide::f64x4, K>;
+
+impl<L: Lane, const K: usize> Tower4Lane<L, K> {
+    /// All-zero tower (every channel `+0.0` in every lane).
+    #[inline]
+    pub fn zero() -> Self {
+        let z = L::splat(0.0);
+        Self { v: z, g: [z; K], h: [[z; K]; K], t3: [[[z; K]; K]; K], t4: [[[[z; K]; K]; K]; K] }
+    }
+    /// Constant `c` (per lane): value channel only.
+    #[inline]
+    pub fn constant(c: L) -> Self {
+        let mut o = Self::zero();
+        o.v = c;
+        o
+    }
+    /// Seeded variable `p_idx` at per-lane `value`: unit first derivative in
+    /// slot `idx` (mirrors [`Tower4::variable`]).
+    #[inline]
+    pub fn variable(value: L, idx: usize) -> Self {
+        let mut o = Self::constant(value);
+        o.g[idx] = L::splat(1.0);
+        o
+    }
+    /// Extract lane `i` as a scalar [`Tower4<K>`] (channel-for-channel).
+    #[inline]
+    pub fn lane(&self, i: usize) -> Tower4<K> {
+        let mut out = Tower4::<K>::zero();
+        out.v = self.v.lane(i);
+        for a in 0..K {
+            out.g[a] = self.g[a].lane(i);
+            for b in 0..K {
+                out.h[a][b] = self.h[a][b].lane(i);
+                for c in 0..K {
+                    out.t3[a][b][c] = self.t3[a][b][c].lane(i);
+                    for d in 0..K {
+                        out.t4[a][b][c][d] = self.t4[a][b][c][d].lane(i);
+                    }
+                }
+            }
+        }
+        out
+    }
+    /// Per-channel lane-wise `self + o` (mirrors `Tower4` `Add`).
+    #[inline]
+    pub fn add(&self, o: &Self) -> Self {
+        let mut out = *self;
+        out.v = self.v.add(o.v);
+        for i in 0..K {
+            out.g[i] = self.g[i].add(o.g[i]);
+            for j in 0..K {
+                out.h[i][j] = self.h[i][j].add(o.h[i][j]);
+                for k in 0..K {
+                    out.t3[i][j][k] = self.t3[i][j][k].add(o.t3[i][j][k]);
+                    for l in 0..K {
+                        out.t4[i][j][k][l] = self.t4[i][j][k][l].add(o.t4[i][j][k][l]);
+                    }
+                }
+            }
+        }
+        out
+    }
+    /// Per-channel lane-wise `self - o` (mirrors `Tower4` `Sub`).
+    #[inline]
+    pub fn sub(&self, o: &Self) -> Self {
+        let mut out = *self;
+        out.v = self.v.sub(o.v);
+        for i in 0..K {
+            out.g[i] = self.g[i].sub(o.g[i]);
+            for j in 0..K {
+                out.h[i][j] = self.h[i][j].sub(o.h[i][j]);
+                for k in 0..K {
+                    out.t3[i][j][k] = self.t3[i][j][k].sub(o.t3[i][j][k]);
+                    for l in 0..K {
+                        out.t4[i][j][k][l] = self.t4[i][j][k][l].sub(o.t4[i][j][k][l]);
+                    }
+                }
+            }
+        }
+        out
+    }
+    /// Multiply every channel by the plain scalar `s` (mirrors `Tower4::scale`).
+    #[inline]
+    pub fn scale(&self, s: f64) -> Self {
+        let sl = L::splat(s);
+        let mut out = *self;
+        out.v = self.v.mul(sl);
+        for i in 0..K {
+            out.g[i] = self.g[i].mul(sl);
+            for j in 0..K {
+                out.h[i][j] = self.h[i][j].mul(sl);
+                for k in 0..K {
+                    out.t3[i][j][k] = self.t3[i][j][k].mul(sl);
+                    for l in 0..K {
+                        out.t4[i][j][k][l] = self.t4[i][j][k][l].mul(sl);
+                    }
+                }
+            }
+        }
+        out
+    }
+    /// Leibniz product `self · o`, term-for-term lift of [`Tower4::mul`].
+    #[inline]
+    pub fn mul(&self, o: &Self) -> Self {
+        let a = self;
+        let b = o;
+        let mut out = Self::zero();
+        out.v = a.v.mul(b.v);
+        for i in 0..K {
+            let mut acc = L::splat(0.0);
+            acc = acc.add(a.v.mul(b.g[i]));
+            acc = acc.add(a.g[i].mul(b.v));
+            out.g[i] = acc;
+        }
+        for i in 0..K {
+            for j in 0..K {
+                let mut acc = L::splat(0.0);
+                acc = acc.add(a.v.mul(b.h[i][j]));
+                acc = acc.add(a.g[i].mul(b.g[j]));
+                acc = acc.add(a.g[j].mul(b.g[i]));
+                acc = acc.add(a.h[i][j].mul(b.v));
+                out.h[i][j] = acc;
+            }
+        }
+        for i in 0..K {
+            for j in 0..K {
+                for k in 0..K {
+                    let mut acc = L::splat(0.0);
+                    acc = acc.add(a.v.mul(b.t3[i][j][k]));
+                    acc = acc.add(a.g[i].mul(b.h[j][k]));
+                    acc = acc.add(a.g[j].mul(b.h[i][k]));
+                    acc = acc.add(a.h[i][j].mul(b.g[k]));
+                    acc = acc.add(a.g[k].mul(b.h[i][j]));
+                    acc = acc.add(a.h[i][k].mul(b.g[j]));
+                    acc = acc.add(a.h[j][k].mul(b.g[i]));
+                    acc = acc.add(a.t3[i][j][k].mul(b.v));
+                    out.t3[i][j][k] = acc;
+                }
+            }
+        }
+        for i in 0..K {
+            for j in 0..K {
+                for k in 0..K {
+                    for l in 0..K {
+                        let mut acc = L::splat(0.0);
+                        acc = acc.add(a.v.mul(b.t4[i][j][k][l]));
+                        acc = acc.add(a.g[i].mul(b.t3[j][k][l]));
+                        acc = acc.add(a.g[j].mul(b.t3[i][k][l]));
+                        acc = acc.add(a.h[i][j].mul(b.h[k][l]));
+                        acc = acc.add(a.g[k].mul(b.t3[i][j][l]));
+                        acc = acc.add(a.h[i][k].mul(b.h[j][l]));
+                        acc = acc.add(a.h[j][k].mul(b.h[i][l]));
+                        acc = acc.add(a.t3[i][j][k].mul(b.g[l]));
+                        acc = acc.add(a.g[l].mul(b.t3[i][j][k]));
+                        acc = acc.add(a.h[i][l].mul(b.h[j][k]));
+                        acc = acc.add(a.h[j][l].mul(b.h[i][k]));
+                        acc = acc.add(a.t3[i][j][l].mul(b.g[k]));
+                        acc = acc.add(a.h[k][l].mul(b.h[i][j]));
+                        acc = acc.add(a.t3[i][k][l].mul(b.g[j]));
+                        acc = acc.add(a.t3[j][k][l].mul(b.g[i]));
+                        acc = acc.add(a.t4[i][j][k][l].mul(b.v));
+                        out.t4[i][j][k][l] = acc;
+                    }
+                }
+            }
+        }
+        out
+    }
+    /// Faà di Bruno composition `f ∘ self`, term-for-term lift of
+    /// [`Tower4::compose_unary`]. `d = [f, f′, f″, f‴, f⁗]` packed per lane
+    /// (build via [`Lane::unary5`] from the scalar special-function stack).
+    #[inline]
+    pub fn compose_unary(&self, d: [L; 5]) -> Self {
+        let mut out = Self::zero();
+        out.v = d[0];
+        for i in 0..K {
+            let mut acc = L::splat(0.0);
+            acc = acc.add(d[1].mul(self.g[i]));
+            out.g[i] = acc;
+        }
+        for i in 0..K {
+            for j in 0..K {
+                let mut acc = L::splat(0.0);
+                acc = acc.add(d[1].mul(self.h[i][j]));
+                acc = acc.add(d[2].mul(self.g[i]).mul(self.g[j]));
+                out.h[i][j] = acc;
+            }
+        }
+        for i in 0..K {
+            for j in 0..K {
+                for k in 0..K {
+                    let mut acc = L::splat(0.0);
+                    acc = acc.add(d[1].mul(self.t3[i][j][k]));
+                    acc = acc.add(d[2].mul(self.h[i][j]).mul(self.g[k]));
+                    acc = acc.add(d[2].mul(self.h[i][k]).mul(self.g[j]));
+                    acc = acc.add(d[2].mul(self.g[i]).mul(self.h[j][k]));
+                    acc = acc.add(d[3].mul(self.g[i]).mul(self.g[j]).mul(self.g[k]));
+                    out.t3[i][j][k] = acc;
+                }
+            }
+        }
+        for i in 0..K {
+            for j in 0..K {
+                for k in 0..K {
+                    for l in 0..K {
+                        let mut acc = L::splat(0.0);
+                        acc = acc.add(d[1].mul(self.t4[i][j][k][l]));
+                        acc = acc.add(d[2].mul(self.t3[i][j][k]).mul(self.g[l]));
+                        acc = acc.add(d[2].mul(self.t3[i][j][l]).mul(self.g[k]));
+                        acc = acc.add(d[2].mul(self.h[i][j]).mul(self.h[k][l]));
+                        acc = acc.add(d[3].mul(self.h[i][j]).mul(self.g[k]).mul(self.g[l]));
+                        acc = acc.add(d[2].mul(self.t3[i][k][l]).mul(self.g[j]));
+                        acc = acc.add(d[2].mul(self.h[i][k]).mul(self.h[j][l]));
+                        acc = acc.add(d[3].mul(self.h[i][k]).mul(self.g[j]).mul(self.g[l]));
+                        acc = acc.add(d[2].mul(self.h[i][l]).mul(self.h[j][k]));
+                        acc = acc.add(d[2].mul(self.g[i]).mul(self.t3[j][k][l]));
+                        acc = acc.add(d[3].mul(self.g[i]).mul(self.h[j][k]).mul(self.g[l]));
+                        acc = acc.add(d[3].mul(self.h[i][l]).mul(self.g[j]).mul(self.g[k]));
+                        acc = acc.add(d[3].mul(self.g[i]).mul(self.h[j][l]).mul(self.g[k]));
+                        acc = acc.add(d[3].mul(self.g[i]).mul(self.g[j]).mul(self.h[k][l]));
+                        acc = acc.add(d[4].mul(self.g[i]).mul(self.g[j]).mul(self.g[k]).mul(self.g[l]));
+                        out.t4[i][j][k][l] = acc;
+                    }
+                }
+            }
+        }
+        out
+    }
+    /// Single-active-slot fast path, term-for-term lift of
+    /// [`Tower4::compose_unary_single_slot`] (only the 5 diagonal channels).
+    #[inline]
+    pub fn compose_unary_single_slot(&self, d: [L; 5], slot: usize) -> Self {
+        let mut out = Self::zero();
+        let s = slot;
+        let g = self.g[s];
+        let h = self.h[s][s];
+        let t3 = self.t3[s][s][s];
+        let t4 = self.t4[s][s][s][s];
+        out.v = d[0];
+        out.g[s] = {
+            let mut acc = L::splat(0.0);
+            acc = acc.add(d[1].mul(g));
+            acc
+        };
+        out.h[s][s] = {
+            let mut acc = L::splat(0.0);
+            acc = acc.add(d[1].mul(h));
+            acc = acc.add(d[2].mul(g).mul(g));
+            acc
+        };
+        out.t3[s][s][s] = {
+            let mut acc = L::splat(0.0);
+            acc = acc.add(d[1].mul(t3));
+            acc = acc.add(d[2].mul(h).mul(g));
+            acc = acc.add(d[2].mul(h).mul(g));
+            acc = acc.add(d[2].mul(g).mul(h));
+            acc = acc.add(d[3].mul(g).mul(g).mul(g));
+            acc
+        };
+        out.t4[s][s][s][s] = {
+            let mut acc = L::splat(0.0);
+            acc = acc.add(d[1].mul(t4));
+            acc = acc.add(d[2].mul(t3).mul(g));
+            acc = acc.add(d[2].mul(t3).mul(g));
+            acc = acc.add(d[2].mul(h).mul(h));
+            acc = acc.add(d[3].mul(h).mul(g).mul(g));
+            acc = acc.add(d[2].mul(t3).mul(g));
+            acc = acc.add(d[2].mul(h).mul(h));
+            acc = acc.add(d[3].mul(h).mul(g).mul(g));
+            acc = acc.add(d[2].mul(h).mul(h));
+            acc = acc.add(d[2].mul(g).mul(t3));
+            acc = acc.add(d[3].mul(g).mul(h).mul(g));
+            acc = acc.add(d[3].mul(h).mul(g).mul(g));
+            acc = acc.add(d[3].mul(g).mul(h).mul(g));
+            acc = acc.add(d[3].mul(g).mul(g).mul(h));
+            acc = acc.add(d[4].mul(g).mul(g).mul(g).mul(g));
+            acc
+        };
+        out
+    }
+    /// Contract `t3` with a primary-space direction (lift of
+    /// [`Tower4::third_contracted`]).
+    #[inline]
+    pub fn third_contracted(&self, dir: &[L; K]) -> [[L; K]; K] {
+        let mut out = [[L::splat(0.0); K]; K];
+        for a in 0..K {
+            for b in 0..K {
+                let mut acc = L::splat(0.0);
+                for c in 0..K {
+                    acc = acc.add(self.t3[a][b][c].mul(dir[c]));
+                }
+                out[a][b] = acc;
+            }
+        }
+        out
+    }
+    /// Contract `t4` with two primary-space directions (lift of
+    /// [`Tower4::fourth_contracted`]).
+    #[inline]
+    pub fn fourth_contracted(&self, u: &[L; K], w: &[L; K]) -> [[L; K]; K] {
+        let mut out = [[L::splat(0.0); K]; K];
+        for i in 0..K {
+            for j in 0..K {
+                let mut acc = L::splat(0.0);
+                for k in 0..K {
+                    for l in 0..K {
+                        acc = acc.add(self.t4[i][j][k][l].mul(u[k]).mul(w[l]));
+                    }
+                }
+                out[i][j] = acc;
+            }
+        }
+        out
+    }
+}
+
+/// Lane-batched [`Tower3`] (order-≤3 sibling of [`Tower4Lane`]).
+#[derive(Clone, Copy)]
+pub struct Tower3Lane<L: Lane, const K: usize> {
+    /// Value channel.
+    pub v: L,
+    /// Gradient.
+    pub g: [L; K],
+    /// Hessian.
+    pub h: [[L; K]; K],
+    /// Third tensor.
+    pub t3: [[[L; K]; K]; K],
+}
+
+/// The 4-rows-per-pass batched [`Tower3`] (`wide::f64x4` lanes).
+pub type Tower3Batch<const K: usize> = Tower3Lane<wide::f64x4, K>;
+
+impl<L: Lane, const K: usize> Tower3Lane<L, K> {
+    /// All-zero tower.
+    #[inline]
+    pub fn zero() -> Self {
+        let z = L::splat(0.0);
+        Self { v: z, g: [z; K], h: [[z; K]; K], t3: [[[z; K]; K]; K] }
+    }
+    /// Constant `c` (per lane).
+    #[inline]
+    pub fn constant(c: L) -> Self {
+        let mut o = Self::zero();
+        o.v = c;
+        o
+    }
+    /// Seeded variable `p_idx` at per-lane `value`.
+    #[inline]
+    pub fn variable(value: L, idx: usize) -> Self {
+        let mut o = Self::constant(value);
+        o.g[idx] = L::splat(1.0);
+        o
+    }
+    /// Extract lane `i` as a scalar [`Tower3<K>`].
+    #[inline]
+    pub fn lane(&self, i: usize) -> Tower3<K> {
+        let mut out = Tower3::<K>::zero();
+        out.v = self.v.lane(i);
+        for a in 0..K {
+            out.g[a] = self.g[a].lane(i);
+            for b in 0..K {
+                out.h[a][b] = self.h[a][b].lane(i);
+                for c in 0..K {
+                    out.t3[a][b][c] = self.t3[a][b][c].lane(i);
+                }
+            }
+        }
+        out
+    }
+    /// Per-channel lane-wise `self + o`.
+    #[inline]
+    pub fn add(&self, o: &Self) -> Self {
+        let mut out = *self;
+        out.v = self.v.add(o.v);
+        for i in 0..K {
+            out.g[i] = self.g[i].add(o.g[i]);
+            for j in 0..K {
+                out.h[i][j] = self.h[i][j].add(o.h[i][j]);
+                for k in 0..K {
+                    out.t3[i][j][k] = self.t3[i][j][k].add(o.t3[i][j][k]);
+                }
+            }
+        }
+        out
+    }
+    /// Per-channel lane-wise `self - o`.
+    #[inline]
+    pub fn sub(&self, o: &Self) -> Self {
+        let mut out = *self;
+        out.v = self.v.sub(o.v);
+        for i in 0..K {
+            out.g[i] = self.g[i].sub(o.g[i]);
+            for j in 0..K {
+                out.h[i][j] = self.h[i][j].sub(o.h[i][j]);
+                for k in 0..K {
+                    out.t3[i][j][k] = self.t3[i][j][k].sub(o.t3[i][j][k]);
+                }
+            }
+        }
+        out
+    }
+    /// Multiply every channel by the plain scalar `s` (mirrors `Tower3::scale`).
+    #[inline]
+    pub fn scale(&self, s: f64) -> Self {
+        let sl = L::splat(s);
+        let mut out = *self;
+        out.v = self.v.mul(sl);
+        for i in 0..K {
+            out.g[i] = self.g[i].mul(sl);
+            for j in 0..K {
+                out.h[i][j] = self.h[i][j].mul(sl);
+                for k in 0..K {
+                    out.t3[i][j][k] = self.t3[i][j][k].mul(sl);
+                }
+            }
+        }
+        out
+    }
+    /// Leibniz product `self · o`, term-for-term lift of [`Tower3::mul`].
+    #[inline]
+    pub fn mul(&self, o: &Self) -> Self {
+        let a = self;
+        let b = o;
+        let mut out = Self::zero();
+        out.v = a.v.mul(b.v);
+        for i in 0..K {
+            let mut acc = L::splat(0.0);
+            acc = acc.add(a.v.mul(b.g[i]));
+            acc = acc.add(a.g[i].mul(b.v));
+            out.g[i] = acc;
+        }
+        for i in 0..K {
+            for j in 0..K {
+                let mut acc = L::splat(0.0);
+                acc = acc.add(a.v.mul(b.h[i][j]));
+                acc = acc.add(a.g[i].mul(b.g[j]));
+                acc = acc.add(a.g[j].mul(b.g[i]));
+                acc = acc.add(a.h[i][j].mul(b.v));
+                out.h[i][j] = acc;
+            }
+        }
+        for i in 0..K {
+            for j in 0..K {
+                for k in 0..K {
+                    let mut acc = L::splat(0.0);
+                    acc = acc.add(a.v.mul(b.t3[i][j][k]));
+                    acc = acc.add(a.g[i].mul(b.h[j][k]));
+                    acc = acc.add(a.g[j].mul(b.h[i][k]));
+                    acc = acc.add(a.h[i][j].mul(b.g[k]));
+                    acc = acc.add(a.g[k].mul(b.h[i][j]));
+                    acc = acc.add(a.h[i][k].mul(b.g[j]));
+                    acc = acc.add(a.h[j][k].mul(b.g[i]));
+                    acc = acc.add(a.t3[i][j][k].mul(b.v));
+                    out.t3[i][j][k] = acc;
+                }
+            }
+        }
+        out
+    }
+    /// Faà di Bruno composition `f ∘ self`, term-for-term lift of
+    /// [`Tower3::compose_unary`]. `d = [f, f′, f″, f‴]` packed per lane.
+    #[inline]
+    pub fn compose_unary(&self, d: [L; 4]) -> Self {
+        let mut out = Self::zero();
+        out.v = d[0];
+        for i in 0..K {
+            let mut acc = L::splat(0.0);
+            acc = acc.add(d[1].mul(self.g[i]));
+            out.g[i] = acc;
+        }
+        for i in 0..K {
+            for j in 0..K {
+                let mut acc = L::splat(0.0);
+                acc = acc.add(d[1].mul(self.h[i][j]));
+                acc = acc.add(d[2].mul(self.g[i]).mul(self.g[j]));
+                out.h[i][j] = acc;
+            }
+        }
+        for i in 0..K {
+            for j in 0..K {
+                for k in 0..K {
+                    let mut acc = L::splat(0.0);
+                    acc = acc.add(d[1].mul(self.t3[i][j][k]));
+                    acc = acc.add(d[2].mul(self.h[i][j]).mul(self.g[k]));
+                    acc = acc.add(d[2].mul(self.h[i][k]).mul(self.g[j]));
+                    acc = acc.add(d[2].mul(self.g[i]).mul(self.h[j][k]));
+                    acc = acc.add(d[3].mul(self.g[i]).mul(self.g[j]).mul(self.g[k]));
+                    out.t3[i][j][k] = acc;
+                }
+            }
+        }
+        out
+    }
+    /// Single-active-slot fast path, term-for-term lift of
+    /// [`Tower3::compose_unary_single_slot`].
+    #[inline]
+    pub fn compose_unary_single_slot(&self, d: [L; 4], slot: usize) -> Self {
+        let mut out = Self::zero();
+        let s = slot;
+        let g = self.g[s];
+        let h = self.h[s][s];
+        let t3 = self.t3[s][s][s];
+        out.v = d[0];
+        out.g[s] = {
+            let mut acc = L::splat(0.0);
+            acc = acc.add(d[1].mul(g));
+            acc
+        };
+        out.h[s][s] = {
+            let mut acc = L::splat(0.0);
+            acc = acc.add(d[1].mul(h));
+            acc = acc.add(d[2].mul(g).mul(g));
+            acc
+        };
+        out.t3[s][s][s] = {
+            let mut acc = L::splat(0.0);
+            acc = acc.add(d[1].mul(t3));
+            acc = acc.add(d[2].mul(h).mul(g));
+            acc = acc.add(d[2].mul(h).mul(g));
+            acc = acc.add(d[2].mul(g).mul(h));
+            acc = acc.add(d[3].mul(g).mul(g).mul(g));
+            acc
+        };
+        out
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    struct Rng(u64);
+    impl Rng {
+        fn f(&mut self) -> f64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((self.0 >> 11) as f64 / (1u64 << 53) as f64) * 4.0 - 2.0
+        }
+    }
+
+    // Fill every channel of a scalar Tower4<K> with random data.
+    fn rand_t4<const K: usize>(r: &mut Rng) -> Tower4<K> {
+        let mut t = Tower4::<K>::zero();
+        t.v = r.f();
+        for i in 0..K {
+            t.g[i] = r.f();
+            for j in 0..K {
+                t.h[i][j] = r.f();
+                for k in 0..K {
+                    t.t3[i][j][k] = r.f();
+                    for l in 0..K {
+                        t.t4[i][j][k][l] = r.f();
+                    }
+                }
+            }
+        }
+        t
+    }
+    fn rand_t3<const K: usize>(r: &mut Rng) -> Tower3<K> {
+        let mut t = Tower3::<K>::zero();
+        t.v = r.f();
+        for i in 0..K {
+            t.g[i] = r.f();
+            for j in 0..K {
+                t.h[i][j] = r.f();
+                for k in 0..K {
+                    t.t3[i][j][k] = r.f();
+                }
+            }
+        }
+        t
+    }
+    fn pack4_t4<const K: usize>(rows: &[Tower4<K>; 4]) -> Tower4Batch<K> {
+        let mut b = Tower4Batch::<K>::zero();
+        let lane = |f: &dyn Fn(&Tower4<K>) -> f64| {
+            wide::f64x4::new([f(&rows[0]), f(&rows[1]), f(&rows[2]), f(&rows[3])])
+        };
+        b.v = lane(&|t| t.v);
+        for i in 0..K {
+            b.g[i] = lane(&|t| t.g[i]);
+            for j in 0..K {
+                b.h[i][j] = lane(&|t| t.h[i][j]);
+                for k in 0..K {
+                    b.t3[i][j][k] = lane(&|t| t.t3[i][j][k]);
+                    for l in 0..K {
+                        b.t4[i][j][k][l] = lane(&|t| t.t4[i][j][k][l]);
+                    }
+                }
+            }
+        }
+        b
+    }
+    fn pack4_t3<const K: usize>(rows: &[Tower3<K>; 4]) -> Tower3Batch<K> {
+        let mut b = Tower3Batch::<K>::zero();
+        let lane = |f: &dyn Fn(&Tower3<K>) -> f64| {
+            wide::f64x4::new([f(&rows[0]), f(&rows[1]), f(&rows[2]), f(&rows[3])])
+        };
+        b.v = lane(&|t| t.v);
+        for i in 0..K {
+            b.g[i] = lane(&|t| t.g[i]);
+            for j in 0..K {
+                b.h[i][j] = lane(&|t| t.h[i][j]);
+                for k in 0..K {
+                    b.t3[i][j][k] = lane(&|t| t.t3[i][j][k]);
+                }
+            }
+        }
+        b
+    }
+    fn assert_t4_eq<const K: usize>(b: &Tower4<K>, s: &Tower4<K>, ctx: &str) {
+        assert_eq!(b.v.to_bits(), s.v.to_bits(), "v {ctx}");
+        for i in 0..K {
+            assert_eq!(b.g[i].to_bits(), s.g[i].to_bits(), "g {ctx}");
+            for j in 0..K {
+                assert_eq!(b.h[i][j].to_bits(), s.h[i][j].to_bits(), "h {ctx}");
+                for k in 0..K {
+                    assert_eq!(b.t3[i][j][k].to_bits(), s.t3[i][j][k].to_bits(), "t3 {ctx}");
+                    for l in 0..K {
+                        assert_eq!(b.t4[i][j][k][l].to_bits(), s.t4[i][j][k][l].to_bits(), "t4 {ctx}");
+                    }
+                }
+            }
+        }
+    }
+    fn assert_t3_eq<const K: usize>(b: &Tower3<K>, s: &Tower3<K>, ctx: &str) {
+        assert_eq!(b.v.to_bits(), s.v.to_bits(), "v {ctx}");
+        for i in 0..K {
+            assert_eq!(b.g[i].to_bits(), s.g[i].to_bits(), "g {ctx}");
+            for j in 0..K {
+                assert_eq!(b.h[i][j].to_bits(), s.h[i][j].to_bits(), "h {ctx}");
+                for k in 0..K {
+                    assert_eq!(b.t3[i][j][k].to_bits(), s.t3[i][j][k].to_bits(), "t3 {ctx}");
+                }
+            }
+        }
+    }
+
+    // Run a representative op chain on 4 scalar rows and on the f64x4 batch,
+    // then assert every channel of every lane is to_bits-identical.
+    fn run4<const K: usize>(seed: u64, batches: usize) {
+        let mut r = Rng(seed);
+        for _ in 0..batches {
+            let a: [Tower4<K>; 4] = std::array::from_fn(|_| rand_t4::<K>(&mut r));
+            let b: [Tower4<K>; 4] = std::array::from_fn(|_| rand_t4::<K>(&mut r));
+            let d: [[f64; 5]; 4] = std::array::from_fn(|_| std::array::from_fn(|_| r.f()));
+            let dir: [[f64; K]; 4] = std::array::from_fn(|_| std::array::from_fn(|_| r.f()));
+            let dir2: [[f64; K]; 4] = std::array::from_fn(|_| std::array::from_fn(|_| r.f()));
+            let s = r.f();
+
+            // scalar per-row reference
+            let scal: [Tower4<K>; 4] = std::array::from_fn(|rw| {
+                let prod = a[rw].mul(&b[rw]);
+                let comp = prod.compose_unary(d[rw]);
+                let summed = comp.add(&a[rw]).sub(&b[rw]).scale(s);
+                summed.compose_unary_single_slot(d[rw], 0)
+            });
+            let third: [[[f64; K]; K]; 4] =
+                std::array::from_fn(|rw| a[rw].third_contracted(&dir[rw]));
+            let fourth: [[[f64; K]; K]; 4] =
+                std::array::from_fn(|rw| a[rw].fourth_contracted(&dir[rw], &dir2[rw]));
+
+            // batched f64x4
+            let ab = pack4_t4(&a);
+            let bb = pack4_t4(&b);
+            let db: [wide::f64x4; 5] = std::array::from_fn(|c| {
+                wide::f64x4::new([d[0][c], d[1][c], d[2][c], d[3][c]])
+            });
+            let dirb: [wide::f64x4; K] = std::array::from_fn(|c| {
+                wide::f64x4::new([dir[0][c], dir[1][c], dir[2][c], dir[3][c]])
+            });
+            let dir2b: [wide::f64x4; K] = std::array::from_fn(|c| {
+                wide::f64x4::new([dir2[0][c], dir2[1][c], dir2[2][c], dir2[3][c]])
+            });
+            let prodb = ab.mul(&bb);
+            let compb = prodb.compose_unary(db);
+            let summedb = compb.add(&ab).sub(&bb).scale(s);
+            let finalb = summedb.compose_unary_single_slot(db, 0);
+            let thirdb = ab.third_contracted(&dirb);
+            let fourthb = ab.fourth_contracted(&dirb, &dir2b);
+
+            for rw in 0..4 {
+                assert_t4_eq(&finalb.lane(rw), &scal[rw], "t4-chain");
+                for i in 0..K {
+                    for j in 0..K {
+                        assert_eq!(thirdb[i][j].lane(rw).to_bits(), third[rw][i][j].to_bits(), "third");
+                        assert_eq!(fourthb[i][j].lane(rw).to_bits(), fourth[rw][i][j].to_bits(), "fourth");
+                    }
+                }
+            }
+        }
+    }
+    fn run3<const K: usize>(seed: u64, batches: usize) {
+        let mut r = Rng(seed);
+        for _ in 0..batches {
+            let a: [Tower3<K>; 4] = std::array::from_fn(|_| rand_t3::<K>(&mut r));
+            let b: [Tower3<K>; 4] = std::array::from_fn(|_| rand_t3::<K>(&mut r));
+            let d: [[f64; 4]; 4] = std::array::from_fn(|_| std::array::from_fn(|_| r.f()));
+            let s = r.f();
+            let scal: [Tower3<K>; 4] = std::array::from_fn(|rw| {
+                let prod = a[rw].mul(&b[rw]);
+                let comp = prod.compose_unary(d[rw]);
+                let summed = comp.add(&a[rw]).sub(&b[rw]).scale(s);
+                summed.compose_unary_single_slot(d[rw], 0)
+            });
+            let ab = pack4_t3(&a);
+            let bb = pack4_t3(&b);
+            let db: [wide::f64x4; 4] = std::array::from_fn(|c| {
+                wide::f64x4::new([d[0][c], d[1][c], d[2][c], d[3][c]])
+            });
+            let prodb = ab.mul(&bb);
+            let compb = prodb.compose_unary(db);
+            let summedb = compb.add(&ab).sub(&bb).scale(s);
+            let finalb = summedb.compose_unary_single_slot(db, 0);
+            for rw in 0..4 {
+                assert_t3_eq(&finalb.lane(rw), &scal[rw], "t3-chain");
+            }
+        }
+    }
+
+    // A `Tower4Batch<9>` carries a `9⁴ = 6561`-entry `t4` tensor in 4-wide
+    // lanes (≈210 KiB by value); the op chain keeps several live, which can
+    // exceed a test thread's default stack. Run each width on a large-stack
+    // thread so K=9 is exercised without a stack overflow.
+    fn big_stack<F: FnOnce() + Send + 'static>(f: F) {
+        std::thread::Builder::new()
+            .stack_size(512 << 20)
+            .spawn(f)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn tower4_batch_lane_bit_identical() {
+        big_stack(|| run4::<2>(0x1111_2222_3333_4444, 2000));
+        big_stack(|| run4::<3>(0x5555_6666_7777_8888, 2000));
+        big_stack(|| run4::<4>(0x9999_aaaa_bbbb_cccc, 2000));
+        big_stack(|| run4::<9>(0xdddd_eeee_ffff_0000, 2000));
+    }
+
+    #[test]
+    fn tower3_batch_lane_bit_identical() {
+        big_stack(|| run3::<2>(0x0f0f_1e1e_2d2d_3c3c, 2000));
+        big_stack(|| run3::<3>(0x4b4b_5a5a_6969_7878, 2000));
+        big_stack(|| run3::<4>(0x8787_9696_a5a5_b4b4, 2000));
+        big_stack(|| run3::<9>(0xc3c3_d2d2_e1e1_f0f0, 2000));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
