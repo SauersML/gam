@@ -49,6 +49,7 @@ fn idx_noise(seed: u64) -> f64 {
 }
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)] // Linear arm retained for arc/superposition axes; rareness uses Curved only
 enum Arm {
     Curved, // periodic M=3
     Linear, // euclidean degree-1, M=2
@@ -104,8 +105,8 @@ fn lsq_decoder(phis: &[Array2<f64>], z: &Array2<f64>, gate: f64) -> Vec<Array2<f
         .collect()
 }
 
-/// Build + fit a K-atom term through the production engine; return (fitted EV, seconds).
-fn fit_ev(arms: &[Arm], coords_k: &[Array2<f64>], z: &Array2<f64>, label: &str) -> (f64, f64) {
+/// Build + fit a K-atom term through the production engine; return (fitted Z, seconds).
+fn fit_ev(arms: &[Arm], coords_k: &[Array2<f64>], z: &Array2<f64>, label: &str) -> (Array2<f64>, f64) {
     let k = arms.len();
     let n = z.nrows();
     let gate = 1.0 / (1.0 + (-SEED_LOGIT / TAU).exp());
@@ -143,7 +144,14 @@ fn fit_ev(arms: &[Arm], coords_k: &[Array2<f64>], z: &Array2<f64>, label: &str) 
     )
     .unwrap();
     let term = SaeManifoldTerm::new(atoms, assignment).unwrap();
-    let init_rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(0); k]);
+    // Dispersion-scaled seed (as the production K=1 pins do): well-conditioned
+    // starting rho so the outer cascade converges fast instead of wandering.
+    let disp = term
+        .seed_reconstruction_dispersion(z.view())
+        .expect("seed dispersion");
+    let init_rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(0); k])
+        .seed_scaled_by_dispersion(disp)
+        .expect("dispersion seed scaling");
     let init_flat = init_rho.to_flat();
     let np = init_flat.len();
     let mut obj = SaeManifoldOuterObjective::new(
@@ -163,7 +171,7 @@ fn fit_ev(arms: &[Arm], coords_k: &[Array2<f64>], z: &Array2<f64>, label: &str) 
         .expect("outer fit");
     let secs = t0.elapsed().as_secs_f64();
     let fitted = obj.into_fitted().term.fitted();
-    (ev(z, &fitted), secs)
+    (fitted, secs)
 }
 
 fn ev(z: &Array2<f64>, fit: &Array2<f64>) -> f64 {
@@ -216,69 +224,105 @@ fn ortho_frames(k: usize, p: usize) -> Array2<f64> {
     q
 }
 
+/// EV measured over a row subset (the active rows of a rare feature).
+fn ev_subset(z: &Array2<f64>, fit: &Array2<f64>, active: &[bool]) -> f64 {
+    let p = z.ncols();
+    let rows: Vec<usize> = (0..z.nrows()).filter(|&i| active[i]).collect();
+    if rows.is_empty() {
+        return f64::NAN;
+    }
+    let mut mean = vec![0.0; p];
+    for &i in &rows {
+        for j in 0..p {
+            mean[j] += z[[i, j]];
+        }
+    }
+    for m in &mut mean {
+        *m /= rows.len() as f64;
+    }
+    let (mut ssr, mut sst) = (0.0, 0.0);
+    for &i in &rows {
+        for j in 0..p {
+            let r = z[[i, j]] - fit[[i, j]];
+            ssr += r * r;
+            let d = z[[i, j]] - mean[j];
+            sst += d * d;
+        }
+    }
+    1.0 - ssr / sst.max(1.0e-12)
+}
+
 #[test]
 #[ignore = "exploration probe; run explicitly with --ignored --nocapture"]
 fn probe_1026_complexity_sweep() {
-    // ---- AXIS A: arc turning Θ (K=1, p=2) — confirm the engine reproduces the
-    //      closed-form dominance boundary (margin dies ~Θ=2.4 rad). ----
-    println!("\n== AXIS A: arc Θ, K=1, p=2, n=120, σ=0.02 (engine) ==");
-    let n = 120usize;
-    let sig = 0.02;
-    for &turn in &[1.0_f64, 0.5, 0.25] {
-        let theta = std::f64::consts::TAU * turn;
+    // ---- SANITY: one dispersion-seeded K=1 fit should now converge FAST (the
+    //      earlier un-seeded probe wandered for ~1 min/fit). ----
+    {
+        let n = 120usize;
+        let sig = 0.02;
         let mut z = Array2::<f64>::zeros((n, 2));
         let mut frac = vec![0.0; n];
         for i in 0..n {
             let t = i as f64 / n as f64;
             frac[i] = t;
-            let ang = theta * t;
+            let ang = std::f64::consts::TAU * t;
             z[[i, 0]] = ang.cos() + sig * idx_noise(i as u64 * 2);
             z[[i, 1]] = ang.sin() + sig * idx_noise(i as u64 * 2 + 1);
         }
         let coord = Array2::from_shape_fn((n, 1), |(i, _)| (frac[i] + 0.03).rem_euclid(1.0));
-        let (ec, tc) = fit_ev(&[Arm::Curved], std::slice::from_ref(&coord), &z, "A-curved");
-        let (el, tl) = fit_ev(&[Arm::Linear], std::slice::from_ref(&coord), &z, "A-linear");
+        let (fitted, secs) = fit_ev(&[Arm::Curved], std::slice::from_ref(&coord), &z, "sanity");
         println!(
-            "  Θ={:.2} ({:.2} turn): curved={:.4} ({:.1}s)  linear={:.4} ({:.1}s)  margin={:+.4}",
-            theta, turn, ec, tc, el, tl, ec - el
+            "== SANITY K=1 full circle (dispersion-seeded): EV={:.4} in {secs:.1}s ==",
+            ev(&z, &fitted)
         );
     }
 
-    // ---- AXIS D: K=2 superposition, orthogonal vs shared-subspace frames ----
-    //      Two full circles, all-active (superposed). Curved K=2 should recover
-    //      both; we read EV + time vs orthogonality.
-    for &(p, tag) in &[(4usize, "orthogonal (p=4, 2K=4)"), (3usize, "shared-subspace (p=3<2K=4)")] {
-        println!("\n== AXIS D: K=2 two superposed circles, {tag}, n=160, σ=0.02 (engine) ==");
-        let n = 160usize;
-        let q = ortho_frames(2, p.max(4)); // build in >=4-dim then project to p
+    // ---- RARENESS axis: a single curved feature active on only a FRACTION of
+    //      rows (rest = pure noise), all gates seeded high. Does the K=1 IBP gate
+    //      RECOVER the rare feature (drive inactive gates down, reconstruct the
+    //      active rows), or COLLAPSE (prune it, EV_active -> 0)? EV is measured on
+    //      the ACTIVE rows — the recoverable signal. ----
+    println!("\n== RARENESS: K=1 circle active on a fraction of rows, p=4, n=400, σ=0.02 ==");
+    let n = 400usize;
+    let p = 4usize;
+    let sig = 0.02;
+    let q = ortho_frames(1, p);
+    for &frac_active in &[1.0_f64, 0.25, 0.10, 0.04] {
+        let nact = ((frac_active * n as f64).round() as usize).max(4);
+        let mut active = vec![false; n];
+        // Spread the active rows deterministically across [0,n).
+        for t in 0..nact {
+            active[(t * n) / nact] = true;
+        }
         let mut z = Array2::<f64>::zeros((n, p));
-        let mut coords = Vec::new();
-        for a in 0..2 {
-            let stride = 0.043 + 0.005 * a as f64;
-            let phase = 0.11 * a as f64;
-            let mut c = Array2::<f64>::zeros((n, 1));
-            for i in 0..n {
-                let th = ((i as f64) * stride + phase).rem_euclid(1.0);
-                c[[i, 0]] = (th + 0.03).rem_euclid(1.0);
+        let mut coord = Array2::<f64>::zeros((n, 1));
+        let mut a_idx = 0usize;
+        for i in 0..n {
+            if active[i] {
+                let th = ((a_idx as f64) / nact as f64).rem_euclid(1.0);
+                a_idx += 1;
+                coord[[i, 0]] = (th + 0.03).rem_euclid(1.0);
                 let ang = std::f64::consts::TAU * th;
                 for col in 0..p {
-                    let u0 = q[[col % q.nrows(), 2 * a]];
-                    let u1 = q[[col % q.nrows(), 2 * a + 1]];
-                    z[[i, col]] += ang.cos() * u0 + ang.sin() * u1;
+                    z[[i, col]] = ang.cos() * q[[col, 0]] + ang.sin() * q[[col, 1]];
                 }
+            } else {
+                // Inactive row: arbitrary coord, pure noise (no circle signal).
+                coord[[i, 0]] = ((i as f64) * 0.013).rem_euclid(1.0);
             }
-            coords.push(c);
-        }
-        for i in 0..n {
             for col in 0..p {
                 z[[i, col]] += sig * idx_noise((i * p + col) as u64 * 7 + 1);
             }
         }
-        let (ec, tc) = fit_ev(&[Arm::Curved, Arm::Curved], &coords, &z, "D-curved-K2");
-        let (el, tl) = fit_ev(&[Arm::Linear, Arm::Linear], &coords, &z, "D-linear-K2");
+        let (fitted, secs) = fit_ev(&[Arm::Curved], std::slice::from_ref(&coord), &z, "rare");
+        let ev_active = ev_subset(&z, &fitted, &active);
+        let ev_all = ev(&z, &fitted);
+        // Collapse signature: EV_active -> 0 means the IBP gate pruned the rare
+        // feature (or failed to gate noise); EV_active staying high means recovery.
+        let verdict = if ev_active < 0.5 { "  <-- RECOVERY COLLAPSE" } else { "" };
         println!(
-            "  curved K2 = {:.4} ({:.1}s)   linear K2 = {:.4} ({:.1}s)   margin = {:+.4}",
-            ec, tc, el, tl, ec - el
+            "  active={:.2} ({:>3} rows): EV_active={:.4}  EV_all={:.4}  ({:.1}s){}",
+            frac_active, nact, ev_active, ev_all, secs, verdict
         );
     }
 }
