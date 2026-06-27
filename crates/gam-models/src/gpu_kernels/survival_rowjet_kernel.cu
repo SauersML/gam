@@ -90,27 +90,6 @@ __device__ __forceinline__ void d_lognormpdf(double x,double o[5]){
 
 struct RowIn{ double wi,di,z_sum,cov_ones,probit_scale; };
 
-// ---- Order2 jet (v,g,H) over K primaries ----
-struct J2{ double v; double g[K]; double h[K][K]; };
-__device__ __forceinline__ J2 j2_const(double c){ J2 r; r.v=c; for(int i=0;i<K;i++){r.g[i]=0; for(int j=0;j<K;j++) r.h[i][j]=0;} return r; }
-__device__ __forceinline__ J2 j2_var(double x,int a){ J2 r=j2_const(x); r.g[a]=1.0; return r; }
-__device__ __forceinline__ J2 j2_scale(const J2&a,double s){ J2 r; r.v=a.v*s; for(int i=0;i<K;i++){r.g[i]=a.g[i]*s; for(int j=0;j<K;j++) r.h[i][j]=a.h[i][j]*s;} return r; }
-__device__ __forceinline__ J2 j2_add(const J2&a,const J2&b){ J2 r; r.v=a.v+b.v; for(int i=0;i<K;i++){r.g[i]=a.g[i]+b.g[i]; for(int j=0;j<K;j++) r.h[i][j]=a.h[i][j]+b.h[i][j];} return r; }
-__device__ __forceinline__ J2 j2_addc(const J2&a,double c){ J2 r=a; r.v+=c; return r; }
-__device__ __forceinline__ J2 j2_mul(const J2&a,const J2&b){
-    J2 r=j2_const(a.v*b.v);
-    for(int i=0;i<K;i++) r.g[i]=a.v*b.g[i]+a.g[i]*b.v;
-    for(int i=0;i<K;i++) for(int j=0;j<K;j++)
-        r.h[i][j]=a.g[i]*b.g[j]+a.g[j]*b.g[i]+a.v*b.h[i][j]+a.h[i][j]*b.v;
-    return r;
-}
-__device__ __forceinline__ J2 j2_compose(const J2&a,const double d[5]){
-    double f1=d[1],f2=d[2]; J2 r=j2_const(d[0]);
-    for(int i=0;i<K;i++) r.g[i]=f1*a.g[i];
-    for(int i=0;i<K;i++) for(int j=0;j<K;j++) r.h[i][j]=f1*a.h[i][j]+f2*a.g[i]*a.g[j];
-    return r;
-}
-
 // ---- OneSeed jet: value+grad+hess + eps-derivatives (eps seeds x_a += eps*dir[a]) ----
 // dh = the eps-Hessian channel = sum_c t3[a][b][c] dir[c].
 struct JS1{ double v; double g[K]; double h[K][K]; double dv; double dg[K]; double dh[K][K]; };
@@ -226,7 +205,6 @@ __device__ __forceinline__ T NAME(T q0,T q1,T qd1,T g,const RowIn&in){         \
         double ll[5]; d_log(ad1.v,ll); td=SCALE(COMPOSE(ad1,ll),-in.wi*in.di);} \
     return ADD(ADD(exit,entry),ADD(ev,td));                                   \
 }
-DEF_NLL(nll_j2,J2,j2_const,j2_scale,j2_mul,j2_add,j2_addc,j2_compose)
 DEF_NLL(nll_js1,JS1,js1_const,js1_scale,js1_mul,js1_add,js1_addc,js1_compose)
 DEF_NLL(nll_js2,JS2,js2_const,js2_scale,js2_mul,js2_add,js2_addc,js2_compose)
 
@@ -244,15 +222,14 @@ extern "C" __global__ void __launch_bounds__(128,1) survival_rowjet(
     if(i>=n) return;
     RowIn in; in.wi=wi[i]; in.di=di[i]; in.z_sum=zsum[i]; in.cov_ones=cov[i]; in.probit_scale=probit_scale;
     double q0v=q0[i],q1v=q1[i],qd1v=qd1[i],gv=gg[i];
-    // (v,g,H)
-    J2 j=nll_j2(j2_var(q0v,0),j2_var(q1v,1),j2_var(qd1v,2),j2_var(gv,3),in);
-    // contracted third
+    // Contracted third. The JS1 base channels are the same value/gradient/Hessian
+    // program the removed J2 path computed, so they also feed out_v/out_g/out_h.
     JS1 j1=nll_js1(js1_var(q0v,0,dir[0]),js1_var(q1v,1,dir[1]),js1_var(qd1v,2,dir[2]),js1_var(gv,3,dir[3]),in);
     // contracted fourth
     JS2 j2=nll_js2(js2_var(q0v,0,diru[0],dirv[0]),js2_var(q1v,1,diru[1],dirv[1]),
                    js2_var(qd1v,2,diru[2],dirv[2]),js2_var(gv,3,diru[3],dirv[3]),in);
-    out_v[i]=j.v;
-    for(int a=0;a<K;a++) out_g[(size_t)i*K+a]=j.g[a];
+    out_v[i]=j1.v;
+    for(int a=0;a<K;a++) out_g[(size_t)i*K+a]=j1.g[a];
     for(int a=0;a<K;a++)for(int b=0;b<K;b++){ size_t o=(size_t)i*K*K+a*K+b;
-        out_h[o]=j.h[a][b]; out_t3[o]=j1.dh[a][b]; out_t4[o]=j2.huv[a][b]; }
+        out_h[o]=j1.h[a][b]; out_t3[o]=j1.dh[a][b]; out_t4[o]=j2.huv[a][b]; }
 }
