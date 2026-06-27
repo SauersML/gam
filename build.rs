@@ -16,6 +16,7 @@ fn main() {
     // warm target. The variable was consumed nowhere in the tree, so it is removed.
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=crates/gam-terms/src/analytic_penalties/manifest.rs");
+    println!("cargo:rerun-if-changed=SPEC.md");
 
     let manifest_dir =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set"));
@@ -42,6 +43,7 @@ fn main() {
     // removed under any circumstances; a human maintainer must approve and commit
     // any modification to this build script.
     forbid_claude_build_rs_edits(&manifest_dir);
+    require_human_spec_edits(&manifest_dir);
 
     // HARD ban (always fatal): build.rs must not weaken, bypass, or
     // environment-gate its OWN hard-fail gates. Introspects this file's source
@@ -1014,6 +1016,71 @@ fn forbid_claude_build_rs_edits(manifest_dir: &Path) {
              commit. The checks in this file are not to be weakened or removed under \
              any circumstances. Please have a human maintainer re-commit any needed \
              change to build.rs.",
+        );
+    }
+}
+
+/// `SPEC.md` holds the project's engineering rules and may only be changed by a
+/// human. The build FAILS when **the commit being built edits `SPEC.md`** and
+/// its message does not contain the literal phrase `I am a human`. Agents
+/// (Claude included) must not edit `SPEC.md` and must not write that phrase;
+/// this gate exists precisely so silent agent edits to the rules cannot
+/// compile. The check is scoped to the HEAD commit (compared against its first
+/// parent) so it flags exactly the offending commit and does not retroactively
+/// break unrelated builds. Like the build.rs author gate above, this check must
+/// not be weakened or removed under any circumstances. Skipped only when
+/// `SPEC.md`, git history, or HEAD's parent is absent (e.g. a published-crate
+/// consumer or a shallow checkout with no parent to diff against).
+fn require_human_spec_edits(manifest_dir: &Path) {
+    if !manifest_dir.join("SPEC.md").is_file() {
+        return;
+    }
+    // Which files did the HEAD commit change (vs its first parent)? If there is
+    // no parent (root/shallow clone), git errors and we cannot tell what
+    // changed, so we do not block the build.
+    let changed = Command::new("git")
+        .arg("-C")
+        .arg(manifest_dir)
+        .arg("diff")
+        .arg("--name-only")
+        .arg("HEAD~1")
+        .arg("HEAD")
+        .output();
+    let changed = match changed {
+        Ok(o) if o.status.success() => o,
+        _ => return,
+    };
+    let touches_spec = String::from_utf8_lossy(&changed.stdout)
+        .lines()
+        .any(|line| line.trim() == "SPEC.md");
+    if !touches_spec {
+        return;
+    }
+
+    let msg = Command::new("git")
+        .arg("-C")
+        .arg(manifest_dir)
+        .arg("log")
+        .arg("-1")
+        .arg("--format=%B")
+        .arg("HEAD")
+        .output();
+    let msg = match msg {
+        Ok(o) if o.status.success() => o,
+        _ => return,
+    };
+    let message = String::from_utf8_lossy(&msg.stdout);
+
+    if !message.contains("I am a human") {
+        panic!(
+            "SPEC.md gate: the HEAD commit edits SPEC.md but its message does not contain \
+             the phrase \"I am a human\".\n\
+             SPEC.md holds the project's engineering rules and may only be edited by a human \
+             who affirms authorship by writing \"I am a human\" in the commit message. Agents \
+             (Claude included) must not modify SPEC.md and must not write that phrase. This \
+             check must not be weakened or removed under any circumstances.\n\
+             HEAD commit message:\n{}",
+            message.trim()
         );
     }
 }
