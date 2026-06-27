@@ -1457,7 +1457,6 @@ pub fn apply_compiled_map_to_designs(
         time_penalties,
         marginal_penalties,
         logslope_penalties,
-        t_full: t.clone(),
     })
 }
 
@@ -1614,23 +1613,24 @@ pub fn build_survival_compiler_inputs(
     }
 }
 
-/// Per-term-aware V+M-exact compiled designs + penalties + the full
-/// triangular T matrix for result-time β lift. The construction site
-/// swaps raw designs/penalties for these compiled versions before
-/// building `ParameterBlockSpec`s; at fit result the joint compiled β
-/// is lifted to raw via `T · θ` (where T is block-upper-triangular with
-/// V_b on the diagonal and `-R_{a→b}` off-diagonal).
+/// V+M-exact compiled designs + per-block penalties for the survival
+/// time/marginal/logslope blocks, produced by
+/// [`apply_compiled_map_to_designs`] from a `CompiledMap`. The
+/// construction site swaps raw designs/penalties for these compiled
+/// versions before building `ParameterBlockSpec`s.
 ///
-/// Difference from [`CompiledSurvivalDesignsPerTerm`]:
-/// - emitted designs use [`ResidualisedDesignOperator`] (the exact
-///   `C_b·V_b − A_{<b}·R_b` row form), not the V-only
-///   `CoefficientTransformOperator`;
-/// - per-term penalties are pulled back through the FULL triangular T
-///   (not just V_b), so they are full-width `PenaltyMatrix::Dense`
-///   matrices that may couple across blocks via the off-diagonal
-///   `-R_{a→b}` entries of T;
-/// - the joint result-time lift uses `t_full` rather than the per-block
-///   V_b matrices on their own.
+/// The emitted designs carry the exact residualised `C_b·V_b − A_{<b}·R_b`
+/// row form (via [`wrap_design_with_transform`] on `V_b = T[raw_b, comp_b]`):
+/// the cross-block residualisation `R_{a→b}` lives in those design columns,
+/// while each block's penalty is pulled back through that block's own
+/// diagonal `V_b` as `V_bᵀ S_b V_b` (the `*_penalties` fields).
+///
+/// At fit result the joint compiled β is lifted back to raw via the
+/// `gam_solve::gauge::Gauge` built from the *same* `CompiledMap`
+/// (`β_raw = T · θ`, T block-upper-triangular with `V_b` on the diagonal
+/// and `-R_{a→b}` off-diagonal). The full T therefore lives on that
+/// `Gauge`, not on this struct — the caller holds the `CompiledMap` and
+/// constructs both from it, so duplicating T here would be dead state.
 pub struct CompiledSurvivalDesignsVMExact {
     pub time_design_entry: DesignMatrix,
     pub time_design_exit: DesignMatrix,
@@ -1647,12 +1647,6 @@ pub struct CompiledSurvivalDesignsVMExact {
     pub time_penalties: Vec<PenaltyMatrix>,
     pub marginal_penalties: Vec<PenaltyMatrix>,
     pub logslope_penalties: Vec<PenaltyMatrix>,
-    /// Full triangular T matrix: rows = raw joint width, cols = compiled
-    /// joint width. Diagonal blocks are V_b; upper off-diagonal blocks
-    /// at `(a, b)` for `a < b` are `-R_{a→b}` (residualised reparam
-    /// against the earlier block). Used at result time to lift
-    /// `θ_compiled → β_raw = T · θ_compiled`.
-    pub t_full: Array2<f64>,
 }
 
 /// Project a raw-space warm start β_raw into compiled coordinates θ via the
