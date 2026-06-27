@@ -22,10 +22,14 @@
 //!
 //! This test builds the equilateral-triangle-on-equator configuration, takes the
 //! Fréchet mean, and asserts its objective does not exceed that of the pole (it
-//! should be ≤, since the pole is a feasible competitor). It currently fails
-//! because the returned objective (~8.773) exceeds the pole's (~7.402). When the
-//! seeding covers the orthogonal axis, the routine finds the pole and the
-//! assertion holds without edits.
+//! should be ≤, since the pole is a feasible competitor).
+//!
+//! FIXED: `sphere_mean_candidates` (crates/gam-geometry/src/manifolds/sphere.rs)
+//! now seeds the Karcher descent from the FULL orthonormal eigenbasis of
+//! `M = Σ wᵢ pᵢ pᵢᵀ` (both signs) via `sphere_eigenbasis`, which Gram–Schmidt
+//! completes the null space — so the orthogonal axis (the pole) is now an offered
+//! seed and the caller keeps the lowest-objective converged result. The returned
+//! objective is therefore ≤ the pole's. This file is now a regression guard.
 
 use gam::geometry::sphere::sphere_frechet_mean;
 use ndarray::{ArrayView1, ArrayView2, array};
