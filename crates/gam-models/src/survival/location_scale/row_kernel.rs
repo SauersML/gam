@@ -645,9 +645,19 @@ impl<'a, const KW: usize> SurvivalLsWiggleRowKernel<'a, KW> {
         let degree = family
             .wiggle_degree
             .ok_or("link-wiggle kernel: missing wiggle degree")?;
-        // Base exit/entry indices where the warp basis is evaluated.
-        let q_exit = dynamic.q_exit.clone();
-        let q_entry = dynamic.q_entry.clone();
+        // Indices where the warp basis derivative stacks are evaluated.
+        // `sls_row_nll_wiggle` composes each stack ONTO the residual jets
+        // `u1 = h_exit + q_exit` and `u0 = h_entry + q_entry`
+        // (`u1.compose_unary([b0x, b1x, ..])`); `compose_unary` requires the stack
+        // evaluated AT `value(u1)`/`value(u0)`, i.e. the FULL residual with the
+        // baseline hazard `h` included. Evaluating at `q_exit`/`q_entry` alone
+        // drops the `h` shift — correct only in the `h ≡ 0` reduced-AFT regime,
+        // wrong by ~O(h·B') otherwise. This matches the FD-verified §13 program
+        // (`survival_ls_wiggle_jet_program_joint_hessian_matches_fd_932`, whose
+        // `WiggleProg` evaluates the basis at `value(u1)`), and is pinned by
+        // `survival_ls_wiggle_joint_hessian_matches_assembler_932`. (#932)
+        let q_exit = &dynamic.h_exit + &dynamic.q_exit;
+        let q_entry = &dynamic.h_entry + &dynamic.q_entry;
         let b_u0_0 = survival_wiggle_basis_with_options(
             q_entry.view(),
             knots,

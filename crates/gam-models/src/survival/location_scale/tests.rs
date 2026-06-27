@@ -6422,12 +6422,13 @@ fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
     let weight = [1.0, 0.8, 1.2, 1.1];
     let n = primaries.len();
 
-    // Base indices (used to evaluate the wiggle basis where the warp applies).
+    // Seed indices for the wiggle DESIGN matrix `x_link_wiggle` only (its column
+    // count `pw` and `etaw = X·betaw`). The warp basis derivative stacks are NOT
+    // evaluated here: they must be taken at the model residual `value(u1)` /
+    // `value(u0)` (the point `sls_row_nll_wiggle`'s `compose_unary` composes onto),
+    // which is computed from the production `dynamic` geometry inside the loop.
     let q0_exit = Array1::from_shape_fn(n, |i| {
         primaries[i][1] - primaries[i][3] * (-primaries[i][6]).exp()
-    });
-    let q0_entry = Array1::from_shape_fn(n, |i| {
-        primaries[i][0] - primaries[i][4] * (-primaries[i][7]).exp()
     });
 
     // A small monotone wiggle basis; degree/knots chosen for a few columns.
@@ -6445,44 +6446,6 @@ fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
             .expect("wiggle design B(q0_exit)");
     let pw = xwiggle.ncols();
     let betaw = Array1::from_shape_fn(pw, |b| 0.25 - 0.08 * b as f64);
-
-    // Per-row basis derivative stacks at the BASE indices (the warp composes the
-    // basis onto the index jet). Exit needs B,B',B'',B'''; entry needs B,B',B''.
-    let bx0 =
-        survival_wiggle_basis_with_options(q0_exit.view(), &knots, degree, BasisOptions::value())
-            .unwrap();
-    let bx1 = survival_wiggle_basis_with_options(
-        q0_exit.view(),
-        &knots,
-        degree,
-        BasisOptions::first_derivative(),
-    )
-    .unwrap();
-    let bx2 = survival_wiggle_basis_with_options(
-        q0_exit.view(),
-        &knots,
-        degree,
-        BasisOptions::second_derivative(),
-    )
-    .unwrap();
-    let bx3 = survival_wiggle_third_basis(q0_exit.view(), &knots, degree).unwrap();
-    let be0 =
-        survival_wiggle_basis_with_options(q0_entry.view(), &knots, degree, BasisOptions::value())
-            .unwrap();
-    let be1 = survival_wiggle_basis_with_options(
-        q0_entry.view(),
-        &knots,
-        degree,
-        BasisOptions::first_derivative(),
-    )
-    .unwrap();
-    let be2 = survival_wiggle_basis_with_options(
-        q0_entry.view(),
-        &knots,
-        degree,
-        BasisOptions::second_derivative(),
-    )
-    .unwrap();
 
     // The single-source §13 warp evaluated on a generic jet scalar, KW = 9 + pw.
     fn wiggle_nll<const KW: usize, S: JetScalar<KW>>(
@@ -6588,6 +6551,59 @@ fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
         let dynamic = family
             .build_dynamic_geometry(&states)
             .expect("dynamic geometry");
+
+        // Warp basis derivative stacks at the MODEL residual indices
+        // `value(u1) = h_exit + q_exit` and `value(u0) = h_entry + q_entry` — the
+        // exact points `sls_row_nll_wiggle` composes the stack onto (so the
+        // production §13 kernel and this independent tower agree). NOT the raw
+        // fixture `q0`: the oracle family transforms `eta_t`, so the fixture-seed
+        // index differs from the model's actual residual. Exit needs B,B',B'',B''';
+        // entry needs B,B',B''.
+        let u1_index = &dynamic.h_exit + &dynamic.q_exit;
+        let u0_index = &dynamic.h_entry + &dynamic.q_entry;
+        let bx0 = survival_wiggle_basis_with_options(
+            u1_index.view(),
+            &knots,
+            degree,
+            BasisOptions::value(),
+        )
+        .unwrap();
+        let bx1 = survival_wiggle_basis_with_options(
+            u1_index.view(),
+            &knots,
+            degree,
+            BasisOptions::first_derivative(),
+        )
+        .unwrap();
+        let bx2 = survival_wiggle_basis_with_options(
+            u1_index.view(),
+            &knots,
+            degree,
+            BasisOptions::second_derivative(),
+        )
+        .unwrap();
+        let bx3 = survival_wiggle_third_basis(u1_index.view(), &knots, degree).unwrap();
+        let be0 = survival_wiggle_basis_with_options(
+            u0_index.view(),
+            &knots,
+            degree,
+            BasisOptions::value(),
+        )
+        .unwrap();
+        let be1 = survival_wiggle_basis_with_options(
+            u0_index.view(),
+            &knots,
+            degree,
+            BasisOptions::first_derivative(),
+        )
+        .unwrap();
+        let be2 = survival_wiggle_basis_with_options(
+            u0_index.view(),
+            &knots,
+            degree,
+            BasisOptions::second_derivative(),
+        )
+        .unwrap();
 
         // Coefficient offsets = cumulative block beta widths (time,thr,ls,wiggle).
         let widths: Vec<usize> = states.iter().map(|s| s.beta.len()).collect();
