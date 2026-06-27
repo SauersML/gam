@@ -2810,6 +2810,8 @@ where
         },
         inference,
         reml_score: outer_result.final_value,
+        outer_cost_evals: usize::try_from(*reml_state.arena.cost_eval_count.read().unwrap())
+            .unwrap_or(usize::MAX),
         fitted_link: if let Some(state) = final_mixture_state {
             FittedLinkState::Mixture {
                 state,

@@ -1,4 +1,5 @@
 mod beta_generative_phi_drives_draw_variance;
+mod binomial_logit_outer_work_1575;
 mod firth_behavior;
 mod firth_general_pc_hyperprior_default;
 mod probit_integration;

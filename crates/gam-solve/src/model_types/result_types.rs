@@ -1182,6 +1182,13 @@ pub struct UnifiedFitResult {
     /// Inner cycle count (blockwise path).
     #[serde(default)]
     pub inner_cycles: usize,
+    /// Number of outer REML cost-only evaluations the fit executed (each
+    /// trust-region / line-search probe drives one, paying an inner P-IRLS
+    /// solve). Diagnostic only — guards regressions in outer work (#1575) and
+    /// is not part of the statistical contract. Zero for paths that do not run
+    /// the standard external REML optimizer.
+    #[serde(default)]
+    pub outer_cost_evals: usize,
 }
 
 pub(crate) use gam_problem::ensure_finite_scalar_estimation;
@@ -1790,6 +1797,10 @@ impl UnifiedFitResult {
             constraint_kkt,
             artifacts,
             inner_cycles,
+            // Populated post-construction by the external REML fit path
+            // (`fit.rs`) from the optimizer's outer cost-eval counter. The
+            // parts builder does not carry it, so it defaults to 0 here.
+            outer_cost_evals: 0,
         })
     }
     pub fn validate_numeric_finiteness(&self) -> Result<(), EstimationError> {
@@ -1863,6 +1874,7 @@ impl UnifiedFitResult {
             constraint_kkt: parts.constraint_kkt,
             artifacts: parts.artifacts,
             inner_cycles: parts.inner_cycles,
+            outer_cost_evals: 0,
         }
     }
 }

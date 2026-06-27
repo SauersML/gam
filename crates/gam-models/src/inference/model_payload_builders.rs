@@ -253,6 +253,7 @@ fn truncate_marginal_slope_influence_absorber(
         constraint_kkt,
         artifacts,
         inner_cycles,
+        outer_cost_evals: _,
     } = fit_result;
 
     // Slice block 0's coefficients (and matching block-state) to the raw p_m,

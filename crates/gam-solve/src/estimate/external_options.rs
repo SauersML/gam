@@ -35,6 +35,11 @@ pub struct ExternalOptimResult {
     /// Complete REML/LAML objective value used for smoothing selection.
     pub reml_score: f64,
     pub fitted_link: FittedLinkState,
+    /// Number of outer REML cost-only evaluations executed during the fit
+    /// (the count the outer optimizer's trust-region/line-search probes drive,
+    /// each paying an inner P-IRLS solve). Surfaced for regression guards on
+    /// outer work (#1575); not part of the statistical contract.
+    pub outer_cost_evals: usize,
 }
 
 #[derive(Clone)]

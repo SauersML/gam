@@ -6163,7 +6163,17 @@ impl<'a> RemlState<'a> {
                 {
                     Some(override_tol)
                 } else if let Some(outer_grad_norm) = self.previous_outer_gradient_norm(&key_opt) {
-                    let ceiling = pirls_config.convergence_tolerance;
+                    // Loose end of the schedule: far-from-optimum probes are
+                    // allowed up to the documented inner-mode correctness floor
+                    // (1e-6), not pinned to the tight 1e-10 inner tolerance.
+                    // Pinning the ceiling to `convergence_tolerance` made the
+                    // clamp able only to *tighten* the inner solve, so the
+                    // schedule never relaxed and every outer probe paid a full
+                    // 1e-10 inner P-IRLS solve (#1575). The ceiling still never
+                    // goes below the tight inner tolerance, so a fit that asks
+                    // for an inner tolerance looser than 1e-6 is unaffected.
+                    let ceiling =
+                        ADAPTIVE_KKT_CEILING.max(pirls_config.convergence_tolerance);
                     let floor = (self.config.reml_convergence_tolerance
                         / ADAPTIVE_KKT_FLOOR_REML_DIVISOR)
                         .min(ceiling);

@@ -300,6 +300,7 @@ where
         .as_ref()
         .and_then(|inf| inf.beta_covariance_corrected.clone());
     let penalized_objective = result.reml_score;
+    let outer_cost_evals = result.outer_cost_evals;
     UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
         blocks: vec![FittedBlock {
             beta: result.beta.clone(),
@@ -333,6 +334,12 @@ where
         constraint_kkt: result.constraint_kkt,
         artifacts: result.artifacts,
         inner_cycles: 0,
+    })
+    .map(|mut unified| {
+        // Surface the optimizer's outer cost-eval count (not carried by the
+        // parts builder) so callers/tests can guard outer work (#1575).
+        unified.outer_cost_evals = outer_cost_evals;
+        unified
     })
 }
 
