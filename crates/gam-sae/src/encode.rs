@@ -1104,8 +1104,36 @@ fn certify_with_basin_warmup(
     lipschitz: f64,
     ridge: f64,
     newton_steps: usize,
+    chart_center: ArrayView1<'_, f64>,
+    chart_radius: f64,
 ) -> Result<Option<CertifiedEncodeProbe>, String> {
+    // SOUNDNESS GUARD: `lipschitz` is the chart's Hessian-Lipschitz sup, which is
+    // only a valid bound over this chart's ball `‖t − center‖ ≤ radius` for the
+    // chart-local families (`EuclideanPatch`/`Linear`/`Poincare` monomial patches,
+    // `Cylinder` line axis, `Duchon` radial kernels). If a warm-up iterate leaves
+    // that ball, `row_certificate` would compute `h = β·η·L` with an `L` that no
+    // longer bounds the true geometry there, so `h ≤ ½` would NOT imply Kantorovich
+    // convergence — a false certificate. (The `h`-contraction check does NOT catch
+    // this: `h` can decrease monotonically toward an out-of-chart root the whole
+    // way.) So we keep every certified iterate inside the chart; a row whose root is
+    // outside this chart flags for the exact fallback — its lever is a denser grid,
+    // not a step using an invalid `L`. Global-`L` families (periodic/torus/sphere)
+    // route their points to charts whose centers are near the root, so the guard
+    // rarely trips for them, and where it does the row was out-of-chart anyway.
+    let in_chart = |t: &Array1<f64>| -> bool {
+        let r2: f64 = t
+            .iter()
+            .zip(chart_center.iter())
+            .map(|(a, b)| (a - b) * (a - b))
+            .sum();
+        r2 <= chart_radius * chart_radius
+    };
     let mut t = t_start;
+    // The distilled / chart-center start must itself be in-chart for its certificate
+    // to be valid; a bad IFT prediction landing outside the chart is uncertifiable.
+    if !in_chart(&t) {
+        return Ok(None);
+    }
     let (mut cert, mut delta) =
         row_certificate(atom, evaluator, t.view(), x, amplitude, lipschitz, ridge)?;
     while !cert.certified() {
@@ -1114,7 +1142,12 @@ fn certify_with_basin_warmup(
             return Ok(None);
         }
         let prev_h = cert.h;
-        t = &t + &delta;
+        let next = &t + &delta;
+        // Refuse to step where the chart's `L` is no longer valid (see guard above).
+        if !in_chart(&next) {
+            return Ok(None);
+        }
+        t = next;
         let (next_cert, next_delta) =
             row_certificate(atom, evaluator, t.view(), x, amplitude, lipschitz, ridge)?;
         cert = next_cert;
@@ -1364,6 +1397,8 @@ impl EncodeAtlas {
             chart.lipschitz,
             self.config.ridge,
             self.config.newton_steps,
+            chart.region.center.view(),
+            chart.region.radius,
         )?
         else {
             return Ok((
@@ -1513,6 +1548,8 @@ impl EncodeAtlas {
             chart.lipschitz,
             self.config.ridge,
             self.config.newton_steps,
+            chart.region.center.view(),
+            chart.region.radius,
         )?
         else {
             return Ok((
@@ -1531,6 +1568,8 @@ impl EncodeAtlas {
             chart.lipschitz,
             self.config.ridge,
             self.config.newton_steps,
+            chart.region.center.view(),
+            chart.region.radius,
         )?
         else {
             return Ok((
