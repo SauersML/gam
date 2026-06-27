@@ -1,14 +1,14 @@
-use gam::families::survival::location_scale::residual_distribution_inverse_link;
-use gam::families::survival::lognormal_kernel::{FrailtySpec, HazardLoading};
-use gam::families::survival::parse_survival_distribution;
-use gam::families::survival::{SurvivalLikelihoodMode, parse_survival_likelihood_mode};
-use gam::inference::formula_dsl::parse_link_choice;
-use gam::inference::model::GroupMetadata;
-use gam::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
+use gam_models::survival::location_scale::residual_distribution_inverse_link;
+use gam_models::survival::lognormal_kernel::{FrailtySpec, HazardLoading};
+use gam_models::survival::parse_survival_distribution;
+use gam_models::survival::{SurvivalLikelihoodMode, parse_survival_likelihood_mode};
+use gam_inference::formula_dsl::parse_link_choice;
+use gam_inference::model::GroupMetadata;
+use gam_solve::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use gam_models::fit_orchestration::descriptors::build_analytic_penalty_registry_from_descriptors;
 use gam_models::fit_orchestration::{CtnStage1Recipe, FitConfig};
-use gam::transformation_normal::TransformationNormalConfig;
-use gam::types::{InverseLink, LinkFunction, MixtureLinkSpec, SasLinkSpec, StandardLink};
+use gam_models::transformation_normal::TransformationNormalConfig;
+use gam_problem::types::{InverseLink, LinkFunction, MixtureLinkSpec, SasLinkSpec, StandardLink};
 use ndarray::Array1;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -204,7 +204,7 @@ fn resolve_json_fit_config(json_config: JsonFitConfig) -> Result<ResolvedFitConf
     fit_config.topology_auto_selector = json_config
         .topology_auto_selector
         .as_ref()
-        .map(gam::solver::topology_selector::TopologyAutoSelector::from_json)
+        .map(gam_solve::topology_selector::TopologyAutoSelector::from_json)
         .transpose()?;
     fit_config.family = normalize_optional_family(json_config.family);
     fit_config.offset_column = json_config.offset;
@@ -904,8 +904,8 @@ fn group_metadata_from_groups(groups: JsonValue) -> Result<Option<GroupMetadata>
     }
 }
 
-fn parse_gpu_policy(raw_gpu: &str) -> Result<gam::gpu::GpuPolicy, String> {
-    gam::gpu::GpuPolicy::parse(raw_gpu).ok_or_else(|| {
+fn parse_gpu_policy(raw_gpu: &str) -> Result<gam_gpu::GpuPolicy, String> {
+    gam_gpu::GpuPolicy::parse(raw_gpu).ok_or_else(|| {
         format!(
             "invalid gpu policy '{}'; supported values are auto, off, force",
             raw_gpu
@@ -935,7 +935,7 @@ fn survival_link_usage() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gam::families::survival::lognormal_kernel::FrailtySpec;
+    use gam_models::survival::lognormal_kernel::FrailtySpec;
     use serde_json::{Value, json};
 
     struct ParityCase {
