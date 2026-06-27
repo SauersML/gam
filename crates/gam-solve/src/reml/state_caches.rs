@@ -19,32 +19,6 @@ pub(crate) const ADAPTIVE_KKT_ETA: f64 = 0.1;
 
 pub(crate) const ADAPTIVE_KKT_FLOOR_REML_DIVISOR: f64 = 100.0;
 
-/// Loosest inner-PIRLS KKT tolerance the *adaptive* schedule is allowed to
-/// request far from the outer optimum (#1575).
-///
-/// The adaptive inner tolerance is `(eta·‖g_outer‖).clamp(floor, ceiling)`. The
-/// floor (≈ reml_tol/100) is the tight end used near convergence. The ceiling
-/// is the loose end used while the outer optimizer is still far from the REML
-/// optimum and a coarse inner mode is all the outer derivatives can use anyway.
-///
-/// Previously the ceiling was pinned to `pirls_config.convergence_tolerance`
-/// (= min(reml_tol, 1e-6), so 1e-10 for a 1e-10 REML fit). With ceiling == the
-/// tight inner tolerance the clamp could only ever *tighten* the inner solve;
-/// the "adaptive" schedule was structurally inert and every far-from-optimum
-/// outer probe paid a full 1e-10 inner P-IRLS solve. That is the dominant cost
-/// in the binomial/logit REML slowdown: ~150 outer evals each forced to a
-/// 1e-10 inner solve.
-///
-/// `1e-6` is exactly the documented inner-mode correctness floor
-/// (`estimate::smoothing_correction::PIRLS_INNER_TOLERANCE_FLOOR`): the inner
-/// Newton certifies the coefficient mode against a *scale-aware* tolerance, and
-/// 1e-6 is the coarsest the project already considers a clean mode (a user who
-/// dials the outer tolerance no looser than 1e-6 leaves the inner there). So a
-/// far-from-optimum probe certified at ‖g‖ ≤ 1e-6·scale carries no more error
-/// than the established inner floor, and the schedule still tightens monotonically
-/// to `floor` as ‖g_outer‖ → 0, leaving the converged REML optimum unchanged.
-pub(crate) const ADAPTIVE_KKT_CEILING: f64 = 1e-6;
-
 pub(crate) const TK_MAX_DENSE_WORK: usize = 5_000_000;
 
 // `n * p` catches bam-shaped tall designs while avoiding small-n wide problems.
