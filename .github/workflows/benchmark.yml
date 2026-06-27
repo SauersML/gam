@@ -75,6 +75,34 @@ jobs:
         run: |
           python3 .github/scripts/workflow_tasks.py build_matrix
 
+  # #1560: the suite once went green while benchmarking *nothing* — the matrix
+  # step emitted empty `*_count` outputs, both shard jobs' `if: *_count != '0'`
+  # gates closed, and the gateless `aggregate` job was skipped along with them,
+  # so the run still concluded `success`. This guard turns that silent
+  # green-but-empty mode back into a hard failure: it depends only on `prepare`
+  # and fails if zero scenarios were scheduled across BOTH buckets. Unlike the
+  # shard/aggregate jobs it carries no `if:` gate of its own, so it cannot be
+  # skipped into a false green.
+  assert-scheduled:
+    name: Assert scenarios were scheduled
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail fast if the matrix is empty
+        shell: bash
+        env:
+          PARALLEL_COUNT: ${{ needs.prepare.outputs.parallel_count }}
+          SERIAL_COUNT: ${{ needs.prepare.outputs.serial_count }}
+        run: |
+          set -euo pipefail
+          echo "parallel_count=${PARALLEL_COUNT}"
+          echo "serial_count=${SERIAL_COUNT}"
+          if [ "${PARALLEL_COUNT:-0}" = "0" ] && [ "${SERIAL_COUNT:-0}" = "0" ]; then
+            echo "::error title=Empty benchmark matrix::prepare scheduled zero scenarios (parallel_count=${PARALLEL_COUNT}, serial_count=${SERIAL_COUNT}); the suite would have gone green without benchmarking anything (#1560)."
+            exit 1
+          fi
+          echo "matrix non-empty: ${PARALLEL_COUNT} parallel + ${SERIAL_COUNT} serial scenarios scheduled"
+
   bootstrap-runtime:
     name: Bootstrap benchmark runtime
     needs: prepare
