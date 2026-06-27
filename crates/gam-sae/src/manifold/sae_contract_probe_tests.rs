@@ -677,32 +677,29 @@ fn amortized_warm_start_matches_or_beats_cold_inner_solve_on_known_manifold() {
 /// — co-adapting the dictionary + λ toward a faithfully-invertible encode can
 /// only help recovery, never regress it.
 ///
-/// HONEST STATE (#1154, verified cluster job 11151242, 2026-06-17): this guarantee
-/// is NOT currently demonstrable on a unit-amplitude held-out encode, and the
-/// test is `#[ignore]`d with the root cause rather than gamed.
+/// STATE (#1154/#1026, basin-warmup fix): this guarantee IS now demonstrable on
+/// unit-amplitude held-out rows — the test certifies all held-out rows and asserts
+/// the recovery comparison live (it is no longer `#[ignore]`d / vacuous).
 ///
-/// Root cause — the encode-atlas Kantorovich certificate (`row_certificate`,
-/// src/terms/sae/encode.rs) certifies ZERO held-out rows of the planted circle
-/// at amplitude 1.0, via BOTH the amortized one-mat-vec predictor AND the exact
-/// cold-Newton chart-center probe (the eprintln prints `certified=0` for the
-/// sequential and co-trained paths alike). The certificate's worst-case
+/// Former root cause (now FIXED) — the encode-atlas Kantorovich certificate
+/// (`row_certificate`, encode.rs) used to certify ZERO held-out rows of the planted
+/// circle at amplitude 1.0, via BOTH the amortized one-mat-vec predictor AND the
+/// exact cold-Newton chart-center probe. The certificate's worst-case
 /// Hessian-Lipschitz constant `L = hessian_lipschitz_constant(.., amplitude, ..)`
-/// scales with the assignment amplitude, so the Kantorovich quantity
-/// `h = β·η·L` exceeds the ½ acceptance bound at amplitude 1.0. The IN-SAMPLE
-/// faithfulness test (`cotrained_criterion_folds_…`) DOES certify and PASSES,
-/// because the fitted softmax masses there are < 1 (smaller L ⇒ `h ≤ ½`). So:
-/// - the amortized encode IS faithful to the exact per-row encode where the
-///   certificate accepts (the in-sample test proves it), and the consistency
-///   lane is sound (`cotrain_fold_is_value_lane_only…`, #1206/#1207), but
-/// - the certificate's reach does not extend to unit-amplitude held-out points
-///   on this circle, so neither path certifies and the "recover ≥ sequential"
-///   comparison has no certified rows to measure.
+/// scales with the assignment amplitude, so `h = β·η·L` exceeded the ½ acceptance
+/// bound at amplitude 1.0 *from the chart-center / distilled start* — even though
+/// that start was positive-definite with a valid Newton step. The IN-SAMPLE
+/// faithfulness test (`cotrained_criterion_folds_…`) certified because its fitted
+/// softmax masses are < 1 (smaller L ⇒ `h ≤ ½`).
 ///
-/// This is a real reach limitation of the encode certificate at unit amplitude
-/// (a concurrent hardening required the basis second jet and removed the
-/// Gauss-Newton certificate fallback). Closing it means widening the certified
-/// radius at unit amplitude (e.g. an amplitude-aware chart refinement), not a
-/// test tweak — tracked as the remaining #1154 Design-A gap.
+/// The fix (`certify_with_basin_warmup`, encode.rs) restores the bounded Newton
+/// "basin warm-up" a prior hardening had removed: from an uncertified-but-PD start,
+/// take up to `SAE_ENCODE_BASIN_WARMUP_STEPS` plain Newton steps INTO the
+/// Kantorovich basin, re-certifying at each iterate. The certificate at the landing
+/// point is a full guarantee from there (`h ≤ ½` ⇒ Newton converges to the in-ball
+/// root), so this widens the certified reach to unit amplitude WITHOUT weakening
+/// the bound. The held-out `certified` count is now strictly positive (asserted
+/// below), closing the remaining #1154 Design-A gap.
 #[test]
 fn cotrained_encoder_recovers_planted_manifold_at_least_as_well_as_sequential() {
     let n = 32usize;
@@ -897,6 +894,19 @@ fn cotrained_encoder_recovers_planted_manifold_at_least_as_well_as_sequential() 
          co-trained max phase gap={cot_gap}, sequential={seq_gap} \
          (amortized-certified rows: co-trained={cot_certified}, \
          sequential={seq_certified})"
+    );
+    // #1154/#1026 basin-warmup fix: the amortized one-mat-vec encoder must now
+    // CERTIFY unit-amplitude held-out rows (previously it certified ZERO — the
+    // Kantorovich h = β·η·L exceeded ½ at amplitude 1.0 from the chart-center start,
+    // so every row fell back to the exact solve). The bounded plain-Newton basin
+    // warm-up navigates into the certified ball, so the distilled encoder is now
+    // usable at unit amplitude — a strictly positive certified count on this clean
+    // planted manifold.
+    assert!(
+        seq_certified > 0 && cot_certified > 0,
+        "the amortized encoder must certify at least one unit-amplitude held-out row \
+         on this clean planted circle (basin warm-up closed the #1154 certifies-zero \
+         gap); got sequential={seq_certified}, co-trained={cot_certified} of {n_holdout}"
     );
 }
 
