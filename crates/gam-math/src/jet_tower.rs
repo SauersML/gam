@@ -762,6 +762,14 @@ pub fn ln_gamma_derivative_stack(x: f64) -> [f64; 5] {
     ]
 }
 
+pub fn ln_gamma_derivative_stack_order2(x: f64) -> [f64; 3] {
+    [
+        statrs::function::gamma::ln_gamma(x),
+        digamma_positive(x),
+        polygamma_positive(1, x),
+    ]
+}
+
 pub fn digamma_derivative_stack(x: f64) -> [f64; 5] {
     [
         digamma_positive(x),

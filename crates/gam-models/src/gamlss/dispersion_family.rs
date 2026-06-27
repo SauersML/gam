@@ -11,18 +11,18 @@ use super::{
     LocationScaleFamilyBuilder, build_location_scale_block, fit_location_scale_terms,
     identity_penalty, solve_penalizedweighted_projection,
 };
+use crate::block_layout::block_count::validate_block_count;
 use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
     FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
 };
-use crate::block_layout::block_count::validate_block_count;
 use crate::gamlss::GamlssError;
-use gam_linalg::matrix::LinearOperator;
 use crate::model_types::UnifiedFitResult;
+use gam_linalg::matrix::LinearOperator;
+use gam_math::jet_scalar::JetScalar;
 use gam_terms::smooth::{
     SpatialLengthScaleOptimizationOptions, TermCollectionDesign, TermCollectionSpec,
 };
-use gam_math::jet_scalar::JetScalar;
 use ndarray::{Array1, Array2, s};
 use statrs::function::gamma::ln_gamma;
 
@@ -172,9 +172,9 @@ pub(super) struct DispersionRowKernel {
     pub(super) disp_response: f64,
 }
 
-/// NB2 row NLL written ONCE over a generic [`JetScalar<2>`] (#932), seeded on
-/// the natural parameters `(μ, θ)`. Instantiated at `Order2<2>` for the
-/// production `(v, g, H)` hot path and at `Tower4<2>` for the test oracle.
+/// Test-oracle NB2 row NLL over a generic [`JetScalar<2>`], seeded on the
+/// natural parameters `(μ, θ)`.
+#[cfg(test)]
 #[inline]
 fn dispersion_nb_nll_generic<S: gam_math::jet_scalar::JetScalar<2>>(
     yi: f64,
@@ -208,11 +208,25 @@ pub(crate) fn dispersion_nb_nll_order2(
     theta_value: f64,
     wi: f64,
 ) -> gam_math::jet_scalar::Order2<2> {
-    dispersion_nb_nll_generic::<gam_math::jet_scalar::Order2<2>>(yi, mu_value, theta_value, wi)
+    type O2 = gam_math::jet_scalar::Order2<2>;
+
+    let mu = O2::variable(mu_value, 0);
+    let theta = O2::variable(theta_value, 1);
+    let tpm = theta.add(&mu);
+    let theta_plus_y = theta.add(&O2::constant(yi));
+    let loglik = order2_ln_gamma(&theta_plus_y)
+        .sub(&order2_ln_gamma(&theta))
+        .sub(&O2::constant(ln_gamma(yi + 1.0)))
+        .add(&theta.mul(&theta.ln()))
+        .sub(&theta.mul(&tpm.ln()))
+        .add(&mu.ln().scale(yi))
+        .sub(&tpm.ln().scale(yi));
+    loglik.scale(-wi)
 }
 
-/// Gamma row NLL written ONCE over a generic [`JetScalar<2>`] (#932), seeded on
+/// Test-oracle Gamma row NLL over a generic [`JetScalar<2>`], seeded on
 /// `(μ, ν)`.
+#[cfg(test)]
 #[inline]
 fn dispersion_gamma_nll_generic<S: gam_math::jet_scalar::JetScalar<2>>(
     yi: f64,
@@ -242,13 +256,22 @@ pub(crate) fn dispersion_gamma_nll_order2(
     nu_value: f64,
     wi: f64,
 ) -> gam_math::jet_scalar::Order2<2> {
-    dispersion_gamma_nll_generic::<gam_math::jet_scalar::Order2<2>>(
-        yi, y_pos, mu_value, nu_value, wi,
-    )
+    type O2 = gam_math::jet_scalar::Order2<2>;
+
+    let mu = O2::variable(mu_value, 0);
+    let nu = O2::variable(nu_value, 1);
+    let loglik = nu
+        .mul(&nu.ln())
+        .sub(&nu.mul(&mu.ln()))
+        .sub(&order2_ln_gamma(&nu))
+        .add(&nu.sub(&O2::constant(1.0)).scale(y_pos.ln()))
+        .sub(&nu.mul(&mu.recip().scale(yi)));
+    loglik.scale(-wi)
 }
 
-/// Beta row NLL written ONCE over a generic [`JetScalar<2>`] (#932), seeded on
+/// Test-oracle Beta row NLL over a generic [`JetScalar<2>`], seeded on
 /// `(μ, φ)`.
+#[cfg(test)]
 #[inline]
 fn dispersion_beta_nll_generic<S: gam_math::jet_scalar::JetScalar<2>>(
     yi: f64,
@@ -282,7 +305,29 @@ pub(crate) fn dispersion_beta_nll_order2(
     phi_value: f64,
     wi: f64,
 ) -> gam_math::jet_scalar::Order2<2> {
-    dispersion_beta_nll_generic::<gam_math::jet_scalar::Order2<2>>(yi, mu_value, phi_value, wi)
+    type O2 = gam_math::jet_scalar::Order2<2>;
+
+    let mu = O2::variable(mu_value, 0);
+    let phi = O2::variable(phi_value, 1);
+    let one_minus_mu = O2::constant(1.0).sub(&mu);
+    let yc = yi.clamp(1e-12, 1.0 - 1e-12);
+    let a = mu.mul(&phi);
+    let b = one_minus_mu.mul(&phi);
+    let loglik = order2_ln_gamma(&phi)
+        .sub(&order2_ln_gamma(&a))
+        .sub(&order2_ln_gamma(&b))
+        .add(&a.sub(&O2::constant(1.0)).scale(yc.ln()))
+        .add(&b.sub(&O2::constant(1.0)).scale((1.0 - yc).ln()));
+    loglik.scale(-wi)
+}
+
+#[inline]
+fn order2_ln_gamma<const K: usize>(
+    x: &gam_math::jet_scalar::Order2<K>,
+) -> gam_math::jet_scalar::Order2<K> {
+    gam_math::jet_scalar::Order2(
+        x.0.compose_unary(gam_math::jet_tower::ln_gamma_derivative_stack_order2(x.0.v)),
+    )
 }
 
 /// Tweedie compound Poisson–Gamma row NLL written ONCE over `Tower4<2>`, seeded
@@ -1175,8 +1220,7 @@ mod tests {
 
     /// #932 oracle: the production `Order2<2>` evaluation of each dispersion
     /// row NLL must reproduce, channel-for-channel (value/grad/Hessian), the
-    /// dense `Tower4<2>` evaluation of the SAME single-source generic body the
-    /// packed-scalar cutover replaced.
+    /// dense `Tower4<2>` evaluation of the same row expression.
     #[test]
     pub(crate) fn order2_matches_dense_tower_all_channels() {
         use gam_math::jet_scalar::{JetScalar, Order2};
@@ -1213,7 +1257,7 @@ mod tests {
         for &(yi, mu, theta) in &[(0.0, 1.2, 3.0), (4.0, 2.5, 0.7), (10.0, 0.6, 5.0)] {
             check_o2_vs_tower4(
                 "nb",
-                dispersion_nb_nll_generic::<Order2<2>>(yi, mu, theta, wi),
+                dispersion_nb_nll_order2(yi, mu, theta, wi),
                 dispersion_nb_nll_generic::<Tower4<2>>(yi, mu, theta, wi),
             );
         }
@@ -1226,7 +1270,7 @@ mod tests {
             let y_pos = yi.max(1e-300);
             check_o2_vs_tower4(
                 "gamma",
-                dispersion_gamma_nll_generic::<Order2<2>>(yi, y_pos, mu, nu, wi),
+                dispersion_gamma_nll_order2(yi, y_pos, mu, nu, wi),
                 dispersion_gamma_nll_generic::<Tower4<2>>(yi, y_pos, mu, nu, wi),
             );
         }
@@ -1234,7 +1278,7 @@ mod tests {
         for &(yi, mu, phi) in &[(0.3, 0.4, 5.0), (0.9, 0.6, 12.0), (0.01, 0.2, 3.0)] {
             check_o2_vs_tower4(
                 "beta",
-                dispersion_beta_nll_generic::<Order2<2>>(yi, mu, phi, wi),
+                dispersion_beta_nll_order2(yi, mu, phi, wi),
                 dispersion_beta_nll_generic::<Tower4<2>>(yi, mu, phi, wi),
             );
         }
