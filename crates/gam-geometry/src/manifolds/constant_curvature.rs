@@ -195,6 +195,111 @@ pub fn t_stacks(w: f64) -> [f64; 5] {
     }
 }
 
+/// Order-≤2 slice `[T, T′, T″]` of [`t_stacks`] — the *exact* prefix the
+/// second-order κ-jets consume.
+///
+/// The κ-jets ride [`Tower2`], whose `compose_unary` reads only `d[0..=2]`; the
+/// `T‴`/`T⁗` slots the full [`t_stacks`] builds are pure waste on that path (in
+/// the series branch each is its own 48-term sum). Each slot `j` is an
+/// independent series, and the closed-form recurrence advances one slot at a
+/// time, so the first three entries are produced by the *identical* arithmetic
+/// as [`t_stacks`] — a strict, bit-for-bit prune of the discarded high orders.
+pub(crate) fn t_stacks3(w: f64) -> [f64; 3] {
+    if w.abs() <= T_SERIES_W_MAX {
+        let mut t = [0.0; 3];
+        for (j, slot) in t.iter_mut().enumerate() {
+            // a_m = (−1)^m m!/(m−j)! w^{m−j} / (2m+1).
+            let mut term = 1.0;
+            for f in 1..=j {
+                let fj = f as f64;
+                term *= -fj * (2.0 * fj - 1.0) / (2.0 * fj + 1.0);
+            }
+            let mut acc = term;
+            for m in j..(j + T_SERIES_TERMS) {
+                let mf = m as f64;
+                let jf = j as f64;
+                term *= -w * (mf + 1.0) * (2.0 * mf + 1.0) / ((mf + 1.0 - jf) * (2.0 * mf + 3.0));
+                acc += term;
+            }
+            *slot = acc;
+        }
+        t
+    } else {
+        let t0 = if w > 0.0 {
+            let r = w.sqrt();
+            r.atan() / r
+        } else {
+            let r = (-w).sqrt();
+            r.atanh() / r
+        };
+        let mut t = [t0, 0.0, 0.0];
+        let mut r_j = 1.0 / (1.0 + w);
+        for j in 0..2 {
+            t[j + 1] = (r_j - (2.0 * j as f64 + 1.0) * t[j]) / (2.0 * w);
+            r_j *= -((j + 1) as f64) / (1.0 + w);
+        }
+        t
+    }
+}
+
+/// Order-≤2 slices `([C,C′,C″], [S,S′,S″])` of [`cs_stacks`] — the *exact*
+/// prefix the second-order κ-jets consume.
+///
+/// As with [`t_stacks3`], the [`Tower2`] `compose_unary` reads only `d[0..=2]`,
+/// so the `C‴/C⁗`, `S‴/S⁗` slots [`cs_stacks`] builds (each a fresh 18-term
+/// series in the small-`u` branch) are never read on the jet path. Both `C` and
+/// `S` value-channels are still computed (so the closed-form `___sincos`
+/// pairing — and hence the value channel — is bit-for-bit identical), and the
+/// per-slot series / one-step recurrence make the first three orders identical
+/// to [`cs_stacks`]; only the two discarded high orders are dropped.
+pub(crate) fn cs_stacks3(u: f64) -> ([f64; 3], [f64; 3]) {
+    if u.abs() <= CS_SERIES_U_MAX {
+        let mut c = [0.0; 3];
+        let mut s = [0.0; 3];
+        for j in 0..3 {
+            let mut term_c = 1.0;
+            let mut term_s = 1.0;
+            for f in 1..=j {
+                let fj = f as f64;
+                term_c *= -fj / ((2.0 * fj - 1.0) * (2.0 * fj));
+                term_s *= -fj / ((2.0 * fj) * (2.0 * fj + 1.0));
+            }
+            let mut acc_c = term_c;
+            let mut acc_s = term_s;
+            for m in j..(j + CS_SERIES_TERMS) {
+                let mf = m as f64;
+                let jf = j as f64;
+                let ratio_c =
+                    -u * (mf + 1.0) / ((mf + 1.0 - jf) * (2.0 * mf + 1.0) * (2.0 * mf + 2.0));
+                let ratio_s =
+                    -u * (mf + 1.0) / ((mf + 1.0 - jf) * (2.0 * mf + 2.0) * (2.0 * mf + 3.0));
+                term_c *= ratio_c;
+                term_s *= ratio_s;
+                acc_c += term_c;
+                acc_s += term_s;
+            }
+            c[j] = acc_c;
+            s[j] = acc_s;
+        }
+        (c, s)
+    } else {
+        let (c0, s0) = if u > 0.0 {
+            let r = u.sqrt();
+            (r.cos(), r.sin() / r)
+        } else {
+            let r = (-u).sqrt();
+            (r.cosh(), r.sinh() / r)
+        };
+        let mut c = [c0, 0.0, 0.0];
+        let mut s = [s0, 0.0, 0.0];
+        for j in 0..2 {
+            s[j + 1] = (c[j] - (2.0 * j as f64 + 1.0) * s[j]) / (2.0 * u);
+            c[j + 1] = -s[j] / 2.0;
+        }
+        (c, s)
+    }
+}
+
 /// The unified constant-curvature manifold `M_κ` in the κ-stereographic
 /// chart. See the module documentation for the model and conventions.
 #[derive(Clone, Debug)]
@@ -616,11 +721,6 @@ impl RiemannianManifold for ConstantCurvature {
 type KJet = Tower2<1>;
 
 #[inline]
-fn stack2(stack: [f64; 5]) -> [f64; 3] {
-    [stack[0], stack[1], stack[2]]
-}
-
-#[inline]
 fn kjet_recip(z: KJet) -> KJet {
     let r = 1.0 / z.v;
     z.compose_unary([r, -r * r, 2.0 * r * r * r])
@@ -672,7 +772,7 @@ pub fn distance_kappa_jet(
         return Ok((0.0, 0.0, 0.0));
     }
     let arg = kappa * nw2;
-    let t = arg.compose_unary(stack2(t_stacks(arg.v)));
+    let t = arg.compose_unary(t_stacks3(arg.v));
     let d = nw2.sqrt() * t * 2.0;
     Ok((d.v, d.g[0], d.h[0][0]))
 }
@@ -696,7 +796,7 @@ pub fn log_map_kappa_jet(
         nw2 = nw2 + *wi * *wi;
     }
     let arg = kappa * nw2;
-    let t = arg.compose_unary(stack2(t_stacks(arg.v)));
+    let t = arg.compose_unary(t_stacks3(arg.v));
     let gauge = kappa * p_from.dot(&p_from) + 1.0;
     let coeff = gauge * t;
     let d = p_from.len();
@@ -742,14 +842,14 @@ pub fn exp_map_kappa_jet(
     let t = kjet_recip(gauge) * n;
     // tn_κ(t) = t·S(κt²)/C(κt²), the primitives composed at the tower arg κt².
     let arg = kappa * (t * t);
-    let (cstk, sstk) = cs_stacks(arg.v);
-    let c = arg.compose_unary(stack2(cstk));
+    let (cstk, sstk) = cs_stacks3(arg.v);
+    let c = arg.compose_unary(cstk);
     if c.v.abs() <= GEOMETRY_EPS {
         return Err(GeometryError::Singular(
             "constant-curvature exp-jet at a conjugate point (cos(√κ t) = 0)",
         ));
     }
-    let s = arg.compose_unary(stack2(sstk));
+    let s = arg.compose_unary(sstk);
     let tn = t * s * kjet_recip(c);
     // step = (tn / ‖v‖) · v   (tower vector; v is a chart constant).
     let scale = tn * (1.0 / n);

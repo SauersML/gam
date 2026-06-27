@@ -162,11 +162,14 @@ pub mod terms {
 /// Shared test-support helpers (FD harness, fixtures, reference-tool + CLI
 /// harnesses) carved into the `gam-test-support` crate under #1521 so the
 /// workspace's other crates can reach them cross-crate. Re-exported here as
-/// `gam::test_support` (and the two `#[macro_export]` macros below) so the
-/// integration tests under `tests/` keep their `gam::test_support::*` /
-/// `gam::gam_binary!` / `gam::assert_central_difference_array!` paths unchanged.
+/// `gam::test_support` (and the `gam_binary!` macro below) so the integration
+/// tests under `tests/` keep their `gam::test_support::*` / `gam::gam_binary!`
+/// paths unchanged. The `assert_central_difference_array!` derivative-check
+/// macro is used only by the in-crate `#[cfg(test)]` unit tests, which call it
+/// through its defining-crate path `gam_test_support::assert_central_difference_array!`,
+/// so it is intentionally NOT re-exported onto the non-test public surface.
 pub use gam_test_support as test_support;
-pub use gam_test_support::{assert_central_difference_array, gam_binary};
+pub use gam_test_support::gam_binary;
 pub mod types;
 pub mod util;
 

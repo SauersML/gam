@@ -10,6 +10,5 @@ mod gradient_decompose_test;
 mod gradient_isolation;
 mod ground_truth_gradient;
 mod lbfgs_secant_pair_curvature_positive;
-mod no_production_finite_differences;
 mod objective_gradient_consistency_universal;
 mod zero_gradient_proposes_zero_step;

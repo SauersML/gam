@@ -1,3 +1,17 @@
+//! #1440 production finite-difference ban scanner, registered as a first-class
+//! top-level integration binary (`tests/no_production_finite_differences.rs`) so
+//! the `for test_file in tests/*.rs` CI loop in `.github/workflows/test.yml`
+//! discovers and runs it. It previously lived as a buried submodule of the
+//! `autodiff` harness (`tests/autodiff/misc/...`), which cargo compiles as the
+//! `autodiff` target — a name the `tests/*.rs` glob never matched — so the ban
+//! never actually ran in CI.
+//!
+//! It also scans the WHOLE workspace: the root crate's `src` plus every
+//! `crates/*/src`. The #1521 monolith carve-out moved nearly all production code
+//! down into workspace crates, so scanning only `root/src` (as the buried copy
+//! did) left the real production tree — including the actual FFI/solver/terms
+//! code — completely uncovered.
+
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -34,16 +48,11 @@ const BANNED_PRODUCTION_MARKERS: &[&str] = &[
 /// review, with the reason it is irreducible.
 ///
 /// Paths are matched as suffixes of the file path (forward-slash normalised), so
-/// `terms/sae/manifold/outer_objective.rs` matches regardless of the absolute
-/// prefix. Each entry MUST carry a justification comment.
-///
-/// INVARIANT (#1440): a file may use `fd-ok`/`FD-OK` audit markers ONLY if it is
-/// listed here. The scanner strips those markers' regions before searching for
-/// banned FD markers, so an UN-listed file that sprinkles `fd-ok` to hide a fresh
-/// finite difference is itself a violation
-/// (`fd_ok_markers_are_confined_to_the_allowlist`). This makes the allowlist the
-/// genuine single source of truth: every sanctioned FD in the tree is enumerated
-/// and justified HERE, in review, not silently exempted line-by-line elsewhere.
+/// `crates/gam-solve/src/rho_optimizer/fd_audit.rs` matches regardless of the
+/// absolute prefix. Each entry MUST carry a justification comment and MUST be a
+/// full workspace-crate path (the #1521 carve-out relocated every entry out of
+/// the old `root/src/...` monolith and down into a `crates/<crate>/src/...`
+/// tree).
 const SANCTIONED_FD_FILES: &[&str] = &[
     // ── FD-audit oracle + certificate machinery (NEVER on the fit-math path) ──
     // The outer-gradient FD audit is a sanctioned DIAGNOSTIC: it differences the
@@ -52,16 +61,16 @@ const SANCTIONED_FD_FILES: &[&str] = &[
     // certificate it produces is stored, copied, and reported through these files
     // (the `fd_directional` / `fd_error` / `fd_step` fields), all gated behind
     // `outer_fd_audit_eligible` and bounded by an explicit Richardson error bar.
-    "solver/rho_optimizer/fd_audit.rs",
-    "solver/rho_optimizer.rs", // module decl + re-export of the audit oracle
-    "solver/rho_optimizer/run.rs", // builds the FD-audit certificate from the oracle
-    "terms/smooth/spatial_optimization.rs", // FD-audit eligibility gate (diagnostic only)
-    "families/custom_family/fit.rs", // FD-audit eligibility gate (diagnostic only)
-    "model_types/result_types.rs", // stores the audit certificate fields
-    "inference/certificate_impls.rs", // serialises the audit certificate
-    "report/mod.rs",           // reports the audit certificate
-    "main/run_sample_generate_report.rs", // copies certificate fields into the report
-    "terms/sae/certificates.rs", // SAE analogue of the audit certificate
+    "crates/gam-solve/src/rho_optimizer/fd_audit.rs",
+    "crates/gam-solve/src/rho_optimizer.rs", // module decl + re-export of the audit oracle
+    "crates/gam-solve/src/rho_optimizer/run.rs", // builds the FD-audit certificate from the oracle
+    "crates/gam-models/src/fit_orchestration/drivers/spatial_optimization.rs", // FD-audit eligibility gate (diagnostic only)
+    "crates/gam-custom-family/src/fit.rs", // FD-audit eligibility gate (diagnostic only)
+    "crates/gam-solve/src/model_types/result_types.rs", // stores the audit certificate fields
+    "crates/gam-solve/src/inference/certificate_impls.rs", // serialises the audit certificate
+    "crates/gam-report/src/lib.rs",        // reports the audit certificate
+    "crates/gam-cli/src/main/run_sample_generate_report.rs", // copies certificate fields into the report
+    "crates/gam-sae/src/certificates.rs", // SAE analogue of the audit certificate
     // ── Tracked REDUCIBLE production FD (NOT theoretically irreducible) ──
     // These two were re-challenged under #1440. Neither is theoretically
     // irreducible; both are listed only so the lint stays green while the analytic
@@ -81,7 +90,7 @@ const SANCTIONED_FD_FILES: &[&str] = &[
     //     correct #1440 disposition is to DELETE the dead block (and its unused
     //     flag plumbing) — not to sanction it as irreducible. Tracked here pending
     //     that removal (solver-owner decision on whether to keep the flag).
-    "solver/pirls/reweight.rs",
+    "crates/gam-solve/src/pirls/reweight.rs",
     // (2) SAE sphere-boost Gauss-Newton chart Jacobian. The residual is
     //     `r(θ) = svec(ÃᵀÃ − s·Ĝ)`; its θ-Jacobian is the closed-form chain rule
     //     `∂(ÃᵀÃ)/∂θ_k = (∂Ã/∂θ_k)ᵀÃ + Ãᵀ(∂Ã/∂θ_k)`, and `∂Ã/∂θ` is the known
@@ -91,18 +100,53 @@ const SANCTIONED_FD_FILES: &[&str] = &[
     //     from `sphere_minimize_boost_defect`). Owned by the SAE agent — flagged
     //     for analytic substitution + an oracle; tracked here meanwhile so it
     //     cannot hide off-allowlist.
-    "terms/sae/chart_canonicalization.rs",
+    "crates/gam-sae/src/chart_canonicalization.rs",
     // SAE manifold outer-ρ files carry NO finite difference (the #1273 fallback was
     // removed; the descent direction is the plain analytic `DeflatedArrowSolver`
     // gradient) and so are NOT listed — they need no exemption.
     //
     // (#1440) The survival marginal-slope pilot W-metric chain factors in
-    // `families/survival/marginal_slope/row_math.rs` were a central difference of
-    // `rigid_observed_eta`; they are now the EXACT closed-form chain
+    // `crates/gam-models/src/survival/marginal_slope/row_math.rs` were a central
+    // difference of `rigid_observed_eta`; they are now the EXACT closed-form chain
     // `∂η₁/∂q = c(g)`, `∂η₁/∂g = q·c'(g) + probit_scale·z` from `c_derivatives` +
     // `rigid_observed_logslope`, so that file carries no FD and is NO LONGER
     // listed (the tracked reducible-FD debt is cleared).
 ];
+
+/// The root crate `src` plus every `crates/*/src`, in stable sorted order. This
+/// is the whole production tree the #1521 carve-out spread across the workspace;
+/// scanning only `root/src` (as the buried autodiff-harness copy did) left the
+/// real FFI/solver/terms code uncovered, so the ban silently passed.
+fn workspace_production_src_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let root_src = root.join("src");
+    if root_src.is_dir() {
+        dirs.push(root_src);
+    }
+    if let Ok(entries) = fs::read_dir(root.join("crates")) {
+        let mut crate_dirs: Vec<PathBuf> = entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.is_dir())
+            .collect();
+        crate_dirs.sort();
+        for crate_dir in crate_dirs {
+            let src = crate_dir.join("src");
+            if src.is_dir() {
+                dirs.push(src);
+            }
+        }
+    }
+    dirs
+}
+
+/// Collect every `.rs` file across the whole workspace production tree.
+fn collect_workspace_production_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for dir in workspace_production_src_dirs(root) {
+        collect_rust_files(&dir, &mut files);
+    }
+    files
+}
 
 /// True when `path` is on the [`SANCTIONED_FD_FILES`] allowlist and may
 /// therefore use `fd-ok` audit markers.
@@ -150,11 +194,22 @@ fn is_test_only_source_file(path: &Path) -> bool {
     }
 
     path.components().any(|component| {
-        matches!(
-            component,
-            Component::Normal(name)
-                if matches!(name.to_str(), Some("tests" | "test_support" | "testing"))
-        )
+        let Component::Normal(name) = component else {
+            return false;
+        };
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        // Exact-name test directories (`…/tests/…`, `…/testing/…`) AND whole
+        // test-support CRATES. The #1521 carve-out moved the FD test harness into
+        // its own `gam-test-support` crate; scanning `crates/*/src` now reaches it,
+        // so a crate directory whose name marks it as test-support infrastructure
+        // (`gam-test-support`) is test-only in its entirety — FD IS sanctioned in
+        // test harnesses. Match the `test-support` / `test_support` substring so the
+        // crate-dir component (`gam-test-support`) is covered without listing it.
+        matches!(name, "tests" | "test_support" | "testing")
+            || name.contains("test-support")
+            || name.contains("test_support")
     })
 }
 
@@ -510,19 +565,19 @@ fn production_visible_fd_grad() {}
 #[test]
 fn test_only_source_file_classification_covers_out_of_line_test_modules() {
     for path in [
-        "src/families/gamlss/tests.rs",
-        "src/solver/estimate/continuous_order_tests.rs",
-        "src/families/custom_family/test_support.rs",
-        "src/test_support/fd_checker.rs",
-        "src/testing/mod.rs",
-        "src/foo/tests/bar.rs",
-        "src/foo/._bar.rs",
+        "crates/gam-models/src/families/gamlss/tests.rs",
+        "crates/gam-solve/src/estimate/continuous_order_tests.rs",
+        "crates/gam-custom-family/src/test_support.rs",
+        "crates/gam-test-support/src/fd_checker.rs",
+        "crates/gam-test-support/src/testing/mod.rs",
+        "crates/gam-terms/src/foo/tests/bar.rs",
+        "crates/gam-terms/src/foo/._bar.rs",
     ] {
         assert!(is_test_only_source_file(Path::new(path)), "{path}");
     }
 
     assert!(!is_test_only_source_file(Path::new(
-        "src/inference/quadrature.rs"
+        "crates/gam-inference/src/quadrature.rs"
     )));
 }
 
@@ -569,50 +624,52 @@ fn sanctioned_fd_allowlist_membership_is_correct() {
     // was removed; the descent direction is the plain analytic gradient), so they
     // are NOT allowlisted.
     assert!(!fd_ok_markers_allowed(Path::new(
-        "/Users/anyone/gam/src/terms/sae/manifold/outer_objective.rs"
+        "/Users/anyone/gam/crates/gam-sae/src/manifold/outer_objective.rs"
     )));
     assert!(!fd_ok_markers_allowed(Path::new(
-        "src/terms/sae/manifold/construction.rs"
+        "crates/gam-sae/src/manifold/construction.rs"
     )));
     // The FD-audit oracle and its certificate-plumbing files ARE allowlisted: the
     // audit differences the objective only to CHECK the analytic gradient and is
     // never on the fit-math path (#1440 sanctioned diagnostic).
     assert!(fd_ok_markers_allowed(Path::new(
-        "src/solver/rho_optimizer/fd_audit.rs"
+        "crates/gam-solve/src/rho_optimizer/fd_audit.rs"
     )));
     assert!(fd_ok_markers_allowed(Path::new(
-        "/Users/anyone/gam/src/solver/rho_optimizer/run.rs"
+        "/Users/anyone/gam/crates/gam-solve/src/rho_optimizer/run.rs"
     )));
     // The two genuinely-irreducible production FDs (geodesic-acceleration curvature
     // probe; SAE sphere-boost GN chart Jacobian) ARE allowlisted, so they are
     // tracked here rather than hidden behind off-allowlist per-line markers.
     assert!(fd_ok_markers_allowed(Path::new(
-        "src/solver/pirls/reweight.rs"
+        "crates/gam-solve/src/pirls/reweight.rs"
     )));
     assert!(fd_ok_markers_allowed(Path::new(
-        "src/terms/sae/chart_canonicalization.rs"
+        "crates/gam-sae/src/chart_canonicalization.rs"
     )));
     // (#1440) The survival pilot W-metric chain is now the closed-form
     // `c_derivatives` chain, so `row_math.rs` carries no FD and is NOT allowlisted.
     assert!(!fd_ok_markers_allowed(Path::new(
-        "src/families/survival/marginal_slope/row_math.rs"
+        "crates/gam-models/src/survival/marginal_slope/row_math.rs"
     )));
     // Files NOT carrying a documented sanction are not on the allowlist.
     assert!(!fd_ok_markers_allowed(Path::new(
-        "src/solver/reml/gradient_hessian.rs"
+        "crates/gam-solve/src/reml/gradient_hessian.rs"
     )));
     assert!(!fd_ok_markers_allowed(Path::new(
-        "src/inference/quadrature.rs"
+        "crates/gam-inference/src/quadrature.rs"
     )));
 }
 
 #[test]
 fn sanctioned_fd_allowlist_files_exist() {
     // Every allowlisted path must point at a real source file, so the allowlist
-    // cannot silently rot into a stale, over-broad exemption (#1440).
+    // cannot silently rot into a stale, over-broad exemption (#1440). Entries are
+    // full workspace-crate paths, resolved against the workspace root (the root
+    // crate's `CARGO_MANIFEST_DIR`).
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     for allowed in SANCTIONED_FD_FILES {
-        let candidate = root.join("src").join(allowed);
+        let candidate = root.join(allowed);
         assert!(
             candidate.exists(),
             "sanctioned FD allowlist entry does not exist: {}",
@@ -631,8 +688,7 @@ fn fd_ok_markers_are_confined_to_the_allowlist() {
     // reviewed enumeration of every sanctioned FD in the tree: introducing FD in a
     // new file forces a reviewed allowlist entry (with a justification) here first.
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut files = Vec::new();
-    collect_rust_files(&root.join("src"), &mut files);
+    let files = collect_workspace_production_files(root);
     let mut offenders = Vec::new();
     for path in &files {
         if is_test_only_source_file(path) {
@@ -696,10 +752,9 @@ fn fd_ok_justification_detector_behaves() {
 fn every_fd_ok_marker_in_the_tree_carries_a_justification() {
     // #1440: an `fd-ok` exemption must always state WHY the finite difference is
     // irreducible, so a bare `// fd-ok` can never silently mask a new FD. Every
-    // marker line across the whole src tree is required to carry a reason.
+    // marker line across the whole workspace tree is required to carry a reason.
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut files = Vec::new();
-    collect_rust_files(&root.join("src"), &mut files);
+    let files = collect_workspace_production_files(root);
     let mut violations = Vec::new();
     for path in files {
         let source = fs::read_to_string(&path).expect("read source file");
@@ -729,8 +784,7 @@ fn every_fd_ok_marker_in_the_tree_carries_a_justification() {
 #[test]
 fn production_code_has_no_finite_difference_markers() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut files = Vec::new();
-    collect_rust_files(&root.join("src"), &mut files);
+    let files = collect_workspace_production_files(root);
     let mut violations = Vec::new();
     for path in files {
         if is_test_only_source_file(&path) {
