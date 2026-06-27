@@ -6664,5 +6664,5 @@ fn matrices_to_nested(matrices: &[Array2<f64>]) -> Vec<Vec<Vec<f64>>> {
 }
 
 #[cfg(test)]
-#[path = "../tests/src_modules/lib_tests.rs"]
+#[path = "../../tests/src_modules/lib_tests.rs"]
 mod tests;
