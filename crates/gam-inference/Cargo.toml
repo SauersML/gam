@@ -11,6 +11,7 @@ warnings = "deny"
 
 [dependencies]
 gam-data = { path = "../gam-data", version = "=0.3.126" }
+gam-runtime = { path = "../gam-runtime", version = "=0.3.126" }
 gam-math = { path = "../gam-math", version = "=0.3.126" }
 gam-linalg = { path = "../gam-linalg", version = "=0.3.126" }
 gam-problem = { path = "../gam-problem", version = "=0.3.126" }
