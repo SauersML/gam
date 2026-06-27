@@ -74,7 +74,11 @@ fn rho_uncertainty_diagnostic_does_not_change_outer_solution() {
         .with_hessian(DeclaredHessianForm::Either)
         .with_initial_rho(array![1.5])
         .with_seed_config(seed_config)
-        .with_problem_size(8, 3);
+        .with_problem_size(8, 3)
+        // The PSIS rho-uncertainty diagnostic is opt-in (default off, #1575).
+        // This test proves the diagnostic, WHEN RUN, does not perturb the
+        // converged outer solution, so it must enable it explicitly.
+        .with_rho_uncertainty_diagnostic(true);
     let config = problem.config();
 
     let mut without_diagnostic = problem.build_objective(
