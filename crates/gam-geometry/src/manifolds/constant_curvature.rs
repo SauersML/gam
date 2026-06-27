@@ -219,7 +219,15 @@ pub(crate) fn t_stacks3(w: f64) -> [f64; 3] {
                 let mf = m as f64;
                 let jf = j as f64;
                 term *= -w * (mf + 1.0) * (2.0 * mf + 1.0) / ((mf + 1.0 - jf) * (2.0 * mf + 3.0));
-                acc += term;
+                // Bit-identical early stop: on |w| ≤ T_SERIES_W_MAX the term ratio
+                // has magnitude < 1, so |term| decreases monotonically; once a term
+                // is too small to move `acc`, every successor is too, so summing the
+                // remaining T_SERIES_TERMS terms reproduces `acc` exactly.
+                let next = acc + term;
+                if next == acc {
+                    break;
+                }
+                acc = next;
             }
             *slot = acc;
         }
@@ -266,17 +274,40 @@ pub(crate) fn cs_stacks3(u: f64) -> ([f64; 3], [f64; 3]) {
             }
             let mut acc_c = term_c;
             let mut acc_s = term_s;
+            // Independent bit-identical early stops for the two channels: each
+            // accumulator is touched only by its own term chain, whose magnitude
+            // decreases monotonically on |u| ≤ CS_SERIES_U_MAX, so dropping the
+            // no-op tail of either reproduces its full CS_SERIES_TERMS sum exactly.
+            let mut done_c = false;
+            let mut done_s = false;
             for m in j..(j + CS_SERIES_TERMS) {
+                if done_c && done_s {
+                    break;
+                }
                 let mf = m as f64;
                 let jf = j as f64;
-                let ratio_c =
-                    -u * (mf + 1.0) / ((mf + 1.0 - jf) * (2.0 * mf + 1.0) * (2.0 * mf + 2.0));
-                let ratio_s =
-                    -u * (mf + 1.0) / ((mf + 1.0 - jf) * (2.0 * mf + 2.0) * (2.0 * mf + 3.0));
-                term_c *= ratio_c;
-                term_s *= ratio_s;
-                acc_c += term_c;
-                acc_s += term_s;
+                if !done_c {
+                    let ratio_c =
+                        -u * (mf + 1.0) / ((mf + 1.0 - jf) * (2.0 * mf + 1.0) * (2.0 * mf + 2.0));
+                    term_c *= ratio_c;
+                    let next = acc_c + term_c;
+                    if next == acc_c {
+                        done_c = true;
+                    } else {
+                        acc_c = next;
+                    }
+                }
+                if !done_s {
+                    let ratio_s =
+                        -u * (mf + 1.0) / ((mf + 1.0 - jf) * (2.0 * mf + 2.0) * (2.0 * mf + 3.0));
+                    term_s *= ratio_s;
+                    let next = acc_s + term_s;
+                    if next == acc_s {
+                        done_s = true;
+                    } else {
+                        acc_s = next;
+                    }
+                }
             }
             c[j] = acc_c;
             s[j] = acc_s;
@@ -297,6 +328,77 @@ pub(crate) fn cs_stacks3(u: f64) -> ([f64; 3], [f64; 3]) {
             c[j + 1] = -s[j] / 2.0;
         }
         (c, s)
+    }
+}
+
+/// Value-only `T(w)` — bit-for-bit `t_stacks(w)[0]` (and `t_stacks3(w)[0]`),
+/// the *only* slot the geodesic-distance / log-map value paths consume.
+///
+/// `distance`, `log_map`, and the radial code read just `[0]`, yet the full
+/// [`t_stacks`] builds five independent 48-term series to do it. This computes
+/// the `j = 0` series alone — the identical arithmetic (`jf = 0`, so
+/// `mf + 1.0 - jf == mf + 1.0`) — and stops as soon as a term no longer moves
+/// the sum (monotone tail on `|w| ≤ T_SERIES_W_MAX`, so a strict no-op prune).
+pub(crate) fn t0(w: f64) -> f64 {
+    if w.abs() <= T_SERIES_W_MAX {
+        let mut term = 1.0;
+        let mut acc = 1.0;
+        for m in 0..T_SERIES_TERMS {
+            let mf = m as f64;
+            term *= -w * (mf + 1.0) * (2.0 * mf + 1.0) / ((mf + 1.0) * (2.0 * mf + 3.0));
+            let next = acc + term;
+            if next == acc {
+                break;
+            }
+            acc = next;
+        }
+        acc
+    } else if w > 0.0 {
+        let r = w.sqrt();
+        r.atan() / r
+    } else {
+        let r = (-w).sqrt();
+        r.atanh() / r
+    }
+}
+
+/// Value-only `(C(u), S(u))` — bit-for-bit `(cs_stacks(u).0[0], cs_stacks(u).1[0])`.
+///
+/// The exp map's generalized tangent `tn_κ = t·S/C` needs both values; the radial
+/// Jacobian needs only `S`; neither needs the four derivative slots [`cs_stacks`]
+/// builds. This evaluates just the two `j = 0` series with the identical
+/// arithmetic and the same no-op tail prune as [`t0`].
+pub(crate) fn cs_val(u: f64) -> (f64, f64) {
+    if u.abs() <= CS_SERIES_U_MAX {
+        let mut term_c = 1.0;
+        let mut acc_c = 1.0;
+        for m in 0..CS_SERIES_TERMS {
+            let mf = m as f64;
+            term_c *= -u * (mf + 1.0) / ((mf + 1.0) * (2.0 * mf + 1.0) * (2.0 * mf + 2.0));
+            let next = acc_c + term_c;
+            if next == acc_c {
+                break;
+            }
+            acc_c = next;
+        }
+        let mut term_s = 1.0;
+        let mut acc_s = 1.0;
+        for m in 0..CS_SERIES_TERMS {
+            let mf = m as f64;
+            term_s *= -u * (mf + 1.0) / ((mf + 1.0) * (2.0 * mf + 2.0) * (2.0 * mf + 3.0));
+            let next = acc_s + term_s;
+            if next == acc_s {
+                break;
+            }
+            acc_s = next;
+        }
+        (acc_c, acc_s)
+    } else if u > 0.0 {
+        let r = u.sqrt();
+        (r.cos(), r.sin() / r)
+    } else {
+        let r = (-u).sqrt();
+        (r.cosh(), r.sinh() / r)
     }
 }
 
@@ -386,7 +488,7 @@ impl ConstantCurvature {
         }
         let exponent = (self.dim - 1) as i32;
         let u = self.kappa * r * r;
-        let s = cs_stacks(u).1[0]; // S(u) = sn_κ(r)/r ≥ 0 inside the chart
+        let s = cs_val(u).1; // S(u) = sn_κ(r)/r ≥ 0 inside the chart
         // Clamp S (not the power) at the κ>0 conjugate shell so the volume
         // element collapses to 0⁺ there regardless of the parity of d−1.
         s.max(0.0).powi(exponent)
@@ -435,18 +537,18 @@ impl ConstantCurvature {
         let neg_x = x.mapv(|v| -v);
         let w = self.mobius_add(neg_x.view(), y)?;
         let nw2 = w.dot(&w);
-        Ok(2.0 * nw2.sqrt() * t_stacks(self.kappa * nw2)[0])
+        Ok(2.0 * nw2.sqrt() * t0(self.kappa * nw2))
     }
 
     /// `tn_κ(t) = sn(t)/cs(t) = t·S(κt²)/C(κt²)` — the generalized tangent.
     fn tn(&self, t: f64) -> GeometryResult<f64> {
-        let (c, s) = cs_stacks(self.kappa * t * t);
-        if c[0].abs() <= GEOMETRY_EPS {
+        let (c, s) = cs_val(self.kappa * t * t);
+        if c.abs() <= GEOMETRY_EPS {
             return Err(GeometryError::Singular(
                 "constant-curvature exp map at a conjugate point (cos(√κ t) = 0)",
             ));
         }
-        Ok(t * s[0] / c[0])
+        Ok(t * s / c)
     }
 
     /// Gyration `gyr[a, b]v = ⊖(a ⊕ b) ⊕ (a ⊕ (b ⊕ v))` — the holonomy
@@ -509,7 +611,7 @@ impl RiemannianManifold for ConstantCurvature {
         self.chart_gauge(p_to)?;
         let neg_x = p_from.mapv(|v| -v);
         let w = self.mobius_add(neg_x.view(), p_to)?;
-        let coeff = gauge * t_stacks(self.kappa * w.dot(&w))[0];
+        let coeff = gauge * t0(self.kappa * w.dot(&w));
         Ok(w.mapv(|z| z * coeff))
     }
 
