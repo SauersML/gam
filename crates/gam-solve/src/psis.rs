@@ -25,7 +25,7 @@ pub struct PsisResult {
     pub tail_count: usize,
 }
 
-pub(crate) const MIN_TAIL_COUNT: usize = 5;
+pub const MIN_TAIL_COUNT: usize = 5;
 const MAX_TAIL_FRACTION: f64 = 0.2;
 
 /// Pareto-smooth a non-negative weight vector and report the fitted GPD tail
