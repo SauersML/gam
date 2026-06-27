@@ -4,7 +4,7 @@
 
 use std::time::Instant;
 
-use gam::solver::grid_spline_2d::GridSpline2dDesign;
+use gam::terms::grid_spline_2d::GridSpline2dDesign;
 
 const N: usize = 10_000_000;
 const CHECKS_PER_AXIS: usize = 50;

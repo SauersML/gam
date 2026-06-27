@@ -28,7 +28,7 @@
 //! no worse than mgcv's by more than 10%. We never assert the two fitted
 //! surfaces are close to each other.
 
-use gam::solver::grid_spline_2d::fit_grid_spline_2d;
+use gam::terms::grid_spline_2d::fit_grid_spline_2d;
 use gam::test_support::reference::{Column, rmse, run_r};
 
 const G: usize = 45;

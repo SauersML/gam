@@ -16,7 +16,7 @@
 //!    (4a1² + 2a1a2 + 4a2²)·Area to 1e-8, which a dropped mixed term
 //!    (the axis-wise P-spline shortcut) would miss by exactly 2a1a2·Area.
 
-use gam::solver::grid_spline_2d::{GridSpline2dDesign, fit_grid_spline_2d_at};
+use gam::terms::grid_spline_2d::{GridSpline2dDesign, fit_grid_spline_2d_at};
 
 // ───────────────────────── in-test dense linear algebra ─────────────────────
 
