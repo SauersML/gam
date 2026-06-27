@@ -1,4 +1,5 @@
 mod gated_sae_decoder_heaviside_contract;
+mod sae_1026_tiny_toy_parity;
 mod sae_arrow_schur_large_scale;
 mod sae_audit_is_invoked;
 mod sae_curvature_estimand_sims;
