@@ -74,7 +74,9 @@ now() { date +%H:%M:%S; }; ep() { date +%s; }
 
 # Preflight: bail FAST instead of dying at link with ENOSPC (which also corrupts
 # the target dir and wastes ~90s). If disk is too low, point the caller at cluster.
-free_gb="$(df -g "$REPO" 2>/dev/null | awk 'NR==2{print $4}')"
+free_kib="$(df -Pk "$REPO" 2>/dev/null | awk 'NR==2{print $4}')"   # POSIX: $4 = available KiB
+free_gb=""
+[[ -n "$free_kib" ]] && free_gb=$(( free_kib / 1024 / 1024 ))      # KiB -> GiB
 if [[ -n "$free_gb" && "$free_gb" -lt "$MIN_FREE_GB" ]]; then
   echo "[build.sh] only ${free_gb}G free (< ${MIN_FREE_GB}G) — a local build would ENOSPC at link." >&2
   # Pluggable remote backend: set GAM_REMOTE_RUN=<runner> (kept out of the repo)
