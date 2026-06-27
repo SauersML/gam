@@ -773,7 +773,12 @@ impl ImplicitDesignPsiDerivative {
     /// Construct a streaming operator that recomputes (q, t, s_a) on the fly
     /// from raw data/centers/eta during each matvec. No O(n*k) arrays are stored.
     /// This is the large-scale path.
-    pub(crate) fn new_streaming(
+    ///
+    /// `pub` like the sibling `new_*` constructors: after the engine crate carve
+    /// (#1521) the REML planner tests live in `gam-solve` and build streaming
+    /// operators as fixtures, so this constructor is part of the cross-crate
+    /// surface, not a crate-private helper.
+    pub fn new_streaming(
         data: Arc<Array2<f64>>,
         centers: Arc<Array2<f64>>,
         eta: Vec<f64>,

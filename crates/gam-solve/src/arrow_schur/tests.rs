@@ -3375,33 +3375,26 @@ pub(crate) fn resident_sae_matvec_matches_generic() {
     }
 }
 
-/// #1033 large-n sharing invariant. The per-row support `a_phi` and local
-/// Jacobians `local_jac` are now held as `Arc<[…]>` so the assembler can hand
-/// BOTH the host matrix-free row operator (`SaeKroneckerRows`) and the solver's
-/// `DeviceSaePcgData` the SAME backing allocation instead of a second full
-/// `O(n·q·p)` clone. This test pins the no-second-copy contract two ways:
-///   1. `DeviceSaePcgData::a_phi_shared()` must return a refcount bump of the
-///      data's own `a_phi` (`Arc::ptr_eq`), not a fresh deep clone.
-///   2. A `SaeKroneckerRows` built from a shared `Arc` and a `DeviceSaePcgData`
-///      built from a CLONE of that same `Arc` reference the identical buffer.
-/// A regression that reverts either to a `Vec` deep-clone would double the
-/// always-resident per-row Jacobian footprint at the LLM shape (p≈5120) and
-/// fail `Arc::ptr_eq` here, even though every matvec stays numerically equal.
+/// #1033 large-n sharing invariant (solver side). The per-row support `a_phi`
+/// and local Jacobians `local_jac` are held as `Arc<[…]>` so the assembler can
+/// hand consumers the SAME backing allocation instead of a second full
+/// `O(n·q·p)` clone. The host-operator (`gam_sae::SaeKroneckerRows`) ↔ solver
+/// (`DeviceSaePcgData`) cross-crate sharing half of this contract lives in
+/// `gam-sae` (`device_and_kron_rows_share_backing_alloc_1033`) — only that crate
+/// can see both types, since `gam-solve` cannot depend on `gam-sae` (the edge
+/// runs the other way after the #1521 carve). This half pins the solver-internal
+/// half: `DeviceSaePcgData::a_phi_shared()` must hand back a refcount bump of the
+/// data's own `a_phi` (`Arc::ptr_eq`), not a fresh deep clone. A regression that
+/// reverts to a `Vec` deep-clone would double the always-resident per-row
+/// footprint at the LLM shape (p≈5120) and fail `Arc::ptr_eq` here.
 #[test]
-pub(crate) fn sae_kron_and_device_share_backing_alloc_1033() {
-    use gam_terms::sae::manifold::SaeKroneckerRows;
+pub(crate) fn device_a_phi_shared_is_refcount_bump_not_clone_1033() {
     let p = 6usize;
     let a_phi: std::sync::Arc<[Vec<(usize, f64)>]> = std::sync::Arc::from(
         vec![vec![(0usize, 2.0f64), (12, 1.0)], vec![(0, 0.5)]].into_boxed_slice(),
     );
     let jac: std::sync::Arc<[Vec<f64>]> =
         std::sync::Arc::from(vec![vec![1.0; 4 * p], vec![2.0; 4 * p]].into_boxed_slice());
-    // Assembler shares ONE allocation with both consumers (refcount bumps only).
-    let host = SaeKroneckerRows::new(
-        p,
-        std::sync::Arc::clone(&a_phi),
-        std::sync::Arc::clone(&jac),
-    );
     let device = DeviceSaePcgData {
         p,
         beta_dim: 6,
@@ -3411,27 +3404,15 @@ pub(crate) fn sae_kron_and_device_share_backing_alloc_1033() {
         sparse_g_blocks: Vec::new(),
         frame: None,
     };
-    // (1) a_phi_shared is O(1) — same backing buffer, not a deep clone.
+    // a_phi_shared is O(1) — same backing buffer, not a deep clone.
     let reshare = device.a_phi_shared();
     assert!(
         std::sync::Arc::ptr_eq(&reshare, &device.a_phi),
         "a_phi_shared must hand back the SAME allocation, not a re-clone"
     );
-    // (2) host operator and device data point at the identical Jacobian buffer.
     assert!(
-        std::sync::Arc::ptr_eq(&host.local_jac, &device.local_jac),
-        "host SaeKroneckerRows and DeviceSaePcgData must share one local_jac alloc"
-    );
-    assert!(
-        std::sync::Arc::ptr_eq(&host.a_phi, &device.a_phi),
-        "host SaeKroneckerRows and DeviceSaePcgData must share one a_phi alloc"
-    );
-    // strong_count = original + host + device (+ reshare for a_phi) — a deep
-    // clone would instead leave the counts at the lower no-share value.
-    assert_eq!(
-        std::sync::Arc::strong_count(&jac),
-        3,
-        "exactly three references (original, host, device) share the Jacobian"
+        std::sync::Arc::ptr_eq(&reshare, &a_phi),
+        "a_phi_shared must alias the assembler's original a_phi allocation"
     );
 }
 

@@ -159,3 +159,59 @@ impl SaeKroneckerRow for SaeKroneckerRows {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::SaeKroneckerRows;
+    use gam_solve::arrow_schur::DeviceSaePcgData;
+    use std::sync::Arc;
+
+    /// #1033 large-n sharing invariant (cross-crate half). The assembler hands
+    /// BOTH the host matrix-free row operator (`SaeKroneckerRows`, this crate)
+    /// and the solver's `DeviceSaePcgData` (`gam-solve`) the SAME `Arc<[…]>`
+    /// backing allocation for `a_phi`/`local_jac` rather than a second full
+    /// `O(n·q·p)` clone — the production path at `construction.rs`'s
+    /// `set_device_sae_pcg_data` does exactly this. This pins the no-second-copy
+    /// contract via `Arc::ptr_eq` across the crate boundary; the solver-internal
+    /// `a_phi_shared()` half is covered in `gam-solve`
+    /// (`device_a_phi_shared_is_refcount_bump_not_clone_1033`). A regression that
+    /// reverts either side to a `Vec` deep-clone would double the always-resident
+    /// per-row Jacobian footprint at the LLM shape (p≈5120) and fail here, even
+    /// though every matvec stays numerically equal.
+    #[test]
+    fn device_and_kron_rows_share_backing_alloc_1033() {
+        let p = 6usize;
+        let a_phi: Arc<[Vec<(usize, f64)>]> = Arc::from(
+            vec![vec![(0usize, 2.0f64), (12, 1.0)], vec![(0, 0.5)]].into_boxed_slice(),
+        );
+        let jac: Arc<[Vec<f64>]> =
+            Arc::from(vec![vec![1.0; 4 * p], vec![2.0; 4 * p]].into_boxed_slice());
+        // Both consumers built from refcount bumps of the same allocation.
+        let host = SaeKroneckerRows::new(p, Arc::clone(&a_phi), Arc::clone(&jac));
+        let device = DeviceSaePcgData {
+            p,
+            beta_dim: 6,
+            a_phi: Arc::clone(&a_phi),
+            local_jac: Arc::clone(&jac),
+            smooth_blocks: Vec::new(),
+            sparse_g_blocks: Vec::new(),
+            frame: None,
+        };
+        // Host operator and device data point at the identical backing buffers.
+        assert!(
+            Arc::ptr_eq(&host.local_jac, &device.local_jac),
+            "host SaeKroneckerRows and DeviceSaePcgData must share one local_jac alloc"
+        );
+        assert!(
+            Arc::ptr_eq(&host.a_phi, &device.a_phi),
+            "host SaeKroneckerRows and DeviceSaePcgData must share one a_phi alloc"
+        );
+        // strong_count = original + host + device — a deep clone would instead
+        // leave the count at the lower no-share value.
+        assert_eq!(
+            Arc::strong_count(&jac),
+            3,
+            "exactly three references (original, host, device) share the Jacobian"
+        );
+    }
+}
