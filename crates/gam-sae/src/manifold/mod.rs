@@ -89,6 +89,7 @@ pub(crate) use crate::certificates::{
 
 pub(crate) use gam_linalg::faer_ndarray::{
     FaerCholesky, FaerCholeskyFactor, FaerEigh, FaerSvd, fast_ab, fast_abt, fast_atb,
+    with_nested_parallel,
 };
 
 pub(crate) use gam_linalg::triangular::cholesky_solve_vector;

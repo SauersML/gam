@@ -3035,11 +3035,16 @@ impl SaeManifoldTerm {
                 .map_init(
                     || (vec![0.0_f64; p], vec![0.0_f64; p]),
                     |(g_buf, fitted_row), idxs| {
-                        let mut acc = 0.0_f64;
-                        for row in idxs {
-                            acc += row_data_fit(row, g_buf, fitted_row)?;
-                        }
-                        Ok(acc)
+                        // #1557 — pin any faer GEMM reached from this row-parallel
+                        // data-fit chunk to `Par::Seq` (no nested Rayon re-fan); the
+                        // per-row reductions are tiny, so the result is bit-identical.
+                        with_nested_parallel(|| {
+                            let mut acc = 0.0_f64;
+                            for row in idxs {
+                                acc += row_data_fit(row, g_buf, fitted_row)?;
+                            }
+                            Ok(acc)
+                        })
                     },
                 )
                 .collect();
@@ -4078,6 +4083,17 @@ impl SaeManifoldTerm {
                         assignments: Array1::<f64>::zeros(k_atoms),
                     },
                     |scratch, row| -> Result<SaeAssemblyRow, String> {
+                        // #1557 — mark this rayon row worker as a nested data-parallel
+                        // region so any faer GEMM reached transitively from the per-row
+                        // assembly (frame `Uᵀ` products, the per-row cross-block /
+                        // Schur-accumulation matmuls, the Riemannian projections) pins to
+                        // `Par::Seq` via `effective_global_parallelism` instead of
+                        // re-fanning the global Rayon pool against this outer fan-out
+                        // (the `spindle` barrier-spin). Serial vs parallel over these tiny
+                        // per-row blocks is a single small product, so the result is
+                        // bit-identical. The guard is held for the whole closure body
+                        // including its `?`/`return` paths.
+                        with_nested_parallel(|| {
                         let RowScratch {
                             decoded,
                             dg_buf,
@@ -4698,6 +4714,7 @@ impl SaeManifoldTerm {
                             kron_a_phi,
                             kron_jac,
                         })
+                        }) // #1557 with_nested_parallel
                     },
                 )
                 .collect::<Result<Vec<_>, String>>()?;

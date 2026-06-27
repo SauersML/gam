@@ -2216,6 +2216,63 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         Ok(None)
     }
 
+    fn joint_trust_metric_block_floor(
+        &self,
+        block_states: &[ParameterBlockState],
+        _specs: &[ParameterBlockSpec],
+    ) -> Result<Option<Array1<f64>>, String> {
+        // Scale-aware trust-metric floor for the coupled smooth-scale TIME block
+        // (issue #1569). See `TIME_BLOCK_TRUST_METRIC_FLOOR_REL`. The time block
+        // is BLOCK_TIME = 0, so its joint range is `[offsets[0], offsets[1])`.
+        let offsets = self.joint_block_offsets();
+        if offsets.len() < 2 {
+            return Ok(None);
+        }
+        let p_total = *offsets
+            .last()
+            .ok_or_else(|| "missing joint block offsets".to_string())?;
+        let (time_start, time_end) = (offsets[Self::BLOCK_TIME], offsets[Self::BLOCK_TIME + 1]);
+        if time_end <= time_start {
+            return Ok(None);
+        }
+        // The time-block metric is the diagonal of the time-time likelihood
+        // Hessian `Σ_channels Xᵀ W X` (the SAME quantity the driver whitens by).
+        // Rebuild it from the scale-stabilized quantities so a large `exp(−η_σ)`
+        // cannot overflow; the uniform `exp(−L)` rescale cancels in the RELATIVE
+        // floor (`fraction × max(diag)`), so the result is scale-invariant.
+        let log_scale = self.hessian_deriv_log_rescale(block_states);
+        let q = self.collect_joint_quantities_rescaled(block_states, log_scale)?;
+        let dynamic = self.build_dynamic_geometry(block_states)?;
+        let nll_time = q.time_channel_nll_curvatures();
+        let h_time = mxtwxd(&dynamic.time_jac_entry, &nll_time.h0, None)
+            + mxtwxd(&dynamic.time_jac_exit, &nll_time.h1, None)
+            + mxtwxd(&dynamic.time_jac_deriv, &nll_time.d, None);
+        if h_time.nrows() != time_end - time_start {
+            // Reduced/parametric time block whose width does not match the
+            // assembled time-time Hessian: leave the metric untouched.
+            return Ok(None);
+        }
+        // Maximum time-block curvature scale on the diagonal (carries the
+        // `exp(−2 η_σ)` envelope automatically). Non-finite or non-positive ⇒
+        // nothing to floor against.
+        let max_diag = (0..h_time.nrows())
+            .map(|j| h_time[[j, j]].abs())
+            .filter(|v| v.is_finite())
+            .fold(0.0_f64, f64::max);
+        if !(max_diag.is_finite() && max_diag > 0.0) {
+            return Ok(None);
+        }
+        let floor_value = TIME_BLOCK_TRUST_METRIC_FLOOR_REL * max_diag;
+        if !(floor_value.is_finite() && floor_value > 0.0) {
+            return Ok(None);
+        }
+        let mut floor = Array1::<f64>::zeros(p_total);
+        for j in time_start..time_end {
+            floor[j] = floor_value;
+        }
+        Ok(Some(floor))
+    }
+
     fn post_update_block_beta(
         &self,
         _: &[ParameterBlockState],
