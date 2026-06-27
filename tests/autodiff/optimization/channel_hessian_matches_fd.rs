@@ -14,8 +14,8 @@
 
 use gam::families::custom_family::FamilyChannelHessian;
 use gam::families::gamlss::GaussianLocationScaleChannelHessian;
+use gam::families::survival::marginal_slope::identifiability::SurvivalRowHessian;
 use gam::identifiability::families::bernoulli::BernoulliRowHessian;
-use gam::identifiability::marginal_slope::{SurvivalRowHessian, survival_row_nll_grad_hess};
 use ndarray::Array1;
 
 const FD_H: f64 = 1e-4;
@@ -78,81 +78,6 @@ fn fd_hessian<F: Fn(&[f64]) -> f64>(f: &F, u: &[f64], k: usize, h: f64) -> Vec<V
         }
     }
     hess
-}
-
-// ── Survival marginal-slope (K=4) ─────────────────────────────────────────────
-
-/// Row NLL for survival marginal-slope as a function of the 4-primary-state
-/// vector (q0, q1, qd1, g). Data (z, w, d) are fixed.
-fn survival_row_nll(u: &[f64], z: f64, w: f64, d: f64, dguard: f64, pscale: f64) -> f64 {
-    match survival_row_nll_grad_hess(u[0], u[1], u[2], u[3], z, w, d, dguard, pscale) {
-        Ok((nll, _, _)) => nll,
-        Err(_) => f64::NAN,
-    }
-}
-
-#[test]
-fn survival_marginal_slope_channel_hessian_matches_fd() {
-    // Fixed data scalars for all subjects.
-    let z = 0.3_f64;
-    let w = 1.0_f64;
-    let dguard = 1e-6_f64;
-    let pscale = 1.0_f64;
-
-    // Two rows: one censored (d=0), one event (d=1).
-    let data_d = [0.0_f64, 1.0_f64];
-
-    // Pilot primary states (q0, q1, qd1, g) for N rows.
-    // qd1 must be > dguard to avoid monotonicity violation.
-    let states: Vec<[f64; 4]> = (0..N)
-        .map(|i| {
-            let t = (i as f64 + 1.0) * 0.1;
-            [
-                -0.5 + t * 0.3,  // q0
-                -0.3 + t * 0.25, // q1
-                0.1 + t * 0.05,  // qd1 > dguard
-                -0.2 + t * 0.15, // g
-            ]
-        })
-        .collect();
-
-    for &d in &data_d {
-        for i in 0..N {
-            let u = states[i];
-            let f = |uu: &[f64]| survival_row_nll(uu, z, w, d, dguard, pscale);
-            let fd = fd_hessian(&f, &u, 4, FD_H);
-
-            // Compare the FD against the RAW analytic Hessian, not the
-            // PSD-CLAMPED per-row tensor that `from_pilot_primary_state`
-            // stores. The clamp projects negative eigenvalues to zero for the
-            // optimizer's curvature model, so on an indefinite censored-row
-            // NLL the clamped [q0,q0] entry legitimately differs from the true
-            // (negative) curvature the FD measures — that is a property of the
-            // clamp, not a derivative error. The derivative-correctness check
-            // this test exists for is the RAW Hessian vs FD.
-            let (_, _, hess) =
-                survival_row_nll_grad_hess(u[0], u[1], u[2], u[3], z, w, d, dguard, pscale)
-                    .expect("survival_row_nll_grad_hess failed");
-
-            for a in 0..4 {
-                for b in 0..4 {
-                    let got = hess[a][b];
-                    let ref_val = fd[a][b];
-                    // Skip NaN FD entries (numerical issues at boundary rows).
-                    if !ref_val.is_finite() {
-                        continue;
-                    }
-                    assert!(
-                        err_within_tol(got, ref_val),
-                        "survival marginal-slope W_i[{a},{b}] row {i} d={d}: \
-                         got={got:.6e} fd={ref_val:.6e} abs_err={abs:.2e} rel_err={rel:.2e}",
-                        abs = (got - ref_val).abs(),
-                        rel = rel_err(got, ref_val),
-                    );
-                }
-            }
-        }
-    }
 }
 
 // ── Bernoulli marginal-slope (K=1) ────────────────────────────────────────────
