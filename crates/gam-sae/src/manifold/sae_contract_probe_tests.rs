@@ -1009,6 +1009,81 @@ fn sae_1026_curved_beats_linear_reconstruction_through_solver() {
     );
 }
 
+/// #1026 — K=2 superposition recovery through the REAL solver, and the p ≥ 2K
+/// admissibility boundary. Two superposed circles fit by two periodic atoms via
+/// the production joint inner solve (`run_joint_fit_arrow_schur`). When the ambient
+/// dimension holds both planted planes (p = 4 = 2K) the joint solve DISENTANGLES the
+/// superposition and reconstructs it (the engine analogue of the closed-form
+/// alternating-projection joint encode); when p < 2K (overlapping planes) the signal
+/// is genuinely under-determined and recovery collapses — no joint optimization can
+/// invent the missing dimension. This pins both the positive recovery and the
+/// boundary. Fast (fixed-rho inner solve, ~0.1 s/arm).
+#[test]
+fn sae_1026_solver_recovers_separable_superposition_but_not_below_2k() {
+    let recover = |p: usize, overlap: bool| -> f64 {
+        let n = 80usize;
+        let theta_a = Array2::from_shape_fn((n, 1), |(r, _)| ((r as f64) * 0.043).rem_euclid(1.0));
+        let theta_b =
+            Array2::from_shape_fn((n, 1), |(r, _)| ((r as f64) * 0.071 + 0.13).rem_euclid(1.0));
+        let mut target = Array2::<f64>::zeros((n, p));
+        for r in 0..n {
+            let a = std::f64::consts::TAU * theta_a[[r, 0]];
+            let b = std::f64::consts::TAU * theta_b[[r, 0]];
+            if !overlap {
+                target[[r, 0]] = a.cos();
+                target[[r, 1]] = a.sin();
+                target[[r, 2]] = b.cos();
+                target[[r, 3]] = b.sin();
+            } else {
+                // p = 3: circle A in dims (0,1), circle B in dims (1,2) — they share dim 1.
+                target[[r, 0]] += a.cos();
+                target[[r, 1]] += a.sin();
+                target[[r, 1]] += b.cos();
+                target[[r, 2]] += b.sin();
+            }
+        }
+        let seed_a = Array2::from_shape_fn((n, 1), |(r, _)| (theta_a[[r, 0]] + 0.03).rem_euclid(1.0));
+        let seed_b = Array2::from_shape_fn((n, 1), |(r, _)| (theta_b[[r, 0]] + 0.03).rem_euclid(1.0));
+        let (pa, ja) = periodic_basis(&seed_a);
+        let (pb, jb) = periodic_basis(&seed_b);
+        let m = pa.ncols();
+        let a0 = SaeManifoldAtom::new(
+            "cA", SaeAtomBasisKind::Periodic, 1, pa, ja,
+            Array2::<f64>::zeros((m, p)), Array2::<f64>::eye(m),
+        ).unwrap().with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+        let a1 = SaeManifoldAtom::new(
+            "cB", SaeAtomBasisKind::Periodic, 1, pb, jb,
+            Array2::<f64>::zeros((m, p)), Array2::<f64>::eye(m),
+        ).unwrap().with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+        let logits = Array2::<f64>::from_elem((n, 2), 6.0 * 0.5);
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            logits,
+            vec![seed_a.clone(), seed_b.clone()],
+            vec![LatentManifold::Circle { period: 1.0 }, LatentManifold::Circle { period: 1.0 }],
+            AssignmentMode::ibp_map(0.5, 1.0, false),
+        ).unwrap();
+        let mut term = SaeManifoldTerm::new(vec![a0, a1], assignment).unwrap();
+        let mut rho = SaeManifoldRho::new(
+            0.0, 0.01_f64.ln(), vec![array![1.0_f64.ln()], array![1.0_f64.ln()]],
+        );
+        term.run_joint_fit_arrow_schur(target.view(), &mut rho, None, 24, 0.1, 1.0e-4, 1.0e-4)
+            .expect("K=2 inner solve converges");
+        let fitted = term.try_fitted_for_rho(&rho).unwrap();
+        reconstruction_explained_variance(target.view(), fitted.view()).unwrap()
+    };
+    let separable = recover(4, false);
+    let under_determined = recover(3, true);
+    eprintln!("#1026 K=2 superposition: separable(p=4)={separable:.4}, overlap(p=3)={under_determined:.4}");
+    assert!(
+        separable > 0.95,
+        "the joint solver must recover two superposed circles when p >= 2K (EV={separable})"
+    );
+    assert!(
+        separable > under_determined + 0.2,
+        "p >= 2K must matter: separable superposition recovers but p < 2K (overlapping planes)          is under-determined and collapses — separable={separable}, overlap={under_determined}"
+    );
+}
+
 #[test]
 pub(crate) fn deflated_solver_matches_plain_solve_when_no_gauge_is_installed() {
     let cache = diagonal_latent_cache(&[2.0_f64, 5.0, 7.0]);
