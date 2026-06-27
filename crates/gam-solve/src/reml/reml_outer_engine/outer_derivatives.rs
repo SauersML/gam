@@ -33,15 +33,18 @@ mod traces;
 pub(crate) use dense::*;
 pub(crate) use kkt::*;
 pub(crate) use operator::*;
-pub(crate) use routing::*;
-// Surface the outer-Hessian routing predicates/thresholds publicly so the
-// relocated families' cross-crate regression tests (#1521 carve) reach them
-// through the flat `gam_solve::estimate::reml::reml_outer_engine::<Name>` path;
-// the `pub(crate) use routing::*` glob above otherwise caps them at crate scope.
-pub use routing::{
-    MATRIX_FREE_OUTER_HESSIAN_DIM_AT_LARGE_N, MATRIX_FREE_OUTER_HESSIAN_LARGE_N_THRESHOLD,
-    OuterHessianRoutePlan, outer_hessian_route_plan, prefer_outer_hessian_operator,
-};
+// Re-flatten `routing` at each item's own declared visibility: the outer-Hessian
+// routing predicates/thresholds (`OuterHessianRoutePlan`, `outer_hessian_route_plan`,
+// `prefer_outer_hessian_operator`, `MATRIX_FREE_OUTER_HESSIAN_{LARGE_N_THRESHOLD,
+// DIM_AT_LARGE_N}`) are declared `pub` so the relocated families' cross-crate
+// regression tests (#1521 carve) reach them through the flat
+// `gam_solve::estimate::reml::reml_outer_engine::<Name>` path; everything else in
+// `routing` is `pub(crate)`. A single `pub use` glob carries those visibilities
+// verbatim. A capped `pub(crate) use routing::*` plus a separate `pub use
+// routing::{…}` un-cap would import the same routing names at two visibilities —
+// `pub(crate)` here and `pub` via the `use super::*` round-trip through the parent's
+// re-export — which the compiler rejects as an ambiguous-visibility glob import.
+pub use routing::*;
 pub(crate) use traces::*;
 
 // ═══════════════════════════════════════════════════════════════════════════
