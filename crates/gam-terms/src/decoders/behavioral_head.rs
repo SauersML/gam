@@ -86,14 +86,6 @@ impl AuxOutcomeFamily {
             AuxOutcomeFamily::Multinomial { n_classes } => n_classes.saturating_sub(1),
         }
     }
-
-    /// A single binary label pins ~1 gauge dimension; a `K`-level categorical
-    /// label pins at most `K − 1`. This is the honest behavioral-subspace
-    /// dimension the head can orient — the load-bearing scope assumption from
-    /// the Khemakhem precondition discussion (the geometry does the rest).
-    pub fn behavioral_subspace_dim(&self) -> usize {
-        self.n_eta_channels()
-    }
 }
 
 /// The behavioral head GLM.

@@ -68,12 +68,6 @@ macro_rules! define_analytic_penalty_kind {
                 }
             }
 
-            pub fn python_wrapper_name(&self) -> &'static str {
-                match self {
-                    $(AnalyticPenaltyKind::$variant(_) => <$ty as PenaltyManifest>::PYTHON_WRAPPER,)*
-                }
-            }
-
             pub fn is_row_block_diagonal(&self) -> bool {
                 match self {
                     $(AnalyticPenaltyKind::$variant(_) => <$ty as PenaltyManifest>::ROW_BLOCK_DIAGONAL,)*
