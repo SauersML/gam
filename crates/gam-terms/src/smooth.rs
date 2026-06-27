@@ -36,5 +36,13 @@ pub use term_design::{
     term_collection_has_one_sided_anchored_bspline,
 };
 
+// Spec→spec freezer relocated DOWN from gam-models `fit_orchestration/drivers/
+// spatial_optimization.rs` (#1521). `freeze_term_collection_from_design` is the
+// single canonical model-save freezer; its helper `freeze_smooth_basis_from_metadata`
+// stays private. A legal gam-terms resident (pure gam-terms/gam-problem types) and
+// a shared home the future family sub-crates can call without depending on gam-models.
+mod design_freezing;
+pub use design_freezing::freeze_term_collection_from_design;
+
 #[cfg(test)]
 mod tests;

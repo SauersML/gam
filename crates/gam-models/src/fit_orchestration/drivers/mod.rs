@@ -39,6 +39,12 @@ use gam_solve::estimate::{
 
 use gam_solve::estimate::reml::DirectionalHyperParam;
 
+// #1521: `freeze_term_collection_from_design` relocated DOWN into gam_terms::smooth
+// (was an `include!`d `pub fn` in spatial_optimization.rs). Re-export here so the
+// `crate::fit_orchestration::drivers::freeze_term_collection_from_design` path used
+// by families + pyffi resolves unchanged.
+pub use gam_terms::smooth::freeze_term_collection_from_design;
+
 use crate::family_runtime::{FamilyStrategy, strategy_for_spec};
 
 use gam_solve::mixture_link::{
