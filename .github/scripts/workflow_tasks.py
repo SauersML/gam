@@ -161,10 +161,22 @@ def download_artifacts(target_name, out_dir_arg):
         return
 
     for a in shard_artifacts:
-        subprocess.run(
-            ["gh", "api", a["archive_download_url"], ">", "artifact.zip"],
-            shell=True, check=True
+        # `gh api <archive_download_url>` streams the zip blob to stdout
+        # (following GitHub's 302 to blob storage). Capture those bytes in
+        # Python and write them to disk: the previous form passed a list with
+        # `shell=True`, so `/bin/sh -c gh api … > artifact.zip` ran only the
+        # bare command `gh` (the remaining list items became `$0…$n` shell
+        # positional params, NOT argv to gh), printing gh's help, never
+        # performing the `>` redirection, and leaving artifact.zip absent —
+        # which surfaced downstream as FileNotFoundError and broke every
+        # benchmark shard's runtime download.
+        proc = subprocess.run(
+            ["gh", "api", a["archive_download_url"]],
+            check=True,
+            capture_output=True,
         )
+        with open("artifact.zip", "wb") as fh:
+            fh.write(proc.stdout)
         with zipfile.ZipFile("artifact.zip") as zf:
             zf.extractall(out_dir)
         os.remove("artifact.zip")
