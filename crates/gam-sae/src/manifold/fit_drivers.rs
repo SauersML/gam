@@ -40,14 +40,6 @@ impl SaeManifoldTerm {
         self.apply_newton_step_impl(delta_ext_coord, delta_beta, step_size, true)
     }
 
-    pub fn apply_newton_step_external_basis_refresh(
-        &mut self,
-        delta_ext_coord: ArrayView1<'_, f64>,
-        delta_beta: ArrayView1<'_, f64>,
-        step_size: f64,
-    ) -> Result<(), String> {
-        self.apply_newton_step_impl(delta_ext_coord, delta_beta, step_size, false)
-    }
 
     /// Capture the mutable state perturbed by an `apply_newton_step` +
     /// `loss` line-search trial, plus the row-layout state read by

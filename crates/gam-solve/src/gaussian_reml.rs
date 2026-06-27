@@ -572,26 +572,6 @@ pub fn gaussian_reml_multi_closed_form_with_cache_no_alloc(
     })
 }
 
-pub fn gaussian_reml_closed_form_batch<'a>(
-    problems: &[GaussianRemlScalarBatchProblem<'a>],
-    penalty: ArrayView2<'a, f64>,
-    nullspace_dim: Option<usize>,
-) -> Result<Vec<GaussianRemlResult>, EstimationError> {
-    let fits: Vec<Result<GaussianRemlResult, EstimationError>> = problems
-        .par_iter()
-        .map(|problem| {
-            gaussian_reml_closed_form_with_nullspace_dim(
-                problem.x.view(),
-                problem.y.view(),
-                penalty.view(),
-                nullspace_dim,
-                problem.weights.as_ref().map(|weights| weights.view()),
-                problem.init_rho,
-            )
-        })
-        .collect();
-    fits.into_iter().collect()
-}
 
 pub fn gaussian_reml_multi_closed_form_batch<'a>(
     problems: &[GaussianRemlMultiBatchProblem<'a>],

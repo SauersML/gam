@@ -24,19 +24,6 @@ use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 // These helpers prevent diagnostic spam while ensuring important messages are seen.
 // Pattern: show first occurrence, then every Nth occurrence, with count indicator.
 
-/// Rate-limited diagnostic counters for gradient calculations
-pub static GRAD_DIAG_BETA_COLLAPSE_COUNT: AtomicUsize = AtomicUsize::new(0);
-/// Count of outer-gradient evaluations where the proposed `δρ` was exactly
-/// zero (Newton step degenerated to no-op). Diagnostic only.
-pub static GRAD_DIAG_DELTA_ZERO_COUNT: AtomicUsize = AtomicUsize::new(0);
-/// Count of outer-gradient evaluations where the `log h(ρ)` quantity was
-/// clamped against the floor `log(eps)` to keep downstream divides
-/// well-defined.
-pub static GRAD_DIAG_LOGH_CLAMPED_COUNT: AtomicUsize = AtomicUsize::new(0);
-/// Count of outer-gradient evaluations that skipped the KKT envelope audit
-/// because no reference scale was available (β all zero or penalty
-/// reference vector all zero).
-pub static GRAD_DIAG_KKT_SKIP_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Rate-limited diagnostic for Hessian minimum eigenvalue warnings
 pub static H_MIN_EIG_LOG_BUCKET: AtomicI32 = AtomicI32::new(i32::MIN);

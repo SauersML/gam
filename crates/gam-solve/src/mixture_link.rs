@@ -1367,32 +1367,6 @@ pub fn inverse_link_pdffourth_derivative_for_inverse_link(
     inverse_link_pdf_derivative_for_inverse_link(link, eta, PdfDerivativeOrder::Fourth)
 }
 
-pub fn inverse_link_jet_for_link_function(
-    link: LinkFunction,
-    eta: f64,
-    mixture_link_state: Option<&MixtureLinkState>,
-    sas_link_state: Option<&SasLinkState>,
-) -> Result<InverseLinkJet, EstimationError> {
-    if let Some(state) = mixture_link_state {
-        return state.jet(eta);
-    }
-    if let Some(sas) = sas_link_state {
-        return match link {
-            LinkFunction::BetaLogistic => BetaLogisticKernel {
-                log_shape_center: sas.log_delta,
-                epsilon: sas.epsilon,
-            }
-            .jet(eta),
-            LinkFunction::Sas => sas.jet(eta),
-            LinkFunction::Logit
-            | LinkFunction::Probit
-            | LinkFunction::CLogLog
-            | LinkFunction::Identity
-            | LinkFunction::Log => link.jet(eta),
-        };
-    }
-    link.jet(eta)
-}
 
 #[inline]
 fn royston_parmar_inverse_link_jet(eta: f64) -> InverseLinkJet {

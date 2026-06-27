@@ -2303,65 +2303,6 @@ pub fn ift_dbeta_drho(
         .mode_response(dg_red_drho)
 }
 
-/// Tier-3 IFT sensitivity `∂u*/∂ρ` (proposal §2.6 / §7).
-///
-/// ```text
-/// ∂u*/∂ρ_a = -H_uu⁻¹ G_{u,ρ_a} - H_uu⁻¹ H_uβ ∂β*/∂ρ_a.
-/// ```
-///
-/// `gu_rho` is the `(N·d) × R` matrix of `G_{u,ρ_a}` columns and
-/// `dbeta_drho` is the `K × R` matrix from [`ift_dbeta_drho`]. Returns
-/// the `(N·d) × R` matrix `u_ρ`.
-pub fn ift_du_drho(
-    cache: &ArrowFactorCache,
-    gu_rho: ArrayView2<'_, f64>,
-    dbeta_drho: ArrayView2<'_, f64>,
-) -> Array2<f64> {
-    let n = cache.undamped_factor_count();
-    let total_len = cache.delta_t_len();
-    let k = cache.k;
-    let r = dbeta_drho.ncols();
-    if !cache.htbeta_available()
-        || gu_rho.nrows() != total_len
-        || gu_rho.ncols() != r
-        || dbeta_drho.nrows() != k
-    {
-        return Array2::<f64>::from_elem((total_len, r), f64::NAN);
-    }
-
-    let mut out = Array2::<f64>::zeros((total_len, r));
-    // Allocate scratch at max_d; per-row slice is ..di.
-    let mut rhs = Array1::<f64>::zeros(cache.d);
-    let mut htbeta_delta = Array1::<f64>::zeros(cache.d);
-    for a in 0..r {
-        // Per-row: rhs_i = G_{u_i,ρ_a} + H_uβ_i · ∂β*/∂ρ_a.
-        for i in 0..n {
-            let di = cache.row_dims[i];
-            let row_base = cache.row_offsets[i];
-            let mut htbeta_i = htbeta_delta.slice_mut(ndarray::s![..di]).to_owned();
-            // Companion to the `du/dβ` assembler above; same H_tβ cache.
-            if !cache.apply_htbeta_row(i, dbeta_drho.column(a), &mut htbeta_i) {
-                // SAFETY: `false` here means the family declared H_tβ row
-                // products available but did not populate them — contract
-                // violation against the joint-evidence capability surface.
-                return Array2::<f64>::from_elem((total_len, r), f64::NAN);
-            }
-            {
-                let mut rhs_i = rhs.slice_mut(ndarray::s![..di]);
-                for c in 0..di {
-                    rhs_i[c] = gu_rho[[row_base + c, a]] + htbeta_i[c];
-                }
-            }
-            let rhs_slice = rhs.slice(ndarray::s![..di]).to_owned();
-            // u_ρ_i = -H_uu_i⁻¹ rhs_i, undamped factor.
-            let v = cholesky_solve_vector(cache.undamped_factor(i), &rhs_slice);
-            for c in 0..di {
-                out[[row_base + c, a]] = -v[c];
-            }
-        }
-    }
-    out
-}
 
 // ---------------------------------------------------------------------------
 // ∂V/∂ρ — analytic optimized-evidence gradient via IFT mode response
@@ -2769,16 +2710,6 @@ fn topology_selection_score(candidate: &TopologyCandidate, scale: TopologyScoreS
 // Cache verification helpers
 // ---------------------------------------------------------------------------
 
-/// Sanity check used by callers that require exact factor-backed evidence.
-/// Proposal §6.4 — ridges must be zero on the evidence-evaluation path.
-/// Matrix-free callers can instead pass an HVP fallback to
-/// [`laplace_evidence`].
-pub fn cache_supports_exact_evidence(cache: &ArrowFactorCache) -> bool {
-    cache.ridge_t == 0.0
-        && cache.ridge_beta == 0.0
-        && cache.schur_factor.is_some()
-        && cache.htbeta_available()
-}
 
 /// Verifies the `ArrowSchurSystem` dimensions match the cache. Used as
 /// a debug-time precondition; never silently masks shape errors

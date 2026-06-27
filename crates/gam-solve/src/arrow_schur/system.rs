@@ -466,21 +466,7 @@ impl ArrowSchurSystem {
         }
     }
 
-    /// Allocate a heterogeneous BA system where each row has its own latent
-    /// dimensionality `per_row_dims[i]`.
-    ///
-    /// Used by sparse-assignment SAE paths (JumpReLU / TopK / sparsemax /
-    /// hard-concrete) where the active-set size varies per observation.
-    /// `sys.d` is set to `max(per_row_dims)` (or 0 for an empty system).
-    pub fn new_with_per_row_dims(per_row_dims: Vec<usize>, k: usize) -> Self {
-        Self::new_with_per_row_dims_and_hbb(per_row_dims, k, Array2::<f64>::zeros((k, k)))
-    }
 
-    /// Allocate a heterogeneous-row arrow system with no dense shared `H_ββ`
-    /// block. See [`Self::new_with_empty_hbb`].
-    pub fn new_with_per_row_dims_empty_hbb(per_row_dims: Vec<usize>, k: usize) -> Self {
-        Self::new_with_per_row_dims_empty_hbb_and_htbeta_cols(per_row_dims, k, k)
-    }
 
     /// Allocate a heterogeneous-row arrow system with no dense shared `H_ββ`
     /// block and with row `H_tβ` slabs allocated at `htbeta_cols` columns.

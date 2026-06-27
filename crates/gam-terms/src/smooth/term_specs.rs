@@ -652,21 +652,6 @@ pub enum ByVariableSpec {
     Level { value_bits: u64, label: String },
 }
 
-/// Tensor-product B-spline smooth specification.
-///
-/// `marginalspecs[i]` is the 1D B-spline setup for `feature_cols[i]`.
-/// The final penalty set is one Kronecker penalty per margin:
-/// `S_i = I ⊗ ... ⊗ S_marginal_i ⊗ ... ⊗ I`, plus optional global ridge.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum TensorMarginalSpec {
-    BSpline(BSplineBasisSpec),
-    Categorical {
-        feature_col_offset: usize,
-        drop_first_level: bool,
-        center_for_identifiability: bool,
-        frozen_levels: Option<Vec<u64>>,
-    },
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ByVarKind {
