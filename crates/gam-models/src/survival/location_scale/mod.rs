@@ -100,9 +100,11 @@ use gam_terms::smooth::{
     SpatialLengthScaleOptimizationOptions, TermCollectionDesign, TermCollectionSpec,
 };
 use crate::fit_orchestration::drivers::{
-    ExactJointHyperSetup, build_term_collection_design, freeze_term_collection_from_design,
+    ExactJointHyperSetup, freeze_term_collection_from_design,
     optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
 };
+// #1521: relocated DOWN into gam_terms::smooth (was drivers::build_term_collection_design).
+use gam_terms::smooth::build_term_collection_design;
 
 use crate::model_types::UnifiedFitResult;
 

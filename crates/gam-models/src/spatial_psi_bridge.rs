@@ -247,10 +247,10 @@ mod tests {
     use super::*;
     use gam_terms::basis::{CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu};
     use crate::custom_family::resolve_custom_family_x_psi_psi_map;
-    use gam_terms::smooth::{ShapeConstraint, SmoothBasisSpec, SmoothTermSpec};
-    use crate::fit_orchestration::drivers::{
-        build_term_collection_design, freeze_term_collection_from_design,
+    use gam_terms::smooth::{
+        ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, build_term_collection_design,
     };
+    use crate::fit_orchestration::drivers::freeze_term_collection_from_design;
     use gam_runtime::resource::ResourcePolicy;
 
     #[test]

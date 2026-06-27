@@ -66,9 +66,11 @@ pub(crate) use gam_terms::smooth::{
     TermCollectionSpec,
 };
 pub(crate) use crate::fit_orchestration::drivers::{
-    ExactJointHyperSetup, build_term_collection_design, freeze_term_collection_from_design,
+    ExactJointHyperSetup, freeze_term_collection_from_design,
     optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
 };
+// #1521: relocated DOWN into gam_terms::smooth (was drivers::build_term_collection_design).
+pub(crate) use gam_terms::smooth::build_term_collection_design;
 pub(crate) use gam_problem::{
     DriftDerivResult, HyperOperator, ProjectedFactorCache, ProjectedFactorKey,
 };

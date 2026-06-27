@@ -116,20 +116,15 @@ pub(crate) fn survival_baseline_pirls_options() -> gam::pirls::WorkingModelPirls
 }
 
 pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
-    let mut progress = gam::visualizer::VisualizerSession::new(true);
-    let survival_total_steps = if args.out.is_some() { 5 } else { 4 };
-    progress.start_workflow("Survival Fit", survival_total_steps);
     let response_expr = surv_response_expr(args.entry.as_deref(), &args.exit, &args.event);
     let formula = format!("{response_expr} ~ {}", args.formula);
     let parsed = parse_formula(&formula)?;
-    progress.set_stage("fit", "loading survival data");
     let requested_columns = required_columns_for_survival(&args, &parsed)?;
     // Force explicit `group(g)` / `factor(g)` / `re(g)` grouping columns to a
     // factor encoding even when numeric-coded (see the matching note in
     // `run_fit`); the survival response is a `Surv(...)` expression, never a
     // bare categorical column, so it is not a forced factor.
     let ds = load_fit_dataset_with_roles(&args.data, &requested_columns, &parsed, false)?;
-    progress.advance_workflow(1);
     let col_map = ds.column_map();
 
     // `entry_col == None` is the right-censored shorthand `Surv(time, event)`:
@@ -342,7 +337,6 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         }
     };
     let mut inference_notes = Vec::new();
-    progress.set_stage("fit", "building survival design matrices");
     // Survival marginal-slope formulas may reference the literal placeholder
     // `z` to bind to the auxiliary score supplied via --z-column. Alias `z`
     // to the actual `z_column` index in a local copy of `col_map` so
@@ -540,7 +534,6 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         &mut time_build.x_exit_time,
         &time_anchor_row,
     )?;
-    progress.advance_workflow(2);
     print_inference_summary(&inference_notes);
 
     if likelihood_mode == SurvivalLikelihoodMode::LocationScale {
@@ -741,7 +734,6 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             None,
         )?;
         let time_design_exit = prepared.time_design_exit.clone();
-        progress.set_stage("fit", "running survival location-scale optimization");
         let phase_start = std::time::Instant::now();
         log::info!(
             "[PHASE] survival-location-scale fit start n={}",
@@ -787,9 +779,7 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             fit.fit.fit.log_likelihood,
             fit.fit.fit.reml_score
         );
-        progress.advance_workflow(3);
         if let Some(out) = args.out {
-            progress.set_stage("fit", "writing survival model");
             let mut fit_result = compact_saved_survival_location_scale_fit_result(
                 &fit.fit.fit,
                 &fitted_inverse_link,
@@ -878,9 +868,7 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 },
             );
             write_payload_json(&out, payload)?;
-            progress.advance_workflow(survival_total_steps);
         }
-        progress.finish_progress("survival fit complete");
         return Ok(());
     }
 
@@ -1103,7 +1091,6 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             effective_timewiggle.as_ref(),
             None,
         )?;
-        progress.set_stage("fit", "running survival marginal-slope optimization");
         let phase_start = std::time::Instant::now();
         log::info!(
             "[PHASE] survival-margslope fit start n={}",
@@ -1142,9 +1129,7 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             fit.fit.reml_score,
             fit.baseline_slope,
         );
-        progress.advance_workflow(3);
         if let Some(out) = args.out {
-            progress.set_stage("fit", "writing survival marginal-slope model");
             let save_frailty = match (&frailty, fit.gaussian_frailty_sd) {
                 (
                     gam::families::survival::lognormal_kernel::FrailtySpec::GaussianShift {
@@ -1205,9 +1190,7 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 },
             );
             write_payload_json(&out, payload)?;
-            progress.advance_workflow(survival_total_steps);
         }
-        progress.finish_progress("survival marginal-slope fit complete");
         return Ok(());
     }
 
@@ -1412,14 +1395,6 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             None,
             Some(latent_loading),
         )?;
-        progress.set_stage(
-            "fit",
-            if likelihood_mode == SurvivalLikelihoodMode::Latent {
-                "running latent survival optimization"
-            } else {
-                "running latent binary optimization"
-            },
-        );
         let (fit, learned_latent_sd) = match likelihood_mode {
             SurvivalLikelihoodMode::Latent => {
                 match fit_model(FitRequest::LatentSurvival(build_survival_request(prepared))) {
@@ -1469,16 +1444,7 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             fit.log_likelihood,
             fit.reml_score,
         );
-        progress.advance_workflow(3);
         if let Some(out) = args.out {
-            progress.set_stage(
-                "fit",
-                if likelihood_mode == SurvivalLikelihoodMode::Latent {
-                    "writing latent survival model"
-                } else {
-                    "writing latent binary model"
-                },
-            );
             let is_latent_survival = likelihood_mode == SurvivalLikelihoodMode::Latent;
             // Source-specific work: resolve the latent family (splicing the
             // learned latent SD into the survival frailty) and its labels. The
@@ -1546,13 +1512,7 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 },
             );
             write_payload_json(&out, payload)?;
-            progress.advance_workflow(survival_total_steps);
         }
-        progress.finish_progress(if likelihood_mode == SurvivalLikelihoodMode::Latent {
-            "latent survival fit complete"
-        } else {
-            "latent binary fit complete"
-        });
         return Ok(());
     }
 
@@ -1583,7 +1543,6 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         } else {
             None
         };
-        progress.set_stage("fit", "running cause-specific survival optimization");
         let fit = match fit_model(FitRequest::SurvivalTransformation(
             SurvivalTransformationFitRequest {
                 data: ds.values.view(),
@@ -1628,9 +1587,7 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             fit.fit.log_likelihood,
             fit.fit.reml_score
         );
-        progress.advance_workflow(3);
         if let Some(out) = args.out {
-            progress.set_stage("fit", "writing cause-specific survival model");
             // Source-specific work: extract the cause-specific baseline-timewiggle
             // coefficients from the first fitted block (this CLI path persists a
             // single shared timewiggle block; cause_count > 1 guarantees the
@@ -1682,9 +1639,7 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 },
             );
             write_payload_json(&out, payload)?;
-            progress.advance_workflow(survival_total_steps);
         }
-        progress.finish_progress("cause-specific survival fit complete");
         return Ok(());
     }
     let build_working_model = |candidate: &SurvivalBaselineConfig| {
@@ -1873,7 +1828,6 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let (prepared, penalty_blocks, p_time_total, beta0, structural_lower_bounds, model) =
         build_working_model(&baseline_cfg)?;
     let beta0_norm = beta0.dot(&beta0).sqrt();
-    progress.set_stage("fit", "running survival pirls");
     let pirls_opts = survival_baseline_pirls_options();
     let pirls_start = std::time::Instant::now();
     let pirls_callback = |info: &gam::pirls::WorkingModelIterationInfo| {
@@ -2038,9 +1992,7 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         survival_baseline_targetname(fitted_baseline_cfg.target)
     );
 
-    progress.advance_workflow(3);
     if let Some(out) = args.out {
-        progress.set_stage("fit", "writing survival model");
         let hessian = state.hessian.to_dense();
         let cov = match invert_symmetric_matrix(&hessian) {
             Ok(c) => Some(c),
@@ -2106,8 +2058,6 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             },
         );
         write_payload_json(&out, payload)?;
-        progress.advance_workflow(survival_total_steps);
     }
-    progress.finish_progress("survival fit complete");
     Ok(())
 }

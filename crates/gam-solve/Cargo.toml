@@ -9,7 +9,6 @@ warnings = "deny"
 
 
 [dependencies]
-crossterm = "0.29.0"
 dyn-stack = "0.13.2"
 faer = "0.24.0"
 gam-geometry = { path = "../gam-geometry", version = "=0.3.124" }
@@ -25,7 +24,6 @@ gam-terms = { path = "../gam-terms", version = "=0.3.124" }
 log = "0.4.29"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 opt = "0.5.2"
-ratatui = "0.30.0"
 rayon = "1.12.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149", features = ["float_roundtrip"] }

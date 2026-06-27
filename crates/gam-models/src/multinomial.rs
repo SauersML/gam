@@ -72,10 +72,10 @@ use crate::model_types::EstimationError;
 use crate::fit_orchestration::{
     FitConfig, build_termspec_with_geometry_and_overrides, resolved_resource_policy,
 };
-use gam_terms::smooth::{PenaltyBlockInfo, TermCollectionDesign, TermCollectionSpec};
-use crate::fit_orchestration::drivers::{
-    build_term_collection_design, freeze_term_collection_from_design,
+use gam_terms::smooth::{
+    PenaltyBlockInfo, TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
 };
+use crate::fit_orchestration::drivers::freeze_term_collection_from_design;
 use gam_terms::term_builder::resolve_role_col;
 use gam_problem::ResponseColumnKind;
 use gam_data::ColumnKindTag;
@@ -658,7 +658,7 @@ pub struct MultinomialSavedModel {
     /// can land without changing the on-disk shape.
     pub reference_class_index: usize,
     /// Resolved term-collection spec used to build `X` at fit time. Replayed
-    /// on predict via [`crate::fit_orchestration::drivers::build_term_collection_design`].
+    /// on predict via [`gam_terms::smooth::build_term_collection_design`].
     pub resolved_termspec: TermCollectionSpec,
     /// Active-class coefficient block, shape `(P, K-1)`. Column `a` is the
     /// coefficient vector for class `class_levels[a]`. Stored flat in

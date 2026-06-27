@@ -47,7 +47,7 @@ use crate::inference::model::{
     FittedModel as SavedModel, PredictModelClass, load_survival_time_basis_config_from_model,
 };
 use crate::linalg::triangular::back_substitution_lower_transpose_guarded_into;
-use crate::families::fit_orchestration::drivers::build_term_collection_design;
+use crate::terms::smooth::build_term_collection_design;
 use crate::smooth::{LinearCoefficientGeometry, weighted_blockwise_penalty_sum};
 use crate::term_builder::resolve_role_col;
 use crate::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};

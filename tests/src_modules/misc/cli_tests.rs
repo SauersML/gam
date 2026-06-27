@@ -2467,9 +2467,7 @@ fn standard_fixed_link_wiggle_generation_uses_wiggle_path() {
     );
     let data = ndarray::Array2::<f64>::zeros((3, 0));
     let headers = vec![];
-    let mut progress = gam::visualizer::VisualizerSession::new(false);
     let spec = super::run_generate_unified(
-        &mut progress,
         &model,
         data.view(),
         &HashMap::new(),
@@ -4632,9 +4630,7 @@ fn gaussian_location_scale_generate_restores_sigma_to_response_units() {
     let data = ndarray::Array2::<f64>::zeros((2, 0));
     let headers = vec![];
     let col_map = HashMap::new();
-    let mut progress = gam::visualizer::VisualizerSession::new(false);
     let spec = super::run_generate_unified(
-        &mut progress,
         &model,
         data.view(),
         &col_map,
@@ -5546,9 +5542,7 @@ fn run_predict_survival_supports_saved_baseline_timewiggle_model() {
         mode: PredictModeArg::Map,
         no_bias_correction: false,
     };
-    let mut progress = gam::visualizer::VisualizerSession::new(false);
     super::run_predict_survival(
-        &mut progress,
         &args,
         &model,
         data.view(),
@@ -5708,9 +5702,7 @@ fn run_predict_survival_supports_saved_latent_survival_model() {
         no_bias_correction: false,
     };
 
-    let mut progress = gam::visualizer::VisualizerSession::new(false);
     super::run_predict_survival(
-        &mut progress,
         &args,
         &model,
         data.view(),
@@ -7738,9 +7730,7 @@ fn binomial_location_scale_wiggle_uses_unified_generate_path() {
     let data = ndarray::Array2::<f64>::zeros((2, 0));
     let headers = vec![];
     let col_map = HashMap::new();
-    let mut progress = gam::visualizer::VisualizerSession::new(false);
     let spec = super::run_generate_unified(
-        &mut progress,
         &model,
         data.view(),
         &col_map,

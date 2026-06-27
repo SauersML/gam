@@ -138,7 +138,6 @@ pub(crate) fn resolve_predict_offsets(
 /// Handles the three prediction modes (simple, posterior-mean, uncertainty) and
 /// writes the appropriate CSV format for the model class.
 pub(crate) fn run_predict_unified(
-    progress: &mut gam::visualizer::VisualizerSession,
     args: &PredictArgs,
     model: &SavedModel,
     pred_input: &PredictInput,
@@ -219,8 +218,6 @@ pub(crate) fn run_predict_unified(
     };
 
     // --- Write CSV output ---
-    progress.advance_workflow(4);
-    progress.set_stage("predict", "writing predictions");
 
     match model_class {
         PredictModelClass::GaussianLocationScale => {
@@ -258,7 +255,6 @@ pub(crate) fn run_predict_unified(
 }
 
 pub(crate) fn run_predict_model(
-    progress: &mut gam::visualizer::VisualizerSession,
     args: &PredictArgs,
     model: &SavedModel,
     data: ndarray::ArrayView2<'_, f64>,
@@ -270,7 +266,6 @@ pub(crate) fn run_predict_model(
 ) -> Result<(), String> {
     if model.predict_model_class() == PredictModelClass::Survival {
         return run_predict_survival(
-            progress,
             args,
             model,
             data,
@@ -281,10 +276,10 @@ pub(crate) fn run_predict_model(
         );
     }
     if model.spline_scan.is_some() {
-        return run_predict_spline_scan(progress, args, model, data, col_map);
+        return run_predict_spline_scan(args, model, data, col_map);
     }
     if model.residual_cascade.is_some() {
-        return run_predict_residual_cascade(progress, args, model, data, col_map);
+        return run_predict_residual_cascade(args, model, data, col_map);
     }
 
     let predictor = model.predictor().ok_or_else(|| {
@@ -302,8 +297,7 @@ pub(crate) fn run_predict_model(
         predict_noise_offset,
         noise_offset_supplied,
     )?;
-    progress.advance_workflow(3);
-    run_predict_unified(progress, args, model, &pred_input, &*predictor)
+    run_predict_unified(args, model, &pred_input, &*predictor)
 }
 
 pub(crate) fn validate_level(level: f64) -> Result<(), String> {
@@ -318,7 +312,6 @@ pub(crate) fn validate_level(level: f64) -> Result<(), String> {
 /// row. The link is identity so η == mean; SEs and intervals come from the
 /// exact smoothing-spline posterior variance of the mean.
 pub(crate) fn run_predict_spline_scan(
-    progress: &mut gam::visualizer::VisualizerSession,
     args: &PredictArgs,
     model: &SavedModel,
     data: ndarray::ArrayView2<'_, f64>,
@@ -341,9 +334,6 @@ pub(crate) fn run_predict_spline_scan(
         mean[i] = m;
         se[i] = v.max(0.0).sqrt();
     }
-    progress.advance_workflow(3);
-    progress.advance_workflow(4);
-    progress.set_stage("predict", "writing predictions");
     let (se_opt, mean_lo, mean_hi) = if args.uncertainty {
         let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
         let lo = Array1::from_iter(mean.iter().zip(se.iter()).map(|(m, s)| m - z * s));
@@ -376,7 +366,6 @@ pub(crate) fn run_predict_spline_scan(
 /// mean replays through the persisted factored precision `predict_chol` — no
 /// training design matrix is retained or rebuilt.
 pub(crate) fn run_predict_residual_cascade(
-    progress: &mut gam::visualizer::VisualizerSession,
     args: &PredictArgs,
     model: &SavedModel,
     data: ndarray::ArrayView2<'_, f64>,
@@ -408,9 +397,6 @@ pub(crate) fn run_predict_residual_cascade(
         mean[i] = m;
         se[i] = v.max(0.0).sqrt();
     }
-    progress.advance_workflow(3);
-    progress.advance_workflow(4);
-    progress.set_stage("predict", "writing predictions");
     let (se_opt, mean_lo, mean_hi) = if args.uncertainty {
         let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
         let lo = Array1::from_iter(mean.iter().zip(se.iter()).map(|(m, s)| m - z * s));
@@ -437,17 +423,12 @@ pub(crate) fn run_predict_residual_cascade(
 
 pub(crate) fn run_predict(args: PredictArgs) -> Result<(), String> {
     validate_level(args.level)?;
-    let mut progress = gam::visualizer::VisualizerSession::new(true);
-    progress.start_workflow("Predict", 5);
     let phase_start = std::time::Instant::now();
-    progress.set_stage("predict", "loading fitted model");
     let model = SavedModel::load_from_path(&args.model)?;
     log::info!(
         "[PHASE] predict load-model done elapsed={:.3}s",
         phase_start.elapsed().as_secs_f64()
     );
-    progress.advance_workflow(1);
-    progress.set_stage("predict", "loading new data");
     // A `--offset-column` / `--noise-offset-column` override at predict time may
     // name a column other than the model's saved offset; keep it (resolved by
     // name below) in addition to the model's referenced columns.
@@ -473,10 +454,8 @@ pub(crate) fn run_predict(args: PredictArgs) -> Result<(), String> {
                 .map(|values| (id_column.clone(), values))
         })
         .transpose()?;
-    progress.advance_workflow(2);
     let col_map = ds.column_map();
     let training_headers = model.training_headers.as_ref();
-    progress.set_stage("predict", "building prediction matrices");
     let (predict_offset, predict_noise_offset) = resolve_predict_offsets(
         &model,
         &ds,
@@ -485,7 +464,6 @@ pub(crate) fn run_predict(args: PredictArgs) -> Result<(), String> {
         effective_noise_offset_column,
     )?;
     let result = run_predict_model(
-        &mut progress,
         &args,
         &model,
         ds.values.view(),
@@ -499,8 +477,6 @@ pub(crate) fn run_predict(args: PredictArgs) -> Result<(), String> {
         if let Some((id_column, values)) = id_values.as_ref() {
             prepend_id_column_to_prediction_csv(&args.out, id_column, values)?;
         }
-        progress.advance_workflow(5);
-        progress.finish_progress("prediction complete");
     }
     result
 }
@@ -758,7 +734,6 @@ pub(crate) fn prepare_saved_latent_window_prediction(
 }
 
 pub(crate) fn run_predict_saved_latent_window_impl(
-    progress: &mut gam::visualizer::VisualizerSession,
     args: &PredictArgs,
     model: &SavedModel,
     cov_design: &DesignMatrix,
@@ -934,8 +909,6 @@ pub(crate) fn run_predict_saved_latent_window_impl(
         mean_hi = Some(hi);
     }
 
-    progress.advance_workflow(4);
-    progress.set_stage("predict", kind.output_stage());
     kind.write_predictions(
         &args.out,
         state.eta.view(),
@@ -952,7 +925,6 @@ pub(crate) fn run_predict_saved_latent_window_impl(
 }
 
 pub(crate) fn run_predict_saved_latent_survival(
-    progress: &mut gam::visualizer::VisualizerSession,
     args: &PredictArgs,
     model: &SavedModel,
     cov_design: &DesignMatrix,
@@ -960,7 +932,6 @@ pub(crate) fn run_predict_saved_latent_survival(
     primary_offset: &Array1<f64>,
 ) -> Result<(), String> {
     run_predict_saved_latent_window_impl(
-        progress,
         args,
         model,
         cov_design,
@@ -971,7 +942,6 @@ pub(crate) fn run_predict_saved_latent_survival(
 }
 
 pub(crate) fn run_predict_saved_latent_binary(
-    progress: &mut gam::visualizer::VisualizerSession,
     args: &PredictArgs,
     model: &SavedModel,
     cov_design: &DesignMatrix,
@@ -979,7 +949,6 @@ pub(crate) fn run_predict_saved_latent_binary(
     primary_offset: &Array1<f64>,
 ) -> Result<(), String> {
     run_predict_saved_latent_window_impl(
-        progress,
         args,
         model,
         cov_design,
@@ -990,7 +959,6 @@ pub(crate) fn run_predict_saved_latent_binary(
 }
 
 pub(crate) fn run_predict_survival(
-    progress: &mut gam::visualizer::VisualizerSession,
     args: &PredictArgs,
     model: &SavedModel,
     data: ndarray::ArrayView2<'_, f64>,
@@ -999,7 +967,6 @@ pub(crate) fn run_predict_survival(
     primary_offset: &Array1<f64>,
     noise_offset: &Array1<f64>,
 ) -> Result<(), String> {
-    progress.set_stage("predict", "building survival prediction design");
     // `survival_entry == None` means the training response was the
     // right-censored shorthand `Surv(time, event)`; entry times are
     // synthesized as zero at prediction time too. Resolution flows
@@ -1018,7 +985,6 @@ pub(crate) fn run_predict_survival(
     let cov_input = cov_clipped.as_ref().map_or(data, |arr| arr.view());
     let cov_design = build_term_collection_design(cov_input, &termspec)
         .map_err(|e| format!("failed to build survival prediction design: {e}"))?;
-    progress.advance_workflow(3);
     let n = data.nrows();
     if primary_offset.len() != n || noise_offset.len() != n {
         return Err(format!(
@@ -1100,7 +1066,6 @@ pub(crate) fn run_predict_survival(
         )?;
         return match saved_likelihood_mode {
             SurvivalLikelihoodMode::Latent => run_predict_saved_latent_survival(
-                progress,
                 args,
                 model,
                 &cov_design.design,
@@ -1108,7 +1073,6 @@ pub(crate) fn run_predict_survival(
                 primary_offset,
             ),
             SurvivalLikelihoodMode::LatentBinary => run_predict_saved_latent_binary(
-                progress,
                 args,
                 model,
                 &cov_design.design,
@@ -1281,8 +1245,6 @@ pub(crate) fn run_predict_survival(
             let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
             let (mean_lo, mean_hi) =
                 response_interval_from_mean_sd(mean.view(), response_sd.view(), z, 0.0, 1.0);
-            progress.advance_workflow(4);
-            progress.set_stage("predict", "writing survival predictions");
             write_survival_prediction_csv(
                 &args.out,
                 eta_out.view(),
@@ -1292,8 +1254,6 @@ pub(crate) fn run_predict_survival(
                 Some(mean_hi.view()),
             )?;
         } else {
-            progress.advance_workflow(4);
-            progress.set_stage("predict", "writing survival predictions");
             write_survival_prediction_csv(
                 &args.out,
                 eta_out.view(),
@@ -1412,8 +1372,6 @@ pub(crate) fn run_predict_survival(
             (eta, mean, None, None, None)
         };
 
-        progress.advance_workflow(4);
-        progress.set_stage("predict", "writing survival predictions");
         write_survival_prediction_csv(
             &args.out,
             eta.view(),
@@ -1556,8 +1514,6 @@ pub(crate) fn run_predict_survival(
         mean_lo = Some(lo);
         mean_hi = Some(hi);
     }
-    progress.advance_workflow(4);
-    progress.set_stage("predict", "writing survival predictions");
     write_survival_prediction_csv(
         &args.out,
         eta.view(),

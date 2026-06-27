@@ -80,8 +80,6 @@ dyn-stack = "0.13.2"
 # differently than the in-memory fit. Required for bit-for-bit model
 # persistence (e.g. the #1034 spline-scan smoother state).
 serde_json = { version = "1.0.149", features = ["float_roundtrip"] }
-ratatui = "0.30.0"
-crossterm = "0.29.0"
 rand_distr = "0.6.0"
 statrs = "0.18.0"
 libm = "0.2.16"

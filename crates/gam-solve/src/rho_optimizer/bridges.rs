@@ -1060,11 +1060,6 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
             g_norm,
             self.iter_count,
         );
-        // Push the (cost, ‖g‖) sample so the live progress chart shows the
-        // BFGS outer descent. Recorded as a trial; `OuterAcceptObserver`
-        // promotes the latest trial into the accepted series when BFGS's
-        // Wolfe line-search accepts the step. Cheap: throttled internally.
-        crate::visualizer::record_outer_eval(eval.cost, g_norm);
         self.iter_count = self.iter_count.saturating_add(1);
         // Cost-stall halt (#1089). `eval_grad` is invoked by `opt::Bfgs` at
         // each accepted iterate (line-search COST probes go through `eval_cost`,
@@ -1498,11 +1493,6 @@ impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
                 .collect::<Vec<_>>()
                 .join(","),
         );
-        // Live-chart trial sample (ARC bridge first-order entry). Mirrors
-        // the eval_hessian site below; both run once per outer iter, so the
-        // chart's x-coord progresses on every accepted-or-rejected eval and
-        // the accepted line moves only on rho-acceptance.
-        crate::visualizer::record_outer_eval(eval.cost, g_norm);
         // NOTE: the cost-stall guard lives in `eval_hessian` below, NOT here.
         // `opt::Arc`'s per-iterate oracle (`eval_cost_grad_hessian`) calls
         // `eval_hessian` for the (value, grad, Hessian) triple and never calls
@@ -1789,7 +1779,6 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
                 .collect::<Vec<_>>()
                 .join(","),
         );
-        crate::visualizer::record_outer_eval(eval.cost, g_norm);
         // Cost-stall halt BEFORE the (possibly expensive) Hessian build: ARC's
         // per-iterate oracle reaches here, so this is where the near-separable
         // multinomial cycling is caught and certified (#1237). See

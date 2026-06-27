@@ -67,11 +67,13 @@ use gam_terms::smooth::{
 };
 
 use crate::fit_orchestration::drivers::{
-    SpatialLengthScaleOptimizationTiming, build_term_collection_design,
+    SpatialLengthScaleOptimizationTiming,
     fit_term_collection_with_coefficient_groups_and_penalty_block_gamma_priors,
     fit_term_collectionwith_latent_coord_optimization,
     fit_term_collectionwith_spatial_length_scale_optimization, freeze_term_collection_from_design,
 };
+// #1521: relocated DOWN into gam_terms::smooth (was drivers::build_term_collection_design).
+use gam_terms::smooth::build_term_collection_design;
 
 use gam_problem::LatentRetractionRegistry;
 

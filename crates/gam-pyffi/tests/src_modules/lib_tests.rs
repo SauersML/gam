@@ -18,7 +18,6 @@ fn pyffi_sources_use_canonical_gam_module_paths() {
         concat!("gam::", "predict::"),
         concat!("gam::", "estimate::"),
         concat!("gam::", "pirls::"),
-        concat!("gam::", "visualizer::"),
         concat!("gam::", "probability::"),
         concat!("gam::", "hmc::"),
         concat!("gam::", "gamlss::"),

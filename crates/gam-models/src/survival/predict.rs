@@ -36,7 +36,7 @@ use crate::model_types::{BlockRole, FittedBlock, FittedLinkState, UnifiedFitResu
 use crate::probability::signed_probit_logcdf_and_mills_ratio;
 use gam_solve::mixture_link::inverse_link_jet_for_inverse_link;
 use gam_terms::term_builder::resolve_role_col;
-use crate::fit_orchestration::drivers::build_term_collection_design;
+use gam_terms::smooth::build_term_collection_design;
 use gam_terms::smooth::TermCollectionSpec;
 use gam_problem::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 
@@ -2251,7 +2251,7 @@ fn predict_survival_location_scale_batch(
     let sigma_clipped = model.axis_clip_to_training_ranges(data, col_map);
     let sigma_input = sigma_clipped.as_ref().map_or(data, |arr| arr.view());
     let raw_sigma_design =
-        crate::fit_orchestration::drivers::build_term_collection_design(sigma_input, &log_sigmaspec)
+        gam_terms::smooth::build_term_collection_design(sigma_input, &log_sigmaspec)
             .map_err(|err| format!("failed to build survival log-sigma design: {err}"))?;
     let survival_noise_transform = scale_transform_from_payload(
         &model.survival_noise_projection,

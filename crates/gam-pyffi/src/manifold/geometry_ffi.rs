@@ -3692,7 +3692,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     // Install the same stderr logger used by the CLI so long-running Rust
     // solver phases (including survival marginal-slope joint-Newton cycles)
     // are visible from Python without requiring a separate shell.
-    gam::solver::visualizer::init_logging();
+    gam::solver::progress_log::init_logging();
     // Background process monitor: emits a `[process-monitor] elapsed=… rss=…`
     // line every 60s for the life of the process, so silent stretches
     // inside long PIRLS line-searches still surface a process-alive
@@ -4821,18 +4821,9 @@ fn fit_dataset_impl(
     config_json: Option<&str>,
     fisher_rao_w: Option<ArrayView3<'_, f64>>,
 ) -> Result<Vec<u8>, WorkflowError> {
-    // Always-on progress for the Python bindings: every gamfit fit call
-    // installs a visualizer session so the [OUTER step] log stream is
-    // accompanied by the `Workflow: Fit | step=N | objective=… (best=…,
-    // Δ=±…) | |grad|=…` lane and the `Descent: ▇▆▄▃▂▁` sparkline. The
-    // session goes through DumbVisualizer in Python land (stdout/stderr
-    // are virtually never TTYs under the gamfit import), so output is
-    // throttled stderr writes — safe for notebooks and batch scripts.
-    // Session is owned by this function so its Drop runs (clearing the
-    // static ACTIVE_FEED) before the result is handed back to Python.
-    let mut progress = gam::solver::visualizer::VisualizerSession::new(true);
-    progress.set_stage("fit", "optimizing penalized likelihood");
-    progress.start_workflow_open_ended("Fit");
+    // The stderr `[OUTER step]` log stream (installed by `progress_log::
+    // init_logging` at module import) carries solver progress for the Python
+    // bindings; the former always-on TUI session lane has been removed.
     let (mut fit_config, training_table_kind) = parse_fit_config(config_json)?;
     if let Some(w) = fisher_rao_w {
         inject_scalar_fisher_rao_weight(&mut dataset, &mut fit_config, w)?;
@@ -6381,7 +6372,7 @@ fn predict_table_jackknife_plus_impl(
         &col_map,
         "resolved_termspec",
     )?;
-    let design = gam::families::fit_orchestration::drivers::build_term_collection_design(dataset.values.view(), &spec)
+    let design = gam::terms::smooth::build_term_collection_design(dataset.values.view(), &spec)
         .map_err(|err| format!("jackknife+ conformal: failed to build test design: {err}"))?;
     let x_test = design
         .design
@@ -6498,7 +6489,7 @@ fn predict_table_full_conformal_impl(
         &col_map,
         "resolved_termspec",
     )?;
-    let design = gam::families::fit_orchestration::drivers::build_term_collection_design(dataset.values.view(), &spec)
+    let design = gam::terms::smooth::build_term_collection_design(dataset.values.view(), &spec)
         .map_err(|err| format!("full conformal: failed to build test design: {err}"))?;
     let x_test = design
         .design
@@ -6931,7 +6922,7 @@ fn design_matrix_dense(
         &col_map,
         "resolved_termspec",
     )?;
-    let design = gam::families::fit_orchestration::drivers::build_term_collection_design(dataset.values.view(), &spec)
+    let design = gam::terms::smooth::build_term_collection_design(dataset.values.view(), &spec)
         .map_err(|err| format!("failed to build design matrix: {err}"))?;
     let dense = design
         .design

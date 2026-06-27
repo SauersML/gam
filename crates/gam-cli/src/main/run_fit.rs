@@ -171,11 +171,6 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
         };
         return run_survival(surv_args);
     }
-    let mut progress = gam::visualizer::VisualizerSession::new(true);
-    let fit_total_steps = if args.out.is_some() { 5 } else { 4 };
-    progress.start_workflow("Fit", fit_total_steps);
-    progress.set_stage("fit", "parsing csv and inferring schema");
-    progress.start_secondary_workflow("Data Loading", 3);
     let requested_columns = required_columns_for_fit(&args, &parsed)?;
     // Force `group(g)` / `factor(g)` / `re(g)` grouping columns to a factor
     // encoding even when their labels are numeric. An untyped CSV cannot carry
@@ -187,8 +182,6 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
     // `s(x)` stay value-inferred, so a continuous integer covariate is untouched.
     let ds = load_fit_dataset_with_roles(&args.data, &requested_columns, &parsed, false)?;
     require_dataset_rows("fit", &args.data, ds.values.nrows())?;
-    progress.advance_secondary_workflow(1);
-    progress.advance_workflow(1);
 
     let col_map = ds.column_map();
 
@@ -234,8 +227,6 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
         }
         return run_fit_transformation_normal(
             &args,
-            &mut progress,
-            fit_total_steps,
             &ds,
             &col_map,
             &parsed,
@@ -251,8 +242,6 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
         }
         return run_fit_bernoulli_marginal_slope(
             &args,
-            &mut progress,
-            fit_total_steps,
             &ds,
             &col_map,
             &parsed,
@@ -432,7 +421,6 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
     }
     if let Some(noise_formula_raw) = &fit_config.noise_formula {
         return run_fitwith_predict_noise(
-            &mut progress,
             &args,
             &ds,
             &col_map,
@@ -453,7 +441,6 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
         );
     }
 
-    progress.set_stage("fit", "building term specification");
     // Shape-derived resource policy: at large-scale n we auto-select strict
     // (analytic-operator-required) so any silent dense fallback in the
     // term-construction layer fails fast.
@@ -477,9 +464,6 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
     let route_flexible_through_standard = link_choice.as_ref().is_some_and(|choice| {
         matches!(choice.mode, LinkMode::Flexible) && choice.mixture_components.is_none()
     });
-    progress.advance_secondary_workflow(2);
-    progress.finish_secondary_progress("dataset parsed and terms resolved");
-    progress.advance_workflow(2);
     let spatial_usagewarnings = collect_smooth_structure_warnings(&spec, &ds.headers, "model");
     emit_smooth_structure_warnings("fit-start", &spatial_usagewarnings);
     print_inference_summary(&inference_notes);
@@ -544,7 +528,6 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
             return Err("flexible(...) links currently require a binomial family/link".to_string());
         }
     }
-    progress.advance_workflow(3);
     let adaptive_opts = if fit_config.adaptive_regularization.unwrap_or(false) {
         Some(AdaptiveRegularizationOptions {
             enabled: true,
@@ -648,7 +631,6 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
     ) = if fit_config.firth && !firth_redundant_for_bounded {
         let design = build_term_collection_design(ds.values.view(), &spec)
             .map_err(|e| format!("failed to build term collection design: {e}"))?;
-        progress.set_stage("fit", "optimizing penalized likelihood");
         let ext = optimize_external_design(
             y.view(),
             weights.view(),
@@ -688,7 +670,6 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
             None,
         )
     } else {
-        progress.set_stage("fit", "optimizing penalized likelihood");
         let phase_start = std::time::Instant::now();
         log::info!(
             "[PHASE] standard-GAM fit start n={} family={:?}",
@@ -759,9 +740,7 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
                 scan.log_lambda,
                 scan.restricted_loglik,
             );
-            progress.advance_workflow(4);
             if let Some(out) = args.out {
-                progress.set_stage("fit", "writing fitted model");
                 let payload = assemble_spline_scan_payload(
                     formula_text,
                     feature_column,
@@ -771,10 +750,8 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
                     ds.feature_ranges(),
                 );
                 write_payload_json(&out, payload)?;
-                progress.advance_workflow(5);
             }
             emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
-            progress.finish_progress("fit complete");
             return Ok(());
         }
         // O(n log n) multiresolution residual-cascade fast path (#1032): a
@@ -832,9 +809,7 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
                     cascade_fit.restricted_loglik,
                     cert.solve_rel_residual,
                 );
-                progress.advance_workflow(4);
                 if let Some(out) = args.out {
-                    progress.set_stage("fit", "writing fitted model");
                     let payload = assemble_residual_cascade_payload(
                         formula_text,
                         feature_columns,
@@ -844,10 +819,8 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
                         ds.feature_ranges(),
                     )?;
                     write_payload_json(&out, payload)?;
-                    progress.advance_workflow(5);
                 }
                 emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
-                progress.finish_progress("fit complete");
                 return Ok(());
             }
             // Quasi-uniformity guard (caveat 2) or degenerate design: fall
@@ -908,7 +881,6 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
             },
         )
     };
-    progress.advance_workflow(4);
     print_spatial_aniso_scales(&resolvedspec);
 
     let frozenspec =
@@ -942,7 +914,6 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
     compact_fit_result_for_batch(&mut saved_fit);
 
     if let Some(out) = args.out {
-        progress.set_stage("fit", "writing fitted model");
         let latent_cloglog_state = if family.is_latent_cloglog() {
             Some(saved_latent_cloglog_state_from_fit(&saved_fit).expect(
                 "latent-cloglog-binomial fit must produce an explicit latent-cloglog state",
@@ -1037,18 +1008,14 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
             fit_config.noise_offset_column.clone(),
         );
         write_payload_json(&out, payload)?;
-        progress.advance_workflow(5);
     }
 
     emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
-    progress.finish_progress("fit complete");
     Ok(())
 }
 
 pub(crate) fn run_fit_bernoulli_marginal_slope(
     args: &FitArgs,
-    progress: &mut gam::visualizer::VisualizerSession,
-    fit_total_steps: usize,
     ds: &Dataset,
     col_map: &HashMap<String, usize>,
     parsed: &ParsedFormula,
@@ -1103,8 +1070,6 @@ pub(crate) fn run_fit_bernoulli_marginal_slope(
         "--logslope-formula",
     )?;
 
-    progress.set_stage("fit", "building marginal/logslope term specifications");
-    progress.start_secondary_workflow("Marginal/Slope Terms", 2);
     // Marginal-slope formulas may reference the literal placeholder `z` to
     // bind to the auxiliary score supplied via --z-column. Alias `z` in the
     // column map to the actual `z_column` index so build_termspec can resolve
@@ -1129,10 +1094,6 @@ pub(crate) fn run_fit_bernoulli_marginal_slope(
         enable_scale_dimensions(&mut marginalspec);
         enable_scale_dimensions(&mut logslopespec);
     }
-    progress.advance_secondary_workflow(2);
-    progress.finish_secondary_progress("marginal and logslope terms resolved");
-    progress.advance_workflow(2);
-
     let mut spatial_usagewarnings =
         collect_smooth_structure_warnings(&marginalspec, &ds.headers, "marginal model");
     spatial_usagewarnings.extend(collect_smooth_structure_warnings(
@@ -1197,7 +1158,6 @@ pub(crate) fn run_fit_bernoulli_marginal_slope(
         opts.pilot_subsample_threshold = args.pilot_subsample_threshold;
         opts
     };
-    progress.set_stage("fit", "optimizing bernoulli marginal-slope model");
     let phase_start = std::time::Instant::now();
     log::info!(
         "[PHASE] bernoulli-margslope fit start n={}",
@@ -1258,7 +1218,6 @@ pub(crate) fn run_fit_bernoulli_marginal_slope(
             return Err(format!("bernoulli marginal-slope fit failed: {e}"));
         }
     };
-    progress.advance_workflow(3);
 
     let frozen_marginal =
         freeze_term_collection_from_design(&solved.marginalspec_resolved, &solved.marginal_design)
@@ -1266,7 +1225,6 @@ pub(crate) fn run_fit_bernoulli_marginal_slope(
     let frozen_logslope =
         freeze_term_collection_from_design(&solved.logslopespec_resolved, &solved.logslope_design)
             .map_err(|e| e.to_string())?;
-    progress.advance_workflow(4);
     cli_out!(
         "model fit complete | family={} | outer_iter={} | status={}",
         FAMILY_BERNOULLI_MARGINAL_SLOPE,
@@ -1277,7 +1235,6 @@ pub(crate) fn run_fit_bernoulli_marginal_slope(
     print_spatial_aniso_scales(&solved.logslopespec_resolved);
 
     if let Some(out) = args.out.as_ref() {
-        progress.set_stage("fit", "writing bernoulli marginal-slope model");
         let save_frailty = match (&frailty, solved.gaussian_frailty_sd) {
             (
                 gam::families::survival::lognormal_kernel::FrailtySpec::GaussianShift {
@@ -1317,18 +1274,14 @@ pub(crate) fn run_fit_bernoulli_marginal_slope(
         model.offset_column = args.offset_column.clone();
         model.noise_offset_column = args.noise_offset_column.clone();
         write_model_json(out, &model)?;
-        progress.advance_workflow(fit_total_steps);
     }
 
     emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
-    progress.finish_progress("bernoulli marginal-slope fit complete");
     Ok(())
 }
 
 pub(crate) fn run_fit_transformation_normal(
     args: &FitArgs,
-    progress: &mut gam::visualizer::VisualizerSession,
-    fit_total_steps: usize,
     ds: &Dataset,
     col_map: &HashMap<String, usize>,
     parsed: &ParsedFormula,
@@ -1351,10 +1304,6 @@ pub(crate) fn run_fit_transformation_normal(
         return Err("--predict-noise cannot be combined with --transformation-normal".to_string());
     }
 
-    progress.set_stage(
-        "fit",
-        "building transformation-normal covariate specification",
-    );
     let mut covariate_spec = build_termspec(
         &parsed.terms,
         ds,
@@ -1381,7 +1330,6 @@ pub(crate) fn run_fit_transformation_normal(
         opts
     };
 
-    progress.set_stage("fit", "optimizing transformation-normal model");
     let phase_start = std::time::Instant::now();
     log::info!(
         "[PHASE] CTN(transformation-normal) fit start n={} cov_terms={}",
@@ -1420,10 +1368,8 @@ pub(crate) fn run_fit_transformation_normal(
         "[PHASE] CTN(transformation-normal) fit end elapsed={:.3}s",
         phase_start.elapsed().as_secs_f64()
     );
-    progress.advance_workflow(3);
 
     let frozen_covariate = solved.covariate_spec_resolved.clone();
-    progress.advance_workflow(4);
     cli_out!(
         "model fit complete | family={} | outer_iter={} | status={}",
         FAMILY_TRANSFORMATION_NORMAL,
@@ -1433,7 +1379,6 @@ pub(crate) fn run_fit_transformation_normal(
     print_spatial_aniso_scales(&solved.covariate_spec_resolved);
 
     if let Some(out) = args.out.as_ref() {
-        progress.set_stage("fit", "writing transformation-normal model");
         let mut model = build_transformation_normal_saved_model(
             formula_text.to_string(),
             ds.schema.clone(),
@@ -1447,16 +1392,13 @@ pub(crate) fn run_fit_transformation_normal(
         model.offset_column = args.offset_column.clone();
         model.noise_offset_column = args.noise_offset_column.clone();
         write_model_json(out, &model)?;
-        progress.advance_workflow(fit_total_steps);
     }
 
     emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
-    progress.finish_progress("transformation-normal fit complete");
     Ok(())
 }
 
 pub(crate) fn run_fitwith_predict_noise(
-    progress: &mut gam::visualizer::VisualizerSession,
     args: &FitArgs,
     ds: &Dataset,
     col_map: &HashMap<String, usize>,
@@ -1470,12 +1412,9 @@ pub(crate) fn run_fitwith_predict_noise(
     noise_formula_raw: &str,
     formula_text: &str,
 ) -> Result<(), String> {
-    let fit_total_steps = if args.out.is_some() { 5 } else { 4 };
     let (noise_formula, parsed_noise) =
         parse_matching_auxiliary_formula(noise_formula_raw, &parsed.response, "--predict-noise")?;
     validate_auxiliary_formula_controls(&parsed_noise, "--predict-noise")?;
-    progress.set_stage("fit", "building mean/noise term specifications");
-    progress.start_secondary_workflow("Mean/Noise Terms", 2);
     let mut noisespec = build_termspec(
         &parsed_noise.terms,
         ds,
@@ -1494,9 +1433,6 @@ pub(crate) fn run_fitwith_predict_noise(
         enable_scale_dimensions(&mut meanspec);
         enable_scale_dimensions(&mut noisespec);
     }
-    progress.advance_secondary_workflow(2);
-    progress.finish_secondary_progress("mean and noise terms resolved");
-    progress.advance_workflow(2);
     let mut spatial_usagewarnings =
         collect_smooth_structure_warnings(&meanspec, &ds.headers, "mean model");
     spatial_usagewarnings.extend(collect_smooth_structure_warnings(
@@ -1521,7 +1457,6 @@ pub(crate) fn run_fitwith_predict_noise(
         // response and receives coefficients/covariance/summary already in raw
         // response units — there is no CLI-side prefit or post-fit rescaling.
         let options = blockwise_options_from_fit_args()?;
-        progress.set_stage("fit", "optimizing gaussian location-scale model");
         let phase_start = std::time::Instant::now();
         log::info!(
             "[PHASE] gaussian-location-scale fit start n={}",
@@ -1567,7 +1502,6 @@ pub(crate) fn run_fitwith_predict_noise(
                 return Err(format!("gaussian location-scale fit failed: {e}"));
             }
         };
-        progress.advance_workflow(3);
         let wiggle_meta = match (
             solved.wiggle_knots,
             solved.wiggle_degree,
@@ -1593,7 +1527,6 @@ pub(crate) fn run_fitwith_predict_noise(
         let frozen_noisespec =
             freeze_term_collection_from_design(&noisespec_resolved, &noise_design)
                 .map_err(|e| e.to_string())?;
-        progress.advance_workflow(4);
         cli_out!(
             "model fit complete | family={} | outer_iter={} | status={}",
             FAMILY_GAUSSIAN_LOCATION_SCALE,
@@ -1603,7 +1536,6 @@ pub(crate) fn run_fitwith_predict_noise(
         print_spatial_aniso_scales(&meanspec_resolved);
         print_spatial_aniso_scales(&noisespec_resolved);
         if let Some(out) = args.out.as_ref() {
-            progress.set_stage("fit", "writing gaussian location-scale model");
             // `fit` already carries raw-unit coefficients, covariance, and a
             // raw-unit residual-scale summary (the standardization and its
             // inverse remap live in `fit_gaussian_location_scale_model`), so the
@@ -1662,10 +1594,8 @@ pub(crate) fn run_fitwith_predict_noise(
                 },
             )?;
             write_payload_json(out, payload)?;
-            progress.advance_workflow(fit_total_steps);
         }
         emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
-        progress.finish_progress("gaussian location-scale fit complete");
         return Ok(());
     }
 
@@ -1679,7 +1609,6 @@ pub(crate) fn run_fitwith_predict_noise(
             ));
         }
         let options = blockwise_options_from_fit_args()?;
-        progress.set_stage("fit", "optimizing dispersion location-scale model");
         let phase_start = std::time::Instant::now();
         log::info!(
             "[PHASE] dispersion-location-scale ({}) fit start n={}",
@@ -1721,7 +1650,6 @@ pub(crate) fn run_fitwith_predict_noise(
                 return Err(format!("dispersion location-scale fit failed: {e}"));
             }
         };
-        progress.advance_workflow(3);
         let fit = solved.fit.fit;
         let frozen_meanspec = freeze_term_collection_from_design(
             &solved.fit.meanspec_resolved,
@@ -1733,7 +1661,6 @@ pub(crate) fn run_fitwith_predict_noise(
             &solved.fit.noise_design,
         )
         .map_err(|e| e.to_string())?;
-        progress.advance_workflow(4);
         cli_out!(
             "model fit complete | family={} | outer_iter={} | status={}",
             kind.family_tag(),
@@ -1743,7 +1670,6 @@ pub(crate) fn run_fitwith_predict_noise(
         print_spatial_aniso_scales(&solved.fit.meanspec_resolved);
         print_spatial_aniso_scales(&solved.fit.noisespec_resolved);
         if let Some(out) = args.out.as_ref() {
-            progress.set_stage("fit", "writing dispersion location-scale model");
             let fit_result = compact_saved_multiblock_fit_result(
                 fit.blocks.clone(),
                 fit.lambdas.clone(),
@@ -1779,10 +1705,8 @@ pub(crate) fn run_fitwith_predict_noise(
                 },
             )?;
             write_payload_json(out, payload)?;
-            progress.advance_workflow(fit_total_steps);
         }
         emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
-        progress.finish_progress("dispersion location-scale fit complete");
         return Ok(());
     }
 
@@ -1821,7 +1745,6 @@ pub(crate) fn run_fitwith_predict_noise(
     }
 
     let options = blockwise_options_from_fit_args()?;
-    progress.set_stage("fit", "optimizing binomial location-scale model");
     let phase_start = std::time::Instant::now();
     log::info!(
         "[PHASE] binomial-location-scale fit start n={}",
@@ -1868,7 +1791,6 @@ pub(crate) fn run_fitwith_predict_noise(
             return Err(e.to_string());
         }
     };
-    progress.advance_workflow(3);
     if let (Some(knots), Some(degree)) = (solved.wiggle_knots.as_ref(), solved.wiggle_degree) {
         let final_q0 = compute_probit_q0_from_fit(&solved.fit.fit)?;
         let domain = summarizewiggle_domain(final_q0.view(), knots.view(), degree)?;
@@ -1906,7 +1828,6 @@ pub(crate) fn run_fitwith_predict_noise(
         &solved.fit.noise_design,
     )
     .map_err(|e| e.to_string())?;
-    progress.advance_workflow(4);
     cli_out!(
         "model fit complete | family={} | outer_iter={} | status={}",
         FAMILY_BINOMIAL_LOCATION_SCALE,
@@ -1916,7 +1837,6 @@ pub(crate) fn run_fitwith_predict_noise(
     print_spatial_aniso_scales(&solved.fit.meanspec_resolved);
     print_spatial_aniso_scales(&solved.fit.noisespec_resolved);
     if let Some(out) = args.out.as_ref() {
-        progress.set_stage("fit", "writing binomial location-scale model");
         let fit_result = compact_saved_multiblock_fit_result(
             fit.blocks.clone(),
             fit.lambdas.clone(),
@@ -1968,10 +1888,8 @@ pub(crate) fn run_fitwith_predict_noise(
             },
         )?;
         write_payload_json(out, payload)?;
-        progress.advance_workflow(fit_total_steps);
     }
     emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
-    progress.finish_progress("binomial location-scale fit complete");
     Ok(())
 }
 

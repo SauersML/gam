@@ -41,7 +41,6 @@ use gam::solver::mixture_link::{
 use gam::types::{
     InverseLink, LikelihoodSpec, ResponseFamily, RhoPrior, StandardLink, is_valid_tweedie_power,
 };
-use gam::visualizer::VisualizerSession;
 use general_mcmc::generic_hmc::HamiltonianTarget;
 pub use general_mcmc::generic_nuts::NUTSMassMatrixConfig;
 use general_mcmc::generic_nuts::{GenericNUTS, MassMatrixAdaptation};
@@ -118,74 +117,6 @@ impl fmt::Display for HmcError {
 impl From<HmcError> for String {
     fn from(err: HmcError) -> String {
         err.to_string()
-    }
-}
-
-struct SamplingVisualizer {
-    session: VisualizerSession,
-    chain: usize,
-    total_chains: usize,
-    warmup: usize,
-    samples: usize,
-}
-
-impl SamplingVisualizer {
-    fn new(stage: &str, total_chains: usize, warmup: usize, samples: usize) -> Self {
-        let mut session = VisualizerSession::new(true);
-        session.set_stage("sample", stage);
-        session.start_workflow(&format!("chains completed ({stage})"), total_chains.max(1));
-        Self {
-            session,
-            chain: 0,
-            total_chains,
-            warmup,
-            samples,
-        }
-    }
-
-    fn begin_chain(&mut self, chain: usize, label: &str) {
-        self.chain = chain;
-        self.session
-            .set_stage("sample", &format!("[Chain {}] {label}", chain + 1));
-        self.session
-            .start_workflow("chains completed", self.total_chains.max(1));
-        self.session.advance_workflow(chain);
-        self.session
-            .start_secondary_workflow(&format!("[Chain {}] Warmup", chain + 1), self.warmup);
-    }
-
-    fn warmup_step(&mut self, iter: usize) {
-        self.session
-            .advance_secondary_workflow(iter.min(self.warmup));
-    }
-
-    fn start_sampling(&mut self) {
-        self.session
-            .finish_secondary_progress(&format!("chain {} warmup complete", self.chain + 1));
-        self.session
-            .start_secondary_workflow(&format!("[Chain {}] Sample", self.chain + 1), self.samples);
-    }
-
-    fn sample_step(&mut self, iter: usize) {
-        self.session
-            .advance_secondary_workflow(iter.min(self.samples));
-    }
-
-    fn finish_chain(&mut self, accept_rate: f64) {
-        self.session.finish_secondary_progress(&format!(
-            "chain {} sample complete | accepted {:.1}%",
-            self.chain + 1,
-            accept_rate * 100.0
-        ));
-        self.session
-            .advance_workflow((self.chain + 1).min(self.total_chains));
-    }
-
-    fn finish_all(&mut self, rhat: f64, ess: f64) {
-        self.session.push_diagnostic(&format!(
-            "sampling diagnostics | rhat={rhat:.3} | ess={ess:.1}"
-        ));
-        self.session.finish_progress("sampling complete");
     }
 }
 
@@ -4546,15 +4477,8 @@ pub fn run_logit_polya_gamma_gibbs(
     let mut mean = Array1::<f64>::zeros(p);
     let mut z = Array1::<f64>::zeros(p);
     let mut noise = Array1::<f64>::zeros(p);
-    let mut progress = SamplingVisualizer::new(
-        "polya-gamma gibbs",
-        config.n_chains,
-        config.nwarmup,
-        config.n_samples,
-    );
 
     for chain in 0..config.n_chains {
-        progress.begin_chain(chain, "polya-gamma gibbs");
         let mut init_rng =
             StdRng::seed_from_u64(chain_stream_seed(config.seed, chain, 0xB3C4_5A1F_8E9D_7632));
         let mut draw_rng =
@@ -4603,20 +4527,13 @@ pub fn run_logit_polya_gamma_gibbs(
             back_substitution_lower_transpose_guarded_into(&l, &z, &mut noise);
             beta.assign(&(&mean + &noise));
 
-            if iter < config.nwarmup {
-                progress.warmup_step(iter + 1);
-            } else {
-                if iter == config.nwarmup {
-                    progress.start_sampling();
-                }
+            if iter >= config.nwarmup {
                 let keep_idx = iter - config.nwarmup;
-                progress.sample_step(keep_idx + 1);
                 samples_array
                     .slice_mut(ndarray::s![chain, keep_idx, ..])
                     .assign(&beta);
             }
         }
-        progress.finish_chain(1.0);
     }
 
     let total_samples = config.n_chains * config.n_samples;
@@ -4640,7 +4557,6 @@ pub fn run_logit_polya_gamma_gibbs(
         (1.0, (total_samples as f64) * 0.5)
     };
     let converged = rhat < 1.1 && ess > 100.0;
-    progress.finish_all(rhat, ess);
 
     Ok(NutsResult {
         samples,

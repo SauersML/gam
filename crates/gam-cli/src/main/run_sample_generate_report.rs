@@ -4,15 +4,9 @@ pub(crate) fn run_sample(args: SampleArgs) -> Result<(), String> {
     validate_positive_optional_usize("--chains", args.chains)?;
     validate_positive_optional_usize("--samples", args.samples)?;
     validate_positive_optional_usize("--warmup", args.warmup)?;
-    let mut progress = gam::visualizer::VisualizerSession::new(true);
-    progress.start_workflow("Sample", 5);
-    progress.set_stage("sample", "loading fitted model");
     let model = SavedModel::load_from_path(&args.model)?;
-    progress.advance_workflow(1);
-    progress.set_stage("sample", "loading sampling data");
     let ds = load_datasetwith_model_schema_for_diagnostics(&args.data, &model)?;
     require_dataset_rows("sample", &args.data, ds.values.nrows())?;
-    progress.advance_workflow(2);
     let col_map = ds.column_map();
     let training_headers = model.training_headers.as_ref();
     let n_base_params = model
@@ -29,8 +23,6 @@ pub(crate) fn run_sample(args: SampleArgs) -> Result<(), String> {
         ..adaptive
     };
 
-    progress.set_stage("sample", "running posterior sampling");
-    progress.teardown();
     // Unified dispatch over saved model class; the inference::sample module
     // routes Survival/Standard to their NUTS paths and every other class to
     // the Laplace-Gaussian fallback.
@@ -45,10 +37,6 @@ pub(crate) fn run_sample(args: SampleArgs) -> Result<(), String> {
     let out = args
         .out
         .unwrap_or_else(|| default_output_path_from_model(&args.model, ".posterior.csv"));
-    let mut progress = gam::visualizer::VisualizerSession::new(true);
-    progress.start_workflow("Sample", 5);
-    progress.advance_workflow(4);
-    progress.set_stage("sample", "writing posterior draws");
 
     let n_coeffs = nuts.samples.ncols();
     let coeff_name = |j: usize| -> String { format!("beta_{j}") };
@@ -72,8 +60,6 @@ pub(crate) fn run_sample(args: SampleArgs) -> Result<(), String> {
         wtr.flush()
             .map_err(|e| format!("failed to flush posterior samples csv: {e}"))?;
     }
-    progress.advance_workflow(5);
-    progress.finish_progress("sampling complete");
     cli_out!(
         "wrote posterior samples: {} (rows={}, cols={})",
         out.display(),
@@ -158,11 +144,7 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<(), String> {
     if args.n_draws == 0 {
         return Err("--n-draws must be > 0".to_string());
     }
-    let mut progress = gam::visualizer::VisualizerSession::new(true);
-    progress.start_workflow("Generate", 5);
-    progress.set_stage("generate", "loading fitted model");
     let model = SavedModel::load_from_path(&args.model)?;
-    progress.advance_workflow(1);
 
     if model.predict_model_class() == PredictModelClass::Survival {
         return Err(
@@ -171,10 +153,8 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<(), String> {
         );
     }
 
-    progress.set_stage("generate", "loading conditioning data");
     let ds = load_datasetwith_model_schema(&args.data, &model)?;
     require_dataset_rows("generate", &args.data, ds.values.nrows())?;
-    progress.advance_workflow(2);
     let col_map = ds.column_map();
     let training_headers = model.training_headers.as_ref();
     let (saved_offset_column, saved_noise_offset_column) = saved_offset_columns(&model);
@@ -185,9 +165,7 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<(), String> {
         saved_offset_column,
         saved_noise_offset_column,
     )?;
-    progress.set_stage("generate", "building predictive state");
     let spec = run_generate_unified(
-        &mut progress,
         &model,
         ds.values.view(),
         &col_map,
@@ -196,18 +174,14 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<(), String> {
         &generate_noise_offset,
         saved_noise_offset_column.is_some(),
     )?;
-    progress.advance_workflow(3);
 
     let mut rng = StdRng::seed_from_u64(args.seed.unwrap_or(42));
-    progress.set_stage("generate", "sampling synthetic observations");
     let draws = sampleobservation_replicates(&spec, args.n_draws, &mut rng)
         .map_err(|e| format!("failed to sample synthetic observations: {e}"))?;
-    progress.advance_workflow(4);
 
     let out = args
         .out
         .unwrap_or_else(|| default_output_path_from_model(&args.model, ".generated.csv"));
-    progress.set_stage("generate", "writing synthetic draws");
     // `sampleobservation_replicates` returns shape (n_draws, nobs): each
     // row is one synthetic observation vector. The natural CSV layout for
     // users is: one row per input row, one column per draw — so column
@@ -217,8 +191,6 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<(), String> {
     // column was really an observation index.
     let draws_per_row = draws.t().to_owned();
     write_matrix_csv(&out, &draws_per_row, "draw")?;
-    progress.advance_workflow(5);
-    progress.finish_progress("generation complete");
     cli_out!(
         "wrote synthetic draws: {} (input_rows={}, draws={})",
         out.display(),
@@ -250,7 +222,6 @@ pub(crate) fn saved_likelihood_spec_for_generate(
 /// all other families derive their observation model from
 /// `generativespec_from_predict`.
 pub(crate) fn run_generate_unified(
-    progress: &mut gam::visualizer::VisualizerSession,
     model: &SavedModel,
     data: ndarray::ArrayView2<'_, f64>,
     col_map: &HashMap<String, usize>,
@@ -259,8 +230,6 @@ pub(crate) fn run_generate_unified(
     offset_noise: &Array1<f64>,
     noise_offset_supplied: bool,
 ) -> Result<gam::generative::GenerativeSpec, String> {
-    progress.set_stage("generate", "building unified generation design");
-
     let pred_input = build_predict_input_for_model(
         model,
         data,
@@ -363,14 +332,11 @@ pub(crate) fn run_generate_unified(
 /// — the headline EDF / λ / REML / deviance are recovered exactly from the
 /// saved `SplineScanFit`, matching the FFI `summary()` path.
 pub(crate) fn run_report_spline_scan(
-    mut progress: gam::visualizer::VisualizerSession,
     args: &ReportArgs,
     model: &SavedModel,
     feature_column: &str,
     scan: &gam::solver::spline_scan::SplineScanFit,
 ) -> Result<(), String> {
-    progress.advance_workflow(1);
-    progress.set_stage("report", "generating html");
     let mut notes = vec![format!(
         "Exact O(n) state-space spline scan for s({feature_column}): \
          λ={:.4e}, EDF={:.3}, knots={}. The smoother retains the per-knot \
@@ -417,20 +383,16 @@ pub(crate) fn run_report_spline_scan(
         notes,
     };
     let out = report::write_report(&input, args.out.as_deref(), &args.model)?;
-    progress.finish_progress("report complete");
     cli_out!("wrote report: {}", out.display());
     Ok(())
 }
 
 pub(crate) fn run_report_residual_cascade(
-    mut progress: gam::visualizer::VisualizerSession,
     args: &ReportArgs,
     model: &SavedModel,
     feature_columns: &[String],
     fit: &gam::solver::residual_cascade::ResidualCascadeFit,
 ) -> Result<(), String> {
-    progress.advance_workflow(1);
-    progress.set_stage("report", "generating html");
     let lambda = fit.log_lambda.exp();
     let mut notes = vec![format!(
         "Exact O(n log n) multiresolution residual cascade for s({features}): \
@@ -490,7 +452,6 @@ pub(crate) fn run_report_residual_cascade(
         notes,
     };
     let out = report::write_report(&input, args.out.as_deref(), &args.model)?;
-    progress.finish_progress("report complete");
     cli_out!("wrote report: {}", out.display());
     Ok(())
 }
@@ -498,10 +459,6 @@ pub(crate) fn run_report_residual_cascade(
 pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
     use gam::probability::standard_normal_quantile;
 
-    let mut progress = gam::visualizer::VisualizerSession::new(true);
-    let report_total_steps = if args.data.is_some() { 5 } else { 3 };
-    progress.start_workflow("Report", report_total_steps);
-    progress.set_stage("report", "loading fitted model");
     let model = SavedModel::load_from_path(&args.model)?;
     // Spline-scan model (#1030/#1034/#1046): no dense fit_result exists — the
     // exact O(n) state-space smoother keeps only the per-knot posterior. Render
@@ -512,7 +469,7 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .map(|(c, f)| (c.to_string(), f))
     {
-        return run_report_spline_scan(progress, &args, &model, &feature_column, &scan);
+        return run_report_spline_scan(&args, &model, &feature_column, &scan);
     }
     // Residual-cascade model (#1032): the multi-resolution analogue of the
     // spline scan. The exact O(n log n) multilevel Wendland smoother keeps only
@@ -523,11 +480,10 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .map(|(c, f)| (c.to_vec(), f))
     {
-        return run_report_residual_cascade(progress, &args, &model, &feature_columns, &fit);
+        return run_report_residual_cascade(&args, &model, &feature_columns, &fit);
     }
     let family = model.likelihood();
     let fit = fit_result_from_saved_model_for_prediction(&model)?;
-    progress.advance_workflow(1);
 
     let beta_se = fit
         .beta_standard_errors_corrected()
@@ -598,10 +554,8 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
     let mut r_squared = None;
 
     if let Some(data_path) = args.data.as_ref() {
-        progress.set_stage("report", "loading report dataset");
         let ds = load_datasetwith_model_schema_for_diagnostics(data_path, &model)?;
         require_dataset_rows("report", data_path, ds.values.nrows())?;
-        progress.advance_workflow(2);
 
         let col_map = ds.column_map();
         let training_headers = model.training_headers.as_ref();
@@ -629,8 +583,6 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
                         &report_noise_offset,
                         saved_noise_offset_column.is_some(),
                     )?;
-                    progress.set_stage("report", "building report diagnostics design");
-                    progress.advance_workflow(3);
                     let pred = predictor
                         .predict_plugin_response(&pred_input)
                         .map_err(|e| format!("prediction for report diagnostics failed: {e}"))?;
@@ -683,10 +635,8 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
                     &col_map,
                     "resolved_termspec",
                 )?;
-                progress.set_stage("report", "building report diagnostics design");
                 let design = build_term_collection_design(ds.values.view(), &spec)
                     .map_err(|e| format!("failed to build design for report diagnostics: {e}"))?;
-                progress.advance_workflow(3);
 
                 let (offset, _report_noise_offset) = report_offset_for(&model, &ds, &col_map)?;
                 let pred = predict_gam(
@@ -946,7 +896,6 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
              Pass training data as the second positional argument."
                 .to_string(),
         );
-        progress.advance_workflow(2);
     }
 
     // The realized band is frozen onto the saved spec, so the measure-jet
@@ -957,7 +906,6 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
         measure_jet_spectra = measure_jet_spectrum_rows_from_spec(model.resolved_termspec.as_ref());
     }
 
-    progress.set_stage("report", "generating html");
     let input = report::ReportInput {
         model_path: args.model.display().to_string(),
         family_name: family.pretty_name().to_string(),
@@ -1000,8 +948,6 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
     };
     let out = report::write_report(&input, args.out.as_deref(), &args.model)?;
 
-    progress.advance_workflow(report_total_steps);
-    progress.finish_progress("report complete");
     cli_out!("wrote report: {}", out.display());
 
     // Terminal quick-look: a unicode sparkline of each smooth term's fitted

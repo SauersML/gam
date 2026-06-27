@@ -103,8 +103,10 @@ pub(crate) use gam::smooth::{
     TermCollectionSpec, analyze_smooth_ownership, smooth_term_feature_cols,
 };
 pub(crate) use gam::families::fit_orchestration::drivers::{
-    build_term_collection_design, fit_term_collection_forspec, freeze_term_collection_from_design,
+    fit_term_collection_forspec, freeze_term_collection_from_design,
 };
+// #1521: relocated DOWN into gam_terms::smooth (was families::...::drivers).
+pub(crate) use gam::terms::smooth::build_term_collection_design;
 
 pub(crate) use gam::smooth_test::SmoothTestScale;
 
@@ -309,7 +311,7 @@ fn run() -> CliResult<()> {
     // Parse first so `--help` / `--version` exit cleanly without spawning the
     // runtime-threads INFO line clap can't suppress.
     let cli = Cli::parse();
-    gam::visualizer::init_logging();
+    gam::progress_log::init_logging();
     log::info!(
         "[STAGE] runtime threads | rayon_current_num_threads={} | std_available_parallelism={}",
         rayon::current_num_threads(),

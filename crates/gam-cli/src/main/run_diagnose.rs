@@ -1,8 +1,6 @@
 use super::*;
 
 pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
-    let mut progress = gam::visualizer::VisualizerSession::new(true);
-    progress.start_workflow("Diagnose", 5);
     // `diagnose` currently has exactly one implemented diagnostic: ALO. Rather
     // than erroring with "only --alo is currently implemented for diagnose"
     // when the user runs the bare subcommand, just run ALO. This is the
@@ -11,9 +9,7 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     // diagnostics land, this path can route based on explicit flags.
     // (`args.alo` is intentionally ignored until other diagnostics land.)
 
-    progress.set_stage("diagnose", "loading fitted model");
     let model = SavedModel::load_from_path(&args.model)?;
-    progress.advance_workflow(1);
     let parsed = parse_formula(&model.formula)?;
     // Survival / location-scale / marginal-slope models don't have a single
     // bare-column response, so the lookup below would fail with the cryptic
@@ -57,10 +53,8 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
                 .to_string(),
         );
     }
-    progress.set_stage("diagnose", "loading diagnostic dataset");
     let ds = load_datasetwith_model_schema_for_diagnostics(&args.data, &model)?;
     require_dataset_rows("diagnose", &args.data, ds.values.nrows())?;
-    progress.advance_workflow(2);
     let col_map = ds.column_map();
     let training_headers = model.training_headers.as_ref();
     let family = model.likelihood();
@@ -73,10 +67,8 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
         &col_map,
         "resolved_termspec",
     )?;
-    progress.set_stage("diagnose", "building diagnostic design");
     let design = build_term_collection_design(ds.values.view(), &spec)
         .map_err(|e| format!("failed to build term collection design: {e}"))?;
-    progress.advance_workflow(3);
 
     let link = family.link_function();
     let weights = Array1::ones(ds.values.nrows());
@@ -96,7 +88,6 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
         .unified()
         .and_then(|u| u.geometry.as_ref().map(|g| (u, g)))
     {
-        progress.set_stage("diagnose", "computing alo from saved geometry");
         let fit_saved = fit_result_from_saved_model_for_prediction(&model)?;
         // ALO's `from_geometry` expects the *full* linear predictor (offset
         // included); it re-centres internally via the separate `offset` arg to
@@ -115,11 +106,9 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
         let phi = geometry_alo_phi(unified, link);
         let input =
             gam::alo::AloInput::from_geometry(geom, &alo_design_dense, &eta, &offset, link, phi);
-        progress.advance_workflow(4);
         gam::alo::compute_alo_from_input(&input)
             .map_err(|e| format!("compute_alo_from_input (geometry path) failed: {e}"))?
     } else {
-        progress.set_stage("diagnose", "refitting model for alo");
         let fit_options = FitOptions {
             latent_cloglog: None,
             mixture_link: None,
@@ -191,7 +180,6 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
             }
         };
 
-        progress.advance_workflow(4);
         alo_result?
     };
 
@@ -271,7 +259,5 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
         cli_out!("{summary}");
     }
 
-    progress.advance_workflow(5);
-    progress.finish_progress("diagnostics complete");
     Ok(())
 }

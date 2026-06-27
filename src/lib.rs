@@ -232,7 +232,7 @@ pub use solver::estimate::reml::per_atom_efs::{
     PerAtomEfsConfig, SharedBorderTopology, run_per_atom_efs,
 };
 pub use solver::{
-    estimate, gaussian_reml, mixture_link, pirls, seeding, topology_selector, visualizer,
+    estimate, gaussian_reml, mixture_link, pirls, progress_log, seeding, topology_selector,
 };
 pub use terms::{basis, construction, smooth, term_builder};
 

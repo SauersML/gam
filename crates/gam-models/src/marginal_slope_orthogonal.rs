@@ -44,7 +44,7 @@ use gam_linalg::matrix::FactorizedSystem;
 use crate::probability::{
     log1mexp_positive, normal_cdf, normal_logcdf, normal_pdf, standard_normal_quantile,
 };
-use crate::fit_orchestration::drivers::build_term_collection_design;
+use gam_terms::smooth::build_term_collection_design;
 use faer::Side;
 use ndarray::{Array1, Array2, ArrayView2};
 

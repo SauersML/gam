@@ -114,9 +114,9 @@ pub(crate) use gam::report::{CoefficientRow, EdfBlockRow, ReportInput, render_ht
 pub(crate) use gam::terms::smooth::{
     TermCollectionDesign, TermCollectionSpec, smooth_term_feature_cols,
 };
-pub(crate) use gam::families::fit_orchestration::drivers::{
-    build_term_collection_design, freeze_term_collection_from_design,
-};
+pub(crate) use gam::families::fit_orchestration::drivers::freeze_term_collection_from_design;
+// #1521: relocated DOWN into gam_terms::smooth (was families::...::drivers).
+pub(crate) use gam::terms::smooth::build_term_collection_design;
 
 pub(crate) use gam::families::fit_orchestration::descriptors::build_analytic_penalty_registry_from_descriptors as build_analytic_penalty_registry_from_json;
 

@@ -29,6 +29,7 @@ pub mod parallel_strategy;
 pub mod persistent_warm_start;
 pub mod pirls;
 pub(crate) mod priority_selection;
+pub mod progress_log;
 pub mod psi_gram_tensor;
 // Pareto-smoothed importance sampling (descended #1521): leaf numerics with no
 // crate-internal dependencies, consumed by `reml::objective`, `rho_uncertainty`,
@@ -59,7 +60,6 @@ pub mod streaming_border;
 pub mod structure_search;
 pub mod topology_formula;
 pub mod topology_selector;
-pub mod visualizer;
 pub(crate) mod warm_start_artifact;
 pub(crate) mod warm_start_transfer;
 

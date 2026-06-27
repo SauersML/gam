@@ -426,7 +426,7 @@ fn posterior_predict_table_impl(
         &col_map,
         "resolved_termspec",
     )?;
-    let design = gam::families::fit_orchestration::drivers::build_term_collection_design(dataset.values.view(), &spec)
+    let design = gam::terms::smooth::build_term_collection_design(dataset.values.view(), &spec)
         .map_err(|err| format!("failed to build design matrix: {err}"))?;
     let base_dense = design
         .design
@@ -1999,7 +1999,7 @@ fn summary_smooth_terms(
     // levels in those columns so `fs`/`sz` designs replay cleanly.
     let factor_levels = frozen_factor_levels_by_col(spec);
     let data = representative_data_from_ranges(ranges, &factor_levels);
-    let Ok(design) = gam::families::fit_orchestration::drivers::build_term_collection_design(data.view(), spec) else {
+    let Ok(design) = gam::terms::smooth::build_term_collection_design(data.view(), spec) else {
         return Vec::new();
     };
 
