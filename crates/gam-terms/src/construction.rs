@@ -33,7 +33,8 @@ pub enum PenaltyRepresentation {
 }
 
 impl PenaltyRepresentation {
-    fn block_dimension(&self) -> usize {
+    /// Side length of the square penalty block this representation expands to.
+    pub fn block_dimension(&self) -> usize {
         match self {
             PenaltyRepresentation::Dense(matrix) => matrix.nrows(),
             PenaltyRepresentation::Banded { bands, offsets } => {
@@ -53,7 +54,9 @@ impl PenaltyRepresentation {
         }
     }
 
-    fn to_block_dense(&self) -> Array2<f64> {
+    /// Materialize this representation (Dense / Banded / Kronecker) into a
+    /// single dense symmetric penalty block.
+    pub fn to_block_dense(&self) -> Array2<f64> {
         match self {
             PenaltyRepresentation::Dense(matrix) => matrix.clone(),
             PenaltyRepresentation::Banded { bands, offsets } => {
