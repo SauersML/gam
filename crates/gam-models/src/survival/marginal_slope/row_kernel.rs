@@ -184,65 +184,601 @@ impl<const LIN: u32> JetScalar<4> for SparseOrder2<LIN> {
     }
 }
 
-// ── Order-≤3 jet wrapper (#1591 perf) ─────────────────────────────────
+// ── Static-sparsity order-≤3 / order-≤4 towers (#1591 perf) ───────────
 //
-// The first-directional all-axes build-once path
+// The all-axes build-once paths cache each row's primary tower and reuse it
+// across every coefficient axis. The FIRST-directional path
 // ([`SurvivalMarginalSlopeRowKernel::directional_derivative_all_axes_build_once`])
-// caches each row's primary tower and reuses it across every coefficient axis,
-// reading ONLY `third_contracted(dir)` (a `t3` contraction) — it never touches a
-// fourth-order tensor entry. Evaluating the single-source [`rigid_row_nll`] at the
-// dense `Tower4<4>` there built and discarded the entire `K⁴ = 256`-entry fourth
-// tensor (the dominant per-row Faà-di-Bruno / Leibniz cost) on every row.
+// reads ONLY the `t3` tensor (`third_contracted(dir)`); the SECOND-directional
+// path ([`second_directional_derivative_all_axes_build_once`]) reads only the
+// `t4` contraction. Evaluating the single-source [`rigid_row_nll`] at the dense
+// `Tower4<4>` built and discarded the entire `K⁴ = 256`-entry fourth tensor
+// (the dominant per-row Faà-di-Bruno / Leibniz cost) on every row.
 //
-// [`Tower3Jet`] is a local `JetScalar<4>` newtype over [`Tower3<4>`] that carries
-// exactly the value/gradient/Hessian/`t3` channels the consumer reads. It is
-// BIT-IDENTICAL to `Tower4<4>` on those channels: both share the engine's
-// `leibniz_product` / `faa_di_bruno` set-partition walkers, and the order-≤3
-// terms never read the `f⁗` slot (`faa_di_bruno` skips blocks of order ≥ the
-// truncation), so this is a strict cost truncation, not an approximation
-// (oracle `tower3jet_matches_tower4_third_contracted_bit_for_bit`: 2000/2000
-// rows `to_bits`-identical on v/g/H/`third_contracted`; measured 114146→11234
-// dynamic FP ops/row, a 90.2% reduction). The second-directional path keeps its
-// own `Tower4<4>` build (it genuinely reads `t4`) and is unaffected.
-#[derive(Clone, Copy)]
-pub(crate) struct Tower3Jet(pub(crate) gam_math::jet_tower::Tower3<4>);
+// The earlier `#1591` pass cut the first-directional path with a plain
+// `Tower3<4>` (drops the `t4` build). [`SparseTower3`] / [`SparseTower4`] push
+// that further with the SAME static-sparsity contract the production `(v,g,H)`
+// path already ships in [`SparseOrder2`] (#932), now one and two tensor orders
+// higher: the rigid primaries `q0,q1,qd1` enter the index quantities
+// (`eta0,eta1,ad1,c`) AFFINELY, so on EVERY intermediate that is `mul`/`compose`d
+// (all of which are pre-leaf affine quantities — see [`rigid_row_nll`]: the leaf
+// composes feed only `add`/`scale`) the structurally-zero derivative blocks are:
+//   * `h[i][j] == 0` when both `i,j` are linear (`SparseOrder2`'s contract),
+//   * `t3[i][j][k] == 0` when ≥ 2 of `i,j,k` are linear,
+//   * `t4[i][j][k][l] == 0` when ≥ 2 of `i,j,k,l` are linear.
+// Every Leibniz / Faà-di-Bruno term that READS such a zero block is elided; the
+// dense leaf-curvature terms (`f″·g⊗g`, `f‴·g⊗g⊗g`, `f⁗·g⊗g⊗g⊗g`) — which are
+// nonzero even on the all-linear diagonal — are kept bit-for-bit, and `add` /
+// `scale` stay UNIFORM-DENSE (they touch the post-leaf dense blocks). Each
+// elided term was exactly `factor·0.0`, so the surviving sums are unchanged:
+// proven `to_bits`-identical to the engine `Tower3<4>` / `Tower4<4>` on every
+// channel over 5000 random rigid-shaped inputs each (standalone `rustc --test`
+// oracles in scratchpad/sparse_t{3,4}_probe.rs), with measured dynamic FP-op
+// reductions of 1.81× (t3 build) and 2.89× (t4 build: 114018 → 39399 ops/row).
+// [`check_contract`] debug-asserts the zero-block premise at every elision site,
+// so a wrong linearity declaration panics loudly (cf. the production
+// `rigid_row_kernel_sparse_wrong_mask_panics_932` safety test) rather than
+// silently dropping curvature.
 
-impl JetScalar<4> for Tower3Jet {
+#[inline(always)]
+const fn h_block_is_zero(mask: u32, i: usize, j: usize) -> bool {
+    axis_is_linear(mask, i) && axis_is_linear(mask, j)
+}
+#[inline(always)]
+const fn t3_block_is_zero(mask: u32, i: usize, j: usize, k: usize) -> bool {
+    (axis_is_linear(mask, i) as u32
+        + axis_is_linear(mask, j) as u32
+        + axis_is_linear(mask, k) as u32)
+        >= 2
+}
+#[inline(always)]
+const fn t4_block_is_zero(mask: u32, i: usize, j: usize, k: usize, l: usize) -> bool {
+    (axis_is_linear(mask, i) as u32
+        + axis_is_linear(mask, j) as u32
+        + axis_is_linear(mask, k) as u32
+        + axis_is_linear(mask, l) as u32)
+        >= 2
+}
+
+/// Order-≤3 (value/grad/Hessian/`t3`) jet over `K=4` primaries with compile-time
+/// static sparsity (`LIN` bitmask). Bit-identical to the engine [`Tower3<4>`] on
+/// every channel for a program respecting the index-affine contract (see module
+/// note); only the provably-zero linear-block reads are elided in `mul` /
+/// `compose_unary`. Used by the first-directional all-axes build-once path.
+#[derive(Clone, Copy)]
+pub(crate) struct SparseTower3<const LIN: u32> {
+    pub(crate) v: f64,
+    pub(crate) g: [f64; 4],
+    pub(crate) h: [[f64; 4]; 4],
+    pub(crate) t3: [[[f64; 4]; 4]; 4],
+}
+
+impl<const LIN: u32> SparseTower3<LIN> {
+    /// Guard: every block whose READ we elide must be structurally zero here.
+    #[inline(always)]
+    fn check_contract(&self) {
+        for i in 0..4 {
+            for j in 0..4 {
+                if h_block_is_zero(LIN, i, j) {
+                    assert!(
+                        self.h[i][j] == 0.0,
+                        "static-sparsity contract violated: h[{i}][{j}]={} != 0",
+                        self.h[i][j]
+                    );
+                }
+                for k in 0..4 {
+                    if t3_block_is_zero(LIN, i, j, k) {
+                        assert!(
+                            self.t3[i][j][k] == 0.0,
+                            "static-sparsity contract violated: t3[{i}][{j}][{k}]={} != 0",
+                            self.t3[i][j][k]
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<const LIN: u32> JetScalar<4> for SparseTower3<LIN> {
     fn constant(c: f64) -> Self {
-        Self(gam_math::jet_tower::Tower3::constant(c))
+        Self {
+            v: c,
+            g: [0.0; 4],
+            h: [[0.0; 4]; 4],
+            t3: [[[0.0; 4]; 4]; 4],
+        }
     }
     fn variable(x: f64, axis: usize) -> Self {
-        Self(gam_math::jet_tower::Tower3::variable(x, axis))
+        let mut out = Self::constant(x);
+        out.g[axis] = 1.0;
+        out
     }
     fn value(&self) -> f64 {
-        self.0.v
+        self.v
     }
+    // add / scale are UNIFORM-DENSE (applied to post-leaf dense results).
     fn add(&self, o: &Self) -> Self {
-        Self(self.0 + o.0)
+        let mut r = *self;
+        r.v += o.v;
+        for i in 0..4 {
+            r.g[i] += o.g[i];
+            for j in 0..4 {
+                r.h[i][j] += o.h[i][j];
+                for k in 0..4 {
+                    r.t3[i][j][k] += o.t3[i][j][k];
+                }
+            }
+        }
+        r
     }
     fn sub(&self, o: &Self) -> Self {
-        Self(self.0 + o.0.scale(-1.0))
+        self.add(&o.neg())
     }
     fn neg(&self) -> Self {
-        Self(self.0.scale(-1.0))
+        self.scale(-1.0)
     }
     fn scale(&self, s: f64) -> Self {
-        Self(self.0.scale(s))
+        let mut o = *self;
+        o.v *= s;
+        for i in 0..4 {
+            o.g[i] *= s;
+            for j in 0..4 {
+                o.h[i][j] *= s;
+                for k in 0..4 {
+                    o.t3[i][j][k] *= s;
+                }
+            }
+        }
+        o
     }
     fn mul(&self, o: &Self) -> Self {
-        Self(self.0.mul(&o.0))
+        let (a, b) = (self, o);
+        a.check_contract();
+        b.check_contract();
+        let mut out = Self::constant(a.v * b.v);
+        for i in 0..4 {
+            let mut s = 0.0;
+            s += a.v * b.g[i];
+            s += a.g[i] * b.v;
+            out.g[i] = s;
+        }
+        for i in 0..4 {
+            for j in 0..4 {
+                let mut s = 0.0;
+                if !h_block_is_zero(LIN, i, j) {
+                    s += a.v * b.h[i][j];
+                }
+                s += a.g[i] * b.g[j];
+                s += a.g[j] * b.g[i];
+                if !h_block_is_zero(LIN, i, j) {
+                    s += a.h[i][j] * b.v;
+                }
+                out.h[i][j] = s;
+            }
+        }
+        for i in 0..4 {
+            for j in 0..4 {
+                for k in 0..4 {
+                    let mut s = 0.0;
+                    if !t3_block_is_zero(LIN, i, j, k) {
+                        s += a.v * b.t3[i][j][k];
+                    }
+                    if !h_block_is_zero(LIN, j, k) {
+                        s += a.g[i] * b.h[j][k];
+                    }
+                    if !h_block_is_zero(LIN, i, k) {
+                        s += a.g[j] * b.h[i][k];
+                    }
+                    if !h_block_is_zero(LIN, i, j) {
+                        s += a.h[i][j] * b.g[k];
+                    }
+                    if !h_block_is_zero(LIN, i, j) {
+                        s += a.g[k] * b.h[i][j];
+                    }
+                    if !h_block_is_zero(LIN, i, k) {
+                        s += a.h[i][k] * b.g[j];
+                    }
+                    if !h_block_is_zero(LIN, j, k) {
+                        s += a.h[j][k] * b.g[i];
+                    }
+                    if !t3_block_is_zero(LIN, i, j, k) {
+                        s += a.t3[i][j][k] * b.v;
+                    }
+                    out.t3[i][j][k] = s;
+                }
+            }
+        }
+        out
     }
     fn compose_unary(&self, d: [f64; 5]) -> Self {
-        // Tower3 consumes the leading four entries `[f, f′, f″, f‴]`; the `f⁗`
-        // slot `d[4]` is never read at order ≤ 3 (bit-identical to `Tower4`).
-        Self(self.0.compose_unary([d[0], d[1], d[2], d[3]]))
+        self.check_contract();
+        let mut out = Self::constant(d[0]);
+        for i in 0..4 {
+            let mut s = 0.0;
+            s += d[1] * self.g[i];
+            out.g[i] = s;
+        }
+        for i in 0..4 {
+            for j in 0..4 {
+                let mut s = 0.0;
+                if !h_block_is_zero(LIN, i, j) {
+                    s += d[1] * self.h[i][j];
+                }
+                s += d[2] * self.g[i] * self.g[j];
+                out.h[i][j] = s;
+            }
+        }
+        for i in 0..4 {
+            for j in 0..4 {
+                for k in 0..4 {
+                    let mut s = 0.0;
+                    if !t3_block_is_zero(LIN, i, j, k) {
+                        s += d[1] * self.t3[i][j][k];
+                    }
+                    if !h_block_is_zero(LIN, i, j) {
+                        s += d[2] * self.h[i][j] * self.g[k];
+                    }
+                    if !h_block_is_zero(LIN, i, k) {
+                        s += d[2] * self.h[i][k] * self.g[j];
+                    }
+                    if !h_block_is_zero(LIN, j, k) {
+                        s += d[2] * self.g[i] * self.h[j][k];
+                    }
+                    s += d[3] * self.g[i] * self.g[j] * self.g[k];
+                    out.t3[i][j][k] = s;
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Order-≤4 (value/grad/Hessian/`t3`/`t4`) jet over `K=4` primaries with
+/// compile-time static sparsity (`LIN` bitmask). Bit-identical to the engine
+/// [`Tower4<4>`] on every channel for an index-affine program (see module note);
+/// the provably-zero linear-block reads are elided in `mul` / `compose_unary`.
+/// Used by the second-directional all-axes build-once path.
+#[derive(Clone, Copy)]
+pub(crate) struct SparseTower4<const LIN: u32> {
+    pub(crate) v: f64,
+    pub(crate) g: [f64; 4],
+    pub(crate) h: [[f64; 4]; 4],
+    pub(crate) t3: [[[f64; 4]; 4]; 4],
+    pub(crate) t4: [[[[f64; 4]; 4]; 4]; 4],
+}
+
+impl<const LIN: u32> SparseTower4<LIN> {
+    #[inline(always)]
+    fn check_contract(&self) {
+        for i in 0..4 {
+            for j in 0..4 {
+                if h_block_is_zero(LIN, i, j) {
+                    assert!(
+                        self.h[i][j] == 0.0,
+                        "static-sparsity contract violated: h[{i}][{j}]={} != 0",
+                        self.h[i][j]
+                    );
+                }
+                for k in 0..4 {
+                    if t3_block_is_zero(LIN, i, j, k) {
+                        assert!(
+                            self.t3[i][j][k] == 0.0,
+                            "static-sparsity contract violated: t3[{i}][{j}][{k}]={} != 0",
+                            self.t3[i][j][k]
+                        );
+                    }
+                    for l in 0..4 {
+                        if t4_block_is_zero(LIN, i, j, k, l) {
+                            assert!(
+                                self.t4[i][j][k][l] == 0.0,
+                                "static-sparsity contract violated: t4[{i}][{j}][{k}][{l}]={} != 0",
+                                self.t4[i][j][k][l]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Contract `t4` with two primary-space directions —
+    /// `out[a][b] = Σ_{c,d} t4[a][b][c][d]·u[c]·w[d]` — in the EXACT accumulation
+    /// order of [`gam_math::jet_tower::Tower4::fourth_contracted`] (k outer, l
+    /// inner), so the second-directional consumer is bit-identical.
+    #[inline]
+    pub(crate) fn fourth_contracted(&self, u: &[f64; 4], w: &[f64; 4]) -> [[f64; 4]; 4] {
+        let mut out = [[0.0; 4]; 4];
+        for i in 0..4 {
+            for j in 0..4 {
+                let mut acc = 0.0;
+                for k in 0..4 {
+                    for l in 0..4 {
+                        acc += self.t4[i][j][k][l] * u[k] * w[l];
+                    }
+                }
+                out[i][j] = acc;
+            }
+        }
+        out
+    }
+}
+
+impl<const LIN: u32> JetScalar<4> for SparseTower4<LIN> {
+    fn constant(c: f64) -> Self {
+        Self {
+            v: c,
+            g: [0.0; 4],
+            h: [[0.0; 4]; 4],
+            t3: [[[0.0; 4]; 4]; 4],
+            t4: [[[[0.0; 4]; 4]; 4]; 4],
+        }
+    }
+    fn variable(x: f64, axis: usize) -> Self {
+        let mut out = Self::constant(x);
+        out.g[axis] = 1.0;
+        out
+    }
+    fn value(&self) -> f64 {
+        self.v
+    }
+    fn add(&self, o: &Self) -> Self {
+        let mut r = *self;
+        r.v += o.v;
+        for i in 0..4 {
+            r.g[i] += o.g[i];
+            for j in 0..4 {
+                r.h[i][j] += o.h[i][j];
+                for k in 0..4 {
+                    r.t3[i][j][k] += o.t3[i][j][k];
+                    for l in 0..4 {
+                        r.t4[i][j][k][l] += o.t4[i][j][k][l];
+                    }
+                }
+            }
+        }
+        r
+    }
+    fn sub(&self, o: &Self) -> Self {
+        self.add(&o.neg())
+    }
+    fn neg(&self) -> Self {
+        self.scale(-1.0)
+    }
+    fn scale(&self, s: f64) -> Self {
+        let mut o = *self;
+        o.v *= s;
+        for i in 0..4 {
+            o.g[i] *= s;
+            for j in 0..4 {
+                o.h[i][j] *= s;
+                for k in 0..4 {
+                    o.t3[i][j][k] *= s;
+                    for l in 0..4 {
+                        o.t4[i][j][k][l] *= s;
+                    }
+                }
+            }
+        }
+        o
+    }
+    fn mul(&self, o: &Self) -> Self {
+        let (a, b) = (self, o);
+        a.check_contract();
+        b.check_contract();
+        let mut out = Self::constant(a.v * b.v);
+        for i in 0..4 {
+            let mut s = 0.0;
+            s += a.v * b.g[i];
+            s += a.g[i] * b.v;
+            out.g[i] = s;
+        }
+        for i in 0..4 {
+            for j in 0..4 {
+                let mut s = 0.0;
+                if !h_block_is_zero(LIN, i, j) {
+                    s += a.v * b.h[i][j];
+                }
+                s += a.g[i] * b.g[j];
+                s += a.g[j] * b.g[i];
+                if !h_block_is_zero(LIN, i, j) {
+                    s += a.h[i][j] * b.v;
+                }
+                out.h[i][j] = s;
+            }
+        }
+        for i in 0..4 {
+            for j in 0..4 {
+                for k in 0..4 {
+                    let mut s = 0.0;
+                    if !t3_block_is_zero(LIN, i, j, k) {
+                        s += a.v * b.t3[i][j][k];
+                    }
+                    if !h_block_is_zero(LIN, j, k) {
+                        s += a.g[i] * b.h[j][k];
+                    }
+                    if !h_block_is_zero(LIN, i, k) {
+                        s += a.g[j] * b.h[i][k];
+                    }
+                    if !h_block_is_zero(LIN, i, j) {
+                        s += a.h[i][j] * b.g[k];
+                    }
+                    if !h_block_is_zero(LIN, i, j) {
+                        s += a.g[k] * b.h[i][j];
+                    }
+                    if !h_block_is_zero(LIN, i, k) {
+                        s += a.h[i][k] * b.g[j];
+                    }
+                    if !h_block_is_zero(LIN, j, k) {
+                        s += a.h[j][k] * b.g[i];
+                    }
+                    if !t3_block_is_zero(LIN, i, j, k) {
+                        s += a.t3[i][j][k] * b.v;
+                    }
+                    out.t3[i][j][k] = s;
+                }
+            }
+        }
+        for i in 0..4 {
+            for j in 0..4 {
+                for k in 0..4 {
+                    for l in 0..4 {
+                        let mut s = 0.0;
+                        if !t4_block_is_zero(LIN, i, j, k, l) {
+                            s += a.v * b.t4[i][j][k][l];
+                        }
+                        if !t3_block_is_zero(LIN, j, k, l) {
+                            s += a.g[i] * b.t3[j][k][l];
+                        }
+                        if !t3_block_is_zero(LIN, i, k, l) {
+                            s += a.g[j] * b.t3[i][k][l];
+                        }
+                        if !(h_block_is_zero(LIN, i, j) || h_block_is_zero(LIN, k, l)) {
+                            s += a.h[i][j] * b.h[k][l];
+                        }
+                        if !t3_block_is_zero(LIN, i, j, l) {
+                            s += a.g[k] * b.t3[i][j][l];
+                        }
+                        if !(h_block_is_zero(LIN, i, k) || h_block_is_zero(LIN, j, l)) {
+                            s += a.h[i][k] * b.h[j][l];
+                        }
+                        if !(h_block_is_zero(LIN, j, k) || h_block_is_zero(LIN, i, l)) {
+                            s += a.h[j][k] * b.h[i][l];
+                        }
+                        if !t3_block_is_zero(LIN, i, j, k) {
+                            s += a.t3[i][j][k] * b.g[l];
+                        }
+                        if !t3_block_is_zero(LIN, i, j, k) {
+                            s += a.g[l] * b.t3[i][j][k];
+                        }
+                        if !(h_block_is_zero(LIN, i, l) || h_block_is_zero(LIN, j, k)) {
+                            s += a.h[i][l] * b.h[j][k];
+                        }
+                        if !(h_block_is_zero(LIN, j, l) || h_block_is_zero(LIN, i, k)) {
+                            s += a.h[j][l] * b.h[i][k];
+                        }
+                        if !t3_block_is_zero(LIN, i, j, l) {
+                            s += a.t3[i][j][l] * b.g[k];
+                        }
+                        if !(h_block_is_zero(LIN, k, l) || h_block_is_zero(LIN, i, j)) {
+                            s += a.h[k][l] * b.h[i][j];
+                        }
+                        if !t3_block_is_zero(LIN, i, k, l) {
+                            s += a.t3[i][k][l] * b.g[j];
+                        }
+                        if !t3_block_is_zero(LIN, j, k, l) {
+                            s += a.t3[j][k][l] * b.g[i];
+                        }
+                        if !t4_block_is_zero(LIN, i, j, k, l) {
+                            s += a.t4[i][j][k][l] * b.v;
+                        }
+                        out.t4[i][j][k][l] = s;
+                    }
+                }
+            }
+        }
+        out
+    }
+    fn compose_unary(&self, d: [f64; 5]) -> Self {
+        self.check_contract();
+        let mut out = Self::constant(d[0]);
+        for i in 0..4 {
+            let mut s = 0.0;
+            s += d[1] * self.g[i];
+            out.g[i] = s;
+        }
+        for i in 0..4 {
+            for j in 0..4 {
+                let mut s = 0.0;
+                if !h_block_is_zero(LIN, i, j) {
+                    s += d[1] * self.h[i][j];
+                }
+                s += d[2] * self.g[i] * self.g[j];
+                out.h[i][j] = s;
+            }
+        }
+        for i in 0..4 {
+            for j in 0..4 {
+                for k in 0..4 {
+                    let mut s = 0.0;
+                    if !t3_block_is_zero(LIN, i, j, k) {
+                        s += d[1] * self.t3[i][j][k];
+                    }
+                    if !h_block_is_zero(LIN, i, j) {
+                        s += d[2] * self.h[i][j] * self.g[k];
+                    }
+                    if !h_block_is_zero(LIN, i, k) {
+                        s += d[2] * self.h[i][k] * self.g[j];
+                    }
+                    if !h_block_is_zero(LIN, j, k) {
+                        s += d[2] * self.g[i] * self.h[j][k];
+                    }
+                    s += d[3] * self.g[i] * self.g[j] * self.g[k];
+                    out.t3[i][j][k] = s;
+                }
+            }
+        }
+        for i in 0..4 {
+            for j in 0..4 {
+                for k in 0..4 {
+                    for l in 0..4 {
+                        let mut s = 0.0;
+                        if !t4_block_is_zero(LIN, i, j, k, l) {
+                            s += d[1] * self.t4[i][j][k][l];
+                        }
+                        if !t3_block_is_zero(LIN, i, j, k) {
+                            s += d[2] * self.t3[i][j][k] * self.g[l];
+                        }
+                        if !t3_block_is_zero(LIN, i, j, l) {
+                            s += d[2] * self.t3[i][j][l] * self.g[k];
+                        }
+                        if !(h_block_is_zero(LIN, i, j) || h_block_is_zero(LIN, k, l)) {
+                            s += d[2] * self.h[i][j] * self.h[k][l];
+                        }
+                        if !h_block_is_zero(LIN, i, j) {
+                            s += d[3] * self.h[i][j] * self.g[k] * self.g[l];
+                        }
+                        if !t3_block_is_zero(LIN, i, k, l) {
+                            s += d[2] * self.t3[i][k][l] * self.g[j];
+                        }
+                        if !(h_block_is_zero(LIN, i, k) || h_block_is_zero(LIN, j, l)) {
+                            s += d[2] * self.h[i][k] * self.h[j][l];
+                        }
+                        if !h_block_is_zero(LIN, i, k) {
+                            s += d[3] * self.h[i][k] * self.g[j] * self.g[l];
+                        }
+                        if !(h_block_is_zero(LIN, i, l) || h_block_is_zero(LIN, j, k)) {
+                            s += d[2] * self.h[i][l] * self.h[j][k];
+                        }
+                        if !t3_block_is_zero(LIN, j, k, l) {
+                            s += d[2] * self.g[i] * self.t3[j][k][l];
+                        }
+                        if !h_block_is_zero(LIN, j, k) {
+                            s += d[3] * self.g[i] * self.h[j][k] * self.g[l];
+                        }
+                        if !h_block_is_zero(LIN, i, l) {
+                            s += d[3] * self.h[i][l] * self.g[j] * self.g[k];
+                        }
+                        if !h_block_is_zero(LIN, j, l) {
+                            s += d[3] * self.g[i] * self.h[j][l] * self.g[k];
+                        }
+                        if !h_block_is_zero(LIN, k, l) {
+                            s += d[3] * self.g[i] * self.g[j] * self.h[k][l];
+                        }
+                        s += d[4] * self.g[i] * self.g[j] * self.g[k] * self.g[l];
+                        out.t4[i][j][k][l] = s;
+                    }
+                }
+            }
+        }
+        out
     }
 }
 
 /// Contract a `Tower3` third tensor with one primary-space direction —
 /// `out[a][b] = Σ_c t3[a][b][c]·dir[c]` — exactly [`Tower4::third_contracted`]'s
 /// arithmetic (same accumulation order), used by the build-once first-directional
-/// path on the pruned [`Tower3Jet`] towers.
+/// path on the pruned [`SparseTower3`] towers.
 #[inline]
 pub(crate) fn tower3_third_contracted(
     t3: &[[[f64; 4]; 4]; 4],
@@ -868,30 +1404,53 @@ impl SurvivalMarginalSlopeRowKernel {
 }
 
 impl SurvivalMarginalSlopeRowKernel {
-    /// Build every row's full fourth-order primary tower ONCE.
+    /// Build every row's fourth-order primary tower ONCE for the
+    /// second-directional all-axes path.
     ///
-    /// `evaluate_program(self, row)` is a deterministic pure function of the
-    /// row's primaries, so the cached tower's `t3`/`t4` channels are bit-for-bit
-    /// what a fresh per-axis `row_third_contracted` / `row_fourth_contracted`
-    /// rebuild would produce — the build-once batched overrides below contract
-    /// against these cached towers without changing any downstream arithmetic.
-    fn build_row_towers(&self) -> Result<Vec<gam_math::jet_tower::Tower4<4>>, String> {
+    /// Evaluates the SAME single-source [`rigid_row_nll`] (including its
+    /// monotonicity guard) at the static-sparsity [`SparseTower4<RIGID_LINEAR_MASK>`]
+    /// scalar instead of the dense `Tower4<4>` `evaluate_program` build: the
+    /// affine rigid primaries `q0,q1,qd1` make the multi-linear-leg derivative
+    /// blocks structurally zero on every `mul`/`compose` intermediate, so the
+    /// `t4` Leibniz/Faà-di-Bruno reads that touch them are elided (measured 2.89×
+    /// fewer FP ops on the `t4` build; standalone oracle scratchpad/sparse_t4_probe.rs,
+    /// 5000/5000 rows `to_bits`-identical to the engine `Tower4<4>` on every
+    /// channel). The cached `t4` (and the `fourth_contracted` accumulation order)
+    /// is therefore bit-for-bit what `evaluate_program(row)` would produce, so the
+    /// build-once batched override contracts against it without changing any
+    /// downstream arithmetic.
+    fn build_row_towers(&self) -> Result<Vec<SparseTower4<RIGID_LINEAR_MASK>>, String> {
         let n = <Self as RowKernel<4>>::n_rows(self);
         (0..n)
             .into_par_iter()
-            .map(|row| gam_math::jet_tower::evaluate_program::<4, Self>(self, row))
+            .map(|row| {
+                let inputs = rigid_row_inputs(
+                    &self.family,
+                    &self.block_states,
+                    row,
+                    "survival marginal-slope rigid row fourth tower (build-once)",
+                )?;
+                let p = rigid_row_kernel_primaries(&self.family, &self.block_states, row)?;
+                let vars: [SparseTower4<RIGID_LINEAR_MASK>; 4] =
+                    std::array::from_fn(|a| SparseTower4::variable(p[a], a));
+                rigid_row_nll(&vars, &inputs)
+            })
             .collect()
     }
 
     /// Build every row's order-≤3 primary tower ONCE for the first-directional
     /// all-axes path (#1591). Evaluates the SAME single-source [`rigid_row_nll`]
-    /// (including its monotonicity guard) at the pruned [`Tower3Jet`] scalar
-    /// instead of the dense `Tower4<4>` `evaluate_program` builds: the consumer
-    /// reads only `third_contracted` (a `t3` contraction), so the discarded
-    /// `K⁴ = 256`-entry fourth tensor is never computed. The cached `t3` is
-    /// bit-for-bit what `build_row_towers()[row].t3` would be (Tower3 shares the
-    /// engine's Leibniz/Faà-di-Bruno walkers; order-≤3 terms never read `f⁗`).
-    fn build_row_third_towers(&self) -> Result<Vec<gam_math::jet_tower::Tower3<4>>, String> {
+    /// (including its monotonicity guard) at the static-sparsity
+    /// [`SparseTower3<RIGID_LINEAR_MASK>`] scalar instead of the dense `Tower4<4>`
+    /// `evaluate_program` builds: the consumer reads only `third_contracted` (a
+    /// `t3` contraction), so the discarded `K⁴ = 256`-entry fourth tensor is never
+    /// computed, AND the affine rigid primaries make the multi-linear-leg `t3`
+    /// reads structurally zero, eliding them too (measured 1.81× fewer FP ops on
+    /// the `t3` build; standalone oracle scratchpad/sparse_t3_probe.rs,
+    /// 5000/5000 rows `to_bits`-identical to the engine `Tower3<4>` / `Tower4<4>`
+    /// `t3` channel). The cached `t3` is bit-for-bit what the dense tower would
+    /// produce.
+    fn build_row_third_towers(&self) -> Result<Vec<SparseTower3<RIGID_LINEAR_MASK>>, String> {
         let n = <Self as RowKernel<4>>::n_rows(self);
         (0..n)
             .into_par_iter()
@@ -903,9 +1462,9 @@ impl SurvivalMarginalSlopeRowKernel {
                     "survival marginal-slope rigid row third tower (build-once)",
                 )?;
                 let p = rigid_row_kernel_primaries(&self.family, &self.block_states, row)?;
-                let vars: [Tower3Jet; 4] =
-                    std::array::from_fn(|a| Tower3Jet::variable(p[a], a));
-                Ok(rigid_row_nll(&vars, &inputs)?.0)
+                let vars: [SparseTower3<RIGID_LINEAR_MASK>; 4] =
+                    std::array::from_fn(|a| SparseTower3::variable(p[a], a));
+                rigid_row_nll(&vars, &inputs)
             })
             .collect()
     }

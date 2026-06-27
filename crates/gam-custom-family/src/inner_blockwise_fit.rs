@@ -2515,7 +2515,25 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     // "preserves linear constraints when present" — this makes the
                     // implementation honor that contract.
                     let constrained_path_active = search_joint_active_set.is_some();
-                    if !tried_preconditioned_descent && !constrained_path_active {
+                    // #1108 disabled the unconstrained preconditioned-descent swap on
+                    // the constrained path because the gradient step leaves the cone
+                    // and nothing re-projected it. But when linear `joint_constraints`
+                    // are present, the cone projection (`project_point_strictly_into_
+                    // feasible_cone`) on the next trust attempt DOES re-project the
+                    // trial step to feasibility — so the descent escape is both safe
+                    // and necessary there: without it a degenerate/ascent QP step (the
+                    // link-wiggle block fully pinned at its β≥0 boundary at the
+                    // REML-optimal ρ throttles the free threshold block to a ~5e-8
+                    // step) has NO feasible escape, the radius collapses, and the
+                    // fixed-point gate refuses at a non-stationary point (gam#979/#1108,
+                    // binomial location-scale wiggle + matern). Allow the swap when a
+                    // cone re-projection will follow; keep it disabled for cone-less
+                    // constrained families (the original #1108 case, e.g. LatentSurvival
+                    // whose feasibility is a barrier with no linear `joint_constraints`).
+                    let descent_will_be_reprojected = joint_constraints.is_some();
+                    if !tried_preconditioned_descent
+                        && (!constrained_path_active || descent_will_be_reprojected)
+                    {
                         match joint_preconditioned_descent_delta(
                             effective_hessian_source,
                             &ranges,

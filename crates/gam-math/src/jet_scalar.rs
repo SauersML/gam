@@ -336,6 +336,369 @@ impl<const K: usize> JetScalar<K> for Order2<K> {
     }
 }
 
+// ── Lane-batched Order-2 scalar: 4 rows per pass in SIMD lanes (perf) ────
+//
+// The hot per-row jet kernels evaluate ONE row's `(v, g, H)` tower at a time in
+// scalar `f64`. A hand-written scalar derivative does the same. The throughput
+// lever a jet has that scalar hand-code cannot is **row batching in SIMD
+// lanes**: the order-≤2 Leibniz product `Order2::mul` is `O(K²)` independent
+// per-channel float ops, and EVERY row runs the identical op graph on different
+// data — the textbook SPMD shape. Packing `LANES = 4` rows into a `wide::f64x4`
+// and running the algebra once per 4 rows replaces 4 scalar passes with one
+// vector pass: the `K²` Hessian channel updates become `K²` NEON `.2d` / SSE2
+// `pd` instructions covering 4 rows each, ~4× fewer FP instructions per row.
+//
+// The carried scalar field is abstracted by [`Lane`] so the SAME algebra body
+// instantiates at `f64` (1 row, used as the bit-identity oracle) or
+// [`wide::f64x4`] (4 rows). Bit-identity is structural, not approximate:
+//
+//   * Every arithmetic op is a plain lane-wise `+` / `-` / `*` (NEVER a fused
+//     `mul_add`), and IEEE-754 double `+`/`-`/`*`/`/` are correctly rounded and
+//     deterministic, so lane `i` of an `f64x4` op equals the scalar `f64` op on
+//     that lane's inputs bit-for-bit.
+//   * The transcendental derivative STACKS (`exp`/`ln`/`sqrt`/…) are produced
+//     **per lane by the identical scalar code** ([`Lane::unary3`] unpacks, runs
+//     the same `[f64; 3]` stack closure the scalar path runs, repacks), so the
+//     only thing vectorised is the cheap rational tensor composition — the
+//     library transcendental itself is the exact same `f64::exp` call per lane.
+//   * The op order mirrors [`crate::jet_tower::Tower2`] term-for-term, so
+//     [`Order2Lane<f64, K>`] is `to_bits`-identical to the production
+//     [`Order2<K>`] (= `Tower2<K>`), and [`Order2Lane<f64x4, K>`] lane `i` is
+//     `to_bits`-identical to that — proven by the `batch_tests` oracle below
+//     (≥2000 random 4-row batches across `K ∈ {2,3,4,9}`).
+
+/// The scalar field a [`Order2Lane`] carries: either a single `f64` (one row,
+/// the oracle) or a [`wide::f64x4`] (four rows evaluated in SIMD lanes). All ops
+/// are plain lane-wise IEEE arithmetic, so a vector op equals the scalar op on
+/// each lane bit-for-bit.
+pub trait Lane: Copy {
+    /// Broadcast a scalar to every lane.
+    fn splat(x: f64) -> Self;
+    /// Lane-wise `self + o`.
+    fn add(self, o: Self) -> Self;
+    /// Lane-wise `self - o`.
+    fn sub(self, o: Self) -> Self;
+    /// Lane-wise `self * o`.
+    fn mul(self, o: Self) -> Self;
+    /// The `f64` in lane `i` (`i < LANES`; `f64` ignores `i`).
+    fn lane(self, i: usize) -> f64;
+    /// Build the order-≤2 derivative stack `[f(u), f′(u), f″(u)]` **per lane**
+    /// from the lane value `u`, via the SAME scalar `stack` closure the
+    /// per-row path runs (so the transcendental/rational stack is bit-identical
+    /// to the scalar evaluation — only the subsequent tensor composition is
+    /// vectorised).
+    fn unary3(self, stack: impl Fn(f64) -> [f64; 3]) -> [Self; 3];
+    /// Build the order-≤4 derivative stack `[f, f′, f″, f‴, f⁗]` **per lane**
+    /// from the lane value `u`, via the SAME scalar `stack` closure the per-row
+    /// path runs. The one-/two-seed scalars ([`OneSeedLane`] / [`TwoSeedLane`])
+    /// need outer derivatives one / two orders beyond their order-2 base, so
+    /// they build their composition stack through this five-entry variant. As
+    /// with [`unary3`](Lane::unary3), only the transcendental/rational stack is
+    /// evaluated per lane (bit-identically to the scalar path); the subsequent
+    /// tensor composition is vectorised.
+    fn unary5(self, stack: impl Fn(f64) -> [f64; 5]) -> [Self; 5];
+}
+
+impl Lane for f64 {
+    #[inline]
+    fn splat(x: f64) -> Self {
+        x
+    }
+    #[inline]
+    fn add(self, o: Self) -> Self {
+        self + o
+    }
+    #[inline]
+    fn sub(self, o: Self) -> Self {
+        self - o
+    }
+    #[inline]
+    fn mul(self, o: Self) -> Self {
+        self * o
+    }
+    #[inline]
+    fn lane(self, _i: usize) -> f64 {
+        self
+    }
+    #[inline]
+    fn unary3(self, stack: impl Fn(f64) -> [f64; 3]) -> [Self; 3] {
+        stack(self)
+    }
+    #[inline]
+    fn unary5(self, stack: impl Fn(f64) -> [f64; 5]) -> [Self; 5] {
+        stack(self)
+    }
+}
+
+impl Lane for wide::f64x4 {
+    #[inline]
+    fn splat(x: f64) -> Self {
+        wide::f64x4::splat(x)
+    }
+    #[inline]
+    fn add(self, o: Self) -> Self {
+        self + o
+    }
+    #[inline]
+    fn sub(self, o: Self) -> Self {
+        self - o
+    }
+    #[inline]
+    fn mul(self, o: Self) -> Self {
+        self * o
+    }
+    #[inline]
+    fn lane(self, i: usize) -> f64 {
+        self.to_array()[i]
+    }
+    #[inline]
+    fn unary3(self, stack: impl Fn(f64) -> [f64; 3]) -> [Self; 3] {
+        let a = self.to_array();
+        let mut d0 = [0.0_f64; 4];
+        let mut d1 = [0.0_f64; 4];
+        let mut d2 = [0.0_f64; 4];
+        for i in 0..4 {
+            let s = stack(a[i]);
+            d0[i] = s[0];
+            d1[i] = s[1];
+            d2[i] = s[2];
+        }
+        [
+            wide::f64x4::new(d0),
+            wide::f64x4::new(d1),
+            wide::f64x4::new(d2),
+        ]
+    }
+    #[inline]
+    fn unary5(self, stack: impl Fn(f64) -> [f64; 5]) -> [Self; 5] {
+        let a = self.to_array();
+        let mut d = [[0.0_f64; 4]; 5];
+        for i in 0..4 {
+            let s = stack(a[i]);
+            for (k, dk) in d.iter_mut().enumerate() {
+                dk[i] = s[k];
+            }
+        }
+        [
+            wide::f64x4::new(d[0]),
+            wide::f64x4::new(d[1]),
+            wide::f64x4::new(d[2]),
+            wide::f64x4::new(d[3]),
+            wide::f64x4::new(d[4]),
+        ]
+    }
+}
+
+/// A lane-batched order-≤2 Taylor scalar: value / gradient / Hessian carried in
+/// a SIMD field [`L: Lane`](Lane). With `L = f64x4` one instance carries FOUR
+/// rows at once, so the row loop processes 4 rows per vector pass instead of one
+/// per scalar pass.
+///
+/// The channel layout and every float op mirror [`crate::jet_tower::Tower2`]
+/// term-for-term, so `Order2Lane<f64, K>` is `to_bits`-identical to the
+/// production [`Order2<K>`] and `Order2Lane<f64x4, K>` lane `i` is
+/// `to_bits`-identical to that (see the module note and `batch_tests`).
+#[derive(Clone, Copy, Debug)]
+pub struct Order2Lane<L: Lane, const K: usize> {
+    /// Value channel `ℓ` (one entry per lane/row).
+    pub v: L,
+    /// Gradient channel `∂ℓ/∂p_a`.
+    pub g: [L; K],
+    /// Hessian channel `∂²ℓ/∂p_a∂p_b` (symmetric).
+    pub h: [[L; K]; K],
+}
+
+/// The 4-rows-per-pass batched order-≤2 scalar (`wide::f64x4` lanes).
+pub type Order2Batch<const K: usize> = Order2Lane<wide::f64x4, K>;
+
+impl<L: Lane, const K: usize> Order2Lane<L, K> {
+    /// A constant: value `c` in every channel-zero slot.
+    #[inline]
+    pub fn constant(c: L) -> Self {
+        Order2Lane {
+            v: c,
+            g: [L::splat(0.0); K],
+            h: [[L::splat(0.0); K]; K],
+        }
+    }
+
+    /// The seeded variable `p_axis` at (per-lane) value `value`: unit first
+    /// derivative in slot `axis`. With `L = f64x4`, `value` packs the four
+    /// rows' values of primary `axis`.
+    #[inline]
+    pub fn variable(value: L, axis: usize) -> Self {
+        let mut out = Self::constant(value);
+        out.g[axis] = L::splat(1.0);
+        out
+    }
+
+    /// Lane-wise `self + o` (mirrors `Tower2` Add: per-channel add).
+    #[inline]
+    pub fn add(&self, o: &Self) -> Self {
+        let mut out = *self;
+        out.v = self.v.add(o.v);
+        for i in 0..K {
+            out.g[i] = self.g[i].add(o.g[i]);
+            for j in 0..K {
+                out.h[i][j] = self.h[i][j].add(o.h[i][j]);
+            }
+        }
+        out
+    }
+
+    /// Multiply every channel by the plain scalar `s` (mirrors `Tower2::scale`).
+    #[inline]
+    pub fn scale(&self, s: f64) -> Self {
+        let sl = L::splat(s);
+        let mut out = *self;
+        out.v = self.v.mul(sl);
+        for i in 0..K {
+            out.g[i] = self.g[i].mul(sl);
+            for j in 0..K {
+                out.h[i][j] = self.h[i][j].mul(sl);
+            }
+        }
+        out
+    }
+
+    /// Lane-wise `self - o`, expressed as `self + o·(-1)` exactly as
+    /// [`Order2::sub`] / `Tower4::sub` do, so signed-zero handling matches.
+    #[inline]
+    pub fn sub(&self, o: &Self) -> Self {
+        self.add(&o.scale(-1.0))
+    }
+
+    /// Negate every channel (= `scale(-1.0)`, matching [`Order2::neg`]).
+    #[inline]
+    pub fn neg(&self) -> Self {
+        self.scale(-1.0)
+    }
+
+    /// Exact order-≤2 Leibniz product, term-for-term identical to
+    /// [`crate::jet_tower::Tower2::mul`] (same factor order, no `mul_add`).
+    #[inline]
+    pub fn mul(&self, o: &Self) -> Self {
+        let a = self;
+        let b = o;
+        let mut out = Self::constant(a.v.mul(b.v));
+        for i in 0..K {
+            // a.v*b.g[i] + a.g[i]*b.v
+            out.g[i] = a.v.mul(b.g[i]).add(a.g[i].mul(b.v));
+        }
+        for i in 0..K {
+            for j in 0..K {
+                // a.v*b.h + a.g[i]*b.g[j] + a.g[j]*b.g[i] + a.h*b.v
+                out.h[i][j] = a
+                    .v
+                    .mul(b.h[i][j])
+                    .add(a.g[i].mul(b.g[j]))
+                    .add(a.g[j].mul(b.g[i]))
+                    .add(a.h[i][j].mul(b.v));
+            }
+        }
+        out
+    }
+
+    /// Exact order-≤2 Faà di Bruno composition `f ∘ self`, given the per-lane
+    /// derivative stack `d = [f(u), f′(u), f″(u)]`. Mirrors
+    /// [`crate::jet_tower::Tower2::compose_unary`] term-for-term (`acc` starts at
+    /// `0` then accumulates, so signed-zero collapses identically).
+    #[inline]
+    pub fn compose_unary(&self, d: [L; 3]) -> Self {
+        let mut out = Self::constant(d[0]);
+        for i in 0..K {
+            let mut acc = L::splat(0.0);
+            acc = acc.add(d[1].mul(self.g[i]));
+            out.g[i] = acc;
+        }
+        for i in 0..K {
+            for j in 0..K {
+                let mut acc = L::splat(0.0);
+                acc = acc.add(d[1].mul(self.h[i][j]));
+                acc = acc.add(d[2].mul(self.g[i]).mul(self.g[j]));
+                out.h[i][j] = acc;
+            }
+        }
+        out
+    }
+
+    /// `e^self`, per-lane stack `[e, e, e]` (matches the [`JetScalar::exp`]
+    /// default forwarded through `Order2`).
+    #[inline]
+    pub fn exp(&self) -> Self {
+        let d = self.v.unary3(|u| {
+            let e = u.exp();
+            [e, e, e]
+        });
+        self.compose_unary(d)
+    }
+
+    /// `ln(self)`; caller guarantees positivity. Per-lane stack
+    /// `[ln u, 1/u, -1/u²]` (matches [`JetScalar::ln`] truncated to order 2).
+    #[inline]
+    pub fn ln(&self) -> Self {
+        let d = self.v.unary3(|u| {
+            let r = 1.0 / u;
+            [u.ln(), r, -r * r]
+        });
+        self.compose_unary(d)
+    }
+
+    /// `√self`; caller guarantees positivity. Per-lane stack
+    /// `[s, 0.5/s, -0.25/(u·s)]` (matches [`JetScalar::sqrt`]).
+    #[inline]
+    pub fn sqrt(&self) -> Self {
+        let d = self.v.unary3(|u| {
+            let s = u.sqrt();
+            [s, 0.5 / s, -0.25 / (u * s)]
+        });
+        self.compose_unary(d)
+    }
+
+    /// `1/self`. Per-lane stack `[r, -r², 2r³]` (matches [`JetScalar::recip`]).
+    #[inline]
+    pub fn recip(&self) -> Self {
+        let d = self.v.unary3(|u| {
+            let r = 1.0 / u;
+            let r2 = r * r;
+            [r, -r2, 2.0 * r2 * r]
+        });
+        self.compose_unary(d)
+    }
+
+    /// `self^a` for real `a`; caller guarantees a positive base. Per-lane
+    /// falling-factorial stack (matches [`JetScalar::powf`]).
+    #[inline]
+    pub fn powf(&self, a: f64) -> Self {
+        let d = self.v.unary3(|u| {
+            [
+                u.powf(a),
+                a * u.powf(a - 1.0),
+                a * (a - 1.0) * u.powf(a - 2.0),
+            ]
+        });
+        self.compose_unary(d)
+    }
+}
+
+impl<const K: usize> Order2Batch<K> {
+    /// Extract lane `i`'s `(v, g, H)` as a production [`Order2<K>`] scalar.
+    /// Lane `i` is `to_bits`-identical to evaluating the same program at
+    /// [`Order2<K>`] on row `i` (see `batch_tests`).
+    #[inline]
+    #[must_use]
+    pub fn lane(&self, i: usize) -> Order2<K> {
+        let mut t = crate::jet_tower::Tower2::<K>::constant(self.v.lane(i));
+        for a in 0..K {
+            t.g[a] = self.g[a].lane(i);
+            for b in 0..K {
+                t.h[a][b] = self.h[a][b].lane(i);
+            }
+        }
+        Order2(t)
+    }
+}
+
 // ── Order1<K>: value / gradient only (doc §A.1, first-order prune) ──────
 
 /// Truncated FIRST-order scalar: value `v` and gradient `g_a` only — NO Hessian.
@@ -538,6 +901,226 @@ impl<const K: usize> JetScalar<K> for OneSeed<K> {
     }
 }
 
+// ── OneSeedLane<L, K>: lane-batched one-seed directional (doc §A.2) ──────
+
+/// Lane-batched [`OneSeed`]: the same one-seed directional scalar with its two
+/// [`Order2`] parts re-typed to [`Order2Lane<L, K>`], so one `L = f64x4`
+/// instance carries FOUR rows' contracted-third evaluations per vector pass.
+///
+/// Every operation (`add`/`sub`/`mul`/`neg`/`scale`/`compose_unary` and the
+/// transcendentals) is a term-for-term structural re-type of the scalar
+/// [`OneSeed`] ops onto the lane-implemented [`Order2Lane`] algebra. With
+/// `L = f64`, `OneSeedLane<f64, K>` is `to_bits`-identical to [`OneSeed<K>`];
+/// with `L = f64x4`, lane `i` is `to_bits`-identical to that (see `batch_tests`).
+#[derive(Clone, Copy, Debug)]
+pub struct OneSeedLane<L: Lane, const K: usize> {
+    /// The `ε⁰` part (lane-batched value / gradient / Hessian of `ℓ`).
+    pub base: Order2Lane<L, K>,
+    /// The `ε¹` part. After a `seed_direction(u)` evaluation,
+    /// `eps.h[a][b]` lane `i` is row `i`'s `Σ_c ℓ_{abc} u_c`.
+    pub eps: Order2Lane<L, K>,
+}
+
+/// The 4-rows-per-pass batched one-seed scalar (`wide::f64x4` lanes).
+pub type OneSeedBatch<const K: usize> = OneSeedLane<wide::f64x4, K>;
+
+impl<L: Lane, const K: usize> OneSeedLane<L, K> {
+    /// A constant: base = `constant(c)`, ε-part zero (mirrors [`OneSeed::constant`]).
+    #[inline]
+    pub fn constant(c: L) -> Self {
+        OneSeedLane {
+            base: Order2Lane::constant(c),
+            eps: Order2Lane::constant(L::splat(0.0)),
+        }
+    }
+
+    /// The seeded variable `p_axis` at (per-lane) value `value`, no ε-direction
+    /// (mirrors [`OneSeed::variable`]).
+    #[inline]
+    pub fn variable(value: L, axis: usize) -> Self {
+        OneSeedLane {
+            base: Order2Lane::variable(value, axis),
+            eps: Order2Lane::constant(L::splat(0.0)),
+        }
+    }
+
+    /// Seed primary `axis` at (per-lane) value `value` with ε-direction
+    /// component `u_axis`: base = `variable(value, axis)`, eps = `constant(u_axis)`
+    /// (mirrors [`OneSeed::seed_direction`]). With `L = f64x4`, `value` / `u_axis`
+    /// pack the four rows' values / directions of primary `axis`.
+    #[inline]
+    pub fn seed_direction(value: L, axis: usize, u_axis: L) -> Self {
+        OneSeedLane {
+            base: Order2Lane::variable(value, axis),
+            eps: Order2Lane::constant(u_axis),
+        }
+    }
+
+    /// The contracted-third channel after a `seed_direction(u)` evaluation:
+    /// `out[a][b]` lane `i` is row `i`'s `Σ_c ℓ_{abc} u_c` (the ε-part Hessian).
+    #[inline]
+    #[must_use]
+    pub fn contracted_third(&self) -> [[L; K]; K] {
+        self.eps.h
+    }
+
+    /// Lane-wise `self + o` (mirrors [`OneSeed::add`]).
+    #[inline]
+    pub fn add(&self, o: &Self) -> Self {
+        OneSeedLane {
+            base: self.base.add(&o.base),
+            eps: self.eps.add(&o.eps),
+        }
+    }
+
+    /// Lane-wise `self - o` (mirrors [`OneSeed::sub`]).
+    #[inline]
+    pub fn sub(&self, o: &Self) -> Self {
+        OneSeedLane {
+            base: self.base.sub(&o.base),
+            eps: self.eps.sub(&o.eps),
+        }
+    }
+
+    /// Lane-wise `self · o`, ε² = 0 truncation (mirrors [`OneSeed::mul`]).
+    #[inline]
+    pub fn mul(&self, o: &Self) -> Self {
+        OneSeedLane {
+            base: self.base.mul(&o.base),
+            eps: self.base.mul(&o.eps).add(&self.eps.mul(&o.base)),
+        }
+    }
+
+    /// Negate every part (mirrors [`OneSeed::neg`]).
+    #[inline]
+    pub fn neg(&self) -> Self {
+        OneSeedLane {
+            base: self.base.neg(),
+            eps: self.eps.neg(),
+        }
+    }
+
+    /// Multiply every part by the plain scalar `s` (mirrors [`OneSeed::scale`]).
+    #[inline]
+    pub fn scale(&self, s: f64) -> Self {
+        OneSeedLane {
+            base: self.base.scale(s),
+            eps: self.eps.scale(s),
+        }
+    }
+
+    /// Exact order-≤2-per-part Faà di Bruno composition `f ∘ self`, given the
+    /// per-lane outer-derivative stack `d = [f, f′, f″, f‴, f⁗]`. Term-for-term
+    /// identical to [`OneSeed::compose_unary`]: the base reads `d[0..=2]` and the
+    /// ε-coefficient is `f′(base)` (reads `d[1..=3]`) times `eps`.
+    #[inline]
+    pub fn compose_unary(&self, d: [L; 5]) -> Self {
+        let base = self.base.compose_unary([d[0], d[1], d[2]]);
+        let fprime = self.base.compose_unary([d[1], d[2], d[3]]);
+        let eps = fprime.mul(&self.eps);
+        OneSeedLane { base, eps }
+    }
+
+    /// `e^self`, per-lane stack `[e, e, e, e, e]` (matches [`JetScalar::exp`]).
+    #[inline]
+    pub fn exp(&self) -> Self {
+        let d = self.base.v.unary5(|u| {
+            let e = u.exp();
+            [e, e, e, e, e]
+        });
+        self.compose_unary(d)
+    }
+
+    /// `ln(self)`; caller guarantees positivity (matches [`JetScalar::ln`]).
+    #[inline]
+    pub fn ln(&self) -> Self {
+        let d = self.base.v.unary5(|u| {
+            let r = 1.0 / u;
+            [u.ln(), r, -r * r, 2.0 * r * r * r, -6.0 * r * r * r * r]
+        });
+        self.compose_unary(d)
+    }
+
+    /// `√self`; caller guarantees positivity (matches [`JetScalar::sqrt`]).
+    #[inline]
+    pub fn sqrt(&self) -> Self {
+        let d = self.base.v.unary5(|u| {
+            let s = u.sqrt();
+            [
+                s,
+                0.5 / s,
+                -0.25 / (u * s),
+                0.375 / (u * u * s),
+                -0.9375 / (u * u * u * s),
+            ]
+        });
+        self.compose_unary(d)
+    }
+
+    /// `1/self` (matches [`JetScalar::recip`]).
+    #[inline]
+    pub fn recip(&self) -> Self {
+        let d = self.base.v.unary5(|u| {
+            let r = 1.0 / u;
+            let r2 = r * r;
+            [r, -r2, 2.0 * r2 * r, -6.0 * r2 * r2, 24.0 * r2 * r2 * r]
+        });
+        self.compose_unary(d)
+    }
+
+    /// `self^a` for real `a`; caller guarantees a positive base (matches
+    /// [`JetScalar::powf`]).
+    #[inline]
+    pub fn powf(&self, a: f64) -> Self {
+        let d = self.base.v.unary5(|u| {
+            [
+                u.powf(a),
+                a * u.powf(a - 1.0),
+                a * (a - 1.0) * u.powf(a - 2.0),
+                a * (a - 1.0) * (a - 2.0) * u.powf(a - 3.0),
+                a * (a - 1.0) * (a - 2.0) * (a - 3.0) * u.powf(a - 4.0),
+            ]
+        });
+        self.compose_unary(d)
+    }
+
+    /// `ln Γ(self)`; caller guarantees positivity (matches [`JetScalar::ln_gamma`],
+    /// same hand-certified stack).
+    #[inline]
+    pub fn ln_gamma(&self) -> Self {
+        let d = self
+            .base
+            .v
+            .unary5(crate::jet_tower::ln_gamma_derivative_stack);
+        self.compose_unary(d)
+    }
+
+    /// `ψ(self)` digamma; caller guarantees positivity (matches
+    /// [`JetScalar::digamma`], same hand-certified stack).
+    #[inline]
+    pub fn digamma(&self) -> Self {
+        let d = self
+            .base
+            .v
+            .unary5(crate::jet_tower::digamma_derivative_stack);
+        self.compose_unary(d)
+    }
+}
+
+impl<const K: usize> OneSeedBatch<K> {
+    /// Extract lane `i`'s parts as a production [`OneSeed<K>`]. Lane `i` is
+    /// `to_bits`-identical to evaluating the same program at [`OneSeed<K>`] on
+    /// row `i` (see `batch_tests`).
+    #[inline]
+    #[must_use]
+    pub fn lane(&self, i: usize) -> OneSeed<K> {
+        OneSeed {
+            base: self.base.lane(i),
+            eps: self.eps.lane(i),
+        }
+    }
+}
+
 // ── TwoSeed<K>: two-seed, contracted fourth (doc §A.3) ──────────────────
 
 /// Two-seed scalar: an [`Order2`] base plus TWO nilpotents ε, δ
@@ -683,6 +1266,272 @@ impl<const K: usize> JetScalar<K> for TwoSeed<K> {
             eps,
             del,
             eps_del,
+        }
+    }
+}
+
+// ── TwoSeedLane<L, K>: lane-batched two-seed, contracted fourth (doc §A.3) ─
+
+/// Lane-batched [`TwoSeed`]: the same two-seed scalar with its four [`Order2`]
+/// parts re-typed to [`Order2Lane<L, K>`], so one `L = f64x4` instance carries
+/// FOUR rows' contracted-fourth evaluations per vector pass.
+///
+/// Every operation is a term-for-term structural re-type of the scalar
+/// [`TwoSeed`] ops onto the lane-implemented [`Order2Lane`] algebra. With
+/// `L = f64`, `TwoSeedLane<f64, K>` is `to_bits`-identical to [`TwoSeed<K>`];
+/// with `L = f64x4`, lane `i` is `to_bits`-identical to that (see `batch_tests`).
+#[derive(Clone, Copy, Debug)]
+pub struct TwoSeedLane<L: Lane, const K: usize> {
+    /// The `ε⁰δ⁰` part.
+    pub base: Order2Lane<L, K>,
+    /// The `ε¹δ⁰` part.
+    pub eps: Order2Lane<L, K>,
+    /// The `ε⁰δ¹` part.
+    pub del: Order2Lane<L, K>,
+    /// The `ε¹δ¹` part. After a `seed(u, v)` evaluation, `eps_del.h[a][b]`
+    /// lane `i` is row `i`'s `Σ_{cd} ℓ_{abcd} u_c v_d`.
+    pub eps_del: Order2Lane<L, K>,
+}
+
+/// The 4-rows-per-pass batched two-seed scalar (`wide::f64x4` lanes).
+pub type TwoSeedBatch<const K: usize> = TwoSeedLane<wide::f64x4, K>;
+
+impl<L: Lane, const K: usize> TwoSeedLane<L, K> {
+    /// A constant: base = `constant(c)`, all seed parts zero (mirrors
+    /// [`TwoSeed::constant`]).
+    #[inline]
+    pub fn constant(c: L) -> Self {
+        let z = Order2Lane::constant(L::splat(0.0));
+        TwoSeedLane {
+            base: Order2Lane::constant(c),
+            eps: z,
+            del: z,
+            eps_del: z,
+        }
+    }
+
+    /// The seeded variable `p_axis` at (per-lane) value `value`, no ε/δ direction
+    /// (mirrors [`TwoSeed::variable`]).
+    #[inline]
+    pub fn variable(value: L, axis: usize) -> Self {
+        let z = Order2Lane::constant(L::splat(0.0));
+        TwoSeedLane {
+            base: Order2Lane::variable(value, axis),
+            eps: z,
+            del: z,
+            eps_del: z,
+        }
+    }
+
+    /// Seed primary `axis` at (per-lane) value `value` with ε-direction `u_axis`
+    /// and δ-direction `v_axis` (mirrors [`TwoSeed::seed`]). With `L = f64x4`,
+    /// each argument packs the four rows' values for primary `axis`.
+    #[inline]
+    pub fn seed(value: L, axis: usize, u_axis: L, v_axis: L) -> Self {
+        TwoSeedLane {
+            base: Order2Lane::variable(value, axis),
+            eps: Order2Lane::constant(u_axis),
+            del: Order2Lane::constant(v_axis),
+            eps_del: Order2Lane::constant(L::splat(0.0)),
+        }
+    }
+
+    /// The contracted-fourth channel after a `seed(u, v)` evaluation:
+    /// `out[a][b]` lane `i` is row `i`'s `Σ_{cd} ℓ_{abcd} u_c v_d`
+    /// (the εδ-part Hessian).
+    #[inline]
+    #[must_use]
+    pub fn contracted_fourth(&self) -> [[L; K]; K] {
+        self.eps_del.h
+    }
+
+    /// Lane-wise `self + o` (mirrors [`TwoSeed::add`]).
+    #[inline]
+    pub fn add(&self, o: &Self) -> Self {
+        TwoSeedLane {
+            base: self.base.add(&o.base),
+            eps: self.eps.add(&o.eps),
+            del: self.del.add(&o.del),
+            eps_del: self.eps_del.add(&o.eps_del),
+        }
+    }
+
+    /// Lane-wise `self - o` (mirrors [`TwoSeed::sub`]).
+    #[inline]
+    pub fn sub(&self, o: &Self) -> Self {
+        TwoSeedLane {
+            base: self.base.sub(&o.base),
+            eps: self.eps.sub(&o.eps),
+            del: self.del.sub(&o.del),
+            eps_del: self.eps_del.sub(&o.eps_del),
+        }
+    }
+
+    /// Lane-wise `self · o`, ε² = δ² = 0 truncation (mirrors [`TwoSeed::mul`]).
+    #[inline]
+    pub fn mul(&self, o: &Self) -> Self {
+        let a = self;
+        let b = o;
+        let base = a.base.mul(&b.base);
+        let eps = a.base.mul(&b.eps).add(&a.eps.mul(&b.base));
+        let del = a.base.mul(&b.del).add(&a.del.mul(&b.base));
+        let eps_del = a
+            .base
+            .mul(&b.eps_del)
+            .add(&a.eps.mul(&b.del))
+            .add(&a.del.mul(&b.eps))
+            .add(&a.eps_del.mul(&b.base));
+        TwoSeedLane {
+            base,
+            eps,
+            del,
+            eps_del,
+        }
+    }
+
+    /// Negate every part (mirrors [`TwoSeed::neg`]).
+    #[inline]
+    pub fn neg(&self) -> Self {
+        TwoSeedLane {
+            base: self.base.neg(),
+            eps: self.eps.neg(),
+            del: self.del.neg(),
+            eps_del: self.eps_del.neg(),
+        }
+    }
+
+    /// Multiply every part by the plain scalar `s` (mirrors [`TwoSeed::scale`]).
+    #[inline]
+    pub fn scale(&self, s: f64) -> Self {
+        TwoSeedLane {
+            base: self.base.scale(s),
+            eps: self.eps.scale(s),
+            del: self.del.scale(s),
+            eps_del: self.eps_del.scale(s),
+        }
+    }
+
+    /// Exact composition `f ∘ self`, given the per-lane outer-derivative stack
+    /// `d = [f, f′, f″, f‴, f⁗]`. Term-for-term identical to
+    /// [`TwoSeed::compose_unary`]: base reads `d[0..=2]`, `f′(base)` reads
+    /// `d[1..=3]`, `f″(base)` reads `d[2..=4]`, and the cross part carries
+    /// `f″·eps·del + f′·eps_del`.
+    #[inline]
+    pub fn compose_unary(&self, d: [L; 5]) -> Self {
+        let base = self.base.compose_unary([d[0], d[1], d[2]]);
+        let fprime = self.base.compose_unary([d[1], d[2], d[3]]);
+        let fsecond = self.base.compose_unary([d[2], d[3], d[4]]);
+        let eps = fprime.mul(&self.eps);
+        let del = fprime.mul(&self.del);
+        let eps_del = fsecond
+            .mul(&self.eps)
+            .mul(&self.del)
+            .add(&fprime.mul(&self.eps_del));
+        TwoSeedLane {
+            base,
+            eps,
+            del,
+            eps_del,
+        }
+    }
+
+    /// `e^self`, per-lane stack `[e; 5]` (matches [`JetScalar::exp`]).
+    #[inline]
+    pub fn exp(&self) -> Self {
+        let d = self.base.v.unary5(|u| {
+            let e = u.exp();
+            [e, e, e, e, e]
+        });
+        self.compose_unary(d)
+    }
+
+    /// `ln(self)`; caller guarantees positivity (matches [`JetScalar::ln`]).
+    #[inline]
+    pub fn ln(&self) -> Self {
+        let d = self.base.v.unary5(|u| {
+            let r = 1.0 / u;
+            [u.ln(), r, -r * r, 2.0 * r * r * r, -6.0 * r * r * r * r]
+        });
+        self.compose_unary(d)
+    }
+
+    /// `√self`; caller guarantees positivity (matches [`JetScalar::sqrt`]).
+    #[inline]
+    pub fn sqrt(&self) -> Self {
+        let d = self.base.v.unary5(|u| {
+            let s = u.sqrt();
+            [
+                s,
+                0.5 / s,
+                -0.25 / (u * s),
+                0.375 / (u * u * s),
+                -0.9375 / (u * u * u * s),
+            ]
+        });
+        self.compose_unary(d)
+    }
+
+    /// `1/self` (matches [`JetScalar::recip`]).
+    #[inline]
+    pub fn recip(&self) -> Self {
+        let d = self.base.v.unary5(|u| {
+            let r = 1.0 / u;
+            let r2 = r * r;
+            [r, -r2, 2.0 * r2 * r, -6.0 * r2 * r2, 24.0 * r2 * r2 * r]
+        });
+        self.compose_unary(d)
+    }
+
+    /// `self^a` for real `a`; caller guarantees a positive base (matches
+    /// [`JetScalar::powf`]).
+    #[inline]
+    pub fn powf(&self, a: f64) -> Self {
+        let d = self.base.v.unary5(|u| {
+            [
+                u.powf(a),
+                a * u.powf(a - 1.0),
+                a * (a - 1.0) * u.powf(a - 2.0),
+                a * (a - 1.0) * (a - 2.0) * u.powf(a - 3.0),
+                a * (a - 1.0) * (a - 2.0) * (a - 3.0) * u.powf(a - 4.0),
+            ]
+        });
+        self.compose_unary(d)
+    }
+
+    /// `ln Γ(self)`; caller guarantees positivity (matches [`JetScalar::ln_gamma`]).
+    #[inline]
+    pub fn ln_gamma(&self) -> Self {
+        let d = self
+            .base
+            .v
+            .unary5(crate::jet_tower::ln_gamma_derivative_stack);
+        self.compose_unary(d)
+    }
+
+    /// `ψ(self)` digamma; caller guarantees positivity (matches
+    /// [`JetScalar::digamma`]).
+    #[inline]
+    pub fn digamma(&self) -> Self {
+        let d = self
+            .base
+            .v
+            .unary5(crate::jet_tower::digamma_derivative_stack);
+        self.compose_unary(d)
+    }
+}
+
+impl<const K: usize> TwoSeedBatch<K> {
+    /// Extract lane `i`'s parts as a production [`TwoSeed<K>`]. Lane `i` is
+    /// `to_bits`-identical to evaluating the same program at [`TwoSeed<K>`] on
+    /// row `i` (see `batch_tests`).
+    #[inline]
+    #[must_use]
+    pub fn lane(&self, i: usize) -> TwoSeed<K> {
+        TwoSeed {
+            base: self.base.lane(i),
+            eps: self.eps.lane(i),
+            del: self.del.lane(i),
+            eps_del: self.eps_del.lane(i),
         }
     }
 }
@@ -970,5 +1819,452 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    //! SIMD row-batching oracle: prove [`Order2Batch<K>`] (4 rows in
+    //! `wide::f64x4` lanes) is `to_bits`-identical, on every value/gradient/
+    //! Hessian channel, to the production [`Order2<K>`] evaluated per row — and
+    //! that the new scalar field [`Order2Lane<f64, K>`] is too. Composing the two
+    //! claims, batch lane `i` reproduces the production scalar for row `i` bit
+    //! for bit, so the 4× throughput is a free lunch (no result change).
+
+    use super::{
+        JetScalar, Lane, OneSeed, OneSeedBatch, OneSeedLane, Order2, Order2Batch, Order2Lane,
+        TwoSeed, TwoSeedBatch, TwoSeedLane,
+    };
+
+    /// The ops the witness row expression needs, so ONE generic body evaluates
+    /// at the production [`Order2<K>`], the new scalar [`Order2Lane<f64, K>`],
+    /// and the batched [`Order2Batch<K>`].
+    trait RowAlg<const K: usize>: Copy {
+        fn constant(c: f64) -> Self;
+        fn add(&self, o: &Self) -> Self;
+        fn sub(&self, o: &Self) -> Self;
+        fn mul(&self, o: &Self) -> Self;
+        fn scale(&self, s: f64) -> Self;
+        fn exp(&self) -> Self;
+        fn sqrt(&self) -> Self;
+        fn recip(&self) -> Self;
+    }
+
+    impl<const K: usize> RowAlg<K> for Order2<K> {
+        fn constant(c: f64) -> Self {
+            <Self as JetScalar<K>>::constant(c)
+        }
+        fn add(&self, o: &Self) -> Self {
+            JetScalar::add(self, o)
+        }
+        fn sub(&self, o: &Self) -> Self {
+            JetScalar::sub(self, o)
+        }
+        fn mul(&self, o: &Self) -> Self {
+            JetScalar::mul(self, o)
+        }
+        fn scale(&self, s: f64) -> Self {
+            JetScalar::scale(self, s)
+        }
+        fn exp(&self) -> Self {
+            JetScalar::exp(self)
+        }
+        fn sqrt(&self) -> Self {
+            JetScalar::sqrt(self)
+        }
+        fn recip(&self) -> Self {
+            JetScalar::recip(self)
+        }
+    }
+
+    impl<L: Lane, const K: usize> RowAlg<K> for Order2Lane<L, K> {
+        fn constant(c: f64) -> Self {
+            Order2Lane::constant(L::splat(c))
+        }
+        fn add(&self, o: &Self) -> Self {
+            Order2Lane::add(self, o)
+        }
+        fn sub(&self, o: &Self) -> Self {
+            Order2Lane::sub(self, o)
+        }
+        fn mul(&self, o: &Self) -> Self {
+            Order2Lane::mul(self, o)
+        }
+        fn scale(&self, s: f64) -> Self {
+            Order2Lane::scale(self, s)
+        }
+        fn exp(&self) -> Self {
+            Order2Lane::exp(self)
+        }
+        fn sqrt(&self) -> Self {
+            Order2Lane::sqrt(self)
+        }
+        fn recip(&self) -> Self {
+            Order2Lane::recip(self)
+        }
+    }
+
+    /// A dense witness row expression touching every algebra op (mul, add, sub,
+    /// scale, exp, sqrt, recip) over ALL `K` primaries, so the gradient and the
+    /// full `K×K` Hessian are dense (no trivially-zero channel). All transcend.
+    /// arguments are kept finite/positive: `sqrt(s²+1) > 0`, `recip(exp+2) > 0`.
+    fn row_expr<const K: usize, A: RowAlg<K>>(p: &[A; K]) -> A {
+        let mut s = A::constant(0.3);
+        for a in 0..K {
+            let b = (a + 1) % K;
+            s = s.add(&p[a].mul(&p[b]).scale(0.1 + 0.05 * a as f64));
+        }
+        let e = s.exp();
+        let r = s.mul(&s).add(&A::constant(1.0)).sqrt();
+        let denom = e.add(&A::constant(2.0));
+        e.mul(&r).sub(&s.scale(0.5)).mul(&denom.recip())
+    }
+
+    /// xorshift64 → `f64` in `[-1, 1)`.
+    fn rand_unit(state: &mut u64) -> f64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        let u = (x >> 11) as f64 / ((1u64 << 53) as f64); // [0, 1)
+        2.0 * u - 1.0
+    }
+
+    fn check_k<const K: usize>(state: &mut u64, batches: usize) {
+        for _ in 0..batches {
+            // Four independent rows of K primary values.
+            let rows: [[f64; K]; 4] =
+                std::array::from_fn(|_| std::array::from_fn(|_| rand_unit(state)));
+
+            // Production ground truth, evaluated per row at Order2<K>.
+            let prod: [Order2<K>; 4] = std::array::from_fn(|r| {
+                let p: [Order2<K>; K] = std::array::from_fn(|a| Order2::variable(rows[r][a], a));
+                row_expr(&p)
+            });
+
+            // New scalar field (Order2Lane<f64>), per row.
+            let scal: [Order2Lane<f64, K>; 4] = std::array::from_fn(|r| {
+                let p: [Order2Lane<f64, K>; K] =
+                    std::array::from_fn(|a| Order2Lane::variable(rows[r][a], a));
+                row_expr(&p)
+            });
+
+            // Batched: 4 rows packed into f64x4 lanes, ONE vector pass.
+            let pbatch: [Order2Batch<K>; K] = std::array::from_fn(|a| {
+                let packed =
+                    wide::f64x4::new([rows[0][a], rows[1][a], rows[2][a], rows[3][a]]);
+                Order2Batch::variable(packed, a)
+            });
+            let batch = row_expr(&pbatch);
+
+            for r in 0..4 {
+                let g = prod[r].0;
+                // Order2Lane<f64> == Order2<K> (bit-identical scalar field).
+                assert_eq!(scal[r].v.to_bits(), g.v.to_bits(), "K={K} scalar v");
+                // Batch lane r == Order2<K> for row r.
+                let lr = batch.lane(r).0;
+                assert_eq!(lr.v.to_bits(), g.v.to_bits(), "K={K} batch lane {r} v");
+                for a in 0..K {
+                    assert_eq!(
+                        scal[r].g[a].to_bits(),
+                        g.g[a].to_bits(),
+                        "K={K} scalar g[{a}]"
+                    );
+                    assert_eq!(
+                        lr.g[a].to_bits(),
+                        g.g[a].to_bits(),
+                        "K={K} batch lane {r} g[{a}]"
+                    );
+                    for b in 0..K {
+                        assert_eq!(
+                            scal[r].h[a][b].to_bits(),
+                            g.h[a][b].to_bits(),
+                            "K={K} scalar h[{a}][{b}]"
+                        );
+                        assert_eq!(
+                            lr.h[a][b].to_bits(),
+                            g.h[a][b].to_bits(),
+                            "K={K} batch lane {r} h[{a}][{b}]"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// ≥2000 random 4-row batches per K, across K ∈ {2,3,4,9}: every channel of
+    /// every lane is `to_bits`-identical to the production scalar per row.
+    #[test]
+    fn batch_lanes_bit_identical_to_scalar_per_row() {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        check_k::<2>(&mut state, 2000);
+        check_k::<3>(&mut state, 2000);
+        check_k::<4>(&mut state, 2000);
+        check_k::<9>(&mut state, 2000);
+    }
+
+    // ── One-/two-seed lane oracles ──────────────────────────────────────────
+    //
+    // The same dense `row_expr` witness program runs over the SEEDED directional
+    // scalars: the scalar `OneSeed`/`TwoSeed` per row, the `f64`-lane re-type
+    // (`*SeedLane<f64>`), and the 4-rows-per-pass batch (`*SeedBatch`). The
+    // headline claim is that the contracted-third / contracted-fourth channel of
+    // every lane is `to_bits`-identical to the production scalar's per row.
+
+    impl<const K: usize> RowAlg<K> for OneSeed<K> {
+        fn constant(c: f64) -> Self {
+            <Self as JetScalar<K>>::constant(c)
+        }
+        fn add(&self, o: &Self) -> Self {
+            JetScalar::add(self, o)
+        }
+        fn sub(&self, o: &Self) -> Self {
+            JetScalar::sub(self, o)
+        }
+        fn mul(&self, o: &Self) -> Self {
+            JetScalar::mul(self, o)
+        }
+        fn scale(&self, s: f64) -> Self {
+            JetScalar::scale(self, s)
+        }
+        fn exp(&self) -> Self {
+            JetScalar::exp(self)
+        }
+        fn sqrt(&self) -> Self {
+            JetScalar::sqrt(self)
+        }
+        fn recip(&self) -> Self {
+            JetScalar::recip(self)
+        }
+    }
+
+    impl<L: Lane, const K: usize> RowAlg<K> for OneSeedLane<L, K> {
+        fn constant(c: f64) -> Self {
+            OneSeedLane::constant(L::splat(c))
+        }
+        fn add(&self, o: &Self) -> Self {
+            OneSeedLane::add(self, o)
+        }
+        fn sub(&self, o: &Self) -> Self {
+            OneSeedLane::sub(self, o)
+        }
+        fn mul(&self, o: &Self) -> Self {
+            OneSeedLane::mul(self, o)
+        }
+        fn scale(&self, s: f64) -> Self {
+            OneSeedLane::scale(self, s)
+        }
+        fn exp(&self) -> Self {
+            OneSeedLane::exp(self)
+        }
+        fn sqrt(&self) -> Self {
+            OneSeedLane::sqrt(self)
+        }
+        fn recip(&self) -> Self {
+            OneSeedLane::recip(self)
+        }
+    }
+
+    impl<const K: usize> RowAlg<K> for TwoSeed<K> {
+        fn constant(c: f64) -> Self {
+            <Self as JetScalar<K>>::constant(c)
+        }
+        fn add(&self, o: &Self) -> Self {
+            JetScalar::add(self, o)
+        }
+        fn sub(&self, o: &Self) -> Self {
+            JetScalar::sub(self, o)
+        }
+        fn mul(&self, o: &Self) -> Self {
+            JetScalar::mul(self, o)
+        }
+        fn scale(&self, s: f64) -> Self {
+            JetScalar::scale(self, s)
+        }
+        fn exp(&self) -> Self {
+            JetScalar::exp(self)
+        }
+        fn sqrt(&self) -> Self {
+            JetScalar::sqrt(self)
+        }
+        fn recip(&self) -> Self {
+            JetScalar::recip(self)
+        }
+    }
+
+    impl<L: Lane, const K: usize> RowAlg<K> for TwoSeedLane<L, K> {
+        fn constant(c: f64) -> Self {
+            TwoSeedLane::constant(L::splat(c))
+        }
+        fn add(&self, o: &Self) -> Self {
+            TwoSeedLane::add(self, o)
+        }
+        fn sub(&self, o: &Self) -> Self {
+            TwoSeedLane::sub(self, o)
+        }
+        fn mul(&self, o: &Self) -> Self {
+            TwoSeedLane::mul(self, o)
+        }
+        fn scale(&self, s: f64) -> Self {
+            TwoSeedLane::scale(self, s)
+        }
+        fn exp(&self) -> Self {
+            TwoSeedLane::exp(self)
+        }
+        fn sqrt(&self) -> Self {
+            TwoSeedLane::sqrt(self)
+        }
+        fn recip(&self) -> Self {
+            TwoSeedLane::recip(self)
+        }
+    }
+
+    fn check_oneseed<const K: usize>(state: &mut u64, batches: usize) {
+        for _ in 0..batches {
+            let rows: [[f64; K]; 4] =
+                std::array::from_fn(|_| std::array::from_fn(|_| rand_unit(state)));
+            // Per-row ε-direction.
+            let u: [[f64; K]; 4] =
+                std::array::from_fn(|_| std::array::from_fn(|_| rand_unit(state)));
+
+            // Production ground truth (scalar OneSeed per row).
+            let prod: [OneSeed<K>; 4] = std::array::from_fn(|r| {
+                let p: [OneSeed<K>; K] =
+                    std::array::from_fn(|a| OneSeed::seed_direction(rows[r][a], a, u[r][a]));
+                row_expr(&p)
+            });
+
+            // f64-lane re-type per row.
+            let scal: [OneSeedLane<f64, K>; 4] = std::array::from_fn(|r| {
+                let p: [OneSeedLane<f64, K>; K] =
+                    std::array::from_fn(|a| OneSeedLane::seed_direction(rows[r][a], a, u[r][a]));
+                row_expr(&p)
+            });
+
+            // 4-rows-per-pass batch.
+            let pbatch: [OneSeedBatch<K>; K] = std::array::from_fn(|a| {
+                let val = wide::f64x4::new([rows[0][a], rows[1][a], rows[2][a], rows[3][a]]);
+                let uu = wide::f64x4::new([u[0][a], u[1][a], u[2][a], u[3][a]]);
+                OneSeedBatch::seed_direction(val, a, uu)
+            });
+            let batch = row_expr(&pbatch);
+
+            for r in 0..4 {
+                let want = prod[r].contracted_third();
+                let got_scal = scal[r].contracted_third();
+                let got_batch = batch.lane(r).contracted_third();
+                // Value channel too (sanity that the base program agrees).
+                assert_eq!(
+                    scal[r].base.v.to_bits(),
+                    prod[r].base.value().to_bits(),
+                    "OneSeed K={K} scalar value"
+                );
+                assert_eq!(
+                    batch.lane(r).base.value().to_bits(),
+                    prod[r].base.value().to_bits(),
+                    "OneSeed K={K} batch lane {r} value"
+                );
+                for a in 0..K {
+                    for b in 0..K {
+                        assert_eq!(
+                            got_scal[a][b].to_bits(),
+                            want[a][b].to_bits(),
+                            "OneSeed K={K} scalar third[{a}][{b}]"
+                        );
+                        assert_eq!(
+                            got_batch[a][b].to_bits(),
+                            want[a][b].to_bits(),
+                            "OneSeed K={K} batch lane {r} third[{a}][{b}]"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn check_twoseed<const K: usize>(state: &mut u64, batches: usize) {
+        for _ in 0..batches {
+            let rows: [[f64; K]; 4] =
+                std::array::from_fn(|_| std::array::from_fn(|_| rand_unit(state)));
+            let u: [[f64; K]; 4] =
+                std::array::from_fn(|_| std::array::from_fn(|_| rand_unit(state)));
+            let v: [[f64; K]; 4] =
+                std::array::from_fn(|_| std::array::from_fn(|_| rand_unit(state)));
+
+            let prod: [TwoSeed<K>; 4] = std::array::from_fn(|r| {
+                let p: [TwoSeed<K>; K] =
+                    std::array::from_fn(|a| TwoSeed::seed(rows[r][a], a, u[r][a], v[r][a]));
+                row_expr(&p)
+            });
+
+            let scal: [TwoSeedLane<f64, K>; 4] = std::array::from_fn(|r| {
+                let p: [TwoSeedLane<f64, K>; K] =
+                    std::array::from_fn(|a| TwoSeedLane::seed(rows[r][a], a, u[r][a], v[r][a]));
+                row_expr(&p)
+            });
+
+            let pbatch: [TwoSeedBatch<K>; K] = std::array::from_fn(|a| {
+                let val = wide::f64x4::new([rows[0][a], rows[1][a], rows[2][a], rows[3][a]]);
+                let uu = wide::f64x4::new([u[0][a], u[1][a], u[2][a], u[3][a]]);
+                let vv = wide::f64x4::new([v[0][a], v[1][a], v[2][a], v[3][a]]);
+                TwoSeedBatch::seed(val, a, uu, vv)
+            });
+            let batch = row_expr(&pbatch);
+
+            for r in 0..4 {
+                let want = prod[r].contracted_fourth();
+                let got_scal = scal[r].contracted_fourth();
+                let got_batch = batch.lane(r).contracted_fourth();
+                assert_eq!(
+                    scal[r].base.v.to_bits(),
+                    prod[r].base.value().to_bits(),
+                    "TwoSeed K={K} scalar value"
+                );
+                assert_eq!(
+                    batch.lane(r).base.value().to_bits(),
+                    prod[r].base.value().to_bits(),
+                    "TwoSeed K={K} batch lane {r} value"
+                );
+                for a in 0..K {
+                    for b in 0..K {
+                        assert_eq!(
+                            got_scal[a][b].to_bits(),
+                            want[a][b].to_bits(),
+                            "TwoSeed K={K} scalar fourth[{a}][{b}]"
+                        );
+                        assert_eq!(
+                            got_batch[a][b].to_bits(),
+                            want[a][b].to_bits(),
+                            "TwoSeed K={K} batch lane {r} fourth[{a}][{b}]"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// ≥2000 random 4-row batches per K, across K ∈ {2,3,4,9}: the
+    /// contracted-third channel of every `OneSeedLane` lane is `to_bits`-identical
+    /// to the production [`OneSeed`] per row.
+    #[test]
+    fn oneseed_lanes_contracted_third_bit_identical() {
+        let mut state = 0x1234_5678_9ABC_DEF0_u64;
+        check_oneseed::<2>(&mut state, 2000);
+        check_oneseed::<3>(&mut state, 2000);
+        check_oneseed::<4>(&mut state, 2000);
+        check_oneseed::<9>(&mut state, 2000);
+    }
+
+    /// ≥2000 random 4-row batches per K, across K ∈ {2,3,4,9}: the
+    /// contracted-fourth channel of every `TwoSeedLane` lane is `to_bits`-identical
+    /// to the production [`TwoSeed`] per row.
+    #[test]
+    fn twoseed_lanes_contracted_fourth_bit_identical() {
+        let mut state = 0x0FED_CBA9_8765_4321_u64;
+        check_twoseed::<2>(&mut state, 2000);
+        check_twoseed::<3>(&mut state, 2000);
+        check_twoseed::<4>(&mut state, 2000);
+        check_twoseed::<9>(&mut state, 2000);
     }
 }

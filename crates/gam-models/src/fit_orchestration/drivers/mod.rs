@@ -9,8 +9,8 @@
 // `gam_solve::*`, basis/term machinery as `gam_terms::*`).
 use gam_terms::basis::{
     BasisError, BasisMetadata, BasisPsiDerivativeResult, BasisPsiSecondDerivativeResult,
-    BasisWorkspace, CenterStrategy, MaternIdentifiability, PenaltyInfo, PenaltySource,
-    build_constant_curvature_basis_kappa_derivatives,
+    BasisWorkspace, CenterStrategy, MaternIdentifiability, PenaltyInfo,
+    PenaltySource, build_constant_curvature_basis_kappa_derivatives,
     build_matern_basis_log_kappa_aniso_derivatives, build_matern_basis_log_kappa_derivatives,
     build_matern_collocation_operator_matrices, build_measure_jet_basis_psi_derivatives,
     build_thin_plate_basis_log_kappa_derivatives, estimate_penalty_nullity, initial_aniso_contrasts,
@@ -64,7 +64,8 @@ use gam_terms::smooth::input_standardization::{
 };
 
 use gam_terms::smooth::penalty_priors::{
-    realize_keyed_penalty_block_gamma_priors, realize_penalty_block_gamma_priors,
+    realize_keyed_penalty_block_gamma_priors,
+    realize_penalty_block_gamma_priors,
 };
 
 use gam_terms::smooth::shape_constraints::{

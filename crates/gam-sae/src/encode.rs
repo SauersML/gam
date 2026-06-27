@@ -352,7 +352,11 @@ pub(crate) fn cylinder_jet_sup(
             rho.powi(line_degree as i32).max(1.0)
         } else {
             let residual = line_degree.saturating_sub(k1 as usize) as i32;
-            big_d.powi(k1 as i32) * rho.powi(residual)
+            // `.max(1.0)` as in `patch_jet_sup`: for ρ < 1 a lower-degree line
+            // monomial dominates the k1-th derivative, so the bare `ρ^residual`
+            // underestimates the line-factor sup. The value case (k1==0) already
+            // clamps; this completes it for the derivative orders.
+            big_d.powi(k1 as i32) * rho.powi(residual).max(1.0)
         };
         best = best.max(circle * line);
     }
@@ -382,7 +386,16 @@ pub(crate) fn patch_jet_sup(
     let big_d = max_degree as f64;
     let rho = patch_rho(chart);
     let residual_degree = max_degree.saturating_sub(order as usize) as i32;
-    d.powi(order as i32) * big_d.powi(order as i32) * rho.powi(residual_degree)
+    // `.max(1.0)`: for ρ < 1 (small charts near the origin) the g-th jet sup is NOT
+    // dominated by the max-degree monomial `t^D` (whose g-th derivative ~ ρ^{D-g}
+    // shrinks with ρ) but by a LOWER-degree monomial whose g-th derivative is a
+    // larger constant — e.g. {1,t,t²}'s jacobian sup is the linear term's constant
+    // `1`, which exceeds `2ρ` when ρ < ½. Without the clamp the bound underestimates
+    // the true sup (numerically: D=3, ρ=0.1, g=1 → formula 0.03 vs true 1.0), which
+    // would make the certificate's Lipschitz `L` too small → a FALSE certificate.
+    // `D^g · max(ρ^{D-g}, 1)` upper-bounds `max_{q∈[g,D]} (q!/(q-g)!)·ρ^{q-g}` for
+    // all ρ (the `q=g` term gives `g! ≤ D^g`, the `q=D` term gives `≤ D^g·ρ^{D-g}`).
+    d.powi(order as i32) * big_d.powi(order as i32) * rho.powi(residual_degree).max(1.0)
 }
 
 impl BasisHessianLipschitz for DuchonCoordinateEvaluator {
