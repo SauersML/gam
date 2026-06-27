@@ -16,8 +16,8 @@
 //! no cargo --release, no parallel cargo.
 
 use gam::families::custom_family::{FamilyChannelHessian, ParameterBlockSpec};
+use gam::families::survival::marginal_slope::identifiability::SurvivalRowHessian;
 use gam::identifiability::audit::{IdentifiabilityAudit, maybe_log_audit_drift};
-use gam::identifiability::marginal_slope::SurvivalRowHessian;
 use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
 use ndarray::{Array1, Array2};
 
