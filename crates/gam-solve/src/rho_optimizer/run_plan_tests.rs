@@ -2966,6 +2966,97 @@ fn parsimonious_keep_best_breaks_laml_tie_toward_more_smoothing() {
     ));
 }
 
+/// #1575: the parsimony-await second-seed waiver fires ONLY for a slot-0 result
+/// that is converged, curvature-pinned (score-relative |g| well inside the tie
+/// band), AND well-penalized (every leading smoothing λ ≥ 1). Every other shape
+/// — the cases the heavy seed actually exists to rescue — must keep slot 1.
+#[test]
+fn parsimony_second_seed_waived_only_for_sharp_well_penalized_optimum() {
+    let plan = OuterPlan {
+        solver: Solver::Arc,
+        hessian_source: HessianSource::Analytic,
+    };
+    let rho_dim = 2usize;
+    // `at_band(frac, score)` is the residual gradient sitting `frac`× the
+    // score-relative sharpness band: frac<1 is inside (sharp), frac>1 outside.
+    let at_band = |frac: f64, score: f64| PARSIMONY_SHARP_GRAD_REL_BAND * (1.0 + score.abs()) * frac;
+
+    // The redundant case: converged, every smoothing ρ ≥ 0, residual gradient
+    // two orders inside the tie band. Slot 1 would only re-derive this — waive.
+    let mut redundant = OuterResult::new(array![3.0, 0.0], 1082.972, 6, true, plan);
+    redundant.final_grad_norm = Some(at_band(0.01, 1082.972)); // 0.01× the band → sharp
+    assert!(
+        parsimony_second_seed_is_redundant(&redundant, rho_dim),
+        "a converged, sharp, well-penalized slot-0 optimum makes the heavy seed redundant"
+    );
+    // Exactly on the band boundary still counts as sharp (≤, not <).
+    let mut on_band = redundant.clone();
+    on_band.final_grad_norm = Some(at_band(1.0, 1082.972));
+    assert!(
+        parsimony_second_seed_is_redundant(&on_band, rho_dim),
+        "the score-relative band is inclusive at its edge"
+    );
+
+    // #1373 under-penalized basin: a smoothing λ < 1 (ρ < 0) is exactly the
+    // overshoot the heavy seed guards against — never waive, even when sharp.
+    let mut under_penalized = redundant.clone();
+    under_penalized.rho = array![-0.5, 3.0];
+    assert!(
+        !parsimony_second_seed_is_redundant(&under_penalized, rho_dim),
+        "a single under-penalized (ρ<0) coordinate keeps the parsimony seed (#1373)"
+    );
+
+    // Flat-valley non-sharp optimum: converged at a residual ABOVE the band, so
+    // the parsimony tie-break could still slide ρ toward the heavier basin.
+    let mut flat_valley = redundant.clone();
+    flat_valley.final_grad_norm = Some(at_band(10.0, 1082.972)); // 10× the band → not sharp
+    assert!(
+        !parsimony_second_seed_is_redundant(&flat_valley, rho_dim),
+        "a converged-but-flat optimum above the tie band keeps the parsimony seed"
+    );
+
+    // Non-converged stall (#1426/#1477): never waive.
+    let mut stalled = redundant.clone();
+    stalled.converged = false;
+    assert!(
+        !parsimony_second_seed_is_redundant(&stalled, rho_dim),
+        "a non-converged slot 0 is precisely the stall the heavy seed rescues (#1426)"
+    );
+
+    // No measured gradient cannot certify sharpness.
+    let mut no_grad = redundant.clone();
+    no_grad.final_grad_norm = None;
+    assert!(
+        !parsimony_second_seed_is_redundant(&no_grad, rho_dim),
+        "an unmeasured gradient cannot prove a curvature-pinned optimum"
+    );
+
+    // The score-relative band scales with |score|: a residual that is absolutely
+    // large is still sharp when the LAML magnitude is large enough.
+    let mut large_score = OuterResult::new(array![2.0, 2.0], 5.0e6, 6, true, plan);
+    large_score.final_grad_norm = Some(40.0); // ≤ 1e-5·(1+5e6) = 50.00001
+    assert!(
+        parsimony_second_seed_is_redundant(&large_score, rho_dim),
+        "sharpness is score-relative, not an absolute gradient threshold"
+    );
+
+    // Trailing auxiliary coordinates (e.g. a GAMLSS log-scale predictor) are not
+    // smoothing parameters and must not block the waiver: only the leading
+    // rho_dim coordinates are tested for λ ≥ 1.
+    let mut with_aux = OuterResult::new(array![3.0, -7.0], 100.0, 6, true, plan);
+    with_aux.final_grad_norm = Some(at_band(0.1, 100.0));
+    assert!(
+        parsimony_second_seed_is_redundant(&with_aux, 1),
+        "a negative trailing auxiliary coordinate (ρ_dim=1) must not block the waiver"
+    );
+
+    // With no smoothing dimension the parsimony tie-break is a no-op.
+    assert!(
+        !parsimony_second_seed_is_redundant(&redundant, 0),
+        "rho_dim=0 has no smoothing parameter for the parsimony seed to decide"
+    );
+}
+
 #[test]
 fn gaussian_multistart_compares_converged_seed_costs() {
     let mut seed_config = gam_problem::SeedConfig::default();
@@ -3008,6 +3099,100 @@ fn gaussian_multistart_compares_converged_seed_costs() {
         "lower-cost converged Gaussian seed should win"
     );
     assert_eq!(result.final_value, 0.0);
+}
+
+/// #1575 end-to-end wiring: drive the real multi-start loop with the
+/// parsimonious (GeneralizedLinear) risk profile and `seed_budget = 2`. A slot-0
+/// seed that CONVERGES to a sharp, well-penalized optimum (every smoothing
+/// λ ≥ 1) must BREAK the multi-start after a single seed — the heavy slot-1 seed
+/// is provably redundant. A slot-0 seed that converges to an UNDER-penalized
+/// (ρ < 0) optimum is the #1373 overshoot regime, so the heavy seed must STILL
+/// run. Counts genuine seed solves by intersecting the recorded solver evals
+/// with the generated seed candidates (a seed-startup eval lands exactly on a
+/// candidate; interior trial steps and the converged optimum do not).
+#[test]
+fn parsimony_multistart_breaks_after_sharp_well_penalized_first_seed() {
+    fn seeds_run(center: f64) -> (usize, OuterResult) {
+        let mut seed_config = gam_problem::SeedConfig::default();
+        seed_config.seed_budget = 2;
+        seed_config.risk_profile = gam_problem::SeedRiskProfile::GeneralizedLinear;
+        let candidates: Vec<Array1<f64>> =
+            crate::seeding::generate_rho_candidates(1, None, &seed_config);
+        // The optimum must not coincide with any generated seed, so only true
+        // seed-startup evals (which land exactly on a candidate) are counted.
+        assert!(
+            candidates.iter().all(|c| (c[0] - center).abs() > 1e-9),
+            "test premise: the optimum {center} must not equal a generated seed"
+        );
+        let started = Arc::new(Mutex::new(Vec::<Array1<f64>>::new()));
+        let problem = OuterProblem::new(1)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(DeclaredHessianForm::Either)
+            .with_seed_config(seed_config)
+            .with_max_iter(16);
+        let mut obj = problem.build_objective(
+            (),
+            move |_: &mut (), theta: &Array1<f64>| {
+                let d = theta[0] - center;
+                Ok(0.5 * d * d)
+            },
+            {
+                let started = Arc::clone(&started);
+                move |_: &mut (), theta: &Array1<f64>| {
+                    started.lock().unwrap().push(theta.clone());
+                    let d = theta[0] - center;
+                    Ok(OuterEval {
+                        cost: 0.5 * d * d,
+                        gradient: array![d],
+                        hessian: HessianResult::Analytic(array![[1.0]]),
+                        inner_beta_hint: None,
+                    })
+                }
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let result = problem
+            .run(&mut obj, "parsimony multistart wiring")
+            .expect("a strictly-convex quadratic outer objective converges");
+        let starts = started.lock().unwrap();
+        let mut origins: Vec<f64> = starts
+            .iter()
+            .filter(|t| candidates.iter().any(|c| (c[0] - t[0]).abs() < 1e-9))
+            .map(|t| t[0])
+            .collect();
+        origins.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+        origins.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+        (origins.len(), result)
+    }
+
+    // Well-penalized minimum (ρ = 2.7 ≥ 0): slot 0 is sharp and every λ ≥ 1, so
+    // the heavy seed is redundant — exactly ONE seed solves.
+    let (well_penalized_seeds, well_result) = seeds_run(2.7);
+    assert!(well_result.converged, "well-penalized fit converges");
+    assert!(
+        (well_result.rho[0] - 2.7).abs() < 1e-4,
+        "publishes the slot-0 optimum, got {}",
+        well_result.rho[0]
+    );
+    assert_eq!(
+        well_penalized_seeds, 1,
+        "a sharp, well-penalized slot-0 optimum must break the multi-start after one seed (#1575)"
+    );
+
+    // Under-penalized minimum (ρ = -2.7 < 0): the #1373 overshoot regime — the
+    // heavy parsimony seed must still run.
+    let (under_penalized_seeds, under_result) = seeds_run(-2.7);
+    assert!(under_result.converged, "under-penalized fit converges");
+    assert!(
+        (under_result.rho[0] + 2.7).abs() < 1e-4,
+        "publishes the slot-0 optimum, got {}",
+        under_result.rho[0]
+    );
+    assert_eq!(
+        under_penalized_seeds, 2,
+        "an under-penalized (ρ<0) slot-0 optimum must keep the parsimony second seed (#1373)"
+    );
 }
 
 /// #1082 separable-multinomial guard: on an expensive-solver risk profile
