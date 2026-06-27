@@ -343,10 +343,7 @@ void arrow_schur_back_sub_pgroup(
 /// pick a CTA size and to allocate the per-block partials buffer.
 #[derive(Clone, Copy, Debug)]
 pub struct FusedLaunchPlan {
-    pub n: usize,
-    pub p_runtime: usize,
     pub p_max: usize,
-    pub r_runtime: usize,
     pub r_template: usize,
     pub threads_per_block: u32,
     pub blocks: u32,
@@ -368,10 +365,7 @@ pub fn plan_fused_launch(n: usize, p: usize, r: usize) -> Option<FusedLaunchPlan
     let threads_per_block = p_max.next_power_of_two().max(32) as u32;
     let blocks = u32::try_from(n).ok()?;
     Some(FusedLaunchPlan {
-        n,
-        p_runtime: p,
         p_max,
-        r_runtime: r,
         r_template,
         threads_per_block,
         blocks,
@@ -409,20 +403,17 @@ pub fn system_admits_fused_path(sys: &ArrowSchurSystem) -> bool {
     ceil_to_template_r(r).is_some()
 }
 
-/// Status of a single emulated fused-kernel block solve. Mirrors the
-/// `status_out` code path of `arrow_schur_forward_pgroup`: zero on success,
-/// otherwise the 1-based pivot row at which the in-shared-memory Cholesky
-/// hit a non-positive diagonal (the kernel's `status_out[i] = j + 1` branch).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FusedBlockStatus {
-    /// Block factored, forward-solved, and reduced cleanly.
-    Ok,
-    /// Non-positive pivot at this 1-based row; the GPU host caller escalates
-    /// `ridge_t` and re-launches (see module-level "Ridge escalation").
-    NonPositivePivot(usize),
-}
+/// Device-free CPU parity harness for the Layer D + E fused arrow-Schur NVRTC
+/// kernel. The functions below reproduce the kernel's exact scalar arithmetic
+/// and column-major memory layout on the host, so the `tests` submodule can
+/// validate the fused algorithm against the dense reference without a CUDA
+/// device. Test-only: production routes through the real NVRTC kernel
+/// (`FORWARD_KERNEL_SOURCE` / `plan_fused_launch`), never this emulation.
+#[cfg(test)]
+mod test_support {
+    use super::*;
 
-/// Why the host-side CPU emulation of the fused Layer D + E pipeline declined.
+    /// Why the host-side CPU emulation of the fused Layer D + E pipeline declined.
 /// These mirror the `ArrowSchurGpuFailure` cases the device host raises so the
 /// emulator can stand in for the GPU path in a device-free parity harness.
 #[derive(Debug, Clone, PartialEq)]
@@ -454,7 +445,7 @@ pub struct FusedCpuSolution {
 /// exactly the device buffers `arrow_schur_forward_pgroup` writes back
 /// (`l_out`, `u_out`, `y_out`) and which `arrow_schur_back_sub_pgroup` reads.
 /// Stored column-major to match the kernel's global-memory layout 1:1.
-struct FusedRowState {
+pub struct FusedRowState {
     /// `L_i` lower Cholesky of `D_i + ρ_t I`, column-major `p×p`.
     l: Vec<f64>,
     /// `u_i = L_i^{-1} g_i`, length `p`.
@@ -481,7 +472,7 @@ struct FusedRowState {
 /// `partial_s` / `partial_r` are written positive (`+Y_iᵀY_i`, `+Y_iᵀu_i`),
 /// matching the NVRTC kernel; the host reduction applies the documented signs.
 /// `log_det_local = 2 Σ_j ln L_i[j,j]` is the block's contribution to `log|H|`.
-fn emulate_forward_block(
+pub fn emulate_forward_block(
     d_col_major: &[f64],
     b_col_major: &[f64],
     g: &[f64],
@@ -761,10 +752,12 @@ pub fn emulate_fused_arrow_newton_step(
         log_det_hessian: log_det,
     })
 }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::test_support::*;
 
     #[test]
     fn ceil_to_template_picks_smallest_admissible() {
@@ -802,11 +795,8 @@ mod tests {
     #[test]
     fn plan_fused_launch_clamps_p_max_and_blocks_count() {
         let plan = plan_fused_launch(7, 10, 4).expect("admissible");
-        assert_eq!(plan.n, 7);
         assert_eq!(plan.blocks, 7);
-        assert_eq!(plan.p_runtime, 10);
         assert!(plan.p_max >= 10);
-        assert_eq!(plan.r_runtime, 4);
         assert_eq!(plan.r_template, 4);
         assert_eq!(plan.partial_r_doubles, 7 * 4);
         assert_eq!(plan.partial_s_doubles, 7 * 4 * 4);
