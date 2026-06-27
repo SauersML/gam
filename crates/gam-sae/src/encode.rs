@@ -1775,8 +1775,11 @@ impl EncodeAtlas {
                         // gather likely missed the true best atom (LSH recall < 1) —
                         // flag it for the exact fallback rather than silently
                         // certifying a mis-route. See CANDIDATE_ROUTING_MIN_ALIGNMENT.
-                        if sketch.alignment(best_atom, targets.row(row))
-                            < CANDIDATE_ROUTING_MIN_ALIGNMENT
+                        // A NaN alignment — a zero-norm target row, ‖d‖ = 0 — must
+                        // also flag for the exact fallback, not slip through `<`.
+                        let routing_alignment = sketch.alignment(best_atom, targets.row(row));
+                        if !routing_alignment.is_finite()
+                            || routing_alignment < CANDIDATE_ROUTING_MIN_ALIGNMENT
                         {
                             return Ok(None);
                         }
@@ -1883,8 +1886,11 @@ impl EncodeAtlas {
                         // for the exact fallback so a missed-true-best LSH route is
                         // never silently certified. See CANDIDATE_ROUTING_MIN_ALIGNMENT
                         // and certified_encode_with_index for the full rationale.
-                        if sketch.alignment(best_atom, targets.row(row))
-                            < CANDIDATE_ROUTING_MIN_ALIGNMENT
+                        // A NaN alignment — a zero-norm target row, ‖d‖ = 0 — must
+                        // also flag for the exact fallback, not slip through `<`.
+                        let routing_alignment = sketch.alignment(best_atom, targets.row(row));
+                        if !routing_alignment.is_finite()
+                            || routing_alignment < CANDIDATE_ROUTING_MIN_ALIGNMENT
                         {
                             return Ok(None);
                         }
