@@ -387,10 +387,7 @@ impl<const K: usize> JetScalar<K> for Order1<K> {
         for i in 0..K {
             g[i] += o.g[i];
         }
-        Order1 {
-            v: self.v + o.v,
-            g,
-        }
+        Order1 { v: self.v + o.v, g }
     }
     fn sub(&self, o: &Self) -> Self {
         // Mirror Order2::sub == self + o.scale(-1.0) exactly: scale then add.
@@ -419,10 +416,7 @@ impl<const K: usize> JetScalar<K> for Order1<K> {
         for i in 0..K {
             g[i] *= s;
         }
-        Order1 {
-            v: self.v * s,
-            g,
-        }
+        Order1 { v: self.v * s, g }
     }
     fn compose_unary(&self, d: [f64; 5]) -> Self {
         // Faà di Bruno truncated to order ≤ 1 (matches `faa_di_bruno` /
@@ -690,6 +684,42 @@ impl<const K: usize> JetScalar<K> for TwoSeed<K> {
             del,
             eps_del,
         }
+    }
+}
+
+// ── Tower3<K>: value / gradient / Hessian / third tensor ────────────────
+
+/// The order-≤3 [`crate::jet_tower::Tower3`] is also a [`JetScalar`]. It serves
+/// consumers that read `.t3` but never `.t4`, avoiding the fourth-tensor
+/// product/composition work while preserving the lower channels
+/// bit-for-bit against [`crate::jet_tower::Tower4`].
+impl<const K: usize> JetScalar<K> for crate::jet_tower::Tower3<K> {
+    fn constant(c: f64) -> Self {
+        crate::jet_tower::Tower3::constant(c)
+    }
+    fn variable(x: f64, axis: usize) -> Self {
+        crate::jet_tower::Tower3::variable(x, axis)
+    }
+    fn value(&self) -> f64 {
+        self.v
+    }
+    fn add(&self, o: &Self) -> Self {
+        *self + *o
+    }
+    fn sub(&self, o: &Self) -> Self {
+        *self + o.scale(-1.0)
+    }
+    fn mul(&self, o: &Self) -> Self {
+        crate::jet_tower::Tower3::mul(self, o)
+    }
+    fn neg(&self) -> Self {
+        self.scale(-1.0)
+    }
+    fn scale(&self, s: f64) -> Self {
+        crate::jet_tower::Tower3::scale(self, s)
+    }
+    fn compose_unary(&self, d: [f64; 5]) -> Self {
+        crate::jet_tower::Tower3::compose_unary(self, [d[0], d[1], d[2], d[3]])
     }
 }
 
