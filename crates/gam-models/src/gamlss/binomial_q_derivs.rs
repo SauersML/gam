@@ -14,7 +14,7 @@
 use gam_solve::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link;
 use crate::probability::signed_probit_logcdf_and_mills_ratio;
 use gam_problem::{InverseLink, StandardLink};
-use gam_math::jet_tower::Tower4;
+use gam_math::jet_tower::{Tower3, Tower4};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BinomialClosedFormLink {
@@ -64,6 +64,28 @@ fn binomial_loglik_q_tower(y: f64, mu: f64, d1: f64, d2: f64, d3: f64, d4: f64) 
     mu_tower.t4[0][0][0][0] = d4;
     // ℓ(μ) via Faà di Bruno; slot-0 (the value f(u)) is unused downstream.
     mu_tower.compose_unary([0.0, ellmu, ellmumu, ellmumum, ellmumumum])
+}
+
+/// The third-order truncation of [`binomial_loglik_q_tower`] as a `Tower3<1>`.
+///
+/// The score/curvature/third consumer
+/// ([`binomial_score_curvaturethird_from_jet`]) reads only the `g`/`h`/`t3`
+/// channels — never `t4`. The order-≤3 Faà-di-Bruno partitions never reach the
+/// `f⁗` stack slot (`ellmumumum` and beyond) nor the inner `t4` tensor, so a
+/// `Tower3<1>` produces those three channels BIT-IDENTICALLY to the full
+/// `Tower4<1>` while skipping the discarded fourth-order seeding, composition,
+/// and tensor (proven by the standalone `to_bits` oracle for #1591). The
+/// fourth-derivative consumer keeps using [`binomial_loglik_q_tower`].
+#[inline]
+fn binomial_loglik_q_tower3(y: f64, mu: f64, d1: f64, d2: f64, d3: f64) -> Tower3<1> {
+    let (ellmu, ellmumu, ellmumum, _ellmumumum) = binomial_loglik_mu_derivatives(y, mu);
+    // μ(q) as the inner jet: value mu, derivatives d1..d3 in the single slot.
+    let mut mu_tower = Tower3::<1>::constant(mu);
+    mu_tower.g[0] = d1;
+    mu_tower.h[0][0] = d2;
+    mu_tower.t3[0][0][0] = d3;
+    // ℓ(μ) via the order-≤3 Faà di Bruno; slot-0 (the value f(u)) is unused.
+    mu_tower.compose_unary([0.0, ellmu, ellmumu, ellmumum])
 }
 
 /// Exact derivatives of the per-row binomial log-likelihood in μ-space,
@@ -160,10 +182,13 @@ pub(super) fn binomial_score_curvaturethird_from_jet(
         return (0.0, 0.0, 0.0);
     }
     // The first three q-derivatives of ℓ(μ(q)) come from ONE jet composition
-    // (issue #932): the inner μ-jet (d1,d2,d3; d4 unused below third order)
-    // composed with the μ-space ℓ-derivative stack. The hand-summed chain rule
-    // `ellmumu·d1² + ellmu·d2` etc. is now the tower's `g`/`h`/`t3` channels.
-    let tower = binomial_loglik_q_tower(y, mu, d1, d2, d3, 0.0);
+    // (issue #932): the inner μ-jet (d1,d2,d3) composed with the μ-space
+    // ℓ-derivative stack. The hand-summed chain rule `ellmumu·d1² + ellmu·d2`
+    // etc. is now the tower's `g`/`h`/`t3` channels. A `Tower3<1>` is used (not
+    // `Tower4<1>`): nothing below reads the fourth channel, so the fourth-order
+    // seeding/compose/tensor would be computed and discarded (#1591 prune,
+    // proven `to_bits`-identical to the `Tower4<1>` read channels).
+    let tower = binomial_loglik_q_tower3(y, mu, d1, d2, d3);
     let score_q = weight * tower.g[0];
     let curvature_q = -weight * tower.h[0][0];
     let third_q = weight * tower.t3[0][0][0];
