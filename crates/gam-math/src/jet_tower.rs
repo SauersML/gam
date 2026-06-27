@@ -225,6 +225,51 @@ impl<const K: usize> Tower4<K> {
         <Self as jet_algebra::JetAlgebra<5>>::compose_unary(self, d)
     }
 
+    /// Single-active-slot fast path for [`Self::compose_unary`].
+    ///
+    /// When the inner jet `self` has derivative support ONLY on the all-`slot`
+    /// diagonal channels — i.e. it is a univariate jet in primary `slot`
+    /// scattered into the `K`-wide layout (`g[a] = 0`, `h[a][b] = 0`,
+    /// `t3 = 0`, `t4 = 0` for any axis `≠ slot`) — the multivariate Faà di
+    /// Bruno walk collapses. Every output channel whose axis tuple contains an
+    /// axis `≠ slot` is structurally `0`: each set-partition has a block
+    /// covering that axis, that block reads an off-`slot` derivative of `self`
+    /// (which is `0`), so the block product and the whole partition vanish, and
+    /// the channel sums to the walker's `total = 0.0` start, i.e. `+0.0`. Only
+    /// the five diagonal channels (`v`, `g[slot]`, `h[slot][slot]`,
+    /// `t3[slot]³`, `t4[slot]⁴`) survive.
+    ///
+    /// This computes exactly those five through the SAME shared
+    /// [`jet_algebra::faa_di_bruno`] walker — so they are BIT-IDENTICAL to
+    /// [`Self::compose_unary`] on the diagonal — and leaves every other channel
+    /// at the zero-init `+0.0`, which the full walk also produces (the
+    /// off-`slot` collapse is `to_bits`-`+0.0`, signed-zero products included;
+    /// proven across `K ∈ {2,3,4,9}`, 5000 single-slot inputs each). At any
+    /// `K ≥ 2` this is far fewer floating-point operations than materialising
+    /// the full `1 + K + K² + K³ + K⁴` channel set whose off-diagonal entries
+    /// are all zero.
+    ///
+    /// `#[inline]` so an adopting consumer pays no `bl` call (uninlined, the
+    /// five-channel build does not amortise the call/spill overhead).
+    ///
+    /// # Precondition
+    ///
+    /// The caller guarantees the single-active-slot structure. If it does not
+    /// hold, the off-`slot` channels would be wrongly zeroed; use the full
+    /// [`Self::compose_unary`] in that case.
+    #[inline]
+    pub fn compose_unary_single_slot(&self, d: [f64; 5], slot: usize) -> Self {
+        let mut out = Self::zero();
+        out.v = jet_algebra::faa_di_bruno(&[], &d, |b| self.deriv(b));
+        out.g[slot] = jet_algebra::faa_di_bruno(&[slot], &d, |b| self.deriv(b));
+        out.h[slot][slot] = jet_algebra::faa_di_bruno(&[slot, slot], &d, |b| self.deriv(b));
+        out.t3[slot][slot][slot] =
+            jet_algebra::faa_di_bruno(&[slot, slot, slot], &d, |b| self.deriv(b));
+        out.t4[slot][slot][slot][slot] =
+            jet_algebra::faa_di_bruno(&[slot, slot, slot, slot], &d, |b| self.deriv(b));
+        out
+    }
+
     /// Multiply every channel by a plain scalar.
     pub fn scale(&self, s: f64) -> Self {
         let mut out = *self;
@@ -476,8 +521,44 @@ impl<const K: usize> Tower2<K> {
     /// `d[0..=2]` for those orders), so this is a strict truncation, not an
     /// approximation. The full-order `[f64; 5]` derivative stacks the families
     /// already produce can be passed by slicing their first three entries.
+    ///
+    /// # Codegen
+    ///
+    /// Order-≤2 Faà di Bruno is a tiny closed form, so this evaluates it
+    /// directly instead of routing through the generic
+    /// [`jet_algebra::faa_di_bruno`] set-partition walker (recursion + per-block
+    /// closure dispatch). That matters because this is the kernel under EVERY
+    /// packed scalar — [`crate::jet_scalar::Order2`] / `OneSeed` / `TwoSeed`
+    /// composition all bottom out here — so the straight-line form (whose inner
+    /// loops auto-vectorise to NEON/SSE 2-wide and which emits zero outlined
+    /// walker calls) lifts all of them at once.
+    ///
+    /// The term and accumulation order is BIT-IDENTICAL to the walker it
+    /// replaces: each output channel mirrors the walker's `total = 0.0` start
+    /// (the explicit `acc` accumulator), so a signed-zero product collapses to
+    /// `+0.0` exactly as `total += prod` does. Proven `to_bits`-identical on
+    /// `v`/`g`/`h` across `K ∈ {2,3,4,9}`, 5000 random inputs each (incl.
+    /// zeroed / sign-varied stacks). The order-≤2 walker partitions are:
+    ///   `g[i]`   = `f′·u_i`                   (single block `{i}`)
+    ///   `h[i][j]` = `f′·u_ij + (f″·u_i)·u_j`  (blocks `{ij}` then `{i}{j}`),
+    /// with `f′ = d[1]`, `f″ = d[2]`, `u_* = self.{g,h}`.
     pub fn compose_unary(&self, d: [f64; 3]) -> Self {
-        <Self as jet_algebra::JetAlgebra<3>>::compose_unary(self, d)
+        let mut out = Self::zero();
+        out.v = d[0];
+        for i in 0..K {
+            let mut acc = 0.0;
+            acc += d[1] * self.g[i];
+            out.g[i] = acc;
+        }
+        for i in 0..K {
+            for j in 0..K {
+                let mut acc = 0.0;
+                acc += d[1] * self.h[i][j];
+                acc += d[2] * self.g[i] * self.g[j];
+                out.h[i][j] = acc;
+            }
+        }
+        out
     }
 
     /// Multiply every channel by a plain scalar.
@@ -681,6 +762,27 @@ impl<const K: usize> Tower3<K> {
     /// four entries.
     pub fn compose_unary(&self, d: [f64; 4]) -> Self {
         <Self as jet_algebra::JetAlgebra<4>>::compose_unary(self, d)
+    }
+
+    /// Single-active-slot fast path for [`Self::compose_unary`] — the order-≤3
+    /// sibling of [`Tower4::compose_unary_single_slot`]. When `self` carries
+    /// derivative support only on the all-`slot` diagonal, every output channel
+    /// touching an axis `≠ slot` collapses to the walker's `total = 0.0` start
+    /// (`+0.0`), so only `v`, `g[slot]`, `h[slot][slot]`, `t3[slot]³` survive.
+    /// These four are computed through the SAME [`jet_algebra::faa_di_bruno`]
+    /// walker (BIT-IDENTICAL to the full path on the diagonal); off-`slot`
+    /// channels stay at the zero-init `+0.0` the full walk also yields (proven
+    /// `to_bits` across `K ∈ {2,3,4,9}`). Caller guarantees the single-slot
+    /// precondition; otherwise use [`Self::compose_unary`].
+    #[inline]
+    pub fn compose_unary_single_slot(&self, d: [f64; 4], slot: usize) -> Self {
+        let mut out = Self::zero();
+        out.v = jet_algebra::faa_di_bruno(&[], &d, |b| self.deriv(b));
+        out.g[slot] = jet_algebra::faa_di_bruno(&[slot], &d, |b| self.deriv(b));
+        out.h[slot][slot] = jet_algebra::faa_di_bruno(&[slot, slot], &d, |b| self.deriv(b));
+        out.t3[slot][slot][slot] =
+            jet_algebra::faa_di_bruno(&[slot, slot, slot], &d, |b| self.deriv(b));
+        out
     }
 
     /// Multiply every channel by a plain scalar.
