@@ -495,6 +495,222 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
     }
 }
 
+/// `ln(2π)` — the per-observation Gaussian / saddlepoint normalizer constant.
+pub(crate) const LN_2PI: f64 = 1.837_877_066_409_345_5;
+
+/// Per-observation **fully normalized, scale-aware** log-likelihood — the true
+/// log predictive density on the response's own measure, evaluated at `mu`.
+///
+/// This is the reporting / model-comparison counterpart of
+/// [`pointwise_loglikelihood_omitting_constants`]. The two are deliberately
+/// different functions serving different masters:
+///
+/// * `*_omitting_constants` is the REML/LAML **building block**. It drops every
+///   family- and saturated-likelihood normalizing constant (and the Gaussian
+///   scale): those are independent of β under the fixed-dispersion handling the
+///   outer objective is routed through, so they cancel in the ρ-derivatives and
+///   in any *within-fit* Δ-log-likelihood. Dropping them is not just harmless
+///   there but *necessary* — carrying the Gamma saturated term `shape·ln shape −
+///   lnΓ(shape)` overflows when the per-iterate shape saturates (#359).
+///
+/// * This function is the **reporting** kernel. It is the sole basis for the
+///   user-facing absolute quantities — the `log_likelihood` that feeds the
+///   conditional/corrected AIC and the per-row predictive densities that feed
+///   the PSIS-LOO `elpd`. There the dropped constants do **not** cancel: they
+///   set the sign and magnitude of a single reported number and break
+///   comparability across families (a Poisson fit that dropped `−ln Γ(y+1)`
+///   against an NB fit that kept it; #1581, #1582), and the Gaussian unit-scale
+///   form breaks the change-of-variables law under response rescaling (#1583).
+///
+/// Every closed-form family carries its full normalizer here:
+///   * Gaussian: `−½[ln(2πφ) − ln wᵢ + wᵢ(yᵢ−μᵢ)²/φ]` with `φ = σ̂²` the
+///     estimated residual variance. The scale **must** be concrete: a profiled
+///     Gaussian whose scale was not resolved (`fixed_phi() == None`) yields NaN
+///     rather than silently collapsing to the unit-variance density — that
+///     silent `φ = 1` fallback was the #1583 defect.
+///   * Poisson: adds the `−ln Γ(y+1)` count normalizer.
+///   * Binomial: adds the `ln C(nᵢ, nᵢyᵢ)` coefficient (`nᵢ = wᵢ` trials).
+///   * Gamma: the full saturated normalizer (shape `= 1/φ`).
+///   * Negative-Binomial / Beta: already fully normalized (unchanged).
+///   * Tweedie: the Jorgensen **saddlepoint** density — exact at `y = 0`
+///     (compound-Poisson point mass) and the standard `(2πφ V(y))^{-½}`
+///     approximation for `y > 0`; the only family whose exact EDM normalizer has
+///     no closed form.
+///
+/// All forms obey `elpd(c·y) − elpd(y) = −n·ln c` under an invertible response
+/// rescaling, and every discrete family returns a log-mass `≤ 0`.
+pub fn pointwise_loglikelihood(
+    y: ArrayView1<f64>,
+    mu: &Array1<f64>,
+    likelihood: &GlmLikelihoodSpec,
+    priorweights: ArrayView1<f64>,
+) -> Array1<f64> {
+    const MU_FLOOR: f64 = 1e-10;
+    const EPS: f64 = 1e-8;
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+    let n = y.len();
+    let values: Vec<f64> = match &likelihood.spec.response {
+        ResponseFamily::Gaussian => {
+            // φ MUST be concrete (the caller resolves the profiled σ̂² into the
+            // scale metadata). No `unwrap_or(1.0)` — see the #1583 note above.
+            let phi = match likelihood.scale.fixed_phi() {
+                Some(p) if p.is_finite() && p > 0.0 => p,
+                _ => return Array1::from_elem(n, f64::NAN),
+            };
+            let inv_phi = 1.0 / phi;
+            let ln_2pi_phi = LN_2PI + phi.ln();
+            (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    let wi = priorweights[i];
+                    if wi <= 0.0 {
+                        // Zero prior weight excludes the observation entirely.
+                        return 0.0;
+                    }
+                    // yᵢ ~ N(μᵢ, φ/wᵢ): ℓᵢ = −½[ln(2πφ) − ln wᵢ + wᵢ(yᵢ−μᵢ)²/φ].
+                    // Only the residual term and the +½ln wᵢ Jacobian carry the
+                    // weight; the 2π·φ normalizer is per-observation.
+                    let resid = y[i] - mu[i];
+                    -0.5 * (ln_2pi_phi - wi.ln() + wi * resid * resid * inv_phi)
+                })
+                .collect()
+        }
+        ResponseFamily::Binomial => (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let mui_c = safe_mu_for_binomial(mu[i]);
+                let wi = priorweights[i];
+                // ln C(nᵢ, nᵢyᵢ) with nᵢ = wᵢ trials (the continuous extension via
+                // lnΓ matches non-integer prior weights). Zero for Bernoulli
+                // (wᵢ = 1, yᵢ ∈ {0,1}: C(1,0) = C(1,1) = 1).
+                let coef = binomial_log_coefficient(wi, y[i]);
+                coef + wi * (y[i] * mui_c.ln() + (1.0 - y[i]) * (1.0 - mui_c).ln())
+            })
+            .collect(),
+        ResponseFamily::Poisson => (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let mui_c = mu[i].max(MU_FLOOR);
+                let log_term = if y[i] > 0.0 { y[i] * mui_c.ln() } else { 0.0 };
+                // − ln Γ(y+1) is the count normalizer the REML kernel drops.
+                priorweights[i] * (log_term - mui_c - ln_gamma(y[i] + 1.0))
+            })
+            .collect(),
+        ResponseFamily::Tweedie { p } => {
+            let p = *p;
+            let phi = fixed_glm_dispersion(likelihood);
+            if !is_valid_tweedie_power(p) || !(phi.is_finite() && phi > 0.0) {
+                return Array1::from_elem(n, f64::NAN);
+            }
+            if validate_tweedie_responses(&y, &priorweights).is_err() {
+                return Array1::from_elem(n, f64::NAN);
+            }
+            (0..n)
+                .into_par_iter()
+                .map(|i| tweedie_saddlepoint_loglik(y[i], mu[i].max(MU_FLOOR), priorweights[i], p, phi))
+                .collect()
+        }
+        ResponseFamily::NegativeBinomial { theta, .. } => {
+            let theta = *theta;
+            (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    if !valid_negbin_theta(theta) || !valid_count_response(y[i]) {
+                        return f64::NAN;
+                    }
+                    let mui_c = mu[i].max(MU_FLOOR);
+                    priorweights[i]
+                        * (ln_gamma(y[i] + theta) - ln_gamma(theta) - ln_gamma(y[i] + 1.0)
+                            + theta * (theta.ln() - (theta + mui_c).ln())
+                            + xlogy(y[i], mui_c)
+                            - y[i] * (theta + mui_c).ln())
+                })
+                .collect()
+        }
+        ResponseFamily::Beta { phi } => {
+            let phi = *phi;
+            (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    if !valid_beta_phi(phi) {
+                        return f64::NAN;
+                    }
+                    priorweights[i] * beta_loglikelihood_full_unit(y[i], mu[i], phi)
+                })
+                .collect()
+        }
+        ResponseFamily::Gamma => {
+            let shape = likelihood.gamma_shape().unwrap_or(1.0);
+            if !(shape.is_finite() && shape > 0.0) {
+                return Array1::from_elem(n, f64::NAN);
+            }
+            (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    let yi_c = y[i].max(EPS);
+                    let mui_c = mu[i].max(MU_FLOOR);
+                    gamma_full_loglik(yi_c, mui_c, priorweights[i], shape)
+                })
+                .collect()
+        }
+        ResponseFamily::RoystonParmar => vec![f64::NAN; n],
+    };
+    Array1::from_vec(values)
+}
+
+/// `ln C(n, n·y)` with `n = w` trials, via the continuous `lnΓ` extension so
+/// non-integer prior weights are handled. The two count arguments `n·y` and
+/// `n·(1−y)` are floored at 0 to absorb tiny negative round-off at `y ∈ {0,1}`.
+#[inline]
+pub(crate) fn binomial_log_coefficient(w: f64, y: f64) -> f64 {
+    if !(w.is_finite() && w > 0.0) {
+        return 0.0;
+    }
+    let k = (w * y).max(0.0);
+    let nk = (w * (1.0 - y)).max(0.0);
+    ln_gamma(w + 1.0) - ln_gamma(k + 1.0) - ln_gamma(nk + 1.0)
+}
+
+/// Full Gamma log-density at mean `mu`, shape `nu = 1/φ`, prior weight `w`
+/// (which scales the shape: `Yᵢ ~ Gamma(shape = w·ν, mean = μ)`).
+#[inline]
+pub(crate) fn gamma_full_loglik(yi: f64, mui: f64, w: f64, nu: f64) -> f64 {
+    let a = (w * nu).max(f64::MIN_POSITIVE);
+    // a·ln(a/μ) + (a−1)·ln y − a·y/μ − lnΓ(a)
+    a * (a / mui).ln() + (a - 1.0) * yi.ln() - a * yi / mui - ln_gamma(a)
+}
+
+/// Tweedie **saddlepoint** log-density (prior weight `w` ⇒ `φᵢ = φ/w`). Exact at
+/// `y = 0` for `1 < p < 2` (compound-Poisson point mass `exp(−wμ^{2−p}/((2−p)φ)`);
+/// the standard `(2πφᵢ V(y))^{-½} exp(−wd/φ)` approximation for `y > 0`, where
+/// `V(y) = y^p` and `d` is the unit deviance. The exponent matches the REML
+/// kernel's `−w·d/φ` term exactly; this only restores the `−½ln(2πφᵢ y^p)`
+/// prefactor. Homogeneous so `elpd(c·y) − elpd(y) = −n ln c` still holds.
+#[inline]
+pub(crate) fn tweedie_saddlepoint_loglik(yi: f64, mui: f64, w: f64, p: f64, phi: f64) -> f64 {
+    let exponent = -w * tweedie_unit_deviance(yi, mui, p) / phi;
+    if yi <= 0.0 {
+        // Exact point mass at zero (no Jacobian prefactor for a mass atom).
+        exponent
+    } else {
+        // φᵢ = φ/w  ⇒  −½ ln(2π (φ/w) y^p).
+        exponent - 0.5 * (LN_2PI + phi.ln() - w.max(f64::MIN_POSITIVE).ln() + p * yi.ln())
+    }
+}
+
+/// Total fully-normalized log-likelihood — the sum of [`pointwise_loglikelihood`]
+/// over all observations. This is the absolute `log_likelihood` reported to the
+/// user (and the basis of the conditional AIC), distinct from the REML
+/// building-block [`calculate_loglikelihood_omitting_constants`].
+pub fn calculate_loglikelihood(
+    y: ArrayView1<f64>,
+    mu: &Array1<f64>,
+    likelihood: &GlmLikelihoodSpec,
+    priorweights: ArrayView1<f64>,
+) -> f64 {
+    pointwise_loglikelihood(y, mu, likelihood, priorweights).sum()
+}
+
 // ---------------------------------------------------------------------------
 // Piece 5: structured low-rank weight in the inner solve.
 //

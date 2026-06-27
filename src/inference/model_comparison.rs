@@ -290,7 +290,6 @@ pub fn model_comparison_from_unified(
     prior_weights: ArrayView1<'_, f64>,
     alo: Option<&AloDiagnostics>,
 ) -> ModelComparison {
-    let log_lik = fit.log_likelihood;
     let phi = fit.dispersion_phi();
     let edf_conditional = fit.edf_total().unwrap_or(f64::NAN);
     let edf = corrected_edf(
@@ -299,18 +298,47 @@ pub fn model_comparison_from_unified(
         fit.smoothing_correction().map(|c| c.view()),
         phi,
     );
-    let aic_conditional = -2.0 * log_lik + 2.0 * edf.conditional;
-    let aic_corrected = -2.0 * log_lik + 2.0 * edf.corrected;
+
+    // The user-facing `log_likelihood` (and the AIC / elpd derived from it) must
+    // be the *fully normalized, scale-aware* absolute log-likelihood — not the
+    // REML building block stored on the fit, which deliberately drops every
+    // family- and saturated-likelihood normalizing constant and the Gaussian
+    // scale (#1581/#1582/#1583). Recompute it here at the fitted means with the
+    // profiled Gaussian scale concretized into σ̂². For custom / GAMLSS fits with
+    // no engine-level family there is no per-row kernel to call, so we fall back
+    // to the stored value (those paths supply their own normalized log-lik).
+    let log_lik = fit
+        .likelihood_family
+        .as_ref()
+        .and_then(|spec| {
+            let scale = reporting_scale(spec, &fit.likelihood_scale, phi);
+            full_loglikelihood_at_eta(y, eta_hat, prior_weights, spec, scale)
+        })
+        .unwrap_or(fit.log_likelihood);
+
+    // An estimated / profiled dispersion is a fitted parameter and adds one
+    // degree of freedom to the conditional AIC — mgcv's `2·(edf + 1)` for a
+    // scale-estimated family (#1583). Fixed-scale families (Poisson, Binomial,
+    // user-fixed φ/θ) add none.
+    let scale_dof = fit
+        .likelihood_family
+        .as_ref()
+        .map(|spec| scale_parameter_count(spec, &fit.likelihood_scale))
+        .unwrap_or(0.0);
+
+    let aic_conditional = -2.0 * log_lik + 2.0 * (edf.conditional + scale_dof);
+    let aic_corrected = -2.0 * log_lik + 2.0 * (edf.corrected + scale_dof);
 
     let loo = alo.and_then(|alo| {
         let spec = fit.likelihood_family.clone()?;
+        let scale = reporting_scale(&spec, &fit.likelihood_scale, phi);
         alo_elpd_from_family(
             y,
             eta_hat,
             alo.eta_tilde.view(),
             prior_weights,
             &spec,
-            fit.likelihood_scale.clone(),
+            scale,
         )
     });
 
@@ -336,7 +364,7 @@ pub fn alo_elpd_from_family(
     scale: crate::types::LikelihoodScaleMetadata,
 ) -> Option<AloElpd> {
     use crate::families::family_runtime::{FamilyStrategy, strategy_for_spec};
-    use crate::pirls::pointwise_loglikelihood_omitting_constants;
+    use crate::pirls::pointwise_loglikelihood;
 
     let n = y.len();
     if eta_hat.len() != n || eta_loo.len() != n || prior_weights.len() != n || n == 0 {
@@ -349,9 +377,103 @@ pub fn alo_elpd_from_family(
         spec: spec.clone(),
         scale,
     };
-    let ll_hat = pointwise_loglikelihood_omitting_constants(y, &mu_hat, &glm, prior_weights);
-    let ll_loo = pointwise_loglikelihood_omitting_constants(y, &mu_loo, &glm, prior_weights);
+    // The PSIS-LOO `elpd` reported to the user is an *absolute* log predictive
+    // density, so it must use the fully normalized, scale-aware kernel (the
+    // profiled Gaussian scale is concretized by the caller). The dropped
+    // constants are identical for the fitted and LOO evaluations of a row (they
+    // depend only on yᵢ and the scale, not on μ), so the PSIS importance ratios
+    // r_i = exp(ℓ̂_i − ℓ_loo,i) — and hence k̂ — are unchanged; only the absolute
+    // elpd is corrected (#1581/#1582/#1583).
+    let ll_hat = pointwise_loglikelihood(y, &mu_hat, &glm, prior_weights);
+    let ll_loo = pointwise_loglikelihood(y, &mu_loo, &glm, prior_weights);
     alo_elpd(ll_hat.view(), ll_loo.view())
+}
+
+/// Total fully-normalized log-likelihood at the fitted linear predictor
+/// `eta_hat`: map through the family inverse link and sum the per-row reporting
+/// kernel. `None` when the inverse link fails, the lengths disagree, or the
+/// result is non-finite (so callers fall back to the stored value).
+fn full_loglikelihood_at_eta(
+    y: ArrayView1<'_, f64>,
+    eta_hat: ArrayView1<'_, f64>,
+    prior_weights: ArrayView1<'_, f64>,
+    spec: &LikelihoodSpec,
+    scale: crate::types::LikelihoodScaleMetadata,
+) -> Option<f64> {
+    use crate::families::family_runtime::{FamilyStrategy, strategy_for_spec};
+    use crate::pirls::calculate_loglikelihood;
+
+    let n = y.len();
+    if eta_hat.len() != n || prior_weights.len() != n || n == 0 {
+        return None;
+    }
+    let mu_hat = strategy_for_spec(spec).inverse_link_array(eta_hat).ok()?;
+    let glm = GlmLikelihoodSpec {
+        spec: spec.clone(),
+        scale,
+    };
+    let ll = calculate_loglikelihood(y, &mu_hat, &glm, prior_weights);
+    ll.is_finite().then_some(ll)
+}
+
+/// Concretize the response-scale metadata for the *reporting* log-likelihood.
+///
+/// The profiled Gaussian carries no fixed scale (`ProfiledGaussian`), so its
+/// predictive density would silently collapse to the unit-variance form. Here we
+/// resolve the estimated residual variance `σ̂² = phi` into a concrete
+/// `FixedDispersion`, so the reporting kernel scores the density on the right
+/// measure and obeys the change-of-variables law (#1583). An explicitly fixed φ
+/// is honored as-is; every other family already carries the parameters its
+/// density needs (Beta φ, NB θ, Gamma shape, Tweedie φ), so its scale is
+/// returned unchanged.
+fn reporting_scale(
+    spec: &LikelihoodSpec,
+    scale: &crate::types::LikelihoodScaleMetadata,
+    phi: f64,
+) -> crate::types::LikelihoodScaleMetadata {
+    use crate::types::{LikelihoodScaleMetadata, ResponseFamily};
+    match spec.response {
+        ResponseFamily::Gaussian => match scale.fixed_phi() {
+            Some(p) if p.is_finite() && p > 0.0 => LikelihoodScaleMetadata::FixedDispersion { phi: p },
+            _ if phi.is_finite() && phi > 0.0 => LikelihoodScaleMetadata::FixedDispersion { phi },
+            _ => scale.clone(),
+        },
+        _ => scale.clone(),
+    }
+}
+
+/// Number of estimated dispersion / scale parameters a family contributes to the
+/// conditional-AIC degrees of freedom (`2·(edf + scale_dof)`, #1583).
+///
+/// Gaussian profiles σ̂² (one extra dof) unless φ was user-fixed; Gamma / Beta /
+/// Tweedie / Negative-Binomial add one only when their dispersion is *estimated*
+/// from data; Poisson and Binomial carry φ ≡ 1 and add none.
+fn scale_parameter_count(
+    spec: &LikelihoodSpec,
+    scale: &crate::types::LikelihoodScaleMetadata,
+) -> f64 {
+    use crate::types::{LikelihoodScaleMetadata, ResponseFamily};
+    let estimated = match spec.response {
+        ResponseFamily::Gaussian => {
+            !matches!(scale, LikelihoodScaleMetadata::FixedDispersion { .. })
+        }
+        ResponseFamily::Gamma => {
+            matches!(scale, LikelihoodScaleMetadata::EstimatedGammaShape { .. })
+        }
+        ResponseFamily::Beta { .. } => {
+            matches!(scale, LikelihoodScaleMetadata::EstimatedBetaPhi { .. })
+        }
+        ResponseFamily::Tweedie { .. } => {
+            matches!(scale, LikelihoodScaleMetadata::EstimatedTweediePhi { .. })
+        }
+        ResponseFamily::NegativeBinomial { .. } => {
+            matches!(scale, LikelihoodScaleMetadata::EstimatedNegBinTheta { .. })
+        }
+        ResponseFamily::Poisson
+        | ResponseFamily::Binomial
+        | ResponseFamily::RoystonParmar => false,
+    };
+    if estimated { 1.0 } else { 0.0 }
 }
 
 #[cfg(test)]

@@ -3590,3 +3590,235 @@ mod root_cause_tests {
         );
     }
 }
+
+/// Regression tests for the fully-normalized, scale-aware **reporting**
+/// log-likelihood kernels (`pointwise_loglikelihood` / `calculate_loglikelihood`)
+/// that back the user-facing AIC and PSIS-LOO elpd. These are distinct from the
+/// REML building-block `*_omitting_constants` kernels, which deliberately drop
+/// family/saturated normalizers. Root causes: #1581 (Poisson `−ln Γ(y+1)`),
+/// #1582 (Poisson↔NB cross-family comparability), #1583 (Gaussian scale + 2π).
+#[cfg(test)]
+mod reporting_loglikelihood_tests {
+    use super::super::{
+        calculate_loglikelihood, calculate_loglikelihood_omitting_constants,
+        pointwise_loglikelihood, pointwise_loglikelihood_omitting_constants,
+    };
+    use gam_problem::{
+        GlmLikelihoodSpec, InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, ResponseFamily,
+        StandardLink,
+    };
+    use ndarray::{Array1, array};
+    use statrs::function::gamma::ln_gamma;
+
+    fn canonical(family: ResponseFamily, link: StandardLink) -> GlmLikelihoodSpec {
+        GlmLikelihoodSpec::canonical(LikelihoodSpec::new(family, InverseLink::Standard(link)))
+    }
+
+    // ---- #1581: Poisson reporting log-likelihood is a true (negative) log-mass.
+    #[test]
+    fn poisson_full_loglik_is_log_mass_and_carries_count_normalizer() {
+        let y = array![0.0, 1.0, 2.0, 3.0, 7.0];
+        let mu = array![0.5, 1.2, 2.5, 2.0, 6.0];
+        let w = Array1::<f64>::ones(y.len());
+        let glm = canonical(ResponseFamily::Poisson, StandardLink::Log);
+
+        let pw = pointwise_loglikelihood(y.view(), &mu, &glm, w.view());
+        // Every Poisson pointwise value is a log probability mass ≤ 0.
+        for (i, &v) in pw.iter().enumerate() {
+            assert!(v <= 0.0, "row {i}: Poisson log-mass must be ≤ 0, got {v}");
+        }
+        // Matches the analytic count log-likelihood y·ln μ − μ − ln Γ(y+1).
+        let analytic: f64 = y
+            .iter()
+            .zip(mu.iter())
+            .map(|(&yi, &mui)| {
+                let log_term = if yi > 0.0 { yi * mui.ln() } else { 0.0 };
+                log_term - mui - ln_gamma(yi + 1.0)
+            })
+            .sum();
+        let total = calculate_loglikelihood(y.view(), &mu, &glm, w.view());
+        assert!((total - analytic).abs() < 1e-10, "{total} vs {analytic}");
+        assert!(total < 0.0, "summed Poisson elpd must be negative, got {total}");
+
+        // The reporting kernel differs from the REML building block by EXACTLY
+        // the dropped −Σ ln Γ(y+1) count normalizer — the #1581 root cause.
+        let omitting =
+            calculate_loglikelihood_omitting_constants(y.view(), &mu, &glm, w.view());
+        let dropped: f64 = y.iter().map(|&yi| ln_gamma(yi + 1.0)).sum();
+        assert!(
+            (omitting - total - dropped).abs() < 1e-10,
+            "omitting − full must equal Σ ln Γ(y+1) = {dropped}; got {}",
+            omitting - total
+        );
+    }
+
+    // ---- #1582: Poisson and NB(θ→∞) report the SAME log-likelihood on the same
+    // count data (NB → Poisson as Var = μ + μ²/θ → μ), so AIC/elpd are
+    // comparable across the two families.
+    #[test]
+    fn poisson_and_large_theta_negbin_full_loglik_agree() {
+        let y = array![0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 9.0];
+        let mu = array![0.8, 1.5, 2.2, 3.1, 3.8, 5.5, 8.0];
+        let w = Array1::<f64>::ones(y.len());
+
+        let poisson = canonical(ResponseFamily::Poisson, StandardLink::Log);
+        let theta = 1.0e5;
+        let negbin = canonical(
+            ResponseFamily::NegativeBinomial { theta, theta_fixed: true },
+            StandardLink::Log,
+        );
+
+        let ll_pois = calculate_loglikelihood(y.view(), &mu, &poisson, w.view());
+        let ll_nb = calculate_loglikelihood(y.view(), &mu, &negbin, w.view());
+
+        // Both are proper negative log-masses.
+        assert!(ll_pois < 0.0 && ll_nb < 0.0, "{ll_pois}, {ll_nb}");
+        // They agree to well under one nat — the residual is O(n·μ²/θ).
+        assert!(
+            (ll_pois - ll_nb).abs() < 1.0e-2,
+            "Poisson vs NB(θ=1e5) must agree: {ll_pois} vs {ll_nb} (Δ={})",
+            ll_pois - ll_nb
+        );
+    }
+
+    // ---- #1583: Gaussian reporting log-likelihood is a true predictive density
+    // — it uses the estimated variance and obeys the change-of-variables law
+    // elpd(c·y) − elpd(y) = −n·ln c, not the c²-scaling of −½·RSS.
+    #[test]
+    fn gaussian_full_loglik_obeys_change_of_variables() {
+        let y = array![1.0, 2.0, 3.0, 4.0, 5.5, 0.5];
+        let mu = array![1.1, 1.9, 3.2, 3.8, 5.0, 0.7];
+        let w = Array1::<f64>::ones(y.len());
+        let n = y.len() as f64;
+        let sigma2 = 0.25_f64;
+
+        let glm = |s2: f64| GlmLikelihoodSpec {
+            spec: LikelihoodSpec::new(ResponseFamily::Gaussian, InverseLink::Standard(StandardLink::Identity)),
+            scale: LikelihoodScaleMetadata::FixedDispersion { phi: s2 },
+        };
+
+        let ll = calculate_loglikelihood(y.view(), &mu, &glm(sigma2), w.view());
+        // Analytic profiled-Gaussian value −½ Σ[ln(2πσ²) + resid²/σ²].
+        let analytic: f64 = y
+            .iter()
+            .zip(mu.iter())
+            .map(|(&yi, &mui)| {
+                let r = yi - mui;
+                -0.5 * ((2.0 * std::f64::consts::PI * sigma2).ln() + r * r / sigma2)
+            })
+            .sum();
+        assert!((ll - analytic).abs() < 1e-10, "{ll} vs {analytic}");
+
+        // Scale equivariance: y→c·y, μ→c·μ, σ̂²→c²·σ̂² ⇒ elpd shifts by −n·ln c.
+        for &c in &[0.5_f64, 2.0, 10.0] {
+            let yc = y.mapv(|v| c * v);
+            let muc = mu.mapv(|v| c * v);
+            let llc = calculate_loglikelihood(yc.view(), &muc, &glm(c * c * sigma2), w.view());
+            let shift = llc - ll;
+            assert!(
+                (shift - (-n * c.ln())).abs() < 1e-9,
+                "c={c}: change-of-variables shift must be −n·ln c = {}, got {shift}",
+                -n * c.ln()
+            );
+        }
+    }
+
+    // A profiled Gaussian whose scale was never concretized must yield NaN, not a
+    // silent unit-variance density — the guard against the #1583 regression.
+    #[test]
+    fn gaussian_full_loglik_requires_concrete_scale() {
+        let y = array![1.0, 2.0, 3.0];
+        let mu = array![1.1, 2.1, 2.9];
+        let w = Array1::<f64>::ones(y.len());
+        let glm = canonical(ResponseFamily::Gaussian, StandardLink::Identity);
+        // canonical Gaussian ⇒ ProfiledGaussian ⇒ fixed_phi() == None.
+        let ll = calculate_loglikelihood(y.view(), &mu, &glm, w.view());
+        assert!(ll.is_nan(), "profiled Gaussian without a concrete σ̂² must be NaN, got {ll}");
+    }
+
+    // Gaussian prior weights act as inverse-variance scaling (Var = φ/wᵢ): the
+    // normalizer picks up the +½ ln wᵢ Jacobian, the residual term picks up wᵢ.
+    #[test]
+    fn gaussian_full_loglik_prior_weight_jacobian() {
+        let y = array![1.0, 2.0];
+        let mu = array![1.3, 1.7];
+        let w = array![2.0, 0.5];
+        let sigma2 = 0.4_f64;
+        let glm = GlmLikelihoodSpec {
+            spec: LikelihoodSpec::new(ResponseFamily::Gaussian, InverseLink::Standard(StandardLink::Identity)),
+            scale: LikelihoodScaleMetadata::FixedDispersion { phi: sigma2 },
+        };
+        let pw = pointwise_loglikelihood(y.view(), &mu, &glm, w.view());
+        for i in 0..2 {
+            let r = y[i] - mu[i];
+            let expect = -0.5
+                * ((2.0 * std::f64::consts::PI * sigma2).ln() - w[i].ln()
+                    + w[i] * r * r / sigma2);
+            assert!((pw[i] - expect).abs() < 1e-12, "row {i}: {} vs {expect}", pw[i]);
+        }
+    }
+
+    // Binomial reporting log-likelihood is a true log-mass ≤ 0 and carries the
+    // ln C(nᵢ, nᵢyᵢ) coefficient (zero for Bernoulli, positive for counts).
+    #[test]
+    fn binomial_full_loglik_carries_coefficient() {
+        // Grouped binomial: prior weights are the trial counts nᵢ.
+        let y = array![0.0, 0.25, 0.5, 1.0];
+        let mu = array![0.1, 0.3, 0.55, 0.9];
+        let w = array![3.0, 4.0, 6.0, 2.0];
+        let glm = canonical(ResponseFamily::Binomial, StandardLink::Logit);
+        let pw = pointwise_loglikelihood(y.view(), &mu, &glm, w.view());
+        for (i, &v) in pw.iter().enumerate() {
+            assert!(v <= 1e-12, "row {i}: binomial log-mass must be ≤ 0, got {v}");
+            let n = w[i];
+            let k = n * y[i];
+            let coef = ln_gamma(n + 1.0) - ln_gamma(k + 1.0) - ln_gamma(n - k + 1.0);
+            let expect = coef + n * (y[i] * mu[i].ln() + (1.0 - y[i]) * (1.0 - mu[i]).ln());
+            assert!((v - expect).abs() < 1e-10, "row {i}: {v} vs {expect}");
+        }
+
+        // Bernoulli (nᵢ = 1, yᵢ ∈ {0,1}): coefficient vanishes, so the full and
+        // omitting kernels coincide.
+        let yb = array![0.0, 1.0, 1.0, 0.0];
+        let mub = array![0.2, 0.8, 0.6, 0.4];
+        let wb = Array1::<f64>::ones(4);
+        let full = pointwise_loglikelihood(yb.view(), &mub, &glm, wb.view());
+        let omit = pointwise_loglikelihood_omitting_constants(yb.view(), &mub, &glm, wb.view());
+        for i in 0..4 {
+            assert!((full[i] - omit[i]).abs() < 1e-12, "row {i}: {} vs {}", full[i], omit[i]);
+        }
+    }
+
+    // Gamma reporting log-likelihood equals the analytic Gamma density (shape
+    // ν = 1/φ, mean μ), summed by calculate_loglikelihood.
+    #[test]
+    fn gamma_full_loglik_matches_density() {
+        let y = array![1.8, 0.7, 3.2];
+        let mu = array![2.0, 1.0, 2.5];
+        let w = array![1.0, 2.0, 0.5];
+        // canonical Gamma ⇒ shape 1 ⇒ ν = 1.
+        let glm = canonical(ResponseFamily::Gamma, StandardLink::Log);
+        let nu = 1.0_f64;
+        let pw = pointwise_loglikelihood(y.view(), &mu, &glm, w.view());
+        for i in 0..3 {
+            let a = w[i] * nu;
+            let expect = a * (a / mu[i]).ln() + (a - 1.0) * y[i].ln() - a * y[i] / mu[i]
+                - ln_gamma(a);
+            assert!((pw[i] - expect).abs() < 1e-10, "row {i}: {} vs {expect}", pw[i]);
+        }
+        let total = calculate_loglikelihood(y.view(), &mu, &glm, w.view());
+        assert!((total - pw.sum()).abs() < 1e-12);
+    }
+
+    // calculate_loglikelihood is exactly the sum of the pointwise kernel.
+    #[test]
+    fn scalar_equals_sum_of_pointwise() {
+        let y = array![0.0, 2.0, 5.0, 1.0];
+        let mu = array![1.0, 2.0, 4.0, 1.5];
+        let w = array![1.0, 1.0, 2.0, 0.5];
+        let glm = canonical(ResponseFamily::Poisson, StandardLink::Log);
+        let pw = pointwise_loglikelihood(y.view(), &mu, &glm, w.view());
+        let total = calculate_loglikelihood(y.view(), &mu, &glm, w.view());
+        assert!((total - pw.sum()).abs() < 1e-12);
+    }
+}
