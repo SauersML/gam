@@ -13,7 +13,14 @@
 //! the `CustomFamily` impl, block Jacobians, fit setup, and the entry point.
 //!
 
-pub(crate) mod identifiability;
+// Public surface: the marginal-slope identifiability pipeline (global-T
+// assembly, per-term parametric design compile, raw↔compiled β projection) is
+// the same public API the pre-#1521 monolith exposed as
+// `gam::identifiability::marginal_slope`. Its entry points are exercised by this
+// module's own unit tests and are public for downstream consumers; keeping the
+// module `pub` (not `pub(crate)`) preserves that contract and the dead-code
+// exemption rustc grants reachable public API.
+pub mod identifiability;
 
 pub(crate) use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyWarmStart,

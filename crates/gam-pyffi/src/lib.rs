@@ -50,7 +50,10 @@ pub(crate) use ffi::ffi_prelude::*;
 // grouped subdirectories above. The Rust module paths now also exist in their
 // canonical grouped form (`crate::ffi::finite_safe_json`, …); the Python
 // surface is unchanged.
-pub(crate) use ffi::{ffi_errors, ffi_prelude, finite_safe_json, python_literal};
+// `ffi_errors`' contents are already glob-re-exported above (line 42); the
+// include!-fragment entrypoints reach them by item name, not via a
+// `crate::ffi_errors::…` module path, so the module itself needs no flat alias.
+pub(crate) use ffi::{ffi_prelude, finite_safe_json, python_literal};
 pub(crate) use inference::{benchmark_scores, inference_instruments};
 pub(crate) use io::{competing_risks_decode, summary_render, survival_surface_io};
 pub(crate) use manifold::manifold_pyclasses;

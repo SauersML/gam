@@ -509,13 +509,6 @@ impl SavedLatentWindowKind {
         }
     }
 
-    fn output_stage(self) -> &'static str {
-        match self {
-            SavedLatentWindowKind::Survival => "writing latent survival predictions",
-            SavedLatentWindowKind::EventProbability => "writing latent binary predictions",
-        }
-    }
-
     fn response_from_survival(self, survival: f64) -> f64 {
         match self {
             SavedLatentWindowKind::Survival => survival,
