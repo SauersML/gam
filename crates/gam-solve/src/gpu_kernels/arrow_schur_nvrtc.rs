@@ -58,6 +58,12 @@ use crate::arrow_schur::ArrowSchurSystem;
 ///
 /// Both conditions trigger admission; the `Unavailable` fall-through preserves
 /// the existing CPU + cuSOLVER paths when admission fails.
+// The fused-path admission rule is consumed only by the CUDA dispatch
+// (`arrow_schur::solve`'s `mod cuda`), which is itself `#[cfg(target_os =
+// "linux")]`. Gating the definition to match keeps it from reading as dead code
+// on the non-linux release builds (mac/windows), exactly as `forward_kernel_source`
+// and `FORWARD_KERNEL_SOURCE` already are.
+#[cfg(target_os = "linux")]
 #[inline]
 #[must_use]
 pub fn fused_path_admitted(n: usize, p: usize, r: usize) -> bool {
@@ -130,6 +136,9 @@ pub fn ceil_to_template_r(r: usize) -> Option<usize> {
 /// process drive multiple device generations without re-compiling on every
 /// launch; `p_max` lets the kernel use a static shared-memory layout sized
 /// for `P × P` and `P × R` doubles.
+// Consumed only by the linux-gated `mod cuda` NVRTC module cache; gated to match
+// so it is not dead on non-linux release builds.
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FusedModuleCacheKey {
     pub cc_major: i32,
@@ -391,6 +400,9 @@ pub fn forward_kernel_source(p_max: usize, r_template: usize) -> String {
 /// Whether the caller-provided system can route through the Layer D + E
 /// NVRTC fused path. Centralised so [`crate::gpu_kernels::arrow_schur::solve`] and
 /// future bench harnesses share the same admission rule.
+// Called only from `arrow_schur::solve`'s `#[cfg(target_os = "linux")]` dispatch
+// block; gated to match so it is not dead on non-linux release builds.
+#[cfg(target_os = "linux")]
 #[inline]
 #[must_use]
 pub fn system_admits_fused_path(sys: &ArrowSchurSystem) -> bool {
@@ -772,6 +784,7 @@ mod tests {
         assert_eq!(ceil_to_template_r(33), None);
     }
 
+    #[cfg(target_os = "linux")] // exercises the linux-only `fused_path_admitted`
     #[test]
     fn fused_admission_rejects_oversize_or_zero_blocks() {
         assert!(!fused_path_admitted(0, 8, 4));
@@ -781,6 +794,7 @@ mod tests {
         assert!(!fused_path_admitted(2, 4, 4)); // total flops ≈ 128, below 1e5, R<16
     }
 
+    #[cfg(target_os = "linux")] // exercises the linux-only `fused_path_admitted`
     #[test]
     fn fused_admission_accepts_dense_arrow_workloads() {
         // Large-scale shape: large n, small p, moderate R. Total flops
