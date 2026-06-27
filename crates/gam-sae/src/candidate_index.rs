@@ -842,6 +842,78 @@ mod tests {
         );
     }
 
+    /// Regression for the routing-confidence gate (#1026): a low-alignment LSH
+    /// route must never be silently certified. `certified_encode_with_index`
+    /// (and the amortized twin) flag a routed row UNCERTIFIED whenever the
+    /// best-aligned proposed atom's frame alignment is below
+    /// `encode::CANDIDATE_ROUTING_MIN_ALIGNMENT`. The gate's decision input is
+    /// exactly `sketch.alignment(best_atom, target)`; pin it here — with exact,
+    /// deterministic linear algebra rather than LSH gather luck — so a future
+    /// change to the frame-alignment formula cannot silently shift the
+    /// threshold's meaning out from under the gate.
+    ///
+    /// Two atoms whose decoder frames span ORTHOGONAL subspaces of a 6-dim
+    /// ambient (atom 0: `span(e0,e1)`, atom 1: `span(e2,e3)`; dims `e4,e5`
+    /// covered by neither). A direction wholly inside atom 1's subspace has
+    /// alignment exactly 1 with atom 1 (in-frame, ABOVE the gate) and exactly 0
+    /// with atom 0 (off-frame, BELOW the gate) — the mis-route the gate exists
+    /// to flag.
+    #[test]
+    fn routing_confidence_gate_input_separates_off_frame_from_in_frame() {
+        use crate::encode::CANDIDATE_ROUTING_MIN_ALIGNMENT as GATE;
+
+        let p = 6usize;
+        let mut block_a = Array2::<f64>::zeros((p, 2));
+        block_a[[0, 0]] = 1.0; // e0
+        block_a[[1, 1]] = 1.0; // e1
+        let mut block_b = Array2::<f64>::zeros((p, 2));
+        block_b[[2, 0]] = 1.0; // e2
+        block_b[[3, 1]] = 1.0; // e3
+        let sketch =
+            RandomProjectionFrameSketch::from_decoder_blocks(&[block_a, block_b], 16, 4242)
+                .unwrap();
+
+        // A unit direction wholly inside atom 1's (e2,e3) subspace.
+        let mut in_frame_b = Array1::<f64>::zeros(p);
+        in_frame_b[2] = 0.6;
+        in_frame_b[3] = 0.8; // unit norm (0.6² + 0.8² = 1)
+        let a_right = sketch.alignment(1, in_frame_b.view());
+        let a_wrong = sketch.alignment(0, in_frame_b.view());
+
+        assert!(
+            a_right > 0.999,
+            "an in-frame direction must align ~1 with its own atom; got {a_right}"
+        );
+        assert!(
+            a_wrong < 1e-9,
+            "an orthogonal-subspace direction must align ~0 with the wrong atom; got {a_wrong}"
+        );
+        // The exact predicate the encode gate evaluates per row: a mis-routed
+        // (orthogonal) atom falls BELOW the gate → flagged for the exact
+        // fallback; the correctly-routed atom sits AT/ABOVE the gate → trusted.
+        assert!(
+            a_wrong < GATE,
+            "a mis-routed (orthogonal) atom must fall below the routing gate {GATE}; got {a_wrong}"
+        );
+        assert!(
+            a_right >= GATE,
+            "the correctly-routed atom must sit at/above the routing gate {GATE}; got {a_right}"
+        );
+
+        // A direction in the UNCOVERED (e4,e5) subspace aligns ~0 with BOTH
+        // atoms, so whichever atom the LSH surfaces, the gate fires: no atom can
+        // certify this route. This is the worst-case the gate exists to catch.
+        let mut uncovered = Array1::<f64>::zeros(p);
+        uncovered[4] = 1.0;
+        for atom in 0..2 {
+            let a = sketch.alignment(atom, uncovered.view());
+            assert!(
+                a < GATE,
+                "an uncovered-subspace direction must fall below the gate for atom {atom}; got {a}"
+            );
+        }
+    }
+
     #[test]
     fn build_is_deterministic_for_a_fixed_seed() {
         let (blocks, _) = synthetic_dictionary(64, 24, 99);

@@ -23,7 +23,7 @@ use std::sync::Arc;
 use ndarray::{Array1, Array2};
 
 use gam::terms::sae::candidate_index::{
-    IndexConfig, RandomProjectionFrameSketch, SaeCandidateIndex,
+    AtomFrameSketch, IndexConfig, RandomProjectionFrameSketch, SaeCandidateIndex,
 };
 use gam::terms::sae::encode::{AtlasConfig, EncodeAtlas, KANTOROVICH_THRESHOLD, row_certificate};
 use gam::terms::sae::manifold::{
@@ -66,6 +66,43 @@ fn planted_circle_atom(n_obs: usize) -> SaeManifoldAtom {
 fn circle_target(t: f64) -> Array1<f64> {
     let angle = TAU * t;
     Array1::from(vec![angle.cos(), angle.sin()])
+}
+
+/// A planted circle atom EMBEDDED in a `p_amb`-dim ambient: the decoder maps
+/// `m(t) = cos(2πt)·e_{plane.0} + sin(2πt)·e_{plane.1}`, so the atom's
+/// column space (its alignment frame) is exactly `span(e_{plane.0},
+/// e_{plane.1})` — a strict 2-d subspace of the higher-dim ambient. The active
+/// 2-d sub-problem is identical to [`planted_circle_atom`] (the extra ambient
+/// dims are inert zeros), so the certificate behaves identically there.
+fn embedded_circle_atom(plane: (usize, usize), p_amb: usize, n_obs: usize) -> SaeManifoldAtom {
+    let evaluator = PeriodicHarmonicEvaluator::new(M).expect("evaluator");
+    let coords = Array2::<f64>::zeros((n_obs.max(1), 1));
+    let (phi, jet) = evaluator.evaluate(coords.view()).expect("evaluate");
+    let mut decoder = Array2::<f64>::zeros((M, p_amb));
+    decoder[[2, plane.0]] = 1.0; // cos column -> e_{plane.0}
+    decoder[[1, plane.1]] = 1.0; // sin column -> e_{plane.1}
+    SaeManifoldAtom::new(
+        format!("circle_{}_{}", plane.0, plane.1),
+        SaeAtomBasisKind::Periodic,
+        1,
+        phi,
+        jet,
+        decoder,
+        Array2::<f64>::eye(M),
+    )
+    .expect("atom build")
+    .with_basis_evaluator(Arc::new(
+        PeriodicHarmonicEvaluator::new(M).expect("evaluator clone"),
+    ))
+}
+
+/// The (p_amb × 2) output-space frame block whose columns are `e_i, e_j` — the
+/// column-space basis the sketch indexes for [`embedded_circle_atom`].
+fn plane_frame(plane: (usize, usize), p_amb: usize) -> Array2<f64> {
+    let mut f = Array2::<f64>::zeros((p_amb, 2));
+    f[[plane.0, 0]] = 1.0;
+    f[[plane.1, 1]] = 1.0;
+    f
 }
 
 #[test]
@@ -734,4 +771,93 @@ fn amortized_predictor_is_the_ift_first_order_map() {
         (ratio - 2.0).abs() < 0.1,
         "the closed-form predictor is the IFT first-order (affine) map: d2/d1 should be ≈ 2, got {ratio}"
     );
+}
+
+// ----------------------------------------------------------------------------
+// Routing-confidence gate (#1026): the LSH proposes the atom, but the in-atom
+// Kantorovich certificate only attests convergence WITHIN that atom — not that
+// the atom is the globally-correct one. A non-empty-but-low-alignment gather
+// (an LSH recall miss that surfaces the wrong atom) must NOT be silently
+// certified; the encode flags it uncertified when the best proposed atom's
+// frame alignment falls below CANDIDATE_ROUTING_MIN_ALIGNMENT (= 0.5), routing
+// it to the exact fallback instead. This test exercises that gate end-to-end.
+// ----------------------------------------------------------------------------
+
+#[test]
+fn lsh_routed_encode_flags_off_frame_target_uncertified() {
+    // Two atoms span ORTHOGONAL planes of a 6-d ambient — atom 0: span(e0,e1),
+    // atom 1: span(e2,e3) — and dims e4,e5 are covered by neither.
+    const P_AMB: usize = 6;
+    let atoms = [
+        embedded_circle_atom((0, 1), P_AMB, 8),
+        embedded_circle_atom((2, 3), P_AMB, 8),
+    ];
+    let atlas = EncodeAtlas::build(
+        &atoms,
+        &[1.0, 1.0],
+        1.0,
+        AtlasConfig {
+            grid_resolution: 32,
+            ridge: 1.0e-9,
+            newton_steps: 2,
+        },
+    )
+    .expect("atlas build");
+
+    // Sketch / index over the two orthogonal column-space frames.
+    let sketch = RandomProjectionFrameSketch::from_decoder_blocks(
+        &[plane_frame((0, 1), P_AMB), plane_frame((2, 3), P_AMB)],
+        16,
+        7,
+    )
+    .expect("sketch build");
+    let index =
+        SaeCandidateIndex::build(&sketch, IndexConfig::auto(16, 2, 7)).expect("index build");
+
+    // Row 0 (CONTRAST, in-frame): target = e2 = m_1(0), exactly on atom 1's
+    // circle AND parallel to atom 1's representative frame column, so the LSH
+    // surfaces atom 1 (its query sketch is identical to atom 1's table
+    // representative) with alignment 1 → the gate passes → it certifies against
+    // the near-root chart.
+    //
+    // Row 1 (GATE, off-frame): target = e4, in the uncovered (e4,e5) subspace,
+    // so its frame alignment with EITHER atom is exactly 0 < 0.5. Whichever atom
+    // (if any) the LSH surfaces, the routing gate fires → uncertified.
+    let mut targets = Array2::<f64>::zeros((2, P_AMB));
+    targets[[0, 2]] = 1.0; // e2
+    targets[[1, 4]] = 1.0; // e4
+    let amplitudes = Array1::<f64>::ones(2);
+
+    let result = atlas
+        .certified_encode_with_index(&atoms, &index, &sketch, targets.view(), amplitudes.view(), 1)
+        .expect("routed encode");
+
+    // The off-frame row is never silently certified — the core regression.
+    assert!(
+        !result.certified[1],
+        "an off-frame (alignment-0) routed row must be flagged uncertified, not certified \
+         against a mis-routed atom"
+    );
+    // The in-frame, on-manifold row routes to its atom and certifies: the gate
+    // flags mis-routes, it must not over-flag a good route.
+    assert!(
+        result.certified[0],
+        "an in-frame, on-manifold routed row must certify; the gate must not over-flag"
+    );
+
+    // Pin the MECHANISM, not merely the outcome: whenever the index surfaces a
+    // candidate for the off-frame target, that candidate's frame alignment is
+    // below the routing gate (0.5 = CANDIDATE_ROUTING_MIN_ALIGNMENT) — i.e. the
+    // row is flagged by the alignment gate, not only by an empty gather (the
+    // pre-existing no-candidate path). `auto_candidate_budget(2) = 32`.
+    let off_frame = targets.row(1).to_owned();
+    let proposal = index.propose(&sketch, off_frame.view(), 32, true);
+    if let Some(&best) = proposal.proposed.first() {
+        let a = sketch.alignment(best, off_frame.view());
+        assert!(
+            a < 0.5,
+            "the off-frame proposal must sit below the routing gate 0.5 \
+             (CANDIDATE_ROUTING_MIN_ALIGNMENT); got alignment {a} for atom {best}"
+        );
+    }
 }
