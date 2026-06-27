@@ -59,6 +59,11 @@ pub use crate::model_types::CriterionCertificate;
 pub(crate) use bridges::*;
 pub use capability::*;
 pub(crate) use fd_audit::*; // fd-ok: re-exports FD-audit oracle; audit-only, not in the math path
+// #1521 carve: the spatial-optimization driver runs the FD-audit oracle as
+// `gam_solve::rho_optimizer::outer_gradient_fd_audit` and inspects its
+// `OuterGradientFdAudit`/`OuterGradientFdComponent` result. The explicit `pub`
+// re-exports override the `pub(crate)` glob above for these audit types.
+pub use fd_audit::{OuterGradientFdAudit, OuterGradientFdComponent, outer_gradient_fd_audit}; // fd-ok: audit-only oracle, not in the math path
 pub use gam_problem::{HessianResult, OuterEval};
 pub use hessian_operator::*;
 pub use objective::*;
@@ -70,5 +75,8 @@ pub(crate) use run_plan::*;
 // Re-export the outer wall-clock deadline arming at `pub` (the blanket
 // `run_plan` re-export above is `pub(crate)`) so the gam-pyffi SAE fit entry can
 // bound its outer search the same way the in-crate survival entry does.
-pub use run_plan::{arm_outer_wall_clock_deadline, clear_outer_wall_clock_deadline};
+pub use run_plan::{
+    arm_outer_wall_clock_deadline, clear_outer_wall_clock_deadline,
+    outer_wall_clock_deadline_exceeded,
+};
 pub(crate) use seed_screening::*;

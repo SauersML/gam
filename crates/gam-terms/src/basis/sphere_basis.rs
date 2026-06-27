@@ -1448,7 +1448,7 @@ pub(crate) fn normalize_penaltywith_psi_derivatives(
     (s_tilde, s_tilde_psi, s_tilde_psi_psi, c)
 }
 
-pub(crate) fn build_matern_operator_penalty_psi_derivatives(
+pub fn build_matern_operator_penalty_psi_derivatives(
     centers: ArrayView2<'_, f64>,
     length_scale: f64,
     nu: MaternNu,
@@ -1752,7 +1752,7 @@ impl DuchonRawPenaltyPsiDerivativeBlocks {
     }
 }
 
-pub(crate) fn build_duchon_operator_penalty_psi_derivatives(
+pub fn build_duchon_operator_penalty_psi_derivatives(
     collocation_points: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
     spec: &DuchonBasisSpec,
@@ -2155,7 +2155,7 @@ pub(crate) fn operator_penalty_candidates_from_derivative_candidates(
         .collect()
 }
 
-pub(crate) fn build_duchon_native_penalty_psi_derivatives(
+pub fn build_duchon_native_penalty_psi_derivatives(
     centers: ArrayView2<'_, f64>,
     spec: &DuchonBasisSpec,
     identifiability_transform: Option<&Array2<f64>>,

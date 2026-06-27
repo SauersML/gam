@@ -59,6 +59,11 @@ mod state_caches;
 pub(crate) use gradient_hessian::*;
 pub(crate) use objective::*;
 pub(crate) use state_caches::*;
+// #1521 carve: the spatial-optimization driver reads the outer-iteration
+// counter through the canonical `outer_eval` module path
+// (`gam_solve::estimate::reml::outer_eval::current_outer_iter`). The explicit
+// `pub use` overrides the `pub(crate)` glob above for this one accessor.
+pub use state_caches::current_outer_iter;
 
 #[cfg(test)]
 mod module_path_lock_tests {

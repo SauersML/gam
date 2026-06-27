@@ -1250,7 +1250,7 @@ pub fn build_duchon_basis_log_kappa_derivativeswithworkspace(
     )
 }
 
-pub(crate) fn build_duchon_basis_log_kappa_derivativeswith_collocationwithworkspace(
+pub fn build_duchon_basis_log_kappa_derivativeswith_collocationwithworkspace(
     data: ArrayView2<'_, f64>,
     spec: &DuchonBasisSpec,
     centers: ArrayView2<'_, f64>,

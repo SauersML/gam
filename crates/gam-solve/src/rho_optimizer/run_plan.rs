@@ -95,7 +95,7 @@ pub fn clear_outer_wall_clock_deadline() {
 
 /// True once an armed deadline has passed; `false` when none is armed, so every
 /// path that does not opt in is byte-for-byte unchanged.
-pub(crate) fn outer_wall_clock_deadline_exceeded() -> bool {
+pub fn outer_wall_clock_deadline_exceeded() -> bool {
     OUTER_WALL_CLOCK_DEADLINE
         .lock()
         .ok()

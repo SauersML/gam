@@ -96,7 +96,7 @@ pub(crate) fn validate_joint_hyper_direction_shapes(
     Ok(())
 }
 
-pub(crate) struct ExternalJointHyperEvaluator<'a> {
+pub struct ExternalJointHyperEvaluator<'a> {
     pub(crate) conditioning: ParametricColumnConditioning,
     pub(crate) penalty_shrinkage_floor: Option<f64>,
     pub(crate) kronecker_penalty_system: Option<gam_terms::smooth::KroneckerPenaltySystem>,
@@ -201,7 +201,7 @@ pub(crate) struct ExternalJointHyperEvaluator<'a> {
 }
 
 impl<'a> ExternalJointHyperEvaluator<'a> {
-    pub(crate) fn new(
+    pub fn new(
         y: ArrayView1<'a, f64>,
         w: ArrayView1<'a, f64>,
         x: &DesignMatrix,
@@ -940,7 +940,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         gradient_is_n_free
     }
 
-    pub(crate) fn evaluate_with_order(
+    pub fn evaluate_with_order(
         &mut self,
         x: &DesignMatrix,
         s_list: &[BlockwisePenalty],
@@ -1012,7 +1012,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         )
     }
 
-    pub(crate) fn evaluate_efs(
+    pub fn evaluate_efs(
         &mut self,
         x: &DesignMatrix,
         s_list: &[BlockwisePenalty],
@@ -1191,7 +1191,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     /// on a joint `[ρ, ψ]` surface. Pass the ψ-tail count into the shared cost
     /// bridge so value-only probes decline the same ext-coordinate-incomplete
     /// corrections as the analytic joint path.
-    pub(crate) fn evaluate_cost_only(
+    pub fn evaluate_cost_only(
         &mut self,
         x: &DesignMatrix,
         s_list: &[BlockwisePenalty],

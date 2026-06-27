@@ -12,7 +12,7 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::{Arc, RwLock};
 
-pub(crate) mod assembly;
+pub mod assembly;
 pub mod atoms;
 pub(crate) mod continuation;
 pub(crate) mod eval;
@@ -20,7 +20,7 @@ mod firth;
 pub(super) mod hyper;
 mod inner_strategy;
 pub(crate) mod jeffreys_subspace;
-pub(crate) mod outer_eval;
+pub mod outer_eval;
 pub mod penalty_logdet;
 pub mod per_atom_efs;
 pub mod reml_outer_engine;
@@ -3912,9 +3912,9 @@ impl From<Array2<f64>> for HyperPenaltyDerivative {
 }
 
 #[derive(Clone)]
-pub(crate) struct PenaltyDerivativeComponent {
-    pub(crate) penalty_index: usize,
-    pub(crate) matrix: HyperPenaltyDerivative,
+pub struct PenaltyDerivativeComponent {
+    pub penalty_index: usize,
+    pub matrix: HyperPenaltyDerivative,
 }
 
 #[derive(Clone)]

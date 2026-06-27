@@ -78,6 +78,24 @@ pub(crate) use std::sync::{Arc, Mutex, OnceLock};
 pub(crate) use gam_model_api::families::custom_family::*;
 pub(crate) use gam_problem::*;
 
+// #1521 carve: targeted PUBLIC re-exports so the lifted `fit_orchestration`
+// drivers (now in gam-models) reach these carriers as
+// `gam_solve::custom_family::<X>` (the globs above keep them crate-internal).
+// Explicit named re-exports shadow the broad `*` globs above (glob imports have
+// lower precedence) and — because every name below resolves to the SAME item in
+// gam-models' own `gam_model_api`/`gam_problem` globs — they do not introduce an
+// E0659 ambiguity in the gam-models facade.
+pub use gam_model_api::families::custom_family::{
+    BlockwiseFitOptions, CustomFamily, FamilyEvaluation, cost_gated_first_order_max_iter,
+    exact_newton_outer_geometry_supports_second_order_solver,
+};
+pub use gam_problem::{
+    AdditiveBlockJacobian, BlockEffectiveJacobian, BlockGeometryDirectionalDerivative,
+    BlockWorkingSet, CustomFamilyBlockPsiDerivative, CustomFamilyPsiDerivativeOperator,
+    ExactNewtonJointPsiTerms, ExactNewtonOuterObjective, FamilyLinearizationState,
+    ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
+};
+
 // `whitened_spectrum` is a submodule hosted inside `joint_newton`; re-export it
 // at the carrier scope so the trust-region tests reach it through `super::*`.
 pub(crate) use joint_newton::whitened_spectrum;
@@ -114,7 +132,10 @@ pub(crate) use covariance::*;
 // the relocated families (`crate::custom_family::{use_joint_matrix_free_path,
 // projected_linear_constraint_stationarity_vector}`); surface them publicly
 // (the `pub(crate) use covariance::*` glob above keeps them crate-internal).
-pub use covariance::{projected_linear_constraint_stationarity_vector, use_joint_matrix_free_path};
+pub use covariance::{
+    joint_exact_analytic_outer_hessian_available, projected_linear_constraint_stationarity_vector,
+    use_joint_matrix_free_path,
+};
 pub use fit::*;
 pub(crate) use inner_blockwise_fit::*;
 pub(crate) use jeffreys::*;

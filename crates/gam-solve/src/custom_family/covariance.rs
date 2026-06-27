@@ -17,7 +17,7 @@ pub(crate) const JOINT_TRACE_STABILITY_RIDGE: f64 = 1e-10;
 
 pub(crate) const JOINT_PCG_MAX_ITER_MULTIPLIER: usize = 4;
 
-pub(crate) fn joint_exact_analytic_outer_hessian_available() -> bool {
+pub fn joint_exact_analytic_outer_hessian_available() -> bool {
     true
 }
 

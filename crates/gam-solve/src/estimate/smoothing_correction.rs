@@ -114,7 +114,7 @@ const DP_FLOOR_SMOOTH_WIDTH: f64 = 1e-8;
 
 // Unified rho bound corresponding to lambda in [exp(-RHO_BOUND), exp(RHO_BOUND)].
 // Additional headroom reduces frequent contact with the hard box constraints.
-pub(crate) const RHO_BOUND: f64 = 30.0;
+pub const RHO_BOUND: f64 = 30.0;
 // Soft interior prior on rho near the box boundaries.
 pub(crate) const RHO_SOFT_PRIOR_WEIGHT: f64 = 1e-6;
 pub(crate) const RHO_SOFT_PRIOR_SHARPNESS: f64 = 4.0;

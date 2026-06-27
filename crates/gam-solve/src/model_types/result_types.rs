@@ -20,7 +20,7 @@ pub use gam_problem::ExecutionPath;
 /// finite without perturbing any `φ` above the denormal range.
 const DISPERSION_POSITIVE_FLOOR: f64 = 1e-300;
 
-pub(crate) fn dispersion_from_likelihood(
+pub fn dispersion_from_likelihood(
     likelihood: &GlmLikelihoodSpec,
     standard_deviation: f64,
 ) -> Dispersion {

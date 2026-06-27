@@ -347,7 +347,7 @@ pub(crate) fn record_current_outer_iter_for_ift(iter: u64) {
     OUTER_IFT_RESIDUAL_ENERGY_ITER.store(iter, Ordering::Relaxed);
 }
 
-pub(crate) fn current_outer_iter() -> u64 {
+pub fn current_outer_iter() -> u64 {
     OUTER_IFT_RESIDUAL_ENERGY_ITER.load(Ordering::Relaxed)
 }
 

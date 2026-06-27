@@ -73,7 +73,7 @@ mod prefit;
 pub(crate) mod smoothing_correction;
 mod summary;
 
-pub(crate) use crate::model_types::result_types::dispersion_from_likelihood;
+pub use crate::model_types::result_types::dispersion_from_likelihood;
 pub use crate::model_types::{
     AdaptiveRegularizationOptions, BlockRole, FitArtifacts, FitGeometry, FitInference, FitOptions,
     FittedBlock, FittedLinkState, UnifiedFitResult, UnifiedFitResultParts,
@@ -95,6 +95,7 @@ pub(crate) use external_options::{
     effective_sas_link_for_family, resolved_external_config, validate_penalty_spec_shape,
 };
 pub use fit::{fit_gam, fit_gam_with_penalty_specs, fit_gamwith_heuristic_lambdas};
+pub use joint_hyper::ExternalJointHyperEvaluator;
 pub(crate) use optimizer::optimize_external_designwith_heuristic_lambdas_andwarm_start;
 pub use optimizer::{optimize_external_design, optimize_external_designwith_heuristic_lambdas};
 pub(crate) use penalty::{
@@ -109,9 +110,12 @@ pub(crate) use prefit::{
 pub(crate) use smoothing_correction::{
     AUTO_CUBATURE_BOUNDARY_MARGIN, AUTO_CUBATURE_MAX_BETA_DIM, AUTO_CUBATURE_MAX_EIGENVECTORS,
     AUTO_CUBATURE_MAX_RHO_DIM, AUTO_CUBATURE_TARGET_VAR_FRAC, MAX_FACTORIZATION_ATTEMPTS,
-    RHO_BOUND, RHO_SOFT_PRIOR_SHARPNESS, RHO_SOFT_PRIOR_WEIGHT, RemlConfig,
-    compute_smoothing_correction, smooth_floor_dp,
+    RHO_SOFT_PRIOR_SHARPNESS, RHO_SOFT_PRIOR_WEIGHT, RemlConfig, compute_smoothing_correction,
+    smooth_floor_dp,
 };
+// #1521 carve: the spatial-optimization driver reads the unified rho bound as
+// `gam_solve::estimate::RHO_BOUND`.
+pub use smoothing_correction::RHO_BOUND;
 pub use summary::{
     ContinuousSmoothnessOrder, ContinuousSmoothnessOrderStatus, ModelSummary,
     ParametricTermSummary, SmoothTermSummary, compute_continuous_smoothness_order,

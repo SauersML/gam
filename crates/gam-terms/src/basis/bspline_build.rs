@@ -2091,7 +2091,7 @@ fn bspline_penalty_candidates(
 }
 
 /// Build the double-penalty ridge from the structural null space of a PSD penalty.
-pub(crate) fn build_nullspace_shrinkage_penalty(
+pub fn build_nullspace_shrinkage_penalty(
     penalty: &Array2<f64>,
 ) -> Result<Option<CanonicalPenaltyBlock>, BasisError> {
     if penalty.nrows() != penalty.ncols() {
@@ -2292,7 +2292,7 @@ pub(crate) fn finite_data_range(data: ArrayView1<'_, f64>) -> Result<(f64, f64),
     Ok((minv, maxv))
 }
 
-pub(crate) fn expand_periodic_centers(
+pub fn expand_periodic_centers(
     centers: &Array2<f64>,
     periodic: Option<&[Option<f64>]>,
 ) -> Result<Array2<f64>, BasisError> {

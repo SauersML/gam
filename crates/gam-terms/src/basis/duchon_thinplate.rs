@@ -1555,7 +1555,7 @@ pub(crate) fn active_thin_plate_penalty_derivatives(
 // (`build_scalar_design_psi_derivatives_shared`) so large-scale TPS terms no
 // longer materialize dense `(n × p)` first/second derivative arrays.
 
-pub(crate) fn build_thin_plate_penalty_psi_derivativeswithworkspace(
+pub fn build_thin_plate_penalty_psi_derivativeswithworkspace(
     centers: ArrayView2<'_, f64>,
     spec: &ThinPlateBasisSpec,
     identifiability_transform: Option<&Array2<f64>>,
