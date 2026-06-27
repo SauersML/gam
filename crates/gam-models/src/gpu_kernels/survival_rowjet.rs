@@ -271,6 +271,10 @@ mod device {
         Ok(m)
     }
 
+    fn has_nonzero_direction(dir: &[f64; 4]) -> bool {
+        dir.iter().any(|&v| v != 0.0)
+    }
+
     pub(super) fn survival_rigid_row_jets_device(
         rows: &[SurvivalRowInputs],
         probit_scale: f64,
@@ -291,9 +295,15 @@ mod device {
         }
         let b = backend()?;
         let m = module(b)?;
+        let need_fourth = has_nonzero_direction(dir_u) && has_nonzero_direction(dir_v);
+        let func_name = if need_fourth {
+            "survival_rowjet"
+        } else {
+            "survival_rowjet_no_t4"
+        };
         let func = m
-            .load_function("survival_rowjet")
-            .gpu_ctx("survival_rowjet load_function")?;
+            .load_function(func_name)
+            .gpu_ctx_with(|err| format!("survival_rowjet load_function {func_name}: {err}"))?;
         let stream = b.stream.clone();
 
         // Flatten inputs into struct-of-arrays for coalesced device reads.
@@ -325,8 +335,6 @@ mod device {
         let zs_d = stream.clone_htod(&zs).gpu_ctx("htod zsum")?;
         let cov_d = stream.clone_htod(&cov).gpu_ctx("htod cov")?;
         let dir_d = stream.clone_htod(&dir.to_vec()).gpu_ctx("htod dir")?;
-        let diru_d = stream.clone_htod(&dir_u.to_vec()).gpu_ctx("htod dir_u")?;
-        let dirv_d = stream.clone_htod(&dir_v.to_vec()).gpu_ctx("htod dir_v")?;
 
         let mut value_d = stream.alloc_zeros::<f64>(n).gpu_ctx("alloc value")?;
         let mut grad_d = stream.alloc_zeros::<f64>(n * 4).gpu_ctx("alloc grad")?;
@@ -334,8 +342,8 @@ mod device {
         let mut third_d = stream.alloc_zeros::<f64>(n * 16).gpu_ctx("alloc third")?;
         let mut fourth_d = stream.alloc_zeros::<f64>(n * 16).gpu_ctx("alloc fourth")?;
 
-        let n_i32 =
-            i32::try_from(n).map_err(|_| gam_gpu::gpu_err!("survival_rowjet n={n} overflows i32"))?;
+        let n_i32 = i32::try_from(n)
+            .map_err(|_| gam_gpu::gpu_err!("survival_rowjet n={n} overflows i32"))?;
         const TPB: u32 = 128;
         let grid = ((n as u32).div_ceil(TPB)).max(1);
         let cfg = LaunchConfig {
@@ -355,18 +363,24 @@ mod device {
             .arg(&zs_d)
             .arg(&cov_d)
             .arg(&probit_scale)
-            .arg(&dir_d)
-            .arg(&diru_d)
-            .arg(&dirv_d)
+            .arg(&dir_d);
+        let diru_d;
+        let dirv_d;
+        if need_fourth {
+            diru_d = stream.clone_htod(&dir_u.to_vec()).gpu_ctx("htod dir_u")?;
+            dirv_d = stream.clone_htod(&dir_v.to_vec()).gpu_ctx("htod dir_v")?;
+            builder.arg(&diru_d).arg(&dirv_d);
+        }
+        builder
             .arg(&mut value_d)
             .arg(&mut grad_d)
             .arg(&mut hess_d)
             .arg(&mut third_d)
             .arg(&mut fourth_d);
         // SAFETY: grid/block validated; every pointer is a cudarc-checked
-        // allocation on this stream; the kernel reads the 8 input arrays of
-        // length n (+ three length-4 directions) and writes within the output
-        // buffers of length n / n*16.
+        // allocation on this stream; the selected kernel reads the 8 input
+        // arrays of length n (+ one or three length-4 directions) and writes
+        // within the output buffers of length n / n*16.
         unsafe { builder.launch(cfg) }.gpu_ctx("survival_rowjet kernel launch")?;
 
         let mut value = vec![0.0_f64; n];

@@ -233,3 +233,24 @@ extern "C" __global__ void __launch_bounds__(128,1) survival_rowjet(
     for(int a=0;a<K;a++)for(int b=0;b<K;b++){ size_t o=(size_t)i*K*K+a*K+b;
         out_h[o]=j1.h[a][b]; out_t3[o]=j1.dh[a][b]; out_t4[o]=j2.huv[a][b]; }
 }
+
+extern "C" __global__ void __launch_bounds__(128,1) survival_rowjet_no_t4(
+        int n,
+        const double* __restrict__ q0,const double* __restrict__ q1,
+        const double* __restrict__ qd1,const double* __restrict__ gg,
+        const double* __restrict__ wi,const double* __restrict__ di,
+        const double* __restrict__ zsum,const double* __restrict__ cov,
+        double probit_scale,
+        const double* __restrict__ dir,
+        double* __restrict__ out_v, double* __restrict__ out_g,
+        double* __restrict__ out_h, double* __restrict__ out_t3, double* __restrict__ out_t4){
+    int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i>=n) return;
+    RowIn in; in.wi=wi[i]; in.di=di[i]; in.z_sum=zsum[i]; in.cov_ones=cov[i]; in.probit_scale=probit_scale;
+    double q0v=q0[i],q1v=q1[i],qd1v=qd1[i],gv=gg[i];
+    JS1 j1=nll_js1(js1_var(q0v,0,dir[0]),js1_var(q1v,1,dir[1]),js1_var(qd1v,2,dir[2]),js1_var(gv,3,dir[3]),in);
+    out_v[i]=j1.v;
+    for(int a=0;a<K;a++) out_g[(size_t)i*K+a]=j1.g[a];
+    for(int a=0;a<K;a++)for(int b=0;b<K;b++){ size_t o=(size_t)i*K*K+a*K+b;
+        out_h[o]=j1.h[a][b]; out_t3[o]=j1.dh[a][b]; out_t4[o]=0.0; }
+}
