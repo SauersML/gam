@@ -83,3 +83,26 @@ def test_every_test_file_is_collected_by_some_ci_step() -> None:
         + "\nEither restore the directory-level catch-all step or name these "
         "files explicitly."
     )
+
+
+if __name__ == "__main__":
+    # #1512: this guard is pure-Python and must run even where ``pytest`` is not
+    # installed (the triage / Rust-only environments). Running it as a plain
+    # script exercises the same assertions as ``pytest`` and exits non-zero on
+    # the first failure, so it can gate locally without the test runner.
+    _CHECKS = (
+        test_workflow_has_a_directory_level_pytest_step,
+        test_every_test_file_is_collected_by_some_ci_step,
+    )
+    _failures = 0
+    for _check in _CHECKS:
+        try:
+            _check()
+        except AssertionError as exc:  # pragma: no cover - exercised via __main__
+            _failures += 1
+            print(f"FAIL {_check.__name__}:\n{exc}")
+        else:
+            print(f"PASS {_check.__name__}")
+    if _failures:
+        raise SystemExit(f"{_failures} guard check(s) failed (#1512)")
+    print("OK: all #1512 orphan-guard checks passed")
