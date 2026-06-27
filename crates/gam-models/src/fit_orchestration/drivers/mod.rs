@@ -7,21 +7,14 @@
 // `prelude.rs`/`term_specs.rs` used to provide is reconstructed below with the
 // relocated paths (families now resolve as `crate::*`, the solver as
 // `gam_solve::*`, basis/term machinery as `gam_terms::*`).
-#![allow(unused_imports)]
-
 use gam_terms::basis::{
-    BSplineIdentifiability, BSplineKnotSpec, BasisError, BasisMetadata, BasisPsiDerivativeResult,
-    BasisPsiSecondDerivativeResult, BasisWorkspace, CenterStrategy, ConstantCurvatureBasisSpec,
-    ConstantCurvatureIdentifiability, DuchonBasisSpec, MaternIdentifiability,
-    MeasureJetFrozenQuadrature, MeasureJetIdentifiability, OneDimensionalBoundary, PenaltyCandidate,
-    PenaltyInfo, PenaltySource, SpatialIdentifiability, SphericalSplineBasisSpec,
-    SphericalSplineIdentifiability, apply_sum_to_zero_constraint, build_bspline_basis_1d,
-    build_constant_curvature_basis_kappa_derivatives,
+    BasisError, BasisMetadata, BasisPsiDerivativeResult, BasisPsiSecondDerivativeResult,
+    BasisWorkspace, CenterStrategy, ConstantCurvatureBasisSpec, MaternIdentifiability, PenaltyInfo,
+    PenaltySource, build_bspline_basis_1d, build_constant_curvature_basis_kappa_derivatives,
     build_matern_basis_log_kappa_aniso_derivatives, build_matern_basis_log_kappa_derivatives,
     build_matern_collocation_operator_matrices, build_measure_jet_basis_psi_derivatives,
-    build_spherical_spline_basis, build_thin_plate_basis_log_kappa_derivatives,
-    estimate_penalty_nullity, filter_active_penalty_candidates, initial_aniso_contrasts,
-    orthogonality_transform_for_design, select_centers_by_strategy,
+    build_thin_plate_basis_log_kappa_derivatives, estimate_penalty_nullity, initial_aniso_contrasts,
+    select_centers_by_strategy,
 };
 
 use gam_custom_family::{
@@ -45,7 +38,7 @@ use gam_solve::estimate::reml::DirectionalHyperParam;
 // by families + pyffi resolves unchanged.
 pub use gam_terms::smooth::freeze_term_collection_from_design;
 
-use crate::family_runtime::{FamilyStrategy, strategy_for_spec};
+use crate::family_runtime::strategy_for_spec;
 
 use gam_solve::mixture_link::{
     logit_inverse_link_jet5, state_from_beta_logisticspec, state_from_sasspec, state_fromspec,
@@ -56,8 +49,7 @@ use gam_math::quantile::quantile_from_sorted;
 use gam_linalg::faer_ndarray::{fast_ab, fast_atb, fast_atv};
 
 use gam_linalg::matrix::{
-    BlockDesignOperator, CoefficientTransformOperator, DesignBlock, DesignMatrix,
-    RandomEffectOperator, SymmetricMatrix,
+    DesignBlock, DesignMatrix, RandomEffectOperator, SymmetricMatrix,
 };
 
 use gam_problem::LinearInequalityConstraints;
@@ -81,8 +73,6 @@ use gam_terms::smooth::shape_constraints::{
     linear_constraints_from_lower_bounds_global, merge_linear_constraints_global,
     shape_lower_bounds_local,
 };
-
-use gam_terms::smooth::structure_analysis::smooth_has_frozen_identifiability;
 
 // Every `pub` item that `gam_terms::smooth` exposes (the `term_specs.rs`
 // spec/design machinery, `SmoothError`, the `penalty_priors`/`structure_analysis`

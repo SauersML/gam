@@ -368,7 +368,7 @@ def __getattr__(name: str):
     This preserves the Python contract that ``hasattr`` only ever returns a
     bool and that ``from gamfit import *`` does not blow up on torch-less
     installs, while ``gamfit.AdaptiveTopK`` (direct access) still produces a
-    clear actionable message pointing at the ``gamfit[torch]`` extra.
+    clear actionable message pointing at ``pip install torch``.
     """
     target = _LAZY_TORCH_ATTRS.get(name)
     if target is not None:
@@ -381,8 +381,8 @@ def __getattr__(name: str):
                 raise
             raise AttributeError(
                 f"gamfit.{name} requires an optional dependency that is not "
-                f"installed ({exc.name!r}). Install the torch extra: "
-                f"pip install 'gamfit[torch]'."
+                f"installed ({exc.name!r}). Install it with: "
+                f"pip install torch."
             ) from exc
         return getattr(module, attr)
     raise AttributeError(f"module 'gamfit' has no attribute {name!r}")

@@ -38,7 +38,7 @@ def _require_torch() -> Any:
     except ImportError as err:
         raise ImportError(
             "this gamfit descriptor method requires torch; install with "
-            "`pip install gamfit[torch]`"
+            "`pip install torch`"
         ) from err
     return torch
 

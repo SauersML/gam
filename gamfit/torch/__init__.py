@@ -24,7 +24,7 @@ Layout:
 - :func:`from_fitted` — wrap a fitted :class:`gamfit.Model` as a frozen
   ``nn.Module``.
 
-The subpackage is an optional extra: ``pip install gamfit[torch]``. Importing
+The subpackage requires torch: ``pip install torch``. Importing
 :mod:`gamfit` itself does not pull in torch.
 """
 

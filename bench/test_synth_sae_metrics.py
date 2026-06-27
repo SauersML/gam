@@ -15,6 +15,13 @@ import numpy as np
 
 from itertools import permutations
 
+import os
+import sys
+
+# Ensure this file's own directory (bench/) is importable when pytest runs
+# under --import-mode=importlib, which does NOT add the test's dir to sys.path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from _synth_sae_metrics import (
     _hungarian_max_numpy,
     feature_uniqueness,
