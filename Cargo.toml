@@ -322,17 +322,44 @@ debug = false
 #     improvement at large scale over `codegen-units = 16`, on top
 #     of the LTO win.
 #
+#   * `opt-level = 3` — pinned explicitly. It is also the `release`
+#     default, but the dev/test profiles drop dependencies to
+#     `opt-level = 2`, so pinning documents that the SHIPPED numeric
+#     hot loops are built at max scalar/autovec optimization.
+#
+#   * `panic = "unwind"` — MUST stay unwind, NOT abort. PyO3 wraps every
+#     `#[pyfunction]`/`#[pymethods]` entry point in `catch_unwind` to turn
+#     a Rust panic into a Python `PanicException` at the FFI boundary. With
+#     `panic = "abort"` a panic anywhere in the engine would SIGABRT the
+#     host interpreter instead of raising a catchable Python exception — a
+#     crash-vs-exception behavior change. The unwind-table removal (faster +
+#     smaller) is therefore deliberately DECLINED at this FFI boundary.
+#
+#   * `strip = true` — strip both the symbol table and debuginfo from the
+#     shipped `cdylib`: smaller wheel, zero runtime cost (release carries no
+#     line tables anyway). Maturin's `--strip` is kept as a redundant
+#     post-link strip.
+#
 # Combined cost: cold-cache wheel builds go from ~12 min to ~22 min on
-# the slowest runner (macos-15-intel). The Swatinem/rust-cache hit on
-# warm rebuilds keeps the typical-case at ~4 min. For PyPI consumers
-# who pip-install once and run large-scale fits for hours, the runtime win
-# is the production lever; the build-time hit is amortized to ~zero.
-# When a faster turnaround is needed during development, dispatch the
-# workflow with `linux_only=true` to skip the slow macOS + Windows
-# matrices entirely.
+# the slowest runner (macos-15-intel). NOTE: sccache caches per-crate
+# codegen but NOT the final whole-program fat-LTO link, so warm rebuilds
+# still pay the fat-LTO link each run (a few minutes) — slower than the
+# thin-LTO warm path. For PyPI consumers who pip-install once and run
+# large-scale fits for hours, the runtime win is the production lever; the
+# build-time hit is amortized to ~zero. When a faster turnaround is needed
+# during development, dispatch the workflow with `scope=x86` to skip the
+# slow macOS + Windows + aarch64 matrices entirely.
+#
+# This is a DEDICATED profile (not a change to `[profile.release]`) so the
+# CLI release binary (build-release-all.yml, disk-tight CUDA runner), the
+# nextest/test builds, benches, fuzz, and large_scale `--release` builds
+# all keep thin-LTO — only the shipped wheel pays the fat-LTO build cost.
+# Selected by pypi-wheels.yml via `--profile release-pypi`.
 [profile.release-pypi]
 inherits = "release"
+opt-level = 3
 lto = "fat"
 codegen-units = 1
+panic = "unwind"
 debug = false
-strip = "debuginfo"
+strip = true

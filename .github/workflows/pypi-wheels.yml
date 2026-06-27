@@ -142,7 +142,7 @@ jobs:
           sccache: true
           target: ${{ matrix.platform.target }}
           args: >-
-            --release
+            --profile release-pypi
             --strip
             --out dist
             --manifest-path crates/gam-pyffi/Cargo.toml
@@ -186,7 +186,7 @@ jobs:
           sccache: true
           target: ${{ matrix.target }}
           args: >-
-            --release
+            --profile release-pypi
             --strip
             --out dist
             --manifest-path crates/gam-pyffi/Cargo.toml
@@ -227,7 +227,7 @@ jobs:
           sccache: true
           target: ${{ matrix.platform.target }}
           args: >-
-            --release
+            --profile release-pypi
             --strip
             --out dist
             --manifest-path crates/gam-pyffi/Cargo.toml
@@ -261,7 +261,7 @@ jobs:
           sccache: false
           target: ${{ matrix.target }}
           args: >-
-            --release
+            --profile release-pypi
             --strip
             --out dist
             --manifest-path crates/gam-pyffi/Cargo.toml
