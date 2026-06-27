@@ -94,6 +94,7 @@ mod joint_derivatives;
 mod joint_newton;
 mod outer_objective;
 mod penalty_labels;
+mod psi_design;
 mod psi_hyper;
 mod warm_start;
 
@@ -120,6 +121,12 @@ pub(crate) use joint_derivatives::*;
 pub use joint_newton::*;
 pub(crate) use outer_objective::*;
 pub(crate) use penalty_labels::*;
+// ψ design-derivative operators / actions / joint-ψ operator / resolvers
+// (relocated from the pre-carve monolith, #1521). `pub use ...::*` preserves
+// each item's visibility so the 18 `pub` symbols surface as
+// `gam_solve::custom_family::*` (and thence `crate::custom_family::*` in
+// gam-models via the facade glob).
+pub use psi_design::*;
 pub use psi_hyper::*;
 pub use warm_start::*;
 
