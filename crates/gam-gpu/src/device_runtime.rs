@@ -500,13 +500,12 @@ mod tests {
             );
         }
 
-        // solver::gpu::pirls_gpu CPU-fallback entry points
-        let xc = Array2::<f64>::from_shape_fn((4, 3), |(i, j)| (i + j) as f64 + 1.0);
-        let weights = Array1::<f64>::ones(4);
-        let xtwx = crate::solver::gpu::pirls_gpu::weighted_crossprod_gpu(xc.view(), weights.view());
-        assert!(
-            xtwx.is_ok(),
-            "weighted_crossprod_gpu must return Ok via CPU fallback on CPU-only host (got {xtwx:?})"
-        );
+        // NOTE: the weighted-crossprod GPU dispatcher with CPU fallback
+        // (`weighted_crossprod_gpu`) moved out of this crate to `gam-solve`
+        // (`gpu::pirls_gpu`) during the #1521 crate carve, since it depends on
+        // the higher-level PIRLS assembly. Its panic-free / Ok-via-CPU-fallback
+        // contract is now exercised by a regression test there
+        // (`weighted_crossprod_gpu_cpu_fallback_*`), not from gam-gpu, which
+        // cannot reach gam-solve without a dependency cycle.
     }
 }

@@ -3889,3 +3889,47 @@ mod stream_device_parity_tests {
         }
     }
 }
+
+/// CPU-fallback contract for the weighted-crossprod GPU dispatcher.
+///
+/// `weighted_crossprod_gpu` moved here from `gam-gpu` during the #1521 crate
+/// carve. On a host with no usable CUDA runtime it must transparently fall back
+/// to the dense CPU path, return `Ok`, and produce the exact XᵀWX. This guards
+/// the panic-free / Ok-via-CPU-fallback contract previously (loosely) checked in
+/// gam-gpu's `cpu_only_host_never_panics_on_gpu_entry_points`, which could no
+/// longer reach the function after the carve.
+#[cfg(test)]
+mod weighted_crossprod_cpu_fallback_tests {
+    use super::weighted_crossprod_gpu;
+    use ndarray::{Array1, Array2};
+
+    #[test]
+    fn weighted_crossprod_gpu_cpu_fallback_matches_dense_xtwx() {
+        // Small, below any GPU dispatch threshold → exercises the CPU fallback
+        // on a CPU-only host (and stays Ok on a GPU host via the same contract).
+        let x = Array2::<f64>::from_shape_fn((4, 3), |(i, j)| (i + j) as f64 + 1.0);
+        let w = Array1::<f64>::from_vec(vec![0.5, 1.0, 1.5, 2.0]);
+
+        let got = weighted_crossprod_gpu(x.view(), w.view())
+            .expect("weighted_crossprod_gpu must return Ok via CPU fallback on a CPU-only host");
+
+        // Reference XᵀWX = Σ_k w_k x_k x_kᵀ, formed directly.
+        let (n, p) = x.dim();
+        let mut expected = Array2::<f64>::zeros((p, p));
+        for k in 0..n {
+            for i in 0..p {
+                for j in 0..p {
+                    expected[[i, j]] += w[k] * x[[k, i]] * x[[k, j]];
+                }
+            }
+        }
+
+        assert_eq!(got.dim(), (p, p));
+        for i in 0..p {
+            for j in 0..p {
+                let diff = (got[[i, j]] - expected[[i, j]]).abs();
+                assert!(diff <= 1e-10, "XtWX[{i},{j}] mismatch: got vs expected diff={diff}");
+            }
+        }
+    }
+}
