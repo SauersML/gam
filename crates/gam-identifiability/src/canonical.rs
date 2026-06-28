@@ -929,6 +929,15 @@ fn canonicalize_for_identifiability_inner(
     // an exactly-zero column, never on a data-bearing one (the near-separable
     // multinomial / marginal-slope reductions, whose dropped columns are nonzero,
     // are byte-unaffected).
+    //
+    // Important narrowing: an all-zero `design` is a zero-placeholder used by
+    // channel-aware callback blocks whose entire geometry lives in the callback
+    // (e.g. competing-risks `FixedMultiChannelJac`-style specs). Such a design
+    // does NOT mean every column is dead — the callback may supply a fully-live
+    // Jacobian for every column. Only gate on a dead column when the design has
+    // at least one non-zero entry (indicating a real design matrix where a single
+    // column is structurally absent). A zero-placeholder design bypasses this
+    // veto so the cross-block residual reduction can proceed normally (gam#1590).
     let dropped_column_is_dead = |drop: &DroppedColumn| -> bool {
         specs.iter().any(|spec| {
             if spec.name != drop.block || spec.jacobian_callback.is_none() {
@@ -943,6 +952,16 @@ fn canonicalize_for_identifiability_inner(
                 .try_to_dense_arc("canonicalize_for_identifiability: dead-column veto probe")
             {
                 Ok(dense) => {
+                    // A zero-placeholder design (all entries zero) means the true
+                    // geometry lives entirely in the callback; `GaugeComposedJacobian`
+                    // handles the column-selection reduction correctly for such blocks.
+                    // Only apply the dead-column veto when the design has real data
+                    // (at least one non-zero entry) and the specific dropped column is
+                    // identically zero within that real design.
+                    let has_any_nonzero = dense.iter().any(|v| *v != 0.0);
+                    if !has_any_nonzero {
+                        return false;
+                    }
                     let col = dense.column(drop.column);
                     col.iter().all(|v| *v == 0.0)
                 }
