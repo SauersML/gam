@@ -626,7 +626,10 @@ pub(super) fn dispersion_row_kernel(
             let theta = ed.exp().max(1e-12); // precision (size)
             let tpm = theta + mu;
             let tower = dispersion_nb_disp_order2(yi, mu, theta, wi);
-            let (s_theta, info_theta_raw) = tower_score_info(&tower, 0, wi);
+            // Exact dispersion score off the θ-tower (drives the working-response
+            // RHS); the tower's observed curvature h[θ][θ] is intentionally NOT
+            // used for the working weight — see #1606 below.
+            let s_theta = tower_score_info(&tower, 0, wi).0;
             let loglik = -tower.value();
             let info_mu = if wi == 0.0 {
                 DISPERSION_MIN_CURVATURE
@@ -636,7 +639,26 @@ pub(super) fn dispersion_row_kernel(
             let score_mu = theta * (yi - mu) / (mu * tpm);
             let mean_weight = wi * mu * mu * info_mu;
             let mean_response = em + score_mu / (mu * info_mu);
-            let info_theta = info_theta_raw;
+            // #1606: the dispersion working curvature must be the EXPECTED
+            // (Fisher) NB-size information, NOT the per-row OBSERVED information
+            // `tower.h[θ][θ] = ψ'(θ)−ψ'(θ+y) − 1/θ + 2/(θ+μ) − (θ+y)/(θ+μ)²`.
+            // For an overdispersed row (y ≫ μ — the common NB case) the observed
+            // info goes NEGATIVE; clamped to the absolute floor 1e-12 it collapses
+            // the row's working weight while its exact score stays in the RHS, so
+            // `disp_response = ed + s_theta/(θ·1e-12)` explodes and the two-block
+            // inner P-IRLS diverges (plain scalar-θ NB is immune — it sums the
+            // observed info to a positive aggregate; Gamma/Beta already use their
+            // expected shape information here). The expected info, with Y replaced
+            // by its mean μ inside the trigamma stack (the rational terms are
+            // exact in expectation since E[Y]=μ), is
+            //     I_E = ψ'(θ) − ψ'(θ+μ) − 1/θ + 1/(θ+μ) = g(θ) − g(θ+μ)
+            // with g(x)=ψ'(x)−1/x strictly decreasing, hence > 0 for all θ,μ > 0.
+            // The working response is built so W·(z−η)=exact score independent of
+            // W, so this reconditioning leaves the inner KKT point β̂(ρ) unchanged
+            // and makes the dispersion Hessian block PSD.
+            let trigamma_theta = gam_math::jet_tower::ln_gamma_derivative_stack_order2(theta)[2];
+            let trigamma_tpm = gam_math::jet_tower::ln_gamma_derivative_stack_order2(tpm)[2];
+            let info_theta = trigamma_theta - trigamma_tpm - 1.0 / theta + 1.0 / tpm;
             let info_pos = info_theta.max(DISPERSION_MIN_CURVATURE);
             let disp_weight = wi * theta * theta * info_pos;
             let disp_response = ed + s_theta / (theta * info_pos);

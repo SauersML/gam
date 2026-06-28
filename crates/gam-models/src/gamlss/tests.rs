@@ -615,9 +615,13 @@ pub(crate) fn hand_dispersion_row_kernel(
                 + 1.0
                 - tpm.ln()
                 - tpy / tpm;
-            let info_theta = -hand_trigamma(yi + theta) + hand_trigamma(theta) - 1.0 / theta
-                + 2.0 / tpm
-                - tpy / (tpm * tpm);
+            // #1606: expected (Fisher) NB-size information (y-independent,
+            // > 0 for all θ,μ > 0) — mirrors production `dispersion_row_kernel`.
+            // The previous OBSERVED form
+            //   −ψ'(y+θ)+ψ'(θ) − 1/θ + 2/(θ+μ) − (θ+y)/(θ+μ)²
+            // goes negative on overdispersed rows and collapsed the working
+            // weight (see dispersion_family.rs NB arm).
+            let info_theta = hand_trigamma(theta) - hand_trigamma(tpm) - 1.0 / theta + 1.0 / tpm;
             let info_pos = info_theta.max(DISPERSION_MIN_CURVATURE);
             DispersionRowKernel {
                 loglik,
@@ -808,6 +812,59 @@ pub(crate) fn dispersion_row_towers_match_hand_witnesses() {
             actual.disp_response,
             expected.disp_response,
             1e-10,
+        );
+    }
+}
+
+#[test]
+// Regression for #1606: the NB location-scale (dispersion) inner solve diverged
+// because the per-row dispersion working curvature was the OBSERVED size
+// information, which goes NEGATIVE on overdispersed rows (y ≫ μ) and was clamped
+// to the absolute floor 1e-12 — collapsing the row's working weight while its
+// exact score stayed in the RHS, so `disp_response = ed + s/(θ·1e-12)` exploded
+// and the two-block P-IRLS never reached KKT (escalated to a fatal
+// IntegrationError). The fix uses the EXPECTED (Fisher) size information, which
+// is y-independent and strictly positive. This test pins both properties on
+// strongly overdispersed rows where the old observed info was negative.
+fn nb_dispersion_curvature_is_positive_and_y_independent() {
+    let kind = DispersionFamilyKind::NegativeBinomial;
+    let eta_mu = 0.8_f64; // μ = exp(0.8) ≈ 2.23
+    let eta_d = 1.2_f64; // θ = exp(1.2) ≈ 3.32
+    let weight = 1.0_f64;
+    let theta = eta_d.exp();
+
+    // Overdispersed rows: y far above μ. Here the OLD observed information
+    // ψ'(θ)−ψ'(θ+y) − 1/θ + 2/(θ+μ) − (θ+y)/(θ+μ)² is negative.
+    let overdispersed_ys = [25.0_f64, 50.0, 90.0, 150.0];
+
+    // Reference disp_weight from the first row; the expected (Fisher) info does
+    // not depend on y, so every overdispersed row must reproduce it exactly.
+    let reference = dispersion_row_kernel(kind, overdispersed_ys[0], eta_mu, eta_d, weight);
+    let collapsed_weight = weight * theta * theta * DISPERSION_MIN_CURVATURE;
+
+    for &y in &overdispersed_ys {
+        let k = dispersion_row_kernel(kind, y, eta_mu, eta_d, weight);
+
+        // Curvature must be a healthy positive value, NOT the collapsed floor.
+        assert!(
+            k.disp_weight.is_finite() && k.disp_weight > 1e6 * collapsed_weight,
+            "NB dispersion weight collapsed for y={y}: {} (floor {})",
+            k.disp_weight,
+            collapsed_weight,
+        );
+        // Working response must stay bounded (the old clamp produced ~1e11).
+        assert!(
+            k.disp_response.is_finite() && k.disp_response.abs() < 1.0e5,
+            "NB dispersion response exploded for y={y}: {}",
+            k.disp_response,
+        );
+        // Expected info is y-independent ⇒ identical working weight across y.
+        assert!(
+            (k.disp_weight - reference.disp_weight).abs()
+                <= 1e-10 * (1.0 + reference.disp_weight.abs()),
+            "NB dispersion weight varied with y ({y}): {} vs {}",
+            k.disp_weight,
+            reference.disp_weight,
         );
     }
 }
