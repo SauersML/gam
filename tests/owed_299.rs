@@ -82,9 +82,21 @@ fn coupled_block_system(
     }
     for r in 0..k {
         sys.gb[r] = 0.02 * ((r + 1) as f64).cos();
-        // Diagonal H_ββ large enough to keep the reduced Schur SPD; the
-        // off-diagonal of S is entirely the cross-row correction.
-        sys.hbb[[r, r]] = 60.0;
+        // Diagonal H_ββ must exceed the spectral radius of the cross-row
+        // point-elimination correction `Σ_i H_tβᵀ (H_tt)⁻¹ H_tβ` to keep the
+        // reduced Schur `S = H_ββ − Σ_i(…)` SPD — the premise of the entire #299
+        // ladder study (every tier is an SPD preconditioner of an SPD S, and the
+        // correctness check is that each one drives CG to tolerance). The densest
+        // fixture (`band == 0`, `n == 64`, `coupling == 0.9`) accumulates that
+        // correction across all 64 rows until its top eigenvalue reaches ≈191, so
+        // the previous `60.0` left S INDEFINITE (`λ_min ≈ −131`): scalar-Jacobi
+        // PCG then correctly hit negative curvature (`pᵀSp ≤ 0`) and stopped
+        // short of tolerance, so the "every tier converges" gate failed on a
+        // fixture that was never actually SPD. `256.0` sits comfortably above the
+        // ≈191 correction radius (S: `λ_min ≈ 65`, `cond ≈ 4`) while leaving the
+        // off-block coupling strong enough that the block-diagonal tiers still
+        // take several PCG iterations — the study would be vacuous otherwise.
+        sys.hbb[[r, r]] = 256.0;
     }
     let mut offsets: Vec<Range<usize>> = Vec::with_capacity(n_blocks);
     for blk in 0..n_blocks {
