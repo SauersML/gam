@@ -700,3 +700,109 @@ impl PenaltyCoordinate {
         hasher.finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::{array, Array1, Array2};
+
+    fn identity_root(n: usize) -> Array2<f64> {
+        Array2::<f64>::eye(n)
+    }
+
+    // ── constructors ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn from_dense_root_creates_dense_root_variant() {
+        let root = identity_root(3);
+        let pc = PenaltyCoordinate::from_dense_root(root);
+        assert!(matches!(pc, PenaltyCoordinate::DenseRoot(_)));
+    }
+
+    #[test]
+    fn from_dense_root_with_zero_mean_degrades_to_dense_root() {
+        let root = identity_root(2);
+        let mean = Array1::<f64>::zeros(2);
+        let pc = PenaltyCoordinate::from_dense_root_with_mean(root, mean);
+        assert!(matches!(pc, PenaltyCoordinate::DenseRoot(_)));
+    }
+
+    #[test]
+    fn from_dense_root_with_nonzero_mean_creates_centered_variant() {
+        let root = identity_root(2);
+        let mean = array![1.0_f64, 0.0];
+        let pc = PenaltyCoordinate::from_dense_root_with_mean(root, mean);
+        assert!(matches!(pc, PenaltyCoordinate::DenseRootCentered { .. }));
+    }
+
+    #[test]
+    fn from_block_root_creates_block_root_variant() {
+        let root = Array2::<f64>::zeros((2, 2));
+        let pc = PenaltyCoordinate::from_block_root(root, 0, 2, 5);
+        assert!(matches!(pc, PenaltyCoordinate::BlockRoot { .. }));
+    }
+
+    // ── rank() and dim() ──────────────────────────────────────────────────────
+
+    #[test]
+    fn dense_root_rank_is_nrows_dim_is_ncols() {
+        // root is 4 × 3
+        let root = Array2::<f64>::zeros((4, 3));
+        let pc = PenaltyCoordinate::from_dense_root(root);
+        assert_eq!(pc.rank(), 4);
+        assert_eq!(pc.dim(), 3);
+    }
+
+    #[test]
+    fn block_root_dim_is_total_dim() {
+        let root = Array2::<f64>::zeros((2, 2));
+        let pc = PenaltyCoordinate::from_block_root(root, 1, 3, 7);
+        assert_eq!(pc.dim(), 7);
+    }
+
+    // ── uses_operator_fast_path ───────────────────────────────────────────────
+
+    #[test]
+    fn dense_root_does_not_use_fast_path() {
+        let pc = PenaltyCoordinate::from_dense_root(identity_root(2));
+        assert!(!pc.uses_operator_fast_path());
+    }
+
+    #[test]
+    fn block_root_uses_fast_path() {
+        let root = Array2::<f64>::zeros((1, 2));
+        let pc = PenaltyCoordinate::from_block_root(root, 0, 2, 4);
+        assert!(pc.uses_operator_fast_path());
+    }
+
+    // ── apply_penalty ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn dense_identity_root_penalty_is_beta() {
+        // S = I^T I = I, so S β = β
+        let pc = PenaltyCoordinate::from_dense_root(identity_root(3));
+        let beta = array![1.0_f64, 2.0, 3.0];
+        let out = pc.apply_penalty(&beta, 1.0);
+        for i in 0..3 {
+            assert!((out[i] - beta[i]).abs() < 1e-12, "index {i}: {}", out[i]);
+        }
+    }
+
+    #[test]
+    fn apply_penalty_zero_scale_returns_zeros() {
+        let pc = PenaltyCoordinate::from_dense_root(identity_root(2));
+        let beta = array![5.0_f64, 7.0];
+        let out = pc.apply_penalty(&beta, 0.0);
+        assert_eq!(out[0], 0.0);
+        assert_eq!(out[1], 0.0);
+    }
+
+    #[test]
+    fn apply_penalty_scale_two_doubles_beta_for_identity_root() {
+        let pc = PenaltyCoordinate::from_dense_root(identity_root(2));
+        let beta = array![3.0_f64, 4.0];
+        let out = pc.apply_penalty(&beta, 2.0);
+        assert!((out[0] - 6.0).abs() < 1e-12);
+        assert!((out[1] - 8.0).abs() < 1e-12);
+    }
+}
