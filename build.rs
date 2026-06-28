@@ -8,7 +8,7 @@ use std::{env, fs};
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR must be set"));
     fs::write(out_dir.join("lint_errors.rs"), "").expect("failed to write lint_errors.rs");
-    // Do NOT emit a wall-clock `cargo:rustc-env=GAM_BUILD_TIMESTAMP=<now>`.
+    // Do NOT emit wall-clock `cargo:rustc-env=GAM_BUILD_TIMESTAMP=<now>`.
     // Cargo records every build-script `rustc-env` in the crate fingerprint, so a
     // value that changes on every run makes the `gam` lib fingerprint dirty on
     // EVERY build — forcing a full recompile of gam + all downstream test crates
