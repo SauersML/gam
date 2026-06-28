@@ -790,18 +790,31 @@ def _interpolate_rows(
     )
 
 
-# Asymptotic boundary values for survival-related surfaces. Used when callers
-# evaluate the surface strictly outside the modeled time grid: rather than
-# clamping to the nearest endpoint (which is meaningful for an estimate but
-# semantically wrong as an extrapolation), we return the value the surface
-# *must* take in that regime by definition.
-#   * survival(t) at t<=0 is 1 (no one has failed yet); at t->inf it is 0
-#     (under the standard assumption that everyone eventually fails).
-#   * cumulative hazard mirrors survival via H(t) = -log S(t).
-#   * Hazard / standard-error surfaces have no canonical asymptote, so we
-#     leave them on the default nearest-endpoint behavior.
+# Boundary values for survival-related surfaces when callers evaluate strictly
+# outside the modeled time grid.
+#
+# Left edge (t below the grid) has an unambiguous, mutually consistent value we
+# can assert by definition: survival(t<=0) = 1 and cumulative-hazard(t<=0) = 0,
+# which satisfy S = exp(-H) exactly (exp(-0) = 1).
+#
+# Right edge (t past the last grid node) must NOT be forced to the t->inf
+# asymptote. survival(t) and cumulative_hazard(t) are two views of ONE fitted
+# curve tied by the exact identity S(t) = exp(-H(t)). The fitted grid only
+# spans the training time support, so past its top node we have no information
+# to distinguish parametric tail shapes -- and forcing survival to its t->inf
+# asymptote 0.0 while leaving H on a flat clamp makes the two views contradict
+# each other (S -> 0 implies H -> +inf, not a finite flat value), and injects a
+# spurious jump discontinuity into S at the grid edge. We therefore flat-clamp
+# BOTH surfaces to their last grid value (right_value=None => nearest-endpoint
+# clamp). Because the identity holds at the top grid node, flat-clamping both
+# preserves S(t) = exp(-H(t)) for every t past the grid: it is the conservative
+# "no further information beyond support" extrapolation that keeps the two
+# accessors mutually consistent and the curve continuous.
+#
+# Hazard / standard-error surfaces have no canonical asymptote, so they stay on
+# the default nearest-endpoint behavior as well.
 _SURVIVAL_EXTRAPOLATION = {
-    "survival": (1.0, 0.0),
+    "survival": (1.0, None),
     "cumulative_hazard": (0.0, None),
 }
 
