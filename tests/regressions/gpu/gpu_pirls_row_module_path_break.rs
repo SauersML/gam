@@ -1,4 +1,4 @@
-//! Regression for issue #1157: `gam::gpu::kernels::pirls_row` module path break.
+//! Regression for issue #1157: `gam::solver::gpu_kernels::pirls_row` module path break.
 //!
 //! Background: the GPU PIRLS row kernels moved from `crate::gpu::pirls_row` to
 //! `crate::gpu::kernels::pirls_row`. The `src/solver/gpu/*.rs` launchers kept
@@ -10,12 +10,12 @@
 //! This file restores that guard. It links the `gam` library — which forces the
 //! whole lib (including the Linux `mod linux_impl` under `src/solver/gpu`) to
 //! compile — and asserts genuine invariants of the GPU row-kernel symbol-naming
-//! scheme reached **only** through `gam::gpu::kernels::pirls_row::...`. If the
+//! scheme reached **only** through `gam::solver::gpu_kernels::pirls_row::...`. If the
 //! module is ever moved/renamed again and a launcher's import goes stale, the
 //! lib stops compiling and this test stops building; if the symbol-naming
 //! scheme drifts, these assertions fail.
 
-use gam::gpu::kernels::pirls_row::PirlsRowFamily;
+use gam::solver::gpu_kernels::pirls_row::PirlsRowFamily;
 
 /// Exactly six built-in families are exposed, and `ALL` enumerates each once.
 #[test]
