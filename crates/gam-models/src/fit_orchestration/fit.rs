@@ -1993,9 +1993,25 @@ pub(crate) fn fit_survival_transformation_model(
             // count of smoothing blocks is recorded before the ridge is added
             // (issue #563).
             let num_smoothing_blocks = penalty_blocks.len();
+            // The Weibull linear time basis is `[1, log t]`. In the SINGLE-cause
+            // dedicated-PIRLS path the constant column carries the baseline level
+            // (β0 = −shape·ln(scale)), so the stabilization ridge excludes it
+            // (`ridge_range_start = 1`) to avoid shrinking the scale. But that
+            // same basis is ANCHOR-CENTERED, which makes the constant column
+            // identically zero — a dead, gradient-free direction. The single-cause
+            // PIRLS leaves β0 at its seed and tolerates the zero column; the
+            // CAUSE-SPECIFIC competing-risks path instead routes through the
+            // custom-family blockwise Newton solver, whose per-block Hessian then
+            // has an exactly-zero row/column on β0. Excluding it from the ridge
+            // leaves that Hessian singular, so the inner Newton step degenerates
+            // and NO coefficient moves off its seed (#1590). For the cause-specific
+            // path penalise the full width so the dead β0 is pinned (→ 0, which the
+            // downstream baseline recovery already ignores: scale = anchor, shape =
+            // β1), leaving the live time/covariate directions well-conditioned.
             let ridge_range_start = if spec.likelihood_mode == SurvivalLikelihoodMode::Weibull
                 && spec.time_build.basisname == "linear"
                 && spec.timewiggle.is_none()
+                && cause_count <= 1
             {
                 1
             } else {

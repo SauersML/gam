@@ -326,6 +326,182 @@ fn workflow_test_dataset() -> Dataset {
     }
 }
 
+/// #1590 end-to-end: a cause-specific competing-risks Weibull fit must reach
+/// convergence rather than aborting in `canonicalize_for_identifiability` with
+/// "post-T rank invariant violated". This is the exact public-API repro from
+/// the issue (`Surv(entry, exit, event) ~ age`, `event ∈ {0, 1, 2}`,
+/// `survival_likelihood = "weibull"`), driven straight through the orchestration
+/// entry so it exercises the real cause-specific block construction
+/// (`fit_cause_specific_survival_transformation_custom`) and the channel-aware
+/// identifiability audit on the genuine `x_exit` time-basis geometry.
+#[test]
+fn competing_risks_weibull_fit_is_reachable_1590() {
+    let n = 320usize;
+    // Deterministic synthetic competing-risks data (LCG, no external RNG dep) of
+    // the same shape as the issue repro: two cause-specific exponential hazards
+    // depending on a centered age covariate plus independent censoring.
+    let mut state: u64 = 0x9E3779B97F4A7C15;
+    let mut unif = || {
+        // SplitMix64 → (0, 1).
+        state = state.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^= z >> 31;
+        ((z >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+    };
+    let mut values = Array2::<f64>::zeros((n, 4)); // entry, exit, event, age
+    for i in 0..n {
+        let age = 40.0 + 35.0 * unif();
+        let x = (age - 55.0) / 10.0;
+        // Cause-specific exponential event times via inverse-CDF (-ln(u)/rate)
+        // plus independent exponential censoring, matching the issue repro.
+        let rate1 = (-3.0 + 0.25 * x).exp();
+        let rate2 = (-3.2 - 0.20 * x).exp();
+        let t1 = -unif().ln() / rate1;
+        let t2 = -unif().ln() / rate2;
+        let c = -unif().ln() * 22.0;
+        let exit = t1.min(t2).min(c) + 0.1;
+        let event = if t1 < t2 && t1 < c {
+            1.0
+        } else if t2 < t1 && t2 < c {
+            2.0
+        } else {
+            0.0
+        };
+        values[[i, 0]] = 0.0;
+        values[[i, 1]] = exit;
+        values[[i, 2]] = event;
+        values[[i, 3]] = age;
+    }
+
+    let data = Dataset {
+        headers: vec![
+            "entry".to_string(),
+            "exit".to_string(),
+            "event".to_string(),
+            "age".to_string(),
+        ],
+        values,
+        schema: DataSchema {
+            columns: vec![
+                SchemaColumn {
+                    name: "entry".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "exit".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "event".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "age".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+            ],
+        },
+        column_kinds: vec![
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+        ],
+    };
+    let config = FitConfig {
+        survival_likelihood: "weibull".to_string(),
+        ..FitConfig::default()
+    };
+
+    let result = crate::fit_orchestration::entry::fit_from_formula(
+        "Surv(entry, exit, event) ~ age",
+        &data,
+        &config,
+    );
+    let fit_result = match result {
+        Ok(r) => r,
+        Err(e) => {
+            let err = e.to_string();
+            assert!(
+                !err.contains("rank invariant violated"),
+                "competing-risks Weibull fit must not abort on the post-T rank invariant (#1590); \
+                 got: {err}"
+            );
+            assert!(
+                !err.contains("beta length mismatch"),
+                "competing-risks Weibull fit must not abort on a reduced-width/raw-width beta \
+                 mismatch (#1590); got: {err}"
+            );
+            panic!("competing-risks Weibull fit failed (#1590): {err}");
+        }
+    };
+
+    // The fit must not merely complete — it must actually estimate. Recover the
+    // per-cause coefficient blocks and verify the cause-specific structure was
+    // learned, not left at the pooled seed (the pre-fix failure mode kept every
+    // coefficient pinned at its initial value behind a singular dead-column
+    // Hessian).
+    let FitResult::SurvivalTransformation(surv) = fit_result else {
+        panic!("competing-risks Weibull fit must return a SurvivalTransformation result (#1590)");
+    };
+    assert_eq!(
+        surv.fit.blocks.len(),
+        2,
+        "two competing causes must yield two coefficient blocks"
+    );
+    // Layout per cause: [β0 = dead anchor-centered time constant, β1 = Weibull
+    // shape (slope on log t), β2 = covariate intercept (baseline level),
+    // β3 = age]. The data-generating cause-specific log-rates are
+    // +0.25·(age−55)/10 for cause 1 and −0.20·(age−55)/10 for cause 2, i.e. the
+    // raw-age coefficient is +0.025 for cause 1 and −0.020 for cause 2.
+    let beta1 = &surv.fit.blocks[0].beta;
+    let beta2 = &surv.fit.blocks[1].beta;
+    assert_eq!(beta1.len(), 4, "cause 1 must keep raw width 4 (no reduction)");
+    assert_eq!(beta2.len(), 4, "cause 2 must keep raw width 4 (no reduction)");
+    // The dead centered-constant coefficient is pinned to ~0 by the stabilization
+    // ridge rather than left at its arbitrary unidentified seed.
+    assert!(
+        beta1[0].abs() < 1e-3 && beta2[0].abs() < 1e-3,
+        "dead anchor-centered time constant β0 must be pinned to ~0, got {} and {}",
+        beta1[0],
+        beta2[0]
+    );
+    // Shape recovered near 1 (exponential cause-specific hazards).
+    for (c, b) in [beta1, beta2].iter().enumerate() {
+        assert!(
+            b[1] > 0.5 && b[1] < 1.6,
+            "cause {} Weibull shape β1 must be ~1 for exponential data, got {}",
+            c + 1,
+            b[1]
+        );
+    }
+    // The qualitative cause-specific effect must be recovered: cause 1's hazard
+    // RISES with age, cause 2's FALLS — opposite-signed age coefficients.
+    assert!(
+        beta1[3] > 0.0,
+        "cause 1 age effect must be positive (hazard rises with age), got {}",
+        beta1[3]
+    );
+    assert!(
+        beta2[3] < 0.0,
+        "cause 2 age effect must be negative (hazard falls with age), got {}",
+        beta2[3]
+    );
+    // And the two causes must be genuinely DISTINCT fits, not a degenerate copy.
+    assert!(
+        (beta1[3] - beta2[3]).abs() > 0.01,
+        "cause-specific age effects must differ (distinct fits), got {} vs {}",
+        beta1[3],
+        beta2[3]
+    );
+}
+
 #[test]
 fn issue_789_transformation_normal_rejects_marginal_slope_controls_before_dispatch() {
     let data = workflow_test_dataset();
