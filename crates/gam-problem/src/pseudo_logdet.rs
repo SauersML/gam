@@ -9,3 +9,18 @@ pub enum PseudoLogdetMode {
     /// and derivative traces.
     HardPseudo,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_is_smooth() {
+        assert_eq!(PseudoLogdetMode::default(), PseudoLogdetMode::Smooth);
+    }
+
+    #[test]
+    fn variants_are_distinct() {
+        assert_ne!(PseudoLogdetMode::Smooth, PseudoLogdetMode::HardPseudo);
+    }
+}
