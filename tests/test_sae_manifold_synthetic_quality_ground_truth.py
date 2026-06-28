@@ -125,7 +125,7 @@ def test_oos_fixed_decoder_recovers_one_hot_oracle_assignments() -> None:
         assignment_kind="softmax",
         sparsity_strength=0.01,
         smoothness=0.01,
-        n_iter=4,
+        max_iter=4,
         learning_rate=1.0,
     )
     assignments = np.asarray(payload["assignments_z"], dtype=float)

@@ -62,6 +62,10 @@ def test_typical_shape_periodic_payload_decodes_ring_not_chord():
         "logits": np.ones((n, 1)),
         "fitted": x,
         "reml_score": 0.0,
+        # #1512: the SAE facade now reads a penalized-loss score from the fit
+        # payload (penalized_loss_score / oos_penalized_loss); the orphaned fake
+        # predates it and tripped KeyError. Mirror reml_score here.
+        "penalized_loss_score": 0.0,
         "chosen_k": 1,
         "dispersion": 1.0e-4,
         "oos_projection_top1": False,
@@ -106,7 +110,7 @@ def _fit_circle(n=400, noise=0.18, seed=0, n_iter=40):
     fit = gamfit.sae_manifold_fit(
         X=x, K=1, d_atom=1, atom_topology="circle", assignment="softmax",
         isometry_weight=0.0, ard_per_atom=False, sparsity_weight=0.01,
-        smoothness_weight=0.01, n_iter=max_iter, learning_rate=1.0, random_state=seed,
+        smoothness_weight=0.01, n_iter=n_iter, learning_rate=1.0, random_state=seed,
     )
     return fit, x
 
