@@ -1230,4 +1230,188 @@ mod tests {
             assert_eq!(cli, json, "{}", case.name);
         }
     }
+
+    // ── parse_comma_f64 ───────────────────────────────────────────────────
+
+    #[test]
+    fn parse_comma_f64_empty_string_returns_empty_vec() {
+        assert_eq!(parse_comma_f64("", "x").unwrap(), Vec::<f64>::new());
+        assert_eq!(parse_comma_f64("   ", "x").unwrap(), Vec::<f64>::new());
+    }
+
+    #[test]
+    fn parse_comma_f64_single_value() {
+        assert_eq!(parse_comma_f64("3.14", "x").unwrap(), vec![3.14]);
+    }
+
+    #[test]
+    fn parse_comma_f64_multiple_values_with_spaces() {
+        let result = parse_comma_f64("1.0, 2.5, -3.0", "x").unwrap();
+        assert_eq!(result, vec![1.0, 2.5, -3.0]);
+    }
+
+    #[test]
+    fn parse_comma_f64_non_numeric_returns_error() {
+        let err = parse_comma_f64("1.0, bad, 3.0", "--vals").unwrap_err();
+        assert!(err.contains("--vals"), "error should name the label: {err}");
+        assert!(err.contains("bad"), "error should name the bad token: {err}");
+    }
+
+    #[test]
+    fn parse_comma_f64_infinity_returns_error() {
+        let err = parse_comma_f64("inf", "--vals").unwrap_err();
+        assert!(err.contains("non-finite"), "error should say non-finite: {err}");
+    }
+
+    #[test]
+    fn parse_comma_f64_nan_returns_error() {
+        let err = parse_comma_f64("nan", "--vals").unwrap_err();
+        assert!(err.contains("non-finite"), "error should say non-finite: {err}");
+    }
+
+    // ── normalize_optional_family ─────────────────────────────────────────
+
+    #[test]
+    fn normalize_optional_family_none_passthrough() {
+        assert_eq!(normalize_optional_family(None), None);
+    }
+
+    #[test]
+    fn normalize_optional_family_auto_becomes_none() {
+        assert_eq!(normalize_optional_family(Some("auto".to_string())), None);
+        assert_eq!(normalize_optional_family(Some("Auto".to_string())), None);
+        assert_eq!(normalize_optional_family(Some("AUTO".to_string())), None);
+    }
+
+    #[test]
+    fn normalize_optional_family_non_auto_passthrough() {
+        assert_eq!(
+            normalize_optional_family(Some("binomial".to_string())),
+            Some("binomial".to_string())
+        );
+        assert_eq!(
+            normalize_optional_family(Some("gaussian".to_string())),
+            Some("gaussian".to_string())
+        );
+    }
+
+    // ── parse_survival_likelihood_cli ─────────────────────────────────────
+
+    #[test]
+    fn parse_survival_likelihood_cli_valid_values() {
+        assert_eq!(
+            parse_survival_likelihood_cli("transformation").unwrap(),
+            "transformation"
+        );
+        assert_eq!(
+            parse_survival_likelihood_cli("weibull").unwrap(),
+            "weibull"
+        );
+        // case-insensitive
+        assert_eq!(
+            parse_survival_likelihood_cli("WEIBULL").unwrap(),
+            "weibull"
+        );
+        assert_eq!(
+            parse_survival_likelihood_cli("Transformation").unwrap(),
+            "transformation"
+        );
+    }
+
+    #[test]
+    fn parse_survival_likelihood_cli_invalid_returns_error() {
+        assert!(parse_survival_likelihood_cli("lognormal").is_err());
+        assert!(parse_survival_likelihood_cli("").is_err());
+    }
+
+    // ── parse_baseline_target_cli ─────────────────────────────────────────
+
+    #[test]
+    fn parse_baseline_target_cli_valid_values() {
+        for target in &["linear", "weibull", "gompertz", "gompertz-makeham"] {
+            assert_eq!(
+                parse_baseline_target_cli(target).unwrap(),
+                *target,
+                "should accept '{target}'"
+            );
+        }
+        // trimmed and lowercased
+        assert_eq!(
+            parse_baseline_target_cli("  Weibull  ").unwrap(),
+            "weibull"
+        );
+    }
+
+    #[test]
+    fn parse_baseline_target_cli_invalid_returns_error() {
+        let err = parse_baseline_target_cli("cox").unwrap_err();
+        assert!(err.contains("cox"), "error should name the bad value: {err}");
+    }
+
+    // ── validate_survival_baseline_args ───────────────────────────────────
+
+    #[test]
+    fn validate_survival_baseline_args_linear_rejects_params() {
+        let mode = parse_survival_likelihood_mode("transformation").unwrap();
+        assert!(validate_survival_baseline_args(
+            mode,
+            "linear",
+            Some(1.0),
+            None,
+            None,
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn validate_survival_baseline_args_linear_accepts_no_params() {
+        let mode = parse_survival_likelihood_mode("transformation").unwrap();
+        assert!(validate_survival_baseline_args(
+            mode, "linear", None, None, None, None
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn validate_survival_baseline_args_weibull_likelihood_rejects_gompertz_target() {
+        let mode = parse_survival_likelihood_mode("weibull").unwrap();
+        assert!(validate_survival_baseline_args(
+            mode,
+            "gompertz",
+            None,
+            None,
+            None,
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn validate_survival_baseline_args_gompertz_rejects_scale() {
+        let mode = parse_survival_likelihood_mode("transformation").unwrap();
+        assert!(validate_survival_baseline_args(
+            mode,
+            "gompertz",
+            Some(2.0),
+            None,
+            None,
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn validate_survival_baseline_args_gompertz_makeham_rejects_scale() {
+        let mode = parse_survival_likelihood_mode("transformation").unwrap();
+        assert!(validate_survival_baseline_args(
+            mode,
+            "gompertz-makeham",
+            Some(1.0),
+            None,
+            None,
+            None
+        )
+        .is_err());
+    }
 }
