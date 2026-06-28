@@ -2021,53 +2021,129 @@ pub fn audit_identifiability_channel_aware(
     // tolerance). For the common case where the redundancy already is trailing
     // this selects the same trailing columns, so axis-aligned channel-aware
     // families (multinomial softmax, location-scale) are unaffected.
+    // Per-block drop budget: the number of columns each block must shed equals
+    // `p_block − kept_b`, where `kept_b` is the compiler's per-block effective
+    // rank. This budget is authoritative (the compiler's sequential residualised
+    // reduction already accounts for cross-block redundancy when it sets
+    // `kept_b`), so the only remaining question is WHICH physical columns of each
+    // block to drop.
+    let drop_budget: Vec<usize> = specs
+        .iter()
+        .enumerate()
+        .map(|(block_idx, spec)| {
+            spec.design
+                .ncols()
+                .saturating_sub(compiled_map.compiled_block_ranges[block_idx].len())
+        })
+        .collect();
+    let total_drop: usize = drop_budget.iter().sum();
+
+    // JOINT-RANK-AWARE per-block column selection for the multi-channel (k ≥ 2)
+    // case (gam#1590).
+    //
+    // The naive per-block selection pivots each block's own DIAGONAL sub-Gram
+    // (`gram_struct[block, block]`), so it can only see redundancy WITHIN a block,
+    // never a direction that is redundant ACROSS the cause channels (e.g. a shared
+    // baseline / time component common to two cause-specific time bases). When
+    // such a cross-channel-redundant column carries a large within-block norm, the
+    // block-local pivot KEEPS it and sheds a genuinely independent column instead
+    // — so the union of per-block-kept columns spans BELOW the true joint rank,
+    // and the downstream faithful-T post-T invariant (correctly) aborts the whole
+    // fit (`rank(J_can) < rank_target`).
+    //
+    // Fix: select each block's dropped columns from its CROSS-BLOCK RESIDUAL Gram
+    // — the Schur complement of the block's columns against EVERY other block's
+    // columns,
+    //
+    //     R_bb = G_bb − G_Abᵀ · G_AA⁺ · G_Ab      (A = all columns not in block b)
+    //
+    // read straight from the streamed structural `gram_struct`. A column that lies
+    // in another block's span has ~zero residual in `R_bb`, so the priority-tiered
+    // pivot on `R_bb` demotes it FIRST — exactly the cross-channel-redundant
+    // column the per-block diagonal pivot missed. Because the Schur complement is
+    // a linear projection, within-block linear relations among the residuals are
+    // preserved too, so an intra-block redundancy (a smooth's affine null mode) is
+    // still caught. The compiler's per-block `drop_budget` (which already accounts
+    // for cross-block redundancy via its sequential residualised reduction) fixes
+    // HOW MANY columns each block sheds; this only fixes WHICH ones, so the
+    // downstream `attribution_complete` / gauge-resolution counting is unchanged.
+    //
+    // The k = 1 (flat / single-channel) path and the single-block multi-channel
+    // path are byte-unchanged: neither enters this branch (`k >= 2 &&
+    // specs.len() >= 2` guard), so sphere/tensor/factor/multinomial callers keep
+    // the exact per-block diagonal-sub-Gram selection they had. With a single
+    // block there are no OTHER blocks for a column to be redundant against, so the
+    // diagonal sub-Gram already IS the cross-block residual.
+    let use_joint_residual = k >= 2 && specs.len() >= 2 && total_drop > 0;
+
     let mut dropped_columns: Vec<DroppedColumn> = Vec::new();
     for (block_idx, spec) in specs.iter().enumerate() {
         let p_block = spec.design.ncols();
-        let kept = compiled_map.compiled_block_ranges[block_idx].len();
-        let n_drop = p_block.saturating_sub(kept);
+        let n_drop = drop_budget[block_idx];
         if n_drop == 0 {
             continue;
         }
         let off = col_offsets[block_idx];
-        // Per-block diagonal structural Gram (p_block × p_block).
-        let block_gram = geometry
-            .gram_struct
-            .slice(ndarray::s![off..off + p_block, off..off + p_block])
-            .to_owned();
+        // The pivot Gram for choosing WHICH columns to drop. For the joint case it
+        // is the block's cross-block residual Gram `R_bb`; otherwise the block's
+        // own diagonal sub-Gram (the original within-block behaviour).
+        let (pivot_gram, joint) = if use_joint_residual {
+            (
+                block_cross_residual_gram(&geometry.gram_struct, &col_offsets, block_idx),
+                true,
+            )
+        } else {
+            (
+                geometry
+                    .gram_struct
+                    .slice(ndarray::s![off..off + p_block, off..off + p_block])
+                    .to_owned(),
+                false,
+            )
+        };
         // Uniform priority within the block: the drop decision here is purely the
-        // within-block residual ordering (cross-block gauge priority is handled by
-        // the joint `fatal`/gauge-resolution logic below, not by which physical
-        // column a block sheds).
+        // residual ordering of this block's columns (cross-block gauge priority is
+        // handled by the joint `fatal`/gauge-resolution logic below, not by which
+        // physical column a block sheds).
         let uniform_priority = vec![0u8; p_block];
         let pivot = priority_tiered_rank_from_gram(
-            &block_gram,
+            &pivot_gram,
             &uniform_priority,
             n * k,
             default_rrqr_rank_alpha(),
         );
+        let kept = p_block - n_drop;
         // The last `n_drop` columns in accept-then-demote order are the
         // lowest-residual (most redundant) ones. Falls back to trailing columns
         // only if the permutation is malformed (never expected: it is always a
         // permutation of `0..p_block`).
-        let mut demoted_locals: Vec<usize> =
-            if pivot.column_permutation.len() == p_block {
-                pivot.column_permutation[p_block - n_drop..].to_vec()
-            } else {
-                (kept..p_block).collect()
-            };
+        let mut demoted_locals: Vec<usize> = if pivot.column_permutation.len() == p_block {
+            pivot.column_permutation[p_block - n_drop..].to_vec()
+        } else {
+            (kept..p_block).collect()
+        };
         demoted_locals.sort_unstable();
         for local_col in demoted_locals {
             let block_name = spec.name.clone();
-            dropped_columns.push(DroppedColumn {
-                block: block_name.clone(),
-                column: local_col,
-                reason: format!(
+            let reason = if joint {
+                format!(
+                    "channel-aware audit (K={k}) demoted block '{block_name}' \
+                     local column {local_col}: column lies in the JOINT (cross-channel) \
+                     row-Jacobian span of the other blocks' retained columns under the \
+                     structural row metric (cross-block residual pivoted-Cholesky selection)",
+                )
+            } else {
+                format!(
                     "channel-aware audit (K={k}) demoted block '{block_name}' \
                      local column {local_col}: column lies in the within-block \
                      row-Jacobian span of the retained columns under the structural \
                      row metric (pivoted-Cholesky residual-ordered selection)",
-                ),
+                )
+            };
+            dropped_columns.push(DroppedColumn {
+                block: block_name,
+                column: local_col,
+                reason,
             });
         }
     }
@@ -2395,6 +2471,91 @@ pub fn audit_identifiability_channel_aware(
 /// audit uses): only `∩_m ker(S_m)` matters for the rank verdict, independent
 /// of the fitted λ values. Blocks with no penalty contribute no rows, so for an
 /// unpenalized multi-channel model this reduces exactly to `rank(J_joint)`.
+/// Cross-block residual Gram of block `block_idx`: the Schur complement of the
+/// block's columns against EVERY other block's columns,
+///
+/// ```text
+/// R_bb = G_bb − G_Abᵀ · G_AA⁺ · G_Ab        (A = all columns NOT in block b)
+/// ```
+///
+/// computed from the streamed joint structural Gram `gram_struct`. A column of
+/// block `b` that lies in the span of the OTHER blocks' columns has ~zero
+/// residual diagonal in `R_bb`; a column carrying a genuinely new direction keeps
+/// its full residual norm. Pivoting `R_bb` (instead of the block's raw diagonal
+/// sub-Gram) therefore demotes the cross-channel-redundant columns first, so the
+/// kept columns are JOINTLY rank-faithful (gam#1590).
+///
+/// `G_AA⁺` is the eigenvalue pseudoinverse with the same relative tolerance the
+/// compiler's `solve_psd_system` uses (`λ_max · 64 · n_A · ε`), so this residual
+/// agrees with the compiler's structural reduction convention. Within-block
+/// linear relations among the residual columns are preserved (the Schur
+/// complement is a linear projection), so intra-block redundancy is still caught.
+fn block_cross_residual_gram(
+    gram_struct: &Array2<f64>,
+    col_offsets: &[usize],
+    block_idx: usize,
+) -> Array2<f64> {
+    let p_total = gram_struct.ncols();
+    let b_start = col_offsets[block_idx];
+    let b_end = col_offsets[block_idx + 1];
+    let p_b = b_end - b_start;
+    // Indices of the OTHER blocks' columns (A).
+    let a_cols: Vec<usize> = (0..p_total)
+        .filter(|&j| j < b_start || j >= b_end)
+        .collect();
+    let g_bb = gram_struct
+        .slice(ndarray::s![b_start..b_end, b_start..b_end])
+        .to_owned();
+    if a_cols.is_empty() || p_b == 0 {
+        return g_bb;
+    }
+    let n_a = a_cols.len();
+    // G_AA (n_a × n_a) and G_Ab (n_a × p_b) gathered from the joint Gram.
+    let mut g_aa = Array2::<f64>::zeros((n_a, n_a));
+    for (ii, &ai) in a_cols.iter().enumerate() {
+        for (jj, &aj) in a_cols.iter().enumerate() {
+            g_aa[[ii, jj]] = gram_struct[[ai, aj]];
+        }
+    }
+    let mut g_ab = Array2::<f64>::zeros((n_a, p_b));
+    for (ii, &ai) in a_cols.iter().enumerate() {
+        for j in 0..p_b {
+            g_ab[[ii, j]] = gram_struct[[ai, b_start + j]];
+        }
+    }
+    // M = G_AA⁺ · G_Ab via eigenvalue pseudoinverse (same relative tolerance as
+    // the compiler's `solve_psd_system`). On eigendecomposition failure fall back
+    // to the bare diagonal sub-Gram (no spurious demotion).
+    let (evals, evecs) = match g_aa.eigh(Side::Lower) {
+        Ok(pair) => pair,
+        Err(_) => return g_bb,
+    };
+    let lambda_max = evals.iter().cloned().fold(0.0_f64, f64::max).max(0.0);
+    let tol = lambda_max * 64.0 * (n_a.max(1) as f64) * f64::EPSILON;
+    // M = U · diag(1/λ_kept) · Uᵀ · G_Ab
+    let u_t_b = fast_atb(&evecs, &g_ab); // (n_a × p_b)
+    let mut scaled = u_t_b;
+    for i in 0..n_a {
+        let inv = if evals[i] > tol { 1.0 / evals[i] } else { 0.0 };
+        for j in 0..p_b {
+            scaled[[i, j]] *= inv;
+        }
+    }
+    let m = evecs.dot(&scaled); // (n_a × p_b)
+    // R_bb = G_bb − G_Abᵀ · M
+    let correction = fast_atb(&g_ab, &m); // (p_b × p_b)
+    let mut r = &g_bb - &correction;
+    // Symmetrise to kill accumulated asymmetry before the pivoted Cholesky.
+    for i in 0..p_b {
+        for j in (i + 1)..p_b {
+            let avg = 0.5 * (r[[i, j]] + r[[j, i]]);
+            r[[i, j]] = avg;
+            r[[j, i]] = avg;
+        }
+    }
+    r
+}
+
 fn channel_aware_penalty_aware_joint_rank(
     gram_struct: &Array2<f64>,
     col_offsets: &[usize],
@@ -3467,6 +3628,226 @@ mod tests {
             total_kept, 20,
             "full-rank design must keep all 20 directions; got {total_kept} ({})",
             audit.summary,
+        );
+    }
+
+    // ── Competing-risks cross-channel redundancy regression (gam#1590) ──────
+    use gam_problem::FamilyLinearizationState;
+    use gam_problem::block_spec::BlockEffectiveJacobian;
+    use std::sync::Arc;
+
+    /// A test block whose multi-channel effective Jacobian is a fixed precomputed
+    /// `(k·n, p)` channel-major matrix, sliced by observation row range: channel
+    /// `c`, observation `i` lives at stacked row `c·n + i`. This is the minimal
+    /// stand-in for a real cause-specific survival block's `BlockEffectiveJacobian`
+    /// (which the channel-aware route wraps in `BlockJacobianAsRowOp`).
+    struct FixedMultiChannelJac {
+        full: Array2<f64>,
+        n: usize,
+        k: usize,
+        p: usize,
+    }
+    impl BlockEffectiveJacobian for FixedMultiChannelJac {
+        fn effective_jacobian_rows(
+            &self,
+            _state: &FamilyLinearizationState<'_>,
+            rows: std::ops::Range<usize>,
+        ) -> Result<Array2<f64>, String> {
+            let start = rows.start.min(self.n);
+            let end = rows.end.min(self.n);
+            let chunk = end - start;
+            let mut out = Array2::<f64>::zeros((self.k * chunk, self.p));
+            for c in 0..self.k {
+                for i in 0..chunk {
+                    for j in 0..self.p {
+                        out[[c * chunk + i, j]] = self.full[[c * self.n + start + i, j]];
+                    }
+                }
+            }
+            Ok(out)
+        }
+        fn n_outputs(&self) -> usize {
+            self.k
+        }
+    }
+
+    fn spec_with_callback(
+        name: &str,
+        n: usize,
+        p: usize,
+        cb: Arc<dyn BlockEffectiveJacobian>,
+    ) -> ParameterBlockSpec {
+        ParameterBlockSpec {
+            name: name.to_string(),
+            design: gam_linalg::matrix::DesignMatrix::Dense(
+                gam_linalg::matrix::DenseDesignMatrix::from(Array2::<f64>::zeros((n, p))),
+            ),
+            offset: ndarray::Array1::<f64>::zeros(n),
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: ndarray::Array1::<f64>::zeros(0),
+            initial_beta: None,
+            gauge_priority: 100,
+            jacobian_callback: Some(cb),
+            stacked_design: None,
+            stacked_offset: None,
+        }
+    }
+
+    /// Numerical rank of a dense matrix via a column-pivoted RRQR at the crate's
+    /// default tolerance — used to certify the reduced design reaches the true
+    /// joint rank.
+    fn matrix_rank(m: &Array2<f64>) -> usize {
+        if m.ncols() == 0 || m.nrows() == 0 {
+            return 0;
+        }
+        gam_linalg::faer_ndarray::rrqr_with_permutation(m, default_rrqr_rank_alpha())
+            .map(|r| r.rank)
+            .unwrap_or_else(|_| m.ncols())
+    }
+
+    /// Regression for gam#1590: competing-risks (cause-specific, k=2) survival
+    /// fits aborted in identifiability canonicalisation with
+    /// "post-T rank invariant violated — J_can is rank-deficient", because the
+    /// channel-aware per-block column-selection T dropped a genuinely-independent
+    /// cause-specific direction while KEEPING a baseline component that is
+    /// redundant ACROSS the two cause channels.
+    ///
+    /// We build two k=2 cause-time blocks (p_raw=8 total, true joint rank 6) that
+    /// reproduce the cross-channel redundancy exactly: each block carries an
+    /// intra-block redundancy AND block 2 carries a large-norm SHARED baseline
+    /// column (`a+b+c`) that lies wholly in span(block 1). The block-local pivot
+    /// kept that large-norm shared column and shed a real direction, so the kept
+    /// 6 columns spanned only rank 4 — the bug.
+    ///
+    /// After the joint-rank-aware (cross-block residual) selection, the shared
+    /// column is the one dropped, so `canonicalize_for_identifiability` SUCCEEDS
+    /// and the reduced design reaches the full joint rank.
+    #[test]
+    fn competing_risks_cross_channel_redundancy_canonicalises_cleanly_1590() {
+        let n = 64;
+        let x = linspace(n);
+        // Mutually orthogonal Legendre directions so every "independent" direction
+        // sits far above the rank floor (the verdict is backend-independent).
+        let leg = legendre_columns(&x, &[0, 1, 2, 3, 4, 5]);
+        let a = leg.column(0).to_owned(); // baseline constant (P0)
+        let b = leg.column(1).to_owned(); // P1
+        let c = leg.column(2).to_owned(); // P2
+        let d1 = leg.column(3).to_owned(); // cause-2-specific P3
+        let d2 = leg.column(4).to_owned(); // cause-2-specific P4
+        let d3 = leg.column(5).to_owned(); // cause-2-specific P5
+        let k = 2usize;
+        let p = 4usize;
+
+        // Block 1 (cause 1): columns [a, b, c, a+b] in BOTH channels. Isolation
+        // rank 3 ({a,b,c}); col3 = a+b is an intra-block redundancy.
+        let mut full1 = Array2::<f64>::zeros((k * n, p));
+        for ch in 0..k {
+            for i in 0..n {
+                full1[[ch * n + i, 0]] = a[i];
+                full1[[ch * n + i, 1]] = b[i];
+                full1[[ch * n + i, 2]] = c[i];
+                full1[[ch * n + i, 3]] = a[i] + b[i];
+            }
+        }
+        // Block 2 (cause 2): three genuinely-new cause-specific directions
+        // d1,d2,d3 and a LARGE-norm SHARED baseline combination a+b+c that lies
+        // wholly in span(block 1). Isolation rank 4, but its residual against
+        // block 1 is only 3-D ({d1,d2,d3}), so the compiler keeps 3. The shared
+        // column's large norm previously fooled the block-local pivot into keeping
+        // it and dropping a real cause direction (the gam#1590 bug).
+        let shared = (&(&a + &b) + &c).mapv(|v| v * 50.0);
+        let mut full2 = Array2::<f64>::zeros((k * n, p));
+        for ch in 0..k {
+            for i in 0..n {
+                full2[[ch * n + i, 0]] = d1[i];
+                full2[[ch * n + i, 1]] = d2[i];
+                full2[[ch * n + i, 2]] = d3[i];
+                full2[[ch * n + i, 3]] = shared[i];
+            }
+        }
+
+        let cb1 = Arc::new(FixedMultiChannelJac {
+            full: full1.clone(),
+            n,
+            k,
+            p,
+        });
+        let cb2 = Arc::new(FixedMultiChannelJac {
+            full: full2.clone(),
+            n,
+            k,
+            p,
+        });
+        let specs = vec![
+            spec_with_callback("time_cause_1", n, p, cb1),
+            spec_with_callback("time_cause_2", n, p, cb2),
+        ];
+
+        // The true joint rank of the channel-major stacked design [J1 | J2].
+        let mut joint = Array2::<f64>::zeros((k * n, 2 * p));
+        joint.slice_mut(ndarray::s![.., ..p]).assign(&full1);
+        joint.slice_mut(ndarray::s![.., p..]).assign(&full2);
+        let joint_rank = matrix_rank(&joint);
+        assert_eq!(
+            joint_rank, 6,
+            "fixture sanity: the 8-column k=2 competing-risks design must have \
+             true joint rank 6 (a,b,c,d1,d2,d3); got {joint_rank}",
+        );
+
+        // BEFORE the fix this returned a `DimensionMismatch` carrying
+        // "post-T rank invariant violated"; the fix makes it succeed.
+        let canon = crate::canonical::canonicalize_for_identifiability(&specs).unwrap_or_else(|e| {
+            panic!(
+                "gam#1590: cause-specific (k=2) canonicalisation must succeed, but \
+                 aborted: {e:?}",
+            )
+        });
+        assert!(
+            canon.used_channel_aware_audit,
+            "the multi-cause (k=2) design must route through the channel-aware audit",
+        );
+
+        // The reduced specs must have total width == true joint rank, and the
+        // reduced design (raw J · block-diagonal T) must ACTUALLY reach that rank —
+        // i.e. the kept columns are jointly independent, no redundant column kept
+        // and no independent direction dropped.
+        let total_reduced: usize = canon.reduced_specs.iter().map(|s| s.design.ncols()).sum();
+        assert_eq!(
+            total_reduced, joint_rank,
+            "reduced total width must equal the true joint rank {joint_rank}; got \
+             {total_reduced}",
+        );
+
+        // Materialise the reduced channel-major joint Jacobian J_can and certify
+        // its actual numerical rank equals the joint rank.
+        let zeros = vec![0.0f64; p];
+        let state = FamilyLinearizationState {
+            beta: &zeros,
+            family_scalars: None,
+            channel_hessian: None,
+            probit_frailty_scale: 1.0,
+        };
+        let mut j_can = Array2::<f64>::zeros((k * n, total_reduced));
+        let mut col_off = 0usize;
+        for spec in &canon.reduced_specs {
+            let jb = spec
+                .effective_jacobian_at("test 1590", &state)
+                .expect("reduced block effective jacobian");
+            let rb = spec.design.ncols();
+            assert_eq!(jb.nrows(), k * n);
+            for r in 0..k * n {
+                for j in 0..rb {
+                    j_can[[r, col_off + j]] = jb[[r, j]];
+                }
+            }
+            col_off += rb;
+        }
+        let rank_j_can = matrix_rank(&j_can);
+        assert_eq!(
+            rank_j_can, joint_rank,
+            "reduced design J_can must reach the true joint rank {joint_rank} \
+             (the kept columns must be jointly independent); got {rank_j_can}",
         );
     }
 }
