@@ -501,7 +501,7 @@ fn kernel_should_parallelize(n: usize, p: usize) -> bool {
 /// no throughput cost.
 #[inline(always)]
 fn fma_dot(a: &[f64], b: &[f64]) -> f64 {
-    debug_assert_eq!(a.len(), b.len());
+    assert_eq!(a.len(), b.len(), "fma_dot: operand length mismatch");
     let mut sum = [0.0f64; FMA_LANES];
     let mut comp = [0.0f64; FMA_LANES];
     let mut ca = a.chunks_exact(FMA_LANES);
@@ -545,9 +545,9 @@ fn fma_dot(a: &[f64], b: &[f64]) -> f64 {
 /// `v` (len `p`). Each output row is an independent [`fma_dot`]; rows fan out
 /// in chunks across the Rayon pool when the work is large.
 fn fast_av_rowmajor_into(x_all: &[f64], v: &[f64], n: usize, p: usize, out: &mut [f64]) {
-    debug_assert_eq!(x_all.len(), n * p);
-    debug_assert_eq!(v.len(), p);
-    debug_assert_eq!(out.len(), n);
+    assert_eq!(x_all.len(), n * p, "fast_av_rowmajor_into: x_all length");
+    assert_eq!(v.len(), p, "fast_av_rowmajor_into: v length");
+    assert_eq!(out.len(), n, "fast_av_rowmajor_into: out length");
     if kernel_should_parallelize(n, p) {
         use rayon::prelude::*;
         out.par_chunks_mut(AV_PAR_CHUNK_ROWS)
@@ -593,9 +593,9 @@ fn pairwise_sum_into(parts: &[Vec<f64>], out: &mut [f64]) {
 /// better-conditioned than a single running sum over all `n` rows and trivially
 /// parallel across blocks.
 fn fast_atv_rowmajor_into(x_all: &[f64], v: &[f64], n: usize, p: usize, out: &mut [f64]) {
-    debug_assert_eq!(x_all.len(), n * p);
-    debug_assert_eq!(v.len(), n);
-    debug_assert_eq!(out.len(), p);
+    assert_eq!(x_all.len(), n * p, "fast_atv_rowmajor_into: x_all length");
+    assert_eq!(v.len(), n, "fast_atv_rowmajor_into: v length");
+    assert_eq!(out.len(), p, "fast_atv_rowmajor_into: out length");
     let nblocks = n.div_ceil(ATV_BLOCK_ROWS);
 
     let block_partial = |b: usize| -> Vec<f64> {
@@ -3053,115 +3053,4 @@ mod tests {
         );
     }
 
-    /// Microbenchmark (ignored): prints ns + GFLOP/s for the kernel GEMVs vs
-    /// the faer single-column matmul they replace and the ndarray reference.
-    /// Run with
-    /// `cargo test -p gam-linalg --release --lib gemv_bench -- --ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn gemv_bench() {
-        use std::time::Instant;
-        let n = 1_000_000usize;
-        let p = 200usize;
-        let mut s = 0x1234_5678u64;
-        let mut next = || {
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            (s >> 11) as f64 / ((1u64 << 53) as f64) - 0.5
-        };
-        let mut x = Array2::<f64>::zeros((n, p));
-        for e in x.iter_mut() {
-            *e = next();
-        }
-        let beta = Array1::from_shape_fn(p, |_| next());
-        let resid = Array1::from_shape_fn(n, |_| next());
-
-        let timeit = |label: &str, flops: f64, mut f: Box<dyn FnMut() -> f64>| {
-            let mut sink = 0.0f64;
-            // warm up
-            sink += f();
-            let iters = 5;
-            let t = Instant::now();
-            for _ in 0..iters {
-                sink += f();
-            }
-            let ns = t.elapsed().as_nanos() as f64 / iters as f64;
-            let gflops = flops / ns; // flops / ns == GFLOP/s
-            println!("{label:28} {ns:12.0} ns   {gflops:8.2} GFLOP/s   (sink={sink:.3e})");
-        };
-
-        // Baseline: the faer single-RHS-column matmul the kernel replaces.
-        let faer_av = |x: &Array2<f64>, v: &Array1<f64>| -> f64 {
-            use faer::Accum;
-            use faer::linalg::matmul::matmul;
-            let (n, p) = x.dim();
-            let mut out = Mat::<f64>::zeros(n, 1);
-            let xv = FaerArrayView::new(x);
-            let vv = FaerColView::new(v);
-            matmul(
-                out.as_mut(),
-                Accum::Replace,
-                xv.as_ref(),
-                vv.as_ref(),
-                1.0,
-                matmul_parallelism(n, 1, p),
-            );
-            (0..n).map(|i| out[(i, 0)]).sum()
-        };
-        let faer_atv = |x: &Array2<f64>, v: &Array1<f64>| -> f64 {
-            use faer::Accum;
-            use faer::linalg::matmul::matmul;
-            let (n, p) = x.dim();
-            let mut out = Mat::<f64>::zeros(p, 1);
-            let xv = FaerArrayView::new(x);
-            let vv = FaerColView::new(v);
-            matmul(
-                out.as_mut(),
-                Accum::Replace,
-                xv.as_ref().transpose(),
-                vv.as_ref(),
-                1.0,
-                matmul_parallelism(p, 1, n),
-            );
-            (0..p).map(|i| out[(i, 0)]).sum()
-        };
-
-        println!("rayon threads = {}", rayon::current_num_threads());
-        let av_flops = 2.0 * n as f64 * p as f64;
-        println!("--- A·v (η = Xβ), n={n} p={p} ---");
-        {
-            let x2 = x.clone();
-            let b2 = beta.clone();
-            timeit("fast_av (kernel)", av_flops, Box::new(move || fast_av(&x2, &b2).sum()));
-        }
-        {
-            let x2 = x.clone();
-            let b2 = beta.clone();
-            timeit("faer matmul (old path)", av_flops, Box::new(move || faer_av(&x2, &b2)));
-        }
-        {
-            let x2 = x.clone();
-            let b2 = beta.clone();
-            timeit("ndarray a.dot(v)", av_flops, Box::new(move || x2.dot(&b2).sum()));
-        }
-
-        let atv_flops = 2.0 * n as f64 * p as f64;
-        println!("--- Aᵀ·r (gradient), n={n} p={p} ---");
-        {
-            let x2 = x.clone();
-            let r2 = resid.clone();
-            timeit("fast_atv (kernel)", atv_flops, Box::new(move || fast_atv(&x2, &r2).sum()));
-        }
-        {
-            let x2 = x.clone();
-            let r2 = resid.clone();
-            timeit("faer matmul (old path)", atv_flops, Box::new(move || faer_atv(&x2, &r2)));
-        }
-        {
-            let x2 = x.clone();
-            let r2 = resid.clone();
-            timeit("ndarray a.t().dot(v)", atv_flops, Box::new(move || x2.t().dot(&r2).sum()));
-        }
-    }
 }
