@@ -425,11 +425,26 @@ mod tests {
         //   0b00=value, 0b01=∂x, 0b10=∂z, 0b11=∂x∂z.
         // The tower carries the same derivatives as tensor entries:
         //   v, g[0], g[1], h[0][1].
-        assert_eq!(jf.coeff(0b00), tf.v, "value");
-        assert_eq!(jf.coeff(0b01), tf.g[0], "∂x");
-        assert_eq!(jf.coeff(0b10), tf.g[1], "∂z");
-        assert_eq!(jf.coeff(0b11), tf.h[0][1], "∂x∂z");
-        // Symmetry of the tower's mixed second partial is also bit-exact.
+        //
+        // The two layouts share the `mul` / Leibniz kernel bit-for-bit, but
+        // `MultiDirJet::compose_unary` now reassociates Faà di Bruno into a
+        // compensated truncated-Taylor polynomial (a *more* accurate evaluation
+        // of the same real value — see `jet_partitions::tests`), so cross-layout
+        // agreement is now a tight numerical equality (relative ~1e-13) rather
+        // than a bit identity.
+        let close = |got: f64, want: f64, label: &str| {
+            let tol = 1e-13 * want.abs().max(1.0);
+            assert!(
+                (got - want).abs() <= tol,
+                "{label}: got={got:.17e}, want={want:.17e}, diff={:.3e}",
+                (got - want).abs()
+            );
+        };
+        close(jf.coeff(0b00), tf.v, "value");
+        close(jf.coeff(0b01), tf.g[0], "∂x");
+        close(jf.coeff(0b10), tf.g[1], "∂z");
+        close(jf.coeff(0b11), tf.h[0][1], "∂x∂z");
+        // Symmetry of the tower's mixed second partial is still bit-exact.
         assert_eq!(tf.h[0][1], tf.h[1][0], "tower mixed-partial symmetry");
     }
 
