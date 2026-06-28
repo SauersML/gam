@@ -30,5 +30,5 @@ approx = "0.5.1"
 # Dev-only cycle (permitted by Cargo): the carrier's `tests` module fits real
 # gamlss/wiggle families that live in `gam-models`, which normally-depends on
 # this crate. The cycle closes through dev-dependencies only.
-gam-models = { path = "../gam-models", version = "=0.3.129" }
-gam-test-support = { path = "../gam-test-support", version = "=0.3.129" }
+gam-models = { path = "../gam-models" }
+gam-test-support = { path = "../gam-test-support" }

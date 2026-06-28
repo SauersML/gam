@@ -37,7 +37,7 @@ cudarc = { version = "0.19.6", default-features = false, features = ["std", "dri
 
 [dev-dependencies]
 approx = "0.5.1"
-gam-test-support = { path = "../gam-test-support", version = "=0.3.129" }
+gam-test-support = { path = "../gam-test-support" }
 # Test-only utilities used by the in-crate `#[cfg(test)]` suites carved out of
 # the root `gam` crate (#1521): `num-dual` for the autodiff jet cross-checks in
 # `reml::objective` tests, `rand` for deterministic synthetic designs, and
