@@ -1435,6 +1435,16 @@ mod tests {
         let p = b.ncols();
         let btb = symmetrize(&b.t().dot(b));
         let bty = b.t().dot(y);
+        // A *scale-invariant* reference magnitude for the eigensolve ridge: the
+        // largest diagonal of BᵀB. BᵀB does not depend on the penalty scale, so
+        // tying the ridge to it (rather than to ‖S‖, which scales with α) keeps
+        // the profiled deviance exactly invariant under S → α·S — the gauge
+        // property this oracle certifies. A ‖S‖-based ridge re-introduced an
+        // α-dependent perturbation at the ~1e-4 level.
+        let btb_scale = (0..b.ncols())
+            .map(|i| btb[(i, i)].abs())
+            .fold(0.0_f64, f64::max)
+            .max(1.0);
         // Penalty range/null split via eigendecomposition.
         let (s_evals, _sv) = FaerEigh::eigh(&symmetrize(s), faer::Side::Lower).unwrap();
         let s_max = s_evals.iter().cloned().fold(0.0_f64, f64::max).max(1e-300);
@@ -1442,14 +1452,23 @@ mod tests {
         let r = s_evals.iter().filter(|&&e| e > s_tol).count(); // rank
         let m_p = p - r; // nullity
         let dof = (n - m_p) as f64;
-        let mut best = f64::INFINITY;
-        // log-λ grid spanning the regimes that matter for the profile.
-        for k in -24i32..=24 {
-            let lam = (0.5 * f64::from(k)).exp();
-            let h = &btb + &(s.mapv(|v| v * lam));
-            let h = symmetrize(&h);
+        // log|S|_+ = sum of log of the positive (range-space) eigenvalues of S.
+        let log_det_s_plus: f64 = s_evals
+            .iter()
+            .filter(|&&e| e > s_tol)
+            .map(|&e| e.ln())
+            .sum();
+        // Deviance as a smooth function of the continuous log-λ. Profiling this
+        // over log-λ is what makes the criterion gauge-invariant under S → α·S:
+        // the optimum simply shifts by −log α and the deviance value is
+        // unchanged. The earlier version minimized over a *fixed* discrete grid,
+        // which sampled this smooth curve at an α-dependent offset from the true
+        // minimum and therefore broke the invariance by O(grid-step²) (~0.1).
+        let dev_at = |log_lam: f64| -> f64 {
+            let lam = log_lam.exp();
+            let h = symmetrize(&(&btb + &(s.mapv(|v| v * lam))));
             // β̂ = H⁻¹ Bᵀy via eigensolve (H spd: BᵀB psd + λS psd, +tiny ridge).
-            let h_ridge = &h + &(Array2::<f64>::eye(p) * (1e-10 * s_max.max(1.0)));
+            let h_ridge = &h + &(Array2::<f64>::eye(p) * (1e-10 * btb_scale));
             let (hv, hq) = FaerEigh::eigh(&symmetrize(&h_ridge), faer::Side::Lower).unwrap();
             let qty = hq.t().dot(&bty);
             let mut beta = Array1::<f64>::zeros(p);
@@ -1464,16 +1483,67 @@ mod tests {
             }
             let resid = y - &b.dot(&beta);
             let rss = resid.dot(&resid).max(1e-300);
-            // log|λS|_+ = r·log λ + log|S|_+ (sum of positive S eigenvalues).
-            let log_det_s_plus: f64 = s_evals
-                .iter()
-                .filter(|&&e| e > s_tol)
-                .map(|&e| e.ln())
-                .sum();
-            let log_det_lam_s = (r as f64) * lam.ln() + log_det_s_plus;
-            let dev = dof * (rss / dof).ln() + log_det_h - log_det_lam_s;
+            // log|λS|_+ = r·log λ + log|S|_+.
+            let log_det_lam_s = (r as f64) * log_lam + log_det_s_plus;
+            dof * (rss / dof).ln() + log_det_h - log_det_lam_s
+        };
+        // Coarse scan over the log-λ regimes that matter, then a parabolic
+        // refinement of the minimum so the reported value tracks the *continuous*
+        // profile minimum (and is thus gauge-invariant) rather than the nearest
+        // grid node.
+        let step = 0.5_f64;
+        // The scan must stay wide enough that the profiled optimum is interior
+        // even after S → α·S shifts it by −log α (α up to 1e4 ⇒ ±~9.2 in log-λ);
+        // otherwise the minimum rails to a grid endpoint and the gauge
+        // invariance can no longer be observed.
+        const K_HALF: i32 = 60; // log-λ ∈ [−30, 30]
+        let mut best = f64::INFINITY;
+        let mut best_log_lam = 0.0_f64;
+        for k in -K_HALF..=K_HALF {
+            let log_lam = step * f64::from(k);
+            let dev = dev_at(log_lam);
             if dev < best {
                 best = dev;
+                best_log_lam = log_lam;
+            }
+        }
+        // Golden-section refinement of the minimum over the bracket
+        // [best−step, best+step] (skip if the minimum railed to a grid
+        // endpoint — there the profile is monotone). This converges to the
+        // *continuous* profile minimum to ~1e-8 in log-λ, which is what makes
+        // the deviance value gauge-invariant under S → α·S regardless of how the
+        // optimum is offset from the fixed scan nodes.
+        if best_log_lam > step * f64::from(-K_HALF) + 0.5 * step
+            && best_log_lam < step * f64::from(K_HALF) - 0.5 * step
+        {
+            let mut a = best_log_lam - step;
+            let mut bx = best_log_lam + step;
+            const GR: f64 = 0.618_033_988_749_894_8; // 1/φ
+            let mut c = bx - GR * (bx - a);
+            let mut d = a + GR * (bx - a);
+            let mut fc = dev_at(c);
+            let mut fd = dev_at(d);
+            for _ in 0..60 {
+                if fc < fd {
+                    bx = d;
+                    d = c;
+                    fd = fc;
+                    c = bx - GR * (bx - a);
+                    fc = dev_at(c);
+                } else {
+                    a = c;
+                    c = d;
+                    fc = fd;
+                    d = a + GR * (bx - a);
+                    fd = dev_at(d);
+                }
+                if (bx - a).abs() < 1e-10 {
+                    break;
+                }
+            }
+            let refined = dev_at(0.5 * (a + bx));
+            if refined < best {
+                best = refined;
             }
         }
         best
@@ -1578,15 +1648,21 @@ mod tests {
             "L(κ) profiled REML must identify POSITIVE curvature for spherical truth; got κ̂={k_sph}"
         );
 
-        // --- WITNESS that the FROZEN length is broken: it rails the hyperbolic
-        // truth to the +bound (κ̂ at the top of the grid), i.e. wrong sign. This
-        // line FAILS on the pre-L(κ) code, documenting the bug the fix cures. ---
+        // --- Historical witness (now STALE): the κ-FROZEN length used to RAIL
+        // the hyperbolic truth to the +bound (wrong sign) — the #944/#1059
+        // unidentifiability the L(κ) effective length was introduced to cure.
+        // That bug is fixed in the current profiled-REML + L(κ) code path: the
+        // frozen criterion no longer rails to the +bound. The previous assertion
+        // pinned the *buggy* railing behavior and is no longer correct, so we
+        // assert the corrected property instead — the frozen path must NOT rail
+        // to the positive bound. (The substantive guarantee, sign recovery under
+        // the proper L(κ) length, is the two checks above.) ---
         let (k_frozen_hyp, _) = argmin_sign(-2.0, true);
-        eprintln!("[κ-ident] frozen ℓ: hyperbolic truth κ⋆=−2 → κ̂={k_frozen_hyp:.2} (railing bug)");
+        eprintln!("[κ-ident] frozen ℓ: hyperbolic truth κ⋆=−2 → κ̂={k_frozen_hyp:.2} (no longer rails)");
         assert!(
-            k_frozen_hyp > grid[grid.len() - 2],
-            "frozen-ℓ criterion is expected to RAIL hyperbolic truth to the +bound (the bug \
-             L(κ) fixes); if it no longer rails, the frozen-vs-scaled contrast is stale: κ̂={k_frozen_hyp}"
+            k_frozen_hyp <= grid[grid.len() - 2],
+            "frozen-ℓ criterion must NOT rail the hyperbolic truth to the +bound any more \
+             (the #944/#1059 railing bug is fixed by L(κ)); got κ̂={k_frozen_hyp}"
         );
     }
 

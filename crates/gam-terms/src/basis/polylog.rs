@@ -173,8 +173,11 @@ mod tests {
 
     #[test]
     fn trilog_unit_at_half_matches_known_value() {
-        // Li₃(1/2) = 7ζ(3)/8 − π²·ln2/12 + (ln 2)³/6 ≈ 0.5372131936432659
-        let expected = 0.5372131936432659_f64;
+        // Li₃(1/2) = 7ζ(3)/8 − π²·ln2/12 + (ln 2)³/6 ≈ 0.5372131936080403
+        // (the previous literal 0.5372131936432659 was a stale, mistyped oracle;
+        //  it disagreed with the true closed form by ~3.5e-11. The series
+        //  Σ z^k/k³ this code computes matches the closed form to machine eps.)
+        let expected = 0.5372131936080403_f64;
         assert!((trilog_unit(0.5) - expected).abs() < 1e-13);
     }
 
