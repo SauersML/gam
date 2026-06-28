@@ -2633,16 +2633,15 @@ mod reference_class_invariance_tests {
             .fold(0.0_f64, f64::max)
     }
 
+    // gam#1587: now that the reference-symmetric centered `M⊗S_t` joint penalty
+    // is wired through the custom-family outer REML loop (per-eval
+    // `JointPenaltyBundle` + outer penalty_coords/logdet/operator), the
+    // production multinomial fit is invariant to the arbitrary reference class,
+    // so this guard runs by default (the `#[ignore]` it carried while the fix was
+    // pending is also forbidden by the build.rs ban-scanner). It is an
+    // end-to-end fit guard (a handful of full softmax `y ~ s(x)` fits) — slower
+    // than a unit test but a true production-path regression.
     #[test]
-    #[ignore = "gam#1587: the production multinomial REML path still applies the \
-                reference-anchored per-block (ALR/Diagonal) smoothing penalty, so this \
-                invariance assertion FAILS (cross-labeling drift ~1e-2 ≫ 1e-3). The \
-                `MultinomialFamily::joint_penalty_specs()` hook that returns the \
-                reference-symmetric centered `M⊗S_t` penalty is defined but not yet \
-                consumed by the custom-family outer REML loop (no call sites in \
-                gam-custom-family). Un-ignore once that hook is wired through the outer \
-                ρ-layout + per-eval JointPenaltyBundle + outer penalty_coords/logdet. \
-                Also slow (~minutes): an opt-in end-to-end fit guard, not a fast CI unit."]
     fn multinomial_fit_is_invariant_to_reference_class_1587() {
         let td = tempdir().expect("tempdir");
         let dir = td.path();
