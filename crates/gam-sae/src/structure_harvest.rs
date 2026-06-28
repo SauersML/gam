@@ -703,9 +703,18 @@ fn fold_atom_into(term: &mut SaeManifoldTerm, a: usize, b: usize) -> Result<(), 
         let la = term.assignment.logits[[row, a]];
         let lb = term.assignment.logits[[row, b]];
         term.assignment.logits[[row, a]] = if softmax_routing {
-            // Numerically stable logsumexp.
+            // Numerically stable logsumexp. When BOTH logits are -∞ (two rows of
+            // zero softmax mass — a hard-masked/dead pair), `m = -∞` makes
+            // `la - m = -∞ - (-∞) = NaN`, and the NaN poisons the whole logits
+            // row (every subsequent softmax over it is NaN). The combined mass of
+            // two zero-mass atoms is exactly zero, i.e. logit -∞ — return that
+            // directly instead of computing NaN.
             let m = la.max(lb);
-            m + ((la - m).exp() + (lb - m).exp()).ln()
+            if m == f64::NEG_INFINITY {
+                f64::NEG_INFINITY
+            } else {
+                m + ((la - m).exp() + (lb - m).exp()).ln()
+            }
         } else {
             la.max(lb)
         };
@@ -3195,6 +3204,41 @@ mod tests {
                 combined[r] > 0.6,
                 "fixture must exercise a co-active pair (combined mass {} should be ~⅔)",
                 combined[r]
+            );
+        }
+    }
+
+    #[test]
+    fn fusion_of_zero_mass_pair_yields_neg_inf_not_nan() {
+        // Folding two atoms whose softmax logits are BOTH -∞ (zero routing mass on
+        // a row) must give the mass-preserving combined logit -∞ (combined mass 0),
+        // NOT NaN. Pre-fix, `logsumexp(-∞,-∞)` evaluated `(-∞)-(-∞)=NaN` and poisoned
+        // the entire logits row.
+        let (mut term, rho) = planted_term(&vec![vec![true, true, true]; 6]);
+        assert!(
+            matches!(term.assignment.mode, AssignmentMode::Softmax { .. }),
+            "fixture must be softmax-routed to exercise the logsumexp combine"
+        );
+        // Zero out atoms 0 and 1 on row 0 (both -∞), leave the rest finite.
+        term.assignment.logits[[0, 0]] = f64::NEG_INFINITY;
+        term.assignment.logits[[0, 1]] = f64::NEG_INFINITY;
+        let (fused, _) =
+            apply_structure_move(&term, &rho, &StructureMove::Fusion { a: 0, b: 1 }, &[]).unwrap();
+        let folded = fused.assignment.logits[[0, 0]];
+        assert!(
+            !folded.is_nan(),
+            "fused zero-mass logit must not be NaN (got {folded})"
+        );
+        assert_eq!(
+            folded,
+            f64::NEG_INFINITY,
+            "combined mass of two zero-mass atoms is zero → logit -∞"
+        );
+        // The whole row must stay NaN-free so softmax over it is well defined.
+        for c in 0..fused.assignment.logits.ncols() {
+            assert!(
+                !fused.assignment.logits[[0, c]].is_nan(),
+                "row 0 col {c} must not be NaN after the fold"
             );
         }
     }
