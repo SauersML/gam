@@ -1,5 +1,4 @@
 import numpy as np
-import pytest
 
 import gamfit._sae_manifold as sae
 
@@ -31,6 +30,27 @@ class _FakeRustModule:
         penalty = np.diag(penalties)
         return phi, jet, penalty
 
+    def build_info(self):
+        # #1601/#1512: the IBP driver gates row-block penalties on
+        # build_info()["sae_row_block_penalties"]; advertise the same kinds the
+        # real extension reports so the driver accepts the test's configuration.
+        return {
+            "sae_row_block_penalties": [
+                "ard", "top_k_activation", "jumprelu", "sparsity",
+                "row_precision_prior", "parametric_row_precision_prior",
+                "scad_mcp", "block_orthogonality", "isometry",
+            ]
+        }
+
+    def basis_with_jet(self, kind, coords, params=None):
+        # Refactored FFI signature: basis_with_jet(kind, coords, params) ->
+        # (phi, jet, penalty). Delegate to the periodic stub; coords is (n, dim),
+        # flattened to the 1-D parameter the periodic basis expects.
+        params = params or {}
+        n_harmonics = int(params.get("n_harmonics", 2))
+        t = np.asarray(coords, dtype=float).reshape(-1)
+        return self.periodic_basis_with_jet(t, n_harmonics)
+
     def sae_manifold_fit_minimal(
         self,
         z,
@@ -52,6 +72,7 @@ class _FakeRustModule:
         initial_logits=None,
         initial_coords=None,
         jumprelu_threshold=0.0,
+        **_forward_compat_kwargs,
     ):
         assert assignment_kind == "ibp_map"
         # Production Rust iterates internally; emulate per-iteration basis
@@ -99,6 +120,7 @@ class _FakeRustModule:
             "atom_active_mask": [True for _ in atom_dim],
             "fitted": np.zeros_like(z),
             "reml_score": -1.0,
+            "penalized_loss_score": -1.0,
             "chosen_k": K,
             "dispersion": 1.0,
             "oos_projection_top1": False,
@@ -110,14 +132,6 @@ class _FakeRustModule:
         }
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#1512 triage: _FakeRustModule is incomplete vs the refactored "
-    "sae_manifold_fit FFI — the IBP driver now calls build_info() (and "
-    "basis_with_jet) which this fake does not stub, so the fit fails with "
-    "AttributeError: build_info. Rebuild the fake against the current FFI "
-    "surface to re-enable.",
-)
 def test_ibp_driver_refreshes_basis_between_rust_steps(monkeypatch):
     fake = _FakeRustModule()
     monkeypatch.setattr(sae, "rust_module", lambda: fake)
