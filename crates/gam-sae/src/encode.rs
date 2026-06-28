@@ -1888,6 +1888,65 @@ impl EncodeAtlas {
         Ok((coords, valid))
     }
 
+    /// Fast batched FULL forward pass against one atom: encode → decode, the
+    /// manifold analogue of a traditional SAE's `x̂ = z·D` (decoder `D`, code `z`).
+    ///
+    /// A traditional SAE decodes with one GEMM. The manifold SAE's reconstruction
+    /// is `m(t̂) = z·Φ(t̂)·B` (module header) — the SAME GEMM `Φ·B`, but the code
+    /// `Φ(t̂)` is the curved chart basis evaluated at the encoded latent coordinate
+    /// rather than a flat one-hot. So the fast forward is exactly:
+    ///   1. [`amortized_encode_batch_fast`] → per-row latent coords `t̂` (one
+    ///      routing GEMM + one affine GEMM per chart — a traditional `W·x+b`);
+    ///   2. ONE batched basis evaluation `Φ(t̂)` (the manifold-curvature step a
+    ///      flat SAE doesn't have — `n×m`);
+    ///   3. ONE GEMM `recon = Φ(t̂)·B` (`(n×m)·(m×p)` — a traditional decoder
+    ///      `z·D`), then the per-row amplitude scale `z`.
+    ///
+    /// Rows the encoder could not certify-predict (no evaluator / singular
+    /// Gauss–Newton block / non-finite-or-zero amplitude) are returned as a ZERO
+    /// reconstruction and flagged `false` in the valid-mask — never a silent wrong
+    /// decode. The reconstruction of a valid row equals, bit-for-bit up to GEMM
+    /// reassociation, `z·(Φ(t̂_row)·B)` with `t̂` from the per-row predictor.
+    pub fn amortized_reconstruct_batch_fast(
+        &self,
+        atom: &SaeManifoldAtom,
+        atom_index: usize,
+        x: ArrayView2<'_, f64>,
+        amplitudes: ArrayView1<'_, f64>,
+    ) -> Result<(Array2<f64>, Vec<bool>), String> {
+        let n = x.nrows();
+        let p = atom.output_dim();
+        // Step 1: batched encode → latent coords (reuses the fast routing+affine).
+        let (coords, valid) = self.amortized_encode_batch_fast(atom, atom_index, x, amplitudes)?;
+        let mut recon = Array2::<f64>::zeros((n, p));
+        // A missing evaluator means no row could encode — every row is zeroed and
+        // already flagged `false` by the encode; nothing to decode.
+        let Some(evaluator) = atom.basis_evaluator.as_ref().cloned() else {
+            return Ok((recon, valid));
+        };
+        // Step 2: ONE batched basis evaluation Φ(t̂) over all rows (n × m). Invalid
+        // rows carry coords = 0 (the chart-origin); we still evaluate them in the
+        // batch for a single GEMM, then zero their reconstruction below — the basis
+        // is finite at the origin so this cannot poison the valid rows' GEMM.
+        let (phi, _jet) = evaluator
+            .evaluate(coords.view())
+            .map_err(|err| format!("amortized_reconstruct_batch_fast: basis eval: {err}"))?;
+        // Step 3: ONE GEMM recon = Φ·B (n × p), then per-row amplitude scale z.
+        // m(t̂) = z·Φ(t̂)·B, matching the module header and `fill_decoded_row`'s
+        // `Φ·decoder` accumulation (the amplitude is applied once here).
+        let decoded = phi.dot(&atom.decoder_coefficients); // (n × p), amplitude-1
+        for row in 0..n {
+            if !valid[row] {
+                continue; // stays zeroed — uncertified, like warm_start `None`.
+            }
+            let z = amplitudes[row];
+            for col in 0..p {
+                recon[[row, col]] = z * decoded[[row, col]];
+            }
+        }
+        Ok((recon, valid))
+    }
+
     /// LSH-routed certified encode (issue #1010 step 2 + 3): for each target
     /// row, the existing [`SaeCandidateIndex`] (#985/#994) proposes the
     /// best-aligned atom by frame alignment to the row direction; the row is then

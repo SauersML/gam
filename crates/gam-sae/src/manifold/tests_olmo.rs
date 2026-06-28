@@ -658,3 +658,90 @@ pub(crate) fn fast_encode_matches_per_row_warm_start() {
         ref_valid.iter().filter(|&&v| v).count()
     );
 }
+
+/// The batched full forward pass (`amortized_reconstruct_batch_fast`) — encode →
+/// decode, the manifold analogue of a traditional SAE's `x̂ = z·D` — must produce
+/// the SAME reconstruction as decoding each row's encoded coord singly:
+/// `m(t̂) = z·Φ(t̂)·B`. The batched path evaluates `Φ(t̂)` over all rows in one call
+/// and decodes with one GEMM `Φ·B`; the oracle evaluates each valid row's coord
+/// singly through the basis and decodes by hand. They must agree up to GEMM
+/// reassociation, and the valid-mask must match the encode's. Run on the real
+/// OLMo l18 slice so multi-chart routing + real curvature are exercised.
+#[test]
+pub(crate) fn fast_reconstruct_matches_per_row_decode() {
+    let mani = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut path = mani.join("tests/data/olmo_l18_pca64_635.npy");
+    if !path.exists() {
+        path = mani.join("../../tests/data/olmo_l18_pca64_635.npy");
+    }
+    let z = read_npy_f32_2d(&path);
+    let n = z.nrows();
+    let p = z.ncols();
+    let k = 1usize;
+    let term = real_data_torus_seed_term(z.view(), k, 3);
+    let mut norm_bound = 0.0_f64;
+    for r in 0..n {
+        norm_bound = norm_bound.max(z.row(r).dot(&z.row(r)).sqrt());
+    }
+    let atlas = crate::encode::EncodeAtlas::build(
+        &term.atoms,
+        &vec![1.0_f64; k],
+        norm_bound,
+        crate::encode::AtlasConfig::default(),
+    )
+    .expect("atlas builds");
+    let atom = &term.atoms[0];
+    let amps = ndarray::Array1::<f64>::ones(n);
+    let evaluator = atom.basis_evaluator.as_ref().unwrap().clone();
+
+    // Fast path: batched encode → basis eval → decode GEMM.
+    let (fast_recon, fast_valid) = atlas
+        .amortized_reconstruct_batch_fast(atom, 0, z.view(), amps.view())
+        .expect("batched fast reconstruct runs");
+    // The coords the fast path encoded to (shared with the decode).
+    let (coords, enc_valid) = atlas
+        .amortized_encode_batch_fast(atom, 0, z.view(), amps.view())
+        .expect("batched fast encode runs");
+
+    let mut max_diff = 0.0_f64;
+    let mut valid_rows = 0usize;
+    for row in 0..n {
+        // Decode's valid-mask MUST equal the encode's — the decode never resurrects
+        // an uncertified row, never drops a certified one.
+        assert_eq!(
+            fast_valid[row], enc_valid[row],
+            "reconstruct valid-mask must equal encode valid-mask at row {row}"
+        );
+        if !fast_valid[row] {
+            // Uncertified rows decode to an exact zero reconstruction.
+            for col in 0..p {
+                assert_eq!(
+                    fast_recon[[row, col]],
+                    0.0,
+                    "uncertified row {row} must decode to zero, got {}",
+                    fast_recon[[row, col]]
+                );
+            }
+            continue;
+        }
+        valid_rows += 1;
+        // Oracle: decode this row's coord singly. m(t̂) = z·Φ(t̂)·B.
+        let single = coords.row(row).insert_axis(ndarray::Axis(0)).to_owned();
+        let (phi_row, _jet) = evaluator.evaluate(single.view()).expect("single basis eval");
+        let decoded_row = phi_row.dot(&atom.decoder_coefficients); // (1 × p)
+        for col in 0..p {
+            let expect = amps[row] * decoded_row[[0, col]];
+            max_diff = max_diff.max((fast_recon[[row, col]] - expect).abs());
+        }
+    }
+    assert!(
+        max_diff < 1.0e-10,
+        "batched fast reconstruct must match the per-row decode z·Φ(t̂)·B (same GEMM, \
+         batched basis eval); max|Δrecon| = {max_diff:.3e}"
+    );
+    // Non-vacuity: most rows decode through the certified-predictor path.
+    assert!(
+        valid_rows > n / 2,
+        "fixture must reconstruct most rows; got {valid_rows} valid of {n}"
+    );
+}
