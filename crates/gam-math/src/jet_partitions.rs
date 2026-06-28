@@ -353,3 +353,123 @@ impl MultiDirJet {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── constructors ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn zero_has_correct_length_and_all_zero_coefficients() {
+        let j = MultiDirJet::zero(3);
+        assert_eq!(j.coeffs.len(), 8);
+        assert!(j.coeffs.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn constant_has_value_at_mask_zero_and_zeros_elsewhere() {
+        let j = MultiDirJet::constant(2, 5.0);
+        assert_eq!(j.coeffs.len(), 4);
+        assert_eq!(j.coeff(0), 5.0);
+        assert_eq!(j.coeff(1), 0.0);
+        assert_eq!(j.coeff(2), 0.0);
+        assert_eq!(j.coeff(3), 0.0);
+    }
+
+    #[test]
+    fn linear_sets_base_and_per_direction_slots() {
+        let j = MultiDirJet::linear(2, 1.0, &[2.0, 3.0]);
+        assert_eq!(j.coeff(0), 1.0); // constant
+        assert_eq!(j.coeff(1), 2.0); // mask 0b01 — direction 0
+        assert_eq!(j.coeff(2), 3.0); // mask 0b10 — direction 1
+        assert_eq!(j.coeff(3), 0.0); // cross term is zero
+    }
+
+    #[test]
+    fn bilinear_sets_all_four_slots() {
+        let j = MultiDirJet::bilinear(1.0, 2.0, 3.0, 4.0);
+        assert_eq!(j.coeff(0), 1.0);
+        assert_eq!(j.coeff(1), 2.0);
+        assert_eq!(j.coeff(2), 3.0);
+        assert_eq!(j.coeff(3), 4.0);
+    }
+
+    #[test]
+    fn with_coeffs_sets_only_specified_entries() {
+        let j = MultiDirJet::with_coeffs(2, &[(0, 9.0), (3, -1.0)]);
+        assert_eq!(j.coeff(0), 9.0);
+        assert_eq!(j.coeff(1), 0.0);
+        assert_eq!(j.coeff(2), 0.0);
+        assert_eq!(j.coeff(3), -1.0);
+    }
+
+    // ── elementwise arithmetic ────────────────────────────────────────────────
+
+    #[test]
+    fn add_is_elementwise() {
+        let a = MultiDirJet::linear(2, 1.0, &[2.0, 3.0]);
+        let b = MultiDirJet::linear(2, 4.0, &[5.0, 6.0]);
+        let c = a.add(&b);
+        assert_eq!(c.coeff(0), 5.0);
+        assert_eq!(c.coeff(1), 7.0);
+        assert_eq!(c.coeff(2), 9.0);
+        assert_eq!(c.coeff(3), 0.0);
+    }
+
+    #[test]
+    fn scale_multiplies_all_coefficients() {
+        let j = MultiDirJet::linear(2, 1.0, &[2.0, 3.0]);
+        let s = j.scale(2.0);
+        assert_eq!(s.coeff(0), 2.0);
+        assert_eq!(s.coeff(1), 4.0);
+        assert_eq!(s.coeff(2), 6.0);
+        assert_eq!(s.coeff(3), 0.0);
+    }
+
+    #[test]
+    fn sub_is_elementwise_difference() {
+        let a = MultiDirJet::constant(2, 5.0);
+        let b = MultiDirJet::constant(2, 3.0);
+        let c = a.sub(&b);
+        assert_eq!(c.coeff(0), 2.0);
+        assert_eq!(c.coeff(1), 0.0);
+        assert_eq!(c.coeff(2), 0.0);
+        assert_eq!(c.coeff(3), 0.0);
+    }
+
+    // ── mul (subset-convolution) ──────────────────────────────────────────────
+
+    #[test]
+    fn mul_of_constants_is_scalar_product() {
+        let a = MultiDirJet::constant(2, 2.0);
+        let b = MultiDirJet::constant(2, 3.0);
+        let c = a.mul(&b);
+        assert_eq!(c.coeff(0), 6.0);
+        assert_eq!(c.coeff(1), 0.0);
+        assert_eq!(c.coeff(2), 0.0);
+        assert_eq!(c.coeff(3), 0.0);
+    }
+
+    #[test]
+    fn mul_satisfies_leibniz_rule_single_direction() {
+        // (1 + ε) * (1 + ε) = 1 + 2ε
+        let x = MultiDirJet::linear(1, 1.0, &[1.0]);
+        let y = MultiDirJet::linear(1, 1.0, &[1.0]);
+        let z = x.mul(&y);
+        assert_eq!(z.coeff(0), 1.0);
+        assert_eq!(z.coeff(1), 2.0);
+    }
+
+    #[test]
+    fn mul_cross_term_two_independent_directions() {
+        // (1 + ε₁)(1 + ε₂) = 1 + ε₁ + ε₂ + ε₁ε₂
+        let x = MultiDirJet::linear(2, 1.0, &[1.0, 0.0]);
+        let y = MultiDirJet::linear(2, 1.0, &[0.0, 1.0]);
+        let z = x.mul(&y);
+        assert_eq!(z.coeff(0), 1.0);
+        assert_eq!(z.coeff(1), 1.0);
+        assert_eq!(z.coeff(2), 1.0);
+        assert_eq!(z.coeff(3), 1.0);
+    }
+}
