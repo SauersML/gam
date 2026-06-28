@@ -21,7 +21,7 @@
 //! point `H z* = g₀`, so a future change that merely made both halves agree on a
 //! wrong value could not pass it.
 
-use gam::gpu::kernels::sae_resident::{
+use gam::solver::gpu_kernels::sae_resident::{
     DeviceResidentArrowShape, DeviceResidentArrowSlabs, DeviceResidentArrowWorkspace,
     DeviceResidentInnerOptions,
 };
