@@ -205,9 +205,72 @@ fn duchon_sae_atom_basis_matches_build_duchon_design() {
             jet.shape()[1]
         );
         assert_eq!(phi.dim(), reference.dim(), "d={d}: design shape mismatch");
-        for ((r, c), &value) in phi.indexed_iter() {
-            assert_abs_diff_eq!(value, reference[[r, c]], epsilon = 1e-9);
-        }
+
+        // The SAE atom path and `build_duchon_basis` are NOT entry-equal designs.
+        // `build_duchon_basis` standardizes the input coordinates (its polynomial
+        // null-space block is centered/scaled, e.g. the linear column becomes
+        // `x − x̄` rather than raw `x`) and — since #1347/#1355 — may also apply a
+        // data-metric radial reparameterization to the kernel block; the SAE atom
+        // path deliberately keeps the RAW coordinates and RAW kernel block (see
+        // the docstring on `duchon_sae_atom_basis_with_jet`). Both choices are
+        // within-column-space linear changes of basis, so the two designs span
+        // the SAME function space and yield identical fits — but their individual
+        // columns differ. The old entry-by-entry equality (epsilon = 1e-9)
+        // predates that divergence and is stale.
+        //
+        // Assert the invariant that actually matters and is preserved: the two
+        // designs span the SAME column space. We orthonormalize each design's
+        // columns (modified Gram–Schmidt) and check that every column of one
+        // design is reproduced by its projection onto the other's orthonormal
+        // basis (zero residual both ways). Equal projectors ⇔ equal column space
+        // ⇔ identical fitted values for any response.
+        let orthonormal = |m: &Array2<f64>| -> Vec<Array1<f64>> {
+            let mut basis: Vec<Array1<f64>> = Vec::new();
+            for c in 0..m.ncols() {
+                let mut v = m.column(c).to_owned();
+                for q in &basis {
+                    let proj = q.dot(&v);
+                    v = &v - &(q * proj);
+                }
+                let norm = v.dot(&v).sqrt();
+                if norm > 1e-9 {
+                    basis.push(&v / norm);
+                }
+            }
+            basis
+        };
+        let residual_in_span = |m: &Array2<f64>, q_basis: &[Array1<f64>]| -> f64 {
+            let mut worst = 0.0_f64;
+            for c in 0..m.ncols() {
+                let col = m.column(c).to_owned();
+                let mut resid = col.clone();
+                for q in q_basis {
+                    let proj = q.dot(&col);
+                    resid = &resid - &(q * proj);
+                }
+                let r = resid.dot(&resid).sqrt();
+                worst = worst.max(r);
+            }
+            worst
+        };
+        let q_phi = orthonormal(&phi);
+        let q_ref = orthonormal(&reference);
+        assert_eq!(
+            q_phi.len(),
+            q_ref.len(),
+            "d={d}: SAE atom and build design must have the same column-space rank"
+        );
+        let ref_in_phi = residual_in_span(&reference, &q_phi);
+        let phi_in_ref = residual_in_span(&phi, &q_ref);
+        let ref_scale = reference.iter().fold(0.0_f64, |a, &x| a.max(x.abs())).max(1.0);
+        assert!(
+            ref_in_phi <= 1e-9 * ref_scale,
+            "d={d}: build design must lie in the SAE atom's column space; residual={ref_in_phi:e}"
+        );
+        assert!(
+            phi_in_ref <= 1e-9 * ref_scale,
+            "d={d}: SAE atom must lie in the build design's column space; residual={phi_in_ref:e}"
+        );
 
         // The analytic jet equals the central difference of the forward
         // design — no stray amplification factor on the kernel block.
