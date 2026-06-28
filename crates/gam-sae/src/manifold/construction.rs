@@ -7566,8 +7566,18 @@ impl SaeManifoldTerm {
             f_rho.fill(0.0);
             for k in 0..k_atoms {
                 self.atoms[k].fill_decoded_row(row, &mut decoded);
-                let sigma = assignments[k] / prior[k];
-                let da_rho = sigma * dprior[k];
+                // Ungated (#1026 background-tier) atoms have a force-fixed unit
+                // gate (`has_ungated` override), so their mass `a_k ≡ 1` is
+                // α-INDEPENDENT (∂a_k/∂logα = 0). The π_k(α) chain below applies
+                // ONLY to gated atoms, whose mass is `a_k = σ(ℓ/τ)·π_k(α)`. (NB:
+                // frozen routing is NOT ungated — there the gate is a fixed σ(ℓ/τ)
+                // but `a_k` still varies with α through `π_k`, so it must NOT be
+                // skipped.)
+                let da_rho = if self.assignment.ungated.get(k).copied().unwrap_or(false) {
+                    0.0
+                } else {
+                    (assignments[k] / prior[k]) * dprior[k]
+                };
                 for out_col in 0..p {
                     fitted[out_col] += assignments[k] * decoded[out_col];
                     f_rho[out_col] += da_rho * decoded[out_col];
@@ -7802,8 +7812,18 @@ impl SaeManifoldTerm {
             f_rho.fill(0.0);
             for k in 0..k_atoms {
                 self.atoms[k].fill_decoded_row(row, &mut decoded_rows[k]);
-                let sigma = assignments[k] / prior[k];
-                let da_rho = sigma * dprior[k];
+                // Ungated (#1026 background-tier) atoms have a force-fixed unit
+                // gate (`has_ungated` override), so their mass `a_k ≡ 1` is
+                // α-INDEPENDENT (∂a_k/∂logα = 0). The π_k(α) chain below applies
+                // ONLY to gated atoms, whose mass is `a_k = σ(ℓ/τ)·π_k(α)`. (NB:
+                // frozen routing is NOT ungated — there the gate is a fixed σ(ℓ/τ)
+                // but `a_k` still varies with α through `π_k`, so it must NOT be
+                // skipped.)
+                let da_rho = if self.assignment.ungated.get(k).copied().unwrap_or(false) {
+                    0.0
+                } else {
+                    (assignments[k] / prior[k]) * dprior[k]
+                };
                 for out_col in 0..p {
                     fitted[out_col] += assignments[k] * decoded_rows[k][out_col];
                     f_rho[out_col] += da_rho * decoded_rows[k][out_col];

@@ -9456,6 +9456,63 @@ pub(crate) fn small_p_zero_decoder_stays_full_b() {
     assert_eq!(atom.border_frame_rank(), p);
 }
 
+/// #1026/#1417: the learnable-α forward data-derivative must give an UNGATED
+/// (background-tier) atom ZERO α-sensitivity. An ungated atom's gate is forced
+/// to 1.0 (`has_ungated` override), so its mass `a_k ≡ 1` is α-independent and
+/// `∂a_k/∂logα = 0` — the `π_k(α)` chain applies only to gated atoms. Before the
+/// fix the code credited the ungated atom `(1/π_k)·dπ_k/dρ ≠ 0`, biasing the
+/// data α-gradient. FD-check the analytic against the data NLL ½Σ‖fitted−target‖²
+/// (where the ungated atom's reconstruction is α-constant) on a 2-atom fixture
+/// with atom 1 ungated.
+#[test]
+pub(crate) fn forward_alpha_data_derivative_skips_ungated_atom_1026() {
+    let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
+    term.assignment.mode = AssignmentMode::ibp_map(0.7, 0.9, true);
+    // Atom 1 is the #1026 ungated background tier (gate ≡ 1).
+    term.assignment = term
+        .assignment
+        .clone()
+        .with_ungated(vec![false, true])
+        .unwrap();
+    rho.log_lambda_sparse = 0.3;
+
+    let analytic = term
+        .learnable_ibp_forward_alpha_data_derivative(&rho, target.view())
+        .unwrap();
+
+    // FD of the data NLL ½Σ‖fitted−target‖² wrt ρ₀ (= logα offset, since
+    // α = α₀·e^{ρ₀} ⇒ ∂logα/∂ρ₀ = 1). The ungated atom's fitted contribution is
+    // α-constant, so the FD sees only the gated atom's π-derivative.
+    let data_nll = |t: &SaeManifoldTerm, r: &SaeManifoldRho| -> f64 {
+        let fitted = t.try_fitted_for_rho(r).unwrap();
+        let mut s = 0.0_f64;
+        for row in 0..fitted.nrows() {
+            for c in 0..fitted.ncols() {
+                let d = fitted[[row, c]] - target[[row, c]];
+                s += d * d;
+            }
+        }
+        0.5 * s
+    };
+    let h = 1.0e-6;
+    let mut rp = rho.clone();
+    let mut rm = rho.clone();
+    rp.log_lambda_sparse += h;
+    rm.log_lambda_sparse -= h;
+    let fd = (data_nll(&term, &rp) - data_nll(&term, &rm)) / (2.0 * h);
+    assert!(
+        (analytic - fd).abs() <= 1.0e-5 * (1.0 + fd.abs()),
+        "forward-α data derivative must match FD with an ungated atom: \
+         analytic={analytic:.8e}, fd={fd:.8e}"
+    );
+    // Non-vacuity: the gated atom must give a materially nonzero derivative
+    // (otherwise the test would pass even if everything were zeroed).
+    assert!(
+        fd.abs() > 1.0e-6,
+        "fixture must exercise a nonzero gated-atom α-derivative; fd={fd:.3e}"
+    );
+}
+
 pub(crate) fn gamma_fd_tiny_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
     let n = 10usize;
     let p = 3usize;
