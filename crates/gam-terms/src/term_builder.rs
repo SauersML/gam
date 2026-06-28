@@ -5503,6 +5503,15 @@ mod tests {
                 terms.smooth_terms[0].basis
             );
         };
+        // Since #1074 a `tp` tensor margin (k >= 3) is realized as a
+        // Lancaster–Salkauskas natural cubic-regression margin (cr basis
+        // dimension == knot count), not an open `Generate` B-spline. It is
+        // still a `TensorBSpline` spec with one penalized 1-D margin per axis,
+        // so the routing assertion above still holds; only the per-margin
+        // knotspec variant changed. The earlier `_ => panic!` arm pinned the
+        // pre-#1074 `Generate`-only representation and is stale. Decode every
+        // margin variant to its basis dimension (mirroring the
+        // `tensor_margin_basis_sizes` helper).
         let dims = spec
             .marginalspecs
             .iter()
@@ -5510,7 +5519,19 @@ mod tests {
                 BSplineKnotSpec::Generate {
                     num_internal_knots, ..
                 } => num_internal_knots + m.degree + 1,
-                _ => panic!("unexpected tensor marginal knotspec"),
+                BSplineKnotSpec::Automatic {
+                    num_internal_knots: Some(num_internal_knots),
+                    ..
+                } => num_internal_knots + m.degree + 1,
+                BSplineKnotSpec::PeriodicUniform { num_basis, .. } => num_basis,
+                BSplineKnotSpec::Provided(ref knots) => {
+                    knots.len().saturating_sub(m.degree + 1)
+                }
+                BSplineKnotSpec::NaturalCubicRegression { ref knots } => knots.len(),
+                BSplineKnotSpec::Automatic {
+                    num_internal_knots: None,
+                    ..
+                } => panic!("test cannot infer automatic knot count"),
             })
             .collect::<Vec<_>>();
         assert_eq!(dims, vec![5, 5]);

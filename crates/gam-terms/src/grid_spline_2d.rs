@@ -1120,7 +1120,20 @@ mod tests {
             }
         }
         let n = x1.len();
-        let y: Vec<f64> = x1.iter().zip(&x2).map(|(&a, &b)| a + b).collect();
+        // The response must carry genuine curvature: a purely affine `a + b`
+        // lies entirely in the penalty NULL SPACE (the spline reproduces it
+        // exactly at any λ), so the penalized residual is identically zero and
+        // `fit_grid_spline_2d` correctly refuses with "degenerate penalized
+        // residual 0" — there is no variance to estimate. Add a smooth
+        // non-null-space (curved) component so the penalized fit leaves a
+        // positive residual and the REML criterion is well-posed; this test is
+        // about `from_state` corruption rejection, which needs a successful fit
+        // first.
+        let y: Vec<f64> = x1
+            .iter()
+            .zip(&x2)
+            .map(|(&a, &b)| a + b + (3.0 * a).sin() * (2.5 * b).cos())
+            .collect();
         let w = vec![1.0_f64; n];
         let fit = fit_grid_spline_2d(&x1, &x2, &y, &w, k, [1.0, 1.0]).expect("fit");
 
