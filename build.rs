@@ -13,7 +13,8 @@ fn main() {
     // value that changes on every run makes the `gam` lib fingerprint dirty on
     // EVERY build — forcing a full recompile of gam + all downstream test crates
     // (~4min) regardless of whether any source changed, and defeating any shared
-    // warm target. The variable was consumed nowhere in the tree, so it is removed.
+    // warm target. The variable was consumed nowhere in the tree, so it is removed
+    // and must not be reintroduced.
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=crates/gam-terms/src/analytic_penalties/manifest.rs");
     println!("cargo:rerun-if-changed=SPEC.md");
