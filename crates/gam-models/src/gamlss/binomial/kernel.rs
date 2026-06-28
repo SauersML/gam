@@ -580,50 +580,6 @@ pub(crate) fn binomial_location_scale_nll_tower(
     )
 }
 
-/// Generic per-row NLL from the precomputed core, parameterised on the
-/// [`JetScalar<2>`] the consumer needs (the packed `Order2`/`OneSeed`/`TwoSeed`
-/// scalars for the Hessian / contracted-third / contracted-fourth hot paths,
-/// without the dense `Tower4<2>` `t3`/`t4`). Reconstructs `(η_t, η_ls)` from the
-/// core's `(σ, q0)` and forwards the per-row stack to
-/// [`binomial_location_scale_nll_generic`].
-///
-/// Test-only: the production hot paths now evaluate the directional contractions
-/// through the SIMD lane-batched kernels; this per-row scalar form is retained as
-/// the to-bits reference oracle for `simd_directional_coefficients_match_scalar_per_row_to_bits`.
-#[cfg(test)]
-#[inline]
-pub(crate) fn binomial_location_scale_nll_generic_from_core_row<
-    S: gam_math::jet_scalar::JetScalar<2>,
->(
-    y: f64,
-    weight: f64,
-    core: &BinomialLocationScaleCore,
-    row: usize,
-    link_kind: &InverseLink,
-    include_fourth: bool,
-    need_value: bool,
-    seed: impl Fn(f64, usize) -> S,
-) -> Result<S, String> {
-    let sigma = core.sigma[row];
-    let eta_t = -core.q0[row] * sigma;
-    let eta_ls = sigma.ln();
-    binomial_location_scale_nll_generic::<S>(
-        y,
-        weight,
-        eta_t,
-        eta_ls,
-        core.q0[row],
-        core.mu[row],
-        core.dmu_dq[row],
-        core.d2mu_dq2[row],
-        core.d3mu_dq3[row],
-        link_kind,
-        include_fourth,
-        need_value,
-        seed,
-    )
-}
-
 /// SIMD 4-rows-per-pass evaluation of the binomial location-scale row NLL at the
 /// packed [`OneSeedBatch`] directional scalar, returning the contracted-third
 /// tensor `Σ_c ℓ_{xyc} dir_c` for FOUR rows at once. The op graph mirrors
@@ -1047,6 +1003,50 @@ mod simd_directional_bit_identity_tests {
     use super::*;
     use gam_math::jet_scalar::{OneSeed, TwoSeed};
     use gam_problem::{InverseLink, StandardLink};
+
+    /// Generic per-row NLL from the precomputed core, parameterised on the
+    /// `JetScalar<2>` the consumer needs (the packed `Order2`/`OneSeed`/`TwoSeed`
+    /// scalars for the Hessian / contracted-third / contracted-fourth hot paths,
+    /// without the dense `Tower4<2>` `t3`/`t4`). Reconstructs `(η_t, η_ls)` from the
+    /// core's `(σ, q0)` and forwards the per-row stack to
+    /// `binomial_location_scale_nll_generic`.
+    ///
+    /// Test-only to-bits reference oracle for
+    /// `simd_directional_coefficients_match_scalar_per_row_to_bits`; the production
+    /// hot paths now evaluate the directional contractions through the SIMD
+    /// lane-batched kernels.
+    #[inline]
+    fn binomial_location_scale_nll_generic_from_core_row<
+        S: gam_math::jet_scalar::JetScalar<2>,
+    >(
+        y: f64,
+        weight: f64,
+        core: &BinomialLocationScaleCore,
+        row: usize,
+        link_kind: &InverseLink,
+        include_fourth: bool,
+        need_value: bool,
+        seed: impl Fn(f64, usize) -> S,
+    ) -> Result<S, String> {
+        let sigma = core.sigma[row];
+        let eta_t = -core.q0[row] * sigma;
+        let eta_ls = sigma.ln();
+        binomial_location_scale_nll_generic::<S>(
+            y,
+            weight,
+            eta_t,
+            eta_ls,
+            core.q0[row],
+            core.mu[row],
+            core.dmu_dq[row],
+            core.d2mu_dq2[row],
+            core.d3mu_dq3[row],
+            link_kind,
+            include_fourth,
+            need_value,
+            seed,
+        )
+    }
 
     /// Tiny deterministic LCG (no external rng dep in the test).
     struct Lcg(u64);
