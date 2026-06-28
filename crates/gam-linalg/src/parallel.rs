@@ -80,3 +80,54 @@ fn reduction_task_cap(reduction_cells: usize) -> usize {
         8
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunk_rows_zero_n_rows_returns_none() {
+        assert_eq!(row_reduction_chunk_rows(0, 100, 1, 1), None);
+    }
+
+    #[test]
+    fn chunk_rows_zero_work_units_returns_none() {
+        assert_eq!(row_reduction_chunk_rows(1000, 0, 1, 1), None);
+    }
+
+    #[test]
+    fn chunk_rows_below_min_parallel_work_returns_none() {
+        // total_work = 10 * 5 = 50 < min_parallel_work = 10_000
+        assert_eq!(row_reduction_chunk_rows(10, 5, 1, 10_000), None);
+    }
+
+    #[test]
+    fn chunk_count_zero_rows_is_zero() {
+        assert_eq!(row_reduction_chunk_count(0, 100), 0);
+    }
+
+    #[test]
+    fn chunk_count_exact_division() {
+        assert_eq!(row_reduction_chunk_count(9, 3), 3);
+    }
+
+    #[test]
+    fn chunk_count_ceiling_division() {
+        assert_eq!(row_reduction_chunk_count(10, 3), 4);
+    }
+
+    #[test]
+    fn chunk_count_zero_chunk_size_treated_as_one() {
+        assert_eq!(row_reduction_chunk_count(7, 0), 7);
+    }
+
+    #[test]
+    fn chunk_count_chunk_equals_n_rows() {
+        assert_eq!(row_reduction_chunk_count(5, 5), 1);
+    }
+
+    #[test]
+    fn chunk_count_chunk_larger_than_n_rows() {
+        assert_eq!(row_reduction_chunk_count(3, 100), 1);
+    }
+}
