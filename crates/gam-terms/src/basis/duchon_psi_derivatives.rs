@@ -2108,3 +2108,58 @@ mod taylor_degree_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod end_to_end_1604 {
+    use super::*;
+    use gam_linalg::faer_ndarray::FaerEigh;
+
+    /// gam#1604 — end-to-end: a 1-D hybrid Duchon smooth with power ≥ 2 must
+    /// build successfully through the public `build_duchon_basis` path and emit
+    /// numerically-PSD penalties. Before the half-integer-ν Taylor-degree fix the
+    /// corrupted collision diagonal made the constrained native penalty
+    /// indefinite, so the build's PSD guard rejected it outright — the issue's
+    /// "any d=1 Duchon smooth with power ≥ 2 currently cannot be fitted".
+    #[test]
+    fn d1_hybrid_duchon_power_ge_2_builds_psd() {
+        // A clustered + spread 1-D sample so center spacing is non-trivial.
+        let n = 40usize;
+        let mut data = Array2::<f64>::zeros((n, 1));
+        for i in 0..n {
+            data[[i, 0]] = -1.0 + 2.0 * (i as f64) / (n as f64 - 1.0);
+        }
+        for &power in &[2.0f64, 3.0] {
+            let spec = DuchonBasisSpec {
+                center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
+                periodic: None,
+                length_scale: Some(0.5),
+                power,
+                nullspace_order: DuchonNullspaceOrder::Linear,
+                identifiability: SpatialIdentifiability::None,
+                aniso_log_scales: None,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
+                boundary: OneDimensionalBoundary::Open,
+                radial_reparam: None,
+            };
+            let result = build_duchon_basis(data.view(), &spec).unwrap_or_else(|e| {
+                panic!("d=1 hybrid Duchon power={power} build rejected (gam#1604): {e}")
+            });
+            assert!(
+                !result.penalties.is_empty(),
+                "d=1 hybrid Duchon power={power} produced no penalty"
+            );
+            for (k, pen) in result.penalties.iter().enumerate() {
+                let sym = symmetrize_penalty(pen);
+                let (evals, _) =
+                    FaerEigh::eigh(&sym, faer::Side::Lower).expect("symmetric eigendecomposition");
+                let lam_min = evals.iter().copied().fold(f64::INFINITY, f64::min);
+                let lam_max = evals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let tol = 1e-9 * lam_max.abs().max(1.0);
+                assert!(
+                    lam_min >= -tol,
+                    "d=1 hybrid Duchon power={power} penalty[{k}] not PSD: λ_min={lam_min:.6e} (tol={tol:.3e})"
+                );
+            }
+        }
+    }
+}
