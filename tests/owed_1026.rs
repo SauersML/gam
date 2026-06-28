@@ -543,16 +543,22 @@ fn matrix_free_pcg_curvature_floor_is_noop_on_healthy_system_1026() {
 /// what makes a large-K fit tractable or not.
 ///
 /// Per-atom ARD (the small/moderate-K default) gives one independent outer
-/// coordinate per atom per axis: `2 + Σ_k d_k`. At K = 32_768 1-D atoms that is
-/// 32_770 outer hyperparameters, each outer eval refitting the whole dictionary
-/// — intractable for a generic outer optimizer. The shared mode collapses ARD
-/// to one strength per intrinsic axis (`max_d`), broadcast to every atom, so the
-/// flat vector is a CONSTANT `2 + max_d` regardless of K.
+/// coordinate per atom per axis, so the flat vector is `1 + K + Σ_k d_k`: the
+/// sparse log-strength, the K per-atom smoothness log-strengths (one per atom
+/// since #1556), and the per-atom per-axis ARD precisions. At K = 32_768 1-D
+/// atoms the ARD block alone is 32_768 coordinates — intractable for a generic
+/// outer optimizer. The shared mode collapses that ARD block to one strength per
+/// intrinsic axis (`max_d`), broadcast to every atom, so the flat vector shrinks
+/// to `1 + K + max_d`: the per-axis ARD count is a CONSTANT `max_d` regardless of
+/// K, removing the `Σ_k d_k` blow-up the per-atom mode carries. (The K per-atom
+/// smoothness coordinates remain in both modes — `ard_sharing` governs the ARD
+/// block only.)
 ///
-/// This gate pins both regimes: per-atom keeps the historical `2 + Σ d_k` count
-/// (so existing fits are unchanged), and shared is O(1) in K. It also checks the
-/// broadcast round-trip: `from_flat` rebuilds the full per-atom precision table
-/// the inner solve consumes, with every atom sharing the per-axis strength.
+/// This gate pins both regimes: per-atom keeps the `1 + K + Σ d_k` count (so
+/// existing fits are unchanged), and shared collapses the ARD block to a
+/// per-axis `max_d` (`1 + K + max_d`). It also checks the broadcast round-trip:
+/// `from_flat` rebuilds the full per-atom precision table the inner solve
+/// consumes, with every atom sharing the per-axis strength.
 #[test]
 fn shared_ard_collapses_outer_param_count_at_large_k() {
     // d=1 atoms (the worst case: one ARD axis per atom).
@@ -564,21 +570,23 @@ fn shared_ard_collapses_outer_param_count_at_large_k() {
 
         let per_atom = SaeManifoldRho::new(-0.5, -0.5, log_ard.clone());
         assert_eq!(per_atom.ard_sharing, ArdSharing::PerAtom);
-        // Per-atom: 2 + Σ_k d_k = 2 + K (d=1). This is exactly the historical
-        // layout — existing small-K fits keep their parameterization.
+        // Per-atom: 1 + K + Σ_k d_k = 1 + K + K (d=1) — the sparse coord, the K
+        // per-atom smoothness coords (#1556), and one ARD precision per atom.
         assert_eq!(
             per_atom.to_flat().len(),
-            2 + k * d_per_atom,
-            "per-atom ARD must keep 2 + Σ d_k outer coords (K={k})"
+            1 + k + k * d_per_atom,
+            "per-atom ARD must keep 1 + K + Σ d_k outer coords (K={k})"
         );
 
         let shared = SaeManifoldRho::new_shared_ard(-0.5, -0.5, log_ard.clone());
         assert_eq!(shared.ard_sharing, ArdSharing::Shared);
-        // Shared: a CONSTANT 2 + max_d outer coords, independent of K.
+        // Shared: the ARD block collapses to a per-axis max_d, so the flat
+        // vector is 1 + K + max_d (= 1 + K + d here) — the Σ_k d_k ARD blow-up
+        // is gone; only the K per-atom smoothness coords scale with K (#1556).
         assert_eq!(
             shared.to_flat().len(),
-            2 + d_per_atom,
-            "shared ARD must be O(1) in K (got K={k})"
+            1 + k + d_per_atom,
+            "shared ARD must collapse the ARD block to a per-axis max_d (got K={k})"
         );
     }
 
@@ -591,13 +599,15 @@ fn shared_ard_collapses_outer_param_count_at_large_k() {
     ];
     let shared = SaeManifoldRho::new_shared_ard(0.0, 0.0, log_ard);
     let flat = shared.to_flat();
-    // max_d = 2 → 2 + 2 = 4 outer coords.
-    assert_eq!(flat.len(), 4);
+    // K = 3 atoms, max_d = 2 → 1 + K + max_d = 1 + 3 + 2 = 6 outer coords. The
+    // shared ARD block (the two per-axis strengths) occupies indices
+    // 1 + K .. 1 + K + max_d = 4..6.
+    assert_eq!(flat.len(), 6);
 
     // Drive the two shared per-axis strengths to distinct values and broadcast.
     let mut moved = flat.clone();
-    moved[2] = 1.5; // axis-0 shared log-precision
-    moved[3] = -2.5; // axis-1 shared log-precision
+    moved[4] = 1.5; // axis-0 shared log-precision
+    moved[5] = -2.5; // axis-1 shared log-precision
     let rebuilt = shared.from_flat(moved.view());
     assert_eq!(rebuilt.ard_sharing, ArdSharing::Shared);
     // Every atom that owns axis 0 sees 1.5; every atom owning axis 1 sees -2.5;
@@ -625,7 +635,8 @@ fn shared_ard_collapses_outer_param_count_at_large_k() {
 /// (`reml_criterion_with_cache`, the same entry the outer optimizer steps on)
 /// at a `new_shared_ard` ρ and asserts:
 ///   1. the shared flat coordinate is strictly SHORTER than the per-atom one
-///      (2 + max_d  <  2 + Σ_k d_k for K>1) — the O(1)-in-K collapse, and
+///      (1 + K + max_d  <  1 + K + Σ_k d_k for K>1, since the ARD block
+///      collapses from Σ_k d_k to max_d) — the ARD-block collapse, and
 ///   2. the inner fit CONVERGES to a FINITE Laplace/REML criterion, i.e. the
 ///      shared `from_flat` broadcast feeds the inner solve a well-posed per-atom
 ///      precision table that the joint Newton can actually reach a minimum on.
@@ -650,8 +661,9 @@ fn shared_ard_is_a_convergent_outer_coordinate_1026() {
     let target =
         Array2::from_shape_fn((n, P), |(i, c)| 0.1 * ((i as f64) * 0.3 + (c as f64)).sin());
 
-    // d=1 circle atoms ⇒ max_d = 1. Per-atom flat = 2 + K*d = 2 + 2 = 4; shared
-    // flat = 2 + max_d = 3. The collapse is real even at K=2; it widens as K→∞.
+    // d=1 circle atoms ⇒ max_d = 1. Per-atom flat = 1 + K + Σ_k d_k = 1 + 2 + 2
+    // = 5; shared flat = 1 + K + max_d = 1 + 2 + 1 = 4. The ARD-block collapse
+    // is real even at K=2; it widens as K→∞.
     let log_ard = vec![Array1::<f64>::from_elem(1, (1.0e-1_f64).ln()); 2];
     let per_atom = SaeManifoldRho::new((1.0e-2_f64).ln(), (1.0e-2_f64).ln(), log_ard.clone());
     let shared = SaeManifoldRho::new_shared_ard((1.0e-2_f64).ln(), (1.0e-2_f64).ln(), log_ard);
