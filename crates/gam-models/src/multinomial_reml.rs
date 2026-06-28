@@ -350,14 +350,36 @@ impl MultinomialFamily {
                 // repeated columns for aliases, and strips every block past
                 // `class_0` to width 0 — the failure in #363.
                 //
-                // Each block carries the FULL per-term physical penalty list, so
-                // the outer loop can select independent smoothing coordinates
-                // for the smooth components that make up each class surface.
+                // Each block carries the FULL per-term physical penalty list.
+                //
+                // #1587 (tied λ): the K−1 cloned per-class copies of term `t`'s
+                // penalty all carry the SAME `precision_label`
+                // (`multinomial_term_{t}`), so the custom-family outer loop
+                // (`penalty_label_layout`) collapses them onto ONE outer ρ per
+                // term — a single shared `λ_t` smoothing every class's copy of
+                // term `t` instead of an independent `λ_{a,t}` per (class, term).
+                // A single shared λ per smooth term is the gauge the
+                // reference-symmetric (CLR) softmax penalty requires: the
+                // centered metric `λ_t·((I−J/K)⊗S_t)` has ONE λ_t, not one per
+                // class. (The cross-block `−(λ_t/K)·S_t` coupling of that metric
+                // is the second half of the #1587 fix; this λ-tying is the
+                // contained prerequisite.) Untied per-(class,term) λ — the prior
+                // behavior — additionally breaks reference-class invariance
+                // because relabeling permutes which class owns which λ.
+                let labeled_penalties: Vec<PenaltyMatrix> = self
+                    .penalties
+                    .iter()
+                    .enumerate()
+                    .map(|(t, pen)| {
+                        pen.clone()
+                            .with_precision_label(format!("multinomial_term_{t}"))
+                    })
+                    .collect();
                 let mut spec = ParameterBlockSpec {
                     name: format!("class_{a}"),
                     design: DesignMatrix::Dense(DenseDesignMatrix::from(self.design.clone())),
                     offset: Array1::<f64>::zeros(self.design.nrows()),
-                    penalties: (*self.penalties).clone(),
+                    penalties: labeled_penalties,
                     nullspace_dims: (*self.penalty_nullspace_dims).clone(),
                     initial_log_lambdas: Array1::<f64>::zeros(n_terms),
                     initial_beta: None,
@@ -2077,6 +2099,97 @@ mod tests {
             );
             assert_eq!(spec.nullspace_dims.len(), n_terms);
         }
+    }
+
+    /// #1587 (tied λ): the K−1 cloned per-class copies of smooth term `t` must
+    /// all carry the SAME per-term precision label `multinomial_term_{t}`, and
+    /// distinct terms must carry DISTINCT labels. The custom-family outer loop
+    /// (`penalty_label_layout`) collapses penalties sharing a label onto one
+    /// outer ρ, so this labelling ties the smoothing parameter of term `t`
+    /// across every class to a single shared `λ_t` (the gauge the
+    /// reference-symmetric softmax penalty requires) instead of the historical
+    /// independent `λ_{a,t}` per (class, term). Untied per-(class,term) λ is a
+    /// reference-class-dependent gauge: relabelling the response permutes which
+    /// class owns which λ, drifting the fit (the secondary half of #1587).
+    #[test]
+    fn block_specs_tie_lambda_per_term_across_classes_1587() {
+        let p = 5;
+        let k = 4; // 3 active classes
+        let n_terms = 3;
+        let n_obs = 9;
+        let y = {
+            let mut y = Array2::<f64>::zeros((n_obs, k));
+            for i in 0..n_obs {
+                y[[i, i % k]] = 1.0;
+            }
+            y
+        };
+        let weights = Array1::<f64>::ones(n_obs);
+        let design = Arc::new(Array2::<f64>::from_shape_fn((n_obs, p), |(i, j)| {
+            ((i + j + 1) as f64).cos()
+        }));
+        let penalties = Arc::new(
+            (0..n_terms)
+                .map(|t| {
+                    crate::custom_family::PenaltyMatrix::Dense(Array2::<f64>::from_shape_fn(
+                        (p, p),
+                        |(i, j)| if i == j { (t + 1) as f64 } else { 0.0 },
+                    ))
+                })
+                .collect::<Vec<_>>(),
+        );
+        let nullspace_dims = Arc::new(vec![0usize; n_terms]);
+        let multi = MultinomialFamily::new(y, weights, k, design, penalties, nullspace_dims)
+            .expect("multi-term MultinomialFamily must construct");
+        let specs = multi.build_block_specs();
+        let m = k - 1;
+        assert_eq!(specs.len(), m);
+
+        // Every block's term-t penalty carries the SAME label across classes.
+        for t in 0..n_terms {
+            let expected = format!("multinomial_term_{t}");
+            for (a, spec) in specs.iter().enumerate() {
+                let label = spec.penalties[t].precision_label();
+                assert_eq!(
+                    label,
+                    Some(expected.as_str()),
+                    "class {a} term {t} must carry the shared per-term precision label \
+                     '{expected}' so the outer loop ties λ across classes (#1587), got {label:?}"
+                );
+            }
+        }
+
+        // Distinct terms carry DISTINCT labels (per-term smoothing preserved).
+        let mut labels: Vec<&str> = (0..n_terms)
+            .map(|t| specs[0].penalties[t].precision_label().unwrap())
+            .collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(
+            labels.len(),
+            n_terms,
+            "each smooth term must keep its OWN shared λ; labels must be distinct per term"
+        );
+
+        // The label set collapses the (K−1)·n_terms physical penalty
+        // coordinates to exactly n_terms unique outer smoothing parameters.
+        let mut all_labels: Vec<String> = specs
+            .iter()
+            .flat_map(|spec| {
+                spec.penalties
+                    .iter()
+                    .map(|p| p.precision_label().unwrap().to_string())
+            })
+            .collect();
+        assert_eq!(all_labels.len(), m * n_terms, "physical penalty count");
+        all_labels.sort();
+        all_labels.dedup();
+        assert_eq!(
+            all_labels.len(),
+            n_terms,
+            "tied λ must collapse {} physical coordinates to {n_terms} outer ρ",
+            m * n_terms
+        );
     }
 
     #[test]
