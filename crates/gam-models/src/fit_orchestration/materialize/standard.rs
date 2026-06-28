@@ -174,13 +174,48 @@ pub(crate) fn materialize_standard<'a>(
     // Standard-fit `FitOptions` are built through the single shared policy
     // source (#1196) so the formula/Python path and the `gam` CLI cannot
     // resolve a different outer-REML optimization policy for the same model.
-    // The link state here is folded into the `family`/`link` by `resolve_family`
-    // (the mixture/SAS spec rides on the family, not on these option fields),
-    // so the formula path leaves the `*_link` inputs empty.
+    // The SAS link state is folded into the `family`/`link` by `resolve_family`
+    // and rebuilt from `FitOptions.sas_link` by the standard path, so the
+    // formula path leaves `sas_link` empty.
+    //
+    // The blended/mixture link, however, is NOT self-sufficient on the family
+    // alone: the binomial-mixture solver guard (`fit_gamwith_penalty_specs...`
+    // in gam-solve) requires `FitOptions.mixture_link` to be `Some` for any
+    // `is_binomial_mixture()` family, and the joint mixing-weight solve reads
+    // its component set + initial ρ from that field. The `gam` CLI populates it
+    // (run_fit.rs `mixture_linkspec`); the formula/Python path used to leave it
+    // `None`, so a `link(type=blended(...))` formula fit aborted immediately
+    // with `BinomialMixture requires mixture_link specification` before reaching
+    // the solver (#1598, the Python-side analogue of #1128/#1160). Thread the
+    // parsed `blended(...)`/`mixture(...)` component spec into `mixture_link`
+    // here so the formula/Python path reaches the same solver the CLI does.
+    //
+    // The formula path rejects `link(rho=...)`
+    // (`effective_link_choice_for_materialize`), so the initial ρ is always the
+    // canonical zero seed of length `n_components - 1`, exactly mirroring what
+    // `resolve_family` embeds into the mixture link state.
+    let mixture_link = link_choice.as_ref().and_then(|choice| {
+        choice.mixture_components.as_ref().map(|components| {
+            let free = components.len().saturating_sub(1);
+            MixtureLinkSpec {
+                components: components.clone(),
+                initial_rho: Array1::<f64>::zeros(free),
+            }
+        })
+    });
+    // A blended/mixture link is only an actual mixture when its mixing weights
+    // are jointly optimized; with `optimize_mixture=false` the solver freezes ρ
+    // at the zero seed and the fit collapses to the first component's pure link.
+    // The CLI sets `optimize_mixture: true` whenever it builds a mixture spec
+    // (run_fit.rs); mirror that so the formula/Python path actually fits the
+    // mixture rather than silently degrading to plain logit (#1598).
+    let optimize_mixture = mixture_link.is_some();
     let options = crate::fit_orchestration::canonical_standard_fit_options(
         config,
         crate::fit_orchestration::StandardFitOptionsInputs {
             latent_cloglog,
+            mixture_link,
+            optimize_mixture,
             firth_bias_reduction: config.firth,
             adaptive_regularization: standard_adaptive_regularization_options(config),
             persist_warm_start_disk: config.persist_warm_start_disk,
