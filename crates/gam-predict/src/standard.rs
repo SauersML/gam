@@ -508,3 +508,151 @@ impl PredictableModel for StandardPredictor {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gam::types::StandardLink;
+    use ndarray::{array, Array2};
+
+    fn make_std(beta: Array1<f64>, family: LikelihoodSpec) -> StandardPredictor {
+        StandardPredictor {
+            beta,
+            family,
+            link_kind: None,
+            covariance: None,
+            link_wiggle: None,
+        }
+    }
+
+    fn simple_input(design: Array2<f64>, offset: Array1<f64>) -> PredictInput {
+        PredictInput {
+            design: DesignMatrix::from(design),
+            offset,
+            design_noise: None,
+            offset_noise: None,
+            auxiliary_scalar: None,
+            auxiliary_matrix: None,
+        }
+    }
+
+    /// Gaussian identity link: eta = X @ beta + offset, mean = eta (identity).
+    #[test]
+    fn gaussian_identity_eta_equals_x_beta() {
+        let beta = array![1.0_f64, -0.5, 2.0];
+        let pred = make_std(beta.clone(), LikelihoodSpec::gaussian_identity());
+        let x = array![[1.0_f64, 0.3, -0.7], [1.0, -0.2, 1.1]];
+        let offset = array![0.1_f64, -0.2];
+        let input = simple_input(x.clone(), offset.clone());
+        let result = pred.predict_plugin_response(&input).expect("plugin");
+        let expected_eta = x.dot(&beta) + &offset;
+        for i in 0..2 {
+            assert!(
+                (result.eta[i] - expected_eta[i]).abs() < 1e-12,
+                "Gaussian identity eta[{i}]: got {:.6e}, expected {:.6e}",
+                result.eta[i],
+                expected_eta[i]
+            );
+            // Identity link: mean == eta
+            assert!(
+                (result.mean[i] - result.eta[i]).abs() < 1e-12,
+                "Gaussian identity mean[{i}] must equal eta"
+            );
+        }
+    }
+
+    /// Poisson log link: mean = exp(X @ beta + offset).
+    #[test]
+    fn poisson_log_mean_is_exp_eta() {
+        let beta = array![0.5_f64, -0.3];
+        let pred = make_std(
+            beta.clone(),
+            LikelihoodSpec::new(
+                ResponseFamily::Poisson,
+                InverseLink::Standard(StandardLink::Log),
+            ),
+        );
+        let x = array![[1.0_f64, 0.8], [1.0, -0.5]];
+        let offset = array![0.0_f64, 0.2];
+        let input = simple_input(x.clone(), offset.clone());
+        let result = pred.predict_plugin_response(&input).expect("plugin");
+        let eta_exp = x.dot(&beta) + &offset;
+        for i in 0..2 {
+            assert!(
+                (result.eta[i] - eta_exp[i]).abs() < 1e-12,
+                "Poisson log eta[{i}]"
+            );
+            assert!(
+                (result.mean[i] - eta_exp[i].exp()).abs() < 1e-12,
+                "Poisson log mean[{i}]: got {:.6e}, expected {:.6e}",
+                result.mean[i],
+                eta_exp[i].exp()
+            );
+        }
+    }
+
+    /// Binomial logit link: mean = 1/(1 + exp(-eta)).
+    #[test]
+    fn binomial_logit_mean_is_sigmoid_eta() {
+        let beta = array![0.0_f64]; // eta = 0 → mean = 0.5
+        let pred = make_std(
+            beta,
+            LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(StandardLink::Logit),
+            ),
+        );
+        let input = simple_input(array![[1.0_f64]], array![0.0_f64]);
+        let result = pred.predict_plugin_response(&input).expect("plugin");
+        assert!(
+            (result.mean[0] - 0.5).abs() < 1e-12,
+            "logit(0) → mean = 0.5, got {}", result.mean[0]
+        );
+    }
+
+    /// Covariance-backed point_state emits eta_se and mean_se;
+    /// for identity link eta_se² = x @ Vb @ x.T (diagonal entries).
+    #[test]
+    fn point_state_with_covariance_emits_ses() {
+        let beta = array![1.0_f64, 0.5];
+        let cov = array![[0.04_f64, 0.0], [0.0, 0.01]];
+        let mut pred = make_std(beta.clone(), LikelihoodSpec::gaussian_identity());
+        pred.covariance = Some(cov.clone());
+        let x = array![[1.0_f64, 2.0]]; // 1 row
+        let offset = array![0.0_f64];
+        let input = simple_input(x.clone(), offset);
+        let state = pred.point_state(&input).expect("point_state");
+        let eta_se = state.eta_se.expect("eta_se must be Some with covariance");
+        // delta-method: eta_se² = x @ Vb @ x.T = 0.04 + 4 * 0.01 = 0.08
+        let expected_var = 0.04_f64 + 4.0 * 0.01;
+        let expected_se = expected_var.sqrt();
+        assert!(
+            (eta_se[0] - expected_se).abs() < 1e-12,
+            "eta_se[0]: got {:.6e}, expected {:.6e}",
+            eta_se[0],
+            expected_se
+        );
+        // For Gaussian identity, dmu/deta = 1, so mean_se == eta_se
+        let mean_se = state.mean_se.expect("mean_se must be Some with covariance");
+        assert!(
+            (mean_se[0] - eta_se[0]).abs() < 1e-12,
+            "Gaussian identity: mean_se must equal eta_se"
+        );
+    }
+
+    /// No covariance → point_state returns None for eta_se and mean_se.
+    #[test]
+    fn point_state_without_covariance_has_no_ses() {
+        let pred = make_std(array![0.0_f64], LikelihoodSpec::gaussian_identity());
+        let input = simple_input(array![[1.0_f64]], array![0.0_f64]);
+        let state = pred.point_state(&input).expect("point_state");
+        assert!(
+            state.eta_se.is_none(),
+            "no covariance → eta_se must be None"
+        );
+        assert!(
+            state.mean_se.is_none(),
+            "no covariance → mean_se must be None"
+        );
+    }
+}
