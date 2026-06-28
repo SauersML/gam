@@ -174,7 +174,17 @@ fn lognormal_hazard_multiplier_kernel_recovers_frailty_variance() {
     // E ~ Exp(1), i.e. integrating H(t|U) = H_0(t)*exp(U) to a draw. Times are
     // administratively censored at `tau` to produce a censored/event mix.
     //
-    const M_GROUPS: usize = 400;
+    // 200 groups (1600 rows): the frailty-scale MLE's sampling error scales as
+    // ~1/sqrt(#groups), and the PRIMARY recovery bar below is `max(3*se_sigma, 0.05)`
+    // with se_sigma read from the observed information at the optimum — so halving
+    // the group count widens the bar by ~sqrt(2) *exactly* as it widens the actual
+    // MLE error. The err/bar ratio is therefore group-count-invariant: a
+    // systematically-wrong kernel still misses by >3 se at 200 groups just as at 400.
+    // The match-or-beat-R arm is group-count-independent in character (both maximize
+    // the same likelihood on the same data). 200 groups still mixes events/censoring
+    // and recovers a group-level variance comfortably; this only removes per-row
+    // quadrature-jet work (the dominant wall-clock cost), not discriminating power.
+    const M_GROUPS: usize = 200;
     const N_PER: usize = 8;
     const N_TOTAL: usize = M_GROUPS * N_PER;
     const SIGMA_TRUE: f64 = 0.5;

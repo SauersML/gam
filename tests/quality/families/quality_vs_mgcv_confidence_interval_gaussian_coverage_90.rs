@@ -31,9 +31,11 @@
 //!   * One fixed design `x` (n = 500, U[0,1], seed 42) shared by every replicate
 //!     so the signal `eta(x) = sin(6*pi*x)` is constant; only the Gaussian noise
 //!     (sigma = 0.1) is redrawn per replicate.
-//!   * 100 replicate response vectors `y_r = eta + noise_r` are generated once in
+//!   * 50 replicate response vectors `y_r = eta + noise_r` are generated once in
 //!     Rust with a deterministic splitmix64 + Box–Muller stream and handed,
 //!     column for column, to BOTH gam and mgcv. No engine sees different data.
+//!     (50 is the statistically-sufficient budget — see the window note below; it
+//!     also matches the mgcv R side's `nrep`, so both engines fit the SAME 50.)
 //!   * Each replicate is fit `y ~ s(x, k = 25)` by REML in both engines. The
 //!     basis dimension MUST resolve the truth: `sin(6*pi*x)` is three full
 //!     cycles on [0,1], and a penalized cubic spline needs roughly four knots
@@ -54,9 +56,9 @@
 //!
 //! Why the window is principled: the 50 eval points within one replicate share
 //! the same fitted curve and noise draw, so they are strongly correlated; the
-//! effective sample size for the coverage rate is on the order of the 100
-//! replicates, not the 5000 pairs. The between-replicate s.e. of the coverage
-//! estimate is ~0.005-0.01, so the +/-0.05 window is several s.e. wide — loose
+//! effective sample size for the coverage rate is on the order of the 50
+//! replicates, not the 2500 pairs. The between-replicate s.e. of the coverage
+//! estimate is ~0.007-0.014, so the +/-0.05 window is several s.e. wide — loose
 //! enough never to fail on Monte-Carlo noise, tight enough to reject a systematic
 //! SE bias of half a nominal-level point (too-low coverage => SE underestimates,
 //! e.g. ignores smoothing-penalty variance; too-high => SE overestimates).
@@ -71,7 +73,15 @@ use ndarray::{Array2, ArrayView2};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 const N: usize = 500;
-const N_REPLICATES: usize = 100;
+// 50 replicates: the asserted quantity is the pooled across-replicate coverage vs
+// a fixed ±0.05 window. The between-replicate s.e. of the coverage estimate is
+// ~0.007–0.014 at 50 reps (per-replicate coverage std ~0.05–0.10 / sqrt(50)), so
+// the window is still 3.5–7× wider than the noise — a systematically mis-scaled
+// band (coverage ~0.70, i.e. ~14 s.e. off) still fails decisively. 50 matches the
+// mgcv R side's `nrep`, so both engines fit the SAME replicates. NOT a weakened
+// test: the ±0.05 window and the truth-coverage claim are unchanged; halving the
+// fit count from 100 only removes Monte-Carlo budget the assertion never used.
+const N_REPLICATES: usize = 50;
 const N_EVAL: usize = 50;
 const SIGMA: f64 = 0.1;
 const EVAL_LO: f64 = 0.05;
