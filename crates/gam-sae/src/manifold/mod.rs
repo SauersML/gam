@@ -96,8 +96,8 @@ pub(crate) use gam_linalg::faer_ndarray::{
 pub(crate) use gam_linalg::triangular::cholesky_solve_vector;
 
 pub(crate) use gam_solve::arrow_schur::{
-    ArrowFactorCache, ArrowRowGaugeDeflation, arrow_factor_max_pivot, arrow_factor_min_pivot,
-    solve_arrow_newton_step_with_options,
+    ArrowFactorCache, ArrowRowGaugeDeflation, RowDeflationSpectrum, arrow_factor_max_pivot,
+    arrow_factor_min_pivot, solve_arrow_newton_step_with_options,
 };
 
 pub(crate) use gam_solve::estimate::EstimationError;

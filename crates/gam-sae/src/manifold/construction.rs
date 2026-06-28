@@ -7206,16 +7206,17 @@ impl SaeManifoldTerm {
         cache: &ArrowFactorCache,
         solver: &DeflatedArrowSolver<'_>,
     ) -> Result<Vec<Array1<f64>>, ArrowSchurError> {
-        // Kept-subspace inverse diagonal: exclude the UNIT-stiffness deflated
-        // directions so the ARD precision trace `½ tr(H⁻¹ ∂H/∂ρ_ard)` is not
-        // biased by the deflated inverse's spurious `1/λ̃ = 1` on a per-row block
-        // direction that overlaps a coordinate slot (the deflation acts on the
-        // whole per-row `H_tt`, so it corrupts every ρ-component's trace, not just
-        // the IBP α one).
+        // RAW selected-inverse diagonal: the per-axis diagonal contraction uses
+        // the DEFLATED inverse; the full kept-subspace + rotation deflation
+        // correction `tr(inv_vv·(D − DΦ[D]))` is subtracted per (row, axis)
+        // afterwards via the Daleckii–Krein helper. Each ARD ρ-component
+        // `(atom k, axis)` differentiates a SINGLE coordinate-slot diagonal entry,
+        // so its `D` is the rank-one `hess·e_s e_sᵀ` at that local slot `s`.
         let inv_diag = solver
-            .latent_inverse_diagonal_kept()
+            .latent_inverse_diagonal()
             .map_err(|err| ArrowSchurError::SchurFactorFailed { reason: err })?;
         let n = self.n_obs();
+        let total_t = cache.delta_t_len();
         let coord_offsets = self.assignment.coord_offsets();
         let ard_axis_periods: Vec<Vec<Option<f64>>> = self
             .assignment
@@ -7238,6 +7239,46 @@ impl SaeManifoldTerm {
             .collect();
         for row in 0..n {
             let row_base = cache.row_offsets[row];
+            let q = cache.row_dims[row];
+            let dirs = cache
+                .deflated_row_directions
+                .get(row)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let spectrum = cache
+                .deflation_row_spectra
+                .get(row)
+                .and_then(Option::as_ref);
+            // Per-row selected-inverse t-block, built once (only when deflated).
+            let inv_vv = if dirs.is_empty() {
+                None
+            } else {
+                let mut m = Array2::<f64>::zeros((q, q));
+                for col in 0..q {
+                    let mut rhs_t = Array1::<f64>::zeros(total_t);
+                    let rhs_beta = Array1::<f64>::zeros(cache.k);
+                    rhs_t[row_base + col] = 1.0;
+                    let solved = solver.solve(rhs_t.view(), rhs_beta.view()).map_err(|err| {
+                        ArrowSchurError::SchurFactorFailed { reason: err }
+                    })?;
+                    for r in 0..q {
+                        m[[r, col]] = solved.t[row_base + r];
+                    }
+                }
+                Some(m)
+            };
+            // Correction for one local coordinate slot `s` with curvature `hess`.
+            let slot_correction = |s: usize, hess: f64| -> f64 {
+                let Some(iv) = inv_vv.as_ref() else {
+                    return 0.0;
+                };
+                if s >= q || hess == 0.0 {
+                    return 0.0;
+                }
+                let mut d = Array2::<f64>::zeros((q, q));
+                d[[s, s]] = hess;
+                Self::deflation_block_correction(iv, &d, dirs, spectrum)
+            };
             match self.last_row_layout {
                 Some(ref layout) => {
                     let active = &layout.active_atoms[row];
@@ -7253,8 +7294,10 @@ impl SaeManifoldTerm {
                             let alpha = SaeManifoldRho::stable_exp_strength(rho.log_ard[k][axis]);
                             let t = coord.row(row)[axis];
                             let prior = ArdAxisPrior::eval(alpha, t, ard_axis_periods[k][axis]);
-                            traces[k][axis] +=
-                                0.5 * inv_diag[row_base + block_start + axis] * prior.hess.max(0.0);
+                            let hess = prior.hess.max(0.0);
+                            let s = block_start + axis;
+                            traces[k][axis] += 0.5 * inv_diag[row_base + s] * hess;
+                            traces[k][axis] -= 0.5 * slot_correction(s, hess);
                         }
                     }
                 }
@@ -7270,8 +7313,10 @@ impl SaeManifoldTerm {
                             let alpha = SaeManifoldRho::stable_exp_strength(rho.log_ard[k][axis]);
                             let t = coord.row(row)[axis];
                             let prior = ArdAxisPrior::eval(alpha, t, ard_axis_periods[k][axis]);
-                            traces[k][axis] +=
-                                0.5 * inv_diag[row_base + block_start + axis] * prior.hess.max(0.0);
+                            let hess = prior.hess.max(0.0);
+                            let s = block_start + axis;
+                            traces[k][axis] += 0.5 * inv_diag[row_base + s] * hess;
+                            traces[k][axis] -= 0.5 * slot_correction(s, hess);
                         }
                     }
                 }
@@ -7503,32 +7548,108 @@ impl SaeManifoldTerm {
         if hdiag.is_empty() {
             return Ok(0.0);
         }
-        // Kept-subspace inverse diagonal: the deflated inverse assigns
-        // `1/λ̃ = 1` to each per-row UNIT-stiffness direction `vᵢ`, so a raw
-        // diagonal contraction would spuriously add `½ Σ_i vᵢᵀ (∂H_p/∂ρ) vᵢ` (a
-        // ρ-independent direction must add 0). `latent_inverse_diagonal_kept`
-        // removes that per-row deflated diagonal centrally; the cross-row
-        // off-diagonal pass below contracts only DISTINCT rows `i ≠ j`, off any
-        // single-row `vᵢ`'s support, so it needs no deflation correction.
+        // RAW selected-inverse diagonal: the per-row diagonal contraction uses the
+        // DEFLATED inverse; the full kept-subspace + β-Schur/rotation deflation
+        // correction `tr(inv_vv·(D − DΦ[D]))` is subtracted per row afterwards
+        // (`deflation_block_correction`), exactly as the data trace does. The
+        // cross-row off-diagonal pass below contracts only DISTINCT rows `i ≠ j`,
+        // off any single-row `vᵢ`'s support, so it needs no deflation correction.
         let inv_diag = solver
-            .latent_inverse_diagonal_kept()
+            .latent_inverse_diagonal()
             .map_err(|err| format!("assignment_log_strength_hessian_trace: {err}"))?;
         let assignment_dim = self.assignment.assignment_coord_dim();
+        let total_t = cache.delta_t_len();
+        // #1416 cross-row IBP source: the per-row block that the deflation
+        // factorizes is the NO-SELF base `H₀'` — the rank-one self curvature
+        // `d_k·J_ik²` is DOWNDATED from each logit diagonal and re-applied through
+        // the Woodbury carrier. The full-`H` diagonal contraction below still uses
+        // the full `hdiag` (which carries that self term), but the per-row
+        // DEFLATION correction must use `(∂H₀'/∂ρ)_tt`, i.e. `hdiag` MINUS the
+        // downdated self term — otherwise the Daleckii–Krein correction
+        // mis-attributes the (un-deflated) Woodbury self curvature's derivative to
+        // the deflated subspace. For non-IBP modes there is no Woodbury source and
+        // the self term is `0` (the deflated block IS the full block).
+        let cross_channels = if self.last_row_layout.is_none() {
+            ibp_assignment_third_channels(&self.assignment, rho)?
+        } else {
+            None
+        };
+        let learnable_alpha = matches!(
+            self.assignment.mode,
+            AssignmentMode::IBPMap {
+                learnable_alpha: true,
+                ..
+            }
+        );
+        let self_curv = |row: usize, atom: usize| -> f64 {
+            let Some(ch) = cross_channels.as_ref() else {
+                return 0.0;
+            };
+            let d_k = if learnable_alpha {
+                ch.cross_row_d_logalpha[atom]
+            } else {
+                ch.cross_row_d[atom]
+            };
+            let j = ch.z_jac[row * k_atoms + atom];
+            d_k * j * j
+        };
         let mut trace = 0.0_f64;
         for row in 0..self.n_obs() {
             let row_base = cache.row_offsets[row];
             let assignment_base = row * k_atoms;
+            let q = cache.row_dims[row];
+            // Per-row diagonal `(∂H₀'/∂ρ)_tt` for the deflation correction: the
+            // assignment prior curves only the logit/assignment slots (coordinate
+            // slots are 0 — ARD handles those), MINUS the downdated cross-row self
+            // curvature. The full-`H` trace contraction keeps the full `hdiag`.
+            let mut d_diag = Array1::<f64>::zeros(q);
             match self.last_row_layout {
                 Some(ref layout) => {
                     for (pos, &atom) in layout.active_atoms[row].iter().enumerate() {
-                        trace += inv_diag[row_base + pos] * hdiag[assignment_base + atom];
+                        let d_slot = hdiag[assignment_base + atom];
+                        trace += inv_diag[row_base + pos] * d_slot;
+                        if pos < q {
+                            d_diag[pos] = d_slot - self_curv(row, atom);
+                        }
                     }
                 }
                 None => {
                     for free_idx in 0..assignment_dim {
-                        trace += inv_diag[row_base + free_idx] * hdiag[assignment_base + free_idx];
+                        let d_slot = hdiag[assignment_base + free_idx];
+                        trace += inv_diag[row_base + free_idx] * d_slot;
+                        if free_idx < q {
+                            d_diag[free_idx] = d_slot - self_curv(row, free_idx);
+                        }
                     }
                 }
+            }
+            let dirs = cache
+                .deflated_row_directions
+                .get(row)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            if !dirs.is_empty() {
+                let mut inv_vv = Array2::<f64>::zeros((q, q));
+                for col in 0..q {
+                    let mut rhs_t = Array1::<f64>::zeros(total_t);
+                    let rhs_beta = Array1::<f64>::zeros(cache.k);
+                    rhs_t[row_base + col] = 1.0;
+                    let solved = solver.solve(rhs_t.view(), rhs_beta.view()).map_err(|err| {
+                        format!("assignment_log_strength_hessian_trace: selected inverse: {err}")
+                    })?;
+                    for r in 0..q {
+                        inv_vv[[r, col]] = solved.t[row_base + r];
+                    }
+                }
+                let mut d_mat = Array2::<f64>::zeros((q, q));
+                for s in 0..q {
+                    d_mat[[s, s]] = d_diag[s];
+                }
+                let spectrum = cache
+                    .deflation_row_spectra
+                    .get(row)
+                    .and_then(Option::as_ref);
+                trace -= Self::deflation_block_correction(&inv_vv, &d_mat, dirs, spectrum);
             }
         }
         // #1416: the IBP prior Hessian is `H_p = d·J Jᵀ + diag(s, c)`, where the
@@ -7686,6 +7807,81 @@ impl SaeManifoldTerm {
         Ok(total)
     }
 
+    /// Per-row spectral-deflation correction `tr((H⁻¹)_tt · (D − DΦ[D]))` for one
+    /// evidence ρ-component, to be SUBTRACTED from the raw-derivative trace
+    /// `tr((H⁻¹)_tt · D)` the trace otherwise accumulates.
+    ///
+    /// The criterion VALUE re-deflates each per-row `H_tt` at every ρ, so the
+    /// correct evidence gradient contracts `(H⁻¹)_tt` against the deflation-map
+    /// derivative `DΦ[D]`, not the raw `D = (∂H_raw/∂ρ)_tt`. By Daleckii–Krein,
+    /// in the row's RAW eigenbasis `U`,
+    ///   `DΦ[D] = U (F ∘ (Uᵀ D U)) Uᵀ`,  `F_{ml} = (λ̃ₘ − λ̃ₗ)/(λₘ − λₗ)`
+    /// (raw `λ` in the denominator, conditioned `λ̃` in the numerator; the
+    /// diagonal / degenerate entry is `f'(λₘ) = 1` for an unclamped kept
+    /// direction and `0` otherwise). Hence `D − DΦ[D] = U ((1−F) ∘ (Uᵀ D U)) Uᵀ`,
+    /// whose kept×kept block is `0`, deflated×deflated block is the full `M`, and
+    /// kept(m)×deflated(i) block carries the ROTATION coefficient
+    /// `(1−λᵢ)/(λₘ−λᵢ)`. Contracting against the FULL deflated selected-inverse
+    /// t-block `inv_vv` (which carries the β-Schur back-substitution) captures
+    /// both the within-row kept-subspace term and the deferred β-Schur/rotation
+    /// coupling in one pass, matching the re-deflating fixed-state FD oracle.
+    ///
+    /// `spectrum = Some` (spectral deflation): exact Daleckii–Krein. `None` with a
+    /// non-empty `dirs` (gauge-only deflation, ρ-independent structural null):
+    /// fall back to the within-row kept-subspace term `Σᵢ vᵢᵀ D vᵢ`.
+    /// `inv_vv` is assumed symmetric (selected inverse of a symmetric PD system).
+    fn deflation_block_correction(
+        inv_vv: &Array2<f64>,
+        d_mat: &Array2<f64>,
+        dirs: &[Array1<f64>],
+        spectrum: Option<&RowDeflationSpectrum>,
+    ) -> f64 {
+        let q = inv_vv.nrows();
+        let Some(spec) = spectrum else {
+            // Gauge-only deflation: ρ-independent structural null → within-row term.
+            let mut acc = 0.0_f64;
+            for v in dirs {
+                for a in 0..q {
+                    let va = if a < v.len() { v[a] } else { 0.0 };
+                    if va == 0.0 {
+                        continue;
+                    }
+                    for b in 0..q {
+                        let vb = if b < v.len() { v[b] } else { 0.0 };
+                        acc += va * vb * d_mat[[a, b]];
+                    }
+                }
+            }
+            return acc;
+        };
+        let u = &spec.evecs;
+        if u.nrows() != q || u.ncols() != q {
+            return 0.0;
+        }
+        let raw = &spec.raw_evals;
+        let cond = &spec.cond_evals;
+        // M = Uᵀ D U, W = Uᵀ inv_vv U (both q×q, symmetric).
+        let m = u.t().dot(d_mat).dot(u);
+        let w = u.t().dot(inv_vv).dot(u);
+        // correction = Σ_{m,l} W[m,l]·M[m,l]·(1 − F[m,l]).
+        let mut acc = 0.0_f64;
+        let eps = 1.0e-12;
+        for a in 0..q {
+            for b in 0..q {
+                let denom = raw[a] - raw[b];
+                let f1 = if denom.abs() > eps {
+                    (cond[a] - cond[b]) / denom
+                } else if cond[a] == raw[a] {
+                    1.0
+                } else {
+                    0.0
+                };
+                acc += w[[a, b]] * m[[a, b]] * (1.0 - f1);
+            }
+        }
+        acc
+    }
+
     /// #1417: exact `½ tr(H⁻¹ ∂H_data/∂logα)` for LEARNABLE IBP alpha.
     ///
     /// The forward assignment is `a_ik = σ(ℓ_ik/τ)·π_k(α)` with the #614
@@ -7831,38 +8027,35 @@ impl SaeManifoldTerm {
                     trace += kw * inv_vv[[b, a]] * h_ab;
                 }
             }
-            // Deflation correction (kept-subspace restriction). The selected
-            // inverse `inv_vv` is the DEFLATED inverse: each per-row UNIT-stiffness
-            // direction `vᵢ` (`λ̃ = 1`) makes the t–t contraction above spuriously
-            // add `½ inv_alpha1 · vᵢᵀ (∂H_data/∂logα)_tt vᵢ`, a contribution that
-            // must be 0 since `vᵢ` is ρ/θ-independent. The t–t block of
-            // `∂H_data/∂logα` is `kw_ab·⟨J_a, J_b⟩` (the SAME operator the trace
-            // contracts), and `vᵢ` is supported on this row's `q`-dim block, so
-            // subtract `Σ_{a,b} vᵢ[a]·vᵢ[b]·kw_ab·⟨J_a, J_b⟩`. The t–β/β–β blocks
-            // are not deflated (the deflation acts on the per-row `H_tt`), so only
-            // the t–t self-contraction is removed.
+            // Deflation correction (kept-subspace restriction + β-Schur/rotation).
+            // `inv_vv` is the DEFLATED selected inverse, so the t–t contraction
+            // above contracts the RAW derivative `D` where the re-deflating
+            // criterion uses the deflation-map derivative `DΦ[D]`. Subtract the
+            // exact over-count `tr(inv_vv·(D − DΦ[D]))` via the Daleckii–Krein
+            // helper, with `D_{ab} = kw_ab·⟨J_a, J_b⟩` the SAME t–t operator the
+            // trace contracts. The t–β/β–β blocks are not deflated, so only the
+            // t–t contraction is corrected.
             let dirs = cache
                 .deflated_row_directions
                 .get(row)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            for v in dirs {
+            if !dirs.is_empty() {
+                let mut d_mat = Array2::<f64>::zeros((q, q));
                 for a in 0..q {
-                    if a >= v.len() || v[a] == 0.0 {
-                        continue;
-                    }
                     for b in 0..q {
-                        if b >= v.len() || v[b] == 0.0 {
-                            continue;
-                        }
                         let h_ab = sae_dot(&jets.first[a], &jets.first[b]);
                         if h_ab == 0.0 {
                             continue;
                         }
-                        let kw = kfac(var_atom[a]) + kfac(var_atom[b]);
-                        trace -= kw * v[a] * v[b] * h_ab;
+                        d_mat[[a, b]] = (kfac(var_atom[a]) + kfac(var_atom[b])) * h_ab;
                     }
                 }
+                let spectrum = cache
+                    .deflation_row_spectra
+                    .get(row)
+                    .and_then(Option::as_ref);
+                trace -= Self::deflation_block_correction(&inv_vv, &d_mat, dirs, spectrum);
             }
             // t–β and β–t blocks: appear symmetrically, contract once with the
             // factor 2 (H, H⁻¹ symmetric; `(H⁻¹)_βt = (H⁻¹)_tβᵀ`).
@@ -8527,15 +8720,22 @@ impl SaeManifoldTerm {
             // Per-row UNIT-stiffness deflated directions: the selected inverse
             // `inv_vv` is the DEFLATED inverse (it assigns `1/λ̃ = 1` to each
             // `vᵢ`), so every `inv_vv`-weighted t–t contraction of `∂H/∂θ_w`
-            // below spuriously includes `vᵢᵀ (∂H_tt/∂θ_w) vᵢ` — a contribution
-            // that must be 0 because `vᵢ` is θ-independent. The kept-subspace Γ
-            // subtracts `Σ_i vᵢ[a]·vᵢ[b]·(∂H_ab/∂θ_w)` over the t–t block (the
-            // t–β / β–β blocks are not deflated).
+            // below spuriously contracts the RAW derivative where the re-deflating
+            // criterion uses the deflation-map derivative `DΦ`. The kept-subspace Γ
+            // subtracts `tr(inv_vv·(D − DΦ[D]))` over the t–t block via the same
+            // Daleckii–Krein helper the ρ-traces use (the t–β / β–β blocks are not
+            // deflated). `θ` enters only the per-row block (no cross-row Woodbury
+            // self-downdate on the θ path), so the raw t–t derivative `D` is used
+            // directly.
             let defl_dirs = cache
                 .deflated_row_directions
                 .get(row)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
+            let defl_spectrum = cache
+                .deflation_row_spectra
+                .get(row)
+                .and_then(Option::as_ref);
             for w in 0..q {
                 let mut gamma = 0.0_f64;
                 // The active logit `w` differentiates against; `None` unless this
@@ -8547,6 +8747,7 @@ impl SaeManifoldTerm {
                         }
                         _ => None,
                     };
+                let mut dh_mat = Array2::<f64>::zeros((q, q));
                 for a in 0..q {
                     for b in 0..q {
                         let mut dh = sae_dot(&jets.second[a][w], &jets.first[b])
@@ -8581,17 +8782,14 @@ impl SaeManifoldTerm {
                                 _ => 0.0,
                             };
                         }
+                        dh_mat[[a, b]] = dh;
                         gamma += inv_vv[[b, a]] * dh;
-                        if !defl_dirs.is_empty() && dh != 0.0 {
-                            let mut vv = 0.0_f64;
-                            for v in defl_dirs {
-                                if a < v.len() && b < v.len() {
-                                    vv += v[a] * v[b];
-                                }
-                            }
-                            gamma -= vv * dh;
-                        }
                     }
+                }
+                if !defl_dirs.is_empty() {
+                    gamma -= Self::deflation_block_correction(
+                        &inv_vv, &dh_mat, defl_dirs, defl_spectrum,
+                    );
                 }
                 for a in 0..q {
                     for (beta_pos, channel) in border.iter().enumerate() {
@@ -8612,21 +8810,19 @@ impl SaeManifoldTerm {
 
             for (w_beta_pos, w_channel) in border.iter().enumerate() {
                 let mut gamma = 0.0_f64;
+                let mut dh_mat = Array2::<f64>::zeros((q, q));
                 for a in 0..q {
                     for b in 0..q {
                         let dh = sae_dot(&jets.beta_l_deriv[a][w_beta_pos], &jets.first[b])
                             + sae_dot(&jets.first[a], &jets.beta_l_deriv[b][w_beta_pos]);
+                        dh_mat[[a, b]] = dh;
                         gamma += inv_vv[[b, a]] * dh;
-                        if !defl_dirs.is_empty() && dh != 0.0 {
-                            let mut vv = 0.0_f64;
-                            for v in defl_dirs {
-                                if a < v.len() && b < v.len() {
-                                    vv += v[a] * v[b];
-                                }
-                            }
-                            gamma -= vv * dh;
-                        }
                     }
+                }
+                if !defl_dirs.is_empty() {
+                    gamma -= Self::deflation_block_correction(
+                        &inv_vv, &dh_mat, defl_dirs, defl_spectrum,
+                    );
                 }
                 for a in 0..q {
                     for (beta_pos, channel) in border.iter().enumerate() {

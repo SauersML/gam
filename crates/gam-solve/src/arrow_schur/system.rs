@@ -2450,6 +2450,24 @@ impl ArrowHtbetaCache {
     }
 }
 
+/// RAW per-row spectral data of a spectrally-deflated undamped evidence `H_tt`
+/// block (see [`ArrowFactorCache::deflation_row_spectra`]).
+///
+/// `evecs` columns are the RAW symmetric eigenvectors `uₘ` of `H_tt`
+/// (orthonormal; the deflated directions `vᵢ` are the subset whose eigenvalue
+/// was pinned). `raw_evals[m]` is the RAW eigenvalue `λₘ` BEFORE the unit-pin /
+/// floor-clamp. `cond_evals[m]` is the conditioned eigenvalue `λ̃ₘ` the factor
+/// actually uses (`λ̃ = λ` for an unclamped kept direction, the positive `floor`
+/// for a clamped kept direction, `1` for a deflated direction). Together they
+/// give the Daleckii–Krein divided differences the outer-gradient deflation
+/// correction needs.
+#[derive(Debug, Clone)]
+pub struct RowDeflationSpectrum {
+    pub evecs: Array2<f64>,
+    pub raw_evals: Array1<f64>,
+    pub cond_evals: Array1<f64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ArrowFactorCache {
     /// Per-row lower-triangular Cholesky factors of `H_tt^(i) + ridge_t·I`.
@@ -2535,6 +2553,27 @@ pub struct ArrowFactorCache {
     /// (kept-subspace restriction) using these directions; without them the
     /// REML outer ρ-gradient is biased by `+Σ_deflated ½ vᵢᵀ ∂H_raw/∂ρ vᵢ`.
     pub deflated_row_directions: Arc<[Vec<Array1<f64>>]>,
+    /// Per-row RAW spectral decomposition of an undamped evidence `H_tt` block
+    /// that underwent SPECTRAL deflation, surfaced so the outer ρ/θ-gradient
+    /// traces can apply the EXACT deflation-map (Daleckii–Krein) derivative
+    /// correction, not just the within-row kept-subspace term.
+    ///
+    /// The criterion VALUE re-deflates `H_tt` at every ρ, so its gradient is
+    /// `tr(H_deflated⁻¹ DΦ[∂H_raw/∂ρ])`, where `Φ` is the spectral pin-to-unit
+    /// map. By Daleckii–Krein `DΦ[Ȧ] = U (F ∘ UᵀȦU) Uᵀ` with the divided-
+    /// difference matrix `F_{ml} = (λ̃ₘ − λ̃ₗ)/(λₘ − λₗ)` (raw `λ` in the
+    /// denominator, conditioned `λ̃` in the numerator). The kept×kept block of
+    /// `F` is `1` (the kept subspace contracts the raw derivative unchanged), the
+    /// deflated×deflated block is `0`, and the kept(m)×deflated(i) block is
+    /// `(λₘ − 1)/(λₘ − λᵢ)` — this last, ROTATION, term is what the per-row
+    /// kept-subspace correction alone misses; it couples to the β-block through
+    /// the Schur back-substitution carried in `(H⁻¹)_tt`.
+    ///
+    /// `Some(spectrum)` only for spectrally-deflated rows; `None` for PD rows,
+    /// gauge-only deflation (ρ-independent structural null — within-row term
+    /// suffices), and every non-SAE-evidence solver path (streaming / device /
+    /// cross-row CG). Empty overall when no row deflated spectrally.
+    pub deflation_row_spectra: Arc<[Option<RowDeflationSpectrum>]>,
     /// Exact cross-row IBP rank-`R` Woodbury correction (#1038), present iff the
     /// source system carried an [`IbpCrossRowSource`]. When set, the per-row
     /// factors above are of the NO-SELF base `H₀'` (self term `d_k·z'_ik²`

@@ -64,12 +64,12 @@ pub(crate) fn learnable_ibp_alpha_logdet_trace_matches_dense_fd_pd_region_deflat
         * (fixed_state_logdet(term.clone(), &target, &rho_plus)
             - fixed_state_logdet(term.clone(), &target, &rho_minus))
         / (2.0 * h);
-    // Post-fix at this fixture: fd = 1.04947881e1, analytic(prior+data) =
-    // 1.04844768e1 (prior = -1.4752775e0, data = 1.1959754e1), gap = 1.03e-2
-    // (the residual is the deflated subspace's β-Schur coupling, higher order
-    // than the per-row-block correction), well within tol ≈ 3.4e-2. Pre-fix the
-    // analytic was 1.04431064e1 and the gap was +5.17e-2 (a hard FD failure).
-    let tol = 3.0e-3 * (1.0 + fd_half.abs().max(analytic.abs()));
+    // With the exact Daleckii–Krein deflation-derivative correction (kept
+    // subspace + β-Schur ROTATION coupling `(1−λᵢ)/(λₘ−λᵢ)`), `analytic(prior+
+    // data)` matches the re-deflating fixed-state central difference of `log|H|`
+    // to FD accuracy. Pre-rotation-fix the gap was ≈ 1.03e-2 (only the within-row
+    // kept-subspace term was subtracted); pre-c1acb96d4 it was +5.17e-2.
+    let tol = 1.0e-6 * (1.0 + fd_half.abs().max(analytic.abs()));
     assert!(
         (fd_half - analytic).abs() <= tol,
         "PD-region deflation logdet trace: fd(½∂log|H|/∂logα)={fd_half:.8e}, \
@@ -185,19 +185,23 @@ pub(crate) fn learnable_ibp_data_logdet_trace_zeroes_ungated_atom_1026() {
         .expect("data-Hessian alpha trace");
     let analytic = prior_trace + data_trace;
 
-    // CLEAN-VERIFICATION NOTE: a full ∂log|H|/∂logα FD oracle is NOT reliable for
-    // this fixture. The ungated background atom's flat coordinates trigger heavy
-    // spectral deflation, and the #1417 deflation fix's DEFERRED higher-order
-    // β-Schur deflation coupling dominates the FD here (gap ~25 even though the
-    // per-row-block deflation is corrected, and the non-ungated `..._deflation`
-    // test matches FD to ~1e-2 at the same ρ). So this test EXERCISES the kfac=0
-    // ungated path (atom 1 ungated) and pins finiteness; CORRECTNESS rests on:
-    //   • the no-op-for-non-ungated property (`kfac(k) = k+1` ≡ identity), pinned
-    //     to dense FD by `learnable_ibp_alpha_logdet_trace_matches_dense_fd_pd_region_deflation`;
-    //   • the FD-bit-flip-verified value-side analog
-    //     `forward_alpha_data_derivative_skips_ungated_atom_1026`;
-    //   • the closed-form `e_k = 0` derivation — an ungated atom's data-Jacobian
-    //     columns carry `a_k ≡ 1` (α-independent), so `∂J_·k/∂logα = 0`.
+    // DEFLATION-BOUNDARY FIXTURE — a full ∂log|H|/∂logα FD oracle is NOT a clean
+    // 1e-6 target here, but NOT because of the deflation DERIVATIVE (that is now
+    // exact, see `..._pd_region_deflation`, which matches FD to 1e-6 with the
+    // Daleckii–Krein correction). The ungated background atom's flat coordinates
+    // drive each per-row block to a DEFLATED null (raw λ ≈ 0 → pinned) PLUS a
+    // near-singular KEPT eigenvalue (raw λ ≈ 4e-4). That kept λ sits on the
+    // deflation floor knife-edge: at the converged ρ₀ it is KEPT (so the analytic
+    // trace contracts its 1/4e-4 ≈ 2500 selected-inverse weight), but the
+    // re-deflating central-difference evaluates `log|H|` at ρ₀±h where the SAME
+    // direction is PINNED (log 1 = 0). Analytic (ρ₀, kept) and FD (ρ±h, deflated)
+    // therefore see INCONSISTENT deflation states — an O(2500·h-independent) gap
+    // that is a property of the floor boundary, not the gradient. The deflation
+    // CORRECTION itself is provably ~0 here: the ungated null carries zero data
+    // coupling, so `tr(inv_vv·(D − DΦ[D]))` collapses to the within-row term
+    // (≈ 7.8e-3) with no kept↔deflated rotation contribution. CORRECTNESS of the
+    // deflation derivative rests on the `..._pd_region_deflation` 1e-6 gate; this
+    // test pins finiteness + the kfac=0 ungated path.
     assert!(
         prior_trace.is_finite() && data_trace.is_finite() && analytic.is_finite(),
         "ungated learnable-α traces must be finite: prior={prior_trace}, \

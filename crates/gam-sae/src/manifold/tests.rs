@@ -5,7 +5,6 @@ use gam_solve::arrow_schur::{
     ArrowFactorSlab, ArrowHtbetaCache, ArrowSolverMode, ArrowUndampedFactors, PcgDiagnostics,
 };
 use gam_terms::analytic_penalties::ARDPenalty;
-use gam_terms::analytic_penalties::IsometryReference;
 use approx::assert_abs_diff_eq;
 use ndarray::{Array5, array};
 
@@ -7673,6 +7672,7 @@ pub(crate) fn near_singular_outer_gradient_cache() -> ArrowFactorCache {
         pcg_diagnostics: PcgDiagnostics::default(),
         gauge_deflated_directions: 0,
         deflated_row_directions: std::sync::Arc::from(Vec::new()),
+        deflation_row_spectra: std::sync::Arc::from(Vec::new()),
         cross_row_woodbury: None,
     }
 }
@@ -7701,6 +7701,7 @@ pub(crate) fn diagonal_latent_cache(diagonal: &[f64]) -> ArrowFactorCache {
         pcg_diagnostics: PcgDiagnostics::default(),
         gauge_deflated_directions: 0,
         deflated_row_directions: std::sync::Arc::from(Vec::new()),
+        deflation_row_spectra: std::sync::Arc::from(Vec::new()),
         cross_row_woodbury: None,
     }
 }
@@ -7842,6 +7843,7 @@ pub(crate) fn rank_deficient_beta_outer_gradient_cache() -> ArrowFactorCache {
         pcg_diagnostics: PcgDiagnostics::default(),
         gauge_deflated_directions: 0,
         deflated_row_directions: std::sync::Arc::from(Vec::new()),
+        deflation_row_spectra: std::sync::Arc::from(Vec::new()),
         cross_row_woodbury: None,
     }
 }
