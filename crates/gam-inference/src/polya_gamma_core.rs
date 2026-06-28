@@ -266,6 +266,53 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // exponential_tail_mass
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn exponential_tail_mass_is_in_unit_interval() {
+        for &tilt in &[0.0_f64, 0.5, 1.0, 2.0, 5.0, 10.0] {
+            let p = exponential_tail_mass(tilt);
+            assert!(
+                p > 0.0 && p < 1.0,
+                "exponential_tail_mass({tilt}) = {p} is outside (0,1)"
+            );
+        }
+    }
+
+    #[test]
+    fn exponential_tail_mass_decreases_with_tilt() {
+        // Larger |c| concentrates PG(1,c) mass away from the exponential
+        // right-tail proposal arm, so the acceptance mass for that arm decreases.
+        let tilts = [0.0_f64, 1.0, 2.0, 5.0, 10.0];
+        let masses: Vec<f64> = tilts.iter().map(|&t| exponential_tail_mass(t)).collect();
+        for w in masses.windows(2) {
+            assert!(
+                w[1] < w[0],
+                "exponential_tail_mass should decrease with tilt, but {:.6} ≥ {:.6}",
+                w[1],
+                w[0]
+            );
+        }
+    }
+
+    #[test]
+    fn std_normal_cdf_symmetry() {
+        for &x in &[0.5_f64, 1.0, 1.5, 2.0, 3.0] {
+            let lo = std_normal_cdf(-x);
+            let hi = std_normal_cdf(x);
+            assert!(
+                (lo + hi - 1.0).abs() < 1e-14,
+                "Φ({x}) + Φ(-{x}) must equal 1.0; got {lo:.15} + {hi:.15}",
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // series_coefficient
+    // -----------------------------------------------------------------------
+
     #[test]
     fn series_coefficient_matches_reference() {
         for &x in &[0.1_f64, 0.5, 1.0, 2.0] {
