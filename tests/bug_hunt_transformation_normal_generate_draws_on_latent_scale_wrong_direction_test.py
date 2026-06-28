@@ -91,8 +91,16 @@ def test_ctm_generate_conditional_mean_increases_with_covariate() -> None:
 
         _write_csv(train, {"y": y, "x": x})
 
+        # `s(x, k=6)` (a modest rank-6 marginal) keeps the CTM transformation
+        # basis well-conditioned for n=1500; the default `smooth(x)` auto-knots
+        # to a rank that blows the joint transformation basis up to ~168 params,
+        # which is over-parameterised for this sample and the inner monotone
+        # solve correctly refuses to certify a non-converged fit. The generate
+        # contract under test (response-scale draws whose mean increases with x)
+        # is independent of the marginal rank — this mirrors the convergent
+        # basis used by the sibling predict-side regression test.
         fit = subprocess.run(
-            [GAM_BIN, "fit", train, "y ~ smooth(x)", "--transformation-normal",
+            [GAM_BIN, "fit", train, "y ~ s(x, k=6)", "--transformation-normal",
              "--out", model],
             capture_output=True, text=True,
         )
