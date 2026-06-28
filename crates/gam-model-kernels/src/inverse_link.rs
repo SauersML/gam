@@ -348,4 +348,80 @@ mod tests {
             "Standard(Log) spec path must report exact exp(705), not the solver clamp"
         );
     }
+
+    // ── apply_inverse_link_vec: per-link unit tests ───────────────────────────
+
+    #[test]
+    fn identity_link_is_passthrough() {
+        let eta = vec![-5.0_f64, 0.0, 3.14, 1e10];
+        let out = apply_inverse_link_vec(&eta, "identity").expect("identity");
+        assert_eq!(out, eta);
+        // Empty string is also accepted as "identity".
+        let out2 = apply_inverse_link_vec(&eta, "").expect("empty = identity");
+        assert_eq!(out2, eta);
+    }
+
+    #[test]
+    fn logit_at_zero_returns_half() {
+        let out = apply_inverse_link_vec(&[0.0], "logit").expect("logit");
+        assert!((out[0] - 0.5).abs() < 1e-15, "logit(0) = {}", out[0]);
+    }
+
+    #[test]
+    fn logit_is_monotone_and_bounded() {
+        // Use η values that stay well inside the representable range so logit
+        // outputs are strictly in (0, 1) without floating-point saturation.
+        let etas = [-10.0_f64, -2.0, -0.5, 0.0, 0.5, 2.0, 10.0];
+        let out = apply_inverse_link_vec(&etas, "logit").expect("logit");
+        for (i, &v) in out.iter().enumerate() {
+            assert!(v > 0.0 && v < 1.0, "logit output {v} out of (0,1) at index {i}");
+        }
+        for w in out.windows(2) {
+            assert!(w[1] > w[0], "logit not monotone: {} >= {}", w[0], w[1]);
+        }
+    }
+
+    #[test]
+    fn probit_at_zero_returns_half() {
+        let out = apply_inverse_link_vec(&[0.0], "probit").expect("probit");
+        assert!((out[0] - 0.5).abs() < 1e-15, "probit(0) = {}", out[0]);
+    }
+
+    #[test]
+    fn probit_is_symmetric_around_half() {
+        // Φ(−η) = 1 − Φ(η) by symmetry of the normal distribution.
+        for &eta in &[0.5_f64, 1.0, 2.5, 5.0] {
+            let pos = apply_inverse_link_vec(&[eta], "probit").expect("probit")[0];
+            let neg = apply_inverse_link_vec(&[-eta], "probit").expect("probit")[0];
+            assert!((pos + neg - 1.0).abs() < 1e-14, "Φ({eta})+Φ(-{eta})={}", pos + neg);
+        }
+    }
+
+    #[test]
+    fn cloglog_at_zero_is_one_minus_exp_neg_one() {
+        // μ = 1 − exp(−exp(0)) = 1 − exp(−1) ≈ 0.6321.
+        let out = apply_inverse_link_vec(&[0.0], "cloglog").expect("cloglog");
+        let expected = 1.0 - (-1.0_f64).exp();  // 1 − e^{-1} ≈ 0.6321
+        assert!((out[0] - expected).abs() < 1e-15, "cloglog(0) = {}", out[0]);
+    }
+
+    #[test]
+    fn cloglog_deep_negative_is_not_clamped_to_zero() {
+        // At η = −50 the old clamp froze μ at exp(−50) ≈ 1.93e-22; the unclamped
+        // version follows μ(η) ~ exp(η) for large negative η (to first order).
+        let eta = -50.0_f64;
+        let out = apply_inverse_link_vec(&[eta], "cloglog").expect("cloglog");
+        let approx = (-eta.exp()).exp_m1().abs(); // |expm1(-exp(-50))| ≈ exp(-50)
+        assert!(out[0] < 1e-20, "cloglog(-50) must be very small, got {}", out[0]);
+        // Must be in (0, 1) — not exactly 0 (which the clamp would have forced for
+        // even deeper inputs).
+        assert!(out[0] > 0.0, "cloglog(-50) must be positive, got {}", out[0]);
+        assert!(approx < 1e-20, "sanity: approx={approx}");
+    }
+
+    #[test]
+    fn unknown_family_kind_returns_error() {
+        let err = apply_inverse_link_vec(&[0.0], "gamma").unwrap_err();
+        assert!(err.contains("family_kind"), "error should mention family_kind: {err}");
+    }
 }
