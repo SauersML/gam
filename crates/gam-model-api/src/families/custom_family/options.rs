@@ -696,6 +696,95 @@ impl Default for BlockwiseFitOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gam_linalg::matrix::DesignMatrix;
+    use ndarray::Array2;
+
+    fn make_spec(nrows: usize, ncols: usize) -> ParameterBlockSpec {
+        ParameterBlockSpec {
+            design: DesignMatrix::from(Array2::<f64>::zeros((nrows, ncols))),
+            ..ParameterBlockSpec::defaults()
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // default_coefficient_hessian_cost
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn hessian_cost_empty_specs_is_zero() {
+        assert_eq!(default_coefficient_hessian_cost(&[]), 0);
+    }
+
+    #[test]
+    fn hessian_cost_single_block() {
+        // n=10, p=3 → 10 * 3^2 = 90
+        let spec = make_spec(10, 3);
+        assert_eq!(default_coefficient_hessian_cost(&[spec]), 90);
+    }
+
+    #[test]
+    fn hessian_cost_two_blocks_sum() {
+        // n=10, p=3 → 90; n=5, p=4 → 5*16=80; total=170
+        let specs = [make_spec(10, 3), make_spec(5, 4)];
+        assert_eq!(default_coefficient_hessian_cost(&specs), 170);
+    }
+
+    // -----------------------------------------------------------------------
+    // default_coefficient_gradient_cost
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn gradient_cost_is_half_hessian_cost() {
+        let specs = [make_spec(10, 3)];
+        let hess = default_coefficient_hessian_cost(&specs);
+        assert_eq!(default_coefficient_gradient_cost(&specs), hess / 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // joint_coupled_coefficient_hessian_cost
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn joint_coupled_cost_empty_specs_is_zero() {
+        assert_eq!(joint_coupled_coefficient_hessian_cost(100, &[]), 0);
+    }
+
+    #[test]
+    fn joint_coupled_cost_two_blocks() {
+        // n=10, p_total = 3+4=7 → 10 * 49 = 490
+        let specs = [make_spec(99, 3), make_spec(99, 4)];
+        assert_eq!(joint_coupled_coefficient_hessian_cost(10, &specs), 490);
+    }
+
+    // -----------------------------------------------------------------------
+    // block_offsets_from_specs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn block_offsets_empty_is_empty() {
+        let offsets = block_offsets_from_specs(&[]);
+        assert_eq!(offsets.len(), 0);
+    }
+
+    #[test]
+    fn block_offsets_three_blocks() {
+        // p = [2, 3, 1] → [0..2, 2..5, 5..6]
+        let specs = [make_spec(1, 2), make_spec(1, 3), make_spec(1, 1)];
+        let offsets = block_offsets_from_specs(&specs);
+        assert_eq!(&offsets[0], &(0..2));
+        assert_eq!(&offsets[1], &(2..5));
+        assert_eq!(&offsets[2], &(5..6));
+    }
+
+    #[test]
+    fn block_offsets_zero_width_block() {
+        // p = [2, 0, 1] → [0..2, 2..2, 2..3]
+        let specs = [make_spec(1, 2), make_spec(1, 0), make_spec(1, 1)];
+        let offsets = block_offsets_from_specs(&specs);
+        assert_eq!(&offsets[0], &(0..2));
+        assert_eq!(&offsets[1], &(2..2));
+        assert_eq!(&offsets[2], &(2..3));
+    }
 
     // -----------------------------------------------------------------------
     // first_order_bfgs_loglambda_step_cap
