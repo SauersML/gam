@@ -944,3 +944,89 @@ fn curved_atom_beats_flat_code_at_matched_latent_dim() {
         "curved EV must improve monotonically with harmonic order; got {curved_ev:?}"
     );
 }
+
+/// The fast amortized encode is not just fast — it is ACCURACY-POSITIVE: by
+/// finding the latent coord that minimizes `‖z − Φ(t)·B‖`, it reconstructs real
+/// OLMo l18 activations strictly better than the PCA-seed coords the decoder was
+/// ridge-fit against. Measured explained-variance (curved d=2 torus atom):
+///   h=1: seed 0.2115 -> encoded 0.2468
+///   h=2: seed 0.2593 -> encoded 0.3089
+///   h=3: seed 0.2961 -> encoded 0.3436   (all 635 rows encode through the fast path)
+/// So the fast forward both runs at GEMM throughput AND improves reconstruction,
+/// and the encoded curved-d=2 EV (0.344) beats the best flat affine d=2 code
+/// (0.169, see `curved_atom_beats_flat_code_at_matched_latent_dim`) by ~2x.
+///
+/// Guards against an encode regression that would make the predicted coords worse
+/// than the seed (a broken distilled Jacobian / routing).
+#[test]
+fn fast_encode_improves_reconstruction_over_seed() {
+    let mani = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut path = mani.join("tests/data/olmo_l18_pca64_635.npy");
+    if !path.exists() {
+        path = mani.join("../../tests/data/olmo_l18_pca64_635.npy");
+    }
+    let z = read_npy_f32_2d(&path);
+    let n = z.nrows();
+    let p = z.ncols();
+    let mut total_sq = 0.0;
+    for r in 0..n {
+        for c in 0..p {
+            total_sq += z[[r, c]] * z[[r, c]];
+        }
+    }
+
+    for &h in &[1usize, 2, 3] {
+        let term = real_data_torus_seed_term(z.view(), 1, h);
+        let atom = &term.atoms[0];
+        let mut norm_bound = 0.0_f64;
+        for r in 0..n {
+            norm_bound = norm_bound.max(z.row(r).dot(&z.row(r)).sqrt());
+        }
+        let atlas = crate::encode::EncodeAtlas::build(
+            &term.atoms,
+            &vec![1.0; 1],
+            norm_bound,
+            crate::encode::AtlasConfig::default(),
+        )
+        .unwrap();
+        let amps = ndarray::Array1::<f64>::ones(n);
+        // Seed-coord reconstruction (the decoder's training coords).
+        let seed_recon = atom.basis_values.dot(&atom.decoder_coefficients);
+        let mut seed_err2 = 0.0;
+        for r in 0..n {
+            for c in 0..p {
+                let d = seed_recon[[r, c]] - z[[r, c]];
+                seed_err2 += d * d;
+            }
+        }
+        // Encoded-coord reconstruction (fast forward).
+        let (enc_recon, valid) = atlas
+            .amortized_reconstruct_batch_fast(atom, 0, z.view(), amps.view())
+            .unwrap();
+        let mut nvalid = 0usize;
+        let mut enc_err2 = 0.0;
+        for r in 0..n {
+            if valid[r] {
+                nvalid += 1;
+            }
+            for c in 0..p {
+                let recon = if valid[r] { enc_recon[[r, c]] } else { seed_recon[[r, c]] };
+                let d = recon - z[[r, c]];
+                enc_err2 += d * d;
+            }
+        }
+        // The fast encode reconstructs strictly better than the seed coords.
+        assert!(
+            enc_err2 < seed_err2,
+            "h={h}: fast-encoded reconstruction must beat the seed; \
+             seed_err2={seed_err2:.4} enc_err2={enc_err2:.4} (EV seed={:.4} enc={:.4})",
+            1.0 - seed_err2 / total_sq,
+            1.0 - enc_err2 / total_sq
+        );
+        // Non-vacuity: the fast path encodes essentially all rows.
+        assert!(
+            nvalid > 3 * n / 4,
+            "h={h}: fast encode must cover most rows; got {nvalid}/{n}"
+        );
+    }
+}
