@@ -2463,4 +2463,103 @@ mod tests {
 
         assert!(err.contains("unseen level 'new-level' in categorical column 'x'"));
     }
+
+    // -----------------------------------------------------------------------
+    // strip_categorical_sentinel
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sentinel_strip_present_returns_rest_and_true() {
+        let marked = format!("{}{}", CATEGORICAL_CELL_SENTINEL, "hello");
+        let (rest, found) = strip_categorical_sentinel(&marked);
+        assert_eq!(rest, "hello");
+        assert!(found);
+    }
+
+    #[test]
+    fn sentinel_strip_absent_returns_original_and_false() {
+        let (rest, found) = strip_categorical_sentinel("hello");
+        assert_eq!(rest, "hello");
+        assert!(!found);
+    }
+
+    #[test]
+    fn sentinel_strip_empty_string_returns_empty_and_false() {
+        let (rest, found) = strip_categorical_sentinel("");
+        assert_eq!(rest, "");
+        assert!(!found);
+    }
+
+    #[test]
+    fn sentinel_strip_only_sentinel_returns_empty_and_true() {
+        let marked = CATEGORICAL_CELL_SENTINEL.to_string();
+        let (rest, found) = strip_categorical_sentinel(&marked);
+        assert_eq!(rest, "");
+        assert!(found);
+    }
+
+    // -----------------------------------------------------------------------
+    // EncodedDataset::feature_ranges
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn feature_ranges_two_columns() {
+        let values = ndarray::arr2(&[[1.0_f64, 10.0], [3.0, 20.0], [2.0, 15.0]]);
+        let ds = EncodedDataset {
+            headers: vec!["a".to_string(), "b".to_string()],
+            values,
+            schema: DataSchema { columns: vec![] },
+            column_kinds: vec![ColumnKindTag::Continuous, ColumnKindTag::Continuous],
+        };
+        let ranges = ds.feature_ranges();
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0], (1.0, 3.0));
+        assert_eq!(ranges[1], (10.0, 20.0));
+    }
+
+    #[test]
+    fn feature_ranges_single_row_min_equals_max() {
+        let values = ndarray::arr2(&[[5.0_f64, -3.0]]);
+        let ds = EncodedDataset {
+            headers: vec!["x".to_string(), "y".to_string()],
+            values,
+            schema: DataSchema { columns: vec![] },
+            column_kinds: vec![ColumnKindTag::Continuous, ColumnKindTag::Continuous],
+        };
+        let ranges = ds.feature_ranges();
+        assert_eq!(ranges[0], (5.0, 5.0));
+        assert_eq!(ranges[1], (-3.0, -3.0));
+    }
+
+    #[test]
+    fn feature_ranges_all_nan_defaults_to_zero() {
+        let values = ndarray::arr2(&[[f64::NAN], [f64::NAN]]);
+        let ds = EncodedDataset {
+            headers: vec!["x".to_string()],
+            values,
+            schema: DataSchema { columns: vec![] },
+            column_kinds: vec![ColumnKindTag::Continuous],
+        };
+        let ranges = ds.feature_ranges();
+        assert_eq!(ranges[0], (0.0, 0.0));
+    }
+
+    // -----------------------------------------------------------------------
+    // EncodedDataset::column_map
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn column_map_indexes_by_name() {
+        let values = ndarray::arr2(&[[0.0_f64, 1.0], [2.0, 3.0]]);
+        let ds = EncodedDataset {
+            headers: vec!["alpha".to_string(), "beta".to_string()],
+            values,
+            schema: DataSchema { columns: vec![] },
+            column_kinds: vec![ColumnKindTag::Continuous, ColumnKindTag::Continuous],
+        };
+        let map = ds.column_map();
+        assert_eq!(map["alpha"], 0);
+        assert_eq!(map["beta"], 1);
+        assert_eq!(map.len(), 2);
+    }
 }

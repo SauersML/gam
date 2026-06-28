@@ -692,3 +692,57 @@ impl Default for BlockwiseFitOptions {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // first_order_bfgs_loglambda_step_cap
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn step_cap_without_outer_hessian_is_some_five() {
+        assert_eq!(first_order_bfgs_loglambda_step_cap(false), Some(5.0));
+    }
+
+    #[test]
+    fn step_cap_with_outer_hessian_is_none() {
+        assert_eq!(first_order_bfgs_loglambda_step_cap(true), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // cost_gated_first_order_max_iter
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cost_gated_iter_passes_through_when_has_outer_hessian() {
+        assert_eq!(cost_gated_first_order_max_iter(100, 1_000_000_000, true), 100);
+    }
+
+    #[test]
+    fn cost_gated_iter_passes_through_at_one_iteration() {
+        assert_eq!(cost_gated_first_order_max_iter(1, 1_000_000_000_000, false), 1);
+    }
+
+    #[test]
+    fn cost_gated_iter_passes_through_zero_cost() {
+        assert_eq!(cost_gated_first_order_max_iter(200, 0, false), 200);
+    }
+
+    #[test]
+    fn cost_gated_iter_clamps_expensive_gradient() {
+        // Budget = 80_000_000_000. With cost = 1_000_000_000 the affordable
+        // count is 80. requested=200 should be clamped to 80.
+        let result = cost_gated_first_order_max_iter(200, 1_000_000_000, false);
+        assert!(result <= 80, "got {result}");
+        assert!(result >= 4, "got {result}");
+    }
+
+    #[test]
+    fn cost_gated_iter_enforces_minimum_four() {
+        // Cost so high only 1 iteration is affordable, but minimum is 4.
+        let result = cost_gated_first_order_max_iter(100, u64::MAX / 2, false);
+        assert_eq!(result, 4);
+    }
+}
