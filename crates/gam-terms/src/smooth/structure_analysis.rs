@@ -4,7 +4,9 @@ use crate::basis::{
     SphericalSplineIdentifiability,
 };
 
-use super::{ByVarKind, SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability};
+use super::{
+    ByVarKind, FactorSmoothFlavour, SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability,
+};
 
 use std::collections::BTreeSet;
 
@@ -176,6 +178,36 @@ fn factor_by_level_gate_of(term: &SmoothTermSpec) -> Option<(usize, u64)> {
     }
 }
 
+/// The grouping column of a sum-to-zero factor *deviation* smooth
+/// (`s(g, x, bs="sz")`, lowered to either `FactorSmooth { Sz }` or the internal
+/// `FactorSumToZero`), or `None` for any other smooth.
+///
+/// An sz smooth's per-level design columns are sum-to-zero ACROSS the grouping
+/// factor at every covariate value (the last level's block is `-Σ` of the
+/// others, so each contrast column's across-group sum vanishes pointwise). They
+/// are therefore orthogonal to — never spanned by — any owner smooth that does
+/// not itself vary with that factor. Ownership/orthogonalization against such an
+/// owner (e.g. the shared `s(x)` in the canonical `s(x) + s(g, x, bs="sz")`)
+/// would residualize the genuine deviation away, collapsing every group's curve
+/// to a constant offset (#1605 — the same failure family as the factor-`by`
+/// level gate #1276). The sz block is self-identified by its own sum-to-zero
+/// contrast + penalty, so it needs no owner block.
+///
+/// This is specific to the `Sz` flavour: `Fs`/`Re` random-effect factor smooths
+/// carry a non-zero group mean that genuinely overlaps a shared `s(x)`, so their
+/// deliberate `s(x) + fs` residualization (#978) is preserved.
+fn factor_sum_to_zero_group_col(term: &SmoothTermSpec) -> Option<usize> {
+    match &term.basis {
+        SmoothBasisSpec::FactorSumToZero { by_col, .. } => Some(*by_col),
+        SmoothBasisSpec::FactorSmooth { spec }
+            if matches!(spec.flavour, FactorSmoothFlavour::Sz) =>
+        {
+            Some(spec.group_col)
+        }
+        _ => None,
+    }
+}
+
 fn smooth_is_owned_by_prior_term(owner: &SmoothTermSpec, target: &SmoothTermSpec) -> bool {
     // A factor-`by=` level smooth is row-gated (zero off its level), so its
     // columns lie outside the span of any owner that is not gated to the SAME
@@ -186,6 +218,19 @@ fn smooth_is_owned_by_prior_term(owner: &SmoothTermSpec, target: &SmoothTermSpec
     // by `factor_by_level_gate` in design construction — not from ownership.
     if let Some(target_gate) = factor_by_level_gate_of(target) {
         if factor_by_level_gate_of(owner) != Some(target_gate) {
+            return false;
+        }
+    }
+    // A sum-to-zero factor deviation smooth is orthogonal to any owner that does
+    // not vary with its grouping factor (its columns sum to zero across that
+    // factor). Such an owner cannot span it, so skip ownership — otherwise the
+    // deviation is residualized down to a per-group constant and the curve
+    // shape is lost (#1605).
+    if let Some(group_col) = factor_sum_to_zero_group_col(target) {
+        let owner_features = smooth_term_feature_cols(owner)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        if !owner_features.contains(&group_col) {
             return false;
         }
     }

@@ -6521,10 +6521,13 @@ pub fn build_factor_smooth(
         // Re-wrap the marginal geometry as `FactorSmooth` metadata exactly as
         // the Fs/Re path below does, giving all three factor-smooth flavours a
         // single, freeze-consistent metadata shape that also pins the levels.
-        // The delegated marginal may be a B-spline (`bs="ps"`-style) OR a cubic
-        // regression spline (`NaturalCubicRegression`, mgcv's `bs="sz"` default,
-        // #1074); capture either so the predict-time freeze restores the SAME
-        // marginal class.
+        // Since #1605 the sz marginal is ALWAYS the penalized B-spline the `fs`
+        // sibling uses (a natural cubic regression marginal hard-enforces f''=0
+        // at the boundary and cannot represent curved deviations — a consistency
+        // failure). The `CubicRegression1D` arm below is therefore unreachable on
+        // a freshly-built sz spec; it is retained only as defense / backward
+        // compatibility for a frozen spec that still carries a cr marginal, so
+        // the predict-time freeze restores whatever marginal class it finds.
         let (knots, degree, periodic, marginal_is_cr) = match &built.metadata {
             BasisMetadata::BSpline1D {
                 knots,
