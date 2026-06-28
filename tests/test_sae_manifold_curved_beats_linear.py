@@ -31,6 +31,12 @@ import pytest
 
 gamfit = pytest.importorskip("gamfit")
 
+# #1512 triage: the curved-vs-linear SAE-manifold comparison fit exceeds the
+# standard Python-API CI runner budget (>240s in triage), so it is tagged slow
+# and excluded from the directory-level `-m "not slow"` CI step while still
+# being collected (and run by a bare `pytest tests/` locally).
+pytestmark = pytest.mark.slow
+
 
 def _synthetic_one_harmonic(
     n: int = 400,

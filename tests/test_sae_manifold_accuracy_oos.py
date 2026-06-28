@@ -22,6 +22,12 @@ import pytest
 
 gamfit = pytest.importorskip("gamfit")
 
+# #1512 triage: these SAE-manifold OOS-accuracy fits run well past the standard
+# Python-API CI runner budget (>240s for the file in triage), so they are tagged
+# slow and excluded from the directory-level `-m "not slow"` CI step while still
+# being collected (and run by a bare `pytest tests/` locally).
+pytestmark = pytest.mark.slow
+
 
 def _circle_data(
     n: int, p: int, noise: float, seed: int

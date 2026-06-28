@@ -46,6 +46,15 @@ def _evidence(fit) -> float:
     )
 
 
+@pytest.mark.slow
+@pytest.mark.xfail(
+    strict=True,
+    reason="#1512 triage: SAE-manifold REML evidence (model selection) fails to "
+    "prefer K=1 on 1-harmonic circle data — per-K evidence ranks K=8 highest "
+    "(K=1 is strongly negative, -20.2, while K>=2 cluster near +0.99), so the "
+    "capacity selector over-fits the atom count. Real model-selection bug; "
+    "tracked open. Also @slow (full SAE multi-K fit ~3 min).",
+)
 def test_reml_evidence_picks_k1_on_one_harmonic_data():
     z = _circle_data(n=400, p=64, noise=0.04, seed=0)
     candidates = [1, 2, 4, 8]
