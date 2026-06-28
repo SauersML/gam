@@ -229,3 +229,153 @@ impl LatentRetractionRegistry {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── RetractionKind::ambient_dim ───────────────────────────────────────────
+
+    #[test]
+    fn euclidean_ambient_dim() {
+        assert_eq!(RetractionKind::euclidean(4).ambient_dim(), 4);
+        assert_eq!(RetractionKind::euclidean(0).ambient_dim(), 0);
+    }
+
+    #[test]
+    fn circle_ambient_dim_is_one() {
+        assert_eq!(RetractionKind::Circle.ambient_dim(), 1);
+    }
+
+    #[test]
+    fn sphere_ambient_dim() {
+        assert_eq!(RetractionKind::Sphere { dim: 3 }.ambient_dim(), 3);
+    }
+
+    #[test]
+    fn product_ambient_dim_is_sum() {
+        let product = ProductRetraction {
+            parts: vec![
+                RetractionKind::euclidean(2),
+                RetractionKind::Circle,
+                RetractionKind::Sphere { dim: 3 },
+            ],
+        };
+        assert_eq!(product.ambient_dim(), 6); // 2 + 1 + 3
+    }
+
+    // ── RetractionKind::is_euclidean ──────────────────────────────────────────
+
+    #[test]
+    fn euclidean_is_euclidean() {
+        assert!(RetractionKind::euclidean(5).is_euclidean());
+    }
+
+    #[test]
+    fn circle_is_not_euclidean() {
+        assert!(!RetractionKind::Circle.is_euclidean());
+    }
+
+    #[test]
+    fn sphere_is_not_euclidean() {
+        assert!(!RetractionKind::Sphere { dim: 3 }.is_euclidean());
+    }
+
+    #[test]
+    fn all_euclidean_product_is_euclidean() {
+        let product = ProductRetraction {
+            parts: vec![RetractionKind::euclidean(2), RetractionKind::euclidean(3)],
+        };
+        assert!(RetractionKind::Product(product).is_euclidean());
+    }
+
+    #[test]
+    fn mixed_product_is_not_euclidean() {
+        let product = ProductRetraction {
+            parts: vec![RetractionKind::euclidean(2), RetractionKind::Circle],
+        };
+        assert!(!RetractionKind::Product(product).is_euclidean());
+    }
+
+    // ── RetractionKind::metric_weights ────────────────────────────────────────
+
+    #[test]
+    fn euclidean_metric_weights_are_all_one() {
+        let w = RetractionKind::euclidean(3).metric_weights();
+        assert_eq!(w, vec![1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn circle_metric_weight_is_inv_twopi_sq() {
+        let w = RetractionKind::Circle.metric_weights();
+        let expected = 1.0 / (TWO_PI * TWO_PI);
+        assert_eq!(w.len(), 1);
+        assert!((w[0] - expected).abs() < 1e-15);
+    }
+
+    // ── RetractionKind::axis_periods ─────────────────────────────────────────
+
+    #[test]
+    fn euclidean_axis_periods_all_none() {
+        let p = RetractionKind::euclidean(3).axis_periods();
+        assert_eq!(p, vec![None, None, None]);
+    }
+
+    #[test]
+    fn circle_axis_period_is_two_pi() {
+        let p = RetractionKind::Circle.axis_periods();
+        assert_eq!(p.len(), 1);
+        assert!((p[0].unwrap() - TWO_PI).abs() < 1e-15);
+    }
+
+    #[test]
+    fn sphere_axis_periods_all_none() {
+        let p = RetractionKind::Sphere { dim: 3 }.axis_periods();
+        assert_eq!(p, vec![None, None, None]);
+    }
+
+    // ── LatentRetractionRegistry ──────────────────────────────────────────────
+
+    #[test]
+    fn all_euclidean_registry_reports_is_all_euclidean() {
+        let r = LatentRetractionRegistry::all_euclidean();
+        assert!(r.is_all_euclidean());
+    }
+
+    #[test]
+    fn circle_registry_is_not_all_euclidean() {
+        let r = LatentRetractionRegistry::new(RetractionKind::Circle);
+        assert!(!r.is_all_euclidean());
+    }
+
+    #[test]
+    fn euclidean_registry_collapses_to_all_euclidean() {
+        // Constructing with a Euclidean kind must collapse to all-Euclidean.
+        let r = LatentRetractionRegistry::new(RetractionKind::euclidean(3));
+        assert!(r.is_all_euclidean());
+    }
+
+    #[test]
+    fn registry_validate_dim_ok_when_matching() {
+        let r = LatentRetractionRegistry::new(RetractionKind::Circle);
+        assert!(r.validate_dim(1, "ctx").is_ok());
+    }
+
+    #[test]
+    fn registry_validate_dim_err_when_mismatched() {
+        let r = LatentRetractionRegistry::new(RetractionKind::Circle);
+        let e = r.validate_dim(3, "ctx").unwrap_err();
+        assert!(e.contains("ctx"), "error should mention context: {e}");
+    }
+
+    #[test]
+    fn registry_euclidean_retract_adds_tangent() {
+        let r = LatentRetractionRegistry::all_euclidean();
+        let mut base = ndarray::array![1.0, 2.0, 3.0];
+        let tangent = ndarray::array![0.1, -0.2, 0.5];
+        r.retract(&mut base.view_mut(), tangent.view());
+        assert!((base[0] - 1.1).abs() < 1e-15);
+        assert!((base[1] - 1.8).abs() < 1e-15);
+        assert!((base[2] - 3.5).abs() < 1e-15);
+    }
+}

@@ -309,3 +309,171 @@ fn kronecker_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
 
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    // ── Dense variant ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn dense_dim_and_shape() {
+        let m = array![[1.0, 0.0], [0.0, 2.0]];
+        let p = PenaltyMatrix::Dense(m);
+        assert_eq!(p.dim(), 2);
+        assert_eq!(p.shape(), (2, 2));
+        assert_eq!(p.nrows(), 2);
+        assert_eq!(p.ncols(), 2);
+    }
+
+    #[test]
+    fn dense_to_dense_is_clone() {
+        let m = array![[3.0, 1.0], [1.0, 4.0]];
+        let p = PenaltyMatrix::Dense(m.clone());
+        assert_eq!(p.to_dense(), m);
+    }
+
+    #[test]
+    fn dense_dot_product() {
+        // [[1, 0], [0, 2]] · [3, 5] = [3, 10]
+        let m = array![[1.0, 0.0], [0.0, 2.0]];
+        let p = PenaltyMatrix::Dense(m);
+        let v = ndarray::array![3.0, 5.0];
+        let result = p.dot(&v);
+        assert_eq!(result.as_slice().unwrap(), &[3.0, 10.0]);
+    }
+
+    #[test]
+    fn dense_quadratic_form() {
+        // beta' S beta with S=diag(1,2), beta=[3,2] → 9 + 8 = 17
+        let m = array![[1.0, 0.0], [0.0, 2.0]];
+        let p = PenaltyMatrix::Dense(m);
+        let beta = ndarray::array![3.0, 2.0];
+        assert!((p.quadratic_form(&beta) - 17.0).abs() < 1e-14);
+    }
+
+    #[test]
+    fn dense_add_scaled_to() {
+        let s = array![[1.0, 0.0], [0.0, 1.0]];
+        let p = PenaltyMatrix::Dense(s);
+        let mut acc = ndarray::Array2::<f64>::zeros((2, 2));
+        p.add_scaled_to(3.0, &mut acc);
+        assert_eq!(acc, array![[3.0, 0.0], [0.0, 3.0]]);
+    }
+
+    #[test]
+    fn dense_add_scaled_diag_to() {
+        let s = array![[2.0, 5.0], [5.0, 7.0]];
+        let p = PenaltyMatrix::Dense(s);
+        let mut diag = ndarray::array![0.0, 0.0];
+        p.add_scaled_diag_to(1.0, &mut diag);
+        // diagonal entries are 2.0 and 7.0
+        assert_eq!(diag.as_slice().unwrap(), &[2.0, 7.0]);
+    }
+
+    // ── KroneckerFactored variant ─────────────────────────────────────────────
+
+    #[test]
+    fn kronecker_dim_is_product() {
+        let left = array![[1.0, 0.0], [0.0, 1.0]]; // 2×2
+        let right = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]; // 3×3
+        let p = PenaltyMatrix::KroneckerFactored { left, right };
+        assert_eq!(p.dim(), 6);
+    }
+
+    #[test]
+    fn kronecker_to_dense_identity_x_identity() {
+        // I_2 ⊗ I_2 = I_4
+        let eye2 = ndarray::Array2::<f64>::eye(2);
+        let p = PenaltyMatrix::KroneckerFactored {
+            left: eye2.clone(),
+            right: eye2,
+        };
+        let dense = p.to_dense();
+        assert_eq!(dense, ndarray::Array2::<f64>::eye(4));
+    }
+
+    #[test]
+    fn kronecker_dot_matches_dense_dot() {
+        let left = array![[2.0, 0.0], [0.0, 3.0]];
+        let right = array![[1.0, 1.0], [0.0, 1.0]];
+        let p = PenaltyMatrix::KroneckerFactored {
+            left: left.clone(),
+            right: right.clone(),
+        };
+        // Compare to materialised version
+        let dense = p.to_dense();
+        let v = ndarray::array![1.0, 2.0, 3.0, 4.0];
+        let got = p.dot(&v);
+        let expected = dense.dot(&v);
+        for (a, b) in got.iter().zip(expected.iter()) {
+            assert!((a - b).abs() < 1e-14, "got={a} expected={b}");
+        }
+    }
+
+    // ── Blockwise variant ─────────────────────────────────────────────────────
+
+    #[test]
+    fn blockwise_dim_is_total() {
+        let local = array![[1.0, 0.0], [0.0, 1.0]];
+        let p = PenaltyMatrix::Blockwise {
+            local,
+            col_range: 1..3,
+            total_dim: 5,
+        };
+        assert_eq!(p.dim(), 5);
+    }
+
+    #[test]
+    fn blockwise_to_dense_embeds_local_block() {
+        // 3×3 total with local 2×2 at cols 1..3
+        let local = array![[2.0, 1.0], [1.0, 3.0]];
+        let p = PenaltyMatrix::Blockwise {
+            local,
+            col_range: 1..3,
+            total_dim: 3,
+        };
+        let dense = p.to_dense();
+        assert_eq!(dense[[0, 0]], 0.0);
+        assert_eq!(dense[[1, 1]], 2.0);
+        assert_eq!(dense[[1, 2]], 1.0);
+        assert_eq!(dense[[2, 1]], 1.0);
+        assert_eq!(dense[[2, 2]], 3.0);
+    }
+
+    #[test]
+    fn blockwise_dot_only_touches_block() {
+        let local = array![[2.0, 0.0], [0.0, 3.0]];
+        let p = PenaltyMatrix::Blockwise {
+            local,
+            col_range: 1..3,
+            total_dim: 4,
+        };
+        let v = ndarray::array![7.0, 1.0, 2.0, 9.0];
+        let out = p.dot(&v);
+        // v[1..3] = [1,2]; local * [1,2] = [2,6]; embedded at positions 1..3
+        assert_eq!(out.as_slice().unwrap(), &[0.0, 2.0, 6.0, 0.0]);
+    }
+
+    // ── Labeled / Fixed wrappers ──────────────────────────────────────────────
+
+    #[test]
+    fn labeled_inherits_dim_and_delegates_dot() {
+        let m = array![[1.0, 0.0], [0.0, 2.0]];
+        let p = PenaltyMatrix::Dense(m).with_precision_label("smooth");
+        assert_eq!(p.dim(), 2);
+        assert_eq!(p.precision_label(), Some("smooth"));
+        let v = ndarray::array![3.0, 4.0];
+        let out = p.dot(&v);
+        assert_eq!(out.as_slice().unwrap(), &[3.0, 8.0]);
+    }
+
+    #[test]
+    fn fixed_inherits_dim_and_exposes_log_lambda() {
+        let m = array![[5.0, 0.0], [0.0, 5.0]];
+        let p = PenaltyMatrix::Dense(m).with_fixed_log_lambda(2.5);
+        assert_eq!(p.dim(), 2);
+        assert_eq!(p.fixed_log_lambda(), Some(2.5));
+    }
+}
