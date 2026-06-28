@@ -2992,42 +2992,57 @@ mod tests {
 
     #[test]
     fn infinite_lambda_keeps_range_penalty_block_finite_1379() {
-        // gam#1379 regression: when the outer optimizer drives one penalty's
-        // λ = exp(ρ) to +∞ (a redundant operator direction REML wants pinned),
-        // the range block Σ_k λ_k S_k must NOT come back non-finite. The defect
-        // was `∞ · 0 = NaN` wherever a transformed S_k entry was exactly 0,
-        // poisoning the whole block ("range penalty block contains non-finite
-        // entries, max finite magnitude 0.000e0") and aborting the fit.
+        // gam#1379 / gam#1074: a genuinely infinite λ = exp(ρ) is NOT silently
+        // clamped to a finite ceiling. The original #1379 fix added a 1e300
+        // ceiling so `∞ · 0` could not poison the range block Σ_k λ_k S_k, but
+        // #1074 DELETED that clamp on purpose (see the comment at the top of
+        // `stable_reparameterizationwith_invariant`): masking ∞ hid the real
+        // defect — the outer optimizer driving a redundant/unidentified penalty
+        // direction off to ∞ instead of that direction being detected and
+        // dropped. With the clamp gone, a literal `f64::INFINITY` λ surfaces as
+        // a clean, detectable error (the eigensolver rejects the NaN-poisoned
+        // block) rather than a silent finite success. Pin that contract: ∞ must
+        // ERROR, not be quietly clamped.
         //
         // Fixture: two penalties on a 3-wide block. The first penalizes only
         // coordinate 0 (so its block S_k has structural zeros everywhere except
         // [0,0]); give it λ = +∞. The second penalizes coordinate 1 at a normal
-        // λ. With the finite-ceiling clamp the reparam succeeds and every output
-        // matrix entry is finite; without it the eigensolve aborts.
+        // λ.
         let p = 3usize;
         let rs_list = vec![array![[1.0, 0.0, 0.0]], array![[0.0, 1.0, 0.0]]];
         let canonical = canonical_from_roots(&rs_list, p);
-        let lambdas = vec![f64::INFINITY, 3.0];
         let inv = precompute_reparam_invariant_from_canonical(&canonical, p)
             .expect("precompute invariant");
-        let rep = stable_reparameterizationwith_invariant(&canonical, &lambdas, p, &inv, None)
-            .expect("stable reparam must not abort on an infinite lambda (gam#1379)");
 
+        let lambdas_inf = vec![f64::INFINITY, 3.0];
+        let inf_result =
+            stable_reparameterizationwith_invariant(&canonical, &lambdas_inf, p, &inv, None);
+        assert!(
+            inf_result.is_err(),
+            "an infinite lambda must surface as an error, not be silently clamped (#1074)"
+        );
+
+        // A finite (even very large) λ must still produce an all-finite reparam:
+        // the function is robust to large-but-finite penalties; only the
+        // non-finite input is rejected.
+        let lambdas_big = vec![1e300_f64, 3.0];
+        let rep = stable_reparameterizationwith_invariant(&canonical, &lambdas_big, p, &inv, None)
+            .expect("stable reparam at large-but-finite lambda");
         assert!(
             rep.s_transformed.iter().all(|v| v.is_finite()),
-            "transformed penalty must be finite with an infinite lambda"
+            "transformed penalty must be finite at large-but-finite lambda"
         );
         assert!(
             rep.qs.iter().all(|v| v.is_finite()),
-            "reparam rotation must be finite with an infinite lambda"
+            "reparam rotation must be finite at large-but-finite lambda"
         );
         assert!(
             rep.log_det.is_finite(),
-            "penalty log-det must be finite with an infinite lambda"
+            "penalty log-det must be finite at large-but-finite lambda"
         );
         assert!(
             rep.det1.iter().all(|v| v.is_finite()),
-            "penalty log-det derivatives must be finite with an infinite lambda"
+            "penalty log-det derivatives must be finite at large-but-finite lambda"
         );
     }
 
