@@ -1277,6 +1277,34 @@ pub struct StreamingArrowSchur {
     /// regression: #1273 wired the deflation into the dense path only). `None`
     /// for every non-evidence caller, which keeps the strict non-PD refusal.
     pub(crate) row_gauge_deflation: Option<ArrowRowGaugeDeflation>,
+    /// The exact cross-row IBP source ([`IbpCrossRowSource`], #1038), cloned from
+    /// the assembled [`ArrowSchurSystem`]. The bare streaming paths
+    /// ([`Self::solve`] / [`Self::reduced_schur_and_log_det_tt`]) still REFUSE
+    /// when this is present (they cannot carry the rank-`R` Woodbury), but the
+    /// evidence-only [`Self::reduced_schur_log_det_tt_woodbury`] consumes it to
+    /// accumulate the chunk-additive Woodbury building blocks `M0 = Uᵀ A⁻¹ U`
+    /// and `W = Bᵀ A⁻¹ U` against the NO-SELF base `H₀'` (self term downdated),
+    /// which the caller closes into the exact `log det(I_R + D Uᵀ H₀'⁻¹ U)` via
+    /// [`streaming_cross_row_woodbury_log_det`].
+    pub(crate) ibp_cross_row: Option<IbpCrossRowSource>,
+}
+
+/// One chunk's contribution to the streaming cross-row IBP Woodbury (#1038).
+///
+/// The capacitance `C = I_R + D·M` with `M = Uᵀ H₀'⁻¹ U` is chunk-additive in
+/// its two ingredients (`A = H₀'` is block-diagonal over rows, `U` is supported
+/// per-row): `M = M0 + Wᵀ S⁻¹ W` where `M0 = Σ_i Uᵢᵀ Aᵢ⁻¹ Uᵢ` (`R×R`) and
+/// `W = Σ_i Bᵢᵀ Aᵢ⁻¹ Uᵢ` (`k×R`) accumulate row-by-row, and `S` is the final
+/// GLOBAL reduced Schur. This carries one chunk's `M0`/`W` plus the per-atom
+/// `D`; the caller sums them and closes the capacitance after the chunk loop.
+#[derive(Debug, Clone)]
+pub struct StreamingWoodburyChunk {
+    /// `Σ_{i∈chunk} Uᵢᵀ Aᵢ⁻¹ Uᵢ`, `R×R`.
+    pub m0: Array2<f64>,
+    /// `Σ_{i∈chunk} Bᵢᵀ Aᵢ⁻¹ Uᵢ`, `k×R` (`k` = reduced β border).
+    pub w: Array2<f64>,
+    /// Per-atom `D`-coefficients `d_k = w·s'_k`, length `R`.
+    pub d: Array1<f64>,
 }
 
 impl std::fmt::Debug for StreamingArrowSchur {
@@ -1322,6 +1350,7 @@ impl StreamingArrowSchur {
             tolerate_ill_conditioning: false,
             ibp_cross_row_active: false,
             row_gauge_deflation: None,
+            ibp_cross_row: None,
         }
     }
 
@@ -1374,6 +1403,7 @@ impl StreamingArrowSchur {
         streaming.htbeta_matvec = htbeta_matvec;
         streaming.htbeta_transpose_matvec = sys.htbeta_transpose_matvec.clone();
         streaming.ibp_cross_row_active = sys.ibp_cross_row.is_some();
+        streaming.ibp_cross_row = sys.ibp_cross_row.clone();
         // Carry the SAE evidence-path per-row gauge deflation so the streaming
         // per-row factor matches the dense `factor_blocks_for_system` exactly
         // (#1377): without it, a row with an intrinsic-dimension-flat `H_tt`
@@ -1690,6 +1720,123 @@ impl StreamingArrowSchur {
         symmetrize_upper_from_lower(&mut self.s_acc);
         let schur = std::mem::replace(&mut self.s_acc, Array2::<f64>::zeros((self.k, self.k)));
         Ok((log_det_tt, schur))
+    }
+
+    /// As [`Self::reduced_schur_and_log_det_tt`], but ALSO accumulates the exact
+    /// cross-row IBP Woodbury building blocks (#1038) when this streaming system
+    /// carried an [`IbpCrossRowSource`].
+    ///
+    /// Mirrors the dense `factor_blocks_for_system` + [`CrossRowWoodbury::build`]
+    /// path exactly:
+    ///
+    /// * the per-row logit self term `Σ_k d_k·z'_ik²`
+    ///   ([`IbpCrossRowSource::self_term_downdate`]) is subtracted from each
+    ///   `H_tt^(i)` BEFORE factoring, so the factored base — and therefore the
+    ///   returned `log_det_tt`/Schur — is the NO-SELF `H₀'` (the dense path
+    ///   factors `H₀'` too, then layers the rank-`R` Woodbury);
+    /// * for each row it forms `Aᵢ⁻¹ Uᵢ` (one block solve against the row's
+    ///   `H₀'` factor, `Uᵢ` the J-weighted atom-column indicator) and adds the
+    ///   row's contributions to `M0 = Σ Uᵢᵀ Aᵢ⁻¹ Uᵢ` (`R×R`) and
+    ///   `W = Σ Bᵢᵀ Aᵢ⁻¹ Uᵢ` (`k×R`, `Bᵢ = H_tβ^(i)`).
+    ///
+    /// The caller sums `M0`/`W`/`log_det_tt`/Schur over chunks and closes the
+    /// capacitance `M = M0 + Wᵀ S⁻¹ W`, `log det(I_R + D·M)` against the GLOBAL
+    /// reduced Schur `S` via [`streaming_cross_row_woodbury_log_det`]. This is
+    /// the exact `log det H_full = log det H₀' + log det(I_R + D Uᵀ H₀'⁻¹ U)`
+    /// the dense [`ArrowFactorCache::arrow_log_det`] returns — the streaming and
+    /// dense evidence then optimize the SAME REML objective (#1225).
+    ///
+    /// When no IBP source is present this delegates to
+    /// [`Self::reduced_schur_and_log_det_tt`] and returns `None` woodbury, so
+    /// every non-IBP (softmax / JumpReLU) caller is bit-for-bit unchanged.
+    pub fn reduced_schur_log_det_tt_woodbury(
+        &mut self,
+        ridge_t: f64,
+        ridge_beta: f64,
+        options: &ArrowSolveOptions,
+    ) -> Result<(f64, Array2<f64>, Option<StreamingWoodburyChunk>), ArrowSchurError> {
+        let Some(source) = self.ibp_cross_row.clone() else {
+            // Temporarily clear the refusal flag so the shared bare path runs;
+            // it is `false` whenever the source is absent, so this is a no-op.
+            let (log_det_tt, schur) =
+                self.reduced_schur_and_log_det_tt(ridge_t, ridge_beta, options)?;
+            return Ok((log_det_tt, schur, None));
+        };
+        let r = source.r;
+        let total_len = self.row_offsets[self.n_rows];
+        let down = source.self_term_downdate(total_len);
+        // Group the sparse `U` entries `(global_t_index, atom, z'_ik)` by row as
+        // `(local_slot, atom, z)`. `row_offsets` is strictly ascending, so the
+        // owning row of a global index is located by binary search.
+        let mut row_entries: Vec<Vec<(usize, usize, f64)>> = vec![Vec::new(); self.n_rows];
+        for &(g, atom, z) in &source.entries {
+            let i = match self.row_offsets.binary_search(&g) {
+                Ok(idx) => idx,
+                Err(idx) => idx - 1,
+            };
+            let slot = g - self.row_offsets[i];
+            row_entries[i].push((slot, atom, z));
+        }
+        self.tolerate_ill_conditioning = options.tolerate_ill_conditioning;
+        self.reset_accumulator(ridge_beta)?;
+        let backend = CpuBatchedBlockSolver;
+        let mut log_det_tt = 0.0_f64;
+        let mut m0 = Array2::<f64>::zeros((r, r));
+        let mut w = Array2::<f64>::zeros((self.k, r));
+        for start in (0..self.n_rows).step_by(self.chunk_size) {
+            let end = (start + self.chunk_size).min(self.n_rows);
+            for row_idx in start..end {
+                let mut row = (self.row_builder)(row_idx)?;
+                let di = row.htt.nrows();
+                self.validate_row(row_idx, &row)?;
+                // Downdate the per-row logit self term so the factored base is
+                // `H₀'` (the dense path downdates the SAME `down[base + j]`).
+                let base = self.row_offsets[row_idx];
+                for j in 0..di {
+                    row.htt[[j, j]] -= down[base + j];
+                }
+                let htbeta = self.row_htbeta(row_idx, &row, di);
+                let factor = self.factor_row(&row, ridge_t, di, row_idx)?;
+                for axis in 0..di {
+                    log_det_tt += 2.0 * factor[[axis, axis]].ln();
+                }
+                match options.mode {
+                    ArrowSolverMode::Direct | ArrowSolverMode::InexactPCG => {
+                        let solved = backend.solve_block_matrix(factor.view(), htbeta.view());
+                        backend.block_gemm_subtract(&mut self.s_acc, &htbeta, &solved);
+                    }
+                    ArrowSolverMode::SqrtBA => {
+                        let whitened =
+                            backend.sqrt_solve_block_matrix(factor.view(), htbeta.view());
+                        backend.block_gemm_subtract(&mut self.s_acc, &whitened, &whitened);
+                    }
+                }
+                let entries = &row_entries[row_idx];
+                if !entries.is_empty() {
+                    // `Uᵢ`: `di × R`, column `atom` carries `z'_ik` at its logit
+                    // slot. `Aᵢ⁻¹ Uᵢ` via the row's `H₀'` Cholesky.
+                    let mut u_local = Array2::<f64>::zeros((di, r));
+                    for &(slot, atom, z) in entries {
+                        u_local[[slot, atom]] += z;
+                    }
+                    let ainv_u = backend.solve_block_matrix(factor.view(), u_local.view());
+                    // `M0 += Uᵢᵀ Aᵢ⁻¹ Uᵢ` (`R×R`); `W += Bᵢᵀ Aᵢ⁻¹ Uᵢ` (`k×R`).
+                    m0 += &u_local.t().dot(&ainv_u);
+                    w += &htbeta.t().dot(&ainv_u);
+                }
+            }
+        }
+        symmetrize_upper_from_lower(&mut self.s_acc);
+        let schur = std::mem::replace(&mut self.s_acc, Array2::<f64>::zeros((self.k, self.k)));
+        Ok((
+            log_det_tt,
+            schur,
+            Some(StreamingWoodburyChunk {
+                m0,
+                w,
+                d: source.d.clone(),
+            }),
+        ))
     }
 
     pub fn reduced_schur_log_det(
@@ -2570,6 +2717,69 @@ impl SmallLu {
         } else {
             None
         }
+    }
+}
+
+/// Close the streaming cross-row IBP Woodbury (#1038) into its exact evidence
+/// log-determinant correction.
+///
+/// Given the chunk-summed `M0 = Uᵀ A⁻¹ U` (`R×R`), `W = Bᵀ A⁻¹ U` (`k×R`), the
+/// GLOBAL reduced Schur `schur` (`S`, `k×k`, PD), and the per-atom `D`, this
+/// forms the EXACT projected `M = Uᵀ H₀'⁻¹ U = M0 + Wᵀ S⁻¹ W` (the bordered
+/// inverse `t`-block `(H₀'⁻¹)_tt = A⁻¹ + A⁻¹ B S⁻¹ Bᵀ A⁻¹` contracted by `U`),
+/// then the capacitance `C = I_R + D·M` and returns `log det C`.
+///
+/// This is byte-for-byte the same quantity, and the same sign convention, that
+/// the dense [`CrossRowWoodbury::log_det`] returns (symmetrize `M`, scale rows
+/// by `D`, partial-pivot LU, reject a non-positive determinant). Returns
+/// `Ok(None)` when the capacitance is non-PD / singular — the recoverable
+/// "cross-row IBP joint Hessian is non-PD at this ρ" infeasible-probe refusal,
+/// NOT a silent wrong value.
+pub fn streaming_cross_row_woodbury_log_det(
+    schur: &Array2<f64>,
+    m0: &Array2<f64>,
+    w: &Array2<f64>,
+    d: &Array1<f64>,
+) -> Result<Option<f64>, ArrowSchurError> {
+    let r = d.len();
+    let factor =
+        cholesky_lower(schur).map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
+    // M = M0 + Wᵀ S⁻¹ W. With S⁻¹ symmetric, `(Wᵀ S⁻¹ W)[a, b] = (S⁻¹ w_a)·w_b`.
+    let mut m = m0.clone();
+    for a in 0..r {
+        let w_a = w.column(a).to_owned();
+        let sinv_w_a = cholesky_solve_vector(&factor, &w_a);
+        for b in 0..r {
+            m[[a, b]] += sinv_w_a.dot(&w.column(b));
+        }
+    }
+    // Symmetrize to clear back-substitution rounding asymmetry (matches
+    // `CrossRowWoodbury::build`).
+    for a in 0..r {
+        for b in (a + 1)..r {
+            let avg = 0.5 * (m[[a, b]] + m[[b, a]]);
+            m[[a, b]] = avg;
+            m[[b, a]] = avg;
+        }
+    }
+    // Capacitance C = I_R + D·M (row k scaled by d_k), factored by partial-pivot
+    // LU (`d_k = w·s'_k` is not sign-definite, so C is generally non-symmetric /
+    // indefinite — exactly the dense carrier's factorization).
+    let mut c = Array2::<f64>::zeros((r, r));
+    for a in 0..r {
+        for b in 0..r {
+            c[[a, b]] = d[a] * m[[a, b]];
+        }
+        c[[a, a]] += 1.0;
+    }
+    match small_lu_factor(&c) {
+        Some(lu) => {
+            let (log_abs, sign) = lu.log_abs_det_and_sign();
+            Ok((sign > 0.0).then_some(log_abs))
+        }
+        // Exactly-singular capacitance: `H_full` det is 0, the Laplace log-det is
+        // undefined — surface as the recoverable non-PD probe refusal.
+        None => Ok(None),
     }
 }
 

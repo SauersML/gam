@@ -6938,6 +6938,15 @@ impl SaeManifoldTerm {
         };
         let mut schur_acc = Array2::<f64>::zeros((border_dim, border_dim));
         let mut log_det_tt = 0.0_f64;
+        // #1038 cross-row IBP Woodbury accumulators. `M = Uᵀ H₀'⁻¹ U` is
+        // chunk-additive in `M0 = Σ Uᵢᵀ Aᵢ⁻¹ Uᵢ` and `W = Σ Bᵢᵀ Aᵢ⁻¹ Uᵢ`
+        // (`A = H₀'` block-diagonal, `U` row-supported), closed against the
+        // GLOBAL reduced Schur `S = schur_acc` after the loop. `None` for every
+        // non-IBP (softmax / JumpReLU) term, where the streaming log-det is
+        // exactly the bare `log_det_tt + log_det_schur` as before.
+        let mut wood_m0: Option<Array2<f64>> = None;
+        let mut wood_w: Option<Array2<f64>> = None;
+        let mut wood_d: Option<Array1<f64>> = None;
         let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
         let mut start = 0usize;
         while start < n_total {
@@ -6967,8 +6976,8 @@ impl SaeManifoldTerm {
                 .assemble_arrow_schur_scaled(z_chunk, rho, registry, penalty_scale)
                 .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}"))?;
             let mut streaming = StreamingArrowSchur::from_system(&sys, sys.rows.len().max(1));
-            let (chunk_log_det_tt, chunk_schur) = streaming
-                .reduced_schur_and_log_det_tt(0.0, 0.0, &options)
+            let (chunk_log_det_tt, chunk_schur, chunk_wood) = streaming
+                .reduced_schur_log_det_tt_woodbury(0.0, 0.0, &options)
                 .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}"))?;
             log_det_tt += chunk_log_det_tt;
             for row in 0..border_dim {
@@ -6976,11 +6985,70 @@ impl SaeManifoldTerm {
                     schur_acc[[row, col]] += chunk_schur[[row, col]];
                 }
             }
+            if chunk_wood.is_some() && chunk_size < n_total {
+                // The cross-row IBP empirical mass `M_k = Σ_i z_ik` couples ALL
+                // rows, so the per-row `H₀'` diagonal (`score_derivative_k(M_k)`)
+                // and the column coefficient `d_k = w·s'_k(M_k)` are only exact
+                // when every row is assembled together — a SINGLE chunk. Under a
+                // genuine multi-chunk pass each chunk would see a partial mass and
+                // the Woodbury (and the bare per-row log-det) would be inexact, so
+                // refuse loudly and route to the dense resident path rather than
+                // return a silently-wrong evidence. The streaming log-det only
+                // runs when the dense reduced Schur fits budget, so the single-
+                // chunk regime is the common case; this guards the rest.
+                return Err(
+                    "SaeManifoldTerm::streaming_exact_arrow_log_det: exact cross-row IBP \
+                     Woodbury evidence requires a single-chunk pass (the empirical mass \
+                     M_k = Σ_i z_ik couples all rows); this shape needs >1 chunk. Route \
+                     IBP-active large-n fits through the dense resident \
+                     ArrowFactorCache::arrow_log_det."
+                        .to_string(),
+                );
+            }
+            if let Some(cw) = chunk_wood {
+                wood_m0 = Some(match wood_m0.take() {
+                    Some(mut acc) => {
+                        acc += &cw.m0;
+                        acc
+                    }
+                    None => cw.m0,
+                });
+                wood_w = Some(match wood_w.take() {
+                    Some(mut acc) => {
+                        acc += &cw.w;
+                        acc
+                    }
+                    None => cw.w,
+                });
+                // `D = diag(d_k)` is per-atom; identical across chunks for a
+                // single-chunk evidence pass (the regime the streaming log-det
+                // runs in — the dense reduced Schur must fit budget here), where
+                // it equals the global mass-derived `cross_row_d`.
+                wood_d = Some(cw.d);
+            }
             start = end;
         }
         let log_det_schur = StreamingArrowSchur::reduced_schur_log_det(&schur_acc, &options)
             .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}"))?;
-        Ok(log_det_tt + log_det_schur)
+        let mut total = log_det_tt + log_det_schur;
+        // #1038/#1225: close the exact cross-row IBP Woodbury correction
+        // `log det(I_R + D Uᵀ H₀'⁻¹ U)` so the streaming evidence equals the
+        // dense `arrow_log_det_from_cache` (which adds the SAME term). Without
+        // it the streaming criterion would silently drop the entire cross-row
+        // coupling and disagree with the dense path by exactly `log|C|`.
+        if let (Some(m0), Some(w), Some(d)) = (wood_m0, wood_w, wood_d) {
+            let correction = streaming_cross_row_woodbury_log_det(&schur_acc, &m0, &w, &d)
+                .map_err(|err| {
+                    format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}")
+                })?
+                .ok_or_else(|| {
+                    "SaeManifoldTerm::reml_criterion: cross-row IBP joint Hessian is non-PD at \
+                     this ρ; evidence Laplace log-det undefined (infeasible ρ probe)"
+                        .to_string()
+                })?;
+            total += correction;
+        }
+        Ok(total)
     }
 
     /// Per-atom, per-axis coordinate sum-of-squares `‖t_kj‖² = Σ_i t_{i,k,j}²`.

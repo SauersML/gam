@@ -2797,6 +2797,123 @@ pub(crate) fn streaming_exact_reml_matches_full_batch_reml_small_sae() {
     assert_abs_diff_eq!(stream_loss.total(), full_loss.total(), epsilon = 1.0e-8);
 }
 
+/// As [`small_two_atom_periodic_term`], but in **IBP-MAP** assignment mode so
+/// the exact joint Hessian carries the #1038 cross-row rank-`R` Woodbury block
+/// `H_full = H₀' + U D Uᵀ` (the empirical-mass coupling between distinct latent
+/// rows through a shared atom column). The dense evidence log-det therefore
+/// includes the capacitance term `log|C| = log det(I_R + D Uᵀ H₀'⁻¹ U)` — the
+/// quantity the streaming path must reproduce.
+pub(crate) fn small_two_atom_ibp_term() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
+    let coords0 = array![[0.05], [0.20], [0.55], [0.80], [0.35]];
+    let coords1 = array![[0.15], [0.30], [0.65], [0.90], [0.45]];
+    let (phi0, jet0) = periodic_basis(&coords0);
+    let (phi1, jet1) = periodic_basis(&coords1);
+    let atom0 = SaeManifoldAtom::new(
+        "periodic0",
+        SaeAtomBasisKind::Periodic,
+        1,
+        phi0,
+        jet0,
+        array![[0.25], [-0.35], [0.15]],
+        Array2::<f64>::eye(3),
+    )
+    .unwrap()
+    .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+    let atom1 = SaeManifoldAtom::new(
+        "periodic1",
+        SaeAtomBasisKind::Periodic,
+        1,
+        phi1,
+        jet1,
+        array![[-0.10], [0.20], [0.30]],
+        Array2::<f64>::eye(3),
+    )
+    .unwrap()
+    .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+    let logits = array![
+        [0.7, -0.2],
+        [0.1, 0.4],
+        [-0.3, 0.5],
+        [0.6, -0.1],
+        [0.2, 0.3]
+    ];
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        logits,
+        vec![coords0, coords1],
+        vec![
+            LatentManifold::Circle { period: 1.0 },
+            LatentManifold::Circle { period: 1.0 },
+        ],
+        AssignmentMode::ibp_map(0.8, 1.0, false),
+    )
+    .unwrap();
+    let term = SaeManifoldTerm::new(vec![atom0, atom1], assignment).unwrap();
+    let target = array![[0.12], [-0.03], [0.08], [0.20], [-0.11]];
+    let rho = SaeManifoldRho::new(
+        (-0.3_f64).exp().ln(),
+        0.7_f64.ln(),
+        vec![array![0.9_f64.ln()], array![1.1_f64.ln()]],
+    );
+    (term, target, rho)
+}
+
+/// #1038/#1225 — the streaming evidence log-det MUST equal the dense full-batch
+/// evidence log-det for an **IBP-MAP** term, i.e. it MUST carry the exact
+/// cross-row Woodbury capacitance correction `log|C|`.
+///
+/// Pre-fix the streaming path could not represent the rank-`R` cross-row block:
+/// `reduced_schur_and_log_det_tt` refused IBP-active systems outright, so
+/// `reml_criterion_streaming_exact` *errored* on this fixture — and if that
+/// refusal had instead silently returned `log_det_tt + log_det_schur`, the
+/// streaming criterion would have under-counted the dense criterion by exactly
+/// `½·log|C|` (the dropped capacitance term), violating the #1225 invariant
+/// that streaming and dense optimize the SAME REML objective.
+///
+/// This pins both halves of the fix:
+///   (1) the dense cache genuinely carries a non-trivial cross-row correction
+///       on this fixture (`|log|C|| > 0`), so the equality below is load-bearing
+///       rather than a vacuous `log|C| = 0` match (which any softmax term gives);
+///   (2) the streaming exact log-det now reproduces the dense criterion to
+///       inner-solve tolerance.
+#[test]
+pub(crate) fn streaming_exact_reml_matches_full_batch_reml_ibp_woodbury() {
+    let (term0, target, rho) = small_two_atom_ibp_term();
+    let mut full = term0;
+    let (_full_cost, _full_loss, cache) = full
+        .reml_criterion_with_cache(target.view(), &rho, None, 2, 0.25, 1.0e-4, 1.0e-4)
+        .expect("dense IBP criterion must evaluate");
+
+    // (1) The dense joint Hessian carries a genuine cross-row Woodbury block on
+    // this fixture: its capacitance correction is present, finite, and nonzero.
+    // This is the `log|C|` the streaming path would drop without the fix.
+    assert!(
+        cache.cross_row_woodbury.is_some(),
+        "IBP fixture must build a cross-row Woodbury carrier (else the test is vacuous)"
+    );
+    let log_c = cache.cross_row_woodbury_log_det();
+    assert!(
+        log_c.is_finite() && log_c.abs() > 1.0e-6,
+        "IBP fixture must have a load-bearing nonzero cross-row log|C|; got {log_c}"
+    );
+
+    // (2) The streaming exact LOG-DET must reproduce the dense `log|H|` at the SAME
+    // converged state — `full` is already at its converged (t,β) after the dense
+    // criterion. We compare the log-det DIRECTLY rather than re-fitting through
+    // `reml_criterion_streaming_exact`: a streaming RE-FIT runs a fresh inner solve
+    // whose faer parallel reduction is non-deterministic under thread contention
+    // and intermittently surfaces the (recoverable) non-PD refusal — orthogonal to
+    // this Woodbury-correctness test. `streaming_exact_arrow_log_det` re-assembles
+    // `log|H_full|` chunk-by-chunk at the frozen state with NO inner solve, so the
+    // only delta vs the dense `arrow_log_det_from_cache` is FP reassociation
+    // (~1e-13). Pre-fix the streaming path DROPPED `log|C|` (or hard-refused on the
+    // cross-row source), so this differed by `log|C|` (≈ {log_c}) or errored.
+    let dense_logdet = arrow_log_det_from_cache(&cache).expect("dense log-det finite");
+    let stream_logdet = full
+        .streaming_exact_arrow_log_det(target.view(), &rho, None)
+        .expect("streaming log-det must evaluate (cross-row Woodbury now carried)");
+    assert_abs_diff_eq!(stream_logdet, dense_logdet, epsilon = 1.0e-8);
+}
+
 /// #1029 measure-consistency gate: the value-probe refine policy must
 /// rank the SAME criterion as the full accepted-point policy. The probe
 /// budget only caps refinement work — it never loosens the KKT/step
