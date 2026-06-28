@@ -187,8 +187,16 @@ fn is_test_only_source_file(path: &Path) -> bool {
     if file_name.is_some_and(|name| name.starts_with("._")) {
         return true;
     }
+    // Split-out unit-test submodules follow the repo's `tests_<topic>.rs` naming
+    // convention and are always declared `#[cfg(test)] mod tests_<topic>;` in
+    // their parent (e.g. crates/gam-sae/src/manifold/tests_row_jet_and_outer_objective_780.rs,
+    // crates/gam-solve/src/estimate/tests_diagnostics.rs). They live alongside the
+    // production source under `src/` rather than under a `tests/` directory, so the
+    // path-component check below never sees them. Recognize the `tests_` prefix the
+    // same way the `tests.rs` exact name and the `_tests.rs` suffix already are —
+    // FD comparison against the analytic gradient is sanctioned inside tests.
     if matches!(file_name, Some("tests.rs" | "test_support.rs"))
-        || file_name.is_some_and(|name| name.ends_with("_tests.rs"))
+        || file_name.is_some_and(|name| name.ends_with("_tests.rs") || name.starts_with("tests_"))
     {
         return true;
     }
