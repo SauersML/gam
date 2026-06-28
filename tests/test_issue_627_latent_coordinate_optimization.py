@@ -49,9 +49,14 @@ def _shuffled_parabola(seed, n=N):
 
 
 def _centers_and_penalty():
-    centers = np.linspace(0.0, 1.0, M)
+    # #1512: gamfit.duchon_function_norm_penalty now requires 2D centers with
+    # shape (K, d) and raises "centers must be 2D ... got 1D" on the bare
+    # np.linspace 1D vector this orphaned test used to pass. Build the (K, 1)
+    # column up front and feed the same 2D array to both the penalty and the
+    # latent fit below.
+    centers = np.linspace(0.0, 1.0, M).reshape(-1, 1)
     penalty = np.asarray(gamfit.duchon_function_norm_penalty(centers, m=2))
-    return centers.reshape(-1, 1), penalty
+    return centers, penalty
 
 
 def _r2(y, fitted):

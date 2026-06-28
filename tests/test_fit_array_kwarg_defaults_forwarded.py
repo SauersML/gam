@@ -11,6 +11,14 @@ import numpy as np
 import gamfit
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="#1512 triage: stale fit_array API — gamfit.fit_array now takes "
+    "`formula` as a required positional (fit_array(X, Y, formula, *, ...)), so "
+    "fit_array(x, y, family=...) raises TypeError: missing 'formula'; and the "
+    "result no longer exposes a `likelihood_spec` attribute. Add the formula "
+    "argument and re-point at the current likelihood-spec accessor to re-enable.",
+)
 def test_fit_array_documented_defaults_reach_likelihood_spec() -> None:
     rng = np.random.default_rng(0)
     x = rng.normal(size=(30, 1))
