@@ -592,3 +592,155 @@ fn format_bytes(value: Option<u64>) -> String {
         format!("{bytes}B")
     }
 }
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+    use std::time::Duration;
+
+    // ── format_duration ───────────────────────────────────────────────────────
+
+    #[test]
+    fn format_duration_seconds_only() {
+        assert_eq!(format_duration(Duration::from_secs(45)), "45s");
+    }
+
+    #[test]
+    fn format_duration_minutes_and_seconds() {
+        assert_eq!(format_duration(Duration::from_secs(90)), "1m30s");
+    }
+
+    #[test]
+    fn format_duration_minutes_zero_seconds() {
+        assert_eq!(format_duration(Duration::from_secs(120)), "2m00s");
+    }
+
+    #[test]
+    fn format_duration_hours_minutes_seconds() {
+        assert_eq!(format_duration(Duration::from_secs(3661)), "1h01m01s");
+    }
+
+    #[test]
+    fn format_duration_exactly_one_hour() {
+        assert_eq!(format_duration(Duration::from_secs(3600)), "1h00m00s");
+    }
+
+    #[test]
+    fn format_duration_zero() {
+        assert_eq!(format_duration(Duration::from_secs(0)), "0s");
+    }
+
+    // ── format_count ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn format_count_some_value() {
+        assert_eq!(format_count(Some(42)), "42");
+    }
+
+    #[test]
+    fn format_count_zero() {
+        assert_eq!(format_count(Some(0)), "0");
+    }
+
+    #[test]
+    fn format_count_none_is_unknown() {
+        assert_eq!(format_count(None), "<unknown>");
+    }
+
+    // ── format_bytes ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn format_bytes_none_is_unknown() {
+        assert_eq!(format_bytes(None), "<unknown>");
+    }
+
+    #[test]
+    fn format_bytes_small_bytes() {
+        assert_eq!(format_bytes(Some(512)), "512B");
+    }
+
+    #[test]
+    fn format_bytes_exactly_1_kib() {
+        assert_eq!(format_bytes(Some(1024)), "1.0KiB");
+    }
+
+    #[test]
+    fn format_bytes_kib_range() {
+        assert_eq!(format_bytes(Some(2048)), "2.0KiB");
+    }
+
+    #[test]
+    fn format_bytes_exactly_1_mib() {
+        assert_eq!(format_bytes(Some(1024 * 1024)), "1.0MiB");
+    }
+
+    #[test]
+    fn format_bytes_exactly_1_gib() {
+        assert_eq!(format_bytes(Some(1024 * 1024 * 1024)), "1.0GiB");
+    }
+
+    #[test]
+    fn format_bytes_gib_range() {
+        assert_eq!(format_bytes(Some(2 * 1024 * 1024 * 1024)), "2.0GiB");
+    }
+
+    // ── format_kb ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn format_kb_none_is_unknown() {
+        assert_eq!(format_kb(None), "<unknown>");
+    }
+
+    #[test]
+    fn format_kb_converts_to_bytes_and_formats() {
+        // 1024 kB = 1 MiB
+        assert_eq!(format_kb(Some(1024)), "1.0MiB");
+    }
+
+    #[test]
+    fn format_kb_small_value() {
+        // 1 kB = 1024 bytes → "1.0KiB"
+        assert_eq!(format_kb(Some(1)), "1.0KiB");
+    }
+
+    // ── parse_status_kb / parse_status_count / parse_io_bytes (Linux) ─────────
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_status_kb_valid_line() {
+        assert_eq!(parse_status_kb("VmRSS:\t1234 kB", "VmRSS:"), Some(1234));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_status_kb_wrong_key_returns_none() {
+        assert_eq!(parse_status_kb("VmRSS:\t1234 kB", "VmPeak:"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_status_count_valid_line() {
+        assert_eq!(
+            parse_status_count("voluntary_ctxt_switches:\t42", "voluntary_ctxt_switches:"),
+            Some(42)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_io_bytes_valid_line() {
+        assert_eq!(
+            parse_io_bytes("read_bytes: 65536", "read_bytes:"),
+            Some(65536)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_io_bytes_wrong_key_returns_none() {
+        assert_eq!(
+            parse_io_bytes("read_bytes: 65536", "write_bytes:"),
+            None
+        );
+    }
+}
