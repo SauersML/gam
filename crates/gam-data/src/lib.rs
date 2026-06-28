@@ -2562,4 +2562,151 @@ mod tests {
         assert_eq!(map["beta"], 1);
         assert_eq!(map.len(), 2);
     }
+
+    // ── shared_prefix ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn shared_prefix_identical_strings() {
+        assert_eq!(shared_prefix("hello", "hello"), 5);
+    }
+
+    #[test]
+    fn shared_prefix_no_common_prefix() {
+        assert_eq!(shared_prefix("abc", "xyz"), 0);
+    }
+
+    #[test]
+    fn shared_prefix_partial_match() {
+        assert_eq!(shared_prefix("foobar", "foobaz"), 5);
+    }
+
+    #[test]
+    fn shared_prefix_one_empty() {
+        assert_eq!(shared_prefix("", "hello"), 0);
+        assert_eq!(shared_prefix("hello", ""), 0);
+    }
+
+    #[test]
+    fn shared_prefix_both_empty() {
+        assert_eq!(shared_prefix("", ""), 0);
+    }
+
+    #[test]
+    fn shared_prefix_shorter_string_is_prefix() {
+        assert_eq!(shared_prefix("foo", "foobar"), 3);
+    }
+
+    // ── detect_format ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn detect_format_csv() {
+        let path = std::path::Path::new("data.csv");
+        assert_eq!(detect_format(path).unwrap(), DataFormat::Csv);
+    }
+
+    #[test]
+    fn detect_format_tsv() {
+        assert_eq!(
+            detect_format(std::path::Path::new("data.tsv")).unwrap(),
+            DataFormat::Tsv
+        );
+        assert_eq!(
+            detect_format(std::path::Path::new("data.txt")).unwrap(),
+            DataFormat::Tsv
+        );
+        assert_eq!(
+            detect_format(std::path::Path::new("data.tab")).unwrap(),
+            DataFormat::Tsv
+        );
+    }
+
+    #[test]
+    fn detect_format_parquet() {
+        assert_eq!(
+            detect_format(std::path::Path::new("data.parquet")).unwrap(),
+            DataFormat::Parquet
+        );
+        assert_eq!(
+            detect_format(std::path::Path::new("data.pq")).unwrap(),
+            DataFormat::Parquet
+        );
+        assert_eq!(
+            detect_format(std::path::Path::new("data.pqt")).unwrap(),
+            DataFormat::Parquet
+        );
+    }
+
+    #[test]
+    fn detect_format_uppercase_extension() {
+        assert_eq!(
+            detect_format(std::path::Path::new("data.CSV")).unwrap(),
+            DataFormat::Csv
+        );
+    }
+
+    #[test]
+    fn detect_format_unknown_extension_is_error() {
+        let err = detect_format(std::path::Path::new("data.json")).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("json") || msg.contains("unsupported"),
+            "error should mention extension, got: {msg}"
+        );
+    }
+
+    // ── strip_categorical_sentinel ────────────────────────────────────────────
+
+    #[test]
+    fn strip_categorical_sentinel_marked_cell() {
+        // Sentinel is a single NUL character prefix
+        let marked = "\u{0}hello";
+        let (text, found) = strip_categorical_sentinel(marked);
+        assert!(found);
+        assert_eq!(text, "hello");
+    }
+
+    #[test]
+    fn strip_categorical_sentinel_unmarked_cell() {
+        let (text, found) = strip_categorical_sentinel("plain");
+        assert!(!found);
+        assert_eq!(text, "plain");
+    }
+
+    #[test]
+    fn strip_categorical_sentinel_empty_string() {
+        let (text, found) = strip_categorical_sentinel("");
+        assert!(!found);
+        assert_eq!(text, "");
+    }
+
+    #[test]
+    fn strip_categorical_sentinel_only_sentinel() {
+        let s = "\u{0}";
+        let (text, found) = strip_categorical_sentinel(s);
+        assert!(found);
+        assert_eq!(text, "");
+    }
+
+    // ── projected_headers ─────────────────────────────────────────────────────
+
+    #[test]
+    fn projected_headers_selects_by_index() {
+        let all = vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()];
+        let selected = projected_headers(&all, &[1, 3]);
+        assert_eq!(selected, vec!["b".to_string(), "d".to_string()]);
+    }
+
+    #[test]
+    fn projected_headers_empty_selection() {
+        let all = vec!["x".to_string(), "y".to_string()];
+        let selected = projected_headers(&all, &[]);
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn projected_headers_all_indices() {
+        let all = vec!["p".to_string(), "q".to_string()];
+        let selected = projected_headers(&all, &[0, 1]);
+        assert_eq!(selected, all);
+    }
 }
