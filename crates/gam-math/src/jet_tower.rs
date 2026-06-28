@@ -2019,6 +2019,33 @@ pub trait RowJet<const K: usize>: Copy {
     /// an out-of-domain row in a 4-group and bail that group to the scalar tail.
     fn guard(&self, pred: impl Fn(f64) -> bool) -> GuardVerdict;
 
+    /// Per-lane scale: multiply every channel by the per-lane factor `s`
+    /// ([`Self::Value`]). On a scalar jet `Self::Value = f64`, so this is exactly
+    /// [`scale`](Self::scale) and the scalar call sites stay BIT-IDENTICAL when
+    /// `.scale(x)` is rewritten to `.scale_rows(x)`; on an `f64x4` lane tower
+    /// `Self::Value = [f64; 4]` and lane `i` is multiplied by `s[i]`. This is the
+    /// primitive that lets a batched body carry CONTINUOUS per-row data — the
+    /// survival `covariance_ones` / `z_sum` / observation-weight `wi` factors that
+    /// enter the jet algebra as `.scale(per_row_value)` and that the single-`f64`
+    /// [`scale`](Self::scale) would broadcast wrongly across the four rows. Build
+    /// `s` from the lane→row map with [`pack_rows`](Self::pack_rows).
+    fn scale_rows(&self, s: Self::Value) -> Self;
+
+    /// Gather a per-lane auxiliary datum from the lane→row map `rows`: `value_of(r)`
+    /// is evaluated for each active lane's row and packed into [`Self::Value`] (a
+    /// single `f64` on a scalar jet, `[f64; 4]` on an `f64x4` lane tower). This is
+    /// how a body written once over [`RowJet`] feeds per-row CONTINUOUS data (the
+    /// arguments to [`scale_rows`](Self::scale_rows)) into the batch path without
+    /// knowing the concrete representation: the program holds the per-row data and
+    /// the caller threads `rows` (length 1 scalar, length 4 batch) into
+    /// [`RowNllProgramRowJet::row_nll`], so the body writes
+    /// `x.scale_rows(R::pack_rows(rows, |r| self.cov(r)))`. A multiplicative weight
+    /// buried in a `compose_unary_with` stack is pulled out the same way:
+    /// `x.compose_unary_with(|u| stack(u, 1.0)).scale_rows(R::pack_rows(rows, |r| self.wi(r)))`.
+    /// (Binary per-row branches such as the event indicator `di` are kept
+    /// lane-uniform by grouping and the [`guard`](Self::guard) bail, not packed.)
+    fn pack_rows(rows: &[usize], value_of: impl Fn(usize) -> f64) -> Self::Value;
+
     // ── value-derived transcendental conveniences ───────────────────────
     // Each routes through `compose_unary_with` with the SAME derivative stack the
     // corresponding `JetScalar` method uses, so on a scalar jet (blanket) the
@@ -2125,6 +2152,16 @@ impl<const K: usize, S: crate::jet_scalar::JetScalar<K>> RowJet<K> for S {
     fn guard(&self, pred: impl Fn(f64) -> bool) -> GuardVerdict {
         GuardVerdict::scalar(pred(crate::jet_scalar::JetScalar::value(self)))
     }
+    #[inline]
+    fn scale_rows(&self, s: f64) -> Self {
+        // `Value == f64`, so per-lane scale is exactly `scale` — the rewrite
+        // `.scale(x)` → `.scale_rows(x)` is bit-identical on the scalar path.
+        crate::jet_scalar::JetScalar::scale(self, s)
+    }
+    #[inline]
+    fn pack_rows(rows: &[usize], value_of: impl Fn(usize) -> f64) -> f64 {
+        value_of(rows[0])
+    }
 }
 
 /// The `f64x4` lane [`Tower4Lane`] is a [`RowJet<K>`] with `Value = [f64; 4]`,
@@ -2176,6 +2213,31 @@ impl<const K: usize> RowJet<K> for Tower4Lane<wide::f64x4, K> {
         }
         GuardVerdict::lanes4(mask)
     }
+    #[inline]
+    fn scale_rows(&self, s: [f64; 4]) -> Self {
+        // True per-lane scale: lane `i` of every channel is multiplied by `s[i]`,
+        // so lane `i` matches the scalar `Tower4::scale(s[i])` on row `i`.
+        let sl = wide::f64x4::new(s);
+        let mut out = *self;
+        out.v = self.v * sl;
+        for i in 0..K {
+            out.g[i] = self.g[i] * sl;
+            for j in 0..K {
+                out.h[i][j] = self.h[i][j] * sl;
+                for k in 0..K {
+                    out.t3[i][j][k] = self.t3[i][j][k] * sl;
+                    for l in 0..K {
+                        out.t4[i][j][k][l] = self.t4[i][j][k][l] * sl;
+                    }
+                }
+            }
+        }
+        out
+    }
+    #[inline]
+    fn pack_rows(rows: &[usize], value_of: impl Fn(usize) -> f64) -> [f64; 4] {
+        [value_of(rows[0]), value_of(rows[1]), value_of(rows[2]), value_of(rows[3])]
+    }
 }
 
 /// The `f64x4` lane [`Tower3Lane`] is a [`RowJet<K>`] with `Value = [f64; 4]`,
@@ -2226,6 +2288,26 @@ impl<const K: usize> RowJet<K> for Tower3Lane<wide::f64x4, K> {
             }
         }
         GuardVerdict::lanes4(mask)
+    }
+    #[inline]
+    fn scale_rows(&self, s: [f64; 4]) -> Self {
+        let sl = wide::f64x4::new(s);
+        let mut out = *self;
+        out.v = self.v * sl;
+        for i in 0..K {
+            out.g[i] = self.g[i] * sl;
+            for j in 0..K {
+                out.h[i][j] = self.h[i][j] * sl;
+                for k in 0..K {
+                    out.t3[i][j][k] = self.t3[i][j][k] * sl;
+                }
+            }
+        }
+        out
+    }
+    #[inline]
+    fn pack_rows(rows: &[usize], value_of: impl Fn(usize) -> f64) -> [f64; 4] {
+        [value_of(rows[0]), value_of(rows[1]), value_of(rows[2]), value_of(rows[3])]
     }
 }
 
@@ -4552,24 +4634,39 @@ mod rowjet_bridge_tests {
     /// the SAME source instantiates at the scalar jets and the `f64x4` lane towers.
     struct ToyProgram {
         primaries: Vec<[f64; 2]>,
+        /// Per-row CONTINUOUS auxiliary data `[cov, z, wi]` — the survival
+        /// `covariance_ones` / `z_sum` / observation-weight analogues that enter
+        /// the jet algebra as `.scale_rows(per_row_value)`, distinct per lane.
+        aux: Vec<[f64; 3]>,
     }
 
     impl ToyProgram {
-        fn body<R: RowJet<2>>(p: &[R; 2]) -> R {
-            let a = p[0].mul(&p[1]);
+        /// The body uses `pack_rows` to gather the per-lane continuous data from
+        /// the lane→row map and `scale_rows` to fold it in — so a 4-row batch
+        /// carries four DISTINCT cov/z/wi, which the single-`f64` `scale` could not.
+        fn body<R: RowJet<2>>(&self, rows: &[usize], p: &[R; 2]) -> R {
+            let cov = R::pack_rows(rows, |r| self.aux[r][0]);
+            let z = R::pack_rows(rows, |r| self.aux[r][1]);
+            let wi = R::pack_rows(rows, |r| self.aux[r][2]);
+
+            let a = p[0].mul(&p[1]).scale_rows(cov);
             let b = a.add(&R::constant(0.5)).sub(&p[0].scale(0.25));
-            let c = b.compose_unary_with(|u| {
-                let e = u.exp();
-                [e, e, e, e, e]
-            });
+            let c = b
+                .compose_unary_with(|u| {
+                    let e = u.exp();
+                    [e, e, e, e, e]
+                })
+                .scale_rows(z);
             let d = c.neg().add(&p[0]);
-            let e = d.compose_unary_with(|u| {
-                let s = (1.0 + u * u).sqrt();
-                let s3 = s * s * s;
-                let s5 = s3 * s * s;
-                let s7 = s5 * s * s;
-                [s, u / s, 1.0 / s3, -3.0 * u / s5, (12.0 * u * u - 3.0) / s7]
-            });
+            let e = d
+                .compose_unary_with(|u| {
+                    let s = (1.0 + u * u).sqrt();
+                    let s3 = s * s * s;
+                    let s5 = s3 * s * s;
+                    let s7 = s5 * s * s;
+                    [s, u / s, 1.0 / s3, -3.0 * u / s5, (12.0 * u * u - 3.0) / s7]
+                })
+                .scale_rows(wi);
             e.mul(&p[1]).add(&e)
         }
     }
@@ -4583,7 +4680,7 @@ mod rowjet_bridge_tests {
         }
         fn row_nll<R: RowJet<2>>(&self, rows: &[usize], p: &[R; 2]) -> Result<R, String> {
             assert!(rows.len() == 1 || rows.len() == 4, "lane→row map is 1 or 4 wide");
-            Ok(Self::body(p))
+            Ok(self.body(rows, p))
         }
     }
 
@@ -4659,7 +4756,9 @@ mod rowjet_bridge_tests {
         let mut batches = 0usize;
         for _ in 0..2500 {
             let bases: [[f64; 2]; 4] = std::array::from_fn(|_| std::array::from_fn(|_| rng.val()));
-            let prog = ToyProgram { primaries: bases.to_vec() };
+            // per-lane-DISTINCT continuous aux (cov/z/wi), signed-zero injected.
+            let aux: [[f64; 3]; 4] = std::array::from_fn(|_| std::array::from_fn(|_| rng.val()));
+            let prog = ToyProgram { primaries: bases.to_vec(), aux: aux.to_vec() };
             let rows = [0usize, 1, 2, 3];
 
             // order-4 batch vs scalar Tower4 (instantiated through the same body).
@@ -4693,9 +4792,13 @@ mod rowjet_bridge_tests {
         let mut rng = Lcg(0x0BAD_F00D_1357_2468);
         for _ in 0..3000 {
             let base: [f64; 2] = std::array::from_fn(|_| rng.val());
-            let prog = ToyProgram { primaries: vec![base] };
+            let aux0: [f64; 3] = std::array::from_fn(|_| rng.val());
+            let prog = ToyProgram { primaries: vec![base], aux: vec![aux0] };
 
-            // (a) RowJet-driven body == JetScalar-driven body, bit-for-bit.
+            // (a) RowJet-driven body == JetScalar-driven body, bit-for-bit. The
+            // reference body uses `scale(f64)` where the RowJet body uses
+            // `scale_rows(f64)` — proving the scalar `scale_rows` rewrite does not
+            // churn the path (`scale_rows(s) == scale(s)` on `Value = f64`).
             let via_rowjet: Tower4<2> = {
                 let vars: [Tower4<2>; 2] =
                     std::array::from_fn(|a| <Tower4<2> as RowJet<2>>::variable(base[a], a));
@@ -4705,21 +4808,26 @@ mod rowjet_bridge_tests {
                 let vars: [Tower4<2>; 2] = std::array::from_fn(|a| {
                     <Tower4<2> as JetScalar<2>>::variable(base[a], a)
                 });
-                // The body using JetScalar's own compose_unary_with directly.
-                let a = vars[0].mul(&vars[1]);
+                let (cov, z, wi) = (aux0[0], aux0[1], aux0[2]);
+                // The body using JetScalar's own ops + scale(f64) directly.
+                let a = vars[0].mul(&vars[1]).scale(cov);
                 let b = a.add(&Tower4::constant(0.5)).sub(&vars[0].scale(0.25));
-                let c = b.compose_unary_with(|u| {
-                    let e = u.exp();
-                    [e, e, e, e, e]
-                });
+                let c = b
+                    .compose_unary_with(|u| {
+                        let e = u.exp();
+                        [e, e, e, e, e]
+                    })
+                    .scale(z);
                 let d = c.neg().add(&vars[0]);
-                let e = d.compose_unary_with(|u| {
-                    let s = (1.0 + u * u).sqrt();
-                    let s3 = s * s * s;
-                    let s5 = s3 * s * s;
-                    let s7 = s5 * s * s;
-                    [s, u / s, 1.0 / s3, -3.0 * u / s5, (12.0 * u * u - 3.0) / s7]
-                });
+                let e = d
+                    .compose_unary_with(|u| {
+                        let s = (1.0 + u * u).sqrt();
+                        let s3 = s * s * s;
+                        let s5 = s3 * s * s;
+                        let s7 = s5 * s * s;
+                        [s, u / s, 1.0 / s3, -3.0 * u / s5, (12.0 * u * u - 3.0) / s7]
+                    })
+                    .scale(wi);
                 e.mul(&vars[1]).add(&e)
             };
             assert_t4_bits_eq(&via_rowjet, &via_jetscalar, "blanket_vs_direct");
@@ -4741,7 +4849,62 @@ mod rowjet_bridge_tests {
             // (c) the Order2 scalar IS a RowJet via the blanket.
             let o2: [Order2<2>; 2] =
                 std::array::from_fn(|a| <Order2<2> as RowJet<2>>::variable(base[a], a));
-            let _ = ToyProgram::body(&o2);
+            let _ = prog.body(&[0], &o2);
+        }
+    }
+
+    /// On the scalar path (`Value = f64`) `scale_rows(s)` is `to_bits`-identical
+    /// to `scale(s)` for EVERY channel — so rewriting a survival `.scale(per_row)`
+    /// to `.scale_rows(per_row)` cannot perturb the existing scalar fits.
+    #[test]
+    fn scale_rows_scalar_is_bit_identical_to_scale() {
+        let mut rng = Lcg(0xFEED_FACE_0042_1001);
+        for _ in 0..3000 {
+            let base: [f64; 2] = std::array::from_fn(|_| rng.val());
+            let s = rng.val();
+            // Build a dense tower with populated channels (exp of a product).
+            let vars: [Tower4<2>; 2] =
+                std::array::from_fn(|a| <Tower4<2> as RowJet<2>>::variable(base[a], a));
+            let jet = vars[0].mul(&vars[1]).compose_unary_with(|u| {
+                let e = u.exp();
+                [e, e, e, e, e]
+            });
+            let via_scale = RowJet::scale(&jet, s);
+            let via_scale_rows = RowJet::scale_rows(&jet, s);
+            assert_t4_bits_eq(&via_scale_rows, &via_scale, "scale_rows==scale");
+        }
+    }
+
+    /// `scale_rows` on a batch multiplies lane `i` by `s[i]`, so lane `i` of a
+    /// per-lane-scaled batch matches the scalar `scale(s[i])` on row `i` — the
+    /// continuous per-row data path the single-`f64` `scale` could not carry.
+    #[test]
+    fn batched_scale_rows_matches_per_row_scalar_scale() {
+        let mut rng = Lcg(0x1357_9BDF_2468_ACE0);
+        for _ in 0..2500 {
+            let bases: [[f64; 2]; 4] = std::array::from_fn(|_| std::array::from_fn(|_| rng.val()));
+            let s: [f64; 4] = std::array::from_fn(|_| rng.val());
+            let batch: [Tower4Batch<2>; 2] = std::array::from_fn(|a| {
+                Tower4Batch::variable(
+                    wide::f64x4::new([bases[0][a], bases[1][a], bases[2][a], bases[3][a]]),
+                    a,
+                )
+            });
+            let prod = batch[0].mul(&batch[1]).compose_unary_with(|u| {
+                let e = u.exp();
+                [e, e, e, e, e]
+            });
+            let scaled = prod.scale_rows(s);
+            for (row, base) in bases.iter().enumerate() {
+                let v: [Tower4<2>; 2] =
+                    std::array::from_fn(|a| <Tower4<2> as RowJet<2>>::variable(base[a], a));
+                let prod_s = v[0].mul(&v[1]).compose_unary_with(|u| {
+                    let e = u.exp();
+                    [e, e, e, e, e]
+                });
+                let ref_s = RowJet::scale(&prod_s, s[row]);
+                assert_t4_bits_eq(&scaled.lane(row), &ref_s, "batched_scale_rows");
+            }
         }
     }
 
