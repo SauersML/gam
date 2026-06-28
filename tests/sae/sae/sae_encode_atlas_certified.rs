@@ -690,9 +690,13 @@ fn amortized_predictor_is_the_ift_first_order_map() {
         &[1.0],
         1.0,
         AtlasConfig {
-            // A coarse grid so a chart center sits well away from t* and the
-            // affine displacement is resolvable (not swamped by re-routing).
-            grid_resolution: 8,
+            // A coarse grid so all three on-tangent targets route to the SAME
+            // chart (their t-range is < 0.02) and the affine displacement is
+            // resolvable, but fine enough that the raw IFT prediction certifies
+            // in-chart WITHOUT a basin-warmup step (#1026 keeps warm-up iterates
+            // inside the chart, and at res=8 the coarse chart's prediction needs a
+            // boundary-crossing step, so it would flag).
+            grid_resolution: 16,
             ridge: 1.0e-12,
             newton_steps: 0, // isolate the closed-form prediction, no refinement.
         },
