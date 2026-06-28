@@ -23,22 +23,14 @@ import pytest
 gamfit = pytest.importorskip("gamfit")
 
 
-# #1512 triage: both tests in this file drive a full SAE-manifold atom-smooth
-# REML fit that does not converge — RemlConvergenceError
+# #1512 (OPEN BUG — these tests fail on purpose to flag it; SPEC.md forbids
+# xfail, so the failure stands as the signal): both tests drive a full
+# SAE-manifold atom-smooth REML fit that does not converge — RemlConvergenceError
 # ("SaeManifoldTerm::reml_criterion: inner solve did not converge at fixed ρ ...
 # after 3200 inner iterations" / "all 1 seed candidates failed (SAE manifold)").
-# A real SAE-REML convergence open bug; also slow (~2-3 min per fit). Marked
-# xfail + slow at module scope so the open bug is tracked without reddening or
-# slowing the directory-level CI suite.
-pytestmark = [
-    pytest.mark.slow,
-    pytest.mark.xfail(
-        strict=True,
-        reason="#1512 triage: SAE-manifold atom-smooth REML inner solve does not "
-        "converge (RemlConvergenceError; 'all 1 seed candidates failed (SAE "
-        "manifold)'). Open SAE-REML convergence bug.",
-    ),
-]
+# Kept @slow (the fit is ~2-3 min) so it is excluded from the default CI run,
+# but NOT xfailed. Fix the SAE-REML convergence to green these.
+pytestmark = pytest.mark.slow
 
 
 def _circle_data(n: int, p: int, noise: float, seed: int) -> np.ndarray:

@@ -85,12 +85,6 @@ def _r2(x: np.ndarray, fitted: np.ndarray) -> float:
     return 1.0 - ss_res / max(ss_tot, 1e-12)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#1512 triage: heterogeneous mixed-topology SAE fit fails REML "
-    "convergence — RemlConvergenceError 'no candidate seeds passed outer "
-    "startup validation (SAE manifold)'. Open SAE-REML convergence bug.",
-)
 def test_heterogeneous_mixed_topology_atoms_reconstruct():
     """A single fit with atom_basis=['periodic','sphere','torus'] and
     per-atom d_atom=[1,2,2] must reconstruct mixed-manifold data and

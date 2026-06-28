@@ -18,23 +18,6 @@ import gamfit
 import gamfit._sae_manifold as sae
 
 
-# #1512 triage: several SAE-facade audit tests have drifted from the current
-# sae_manifold_fit FFI/payload surface — the _FakeRustModule.sae_manifold_fit_
-# minimal stub no longer accepts new keyword args (fisher_factors, ...), and the
-# fit payload no longer carries the keys these tests read (e.g. a
-# penalized-loss score). Real test-fixture drift against the evolved engine;
-# marked xfail so they don't redden the directory-level CI suite. Rebuild the
-# stub/payload expectations against the current FFI to re-enable. The other 23
-# facade-audit tests still pass.
-_XFAIL_FACADE = pytest.mark.xfail(
-    strict=True,
-    reason="#1512 triage: SAE-facade fixture drift — _FakeRustModule stub "
-    "missing new sae_manifold_fit_minimal kwargs (fisher_factors) and/or the "
-    "fit payload missing keys the test reads (penalized_loss_score, ibp_map "
-    "metadata).",
-)
-
-
 def _no_row_block_probe(monkeypatch):
     """Disable the Rust-backed row-block capability probe for payload tests."""
     monkeypatch.setattr(sae, "_require_sae_row_block_penalty", lambda kind, kwarg: None)
@@ -244,26 +227,36 @@ class _FakeRustModule:
         return 1.0 - ss_res / max(ss_tot, 1.0e-12)
 
     def basis_with_jet(self, kind, coords, params):
-        """Minimal real periodic Fourier basis (width 2H+1) plus its phase jet.
+        """Minimal real basis plus its coordinate jet.
 
-        Enough for the `_periodic_shape_band` / `_atom_functional_evidence`
-        readers exercised by the variable-K round-trip: a (G, 2H+1) design, its
-        (G, 2H+1, 1) derivative tower, and a zero penalty stub.
+        For ``periodic`` atoms this is the Fourier design (width 2H+1) exercised
+        by the `_periodic_shape_band` round-trip. For any other manifold kind
+        (e.g. ``sphere`` in the mixed-topology fit) a generic affine design
+        ``[1, t_1, ..., t_d]`` (width 1+d) plus its identity jet is returned; the
+        `_atom_functional_evidence` reader gracefully skips an atom whose basis
+        width does not match its decoder, so an exact analytic basis is not
+        required to keep the surface contract deterministic.
         """
-        if str(kind) != "periodic":
-            raise ValueError(f"fake basis_with_jet only models 'periodic'; got {kind!r}")
         coords = np.asarray(coords, dtype=float)
-        theta = 2.0 * np.pi * coords[:, 0]
-        h = int(params["n_harmonics"])
-        cols = [np.ones_like(theta)]
-        jet_cols = [np.zeros_like(theta)]
-        for m in range(1, h + 1):
-            cols.append(np.cos(m * theta))
-            cols.append(np.sin(m * theta))
-            jet_cols.append(-2.0 * np.pi * m * np.sin(m * theta))
-            jet_cols.append(2.0 * np.pi * m * np.cos(m * theta))
-        phi = np.stack(cols, axis=1)
-        jet = np.stack(jet_cols, axis=1)[:, :, None]
+        if str(kind) == "periodic":
+            theta = 2.0 * np.pi * coords[:, 0]
+            h = int(params["n_harmonics"])
+            cols = [np.ones_like(theta)]
+            jet_cols = [np.zeros_like(theta)]
+            for m in range(1, h + 1):
+                cols.append(np.cos(m * theta))
+                cols.append(np.sin(m * theta))
+                jet_cols.append(-2.0 * np.pi * m * np.sin(m * theta))
+                jet_cols.append(2.0 * np.pi * m * np.cos(m * theta))
+            phi = np.stack(cols, axis=1)
+            jet = np.stack(jet_cols, axis=1)[:, :, None]
+            penalty = np.zeros((phi.shape[1], phi.shape[1]), dtype=float)
+            return phi, jet, penalty
+        n_obs, dim = coords.shape
+        phi = np.concatenate([np.ones((n_obs, 1)), coords], axis=1)
+        jet = np.zeros((n_obs, dim + 1, dim), dtype=float)
+        for axis in range(dim):
+            jet[:, axis + 1, axis] = 1.0
         penalty = np.zeros((phi.shape[1], phi.shape[1]), dtype=float)
         return phi, jet, penalty
 
@@ -281,16 +274,24 @@ class _FakeRustModule:
         smoothness,
         max_iter,
         learning_rate,
-        gumbel_schedule,
-        analytic_penalties,
         random_state,
         top_k,
-        initial_logits,
-        initial_coords,
-        jumprelu_threshold,
-        native_ard_enabled,
+        gumbel_schedule=None,
+        analytic_penalties=None,
+        initial_logits=None,
+        initial_coords=None,
+        jumprelu_threshold=0.0,
+        **_forward_compat_kwargs,
     ):
-        self.last_native_ard_enabled = bool(native_ard_enabled)
+        # ARD-per-atom is now plumbed as an `{"kind": "ard"}` analytic-penalty
+        # descriptor rather than a dedicated `native_ard_enabled` FFI flag.
+        if analytic_penalties is None:
+            self.last_native_ard_enabled = False
+        else:
+            items = json.loads(str(analytic_penalties))
+            self.last_native_ard_enabled = any(
+                str(it.get("kind")) == "ard" for it in items
+            )
         z = np.asarray(z, dtype=float)
         n_obs, p_out = z.shape
         k_atoms = len(atom_basis)
@@ -322,6 +323,7 @@ class _FakeRustModule:
             "logits": logits,
             "fitted": np.zeros_like(z),
             "reml_score": -1.0,
+            "penalized_loss_score": -1.0,
             "chosen_k": k_atoms,
             "dispersion": 1.0,
             "oos_projection_top1": False,
@@ -479,19 +481,10 @@ def test_alignment_public_api_uses_rich_result():
     "kind,expected_threshold",
     [
         ("softmax", 0.25),   # 1/K with K=4
-        # #1512 triage: the ibp_map summary threshold no longer resolves to 0.5
-        # — the stub observes ~1e-08 (like jumprelu), so the ibp_map-specific
-        # 0.5 threshold mapping regressed/changed. xfail just this case; softmax
-        # and jumprelu still resolve correctly.
-        pytest.param(
-            "ibp_map",
-            0.5,
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="#1512 triage: ibp_map summary threshold resolves to "
-                "~1e-08, not the expected 0.5.",
-            ),
-        ),
+        # #1547: the ibp_map summary threshold is a small responsibility-mass
+        # epsilon (1e-8), not a 0.5 gate bar — `assignments_z` are normalized
+        # reconstruction responsibilities that cannot reach 0.5 once K>=2.
+        ("ibp_map", 1.0e-8),
         ("jumprelu", 0.0),
     ],
 )
@@ -503,16 +496,15 @@ def test_summary_threshold_mode_specific(monkeypatch, kind, expected_threshold):
     assert stub.threshold == pytest.approx(expected_threshold)
 
 
-@_XFAIL_FACADE
 def test_summary_canonical_kind_for_ibp_map_label(monkeypatch):
-    """The canonical ibp_map label drives the 0.5 threshold."""
+    """The canonical ibp_map label drives the responsibility-mass threshold."""
     stub = _StubModule()
     monkeypatch.setattr(sae, "rust_module", lambda: stub)
     # Even if the stored label is the raw alias, the canonical field governs.
     fit = _make_fit("ibp_map", n_atoms=4)
     fit.assignment_label = "ibp_map"
     fit.summary()
-    assert stub.threshold == pytest.approx(0.5)
+    assert stub.threshold == pytest.approx(1.0e-8)
 
 
 def test_summary_and_roundtrip_surface_atom_functional_evidence(monkeypatch):
@@ -585,7 +577,6 @@ def test_top_k_negative_raises(monkeypatch):
 # and do not depend on the current convergence state of the compiled solver.
 # ---------------------------------------------------------------------------
 
-@_XFAIL_FACADE
 def test_ibp_map_metadata_e2e(monkeypatch):
     fake = _FakeRustModule()
     monkeypatch.setattr(sae, "rust_module", lambda: fake)
@@ -603,7 +594,6 @@ def test_ibp_map_metadata_e2e(monkeypatch):
     assert fit_map.assignment == "ibp_map"
 
 
-@_XFAIL_FACADE
 def test_mixed_basis_topology_e2e(monkeypatch):
     fake = _FakeRustModule()
     monkeypatch.setattr(sae, "rust_module", lambda: fake)
@@ -624,7 +614,6 @@ def test_mixed_basis_topology_e2e(monkeypatch):
     assert fit.atom_topologies == ["circle", "sphere"]
 
 
-@_XFAIL_FACADE
 def test_ard_per_atom_controls_native_ard_plumbing(monkeypatch):
     fake = _FakeRustModule()
     monkeypatch.setattr(sae, "rust_module", lambda: fake)
@@ -717,6 +706,7 @@ def _grown_k_payload(n_obs: int, p_out: int) -> dict[str, object]:
         "logits": logits,
         "fitted": rng.standard_normal((n_obs, p_out)),
         "reml_score": -2.0,
+        "penalized_loss_score": -2.0,
         "chosen_k": k,
         "dispersion": 1.0,
         "oos_projection_top1": False,
@@ -724,7 +714,6 @@ def _grown_k_payload(n_obs: int, p_out: int) -> dict[str, object]:
     }
 
 
-@_XFAIL_FACADE
 def test_grown_k_payload_round_trips_through_from_payload(monkeypatch):
     monkeypatch.setattr(sae, "rust_module", lambda: _FakeRustModule())
     n_obs, p_out = 16, 3

@@ -18,17 +18,6 @@ from gamfit._sampling import PosteriorSamples
 from gamfit._survival import SurvivalPrediction
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#1512 triage: SurvivalPrediction.survival_at no longer extrapolates "
-    "out-of-range query times — survival_at([-2.0, 0.0, inf]) now raises "
-    "GamError('survival prediction times must be finite and non-negative, index "
-    "0 = -2') instead of returning the boundary survival values (S(t<0)=1, "
-    "S(inf)=0) this test asserts. (The earlier sample_table float-vs-string "
-    "row drift in this test is fixed in the same change.) Tracking the lost "
-    "tail-extrapolation contract as open; restore it or gate the query times to "
-    "[0, inf) to re-enable.",
-)
 def test_penalty_specs_sampling_survival_and_diagnostics_regressions():
     ffi = rust_module()
 

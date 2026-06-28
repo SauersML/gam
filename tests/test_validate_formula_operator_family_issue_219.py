@@ -23,26 +23,17 @@ import gamfit
 
 
 # #1512 triage: gamfit.validate_formula now enforces fit-FEASIBILITY, not just
-# parse-validity — on the 4-row ROWS fixture it rejects the heavier formulas:
-# te(x1, x2)+ti(x1, x2) needs >=20 rows ("dataset has n=4 rows but the smooth
-# terms ... need at least 20"), and x1 + x2 + x1*x2 (which expands x1*x2 ->
-# x1 + x2 + x1:x2) is rejected as listing term x1 "more than once". These
-# orphaned tests assert parse-only acceptance with a tiny fixture, which the new
-# feasibility checks now block. xfail the affected cases; give them a >=20-row
-# fixture (and de-duplicate the x1*x2 formula) to re-enable as accept tests.
-_XFAIL_219 = pytest.mark.xfail(
-    strict=True,
-    reason="#1512 triage: validate_formula now enforces fit feasibility "
-    "(min-row / duplicate-term) on the 4-row fixture, rejecting these "
-    "parse-acceptance formulas.",
-)
-
-
+# parse-validity. The tensor-smooth formula te(x1, x2)+ti(x1, x2) needs >=22
+# rows total, so the fixture below provides a deterministic 24-row dataset.
 ROWS = [
-    {"y": 1.0, "x1": 0.0, "x2": 1.0, "x3": 0.5, "g": "a"},
-    {"y": 2.0, "x1": 1.0, "x2": 0.0, "x3": 0.25, "g": "b"},
-    {"y": 3.0, "x1": 2.0, "x2": 1.0, "x3": 0.75, "g": "a"},
-    {"y": 4.0, "x1": 0.5, "x2": 0.5, "x3": 1.0, "g": "b"},
+    {
+        "y": float(i + 1),
+        "x1": float(i % 5),
+        "x2": float((i * 2) % 7),
+        "x3": float((i % 4) * 0.25 + 0.1),
+        "g": ["a", "b", "c", "d"][i % 4],
+    }
+    for i in range(24)
 ]
 
 
@@ -89,23 +80,23 @@ def test_caret_power_crossing() -> None:
     _accept("y ~ (x1 + x2 + x3)^2")
 
 
-@_XFAIL_219
 def test_identity_wrapper_pass_through() -> None:
     _accept("y ~ I(x1 + x2)")
 
 
-@_XFAIL_219
 def test_full_operator_family_from_issue_219() -> None:
-    # Exact repro from the bug report.
-    _accept("y ~ x1 + x2 + x1:x2 + x1*x2 + x1/x2 + group(g)")
+    # Non-redundant exercise of the documented `*` (crossing) and `/` (nesting)
+    # operators plus group(): `x3*x2` expands to x3 + x2 + x3:x2 and `x1/x2` to
+    # x1 + x1:x2, with no duplicated term. (The literal repro from the bug report
+    # double-lists x1/x1:x2 because x1*x2 and x1/x2 overlap, which the current
+    # materializer correctly rejects as rank-deficient.)
+    _accept("y ~ x3*x2 + x1/x2 + group(g)")
 
 
-@_XFAIL_219
 def test_colon_inside_mixed_smooth_formula() -> None:
     _accept("y ~ s(x1) + s(x2) + x1:x2")
 
 
-@_XFAIL_219
 def test_colon_with_tensor_smooths() -> None:
     _accept("y ~ te(x1, x2) + ti(x1, x2) + x1:x3")
 

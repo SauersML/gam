@@ -14,6 +14,7 @@ from __future__ import annotations
 import importlib.util
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -46,9 +47,14 @@ def test_fake_rust_module_exposes_sae_manifold_fit_minimal(path: Path) -> None:
 
 @pytest.mark.parametrize("path", FAKE_TEST_FILES, ids=lambda p: p.name)
 def test_existing_fake_module_tests_pass(path: Path) -> None:
+    # Run from a directory without the source ./gamfit package so the installed
+    # compiled wheel (which carries `gamfit._rust`) wins the import, mirroring how
+    # the CI `python-tests` job runs pytest from `runner.temp`. Running from
+    # REPO_ROOT would let the source ./gamfit (no `_rust`) shadow the wheel and
+    # fail with ModuleNotFoundError: gamfit._rust.
     result = subprocess.run(
         [sys.executable, "-m", "pytest", str(path), "-q", "--no-header"],
-        cwd=str(REPO_ROOT),
+        cwd=tempfile.gettempdir(),
         capture_output=True,
         text=True,
     )

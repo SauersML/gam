@@ -84,32 +84,27 @@ def test_sphere_cross_backend_identical():
     print(f"Sphere torch vs numpy max-abs-diff:  {diff:.3e}")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#1512 triage: Matern is no longer torch-only — it now declares "
-    "SUPPORTED_BACKENDS={numpy, torch, jax} and Matern.evaluate(x, "
-    "backend='numpy') returns a finite (n, n_centers) basis, so the numpy path "
-    "no longer raises NotImplementedError. This test pins the obsolete "
-    "torch-only contract; update it to the multi-backend behavior to re-enable.",
-)
-def test_matern_is_torch_only():
-    """Matern is pure-torch math; numpy/jax must raise NotImplementedError."""
+def test_matern_supports_numpy_and_jax():
+    """Matern is now multi-backend: the numpy path returns a finite
+    (n, n_centers) basis (the obsolete torch-only premise is gone), and the
+    jax path matches it numerically when jax is installed."""
     centers = np.linspace(0.0, 1.0, 8).reshape(-1, 1)
     spec = gamfit.Matern(centers=centers, nu=1.5, length_scale=0.3)
     x = np.linspace(0.0, 1.0, 16)
 
-    with pytest.raises(NotImplementedError, match="numpy"):
-        spec.evaluate(x, backend="numpy")
-    with pytest.raises(NotImplementedError, match="jax"):
-        spec.evaluate(x, backend="jax")
+    out_numpy = _to_numpy(spec.evaluate(x, backend="numpy"))
+    assert out_numpy.shape == (16, 8)
+    assert np.all(np.isfinite(out_numpy)), "Matern numpy basis must be finite"
+
+    jax = pytest.importorskip("jax")
+    import jax.numpy as jnp
+
+    out_jax = _to_numpy(spec.evaluate(jnp.asarray(x), backend="jax"))
+    assert out_jax.shape == (16, 8)
+    diff = _maxabs(out_numpy, out_jax)
+    assert diff < 1e-10, f"Matern jax vs numpy max-abs-diff = {diff:.3e}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#1512 triage: the expected matrix pins Matern: {'torch'}, but "
-    "Matern.SUPPORTED_BACKENDS is now {'numpy', 'torch', 'jax'} (Matern gained "
-    "numpy/jax support). Stale expectation; update the matrix entry to re-enable.",
-)
 def test_capability_matrix_declared():
     """Each descriptor declares SUPPORTED_BACKENDS — none missing."""
     matrix = {
@@ -119,7 +114,7 @@ def test_capability_matrix_declared():
         gamfit.Sphere: {"torch", "numpy", "jax"},
         gamfit.PeriodicSplineCurve: {"torch", "numpy", "jax"},
         gamfit.Pca: {"torch", "numpy", "jax"},
-        gamfit.Matern: {"torch"},
+        gamfit.Matern: {"torch", "numpy", "jax"},
     }
     for cls, expected in matrix.items():
         got = set(cls.SUPPORTED_BACKENDS)

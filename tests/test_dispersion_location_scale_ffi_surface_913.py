@@ -23,25 +23,16 @@ import numpy as np
 import gamfit
 
 
-# #1512 triage / #913 still open: the `family=<nb|gamma|tweedie|beta>` +
-# `noise_formula=` magic-routing to the dispersion location-scale families is
-# not wired through the current Python surface. `gamfit.fit(..., family="nb",
-# noise_formula="x")` accepts the call but returns the mean-only family tag
-# ("Negative-Binomial Log", "Gamma Log", "Tweedie Log", "Beta Regression
-# Logit") instead of the "<family>-location-scale" tag every test in this file
-# asserts — reproduced across all four families and the constant-noise case.
-# Marked xfail (strict) so the open #913 surface gap is tracked but does not
-# redden the directory-level CI suite; flip to a hard gate when fit() routes a
-# present noise_formula to the dispersion location-scale family.
-pytestmark = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "#913 open: family + noise_formula does not magic-route to the "
-        "dispersion location-scale family through the Python surface "
-        "(returns the mean-only family tag, e.g. 'negative-binomial log' "
-        "instead of 'negbin-location-scale')."
-    ),
-)
+# #1512 / #913 (OPEN BUG — these tests fail on purpose to flag it; SPEC.md
+# forbids xfail, so the failure stands as the signal): the
+# `family=<nb|gamma|tweedie|beta>` + `noise_formula=` magic-routing to the
+# dispersion location-scale families is not wired through the current Python
+# surface. `gamfit.fit(..., family="nb", noise_formula="x")` accepts the call but
+# returns the mean-only family tag ("Negative-Binomial Log", "Gamma Log",
+# "Tweedie Log", "Beta Regression Logit") instead of the
+# "<family>-location-scale" tag every test in this file asserts — reproduced
+# across all four families and the constant-noise case. Route a present
+# noise_formula to the dispersion location-scale family to green these.
 
 
 def _heteroscedastic_count_rows(n: int, seed: int) -> list[dict[str, float]]:

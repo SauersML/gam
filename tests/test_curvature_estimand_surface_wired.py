@@ -74,15 +74,9 @@ def _hyperbolic_dataset(n: int = 360, seed: int = 11) -> pd.DataFrame:
 # which contradicts a correct "flat" verdict (the same fit recovers the
 # hyperbolic sign cleanly at seeds 1-2 and at radius=0.68, the case the wired
 # #1464 contract test_bug_hunt_curv_smooth_hyperbolic_recovered_as_spherical.py
-# already guards). Marked xfail so this over-strict point-estimate-sign check on
-# a flat verdict does not redden the directory-level CI suite; tighten the test
+# already guards). SPEC.md forbids xfail, so these stand FAILING as the signal;
+# tighten the test
 # to gate on verdict / CI sign (not the raw point estimate) to re-enable.
-@pytest.mark.xfail(
-    strict=True,
-    reason="#1464 residual: at radius=0.45 seed=0 the estimator correctly "
-    "reports verdict='flat' (symmetric CI, p=1) so the kappa_hat point estimate "
-    "may be positive; the test asserts kappa_hat<=1e-6 unconditionally.",
-)
 def test_summary_surfaces_fitted_kappa_with_no_refit() -> None:
     df = _hyperbolic_dataset()
     model = gamfit.fit(df, "y ~ curv(x1, x2, centers=10)")
@@ -97,12 +91,6 @@ def test_summary_surfaces_fitted_kappa_with_no_refit() -> None:
     assert row["kappa_hat"] <= 1e-6, f"κ̂={row['kappa_hat']} should not be spherical"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#1464 residual: at radius=0.45 seed=0 the estimator correctly "
-    "reports verdict='flat' (symmetric CI, p=1) so the kappa_hat point estimate "
-    "may be positive; the final assert demands kappa_hat<=1e-6 unconditionally.",
-)
 def test_curvature_method_reports_ci_and_flatness() -> None:
     df = _hyperbolic_dataset()
     model = gamfit.fit(df, "y ~ curv(x1, x2, centers=10)")

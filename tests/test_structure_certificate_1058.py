@@ -25,20 +25,12 @@ import pytest
 gamfit = pytest.importorskip("gamfit")
 
 
-# #1512 triage / #1058: a fresh gamfit.sae_manifold_fit(...) does NOT populate
-# the structure certificate — fit.structure_certificate() raises ValueError
-# "this fitted model carries no structure certificate (payload predates #1058);
-# refit to obtain one" even on a brand-new fit. So the certificate the whole
-# file exercises is never produced by the current SAE fit path. Marked xfail at
-# module scope so the open #1058 gap is tracked without reddening the
-# directory-level CI suite; wire the certificate into sae_manifold_fit to
-# re-enable.
-pytestmark = pytest.mark.xfail(
-    strict=True,
-    reason="#1058 open: gamfit.sae_manifold_fit does not emit a structure "
-    "certificate (structure_certificate() raises 'carries no structure "
-    "certificate ... refit to obtain one' on a fresh fit).",
-)
+# #1512 / #1058 (OPEN BUG — these tests fail on purpose to flag it; SPEC.md
+# forbids xfail, so the failure stands as the signal): a fresh
+# gamfit.sae_manifold_fit(...) does NOT populate the structure certificate —
+# fit.structure_certificate() raises ValueError "this fitted model carries no
+# structure certificate (payload predates #1058); refit to obtain one" even on a
+# brand-new fit. Wire the certificate into sae_manifold_fit to green these.
 
 
 def _circle(n: int, p: int, noise: float, seed: int) -> np.ndarray:

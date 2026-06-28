@@ -75,13 +75,6 @@ def test_sae_fit_is_deterministic_for_fixed_seed():
         )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#1512 triage: SAE-manifold random_state is IGNORED — fits with "
-    "rs=0 and rs=1 are bit-identical (fitted max-abs diff = 0.0), so distinct "
-    "seeds do not produce different fits. Real open bug (seed not threaded into "
-    "the SAE solver). The fixed-seed determinism test in this file still passes.",
-)
 def test_sae_fit_random_state_changes_output():
     """Distinct `random_state` values must produce observably different fits
     (issue #178). With the seed wired into the assignment-logit init, any two

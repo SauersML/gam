@@ -1,25 +1,42 @@
 import numpy as np
-import pytest
 
 import gamfit._sae_manifold as sae
 
 
-# #1512 triage: same _FakeRust mock drift as
-# test_sae_assignment_and_schedule_bridge — the refactored sae_manifold_fit path
-# now also calls build_info() and basis_with_jet() and uses a reordered
-# sae_manifold_fit_minimal signature, none of which this minimal fake stubs, so
-# the bridge fails with AttributeError: build_info. Marked xfail so the drift is
-# tracked without reddening the directory-level CI suite; rebuild the fake
-# against the current FFI surface to re-enable.
-@pytest.mark.xfail(
-    strict=True,
-    reason="#1512 triage: _FakeRust mock is incomplete vs the refactored "
-    "sae_manifold_fit FFI (missing build_info / basis_with_jet, stale "
-    "sae_manifold_fit_minimal signature).",
-)
 def test_sae_dictionary_atom_count_matches_python_and_rust_payload(monkeypatch):
     class _FakeRust:
-        def sae_manifold_fit_minimal(self, z, k_atoms, atom_basis, atom_dim, assignment_kind, alpha, tau, learnable_alpha, sparsity_strength, smoothness, max_iter, learning_rate, random_state, top_k, *, gumbel_schedule=None):
+        def build_info(self):
+            return {
+                "sae_row_block_penalties": [
+                    "ard", "top_k_activation", "jumprelu", "sparsity",
+                    "row_precision_prior", "parametric_row_precision_prior",
+                    "scad_mcp", "block_orthogonality", "isometry",
+                ]
+            }
+
+        def periodic_basis_with_jet(self, t, n_harmonics):
+            x = np.asarray(t, dtype=float)
+            columns = [np.ones_like(x)]
+            jacobian_columns = [np.zeros_like(x)]
+            penalties = [0.0]
+            for harmonic in range(1, int(n_harmonics) + 1):
+                omega = 2.0 * np.pi * harmonic
+                columns.extend([np.cos(omega * x), np.sin(omega * x)])
+                jacobian_columns.extend([-omega * np.sin(omega * x), omega * np.cos(omega * x)])
+                penalties.extend([omega**4, omega**4])
+            phi = np.stack(columns, axis=1)
+            jet = np.stack(jacobian_columns, axis=1)[:, :, None]
+            penalty = np.diag(penalties)
+            return phi, jet, penalty
+
+        def basis_with_jet(self, kind, coords, params=None):
+            params = params or {}
+            n_harmonics = int(params.get("n_harmonics", 2))
+            t = np.asarray(coords, dtype=float).reshape(-1)
+            return self.periodic_basis_with_jet(t, n_harmonics)
+
+        def sae_manifold_fit_minimal(self, z, atom_basis, atom_dim, alpha, tau, learnable_alpha, assignment_kind, *, sparsity_strength, smoothness, max_iter, learning_rate, random_state, top_k, gumbel_schedule=None, **_forward_compat_kwargs):
+            k_atoms = len(atom_basis)
             atoms = []
             for i in range(k_atoms):
                 atoms.append({"decoder_B": np.ones((2, z.shape[1])) * (i + 1), "basis_kind": atom_basis[i], "on_atom_coords_t": np.zeros((z.shape[0], atom_dim[i])), "assignments_z": np.ones(z.shape[0]), "active_dim": atom_dim[i]})
@@ -33,6 +50,7 @@ def test_sae_dictionary_atom_count_matches_python_and_rust_payload(monkeypatch):
                 "logits": np.zeros((z.shape[0], k_atoms)),
                 "fitted": np.zeros_like(z),
                 "reml_score": -1.0,
+                "penalized_loss_score": -1.0,
                 "chosen_k": 1,
                 "dispersion": 1.0,
                 "oos_projection_top1": False,

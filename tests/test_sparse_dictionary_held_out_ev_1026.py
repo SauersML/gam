@@ -41,13 +41,6 @@ def _pca_held_out_ev(train, test, rank):
     return _ev(test, proj)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#1026 open: the sparse-dictionary trainer under-recovers held-out "
-    "explained variance — empirical EV ~0.24 vs the >0.9 the test requires "
-    "(same recon-parity gap as test_sae_manifold_olmo_real_recon_ev). The "
-    "fixed-width-storage test in this file still passes.",
-)
 def test_sparse_trainer_held_out_ev_beats_pca_baseline_modest_k():
     rng = np.random.default_rng(0)
     k, p = 16, 24

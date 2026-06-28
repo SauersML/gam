@@ -78,13 +78,6 @@ def _decoder_cross_gram_energy(fit) -> float:
 
 
 @pytest.mark.slow
-@pytest.mark.xfail(
-    strict=True,
-    reason="#1512 triage: the decoder-incoherence cross-gram fit panics — "
-    "pyo3_runtime.PanicException 'index out of bounds: the len is 2 but the "
-    "index is 2' (same SAE out-of-bounds family as #357). Real engine bug; "
-    "also @slow (~3 min).",
-)
 def test_decoder_incoherence_reduces_recovered_cross_atom_decoder_cross_gram():
     z = _redundant_two_atom_data()
 

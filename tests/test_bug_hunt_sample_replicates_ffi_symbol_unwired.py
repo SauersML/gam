@@ -63,21 +63,6 @@ def _poisson_frame(n: int, seed: int):
     return pd.DataFrame({"x": x, "y": y})
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "#1057 partial: the generative_replicates FFI symbol is now wired (the "
-        "original AttributeError is gone) and the shape / Poisson-support / "
-        "seed-determinism contracts hold, but the per-row replicate mean is "
-        "still systematically inconsistent with model.predict(): |col_mean - mu| "
-        "exceeds the 5-sigma plug-in Poisson band (sqrt(mu/n_draws)) for several "
-        "rows, and the z-score GROWS with n_draws (5.3 sigma at 8000 draws, "
-        "12 sigma at 40000) — a fixed ~1-3% bias, not Monte-Carlo noise, across "
-        "seeds 0-4. Tracks the open replicate-mean/predict consistency gap. Flip "
-        "to a hard assert once the generative rate matches predict() within the "
-        "asserted band."
-    ),
-)
 def test_sample_replicates_is_reachable_and_family_correct() -> None:
     import pandas as pd
 

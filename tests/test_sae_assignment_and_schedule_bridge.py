@@ -1,30 +1,8 @@
 import numpy as np
-import pytest
 
 import gamfit._sae_manifold as sae
 
 
-# #1512 triage: this test mocks the Rust module with a minimal _FakeRust and
-# asserts the assignment mode / temperature / gumbel schedule survive the
-# Python->Rust bridge. The sae_manifold_fit path has since been refactored to
-# call a much larger FFI surface during a single fit — build_info() (assignment
-# validation), a reordered sae_manifold_fit_minimal positional convention with
-# new keyword args (analytic_penalties, fisher_*, row_loss_weights, ...), and a
-# post-fit basis_with_jet() evaluation. The _FakeRust here only stubs
-# sae_manifold_fit_minimal + sae_manifold_reconstruction_r2, so the bridge now
-# trips over the unstubbed methods (basis_with_jet). The signature/build_info
-# stubs below were updated to the current convention, but faithfully faking the
-# whole evolved FFI surface (jet-correct basis_with_jet) is out of scope for the
-# orphan triage. Marked xfail so the drift is tracked without reddening the
-# directory-level CI suite; rebuild the fake against the current sae_manifold_fit
-# FFI calls (or convert to a real-module bridge test) to re-enable.
-@pytest.mark.xfail(
-    strict=True,
-    reason="#1512 triage: _FakeRust mock is incomplete against the refactored "
-    "sae_manifold_fit FFI surface (now also calls build_info / basis_with_jet "
-    "and a reordered sae_manifold_fit_minimal); the bridge trips on the "
-    "unstubbed basis_with_jet. Rebuild the fake to re-enable.",
-)
 def test_sae_assignment_mode_and_schedule_survive_python_to_rust_bridge(monkeypatch):
     captured = {}
 
@@ -50,6 +28,27 @@ def test_sae_assignment_mode_and_schedule_survive_python_to_rust_bridge(monkeypa
                 ],
             }
 
+        def periodic_basis_with_jet(self, t, n_harmonics):
+            x = np.asarray(t, dtype=float)
+            columns = [np.ones_like(x)]
+            jacobian_columns = [np.zeros_like(x)]
+            penalties = [0.0]
+            for harmonic in range(1, int(n_harmonics) + 1):
+                omega = 2.0 * np.pi * harmonic
+                columns.extend([np.cos(omega * x), np.sin(omega * x)])
+                jacobian_columns.extend([-omega * np.sin(omega * x), omega * np.cos(omega * x)])
+                penalties.extend([omega**4, omega**4])
+            phi = np.stack(columns, axis=1)
+            jet = np.stack(jacobian_columns, axis=1)[:, :, None]
+            penalty = np.diag(penalties)
+            return phi, jet, penalty
+
+        def basis_with_jet(self, kind, coords, params=None):
+            params = params or {}
+            n_harmonics = int(params.get("n_harmonics", 2))
+            t = np.asarray(coords, dtype=float).reshape(-1)
+            return self.periodic_basis_with_jet(t, n_harmonics)
+
         def sae_manifold_fit_minimal(self, z, atom_basis, atom_dim, alpha, tau, learnable_alpha, assignment_kind, *, gumbel_schedule=None, **_extra):
             # #1512: the FFI positional convention is now (x, bases, dims,
             # alpha_value, tau, learnable_alpha, kind, **keyword) — the bridge
@@ -71,6 +70,7 @@ def test_sae_assignment_mode_and_schedule_survive_python_to_rust_bridge(monkeypa
                 "logits": np.zeros((z.shape[0], 1)),
                 "fitted": np.zeros_like(z),
                 "reml_score": -1.0,
+                "penalized_loss_score": -1.0,
                 "chosen_k": 1,
                 "dispersion": 1.0,
                 "oos_projection_top1": False,

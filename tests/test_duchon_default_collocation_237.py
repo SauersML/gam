@@ -97,15 +97,9 @@ def test_descriptor_evaluate_d2_various_m(m: int) -> None:
 # `.evaluate` path for the same config returns the full one-column-per-center
 # basis (test_descriptor_evaluate_d2_m2_thin_plate, which passes). The two
 # Duchon surfaces disagree on the default collocation/null-space augmentation.
-# Marked xfail (strict) so the open #237 inconsistency is tracked without
-# reddening the directory-level CI suite; flip to a hard assert once the pyffi
-# basis emits one column per center like the descriptor path.
-@pytest.mark.xfail(
-    strict=True,
-    reason="#237 open: pyffi duchon_basis returns fewer columns than centers "
-    "for this config (got 8, expected 9); disagrees with the descriptor "
-    ".evaluate path that emits one column per center.",
-)
+# SPEC.md forbids xfail, so these pyffi-duchon tests stand FAILING as the signal
+# of the open #237 inconsistency; fix the pyffi basis to emit one column per
+# center like the descriptor path to green them.
 def test_pyffi_duchon_basis_d2_m2_default() -> None:
     rng = np.random.default_rng(10)
     centers = rng.standard_normal((9, 2))
@@ -115,12 +109,6 @@ def test_pyffi_duchon_basis_d2_m2_default() -> None:
     assert np.all(np.isfinite(basis))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#237 open: pyffi duchon_basis returns fewer columns than centers "
-    "for this config (got 9, expected 11); disagrees with the descriptor "
-    ".evaluate path that emits one column per center.",
-)
 def test_pyffi_duchon_basis_d3_m2_default() -> None:
     rng = np.random.default_rng(11)
     centers = rng.standard_normal((11, 3))
@@ -140,12 +128,6 @@ def test_pyffi_duchon_basis_higher_d_m2_default(d: int) -> None:
     assert np.all(np.isfinite(basis))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#237 open: pyffi duchon_basis returns fewer columns than centers "
-    "for this config (got 8, expected 10); disagrees with the descriptor "
-    ".evaluate path that emits one column per center.",
-)
 @pytest.mark.parametrize("m", [1, 2, 3])
 def test_pyffi_duchon_basis_d2_various_m(m: int) -> None:
     rng = np.random.default_rng(30 + m)

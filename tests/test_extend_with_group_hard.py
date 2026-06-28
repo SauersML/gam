@@ -220,15 +220,6 @@ def test_precision_hyperpriors_dict_path_accepts_known_label() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#1512 triage: the group `levels` handed to the precision_hyperpriors "
-    "callback carry a leading NUL byte across the Rust->Python boundary — "
-    "ctx['levels'] == ['\\x00alpha', '\\x00beta', '\\x00gamma'] instead of "
-    "['alpha', 'beta', 'gamma']. A real FFI string-decoding defect (engine-side "
-    "fix needed); the documented-keys / label / n_coefficients assertions are "
-    "otherwise correct.",
-)
 def test_precision_hyperpriors_callable_is_invoked_with_documented_keys() -> None:
     captured: list[dict[str, Any]] = []
 
@@ -339,14 +330,6 @@ def test_precision_hyperpriors_callable_returning_nonfinite_is_rejected() -> Non
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#1512 triage: deliberate placeholder — the body ends with "
-    "`raise AssertionError(\"closed-form lambda* not verifiable from Python "
-    "API\")` because the per-group selected lambda is not exposed through the "
-    "Python surface, so the closed-form lambda_star identity cannot be checked. "
-    "Wire a lambdas['g'] accessor to replace the placeholder and re-enable.",
-)
 def test_hyperprior_plus_prior_mean_matches_closed_form_lambda_star() -> None:
     fit_model = gamfit.fit(
         _training_frame(),

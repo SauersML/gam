@@ -119,13 +119,8 @@ def test_constant_curvature_response_recovers_hyperbolic_sign() -> None:
 # (kappa*=+2.5, dim=3, seed=7) is recovered as strongly hyperbolic
 # (kappa_hat=-6.49), the mirror of the #1464 hyperbolic-as-spherical failure.
 # The hyperbolic-sign and predict-roundtrip tests in this file pass; only the
-# spherical-sign and flat-truth cases fail. Marked xfail (strict) so the open
-# residual is tracked without reddening the directory-level CI suite.
-@pytest.mark.xfail(
-    strict=True,
-    reason="#1464 residual: spherical truth (kappa*=+2.5, dim=3) recovered as "
-    "hyperbolic (kappa_hat=-6.49) — constant-curvature sign recovery not robust.",
-)
+# spherical-sign and flat-truth cases fail. SPEC.md forbids xfail, so these
+# stand FAILING as the signal of the open #1464 residual.
 def test_constant_curvature_response_recovers_spherical_sign() -> None:
     dim = 3
     df = _constant_curvature_dataset(kappa_star=2.5, dim=dim)
@@ -142,12 +137,6 @@ def test_constant_curvature_response_recovers_spherical_sign() -> None:
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#1464 residual: flat truth (kappa*=0.0, dim=3, seed=7) wrongly "
-    "rejects flatness (flatness_lr=10.7 > 3.84) — the constant-curvature "
-    "flatness test is not calibrated under the null.",
-)
 def test_constant_curvature_response_does_not_reject_flat_truth() -> None:
     dim = 3
     df = _constant_curvature_dataset(kappa_star=0.0, dim=dim)

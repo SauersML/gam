@@ -122,15 +122,6 @@ def _location_scale_training_frame() -> typing.Any:
     return {"y": y.tolist(), "x": x.tolist()}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#1512 triage / #913: family='gaussian-location-scale' is not a "
-    "directly-nameable family (InvalidConfigurationError: unknown family "
-    "'gaussian-location-scale'; the location-scale families are only reached "
-    "via family='gaussian' + a noise_formula, which #913 tracks as not yet "
-    "magic-routed). The kwarg-vs-config parity cannot be checked until the "
-    "location-scale family is selectable; tracking as open.",
-)
 def test_rust_location_scale_fit_kwarg_matches_config() -> None:
     pytest.importorskip("gamfit._rust")
     np = pytest.importorskip("numpy")
@@ -164,14 +155,6 @@ def test_rust_location_scale_fit_kwarg_matches_config() -> None:
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#1512 triage / gam#1596: family='bernoulli' with flexible_link=True "
-    "does not converge on this data — the binomial mean link-wiggle joint solve "
-    "exits the Newton path before convergence (IntegrationError citing gam#1596), "
-    "so the kwarg-vs-config parity fit cannot complete. Tracking the flexible-link "
-    "convergence gap as open.",
-)
 def test_rust_flexible_link_fit_kwarg_matches_config() -> None:
     pytest.importorskip("gamfit._rust")
     np = pytest.importorskip("numpy")

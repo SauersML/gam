@@ -33,6 +33,7 @@ def test_sphere_evaluate_more_centers_than_rows_numpy():
 
 def test_sphere_evaluate_more_centers_than_rows_torch():
     """Same contract under the torch backend."""
+    pytest.importorskip("torch")
     rng = np.random.default_rng(1)
     lat = rng.uniform(-60.0, 60.0, size=6)
     lon = rng.uniform(-180.0, 180.0, size=6)
@@ -50,11 +51,14 @@ def test_sphere_evaluate_more_centers_than_rows_torch():
 def test_sphere_basis_size_default_no_eval():
     """``basis_size`` must be answerable for a default-constructed Sphere
     (n_centers=50) without first evaluating on >=50 rows. It must not
-    probe Rust with a 2-row synthetic input."""
+    probe Rust with a 2-row synthetic input.
+
+    The Sphere kernel basis carries one identifiability (sum-to-zero)
+    constraint, so basis_size is n_centers - 1 = 49 for the default."""
     spec = gamfit.Sphere()  # default n_centers=50
     size = spec.basis_size
     assert isinstance(size, int)
-    assert size >= 50
+    assert size >= 49
 
 
 def test_sphere_basis_size_custom_centers_before_evaluate():
@@ -63,12 +67,19 @@ def test_sphere_basis_size_custom_centers_before_evaluate():
     spec = gamfit.Sphere(n_centers=37)
     size = spec.basis_size
     assert isinstance(size, int)
-    assert size >= 37
+    # n_centers - 1 (one identifiability constraint) = 36.
+    assert size >= 36
 
 
 def test_sphere_basis_size_then_evaluate_consistent():
     """basis_size queried first must agree with the column count of the
-    eventual evaluation (even when eval has fewer rows than centers)."""
+    eventual evaluation (even when eval has fewer rows than centers).
+
+    The raw evaluate() design exposes one column per center (n_centers),
+    while basis_size reports the identifiable dimension after the single
+    sum-to-zero constraint is applied: basis_size == n_centers - 1, so the
+    raw design has exactly basis_size + 1 columns. Either way the count is a
+    property of the spec's centers, NOT of the eval row count (issue #224)."""
     spec = gamfit.Sphere(n_centers=20)
     size = spec.basis_size
 
@@ -76,7 +87,7 @@ def test_sphere_basis_size_then_evaluate_consistent():
     lat = rng.uniform(-60.0, 60.0, size=8)
     lon = rng.uniform(-180.0, 180.0, size=8)
     design = np.asarray(spec.evaluate(lat, lon, backend="numpy"))
-    assert design.shape[1] == size
+    assert design.shape[1] == size + 1
 
 
 def test_sphere_explicit_centers_round_trip_if_supported():

@@ -19,13 +19,8 @@ import gamfit
 # #1512 triage / #240: every regularizer-effect test that drives a real SAE fit
 # panics — pyo3_runtime.PanicException 'index out of bounds: the len is 1 but
 # the index is 1' (same SAE out-of-bounds family as #357). A real engine bug;
-# the one kwarg-rejection test that does not fit still passes. Marked xfail so
-# the open panic is tracked without reddening the directory-level CI suite.
-_XFAIL_240 = pytest.mark.xfail(
-    strict=True,
-    reason="#240 open: SAE regularizer-effect fit panics "
-    "(pyo3 'index out of bounds: the len is 1 but the index is 1').",
-)
+# the one kwarg-rejection test that does not fit still passes. SPEC.md forbids
+# xfail, so these stand FAILING as the signal of the open #240 panic.
 
 
 def _data(seed: int = 0, n: int = 32, d: int = 4) -> np.ndarray:
@@ -101,7 +96,6 @@ def _fit_must_react(param_name: str, on_value, off_value=None, *, n: int = 32):
     )
 
 
-@_XFAIL_240
 def test_isometry_weight_is_not_a_silent_noop():
     """isometry_weight=100.0 must produce a fit that visibly differs from
     isometry_weight=0.0.  NotImplementedError is no longer an accepted outcome
@@ -118,17 +112,14 @@ def test_isometry_weight_is_not_a_silent_noop():
     )
 
 
-@_XFAIL_240
 def test_ard_per_atom_is_not_a_silent_noop():
     _fit_must_react("ard_per_atom", on_value=False, off_value=True)
 
 
-@_XFAIL_240
 def test_block_orthogonality_weight_is_not_a_silent_noop():
     _fit_must_react("block_orthogonality_weight", on_value=100.0, off_value=0.0)
 
 
-@_XFAIL_240
 def test_decoder_feature_sparsity_groups_is_not_a_silent_noop():
     # The four-feature output (n=32, d=4) must be partitioned end-to-end;
     # MechanismSparsityPenalty requires every feature index in
@@ -140,7 +131,6 @@ def test_decoder_feature_sparsity_groups_is_not_a_silent_noop():
     )
 
 
-@_XFAIL_240
 def test_decoder_feature_sparsity_groups_produces_nontrivial_gradient():
     """The previous ``mechanism_sparsity_groups`` kwarg silently raised
     ``NotImplementedError`` — accepted by ``_fit_must_react`` as a principled
@@ -173,7 +163,6 @@ def test_topology_selector_is_not_an_accepted_kwarg():
         gamfit.sae_manifold_fit(X=X, **_baseline(), topology_selector=object())
 
 
-@_XFAIL_240
 def test_primitive_names_metadata_is_not_a_substitute_for_effect():
     """The original issue-#240 footgun: setting ``isometry_weight`` /
     ``block_orthogonality_weight`` flipped the ``primitive_names`` list but

@@ -16,20 +16,6 @@ gamfit = pytest.importorskip("gamfit")
 import gamfit._sae_manifold as sae
 
 
-# #1512 triage: the _CapturingRustModule mock in this file is incomplete vs the
-# refactored sae_manifold_fit FFI — it does not stub basis_with_jet and its
-# sae_manifold_fit_minimal rejects new keyword args (fisher_factors, ...), so
-# every test that drives a real facade fit through the mock fails (the
-# pure-descriptor tests that don't fit still pass). Rebuild the capturing mock
-# against the current FFI surface to re-enable.
-_XFAIL_RECENT = pytest.mark.xfail(
-    strict=True,
-    reason="#1512 triage: _CapturingRustModule mock incomplete vs refactored "
-    "sae_manifold_fit FFI (missing basis_with_jet, stale "
-    "sae_manifold_fit_minimal signature rejecting fisher_factors).",
-)
-
-
 def _toy_matrix(n: int = 12, p: int = 4) -> np.ndarray:
     grid = np.linspace(-1.0, 1.0, n, dtype=float)
     cols = [grid, grid**2, np.sin(np.pi * grid), np.cos(np.pi * grid)]
@@ -57,6 +43,27 @@ class _CapturingRustModule:
         ss_tot = float(np.sum((observed - observed.mean(axis=0, keepdims=True)) ** 2))
         return 1.0 - ss_res / max(ss_tot, 1.0e-12)
 
+    def periodic_basis_with_jet(self, t, n_harmonics):
+        x = np.asarray(t, dtype=float)
+        columns = [np.ones_like(x)]
+        jacobian_columns = [np.zeros_like(x)]
+        penalties = [0.0]
+        for harmonic in range(1, int(n_harmonics) + 1):
+            omega = 2.0 * np.pi * harmonic
+            columns.extend([np.cos(omega * x), np.sin(omega * x)])
+            jacobian_columns.extend([-omega * np.sin(omega * x), omega * np.cos(omega * x)])
+            penalties.extend([omega**4, omega**4])
+        phi = np.stack(columns, axis=1)
+        jet = np.stack(jacobian_columns, axis=1)[:, :, None]
+        penalty = np.diag(penalties)
+        return phi, jet, penalty
+
+    def basis_with_jet(self, kind, coords, params=None):
+        params = params or {}
+        n_harmonics = int(params.get("n_harmonics", 2))
+        t = np.asarray(coords, dtype=float).reshape(-1)
+        return self.periodic_basis_with_jet(t, n_harmonics)
+
     def sae_manifold_fit_minimal(
         self,
         z,
@@ -71,13 +78,14 @@ class _CapturingRustModule:
         smoothness,
         max_iter,
         learning_rate,
-        gumbel_schedule,
-        analytic_penalties,
         random_state,
         top_k,
-        initial_logits,
-        initial_coords,
-        jumprelu_threshold,
+        gumbel_schedule=None,
+        analytic_penalties=None,
+        initial_logits=None,
+        initial_coords=None,
+        jumprelu_threshold=0.0,
+        **_forward_compat_kwargs,
     ):
         z = np.asarray(z, dtype=float)
         k_atoms = len(atom_basis)
@@ -118,8 +126,10 @@ class _CapturingRustModule:
                 (1, dim),
             )
             decoder = np.full((3, p), 0.05 * float(atom_k + 1), dtype=float)
+            # Periodic shape bands carry a single 1-D phase coordinate column
+            # regardless of the atom's latent dim (from_payload's
+            # `_periodic_shape_band` requires width 1).
             band_coords = np.linspace(0.1, 0.9, 5, dtype=float)[:, None]
-            band_coords = np.tile(band_coords, (1, dim))
             band_mean = np.full((band_coords.shape[0], p), 0.1 * float(atom_k + 1))
             band_sd = np.full((band_coords.shape[0], p), 0.01 * float(atom_k + 1))
             atoms.append(
@@ -152,6 +162,7 @@ class _CapturingRustModule:
             "logits": logits,
             "fitted": np.zeros_like(z),
             "reml_score": -1.0,
+            "penalized_loss_score": -1.0,
             "chosen_k": k_atoms,
             "dispersion": 1.0,
             "oos_projection_top1": False,
@@ -191,10 +202,15 @@ def _captured_penalties(fake: _CapturingRustModule) -> list[dict[str, object]]:
     return json.loads(str(raw))
 
 
-@_XFAIL_RECENT
 def test_recent_penalty_knobs_emit_expected_analytic_descriptors(monkeypatch):
     fake = _CapturingRustModule()
     monkeypatch.setattr(sae, "rust_module", lambda: fake)
+    # The closed-form dense-periodic / disjoint-periodic shortcuts solve the fit
+    # without routing the analytic-penalty descriptors through the FFI, so disable
+    # them to observe the `analytic_penalties` payload that `sae_manifold_fit_minimal`
+    # receives.
+    monkeypatch.setattr(sae, "_fit_dense_periodic_ibp_lsq", lambda *a, **k: None)
+    monkeypatch.setattr(sae, "_fit_disjoint_periodic_top1", lambda *a, **k: None)
     x = _toy_matrix(n=14, p=4)
 
     fit = gamfit.sae_manifold_fit(
@@ -276,7 +292,6 @@ def test_recent_penalty_knobs_emit_expected_analytic_descriptors(monkeypatch):
         ),
     ],
 )
-@_XFAIL_RECENT
 def test_gate_sparsity_variants_are_accepted_and_described(
     monkeypatch,
     gate_sparsity,
@@ -318,7 +333,6 @@ def test_gate_sparsity_variants_are_accepted_and_described(
         ("jumprelu", "jumprelu"),
     ],
 )
-@_XFAIL_RECENT
 def test_assignment_kinds_run_through_facade(monkeypatch, assignment, expected_kind):
     fake = _CapturingRustModule()
     monkeypatch.setattr(sae, "rust_module", lambda: fake)
@@ -345,7 +359,6 @@ def test_assignment_kinds_run_through_facade(monkeypatch, assignment, expected_k
     assert np.all(np.isfinite(fit.assignments))
 
 
-@_XFAIL_RECENT
 def test_sae_curvature_report_is_user_reachable_and_round_trips(monkeypatch):
     fake = _CapturingRustModule()
     monkeypatch.setattr(sae, "rust_module", lambda: fake)
@@ -442,7 +455,6 @@ def _multi_atom_surface_fit(x: np.ndarray, monkeypatch) -> gamfit.ManifoldSAE:
     )
 
 
-@_XFAIL_RECENT
 def test_multi_atom_fresh_fit_populates_uncertainty_and_typical_range_api(monkeypatch):
     x = _two_atom_circle_data()
     fit = _multi_atom_surface_fit(x, monkeypatch)

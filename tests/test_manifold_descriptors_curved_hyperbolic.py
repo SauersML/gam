@@ -1,6 +1,6 @@
 """Constructibility + primitive-correctness tests for the curved / hyperbolic
 manifold descriptors newly surfaced in :mod:`gamfit.manifolds`:
-``Grassmann``, ``Stiefel``, ``Spd``, ``Poincare`` (and its ``Hyperbolic`` alias).
+``Grassmann``, ``Stiefel``, ``Spd``, ``Poincare`` (the hyperbolic manifold).
 
 These descriptors expose GEOMETRY PRIMITIVES ONLY (exp / log / metric /
 distance / dimension), not fittable latent smooths. The tests here lock in:
@@ -72,21 +72,14 @@ def test_spd_constructible_and_dimensions():
         manifolds.Spd(n=0)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#1512 triage: gamfit.manifolds exposes Poincare but NOT a "
-    "`Hyperbolic` alias (AttributeError on manifolds.Hyperbolic), so the "
-    "`manifolds.Hyperbolic is manifolds.Poincare` assertion fails. The other "
-    "Poincare construction/geometry tests in this file pass. Add the documented "
-    "Hyperbolic alias (or drop the alias assertion) to re-enable.",
-)
 def test_poincare_constructible_and_dimensions():
     m = manifolds.Poincare(dim=3)
     assert m.dimension == 3
     assert m.ambient_dim == 3
     assert "Poincare" in repr(m)
-    # Hyperbolic alias is the same class.
-    assert manifolds.Hyperbolic is manifolds.Poincare
+    # Poincare IS the hyperbolic manifold: it defaults to (and requires)
+    # negative curvature.
+    assert float(m.curvature) < 0.0
     with pytest.raises(ValueError):
         manifolds.Poincare(dim=2, curvature=0.0)  # must be c < 0
     with pytest.raises(ValueError):
