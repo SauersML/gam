@@ -192,7 +192,7 @@ fn first_whole_rho_borrow_after(region: &str, start: usize) -> Option<usize> {
 #[test]
 fn sae_manifold_fit_inner_does_not_borrow_rho_after_partial_move() {
     let manifest = env!("CARGO_MANIFEST_DIR");
-    let path = Path::new(manifest).join("crates/gam-pyffi/src/latent_basis_and_sae_ffi.rs");
+    let path = Path::new(manifest).join("crates/gam-pyffi/src/latent/latent_basis_and_sae_ffi.rs");
     let raw =
         fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
     let code = strip_comments(&raw);
