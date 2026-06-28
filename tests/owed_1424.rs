@@ -24,12 +24,20 @@
 //! ## What this guards
 //!
 //! At fast basis scope (no end-to-end fit): a high-dimensional (`d = 6`) hybrid
-//! Duchon–Matérn smooth (`length_scale = Some`, `power = 1`, constants-only
-//! null space → `p = 1`, so `2p = 2 < 6` and `s = 1`: the catastrophic-
-//! cancellation regime) builds successfully and its realized primary penalty is
-//! PSD (`λmin ≥ −tol`) while remaining a non-trivial roughness penalty
-//! (`λmax > 0`). The pre-fix alternating partial-fraction sum produced large
-//! negative eigenvalues here.
+//! Duchon–Matérn smooth (`length_scale = Some`, `power = 3` → `s = 3`,
+//! constants-only null space → `p = 1`) builds successfully and its realized
+//! primary penalty is PSD (`λmin ≥ −tol`) while remaining a non-trivial
+//! roughness penalty (`λmax > 0`). The pre-fix alternating partial-fraction sum
+//! produced large negative eigenvalues here.
+//!
+//! The catastrophic-cancellation regime is exactly `2p < d < 2(p+s)`: the
+//! kernel must EXIST pointwise (`2(p+s) > d`, here `8 > 6`, so the radial
+//! Fourier integral converges at infinity), while the stable single-integral
+//! reduction must apply (`2p < d`, here `2 < 6`, so the `w → 0` endpoint is
+//! integrable and `b = p + s − d/2 = 1 > 0`). Picking `s = 1` here would give
+//! `2(p+s) = 4 < 6`: the kernel does not exist (the validator correctly rejects
+//! it), so it cannot probe the cancellation path — `s ≥ 3` is the smallest
+//! power that keeps `d = 6` inside the genuine high-dimensional blend.
 //!
 //! Reference-as-truth: PSD-ness is an intrinsic requirement of a roughness
 //! penalty, asserted on gam's own realized penalty — never against another
@@ -137,12 +145,14 @@ fn high_dim_hybrid_duchon_matern_penalty_is_psd_1424() {
         center_strategy: CenterStrategy::UserProvided(data.clone()),
         periodic: None,
         // Hybrid Matérn blend: length_scale = Some triggers the
-        // partial-fraction / stable-integral kernel; power = 1 → s = 1.
+        // partial-fraction / stable-integral kernel; power = 3 → s = 3.
         length_scale: Some(0.75),
-        power: 1.0,
-        // Constants-only null space → p = 1, so 2p = 2 < d = 6: the
-        // `duchon_hybrid_stable_integral_applies` (s ≥ 1 && 2p < d)
-        // catastrophic-cancellation regime.
+        power: 3.0,
+        // Constants-only null space → p = 1. With d = 6 this is the
+        // catastrophic-cancellation regime 2p < d < 2(p+s) (2 < 6 < 8):
+        // `duchon_hybrid_stable_integral_applies` (s ≥ 1 && 2p < d) holds and
+        // the kernel exists pointwise (2(p+s) > d), so the stable single
+        // integral (b = p + s − d/2 = 1 > 0) replaces the cancelling sum.
         nullspace_order: DuchonNullspaceOrder::Zero,
         identifiability: Default::default(),
         aniso_log_scales: None,
