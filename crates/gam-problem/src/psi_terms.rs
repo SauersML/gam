@@ -135,3 +135,42 @@ pub trait ExactNewtonJointPsiWorkspace: Send + Sync {
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<DriftDerivResult>, String>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zeros_has_zero_objective() {
+        let t = ExactNewtonJointPsiTerms::zeros(3);
+        assert_eq!(t.objective_psi, 0.0);
+    }
+
+    #[test]
+    fn zeros_has_correct_score_dimension() {
+        let t = ExactNewtonJointPsiTerms::zeros(5);
+        assert_eq!(t.score_psi.len(), 5);
+        assert!(t.score_psi.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn zeros_has_square_hessian_of_correct_size() {
+        let t = ExactNewtonJointPsiTerms::zeros(4);
+        assert_eq!(t.hessian_psi.nrows(), 4);
+        assert_eq!(t.hessian_psi.ncols(), 4);
+        assert!(t.hessian_psi.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn zeros_has_no_operator() {
+        let t = ExactNewtonJointPsiTerms::zeros(2);
+        assert!(t.hessian_psi_operator.is_none());
+    }
+
+    #[test]
+    fn zeros_with_dimension_zero_does_not_panic() {
+        let t = ExactNewtonJointPsiTerms::zeros(0);
+        assert_eq!(t.score_psi.len(), 0);
+        assert_eq!(t.hessian_psi.nrows(), 0);
+    }
+}

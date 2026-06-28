@@ -104,3 +104,76 @@ impl std::fmt::Display for MapUniquenessError {
         write!(f, "{}", self.message)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── MapUniquenessError ────────────────────────────────────────────────────
+
+    #[test]
+    fn map_uniqueness_error_display_uses_message_field() {
+        let err = MapUniquenessError {
+            message: "null direction in block_x".to_string(),
+            dominant_block: "block_x".to_string(),
+            null_direction_index: 2,
+            penalty_quadratic_form: 1e-18,
+        };
+        assert_eq!(err.to_string(), "null direction in block_x");
+    }
+
+    #[test]
+    fn map_uniqueness_error_fields_accessible() {
+        let err = MapUniquenessError {
+            message: "msg".to_string(),
+            dominant_block: "blk".to_string(),
+            null_direction_index: 5,
+            penalty_quadratic_form: 0.0,
+        };
+        assert_eq!(err.dominant_block, "blk");
+        assert_eq!(err.null_direction_index, 5);
+        assert_eq!(err.penalty_quadratic_form, 0.0);
+    }
+
+    // ── IdentifiabilityAudit ──────────────────────────────────────────────────
+
+    #[test]
+    fn identifiability_audit_fatal_field_readable() {
+        let audit = IdentifiabilityAudit {
+            blocks: vec![],
+            aliased_pairs: vec![],
+            dropped_columns: vec![],
+            fatal: true,
+            summary: "summary text".to_string(),
+        };
+        assert!(audit.fatal);
+        assert_eq!(audit.summary, "summary text");
+    }
+
+    #[test]
+    fn block_identity_fields_accessible() {
+        let bi = BlockIdentity {
+            block_name: "smooth_1".to_string(),
+            original_dim: 5,
+            effective_dim: 4,
+            design_range_rank: 4,
+        };
+        assert_eq!(bi.block_name, "smooth_1");
+        assert_eq!(bi.original_dim, 5);
+        assert_eq!(bi.effective_dim, 4);
+    }
+
+    #[test]
+    fn aliased_pair_overlap_in_range() {
+        let pair = AliasedPair {
+            block_a: "a".to_string(),
+            block_b: "b".to_string(),
+            direction_a: 0,
+            direction_b: 1,
+            overlap: 0.95,
+            bias_shift: 0.0,
+        };
+        assert!(pair.overlap >= 0.0 && pair.overlap <= 1.0);
+        assert_eq!(pair.block_a, "a");
+    }
+}
