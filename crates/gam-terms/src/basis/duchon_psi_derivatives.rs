@@ -677,7 +677,12 @@ pub(crate) fn duchon_matern_block_taylor_r2j_triplet(
         }
     } else {
         let nu_abs = nu.abs();
-        let l = (2.0 * nu_abs - 1.0).round().max(0.0) as usize;
+        // |ν| = l + ½ ⇒ l = |ν| − ½. (The earlier `2|ν| − 1` form computed `2l`,
+        // not `l`: it is correct only at ν = ½, and for |ν| ≥ 3/2 it selected the
+        // K_{2|ν|−½} polynomial instead of K_{|ν|}, collapsing the Taylor
+        // coefficients — e.g. the r⁰ diagonal term of the ν = 3/2 block to 0,
+        // which broke the d=1 / power≥2 Duchon penalty diagonal — gam#1604.)
+        let l = (nu_abs - 0.5).round().max(0.0) as usize;
         let prefactor_const = (std::f64::consts::PI / 2.0).sqrt();
         let prefactor_exp = -0.5;
         let target = 2 * j;
@@ -807,7 +812,10 @@ pub(crate) fn duchon_matern_block_taylor_r2j_half_integer_nu(
     j: usize,
 ) -> (f64, f64) {
     let nu_abs = nu.abs();
-    let l = (2.0 * nu_abs - 1.0).round().max(0.0) as usize;
+    // |ν| = l + ½ ⇒ l = |ν| − ½. (The earlier `2|ν| − 1` form computed `2l`,
+    // not `l` — see the matching note in `duchon_matern_block_taylor_r2j_triplet`;
+    // gam#1604.)
+    let l = (nu_abs - 0.5).round().max(0.0) as usize;
     // Compute the polynomial coefficients C_i / (2κ)^i for each r-power.
     //
     // r^ν · K_{l+½}(κr) = √(π/(2κ)) · e^{−κr} · Σ_{i=0}^{l} C_i (2κ)^{−i} r^{ν−½−i}
