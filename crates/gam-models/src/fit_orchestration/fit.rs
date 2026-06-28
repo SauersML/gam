@@ -273,12 +273,28 @@ pub(crate) fn fit_standard_model(
     ) {
         Ok(solved) => solved,
         Err(e) => {
+            // The flexible/learnable link the formula asked for could not be
+            // fitted: the coupled link-wiggle joint Newton solve failed to
+            // certify convergence. Previously this arm silently `return
+            // Ok(result)` with the *no-wiggle baseline* (the large-smoothing
+            // limit), so a `link(type=flexible(...))` request returned a model
+            // bit-identical to the fixed base link, with no signal to the
+            // caller — the warp never engaged but the fit looked successful
+            // (#1596). Returning the baseline as if the request were honored is
+            // a silent contract violation. Surface the non-convergence LOUDLY
+            // (a real `Err` the caller sees), matching how the SAS / mixture
+            // adaptive-link paths now report startup-validation failures
+            // (#1571/#1572). The fit is NOT silently downgraded.
             log::warn!(
-                "[linkwiggle] binomial mean link-wiggle joint solve did not converge ({e}); \
-                 falling back to the no-wiggle baseline fit (the large-smoothing limit of the \
-                 penalized wiggle model, which contains it as a limiting case)"
+                "[linkwiggle] binomial mean link-wiggle joint solve did not converge ({e})"
             );
-            return Ok(result);
+            return Err(format!(
+                "flexible/learnable link requested via link(type=flexible(...)) / \
+                 linkwiggle(...), but the binomial mean link-wiggle joint solve did not \
+                 converge ({e}). The fit was NOT silently downgraded to the fixed base \
+                 link. Refit with a fixed link (e.g. logit/probit/cloglog) or adjust the \
+                 wiggle spec (linkwiggle(internal_knots=...)). See gam#1596."
+            ));
         }
     };
 
