@@ -577,3 +577,84 @@ pub(crate) fn fit_data_collapse_bar_is_data_derived_not_absolute_floor_1522() {
         terminal.floor
     );
 }
+
+/// The batched-GEMM fast encode (`amortized_encode_batch_fast`) — the manifold
+/// SAE's traditional-encoder-speed path — must produce the SAME latent coords as
+/// the per-row `nearest_chart` + `amortized_warm_start` distilled linear
+/// predictor. It is the same affine map `t̂ = (A₁/z)·x + (t_c − A₁·m₁)` per chart,
+/// just GEMM-batched over rows (one routing GEMM + argmin, one predictor GEMM per
+/// chart), so the speed mode is bit-faithful to the per-chart predictor — a
+/// traditional-encoder forward pass landing on the curved manifold charts. Run on
+/// the real OLMo l18 slice (256-chart torus) so multi-chart routing is exercised.
+#[test]
+pub(crate) fn fast_encode_matches_per_row_warm_start() {
+    let mani = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut path = mani.join("tests/data/olmo_l18_pca64_635.npy");
+    if !path.exists() {
+        path = mani.join("../../tests/data/olmo_l18_pca64_635.npy");
+    }
+    let z = read_npy_f32_2d(&path);
+    let n = z.nrows();
+    let k = 1usize;
+    let term = real_data_torus_seed_term(z.view(), k, 3);
+    let mut norm_bound = 0.0_f64;
+    for r in 0..n {
+        norm_bound = norm_bound.max(z.row(r).dot(&z.row(r)).sqrt());
+    }
+    let atlas = crate::encode::EncodeAtlas::build(
+        &term.atoms,
+        &vec![1.0_f64; k],
+        norm_bound,
+        crate::encode::AtlasConfig::default(),
+    )
+    .expect("atlas builds");
+    let atom = &term.atoms[0];
+    let amps = ndarray::Array1::<f64>::ones(n);
+    let evaluator = atom.basis_evaluator.as_ref().unwrap().clone();
+
+    // Reference: per-row nearest_chart routing + the distilled affine predictor.
+    let mut ref_coords = ndarray::Array2::<f64>::zeros((n, atom.latent_dim));
+    let mut ref_valid = vec![false; n];
+    for row in 0..n {
+        if let Some((cidx, _)) =
+            crate::encode::nearest_chart(&atlas.atoms[0], z.row(row), atom, evaluator.as_ref())
+        {
+            if let Some(t) = crate::encode::amortized_warm_start(
+                &atlas.atoms[0].charts[cidx],
+                z.row(row),
+                amps[row],
+            ) {
+                ref_coords.row_mut(row).assign(&t);
+                ref_valid[row] = true;
+            }
+        }
+    }
+
+    let (fast_coords, fast_valid) = atlas
+        .amortized_encode_batch_fast(atom, 0, z.view(), amps.view())
+        .expect("batched fast encode runs");
+
+    let mut max_diff = 0.0_f64;
+    for row in 0..n {
+        assert_eq!(
+            fast_valid[row], ref_valid[row],
+            "valid-mask mismatch at row {row} (routing/predictor disagreement)"
+        );
+        if ref_valid[row] {
+            for c in 0..atom.latent_dim {
+                max_diff = max_diff.max((fast_coords[[row, c]] - ref_coords[[row, c]]).abs());
+            }
+        }
+    }
+    assert!(
+        max_diff < 1.0e-12,
+        "batched fast-encode must match the per-row warm-start to 1e-12 (same affine \
+         map, GEMM-batched); max|Δcoord| = {max_diff:.3e}"
+    );
+    // Non-vacuity: the fixture must actually produce certified-predictor encodes.
+    assert!(
+        ref_valid.iter().filter(|&&v| v).count() > n / 2,
+        "fixture must produce valid encodes on most rows; got {}",
+        ref_valid.iter().filter(|&&v| v).count()
+    );
+}
