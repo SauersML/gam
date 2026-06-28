@@ -1397,3 +1397,182 @@ fn certified_encode_is_globally_sound_near_self_crossing() {
          the global min = {worst_global_excess:.5} (was ~0.08 with single-chart routing)"
     );
 }
+
+/// OUT-OF-SAMPLE generalization of the curved manifold atom. All prior EV numbers
+/// were in-sample (training reconstruction); the real test of an SAE is held-out
+/// reconstruction. Train a d=2 torus atom on the first 60% of OLMo l18 (alternating
+/// fast-encode ↔ ridge-refit), then reconstruct the held-out last 40% via the fast
+/// encode→decode, and compare to a flat affine d=2 baseline (train mean + top-2 PCA
+/// applied to the held-out rows). The split is CONTIGUOUS (leakage-safe for the
+/// autocorrelated activations — see project_sae_structure_harvest_contiguous_split).
+///
+/// Measured: curved in-sample EV ≈ 0.57 drops to OOS ≈ 0.22 (a real overfitting gap
+/// on the small 381-row train set with sequence drift), BUT the manifold advantage
+/// PERSISTS out-of-sample: curved OOS ≈ 0.22 vs flat affine OOS ≈ 0.11 (~+90%). The
+/// curvature captures GENERALIZABLE structure, not just train noise. This guards the
+/// out-of-sample manifold thesis: a regression that made the curved atom overfit to
+/// the point of losing its held-out edge over a flat code would trip it.
+#[test]
+fn curved_atom_generalizes_better_than_flat_out_of_sample() {
+    use gam_linalg::faer_ndarray::FaerEigh;
+    let mani = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut path = mani.join("tests/data/olmo_l18_pca64_635.npy");
+    if !path.exists() {
+        path = mani.join("../../tests/data/olmo_l18_pca64_635.npy");
+    }
+    let z = read_npy_f32_2d(&path);
+    let n = z.nrows();
+    let p = z.ncols();
+    let n_tr = (n * 6) / 10;
+    let z_tr = z.slice(s![..n_tr, ..]).to_owned();
+    let z_te = z.slice(s![n_tr.., ..]).to_owned();
+    let n_te = z_te.nrows();
+    let mut tot_tr = 0.0;
+    for r in 0..n_tr {
+        for c in 0..p {
+            tot_tr += z_tr[[r, c]] * z_tr[[r, c]];
+        }
+    }
+    let mut tot_te = 0.0;
+    for r in 0..n_te {
+        for c in 0..p {
+            tot_te += z_te[[r, c]] * z_te[[r, c]];
+        }
+    }
+    let mut mu_tr = ndarray::Array1::<f64>::zeros(p);
+    for r in 0..n_tr {
+        for c in 0..p {
+            mu_tr[c] += z_tr[[r, c]];
+        }
+    }
+    mu_tr.mapv_inplace(|v| v / n_tr as f64);
+
+    let evaluator = Arc::new(TorusHarmonicEvaluator::new(2, 3).unwrap());
+    let mut nb = 0.0_f64;
+    for r in 0..n_tr {
+        nb = nb.max(z_tr.row(r).dot(&z_tr.row(r)).sqrt());
+    }
+    for r in 0..n_te {
+        nb = nb.max(z_te.row(r).dot(&z_te.row(r)).sqrt());
+    }
+    let seed = sae_pca_seed_initial_coords(
+        z_tr.view(),
+        &vec![SaeAtomBasisKind::Periodic; 1],
+        &vec![2usize],
+    )
+    .unwrap();
+    let mut coords = seed.slice(s![0, .., 0..2]).to_owned();
+    let build = |coords: &Array2<f64>| -> SaeManifoldAtom {
+        let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+        let m = phi.ncols();
+        let mut xtx = fast_ata(&phi);
+        for i in 0..m {
+            xtx[[i, i]] += 1e-8;
+        }
+        let xtz = fast_atb(&phi, &z_tr.to_owned());
+        let dec = xtx.cholesky(Side::Lower).unwrap().solve_mat(&xtz);
+        SaeManifoldAtom::new("t", SaeAtomBasisKind::Periodic, 2, phi, jet, dec, Array2::eye(m))
+            .unwrap()
+            .with_basis_evaluator(evaluator.clone())
+    };
+    let amps_tr = ndarray::Array1::<f64>::ones(n_tr);
+    let mut atom = build(&coords);
+    for _ in 0..5 {
+        let atlas = crate::encode::EncodeAtlas::build(
+            std::slice::from_ref(&atom),
+            &[1.0],
+            nb,
+            crate::encode::AtlasConfig::default(),
+        )
+        .unwrap();
+        let (ec, v) = atlas
+            .amortized_encode_batch_fast(&atom, 0, z_tr.view(), amps_tr.view())
+            .unwrap();
+        for i in 0..n_tr {
+            if v[i] {
+                coords.row_mut(i).assign(&ec.row(i));
+            }
+        }
+        atom = build(&coords);
+    }
+    // In-sample EV.
+    let recon_tr = atom.basis_values.dot(&atom.decoder_coefficients);
+    let mut e_tr = 0.0;
+    for r in 0..n_tr {
+        for c in 0..p {
+            let d = recon_tr[[r, c]] - z_tr[[r, c]];
+            e_tr += d * d;
+        }
+    }
+    let ev_tr = 1.0 - e_tr / tot_tr;
+    // OOS curved EV.
+    let atlas = crate::encode::EncodeAtlas::build(
+        std::slice::from_ref(&atom),
+        &[1.0],
+        nb,
+        crate::encode::AtlasConfig::default(),
+    )
+    .unwrap();
+    let amps_te = ndarray::Array1::<f64>::ones(n_te);
+    let (recon_te, vmask) = atlas
+        .amortized_reconstruct_batch_fast(&atom, 0, z_te.view(), amps_te.view())
+        .unwrap();
+    let mut e_te = 0.0;
+    let mut nv = 0usize;
+    for r in 0..n_te {
+        if vmask[r] {
+            nv += 1;
+        }
+        for c in 0..p {
+            let d = recon_te[[r, c]] - z_te[[r, c]];
+            e_te += d * d;
+        }
+    }
+    let ev_te = 1.0 - e_te / tot_te;
+    // OOS flat affine d=2: train mean + top-2 train PCA applied to held-out rows.
+    let mut cen = z_tr.clone();
+    for r in 0..n_tr {
+        for c in 0..p {
+            cen[[r, c]] -= mu_tr[c];
+        }
+    }
+    let gram = fast_ata(&cen);
+    let (evals, evecs) = gram.eigh(faer::Side::Lower).unwrap();
+    let mut idx: Vec<usize> = (0..p).collect();
+    idx.sort_by(|&a, &b| evals[b].partial_cmp(&evals[a]).unwrap());
+    let mut basis = Array2::<f64>::zeros((p, 2));
+    for j in 0..2 {
+        for c in 0..p {
+            basis[[c, j]] = evecs[[c, idx[j]]];
+        }
+    }
+    let mut e_flat_te = 0.0;
+    for r in 0..n_te {
+        let mut coef = [0.0; 2];
+        for j in 0..2 {
+            for c in 0..p {
+                coef[j] += (z_te[[r, c]] - mu_tr[c]) * basis[[c, j]];
+            }
+        }
+        for c in 0..p {
+            let rec = mu_tr[c] + coef[0] * basis[[c, 0]] + coef[1] * basis[[c, 1]];
+            let d = rec - z_te[[r, c]];
+            e_flat_te += d * d;
+        }
+    }
+    let ev_flat_te = 1.0 - e_flat_te / tot_te;
+
+    assert_eq!(nv, n_te, "all held-out rows must reconstruct through the fast encode");
+    // The manifold advantage holds OUT-OF-SAMPLE: curved held-out EV beats the flat
+    // affine d=2 held-out EV by a clear margin (measured ~+90%).
+    assert!(
+        ev_te > 1.3 * ev_flat_te && ev_flat_te > 0.0,
+        "curved OOS EV must beat flat affine OOS EV by >30% (manifold generalizes); \
+         curved_oos={ev_te:.4} flat_oos={ev_flat_te:.4}"
+    );
+    // Sanity: in-sample exceeds OOS (the expected, documented overfitting gap).
+    assert!(
+        ev_tr > ev_te,
+        "in-sample EV should exceed OOS EV (overfitting gap); in={ev_tr:.4} oos={ev_te:.4}"
+    );
+}
