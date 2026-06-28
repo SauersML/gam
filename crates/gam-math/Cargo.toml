@@ -1,6 +1,6 @@
 [package]
 name = "gam-math"
-version = "0.3.128"
+version = "0.3.129"
 edition = "2024"
 rust-version = "1.93"
 description = "Hand-derived analytic-derivative jet/Taylor-tower machinery for the gam penalized-likelihood engine"

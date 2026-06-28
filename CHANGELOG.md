@@ -1,3 +1,62 @@
+## v0.3.129 — gam 0.3.129 / gamfit 0.1.231 (2026-06-28)
+
+crates.io + PyPI release of the fix + SAE-fast-forward wave landed since gam
+0.3.128 / gamfit 0.1.230. The most user-visible change is a prediction-contract
+fix: `design_matrix(data) @ coef` now reproduces the reported `linear_predictor`
+for every link (it was off by the bias-correction term for curved links). The
+`gamfit` Python API surface is unchanged.
+
+**Prediction contract (#1602)**
+- The wiggle-free posterior-mean predict path reported a *bias-corrected* linear
+  predictor `η̂_BC = X(β̂ + b̂)` (with `b̂ = H⁻¹S(β̂−μ)` the O(1/n) frequentist
+  bias-correction) while the exported coefficients are the penalized MLE / mode
+  `β̂`. That broke the documented "Raw design matrix" identity
+  `design_matrix(data) @ coef == linear_predictor` (and the `posterior.samples @
+  X.T` recipe) by exactly `X@b̂` — 1.5–4 % of the lp range for Poisson/Gamma log
+  and binomial logit/probit, while staying exact only for the identity link. It
+  now reports the uncorrected `η̂ = Xβ̂`, restoring the identity for all links and
+  matching the plug-in / link-wiggle sibling paths.
+
+**SAE manifold solver (#1033)**
+- Frames-engaged SAE assembly (`build_framed_device_sae_data`, the decoder-rank <
+  p large-output case) panicked at install: `set_device_sae_pcg_data`
+  unconditionally asserted the per-row `a_phi`/`local_jac` slabs had length
+  `rows.len()`, but the framed builder intentionally leaves them empty (the
+  per-row cross block rides `frame.frame_blocks`). The length asserts are now
+  gated on the non-framed path, so a real OLMo-shaped fit runs to completion. A
+  regression test pins both the install (no panic) and the consumer contract (the
+  CPU-resident reduced-Schur factor declines on empty slabs → generic matvec).
+
+**SAE manifold structure search**
+- `fold_atom_into`'s mass-preserving logsumexp combine produced NaN when fusing
+  two zero-mass (`−∞`-logit) atoms (`−∞ − (−∞) = NaN`), poisoning the entire
+  logits row and silently corrupting routing for every atom on it. Two zero-mass
+  atoms have combined mass zero (logit `−∞`); that is now returned directly.
+
+**SAE manifold fast forward (new public API)**
+- A traditional-SAE-shaped GEMM forward pass for the manifold SAE:
+  `EncodeAtlas::amortized_encode_batch_fast` / `amortized_reconstruct_batch_fast`
+  (single atom) and the whole-dictionary LSH-routed
+  `amortized_encode_with_index_fast` / `amortized_reconstruct_with_index_fast`.
+  These run the routing + distilled affine predictor + curved-basis decode as
+  batched matrix products (≈ a flat encoder's `W·x` throughput, the only extra
+  cost the one batched basis eval), and were measured bit-faithful to the per-row
+  predictor and accuracy-parity with the certified Newton solve. Degenerate rows
+  (no evaluator / singular Gauss–Newton block / non-finite amplitude / no LSH
+  proposal) are zeroed and flagged in a returned valid-mask — never a silent
+  wrong encode/decode. The certified `*_encode_*` paths remain the accuracy mode.
+
+**Testing & build**
+- `cargo test -p gam-terms --lib` builds again (607 errors → 0, #1601): the
+  #1521 carve left basis/smooth test fixtures referencing the pre-carve monolith;
+  the basis fixtures are repointed at `gam-linalg` and restored, and the three
+  smooth fixtures (which reach `gam-solve`/`gam-models`, below `gam-terms` in the
+  dependency order) are set aside in `tests/src_modules/smooths/` for relocation
+  to the top-level crate, tracked in the still-open #1601.
+- Broad new unit-test coverage across gam-config, gam-data, gam-geometry,
+  gam-gpu, gam-linalg, gam-math, gam-model-kernels, gam-models, gam-problem,
+  gam-report, gam-runtime, gam-sae and gam-inference.
+
 ## v0.3.128 — gam 0.3.128 / gamfit 0.1.230 (2026-06-28)
 
 crates.io + PyPI release of the open-issue fix wave landed since gam 0.3.126 /

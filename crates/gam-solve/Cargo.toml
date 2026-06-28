@@ -1,6 +1,6 @@
 [package]
 name = "gam-solve"
-version = "0.3.128"
+version = "0.3.129"
 edition = "2024"
 description = "REML/LAML outer solver and PIRLS inner engine for the gam penalized-likelihood engine"
 license = "AGPL-3.0-or-later"
@@ -14,16 +14,16 @@ warnings = "deny"
 [dependencies]
 dyn-stack = "0.13.2"
 faer = "0.24.0"
-gam-geometry = { path = "../gam-geometry", version = "=0.3.128" }
-gam-gpu = { path = "../gam-gpu", version = "=0.3.128" }
-gam-identifiability = { path = "../gam-identifiability", version = "=0.3.128" }
-gam-linalg = { path = "../gam-linalg", version = "=0.3.128" }
-gam-math = { path = "../gam-math", version = "=0.3.128" }
-gam-model-api = { path = "../gam-model-api", version = "=0.3.128" }
-gam-problem = { path = "../gam-problem", version = "=0.3.128" }
-gam-runtime = { path = "../gam-runtime", version = "=0.3.128" }
-gam-spec = { path = "../gam-spec", version = "=0.3.128" }
-gam-terms = { path = "../gam-terms", version = "=0.3.128" }
+gam-geometry = { path = "../gam-geometry", version = "=0.3.129" }
+gam-gpu = { path = "../gam-gpu", version = "=0.3.129" }
+gam-identifiability = { path = "../gam-identifiability", version = "=0.3.129" }
+gam-linalg = { path = "../gam-linalg", version = "=0.3.129" }
+gam-math = { path = "../gam-math", version = "=0.3.129" }
+gam-model-api = { path = "../gam-model-api", version = "=0.3.129" }
+gam-problem = { path = "../gam-problem", version = "=0.3.129" }
+gam-runtime = { path = "../gam-runtime", version = "=0.3.129" }
+gam-spec = { path = "../gam-spec", version = "=0.3.129" }
+gam-terms = { path = "../gam-terms", version = "=0.3.129" }
 log = "0.4.29"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 opt = "0.5.2"
@@ -37,7 +37,7 @@ cudarc = { version = "0.19.6", default-features = false, features = ["std", "dri
 
 [dev-dependencies]
 approx = "0.5.1"
-gam-test-support = { path = "../gam-test-support", version = "=0.3.128" }
+gam-test-support = { path = "../gam-test-support", version = "=0.3.129" }
 # Test-only utilities used by the in-crate `#[cfg(test)]` suites carved out of
 # the root `gam` crate (#1521): `num-dual` for the autodiff jet cross-checks in
 # `reml::objective` tests, `rand` for deterministic synthetic designs, and
