@@ -61,3 +61,155 @@ pub fn joint_coupled_operator_aware_hessian_cost(n: u64, specs: &[ParameterBlock
         joint_coupled_coefficient_hessian_cost(n, specs),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::custom_family::ParameterBlockSpec;
+    use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix};
+    use ndarray::Array2;
+
+    /// The gate predicate `use_joint_matrix_free_path` fires when `p_total >= 512`,
+    /// or `n >= 50_000 && p_total >= 128`, or `p_total >= 128 && n*p_total >= 4_000_000`.
+    /// These constants are reproduced as anchors so the tests document the contract
+    /// the gate enforces; if the gate is retuned the asserted boundaries below break.
+    const MIN_DIM: u64 = 512;
+    const MIN_ROWS: u64 = 50_000;
+    const MIN_DIM_AT_LARGE_N: u64 = 128;
+
+    fn spec_with_ncols(p: usize) -> ParameterBlockSpec {
+        ParameterBlockSpec {
+            design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::<f64>::zeros((1, p)))),
+            ..ParameterBlockSpec::defaults()
+        }
+    }
+
+    #[test]
+    fn operator_aware_picks_dense_for_small_problem() {
+        // Small (p_total, n): gate does not fire -> dense_cost is returned.
+        let p = 4;
+        let n = 100;
+        let mf = 11;
+        let dense = 22;
+        assert!(!use_joint_matrix_free_path(p as usize, n as usize));
+        assert_eq!(operator_aware_hessian_cost(p, n, mf, dense), dense);
+    }
+
+    #[test]
+    fn operator_aware_picks_matrix_free_for_wide_problem() {
+        // p_total >= MIN_DIM (512) forces the matrix-free branch regardless of n.
+        let p = MIN_DIM;
+        let n = 1;
+        let mf = 11;
+        let dense = 22;
+        assert!(use_joint_matrix_free_path(p as usize, n as usize));
+        assert_eq!(operator_aware_hessian_cost(p, n, mf, dense), mf);
+    }
+
+    #[test]
+    fn operator_aware_branch_is_exactly_the_gate() {
+        // The function is precisely "if gate then mf else dense": exercise a grid
+        // of (p, n) and confirm the returned value tracks the predicate exactly.
+        let mf = 7;
+        let dense = 99;
+        for &p in &[1u64, 64, 128, 256, 511, 512, 1024] {
+            for &n in &[1u64, 100, 49_999, 50_000, 100_000] {
+                let expected = if use_joint_matrix_free_path(p as usize, n as usize) {
+                    mf
+                } else {
+                    dense
+                };
+                assert_eq!(
+                    operator_aware_hessian_cost(p, n, mf, dense),
+                    expected,
+                    "p={p} n={n}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gate_large_n_branch_boundary() {
+        // n >= 50_000 && p >= 128 fires; just below either threshold does not
+        // (given p < 512 and n*p < 4_000_000 so the other two clauses stay off).
+        let mf = 1;
+        let dense = 2;
+        // p just below 128 with large n: off.
+        assert_eq!(
+            operator_aware_hessian_cost(MIN_DIM_AT_LARGE_N - 1, MIN_ROWS, mf, dense),
+            dense
+        );
+        // p == 128, n = 30_000: large-n clause off (n < 50_000), linear-work clause
+        // off (n*p = 3_840_000 < 4_000_000), wide clause off (p < 512) -> dense.
+        assert!(MIN_DIM_AT_LARGE_N * 30_000 < 4_000_000);
+        assert_eq!(
+            operator_aware_hessian_cost(MIN_DIM_AT_LARGE_N, 30_000, mf, dense),
+            dense
+        );
+        // p == 128, n == 50_000: on via the large-n clause.
+        assert_eq!(
+            operator_aware_hessian_cost(MIN_DIM_AT_LARGE_N, MIN_ROWS, mf, dense),
+            mf
+        );
+    }
+
+    #[test]
+    fn gate_linear_work_branch() {
+        // p >= 128 && n*p >= 4_000_000 fires even when n < 50_000.
+        // Use p = 200, n = 20_000 -> n*p = 4_000_000 >= threshold, n < 50_000.
+        let p = 200u64;
+        let n = 20_000u64;
+        assert!(p * n >= 4_000_000);
+        assert!(n < MIN_ROWS);
+        assert!(p < MIN_DIM);
+        assert!(use_joint_matrix_free_path(p as usize, n as usize));
+        assert_eq!(operator_aware_hessian_cost(p, n, 5, 6), 5);
+    }
+
+    #[test]
+    fn joint_coupled_small_returns_dense_n_p_squared() {
+        // Small problem -> dense branch -> n * p_total^2, summed over block ncols.
+        let specs = [spec_with_ncols(3), spec_with_ncols(5)];
+        let n = 10u64;
+        let p_total = 8u64; // 3 + 5
+        assert!(!use_joint_matrix_free_path(p_total as usize, n as usize));
+        assert_eq!(
+            joint_coupled_operator_aware_hessian_cost(n, &specs),
+            n * p_total * p_total
+        );
+    }
+
+    #[test]
+    fn joint_coupled_wide_returns_matrix_free_n_times_p() {
+        // p_total >= 512 -> matrix-free branch -> n * p_total.
+        let specs = [spec_with_ncols(300), spec_with_ncols(300)];
+        let n = 4u64;
+        let p_total = 600u64;
+        assert!(use_joint_matrix_free_path(p_total as usize, n as usize));
+        assert_eq!(
+            joint_coupled_operator_aware_hessian_cost(n, &specs),
+            n * p_total
+        );
+    }
+
+    #[test]
+    fn joint_coupled_empty_specs_is_zero() {
+        // No blocks => p_total == 0 => both candidate costs are 0.
+        let specs: [ParameterBlockSpec; 0] = [];
+        assert_eq!(joint_coupled_operator_aware_hessian_cost(1234, &specs), 0);
+    }
+
+    #[test]
+    fn joint_coupled_p_total_sums_block_ncols() {
+        // The dense cost must reflect the summed ncols across all blocks, not a
+        // single block: three blocks of 2 columns => p_total = 6.
+        let specs = [spec_with_ncols(2), spec_with_ncols(2), spec_with_ncols(2)];
+        let n = 7u64;
+        let p_total = 6u64;
+        assert!(!use_joint_matrix_free_path(p_total as usize, n as usize));
+        assert_eq!(
+            joint_coupled_operator_aware_hessian_cost(n, &specs),
+            n * p_total * p_total
+        );
+    }
+}
