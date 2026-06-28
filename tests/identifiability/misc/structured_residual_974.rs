@@ -325,9 +325,19 @@ fn structured_likelihood_removes_spurious_topology_preference() {
         }
     }
     let activity = Array1::<f64>::zeros(n);
-    let metric =
-        RowMetric::from_estimated_residual_covariance(residuals.view(), activity.view(), 2)
-            .expect("structured metric fits");
+    // `WhitenedStructured` has a single production site: the #974 factor-analytic
+    // fitter `StructuredResidualModel::fit(...).row_metric(...)` in `gam-solve`.
+    // `RowMetric` lives in the lower `gam-problem` crate, so an inherent
+    // `RowMetric::from_estimated_residual_covariance` constructor cannot reach the
+    // fitter (it would invert the crate dependency) and would duplicate that sole
+    // production site — fit through the documented API instead.
+    let model = StructuredResidualModel::fit(ResidualFactorInput {
+        residuals: residuals.view(),
+        activity: activity.view(),
+        max_factor_rank: 2,
+    })
+    .expect("structured covariance fits");
+    let metric = model.row_metric(n).expect("structured metric builds");
     assert!(
         metric.whitens_likelihood(),
         "the fitted structured covariance must produce a likelihood-whitening metric"

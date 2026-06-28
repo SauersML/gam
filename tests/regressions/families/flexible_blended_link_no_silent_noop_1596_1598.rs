@@ -22,11 +22,6 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Uniform};
 
-/// Φ(x): standard normal CDF via erf.
-fn norm_cdf(x: f64) -> f64 {
-    0.5 * (1.0 + libm::erf(x / std::f64::consts::SQRT_2))
-}
-
 fn encode(x: &[f64], y: &[f64]) -> gam::inference::data::EncodedDataset {
     let headers: Vec<String> = ["y", "x"].into_iter().map(String::from).collect();
     let rows: Vec<StringRecord> = (0..x.len())

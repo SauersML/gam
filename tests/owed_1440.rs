@@ -38,7 +38,7 @@
 //! per-line-marker hole or empty the allowlist while leaving production FD in the
 //! tree.
 
-const SCANNER_SRC: &str = include_str!("autodiff/misc/no_production_finite_differences.rs");
+const SCANNER_SRC: &str = include_str!("no_production_finite_differences.rs");
 
 /// The confinement guard test — the core #1440 invariant — must exist and must
 /// flag non-allowlisted files that use `fd-ok` markers.
@@ -88,9 +88,9 @@ fn scanner_keeps_a_tracked_allowlist_constant() {
 #[test]
 fn known_sanctioned_fd_sites_stay_enumerated() {
     for site in [
-        "solver/pirls/reweight.rs", // geodesic-acceleration curvature probe
-        "terms/sae/chart_canonicalization.rs", // SAE sphere-boost GN chart Jacobian
-        "solver/rho_optimizer/fd_audit.rs", // FD-audit oracle (diagnostic only)
+        "crates/gam-solve/src/pirls/reweight.rs", // geodesic-acceleration curvature probe
+        "crates/gam-sae/src/chart_canonicalization.rs", // SAE sphere-boost GN chart Jacobian
+        "crates/gam-solve/src/rho_optimizer/fd_audit.rs", // FD-audit oracle (diagnostic only)
     ] {
         assert!(
             SCANNER_SRC.contains(site),
