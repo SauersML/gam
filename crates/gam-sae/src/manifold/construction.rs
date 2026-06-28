@@ -3050,8 +3050,20 @@ impl SaeManifoldTerm {
         // oversubscription.
         let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
         let row_data_fit =
-            |row: usize, g_buf: &mut [f64], fitted_row: &mut [f64]| -> Result<f64, String> {
-                let a = self.assignment.try_assignments_row_for_rho(row, rho)?;
+            |row: usize,
+             g_buf: &mut [f64],
+             fitted_row: &mut [f64],
+             assign_buf: &mut [f64]|
+             -> Result<f64, String> {
+                // #1557 — fill the per-atom assignment row into reused per-worker
+                // scratch via the `_into` twin instead of heap-allocating a fresh
+                // `Array1` per row per loss eval. Bit-identical to the allocating
+                // `try_assignments_row_for_rho` (same arithmetic, same order); this
+                // loss reruns every Armijo halving × inner Newton iter × outer ρ
+                // eval, so the per-row K-sized allocation was a hot-path churn.
+                self.assignment
+                    .try_assignments_row_for_rho_into(row, rho, assign_buf)?;
+                let a = &*assign_buf;
                 for slot in fitted_row.iter_mut() {
                     *slot = 0.0;
                 }
@@ -3089,15 +3101,15 @@ impl SaeManifoldTerm {
                 .into_par_iter()
                 .chunks(CHUNK)
                 .map_init(
-                    || (vec![0.0_f64; p], vec![0.0_f64; p]),
-                    |(g_buf, fitted_row), idxs| {
+                    || (vec![0.0_f64; p], vec![0.0_f64; p], vec![0.0_f64; k_atoms]),
+                    |(g_buf, fitted_row, assign_buf), idxs| {
                         // #1557 — pin any faer GEMM reached from this row-parallel
                         // data-fit chunk to `Par::Seq` (no nested Rayon re-fan); the
                         // per-row reductions are tiny, so the result is bit-identical.
                         with_nested_parallel(|| {
                             let mut acc = 0.0_f64;
                             for row in idxs {
-                                acc += row_data_fit(row, g_buf, fitted_row)?;
+                                acc += row_data_fit(row, g_buf, fitted_row, assign_buf)?;
                             }
                             Ok(acc)
                         })
@@ -3112,9 +3124,10 @@ impl SaeManifoldTerm {
         } else {
             let mut g_buf = vec![0.0_f64; p];
             let mut fitted_row = vec![0.0_f64; p];
+            let mut assign_buf = vec![0.0_f64; k_atoms];
             let mut total = 0.0_f64;
             for row in 0..n {
-                total += row_data_fit(row, &mut g_buf, &mut fitted_row)?;
+                total += row_data_fit(row, &mut g_buf, &mut fitted_row, &mut assign_buf)?;
             }
             total
         };
