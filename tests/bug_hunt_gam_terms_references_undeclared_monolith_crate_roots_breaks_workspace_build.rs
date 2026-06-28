@@ -107,6 +107,66 @@ fn identifiers(src: &str) -> impl Iterator<Item = String> + '_ {
     })
 }
 
+/// Replace `//` line comments, `/* … */` block comments, and string-literal
+/// bodies with spaces (newlines preserved). A `crate::solver::…` written in a
+/// doc comment or a string is prose, not a path the compiler resolves, so it
+/// cannot make the crate fail to build — the invariant this test pins. Scanning
+/// the raw text instead false-flagged such prose (e.g. a `//! crate::families`
+/// design note), reporting a clean, compiling crate as broken. Mirror the
+/// comment/string stripping the sibling scanner tests already apply.
+fn strip_comments_and_strings(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        // Block comment.
+        if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            out.push_str("  ");
+            i += 2;
+            while i < bytes.len() && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/')) {
+                out.push(if bytes[i] == b'\n' { '\n' } else { ' ' });
+                i += 1;
+            }
+            if i < bytes.len() {
+                out.push_str("  ");
+                i += 2;
+            }
+            continue;
+        }
+        // Line comment.
+        if b == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                out.push(' ');
+                i += 1;
+            }
+            continue;
+        }
+        // String literal (with backslash escapes).
+        if b == b'"' {
+            out.push(' ');
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'"' {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    out.push_str("  ");
+                    i += 2;
+                    continue;
+                }
+                out.push(if bytes[i] == b'\n' { '\n' } else { ' ' });
+                i += 1;
+            }
+            if i < bytes.len() {
+                out.push(' ');
+                i += 1;
+            }
+            continue;
+        }
+        out.push(b as char);
+        i += 1;
+    }
+    out
+}
+
 /// First path segment of every `crate::<seg>` occurrence in `src`.
 fn crate_root_refs(src: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -179,7 +239,7 @@ fn gam_terms_only_references_crate_roots_it_provides() {
         }
         let src = fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-        for root in crate_root_refs(&src) {
+        for root in crate_root_refs(&strip_comments_and_strings(&src)) {
             if !provided.contains(&root) {
                 undeclared.entry(root).or_insert_with(|| path.clone());
             }
