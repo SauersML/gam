@@ -258,6 +258,19 @@ impl<const K: usize> Tower4<K> {
         out
     }
 
+    /// Ref-taking elementwise sum, the by-ref twin of the `std::ops::Add`
+    /// operator (which consumes by value). Mirrors the inherent `mul`/`scale`
+    /// API so a chain like `a.mul(&b).add(&c)` reads uniformly without moving
+    /// out of the borrowed operands.
+    pub fn add(&self, o: &Self) -> Self {
+        *self + *o
+    }
+
+    /// Ref-taking elementwise difference, the by-ref twin of `std::ops::Sub`.
+    pub fn sub(&self, o: &Self) -> Self {
+        *self + o.scale(-1.0)
+    }
+
     /// Exact multivariate Faà di Bruno composition `f ∘ self`.
     ///
     /// `d = [f(u), f′(u), f″(u), f‴(u), f⁗(u)]` evaluated at `u = self.v` —
@@ -946,6 +959,19 @@ impl<const K: usize> Tower3<K> {
             }
         }
         out
+    }
+
+    /// Ref-taking elementwise sum, the by-ref twin of the `std::ops::Add`
+    /// operator (which consumes by value). Mirrors the inherent `mul`/`scale`
+    /// API so a chain like `a.mul(&b).add(&c)` reads uniformly without moving
+    /// out of the borrowed operands.
+    pub fn add(&self, o: &Self) -> Self {
+        *self + *o
+    }
+
+    /// Ref-taking elementwise difference, the by-ref twin of `std::ops::Sub`.
+    pub fn sub(&self, o: &Self) -> Self {
+        *self + o.scale(-1.0)
     }
 
     /// Exact (order ≤ 3) multivariate Faà di Bruno composition `f ∘ self`.
