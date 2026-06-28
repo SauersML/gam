@@ -154,3 +154,109 @@ impl std::fmt::Display for MonotoneRootError {
 }
 
 impl std::error::Error for MonotoneRootError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eval_failed_shows_source() {
+        let err = MonotoneRootError::EvalFailed {
+            label: "test".to_string(),
+            a: 1.0,
+            source: "inner error msg".to_string(),
+        };
+        assert_eq!(err.to_string(), "inner error msg");
+    }
+
+    #[test]
+    fn non_finite_eval_shows_label_and_a() {
+        let err = MonotoneRootError::NonFiniteEval {
+            label: "myroot".to_string(),
+            a: 3.5,
+            f: f64::NAN,
+            fp: 0.0,
+            fpp: 0.0,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("myroot"), "message: {msg}");
+        assert!(msg.contains("3.5") || msg.contains("a=3"), "message: {msg}");
+    }
+
+    #[test]
+    fn degenerate_derivative_shows_label_and_a() {
+        let err = MonotoneRootError::DegenerateDerivative {
+            label: "solver".to_string(),
+            a: -1.0,
+            fp: 0.0,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("solver"), "message: {msg}");
+        assert!(msg.to_lowercase().contains("derivative") || msg.contains("zero"), "message: {msg}");
+    }
+
+    #[test]
+    fn bracketing_exhausted_default_shows_a_lo_and_a_hi() {
+        let err = MonotoneRootError::BracketingExhausted {
+            label: "mysolve".to_string(),
+            iters: 10,
+            a_lo: -1.0,
+            a_hi: 2.0,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("mysolve"), "message: {msg}");
+        assert!(msg.contains("-1") && msg.contains("2"), "message: {msg}");
+    }
+
+    #[test]
+    fn analytic_bracket_invalid_factory_shows_real_label() {
+        let err = MonotoneRootError::analytic_bracket_invalid("myfunc", 0.5, 1.5);
+        let msg = err.to_string();
+        assert!(msg.contains("myfunc"), "message: {msg}");
+        assert!(msg.contains("invalid") || msg.contains("bracket"), "message: {msg}");
+    }
+
+    #[test]
+    fn analytic_bracket_no_straddle_factory_shows_f_values() {
+        let err = MonotoneRootError::analytic_bracket_no_straddle("myfunc", 0.1, 0.2);
+        let msg = err.to_string();
+        assert!(msg.contains("myfunc"), "message: {msg}");
+        assert!(msg.to_lowercase().contains("straddle") || msg.contains("f_lo"), "message: {msg}");
+    }
+
+    #[test]
+    fn search_exhausted_factory_shows_real_label() {
+        let err = MonotoneRootError::search_exhausted("myfunc", 1.0, 0.0);
+        let msg = err.to_string();
+        assert!(msg.contains("myfunc"), "message: {msg}");
+        assert!(msg.to_lowercase().contains("bracket") || msg.contains("search"), "message: {msg}");
+    }
+
+    #[test]
+    fn refinement_did_not_converge_default_shows_residual() {
+        let err = MonotoneRootError::RefinementDidNotConverge {
+            label: "fit".to_string(),
+            iters: 50,
+            last_residual: 1.23e-4,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("fit"), "message: {msg}");
+        assert!(msg.to_lowercase().contains("converge"), "message: {msg}");
+    }
+
+    #[test]
+    fn exact_root_degenerate_factory_shows_real_label() {
+        let err = MonotoneRootError::exact_root_degenerate("myroot", 0.75);
+        let msg = err.to_string();
+        assert!(msg.contains("myroot"), "message: {msg}");
+        assert!(msg.contains("0.75") || msg.contains("a=0"), "message: {msg}");
+    }
+
+    #[test]
+    fn converged_root_degenerate_factory_shows_real_label() {
+        let err = MonotoneRootError::converged_root_degenerate("conv_root", 2.0);
+        let msg = err.to_string();
+        assert!(msg.contains("conv_root"), "message: {msg}");
+        assert!(msg.contains("2.0") || msg.contains("a=2"), "message: {msg}");
+    }
+}

@@ -148,3 +148,67 @@ pub enum BasisError {
     #[error("{0}")]
     Other(String),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_degree_mentions_degree_in_message() {
+        let err = BasisError::InvalidDegree(0);
+        let msg = err.to_string();
+        assert!(msg.contains("0"), "expected degree in message, got: {msg}");
+        assert!(msg.to_lowercase().contains("degree"));
+    }
+
+    #[test]
+    fn invalid_range_mentions_start_and_end() {
+        let err = BasisError::InvalidRange(2.5, 1.0);
+        let msg = err.to_string();
+        assert!(msg.contains("2.5") || msg.contains("start"), "message: {msg}");
+    }
+
+    #[test]
+    fn degenerate_range_mentions_zero_width() {
+        let err = BasisError::DegenerateRange(4);
+        let msg = err.to_string().to_lowercase();
+        assert!(msg.contains("zero"), "message: {msg}");
+    }
+
+    #[test]
+    fn invalid_penalty_order_mentions_order_and_num_basis() {
+        let err = BasisError::InvalidPenaltyOrder { order: 5, num_basis: 3 };
+        let msg = err.to_string();
+        assert!(msg.contains("5") && msg.contains("3"), "message: {msg}");
+    }
+
+    #[test]
+    fn insufficient_knots_mentions_degree() {
+        let err = BasisError::InsufficientKnotsForDegree {
+            degree: 3,
+            required: 10,
+            provided: 5,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("3") && msg.contains("10") && msg.contains("5"), "message: {msg}");
+    }
+
+    #[test]
+    fn invalid_knot_vector_includes_reason() {
+        let err = BasisError::InvalidKnotVector("decreasing knots".to_string());
+        let msg = err.to_string();
+        assert!(msg.contains("decreasing knots"), "message: {msg}");
+    }
+
+    #[test]
+    fn invalid_input_passthrough() {
+        let err = BasisError::InvalidInput("bad value".to_string());
+        assert!(err.to_string().contains("bad value"));
+    }
+
+    #[test]
+    fn other_passthrough() {
+        let err = BasisError::Other("catch-all".to_string());
+        assert_eq!(err.to_string(), "catch-all");
+    }
+}

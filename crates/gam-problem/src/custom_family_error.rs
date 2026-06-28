@@ -61,3 +61,55 @@ impl From<CustomFamilyError> for String {
         value.to_string()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_input_display_contains_context_and_reason() {
+        let err = CustomFamilyError::InvalidInput {
+            context: "my_context",
+            reason: "something broke".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("my_context"), "message: {msg}");
+        assert!(msg.contains("something broke"), "message: {msg}");
+    }
+
+    #[test]
+    fn optimization_display_contains_context_and_reason() {
+        let err = CustomFamilyError::Optimization {
+            context: "outer_loop",
+            reason: "diverged".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("outer_loop") && msg.contains("diverged"), "message: {msg}");
+    }
+
+    #[test]
+    fn dimension_mismatch_displays_reason() {
+        let err = CustomFamilyError::DimensionMismatch { reason: "3 vs 4".to_string() };
+        assert_eq!(err.to_string(), "3 vs 4");
+    }
+
+    #[test]
+    fn numerical_failure_displays_reason() {
+        let err = CustomFamilyError::NumericalFailure { reason: "NaN detected".to_string() };
+        assert_eq!(err.to_string(), "NaN detected");
+    }
+
+    #[test]
+    fn from_string_creates_invalid_input_with_boundary_context() {
+        let err = CustomFamilyError::from("string error".to_string());
+        assert!(matches!(err, CustomFamilyError::InvalidInput { .. }));
+        assert!(err.to_string().contains("string error"));
+    }
+
+    #[test]
+    fn from_custom_family_error_for_string_uses_display() {
+        let err = CustomFamilyError::NumericalFailure { reason: "singular".to_string() };
+        let s = String::from(err);
+        assert_eq!(s, "singular");
+    }
+}
