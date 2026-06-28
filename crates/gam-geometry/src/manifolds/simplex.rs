@@ -304,6 +304,147 @@ mod tests {
     use super::*;
     use ndarray::{Array1, array};
 
+    // ── parse_simplex_coord ───────────────────────────────────────────────────
+
+    #[test]
+    fn parse_simplex_coord_simplex_and_clr_map_to_clr() {
+        assert_eq!(parse_simplex_coord("simplex").unwrap(), SimplexCoord::Clr);
+        assert_eq!(parse_simplex_coord("clr").unwrap(), SimplexCoord::Clr);
+    }
+
+    #[test]
+    fn parse_simplex_coord_alr_maps_to_alr() {
+        assert_eq!(parse_simplex_coord("alr").unwrap(), SimplexCoord::Alr);
+    }
+
+    #[test]
+    fn parse_simplex_coord_case_insensitive() {
+        assert_eq!(parse_simplex_coord("CLR").unwrap(), SimplexCoord::Clr);
+        assert_eq!(parse_simplex_coord("ALR").unwrap(), SimplexCoord::Alr);
+        assert_eq!(parse_simplex_coord("Simplex").unwrap(), SimplexCoord::Clr);
+    }
+
+    #[test]
+    fn parse_simplex_coord_unknown_is_error() {
+        assert!(parse_simplex_coord("pca").is_err());
+        assert!(parse_simplex_coord("").is_err());
+    }
+
+    // ── validate_simplex_array ────────────────────────────────────────────────
+
+    #[test]
+    fn validate_simplex_array_valid_input_passes() {
+        let m = array![[0.5_f64, 0.5]];
+        assert!(validate_simplex_array(m.view()).is_ok());
+    }
+
+    #[test]
+    fn validate_simplex_array_no_rows_is_error() {
+        use ndarray::Array2;
+        let m: Array2<f64> = Array2::zeros((0, 3));
+        assert!(validate_simplex_array(m.view()).is_err());
+    }
+
+    #[test]
+    fn validate_simplex_array_single_column_is_error() {
+        let m = array![[0.5_f64]];
+        assert!(validate_simplex_array(m.view()).is_err());
+    }
+
+    #[test]
+    fn validate_simplex_array_non_finite_is_error() {
+        let m = array![[0.5_f64, f64::NAN]];
+        let err = validate_simplex_array(m.view()).unwrap_err();
+        assert!(err.contains("finite"), "error should mention finite, got: {err}");
+    }
+
+    // ── closure ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn closure_normalizes_rows_to_sum_one() {
+        let m = array![[1.0_f64, 2.0, 3.0], [4.0, 4.0, 4.0]];
+        let c = closure(m.view()).unwrap();
+        assert!((c.row(0).sum() - 1.0).abs() < 1e-14, "row 0 sum: {}", c.row(0).sum());
+        assert!((c.row(1).sum() - 1.0).abs() < 1e-14, "row 1 sum: {}", c.row(1).sum());
+    }
+
+    #[test]
+    fn closure_equal_weights_gives_uniform_composition() {
+        let m = array![[2.0_f64, 2.0]];
+        let c = closure(m.view()).unwrap();
+        assert!((c[[0, 0]] - 0.5).abs() < 1e-14);
+        assert!((c[[0, 1]] - 0.5).abs() < 1e-14);
+    }
+
+    #[test]
+    fn closure_negative_value_is_error() {
+        let m = array![[1.0_f64, -0.5]];
+        assert!(closure(m.view()).is_err());
+    }
+
+    #[test]
+    fn closure_zero_total_mass_is_error() {
+        let m = array![[0.0_f64, 0.0]];
+        let err = closure(m.view()).unwrap_err();
+        assert!(err.contains("total mass") || err.contains("positive"), "got: {err}");
+    }
+
+    // ── resolve_reference ─────────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_reference_positive_index() {
+        assert_eq!(resolve_reference(1, 3), 1);
+        assert_eq!(resolve_reference(2, 3), 2);
+    }
+
+    #[test]
+    fn resolve_reference_negative_index_wraps() {
+        // -1 → last element (d-1)
+        assert_eq!(resolve_reference(-1, 3), 2);
+        // -2 → second-to-last
+        assert_eq!(resolve_reference(-2, 3), 1);
+        // -3 → first (same as 0)
+        assert_eq!(resolve_reference(-3, 3), 0);
+    }
+
+    // ── clr known values ──────────────────────────────────────────────────────
+
+    #[test]
+    fn clr_of_uniform_composition_is_zero() {
+        // clr([1/3, 1/3, 1/3]) = [0, 0, 0]
+        let m = array![[1.0_f64, 1.0, 1.0]];
+        let c = clr(m.view()).unwrap();
+        for v in c.iter() {
+            assert!(v.abs() < 1e-14, "clr of uniform should be 0, got {v}");
+        }
+    }
+
+    #[test]
+    fn clr_sum_is_zero_per_row() {
+        let m = array![[1.0_f64, 2.0, 3.0], [4.0, 1.0, 1.0]];
+        let c = clr(m.view()).unwrap();
+        for row in c.rows() {
+            assert!(row.sum().abs() < 1e-12, "clr row must sum to zero, got {}", row.sum());
+        }
+    }
+
+    // ── alr / inverse_alr round-trip ─────────────────────────────────────────
+
+    #[test]
+    fn alr_inverse_alr_round_trip() {
+        let m = array![[0.2_f64, 0.5, 0.3]];
+        let coords = alr(m.view(), -1).unwrap(); // reference = last
+        let recovered = inverse_alr(coords.view(), -1).unwrap();
+        for col in 0..3 {
+            assert!(
+                (recovered[[0, col]] - m[[0, col]]).abs() < 1e-12,
+                "col {col}: {} vs {}",
+                recovered[[0, col]],
+                m[[0, col]]
+            );
+        }
+    }
+
     /// CLR exp map at a strictly-interior base with a finite tangent succeeds
     /// and lands in the open simplex (all components strictly positive, summing
     /// to one).
