@@ -4,6 +4,9 @@
 // resolve through the parent namespace.
 use super::*;
 
+use gam_math::jet_scalar::{OneSeedBatch, TwoSeedBatch};
+use wide::f64x4;
+
 pub(crate) struct BinomialLocationScaleCore {
     pub(crate) sigma: Array1<f64>,
     pub(crate) dsigma_deta: Array1<f64>,
@@ -616,6 +619,79 @@ pub(crate) fn binomial_location_scale_nll_generic_from_core_row<
     )
 }
 
+/// SIMD 4-rows-per-pass evaluation of the binomial location-scale row NLL at the
+/// packed [`OneSeedBatch`] directional scalar, returning the contracted-third
+/// tensor `Σ_c ℓ_{xyc} dir_c` for FOUR rows at once. The op graph mirrors
+/// [`binomial_location_scale_nll_generic`] term-for-term over `OneSeedBatch<2>`
+/// (`q = −η_t·e^{−η_ls}`, then `q.compose_unary([0, m1, m2, m3, 0])`).
+///
+/// Unlike the survival-LS row NLL, the binomial row NLL composes its q-space
+/// derivative stack UNCONDITIONALLY — there is no per-term `0·∞` gating — so
+/// every row is homogeneous and no signature grouping is needed: the same op
+/// graph applies to all four lanes. By the jet engine's lane identity
+/// (`OneSeedBatch` lane `i` `to_bits`== `OneSeed` row `i`; the transcendental
+/// `exp` and the rational tensor composition are evaluated per lane through the
+/// identical scalar code), lane `i` of the returned tensor is
+/// `to_bits`-identical to the scalar
+/// `binomial_location_scale_nll_generic::<OneSeed<2>>(..).contracted_third()`.
+/// The per-row `(m1, m2, m3)` q-derivative stack is the SAME
+/// [`binomial_neglog_q_derivatives_dispatch`] scalar the per-row path computed,
+/// packed lane-wise.
+#[inline]
+fn binomial_ls_directional_third_batch(
+    eta_t: f64x4,
+    eta_ls: f64x4,
+    dir0: f64x4,
+    dir1: f64x4,
+    m1: f64x4,
+    m2: f64x4,
+    m3: f64x4,
+) -> [[f64x4; 2]; 2] {
+    let eta_t_jet = OneSeedBatch::<2>::seed_direction(eta_t, 0, dir0);
+    let eta_ls_jet = OneSeedBatch::<2>::seed_direction(eta_ls, 1, dir1);
+    let inv_sigma = eta_ls_jet.scale(-1.0).exp();
+    let q = eta_t_jet.neg().mul(&inv_sigma);
+    let zero = f64x4::splat(0.0);
+    q.compose_unary([zero, m1, m2, m3, zero]).contracted_third()
+}
+
+/// SIMD 4-rows-per-pass evaluation of the binomial location-scale row NLL at the
+/// packed [`TwoSeedBatch`] bidirectional scalar, returning the contracted-fourth
+/// tensor `Σ_cd ℓ_{xycd} u_c v_d` for FOUR rows at once. Mirrors
+/// [`binomial_ls_directional_third_batch`] but with the fourth q-derivative `m4`
+/// (so `q.compose_unary([0, m1, m2, m3, m4])`). Same lane-identity bit-identity
+/// to the scalar `..::<TwoSeed<2>>(..).contracted_fourth()`.
+#[inline]
+fn binomial_ls_directional_fourth_batch(
+    eta_t: f64x4,
+    eta_ls: f64x4,
+    du0: f64x4,
+    du1: f64x4,
+    dv0: f64x4,
+    dv1: f64x4,
+    m1: f64x4,
+    m2: f64x4,
+    m3: f64x4,
+    m4: f64x4,
+) -> [[f64x4; 2]; 2] {
+    let eta_t_jet = TwoSeedBatch::<2>::seed(eta_t, 0, du0, dv0);
+    let eta_ls_jet = TwoSeedBatch::<2>::seed(eta_ls, 1, du1, dv1);
+    let inv_sigma = eta_ls_jet.scale(-1.0).exp();
+    let q = eta_t_jet.neg().mul(&inv_sigma);
+    let zero = f64x4::splat(0.0);
+    q.compose_unary([zero, m1, m2, m3, m4]).contracted_fourth()
+}
+
+/// Reconstruct the per-row `(eta_t, eta_ls)` the row NLL seeds from the core's
+/// `(σ, q0)` — identical to
+/// [`binomial_location_scale_nll_generic_from_core_row`]'s reconstruction, so
+/// the lane-batched path seeds the SAME primary values as the scalar path.
+#[inline]
+fn core_row_eta(core: &BinomialLocationScaleCore, row: usize) -> (f64, f64) {
+    let sigma = core.sigma[row];
+    (-core.q0[row] * sigma, sigma.ln())
+}
+
 /// Pure row-coefficient builder for the binomial location-scale joint
 /// directional derivative `D_β H_L[u]`. Returns `(c_tt, c_tl, c_ll)` such
 /// that the resulting matrix is
@@ -625,6 +701,10 @@ pub(crate) fn binomial_location_scale_nll_generic_from_core_row<
 ///
 /// Inputs `d_eta_t = X_t · u_t`, `d_eta_ls = X_ls · u_ls` are the linear
 /// predictor perturbations along the joint direction `u = (u_t, u_ls)`.
+///
+/// Evaluated 4 rows per SIMD pass through [`binomial_ls_directional_third_batch`]
+/// (bit-identical to the prior scalar per-row `OneSeed<2>` contraction; see
+/// `simd_directional_coefficients_match_scalar_per_row_to_bits`).
 pub(crate) fn binomial_location_scale_first_directional_coefficients(
     y: &Array1<f64>,
     weights: &Array1<f64>,
@@ -634,35 +714,70 @@ pub(crate) fn binomial_location_scale_first_directional_coefficients(
     link_kind: &InverseLink,
 ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), String> {
     let n = y.len();
-    let triples: Result<Vec<(f64, f64, f64)>, String> = (0..n)
+    let nchunks = n.div_ceil(4);
+    // SIMD 4-rows-per-pass over the contracted-third directional contraction.
+    // Each chunk's trailing lanes (when `n % 4 != 0`) are padded with the
+    // chunk's first row — a valid, finite row whose result is simply discarded —
+    // so the unconditional binomial compose never sees a non-finite lane.
+    let chunked: Result<Vec<Vec<(f64, f64, f64)>>, String> = (0..nchunks)
         .into_par_iter()
-        .map(|i| {
-            use gam_math::jet_scalar::OneSeed;
-            let dir = [d_eta_t[i], d_eta_ls[i]];
-            // PACKED contracted-third scalar: seed each primary's ε-direction
-            // with `dir`, so the ε-Hessian channel is `Σ_c ℓ_{abc} dir_c`
-            // (`row_third_contracted`) without materialising the dense `t3`.
-            let scalar = binomial_location_scale_nll_generic_from_core_row::<OneSeed<2>>(
-                y[i],
-                weights[i],
-                core,
-                i,
-                link_kind,
-                false, // include_fourth
-                false, // need_value: contracted third discards the value channel
-                |x, axis| OneSeed::seed_direction(x, axis, dir[axis]),
-            )?;
-            let contracted = scalar.contracted_third();
-            Ok((contracted[0][0], contracted[0][1], contracted[1][1]))
+        .map(|chunk| -> Result<Vec<(f64, f64, f64)>, String> {
+            let start = chunk * 4;
+            let cnt = (n - start).min(4);
+            let rows: [usize; 4] = std::array::from_fn(|l| start + if l < cnt { l } else { 0 });
+            let eta: [(f64, f64); 4] = std::array::from_fn(|l| core_row_eta(core, rows[l]));
+            let eta_t = f64x4::new(std::array::from_fn(|l| eta[l].0));
+            let eta_ls = f64x4::new(std::array::from_fn(|l| eta[l].1));
+            let dir0 = f64x4::new(std::array::from_fn(|l| d_eta_t[rows[l]]));
+            let dir1 = f64x4::new(std::array::from_fn(|l| d_eta_ls[rows[l]]));
+            // Per-lane q-derivative stack: the SAME scalar dispatch the per-row
+            // path ran, packed lane-wise.
+            let mut m1a = [0.0_f64; 4];
+            let mut m2a = [0.0_f64; 4];
+            let mut m3a = [0.0_f64; 4];
+            for l in 0..4 {
+                let r = rows[l];
+                let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
+                    y[r],
+                    weights[r],
+                    core.q0[r],
+                    core.mu[r],
+                    core.dmu_dq[r],
+                    core.d2mu_dq2[r],
+                    core.d3mu_dq3[r],
+                    link_kind,
+                );
+                m1a[l] = m1;
+                m2a[l] = m2;
+                m3a[l] = m3;
+            }
+            let third = binomial_ls_directional_third_batch(
+                eta_t,
+                eta_ls,
+                dir0,
+                dir1,
+                f64x4::new(m1a),
+                f64x4::new(m2a),
+                f64x4::new(m3a),
+            );
+            let tt = third[0][0].to_array();
+            let tl = third[0][1].to_array();
+            let ll = third[1][1].to_array();
+            Ok((0..cnt).map(|l| (tt[l], tl[l], ll[l])).collect())
         })
         .collect();
+    let chunked = chunked?;
     let mut coeff_tt = Array1::<f64>::zeros(n);
     let mut coeff_tl = Array1::<f64>::zeros(n);
     let mut coeff_ll = Array1::<f64>::zeros(n);
-    for (i, (tt, tl, ll)) in triples?.into_iter().enumerate() {
-        coeff_tt[i] = tt;
-        coeff_tl[i] = tl;
-        coeff_ll[i] = ll;
+    let mut idx = 0usize;
+    for chunk in chunked {
+        for (tt, tl, ll) in chunk {
+            coeff_tt[idx] = tt;
+            coeff_tl[idx] = tl;
+            coeff_ll[idx] = ll;
+            idx += 1;
+        }
     }
     Ok((coeff_tt, coeff_tl, coeff_ll))
 }
@@ -684,39 +799,85 @@ pub(crate) fn binomial_location_scalesecond_directional_coefficients(
 ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), String> {
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let n = y.len();
-    // Per-row second-directional coefficient computation. m4 dispatch
-    // can fail (Result), so collect a Result<Vec<(tt, tl, ll)>>.
-    let triples: Result<Vec<(f64, f64, f64)>, String> = (0..n)
+    let nchunks = n.div_ceil(4);
+    // SIMD 4-rows-per-pass over the contracted-fourth bidirectional contraction.
+    // m4 dispatch can fail (Result); trailing lanes are padded with the chunk's
+    // first row (a row already evaluated within `cnt`, so it adds no new error
+    // source), and discarded.
+    let chunked: Result<Vec<Vec<(f64, f64, f64)>>, String> = (0..nchunks)
         .into_par_iter()
-        .map(|i| -> Result<(f64, f64, f64), String> {
-            use gam_math::jet_scalar::TwoSeed;
-            let dir_u = [d_eta_t_u[i], d_eta_ls_u[i]];
-            let dir_v = [d_eta_t_v[i], d_eta_ls_v[i]];
-            // PACKED contracted-fourth scalar: seed ε with `dir_u` and δ with
-            // `dir_v`, so the εδ-Hessian channel is `Σ_{cd} ℓ_{abcd} u_c v_d`
-            // (`row_fourth_contracted`) without materialising the dense `t4`.
-            let scalar = binomial_location_scale_nll_generic_from_core_row::<TwoSeed<2>>(
-                y[i],
-                weights[i],
-                core,
-                i,
-                link_kind,
-                true,  // include_fourth
-                false, // need_value: contracted fourth discards the value channel
-                |x, axis| TwoSeed::seed(x, axis, dir_u[axis], dir_v[axis]),
-            )?;
-            let contracted = scalar.contracted_fourth();
-            Ok((contracted[0][0], contracted[0][1], contracted[1][1]))
+        .map(|chunk| -> Result<Vec<(f64, f64, f64)>, String> {
+            let start = chunk * 4;
+            let cnt = (n - start).min(4);
+            let rows: [usize; 4] = std::array::from_fn(|l| start + if l < cnt { l } else { 0 });
+            let eta: [(f64, f64); 4] = std::array::from_fn(|l| core_row_eta(core, rows[l]));
+            let eta_t = f64x4::new(std::array::from_fn(|l| eta[l].0));
+            let eta_ls = f64x4::new(std::array::from_fn(|l| eta[l].1));
+            let du0 = f64x4::new(std::array::from_fn(|l| d_eta_t_u[rows[l]]));
+            let du1 = f64x4::new(std::array::from_fn(|l| d_eta_ls_u[rows[l]]));
+            let dv0 = f64x4::new(std::array::from_fn(|l| d_eta_t_v[rows[l]]));
+            let dv1 = f64x4::new(std::array::from_fn(|l| d_eta_ls_v[rows[l]]));
+            let mut m1a = [0.0_f64; 4];
+            let mut m2a = [0.0_f64; 4];
+            let mut m3a = [0.0_f64; 4];
+            let mut m4a = [0.0_f64; 4];
+            for l in 0..4 {
+                let r = rows[l];
+                let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
+                    y[r],
+                    weights[r],
+                    core.q0[r],
+                    core.mu[r],
+                    core.dmu_dq[r],
+                    core.d2mu_dq2[r],
+                    core.d3mu_dq3[r],
+                    link_kind,
+                );
+                let m4 = binomial_neglog_q_fourth_derivative_dispatch(
+                    y[r],
+                    weights[r],
+                    core.q0[r],
+                    core.mu[r],
+                    core.dmu_dq[r],
+                    core.d2mu_dq2[r],
+                    core.d3mu_dq3[r],
+                    link_kind,
+                )?;
+                m1a[l] = m1;
+                m2a[l] = m2;
+                m3a[l] = m3;
+                m4a[l] = m4;
+            }
+            let fourth = binomial_ls_directional_fourth_batch(
+                eta_t,
+                eta_ls,
+                du0,
+                du1,
+                dv0,
+                dv1,
+                f64x4::new(m1a),
+                f64x4::new(m2a),
+                f64x4::new(m3a),
+                f64x4::new(m4a),
+            );
+            let tt = fourth[0][0].to_array();
+            let tl = fourth[0][1].to_array();
+            let ll = fourth[1][1].to_array();
+            Ok((0..cnt).map(|l| (tt[l], tl[l], ll[l])).collect())
         })
         .collect();
-    let triples = triples?;
+    let chunked = chunked?;
     let mut coeff_tt = Array1::<f64>::zeros(n);
     let mut coeff_tl = Array1::<f64>::zeros(n);
     let mut coeff_ll = Array1::<f64>::zeros(n);
-    for (i, (tt, tl, ll)) in triples.into_iter().enumerate() {
-        coeff_tt[i] = tt;
-        coeff_tl[i] = tl;
-        coeff_ll[i] = ll;
+    let mut idx = 0usize;
+    for chunk in chunked {
+        for (tt, tl, ll) in chunk {
+            coeff_tt[idx] = tt;
+            coeff_tl[idx] = tl;
+            coeff_ll[idx] = ll;
+            idx += 1;
+        }
     }
     Ok((coeff_tt, coeff_tl, coeff_ll))
 }
@@ -867,5 +1028,135 @@ mod packed_scalar_oracle_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod simd_directional_bit_identity_tests {
+    //! The SIMD 4-rows-per-pass directional/bidirectional coefficient builders
+    //! ([`binomial_location_scale_first_directional_coefficients`] /
+    //! [`binomial_location_scalesecond_directional_coefficients`], now lane
+    //! batched) must be `f64::to_bits`-identical, for EVERY row, to the scalar
+    //! per-row `OneSeed<2>`/`TwoSeed<2>` contraction they replaced — including the
+    //! `n % 4 != 0` trailing-batch tail.
+    use super::*;
+    use gam_math::jet_scalar::{OneSeed, TwoSeed};
+    use gam_problem::{InverseLink, StandardLink};
+
+    /// Tiny deterministic LCG (no external rng dep in the test).
+    struct Lcg(u64);
+    impl Lcg {
+        fn step(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0
+        }
+        /// Finite value in roughly `[-1.5, 1.5]`, occasionally exact `0.0`.
+        fn val(&mut self) -> f64 {
+            let u = self.step();
+            if u & 0x1F == 0 {
+                return 0.0;
+            }
+            ((u >> 11) as f64 / (1u64 << 53) as f64 - 0.5) * 3.0
+        }
+    }
+
+    fn assert_bits(a: f64, b: f64, label: &str) {
+        if a.is_nan() {
+            assert!(b.is_nan(), "{label}: scalar NaN but SIMD finite ({b:e})");
+        } else {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "{label}: SIMD {a:+.17e} != scalar {b:+.17e}"
+            );
+        }
+    }
+
+    #[test]
+    fn simd_directional_coefficients_match_scalar_per_row_to_bits() {
+        let links = [
+            InverseLink::Standard(StandardLink::Logit),
+            InverseLink::Standard(StandardLink::Probit),
+            InverseLink::Standard(StandardLink::CLogLog),
+        ];
+        let mut rng = Lcg(0xD1B54A32D192ED03);
+        let mut compared = 0usize;
+        let mut tail_seen = false;
+        // Deliberately n % 4 != 0 to exercise the trailing partial batch.
+        for &n in &[13usize, 17, 23, 30, 1, 2, 3] {
+            if n % 4 != 0 {
+                tail_seen = true;
+            }
+            for link in &links {
+                let y = Array1::from_iter((0..n).map(|_| (rng.step() & 1) as f64));
+                let weights = Array1::from_iter((0..n).map(|_| rng.val().abs() + 0.3));
+                let eta_t = Array1::from_iter((0..n).map(|_| rng.val()));
+                let eta_ls = Array1::from_iter((0..n).map(|_| rng.val() * 0.5));
+                let core =
+                    binomial_location_scale_core(&y, &weights, &eta_t, &eta_ls, None, link)
+                        .expect("core");
+
+                let d_eta_t = Array1::from_iter((0..n).map(|_| rng.val()));
+                let d_eta_ls = Array1::from_iter((0..n).map(|_| rng.val()));
+                let d_eta_t_v = Array1::from_iter((0..n).map(|_| rng.val()));
+                let d_eta_ls_v = Array1::from_iter((0..n).map(|_| rng.val()));
+
+                // ---- First directional (OneSeed contracted third) ----
+                let (tt, tl, ll) = binomial_location_scale_first_directional_coefficients(
+                    &y, &weights, &core, &d_eta_t, &d_eta_ls, link,
+                )
+                .expect("first directional");
+                for i in 0..n {
+                    let dir = [d_eta_t[i], d_eta_ls[i]];
+                    let s = binomial_location_scale_nll_generic_from_core_row::<OneSeed<2>>(
+                        y[i],
+                        weights[i],
+                        &core,
+                        i,
+                        link,
+                        false,
+                        false,
+                        |x, axis| OneSeed::seed_direction(x, axis, dir[axis]),
+                    )
+                    .expect("scalar oneseed");
+                    let c = s.contracted_third();
+                    assert_bits(tt[i], c[0][0], "first tt");
+                    assert_bits(tl[i], c[0][1], "first tl");
+                    assert_bits(ll[i], c[1][1], "first ll");
+                    compared += 3;
+                }
+
+                // ---- Second directional (TwoSeed contracted fourth) ----
+                let (tt2, tl2, ll2) = binomial_location_scalesecond_directional_coefficients(
+                    &y, &weights, &core, &d_eta_t, &d_eta_ls, &d_eta_t_v, &d_eta_ls_v, link,
+                )
+                .expect("second directional");
+                for i in 0..n {
+                    let dir_u = [d_eta_t[i], d_eta_ls[i]];
+                    let dir_v = [d_eta_t_v[i], d_eta_ls_v[i]];
+                    let s = binomial_location_scale_nll_generic_from_core_row::<TwoSeed<2>>(
+                        y[i],
+                        weights[i],
+                        &core,
+                        i,
+                        link,
+                        true,
+                        false,
+                        |x, axis| TwoSeed::seed(x, axis, dir_u[axis], dir_v[axis]),
+                    )
+                    .expect("scalar twoseed");
+                    let c = s.contracted_fourth();
+                    assert_bits(tt2[i], c[0][0], "second tt");
+                    assert_bits(tl2[i], c[0][1], "second tl");
+                    assert_bits(ll2[i], c[1][1], "second ll");
+                    compared += 3;
+                }
+            }
+        }
+        assert!(tail_seen, "tail (n % 4 != 0) never exercised");
+        assert!(compared >= 1000, "expected >=1000 comparisons, got {compared}");
     }
 }
