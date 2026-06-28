@@ -100,6 +100,12 @@ const FUSION_DEPENDENCE_FLOOR: f64 = 0.6;
 /// (the A⇒B absorption signature: one conditional near 1 without the converse).
 const ABSORPTION_ASYMMETRY_FLOOR: f64 = 0.5;
 
+/// Anti-symmetric decoder perturbation applied when a fission DUPLICATES an atom,
+/// to break the symmetric saddle so the two children can separate in the joint
+/// refit (see `duplicate_atom`). Small enough to preserve the warm-start (and the
+/// mass-split combined decoder is exactly unchanged), but ≫ floating-point noise.
+const FISSION_SYMMETRY_BREAK_EPS: f64 = 0.05;
+
 /// Level at which the within-atom representational carve (#993) calls binding
 /// PROVEN (blocking a fission). The harvest carve is a PROPOSAL filter, not the
 /// final certificate — the downstream held-out e-gate owns acceptance — so this
@@ -712,7 +718,42 @@ fn duplicate_atom(
         ));
     }
     let mut atoms = term.atoms.clone();
-    let child_atom = term.atoms[parent].clone();
+    let mut child_atom = term.atoms[parent].clone();
+    // Symmetry-breaking perturbation. A fission that duplicates the parent atom
+    // IDENTICALLY (same decoder, same coords, mass split 50/50) sits at a
+    // SYMMETRIC SADDLE of the joint refit: the two children have identical
+    // gradients, so a deterministic Newton/descent refit moves them in lockstep
+    // and they NEVER separate — the fission stays a no-op (two identical
+    // half-atoms ≡ the original atom) and the e-gate, seeing no reconstruction
+    // gain, rejects it. So fission could only ever land by floating-point noise.
+    // Apply a small ANTI-SYMMETRIC perturbation — parent decoder ×(1−ε·s_ij),
+    // child decoder ×(1+ε·s_ij) for a deterministic varying pattern s_ij — which
+    // breaks the symmetry (the refit can roll off the saddle toward the
+    // two-factor configuration the carve identified) while leaving the mass-split
+    // combined decoder `½·parent + ½·child = original` EXACTLY unchanged (the
+    // ±ε·s_ij cancel), so the warm-start is preserved. `ε ≫ fp noise`.
+    {
+        let (m, p) = atoms[parent].decoder_coefficients.dim();
+        let s = |i: usize, j: usize| -> f64 {
+            // Deterministic, varying, NON-ZERO pattern in [-1,-0.2]∪[0.2,1]. It
+            // must vary across (i,j) (so `parent − child = −2·f_ij·D_ij` points
+            // off the symmetric `D` direction and can separate factors) and never
+            // vanish (else a sparse decoder element gets no perturbation).
+            let raw = ((i * 7 + j * 13) % 11) as f64 / 5.0 - 1.0;
+            if raw.abs() < 0.2 { 0.3 } else { raw }
+        };
+        for i in 0..m {
+            for j in 0..p {
+                let f = FISSION_SYMMETRY_BREAK_EPS * s(i, j);
+                atoms[parent].decoder_coefficients[[i, j]] *= 1.0 - f;
+                child_atom.decoder_coefficients[[i, j]] *= 1.0 + f;
+            }
+        }
+        // The Grassmann decoder frame is derived from the coefficients; drop both
+        // so the warm refit recomputes them consistent with the perturbed decoders.
+        atoms[parent].decoder_frame = None;
+        child_atom.decoder_frame = None;
+    }
     atoms.push(child_atom);
 
     let n = term.assignment.logits.nrows();
@@ -3060,5 +3101,53 @@ mod tests {
             "the live per-shard likelihood must equal reconstruction + the \
              PG gate-block evidence (so the corrected normalizer reaches the gate)"
         );
+    }
+
+    /// Fission must BREAK the parent/child symmetry. Duplicating an atom
+    /// identically (same decoder, mass split 50/50) sits at a symmetric saddle of
+    /// the joint refit — the children's gradients are identical, so a
+    /// deterministic refit never separates them and the fission is a no-op the
+    /// e-gate rejects. The anti-symmetric perturbation makes the two children's
+    /// decoders genuinely differ (so the refit can separate factors) while the
+    /// equal-mass combined decoder `½(parent+child)` stays EXACTLY the original
+    /// (warm-start preserved).
+    #[test]
+    fn fission_breaks_symmetry_so_children_can_separate() {
+        let (term, rho) = planted_term(&vec![vec![true]; 8]);
+        assert_eq!(term.k_atoms(), 1);
+        let orig = term.atoms[0].decoder_coefficients.clone();
+
+        let (child, _child_rho) =
+            apply_structure_move(&term, &rho, &StructureMove::Fission { atom: 0 }, &[]).unwrap();
+        assert_eq!(child.k_atoms(), 2, "fission must add one atom");
+
+        let d0 = &child.atoms[0].decoder_coefficients;
+        let d1 = &child.atoms[1].decoder_coefficients;
+        // (1) Symmetry BROKEN: the children's decoders are not identical (without
+        // this the refit is stuck at the symmetric saddle and fission is a no-op).
+        let sep = (d0 - d1).iter().map(|x| x * x).sum::<f64>().sqrt();
+        let scale = orig.iter().map(|x| x * x).sum::<f64>().sqrt().max(1e-12);
+        assert!(
+            sep / scale > 1.0e-3,
+            "fission children must NOT be identical (symmetric saddle); rel sep = {}",
+            sep / scale
+        );
+        // (2) Warm-start preserved EXACTLY: the equal-mass combined decoder is the
+        // original (the anti-symmetric ±ε perturbation cancels).
+        let combined = (d0 + d1).mapv(|x| 0.5 * x);
+        let warm_err = (&combined - &orig).iter().map(|x| x * x).sum::<f64>().sqrt();
+        assert!(
+            warm_err < 1.0e-12,
+            "mass-split combined decoder must equal the original; err = {warm_err}"
+        );
+        // (3) Mass split is EVEN: the parent and child carry equal routing logits
+        // on every row (each gets half the parent's softmax mass).
+        for row in 0..child.assignment.logits.nrows() {
+            assert!(
+                (child.assignment.logits[[row, 0]] - child.assignment.logits[[row, 1]]).abs()
+                    < 1e-12,
+                "fission must split routing mass 50/50 (equal child logits)"
+            );
+        }
     }
 }
