@@ -2839,3 +2839,159 @@ where
     };
     Ok(conditioning.backtransform_external_result(result))
 }
+
+#[cfg(test)]
+mod blended_mixture_link_solve_tests {
+    //! Regression coverage for issue #1598.
+    //!
+    //! A `blended(logit, probit)` learnable link NESTS each pure component
+    //! (mixing weight 1 on one inverse link). On data generated from a plain
+    //! logit link, the joint (smoothing + mixing-weight ρ) solve must therefore
+    //! converge and recover a near-logit fit — at the ρ=0 seed the mixture
+    //! collapses to its well-conditioned first component (logit).
+    //!
+    //! Before the fix the inner P-IRLS observed-Hessian curvature build aborted
+    //! with "observed Hessian curvature is not positive finite at row N" the
+    //! moment a single row's residual-dependent observed weight went
+    //! non-positive (which the non-canonical mixture path produces on finite
+    //! data even at the logit-collapsed seed). That abort propagated up as
+    //! "no candidate seeds passed outer startup validation (mixture/SAS flexible
+    //! link)" and the whole fit failed. The downstream solver weight floor
+    //! (`solver_hessian_weights_into`) is designed to clamp exactly those rows
+    //! to keep the Newton system SPD, so the array build must tolerate a finite
+    //! non-positive observed weight rather than hard-bail on it.
+
+    use super::optimize_external_design;
+    use crate::estimate::external_options::ExternalOptimOptions;
+    use gam_problem::{
+        InverseLink, LikelihoodSpec, LinkComponent, MixtureLinkSpec, ResponseFamily, StandardLink,
+    };
+    use gam_terms::smooth::BlockwisePenalty;
+    use ndarray::{Array1, Array2};
+
+    #[test]
+    fn blended_logit_probit_fits_clean_logit_data() {
+        // --- Synthetic clean logit data ---------------------------------
+        // y_i ~ Bernoulli(logistic(eta_i)), eta_i = b0 + b1 * x_i.
+        let n = 120usize;
+        let b0 = -0.3_f64;
+        let b1 = 1.7_f64;
+        // Deterministic pseudo-random x and Bernoulli draws so the test is
+        // reproducible without an RNG dependency.
+        let mut x = Array1::<f64>::zeros(n);
+        let mut y = Array1::<f64>::zeros(n);
+        let mut true_p = Array1::<f64>::zeros(n);
+        let mut seed = 0x9E3779B97F4A7C15u64;
+        let mut next_unit = || {
+            // SplitMix64 → uniform in [0, 1).
+            seed = seed.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = seed;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^= z >> 31;
+            (z >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for i in 0..n {
+            let xi = -2.5 + 5.0 * next_unit();
+            let eta = b0 + b1 * xi;
+            let p = 1.0 / (1.0 + (-eta).exp());
+            x[i] = xi;
+            true_p[i] = p;
+            y[i] = if next_unit() < p { 1.0 } else { 0.0 };
+        }
+
+        // Design with intercept + slope, both unpenalized (zero penalty block).
+        let mut design = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            design[[i, 0]] = 1.0;
+            design[[i, 1]] = x[i];
+        }
+        let w = Array1::<f64>::ones(n);
+        let offset = Array1::<f64>::zeros(n);
+        let penalty = BlockwisePenalty::new(0..2, Array2::<f64>::zeros((2, 2)));
+
+        // blended(logit, probit) with the documented ρ=0 (pure first-component)
+        // seed: mixing weight 1 on logit, 0 on probit.
+        let mix_spec = MixtureLinkSpec {
+            components: vec![LinkComponent::Logit, LinkComponent::Probit],
+            initial_rho: Array1::zeros(1),
+        };
+
+        let opts = ExternalOptimOptions {
+            family: LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(StandardLink::Logit),
+            ),
+            latent_cloglog: None,
+            mixture_link: Some(mix_spec),
+            optimize_mixture: true,
+            sas_link: None,
+            optimize_sas: false,
+            compute_inference: false,
+            skip_rho_posterior_inference: true,
+            max_iter: 200,
+            tol: 1e-9,
+            nullspace_dims: vec![2],
+            linear_constraints: None,
+            firth_bias_reduction: None,
+            penalty_shrinkage_floor: None,
+            rho_prior: Default::default(),
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
+            persist_warm_start_disk: false,
+        };
+
+        // The joint mixture solve must converge (no error) on data its own pure
+        // logit component fits trivially.
+        let result = optimize_external_design(
+            y.view(),
+            w.view(),
+            design.clone(),
+            offset.view(),
+            vec![penalty],
+            &opts,
+        )
+        .expect("blended(logit, probit) joint solve must converge on clean logit data");
+
+        // Reconstruct the fitted linear predictor η̂ = X·β̂ and correlate it
+        // with the true probabilities. The mixture inverse link is monotone, so
+        // a faithful fit makes corr(η̂, true_p) ≈ 1.
+        assert_eq!(result.beta.len(), 2, "fitted β has intercept + slope");
+        let mut eta_hat = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            eta_hat[i] = design[[i, 0]] * result.beta[0] + design[[i, 1]] * result.beta[1];
+        }
+        let corr = pearson(&eta_hat, &true_p);
+        assert!(
+            corr > 0.95,
+            "blended(logit, probit) on clean logit data must recover a near-logit \
+             fit: corr(η̂, true_p)={corr:.4} (β̂={:?}, λ̂={:?})",
+            result.beta.as_slice().unwrap(),
+            result.lambdas.as_slice().unwrap(),
+        );
+        // The recovered slope must keep the sign and order of magnitude of the
+        // generating coefficient (it is not penalized).
+        assert!(
+            result.beta[1] > 0.5,
+            "recovered slope must stay strongly positive: β̂₁={}",
+            result.beta[1]
+        );
+    }
+
+    fn pearson(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
+        let n = a.len() as f64;
+        let ma = a.sum() / n;
+        let mb = b.sum() / n;
+        let mut cov = 0.0;
+        let mut va = 0.0;
+        let mut vb = 0.0;
+        for i in 0..a.len() {
+            let da = a[i] - ma;
+            let db = b[i] - mb;
+            cov += da * db;
+            va += da * da;
+            vb += db * db;
+        }
+        cov / (va.sqrt() * vb.sqrt())
+    }
+}

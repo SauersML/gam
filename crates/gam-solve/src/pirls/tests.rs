@@ -1601,6 +1601,92 @@ mod tests {
     }
 
     #[test]
+    pub(crate) fn binomial_mixture_observed_curvature_tolerates_indefinite_rows() {
+        // Regression for issue #1598.
+        //
+        // For a binomial *blended/mixture* link the observed information
+        //   W_obs = W_Fisher − (y − μ)·B
+        // legitimately goes non-positive on individual rows when a large
+        // residual flips the sign of the residual-dependent correction `B`
+        // (the link is non-canonical, so B ≠ 0). The observed-curvature array
+        // build must NOT hard-bail on such a finite-but-indefinite row: the
+        // inner Newton system floors it via `solver_hessian_weights_into` and
+        // the outer REML derivative path floors it via
+        // `outer_hessian_curvature_arrays`, both keeping the Hessian SPD. Before
+        // the fix the build aborted with "observed Hessian curvature is not
+        // positive finite at row N", which propagated up as
+        // "no candidate seeds passed outer startup validation
+        // (mixture/SAS flexible link)" and made the whole joint solve fail.
+        //
+        // Construct a real blend (mixing weight ~0.5 on probit) and place
+        // observations at extreme η where μ saturates while the *opposite*
+        // label is observed, forcing a large residual and an indefinite W_obs.
+        let mix_spec = MixtureLinkSpec {
+            components: vec![LinkComponent::Logit, LinkComponent::Probit],
+            // rho such that the softmax weights are well away from a pure
+            // component, so B carries a genuine non-canonical contribution.
+            initial_rho: Array1::from_vec(vec![0.0]),
+        };
+        let mix_state = state_fromspec(&mix_spec).expect("mixture state");
+        let link = InverseLink::Mixture(mix_state);
+        // The likelihood spec's link must match the mixture inverse link so the
+        // `supports_observed_hessian_curvature_for_likelihood` gate (keyed on
+        // `spec.link`) recognizes the binomial-mixture observed-curvature path.
+        let likelihood = GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            link.clone(),
+        ));
+
+        // Extreme η with mismatched labels: y=1 at η≈−6 (μ≈0) and y=0 at
+        // η≈+6 (μ≈1) → huge residuals → indefinite observed weight on those
+        // rows. Interior rows keep the build exercising the positive branch too.
+        let eta = array![-6.0, 6.0, -0.3, 0.4, -2.0, 2.0];
+        let y = array![1.0, 0.0, 0.0, 1.0, 1.0, 0.0];
+        let w = Array1::<f64>::ones(eta.len());
+
+        // Fisher weights at these η (positive, used as the SPD floor reference).
+        let mut fisher = Array1::<f64>::zeros(eta.len());
+        for i in 0..eta.len() {
+            let jet = crate::mixture_link::inverse_link_jet_for_inverse_link(&link, eta[i])
+                .expect("mixture jet");
+            let mu = jet.mu;
+            let v = (mu * (1.0 - mu)).max(1e-12);
+            fisher[i] = (jet.d1 * jet.d1 / v).max(1e-12);
+        }
+
+        // Post-fix contract: the build SUCCEEDS (no bail) and returns finite
+        // arrays even though some rows carry a non-positive observed weight.
+        let (w_obs, c_obs, d_obs) = compute_observed_hessian_curvature_arrays(
+            &likelihood,
+            &link,
+            &eta,
+            y.view(),
+            &fisher,
+            w.view(),
+        )
+        .expect(
+            "binomial mixture observed curvature must tolerate finite indefinite \
+             rows instead of bailing (#1598)",
+        );
+
+        assert!(
+            w_obs.iter().all(|w| w.is_finite()),
+            "all observed weights must be finite: {w_obs:?}"
+        );
+        assert!(
+            c_obs.iter().all(|c| c.is_finite()) && d_obs.iter().all(|d| d.is_finite()),
+            "all observed curvature derivatives must be finite"
+        );
+        // The test is only meaningful if it actually exercises the formerly-
+        // bailing branch: at least one row must be non-positive (indefinite).
+        assert!(
+            w_obs.iter().any(|&w| w <= 0.0),
+            "fixture must produce at least one indefinite observed-weight row to \
+             guard the no-bail contract; got {w_obs:?}"
+        );
+    }
+
+    #[test]
     pub(crate) fn negative_binomial_log_observed_curvature_matches_size_theta_closed_form() {
         let theta = 2.5;
         let eta = array![0.2, -0.4, 1.1];

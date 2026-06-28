@@ -395,9 +395,29 @@ pub(crate) fn compute_observed_hessian_curvature_arrays_into(
                 h4,
             );
             let fisher_weight = fisher_weights[i].max(0.0);
-            if !(w_obs.is_finite() && w_obs > 0.0) {
+            // A *finite* but non-positive observed weight is NOT a failure: the
+            // observed information `W_obs = W_Fisher - (y-μ)·B` legitimately goes
+            // indefinite on individual rows for a non-canonical link (probit,
+            // cloglog, SAS, and — critically for #1598 — a blended/mixture link)
+            // whenever a large residual flips the sign of the residual-dependent
+            // correction. The inner Newton system never uses this raw value: it
+            // is clamped to the SPD floor `max(W_Fisher·1e-6, 1e-12)` by
+            // `solver_hessian_weights_into`, and the outer REML/LAML derivative
+            // path applies the *same* floor through `outer_hessian_curvature_arrays`
+            // (which also zeroes c/d on the floored row). Both consumers are
+            // designed precisely to absorb an indefinite W_obs, so hard-bailing
+            // here defeats that stabilization and aborts an otherwise well-posed
+            // solve — the mixture/SAS joint link fit on data its own pure
+            // components fit trivially (clean logit under blended(logit, probit)).
+            //
+            // We therefore reject ONLY a genuinely non-finite (NaN/Inf) weight,
+            // which signals a broken jet rather than benign indefiniteness, and
+            // pass finite values (including non-positive ones) straight through to
+            // the flooring consumers. Likewise `c_obs`/`d_obs` only need to be
+            // finite; they are zeroed automatically on any floored row downstream.
+            if !w_obs.is_finite() {
                 crate::bail_invalid_estim!(
-                    "observed Hessian curvature is not positive finite at row {i}: observed={w_obs}, fisher={fisher_weight}"
+                    "observed Hessian curvature is not finite at row {i}: observed={w_obs}, fisher={fisher_weight}"
                 );
             }
             if !c_obs.is_finite() || !d_obs.is_finite() {
