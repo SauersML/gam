@@ -761,14 +761,21 @@ impl SaeManifoldTerm {
 
     /// #1026/#1522 — PUBLIC test inspector: the SEPARATION barrier value and its
     /// analytic decoder gradient (length `beta_dim`, full-`B` layout) at the
-    /// current decoders, with `penalty_scale = 1`. Hermetic seam so the owed-1026
-    /// FD battery can certify `∂P_sep/∂B` in isolation. Returns `(value, grad)`.
-    pub fn separation_barrier_value_and_grad_for_test(&self) -> (f64, Array1<f64>) {
+    /// current decoders, scaled by `penalty_scale`. Hermetic seam so the owed-1026
+    /// FD battery can certify `∂P_sep/∂B` in isolation, and so the #1522
+    /// prevention-vs-bandaid pinning test can read the barrier ON (`scale = 1`)
+    /// against barrier OFF (`scale = 0`, the local "no prevention" arm — `μ = 0`
+    /// writes nothing — without touching the process-global strength override).
+    /// Returns `(value, grad)`.
+    pub fn separation_barrier_value_and_grad_for_test(
+        &self,
+        penalty_scale: f64,
+    ) -> (f64, Array1<f64>) {
         let mut sys = ArrowSchurSystem::new(0, 0, self.beta_dim());
         sys.gb = Array1::<f64>::zeros(self.beta_dim());
         sys.hbb = Array2::<f64>::zeros((0, 0));
-        self.add_sae_separation_barrier(&mut sys, 1.0, false);
-        (self.separation_barrier_value(1.0), sys.gb)
+        self.add_sae_separation_barrier(&mut sys, penalty_scale, false);
+        (self.separation_barrier_value(penalty_scale), sys.gb)
     }
 }
 

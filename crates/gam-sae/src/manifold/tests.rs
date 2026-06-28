@@ -1951,6 +1951,194 @@ pub(crate) fn decoder_repulsion_gate_off_when_separated_on_when_collinear() {
     );
 }
 
+/// #1522 — the SEPARATION interior-point barrier is the deterministic collapse
+/// PREVENTION (not a detect-then-reseed bandaid). On a constructed collapse-prone
+/// fixture — two co-firing K=2 atoms whose decoders point nearly the same way
+/// (normalized alignment `c² ≈ 0.8`, the geometry that drives the per-row `H_tt`
+/// near-singular and the whole dictionary into the co-collapse basin) — this
+/// pins that the barrier:
+///   1. WITH it (`scale = 1`): adds a positive penalty AND a genuine SEPARATING
+///      force — one gradient-descent step along `-∂P_sep/∂B` strictly REDUCES the
+///      alignment `c²`, i.e. the atoms move apart (collapse is prevented in the
+///      optimizer, not patched after the fact).
+///   2. WITHOUT it (`scale = 0` ⇒ `μ = 0`, the LOCAL "no prevention" arm — no
+///      process-global override toggled, so it is parallelism-safe): value `0`
+///      and an all-zero gradient. The aligned atoms feel NO restoring force and
+///      would stay collapsed — this is the "collapses without the prevention"
+///      half of the pin.
+///   3. INTERIOR-POINT divergence: a MORE-aligned configuration carries a strictly
+///      LARGER barrier value than a less-aligned one, so the force grows without
+///      bound toward the collapse boundary (`c² → 1`).
+///   4. NON-REGRESSION: ORTHOGONAL (healthy, well-separated) decoders get value
+///      `0` and an all-zero gradient even with the barrier ON, so the prevention
+///      is a strict no-op away from collapse and healthy fits stay byte-identical
+///      (the reseed backstop can remain as defense-in-depth and rarely fires).
+#[test]
+pub(crate) fn separation_barrier_is_collapse_prevention_not_bandaid_1522() {
+    let coords0 = array![[0.05], [0.20], [0.55], [0.80], [0.35], [0.65]];
+    let coords1 = array![[0.15], [0.30], [0.65], [0.90], [0.45], [0.10]];
+    let (phi0, jet0) = periodic_basis(&coords0);
+    let (phi1, jet1) = periodic_basis(&coords1);
+    // softmax routing ⇒ every atom carries strictly positive mass on every row,
+    // so the pair co-fires (`q_01 > 0`) and the separation barrier engages.
+    let logits = array![
+        [0.7, -0.2],
+        [0.1, 0.4],
+        [-0.3, 0.5],
+        [0.6, -0.1],
+        [0.2, 0.3],
+        [0.4, 0.1]
+    ];
+    let build = |dec0: Array2<f64>, dec1: Array2<f64>| {
+        let make = |name: &str, phi: Array2<f64>, jet: Array3<f64>, decoder: Array2<f64>| {
+            SaeManifoldAtom::new(
+                name,
+                SaeAtomBasisKind::Periodic,
+                1,
+                phi,
+                jet,
+                decoder,
+                Array2::<f64>::eye(3),
+            )
+            .unwrap()
+            .with_basis_evaluator(Arc::new(TestPeriodicEvaluator))
+        };
+        let atom0 = make("periodic0", phi0.clone(), jet0.clone(), dec0);
+        let atom1 = make("periodic1", phi1.clone(), jet1.clone(), dec1);
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            logits.clone(),
+            vec![coords0.clone(), coords1.clone()],
+            vec![
+                LatentManifold::Circle { period: 1.0 },
+                LatentManifold::Circle { period: 1.0 },
+            ],
+            AssignmentMode::softmax(0.8),
+        )
+        .unwrap();
+        SaeManifoldTerm::new(vec![atom0, atom1], assignment).unwrap()
+    };
+    // Single-row decoders so the normalized alignment `c²` is exactly the squared
+    // cosine of the two output-direction vectors. Channel choices give `c² = 0.8`
+    // (cosθ = √0.8): high enough to drive collapse, low enough that the barrier
+    // gradient (`α ∝ 1/(1-c²+ε)`) is finite and a small step stays in the basin.
+    let row_decoder = |r: [f64; 3]| {
+        let mut d = Array2::<f64>::zeros((3, 3));
+        d[[0, 0]] = r[0];
+        d[[0, 1]] = r[1];
+        d[[0, 2]] = r[2];
+        d
+    };
+    // Normalized-alignment c² between two single-row decoders, read straight off
+    // the atom decoder coefficients (the same quantity the barrier penalizes).
+    let alignment_c2 = |b0: &Array2<f64>, b1: &Array2<f64>| -> f64 {
+        let (m0, p) = (b0.nrows(), b0.ncols());
+        let m1 = b1.nrows();
+        let mut cross = 0.0_f64;
+        for a in 0..m0 {
+            for b in 0..m1 {
+                let mut c = 0.0_f64;
+                for o in 0..p {
+                    c += b0[[a, o]] * b1[[b, o]];
+                }
+                cross += c * c;
+            }
+        }
+        let n0: f64 = b0.iter().map(|v| v * v).sum();
+        let n1: f64 = b1.iter().map(|v| v * v).sum();
+        cross / (n0 * n1)
+    };
+
+    let dec0 = row_decoder([1.0, 0.0, 0.0]);
+    // cosθ = √0.8 ≈ 0.894427, sinθ = √0.2 ≈ 0.447214 ⇒ unit-norm, c² = 0.8.
+    let dec1 = row_decoder([0.894_427_191, 0.447_213_595, 0.0]);
+    let c2_before = alignment_c2(&dec0, &dec1);
+    assert!(
+        (c2_before - 0.8).abs() < 1e-6,
+        "fixture precondition: aligned decoders must start at c² ≈ 0.8, got {c2_before}"
+    );
+
+    let term = build(dec0.clone(), dec1.clone());
+
+    // ── Arm 2 (do this first): barrier OFF (scale 0 ⇒ μ = 0) is a no-op. ──
+    let (value_off, grad_off) = term.separation_barrier_value_and_grad_for_test(0.0);
+    assert_eq!(
+        value_off, 0.0,
+        "barrier OFF must contribute zero value (the no-prevention arm)"
+    );
+    assert!(
+        grad_off.iter().all(|&g| g == 0.0),
+        "barrier OFF must leave the gradient identically zero — aligned atoms feel \
+         NO separating force, so without prevention they stay collapsed"
+    );
+
+    // ── Arm 1: barrier ON supplies a positive penalty and a separating force. ──
+    let (value_on, grad_on) = term.separation_barrier_value_and_grad_for_test(1.0);
+    assert!(
+        value_on > 0.0,
+        "barrier ON must penalize the aligned, co-firing pair (value {value_on} ≤ 0)"
+    );
+    assert!(
+        grad_on.iter().any(|&g| g != 0.0),
+        "barrier ON must produce a non-zero separating gradient on the aligned pair"
+    );
+
+    // One gradient-descent step `B ← B - η·∂P/∂B` must REDUCE the alignment c².
+    // η is small relative to the decoder scale so the step stays inside the basin.
+    let eta = 1.0e-3;
+    let offsets = term.beta_offsets();
+    let p = term.output_dim();
+    let stepped = |atom: usize, base: &Array2<f64>| -> Array2<f64> {
+        let mut out = base.clone();
+        let off = offsets[atom];
+        for a in 0..out.nrows() {
+            for o in 0..p {
+                out[[a, o]] -= eta * grad_on[off + a * p + o];
+            }
+        }
+        out
+    };
+    let dec0_stepped = stepped(0, &dec0);
+    let dec1_stepped = stepped(1, &dec1);
+    let c2_after = alignment_c2(&dec0_stepped, &dec1_stepped);
+    assert!(
+        c2_after < c2_before - 1e-9,
+        "a descent step along the barrier gradient must SEPARATE the atoms \
+         (c² must fall): before={c2_before:.6} after={c2_after:.6}"
+    );
+
+    // ── Arm 3: interior-point divergence — more alignment ⇒ strictly larger value. ──
+    // Less aligned: r_k = (0.6, 0.8, 0) ⇒ c² = 0.36. More aligned: c² ≈ 0.98.
+    let term_less = build(dec0.clone(), row_decoder([0.6, 0.8, 0.0]));
+    let term_more = build(dec0.clone(), row_decoder([0.989_949_49, 0.141_421_36, 0.0]));
+    let value_less = term_less.separation_barrier_value(1.0);
+    let value_more = term_more.separation_barrier_value(1.0);
+    assert!(
+        value_more > value_on && value_on > value_less,
+        "barrier value must grow with alignment toward the collapse boundary: \
+         less(c²=.36)={value_less:.6} < base(c²=.8)={value_on:.6} < more(c²=.98)={value_more:.6}"
+    );
+
+    // ── Arm 4: non-regression — orthogonal (healthy) decoders are a strict no-op
+    // in the FORCE. The separating gradient (and hence the optimizer trajectory)
+    // is identically zero, so a well-separated fit is steered exactly as if no
+    // barrier were present; the scalar value carries only the negligible constant
+    // `-μ·q·log(1+ε) ≈ -1e-5` eps-softening offset (a constant in the objective,
+    // which cannot move the optimum or fire the reseed). ──
+    let term_ortho = build(row_decoder([1.0, 0.0, 0.0]), row_decoder([0.0, 1.0, 0.0]));
+    let (value_ortho, grad_ortho) = term_ortho.separation_barrier_value_and_grad_for_test(1.0);
+    assert!(
+        grad_ortho.iter().all(|&g| g == 0.0),
+        "orthogonal (well-separated) decoders must leave the separating gradient \
+         identically zero (strict no-op force) — healthy fits steer unchanged: {grad_ortho:?}"
+    );
+    assert!(
+        value_ortho.abs() < 1.0e-4,
+        "orthogonal decoders' barrier value must be negligible (only the ε-softening \
+         constant), got {value_ortho}"
+    );
+}
+
+
 /// #976 distinct-basin lever: the co-collapse multi-start reseed must read a
 /// DIFFERENT principal subspace on each retry. The PC-pair rotation offset (=
 /// the 0-based retry index) shifts which residual PC pair each periodic atom
