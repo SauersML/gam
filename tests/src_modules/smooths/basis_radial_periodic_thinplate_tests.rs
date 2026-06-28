@@ -1084,7 +1084,28 @@ fn test_thin_plate_basis_reuse_knots_for_new_points() {
     let (train_tps, knots) =
         create_thin_plate_spline_basis_with_knot_count(train.view(), 4).unwrap();
     let test = array![[0.2, 0.8], [0.8, 0.2], [0.5, 0.1]];
-    let test_tps = create_thin_plate_spline_basis(test.view(), knots.view()).unwrap();
+
+    // Under #1347 the radial reparameterization is performed in the *realized
+    // data metric* (G_c = (K Z)ᵀ(K Z)), so the bending spectrum is the
+    // curvature per unit data-variance — deliberately data-dependent. A fresh
+    // unfrozen fit on the test points therefore produces a DIFFERENT penalty
+    // than the train fit even with identical knots; the pre-#1347 expectation
+    // that the penalty is a knot-only invariant is stale.
+    //
+    // The genuine reuse contract for prediction is that the penalty is FROZEN
+    // at fit time: rebuilding the basis on new points while reusing the train
+    // fit's `radial_reparam` must reproduce the train penalty exactly (the
+    // prediction columns then live in the same parameterization as the fitted
+    // coefficients). That is what we assert here.
+    let mut workspace = BasisWorkspace::default();
+    let test_tps = create_thin_plate_spline_basis_scaledwithworkspace(
+        test.view(),
+        knots.view(),
+        1.0,
+        Some(&train_tps.radial_reparam),
+        &mut workspace,
+    )
+    .unwrap();
 
     assert_eq!(train_tps.basis.ncols(), test_tps.basis.ncols());
     assert_eq!(
@@ -1104,6 +1125,21 @@ fn test_thin_plate_basis_reuse_knots_for_new_points() {
         train_tps.penalty_ridge.as_slice().unwrap(),
         test_tps.penalty_ridge.as_slice().unwrap(),
         epsilon = 1e-12
+    );
+
+    // A fresh UNFROZEN fit on the test points does NOT match (data-metric
+    // reparam is data-dependent) — pin that contrast so the frozen-reuse
+    // guarantee above is not silently trivialized.
+    let test_unfrozen = create_thin_plate_spline_basis(test.view(), knots.view()).unwrap();
+    let bend_train = train_tps.penalty_bending.as_slice().unwrap();
+    let bend_unfrozen = test_unfrozen.penalty_bending.as_slice().unwrap();
+    let max_gap = bend_train
+        .iter()
+        .zip(bend_unfrozen.iter())
+        .fold(0.0_f64, |a, (x, y)| a.max((x - y).abs()));
+    assert!(
+        max_gap > 1e-6,
+        "data-metric reparam must make an unfrozen test-point fit differ from train; max_gap={max_gap}"
     );
 }
 
