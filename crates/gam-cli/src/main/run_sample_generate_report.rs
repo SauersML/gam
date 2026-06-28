@@ -305,6 +305,31 @@ pub(crate) fn run_generate_unified(
                 .map_err(|e| format!("failed to build generative spec: {e}"))
             }
         }
+    } else if model_class == PredictModelClass::TransformationNormal {
+        // Conditional transformation-normal (CTM): the latent transform
+        // `h(Y|x) ~ N(0,1)` is strictly increasing in `y`, so a response-scale
+        // draw is `Y = h⁻¹(Z|x)`, `Z ~ N(0,1)` — genuine inverse-transform
+        // sampling from `F(·|x)`, a function of the covariates alone (#1613).
+        // The earlier path fell into the scalar `else` arm below and drew
+        // Gaussian noise around the mean on the LATENT scale (sd ≈ 1, per-row
+        // mean moving the wrong way with x). Build the same monotone transform
+        // grid `predict` inverts for `E[Y|x]` (#1612) and hand it to the
+        // inverse-transform sampler so generation and prediction share one
+        // transform.
+        let grid = build_transformation_normal_quantile_grid(
+            model,
+            data,
+            col_map,
+            training_headers,
+            offset,
+        )?;
+        Ok(gam::generative::GenerativeSpec {
+            mean: grid.conditional_mean,
+            noise: gam::generative::NoiseModel::TransformationNormalQuantile {
+                grid_y: grid.grid_y,
+                h_grid: grid.h_grid,
+            },
+        })
     } else {
         // Non-Gaussian models produce their response-scale plug-in mean
         // directly here.
