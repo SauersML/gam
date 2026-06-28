@@ -502,3 +502,131 @@ fn add_sparse_symmetric_upper(
     SparseColMat::try_new_from_triplets(lhs.nrows(), lhs.ncols(), &triplets)
         .map_err(|_| "add_sparse_symmetric_upper failed to assemble CSC".to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    fn dense2x2() -> SymmetricMatrix {
+        SymmetricMatrix::Dense(array![[1.0_f64, 2.0], [2.0, 4.0]])
+    }
+
+    // ── variant dispatch ──────────────────────────────────────────────────────
+
+    #[test]
+    fn as_dense_returns_some_for_dense_variant() {
+        let m = dense2x2();
+        assert!(m.as_dense().is_some());
+        assert!(m.as_sparse().is_none());
+    }
+
+    // ── nrows / ncols ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn nrows_and_ncols_match_inner_array() {
+        let m = dense2x2();
+        assert_eq!(m.nrows(), 2);
+        assert_eq!(m.ncols(), 2);
+    }
+
+    // ── to_dense ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn to_dense_for_dense_variant_is_clone() {
+        let m = dense2x2();
+        let d = m.to_dense();
+        assert_eq!(d[[0, 0]], 1.0);
+        assert_eq!(d[[0, 1]], 2.0);
+        assert_eq!(d[[1, 1]], 4.0);
+    }
+
+    // ── try_to_dense_exact ────────────────────────────────────────────────────
+
+    #[test]
+    fn try_to_dense_exact_ok_for_square_finite() {
+        let m = dense2x2();
+        assert!(m.try_to_dense_exact("ctx").is_ok());
+    }
+
+    #[test]
+    fn try_to_dense_exact_err_for_nan_entry() {
+        let m = SymmetricMatrix::Dense(array![[f64::NAN, 0.0], [0.0, 1.0]]);
+        let err = m.try_to_dense_exact("nantest").unwrap_err();
+        assert!(err.contains("nantest"), "error should mention context: {err}");
+    }
+
+    // ── add ───────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn add_dense_dense_is_elementwise_sum() {
+        let a = dense2x2();
+        let b = SymmetricMatrix::Dense(array![[3.0_f64, 0.0], [0.0, 1.0]]);
+        let c = a.add(&b).unwrap().to_dense();
+        assert_eq!(c[[0, 0]], 4.0);
+        assert_eq!(c[[1, 1]], 5.0);
+    }
+
+    #[test]
+    fn add_shape_mismatch_is_error() {
+        let a = dense2x2();
+        let b = SymmetricMatrix::Dense(array![[1.0_f64]]);
+        assert!(a.add(&b).is_err());
+    }
+
+    // ── addridge ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn addridge_zero_returns_clone() {
+        let m = dense2x2();
+        let r = m.addridge(0.0).unwrap().to_dense();
+        assert_eq!(r[[0, 0]], 1.0);
+        assert_eq!(r[[1, 1]], 4.0);
+    }
+
+    #[test]
+    fn addridge_nonzero_adds_to_diagonal_only() {
+        let m = dense2x2();
+        let r = m.addridge(10.0).unwrap().to_dense();
+        assert_eq!(r[[0, 0]], 11.0);
+        assert_eq!(r[[0, 1]], 2.0); // off-diagonal unchanged
+        assert_eq!(r[[1, 1]], 14.0);
+    }
+
+    // ── dot ───────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn dot_identity_times_vector_is_vector() {
+        let m = SymmetricMatrix::Dense(ndarray::Array2::eye(3));
+        let x = array![1.0_f64, 2.0, 3.0];
+        let y = m.dot(&x);
+        assert_eq!(y[0], 1.0);
+        assert_eq!(y[1], 2.0);
+        assert_eq!(y[2], 3.0);
+    }
+
+    #[test]
+    fn dot_known_2x2_result() {
+        // A = [[1, 2], [2, 4]], x = [1, 1] → Ax = [3, 6]
+        let m = dense2x2();
+        let x = array![1.0_f64, 1.0];
+        let y = m.dot(&x);
+        assert!((y[0] - 3.0).abs() < 1e-14);
+        assert!((y[1] - 6.0).abs() < 1e-14);
+    }
+
+    // ── max_abs_diag ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn max_abs_diag_finds_largest_diagonal() {
+        // A = [[1, 2], [2, 4]]: diag = {1, 4}, max_abs = 4
+        let m = dense2x2();
+        assert_eq!(m.max_abs_diag(), 4.0);
+    }
+
+    #[test]
+    fn max_abs_diag_with_negative_diagonal_entry() {
+        let m = SymmetricMatrix::Dense(array![[-5.0_f64, 0.0], [0.0, 3.0]]);
+        assert_eq!(m.max_abs_diag(), 5.0);
+    }
+}
