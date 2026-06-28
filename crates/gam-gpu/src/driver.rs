@@ -557,3 +557,63 @@ pub fn from_col_major(values: &[f64], rows: usize, cols: usize) -> Option<Array2
     from_col_major_inplace(values, &mut out)?;
     Some(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    #[test]
+    fn to_i32_fits_small_value() {
+        assert_eq!(to_i32(0), Some(0));
+        assert_eq!(to_i32(42), Some(42));
+        assert_eq!(to_i32(i32::MAX as usize), Some(i32::MAX));
+    }
+
+    #[test]
+    fn to_i32_overflows_returns_none() {
+        assert_eq!(to_i32(i32::MAX as usize + 1), None);
+    }
+
+    #[test]
+    fn to_col_major_2x3_row_major() {
+        // Row-major [[1,2,3],[4,5,6]] → col-major [1,4,2,5,3,6]
+        let a = array![[1.0_f64, 2.0, 3.0], [4.0, 5.0, 6.0]];
+        let col = to_col_major(&a);
+        assert_eq!(&*col, &[1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+    }
+
+    #[test]
+    fn to_col_major_identity_roundtrip() {
+        let a = array![[1.0_f64, 0.0], [0.0, 1.0]];
+        let col = to_col_major(&a);
+        assert_eq!(&*col, &[1.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn from_col_major_2x3_roundtrip() {
+        let original = array![[1.0_f64, 2.0, 3.0], [4.0, 5.0, 6.0]];
+        let col = to_col_major(&original);
+        let recovered = from_col_major(&col, 2, 3).expect("should succeed");
+        assert_eq!(recovered, original);
+    }
+
+    #[test]
+    fn from_col_major_wrong_length_returns_none() {
+        // 2x3 = 6 elements, but only 5 provided
+        assert!(from_col_major(&[1.0, 2.0, 3.0, 4.0, 5.0], 2, 3).is_none());
+    }
+
+    #[test]
+    fn from_col_major_inplace_mismatched_buffer_returns_none() {
+        let mut out = Array2::<f64>::zeros((3, 3));
+        let short = vec![1.0_f64; 8]; // 9 expected, 8 given
+        assert!(from_col_major_inplace(&short, &mut out).is_none());
+    }
+
+    #[test]
+    fn from_col_major_single_element() {
+        let result = from_col_major(&[7.0], 1, 1).expect("should succeed");
+        assert_eq!(result[[0, 0]], 7.0);
+    }
+}
