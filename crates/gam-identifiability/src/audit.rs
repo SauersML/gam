@@ -3650,7 +3650,7 @@ mod tests {
     impl BlockEffectiveJacobian for FixedMultiChannelJac {
         fn effective_jacobian_rows(
             &self,
-            _state: &FamilyLinearizationState<'_>,
+            _: &FamilyLinearizationState<'_>,
             rows: std::ops::Range<usize>,
         ) -> Result<Array2<f64>, String> {
             let start = rows.start.min(self.n);
