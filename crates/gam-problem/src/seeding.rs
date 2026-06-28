@@ -109,3 +109,94 @@ pub fn clamp_seed_rho_to_bounds(value: f64, bounds: (f64, f64)) -> f64 {
     let (lo, hi) = normalize_seed_bounds(bounds);
     value.clamp(lo, hi)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── anchor_rho_shift ───────────────────────────────────────────────────────
+
+    #[test]
+    fn anchor_rho_shift_gaussian_is_zero() {
+        assert_eq!(SeedRiskProfile::Gaussian.anchor_rho_shift(), 0.0);
+        assert_eq!(SeedRiskProfile::GaussianLocationScale.anchor_rho_shift(), 0.0);
+    }
+
+    #[test]
+    fn anchor_rho_shift_generalized_linear_is_one() {
+        assert_eq!(SeedRiskProfile::GeneralizedLinear.anchor_rho_shift(), 1.0);
+    }
+
+    #[test]
+    fn anchor_rho_shift_survival_is_two() {
+        assert_eq!(SeedRiskProfile::Survival.anchor_rho_shift(), 2.0);
+    }
+
+    // ── promotes_interior_seed_extremes ───────────────────────────────────────
+
+    #[test]
+    fn promotes_interior_extremes_false_for_gaussian_only() {
+        assert!(!SeedRiskProfile::Gaussian.promotes_interior_seed_extremes());
+        assert!(SeedRiskProfile::GaussianLocationScale.promotes_interior_seed_extremes());
+        assert!(SeedRiskProfile::GeneralizedLinear.promotes_interior_seed_extremes());
+        assert!(SeedRiskProfile::Survival.promotes_interior_seed_extremes());
+    }
+
+    // ── keep-best policy flags ────────────────────────────────────────────────
+
+    #[test]
+    fn parsimonious_keep_best_only_for_glm_and_survival() {
+        assert!(!SeedRiskProfile::Gaussian.uses_parsimonious_keep_best());
+        assert!(!SeedRiskProfile::GaussianLocationScale.uses_parsimonious_keep_best());
+        assert!(SeedRiskProfile::GeneralizedLinear.uses_parsimonious_keep_best());
+        assert!(SeedRiskProfile::Survival.uses_parsimonious_keep_best());
+    }
+
+    #[test]
+    fn lowest_cost_keep_best_only_for_gaussian_variants() {
+        assert!(SeedRiskProfile::Gaussian.uses_lowest_cost_keep_best());
+        assert!(SeedRiskProfile::GaussianLocationScale.uses_lowest_cost_keep_best());
+        assert!(!SeedRiskProfile::GeneralizedLinear.uses_lowest_cost_keep_best());
+        assert!(!SeedRiskProfile::Survival.uses_lowest_cost_keep_best());
+    }
+
+    // ── normalize_seed_bounds ─────────────────────────────────────────────────
+
+    #[test]
+    fn normalize_already_ordered_bounds_unchanged() {
+        assert_eq!(normalize_seed_bounds((-3.0, 5.0)), (-3.0, 5.0));
+    }
+
+    #[test]
+    fn normalize_reversed_bounds_swaps() {
+        assert_eq!(normalize_seed_bounds((5.0, -3.0)), (-3.0, 5.0));
+    }
+
+    #[test]
+    fn normalize_equal_bounds_unchanged() {
+        assert_eq!(normalize_seed_bounds((2.0, 2.0)), (2.0, 2.0));
+    }
+
+    // ── clamp_seed_rho_to_bounds ──────────────────────────────────────────────
+
+    #[test]
+    fn clamp_within_bounds_returns_value() {
+        assert_eq!(clamp_seed_rho_to_bounds(1.0, (-3.0, 5.0)), 1.0);
+    }
+
+    #[test]
+    fn clamp_below_lo_returns_lo() {
+        assert_eq!(clamp_seed_rho_to_bounds(-10.0, (-3.0, 5.0)), -3.0);
+    }
+
+    #[test]
+    fn clamp_above_hi_returns_hi() {
+        assert_eq!(clamp_seed_rho_to_bounds(100.0, (-3.0, 5.0)), 5.0);
+    }
+
+    #[test]
+    fn clamp_normalizes_reversed_bounds_before_clamping() {
+        // bounds (5, -3) normalizes to (-3, 5); 100 clamps to 5
+        assert_eq!(clamp_seed_rho_to_bounds(100.0, (5.0, -3.0)), 5.0);
+    }
+}
