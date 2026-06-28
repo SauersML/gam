@@ -315,7 +315,7 @@ mod softmax_majorizer_active_entry_1410_tests {
 #[cfg(test)]
 mod exact_stationarity_solve_1418_tests {
     use super::*;
-    use crate::manifold::tests::gamma_fd_tiny_fixture;
+    use crate::manifold::tests_logdet_adjoint::gamma_fd_tiny_fixture;
     use ndarray::Array1;
 
     /// Build a converged tiny SAE state whose inner residual is genuinely

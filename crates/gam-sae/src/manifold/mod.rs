@@ -145,6 +145,9 @@ mod tests;
 mod tests_parallelism_invariance_1557;
 
 #[cfg(test)]
+mod tests_logdet_adjoint;
+
+#[cfg(test)]
 mod tests_olmo;
 
 #[cfg(test)]

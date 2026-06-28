@@ -856,16 +856,17 @@ impl SaeReconstructionRowProgram {
     /// latent / decoder dimensions. (Decoder/basis VALUES may differ per row and
     /// are lane-packed; only the SHAPES must match.)
     fn batch_aligned_softmax_with(&self, other: &Self) -> bool {
-        let inv_tau = match (self.gate, other.gate) {
+        // Both rows must gate by softmax at the SAME temperature (bit-for-bit) to
+        // share one SIMD op graph; the temperature VALUE is supplied separately to
+        // `all_gates_o2x4`, so the layout check only needs the equality predicate.
+        match (self.gate, other.gate) {
             (RowGate::Softmax { inv_tau: a }, RowGate::Softmax { inv_tau: b }) => {
                 if a.to_bits() != b.to_bits() {
                     return false;
                 }
-                a
             }
             _ => return false,
-        };
-        let _ = inv_tau;
+        }
         if self.n_primaries != other.n_primaries
             || self.atoms.len() != other.atoms.len()
             || self.logit_slot != other.logit_slot
