@@ -2767,6 +2767,34 @@ impl CrossRowWoodbury {
         }
         Ok(())
     }
+
+    /// Forward apply of the rank-`R` cross-row curvature on the latent (`t`)
+    /// block: `out_t += U D Uᵀ v_t`. This is the EXACT forward of the same
+    /// `H_full = H₀' + U D Uᵀ` whose inverse [`Self::apply_inverse_correction`]
+    /// applies and whose log-determinant [`Self::log_det_correction`] reports, so
+    /// a forward Hessian apply that adds this term stays consistent (operator and
+    /// preconditioner describe the SAME operator). `U` has no `β` support, so the
+    /// forward term touches only the `t` block; the `β` coupling is purely an
+    /// inverse-side Schur artifact (`h0inv_u_beta`) and must NOT appear here.
+    ///
+    /// Formed over the sparse `entries` `(global_t_index, atom_k, z'_ik)` so it
+    /// matches `Uᵀ·v` in `apply_inverse_correction` bit-for-bit:
+    /// `p_k = d_k · Σ_{(g,k,z)} z·v_t[g]`, then `out_t[g] += Σ_{(g,k,z)} z·p_k`.
+    pub fn apply_forward_t(&self, v_t: ArrayView1<'_, f64>, out_t: &mut Array1<f64>) {
+        let r = self.d.len();
+        // p = D Uᵀ v_t.
+        let mut p = Array1::<f64>::zeros(r);
+        for &(g, k, z) in &self.entries {
+            p[k] += z * v_t[g];
+        }
+        for k in 0..r {
+            p[k] *= self.d[k];
+        }
+        // out_t += U p.
+        for &(g, k, z) in &self.entries {
+            out_t[g] += z * p[k];
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
