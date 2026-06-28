@@ -91,6 +91,53 @@ pub enum NoiseModel {
         shape: Array1<f64>,
     },
     Bernoulli,
+    /// Inverse-transform sampling for a conditional transformation-normal (CTM)
+    /// model (issue #1613). The fitted latent transform `h(·|x_i)` is strictly
+    /// increasing in `y` and `h(Y|x) ~ N(0, 1)`, so a response-scale draw is
+    /// `Y = h⁻¹(Z | x_i)` with `Z ~ N(0, 1)`. The earlier generate path drew
+    /// Gaussian noise around the mean, which produced latent-scale draws whose
+    /// per-row mean moved the wrong way with the covariate; this variant instead
+    /// samples from the genuine conditional law `F(·|x)`.
+    ///
+    /// Both this sampler and the response-scale conditional mean `E[Y|x]` used by
+    /// `predict` (#1612) invert the SAME per-row monotone curve, materialized on
+    /// a shared response grid, so the two paths cannot disagree on the underlying
+    /// transform.
+    TransformationNormalQuantile {
+        /// Shared, strictly increasing response grid (length `g ≥ 2`).
+        grid_y: Array1<f64>,
+        /// `h_grid[[i, k]] = h(grid_y[k] | x_i)`, strictly increasing in `k` for
+        /// every row `i` (one row per observation).
+        h_grid: Array2<f64>,
+    },
+}
+
+/// Invert a monotone increasing tabulated function `z = h_row(grid_y)` at the
+/// latent value `target`: find the bracketing grid interval and linearly
+/// interpolate `y`. Values below/above the tabulated range map to the support
+/// endpoints (the finite-support tails carry no mass between the clamp and the
+/// endpoint). This is the same bracketing inversion the CTM `predict` mean
+/// (#1612) uses on its quadrature nodes, applied here to a random latent draw.
+fn invert_monotone_grid(grid_y: &Array1<f64>, h_row: ndarray::ArrayView1<'_, f64>, target: f64) -> f64 {
+    let g = grid_y.len();
+    if target <= h_row[0] {
+        return grid_y[0];
+    }
+    if target >= h_row[g - 1] {
+        return grid_y[g - 1];
+    }
+    let mut lo = 0usize;
+    let mut hi = g - 1;
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if h_row[mid] <= target {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let t = (target - h_row[lo]) / (h_row[hi] - h_row[lo]);
+    grid_y[lo] + t * (grid_y[hi] - grid_y[lo])
 }
 
 /// First-class generative specification: mean process + observation noise.
@@ -512,6 +559,36 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
             }
             Ok(y)
         }
+        NoiseModel::TransformationNormalQuantile { grid_y, h_grid } => {
+            let n = spec.mean.len();
+            if h_grid.nrows() != n {
+                crate::bail_invalid_estim!(
+                    "transformation-normal h_grid has {} rows but mean length is {n}",
+                    h_grid.nrows()
+                );
+            }
+            let g = grid_y.len();
+            if g < 2 || h_grid.ncols() != g {
+                crate::bail_invalid_estim!(
+                    "transformation-normal grid is degenerate: grid_y len {g}, h_grid cols {}",
+                    h_grid.ncols()
+                );
+            }
+            // `h(Y|x) ~ N(0,1)` ⇒ a response-scale draw is `Y = h⁻¹(Z | x)`,
+            // `Z ~ N(0,1)`. One independent latent draw per observation, inverted
+            // through that row's monotone transform.
+            let dist = rand_distr::Normal::new(0.0, 1.0).map_err(|e| {
+                EstimationError::InvalidInput(format!(
+                    "invalid standard-normal latent sampler: {e}"
+                ))
+            })?;
+            let mut y = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let z: f64 = rand_distr::Distribution::sample(&dist, rng);
+                y[i] = invert_monotone_grid(grid_y, h_grid.row(i), z);
+            }
+            Ok(y)
+        }
     }
 }
 
@@ -543,6 +620,74 @@ pub trait CustomFamilyGenerative: CustomFamily {
 mod tests {
     use super::*;
     use crate::family_runtime::{FamilyStrategy, strategy_for_spec};
+
+    /// The CTM inverse-transform sampler (#1613) must draw `Y = h⁻¹(Z|x)`,
+    /// `Z ~ N(0,1)`, from each row's monotone transform — NOT Gaussian noise on
+    /// the latent scale. With the analytically invertible linear transform
+    /// `h(y|x_i) = slope_i·(y − center_i)` we have `h⁻¹(z) = center_i + z/slope_i`,
+    /// so the draws must be `N(center_i, (1/slope_i)²)`: the per-row mean tracks
+    /// `center_i` (response scale) and the spread is `1/slope_i` (NOT ≈ 1, the
+    /// latent scale of the old buggy path).
+    #[test]
+    fn transformation_normal_quantile_sampler_is_inverse_transform() {
+        use rand::SeedableRng;
+
+        let g = 801usize;
+        let (y_lo, y_hi) = (-12.0_f64, 12.0_f64);
+        let grid_y = Array1::from_shape_fn(g, |k| {
+            y_lo + (y_hi - y_lo) * (k as f64) / ((g - 1) as f64)
+        });
+        // Row 0: center -1, slope 2 (sd 0.5). Row 1: center +2, slope 4 (sd 0.25).
+        let centers = [-1.0_f64, 2.0_f64];
+        let slopes = [2.0_f64, 4.0_f64];
+        let mut h_grid = Array2::<f64>::zeros((2, g));
+        for i in 0..2 {
+            for k in 0..g {
+                h_grid[[i, k]] = slopes[i] * (grid_y[k] - centers[i]);
+            }
+        }
+        let spec = GenerativeSpec {
+            mean: Array1::from_vec(vec![centers[0], centers[1]]),
+            noise: NoiseModel::TransformationNormalQuantile {
+                grid_y: grid_y.clone(),
+                h_grid,
+            },
+        };
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(20240613);
+        let n_draws = 40_000usize;
+        let draws = sampleobservation_replicates(&spec, n_draws, &mut rng).unwrap();
+        assert_eq!(draws.shape(), &[n_draws, 2]);
+
+        let mut row_means = [0.0_f64; 2];
+        for i in 0..2 {
+            let col = draws.column(i);
+            let mean = col.sum() / (n_draws as f64);
+            let var =
+                col.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / (n_draws as f64);
+            let sd = var.sqrt();
+            row_means[i] = mean;
+            assert!(
+                (mean - centers[i]).abs() < 0.02,
+                "row {i} draw mean {mean:.4} should be the response-scale center {:.4}",
+                centers[i]
+            );
+            let expected_sd = 1.0 / slopes[i];
+            assert!(
+                (sd - expected_sd).abs() < 0.02,
+                "row {i} draw sd {sd:.4} should be the response-scale 1/slope {expected_sd:.4}, \
+                 not the latent ≈1 of the old Gaussian-noise path"
+            );
+        }
+        // The conditional mean must INCREASE with the covariate-driven center —
+        // the exact direction the #1613 bug got backwards.
+        assert!(
+            row_means[1] > row_means[0],
+            "draw means must increase with center: row0={:.4} row1={:.4}",
+            row_means[0],
+            row_means[1]
+        );
+    }
 
     /// The canonical dispersion picker must read the *fitted* dispersion off the
     /// scale metadata, never the construction seed embedded in the response

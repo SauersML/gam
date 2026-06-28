@@ -77,7 +77,9 @@ pub(crate) use gam::inference::model_payload_builders::{
     assemble_transformation_normal_payload,
 };
 
-pub(crate) use gam_predict::input::build_predict_input_for_model;
+pub(crate) use gam_predict::input::{
+    build_predict_input_for_model, build_transformation_normal_quantile_grid,
+};
 
 pub(crate) use gam_predict::linalg::{PredictionCovarianceBackend, rowwise_local_covariances};
 
