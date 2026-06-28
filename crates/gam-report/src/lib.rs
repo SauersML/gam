@@ -974,3 +974,235 @@ fn fmt_num(v: f64) -> String {
         format!("{:.6e}", v)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── esc ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn esc_passthrough_safe_text() {
+        assert_eq!(esc("hello world"), "hello world");
+    }
+
+    #[test]
+    fn esc_empty_string() {
+        assert_eq!(esc(""), "");
+    }
+
+    #[test]
+    fn esc_ampersand() {
+        assert_eq!(esc("a&b"), "a&amp;b");
+    }
+
+    #[test]
+    fn esc_angle_brackets() {
+        assert_eq!(esc("<script>"), "&lt;script&gt;");
+    }
+
+    #[test]
+    fn esc_double_quote() {
+        assert_eq!(esc("\"x\""), "&quot;x&quot;");
+    }
+
+    #[test]
+    fn esc_single_quote() {
+        assert_eq!(esc("it's"), "it&#39;s");
+    }
+
+    #[test]
+    fn esc_all_entities() {
+        assert_eq!(
+            esc("a&b<c>d\"e'f"),
+            "a&amp;b&lt;c&gt;d&quot;e&#39;f"
+        );
+    }
+
+    // ── js_escape ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn js_escape_passthrough_safe_text() {
+        assert_eq!(js_escape("hello"), "hello");
+    }
+
+    #[test]
+    fn js_escape_backslash() {
+        assert_eq!(js_escape("a\\b"), "a\\\\b");
+    }
+
+    #[test]
+    fn js_escape_single_quote() {
+        assert_eq!(js_escape("it's"), "it\\'s");
+    }
+
+    #[test]
+    fn js_escape_double_quote() {
+        assert_eq!(js_escape("say \"hi\""), "say \\\"hi\\\"");
+    }
+
+    #[test]
+    fn js_escape_newline() {
+        assert_eq!(js_escape("line\nnext"), "line\\nnext");
+    }
+
+    // ── to_html_id ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn to_html_id_passthrough_alphanumeric() {
+        assert_eq!(to_html_id("hello123"), "hello123");
+    }
+
+    #[test]
+    fn to_html_id_hyphen_and_underscore_preserved() {
+        assert_eq!(to_html_id("x-var_1"), "x-var_1");
+    }
+
+    #[test]
+    fn to_html_id_dot_becomes_underscore() {
+        assert_eq!(to_html_id("x.1"), "x_1");
+    }
+
+    #[test]
+    fn to_html_id_parens_become_underscore() {
+        assert_eq!(to_html_id("s(x)"), "s_x_");
+    }
+
+    #[test]
+    fn to_html_id_empty_string() {
+        assert_eq!(to_html_id(""), "");
+    }
+
+    // ── fmt_num ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn fmt_num_normal_range_positive() {
+        assert_eq!(fmt_num(1.5), "1.5000");
+    }
+
+    #[test]
+    fn fmt_num_normal_range_negative() {
+        assert_eq!(fmt_num(-3.14), "-3.1400");
+    }
+
+    #[test]
+    fn fmt_num_just_below_1e4() {
+        assert_eq!(fmt_num(9999.0), "9999.0000");
+    }
+
+    #[test]
+    fn fmt_num_at_1e4_uses_scientific() {
+        let s = fmt_num(10000.0);
+        assert!(s.contains('e'), "expected scientific for 1e4, got {s}");
+    }
+
+    #[test]
+    fn fmt_num_just_above_0_01_threshold() {
+        assert_eq!(fmt_num(0.011), "0.0110");
+    }
+
+    #[test]
+    fn fmt_num_exactly_0_01_uses_scientific() {
+        let s = fmt_num(0.01);
+        assert!(s.contains('e'), "expected scientific for 0.01, got {s}");
+    }
+
+    #[test]
+    fn fmt_num_zero_uses_scientific() {
+        let s = fmt_num(0.0);
+        assert!(s.contains('e'), "expected scientific for 0.0, got {s}");
+    }
+
+    // ── render_html smoke test ────────────────────────────────────────────────
+
+    fn minimal_input(formula: &str) -> ReportInput {
+        ReportInput {
+            model_path: "model.gam".to_string(),
+            family_name: "Gaussian".to_string(),
+            model_class: "GAM".to_string(),
+            formula: formula.to_string(),
+            n_obs: Some(100),
+            deviance: 42.5,
+            reml_score: -17.3,
+            iterations: 5,
+            convergence_status: "Converged".to_string(),
+            converged: true,
+            outer_gradient_norm: None,
+            criterion_certificate: None,
+            edf_total: 3.2,
+            r_squared: Some(0.85),
+            coefficients: vec![CoefficientRow {
+                index: 0,
+                estimate: 1.23,
+                std_error: Some(0.05),
+            }],
+            edf_blocks: vec![EdfBlockRow {
+                index: 0,
+                edf: 3.2,
+                role: None,
+            }],
+            continuous_order: vec![],
+            anisotropic_scales: vec![],
+            measure_jet_spectra: vec![],
+            diagnostics: None,
+            smooth_plots: vec![],
+            alo: None,
+            notes: vec![],
+        }
+    }
+
+    #[test]
+    fn render_html_produces_doctype() {
+        let html = render_html(&minimal_input("y ~ s(x)")).unwrap();
+        assert!(
+            html.starts_with("<!doctype html>"),
+            "expected HTML doctype at start"
+        );
+    }
+
+    #[test]
+    fn render_html_contains_formula() {
+        let html = render_html(&minimal_input("y ~ s(x)")).unwrap();
+        assert!(
+            html.contains("y ~ s(x)"),
+            "formula not found in rendered HTML"
+        );
+    }
+
+    #[test]
+    fn render_html_escapes_formula_special_chars() {
+        let html = render_html(&minimal_input("y ~ <bad>")).unwrap();
+        assert!(
+            html.contains("&lt;bad&gt;"),
+            "HTML special chars in formula must be escaped"
+        );
+        assert!(!html.contains("<bad>"), "raw unescaped <bad> must not appear");
+    }
+
+    #[test]
+    fn render_html_notes_are_escaped() {
+        let mut input = minimal_input("y ~ s(x)");
+        input.notes = vec!["<script>alert('xss')</script>".to_string()];
+        let html = render_html(&input).unwrap();
+        assert!(
+            !html.contains("<script>alert"),
+            "raw <script> tag must not appear in output"
+        );
+        assert!(
+            html.contains("&lt;script&gt;"),
+            "script tag must be HTML-escaped"
+        );
+    }
+
+    #[test]
+    fn render_html_non_converged_shows_warning() {
+        let mut input = minimal_input("y ~ s(x)");
+        input.converged = false;
+        input.convergence_status = "Max iterations reached".to_string();
+        let html = render_html(&input).unwrap();
+        assert!(
+            html.contains("conv-warn"),
+            "non-converged fit must show conv-warn class"
+        );
+    }
+}
