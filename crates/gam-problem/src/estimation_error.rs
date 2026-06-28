@@ -225,3 +225,97 @@ impl From<LinalgError> for EstimationError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── is_inner_solve_retreat ────────────────────────────────────────────────
+
+    #[test]
+    fn model_ill_conditioned_is_retreat() {
+        assert!(EstimationError::ModelIsIllConditioned { condition_number: 1e15 }
+            .is_inner_solve_retreat());
+    }
+
+    #[test]
+    fn perfect_separation_is_retreat() {
+        assert!(EstimationError::PerfectSeparationDetected {
+            iteration: 3,
+            max_abs_eta: 50.0
+        }
+        .is_inner_solve_retreat());
+    }
+
+    #[test]
+    fn multinomial_separation_is_retreat() {
+        assert!(EstimationError::MultinomialSeparationDetected {
+            iteration: 1,
+            max_abs_eta: 100.0,
+            active_class_index: 2,
+            row_index: 7
+        }
+        .is_inner_solve_retreat());
+    }
+
+    #[test]
+    fn pirls_did_not_converge_is_retreat() {
+        assert!(EstimationError::PirlsDidNotConverge {
+            max_iterations: 100,
+            last_change: 1e-3
+        }
+        .is_inner_solve_retreat());
+    }
+
+    #[test]
+    fn invalid_input_is_not_retreat() {
+        assert!(
+            !EstimationError::InvalidInput("bad".to_string()).is_inner_solve_retreat()
+        );
+    }
+
+    #[test]
+    fn reml_optimization_failed_is_not_retreat() {
+        assert!(
+            !EstimationError::RemlOptimizationFailed("outer fail".to_string())
+                .is_inner_solve_retreat()
+        );
+    }
+
+    // ── error message content ─────────────────────────────────────────────────
+
+    #[test]
+    fn invalid_input_message_appears_in_display() {
+        let err = EstimationError::InvalidInput("test_message".to_string());
+        assert!(err.to_string().contains("test_message"));
+    }
+
+    #[test]
+    fn pirls_did_not_converge_mentions_max_iterations() {
+        let err = EstimationError::PirlsDidNotConverge {
+            max_iterations: 42,
+            last_change: 0.001,
+        };
+        assert!(err.to_string().contains("42"));
+    }
+
+    // ── From<LinalgError> ─────────────────────────────────────────────────────
+
+    #[test]
+    fn from_linalg_invalid_input_maps_to_invalid_input() {
+        let linalg_err = LinalgError::InvalidInput("linalg msg".to_string());
+        let err = EstimationError::from(linalg_err);
+        assert!(matches!(err, EstimationError::InvalidInput(_)));
+        assert!(err.to_string().contains("linalg msg"));
+    }
+
+    #[test]
+    fn from_linalg_hessian_not_spd_maps_correctly() {
+        let linalg_err = LinalgError::HessianNotPositiveDefinite { min_eigenvalue: -1.0 };
+        let err = EstimationError::from(linalg_err);
+        assert!(matches!(
+            err,
+            EstimationError::HessianNotPositiveDefinite { .. }
+        ));
+    }
+}
