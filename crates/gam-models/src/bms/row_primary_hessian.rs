@@ -113,7 +113,21 @@ impl BernoulliMarginalSlopeFamily {
         let marginal = self.marginal_link_map(marginal_eta)?;
         let probit_scale = self.probit_frailty_scale();
         let target = marginal.mu;
-        let abs_tol = 1e-8_f64.max(1e-4 * target.abs());
+        // The calibrated intercept `a` is consumed as the *root* of the
+        // calibration residual `F(a) = Σ∫Φ(η) − μ(q) = 0` by the analytic
+        // implicit-function gradient/Hessian (`a_u = -F_u/F_a`, `a_uv = …`),
+        // which are valid ONLY at `F = 0`. A loose acceptance band leaves `a`
+        // off the root by `O(residual)`, and that offset propagates linearly
+        // into every IFT derivative — most visibly into the q-axis second
+        // derivative `H[0][0]`, where a `~1e-4·μ` (≈5e-5) residual band shows
+        // up directly as a `~5e-5` gap against the finite difference of the
+        // gradient (#1607). The cell-moment value integrals already carry far
+        // more than 5 digits, so a tight relative band costs only a couple of
+        // extra Newton steps on the few rows that miss the warm-start basin,
+        // while making the analytic Hessian self-consistent with a re-solved
+        // gradient to the f64 floor. Keep a relative component so genuinely
+        // flat (extreme-slope) rows are still solvable.
+        let abs_tol = 1e-12_f64.max(1e-10 * target.abs());
         let rigid_a = rigid_prescale_intercept_from_marginal(marginal.q, slope, probit_scale);
         let rigid_abs_deriv =
             rigid_prescale_intercept_derivative_abs(marginal.q, slope, probit_scale);
