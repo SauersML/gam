@@ -2391,3 +2391,229 @@ mod batch_tests {
         assert_eq!(rows_checked, 4 * batches * 4);
     }
 }
+
+#[cfg(test)]
+mod unit_tests {
+    use super::{JetScalar, Order1, Order2, filtered_implicit_solve_scalar};
+
+    // ── Order2 direct property tests ─────────────────────────────────────────
+
+    /// `Order2::constant(c)` carries value `c` and zero everywhere else.
+    #[test]
+    fn order2_constant_has_zero_derivatives() {
+        let s = Order2::<3>::constant(7.5);
+        assert_eq!(s.value(), 7.5);
+        for a in 0..3 {
+            assert_eq!(s.g()[a], 0.0, "grad[{a}] should be zero");
+            for b in 0..3 {
+                assert_eq!(s.h()[a][b], 0.0, "hess[{a}][{b}] should be zero");
+            }
+        }
+    }
+
+    /// `Order2::variable(x, axis)` has unit gradient in slot `axis` and zero Hessian.
+    #[test]
+    fn order2_variable_has_unit_gradient_in_seeded_slot() {
+        let x = -2.5_f64;
+        let s = Order2::<4>::variable(x, 2);
+        assert_eq!(s.value(), x);
+        for a in 0..4 {
+            let expected_g = if a == 2 { 1.0 } else { 0.0 };
+            assert_eq!(s.g()[a], expected_g, "grad[{a}]");
+            for b in 0..4 {
+                assert_eq!(s.h()[a][b], 0.0, "hess[{a}][{b}] should be zero");
+            }
+        }
+    }
+
+    /// `Order2::add` sums gradient channels; `sub` is the inverse on gradients.
+    /// Uses integer-valued primaries so the value roundtrip is also exact.
+    #[test]
+    fn order2_add_sub_roundtrip() {
+        let p = Order2::<2>::variable(3.0, 0);
+        let q = Order2::<2>::variable(2.0, 1);
+        let pq = JetScalar::add(&p, &q);
+        // value = 3 + 2 = 5
+        assert_eq!(pq.value(), 5.0, "add value");
+        let back = JetScalar::sub(&pq, &q);
+        // (p + q) - q gradient should equal p's gradient exactly
+        for a in 0..2 {
+            assert_eq!(back.g()[a], p.g()[a], "grad[{a}] roundtrip");
+        }
+    }
+
+    /// `Order2::mul` of two variables satisfies the Leibniz product rule:
+    ///   ∂(p·q)/∂p = q,  ∂(p·q)/∂q = p,  ∂²(p·q)/∂p∂q = 1.
+    #[test]
+    fn order2_mul_satisfies_leibniz_rule() {
+        let pv = 3.0_f64;
+        let qv = -2.0_f64;
+        let p = Order2::<2>::variable(pv, 0);
+        let q = Order2::<2>::variable(qv, 1);
+        let pq = JetScalar::mul(&p, &q);
+        assert_eq!(pq.value(), pv * qv, "value = p·q");
+        assert_eq!(pq.g()[0], qv, "∂(p·q)/∂p = q");
+        assert_eq!(pq.g()[1], pv, "∂(p·q)/∂q = p");
+        assert_eq!(pq.h()[0][1], 1.0, "∂²(p·q)/∂p∂q = 1");
+        assert_eq!(pq.h()[1][0], 1.0, "∂²(p·q)/∂q∂p = 1 (symmetric)");
+        assert_eq!(pq.h()[0][0], 0.0, "∂²(p·q)/∂p² = 0");
+        assert_eq!(pq.h()[1][1], 0.0, "∂²(p·q)/∂q² = 0");
+    }
+
+    /// `Order2::scale(s)` multiplies every channel by `s`.
+    #[test]
+    fn order2_scale_multiplies_all_channels() {
+        let p = Order2::<2>::variable(4.0, 0);
+        let s = 2.5_f64;
+        let ps = JetScalar::scale(&p, s);
+        assert_eq!(ps.value(), 4.0 * s);
+        assert_eq!(ps.g()[0], 1.0 * s);
+        assert_eq!(ps.g()[1], 0.0);
+    }
+
+    /// `Order2::exp` at a constant has value `e^c`, gradient `e^c * g`, Hessian `e^c * (g⊗g + H)`.
+    /// At a seeded variable `p₀`, the first derivative is `e^{p₀}` and second is `e^{p₀}`.
+    #[test]
+    fn order2_exp_derivative_stack_correct() {
+        let p0 = 1.0_f64;
+        let p = Order2::<1>::variable(p0, 0);
+        let ep = JetScalar::exp(&p);
+        let e = p0.exp();
+        assert!((ep.value() - e).abs() < 1e-15, "exp value");
+        assert!((ep.g()[0] - e).abs() < 1e-15, "d/dp exp(p) = exp(p)");
+        assert!((ep.h()[0][0] - e).abs() < 1e-15, "d²/dp² exp(p) = exp(p)");
+    }
+
+    /// `Order2::ln` at a seeded variable: d/dp ln(p) = 1/p, d²/dp² ln(p) = -1/p².
+    #[test]
+    fn order2_ln_derivative_stack_correct() {
+        let p0 = 2.0_f64;
+        let p = Order2::<1>::variable(p0, 0);
+        let lnp = JetScalar::ln(&p);
+        assert!((lnp.value() - p0.ln()).abs() < 1e-15, "ln value");
+        assert!((lnp.g()[0] - 1.0 / p0).abs() < 1e-15, "d/dp ln(p) = 1/p");
+        assert!((lnp.h()[0][0] - (-1.0 / (p0 * p0))).abs() < 1e-15, "d²/dp² ln(p) = -1/p²");
+    }
+
+    /// `exp` and `ln` are mutual inverses: `ln(exp(p)).value() == p` at the scalar.
+    #[test]
+    fn order2_exp_ln_roundtrip_at_value() {
+        let p0 = 0.8_f64;
+        let p = Order2::<1>::variable(p0, 0);
+        let roundtrip = JetScalar::ln(&JetScalar::exp(&p));
+        assert!((roundtrip.value() - p0).abs() < 1e-14, "ln(exp(p)) ≈ p");
+    }
+
+    // ── Order1 tests ─────────────────────────────────────────────────────────
+
+    /// `Order1::constant` carries the correct value with all-zero gradient.
+    #[test]
+    fn order1_constant_has_zero_gradient() {
+        let s = Order1::<3>::constant(-5.0);
+        assert_eq!(s.value(), -5.0);
+        for a in 0..3 {
+            assert_eq!(s.g()[a], 0.0, "g[{a}] should be zero");
+        }
+    }
+
+    /// `Order1::variable(x, axis)` has unit gradient only in `axis`.
+    #[test]
+    fn order1_variable_has_unit_gradient_in_seeded_slot() {
+        let s = Order1::<3>::variable(2.0, 1);
+        assert_eq!(s.value(), 2.0);
+        assert_eq!(s.g()[0], 0.0);
+        assert_eq!(s.g()[1], 1.0);
+        assert_eq!(s.g()[2], 0.0);
+    }
+
+    /// `Order1::mul` satisfies the product rule (value and gradient, no Hessian).
+    #[test]
+    fn order1_mul_satisfies_product_rule() {
+        let pv = 3.0_f64;
+        let qv = -2.0_f64;
+        let p = Order1::<2>::variable(pv, 0);
+        let q = Order1::<2>::variable(qv, 1);
+        let pq = JetScalar::mul(&p, &q);
+        assert_eq!(pq.value(), pv * qv);
+        assert_eq!(pq.g()[0], qv, "∂(p·q)/∂p = q");
+        assert_eq!(pq.g()[1], pv, "∂(p·q)/∂q = p");
+    }
+
+    /// `Order1::exp` carries the correct value and gradient `e^{p₀}`.
+    #[test]
+    fn order1_exp_has_correct_value_and_gradient() {
+        let p0 = 0.5_f64;
+        let p = Order1::<2>::variable(p0, 0);
+        let ep = JetScalar::exp(&p);
+        let e = p0.exp();
+        assert!((ep.value() - e).abs() < 1e-15, "exp value");
+        assert!((ep.g()[0] - e).abs() < 1e-15, "d/dp exp(p)");
+        assert_eq!(ep.g()[1], 0.0, "irrelevant gradient slot is zero");
+    }
+
+    /// `Order1` and `Order2` agree on value and gradient for the same expression.
+    #[test]
+    fn order1_and_order2_agree_on_value_and_gradient() {
+        let p0 = 1.3_f64;
+        let q0 = -0.7_f64;
+        // evaluate (p * q + p).exp() at (p0, q0)
+        let p1 = Order1::<2>::variable(p0, 0);
+        let q1 = Order1::<2>::variable(q0, 1);
+        let expr1 = JetScalar::exp(&JetScalar::add(&JetScalar::mul(&p1, &q1), &p1));
+
+        let p2 = Order2::<2>::variable(p0, 0);
+        let q2 = Order2::<2>::variable(q0, 1);
+        let expr2 = JetScalar::exp(&JetScalar::add(&JetScalar::mul(&p2, &q2), &p2));
+
+        assert!((expr1.value() - expr2.value()).abs() < 1e-14, "value mismatch");
+        for a in 0..2 {
+            assert!(
+                (expr1.g()[a] - expr2.g()[a]).abs() < 1e-14,
+                "gradient[{a}] mismatch"
+            );
+        }
+    }
+
+    // ── filtered_implicit_solve_scalar ────────────────────────────────────────
+
+    /// Lift the trivial linear constraint F(a, θ) = a - θ = 0 through `Order2<1>`.
+    /// The exact lifted jet is a(θ) = θ, so value=θ₀, gradient=1.
+    #[test]
+    fn filtered_implicit_solve_linear_constraint_gives_exact_jet() {
+        let theta0 = 3.0_f64;
+        let theta = Order2::<1>::variable(theta0, 0);
+        // a0 = theta0, F_a = 1, inv_fa = 1; 2 iters suffice for Order2.
+        let a = filtered_implicit_solve_scalar::<1, Order2<1>>(
+            theta0,
+            1.0,
+            2,
+            |a_jet| JetScalar::sub(a_jet, &theta),
+        );
+        assert!((a.value() - theta0).abs() < 1e-14, "value = theta0");
+        // da/dtheta = 1 (identity)
+        assert!((a.g()[0] - 1.0).abs() < 1e-14, "gradient = 1");
+        // d²a/dtheta² = 0 (linear)
+        assert!(a.h()[0][0].abs() < 1e-14, "hessian = 0");
+    }
+
+    /// `filtered_implicit_solve_scalar` on a quadratic constraint F(a,θ)=a²-θ=0
+    /// with primal root a₀=√θ₀, giving da/dθ = 1/(2√θ₀), d²a/dθ² = -1/(4θ₀^{3/2}).
+    #[test]
+    fn filtered_implicit_solve_quadratic_constraint_matches_analytic_derivatives() {
+        let theta0 = 4.0_f64;
+        let a0 = theta0.sqrt();
+        let inv_fa = 1.0 / (2.0 * a0);
+        let theta = Order2::<1>::variable(theta0, 0);
+        // F(a,theta) = a*a - theta
+        let a = filtered_implicit_solve_scalar::<1, Order2<1>>(a0, inv_fa, 2, |a_jet| {
+            let aa = JetScalar::mul(a_jet, a_jet);
+            JetScalar::sub(&aa, &theta)
+        });
+        let tol = 1e-12;
+        assert!((a.value() - a0).abs() < tol, "value = sqrt(theta0)");
+        let expected_g = 0.5 / a0;
+        assert!((a.g()[0] - expected_g).abs() < tol, "da/dtheta = 1/(2*sqrt)");
+        let expected_h = -0.25 / (theta0 * a0);
+        assert!((a.h()[0][0] - expected_h).abs() < tol, "d2a/dtheta2 = -1/(4*theta^1.5)");
+    }
+}
