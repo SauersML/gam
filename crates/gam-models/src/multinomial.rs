@@ -706,6 +706,21 @@ pub struct MultinomialSavedModel {
     /// inference block; falls back to `None` for the legacy fixed-λ path.
     #[serde(default)]
     pub edf_per_class: Option<Vec<f64>>,
+    /// Per-PENALTY effective degrees of freedom, one entry per smoothing
+    /// parameter (length `== lambdas.len()`), aligned block-major with the flat
+    /// [`Self::lambdas`] / [`Self::lambdas_per_block`] layout. Each entry is the
+    /// penalty-block trace EDF `rank(S_k) − λ_k·tr(H⁻¹ S_k)`, clamped to
+    /// `[0, rank(S_k)]`. This is the per-(class, term, penalty) resolution that
+    /// the per-class [`Self::edf_per_class`] SUM deliberately hides: only the
+    /// per-penalty vector reveals whether an individual smooth collapsed onto its
+    /// polynomial null space (its wiggliness λ driven to the λ-cap), which a
+    /// per-class total cannot show. Populated whenever the REML driver reports an
+    /// inference block; `None` on the legacy fixed-λ path or when the trace
+    /// channel is mis-shaped. Unlike `edf_per_class`, the entries do NOT sum to
+    /// the model EDF when several penalties share one coefficient range (a
+    /// double-penalty smooth has `Σ_k rank(S_k) > p_per_class`).
+    #[serde(default)]
+    pub edf_per_penalty: Option<Vec<f64>>,
     /// Joint posterior coefficient covariance `H⁻¹` (#1101), block-ordered to
     /// match the stacked active-class coefficient vector `β = [β_0; …; β_{K-2}]`
     /// (class `a`'s `P` coefficients occupy rows/cols `a·P .. (a+1)·P`). This is
@@ -1760,6 +1775,26 @@ pub fn fit_penalized_multinomial_formula(
         }
         Some(per_class)
     });
+    // Per-PENALTY EDF: the inference layer's `edf_by_block` is already the
+    // clamped per-penalty-block trace EDF `rank(S_k) − λ_k·tr(H⁻¹ S_k)`, one
+    // entry per smoothing parameter and block-major aligned 1:1 with the flat
+    // `lambdas`. Surface it verbatim (guarding only on the length contract) so
+    // consumers can inspect per-(class, term, penalty) collapse onto the null
+    // space — a signal the per-class EDF SUM hides. This is NOT a per-class
+    // total: with double-penalty smooths `Σ_k rank(S_k) > p_per_class`, so the
+    // entries deliberately need not sum to the model EDF (the per-class field
+    // carries that contract instead).
+    let edf_per_penalty = fit.inference.as_ref().and_then(|info| {
+        if info.edf_by_block.len() != lambdas_flat.len() {
+            return None;
+        }
+        Some(
+            info.edf_by_block
+                .iter()
+                .map(|&e| e.max(0.0))
+                .collect::<Vec<f64>>(),
+        )
+    });
     let coefficients_flat: Vec<f64> = coefficients_active.iter().copied().collect();
 
     // #1101: surface the joint Laplace posterior covariance `H⁻¹` (block-ordered
@@ -1940,6 +1975,7 @@ pub fn fit_penalized_multinomial_formula(
         penalized_neg_log_likelihood: -fit.log_likelihood + 0.5 * fit.stable_penalty_term,
         deviance,
         edf_per_class,
+        edf_per_penalty,
         coefficient_covariance_flat,
         coefficient_influence_flat,
         smooth_term_spans,

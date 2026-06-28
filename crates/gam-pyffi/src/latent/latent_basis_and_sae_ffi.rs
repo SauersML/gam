@@ -1129,6 +1129,9 @@ fn multinomial_model_metadata_pyfunc<'py>(
     if let Some(edf) = envelope.saved.edf_per_class.as_ref() {
         out.set_item("edf_per_class", edf.clone())?;
     }
+    if let Some(edf_pen) = envelope.saved.edf_per_penalty.as_ref() {
+        out.set_item("edf_per_penalty", edf_pen.clone())?;
+    }
     Ok(out.unbind())
 }
 
