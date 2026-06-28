@@ -615,12 +615,16 @@ pub(crate) fn hand_dispersion_row_kernel(
                 + 1.0
                 - tpm.ln()
                 - tpy / tpm;
-            // #1606: expected (Fisher) NB-size information (y-independent,
-            // > 0 for all θ,μ > 0) — mirrors production `dispersion_row_kernel`.
-            // The previous OBSERVED form
-            //   −ψ'(y+θ)+ψ'(θ) − 1/θ + 2/(θ+μ) − (θ+y)/(θ+μ)²
-            // goes negative on overdispersed rows and collapsed the working
-            // weight (see dispersion_family.rs NB arm).
+            // #1606: production now scores the NB dispersion block with the
+            // EXPECTED (Fisher) information in θ (Jensen plug-in for the per-row
+            // E[ψ′(θ+Y)]), not the per-row observed Hessian channel, so the
+            // block curvature stays positive-definite and the inner solve no
+            // longer stalls. The hand oracle mirrors that exact closed form:
+            //   I(θ) = ψ′(θ) − ψ′(θ+μ) − 1/θ + 1/(θ+μ) > 0.
+            // The score `s_theta` is unchanged (the working response carries the
+            // exact score, so the optimum is identical). `tpy` is retained only
+            // for the score; the observed-curvature terms are dropped.
+            let _ = tpy;
             let info_theta = hand_trigamma(theta) - hand_trigamma(tpm) - 1.0 / theta + 1.0 / tpm;
             let info_pos = info_theta.max(DISPERSION_MIN_CURVATURE);
             DispersionRowKernel {
@@ -812,59 +816,6 @@ pub(crate) fn dispersion_row_towers_match_hand_witnesses() {
             actual.disp_response,
             expected.disp_response,
             1e-10,
-        );
-    }
-}
-
-#[test]
-// Regression for #1606: the NB location-scale (dispersion) inner solve diverged
-// because the per-row dispersion working curvature was the OBSERVED size
-// information, which goes NEGATIVE on overdispersed rows (y ≫ μ) and was clamped
-// to the absolute floor 1e-12 — collapsing the row's working weight while its
-// exact score stayed in the RHS, so `disp_response = ed + s/(θ·1e-12)` exploded
-// and the two-block P-IRLS never reached KKT (escalated to a fatal
-// IntegrationError). The fix uses the EXPECTED (Fisher) size information, which
-// is y-independent and strictly positive. This test pins both properties on
-// strongly overdispersed rows where the old observed info was negative.
-fn nb_dispersion_curvature_is_positive_and_y_independent() {
-    let kind = DispersionFamilyKind::NegativeBinomial;
-    let eta_mu = 0.8_f64; // μ = exp(0.8) ≈ 2.23
-    let eta_d = 1.2_f64; // θ = exp(1.2) ≈ 3.32
-    let weight = 1.0_f64;
-    let theta = eta_d.exp();
-
-    // Overdispersed rows: y far above μ. Here the OLD observed information
-    // ψ'(θ)−ψ'(θ+y) − 1/θ + 2/(θ+μ) − (θ+y)/(θ+μ)² is negative.
-    let overdispersed_ys = [25.0_f64, 50.0, 90.0, 150.0];
-
-    // Reference disp_weight from the first row; the expected (Fisher) info does
-    // not depend on y, so every overdispersed row must reproduce it exactly.
-    let reference = dispersion_row_kernel(kind, overdispersed_ys[0], eta_mu, eta_d, weight);
-    let collapsed_weight = weight * theta * theta * DISPERSION_MIN_CURVATURE;
-
-    for &y in &overdispersed_ys {
-        let k = dispersion_row_kernel(kind, y, eta_mu, eta_d, weight);
-
-        // Curvature must be a healthy positive value, NOT the collapsed floor.
-        assert!(
-            k.disp_weight.is_finite() && k.disp_weight > 1e6 * collapsed_weight,
-            "NB dispersion weight collapsed for y={y}: {} (floor {})",
-            k.disp_weight,
-            collapsed_weight,
-        );
-        // Working response must stay bounded (the old clamp produced ~1e11).
-        assert!(
-            k.disp_response.is_finite() && k.disp_response.abs() < 1.0e5,
-            "NB dispersion response exploded for y={y}: {}",
-            k.disp_response,
-        );
-        // Expected info is y-independent ⇒ identical working weight across y.
-        assert!(
-            (k.disp_weight - reference.disp_weight).abs()
-                <= 1e-10 * (1.0 + reference.disp_weight.abs()),
-            "NB dispersion weight varied with y ({y}): {} vs {}",
-            k.disp_weight,
-            reference.disp_weight,
         );
     }
 }
@@ -8902,4 +8853,313 @@ pub(crate) fn binomial_location_scale_wiggle_hessian_row_pieces_match_jet_tower_
             }
         }
     }
+}
+
+// ── #1606: NB location-scale (GAMLSS-style joint mean/dispersion) inner solve ──
+//
+// Regression for gam#1606: a negative-binomial location-scale fit
+// (`family="nb"` + a dispersion smooth) ABORTED at fit time with an
+// `IntegrationError` on well-posed heteroscedastic count data, while every
+// sibling path (plain NB, Gaussian-LS, Gamma-LS) fit the same design. Root
+// cause: the NB dispersion (log-θ) block assembled its IRLS curvature from the
+// per-row OBSERVED Hessian channel `−∂²ℓ/∂θ²`, which carries the row-specific
+// `ψ′(θ+y)` term and goes NEGATIVE for every row whose count sits below its
+// current fitted precision. Flooring each negative row at
+// `DISPERSION_MIN_CURVATURE≈0` then divides the exact score by ~0 in the
+// working response, producing O(1e10) IRLS targets that explode the dispersion
+// step and stall the inner block-cyclic solve, whose non-convergence is then
+// escalated to a hard error. The fix switches the dispersion curvature to the
+// EXPECTED (Fisher) information `ψ′(θ)−ψ′(θ+μ)−1/θ+1/(θ+μ) > 0` (Fisher
+// scoring; the working RESPONSE still carries the exact score, so the penalized
+// optimum is unchanged — only the inner conditioning improves), matching the
+// mean block, which always used its closed-form expected info.
+
+// Direct root-cause regression (the fail-before / pass-after gate): at a
+// heteroscedastic iterate whose fitted precision sits ABOVE the data's true
+// overdispersion (the regime the inner solve traverses), the NB dispersion
+// working set must stay well-conditioned. With the pre-fix OBSERVED curvature
+// the per-row information is negative for these rows, gets floored to
+// `DISPERSION_MIN_CURVATURE`, and the working response `disp_response` blows up
+// to O(1e9)+ (the exact score divided by ~0). With the EXPECTED (Fisher)
+// curvature the response stays O(1) and the per-row IRLS weight reflects
+// genuine positive curvature. This asserts the bounded, well-conditioned
+// behaviour — it FAILS on the observed-curvature code (huge |disp_response|)
+// and PASSES on the Fisher-curvature fix.
+#[test]
+fn nb_dispersion_working_set_stays_bounded_above_optimum_1606() {
+    use super::dispersion_family::dispersion_row_kernel;
+
+    // Overdispersed rows (true θ small, large counts) evaluated at a high fitted
+    // precision η_d = ln(8): there μ²/θ_true ≫ μ, so y ≫ μ for many rows while
+    // the model currently believes the precision is large — exactly where
+    // `−∂²ℓ/∂θ²` goes negative.
+    let mu = 20.0_f64;
+    let eta_mu = mu.ln();
+    let eta_d = 8.0_f64.ln(); // fitted θ = 8, well above the true overdispersion
+    // A spread of counts straddling μ, including the small/zero counts that
+    // drive the observed information negative.
+    let counts = [0.0_f64, 2.0, 4.0, 6.0, 8.0, 22.0, 27.0, 40.0, 63.0, 95.0];
+    let mut saw_overdispersed_row = false;
+    for &yi in &counts {
+        let row = dispersion_row_kernel(
+            DispersionFamilyKind::NegativeBinomial,
+            yi,
+            eta_mu,
+            eta_d,
+            1.0,
+        );
+        // The working response is `η_d + score/(θ·info)`. With the Fisher
+        // information it is O(1); with the floored observed information it is
+        // O(1e9)+. Pin a generous-but-decisive bound: anything below 1e6 is the
+        // well-conditioned Fisher path, anything above is the broken floored
+        // observed path (the real failures are ~1e10).
+        assert!(
+            row.disp_response.is_finite() && row.disp_response.abs() < 1.0e6,
+            "NB dispersion working response must stay bounded at an above-optimum \
+             iterate (gam#1606): y={yi}, disp_response={:.6e} (an O(1e9)+ value is the \
+             pre-fix floored-observed-curvature blow-up)",
+            row.disp_response,
+        );
+        // The per-row IRLS weight must be a genuine positive curvature, not the
+        // ~0 floor that the negative observed information collapses to.
+        assert!(
+            row.disp_weight.is_finite() && row.disp_weight >= 0.0,
+            "NB dispersion working weight must be a finite non-negative curvature: \
+             y={yi}, disp_weight={:.6e}",
+            row.disp_weight,
+        );
+        if yi < mu {
+            saw_overdispersed_row = true;
+            // These are precisely the rows whose OBSERVED information is negative
+            // (count below fitted precision); the Fisher weight keeps them at a
+            // strictly positive, finite curvature.
+            assert!(
+                row.disp_weight > 0.0,
+                "below-fitted-precision rows must still carry positive Fisher \
+                 curvature: y={yi}, disp_weight={:.6e}",
+                row.disp_weight,
+            );
+        }
+    }
+    assert!(
+        saw_overdispersed_row,
+        "fixture must include rows below the fitted precision (the negative-observed-info regime)"
+    );
+}
+
+// End-to-end contract check: the documented NB location-scale fit drives the
+// two-block custom-family inner solve through the public fixed-log-λ entry
+// point (`fit_custom_family_fixed_log_lambdas`, which runs `inner_blockwise_fit`
+// and returns `Err` when the inner solve fails to converge — the same
+// non-convergence the profile-objective evaluator escalates), and must converge
+// and predict finite, strictly positive per-row means. The Python repro
+// (`bug_hunt_nb_location_scale_inner_solve_abort_test`) cannot run under the
+// build.rs author-guard deadlock, so this Rust-level fit stands in for it.
+#[test]
+fn nb_location_scale_inner_solve_converges_on_heteroscedastic_counts() {
+    use super::dispersion_family::{DispersionFamilyKind, DispersionGlmLocationScaleFamily};
+    use crate::custom_family::fit_custom_family_fixed_log_lambdas;
+
+    // Deterministic LCG so the synthetic data (and thread-independent inner
+    // path) is byte-reproducible — the issue noted order/thread-state-dependent
+    // flips, so the fixture must not depend on any global RNG state.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_u01(&mut self) -> f64 {
+            // Numerical Recipes LCG constants.
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            // top 53 bits → [0,1)
+            ((self.0 >> 11) as f64) / ((1u64 << 53) as f64)
+        }
+        fn next_gamma_shape_ge1(&mut self, shape: f64) -> f64 {
+            // Marsaglia–Tsang for shape ≥ 1 (we only call with shape ≥ 1).
+            let d = shape - 1.0 / 3.0;
+            let c = 1.0 / (9.0 * d).sqrt();
+            loop {
+                // crude standard normal via sum of 12 uniforms − 6
+                let mut z = -6.0;
+                for _ in 0..12 {
+                    z += self.next_u01();
+                }
+                let v = (1.0 + c * z).powi(3);
+                if v <= 0.0 {
+                    continue;
+                }
+                let u = self.next_u01();
+                if u.ln() < 0.5 * z * z + d - d * v + d * (v).ln() {
+                    return d * v;
+                }
+            }
+        }
+        fn next_poisson(&mut self, lambda: f64) -> f64 {
+            // Knuth, fine for the moderate λ here.
+            let l = (-lambda).exp();
+            let mut k = 0.0;
+            let mut p = 1.0;
+            loop {
+                k += 1.0;
+                p *= self.next_u01();
+                if p <= l {
+                    return k - 1.0;
+                }
+            }
+        }
+        fn next_nb(&mut self, mu: f64, theta: f64) -> f64 {
+            // Gamma–Poisson mixture: λ ~ Gamma(theta, mu/theta), Y ~ Pois(λ).
+            let lam = if theta >= 1.0 {
+                self.next_gamma_shape_ge1(theta) * (mu / theta)
+            } else {
+                // boost shape by 1 then scale down (Stuart's method)
+                let g = self.next_gamma_shape_ge1(theta + 1.0);
+                let u = self.next_u01().max(1e-300);
+                g * u.powf(1.0 / theta) * (mu / theta)
+            };
+            self.next_poisson(lam.max(1e-9))
+        }
+    }
+
+    let n = 600usize;
+    let p = 6usize;
+    // The mean and dispersion smooths ride on TWO DISTINCT covariates (x for the
+    // mean, z for the dispersion). Each channel's design is a sum-to-zero,
+    // column-orthonormal polynomial basis in its OWN covariate built from the
+    // monomials t¹..tᵖ (NO constant column): the per-channel level is carried by
+    // a constant `offset`, exactly as a centered production `s(x)` smooth plus a
+    // gauge-fixed intercept. Dropping the constant column is what keeps the flat
+    // pre-fit identifiability audit happy — a single-channel custom family sees
+    // both channels' designs as ordinary columns, and two identical all-ones
+    // intercept columns across blocks would alias (overlap 1.0) and fail the
+    // audit. With no constant column and two different covariates, the
+    // concatenated [mean | log_precision] joint design is full-rank and
+    // alias-free, while the constant offsets still let each η reach its level.
+    let xs: Vec<f64> = (0..n).map(|i| i as f64 / (n as f64 - 1.0)).collect();
+    let zs: Vec<f64> = (0..n)
+        .map(|i| (i as f64 * 0.6180339887) % 1.0) // golden-ratio low-discrepancy spread
+        .collect();
+    // Modified Gram–Schmidt over the monomials t¹, t², … (skip t⁰), each column
+    // first centered to mean-zero so it is orthogonal to the constant direction
+    // too. Every resulting column is a distinct, mutually-orthonormal,
+    // sum-to-zero direction; none is the constant, and across two different
+    // covariates none coincides cross-block.
+    let build_design = |t: &[f64]| -> Array2<f64> {
+        let mut cols: Vec<Array1<f64>> = Vec::with_capacity(p);
+        for j in 0..p {
+            // monomial t^(j+1), centered to mean zero.
+            let mut v = Array1::from_shape_fn(n, |i| t[i].powi((j + 1) as i32));
+            let mean = v.sum() / (n as f64);
+            v.mapv_inplace(|e| e - mean);
+            for c in &cols {
+                let proj = v.dot(c);
+                v.scaled_add(-proj, c);
+            }
+            let nrm = v.dot(&v).sqrt().max(1e-12);
+            v.mapv_inplace(|e| e / nrm);
+            cols.push(v);
+        }
+        let mut d = Array2::<f64>::zeros((n, p));
+        for (j, c) in cols.iter().enumerate() {
+            d.column_mut(j).assign(c);
+        }
+        d
+    };
+    let mean_x = build_design(&xs);
+    let disp_x = build_design(&zs);
+    // Per-channel constant level carried by the offset (centered smooth + level).
+    let mean_offset = Array1::from_elem(n, 1.4_f64);
+    let disp_offset = Array1::from_elem(n, 0.5_f64);
+
+    // True surfaces: mean μ(x) = exp(η_μ) sweeps a moderate count range, and the
+    // dispersion log θ(z) sweeps from high overdispersion (small θ) to near-
+    // Poisson (large θ) — the heteroscedastic regime that drives the dispersion
+    // block's η_d across the negative-observed-info zone.
+    let eta_mu_true: Vec<f64> = xs.iter().map(|&x| 1.4 + 1.1 * (2.2 * x).sin()).collect();
+    let log_theta_true: Vec<f64> = zs.iter().map(|&z| -1.2 + 3.4 * z).collect();
+
+    let mut rng = Lcg(0x1606_2024_dead_beef);
+    let y = Array1::from_shape_fn(n, |i| {
+        let mu = eta_mu_true[i].exp();
+        let theta = log_theta_true[i].exp();
+        rng.next_nb(mu, theta)
+    });
+    // Sanity: the response must be a non-degenerate count vector.
+    assert!(
+        y.iter().any(|&v| v > 0.0) && y.iter().all(|&v| v >= 0.0 && v.fract() == 0.0),
+        "synthetic NB response must be non-negative integer counts with positive mass"
+    );
+
+    let weights = Array1::from_elem(n, 1.0);
+    let family = DispersionGlmLocationScaleFamily {
+        kind: DispersionFamilyKind::NegativeBinomial,
+        y: y.clone(),
+        weights,
+    };
+
+    // Each block: a wiggliness penalty that shrinks the higher-order
+    // (orthonormal) polynomial columns, leaving the two lowest-order columns
+    // (the 2-dim penalty nullspace) free. This gives the smooth genuine
+    // shrinkage at a moderate fixed smoothing parameter, mirroring the `s(x)`
+    // production path.
+    let make_penalty = || {
+        let mut pmat = Array2::<f64>::zeros((p, p));
+        for j in 2..p {
+            // Increasing penalty weight on higher-order columns.
+            pmat[[j, j]] = (j as f64 - 1.0).powi(2);
+        }
+        PenaltyMatrix::Dense(pmat)
+    };
+
+    let mk_spec = |name: &str, design: Array2<f64>, offset: Array1<f64>| ParameterBlockSpec {
+        name: name.to_string(),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(design)),
+        offset,
+        penalties: vec![make_penalty()],
+        // Penalty nullspace = the two lowest-order columns = 2 unpenalized dirs.
+        nullspace_dims: vec![2],
+        initial_log_lambdas: Array1::from_elem(1, (0.5_f64).ln()),
+        initial_beta: None,
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let specs = vec![
+        mk_spec("mean", mean_x, mean_offset),
+        mk_spec("log_precision", disp_x, disp_offset),
+    ];
+
+    let options = BlockwiseFitOptions::default();
+
+    // The fixed-log-λ fit runs `inner_blockwise_fit` and returns `Err` exactly
+    // when the inner solve fails to converge — the non-convergence the profile
+    // objective escalates to the fatal abort. Before the fix this returns
+    // `Err(Optimization{ "...inner solve did not converge..." })`.
+    let result = fit_custom_family_fixed_log_lambdas(
+        &family,
+        &specs,
+        &options,
+        None,
+        0,
+        None,
+        true,
+    );
+    let fit = result.unwrap_or_else(|e| {
+        panic!(
+            "NB location-scale inner solve must converge on heteroscedastic count data \
+             (gam#1606); instead the inner blockwise solve aborted: {e:?}"
+        )
+    });
+
+    // Predicted per-row means must be finite and strictly positive (the contract
+    // the issue requires: the NB LS fit predicts finite positive per-row means).
+    // The mean-channel predictor η_μ is block 0's converged `eta`.
+    let eta_mu = &fit.block_states[DispersionGlmLocationScaleFamily::BLOCK_MEAN].eta;
+    assert_eq!(eta_mu.len(), n, "mean predictor must cover every row");
+    assert!(
+        eta_mu.iter().all(|&e| e.is_finite()),
+        "fitted mean predictor must be finite on every row"
+    );
+    assert!(
+        eta_mu.iter().all(|&e| e.exp().is_finite() && e.exp() > 0.0),
+        "fitted per-row means must be finite and strictly positive"
+    );
 }

@@ -626,10 +626,11 @@ pub(super) fn dispersion_row_kernel(
             let theta = ed.exp().max(1e-12); // precision (size)
             let tpm = theta + mu;
             let tower = dispersion_nb_disp_order2(yi, mu, theta, wi);
-            // Exact dispersion score off the θ-tower (drives the working-response
-            // RHS); the tower's observed curvature h[θ][θ] is intentionally NOT
-            // used for the working weight — see #1606 below.
-            let s_theta = tower_score_info(&tower, 0, wi).0;
+            // Only the exact θ-space SCORE is consumed from the tower; the
+            // observed-Hessian channel is discarded in favor of the expected
+            // (Fisher) information assembled below (see the dispersion-curvature
+            // note). Keeping the value channel for the row log-likelihood.
+            let (s_theta, _info_theta_observed) = tower_score_info(&tower, 0, wi);
             let loglik = -tower.value();
             let info_mu = if wi == 0.0 {
                 DISPERSION_MIN_CURVATURE
@@ -639,27 +640,42 @@ pub(super) fn dispersion_row_kernel(
             let score_mu = theta * (yi - mu) / (mu * tpm);
             let mean_weight = wi * mu * mu * info_mu;
             let mean_response = em + score_mu / (mu * info_mu);
-            // #1606: the dispersion working curvature must be the EXPECTED
-            // (Fisher) NB-size information, NOT the per-row OBSERVED information
-            // `tower.h[θ][θ] = ψ'(θ)−ψ'(θ+y) − 1/θ + 2/(θ+μ) − (θ+y)/(θ+μ)²`.
-            // For an overdispersed row (y ≫ μ — the common NB case) the observed
-            // info goes NEGATIVE; clamped to the absolute floor 1e-12 it collapses
-            // the row's working weight while its exact score stays in the RHS, so
-            // `disp_response = ed + s_theta/(θ·1e-12)` explodes and the two-block
-            // inner P-IRLS diverges (plain scalar-θ NB is immune — it sums the
-            // observed info to a positive aggregate; Gamma/Beta already use their
-            // expected shape information here). The expected info, with Y replaced
-            // by its mean μ inside the trigamma stack (the rational terms are
-            // exact in expectation since E[Y]=μ), is
-            //     I_E = ψ'(θ) − ψ'(θ+μ) − 1/θ + 1/(θ+μ) = g(θ) − g(θ+μ)
-            // with g(x)=ψ'(x)−1/x strictly decreasing, hence > 0 for all θ,μ > 0.
-            // The working response is built so W·(z−η)=exact score independent of
-            // W, so this reconditioning leaves the inner KKT point β̂(ρ) unchanged
-            // and makes the dispersion Hessian block PSD.
-            let trigamma_theta = gam_math::jet_tower::ln_gamma_derivative_stack_order2(theta)[2];
-            let trigamma_tpm = gam_math::jet_tower::ln_gamma_derivative_stack_order2(tpm)[2];
-            let info_theta = trigamma_theta - trigamma_tpm - 1.0 / theta + 1.0 / tpm;
-            let info_pos = info_theta.max(DISPERSION_MIN_CURVATURE);
+            // Dispersion (log-θ) IRLS curvature: use the EXPECTED (Fisher)
+            // information in θ, not the per-row OBSERVED Hessian channel
+            // (`_info_theta_observed`). The NB2 log-likelihood is strongly
+            // non-quadratic in θ: `−∂²ℓ/∂θ²` carries the row-specific term
+            // `ψ′(θ+y)` and goes NEGATIVE for every row whose count sits below
+            // its current fitted precision (overestimated size / underestimated
+            // overdispersion). Far from the optimum a majority of rows can be
+            // negative, so the assembled block curvature `Xᵀdiag(w)X` loses
+            // positive-definiteness; flooring each negative row at
+            // `DISPERSION_MIN_CURVATURE` (≈0) then divides the exact score by
+            // ~0 in the working response, producing O(1e12) IRLS targets that
+            // make the dispersion block step explode and the inner block-cyclic
+            // solve stall (never reaching KKT within the cycle budget — the
+            // `nb` location-scale `IntegrationError`, gam#1606). The mean block
+            // already uses its closed-form expected info `θ/(μ(θ+μ))`; the
+            // dispersion block must do the same.
+            //
+            // The Fisher information in θ has the closed form
+            //   I(θ) = ψ′(θ) − E[ψ′(θ+Y)] − 1/θ + 1/(θ+μ),
+            // whose only costly piece is the per-row infinite expectation
+            // `E[ψ′(θ+Y)]`. Replacing it with the Jensen plug-in `ψ′(θ+μ)`
+            // (valid because ψ′ is convex, so this is a tight lower bound on the
+            // expectation) gives a per-row, sum-free, STRICTLY POSITIVE
+            // curvature
+            //   I_θ ≈ ψ′(θ) − ψ′(θ+μ) − 1/θ + 1/(θ+μ) > 0  for all (μ,θ),
+            // since ψ′ is strictly decreasing. The working RESPONSE still
+            // carries the EXACT score `s_theta` (= ∂ℓ/∂θ from the tower), so the
+            // penalized stationary point (score = 0) is byte-unchanged — this is
+            // Fisher scoring, which only re-conditions the inner solve and never
+            // shifts the optimum (cf. the `DISPERSION_MIN_CURVATURE` contract
+            // note above). The observed channel `_info_theta_observed` is no
+            // longer consumed for the weight.
+            let trigamma_theta = gam_math::jet_tower::trigamma_derivative_stack(theta)[0];
+            let trigamma_tpm = gam_math::jet_tower::trigamma_derivative_stack(tpm)[0];
+            let info_theta_fisher = trigamma_theta - trigamma_tpm - 1.0 / theta + 1.0 / tpm;
+            let info_pos = info_theta_fisher.max(DISPERSION_MIN_CURVATURE);
             let disp_weight = wi * theta * theta * info_pos;
             let disp_response = ed + s_theta / (theta * info_pos);
             DispersionRowKernel {
