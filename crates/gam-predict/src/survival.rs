@@ -404,3 +404,110 @@ impl PredictableModel for SurvivalPredictor {
         vec![BlockRole::Threshold, BlockRole::Scale]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inverse_sigma_at_zero_is_one() {
+        let result = survival_inverse_sigma_from_eta_log_sigma(0.0);
+        assert!((result - 1.0).abs() < 1e-15);
+    }
+
+    #[test]
+    fn inverse_sigma_positive_eta_decreases() {
+        let result = survival_inverse_sigma_from_eta_log_sigma(1.0);
+        assert!((result - (-1.0_f64).exp()).abs() < 1e-15);
+    }
+
+    #[test]
+    fn inverse_sigma_negative_eta_increases() {
+        let result = survival_inverse_sigma_from_eta_log_sigma(-2.0);
+        assert!((result - 2.0_f64.exp()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn inverse_sigma_large_positive_clamps_near_zero() {
+        // exp(-eta) clamped at exp(-500) ≈ 0
+        let result = survival_inverse_sigma_from_eta_log_sigma(1000.0);
+        assert!(result < 1e-200);
+    }
+
+    #[test]
+    fn inverse_sigma_large_negative_uses_cap() {
+        // exp(-eta) clamped to exp(500) for eta = -1000
+        let result = survival_inverse_sigma_from_eta_log_sigma(-1000.0);
+        let capped = 500.0_f64.exp();
+        assert!((result - capped).abs() < 1e-6 * capped);
+    }
+
+    #[test]
+    fn q0_zero_threshold_returns_zero_and_inv_sigma() {
+        let (q0, inv_sigma) = survival_q0_and_inverse_sigma(0.0, 1.0);
+        assert_eq!(q0, 0.0);
+        assert!((inv_sigma - (-1.0_f64).exp()).abs() < 1e-15);
+    }
+
+    #[test]
+    fn q0_unit_threshold_and_zero_log_sigma() {
+        // eta_threshold = 1.0, eta_log_sigma = 0.0 → inv_sigma = 1.0, q0 = -1.0
+        let (q0, inv_sigma) = survival_q0_and_inverse_sigma(1.0, 0.0);
+        assert!((inv_sigma - 1.0).abs() < 1e-15);
+        assert!((q0 - (-1.0)).abs() < 1e-15);
+    }
+
+    #[test]
+    fn q0_negative_threshold_positive_sign() {
+        // eta_threshold = -2.0, eta_log_sigma = 0.0 → q0 = -(-2.0)*1.0 = 2.0
+        let (q0, _) = survival_q0_and_inverse_sigma(-2.0, 0.0);
+        assert!((q0 - 2.0).abs() < 1e-15);
+    }
+
+    #[test]
+    fn q0_large_positive_threshold_clamps_to_neg_max() {
+        // Very large positive threshold: log_abs > 500 → q0 = -f64::MAX
+        let (q0, _) = survival_q0_and_inverse_sigma(1e300, 0.0);
+        assert_eq!(q0, -f64::MAX);
+    }
+
+    #[test]
+    fn q0_large_negative_threshold_clamps_to_pos_max() {
+        let (q0, _) = survival_q0_and_inverse_sigma(-1e300, 0.0);
+        assert_eq!(q0, f64::MAX);
+    }
+
+    #[test]
+    fn survival_tail_probit_at_infinity_is_zero() {
+        let link = InverseLink::Standard(gam::types::StandardLink::Probit);
+        let jet = InverseLinkJet { mu: 0.0, d1: 0.0, d2: 0.0, d3: 0.0 };
+        let tail = survival_tail_value_from_failure_jet(&link, f64::INFINITY, &jet);
+        assert_eq!(tail, 0.0);
+    }
+
+    #[test]
+    fn survival_tail_probit_at_neg_infinity_is_one() {
+        let link = InverseLink::Standard(gam::types::StandardLink::Probit);
+        let jet = InverseLinkJet { mu: 1.0, d1: 0.0, d2: 0.0, d3: 0.0 };
+        let tail = survival_tail_value_from_failure_jet(&link, f64::NEG_INFINITY, &jet);
+        assert_eq!(tail, 1.0);
+    }
+
+    #[test]
+    fn survival_tail_logit_at_zero_is_half() {
+        let link = InverseLink::Standard(gam::types::StandardLink::Logit);
+        let jet = InverseLinkJet { mu: 0.5, d1: 0.25, d2: 0.0, d3: 0.0 };
+        let tail = survival_tail_value_from_failure_jet(&link, 0.0, &jet);
+        // 1 / (1 + exp(0)) = 0.5
+        assert!((tail - 0.5).abs() < 1e-15);
+    }
+
+    #[test]
+    fn survival_tail_cloglog_at_zero() {
+        let link = InverseLink::Standard(gam::types::StandardLink::CLogLog);
+        let jet = InverseLinkJet { mu: 0.0, d1: 0.0, d2: 0.0, d3: 0.0 };
+        // exp(-exp(0)) = exp(-1)
+        let tail = survival_tail_value_from_failure_jet(&link, 0.0, &jet);
+        assert!((tail - (-1.0_f64).exp()).abs() < 1e-15);
+    }
+}
