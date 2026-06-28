@@ -1109,6 +1109,39 @@ pub trait CustomFamily {
         false
     }
 
+    /// Full-span cross-block smoothing penalties, in **raw** (pre-canonicalisation)
+    /// coordinates over the entire stacked parameter vector `Σ_b p_b_raw`.
+    ///
+    /// The per-block [`ParameterBlockSpec::penalties`] model can only express a
+    /// penalty whose support is confined to one block's column range. Some
+    /// families need a penalty that genuinely couples blocks — most notably the
+    /// reference-symmetric (CLR / "centered") softmax penalty
+    /// `λ_t · ((I − J/K) ⊗ S_t)` whose cross-class `−(λ_t/K)·S_t` off-diagonal
+    /// blocks make the multinomial fit invariant to the arbitrary reference class
+    /// (gam#1587; the multinomial analogue of the ALR-reference sibling #1549).
+    ///
+    /// A family returns one [`JointPenaltySpec`] per smoothing coordinate it wants
+    /// selected jointly. Each spec carries a dense PSD `raw_total × raw_total`
+    /// quadratic form, an `initial_log_lambda`, a structural `nullspace_dim`, and
+    /// an optional precision `label` (specs sharing a label tie to one outer ρ).
+    /// The custom-family driver pulls each matrix back through the
+    /// identifiability gauge `T_full` (`S_red = T_fullᵀ S_raw T_full`), assigns
+    /// the (tied) outer ρ coordinate, threads the current λ through the inner
+    /// solve as a [`gam_problem::JointPenaltyBundle`], and adds the full-width
+    /// `DenseRoot` penalty coordinate to the outer REML objective / analytic
+    /// gradient / pseudo-logdet so the **same** centered penalty drives the inner
+    /// β̂, the LAML logdet, and the smoothing-parameter selection.
+    ///
+    /// A family that supplies joint penalties for a smooth term must NOT also
+    /// attach that term's per-block penalty (it would double-count); the joint
+    /// penalty is the sole carrier of that term's smoothing.
+    ///
+    /// Default: none — every existing family keeps its purely per-block penalty
+    /// model and all joint-penalty code paths are skipped.
+    fn joint_penalty_specs(&self) -> Result<Vec<gam_problem::JointPenaltySpec>, String> {
+        Ok(Vec::new())
+    }
+
     /// Optional Tier-B Jeffreys information matrix.
     ///
     /// Defaults to the exact joint Newton Hessian for existing families.

@@ -75,6 +75,19 @@ use gam_problem::{DenseMatrixHyperOperator, HyperOperator};
 use ndarray::{Array1, Array2, Array3, ArrayView2};
 use std::sync::{Arc, Mutex};
 
+/// The reference-symmetric class-space metric `M = I_m − J_m/K` (`m = K−1`
+/// active classes, `J` = all-ones), the closed-form CLR whitening factor of
+/// the softmax gauge (gam#1587). Symmetric positive-definite with eigenvalues
+/// `1` (multiplicity `m−1`) and `1/K` (once).
+pub(crate) fn centered_class_metric(m: usize, k: usize) -> Array2<f64> {
+    let inv_k = 1.0 / k as f64;
+    let mut metric = Array2::<f64>::from_elem((m, m), -inv_k);
+    for a in 0..m {
+        metric[[a, a]] += 1.0;
+    }
+    metric
+}
+
 /// Joint-coupled multinomial-logit family with shared design and shared
 /// smoothing penalty across active classes.
 ///
@@ -165,6 +178,12 @@ pub struct MultinomialFamily {
     /// for EVERY ρ — only a proper prior on that quotient-null subspace can
     /// bound it, never a smoothing parameter.
     use_joint_jeffreys_term: bool,
+    /// Warm-start seed `log λ` for the reference-symmetric joint smoothing
+    /// penalties (gam#1587). The formula REML driver overrides this from its
+    /// `init_lambda` so the joint-penalty outer ρ starts at the same seed the
+    /// per-block path used historically; the outer loop then selects the true
+    /// optimum. Defaults to `0.0` (`λ = 1`).
+    initial_log_lambda: f64,
 }
 
 /// One frozen-`β` snapshot of every canonical-axis joint-Hessian directional
@@ -306,6 +325,7 @@ impl MultinomialFamily {
             likelihood,
             axis_derivative_cache: Arc::new(Mutex::new(None)),
             use_joint_jeffreys_term: true,
+            initial_log_lambda: 0.0,
         })
     }
 
@@ -401,6 +421,58 @@ impl MultinomialFamily {
     /// Total stacked-coefficient dimension `(K − 1) · P`.
     pub fn beta_flat_dim(&self) -> usize {
         self.active_classes() * self.design.ncols()
+    }
+
+    /// Build the reference-symmetric ("centered") full-width smoothing
+    /// penalties `λ_t · (M ⊗ S_t)`, one per smooth term `t`, in raw stacked
+    /// (class-major) coordinates `[β_0; …; β_{K-2}]` (gam#1587).
+    ///
+    /// `M = I_{K-1} − J_{K-1}/K` is the closed-form CLR whitening metric of the
+    /// softmax class gauge (the multinomial analogue of the resolved ALR
+    /// sibling #1549). The quadratic form `βᵀ (M ⊗ S_t) β` equals the symmetric
+    /// CLR penalty `Σ_{k=0}^{K-1} β̃_{k}ᵀ S_t β̃_{k}` over centered coefficients
+    /// `β̃_k = β_k − (1/K)Σ_b β_b` (`β_{K-1} ≡ 0`), a symmetric function of all
+    /// `K` classes — so the penalized fit no longer depends on which class is
+    /// the arbitrary softmax reference. Block `(a, b)` of the returned
+    /// `(M·P)×(M·P)` matrix is `M[a,b]·S_t`; `M` is SPD (eigenvalues `1` with
+    /// multiplicity `K−2` and `1/K` once), so each `M ⊗ S_t` is PSD with
+    /// `nullspace_dim = (K−1)·nullspace_dim(S_t)`.
+    ///
+    /// Every spec carries the per-term precision label `multinomial_term_{t}`
+    /// so the outer loop ties one shared `λ_t` across all classes (the gauge
+    /// the centered metric requires; an untied per-(class,term) `λ` is itself a
+    /// second source of reference dependence).
+    pub fn centered_joint_penalty_specs(&self) -> Vec<gam_problem::JointPenaltySpec> {
+        let m = self.active_classes();
+        let k = self.total_classes;
+        let p = self.design.ncols();
+        let metric = centered_class_metric(m, k);
+        let raw_total = m * p;
+        self.penalties
+            .iter()
+            .enumerate()
+            .map(|(t, pen)| {
+                let s_t = pen.to_dense();
+                let mut matrix = Array2::<f64>::zeros((raw_total, raw_total));
+                for a in 0..m {
+                    for b in 0..m {
+                        let scale = metric[[a, b]];
+                        for i in 0..p {
+                            for j in 0..p {
+                                matrix[[a * p + i, b * p + j]] = scale * s_t[[i, j]];
+                            }
+                        }
+                    }
+                }
+                let ns_t = self.penalty_nullspace_dims.get(t).copied().unwrap_or(0);
+                gam_problem::JointPenaltySpec {
+                    label: Some(format!("multinomial_term_{t}")),
+                    matrix,
+                    initial_log_lambda: self.initial_log_lambda,
+                    nullspace_dim: m * ns_t,
+                }
+            })
+            .collect()
     }
 
     fn specs_match_workspace_shape(&self, specs: &[ParameterBlockSpec]) -> bool {
@@ -1571,6 +1643,15 @@ impl MultinomialFamily {
 impl CustomFamily for MultinomialFamily {
     fn joint_jeffreys_term_required(&self) -> bool {
         self.use_joint_jeffreys_term
+    }
+
+    fn joint_penalty_specs(&self) -> Result<Vec<gam_problem::JointPenaltySpec>, String> {
+        // gam#1587: the smooth-term penalties are carried as reference-symmetric
+        // full-width `M ⊗ S_t` joint penalties (not per-block `I ⊗ S_t`), so the
+        // multinomial fit is invariant to the arbitrary reference class. The
+        // per-class block specs therefore attach NO smooth penalty (see
+        // `build_block_specs`); this is the sole carrier of their smoothing.
+        Ok(self.centered_joint_penalty_specs())
     }
 
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
@@ -3304,5 +3385,145 @@ mod tests {
             curv_hphi.is_finite() && curv_hphi >= curv_h,
             "augmented curvature {curv_hphi} must dominate the near-zero bare curvature {curv_h}"
         );
+    }
+
+    /// A second-difference penalty on `p` coefficients: `D₂ᵀD₂` where `D₂` is the
+    /// `(p−2)×p` second-difference operator. Rank `p−2` (nullspace = constants +
+    /// linears), a realistic smooth-term penalty with a genuine nullspace.
+    fn second_difference_penalty(p: usize) -> Array2<f64> {
+        let mut s = Array2::<f64>::zeros((p, p));
+        for r in 0..p.saturating_sub(2) {
+            // row of D₂: [.. 1, -2, 1 ..]
+            let d = [1.0_f64, -2.0, 1.0];
+            for (a, &da) in d.iter().enumerate() {
+                for (b, &db) in d.iter().enumerate() {
+                    s[[r + a, r + b]] += da * db;
+                }
+            }
+        }
+        s
+    }
+
+    /// gam#1587: the reference-symmetric centered penalty `M ⊗ S` is a symmetric
+    /// function of all `K` classes, so its quadratic form is identical under
+    /// every choice of reference class — while the legacy reference-anchored
+    /// (block-diagonal `Σ_a β_aᵀ S β_a`) penalty genuinely disagrees. This is the
+    /// pure-algebra core of the fix; the end-to-end fit invariance is verified by
+    /// `tests/glm/families/multinomial_reference_class_invariant_1587`.
+    #[test]
+    fn centered_penalty_is_reference_class_invariant_1587() {
+        let p = 5usize;
+        let s = second_difference_penalty(p);
+        // A fixed set of full per-class smooth coefficients γ_0,γ_1,γ_2 (K=3).
+        // The softmax depends only on η differences, so the penalized fit must
+        // not care which class is pinned to η ≡ 0.
+        let gamma: [Array1<f64>; 3] = [
+            array![0.4, -0.1, 0.7, 0.2, -0.5],
+            array![-0.3, 0.8, 0.1, -0.6, 0.25],
+            array![0.15, 0.05, -0.4, 0.9, -0.2],
+        ];
+        let k = 3usize;
+        let m = k - 1;
+        let metric = centered_class_metric(m, k);
+
+        // For reference class `r`, the active (ALR) coefficients are the two
+        // non-reference classes' `γ_a − γ_r`. Build the stacked β^{(r)} and
+        // evaluate both penalties.
+        let centered_value = |r: usize| -> f64 {
+            let actives: Vec<usize> = (0..3).filter(|&c| c != r).collect();
+            let mut beta = Array1::<f64>::zeros(m * p);
+            for (a, &cls) in actives.iter().enumerate() {
+                let diff = &gamma[cls] - &gamma[r];
+                beta.slice_mut(ndarray::s![a * p..(a + 1) * p]).assign(&diff);
+            }
+            // βᵀ (M ⊗ S) β with block (a,b) = M[a,b]·S.
+            let mut acc = 0.0;
+            for a in 0..m {
+                for b in 0..m {
+                    let ba = beta.slice(ndarray::s![a * p..(a + 1) * p]);
+                    let bb = beta.slice(ndarray::s![b * p..(b + 1) * p]);
+                    acc += metric[[a, b]] * ba.dot(&s.dot(&bb));
+                }
+            }
+            acc
+        };
+        let diagonal_value = |r: usize| -> f64 {
+            let actives: Vec<usize> = (0..3).filter(|&c| c != r).collect();
+            actives
+                .iter()
+                .map(|&cls| {
+                    let diff = &gamma[cls] - &gamma[r];
+                    diff.dot(&s.dot(&diff))
+                })
+                .sum()
+        };
+
+        let c0 = centered_value(0);
+        let c1 = centered_value(1);
+        let c2 = centered_value(2);
+        assert!(
+            (c0 - c1).abs() < 1e-12 && (c0 - c2).abs() < 1e-12,
+            "centered penalty must be reference-invariant: {c0} {c1} {c2}"
+        );
+        // And it equals the symmetric CLR form Σ_k (γ_k − γ̄)ᵀ S (γ_k − γ̄).
+        let mean: Array1<f64> = (&gamma[0] + &gamma[1] + &gamma[2]) / 3.0;
+        let clr: f64 = gamma
+            .iter()
+            .map(|g| {
+                let c = g - &mean;
+                c.dot(&s.dot(&c))
+            })
+            .sum();
+        assert!(
+            (c0 - clr).abs() < 1e-10,
+            "centered penalty {c0} must equal the CLR form {clr}"
+        );
+
+        // The legacy reference-anchored penalty genuinely DEPENDS on r (the bug).
+        let d0 = diagonal_value(0);
+        let d1 = diagonal_value(1);
+        let d2 = diagonal_value(2);
+        let diag_spread = (d0 - d1).abs().max((d0 - d2).abs()).max((d1 - d2).abs());
+        assert!(
+            diag_spread > 1e-6,
+            "reference-anchored penalty should differ across references (reproducing the bug); spread {diag_spread}"
+        );
+    }
+
+    /// `M ⊗ S` is symmetric PSD with the declared nullspace `(K−1)·ns(S)`, the
+    /// contract `JointPenaltySpec::validate` and the outer pseudo-logdet rely on.
+    #[test]
+    fn centered_joint_penalty_spec_is_psd_with_declared_nullspace_1587() {
+        use gam_linalg::faer_ndarray::FaerEigh;
+        let p = 5usize;
+        let s = second_difference_penalty(p); // rank p-2 ⇒ ns(S) = 2
+        let k = 4usize; // K=4 ⇒ m=3
+        let m = k - 1;
+        let metric = centered_class_metric(m, k);
+        let raw_total = m * p;
+        let mut matrix = Array2::<f64>::zeros((raw_total, raw_total));
+        for a in 0..m {
+            for b in 0..m {
+                for i in 0..p {
+                    for j in 0..p {
+                        matrix[[a * p + i, b * p + j]] = metric[[a, b]] * s[[i, j]];
+                    }
+                }
+            }
+        }
+        // Symmetric.
+        for i in 0..raw_total {
+            for j in 0..raw_total {
+                assert!((matrix[[i, j]] - matrix[[j, i]]).abs() < 1e-14);
+            }
+        }
+        let (evals, _) = FaerEigh::eigh(&matrix, faer::Side::Lower).expect("eigh");
+        let mut sorted: Vec<f64> = evals.iter().copied().collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        // PSD: no meaningfully negative eigenvalue.
+        assert!(sorted[0] > -1e-10, "M⊗S must be PSD; min eig {}", sorted[0]);
+        // Nullspace dim = (K-1)·ns(S) = 3·2 = 6.
+        let zeros = sorted.iter().take_while(|&&v| v.abs() < 1e-9).count();
+        assert_eq!(zeros, m * 2, "nullspace dim must be (K-1)·ns(S); spectrum {sorted:?}");
     }
 }
