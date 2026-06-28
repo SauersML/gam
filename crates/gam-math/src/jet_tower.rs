@@ -1874,6 +1874,472 @@ pub fn generic_full_tower<const K: usize, P: RowNllProgramGeneric<K> + ?Sized>(
     prog.row_nll_generic(row, &vars)
 }
 
+// ── The RowJet bridge: one row-NLL body over scalar jets AND lane towers ─
+//
+// `JetScalar<K>` (jet_scalar.rs) abstracts the SCALAR jets — its `value()`
+// returns one `f64`, so the `f64x4` lane towers ([`Tower3Lane`] / [`Tower4Lane`])
+// CANNOT implement it (their value channel is four rows). `compose_unary_with`
+// exists as an inherent method on BOTH the scalar towers and the lane towers, but
+// as separate inherent methods, not a shared trait bound — so a row-NLL body
+// written `<S: JetScalar<K>>` could not be instantiated at `Tower4Lane`, and the
+// 4-rows-per-pass SIMD batch path could not reuse the single source.
+//
+// [`RowJet<K>`] is that shared bound. It exposes exactly the ops a row-NLL body
+// needs — `constant` / `variable` / `add` / `sub` / `mul` / `scale` / `neg`, the
+// value-derived `compose_unary_with`, and a per-lane domain `guard` — over BOTH
+// representations. A blanket impl makes every scalar `JetScalar<K>` a `RowJet<K>`
+// (so the scalar call sites compile unchanged and bit-identically), and explicit
+// impls route the `f64x4` lane towers through their existing per-lane methods. A
+// body written once over `R: RowJet<K>` then instantiates at a scalar jet for the
+// `(v, g, H)` / contracted-tensor channels AND at a lane tower for the batch.
+
+/// The verdict of a per-lane [`RowJet::guard`] domain check.
+///
+/// A scalar jet (a [`crate::jet_scalar::JetScalar`] via the blanket impl) carries
+/// ONE value, so it reports `lanes == 1` and a one-bit mask. A lane tower
+/// ([`Tower3Lane`] / [`Tower4Lane`] over `f64x4`) carries FOUR rows, so it reports
+/// `lanes == 4` and one mask bit per lane. The mask lets a batched program bail
+/// exactly the offending 4-group to the scalar tail ([`any_failed`](Self::any_failed)),
+/// or inspect which lanes tripped ([`lane_failed`](Self::lane_failed)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GuardVerdict {
+    lanes: u8,
+    failed_mask: u8,
+}
+
+impl GuardVerdict {
+    /// A scalar (1-lane) verdict: `pass == true` ⇒ no failure.
+    #[inline]
+    pub fn scalar(pass: bool) -> Self {
+        Self { lanes: 1, failed_mask: if pass { 0 } else { 1 } }
+    }
+    /// A 4-lane verdict from a per-lane failure mask (bit `i` ⇒ lane `i` failed).
+    #[inline]
+    pub fn lanes4(failed_mask: u8) -> Self {
+        Self { lanes: 4, failed_mask: failed_mask & 0x0f }
+    }
+    /// Number of active lanes inspected (1 scalar, 4 batch).
+    #[inline]
+    pub fn lanes(self) -> usize {
+        self.lanes as usize
+    }
+    /// True iff every inspected lane satisfied the predicate.
+    #[inline]
+    pub fn all_pass(self) -> bool {
+        self.failed_mask == 0
+    }
+    /// True iff at least one inspected lane failed the predicate.
+    #[inline]
+    pub fn any_failed(self) -> bool {
+        self.failed_mask != 0
+    }
+    /// True iff lane `i` failed the predicate.
+    #[inline]
+    pub fn lane_failed(self, i: usize) -> bool {
+        (self.failed_mask >> i) & 1 == 1
+    }
+    /// The raw failure mask (bit `i` ⇒ lane `i` failed).
+    #[inline]
+    pub fn failed_mask(self) -> u8 {
+        self.failed_mask
+    }
+}
+
+/// Copy-or-zero-pad a derivative stack from length `N` to length `M`. Used by the
+/// [`RowJet::compose_unary_with`] impls to bridge a program's chosen stack length
+/// to each tower's native compose width ([`Tower4Lane`]: 5, [`Tower3Lane`]: 4).
+/// `M ≥ N` zero-pads the unseeded high derivatives; `M < N` drops the unused tail
+/// — both total, so the order-`(M−1)` tower reads exactly the channels it needs
+/// and never an uninitialised entry. With `N == M` it is a verbatim copy (the
+/// common `N == 5` case is bit-identical to passing the stack straight through).
+#[inline]
+fn resize_stack<const N: usize, const M: usize>(s: [f64; N]) -> [f64; M] {
+    let mut out = [0.0_f64; M];
+    let m = N.min(M);
+    out[..m].copy_from_slice(&s[..m]);
+    out
+}
+
+/// The shared row-NLL algebra over BOTH the scalar jets and the `f64x4` lane
+/// towers — the bound that lets ONE single-source row-NLL body SIMD-batch 4
+/// rows/pass without a dual-source copy (module §"The RowJet bridge").
+///
+/// Every scalar [`crate::jet_scalar::JetScalar<K>`] is a `RowJet<K>` via the
+/// blanket impl below (`Value = f64`), bit-identically to its `JetScalar`
+/// methods; [`Tower3Lane`] / [`Tower4Lane`] over `f64x4` are `RowJet<K>` with
+/// `Value = [f64; 4]`, routing through their per-lane methods so lane `i` of a
+/// batched evaluation is `to_bits`-identical to the scalar evaluation on row `i`.
+pub trait RowJet<const K: usize>: Copy {
+    /// The value channel(s) seen by [`guard`](Self::guard) and
+    /// [`values`](Self::values): a single `f64` on a scalar jet, `[f64; 4]` on an
+    /// `f64x4` lane tower.
+    type Value: Copy;
+
+    /// A constant (value `c`, all derivatives zero), broadcast to every lane.
+    fn constant(c: f64) -> Self;
+    /// The seeded primary `slot` at value `x` (unit first derivative in `slot`),
+    /// broadcast to every lane. Per-lane-DISTINCT seeding for the batch path is
+    /// done by the lane instantiators ([`generic_batched_fourth_tower`] /
+    /// [`generic_batched_third_tower`]), which build the tower variables directly
+    /// from each row's primaries; this method is for any row-invariant auxiliary
+    /// variable a body introduces.
+    fn variable(x: f64, slot: usize) -> Self;
+    /// The value channel(s): `f64` (scalar) or `[f64; 4]` (lane).
+    fn values(&self) -> Self::Value;
+
+    /// Truncated Leibniz `self + o`.
+    fn add(&self, o: &Self) -> Self;
+    /// Truncated Leibniz `self − o`.
+    fn sub(&self, o: &Self) -> Self;
+    /// Truncated Leibniz `self · o`.
+    fn mul(&self, o: &Self) -> Self;
+    /// Multiply every channel by the plain scalar `s`.
+    fn scale(&self, s: f64) -> Self;
+    /// Negate every channel. Defaults to `scale(-1.0)`; the blanket overrides it
+    /// to delegate to [`crate::jet_scalar::JetScalar::neg`].
+    fn neg(&self) -> Self {
+        self.scale(-1.0)
+    }
+
+    /// Faà di Bruno compose with a unary special function whose `[f64; N]`
+    /// derivative stack is built from the running base value PER LANE through
+    /// `stack_fn`. This is the SHARED-TRAIT version of the `compose_unary_with`
+    /// inherent method that already exists on both the scalar towers and the lane
+    /// towers: on a scalar jet `stack_fn` is run once at the value; on an `f64x4`
+    /// lane tower it is re-run per lane (the four rows carry four distinct base
+    /// values), so lane `i` is `to_bits`-identical to the scalar result on row `i`.
+    /// Making it a trait method is precisely what lets a body written once over
+    /// `R: RowJet<K>` instantiate at the batch towers. `N` is widened/narrowed to
+    /// the tower's native width by [`resize_stack`] (`N == 5` is a verbatim copy).
+    fn compose_unary_with<const N: usize>(&self, stack_fn: impl Fn(f64) -> [f64; N]) -> Self;
+
+    /// Per-lane domain guard: evaluate `pred` on each active lane's value channel
+    /// and report which lanes failed (see [`GuardVerdict`]). A scalar jet checks
+    /// its one value; a lane tower checks all four. Lets a batched program detect
+    /// an out-of-domain row in a 4-group and bail that group to the scalar tail.
+    fn guard(&self, pred: impl Fn(f64) -> bool) -> GuardVerdict;
+
+    // ── value-derived transcendental conveniences ───────────────────────
+    // Each routes through `compose_unary_with` with the SAME derivative stack the
+    // corresponding `JetScalar` method uses, so on a scalar jet (blanket) the
+    // result is bit-identical to the `JetScalar` method, and on a lane tower lane
+    // `i` is bit-identical to the scalar result on row `i`.
+
+    /// `e^self`.
+    fn exp(&self) -> Self {
+        self.compose_unary_with(|u| {
+            let e = u.exp();
+            [e, e, e, e, e]
+        })
+    }
+    /// `ln(self)`. Caller guarantees positivity.
+    fn ln(&self) -> Self {
+        self.compose_unary_with(|u| {
+            let r = 1.0 / u;
+            [u.ln(), r, -r * r, 2.0 * r * r * r, -6.0 * r * r * r * r]
+        })
+    }
+    /// `√self`. Caller guarantees positivity.
+    fn sqrt(&self) -> Self {
+        self.compose_unary_with(|u| {
+            let s = u.sqrt();
+            [s, 0.5 / s, -0.25 / (u * s), 0.375 / (u * u * s), -0.9375 / (u * u * u * s)]
+        })
+    }
+    /// `1/self`.
+    fn recip(&self) -> Self {
+        self.compose_unary_with(|u| {
+            let r = 1.0 / u;
+            let r2 = r * r;
+            [r, -r2, 2.0 * r2 * r, -6.0 * r2 * r2, 24.0 * r2 * r2 * r]
+        })
+    }
+    /// `self^a` for real `a`. Caller guarantees a positive base.
+    fn powf(&self, a: f64) -> Self {
+        self.compose_unary_with(move |u| {
+            [
+                u.powf(a),
+                a * u.powf(a - 1.0),
+                a * (a - 1.0) * u.powf(a - 2.0),
+                a * (a - 1.0) * (a - 2.0) * u.powf(a - 3.0),
+                a * (a - 1.0) * (a - 2.0) * (a - 3.0) * u.powf(a - 4.0),
+            ]
+        })
+    }
+    /// `ln Γ(self)`. Caller guarantees a positive argument.
+    fn ln_gamma(&self) -> Self {
+        self.compose_unary_with(ln_gamma_derivative_stack)
+    }
+    /// `ψ(self)` (digamma). Caller guarantees a positive argument.
+    fn digamma(&self) -> Self {
+        self.compose_unary_with(digamma_derivative_stack)
+    }
+}
+
+/// Blanket: every scalar [`crate::jet_scalar::JetScalar<K>`] is a [`RowJet<K>`]
+/// with `Value = f64`. Each op delegates to the identical `JetScalar` method, so
+/// the existing scalar call sites compile UNCHANGED and bit-identically — the
+/// bridge adds the lane representation without churning the scalar path. (The
+/// concrete lane impls below cannot overlap this: [`Tower3Lane`] / [`Tower4Lane`]
+/// are local types that do not implement `JetScalar`, and the orphan rule forbids
+/// any downstream impl, so the coherence checker proves the impls disjoint.)
+impl<const K: usize, S: crate::jet_scalar::JetScalar<K>> RowJet<K> for S {
+    type Value = f64;
+    #[inline]
+    fn constant(c: f64) -> Self {
+        <S as crate::jet_scalar::JetScalar<K>>::constant(c)
+    }
+    #[inline]
+    fn variable(x: f64, slot: usize) -> Self {
+        <S as crate::jet_scalar::JetScalar<K>>::variable(x, slot)
+    }
+    #[inline]
+    fn values(&self) -> f64 {
+        crate::jet_scalar::JetScalar::value(self)
+    }
+    #[inline]
+    fn add(&self, o: &Self) -> Self {
+        crate::jet_scalar::JetScalar::add(self, o)
+    }
+    #[inline]
+    fn sub(&self, o: &Self) -> Self {
+        crate::jet_scalar::JetScalar::sub(self, o)
+    }
+    #[inline]
+    fn mul(&self, o: &Self) -> Self {
+        crate::jet_scalar::JetScalar::mul(self, o)
+    }
+    #[inline]
+    fn scale(&self, s: f64) -> Self {
+        crate::jet_scalar::JetScalar::scale(self, s)
+    }
+    #[inline]
+    fn neg(&self) -> Self {
+        crate::jet_scalar::JetScalar::neg(self)
+    }
+    #[inline]
+    fn compose_unary_with<const N: usize>(&self, stack_fn: impl Fn(f64) -> [f64; N]) -> Self {
+        crate::jet_scalar::JetScalar::compose_unary_with(self, |u| resize_stack::<N, 5>(stack_fn(u)))
+    }
+    #[inline]
+    fn guard(&self, pred: impl Fn(f64) -> bool) -> GuardVerdict {
+        GuardVerdict::scalar(pred(crate::jet_scalar::JetScalar::value(self)))
+    }
+}
+
+/// The `f64x4` lane [`Tower4Lane`] is a [`RowJet<K>`] with `Value = [f64; 4]`,
+/// routing each op through its existing per-lane method. Lane `i` of a batched
+/// evaluation is `to_bits`-identical to the scalar [`Tower4`] evaluation on row
+/// `i` (the per-lane methods are term-for-term lifts of the scalar tower).
+impl<const K: usize> RowJet<K> for Tower4Lane<wide::f64x4, K> {
+    type Value = [f64; 4];
+    #[inline]
+    fn constant(c: f64) -> Self {
+        Tower4Lane::constant(<wide::f64x4 as crate::jet_scalar::Lane>::splat(c))
+    }
+    #[inline]
+    fn variable(x: f64, slot: usize) -> Self {
+        Tower4Lane::variable(<wide::f64x4 as crate::jet_scalar::Lane>::splat(x), slot)
+    }
+    #[inline]
+    fn values(&self) -> [f64; 4] {
+        self.v.to_array()
+    }
+    #[inline]
+    fn add(&self, o: &Self) -> Self {
+        Tower4Lane::add(self, o)
+    }
+    #[inline]
+    fn sub(&self, o: &Self) -> Self {
+        Tower4Lane::sub(self, o)
+    }
+    #[inline]
+    fn mul(&self, o: &Self) -> Self {
+        Tower4Lane::mul(self, o)
+    }
+    #[inline]
+    fn scale(&self, s: f64) -> Self {
+        Tower4Lane::scale(self, s)
+    }
+    #[inline]
+    fn compose_unary_with<const N: usize>(&self, stack_fn: impl Fn(f64) -> [f64; N]) -> Self {
+        Tower4Lane::compose_unary_with(self, |u| resize_stack::<N, 5>(stack_fn(u)))
+    }
+    #[inline]
+    fn guard(&self, pred: impl Fn(f64) -> bool) -> GuardVerdict {
+        let vals = self.v.to_array();
+        let mut mask = 0u8;
+        for (i, &v) in vals.iter().enumerate() {
+            if !pred(v) {
+                mask |= 1 << i;
+            }
+        }
+        GuardVerdict::lanes4(mask)
+    }
+}
+
+/// The `f64x4` lane [`Tower3Lane`] is a [`RowJet<K>`] with `Value = [f64; 4]`,
+/// the order-≤3 sibling of the [`Tower4Lane`] impl. A body that uses `N == 5`
+/// stacks drops the (unused) fourth-derivative entry here, matching the scalar
+/// [`Tower3`] which also carries only up to the third tensor.
+impl<const K: usize> RowJet<K> for Tower3Lane<wide::f64x4, K> {
+    type Value = [f64; 4];
+    #[inline]
+    fn constant(c: f64) -> Self {
+        Tower3Lane::constant(<wide::f64x4 as crate::jet_scalar::Lane>::splat(c))
+    }
+    #[inline]
+    fn variable(x: f64, slot: usize) -> Self {
+        Tower3Lane::variable(<wide::f64x4 as crate::jet_scalar::Lane>::splat(x), slot)
+    }
+    #[inline]
+    fn values(&self) -> [f64; 4] {
+        self.v.to_array()
+    }
+    #[inline]
+    fn add(&self, o: &Self) -> Self {
+        Tower3Lane::add(self, o)
+    }
+    #[inline]
+    fn sub(&self, o: &Self) -> Self {
+        Tower3Lane::sub(self, o)
+    }
+    #[inline]
+    fn mul(&self, o: &Self) -> Self {
+        Tower3Lane::mul(self, o)
+    }
+    #[inline]
+    fn scale(&self, s: f64) -> Self {
+        Tower3Lane::scale(self, s)
+    }
+    #[inline]
+    fn compose_unary_with<const N: usize>(&self, stack_fn: impl Fn(f64) -> [f64; N]) -> Self {
+        Tower3Lane::compose_unary_with(self, |u| resize_stack::<N, 4>(stack_fn(u)))
+    }
+    #[inline]
+    fn guard(&self, pred: impl Fn(f64) -> bool) -> GuardVerdict {
+        let vals = self.v.to_array();
+        let mut mask = 0u8;
+        for (i, &v) in vals.iter().enumerate() {
+            if !pred(v) {
+                mask |= 1 << i;
+            }
+        }
+        GuardVerdict::lanes4(mask)
+    }
+}
+
+/// A family's row negative log-likelihood written ONCE over the [`RowJet`]
+/// bridge, so the SAME body instantiates at the scalar jets (for the `(v, g, H)`
+/// and contracted-tensor channels) AND at the `f64x4` lane towers (for the
+/// 4-rows-per-pass SIMD batch). This is the lane-capable successor to
+/// [`RowNllProgramGeneric`]: a body written here gets the scalar channels through
+/// [`rowjet_row_kernel`] / [`rowjet_third_contracted`] / [`rowjet_fourth_contracted`]
+/// and the batched channels through [`generic_batched_fourth_tower`] /
+/// [`generic_batched_third_tower`], all from a single source.
+pub trait RowNllProgramRowJet<const K: usize>: Send + Sync {
+    /// Number of observations the program covers.
+    fn n_rows(&self) -> usize;
+
+    /// Current primary-scalar values for `row` (where to seed each lane).
+    fn primaries(&self, row: usize) -> Result<[f64; K], String>;
+
+    /// The row NLL evaluated on the [`RowJet`] bridge. `rows` is the lane→row map
+    /// (length 1 for a scalar instantiation, length 4 for a batch); `p[a]` arrives
+    /// pre-seeded by the caller (base value plus, for the directional scalars, the
+    /// nilpotent contraction directions). The body uses ONLY [`RowJet`] ops and
+    /// per-row data entering through `rows`/`self` as constants.
+    fn row_nll<R: RowJet<K>>(&self, rows: &[usize], p: &[R; K]) -> Result<R, String>;
+}
+
+/// Evaluate a [`RowNllProgramRowJet`] at the value/gradient/Hessian scalar
+/// [`crate::jet_scalar::Order2`] (the `(v, g, H)` inner-Newton channel) — the
+/// `RowJet` twin of [`generic_row_kernel`].
+pub fn rowjet_row_kernel<const K: usize, P: RowNllProgramRowJet<K> + ?Sized>(
+    prog: &P,
+    row: usize,
+) -> Result<(f64, [f64; K], [[f64; K]; K]), String> {
+    let base = prog.primaries(row)?;
+    let vars: [crate::jet_scalar::Order2<K>; K] =
+        std::array::from_fn(|a| <crate::jet_scalar::Order2<K> as RowJet<K>>::variable(base[a], a));
+    let s = prog.row_nll(&[row], &vars)?;
+    Ok((crate::jet_scalar::JetScalar::value(&s), s.g(), s.h()))
+}
+
+/// Evaluate a [`RowNllProgramRowJet`] at the one-seed scalar
+/// [`crate::jet_scalar::OneSeed`], returning the contracted third
+/// `Σ_c ℓ_{abc} dir_c` — the `RowJet` twin of [`generic_third_contracted`].
+pub fn rowjet_third_contracted<const K: usize, P: RowNllProgramRowJet<K> + ?Sized>(
+    prog: &P,
+    row: usize,
+    dir: &[f64; K],
+) -> Result<[[f64; K]; K], String> {
+    let base = prog.primaries(row)?;
+    let vars: [crate::jet_scalar::OneSeed<K>; K] =
+        std::array::from_fn(|a| crate::jet_scalar::OneSeed::seed_direction(base[a], a, dir[a]));
+    let s = prog.row_nll(&[row], &vars)?;
+    Ok(s.contracted_third())
+}
+
+/// Evaluate a [`RowNllProgramRowJet`] at the two-seed scalar
+/// [`crate::jet_scalar::TwoSeed`], returning the contracted fourth
+/// `Σ_{cd} ℓ_{abcd} u_c v_d` — the `RowJet` twin of [`generic_fourth_contracted`].
+pub fn rowjet_fourth_contracted<const K: usize, P: RowNllProgramRowJet<K> + ?Sized>(
+    prog: &P,
+    row: usize,
+    dir_u: &[f64; K],
+    dir_v: &[f64; K],
+) -> Result<[[f64; K]; K], String> {
+    let base = prog.primaries(row)?;
+    let vars: [crate::jet_scalar::TwoSeed<K>; K] =
+        std::array::from_fn(|a| crate::jet_scalar::TwoSeed::seed(base[a], a, dir_u[a], dir_v[a]));
+    let s = prog.row_nll(&[row], &vars)?;
+    Ok(s.contracted_fourth())
+}
+
+/// Evaluate a [`RowNllProgramRowJet`] at the `f64x4` lane [`Tower4Batch`],
+/// computing the FULL `(v, g, H, t3, t4)` for FOUR rows in one SIMD pass — the
+/// lane twin of [`generic_full_tower`]. Each of the four lanes is seeded with its
+/// own row's primaries, so [`Tower4Batch::lane`]`(i)` is `to_bits`-identical to
+/// the scalar [`generic_full_tower`] on `rows[i]`.
+pub fn generic_batched_fourth_tower<const K: usize, P: RowNllProgramRowJet<K> + ?Sized>(
+    prog: &P,
+    rows: [usize; 4],
+) -> Result<Tower4Batch<K>, String> {
+    let bases: [[f64; K]; 4] = [
+        prog.primaries(rows[0])?,
+        prog.primaries(rows[1])?,
+        prog.primaries(rows[2])?,
+        prog.primaries(rows[3])?,
+    ];
+    let vars: [Tower4Batch<K>; K] = std::array::from_fn(|a| {
+        let lane_vals = wide::f64x4::new([bases[0][a], bases[1][a], bases[2][a], bases[3][a]]);
+        Tower4Batch::variable(lane_vals, a)
+    });
+    prog.row_nll(&rows, &vars)
+}
+
+/// Evaluate a [`RowNllProgramRowJet`] at the `f64x4` lane [`Tower3Batch`],
+/// computing `(v, g, H, t3)` for FOUR rows in one SIMD pass — the order-≤3 lane
+/// twin of [`generic_full_tower`]. [`Tower3Batch::lane`]`(i)` is
+/// `to_bits`-identical to the order-≤3 scalar evaluation on `rows[i]`.
+pub fn generic_batched_third_tower<const K: usize, P: RowNllProgramRowJet<K> + ?Sized>(
+    prog: &P,
+    rows: [usize; 4],
+) -> Result<Tower3Batch<K>, String> {
+    let bases: [[f64; K]; 4] = [
+        prog.primaries(rows[0])?,
+        prog.primaries(rows[1])?,
+        prog.primaries(rows[2])?,
+        prog.primaries(rows[3])?,
+    ];
+    let vars: [Tower3Batch<K>; K] = std::array::from_fn(|a| {
+        let lane_vals = wide::f64x4::new([bases[0][a], bases[1][a], bases[2][a], bases[3][a]]);
+        Tower3Batch::variable(lane_vals, a)
+    });
+    prog.row_nll(&rows, &vars)
+}
+
 // ── The oracle ───────────────────────────────────────────────────────
 
 /// One row's worth of hand-written kernel outputs, as claimed by a
@@ -4072,4 +4538,238 @@ pub fn unary_derivatives_log1mexp_positive(x: f64) -> [f64; 5] {
         r * (1.0 + r) * (1.0 + 2.0 * r),
         -r * (1.0 + r) * (1.0 + 6.0 * r + 6.0 * r * r),
     ]
+}
+// ── The RowJet bridge oracle (CI) ─────────────────────────────────────
+#[cfg(test)]
+mod rowjet_bridge_tests {
+    use super::*;
+    use crate::jet_scalar::{JetScalar, Order2};
+
+    /// A toy row-NLL written ONCE over the [`RowJet`] bridge: a product, a sum, a
+    /// subtraction, a scale/neg, a constant, and two value-distinct
+    /// `compose_unary_with` stacks (an exp stack and a smooth finite-everywhere
+    /// stack), plus a domain `guard`. The body is generic over `R: RowJet<2>`, so
+    /// the SAME source instantiates at the scalar jets and the `f64x4` lane towers.
+    struct ToyProgram {
+        primaries: Vec<[f64; 2]>,
+    }
+
+    impl ToyProgram {
+        fn body<R: RowJet<2>>(p: &[R; 2]) -> R {
+            let a = p[0].mul(&p[1]);
+            let b = a.add(&R::constant(0.5)).sub(&p[0].scale(0.25));
+            let c = b.compose_unary_with(|u| {
+                let e = u.exp();
+                [e, e, e, e, e]
+            });
+            let d = c.neg().add(&p[0]);
+            let e = d.compose_unary_with(|u| {
+                let s = (1.0 + u * u).sqrt();
+                let s3 = s * s * s;
+                let s5 = s3 * s * s;
+                let s7 = s5 * s * s;
+                [s, u / s, 1.0 / s3, -3.0 * u / s5, (12.0 * u * u - 3.0) / s7]
+            });
+            e.mul(&p[1]).add(&e)
+        }
+    }
+
+    impl RowNllProgramRowJet<2> for ToyProgram {
+        fn n_rows(&self) -> usize {
+            self.primaries.len()
+        }
+        fn primaries(&self, row: usize) -> Result<[f64; 2], String> {
+            Ok(self.primaries[row])
+        }
+        fn row_nll<R: RowJet<2>>(&self, rows: &[usize], p: &[R; 2]) -> Result<R, String> {
+            assert!(rows.len() == 1 || rows.len() == 4, "lane→row map is 1 or 4 wide");
+            Ok(Self::body(p))
+        }
+    }
+
+    fn assert_t4_bits_eq(a: &Tower4<2>, b: &Tower4<2>, ctx: &str) {
+        assert_eq!(a.v.to_bits(), b.v.to_bits(), "{ctx}: v");
+        for i in 0..2 {
+            assert_eq!(a.g[i].to_bits(), b.g[i].to_bits(), "{ctx}: g[{i}]");
+            for j in 0..2 {
+                assert_eq!(a.h[i][j].to_bits(), b.h[i][j].to_bits(), "{ctx}: h[{i}][{j}]");
+                for k in 0..2 {
+                    assert_eq!(
+                        a.t3[i][j][k].to_bits(),
+                        b.t3[i][j][k].to_bits(),
+                        "{ctx}: t3[{i}][{j}][{k}]"
+                    );
+                    for l in 0..2 {
+                        assert_eq!(
+                            a.t4[i][j][k][l].to_bits(),
+                            b.t4[i][j][k][l].to_bits(),
+                            "{ctx}: t4[{i}][{j}][{k}][{l}]"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn assert_t3_bits_eq(a: &Tower3<2>, b: &Tower3<2>, ctx: &str) {
+        assert_eq!(a.v.to_bits(), b.v.to_bits(), "{ctx}: v");
+        for i in 0..2 {
+            assert_eq!(a.g[i].to_bits(), b.g[i].to_bits(), "{ctx}: g[{i}]");
+            for j in 0..2 {
+                assert_eq!(a.h[i][j].to_bits(), b.h[i][j].to_bits(), "{ctx}: h[{i}][{j}]");
+                for k in 0..2 {
+                    assert_eq!(
+                        a.t3[i][j][k].to_bits(),
+                        b.t3[i][j][k].to_bits(),
+                        "{ctx}: t3[{i}][{j}][{k}]"
+                    );
+                }
+            }
+        }
+    }
+
+    // Deterministic LCG with signed-zero injection and per-lane-distinct values.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 11) as f64 / (1u64 << 53) as f64
+        }
+        fn val(&mut self) -> f64 {
+            let u = self.next();
+            if u < 0.04 {
+                return 0.0;
+            }
+            if u < 0.08 {
+                return -0.0;
+            }
+            (self.next() - 0.5) * 5.0
+        }
+    }
+
+    /// Lane `i` of the batched order-4 / order-3 tower is `to_bits`-identical to
+    /// the scalar tower on row `i`, for ≥2000 distinct 4-row batches with
+    /// signed-zero and per-lane-distinct primaries.
+    #[test]
+    fn batched_lane_i_matches_scalar_row_i_bit_identical() {
+        let mut rng = Lcg(0xA5A5_1234_DEAD_BEEF);
+        let mut batches = 0usize;
+        for _ in 0..2500 {
+            let bases: [[f64; 2]; 4] = std::array::from_fn(|_| std::array::from_fn(|_| rng.val()));
+            let prog = ToyProgram { primaries: bases.to_vec() };
+            let rows = [0usize, 1, 2, 3];
+
+            // order-4 batch vs scalar Tower4 (instantiated through the same body).
+            let batch4 = generic_batched_fourth_tower(&prog, rows).expect("batch4");
+            for (row, base) in bases.iter().enumerate() {
+                let vars: [Tower4<2>; 2] =
+                    std::array::from_fn(|a| <Tower4<2> as RowJet<2>>::variable(base[a], a));
+                let scal = prog.row_nll(&[row], &vars).expect("scalar tower4");
+                assert_t4_bits_eq(&batch4.lane(row), &scal, "batched_fourth");
+            }
+
+            // order-3 batch vs scalar Tower3.
+            let batch3 = generic_batched_third_tower(&prog, rows).expect("batch3");
+            for (row, base) in bases.iter().enumerate() {
+                let vars: [Tower3<2>; 2] =
+                    std::array::from_fn(|a| <Tower3<2> as RowJet<2>>::variable(base[a], a));
+                let scal = prog.row_nll(&[row], &vars).expect("scalar tower3");
+                assert_t3_bits_eq(&batch3.lane(row), &scal, "batched_third");
+            }
+            batches += 1;
+        }
+        assert_eq!(batches, 2500);
+    }
+
+    /// The blanket impl does not churn the scalar path: the body driven through
+    /// `RowJet` ops is `to_bits`-identical to the body driven directly through
+    /// `JetScalar` ops, and `rowjet_row_kernel`'s `(v, g, H)` matches the dense
+    /// `Tower4` lower channels.
+    #[test]
+    fn blanket_scalar_path_is_unchanged_and_consistent() {
+        let mut rng = Lcg(0x0BAD_F00D_1357_2468);
+        for _ in 0..3000 {
+            let base: [f64; 2] = std::array::from_fn(|_| rng.val());
+            let prog = ToyProgram { primaries: vec![base] };
+
+            // (a) RowJet-driven body == JetScalar-driven body, bit-for-bit.
+            let via_rowjet: Tower4<2> = {
+                let vars: [Tower4<2>; 2] =
+                    std::array::from_fn(|a| <Tower4<2> as RowJet<2>>::variable(base[a], a));
+                prog.row_nll(&[0], &vars).expect("rowjet")
+            };
+            let via_jetscalar: Tower4<2> = {
+                let vars: [Tower4<2>; 2] = std::array::from_fn(|a| {
+                    <Tower4<2> as JetScalar<2>>::variable(base[a], a)
+                });
+                // The body using JetScalar's own compose_unary_with directly.
+                let a = vars[0].mul(&vars[1]);
+                let b = a.add(&Tower4::constant(0.5)).sub(&vars[0].scale(0.25));
+                let c = b.compose_unary_with(|u| {
+                    let e = u.exp();
+                    [e, e, e, e, e]
+                });
+                let d = c.neg().add(&vars[0]);
+                let e = d.compose_unary_with(|u| {
+                    let s = (1.0 + u * u).sqrt();
+                    let s3 = s * s * s;
+                    let s5 = s3 * s * s;
+                    let s7 = s5 * s * s;
+                    [s, u / s, 1.0 / s3, -3.0 * u / s5, (12.0 * u * u - 3.0) / s7]
+                });
+                e.mul(&vars[1]).add(&e)
+            };
+            assert_t4_bits_eq(&via_rowjet, &via_jetscalar, "blanket_vs_direct");
+
+            // (b) rowjet_row_kernel (v,g,H) == dense Tower4 lower channels.
+            let (v, g, h) = rowjet_row_kernel(&prog, 0).expect("kernel");
+            assert_eq!(v.to_bits(), via_rowjet.v.to_bits(), "kernel v");
+            for i in 0..2 {
+                assert_eq!(g[i].to_bits(), via_rowjet.g[i].to_bits(), "kernel g[{i}]");
+                for j in 0..2 {
+                    assert_eq!(
+                        h[i][j].to_bits(),
+                        via_rowjet.h[i][j].to_bits(),
+                        "kernel h[{i}][{j}]"
+                    );
+                }
+            }
+
+            // (c) the Order2 scalar IS a RowJet via the blanket.
+            let o2: [Order2<2>; 2] =
+                std::array::from_fn(|a| <Order2<2> as RowJet<2>>::variable(base[a], a));
+            let _ = ToyProgram::body(&o2);
+        }
+    }
+
+    /// The per-lane guard reports exactly the failing lanes on a batch and the
+    /// single lane on a scalar jet.
+    #[test]
+    fn guard_reports_per_lane_failures() {
+        let cols: [[f64; 2]; 4] = [[1.0, 0.5], [-2.0, 0.5], [3.0, 0.5], [-0.0, 0.5]];
+        let vars: [Tower4Batch<2>; 2] = std::array::from_fn(|a| {
+            Tower4Batch::variable(
+                wide::f64x4::new([cols[0][a], cols[1][a], cols[2][a], cols[3][a]]),
+                a,
+            )
+        });
+        let verdict = vars[0].guard(|v| v > 0.0);
+        assert_eq!(verdict.lanes(), 4);
+        assert!(verdict.any_failed());
+        assert!(!verdict.all_pass());
+        assert!(!verdict.lane_failed(0));
+        assert!(verdict.lane_failed(1));
+        assert!(!verdict.lane_failed(2));
+        assert!(verdict.lane_failed(3));
+        assert_eq!(verdict.failed_mask(), 0b1010);
+
+        let s_ok = <Tower4<2> as RowJet<2>>::variable(1.0, 0);
+        let s_bad = <Tower4<2> as RowJet<2>>::variable(-1.0, 0);
+        assert!(RowJet::guard(&s_ok, |v| v > 0.0).all_pass());
+        assert!(RowJet::guard(&s_bad, |v| v > 0.0).any_failed());
+        assert_eq!(RowJet::guard(&s_ok, |v| v > 0.0).lanes(), 1);
+    }
 }
