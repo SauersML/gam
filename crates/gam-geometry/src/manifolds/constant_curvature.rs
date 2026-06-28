@@ -362,6 +362,48 @@ pub(crate) fn t0(w: f64) -> f64 {
     }
 }
 
+/// SIMD batch of the [`t0`] **series branch** — four `w = κ‖w‖²` arguments in
+/// the lanes of a [`wide::f64x4`], returning `T(w)` in the matching lanes.
+///
+/// Lane `i` is **bit-for-bit** identical to the scalar series of [`t0`] on
+/// `w[i]` whenever `|w[i]| ≤ T_SERIES_W_MAX` (the only lanes [`distance_batch`]
+/// keeps; lanes in the closed-form branch are recomputed scalar by the caller).
+/// Bit-identity is structural: every operation is a plain lane-wise IEEE
+/// `+`/`-`/`*`/`/` (never a fused `mul_add`), built in the SAME left-to-right
+/// order and with the SAME splatted scalar coefficients as the scalar term
+/// recurrence, so lane `i` evaluates exactly the scalar arithmetic on `w[i]`.
+/// The loop runs until **every** lane's next partial sum stops moving
+/// (`next == acc` in all four lanes) and is capped at [`T_SERIES_TERMS`]; a lane
+/// that converged earlier than its neighbours only accumulates the tail of terms
+/// that are too small to move its sum — a provable no-op on `|w| ≤
+/// T_SERIES_W_MAX` (the term magnitude is strictly decreasing there), exactly as
+/// the scalar `if next == acc { break }` early-stop, so the extra lane-passes
+/// change no bit.
+fn t0x4(w: wide::f64x4) -> wide::f64x4 {
+    use wide::f64x4;
+    let neg_w = -w;
+    let mut term = f64x4::splat(1.0);
+    let mut acc = f64x4::splat(1.0);
+    for m in 0..T_SERIES_TERMS {
+        let mf = m as f64;
+        // factor = -w · (m+1)·(2m+1) / ((m+1)·(2m+3)) — same op order/operands
+        // as the scalar `term *= ...` recurrence, lane-wise.
+        let factor = neg_w * f64x4::splat(mf + 1.0) * f64x4::splat(2.0 * mf + 1.0)
+            / f64x4::splat((mf + 1.0) * (2.0 * mf + 3.0));
+        term *= factor;
+        let next = acc + term;
+        // Collective bit-identical early stop: break only once all four lanes
+        // have stopped moving (NaN lanes from the closed branch never compare
+        // equal, so they simply run the loop to the T_SERIES_TERMS cap and are
+        // discarded by the caller).
+        if next.to_array() == acc.to_array() {
+            break;
+        }
+        acc = next;
+    }
+    acc
+}
+
 /// Value-only `(C(u), S(u))` — bit-for-bit `(cs_stacks(u).0[0], cs_stacks(u).1[0])`.
 ///
 /// The exp map's generalized tangent `tn_κ = t·S/C` needs both values; the radial
@@ -545,10 +587,15 @@ impl ConstantCurvature {
     /// `out[i] = self.distance(x, rows.row(i))` for every `i`.
     ///
     /// This is the throughput entry point the per-row response-geometry hot loop
-    /// calls. Every `out[i]` is **bit-for-bit** identical to the scalar
-    /// `distance(x, rows.row(i))`; the batch boundary lets the κ-stereographic
-    /// `T`-series (the dominant cost) be evaluated four rows at a time in SIMD
-    /// lanes without changing any result.
+    /// calls: the base `x` is constant across the batch (the κ-independent flat
+    /// centroid), so its chart validation is hoisted out of the per-row work and
+    /// the κ-stereographic `T`-series (the dominant cost) is evaluated four rows
+    /// at a time in [`wide::f64x4`] lanes via [`t0x4`]. Every `out[i]` is
+    /// **bit-for-bit** identical to the scalar `distance(x, rows.row(i))`: the
+    /// per-row Möbius/dot arithmetic is the same scalar `ndarray` code, and the
+    /// vectorised series reproduces the scalar [`t0`] value per lane exactly.
+    /// Lanes in the closed-form (`|κ‖w‖²| > T_SERIES_W_MAX`) branch and the
+    /// non-multiple-of-four tail fall back to the scalar path.
     pub fn distance_batch(
         &self,
         x: ArrayView1<'_, f64>,
@@ -561,8 +608,48 @@ impl ConstantCurvature {
             n,
             "distance_batch output length must equal the number of rows"
         );
-        for (i, slot) in out.iter_mut().enumerate() {
-            *slot = self.distance(x, rows.row(i))?;
+        // Validate the fixed base `x` once (it is constant across the batch).
+        self.check_len("constant-curvature distance x", x.len())?;
+        self.chart_gauge(x)?;
+        let neg_x = x.mapv(|v| -v);
+
+        let mut i = 0usize;
+        while i + 4 <= n {
+            // Per-row scalar Möbius/dot — bit-identical to `distance`'s prefix.
+            let mut nw2 = [0.0_f64; 4];
+            for (l, slot) in nw2.iter_mut().enumerate() {
+                let row = rows.row(i + l);
+                self.check_len("constant-curvature distance y", row.len())?;
+                self.chart_gauge(row)?;
+                let w = self.mobius_add(neg_x.view(), row)?;
+                *slot = w.dot(&w);
+            }
+            // Series argument `κ·‖w‖²` per lane — bit-identical to the scalar
+            // `t0(self.kappa * nw2)` argument.
+            let args = [
+                self.kappa * nw2[0],
+                self.kappa * nw2[1],
+                self.kappa * nw2[2],
+                self.kappa * nw2[3],
+            ];
+            let t_series = t0x4(wide::f64x4::from(args)).to_array();
+            for l in 0..4 {
+                // Series-branch lanes use the (bit-identical) vectorised value;
+                // closed-branch lanes take the scalar closed form so every lane
+                // equals `t0(args[l])` exactly.
+                let t_l = if args[l].abs() <= T_SERIES_W_MAX {
+                    t_series[l]
+                } else {
+                    t0(args[l])
+                };
+                out[i + l] = 2.0 * nw2[l].sqrt() * t_l;
+            }
+            i += 4;
+        }
+        // Non-multiple-of-four tail: scalar distance, bit-identical by definition.
+        while i < n {
+            out[i] = self.distance(x, rows.row(i))?;
+            i += 1;
         }
         Ok(())
     }
@@ -1415,9 +1502,18 @@ mod tests {
             let chart = ConstantCurvature::new(dim, kappa);
             // Deterministic base inside the chart (near the origin).
             let base = Array1::from_iter((0..dim).map(|j| 0.01 * (j as f64 + 1.0)));
+            // A "far" radius that stays inside the chart (`1 + κ‖x‖² > 0`) yet
+            // drives `|κ‖w‖²| > T_SERIES_W_MAX`, so the closed-form (atan/atanh)
+            // branch and its per-lane scalar override are exercised alongside the
+            // SIMD series lanes within the same 4-lane group.
+            let r_far = if kappa == 0.0 {
+                0.5
+            } else {
+                0.8 / kappa.abs().sqrt()
+            };
             // Build a batch whose sizes are NOT multiples of four so the tail
             // path is exercised, including a duplicate-of-base row (w = 0, the
-            // signed-zero / zero-distance edge).
+            // signed-zero / zero-distance edge) and far rows (closed branch).
             for &n in &[1usize, 2, 3, 5, 7, 2003] {
                 let mut rows = Array2::<f64>::zeros((n, dim));
                 let mut seed = 0x9e3779b97f4a7c15u64;
@@ -1429,12 +1525,18 @@ mod tests {
                         seed ^= seed >> 27;
                         let u = (seed.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64
                             / (1u64 << 53) as f64;
-                        rows[[i, j]] = 0.18 * (u - 0.5); // tiny radius → in-chart for all κ
+                        rows[[i, j]] = 0.18 * (u - 0.5); // tiny radius → series branch
                     }
                     // Every 5th row coincides with the base (exact zero distance).
                     if i % 5 == 0 {
                         for j in 0..dim {
                             rows[[i, j]] = base[j];
+                        }
+                    } else if i % 7 == 3 {
+                        // Far in-chart row → closed-form branch lane.
+                        rows[[i, 0]] = r_far;
+                        for j in 1..dim {
+                            rows[[i, j]] = 0.0;
                         }
                     }
                 }
