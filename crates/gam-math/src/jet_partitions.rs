@@ -365,124 +365,6 @@ impl crate::jet_algebra::JetAlgebra<DERIVS> for MultiDirJet {
     }
 }
 
-/// A flattened set-partition table for a fixed slot count. `parts[i] = (off,
-/// order)` describes one partition: its `order` block submasks (compacted) are
-/// `flat[off .. off + order]`.
-///
-/// This direct set-partition sum is the previous production `compose_unary`
-/// implementation, retained (test-gated) as the **accuracy reference** the new
-/// truncated-Taylor path is graded against: a double-double oracle is the
-/// truth, and the test asserts the new path's error-vs-truth is `≤` this naive
-/// partition sum's error-vs-truth on every randomised program.
-#[cfg(test)]
-struct PartTable {
-    flat: Vec<u32>,
-    parts: Vec<(usize, u8)>,
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Cached set-partition tables, indexed by slot count `m`. Entry `m` holds
-    /// every partition of `{0..m}` into `< DERIVS` blocks, in the shared
-    /// walker's recursion order, each block a compacted submask. Pure function
-    /// of `m`, so caching is sound and deterministic.
-    static PARTITION_TABLES: RefCell<Vec<std::rc::Rc<PartTable>>> =
-        const { RefCell::new(Vec::new()) };
-}
-
-/// Return cached partition tables for slot counts `0..=n_dirs`.
-#[cfg(test)]
-fn partition_tables(n_dirs: usize) -> Vec<std::rc::Rc<PartTable>> {
-    PARTITION_TABLES.with(|cell| {
-        let mut tables = cell.borrow_mut();
-        while tables.len() <= n_dirs {
-            let m = tables.len();
-            tables.push(std::rc::Rc::new(build_partitions(m)));
-        }
-        (0..=n_dirs).map(|m| std::rc::Rc::clone(&tables[m])).collect()
-    })
-}
-
-/// The previous production `compose_unary`: a direct set-partition (Faà di
-/// Bruno) sum per output mask, retained test-gated as the accuracy reference.
-#[cfg(test)]
-fn compose_unary_partition_reference(coeffs: &[f64], derivs: [f64; DERIVS]) -> Vec<f64> {
-    let count = coeffs.len();
-    let n_dirs = count.trailing_zeros() as usize;
-    let tables = partition_tables(n_dirs);
-    let mut out = vec![0.0; count];
-    let mut remap = vec![0usize; count];
-    let mut pos = [0usize; usize::BITS as usize];
-    for (mask, slot) in out.iter_mut().enumerate() {
-        if mask == 0 {
-            *slot = derivs[0];
-            continue;
-        }
-        let mut npos = 0usize;
-        let mut m = mask;
-        while m != 0 {
-            pos[npos] = m.trailing_zeros() as usize;
-            npos += 1;
-            m &= m - 1;
-        }
-        remap[0] = 0;
-        for cb in 1usize..(1usize << npos) {
-            let low = cb.trailing_zeros() as usize;
-            remap[cb] = remap[cb & (cb - 1)] | (1usize << pos[low]);
-        }
-        let table = &tables[npos];
-        let flat = &table.flat;
-        let mut total = 0.0;
-        for &(off, order) in table.parts.iter() {
-            let order = order as usize;
-            let mut prod = derivs[order];
-            for &cb in &flat[off..off + order] {
-                prod *= coeffs[remap[cb as usize]];
-            }
-            total += prod;
-        }
-        *slot = total;
-    }
-    out
-}
-
-/// Enumerate the set-partitions of `{0..m}` with fewer than `DERIVS` blocks, in
-/// the exact DFS order of [`crate::jet_algebra`]'s `for_each_partition`
-/// recursion ("place each element into an existing block, else open a new one"),
-/// each block recorded as a compacted submask of `{0..m}`, flattened.
-#[cfg(test)]
-fn build_partitions(m: usize) -> PartTable {
-    fn recurse(elem: usize, m: usize, blocks: &mut [u32; 8], n_blocks: usize, out: &mut PartTable) {
-        // Partitions with `>= DERIVS` blocks are truncated (their `f^{(order)}`
-        // is beyond the stack); the block count never decreases, so the whole
-        // subtree contributes nothing and is pruned — matching the walker's
-        // per-partition `order >= derivs.len()` skip.
-        if n_blocks >= DERIVS {
-            return;
-        }
-        if elem == m {
-            let off = out.flat.len();
-            out.flat.extend_from_slice(&blocks[..n_blocks]);
-            out.parts.push((off, n_blocks as u8));
-            return;
-        }
-        for b in 0..n_blocks {
-            blocks[b] |= 1u32 << elem;
-            recurse(elem + 1, m, blocks, n_blocks, out);
-            blocks[b] &= !(1u32 << elem);
-        }
-        blocks[n_blocks] = 1u32 << elem;
-        recurse(elem + 1, m, blocks, n_blocks + 1, out);
-    }
-    let mut out = PartTable {
-        flat: Vec::new(),
-        parts: Vec::new(),
-    };
-    let mut blocks = [0u32; 8];
-    recurse(0, m, &mut blocks, 0, &mut out);
-    out
-}
-
 /// The set-bit positions of `mask`, low to high — the differentiation slots of
 /// that coefficient.
 fn bit_positions(mask: usize) -> crate::jet_algebra::SlotBuf {
@@ -532,6 +414,122 @@ impl MultiDirJet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── test-only accuracy reference (the previous production `compose_unary`,
+    //    a direct set-partition Faà-di-Bruno sum; the truncated-Taylor path is
+    //    graded against it) ─────────────────────────────────────────────────
+    /// A flattened set-partition table for a fixed slot count. `parts[i] = (off,
+    /// order)` describes one partition: its `order` block submasks (compacted) are
+    /// `flat[off .. off + order]`.
+    ///
+    /// This direct set-partition sum is the previous production `compose_unary`
+    /// implementation, retained (test-gated) as the **accuracy reference** the new
+    /// truncated-Taylor path is graded against: a double-double oracle is the
+    /// truth, and the test asserts the new path's error-vs-truth is `≤` this naive
+    /// partition sum's error-vs-truth on every randomised program.
+    struct PartTable {
+        flat: Vec<u32>,
+        parts: Vec<(usize, u8)>,
+    }
+
+    thread_local! {
+        /// Cached set-partition tables, indexed by slot count `m`. Entry `m` holds
+        /// every partition of `{0..m}` into `< DERIVS` blocks, in the shared
+        /// walker's recursion order, each block a compacted submask. Pure function
+        /// of `m`, so caching is sound and deterministic.
+        static PARTITION_TABLES: RefCell<Vec<std::rc::Rc<PartTable>>> =
+            const { RefCell::new(Vec::new()) };
+    }
+
+    /// Return cached partition tables for slot counts `0..=n_dirs`.
+    fn partition_tables(n_dirs: usize) -> Vec<std::rc::Rc<PartTable>> {
+        PARTITION_TABLES.with(|cell| {
+            let mut tables = cell.borrow_mut();
+            while tables.len() <= n_dirs {
+                let m = tables.len();
+                tables.push(std::rc::Rc::new(build_partitions(m)));
+            }
+            (0..=n_dirs).map(|m| std::rc::Rc::clone(&tables[m])).collect()
+        })
+    }
+
+    /// The previous production `compose_unary`: a direct set-partition (Faà di
+    /// Bruno) sum per output mask, retained test-gated as the accuracy reference.
+    fn compose_unary_partition_reference(coeffs: &[f64], derivs: [f64; DERIVS]) -> Vec<f64> {
+        let count = coeffs.len();
+        let n_dirs = count.trailing_zeros() as usize;
+        let tables = partition_tables(n_dirs);
+        let mut out = vec![0.0; count];
+        let mut remap = vec![0usize; count];
+        let mut pos = [0usize; usize::BITS as usize];
+        for (mask, slot) in out.iter_mut().enumerate() {
+            if mask == 0 {
+                *slot = derivs[0];
+                continue;
+            }
+            let mut npos = 0usize;
+            let mut m = mask;
+            while m != 0 {
+                pos[npos] = m.trailing_zeros() as usize;
+                npos += 1;
+                m &= m - 1;
+            }
+            remap[0] = 0;
+            for cb in 1usize..(1usize << npos) {
+                let low = cb.trailing_zeros() as usize;
+                remap[cb] = remap[cb & (cb - 1)] | (1usize << pos[low]);
+            }
+            let table = &tables[npos];
+            let flat = &table.flat;
+            let mut total = 0.0;
+            for &(off, order) in table.parts.iter() {
+                let order = order as usize;
+                let mut prod = derivs[order];
+                for &cb in &flat[off..off + order] {
+                    prod *= coeffs[remap[cb as usize]];
+                }
+                total += prod;
+            }
+            *slot = total;
+        }
+        out
+    }
+
+    /// Enumerate the set-partitions of `{0..m}` with fewer than `DERIVS` blocks, in
+    /// the exact DFS order of [`crate::jet_algebra`]'s `for_each_partition`
+    /// recursion ("place each element into an existing block, else open a new one"),
+    /// each block recorded as a compacted submask of `{0..m}`, flattened.
+    fn build_partitions(m: usize) -> PartTable {
+        fn recurse(elem: usize, m: usize, blocks: &mut [u32; 8], n_blocks: usize, out: &mut PartTable) {
+            // Partitions with `>= DERIVS` blocks are truncated (their `f^{(order)}`
+            // is beyond the stack); the block count never decreases, so the whole
+            // subtree contributes nothing and is pruned — matching the walker's
+            // per-partition `order >= derivs.len()` skip.
+            if n_blocks >= DERIVS {
+                return;
+            }
+            if elem == m {
+                let off = out.flat.len();
+                out.flat.extend_from_slice(&blocks[..n_blocks]);
+                out.parts.push((off, n_blocks as u8));
+                return;
+            }
+            for b in 0..n_blocks {
+                blocks[b] |= 1u32 << elem;
+                recurse(elem + 1, m, blocks, n_blocks, out);
+                blocks[b] &= !(1u32 << elem);
+            }
+            blocks[n_blocks] = 1u32 << elem;
+            recurse(elem + 1, m, blocks, n_blocks + 1, out);
+        }
+        let mut out = PartTable {
+            flat: Vec::new(),
+            parts: Vec::new(),
+        };
+        let mut blocks = [0u32; 8];
+        recurse(0, m, &mut blocks, 0, &mut out);
+        out
+    }
 
     // ── constructors ─────────────────────────────────────────────────────────
 
