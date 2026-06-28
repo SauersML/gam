@@ -107,6 +107,26 @@ pub trait JetScalar<const K: usize>: Copy {
     /// array makes that windowing total, no length guard required.
     fn compose_unary(&self, d: [f64; 5]) -> Self;
 
+    /// Compose with a unary special-function whose derivative STACK is built
+    /// from the scalar base value through `stack_fn` — the generic-over-`Lane`
+    /// seam that lets a single-sourced row program instantiate at BOTH the scalar
+    /// `f64` jets and the SIMD `f64x4` batch towers from ONE expression.
+    ///
+    /// On a scalar jet this evaluates `stack_fn(self.value())` ONCE and forwards
+    /// to [`compose_unary`](Self::compose_unary), so it is BIT-IDENTICAL to the
+    /// hand-written `self.compose_unary(stack_fn(self.value()))` (default body
+    /// below). The lever is that the SAME call shape exists on
+    /// [`crate::jet_tower::Tower3Lane`] / [`crate::jet_tower::Tower4Lane`], where
+    /// the four lanes carry FOUR DISTINCT base values, so the batch
+    /// implementation re-runs `stack_fn` per lane — a thing the old
+    /// `compose_unary(stack_from(self.value()))` shape could not express on a
+    /// batch type (it has no single scalar `.value()`). Writing a row program
+    /// against this method instead of the explicit two-step is what makes it
+    /// instantiate, unchanged, at `f64x4` for the 4-rows-per-pass batch path.
+    fn compose_unary_with(&self, stack_fn: impl Fn(f64) -> [f64; 5]) -> Self {
+        self.compose_unary(stack_fn(self.value()))
+    }
+
     /// `e^self`. Convenience for tame arguments (see module stability note).
     fn exp(&self) -> Self {
         let e = self.value().exp();
@@ -397,6 +417,18 @@ pub trait Lane: Copy {
     /// evaluated per lane (bit-identically to the scalar path); the subsequent
     /// tensor composition is vectorised.
     fn unary5(self, stack: impl Fn(f64) -> [f64; 5]) -> [Self; 5];
+    /// The general-`N` sibling of [`unary3`](Lane::unary3) / [`unary5`](Lane::unary5):
+    /// build an `N`-wide derivative stack **per lane** from the lane value, via
+    /// the SAME scalar `stack` closure the per-row path runs, then pack the `N`
+    /// columns lane-wise. This is the lane primitive the compose-with-stack seam
+    /// ([`crate::jet_tower::Tower4Lane::compose_unary_with`] and its `Tower3`
+    /// sibling) routes through: it evaluates `stack` once per lane at that lane's
+    /// OWN base value (each of the four rows in an `f64x4` carries a distinct
+    /// base), so lane `i` of the packed result equals the scalar `stack(value_i)`
+    /// bit-for-bit (only the cheap pack is vectorised; the closure body is the
+    /// identical scalar code). With `N = 3` / `N = 5` it is `to_bits`-identical to
+    /// [`unary3`](Lane::unary3) / [`unary5`](Lane::unary5).
+    fn unary_with<const N: usize>(self, stack: impl Fn(f64) -> [f64; N]) -> [Self; N];
 }
 
 impl Lane for f64 {
@@ -426,6 +458,11 @@ impl Lane for f64 {
     }
     #[inline]
     fn unary5(self, stack: impl Fn(f64) -> [f64; 5]) -> [Self; 5] {
+        stack(self)
+    }
+    #[inline]
+    fn unary_with<const N: usize>(self, stack: impl Fn(f64) -> [f64; N]) -> [Self; N] {
+        // One row: the packed result IS the scalar stack ([Self; N] = [f64; N]).
         stack(self)
     }
 }
@@ -486,6 +523,21 @@ impl Lane for wide::f64x4 {
             wide::f64x4::new(d[3]),
             wide::f64x4::new(d[4]),
         ]
+    }
+    #[inline]
+    fn unary_with<const N: usize>(self, stack: impl Fn(f64) -> [f64; N]) -> [Self; N] {
+        // Evaluate the scalar stack PER LANE at that lane's own base value, then
+        // pack the N derivative columns lane-wise (the same shape `unary5` uses,
+        // generalised to N). Lane `i` of column `k` is `stack(base_i)[k]`.
+        let a = self.to_array();
+        let mut cols = [[0.0_f64; 4]; N];
+        for (i, &base) in a.iter().enumerate() {
+            let s = stack(base);
+            for (k, sk) in s.iter().enumerate() {
+                cols[k][i] = *sk;
+            }
+        }
+        std::array::from_fn(|k| wide::f64x4::new(cols[k]))
     }
 }
 
@@ -1684,6 +1736,55 @@ mod tests {
                 close(s.h()[a][b], t.h[a][b], &format!("hess[{a}][{b}]"));
             }
         }
+    }
+
+    /// The `compose_unary_with` seam on a scalar jet is `to_bits`-identical to
+    /// the explicit `compose_unary(stack_fn(value))` — the contract the batch
+    /// arm (`Tower{3,4}Lane::compose_unary_with`) lane-matches. Exercised on
+    /// [`Order2`] across `K ∈ {2,3,4,9}`, ≥ 4000 random seeded inputs.
+    #[test]
+    fn compose_unary_with_scalar_seam_bit_identical() {
+        fn rand_unit(state: &mut u64) -> f64 {
+            let mut x = *state;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *state = x;
+            2.0 * ((x >> 11) as f64 / ((1u64 << 53) as f64)) - 1.0
+        }
+        // A base-value-dependent finite stack standing in for a family stack.
+        fn stack(u: f64) -> [f64; 5] {
+            [u.sin(), u.cos(), (2.0 * u).sin(), (0.5 * u).cos(), u * u - 0.3]
+        }
+        fn run<const K: usize>(state: &mut u64, n: usize) -> usize {
+            for _ in 0..n {
+                // A non-trivial Order2<K> jet: a seeded variable pushed through a
+                // couple of algebra ops so g/h are dense, then exercise the seam.
+                let base = rand_unit(state);
+                let mut s = Order2::<K>::variable(base, 0);
+                for a in 1..K {
+                    s = JetScalar::mul(&s, &Order2::<K>::variable(rand_unit(state), a));
+                }
+                let with = s.compose_unary_with(stack);
+                let explicit = s.compose_unary(stack(s.value()));
+                assert_eq!(with.value().to_bits(), explicit.value().to_bits(), "value");
+                for a in 0..K {
+                    assert_eq!(with.g()[a].to_bits(), explicit.g()[a].to_bits(), "g[{a}]");
+                    for b in 0..K {
+                        assert_eq!(
+                            with.h()[a][b].to_bits(),
+                            explicit.h()[a][b].to_bits(),
+                            "h[{a}][{b}]"
+                        );
+                    }
+                }
+            }
+            n
+        }
+        let mut st = 0x9e37_79b9_7f4a_7c15u64;
+        let total =
+            run::<2>(&mut st, 1100) + run::<3>(&mut st, 1100) + run::<4>(&mut st, 1100) + run::<9>(&mut st, 1100);
+        assert_eq!(total, 4400);
     }
 
     /// OneSeed's ε-Hessian is the contracted third Σ_c ℓ_{abc} u_c, matching
