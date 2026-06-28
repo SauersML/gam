@@ -2110,7 +2110,7 @@ mod taylor_degree_tests {
 }
 
 #[cfg(test)]
-mod end_to_end_1604 {
+mod end_to_end_1604_tests {
     use super::*;
     use gam_linalg::faer_ndarray::FaerEigh;
 
