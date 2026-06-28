@@ -8,6 +8,12 @@ import pytest
 
 gamfit = pytest.importorskip("gamfit")
 
+# #1512 triage: the SAE-manifold dim-matrix sweep fits many configurations and
+# runs past the standard Python-API CI runner budget (>240s in triage), so it
+# is tagged slow and excluded from the directory-level `-m "not slow"` CI step
+# (still collected, and run by a bare `pytest tests/` locally).
+pytestmark = pytest.mark.slow
+
 
 TOPOLOGIES = ("circle", "euclidean", "torus", "sphere")
 D_ATOMS = (1, 2)

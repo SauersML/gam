@@ -18,6 +18,12 @@ import pytest
 
 import gamfit
 
+# #1512 triage: these Duchon/Euclidean SAE-manifold fits exceed the standard
+# Python-API CI runner budget (>240s in triage), so they are tagged slow and
+# excluded from the directory-level `-m "not slow"` CI step (still collected,
+# and run by a bare `pytest tests/` locally).
+pytestmark = pytest.mark.slow
+
 
 @pytest.fixture(scope="module")
 def random_data() -> np.ndarray:
