@@ -103,6 +103,16 @@ mod tests {
     #[test]
     fn tick_delta_zero_still_works() {
         let lp = LoopProgress::new(0);
-        lp.tick(0, |_, _| {}); // should not panic
+        let seen = AtomicUsize::new(usize::MAX);
+        lp.tick(0, |progress, _elapsed| {
+            seen.store(progress, Ordering::Relaxed);
+        });
+        // A zero-delta tick must not panic and leaves the counter at 0; the
+        // zero interval still lets the single emit fire with progress 0.
+        assert_eq!(
+            seen.load(Ordering::Relaxed),
+            0,
+            "zero-delta tick must emit progress 0"
+        );
     }
 }
