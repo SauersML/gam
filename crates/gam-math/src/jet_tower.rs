@@ -440,6 +440,16 @@ impl<const K: usize> Tower4<K> {
         out
     }
 
+    /// Channel-wise addition (by reference, mirrors the batch-type API).
+    pub fn add(&self, o: &Self) -> Self {
+        *self + *o
+    }
+
+    /// Channel-wise subtraction (by reference, mirrors the batch-type API).
+    pub fn sub(&self, o: &Self) -> Self {
+        *self - *o
+    }
+
     /// Multiply every channel by a plain scalar.
     pub fn scale(&self, s: f64) -> Self {
         let mut out = *self;
@@ -1048,6 +1058,16 @@ impl<const K: usize> Tower3<K> {
             acc
         };
         out
+    }
+
+    /// Channel-wise addition (by reference, mirrors the batch-type API).
+    pub fn add(&self, o: &Self) -> Self {
+        *self + *o
+    }
+
+    /// Channel-wise subtraction (by reference, mirrors the batch-type API).
+    pub fn sub(&self, o: &Self) -> Self {
+        self.add(&o.scale(-1.0))
     }
 
     /// Multiply every channel by a plain scalar.

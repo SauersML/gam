@@ -29,8 +29,10 @@
 //! The dictionary decoder used by `PoincareAtoms` is tangent-space
 //! aggregation at the origin followed by the ball exponential:
 //!
-//!     v        = sum_f z_f * log_0(a_f)
-//!     x_hat    = exp_0(v).
+//! ```text
+//! v        = sum_f z_f * log_0(a_f)
+//! x_hat    = exp_0(v).
+//! ```
 //!
 //! This is closed-form, fully differentiable in both the gates `z` and the
 //! atom positions `a`, reduces to ordinary linear mixing in the Euclidean
@@ -183,9 +185,11 @@ pub fn project_into_ball(
 ///
 /// With `k = -c`, this evaluates the closed-form
 ///
-///     (1 + 2 k <u,v> + k |v|^2) u + (1 - k |u|^2) v
-///     -----------------------------------------------
-///         1 + 2 k <u,v> + k^2 |u|^2 |v|^2
+/// ```text
+/// (1 + 2 k <u,v> + k |v|^2) u + (1 - k |u|^2) v
+/// -----------------------------------------------
+///     1 + 2 k <u,v> + k^2 |u|^2 |v|^2
+/// ```
 ///
 /// (Ganea et al. 2018 with their `c > 0` mapped to our `k = -c`).
 pub fn mobius_add(
@@ -215,10 +219,12 @@ pub fn mobius_add(
 ///
 /// Uses the standard closed form
 ///
-///     d_c(a, b) = (1/sqrt(-c)) * arccosh(
-///                     1 + 2(-c) |a-b|^2
-///                     / ((1 + c|a|^2)(1 + c|b|^2))
-///                 ).
+/// ```text
+/// d_c(a, b) = (1/sqrt(-c)) * arccosh(
+///                 1 + 2(-c) |a-b|^2
+///                 / ((1 + c|a|^2)(1 + c|b|^2))
+///             ).
+/// ```
 pub fn poincare_distance(
     a: ArrayView1<'_, f64>,
     b: ArrayView1<'_, f64>,
@@ -570,7 +576,9 @@ pub fn tangent_decode_forward(
 /// 1. `x_hat_b = phi(s_b) * v_b`, where `s_b = sqrt(k) |v_b|` and
 ///    `phi(s) = tanh(s) / s`. Then
 ///
-///        ∂x_hat / ∂v = phi(s) I + (phi'(s) sqrt(k) / |v|) v v^T
+///    ```text
+///    ∂x_hat / ∂v = phi(s) I + (phi'(s) sqrt(k) / |v|) v v^T
+///    ```
 ///
 ///    with `phi'(s) = (1/s^2)((1 - tanh(s)^2) s - tanh(s)) = (s sech^2(s) - tanh(s))/s^2`.
 ///
@@ -580,8 +588,10 @@ pub fn tangent_decode_forward(
 /// 3. `L_f = psi(t_f) * y_f`, where `y_f = sqrt(k) a_f` (after projection)
 ///    and `psi(t) = atanh(t)/t`. So
 ///
-///        ∂L_f/∂a_f = psi(|y_f|) sqrt(k)^2 I
-///                  + sqrt(k) (psi'(|y_f|) sqrt(k) / |a_f|) a_f a_f^T
+///    ```text
+///    ∂L_f/∂a_f = psi(|y_f|) sqrt(k)^2 I
+///              + sqrt(k) (psi'(|y_f|) sqrt(k) / |a_f|) a_f a_f^T
+///    ```
 ///
 ///    after applying the chain rule through `y_f = sqrt(k) a_f`. Substituting
 ///    `t = sqrt(k) |a_f|` and reorganising gives the closed form used below.
@@ -931,18 +941,24 @@ pub fn lorentz_decode_forward(
 /// linear mix → Lorentz exp_o → stereographic projection back to ball)
 /// produces, after using
 ///
-///     acosh((1+q)/(1-q)) = 2 artanh(sqrt(q))     (for q in [0,1)),
-///     cosh(σ) + 1        = 2 cosh^2(σ/2),
-///     sinh(σ)            = 2 sinh(σ/2) cosh(σ/2),
+/// ```text
+/// acosh((1+q)/(1-q)) = 2 artanh(sqrt(q))     (for q in [0,1)),
+/// cosh(σ) + 1        = 2 cosh^2(σ/2),
+/// sinh(σ)            = 2 sinh(σ/2) cosh(σ/2),
+/// ```
 ///
 /// the algebraic identity
 ///
-///     L_f^{Lorentz}      = 2 * log_0^{Poincare}(a_f),
-///     y^{Lorentz}(v)     = exp_0^{Poincare}( v / 2 ).
+/// ```text
+/// L_f^{Lorentz}      = 2 * log_0^{Poincare}(a_f),
+/// y^{Lorentz}(v)     = exp_0^{Poincare}( v / 2 ).
+/// ```
 ///
 /// The factors of 2 cancel inside the linear-mix step, so:
 ///
-///     y_Lorentz(z; A) === y_Poincare(z; A),
+/// ```text
+/// y_Lorentz(z; A) === y_Poincare(z; A),
+/// ```
 ///
 /// not just isometrically — they are the *same function* of the inputs.
 /// The two forward implementations are numerically distinct routes (Lorentz
