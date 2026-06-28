@@ -2584,4 +2584,86 @@ mod tests {
         let link = InverseLink::Standard(StandardLink::Identity);
         assert!(inverse_link_to_binomial_spec(&link).is_err());
     }
+
+    // -----------------------------------------------------------------------
+    // FamilySpecKind::name / pretty_name
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn family_spec_kind_name_non_binomial_variants() {
+        assert_eq!(FamilySpecKind::GaussianIdentity.name(), "gaussian");
+        assert_eq!(FamilySpecKind::PoissonLog.name(), "poisson-log");
+        assert_eq!(FamilySpecKind::GammaLog.name(), "gamma-log");
+        assert_eq!(FamilySpecKind::TweedieLog { p: 1.5 }.name(), "tweedie-log");
+        assert_eq!(
+            FamilySpecKind::NegativeBinomialLog { theta: 2.0 }.name(),
+            "negative-binomial-log"
+        );
+        assert_eq!(FamilySpecKind::BetaLogit { phi: 5.0 }.name(), "beta-regression-logit");
+        assert_eq!(FamilySpecKind::RoystonParmar.name(), "royston-parmar");
+    }
+
+    #[test]
+    fn family_spec_kind_name_binomial_variants() {
+        assert_eq!(FamilySpecKind::BinomialLogit.name(), "binomial-logit");
+        assert_eq!(FamilySpecKind::BinomialProbit.name(), "binomial-probit");
+        assert_eq!(FamilySpecKind::BinomialCLogLog.name(), "binomial-cloglog");
+    }
+
+    #[test]
+    fn family_spec_kind_pretty_name_gaussian() {
+        assert_eq!(FamilySpecKind::GaussianIdentity.pretty_name(), "Gaussian Identity");
+    }
+
+    #[test]
+    fn family_spec_kind_pretty_name_binomial_logit() {
+        assert_eq!(FamilySpecKind::BinomialLogit.pretty_name(), "Binomial Logit");
+    }
+
+    // -----------------------------------------------------------------------
+    // FamilySpecKind::is_binomial and companions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_binomial_true_for_all_binomial_variants() {
+        assert!(FamilySpecKind::BinomialLogit.is_binomial());
+        assert!(FamilySpecKind::BinomialProbit.is_binomial());
+        assert!(FamilySpecKind::BinomialCLogLog.is_binomial());
+    }
+
+    #[test]
+    fn is_binomial_false_for_non_binomial_variants() {
+        assert!(!FamilySpecKind::GaussianIdentity.is_binomial());
+        assert!(!FamilySpecKind::PoissonLog.is_binomial());
+        assert!(!FamilySpecKind::GammaLog.is_binomial());
+        assert!(!FamilySpecKind::RoystonParmar.is_binomial());
+        assert!(!FamilySpecKind::TweedieLog { p: 1.5 }.is_binomial());
+        assert!(!FamilySpecKind::NegativeBinomialLog { theta: 1.0 }.is_binomial());
+        assert!(!FamilySpecKind::BetaLogit { phi: 1.0 }.is_binomial());
+    }
+
+    #[test]
+    fn is_gaussian_identity_true_only_for_gaussian() {
+        assert!(FamilySpecKind::GaussianIdentity.is_gaussian_identity());
+        assert!(!FamilySpecKind::PoissonLog.is_gaussian_identity());
+        assert!(!FamilySpecKind::BinomialLogit.is_gaussian_identity());
+    }
+
+    #[test]
+    fn is_royston_parmar_true_only_for_royston_parmar() {
+        assert!(FamilySpecKind::RoystonParmar.is_royston_parmar());
+        assert!(!FamilySpecKind::GaussianIdentity.is_royston_parmar());
+        assert!(!FamilySpecKind::BinomialLogit.is_royston_parmar());
+    }
+
+    #[test]
+    fn supports_firth_iff_is_binomial() {
+        assert!(FamilySpecKind::BinomialLogit.supports_firth());
+        assert!(FamilySpecKind::BinomialProbit.supports_firth());
+        assert!(FamilySpecKind::BinomialCLogLog.supports_firth());
+        assert!(!FamilySpecKind::GaussianIdentity.supports_firth());
+        assert!(!FamilySpecKind::PoissonLog.supports_firth());
+        assert!(!FamilySpecKind::GammaLog.supports_firth());
+        assert!(!FamilySpecKind::RoystonParmar.supports_firth());
+    }
 }
