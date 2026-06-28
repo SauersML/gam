@@ -61,7 +61,7 @@ use crate::basis::{
     SaeBasisSecondJet, SphereChartEvaluator, TorusHarmonicEvaluator,
 };
 use crate::manifold::{
-    SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
+    AssignmentMode, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
 };
 use gam_terms::structure::anova_atom::{
     CarveReport, FissionDecision, carve, carve_input_from_fitted_atom, fission_decision,
@@ -689,13 +689,26 @@ fn fold_atom_into(term: &mut SaeManifoldTerm, a: usize, b: usize) -> Result<(), 
     if a == b {
         return Err("fold_atom_into: cannot fuse an atom with itself".to_string());
     }
+    // For SOFTMAX the fused atom must carry the COMBINED routing mass of its two
+    // constituents. `softmax` mass is `e^logit/Z`, so the mass-preserving combine
+    // is `logsumexp(la, lb)` (`softmax(logsumexp(la,lb)) = softmax(la)+softmax(lb)`).
+    // Plain `max` UNDER-masses by up to `ln 2` on exactly the co-active rows that
+    // triggered the fusion (where `la ≈ lb`): it gives the fused atom half the
+    // combined mass, leaving the warm-start short and risking a FALSE rejection by
+    // the e-gate under a capped refit. For IBP/JumpReLU the per-atom gate is the
+    // UN-normalized `σ(logit)`, so the union gate is `max(σ(la),σ(lb)) = σ(max(la,lb))`
+    // → `max` is the correct combine there (a sum/logsumexp would over-gate).
+    let softmax_routing = matches!(term.assignment.mode, AssignmentMode::Softmax { .. });
     for row in 0..term.assignment.logits.nrows() {
         let la = term.assignment.logits[[row, a]];
         let lb = term.assignment.logits[[row, b]];
-        // The fused atom should route wherever EITHER constituent did: take the
-        // dominant logit. (A sum would double-count and overflow the softmax;
-        // the max preserves the union support the fusion asserts.)
-        term.assignment.logits[[row, a]] = la.max(lb);
+        term.assignment.logits[[row, a]] = if softmax_routing {
+            // Numerically stable logsumexp.
+            let m = la.max(lb);
+            m + ((la - m).exp() + (lb - m).exp()).ln()
+        } else {
+            la.max(lb)
+        };
     }
     demote_atom(term, b)?;
     Ok(())
@@ -3147,6 +3160,41 @@ mod tests {
                 (child.assignment.logits[[row, 0]] - child.assignment.logits[[row, 1]]).abs()
                     < 1e-12,
                 "fission must split routing mass 50/50 (equal child logits)"
+            );
+        }
+    }
+
+    /// Softmax fusion must PRESERVE the combined routing mass. Merging the two
+    /// constituent logits with `logsumexp` keeps `mass(fused) = mass(a)+mass(b)`;
+    /// the old `max` under-massed the fused atom (½ vs ⅔ on this 3-atom fixture
+    /// where atoms 0,1 are co-active and atom 2 competes), leaving the warm-start
+    /// short and risking a FALSE e-gate rejection of a good fusion under a capped
+    /// refit. (For IBP routing `max` stays correct — the gate is un-normalized.)
+    #[test]
+    fn fusion_preserves_combined_softmax_mass() {
+        let (term, rho) = planted_term(&vec![vec![true, true, true]; 6]);
+        let combined: Vec<f64> = (0..6)
+            .map(|r| {
+                let a = term.assignment.try_assignments_row(r).unwrap();
+                a[0] + a[1]
+            })
+            .collect();
+        let (fused, _) =
+            apply_structure_move(&term, &rho, &StructureMove::Fusion { a: 0, b: 1 }, &[]).unwrap();
+        for r in 0..6 {
+            let a = fused.assignment.try_assignments_row(r).unwrap();
+            assert!(
+                (a[0] - combined[r]).abs() < 1e-6,
+                "fused atom must carry the COMBINED softmax mass (logsumexp, not \
+                 max): got {}, want {} (row {r})",
+                a[0],
+                combined[r]
+            );
+            // Sanity: plain max would have given ½ here, materially short of ⅔.
+            assert!(
+                combined[r] > 0.6,
+                "fixture must exercise a co-active pair (combined mass {} should be ~⅔)",
+                combined[r]
             );
         }
     }
