@@ -136,6 +136,7 @@ fn gamlss_joint_derivatives_match_finite_difference() {
                 wiggle_knots: array![-1.0, -0.3, 0.4, 1.1],
                 wiggle_degree: 3,
                 policy: ResourcePolicy::default_library(),
+                frozen_warp_design: None,
             }),
             vec![
                 spec("eta", &x),
