@@ -362,6 +362,19 @@ impl<const K: usize> Tower4<K> {
         out
     }
 
+    /// Compose with a unary special-function whose `[f64; 5]` derivative STACK is
+    /// built from the base value through `stack_fn` — the scalar arm of the
+    /// generic-over-[`Lane`](crate::jet_scalar::Lane) compose seam (see
+    /// [`Tower4Lane::compose_unary_with`]). Evaluates `stack_fn(self.v)` ONCE and
+    /// forwards to [`Self::compose_unary`], so it is BIT-IDENTICAL to the explicit
+    /// `self.compose_unary(stack_fn(self.v))`. Writing a program against this seam
+    /// lets it re-instantiate, unchanged, at [`Tower4Lane`] (where each of the four
+    /// lanes carries a DISTINCT base value and `stack_fn` is re-run per lane).
+    #[inline]
+    pub fn compose_unary_with(&self, stack_fn: impl Fn(f64) -> [f64; 5]) -> Self {
+        self.compose_unary(stack_fn(self.v))
+    }
+
     /// Single-active-slot fast path for [`Self::compose_unary`].
     ///
     /// When the inner jet `self` has derivative support ONLY on the all-`slot`
@@ -1026,6 +1039,18 @@ impl<const K: usize> Tower3<K> {
             }
         }
         out
+    }
+
+    /// Compose with a unary special-function whose `[f64; 4]` derivative STACK is
+    /// built from the base value through `stack_fn` — the scalar arm of the
+    /// generic-over-[`Lane`](crate::jet_scalar::Lane) compose seam (see
+    /// [`Tower3Lane::compose_unary_with`]). Evaluates `stack_fn(self.v)` ONCE and
+    /// forwards to [`Self::compose_unary`], so it is BIT-IDENTICAL to the explicit
+    /// `self.compose_unary(stack_fn(self.v))`. The order-≤3 sibling of
+    /// [`Tower4::compose_unary_with`].
+    #[inline]
+    pub fn compose_unary_with(&self, stack_fn: impl Fn(f64) -> [f64; 4]) -> Self {
+        self.compose_unary(stack_fn(self.v))
     }
 
     /// Single-active-slot fast path for [`Self::compose_unary`] — the order-≤3
@@ -2235,6 +2260,25 @@ impl<L: Lane, const K: usize> Tower4Lane<L, K> {
         }
         out
     }
+    /// Compose with a unary special-function whose `[f64; 5]` derivative stack is
+    /// built from the base value through `stack_fn`, evaluated PER LANE — the
+    /// batch arm of the generic-over-[`Lane`](crate::jet_scalar::Lane) compose
+    /// seam (the SIMD twin of [`Tower4::compose_unary_with`]).
+    ///
+    /// Each of the four lanes carries a DISTINCT base value, so the scalar
+    /// `stack_fn` is run once per lane at that lane's own value (via
+    /// [`Lane::unary_with`]) and the `[f64; 5]` results are packed into `[L; 5]`;
+    /// the composition is then the existing per-lane [`Self::compose_unary`].
+    /// Because `unary_with` runs the identical scalar closure per lane and
+    /// `compose_unary` is a term-for-term lift of the scalar tower, lane `i` of
+    /// the result is `to_bits`-identical to `self.lane(i).compose_unary_with(stack_fn)`
+    /// — which is exactly what lets a row program written against the scalar
+    /// [`Tower4::compose_unary_with`] seam re-instantiate, unchanged, at `f64x4`.
+    #[inline]
+    pub fn compose_unary_with(&self, stack_fn: impl Fn(f64) -> [f64; 5]) -> Self {
+        self.compose_unary(self.v.unary_with(stack_fn))
+    }
+
     /// Single-active-slot fast path, term-for-term lift of
     /// [`Tower4::compose_unary_single_slot`] (only the 5 diagonal channels).
     #[inline]
@@ -2500,6 +2544,19 @@ impl<L: Lane, const K: usize> Tower3Lane<L, K> {
         }
         out
     }
+    /// Compose with a unary special-function whose `[f64; 4]` derivative stack is
+    /// built from the base value through `stack_fn`, evaluated PER LANE — the
+    /// batch arm of the generic-over-[`Lane`](crate::jet_scalar::Lane) compose
+    /// seam (the SIMD twin of [`Tower3::compose_unary_with`], order-≤3 sibling of
+    /// [`Tower4Lane::compose_unary_with`]). The scalar `stack_fn` is run once per
+    /// lane at that lane's own base value (via [`Lane::unary_with`]) and packed
+    /// into `[L; 4]` for the existing per-lane [`Self::compose_unary`], so lane
+    /// `i` is `to_bits`-identical to `self.lane(i).compose_unary_with(stack_fn)`.
+    #[inline]
+    pub fn compose_unary_with(&self, stack_fn: impl Fn(f64) -> [f64; 4]) -> Self {
+        self.compose_unary(self.v.unary_with(stack_fn))
+    }
+
     /// Single-active-slot fast path, term-for-term lift of
     /// [`Tower3::compose_unary_single_slot`].
     #[inline]
@@ -2766,6 +2823,130 @@ mod batch_tests {
         // 4 widths × `batches` batches × 4 rows each: guards the large-stack
         // worker threads against silently running zero comparisons.
         assert_eq!(rows_checked, 4 * batches * 4);
+    }
+
+    // ── compose_unary_with seam (generic-over-Lane compose) ─────────────────
+    //
+    // The seam lets a single-sourced row program build its special-function
+    // STACK from the base value through a closure, so the SAME expression
+    // instantiates at a scalar tower (one base) AND a batch tower (four distinct
+    // per-lane bases). These oracles pin both arms `to_bits`.
+
+    /// A base-value-dependent `[f64; 5]` derivative stack (finite for finite `u`),
+    /// standing in for a family's hand-certified special-function stack. `stack4`
+    /// is its order-≤3 truncation.
+    fn seam_stack5(u: f64) -> [f64; 5] {
+        [u.sin(), u.cos(), (2.0 * u).sin(), (0.5 * u).cos(), u * u - 0.3]
+    }
+    fn seam_stack4(u: f64) -> [f64; 4] {
+        let s = seam_stack5(u);
+        [s[0], s[1], s[2], s[3]]
+    }
+
+    /// Force a distinct / edge per-lane base value (signed zeros included).
+    fn seam_edge_base(r: &mut Rng, which: usize) -> f64 {
+        match which {
+            0 => -0.0,
+            1 => 0.0,
+            2 => r.f(),
+            _ => r.f() + 3.0,
+        }
+    }
+
+    /// (a) scalar arm: `Tower4::compose_unary_with(f)` is `to_bits`-identical to
+    /// the explicit `compose_unary(f(value))` on every channel.
+    fn scalar_seam_t4<const K: usize>(seed: u64, n: usize) -> usize {
+        let mut r = Rng(seed);
+        for _ in 0..n {
+            let mut t = rand_t4::<K>(&mut r);
+            t.v = seam_edge_base(&mut r, (t.v.to_bits() % 4) as usize);
+            assert_t4_eq(
+                &t.compose_unary_with(seam_stack5),
+                &t.compose_unary(seam_stack5(t.v)),
+                "scalar t4 seam",
+            );
+        }
+        n
+    }
+    fn scalar_seam_t3<const K: usize>(seed: u64, n: usize) -> usize {
+        let mut r = Rng(seed);
+        for _ in 0..n {
+            let mut t = rand_t3::<K>(&mut r);
+            t.v = seam_edge_base(&mut r, (t.v.to_bits() % 4) as usize);
+            assert_t3_eq(
+                &t.compose_unary_with(seam_stack4),
+                &t.compose_unary(seam_stack4(t.v)),
+                "scalar t3 seam",
+            );
+        }
+        n
+    }
+
+    /// (b) lane arm: `Tower4Lane::compose_unary_with` lane `i` is
+    /// `to_bits`-identical to the scalar `Tower4::compose_unary_with` on row `i`,
+    /// with the four lanes carrying DISTINCT base values (signed zeros included),
+    /// so a buggy impl reusing one lane's base would fail.
+    fn lane_seam_t4<const K: usize>(seed: u64, batches: usize) -> usize {
+        let mut r = Rng(seed);
+        let mut verified = 0usize;
+        for _ in 0..batches {
+            let mut rows: [Tower4<K>; 4] = std::array::from_fn(|_| rand_t4::<K>(&mut r));
+            for (rw, row) in rows.iter_mut().enumerate() {
+                row.v = seam_edge_base(&mut r, rw);
+            }
+            let batch_out = pack4_t4(&rows).compose_unary_with(seam_stack5);
+            for (rw, row) in rows.iter().enumerate() {
+                assert_t4_eq(&batch_out.lane(rw), &row.compose_unary_with(seam_stack5), "lane t4 seam");
+                verified += 1;
+            }
+        }
+        verified
+    }
+    fn lane_seam_t3<const K: usize>(seed: u64, batches: usize) -> usize {
+        let mut r = Rng(seed);
+        let mut verified = 0usize;
+        for _ in 0..batches {
+            let mut rows: [Tower3<K>; 4] = std::array::from_fn(|_| rand_t3::<K>(&mut r));
+            for (rw, row) in rows.iter_mut().enumerate() {
+                row.v = seam_edge_base(&mut r, rw);
+            }
+            let batch_out = pack4_t3(&rows).compose_unary_with(seam_stack4);
+            for (rw, row) in rows.iter().enumerate() {
+                assert_t3_eq(&batch_out.lane(rw), &row.compose_unary_with(seam_stack4), "lane t3 seam");
+                verified += 1;
+            }
+        }
+        verified
+    }
+
+    #[test]
+    fn compose_unary_with_scalar_bit_identical() {
+        let n = 1100;
+        let total = scalar_seam_t4::<2>(0x2200_0001, n)
+            + scalar_seam_t4::<3>(0x2200_0002, n)
+            + scalar_seam_t4::<4>(0x2200_0003, n)
+            + big_stack(move || scalar_seam_t4::<9>(0x2200_0004, n))
+            + scalar_seam_t3::<2>(0x3300_0001, n)
+            + scalar_seam_t3::<3>(0x3300_0002, n)
+            + scalar_seam_t3::<4>(0x3300_0003, n)
+            + big_stack(move || scalar_seam_t3::<9>(0x3300_0004, n));
+        // 8 arms × 1100 = 8800 ≥ 4000 inputs.
+        assert_eq!(total, 8 * n);
+    }
+
+    #[test]
+    fn compose_unary_with_lane_matches_scalar() {
+        let b = 600;
+        let total = lane_seam_t4::<2>(0x4400_0001, b)
+            + lane_seam_t4::<3>(0x4400_0002, b)
+            + lane_seam_t4::<4>(0x4400_0003, b)
+            + big_stack(move || lane_seam_t4::<9>(0x4400_0004, b))
+            + lane_seam_t3::<2>(0x5500_0001, b)
+            + lane_seam_t3::<3>(0x5500_0002, b)
+            + lane_seam_t3::<4>(0x5500_0003, b)
+            + big_stack(move || lane_seam_t3::<9>(0x5500_0004, b));
+        // 8 arms × 600 = 4800 batches ≥ 2000; each verifies 4 lanes (19200 checks).
+        assert_eq!(total, 8 * b * 4);
     }
 }
 
