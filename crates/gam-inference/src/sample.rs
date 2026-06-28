@@ -262,7 +262,19 @@ pub fn sample_saved_model(
             }
         }
         PredictModelClass::Standard => {
-            sample_standard(model, data, col_map, training_headers, likelihood, cfg)
+            // Most `Standard` GLM families (Gaussian, Poisson, Gamma, Tweedie,
+            // Negative-Binomial, binomial logit/probit/cloglog) have an exact
+            // NUTS implementation and run through `sample_standard`. Beta
+            // regression is the one `Standard` family the engine cannot sample
+            // with NUTS (`hmc_io.rs` returns a hard error for it). Rather than
+            // aborting the whole `sample` command, route it to the same
+            // Laplace-Gaussian fallback every other NUTS-unsupported model
+            // class already uses, so callers still get a usable posterior.
+            if matches!(likelihood.response, ResponseFamily::Beta { .. }) {
+                laplace_gaussian_fallback(model, cfg, "beta-regression posterior fallback")
+            } else {
+                sample_standard(model, data, col_map, training_headers, likelihood, cfg)
+            }
         }
         // For classes where the Rust core doesn't yet have an exact NUTS
         // implementation we fall back to drawing from the Laplace
