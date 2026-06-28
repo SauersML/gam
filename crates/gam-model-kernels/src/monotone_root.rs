@@ -380,7 +380,10 @@ pub fn solve_monotone_root_detailed_with_bracket(
 
 #[cfg(test)]
 mod tests {
-    use super::solve_monotone_root;
+    use super::{
+        solve_monotone_root, solve_monotone_root_detailed,
+        solve_monotone_root_detailed_with_bracket, MonotoneRootError,
+    };
     use std::cell::RefCell;
 
     #[test]
@@ -435,5 +438,93 @@ mod tests {
                 .copied()
                 .any(|a| (a - expected_probe).abs() < 1e-12)
         );
+    }
+
+    #[test]
+    fn solve_linear_function_reaches_exact_root() {
+        // F(a) = 2a − 7, root at a = 3.5, F' = 2 everywhere.
+        let (root, abs_deriv, residual) = solve_monotone_root(
+            |a| Ok((2.0 * a - 7.0, 2.0, 0.0)),
+            0.0,
+            "linear",
+            1e-12,
+            32,
+            64,
+        )
+        .expect("root");
+        assert!((root - 3.5).abs() < 1e-10, "root={root}");
+        assert!((abs_deriv - 2.0).abs() < 1e-10, "abs_deriv={abs_deriv}");
+        assert!(residual.abs() < 1e-12, "residual={residual}");
+    }
+
+    #[test]
+    fn exact_root_at_init_returns_zero_iters() {
+        // F(0) = 0 exactly, so the solver should return immediately with refine_iters=0.
+        let result = solve_monotone_root_detailed(
+            |a| Ok((a, 1.0, 0.0)),
+            0.0,
+            "exact_at_init",
+            1e-12,
+            32,
+            32,
+        )
+        .expect("solution");
+        assert!(result.root.abs() < 1e-12, "root={}", result.root);
+        assert_eq!(result.refine_iters, 0);
+    }
+
+    #[test]
+    fn degenerate_derivative_returns_error() {
+        // F'(a_init) = 0 is degenerate; the solver must return Err rather than
+        // infinite-loop or divide by zero.
+        let err = solve_monotone_root(
+            |a| Ok((a - 5.0, 0.0, 0.0)),
+            0.0,
+            "degenerate_fp",
+            1e-12,
+            32,
+            32,
+        )
+        .unwrap_err();
+        match err {
+            MonotoneRootError::DegenerateDerivative { .. } => {}
+            other => panic!("expected DegenerateDerivative, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn analytic_bracket_is_honored() {
+        // Supply a bracket [0, 10] for F(a) = a − 3; the solver must use it and
+        // converge to root = 3.
+        let sol = solve_monotone_root_detailed_with_bracket(
+            |a| Ok((a - 3.0, 1.0, 0.0)),
+            5.0,
+            "analytic_bracket",
+            1e-12,
+            32,
+            64,
+            Some((0.0, 10.0)),
+        )
+        .expect("solution");
+        assert!((sol.root - 3.0).abs() < 1e-10, "root={}", sol.root);
+        assert!(sol.residual.abs() < 1e-12, "residual={}", sol.residual);
+    }
+
+    #[test]
+    fn search_exhausted_with_zero_bracket_iters() {
+        // max_bracket_iters=0 and init is not at root → bracketing cannot succeed.
+        let err = solve_monotone_root(
+            |a| Ok((a - 100.0, 1.0, 0.0)),
+            0.0,
+            "no_bracket",
+            1e-12,
+            0,  // no bracket iterations allowed
+            32,
+        )
+        .unwrap_err();
+        match err {
+            MonotoneRootError::BracketingExhausted { .. } => {}
+            other => panic!("expected BracketingExhausted, got {other:?}"),
+        }
     }
 }
