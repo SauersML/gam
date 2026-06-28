@@ -2619,8 +2619,9 @@ mod batch_tests {
 
     // Run a representative op chain on 4 scalar rows and on the f64x4 batch,
     // then assert every channel of every lane is to_bits-identical.
-    fn run4<const K: usize>(seed: u64, batches: usize) {
+    fn run4<const K: usize>(seed: u64, batches: usize) -> usize {
         let mut r = Rng(seed);
+        let mut rows_checked = 0;
         for _ in 0..batches {
             let a: [Tower4<K>; 4] = std::array::from_fn(|_| rand_t4::<K>(&mut r));
             let b: [Tower4<K>; 4] = std::array::from_fn(|_| rand_t4::<K>(&mut r));
@@ -2668,11 +2669,14 @@ mod batch_tests {
                         assert_eq!(fourthb[i][j].lane(rw).to_bits(), fourth[rw][i][j].to_bits(), "fourth");
                     }
                 }
+                rows_checked += 1;
             }
         }
+        rows_checked
     }
-    fn run3<const K: usize>(seed: u64, batches: usize) {
+    fn run3<const K: usize>(seed: u64, batches: usize) -> usize {
         let mut r = Rng(seed);
+        let mut rows_checked = 0;
         for _ in 0..batches {
             let a: [Tower3<K>; 4] = std::array::from_fn(|_| rand_t3::<K>(&mut r));
             let b: [Tower3<K>; 4] = std::array::from_fn(|_| rand_t3::<K>(&mut r));
@@ -2695,37 +2699,47 @@ mod batch_tests {
             let finalb = summedb.compose_unary_single_slot(db, 0);
             for rw in 0..4 {
                 assert_t3_eq(&finalb.lane(rw), &scal[rw], "t3-chain");
+                rows_checked += 1;
             }
         }
+        rows_checked
     }
 
     // A `Tower4Batch<9>` carries a `9⁴ = 6561`-entry `t4` tensor in 4-wide
     // lanes (≈210 KiB by value); the op chain keeps several live, which can
     // exceed a test thread's default stack. Run each width on a large-stack
     // thread so K=9 is exercised without a stack overflow.
-    fn big_stack<F: FnOnce() + Send + 'static>(f: F) {
+    fn big_stack<R: Send + 'static, F: FnOnce() -> R + Send + 'static>(f: F) -> R {
         std::thread::Builder::new()
             .stack_size(512 << 20)
             .spawn(f)
             .unwrap()
             .join()
-            .unwrap();
+            .unwrap()
     }
 
     #[test]
     fn tower4_batch_lane_bit_identical() {
-        big_stack(|| run4::<2>(0x1111_2222_3333_4444, 2000));
-        big_stack(|| run4::<3>(0x5555_6666_7777_8888, 2000));
-        big_stack(|| run4::<4>(0x9999_aaaa_bbbb_cccc, 2000));
-        big_stack(|| run4::<9>(0xdddd_eeee_ffff_0000, 2000));
+        let batches = 2000;
+        let rows_checked = big_stack(move || run4::<2>(0x1111_2222_3333_4444, batches))
+            + big_stack(move || run4::<3>(0x5555_6666_7777_8888, batches))
+            + big_stack(move || run4::<4>(0x9999_aaaa_bbbb_cccc, batches))
+            + big_stack(move || run4::<9>(0xdddd_eeee_ffff_0000, batches));
+        // 4 widths × `batches` batches × 4 rows each: guards the large-stack
+        // worker threads against silently running zero comparisons.
+        assert_eq!(rows_checked, 4 * batches * 4);
     }
 
     #[test]
     fn tower3_batch_lane_bit_identical() {
-        big_stack(|| run3::<2>(0x0f0f_1e1e_2d2d_3c3c, 2000));
-        big_stack(|| run3::<3>(0x4b4b_5a5a_6969_7878, 2000));
-        big_stack(|| run3::<4>(0x8787_9696_a5a5_b4b4, 2000));
-        big_stack(|| run3::<9>(0xc3c3_d2d2_e1e1_f0f0, 2000));
+        let batches = 2000;
+        let rows_checked = big_stack(move || run3::<2>(0x0f0f_1e1e_2d2d_3c3c, batches))
+            + big_stack(move || run3::<3>(0x4b4b_5a5a_6969_7878, batches))
+            + big_stack(move || run3::<4>(0x8787_9696_a5a5_b4b4, batches))
+            + big_stack(move || run3::<9>(0xc3c3_d2d2_e1e1_f0f0, batches));
+        // 4 widths × `batches` batches × 4 rows each: guards the large-stack
+        // worker threads against silently running zero comparisons.
+        assert_eq!(rows_checked, 4 * batches * 4);
     }
 }
 

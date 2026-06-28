@@ -2128,7 +2128,8 @@ mod batch_tests {
         }
     }
 
-    fn check_oneseed<const K: usize>(state: &mut u64, batches: usize) {
+    fn check_oneseed<const K: usize>(state: &mut u64, batches: usize) -> usize {
+        let mut rows_checked = 0;
         for _ in 0..batches {
             let rows: [[f64; K]; 4] =
                 std::array::from_fn(|_| std::array::from_fn(|_| rand_unit(state)));
@@ -2187,11 +2188,14 @@ mod batch_tests {
                         );
                     }
                 }
+                rows_checked += 1;
             }
         }
+        rows_checked
     }
 
-    fn check_twoseed<const K: usize>(state: &mut u64, batches: usize) {
+    fn check_twoseed<const K: usize>(state: &mut u64, batches: usize) -> usize {
+        let mut rows_checked = 0;
         for _ in 0..batches {
             let rows: [[f64; K]; 4] =
                 std::array::from_fn(|_| std::array::from_fn(|_| rand_unit(state)));
@@ -2248,8 +2252,10 @@ mod batch_tests {
                         );
                     }
                 }
+                rows_checked += 1;
             }
         }
+        rows_checked
     }
 
     /// ≥2000 random 4-row batches per K, across K ∈ {2,3,4,9}: the
@@ -2258,10 +2264,14 @@ mod batch_tests {
     #[test]
     fn oneseed_lanes_contracted_third_bit_identical() {
         let mut state = 0x1234_5678_9ABC_DEF0_u64;
-        check_oneseed::<2>(&mut state, 2000);
-        check_oneseed::<3>(&mut state, 2000);
-        check_oneseed::<4>(&mut state, 2000);
-        check_oneseed::<9>(&mut state, 2000);
+        let batches = 2000;
+        let rows_checked = check_oneseed::<2>(&mut state, batches)
+            + check_oneseed::<3>(&mut state, batches)
+            + check_oneseed::<4>(&mut state, batches)
+            + check_oneseed::<9>(&mut state, batches);
+        // 4 widths × `batches` batches × 4 rows each: a silently empty inner
+        // loop would leave this at zero instead of passing as a no-op.
+        assert_eq!(rows_checked, 4 * batches * 4);
     }
 
     /// ≥2000 random 4-row batches per K, across K ∈ {2,3,4,9}: the
@@ -2270,9 +2280,13 @@ mod batch_tests {
     #[test]
     fn twoseed_lanes_contracted_fourth_bit_identical() {
         let mut state = 0x0FED_CBA9_8765_4321_u64;
-        check_twoseed::<2>(&mut state, 2000);
-        check_twoseed::<3>(&mut state, 2000);
-        check_twoseed::<4>(&mut state, 2000);
-        check_twoseed::<9>(&mut state, 2000);
+        let batches = 2000;
+        let rows_checked = check_twoseed::<2>(&mut state, batches)
+            + check_twoseed::<3>(&mut state, batches)
+            + check_twoseed::<4>(&mut state, batches)
+            + check_twoseed::<9>(&mut state, batches);
+        // 4 widths × `batches` batches × 4 rows each: a silently empty inner
+        // loop would leave this at zero instead of passing as a no-op.
+        assert_eq!(rows_checked, 4 * batches * 4);
     }
 }
