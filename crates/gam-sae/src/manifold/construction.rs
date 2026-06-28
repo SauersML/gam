@@ -7738,6 +7738,18 @@ impl SaeManifoldTerm {
                 }
             }
 
+            // #1026 — UNGATED (background-tier) atoms have a force-fixed unit gate,
+            // so their mass `a_k ≡ 1` is α-INDEPENDENT: every data-Jacobian column
+            // for an ungated atom carries `a_k = 1`, NOT `π_k(α)`, so its α-exponent
+            // is `e_k = 0`, not `k+1`. Gated atoms keep `e_k = k+1`. (The prior trace
+            // handles ungated separately by zeroing the fixed-logit `z_jac`.)
+            let kfac = |atom: usize| -> f64 {
+                if self.assignment.ungated.get(atom).copied().unwrap_or(false) {
+                    0.0
+                } else {
+                    (atom + 1) as f64
+                }
+            };
             // t–t block: Σ_{a,b} (e_a + e_b)·(H⁻¹)_{ba}·⟨J_a, J_b⟩, where the
             // per-atom log-prior exponent is e_k = k+1 for the #614 consistent
             // stick-breaking mean π_k = (α/(α+1))^(k+1) (dlogπ_k/dlogα = (k+1)·inv_alpha1).
@@ -7747,7 +7759,7 @@ impl SaeManifoldTerm {
                     if h_ab == 0.0 {
                         continue;
                     }
-                    let kw = (var_atom[a] + 1 + var_atom[b] + 1) as f64;
+                    let kw = kfac(var_atom[a]) + kfac(var_atom[b]);
                     trace += kw * inv_vv[[b, a]] * h_ab;
                 }
             }
@@ -7779,7 +7791,7 @@ impl SaeManifoldTerm {
                         if h_ab == 0.0 {
                             continue;
                         }
-                        let kw = (var_atom[a] + 1 + var_atom[b] + 1) as f64;
+                        let kw = kfac(var_atom[a]) + kfac(var_atom[b]);
                         trace -= kw * v[a] * v[b] * h_ab;
                     }
                 }
@@ -7792,7 +7804,7 @@ impl SaeManifoldTerm {
                     if h_ab == 0.0 {
                         continue;
                     }
-                    let kw = (var_atom[a] + 1 + border_atom[beta_pos] + 1) as f64;
+                    let kw = kfac(var_atom[a]) + kfac(border_atom[beta_pos]);
                     trace += 2.0 * kw * inv_vbeta[[a, channel.index]] * h_ab;
                 }
             }
@@ -7803,7 +7815,7 @@ impl SaeManifoldTerm {
                     if h_ab == 0.0 {
                         continue;
                     }
-                    let kw = (border_atom[beta_i] + 1 + border_atom[beta_j] + 1) as f64;
+                    let kw = kfac(border_atom[beta_i]) + kfac(border_atom[beta_j]);
                     trace += kw * beta_inv[[channel_i.index, channel_j.index]] * h_ab;
                 }
             }
