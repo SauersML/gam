@@ -55,7 +55,18 @@ def test_competing_risks_predict_has_unit_survival_at_origin() -> None:
         train,
         "Surv(entry, exit, event) ~ age",
         survival_likelihood="weibull",
-        precision_hyperpriors={"cause_specific_survival_penalty_0": [2.0, 1.0]},
+        # #1512: the engine emits one penalty-block label per competing-risks
+        # cause (`cause_specific_survival_cause_{N}_penalty_{idx}`, see
+        # crates/gam-models/.../fit_orchestration/fit.rs). This orphaned repro
+        # still passed the pre-split single-block label
+        # `cause_specific_survival_penalty_0`, which the engine now rejects with
+        # an `unknown ... penalty block label` IntegrationError before the
+        # #1161 origin assertions below ever run. Address each cause's block so
+        # the test exercises the origin guard it documents.
+        precision_hyperpriors={
+            "cause_specific_survival_cause_1_penalty_0": [2.0, 1.0],
+            "cause_specific_survival_cause_2_penalty_0": [2.0, 1.0],
+        },
     )
     pred_rows = pd.DataFrame(
         {
