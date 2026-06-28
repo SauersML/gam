@@ -385,14 +385,28 @@ impl PredictableModel for StandardPredictor {
             })?;
             let family = spec_from_family_link(self.family.clone(), self.link_kind.as_ref());
             let strategy = strategy_from_fit(&family, fit)?;
-            let mut result = predict_gam_posterior_mean_from_backendwith_bc(
+            // #1602: report the UNCORRECTED linear predictor η̂ = Xβ̂ here. The
+            // exported coefficients (`summary().coefficients`) are the penalized
+            // MLE / posterior mode β̂, and `docs/predictions.md` ("Raw design
+            // matrix") promises `design_matrix(data) @ coef == linear_predictor`
+            // for every family (and the `posterior.samples @ X.T` recipe). Adding
+            // the O(1/n) frequentist bias-correction `b̂ = H⁻¹S(β̂−μ)` to η broke
+            // that identity by exactly `X@b̂` for curved links (1.5–4% of the lp
+            // range) while leaving identity-link Gaussian exact. It is also the
+            // lone outlier among the sibling paths: the plug-in/full-uncertainty
+            // arm sets `apply_bias_correction: false` (empirically worse against
+            // truth, #398/#1536) and the link-wiggle posterior-mean path reports
+            // the plug-in η. The Bayesian posterior mean `E[g⁻¹(η)]` should
+            // integrate the conditional posterior of η, which is centered at the
+            // mode Xβ̂ — not a frequentist-bias-shifted center — so dropping `b̂`
+            // here is both contract-restoring and more principled. Pass `None`.
+            let mut result = predict_gam_posterior_mean_from_backend(
                 input.design.clone(),
                 self.beta.view(),
                 input.offset.view(),
                 &backend,
                 &strategy,
                 "standard posterior mean",
-                fit.bias_correction_beta().map(|b| b.view()),
             )?;
             if let Some(level) = options.confidence_level {
                 // UNCERTAINTY: the reported SE, credible bounds and observation
