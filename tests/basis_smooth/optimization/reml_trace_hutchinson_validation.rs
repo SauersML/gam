@@ -1,5 +1,5 @@
 //! Math block 2 §16 validation tests for the Hutchinson REML logdet-gradient
-//! estimator in `gam::gpu::kernels::reml_trace`.
+//! estimator in `gam::solver::gpu_kernels::reml_trace`.
 //!
 //! These tests run against the CPU reference path
 //! (`evidence_derivatives_hutchinson_cpu`) and the public dispatch entry
@@ -18,7 +18,7 @@
 
 use ndarray::Array2;
 
-use gam::gpu::kernels::reml_trace::{
+use gam::solver::gpu_kernels::reml_trace::{
     AdaptiveTraceEvidence, DerivativeHessian, HUTCHINSON_ADAPTIVE_REL_TOL,
     HUTCHINSON_ADAPTIVE_TAU_REL, ProbeSeed, RemlTraceHutchinsonInput,
     evidence_derivatives_hutchinson_cpu, evidence_derivatives_hutchinson_gpu,
