@@ -735,3 +735,150 @@ fn amortized_predictor_is_the_ift_first_order_map() {
         "the closed-form predictor is the IFT first-order (affine) map: d2/d1 should be ≈ 2, got {ratio}"
     );
 }
+
+/// A unit-circle atom embedded in the `(axis0, axis1)` 2-plane of an `ambient`-dim
+/// output space: `m(t) = cos(2πt)·e_{axis0} + sin(2πt)·e_{axis1}`. Two such atoms
+/// in ORTHOGONAL planes give the candidate index distinct decoder frames, so a
+/// target lying in one plane routes to that atom and not the other.
+fn planted_circle_atom_in_plane(axis0: usize, axis1: usize, ambient: usize, n_obs: usize) -> SaeManifoldAtom {
+    let evaluator = PeriodicHarmonicEvaluator::new(M).expect("evaluator");
+    let coords = Array2::<f64>::zeros((n_obs.max(1), 1));
+    let (phi, jet) = evaluator.evaluate(coords.view()).expect("evaluate");
+    let mut decoder = Array2::<f64>::zeros((M, ambient));
+    decoder[[2, axis0]] = 1.0; // cos column -> axis0
+    decoder[[1, axis1]] = 1.0; // sin column -> axis1
+    SaeManifoldAtom::new(
+        "circle".to_string(),
+        SaeAtomBasisKind::Periodic,
+        1,
+        phi,
+        jet,
+        decoder,
+        Array2::<f64>::eye(M),
+    )
+    .expect("atom build")
+    .with_basis_evaluator(Arc::new(
+        PeriodicHarmonicEvaluator::new(M).expect("evaluator clone"),
+    ))
+}
+
+/// The LSH-routed FAST whole-dictionary forward (`amortized_encode_with_index_fast`
+/// / `amortized_reconstruct_with_index_fast`) must (a) route each row to the
+/// correct atom and (b) reproduce, on every routed row, the per-atom batched
+/// `amortized_encode_batch_fast` / `amortized_reconstruct_batch_fast` against the
+/// atom it routed to. Two unit-circle atoms in ORTHOGONAL planes of a 4-D output
+/// space: rows in plane (0,1) must route to atom 0, rows in plane (2,3) to atom 1.
+/// This exercises the multi-atom GROUPING + gather/scatter the single-atom
+/// composition test cannot.
+#[test]
+fn fast_routed_forward_groups_atoms_correctly() {
+    const AMBIENT: usize = 4;
+    let atom0 = planted_circle_atom_in_plane(0, 1, AMBIENT, 8);
+    let atom1 = planted_circle_atom_in_plane(2, 3, AMBIENT, 8);
+    let atoms = vec![atom0.clone(), atom1.clone()];
+    let atlas = EncodeAtlas::build(
+        &atoms,
+        &[1.0, 1.0],
+        1.0,
+        AtlasConfig {
+            grid_resolution: 32,
+            ridge: 1.0e-9,
+            newton_steps: 2,
+        },
+    )
+    .expect("atlas build");
+
+    // Sketch/index over BOTH atoms' decoder frames (oriented p-rows: (p, m)).
+    let frame0 = atom0.decoder_coefficients.t().to_owned();
+    let frame1 = atom1.decoder_coefficients.t().to_owned();
+    let sketch = RandomProjectionFrameSketch::from_decoder_blocks(&[frame0, frame1], 8, 7)
+        .expect("sketch build");
+    let index = SaeCandidateIndex::build(&sketch, IndexConfig::auto(8, 2, 7)).expect("index build");
+
+    // 64 targets: first 32 on the plane-(0,1) circle (-> atom 0), next 32 on the
+    // plane-(2,3) circle (-> atom 1).
+    let half = 32usize;
+    let n = 2 * half;
+    let mut targets = Array2::<f64>::zeros((n, AMBIENT));
+    for i in 0..half {
+        let a = TAU * (i as f64 / half as f64);
+        targets[[i, 0]] = a.cos();
+        targets[[i, 1]] = a.sin();
+        let b = TAU * (i as f64 / half as f64);
+        targets[[half + i, 2]] = b.cos();
+        targets[[half + i, 3]] = b.sin();
+    }
+    let amplitudes = Array1::<f64>::ones(n);
+
+    let (routed_coords, routed_valid) = atlas
+        .amortized_encode_with_index_fast(&atoms, &index, &sketch, targets.view(), amplitudes.view(), 1)
+        .expect("fast routed encode");
+    let (routed_recon, recon_valid) = atlas
+        .amortized_reconstruct_with_index_fast(&atoms, &index, &sketch, targets.view(), amplitudes.view())
+        .expect("fast routed reconstruct");
+
+    // Reference: each plane's rows batched directly against the atom they SHOULD
+    // route to. If routing + grouping is correct, the routed result equals this.
+    let plane0 = targets.slice(ndarray::s![0..half, ..]).to_owned();
+    let plane1 = targets.slice(ndarray::s![half..n, ..]).to_owned();
+    let amp_half = Array1::<f64>::ones(half);
+    let (ref0_coords, ref0_valid) = atlas
+        .amortized_encode_batch_fast(&atoms[0], 0, plane0.view(), amp_half.view())
+        .expect("ref0 encode");
+    let (ref1_coords, ref1_valid) = atlas
+        .amortized_encode_batch_fast(&atoms[1], 1, plane1.view(), amp_half.view())
+        .expect("ref1 encode");
+    let (ref0_recon, _) = atlas
+        .amortized_reconstruct_batch_fast(&atoms[0], 0, plane0.view(), amp_half.view())
+        .expect("ref0 recon");
+    let (ref1_recon, _) = atlas
+        .amortized_reconstruct_batch_fast(&atoms[1], 1, plane1.view(), amp_half.view())
+        .expect("ref1 recon");
+
+    let mut valid_count = 0usize;
+    for i in 0..half {
+        // Plane-0 rows: routed result must equal the direct atom-0 batch.
+        assert_eq!(
+            routed_valid[i], ref0_valid[i],
+            "plane-0 row {i}: routed valid-mask must match the atom-0 batch (routed to atom 0)"
+        );
+        assert_eq!(recon_valid[i], routed_valid[i], "encode/recon valid-mask agree, row {i}");
+        if routed_valid[i] {
+            valid_count += 1;
+            assert!(
+                (routed_coords[[i, 0]] - ref0_coords[[i, 0]]).abs() < 1e-12,
+                "plane-0 row {i}: routed coord must equal direct atom-0 batch coord"
+            );
+            for c in 0..AMBIENT {
+                assert!(
+                    (routed_recon[[i, c]] - ref0_recon[[i, c]]).abs() < 1e-12,
+                    "plane-0 row {i} col {c}: routed recon must equal direct atom-0 batch recon"
+                );
+            }
+        }
+        // Plane-1 rows: routed result must equal the direct atom-1 batch.
+        let r = half + i;
+        assert_eq!(
+            routed_valid[r], ref1_valid[i],
+            "plane-1 row {r}: routed valid-mask must match the atom-1 batch (routed to atom 1)"
+        );
+        if routed_valid[r] {
+            valid_count += 1;
+            assert!(
+                (routed_coords[[r, 0]] - ref1_coords[[i, 0]]).abs() < 1e-12,
+                "plane-1 row {r}: routed coord must equal direct atom-1 batch coord"
+            );
+            for c in 0..AMBIENT {
+                assert!(
+                    (routed_recon[[r, c]] - ref1_recon[[i, c]]).abs() < 1e-12,
+                    "plane-1 row {r} col {c}: routed recon must equal direct atom-1 batch recon"
+                );
+            }
+        }
+    }
+    // Non-vacuity: most rows actually routed + predicted through the fast path.
+    assert!(
+        valid_count > n / 2,
+        "fixture must route+predict most rows; got {valid_count} of {n}"
+    );
+}

@@ -2174,6 +2174,173 @@ impl EncodeAtlas {
         }
         Ok(EncodeResult::from_rows(coords, certified))
     }
+
+    /// LSH-routed FAST amortized encode over the WHOLE dictionary — the
+    /// multi-atom, corpus-rate analogue of [`Self::amortized_encode_with_index`].
+    ///
+    /// `amortized_encode_with_index` routes per row, then runs the per-row
+    /// closed-form predictor + Kantorovich certificate + cold cross-check on each
+    /// row independently. This fast variant keeps the SAME sublinear per-row LSH
+    /// routing (cheap — `index.propose` + the alignment gate), but replaces the
+    /// per-row predictor with the GEMM-batched [`Self::amortized_encode_batch_fast`]:
+    /// it GROUPS rows by their proposed atom and runs one batched affine-predictor
+    /// pass per atom-group (a routing GEMM + a predictor GEMM each), reproducing a
+    /// traditional SAE's whole-dictionary `W·x+b` throughput. No per-row
+    /// certificate — this is the speed mode validated as accuracy-parity with the
+    /// certified solve (`fast_forward_is_accuracy_parity_with_certified`).
+    ///
+    /// Returns the per-row latent coords and a valid-mask: `false` for a row with
+    /// no LSH proposal, a sub-threshold/NaN routing alignment, or one the batched
+    /// predictor could not fire on (no evaluator / singular Gauss–Newton block /
+    /// non-finite-or-zero amplitude). Each row is written exactly once (disjoint
+    /// per-atom groups), so the result is independent of group iteration order.
+    pub fn amortized_encode_with_index_fast<S: AtomFrameSketch + Sync>(
+        &self,
+        atoms: &[SaeManifoldAtom],
+        index: &SaeCandidateIndex,
+        sketch: &S,
+        targets: ArrayView2<'_, f64>,
+        amplitudes: ArrayView1<'_, f64>,
+        latent_dim: usize,
+    ) -> Result<(Array2<f64>, Vec<bool>), String> {
+        let n = targets.nrows();
+        if amplitudes.len() != n {
+            return Err(format!(
+                "amortized_encode_with_index_fast: amplitudes len {} != rows {n}",
+                amplitudes.len()
+            ));
+        }
+        let budget = auto_candidate_budget(atoms.len().max(1));
+        // ── Per-row LSH routing (sublinear), grouped by proposed atom. ──────────
+        let mut groups: std::collections::HashMap<usize, Vec<usize>> =
+            std::collections::HashMap::new();
+        for row in 0..n {
+            let proposal = index.propose(sketch, targets.row(row), budget, true);
+            let Some(&best_atom) = proposal.proposed.first() else {
+                continue;
+            };
+            // Same routing-confidence gate as the per-row path: a low-alignment or
+            // NaN (zero-norm row) gather flags the row for the exact fallback, so a
+            // missed-true-best LSH route is never silently encoded.
+            let routing_alignment = sketch.alignment(best_atom, targets.row(row));
+            if !routing_alignment.is_finite()
+                || routing_alignment < CANDIDATE_ROUTING_MIN_ALIGNMENT
+            {
+                continue;
+            }
+            groups.entry(best_atom).or_default().push(row);
+        }
+
+        let mut coords = Array2::<f64>::zeros((n, latent_dim));
+        let mut valid = vec![false; n];
+        // ── Per-atom batched predictor over each group's rows. ──────────────────
+        for (atom_idx, rows_here) in groups {
+            let atom = atoms.get(atom_idx).ok_or_else(|| {
+                format!("amortized_encode_with_index_fast: proposed atom {atom_idx} out of range")
+            })?;
+            if atom.latent_dim != latent_dim {
+                return Err(format!(
+                    "amortized_encode_with_index_fast: atom {atom_idx} latent_dim {} != declared \
+                     {latent_dim}; heterogeneous-dim dictionaries are not supported by this path",
+                    atom.latent_dim
+                ));
+            }
+            // Gather this group's target rows and amplitudes (contiguous sub-batch).
+            let p = atom.output_dim();
+            let mut x_sub = Array2::<f64>::zeros((rows_here.len(), p));
+            let mut amp_sub = Array1::<f64>::zeros(rows_here.len());
+            for (i, &row) in rows_here.iter().enumerate() {
+                x_sub.row_mut(i).assign(&targets.row(row));
+                amp_sub[i] = amplitudes[row];
+            }
+            let (sub_coords, sub_valid) =
+                self.amortized_encode_batch_fast(atom, atom_idx, x_sub.view(), amp_sub.view())?;
+            for (i, &row) in rows_here.iter().enumerate() {
+                if sub_valid[i] {
+                    coords.row_mut(row).assign(&sub_coords.row(i));
+                    valid[row] = true;
+                }
+            }
+        }
+        Ok((coords, valid))
+    }
+
+    /// LSH-routed FAST full forward over the WHOLE dictionary: encode → decode,
+    /// the multi-atom analogue of [`Self::amortized_reconstruct_batch_fast`]. Same
+    /// sublinear per-row routing + per-atom grouping as
+    /// [`Self::amortized_encode_with_index_fast`], but each group is run through
+    /// the batched reconstruct (`m(t̂) = z·Φ(t̂)·B`) so the result is the per-row
+    /// reconstruction in the ambient space. Rows that do not route/predict decode
+    /// to an exact zero reconstruction and are flagged `false`.
+    pub fn amortized_reconstruct_with_index_fast<S: AtomFrameSketch + Sync>(
+        &self,
+        atoms: &[SaeManifoldAtom],
+        index: &SaeCandidateIndex,
+        sketch: &S,
+        targets: ArrayView2<'_, f64>,
+        amplitudes: ArrayView1<'_, f64>,
+    ) -> Result<(Array2<f64>, Vec<bool>), String> {
+        let n = targets.nrows();
+        let p = targets.ncols();
+        if amplitudes.len() != n {
+            return Err(format!(
+                "amortized_reconstruct_with_index_fast: amplitudes len {} != rows {n}",
+                amplitudes.len()
+            ));
+        }
+        let budget = auto_candidate_budget(atoms.len().max(1));
+        let mut groups: std::collections::HashMap<usize, Vec<usize>> =
+            std::collections::HashMap::new();
+        for row in 0..n {
+            let proposal = index.propose(sketch, targets.row(row), budget, true);
+            let Some(&best_atom) = proposal.proposed.first() else {
+                continue;
+            };
+            let routing_alignment = sketch.alignment(best_atom, targets.row(row));
+            if !routing_alignment.is_finite()
+                || routing_alignment < CANDIDATE_ROUTING_MIN_ALIGNMENT
+            {
+                continue;
+            }
+            groups.entry(best_atom).or_default().push(row);
+        }
+
+        let mut recon = Array2::<f64>::zeros((n, p));
+        let mut valid = vec![false; n];
+        for (atom_idx, rows_here) in groups {
+            let atom = atoms.get(atom_idx).ok_or_else(|| {
+                format!(
+                    "amortized_reconstruct_with_index_fast: proposed atom {atom_idx} out of range"
+                )
+            })?;
+            if atom.output_dim() != p {
+                return Err(format!(
+                    "amortized_reconstruct_with_index_fast: atom {atom_idx} output_dim {} != target \
+                     dim {p}",
+                    atom.output_dim()
+                ));
+            }
+            let mut x_sub = Array2::<f64>::zeros((rows_here.len(), p));
+            let mut amp_sub = Array1::<f64>::zeros(rows_here.len());
+            for (i, &row) in rows_here.iter().enumerate() {
+                x_sub.row_mut(i).assign(&targets.row(row));
+                amp_sub[i] = amplitudes[row];
+            }
+            let (sub_recon, sub_valid) = self.amortized_reconstruct_batch_fast(
+                atom,
+                atom_idx,
+                x_sub.view(),
+                amp_sub.view(),
+            )?;
+            for (i, &row) in rows_here.iter().enumerate() {
+                if sub_valid[i] {
+                    recon.row_mut(row).assign(&sub_recon.row(i));
+                    valid[row] = true;
+                }
+            }
+        }
+        Ok((recon, valid))
+    }
 }
 
 /// Offline `β = 1/λ_min(H_GN)` at a chart center from the Gauss-Newton block
