@@ -1524,6 +1524,17 @@ impl ResidualCascadeDesign {
         self.core.m
     }
 
+    /// Structural nonzero count of the sparse design `X` (its CSR size). Each
+    /// iterative-route PCG iteration applies the operator `A = XᵀWX + λD` as two
+    /// CSR products against `X`, so its per-iteration cost is `Θ(nnz(X))`; the
+    /// certified sparse-solve work is therefore `solve_iters · num_nonzeros()`,
+    /// the figure the residual-cascade complexity certificate compares against
+    /// the dense `m³/3` factorization cost. Zero on a predict-only core rebuilt
+    /// from a persisted snapshot (the training CSR is intentionally dropped).
+    pub fn num_nonzeros(&self) -> usize {
+        self.core.col_idx.len()
+    }
+
     /// Total centers across all levels.
     pub fn num_centers(&self) -> usize {
         self.core.m - self.core.nullity()
