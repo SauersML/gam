@@ -2758,6 +2758,22 @@ pub(crate) fn sae_value_probe_refusal_classification_is_inner_only() {
             "SaeManifoldTerm::reml_criterion: undamped evidence factorization hit a non-PD per-row H_tt block before KKT stationarity"
         )
     );
+    // A non-PD cross-row IBP joint Hessian at a probed ρ is genuine infeasibility
+    // (the Laplace evidence log-det is undefined there) — recoverable, the same
+    // class as the per-row non-PD refusal, so the outer optimizer returns +∞ and
+    // steers back into the PD region instead of aborting the whole fit.
+    assert!(
+        SaeManifoldOuterObjective::is_recoverable_value_probe_refusal(
+            "SaeManifoldTerm::reml_criterion: cross-row IBP joint Hessian is non-PD at this ρ; evidence Laplace log-det undefined (infeasible ρ probe)"
+        )
+    );
+    // The generic "log-det unavailable" message (a real factorization defect, not
+    // an infeasibility) stays FATAL — it is NOT in the recoverable set.
+    assert!(
+        !SaeManifoldOuterObjective::is_recoverable_value_probe_refusal(
+            "SaeManifoldTerm::reml_criterion: arrow_log_det_from_cache returned None (undamped joint Hessian log-det unavailable for the Laplace normaliser)"
+        )
+    );
     assert!(
         !SaeManifoldOuterObjective::is_recoverable_value_probe_refusal(
             "SaeManifoldTerm::reml_criterion: row-gauge evidence deflation count re-anchored \

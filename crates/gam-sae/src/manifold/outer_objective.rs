@@ -1227,6 +1227,13 @@ impl SaeManifoldOuterObjective {
             || err.contains(
                 "undamped evidence factorization hit a non-PD per-row H_tt block before KKT",
             )
+            // A probed ρ whose cross-row IBP joint Hessian is non-PD has an
+            // undefined Laplace evidence log-det — a genuine infeasibility, the
+            // same class as the per-row non-PD refusal above. The outer optimizer
+            // must read it as +∞ and steer back into the PD region, NOT abort the
+            // whole fit (the indefinite basin is adjacent to the PD optimum, so
+            // line searches WILL overshoot into it).
+            || err.contains("cross-row IBP joint Hessian is non-PD at this ρ")
     }
 
     /// Shared cost path: evaluate the REML criterion at `rho_flat`, updating

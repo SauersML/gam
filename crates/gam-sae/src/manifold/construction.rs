@@ -5855,10 +5855,30 @@ impl SaeManifoldTerm {
         self.record_evidence_gauge_deflation_count(cache.gauge_deflated_directions)?;
         loss.evidence_gauge_deflated_directions = cache.gauge_deflated_directions;
         let log_det = arrow_log_det_from_cache(&cache).ok_or_else(|| {
-            "SaeManifoldTerm::reml_criterion: arrow_log_det_from_cache returned None at \
-             ridge=0 Direct mode (no dense Schur factor); the joint Hessian log-det is \
-             required for the Laplace normaliser"
-                .to_string()
+            // Distinguish a GENUINE infeasibility — a probed ρ where the joint
+            // Hessian is not PD so the Laplace evidence log-det is undefined —
+            // from a real factorization defect. The cross-row IBP Woodbury
+            // capacitance `C = I_R + D·Uᵀ H₀'⁻¹ U` can have det ≤ 0 at a ρ the
+            // outer optimizer line-searches into (the indefinite basin adjacent
+            // to the PD region); there the log-det legitimately does not exist.
+            // That refusal must be RECOVERABLE (the outer BFGS should get +∞ and
+            // steer back into the PD region), exactly like the "non-PD per-row
+            // H_tt block" refusal — not a fatal `RemlOptimizationFailed` that
+            // aborts the whole fit. See `is_recoverable_value_probe_refusal`.
+            // (The old message claimed "no dense Schur factor", which is false
+            // here — the Schur factor is present; the Woodbury correction is the
+            // non-finite term.)
+            if cache.cross_row_woodbury.is_some()
+                && !cache.cross_row_woodbury_log_det().is_finite()
+            {
+                "SaeManifoldTerm::reml_criterion: cross-row IBP joint Hessian is non-PD at \
+                 this ρ; evidence Laplace log-det undefined (infeasible ρ probe)"
+                    .to_string()
+            } else {
+                "SaeManifoldTerm::reml_criterion: arrow_log_det_from_cache returned None \
+                 (undamped joint Hessian log-det unavailable for the Laplace normaliser)"
+                    .to_string()
+            }
         })?;
 
         // 3. Smoothing-penalty Occam term `−½·Σ_k r_k·rank(S_k)·log λ_smooth`
