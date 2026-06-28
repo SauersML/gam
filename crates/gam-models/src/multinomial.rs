@@ -2637,10 +2637,10 @@ mod reference_class_invariance_tests {
     // is wired through the custom-family outer REML loop (per-eval
     // `JointPenaltyBundle` + outer penalty_coords/logdet/operator), the
     // production multinomial fit is invariant to the arbitrary reference class,
-    // so this guard runs by default (the `#[ignore]` it carried while the fix was
-    // pending is also forbidden by the build.rs ban-scanner). It is an
-    // end-to-end fit guard (a handful of full softmax `y ~ s(x)` fits) — slower
-    // than a unit test but a true production-path regression.
+    // so this guard runs by default (the opt-in skip attribute it carried while
+    // the fix was pending is also forbidden by the build.rs ban-scanner). It is
+    // an end-to-end fit guard (a handful of full softmax `y ~ s(x)` fits) —
+    // slower than a unit test but a true production-path regression.
     #[test]
     fn multinomial_fit_is_invariant_to_reference_class_1587() {
         let td = tempdir().expect("tempdir");
