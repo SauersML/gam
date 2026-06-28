@@ -168,9 +168,9 @@ pub mod terms {
     // re-exports take priority over the `gam_terms::*` glob above, so there is
     // no ambiguity with any same-named term-side item.
     pub use gam_sae::manifold::{
-        AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
-        SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldLoss, SaeManifoldRho, SaeManifoldTerm,
-        TorusHarmonicEvaluator,
+        ArdSharing, AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
+        SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldLoss, SaeManifoldOuterObjective,
+        SaeManifoldRho, SaeManifoldTerm, SphereChartEvaluator, TorusHarmonicEvaluator,
     };
 }
 /// Shared test-support helpers (FD harness, fixtures, reference-tool + CLI
