@@ -540,4 +540,115 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn constructor_rejects_invalid_args() {
+        assert!(GrassmannManifold::new(3, 2).is_err());
+        assert!(GrassmannManifold::new(0, 3).is_err());
+        assert!(GrassmannManifold::new(1, 0).is_err());
+        assert!(GrassmannManifold::new(2, 2).is_ok());
+        assert!(GrassmannManifold::new(1, 4).is_ok());
+    }
+
+    #[test]
+    fn dim_and_ambient_dim_are_correct() {
+        let gr = GrassmannManifold::new(2, 5).unwrap();
+        assert_eq!(gr.dim(), 6);
+        assert_eq!(gr.ambient_dim(), 10);
+        let gr14 = GrassmannManifold::new(1, 4).unwrap();
+        assert_eq!(gr14.dim(), 3);
+        assert_eq!(gr14.ambient_dim(), 4);
+    }
+
+    #[test]
+    fn project_tangent_is_horizontal() {
+        let gr = GrassmannManifold::new(2, 4).unwrap();
+        let y = flat(&Array2::from_shape_vec((4, 2), vec![1., 0., 0., 1., 0., 0., 0., 0.]).unwrap());
+        let v = flat(&Array2::from_shape_vec((4, 2), vec![1., 1., 1., 1., 1., 0., 0., 1.]).unwrap());
+        let h_flat = gr.project_tangent(y.view(), v.view()).unwrap();
+        // Y = [e0, e1], so YᵀH[a, b] = H[a, b] (rows 0 and 1 of H in n×k layout).
+        for a in 0..2usize {
+            for b in 0..2usize {
+                let yth_ab: f64 = (0..4).map(|r| {
+                    let ya = if r == a { 1.0 } else { 0.0 };
+                    ya * h_flat[r * 2 + b]
+                }).sum();
+                assert!(yth_ab.abs() < 1e-12, "YᵀH[{a},{b}] = {yth_ab}");
+            }
+        }
+    }
+
+    #[test]
+    fn retract_stays_on_manifold() {
+        let gr = GrassmannManifold::new(2, 4).unwrap();
+        let y = flat(&Array2::from_shape_vec((4, 2), vec![1., 0., 0., 1., 0., 0., 0., 0.]).unwrap());
+        let delta = flat(&Array2::from_shape_vec((4, 2), vec![0., 0., 0., 0., 0.3, 0.1, 0., 0.2]).unwrap());
+        let q_flat = gr.retract(y.view(), delta.view()).unwrap();
+        let n = 4usize;
+        let k = 2usize;
+        let mut qtq = [[0.0_f64; 2]; 2];
+        for r in 0..n {
+            for a in 0..k {
+                for b in 0..k {
+                    qtq[a][b] += q_flat[r * k + a] * q_flat[r * k + b];
+                }
+            }
+        }
+        for i in 0..k {
+            for j in 0..k {
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!((qtq[i][j] - want).abs() < 1e-12, "QᵀQ[{i},{j}] = {}", qtq[i][j]);
+            }
+        }
+    }
+
+    #[test]
+    fn metric_tensor_is_ambient_identity() {
+        let gr = GrassmannManifold::new(2, 3).unwrap();
+        let y = flat(&Array2::from_shape_vec((3, 2), vec![1., 0., 0., 1., 0., 0.]).unwrap());
+        let g = gr.metric_tensor(y.view()).unwrap();
+        let amb = gr.ambient_dim();
+        assert_eq!(g.dim(), (amb, amb));
+        for i in 0..amb {
+            for j in 0..amb {
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!((g[[i, j]] - want).abs() < 1e-14, "G[{i},{j}] = {}", g[[i, j]]);
+            }
+        }
+    }
+
+    #[test]
+    fn sectional_curvature_degenerate_plane_is_singular() {
+        let gr = GrassmannManifold::new(2, 4).unwrap();
+        let y = flat(&Array2::from_shape_vec((4, 2), vec![1., 0., 0., 1., 0., 0., 0., 0.]).unwrap());
+        let u = flat(&Array2::from_shape_vec((4, 2), vec![0., 0., 0., 0., 1., 0., 0., 0.]).unwrap());
+        let v = u.clone();
+        match gr.sectional_curvature(y.view(), (u.view(), v.view())) {
+            Err(GeometryError::Singular(_)) => {}
+            other => panic!("expected Singular for degenerate pair, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sectional_curvature_gr1n_is_plus_one() {
+        // Gr(1,3) = RP² delegates to SphereManifold; sectional curvature must be +1.
+        let gr = GrassmannManifold::new(1, 3).unwrap();
+        let p = Array1::from(vec![1.0_f64, 0.0, 0.0]);
+        let u = Array1::from(vec![0.0_f64, 1.0, 0.0]);
+        let v = Array1::from(vec![0.0_f64, 0.0, 1.0]);
+        let k = gr.sectional_curvature(p.view(), (u.view(), v.view())).unwrap();
+        assert!((k - 1.0).abs() < 1e-12, "Gr(1,3) sectional curvature must be +1, got {k}");
+    }
+
+    #[test]
+    fn exp_map_vjp_k_gt_1_is_unsupported() {
+        let gr = GrassmannManifold::new(2, 4).unwrap();
+        let y = flat(&Array2::from_shape_vec((4, 2), vec![1., 0., 0., 1., 0., 0., 0., 0.]).unwrap());
+        let delta = flat(&Array2::from_shape_vec((4, 2), vec![0., 0., 0., 0., 1., 0., 0., 0.]).unwrap());
+        let g_out = y.clone();
+        match gr.exp_map_vjp(y.view(), delta.view(), g_out.view()) {
+            Err(GeometryError::Unsupported(_)) => {}
+            other => panic!("expected Unsupported for k>1, got {other:?}"),
+        }
+    }
 }

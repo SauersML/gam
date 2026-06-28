@@ -479,3 +479,118 @@ mod tangent_basis_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod stiefel_tests {
+    use super::StiefelManifold;
+    use crate::manifold::{GeometryError, RiemannianManifold};
+    use ndarray::{Array1, Array2};
+
+    #[test]
+    fn constructor_rejects_invalid_args() {
+        assert!(StiefelManifold::new(3, 2).is_err());
+        assert!(StiefelManifold::new(0, 3).is_err());
+        assert!(StiefelManifold::new(1, 0).is_err());
+        assert!(StiefelManifold::new(2, 2).is_ok());
+        assert!(StiefelManifold::new(1, 5).is_ok());
+    }
+
+    #[test]
+    fn dim_and_ambient_dim_are_correct() {
+        // St(2, 3): dim = 3*2 − 2*3/2 = 6 − 3 = 3, ambient = 6
+        let st = StiefelManifold::new(2, 3).unwrap();
+        assert_eq!(st.dim(), 3);
+        assert_eq!(st.ambient_dim(), 6);
+        // St(1, 4): dim = 4*1 − 1*2/2 = 4 − 1 = 3, ambient = 4
+        let st14 = StiefelManifold::new(1, 4).unwrap();
+        assert_eq!(st14.dim(), 3);
+        assert_eq!(st14.ambient_dim(), 4);
+    }
+
+    #[test]
+    fn log_map_k_gt_1_returns_unsupported() {
+        let st = StiefelManifold::new(2, 3).unwrap();
+        let y = Array1::from(vec![1.0_f64, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        let z = Array1::from(vec![0.0_f64, 1.0, 1.0, 0.0, 0.0, 0.0]);
+        match st.log_map(y.view(), z.view()) {
+            Err(GeometryError::Unsupported(_)) => {}
+            other => panic!("expected Unsupported for k>1, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parallel_transport_k_gt_1_returns_unsupported() {
+        let st = StiefelManifold::new(2, 3).unwrap();
+        let path = Array2::from_shape_vec((1, 6), vec![1.0_f64, 0.0, 0.0, 1.0, 0.0, 0.0]).unwrap();
+        let v = Array1::from(vec![0.0_f64, -1.0, 1.0, 0.0, 0.0, 0.0]);
+        match st.parallel_transport(path.view(), v.view()) {
+            Err(GeometryError::Unsupported(_)) => {}
+            other => panic!("expected Unsupported for k>1, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sectional_curvature_k_gt_1_returns_unsupported() {
+        let st = StiefelManifold::new(2, 3).unwrap();
+        let y = Array1::from(vec![1.0_f64, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        let u = Array1::from(vec![0.0_f64, -1.0, 1.0, 0.0, 0.0, 0.0]);
+        let v = Array1::from(vec![0.0_f64, 0.0, 0.0, 0.0, 1.0, 0.0]);
+        match st.sectional_curvature(y.view(), (u.view(), v.view())) {
+            Err(GeometryError::Unsupported(_)) => {}
+            other => panic!("expected Unsupported for k>1, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn project_tangent_makes_ytz_skew_symmetric() {
+        // Y = [e0, e1] as 3×2 row-major: rows (1,0), (0,1), (0,0)
+        let st = StiefelManifold::new(2, 3).unwrap();
+        let y = Array1::from(vec![1.0_f64, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        let v = Array1::from(vec![0.5_f64, 1.0, 0.0, 0.5, 1.0, 0.0]);
+        let h = st.project_tangent(y.view(), v.view()).unwrap();
+        // YᵀH where Y=[e0,e1] (3×2 standard frame): YᵀH[a,b] = H[a,b],
+        // i.e. h[0..4] encodes the 2×2 block. Skew requires diagonal = 0
+        // and off-diagonal sum = 0.
+        assert!(h[0].abs() < 1e-12, "YᵀH[0,0] = {}", h[0]);
+        assert!(h[3].abs() < 1e-12, "YᵀH[1,1] = {}", h[3]);
+        assert!((h[1] + h[2]).abs() < 1e-12, "YᵀH not skew: h[1]={}, h[2]={}", h[1], h[2]);
+    }
+
+    #[test]
+    fn retract_stays_on_stiefel_manifold() {
+        // St(2, 4): QR retraction must return a frame with QᵀQ = I₂.
+        let st = StiefelManifold::new(2, 4).unwrap();
+        // Y = [e0, e1] as 4×2 row-major: [1,0, 0,1, 0,0, 0,0]
+        let y = Array1::from(vec![1.0_f64, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
+        let delta = Array1::from(vec![0.0_f64, -0.2, 0.2, 0.0, 0.1, 0.0, 0.0, 0.05]);
+        let q_flat = st.retract(y.view(), delta.view()).unwrap();
+        let n = 4usize;
+        let k = 2usize;
+        let mut qtq = [[0.0_f64; 2]; 2];
+        for r in 0..n {
+            for a in 0..k {
+                for b in 0..k {
+                    qtq[a][b] += q_flat[r * k + a] * q_flat[r * k + b];
+                }
+            }
+        }
+        for i in 0..k {
+            for j in 0..k {
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!((qtq[i][j] - want).abs() < 1e-12, "QᵀQ[{i},{j}] = {}", qtq[i][j]);
+            }
+        }
+    }
+
+    #[test]
+    fn exp_map_k1_sphere_half_pi_rotation() {
+        // St(1, 3) = S²: exp at e1 along π/2·e2 reaches e2.
+        let st = StiefelManifold::new(1, 3).unwrap();
+        let p = Array1::from(vec![1.0_f64, 0.0, 0.0]);
+        let v = Array1::from(vec![0.0_f64, std::f64::consts::FRAC_PI_2, 0.0]);
+        let q = st.exp_map(p.view(), v.view()).unwrap();
+        assert!(q[0].abs() < 1e-12, "q[0] = {}", q[0]);
+        assert!((q[1] - 1.0).abs() < 1e-12, "q[1] = {}", q[1]);
+        assert!(q[2].abs() < 1e-12, "q[2] = {}", q[2]);
+    }
+}
