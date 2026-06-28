@@ -366,3 +366,165 @@ impl PerRowDispersionChannel for DispersionLocationScalePredictor {
         Ok(dispersion)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gam::types::StandardLink;
+    use ndarray::array;
+
+    /// Build a predictor for the given family with unit (intercept-only) design.
+    fn make_pred(family: ResponseFamily, link: StandardLink) -> DispersionLocationScalePredictor {
+        DispersionLocationScalePredictor {
+            beta_mu: array![0.0_f64],
+            beta_noise: array![0.0_f64],
+            likelihood: LikelihoodSpec::new(family, InverseLink::Standard(link)),
+            inverse_link: None,
+            covariance: None,
+        }
+    }
+
+    /// Intercept-only input: noise eta determined by `eta_d_offset` alone
+    /// (beta_noise = 0, so eta_d = 0*1 + eta_d_offset = eta_d_offset).
+    fn make_input(eta_d_offset: f64) -> PredictInput {
+        PredictInput {
+            design: DesignMatrix::from(array![[1.0_f64]]),
+            offset: array![0.0_f64],
+            design_noise: Some(DesignMatrix::from(array![[1.0_f64]])),
+            offset_noise: Some(array![eta_d_offset]),
+            auxiliary_scalar: None,
+            auxiliary_matrix: None,
+        }
+    }
+
+    /// NegativeBinomial noise SD: `sqrt(mu + mu²/theta)`, theta = precision.
+    #[test]
+    fn nb_noise_sd_uses_correct_mean_variance_law() {
+        let theta = 4.0_f64;
+        let mu = 2.0_f64; // exp(ln 2) via log link
+        let mut pred = make_pred(
+            ResponseFamily::NegativeBinomial { theta: 1.0, theta_fixed: false },
+            StandardLink::Log,
+        );
+        pred.beta_mu = array![mu.ln()];
+        let input = make_input(theta.ln());
+        let sd = pred.noise_sd(&input).expect("NB noise_sd");
+        let expected = (mu + mu * mu / theta).sqrt();
+        assert!(
+            (sd[0] - expected).abs() < 1e-12,
+            "NB noise_sd: got {:.6e}, expected {:.6e}",
+            sd[0],
+            expected
+        );
+    }
+
+    /// Gamma noise SD: `sqrt(mu²/nu)`, nu = precision.
+    #[test]
+    fn gamma_noise_sd_uses_correct_mean_variance_law() {
+        let nu = 5.0_f64;
+        let mu = 3.0_f64;
+        let mut pred = make_pred(ResponseFamily::Gamma, StandardLink::Log);
+        pred.beta_mu = array![mu.ln()];
+        let input = make_input(nu.ln());
+        let sd = pred.noise_sd(&input).expect("Gamma noise_sd");
+        let expected = (mu * mu / nu).sqrt();
+        assert!(
+            (sd[0] - expected).abs() < 1e-12,
+            "Gamma noise_sd: got {:.6e}, expected {:.6e}",
+            sd[0],
+            expected
+        );
+    }
+
+    /// Beta noise SD: `sqrt(mu(1-mu)/(1+phi))`, phi = precision; logit link → mu = 0.5 at eta=0.
+    #[test]
+    fn beta_noise_sd_uses_correct_mean_variance_law() {
+        let phi = 7.0_f64;
+        let mu = 0.5_f64; // logit⁻¹(0) = 0.5
+        let pred = make_pred(
+            ResponseFamily::Beta { phi: 1.0 },
+            StandardLink::Logit,
+        );
+        let input = make_input(phi.ln());
+        let sd = pred.noise_sd(&input).expect("Beta noise_sd");
+        let expected = (mu * (1.0 - mu) / (1.0 + phi)).sqrt();
+        assert!(
+            (sd[0] - expected).abs() < 1e-12,
+            "Beta noise_sd: got {:.6e}, expected {:.6e}",
+            sd[0],
+            expected
+        );
+    }
+
+    /// Tweedie noise SD: `sqrt(phi * mu^p)`, phi = 1/precision (precision = exp(eta_d)).
+    #[test]
+    fn tweedie_noise_sd_uses_reciprocal_precision() {
+        let p = 1.5_f64;
+        let precision = 4.0_f64;
+        let phi = 1.0 / precision;
+        let mu = 2.0_f64;
+        let mut pred = make_pred(ResponseFamily::Tweedie { p }, StandardLink::Log);
+        pred.beta_mu = array![mu.ln()];
+        let input = make_input(precision.ln());
+        let sd = pred.noise_sd(&input).expect("Tweedie noise_sd");
+        let expected = (phi * mu.powf(p)).sqrt();
+        assert!(
+            (sd[0] - expected).abs() < 1e-12,
+            "Tweedie noise_sd: got {:.6e}, expected {:.6e}",
+            sd[0],
+            expected
+        );
+    }
+
+    /// Tweedie per_row_dispersion returns `phi = 1/precision`, not precision.
+    #[test]
+    fn tweedie_per_row_dispersion_is_reciprocal_precision() {
+        let precision = 8.0_f64;
+        let phi = 1.0 / precision;
+        let pred = make_pred(ResponseFamily::Tweedie { p: 1.5 }, StandardLink::Log);
+        let input = make_input(precision.ln());
+        let disp = pred.per_row_dispersion(&input).expect("Tweedie per_row_dispersion");
+        assert!(
+            (disp[0] - phi).abs() < 1e-12,
+            "Tweedie dispersion: got {:.6e}, expected phi={:.6e}",
+            disp[0],
+            phi
+        );
+    }
+
+    /// NB per_row_dispersion returns precision (theta) directly, not its reciprocal.
+    #[test]
+    fn nb_per_row_dispersion_is_precision() {
+        let theta = 6.0_f64;
+        let pred = make_pred(
+            ResponseFamily::NegativeBinomial { theta: 1.0, theta_fixed: false },
+            StandardLink::Log,
+        );
+        let input = make_input(theta.ln());
+        let disp = pred.per_row_dispersion(&input).expect("NB per_row_dispersion");
+        assert!(
+            (disp[0] - theta).abs() < 1e-12,
+            "NB dispersion: got {:.6e}, expected theta={:.6e}",
+            disp[0],
+            theta
+        );
+    }
+
+    /// Missing noise design matrix returns an error rather than silently using zeros.
+    #[test]
+    fn precision_errors_without_noise_design() {
+        let pred = make_pred(ResponseFamily::Gamma, StandardLink::Log);
+        let input = PredictInput {
+            design: DesignMatrix::from(array![[1.0_f64]]),
+            offset: array![0.0_f64],
+            design_noise: None, // <-- absent
+            offset_noise: None,
+            auxiliary_scalar: None,
+            auxiliary_matrix: None,
+        };
+        assert!(
+            pred.noise_sd(&input).is_err(),
+            "noise_sd must error when design_noise is absent"
+        );
+    }
+}
