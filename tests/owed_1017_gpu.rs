@@ -13,10 +13,10 @@
 
 use cudarc::cublas::CudaBlas;
 use gam::gpu::device_runtime::{GpuRuntime, cuda_context_for};
-use gam::gpu::kernels::arrow_schur::{
+use gam::solver::gpu_kernels::arrow_schur::{
     solve_arrow_newton_step, solve_arrow_newton_step_dense_reference,
 };
-use gam::gpu::kernels::sae_resident::{DeviceResidentInnerOptions, color_arm_fixture};
+use gam::solver::gpu_kernels::sae_resident::{DeviceResidentInnerOptions, color_arm_fixture};
 use gam::solver::arrow_schur::ArrowSchurSystem;
 
 fn build_wide_border(n: usize, d: usize, k: usize) -> ArrowSchurSystem {
