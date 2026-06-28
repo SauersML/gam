@@ -31,25 +31,51 @@ class _FakeRustModule:
         penalty = np.diag(penalties)
         return phi, jet, penalty
 
+    def build_info(self):
+        # #1512: the SAE driver gates row-block penalties on
+        # build_info()["sae_row_block_penalties"]; advertise the kinds the real
+        # extension reports so the fit accepts the test's configuration.
+        return {
+            "sae_row_block_penalties": [
+                "ard", "top_k_activation", "jumprelu", "sparsity",
+                "row_precision_prior", "parametric_row_precision_prior",
+                "scad_mcp", "block_orthogonality", "isometry",
+            ]
+        }
+
+    def basis_with_jet(self, kind, coords, params=None):
+        # #1512: refactored FFI signature basis_with_jet(kind, coords, params)
+        # -> (phi, jet, penalty). Delegate to the periodic stub; coords is
+        # (n, dim), flattened to the 1-D parameter the periodic basis expects.
+        params = params or {}
+        n_harmonics = int(params.get("n_harmonics", 2))
+        t = np.asarray(coords, dtype=float).reshape(-1)
+        return self.periodic_basis_with_jet(t, n_harmonics)
+
     def sae_manifold_fit_minimal(
         self,
         z,
-        k_atoms,
         atom_basis,
         atom_dim,
-        assignment_kind,
         alpha,
         tau,
         learnable_alpha,
+        assignment_kind,
+        *,
         sparsity_strength,
         smoothness,
         max_iter,
         learning_rate,
         random_state,
         top_k,
-        *,
         gumbel_schedule=None,
+        **_forward_compat_kwargs,
     ):
+        # #1512: the FFI positional convention is now (z, bases, dims,
+        # alpha, tau, learnable_alpha, kind, **keyword), and the schedule /
+        # analytic_penalties / fisher_* / row_loss_weights ride as keywords
+        # (absorbed by **_forward_compat_kwargs). k_atoms is the basis count.
+        k_atoms = len(atom_basis)
         assert len(atom_dim) == int(k_atoms) == 2
         assert assignment_kind == "softmax"
         assert learnable_alpha is False
@@ -94,6 +120,7 @@ class _FakeRustModule:
             "atom_active_mask": [True for _ in atom_dim],
             "fitted": np.zeros_like(z),
             "reml_score": -1.0,
+            "penalized_loss_score": -1.0,
             "chosen_k": int(k_atoms),
             "dispersion": 1.0,
             "oos_projection_top1": False,
