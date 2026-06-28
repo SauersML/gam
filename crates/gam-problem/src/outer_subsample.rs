@@ -319,3 +319,125 @@ impl RowSet {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── arrow_row_chunk_count ─────────────────────────────────────────────────
+
+    #[test]
+    fn chunk_count_zero_rows_is_zero() {
+        assert_eq!(arrow_row_chunk_count(0), 0);
+    }
+
+    #[test]
+    fn chunk_count_one_row_is_one() {
+        assert_eq!(arrow_row_chunk_count(1), 1);
+    }
+
+    #[test]
+    fn chunk_count_exact_multiple() {
+        assert_eq!(arrow_row_chunk_count(ARROW_ROW_CHUNK), 1);
+        assert_eq!(arrow_row_chunk_count(ARROW_ROW_CHUNK * 3), 3);
+    }
+
+    #[test]
+    fn chunk_count_just_over_boundary() {
+        assert_eq!(arrow_row_chunk_count(ARROW_ROW_CHUNK + 1), 2);
+    }
+
+    // ── OuterScoreSubsample::from_uniform_inclusion_mask ─────────────────────
+
+    #[test]
+    fn uniform_mask_weight_scale_is_n_full_over_m() {
+        let mask = vec![0usize, 2, 4];
+        let s = OuterScoreSubsample::from_uniform_inclusion_mask(mask, 6, 0);
+        assert_eq!(s.len(), 3);
+        assert!((s.weight_scale - 2.0).abs() < 1e-14);
+        assert!(s.rows.iter().all(|r| (r.weight - 2.0).abs() < 1e-14));
+    }
+
+    #[test]
+    fn uniform_mask_empty_has_weight_scale_one() {
+        let s = OuterScoreSubsample::from_uniform_inclusion_mask(vec![], 10, 0);
+        assert_eq!(s.len(), 0);
+        assert!(s.is_empty());
+        assert_eq!(s.weight_scale, 1.0);
+    }
+
+    // ── OuterScoreSubsample::from_weighted_rows ───────────────────────────────
+
+    #[test]
+    fn weighted_rows_sorts_and_deduplicates() {
+        let rows = vec![
+            WeightedOuterRow { index: 3, weight: 2.0, stratum: 0 },
+            WeightedOuterRow { index: 1, weight: 1.0, stratum: 0 },
+            WeightedOuterRow { index: 3, weight: 2.0, stratum: 0 }, // duplicate
+        ];
+        let s = OuterScoreSubsample::from_weighted_rows(rows, 10, 42);
+        assert_eq!(s.len(), 2);
+        assert_eq!(s.mask[0], 1);
+        assert_eq!(s.mask[1], 3);
+    }
+
+    #[test]
+    fn weighted_rows_weight_scale_is_average_weight() {
+        let rows = vec![
+            WeightedOuterRow { index: 0, weight: 1.0, stratum: 0 },
+            WeightedOuterRow { index: 1, weight: 3.0, stratum: 0 },
+        ];
+        let s = OuterScoreSubsample::from_weighted_rows(rows, 10, 0);
+        assert!((s.weight_scale - 2.0).abs() < 1e-14);
+    }
+
+    // ── OuterScoreSubsample::has_variable_weights ─────────────────────────────
+
+    #[test]
+    fn has_variable_weights_false_for_uniform() {
+        let s = OuterScoreSubsample::with_uniform_weight(vec![0, 1, 2], 3, 0, 1.5);
+        assert!(!s.has_variable_weights());
+    }
+
+    #[test]
+    fn has_variable_weights_true_for_mixed() {
+        let rows = vec![
+            WeightedOuterRow { index: 0, weight: 1.0, stratum: 0 },
+            WeightedOuterRow { index: 1, weight: 2.0, stratum: 0 },
+        ];
+        let s = OuterScoreSubsample::from_weighted_rows(rows, 5, 0);
+        assert!(s.has_variable_weights());
+    }
+
+    // ── RowSet::par_reduce_fold ───────────────────────────────────────────────
+
+    #[test]
+    fn row_set_all_sums_indices_zero_to_n() {
+        let rs = RowSet::All;
+        let sum: f64 = rs.par_reduce_fold(
+            5,
+            || 0.0_f64,
+            |acc, i, w| acc + i as f64 * w,
+            |a, b| a + b,
+        );
+        // 1*0 + 1*1 + 1*2 + 1*3 + 1*4 = 10
+        assert!((sum - 10.0).abs() < 1e-14);
+    }
+
+    #[test]
+    fn row_set_subsample_applies_per_row_weight() {
+        let rows = Arc::new(vec![
+            WeightedOuterRow { index: 2, weight: 3.0, stratum: 0 },
+            WeightedOuterRow { index: 5, weight: 2.0, stratum: 0 },
+        ]);
+        let rs = RowSet::Subsample { rows, n_full: 10 };
+        let sum: f64 = rs.par_reduce_fold(
+            10,
+            || 0.0_f64,
+            |acc, i, w| acc + w * i as f64,
+            |a, b| a + b,
+        );
+        // 3.0 * 2 + 2.0 * 5 = 6 + 10 = 16
+        assert!((sum - 16.0).abs() < 1e-14);
+    }
+}
