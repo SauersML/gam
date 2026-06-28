@@ -226,3 +226,141 @@ pub fn symmetric_lanczos_eigenpairs(
         residual_norm,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    fn no_reortho() -> SymmetricLanczosOptions {
+        SymmetricLanczosOptions {
+            max_steps: 10,
+            residual_tol: 1e-12,
+            local_reorthogonalize: false,
+            full_reorthogonalize: false,
+        }
+    }
+
+    // ── symmetric_lanczos_log_quadrature ─────────────────────────────────────
+
+    #[test]
+    fn log_quadrature_empty_eigenvectors_is_error() {
+        let ep = SymmetricLanczosEigenpairs {
+            eigenvalues: array![1.0],
+            eigenvectors: ndarray::Array2::zeros((0, 1)),
+            residual_norm: 0.0,
+        };
+        assert!(symmetric_lanczos_log_quadrature(&ep, "ctx").is_err());
+    }
+
+    #[test]
+    fn log_quadrature_non_positive_eigenvalue_is_error() {
+        let ep = SymmetricLanczosEigenpairs {
+            eigenvalues: array![0.0],
+            eigenvectors: array![[1.0]],
+            residual_norm: 0.0,
+        };
+        let err = symmetric_lanczos_log_quadrature(&ep, "myctx").unwrap_err();
+        assert!(err.contains("myctx"), "error should mention context: {err}");
+    }
+
+    #[test]
+    fn log_quadrature_single_eigenvalue_at_e_gives_one() {
+        let ep = SymmetricLanczosEigenpairs {
+            eigenvalues: array![std::f64::consts::E],
+            eigenvectors: array![[1.0]],
+            residual_norm: 0.0,
+        };
+        let result = symmetric_lanczos_log_quadrature(&ep, "ctx").unwrap();
+        assert!((result - 1.0).abs() < 1e-14);
+    }
+
+    #[test]
+    fn log_quadrature_two_eigenvalues_weighted_sum() {
+        // weights 0.5² each, eigenvalues 2 and 8 → 0.25*(ln2 + ln8) = 0.25*4*ln2 = ln2
+        let ep = SymmetricLanczosEigenpairs {
+            eigenvalues: array![2.0, 8.0],
+            eigenvectors: array![[0.5, 0.5]],
+            residual_norm: 0.0,
+        };
+        let result = symmetric_lanczos_log_quadrature(&ep, "ctx").unwrap();
+        let expected = 0.25 * (2.0_f64.ln() + 8.0_f64.ln());
+        assert!((result - expected).abs() < 1e-14);
+    }
+
+    // ── symmetric_lanczos_eigenpairs — validation ─────────────────────────────
+
+    #[test]
+    fn eigenpairs_zero_dim_is_error() {
+        let r = symmetric_lanczos_eigenpairs(0, &[], no_reortho(), |_, _| Ok(()));
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn eigenpairs_start_dim_mismatch_is_error() {
+        let r = symmetric_lanczos_eigenpairs(3, &[1.0, 0.0], no_reortho(), |_, _| Ok(()));
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn eigenpairs_zero_max_steps_is_error() {
+        let opts = SymmetricLanczosOptions {
+            max_steps: 0,
+            ..no_reortho()
+        };
+        let r = symmetric_lanczos_eigenpairs(1, &[1.0], opts, |_, _| Ok(()));
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn eigenpairs_infinite_residual_tol_is_error() {
+        let opts = SymmetricLanczosOptions {
+            residual_tol: f64::INFINITY,
+            ..no_reortho()
+        };
+        let r = symmetric_lanczos_eigenpairs(1, &[1.0], opts, |_, _| Ok(()));
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn eigenpairs_non_finite_start_is_error() {
+        let r = symmetric_lanczos_eigenpairs(1, &[f64::NAN], no_reortho(), |_, _| Ok(()));
+        assert!(r.is_err());
+    }
+
+    // ── symmetric_lanczos_eigenpairs — correctness ────────────────────────────
+
+    #[test]
+    fn eigenpairs_1x1_diagonal_recovers_exact_eigenvalue() {
+        let ep = symmetric_lanczos_eigenpairs(1, &[1.0], no_reortho(), |q, w| {
+            w[0] = 3.0 * q[0];
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(ep.eigenvalues.len(), 1);
+        assert!((ep.eigenvalues[0] - 3.0).abs() < 1e-12);
+        assert_eq!(ep.residual_norm, 0.0);
+    }
+
+    #[test]
+    fn eigenpairs_2x2_diagonal_recovers_both_eigenvalues() {
+        let sq2_inv = 1.0_f64 / 2.0_f64.sqrt();
+        let ep = symmetric_lanczos_eigenpairs(
+            2,
+            &[sq2_inv, sq2_inv],
+            no_reortho(),
+            |q, w| {
+                w[0] = 1.0 * q[0];
+                w[1] = 4.0 * q[1];
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(ep.eigenvalues.len(), 2);
+        let mut evs = ep.eigenvalues.to_vec();
+        evs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert!((evs[0] - 1.0).abs() < 1e-10, "smallest: {}", evs[0]);
+        assert!((evs[1] - 4.0).abs() < 1e-10, "largest: {}", evs[1]);
+        assert_eq!(ep.residual_norm, 0.0);
+    }
+}
