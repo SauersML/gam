@@ -865,6 +865,11 @@ pub struct BinomialMeanWiggleTermFitResult {
     pub design: TermCollectionDesign,
     pub wiggle_knots: Array1<f64>,
     pub wiggle_degree: usize,
+    /// Standard-basis warp coefficients `β_w = Z·γ` for the saved-model predict
+    /// runtime, when the frozen-basis de-aliasing engaged (#1596). The fit's own
+    /// coefficients stay in the reduced, identifiable `γ` coordinate; this is the
+    /// out-of-band full-width lift consumed by `beta_link_wiggle`.
+    pub saved_warp_beta: Option<Vec<f64>>,
 }
 
 pub(crate) struct BlockwiseTermWiggleFitResultParts {
@@ -1161,10 +1166,13 @@ pub struct GaussianLocationScaleFitResult {
     pub response_scale: f64,
 }
 
+/// Fit the binomial mean link-wiggle model. Returns the γ-space fit and, when
+/// the frozen-basis de-aliasing engaged (#1596), the standard-basis warp
+/// coefficients `β_w = Z·γ` for the saved-model predict runtime.
 pub(crate) fn fit_binomial_mean_wiggle(
     spec: BinomialMeanWiggleSpec,
     options: &BlockwiseFitOptions,
-) -> Result<UnifiedFitResult, String> {
+) -> Result<(UnifiedFitResult, Option<Vec<f64>>), String> {
     let n = spec.y.len();
     validate_len_match("weights vs y", n, spec.weights.len())?;
     validateweights(&spec.weights, "fit_binomial_mean_wiggle")?;
@@ -1288,6 +1296,27 @@ pub(crate) fn fit_binomial_mean_wiggle(
         Ok((block, z, std::sync::Arc::new(bda)))
     };
 
+    // True iff the warped link `q = η + B(η)·β_w` is strictly increasing across
+    // `[lo, hi]` (`dq/dη = 1 + B'(η)·β_w > 0`), evaluated on a dense grid.
+    let link_monotone = |beta_w: &[f64], lo: f64, hi: f64| -> Result<bool, String> {
+        if !(lo.is_finite() && hi.is_finite()) || hi <= lo {
+            return Ok(true);
+        }
+        let grid = Array1::linspace(lo, hi, 257);
+        let d1 = crate::wiggle::monotone_wiggle_basis_with_derivative_order(
+            grid.view(),
+            &family.wiggle_knots,
+            family.wiggle_degree,
+            1,
+        )?;
+        let beta = Array1::from_vec(beta_w.to_vec());
+        if d1.ncols() != beta.len() {
+            return Ok(false);
+        }
+        let dq = d1.dot(&beta) + 1.0;
+        Ok(dq.iter().all(|v| *v > 0.0))
+    };
+
     // Outer Gauss-Newton / backfitting loop over the frozen warp index. One
     // iteration already recovers the warp; a few more align `η̂` with the refit
     // `η` so the in-sample warp matches what `predict` reconstructs.
@@ -1295,6 +1324,7 @@ pub(crate) fn fit_binomial_mean_wiggle(
     const FROZEN_ETA_TOL: f64 = 1e-5;
     let mut frozen_eta = pilot_eta;
     let mut last_fit: Option<UnifiedFitResult> = None;
+    let mut last_reduction: Option<Array2<f64>> = None;
     for _outer in 0..MAX_FROZEN_OUTER {
         let (wiggle_block, z, bda) = build_dealiased(&frozen_eta)?;
         let blocks = vec![
@@ -1303,7 +1333,7 @@ pub(crate) fn fit_binomial_mean_wiggle(
         ];
         let mut fam = family.clone();
         fam.frozen_warp_design = Some(bda);
-        let mut fit = fit_custom_family(&fam, &blocks, options).map_err(|e| e.to_string())?;
+        let fit = fit_custom_family(&fam, &blocks, options).map_err(|e| e.to_string())?;
         let new_eta = fit
             .block_states
             .get(BinomialMeanWiggleFamily::BLOCK_ETA)
@@ -1313,14 +1343,16 @@ pub(crate) fn fit_binomial_mean_wiggle(
                 "fit_binomial_mean_wiggle: frozen-basis refit did not expose a fitted eta block"
                     .to_string()
             })?;
-        // Lift the fitted reduced coefficient `γ` back to the standard I-spline
-        // basis `β_w = Z·γ` so the saved model + predict reconstruct the warp
-        // from `B(η_new)·β_w` with the original full-width basis.
-        if let Some(state) = fit.block_states.get_mut(BinomialMeanWiggleFamily::BLOCK_WIGGLE) {
-            if z.ncols() == state.beta.len() {
-                state.beta = z.dot(&state.beta);
-            }
-        }
+        // The fit stays entirely in the reduced, identifiable coordinate `γ`:
+        // the result (top-level `beta`, role-tagged `blocks`, `block_states`,
+        // penalized Hessian, and covariance) is full rank and self-consistent at
+        // width `p_eta + q`. The widened standard-basis warp coefficients
+        // `β_w = Z·γ` form a rank-deficient over-parametrization (the two
+        // mean-aliased directions carry no curvature), so they are NOT folded
+        // back into the result; instead `Z` is returned out-of-band and the
+        // saved model stores `β_w = Z·γ` for the predict runtime, which
+        // reconstructs the warp from the full-width basis as `B(η_new)·β_w`.
+        last_reduction = Some(z.clone());
         let scale = 1.0
             + frozen_eta
                 .iter()
@@ -1337,9 +1369,98 @@ pub(crate) fn fit_binomial_mean_wiggle(
         }
         frozen_eta = new_eta;
     }
-    last_fit.ok_or_else(|| {
+    let mut fit = last_fit.ok_or_else(|| {
         "fit_binomial_mean_wiggle: frozen-basis outer loop produced no fit".to_string()
-    })
+    })?;
+    // Widen the reduced warp coefficient `γ` to the standard I-spline basis
+    // `β_w = Z·γ` for the saved-model predict runtime (which reconstructs the
+    // warp from the full-width basis).
+    let warp_beta_from = |fit: &UnifiedFitResult, z: &Array2<f64>| -> Option<Vec<f64>> {
+        fit.block_states
+            .get(BinomialMeanWiggleFamily::BLOCK_WIGGLE)
+            .filter(|state| state.beta.len() == z.ncols())
+            .map(|state| z.dot(&state.beta).to_vec())
+    };
+    let mut saved_warp_beta = match last_reduction.as_ref() {
+        Some(z) => warp_beta_from(&fit, z),
+        None => None,
+    };
+
+    // Monotone-link guarantee (#1596). The reduced curvature fit is
+    // unconstrained, so the REML-selected warp can turn the link non-monotone
+    // (non-invertible) over the fitted predictor range. The warp NESTS the base
+    // link at λ → ∞ (`γ → 0`, `dq/dη ≡ 1`), so escalating the warp's smoothing
+    // always reaches a strictly-increasing link while preserving as much of the
+    // learned curvature as monotonicity allows. We fixed-λ re-fit at the
+    // converged frozen index with a geometrically increasing penalty until the
+    // link is monotone — a monotonicity-driven smoothing floor, not a hard
+    // active-set constraint (which the coupled `Z·γ ≥ 0` inequality would
+    // reintroduce). The base link itself is the λ → ∞ fixed point, so this
+    // terminates.
+    if last_reduction.is_some() {
+        let lo = frozen_eta.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = frozen_eta.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let already_monotone = saved_warp_beta
+            .as_ref()
+            .map(|bw| link_monotone(bw, lo, hi))
+            .transpose()?
+            .unwrap_or(true);
+        if !already_monotone {
+            let eta_penalty_count = eta_block_input.penalties.len();
+            let reml_log = fit.log_lambdas.clone();
+            const MAX_MONO_STEPS: usize = 16;
+            const MONO_LOG_LAMBDA_STEP: f64 = 0.75;
+            for step in 1..=MAX_MONO_STEPS {
+                let bump = MONO_LOG_LAMBDA_STEP * step as f64;
+                let (mut wb, z2, bda2) = build_dealiased(&frozen_eta)?;
+                let wlen = wb.penalties.len();
+                let wiggle_base: Array1<f64> = if reml_log.len() >= eta_penalty_count + wlen {
+                    reml_log
+                        .slice(s![eta_penalty_count..eta_penalty_count + wlen])
+                        .to_owned()
+                } else {
+                    Array1::zeros(wlen)
+                };
+                wb.initial_log_lambdas = Some(wiggle_base.mapv(|v| v + bump));
+                let mut eta_in = eta_block_input.clone();
+                if reml_log.len() >= eta_penalty_count && eta_penalty_count > 0 {
+                    eta_in.initial_log_lambdas =
+                        Some(reml_log.slice(s![0..eta_penalty_count]).to_owned());
+                }
+                let blocks = vec![eta_in.intospec("eta")?, wb.intospec("wiggle")?];
+                let mut fam = family.clone();
+                fam.frozen_warp_design = Some(bda2);
+                let refit = crate::custom_family::fit_custom_family_fixed_log_lambdas(
+                    &fam, &blocks, options, None, 0, None, true,
+                )
+                .map_err(|e| e.to_string())?;
+                let refit_beta = warp_beta_from(&refit, &z2);
+                let monotone = refit_beta
+                    .as_ref()
+                    .map(|bw| link_monotone(bw, lo, hi))
+                    .transpose()?
+                    .unwrap_or(true);
+                if monotone || step == MAX_MONO_STEPS {
+                    fit = refit;
+                    saved_warp_beta = refit_beta;
+                    break;
+                }
+            }
+            // Final certification: the λ → ∞ base link is monotone, so this
+            // should hold; surface loudly if a pathological basis defeats it.
+            let final_monotone = saved_warp_beta
+                .as_ref()
+                .map(|bw| link_monotone(bw, lo, hi))
+                .transpose()?
+                .unwrap_or(true);
+            if !final_monotone {
+                return Err("binomial flexible link could not be smoothed to a monotone \
+                            (invertible) link over the fitted predictor range"
+                    .to_string());
+            }
+        }
+    }
+    Ok((fit, saved_warp_beta))
 }
 
 /// Densify a wiggle-block penalty spec to its full `p×p` matrix for the
@@ -2694,7 +2815,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
 
     let spatial_terms = spatial_length_scale_term_indices(pilot_spec);
     if spatial_terms.is_empty() {
-        let fit = fit_binomial_mean_wiggle(
+        let (fit, saved_warp_beta) = fit_binomial_mean_wiggle(
             BinomialMeanWiggleSpec {
                 y: y.clone(),
                 weights: weights.clone(),
@@ -2727,6 +2848,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             design: pilot_design.clone(),
             wiggle_knots,
             wiggle_degree,
+            saved_warp_beta,
         });
     }
 
@@ -2785,7 +2907,8 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             wiggle_block: wiggle_block.clone(),
         },
         options,
-    )?;
+    )?
+    .0;
     let baseline_log_lambdas = baseline_fit
         .lambdas
         .mapv(|v| v.max(WARMSTART_LOG_LAMBDA_FLOOR).ln());
@@ -3202,6 +3325,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         },
         options,
     )?;
+    let (fit, saved_warp_beta) = fit;
 
     Ok(BinomialMeanWiggleTermFitResult {
         fit,
@@ -3209,5 +3333,6 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         design,
         wiggle_knots,
         wiggle_degree,
+        saved_warp_beta,
     })
 }

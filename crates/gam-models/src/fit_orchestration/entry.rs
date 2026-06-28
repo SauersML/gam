@@ -341,6 +341,7 @@ fn constant_gaussian_standard_fit(
         saved_link_state: gam_solve::estimate::FittedLinkState::Standard(None),
         wiggle_knots: None,
         wiggle_degree: None,
+        wiggle_saved_warp_beta: None,
     })
 }
 

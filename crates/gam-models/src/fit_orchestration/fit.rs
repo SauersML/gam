@@ -217,6 +217,7 @@ pub(crate) fn fit_standard_model(
         kappa_timing: fitted.kappa_timing,
         wiggle_knots: None,
         wiggle_degree: None,
+        wiggle_saved_warp_beta: None,
     };
 
     let Some(wiggle) = request.wiggle else {
@@ -311,6 +312,7 @@ pub(crate) fn fit_standard_model(
         kappa_timing: result.kappa_timing,
         wiggle_knots: Some(solved.wiggle_knots),
         wiggle_degree: Some(solved.wiggle_degree),
+        wiggle_saved_warp_beta: solved.saved_warp_beta,
     })
 }
 

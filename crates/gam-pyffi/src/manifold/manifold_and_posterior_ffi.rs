@@ -5376,6 +5376,7 @@ fn build_standard_payload(
     >,
     wiggle_knots: Option<Vec<f64>>,
     wiggle_degree: Option<usize>,
+    wiggle_saved_warp_beta: Option<Vec<f64>>,
 ) -> Result<FittedModelPayload, String> {
     let saved_fit = fit_with_null_space_logdet(design, saved_fit)?;
     let latent_cloglog_state =
@@ -5425,6 +5426,12 @@ fn build_standard_payload(
     payload.link = Some(family_inverse_link);
     payload.linkwiggle_knots = wiggle_knots;
     payload.linkwiggle_degree = wiggle_degree;
+    // #1596: the standard link-wiggle warp is fit in a reduced, identifiable
+    // coordinate `γ` (`β_w = Z·γ`); the saved fit_result block carries `γ`, so
+    // persist the full-width standard-basis lift `β_w` here for the predict
+    // runtime, which reconstructs the warp as `B(η_new)·β_w`. `None` (the
+    // dynamic-basis / non-de-aliased path) leaves predict reading the block.
+    payload.beta_link_wiggle = wiggle_saved_warp_beta;
     payload.set_training_feature_metadata(dataset.headers.clone(), dataset.feature_ranges());
     payload.resolved_termspec = Some(resolved_termspec);
     payload.adaptive_regularization_diagnostics = adaptive_regularization_diagnostics;

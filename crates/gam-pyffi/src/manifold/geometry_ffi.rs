@@ -4926,6 +4926,7 @@ fn fit_dataset_impl(
                 standard_result.adaptive_diagnostics,
                 standard_result.wiggle_knots.map(|knots| knots.to_vec()),
                 standard_result.wiggle_degree,
+                standard_result.wiggle_saved_warp_beta,
             )?
         }
         FitRequest::TransformationNormal(tn_request) => {

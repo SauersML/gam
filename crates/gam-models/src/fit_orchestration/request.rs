@@ -162,6 +162,11 @@ pub struct StandardFitResult {
     pub saved_link_state: FittedLinkState,
     pub wiggle_knots: Option<Array1<f64>>,
     pub wiggle_degree: Option<usize>,
+    /// Standard-basis link-warp coefficients `β_w = Z·γ` for the saved-model
+    /// predict runtime when the frozen-basis de-aliasing engaged (#1596). The
+    /// fit's coefficients stay in the reduced `γ` coordinate; this lift is
+    /// persisted into the payload's `beta_link_wiggle`.
+    pub wiggle_saved_warp_beta: Option<Vec<f64>>,
 }
 
 pub struct SurvivalLocationScaleFitResult {

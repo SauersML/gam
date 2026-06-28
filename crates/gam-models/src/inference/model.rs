@@ -1317,16 +1317,16 @@ fn validate_marginal_slope_saved_fit_impl(
 }
 
 impl SavedLinkWiggleRuntime {
-    fn validate_global_monotonicity(&self) -> Result<(), FittedModelError> {
-        validate_monotone_wiggle_beta_nonnegative(&self.beta, "saved link-wiggle")
-            .map_err(|reason| FittedModelError::PayloadCorrupt { reason })
-    }
-
     fn validate_monotone_derivative(
         &self,
         q0: &Array1<f64>,
     ) -> Result<Array1<f64>, FittedModelError> {
-        self.validate_global_monotonicity()?;
+        // Monotonicity is verified pointwise at the actual evaluation grid `q0`
+        // (the predict η). The fit guarantees a strictly-increasing warped link
+        // across the training η range (#1596); checking at `q0` here flags an
+        // extrapolation point where the learnable link genuinely turns
+        // non-invertible, without rejecting the whole model for a sign dip in the
+        // basis tail far outside any data or evaluation point.
         let d_constrained = self.constrained_basis(q0, BasisOptions::first_derivative())?;
         let beta_link_wiggle = Array1::from_vec(self.beta.clone());
         let dq_dq0 = d_constrained.dot(&beta_link_wiggle) + 1.0;
@@ -1366,7 +1366,7 @@ impl SavedLinkWiggleRuntime {
     }
 
     pub fn design(&self, q0: &Array1<f64>) -> Result<Array2<f64>, FittedModelError> {
-        self.validate_global_monotonicity()?;
+        self.validate_monotone_derivative(q0)?;
         self.constrained_basis(q0, BasisOptions::value())
     }
 
@@ -2868,14 +2868,17 @@ impl FittedModel {
             });
         }
         let beta = match self.predict_model_class() {
+            // #1596: the frozen-basis de-aliased standard link-warp is fit in a
+            // reduced, identifiable coordinate `γ` and the fit_result LinkWiggle
+            // block stores `γ` (its true free parameters). The full-width
+            // standard-basis lift `β_w = Z·γ`, the coefficients the predict-time
+            // I-spline basis multiplies, is persisted in `payload.beta_link_wiggle`
+            // — prefer it when present. Without it (the dynamic-basis path) the
+            // block coefficients ARE the standard-basis warp, read directly.
+            PredictModelClass::Standard if payload.beta_link_wiggle.is_some() => {
+                payload.beta_link_wiggle.clone().expect("checked is_some")
+            }
             PredictModelClass::Standard => {
-                if payload.beta_link_wiggle.is_some() {
-                    return Err(FittedModelError::SchemaMismatch {
-                        reason:
-                            "standard link-wiggle coefficients must be stored in fit_result LinkWiggle block, not payload.beta_link_wiggle"
-                                .to_string(),
-                    });
-                }
                 let fit = payload.fit_result.as_ref().ok_or_else(|| {
                     FittedModelError::MissingField {
                         reason:
