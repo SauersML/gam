@@ -16,6 +16,28 @@ pub struct BinomialMeanWiggleFamily {
     /// `ResourcePolicy::default_library()` when the family is built without
     /// an explicit policy.
     pub policy: gam_runtime::resource::ResourcePolicy,
+    /// Per-row linear predictor `η̂` at which the monotone I-spline warp basis
+    /// `B(η)` is **frozen** for the duration of one inner joint-Newton solve
+    /// (#1596). When `Some(η̂)`, the warp contribution is the additive offset
+    /// `s_i = Σ_k B(η̂_i)_k · β_{w,k}` evaluated at the *frozen* index `η̂` — so
+    /// `q_i = η_i + s_i` is **linear** in `(β_η, β_w)` and `∂q/∂η = 1`, with no
+    /// `∂B/∂η` chain term.
+    ///
+    /// This is the Gauss-Newton linearization point of the link warp. The
+    /// fully-coupled `q = η + B(η)·β_w` model with a *dynamic* basis regenerated
+    /// at the moving `η` every cycle makes the trust-region model (frozen `B`)
+    /// inconsistent with the line-searched objective (`B` re-evaluated at the
+    /// trial `η`): for any step that moves `η` the actual reduction diverges from
+    /// the quadratic model, the trust radius collapses, and the constrained KKT
+    /// certificate refuses every iterate (`active_set_incomplete`) even when the
+    /// optimal warp is flat. Freezing `B(η̂)` removes that inconsistency: each
+    /// inner solve is a well-conditioned, monotone-constrained two-block GLM that
+    /// certifies normally. The caller re-freezes at the updated `η̂` across a
+    /// handful of outer iterations (`fit_binomial_mean_wiggle`) until `η̂` stops
+    /// moving — a standard backfitting / Gauss-Newton outer loop.
+    ///
+    /// `None` preserves the original dynamic-basis behaviour.
+    pub frozen_warp_eta: Option<Arc<Array1<f64>>>,
 }
 
 pub(crate) struct BinomialMeanWiggleGeometry {
@@ -131,11 +153,45 @@ impl BinomialMeanWiggleFamily {
         Ok(d4.dot(&beta_link_wiggle))
     }
 
+    /// The index `η̂` at which to evaluate the warp basis: the frozen index when
+    /// the Gauss-Newton outer loop has pinned one (#1596), else the live `q0`.
+    pub(crate) fn warp_basis_index<'a>(
+        &'a self,
+        q0: ArrayView1<'a, f64>,
+    ) -> ArrayView1<'a, f64> {
+        match self.frozen_warp_eta.as_ref() {
+            Some(frozen) => frozen.view(),
+            None => q0,
+        }
+    }
+
     pub(crate) fn wiggle_geometry(
         &self,
         q0: ArrayView1<'_, f64>,
         beta_link_wiggle: ArrayView1<'_, f64>,
     ) -> Result<BinomialMeanWiggleGeometry, String> {
+        // Frozen-basis (#1596): the warp offset `s = B(η̂)·β_w` is evaluated at
+        // the pinned index `η̂`, so it is a per-row constant w.r.t. the *live*
+        // linear predictor `η`. Then `q = η + s` gives `∂q/∂η = 1` exactly and
+        // every higher derivative of `q` in `η` vanishes, and the `∂B/∂η` chain
+        // bases drop out (the warp basis does not move with `η`). The value
+        // basis `B(η̂)` — the column block carrying `∂q/∂β_w` — is the only
+        // surviving geometry term.
+        if let Some(frozen) = self.frozen_warp_eta.as_ref() {
+            let basis = self.wiggle_design(frozen.view())?;
+            let n = basis.nrows();
+            let pw = basis.ncols();
+            return Ok(BinomialMeanWiggleGeometry {
+                basis,
+                basis_d1: Array2::zeros((n, pw)),
+                basis_d2: Array2::zeros((n, pw)),
+                basis_d3: Array2::zeros((n, pw)),
+                dq_dq0: Array1::ones(n),
+                d2q_dq02: Array1::zeros(n),
+                d3q_dq03: Array1::zeros(n),
+                d4q_dq04: Array1::zeros(n),
+            });
+        }
         let basis = self.wiggle_design(q0)?;
         let basis_d1 = self.wiggle_basiswith_options(q0, BasisOptions::first_derivative())?;
         let basis_d2 = self.wiggle_basiswith_options(q0, BasisOptions::second_derivative())?;
@@ -692,7 +748,14 @@ impl CustomFamily for BinomialMeanWiggleFamily {
             }
             .into());
         }
-        let dq_dq0 = self.wiggle_dq_dq0(eta.view(), betaw.view())?;
+        // Frozen-basis (#1596): with `B(η̂)` pinned, `q = η + B(η̂)·β_w` so
+        // `∂q/∂η = 1` exactly (the warp offset is constant in the live `η`).
+        // Otherwise `∂q/∂η = 1 + B'(η)·β_w`, the dynamic warp slope.
+        let dq_dq0 = if self.frozen_warp_eta.is_some() {
+            Array1::<f64>::ones(n)
+        } else {
+            self.wiggle_dq_dq0(eta.view(), betaw.view())?
+        };
         if dq_dq0.len() != n {
             return Err(GamlssError::DimensionMismatch {
                 reason: format!(
@@ -772,7 +835,13 @@ impl CustomFamily for BinomialMeanWiggleFamily {
             }
             .into());
         }
-        let x = self.wiggle_design(eta.view())?;
+        // Frozen-basis (#1596): evaluate the warp regressor `B` at the pinned
+        // index `η̂` rather than the live `η`. `B(η̂)` is then constant across
+        // inner cycles, so the engine rebuilds the *same* matrix every cycle —
+        // the death-spiral source (a basis that moves under the line search) is
+        // gone, while the dynamic-geometry plumbing (gauge-priority, full-width
+        // wiggle) is preserved unchanged.
+        let x = self.wiggle_design(self.warp_basis_index(eta.view()))?;
         if x.ncols() != spec.design.ncols() {
             return Err(GamlssError::DimensionMismatch {
                 reason: format!(

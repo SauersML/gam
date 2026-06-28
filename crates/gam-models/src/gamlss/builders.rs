@@ -1203,6 +1203,38 @@ pub(crate) fn fit_binomial_mean_wiggle(
         ) }.into());
     }
 
+    // Seed for the frozen-basis Gauss-Newton outer loop (#1596): the pilot
+    // linear predictor `η̂₀ = X·β_pilot`. The warp basis `B(η)` is frozen at
+    // `η̂` for each inner solve so that `q = η + B(η̂)·β_w` is linear in
+    // `(β_η, β_w)` with `∂q/∂η = 1` — a well-conditioned, monotone-constrained
+    // two-block GLM that certifies, instead of the dynamic-basis coupled solve
+    // whose trust region collapses and refuses every KKT certificate. We then
+    // re-freeze at the refit `η̂` until it stops moving.
+    let pilot_eta: Array1<f64> = {
+        let pilot_beta = spec.eta_block.initial_beta.clone().ok_or_else(|| {
+            "fit_binomial_mean_wiggle: eta block carries no pilot β to seed the \
+             frozen-basis warp index"
+                .to_string()
+        })?;
+        let design = spec.eta_block.design.to_dense();
+        if design.ncols() != pilot_beta.len() {
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "fit_binomial_mean_wiggle: eta design has {} columns but pilot β has {} \
+                     coefficients",
+                    design.ncols(),
+                    pilot_beta.len()
+                ),
+            }
+            .into());
+        }
+        let mut eta = design.dot(&pilot_beta);
+        if spec.eta_block.offset.len() == eta.len() {
+            eta += &spec.eta_block.offset;
+        }
+        eta
+    };
+
     let family = BinomialMeanWiggleFamily {
         y: spec.y,
         weights: spec.weights,
@@ -1210,24 +1242,67 @@ pub(crate) fn fit_binomial_mean_wiggle(
         wiggle_knots: spec.wiggle_knots,
         wiggle_degree: spec.wiggle_degree,
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
+        // Set per outer iteration below.
+        frozen_warp_eta: None,
     };
     let blocks = vec![
-        // The wiggle block is a DYNAMIC monotone I-spline basis that the
-        // family regenerates at full (raw) width every inner iteration
-        // (`block_geometry_is_dynamic` + the `x.ncols() == spec.design.ncols()`
-        // assertion in `block_geometry`), so it cannot tolerate a physical
-        // column drop. The level/intercept direction that the I-spline shares
-        // with the eta block must therefore be yielded by the *eta* block,
-        // whose static term-collection design is safely column-reducible (and
-        // lifted back via the canonical per-block transform `T`). Give the eta
-        // block the lower gauge priority so the canonical-gauge RRQR routes the
-        // shared-level alias drop onto eta and leaves the dynamic wiggle basis
-        // full-width.
+        // The wiggle block is a monotone I-spline basis carried at full (raw)
+        // width via the dynamic `block_geometry` path (the `x.ncols() ==
+        // spec.design.ncols()` assertion forbids a physical column drop). The
+        // level/intercept direction the I-spline shares with the eta block must
+        // therefore be yielded by the *eta* block, whose static term-collection
+        // design is safely column-reducible (and lifted back via the canonical
+        // per-block transform `T`). Give the eta block the lower gauge priority
+        // so the canonical-gauge RRQR routes the shared-level alias drop onto
+        // eta and leaves the wiggle basis full-width. Under the frozen-basis
+        // scheme (#1596) the dynamic `block_geometry` returns the *same*
+        // `B(η̂)` every cycle, so this plumbing is preserved unchanged while the
+        // basis no longer moves under the line search.
         spec.eta_block
             .intospec_with_gauge_priority("eta", LINK_WIGGLE_GAUGE_PRIORITY)?,
         spec.wiggle_block.intospec("wiggle")?,
     ];
-    fit_custom_family(&family, &blocks, options).map_err(|e| e.to_string())
+
+    // Outer Gauss-Newton / backfitting loop over the frozen warp index. One
+    // iteration already recovers the warp (the offset basis is evaluated at the
+    // pilot index); a few more align the frozen index `η̂` with the refit `η` so
+    // the in-sample warp matches what `predict` reconstructs from `B(η_new)`.
+    const MAX_FROZEN_OUTER: usize = 6;
+    const FROZEN_ETA_TOL: f64 = 1e-5;
+    let mut frozen_eta = pilot_eta;
+    let mut last_fit: Option<UnifiedFitResult> = None;
+    for _outer in 0..MAX_FROZEN_OUTER {
+        let mut fam = family.clone();
+        fam.frozen_warp_eta = Some(std::sync::Arc::new(frozen_eta.clone()));
+        let fit = fit_custom_family(&fam, &blocks, options).map_err(|e| e.to_string())?;
+        let new_eta = fit
+            .block_states
+            .get(BinomialMeanWiggleFamily::BLOCK_ETA)
+            .map(|state| state.eta.clone())
+            .filter(|eta| eta.len() == frozen_eta.len())
+            .ok_or_else(|| {
+                "fit_binomial_mean_wiggle: frozen-basis refit did not expose a fitted eta block"
+                    .to_string()
+            })?;
+        let scale = 1.0
+            + frozen_eta
+                .iter()
+                .map(|v: &f64| v.abs())
+                .fold(0.0_f64, f64::max);
+        let delta = new_eta
+            .iter()
+            .zip(frozen_eta.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        last_fit = Some(fit);
+        if delta <= FROZEN_ETA_TOL * scale {
+            break;
+        }
+        frozen_eta = new_eta;
+    }
+    last_fit.ok_or_else(|| {
+        "fit_binomial_mean_wiggle: frozen-basis outer loop produced no fit".to_string()
+    })
 }
 
 pub(crate) trait LocationScaleFamilyBuilder {
@@ -2702,6 +2777,9 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         wiggle_knots: wiggle_knots_cloned.clone(),
         wiggle_degree,
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
+        // The spatial joint-κ path keeps the dynamic warp basis (#1596 frozen
+        // basis applies to the non-spatial `fit_binomial_mean_wiggle` loop).
+        frozen_warp_eta: None,
     };
     let screening_cap = Arc::new(AtomicUsize::new(0));
     let mut outer_options = options.clone();
