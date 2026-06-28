@@ -442,9 +442,13 @@ impl PredictableModel for StandardPredictor {
                     // The observation band is recomputed below, centred on the
                     // posterior-mean point rather than the plug-in point.
                     includeobservation_interval: false,
-                    // The point already carries any bias correction; asking the
-                    // engine to re-apply it would double-count and shift the SE
-                    // basis. We only consume its SE / bounds.
+                    // #1602: the reported point is the UNCORRECTED η̂ = Xβ̂ (the
+                    // posterior-mean engine above is called without a bias-
+                    // correction vector), matching the exported coefficients
+                    // `summary().coefficients == β̂` so `design_matrix @ coef ==
+                    // linear_predictor` holds for every link. Mirror that here so
+                    // the borrowed SE / bounds are centred on the same η̂; we only
+                    // consume the engine's SE / bounds, never its point.
                     apply_bias_correction: false,
                     ..PredictUncertaintyOptions::default()
                 };
@@ -458,7 +462,7 @@ impl PredictableModel for StandardPredictor {
                 )?;
                 // Adopt the covariance-mode η-scale SE, then re-derive the
                 // TransformEta credible bounds from the posterior-mean point's
-                // own η (which carries the bias correction) so the bounds stay
+                // own η (the uncorrected η̂ = Xβ̂ per #1602) so the bounds stay
                 // centred consistently with the reported point — only their width
                 // changes with `covariance_mode`.
                 result.eta_standard_error = unc.eta_standard_error;
