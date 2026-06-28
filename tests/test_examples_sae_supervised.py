@@ -22,6 +22,12 @@ import pytest
 
 import gamfit
 
+# #1512 triage: the supervised-SAE example fits run well past the standard
+# Python-API CI runner budget (the file timed out at >240s in triage), so they
+# are tagged slow and excluded from the directory-level `-m "not slow"` CI step
+# (still collected, and run by a bare `pytest tests/` locally).
+pytestmark = pytest.mark.slow
+
 
 @pytest.fixture(scope="module")
 def synthetic() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
