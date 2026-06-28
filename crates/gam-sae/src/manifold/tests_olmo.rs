@@ -996,71 +996,34 @@ pub(crate) fn oos_train_curved(
     (ev_in, ev_oos)
 }
 
-/// OOS EV of the best affine rank-`r` code: train mean + top-`r` train PCA
-/// applied to the held-out rows — the flat-dictionary baseline at latent dim `r`.
-pub(crate) fn oos_flat_affine_ev(z_tr: &Array2<f64>, z_te: &Array2<f64>, rank: usize) -> f64 {
-    use gam_linalg::faer_ndarray::FaerEigh;
-    let n_tr = z_tr.nrows();
-    let n_te = z_te.nrows();
-    let p = z_tr.ncols();
-    let tot_te = oos_sq_sum(z_te);
-    let mut mu = ndarray::Array1::<f64>::zeros(p);
-    for r in 0..n_tr {
-        for c in 0..p {
-            mu[c] += z_tr[[r, c]];
-        }
-    }
-    mu.mapv_inplace(|v| v / n_tr as f64);
-    let mut cen = z_tr.clone();
-    for r in 0..n_tr {
-        for c in 0..p {
-            cen[[r, c]] -= mu[c];
-        }
-    }
-    let gram = fast_ata(&cen);
-    let (evals, evecs) = gram.eigh(faer::Side::Lower).unwrap();
-    let mut idx: Vec<usize> = (0..p).collect();
-    idx.sort_by(|&a, &b| evals[b].partial_cmp(&evals[a]).unwrap());
-    let mut basis = Array2::<f64>::zeros((p, rank));
-    for j in 0..rank {
-        for c in 0..p {
-            basis[[c, j]] = evecs[[c, idx[j]]];
-        }
-    }
-    let mut e = 0.0;
-    for r in 0..n_te {
-        let mut coef = vec![0.0; rank];
-        for j in 0..rank {
-            for c in 0..p {
-                coef[j] += (z_te[[r, c]] - mu[c]) * basis[[c, j]];
-            }
-        }
-        for c in 0..p {
-            let mut rec = mu[c];
-            for j in 0..rank {
-                rec += coef[j] * basis[[c, j]];
-            }
-            let d = rec - z_te[[r, c]];
-            e += d * d;
-        }
-    }
-    1.0 - e / tot_te
-}
-
-/// The manifold thesis, OUT-OF-SAMPLE on real OLMo l18: a curved d=2 torus atom
-/// reconstructs the HELD-OUT 40% better than the best flat affine d=2 code at the
-/// same latent dim. Measured: curved OOS EV ≈ 0.22 vs flat affine OOS ≈ 0.11
-/// (~2x). The curvature captures GENERALISABLE structure, not just train noise.
+/// The curved manifold atom evaluated OUT-OF-SAMPLE against a REAL traditional
+/// SAE — NOT against PCA. PCA is dense and global (it uses ALL input dims to form
+/// the code and is the optimal LINEAR autoencoder); it is NOT a sparse
+/// autoencoder, so it is not a valid SAE baseline. An earlier version of this test
+/// wrongly used a PCA d=2 subspace as the "flat baseline", which made the manifold
+/// look ~2x better than it actually is.
+///
+/// The honest baseline is a TRAINED TopK SAE. `tests/sae/real_topk_sae_baseline.py`
+/// trains the `dictionary_learning` TopK SAE (Gao et al. recipe) on the SAME 60/40
+/// OLMo l18 split and reports held-out reconstruction EV at matched sparsity:
+///   dict=32 k=2 → OOS 0.217,  dict=64 k=2 → 0.242,  dict=64 k=4 → 0.272.
+/// A single curved d=2 atom reaches OOS ≈ 0.22 — COMPETITIVE with a real TopK SAE
+/// at 2 active latents (one curved atom ≈ a small flat dictionary), NOT
+/// dramatically better. This test guards that the curved atom's held-out
+/// reconstruction stays in that real-SAE-competitive band (a regression that
+/// collapsed it, or an implausibly-high in-sample-overfit leaking to OOS, trips).
 #[test]
-fn curved_atom_beats_flat_code_at_matched_latent_dim() {
+fn curved_atom_oos_competitive_with_real_topk_sae() {
     let (tr, te) = olmo_l18_oos_split();
     let (_in, curved_oos) = oos_train_curved(&tr, &te, 2, 3, 5, false, 0);
-    let flat_oos = oos_flat_affine_ev(&tr, &te, 2);
-    eprintln!("OOS curved d=2 EV={curved_oos:.4}  flat affine d=2 EV={flat_oos:.4}");
+    eprintln!(
+        "curved d=2 OOS EV={curved_oos:.4}  (real TopK SAE k=2 OOS ≈ 0.217–0.242, \
+         see tests/sae/real_topk_sae_baseline.py)"
+    );
     assert!(
-        flat_oos > 0.0 && curved_oos > 1.15 * flat_oos,
-        "curved d=2 must beat flat affine d=2 OUT-OF-SAMPLE (manifold thesis \
-         generalises); curved_oos={curved_oos:.4} flat_oos={flat_oos:.4}"
+        curved_oos > 0.15 && curved_oos < 0.40,
+        "curved d=2 OOS EV must sit in the real-TopK-SAE-competitive band [0.15,0.40] \
+         (measured ~0.22); got {curved_oos:.4}"
     );
 }
 
