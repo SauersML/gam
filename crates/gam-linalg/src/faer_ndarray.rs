@@ -2426,4 +2426,185 @@ mod tests {
             gram_rrqr.verdict_margin,
         );
     }
+
+    // ── fast_ab / fast_atb / fast_abt / fast_av / fast_atv / fast_xt_diag_y ──
+
+    fn max_abs_diff(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
+        assert_eq!(a.dim(), b.dim(), "shape mismatch in max_abs_diff");
+        a.iter().zip(b.iter()).fold(0.0_f64, |acc, (&x, &y)| acc.max((x - y).abs()))
+    }
+
+    fn max_abs_diff_1d(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
+        assert_eq!(a.len(), b.len(), "len mismatch in max_abs_diff_1d");
+        a.iter().zip(b.iter()).fold(0.0_f64, |acc, (&x, &y)| acc.max((x - y).abs()))
+    }
+
+    /// `fast_ab(A, B)` matches `A.dot(&B)` for small (ndarray-path) matrices.
+    #[test]
+    fn fast_ab_small_matches_ndarray_dot() {
+        let a = array![[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]];
+        let b = array![[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]];
+        let got = fast_ab(&a, &b);
+        let want = a.dot(&b);
+        assert!(max_abs_diff(&got, &want) < 1e-12, "fast_ab small mismatch");
+        assert_eq!(got.dim(), (2, 2));
+    }
+
+    /// `fast_ab` on larger matrices (faer path) agrees with ndarray dot.
+    #[test]
+    fn fast_ab_large_matches_ndarray_dot() {
+        let n = 50usize;
+        let p = 40usize;
+        let q = 35usize;
+        let mut a = Array2::<f64>::zeros((n, p));
+        let mut b = Array2::<f64>::zeros((p, q));
+        let mut state = 0xDEAD_BEEF_1234_5678u64;
+        let next = |s: &mut u64| -> f64 {
+            *s ^= *s << 13;
+            *s ^= *s >> 7;
+            *s ^= *s << 17;
+            ((*s >> 11) as f64 / ((1u64 << 53) as f64)) - 0.5
+        };
+        for v in a.iter_mut() { *v = next(&mut state); }
+        for v in b.iter_mut() { *v = next(&mut state); }
+        let got = fast_ab(&a, &b);
+        let want = a.dot(&b);
+        assert!(max_abs_diff(&got, &want) < 1e-9, "fast_ab large mismatch");
+    }
+
+    /// `fast_atb(A, B)` = A^T * B for small matrices (ndarray path).
+    #[test]
+    fn fast_atb_small_matches_ndarray_dot() {
+        let a = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
+        let b = array![[7.0, 8.0, 9.0], [10.0, 11.0, 12.0], [13.0, 14.0, 15.0]];
+        let got = fast_atb(&a, &b);
+        let want = a.t().dot(&b);
+        assert!(max_abs_diff(&got, &want) < 1e-12, "fast_atb small mismatch");
+        assert_eq!(got.dim(), (2, 3));
+    }
+
+    /// `fast_atb` on larger matrices (faer path) agrees with ndarray.
+    #[test]
+    fn fast_atb_large_matches_ndarray_dot() {
+        let n = 50usize;
+        let p = 40usize;
+        let q = 35usize;
+        let mut a = Array2::<f64>::zeros((n, p));
+        let mut b = Array2::<f64>::zeros((n, q));
+        let mut state = 0xCAFE_BABE_9876_5432u64;
+        let next = |s: &mut u64| -> f64 {
+            *s ^= *s << 13;
+            *s ^= *s >> 7;
+            *s ^= *s << 17;
+            ((*s >> 11) as f64 / ((1u64 << 53) as f64)) - 0.5
+        };
+        for v in a.iter_mut() { *v = next(&mut state); }
+        for v in b.iter_mut() { *v = next(&mut state); }
+        let got = fast_atb(&a, &b);
+        let want = a.t().dot(&b);
+        assert!(max_abs_diff(&got, &want) < 1e-9, "fast_atb large mismatch");
+    }
+
+    /// `fast_abt(A, B)` = A * B^T for small matrices (ndarray path).
+    #[test]
+    fn fast_abt_small_matches_ndarray_dot() {
+        let a = array![[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]];
+        let b = array![[7.0, 8.0, 9.0], [10.0, 11.0, 12.0]];
+        let got = fast_abt(&a, &b);
+        let want = a.dot(&b.t());
+        assert!(max_abs_diff(&got, &want) < 1e-12, "fast_abt small mismatch");
+        assert_eq!(got.dim(), (2, 2));
+    }
+
+    /// `fast_av(A, v)` = A * v for small (ndarray path) and larger (faer path).
+    #[test]
+    fn fast_av_small_matches_ndarray_dot() {
+        let a = array![[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]];
+        let v = array![1.0, -1.0, 2.0];
+        let got = fast_av(&a, &v);
+        let want = a.dot(&v);
+        assert!(max_abs_diff_1d(&got, &want) < 1e-12, "fast_av small mismatch");
+        // 1*1 + 2*(-1) + 3*2 = 1-2+6 = 5
+        assert!((got[0] - 5.0).abs() < 1e-12, "fast_av[0] should be 5");
+        // 4*1 + 5*(-1) + 6*2 = 4-5+12 = 11
+        assert!((got[1] - 11.0).abs() < 1e-12, "fast_av[1] should be 11");
+    }
+
+    /// `fast_av` on larger matrices (faer path) agrees with ndarray.
+    #[test]
+    fn fast_av_large_matches_ndarray_dot() {
+        let n = 50usize;
+        let p = 40usize;
+        let mut a = Array2::<f64>::zeros((n, p));
+        let mut v = Array1::<f64>::zeros(p);
+        let mut state = 0xFEED_FACE_ABCD_EF01u64;
+        let next = |s: &mut u64| -> f64 {
+            *s ^= *s << 13;
+            *s ^= *s >> 7;
+            *s ^= *s << 17;
+            ((*s >> 11) as f64 / ((1u64 << 53) as f64)) - 0.5
+        };
+        for v in a.iter_mut() { *v = next(&mut state); }
+        for x in v.iter_mut() { *x = next(&mut state); }
+        let got = fast_av(&a, &v);
+        let want = a.dot(&v);
+        assert!(max_abs_diff_1d(&got, &want) < 1e-9, "fast_av large mismatch");
+    }
+
+    /// `fast_atv(A, v)` = A^T * v for small matrices (ndarray path).
+    #[test]
+    fn fast_atv_small_matches_ndarray_dot() {
+        let a = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
+        let v = array![1.0, 0.0, -1.0];
+        let got = fast_atv(&a, &v);
+        let want = a.t().dot(&v);
+        // A^T * v = [1*1+3*0+5*(-1), 2*1+4*0+6*(-1)] = [-4, -4]
+        assert!(max_abs_diff_1d(&got, &want) < 1e-12, "fast_atv small mismatch");
+        assert!((got[0] - (-4.0)).abs() < 1e-12, "fast_atv[0]");
+        assert!((got[1] - (-4.0)).abs() < 1e-12, "fast_atv[1]");
+    }
+
+    /// `fast_atv` on larger matrices (faer path) agrees with ndarray.
+    #[test]
+    fn fast_atv_large_matches_ndarray_dot() {
+        let n = 50usize;
+        let p = 40usize;
+        let mut a = Array2::<f64>::zeros((n, p));
+        let mut v = Array1::<f64>::zeros(n);
+        let mut state = 0x1234_ABCD_5678_EF90u64;
+        let next = |s: &mut u64| -> f64 {
+            *s ^= *s << 13;
+            *s ^= *s >> 7;
+            *s ^= *s << 17;
+            ((*s >> 11) as f64 / ((1u64 << 53) as f64)) - 0.5
+        };
+        for x in a.iter_mut() { *x = next(&mut state); }
+        for x in v.iter_mut() { *x = next(&mut state); }
+        let got = fast_atv(&a, &v);
+        let want = a.t().dot(&v);
+        assert!(max_abs_diff_1d(&got, &want) < 1e-9, "fast_atv large mismatch");
+    }
+
+    /// `fast_xt_diag_y(X, d, Y)` = X^T * diag(d) * Y, verified against
+    /// a manual triple-product for small inputs.
+    #[test]
+    fn fast_xt_diag_y_small_matches_manual() {
+        let x = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
+        let d = array![2.0, 0.5, 1.0];
+        let y = array![[7.0, 8.0, 9.0], [10.0, 11.0, 12.0], [13.0, 14.0, 15.0]];
+        let got = fast_xt_diag_y(&x, &d, &y);
+        // Manual: X^T * diag(d) * Y
+        let diag_y = {
+            let mut dy = Array2::<f64>::zeros(y.dim());
+            for i in 0..3 {
+                for j in 0..3 {
+                    dy[[i, j]] = d[i] * y[[i, j]];
+                }
+            }
+            dy
+        };
+        let want = x.t().dot(&diag_y);
+        assert!(max_abs_diff(&got, &want) < 1e-12, "fast_xt_diag_y small mismatch");
+        assert_eq!(got.dim(), (2, 3));
+    }
 }
