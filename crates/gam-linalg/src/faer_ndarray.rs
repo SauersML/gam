@@ -2341,14 +2341,13 @@ mod tests {
     }
 
     /// gam#933 regression: the Gram-squared RRQR must NOT silently over-rank an
-    /// EXACTLY collinear design. Forming `G = XᵀX` squares the spectrum, so the
-    /// zero singular value of an exact alias underflows to `≈ ε·σ_max²` in `G` and
-    /// the eigen-square-root resurrects it as a SPURIOUS pivot `≈ √ε·σ_max` that
-    /// sits above `tol` — col-piv QR on the Gram factor would KEEP it and report
-    /// full rank. The precision-floor margin term must catch this: the smallest
-    /// kept pivot is near `√ε·leading`, so `verdict_margin` collapses below the
-    /// caller's fallback threshold, forcing the full-precision tall path (which
-    /// sees the true zero singular value and demotes the column).
+    /// EXACTLY collinear design. The invariant is: either the Gram path finds the
+    /// correct rank (3) by itself — because the precision-floor logic demotes the
+    /// spurious near-zero pivot before it reaches the kept set — OR, if it
+    /// over-ranks (reports 4), the `verdict_margin` must collapse below the
+    /// caller's fallback threshold so the full-precision tall path is used
+    /// instead. Both outcomes prevent the original gam#933 bug (silent rank=4
+    /// with high-confidence margin that the caller trusts without verification).
     #[test]
     fn gram_rrqr_flags_low_margin_on_exact_collinearity_so_caller_falls_back() {
         // Joint design [1, x | x, x²] with x ∈ [-1, 1]: columns 1 and 2 are an
@@ -2371,20 +2370,29 @@ mod tests {
         let tall = rrqr_with_permutation(&a, alpha).expect("tall RRQR should succeed");
         assert_eq!(tall.rank, 3, "tall RRQR must demote the exact alias");
 
-        // The Gram-squared RRQR must report a SMALL verdict_margin here so the
-        // caller re-confirms on the tall design instead of trusting a possibly
-        // over-ranked Gram verdict. (We do not assert the Gram rank itself —
-        // squaring may report 3 or 4 — only that the margin signals the cliff.)
+        // The Gram-squared RRQR must satisfy the gam#933 invariant:
+        //   rank == 3 (correct result)  OR  verdict_margin < threshold (force fallback)
+        //
+        // The precision-floor margin term was designed to catch the case where
+        // squaring the spectrum resurrects a spurious kept pivot near √ε·σ_max.
+        // When the eigen-square-root approach correctly demotes that pivot
+        // (yielding rank=3 without spurious kept columns), the margin is
+        // legitimately high — trusting the Gram result is then safe and correct.
+        // When it over-ranks (rank=4), the floor margin must be low so the
+        // caller falls back to the tall RRQR and gets the right answer.
         let unit = Array1::<f64>::ones(n);
         let gram = fast_xt_diag_x_with_parallelism(&a, &unit, faer::get_global_parallelism());
         let gram_rrqr =
             rrqr_from_gram_with_permutation(&gram, n, alpha).expect("Gram RRQR should succeed");
+        let ok = gram_rrqr.rank == 3
+            || gram_rrqr.verdict_margin < JOINT_GRAM_RRQR_TRUST_MARGIN_FOR_TEST;
         assert!(
-            gram_rrqr.verdict_margin < JOINT_GRAM_RRQR_TRUST_MARGIN_FOR_TEST,
-            "exact-collinearity Gram verdict must report low margin to force tall \
-             fallback; got margin={:.3e} (rank={})",
-            gram_rrqr.verdict_margin,
+            ok,
+            "gam#933: Gram RRQR must either find correct rank=3 OR signal low margin \
+             (< {:.0e}) to force the tall fallback; got rank={} margin={:.3e}",
+            JOINT_GRAM_RRQR_TRUST_MARGIN_FOR_TEST,
             gram_rrqr.rank,
+            gram_rrqr.verdict_margin,
         );
     }
 

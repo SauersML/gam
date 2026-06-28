@@ -346,7 +346,9 @@ impl<'a> StableSolver<'a> {
     /// In that case we fall back to the truncated-eigendecomposition
     /// pseudoinverse:
     ///
-    ///     δ = Σ_k (uₖᵀ rhs / λₖ) · uₖ      for k with |λₖ| > cutoff
+    /// ```text
+    /// δ = Σ_k (uₖᵀ rhs / λₖ) · uₖ      for k with |λₖ| > cutoff
+    /// ```
     ///
     /// where `(λₖ, uₖ)` are the eigenpairs of `matrix` (assumed symmetric).
     /// Components in `null(matrix)` (i.e. |λₖ| ≤ cutoff) are *excluded* from
