@@ -52,4 +52,55 @@ mod tests {
             2
         );
     }
+
+    #[test]
+    fn value_below_first_breakpoint_returns_span_zero() {
+        let bp = [0.0, 1.0, 2.0];
+        assert_eq!(span_index_for_breakpoints(&bp, -5.0, "t").unwrap(), 0);
+    }
+
+    #[test]
+    fn value_above_last_breakpoint_returns_last_span() {
+        let bp = [0.0, 1.0, 2.0];
+        assert_eq!(span_index_for_breakpoints(&bp, 99.0, "t").unwrap(), 1);
+    }
+
+    #[test]
+    fn two_breakpoints_only_one_span() {
+        let bp = [0.0, 1.0];
+        assert_eq!(span_index_for_breakpoints(&bp, 0.5, "t").unwrap(), 0);
+        assert_eq!(span_index_for_breakpoints(&bp, 0.0, "t").unwrap(), 0);
+        assert_eq!(span_index_for_breakpoints(&bp, 1.0, "t").unwrap(), 0);
+    }
+
+    #[test]
+    fn non_finite_value_returns_error() {
+        let bp = [0.0, 1.0, 2.0];
+        assert!(span_index_for_breakpoints(&bp, f64::NAN, "t").is_err());
+        assert!(span_index_for_breakpoints(&bp, f64::INFINITY, "t").is_err());
+        assert!(span_index_for_breakpoints(&bp, f64::NEG_INFINITY, "t").is_err());
+    }
+
+    #[test]
+    fn fewer_than_two_breakpoints_returns_error() {
+        assert!(span_index_for_breakpoints(&[], 0.5, "t").is_err());
+        assert!(span_index_for_breakpoints(&[1.0], 0.5, "t").is_err());
+    }
+
+    #[test]
+    fn interior_midpoint_selects_correct_span() {
+        let bp = [0.0, 1.0, 2.0, 3.0];
+        // 0.5 is in [0,1) → span 0
+        assert_eq!(span_index_for_breakpoints(&bp, 0.5, "t").unwrap(), 0);
+        // 1.5 is in [1,2) → span 1
+        assert_eq!(span_index_for_breakpoints(&bp, 1.5, "t").unwrap(), 1);
+        // 2.5 is in [2,3) → span 2
+        assert_eq!(span_index_for_breakpoints(&bp, 2.5, "t").unwrap(), 2);
+    }
+
+    #[test]
+    fn error_message_contains_label() {
+        let err = span_index_for_breakpoints(&[0.0], 0.5, "my_var").unwrap_err();
+        assert!(err.contains("my_var"), "error should mention label, got: {err}");
+    }
 }
