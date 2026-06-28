@@ -97,13 +97,11 @@ _CHILD = textwrap.dedent(
 )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#808 open: clustered-PC survival marginal-slope inner solve stalls "
-    "(residual ~3.7e8 >> tol, frozen |g|=1.863); v2 W-aware reduction drops the "
-    "whole logslope block but the residual lives in the time block, so the "
-    "outer REML never converges. Flip to a hard assert when #808 is fixed.",
-)
+# #1512 / SPEC.md (xfail is never allowed): this stands FAILING as the signal of
+# the open #808 bug — clustered-PC survival marginal-slope inner solve stalls
+# (residual ~3.7e8 >> tol, frozen |g|=1.863); v2 W-aware reduction drops the
+# whole logslope block but the residual lives in the time block, so the outer
+# REML never converges. Fix #808 to green this.
 def test_survival_marginal_slope_clustered_pc_converges_808() -> None:
     env = dict(os.environ)
     env.setdefault("OMP_NUM_THREADS", "1")

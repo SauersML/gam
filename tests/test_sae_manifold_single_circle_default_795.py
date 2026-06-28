@@ -70,14 +70,9 @@ def test_single_circle_quickstart_converges_with_default_regularizers() -> None:
     assert np.isfinite(fit.reconstruction_r2), "reconstruction R² is non-finite"
 
 
-@pytest.mark.xfail(
-    reason=(
-        "positive normalized isometry still fails cold startup after the "
-        "curvature walk bifurcates and fallback seed validation jumps to the "
-        "target isometry weight"
-    ),
-    strict=False,
-)
+# #1512 / SPEC.md (xfail is never allowed): this stands FAILING as the signal —
+# positive normalized isometry still fails cold startup after the curvature walk
+# bifurcates and fallback seed validation jumps to the target isometry weight.
 def test_single_circle_positive_isometry_recovers_honest_chart_span() -> None:
     z = _planted_circle()
     with warnings.catch_warnings():
