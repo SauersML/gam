@@ -1150,3 +1150,150 @@ fn manifold_training_loop_converges_and_improves() {
         evs.last().unwrap()
     );
 }
+
+/// Data-driven chart placement (`EncodeAtlas::build_data_driven`) UNLOCKS the
+/// higher-dimensional manifold atoms real activations want. The certified-encode
+/// atlas's regular grid is `resolution^d` charts — exponential in latent dim, so
+/// it cannot afford well-certified `d ≥ 4` atoms (the data, on OLMo l18, wants
+/// them: EV climbs steeply with d). Placing a BOUNDED number of charts at the
+/// data's own latent coords instead is `O(max_charts)` regardless of d.
+///
+/// Two claims, measured on real OLMo l18 (h=1 torus, training loop = alternate
+/// fast-encode ↔ ridge-refit), all at a 256-chart budget:
+///  (1) CORRECTNESS — at d=2, where the grid is affordable, data-driven placement
+///      matches the grid's reconstruction (measured 0.2918 vs 0.2913).
+///  (2) UNLOCK — at d=4 (basis 81 < n, well-determined), data-driven reaches
+///      EV ≈ 0.62 vs the grid d=2's ≈ 0.29 (+113%), with all 635 rows certifiable
+///      against ≤256 charts — coverage the grid cannot give at d=4.
+#[test]
+fn data_driven_charts_unlock_higher_latent_dim() {
+    let mani = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut path = mani.join("tests/data/olmo_l18_pca64_635.npy");
+    if !path.exists() {
+        path = mani.join("../../tests/data/olmo_l18_pca64_635.npy");
+    }
+    let z = read_npy_f32_2d(&path);
+    let n = z.nrows();
+    let p = z.ncols();
+    let mut total_sq = 0.0;
+    for r in 0..n {
+        for c in 0..p {
+            total_sq += z[[r, c]] * z[[r, c]];
+        }
+    }
+    let mut norm_bound = 0.0_f64;
+    for r in 0..n {
+        norm_bound = norm_bound.max(z.row(r).dot(&z.row(r)).sqrt());
+    }
+    let amps = ndarray::Array1::<f64>::ones(n);
+
+    // Run the training loop (5 steps) for a torus atom of latent dim `d`, with
+    // either the regular grid atlas or the data-driven atlas. Returns
+    // (converged EV, certifiable chart count, valid-row count).
+    let run = |d: usize, data_driven: bool, max_charts: usize| -> (f64, usize, usize) {
+        let evaluator = Arc::new(TorusHarmonicEvaluator::new(d, 1).unwrap());
+        let seed = sae_pca_seed_initial_coords(
+            z.view(),
+            &vec![SaeAtomBasisKind::Periodic; 1],
+            &vec![d],
+        )
+        .unwrap();
+        let mut coords = seed.slice(s![0, .., 0..d]).to_owned();
+        let build = |coords: &Array2<f64>| -> SaeManifoldAtom {
+            let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+            let m = phi.ncols();
+            let mut xtx = fast_ata(&phi);
+            for i in 0..m {
+                xtx[[i, i]] += 1e-8;
+            }
+            let xtz = fast_atb(&phi, &z.to_owned());
+            let dec = xtx.cholesky(Side::Lower).unwrap().solve_mat(&xtz);
+            SaeManifoldAtom::new("t", SaeAtomBasisKind::Periodic, d, phi, jet, dec, Array2::eye(m))
+                .unwrap()
+                .with_basis_evaluator(evaluator.clone())
+        };
+        let ev_of = |a: &SaeManifoldAtom| {
+            let r = a.basis_values.dot(&a.decoder_coefficients);
+            let mut e = 0.0;
+            for i in 0..n {
+                for c in 0..p {
+                    let q = r[[i, c]] - z[[i, c]];
+                    e += q * q;
+                }
+            }
+            1.0 - e / total_sq
+        };
+        let (mut last, mut charts, mut valid) = (0.0, 0usize, 0usize);
+        for _ in 0..5 {
+            let atom = build(&coords);
+            last = ev_of(&atom);
+            let atlas = if data_driven {
+                crate::encode::EncodeAtlas::build_data_driven(
+                    std::slice::from_ref(&atom),
+                    std::slice::from_ref(&coords),
+                    &[1.0],
+                    norm_bound,
+                    max_charts,
+                    crate::encode::AtlasConfig::default(),
+                )
+                .unwrap()
+            } else {
+                crate::encode::EncodeAtlas::build(
+                    std::slice::from_ref(&atom),
+                    &[1.0],
+                    norm_bound,
+                    crate::encode::AtlasConfig::default(),
+                )
+                .unwrap()
+            };
+            charts = atlas.atoms[0]
+                .charts
+                .iter()
+                .filter(|c| c.certified_radius > 0.0)
+                .count();
+            let (ec, v) = atlas
+                .amortized_encode_batch_fast(&atom, 0, z.view(), amps.view())
+                .unwrap();
+            valid = v.iter().filter(|&&b| b).count();
+            let mut nx = coords.clone();
+            for i in 0..n {
+                if v[i] {
+                    nx.row_mut(i).assign(&ec.row(i));
+                }
+            }
+            coords = nx;
+        }
+        (last, charts, valid)
+    };
+
+    let (ev_grid2, _c2, v_grid2) = run(2, false, 0);
+    let (ev_dd2, c_dd2, _v_dd2) = run(2, true, 256);
+    let (ev_dd4, c_dd4, v_dd4) = run(4, true, 256);
+
+    // (1) Correctness: data-driven d=2 matches the grid d=2 (placement, not
+    //     parameterization, changed) — within a small EV tolerance.
+    assert!(
+        (ev_dd2 - ev_grid2).abs() < 0.03,
+        "data-driven d=2 must match grid d=2 reconstruction; dd={ev_dd2:.4} grid={ev_grid2:.4}"
+    );
+    assert!(
+        c_dd2 <= 256,
+        "data-driven chart count must be bounded by max_charts; got {c_dd2}"
+    );
+    // (2) Unlock: data-driven d=4 reconstructs far better than the grid d=2 (the
+    //     data wants the higher dimension and the data-driven atlas affords it),
+    //     against a bounded chart budget, with full row coverage.
+    assert!(
+        ev_dd4 > 1.7 * ev_grid2,
+        "data-driven d=4 must beat grid d=2 by >70% (higher-dim unlock); \
+         d4={ev_dd4:.4} grid_d2={ev_grid2:.4}"
+    );
+    assert!(
+        c_dd4 <= 256,
+        "data-driven d=4 chart count must stay bounded (not resolution^d); got {c_dd4}"
+    );
+    assert!(
+        v_dd4 > 95 * n / 100 && v_grid2 > 95 * n / 100,
+        "data-driven d=4 must certify ~all rows like the grid d=2; d4={v_dd4} grid2={v_grid2} of {n}"
+    );
+}

@@ -1321,16 +1321,57 @@ impl EncodeAtlas {
         target_norm_bound: f64,
         config: &AtlasConfig,
     ) -> Result<AtomEncodeAtlas, String> {
-        let d = atom.latent_dim;
-        let decoder_norm_sum = decoder_row_norm_sum(atom.decoder_coefficients.view());
         let centers = chart_center_grid(atom, config.grid_resolution);
         // Half the inter-center spacing is the natural in-chart radius so the
         // charts tile the grid without gaps; refined below if the certificate
-        // fails at that radius.
+        // fails at that radius. One uniform radius for the regular grid.
         let nominal_radius = chart_nominal_radius(atom, config.grid_resolution);
+        let radii = vec![nominal_radius; centers.nrows()];
+        Self::build_atom_atlas_from_centers(
+            atom_index,
+            atom,
+            centers.view(),
+            &radii,
+            amplitude_bound,
+            target_norm_bound,
+            config,
+        )
+    }
+
+    /// Build a per-atom atlas from EXPLICIT chart centers with a per-center
+    /// nominal radius — the geometry-agnostic core shared by the regular-grid
+    /// [`Self::build_atom_atlas`] and the data-driven [`Self::build_data_driven`].
+    /// Every chart is certified identically (Kantorovich radius from the in-chart
+    /// curvature at its center); only the center PLACEMENT and per-center radius
+    /// differ. `radii[c]` is the nominal in-chart radius for `centers[c]`.
+    pub(crate) fn build_atom_atlas_from_centers(
+        atom_index: usize,
+        atom: &SaeManifoldAtom,
+        centers: ArrayView2<'_, f64>,
+        radii: &[f64],
+        amplitude_bound: f64,
+        target_norm_bound: f64,
+        config: &AtlasConfig,
+    ) -> Result<AtomEncodeAtlas, String> {
+        let d = atom.latent_dim;
+        if centers.ncols() != d {
+            return Err(format!(
+                "build_atom_atlas_from_centers: centers have {} cols but atom latent_dim is {d}",
+                centers.ncols()
+            ));
+        }
+        if radii.len() != centers.nrows() {
+            return Err(format!(
+                "build_atom_atlas_from_centers: {} radii != {} centers",
+                radii.len(),
+                centers.nrows()
+            ));
+        }
+        let decoder_norm_sum = decoder_row_norm_sum(atom.decoder_coefficients.view());
         let mut charts = Vec::with_capacity(centers.nrows());
         for c in 0..centers.nrows() {
             let center = centers.row(c).to_owned();
+            let nominal_radius = radii[c];
             let region = chart_region(atom, center.clone(), nominal_radius);
             let sups = family_jet_sups(atom, &region)?;
             let recon_sups = reconstruction_jet_sups(atom, sups);
@@ -1387,6 +1428,59 @@ impl EncodeAtlas {
             latent_dim: d,
             decoder_norm_sum,
             charts,
+        })
+    }
+
+    /// Build the atlas with DATA-DRIVEN chart placement: instead of a dense
+    /// `resolution^d` product grid (exponential in latent dim `d`, so the regular
+    /// [`Self::build`] is forced to coarse, poorly-certified charts for `d ≥ 3`),
+    /// place a bounded number of charts AT the data's own latent coordinates. The
+    /// chart count is then `O(max_charts)` regardless of `d`, and every chart sits
+    /// where data actually lands (small in-chart residual → certifies), so
+    /// higher-dimensional atoms — which reconstruct real activations far better per
+    /// parameter — become affordable and well-covered.
+    ///
+    /// `coords[k]` is atom `k`'s `n × d_k` latent coordinates (the seed coords, or
+    /// a previous encode's output). Charts are chosen by greedy farthest-point
+    /// sampling over those coords (deterministic, coverage-maximizing), capped at
+    /// `max_charts`. Each chart's nominal radius is half the distance to its
+    /// nearest neighbor center, so the charts tile the local data density. The
+    /// per-chart Kantorovich certification is IDENTICAL to the regular grid — only
+    /// the center placement differs.
+    pub fn build_data_driven(
+        atoms: &[SaeManifoldAtom],
+        coords: &[Array2<f64>],
+        amplitude_bound: &[f64],
+        target_norm_bound: f64,
+        max_charts: usize,
+        config: AtlasConfig,
+    ) -> Result<Self, String> {
+        if amplitude_bound.len() != atoms.len() || coords.len() != atoms.len() {
+            return Err(format!(
+                "build_data_driven: amplitude_bound {} / coords {} must match atom count {}",
+                amplitude_bound.len(),
+                coords.len(),
+                atoms.len()
+            ));
+        }
+        let mut atom_atlases = Vec::with_capacity(atoms.len());
+        for (k, atom) in atoms.iter().enumerate() {
+            let (centers, radii) =
+                data_driven_chart_centers(atom, coords[k].view(), max_charts.max(1))?;
+            let atlas = Self::build_atom_atlas_from_centers(
+                k,
+                atom,
+                centers.view(),
+                &radii,
+                amplitude_bound[k],
+                target_norm_bound,
+                &config,
+            )?;
+            atom_atlases.push(atlas);
+        }
+        Ok(Self {
+            atoms: atom_atlases,
+            config,
         })
     }
 
@@ -2564,6 +2658,110 @@ pub(crate) const SHAPE_BAND_MAX_POINTS: usize = 512;
 /// spans `[0, 1)`; the sphere chart spans `lat ∈ [−π/2, π/2]`, `lon ∈ [−π, π)`.
 /// These conventions match the basis evaluators (the fraction-of-period circle
 /// harmonic and the lat/lon sphere chart).
+/// Squared coordinate distance between two latent points under the atom's chart
+/// geometry: per-axis WRAPPED distance `min(|a−b|, period−|a−b|)` on periodic
+/// (circle) axes — period 1 to match `chart_center_grid`'s `[0,1)` torus tiling
+/// — and plain difference on line axes. Used to place + size data-driven charts.
+pub(crate) fn coord_dist_sq(atom: &SaeManifoldAtom, a: ArrayView1<'_, f64>, b: ArrayView1<'_, f64>) -> f64 {
+    use crate::manifold::SaeAtomBasisKind::*;
+    let periodic_axis = |axis: usize| -> bool {
+        match &atom.basis_kind {
+            Periodic | Torus | Sphere => true,
+            // Cylinder S¹×ℝ: only axis 0 is the circle.
+            Cylinder => axis == 0,
+            Linear | Duchon | EuclideanPatch | Poincare | Precomputed(_) => false,
+        }
+    };
+    let mut acc = 0.0;
+    for axis in 0..a.len() {
+        let mut d = (a[axis] - b[axis]).abs();
+        if periodic_axis(axis) {
+            // Wrap onto the circle of unit period.
+            d -= d.floor(); // fractional part in [0,1)
+            d = d.min(1.0 - d);
+        }
+        acc += d * d;
+    }
+    acc
+}
+
+/// Greedy farthest-point sampling of up to `max_charts` chart centers from the
+/// atom's latent `coords` (n × d), with each center's nominal radius set to half
+/// the distance to its nearest neighbor center (floored, so a singleton/coincident
+/// cluster still gets a usable ball). Deterministic: seeds from row 0, then
+/// repeatedly adds the coord maximally far (under [`coord_dist_sq`]) from the
+/// chosen set — coverage-maximizing and reproducible run-to-run.
+pub(crate) fn data_driven_chart_centers(
+    atom: &SaeManifoldAtom,
+    coords: ArrayView2<'_, f64>,
+    max_charts: usize,
+) -> Result<(Array2<f64>, Vec<f64>), String> {
+    let n = coords.nrows();
+    let d = coords.ncols();
+    if d != atom.latent_dim {
+        return Err(format!(
+            "data_driven_chart_centers: coords have {d} cols but atom latent_dim is {}",
+            atom.latent_dim
+        ));
+    }
+    if n == 0 {
+        return Ok((Array2::<f64>::zeros((0, d)), Vec::new()));
+    }
+    let k = max_charts.min(n);
+    // Farthest-point sampling: maintain each row's distance to the nearest chosen
+    // center, add the row with the maximum such distance each step.
+    let mut chosen: Vec<usize> = Vec::with_capacity(k);
+    chosen.push(0);
+    let mut nearest_sq: Vec<f64> = (0..n)
+        .map(|r| coord_dist_sq(atom, coords.row(r), coords.row(0)))
+        .collect();
+    while chosen.len() < k {
+        // Pick the row farthest from the current center set (first-wins tie).
+        let mut best = 0usize;
+        let mut best_d = -1.0;
+        for r in 0..n {
+            if nearest_sq[r] > best_d {
+                best_d = nearest_sq[r];
+                best = r;
+            }
+        }
+        if best_d <= 0.0 {
+            break; // all remaining rows coincide with a chosen center.
+        }
+        chosen.push(best);
+        for r in 0..n {
+            let dr = coord_dist_sq(atom, coords.row(r), coords.row(best));
+            if dr < nearest_sq[r] {
+                nearest_sq[r] = dr;
+            }
+        }
+    }
+    let m = chosen.len();
+    let mut centers = Array2::<f64>::zeros((m, d));
+    for (i, &row) in chosen.iter().enumerate() {
+        centers.row_mut(i).assign(&coords.row(row));
+    }
+    // Per-center radius = half the nearest-OTHER-center distance, floored so a
+    // coincident pair still yields a positive ball, capped at 0.5 (the largest
+    // meaningful half-period on a unit circle).
+    let mut radii = vec![0.0_f64; m];
+    for i in 0..m {
+        let mut nn = f64::INFINITY;
+        for j in 0..m {
+            if i == j {
+                continue;
+            }
+            let dsq = coord_dist_sq(atom, centers.row(i), centers.row(j));
+            if dsq < nn {
+                nn = dsq;
+            }
+        }
+        let r = if nn.is_finite() { 0.5 * nn.sqrt() } else { 0.5 };
+        radii[i] = r.max(1.0e-3).min(0.5);
+    }
+    Ok((centers, radii))
+}
+
 pub(crate) fn chart_center_grid(atom: &SaeManifoldAtom, resolution: usize) -> Array2<f64> {
     use crate::manifold::SaeAtomBasisKind::*;
     let d = atom.latent_dim;
