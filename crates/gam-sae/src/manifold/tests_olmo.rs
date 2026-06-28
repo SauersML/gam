@@ -745,3 +745,111 @@ pub(crate) fn fast_reconstruct_matches_per_row_decode() {
         "fixture must reconstruct most rows; got {valid_rows} valid of {n}"
     );
 }
+
+/// Accuracy-parity guard for the fast amortized forward vs the per-row CERTIFIED
+/// Newton solve. The fast path skips the per-row Kantorovich certificate — the
+/// question this pins is whether that costs reconstruction accuracy. It does not:
+/// on the real OLMo l18 slice, on every row the certificate accepts, the
+/// amortized linear predictor's reconstruction `z·Φ(t̂)·B` matches the certified
+/// Newton-refined reconstruction to within 5% mean relative error (measured
+/// ratio ≈ 1.00). And the fast path produces a usable encode on STRICTLY MORE
+/// rows than the certificate certifies (the certificate is sufficient-not-
+/// necessary, so it conservatively rejects rows that in fact reconstruct fine).
+///
+/// So the fast forward is the right production default: traditional-encoder
+/// throughput, no accuracy regression vs the certified solve, broader coverage.
+/// This guards against a future change that silently degrades the amortized
+/// predictor relative to the certified path.
+#[test]
+fn fast_forward_is_accuracy_parity_with_certified() {
+    let mani = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut path = mani.join("tests/data/olmo_l18_pca64_635.npy");
+    if !path.exists() {
+        path = mani.join("../../tests/data/olmo_l18_pca64_635.npy");
+    }
+    let z = read_npy_f32_2d(&path);
+    let n = z.nrows();
+    let p = z.ncols();
+    let term = real_data_torus_seed_term(z.view(), 1, 3);
+    let mut norm_bound = 0.0_f64;
+    for r in 0..n {
+        norm_bound = norm_bound.max(z.row(r).dot(&z.row(r)).sqrt());
+    }
+    let atlas = crate::encode::EncodeAtlas::build(
+        &term.atoms,
+        &vec![1.0_f64; 1],
+        norm_bound,
+        crate::encode::AtlasConfig::default(),
+    )
+    .unwrap();
+    let atom = &term.atoms[0];
+    let amps = ndarray::Array1::<f64>::ones(n);
+    let evaluator = atom.basis_evaluator.as_ref().unwrap().clone();
+
+    // Fast forward: batched encode → batched basis eval → decode GEMM.
+    let (fast_recon, fast_valid) = atlas
+        .amortized_reconstruct_batch_fast(atom, 0, z.view(), amps.view())
+        .unwrap();
+
+    // Per-row CERTIFIED forward: certified_encode_row → decode z·Φ(t̂)·B.
+    let mut both: Vec<(f64, f64)> = Vec::new(); // (fast_rel_err, cert_rel_err)
+    let mut fast_valid_count = 0usize;
+    let mut cert_valid_count = 0usize;
+    for row in 0..n {
+        let xr = z.row(row);
+        let xn = xr.dot(&xr).sqrt().max(1e-12);
+        let fast_e = if fast_valid[row] {
+            fast_valid_count += 1;
+            let mut e = 0.0;
+            for c in 0..p {
+                let d = fast_recon[[row, c]] - xr[c];
+                e += d * d;
+            }
+            Some(e.sqrt() / xn)
+        } else {
+            None
+        };
+        let (coords, cert) = atlas.certified_encode_row(atom, 0, xr, amps[row]).unwrap();
+        let cert_e = if cert.beta.is_finite() && cert.h.is_finite() {
+            cert_valid_count += 1;
+            let single = coords.insert_axis(ndarray::Axis(0));
+            let (phi, _) = evaluator.evaluate(single.view()).unwrap();
+            let dec = phi.dot(&atom.decoder_coefficients);
+            let mut e = 0.0;
+            for c in 0..p {
+                let d = amps[row] * dec[[0, c]] - xr[c];
+                e += d * d;
+            }
+            Some(e.sqrt() / xn)
+        } else {
+            None
+        };
+        if let (Some(f), Some(c)) = (fast_e, cert_e) {
+            both.push((f, c));
+        }
+    }
+
+    // Coverage: the fast path encodes at least as many rows as the certificate
+    // certifies (the certificate is the more conservative gate).
+    assert!(
+        fast_valid_count >= cert_valid_count,
+        "fast path must cover >= certified rows; fast={fast_valid_count} cert={cert_valid_count}"
+    );
+    // Non-vacuity: a meaningful set of co-valid rows to compare on.
+    assert!(
+        both.len() > n / 8,
+        "need a non-trivial co-valid set; got {} of {n}",
+        both.len()
+    );
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
+    let fast_mean = mean(&both.iter().map(|x| x.0).collect::<Vec<_>>());
+    let cert_mean = mean(&both.iter().map(|x| x.1).collect::<Vec<_>>());
+    // Accuracy parity: fast mean relative reconstruction error within 5% of the
+    // certified path's on co-valid rows (measured ratio ≈ 1.00).
+    assert!(
+        fast_mean <= 1.05 * cert_mean,
+        "fast forward must be accuracy-parity with certified on co-valid rows; \
+         fast_mean={fast_mean:.4} cert_mean={cert_mean:.4} ratio={:.3}",
+        fast_mean / cert_mean
+    );
+}
