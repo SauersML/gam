@@ -801,4 +801,85 @@ mod tests {
         let parsed: Vec<TheoremResult> = serde_json::from_str(&out).unwrap();
         assert_eq!(parsed.len(), 3);
     }
+
+    // ── rows_to_array ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn rows_to_array_empty_returns_0x0() {
+        let a = rows_to_array(&[]).unwrap();
+        assert_eq!(a.dim(), (0, 0));
+    }
+
+    #[test]
+    fn rows_to_array_rectangular_shape_and_values() {
+        let rows = vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]];
+        let a = rows_to_array(&rows).unwrap();
+        assert_eq!(a.dim(), (2, 3));
+        assert_eq!(a[[0, 0]], 1.0);
+        assert_eq!(a[[0, 2]], 3.0);
+        assert_eq!(a[[1, 1]], 5.0);
+    }
+
+    #[test]
+    fn rows_to_array_ragged_returns_err() {
+        let rows = vec![vec![1.0, 2.0], vec![3.0]];
+        assert!(rows_to_array(&rows).is_err());
+    }
+
+    #[test]
+    fn rows_to_array_ragged_error_mentions_row_indices() {
+        let rows = vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0]];
+        let err = rows_to_array(&rows).unwrap_err();
+        assert!(err.contains('2'), "error should mention row 2, got: {err}");
+    }
+
+    // ── column_std / column_var ────────────────────────────────────────────────
+
+    #[test]
+    fn column_std_constant_column_is_zero() {
+        use ndarray::array;
+        let m = array![[3.0_f64], [3.0], [3.0]];
+        let std = column_std(m.view());
+        assert_eq!(std.len(), 1);
+        assert!(std[0].abs() < 1e-14, "constant column std should be 0, got {}", std[0]);
+    }
+
+    #[test]
+    fn column_std_known_value() {
+        use ndarray::array;
+        // Column [0, 2]: mean=1, deviations [-1,1], pop var=1, std=1
+        let m = array![[0.0_f64], [2.0]];
+        let std = column_std(m.view());
+        assert!((std[0] - 1.0).abs() < 1e-14, "expected std=1.0, got {}", std[0]);
+    }
+
+    #[test]
+    fn column_var_equals_std_squared() {
+        use ndarray::array;
+        let m = array![[1.0_f64, 2.0], [3.0, 4.0], [5.0, 6.0]];
+        let std = column_std(m.view());
+        let var = column_var(m.view());
+        assert_eq!(std.len(), var.len());
+        for (s, v) in std.iter().zip(var.iter()) {
+            assert!((v - s * s).abs() < 1e-14, "var={v} should equal std²={}", s*s);
+        }
+    }
+
+    #[test]
+    fn column_std_empty_rows_returns_zeros() {
+        use ndarray::Array2;
+        let m: Array2<f64> = Array2::zeros((0, 3));
+        let std = column_std(m.view());
+        assert_eq!(std, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn column_std_two_columns_independently() {
+        use ndarray::array;
+        // col0: [0,2] → std=1; col1: [1,1] → std=0
+        let m = array![[0.0_f64, 1.0], [2.0, 1.0]];
+        let std = column_std(m.view());
+        assert!((std[0] - 1.0).abs() < 1e-14, "col0 std={}", std[0]);
+        assert!(std[1].abs() < 1e-14, "col1 std={}", std[1]);
+    }
 }

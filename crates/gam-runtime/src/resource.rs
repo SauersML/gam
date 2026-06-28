@@ -573,3 +573,126 @@ mod byte_lru_tests {
         assert_eq!(cache.resident_bytes(), 0);
     }
 }
+
+#[cfg(test)]
+mod resource_policy_tests {
+    use super::*;
+
+    // ── rows_for_target_bytes ─────────────────────────────────────────────────
+
+    #[test]
+    fn rows_for_target_bytes_exact_fit() {
+        // 1 col × 8 bytes/f64; target 8 bytes → 1 row
+        assert_eq!(rows_for_target_bytes(8, 1), 1);
+    }
+
+    #[test]
+    fn rows_for_target_bytes_multiple_rows() {
+        // 1 col × 8 bytes/f64; target 80 bytes → 10 rows
+        assert_eq!(rows_for_target_bytes(80, 1), 10);
+    }
+
+    #[test]
+    fn rows_for_target_bytes_multiple_cols() {
+        // 4 cols × 8 = 32 bytes/row; target 128 → 4 rows
+        assert_eq!(rows_for_target_bytes(128, 4), 4);
+    }
+
+    #[test]
+    fn rows_for_target_bytes_zero_target_returns_one() {
+        // Zero target cannot give 0 rows — floor to 1
+        assert_eq!(rows_for_target_bytes(0, 1), 1);
+    }
+
+    #[test]
+    fn rows_for_target_bytes_zero_cols_returns_non_zero() {
+        // Zero cols → bytes_per_row falls back to 1 → rows = target
+        assert_eq!(rows_for_target_bytes(100, 0), 100);
+    }
+
+    #[test]
+    fn rows_for_target_bytes_large_target() {
+        // 8 MiB target, 1024 cols → 1024 bytes/row → 8192 rows
+        let target = 8 * 1024 * 1024;
+        let cols = 1024_usize;
+        let expected = target / (cols * std::mem::size_of::<f64>());
+        assert_eq!(rows_for_target_bytes(target, cols), expected);
+    }
+
+    // ── ResourcePolicy::for_problem ──────────────────────────────────────────
+
+    #[test]
+    fn for_problem_small_data_uses_materialize_if_small() {
+        let p = ResourcePolicy::for_problem(1000, 100, ProblemHints::default());
+        assert_eq!(
+            p.derivative_storage_mode,
+            DerivativeStorageMode::MaterializeIfSmall
+        );
+    }
+
+    #[test]
+    fn for_problem_large_nrows_is_strict() {
+        let p = ResourcePolicy::for_problem(
+            STRICT_POLICY_NROWS_THRESHOLD,
+            100,
+            ProblemHints::default(),
+        );
+        assert_eq!(
+            p.derivative_storage_mode,
+            DerivativeStorageMode::AnalyticOperatorRequired
+        );
+    }
+
+    #[test]
+    fn for_problem_large_p_is_strict() {
+        let p = ResourcePolicy::for_problem(
+            100,
+            STRICT_POLICY_P_THRESHOLD,
+            ProblemHints::default(),
+        );
+        assert_eq!(
+            p.derivative_storage_mode,
+            DerivativeStorageMode::AnalyticOperatorRequired
+        );
+    }
+
+    #[test]
+    fn for_problem_marginal_slope_hint_is_strict() {
+        let p = ResourcePolicy::for_problem(
+            100,
+            100,
+            ProblemHints {
+                marginal_slope_large_scale_active: true,
+            },
+        );
+        assert_eq!(
+            p.derivative_storage_mode,
+            DerivativeStorageMode::AnalyticOperatorRequired
+        );
+    }
+
+    // ── ResourcePolicy::material_policy ─────────────────────────────────────
+
+    #[test]
+    fn material_policy_default_library_allows_operator_and_diagnostics() {
+        let mp = ResourcePolicy::default_library().material_policy();
+        assert!(mp.allow_operator_materialization);
+        assert!(mp.allow_diagnostic_materialization);
+    }
+
+    #[test]
+    fn material_policy_analytic_operator_required_blocks_both() {
+        let mp = ResourcePolicy::analytic_operator_required().material_policy();
+        assert!(!mp.allow_operator_materialization);
+        assert!(!mp.allow_diagnostic_materialization);
+    }
+
+    #[test]
+    fn material_policy_propagates_byte_limits() {
+        let policy = ResourcePolicy::default_library();
+        let mp = policy.material_policy();
+        assert_eq!(mp.max_single_dense_bytes, policy.max_single_materialization_bytes);
+        assert_eq!(mp.max_cached_dense_bytes, policy.max_operator_cache_bytes);
+        assert_eq!(mp.row_chunk_target_bytes, policy.row_chunk_target_bytes);
+    }
+}
