@@ -1297,3 +1297,103 @@ fn data_driven_charts_unlock_higher_latent_dim() {
         "data-driven d=4 must certify ~all rows like the grid d=2; d4={v_dd4} grid2={v_grid2} of {n}"
     );
 }
+
+/// Certified-encode soundness near a SELF-CROSSING manifold, characterizing the
+/// exact contract. The figure-eight atom `m(t) = (cos 2πt, sin 4πt)` self-crosses
+/// at the origin (t=0.25 and t=0.75 → (0,0)), so a target near the crossing has
+/// two competing reconstruction minima. We sweep a box around the crossing and,
+/// for every CERTIFIED row, check two distinct properties:
+///
+///  (A) LOCAL soundness — the certificate's ACTUAL claim: the returned coord is a
+///      genuine stationary point of ½‖x − m(t)‖² (‖∇‖ ≈ 0). This MUST hold; a
+///      failure would mean the certificate is lying about Newton convergence.
+///
+///  (B) GLOBAL soundness is NOT guaranteed: because `nearest_chart` routes by
+///      center-reconstruction distance and the cold cross-check probes the SAME
+///      chart, a target near the crossing can certify into the locally-worse
+///      branch. Measured: the worst certified row reconstructs at err ≈ 0.094
+///      while the global min is ≈ 0.013 (~7x). This is a KNOWN limitation of
+///      single-chart routing, not a violation of the certificate's local claim —
+///      the globally-correct value is owned by the exact multi-start fallback.
+///      The test records the gap is bounded (does not blow up) but does NOT assert
+///      it is zero (it is not).
+#[test]
+fn certified_encode_local_sound_but_global_gap_near_self_crossing() {
+    use ndarray::{Array1, Array2};
+    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(5).unwrap());
+    let n_seed = 64usize;
+    let seed: Array2<f64> = Array2::from_shape_fn((n_seed, 1), |(i, _)| i as f64 / n_seed as f64);
+    let (phi, jet) = evaluator.evaluate(seed.view()).unwrap();
+    let m = phi.ncols();
+    let mut decoder = Array2::<f64>::zeros((m, 2));
+    decoder[[2, 0]] = 1.0; // x = cos 2πt
+    decoder[[3, 1]] = 1.0; // y = sin 4πt
+    let atom = SaeManifoldAtom::new("fig8", SaeAtomBasisKind::Periodic, 1, phi, jet, decoder,
+        Array2::<f64>::eye(m)).unwrap().with_basis_evaluator(evaluator.clone());
+
+    let recon = |t: f64| -> [f64; 2] {
+        let a = 2.0 * std::f64::consts::PI * t;
+        [a.cos(), (2.0 * a).sin()]
+    };
+    // ‖∇_t ½‖x − m(t)‖²‖ = | −(dm/dt)·(x − m(t)) |.
+    let grad = |t: f64, x: &[f64; 2]| -> f64 {
+        let a = 2.0 * std::f64::consts::PI * t;
+        let dm = [-2.0 * std::f64::consts::PI * a.sin(),
+                   4.0 * std::f64::consts::PI * (2.0 * a).cos()];
+        let r = recon(t);
+        -(dm[0] * (x[0] - r[0]) + dm[1] * (x[1] - r[1]))
+    };
+    let global_min_err = |x: &[f64; 2]| -> f64 {
+        let mut best = f64::INFINITY;
+        let g = 20000;
+        for i in 0..g {
+            let t = i as f64 / g as f64;
+            let r = recon(t);
+            let e = (r[0]-x[0]).powi(2) + (r[1]-x[1]).powi(2);
+            if e < best { best = e; }
+        }
+        best.sqrt()
+    };
+
+    let atlas = crate::encode::EncodeAtlas::build(std::slice::from_ref(&atom), &[1.0], 1.6,
+        crate::encode::AtlasConfig { grid_resolution: 64, ridge: 1e-10, newton_steps: 8 }).unwrap();
+
+    let mut certified = 0usize;
+    let mut worst_grad = 0.0_f64;
+    let mut worst_global_excess = 0.0_f64;
+    let steps = 41;
+    for ix in 0..steps {
+        for iy in 0..steps {
+            let x0 = -0.30 + 0.60 * ix as f64 / (steps - 1) as f64;
+            let x1 = -0.30 + 0.60 * iy as f64 / (steps - 1) as f64;
+            let xv = Array1::from(vec![x0, x1]);
+            let (coord, cert) = atlas.certified_encode_row(&atom, 0, xv.view(), 1.0).unwrap();
+            if !cert.certified() { continue; }
+            certified += 1;
+            let t = coord[0];
+            worst_grad = worst_grad.max(grad(t, &[x0, x1]).abs());
+            let r = recon(t);
+            let cert_err = ((r[0]-x0).powi(2) + (r[1]-x1).powi(2)).sqrt();
+            worst_global_excess = worst_global_excess.max(cert_err - global_min_err(&[x0, x1]));
+        }
+    }
+    eprintln!("certified={certified}/{}  worst|grad|={worst_grad:.2e}  worst global excess={worst_global_excess:.4}",
+        steps*steps);
+
+    // (A) LOCAL soundness: every certified coord is a true stationary point.
+    assert!(
+        worst_grad < 1e-4,
+        "certificate's LOCAL claim must hold: certified coords must be stationary \
+         points (‖∇‖≈0); worst |∇| = {worst_grad:.2e}"
+    );
+    // Non-vacuity: the sweep actually certified a substantial set.
+    assert!(certified > steps * steps / 2, "fixture must certify most targets; got {certified}");
+    // (B) The GLOBAL gap is real (single-chart routing can pick the worse basin) —
+    //     documented and bounded, NOT asserted to be zero. If it ever blows up past
+    //     this loose ceiling, the routing has regressed badly.
+    assert!(
+        worst_global_excess > 1e-3 && worst_global_excess < 0.5,
+        "certified encode has a KNOWN bounded global-soundness gap near self-crossings \
+         (single-chart routing); worst excess = {worst_global_excess:.4}"
+    );
+}
