@@ -665,3 +665,139 @@ impl RowMetric {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    // ── RowMetric::euclidean ──────────────────────────────────────────────────
+
+    #[test]
+    fn euclidean_metric_has_correct_dimensions() {
+        let m = RowMetric::euclidean(5, 3).unwrap();
+        assert_eq!(m.n_rows(), 5);
+        assert_eq!(m.p_out(), 3);
+        assert_eq!(m.metric_rank(), 3);
+    }
+
+    #[test]
+    fn euclidean_metric_traces_equal_p() {
+        let p = 4_usize;
+        let m = RowMetric::euclidean(3, p).unwrap();
+        for tr in m.row_traces().iter() {
+            assert!((*tr - p as f64).abs() < 1e-14, "trace {tr} != p={p}");
+        }
+    }
+
+    #[test]
+    fn euclidean_provenance_is_euclidean() {
+        let m = RowMetric::euclidean(1, 2).unwrap();
+        assert_eq!(m.provenance(), MetricProvenance::Euclidean);
+    }
+
+    #[test]
+    fn euclidean_does_not_whiten_likelihood() {
+        let m = RowMetric::euclidean(1, 2).unwrap();
+        assert!(!m.whitens_likelihood());
+    }
+
+    #[test]
+    fn euclidean_does_not_drive_gauge() {
+        let m = RowMetric::euclidean(1, 2).unwrap();
+        assert!(!m.drives_gauge());
+    }
+
+    #[test]
+    fn euclidean_is_not_output_fisher_like() {
+        let m = RowMetric::euclidean(1, 2).unwrap();
+        assert!(!m.is_output_fisher_like());
+    }
+
+    #[test]
+    fn euclidean_solver_floor_is_zero() {
+        let m = RowMetric::euclidean(1, 2).unwrap();
+        assert_eq!(m.solver_floor(), 0.0);
+    }
+
+    #[test]
+    fn euclidean_to_weight_field_is_identity() {
+        let m = RowMetric::euclidean(1, 2).unwrap();
+        assert!(matches!(m.to_weight_field(), WeightField::Identity));
+    }
+
+    #[test]
+    fn euclidean_whiten_residual_is_passthrough() {
+        let m = RowMetric::euclidean(1, 3).unwrap();
+        let r = array![1.0_f64, 2.0, 3.0];
+        let w = m.whiten_residual_row(0, r.view());
+        assert_eq!(w, vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn euclidean_factor_entry_is_identity() {
+        let m = RowMetric::euclidean(1, 3).unwrap();
+        assert_eq!(m.factor_entry(0, 0, 0), 1.0);
+        assert_eq!(m.factor_entry(0, 1, 1), 1.0);
+        assert_eq!(m.factor_entry(0, 2, 2), 1.0);
+        assert_eq!(m.factor_entry(0, 0, 1), 0.0);
+        assert_eq!(m.factor_entry(0, 1, 0), 0.0);
+    }
+
+    #[test]
+    fn euclidean_quad_form_is_squared_norm() {
+        let m = RowMetric::euclidean(1, 3).unwrap();
+        let r = array![1.0_f64, 2.0, 2.0];
+        assert!((m.quad_form(0, r.view()) - 9.0).abs() < 1e-14);
+    }
+
+    // ── MetricProvenance predicates ───────────────────────────────────────────
+
+    #[test]
+    fn output_fisher_drives_gauge_but_not_likelihood() {
+        let u = Arc::new(array![[1.0_f64]]);
+        let m = RowMetric::output_fisher(u, 1, 1).unwrap();
+        assert!(m.drives_gauge());
+        assert!(!m.whitens_likelihood());
+        assert!(m.is_output_fisher_like());
+    }
+
+    #[test]
+    fn whitened_structured_whitens_likelihood_and_drives_gauge() {
+        let u = Arc::new(array![[1.0_f64]]);
+        let m = RowMetric::whitened_structured(u, 1, 1).unwrap();
+        assert!(m.whitens_likelihood());
+        assert!(m.drives_gauge());
+        assert!(!m.is_output_fisher_like());
+    }
+
+    #[test]
+    fn output_fisher_downstream_is_output_fisher_like() {
+        let u = Arc::new(array![[1.0_f64]]);
+        let m = RowMetric::output_fisher_downstream(u, 1, 1).unwrap();
+        assert!(m.is_output_fisher_like());
+        assert!(m.drives_gauge());
+    }
+
+    // ── WeightField::project_jac_row_with_u ──────────────────────────────────
+
+    #[test]
+    fn project_jac_with_identity_returns_jac() {
+        // p=2, rank=2, d=2; U=I_2, J=[[1,2],[3,4]] → M = U^T J = J
+        let u_row = [1.0_f64, 0.0, 0.0, 1.0]; // U[i,k]=u[i*rank+k], I_2
+        let j_row = [1.0_f64, 2.0, 3.0, 4.0]; // J[i,a]=j[i*d+a]
+        let m = WeightField::project_jac_row_with_u(&u_row, &j_row, 2, 2, 2);
+        assert!((m[[0, 0]] - 1.0).abs() < 1e-14);
+        assert!((m[[0, 1]] - 2.0).abs() < 1e-14);
+        assert!((m[[1, 0]] - 3.0).abs() < 1e-14);
+        assert!((m[[1, 1]] - 4.0).abs() < 1e-14);
+    }
+
+    #[test]
+    fn project_jac_with_zeros_returns_zero_matrix() {
+        let u_row = [0.0_f64, 0.0];
+        let j_row = [1.0_f64, 2.0];
+        let m = WeightField::project_jac_row_with_u(&u_row, &j_row, 2, 1, 1);
+        assert_eq!(m[[0, 0]], 0.0);
+    }
+}
