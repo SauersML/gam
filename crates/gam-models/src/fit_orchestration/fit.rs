@@ -249,16 +249,20 @@ pub(crate) fn fit_standard_model(
     // the I-spline warp `q = η + B(η)·β_w` can drive the linear predictor
     // toward link saturation, where the per-cycle data curvature collapses
     // and the joint trust region shrinks faster than the active-set QP can
-    // pin the binding monotonicity rows (gam#872). Aborting the entire fit
-    // there is wrong: a model that *contains* a fittable baseline must never
-    // be less fittable than that baseline. Fall back to the pilot — a valid,
-    // finite-deviance fit no worse than the wiggle model's own limit — rather
-    // than surfacing an `IntegrationError` to the caller. (The separate
-    // divergence failure mode, where the unconditional Jeffreys/Firth
-    // augmentation blew the augmented objective up to ~1e9 on this path, is
+    // pin the binding monotonicity rows (gam#872).
+    //
+    // #1596: when that solve does not converge we now surface the failure
+    // LOUDLY (see the `Err` arm below) instead of silently returning the
+    // no-wiggle baseline. The baseline IS the large-`λ` limit, so falling back
+    // to it produces a finite, valid fit — but a `link(type=flexible(...))`
+    // request answered with a model bit-identical to the fixed base link, with
+    // no signal that the warp never engaged, is a silent contract violation:
+    // the caller cannot tell a genuinely-flat learned link from a non-converged
+    // one. The divergence failure mode (the unconditional Jeffreys/Firth
+    // augmentation blowing the augmented objective up to ~1e9 on this path) is
     // fixed at the root by `BinomialMeanWiggleFamily::joint_jeffreys_term_required
-    // = false`; this fallback only catches the residual trust-region/active-set
-    // non-convergence.)
+    // = false`; the loud `Err` below catches the residual trust-region/active-set
+    // non-convergence that the root fix cannot.
     let solved = match fit_binomial_mean_wiggle_terms_with_selected_basis(
         request.data.view(),
         &result.resolvedspec,
