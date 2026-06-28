@@ -6949,6 +6949,10 @@ pub fn build_single_local_smooth_term(
                 joint_null_rotation: None,
             };
             let mut inner_built = build_single_local_smooth_term(data, &inner_term, workspace)?;
+            // Capture the marginal penalty's null directions BEFORE the penalty
+            // vector is rebuilt below; the sum-to-zero null-space ridge replicates
+            // these `z_k` into the contrast space (mgcv `bs="fs"` double-penalty).
+            let inner_null_eigenvectors = inner_built.null_eigenvectors.clone();
             let base = inner_built
                 .design
                 .try_to_dense_by_chunks("sum-to-zero factor smooth")
@@ -6994,7 +6998,13 @@ pub fn build_single_local_smooth_term(
                     inner_built.penalties.len()
                 );
             }
-            for (penalty_pos, s_inner) in inner_built.penalties.iter().enumerate() {
+            // Replicate each marginal penalty into the sum-to-zero contrast
+            // space. With `L-1` free deviation blocks and the reference level
+            // `d_L = -Σ_{k<L} d_k`, the marginal penalty summed over ALL `L`
+            // levels, `Σ_{k=1}^{L} d_kᵀ S d_k`, expands to the `(I + 11ᵀ) ⊗ S`
+            // contrast form (factor 2 on the diagonal blocks, 1 off-diagonal) —
+            // the exact penalty the zero-sum reparameterization induces.
+            let stz_contrast_penalty = |s_inner: &Array2<f64>| -> Array2<f64> {
                 let mut s_big = Array2::<f64>::zeros((p * l_minus_one, p * l_minus_one));
                 for a in 0..l_minus_one {
                     for b in 0..l_minus_one {
@@ -7003,20 +7013,81 @@ pub fn build_single_local_smooth_term(
                         block.assign(&s_inner.mapv(|v| v * factor));
                     }
                 }
-                let (s_big, factor_smooth_scale) = normalize_penalty_in_constrained_space(&s_big);
+                s_big
+            };
+            // One nullspace-dim entry per emitted penalty (must stay parallel to
+            // `penalties`); the wiggliness blocks inherit the marginal nullity
+            // scaled by `l_minus_one`, the null ridges record their own nullity.
+            let mut nullspaces = Vec::<usize>::with_capacity(penalties.capacity());
+            for (penalty_pos, s_inner) in inner_built.penalties.iter().enumerate() {
+                let (s_big, factor_smooth_scale) =
+                    normalize_penalty_in_constrained_space(&stz_contrast_penalty(s_inner));
                 let info_idx = active_penalty_indices[penalty_pos];
                 inner_built.penaltyinfo[info_idx].normalization_scale *= factor_smooth_scale;
                 penalties.push(s_big);
+                nullspaces.push(
+                    inner_built
+                        .nullspaces
+                        .get(penalty_pos)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_mul(l_minus_one),
+                );
+            }
+
+            // Null-space ridge, mirroring the `bs="fs"` double-penalty
+            // construction (#1605, same defect class as #700/#712/#713). The
+            // marginal wiggliness penalty `S` shapes curvature but leaves the
+            // {const, linear} null space of each deviation curve COMPLETELY
+            // unpenalized. With that null space free, the single combined
+            // wiggliness smoothing parameter cannot separate the per-group
+            // intercept/slope variance from the curvature variance, so REML
+            // parks the wiggliness `λ` high — over-smoothing (under-fitting) the
+            // deviation blocks even when the truth lives in their span (the `sz`
+            // recovery gap vs the `fs` superset). mgcv's `bs="fs"` fixes the
+            // analogous gap by penalizing each null-space dimension SEPARATELY
+            // under its own shared variance; we mirror that here while keeping
+            // the zero-sum reparameterization, so the constraint (and the
+            // identifiability of `sz` vs `fs`) is preserved. For each orthonormal
+            // null direction `z_k` of the marginal penalty, add the rank-1
+            // marginal penalty `z_k z_kᵀ` mapped into the SAME `(I + 11ᵀ)`
+            // sum-to-zero contrast space, each carrying its own `λ`.
+            if let Some(Some(z)) = inner_null_eigenvectors.first()
+                && z.nrows() == p
+            {
+                for k in 0..z.ncols() {
+                    let zk = z.column(k);
+                    let mut p_k = Array2::<f64>::zeros((p, p));
+                    for a in 0..p {
+                        for b in 0..p {
+                            p_k[[a, b]] = zk[a] * zk[b];
+                        }
+                    }
+                    let (s_null, null_scale) =
+                        normalize_penalty_in_constrained_space(&stz_contrast_penalty(&p_k));
+                    let null_block = crate::basis::analyze_penalty_block_with_op(&s_null, None)?;
+                    if null_block.rank > 0 {
+                        let original_index = penalties.len();
+                        penalties.push(null_block.sym_penalty);
+                        nullspaces.push(null_block.nullity);
+                        inner_built.penaltyinfo.push(PenaltyInfo {
+                            source: PenaltySource::Primary,
+                            original_index,
+                            active: true,
+                            effective_rank: null_block.rank,
+                            dropped_reason: None,
+                            nullspace_dim_hint: null_block.nullity,
+                            normalization_scale: null_scale,
+                            kronecker_factors: None,
+                        });
+                    }
+                }
             }
             inner_built.dim = p * l_minus_one;
             inner_built.design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(dense));
             inner_built.penalties = penalties;
             inner_built.ops = vec![None; inner_built.penalties.len()];
-            inner_built.nullspaces = inner_built
-                .nullspaces
-                .iter()
-                .map(|ns| ns.saturating_mul(l_minus_one))
-                .collect();
+            inner_built.nullspaces = nullspaces;
             // Invariant: `null_eigenvectors[k]` must mirror `penalties[k]`'s
             // spectral null space. We just rebuilt `inner_built.penalties` from
             // Kronecker-like `S_big` blocks, so the previously-plumbed

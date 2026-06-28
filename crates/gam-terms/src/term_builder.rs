@@ -5159,6 +5159,166 @@ mod tests {
         );
     }
 
+    /// A dataset with a genuinely continuous covariate `x` (many distinct
+    /// values) and a `L`-level grouping factor `g`, suitable for building a
+    /// real factor-smooth marginal with a non-trivial {const, linear} null
+    /// space. `y` is unused by the structural penalty checks below.
+    fn continuous_x_factor_dataset(n: usize, n_groups: usize) -> Dataset {
+        let rows = (0..n)
+            .map(|i| {
+                let x = i as f64 / (n as f64 - 1.0);
+                let g = (i % n_groups) as f64;
+                vec![x + g, x, g]
+            })
+            .collect::<Vec<_>>();
+        let levels: Vec<String> = (0..n_groups).map(|k| format!("g{k}")).collect();
+        Dataset {
+            headers: vec!["y".into(), "x".into(), "g".into()],
+            values: Array2::from_shape_vec(
+                (rows.len(), 3),
+                rows.into_iter().flat_map(|row| row.into_iter()).collect(),
+            )
+            .expect("rectangular continuous-x factor data"),
+            schema: DataSchema {
+                columns: vec![
+                    SchemaColumn {
+                        name: "y".into(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "x".into(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "g".into(),
+                        kind: ColumnKindTag::Categorical,
+                        levels,
+                    },
+                ],
+            },
+            column_kinds: vec![
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Categorical,
+            ],
+        }
+    }
+
+    fn factor_smooth_spec_for(formula: &str, ds: &Dataset) -> FactorSmoothSpec {
+        let col_map = ds.column_map();
+        let parsed = parse_formula(formula).expect("parse factor smooth formula");
+        let mut notes = Vec::new();
+        let terms = build_termspec(
+            &parsed.terms,
+            ds,
+            &col_map,
+            &mut notes,
+            &gam_runtime::resource::ResourcePolicy::default_library(),
+        )
+        .expect("build factor smooth term");
+        let SmoothBasisSpec::FactorSmooth { spec } = &terms.smooth_terms[0].basis else {
+            panic!("expected FactorSmooth basis for `{formula}`");
+        };
+        spec.clone()
+    }
+
+    /// #1605: the sum-to-zero factor smooth `s(x, g, bs="sz")` under-fit data
+    /// drawn from its own model class because its deviation blocks carried ONLY
+    /// the marginal wiggliness penalty — the {const, linear} null space of every
+    /// deviation curve was left completely unpenalized, so the single combined
+    /// wiggliness λ could not separate per-group intercept/slope variance from
+    /// curvature variance and REML parked it over-smoothed (same defect class as
+    /// the closed #700, more severe). mgcv's `bs="fs"` sibling avoids the gap by
+    /// adding a SEPARATE per-null-dimension ridge (one λ each), the
+    /// double-penalty `I_L ⊗ S_j` structure. The fix gives `sz` the same
+    /// null-space-ridge structure, mapped into the zero-sum CONTRAST space so the
+    /// constraint (and `sz`'s distinctness from `fs`) is preserved.
+    ///
+    /// This pins the structural defect: after the fix the `sz` deviation build
+    /// must carry MORE than just its wiggliness penalty(s) — exactly one extra
+    /// null-space-ridge penalty per marginal null direction, matching the count
+    /// that `fs` carries — while keeping the narrower `(L-1)·p` zero-sum design
+    /// (NOT the `L·p` full-rank `fs` design). Before the fix `sz` carried only
+    /// the wiggliness penalties and this fails.
+    #[test]
+    fn sz_factor_smooth_carries_null_space_ridge_like_fs() {
+        let ds = continuous_x_factor_dataset(180, 4);
+        let mut workspace = crate::basis::BasisWorkspace::new();
+
+        let sz_spec = factor_smooth_spec_for("y ~ s(x, g, bs=sz, k=8)", &ds);
+        let sz_built = crate::smooth::build_factor_smooth(
+            ds.values.view(),
+            &sz_spec,
+            "sz_term",
+            &mut workspace,
+        )
+        .expect("build sz factor smooth");
+
+        let fs_spec = factor_smooth_spec_for("y ~ s(x, g, bs=fs, k=8)", &ds);
+        let fs_built = crate::smooth::build_factor_smooth(
+            ds.values.view(),
+            &fs_spec,
+            "fs_term",
+            &mut workspace,
+        )
+        .expect("build fs factor smooth");
+
+        // The marginal wiggliness penalty count (one per marginal penalty) is the
+        // SAME for sz and fs; the difference of interest is the null-space ridges.
+        // `fs` adds one rank-1 ridge per marginal null direction. After the fix
+        // `sz` must add the SAME number of null-space ridges, so its total
+        // penalty count must equal `fs`'s. Before the fix `sz` had strictly fewer
+        // penalties (only the wiggliness penalties), so this assertion fails.
+        let n_levels = sz_spec
+            .group_frozen_levels
+            .as_ref()
+            .map(|l| l.len())
+            .unwrap_or(4);
+        assert!(n_levels >= 3, "test needs >=3 groups, got {n_levels}");
+
+        assert_eq!(
+            sz_built.penalties.len(),
+            fs_built.penalties.len(),
+            "sz must carry the same number of penalties as fs (wiggliness + one \
+             null-space ridge per marginal null direction); sz had {} (only the \
+             wiggliness penalties => null space unpenalized => over-smoothed), fs \
+             had {}",
+            sz_built.penalties.len(),
+            fs_built.penalties.len(),
+        );
+
+        // There must be at least one extra null-space ridge beyond the wiggliness
+        // penalty (a cubic-regression marginal has a 2-D {const, linear} null
+        // space). This is the structural property that lets REML keep the
+        // deviation curvature un-over-smoothed.
+        assert!(
+            sz_built.penalties.len() >= 2,
+            "sz deviation block carries no null-space ridge (penalties={}); the \
+             null space is unpenalized and REML over-smooths the deviations",
+            sz_built.penalties.len(),
+        );
+
+        // The zero-sum constraint must be preserved: the sz design must stay the
+        // NARROWER `(L-1)·p` contrast design, strictly narrower than the fs
+        // full-rank `L·p` design. This guards against "fixing" sz by making it
+        // identical to fs (which would break identifiability / sum-to-zero).
+        assert!(
+            sz_built.dim < fs_built.dim,
+            "sz design width {} must be strictly less than fs width {} \
+             (zero-sum contrast drops one level block)",
+            sz_built.dim,
+            fs_built.dim,
+        );
+
+        // Every penalty/metadata vector must stay parallel (length invariant the
+        // downstream REML assembly relies on).
+        assert_eq!(sz_built.penalties.len(), sz_built.nullspaces.len());
+        assert_eq!(sz_built.penalties.len(), sz_built.penaltyinfo.len());
+        assert_eq!(sz_built.penalties.len(), sz_built.null_eigenvectors.len());
+    }
+
     /// #1457: `y ~ s(x, by=g) + g` with a BARE categorical `g` must NOT lower to
     /// two `g` design blocks. The bare `+ g` is auto-promoted to a single
     /// penalized random-effect block owning the factor's full level offsets; the

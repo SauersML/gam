@@ -1127,3 +1127,212 @@ pub fn materialize<'a>(
         }
     }
 }
+
+#[cfg(test)]
+mod sz_factor_smooth_recovery_tests {
+    // `super::*` brings in `Dataset` (= gam_data::EncodedDataset), `FitConfig`,
+    // `FitResult`, `StandardFitResult`, and `fit_from_formula`.
+    use super::*;
+
+    const NOISE_SD: f64 = 0.20;
+    const N: usize = 4000;
+    const N_GROUPS: usize = 4;
+
+    /// A simple deterministic LCG so the dataset is reproducible without pulling
+    /// an RNG dependency into the test.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_u64(&mut self) -> u64 {
+            // Numerical Recipes LCG constants.
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0
+        }
+        /// Uniform in [0, 1).
+        fn unif(&mut self) -> f64 {
+            (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+        }
+        /// Standard normal via Box–Muller (one of the pair).
+        fn normal(&mut self) -> f64 {
+            let u1 = (self.unif()).max(1e-12);
+            let u2 = self.unif();
+            (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+        }
+    }
+
+    /// Data drawn from EXACTLY the `sz` model class: a shared smooth `f0(x)` plus
+    /// zero-sum per-group deviations `d_g(x)` (phase-shifted sinusoids whose
+    /// cross-group mean is removed at every `x`), plus observation noise. This
+    /// mirrors the (blocked) Python bug-hunt test `tests/bug_hunt_sz_factor_
+    /// smooth_underfits_own_model_class_test.py`.
+    ///
+    /// Written to a CSV and loaded through the real `load_dataset_projected`
+    /// inferer so the grouping column `g` (string levels) is encoded as a genuine
+    /// categorical exactly as production does — hand-built `EncodedDataset`s do
+    /// not carry the categorical level map the factor-smooth level resolver needs.
+    fn sz_class_dataset() -> (Dataset, tempfile::TempDir) {
+        let mut rng = Lcg(0x5326_2026_0628_1605);
+        let phases: Vec<f64> = (0..N_GROUPS)
+            .map(|k| 1.2 * k as f64 / (N_GROUPS as f64 - 1.0))
+            .collect();
+        let deviations = |xi: f64| -> Vec<f64> {
+            let vals: Vec<f64> = phases
+                .iter()
+                .map(|p| 0.6 * (std::f64::consts::TAU * xi + std::f64::consts::TAU * p).sin())
+                .collect();
+            let mean = vals.iter().sum::<f64>() / vals.len() as f64;
+            vals.iter().map(|v| v - mean).collect()
+        };
+
+        let mut csv = String::from("y,x,g\n");
+        for _ in 0..N {
+            let x = rng.unif();
+            // Use the HIGH bits (via `unif`) for the group draw — an LCG's low
+            // bits have a tiny period and would collapse `% N_GROUPS` to a near
+            // constant.
+            let g = ((rng.unif() * N_GROUPS as f64) as usize).min(N_GROUPS - 1);
+            let f0 = (std::f64::consts::TAU * x).sin();
+            let mu = f0 + deviations(x)[g];
+            let y = mu + NOISE_SD * rng.normal();
+            csv.push_str(&format!("{y},{x},g{g}\n"));
+        }
+        let td = tempfile::tempdir().expect("tempdir");
+        let path = td.path().join("sz_class.csv");
+        std::fs::write(&path, csv).expect("write sz-class csv");
+        // Force `g` into a categorical role exactly as the formula intends so the
+        // factor-smooth level resolver sees all `N_GROUPS` distinct levels.
+        let mut roles = std::collections::HashSet::new();
+        roles.insert("g");
+        let data = gam_data::load_dataset_projected_with_categorical_roles(
+            &path,
+            &["y".to_string(), "x".to_string(), "g".to_string()],
+            &roles,
+        )
+        .expect("load sz-class dataset");
+        (data, td)
+    }
+
+    fn gaussian_config() -> FitConfig {
+        FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() }
+    }
+
+    /// In-sample residual sd of a fitted standard GAM: `sd(y − Xβ̂)`.
+    fn residual_sd(fit: &StandardFitResult, data: &Dataset) -> f64 {
+        let beta = &fit.fit.beta;
+        let design = &fit.design.design;
+        let n = design.nrows();
+        assert_eq!(design.ncols(), beta.len(), "design/beta width mismatch");
+        let mut fitted = vec![0.0f64; n];
+        // `try_row_chunk` materializes contiguous row blocks of whatever design
+        // storage the fit used (dense or block-lazy) — robust to the storage kind.
+        const CHUNK: usize = 512;
+        let mut start = 0usize;
+        while start < n {
+            let end = (start + CHUNK).min(n);
+            let block = design
+                .try_row_chunk(start..end)
+                .expect("materialize design row chunk");
+            for (r, row) in block.rows().into_iter().enumerate() {
+                let mut acc = 0.0;
+                for (c, &xv) in row.iter().enumerate() {
+                    acc += xv * beta[c];
+                }
+                fitted[start + r] = acc;
+            }
+            start = end;
+        }
+        let y = data.values.column(0);
+        let resid: Vec<f64> = y.iter().zip(fitted.iter()).map(|(&yi, &fi)| yi - fi).collect();
+        let mean = resid.iter().sum::<f64>() / resid.len() as f64;
+        let var = resid.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / resid.len() as f64;
+        var.sqrt()
+    }
+
+    fn fit_standard(formula: &str, data: &Dataset) -> StandardFitResult {
+        match fit_from_formula(formula, data, &gaussian_config())
+            .unwrap_or_else(|e| panic!("fit `{formula}` failed: {e:?}"))
+        {
+            FitResult::Standard(r) => r,
+            other => panic!("expected Standard fit for `{formula}`, got a different variant: {}",
+                std::any::type_name_of_val(&other)),
+        }
+    }
+
+    /// #1605 (gold standard, end-to-end REML fit): the sum-to-zero factor smooth
+    /// `s(x) + s(g, x, bs="sz")` must RECOVER data drawn from its own model class
+    /// to the observation-noise floor, exactly as the strictly-more-general
+    /// `s(x, g, bs="fs")` superset provably does.
+    ///
+    /// Before the fix, the `sz` deviation blocks left their {const, linear} null
+    /// space unpenalized, so REML could not separate per-group intercept/slope
+    /// variance from curvature variance and parked the wiggliness λ over-smoothed
+    /// — leaving ≈2.1× the noise floor as systematic residual (resid sd ≈ 0.43 vs
+    /// the 0.20 floor) while `fs` reached ≈0.20. The fix gives `sz` the same
+    /// per-null-dimension ridge structure as `fs`, mapped into the zero-sum
+    /// contrast space, so `sz` now recovers its own class to the floor.
+    ///
+    /// STATUS (#1605, partial): `#[ignore]`d — it still FAILS. This is the
+    /// honest, end-to-end reproduction of the recovery gap and the live
+    /// acceptance bar for the remaining work. The committed marginal fix
+    /// (baef17e: cr → curvature-capable B-spline) and the null-space-ridge
+    /// structural fix in this change are both necessary mgcv-faithful
+    /// corrections, but neither closes this gap, because the dominant cause is
+    /// elsewhere and was localized here:
+    ///
+    ///   In `y ~ s(x) + s(g, x, bs='sz')`, REML rails the SHARED `s(x)`
+    ///   wiggliness `λ` to ~2.9e3 (block-mapped to `s(x)`, confirmed via
+    ///   `penaltyinfo[i].termname`), flattening `s(x)` toward its linear null
+    ///   space. The `sz` deviation blocks are NOT over-smoothed (their `λ`s are
+    ///   ~1e-2, edf ~13); they partially absorb the shared mean because each
+    ///   level-gated deviation column has a sub-tolerance cross-residual with
+    ///   `s(x)`'s full-support B-spline span, so the `s(x)` owner-residualization
+    ///   (`OVERLAP_REL_RESIDUAL_TOL`) never fires for the block-diagonal `sz`
+    ///   design. With `s(x)` flattened, the common `sin(2πx)` mean is lost and
+    ///   the zero-sum deviations cannot restore it → ~2x the noise floor in the
+    ///   residual. (`fs` ALONE carries its own mean and needs no shared `s(x)`,
+    ///   so it reaches the floor; `fs` WITH a redundant `+ s(x)` rails the same
+    ///   way — this is the `s(x)`+factor-smooth overlap, not `sz`-specific.)
+    ///
+    /// The correct fix is in the #978 ownership/overlap residualization (make
+    /// the collective `sz` deviation design orthogonal to the shared `s(x)` span
+    /// without collapsing the per-group #1276 level-gated deviation to zero) —
+    /// deeper, higher-risk shared machinery left for follow-up. Un-`ignore` when
+    /// addressed; it must pass unedited.
+    #[ignore = "#1605 recovery gap: s(x) over-smoothing in the s(x)+factor-smooth overlap not yet fixed (see doc comment)"]
+    #[test]
+    fn sz_factor_smooth_recovers_its_own_model_class_end_to_end() {
+        let (data, _td) = sz_class_dataset();
+
+        // Control: bs="fs", a strict superset of the sz span, must reach the
+        // noise floor — proves the data is well-posed and pins the floor.
+        let fs_fit = fit_standard("y ~ s(x, g, bs='fs')", &data);
+        let fs_resid = residual_sd(&fs_fit, &data);
+        assert!(
+            fs_resid < 1.2 * NOISE_SD,
+            "control bs='fs' did not reach the noise floor: resid_sd={fs_resid:.4} \
+             vs noise_sd={NOISE_SD} (data/floor sanity check)",
+        );
+
+        // The documented sz idiom on data drawn from the sz model class.
+        let sz_fit = fit_standard("y ~ s(x) + s(g, x, bs='sz')", &data);
+        let sz_resid = residual_sd(&sz_fit, &data);
+
+        // A smoother whose span contains the truth, fit at large n, must explain
+        // the systematic structure and leave ~only observation noise.
+        assert!(
+            sz_resid < 1.4 * NOISE_SD,
+            "bs='sz' under-fits its own model class: resid_sd={sz_resid:.4} \
+             ({:.2}x the noise floor {NOISE_SD}); the bs='fs' superset reached \
+             {fs_resid:.4}. The sz fit leaves systematic signal in the residual.",
+            sz_resid / NOISE_SD,
+        );
+
+        // Comparative guard: sz must not be dramatically worse than the fs
+        // superset that recovers the same data.
+        assert!(
+            sz_resid < 1.5 * fs_resid,
+            "bs='sz' residual {sz_resid:.4} is {:.2}x the bs='fs' residual \
+             {fs_resid:.4} on identical sz-class data",
+            sz_resid / fs_resid,
+        );
+    }
+}
