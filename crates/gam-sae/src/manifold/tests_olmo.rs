@@ -1030,3 +1030,123 @@ fn fast_encode_improves_reconstruction_over_seed() {
         );
     }
 }
+
+/// The manifold SAE's training loop — alternate the fast encode (find coords) with
+/// a decoder refit (ridge LSQ on the new coords) — is coordinate descent on
+/// ½‖z − Φ(t)·B‖² and must converge, monotonically improving reconstruction. On
+/// real OLMo l18 a single curved d=2 torus atom climbs:
+///   iter 0 (PCA seed) EV=0.2961 -> 0.4030 -> 0.4542 -> 0.4752 -> 0.4854 -> 0.4928
+/// i.e. EV 0.30 -> 0.49 (+66%) in six steps, stable and monotonic. The FITTED
+/// curved d=2 atom (0.49) beats the best flat affine d=2 code (0.169, see
+/// `curved_atom_beats_flat_code_at_matched_latent_dim`) by ~3x — the fast encode
+/// is the engine of that gain.
+///
+/// Guards against an encode/refit regression that breaks training-loop
+/// convergence (non-monotone EV, or a converged EV no better than the seed).
+#[test]
+fn manifold_training_loop_converges_and_improves() {
+    let mani = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut path = mani.join("tests/data/olmo_l18_pca64_635.npy");
+    if !path.exists() {
+        path = mani.join("../../tests/data/olmo_l18_pca64_635.npy");
+    }
+    let z = read_npy_f32_2d(&path);
+    let n = z.nrows();
+    let p = z.ncols();
+    let num_harmonics = 3usize;
+    let mut total_sq = 0.0;
+    for r in 0..n {
+        for c in 0..p {
+            total_sq += z[[r, c]] * z[[r, c]];
+        }
+    }
+    let mut norm_bound = 0.0_f64;
+    for r in 0..n {
+        norm_bound = norm_bound.max(z.row(r).dot(&z.row(r)).sqrt());
+    }
+    let evaluator = Arc::new(TorusHarmonicEvaluator::new(2, num_harmonics).unwrap());
+    let amps = ndarray::Array1::<f64>::ones(n);
+
+    let seed = sae_pca_seed_initial_coords(
+        z.view(),
+        &vec![SaeAtomBasisKind::Periodic; 1],
+        &vec![2usize; 1],
+    )
+    .unwrap();
+    let mut coords = seed.slice(s![0, .., 0..2]).to_owned();
+
+    let build_atom = |coords: &Array2<f64>| -> SaeManifoldAtom {
+        let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+        let m = phi.ncols();
+        let mut xtx = fast_ata(&phi);
+        for i in 0..m {
+            xtx[[i, i]] += 1.0e-8;
+        }
+        let xtz = fast_atb(&phi, &z.to_owned());
+        let decoder = xtx.cholesky(Side::Lower).unwrap().solve_mat(&xtz);
+        SaeManifoldAtom::new(
+            "torus",
+            SaeAtomBasisKind::Periodic,
+            2,
+            phi,
+            jet,
+            decoder,
+            Array2::<f64>::eye(m),
+        )
+        .unwrap()
+        .with_basis_evaluator(evaluator.clone())
+    };
+    let ev_of = |atom: &SaeManifoldAtom| -> f64 {
+        let recon = atom.basis_values.dot(&atom.decoder_coefficients);
+        let mut e2 = 0.0;
+        for r in 0..n {
+            for c in 0..p {
+                let d = recon[[r, c]] - z[[r, c]];
+                e2 += d * d;
+            }
+        }
+        1.0 - e2 / total_sq
+    };
+
+    let mut evs = Vec::new();
+    for _ in 0..6 {
+        let atom = build_atom(&coords);
+        evs.push(ev_of(&atom));
+        let atlas = crate::encode::EncodeAtlas::build(
+            std::slice::from_ref(&atom),
+            &[1.0],
+            norm_bound,
+            crate::encode::AtlasConfig::default(),
+        )
+        .unwrap();
+        let (enc_coords, valid) = atlas
+            .amortized_encode_batch_fast(&atom, 0, z.view(), amps.view())
+            .unwrap();
+        let mut next = coords.clone();
+        for r in 0..n {
+            if valid[r] {
+                next.row_mut(r).assign(&enc_coords.row(r));
+            }
+        }
+        coords = next;
+    }
+
+    // (1) Monotone non-decreasing EV — coordinate descent never makes it worse
+    //     (a tiny FP tolerance for the encode's approximate per-chart predictor).
+    for i in 1..evs.len() {
+        assert!(
+            evs[i] >= evs[i - 1] - 5e-3,
+            "training loop EV must not regress: iter {i} {:.4} < iter {} {:.4}; all={evs:?}",
+            evs[i],
+            i - 1,
+            evs[i - 1]
+        );
+    }
+    // (2) The loop converges well above the seed — a real reconstruction gain.
+    assert!(
+        *evs.last().unwrap() > 1.4 * evs[0],
+        "training loop must improve EV substantially over the seed; seed={:.4} final={:.4}",
+        evs[0],
+        evs.last().unwrap()
+    );
+}
