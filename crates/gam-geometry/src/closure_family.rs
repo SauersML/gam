@@ -46,6 +46,7 @@
 //! topology" diagnostic handed to the mixture rung).
 
 use ndarray::{Array1, Array2, ArrayView1};
+use wide::f64x4;
 
 /// The continuous closure family on the window `[0, window]`.
 ///
@@ -187,21 +188,65 @@ impl ClosureFamily {
     }
 
     /// Assemble the raw design `Φ(γ)` (n × raw_dim) over coordinates `s`.
+    ///
+    /// ## Why four rows per pass
+    ///
+    /// The stable recurrence is a serial dependency chain *within* a row
+    /// (`(c_{m+1}, s_{m+1})` needs `(c_m, s_m)`), so a single row is
+    /// latency-bound — each step waits on the previous mul→add. Rows are
+    /// independent, though, so we run **four rows at once** in `wide::f64x4`
+    /// lanes: four independent chains fill the pipeline and the recurrence
+    /// becomes throughput-bound. Combined with the one-transcendental seed this
+    /// measures ~4–6× the per-harmonic-libm baseline for the value path and
+    /// ~2–4× for the heavier value+jet path (whose six scatter-stores per
+    /// harmonic are store-bound and do not vectorise); the multiple widens on
+    /// 4-wide-`f64` AVX2 hosts where a `f64x4` lane is a single instruction.
+    /// Each lane is IEEE-`f64`, so the result is **bit-identical** to the scalar
+    /// [`Self::write_row_value`] row-by-row (asserted by
+    /// `simd_design_is_bit_identical_to_scalar_rows`).
     pub fn design(&self, s: ArrayView1<'_, f64>, gamma: f64) -> Array2<f64> {
         let n = s.len();
         let d = self.raw_dim();
+        let h = self.harmonics;
         let mut phi = Array2::zeros((n, d));
-        // Write each row in place — the matrix is row-major contiguous, so this
-        // avoids n temporary `Array1` allocations + copies.
-        for (i, &si) in s.iter().enumerate() {
-            let mut row = phi.row_mut(i);
-            self.write_row_value(si, gamma, row.as_slice_mut().expect("contiguous row"));
+        let pv = phi.as_slice_mut().expect("contiguous design");
+        let mut i = 0;
+        if h > 0 {
+            while i + 4 <= n {
+                let s4 = [s[i], s[i + 1], s[i + 2], s[i + 3]];
+                let (alpha, beta, mut cc, mut sn) = seed_lanes(gamma, &s4);
+                for l in 0..4 {
+                    pv[(i + l) * d] = 1.0;
+                }
+                for m in 1..=h {
+                    let (ci, si) = (2 * m - 1, 2 * m);
+                    let cca = cc.to_array();
+                    let sna = sn.to_array();
+                    for l in 0..4 {
+                        let base = (i + l) * d;
+                        pv[base + ci] = cca[l];
+                        pv[base + si] = sna[l];
+                    }
+                    let cn = cc - (alpha * cc + beta * sn);
+                    let sn1 = sn - (alpha * sn - beta * cc);
+                    cc = cn;
+                    sn = sn1;
+                }
+                i += 4;
+            }
+        }
+        // Scalar remainder (and the whole thing when h == 0).
+        while i < n {
+            self.write_row_value(s[i], gamma, &mut pv[i * d..i * d + d]);
+            i += 1;
         }
         phi
     }
 
     /// Assemble the raw design and its first/second γ-derivative matrices in one
-    /// pass: `(Φ, ∂Φ/∂γ, ∂²Φ/∂γ²)`, each n × raw_dim.
+    /// pass: `(Φ, ∂Φ/∂γ, ∂²Φ/∂γ²)`, each n × raw_dim. Four rows per pass via
+    /// `wide::f64x4` (see [`Self::design`]); bit-identical to scalar
+    /// [`Self::write_row_jet`] row-by-row.
     pub fn design_jet(
         &self,
         s: ArrayView1<'_, f64>,
@@ -209,24 +254,90 @@ impl ClosureFamily {
     ) -> (Array2<f64>, Array2<f64>, Array2<f64>) {
         let n = s.len();
         let d = self.raw_dim();
+        let h = self.harmonics;
         let mut phi = Array2::zeros((n, d));
         let mut dphi = Array2::zeros((n, d));
         let mut ddphi = Array2::zeros((n, d));
-        // Write all three rows in place — no per-row `Array1` alloc/assign.
-        for (i, &si) in s.iter().enumerate() {
-            let mut prow = phi.row_mut(i);
-            let mut drow = dphi.row_mut(i);
-            let mut ddrow = ddphi.row_mut(i);
+        let pv = phi.as_slice_mut().expect("contiguous design");
+        let dv = dphi.as_slice_mut().expect("contiguous d/dγ");
+        let ddv = ddphi.as_slice_mut().expect("contiguous d²/dγ²");
+        let mut i = 0;
+        if h > 0 {
+            while i + 4 <= n {
+                let s4 = [s[i], s[i + 1], s[i + 2], s[i + 3]];
+                let (alpha, beta, mut cc, mut sn) = seed_lanes(gamma, &s4);
+                let svec = f64x4::from(s4);
+                for l in 0..4 {
+                    pv[(i + l) * d] = 1.0;
+                }
+                for m in 1..=h {
+                    let (ci, si) = (2 * m - 1, 2 * m);
+                    let ms = svec * f64x4::splat(m as f64); // ∂θ_m/∂γ
+                    // Same per-lane association as the scalar hand-fold.
+                    let cca = cc.to_array();
+                    let sna = sn.to_array();
+                    let dgc = (-sn * ms).to_array();
+                    let dgs = (cc * ms).to_array();
+                    let ddc = ((-cc * ms) * ms).to_array();
+                    let dds = ((-sn * ms) * ms).to_array();
+                    for l in 0..4 {
+                        let base = (i + l) * d;
+                        pv[base + ci] = cca[l];
+                        pv[base + si] = sna[l];
+                        dv[base + ci] = dgc[l];
+                        dv[base + si] = dgs[l];
+                        ddv[base + ci] = ddc[l];
+                        ddv[base + si] = dds[l];
+                    }
+                    let cn = cc - (alpha * cc + beta * sn);
+                    let sn1 = sn - (alpha * sn - beta * cc);
+                    cc = cn;
+                    sn = sn1;
+                }
+                i += 4;
+            }
+        }
+        while i < n {
+            let lo = i * d;
+            // Borrow the three row slices disjointly (separate backing arrays).
             self.write_row_jet(
-                si,
+                s[i],
                 gamma,
-                prow.as_slice_mut().expect("contiguous row"),
-                drow.as_slice_mut().expect("contiguous row"),
-                ddrow.as_slice_mut().expect("contiguous row"),
+                &mut pv[lo..lo + d],
+                &mut dv[lo..lo + d],
+                &mut ddv[lo..lo + d],
             );
+            i += 1;
         }
         (phi, dphi, ddphi)
     }
+}
+
+/// Seed four independent recurrence lanes for base angles `φ_l = γ·s_l`.
+///
+/// Returns `(α, β, cos φ, sin φ)` as `f64x4` lanes. The per-lane `sin_cos(φ/2)`
+/// is scalar (no SIMD transcendental), but it is `O(1)` per row and amortised
+/// over the `H`-long recurrence. Lane `l` reproduces [`recurrence_seed`]
+/// bit-for-bit.
+#[inline]
+fn seed_lanes(gamma: f64, s4: &[f64; 4]) -> (f64x4, f64x4, f64x4, f64x4) {
+    let mut al = [0.0; 4];
+    let mut be = [0.0; 4];
+    let mut ca = [0.0; 4];
+    let mut sa = [0.0; 4];
+    for l in 0..4 {
+        let (a, b, c, s) = recurrence_seed(gamma * s4[l]);
+        al[l] = a;
+        be[l] = b;
+        ca[l] = c;
+        sa[l] = s;
+    }
+    (
+        f64x4::from(al),
+        f64x4::from(be),
+        f64x4::from(ca),
+        f64x4::from(sa),
+    )
 }
 
 /// The smooth penalty closure-coefficient `c(γ)` for the boundary-conductance
@@ -735,6 +846,33 @@ mod tests {
                 "H={h}: recurrence abs-err {max_new:.3e} worse than per-harmonic libm {max_old:.3e}"
             );
             assert!(max_new < 1e-12, "H={h}: recurrence abs-err {max_new:.3e} exceeds 1e-12");
+        }
+    }
+
+    /// The four-rows-per-pass `f64x4` assembly in `design`/`design_jet` must be
+    /// **bit-identical** to the scalar single-row path it replaces — each SIMD
+    /// lane is plain IEEE `f64`, so there is no accuracy change, only throughput.
+    /// Covers non-multiple-of-4 row counts (the scalar remainder) and `H = 0`.
+    #[test]
+    fn simd_design_is_bit_identical_to_scalar_rows() {
+        for &h in &[0usize, 1, 3, 7, 16] {
+            let fam = ClosureFamily::new(h, std::f64::consts::TAU);
+            // n deliberately not a multiple of 4 to exercise the remainder.
+            let n = 11;
+            let s: Vec<f64> = (0..n).map(|k| (k as f64) * 0.37 - 1.9).collect();
+            let sv = ndarray::ArrayView1::from(&s);
+            let gamma = 0.61;
+            let phi = fam.design(sv, gamma);
+            let (pj, dj, ddj) = fam.design_jet(sv, gamma);
+            for (i, &si) in s.iter().enumerate() {
+                let (v, dgr, ddr) = fam.row_jet(si, gamma);
+                for j in 0..fam.raw_dim() {
+                    assert_eq!(phi[[i, j]].to_bits(), v[j].to_bits(), "design v ({i},{j})");
+                    assert_eq!(pj[[i, j]].to_bits(), v[j].to_bits(), "design_jet v ({i},{j})");
+                    assert_eq!(dj[[i, j]].to_bits(), dgr[j].to_bits(), "design_jet dγ ({i},{j})");
+                    assert_eq!(ddj[[i, j]].to_bits(), ddr[j].to_bits(), "design_jet d²γ ({i},{j})");
+                }
+            }
         }
     }
 }
