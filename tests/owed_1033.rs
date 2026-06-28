@@ -40,8 +40,10 @@
 //! The half of #1033 that is mathematically sound is already in place: the
 //! objects the outer search CONSUMES are k-dim, not n-dim. The outer-ρ gradient
 //! — the per-evaluation payload the optimizer steps on — has length
-//! `2 + Σ_k d_k` (the two shared log-strengths plus the per-atom per-axis ARD
-//! precisions), independent of the row count n. Each of its four analytic
+//! `1 + K + Σ_k d_k` (the shared sparse log-strength, the K per-atom smoothness
+//! log-strengths — `log_lambda_smooth[k]`, one per atom since #1556 — plus the
+//! per-atom per-axis ARD precisions), independent of the row count n. Each of
+//! its four analytic
 //! channels (`explicit`, `logdet_trace`, `occam`, `third_order_correction`) is a
 //! k-dim `Array1`. The k-dim CONSUMPTION is exactly what makes the search scale
 //! in the hyperparameter dimension and not in n — even though BUILDING each
@@ -51,7 +53,7 @@
 //! atoms, decoders, ARD layout, and ρ — over two DIFFERENT row counts, run the
 //! public `reml_criterion_with_cache`, take the public
 //! `analytic_outer_rho_gradient_at_converged`, and assert every gradient channel
-//! has the k-dim length `2 + Σ_k d_k` for BOTH n, and that the assembled
+//! has the k-dim length `1 + K + Σ_k d_k` for BOTH n, and that the assembled
 //! gradient vector has that same n-invariant length. A regression that routed an
 //! n-sized object into the outer-search payload (re-introducing an n-dimensional
 //! coordinate the optimizer would have to walk) would change one of these
@@ -76,11 +78,12 @@ const P: usize = 3; // output channels
 const D: usize = 1; // latent dim per atom (circle)
 const K: usize = 2; // atoms
 
-/// k-dim outer-coordinate length: the two shared log-strengths
-/// (`log_lambda_sparse`, `log_lambda_smooth`) plus one ARD precision per atom
-/// per latent axis. Independent of the row count n — that is the property under
-/// test.
-const RHO_FLAT_LEN: usize = 2 + K * D;
+/// k-dim outer-coordinate length: the shared sparse log-strength
+/// (`log_lambda_sparse`), the K per-atom smoothness log-strengths
+/// (`log_lambda_smooth[k]`, one per atom — #1556), plus one ARD precision per
+/// atom per latent axis. Independent of the row count n — that is the property
+/// under test.
+const RHO_FLAT_LEN: usize = 1 + K + K * D;
 
 /// Build a two-atom periodic circle SAE term over `n` rows, with a fixed decoder
 /// and deterministic coordinates / logits / target. The ONLY thing that varies
@@ -161,7 +164,7 @@ fn ard_rho() -> SaeManifoldRho {
 }
 
 /// The ρ flat-coordinate space the outer engine optimizes over is k-dim, not
-/// n-dim: `to_flat` / `from_flat` round-trip at length `2 + Σ_k d_k`
+/// n-dim: `to_flat` / `from_flat` round-trip at length `1 + K + Σ_k d_k`
 /// independent of the row count. (Pure ρ-structure property — no inner solve.)
 #[test]
 fn rho_flat_coordinate_space_is_n_invariant_1033() {
@@ -170,7 +173,7 @@ fn rho_flat_coordinate_space_is_n_invariant_1033() {
     assert_eq!(
         flat.len(),
         RHO_FLAT_LEN,
-        "ρ flat coordinate length must be the k-dim 2 + Σ d_k = {RHO_FLAT_LEN}, the outer \
+        "ρ flat coordinate length must be the k-dim 1 + K + Σ d_k = {RHO_FLAT_LEN}, the outer \
          search space dimension; got {}",
         flat.len()
     );
@@ -184,7 +187,7 @@ fn rho_flat_coordinate_space_is_n_invariant_1033() {
 }
 
 /// The outer-ρ GRADIENT — the object the hyperparameter search consumes on every
-/// outer evaluation — is k-dim (`2 + Σ_k d_k`) and that length is invariant to
+/// outer evaluation — is k-dim (`1 + K + Σ_k d_k`) and that length is invariant to
 /// the row count n. Each of its four analytic channels is a k-dim `Array1`. This
 /// is the genuinely-achievable half of #1033: the search CONSUMES only k-dim
 /// objects even though BUILDING them still costs O(n) per ρ (the inner solve is
