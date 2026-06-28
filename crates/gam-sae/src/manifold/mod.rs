@@ -153,6 +153,9 @@ mod tests_olmo;
 mod tests_row_jet_and_outer_objective_780;
 
 #[cfg(test)]
+mod tests_deflation_traces_780;
+
+#[cfg(test)]
 mod sae_contract_probe_tests;
 
 #[cfg(test)]
