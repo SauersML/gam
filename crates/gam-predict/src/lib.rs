@@ -3023,10 +3023,16 @@ mod tests {
         let beta_lower = beta_pred.observation_lower.expect("beta lower");
         let beta_upper = beta_pred.observation_upper.expect("beta upper");
         let beta_half_width = 0.5 * (beta_upper[0] - beta_lower[0]);
-        let expected_beta_half_width = z * (0.25 / (1.0 + beta_phi)).sqrt();
+        // Expected: moment-matched Beta quantile at the same phi (31), zero
+        // estimation uncertainty.  logit(0) → mu = 0.5; response_var = mu*(1-mu)/(1+phi).
+        let mu = 0.5_f64;
+        let response_var = mu * (1.0 - mu) / (1.0 + beta_phi);
+        let (exp_lo, exp_hi) = beta_moment_matched_interval(mu, response_var, normal_cdf(-z), normal_cdf(z))
+            .expect("beta quantiles from phi=31");
+        let expected_beta_half_width = 0.5 * (exp_hi - exp_lo);
         assert!(
             (beta_half_width - expected_beta_half_width).abs() < 1e-12,
-            "Beta observation interval must use fitted phi hint"
+            "Beta observation interval must use fitted phi hint: got {beta_half_width:.6e}, expected {expected_beta_half_width:.6e}"
         );
 
         let theta_hat = 4.0;
@@ -3050,10 +3056,22 @@ mod tests {
         )
         .expect("hinted NB covariance prediction");
         let nb_upper = nb_pred.observation_upper.expect("nb upper");
-        let expected_nb_upper = 1.0 + z * (1.0 + 1.0 / theta_hat).sqrt();
+        // Expected: moment-matched NB quantile at theta=4 (hint), zero estimation
+        // uncertainty.  log(0)→mu=1; response_var=mu+mu²/theta=1.25.
+        let nb_mu = 1.0_f64;
+        let nb_response_var = nb_mu + nb_mu.powi(2) / theta_hat;
+        let (_, exp_nb_hi) = negative_binomial_moment_matched_interval(
+            nb_mu,
+            theta_hat,
+            nb_response_var,
+            normal_cdf(-z),
+            normal_cdf(z),
+        )
+        .expect("nb quantiles from theta=4");
         assert!(
-            (nb_upper[0] - expected_nb_upper).abs() < 1e-12,
-            "NB observation interval must use fitted theta hint"
+            (nb_upper[0] - exp_nb_hi).abs() < 1e-12,
+            "NB observation interval must use fitted theta hint: got {:.6e}, expected {exp_nb_hi:.6e}",
+            nb_upper[0]
         );
     }
 
