@@ -4679,6 +4679,7 @@ mod tests {
             used_device: false,
             outer_iterations: 0,
             outer_cost_evals: 0,
+            inner_pirls_solves: 0,
             outer_converged: true,
             outer_gradient_norm: None,
             standard_deviation: 1.0,

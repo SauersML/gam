@@ -1189,6 +1189,15 @@ pub struct UnifiedFitResult {
     /// the standard external REML optimizer.
     #[serde(default)]
     pub outer_cost_evals: usize,
+    /// Number of *actual* full-n inner P-IRLS solves the fit performed (the
+    /// cache-missing solves across the seed-grid prepass, screening, multistart,
+    /// and finalize). This is the true #1575 cost metric — distinct from, and
+    /// typically ~2× larger than, `outer_cost_evals`, which counts outer
+    /// requests including single-slot cache hits. Diagnostic only; not part of
+    /// the statistical contract. Zero for paths that do not run the standard
+    /// external REML optimizer.
+    #[serde(default)]
+    pub inner_pirls_solves: usize,
 }
 
 pub(crate) use gam_problem::ensure_finite_scalar_estimation;
@@ -1801,6 +1810,9 @@ impl UnifiedFitResult {
             // (`fit.rs`) from the optimizer's outer cost-eval counter. The
             // parts builder does not carry it, so it defaults to 0 here.
             outer_cost_evals: 0,
+            // Likewise populated post-construction from the optimizer's inner
+            // P-IRLS solve counter (#1575); defaults to 0 here.
+            inner_pirls_solves: 0,
         })
     }
     pub fn validate_numeric_finiteness(&self) -> Result<(), EstimationError> {
@@ -1875,6 +1887,7 @@ impl UnifiedFitResult {
             artifacts: parts.artifacts,
             inner_cycles: parts.inner_cycles,
             outer_cost_evals: 0,
+            inner_pirls_solves: 0,
         }
     }
 }

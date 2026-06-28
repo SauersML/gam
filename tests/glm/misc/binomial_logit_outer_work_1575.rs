@@ -160,8 +160,13 @@ fn binomial_logit_reml_outer_work_bounded_1575() {
     );
 
     eprintln!(
-        "RECORD_1575 reml_score={:.10} edf={:.10} outer_cost_evals={} outer_grad_norm={:?} converged={}",
-        fit.reml_score, edf, fit.outer_cost_evals, fit.outer_gradient_norm, fit.outer_converged
+        "RECORD_1575 reml_score={:.10} edf={:.10} outer_cost_evals={} inner_pirls_solves={} outer_grad_norm={:?} converged={}",
+        fit.reml_score,
+        edf,
+        fit.outer_cost_evals,
+        fit.inner_pirls_solves,
+        fit.outer_gradient_norm,
+        fit.outer_converged
     );
 
     assert!(
@@ -221,5 +226,30 @@ fn binomial_logit_reml_outer_work_bounded_1575() {
          {} (the well-posed 3-smooth fit should stay well under 60; the ~150-eval \
          blow-up is the open perf target)",
         fit.outer_cost_evals
+    );
+
+    // ── (c) actual inner P-IRLS solve bound (the TRUE #1575 cost metric) ────
+    // `outer_cost_evals` counts outer REQUESTS, including single-slot cache hits
+    // and prior short-circuits; the genuinely expensive work the #1575 slowdown
+    // is measured in is the number of cache-missing full-n inner P-IRLS solves
+    // (`inner_pirls_solves`) across the seed-grid prepass, screening, multistart,
+    // and finalize. A healthy warm-started fit performs ~2 inner solves per outer
+    // cost-eval. This guard pins that the warm-start / parsimony-waiver /
+    // PSIS-opt-in economy that cut the original ~150-eval (and many-hundred-solve)
+    // pathology stays in force: if warm-starting broke, duplicate solving crept
+    // in, or the redundant-seed / diagnostic-solve guards regressed, the solve
+    // count would blow back up and trip this bound. It is a coarse upper bound
+    // (the fixture solves in well under 150), NOT a correctness check — the
+    // correctness gates are (a) above.
+    assert!(
+        fit.inner_pirls_solves > 0,
+        "inner P-IRLS solve counter must be wired (got 0)"
+    );
+    assert!(
+        fit.inner_pirls_solves < 150,
+        "actual full-n inner P-IRLS solves regressed toward the #1575 bug regime: \
+         {} (the well-posed 3-smooth fit should stay well under 150; a blow-up here \
+         signals broken inner warm-starting or duplicate/redundant solving)",
+        fit.inner_pirls_solves
     );
 }

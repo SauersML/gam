@@ -301,6 +301,7 @@ where
         .and_then(|inf| inf.beta_covariance_corrected.clone());
     let penalized_objective = result.reml_score;
     let outer_cost_evals = result.outer_cost_evals;
+    let inner_pirls_solves = result.inner_pirls_solves;
     UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
         blocks: vec![FittedBlock {
             beta: result.beta.clone(),
@@ -339,6 +340,10 @@ where
         // Surface the optimizer's outer cost-eval count (not carried by the
         // parts builder) so callers/tests can guard outer work (#1575).
         unified.outer_cost_evals = outer_cost_evals;
+        // Surface the actual full-n inner P-IRLS solve count — the true #1575
+        // cost metric — so callers/tests can guard that the warm-start /
+        // parsimony-waiver / PSIS-optin economy does not regress.
+        unified.inner_pirls_solves = inner_pirls_solves;
         unified
     })
 }

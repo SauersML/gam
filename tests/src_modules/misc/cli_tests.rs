@@ -243,6 +243,8 @@ fn external_fit_result_preserves_outer_convergence_flag() {
         reml_score: 4.0,
         fitted_link: FittedLinkState::Standard(None),
         used_device: false,
+        outer_cost_evals: 0,
+        inner_pirls_solves: 0,
     };
 
     let fit = fit_result_from_external(ext);

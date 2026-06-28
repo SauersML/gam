@@ -3883,6 +3883,15 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         key: Option<Vec<u64>>,
     ) -> Result<EvalShared, EstimationError> {
+        // #1575 observability: count every genuine (cache-missing) full-n inner
+        // P-IRLS solve. Callers funnel cache hits through `obtain_eval_bundle*`,
+        // which only reaches here on a miss, so this counts exactly the
+        // expensive solves the #1575 slowdown is measured in. Relaxed ordering
+        // is sufficient — this is a monotone diagnostic counter, never read on
+        // the math path.
+        self.arena
+            .inner_pirls_solve_count
+            .fetch_add(1, Ordering::Relaxed);
         let decision = self.select_reml_geometry(rho);
         match decision.geometry {
             RemlGeometry::SparseExactSpd => {

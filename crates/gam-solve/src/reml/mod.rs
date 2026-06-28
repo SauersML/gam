@@ -4792,6 +4792,19 @@ impl EvalCacheManager {
 /// state invariants.
 pub(crate) struct RemlArena {
     pub(crate) cost_eval_count: RwLock<u64>,
+    /// Number of *actual* full-n inner P-IRLS solves performed (#1575).
+    ///
+    /// Distinct from `cost_eval_count`, which counts every outer cost/gradient
+    /// REQUEST including single-slot cache hits and prior short-circuits. This
+    /// counts only the cache-missing `prepare_eval_bundlewithkey` calls — i.e.
+    /// the genuinely expensive `O(n·p²)` inner solves the #1575 slowdown is
+    /// about ("~150 outer cost evals each running a full n-sized P-IRLS"). A
+    /// healthy warm-started fit performs roughly 2 inner solves per outer
+    /// cost-eval (one value, one gradient/Hessian), so a large ratio between
+    /// the two signals broken warm-starting or duplicate solving. This is pure
+    /// observability: it never feeds back into the optimization and changes no
+    /// fitted value.
+    pub(crate) inner_pirls_solve_count: AtomicU64,
     pub(crate) lastgradient_used_stochastic_fallback: AtomicBool,
 }
 
@@ -4799,6 +4812,7 @@ impl RemlArena {
     pub(crate) fn new() -> Self {
         Self {
             cost_eval_count: RwLock::new(0),
+            inner_pirls_solve_count: AtomicU64::new(0),
             lastgradient_used_stochastic_fallback: AtomicBool::new(false),
         }
     }

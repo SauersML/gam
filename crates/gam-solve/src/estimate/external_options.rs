@@ -40,6 +40,15 @@ pub struct ExternalOptimResult {
     /// each paying an inner P-IRLS solve). Surfaced for regression guards on
     /// outer work (#1575); not part of the statistical contract.
     pub outer_cost_evals: usize,
+    /// Number of *actual* full-n inner P-IRLS solves performed (cache-missing
+    /// `prepare_eval_bundlewithkey` calls). This is the true cost driver the
+    /// #1575 slowdown is measured in ("~150 outer cost evals each running a
+    /// full n-sized P-IRLS"): unlike `outer_cost_evals`, it excludes single-slot
+    /// cache hits and prior short-circuits and includes every solve done by the
+    /// seed-grid prepass, screening, multistart, and finalize phases. Surfaced
+    /// for a regression guard that pins the warm-start / parsimony-waiver /
+    /// PSIS-optin economy (#1575); not part of the statistical contract.
+    pub inner_pirls_solves: usize,
 }
 
 #[derive(Clone)]
