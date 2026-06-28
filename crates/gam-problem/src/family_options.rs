@@ -34,3 +34,37 @@ impl ExactOuterDerivativeOrder {
         matches!(self, Self::Second)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zeroth_order_has_no_gradient_or_hessian() {
+        let o = ExactOuterDerivativeOrder::Zeroth;
+        assert!(!o.has_gradient());
+        assert!(!o.has_hessian());
+    }
+
+    #[test]
+    fn first_order_has_gradient_but_not_hessian() {
+        let o = ExactOuterDerivativeOrder::First;
+        assert!(o.has_gradient());
+        assert!(!o.has_hessian());
+    }
+
+    #[test]
+    fn second_order_has_both_gradient_and_hessian() {
+        let o = ExactOuterDerivativeOrder::Second;
+        assert!(o.has_gradient());
+        assert!(o.has_hessian());
+    }
+
+    #[test]
+    fn ordering_is_zeroth_lt_first_lt_second() {
+        use ExactOuterDerivativeOrder::*;
+        assert!(Zeroth < First);
+        assert!(First < Second);
+        assert!(Zeroth < Second);
+    }
+}

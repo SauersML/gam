@@ -81,3 +81,48 @@ impl RidgePolicy {
         }
     }
 }
+
+#[cfg(test)]
+mod ridge_policy_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_stabilization_full_includes_all_terms() {
+        let p = RidgePolicy::explicit_stabilization_full();
+        assert!(p.rho_independent);
+        assert!(p.include_quadratic_penalty);
+        assert!(p.include_penalty_logdet);
+        assert!(p.include_laplacehessian);
+        assert_eq!(p.determinant_mode, RidgeDeterminantMode::Auto);
+    }
+
+    #[test]
+    fn explicit_stabilization_full_exact_uses_full_determinant() {
+        let p = RidgePolicy::explicit_stabilization_full_exact();
+        assert!(p.include_penalty_logdet);
+        assert_eq!(p.determinant_mode, RidgeDeterminantMode::Full);
+    }
+
+    #[test]
+    fn explicit_stabilization_pospart_uses_positive_part_determinant() {
+        let p = RidgePolicy::explicit_stabilization_pospart();
+        assert!(p.include_penalty_logdet);
+        assert_eq!(p.determinant_mode, RidgeDeterminantMode::PositivePart);
+    }
+
+    #[test]
+    fn solver_only_ridge_policy_stays_off_objective_accounting() {
+        let p = RidgePolicy::solver_only();
+        assert!(p.rho_independent);
+        assert!(!p.include_quadratic_penalty);
+        assert!(!p.include_penalty_logdet);
+        assert!(!p.include_laplacehessian);
+    }
+
+    #[test]
+    fn determinant_mode_variants_are_distinct() {
+        assert_ne!(RidgeDeterminantMode::Auto, RidgeDeterminantMode::Full);
+        assert_ne!(RidgeDeterminantMode::Full, RidgeDeterminantMode::PositivePart);
+        assert_ne!(RidgeDeterminantMode::Auto, RidgeDeterminantMode::PositivePart);
+    }
+}
