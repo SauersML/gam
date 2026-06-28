@@ -20,8 +20,11 @@ FINDINGS (run on this machine; OLMo l18 train 381 / test 254):
         D=128 k=8: MAN 0.633  FLAT 0.758
       The manifold helps where the data is curved (l18: autocorrelated, low local
       intrinsic dim) and hurts where it reconstructs well linearly (mixedlayer,
-      higher EV ceiling). Confounder: the manifold may be under-trained on the
-      larger mixedlayer set (768 rows, 600 steps vs flat 2500) — worth chasing.
+      higher EV ceiling). CONFIRMED not an under-training artifact: a step sweep
+      (600/1500/3000/6000) leaves the manifold OOS plateaued ~0.65 (D=64 k=4) and
+      ~0.70 (D=128 k=8), still below flat's 0.709/0.763, while in-sample OVERFITS to
+      0.96-0.998. The manifold genuinely OVERFITS heavy-tailed mixedlayer; the
+      dataset-dependence is real.
 
 Run:  saevenv/bin/python tests/sae/manifold_vs_flat_exploration.py
       (needs dictionary_learning + the repo on sys.path for gamfit/_rust.abi3.so)
