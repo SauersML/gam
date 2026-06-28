@@ -20,7 +20,7 @@
 use std::process::ExitCode;
 use std::time::Instant;
 
-use gam::gpu::kernels::arrow_schur::{
+use gam::solver::gpu_kernels::arrow_schur::{
     ArrowSchurGpuFailure, solve_arrow_newton_step, solve_arrow_newton_step_dense_reference,
     solve_arrow_newton_step_fused_force,
 };
