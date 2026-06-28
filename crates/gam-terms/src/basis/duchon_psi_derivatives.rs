@@ -2047,3 +2047,64 @@ pub fn create_duchon_basis_1d_derivative_dense(
     fill_duchon_1d_polynomial_derivative(&mut basis, kernel_cols, t, effective_order, order);
     Ok(basis)
 }
+
+#[cfg(test)]
+mod taylor_degree_tests {
+    use super::*;
+
+    /// gam#1604 — the half-integer-ν Matérn block Taylor coefficients. For
+    /// |ν| = l + ½ the block has the elementary closed form
+    /// `c · r^ν K_ν(κr) = c · √(π/2κ) · e^{−κr} · P(κ,r)` with P a finite
+    /// Laurent polynomial, so the exact `r^{2j}` coefficients are clean rationals
+    /// (no log term). At κ = 1, d = 1:
+    ///   • n = 2 (ν = 3/2): block = ¼ (r + 1) e^{−r}        → [0.25, −0.125, −0.03125]
+    ///   • n = 3 (ν = 5/2): block = 1/16 (r² + 3r + 3) e^{−r} → [0.1875, −0.03125, 0.0078125]
+    /// The earlier `l = round(2|ν| − 1)` miscount used the K_{5/2} / K_{9/2}
+    /// polynomials for these (degree 2|ν|−½, not |ν|), collapsing the j = 0 term
+    /// to exactly 0. These references would all fail under that bug.
+    #[test]
+    fn half_integer_matern_taylor_coeffs_1604() {
+        let want_nu_3_2 = [0.25_f64, -0.125, -0.03125];
+        let want_nu_5_2 = [0.1875_f64, -0.03125, 0.0078125];
+        for (j, &want) in want_nu_3_2.iter().enumerate() {
+            let (pure, log) = duchon_matern_block_taylor_r2j(1.0, 2, 1, j);
+            assert!(log == 0.0, "no log term for half-integer ν (j={j}): {log}");
+            assert!(
+                (pure - want).abs() < 1e-13,
+                "ν=3/2 r^{{{}}} coeff: got {pure:.15}, want {want}",
+                2 * j
+            );
+        }
+        for (j, &want) in want_nu_5_2.iter().enumerate() {
+            let (pure, log) = duchon_matern_block_taylor_r2j(1.0, 3, 1, j);
+            assert!(log == 0.0, "no log term for half-integer ν (j={j}): {log}");
+            assert!(
+                (pure - want).abs() < 1e-13,
+                "ν=5/2 r^{{{}}} coeff: got {pure:.15}, want {want}",
+                2 * j
+            );
+        }
+    }
+
+    /// gam#1604 — the j = 0 Taylor coefficient must equal the r → 0⁺ limit of the
+    /// block computed independently via the real Bessel-K value path
+    /// (`r^ν K_ν(κr) → 2^{ν−1} Γ(ν) κ^{−ν}` for ν > 0). Sweeps half-integer ν up
+    /// to 7/2 and several κ; the regressed code returned 0 for ν ≥ 3/2.
+    #[test]
+    fn half_integer_matern_taylor_j0_matches_value_limit_1604() {
+        let d = 1usize;
+        for n in 1..=4usize {
+            let nu = n as f64 - 0.5 * d as f64; // ν = n − ½ ∈ {0.5, 1.5, 2.5, 3.5}
+            for &kappa in &[0.3_f64, 1.0, 2.0, 7.5] {
+                let (pure, _log) = duchon_matern_block_taylor_r2j(kappa, n, d, 0);
+                // Independent r→0⁺ limit through the value path.
+                let want = duchon_matern_block(0.0, kappa, n, d).expect("r→0 limit");
+                let rel = (pure - want).abs() / want.abs().max(1e-300);
+                assert!(
+                    rel < 1e-12,
+                    "ν={nu} κ={kappa}: Taylor j=0 {pure:.15e} vs value limit {want:.15e} (rel {rel:.2e})"
+                );
+            }
+        }
+    }
+}

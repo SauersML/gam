@@ -2253,6 +2253,157 @@ mod duchon_hybrid_psd_tests {
         );
     }
 
+    /// gam#1604: independent closed form for the hybrid-kernel origin value
+    /// `φ(0) = F⁻¹[ρ^{-2p}(κ²+ρ²)^{-s}](0)` in `d` dimensions, derived by
+    /// Schwinger-parametrizing both rational factors and evaluating the radial
+    /// inverse-FT integral at `r = 0`:
+    ///
+    ///   φ(0) = (4π)^{-d/2} / Γ(s) · Γ(b) · κ^{-2b} · Γ(d/2 − p) / Γ(d/2),
+    ///   b = p + s − d/2.
+    ///
+    /// Finite whenever `2(p+s) > d` and (for the Γ(d/2 − p) factor to avoid a
+    /// pole) `d` is odd or `2p < d`. This reuses none of the Taylor-coefficient
+    /// machinery under test, so it is a true oracle for the collision diagonal.
+    fn phi0_closed_form(p: usize, s: usize, d: usize, kappa: f64) -> f64 {
+        let half_d = 0.5 * d as f64;
+        let b = p as f64 + s as f64 - half_d;
+        (4.0 * std::f64::consts::PI).powf(-half_d) / gamma_lanczos(s as f64)
+            * gamma_lanczos(b)
+            * kappa.powf(-2.0 * b)
+            * gamma_lanczos(half_d - p as f64)
+            / gamma_lanczos(half_d)
+    }
+
+    /// gam#1604 — the collision (r = 0) diagonal of the hybrid Duchon–Matérn
+    /// kernel must equal the independent closed form above. The half-integer-ν
+    /// Taylor coefficients that feed `duchon_hybrid_kernel_collision_value`
+    /// previously miscounted the K_{l+½} polynomial degree (`l = 2|ν| − 1`
+    /// instead of `|ν| − ½`), zeroing the r⁰ term of every |ν| ≥ 3/2 block and
+    /// silently dropping their contribution to φ(0).
+    #[test]
+    fn hybrid_collision_diagonal_matches_closed_form_1604() {
+        // Odd dimensions exercise the half-integer-ν path. For each, sweep p, s
+        // (with 2(p+s) > d) and κ. d = 1, n ≥ 2 ⇒ ν ≥ 3/2 is the regressed case.
+        for &d in &[1usize, 3, 5] {
+            for &p in &[1usize, 2, 3] {
+                for &s in &[1usize, 2, 3, 4] {
+                    if 2 * (p + s) <= d {
+                        continue;
+                    }
+                    for &kappa in &[0.5f64, 1.0, 2.5] {
+                        let coeffs = duchon_partial_fraction_coeffs(p, s, kappa);
+                        let got = duchon_hybrid_kernel_collision_value(
+                            1.0 / kappa,
+                            p,
+                            s,
+                            d,
+                            &coeffs,
+                        )
+                        .expect("collision diagonal");
+                        let want = phi0_closed_form(p, s, d, kappa);
+                        let rel = (got - want).abs() / want.abs().max(1e-300);
+                        assert!(
+                            rel < 1e-10,
+                            "φ(0) mismatch d={d} p={p} s={s} κ={kappa}: got {got:.12e}, want {want:.12e} (rel {rel:.2e})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// gam#1604 — the near-collision Taylor branch must be continuous with the
+    /// direct partial-fraction sum: assembling φ(r) from φ(0), φ″(0), φ⁗(0),
+    /// φ⁽⁶⁾(0) (all built from the same half-integer-ν Taylor coefficients) must
+    /// match the cancellation-free direct block sum at a small radius where both
+    /// are individually accurate. This exercises the j ≥ 1 coefficients (the
+    /// diagonal test only pins j = 0).
+    #[test]
+    fn hybrid_near_collision_continuous_with_direct_1604() {
+        for &d in &[1usize, 3] {
+            for &p in &[1usize, 2] {
+                for &s in &[2usize, 3] {
+                    if 2 * (p + s) <= d + 6 {
+                        // Need φ⁽⁶⁾(0) to exist for the full 6th-order Taylor.
+                        continue;
+                    }
+                    for &kappa in &[0.5f64, 1.0, 2.0] {
+                        let length_scale = 1.0 / kappa;
+                        let coeffs = duchon_partial_fraction_coeffs(p, s, kappa);
+                        // r small enough that the truncated 6th-order Taylor is
+                        // accurate to ~r⁸, yet large enough that the direct block
+                        // sum has not lost precision (d = 1/3, moderate κ).
+                        let r = 0.02 * length_scale;
+                        let taylor = duchon_hybrid_kernel_near_collision_value(
+                            r,
+                            length_scale,
+                            p,
+                            s,
+                            d,
+                            &coeffs,
+                        )
+                        .expect("near-collision value");
+                        // Direct partial-fraction sum (real Bessel-K, no Taylor).
+                        let mut direct = 0.0f64;
+                        for (m, &a_m) in coeffs.a.iter().enumerate().skip(1) {
+                            if a_m != 0.0 {
+                                direct += a_m * polyharmonic_kernel(r, m as f64, d);
+                            }
+                        }
+                        for (n, &b_n) in coeffs.b.iter().enumerate().skip(1) {
+                            if b_n != 0.0 {
+                                direct +=
+                                    b_n * duchon_matern_block(r, kappa, n, d).expect("matern block");
+                            }
+                        }
+                        let rel = (taylor - direct).abs() / direct.abs().max(1e-300);
+                        assert!(
+                            rel < 1e-9,
+                            "near-collision vs direct mismatch d={d} p={p} s={s} κ={kappa} r={r}: \
+                             taylor {taylor:.12e}, direct {direct:.12e} (rel {rel:.2e})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// gam#1604 — the production constrained Duchon penalty `Ω_c = α²·ZᵀK_CC Z`
+    /// for a `d = 1` hybrid smooth with power ≥ 2 must be numerically PSD across
+    /// realistic length scales. Before the Taylor-degree fix the corrupted
+    /// diagonal made `Ω_c ≈ Ω_true − δ·I` (δ = the dropped diagonal mass),
+    /// giving λ_min ≈ −δ < 0 at *every* length scale — the issue's report.
+    #[test]
+    fn d1_hybrid_penalty_is_psd_1604() {
+        let d = 1usize;
+        let nullspace_order = DuchonNullspaceOrder::Linear; // p = 2
+        let centers = fixture_centers(d, 12);
+        let mut cache = BasisCacheContext::default();
+        let z = kernel_constraint_nullspace(centers.view(), nullspace_order, &mut cache)
+            .expect("constraint null space");
+        for &power in &[2.0f64, 3.0] {
+            for &length_scale in &[0.5f64, 1.0, 10.0, 100.0] {
+                let omega = duchon_constrained_bending_penalty(
+                    centers.view(),
+                    Some(length_scale),
+                    power,
+                    nullspace_order,
+                    None,
+                    &z,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("d=1 p=2 s={power} ls={length_scale} penalty rejected: {e}")
+                });
+                let (penalty, _scale) = normalize_penalty(&omega);
+                let lam_min = lambda_min(&penalty);
+                assert!(
+                    lam_min >= -1e-9,
+                    "d=1 p=2 s={power} ls={length_scale}: λ_min={lam_min:.6e} (not PSD)"
+                );
+            }
+        }
+    }
+
     /// No-regression guard: a well-conditioned low-dimensional fixture must keep
     /// the exact kernel VALUES the partial-fraction path produced before the
     /// gam#1424 fix. For d=2 the stable-integral reroute does not apply
