@@ -329,3 +329,86 @@ impl RiemannianManifold for ProductManifold {
         Ok(out)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manifold::RiemannianManifold;
+    use crate::manifolds::euclidean::EuclideanManifold;
+    use ndarray::array;
+
+    fn two_euclidean() -> ProductManifold {
+        ProductManifold::new(vec![
+            Box::new(EuclideanManifold::new(2)),
+            Box::new(EuclideanManifold::new(3)),
+        ])
+    }
+
+    #[test]
+    fn dim_is_sum_of_component_dims() {
+        assert_eq!(two_euclidean().dim(), 5);
+    }
+
+    #[test]
+    fn ambient_dim_equals_dim_for_euclidean_factors() {
+        assert_eq!(two_euclidean().ambient_dim(), 5);
+    }
+
+    #[test]
+    fn exp_map_euclidean_product_is_componentwise_add() {
+        let m = two_euclidean();
+        let p = array![1.0_f64, 2.0, 3.0, 4.0, 5.0];
+        let v = array![10.0_f64, 20.0, 30.0, 40.0, 50.0];
+        let q = m.exp_map(p.view(), v.view()).unwrap();
+        assert_eq!(q.len(), 5);
+        for i in 0..5 {
+            assert!((q[i] - (p[i] + v[i])).abs() < 1e-12, "index {i}: {}", q[i]);
+        }
+    }
+
+    #[test]
+    fn log_map_euclidean_product_is_componentwise_sub() {
+        let m = two_euclidean();
+        let p = array![1.0_f64, 2.0, 3.0, 4.0, 5.0];
+        let q = array![4.0_f64, 2.0, 1.0, 9.0, 5.0];
+        let v = m.log_map(p.view(), q.view()).unwrap();
+        let expected = array![3.0_f64, 0.0, -2.0, 5.0, 0.0];
+        for i in 0..5 {
+            assert!((v[i] - expected[i]).abs() < 1e-12, "index {i}: {}", v[i]);
+        }
+    }
+
+    #[test]
+    fn metric_tensor_is_block_identity_for_euclidean_factors() {
+        let m = two_euclidean();
+        let p = Array1::<f64>::zeros(5);
+        let g = m.metric_tensor(p.view()).unwrap();
+        assert_eq!(g.dim(), (5, 5));
+        for i in 0..5 {
+            for j in 0..5 {
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert!((g[[i, j]] - expected).abs() < 1e-14);
+            }
+        }
+    }
+
+    #[test]
+    fn dimension_mismatch_returns_error() {
+        let m = two_euclidean();
+        let p = array![1.0_f64, 2.0]; // wrong size (2 vs 5)
+        let v = array![0.0_f64, 0.0];
+        assert!(m.exp_map(p.view(), v.view()).is_err());
+    }
+
+    #[test]
+    fn single_factor_product_behaves_like_that_manifold() {
+        let m = ProductManifold::new(vec![Box::new(EuclideanManifold::new(3))]);
+        assert_eq!(m.dim(), 3);
+        let p = array![1.0_f64, 0.0, -1.0];
+        let v = array![2.0_f64, 3.0, 4.0];
+        let q = m.exp_map(p.view(), v.view()).unwrap();
+        assert!((q[0] - 3.0).abs() < 1e-12);
+        assert!((q[1] - 3.0).abs() < 1e-12);
+        assert!((q[2] - 3.0).abs() < 1e-12);
+    }
+}
