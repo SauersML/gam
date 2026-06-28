@@ -547,15 +547,24 @@ impl<const K: usize> Tower4<K> {
     /// Contract `t3` with one primary-space direction:
     /// `out[a][b] = Σ_c t3[a][b][c] · dir[c]` — exactly the
     /// `row_third_contracted` shape.
+    ///
+    /// The output is symmetric in `(a, b)`: `t3` is fully index-symmetric, so
+    /// `t3[a][b][c] == t3[b][a][c]` and the `Σ_c` contraction gives
+    /// `out[a][b] == out[b][a]` term-for-term, in the same `c` order. We compute
+    /// only the upper triangle `a ≤ b` (the inner contraction is unchanged and
+    /// stays contiguous/vectorisable) and mirror into the lower triangle — this
+    /// is BIT-IDENTICAL to the full `a, b ∈ 0..K` nest while doing ~2× fewer
+    /// inner contractions, with no dense scatter (the mirror is a `K × K` copy).
     pub fn third_contracted(&self, dir: &[f64; K]) -> [[f64; K]; K] {
         let mut out = [[0.0; K]; K];
         for a in 0..K {
-            for b in 0..K {
+            for b in a..K {
                 let mut acc = 0.0;
                 for c in 0..K {
                     acc += self.t3[a][b][c] * dir[c];
                 }
                 out[a][b] = acc;
+                out[b][a] = acc;
             }
         }
         out
@@ -564,10 +573,16 @@ impl<const K: usize> Tower4<K> {
     /// Contract `t4` with two primary-space directions:
     /// `out[a][b] = Σ_{c,d} t4[a][b][c][d] · u[c] · v[d]` — exactly the
     /// `row_fourth_contracted` shape.
+    ///
+    /// As in [`Self::third_contracted`], the output is symmetric in `(i, j)`
+    /// (`t4[j][i][k][l] == t4[i][j][k][l]`, contracted in the same `(k, l)`
+    /// order), so the upper triangle `i ≤ j` is computed and mirrored —
+    /// BIT-IDENTICAL to the full nest, ~2× fewer inner `Σ_{k,l}` contractions,
+    /// and the inner double loop stays the original contiguous/vectorisable form.
     pub fn fourth_contracted(&self, u: &[f64; K], w: &[f64; K]) -> [[f64; K]; K] {
         let mut out = [[0.0; K]; K];
         for i in 0..K {
-            for j in 0..K {
+            for j in i..K {
                 let mut acc = 0.0;
                 for k in 0..K {
                     for l in 0..K {
@@ -575,6 +590,7 @@ impl<const K: usize> Tower4<K> {
                     }
                 }
                 out[i][j] = acc;
+                out[j][i] = acc;
             }
         }
         out
@@ -2880,28 +2896,31 @@ impl<L: Lane, const K: usize> Tower4Lane<L, K> {
         out
     }
     /// Contract `t3` with a primary-space direction (lift of
-    /// [`Tower4::third_contracted`]).
+    /// [`Tower4::third_contracted`]). Output-symmetric in `(a, b)`: compute the
+    /// upper triangle and mirror — bit-identical to the full nest, lane-for-lane.
     #[inline]
     pub fn third_contracted(&self, dir: &[L; K]) -> [[L; K]; K] {
         let mut out = [[L::splat(0.0); K]; K];
         for a in 0..K {
-            for b in 0..K {
+            for b in a..K {
                 let mut acc = L::splat(0.0);
                 for c in 0..K {
                     acc = acc.add(self.t3[a][b][c].mul(dir[c]));
                 }
                 out[a][b] = acc;
+                out[b][a] = acc;
             }
         }
         out
     }
     /// Contract `t4` with two primary-space directions (lift of
-    /// [`Tower4::fourth_contracted`]).
+    /// [`Tower4::fourth_contracted`]). Output-symmetric in `(i, j)`: compute the
+    /// upper triangle and mirror — bit-identical to the full nest, lane-for-lane.
     #[inline]
     pub fn fourth_contracted(&self, u: &[L; K], w: &[L; K]) -> [[L; K]; K] {
         let mut out = [[L::splat(0.0); K]; K];
         for i in 0..K {
-            for j in 0..K {
+            for j in i..K {
                 let mut acc = L::splat(0.0);
                 for k in 0..K {
                     for l in 0..K {
@@ -2909,6 +2928,7 @@ impl<L: Lane, const K: usize> Tower4Lane<L, K> {
                     }
                 }
                 out[i][j] = acc;
+                out[j][i] = acc;
             }
         }
         out
@@ -5047,5 +5067,209 @@ mod rowjet_bridge_tests {
                 assert!(v.is_finite(), "trigamma_stack non-finite at x={x}: {v}");
             }
         }
+    }
+}
+
+// ── Contraction-symmetry optimization gate ────────────────────────────────────
+//
+// `Tower4::third_contracted` / `fourth_contracted` contract the (fully
+// index-symmetric) `t3`/`t4` tensors against directions, leaving the output
+// indices `(a, b)` / `(i, j)` free. Those free indices inherit the tensor's
+// symmetry — `out[a][b] == out[b][a]` term-for-term — so only the upper triangle
+// need be summed and the lower triangle mirrored. Unlike the dense symmetric
+// FILL (which needs a K⁴ scatter and loses inner-loop vectorisation, and was
+// measured SLOWER), the mirror here is a tiny K×K copy and the inner contraction
+// is untouched (contiguous, vectorisable). This is BIT-IDENTICAL to the full
+// nest, so it needs no fingerprint re-baseline; the gate is (1) bit-identity vs
+// the full reference and (2) a measured wall-clock that is not slower.
+#[cfg(test)]
+mod contraction_symmetry_tests {
+    use super::*;
+
+    struct Rng(u64);
+    impl Rng {
+        fn u(&mut self) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 11) as f64 / (1u64 << 53) as f64
+        }
+        fn s(&mut self) -> f64 {
+            (self.u() - 0.5) * 4.0
+        }
+    }
+
+    /// Random VALID fully-symmetric `Tower4<K>` (symmetric `h`/`t3`/`t4`).
+    fn rand_sym4<const K: usize>(r: &mut Rng) -> Tower4<K> {
+        let mut t = Tower4::<K>::zero();
+        t.v = r.s();
+        for i in 0..K {
+            t.g[i] = r.s();
+        }
+        for a in 0..K {
+            for b in a..K {
+                let v2 = r.s();
+                t.h[a][b] = v2;
+                t.h[b][a] = v2;
+                for c in b..K {
+                    let v3 = r.s();
+                    for p in perms3([a, b, c]) {
+                        t.t3[p[0]][p[1]][p[2]] = v3;
+                    }
+                    for d in c..K {
+                        let v4 = r.s();
+                        for p in perms4([a, b, c, d]) {
+                            t.t4[p[0]][p[1]][p[2]][p[3]] = v4;
+                        }
+                    }
+                }
+            }
+        }
+        t
+    }
+
+    fn perms3(idx: [usize; 3]) -> [[usize; 3]; 6] {
+        let [a, b, c] = idx;
+        [[a, b, c], [a, c, b], [b, a, c], [b, c, a], [c, a, b], [c, b, a]]
+    }
+    fn perms4(idx: [usize; 4]) -> [[usize; 4]; 24] {
+        let [a, b, c, d] = idx;
+        [
+            [a, b, c, d], [a, b, d, c], [a, c, b, d], [a, c, d, b], [a, d, b, c], [a, d, c, b],
+            [b, a, c, d], [b, a, d, c], [b, c, a, d], [b, c, d, a], [b, d, a, c], [b, d, c, a],
+            [c, a, b, d], [c, a, d, b], [c, b, a, d], [c, b, d, a], [c, d, a, b], [c, d, b, a],
+            [d, a, b, c], [d, a, c, b], [d, b, a, c], [d, b, c, a], [d, c, a, b], [d, c, b, a],
+        ]
+    }
+
+    /// Full-nest reference (the pre-opt `a, b ∈ 0..K` form).
+    fn third_full<const K: usize>(t: &Tower4<K>, dir: &[f64; K]) -> [[f64; K]; K] {
+        let mut out = [[0.0; K]; K];
+        for a in 0..K {
+            for b in 0..K {
+                let mut acc = 0.0;
+                for c in 0..K {
+                    acc += t.t3[a][b][c] * dir[c];
+                }
+                out[a][b] = acc;
+            }
+        }
+        out
+    }
+    fn fourth_full<const K: usize>(t: &Tower4<K>, u: &[f64; K], w: &[f64; K]) -> [[f64; K]; K] {
+        let mut out = [[0.0; K]; K];
+        for i in 0..K {
+            for j in 0..K {
+                let mut acc = 0.0;
+                for k in 0..K {
+                    for l in 0..K {
+                        acc += t.t4[i][j][k][l] * u[k] * w[l];
+                    }
+                }
+                out[i][j] = acc;
+            }
+        }
+        out
+    }
+
+    fn check_bit_identical<const K: usize>(seed: u64, n: usize) {
+        let mut r = Rng(seed);
+        for _ in 0..n {
+            let t = rand_sym4::<K>(&mut r);
+            let dir: [f64; K] = std::array::from_fn(|_| r.s());
+            let u: [f64; K] = std::array::from_fn(|_| r.s());
+            let w: [f64; K] = std::array::from_fn(|_| r.s());
+            let t3_sym = t.third_contracted(&dir);
+            let t3_full = third_full(&t, &dir);
+            let t4_sym = t.fourth_contracted(&u, &w);
+            let t4_full = fourth_full(&t, &u, &w);
+            for a in 0..K {
+                for b in 0..K {
+                    assert_eq!(
+                        t3_sym[a][b].to_bits(),
+                        t3_full[a][b].to_bits(),
+                        "third K={K} [{a}][{b}]"
+                    );
+                    assert_eq!(
+                        t4_sym[a][b].to_bits(),
+                        t4_full[a][b].to_bits(),
+                        "fourth K={K} [{a}][{b}]"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The output-symmetric contraction is BIT-IDENTICAL to the full nest across
+    /// `K ∈ {2,3,4,9}` (so no fingerprint re-baseline is owed — accuracy and bits
+    /// are unchanged; this is a pure speed-only optimization).
+    #[test]
+    fn contraction_symmetry_is_bit_identical_to_full_nest() {
+        check_bit_identical::<2>(0x0000_0002_C0FF_EE01, 1000);
+        check_bit_identical::<3>(0x0000_0003_C0FF_EE01, 800);
+        check_bit_identical::<4>(0x0000_0004_C0FF_EE01, 600);
+        check_bit_identical::<9>(0x0000_0009_C0FF_EE01, 300);
+    }
+
+    /// Measure the wall-clock of the output-symmetric contraction vs the full
+    /// nest at `K = 9` (it does ~2× fewer inner contractions; the bit-identity
+    /// test is the correctness gate). Informational — wall-clock is noisy — with
+    /// only a PATHOLOGICAL-regression guard (the symmetric form does strictly
+    /// fewer inner contractions, so it must not be materially slower).
+    #[test]
+    fn contraction_symmetry_speedup_is_reported() {
+        const K: usize = 9;
+        let mut r = Rng(0xC0FF_EE99_1234_5678);
+        let towers: Vec<Tower4<K>> = (0..512).map(|_| rand_sym4::<K>(&mut r)).collect();
+        let dir: [f64; K] = std::array::from_fn(|_| r.s());
+        let u: [f64; K] = std::array::from_fn(|_| r.s());
+        let w: [f64; K] = std::array::from_fn(|_| r.s());
+
+        let reps = 400usize;
+        let t_sym = {
+            let start = std::time::Instant::now();
+            let mut sink = 0.0f64;
+            for _ in 0..reps {
+                for t in &towers {
+                    let o3 = std::hint::black_box(t).third_contracted(std::hint::black_box(&dir));
+                    let o4 = std::hint::black_box(t)
+                        .fourth_contracted(std::hint::black_box(&u), std::hint::black_box(&w));
+                    sink += o3[0][K - 1] + o4[0][K - 1];
+                }
+            }
+            std::hint::black_box(sink);
+            start.elapsed().as_secs_f64()
+        };
+        let t_full = {
+            let start = std::time::Instant::now();
+            let mut sink = 0.0f64;
+            for _ in 0..reps {
+                for t in &towers {
+                    let o3 = third_full(std::hint::black_box(t), std::hint::black_box(&dir));
+                    let o4 = fourth_full(
+                        std::hint::black_box(t),
+                        std::hint::black_box(&u),
+                        std::hint::black_box(&w),
+                    );
+                    sink += o3[0][K - 1] + o4[0][K - 1];
+                }
+            }
+            std::hint::black_box(sink);
+            start.elapsed().as_secs_f64()
+        };
+        let calls = (reps * towers.len()) as f64;
+        eprintln!(
+            "[contraction-symmetry speedup K=9] sym={:.1}ns/call full={:.1}ns/call \
+             wall_speedup={:.2}x",
+            t_sym / calls * 1e9,
+            t_full / calls * 1e9,
+            t_full / t_sym
+        );
+        assert!(
+            t_sym <= t_full * 1.5,
+            "output-symmetric contraction pathologically slower: \
+             sym={t_sym:.4}s full={t_full:.4}s"
+        );
     }
 }
