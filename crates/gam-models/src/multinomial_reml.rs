@@ -917,7 +917,7 @@ impl MultinomialFamily {
         probs_full: ArrayView2<'_, f64>,
         directions: &[Array1<f64>],
     ) -> Result<Vec<Array2<f64>>, String> {
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
         let n_dirs = directions.len();
         if n_dirs == 0 {
@@ -936,103 +936,91 @@ impl MultinomialFamily {
             }
         }
         let design = self.design.view();
-        let flat = (0..n)
-            .into_par_iter()
-            .fold(
-                || vec![0.0_f64; n_dirs * dim * dim],
-                |mut acc, row| {
+        // #1082: parallelise over the DIRECTION batch instead of rows, dropping
+        // the `n_dirs·dim·dim` per-worker accumulator + `reduce` (see the note on
+        // `assemble_all_axis_directional_derivatives`). Each direction owns one
+        // `dim·dim` block and scans all rows independently; the per-row
+        // arithmetic is unchanged (only the row-summation order differs, admitted
+        // to 1e-10 by the batched-vs-per-direction parity test).
+        let out: Vec<Array2<f64>> = directions
+            .par_iter()
+            .map(|direction| {
+                let mut mat = vec![0.0_f64; dim * dim];
+                let mut d_eta = vec![0.0_f64; m];
+                let mut dp = vec![0.0_f64; m];
+                for row in 0..n {
                     let w = self.weights[row];
                     if w == 0.0 {
-                        return acc;
+                        continue;
                     }
-                    let mut d_eta = vec![0.0_f64; m];
-                    let mut dp = vec![0.0_f64; m];
-                    for (dir_idx, direction) in directions.iter().enumerate() {
-                        let mut s = 0.0_f64;
-                        for a in 0..m {
-                            let base = a * p;
-                            let mut eta_dir = 0.0_f64;
-                            for i in 0..p {
-                                eta_dir += design[[row, i]] * direction[base + i];
-                            }
-                            d_eta[a] = eta_dir;
-                            s += probs_full[[row, a]] * eta_dir;
+                    let mut s = 0.0_f64;
+                    for a in 0..m {
+                        let base = a * p;
+                        let mut eta_dir = 0.0_f64;
+                        for i in 0..p {
+                            eta_dir += design[[row, i]] * direction[base + i];
                         }
-                        for a in 0..m {
-                            dp[a] = probs_full[[row, a]] * (d_eta[a] - s);
-                        }
+                        d_eta[a] = eta_dir;
+                        s += probs_full[[row, a]] * eta_dir;
+                    }
+                    for a in 0..m {
+                        dp[a] = probs_full[[row, a]] * (d_eta[a] - s);
+                    }
 
-                        let dir_base = dir_idx * dim * dim;
-                        for a in 0..m {
-                            let pa = probs_full[[row, a]];
-                            let row_a = a * p;
-                            let jaa = w * (dp[a] - 2.0 * dp[a] * pa);
-                            if jaa != 0.0 {
-                                for i in 0..p {
-                                    let xi = design[[row, i]];
-                                    if xi == 0.0 {
-                                        continue;
-                                    }
-                                    let scaled = jaa * xi;
-                                    let out_row = dir_base + (row_a + i) * dim;
-                                    for j in 0..p {
-                                        acc[out_row + row_a + j] += scaled * design[[row, j]];
-                                    }
-                                }
-                            }
-                            for b in (a + 1)..m {
-                                let pb = probs_full[[row, b]];
-                                let jab = w * (-(dp[a] * pb + pa * dp[b]));
-                                if jab == 0.0 {
+                    for a in 0..m {
+                        let pa = probs_full[[row, a]];
+                        let row_a = a * p;
+                        let jaa = w * (dp[a] - 2.0 * dp[a] * pa);
+                        if jaa != 0.0 {
+                            for i in 0..p {
+                                let xi = design[[row, i]];
+                                if xi == 0.0 {
                                     continue;
                                 }
-                                let row_b = b * p;
-                                for i in 0..p {
-                                    let xi = design[[row, i]];
-                                    if xi == 0.0 {
-                                        continue;
-                                    }
-                                    let scaled = jab * xi;
-                                    let out_a = dir_base + (row_a + i) * dim;
-                                    let out_b = dir_base + (row_b + i) * dim;
-                                    for j in 0..p {
-                                        let xj = design[[row, j]];
-                                        let value = scaled * xj;
-                                        acc[out_a + row_b + j] += value;
-                                        acc[out_b + row_a + j] += value;
-                                    }
+                                let scaled = jaa * xi;
+                                let out_row = (row_a + i) * dim;
+                                for j in 0..p {
+                                    mat[out_row + row_a + j] += scaled * design[[row, j]];
+                                }
+                            }
+                        }
+                        for b in (a + 1)..m {
+                            let pb = probs_full[[row, b]];
+                            let jab = w * (-(dp[a] * pb + pa * dp[b]));
+                            if jab == 0.0 {
+                                continue;
+                            }
+                            let row_b = b * p;
+                            for i in 0..p {
+                                let xi = design[[row, i]];
+                                if xi == 0.0 {
+                                    continue;
+                                }
+                                let scaled = jab * xi;
+                                let out_a = (row_a + i) * dim;
+                                let out_b = (row_b + i) * dim;
+                                for j in 0..p {
+                                    let xj = design[[row, j]];
+                                    let value = scaled * xj;
+                                    mat[out_a + row_b + j] += value;
+                                    mat[out_b + row_a + j] += value;
                                 }
                             }
                         }
                     }
-                    acc
-                },
-            )
-            .reduce(
-                || vec![0.0_f64; n_dirs * dim * dim],
-                |mut a, b| {
-                    for (av, bv) in a.iter_mut().zip(b.iter()) {
-                        *av += *bv;
-                    }
-                    a
-                },
-            );
-
-        let mut out = Vec::with_capacity(n_dirs);
-        for dir_idx in 0..n_dirs {
-            let start = dir_idx * dim * dim;
-            let mut mat =
-                Array2::<f64>::from_shape_vec((dim, dim), flat[start..start + dim * dim].to_vec())
-                    .expect("batched direction derivative buffer is dim·dim");
-            for i in 0..dim {
-                for j in (i + 1)..dim {
-                    let avg = 0.5 * (mat[[i, j]] + mat[[j, i]]);
-                    mat[[i, j]] = avg;
-                    mat[[j, i]] = avg;
                 }
-            }
-            out.push(mat);
-        }
+                let mut mat = Array2::<f64>::from_shape_vec((dim, dim), mat)
+                    .expect("batched direction derivative buffer is dim·dim");
+                for i in 0..dim {
+                    for j in (i + 1)..dim {
+                        let avg = 0.5 * (mat[[i, j]] + mat[[j, i]]);
+                        mat[[i, j]] = avg;
+                        mat[[j, i]] = avg;
+                    }
+                }
+                mat
+            })
+            .collect();
         Ok(out)
     }
 
@@ -1051,7 +1039,7 @@ impl MultinomialFamily {
         probs_full: ArrayView2<'_, f64>,
         pairs: &[(Array1<f64>, Array1<f64>)],
     ) -> Result<Vec<Array2<f64>>, String> {
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
         let n_pairs = pairs.len();
         if n_pairs == 0 {
@@ -1072,130 +1060,118 @@ impl MultinomialFamily {
         }
 
         let design = self.design.view();
-        let flat = (0..n)
-            .into_par_iter()
-            .fold(
-                || vec![0.0_f64; n_pairs * dim * dim],
-                |mut acc, row| {
+        // #1082: parallelise over the PAIR batch instead of rows, dropping the
+        // `n_pairs·dim·dim` per-worker accumulator + `reduce` (this is the exact
+        // outer Hessian's `K(K+1)/2` pair walk; see the note on
+        // `assemble_all_axis_directional_derivatives`). Each pair owns one
+        // `dim·dim` block and scans all rows independently; the per-row
+        // arithmetic is unchanged (only the row-summation order differs, admitted
+        // to 1e-10 by the workspace-batched-vs-per-pair parity test).
+        let out: Vec<Array2<f64>> = pairs
+            .par_iter()
+            .map(|(u, v)| {
+                let mut mat = vec![0.0_f64; dim * dim];
+                let mut d_eta_u = vec![0.0_f64; m];
+                let mut d_eta_v = vec![0.0_f64; m];
+                let mut dp_u = vec![0.0_f64; m];
+                let mut dp_v = vec![0.0_f64; m];
+                let mut ddp = vec![0.0_f64; m];
+                for row in 0..n {
                     let w = self.weights[row];
                     if w == 0.0 {
-                        return acc;
+                        continue;
                     }
-                    let mut d_eta_u = vec![0.0_f64; m];
-                    let mut d_eta_v = vec![0.0_f64; m];
-                    let mut dp_u = vec![0.0_f64; m];
-                    let mut dp_v = vec![0.0_f64; m];
-                    let mut ddp = vec![0.0_f64; m];
+                    let mut s_u = 0.0_f64;
+                    let mut s_v = 0.0_f64;
+                    for a in 0..m {
+                        let base = a * p;
+                        let mut eta_u = 0.0_f64;
+                        let mut eta_v = 0.0_f64;
+                        for i in 0..p {
+                            let x = design[[row, i]];
+                            eta_u += x * u[base + i];
+                            eta_v += x * v[base + i];
+                        }
+                        d_eta_u[a] = eta_u;
+                        d_eta_v[a] = eta_v;
+                        s_u += probs_full[[row, a]] * eta_u;
+                        s_v += probs_full[[row, a]] * eta_v;
+                    }
 
-                    for (pair_idx, (u, v)) in pairs.iter().enumerate() {
-                        let mut s_u = 0.0_f64;
-                        let mut s_v = 0.0_f64;
-                        for a in 0..m {
-                            let base = a * p;
-                            let mut eta_u = 0.0_f64;
-                            let mut eta_v = 0.0_f64;
+                    for a in 0..m {
+                        let pa = probs_full[[row, a]];
+                        dp_u[a] = pa * (d_eta_u[a] - s_u);
+                        dp_v[a] = pa * (d_eta_v[a] - s_v);
+                    }
+
+                    let mut ds_u_dv = 0.0_f64;
+                    for a in 0..m {
+                        ds_u_dv += dp_v[a] * d_eta_u[a];
+                    }
+                    for a in 0..m {
+                        let pa = probs_full[[row, a]];
+                        ddp[a] = dp_v[a] * (d_eta_u[a] - s_u) - pa * ds_u_dv;
+                    }
+
+                    for a in 0..m {
+                        let pa = probs_full[[row, a]];
+                        let row_a = a * p;
+                        let jaa = w * (ddp[a] - 2.0 * ddp[a] * pa - 2.0 * dp_u[a] * dp_v[a]);
+                        if jaa != 0.0 {
                             for i in 0..p {
-                                let x = design[[row, i]];
-                                eta_u += x * u[base + i];
-                                eta_v += x * v[base + i];
-                            }
-                            d_eta_u[a] = eta_u;
-                            d_eta_v[a] = eta_v;
-                            s_u += probs_full[[row, a]] * eta_u;
-                            s_v += probs_full[[row, a]] * eta_v;
-                        }
-
-                        for a in 0..m {
-                            let pa = probs_full[[row, a]];
-                            dp_u[a] = pa * (d_eta_u[a] - s_u);
-                            dp_v[a] = pa * (d_eta_v[a] - s_v);
-                        }
-
-                        let mut ds_u_dv = 0.0_f64;
-                        for a in 0..m {
-                            ds_u_dv += dp_v[a] * d_eta_u[a];
-                        }
-                        for a in 0..m {
-                            let pa = probs_full[[row, a]];
-                            ddp[a] = dp_v[a] * (d_eta_u[a] - s_u) - pa * ds_u_dv;
-                        }
-
-                        let pair_base = pair_idx * dim * dim;
-                        for a in 0..m {
-                            let pa = probs_full[[row, a]];
-                            let row_a = a * p;
-                            let jaa = w * (ddp[a] - 2.0 * ddp[a] * pa - 2.0 * dp_u[a] * dp_v[a]);
-                            if jaa != 0.0 {
-                                for i in 0..p {
-                                    let xi = design[[row, i]];
-                                    if xi == 0.0 {
-                                        continue;
-                                    }
-                                    let scaled = jaa * xi;
-                                    let out_row = pair_base + (row_a + i) * dim;
-                                    for j in 0..p {
-                                        acc[out_row + row_a + j] += scaled * design[[row, j]];
-                                    }
-                                }
-                            }
-
-                            for b in (a + 1)..m {
-                                let pb = probs_full[[row, b]];
-                                let jab = -w
-                                    * (ddp[a] * pb
-                                        + dp_u[a] * dp_v[b]
-                                        + dp_v[a] * dp_u[b]
-                                        + pa * ddp[b]);
-                                if jab == 0.0 {
+                                let xi = design[[row, i]];
+                                if xi == 0.0 {
                                     continue;
                                 }
-                                let row_b = b * p;
-                                for i in 0..p {
-                                    let xi = design[[row, i]];
-                                    if xi == 0.0 {
-                                        continue;
-                                    }
-                                    let scaled = jab * xi;
-                                    let out_a = pair_base + (row_a + i) * dim;
-                                    let out_b = pair_base + (row_b + i) * dim;
-                                    for j in 0..p {
-                                        let xj = design[[row, j]];
-                                        let value = scaled * xj;
-                                        acc[out_a + row_b + j] += value;
-                                        acc[out_b + row_a + j] += value;
-                                    }
+                                let scaled = jaa * xi;
+                                let out_row = (row_a + i) * dim;
+                                for j in 0..p {
+                                    mat[out_row + row_a + j] += scaled * design[[row, j]];
+                                }
+                            }
+                        }
+
+                        for b in (a + 1)..m {
+                            let pb = probs_full[[row, b]];
+                            let jab = -w
+                                * (ddp[a] * pb
+                                    + dp_u[a] * dp_v[b]
+                                    + dp_v[a] * dp_u[b]
+                                    + pa * ddp[b]);
+                            if jab == 0.0 {
+                                continue;
+                            }
+                            let row_b = b * p;
+                            for i in 0..p {
+                                let xi = design[[row, i]];
+                                if xi == 0.0 {
+                                    continue;
+                                }
+                                let scaled = jab * xi;
+                                let out_a = (row_a + i) * dim;
+                                let out_b = (row_b + i) * dim;
+                                for j in 0..p {
+                                    let xj = design[[row, j]];
+                                    let value = scaled * xj;
+                                    mat[out_a + row_b + j] += value;
+                                    mat[out_b + row_a + j] += value;
                                 }
                             }
                         }
                     }
-                    acc
-                },
-            )
-            .reduce(
-                || vec![0.0_f64; n_pairs * dim * dim],
-                |mut a, b| {
-                    for (av, bv) in a.iter_mut().zip(b.iter()) {
-                        *av += *bv;
-                    }
-                    a
-                },
-            );
-
-        let mut out = Vec::with_capacity(n_pairs);
-        for pair_idx in 0..n_pairs {
-            let start = pair_idx * dim * dim;
-            let mut mat =
-                Array2::<f64>::from_shape_vec((dim, dim), flat[start..start + dim * dim].to_vec())
-                    .expect("batched second-directional buffer is dim·dim");
-            for i in 0..dim {
-                for j in (i + 1)..dim {
-                    let avg = 0.5 * (mat[[i, j]] + mat[[j, i]]);
-                    mat[[i, j]] = avg;
-                    mat[[j, i]] = avg;
                 }
-            }
-            out.push(mat);
-        }
+                let mut mat = Array2::<f64>::from_shape_vec((dim, dim), mat)
+                    .expect("batched second-directional buffer is dim·dim");
+                for i in 0..dim {
+                    for j in (i + 1)..dim {
+                        let avg = 0.5 * (mat[[i, j]] + mat[[j, i]]);
+                        mat[[i, j]] = avg;
+                        mat[[j, i]] = avg;
+                    }
+                }
+                mat
+            })
+            .collect();
         Ok(out)
     }
 
@@ -1312,111 +1288,93 @@ impl MultinomialFamily {
         let n_axes = m * p;
         let probs_full = self.row_probabilities(eta);
         let design = self.design.view();
-        // Per-thread accumulator: one dense `(dim, dim)` buffer per axis, stored
-        // as a flat `n_axes · dim · dim` block so the inner scatter writes are
-        // contiguous and the parallel reduce is a single elementwise add.
-        let mut flat = (0..n)
+        // #1082: parallelise over OUTPUT AXES, not rows. The earlier row-fold
+        // allocated and zeroed a single flat `n_axes·dim·dim` accumulator PER
+        // rayon worker (e.g. ~370k f64 ≈ 3 MB each at the penguin K=3, k=10 fit)
+        // every call, then summed them all in a `reduce` — and this function is
+        // the per-inner-cycle hot path of the near-separable Jeffreys/Firth solve
+        // (gam#1082), so that `memset` + reduce dominated the wall clock. Each
+        // axis `(a0,i0)` writes only its own `dim·dim` block and is independent of
+        // every other axis, so mapping over axes drops the giant per-worker buffer
+        // (each task owns one `dim·dim` block ≈ 40 kB), removes the reduce, and
+        // load-balances across the `n_axes = m·p` outputs. The per-row arithmetic
+        // is unchanged; only the summation order differs (each block now sums rows
+        // in index order), which the parity tests admit to 1e-10.
+        (0..n_axes)
             .into_par_iter()
-            .fold(
-                || vec![0.0_f64; n_axes * dim * dim],
-                |mut acc, row| {
+            .map(|axis| {
+                let a0 = axis / p;
+                let i0 = axis % p;
+                let mut mat = vec![0.0_f64; dim * dim];
+                for row in 0..n {
                     let w = self.weights[row];
                     if w == 0.0 {
-                        return acc;
+                        continue;
                     }
-                    // dp̂_c = p_c (δ_{c,a0} − p_{a0}) for the active axis class a0,
-                    // computed per a0 below. The per-axis directional jet is then
-                    // `X[row,i0] · Ĵ_{a0}` (Ĵ shared across all i0 for that a0).
-                    for a0 in 0..m {
-                        let pa0 = probs_full[[row, a0]];
-                        // Ĵ_{a0}[c,d] (the X[row,i0]-free per-row jet) using the
-                        // SAME closed form as `directional_fisher_jet`:
-                        //   dp̂_c = p_c (δ_{c,a0} − p_{a0}),
-                        //   Ĵ[c,c] = w (dp̂_c − 2 dp̂_c p_c),
-                        //   Ĵ[c,d] = −w (dp̂_c p_d + p_c dp̂_d)   (c ≠ d).
-                        // Symmetric in (c,d), so store the full M×M.
-                        let mut jhat = vec![0.0_f64; m * m];
-                        for c in 0..m {
-                            let pc = probs_full[[row, c]];
-                            let dpc = pc * (if c == a0 { 1.0 } else { 0.0 } - pa0);
-                            jhat[c * m + c] = w * (dpc - 2.0 * dpc * pc);
-                            for d in (c + 1)..m {
-                                let pd = probs_full[[row, d]];
-                                let dpd = pd * (if d == a0 { 1.0 } else { 0.0 } - pa0);
-                                let off = w * (-(dpc * pd + pc * dpd));
-                                jhat[c * m + d] = off;
-                                jhat[d * m + c] = off;
-                            }
+                    let xi0 = design[[row, i0]];
+                    if xi0 == 0.0 {
+                        continue;
+                    }
+                    let pa0 = probs_full[[row, a0]];
+                    // Ĵ_{a0}[c,d] (the X[row,i0]-free per-row jet) using the SAME
+                    // closed form as `directional_fisher_jet`:
+                    //   dp̂_c = p_c (δ_{c,a0} − p_{a0}),
+                    //   Ĵ[c,c] = w (dp̂_c − 2 dp̂_c p_c),
+                    //   Ĵ[c,d] = −w (dp̂_c p_d + p_c dp̂_d)   (c ≠ d).
+                    let mut jhat = vec![0.0_f64; m * m];
+                    for c in 0..m {
+                        let pc = probs_full[[row, c]];
+                        let dpc = pc * (if c == a0 { 1.0 } else { 0.0 } - pa0);
+                        jhat[c * m + c] = w * (dpc - 2.0 * dpc * pc);
+                        for d in (c + 1)..m {
+                            let pd = probs_full[[row, d]];
+                            let dpd = pd * (if d == a0 { 1.0 } else { 0.0 } - pa0);
+                            let off = w * (-(dpc * pd + pc * dpd));
+                            jhat[c * m + d] = off;
+                            jhat[d * m + c] = off;
                         }
-                        // Scatter `X[row,i0] · Ĵ_{a0}[c,d] · X[row,i] X[row,j]`
-                        // into axis `(a0,i0)`'s `(dim,dim)` buffer. The block
-                        // `(c,d)` lives at rows `c·P .. c·P+P`, cols `d·P .. d·P+P`
-                        // — the output-major layout `dense_block_xtwx` produces.
-                        for i0 in 0..p {
-                            let xi0 = design[[row, i0]];
-                            if xi0 == 0.0 {
+                    }
+                    // Scatter `X[row,i0] · Ĵ_{a0}[c,d] · X[row,i] X[row,j]` into
+                    // this axis's `(dim,dim)` block (output-major: block `(c,d)`
+                    // at rows `c·P..`, cols `d·P..`).
+                    for c in 0..m {
+                        let row_c = c * p;
+                        for d in 0..m {
+                            let jcd = jhat[c * m + d];
+                            if jcd == 0.0 {
                                 continue;
                             }
-                            let axis = a0 * p + i0;
-                            let axis_base = axis * dim * dim;
-                            for c in 0..m {
-                                let row_c = c * p;
-                                for d in 0..m {
-                                    let jcd = jhat[c * m + d];
-                                    if jcd == 0.0 {
-                                        continue;
-                                    }
-                                    let wcd = xi0 * jcd;
-                                    let col_d = d * p;
-                                    for i in 0..p {
-                                        let xi = design[[row, i]];
-                                        if xi == 0.0 {
-                                            continue;
-                                        }
-                                        let scaled = wcd * xi;
-                                        let out_row = axis_base + (row_c + i) * dim;
-                                        for j in 0..p {
-                                            acc[out_row + col_d + j] += scaled * design[[row, j]];
-                                        }
-                                    }
+                            let wcd = xi0 * jcd;
+                            let col_d = d * p;
+                            for i in 0..p {
+                                let xi = design[[row, i]];
+                                if xi == 0.0 {
+                                    continue;
+                                }
+                                let scaled = wcd * xi;
+                                let out_row = (row_c + i) * dim;
+                                for j in 0..p {
+                                    mat[out_row + col_d + j] += scaled * design[[row, j]];
                                 }
                             }
                         }
                     }
-                    acc
-                },
-            )
-            .reduce(
-                || vec![0.0_f64; n_axes * dim * dim],
-                |mut a, b| {
-                    for (av, bv) in a.iter_mut().zip(b.iter()) {
-                        *av += *bv;
-                    }
-                    a
-                },
-            );
-        // Slice the flat buffer into per-axis `(dim, dim)` matrices, symmetrising
-        // each to cancel accumulator drift (matching `dense_block_xtwx`'s final
-        // pass so the result is identical to the per-axis route).
-        let mut out = Vec::with_capacity(n_axes);
-        for axis in 0..n_axes {
-            let start = axis * dim * dim;
-            let mut mat =
-                Array2::<f64>::from_shape_vec((dim, dim), flat[start..start + dim * dim].to_vec())
-                    .expect("axis derivative buffer is dim·dim");
-            for i in 0..dim {
-                for j in (i + 1)..dim {
-                    let avg = 0.5 * (mat[[i, j]] + mat[[j, i]]);
-                    mat[[i, j]] = avg;
-                    mat[[j, i]] = avg;
                 }
-            }
-            out.push(mat);
-        }
-        // Release the large flat buffer promptly.
-        flat.clear();
-        flat.shrink_to_fit();
-        out
+                let mut mat = Array2::<f64>::from_shape_vec((dim, dim), mat)
+                    .expect("axis derivative buffer is dim·dim");
+                // Symmetrise to cancel accumulator drift (matching
+                // `dense_block_xtwx`'s final pass so the result is identical to
+                // the per-axis route).
+                for i in 0..dim {
+                    for j in (i + 1)..dim {
+                        let avg = 0.5 * (mat[[i, j]] + mat[[j, i]]);
+                        mat[[i, j]] = avg;
+                        mat[[j, i]] = avg;
+                    }
+                }
+                mat
+            })
+            .collect()
     }
 
     /// Assemble the FULL set of second-directional joint-Hessian derivatives
@@ -1466,16 +1424,28 @@ impl MultinomialFamily {
         let probs_full = self.row_probabilities(eta);
         let d_eta_u = self.d_eta_from_d_beta(d_beta_u)?;
         let design = self.design.view();
-        let mut flat = (0..n)
+        // #1082: parallelise over OUTPUT AXES instead of rows, dropping the
+        // `n_axes·dim·dim` per-worker accumulator + `reduce` (see the matching
+        // note on `assemble_all_axis_directional_derivatives`). Each axis owns
+        // one `dim·dim` block and is independent. The per-row arithmetic is
+        // unchanged; only the row-summation order differs (admitted to 1e-10 by
+        // the batched/per-axis parity tests).
+        let out: Vec<Array2<f64>> = (0..n_axes)
             .into_par_iter()
-            .fold(
-                || vec![0.0_f64; n_axes * dim * dim],
-                |mut acc, row| {
+            .map(|axis| {
+                let a0 = axis / p;
+                let i0 = axis % p;
+                let mut mat = vec![0.0_f64; dim * dim];
+                for row in 0..n {
                     let w = self.weights[row];
                     if w == 0.0 {
-                        return acc;
+                        continue;
                     }
-                    // δ-only quantities (shared across all a0 / axes this row).
+                    let xi0 = design[[row, i0]];
+                    if xi0 == 0.0 {
+                        continue;
+                    }
+                    // δ-only quantities for this row.
                     let mut s_u = 0.0_f64;
                     for c in 0..m {
                         s_u += probs_full[[row, c]] * d_eta_u[[row, c]];
@@ -1484,102 +1454,76 @@ impl MultinomialFamily {
                     for c in 0..m {
                         dp_u[c] = probs_full[[row, c]] * (d_eta_u[[row, c]] - s_u);
                     }
-                    for a0 in 0..m {
-                        let pa0 = probs_full[[row, a0]];
-                        // a0-specific (X-free) v-side quantities.
-                        let mut dp_v_hat = vec![0.0_f64; m];
-                        let mut ds_u_dv = 0.0_f64;
-                        for c in 0..m {
-                            let pc = probs_full[[row, c]];
-                            let v = pc * (if c == a0 { 1.0 } else { 0.0 } - pa0);
-                            dp_v_hat[c] = v;
-                            ds_u_dv += v * d_eta_u[[row, c]];
+                    let pa0 = probs_full[[row, a0]];
+                    // a0-specific (X-free) v-side quantities.
+                    let mut dp_v_hat = vec![0.0_f64; m];
+                    let mut ds_u_dv = 0.0_f64;
+                    for c in 0..m {
+                        let pc = probs_full[[row, c]];
+                        let v = pc * (if c == a0 { 1.0 } else { 0.0 } - pa0);
+                        dp_v_hat[c] = v;
+                        ds_u_dv += v * d_eta_u[[row, c]];
+                    }
+                    let mut ddp_hat = vec![0.0_f64; m];
+                    for c in 0..m {
+                        let pc = probs_full[[row, c]];
+                        ddp_hat[c] = dp_v_hat[c] * (d_eta_u[[row, c]] - s_u) - pc * ds_u_dv;
+                    }
+                    // Ĵ²_{a0}[c,d] (the X[row,i0]-free per-row second jet),
+                    // matching `second_directional_fisher_jet` term-for-term.
+                    let mut jhat = vec![0.0_f64; m * m];
+                    for a in 0..m {
+                        let pa = probs_full[[row, a]];
+                        jhat[a * m + a] =
+                            w * (ddp_hat[a] * (1.0 - 2.0 * pa) - 2.0 * dp_u[a] * dp_v_hat[a]);
+                        for b in (a + 1)..m {
+                            let pb = probs_full[[row, b]];
+                            let off = -w
+                                * (ddp_hat[a] * pb
+                                    + dp_u[a] * dp_v_hat[b]
+                                    + dp_v_hat[a] * dp_u[b]
+                                    + pa * ddp_hat[b]);
+                            jhat[a * m + b] = off;
+                            jhat[b * m + a] = off;
                         }
-                        let mut ddp_hat = vec![0.0_f64; m];
-                        for c in 0..m {
-                            let pc = probs_full[[row, c]];
-                            ddp_hat[c] = dp_v_hat[c] * (d_eta_u[[row, c]] - s_u) - pc * ds_u_dv;
-                        }
-                        // Ĵ²_{a0}[c,d] (the X[row,i0]-free per-row second jet),
-                        // matching `second_directional_fisher_jet` term-for-term.
-                        let mut jhat = vec![0.0_f64; m * m];
-                        for a in 0..m {
-                            let pa = probs_full[[row, a]];
-                            jhat[a * m + a] =
-                                w * (ddp_hat[a] * (1.0 - 2.0 * pa) - 2.0 * dp_u[a] * dp_v_hat[a]);
-                            for b in (a + 1)..m {
-                                let pb = probs_full[[row, b]];
-                                let off = -w
-                                    * (ddp_hat[a] * pb
-                                        + dp_u[a] * dp_v_hat[b]
-                                        + dp_v_hat[a] * dp_u[b]
-                                        + pa * ddp_hat[b]);
-                                jhat[a * m + b] = off;
-                                jhat[b * m + a] = off;
-                            }
-                        }
-                        // Scatter `X[row,i0] · Ĵ²_{a0}[c,d] · X[row,i] X[row,j]`
-                        // into axis `(a0,i0)`'s `(dim,dim)` buffer (output-major).
-                        for i0 in 0..p {
-                            let xi0 = design[[row, i0]];
-                            if xi0 == 0.0 {
+                    }
+                    // Scatter `X[row,i0] · Ĵ²_{a0}[c,d] · X[row,i] X[row,j]` into
+                    // this axis's `(dim,dim)` block (output-major).
+                    for c in 0..m {
+                        let row_c = c * p;
+                        for d in 0..m {
+                            let jcd = jhat[c * m + d];
+                            if jcd == 0.0 {
                                 continue;
                             }
-                            let axis = a0 * p + i0;
-                            let axis_base = axis * dim * dim;
-                            for c in 0..m {
-                                let row_c = c * p;
-                                for d in 0..m {
-                                    let jcd = jhat[c * m + d];
-                                    if jcd == 0.0 {
-                                        continue;
-                                    }
-                                    let wcd = xi0 * jcd;
-                                    let col_d = d * p;
-                                    for i in 0..p {
-                                        let xi = design[[row, i]];
-                                        if xi == 0.0 {
-                                            continue;
-                                        }
-                                        let scaled = wcd * xi;
-                                        let out_row = axis_base + (row_c + i) * dim;
-                                        for j in 0..p {
-                                            acc[out_row + col_d + j] += scaled * design[[row, j]];
-                                        }
-                                    }
+                            let wcd = xi0 * jcd;
+                            let col_d = d * p;
+                            for i in 0..p {
+                                let xi = design[[row, i]];
+                                if xi == 0.0 {
+                                    continue;
+                                }
+                                let scaled = wcd * xi;
+                                let out_row = (row_c + i) * dim;
+                                for j in 0..p {
+                                    mat[out_row + col_d + j] += scaled * design[[row, j]];
                                 }
                             }
                         }
                     }
-                    acc
-                },
-            )
-            .reduce(
-                || vec![0.0_f64; n_axes * dim * dim],
-                |mut a, b| {
-                    for (av, bv) in a.iter_mut().zip(b.iter()) {
-                        *av += *bv;
-                    }
-                    a
-                },
-            );
-        let mut out = Vec::with_capacity(n_axes);
-        for axis in 0..n_axes {
-            let start = axis * dim * dim;
-            let mut mat =
-                Array2::<f64>::from_shape_vec((dim, dim), flat[start..start + dim * dim].to_vec())
-                    .expect("axis second-derivative buffer is dim·dim");
-            for i in 0..dim {
-                for j in (i + 1)..dim {
-                    let avg = 0.5 * (mat[[i, j]] + mat[[j, i]]);
-                    mat[[i, j]] = avg;
-                    mat[[j, i]] = avg;
                 }
-            }
-            out.push(mat);
-        }
-        flat.clear();
-        flat.shrink_to_fit();
+                let mut mat = Array2::<f64>::from_shape_vec((dim, dim), mat)
+                    .expect("axis second-derivative buffer is dim·dim");
+                for i in 0..dim {
+                    for j in (i + 1)..dim {
+                        let avg = 0.5 * (mat[[i, j]] + mat[[j, i]]);
+                        mat[[i, j]] = avg;
+                        mat[[j, i]] = avg;
+                    }
+                }
+                mat
+            })
+            .collect();
         Ok(out)
     }
 
