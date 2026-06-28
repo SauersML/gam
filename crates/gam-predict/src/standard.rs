@@ -110,18 +110,34 @@ impl StandardPredictor {
         })?;
         let plugin = self.predict_plugin_response(input)?;
         let eta_base = input.design.dot(&self.beta) + &input.offset;
-        let backend = posterior_mean_backend_or_warn(
+        let strategy = strategy_for_family(self.family.clone(), self.link_kind.as_ref());
+        let Some(backend) = posterior_mean_backend_or_warn(
             fit,
             self.covariance.as_ref(),
             self.beta.len() + runtime.beta.len(),
             "standard link-wiggle posterior mean",
-        )
-        .ok_or_else(|| {
-            EstimationError::InvalidInput(
-                "posterior-mean prediction requires beta covariance or penalized Hessian"
-                    .to_string(),
-            )
-        })?;
+        ) else {
+            // No usable coefficient covariance at the full warp width. The
+            // identifiable frozen-basis learnable-link fit (#1596) keeps its
+            // covariance in a reduced coordinate that does not match the
+            // widened standard-basis warp the predict layer reconstructs, so the
+            // posterior-mean uncertainty integral is unavailable. Degrade
+            // gracefully to the finite plug-in mean `g⁻¹(q̂)` (the reported
+            // linear predictor) rather than failing the whole prediction;
+            // `eta_se`/`mean_se` are then `None`.
+            let mean = plugin
+                .eta
+                .iter()
+                .map(|&e| strategy.inverse_link(e))
+                .collect::<Result<Array1<f64>, _>>()?;
+            return Ok(LinearState {
+                eta: plugin.eta,
+                mean,
+                eta_se: None,
+                mean_se: None,
+                covariance_corrected_used: false,
+            });
+        };
         let p_main = self.beta.len();
         let p_w = runtime.beta.len();
         let p_total = p_main + p_w;
@@ -138,7 +154,6 @@ impl StandardPredictor {
             },
             "standard link-wiggle posterior mean covariance mismatch",
         )?;
-        let strategy = strategy_for_family(self.family.clone(), self.link_kind.as_ref());
         let quadctx = gam::quadrature::QuadratureContext::new();
         let mean = plugin
             .eta
