@@ -13,3 +13,26 @@ pub enum LinalgError {
     )]
     ModelIsIllConditioned { condition_number: f64 },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_input_display_contains_message() {
+        let err = LinalgError::InvalidInput("bad dims".to_string());
+        assert!(err.to_string().contains("bad dims"));
+    }
+
+    #[test]
+    fn hessian_not_spd_display_contains_min_eigenvalue() {
+        let err = LinalgError::HessianNotPositiveDefinite { min_eigenvalue: -0.001 };
+        assert!(err.to_string().to_lowercase().contains("positive definite"));
+    }
+
+    #[test]
+    fn ill_conditioned_display_contains_condition_number() {
+        let err = LinalgError::ModelIsIllConditioned { condition_number: 1.5e12 };
+        assert!(err.to_string().to_lowercase().contains("ill-conditioned"));
+    }
+}
