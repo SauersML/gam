@@ -4940,4 +4940,112 @@ mod rowjet_bridge_tests {
         assert!(RowJet::guard(&s_bad, |v| v > 0.0).any_failed());
         assert_eq!(RowJet::guard(&s_ok, |v| v > 0.0).lanes(), 1);
     }
+
+    // ── ln_gamma_derivative_stack / digamma_derivative_stack / trigamma_derivative_stack ──
+
+    #[test]
+    fn ln_gamma_derivative_stack_known_values_at_1() {
+        let s = ln_gamma_derivative_stack(1.0);
+        // ln Γ(1) = 0; statrs uses Lanczos so the result is within ULP noise
+        assert!(s[0].abs() < 1e-14, "ln_gamma(1) must be ~0, got {}", s[0]);
+        // ψ₀(1) = -γ  (Euler–Mascheroni)
+        let euler_mascheroni = 0.577_215_664_901_532_9_f64;
+        assert!(
+            (s[1] + euler_mascheroni).abs() < 1e-10,
+            "digamma(1) ≈ -{euler_mascheroni:.6}, got {}",
+            s[1]
+        );
+        // ψ₁(1) = π²/6
+        let pi2_6 = std::f64::consts::PI * std::f64::consts::PI / 6.0;
+        assert!(
+            (s[2] - pi2_6).abs() < 1e-10,
+            "trigamma(1) ≈ {pi2_6:.6}, got {}",
+            s[2]
+        );
+    }
+
+    #[test]
+    fn ln_gamma_derivative_stack_known_values_at_2() {
+        let s = ln_gamma_derivative_stack(2.0);
+        // ln Γ(2) = ln(1) = 0 exactly
+        assert!(s[0].abs() < 1e-14, "ln_gamma(2) must be 0, got {}", s[0]);
+        // ψ₀(2) = 1 − γ (recurrence: ψ₀(x+1) = ψ₀(x) + 1/x)
+        let euler_mascheroni = 0.577_215_664_901_532_9_f64;
+        let digamma_2 = 1.0 - euler_mascheroni;
+        assert!(
+            (s[1] - digamma_2).abs() < 1e-10,
+            "digamma(2) ≈ {digamma_2:.6}, got {}",
+            s[1]
+        );
+    }
+
+    #[test]
+    fn ln_gamma_derivative_stack_order2_is_prefix() {
+        for &x in &[0.5_f64, 1.0, 2.0, 5.0] {
+            let full = ln_gamma_derivative_stack(x);
+            let ord2 = ln_gamma_derivative_stack_order2(x);
+            assert_eq!(
+                ord2[0], full[0],
+                "order2[0] != full[0] at x={x}"
+            );
+            assert_eq!(
+                ord2[1], full[1],
+                "order2[1] != full[1] at x={x}"
+            );
+            assert_eq!(
+                ord2[2], full[2],
+                "order2[2] != full[2] at x={x}"
+            );
+        }
+    }
+
+    #[test]
+    fn digamma_derivative_stack_overlaps_ln_gamma_stack() {
+        // The two stacks share a run of four polygamma values:
+        // ln_gamma_stack[1..5] == digamma_stack[0..4]
+        for &x in &[0.5_f64, 1.0, 2.0, 7.0] {
+            let lg = ln_gamma_derivative_stack(x);
+            let dg = digamma_derivative_stack(x);
+            for i in 0..4 {
+                assert_eq!(
+                    lg[i + 1], dg[i],
+                    "ln_gamma_stack[{}] != digamma_stack[{}] at x={x}",
+                    i + 1,
+                    i
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn trigamma_derivative_stack_overlaps_digamma_stack() {
+        // digamma_stack[1..5] == trigamma_stack[0..4]
+        for &x in &[0.5_f64, 1.0, 2.0, 7.0] {
+            let dg = digamma_derivative_stack(x);
+            let tg = trigamma_derivative_stack(x);
+            for i in 0..4 {
+                assert_eq!(
+                    dg[i + 1], tg[i],
+                    "digamma_stack[{}] != trigamma_stack[{}] at x={x}",
+                    i + 1,
+                    i
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn derivative_stacks_all_finite_at_positive_inputs() {
+        for &x in &[0.01_f64, 0.5, 1.0, 2.0, 10.0, 100.0] {
+            for v in ln_gamma_derivative_stack(x) {
+                assert!(v.is_finite(), "ln_gamma_stack non-finite at x={x}: {v}");
+            }
+            for v in digamma_derivative_stack(x) {
+                assert!(v.is_finite(), "digamma_stack non-finite at x={x}: {v}");
+            }
+            for v in trigamma_derivative_stack(x) {
+                assert!(v.is_finite(), "trigamma_stack non-finite at x={x}: {v}");
+            }
+        }
+    }
 }
