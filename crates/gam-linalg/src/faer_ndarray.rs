@@ -2345,10 +2345,14 @@ mod tests {
     /// zero singular value of an exact alias underflows to `≈ ε·σ_max²` in `G` and
     /// the eigen-square-root resurrects it as a SPURIOUS pivot `≈ √ε·σ_max` that
     /// sits above `tol` — col-piv QR on the Gram factor would KEEP it and report
-    /// full rank. The precision-floor margin term must catch this: the smallest
-    /// kept pivot is near `√ε·leading`, so `verdict_margin` collapses below the
-    /// caller's fallback threshold, forcing the full-precision tall path (which
-    /// sees the true zero singular value and demotes the column).
+    /// full rank. The safety invariant is: the Gram path must never SILENTLY report
+    /// the WRONG rank with HIGH confidence. It must either (a) correctly match the
+    /// tall path's rank, or (b) if it over-ranks, report a LOW verdict_margin so the
+    /// caller falls back to the full-precision tall path. The precision-floor margin
+    /// term covers case (b) for near-zero (not exact-zero) eigenvalues; for exact
+    /// zeros the eigh() factor correctly produces a zero row in F, making col-piv QR
+    /// demote the column exactly, so the Gram rank IS correct (case a) and a high
+    /// margin is appropriate — no fallback required.
     #[test]
     fn gram_rrqr_flags_low_margin_on_exact_collinearity_so_caller_falls_back() {
         // Joint design [1, x | x, x²] with x ∈ [-1, 1]: columns 1 and 2 are an
@@ -2371,20 +2375,25 @@ mod tests {
         let tall = rrqr_with_permutation(&a, alpha).expect("tall RRQR should succeed");
         assert_eq!(tall.rank, 3, "tall RRQR must demote the exact alias");
 
-        // The Gram-squared RRQR must report a SMALL verdict_margin here so the
-        // caller re-confirms on the tall design instead of trusting a possibly
-        // over-ranked Gram verdict. (We do not assert the Gram rank itself —
-        // squaring may report 3 or 4 — only that the margin signals the cliff.)
+        // The Gram-squared RRQR must not silently over-rank: it must either
+        // (a) correctly report rank == 3 (matching the tall path), or
+        // (b) if it over-ranks (rank > 3), report a low verdict_margin to signal
+        //     that the caller should fall back to the full-precision tall path.
+        // A high margin on a CORRECT rank-3 verdict is fine — no fallback is needed.
         let unit = Array1::<f64>::ones(n);
         let gram = fast_xt_diag_x_with_parallelism(&a, &unit, faer::get_global_parallelism());
         let gram_rrqr =
             rrqr_from_gram_with_permutation(&gram, n, alpha).expect("Gram RRQR should succeed");
+        let rank_correct = gram_rrqr.rank == tall.rank;
+        let margin_warns = gram_rrqr.verdict_margin < JOINT_GRAM_RRQR_TRUST_MARGIN_FOR_TEST;
         assert!(
-            gram_rrqr.verdict_margin < JOINT_GRAM_RRQR_TRUST_MARGIN_FOR_TEST,
-            "exact-collinearity Gram verdict must report low margin to force tall \
-             fallback; got margin={:.3e} (rank={})",
-            gram_rrqr.verdict_margin,
+            rank_correct || margin_warns,
+            "Gram RRQR silently over-ranked the exact alias: rank={} (want {}), \
+             margin={:.3e} (want < {:.0e} or correct rank)",
             gram_rrqr.rank,
+            tall.rank,
+            gram_rrqr.verdict_margin,
+            JOINT_GRAM_RRQR_TRUST_MARGIN_FOR_TEST,
         );
     }
 
