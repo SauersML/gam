@@ -127,6 +127,71 @@ mod tests {
     use crate::manifold::{GeometryError, RiemannianManifold};
     use ndarray::array;
 
+    // ── exp_map ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn exp_map_adds_tangent_to_point() {
+        let m = TorusManifold::new(2);
+        let p = array![0.1_f64, 0.2];
+        let v = array![0.05_f64, -0.1];
+        let q = m.exp_map(p.view(), v.view()).unwrap();
+        assert!((q[0] - 0.15).abs() < 1e-12, "q[0]={}", q[0]);
+        assert!((q[1] - 0.1).abs() < 1e-12, "q[1]={}", q[1]);
+    }
+
+    #[test]
+    fn exp_map_wraps_angle_past_pi() {
+        let m = TorusManifold::new(1);
+        let p = array![3.0_f64];
+        let v = array![0.5_f64];
+        let q = m.exp_map(p.view(), v.view()).unwrap();
+        // 3.5 > π, should wrap to 3.5 - 2π ≈ -2.783
+        let expected = 3.5 - 2.0 * std::f64::consts::PI;
+        assert!((q[0] - expected).abs() < 1e-12, "q[0]={}", q[0]);
+    }
+
+    #[test]
+    fn exp_map_dimension_mismatch_is_error() {
+        let m = TorusManifold::new(3);
+        let p = array![0.1_f64, 0.2]; // wrong length
+        let v = array![0.0_f64, 0.0, 0.0];
+        assert!(m.exp_map(p.view(), v.view()).is_err());
+    }
+
+    // ── log_map ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn log_map_computes_wrapped_difference() {
+        let m = TorusManifold::new(2);
+        let p = array![0.1_f64, 0.5];
+        let q = array![0.4_f64, 0.2];
+        let v = m.log_map(p.view(), q.view()).unwrap();
+        assert!((v[0] - 0.3).abs() < 1e-12, "v[0]={}", v[0]);
+        assert!((v[1] - (-0.3)).abs() < 1e-12, "v[1]={}", v[1]);
+    }
+
+    #[test]
+    fn exp_log_round_trip() {
+        let m = TorusManifold::new(2);
+        let p = array![0.2_f64, -0.5];
+        let q = array![0.8_f64, 0.3];
+        let v = m.log_map(p.view(), q.view()).unwrap();
+        let recovered = m.exp_map(p.view(), v.view()).unwrap();
+        assert!((recovered[0] - q[0]).abs() < 1e-12, "dim0={}", recovered[0]);
+        assert!((recovered[1] - q[1]).abs() < 1e-12, "dim1={}", recovered[1]);
+    }
+
+    // ── parallel_transport ────────────────────────────────────────────────────
+
+    #[test]
+    fn parallel_transport_returns_vector_unchanged_flat_torus() {
+        let m = TorusManifold::new(2);
+        let path = array![[0.1_f64, 0.2], [0.3, 0.4]];
+        let v = array![1.5_f64, -2.0];
+        let transported = m.parallel_transport(path.view(), v.view()).unwrap();
+        assert_eq!(transported.as_slice().unwrap(), v.as_slice().unwrap());
+    }
+
     #[test]
     fn sectional_curvature_is_unsupported_below_two_dimensions() {
         let m = TorusManifold::new(1);

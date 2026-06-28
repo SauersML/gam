@@ -125,6 +125,80 @@ mod tests {
     use crate::manifold::{GeometryError, RiemannianManifold};
     use ndarray::array;
 
+    // ── exp_map ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn exp_map_is_addition() {
+        let m = EuclideanManifold::new(3);
+        let p = array![1.0_f64, 2.0, 3.0];
+        let v = array![0.5_f64, -1.0, 2.0];
+        let q = m.exp_map(p.view(), v.view()).unwrap();
+        assert!((q[0] - 1.5).abs() < 1e-14);
+        assert!((q[1] - 1.0).abs() < 1e-14);
+        assert!((q[2] - 5.0).abs() < 1e-14);
+    }
+
+    #[test]
+    fn exp_map_dimension_mismatch_is_error() {
+        let m = EuclideanManifold::new(3);
+        let p = array![1.0_f64, 2.0]; // wrong length
+        let v = array![0.0_f64, 0.0, 0.0];
+        assert!(m.exp_map(p.view(), v.view()).is_err());
+    }
+
+    // ── log_map ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn log_map_is_subtraction() {
+        let m = EuclideanManifold::new(2);
+        let p = array![1.0_f64, 2.0];
+        let q = array![4.0_f64, 0.0];
+        let v = m.log_map(p.view(), q.view()).unwrap();
+        assert!((v[0] - 3.0).abs() < 1e-14);
+        assert!((v[1] - (-2.0)).abs() < 1e-14);
+    }
+
+    #[test]
+    fn exp_log_round_trip() {
+        let m = EuclideanManifold::new(3);
+        let p = array![0.5_f64, -1.0, 2.0];
+        let v = array![1.0_f64, 3.0, -0.5];
+        let q = m.exp_map(p.view(), v.view()).unwrap();
+        let v2 = m.log_map(p.view(), q.view()).unwrap();
+        for i in 0..3 {
+            assert!((v2[i] - v[i]).abs() < 1e-14, "dim {i}: {} vs {}", v2[i], v[i]);
+        }
+    }
+
+    // ── parallel_transport ────────────────────────────────────────────────────
+
+    #[test]
+    fn parallel_transport_returns_vector_unchanged() {
+        let m = EuclideanManifold::new(3);
+        let path = array![[0.0_f64, 0.0, 0.0], [1.0, 1.0, 1.0]];
+        let v = array![2.0_f64, -3.0, 0.5];
+        let result = m.parallel_transport(path.view(), v.view()).unwrap();
+        for i in 0..3 {
+            assert_eq!(result[i], v[i], "dim {i}");
+        }
+    }
+
+    // ── metric_tensor ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn metric_tensor_is_identity() {
+        let m = EuclideanManifold::new(3);
+        let p = array![1.0_f64, 2.0, 3.0];
+        let g = m.metric_tensor(p.view()).unwrap();
+        assert_eq!(g.dim(), (3, 3));
+        for i in 0..3 {
+            for j in 0..3 {
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert!((g[[i, j]] - expected).abs() < 1e-14);
+            }
+        }
+    }
+
     #[test]
     fn sectional_curvature_is_zero_on_nondegenerate_plane() {
         let m = EuclideanManifold::new(2);
