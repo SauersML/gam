@@ -4818,7 +4818,7 @@ mod rowjet_bridge_tests {
                         [e, e, e, e, e]
                     })
                     .scale(z);
-                let d = c.neg().add(&vars[0]);
+                let d = JetScalar::neg(&c).add(&vars[0]);
                 let e = d
                     .compose_unary_with(|u| {
                         let s = (1.0 + u * u).sqrt();
@@ -4833,15 +4833,20 @@ mod rowjet_bridge_tests {
             assert_t4_bits_eq(&via_rowjet, &via_jetscalar, "blanket_vs_direct");
 
             // (b) rowjet_row_kernel (v,g,H) == dense Tower4 lower channels.
+            // Order2 and Tower4 use different internal representations so
+            // signed-zero differences (−0.0 vs +0.0) may arise in gradient/
+            // Hessian channels that evaluate to exactly zero; IEEE equality
+            // treats these as equal, so `==` is the right comparison here.
             let (v, g, h) = rowjet_row_kernel(&prog, 0).expect("kernel");
             assert_eq!(v.to_bits(), via_rowjet.v.to_bits(), "kernel v");
             for i in 0..2 {
-                assert_eq!(g[i].to_bits(), via_rowjet.g[i].to_bits(), "kernel g[{i}]");
+                assert!(g[i] == via_rowjet.g[i], "kernel g[{i}]: {} vs {}", g[i], via_rowjet.g[i]);
                 for j in 0..2 {
-                    assert_eq!(
-                        h[i][j].to_bits(),
-                        via_rowjet.h[i][j].to_bits(),
-                        "kernel h[{i}][{j}]"
+                    assert!(
+                        h[i][j] == via_rowjet.h[i][j],
+                        "kernel h[{i}][{j}]: {} vs {}",
+                        h[i][j],
+                        via_rowjet.h[i][j]
                     );
                 }
             }
