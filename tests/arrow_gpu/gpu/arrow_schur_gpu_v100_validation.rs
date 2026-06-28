@@ -1,5 +1,5 @@
 //! Block 3 V100 validation suite for the device-resident Arrow-Schur Newton
-//! solver (`gam::gpu::kernels::arrow_schur`). Five tests exercise the Layer-A/B/C
+//! solver (`gam::solver::gpu_kernels::arrow_schur`). Five tests exercise the Layer-A/B/C
 //! pipeline against the dense reference baseline; the Layer C↔D parity test
 //! ships alongside the Layer D NVRTC implementation.
 //!
@@ -29,7 +29,7 @@
 
 #![cfg(target_os = "linux")]
 
-use gam::gpu::kernels::arrow_schur::{
+use gam::solver::gpu_kernels::arrow_schur::{
     ArrowSchurGpuFailure, solve_arrow_newton_step, solve_arrow_newton_step_dense_reference,
     solve_arrow_newton_step_fused_force,
 };
@@ -119,8 +119,8 @@ fn assert_solution_matches(
     n: usize,
     d: usize,
     k: usize,
-    got: &gam::gpu::kernels::arrow_schur::ArrowSchurGpuSolution,
-    expected: &gam::gpu::kernels::arrow_schur::ArrowSchurGpuSolution,
+    got: &gam::solver::gpu_kernels::arrow_schur::ArrowSchurGpuSolution,
+    expected: &gam::solver::gpu_kernels::arrow_schur::ArrowSchurGpuSolution,
     tol: f64,
 ) {
     assert_eq!(got.delta_t.len(), n * d, "[{label}] delta_t length");
