@@ -194,3 +194,110 @@ fn mat_to_array(mat: MatRef<'_, f64>) -> Array2<f64> {
 // left a byte-identical copy here. Re-use the canonical one (this crate already
 // depends on gam-linalg and calls into `gam_linalg::faer_ndarray`).
 use gam_linalg::faer_ndarray::FaerArrayView;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::{array, Array1, Array2};
+
+    // ── should_use_faer_matmul ────────────────────────────────────────────────
+
+    #[test]
+    fn faer_dispatch_false_for_tiny_dims() {
+        assert!(!should_use_faer_matmul(1, 1, 1));
+        assert!(!should_use_faer_matmul(4, 4, 4));
+    }
+
+    #[test]
+    fn faer_dispatch_true_when_large_dim_and_flop_scale_met() {
+        // 64 × 64 × 64 = 262144 >= 4096, all dims >= 32
+        assert!(should_use_faer_matmul(64, 64, 64));
+    }
+
+    #[test]
+    fn faer_dispatch_false_when_flop_scale_not_met_despite_large_dim() {
+        // one dim large but product tiny: 32 × 1 × 1 = 32 < 4096
+        assert!(!should_use_faer_matmul(32, 1, 1));
+    }
+
+    // ── dense_matvec_into ─────────────────────────────────────────────────────
+
+    #[test]
+    fn matvec_identity_is_passthrough() {
+        let m = Array2::<f64>::eye(3);
+        let x = array![1.0_f64, 2.0, 3.0];
+        let mut out = Array1::<f64>::zeros(3);
+        dense_matvec_into(&m, x.view(), out.view_mut());
+        assert_eq!(out, x);
+    }
+
+    #[test]
+    fn matvec_known_2x3() {
+        // [[1,2,3],[4,5,6]] * [1,0,-1]^T = [1-3, 4-6] = [-2,-2]
+        let m = array![[1.0_f64, 2.0, 3.0], [4.0, 5.0, 6.0]];
+        let x = array![1.0_f64, 0.0, -1.0];
+        let mut out = Array1::<f64>::zeros(2);
+        dense_matvec_into(&m, x.view(), out.view_mut());
+        assert!((out[0] - (-2.0)).abs() < 1e-14);
+        assert!((out[1] - (-2.0)).abs() < 1e-14);
+    }
+
+    // ── dense_matvec_scaled_add_into ──────────────────────────────────────────
+
+    #[test]
+    fn scaled_add_zero_scale_is_noop() {
+        let m = Array2::<f64>::eye(2);
+        let x = array![5.0_f64, 6.0];
+        let mut out = array![10.0_f64, 20.0];
+        dense_matvec_scaled_add_into(&m, x.view(), 0.0, out.view_mut());
+        assert_eq!(out[0], 10.0);
+        assert_eq!(out[1], 20.0);
+    }
+
+    #[test]
+    fn scaled_add_accumulates_correctly() {
+        // out starts at [1,1]; add 2 * I * [3,4] → [1+6, 1+8] = [7, 9]
+        let m = Array2::<f64>::eye(2);
+        let x = array![3.0_f64, 4.0];
+        let mut out = array![1.0_f64, 1.0];
+        dense_matvec_scaled_add_into(&m, x.view(), 2.0, out.view_mut());
+        assert!((out[0] - 7.0).abs() < 1e-14);
+        assert!((out[1] - 9.0).abs() < 1e-14);
+    }
+
+    // ── dense_transpose_matvec_scaled_add_into ────────────────────────────────
+
+    #[test]
+    fn transpose_matvec_known_result() {
+        // A = [[1,2],[3,4],[5,6]] (3x2); x = [1,0,2]; A^T x = [1+10, 2+12] = [11, 14]
+        // scale = 1.0, out starts at [0,0]
+        let m = array![[1.0_f64, 2.0], [3.0, 4.0], [5.0, 6.0]];
+        let x = array![1.0_f64, 0.0, 2.0];
+        let mut out = Array1::<f64>::zeros(2);
+        dense_transpose_matvec_scaled_add_into(&m, x.view(), 1.0, out.view_mut());
+        assert!((out[0] - 11.0).abs() < 1e-14);
+        assert!((out[1] - 14.0).abs() < 1e-14);
+    }
+
+    // ── dense_bilinear ────────────────────────────────────────────────────────
+
+    #[test]
+    fn bilinear_with_identity_is_dot() {
+        let m = Array2::<f64>::eye(3);
+        let u = array![1.0_f64, 2.0, 3.0];
+        let v = array![4.0_f64, 5.0, 6.0];
+        let result = dense_bilinear(&m, v.view(), u.view());
+        // u^T I v = u · v = 4 + 10 + 18 = 32
+        assert!((result - 32.0).abs() < 1e-14);
+    }
+
+    #[test]
+    fn bilinear_known_2x2() {
+        // M = [[2,0],[0,3]], u = [1,2], v = [3,4] → u^T M v = 2*3 + 3*2*4 = 6+24 = 30
+        let m = array![[2.0_f64, 0.0], [0.0, 3.0]];
+        let u = array![1.0_f64, 2.0];
+        let v = array![3.0_f64, 4.0];
+        let result = dense_bilinear(&m, v.view(), u.view());
+        assert!((result - 30.0).abs() < 1e-14);
+    }
+}

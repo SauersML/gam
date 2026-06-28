@@ -152,3 +152,103 @@ impl CoefficientPriorMean {
         Ok(values)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    #[test]
+    fn zero_variant_returns_zeros_of_requested_len() {
+        let m = CoefficientPriorMean::Zero;
+        let v = m.evaluate(4, "ctx").unwrap();
+        assert_eq!(v.len(), 4);
+        assert!(v.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn scalar_fills_vector_with_constant() {
+        let m = CoefficientPriorMean::scalar(3.0);
+        let v = m.evaluate(3, "ctx").unwrap();
+        assert_eq!(v.len(), 3);
+        assert!(v.iter().all(|&x| x == 3.0));
+    }
+
+    #[test]
+    fn scalar_nan_returns_error() {
+        let m = CoefficientPriorMean::scalar(f64::NAN);
+        assert!(m.evaluate(2, "ctx").is_err());
+    }
+
+    #[test]
+    fn scalar_infinite_returns_error() {
+        let m = CoefficientPriorMean::scalar(f64::INFINITY);
+        assert!(m.evaluate(2, "ctx").is_err());
+    }
+
+    #[test]
+    fn constant_variant_clones_vector() {
+        let arr = array![1.0_f64, 2.0, 3.0];
+        let m = CoefficientPriorMean::constant(arr.clone());
+        let v = m.evaluate(3, "ctx").unwrap();
+        assert_eq!(v, arr);
+    }
+
+    #[test]
+    fn constant_dimension_mismatch_returns_error() {
+        let arr = array![1.0_f64, 2.0];
+        let m = CoefficientPriorMean::constant(arr);
+        assert!(m.evaluate(5, "ctx").is_err());
+    }
+
+    #[test]
+    fn functional_variant_calls_evaluator() {
+        let meta = array![0.0_f64];
+        let m = CoefficientPriorMean::functional(
+            meta,
+            Arc::new(|_| array![7.0_f64, 8.0]),
+        );
+        let v = m.evaluate(2, "ctx").unwrap();
+        assert_eq!(v[0], 7.0);
+        assert_eq!(v[1], 8.0);
+    }
+
+    #[test]
+    fn kernel_basis_scales_kernel_output() {
+        let covs = array![0.0_f64];
+        let m = CoefficientPriorMean::kernel_basis(
+            covs,
+            2.0,
+            Arc::new(|_| array![1.0_f64, 3.0]),
+        );
+        let v = m.evaluate(2, "ctx").unwrap();
+        assert!((v[0] - 2.0).abs() < 1e-14);
+        assert!((v[1] - 6.0).abs() < 1e-14);
+    }
+
+    #[test]
+    fn kernel_basis_nan_amplitude_returns_error() {
+        let covs = array![0.0_f64];
+        let m = CoefficientPriorMean::kernel_basis(
+            covs,
+            f64::NAN,
+            Arc::new(|_| array![1.0_f64]),
+        );
+        assert!(m.evaluate(1, "ctx").is_err());
+    }
+
+    #[test]
+    fn default_is_zero_variant() {
+        let m = CoefficientPriorMean::default();
+        let v = m.evaluate(5, "ctx").unwrap();
+        assert!(v.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn error_message_includes_context() {
+        let m = CoefficientPriorMean::scalar(f64::NAN);
+        let err = m.evaluate(1, "myctx").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("myctx"), "error should mention context: {msg}");
+    }
+}
