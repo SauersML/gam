@@ -505,6 +505,107 @@ mod tests {
         );
     }
 
+    // ── Direct faa_di_bruno / leibniz_product unit tests ────────────────────
+
+    use super::{faa_di_bruno, leibniz_product};
+
+    /// `faa_di_bruno` with m=0 (constant output) returns `derivs[0]`.
+    #[test]
+    fn faa_di_bruno_m_zero_returns_f_of_u() {
+        let result = faa_di_bruno(&[], &[7.5, 1.0, 2.0, 3.0, 4.0], |_| 0.0);
+        assert_eq!(result, 7.5, "m=0 should return derivs[0]");
+    }
+
+    /// `faa_di_bruno` with m=1, single variable: d/dx f(u(x)) = f'(u) * u'(x).
+    /// Choose u(x) = 2 (constant), u'(x) = 3; f(u) = e^u, f'(u) = e^2.
+    #[test]
+    fn faa_di_bruno_m_one_chain_rule() {
+        let e2 = 2.0_f64.exp();
+        let derivs = [e2, e2, e2, e2, e2]; // f^(r)(u) = e^2 for all r
+        let u_prime = 3.0_f64;
+        let result = faa_di_bruno(&[0], &derivs, |_| u_prime);
+        // Chain rule: f'(u) * u'(x) = e^2 * 3
+        let expected = e2 * u_prime;
+        assert!((result - expected).abs() < 1e-12, "m=1: {result} vs {expected}");
+    }
+
+    /// `faa_di_bruno` with m=2 (mixed second partial). For u = x*y (so
+    /// u_x = y, u_y = x, u_xx = u_yy = 0, u_xy = 1), and f = exp with
+    /// f'(0)=1, f''(0)=1, the second partial d²/dx dy exp(x*y)|_(0,0) = 1.
+    #[test]
+    fn faa_di_bruno_m_two_mixed_partial_of_exp_at_zero() {
+        // u = x*y at (0,0): value=0, u_x=0, u_y=0, u_xy=1.
+        // f = exp, f'(0)=1, f''(0)=1.
+        let derivs = [1.0_f64, 1.0, 1.0, 1.0, 1.0]; // all f^(r)(0)=1
+        let result = faa_di_bruno(&[0, 1], &derivs, |positions| match positions {
+            [] => 0.0,       // u(0,0) = 0 (unused by the formula for m=2)
+            [0] => 0.0,      // u_x = 0
+            [1] => 0.0,      // u_y = 0
+            [0, 1] => 1.0,   // u_xy = 1
+            _ => panic!("unexpected positions"),
+        });
+        // d²/dx dy exp(x*y)|_(0,0) = exp(0)*u_xy + exp(0)*u_x*u_y = 1*1 + 1*0*0 = 1
+        assert!((result - 1.0).abs() < 1e-14, "m=2 mixed: {result}");
+    }
+
+    /// `leibniz_product` with m=0 (constant * constant) = left([]) * right([]).
+    #[test]
+    fn leibniz_product_m_zero_is_product_of_values() {
+        let result = leibniz_product(&[], |_| 3.0, |_| 4.0);
+        assert_eq!(result, 12.0, "m=0: 3*4=12");
+    }
+
+    /// `leibniz_product` with m=1: d/dx (a(x)*b(x)) = a'*b + a*b'. Choose
+    /// a(x)=e^x at x=0 (a=1, a'=1) and b(x)=x² (b=0, b'=0)... better
+    /// to choose b(x)=x so b=0, b'=1. Then (a*b)' = 1*0 + 1*1 = 1. Hmm,
+    /// but with a=e^0=1 and derivative 1, b=0 and derivative 1: 1*0+1*1=1.
+    #[test]
+    fn leibniz_product_m_one_product_rule() {
+        let av = 2.0_f64;  // a(x0) = 2
+        let ad = 5.0_f64;  // a'(x0) = 5
+        let bv = 3.0_f64;  // b(x0) = 3
+        let bd = 7.0_f64;  // b'(x0) = 7
+        let result = leibniz_product(
+            &[0],
+            |pos| if pos.is_empty() { av } else { ad },
+            |pos| if pos.is_empty() { bv } else { bd },
+        );
+        // (a*b)' = a'*b + a*b' = 5*3 + 2*7 = 15+14 = 29
+        let expected = ad * bv + av * bd;
+        assert_eq!(result, expected, "m=1: {result} vs {expected}");
+    }
+
+    /// `leibniz_product` with m=2 (mixed second partial of a product).
+    /// d²/dx₀ dx₁ (a * b) = a_{01}*b + a_0*b_1 + a_1*b_0 + a*b_{01}.
+    #[test]
+    fn leibniz_product_m_two_mixed_second_partial() {
+        // Simple concrete values for a and b derivatives.
+        let a = |pos: &[usize]| -> f64 {
+            match pos {
+                [] => 2.0,     // a(x0)
+                [0] => 3.0,    // a_{x0}
+                [1] => 5.0,    // a_{x1}
+                _ => 7.0,      // a_{x0,x1}
+            }
+        };
+        let b = |pos: &[usize]| -> f64 {
+            match pos {
+                [] => 11.0,    // b(x0)
+                [0] => 13.0,   // b_{x0}
+                [1] => 17.0,   // b_{x1}
+                _ => 19.0,     // b_{x0,x1}
+            }
+        };
+        let result = leibniz_product(&[0, 1], a, b);
+        // Leibniz: sum over all subsets T of {0,1}
+        // T={} : a({0,1})*b({}) = 7*11 = 77
+        // T={0}: a({1})*b({0}) = 5*13 = 65
+        // T={1}: a({0})*b({1}) = 3*17 = 51
+        // T={0,1}: a({})*b({0,1}) = 2*19 = 38
+        let expected = 7.0 * 11.0 + 5.0 * 13.0 + 3.0 * 17.0 + 2.0 * 19.0;
+        assert_eq!(result, expected, "m=2: {result} vs {expected}");
+    }
+
     fn exp_dirjet(j: &MultiDirJet) -> MultiDirJet {
         let e = j.coeff(0).exp();
         j.compose_unary([e, e, e, e, e])
