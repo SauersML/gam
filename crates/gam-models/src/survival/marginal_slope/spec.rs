@@ -80,9 +80,18 @@ pub(crate) fn survival_derivative_guard_tolerance(qd1: f64, derivative_guard: f6
 
 #[inline]
 pub(crate) fn survival_derivative_guard_violated(qd1: f64, derivative_guard: f64) -> bool {
-    !qd1.is_finite()
-        | !derivative_guard.is_finite()
-        | (qd1 + survival_derivative_guard_tolerance(qd1, derivative_guard) < derivative_guard)
+    if !qd1.is_finite() {
+        return true;
+    }
+    // NEG_INFINITY is the "no lower bound" sentinel used by callers that want to
+    // skip the guard entirely (e.g. GPU rowjet tests that don't compute a bound).
+    // Production paths assert derivative_guard is finite and positive before
+    // calling this function, so this branch only fires in the unbounded case.
+    if derivative_guard == f64::NEG_INFINITY {
+        return false;
+    }
+    !derivative_guard.is_finite()
+        || (qd1 + survival_derivative_guard_tolerance(qd1, derivative_guard) < derivative_guard)
 }
 
 pub struct SurvivalMarginalSlopeFitResult {

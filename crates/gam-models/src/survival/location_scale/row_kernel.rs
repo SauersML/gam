@@ -430,6 +430,20 @@ impl SurvivalLsRowKernel<'_> {
         &self,
         row: usize,
     ) -> Result<([f64; SLS_ROW_K], SurvivalExactRowKernel), String> {
+        self.row_nll_inputs_opt(row)?
+            .ok_or_else(|| format!("survival location-scale row {row} has no exact kernel"))
+    }
+
+    /// Like [`Self::row_nll_inputs`] but returns `Ok(None)` for degenerate rows
+    /// (survival probability underflowed to 0, derivatives non-finite) instead of
+    /// converting `None` to an error. Callers that accumulate per-row quantities
+    /// (third/fourth contracted forms) use this to skip degenerate rows with a
+    /// zero contribution — the same policy as `exact_row_kernel_rescaled` and the
+    /// `evaluate()` path which also treat these rows as non-contributors.
+    fn row_nll_inputs_opt(
+        &self,
+        row: usize,
+    ) -> Result<Option<([f64; SLS_ROW_K], SurvivalExactRowKernel)>, String> {
         let p = self.row_primary_values(row);
         let state = self.family.row_predictor_state(
             self.dynamic.h_entry[row],
@@ -441,9 +455,8 @@ impl SurvivalLsRowKernel<'_> {
         );
         let kernel = self
             .family
-            .exact_row_kernel_rescaled(row, state, self.deriv_log_scale)?
-            .ok_or_else(|| format!("survival location-scale row {row} has no exact kernel"))?;
-        Ok((p, kernel))
+            .exact_row_kernel_rescaled(row, state, self.deriv_log_scale)?;
+        Ok(kernel.map(|k| (p, k)))
     }
 }
 
@@ -1518,7 +1531,13 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
         // channel is exactly `Σ_c ℓ_{abc} dir_c` without materialising the dense
         // `t3`. Bit-identical to `row_nll_tower(row)?.third_contracted(dir)` by
         // the `survival_ls_packed_scalar_*` oracle.
-        let (p, kernel) = self.row_nll_inputs(row)?;
+        //
+        // Degenerate rows (survival probability underflowed to 0) return None
+        // from the exact kernel — treat their contribution as zero, consistent
+        // with how evaluate() and the zero-weight (w<=0) path handle them.
+        let Some((p, kernel)) = self.row_nll_inputs_opt(row)? else {
+            return Ok([[0.0; SLS_ROW_K]; SLS_ROW_K]);
+        };
         let vars: [OneSeed<SLS_ROW_K>; SLS_ROW_K] =
             std::array::from_fn(|a| OneSeed::seed_direction(p[a], a, dir[a]));
         Ok(sls_row_nll(&vars, &kernel)?.contracted_third())
@@ -1533,7 +1552,11 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
         // Packed two-seed scalar (2.8 KiB/row): the εδ-Hessian channel is exactly
         // `Σ_{cd} ℓ_{abcd} u_c v_d` without materialising the dense `t4`.
         // Bit-identical to `row_nll_tower(row)?.fourth_contracted(u, v)`.
-        let (p, kernel) = self.row_nll_inputs(row)?;
+        //
+        // Degenerate rows: same zero-contribution policy as row_third_contracted.
+        let Some((p, kernel)) = self.row_nll_inputs_opt(row)? else {
+            return Ok([[0.0; SLS_ROW_K]; SLS_ROW_K]);
+        };
         let vars: [TwoSeed<SLS_ROW_K>; SLS_ROW_K] =
             std::array::from_fn(|a| TwoSeed::seed(p[a], a, dir_u[a], dir_v[a]));
         Ok(sls_row_nll(&vars, &kernel)?.contracted_fourth())
