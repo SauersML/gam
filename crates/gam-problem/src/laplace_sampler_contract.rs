@@ -303,3 +303,96 @@ pub fn set_gaussian_mode_posterior_sampler(
 pub fn gaussian_mode_posterior_sampler() -> Option<&'static dyn GaussianModePosteriorSampler> {
     GAUSSIAN_MODE_POSTERIOR_SAMPLER.get().map(|b| b.as_ref())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    // ── laplace_skewness_threshold ────────────────────────────────────────────
+
+    #[test]
+    fn threshold_is_infinity_for_zero_n_eff() {
+        assert_eq!(laplace_skewness_threshold(0.0), f64::INFINITY);
+    }
+
+    #[test]
+    fn threshold_is_infinity_for_negative_n_eff() {
+        assert_eq!(laplace_skewness_threshold(-5.0), f64::INFINITY);
+    }
+
+    #[test]
+    fn threshold_known_value() {
+        // n_eff = 24/5 → sqrt((24/5) / (24/5)) = 1.0
+        let n_eff = 24.0 / 5.0;
+        let t = laplace_skewness_threshold(n_eff);
+        assert!((t - 1.0).abs() < 1e-14, "threshold={t}");
+    }
+
+    #[test]
+    fn threshold_decreases_as_n_eff_increases() {
+        let t_small = laplace_skewness_threshold(10.0);
+        let t_large = laplace_skewness_threshold(1000.0);
+        assert!(t_large < t_small, "threshold should decrease with more data");
+    }
+
+    // ── laplace_trustworthiness_from_skewness ─────────────────────────────────
+
+    #[test]
+    fn all_small_skewness_gives_no_untrustworthy_directions() {
+        // With n_eff=1000, threshold ≈ 0.069; all |γ| < that
+        let skewness = array![0.01_f64, -0.02, 0.005];
+        let result = laplace_trustworthiness_from_skewness(&skewness, 1000.0);
+        assert!(result.untrustworthy_directions.is_empty());
+        assert!(!result.fallback_required());
+    }
+
+    #[test]
+    fn large_skewness_flagged_as_untrustworthy() {
+        // With n_eff=10, threshold ≈ 0.693; γ=2.0 exceeds it
+        let skewness = array![0.1_f64, 2.0];
+        let result = laplace_trustworthiness_from_skewness(&skewness, 10.0);
+        assert!(result.untrustworthy_directions.contains(&1));
+        assert!(!result.untrustworthy_directions.contains(&0));
+        assert!(result.fallback_required());
+    }
+
+    #[test]
+    fn max_abs_skewness_is_largest_abs_value() {
+        let skewness = array![1.5_f64, -3.0, 2.0];
+        let result = laplace_trustworthiness_from_skewness(&skewness, 1.0);
+        assert!((result.max_abs_skewness - 3.0).abs() < 1e-14);
+    }
+
+    #[test]
+    fn non_finite_skewness_treated_as_zero_for_max_abs() {
+        let skewness = array![f64::NAN, 1.0];
+        let result = laplace_trustworthiness_from_skewness(&skewness, 1.0);
+        // NaN is treated as 0 in the loop; max_abs comes from 1.0
+        assert!((result.max_abs_skewness - 1.0).abs() < 1e-14);
+    }
+
+    // ── LaplaceTrustworthiness::fallback_required ─────────────────────────────
+
+    #[test]
+    fn fallback_required_true_when_directions_nonempty() {
+        let lt = LaplaceTrustworthiness {
+            directional_skewness: array![1.0_f64],
+            untrustworthy_directions: vec![0],
+            threshold: 0.5,
+            max_abs_skewness: 1.0,
+        };
+        assert!(lt.fallback_required());
+    }
+
+    #[test]
+    fn fallback_required_false_when_directions_empty() {
+        let lt = LaplaceTrustworthiness {
+            directional_skewness: array![0.1_f64],
+            untrustworthy_directions: vec![],
+            threshold: 0.5,
+            max_abs_skewness: 0.1,
+        };
+        assert!(!lt.fallback_required());
+    }
+}

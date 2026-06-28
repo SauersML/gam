@@ -465,3 +465,117 @@ impl EfsEval {
         self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    // ── OuterHessianMaterialization ───────────────────────────────────────────
+
+    #[test]
+    fn unavailable_is_not_available() {
+        assert!(!OuterHessianMaterialization::Unavailable.is_available());
+    }
+
+    #[test]
+    fn repeated_hvp_is_available() {
+        assert!(OuterHessianMaterialization::RepeatedHvp.is_available());
+    }
+
+    #[test]
+    fn batched_hvp_is_available() {
+        assert!(OuterHessianMaterialization::BatchedHvp.is_available());
+    }
+
+    #[test]
+    fn explicit_is_available() {
+        assert!(OuterHessianMaterialization::Explicit.is_available());
+    }
+
+    // ── DeclaredHessianForm ───────────────────────────────────────────────────
+
+    #[test]
+    fn declared_unavailable_is_not_analytic() {
+        assert!(!DeclaredHessianForm::Unavailable.is_analytic());
+    }
+
+    #[test]
+    fn declared_dense_is_analytic() {
+        assert!(DeclaredHessianForm::Dense.is_analytic());
+    }
+
+    #[test]
+    fn declared_either_is_analytic() {
+        assert!(DeclaredHessianForm::Either.is_analytic());
+    }
+
+    #[test]
+    fn declared_operator_is_analytic() {
+        let form = DeclaredHessianForm::Operator {
+            materialization: OuterHessianMaterialization::Explicit,
+            estimated_materialization_cost: None,
+        };
+        assert!(form.is_analytic());
+    }
+
+    #[test]
+    fn only_operator_variant_is_operator_only() {
+        let form = DeclaredHessianForm::Operator {
+            materialization: OuterHessianMaterialization::RepeatedHvp,
+            estimated_materialization_cost: Some(1.0),
+        };
+        assert!(form.is_operator_only());
+        assert!(!DeclaredHessianForm::Dense.is_operator_only());
+        assert!(!DeclaredHessianForm::Either.is_operator_only());
+        assert!(!DeclaredHessianForm::Unavailable.is_operator_only());
+    }
+
+    #[test]
+    fn only_dense_variant_is_dense_only() {
+        assert!(DeclaredHessianForm::Dense.is_dense_only());
+        assert!(!DeclaredHessianForm::Either.is_dense_only());
+        assert!(!DeclaredHessianForm::Unavailable.is_dense_only());
+    }
+
+    // ── HessianResult ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn hessian_unavailable_is_not_analytic() {
+        assert!(!HessianResult::Unavailable.is_analytic());
+    }
+
+    #[test]
+    fn hessian_analytic_is_analytic() {
+        let h = HessianResult::Analytic(array![[1.0_f64]]);
+        assert!(h.is_analytic());
+    }
+
+    #[test]
+    fn hessian_unavailable_dim_is_none() {
+        assert_eq!(HessianResult::Unavailable.dim(), None);
+    }
+
+    #[test]
+    fn hessian_analytic_dim_is_nrows() {
+        let h = HessianResult::Analytic(array![[1.0_f64, 0.0], [0.0, 1.0]]);
+        assert_eq!(h.dim(), Some(2));
+    }
+
+    // ── OuterEval ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn infeasible_eval_has_infinity_cost() {
+        let eval = OuterEval::infeasible(3);
+        assert_eq!(eval.cost, f64::INFINITY);
+        assert_eq!(eval.gradient.len(), 3);
+    }
+
+    #[test]
+    fn value_only_eval_has_specified_cost() {
+        let eval = OuterEval::value_only(42.5, 2, None);
+        assert_eq!(eval.cost, 42.5);
+        assert_eq!(eval.gradient.len(), 2);
+        assert!(eval.inner_beta_hint.is_none());
+    }
+}
