@@ -632,17 +632,28 @@ jobs:
         # current AND future test_*.py is collected automatically — no per-file
         # workflow line to hand-add. `-m "not slow"` drops the files tagged
         # @pytest.mark.slow (registered in pyproject.toml) so the long-running
-        # repros do not blow the standard runner's budget; everything else,
-        # including the @pytest.mark.xfail open-bug repros, still runs (an
-        # XFAIL/XPASS never reddens the suite).
+        # SAE / survival fits do not blow the standard runner's budget; every
+        # other test runs and is visible in the job log.
         #
-        # Still `continue-on-error: true`: the wheel build (build.rs human-author
-        # gate, #1458) could not be exercised in the triage environment, so the
-        # full green/red status of the gamfit-dependent suite was not verified
-        # end-to-end here. Keeping the step soft preserves the #1512 win (the
-        # orphaned repros now RUN and are visible in the job log) without risking
-        # a red gate on tests that were never confirmed green. Flip to a hard gate
-        # once a wheel-backed run confirms the `-m "not slow"` subset is green.
+        # `continue-on-error: true` is RETAINED ON PURPOSE — it cannot become a
+        # hard gate. The #1512 triage ran the whole `tests/test_*.py` suite
+        # against a freshly-built gamfit wheel. The orphaned repros split into:
+        #   (a) a large green set — stale fakes/APIs/inputs were fixed so those
+        #       tests now genuinely PASS, and
+        #   (b) ~20 files that document still-OPEN engine bugs and therefore
+        #       FAIL (SAE pyo3 index-out-of-bounds panics #357/#240; SAE-REML
+        #       non-convergence; SAE random_state ignored; #1058 missing
+        #       structure certificate; #1026 recon-parity under-coverage;
+        #       conformal under-coverage; #1464 curvature-sign residual; NUL
+        #       group labels; #913 dispersion routing; #1596 flexible-link;
+        #       #237 duchon column count; sphere-jet lat-gating; #808 survival
+        #       non-convergence; ...).
+        # SPEC.md forbids the XFAIL pattern outright ("a failing test should
+        # always indicate problematic behavior"), so the (b) failures are NOT
+        # masked — they stand red here as the signal of those open bugs. Until
+        # they are fixed at the engine level, this step must stay soft so a real
+        # open-bug repro does not break the whole CI job. Flip to a hard gate
+        # only once the open bugs above are fixed and `-m "not slow"` is green.
         continue-on-error: true
         run: |
           python -m pytest tests/ \
