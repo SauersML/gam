@@ -797,3 +797,93 @@ impl DenseDesignOperator for RowwiseKroneckerOperator {
         ));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── decode_multi_index ────────────────────────────────────────────────────
+
+    #[test]
+    fn decode_multi_index_zero_gives_all_zeros() {
+        let mut out = [99usize; 2];
+        decode_multi_index(0, &[3, 4], &mut out);
+        assert_eq!(out, [0, 0]);
+    }
+
+    #[test]
+    fn decode_multi_index_last_index_gives_max_coords() {
+        let mut out = [0usize; 2];
+        decode_multi_index(11, &[3, 4], &mut out);
+        assert_eq!(out, [2, 3]);
+    }
+
+    #[test]
+    fn decode_multi_index_middle_index() {
+        let mut out = [0usize; 2];
+        decode_multi_index(4, &[3, 4], &mut out);
+        assert_eq!(out, [1, 0]);
+    }
+
+    #[test]
+    fn decode_multi_index_three_dims() {
+        // dims [2, 3, 4], flat = 2*12 + 1*4 + 3 = 31 → [1,2,3]? No:
+        // dims [2, 3, 4]: total = 24
+        // flat = 23: last element
+        // d=2: out[2] = 23%4=3, flat=23/4=5
+        // d=1: out[1] = 5%3=2, flat=5/3=1
+        // d=0: out[0] = 1%2=1, flat=1/2=0
+        let mut out = [0usize; 3];
+        decode_multi_index(23, &[2, 3, 4], &mut out);
+        assert_eq!(out, [1, 2, 3]);
+    }
+
+    // ── upper_triangle_pair_from_index ────────────────────────────────────────
+
+    #[test]
+    fn upper_triangle_pair_index_zero_is_diagonal_origin() {
+        assert_eq!(upper_triangle_pair_from_index(0, 3), (0, 0));
+    }
+
+    #[test]
+    fn upper_triangle_pair_first_row_entries() {
+        // n=3: row 0 → (0,0),(0,1),(0,2)
+        assert_eq!(upper_triangle_pair_from_index(1, 3), (0, 1));
+        assert_eq!(upper_triangle_pair_from_index(2, 3), (0, 2));
+    }
+
+    #[test]
+    fn upper_triangle_pair_second_row_start_is_diagonal() {
+        // pair_idx=3 for n=3: (1,1)
+        assert_eq!(upper_triangle_pair_from_index(3, 3), (1, 1));
+        assert_eq!(upper_triangle_pair_from_index(4, 3), (1, 2));
+    }
+
+    #[test]
+    fn upper_triangle_pair_last_entry_is_bottom_right() {
+        // n=3: 6 pairs total, idx=5 → (2,2)
+        assert_eq!(upper_triangle_pair_from_index(5, 3), (2, 2));
+    }
+
+    // ── lower_triangle_pair_from_index ────────────────────────────────────────
+
+    #[test]
+    fn lower_triangle_pair_index_zero_is_origin() {
+        assert_eq!(lower_triangle_pair_from_index(0), (0, 0));
+    }
+
+    #[test]
+    fn lower_triangle_pair_second_row_entries() {
+        // Row 1: (1,0) at idx=1, (1,1) at idx=2
+        assert_eq!(lower_triangle_pair_from_index(1), (1, 0));
+        assert_eq!(lower_triangle_pair_from_index(2), (1, 1));
+    }
+
+    #[test]
+    fn lower_triangle_pair_third_row_entries() {
+        // Row 2: (2,0) at idx=3, (2,1) at idx=4, (2,2) at idx=5
+        assert_eq!(lower_triangle_pair_from_index(3), (2, 0));
+        assert_eq!(lower_triangle_pair_from_index(4), (2, 1));
+        assert_eq!(lower_triangle_pair_from_index(5), (2, 2));
+    }
+}
