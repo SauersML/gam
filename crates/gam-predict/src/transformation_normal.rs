@@ -1,21 +1,25 @@
 use super::*;
 
-/// Predictor for transformation-normal (PIT) models.
+/// Predictor for transformation-normal (CTM) models.
 ///
-/// The PIT-transformed values h(y|x) are precomputed in
-/// `build_predict_input_for_model` and stored in the PredictInput offset.
-/// This predictor passes them through as the prediction: eta = h, mean = h.
+/// The response-scale conditional mean `E[Y|x]` is precomputed in
+/// `build_predict_input_for_model` (issue #1612) and stored in the PredictInput
+/// offset. `E[Y|x] = E_{Z~N(0,1)}[h⁻¹(Z|x)]` is a function of the covariates
+/// alone, so prediction is covariate-only and does not require the outcome
+/// column. This predictor passes the precomputed value through unchanged as both
+/// the linear predictor and the mean: eta = mean = E[Y|x].
 pub struct TransformationNormalPredictor {
     pub covariance: Option<Array2<f64>>,
 }
 
 impl PredictionTransform for TransformationNormalPredictor {
     fn point_state(&self, input: &PredictInput) -> Result<LinearState, EstimationError> {
-        // The conditional transformation maps directly onto the offset `h`; the
-        // standard error is zero (the η endpoints coincide with `h`), so the
-        // engine's identity-η path reproduces `eta = mean = bounds = h`. The
-        // zero SEs make the posterior-mean bounds collapse onto `h`; whether
-        // bounds are produced at all is gated upstream by fit covariance.
+        // The offset carries the precomputed response-scale conditional mean
+        // `E[Y|x]`; the standard error is zero (the η endpoints coincide with the
+        // offset), so the engine's identity-η path reproduces
+        // `eta = mean = bounds = E[Y|x]`. The zero SEs make the posterior-mean
+        // bounds collapse onto the point; whether bounds are produced at all is
+        // gated upstream by fit covariance.
         let h = input.offset.clone();
         let zeros = Array1::zeros(h.len());
         Ok(LinearState {
@@ -79,7 +83,8 @@ impl PredictableModel for TransformationNormalPredictor {
         &self,
         input: &PredictInput,
     ) -> Result<PredictionWithSE, EstimationError> {
-        // The PIT predictor reports no covariance-derived SEs on the point path.
+        // The CTM predictor reports no covariance-derived SEs on the point path;
+        // it passes through the precomputed E[Y|x] offset as eta and mean.
         let h = input.offset.clone();
         Ok(PredictionWithSE {
             eta: h.clone(),

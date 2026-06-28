@@ -2707,15 +2707,13 @@ impl FittedModel {
         {
             required.insert(left);
             required.insert(right);
-        } else if matches!(
-            self.predict_model_class(),
-            PredictModelClass::TransformationNormal
-        ) {
-            let response = parsed.response.trim();
-            if !response.is_empty() && !response.starts_with("Surv(") {
-                required.insert(response.to_string());
-            }
         }
+        // A transformation-normal (CTM) prediction returns the response-scale
+        // conditional mean E[Y|x], a function of the covariates alone (issue
+        // #1612). The earlier implementation precomputed the PIT h(y|x) of the
+        // supplied response, which made the outcome column mandatory at predict
+        // time; the response is no longer required, so a covariate-only frame
+        // must predict without it.
 
         if let Some(offset) = payload.offset_column.as_ref() {
             required.insert(offset.clone());

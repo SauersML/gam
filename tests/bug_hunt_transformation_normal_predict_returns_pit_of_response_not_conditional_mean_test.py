@@ -1,138 +1,190 @@
-"""Bug hunt: ``gam predict`` on a conditional transformation-normal (CTM) model
-returns the probability-integral transform ``h(y|x)`` of the *supplied response*
-as both the ``linear_predictor`` and the ``mean`` column — not a response-scale
-prediction ``E[Y|x]``.
+"""Bug hunt (#1612): ``gam predict`` on a conditional transformation-normal (CTM)
+model must return the response-scale conditional mean ``E[Y|x]``, not the
+probability-integral transform ``h(y|x)`` of the supplied outcome.
 
-A transformation-normal model fits ``h(Y|x) ~ N(0,1)`` with ``h`` monotone in
-``y`` and covariate effects in ``x``. ``gam predict`` is documented as "Predict
-on a new dataset"; for every other family the ``mean`` column is the conditional
-mean ``E[Y|x]`` computed from the covariates. A prediction is therefore a
-function of the covariates alone: at a fixed ``x`` it cannot depend on which
-outcome value ``y`` you hand it.
+A CTM fits a smooth, strictly monotone map ``h(Y | x)`` such that the latent
+``h(Y | x) ~ N(0, 1)``. The fitted model is a conditional distribution of ``Y``
+given the covariates ``x`` alone; a *prediction* is therefore a statement about
+``Y`` at a new ``x`` and must not require — or depend on — an observed outcome.
+The correct response-scale point prediction is the conditional mean
 
-The CTM predictor breaks this. ``crates/gam-predict/src/transformation_normal.rs``
-(lines 3-28) documents and implements:
+    E[Y | x] = E_{Z ~ N(0,1)}[ h^{-1}(Z | x) ],
 
-    "The PIT-transformed values h(y|x) are precomputed in
-     `build_predict_input_for_model` and stored in the PredictInput offset.
-     This predictor passes them through as the prediction: eta = h, mean = h."
+a function of ``x`` alone, obtained by numerically inverting the monotone
+transform on a standard-normal quadrature and averaging.
 
-        let h = input.offset.clone();
-        Ok(LinearState { eta: h.clone(), mean: h, ... })
+The original predict path instead precomputed ``h(y | x)`` (the PIT of the
+*supplied* response) and returned it as both ``linear_predictor`` and ``mean``.
+That had two observable consequences this test pins down:
 
-So the reported ``mean`` is ``h(y|x)`` (a per-row standard-normal residual), which
-(a) *requires the response column at prediction time* and (b) varies monotonically
-with ``y`` at fixed ``x``.
+  (a) prediction wrongly REQUIRED the outcome column ``y`` — a covariate-only
+      frame (the realistic prediction case) was rejected; and
+  (b) at a fixed covariate ``x`` the predicted "mean" swept with ``y`` — feeding
+      two different ``y`` values for the same ``x`` produced two different
+      "means", which is impossible for a genuine ``E[Y|x]``.
 
-Reproduction (this test): fit a CTM with a genuinely monotone conditional mean
-``E[Y|x] = 2 + 0.9x``, then predict a 5-row frame holding ``x = 1`` fixed while
-``y`` sweeps ``-2 … 6``. The conditional mean is constant across those rows, but
-the engine returns:
+This test drives the ``gam`` CLI end to end. It fits a CTM, then asserts:
+  * predicting on a frame WITHOUT the response column succeeds and returns one
+    finite prediction per row (covariate-only prediction works); and
+  * the prediction is invariant to the value placed in the response column —
+    two frames sharing the same ``x`` but carrying wildly different ``y`` yield
+    byte-for-byte identical ``mean`` columns (the prediction is ``E[Y|x]``, not a
+    transform of ``y``); and
+  * the conditional mean lies inside the observed response range (a sane
+    response-scale value, not a standardized z-score).
 
-    linear_predictor,mean
-    -7.034483825305,-7.034483825305
-    -5.796814382494,-5.796814382494
-    -1.789977907165,-1.789977907165
-     2.152049428025, 2.152049428025
-     7.034486910051, 7.034486910051
-
-— a 14-unit monotone sweep in ``y`` at fixed ``x``. (Predicting on a
-covariate-only frame is rejected outright with "requested column 'y' not found",
-the same root cause from a different angle.)
-
-This test asserts the unimpeachable invariant: the predicted ``mean`` at a fixed
-covariate value must be (nearly) constant across different supplied responses,
-because ``E[Y|x]`` is a function of ``x`` alone. It currently fails (the means
-span ~14 units); once predict returns a covariate-only response-scale prediction
-it passes, with no further edits.
-
-Driven through the ``gam`` CLI (the buildable front-end), so it does not depend
-on the gamfit wheel.
+Before the fix the covariate-only predict aborts (the response column is
+required) and the two-``y`` frames disagree; after the fix all three hold.
 """
 
 from __future__ import annotations
 
 import csv
+import importlib
+import math
 import os
-import shutil
 import subprocess
 import tempfile
+from typing import Any
 
-import numpy as np
-import pytest
+pytest: Any = importlib.import_module("pytest")
 
-# Prefer the workspace release binary (the suite's convention); fall back to a
-# `gam` on PATH so the check runs against the installed engine too.
-_REPO_BIN = os.path.join(os.path.dirname(__file__), "..", "target", "release", "gam")
-GAM_BIN = _REPO_BIN if os.path.exists(_REPO_BIN) else (shutil.which("gam") or _REPO_BIN)
-
-pytestmark = pytest.mark.skipif(
-    not os.path.exists(GAM_BIN),
-    reason="`gam` CLI binary not available (neither target/release/gam nor PATH)",
-)
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+GAM_BIN = os.path.join(REPO_ROOT, "target", "release", "gam")
 
 
-def _write_csv(path: str, cols: dict[str, np.ndarray]) -> None:
-    keys = list(cols)
-    n = len(cols[keys[0]])
-    with open(path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(keys)
-        for i in range(n):
-            w.writerow([cols[k][i] for k in keys])
+def _ensure_binary() -> str:
+    if os.path.exists(GAM_BIN):
+        return GAM_BIN
+    build = subprocess.run(
+        ["cargo", "build", "--release", "--bin", "gam"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "CARGO_PROFILE_DEV_DEBUG": "0"},
+    )
+    if build.returncode != 0 or not os.path.exists(GAM_BIN):
+        pytest.skip(f"could not build release gam binary:\n{build.stderr[-2000:]}")
+    return GAM_BIN
 
 
-def _read_pred_mean(path: str) -> np.ndarray:
-    with open(path) as f:
-        r = csv.DictReader(f)
-        assert "mean" in (r.fieldnames or []), f"no 'mean' column in {r.fieldnames}"
-        return np.array([float(row["mean"]) for row in r])
+def _run(args: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [GAM_BIN, *args], cwd=REPO_ROOT, capture_output=True, text=True, timeout=600
+    )
 
 
-def test_ctm_predicted_mean_is_function_of_covariates_only() -> None:
-    rng = np.random.default_rng(3)
-    n = 1500
-    x = rng.uniform(-2.0, 2.0, n)
-    # Genuinely monotone conditional mean E[Y|x] = 2 + 0.9 x.
-    y = 2.0 + 0.9 * x + rng.normal(0.0, 0.5, n)
+def _write_csv(path: str, header: list[str], rows: list[list[float]]) -> None:
+    with open(path, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(header)
+        for row in rows:
+            w.writerow([f"{v:.17g}" for v in row])
 
-    with tempfile.TemporaryDirectory() as d:
-        train = os.path.join(d, "train.csv")
-        grid = os.path.join(d, "grid.csv")
-        model = os.path.join(d, "ctm.gam")
-        pred = os.path.join(d, "pred.csv")
 
-        _write_csv(train, {"y": y, "x": x})
-
-        fit = subprocess.run(
-            [GAM_BIN, "fit", train, "y ~ smooth(x)", "--transformation-normal",
-             "--out", model],
-            capture_output=True, text=True,
+def _read_col(path: str, name: str) -> list[float]:
+    with open(path, newline="") as fh:
+        reader = csv.DictReader(fh)
+        assert reader.fieldnames is not None and name in reader.fieldnames, (
+            f"prediction CSV {path} is missing column '{name}'; "
+            f"has {reader.fieldnames}"
         )
-        assert fit.returncode == 0, f"fit failed: {fit.stderr[-2000:]}"
+        return [float(row[name]) for row in reader]
 
-        # Five rows at the SAME covariate x = 1.0, sweeping the response y.
-        grid_y = np.array([-2.0, 0.0, 2.0, 4.0, 6.0])
-        grid_x = np.full_like(grid_y, 1.0)
-        _write_csv(grid, {"y": grid_y, "x": grid_x})
 
-        out = subprocess.run(
-            [GAM_BIN, "predict", model, grid, "--out", pred],
-            capture_output=True, text=True,
+def test_transformation_normal_predict_returns_conditional_mean_not_pit() -> None:
+    _ensure_binary()
+
+    # ---- deterministic synthetic bounded, x-dependent data ------------------
+    # y in (0,1), location moving with x so E[Y|x] genuinely varies; a plain
+    # LCG keeps the data identical on every platform without an RNG dependency.
+    state = 0x2545F4914F6CDD1D
+    def nextf() -> float:
+        nonlocal state
+        state = (state * 6364136223846793005 + 1442695040888963407) & ((1 << 64) - 1)
+        return ((state >> 11) / float(1 << 53))
+
+    n = 300
+    xs: list[float] = []
+    ys: list[float] = []
+    for _ in range(n):
+        x = nextf()
+        # logistic location shift in x, plus bounded noise; clamp into (0.02,0.98).
+        loc = 0.25 + 0.5 * x
+        y = min(0.98, max(0.02, loc + 0.12 * (nextf() - 0.5)))
+        xs.append(x)
+        ys.append(y)
+
+    y_min, y_max = min(ys), max(ys)
+
+    with tempfile.TemporaryDirectory(prefix="gam_ctm_1612_") as tmp:
+        train_csv = os.path.join(tmp, "train.csv")
+        _write_csv(train_csv, ["x", "y"], [[xs[i], ys[i]] for i in range(n)])
+
+        model = os.path.join(tmp, "ctm.gam")
+        fit = _run(["fit", train_csv, "y ~ s(x, k=6)", "--transformation-normal",
+                    "--out", model])
+        assert fit.returncode == 0, (
+            f"transformation-normal fit failed:\n{fit.stdout}\n{fit.stderr}"
         )
-        assert out.returncode == 0, f"predict failed: {out.stderr[-2000:]}"
 
-        means = _read_pred_mean(pred)
-        assert means.size == grid_y.size
+        # Held-out covariate grid (the rows we actually predict at).
+        grid_x = [0.1, 0.3, 0.5, 0.7, 0.9]
 
-        spread = float(means.max() - means.min())
-        # E[Y|x=1] is one number; the five predictions must coincide. Allow a
-        # generous absolute slack for numerical noise — the bug produces a
-        # ~14-unit monotone sweep in y, orders of magnitude above any tolerance.
-        assert spread < 1e-3, (
-            "transformation-normal predict() returns a per-row value that depends "
-            f"on the supplied response y: predicted mean at fixed x=1 spans {spread:.4f} "
-            f"across y in {list(grid_y)} (means={list(means)}). A prediction must be a "
-            "function of the covariates only (E[Y|x] is constant at fixed x); the CTM "
-            "predictor instead passes through the PIT residual h(y|x) as the 'mean'."
+        # (1) Covariate-only frame: NO response column at all. This is the
+        # realistic prediction case and must succeed.
+        cov_only = os.path.join(tmp, "cov_only.csv")
+        _write_csv(cov_only, ["x"], [[gx] for gx in grid_x])
+        pred_cov = os.path.join(tmp, "pred_cov.csv")
+        r_cov = _run(["predict", model, cov_only, "--out", pred_cov])
+        assert r_cov.returncode == 0, (
+            "covariate-only prediction (no response column) must succeed for a "
+            f"CTM, but failed:\n{r_cov.stdout}\n{r_cov.stderr}"
+        )
+        mean_cov = _read_col(pred_cov, "mean")
+        assert len(mean_cov) == len(grid_x)
+        assert all(math.isfinite(m) for m in mean_cov), f"non-finite means: {mean_cov}"
+
+        # (2) Two frames sharing the same x but carrying very different y. A
+        # genuine E[Y|x] is invariant to y; the buggy PIT path swept with y.
+        frame_lo = os.path.join(tmp, "frame_lo.csv")
+        frame_hi = os.path.join(tmp, "frame_hi.csv")
+        _write_csv(frame_lo, ["x", "y"], [[gx, 0.05] for gx in grid_x])
+        _write_csv(frame_hi, ["x", "y"], [[gx, 0.95] for gx in grid_x])
+        pred_lo = os.path.join(tmp, "pred_lo.csv")
+        pred_hi = os.path.join(tmp, "pred_hi.csv")
+        r_lo = _run(["predict", model, frame_lo, "--out", pred_lo])
+        r_hi = _run(["predict", model, frame_hi, "--out", pred_hi])
+        assert r_lo.returncode == 0, f"predict (y=lo) failed:\n{r_lo.stderr}"
+        assert r_hi.returncode == 0, f"predict (y=hi) failed:\n{r_hi.stderr}"
+        mean_lo = _read_col(pred_lo, "mean")
+        mean_hi = _read_col(pred_hi, "mean")
+
+        for a, b in zip(mean_lo, mean_hi):
+            assert abs(a - b) <= 1e-9, (
+                "CTM prediction mean depends on the supplied response y: "
+                f"y=0.05 -> {a}, y=0.95 -> {b} at the same x. A response-scale "
+                "E[Y|x] must be a function of x alone."
+            )
+
+        # The covariate-only mean must match the y-bearing frames too (same x).
+        for a, b in zip(mean_cov, mean_lo):
+            assert abs(a - b) <= 1e-9, (
+                f"covariate-only mean {a} != mean with y column {b} at same x"
+            )
+
+        # (3) The conditional mean is a response-scale value inside the observed
+        # range, not a standardized z-score (which would routinely exceed [0,1]).
+        lo_bound = y_min - 0.1 * (y_max - y_min)
+        hi_bound = y_max + 0.1 * (y_max - y_min)
+        for m in mean_cov:
+            assert lo_bound <= m <= hi_bound, (
+                f"conditional mean {m} outside the plausible response range "
+                f"[{lo_bound:.3f}, {hi_bound:.3f}]; looks like a z-score, not E[Y|x]"
+            )
+
+        # E[Y|x] should increase with x given the x-dependent location.
+        assert mean_cov[-1] > mean_cov[0], (
+            "E[Y|x] should track the x-dependent location (increasing in x), "
+            f"got {mean_cov}"
         )
