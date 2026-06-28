@@ -1477,3 +1477,169 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod pure_fn_tests {
+    use super::{
+        addridge, inf_norm, max_abs_diag, predict_gam_dimension_mismatch_message,
+        row_mismatch_message, stable_logistic, stable_softplus,
+    };
+    use ndarray::array;
+
+    // -----------------------------------------------------------------------
+    // stable_softplus: log(1 + exp(x))
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn softplus_at_zero() {
+        let got = stable_softplus(0.0);
+        let expected = (1.0_f64 + 1.0_f64).ln();
+        assert!((got - expected).abs() < 1e-14, "got={got}");
+    }
+
+    #[test]
+    fn softplus_positive_large_approximates_x() {
+        let x = 100.0_f64;
+        let got = stable_softplus(x);
+        assert!((got - x).abs() < 1e-10, "softplus({x}) = {got}, expected ~{x}");
+    }
+
+    #[test]
+    fn softplus_negative_large_approximates_zero() {
+        let x = -50.0_f64;
+        let got = stable_softplus(x);
+        assert!(got >= 0.0, "softplus must be non-negative, got {got}");
+        assert!(got < 1e-10, "softplus({x}) = {got}, expected ~0");
+    }
+
+    #[test]
+    fn softplus_matches_naive_formula_at_moderate_x() {
+        for x in [-5.0_f64, -1.0, 0.5, 1.0, 5.0] {
+            let got = stable_softplus(x);
+            let expected = (1.0 + x.exp()).ln();
+            assert!((got - expected).abs() < 1e-12, "x={x}: got={got} expected={expected}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // stable_logistic: 1 / (1 + exp(-x))
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn logistic_at_zero_is_half() {
+        let got = stable_logistic(0.0);
+        assert!((got - 0.5).abs() < 1e-15, "got={got}");
+    }
+
+    #[test]
+    fn logistic_large_positive_approaches_one() {
+        let got = stable_logistic(100.0);
+        assert!((got - 1.0).abs() < 1e-10, "got={got}");
+    }
+
+    #[test]
+    fn logistic_large_negative_approaches_zero() {
+        let got = stable_logistic(-100.0);
+        assert!(got >= 0.0 && got < 1e-10, "got={got}");
+    }
+
+    #[test]
+    fn logistic_symmetry_around_zero() {
+        for x in [0.5_f64, 1.0, 2.0, 5.0] {
+            let pos = stable_logistic(x);
+            let neg = stable_logistic(-x);
+            assert!((pos + neg - 1.0).abs() < 1e-15, "x={x}: pos={pos} neg={neg}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // inf_norm
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn inf_norm_empty_is_zero() {
+        assert_eq!(inf_norm(std::iter::empty()), 0.0);
+    }
+
+    #[test]
+    fn inf_norm_all_positive() {
+        assert_eq!(inf_norm([1.0, 2.0, 3.0]), 3.0);
+    }
+
+    #[test]
+    fn inf_norm_mixed_signs() {
+        assert_eq!(inf_norm([-5.0_f64, 2.0, -3.0]), 5.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // max_abs_diag
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn max_abs_diag_floors_at_one() {
+        let m = array![[0.1_f64, 0.0], [0.0, 0.2]];
+        assert_eq!(max_abs_diag(&m), 1.0);
+    }
+
+    #[test]
+    fn max_abs_diag_returns_largest_abs_diagonal() {
+        let m = array![[3.0_f64, 99.0], [0.0, -7.0]];
+        assert_eq!(max_abs_diag(&m), 7.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // addridge
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn addridge_zero_ridge_clones_matrix() {
+        let m = array![[1.0_f64, 2.0], [3.0, 4.0]];
+        let r = addridge(&m, 0.0);
+        assert_eq!(r, m);
+    }
+
+    #[test]
+    fn addridge_negative_ridge_clones_matrix() {
+        let m = array![[1.0_f64, 2.0], [3.0, 4.0]];
+        let r = addridge(&m, -1.0);
+        assert_eq!(r, m);
+    }
+
+    #[test]
+    fn addridge_positive_adds_to_diagonal() {
+        let m = array![[1.0_f64, 0.0], [0.0, 2.0]];
+        let r = addridge(&m, 0.5);
+        assert_eq!(r[[0, 0]], 1.5);
+        assert_eq!(r[[1, 1]], 2.5);
+        assert_eq!(r[[0, 1]], 0.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // row_mismatch_message / predict_gam_dimension_mismatch_message
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn row_mismatch_none_when_all_match() {
+        assert_eq!(row_mismatch_message(5, 5, 5, 5), None);
+    }
+
+    #[test]
+    fn row_mismatch_some_when_lengths_differ() {
+        assert!(row_mismatch_message(5, 4, 5, 5).is_some());
+    }
+
+    #[test]
+    fn predict_gam_mismatch_none_when_consistent() {
+        assert_eq!(predict_gam_dimension_mismatch_message(10, 3, 3, 10), None);
+    }
+
+    #[test]
+    fn predict_gam_mismatch_some_when_cols_differ() {
+        assert!(predict_gam_dimension_mismatch_message(10, 3, 4, 10).is_some());
+    }
+
+    #[test]
+    fn predict_gam_mismatch_some_when_rows_differ() {
+        assert!(predict_gam_dimension_mismatch_message(10, 3, 3, 9).is_some());
+    }
+}
