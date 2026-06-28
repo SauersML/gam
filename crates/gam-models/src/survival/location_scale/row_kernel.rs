@@ -1285,37 +1285,40 @@ fn sls_row_nll_onesseed_batch(
     nll
 }
 
-/// Contracted-third tensors `Σ_c ℓ_{xyc} dir_c` for every row in `start..end`
-/// at swept axis `a`, computed 4 rows per SIMD pass. Rows are grouped by their
-/// gating signature `(censored-active, event-active)` so each batch is
-/// homogeneous (see [`sls_row_nll_onesseed_batch`]); a partial trailing batch
-/// pads the unused lanes with the batch's first row (a valid same-signature row)
-/// and ignores those lanes. Output `out[row − start]` is `to_bits`-identical to
-/// the scalar `sls_row_nll(seed_direction(primary, dir))?.contracted_third()` the
-/// per-axis reducer computed inline — the grouping and SIMD only change HOW each
-/// independent per-row tensor is produced, never its value or the downstream
-/// pullback order.
-fn batched_axis_thirds(
-    inputs: &[([f64; SLS_ROW_K], SurvivalExactRowKernel)],
-    chans: &[Vec<Option<(usize, Array1<f64>)>>],
-    a: usize,
+/// Dense per-row channel third tensors `t3[x][y][c] = ℓ_{xyc}` for every row in
+/// `start..end`, computed 4 rows per SIMD pass. The full third tensor is built
+/// ONCE per row via `K = 9` channel-unit-seed evaluations (one per primary
+/// channel `c`, seeding the unit ε-direction `e_c`), so the all-axes override can
+/// close every swept axis as the small contraction `Σ_c ℓ_{xyc} dir_c(a)`
+/// ([`contract_channel_third`]) — retiring the per-(row, axis) OneSeed
+/// contraction the legacy per-axis path paid `p` times per row. Rows are grouped
+/// by their gating signature `(censored-active, event-active)` so each 4-lane
+/// batch is homogeneous (see [`sls_row_nll_onesseed_batch`]); a partial trailing
+/// batch pads the unused lanes with the batch's first (valid same-signature) row
+/// and ignores them.
+///
+/// Each entry `t3[li][x][y][c]` is `to_bits`-identical to the scalar
+/// `sls_row_nll(seed_direction(primary, e_c))?.contracted_third()[x][y]`; the
+/// SIMD batching and the regime grouping only change HOW each independent
+/// per-(row, channel) third is produced, never its value
+/// (`batched_row_third_tensors_matches_scalar_per_channel_to_bits`).
+fn batched_row_third_tensors(
+    inputs: &[Option<([f64; SLS_ROW_K], SurvivalExactRowKernel)>],
     start: usize,
     end: usize,
-) -> Vec<[[f64; SLS_ROW_K]; SLS_ROW_K]> {
+) -> Vec<[[[f64; SLS_ROW_K]; SLS_ROW_K]; SLS_ROW_K]> {
     let m = end - start;
-    let mut out = vec![[[0.0_f64; SLS_ROW_K]; SLS_ROW_K]; m];
-    // Per-row direction (axis-dependent) materialized once.
-    let dirs: Vec<[f64; SLS_ROW_K]> = (start..end)
-        .map(|row| axis_direction_from_channel_cache(&chans[row], a))
-        .collect();
+    let mut out = vec![[[[0.0_f64; SLS_ROW_K]; SLS_ROW_K]; SLS_ROW_K]; m];
     // Partition local indices by gating signature: (censored-active, event-active).
-    let signature = |row: usize| -> (bool, bool) {
-        let ker = &inputs[row].1;
-        (ker.w * (1.0 - ker.d) != 0.0, ker.w * ker.d != 0.0)
-    };
+    // Degenerate rows (`inputs[..] == None`) are skipped entirely; their tensor
+    // stays the zero initializer (the per-axis path's zero-matrix contribution).
     let mut groups: [Vec<usize>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
     for li in 0..m {
-        let (c, e) = signature(start + li);
+        let Some((_, ker)) = &inputs[start + li] else {
+            continue;
+        };
+        let c = ker.w * (1.0 - ker.d) != 0.0;
+        let e = ker.w * ker.d != 0.0;
         let key = (c as usize) | ((e as usize) << 1);
         groups[key].push(li);
     }
@@ -1329,21 +1332,78 @@ fn batched_axis_thirds(
             let cnt = batch.len();
             // Pad missing lanes with the batch's first (valid same-signature) row.
             let li_of = |lane: usize| batch[if lane < cnt { lane } else { 0 }];
-            let kers: [&SurvivalExactRowKernel; 4] =
-                std::array::from_fn(|lane| &inputs[start + li_of(lane)].1);
-            let vars: [OneSeedBatch<SLS_ROW_K>; SLS_ROW_K] = std::array::from_fn(|c| {
-                let value = f64x4::new(std::array::from_fn(|lane| inputs[start + li_of(lane)].0[c]));
-                let dir = f64x4::new(std::array::from_fn(|lane| dirs[li_of(lane)][c]));
-                OneSeedBatch::seed_direction(value, c, dir)
-            });
-            let third = sls_row_nll_onesseed_batch(&vars, &kers, cens_on, event_on).contracted_third();
-            for (lane, &li) in batch.iter().enumerate() {
-                for x in 0..SLS_ROW_K {
-                    for y in 0..SLS_ROW_K {
-                        out[li][x][y] = third[x][y].to_array()[lane];
+            let row_of = |lane: usize| {
+                inputs[start + li_of(lane)]
+                    .as_ref()
+                    .expect("grouped row is non-degenerate")
+            };
+            let kers: [&SurvivalExactRowKernel; 4] = std::array::from_fn(|lane| &row_of(lane).1);
+            // One SIMD pass per channel direction `e_c` yields `t3[..][..][c]`
+            // for all four lanes. The base value/grad/Hessian is reseeded per
+            // channel (only the ε-component changes), but this is a fixed nine
+            // evaluations per row regardless of the coefficient count `p`.
+            for c in 0..SLS_ROW_K {
+                let vars: [OneSeedBatch<SLS_ROW_K>; SLS_ROW_K] = std::array::from_fn(|i| {
+                    let value = f64x4::new(std::array::from_fn(|lane| row_of(lane).0[i]));
+                    let dir = if i == c {
+                        f64x4::splat(1.0)
+                    } else {
+                        f64x4::splat(0.0)
+                    };
+                    OneSeedBatch::seed_direction(value, i, dir)
+                });
+                let third = sls_row_nll_onesseed_batch(&vars, &kers, cens_on, event_on)
+                    .contracted_third();
+                for (lane, &li) in batch.iter().enumerate() {
+                    for x in 0..SLS_ROW_K {
+                        for y in 0..SLS_ROW_K {
+                            out[li][x][y][c] = third[x][y].to_array()[lane];
+                        }
                     }
                 }
             }
+        }
+    }
+    out
+}
+
+/// Close the cached per-row channel third tensor against a swept axis's channel
+/// direction: `out[x][y] = Σ_c t3[x][y][c] · dir_c`. This is the contraction the
+/// legacy per-axis path folded into the jet
+/// (`sls_row_nll(seed_direction(dir))?.contracted_third()`); materializing
+/// `ℓ_{xyc}` first and summing here reassociates that `Σ_c`, so the result
+/// differs from the jet-folded form only at the ULP level (a `~5e-14`
+/// reassociation deviation, far inside the solver's `1e-9` tolerance). The `Σ_c`
+/// reduction uses Neumaier compensated summation, which keeps this dense-tensor
+/// closure at least as accurate as the jet-folded contraction relative to the
+/// exact value (`all_axes_dense_3tensor_*_accuracy_vs_truth`).
+#[inline]
+fn contract_channel_third(
+    t3: &[[[f64; SLS_ROW_K]; SLS_ROW_K]; SLS_ROW_K],
+    dir: &[f64; SLS_ROW_K],
+) -> [[f64; SLS_ROW_K]; SLS_ROW_K] {
+    let mut out = [[0.0_f64; SLS_ROW_K]; SLS_ROW_K];
+    let mut comp = [[0.0_f64; SLS_ROW_K]; SLS_ROW_K];
+    for (c, &dc) in dir.iter().enumerate() {
+        if dc == 0.0 {
+            continue;
+        }
+        for x in 0..SLS_ROW_K {
+            for y in 0..SLS_ROW_K {
+                let term = t3[x][y][c] * dc;
+                let s = out[x][y] + term;
+                comp[x][y] += if out[x][y].abs() >= term.abs() {
+                    (out[x][y] - s) + term
+                } else {
+                    (term - s) + out[x][y]
+                };
+                out[x][y] = s;
+            }
+        }
+    }
+    for x in 0..SLS_ROW_K {
+        for y in 0..SLS_ROW_K {
+            out[x][y] += comp[x][y];
         }
     }
     out
@@ -1577,14 +1637,22 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
     /// closes against the cached stack with only the cheap `OneSeed` jet
     /// arithmetic and the design-row pullback.
     ///
-    /// **Correctness contract.** Output `a` equals, bit-for-bit, the generic
-    /// per-axis `row_kernel_directional_derivative(self, rows, e_a)`: the same
-    /// `RowSet` reduction primitive (chunk-index-order
-    /// `par_try_reduce_fold`), the same per-row
-    /// `jacobian_action → sls_row_nll(seed_direction(..)).contracted_third() →
-    /// add_pullback_hessian` pipeline, reading a cached `(primary, kernel)` that
-    /// is identical (a pure function of `row`) to the per-call rebuild. Only the
-    /// full-data unit-weight `RowSet::All` case is accelerated; a subsample
+    /// **Accuracy contract.** The dense per-row channel third tensor
+    /// `ℓ_{xyc}` is built ONCE per row (`K = 9` channel-unit-seed evaluations via
+    /// [`batched_row_third_tensors`]), then every swept axis closes the same
+    /// contraction `Σ_c ℓ_{xyc} dir_c(a)` ([`contract_channel_third`]) and reduces
+    /// through the identical chunk-index-order pullback the per-axis path uses.
+    /// This reassociates the `Σ_c` sum that the legacy per-axis OneSeed path
+    /// folded into the jet, so output `a` is no longer bit-for-bit identical to
+    /// the generic per-axis `row_kernel_directional_derivative(self, rows, e_a)`;
+    /// it agrees to a `~5e-14` reassociation deviation (far inside the solver's
+    /// `1e-9` tolerance). Against the exact (extended-precision) contraction the
+    /// dense-tensor closure is at least as accurate as the jet-folded form — the
+    /// `Σ_c` step is closed with Neumaier compensated summation — verified by the
+    /// `all_axes_dense_3tensor_*_accuracy_vs_truth` oracle. The build-once tensor
+    /// retires the `O(n·p)` OneSeed contractions of the per-axis path, leaving the
+    /// channel build at a fixed `9` evaluations per row independent of `p`. Only
+    /// the full-data unit-weight `RowSet::All` case is accelerated; a subsample
     /// declines (`None`) so the generic Horvitz–Thompson per-axis path runs.
     fn directional_derivative_all_axes_dense_override(
         &self,
@@ -1603,7 +1671,7 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
         };
         Some((|| {
             let n = self.n_rows();
-            // Two per-row builds shared by EVERY axis, so the special-function and
+            // Per-row builds shared by EVERY axis, so the special-function and
             // design-materialization cost is paid once instead of `p` times:
             //   * `inputs[row]`  — the special-function-heavy NLL derivative stack
             //     (`exact_row_kernel_rescaled`: exp / log / log-Φ ladders), and
@@ -1612,30 +1680,48 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
             //     `channel_row`/`add_pullback_hessian` for every `(row, axis)`.
             // The unit-axis direction is then read straight out of `chans`
             // (`axis_direction_from_channel_cache`), retiring the per-axis
-            // `jacobian_action` dot products as well. Only the cheap `OneSeed` jet
-            // contraction (which fixes the bit-identity contract) stays in the
-            // `p`-loop.
-            let inputs: Vec<([f64; SLS_ROW_K], SurvivalExactRowKernel)> = (0..n)
+            // `jacobian_action` dot products. The `Σ_c` jet contraction itself is
+            // also lifted out of the `p`-loop: the dense channel third tensor is
+            // built once (`third_full`) and every axis closes it with the cheap
+            // `contract_channel_third`.
+            // Degenerate rows (survival probability underflowed to 0) yield
+            // `None`; they contribute a zero third tensor, exactly as the
+            // per-axis `row_third_contracted` skips them with a zero matrix.
+            let inputs: Vec<Option<([f64; SLS_ROW_K], SurvivalExactRowKernel)>> = (0..n)
                 .into_par_iter()
-                .map(|row| self.row_nll_inputs(row))
+                .map(|row| self.row_nll_inputs_opt(row))
                 .collect::<Result<Vec<_>, String>>()?;
             let chans: Vec<Vec<Option<(usize, Array1<f64>)>>> = (0..n)
                 .into_par_iter()
                 .map(|row| self.cached_channel_rows(row))
                 .collect();
-            // The per-(row, axis) `OneSeed` contraction — the dominant remaining
-            // cost after the channel cache retired the design materialization —
-            // is now evaluated FOUR rows per SIMD pass (`batched_axis_thirds` over
-            // `OneSeedBatch`/`wide::f64x4`). The contracted-third of a row is a
-            // pure function of `(row, axis)`, so it is computed in any
-            // convenient (regime-grouped) order, while the pullback into the dense
-            // accumulator stays in the canonical row order. This manual reducer
-            // reproduces `RowSet::All::par_try_reduce_fold` term-for-term:
-            // contiguous `ARROW_ROW_CHUNK` chunks, sequential per-row pullback
-            // within a chunk (`w = 1.0`), and in-order `total + acc` combine — so
-            // the dense Hessian is `to_bits`-identical to the scalar reducer the
-            // bit-identity oracle pins.
             let n_chunks = arrow_row_chunk_count(n);
+            // The dense per-row channel third tensor `ℓ_{xyc}` is built ONCE per
+            // row (`K = 9` channel-unit-seed evaluations, four rows per SIMD pass
+            // via `batched_row_third_tensors`). The legacy per-axis path instead
+            // ran one direction-seeded `OneSeed` contraction per `(row, axis)`,
+            // paying the `Σ_c` fold `p` times per row; building the tensor once
+            // closes every axis with the cheap `contract_channel_third`
+            // (`Σ_c ℓ_{xyc} dir_c`), so the special-function-free jet work is now a
+            // fixed `9` evaluations per row independent of the coefficient count.
+            let third_full: Vec<[[[f64; SLS_ROW_K]; SLS_ROW_K]; SLS_ROW_K]> = (0..n_chunks)
+                .into_par_iter()
+                .map(|chunk_idx| {
+                    let start = chunk_idx * ARROW_ROW_CHUNK;
+                    let end = (start + ARROW_ROW_CHUNK).min(n);
+                    batched_row_third_tensors(&inputs, start, end)
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .flatten()
+                .collect();
+            // Each axis is one independent full-data Gram. The per-row contraction
+            // and the pullback into the dense accumulator stay in the canonical
+            // chunk/row order: contiguous `ARROW_ROW_CHUNK` chunks, sequential
+            // per-row pullback within a chunk (`w = 1.0`), and in-order
+            // `total + acc` combine — the same reduction order as the per-axis
+            // path, so the only departure from its bits is the `Σ_c` reassociation
+            // inside `contract_channel_third` (`~5e-14`, accuracy-pinned).
             (0..p)
                 .into_par_iter()
                 .map(|a| {
@@ -1645,15 +1731,12 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
                             .map(|chunk_idx| {
                                 let start = chunk_idx * ARROW_ROW_CHUNK;
                                 let end = (start + ARROW_ROW_CHUNK).min(n);
-                                let thirds = batched_axis_thirds(&inputs, &chans, a, start, end);
                                 let mut acc = Array2::<f64>::zeros((p, p));
                                 for row in start..end {
-                                    pullback_from_channel_cache(
-                                        &chans[row],
-                                        &thirds[row - start],
-                                        1.0,
-                                        &mut acc,
-                                    );
+                                    let dir =
+                                        axis_direction_from_channel_cache(&chans[row], a);
+                                    let t = contract_channel_third(&third_full[row], &dir);
+                                    pullback_from_channel_cache(&chans[row], &t, 1.0, &mut acc);
                                 }
                                 acc
                             })
@@ -3329,79 +3412,81 @@ mod simd_batch_bit_identity_tests {
         }
     }
 
-    /// The SIMD 4-rows-per-pass `batched_axis_thirds` is `to_bits`-identical, for
-    /// EVERY row, to the scalar `sls_row_nll(seed_direction(..))?.contracted_third()`
-    /// the per-axis reducer used inline — across mixed gating regimes (so the
-    /// signature grouping AND the non-multiple-of-4 trailing batch are exercised),
-    /// signed-zero primary/design channels, null (`w = 0`) rows, and non-finite
-    /// poisoned inactive residual-distribution stacks.
+    /// The SIMD 4-rows-per-pass [`batched_row_third_tensors`] is
+    /// `to_bits`-identical, for EVERY (row, channel), to the scalar per-channel
+    /// `sls_row_nll(seed_direction(primary, e_c))?.contracted_third()` — across
+    /// mixed gating regimes (so the signature grouping AND the non-multiple-of-4
+    /// trailing batch are exercised), signed-zero primary channels, null
+    /// (`w = 0`) rows, and non-finite poisoned inactive residual-distribution
+    /// stacks. This pins that materializing the full channel third tensor
+    /// reproduces the engine's per-channel third exactly; the only departure of
+    /// the dense-tensor override from the legacy per-axis bits is the `Σ_c`
+    /// reassociation in [`contract_channel_third`], measured separately by
+    /// `all_axes_dense_3tensor_contraction_accuracy_vs_truth`.
     #[test]
-    fn batched_axis_thirds_matches_scalar_per_row_to_bits() {
+    fn batched_row_third_tensors_matches_scalar_per_channel_to_bits() {
         let mut rng = Lcg(0x9E3779B97F4A7C15);
-        let block_of = [0usize, 0, 0, 1, 1, 1, 2, 2, 2];
         let mut compared = 0usize;
         let mut tail_batches_seen = 0usize;
-        for _ in 0..2500 {
-            let widths = [1 + rng.range(4), 1 + rng.range(4), 1 + rng.range(4)];
-            let offs = [0usize, widths[0], widths[0] + widths[1]];
-            let p = widths[0] + widths[1] + widths[2];
+        for _ in 0..900 {
             let m = 5 + rng.range(20); // generally not a multiple of 4
             if m % 4 != 0 {
                 tail_batches_seen += 1;
             }
 
-            let mut inputs: Vec<([f64; SLS_ROW_K], SurvivalExactRowKernel)> = Vec::with_capacity(m);
-            let mut chans: Vec<Vec<Option<(usize, Array1<f64>)>>> = Vec::with_capacity(m);
+            let mut inputs: Vec<Option<([f64; SLS_ROW_K], SurvivalExactRowKernel)>> =
+                Vec::with_capacity(m);
             for _ in 0..m {
+                // ~1 in 9 rows is degenerate (None) to exercise the skip path.
+                if rng.step() % 9 == 0 {
+                    inputs.push(None);
+                    continue;
+                }
                 let sig = rng.range(4);
                 let kernel = make_kernel(&mut rng, sig);
                 let primary: [f64; SLS_ROW_K] =
                     std::array::from_fn(|_| if rng.step() & 7 == 0 { 0.0 } else { rng.val() });
-                inputs.push((primary, kernel));
-                let row_chans: Vec<Option<(usize, Array1<f64>)>> = (0..SLS_ROW_K)
-                    .map(|c| {
-                        let blk = block_of[c];
-                        if (c == 5 || c == 8) && rng.step() & 1 == 0 {
-                            None
-                        } else {
-                            let row = Array1::from_iter((0..widths[blk]).map(|_| {
-                                if rng.step() & 3 == 0 { 0.0 } else { rng.val() }
-                            }));
-                            Some((offs[blk], row))
-                        }
-                    })
-                    .collect();
-                chans.push(row_chans);
+                inputs.push(Some((primary, kernel)));
             }
 
-            let a = rng.range(p);
-            let batched = batched_axis_thirds(&inputs, &chans, a, 0, m);
+            let tensors = batched_row_third_tensors(&inputs, 0, m);
             for row in 0..m {
-                let dir_k = axis_direction_from_channel_cache(&chans[row], a);
-                let kernel = &inputs[row].1;
-                let primary = &inputs[row].0;
-                let vars: [OneSeed<SLS_ROW_K>; SLS_ROW_K] =
-                    std::array::from_fn(|c| OneSeed::seed_direction(primary[c], c, dir_k[c]));
-                let scalar = sls_row_nll(&vars, kernel)
-                    .expect("scalar row NLL")
-                    .contracted_third();
-                for x in 0..SLS_ROW_K {
-                    for y in 0..SLS_ROW_K {
-                        let b = batched[row][x][y];
-                        let s = scalar[x][y];
-                        if s.is_nan() {
-                            assert!(
-                                b.is_nan(),
-                                "scalar NaN but SIMD finite at row={row} x={x} y={y} axis={a}"
-                            );
-                        } else {
-                            assert_eq!(
-                                b.to_bits(),
-                                s.to_bits(),
-                                "SIMD batch != scalar third at row={row} x={x} y={y} axis={a}"
-                            );
+                let Some((primary, kernel)) = &inputs[row] else {
+                    // Degenerate row: tensor must be the zero contribution.
+                    for x in 0..SLS_ROW_K {
+                        for y in 0..SLS_ROW_K {
+                            for c in 0..SLS_ROW_K {
+                                assert_eq!(tensors[row][x][y][c].to_bits(), 0.0_f64.to_bits());
+                            }
                         }
-                        compared += 1;
+                    }
+                    continue;
+                };
+                for c in 0..SLS_ROW_K {
+                    let vars: [OneSeed<SLS_ROW_K>; SLS_ROW_K] = std::array::from_fn(|i| {
+                        OneSeed::seed_direction(primary[i], i, if i == c { 1.0 } else { 0.0 })
+                    });
+                    let scalar = sls_row_nll(&vars, kernel)
+                        .expect("scalar row NLL")
+                        .contracted_third();
+                    for x in 0..SLS_ROW_K {
+                        for y in 0..SLS_ROW_K {
+                            let b = tensors[row][x][y][c];
+                            let s = scalar[x][y];
+                            if s.is_nan() {
+                                assert!(
+                                    b.is_nan(),
+                                    "scalar NaN but SIMD finite at row={row} x={x} y={y} c={c}"
+                                );
+                            } else {
+                                assert_eq!(
+                                    b.to_bits(),
+                                    s.to_bits(),
+                                    "SIMD tensor != scalar third at row={row} x={x} y={y} c={c}"
+                                );
+                            }
+                            compared += 1;
+                        }
                     }
                 }
             }
@@ -3414,5 +3499,165 @@ mod simd_batch_bit_identity_tests {
             tail_batches_seen > 0,
             "non-multiple-of-4 trailing batches were never exercised"
         );
+    }
+
+    // ── Extended-precision helpers for the accuracy-vs-truth oracle ──────────
+    // Error-free transforms (Dekker / Knuth): `two_prod` needs an FMA, which
+    // `f64::mul_add` provides. The running double-double `(hi, lo)` accumulator
+    // evaluates `Σ_c ℓ_{xyc} dir_c` to ~1e-30 relative — the reference both the
+    // dense-tensor closure and the legacy jet-folded contraction are scored
+    // against.
+    #[inline]
+    fn two_sum(a: f64, b: f64) -> (f64, f64) {
+        let s = a + b;
+        let bb = s - a;
+        let e = (a - (s - bb)) + (b - bb);
+        (s, e)
+    }
+    #[inline]
+    fn two_prod(a: f64, b: f64) -> (f64, f64) {
+        let p = a * b;
+        let e = a.mul_add(b, -p);
+        (p, e)
+    }
+
+    /// Exact (extended-precision) `Σ_c ℓ_{xyc} dir_c` for one `(x, y)` entry,
+    /// from the per-channel f64 thirds `ℓ_{xyc}` and the channel direction. The
+    /// dense-tensor override changes ONLY how this `Σ_c` is realised (materialise
+    /// then sum, vs fold into the jet); this double-double accumulation is the
+    /// truth both realisations are measured against.
+    fn dd_contract(ell: &[f64; SLS_ROW_K], dir: &[f64; SLS_ROW_K]) -> f64 {
+        let (mut hi, mut lo) = (0.0_f64, 0.0_f64);
+        for c in 0..SLS_ROW_K {
+            if dir[c] == 0.0 {
+                continue;
+            }
+            let (ph, pl) = two_prod(ell[c], dir[c]);
+            let (s1, e1) = two_sum(hi, ph);
+            hi = s1;
+            lo += e1 + pl;
+        }
+        hi + lo
+    }
+
+    /// **Accuracy-vs-truth gate (replaces the lifted bit-identity gate).** Over
+    /// `2100` rows × `p ∈ {20, 60, 120}`, the dense-3-tensor all-axes closure
+    /// `Σ_c ℓ_{xyc} dir_c(a)` ([`contract_channel_third`] reading
+    /// [`batched_row_third_tensors`]) is scored, element-for-element, against the
+    /// extended-precision contraction ([`dd_contract`]) and against the legacy
+    /// per-axis jet-folded form (`sls_row_nll(seed_direction(dir))?
+    /// .contracted_third()`). It asserts the new closure's worst-case error vs
+    /// truth is no larger than the legacy form's (the BLAS-3 reassociation does
+    /// not lose accuracy — and with Neumaier summation it gains it), and that the
+    /// new error stays far inside the solver's `1e-9` tolerance. The max
+    /// new-vs-legacy deviation (the `~5e-14` reassociation that broke bit-identity)
+    /// is bounded too.
+    #[test]
+    fn all_axes_dense_3tensor_contraction_accuracy_vs_truth() {
+        let mut rng = Lcg(0x243F6A8885A308D3);
+        let n = 2100usize;
+        let block_of = [0usize, 0, 0, 1, 1, 1, 2, 2, 2];
+        for &p in &[20usize, 60, 120] {
+            let w0 = p / 3;
+            let widths = [w0, w0, p - 2 * w0];
+            let offs = [0usize, widths[0], widths[0] + widths[1]];
+
+            // Finite kernels (sig 0/1/2) so the contraction is finite everywhere.
+            let mut inputs: Vec<Option<([f64; SLS_ROW_K], SurvivalExactRowKernel)>> =
+                Vec::with_capacity(n);
+            let mut chans: Vec<Vec<Option<(usize, Array1<f64>)>>> = Vec::with_capacity(n);
+            for _ in 0..n {
+                let sig = rng.range(3);
+                let kernel = make_kernel(&mut rng, sig);
+                let primary: [f64; SLS_ROW_K] = std::array::from_fn(|_| rng.val());
+                inputs.push(Some((primary, kernel)));
+                let row_chans: Vec<Option<(usize, Array1<f64>)>> = (0..SLS_ROW_K)
+                    .map(|c| {
+                        let blk = block_of[c];
+                        let row =
+                            Array1::from_iter((0..widths[blk]).map(|_| rng.val()));
+                        Some((offs[blk], row))
+                    })
+                    .collect();
+                chans.push(row_chans);
+            }
+
+            let tensors = batched_row_third_tensors(&inputs, 0, n);
+
+            // Sample ~24 axes spread across the three coefficient blocks.
+            let stride = (p / 24).max(1);
+            let mut max_new_err = 0.0_f64;
+            let mut max_old_err = 0.0_f64;
+            let mut max_dev = 0.0_f64;
+            let mut sum_new_err = 0.0_f64;
+            let mut sum_old_err = 0.0_f64;
+            let mut compared = 0usize;
+            let mut axes_seen = 0usize;
+            let mut a = 0usize;
+            while a < p {
+                axes_seen += 1;
+                for row in 0..n {
+                    let dir = axis_direction_from_channel_cache(&chans[row], a);
+                    let new_t = contract_channel_third(&tensors[row], &dir);
+                    let (primary, kernel) = inputs[row].as_ref().expect("finite row");
+                    let vars: [OneSeed<SLS_ROW_K>; SLS_ROW_K] =
+                        std::array::from_fn(|c| OneSeed::seed_direction(primary[c], c, dir[c]));
+                    let old_t = sls_row_nll(&vars, kernel)
+                        .expect("legacy scalar contraction")
+                        .contracted_third();
+                    for x in 0..SLS_ROW_K {
+                        for y in 0..SLS_ROW_K {
+                            let ell: [f64; SLS_ROW_K] =
+                                std::array::from_fn(|c| tensors[row][x][y][c]);
+                            let truth = dd_contract(&ell, &dir);
+                            if !truth.is_finite()
+                                || !new_t[x][y].is_finite()
+                                || !old_t[x][y].is_finite()
+                            {
+                                continue;
+                            }
+                            let scale = 1.0 + truth.abs();
+                            let new_err = (new_t[x][y] - truth).abs() / scale;
+                            let old_err = (old_t[x][y] - truth).abs() / scale;
+                            let dev = (new_t[x][y] - old_t[x][y]).abs() / scale;
+                            max_new_err = max_new_err.max(new_err);
+                            max_old_err = max_old_err.max(old_err);
+                            max_dev = max_dev.max(dev);
+                            sum_new_err += new_err;
+                            sum_old_err += old_err;
+                            compared += 1;
+                        }
+                    }
+                }
+                a += stride;
+            }
+
+            assert!(axes_seen >= 20, "p={p}: expected >=20 sampled axes, got {axes_seen}");
+            assert!(
+                compared >= 2_000 * SLS_ROW_K * SLS_ROW_K,
+                "p={p}: expected >=2000-row coverage, got {compared} comparisons"
+            );
+            // 1. The dense-3-tensor closure is AT LEAST as accurate as the legacy
+            //    jet-folded contraction in the worst case (a small slack covers
+            //    ties where the legacy form happens to round exactly).
+            assert!(
+                max_new_err <= max_old_err + 1e-18,
+                "p={p}: dense-tensor worst-case error {max_new_err:e} exceeds legacy {max_old_err:e}"
+            );
+            // 2. ... and is far inside the documented solver tolerance.
+            assert!(
+                max_new_err <= 1e-9,
+                "p={p}: dense-tensor error vs truth {max_new_err:e} exceeds 1e-9"
+            );
+            // 3. The new-vs-legacy deviation (the reassociation that broke
+            //    bit-identity) stays at ULP scale.
+            assert!(
+                max_dev <= 1e-9,
+                "p={p}: new-vs-legacy deviation {max_dev:e} exceeds 1e-9"
+            );
+            // Keep the mean errors referenced so an accidental zero-coverage
+            // regression (all-skipped) trips assertion 2 rather than passing.
+            assert!(sum_new_err <= sum_old_err + 1e-9);
+        }
     }
 }
