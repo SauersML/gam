@@ -2274,6 +2274,70 @@ impl CustomFamily for BinomialLocationScaleFamily {
         true
     }
 
+    // OUTER-REML CURVATURE: use the EXPECTED (Fisher) joint information, not the
+    // OBSERVED joint Hessian (#1607). The probit (and any non-canonical) link
+    // makes the observed joint Hessian
+    //   coeff_tt = m2 r², coeff_tl = r(m1 + q m2), coeff_ll = q(m1 + q m2)
+    // INDEFINITE away from an exact mode: its per-row 2×2 block has determinant
+    // `−m1(m1 + q m2)·(…)²`, which is negative whenever the row's score factor
+    // `m1` and curvature factor `(m1 + q m2)` share a sign — the generic case at
+    // the loose β̂ an `outer_max_iter:1` evaluation (and every early outer iterate)
+    // hands the REML criterion. The outer LAML logdet `½ log|H + S_λ|` and its
+    // ρ-derivative trace then run on an indefinite `H`: the smooth pseudo-logdet
+    // floors the negative eigenvalue, the projected generalized-determinant kernel
+    // drops it from `range(H + S_λ)` (leaving the inner KKT residual with
+    // unresolved mass), and the envelope trace `tr((H+S_λ)⁺ ∂_ρ(H+S_λ))` blows up
+    // to O(1/floor) ≈ 1e13 while the FD of the floored cost stays O(1) — the
+    // envelope-consistency tripwire then suppresses the analytic gradient to zero
+    // (the cluster-2 symptom) and the NaN/cond spectra of clusters 3/4.
+    //
+    // The EXPECTED information `I = Σ_i f_i (q_a)(q_b)` (f_i = E[F''] ≥ 0, no `m1`
+    // term) is PSD by construction, so `H_E + S_λ` is SPD, its logdet and trace
+    // kernel are well-conditioned, and value/gradient/mode-response all live on
+    // one identifiable subspace. This is Fisher-scoring REML (mgcv's treatment for
+    // non-canonical links) and matches the #1606 NB/Gamma location-scale fix: the
+    // inner P-IRLS score (= 0 at β̂) is untouched, so the stationary point β̂(ρ),
+    // the reported coefficients, and the optimum are unchanged — only the outer
+    // curvature conditioning improves. The directional derivatives below switch in
+    // lock-step so `∂_ρ H_E` and `∂²_ρ H_E` differentiate the SAME expected
+    // information the value path uses.
+    fn exact_newton_outer_curvature(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Option<crate::custom_family::ExactNewtonOuterCurvature>, String> {
+        Ok(self.expected_joint_information_for_specs(block_states, None)?.map(
+            |hessian| crate::custom_family::ExactNewtonOuterCurvature {
+                hessian,
+                rho_curvature_scale: 1.0,
+                hessian_logdet_correction: 0.0,
+            },
+        ))
+    }
+
+    fn exact_newton_outer_curvature_directional_derivative_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.expected_joint_information_directional_for_specs(block_states, Some(specs), d_beta_flat)
+    }
+
+    fn exact_newton_outer_curvature_second_directional_derivative_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.expected_joint_information_second_directional_for_specs(
+            block_states,
+            Some(specs),
+            d_beta_u_flat,
+            d_beta_v_flat,
+        )
+    }
+
     fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
         // Operator-aware: matrix-free workspace applies joint Hv at
         // O(n · (p_t + p_ℓ)); only fall back to the dense build cost when
