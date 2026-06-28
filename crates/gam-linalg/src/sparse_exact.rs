@@ -1105,7 +1105,7 @@ impl TakahashiInverse {
 mod tests {
     use super::*;
     use crate::faer_ndarray::FaerCholesky;
-    use ndarray::array;
+    use ndarray::{array, Array1, Array2};
 
     fn approx_eq(a: f64, b: f64, tol: f64) {
         assert!(
@@ -1113,6 +1113,162 @@ mod tests {
             "values differ: left={a:.12e}, right={b:.12e}, |diff|={:.12e}, tol={tol:.12e}",
             (a - b).abs()
         );
+    }
+
+    // ── dense_to_sparse ───────────────────────────────────────────────────
+
+    #[test]
+    fn dense_to_sparse_preserves_all_nonzero_entries() {
+        // 3x3 matrix with a zero at (1,0) and all others nonzero.
+        let m = array![[1.0, 2.0, 3.0], [0.0, 5.0, 6.0], [7.0, 8.0, 9.0]];
+        let s = dense_to_sparse(&m, ZERO_TOL).unwrap();
+        assert_eq!(s.nrows(), 3);
+        assert_eq!(s.ncols(), 3);
+        // 8 entries should be stored (one zero excluded).
+        assert_eq!(s.compute_nnz(), 8);
+    }
+
+    #[test]
+    fn dense_to_sparse_round_trips_via_matvec_identity() {
+        // Verify that (sparse A) * e_j == column j of A for each column.
+        let m = array![[4.0, 1.0, 0.5], [1.0, 3.0, 2.0], [0.5, 2.0, 6.0]];
+        let s = dense_to_sparse(&m, ZERO_TOL).unwrap();
+        for j in 0..3 {
+            let mut ej = Array1::<f64>::zeros(3);
+            ej[j] = 1.0;
+            // Multiply via the raw faer sparse multiply.
+            let result = {
+                let mut out = Array1::<f64>::zeros(3);
+                let (sym, vals) = s.parts();
+                let col_ptr = sym.col_ptr();
+                let row_idx = sym.row_idx();
+                for col in 0..3 {
+                    for idx in col_ptr[col]..col_ptr[col + 1] {
+                        let row = row_idx[idx];
+                        out[row] += vals[idx] * ej[col];
+                    }
+                }
+                out
+            };
+            for i in 0..3 {
+                approx_eq(result[i], m[[i, j]], 1e-14);
+            }
+        }
+    }
+
+    #[test]
+    fn dense_to_sparse_filters_entries_below_tolerance() {
+        let tol = 0.1;
+        let m = array![[1.0, 0.05], [0.05, 2.0]];
+        let s = dense_to_sparse(&m, tol).unwrap();
+        // Only the two diagonal entries exceed tol.
+        assert_eq!(s.compute_nnz(), 2, "off-diagonal entries below tol must be dropped");
+    }
+
+    // ── dense_to_sparse_symmetric_upper ───────────────────────────────────
+
+    #[test]
+    fn dense_to_sparse_symmetric_upper_stores_only_upper_triangle() {
+        // Full symmetric 3x3 matrix — only upper triangle (i<=j) should be stored.
+        let m = array![[4.0, 1.0, 2.0], [1.0, 5.0, 3.0], [2.0, 3.0, 6.0]];
+        let s = dense_to_sparse_symmetric_upper(&m, ZERO_TOL).unwrap();
+        // Upper triangle has 3 diagonal + 3 off-diagonal = 6 entries.
+        assert_eq!(s.compute_nnz(), 6);
+    }
+
+    // ── sparse_symmetric_upper_matvec_public ──────────────────────────────
+
+    #[test]
+    fn sparse_symmetric_upper_matvec_matches_dense_matvec() {
+        // Symmetric matrix A; upper-sparse encodes only the upper triangle.
+        // A * v must equal the result of the symmetric matvec.
+        let a = array![[4.0, 2.0, 0.0], [2.0, 5.0, 3.0], [0.0, 3.0, 6.0]];
+        let v = array![1.0, 2.0, 3.0];
+        let expected = a.dot(&v); // dense reference
+        let a_sparse = dense_to_sparse_symmetric_upper(&a, ZERO_TOL).unwrap();
+        let got = sparse_symmetric_upper_matvec_public(&a_sparse, &v);
+        for i in 0..3 {
+            approx_eq(got[i], expected[i], 1e-13);
+        }
+    }
+
+    #[test]
+    fn sparse_symmetric_upper_matvec_diagonal_only() {
+        // Pure diagonal matrix: matvec should scale each component.
+        let a = array![[3.0, 0.0, 0.0], [0.0, 5.0, 0.0], [0.0, 0.0, 7.0]];
+        let v = array![2.0, 4.0, 6.0];
+        let a_sparse = dense_to_sparse_symmetric_upper(&a, ZERO_TOL).unwrap();
+        let got = sparse_symmetric_upper_matvec_public(&a_sparse, &v);
+        approx_eq(got[0], 6.0, 1e-14);
+        approx_eq(got[1], 20.0, 1e-14);
+        approx_eq(got[2], 42.0, 1e-14);
+    }
+
+    // ── solve_sparse_spd / logdet_from_factor ─────────────────────────────
+
+    #[test]
+    fn solve_sparse_spd_recovers_known_solution() {
+        // A = [[4,2],[2,5]]; A^{-1} b = [0.5, 2.0] for b = [6, 11].
+        let a = array![[4.0, 2.0], [2.0, 5.0]];
+        let a_sparse = dense_to_sparse_symmetric_upper(&a, ZERO_TOL).unwrap();
+        let factor = factorize_sparse_spd(&a_sparse).unwrap();
+        let rhs = array![6.0, 11.0];
+        let x = solve_sparse_spd(&factor, &rhs).unwrap();
+        // A^-1 = (1/16)*[[5,-2],[-2,4]]; x = (1/16)*[5*6-2*11, -2*6+4*11] = [0.5, 2.0]
+        approx_eq(x[0], 0.5, 1e-12);
+        approx_eq(x[1], 2.0, 1e-12);
+    }
+
+    #[test]
+    fn solve_sparse_spd_3x3_round_trip() {
+        let a: Array2<f64> = array![
+            [9.0, 3.0, 1.0],
+            [3.0, 8.0, 2.0],
+            [1.0, 2.0, 7.0]
+        ];
+        let a_sparse = dense_to_sparse_symmetric_upper(&a, ZERO_TOL).unwrap();
+        let factor = factorize_sparse_spd(&a_sparse).unwrap();
+        for j in 0..3 {
+            let mut ej = Array1::<f64>::zeros(3);
+            ej[j] = 1.0;
+            let col_j = solve_sparse_spd(&factor, &ej).unwrap();
+            // A * x should equal ej.
+            let ax = a.dot(&col_j);
+            for i in 0..3 {
+                approx_eq(ax[i], ej[i], 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn logdet_from_factor_matches_dense_logdet_diagonal() {
+        // Diagonal matrix diag(4,9,16): log-det = log(4)+log(9)+log(16)
+        let a: Array2<f64> =
+            array![[4.0, 0.0, 0.0], [0.0, 9.0, 0.0], [0.0, 0.0, 16.0]];
+        let a_sparse = dense_to_sparse_symmetric_upper(&a, ZERO_TOL).unwrap();
+        let factor = factorize_sparse_spd(&a_sparse).unwrap();
+        let logdet = logdet_from_factor(&factor).unwrap();
+        let expected = 4.0_f64.ln() + 9.0_f64.ln() + 16.0_f64.ln();
+        approx_eq(logdet, expected, 1e-12);
+    }
+
+    #[test]
+    fn logdet_from_factor_matches_2x2_formula() {
+        // A = [[4,2],[2,5]]; det(A) = 20-4 = 16; log-det = log(16)
+        let a = array![[4.0, 2.0], [2.0, 5.0]];
+        let a_sparse = dense_to_sparse_symmetric_upper(&a, ZERO_TOL).unwrap();
+        let factor = factorize_sparse_spd(&a_sparse).unwrap();
+        let logdet = logdet_from_factor(&factor).unwrap();
+        approx_eq(logdet, 16.0_f64.ln(), 1e-12);
+    }
+
+    #[test]
+    fn solve_sparse_spd_dimension_mismatch_returns_error() {
+        let a = array![[4.0, 2.0], [2.0, 5.0]];
+        let a_sparse = dense_to_sparse_symmetric_upper(&a, ZERO_TOL).unwrap();
+        let factor = factorize_sparse_spd(&a_sparse).unwrap();
+        let rhs = array![1.0, 2.0, 3.0]; // wrong length
+        assert!(solve_sparse_spd(&factor, &rhs).is_err());
     }
 
     #[test]
