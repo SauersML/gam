@@ -688,8 +688,15 @@ impl ArrowSchurSystem {
 
     pub fn set_device_sae_pcg_data(&mut self, data: DeviceSaePcgData) {
         assert_eq!(data.beta_dim, self.k);
-        assert_eq!(data.a_phi.len(), self.rows.len());
-        assert_eq!(data.local_jac.len(), self.rows.len());
+        // The frames-engaged builder (`build_framed_device_sae_data`) carries the
+        // per-row cross block through `frame.frame_blocks` and intentionally leaves
+        // the full-`B` `a_phi`/`local_jac` slabs EMPTY (#1033). Only the non-framed
+        // full-`B` path populates those per-row slabs, so the length contract
+        // applies only when there is no frame.
+        if data.frame.is_none() {
+            assert_eq!(data.a_phi.len(), self.rows.len());
+            assert_eq!(data.local_jac.len(), self.rows.len());
+        }
         self.device_sae_pcg = Some(Arc::new(data));
     }
 

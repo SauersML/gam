@@ -1733,6 +1733,161 @@ impl EncodeAtlas {
         Ok(EncodeResult::from_rows(coords, certified))
     }
 
+    /// Batched GEMM "fast" amortized encode — the traditional-encoder forward
+    /// pass, WITH manifolds. For every row this applies the SAME closed-form
+    /// affine predictor as [`amortized_warm_start`]
+    /// (`t̂ = t_c + (1/z)·A₁·(x − z·m₁)`), but routed and applied as batched
+    /// matrix products instead of a per-row loop wrapped in the Kantorovich
+    /// certificate + basin warmup. NO per-row certificate is taken: this is the
+    /// speed mode (the certified `*_encode_*` paths remain the accuracy mode).
+    ///
+    /// Cost is GEMM-bound: one `(n × p)·(p × d)` decode-distance product for
+    /// nearest-chart routing (skipped for single-chart atoms) plus, per chart,
+    /// one `(n_c × p)·(p × d)` predictor product — i.e. `≈ X·Wᵀ`, exactly a
+    /// dense SAE encoder's forward map.
+    ///
+    /// Degenerate rows are handled exactly as `amortized_warm_start` flags them
+    /// (returns `None` ⇒ zeroed coord here): a missing basis evaluator, a chart
+    /// whose Gauss–Newton block was singular (`amortized_jacobian == None`), or a
+    /// non-finite / non-positive amplitude. Those rows are zeroed (never a panic,
+    /// never a silent wrong encode), and their indices are returned in the
+    /// `valid` mask so the caller can route them to the exact path if desired.
+    ///
+    /// Returns `(coords, valid)` where `coords` is `n × d` and `valid[row]` is
+    /// `true` iff the amortized predictor fired for that row.
+    pub fn amortized_encode_batch_fast(
+        &self,
+        atom: &SaeManifoldAtom,
+        atom_index: usize,
+        x: ArrayView2<'_, f64>,
+        amplitudes: ArrayView1<'_, f64>,
+    ) -> Result<(Array2<f64>, Vec<bool>), String> {
+        let n = x.nrows();
+        let p = atom.output_dim();
+        let d = atom.latent_dim;
+        if x.ncols() != p {
+            return Err(format!(
+                "amortized_encode_batch_fast: x has {} cols but atom output dim is {p}",
+                x.ncols()
+            ));
+        }
+        if amplitudes.len() != n {
+            return Err(format!(
+                "amortized_encode_batch_fast: amplitudes len {} != rows {n}",
+                amplitudes.len()
+            ));
+        }
+        let atom_atlas = self.atoms.get(atom_index).ok_or_else(|| {
+            format!("amortized_encode_batch_fast: atom {atom_index} not in atlas")
+        })?;
+        let mut coords = Array2::<f64>::zeros((n, d));
+        let mut valid = vec![false; n];
+
+        // A missing basis evaluator means the distilled predictor cannot fire for
+        // this atom — every row is uncertified (zeroed), exactly like the per-row
+        // `amortized_encode_row` no-evaluator branch.
+        let Some(evaluator) = atom.basis_evaluator.as_ref().cloned() else {
+            return Ok((coords, valid));
+        };
+
+        // ── Routing recon-centers (one evaluation per chart, batched). ────────
+        // `nearest_chart` routes a row to the chart whose center reconstruction
+        // `m(t_c) = BᵀΦ(t_c)` is closest in ‖·‖², skipping charts with
+        // `certified_radius <= 0`. Evaluate every candidate center ONCE here
+        // (chart count ≪ n) and GEMM the recon, reproducing `nearest_chart`'s
+        // per-chart recon bit-for-bit (same φ·decoder accumulation order).
+        let valid_charts: Vec<usize> = (0..atom_atlas.charts.len())
+            .filter(|&c| atom_atlas.charts[c].certified_radius > 0.0)
+            .collect();
+        if valid_charts.is_empty() {
+            return Ok((coords, valid));
+        }
+        // Stack candidate centers (C × d) and evaluate the basis in one call.
+        let mut centers = Array2::<f64>::zeros((valid_charts.len(), d));
+        for (ci, &c) in valid_charts.iter().enumerate() {
+            centers
+                .row_mut(ci)
+                .assign(&atom_atlas.charts[c].region.center);
+        }
+        let (phi_centers, _jet) = evaluator
+            .evaluate(centers.view())
+            .map_err(|err| format!("amortized_encode_batch_fast: center eval: {err}"))?;
+        // recon_centers = Φ_centers · decoder  (C × p), the routing targets.
+        let recon_centers = phi_centers.dot(&atom.decoder_coefficients);
+        // Per-chart routing key: route_idx[row] = argmin_c ‖x_row − recon_c‖².
+        // ‖x − r‖² = ‖x‖² − 2 x·r + ‖r‖²; the ‖x‖² term is row-constant so the
+        // argmin uses S = X·recon_centersᵀ and the per-chart ‖r‖². First chart
+        // wins on a tie (strict `<`), matching `nearest_chart`.
+        let route_idx: Vec<usize> = if valid_charts.len() == 1 {
+            vec![0usize; n]
+        } else {
+            let s = x.dot(&recon_centers.t()); // (n × C)
+            let r_sq: Vec<f64> = (0..valid_charts.len())
+                .map(|c| recon_centers.row(c).dot(&recon_centers.row(c)))
+                .collect();
+            (0..n)
+                .map(|row| {
+                    let mut best_c = 0usize;
+                    let mut best_d = f64::INFINITY;
+                    for c in 0..valid_charts.len() {
+                        let dist = r_sq[c] - 2.0 * s[[row, c]];
+                        if dist < best_d {
+                            best_d = dist;
+                            best_c = c;
+                        }
+                    }
+                    best_c
+                })
+                .collect()
+        };
+
+        // ── Per-chart batched affine predictor. ───────────────────────────────
+        // For rows routed to chart `c` with finite jacobian `A₁` (d × p) and
+        // center reconstruction `m₁` (= `chart.recon_center`), the predictor is
+        //   t̂ = t_c − A₁·m₁ + (1/z)·(A₁·x).
+        // The `A₁·x` term is one `(n_c × p)·(p × d)` GEMM; the `1/z` is a per-row
+        // scalar; `t_c − A₁·m₁` is a per-chart constant. This reproduces
+        // `amortized_warm_start` up to FP reassociation of the per-output sum.
+        for (ci, &c) in valid_charts.iter().enumerate() {
+            let chart = &atom_atlas.charts[c];
+            let Some(a1) = chart.amortized_jacobian.as_ref() else {
+                // Singular Gauss–Newton block: predictor cannot fire — the rows
+                // routed here stay zeroed/uncertified (same as warm_start `None`).
+                continue;
+            };
+            // Gather rows routed to this chart with a usable amplitude.
+            let rows_here: Vec<usize> = (0..n)
+                .filter(|&row| {
+                    route_idx[row] == ci
+                        && amplitudes[row].is_finite()
+                        && amplitudes[row].abs() > 0.0
+                })
+                .collect();
+            if rows_here.is_empty() {
+                continue;
+            }
+            // X_c (n_c × p).
+            let mut x_c = Array2::<f64>::zeros((rows_here.len(), p));
+            for (i, &row) in rows_here.iter().enumerate() {
+                x_c.row_mut(i).assign(&x.row(row));
+            }
+            // U = X_c · A₁ᵀ  (n_c × d) — the GEMM.
+            let u = x_c.dot(&a1.t());
+            // Per-chart constant base = t_c − A₁·m₁ (length d).
+            let m1 = &chart.recon_center;
+            let a1_m1 = a1.dot(m1); // (d)
+            let base = &chart.region.center - &a1_m1; // (d)
+            for (i, &row) in rows_here.iter().enumerate() {
+                let inv_z = 1.0 / amplitudes[row];
+                for axis in 0..d {
+                    coords[[row, axis]] = base[axis] + u[[i, axis]] * inv_z;
+                }
+                valid[row] = true;
+            }
+        }
+        Ok((coords, valid))
+    }
+
     /// LSH-routed certified encode (issue #1010 step 2 + 3): for each target
     /// row, the existing [`SaeCandidateIndex`] (#985/#994) proposes the
     /// best-aligned atom by frame alignment to the row direction; the row is then
