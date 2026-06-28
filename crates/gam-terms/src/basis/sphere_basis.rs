@@ -3546,28 +3546,64 @@ mod harmonic_penalty_invariants_tests {
         assert_eq!(built.penalties.len(), 2);
         let primary = &built.penalties[0];
         let shrink = &built.penalties[1];
-        for col in 0..primary.ncols() {
-            let primary_diag = primary[[col, col]].abs();
-            let shrink_diag = shrink[[col, col]].abs();
-            if col < SPHERE_UNPENALIZED_LOW_DEGREE * (SPHERE_UNPENALIZED_LOW_DEGREE + 2) {
-                assert!(
-                    primary_diag <= 1e-12,
-                    "low-degree column {col} must be primary-null"
-                );
-                assert!(
-                    shrink_diag > 0.0,
-                    "low-degree column {col} must be shrink-penalized"
-                );
-            } else {
-                assert!(
-                    primary_diag > 0.0,
-                    "higher-degree column {col} must carry roughness"
-                );
-                assert!(
-                    shrink_diag <= 1e-12,
-                    "higher-degree column {col} must not be in null shrinkage"
-                );
+
+        // The CURRENT harmonic builder (see build_spherical_harmonic_basis) uses
+        // a FULL-RANK Laplace–Beltrami curvature penalty: the harmonic basis
+        // starts at degree l=1 (there is no degree-0/constant column), and every
+        // column carries the strictly-positive eigenvalue [l(l+1)]^order. There
+        // is therefore NO primary null space, and the double penalty is a UNIFORM
+        // isotropic ridge over ALL columns (Frobenius-normalized). The earlier
+        // expectation — that degree-≤`SPHERE_UNPENALIZED_LOW_DEGREE` columns are
+        // primary-null and shrink-penalized while higher degrees are the reverse
+        // — pinned the Wahba low-degree-nullspace structure, which this Harmonic
+        // method does not use. (`SPHERE_UNPENALIZED_LOW_DEGREE` governs the Wahba
+        // decomposition only.) Assert the real Harmonic contract instead.
+        let l_max = spec.max_degree.unwrap();
+        let expected_p = l_max * (l_max + 2);
+        assert_eq!(primary.ncols(), expected_p);
+
+        // Reconstruct the per-column degree (block l has 2l+1 modes, l = 1..=l_max).
+        let mut col_degree = Vec::with_capacity(expected_p);
+        for l in 1..=l_max {
+            for _ in 0..(2 * l + 1) {
+                col_degree.push(l);
             }
+        }
+        assert_eq!(col_degree.len(), expected_p);
+
+        for col in 0..primary.ncols() {
+            let primary_diag = primary[[col, col]];
+            let shrink_diag = shrink[[col, col]];
+            // Every column carries strictly-positive curvature roughness.
+            assert!(
+                primary_diag > 0.0,
+                "column {col} (degree {}) must carry positive curvature roughness, got {primary_diag}",
+                col_degree[col]
+            );
+            // Curvature penalty equals the Laplace–Beltrami eigenvalue
+            // [l(l+1)]^order on its diagonal.
+            let l = col_degree[col] as f64;
+            let eig = (l * (l + 1.0)).powi(spec.penalty_order as i32);
+            assert!(
+                (primary_diag - eig).abs() <= 1e-9 * eig,
+                "column {col} primary diagonal must be [l(l+1)]^order={eig}, got {primary_diag}"
+            );
+            // The shrink ridge is uniform and positive on every column.
+            assert!(
+                shrink_diag > 0.0,
+                "column {col} must be shrink-penalized by the uniform ridge, got {shrink_diag}"
+            );
+        }
+
+        // The shrink ridge must be the SAME on every column (a uniform isotropic
+        // ridge, not a degree-selective one).
+        let ridge0 = shrink[[0, 0]];
+        for col in 1..shrink.ncols() {
+            assert!(
+                (shrink[[col, col]] - ridge0).abs() <= 1e-12 * ridge0.max(1.0),
+                "shrink ridge must be uniform; column {col} = {} differs from column 0 = {ridge0}",
+                shrink[[col, col]]
+            );
         }
     }
 }
