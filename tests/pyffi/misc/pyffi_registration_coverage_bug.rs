@@ -16,17 +16,17 @@ use std::fs;
 fn pyffi_every_pyfunction_is_registered_once() {
     // Source fragments `include!`d into crates/gam-pyffi/src/lib.rs. The
     // `#[pyfunction]`s and the `#[pymodule]` body are distributed across these.
-    let fragment_files = [
-        "crates/gam-pyffi/src/model_ffi.rs",
-        "crates/gam-pyffi/src/latent_basis_and_sae_ffi.rs",
-        "crates/gam-pyffi/src/reml_latent_fit_ffi.rs",
-        "crates/gam-pyffi/src/geometry_ffi.rs",
-        "crates/gam-pyffi/src/manifold_and_posterior_ffi.rs",
-    ];
+    // Derive the list from lib.rs's own `include!("…")` directives rather than
+    // hardcoding paths: the fragments have already been relocated once (the
+    // flat `src/<x>_ffi.rs` files moved under `src/model/`, `src/latent/`,
+    // `src/manifold/`), and a hardcoded list silently rots into a `cannot read`
+    // panic on the next move. lib.rs is the single source of truth for which
+    // fragments the compiler actually inlines, so read it from there.
+    let fragment_files = pyffi_include_fragments();
 
     // Collect every `#[pyfunction]` name across all fragments.
     let mut pyfns = BTreeSet::new();
-    for path in fragment_files {
+    for path in &fragment_files {
         let src = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
         let lines: Vec<&str> = src.lines().collect();
         let mut i = 0usize;
@@ -66,7 +66,7 @@ fn pyffi_every_pyfunction_is_registered_once() {
     // registration. Locate the fragment that defines it and scan from the
     // function start to the end of file (the body runs to EOF in its fragment).
     let mut mod_src = String::new();
-    for path in fragment_files {
+    for path in &fragment_files {
         let src = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
         if let Some(module_start) = src.find("fn rust_extension") {
             // If a `#[cfg(test)]` module trails the pymodule body in the same
@@ -119,4 +119,35 @@ fn pyffi_every_pyfunction_is_registered_once() {
         missing.is_empty(),
         "unregistered #[pyfunction] exports: {missing:?}"
     );
+}
+
+/// The boundary fragments `include!`d into `crates/gam-pyffi/src/lib.rs`,
+/// resolved to workspace-relative paths. Parsing them out of `lib.rs` keeps this
+/// list in lockstep with the real layout: when a fragment is renamed, moved, or
+/// added, lib.rs's `include!` directive is the one place that must change, and
+/// this test follows it automatically instead of failing on a stale hardcoded
+/// path.
+fn pyffi_include_fragments() -> Vec<String> {
+    const SRC_DIR: &str = "crates/gam-pyffi/src";
+    let lib_rs = format!("{SRC_DIR}/lib.rs");
+    let lib_src =
+        fs::read_to_string(&lib_rs).unwrap_or_else(|e| panic!("read {lib_rs}: {e}"));
+
+    let needle = "include!(\"";
+    let mut fragments = Vec::new();
+    let mut from = 0usize;
+    while let Some(off) = lib_src[from..].find(needle) {
+        let start = from + off + needle.len();
+        let Some(end_rel) = lib_src[start..].find('"') else {
+            break;
+        };
+        let rel = &lib_src[start..start + end_rel];
+        fragments.push(format!("{SRC_DIR}/{rel}"));
+        from = start + end_rel;
+    }
+    assert!(
+        !fragments.is_empty(),
+        "no include!(\"…\") fragments found in {lib_rs}; the boundary layout changed"
+    );
+    fragments
 }
