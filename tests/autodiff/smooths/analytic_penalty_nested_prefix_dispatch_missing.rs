@@ -4,8 +4,8 @@ use std::fs;
 fn analytic_penalty_nested_prefix_kind_is_missing_from_pyffi_json_dispatch() {
     let pyffi = fs::read_to_string("crates/gam-pyffi/src/lib.rs")
         .expect("BUG: could not read crates/gam-pyffi/src/lib.rs");
-    let registry = fs::read_to_string("src/terms/analytic_penalties/manifest.rs")
-        .expect("BUG: could not read src/terms/analytic_penalties/manifest.rs");
+    let registry = fs::read_to_string("crates/gam-terms/src/analytic_penalties/manifest.rs")
+        .expect("BUG: could not read crates/gam-terms/src/analytic_penalties/manifest.rs");
 
     assert!(
         registry.contains("register!(NestedPrefix, NestedPrefixPenalty);"),
