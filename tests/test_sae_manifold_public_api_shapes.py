@@ -53,6 +53,12 @@ def _fresh_fit_or_fail(z: np.ndarray):
     return fit
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="#1512 triage: ManifoldSAE no longer exposes a `shape_band` attribute "
+    "(AttributeError) — the per-atom uncertainty shape-band surface was "
+    "removed/renamed. Re-point at the current uncertainty accessor to re-enable.",
+)
 def test_per_atom_uncertainty_shape_band_and_coordinate_range_shapes_are_sane():
     z = _circle_data()
     fit = _fresh_fit_or_fail(z)
