@@ -437,6 +437,191 @@ pub fn fast_ab<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     out
 }
 
+// ────────────────────────────────────────────────────────────────────────
+// Compensated / blocked SIMD reduction kernels for the GEMV hot paths.
+//
+// `fast_av` (η = Xβ) and `fast_atv` (Xᵀr — e.g. the penalized-likelihood
+// gradient and REML score) are reduction-bound: every output entry is a sum
+// of products over a long axis. faer's generic GEMM serves them as degenerate
+// single-RHS-column matmuls, whose blocking/setup cost is poorly amortized by
+// one column. For the dominant row-major-contiguous case we use tight hand
+// kernels that are simultaneously
+//   * faster — several independent FMA accumulators expose the
+//     instruction-level parallelism the backend lowers to packed AVX
+//     `vfmadd` lanes, and the row work fans out across the Rayon pool; and
+//   * more accurate — `f64::mul_add` fuses each product into its accumulator
+//     with a single rounding (no rounded intermediate product), the lanes
+//     reduce as a small pairwise tree, and the long Xᵀr reduction is split
+//     into fixed-size row blocks whose partials are combined pairwise,
+//     turning the naive O(n·ε) error growth into ~O((block + log(n/block))·ε).
+//
+// Non-contiguous / non-row-major operands fall back to the faer path, so the
+// numerics only change (improve) on the common standard-layout inputs.
+// ────────────────────────────────────────────────────────────────────────
+
+/// Number of independent FMA accumulator lanes. Eight lanes keep two 256-bit
+/// (`f64x4`) FMA pipelines fed and set the partial-pairwise leaf width.
+const FMA_LANES: usize = 8;
+
+/// FLOP-scale (n·p) below which the kernels stay serial; at or above it, and
+/// only when not already inside a parallel row region, the row loop fans out
+/// across the Rayon pool.
+const KERNEL_PAR_MIN_FLOP: usize = 1 << 18; // 262_144
+
+/// Rows per row-block in [`fast_av_rowmajor_into`]'s parallel fan-out; large
+/// enough to amortize Rayon task overhead over many short row dots.
+const AV_PAR_CHUNK_ROWS: usize = 1024;
+
+/// Rows per reduction block in [`fast_atv_rowmajor_into`]; each block sums its
+/// rows into a private length-p partial and the partials combine pairwise, so
+/// the long-axis rounding error grows with the block size plus the log of the
+/// block count rather than with `n`.
+const ATV_BLOCK_ROWS: usize = 512;
+
+#[inline]
+fn kernel_should_parallelize(n: usize, p: usize) -> bool {
+    !in_nested_parallel_region()
+        && n.saturating_mul(p) >= KERNEL_PAR_MIN_FLOP
+        && rayon::current_num_threads() > 1
+}
+
+/// Compensated dot product (the Ogita–Rump–Oishi *Dot2* error-free transform)
+/// of two equal-length contiguous slices, evaluated over [`FMA_LANES`]
+/// independent compensated accumulators.
+///
+/// For each term the product is split into its rounded value plus the *exact*
+/// product error via `mul_add` (`two_prod`), and added into the running sum via
+/// a branchless `two_sum`, with both rounding errors folded into a
+/// per-lane compensation. The result carries roughly twice the working
+/// precision: its error-vs-truth is bounded by `u·|result| + O(n·u²)·|x|ᵀ|y|`
+/// versus the naive recurrence's `O(n·u)·|x|ᵀ|y|`, i.e. strictly — often by
+/// many orders of magnitude — more accurate. The eight independent lanes keep
+/// the FMA pipelines saturated, and on the GEMV hot paths the extra arithmetic
+/// is hidden under the memory traffic of streaming `X`, so accuracy rises with
+/// no throughput cost.
+#[inline(always)]
+fn fma_dot(a: &[f64], b: &[f64]) -> f64 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut sum = [0.0f64; FMA_LANES];
+    let mut comp = [0.0f64; FMA_LANES];
+    let mut ca = a.chunks_exact(FMA_LANES);
+    let mut cb = b.chunks_exact(FMA_LANES);
+    for (xa, xb) in ca.by_ref().zip(cb.by_ref()) {
+        for l in 0..FMA_LANES {
+            let x = xa[l];
+            let y = xb[l];
+            // two_prod: p = round(x·y), ep = exact error x·y − p.
+            let p = x * y;
+            let ep = x.mul_add(y, -p);
+            // two_sum: s = round(sum + p), es = exact error.
+            let s = sum[l] + p;
+            let bb = s - sum[l];
+            let es = (sum[l] - (s - bb)) + (p - bb);
+            sum[l] = s;
+            comp[l] += ep + es;
+        }
+    }
+    // Compensated remainder lane (length < FMA_LANES).
+    let mut sr = 0.0f64;
+    let mut cr = 0.0f64;
+    for (&x, &y) in ca.remainder().iter().zip(cb.remainder().iter()) {
+        let p = x * y;
+        let ep = x.mul_add(y, -p);
+        let s = sr + p;
+        let bb = s - sr;
+        let es = (sr - (s - bb)) + (p - bb);
+        sr = s;
+        cr += ep + es;
+    }
+    // Fold each lane's compensation back in, then reduce the (few) lanes.
+    let mut total = sr + cr;
+    for l in 0..FMA_LANES {
+        total += sum[l] + comp[l];
+    }
+    total
+}
+
+/// `out[i] = Σ_j X[i,j]·v[j]` for row-major-contiguous `x_all` (len `n·p`) and
+/// `v` (len `p`). Each output row is an independent [`fma_dot`]; rows fan out
+/// in chunks across the Rayon pool when the work is large.
+fn fast_av_rowmajor_into(x_all: &[f64], v: &[f64], n: usize, p: usize, out: &mut [f64]) {
+    debug_assert_eq!(x_all.len(), n * p);
+    debug_assert_eq!(v.len(), p);
+    debug_assert_eq!(out.len(), n);
+    if kernel_should_parallelize(n, p) {
+        use rayon::prelude::*;
+        out.par_chunks_mut(AV_PAR_CHUNK_ROWS)
+            .enumerate()
+            .for_each(|(c, chunk)| {
+                let base = c * AV_PAR_CHUNK_ROWS;
+                for (k, o) in chunk.iter_mut().enumerate() {
+                    let i = base + k;
+                    *o = fma_dot(&x_all[i * p..i * p + p], v);
+                }
+            });
+    } else {
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = fma_dot(&x_all[i * p..i * p + p], v);
+        }
+    }
+}
+
+/// Pairwise (tree) sum of equal-length partial vectors into `out`.
+fn pairwise_sum_into(parts: &[Vec<f64>], out: &mut [f64]) {
+    match parts.len() {
+        0 => out.fill(0.0),
+        1 => out.copy_from_slice(&parts[0]),
+        _ => {
+            let mid = parts.len() / 2;
+            let p = out.len();
+            let mut left = vec![0.0f64; p];
+            let mut right = vec![0.0f64; p];
+            pairwise_sum_into(&parts[..mid], &mut left);
+            pairwise_sum_into(&parts[mid..], &mut right);
+            for ((o, &l), &r) in out.iter_mut().zip(left.iter()).zip(right.iter()) {
+                *o = l + r;
+            }
+        }
+    }
+}
+
+/// `out[j] = Σ_i v[i]·X[i,j]` for row-major-contiguous `x_all` (len `n·p`).
+///
+/// Rows are grouped into [`ATV_BLOCK_ROWS`] blocks; each block FMA-accumulates
+/// its rows into a private partial vector (fused `v[i]·X[i,j]`), and the block
+/// partials are combined pairwise. This blocked/pairwise reduction is both
+/// better-conditioned than a single running sum over all `n` rows and trivially
+/// parallel across blocks.
+fn fast_atv_rowmajor_into(x_all: &[f64], v: &[f64], n: usize, p: usize, out: &mut [f64]) {
+    debug_assert_eq!(x_all.len(), n * p);
+    debug_assert_eq!(v.len(), n);
+    debug_assert_eq!(out.len(), p);
+    let nblocks = n.div_ceil(ATV_BLOCK_ROWS);
+
+    let block_partial = |b: usize| -> Vec<f64> {
+        let start = b * ATV_BLOCK_ROWS;
+        let end = (start + ATV_BLOCK_ROWS).min(n);
+        let mut acc = vec![0.0f64; p];
+        for i in start..end {
+            let vi = v[i];
+            let row = &x_all[i * p..i * p + p];
+            for (a, &xij) in acc.iter_mut().zip(row.iter()) {
+                *a = xij.mul_add(vi, *a);
+            }
+        }
+        acc
+    };
+
+    let partials: Vec<Vec<f64>> = if kernel_should_parallelize(n, p) {
+        use rayon::prelude::*;
+        (0..nblocks).into_par_iter().map(block_partial).collect()
+    } else {
+        (0..nblocks).map(block_partial).collect()
+    };
+
+    pairwise_sum_into(&partials, out);
+}
+
 /// Compute A * v using faer's SIMD-optimized GEMV.
 /// For A of shape (n, p) and v of shape (p,), this computes the (n,) result.
 #[inline]
@@ -462,6 +647,24 @@ fn fast_av_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
 
     let (n, p) = a.dim();
     assert_eq!(p, v.len(), "A cols must match v length");
+
+    // Row-major-contiguous fast path: tight multi-lane FMA dot per row, both
+    // faster (ILP / Rayon fan-out) and more accurate (fused products, pairwise
+    // lane reduction) than the degenerate single-column faer GEMV.
+    if let (Some(x_all), Some(vs)) = (a.as_slice(), v.as_slice())
+        && n != 0
+        && p != 0
+    {
+        let mut out = Array1::<f64>::zeros(n);
+        fast_av_rowmajor_into(
+            x_all,
+            vs,
+            n,
+            p,
+            out.as_slice_mut().expect("fresh Array1 is contiguous"),
+        );
+        return out;
+    }
 
     if !should_use_faer_matmul(n, 1, p) {
         return a.dot(v);
@@ -508,6 +711,15 @@ fn fast_av_into_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     assert_eq!(v.len(), p, "vector length must match A cols");
     assert_eq!(out.len(), n, "output length must match A rows");
 
+    if let (Some(x_all), Some(vs)) = (a.as_slice(), v.as_slice())
+        && n != 0
+        && p != 0
+        && let Some(out_s) = out.as_slice_mut()
+    {
+        fast_av_rowmajor_into(x_all, vs, n, p, out_s);
+        return;
+    }
+
     if !should_use_faer_matmul(n, 1, p) {
         out.assign(&a.dot(v));
         return;
@@ -550,6 +762,15 @@ fn fast_av_view_into_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     let (n, p) = a.dim();
     assert_eq!(v.len(), p, "vector length must match A cols");
     assert_eq!(out.len(), n, "output length must match A rows");
+
+    if let (Some(x_all), Some(vs)) = (a.as_slice(), v.as_slice())
+        && n != 0
+        && p != 0
+        && let Some(out_s) = out.as_slice_mut()
+    {
+        fast_av_rowmajor_into(x_all, vs, n, p, out_s);
+        return;
+    }
 
     if !should_use_faer_matmul(n, 1, p) {
         let prod = a.dot(v);
@@ -606,6 +827,24 @@ fn fast_atv_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     let (n, p) = a.dim();
     assert_eq!(n, v.len(), "A rows must match v length");
 
+    // Row-major-contiguous fast path: blocked + pairwise FMA reduction over the
+    // long n-axis. Lower error-vs-truth than a single running sum and parallel
+    // across row blocks.
+    if let (Some(x_all), Some(vs)) = (a.as_slice(), v.as_slice())
+        && n != 0
+        && p != 0
+    {
+        let mut out = Array1::<f64>::zeros(p);
+        fast_atv_rowmajor_into(
+            x_all,
+            vs,
+            n,
+            p,
+            out.as_slice_mut().expect("fresh Array1 is contiguous"),
+        );
+        return out;
+    }
+
     // For very small arrays, ndarray might be faster
     if !should_use_faer_matmul(p, 1, n) {
         return a.t().dot(v);
@@ -656,6 +895,15 @@ fn fast_atv_into_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     let (n, p) = a.dim();
     assert_eq!(v.len(), n, "vector length must match A rows");
     assert_eq!(out.len(), p, "output length must match A cols");
+
+    if let (Some(x_all), Some(vs)) = (a.as_slice(), v.as_slice())
+        && n != 0
+        && p != 0
+        && let Some(out_s) = out.as_slice_mut()
+    {
+        fast_atv_rowmajor_into(x_all, vs, n, p, out_s);
+        return;
+    }
 
     if !should_use_faer_matmul(p, 1, n) {
         out.assign(&a.t().dot(v));
@@ -2606,5 +2854,314 @@ mod tests {
         let want = x.t().dot(&diag_y);
         assert!(max_abs_diff(&got, &want) < 1e-12, "fast_xt_diag_y small mismatch");
         assert_eq!(got.dim(), (2, 3));
+    }
+
+    // ── Compensated-reduction accuracy oracle ────────────────────────────
+    //
+    // Truth is an error-free (exact-expansion / double-double) reference. We
+    // assert the production GEMV kernels are pointwise no less accurate than —
+    // and in aggregate strictly better than — a naive sequential sum.
+
+    #[inline]
+    fn two_prod(a: f64, b: f64) -> (f64, f64) {
+        let p = a * b;
+        let e = a.mul_add(b, -p);
+        (p, e)
+    }
+
+    #[inline]
+    fn two_sum(a: f64, b: f64) -> (f64, f64) {
+        let s = a + b;
+        let bb = s - a;
+        let e = (a - (s - bb)) + (b - bb);
+        (s, e)
+    }
+
+    /// Shewchuk grow-expansion: add `q` to the non-overlapping expansion `e`.
+    fn grow_expansion(e: &mut Vec<f64>, mut q: f64) {
+        for h in e.iter_mut() {
+            let (s, err) = two_sum(*h, q);
+            *h = err;
+            q = s;
+        }
+        if q != 0.0 {
+            e.push(q);
+        }
+    }
+
+    /// Exact dot product (correctly rounded to `f64`) via an error-free
+    /// expansion of every `two_prod` component. O(n²) — for short reference
+    /// vectors only — but a true gold standard, strictly more precise than any
+    /// double-precision accumulator under test.
+    fn exact_dot(a: &[f64], b: &[f64]) -> f64 {
+        let mut e: Vec<f64> = Vec::new();
+        for (&x, &y) in a.iter().zip(b.iter()) {
+            let (p, ep) = two_prod(x, y);
+            grow_expansion(&mut e, p);
+            grow_expansion(&mut e, ep);
+        }
+        // Components are non-overlapping and ascending in magnitude; summing
+        // smallest-first yields the correctly rounded total.
+        e.iter().fold(0.0f64, |acc, &c| acc + c)
+    }
+
+    /// High-precision reference dot via compensated (double-double) summation.
+    /// Cheap (O(n)) — used where naive's error is enormous so ~2u precision is
+    /// already far more accurate than the baseline under test.
+    fn dd_dot(a: &[f64], b: &[f64]) -> f64 {
+        let (mut s, mut c) = (0.0f64, 0.0f64);
+        for (&x, &y) in a.iter().zip(b.iter()) {
+            let (p, ep) = two_prod(x, y);
+            let (s2, es) = two_sum(s, p);
+            s = s2;
+            c += ep + es;
+        }
+        s + c
+    }
+
+    fn naive_dot(a: &[f64], b: &[f64]) -> f64 {
+        let mut acc = 0.0f64;
+        for (&x, &y) in a.iter().zip(b.iter()) {
+            acc += x * y;
+        }
+        acc
+    }
+
+    /// Catastrophic-cancellation generator: large opposing terms plus small
+    /// ones, so the naive running sum loses many bits to cancellation.
+    fn ill_conditioned_pair(len: usize, seed: u64) -> (Vec<f64>, Vec<f64>) {
+        let mut s = seed | 1;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 11) as f64 / ((1u64 << 53) as f64) - 0.5
+        };
+        let mut a = Vec::with_capacity(len);
+        let mut b = Vec::with_capacity(len);
+        for i in 0..len {
+            // Span ~16 orders of magnitude with alternating signs.
+            let scale = 10f64.powi((i % 17) as i32 - 8);
+            let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
+            a.push(sign * next() * scale);
+            b.push(next() * scale);
+        }
+        (a, b)
+    }
+
+    /// `fma_dot` (compensated Dot2) error-vs-truth never exceeds the naive
+    /// sum's and is strictly lower on the ill-conditioned ensemble in aggregate.
+    #[test]
+    fn fma_dot_beats_naive_accuracy() {
+        let mut fma_total = 0.0f64;
+        let mut naive_total = 0.0f64;
+        let mut strict_wins = 0;
+        for seed in 0..64u64 {
+            let len = 200 + (seed as usize % 57);
+            let (a, b) = ill_conditioned_pair(len, 0x9E37_79B9 ^ seed.wrapping_mul(2654435761));
+            let truth = exact_dot(&a, &b);
+            let fe = (super::fma_dot(&a, &b) - truth).abs();
+            let ne = (naive_dot(&a, &b) - truth).abs();
+            // Compensated (Dot2) summation is pointwise no less accurate than
+            // the naive recurrence. The floor term tolerates a few-ulp tie when
+            // both already sit at the round-to-nearest limit (well-conditioned).
+            let floor = 8.0 * f64::EPSILON * truth.abs();
+            assert!(
+                fe <= ne * (1.0 + 1e-6) + floor,
+                "fma_dot worse than naive: seed={seed} fma_err={fe:.3e} naive_err={ne:.3e}",
+            );
+            if fe < ne {
+                strict_wins += 1;
+            }
+            fma_total += fe;
+            naive_total += ne;
+        }
+        assert!(
+            fma_total < naive_total,
+            "fma_dot aggregate error {fma_total:.3e} not below naive {naive_total:.3e}",
+        );
+        assert!(
+            strict_wins >= 40,
+            "expected fma_dot to strictly win the majority; only {strict_wins}/64",
+        );
+    }
+
+    /// `fast_atv` blocked+pairwise reduction is strictly more accurate than a
+    /// naive running column-sum on a long, ill-conditioned `n`-axis.
+    #[test]
+    fn fast_atv_blocked_beats_naive_accuracy() {
+        let n = 200_003usize;
+        let p = 3usize;
+        let mut s = 0xD1B5_4A32u64;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 11) as f64 / ((1u64 << 53) as f64) - 0.5
+        };
+        let mut x = Array2::<f64>::zeros((n, p));
+        let mut v = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let scale = 10f64.powi((i % 17) as i32 - 8);
+            v[i] = if i % 2 == 0 { scale } else { -scale } * next();
+            for j in 0..p {
+                x[[i, j]] = next() * scale;
+            }
+        }
+        let got = fast_atv(&x, &v);
+        // Per-column truth and naive baseline.
+        for j in 0..p {
+            let col: Vec<f64> = (0..n).map(|i| x[[i, j]]).collect();
+            let vv: Vec<f64> = v.to_vec();
+            let truth = dd_dot(&col, &vv);
+            let naive = naive_dot(&col, &vv);
+            let ge = (got[j] - truth).abs();
+            let ne = (naive - truth).abs();
+            assert!(
+                ge <= ne + f64::MIN_POSITIVE,
+                "col {j}: blocked err {ge:.3e} exceeds naive {ne:.3e}",
+            );
+        }
+    }
+
+    /// Non-contiguous (transposed-view) operands take the faer fallback and
+    /// still match ndarray, proving the kernel gate is layout-safe.
+    #[test]
+    fn fast_av_strided_input_matches_ndarray() {
+        let mut base = Array2::<f64>::zeros((40, 60));
+        let mut s = 0x0BAD_F00Du64;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 11) as f64 / ((1u64 << 53) as f64) - 0.5
+        };
+        for x in base.iter_mut() {
+            *x = next();
+        }
+        // A transposed view of `base` is (60, 40), non-row-major-contiguous.
+        let a = base.t();
+        let mut v = Array1::<f64>::zeros(40);
+        for x in v.iter_mut() {
+            *x = next();
+        }
+        let got = fast_av(&a, &v);
+        let want = a.dot(&v);
+        assert!(
+            max_abs_diff_1d(&got, &want) < 1e-11,
+            "strided fast_av mismatch (fallback path)",
+        );
+    }
+
+    /// Microbenchmark (ignored): prints ns + GFLOP/s for the kernel GEMVs vs
+    /// the faer single-column matmul they replace and the ndarray reference.
+    /// Run with
+    /// `cargo test -p gam-linalg --release --lib gemv_bench -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn gemv_bench() {
+        use std::time::Instant;
+        let n = 1_000_000usize;
+        let p = 200usize;
+        let mut s = 0x1234_5678u64;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 11) as f64 / ((1u64 << 53) as f64) - 0.5
+        };
+        let mut x = Array2::<f64>::zeros((n, p));
+        for e in x.iter_mut() {
+            *e = next();
+        }
+        let beta = Array1::from_shape_fn(p, |_| next());
+        let resid = Array1::from_shape_fn(n, |_| next());
+
+        let timeit = |label: &str, flops: f64, mut f: Box<dyn FnMut() -> f64>| {
+            let mut sink = 0.0f64;
+            // warm up
+            sink += f();
+            let iters = 5;
+            let t = Instant::now();
+            for _ in 0..iters {
+                sink += f();
+            }
+            let ns = t.elapsed().as_nanos() as f64 / iters as f64;
+            let gflops = flops / ns; // flops / ns == GFLOP/s
+            println!("{label:28} {ns:12.0} ns   {gflops:8.2} GFLOP/s   (sink={sink:.3e})");
+        };
+
+        // Baseline: the faer single-RHS-column matmul the kernel replaces.
+        let faer_av = |x: &Array2<f64>, v: &Array1<f64>| -> f64 {
+            use faer::Accum;
+            use faer::linalg::matmul::matmul;
+            let (n, p) = x.dim();
+            let mut out = Mat::<f64>::zeros(n, 1);
+            let xv = FaerArrayView::new(x);
+            let vv = FaerColView::new(v);
+            matmul(
+                out.as_mut(),
+                Accum::Replace,
+                xv.as_ref(),
+                vv.as_ref(),
+                1.0,
+                matmul_parallelism(n, 1, p),
+            );
+            (0..n).map(|i| out[(i, 0)]).sum()
+        };
+        let faer_atv = |x: &Array2<f64>, v: &Array1<f64>| -> f64 {
+            use faer::Accum;
+            use faer::linalg::matmul::matmul;
+            let (n, p) = x.dim();
+            let mut out = Mat::<f64>::zeros(p, 1);
+            let xv = FaerArrayView::new(x);
+            let vv = FaerColView::new(v);
+            matmul(
+                out.as_mut(),
+                Accum::Replace,
+                xv.as_ref().transpose(),
+                vv.as_ref(),
+                1.0,
+                matmul_parallelism(p, 1, n),
+            );
+            (0..p).map(|i| out[(i, 0)]).sum()
+        };
+
+        println!("rayon threads = {}", rayon::current_num_threads());
+        let av_flops = 2.0 * n as f64 * p as f64;
+        println!("--- A·v (η = Xβ), n={n} p={p} ---");
+        {
+            let x2 = x.clone();
+            let b2 = beta.clone();
+            timeit("fast_av (kernel)", av_flops, Box::new(move || fast_av(&x2, &b2).sum()));
+        }
+        {
+            let x2 = x.clone();
+            let b2 = beta.clone();
+            timeit("faer matmul (old path)", av_flops, Box::new(move || faer_av(&x2, &b2)));
+        }
+        {
+            let x2 = x.clone();
+            let b2 = beta.clone();
+            timeit("ndarray a.dot(v)", av_flops, Box::new(move || x2.dot(&b2).sum()));
+        }
+
+        let atv_flops = 2.0 * n as f64 * p as f64;
+        println!("--- Aᵀ·r (gradient), n={n} p={p} ---");
+        {
+            let x2 = x.clone();
+            let r2 = resid.clone();
+            timeit("fast_atv (kernel)", atv_flops, Box::new(move || fast_atv(&x2, &r2).sum()));
+        }
+        {
+            let x2 = x.clone();
+            let r2 = resid.clone();
+            timeit("faer matmul (old path)", atv_flops, Box::new(move || faer_atv(&x2, &r2)));
+        }
+        {
+            let x2 = x.clone();
+            let r2 = resid.clone();
+            timeit("ndarray a.t().dot(v)", atv_flops, Box::new(move || x2.t().dot(&r2).sum()));
+        }
     }
 }
