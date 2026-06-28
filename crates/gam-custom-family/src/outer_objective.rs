@@ -76,10 +76,19 @@ impl LabeledOuterHessianOperator {
         base: Arc<dyn gam_problem::OuterHessianOperator>,
         layout: &PenaltyLabelLayout,
     ) -> Self {
-        let n_physical = layout.physical_to_outer.len();
+        // gam#1587: the base operator spans the per-block physical coords followed
+        // by the appended joint coords; both map into the outer ρ space (joint
+        // coords always to a concrete outer slot).
+        let physical_to_outer: Vec<Option<usize>> = layout
+            .physical_to_outer
+            .iter()
+            .copied()
+            .chain(layout.joint_to_outer.iter().map(|&o| Some(o)))
+            .collect();
+        let n_physical = physical_to_outer.len();
         Self {
             base,
-            physical_to_outer: layout.physical_to_outer.clone(),
+            physical_to_outer,
             outer_dim: layout.initial_rho.len(),
             scratch: std::sync::Mutex::new((
                 ndarray::Array1::zeros(n_physical),

@@ -336,6 +336,15 @@ impl MultinomialFamily {
         self
     }
 
+    /// Seed the warm-start `log λ` carried into the reference-symmetric joint
+    /// smoothing penalties (gam#1587). The formula REML driver sets this from its
+    /// `init_lambda` so the joint-penalty outer ρ starts at the same seed the
+    /// per-block path used historically; the outer loop then selects the optimum.
+    pub fn with_initial_log_lambda(mut self, log_lambda: f64) -> Self {
+        self.initial_log_lambda = log_lambda;
+        self
+    }
+
     /// Build the canonical block specs for this family.
     ///
     /// One [`ParameterBlockSpec`] per active class, all sharing the same
@@ -386,22 +395,23 @@ impl MultinomialFamily {
                 // contained prerequisite.) Untied per-(class,term) λ — the prior
                 // behavior — additionally breaks reference-class invariance
                 // because relabeling permutes which class owns which λ.
-                let labeled_penalties: Vec<PenaltyMatrix> = self
-                    .penalties
-                    .iter()
-                    .enumerate()
-                    .map(|(t, pen)| {
-                        pen.clone()
-                            .with_precision_label(format!("multinomial_term_{t}"))
-                    })
-                    .collect();
+                // gam#1587: the smooth-term penalties are carried as
+                // reference-symmetric full-width `M⊗S_t` JOINT penalties (see
+                // `joint_penalty_specs` / `centered_joint_penalty_specs`), NOT
+                // per-block `I⊗S_t`. The per-class blocks therefore attach NO
+                // smooth penalty here — the joint penalty is the sole carrier of
+                // their smoothing, and the outer ρ coordinates `multinomial_term_t`
+                // are created by the joint specs. Attaching the per-block penalty
+                // too would double-count `(I+M)⊗S_t` and re-introduce the
+                // reference-anchored frame.
+                let _ = n_terms;
                 let mut spec = ParameterBlockSpec {
                     name: format!("class_{a}"),
                     design: DesignMatrix::Dense(DenseDesignMatrix::from(self.design.clone())),
                     offset: Array1::<f64>::zeros(self.design.nrows()),
-                    penalties: labeled_penalties,
-                    nullspace_dims: (*self.penalty_nullspace_dims).clone(),
-                    initial_log_lambdas: Array1::<f64>::zeros(n_terms),
+                    penalties: Vec::new(),
+                    nullspace_dims: Vec::new(),
+                    initial_log_lambdas: Array1::<f64>::zeros(0),
                     initial_beta: None,
                     gauge_priority: priority,
                     jacobian_callback: None,
@@ -485,8 +495,15 @@ impl MultinomialFamily {
                     && spec.offset.len() == n
                     && spec.stacked_design.is_none()
                     && spec.stacked_offset.is_none()
-                    && spec.initial_log_lambdas.len() == self.penalties.len()
-                    && spec.penalties.len() == self.penalties.len()
+                    // gam#1587: per-block smooth penalties are emptied (the
+                    // centered `M⊗S_t` joint penalty is the sole smoothing
+                    // carrier), so the per-block penalty/λ count is 0. Accept
+                    // either the legacy full per-term list or the emptied form so
+                    // the workspace HVP/gradient/loglik stay available.
+                    && (spec.initial_log_lambdas.len() == self.penalties.len()
+                        || spec.initial_log_lambdas.is_empty())
+                    && (spec.penalties.len() == self.penalties.len()
+                        || spec.penalties.is_empty())
             })
     }
 
@@ -2061,22 +2078,32 @@ mod tests {
     }
 
     #[test]
-    fn each_block_carries_the_full_per_term_penalty_list() {
-        // Single-term family: every block carries exactly one penalty and one λ
-        // (the classic Kronecker form I_{K-1} ⊗ (λ_a S)).
+    fn per_term_smoothing_is_carried_by_the_centered_joint_penalty() {
+        // gam#1587: the per-block specs no longer attach ANY smooth penalty —
+        // the reference-symmetric centered `M⊗S_t` JOINT penalty is the sole
+        // carrier of the per-term smoothing (otherwise the per-block `I⊗S_t` and
+        // the joint `M⊗S_t` would double-count, re-introducing the
+        // reference-anchored frame). Each block therefore reports an EMPTY
+        // per-block penalty/λ list, and `joint_penalty_specs()` returns one
+        // full-width penalty per smooth term.
+
+        // Single-term family: one joint penalty, blocks carry none.
         let single = toy_family(6, 4, 3);
         for spec in &single.build_block_specs() {
-            assert_eq!(spec.penalties.len(), 1);
-            assert_eq!(spec.initial_log_lambdas.len(), 1);
-            assert_eq!(spec.nullspace_dims.len(), 1);
+            assert!(spec.penalties.is_empty());
+            assert!(spec.initial_log_lambdas.is_empty());
+            assert!(spec.nullspace_dims.is_empty());
         }
+        assert_eq!(
+            single.joint_penalty_specs().expect("joint specs").len(),
+            1,
+            "single-term family carries exactly one full-width joint penalty"
+        );
 
-        // Multi-term family (#561): every active-class block must receive the
-        // FULL list of per-term penalties, with one entry of `initial_log_lambdas`
-        // (and `nullspace_dims`) per term — so the outer REML loop selects an
-        // INDEPENDENT λ_{a,t} per (class, term). A fused single-penalty driver
-        // would collapse this back to one penalty / one λ and silently
-        // over-smooth one term while under-smoothing another.
+        // Multi-term family (#561): the per-term list is preserved — one joint
+        // `M⊗S_t` per term — so the outer REML loop still selects a per-term λ_t
+        // (now shared across classes by the centered metric, see the tied-label
+        // test). The per-block lists stay empty.
         let p = 5;
         let k = 4;
         let n_terms = 3;
@@ -2112,17 +2139,24 @@ mod tests {
         let specs = multi.build_block_specs();
         assert_eq!(specs.len(), k - 1, "one block per active class");
         for spec in &specs {
-            assert_eq!(
-                spec.penalties.len(),
-                n_terms,
-                "each block must carry the full per-term penalty list (#561)"
+            assert!(
+                spec.penalties.is_empty(),
+                "per-block smooth penalties are emptied; the joint penalty carries them (#1587)"
             );
-            assert_eq!(
-                spec.initial_log_lambdas.len(),
-                n_terms,
-                "each block must carry one independent λ per smooth term (#561)"
-            );
-            assert_eq!(spec.nullspace_dims.len(), n_terms);
+            assert!(spec.initial_log_lambdas.is_empty());
+            assert!(spec.nullspace_dims.is_empty());
+        }
+        // One full-width joint penalty per smooth term, each acting on the whole
+        // (K−1)·P stacked coefficient vector.
+        let joint = multi.joint_penalty_specs().expect("joint specs");
+        assert_eq!(
+            joint.len(),
+            n_terms,
+            "each smooth term contributes one full-width centered joint penalty (#561/#1587)"
+        );
+        for spec in &joint {
+            assert_eq!(spec.matrix.nrows(), (k - 1) * p);
+            assert_eq!(spec.matrix.ncols(), (k - 1) * p);
         }
     }
 
@@ -2170,50 +2204,45 @@ mod tests {
         let m = k - 1;
         assert_eq!(specs.len(), m);
 
-        // Every block's term-t penalty carries the SAME label across classes.
-        for t in 0..n_terms {
-            let expected = format!("multinomial_term_{t}");
-            for (a, spec) in specs.iter().enumerate() {
-                let label = spec.penalties[t].precision_label();
-                assert_eq!(
-                    label,
-                    Some(expected.as_str()),
-                    "class {a} term {t} must carry the shared per-term precision label \
-                     '{expected}' so the outer loop ties λ across classes (#1587), got {label:?}"
-                );
-            }
+        // gam#1587: the per-block specs carry NO smooth penalty; the per-term
+        // tied label now lives on the full-width centered JOINT penalties, one
+        // per smooth term. Each `multinomial_term_{t}` appears EXACTLY ONCE among
+        // the joint specs (the centered metric already couples the classes), so
+        // the outer loop yields exactly `n_terms` shared `λ_t` coordinates.
+        for spec in &specs {
+            assert!(
+                spec.penalties.is_empty(),
+                "per-block penalties are emptied; the joint penalty carries the tied label (#1587)"
+            );
         }
 
-        // Distinct terms carry DISTINCT labels (per-term smoothing preserved).
-        let mut labels: Vec<&str> = (0..n_terms)
-            .map(|t| specs[0].penalties[t].precision_label().unwrap())
+        let joint = multi.joint_penalty_specs().expect("joint specs");
+        assert_eq!(joint.len(), n_terms, "one joint penalty per smooth term");
+
+        // Each term-t joint penalty carries the shared per-term label.
+        for (t, spec) in joint.iter().enumerate() {
+            let expected = format!("multinomial_term_{t}");
+            assert_eq!(
+                spec.label.as_deref(),
+                Some(expected.as_str()),
+                "joint term {t} must carry the shared per-term precision label \
+                 '{expected}' so the outer loop ties λ across classes (#1587), got {:?}",
+                spec.label,
+            );
+        }
+
+        // Distinct terms carry DISTINCT labels (per-term smoothing preserved),
+        // and the label set is exactly `n_terms` outer smoothing parameters.
+        let mut labels: Vec<String> = joint
+            .iter()
+            .map(|spec| spec.label.clone().unwrap())
             .collect();
-        labels.sort_unstable();
+        labels.sort();
         labels.dedup();
         assert_eq!(
             labels.len(),
             n_terms,
             "each smooth term must keep its OWN shared λ; labels must be distinct per term"
-        );
-
-        // The label set collapses the (K−1)·n_terms physical penalty
-        // coordinates to exactly n_terms unique outer smoothing parameters.
-        let mut all_labels: Vec<String> = specs
-            .iter()
-            .flat_map(|spec| {
-                spec.penalties
-                    .iter()
-                    .map(|p| p.precision_label().unwrap().to_string())
-            })
-            .collect();
-        assert_eq!(all_labels.len(), m * n_terms, "physical penalty count");
-        all_labels.sort();
-        all_labels.dedup();
-        assert_eq!(
-            all_labels.len(),
-            n_terms,
-            "tied λ must collapse {} physical coordinates to {n_terms} outer ρ",
-            m * n_terms
         );
     }
 

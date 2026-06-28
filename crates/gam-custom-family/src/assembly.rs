@@ -34,10 +34,12 @@ pub(crate) fn build_custom_family_inner_assembly<'dp>(
     deriv_provider: Box<dyn HessianDerivativeProvider + 'dp>,
     ext_bundle: Option<ExtCoordBundle>,
     firth_value: Option<f64>,
-) -> Result<(gam_solve::estimate::reml::assembly::InnerAssembly<'dp>, usize), String> {
+) -> Result<(gam_solve::estimate::reml::assembly::InnerAssembly<'dp>, usize, Vec<f64>), String> {
     use gam_solve::estimate::reml::assembly::{
         InnerAssembly, PenaltyBlockDesc, penalty_coords_from_blocks,
     };
+    use gam_solve::estimate::reml::reml_outer_engine::penalty_matrix_root;
+    use gam_problem::PenaltyCoordinate;
 
     // Collect dense penalty matrices so references stay valid for the assembler.
     let per_block_penalties_dense: Vec<Vec<Array2<f64>>> = {
@@ -59,10 +61,10 @@ pub(crate) fn build_custom_family_inner_assembly<'dp>(
                 })
         })
         .collect();
-    let penalty_coords = penalty_coords_from_blocks(&block_descs, total)?;
+    let mut penalty_coords = penalty_coords_from_blocks(&block_descs, total)?;
 
     // Compute penalty logdet derivatives.
-    let per_block_penalties: Vec<&[Array2<f64>]> = per_block_penalties_dense
+    let mut per_block_penalties: Vec<&[Array2<f64>]> = per_block_penalties_dense
         .iter()
         .map(|v| v.as_slice())
         .collect();
@@ -71,8 +73,44 @@ pub(crate) fn build_custom_family_inner_assembly<'dp>(
     } else {
         0.0
     };
-    let penalty_logdet =
-        compute_block_penalty_logdet_derivs(per_block, &per_block_penalties, penalty_logdet_ridge)?;
+
+    // gam#1587: append the full-width joint penalties as one extra pseudo-block.
+    // Each `M⊗S_t` becomes a `PenaltyCoordinate::DenseRoot` (dim == total) at the
+    // outer ρ slot following the per-block coords, and the same matrices form one
+    // coupled logdet block `log|Σ_t λ_t M⊗S_t|₊`. The evaluator's positional
+    // contract (penalty_coords.len() == rho_slice.len() == penalty_logdet.first
+    // .len()) is preserved by extending all three in lock-step. Empty for every
+    // family without joint penalties — `joint_log_lambdas` is then empty and the
+    // assembly is byte-identical to the per-block-only path.
+    let joint_bundle = options.joint_penalties.as_deref();
+    let joint_log_lambdas: Vec<f64> = joint_bundle
+        .map(|b| b.log_lambdas.clone())
+        .unwrap_or_default();
+    let joint_penalty_matrices: Vec<Array2<f64>> = joint_bundle
+        .map(|b| b.specs.iter().map(|s| s.matrix.clone()).collect())
+        .unwrap_or_default();
+    for matrix in &joint_penalty_matrices {
+        let root = penalty_matrix_root(matrix)?;
+        penalty_coords.push(PenaltyCoordinate::from_dense_root(root));
+    }
+    let per_block_with_joint: Vec<Array1<f64>>;
+    let penalty_logdet = if joint_penalty_matrices.is_empty() {
+        compute_block_penalty_logdet_derivs(per_block, &per_block_penalties, penalty_logdet_ridge)?
+    } else {
+        // Append the joint pseudo-block to the per-block rho list and penalty list
+        // so its logdet value / ρ-derivatives slot in after the per-block coords.
+        per_block_with_joint = per_block
+            .iter()
+            .cloned()
+            .chain(std::iter::once(Array1::from(joint_log_lambdas.clone())))
+            .collect();
+        per_block_penalties.push(joint_penalty_matrices.as_slice());
+        compute_block_penalty_logdet_derivs(
+            &per_block_with_joint,
+            &per_block_penalties,
+            penalty_logdet_ridge,
+        )?
+    };
 
     let n_observations = inner.block_states.first().map(|s| s.eta.len()).unwrap_or(0);
 
@@ -129,7 +167,7 @@ pub(crate) fn build_custom_family_inner_assembly<'dp>(
         active_constraints: inner.active_constraints.clone(),
     };
 
-    Ok((evaluator, ext_dim))
+    Ok((evaluator, ext_dim, joint_log_lambdas))
 }
 
 pub(crate) struct FirstOrderTraceSkipOperator {
@@ -383,7 +421,7 @@ pub(crate) fn unified_joint_cost_gradient(
         ),
         _ => hessian_op,
     };
-    let (evaluator, ext_dim) = build_custom_family_inner_assembly(
+    let (evaluator, ext_dim, joint_log_lambdas) = build_custom_family_inner_assembly(
         inner,
         specs,
         per_block,
@@ -403,11 +441,32 @@ pub(crate) fn unified_joint_cost_gradient(
         ext_bundle,
         firth_value,
     )?;
-    let rho_slice = rho
+    // gam#1587: the evaluator's penalty coords are per-block coords followed by
+    // the appended joint coords, so the rho slice must carry the joint λ tail
+    // (`[per_block_rho ; joint_log_lambdas]`). Empty joint tail ⇒ unchanged.
+    let n_joint = joint_log_lambdas.len();
+    let rho_with_joint: Array1<f64> = if n_joint == 0 {
+        rho.clone()
+    } else {
+        rho.iter()
+            .copied()
+            .chain(joint_log_lambdas.iter().copied())
+            .collect()
+    };
+    let rho_slice = rho_with_joint
         .as_slice()
         .ok_or_else(|| "outer rho vector must be contiguous".to_string())?;
     let first_order_trace_correction = first_order_trace_skip.map(|trace_values| {
-        let gradient_correction = trace_values.mapv(|trace| 0.5 * trace);
+        // Append zero corrections for the joint coords so the correction vector
+        // aligns with the extended penalty-coordinate / rho length.
+        let mut gradient_correction = trace_values.mapv(|trace| 0.5 * trace);
+        if n_joint > 0 {
+            let mut extended = Array1::<f64>::zeros(gradient_correction.len() + n_joint);
+            extended
+                .slice_mut(ndarray::s![..gradient_correction.len()])
+                .assign(&gradient_correction);
+            gradient_correction = extended;
+        }
         (0.0, gradient_correction, None)
     });
     let result = evaluator.evaluate(rho_slice, eval_mode, first_order_trace_correction)?;
@@ -415,7 +474,7 @@ pub(crate) fn unified_joint_cost_gradient(
     let cost = result.cost;
     let gradient = result
         .gradient
-        .unwrap_or_else(|| Array1::zeros(rho.len() + ext_dim));
+        .unwrap_or_else(|| Array1::zeros(rho.len() + n_joint + ext_dim));
 
     let hessian = result.hessian;
 
@@ -442,7 +501,7 @@ pub(crate) fn unified_joint_efs_eval(
     deriv_provider: Box<dyn HessianDerivativeProvider + '_>,
     ext_bundle: Option<ExtCoordBundle>,
 ) -> Result<gam_problem::EfsEval, String> {
-    let (assembly, _) = build_custom_family_inner_assembly(
+    let (assembly, _, joint_log_lambdas) = build_custom_family_inner_assembly(
         inner,
         specs,
         per_block,
@@ -465,7 +524,17 @@ pub(crate) fn unified_joint_efs_eval(
         // the Tier-B Firth fold.
         None,
     )?;
-    let rho_slice = rho
+    // gam#1587: extend the rho slice with the joint λ tail to match the appended
+    // joint penalty coords (empty for every non-joint family ⇒ unchanged).
+    let rho_with_joint: Array1<f64> = if joint_log_lambdas.is_empty() {
+        rho.clone()
+    } else {
+        rho.iter()
+            .copied()
+            .chain(joint_log_lambdas.iter().copied())
+            .collect()
+    };
+    let rho_slice = rho_with_joint
         .as_slice()
         .ok_or_else(|| "outer rho vector must be contiguous".to_string())?;
     let inner_solution = assembly.build();
@@ -857,6 +926,28 @@ pub(crate) fn joint_outer_evaluate(
         })
         .collect();
 
+    // gam#1587: the reconstructed outer `H_pen = H + S_λ` operator below adds
+    // only the per-block `scaled_s_lambdas`. When a full-width joint penalty is
+    // active (the centered `M⊗S_t` multinomial smoothing), its
+    // `rho_curvature_scale · Σ_t λ_t S_joint_t` must ALSO be folded in, or the
+    // LAML `log|H_pen|` and the trace kernel `K = H_pen⁻¹` disagree with the
+    // inner-converged penalized Hessian (which DID include it). Precompute the
+    // dense scaled joint penalty once (`total × total`); `None` for every family
+    // without joint penalties keeps every operator path byte-identical.
+    let scaled_joint_penalty: Option<Array2<f64>> = options.joint_penalties.as_deref().and_then(
+        |bundle| {
+            if bundle.is_empty() {
+                return None;
+            }
+            let mut matrix = Array2::<f64>::zeros((total, total));
+            bundle.add_to_matrix(&mut matrix);
+            if rho_curvature_scale != 1.0 {
+                matrix.mapv_inplace(|value| rho_curvature_scale * value);
+            }
+            Some(matrix)
+        },
+    );
+
     // Reuse the assembled outer Hessian operator (and its lazily-built spectral
     // factorization) when an immediately-prior eval at the SAME ρ/β̂/curvature
     // assembled the bit-identical operator (the BFGS Value→ValueAndGradient
@@ -892,6 +983,10 @@ pub(crate) fn joint_outer_evaluate(
         ) {
             let ranges_vec = ranges.to_vec();
             let s_lambdas = Arc::new(scaled_s_lambdas.clone());
+            // gam#1587: full-width joint penalty (already scaled by
+            // `rho_curvature_scale`), folded into every operator path below.
+            let joint_penalty_arc: Option<Arc<Array2<f64>>> =
+                scaled_joint_penalty.clone().map(Arc::new);
             let trace_diagonal_ridge = scaled_joint_trace_diagonal_ridge
                 + rho_curvature_scale * JOINT_TRACE_STABILITY_RIDGE;
             match &h_joint_unpen {
@@ -901,6 +996,7 @@ pub(crate) fn joint_outer_evaluate(
                     let apply_ranges = ranges_vec.clone();
                     let apply_s = Arc::clone(&s_lambdas);
                     let apply_hphi = robust_jeffreys_hphi_for_operator.clone();
+                    let apply_joint = joint_penalty_arc.clone();
                     let hphi_scale = rho_curvature_scale;
                     Arc::new(MatrixFreeSpdOperator::new_with_mode(
                         total,
@@ -914,6 +1010,9 @@ pub(crate) fn joint_outer_evaluate(
                                 None,
                             );
                             out += &penalty;
+                            if let Some(joint) = apply_joint.as_ref() {
+                                out += &joint.dot(v);
+                            }
                             if let Some(hphi) = apply_hphi.as_ref() {
                                 let jeffreys = hphi.dot(v);
                                 out.scaled_add(hphi_scale, &jeffreys);
@@ -932,6 +1031,8 @@ pub(crate) fn joint_outer_evaluate(
                     let apply_ranges = ranges_vec.clone();
                     let apply_s = Arc::clone(&s_lambdas);
                     let apply_hphi = robust_jeffreys_hphi_for_operator.clone();
+                    let apply_joint = joint_penalty_arc.clone();
+                    let dense_joint = joint_penalty_arc.clone();
                     let hphi_scale = rho_curvature_scale;
                     // Single-pass dense assembly of the SAME penalized
                     // operator `H_unpen + S_λ + scale·H_Φ`. When the
@@ -971,6 +1072,9 @@ pub(crate) fn joint_outer_evaluate(
                                 trace_diagonal_ridge,
                                 None,
                             );
+                            if let Some(joint) = dense_joint.as_ref() {
+                                matrix += joint.as_ref();
+                            }
                             if let Some(hphi) = dense_hphi.as_ref() {
                                 matrix.scaled_add(hphi_scale, hphi);
                             }
@@ -996,6 +1100,9 @@ pub(crate) fn joint_outer_evaluate(
                                 None,
                             );
                             out += &penalty;
+                            if let Some(joint) = apply_joint.as_ref() {
+                                out += &joint.dot(v);
+                            }
                             if let Some(hphi) = apply_hphi.as_ref() {
                                 let jeffreys = hphi.dot(v);
                                 out.scaled_add(hphi_scale, &jeffreys);
@@ -1020,6 +1127,9 @@ pub(crate) fn joint_outer_evaluate(
                 scaled_joint_trace_diagonal_ridge,
                 None,
             );
+            if let Some(joint) = scaled_joint_penalty.as_ref() {
+                j_for_traces += joint;
+            }
             if let Some(hphi) = robust_jeffreys_hphi_for_operator.as_ref() {
                 j_for_traces.scaled_add(rho_curvature_scale, hphi);
             }
@@ -1074,6 +1184,12 @@ pub(crate) fn joint_outer_evaluate(
                 scaled_joint_trace_diagonal_ridge,
                 None,
             );
+            // gam#1587: the assembled operator includes the full-width joint
+            // penalty, so the ground-truth reference must too — otherwise this
+            // guard false-positives a logdet divergence.
+            if let Some(joint) = scaled_joint_penalty.as_ref() {
+                ground_truth += joint;
+            }
             // Mirror the operator's `else`-branch Jeffreys term EXACTLY
             // (`robust_jeffreys_hphi_for_operator` scaled by `rho_curvature_scale`,
             // including any completion span) rather than the pre-scaled

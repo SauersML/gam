@@ -37,9 +37,23 @@ pub(crate) struct PenaltyLabelLayout {
     pub(crate) physical_to_outer: Vec<Option<usize>>,
     pub(crate) fixed_log_lambdas: Vec<Option<f64>>,
     pub(crate) initial_rho: Array1<f64>,
+    /// Full-width cross-block joint penalties (gam#1587: the reference-symmetric
+    /// `M⊗S_t` multinomial penalty). Empty for every family whose
+    /// `joint_penalty_specs()` returns no specs (all paths below are then
+    /// byte-identical to the per-block-only layout). When non-empty, each joint
+    /// spec is tied to an outer ρ coordinate by its `label` (sharing the
+    /// coordinate with any per-block penalty carrying the same label), recorded
+    /// in `joint_to_outer` parallel to this vector.
+    pub(crate) joint_specs: Vec<gam_problem::JointPenaltySpec>,
+    /// Outer ρ coordinate each joint spec maps to, parallel to `joint_specs`.
+    pub(crate) joint_to_outer: Vec<usize>,
 }
 
 impl PenaltyLabelLayout {
+    /// Number of per-block physical penalty slots (the per-block contribution to
+    /// the evaluator's positional penalty list / gradient). The joint coords are
+    /// appended AFTER these in the assembly, so the full evaluator-gradient
+    /// length is `physical_count() + joint_specs.len()`.
     pub(crate) fn physical_count(&self) -> usize {
         self.physical_to_outer.len()
     }
@@ -47,11 +61,27 @@ impl PenaltyLabelLayout {
     pub(crate) fn has_tied_coordinates(&self) -> bool {
         self.initial_rho.len() != self.physical_to_outer.len()
     }
+
+    /// Joint-penalty `log λ` values for the current outer ρ, parallel to
+    /// `joint_specs` (each pulled from its tied outer coordinate). Empty when no
+    /// joint penalties are present.
+    pub(crate) fn joint_log_lambdas(&self, rho: &Array1<f64>) -> Vec<f64> {
+        self.joint_to_outer.iter().map(|&o| rho[o]).collect()
+    }
 }
 
+#[cfg(test)]
 pub(crate) fn penalty_label_layout(
     specs: &[ParameterBlockSpec],
     penalty_counts: Vec<usize>,
+) -> Result<PenaltyLabelLayout, String> {
+    penalty_label_layout_with_joint(specs, penalty_counts, Vec::new())
+}
+
+pub(crate) fn penalty_label_layout_with_joint(
+    specs: &[ParameterBlockSpec],
+    penalty_counts: Vec<usize>,
+    joint_specs: Vec<gam_problem::JointPenaltySpec>,
 ) -> Result<PenaltyLabelLayout, String> {
     let mut label_to_outer = BTreeMap::<String, usize>::new();
     let mut physical_to_outer = Vec::<Option<usize>>::new();
@@ -97,11 +127,45 @@ pub(crate) fn penalty_label_layout(
         }
     }
 
+    // gam#1587: tie each full-width joint penalty to an outer ρ coordinate by
+    // its label. A joint spec carrying a label already seen on a per-block
+    // penalty shares that coordinate (the multinomial centered penalty shares
+    // `multinomial_term_{t}` with — now empty — per-block slots, so one shared
+    // λ_t smooths every class). A new label creates a fresh coordinate.
+    let mut joint_to_outer = Vec::<usize>::with_capacity(joint_specs.len());
+    for (joint_idx, spec) in joint_specs.iter().enumerate() {
+        let label = spec
+            .label
+            .clone()
+            .unwrap_or_else(|| format!("__joint_penalty_{joint_idx}"));
+        let rho0 = spec.initial_log_lambda;
+        let outer = if let Some(&outer) = label_to_outer.get(&label) {
+            let first = initial[outer];
+            if first.is_finite() && rho0.is_finite() && (first - rho0).abs() > 1e-10 {
+                return Err(CustomFamilyError::ConstraintViolation {
+                    reason: format!(
+                        "joint penalty label '{label}' has inconsistent initial log-precisions: {first} and {rho0}"
+                    ),
+                }
+                .into());
+            }
+            outer
+        } else {
+            let outer = initial.len();
+            label_to_outer.insert(label, outer);
+            initial.push(rho0);
+            outer
+        };
+        joint_to_outer.push(outer);
+    }
+
     Ok(PenaltyLabelLayout {
         penalty_counts,
         physical_to_outer,
         fixed_log_lambdas,
         initial_rho: Array1::from_vec(initial),
+        joint_specs,
+        joint_to_outer,
     })
 }
 
@@ -148,12 +212,18 @@ pub(crate) fn aggregate_labeled_gradient(
     gradient: &Array1<f64>,
     layout: &PenaltyLabelLayout,
 ) -> Result<Array1<f64>, String> {
-    if gradient.len() != layout.physical_count() {
+    // The evaluator gradient is the per-block physical coords followed by the
+    // appended joint coords (gam#1587). When no joint penalties are present this
+    // is exactly the legacy per-block length.
+    let expected = layout.physical_count() + layout.joint_specs.len();
+    if gradient.len() != expected {
         return Err(CustomFamilyError::DimensionMismatch {
             reason: format!(
-                "physical gradient length mismatch: got {}, expected {}",
+                "physical gradient length mismatch: got {}, expected {} (per-block {} + joint {})",
                 gradient.len(),
-                layout.physical_count()
+                expected,
+                layout.physical_count(),
+                layout.joint_specs.len(),
             ),
         }
         .into());
@@ -163,6 +233,10 @@ pub(crate) fn aggregate_labeled_gradient(
         if let Some(outer) = *outer {
             out[outer] += gradient[physical];
         }
+    }
+    let joint_base = layout.physical_count();
+    for (joint_idx, &outer) in layout.joint_to_outer.iter().enumerate() {
+        out[outer] += gradient[joint_base + joint_idx];
     }
     Ok(out)
 }

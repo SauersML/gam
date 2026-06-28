@@ -641,7 +641,56 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     let specs: &[ParameterBlockSpec] = &canonical.reduced_specs;
     let penalty_counts = validate_blockspecs(specs)?;
 
-    let label_layout = penalty_label_layout(specs, penalty_counts.clone())?;
+    // gam#1587: full-width cross-block joint penalties (the reference-symmetric
+    // `M⊗S_t` multinomial smoothing penalty). Empty for every other family, so
+    // the joint-penalty code paths below are skipped and behaviour is identical.
+    // The specs are produced in raw (pre-canonicalisation) stacked coordinates;
+    // pull each back through the identifiability gauge `T_full`
+    // (`S_red = T_fullᵀ S_raw T_full`) so it acts on the reduced coordinate space
+    // the inner solve and outer evaluator run in.
+    let reduced_total: usize = specs.iter().map(|s| s.design.ncols()).sum();
+    let joint_specs: Vec<gam_problem::JointPenaltySpec> = {
+        let raw_specs_joint = family
+            .joint_penalty_specs()
+            .map_err(|reason| CustomFamilyError::Optimization {
+                context: "fit_custom_family joint penalty specs",
+                reason,
+            })?;
+        let t_full = &canonical.gauge.t_full;
+        raw_specs_joint
+            .into_iter()
+            .map(|spec| {
+                let pulled = if spec.matrix.nrows() == reduced_total {
+                    spec.matrix
+                } else if spec.matrix.nrows() == t_full.nrows() {
+                    t_full.t().dot(&spec.matrix).dot(t_full)
+                } else {
+                    return Err(CustomFamilyError::DimensionMismatch {
+                        reason: format!(
+                            "joint penalty '{}' has dim {} but neither reduced total {} nor raw total {}",
+                            spec.label.as_deref().unwrap_or("<unlabeled>"),
+                            spec.matrix.nrows(),
+                            reduced_total,
+                            t_full.nrows(),
+                        ),
+                    });
+                };
+                let out = gam_problem::JointPenaltySpec {
+                    label: spec.label,
+                    matrix: pulled,
+                    initial_log_lambda: spec.initial_log_lambda,
+                    nullspace_dim: spec.nullspace_dim.min(reduced_total),
+                };
+                out.validate().map_err(|e| CustomFamilyError::ConstraintViolation {
+                    reason: format!("joint penalty validation failed: {e}"),
+                })?;
+                Ok(out)
+            })
+            .collect::<Result<Vec<_>, CustomFamilyError>>()?
+    };
+
+    let label_layout =
+        penalty_label_layout_with_joint(specs, penalty_counts.clone(), joint_specs)?;
     let mut rho0 = label_layout.initial_rho.clone();
     let (persistent_warm_start_key, mut persistent_warm_start) =
         load_persistent_custom_family_warm_start::<F>(family, specs, options, rho0.len());
@@ -1493,6 +1542,20 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         .filter(|seed| warm_start_matches_block_log_lambdas(seed, &per_block));
     let mut final_options = options.clone();
     final_options.outer_inner_max_iterations = None;
+    // gam#1587: the final β̂ refit must apply the same full-width joint penalty
+    // at the converged ρ* as every outer eval did, or the reported coefficients
+    // (and predictions) would be the UNPENALIZED-by-the-centered-metric mode.
+    if !label_layout.joint_specs.is_empty() {
+        let total_compiled: usize = specs.iter().map(|s| s.design.ncols()).sum();
+        let joint_log_lambdas = label_layout.joint_log_lambdas(&rho_star);
+        let bundle = gam_problem::JointPenaltyBundle::new(
+            std::sync::Arc::new(label_layout.joint_specs.clone()),
+            joint_log_lambdas,
+            total_compiled,
+        )
+        .map_err(CustomFamilyError::from)?;
+        final_options.joint_penalties = Some(std::sync::Arc::new(bundle));
+    }
     let mut inner = inner_blockwise_fit(
         family,
         specs,
@@ -1562,8 +1625,16 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
              {e}.{last_error_detail}"
         )
     })?;
-    let mut covariance_conditional =
-        compute_joint_covariance_required(family, specs, &inner.block_states, &per_block, options)?;
+    // gam#1587: pass `final_options` (carrying the joint penalty bundle) so the
+    // posterior precision `H = H_lik + S_λ` includes the full-width centered
+    // penalty, matching the inner-converged mode.
+    let mut covariance_conditional = compute_joint_covariance_required(
+        family,
+        specs,
+        &inner.block_states,
+        &per_block,
+        &final_options,
+    )?;
 
     let geometry = compute_joint_geometry(family, specs, &inner.block_states, &per_block).map_err(
         |reason| CustomFamilyError::Optimization {

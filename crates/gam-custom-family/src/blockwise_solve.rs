@@ -10,22 +10,35 @@ pub(crate) fn aggregate_labeled_hessian(
     hessian: &Array2<f64>,
     layout: &PenaltyLabelLayout,
 ) -> Result<Array2<f64>, String> {
-    if hessian.nrows() != layout.physical_count() || hessian.ncols() != layout.physical_count() {
+    // gam#1587: the evaluator Hessian indexes the per-block physical coords
+    // followed by the appended joint coords. Build the unified physical→outer map
+    // over both ranges (joint always maps to a concrete outer coord).
+    let n_joint = layout.joint_specs.len();
+    let expected = layout.physical_count() + n_joint;
+    if hessian.nrows() != expected || hessian.ncols() != expected {
         return Err(CustomFamilyError::DimensionMismatch {
             reason: format!(
-                "physical Hessian shape mismatch: got {}x{}, expected {}x{}",
+                "physical Hessian shape mismatch: got {}x{}, expected {}x{} (per-block {} + joint {})",
                 hessian.nrows(),
                 hessian.ncols(),
+                expected,
+                expected,
                 layout.physical_count(),
-                layout.physical_count()
+                n_joint,
             ),
         }
         .into());
     }
+    let to_outer: Vec<Option<usize>> = layout
+        .physical_to_outer
+        .iter()
+        .copied()
+        .chain(layout.joint_to_outer.iter().map(|&o| Some(o)))
+        .collect();
     let mut out = Array2::<f64>::zeros((layout.initial_rho.len(), layout.initial_rho.len()));
-    for (i, oi) in layout.physical_to_outer.iter().enumerate() {
+    for (i, oi) in to_outer.iter().enumerate() {
         let Some(oi) = *oi else { continue };
-        for (j, oj) in layout.physical_to_outer.iter().enumerate() {
+        for (j, oj) in to_outer.iter().enumerate() {
             if let Some(oj) = *oj {
                 out[[oi, oj]] += hessian[[i, j]];
             }
@@ -158,6 +171,27 @@ pub(crate) fn outerobjectivegradienthessian_labeled<
 ) -> Result<OuterObjectiveEvalResult, String> {
     let physical_rho = expand_labeled_log_lambdas(rho, layout)?;
     let physical_warm_start = physical_warm_start_for_labeled(warm_start, &physical_rho, layout);
+    // gam#1587: build the per-eval joint penalty bundle from the current outer ρ
+    // (each joint spec's λ pulled from its tied outer coordinate) and attach it
+    // to the inner-solve options so BOTH the inner β̂ AND the outer evaluator
+    // (penalty coords / logdet / operator) see the full-width centered penalty.
+    // No joint specs ⇒ `options` is passed through untouched (byte-identical).
+    let options_with_joint;
+    let options: &BlockwiseFitOptions = if layout.joint_specs.is_empty() {
+        options
+    } else {
+        let total_compiled: usize = specs.iter().map(|s| s.design.ncols()).sum();
+        let joint_log_lambdas = layout.joint_log_lambdas(rho);
+        let bundle = gam_problem::JointPenaltyBundle::new(
+            std::sync::Arc::new(layout.joint_specs.clone()),
+            joint_log_lambdas,
+            total_compiled,
+        )?;
+        let mut cloned = options.clone();
+        cloned.joint_penalties = Some(std::sync::Arc::new(bundle));
+        options_with_joint = cloned;
+        &options_with_joint
+    };
     let base = outerobjectivegradienthessian_internal(
         family,
         specs,
@@ -195,10 +229,22 @@ pub(crate) fn custom_family_seed_screening_proxy_labeled<
     // and made the coupled fit non-completing in screening alone. The real fit
     // (after a seed is selected) runs with `seed_screening = false`, so the
     // load-bearing Firth curvature is fully present where it matters.
-    let screening_options = BlockwiseFitOptions {
+    let mut screening_options = BlockwiseFitOptions {
         seed_screening: true,
         ..options.clone()
     };
+    // gam#1587: the screening inner solve must apply the same full-width joint
+    // penalty so the ranked proxy objective matches the real penalized fit.
+    if !layout.joint_specs.is_empty() {
+        let total_compiled: usize = specs.iter().map(|s| s.design.ncols()).sum();
+        let joint_log_lambdas = layout.joint_log_lambdas(rho);
+        let bundle = gam_problem::JointPenaltyBundle::new(
+            std::sync::Arc::new(layout.joint_specs.clone()),
+            joint_log_lambdas,
+            total_compiled,
+        )?;
+        screening_options.joint_penalties = Some(std::sync::Arc::new(bundle));
+    }
     let mut inner = inner_blockwise_fit(
         family,
         specs,
