@@ -28,8 +28,8 @@ pub use gam_problem::{CustomFamilyError, ParameterBlockSpec, ParameterBlockState
 // `custom_family` glob above. Named re-exports here keep the prior
 // `crate::custom_family::{AdditiveBlockJacobian, …}` paths resolving.
 pub use gam_problem::{
-    AdditiveBlockJacobian, BlockEffectiveJacobian, BlockWorkingSet, FamilyChannelHessian,
-    FamilyLinearizationState, PenaltyMatrix, RowScaledJacobian,
+    AdditiveBlockJacobian, BlockEffectiveJacobian, BlockWorkingSet, EvalMode, FamilyChannelHessian,
+    FamilyLinearizationState, PenaltyMatrix, RowScaledJacobian, TensorChannelHessian,
 };
 
 // Pseudo-log-det mode selector for the custom-family Jeffreys/pseudo-logdet path;

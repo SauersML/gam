@@ -154,7 +154,23 @@ pub use gam_report as report;
 /// lower-layer `psis`; descended into `gam-solve` (#1521) and re-exported here
 /// so the public `gam::rho_uncertainty` path is preserved.
 pub use gam_solve::rho_uncertainty;
-pub use gam_solve as solver;
+/// `gam::solver` — the estimation-engine public surface.
+///
+/// Almost everything is the `gam-solve` crate, re-exported wholesale. The one
+/// exception is `gam::solver::fit_orchestration`: the fit/predict orchestration
+/// layer (`FitConfig`, `FitResult`, `fit_model`, `fit_from_formula`,
+/// `materialize`, `WorkflowError`, …) used to live in the solver, but the #1521
+/// carve lifted it up into `gam-models` (which sits ABOVE `gam-solve`, so
+/// `gam-solve` cannot host it without inverting the dependency). The CLI↔FFI
+/// fit-parity and warm-start regression tests still import it as
+/// `gam::solver::fit_orchestration::{…}`, so preserve that path by shadowing the
+/// (absent) glob entry with a compat module re-exporting the relocated layer.
+pub mod solver {
+    pub use gam_solve::*;
+    pub mod fit_orchestration {
+        pub use gam_models::fit_orchestration::*;
+    }
+}
 pub mod terms {
     pub use gam_terms::*;
     pub use gam_sae as sae;
@@ -168,10 +184,16 @@ pub mod terms {
     // re-exports take priority over the `gam_terms::*` glob above, so there is
     // no ambiguity with any same-named term-side item.
     pub use gam_sae::manifold::{
-        ArdSharing, AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
-        SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldLoss, SaeManifoldOuterObjective,
-        SaeManifoldRho, SaeManifoldTerm, SphereChartEvaluator, TorusHarmonicEvaluator,
+        ArdSharing, AssignmentMode, CurvatureWalkReport, EuclideanPatchEvaluator,
+        PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,
+        SaeManifoldAtom, SaeManifoldLoss, SaeManifoldOuterObjective, SaeManifoldRho,
+        SaeManifoldTerm, SphereChartEvaluator, TorusHarmonicEvaluator,
     };
+    // `LatentManifold` lives in `gam_terms::latent` and is not surfaced at the
+    // `gam_terms` root, so the `gam_terms::*` glob does not bring it to the flat
+    // `gam::terms::LatentManifold` path (only `gam::terms::latent::LatentManifold`).
+    // Several manifold tests/examples import the flat path; restore it.
+    pub use gam_terms::latent::LatentManifold;
 }
 /// Shared test-support helpers (FD harness, fixtures, reference-tool + CLI
 /// harnesses) carved into the `gam-test-support` crate under #1521 so the
@@ -264,11 +286,27 @@ pub use terms::{basis, construction, term_builder};
 pub mod smooth {
     pub use crate::terms::smooth::*;
     // `build_term_collection_design` is re-exported by the `crate::terms::smooth`
-    // glob above (it now lives in `gam_terms::smooth::term_design`). Only the two
-    // joint builders stayed in `gam_models::fit_orchestration::drivers`, so those
-    // are the ones re-exported from there.
+    // glob above (it now lives in `gam_terms::smooth::term_design`). The
+    // term-collection *fit/design drivers* — the joint builders, the per-spec
+    // fit/curvature/LR-inference entry points, the coefficient-group and
+    // penalty-block-gamma-prior fit variants, the spatial length-scale optimizer
+    // (and its timing record), the fixed-κ profiled-REML score, and the
+    // constant-curvature κ accessor — stayed in (or descended to)
+    // `gam_models::fit_orchestration::drivers` in the #1521 carve and are NOT
+    // surfaced by the `gam_terms::smooth` glob. Name them here so the
+    // long-standing flat `gam::smooth::{…}` paths — imported across the
+    // inference/curvature/coefficient-group integration tests — keep resolving.
     pub use gam_models::fit_orchestration::drivers::{
+        CurvatureInference, FittedTermCollectionWithSpec, SmoothLrCorrection,
+        SmoothTermLrInference, SpatialLengthScaleOptimizationTiming,
         build_term_collection_designs_and_freeze_joint, build_term_collection_designs_joint,
+        curvature_inference_forspec, fit_term_collection_forspec,
+        fit_term_collection_with_coefficient_groups,
+        fit_term_collection_with_coefficient_groups_and_penalty_block_gamma_priors,
+        fit_term_collection_with_penalty_block_gamma_prior_callback,
+        fit_term_collection_with_penalty_block_gamma_priors,
+        fit_term_collectionwith_spatial_length_scale_optimization, fixed_kappa_profiled_reml_score,
+        get_constant_curvature_kappa, smooth_term_lr_inference_forspec,
     };
 }
 
