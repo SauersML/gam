@@ -853,3 +853,94 @@ fn fast_forward_is_accuracy_parity_with_certified() {
         fast_mean / cert_mean
     );
 }
+
+/// The manifold SAE's central thesis, pinned on real OLMo l18 activations: a
+/// CURVED low-dim atom reconstructs better than a FLAT code of the SAME latent
+/// dim. A d=2 torus atom (harmonic decoder) is compared against the best possible
+/// affine 2-dim code (data mean + top-2 PCA — the flat-dictionary equivalent at
+/// the same active-latent count). On the sparsity-relevant axis (reconstruction
+/// per ACTIVE latent), the curved atom wins decisively: measured EV ≈ 0.30 vs
+/// 0.17 (+75% relative) at 3 harmonics, growing monotonically with harmonic order
+/// (0.21 → 0.26 → 0.30 at 1/2/3 harmonics). (Per PARAMETER a flat rank-M linear
+/// code is far more efficient — EV ≈ 0.90 at rank 49 — so the manifold's value is
+/// strictly reconstruction-per-active-latent, i.e. sparsity, not raw EV. That is
+/// the design premise, not a defect.)
+///
+/// Guards against a regression that breaks the curved decoder so it no longer
+/// beats a flat affine code at matched latent dim — which would invalidate the
+/// whole curved-atom approach.
+#[test]
+fn curved_atom_beats_flat_code_at_matched_latent_dim() {
+    use gam_linalg::faer_ndarray::FaerEigh;
+    let mani = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut path = mani.join("tests/data/olmo_l18_pca64_635.npy");
+    if !path.exists() {
+        path = mani.join("../../tests/data/olmo_l18_pca64_635.npy");
+    }
+    let z = read_npy_f32_2d(&path);
+    let n = z.nrows();
+    let p = z.ncols();
+
+    // Total variance about the mean — the EV denominator.
+    let mut mean = ndarray::Array1::<f64>::zeros(p);
+    for r in 0..n {
+        for c in 0..p {
+            mean[c] += z[[r, c]];
+        }
+    }
+    mean.mapv_inplace(|v| v / n as f64);
+    let mut total_var = 0.0;
+    for r in 0..n {
+        for c in 0..p {
+            let d = z[[r, c]] - mean[c];
+            total_var += d * d;
+        }
+    }
+
+    // Best affine d=2 code (flat-dictionary equivalent): mean + top-2 PCA. Its
+    // reconstruction err^2 = sum of the dropped centered-Gram eigenvalues.
+    let mut centered = z.clone();
+    for r in 0..n {
+        for c in 0..p {
+            centered[[r, c]] -= mean[c];
+        }
+    }
+    let gram = fast_ata(&centered);
+    let (evals, _) = gram.eigh(faer::Side::Lower).unwrap();
+    let mut ev: Vec<f64> = evals.iter().copied().collect();
+    ev.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    let flat_affine_d2_err2: f64 = ev.iter().skip(2).sum::<f64>().max(0.0);
+    let flat_affine_d2_ev = 1.0 - flat_affine_d2_err2 / total_var;
+
+    // Curved d=2 torus atom EV at increasing harmonic order.
+    let mut curved_ev = Vec::new();
+    for &h in &[1usize, 2, 3] {
+        let term = real_data_torus_seed_term(z.view(), 1, h);
+        let atom = &term.atoms[0];
+        let recon = atom.basis_values.dot(&atom.decoder_coefficients);
+        let mut err2 = 0.0;
+        for r in 0..n {
+            for c in 0..p {
+                let d = recon[[r, c]] - z[[r, c]];
+                err2 += d * d;
+            }
+        }
+        curved_ev.push(1.0 - err2 / total_var);
+    }
+
+    // (1) At matched latent dim, the curved atom beats the flat affine code — with
+    //     a clear margin (measured +75% relative; require at least +15%).
+    assert!(
+        curved_ev[2] > 1.15 * flat_affine_d2_ev,
+        "curved d=2 EV must beat flat affine d=2 EV by >15% (manifold thesis); \
+         curved={:.4} flat={:.4}",
+        curved_ev[2],
+        flat_affine_d2_ev
+    );
+    // (2) More harmonic curvature is monotonically not-worse (the curved decoder
+    //     genuinely uses the added basis to fit real structure).
+    assert!(
+        curved_ev[1] >= curved_ev[0] - 1e-9 && curved_ev[2] >= curved_ev[1] - 1e-9,
+        "curved EV must improve monotonically with harmonic order; got {curved_ev:?}"
+    );
+}
