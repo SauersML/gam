@@ -192,3 +192,67 @@ pub fn set_rho_posterior_escalator(
 pub fn rho_posterior_escalator() -> Option<&'static dyn RhoPosteriorEscalator> {
     RHO_POSTERIOR_ESCALATOR.get().map(|b| b.as_ref())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_k_hat_below_half_is_plug_in_certified() {
+        assert_eq!(
+            RhoCertificate::from_k_hat(0.0),
+            RhoCertificate::PlugInCertified
+        );
+        assert_eq!(
+            RhoCertificate::from_k_hat(0.499),
+            RhoCertificate::PlugInCertified
+        );
+    }
+
+    #[test]
+    fn from_k_hat_between_half_and_point_seven_is_importance_correct() {
+        assert_eq!(
+            RhoCertificate::from_k_hat(0.5),
+            RhoCertificate::ImportanceCorrect
+        );
+        assert_eq!(
+            RhoCertificate::from_k_hat(0.7),
+            RhoCertificate::ImportanceCorrect
+        );
+        assert_eq!(
+            RhoCertificate::from_k_hat(0.65),
+            RhoCertificate::ImportanceCorrect
+        );
+    }
+
+    #[test]
+    fn from_k_hat_above_point_seven_is_escalate() {
+        assert_eq!(
+            RhoCertificate::from_k_hat(0.701),
+            RhoCertificate::Escalate
+        );
+        assert_eq!(
+            RhoCertificate::from_k_hat(10.0),
+            RhoCertificate::Escalate
+        );
+    }
+
+    #[test]
+    fn from_k_hat_nan_is_escalate() {
+        assert_eq!(RhoCertificate::from_k_hat(f64::NAN), RhoCertificate::Escalate);
+    }
+
+    #[test]
+    fn from_k_hat_infinity_is_escalate() {
+        assert_eq!(
+            RhoCertificate::from_k_hat(f64::INFINITY),
+            RhoCertificate::Escalate
+        );
+    }
+
+    #[test]
+    fn rho_posterior_escalator_returns_none_when_unregistered() {
+        // In tests, the monolith escalator is never injected — expect None.
+        assert!(rho_posterior_escalator().is_none());
+    }
+}
