@@ -186,3 +186,88 @@ impl DispersionExt for Dispersion {
         self.phi().max(0.0).sqrt()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    // ── se_from_covariance ────────────────────────────────────────────────────
+
+    #[test]
+    fn se_from_diagonal_matrix_is_sqrt_of_diagonal() {
+        // cov = diag(4, 9) → se = [2, 3]
+        let cov = array![[4.0_f64, 0.0], [0.0, 9.0]];
+        let se = se_from_covariance(&cov);
+        assert_eq!(se.len(), 2);
+        assert!((se[0] - 2.0).abs() < 1e-14);
+        assert!((se[1] - 3.0).abs() < 1e-14);
+    }
+
+    #[test]
+    fn se_clamps_negative_diagonal_to_zero() {
+        // A numerically-negative diagonal entry should clamp to 0 rather than NaN.
+        let cov = array![[1.0_f64, 0.0], [0.0, -1e-15]];
+        let se = se_from_covariance(&cov);
+        assert!(se[1].is_finite());
+        assert_eq!(se[1], 0.0);
+    }
+
+    // ── PhiScaledCovariance ───────────────────────────────────────────────────
+
+    #[test]
+    fn phi_scaled_covariance_wrap_and_as_array_round_trip() {
+        let m = array![[1.0_f64, 2.0], [3.0, 4.0]];
+        let wrapped = PhiScaledCovariance::wrap(m.clone());
+        assert_eq!(*wrapped.as_array(), m);
+    }
+
+    #[test]
+    fn phi_scaled_covariance_deref_gives_array2() {
+        let m = array![[5.0_f64]];
+        let wrapped = PhiScaledCovariance::wrap(m.clone());
+        assert_eq!(wrapped.nrows(), 1);
+        assert_eq!(wrapped[[0, 0]], 5.0);
+    }
+
+    #[test]
+    fn phi_scaled_covariance_into_array_consumes() {
+        let m = array![[7.0_f64]];
+        let wrapped = PhiScaledCovariance::wrap(m.clone());
+        assert_eq!(wrapped.into_array(), m);
+    }
+
+    // ── UnscaledPrecision ─────────────────────────────────────────────────────
+
+    #[test]
+    fn unscaled_precision_wrap_and_as_array_round_trip() {
+        let h = array![[2.0_f64, 0.0], [0.0, 3.0]];
+        let wrapped = UnscaledPrecision::wrap(h.clone());
+        assert_eq!(*wrapped.as_array(), h);
+    }
+
+    // ── DispersionExt ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn inv_phi_known_dispersion() {
+        assert!((Dispersion::Known(4.0).inv_phi() - 0.25).abs() < 1e-14);
+    }
+
+    #[test]
+    fn inv_phi_floors_at_one_over_1e_minus_300() {
+        // phi = 0 should return 1/1e-300, not infinity
+        let r = Dispersion::Known(0.0).inv_phi();
+        assert!(r.is_finite());
+        assert!((r - 1.0 / 1e-300).abs() < 1.0);
+    }
+
+    #[test]
+    fn sqrt_phi_returns_sqrt() {
+        assert!((Dispersion::Estimated(9.0).sqrt_phi() - 3.0).abs() < 1e-14);
+    }
+
+    #[test]
+    fn sqrt_phi_clamps_negative_to_zero() {
+        assert_eq!(Dispersion::Known(-1.0).sqrt_phi(), 0.0);
+    }
+}
