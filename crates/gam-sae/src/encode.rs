@@ -99,6 +99,14 @@ pub(crate) const ENCODE_BATCH_PARALLEL_ROW_MIN: usize = 256;
 /// ever adds exact-fallback work (correct, slower); it never certifies a mis-route.
 pub(crate) const CANDIDATE_ROUTING_MIN_ALIGNMENT: f64 = 0.5;
 
+/// Number of nearest charts the CERTIFIED encode refines in before returning the
+/// lowest-reconstruction-error certified result. A single nearest chart is not
+/// globally sound where the decoded manifold folds near itself (both competing
+/// basins' charts reconstruct near the fold, so both rank among the nearest by
+/// ambient distance); refining the top few captures the global basin. For a
+/// unimodal atom all candidates converge to the same root, so K>1 is a no-op.
+pub(crate) const CERTIFIED_ROUTING_TOPK: usize = 4;
+
 /// A chart region on an atom's latent coordinate: a center `t_c` plus a
 /// certified in-chart radius. Over the ball `‖t − t_c‖ ≤ radius` the jet sup
 /// bounds returned by [`BasisHessianLipschitz`] hold, so the Kantorovich
@@ -1552,10 +1560,20 @@ impl EncodeAtlas {
             ));
         };
 
-        // Route to the nearest chart center (ambient routing happens upstream via
-        // sae_candidate_index; here we pick the in-atom chart). Without a chart we
-        // cannot certify — flag immediately.
-        let Some((chart_idx, _)) = nearest_chart(atom_atlas, x, atom, evaluator.as_ref()) else {
+        // Route to the nearest chart centers by AMBIENT reconstruction distance.
+        // A single nearest chart is NOT globally sound on self-approaching atoms:
+        // where the decoded manifold folds near itself (two distant latent points
+        // map near the same output), the nearest-center chart can certify into the
+        // locally-worse basin while another chart holds the GLOBAL minimum (both
+        // branches' charts reconstruct near the crossing, so both are near in
+        // ambient distance). The certificate is honest about LOCAL convergence but
+        // cannot see the better far basin. So we refine in the top-K nearest charts
+        // and keep the lowest-reconstruction-error CERTIFIED result. For a unimodal
+        // atom every candidate chart converges to the same root, so this is a no-op
+        // (first-wins tie → the nearest chart), preserving the existing behavior.
+        let candidates =
+            nearest_charts_topk(atom_atlas, x, atom, evaluator.as_ref(), CERTIFIED_ROUTING_TOPK);
+        if candidates.is_empty() {
             return Ok((
                 Array1::<f64>::zeros(d),
                 RowCertificate {
@@ -1565,15 +1583,54 @@ impl EncodeAtlas {
                     h: f64::INFINITY,
                 },
             ));
-        };
-        let chart = &atom_atlas.charts[chart_idx];
-        let Some(t) = amortized_warm_start(chart, x, amplitude) else {
-            return Ok((
-                Array1::<f64>::zeros(d),
-                uncertified_certificate(chart.lipschitz),
-            ));
-        };
-        self.refine_certified_encode_start(atom, evaluator.as_ref(), chart, t, x, amplitude)
+        }
+        // Best CERTIFIED result by reconstruction error, plus the nearest chart's
+        // result as the uncertified fallback (preserving the prior return when no
+        // candidate certifies — the nearest chart owns the flagged row).
+        let mut best: Option<(Array1<f64>, RowCertificate, f64)> = None;
+        let mut nearest_fallback: Option<(Array1<f64>, RowCertificate)> = None;
+        for chart_idx in candidates {
+            let chart = &atom_atlas.charts[chart_idx];
+            let Some(t) = amortized_warm_start(chart, x, amplitude) else {
+                if nearest_fallback.is_none() {
+                    nearest_fallback =
+                        Some((Array1::<f64>::zeros(d), uncertified_certificate(chart.lipschitz)));
+                }
+                continue;
+            };
+            let (coord, cert) = self.refine_certified_encode_start(
+                atom,
+                evaluator.as_ref(),
+                chart,
+                t,
+                x,
+                amplitude,
+            )?;
+            if nearest_fallback.is_none() {
+                nearest_fallback = Some((coord.clone(), cert.clone()));
+            }
+            if cert.certified() {
+                let err =
+                    encode_reconstruction_error(atom, evaluator.as_ref(), coord.view(), x, amplitude);
+                if best.as_ref().map(|(_, _, e)| err < *e).unwrap_or(true) {
+                    best = Some((coord, cert, err));
+                }
+            }
+        }
+        match best {
+            Some((coord, cert, _)) => Ok((coord, cert)),
+            None => Ok(nearest_fallback.unwrap_or_else(|| {
+                (
+                    Array1::<f64>::zeros(d),
+                    RowCertificate {
+                        beta: f64::INFINITY,
+                        eta: f64::INFINITY,
+                        lipschitz: f64::INFINITY,
+                        h: f64::INFINITY,
+                    },
+                )
+            })),
+        }
     }
 
     /// Amortized (distilled) encode of one target row `x` against one atom `k`
@@ -2643,6 +2700,94 @@ pub(crate) fn nearest_chart(
         }
     }
     best
+}
+
+/// The `k` charts whose CENTER reconstruction `m(t_c)` is nearest to `x` in
+/// ambient ‖·‖², returned as chart indices sorted by increasing distance (ties
+/// broken by chart index — deterministic). Only certifiable charts
+/// (`certified_radius > 0`) are considered, exactly like [`nearest_chart`], whose
+/// single result is `nearest_charts_topk(.., 1)[0]`. Used by the certified encode
+/// to refine the global basin on self-approaching atoms (see
+/// [`CERTIFIED_ROUTING_TOPK`]).
+pub(crate) fn nearest_charts_topk(
+    atom_atlas: &AtomEncodeAtlas,
+    x: ArrayView1<'_, f64>,
+    atom: &SaeManifoldAtom,
+    evaluator: &dyn SaeBasisEvaluator,
+    k: usize,
+) -> Vec<usize> {
+    if atom_atlas.charts.is_empty() || k == 0 {
+        return Vec::new();
+    }
+    let d = atom.latent_dim;
+    let p = atom.output_dim();
+    let m = atom.basis_size();
+    let mut scored: Vec<(usize, f64)> = Vec::new();
+    for (idx, chart) in atom_atlas.charts.iter().enumerate() {
+        if chart.certified_radius <= 0.0 {
+            continue;
+        }
+        let coords = match chart.region.center.view().to_shape((1, d)) {
+            Ok(c) => c.to_owned(),
+            Err(_) => continue,
+        };
+        let Ok((phi, _jet)) = evaluator.evaluate(coords.view()) else {
+            continue;
+        };
+        let mut recon = Array1::<f64>::zeros(p);
+        for basis_col in 0..m {
+            let phi_v = phi[[0, basis_col]];
+            if phi_v == 0.0 {
+                continue;
+            }
+            for out in 0..p {
+                recon[out] += phi_v * atom.decoder_coefficients[[basis_col, out]];
+            }
+        }
+        let diff = &recon - &x;
+        scored.push((idx, diff.dot(&diff)));
+    }
+    // Sort by distance, then chart index for a deterministic, first-wins order
+    // consistent with `nearest_chart`'s strict-`<` tie rule.
+    scored.sort_by(|a, b| {
+        a.1.partial_cmp(&b.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    scored.into_iter().take(k).map(|(idx, _)| idx).collect()
+}
+
+/// Reconstruction error `‖x − z·m(t)‖` of an encoded coordinate `t` — the
+/// criterion the certified encode minimizes over its candidate charts to pick the
+/// GLOBAL basin. `m(t) = Bᵀ Φ(t)` is the amplitude-1 reconstruction; `z` is the
+/// amplitude. A non-finite reconstruction returns `+∞` so it never wins.
+pub(crate) fn encode_reconstruction_error(
+    atom: &SaeManifoldAtom,
+    evaluator: &dyn SaeBasisEvaluator,
+    coord: ArrayView1<'_, f64>,
+    x: ArrayView1<'_, f64>,
+    amplitude: f64,
+) -> f64 {
+    let d = atom.latent_dim;
+    let p = atom.output_dim();
+    let m = atom.basis_size();
+    let coords = match coord.to_shape((1, d)) {
+        Ok(c) => c.to_owned(),
+        Err(_) => return f64::INFINITY,
+    };
+    let Ok((phi, _jet)) = evaluator.evaluate(coords.view()) else {
+        return f64::INFINITY;
+    };
+    let mut err2 = 0.0;
+    for out in 0..p {
+        let mut recon = 0.0;
+        for basis_col in 0..m {
+            recon += phi[[0, basis_col]] * atom.decoder_coefficients[[basis_col, out]];
+        }
+        let r = x[out] - amplitude * recon;
+        err2 += r * r;
+    }
+    if err2.is_finite() { err2.sqrt() } else { f64::INFINITY }
 }
 
 /// Maximum number of chart centers laid down per atom (the SHAPE_BAND grid

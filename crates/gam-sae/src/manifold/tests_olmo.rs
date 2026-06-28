@@ -1298,27 +1298,24 @@ fn data_driven_charts_unlock_higher_latent_dim() {
     );
 }
 
-/// Certified-encode soundness near a SELF-CROSSING manifold, characterizing the
-/// exact contract. The figure-eight atom `m(t) = (cos 2πt, sin 4πt)` self-crosses
-/// at the origin (t=0.25 and t=0.75 → (0,0)), so a target near the crossing has
-/// two competing reconstruction minima. We sweep a box around the crossing and,
-/// for every CERTIFIED row, check two distinct properties:
+/// Certified-encode soundness near a SELF-CROSSING manifold. The figure-eight atom
+/// `m(t) = (cos 2πt, sin 4πt)` self-crosses at the origin (t=0.25 and t=0.75 →
+/// (0,0)), so a target near the crossing has two competing reconstruction minima.
+/// We sweep a box around the crossing and, for every CERTIFIED row, check:
 ///
-///  (A) LOCAL soundness — the certificate's ACTUAL claim: the returned coord is a
-///      genuine stationary point of ½‖x − m(t)‖² (‖∇‖ ≈ 0). This MUST hold; a
-///      failure would mean the certificate is lying about Newton convergence.
+///  (A) LOCAL soundness — the certificate's claim: the returned coord is a genuine
+///      stationary point of ½‖x − m(t)‖² (‖∇‖ ≈ 0). A failure would mean the
+///      certificate is lying about Newton convergence.
 ///
-///  (B) GLOBAL soundness is NOT guaranteed: because `nearest_chart` routes by
-///      center-reconstruction distance and the cold cross-check probes the SAME
-///      chart, a target near the crossing can certify into the locally-worse
-///      branch. Measured: the worst certified row reconstructs at err ≈ 0.094
-///      while the global min is ≈ 0.013 (~7x). This is a KNOWN limitation of
-///      single-chart routing, not a violation of the certificate's local claim —
-///      the globally-correct value is owned by the exact multi-start fallback.
-///      The test records the gap is bounded (does not blow up) but does NOT assert
-///      it is zero (it is not).
+///  (B) GLOBAL soundness — the SYSTEM contract: the certified coord is the GLOBAL
+///      reconstruction minimum, not a locally-worse basin. With single-chart
+///      routing this FAILED (worst certified row reconstructed at err ≈ 0.094 vs
+///      global ≈ 0.013, ~7x — a confident sub-global encode). The top-K chart
+///      routing fix (`CERTIFIED_ROUTING_TOPK`) refines the competing branches and
+///      keeps the lowest-reconstruction certified result, restoring global
+///      soundness; this test now asserts the excess is ≈ 0.
 #[test]
-fn certified_encode_local_sound_but_global_gap_near_self_crossing() {
+fn certified_encode_is_globally_sound_near_self_crossing() {
     use ndarray::{Array1, Array2};
     let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(5).unwrap());
     let n_seed = 64usize;
@@ -1388,12 +1385,15 @@ fn certified_encode_local_sound_but_global_gap_near_self_crossing() {
     );
     // Non-vacuity: the sweep actually certified a substantial set.
     assert!(certified > steps * steps / 2, "fixture must certify most targets; got {certified}");
-    // (B) The GLOBAL gap is real (single-chart routing can pick the worse basin) —
-    //     documented and bounded, NOT asserted to be zero. If it ever blows up past
-    //     this loose ceiling, the routing has regressed badly.
+    // (B) GLOBAL soundness now HOLDS: top-K chart routing (CERTIFIED_ROUTING_TOPK)
+    //     refines the competing branches and returns the lowest-reconstruction
+    //     certified result, so a certified encode lands within the GLOBAL minimum's
+    //     neighborhood even at the self-crossing. Pre-fix this excess was ~0.08
+    //     (single-chart routing certified into the locally-worse branch); the fix
+    //     drives it to the global-scan grid resolution.
     assert!(
-        worst_global_excess > 1e-3 && worst_global_excess < 0.5,
-        "certified encode has a KNOWN bounded global-soundness gap near self-crossings \
-         (single-chart routing); worst excess = {worst_global_excess:.4}"
+        worst_global_excess < 5e-3,
+        "certified encode must be GLOBALLY sound (top-K routing): worst excess over \
+         the global min = {worst_global_excess:.5} (was ~0.08 with single-chart routing)"
     );
 }
