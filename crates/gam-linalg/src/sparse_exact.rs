@@ -1322,6 +1322,70 @@ mod tests {
         approx_eq(sfactor.logdet, logdet_dense, 1e-10);
     }
 
+    // ── solve_sparse_spdmulti / solve_sparse_spdmulti_rows ───────────────────
+
+    #[test]
+    fn solve_sparse_spdmulti_recovers_identity_inverse() {
+        // A = diag(4,9): A^{-1} * A = I
+        let a = array![[4.0, 0.0], [0.0, 9.0]];
+        let a_sparse = dense_to_sparse_symmetric_upper(&a, ZERO_TOL).unwrap();
+        let factor = factorize_sparse_spd(&a_sparse).unwrap();
+        // Solve against the identity matrix
+        let rhs = Array2::<f64>::eye(2);
+        let inv = solve_sparse_spdmulti(&factor, &rhs).unwrap();
+        approx_eq(inv[[0, 0]], 0.25, 1e-12);
+        approx_eq(inv[[0, 1]], 0.0,  1e-12);
+        approx_eq(inv[[1, 0]], 0.0,  1e-12);
+        approx_eq(inv[[1, 1]], 1.0 / 9.0, 1e-12);
+    }
+
+    #[test]
+    fn solve_sparse_spdmulti_3x3_matches_column_wise_solve() {
+        let a: Array2<f64> = array![[9.0, 3.0, 1.0], [3.0, 8.0, 2.0], [1.0, 2.0, 7.0]];
+        let a_sparse = dense_to_sparse_symmetric_upper(&a, ZERO_TOL).unwrap();
+        let factor = factorize_sparse_spd(&a_sparse).unwrap();
+        // multi-rhs: two distinct RHS vectors as columns
+        let rhs = array![[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]];
+        let x = solve_sparse_spdmulti(&factor, &rhs).unwrap();
+        // Each column of x should satisfy A*x_j = rhs_j
+        for j in 0..2 {
+            let xj = x.column(j);
+            let ax = a.dot(&xj);
+            for i in 0..3 {
+                approx_eq(ax[i], rhs[[i, j]], 1e-11);
+            }
+        }
+    }
+
+    #[test]
+    fn solve_sparse_spdmulti_rows_selects_subset_of_rows() {
+        // A = [[4,2],[2,5]]; A^{-1} has known entries.
+        let a = array![[4.0, 2.0], [2.0, 5.0]];
+        let a_sparse = dense_to_sparse_symmetric_upper(&a, ZERO_TOL).unwrap();
+        let factor = factorize_sparse_spd(&a_sparse).unwrap();
+        // Solve against a 2x2 RHS, requesting only row 0..1 (first row only).
+        let rhs = Array2::<f64>::eye(2);
+        let row0 = solve_sparse_spdmulti_rows(&factor, &rhs, 0, 1).unwrap();
+        // Should be a 1x2 matrix: first row of A^{-1}.
+        // A^{-1} = (1/16)*[[5,-2],[-2,4]]
+        assert_eq!(row0.dim(), (1, 2));
+        approx_eq(row0[[0, 0]], 5.0 / 16.0, 1e-12);
+        approx_eq(row0[[0, 1]], -2.0 / 16.0, 1e-12);
+    }
+
+    #[test]
+    fn solve_sparse_spdmulti_diagonal_sum_matches_trace_of_partial_inverse() {
+        // A = [[4,2],[2,5]]; A^{-1} diagonal = [5/16, 4/16] = [0.3125, 0.25].
+        // diagonal_sum from row_start=0, rhs=I_2 sums diag(A^{-1})[0..2] = trace.
+        let a = array![[4.0, 2.0], [2.0, 5.0]];
+        let a_sparse = dense_to_sparse_symmetric_upper(&a, ZERO_TOL).unwrap();
+        let factor = factorize_sparse_spd(&a_sparse).unwrap();
+        let rhs = Array2::<f64>::eye(2);
+        let diag_sum = solve_sparse_spdmulti_diagonal_sum(&factor, &rhs, 0).unwrap();
+        // trace(A^{-1}) = 5/16 + 4/16 = 9/16
+        approx_eq(diag_sum, 9.0 / 16.0, 1e-12);
+    }
+
     #[test]
     fn takahashi_get_and_block_recover_off_pattern_inverse_entries() {
         let h = array![
