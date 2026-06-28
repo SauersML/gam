@@ -2128,7 +2128,11 @@ mod batch_tests {
         }
     }
 
-    fn check_oneseed<const K: usize>(state: &mut u64, batches: usize) {
+    /// Returns the number of `to_bits` equality comparisons performed, so the
+    /// caller can assert the full sweep actually ran (a helper that silently
+    /// did nothing would return 0 and fail the caller's count check).
+    fn check_oneseed<const K: usize>(state: &mut u64, batches: usize) -> usize {
+        let mut checks = 0usize;
         for _ in 0..batches {
             let rows: [[f64; K]; 4] =
                 std::array::from_fn(|_| std::array::from_fn(|_| rand_unit(state)));
@@ -2173,6 +2177,7 @@ mod batch_tests {
                     prod[r].base.value().to_bits(),
                     "OneSeed K={K} batch lane {r} value"
                 );
+                checks += 2;
                 for a in 0..K {
                     for b in 0..K {
                         assert_eq!(
@@ -2185,13 +2190,18 @@ mod batch_tests {
                             want[a][b].to_bits(),
                             "OneSeed K={K} batch lane {r} third[{a}][{b}]"
                         );
+                        checks += 2;
                     }
                 }
             }
         }
+        checks
     }
 
-    fn check_twoseed<const K: usize>(state: &mut u64, batches: usize) {
+    /// Returns the number of `to_bits` equality comparisons performed (see
+    /// [`check_oneseed`]).
+    fn check_twoseed<const K: usize>(state: &mut u64, batches: usize) -> usize {
+        let mut checks = 0usize;
         for _ in 0..batches {
             let rows: [[f64; K]; 4] =
                 std::array::from_fn(|_| std::array::from_fn(|_| rand_unit(state)));
@@ -2234,6 +2244,7 @@ mod batch_tests {
                     prod[r].base.value().to_bits(),
                     "TwoSeed K={K} batch lane {r} value"
                 );
+                checks += 2;
                 for a in 0..K {
                     for b in 0..K {
                         assert_eq!(
@@ -2246,10 +2257,12 @@ mod batch_tests {
                             want[a][b].to_bits(),
                             "TwoSeed K={K} batch lane {r} fourth[{a}][{b}]"
                         );
+                        checks += 2;
                     }
                 }
             }
         }
+        checks
     }
 
     /// ≥2000 random 4-row batches per K, across K ∈ {2,3,4,9}: the
@@ -2258,10 +2271,16 @@ mod batch_tests {
     #[test]
     fn oneseed_lanes_contracted_third_bit_identical() {
         let mut state = 0x1234_5678_9ABC_DEF0_u64;
-        check_oneseed::<2>(&mut state, 2000);
-        check_oneseed::<3>(&mut state, 2000);
-        check_oneseed::<4>(&mut state, 2000);
-        check_oneseed::<9>(&mut state, 2000);
+        // Each `check_oneseed::<K>` runs `batches·4·(2 + 2·K²)` bit comparisons
+        // (2 value + 2·K² third-channel, per row × 4 rows). Asserting the total
+        // pins that every width's full sweep executed — a helper that returned
+        // early would undercount and fail here.
+        let expect = |k: usize| 2000 * 4 * (2 + 2 * k * k);
+        let total = check_oneseed::<2>(&mut state, 2000)
+            + check_oneseed::<3>(&mut state, 2000)
+            + check_oneseed::<4>(&mut state, 2000)
+            + check_oneseed::<9>(&mut state, 2000);
+        assert_eq!(total, expect(2) + expect(3) + expect(4) + expect(9));
     }
 
     /// ≥2000 random 4-row batches per K, across K ∈ {2,3,4,9}: the
@@ -2270,9 +2289,13 @@ mod batch_tests {
     #[test]
     fn twoseed_lanes_contracted_fourth_bit_identical() {
         let mut state = 0x0FED_CBA9_8765_4321_u64;
-        check_twoseed::<2>(&mut state, 2000);
-        check_twoseed::<3>(&mut state, 2000);
-        check_twoseed::<4>(&mut state, 2000);
-        check_twoseed::<9>(&mut state, 2000);
+        // See `oneseed_lanes_contracted_third_bit_identical`: assert the full
+        // per-width sweep ran (`batches·4·(2 + 2·K²)` comparisons each).
+        let expect = |k: usize| 2000 * 4 * (2 + 2 * k * k);
+        let total = check_twoseed::<2>(&mut state, 2000)
+            + check_twoseed::<3>(&mut state, 2000)
+            + check_twoseed::<4>(&mut state, 2000)
+            + check_twoseed::<9>(&mut state, 2000);
+        assert_eq!(total, expect(2) + expect(3) + expect(4) + expect(9));
     }
 }

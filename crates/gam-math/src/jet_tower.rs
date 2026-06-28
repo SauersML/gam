@@ -2511,6 +2511,10 @@ impl<L: Lane, const K: usize> Tower3Lane<L, K> {
 #[cfg(test)]
 mod batch_tests {
     use super::*;
+    // `Tower3`/`Tower4` get `add`/`sub` from the `JetScalar` trait (only `mul`,
+    // `scale`, `compose_unary` are inherent), so the trait must be in scope for
+    // the `run3`/`run4` op chains below.
+    use crate::jet_scalar::JetScalar;
 
     struct Rng(u64);
     impl Rng {
@@ -2619,8 +2623,12 @@ mod batch_tests {
 
     // Run a representative op chain on 4 scalar rows and on the f64x4 batch,
     // then assert every channel of every lane is to_bits-identical.
-    fn run4<const K: usize>(seed: u64, batches: usize) {
+    /// Returns the number of lane-vs-scalar bit-identity checks performed, so
+    /// the caller can assert the full sweep ran (the chain check counts once per
+    /// row; the third/fourth contractions count once each per `(i, j)`).
+    fn run4<const K: usize>(seed: u64, batches: usize) -> usize {
         let mut r = Rng(seed);
+        let mut checks = 0usize;
         for _ in 0..batches {
             let a: [Tower4<K>; 4] = std::array::from_fn(|_| rand_t4::<K>(&mut r));
             let b: [Tower4<K>; 4] = std::array::from_fn(|_| rand_t4::<K>(&mut r));
@@ -2662,17 +2670,23 @@ mod batch_tests {
 
             for rw in 0..4 {
                 assert_t4_eq(&finalb.lane(rw), &scal[rw], "t4-chain");
+                checks += 1;
                 for i in 0..K {
                     for j in 0..K {
                         assert_eq!(thirdb[i][j].lane(rw).to_bits(), third[rw][i][j].to_bits(), "third");
                         assert_eq!(fourthb[i][j].lane(rw).to_bits(), fourth[rw][i][j].to_bits(), "fourth");
+                        checks += 2;
                     }
                 }
             }
         }
+        checks
     }
-    fn run3<const K: usize>(seed: u64, batches: usize) {
+    /// Returns the number of lane-vs-scalar chain bit-identity checks performed
+    /// (one per row; see [`run4`]).
+    fn run3<const K: usize>(seed: u64, batches: usize) -> usize {
         let mut r = Rng(seed);
+        let mut checks = 0usize;
         for _ in 0..batches {
             let a: [Tower3<K>; 4] = std::array::from_fn(|_| rand_t3::<K>(&mut r));
             let b: [Tower3<K>; 4] = std::array::from_fn(|_| rand_t3::<K>(&mut r));
@@ -2695,37 +2709,49 @@ mod batch_tests {
             let finalb = summedb.compose_unary_single_slot(db, 0);
             for rw in 0..4 {
                 assert_t3_eq(&finalb.lane(rw), &scal[rw], "t3-chain");
+                checks += 1;
             }
         }
+        checks
     }
 
     // A `Tower4Batch<9>` carries a `9⁴ = 6561`-entry `t4` tensor in 4-wide
     // lanes (≈210 KiB by value); the op chain keeps several live, which can
     // exceed a test thread's default stack. Run each width on a large-stack
     // thread so K=9 is exercised without a stack overflow.
-    fn big_stack<F: FnOnce() + Send + 'static>(f: F) {
+    fn big_stack<T: Send + 'static, F: FnOnce() -> T + Send + 'static>(f: F) -> T {
         std::thread::Builder::new()
             .stack_size(512 << 20)
             .spawn(f)
             .unwrap()
             .join()
-            .unwrap();
+            .unwrap()
     }
 
     #[test]
     fn tower4_batch_lane_bit_identical() {
-        big_stack(|| run4::<2>(0x1111_2222_3333_4444, 2000));
-        big_stack(|| run4::<3>(0x5555_6666_7777_8888, 2000));
-        big_stack(|| run4::<4>(0x9999_aaaa_bbbb_cccc, 2000));
-        big_stack(|| run4::<9>(0xdddd_eeee_ffff_0000, 2000));
+        // Each `run4::<K>` performs `batches·4·(1 + 2·K²)` lane-vs-scalar
+        // comparisons (1 chain + 2·K² contraction, per row × 4 rows). Asserting
+        // the total pins that every width's full sweep ran on its big-stack
+        // thread — a panic-free early return would undercount and fail here.
+        let expect = |k: usize| 2000 * 4 * (1 + 2 * k * k);
+        let total = big_stack(|| run4::<2>(0x1111_2222_3333_4444, 2000))
+            + big_stack(|| run4::<3>(0x5555_6666_7777_8888, 2000))
+            + big_stack(|| run4::<4>(0x9999_aaaa_bbbb_cccc, 2000))
+            + big_stack(|| run4::<9>(0xdddd_eeee_ffff_0000, 2000));
+        assert_eq!(total, expect(2) + expect(3) + expect(4) + expect(9));
     }
 
     #[test]
     fn tower3_batch_lane_bit_identical() {
-        big_stack(|| run3::<2>(0x0f0f_1e1e_2d2d_3c3c, 2000));
-        big_stack(|| run3::<3>(0x4b4b_5a5a_6969_7878, 2000));
-        big_stack(|| run3::<4>(0x8787_9696_a5a5_b4b4, 2000));
-        big_stack(|| run3::<9>(0xc3c3_d2d2_e1e1_f0f0, 2000));
+        // Each `run3::<K>` performs `batches·4` chain comparisons (1 per row ×
+        // 4 rows); assert the four widths' full sweep ran.
+        let expect = 2000 * 4;
+        let total = big_stack(|| run3::<2>(0x0f0f_1e1e_2d2d_3c3c, 2000))
+            + big_stack(|| run3::<3>(0x4b4b_5a5a_6969_7878, 2000))
+            + big_stack(|| run3::<4>(0x8787_9696_a5a5_b4b4, 2000))
+            + big_stack(|| run3::<9>(0xc3c3_d2d2_e1e1_f0f0, 2000));
+        assert_eq!(total, 4 * expect);
     }
 }
 
