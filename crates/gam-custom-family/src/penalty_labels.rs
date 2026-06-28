@@ -70,14 +70,6 @@ impl PenaltyLabelLayout {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn penalty_label_layout(
-    specs: &[ParameterBlockSpec],
-    penalty_counts: Vec<usize>,
-) -> Result<PenaltyLabelLayout, String> {
-    penalty_label_layout_with_joint(specs, penalty_counts, Vec::new())
-}
-
 pub(crate) fn penalty_label_layout_with_joint(
     specs: &[ParameterBlockSpec],
     penalty_counts: Vec<usize>,

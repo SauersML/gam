@@ -2440,7 +2440,8 @@ pub(crate) fn nonconverged_inner_refuses_profile_derivatives() {
 pub(crate) fn custom_family_seed_screening_proxy_accepts_finite_partial_inner_fit() {
     let specs = vec![default_diagonal_exact_hook_spec()];
     let penalty_counts = validate_blockspecs(&specs).expect("valid test spec");
-    let layout = penalty_label_layout(&specs, penalty_counts).expect("valid label layout");
+    let layout = penalty_label_layout_with_joint(&specs, penalty_counts, Vec::new())
+        .expect("valid label layout");
     let options = BlockwiseFitOptions {
         use_remlobjective: true,
         use_outer_hessian: true,

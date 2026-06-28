@@ -363,7 +363,6 @@ impl MultinomialFamily {
     /// to `fit_custom_family_with_rho_prior`.
     pub fn build_block_specs(&self) -> Vec<ParameterBlockSpec> {
         let m = self.active_classes();
-        let n_terms = self.penalties.len();
         (0..m)
             .map(|a| {
                 let priority = 100u8.saturating_add(u8::try_from(m - a).unwrap_or(u8::MAX));
@@ -404,7 +403,6 @@ impl MultinomialFamily {
                 // are created by the joint specs. Attaching the per-block penalty
                 // too would double-count `(I+M)⊗S_t` and re-introduce the
                 // reference-anchored frame.
-                let _ = n_terms;
                 let mut spec = ParameterBlockSpec {
                     name: format!("class_{a}"),
                     design: DesignMatrix::Dense(DenseDesignMatrix::from(self.design.clone())),
