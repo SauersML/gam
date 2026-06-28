@@ -126,6 +126,7 @@ mod certificate;
 mod construction;
 mod construction_cache_refresh;
 mod construction_padded_blocks;
+mod construction_reconstruction;
 mod fit_drivers;
 mod kronecker;
 mod loss;
