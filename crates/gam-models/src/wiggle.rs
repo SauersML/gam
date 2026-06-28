@@ -282,3 +282,133 @@ pub(crate) fn select_wiggle_basis_from_seed(
         block,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model_types::PenaltySpec;
+    use ndarray::Array1;
+
+    fn dense_penalty(spec: &PenaltySpec) -> &Array2<f64> {
+        match spec {
+            PenaltySpec::Dense(m) => m,
+            other => panic!("expected Dense penalty, got {other:?}"),
+        }
+    }
+
+    fn is_symmetric(m: &Array2<f64>) -> bool {
+        let n = m.nrows();
+        if m.ncols() != n {
+            return false;
+        }
+        for i in 0..n {
+            for j in 0..n {
+                if (m[[i, j]] - m[[j, i]]).abs() > 1e-12 {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    // ---- monotone_wiggle_internal_degree ----
+
+    #[test]
+    fn internal_degree_rejects_degree_below_two() {
+        // degree 0 and 1 yield internal_degree < 1 -> Err with the documented message.
+        for d in [0usize, 1] {
+            let err = monotone_wiggle_internal_degree(d).unwrap_err();
+            assert_eq!(err, "monotone wiggle degree must be >= 2");
+        }
+    }
+
+    #[test]
+    fn internal_degree_is_degree_minus_one_for_valid_degrees() {
+        // degree >= 2 -> Ok(degree - 1): the per-span value degree aligned to the
+        // public value-basis degree.
+        assert_eq!(monotone_wiggle_internal_degree(2).unwrap(), 1);
+        assert_eq!(monotone_wiggle_internal_degree(3).unwrap(), 2);
+        assert_eq!(monotone_wiggle_internal_degree(10).unwrap(), 9);
+    }
+
+    // ---- buildwiggle_block_input_from_knots (driven via seed for valid knots) ----
+
+    fn build(double_penalty: bool, penalty_order: usize) -> (ParameterBlockInput, usize) {
+        // A spread-out seed so knot generation yields several monotone columns.
+        let seed = Array1::linspace(0.0, 1.0, 40);
+        let cfg = WiggleBlockConfig {
+            degree: 3,
+            num_internal_knots: 5,
+            penalty_order,
+            double_penalty,
+        };
+        let knots = initializewiggle_knots_from_seed(seed.view(), cfg.degree, cfg.num_internal_knots)
+            .expect("knot init");
+        let block = buildwiggle_block_input_from_knots(
+            seed.view(),
+            &knots,
+            cfg.degree,
+            cfg.penalty_order,
+            cfg.double_penalty,
+        )
+        .expect("build block");
+        let p = block.design.ncols();
+        (block, p)
+    }
+
+    #[test]
+    fn single_penalty_block_shapes_and_invariants() {
+        let (block, p) = build(false, 2);
+        assert!(p >= 2, "expected multiple monotone columns, got p={p}");
+        // Offset is zeros with length = seed length.
+        assert_eq!(block.offset.len(), 40);
+        assert!(block.offset.iter().all(|&v| v == 0.0));
+        // initial_beta is Some(zeros(p)).
+        let beta = block.initial_beta.as_ref().expect("initial_beta");
+        assert_eq!(beta.len(), p);
+        assert!(beta.iter().all(|&v| v == 0.0));
+        // Without double penalty there is exactly one penalty.
+        assert_eq!(block.penalties.len(), 1);
+        assert_eq!(block.nullspace_dims.len(), 1);
+        // The penalty is the p x p difference penalty; symmetric (S = Dᵀ D).
+        let s = dense_penalty(&block.penalties[0]);
+        assert_eq!(s.dim(), (p, p));
+        assert!(is_symmetric(s));
+        // effective_order = penalty_order.max(1).min(p-1); here 2 (<= p-1 since p>=3
+        // for this seed). nullspace_dim equals the effective difference order.
+        let effective = 2usize.max(1).min(p - 1);
+        assert_eq!(block.nullspace_dims[0], effective);
+    }
+
+    #[test]
+    fn double_penalty_appends_identity_ridge() {
+        let (block, p) = build(true, 2);
+        assert!(p >= 2);
+        // double_penalty -> two penalties: difference penalty then p x p identity.
+        assert_eq!(block.penalties.len(), 2);
+        assert_eq!(block.nullspace_dims.len(), 2);
+        let ridge = dense_penalty(&block.penalties[1]);
+        assert_eq!(ridge.dim(), (p, p));
+        // Identity: diagonal ones, off-diagonal zeros.
+        for i in 0..p {
+            for j in 0..p {
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert_eq!(ridge[[i, j]], expected);
+            }
+        }
+        // The appended identity is full rank, so its nullspace dim is 0.
+        assert_eq!(block.nullspace_dims[1], 0);
+    }
+
+    #[test]
+    fn penalty_order_clamped_to_p_minus_one() {
+        // Requesting an absurdly large penalty order clamps effective_order to p-1
+        // (still a valid difference penalty), per `penalty_order.max(1).min(p-1)`.
+        let (block, p) = build(false, 10_000);
+        assert!(p >= 2);
+        let s = dense_penalty(&block.penalties[0]);
+        assert_eq!(s.dim(), (p, p));
+        assert!(is_symmetric(s));
+        assert_eq!(block.nullspace_dims[0], p - 1);
+    }
+}
