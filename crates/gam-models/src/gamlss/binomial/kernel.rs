@@ -586,6 +586,11 @@ pub(crate) fn binomial_location_scale_nll_tower(
 /// without the dense `Tower4<2>` `t3`/`t4`). Reconstructs `(η_t, η_ls)` from the
 /// core's `(σ, q0)` and forwards the per-row stack to
 /// [`binomial_location_scale_nll_generic`].
+///
+/// Test-only: the production hot paths now evaluate the directional contractions
+/// through the SIMD lane-batched kernels; this per-row scalar form is retained as
+/// the to-bits reference oracle for `simd_directional_coefficients_match_scalar_per_row_to_bits`.
+#[cfg(test)]
 #[inline]
 pub(crate) fn binomial_location_scale_nll_generic_from_core_row<
     S: gam_math::jet_scalar::JetScalar<2>,
@@ -684,7 +689,7 @@ fn binomial_ls_directional_fourth_batch(
 
 /// Reconstruct the per-row `(eta_t, eta_ls)` the row NLL seeds from the core's
 /// `(σ, q0)` — identical to
-/// [`binomial_location_scale_nll_generic_from_core_row`]'s reconstruction, so
+/// `binomial_location_scale_nll_generic_from_core_row`'s reconstruction, so
 /// the lane-batched path seeds the SAME primary values as the scalar path.
 #[inline]
 fn core_row_eta(core: &BinomialLocationScaleCore, row: usize) -> (f64, f64) {
