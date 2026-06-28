@@ -530,6 +530,64 @@ impl<'a> Deref for LogSmoothingParamsView<'a> {
 }
 
 #[cfg(test)]
+mod newtype_tests {
+    use super::*;
+    use ndarray::array;
+
+    #[test]
+    fn smooth_term_idx_new_get_roundtrip() {
+        let idx = SmoothTermIdx::new(7);
+        assert_eq!(idx.get(), 7);
+        assert!(!idx.is_placeholder());
+        assert_eq!(format!("{idx}"), "7");
+    }
+
+    #[test]
+    fn smooth_term_idx_placeholder_is_detected() {
+        let p = SmoothTermIdx::placeholder();
+        assert!(p.is_placeholder());
+        assert_eq!(p.get(), usize::MAX);
+    }
+
+    #[test]
+    fn smooth_term_idx_ordering() {
+        let a = SmoothTermIdx::new(1);
+        let b = SmoothTermIdx::new(2);
+        assert!(a < b);
+        assert_eq!(a, SmoothTermIdx::new(1));
+    }
+
+    #[test]
+    fn coefficients_zeros_and_deref() {
+        let c = Coefficients::zeros(3);
+        assert_eq!(c.len(), 3);
+        assert!(c.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn coefficients_from_array1() {
+        let arr = array![1.0, 2.0, 3.0];
+        let c = Coefficients::from(arr.clone());
+        assert_eq!(*c, arr);
+    }
+
+    #[test]
+    fn log_smoothing_params_exp_matches_elementwise() {
+        let arr = array![0.0_f64, 1.0, -1.0];
+        let rho = LogSmoothingParams::new(arr.clone());
+        let expected = arr.mapv(f64::exp);
+        assert_eq!(rho.exp(), expected);
+    }
+
+    #[test]
+    fn linear_predictor_zeros_and_deref() {
+        let lp = LinearPredictor::zeros(4);
+        assert_eq!(lp.len(), 4);
+        assert!(lp.iter().all(|&v| v == 0.0));
+    }
+}
+
+#[cfg(test)]
 mod ridge_policy_tests {
     use super::{RidgePassport, RidgePolicy, StabilizationKind, StabilizationLedger};
 
