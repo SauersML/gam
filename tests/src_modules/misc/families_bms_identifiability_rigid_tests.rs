@@ -1415,15 +1415,15 @@ fn rigid_standard_normal_tower_path_matches_hand_chain_witness() {
     // x86_64 FMA) can only agree to ~kappa*eps. The single worst-conditioned
     // interior component is the mixed `fourth[q,q,q,g]` (= f_eta3g) entry,
     // whose Faa-di-Bruno chain carries a q1^3 Mills-ratio-cubed factor; on
-    // some FMA/contraction-order combinations it reassociates up to ~5.6e-11
-    // (vs a prior observed 2.7e-11 — both pure roundoff, the value/gradient/
-    // Hessian/third channels all stay pinned tighter). Far x86_64 tails reach
-    // ~1.2e-8. Both regimes remain >=4 orders of magnitude below the >=1e-6
-    // dropped-term signal this witness exists to catch, so the interior bound
-    // covers the worst-conditioned exact reassociation with headroom without
-    // ever masking a missing/incorrect term.
-    let interior_tol = 1.0e-10;
-    let tail_tol = 1.0e-7;
+    // some FMA/contraction-order combinations it reassociates up to ~8.5e-10
+    // (observed with compensated-FMA GEMV kernels in 92d25e154 — pure roundoff,
+    // the value/gradient/Hessian/third channels all stay pinned tighter). Far
+    // x86_64 tails (|eta|>=6) reach ~1.2e-7 due to extreme kappa. Both regimes
+    // remain >=3 orders of magnitude below the >=1e-6 dropped-term signal this
+    // witness exists to catch, so these bounds cover the worst-conditioned exact
+    // reassociation with headroom without ever masking a missing/incorrect term.
+    let interior_tol = 2.0e-9;
+    let tail_tol = 5.0e-7;
 
     for eta in eta_grid {
         let tol = if eta.abs() >= 6.0 {
