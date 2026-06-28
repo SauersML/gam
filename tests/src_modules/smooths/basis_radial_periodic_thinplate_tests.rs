@@ -1359,7 +1359,7 @@ fn test_build_thin_plate_basis_switches_to_lazy_design_for_large_blocks() {
     let result = build_thin_plate_basis(data.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "large thin-plate basis", e));
     assert!(matches!(
         result.design,
-        DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::Lazy(_))
+        DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::Lazy(_))
     ));
 }
 
@@ -4210,7 +4210,7 @@ fn assert_scale_free_joint_null_is_only_constant(
     data: ArrayView2<'_, f64>,
     spec: &DuchonBasisSpec,
 ) {
-    use crate::faer_ndarray::FaerEigh;
+    use gam_linalg::faer_ndarray::FaerEigh;
     let out =
         build_duchon_basis(data, spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "Duchon basis should build for joint-null test", e));
     let design = out.design.to_dense();
@@ -4235,7 +4235,7 @@ fn assert_scale_free_joint_null_is_only_constant(
     let kernel_cols = p - poly_cols;
     let mut v_const = Array1::<f64>::zeros(p);
     v_const[kernel_cols] = 1.0;
-    let recon = crate::faer_ndarray::fast_av(&design, &v_const);
+    let recon = gam_linalg::faer_ndarray::fast_av(&design, &v_const);
     let ones = Array1::<f64>::ones(n);
     let err = (&recon - &ones)
         .iter()
@@ -4254,7 +4254,7 @@ fn assert_scale_free_joint_null_is_only_constant(
     for s in out.penalties.iter() {
         joint.scaled_add(1.0, s);
     }
-    let s_v = crate::faer_ndarray::fast_av(&joint, &v_const);
+    let s_v = gam_linalg::faer_ndarray::fast_av(&joint, &v_const);
     let s_v_norm = s_v.iter().map(|v| v * v).sum::<f64>().sqrt();
     let joint_scale = joint.iter().map(|v| v * v).sum::<f64>().sqrt().max(1.0);
     // Tolerance: the centered design Gram (q=0) is f64-accumulation
@@ -5781,7 +5781,7 @@ fn test_matern_overspecified_centers_yield_full_rank_basis() {
     // basis functions. The realized kernel design then exceeds the kernel's
     // numerical rank and the identifiability audit would FATAL. The basis
     // builder must rank-reduce centers so the emitted design is full rank.
-    use crate::linalg::faer_ndarray::rrqr_with_permutation;
+    use gam_linalg::faer_ndarray::rrqr_with_permutation;
     // Pack K=30 centers far tighter than the fixed length_scale can resolve:
     // 30 centers crammed into a 0.1-wide interval with length_scale=3.0
     // makes adjacent radial functions near-identical, so the un-reduced
