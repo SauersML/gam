@@ -3416,6 +3416,82 @@ pub(crate) fn device_a_phi_shared_is_refcount_bump_not_clone_1033() {
     );
 }
 
+/// #1033 frames-engaged assembly guard: `set_device_sae_pcg_data` must NOT panic
+/// when the frames-engaged builder (`build_framed_device_sae_data`) hands it a
+/// `DeviceSaePcgData` whose full-`B` per-row `a_phi`/`local_jac` slabs are left
+/// intentionally EMPTY (the per-row cross block rides `frame.frame_blocks`
+/// instead). Before the fix the install unconditionally asserted
+/// `a_phi.len() == rows.len()` and `local_jac.len() == rows.len()`, so EVERY
+/// frames-engaged SAE assembly (decoder rank < p — the common large-output case)
+/// panicked at install; it was dormant only because no test exercised a
+/// frame-activating shape, and it surfaced while profiling a real OLMo l18 fit.
+///
+/// This pins both halves of the fix: (1) the relaxed length contract — the
+/// per-row-slab asserts apply ONLY when `frame.is_none()`, so a framed payload
+/// installs without panicking; and (2) the consumer contract — with the slabs
+/// empty the CPU-resident reduced-Schur factor must DECLINE to build
+/// (`SaeResidentReducedSchur::build → None`), so the solve falls back to the
+/// generic per-row matvec rather than relocating the panic to an empty-slab
+/// index. Reverting the assert gate makes `set_device_sae_pcg_data` panic here.
+#[test]
+pub(crate) fn framed_device_sae_pcg_install_tolerates_empty_per_row_slabs_1033() {
+    let n = 4usize;
+    let q = 3usize;
+    let p = 5usize;
+    let n_atoms = 2usize;
+    let k = n_atoms * p;
+    let mut sys = ArrowSchurSystem::new(n, q, k);
+    // SPD per-row H_tt so the resident factor COULD build if the slabs were
+    // populated — isolating the empty-slab decline as the property under test
+    // (a degenerate H_tt would let the factor fail for an unrelated reason).
+    for i in 0..n {
+        let mut htt = Array2::<f64>::zeros((q, q));
+        for r in 0..q {
+            htt[[r, r]] = (q as f64) + 2.0 + i as f64;
+        }
+        sys.rows[i].htt = htt;
+        sys.rows[i].gt = Array1::<f64>::zeros(q);
+    }
+
+    // A frames-engaged device payload: the per-row cross block rides
+    // `frame.frame_blocks`/`frame.row_htbeta`, so the full-`B` `a_phi`/`local_jac`
+    // slabs are EMPTY — exactly what `build_framed_device_sae_data` produces.
+    let frame = DeviceSaeFrameData {
+        ranks: vec![p; n_atoms],
+        basis_sizes: vec![1; n_atoms],
+        border_offsets: vec![0, p], // prefix sum of M_k·r_k = 1·p per atom
+        frame_blocks: Vec::new(),
+        smooth_ranks: Vec::new(),
+        row_htbeta: vec![Vec::new(); n],
+    };
+    let device = DeviceSaePcgData {
+        p,
+        beta_dim: k,
+        a_phi: std::sync::Arc::from(Vec::<Vec<(usize, f64)>>::new().into_boxed_slice()),
+        local_jac: std::sync::Arc::from(Vec::<Vec<f64>>::new().into_boxed_slice()),
+        smooth_blocks: Vec::new(),
+        sparse_g_blocks: Vec::new(),
+        frame: Some(frame),
+    };
+
+    // The core of #1033: this install must NOT panic on the empty slabs.
+    sys.set_device_sae_pcg_data(device);
+
+    // Consumer contract: the empty-slab framed payload must make the CPU-resident
+    // reduced-Schur factor decline (None) → generic per-row matvec fallback, so
+    // no consumer ever indexes the empty `a_phi`/`local_jac`.
+    let backend = CpuBatchedBlockSolver;
+    let htt_factors = backend
+        .factor_blocks(&sys.rows, 0.0, q, false)
+        .expect("SPD per-row blocks must factor");
+    let resident = SaeResidentReducedSchur::build(&sys, &htt_factors, &backend);
+    assert!(
+        resident.is_none(),
+        "frames-engaged empty-slab payload must decline the resident factor and \
+         fall back to the generic matvec, not index the empty per-row slabs"
+    );
+}
+
 /// The #1017 SAE-resident scalar Jacobi (built from the staged `(L_i, Y_i)`
 /// factors in one support-sparse pass) must produce the SAME reduced-Schur
 /// diagonal — hence the SAME `BlockFactor::Scalar` inverses — as the generic
