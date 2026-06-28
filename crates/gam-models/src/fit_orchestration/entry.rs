@@ -1262,42 +1262,28 @@ mod sz_factor_smooth_recovery_tests {
     /// to the observation-noise floor, exactly as the strictly-more-general
     /// `s(x, g, bs="fs")` superset provably does.
     ///
-    /// Before the fix, the `sz` deviation blocks left their {const, linear} null
-    /// space unpenalized, so REML could not separate per-group intercept/slope
-    /// variance from curvature variance and parked the wiggliness λ over-smoothed
-    /// — leaving ≈2.1× the noise floor as systematic residual (resid sd ≈ 0.43 vs
-    /// the 0.20 floor) while `fs` reached ≈0.20. The fix gives `sz` the same
-    /// per-null-dimension ridge structure as `fs`, mapped into the zero-sum
-    /// contrast space, so `sz` now recovers its own class to the floor.
+    /// The recovery gap (`sz` resid ≈ 0.43 ≈ 2.1× the 0.20 floor while `fs`
+    /// reaches the floor) was closed by THREE mgcv-faithful corrections, each
+    /// necessary, that this end-to-end fit jointly exercises:
+    ///   1. marginal basis (baef17e): cr → curvature-capable B-spline, so a
+    ///      deviation with non-zero boundary curvature is representable;
+    ///   2. ownership/overlap residualization (b49bb5c): the `sz` deviation is
+    ///      sum-to-zero ACROSS the grouping factor, hence orthogonal to a
+    ///      factor-independent owner like the shared `s(x)`. Residualizing it
+    ///      against `s(x)`'s realized span (the #978 chart) collapsed every
+    ///      group's curve to a flat per-group contrast; skipping that ownership
+    ///      (same family as the #1276 factor-`by` level gate) restores the curve
+    ///      shape and stops REML railing the shared `s(x)` wiggliness λ;
+    ///   3. null-space ridge (this change): the `sz` deviation blocks now carry
+    ///      the per-null-dimension ridge structure of `fs`, mapped into the
+    ///      zero-sum contrast space, so the {const, linear} null space is
+    ///      shrinkable per dimension (the #700/#712/#713 partial-pooling form)
+    ///      rather than left free — without breaking the zero-sum constraint.
     ///
-    /// STATUS (#1605, partial): `#[ignore]`d — it still FAILS. This is the
-    /// honest, end-to-end reproduction of the recovery gap and the live
-    /// acceptance bar for the remaining work. The committed marginal fix
-    /// (baef17e: cr → curvature-capable B-spline) and the null-space-ridge
-    /// structural fix in this change are both necessary mgcv-faithful
-    /// corrections, but neither closes this gap, because the dominant cause is
-    /// elsewhere and was localized here:
-    ///
-    ///   In `y ~ s(x) + s(g, x, bs='sz')`, REML rails the SHARED `s(x)`
-    ///   wiggliness `λ` to ~2.9e3 (block-mapped to `s(x)`, confirmed via
-    ///   `penaltyinfo[i].termname`), flattening `s(x)` toward its linear null
-    ///   space. The `sz` deviation blocks are NOT over-smoothed (their `λ`s are
-    ///   ~1e-2, edf ~13); they partially absorb the shared mean because each
-    ///   level-gated deviation column has a sub-tolerance cross-residual with
-    ///   `s(x)`'s full-support B-spline span, so the `s(x)` owner-residualization
-    ///   (`OVERLAP_REL_RESIDUAL_TOL`) never fires for the block-diagonal `sz`
-    ///   design. With `s(x)` flattened, the common `sin(2πx)` mean is lost and
-    ///   the zero-sum deviations cannot restore it → ~2x the noise floor in the
-    ///   residual. (`fs` ALONE carries its own mean and needs no shared `s(x)`,
-    ///   so it reaches the floor; `fs` WITH a redundant `+ s(x)` rails the same
-    ///   way — this is the `s(x)`+factor-smooth overlap, not `sz`-specific.)
-    ///
-    /// The correct fix is in the #978 ownership/overlap residualization (make
-    /// the collective `sz` deviation design orthogonal to the shared `s(x)` span
-    /// without collapsing the per-group #1276 level-gated deviation to zero) —
-    /// deeper, higher-risk shared machinery left for follow-up. Un-`ignore` when
-    /// addressed; it must pass unedited.
-    #[ignore = "#1605 recovery gap: s(x) over-smoothing in the s(x)+factor-smooth overlap not yet fixed (see doc comment)"]
+    /// This is the gold-standard verification: it drives the real
+    /// `fit_from_formula` REML λ-selection on data drawn from exactly the `sz`
+    /// model class and asserts `sz` reaches the floor (and a `fs` control does
+    /// too). It failed before the fixes and passes after.
     #[test]
     fn sz_factor_smooth_recovers_its_own_model_class_end_to_end() {
         let (data, _td) = sz_class_dataset();
