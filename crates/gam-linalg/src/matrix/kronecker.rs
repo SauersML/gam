@@ -801,6 +801,7 @@ impl DenseDesignOperator for RowwiseKroneckerOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ndarray::array;
 
     // ── decode_multi_index ────────────────────────────────────────────────────
 
@@ -863,6 +864,51 @@ mod tests {
     fn upper_triangle_pair_last_entry_is_bottom_right() {
         // n=3: 6 pairs total, idx=5 → (2,2)
         assert_eq!(upper_triangle_pair_from_index(5, 3), (2, 2));
+    }
+
+    // ── dense_rowwise_kronecker ───────────────────────────────────────────────
+
+    #[test]
+    fn dense_rowwise_kronecker_1x1_by_1x1() {
+        // 1-row, 1-col matrices: result is element product.
+        let a = array![[3.0_f64]];
+        let b = array![[5.0_f64]];
+        let out = dense_rowwise_kronecker(a.view(), b.view());
+        assert_eq!(out.dim(), (1, 1));
+        assert_eq!(out[[0, 0]], 15.0);
+    }
+
+    #[test]
+    fn dense_rowwise_kronecker_1_row_outer_product() {
+        // a=[1,2], b=[3,4] → row 0: a⊗b = [1*3, 1*4, 2*3, 2*4] = [3,4,6,8]
+        let a = array![[1.0_f64, 2.0]];
+        let b = array![[3.0_f64, 4.0]];
+        let out = dense_rowwise_kronecker(a.view(), b.view());
+        assert_eq!(out.dim(), (1, 4));
+        assert_eq!(out.row(0).to_vec(), vec![3.0, 4.0, 6.0, 8.0]);
+    }
+
+    #[test]
+    fn dense_rowwise_kronecker_2_rows() {
+        // Row 0: a=[1,2]⊗b=[3,4] = [3,4,6,8]
+        // Row 1: a=[5,6]⊗b=[7,8] = [35,40,42,48]
+        let a = array![[1.0_f64, 2.0], [5.0, 6.0]];
+        let b = array![[3.0_f64, 4.0], [7.0, 8.0]];
+        let out = dense_rowwise_kronecker(a.view(), b.view());
+        assert_eq!(out.dim(), (2, 4));
+        assert_eq!(out.row(0).to_vec(), vec![3.0, 4.0, 6.0, 8.0]);
+        assert_eq!(out.row(1).to_vec(), vec![35.0, 40.0, 42.0, 48.0]);
+    }
+
+    #[test]
+    fn dense_rowwise_kronecker_zero_element_skips_product() {
+        // a row with a zero entry: the zero-skip path must give the same result.
+        let a = array![[1.0_f64, 0.0, 2.0]];
+        let b = array![[1.0_f64, 2.0]];
+        let out = dense_rowwise_kronecker(a.view(), b.view());
+        // expected: [1*1, 1*2, 0*1, 0*2, 2*1, 2*2] = [1, 2, 0, 0, 2, 4]
+        assert_eq!(out.dim(), (1, 6));
+        assert_eq!(out.row(0).to_vec(), vec![1.0, 2.0, 0.0, 0.0, 2.0, 4.0]);
     }
 
     // ── lower_triangle_pair_from_index ────────────────────────────────────────
