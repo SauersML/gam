@@ -1,3 +1,89 @@
+## v0.3.130 — gam 0.3.130 / gamfit 0.1.232 (2026-06-28)
+
+crates.io + PyPI release of the prediction/generation-contract and
+GAMLSS-convergence wave landed since gam 0.3.129 / gamfit 0.1.231. The headline
+fixes repair the response-scale `predict`/`generate` contract for conditional
+transformation-normal (CTM) models and for Beta regression, and replace observed
+with expected (Fisher) information in the negative-binomial and binomial
+location-scale curvature so those GAMLSS fits converge on well-posed data. The
+`gamfit` Python API surface is unchanged.
+
+**Conditional transformation-normal models (#1612)**
+- `gam predict` returned the probability-integral transform `h(y|x)` of the
+  *supplied* response as both `linear_predictor` and `mean`, which wrongly
+  required the outcome column at predict time and made the reported "mean" sweep
+  with `y` at fixed `x`. It now returns the genuine response-scale conditional
+  mean `E[Y|x] = E_{Z~N(0,1)}[h⁻¹(Z|x)]` — a function of the covariates alone —
+  computed by inverting the monotone transform on a standard-normal quadrature
+  (midpoint rule in probability space, shared fine `y`-grid I-spline inversion).
+  A covariate-only frame now predicts without `y`.
+- `gam generate` shared the same broken plug-in path and drew `N(h(y|x), sd)` on
+  the latent scale, so synthetic responses moved the *wrong way* with the
+  covariate. It now draws response-scale `Y` tracking `E[Y|x]` (verified: draws
+  at `x = −1, 0, 1` center on `1.10, 1.99, 2.91` for a fit to `E[Y|x] = 2 + 0.9x`).
+
+**Beta regression (#1608, #1609)**
+- `gam sample` on a Beta-regression model aborted ("NUTS not implemented for
+  beta-regression logit") instead of routing to the documented Gaussian Laplace
+  fallback like every other NUTS-unsupported family. It now falls back correctly.
+- `gam diagnose` computed Beta AIC / PSIS-LOO elpd at the placeholder precision
+  `φ = 1` instead of the fitted `φ̂` (off ~1700 nats, incomparable across
+  families). The fitted Beta `φ` is now threaded onto the reported family,
+  mirroring the NB-`θ` path and restoring the `with_beta_phi` invariant.
+
+**GAMLSS location-scale convergence (#1606, #1607)**
+- Negative-binomial location-scale fits aborted with an `IntegrationError` on
+  well-posed heteroscedastic counts: the log-`θ` dispersion block built its IRLS
+  curvature from the strongly non-quadratic *observed* information, which goes
+  negative for under-dispersed rows and divides the score by ≈0. It now uses the
+  expected (Fisher) information, so the inner P-IRLS reaches KKT stationarity.
+- The probit binomial location-scale outer REML/LAML curvature was likewise
+  assembled from observed information, yielding an indefinite penalized Hessian
+  that blew up the envelope-trace gradient (surfacing as an unavailable/zero
+  analytic gradient). It now uses expected Fisher information.
+
+**Flexible (learnable) link (#1596)**
+- The flexible-link warp now genuinely engages and improves the fit: the frozen
+  warp basis is de-aliased against the mean design (no canonical-gauge rank
+  drop), the learned link is guaranteed strictly monotone/invertible over the
+  fitted predictor range, and the warp is threaded through to `predict`. Deviance
+  on the cloglog reproduction improves `1018 → 980` (reference `979.5`) with a
+  certified monotone link.
+
+**Multinomial REML invariance (#1587)**
+- A penalized multinomial-logit GAM was not invariant to the arbitrary softmax
+  reference class (predicted probabilities drifted ~1% under relabeling) because
+  it applied the reference-anchored ALR penalty. The reference-symmetric centered
+  CLR penalty `M⊗S_t` (`M = I − J/K`) is now wired through the custom-family outer
+  REML loop; all other families are byte-identical.
+
+**Duchon / Matérn smooths (#1604)**
+- The half-integer-`ν` Matérn Taylor-coefficient path used the wrong polynomial
+  degree (`2l` instead of `l`), collapsing every `ν ≥ 3/2` block (e.g. zeroing
+  the `ν = 3/2` diagonal). Corrected, so `d = 1` hybrid Duchon smooths with power
+  `≥ 2` build a PSD penalty again.
+
+**Performance**
+- Compensated multi-lane FMA GEMV kernels (faster *and* more accurate than the
+  faer reference), truncated-Taylor `compose_unary` (~2.4×), SIMD-batched closure
+  `design`/`design_jet` rows, output-symmetry Tower4 `t3`/`t4` contractions, a
+  stable trig recurrence for the harmonic γ-jet, and a per-row alloc dropped from
+  the `loss_scaled` data-fit hot loop. A measured survival regression from a
+  build-once dense-3-tensor closure was reverted.
+
+**SAE manifold (research surface)**
+- Data-driven chart placement (`EncodeAtlas::build_data_driven`) places a bounded
+  number of charts at the data's own latent coordinates (greedy farthest-point
+  sampling), unlocking well-certified higher-dimensional manifold atoms; the
+  PCA "flat SAE" baseline was replaced with a real trained TopK SAE; and the
+  dense k-sweep "saturation" was diagnosed as a gate-cap bug and corrected.
+
+**Release & build infrastructure**
+- The intra-family dev-dependency publish cycle is broken so the crate family
+  publishes cleanly in topological order (#1603); the `gam-terms` test crate
+  builds clean again (#1601); broad new unit-test coverage across the
+  predict / models / inference / terms crates.
+
 ## v0.3.129 — gam 0.3.129 / gamfit 0.1.231 (2026-06-28)
 
 crates.io + PyPI release of the fix + SAE-fast-forward wave landed since gam
