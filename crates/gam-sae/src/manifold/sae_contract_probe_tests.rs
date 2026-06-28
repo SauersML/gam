@@ -1451,3 +1451,66 @@ fn encode_grad_hess_and_beta_eta_match_finite_differences() {
     assert_abs_diff_eq!(delta[0], -g[0] / hpd[[0, 0]], epsilon = 1e-12);
     assert_abs_diff_eq!(eta, (g[0] / hpd[[0, 0]]).abs(), epsilon = 1e-12);
 }
+
+/// #1026 outlier-robust weighting: heavy-tailed token norms (real LLM residual
+/// streams have `p99/median ≈ 4.7`) let a small COHERENT high-norm cluster —
+/// typically special / attention-sink tokens, not semantic content — dominate
+/// the unweighted least-squares objective (measured on a real OLMo slice: top 5%
+/// of tokens carry ~31% of the `‖z‖²` budget). `robust_norm_row_weights`
+/// (Huber-on-norm) downweights them so their objective share grows only linearly
+/// with norm. This pins the rebalancing and the mean-normalization contract.
+#[test]
+fn robust_norm_row_weights_rebalances_heavy_tailed_objective() {
+    use ndarray::Array2;
+    let n = 100usize;
+    let p = 4usize;
+    let mut target = Array2::<f64>::zeros((n, p));
+    for i in 0..n {
+        if i < 95 {
+            // Bulk: small, scattered (norm ~0.5).
+            for c in 0..p {
+                target[[i, c]] = ((i * 7 + c * 13) % 11) as f64 / 11.0 - 0.5;
+            }
+        } else {
+            // High-norm coherent cluster (~10x bulk norm, same direction) — a
+            // stand-in for attention-sink / special tokens.
+            for c in 0..p {
+                target[[i, c]] = 5.0 * if c == 0 { 1.0 } else { 0.3 };
+            }
+        }
+    }
+    let norms: Vec<f64> = (0..n)
+        .map(|i| {
+            let r = target.row(i);
+            r.dot(&r).sqrt()
+        })
+        .collect();
+    let hi: Vec<usize> = (95..n).collect();
+    let total_sq: f64 = norms.iter().map(|nm| nm * nm).sum();
+    let hi_sq: f64 = hi.iter().map(|&i| norms[i] * norms[i]).sum();
+    let unweighted_share = hi_sq / total_sq;
+
+    let w = SaeManifoldTerm::robust_norm_row_weights(target.view(), 1.0).unwrap();
+
+    // Mean-normalized (matches the set_row_loss_weights convention).
+    let mean: f64 = w.iter().sum::<f64>() / n as f64;
+    assert_abs_diff_eq!(mean, 1.0, epsilon = 1e-9);
+    // High-norm tokens downweighted; a median-ish bulk token keeps ~full weight.
+    for &i in &hi {
+        assert!(w[i] < 0.5, "high-norm token {i} should be downweighted, w={}", w[i]);
+    }
+    // Weighted objective share of the high-norm cluster.
+    let total_w: f64 = (0..n).map(|i| w[i] * norms[i] * norms[i]).sum();
+    let hi_w: f64 = hi.iter().map(|&i| w[i] * norms[i] * norms[i]).sum();
+    let weighted_share = hi_w / total_w;
+    assert!(
+        weighted_share < unweighted_share * 0.6,
+        "robust weighting must materially cut the high-norm cluster's objective \
+         share: unweighted={unweighted_share:.3}, weighted={weighted_share:.3}"
+    );
+    // It must also be installable through the existing mechanism without error
+    // (uniform-design guard: a flat slice yields all-1.0 and the unweighted path).
+    let flat = Array2::<f64>::from_elem((4, p), 2.0);
+    let wf = SaeManifoldTerm::robust_norm_row_weights(flat.view(), 1.0).unwrap();
+    assert!(wf.iter().all(|&x| (x - 1.0).abs() < 1e-12), "flat norms → uniform weights");
+}

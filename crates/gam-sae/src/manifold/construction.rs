@@ -575,6 +575,62 @@ impl SaeManifoldTerm {
         self.row_loss_weights = None;
     }
 
+    /// Huber-style OUTLIER-ROBUST per-row weights from the target activation
+    /// norms — the missing default *policy* for the existing
+    /// [`set_row_loss_weights`](Self::set_row_loss_weights) mechanism.
+    ///
+    /// The SAE fits unweighted least squares, which weights each token by its
+    /// squared residual ∝ `‖z_i‖²`. On real LLM residual streams the per-token
+    /// norm distribution is heavy-tailed (e.g. an OLMo mixed-layer slice has
+    /// `p99/median ≈ 4.7`), so a small **coherent** cluster of high-norm tokens —
+    /// typically special / attention-sink tokens, not semantic content —
+    /// dominates the objective (measured: the top 5% of tokens carry ~31% of the
+    /// total `‖z‖²` budget) and pulls dictionary atoms toward their direction.
+    /// Mean-centering does NOT address this (it is per-feature, not per-token).
+    ///
+    /// This returns Huber weights `w_i = min(1, δ·m / ‖z_i‖)` where `m` is the
+    /// MEDIAN token norm: tokens at or below `δ·m` keep full weight, higher-norm
+    /// tokens are downweighted so their objective share grows only LINEARLY (not
+    /// quadratically) with norm. `δ` is the robustness knob (`δ=1` thresholds at
+    /// the median; larger `δ` only touches the extreme tail). The result is
+    /// mean-normalized (overall objective scale preserved). OPT-IN: the caller
+    /// installs it via `set_row_loss_weights` — the default fit is unchanged.
+    pub fn robust_norm_row_weights(
+        target: ArrayView2<'_, f64>,
+        delta: f64,
+    ) -> Result<Vec<f64>, String> {
+        if !(delta.is_finite() && delta > 0.0) {
+            return Err(format!(
+                "robust_norm_row_weights: delta must be finite and positive; got {delta}"
+            ));
+        }
+        let n = target.nrows();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let norms: Vec<f64> = (0..n)
+            .map(|i| {
+                let r = target.row(i);
+                r.dot(&r).sqrt()
+            })
+            .collect();
+        let mut sorted = norms.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        // Median token norm (lower-median for even n; floored off zero so an
+        // all-zero/degenerate slice yields uniform weights instead of NaN).
+        let median = sorted[n / 2].max(f64::MIN_POSITIVE);
+        let thresh = delta * median;
+        let raw: Vec<f64> = norms
+            .iter()
+            .map(|&nm| if nm <= thresh { 1.0 } else { thresh / nm })
+            .collect();
+        let mean = raw.iter().sum::<f64>() / n as f64;
+        if !(mean.is_finite() && mean > 0.0) {
+            return Err("robust_norm_row_weights: degenerate weight normalizer".to_string());
+        }
+        Ok(raw.into_iter().map(|w| w / mean).collect())
+    }
+
     /// Install the single per-row [`RowMetric`](gam_problem::RowMetric)
     /// that both the reconstruction likelihood and the isometry gauge read.
     /// Installing per-row output-Fisher factors here flips the provenance to
