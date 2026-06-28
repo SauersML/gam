@@ -75,3 +75,109 @@ impl Fnv1a {
         if self.hash == 0 { 1 } else { self.hash }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    /// A fresh hasher starts at the FNV-1a offset basis.
+    #[test]
+    fn new_starts_at_fnv_offset_basis() {
+        let h = Fnv1a::new();
+        assert_eq!(h.hash, 0xcbf2_9ce4_8422_2325u64, "initial hash is FNV offset basis");
+    }
+
+    /// `finish_nonzero` returns the hash unchanged when nonzero.
+    #[test]
+    fn finish_nonzero_nonzero_hash_unchanged() {
+        let mut h = Fnv1a::new();
+        h.mix_byte(0x42);
+        let result = h.finish_nonzero();
+        assert_ne!(result, 0, "should not be zero");
+        assert_eq!(result, h.hash, "nonzero hash passes through");
+    }
+
+    /// `finish_nonzero` returns 1 when the hash is somehow 0.
+    #[test]
+    fn finish_nonzero_zero_hash_becomes_one() {
+        let h = Fnv1a { hash: 0 };
+        assert_eq!(h.finish_nonzero(), 1, "zero hash maps to 1");
+    }
+
+    /// Same byte sequence always produces the same hash (determinism).
+    #[test]
+    fn same_bytes_produce_same_hash() {
+        let mut a = Fnv1a::new();
+        let mut b = Fnv1a::new();
+        for byte in [0x01u8, 0x02, 0xFF, 0xAB] {
+            a.mix_byte(byte);
+            b.mix_byte(byte);
+        }
+        assert_eq!(a.finish_nonzero(), b.finish_nonzero(), "deterministic");
+    }
+
+    /// Different byte sequences produce different hashes (collision avoidance
+    /// for simple cases — not a general guarantee, but covers the basics).
+    #[test]
+    fn different_bytes_produce_different_hashes() {
+        let mut a = Fnv1a::new();
+        a.mix_byte(0x01);
+        let mut b = Fnv1a::new();
+        b.mix_byte(0x02);
+        assert_ne!(a.finish_nonzero(), b.finish_nonzero(), "distinct bytes → distinct hashes");
+    }
+
+    /// `mix_f64` canonicalizes -0.0 to +0.0 so they hash identically.
+    #[test]
+    fn mix_f64_negative_zero_equals_positive_zero() {
+        let mut a = Fnv1a::new();
+        a.mix_f64(-0.0_f64);
+        let mut b = Fnv1a::new();
+        b.mix_f64(0.0_f64);
+        assert_eq!(a.finish_nonzero(), b.finish_nonzero(), "-0.0 and +0.0 should hash equally");
+    }
+
+    /// `mix_f64` distinguishes distinct nonzero values.
+    #[test]
+    fn mix_f64_distinct_values_differ() {
+        let mut a = Fnv1a::new();
+        a.mix_f64(1.0_f64);
+        let mut b = Fnv1a::new();
+        b.mix_f64(2.0_f64);
+        assert_ne!(a.finish_nonzero(), b.finish_nonzero(), "1.0 and 2.0 hash differently");
+    }
+
+    /// `mix_opt_beta(Some([]))` and `mix_opt_beta(None)` produce different hashes.
+    #[test]
+    fn mix_opt_beta_none_differs_from_empty_some() {
+        let mut a = Fnv1a::new();
+        a.mix_opt_beta(0, None);
+        let mut b = Fnv1a::new();
+        b.mix_opt_beta(0, Some(&array![]));
+        assert_ne!(a.finish_nonzero(), b.finish_nonzero(), "None vs Some([]) must differ");
+    }
+
+    /// `mix_opt_beta` with two different arrays produces different hashes.
+    #[test]
+    fn mix_opt_beta_different_arrays_differ() {
+        let v1 = array![1.0_f64, 2.0, 3.0];
+        let v2 = array![1.0_f64, 2.0, 4.0];
+        let mut a = Fnv1a::new();
+        a.mix_opt_beta(0, Some(&v1));
+        let mut b = Fnv1a::new();
+        b.mix_opt_beta(0, Some(&v2));
+        assert_ne!(a.finish_nonzero(), b.finish_nonzero(), "distinct arrays → distinct hashes");
+    }
+
+    /// `mix_opt_beta` with the same array produces the same hash (determinism).
+    #[test]
+    fn mix_opt_beta_same_array_deterministic() {
+        let v = array![3.14_f64, -2.71, 0.0];
+        let mut a = Fnv1a::new();
+        a.mix_opt_beta(1, Some(&v));
+        let mut b = Fnv1a::new();
+        b.mix_opt_beta(1, Some(&v));
+        assert_eq!(a.finish_nonzero(), b.finish_nonzero(), "same array → same hash");
+    }
+}
