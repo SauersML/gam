@@ -2141,9 +2141,25 @@ fn test_build_bspline_basis_1d_quantile_uses_divided_difference_penalty() {
     let g = penalty_greville_abscissae_for_knots(knots, spec.degree)
         .unwrap()
         .unwrap_or_else(|| panic!("{} failed", "quantile knots should trigger Greville scaling"));
-    let expected =
+    let expected_raw =
         create_difference_penalty_matrix(built_design.ncols(), spec.penalty_order, Some(g.view()))
             .unwrap();
+    // Since #1365 the shipped B-spline bending penalty is Frobenius-normalized
+    // (`normalize_penalty`) so the REML λ-search sees a unit-Frobenius block on
+    // a basis-independent scale; `built.penalties[0]` is therefore `S/‖S‖_F`,
+    // not the raw divided-difference matrix. The test's claim — that quantile
+    // (non-uniform) knots use the Greville-scaled divided-difference penalty —
+    // holds up to that normalization, so compare against the normalized oracle.
+    // (The earlier raw comparison mismatched by ~1e4 purely from the missing
+    // 1/‖S‖_F factor: this data's 0.45→10 gap makes the raw Greville-scaled
+    // entries large.)
+    let frob = expected_raw
+        .iter()
+        .map(|v| v * v)
+        .sum::<f64>()
+        .sqrt()
+        .max(1e-12);
+    let expected = expected_raw.mapv(|v| v / frob);
 
     let got = &built.penalties[0];
     let mut max_abs = 0.0_f64;
