@@ -1809,54 +1809,46 @@ pub fn build_smooth_basis(
         let penalty_order = option_usize(options, "penalty_order")
             .unwrap_or(if effective_degree > 1 { 2 } else { 1 })
             .min(effective_degree);
-        // mgcv's `bs="sz"` builds the per-level deviation curves on a CUBIC
-        // REGRESSION SPLINE marginal (`cr`): quantile-placed knots with the
-        // integrated-squared-second-derivative penalty, NOT a uniform-knot
-        // B-spline with a difference penalty (#1074). On a smooth signal like
-        // sin(2*pi*x) the cr marginal recovers the per-group curves more
-        // efficiently than the B-spline margin gam used to hand it — the same
-        // marginal-basis gap seen in the te_3d cr comparison. Match mgcv: place
-        // the sz marginal on cr knots (k = internal + degree + 1, floored at the
-        // cr minimum of 3) when the caller has not overridden the degree. `fs`
-        // and `re` keep the B-spline marginal: `fs` is a random-effect-style
-        // smooth that penalizes the whole per-level coefficient (the difference
-        // penalty + null-space ridge is what makes its partial pooling work) and
-        // `re` is the raw linear effect handled above.
-        let sz_uses_cr = type_opt.as_str() == "sz" && effective_degree == DEFAULT_BSPLINE_DEGREE;
-        // The `sz` cr marginal is capped to the covariate's data support exactly
-        // like the univariate `cr`/`cs` path (#1542): `select_cr_knots` cannot
-        // place more value-knots than there are distinct covariate values, so an
-        // unclamped marginal `k` on a low-cardinality covariate (a 3-level ordinal,
-        // a small count) used to hard-fail the whole factor smooth instead of
-        // reducing like mgcv — while the B-spline-marginal `fs` sibling fit the
-        // identical data. Below the cr minimum (a binary covariate) degrade to the
-        // B-spline marginal `fs` already uses, keeping the `sz` deviation flavour.
-        let marginal_knotspec = if sz_uses_cr {
-            let k_cr = (n_knots + effective_degree + 1).max(CR_MIN_KNOTS);
-            match capped_cr_marginal_knotspec(
-                ds.values.column(c),
-                k_cr,
-                &vars.join(","),
-                inference_notes,
-            )? {
-                Some(cr_knotspec) => cr_knotspec,
-                None => resolve_nonperiodic_bspline_knotspec(
-                    options,
-                    ds.values.column(c),
-                    (minv, maxv),
-                    effective_degree,
-                    n_knots,
-                )?,
-            }
-        } else {
-            resolve_nonperiodic_bspline_knotspec(
-                options,
-                ds.values.column(c),
-                (minv, maxv),
-                effective_degree,
-                n_knots,
-            )?
-        };
+        // All factor-smooth flavours (`fs`, `sz`, `re`) place their per-level
+        // marginal on the SAME penalized B-spline (P-spline) basis. The flavours
+        // differ ONLY in their penalty/constraint structure (handled below) —
+        // sz: zero-sum deviation blocks with the per-level null space left
+        // unpenalized; fs: random-effect double penalty; re: identity ridge.
+        //
+        // `sz` USED to route its default-degree marginal to a NATURAL cubic
+        // regression spline (`cr`), on the belief that mgcv's `bs="sz"` does the
+        // same and that cr recovers smooth signals more efficiently than the
+        // (then uncapped) B-spline margin (#1074). That introduced a consistency
+        // failure (#1605): the `cr` basis enforces the natural boundary
+        // conditions f''(x_1)=f''(x_k)=0 and extrapolates linearly past the end
+        // knots, so it CANNOT represent a per-group deviation curve with non-zero
+        // curvature at the data boundary. Phase-shifted deviation shapes
+        // (f''(0) = -(2π)² sin(φ) ≠ 0) are then biased toward "free linear +
+        // anchored wiggle", under-shooting the amplitude — a bias that does NOT
+        // vanish as n→∞ (n-independent: a genuine consistency failure, not
+        // finite-sample shrinkage). The earlier #700/#1074 sz fixtures used
+        // d_g ∝ sin(2πx), whose f'' happens to vanish at x=0 and x=1, so they
+        // accidentally satisfied the natural BC and never exposed the gap; the
+        // `fs` sibling, on this very B-spline marginal, recovers the SAME
+        // phase-shifted data to the noise floor.
+        //
+        // The penalized B-spline marginal makes no boundary assumption, so it
+        // represents arbitrary deviation shapes, and — with the
+        // FACTOR_SMOOTH_DEFAULT_BASIS_DIM cap above already removing the
+        // noise-fitting capacity that originally motivated leaving B-splines —
+        // it recovers the BC-satisfying #700/#1074 signals just as well. Sharing
+        // one marginal basis across all flavours also lets the B-spline degree/
+        // knot degradation handle low-cardinality covariates uniformly (what
+        // `fs` already does), so the `sz`-only cr data-support cap (#1541/#1542)
+        // — and the asymmetry where only the cr-marginal `sz` spelling hard-
+        // failed a 3-level ordinal — is no longer needed.
+        let marginal_knotspec = resolve_nonperiodic_bspline_knotspec(
+            options,
+            ds.values.column(c),
+            (minv, maxv),
+            effective_degree,
+            n_knots,
+        )?;
         let marginal = BSplineBasisSpec {
             degree: effective_degree,
             penalty_order,
@@ -5132,10 +5124,15 @@ mod tests {
     }
 
     #[test]
-    fn sz_factor_smooth_caps_cr_marginal_to_data_support() {
-        // #1542: the `sz` factor-smooth cr MARGINAL must cap to the data support
-        // too, not hard-fail. On a ternary covariate the marginal is a cr basis
-        // of exactly 3 value-knots (full-rank for the data).
+    fn sz_factor_smooth_low_cardinality_uses_bspline_marginal() {
+        // #1605: the `sz` factor-smooth marginal is the SAME penalized B-spline
+        // the `fs` sibling uses — NOT a natural cubic regression (`cr`) marginal,
+        // whose hard natural boundary conditions f''=0 bias curved deviations
+        // (a consistency failure). #1542 (the reason this test exists) is
+        // subsumed: with a B-spline marginal a low-cardinality covariate no
+        // longer needs a special cr data-support cap and can never hard-fail the
+        // way the old cr-marginal `sz` spelling did — the build just succeeds,
+        // exactly as `fs` already does on the identical data.
         let ds = ternary_factor_dataset();
         let col_map = ds.column_map();
         let parsed = parse_formula("y ~ s(x, g, bs=sz, k=10)").expect("parse sz factor smooth");
@@ -5147,22 +5144,19 @@ mod tests {
             &mut notes,
             &gam_runtime::resource::ResourcePolicy::default_library(),
         )
-        .expect("sz k=10 must cap the cr marginal instead of erroring");
+        .expect("sz on a ternary covariate must build (B-spline marginal), not hard-fail");
         let SmoothBasisSpec::FactorSmooth { spec } = &terms.smooth_terms[0].basis else {
             panic!("expected FactorSmooth for s(x, g, bs=sz)");
         };
-        let BSplineKnotSpec::NaturalCubicRegression { knots } = &spec.marginal.knotspec else {
-            panic!(
-                "expected cr marginal knotspec, got {:?}",
-                spec.marginal.knotspec
-            );
-        };
-        assert_eq!(
-            knots.len(),
-            3,
-            "sz cr marginal not capped to 3 distinct values"
+        assert!(
+            !matches!(
+                spec.marginal.knotspec,
+                BSplineKnotSpec::NaturalCubicRegression { .. }
+            ),
+            "sz marginal must be a B-spline (curvature-capable), not the \
+             natural-BC cr basis; got {:?}",
+            spec.marginal.knotspec
         );
-        assert_eq!(knots.as_slice().unwrap(), &[0.0, 1.0, 2.0]);
     }
 
     /// #1457: `y ~ s(x, by=g) + g` with a BARE categorical `g` must NOT lower to
