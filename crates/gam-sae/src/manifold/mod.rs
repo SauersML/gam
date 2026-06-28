@@ -149,6 +149,9 @@ mod tests_parallelism_invariance_1557;
 mod tests_olmo;
 
 #[cfg(test)]
+mod tests_row_jet_and_outer_objective_780;
+
+#[cfg(test)]
 mod sae_contract_probe_tests;
 
 #[cfg(test)]
