@@ -202,4 +202,7 @@ mod binomial;
 pub use binomial::*;
 
 #[cfg(test)]
+mod test_support;
+
+#[cfg(test)]
 mod tests;

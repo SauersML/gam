@@ -15,8 +15,8 @@ use super::binomial_q_derivs::{
 };
 use super::dispersion_family::{
     DISPERSION_ETA_CLAMP, DISPERSION_MIN_CURVATURE, DispersionRowKernel, dispersion_row_kernel,
-    dispersion_tweedie_nll_generic,
 };
+use super::test_support::dispersion_tweedie_nll_generic;
 
 /// Dense `Tower4<2>` Tweedie row NLL oracle: the #932 all-channels instantiation
 /// of the single-source [`dispersion_tweedie_nll_generic`] that production runs
