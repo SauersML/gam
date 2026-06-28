@@ -373,4 +373,102 @@ mod tests {
             "parallel-dω boundary case shifted: max err = {max_err:.3e}"
         );
     }
+
+    #[test]
+    fn rho_so2_at_zero_is_identity() {
+        let theta = ndarray::array![0.0_f64];
+        let r = rho_so2(theta.view());
+        assert_eq!(r.dim(), (1, 2, 2));
+        assert!((r[[0, 0, 0]] - 1.0).abs() < 1e-15);
+        assert!(r[[0, 0, 1]].abs() < 1e-15);
+        assert!(r[[0, 1, 0]].abs() < 1e-15);
+        assert!((r[[0, 1, 1]] - 1.0).abs() < 1e-15);
+    }
+
+    #[test]
+    fn rho_so2_quarter_turn_is_correct() {
+        let theta = ndarray::array![std::f64::consts::FRAC_PI_2];
+        let r = rho_so2(theta.view());
+        // [[0, -1], [1, 0]]
+        assert!(r[[0, 0, 0]].abs() < 1e-15, "cos(π/2)={}", r[[0, 0, 0]]);
+        assert!((r[[0, 0, 1]] + 1.0).abs() < 1e-15, "-sin(π/2)={}", r[[0, 0, 1]]);
+        assert!((r[[0, 1, 0]] - 1.0).abs() < 1e-15, "sin(π/2)={}", r[[0, 1, 0]]);
+        assert!(r[[0, 1, 1]].abs() < 1e-15, "cos(π/2)={}", r[[0, 1, 1]]);
+    }
+
+    #[test]
+    fn rho_so2_output_is_orthogonal_batch() {
+        // Rᵀ·R = I₂ for arbitrary angles.
+        let thetas = ndarray::array![0.0_f64, 1.0, -2.5, std::f64::consts::PI];
+        let r = rho_so2(thetas.view());
+        for k in 0..4 {
+            for i in 0..2 {
+                for j in 0..2 {
+                    let rtij: f64 = (0..2).map(|m| r[[k, m, i]] * r[[k, m, j]]).sum();
+                    let want = if i == j { 1.0 } else { 0.0 };
+                    assert!((rtij - want).abs() < 1e-14, "RᵀR[{i},{j}] at k={k}: {rtij}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rho_so2_jvp_at_zero_is_antisymmetric_generator() {
+        // d/dθ R(0) = [[0,-1],[1,0]], the Lie algebra generator of SO(2).
+        let theta = ndarray::array![0.0_f64];
+        let jvp = rho_so2_jvp(theta.view());
+        assert!(jvp[[0, 0, 0]].abs() < 1e-15);
+        assert!((jvp[[0, 0, 1]] + 1.0).abs() < 1e-15);
+        assert!((jvp[[0, 1, 0]] - 1.0).abs() < 1e-15);
+        assert!(jvp[[0, 1, 1]].abs() < 1e-15);
+    }
+
+    #[test]
+    fn rho_so3_single_at_zero_is_identity() {
+        let r = rho_so3_single(0.0, 0.0, 0.0);
+        for i in 0..3 {
+            for j in 0..3 {
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!((r[i][j] - want).abs() < 1e-12, "R[{i},{j}]={}", r[i][j]);
+            }
+        }
+    }
+
+    #[test]
+    fn rho_so3_single_is_orthogonal_and_det_one() {
+        let r = rho_so3_single(0.5, -0.3, 0.7);
+        for i in 0..3 {
+            for j in 0..3 {
+                let rtij: f64 = (0..3).map(|m| r[m][i] * r[m][j]).sum();
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!((rtij - want).abs() < 1e-12, "RᵀR[{i},{j}]={rtij}");
+            }
+        }
+        let det = r[0][0] * (r[1][1] * r[2][2] - r[1][2] * r[2][1])
+            - r[0][1] * (r[1][0] * r[2][2] - r[1][2] * r[2][0])
+            + r[0][2] * (r[1][0] * r[2][1] - r[1][1] * r[2][0]);
+        assert!((det - 1.0).abs() < 1e-12, "det(R)={det}");
+    }
+
+    #[test]
+    fn rho_so3_ncols_mismatch_returns_error() {
+        let bad = ndarray::Array2::from_shape_vec((2, 2), vec![0.0_f64; 4]).unwrap();
+        assert!(rho_so3(bad.view()).is_err());
+    }
+
+    #[test]
+    fn rho_dispatch_r1_returns_one_by_one_identity() {
+        let g = ndarray::ArrayD::<f64>::from_elem(ndarray::IxDyn(&[3]), 0.5_f64);
+        let out = rho("R1", g.view()).unwrap();
+        assert_eq!(out.shape(), &[3, 1, 1]);
+        for v in out.iter() {
+            assert!((*v - 1.0).abs() < 1e-15);
+        }
+    }
+
+    #[test]
+    fn rho_dispatch_unknown_group_returns_error() {
+        let g = ndarray::ArrayD::<f64>::zeros(ndarray::IxDyn(&[1]));
+        assert!(rho("UNKNOWN_GROUP_XYZ", g.view()).is_err());
+    }
 }
