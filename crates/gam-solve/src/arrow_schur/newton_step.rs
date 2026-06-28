@@ -80,18 +80,26 @@ pub fn solve_arrow_newton_step_with_options(
     // can alias htt_factors directly; otherwise pay a second per-row
     // Cholesky (O(N d³), same complexity class as the Newton solve).
     let htt_factors = step.htt_factors;
-    let (htt_factors_undamped, gauge_deflated_directions) = if ridge_t == 0.0 {
-        (
-            ArrowUndampedFactors::SameAsDamped,
-            step.gauge_deflated_directions,
-        )
-    } else {
-        let undamped = factor_blocks_for_system(sys, 0.0, options, &backend)?;
-        (
-            ArrowUndampedFactors::Owned(undamped.factors),
-            undamped.gauge_deflated_directions,
-        )
-    };
+    // The per-row deflated directions must describe the factors the gradient's
+    // selected-inverse actually uses. For the ridge-0 evidence cache the damped
+    // and undamped factors coincide, so the step's directions apply directly;
+    // for a damped Newton cache (ridge_t > 0, never the gradient path) re-derive
+    // them from the undamped factorization alongside its deflation count.
+    let (htt_factors_undamped, gauge_deflated_directions, deflated_row_directions) =
+        if ridge_t == 0.0 {
+            (
+                ArrowUndampedFactors::SameAsDamped,
+                step.gauge_deflated_directions,
+                step.deflated_row_directions,
+            )
+        } else {
+            let undamped = factor_blocks_for_system(sys, 0.0, options, &backend)?;
+            (
+                ArrowUndampedFactors::Owned(undamped.factors),
+                undamped.gauge_deflated_directions,
+                undamped.deflated_row_directions,
+            )
+        };
     let mut cache = ArrowFactorCache {
         htt_factors,
         htt_factors_undamped,
@@ -109,6 +117,7 @@ pub fn solve_arrow_newton_step_with_options(
         row_hessian_fingerprint: sys.current_row_hessian_fingerprint(),
         pcg_diagnostics: step.pcg_diagnostics,
         gauge_deflated_directions,
+        deflated_row_directions: Arc::from(deflated_row_directions),
         cross_row_woodbury: None,
     };
     let mut delta_t = step.delta_t;
@@ -378,6 +387,7 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
     options: &ArrowSolveOptions,
     backend: &CpuBatchedBlockSolver,
     gauge_deflated_directions: usize,
+    deflated_row_directions: &[Vec<Array1<f64>>],
 ) -> Option<Result<ArrowNewtonStepArtifacts, ArrowSchurError>> {
     if options.mode != ArrowSolverMode::Direct {
         return None;
@@ -462,6 +472,7 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
                 schur_factor: Some(schur_factor),
                 pcg_diagnostics: diag,
                 gauge_deflated_directions,
+                deflated_row_directions: deflated_row_directions.to_vec(),
             }))
         }
         // A non-PD per-row / Schur condition is a real numerical signal the LM
@@ -919,11 +930,20 @@ pub(crate) struct ArrowNewtonStepArtifacts {
     pub(crate) schur_factor: Option<Array2<f64>>,
     pub(crate) pcg_diagnostics: PcgDiagnostics,
     pub(crate) gauge_deflated_directions: usize,
+    /// Per-row unit-norm deflated directions surfaced for the outer-gradient
+    /// deflation correction (see [`ArrowBlockFactorization::deflated_row_directions`]).
+    pub(crate) deflated_row_directions: Vec<Vec<Array1<f64>>>,
 }
 
 pub(crate) struct ArrowBlockFactorization {
     pub(crate) factors: ArrowFactorSlab,
     pub(crate) gauge_deflated_directions: usize,
+    /// Per-row unit-norm deflated directions `vᵢ` (in each row's `d`-dim block
+    /// coordinates) stiffened to UNIT stiffness in this undamped evidence
+    /// factorization. Indexed by row; empty for every row factored without
+    /// deflation. Surfaced so the outer ρ/θ-gradient traces can exclude the
+    /// deflated subspace from the `½ tr(H_deflated⁻¹ ∂H_raw/∂ρ)` contraction.
+    pub(crate) deflated_row_directions: Vec<Vec<Array1<f64>>>,
 }
 
 pub(crate) fn factor_blocks_for_system<B: BatchedBlockSolver>(
@@ -941,10 +961,13 @@ pub(crate) fn factor_blocks_for_system<B: BatchedBlockSolver>(
                 options.tolerate_ill_conditioning,
             )?,
             gauge_deflated_directions: 0,
+            deflated_row_directions: Vec::new(),
         });
     };
     let mut blocks = Vec::with_capacity(sys.rows.len());
     let mut count = 0usize;
+    let mut deflated_row_directions: Vec<Vec<Array1<f64>>> =
+        Vec::with_capacity(sys.rows.len());
     for (row_idx, row) in sys.rows.iter().enumerate() {
         let result = factor_one_row_result(
             row,
@@ -960,11 +983,13 @@ pub(crate) fn factor_blocks_for_system<B: BatchedBlockSolver>(
             true,
         )?;
         count += result.gauge_deflated_directions;
+        deflated_row_directions.push(result.deflated_directions);
         blocks.push(result.factor);
     }
     Ok(ArrowBlockFactorization {
         factors: ArrowFactorSlab::from_blocks(blocks),
         gauge_deflated_directions: count,
+        deflated_row_directions,
     })
 }
 
@@ -1527,6 +1552,7 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
             schur_factor,
             pcg_diagnostics: PcgDiagnostics::default(),
             gauge_deflated_directions: 0,
+            deflated_row_directions: Vec::new(),
         });
     }
     let backend = CpuBatchedBlockSolver;
@@ -1537,6 +1563,7 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
     let block_factorization = factor_blocks_for_system(sys, ridge_t, options, &backend)?;
     let htt_factors = block_factorization.factors;
     let gauge_deflated_directions = block_factorization.gauge_deflated_directions;
+    let deflated_row_directions = block_factorization.deflated_row_directions;
 
     // 2. Reduced RHS r_β = -g_β + Σ_i H_βt^(i) (H_tt^(i))⁻¹ g_t^(i).
     let rhs_beta = reduced_rhs_beta(sys, &htt_factors, &backend);
@@ -1564,6 +1591,7 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
                 options,
                 &backend,
                 gauge_deflated_directions,
+                &deflated_row_directions,
             ) {
                 return device_step;
             }
@@ -1593,6 +1621,7 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
                             schur_factor: Some(schur_factor),
                             pcg_diagnostics,
                             gauge_deflated_directions,
+                            deflated_row_directions,
                         });
                     }
                     MixedPrecisionAttempt::Fallback { reason } => {
@@ -1632,6 +1661,7 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
                             schur_factor: Some(schur_factor),
                             pcg_diagnostics,
                             gauge_deflated_directions,
+                            deflated_row_directions,
                         });
                     }
                     MixedPrecisionAttempt::Fallback { reason } => {
@@ -1688,6 +1718,7 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
                             schur_factor: None,
                             pcg_diagnostics: diag,
                             gauge_deflated_directions,
+                            deflated_row_directions,
                         });
                     }
                 }
@@ -1723,6 +1754,7 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
         schur_factor,
         pcg_diagnostics,
         gauge_deflated_directions,
+        deflated_row_directions,
     })
 }
 
@@ -2180,6 +2212,10 @@ pub(crate) fn solve_arrow_newton_step_cross_row(
         schur_factor: Some(precond.schur_factor),
         pcg_diagnostics: diag,
         gauge_deflated_directions: 0,
+        // The cross-row-penalty CG preconditioner path does not run the SAE
+        // evidence per-row spectral/gauge deflation, so no λ̃ = 1 directions are
+        // surfaced (the outer-gradient deflation correction is a no-op here).
+        deflated_row_directions: Vec::new(),
     })
 }
 

@@ -7138,8 +7138,14 @@ impl SaeManifoldTerm {
         cache: &ArrowFactorCache,
         solver: &DeflatedArrowSolver<'_>,
     ) -> Result<Vec<Array1<f64>>, ArrowSchurError> {
+        // Kept-subspace inverse diagonal: exclude the UNIT-stiffness deflated
+        // directions so the ARD precision trace `½ tr(H⁻¹ ∂H/∂ρ_ard)` is not
+        // biased by the deflated inverse's spurious `1/λ̃ = 1` on a per-row block
+        // direction that overlaps a coordinate slot (the deflation acts on the
+        // whole per-row `H_tt`, so it corrupts every ρ-component's trace, not just
+        // the IBP α one).
         let inv_diag = solver
-            .latent_inverse_diagonal()
+            .latent_inverse_diagonal_kept()
             .map_err(|err| ArrowSchurError::SchurFactorFailed { reason: err })?;
         let n = self.n_obs();
         let coord_offsets = self.assignment.coord_offsets();
@@ -7373,8 +7379,13 @@ impl SaeManifoldTerm {
             // per active atom. The diagonal selected inverse gives each slot's
             // (H⁻¹)_{slot,slot}.
             let assignment_dim = self.assignment.assignment_coord_dim();
+            // Kept-subspace inverse diagonal: the deflated inverse assigns
+            // `1/λ̃ = 1` to each per-row UNIT-stiffness direction `vᵢ`, so a raw
+            // diagonal `D` contraction would spuriously add `½ Σ_i vᵢᵀ D vᵢ` (a
+            // ρ-independent direction must add 0). `latent_inverse_diagonal_kept`
+            // removes that per-row deflated diagonal centrally.
             let inv_diag = solver
-                .latent_inverse_diagonal()
+                .latent_inverse_diagonal_kept()
                 .map_err(|err| format!("assignment_log_strength_hessian_trace: {err}"))?;
             let mut trace = 0.0_f64;
             for row in 0..self.n_obs() {
@@ -7424,8 +7435,15 @@ impl SaeManifoldTerm {
         if hdiag.is_empty() {
             return Ok(0.0);
         }
+        // Kept-subspace inverse diagonal: the deflated inverse assigns
+        // `1/λ̃ = 1` to each per-row UNIT-stiffness direction `vᵢ`, so a raw
+        // diagonal contraction would spuriously add `½ Σ_i vᵢᵀ (∂H_p/∂ρ) vᵢ` (a
+        // ρ-independent direction must add 0). `latent_inverse_diagonal_kept`
+        // removes that per-row deflated diagonal centrally; the cross-row
+        // off-diagonal pass below contracts only DISTINCT rows `i ≠ j`, off any
+        // single-row `vᵢ`'s support, so it needs no deflation correction.
         let inv_diag = solver
-            .latent_inverse_diagonal()
+            .latent_inverse_diagonal_kept()
             .map_err(|err| format!("assignment_log_strength_hessian_trace: {err}"))?;
         let assignment_dim = self.assignment.assignment_coord_dim();
         let mut trace = 0.0_f64;
@@ -7731,6 +7749,39 @@ impl SaeManifoldTerm {
                     }
                     let kw = (var_atom[a] + 1 + var_atom[b] + 1) as f64;
                     trace += kw * inv_vv[[b, a]] * h_ab;
+                }
+            }
+            // Deflation correction (kept-subspace restriction). The selected
+            // inverse `inv_vv` is the DEFLATED inverse: each per-row UNIT-stiffness
+            // direction `vᵢ` (`λ̃ = 1`) makes the t–t contraction above spuriously
+            // add `½ inv_alpha1 · vᵢᵀ (∂H_data/∂logα)_tt vᵢ`, a contribution that
+            // must be 0 since `vᵢ` is ρ/θ-independent. The t–t block of
+            // `∂H_data/∂logα` is `kw_ab·⟨J_a, J_b⟩` (the SAME operator the trace
+            // contracts), and `vᵢ` is supported on this row's `q`-dim block, so
+            // subtract `Σ_{a,b} vᵢ[a]·vᵢ[b]·kw_ab·⟨J_a, J_b⟩`. The t–β/β–β blocks
+            // are not deflated (the deflation acts on the per-row `H_tt`), so only
+            // the t–t self-contraction is removed.
+            let dirs = cache
+                .deflated_row_directions
+                .get(row)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            for v in dirs {
+                for a in 0..q {
+                    if a >= v.len() || v[a] == 0.0 {
+                        continue;
+                    }
+                    for b in 0..q {
+                        if b >= v.len() || v[b] == 0.0 {
+                            continue;
+                        }
+                        let h_ab = sae_dot(&jets.first[a], &jets.first[b]);
+                        if h_ab == 0.0 {
+                            continue;
+                        }
+                        let kw = (var_atom[a] + 1 + var_atom[b] + 1) as f64;
+                        trace -= kw * v[a] * v[b] * h_ab;
+                    }
                 }
             }
             // t–β and β–t blocks: appear symmetrically, contract once with the
@@ -8875,6 +8926,18 @@ impl SaeManifoldTerm {
                     }
                     _ => None,
                 };
+            // Per-row UNIT-stiffness deflated directions: the selected inverse
+            // `inv_vv` is the DEFLATED inverse (it assigns `1/λ̃ = 1` to each
+            // `vᵢ`), so every `inv_vv`-weighted t–t contraction of `∂H/∂θ_w`
+            // below spuriously includes `vᵢᵀ (∂H_tt/∂θ_w) vᵢ` — a contribution
+            // that must be 0 because `vᵢ` is θ-independent. The kept-subspace Γ
+            // subtracts `Σ_i vᵢ[a]·vᵢ[b]·(∂H_ab/∂θ_w)` over the t–t block (the
+            // t–β / β–β blocks are not deflated).
+            let defl_dirs = cache
+                .deflated_row_directions
+                .get(row)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
             for w in 0..q {
                 let mut gamma = 0.0_f64;
                 // The active logit `w` differentiates against; `None` unless this
@@ -8921,6 +8984,15 @@ impl SaeManifoldTerm {
                             };
                         }
                         gamma += inv_vv[[b, a]] * dh;
+                        if !defl_dirs.is_empty() && dh != 0.0 {
+                            let mut vv = 0.0_f64;
+                            for v in defl_dirs {
+                                if a < v.len() && b < v.len() {
+                                    vv += v[a] * v[b];
+                                }
+                            }
+                            gamma -= vv * dh;
+                        }
                     }
                 }
                 for a in 0..q {
@@ -8947,6 +9019,15 @@ impl SaeManifoldTerm {
                         let dh = sae_dot(&jets.beta_l_deriv[a][w_beta_pos], &jets.first[b])
                             + sae_dot(&jets.first[a], &jets.beta_l_deriv[b][w_beta_pos]);
                         gamma += inv_vv[[b, a]] * dh;
+                        if !defl_dirs.is_empty() && dh != 0.0 {
+                            let mut vv = 0.0_f64;
+                            for v in defl_dirs {
+                                if a < v.len() && b < v.len() {
+                                    vv += v[a] * v[b];
+                                }
+                            }
+                            gamma -= vv * dh;
+                        }
                     }
                 }
                 for a in 0..q {

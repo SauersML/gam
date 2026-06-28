@@ -3354,6 +3354,7 @@ mod tests {
             row_hessian_fingerprint: 0,
             pcg_diagnostics: crate::arrow_schur::PcgDiagnostics::default(),
             gauge_deflated_directions: 0,
+            deflated_row_directions: std::sync::Arc::from(Vec::new()),
             cross_row_woodbury: None,
         }
     }
@@ -3406,6 +3407,7 @@ mod tests {
             row_hessian_fingerprint: 0,
             pcg_diagnostics: crate::arrow_schur::PcgDiagnostics::default(),
             gauge_deflated_directions: 0,
+            deflated_row_directions: std::sync::Arc::from(Vec::new()),
             cross_row_woodbury: None,
         }
     }

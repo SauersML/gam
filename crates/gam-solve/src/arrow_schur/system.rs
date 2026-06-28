@@ -2372,6 +2372,22 @@ pub struct ArrowFactorCache {
     /// nothing to the Laplace normalizer (the quotient pseudo-determinant
     /// convention, cf. `PenaltyPseudologdet`). Zero theta/rho dependence.
     pub gauge_deflated_directions: usize,
+    /// Per-row unit-norm directions `vᵢ` (in each row's `d`-dim latent block
+    /// coordinates) that an undamped evidence factorization stiffened to UNIT
+    /// stiffness `λ̃ = 1` (gauge or spectral deflation). Indexed by row; empty
+    /// for every PD row factored without deflation, and empty overall on the
+    /// non-deflating solver paths (streaming / cross-row-penalty CG / device).
+    ///
+    /// A deflated direction contributes `log(1) = 0` to the row-block log-det
+    /// and is ρ/θ-INDEPENDENT, so its true contribution to `∂log|H|/∂ρ` is `0`.
+    /// The analytic outer-gradient traces (`assignment_log_strength_hessian_trace`,
+    /// `learnable_ibp_data_logdet_alpha_trace`, `logdet_theta_adjoint`) contract
+    /// `∂H_raw/∂ρ` (the RAW, pre-deflation block derivative) against the DEFLATED
+    /// inverse, which assigns `1/λ̃ = 1` to each `vᵢ` and therefore spuriously
+    /// adds `½ vᵢᵀ (∂H_raw/∂ρ) vᵢ`. Those traces subtract this per-row term
+    /// (kept-subspace restriction) using these directions; without them the
+    /// REML outer ρ-gradient is biased by `+Σ_deflated ½ vᵢᵀ ∂H_raw/∂ρ vᵢ`.
+    pub deflated_row_directions: Arc<[Vec<Array1<f64>>]>,
     /// Exact cross-row IBP rank-`R` Woodbury correction (#1038), present iff the
     /// source system carried an [`IbpCrossRowSource`]. When set, the per-row
     /// factors above are of the NO-SELF base `H₀'` (self term `d_k·z'_ik²`

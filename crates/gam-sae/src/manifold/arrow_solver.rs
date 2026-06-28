@@ -140,6 +140,39 @@ impl<'a> DeflatedArrowSolver<'a> {
         })
     }
 
+    /// Per-row latent-block inverse diagonal with the UNIT-stiffness deflated
+    /// subspace REMOVED — the kept-subspace selected inverse the outer ρ/θ
+    /// gradient diagonal traces must contract against.
+    ///
+    /// [`Self::latent_inverse_diagonal`] returns the diagonal of the DEFLATED
+    /// inverse, which assigns `1/λ̃ = 1` to every per-row direction `vᵢ` that the
+    /// undamped evidence factor stiffened to unit curvature; a `½ tr(H⁻¹ ∂H/∂ρ)`
+    /// diagonal contraction against it therefore spuriously includes
+    /// `Σ_i vᵢ[s]²` at slot `s`, a ρ/θ-independent contribution that must be 0.
+    /// This variant subtracts the per-row deflated outer-product diagonal
+    /// `Σ_i vᵢ[s]²` so the diagonal traces (ARD precision, IBP/softmax assignment
+    /// log-strength) see only the kept subspace. The deflated subspace's β-Schur
+    /// coupling is higher order and left to the per-block subtraction the
+    /// off-diagonal (`solve`-based) traces apply directly.
+    pub(crate) fn latent_inverse_diagonal_kept(&self) -> Result<Array1<f64>, String> {
+        let mut out = self.latent_inverse_diagonal()?;
+        let cache = self.cache;
+        for (row, dirs) in cache.deflated_row_directions.iter().enumerate() {
+            if dirs.is_empty() {
+                continue;
+            }
+            let base = cache.row_offsets[row];
+            for v in dirs {
+                for s in 0..v.len() {
+                    if base + s < out.len() {
+                        out[base + s] -= v[s] * v[s];
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub(crate) fn latent_inverse_diagonal(&self) -> Result<Array1<f64>, String> {
         if self.woodbury_factor.is_none() {
             return self

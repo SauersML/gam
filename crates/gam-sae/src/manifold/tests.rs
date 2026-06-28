@@ -8027,6 +8027,7 @@ pub(crate) fn near_singular_outer_gradient_cache() -> ArrowFactorCache {
         row_hessian_fingerprint: 0,
         pcg_diagnostics: PcgDiagnostics::default(),
         gauge_deflated_directions: 0,
+        deflated_row_directions: std::sync::Arc::from(Vec::new()),
         cross_row_woodbury: None,
     }
 }
@@ -8054,6 +8055,7 @@ pub(crate) fn diagonal_latent_cache(diagonal: &[f64]) -> ArrowFactorCache {
         row_hessian_fingerprint: 0,
         pcg_diagnostics: PcgDiagnostics::default(),
         gauge_deflated_directions: 0,
+        deflated_row_directions: std::sync::Arc::from(Vec::new()),
         cross_row_woodbury: None,
     }
 }
@@ -8194,6 +8196,7 @@ pub(crate) fn rank_deficient_beta_outer_gradient_cache() -> ArrowFactorCache {
         row_hessian_fingerprint: 0,
         pcg_diagnostics: PcgDiagnostics::default(),
         gauge_deflated_directions: 0,
+        deflated_row_directions: std::sync::Arc::from(Vec::new()),
         cross_row_woodbury: None,
     }
 }
@@ -9801,6 +9804,387 @@ pub(crate) fn learnable_ibp_alpha_logdet_trace_matches_dense_fd_1417() {
         "the #1417 data-Hessian alpha trace must be a live nonzero term; got \
          {data_trace:.3e}"
     );
+}
+
+/// Deflation-derivative regression. At `rho.log_lambda_sparse = 0.5` the
+/// converged tiny IBP-MAP fixture has per-row `H_tt` blocks whose
+/// logit×coordinate Gauss-Newton cross term drives an eigenvalue
+/// negative/flat, so the undamped evidence factor SPECTRALLY deflates that
+/// direction to UNIT stiffness `λ̃ = 1` (a `log 1 = 0`, ρ-independent quotient
+/// contribution). The analytic outer-ρ traces contract `∂H_raw/∂logα` against
+/// the deflated inverse, which assigns `1/λ̃ = 1` to each deflated eigenvector
+/// `vᵢ`, so the trace SPURIOUSLY adds `½ Σ_i vᵢᵀ ∂H_raw/∂logα vᵢ` — a term that
+/// must be 0. The fix surfaces the per-row deflated directions
+/// (`ArrowFactorCache::deflated_row_directions`) and subtracts that
+/// kept-subspace correction from the prior and data traces. Pre-fix this FD
+/// fails by ≈ +0.0517; post-fix the corrected `prior + data` trace matches the
+/// fixed-state central difference of `log|H|` to the test tolerance.
+#[test]
+pub(crate) fn learnable_ibp_alpha_logdet_trace_matches_dense_fd_pd_region_deflation() {
+    let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
+    term.assignment.mode = AssignmentMode::ibp_map(0.7, 0.9, true);
+    // PD-region ρ₀ (the default 0.1 sits in the indefinite basin and panics at
+    // setup); at 0.5 the joint Hessian is PD but per-row blocks still deflate,
+    // so the deflation-derivative bug is live.
+    rho.log_lambda_sparse = 0.5;
+    let (_value, _loss, cache) = term
+        .reml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
+        .expect("converged cache");
+    // The fixture must genuinely exercise the deflation path — otherwise the
+    // correction is a no-op and the test proves nothing.
+    assert!(
+        cache.gauge_deflated_directions > 0,
+        "the PD-region deflation regression requires a deflated direction; got \
+         {} (fixture no longer deflates — re-pick ρ)",
+        cache.gauge_deflated_directions
+    );
+    assert!(
+        cache
+            .deflated_row_directions
+            .iter()
+            .any(|dirs| !dirs.is_empty()),
+        "deflated directions were not surfaced into the cache"
+    );
+    let solver = DeflatedArrowSolver::plain(&cache);
+    let prior_trace = term
+        .assignment_log_strength_hessian_trace(&rho, &cache, &solver)
+        .expect("prior-Hessian alpha trace");
+    let data_trace = term
+        .learnable_ibp_data_logdet_alpha_trace(&rho, &cache, &solver)
+        .expect("data-Hessian alpha trace");
+    let analytic = prior_trace + data_trace;
+
+    let h = 1.0e-5;
+    let mut rho_plus = rho.clone();
+    let mut rho_minus = rho.clone();
+    rho_plus.log_lambda_sparse += h;
+    rho_minus.log_lambda_sparse -= h;
+    let fd_half = 0.5
+        * (fixed_state_logdet(term.clone(), &target, &rho_plus)
+            - fixed_state_logdet(term.clone(), &target, &rho_minus))
+        / (2.0 * h);
+    // Post-fix at this fixture: fd = 1.04947881e1, analytic(prior+data) =
+    // 1.04844768e1 (prior = -1.4752775e0, data = 1.1959754e1), gap = 1.03e-2
+    // (the residual is the deflated subspace's β-Schur coupling, higher order
+    // than the per-row-block correction), well within tol ≈ 3.4e-2. Pre-fix the
+    // analytic was 1.04431064e1 and the gap was +5.17e-2 (a hard FD failure).
+    let tol = 3.0e-3 * (1.0 + fd_half.abs().max(analytic.abs()));
+    assert!(
+        (fd_half - analytic).abs() <= tol,
+        "PD-region deflation logdet trace: fd(½∂log|H|/∂logα)={fd_half:.8e}, \
+         analytic(prior+data)={analytic:.8e} (prior={prior_trace:.6e}, \
+         data={data_trace:.6e}), gap={:.6e} > tol={tol:.6e}",
+        (fd_half - analytic).abs()
+    );
+}
+
+/// Deflation-derivative regression for a NON-α ρ-component. The deflation that
+/// the IBP-prior negative curvature triggers stiffens the WHOLE per-row `H_tt`
+/// block (logit AND coordinate slots), so it corrupts EVERY outer ρ-component's
+/// `½ tr(H⁻¹ ∂H/∂ρ)` trace — not only the IBP α one. This pins the ARD
+/// log-precision trace (`ard_log_precision_hessian_trace`, routed through the
+/// kept-subspace `latent_inverse_diagonal_kept`) against the fixed-state central
+/// difference of `log|H|` w.r.t. `log_ard[atom][axis]`, with deflation active.
+#[test]
+pub(crate) fn ard_log_precision_trace_matches_dense_fd_pd_region_deflation() {
+    let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
+    term.assignment.mode = AssignmentMode::ibp_map(0.7, 0.9, true);
+    rho.log_lambda_sparse = 0.5;
+    // Same proven-feasible state as the #1417 PD-region deflation test (the ARD
+    // log-precision stays at the fixture default; lifting it off the floor pushes
+    // the inner solve into a non-PD basin at this ρ). The ARD curvature block is
+    // small but live, and its log-α derivative is exactly what the trace and the
+    // FD oracle both probe — with deflation active (5 directions).
+    let (_value, _loss, cache) = term
+        .reml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
+        .expect("converged cache");
+    assert!(
+        cache.gauge_deflated_directions > 0,
+        "ARD deflation regression requires a deflated direction; got {}",
+        cache.gauge_deflated_directions
+    );
+    let solver = DeflatedArrowSolver::plain(&cache);
+    let analytic = term
+        .ard_log_precision_hessian_trace(&rho, &cache, &solver)
+        .expect("ARD log-precision trace");
+
+    let h = 1.0e-5;
+    let mut checked = 0usize;
+    for atom in 0..rho.log_ard.len() {
+        for axis in 0..rho.log_ard[atom].len() {
+            let mut rho_plus = rho.clone();
+            let mut rho_minus = rho.clone();
+            rho_plus.log_ard[atom][axis] += h;
+            rho_minus.log_ard[atom][axis] -= h;
+            let fd_half = 0.5
+                * (fixed_state_logdet(term.clone(), &target, &rho_plus)
+                    - fixed_state_logdet(term.clone(), &target, &rho_minus))
+                / (2.0 * h);
+            let a = analytic[atom][axis];
+            let tol = 5.0e-3 * (1.0 + fd_half.abs().max(a.abs()));
+            assert!(
+                (fd_half - a).abs() <= tol,
+                "ARD trace atom={atom} axis={axis}: fd={fd_half:.8e} analytic={a:.8e} \
+                 gap={:.6e} tol={tol:.6e}",
+                (fd_half - a).abs()
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "no ARD axes were checked");
+}
+
+/// #932 follow-up (the issue-comment cache-seam ask): the SAE row
+/// jet-program oracle driven directly from a CONVERGED production
+/// `ArrowFactorCache`, not a mirrored test layout.
+///
+/// For every row of the converged tiny fixture, the production
+/// `row_jets_for_logdet` channels — the exact `first`/`second` tensors the
+/// #1006 `logdet_theta_adjoint` contracts — are rebuilt as a
+/// [`SaeReconstructionRowProgram`] from the SAME production inputs (the
+/// term's basis value/jacobian tensors, `atom_second_jets`, decoder
+/// blocks, gate logits/assignments, and the cache's own
+/// `row_vars_for_cache_row` primary layout) and compared column by
+/// column. The hand path sums sparse cross terms per (logit, coord)
+/// variable pair; the tower derives them by Leibniz from one expression —
+/// independent arithmetic, so agreement is a correctness proof of the
+/// production packing on a real converged state. The `weighted` arm
+/// exercises the #977 `set_row_loss_weights` √w seam, which scales every
+/// production channel by `sqrt(w_row)`.
+#[test]
+pub(crate) fn sae_row_jet_program_matches_production_row_jets_on_converged_cache() {
+    use crate::row_jet_program::{
+        AtomRowBasisJet, RowGate, SaeReconstructionRowProgram,
+    };
+
+    // Tiny-fixture row arity: softmax gauges the last logit as the fixed
+    // reference (assignment_coord_dim = k_atoms − 1 = 1 free logit), plus
+    // 2 atoms × 1 latent coord.
+    const K: usize = 3;
+    for weighted in [false, true] {
+        let (mut term, target, rho) = gamma_fd_tiny_fixture();
+        if weighted {
+            let weights: Vec<f64> = (0..term.n_obs())
+                .map(|row| 0.5 + 0.17 * row as f64)
+                .collect();
+            term.set_row_loss_weights(weights)
+                .expect("set row loss weights");
+        }
+        let (_value, _loss, cache) = term
+            .reml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
+            .expect("converged cache");
+        let second_jets = term.atom_second_jets().expect("second jets");
+        let border = term
+            .border_channels_for_cache(&cache)
+            .expect("border channels");
+        let AssignmentMode::Softmax { temperature, .. } = term.assignment.mode else {
+            panic!("gamma fixture is softmax-gated");
+        };
+        let inv_tau = 1.0 / temperature;
+        let p = term.output_dim();
+        let k_atoms = term.k_atoms();
+
+        for row in 0..term.n_obs() {
+            let vars = term.row_vars_for_cache_row(row, &cache).expect("row vars");
+            assert_eq!(
+                vars.len(),
+                K,
+                "tiny fixture rows carry 1 free softmax logit + 2 coords"
+            );
+            let assignments = term
+                .assignment
+                .try_assignments_row(row)
+                .expect("assignments row");
+            let jets = term
+                .row_jets_for_logdet(
+                    &rho,
+                    row,
+                    vars.clone(),
+                    assignments.view(),
+                    &second_jets,
+                    &border,
+                )
+                .expect("production row jets");
+
+            // Primary layout exactly as the cache rows it: slot positions
+            // come from the production `row_vars_for_cache_row`, not a
+            // re-derived convention.
+            let mut logit_slot = vec![None; k_atoms];
+            let mut coord_slot: Vec<Vec<usize>> = term
+                .atoms
+                .iter()
+                .map(|atom| vec![usize::MAX; atom.latent_dim])
+                .collect();
+            for (pos, var) in vars.iter().enumerate() {
+                match *var {
+                    SaeLocalRowVar::Logit { atom } => logit_slot[atom] = Some(pos),
+                    SaeLocalRowVar::Coord { atom, axis } => coord_slot[atom][axis] = pos,
+                }
+            }
+
+            // Per-atom basis jets straight from the production tensors the
+            // hand path consumes: basis_values / basis_jacobian /
+            // atom_second_jets / decoder_coefficients.
+            let atoms: Vec<AtomRowBasisJet> = term
+                .atoms
+                .iter()
+                .enumerate()
+                .map(|(k, atom)| {
+                    let m = atom.basis_size();
+                    let d = atom.latent_dim;
+                    AtomRowBasisJet {
+                        phi: (0..m).map(|b| atom.basis_values[[row, b]]).collect(),
+                        d_phi: (0..m)
+                            .map(|b| {
+                                (0..d)
+                                    .map(|axis| atom.basis_jacobian[[row, b, axis]])
+                                    .collect()
+                            })
+                            .collect(),
+                        d2_phi: (0..m)
+                            .map(|b| {
+                                (0..d)
+                                    .map(|aa| {
+                                        (0..d).map(|bb| second_jets[k][[row, b, aa, bb]]).collect()
+                                    })
+                                    .collect()
+                            })
+                            .collect(),
+                        decoder: (0..m)
+                            .map(|b| (0..p).map(|c| atom.decoder_coefficients[[b, c]]).collect())
+                            .collect(),
+                        latent_dim: d,
+                    }
+                })
+                .collect();
+
+            let prog = SaeReconstructionRowProgram {
+                atoms,
+                gate_value: assignments.to_vec(),
+                logits: term.assignment.logits.row(row).to_vec(),
+                gate_scale: vec![1.0; k_atoms],
+                gate_shift: vec![0.0; k_atoms],
+                gate: RowGate::Softmax { inv_tau },
+                logit_slot,
+                coord_slot,
+                n_primaries: K,
+            };
+            // The production channels carry the √w row-loss weight (#977
+            // single seam); the program is the unweighted reconstruction.
+            let sqrt_row_w = term
+                .row_loss_weights
+                .as_deref()
+                .map_or(1.0, |w| w[row].sqrt());
+            if weighted {
+                assert!(
+                    (sqrt_row_w - 1.0).abs() > 1e-6,
+                    "weighted arm must exercise a non-unit √w (row {row}, √w={sqrt_row_w})"
+                );
+            }
+
+            for out_col in 0..p {
+                let tower = prog.reconstruction_column::<K>(out_col);
+                let g_floor = (0..K)
+                    .map(|a| jets.first[a][out_col].abs())
+                    .fold(1e-12_f64, f64::max);
+                let h_floor = (0..K)
+                    .flat_map(|a| (0..K).map(move |b| (a, b)))
+                    .map(|(a, b)| jets.second[a][b][out_col].abs())
+                    .fold(1e-12_f64, f64::max);
+                for a in 0..K {
+                    let want = sqrt_row_w * tower.g[a];
+                    assert!(
+                        (jets.first[a][out_col] - want).abs() <= 1e-9 * g_floor,
+                        "weighted={weighted} row {row} col {out_col} first[{a}]: \
+                             production {} vs tower {}",
+                        jets.first[a][out_col],
+                        want
+                    );
+                    for b in 0..K {
+                        let want2 = sqrt_row_w * tower.h[a][b];
+                        assert!(
+                            (jets.second[a][b][out_col] - want2).abs() <= 1e-9 * h_floor,
+                            "weighted={weighted} row {row} col {out_col} \
+                                 second[{a}][{b}]: production {} vs tower {}",
+                            jets.second[a][b][out_col],
+                            want2
+                        );
+                    }
+                }
+            }
+
+            // β BORDER CHANNELS (#932): the hand path packs `beta`
+            // (value ∂ẑ_c/∂β = ζ_k·Φ_b·output_c) and `beta_deriv` /
+            // `beta_l_deriv` (the mixed ∂²ẑ_c/∂β∂p_a = ∂(ζ_k·Φ_b)/∂p_a·output_c)
+            // term by term in `row_jets_for_logdet`, with NO tower oracle
+            // previously. The arrow β coefficient multiplies the channel's
+            // (frame / identity) `output` vector — NOT the current decoder
+            // matrix — so the local-variable dependence is exactly
+            // s = ζ_k(ℓ)·Φ_b(t_k) = `beta_border_tower` (built from the SAME
+            // gate_tower / basis_tower primitives as the reconstruction column);
+            // production multiplies that scalar by `channel.output[c]·√w`. Pin
+            // every β channel (value + both mixed-derivative arrays) to it at
+            // ~1e-9.
+            for (beta_pos, channel) in border.iter().enumerate() {
+                // The β border channel's LOCAL-variable dependence is
+                // s = ζ_k(ℓ)·Φ_b(t_k); the production packing multiplies that
+                // scalar by the channel's (frame / identity) `output[c]` — NOT
+                // the decoder matrix — and by √w.
+                let s = prog.beta_border_tower::<K>(channel.atom, channel.basis_col);
+                for out_col in 0..p {
+                    let out_c = channel.output[out_col];
+                    let want_v = sqrt_row_w * s.v * out_c;
+                    let v_floor = want_v.abs().max(1e-12);
+                    assert!(
+                        (jets.beta[beta_pos][out_col] - want_v).abs() <= 1e-9 * v_floor,
+                        "weighted={weighted} row {row} col {out_col} \
+                         beta[{beta_pos}] (atom {} basis {}): production {} vs tower {}",
+                        channel.atom,
+                        channel.basis_col,
+                        jets.beta[beta_pos][out_col],
+                        want_v
+                    );
+                    for a in 0..K {
+                        let want_d = sqrt_row_w * s.g[a] * out_c;
+                        let d_floor = want_d.abs().max(1e-12);
+                        // `beta_deriv` and `beta_l_deriv` are the SAME mixed
+                        // ∂²ẑ_c/∂β∂p_a derivative the linear-in-β reconstruction
+                        // produces (the hand path fills both identically); both
+                        // must equal the tower's first-derivative channel × out_c.
+                        assert!(
+                            (jets.beta_deriv[a][beta_pos][out_col] - want_d).abs()
+                                <= 1e-9 * d_floor,
+                            "weighted={weighted} row {row} col {out_col} \
+                             beta_deriv[{a}][{beta_pos}]: production {} vs tower {}",
+                            jets.beta_deriv[a][beta_pos][out_col],
+                            want_d
+                        );
+                        assert!(
+                            (jets.beta_l_deriv[a][beta_pos][out_col] - want_d).abs()
+                                <= 1e-9 * d_floor,
+                            "weighted={weighted} row {row} col {out_col} \
+                             beta_l_deriv[{a}][{beta_pos}]: production {} vs tower {}",
+                            jets.beta_l_deriv[a][beta_pos][out_col],
+                            want_d
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+pub(crate) fn ibp_map_outer_objective_advertises_analytic_gradient() {
+    // The IBP-MAP empirical-π third channel (including the cross-row M_k
+    // coupling) is now assembled exactly in `logdet_theta_adjoint` (#1006),
+    // so the outer objective advertises an analytic gradient like every
+    // other assignment mode.
+    let (mut term, target, rho) = gamma_fd_tiny_fixture();
+    term.assignment.mode = AssignmentMode::ibp_map(0.9, 1.0, false);
+
+    let obj = SaeManifoldOuterObjective::new(term, target, None, rho, 5, 0.4, 1.0e-6, 1.0e-6);
+    assert_eq!(obj.capability().gradient, Derivative::Analytic);
 }
 
 // [#780 line-count gate] The #1557 arrow-Schur parallelism-invariance

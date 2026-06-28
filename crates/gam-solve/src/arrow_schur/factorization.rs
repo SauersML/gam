@@ -8,6 +8,19 @@ use super::*;
 pub(crate) struct ArrowRowFactorResult {
     pub(crate) factor: Array2<f64>,
     pub(crate) gauge_deflated_directions: usize,
+    /// The unit-norm per-row eigen/gauge directions `vᵢ` (in this row's `d`-dim
+    /// latent block coordinates) that were stiffened to UNIT stiffness `λ̃ = 1`
+    /// in an undamped evidence factorization (gauge or spectral deflation).
+    ///
+    /// These directions contribute `log(1) = 0` to the row-block log-det and are
+    /// ρ/θ-INDEPENDENT, so their contribution to `∂log|H|/∂ρ` must be exactly 0.
+    /// The analytic outer-gradient traces contract `∂H_raw/∂ρ` (the RAW,
+    /// pre-deflation block derivative) against the DEFLATED inverse, which
+    /// assigns `1/λ̃ = 1` to each `vᵢ` and therefore SPURIOUSLY adds
+    /// `½ vᵢᵀ (∂H_raw/∂ρ) vᵢ`. Surfacing the directions lets the gradient code
+    /// subtract that spurious per-row contribution and restore the kept-subspace
+    /// trace. Empty for every PD row that factored without deflation.
+    pub(crate) deflated_directions: Vec<Array1<f64>>,
 }
 
 /// Attempt the per-row block factorization as one device batch spread across
@@ -349,9 +362,13 @@ pub(crate) fn factor_gauge_deflated_evidence_row(
         }
     }
     let factor = cholesky_lower(&deflated).ok()?;
+    let gauge_deflated_directions = basis.len();
     Some(ArrowRowFactorResult {
         factor,
-        gauge_deflated_directions: basis.len(),
+        gauge_deflated_directions,
+        // The orthonormal gauge orbit directions stiffened at κ = 1; each is a
+        // λ̃ = 1 deflated direction the outer-gradient correction must exclude.
+        deflated_directions: basis,
     })
 }
 
@@ -482,6 +499,10 @@ pub(crate) fn factor_spectral_deflated_evidence_row(
     // so every block the old path already conditioned is bit-for-bit unchanged.
     let mut conditioned = Array2::<f64>::zeros((d, d));
     let mut deflated_count = 0usize;
+    // The unit-stiffness deflated eigenvectors `vᵢ` (columns of `evecs`), in
+    // this row's `d`-dim block coordinates — surfaced so the outer ρ/θ-gradient
+    // can subtract the spurious `½ vᵢᵀ ∂H_raw/∂ρ vᵢ` the deflated inverse adds.
+    let mut deflated_directions: Vec<Array1<f64>> = Vec::new();
     for eig_idx in 0..evals.len() {
         let lambda = evals[eig_idx];
         let lambda_tilde = if lambda.is_finite() && lambda > deflate_floor {
@@ -493,6 +514,7 @@ pub(crate) fn factor_spectral_deflated_evidence_row(
             // Null / indefinite / numerically-flat quotient direction: unit
             // stiffness `+1`, contributing `log 1 = 0` to the evidence log-det.
             deflated_count += 1;
+            deflated_directions.push(evecs.column(eig_idx).to_owned());
             1.0
         };
         for i in 0..d {
@@ -529,11 +551,14 @@ pub(crate) fn factor_spectral_deflated_evidence_row(
             }
         }
         deflated_count = 1;
+        deflated_directions.clear();
+        deflated_directions.push(evecs.column(min_idx).to_owned());
     }
     let factor = cholesky_lower(&conditioned).ok()?;
     Some(ArrowRowFactorResult {
         factor,
         gauge_deflated_directions: deflated_count,
+        deflated_directions,
     })
 }
 
@@ -729,6 +754,7 @@ pub(crate) fn factor_one_row_result(
                     break ArrowRowFactorResult {
                         factor,
                         gauge_deflated_directions: 0,
+                        deflated_directions: Vec::new(),
                     };
                 }
                 // Diagonal-ratio condition-number proxy κ(LLᵀ) ≈
@@ -742,6 +768,7 @@ pub(crate) fn factor_one_row_result(
                     break ArrowRowFactorResult {
                         factor,
                         gauge_deflated_directions: 0,
+                        deflated_directions: Vec::new(),
                     };
                 }
                 let next = if ridge_eff > 0.0 {
