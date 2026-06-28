@@ -47,3 +47,49 @@ impl ExecutionPath {
         !matches!(self, Self::Cpu)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn as_str_cpu() {
+        assert_eq!(ExecutionPath::Cpu.as_str(), "cpu");
+    }
+
+    #[test]
+    fn as_str_gpu_reupload() {
+        assert_eq!(ExecutionPath::GpuReupload.as_str(), "gpu-reupload");
+    }
+
+    #[test]
+    fn as_str_gpu_resident_linearization() {
+        assert_eq!(
+            ExecutionPath::GpuResidentLinearization.as_str(),
+            "gpu-resident-linearization"
+        );
+    }
+
+    #[test]
+    fn as_str_gpu_resident_full() {
+        assert_eq!(ExecutionPath::GpuResidentFull.as_str(), "gpu-resident-full");
+    }
+
+    #[test]
+    fn used_device_false_for_cpu() {
+        assert!(!ExecutionPath::Cpu.used_device());
+    }
+
+    #[test]
+    fn used_device_true_for_all_gpu_variants() {
+        assert!(ExecutionPath::GpuReupload.used_device());
+        assert!(ExecutionPath::GpuResidentLinearization.used_device());
+        assert!(ExecutionPath::GpuResidentFull.used_device());
+    }
+
+    #[test]
+    fn default_is_cpu() {
+        assert_eq!(ExecutionPath::default(), ExecutionPath::Cpu);
+        assert!(!ExecutionPath::default().used_device());
+    }
+}

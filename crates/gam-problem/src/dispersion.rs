@@ -34,3 +34,40 @@ impl Default for Dispersion {
         Self::Known(1.0)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn phi_known_returns_inner_value() {
+        assert_eq!(Dispersion::Known(2.5).phi(), 2.5);
+    }
+
+    #[test]
+    fn phi_estimated_returns_inner_value() {
+        assert_eq!(Dispersion::Estimated(0.5).phi(), 0.5);
+    }
+
+    #[test]
+    fn is_estimated_false_for_known() {
+        assert!(!Dispersion::Known(1.0).is_estimated());
+    }
+
+    #[test]
+    fn is_estimated_true_for_estimated() {
+        assert!(Dispersion::Estimated(0.1).is_estimated());
+    }
+
+    #[test]
+    fn default_is_known_one() {
+        let d = Dispersion::default();
+        assert_eq!(d.phi(), 1.0);
+        assert!(!d.is_estimated());
+    }
+
+    #[test]
+    fn known_and_estimated_same_phi_are_not_equal() {
+        assert_ne!(Dispersion::Known(1.0), Dispersion::Estimated(1.0));
+    }
+}

@@ -30,3 +30,44 @@ impl BlockRole {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn name_mean() {
+        assert_eq!(BlockRole::Mean.name(), "mean");
+    }
+
+    #[test]
+    fn name_location() {
+        assert_eq!(BlockRole::Location.name(), "location");
+    }
+
+    #[test]
+    fn name_scale() {
+        assert_eq!(BlockRole::Scale.name(), "scale");
+    }
+
+    #[test]
+    fn name_time() {
+        assert_eq!(BlockRole::Time.name(), "time");
+    }
+
+    #[test]
+    fn name_threshold() {
+        assert_eq!(BlockRole::Threshold.name(), "threshold");
+    }
+
+    #[test]
+    fn name_link_wiggle() {
+        assert_eq!(BlockRole::LinkWiggle.name(), "link-wiggle");
+    }
+
+    #[test]
+    fn eq_reflexive() {
+        assert_eq!(BlockRole::Mean, BlockRole::Mean);
+        assert_ne!(BlockRole::Mean, BlockRole::Scale);
+    }
+}
