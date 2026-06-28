@@ -1,6 +1,6 @@
 [package]
 name = "gam-problem"
-version = "0.3.126"
+version = "0.3.128"
 edition = "2024"
 rust-version = "1.93"
 description = "Neutral solver/criterion contract types for the gam penalized-likelihood engine"
@@ -12,9 +12,9 @@ path = "src/lib.rs"
 
 [dependencies]
 faer = "0.24.0"
-gam-geometry = { path = "../gam-geometry", version = "=0.3.126" }
-gam-linalg = { path = "../gam-linalg", version = "=0.3.126" }
-gam-spec = { path = "../gam-spec", version = "=0.3.126" }
+gam-geometry = { path = "../gam-geometry", version = "=0.3.128" }
+gam-linalg = { path = "../gam-linalg", version = "=0.3.128" }
+gam-spec = { path = "../gam-spec", version = "=0.3.128" }
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 rayon = "1.12.0"
 serde = { version = "1.0.228", features = ["derive"] }

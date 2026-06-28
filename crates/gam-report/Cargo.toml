@@ -1,6 +1,6 @@
 [package]
 name = "gam-report"
-version = "0.3.126"
+version = "0.3.128"
 edition = "2024"
 rust-version = "1.93"
 description = "Human-readable fit/diagnostic report rendering for the gam engine"

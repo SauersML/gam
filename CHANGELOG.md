@@ -1,3 +1,109 @@
+## v0.3.128 — gam 0.3.128 / gamfit 0.1.230 (2026-06-28)
+
+crates.io + PyPI release of the open-issue fix wave landed since gam 0.3.126 /
+gamfit 0.1.228. The most user-visible changes are the adaptive/flexible Binomial
+link now fitting (or failing loudly instead of silently) and tensor smooths
+becoming invariant to the typed order of their covariates; the `gamfit` Python
+API is unchanged.
+
+Versions skip gam 0.3.127 / gamfit 0.1.229: those numbers are already on
+crates.io / PyPI from a prior orphaned release run whose version bump never
+persisted to `main` (registry versions are immutable), so this release takes the
+next free numbers — the same skip pattern recorded for 0.3.125 at 0.3.126.
+
+**Adaptive / flexible Binomial links (#1596, #1598)**
+- **#1598**: a `link(type=blended(...))` / `mixture(...)` learnable Binomial link
+  is now fittable end-to-end. The Python/formula path threads the blended/mixture
+  link components into the solver's `mixture_link` spec (it previously aborted
+  before the solver with "BinomialMixture requires mixture_link specification"),
+  and the joint link solve no longer refuses a finite-but-indefinite observed
+  Hessian row: the array build was the lone over-strict consumer, and both
+  downstream consumers already floor non-positive curvature, so the CLI fit that
+  failed with "observed Hessian curvature is not positive finite" now converges.
+- **#1596**: a non-convergent `link(type=flexible(logit))` wiggle fit is now
+  surfaced **loudly** as an error instead of silently returning a model
+  bit-identical to the fixed base link. Returning the large-smoothing baseline as
+  if the flexible request were honored was a silent contract violation — callers
+  could not distinguish a genuinely-flat learned link from a non-converged one.
+
+**Gauge invariance (#1593)**
+- A tensor-product smooth is now invariant to the typed order of its covariates:
+  `te(x, z)` and `te(z, x)` span the identical tensor space under the identical
+  per-margin penalty family, but the Khatri–Rao design permuted the columns and
+  per-margin penalty blocks, routing the outer λ optimizer to a different terminal
+  point in te's flat REML valley and drifting the shipped surface ~2–6 % of range
+  on a cosmetic swap. Margins (plus feature columns and periods) are now
+  canonicalized by source feature-column index at construction, so `te`/`ti`/`t2`
+  build the identical problem regardless of typed order. Pinned by a new
+  covariate-order regression test alongside the additive term-order, categorical
+  reference-level, and by-factor labeling gauge guards.
+
+**Survival (#1595)**
+- `survival_at` and `cumulative_hazard_at` are now consistent past the fitted
+  time grid: both flat-clamp beyond the support (they previously used contradictory
+  right-edge extrapolation rules, breaking `S = exp(−H)` past the last grid point).
+
+**GP / spatial smooths (#1074)**
+- Isotropic Matérn / Duchon GP smooths now run a kernel-range multi-start: the
+  profiled REML is re-fit across a log-κ grid and the strictly-best range adopted,
+  so an unlucky single start no longer strands the fit on a poor local range.
+
+**REML correctness (#1417 / #1006, #1038 / #1225 / #1418)**
+- The REML log-det trace gradients now carry the full Daleckii–Krein
+  deflation-derivative correction (with a divided-difference 0/0 guard),
+  spectrally-deflated directions are excluded consistently across all four trace
+  paths, and ungated atoms receive zero α-sensitivity in the data log-det trace.
+- Streaming-exact REML now accumulates the cross-row IBP Woodbury log-det in both
+  the criterion and the exact-Hessian matvec, matching the dense path to 1e-8; a
+  non-PD capacitance is a recoverable ρ-probe refusal rather than a wrong number.
+
+**Identifiability & competing risks (#1590)**
+- The dead-column veto is narrowed to skip only entirely-zero placeholder designs,
+  and channel-aware drop selection is now joint-rank-aware with faithful joint drop
+  attribution for cause-specific competing-risks survival fits.
+
+**Diagnostics & performance (#1575, #1557, #1151 / #1591 / #1592, #932)**
+- The post-fit PSIS ρ-uncertainty diagnostic is now opt-in (default off), cutting
+  ~33 surplus full-n solves per fit; the redundant parsimony second seed is waived
+  for sharp well-penalized GLM optima.
+- Extensive bit-identical jet/compose and SIMD row-batching speedups across the
+  math, geometry, survival and SAE row kernels (straight-line Faà di Bruno /
+  Leibniz towers, 4-row f64x4 lanes, pruned unused jet channels). The SAE
+  arrow-Schur per-row GEMM is pinned to a sequential faer pool for
+  parallelism-invariant losses.
+
+**Validation & ergonomics (#1597, #11, #12, #13)**
+- Weights-column validators report a **1-based** row index, matching the rest of
+  the Python/data layer. Portable disk preflight in `build.sh`, a corrected
+  `pip install torch` hint for `gamfit[torch]`, and an importable synthetic-SAE
+  metrics bench round out the ergonomics fixes.
+
+**Multinomial reference-class invariance (#1587, in progress)**
+- Foundation toward making the penalized multinomial-logit fit invariant to the
+  arbitrary reference class: the REML smoothing parameter is now **tied per term**
+  across classes (the gauge the centered/CLR penalty requires), the
+  reference-symmetric centered metric `λ·((I−J/K)⊗S)` is implemented and unit-proven
+  in the vector-GLM engine, and a `CustomFamily::joint_penalty_specs` hook plus a
+  `MultinomialFamily` centered-penalty builder are in place. The production formula
+  path still uses the reference-anchored per-class metric pending the outer-REML
+  joint-penalty wiring, so #1587 remains open; a red end-to-end repro documents the
+  remaining drift.
+
+**SAE structure & encode (#1026, #993)**
+- Fission now applies an anti-symmetric decoder perturbation when it duplicates an
+  atom, breaking the symmetric saddle that previously left the two children stuck
+  in lockstep (so a bound product atom can actually split into its factors) while
+  leaving the mass-split combined decoder exactly unchanged. The encode basin
+  warm-up, NaN-alignment routing gate, and an opt-in outlier-robust per-row
+  weighting policy for heavy-tailed activations also land.
+
+**Build / CI**
+- Completion of the public-API path restoration after the #1521 engine carve,
+  GPU-kernel import repointing across the SAE FFI/examples/tests (#1577),
+  line-count-gate decompositions (#780), repaired CI test-build APIs/paths, and a
+  large set of new unit tests across the foundation crates (gam-problem,
+  gam-linalg, gam-math, gam-spec, gam-geometry, gam-predict).
+
 ## v0.3.126 — gam 0.3.126 / gamfit 0.1.228 (2026-06-27)
 
 crates.io + PyPI release of the open-issue fix wave landed since gam 0.3.124 /

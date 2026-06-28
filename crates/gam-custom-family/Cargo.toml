@@ -1,6 +1,6 @@
 [package]
 name = "gam-custom-family"
-version = "0.3.126"
+version = "0.3.128"
 edition = "2024"
 description = "Custom-family blockwise carrier and joint-Newton solve for the gam penalized-likelihood engine"
 license = "AGPL-3.0-or-later"
@@ -13,14 +13,14 @@ warnings = "deny"
 
 [dependencies]
 faer = "0.24.0"
-gam-identifiability = { path = "../gam-identifiability", version = "=0.3.126" }
-gam-linalg = { path = "../gam-linalg", version = "=0.3.126" }
-gam-model-api = { path = "../gam-model-api", version = "=0.3.126" }
-gam-problem = { path = "../gam-problem", version = "=0.3.126" }
-gam-runtime = { path = "../gam-runtime", version = "=0.3.126" }
-gam-solve = { path = "../gam-solve", version = "=0.3.126" }
-gam-spec = { path = "../gam-spec", version = "=0.3.126" }
-gam-terms = { path = "../gam-terms", version = "=0.3.126" }
+gam-identifiability = { path = "../gam-identifiability", version = "=0.3.128" }
+gam-linalg = { path = "../gam-linalg", version = "=0.3.128" }
+gam-model-api = { path = "../gam-model-api", version = "=0.3.128" }
+gam-problem = { path = "../gam-problem", version = "=0.3.128" }
+gam-runtime = { path = "../gam-runtime", version = "=0.3.128" }
+gam-solve = { path = "../gam-solve", version = "=0.3.128" }
+gam-spec = { path = "../gam-spec", version = "=0.3.128" }
+gam-terms = { path = "../gam-terms", version = "=0.3.128" }
 log = "0.4.29"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 rayon = "1.12.0"
@@ -30,5 +30,5 @@ approx = "0.5.1"
 # Dev-only cycle (permitted by Cargo): the carrier's `tests` module fits real
 # gamlss/wiggle families that live in `gam-models`, which normally-depends on
 # this crate. The cycle closes through dev-dependencies only.
-gam-models = { path = "../gam-models", version = "=0.3.126" }
-gam-test-support = { path = "../gam-test-support", version = "=0.3.126" }
+gam-models = { path = "../gam-models", version = "=0.3.128" }
+gam-test-support = { path = "../gam-test-support", version = "=0.3.128" }
