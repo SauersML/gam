@@ -3190,6 +3190,35 @@ pub fn build_smooth_basis(
                 });
                 emitted_periods.push(axis_period);
             }
+            // #1593: canonicalize the margin order so a tensor smooth is invariant
+            // to the typed order of its covariates. `te(x, z)` and `te(z, x)` span
+            // the IDENTICAL tensor-product space under the identical per-margin
+            // penalty family, but the design is the Khatri–Rao product
+            // `B_first ⊙ B_second`, so the typed order permutes the design columns
+            // (and the per-margin penalty blocks `S_first⊗I`, `I⊗S_second`). That
+            // permutation is a pure relabelling in exact arithmetic — REML is
+            // invariant to it — yet it reorders the penalized normal-equation / REML
+            // eigen/Cholesky linear algebra, and the resulting sub-ULP differences
+            // route the outer λ optimizer to a different terminal point in te's flat
+            // REML valley (the over-smoothed margin rails to the ρ bound while the
+            // other lands on a materially different λ̂). So the shipped surface
+            // drifted ~2–6 % of range with a cosmetic swap of the covariate order
+            // (the #1378 row-permutation / #1456 rotation flat-valley gauge family).
+            // Sorting the margins by their source feature-column index makes the same
+            // physical model build the identical problem regardless of typed order,
+            // so the fit — and every prediction rebuilt from the resolved spec — is
+            // genuinely order-invariant. `ti`/`t2` share this arm and become exactly
+            // invariant too (they were already ~1e-5 by centring each margin
+            // separately; canonicalization makes the swap bit-identical).
+            let canon_cols: Vec<usize> = {
+                let mut perm: Vec<usize> = (0..dim).collect();
+                perm.sort_by_key(|&a| cols[a]);
+                if perm.iter().enumerate().any(|(i, &a)| i != a) {
+                    margins = perm.iter().map(|&a| margins[a].clone()).collect();
+                    emitted_periods = perm.iter().map(|&a| emitted_periods[a]).collect();
+                }
+                perm.iter().map(|&a| cols[a]).collect()
+            };
             let any_periodic = emitted_periods.iter().any(|p| p.is_some());
             let periods_vec = if any_periodic {
                 emitted_periods
@@ -3213,7 +3242,7 @@ pub fn build_smooth_basis(
             // still wins.
             let tensor_double_penalty = option_bool(options, "double_penalty").unwrap_or(false);
             Ok(SmoothBasisSpec::TensorBSpline {
-                feature_cols: cols.to_vec(),
+                feature_cols: canon_cols,
                 spec: TensorBSplineSpec {
                     marginalspecs: margins,
                     periods: periods_vec,
