@@ -9,6 +9,12 @@ import numpy as np
 import pandas as pd
 
 import gamfit
+import pytest
+
+# #1512: this fit exceeds the standard Python-API CI runner budget (>60s in
+# triage), so it is tagged slow and excluded from the directory-level
+# `-m "not slow"` CI step while still being collected (run by a bare pytest).
+pytestmark = pytest.mark.slow
 
 
 HARD_N = 195_780

@@ -28,6 +28,12 @@ from __future__ import annotations
 import numpy as np
 
 import gamfit
+import pytest
+
+# #1512: this fit exceeds the standard Python-API CI runner budget (>60s in
+# triage), so it is tagged slow and excluded from the directory-level
+# `-m "not slow"` CI step while still being collected (run by a bare pytest).
+pytestmark = pytest.mark.slow
 
 
 def _planted_circles(n: int = 60, d: int = 6, k: int = 3, seed: int = 0) -> np.ndarray:

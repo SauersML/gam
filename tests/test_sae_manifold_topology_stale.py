@@ -12,6 +12,11 @@ import pytest
 
 import gamfit
 
+# #1512: this fit exceeds the standard Python-API CI runner budget (>60s in
+# triage), so it is tagged slow and excluded from the directory-level
+# `-m "not slow"` CI step while still being collected (run by a bare pytest).
+pytestmark = pytest.mark.slow
+
 
 def _toy_inputs(n: int = 24, p: int = 5, seed: int = 0) -> np.ndarray:
     rng = np.random.default_rng(seed)
