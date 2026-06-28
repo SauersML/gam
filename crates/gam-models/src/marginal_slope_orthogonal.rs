@@ -520,3 +520,136 @@ pub(crate) fn residualized_influence_block(
     }
     Ok(residualized)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    fn jac_from(columns: Array2<f64>) -> ScoreInfluenceJacobian {
+        let n = columns.nrows();
+        ScoreInfluenceJacobian {
+            columns,
+            z: Array1::zeros(n),
+        }
+    }
+
+    // ---- influence_block_design ----
+
+    #[test]
+    fn influence_block_design_row_scales_by_sf_times_pilot() {
+        // Z_infl[i, :] = (s_f * pilot_beta0[i]) * J[i, :].
+        let cols = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
+        let jac = jac_from(cols.clone());
+        let pilot = array![2.0, -1.0, 0.5];
+        let s_f = 3.0;
+        let out = influence_block_design(&jac, &pilot, s_f);
+        for i in 0..3 {
+            let scale = s_f * pilot[i];
+            for j in 0..2 {
+                assert_eq!(out[[i, j]], cols[[i, j]] * scale);
+            }
+        }
+    }
+
+    #[test]
+    fn influence_block_design_preserves_shape_and_does_not_mutate_input() {
+        let cols = array![[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]];
+        let jac = jac_from(cols.clone());
+        let out = influence_block_design(&jac, &array![1.0, 1.0], 1.0);
+        assert_eq!(out.dim(), (2, 3));
+        // s_f = 1, pilot = ones => Z_infl == J exactly.
+        assert_eq!(out, cols);
+        // Source columns untouched (function clones internally).
+        assert_eq!(jac.columns, cols);
+    }
+
+    #[test]
+    #[should_panic(expected = "pilot_beta0 length must equal Jacobian rows")]
+    fn influence_block_design_panics_on_pilot_length_mismatch() {
+        let jac = jac_from(array![[1.0], [2.0]]);
+        let _ = influence_block_design(&jac, &array![1.0], 1.0);
+    }
+
+    // ---- residualize_influence_columns ----
+
+    #[test]
+    fn residualize_returns_input_when_no_marginal_columns() {
+        // p_m == 0 => nothing to project out, raw columns returned verbatim.
+        let z = array![[1.0, 2.0], [3.0, 4.0]];
+        let m = Array2::<f64>::zeros((2, 0));
+        let w = array![1.0, 1.0];
+        let out = residualize_influence_columns(&z, m.view(), &w, 1e-12);
+        assert_eq!(out, z);
+    }
+
+    #[test]
+    fn residualize_kills_columns_in_marginal_span() {
+        // If Z lies entirely in the column span of M, the residual is ~0
+        // (with a tiny ridge). Build Z = M * C.
+        let m = array![[1.0, 0.0], [1.0, 1.0], [1.0, 2.0], [1.0, 3.0]];
+        let c = array![[2.0, -1.0], [0.5, 4.0]];
+        let z = fast_ab(&m, &c);
+        let w = Array1::<f64>::ones(4);
+        let out = residualize_influence_columns(&z, m.view(), &w, 1e-12);
+        let max_abs = out.iter().fold(0.0_f64, |a, &v| a.max(v.abs()));
+        assert!(max_abs < 1e-6, "residual of in-span Z too large: {max_abs}");
+    }
+
+    #[test]
+    fn residualize_yields_w_orthogonal_residual() {
+        // The defining property: MᵀW Z̃ ≈ 0 in the row metric W. Use a Z with a
+        // component outside span(M) so the residual is nonzero but W-orthogonal.
+        let m = array![[1.0, 0.0], [1.0, 1.0], [1.0, 2.0], [1.0, 4.0]];
+        let z = array![[0.3, 1.0], [-2.0, 0.5], [4.0, -1.0], [0.7, 2.0]];
+        let w = array![1.0, 2.0, 0.5, 1.5];
+        let out = residualize_influence_columns(&z, m.view(), &w, 1e-12);
+        // MᵀW Z̃ should be ~0.
+        let mtwz = fast_xt_diag_y(&m, &w, &out);
+        let max_abs = mtwz.iter().fold(0.0_f64, |a, &v| a.max(v.abs()));
+        assert!(max_abs < 1e-6, "MᵀW Z̃ not ~0: {max_abs}");
+        // The residual is genuinely nonzero (Z had an out-of-span part).
+        let resid_mag = out.iter().fold(0.0_f64, |a, &v| a.max(v.abs()));
+        assert!(resid_mag > 1e-3, "residual unexpectedly zero: {resid_mag}");
+        // Shape preserved.
+        assert_eq!(out.dim(), z.dim());
+    }
+
+    // ---- residualized_influence_block (end-to-end pure path) ----
+
+    #[test]
+    fn residualized_block_matches_manual_scale_then_residualize() {
+        // The block builds Z_infl = diag(s_f·β̂₀)·J then residualizes against M in
+        // the W-metric with a Gram-scaled ridge. Reconstruct that path manually.
+        let raw_jac = array![[1.0, 0.5], [2.0, -1.0], [0.0, 3.0], [1.5, 1.0]];
+        let oof_z = array![0.1, 0.2, 0.3, 0.4];
+        let pilot = array![1.0, 2.0, -0.5, 0.5];
+        let s_f = 1.5;
+        let m = array![[1.0, 0.0], [1.0, 1.0], [1.0, 2.0], [1.0, 3.0]];
+        let w = array![1.0, 1.0, 2.0, 0.5];
+
+        let out =
+            residualized_influence_block(&raw_jac, &oof_z, &pilot, s_f, m.view(), &w).unwrap();
+
+        // Manual: scale rows, derive eps from the weighted Gram diagonal, residualize.
+        let jac = ScoreInfluenceJacobian {
+            columns: raw_jac.clone(),
+            z: oof_z.clone(),
+        };
+        let z_infl = influence_block_design(&jac, &pilot, s_f);
+        let gram = fast_xt_diag_x(&m, &w);
+        let gram_scale = (0..m.ncols()).map(|i| gram[[i, i]]).fold(0.0_f64, f64::max);
+        let eps = (gram_scale * INFLUENCE_PROJECTION_RELATIVE_RIDGE)
+            .max(INFLUENCE_PROJECTION_RIDGE_FLOOR);
+        let expected = residualize_influence_columns(&z_infl, m.view(), &w, eps);
+
+        assert_eq!(out.dim(), expected.dim());
+        for (a, b) in out.iter().zip(expected.iter()) {
+            assert!((a - b).abs() < 1e-12, "mismatch: {a} vs {b}");
+        }
+        // And the result is W-orthogonal to the marginal span.
+        let mtwz = fast_xt_diag_y(&m, &w, &out);
+        let max_abs = mtwz.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        assert!(max_abs < 1e-6, "MᵀW Z̃ not ~0: {max_abs}");
+    }
+}
