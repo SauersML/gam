@@ -2175,8 +2175,22 @@ where
     // numerator that already excludes zero-weight rows over a denominator that
     // counts them, biasing φ̂ low and shrinking every SE (#584). The REML
     // criterion's own observation count (which drives λ selection) lives in the
-    // inner-solution assembly and must apply the same positive-weight count.
-    let n = w_o.iter().filter(|&&wi| wi > 0.0).count() as f64;
+    // inner-solution assembly and must apply the same effective count.
+    //
+    // For the Gaussian-identity scale that effective count is the *sum of
+    // prior weights* `Σ wᵢ`, NOT the cardinality of positive-weight rows.
+    // `weights` are documented frequency / case weights (a row of weight `w` is
+    // `w` copies — `crates/gam-terms/src/inference/lawley.rs`), so the numerator
+    // `weighted_rss = Σ wᵢ·rᵢ²` already carries total mass `≈ Σ wᵢ`; dividing it
+    // by the row count `n₊` instead of `Σ wᵢ` inflates φ̂ by `Σw/n₊`, which
+    // inflates every reported SE by `sqrt(Σw/n₊)` on a parametric fit (#1618)
+    // and — through the matching mistake in the REML denominator — over-smooths
+    // a penalized fit relative to the row-expanded data (#1617). Zero-weight
+    // rows contribute `0` to the sum, so they stay exactly equivalent to absent
+    // rows (the `#584` invariant); with all positive weights 1 this equals `n₊`,
+    // so unweighted fits are byte-identical. This mirrors the inner REML
+    // criterion's `RemlState::dispersion_effective_n` (objective.rs).
+    let n = w_o.iter().filter(|&&wi| wi > 0.0).sum::<f64>();
     let weighted_rss = if matches!(cfg.link_function(), LinkFunction::Identity) {
         let fitted = {
             let mut eta = offset_o.clone();

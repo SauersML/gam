@@ -3414,6 +3414,29 @@ impl<'a> RemlState<'a> {
             .sum::<f64>()
     }
 
+    /// Effective sample size `Σ wᵢ` over the positive-weight rows — the
+    /// observation count that enters the profiled-dispersion denominator
+    /// `(n_eff − M_p)` (see `InnerSolution::dispersion_effective_n`).
+    ///
+    /// `weights` are documented frequency / case weights, so a row with weight
+    /// `w` is `w` observations. The profiled Gaussian deviance numerator
+    /// `D_p = Σ wᵢ rᵢ² + penalty` already carries total mass `≈ Σ wᵢ`; dividing
+    /// it by `Σ wᵢ − M_p` (not the row count `n₊ − M_p`) is what makes the
+    /// weighted fit reproduce the row-expanded fit's `φ̂`, λ̂, EDF, predictions
+    /// and standard errors exactly (#1617 over-smoothing, #1618 SE inflation).
+    /// Zero-weight rows contribute `0` to the sum, so they remain exactly
+    /// equivalent to absent rows (R's `n.ok`, mgcv's dropped zero-weight rows,
+    /// #584). With all positive weights 1 this equals the positive-weight row
+    /// count `n₊`, so unweighted fits are byte-identical.
+    ///
+    /// Only the `ProfiledGaussian` dispersion arm consumes it; fixed-dispersion
+    /// families (Poisson, binomial, Gamma, …) never read it and so are
+    /// unaffected — their `w = c ⇔ c-fold replication` equivalence is already
+    /// exact via an identical penalized deviance and `XᵀWX` (#893).
+    pub(crate) fn dispersion_effective_n(&self) -> f64 {
+        self.weights.iter().filter(|&&wi| wi > 0.0).sum::<f64>()
+    }
+
     /// Weighted null deviance `D₀ = Σ wᵢ(yᵢ − ȳ_w)²` of the Gaussian response,
     /// used as the *relative* reference scale for the smooth penalized-deviance
     /// floor (`InnerSolution::dp_floor_scale`, see
