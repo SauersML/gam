@@ -1932,6 +1932,13 @@ mod tests {
 
         let base = ws.to_arrow_system();
 
+        println!(
+            "DIAG_RESIDENT device_resident={} shape=({},{},{})",
+            ws.device_resident(),
+            ws.shape.n,
+            ws.shape.d,
+            ws.shape.p
+        );
         if ws.device_resident() {
             // Resident device loop: factors stay on-device across iterations.
             let dev = ws.device_fit(&opts).expect("device resident fit");
