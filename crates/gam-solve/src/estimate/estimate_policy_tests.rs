@@ -14,7 +14,12 @@ use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
 #[test]
-fn gaussian_external_reml_uses_single_seed_policy() {
+fn gaussian_external_reml_seeds_over_smoothing_safety_net() {
+    // #1074: low-dimensional Gaussian REML ranks several deterministic candidate
+    // basins (`max_seeds > seed_budget`) AND fully solves TWO of them — the
+    // flexible anchor (slot 0) and the over-smoothing probe (slot 1) — so
+    // lowest-cost keep-best can escape the flexible over-fit basin a weak-signal
+    // over-rich fit otherwise rails into. The probe is an absolute high-λ start.
     let cfg = external_reml_seed_config(2, LinkFunction::Identity);
     assert_eq!(cfg.risk_profile, SeedRiskProfile::Gaussian);
     assert!(
@@ -22,20 +27,42 @@ fn gaussian_external_reml_uses_single_seed_policy() {
         "Gaussian REML should rank deterministic candidate basins before startup"
     );
     assert_eq!(
-        cfg.seed_budget, 1,
-        "standard Gaussian REML should fully optimize the best screened start by default"
+        cfg.seed_budget, 2,
+        "Gaussian REML must fully solve both the flexible anchor and the over-smoothing \
+         probe so keep-best can reject an over-fit basin"
+    );
+    assert_eq!(
+        cfg.over_smoothing_probe_rho,
+        Some(8.0),
+        "Gaussian REML must seed an absolute high-λ over-smoothing probe (#1074)"
     );
 }
 
 #[test]
-fn high_dimensional_external_reml_skips_seed_screening() {
+fn high_dimensional_gaussian_external_reml_keeps_over_smoothing_safety_net() {
+    // #1074: a MULTI-TERM Gaussian model (e.g. `s(long,lat,bs="tp") + s(depth)`,
+    // four penalty blocks) lands at/above the screening cap. It must STILL get
+    // the over-smoothing safety net — a budget-2 multi-start with the high-λ
+    // probe — or it descends into the flexible basin and over-fits the weak
+    // signal (the #1074 quakes edf≈104 vs mgcv≈15 failure). The lattice stays
+    // minimal (anchor + global shifts + probe, no exploratory seeds) to honour
+    // the cap's perf intent, but the budget-2 keep-best coverage is preserved.
     let cfg = external_reml_seed_config(REML_SEED_SCREENING_RHO_CAP, LinkFunction::Identity);
     assert_eq!(cfg.risk_profile, SeedRiskProfile::Gaussian);
-    assert_eq!(
-        cfg.max_seeds, 1,
-        "moderate/high-dimensional REML should start from the deterministic seed directly"
+    assert!(
+        cfg.max_seeds > cfg.seed_budget,
+        "high-dimensional Gaussian REML must still rank the flexible and over-smoothing basins"
     );
-    assert_eq!(cfg.seed_budget, 1);
+    assert_eq!(
+        cfg.seed_budget, 2,
+        "high-dimensional Gaussian REML must fully solve both basins so keep-best can \
+         reject the multi-term over-fit (#1074)"
+    );
+    assert_eq!(
+        cfg.over_smoothing_probe_rho,
+        Some(8.0),
+        "the over-smoothing probe must survive past the screening cap for Gaussian (#1074)"
+    );
 }
 
 #[test]

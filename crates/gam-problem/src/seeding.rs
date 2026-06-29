@@ -151,8 +151,17 @@ mod tests {
     // ── promotes_interior_seed_extremes ───────────────────────────────────────
 
     #[test]
-    fn promotes_interior_extremes_false_for_gaussian_only() {
-        assert!(!SeedRiskProfile::Gaussian.promotes_interior_seed_extremes());
+    fn promotes_interior_extremes_for_all_profiles() {
+        // #1074: plain Gaussian was originally excluded (its profiled-scale REML
+        // basin has no capped-screening over-smoothing bias), but a weak-signal
+        // Gaussian fit on an over-rich basis has the OPPOSITE failure — it
+        // descends into the flexible (low-λ) basin and over-fits. Promoting the
+        // heaviest interior seed to the second full-budget slot (paired with the
+        // over-smoothing probe + `seed_budget ≥ 2`) lets the multi-start SEE the
+        // heavily-penalized basin; Gaussian's lowest-cost keep-best then adopts
+        // it only when it scores a strictly lower REML, so this can never worsen
+        // a flexible fit. Every risk profile now promotes the interior extremes.
+        assert!(SeedRiskProfile::Gaussian.promotes_interior_seed_extremes());
         assert!(SeedRiskProfile::GaussianLocationScale.promotes_interior_seed_extremes());
         assert!(SeedRiskProfile::GeneralizedLinear.promotes_interior_seed_extremes());
         assert!(SeedRiskProfile::Survival.promotes_interior_seed_extremes());
