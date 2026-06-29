@@ -89,3 +89,36 @@ success-output = "never"
 [[profile.ci.overrides]]
 filter = 'test(/hifreq_tensor_k(8|10)/)'
 slow-timeout = { period = "600s", terminate-after = 4 }
+
+# Two survival integration probes carry a per-test wall-clock that exceeds the
+# default 600s SIGKILL by construction, so at the default budget nextest kills
+# them BEFORE their assertion runs — turning a designed verdict into an opaque
+# "TERMINATING [>600s]" with no coverage. Same remedy as the hifreq probes
+# above: rather than `#[ignore]` them (which drops the coverage), give ONLY
+# these two a generous budget so the run completes and ASSERTS them.
+#
+#   `competing_risks_cif_is_invariant_to_cause_label_permutation_1593` is a
+#   gauge-invariance guard (the #1549/#1587/#1593 family) that fits the SAME
+#   physical two-cause competing-risks data ~9 times — natural labelling, a
+#   determinism refit, and the swapped labelling, across three seeds — each a
+#   full unified competing-risks Weibull fit on n=1500. The invariant itself is
+#   cheap to check; it is the summed fit wall-clock that crosses 600s, and a
+#   SIGKILL mid-suite means the cross-labelling CIF agreement is never asserted.
+#
+#   `survival_marginal_slope_converges_with_deadline_disarmed_979` deliberately
+#   DISARMS the fit's outer wall-clock deadline (raising it to 900s, hard-limit
+#   1140s in the test) to prove the #979 reduced-logslope joint-Newton
+#   self-certifies WITHOUT the deadline being load-bearing. That 900s internal
+#   budget is, by design, far above the default 600s cap, so the probe's own
+#   `secs < budget - margin` assertion can never run at the default budget. The
+#   companion `survival_marginal_slope_returns_bounded_not_hang_979` (20s
+#   budget) stays on the default cap and is intentionally NOT matched here.
+#
+# The fits these probes drive are heavy but not hung (each is bounded by its own
+# deadline / iteration budget); the generous cap lets the verdict surface
+# instead of a bulk kill. terminate-after = 4 (→ 2400s) still SIGKILLs a genuine
+# hang far inside the 350-min job backstop, and period = 600s keeps the named
+# SLOW notice so the per-test slow attribution (#1393) still flags them.
+[[profile.ci.overrides]]
+filter = 'test(/(competing_risks_cif_is_invariant_to_cause_label_permutation_1593|survival_marginal_slope_converges_with_deadline_disarmed_979)/)'
+slow-timeout = { period = "600s", terminate-after = 4 }
