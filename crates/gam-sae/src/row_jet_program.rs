@@ -1469,53 +1469,34 @@ mod tests {
         }
     }
 
-    /// #932 ns/row microbench: the production packed jet recon
+    /// #932 correctness gate (converted from a ns/row microbench, which only
+    /// printed timings): the production packed jet recon
     /// ([`SaeReconstructionRowProgram::reconstruction_all_columns_packed`], gate +
     /// basis jets HOISTED out of the column loop, softmax denom/recip SHARED)
-    /// versus the hand path ([`hand_softmax_column`], the old `row_jets_for_logdet`
-    /// closed-form softmax gate Jacobian/Hessian × decoded basis, re-derived per
-    /// output column). Both produce every output column's value/grad/Hessian. This
-    /// is a measurement, not an assertion; run with `--release --nocapture`.
+    /// must reproduce the hand path ([`hand_softmax_column`], the old
+    /// `row_jets_for_logdet` closed-form softmax gate Jacobian/Hessian × decoded
+    /// basis, re-derived per output column) on every output column's
+    /// value/grad/Hessian — the #932 bit-identity bar.
     #[test]
-    #[ignore = "microbench; run with --release --nocapture"]
-    fn bench_recon_jet_vs_hand_ns_per_row() {
+    fn recon_jet_matches_hand() {
         let out_dim = 16;
         let n_basis = 4;
         let inv_tau = 1.3;
-        let warm = 2_000usize;
-        let iters = 50_000usize;
 
         // K=8: 4 atoms × (1 logit + 1 coord) = 8 primaries.
-        bench_one::<8>(
-            softmax_fixture_k(4, 1, n_basis, out_dim, inv_tau),
-            inv_tau,
-            warm,
-            iters,
-            "K=8 (4 atoms, latent_dim=1)",
-        );
+        assert_recon_jet_matches_hand::<8>(softmax_fixture_k(4, 1, n_basis, out_dim, inv_tau), inv_tau);
         // K=16: 8 atoms × (1 logit + 1 coord) = 16 primaries.
-        bench_one::<16>(
-            softmax_fixture_k(8, 1, n_basis, out_dim, inv_tau),
-            inv_tau,
-            warm,
-            iters / 2,
-            "K=16 (8 atoms, latent_dim=1)",
-        );
+        assert_recon_jet_matches_hand::<16>(softmax_fixture_k(8, 1, n_basis, out_dim, inv_tau), inv_tau);
     }
 
-    fn bench_one<const K: usize>(
+    fn assert_recon_jet_matches_hand<const K: usize>(
         prog: SaeReconstructionRowProgram,
         inv_tau: f64,
-        warm: usize,
-        iters: usize,
-        label: &str,
     ) {
-        use std::hint::black_box;
-        use std::time::Instant;
         let out_dim = prog.out_dim();
 
-        // Correctness gate before timing: the packed jet all-columns path agrees
-        // with the hand path on value/grad/Hessian (the #932 bit-identity bar).
+        // The packed jet all-columns path agrees with the hand path on
+        // value/grad/Hessian (the #932 bit-identity bar).
         let cols = prog.reconstruction_all_columns_packed::<K>();
         for c in 0..out_dim {
             let hand = hand_softmax_column(&prog, c, inv_tau);
@@ -1534,47 +1515,6 @@ mod tests {
                 }
             }
         }
-
-        // Warmup.
-        for _ in 0..warm {
-            black_box(prog.reconstruction_all_columns_packed::<K>());
-            for c in 0..out_dim {
-                black_box(hand_softmax_column(&prog, c, inv_tau));
-            }
-        }
-
-        // Jet: one all-columns packed call per row.
-        let t0 = Instant::now();
-        for _ in 0..iters {
-            black_box(prog.reconstruction_all_columns_packed::<K>());
-        }
-        let jet_ns = t0.elapsed().as_nanos() as f64 / iters as f64;
-
-        // Hand: every output column re-derived (the production hand path).
-        let t1 = Instant::now();
-        for _ in 0..iters {
-            for c in 0..out_dim {
-                black_box(hand_softmax_column(&prog, c, inv_tau));
-            }
-        }
-        let hand_ns = t1.elapsed().as_nanos() as f64 / iters as f64;
-
-        // Jet per-column (no hoist) to isolate the hoist/share win.
-        let t2 = Instant::now();
-        for _ in 0..iters {
-            for c in 0..out_dim {
-                black_box(prog.reconstruction_column_packed::<K>(c));
-            }
-        }
-        let jet_percol_ns = t2.elapsed().as_nanos() as f64 / iters as f64;
-
-        eprintln!(
-            "[#932 bench {label}] out_dim={out_dim}  jet(hoisted)={jet_ns:.1} ns/row  \
-             jet(per-col)={jet_percol_ns:.1} ns/row  hand={hand_ns:.1} ns/row  \
-             jet-vs-hand={:.2}x  hoist={:.2}x",
-            hand_ns / jet_ns,
-            jet_percol_ns / jet_ns
-        );
     }
 
     /// INDEPENDENT scalar witness for the reconstruction column `ẑ_c(δ)` as a

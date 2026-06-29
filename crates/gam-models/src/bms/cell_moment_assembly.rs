@@ -4764,16 +4764,14 @@ mod empirical_flex_jet_oracle_tests {
         }
     }
 
-    /// #932 timing baseline (investigation only, ignored by default): measures
-    /// ns/row of the hand path `compute_row_analytic_flex_from_parts_into`
-    /// (need_hessian=true) versus the naive per-op-alloc `Jet2` single-source
-    /// `empirical_flex_row_nll_jet2` on the SAME representative flex fixture, so
-    /// the #932 "jet must be measurably faster" constraint can be quantified.
-    /// Run with: `cargo test -p gam-models --release flex_handpath_vs_jet2_timing_932 -- --ignored --nocapture`.
+    /// #932 correctness gate (converted from a timing-only bench, which enforced
+    /// nothing): the hand path `compute_row_analytic_flex_from_parts_into`
+    /// (need_hessian=true) must reproduce the naive per-op-alloc `Jet2`
+    /// single-source `empirical_flex_row_nll_jet2` on a representative flex
+    /// fixture — value, gradient AND Hessian. This pins the equivalence #932's
+    /// perf cutover relies on.
     #[test]
-    #[ignore]
-    fn flex_handpath_vs_jet2_timing_932() {
-        use std::time::Instant;
+    fn flex_handpath_matches_jet2() {
         let fx = make_fixture(false); // link-dev block
         let r = fx.primary.total;
         let q0 = 0.2_f64;
@@ -4792,10 +4790,23 @@ mod empirical_flex_jet_oracle_tests {
             q0,
         )
         .expect("link map");
+        // Converged scalar intercept root (IFT/lift order-0 anchor) and the
+        // calibration Jacobian F_a = Σ_k π_k φ(η₀)·∂η/∂a — the exact `m_a` the
+        // hand IFT divides by (link-dev branch: ∂η/∂a = scale·(1 + Σ_j β_j·B'_j)).
+        // Computed identically to the jet's internal F_a (mirrors the full oracle
+        // `empirical_flex_row_nll_jet2_matches_hand_path_932`); the simplified
+        // pdf-only sum the old bench used omitted the ∂η/∂a factor.
         let intercept = witness_intercept(&fx, marginal.mu, b0, &beta, scale);
         let mut m_a = 0.0;
         for (node, weight) in fx.grid.pairs() {
-            m_a += weight * witness_normal_pdf(witness_eta(&fx, intercept, b0, &beta, node, scale));
+            let eta0 = witness_eta(&fx, intercept, b0, &beta, node, scale);
+            let stacks = witness_basis_stacks_at(&fx, intercept + b0 * node);
+            let mut s = 1.0_f64;
+            for (j, stack) in stacks.iter().enumerate() {
+                s += beta[j] * stack[1];
+            }
+            let eta0_a = scale * s;
+            m_a += weight * witness_normal_pdf(eta0) * eta0_a;
         }
         let row_ctx = BernoulliMarginalSlopeRowExactContext {
             intercept,
@@ -4804,47 +4815,40 @@ mod empirical_flex_jet_oracle_tests {
             degree9_cells: None,
         };
 
-        let iters = 100_000usize;
-
         // --- Hand path (value + gradient + Hessian). ---
         let mut scratch =
             crate::bms::hessian_paths::BernoulliMarginalSlopeFlexRowScratch::new(r);
-        let mut acc = 0.0_f64;
-        for _ in 0..1000 {
-            acc += fx
-                .family
-                .compute_row_analytic_flex_from_parts_into(
-                    0, &fx.primary, q0, b0, None, Some(&beta), &row_ctx, None, None, true,
-                    &mut scratch,
-                )
-                .expect("hand path");
-        }
-        let t0 = Instant::now();
-        for _ in 0..iters {
-            acc += fx
-                .family
-                .compute_row_analytic_flex_from_parts_into(
-                    0, &fx.primary, q0, b0, None, Some(&beta), &row_ctx, None, None, true,
-                    &mut scratch,
-                )
-                .expect("hand path");
-        }
-        let hand_ns = t0.elapsed().as_nanos() as f64 / iters as f64;
+        let neglog = fx
+            .family
+            .compute_row_analytic_flex_from_parts_into(
+                0, &fx.primary, q0, b0, None, Some(&beta), &row_ctx, None, None, true,
+                &mut scratch,
+            )
+            .expect("hand path");
 
         // --- Naive Jet2 single-source path (value + gradient + Hessian). ---
-        let mut acc2 = 0.0_f64;
-        for _ in 0..1000 {
-            acc2 += empirical_flex_row_nll_jet2(&fx, &p0).v;
-        }
-        let t1 = Instant::now();
-        for _ in 0..iters {
-            acc2 += empirical_flex_row_nll_jet2(&fx, &p0).v;
-        }
-        let jet_ns = t1.elapsed().as_nanos() as f64 / iters as f64;
+        let jet = empirical_flex_row_nll_jet2(&fx, &p0);
 
-        eprintln!(
-            "#932 flex timing  r={r}  iters={iters}\n  hand_path  = {hand_ns:.1} ns/row\n  jet2_naive = {jet_ns:.1} ns/row\n  ratio jet2/hand = {:.2}x  (acc={acc:.3}, acc2={acc2:.3})",
-            jet_ns / hand_ns
+        assert!(
+            (neglog - jet.v).abs() <= 1e-9 * jet.v.abs().max(1.0),
+            "value: hand {neglog:+.12e} != jet {:+.12e}",
+            jet.v,
         );
+        for u in 0..r {
+            assert!(
+                (scratch.grad[u] - jet.g[u]).abs() <= 1e-9 * jet.g[u].abs().max(1.0),
+                "grad[{u}]: hand {:+.12e} != jet {:+.12e}",
+                scratch.grad[u],
+                jet.g[u],
+            );
+            for v in 0..r {
+                let h_hand = scratch.hess[[u, v]];
+                let h_jet = jet.h[u * r + v];
+                assert!(
+                    (h_hand - h_jet).abs() <= 1e-9 * h_jet.abs().max(1.0),
+                    "hess[{u},{v}]: hand {h_hand:+.12e} != jet {h_jet:+.12e}"
+                );
+            }
+        }
     }
 }
