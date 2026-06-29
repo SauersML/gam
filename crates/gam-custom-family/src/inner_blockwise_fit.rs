@@ -4006,8 +4006,34 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // curved (large-decrement) unconverged iterate. A still-progressing
             // solve never reaches the stall window (its residual keeps improving,
             // resetting the counter).
+            //
+            // Plateau disjunct (gam#1607 gaussian/binomial homoscedastic location-
+            // scale). The residual-stall window alone has a complementary blind
+            // spot to the multinomial drift it was built for: a near-flat scale
+            // ridge (homoscedastic data → the log_σ block is weakly identified, the
+            // μ block's penalized residual floors a few ×10⁻² above `residual_tol`
+            // with a tiny `decrement`) keeps the raw residual JITTERING by >10% per
+            // cycle around its plateau (0.031 → 0.024 → 0.028), so the 10%-drop test
+            // resets `cycles_since_residual_improved` to 0 every cycle and the stall
+            // window NEVER reaches DECREMENT_STALL_WINDOW within the (outer-capped,
+            // ~12-cycle) refit budget. The OBJECTIVE, however, is genuinely flat
+            // there (`objective_change` ~10⁻⁵ ≪ `objective_tol`) — that is the very
+            // signal the original gam#1082 precondition used before it was narrowed
+            // to the stall window for the multinomial gauge-drift case (where the
+            // objective keeps changing). Restoring it as a DISJUNCTIVE alternative
+            // recovers the homoscedastic case without touching multinomial (which
+            // still fires via the stall window): both disjuncts gate the SAME
+            // rigorous `decrement ≤ objective_tol` Conn–Gould–Toint stopping test
+            // below, so neither can certify a genuinely reducible (large-decrement)
+            // iterate — a fit one resolvable step from the optimum has a large
+            // decrement (fails the bound) regardless of which precondition admits
+            // it, and a fit still making real objective progress has
+            // `objective_change > objective_tol` (fails this disjunct) AND a
+            // descending residual that resets the stall window (fails the other).
             const DECREMENT_STALL_WINDOW: usize = 3;
-            if cycles_since_residual_improved >= DECREMENT_STALL_WINDOW
+            let decrement_precondition = cycles_since_residual_improved >= DECREMENT_STALL_WINDOW
+                || objective_change <= objective_tol;
+            if decrement_precondition
                 && let Some(decrement) = joint_spectrum
                     .as_ref()
                     .map(|spectrum| spectrum.newton_decrement())
