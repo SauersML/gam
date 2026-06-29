@@ -874,7 +874,7 @@ fn separation_barrier_analytic_gradient_matches_central_fd_1026() {
     dec1[[2, 2]] = 0.9;
 
     let mut term = two_atom_barrier_term(dec0, dec1);
-    let (v, analytic) = term.separation_barrier_value_and_grad_for_test();
+    let (v, analytic) = term.separation_barrier_value_and_grad_for_test(1.0);
     assert!(
         v.abs() > 0.0 && analytic.iter().any(|g| g.abs() > 0.0),
         "fixture must engage the separation barrier (value {v:e} and a nonzero \
@@ -882,7 +882,7 @@ fn separation_barrier_analytic_gradient_matches_central_fd_1026() {
     );
     let fd = barrier_fd_grad(
         &mut term,
-        |t| t.separation_barrier_value_and_grad_for_test().0,
+        |t| t.separation_barrier_value_and_grad_for_test(1.0).0,
         1e-6,
     );
     let err = rel_grad_err(&analytic, &fd);
