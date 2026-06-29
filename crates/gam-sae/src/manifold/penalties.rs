@@ -415,6 +415,7 @@ impl SaeManifoldTerm {
         sys: &mut ArrowSchurSystem,
         penalty_scale: f64,
         dense_beta_curvature: bool,
+        atom_curv: &mut [f64],
     ) -> bool {
         let mu = penalty_scale * sae_separation_barrier_strength();
         if mu == 0.0 {
@@ -487,23 +488,44 @@ impl SaeManifoldTerm {
                 }
             }
             wrote = true;
-            if !dense_beta_curvature {
-                continue;
-            }
-            // Levenberg PSD majorizer: positive scalar on each atom's
-            // diagonal block, magnitude `2α c²/n_·²`, growing as c²→1.
+            // Levenberg PSD majorizer: a positive scalar on each atom's diagonal
+            // block, magnitude `2α c²/n_·²`, growing as c²→1 — exactly the
+            // separating curvature needed at the co-collapse alignment limit.
             let lev_j = 2.0 * alpha * c2 / nj2;
             let lev_k = 2.0 * alpha * c2 / nk2;
-            if lev_j > 0.0 {
-                for idx in 0..(m_j * p) {
-                    let g_i = off_j + idx;
-                    sys.hbb[[g_i, g_i]] += lev_j;
+            if dense_beta_curvature {
+                // Dense path: scatter onto the dense `sys.hbb` diagonal — the
+                // block `effective_penalty_op` reads (`DensePenaltyOp(hbb)`).
+                if lev_j > 0.0 {
+                    for idx in 0..(m_j * p) {
+                        let g_i = off_j + idx;
+                        sys.hbb[[g_i, g_i]] += lev_j;
+                    }
                 }
-            }
-            if lev_k > 0.0 {
-                for idx in 0..(m_k * p) {
-                    let g_i = off_k + idx;
-                    sys.hbb[[g_i, g_i]] += lev_k;
+                if lev_k > 0.0 {
+                    for idx in 0..(m_k * p) {
+                        let g_i = off_k + idx;
+                        sys.hbb[[g_i, g_i]] += lev_k;
+                    }
+                }
+            } else {
+                // #1610 — matrix-free / framed production path: `sys.hbb` is unused
+                // (the β-block is the structured `penalty_op`), so a dense-hbb write
+                // is silently dropped and the dictionary co-collapses (indefinite
+                // joint Hessian → non-PD reduced Schur → all seeds rejected on real
+                // OLMo). The majorizer is a per-ATOM scalar ridge `lev·I` over the
+                // whole `M_k·p` decoder block; because the frame `U_k` is
+                // orthonormal (`U_kᵀU_k = I`) it projects to the same scalar ridge
+                // in factored coordinates. Hand the per-atom scalar back to the
+                // assembler, which folds it into `smooth_scaled_s[k]` — the single
+                // source for the CPU composite penalty op AND the device smooth
+                // blocks — so the curvature reaches the operator on every path
+                // (CPU dense-Direct, CPU PCG, device PCG) with no divergence.
+                if lev_j > 0.0 {
+                    atom_curv[j] += lev_j;
+                }
+                if lev_k > 0.0 {
+                    atom_curv[k] += lev_k;
                 }
             }
         }
@@ -774,7 +796,8 @@ impl SaeManifoldTerm {
         let mut sys = ArrowSchurSystem::new(0, 0, self.beta_dim());
         sys.gb = Array1::<f64>::zeros(self.beta_dim());
         sys.hbb = Array2::<f64>::zeros((0, 0));
-        self.add_sae_separation_barrier(&mut sys, penalty_scale, false);
+        let mut atom_curv = vec![0.0_f64; self.k_atoms()];
+        self.add_sae_separation_barrier(&mut sys, penalty_scale, false, &mut atom_curv);
         (self.separation_barrier_value(penalty_scale), sys.gb)
     }
 }

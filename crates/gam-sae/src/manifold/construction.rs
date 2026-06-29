@@ -5127,8 +5127,45 @@ impl SaeManifoldTerm {
         // curvature on normalized shapes weighted by coactivation. Both accumulate
         // into the full-`B` β-tier here, BEFORE the frame transform, so a framed
         // system carries them identically to the analytic β penalties.
-        if self.add_sae_separation_barrier(&mut sys, penalty_scale, dense_beta_curvature) {
-            beta_penalty_assembly.record_curvature(dense_beta_curvature);
+        // #1610 — on the dense path the barrier's Levenberg majorizer scatters
+        // onto `sys.hbb`; on the matrix-free / framed production path `sys.hbb` is
+        // unused, so the barrier hands back a per-atom scalar ridge which we fold
+        // into `smooth_scaled_s` (the single source for the CPU composite penalty
+        // op AND the device smooth blocks), restoring the collapse-prevention
+        // curvature the operator was silently dropping there.
+        let mut sep_atom_curv = vec![0.0_f64; self.atoms.len()];
+        if self.add_sae_separation_barrier(
+            &mut sys,
+            penalty_scale,
+            dense_beta_curvature,
+            &mut sep_atom_curv,
+        ) {
+            if dense_beta_curvature {
+                beta_penalty_assembly.record_curvature(true);
+            } else {
+                // Fold the per-atom majorizer `lev_k·I_{M_k}` into the smooth
+                // penalty factor `λ S_k`. With `⊗ I_p` (full-`B`) or `⊗ I_{r_k}`
+                // (factored, `U_kᵀU_k = I`) this is exactly the `lev_k·I` block
+                // diagonal the dense path writes — and it now flows through the
+                // structured penalty op and the device smooth blocks. No
+                // `deferred_factored` mark: the curvature is in the smooth op, not
+                // a deferred dense block, so the device path stays engaged.
+                for atom_idx in 0..self.atoms.len() {
+                    let c = sep_atom_curv[atom_idx];
+                    if c > 0.0 {
+                        let m = smooth_scaled_s[atom_idx].nrows();
+                        for i in 0..m {
+                            smooth_scaled_s[atom_idx][[i, i]] += c;
+                        }
+                        smooth_ops[atom_idx] = Arc::new(IdentityRightKroneckerPenaltyOp {
+                            factor_a: smooth_scaled_s[atom_idx].clone(),
+                            p,
+                            global_offset: beta_offsets[atom_idx],
+                            k: beta_dim,
+                        });
+                    }
+                }
+            }
         }
         if frames_engaged {
             // ── #972 / #977 T1 — FACTORED β-tier transform ──────────────────
