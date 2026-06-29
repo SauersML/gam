@@ -925,6 +925,7 @@ fn apply_global_smooth_identifiability(
         let owner_indices = if replay_z.is_some()
             || skip_global_transform
             || termspec.basis.is_marginally_centered_tensor()
+            || termspec.basis.is_sum_to_zero_factor_smooth()
         {
             Vec::new()
         } else {

@@ -563,6 +563,35 @@ impl SmoothBasisSpec {
         )
     }
 
+    /// A sum-to-zero factor smooth (`bs="sz"`) has ALREADY removed the
+    /// cross-group main effect analytically, in coefficient space, via its
+    /// `Σ_g d_g(x) ≡ 0` reparameterization (`L-1` deviation blocks with the
+    /// reference level the negative sum of the others) — exactly mgcv's `sz`
+    /// construction, which is self-identifiable against an overlapping `s(x)`
+    /// with no further constraint. Residualizing it a SECOND time against the
+    /// realized B-spline span of the explicit `s(x)` smooth is redundant in
+    /// exact arithmetic (the common-to-all-groups component is zero by
+    /// construction) and actively HARMFUL on finite data: each deviation block
+    /// is a B-spline in `x` whose realized columns share `s(x)`'s span, so the
+    /// joint residualization collapses the full `L·k`-column deviation design to
+    /// `L·k − rank(s(x))` columns and eats the within-group curvature `s(x)`
+    /// cannot represent. REML then rails the deviation smoothing parameter and
+    /// the factor smooth under-recovers (#1605). This is the exact analogue of
+    /// the marginally-centered tensor (`ti`) exemption (#1470), so such a term
+    /// takes NO owner-residualization block.
+    pub fn is_sum_to_zero_factor_smooth(&self) -> bool {
+        matches!(
+            self,
+            Self::FactorSumToZero { .. }
+                | Self::FactorSmooth {
+                    spec: FactorSmoothSpec {
+                        flavour: FactorSmoothFlavour::Sz,
+                        ..
+                    }
+                }
+        )
+    }
+
     /// Feature columns this basis consumes, used alongside [`structural_kind`]
     /// to disambiguate two same-kind smooths on different axes. Wrapper
     /// variants delegate to their inner basis.
