@@ -68,7 +68,13 @@ pub(crate) fn external_reml_seed_config(k: usize, link: LinkFunction) -> SeedCon
     SeedConfig {
         bounds: (-12.0, 12.0),
         max_seeds: if gaussian && k <= 4 {
-            2
+            // #1074: widen the small-k Gaussian candidate pool from 2 to 4 so the
+            // flexible anchor shifts AND the absolute over-smoothing probe (set
+            // below) both survive into the screened pool instead of one being
+            // truncated. With promote-extreme seeding (now enabled for Gaussian)
+            // and seed_budget 2, the flexible basin is solved at slot 0 and the
+            // heavy basin at slot 1.
+            4
         } else if gaussian && k <= 12 {
             4
         } else if gaussian {
@@ -80,7 +86,13 @@ pub(crate) fn external_reml_seed_config(k: usize, link: LinkFunction) -> SeedCon
         } else {
             10
         },
-        seed_budget: if gaussian && k <= 6 { 1 } else { 2 },
+        // #1074: Gaussian small-k fits get TWO full-budget solves (was 1) so the
+        // heavily-penalized basin is actually solved alongside the flexible one;
+        // lowest-cost keep-best then returns whichever has the lower REML, so a
+        // genuinely flexible fit (tp_2d/te_3d) is never worsened while a
+        // weak-signal over-rich spatial fit (quakes) can escape the over-fit
+        // basin it currently rails into (edf≈104 → mgcv-like).
+        seed_budget: 2,
         risk_profile: if gaussian {
             SeedRiskProfile::Gaussian
         } else {
@@ -88,7 +100,12 @@ pub(crate) fn external_reml_seed_config(k: usize, link: LinkFunction) -> SeedCon
         },
         screen_max_inner_iterations: SeedConfig::default().screen_max_inner_iterations,
         num_auxiliary_trailing: 0,
-        over_smoothing_probe_rho: None,
+        // #1074: an ABSOLUTE high-λ probe (interior, below the 11.5 over-smoothing
+        // boundary so it is promoted as the heaviest interior seed rather than
+        // parked at the tail) seeds the over-smoothed basin the Gaussian global
+        // shifts (±4) and baseline centers (±6) never reach. None for non-Gaussian
+        // (their symmetric shifts + promote-extreme already span both basins).
+        over_smoothing_probe_rho: if gaussian { Some(8.0) } else { None },
     }
 }
 
