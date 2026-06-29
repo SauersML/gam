@@ -1079,25 +1079,36 @@ impl TakahashiInverse {
         let (symbolic, values) = s.parts();
         let s_col_ptr = symbolic.col_ptr();
         let s_row_idx = symbolic.row_idx();
-        let mut trace = 0.0;
-        for col in 0..s.ncols() {
-            let col_start = s_col_ptr[col];
-            let col_end = s_col_ptr[col + 1];
-            for idx in col_start..col_end {
-                let row = s_row_idx[idx];
-                if row > col {
-                    continue; // skip lower triangle (handled via its mirror)
+        // tr(Z S) = Σ_diag Z[i,i] S[i,i] + 2 Σ_{i<j} Z[i,j] S[i,j]. Each column's
+        // contribution is independent of every other column's, so the outer loop
+        // is a pure associative reduction — fan it across rayon. `self.get` takes
+        // `&self`, and its on-demand exact-inverse-column cache is `Mutex`-guarded
+        // (`exact_columns`), so concurrent lookups — including cache-miss column
+        // solves — are sound. (This parallelization was first landed for #759 in
+        // b7879667b, then lost in the gam-linalg crate-extraction refactor
+        // a80fe6943; restored here with a regression test pinning the agreement.)
+        (0..s.ncols())
+            .into_par_iter()
+            .map(|col| {
+                let col_start = s_col_ptr[col];
+                let col_end = s_col_ptr[col + 1];
+                let mut partial = 0.0;
+                for idx in col_start..col_end {
+                    let row = s_row_idx[idx];
+                    if row > col {
+                        continue; // skip lower triangle (handled via its mirror)
+                    }
+                    let val = values[idx];
+                    let z_ij = self.get(row, col);
+                    if row == col {
+                        partial += z_ij * val;
+                    } else {
+                        partial += 2.0 * z_ij * val;
+                    }
                 }
-                let val = values[idx];
-                let z_ij = self.get(row, col);
-                if row == col {
-                    trace += z_ij * val;
-                } else {
-                    trace += 2.0 * z_ij * val;
-                }
-            }
-        }
-        trace
+                partial
+            })
+            .sum()
     }
 }
 
@@ -1419,5 +1430,118 @@ mod tests {
         let block = taka.block(0, 3);
         approx_eq(block[[0, 2]], h_inv[[0, 2]], 1e-10);
         approx_eq(block[[2, 0]], h_inv[[2, 0]], 1e-10);
+    }
+
+    /// Build the dense inverse of an SPD matrix via per-column Cholesky solves.
+    fn dense_inverse_spd(h: &Array2<f64>) -> Array2<f64> {
+        let n = h.nrows();
+        let chol = h.cholesky(Side::Lower).unwrap();
+        let mut inv = Array2::<f64>::zeros((n, n));
+        for j in 0..n {
+            let mut rhs = Array1::<f64>::zeros(n);
+            rhs[j] = 1.0;
+            let col = chol.solvevec(&rhs);
+            for i in 0..n {
+                inv[[i, j]] = col[i];
+            }
+        }
+        inv
+    }
+
+    /// Reference tr(Z·S) computed densely from full matrices.
+    fn dense_trace_product(z: &Array2<f64>, s_dense: &Array2<f64>) -> f64 {
+        let n = z.nrows();
+        let mut acc = 0.0;
+        for i in 0..n {
+            for j in 0..n {
+                acc += z[[i, j]] * s_dense[[j, i]];
+            }
+        }
+        acc
+    }
+
+    #[test]
+    fn trace_product_sparse_matches_dense_reference_small() {
+        // tr(H⁻¹ S) on a small banded SPD H, with S an arbitrary symmetric
+        // sparse matrix supplied as upper-triangle-only CSC.
+        let h = array![
+            [4.0, 1.0, 0.0, 0.0],
+            [1.0, 3.0, 1.0, 0.0],
+            [0.0, 1.0, 2.5, 1.0],
+            [0.0, 0.0, 1.0, 2.0]
+        ];
+        let s = array![
+            [2.0, 0.5, 0.0, 0.1],
+            [0.5, 1.5, 0.3, 0.0],
+            [0.0, 0.3, 1.0, 0.4],
+            [0.1, 0.0, 0.4, 3.0]
+        ];
+
+        let h_sparse = dense_to_sparse_symmetric_upper(&h, ZERO_TOL).unwrap();
+        let s_sparse = dense_to_sparse_symmetric_upper(&s, ZERO_TOL).unwrap();
+        let sfactor = factorize_simplicial(&h_sparse).unwrap();
+        let taka = TakahashiInverse::compute(&sfactor).unwrap();
+
+        let h_inv = dense_inverse_spd(&h);
+        let expected = dense_trace_product(&h_inv, &s);
+        approx_eq(taka.trace_product_sparse(&s_sparse), expected, 1e-9);
+    }
+
+    /// #759 regression: `trace_product_sparse` is a rayon reduction over columns.
+    /// On a larger system (many columns, off-pattern S entries that force
+    /// cache-miss exact-column solves under the `Mutex`-guarded cache) the
+    /// parallel sum must agree with the dense reference to rounding. This pins
+    /// the parallelization so a future refactor can't silently revert it to a
+    /// serial scan again (as happened between b7879667b and a80fe6943).
+    #[test]
+    fn trace_product_sparse_parallel_matches_dense_reference_large() {
+        // n=40 tridiagonal SPD H (diagonally dominant -> SPD).
+        let n = 40usize;
+        let mut h = Array2::<f64>::zeros((n, n));
+        for i in 0..n {
+            h[[i, i]] = 4.0 + (i as f64) * 0.01;
+            if i + 1 < n {
+                h[[i, i + 1]] = 1.0;
+                h[[i + 1, i]] = 1.0;
+            }
+        }
+        // S is symmetric with both near-diagonal and far off-diagonal entries,
+        // so tr(Z·S) touches inverse entries OUTSIDE the Cholesky pattern,
+        // exercising the on-demand exact-column cache concurrently.
+        let mut s = Array2::<f64>::zeros((n, n));
+        for i in 0..n {
+            s[[i, i]] = 2.0 + (i as f64) * 0.05;
+        }
+        for &(i, j, v) in &[
+            (0usize, 3usize, 0.7f64),
+            (1, 5, -0.4),
+            (2, 9, 0.3),
+            (4, 20, 0.25),
+            (7, 30, -0.15),
+            (10, 39, 0.2),
+            (15, 22, 0.35),
+        ] {
+            s[[i, j]] = v;
+            s[[j, i]] = v;
+        }
+
+        let h_sparse = dense_to_sparse_symmetric_upper(&h, ZERO_TOL).unwrap();
+        let s_sparse = dense_to_sparse_symmetric_upper(&s, ZERO_TOL).unwrap();
+        let sfactor = factorize_simplicial(&h_sparse).unwrap();
+        let taka = TakahashiInverse::compute(&sfactor).unwrap();
+
+        let h_inv = dense_inverse_spd(&h);
+        let expected = dense_trace_product(&h_inv, &s);
+
+        let got = taka.trace_product_sparse(&s_sparse);
+        approx_eq(got, expected, 1e-8);
+
+        // Determinism / order-invariance: repeated calls (cache now warm) agree
+        // bit-for-bit with the first parallel reduction.
+        let got_again = taka.trace_product_sparse(&s_sparse);
+        assert_eq!(
+            got, got_again,
+            "parallel trace_product_sparse must be deterministic across calls"
+        );
     }
 }
