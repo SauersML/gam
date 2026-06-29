@@ -12,6 +12,22 @@ pub(crate) const FIRTH_DERIVATIVE_PARALLEL_MIN_N: usize = 16_384;
 /// ill-conditioned near active-subspace boundaries.
 pub(crate) const FIRTH_REDUCED_FISHER_RCOND_WARN: f64 = 1e-10;
 
+/// β-dependent reduced-space pieces of the Firth/Jeffreys operator at the
+/// current `η`, produced by `FirthDenseOperator::firth_reduced_core` from a
+/// cached β-independent [`FirthDesignFactor`]. The full operator build consumes
+/// every field; the lightweight PIRLS-diagnostics path consumes only `w`, `w1`,
+/// `h_diag`, and `half_log_det`.
+struct FirthReducedCore {
+    w: Array1<f64>,
+    w1: Array1<f64>,
+    w2: Array1<f64>,
+    w3: Array1<f64>,
+    w4: Array1<f64>,
+    k_reduced: Array2<f64>,
+    half_log_det: f64,
+    h_diag: Array1<f64>,
+}
+
 impl<'a> RemlState<'a> {
     pub(crate) fn xt_diag_x_dense_into(
         x: &Array2<f64>,
@@ -440,6 +456,10 @@ impl FirthDenseOperator {
         Self::build_with_observation_weights_impl(link, x_dense, eta, Some(observation_weights))
     }
 
+    // Test-only since #1575: the production inner-PIRLS path reads the hat
+    // diagonal through `pirls_diagnostics_from_factor`; this accessor remains for
+    // the operator-equivalence unit tests.
+    #[cfg(test)]
     #[inline]
     pub(crate) fn pirls_hat_diag(&self) -> Array1<f64> {
         &self.w * &self.h_diag
@@ -464,6 +484,10 @@ impl FirthDenseOperator {
     /// correct link-general shift from the same `w`, `w1`, `h_diag` the operator
     /// already caches. `w_i ≤ 0` rows contribute no curvature and get a zero
     /// shift (they cannot enter `Xᵀ W (z*−η)` anyway).
+    ///
+    /// Test-only since #1575: production reads the shift through
+    /// `pirls_diagnostics_from_factor`; this accessor remains for unit tests.
+    #[cfg(test)]
     #[inline]
     pub(crate) fn pirls_firth_score_shift(&self) -> Array1<f64> {
         let mut shift = Array1::<f64>::zeros(self.w.len());
@@ -474,6 +498,229 @@ impl FirthDenseOperator {
             }
         }
         shift
+    }
+
+    /// Build the β-independent (design-only) factor of the Firth/Jeffreys
+    /// operator: the identifiable-subspace basis `Q`, the reduced design
+    /// `X_r = A^{1/2} X Q`, the retained design-Gram spectrum `S_r`, and the raw
+    /// design/transpose. This is the O(n·p²) Gram + O(p³) eigendecomposition +
+    /// the n×p design clones. None of it depends on `η`/β, so it is computed
+    /// ONCE per inner PIRLS solve and reused across Newton iterations (#1575).
+    ///
+    /// `build_with_observation_weights_impl` is exactly this factor followed by
+    /// the per-η remainder, so existing callers stay bit-for-bit identical.
+    pub(crate) fn build_design_factor_with_observation_weights(
+        x_dense: &Array2<f64>,
+        observation_weights: Option<ndarray::ArrayView1<'_, f64>>,
+    ) -> Result<FirthDesignFactor, EstimationError> {
+        let n = x_dense.nrows();
+        let observation_weight_sqrt = if let Some(weights) = observation_weights {
+            if weights.len() != n {
+                crate::bail_invalid_estim!(
+                    "Firth operator observation weight length {} != number of rows {}",
+                    weights.len(),
+                    n
+                );
+            }
+            let mut sqrt = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let weight = weights[i];
+                if !weight.is_finite() || weight < 0.0 {
+                    crate::bail_invalid_estim!(
+                        "Firth operator requires finite nonnegative observation weights, got {} at row {}",
+                        weight,
+                        i
+                    );
+                }
+                sqrt[i] = weight.sqrt();
+            }
+            Some(sqrt)
+        } else {
+            None
+        };
+        let basis_design = if let Some(scale) = observation_weight_sqrt.as_ref() {
+            RemlState::row_scale(x_dense, scale)
+        } else {
+            x_dense.clone()
+        };
+        // X̃ᵀX̃ Gram → identifiable-subspace basis Q and retained spectrum S_r.
+        let gram = fast_atb(&basis_design, &basis_design);
+        let (q_basis, metric_spectrum) = Self::identifiable_subspace_basis_from_gram(&gram)?;
+        let x_reduced = fast_ab(&basis_design, &q_basis);
+        let r = q_basis.ncols();
+        let mut x_metric_reduced_inv_diag = Array1::<f64>::zeros(r);
+        for col in 0..r {
+            x_metric_reduced_inv_diag[col] = metric_spectrum[col].recip();
+        }
+        let x_dense_t = x_dense.t().to_owned();
+        Ok(FirthDesignFactor {
+            x_dense: x_dense.clone(),
+            x_dense_t,
+            q_basis,
+            x_reduced,
+            observation_weight_sqrt,
+            metric_spectrum,
+            x_metric_reduced_inv_diag,
+            r,
+            n,
+        })
+    }
+
+    /// β-dependent reduced core shared by [`Self::build_from_design_factor`] and
+    /// [`Self::pirls_diagnostics_from_factor`]: from the cached design factor and
+    /// the current `η`, compute the Fisher-weight 5-jet, the reduced Fisher
+    /// inverse `K_r`, the identifiable-subspace half-log-determinant, and the hat
+    /// diagonal `h`. The operations and their order match the un-hoisted
+    /// `build_with_observation_weights_impl` exactly, so every consumer stays
+    /// bit-for-bit identical.
+    fn firth_reduced_core(
+        factor: &FirthDesignFactor,
+        link: &InverseLink,
+        eta: &Array1<f64>,
+    ) -> Result<FirthReducedCore, EstimationError> {
+        let n = factor.n;
+        if eta.len() != n {
+            crate::bail_invalid_estim!(
+                "Firth operator shape mismatch: nrows={}, eta_len={}",
+                n,
+                eta.len()
+            );
+        }
+        let r = factor.r;
+        let mut w = Array1::<f64>::zeros(n);
+        let mut w1 = Array1::<f64>::zeros(n);
+        let mut w2 = Array1::<f64>::zeros(n);
+        let mut w3 = Array1::<f64>::zeros(n);
+        let mut w4 = Array1::<f64>::zeros(n);
+        RemlState::fill_fisher_weight_derivative_arrays(
+            link, eta, &mut w, &mut w1, &mut w2, &mut w3, &mut w4,
+        )?;
+
+        // Reduced Fisher I_r = X_rᵀ W X_r on the identifiable subspace.
+        let fisher_reduced = gam_linalg::faer_ndarray::fast_xt_diag_x(&factor.x_reduced, &w);
+        if let Ok((eigvals_ir, _)) = fisher_reduced.eigh(Side::Lower) {
+            let max_ev = eigvals_ir.iter().copied().fold(0.0_f64, f64::max).max(1.0);
+            let min_ev = eigvals_ir
+                .iter()
+                .copied()
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .fold(f64::INFINITY, f64::min);
+            if min_ev.is_finite() {
+                let rel = min_ev / max_ev;
+                if rel < FIRTH_REDUCED_FISHER_RCOND_WARN {
+                    log::warn!(
+                        "[REML/Firth] reduced Fisher I_r is near-singular (min/max={:.3e}/{:.3e}, rel={:.3e}); exact derivatives may be ill-conditioned near active-subspace boundaries.",
+                        min_ev,
+                        max_ev,
+                        rel
+                    );
+                }
+            }
+        }
+
+        let (k_reduced, mut half_log_det) = if r > 0 {
+            RemlState::reduced_fisher_inverse_and_half_logdet(&fisher_reduced)?
+        } else {
+            (Array2::<f64>::zeros((r, r)), 0.0)
+        };
+        if r > 0 {
+            for col in 0..r {
+                let metric_eig = factor.metric_spectrum[col];
+                half_log_det -= 0.5 * metric_eig.ln();
+            }
+        }
+        let h_diag = if r > 0 {
+            RemlState::reduced_diag_gram(&factor.x_reduced, &k_reduced)
+        } else {
+            Array1::<f64>::zeros(n)
+        };
+        Ok(FirthReducedCore {
+            w,
+            w1,
+            w2,
+            w3,
+            w4,
+            k_reduced,
+            half_log_det,
+            h_diag,
+        })
+    }
+
+    /// Rebuild the full Firth operator at a new `η` from a cached design factor.
+    /// Pure memoization: byte-identical to `build_with_observation_weights_impl`
+    /// for the same `(link, design, weights, η)`.
+    pub(crate) fn build_from_design_factor(
+        factor: &FirthDesignFactor,
+        link: &InverseLink,
+        eta: &Array1<f64>,
+    ) -> Result<FirthDenseOperator, EstimationError> {
+        let FirthReducedCore {
+            w,
+            w1,
+            w2,
+            w3,
+            w4,
+            k_reduced,
+            half_log_det,
+            h_diag,
+        } = Self::firth_reduced_core(factor, link, eta)?;
+        let b_base = RemlState::row_scale(&factor.x_dense, &w1);
+        let p_b_base = RemlState::apply_hadamard_gram_to_matrix(
+            &factor.x_reduced,
+            &k_reduced,
+            &k_reduced,
+            &b_base,
+        );
+        Ok(FirthDenseOperator {
+            x_dense: factor.x_dense.clone(),
+            x_dense_t: factor.x_dense_t.clone(),
+            q_basis: factor.q_basis.clone(),
+            x_reduced: factor.x_reduced.clone(),
+            observation_weight_sqrt: factor.observation_weight_sqrt.clone(),
+            k_reduced,
+            x_metric_reduced_inv_diag: factor.x_metric_reduced_inv_diag.clone(),
+            half_log_det,
+            h_diag,
+            w,
+            w1,
+            w2,
+            w3,
+            w4,
+            b_base,
+            p_b_base,
+        })
+    }
+
+    /// Compute ONLY the three PIRLS Firth diagnostics — `(hat_diag,
+    /// jeffreys_logdet, firth_score_shift)` — from a cached design factor at a
+    /// new `η`, skipping the per-iteration `B = diag(w') X` and `P·B` Hadamard
+    /// blocks that the inner PIRLS solve never consumes. Each output is the same
+    /// closed form the full operator's accessors return:
+    ///   hat_diag         = w ⊙ h_diag             (`pirls_hat_diag`),
+    ///   jeffreys_logdet  = half_log_det           (`jeffreys_logdet`),
+    ///   firth_score_shift= ½ (w'/w) ⊙ h_diag      (`pirls_firth_score_shift`),
+    /// so the result is bit-for-bit identical to building the full operator and
+    /// calling those accessors, at a fraction of the cost (#1575).
+    pub(crate) fn pirls_diagnostics_from_factor(
+        factor: &FirthDesignFactor,
+        link: &InverseLink,
+        eta: &Array1<f64>,
+    ) -> Result<(Array1<f64>, f64, Array1<f64>), EstimationError> {
+        let core = Self::firth_reduced_core(factor, link, eta)?;
+        let (w, w1, h_diag, half_log_det) =
+            (core.w, core.w1, core.h_diag, core.half_log_det);
+        // hat_diag = w ⊙ h_diag (matches `pirls_hat_diag`).
+        let hat_diag = &w * &h_diag;
+        // firth_score_shift_i = ½ (w'_i / w_i) h_diag_i for w_i > 0, else 0
+        // (matches `pirls_firth_score_shift`).
+        let mut score_shift = Array1::<f64>::zeros(w.len());
+        for i in 0..w.len() {
+            let wi = w[i];
+            if wi > 0.0 {
+                score_shift[i] = 0.5 * (w1[i] / wi) * h_diag[i];
+            }
+        }
+        Ok((hat_diag, half_log_det, score_shift))
     }
 
     pub(crate) fn build_with_observation_weights_impl(
@@ -532,6 +779,16 @@ impl FirthDenseOperator {
         // We fold those fixed a_i into the identifiable basis and reduced design
         // via X̃ = diag(sqrt(a_i)) X, so all derivative formulas continue to use
         // the same η-derivatives of the family Fisher weights w(η), w'(η), ....
+        //
+        // This routine is now a thin wrapper: it builds the β-independent design
+        // factor (Gram, identifiable basis Q, reduced design X_r, retained
+        // spectrum S_r — the O(n·p²) + O(p³) work) and then the β-dependent
+        // remainder at `eta`. The two helpers are split out so a single inner
+        // PIRLS solve can hoist the factor out of the per-Newton-iteration hot
+        // path (#1575) while every output here stays bit-for-bit identical.
+        //
+        // The eta-length check is kept here (before the factor build) to
+        // preserve the original error ordering for existing callers.
         let n = x_dense.nrows();
         if eta.len() != n {
             crate::bail_invalid_estim!(
@@ -540,145 +797,9 @@ impl FirthDenseOperator {
                 eta.len()
             );
         }
-        let observation_weight_sqrt = if let Some(weights) = observation_weights {
-            if weights.len() != n {
-                crate::bail_invalid_estim!(
-                    "Firth operator observation weight length {} != number of rows {}",
-                    weights.len(),
-                    n
-                );
-            }
-            let mut sqrt = Array1::<f64>::zeros(n);
-            for i in 0..n {
-                let weight = weights[i];
-                if !weight.is_finite() || weight < 0.0 {
-                    crate::bail_invalid_estim!(
-                        "Firth operator requires finite nonnegative observation weights, got {} at row {}",
-                        weight,
-                        i
-                    );
-                }
-                sqrt[i] = weight.sqrt();
-            }
-            Some(sqrt)
-        } else {
-            None
-        };
-        let mut w = Array1::<f64>::zeros(n);
-        let mut w1 = Array1::<f64>::zeros(n);
-        let mut w2 = Array1::<f64>::zeros(n);
-        let mut w3 = Array1::<f64>::zeros(n);
-        let mut w4 = Array1::<f64>::zeros(n);
-        RemlState::fill_fisher_weight_derivative_arrays(
-            link, eta, &mut w, &mut w1, &mut w2, &mut w3, &mut w4,
-        )?;
-        let basis_design = if let Some(scale) = observation_weight_sqrt.as_ref() {
-            RemlState::row_scale(x_dense, scale)
-        } else {
-            x_dense.clone()
-        };
-
-        // Build one orthonormal coefficient-space basis Q for the identifiable
-        // subspace of A^{1/2} X (A = I without fixed case weights).
-        //
-        // This must happen even when the weighted design is full rank. The old
-        // Q = I shortcut left full-rank designs in raw coordinates while the
-        // singular branch switched to an orthonormal identifiable basis, so the
-        // reduced Fisher determinant depended on which branch we took rather
-        // than only on the identifiable subspace itself.
-        //
-        // Using the retained eigenspace of X̃ᵀ X̃ for every design keeps both
-        // branches on one representation:
-        //   X̃ = A^{1/2} X,
-        //   Qᵀ Q = I,
-        //   X_r = X̃ Q,
-        //   S_r = X_rᵀ X_r = diag(positive spectrum of X̃ᵀ X̃).
-        let gram = fast_atb(&basis_design, &basis_design);
-        let (q_basis, metric_spectrum) = Self::identifiable_subspace_basis_from_gram(&gram)?;
-        let x_reduced = fast_ab(&basis_design, &q_basis);
-        let r = q_basis.ncols();
-
-        // Reduced Fisher on the identifiable subspace:
-        //   I_r = X_rᵀ W X_r.
-        // Under finite-logit eta, W has strictly positive diagonal entries and
-        // X_r has full column rank by construction, so I_r is SPD.
-        let fisher_reduced = gam_linalg::faer_ndarray::fast_xt_diag_x(&x_reduced, &w);
-        // Smooth-regime diagnostic:
-        // for exact pseudodet derivatives we require I_r to stay SPD on the
-        // fixed identifiable subspace. Emit a warning when I_r appears close
-        // to singular, because this is where Jeffreys/Firth curvature becomes
-        // numerically fragile and active-subspace assumptions may fail.
-        if let Ok((eigvals_ir, _)) = fisher_reduced.eigh(Side::Lower) {
-            let max_ev = eigvals_ir.iter().copied().fold(0.0_f64, f64::max).max(1.0);
-            let min_ev = eigvals_ir
-                .iter()
-                .copied()
-                .filter(|v| v.is_finite() && *v > 0.0)
-                .fold(f64::INFINITY, f64::min);
-            if min_ev.is_finite() {
-                let rel = min_ev / max_ev;
-                if rel < FIRTH_REDUCED_FISHER_RCOND_WARN {
-                    log::warn!(
-                        "[REML/Firth] reduced Fisher I_r is near-singular (min/max={:.3e}/{:.3e}, rel={:.3e}); exact derivatives may be ill-conditioned near active-subspace boundaries.",
-                        min_ev,
-                        max_ev,
-                        rel
-                    );
-                }
-            }
-        }
-
-        let mut x_metric_reduced_inv_diag = Array1::<f64>::zeros(r);
-        let (k_reduced, mut half_log_det) = if r > 0 {
-            // The fixed-Q identifiable-space value is the generalized
-            // determinant 0.5(log|I_r| - log|S_r|), which is equivalent to
-            // evaluating W on the orthonormalized design U = X_r S_r^{-1/2}.
-            //
-            // Because Q diagonalizes X̃ᵀ X̃ by construction, S_r is exactly the
-            // retained positive spectrum of that Gram matrix in these reduced
-            // coordinates, so its inverse/logdet are diagonal operations here.
-            // Prefer the fast SPD path for I_r, but when I_r is only
-            // numerically semidefinite after projection, keep the exact
-            // positive eigenspace instead of failing outright.
-            RemlState::reduced_fisher_inverse_and_half_logdet(&fisher_reduced)?
-        } else {
-            (Array2::<f64>::zeros((r, r)), 0.0)
-        };
-        if r > 0 {
-            for col in 0..r {
-                let metric_eig = metric_spectrum[col];
-                half_log_det -= 0.5 * metric_eig.ln();
-                x_metric_reduced_inv_diag[col] = metric_eig.recip();
-            }
-        }
-        // Reduced design enters M = X_r K_r X_rᵀ and P = M⊙M.
-        let h_diag = if r > 0 {
-            RemlState::reduced_diag_gram(&x_reduced, &k_reduced)
-        } else {
-            Array1::<f64>::zeros(n)
-        };
-        let x_dense_t = x_dense.t().to_owned();
-        let b_base = RemlState::row_scale(x_dense, &w1);
-        let p_b_base =
-            RemlState::apply_hadamard_gram_to_matrix(&x_reduced, &k_reduced, &k_reduced, &b_base);
-        Ok(FirthDenseOperator {
-            x_dense: x_dense.clone(),
-            x_dense_t,
-            q_basis,
-            x_reduced,
-            observation_weight_sqrt,
-            k_reduced,
-            x_metric_reduced_inv_diag,
-            half_log_det,
-            h_diag,
-            w,
-            w1,
-            w2,
-            w3,
-            w4,
-            b_base,
-            p_b_base,
-        })
+        let factor =
+            Self::build_design_factor_with_observation_weights(x_dense, observation_weights)?;
+        Self::build_from_design_factor(&factor, link, eta)
     }
 
     #[inline]
