@@ -2043,6 +2043,44 @@ impl GlmLikelihoodSpec {
         }
     }
 
+    /// Produce a copy of this spec with the Tweedie exponential-dispersion
+    /// `phi` PINNED at `phi` for the duration of the smoothing-parameter (λ)
+    /// search (#1477). Converts an `EstimatedTweediePhi` scale into the
+    /// statistically-identical `FixedDispersion` form, which gates off the
+    /// per-inner-solve Pearson refresh in
+    /// `GamWorkingModel::update_with_curvature` (its guard is
+    /// `tweedie_phi_is_estimated()`, which `FixedDispersion` does not satisfy)
+    /// while leaving every weight / variance / covariance expression unchanged
+    /// (they read `phi` through `fixed_phi()`, which `FixedDispersion` answers
+    /// identically).
+    ///
+    /// Rationale: with `phi` estimated, the inner solver re-derives it from each
+    /// outer iterate's *warm-start* η (the Pearson moment estimator
+    /// `phî = Σ wᵢ(yᵢ−μᵢ)²/μᵢ^p / Σ wᵢ`). The Tweedie LAML omits the
+    /// `phi`-dependent saddlepoint normalizer `a(y,φ)` from `−ℓ(β̂)` — valid only
+    /// when `phi` is fixed across the surface — so a drifting `phi` makes
+    /// `F(ρ)` a non-stationary function of ρ that REWARDS dispersion inflation:
+    /// driving a double-penalty null-space `λ` up kills a genuinely-supported
+    /// linear trend, the residuals grow, the warm-start `phî` rises, and the
+    /// `[yθ−κ]/φ` deviance term shrinks with no compensating normalizer penalty,
+    /// so the criterion falls and the outer optimizer rails `λ_null` to the box
+    /// bound (the #1477 Tweedie double-penalty boundary blow-up). Holding `phi`
+    /// fixed across the λ-search makes `F(ρ) = REML(ρ, φ_frozen)` a genuine
+    /// stationary function of ρ, exactly as for the Gaussian profiled scale
+    /// (whose `(n−Mp)/2·log(2πφ̂)` normalizer is retained) and as mgcv does for
+    /// Tweedie. `phi` is still Pearson-refreshed at the single final reported fit
+    /// (the `refine_dispersion_at_converged_eta = true` accept-fit). No-op for
+    /// non-Tweedie families and for a user-fixed `phi`.
+    #[inline]
+    pub fn with_tweedie_phi_frozen_for_search(mut self, phi: f64) -> Self {
+        if matches!(self.spec.response, ResponseFamily::Tweedie { .. })
+            && self.scale.tweedie_phi_is_estimated()
+        {
+            self.scale = LikelihoodScaleMetadata::FixedDispersion { phi };
+        }
+        self
+    }
+
     /// Produce a copy of this spec with the Negative-Binomial overdispersion
     /// `theta` PINNED at `theta` for the duration of the smoothing-parameter
     /// (λ) search (#1082). Converts an `EstimatedNegBinTheta` spec into the

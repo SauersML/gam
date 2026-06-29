@@ -3669,6 +3669,7 @@ impl<'a> RemlState<'a> {
             ift_warm_start_cache: RwLock::new(None),
             last_pirls_lm_lambda: Arc::new(AtomicU64::new(0)),
             frozen_negbin_theta: Arc::new(AtomicU64::new(0)),
+            frozen_tweedie_phi: Arc::new(AtomicU64::new(0)),
             last_ift_prediction_residual: Arc::new(AtomicU64::new(IFT_RESIDUAL_NO_SIGNAL_BITS)),
             last_pirls_accept_rho: Arc::new(AtomicU64::new(IFT_RESIDUAL_NO_SIGNAL_BITS)),
             ift_cached_factor: RwLock::new(None),
@@ -3767,6 +3768,10 @@ impl<'a> RemlState<'a> {
         // PREVIOUS design; a new surface (different X / penalties) must re-freeze
         // it from its own seed. `0` = "not yet frozen".
         self.frozen_negbin_theta.store(0, Ordering::Relaxed);
+        // The λ-search frozen Tweedie φ (#1477) is likewise computed from the
+        // seed fit on the PREVIOUS design; re-freeze it from the new surface's
+        // own seed. `0` = "not yet frozen".
+        self.frozen_tweedie_phi.store(0, Ordering::Relaxed);
         Ok(())
     }
 
@@ -6153,6 +6158,29 @@ impl<'a> RemlState<'a> {
                     }
                 }
             }
+            // Tweedie λ-search φ freeze (#1477). The same drift mechanism as the
+            // NB θ freeze above, with a sharper failure mode: the Tweedie LAML
+            // `−ℓ(β̂)` omits the φ-dependent saddlepoint normalizer, so a φ
+            // re-estimated from each outer iterate's warm-start η does not merely
+            // make `F(ρ)` drift — it makes the criterion REWARD dispersion
+            // inflation, railing a double-penalty null-space `λ` to the box bound
+            // and shipping a boundary blow-up (#1477). Pin every λ-search inner
+            // solve to the first converged solve's Pearson φ so
+            // `F(ρ) = REML(ρ, φ_frozen)` is stationary in ρ; φ is still refreshed
+            // at the single final reported fit. No effect on non-Tweedie or
+            // user-fixed-φ specs.
+            if pirls_config.likelihood.tweedie_phi_is_estimated() {
+                let frozen_bits = self.frozen_tweedie_phi.load(Ordering::Relaxed);
+                if frozen_bits != 0 {
+                    let frozen_phi = f64::from_bits(frozen_bits);
+                    if frozen_phi.is_finite() && frozen_phi > 0.0 {
+                        pirls_config.likelihood = pirls_config
+                            .likelihood
+                            .clone()
+                            .with_tweedie_phi_frozen_for_search(frozen_phi);
+                    }
+                }
+            }
             // Levenberg-Marquardt damping warm-start. Read the cached
             // λ from the previous successful PIRLS solve at this
             // surface (0 = no hint), and seed the inner solver. The
@@ -6331,6 +6359,30 @@ impl<'a> RemlState<'a> {
             log::info!(
                 "[OUTER] negative-binomial λ-search θ frozen at {theta:.6e} (#1082); \
                  outer REML criterion now stationary in ρ"
+            );
+        }
+        // Capture the data-driven Tweedie φ from the first converged non-screening
+        // λ-search solve and freeze it for the rest of the search (#1477), exactly
+        // as for the NB θ above. The first solve estimated φ from the seed η via
+        // the Pearson moment estimator (this branch only runs when no frozen value
+        // exists yet), so the captured value is the seed-fit φ the estimated path
+        // would have used — we simply stop letting it drift (and reward dispersion
+        // inflation) on subsequent outer evaluations.
+        if !in_screening
+            && pirls_result.likelihood.tweedie_phi_is_estimated()
+            && self.frozen_tweedie_phi.load(Ordering::Relaxed) == 0
+            && matches!(
+                pirls_result.status,
+                pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum
+            )
+            && let Some(phi) = pirls_result.likelihood.fixed_phi()
+            && phi.is_finite()
+            && phi > 0.0
+        {
+            self.frozen_tweedie_phi.store(phi.to_bits(), Ordering::Relaxed);
+            log::info!(
+                "[OUTER] tweedie λ-search φ frozen at {phi:.6e} (#1477); \
+                 outer LAML criterion now stationary in ρ"
             );
         }
         // Under seed screening the inner solver is intentionally given a tiny
@@ -6626,6 +6678,22 @@ impl<'a> RemlState<'a> {
                         .likelihood
                         .clone()
                         .with_negbin_theta_frozen_for_search(frozen_theta);
+                }
+            }
+        }
+        // Pin the same λ-search-frozen Tweedie φ the outer loop converged under
+        // (#1477), so the rho-uncertainty sigma-point criterion is evaluated on
+        // the identical stationary surface F(ρ) = REML(ρ, φ_frozen) rather than
+        // re-estimating φ at each off-trajectory σ-point.
+        if pirls_config.likelihood.tweedie_phi_is_estimated() {
+            let frozen_bits = self.frozen_tweedie_phi.load(Ordering::Relaxed);
+            if frozen_bits != 0 {
+                let frozen_phi = f64::from_bits(frozen_bits);
+                if frozen_phi.is_finite() && frozen_phi > 0.0 {
+                    pirls_config.likelihood = pirls_config
+                        .likelihood
+                        .clone()
+                        .with_tweedie_phi_frozen_for_search(frozen_phi);
                 }
             }
         }
