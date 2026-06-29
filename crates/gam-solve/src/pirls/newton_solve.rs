@@ -400,12 +400,12 @@ pub(crate) fn accumulate_outer_upper(
     }
 }
 
-pub(super) fn compute_jeffreys_pirls_diagnostics_sparse(
-    link: &InverseLink,
+/// Densify a CSR design row-major into a fresh `Array2`. Shared by the sparse
+/// Firth diagnostics and the sparse design-factor builder so both densify the
+/// design identically.
+fn dense_design_from_csr(
     x_design_csr: &SparseRowMat<usize, f64>,
-    eta: ArrayView1<f64>,
-    observation_weights: ArrayView1<f64>,
-) -> Result<(Array1<f64>, f64, Array1<f64>), EstimationError> {
+) -> Result<Array2<f64>, EstimationError> {
     let n = x_design_csr.nrows();
     let p = x_design_csr.ncols();
     let mut x_dense = Array2::<f64>::zeros((n, p));
@@ -414,15 +414,52 @@ pub(super) fn compute_jeffreys_pirls_diagnostics_sparse(
         let vals = xview.val_of_row(i);
         let cols = xview.col_idx_of_row_raw(i);
         if cols.len() != vals.len() {
-            crate::bail_invalid_estim!(
-                "sparse row structure mismatch: column/value lengths differ"
-            );
+            crate::bail_invalid_estim!("sparse row structure mismatch: column/value lengths differ");
         }
         for (idx, &col) in cols.iter().enumerate() {
             x_dense[[i, col.unbound()]] = vals[idx];
         }
     }
-    compute_jeffreys_pirls_diagnostics(link, x_dense.view(), eta, observation_weights)
+    Ok(x_dense)
+}
+
+/// Build the β-independent Firth design factor from a CSR design (#1575). The
+/// densified design and the factor it produces are identical to what the
+/// per-iteration sparse diagnostics path constructed; only the β-dependent
+/// remainder is then rebuilt per Newton iteration.
+pub(super) fn build_firth_design_factor_sparse(
+    x_design_csr: &SparseRowMat<usize, f64>,
+    observation_weights: ArrayView1<f64>,
+) -> Result<FirthDesignFactor, EstimationError> {
+    let x_dense = dense_design_from_csr(x_design_csr)?;
+    FirthDenseOperator::build_design_factor_with_observation_weights(
+        &x_dense,
+        Some(observation_weights),
+    )
+}
+
+/// Build the β-independent Firth design factor from a dense design (#1575).
+pub(super) fn build_firth_design_factor_dense(
+    x_design: ArrayView2<f64>,
+    observation_weights: ArrayView1<f64>,
+) -> Result<FirthDesignFactor, EstimationError> {
+    FirthDenseOperator::build_design_factor_with_observation_weights(
+        &x_design.to_owned(),
+        Some(observation_weights),
+    )
+}
+
+/// Compute the three PIRLS Firth diagnostics from a cached β-independent design
+/// factor at the current `η` (#1575). Bit-identical to building the full
+/// operator via `compute_jeffreys_pirls_diagnostics` and reading its accessors,
+/// but skips the per-iteration Gram/eigendecomposition and the unused `B`/`P·B`
+/// Hadamard blocks.
+pub(super) fn jeffreys_pirls_diagnostics_from_factor(
+    factor: &FirthDesignFactor,
+    link: &InverseLink,
+    eta: ArrayView1<f64>,
+) -> Result<(Array1<f64>, f64, Array1<f64>), EstimationError> {
+    FirthDenseOperator::pirls_diagnostics_from_factor(factor, link, &eta.to_owned())
 }
 
 pub(super) fn compute_jeffreys_pirls_diagnostics(
