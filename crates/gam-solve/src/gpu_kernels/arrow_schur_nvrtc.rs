@@ -438,6 +438,10 @@ pub fn system_admits_fused_path(sys: &ArrowSchurSystem) -> bool {
 /// device. Test-only: production routes through the real NVRTC kernel
 /// (`FORWARD_KERNEL_SOURCE` / `plan_fused_launch`), never this emulation.
 #[cfg(test)]
+// On non-linux the consumers of these imports live in `#[cfg(target_os = "linux")]`
+// test bodies (CI runs the device-parity tests on linux), so the imports read as
+// unused under `-D warnings`. Keep the macOS lib-test binary building for everyone.
+#[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
 mod test_support {
     use super::*;
 
@@ -783,6 +787,9 @@ pub fn emulate_fused_arrow_newton_step(
 }
 
 #[cfg(test)]
+// See `test_support`: linux-gated test bodies are the only consumers, so on
+// non-linux these imports are unused under `-D warnings`.
+#[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
 mod tests {
     use super::*;
     use super::test_support::*;
