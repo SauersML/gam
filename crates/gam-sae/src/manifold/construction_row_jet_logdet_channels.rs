@@ -330,7 +330,6 @@ impl SaeManifoldTerm {
     /// Softmax-only: the per-atom-logistic (IBP / JumpReLU) modes keep the jet
     /// path (their hand gate prior diverged from the live ordered-geometric
     /// prior, so routing them through the jet is the value-preserving choice).
-    #[allow(clippy::too_many_arguments)]
     fn fill_row_jets_hand_softmax(
         &self,
         row: usize,
@@ -629,21 +628,30 @@ impl SaeManifoldTerm {
             beta_l_deriv,
         })
     }
+}
 
-    /// Build [`SaeRowJets`] for FOUR rows at once via the 4-row SIMD batch
-    /// (#932), returning `None` when the four rows are not softmax-aligned (same
-    /// primary layout / temperature). Each lane's `SaeRowJets` is BIT-IDENTICAL
-    /// to `row_jets_for_logdet` on that row: the batch primitives
-    /// (`reconstruction_all_columns_batch4` / `beta_border_order1_batch4`) are
-    /// proven lane-`i` `to_bits`-identical to the scalar `*_packed` paths, and the
-    /// `√w` / `output_c` scaling here mirrors the scalar fills term-for-term.
-    ///
-    /// DEMOTED TO ORACLE (#932 revert): no longer on the production hot path —
-    /// `refill_jet_window` now builds the hand `row_jets_for_logdet` per row (the
-    /// jet was a 25–57× regression). Retained `#[cfg(test)]` so the jet stays a
-    /// live cross-check of the hand path
-    /// (`batch4_jet_lanes_match_scalar_hand_row_jets`).
-    #[cfg(test)]
+/// Test-only oracle (#932 revert): the demoted 4-row SIMD jet batch, retained as
+/// a live cross-check of the production hand `row_jets_for_logdet`. It lives in a
+/// `#[cfg(test)]` module (rather than carrying a bare `#[cfg(test)]` on the items
+/// inside the production `impl`) so the first-party dead-code / hygiene gates see
+/// it as test support rather than an unreferenced production item.
+#[cfg(test)]
+mod batch4_oracle_tests {
+    use super::*;
+
+    impl SaeManifoldTerm {
+        /// Build [`SaeRowJets`] for FOUR rows at once via the 4-row SIMD batch
+        /// (#932), returning `None` when the four rows are not softmax-aligned (same
+        /// primary layout / temperature). Each lane's `SaeRowJets` is BIT-IDENTICAL
+        /// to `row_jets_for_logdet` on that row: the batch primitives
+        /// (`reconstruction_all_columns_batch4` / `beta_border_order1_batch4`) are
+        /// proven lane-`i` `to_bits`-identical to the scalar `*_packed` paths, and the
+        /// `√w` / `output_c` scaling here mirrors the scalar fills term-for-term.
+        ///
+        /// DEMOTED TO ORACLE (#932 revert): no longer on the production hot path —
+        /// `refill_jet_window` now builds the hand `row_jets_for_logdet` per row (the
+        /// jet was a 25–57× regression). Retained as the live cross-check of the hand
+        /// path (`batch4_jet_lanes_match_scalar_hand_row_jets`).
     pub(crate) fn row_jets_for_logdet_batch4(
         &self,
         rho: &SaeManifoldRho,
@@ -691,7 +699,6 @@ impl SaeManifoldTerm {
     /// applying the identical `√w` / `output_c` scaling the scalar fills use.
     /// Returns `None` if the rows are not batchable (the batch primitives
     /// decline). Test-only oracle helper for `row_jets_for_logdet_batch4`.
-    #[cfg(test)]
     fn batch4_assemble<const K: usize>(
         rows: [&crate::row_jet_program::SaeReconstructionRowProgram; 4],
         vars_each: &[Vec<SaeLocalRowVar>],
@@ -755,7 +762,10 @@ impl SaeManifoldTerm {
             .map_err(|_| "batch4_assemble produced wrong lane count".to_string())?;
         Ok(Some(arr))
     }
+    }
+}
 
+impl SaeManifoldTerm {
     /// Refill the bounded look-ahead jet window with the next row's
     /// [`SaeRowJets`], built by the hand `row_jets_for_logdet`. Returns the next
     /// unbuilt row index.
@@ -764,12 +774,11 @@ impl SaeManifoldTerm {
     /// (`row_jets_for_logdet_batch4`) is a 25–57× throughput regression versus
     /// the hand closed form, so production builds one hand row per refill. The
     /// window machinery is retained (the call sites still drain one row at a
-    /// time) and `n` / `cache` stay in the signature for the unchanged callers.
+    /// time); `cache` stays in the signature for `row_vars_for_cache_row`.
     fn refill_jet_window(
         &self,
         rho: &SaeManifoldRho,
         start: usize,
-        _n: usize,
         cache: &ArrowFactorCache,
         second_jets: &[Array4<f64>],
         border: &[SaeBorderChannel],

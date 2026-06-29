@@ -8189,7 +8189,6 @@ impl SaeManifoldTerm {
                 jet_window_next = self.refill_jet_window(
                     rho,
                     jet_window_next,
-                    n,
                     cache,
                     &second_jets,
                     &border,
@@ -8897,7 +8896,6 @@ impl SaeManifoldTerm {
                 jet_window_next = self.refill_jet_window(
                     rho,
                     jet_window_next,
-                    n,
                     cache,
                     &second_jets,
                     &border,
@@ -9267,7 +9265,6 @@ impl SaeManifoldTerm {
                 jet_window_next = self.refill_jet_window(
                     rho,
                     jet_window_next,
-                    n,
                     cache,
                     &second_jets,
                     &border,

@@ -1,9 +1,63 @@
 name: Rust CI
 
+# REDESIGN (completeness + speed + total-failure visibility)
+# ----------------------------------------------------------
+# The previous version of this workflow had three structural defects:
+#
+#   1. INCOMPLETE. Its `cargo nextest run --lib --bins --examples` phase ran
+#      WITHOUT `--workspace`/`-p`, so it only built/ran the root `gam` crate's
+#      in-crate tests (it reported "1 test across 30 binaries"). The 23 member
+#      crates under crates/* — ~4,587 `#[test]`s — were NEVER built or run, so
+#      a crate whose `#[cfg(test)]` module failed to COMPILE (e.g. gam-terms,
+#      607 errors) was completely invisible to CI. Its integration loop
+#      `for test_file in tests/*.rs` also matched ONLY the flat `tests/*.rs`
+#      files and silently skipped the ~26 DIRECTORY integration targets
+#      (tests/quality/main.rs, tests/basis_smooth/main.rs, tests/manifolds/...
+#      — ~2,154 more `#[test]`s). Net: ~197 tests actually executed out of a
+#      real surface in the THOUSANDS.
+#
+#   2. SLOW. One job, one 4-vCPU runner, fully serial (`--build-jobs 1
+#      --test-threads 1`), with a per-binary relink loop and a ~350-min budget.
+#
+#   3. FAILURES HIDDEN. A bulk SIGKILL at a wall-clock cap could drop the
+#      per-test summary, so failures were scattered across a giant log.
+#
+# This redesign fixes all three with the nextest BUILD-ONCE / RUN-MANY model:
+#
+#   * `build`     — ONE job runs `cargo nextest archive --workspace
+#                   --all-features` (root crate + every member crate's lib/bins/
+#                   examples + ALL flat AND directory integration targets, all
+#                   auto-discovered). This is the COMPLETENESS fix and it also
+#                   surfaces every COMPILE failure across the workspace
+#                   (CARGO_BUILD_KEEP_GOING=true => one pass reports them all).
+#   * `rust-test` — a `strategy.matrix` of N run-shards on parallel runners, each
+#                   `cargo nextest run --archive-file ... --partition
+#                   count:i/N`. Run-shards DO NOT rebuild/relink (the archive
+#                   holds pre-linked binaries), so the OOM/Bus-error guard, the
+#                   disk-prune, and the serial relink loop are all gone from the
+#                   run side. Parallelism is the speedup; bump `shards` to dial.
+#   * `aggregate` — downloads every shard's output + the build log and writes a
+#                   single MASTER_FAILURES.md artifact listing EVERY compile
+#                   failure and EVERY runtime test failure (status + crate/binary
+#                   + test name + captured error), plus the forbidden-runtime-
+#                   pattern grep and the #1393 slow/timeout attribution.
+#
+# Preserved from the old workflow: the nextest `ci` profile + per-test
+# slow-timeouts (.config/nextest.toml, untouched), the python-tests maturin/wheel
+# flow, the gam-pyffi special handling (its unit tests run with
+# --no-default-features; the `python_rust_ffi_parity_*` test runs only in
+# python-tests against the installed wheel), the forbidden-runtime-pattern grep,
+# and the build.rs human-author gate (fetch-depth: 0 on every building job).
+
 on:
   schedule:
     - cron: "0 2 * * *"
   workflow_dispatch:
+    inputs:
+      shards:
+        description: "Number of parallel test run-shards (matrix size)."
+        default: "10"
+        required: false
 
 concurrency:
   group: rust-ci-${{ github.ref }}
@@ -15,37 +69,68 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # #1072: the per-file integration loop ran `cargo {test,nextest run} --test
-  # <name>` once per tests/*.rs and recompiled the `gam` crate FROM SCRATCH every
-  # iteration (~3.5 min × 707 files ≈ 41 h vs the 6 h cap → only ~3% of tests ran
-  # before the job was cancelled). Root cause: the per-iteration deletion of
-  # target/debug/incremental/ corrupted cargo's incremental fingerprint and
-  # forced a full gam rebuild on the next `--test`. Disabling incremental
-  # entirely removes that corruption surface: gam's rlib is built ONCE (the
-  # --lib phase), then reused unchanged by every per-file `--test` link.
+  # See the long note in the old workflow (#1072): incremental corrupted the
+  # fingerprint and forced full rebuilds. The archive build links every test
+  # binary exactly once, so incremental buys nothing here and only adds a
+  # corruption surface — keep it off.
   CARGO_INCREMENTAL: "0"
-  # Content-addressed compiler cache, shared across CI runs via the GitHub
-  # Actions cache. Pairs with Swatinem/rust-cache (which caches the registry):
-  # sccache turns a cold dep graph warm without relying on a portable target/.
-  # The same RUSTC_WRAPPER seam is honored by build.sh locally, so a shared
-  # remote backend (SCCACHE_BUCKET) would let CI and dev share one cache.
-  # RUSTC_WRAPPER is deliberately NOT set here: sccache aborts at server
-  # startup if its cache backend is unreachable, so wiring every rustc through
-  # it unconditionally turns a GitHub Actions cache outage into a hard build
-  # failure. Each job instead enables the wrapper only after a backend probe
-  # (see "Enable sccache only if its cache backend is reachable"), keeping the
-  # cache a pure speedup that degrades to a cold-but-green build during outages.
+  # Content-addressed compiler cache shared across CI runs (GitHub Actions
+  # backend). Enabled per-job only after a backend reachability probe inside
+  # setup-rust-ci, so a cache outage degrades to a cold-but-green build instead
+  # of a hard failure.
   SCCACHE_GHA_ENABLED: "true"
 
 jobs:
-  test:
-    name: Test
+  # ---------------------------------------------------------------------------
+  # Plan the run-shard matrix. `shards` (workflow_dispatch input, default 10)
+  # becomes a JSON array [1..N] consumed by the rust-test matrix, and `total`
+  # feeds the `count:i/N` partition denominator.
+  # ---------------------------------------------------------------------------
+  setup:
+    name: Plan run shards
     runs-on: ubuntu-latest
-    # Backstop just under GitHub's 6-hour ceiling (360 min). The per-command
-    # wall-clock caps and the per-test slow-timeout (nextest terminate-after)
-    # below fail an over-budget test with a useful name; this job timeout
-    # catches anything outside those wrappers.
-    timeout-minutes: 350
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+      total: ${{ steps.plan.outputs.total }}
+    steps:
+      - id: plan
+        shell: bash
+        run: |
+          set -uo pipefail
+          N="${{ github.event.inputs.shards }}"
+          if ! [[ "$N" =~ ^[0-9]+$ ]] || [ "$N" -lt 1 ]; then N=10; fi
+          echo "total=$N" >> "$GITHUB_OUTPUT"
+          echo "shards=$(seq 1 "$N" | jq -R . | jq -cs .)" >> "$GITHUB_OUTPUT"
+          echo "Planned ${N} parallel run shards."
+
+  # ---------------------------------------------------------------------------
+  # BUILD ONCE. Archive the ENTIRE workspace's test binaries with --all-features.
+  # This is the completeness fix and the single compile gate; it surfaces every
+  # compile failure across the workspace in one pass (keep-going). The archive is
+  # uploaded as an artifact for the run-shards to download and execute.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build & archive workspace tests
+    runs-on: ubuntu-latest
+    # The archive build is the long pole (it compiles + links every test binary
+    # once). Keep a generous backstop under GitHub's 6-hour ceiling.
+    timeout-minutes: 330
+    outputs:
+      archived: ${{ steps.archive.outputs.archived }}
+      test_count: ${{ steps.count.outputs.test_count }}
+    env:
+      # Pin lld to one worker and link test binaries serially: each `gam` test
+      # binary pulls the full dep closure (faer, burn, bevy_reflect, ndarray,
+      # nalgebra, arrow, parquet, ad_trait, num-dual, statrs, …) and two large
+      # links at once overflowed the 16-GB runner ("collect2: ld terminated with
+      # signal 7 [Bus error]"). The run-shards no longer link, so this guard is
+      # only needed here.
+      RUSTFLAGS: "-C link-arg=-Wl,--threads=1"
+      # Build EVERY test target in one pass and report ALL compile errors,
+      # instead of aborting at the first crate that fails to compile. This is
+      # what makes the 607-class member-crate test-compile failures show up
+      # together rather than one-at-a-time.
+      CARGO_BUILD_KEEP_GOING: "true"
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -58,455 +143,471 @@ jobs:
           free-disk-space: 'true'
           cache-targets: 'false'
 
-      # #871: `gam-pyffi` (the PyO3 wheel crate) imports many `pub` items from
-      # `gam` via `use gam::…`. The `gam` crate's own dead-code lint and the
-      # `--lib --bins --examples` test phase below only see in-crate
-      # reachability, so a `pub fn`/`pub mod`/re-export with no `gam`-internal
-      # caller looks dead even when the wheel depends on it. The de-magic /
-      # dead-code sweep deleted such items three times (cyclic and seven more
-      # modules), each only surfacing ~12 min into the release wheel build and
-      # blocking every PyPI publish. Gate cross-crate reachability here so any
-      # pub-item removal that breaks the wheel fast-fails in normal CI instead.
-      - name: Check gam-pyffi cross-crate reachability (#871)
-        shell: bash
-        run: cargo check -p gam-pyffi --all-targets --all-features
-
       - name: Install cargo-nextest
-        # nextest runs each `#[test]` as its own process and enforces the
-        # per-test `slow-timeout`/`terminate-after` from .config/nextest.toml:
-        # a single test that runs past the cap is SIGKILLed and reported as a
-        # FAILURE naming that exact test. `taiki-e/install-action` fetches the
-        # prebuilt nextest binary (no compile) so this stays fast.
         uses: taiki-e/install-action@v2
         with:
           tool: nextest
 
-      - name: Run tests
+      # #871: gam-pyffi imports many `pub` items from `gam`; the root crate's own
+      # dead-code lint cannot see that cross-crate use, so a `pub`-item removal
+      # that breaks the wheel must fast-fail here in normal CI rather than ~12 min
+      # into the release wheel build. `cargo check` does not link, so enabling
+      # `extension-module` via --all-features is fine for a check.
+      - name: Check gam-pyffi cross-crate reachability (#871)
         shell: bash
-        env:
-          # ubuntu-latest is a 4-vCPU / 16-GB runner. By default cargo can
-          # link multiple integration-test binaries in parallel, and each link
-          # of a `gam` test binary pulls in the full dependency closure
-          # (faer, burn, bevy_reflect, ndarray, nalgebra, arrow, parquet,
-          # criterion, ad_trait, autodiff, num-dual, statrs, …). rust-lld
-          # plus collect2 still overflowed the runner when two large test
-          # binaries linked at once, even with lld itself pinned to one worker:
-          # `collect2: fatal error: ld terminated with signal 7 [Bus error]`.
-          # Build/link the test binaries serially below; test execution stays
-          # under Cargo's normal harness once each binary exists.
-          # Rust 1.93 injects `-fuse-ld=lld` for this target. Pin lld to one
-          # worker so the linker does not oversubscribe the runner while Cargo
-          # serializes test-binary links below. The test command also disables
-          # dev debuginfo, which removes the largest non-executable payload from
-          # these huge integration-test links.
-          RUSTFLAGS: "-C link-arg=-Wl,--threads=1"
+        run: cargo check -p gam-pyffi --all-targets --all-features
+
+      # THE COMPLETENESS FIX. `--workspace --all-features` builds the root crate
+      # AND every member crate's lib/bins/examples AND every integration target —
+      # both the flat tests/*.rs and the directory tests/<dir>/main.rs targets,
+      # all auto-discovered by cargo. `--exclude gam-pyffi`: with --all-features,
+      # gam-pyffi's default-on `extension-module` feature is enabled, which tells
+      # PyO3 NOT to link libpython, so a standalone test binary fails to LINK.
+      # gam-pyffi is archived separately below with --no-default-features.
+      #
+      # `--config profile.dev.debug=0` drops dev DWARF (the largest non-executable
+      # payload) to keep the archive small and the links practical on a standard
+      # runner. The step exits 0 even on compile failure so the archive (if any)
+      # and the build log still upload and the run-shards/aggregate jobs proceed;
+      # the compile errors captured in archive-build.log become the aggregate
+      # job's verdict.
+      - name: Build nextest archive (whole workspace, all features)
+        id: archive
+        shell: bash
         run: |
           set -uo pipefail
-          # nextest captures each test's stdout/stderr and, with
-          # failure-output = "immediate-final" in .config/nextest.toml, re-prints
-          # it only for tests that FAILED (or were terminated by the per-test
-          # slow-timeout). That is what we want here: the forbidden-pattern grep
-          # below only fires when the test run returned non-zero, and at that
-          # point the failed tests' captured output is already in
-          # /tmp/cargo-test.log via that final failure block. Passing tests that
-          # deliberately drive the solver into degenerate states (and the
-          # diagnostic eprintln!/log::warn! sites they exercise on the hot
-          # REML / PIRLS / joint-Newton paths) stay silent
-          # (success-output = "never"), so their output cannot accumulate on the
-          # runner's disk and exhaust it mid-link. That accumulation was the
-          # recurring "exit code 101 / LLVM ERROR: No space left on device"
-          # failure mode that this step kept reproducing every time a probe
-          # `eprintln!` got added anywhere in the hot solver paths.
-          # The CI assertions need line numbers from panic output, not full DWARF
-          # debug sections in every integration-test binary. Dropping dev
-          # debuginfo (--config profile.dev.debug=0) removes the largest
-          # non-executable payload from the link and keeps the serialized link
-          # job practical on standard runners.
-          #
-          # PER-TEST timeout: the primary hang catcher is nextest's per-test
-          # slow-timeout (period = 300s, terminate-after = 2 => named SLOW notice
-          # at 300s, SIGKILL at 600s) in .config/nextest.toml — a single `#[test]`
-          # that overruns is reported SLOW by name at 300s and, if it crosses
-          # 600s, SIGKILLed and reported as a FAILURE naming that exact test
-          # (#1393). nextest builds each
-          # tests/*.rs binary (via --test <name>) and the --lib/--bins/--examples
-          # set in isolation below, exactly like the previous per-binary cargo
-          # test loop, so the serial-link + disk-prune discipline is unchanged.
-          #
-          # Per-binary wall-clock caps (GNU timeout) remain as an OUTER backstop
-          # around the whole nextest invocation for one binary: they bound a
-          # build/link hang or a pathological binary whose many fast tests sum
-          # past the budget, and are set comfortably above the 600s per-test cap
-          # so they never preempt nextest's finer-grained, better-named layer.
-          # GNU timeout runs the command in its own process group by default, so
-          # an overrun kills nextest and every test process it spawned instead of
-          # leaving a runaway test behind for later iterations.
-          INTEGRATION_TEST_TIMEOUT=1800
-          LIB_TEST_TIMEOUT=1800
-          # Per-partition cap for the binaries sharded via nextest
-          # `--partition` below (#1393). Higher than the single-binary cap
-          # because a partition can draw several of the known multi-minute
-          # tests at once; still far below the 350-min job backstop.
-          PARTITIONED_BINARY_TIMEOUT=2700
-
-          run_capped() {
-            local cap="$1"; shift
-            timeout --kill-after=30s "${cap}s" "$@" 2>&1 | tee -a /tmp/cargo-test.log
-            local status="${PIPESTATUS[0]}"
-            if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
-              echo "::error::Test command exceeded ${cap}s wall-clock cap and was killed: $*" | tee -a /tmp/cargo-test.log
-            fi
-            return "$status"
-          }
-
-          # --build-jobs 1: serialize the link step (the OOM/Bus-error guard).
-          # --test-threads 1: run the binary's tests serially, matching the old
-          #   per-binary model and avoiding peak-RSS spikes from many solver
-          #   tests at once on the 16-GB runner.
-          # -P ci --config-file .config/nextest.toml: the per-test slow-timeout
-          #   profile. A timed-out or failed test makes nextest exit non-zero,
-          #   which run_capped propagates as a failure.
-          run_cargo_test() {
-            local cap="$1"; shift
-            run_capped "$cap" \
-              cargo nextest run \
-                --profile ci --config-file .config/nextest.toml \
-                --config profile.dev.debug=0 --all-features \
-                --build-jobs 1 --test-threads 1 "$@"
-          }
-
-          # #1393: the grouped integration binaries (#1146 folded ~700 former
-          # per-file crates into a handful of aggregator binaries so the gam
-          # rlib links once). A few of those binaries now hold hundreds of
-          # `#[test]`s — `quality` ~427, `basis_smooth` ~292, `manifolds`
-          # ~152 — run SERIALLY (--test-threads 1, the peak-RSS guard). Even
-          # though nextest's per-test slow-timeout (600s) catches any single
-          # hang, the SUM of the legitimately-slow REML/PIRLS/joint-Newton and
-          # R/Python reference-comparison tests in one binary overruns the
-          # 1800s per-binary GNU `timeout`, which SIGKILLs the whole binary
-          # (exit 124/137) BEFORE the per-test summary is printed — so the
-          # whole target fails in bulk with no attribution of which test was
-          # slow. Splitting each oversized binary into nextest `--partition
-          # count:i/N` shards bounds each shard's wall-clock under the cap and
-          # keeps per-test attribution: `--partition` is a pure run-time test
-          # FILTER, so the binary still links exactly once and each shard
-          # reuses it (no extra link, no extra disk). N is sized by the
-          # binary's test count; everything else stays a single shard.
-          # #1082: the `quality` binary holds the multi-minute reference-
-          # comparison tests (tensor-te 2D/3D, poisson, cyclic/torus, CI
-          # coverage, competing-risks, location-scale PIT, and the separable
-          # multinomial smooth-by-factor) that drove the 360s-budget timeouts.
-          # Run serially (--test-threads 1, the peak-RSS guard) several of these
-          # can co-land in one shard and push the shard wall-clock high, which
-          # both lengthens the run and coarsens per-test attribution. Finer
-          # sharding of `quality` (6 -> 8) spreads those known-slow tests across
-          # more shards so each shard's summed wall-clock is lower and a slow
-          # test is attributed within a smaller batch. `--partition` is a pure
-          # run-time filter: the binary still links once and each shard reuses
-          # it (no extra link, no extra disk).
-          # #1393: every binary the tracked CI runs killed at the 1800s cap
-          # (run 74518830554 and repeats) has a tuned floor here. The previously
-          # un-mapped killed targets — `misc` (holds the multi-minute
-          # `residual_cascade_auto_route_quality::*`), `measure_jet` (the
-          # large-scale margslope/measure-jet repros), and `pathological` (the
-          # degenerate-geometry solver stress) — defaulted to 1 shard at the
-          # 1800s cap and so were the ones bulk-killed before their per-test
-          # summary printed. Give them an explicit shard floor matched to their
-          # known multi-minute tests; the dynamic test-count floor below still
-          # raises any of these further if they grow.
-          partitions_for_binary() {
-            case "$1" in
-              quality)      echo 8 ;;
-              basis_smooth) echo 4 ;;
-              manifolds)    echo 3 ;;
-              perf_scale)   echo 2 ;;
-              identifiability) echo 2 ;;
-              inference)    echo 2 ;;
-              misc)         echo 2 ;;
-              measure_jet)  echo 2 ;;
-              pathological) echo 2 ;;
-              *)            echo 1 ;;
-            esac
-          }
-
-          # #1393: the hardcoded partition map above is a TUNED floor, but a
-          # binary that grows new tests (the bug-hunt agent and the
-          # reference-quality waves add `#[test]`s continuously) could silently
-          # outgrow its entry and regress to the bulk 1800s target-kill. Derive a
-          # dynamic floor from the binary's actual test count so growth
-          # auto-shards even when the map is stale: ~120 tests per shard keeps a
-          # shard's summed wall-clock well under the cap. The effective partition
-          # count is the MAX of the tuned map and this dynamic floor — the map can
-          # raise sharding for known-slow binaries, growth can raise it for any
-          # binary, and neither can lower it.
-          DYNAMIC_TESTS_PER_PARTITION=120
-          dynamic_partitions_for_binary() {
-            local name="$1"
-            # `nextest list` is a pure metadata query (no test execution) over the
-            # already-built binary; count its test lines. On any failure fall back
-            # to 1 so the tuned map alone governs.
-            local count
-            count="$(cargo nextest list --test "$name" --all-features \
-                       --message-format human 2>/dev/null \
-                     | grep -cE '^\s' || echo 0)"
-            if ! [ "$count" -gt 0 ] 2>/dev/null; then echo 1; return; fi
-            echo $(( (count + DYNAMIC_TESTS_PER_PARTITION - 1) / DYNAMIC_TESTS_PER_PARTITION ))
-          }
-
-          # Run one integration-test binary, sharding it into N nextest
-          # partitions when partitions_for_binary says so. Each partition gets
-          # its own per-binary wall-clock cap; a failure in any partition marks
-          # the binary failed (without aborting the remaining partitions, to
-          # preserve the no-fail-fast contract within the binary too).
-          run_integration_binary() {
-            local cap="$1"; local name="$2"; shift 2
-            local nparts; nparts="$(partitions_for_binary "$name")"
-            # Raise to the growth-driven floor if the binary outgrew its map entry.
-            local dyn; dyn="$(dynamic_partitions_for_binary "$name")"
-            if [ "$dyn" -gt "$nparts" ]; then
-              echo "::notice::${name}: dynamic test-count floor raised partitions ${nparts} -> ${dyn} (#1393 anti-regression)"
-              nparts="$dyn"
-            fi
-            local rc=0
-            if [ "$nparts" -le 1 ]; then
-              run_cargo_test "$cap" --test "$name" "$@" || rc=1
-            else
-              # Each partition carries the full per-binary cap. A partition
-              # holds at most ~(tests/N) of the binary's tests; with the 600s
-              # per-test slow-timeout already bounding any single hang, the cap
-              # only has to cover the SUM of the legitimately-slow tests that
-              # happen to land in one partition. The per-partition cap is held
-              # at PARTITIONED_BINARY_TIMEOUT (> the 1800s single-binary cap)
-              # so a partition that draws several of the known multi-minute
-              # reference-comparison / large-scale solver tests still finishes
-              # and reports per-test results instead of being SIGKILLed; it
-              # stays far under the 350-min job backstop.
-              local i
-              for i in $(seq 1 "$nparts"); do
-                echo "::group::${name} partition ${i}/${nparts}"
-                run_cargo_test "$PARTITIONED_BINARY_TIMEOUT" --test "$name" \
-                  --partition "count:${i}/${nparts}" "$@" || rc=1
-                echo "::endgroup::"
-              done
-            fi
-            return "$rc"
-          }
-
-          test_status=0
-          : > /tmp/cargo-test.log
-
-          # #1393: the in-crate unit suite (`--lib --bins --examples`) is the
-          # single LARGEST nextest invocation in this job — ~4000 `#[test]`s from
-          # the in-module `tests` blocks (the multi-thousand-line sae/custom_family/
-          # gamlss/survival `tests.rs` modules) all in ONE process group. Run
-          # serially (--test-threads 1, the peak-RSS guard) under the 1800s cap, the
-          # SUM of its legitimately-slow REML/PIRLS/joint-Newton unit tests overruns
-          # the GNU `timeout`, which SIGKILLs the whole phase (exit 124/137) BEFORE
-          # nextest prints any end-of-run summary — so the phase fails in bulk with
-          # NO per-test attribution (observed: 1241/4059 tests run, then killed at
-          # 1800s with no SLOW line). Every integration BINARY already escapes this
-          # via nextest `--partition`; the lib phase was the one un-sharded
-          # invocation still exposed to it. Shard it the same way: `--partition` is a
-          # pure run-time FILTER, so the lib/bins/examples binaries still LINK exactly
-          # once and each shard reuses them (no extra link, no extra disk, no change
-          # to which tests run or what they assert). Each shard carries the higher
-          # PARTITIONED_BINARY_TIMEOUT so a shard that draws several multi-minute unit
-          # tests still finishes and reports per-test results instead of being
-          # bulk-killed, while a genuine single-test hang is still caught by the 600s
-          # per-test slow-timeout and named.
-          LIB_PARTITIONS=8
-          for i in $(seq 1 "$LIB_PARTITIONS"); do
-            echo "::group::lib/bins/examples partition ${i}/${LIB_PARTITIONS}"
-            if ! run_cargo_test "$PARTITIONED_BINARY_TIMEOUT" --lib --bins --examples \
-                  --partition "count:${i}/${LIB_PARTITIONS}"; then
-              test_status=1
-            fi
-            echo "::endgroup::"
-          done
-
-          # Free the executable test binaries that the lib/bins/examples
-          # phase just linked. They were already executed, will not be rerun,
-          # and each is several hundred MB of ELF (gam + faer + burn + arrow +
-          # …) sitting in target/debug/deps eating runner disk. The .rlib /
-          # .rmeta / .d files stay so cargo can reuse the compiled crates for
-          # the integration-test binaries linked below; that reuse is what
-          # made every integration-test compile fast in the loop. Without
-          # this prune the first integration-test link runs against a nearly
-          # full disk and rust-lld dies with "ld terminated with signal 7
-          # [Bus error]" inside llvm::parallelFor, which has been the
-          # recurring `cargo test --test <name>` failure mode on this job.
-          #
-          # This prune (and the integration loop below) run UNCONDITIONALLY —
-          # NOT gated on the lib phase passing. main's lib suite is frequently
-          # red on purpose (a scheduled bug-hunt agent commits failing
-          # regression tests), so gating the integration tests behind a green
-          # lib phase meant the entire `tests/*.rs` suite — including the
-          # committed bug-repro tests that gate issue fixes — silently never
-          # ran. The lib binaries are already executed regardless of their
-          # pass/fail outcome, so pruning them here is always safe.
-          find target/debug/deps -maxdepth 1 -type f \
-                ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' \
-                ! -name '*.so' ! -name '*.so.*' \
-                -size +10M -delete || true
-          df -h /
-
-          # Run every integration-test binary and record any failure, but do
-          # NOT fail-fast: a single failing `tests/*.rs` must not suppress the
-          # results of the others. The per-iteration rm below frees each
-          # binary's disk after it runs (failed or not), keeping the
-          # serialized link job within the runner's disk budget.
-          for test_file in tests/*.rs; do
-            test_name="$(basename "$test_file" .rs)"
-            # The `pyffi` binary holds one test that shells out to
-            # `python3 -c "import gamfit"` (the Rust↔Python FFI parity check).
-            # This Rust-only job has no maturin-built `gamfit._rust` extension
-            # installed, so that test can never import it here. It is run in the
-            # `python-tests` job below, AFTER the wheel is built and installed.
-            # Exclude only that one test here so the rest of the `pyffi` binary
-            # still runs in this job (#1251).
-            extra_filter=()
-            if [ "$test_name" = "pyffi" ]; then
-              extra_filter=(-E 'not test(python_rust_ffi_parity_gaussian_linear_case)')
-            fi
-            if ! run_integration_binary "$INTEGRATION_TEST_TIMEOUT" "$test_name" "${extra_filter[@]}"; then
-              test_status=1
-            fi
-            # Prune only the executed test EXECUTABLE to reclaim disk. Do NOT
-            # delete target/debug/incremental/ — that corrupted cargo's
-            # fingerprint and forced a full ~3.5min gam recompile every iteration
-            # (#1072). With CARGO_INCREMENTAL=0 there is no incremental dir to
-            # prune anyway; the gam rlib stays built-once and is reused.
-            rm -f "target/debug/deps/${test_name}"-* \
-                  "target/debug/deps/${test_name//-/_}"-* || true
-            df -h /
-          done
-
-          # The patterns here are literal/ERE substrings that match the
-          # exact log::warn!/log::error!/Display strings emitted at runtime
-          # when the solver hits specific degenerate states. The grep only
-          # fires when cargo test itself returned non-zero, where the
-          # pattern match helps classify the failure mode against the
-          # failures: section that cargo writes for failing tests.
-          #
-          # Patterns verified against src/ to match non-test runtime log
-          # output:
-          #   - "P-IRLS INNER LOOP FAILED" — solver/reml/runtime.rs
-          #     log::warn! emitted by the outer REML cost path when PIRLS
-          #     returns an error.
-          #   - "P-IRLS could not certify a valid minimum" — runtime.rs
-          #     log::error! when the inner solve hits max iterations with
-          #     gradient norm still above the acceptable KKT band.
-          #   - "P-IRLS separation/non-convergence at current rho" —
-          #     runtime.rs log::warn! used when PerfectSeparationDetected
-          #     or PirlsDidNotConverge gets converted into +inf/infeasible
-          #     outer evaluations.
-          #   - "Perfect or quasi-perfect separation detected" — Display
-          #     for EstimationError::PerfectSeparationDetected.
-          #   - "seed candidates failed" — aggregate seed-loop error from
-          #     solver/outer_strategy.rs.
-          #   - "no candidate seeds passed outer startup validation" —
-          #     aggregate seed-loop error when started_seeds == 0.
-          # #1393: per-test SLOW attribution that survives a bulk target-kill.
-          #
-          # nextest streams a `SLOW [> 300.000s] <binary> <test>` line LIVE the
-          # moment a test crosses the 300s slow-timeout period (and
-          # `TIMEOUT [> 600.000s] ...` / `TERMINATING` when it is SIGKILLed at the
-          # terminate-after multiple), and `run_capped` tees that stream into
-          # /tmp/cargo-test.log as it is produced. So even when a whole target is
-          # killed by the OUTER GNU `timeout` wall-clock cap (exit 124/137) BEFORE
-          # nextest can print its end-of-run summary, every slow/terminated test
-          # that had already crossed 300s is already in the log, named. The issue's
-          # core complaint was that this attribution was buried; here we hoist it
-          # into an explicit, sorted, deduped summary in the job output (and the
-          # step summary) so the real wall-clock drivers are visible at a glance
-          # regardless of whether the target finished cleanly or was bulk-killed.
-          # This is pure log post-processing — it changes no test and no cap.
-          #
-          # CARGO_TERM_COLOR=always (job env) makes nextest emit these status
-          # lines WRAPPED in ANSI SGR escapes — the bytes are
-          # `\e[33;1m        SLOW\e[0m [>300.000s] (1/1) \e[35;1mgam::owed_X\e[0m
-          # \e[34;1m<test>\e[0m`, NOT a plain `SLOW [`. A regex anchored on
-          # `SLOW +\[` therefore matched NOTHING, slow_lines came back empty on
-          # every run, and the "NO test crossed the 300s SLOW period" branch
-          # below fired even when tests had visibly TIMED OUT at 600s — sending
-          # every tuning pass chasing partition counts instead of the actually
-          # hung tests. Strip the SGR escapes first so the match sees plain text,
-          # and capture through the `(n/m)` field to the test NAME (the previous
-          # pattern stopped at the binary). `\x1b\[[0-9;]*m` is the SGR form; GNU
-          # sed on the runner understands the `\x1b` escape.
-          echo "::group::#1393 per-test slow/timeout attribution"
-          slow_lines="$(sed -E 's/\x1b\[[0-9;]*m//g' /tmp/cargo-test.log 2>/dev/null \
-                          | grep -oE '(SLOW|TIMEOUT|TERMINATING) +\[[^]]*\] +\([^)]*\) +[^ ]+ +[^ ]+' \
-                          | sort -u || true)"
-          if [ -n "$slow_lines" ]; then
-            echo "Tests that crossed the 300s SLOW period (named even if their target was later bulk-killed):"
-            printf '%s\n' "$slow_lines"
-            {
-              echo "### #1393 slow/timeout per-test attribution"
-              echo ""
-              echo '```'
-              printf '%s\n' "$slow_lines"
-              echo '```'
-            } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
-            # A target was also killed at its wall-clock cap. Its drivers are
-            # almost always among the SLOW/TIMEOUT lines just printed (a binary
-            # holding several 600s-terminate tests sums past the cap); point the
-            # next tuning pass at those, or finer-shard the target if its kill
-            # left no slow line of its own.
-            if grep -q '::error::Test command exceeded' /tmp/cargo-test.log; then
-              echo "::warning::#1393: a target hit its wall-clock cap; cross-reference the SLOW/TIMEOUT lines above to find the drivers, or finer-shard that target if none are listed."
-            fi
-          elif grep -q '::error::Test command exceeded' /tmp/cargo-test.log; then
-            echo "::warning::#1393: a target was killed at its wall-clock cap but NO test crossed the 300s SLOW period — the cap was reached by the SUM of sub-300s tests. Increase that target's partition count in partitions_for_binary (or lower DYNAMIC_TESTS_PER_PARTITION)."
+          status=0
+          cargo nextest archive \
+            --workspace --all-features --exclude gam-pyffi \
+            --config 'profile.dev.debug=0' \
+            --archive-file nx.tar.zst 2>&1 | tee archive-build.log || status="${PIPESTATUS[0]}"
+          echo "nextest archive exit status: ${status}"
+          if [ -f nx.tar.zst ]; then
+            echo "archived=true" >> "$GITHUB_OUTPUT"
+            echo "Archive built: $(du -h nx.tar.zst | cut -f1)"
           else
-            echo "No test crossed the 300s slow-timeout period."
-          fi
-          echo "::endgroup::"
-
-          forbidden='P-IRLS INNER LOOP FAILED|P-IRLS could not certify a valid minimum|P-IRLS separation/non-convergence at current rho|Perfect or quasi-perfect separation detected|seed candidates failed|no candidate seeds passed outer startup validation'
-          if [ "$test_status" -ne 0 ]; then
-            if grep -nE "$forbidden" /tmp/cargo-test.log; then
-              echo "::error::Forbidden runtime error signatures were found alongside a cargo test failure."
-            fi
-            exit "$test_status"
+            echo "archived=false" >> "$GITHUB_OUTPUT"
+            echo "::error::Workspace test build FAILED to produce an archive (compile errors). See the MASTER_FAILURES.md artifact / aggregate job for every compile failure."
           fi
 
-      - name: Run gam-pyffi unit tests
-        # The `gam` package tested above is the workspace root; the FFI crate
-        # `gam-pyffi` is a separate member whose `#[test]`s (the survival
-        # surface-IO conversions for #964/#965/#966 and the latent-stationarity
-        # checks for #954) were never run by CI: the crate used to be
-        # `crate-type = ["cdylib"]` (no test harness) and the command above does
-        # not target it. With the crate now exposing an `rlib` and gating the
-        # PyO3 `extension-module` feature behind a default, we can build and run
-        # its harness here. `--no-default-features` drops `extension-module` so
-        # the test binary links libpython (the host interpreter is only present
-        # at import time for the real extension, not for a standalone test exe).
-        env:
-          RUSTFLAGS: "-C link-arg=-Wl,--threads=1"
+      # gam-pyffi unit tests need extension-module OFF so the harness links
+      # libpython (host interpreter only present at import time for the real
+      # extension). Archive it on its own so its tests still run; covers the
+      # survival-surface (#964/#965/#966) and latent-stationarity (#954) tests.
+      - name: Build nextest archive (gam-pyffi, no default features)
+        shell: bash
         run: |
           set -uo pipefail
-          # Run through nextest so each gam-pyffi `#[test]` gets the same
-          # per-test slow-timeout (600s, terminate-after) as the main suite; the
-          # GNU timeout below is the outer per-invocation backstop.
-          PYFFI_TEST_TIMEOUT=1800
-          timeout --kill-after=30s "${PYFFI_TEST_TIMEOUT}s" \
-            cargo nextest run -p gam-pyffi --no-default-features \
-            --profile ci --config-file .config/nextest.toml \
-            --config profile.dev.debug=0 \
-            --build-jobs 1 --test-threads 1 2>&1 | tee -a /tmp/cargo-test.log
-          status="${PIPESTATUS[0]}"
-          if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
-            echo "::error::gam-pyffi tests exceeded ${PYFFI_TEST_TIMEOUT}s wall-clock cap and were killed."
+          cargo nextest archive \
+            -p gam-pyffi --no-default-features \
+            --config 'profile.dev.debug=0' \
+            --archive-file nx-pyffi.tar.zst 2>&1 | tee -a archive-build.log || true
+          if [ -f nx-pyffi.tar.zst ]; then echo "gam-pyffi archive built."; fi
+          exit 0
+
+      # Completeness EVIDENCE: list the tests discovered in the archive (no
+      # rebuild — pure metadata over the already-built binaries). The total must
+      # be in the THOUSANDS; if it collapses back toward ~197 something is being
+      # excluded again. `grep -cE '^\s'` counts the indented per-test lines
+      # (the repo's own convention for counting from `nextest list`).
+      - name: Count discovered tests (completeness evidence)
+        id: count
+        if: ${{ steps.archive.outputs.archived == 'true' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          main_count=0; pyffi_count=0
+          cargo nextest list --archive-file nx.tar.zst --workspace-remap . \
+            2>/dev/null | tee nextest-list.log | tail -n 5 || true
+          main_count="$(grep -cE '^\s' nextest-list.log || echo 0)"
+          if [ -f nx-pyffi.tar.zst ]; then
+            cargo nextest list --archive-file nx-pyffi.tar.zst --workspace-remap . \
+              2>/dev/null > nextest-list-pyffi.log || true
+            pyffi_count="$(grep -cE '^\s' nextest-list-pyffi.log || echo 0)"
           fi
+          total=$(( main_count + pyffi_count ))
+          echo "test_count=${total}" >> "$GITHUB_OUTPUT"
+          echo "Discovered ${total} tests (workspace: ${main_count}, gam-pyffi: ${pyffi_count})."
+          {
+            echo "### Test surface discovered by the archive"
+            echo ""
+            echo "- workspace (--all-features, excl. gam-pyffi): **${main_count}**"
+            echo "- gam-pyffi (--no-default-features): **${pyffi_count}**"
+            echo "- **total discovered: ${total}**"
+            echo ""
+            echo "Old CI executed ~197. The completeness fix exposes the full surface."
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+      - name: Upload workspace test archive
+        uses: actions/upload-artifact@v4
+        if: ${{ steps.archive.outputs.archived == 'true' }}
+        with:
+          name: nx-archive
+          path: nx.tar.zst
+          retention-days: 3
+          if-no-files-found: warn
+
+      - name: Upload gam-pyffi test archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: nx-pyffi-archive
+          path: nx-pyffi.tar.zst
+          retention-days: 3
+          if-no-files-found: warn
+
+      - name: Upload build logs (compile-failure surface)
+        uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: build-logs
+          path: |
+            archive-build.log
+            nextest-list.log
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # RUN MANY. N parallel shards, each running 1/N of the test surface from the
+  # prebuilt archive. No rebuild, no link, no OOM/disk machinery. --no-fail-fast
+  # + fail-fast:false means every failure in the run is collected.
+  # ---------------------------------------------------------------------------
+  rust-test:
+    name: Test shard ${{ matrix.shard }}
+    needs: [setup, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.setup.outputs.shards) }}
+    steps:
+      - name: Checkout
+        # Needed for .config/nextest.toml (per-test slow-timeouts) and
+        # --workspace-remap. No build happens here, so depth 1 is fine (the
+        # build.rs human-author gate ran in the build job).
+        uses: actions/checkout@v5
+
+      - name: Install Rust 1.93.0
+        # Run-shards execute prebuilt binaries; they only need `cargo` on PATH to
+        # drive nextest. No sccache / target cache needed on the run side.
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      - name: Download workspace test archive
+        uses: actions/download-artifact@v4
+        continue-on-error: true # archive may be absent if the workspace failed to compile
+        with:
+          name: nx-archive
+
+      - name: Run shard ${{ matrix.shard }}/${{ needs.setup.outputs.total }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          log="shard-${{ matrix.shard }}.log"
+          if [ ! -f nx.tar.zst ]; then
+            echo "::warning::No nextest archive (workspace test build failed to compile upstream). Compile failures are surfaced in MASTER_FAILURES.md; nothing to run in this shard."
+            echo "ARCHIVE_MISSING shard ${{ matrix.shard }}/${{ needs.setup.outputs.total }}" | tee "$log"
+            exit 0
+          fi
+          status=0
+          # `-E 'not test(...)'`: the root-crate `pyffi` integration binary holds
+          # one test that shells out to `python3 -c "import gamfit"` and needs the
+          # maturin-built extension, which this Rust-only shard does not install.
+          # It runs in the python-tests job instead (#1251).
+          # `--partition count:i/N` is a pure run-time FILTER over the prebuilt
+          # binaries; `--profile ci --config-file` applies the per-test
+          # slow-timeouts; `--no-fail-fast` collects every failure in this shard.
+          cargo nextest run \
+            --archive-file nx.tar.zst \
+            --workspace-remap . \
+            --profile ci --config-file .config/nextest.toml \
+            --partition "count:${{ matrix.shard }}/${{ needs.setup.outputs.total }}" \
+            --no-fail-fast \
+            --test-threads 1 \
+            -E 'not test(python_rust_ffi_parity_gaussian_linear_case)' \
+            2>&1 | tee "$log" || status="${PIPESTATUS[0]}"
+          echo "nextest exit status: ${status}"
+          # Surface this shard's own pass/fail in the matrix UI; the aggregate
+          # job (if: always()) is the single place that lists EVERY failure.
           exit "$status"
 
+      - name: Upload shard log
+        uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: shard-logs-${{ matrix.shard }}
+          path: shard-${{ matrix.shard }}.log
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # gam-pyffi unit tests (separate feature config). Runs regardless of the
+  # rust-test shards' outcome so its failures always surface.
+  # ---------------------------------------------------------------------------
+  pyffi-test:
+    name: gam-pyffi unit tests
+    needs: [build]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust 1.93.0
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      - name: Download gam-pyffi test archive
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: nx-pyffi-archive
+
+      - name: Run gam-pyffi unit tests
+        shell: bash
+        run: |
+          set -uo pipefail
+          log="shard-logs-pyffi.log"
+          if [ ! -f nx-pyffi.tar.zst ]; then
+            echo "::warning::No gam-pyffi archive (failed to compile upstream); see MASTER_FAILURES.md."
+            echo "ARCHIVE_MISSING gam-pyffi" | tee "$log"
+            exit 0
+          fi
+          status=0
+          cargo nextest run \
+            --archive-file nx-pyffi.tar.zst \
+            --workspace-remap . \
+            --profile ci --config-file .config/nextest.toml \
+            --no-fail-fast \
+            --test-threads 1 \
+            2>&1 | tee "$log" || status="${PIPESTATUS[0]}"
+          echo "nextest exit status: ${status}"
+          exit "$status"
+
+      - name: Upload gam-pyffi log
+        uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: shard-logs-pyffi
+          path: shard-logs-pyffi.log
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # AGGREGATE. The single place that lists EVERYTHING: every compile failure
+  # (from the build log) and every runtime test failure (from every shard log),
+  # plus the forbidden-runtime-pattern grep and the #1393 slow/timeout
+  # attribution. Writes MASTER_FAILURES.md and fails the workflow if anything is
+  # red — so the owner gets one artifact with every failure.
+  # ---------------------------------------------------------------------------
+  aggregate:
+    name: Aggregate failures (MASTER_FAILURES.md)
+    needs: [build, rust-test, pyffi-test]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build logs
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: build-logs
+          path: agg/build
+
+      - name: Download all shard logs
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: shard-logs-*
+          path: agg/shards
+          merge-multiple: true
+
+      - name: Build MASTER_FAILURES.md
+        id: master
+        shell: bash
+        run: |
+          set -uo pipefail
+          python3 - <<'PY'
+          import os, re, glob
+
+          ANSI = re.compile(r'\x1b\[[0-9;]*m')
+          def strip(s): return ANSI.sub('', s)
+
+          # ---- compile failures (from the archive build log) -----------------
+          compile_errs = []
+          build_logs = set(glob.glob('agg/build/**/archive-build.log', recursive=True))
+          build_logs.update(glob.glob('agg/build/archive-build.log'))
+          for path in sorted(build_logs):
+              try:
+                  lines = [strip(l.rstrip('\n')) for l in open(path, errors='replace')]
+              except OSError:
+                  continue
+              for i, l in enumerate(lines):
+                  m = re.match(r'^error(\[[A-Z0-9]+\])?: (.*)$', l)
+                  if not m:
+                      continue
+                  code = (m.group(1) or '').strip('[]')
+                  msg = m.group(2).strip()
+                  loc = ''
+                  for j in range(i + 1, min(i + 8, len(lines))):
+                      lm = re.match(r'^\s*-->\s+(.*)$', lines[j])
+                      if lm:
+                          loc = lm.group(1).strip(); break
+                  compile_errs.append((loc, code, msg))
+          seen = set()
+          compile_errs = [e for e in compile_errs if not (e in seen or seen.add(e))]
+
+          # ---- runtime failures (from every shard log) -----------------------
+          # nextest prints, e.g. `FAIL [ 0.0s] (1/1) gam::quality the_test`; the
+          # `(n/m)` try-counter is optional (absent when retries are off), so
+          # consume it non-capturing if present before the package::binary id.
+          FAILRE = re.compile(r'^\s*(FAIL|TIMEOUT|TERMINATING|LEAK|SIGSEGV|ABORT)\s*\[[^\]]*\]\s+(?:\(\d+/\d+\)\s+)?(\S+)\s+(.+?)\s*$')
+          SLOWRE = re.compile(r'^\s*(SLOW|TIMEOUT|TERMINATING)\s*\[[^\]]*\]\s+(?:\(\d+/\d+\)\s+)?(\S+)\s+(.+?)\s*$')
+          run_fails = []; slow = []
+          shard_logs = sorted(set(glob.glob('agg/shards/**/*.log', recursive=True) +
+                                  glob.glob('agg/shards/*.log')))
+          all_text = []
+          for path in shard_logs:
+              try:
+                  txt = open(path, errors='replace').read()
+              except OSError:
+                  continue
+              all_text.append(txt)
+              for raw in txt.splitlines():
+                  l = strip(raw)
+                  m = FAILRE.match(l)
+                  if m and m.group(1) != 'SLOW':
+                      run_fails.append((m.group(1), m.group(2), m.group(3)))
+                  sm = SLOWRE.match(l)
+                  if sm:
+                      slow.append((sm.group(1), sm.group(2), sm.group(3)))
+          def dedup(xs):
+              s = set(); return [x for x in xs if not (x in s or s.add(x))]
+          run_fails = dedup(run_fails); slow = dedup(slow)
+
+          # ---- forbidden runtime-error signatures (preserved grep) -----------
+          forbidden = [
+              'P-IRLS INNER LOOP FAILED',
+              'P-IRLS could not certify a valid minimum',
+              'P-IRLS separation/non-convergence at current rho',
+              'Perfect or quasi-perfect separation detected',
+              'seed candidates failed',
+              'no candidate seeds passed outer startup validation',
+          ]
+          joined = '\n'.join(all_text)
+          forbidden_hits = [p for p in forbidden if p in joined]
+          archive_missing = 'ARCHIVE_MISSING' in joined
+
+          # ---- write MASTER_FAILURES.md --------------------------------------
+          out = []
+          out.append('# MASTER_FAILURES')
+          out.append('')
+          out.append(f'- Compile failures: **{len(compile_errs)}**')
+          out.append(f'- Runtime test failures (FAIL/TIMEOUT/TERMINATING/LEAK): **{len(run_fails)}**')
+          out.append(f'- Forbidden runtime signatures seen: **{len(forbidden_hits)}**')
+          out.append(f'- Slow/timeout notices (#1393): **{len(slow)}**')
+          if archive_missing:
+              out.append('')
+              out.append('> NOTE: at least one shard found NO test archive — the workspace '
+                         'test build did not fully compile, so runtime tests for the '
+                         'affected targets could not run. Fix the compile failures below '
+                         'first; the runtime surface will then be exercised.')
+          out.append('')
+
+          out.append('## Compile failures')
+          out.append('')
+          if compile_errs:
+              for loc, code, msg in compile_errs:
+                  tag = f'[{code}] ' if code else ''
+                  out.append(f'- `{loc or "?"}` — {tag}{msg}')
+          else:
+              out.append('_None._')
+          out.append('')
+
+          out.append('## Runtime test failures')
+          out.append('')
+          if run_fails:
+              for status, binid, test in run_fails:
+                  out.append(f'- **{status}** `{binid}` :: `{test}`')
+          else:
+              out.append('_None._')
+          out.append('')
+
+          out.append('## Forbidden runtime-error signatures')
+          out.append('')
+          if forbidden_hits:
+              for p in forbidden_hits:
+                  out.append(f'- {p}')
+          else:
+              out.append('_None._')
+          out.append('')
+
+          out.append('## Slow / timeout attribution (#1393)')
+          out.append('')
+          if slow:
+              for status, binid, test in slow:
+                  out.append(f'- {status} `{binid}` :: `{test}`')
+          else:
+              out.append('_No test crossed the 300s slow period._')
+          out.append('')
+
+          md = '\n'.join(out) + '\n'
+          open('MASTER_FAILURES.md', 'w').write(md)
+          print(md)
+
+          summary = os.environ.get('GITHUB_STEP_SUMMARY')
+          if summary:
+              open(summary, 'a').write(md)
+
+          ghout = os.environ.get('GITHUB_OUTPUT')
+          total_fail = len(compile_errs) + len(run_fails)
+          if ghout:
+              open(ghout, 'a').write(f'failures={total_fail}\n')
+          PY
+
+      - name: Upload MASTER_FAILURES.md
+        uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: MASTER_FAILURES
+          path: MASTER_FAILURES.md
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Fail the run if any failure was collected
+        shell: bash
+        run: |
+          set -uo pipefail
+          n="${{ steps.master.outputs.failures }}"
+          n="${n:-0}"
+          if [ "$n" -gt 0 ]; then
+            echo "::error::${n} total failures (compile + runtime). See the MASTER_FAILURES.md artifact."
+            exit 1
+          fi
+          echo "No failures collected."
+
+  # ---------------------------------------------------------------------------
+  # Python API + maturin/wheel flow. PRESERVED verbatim from the old workflow,
+  # except it is no longer gated behind the Rust suite passing (`needs: test`):
+  # the Rust suite is frequently red on purpose (committed bug-repro tests), and
+  # the "see ALL failures" goal requires the Python suite + the Rust<->Python FFI
+  # parity test to run regardless. It builds its own wheel, so it is independent.
+  # ---------------------------------------------------------------------------
   python-tests:
     name: Python API tests
     runs-on: ubuntu-latest
-    # Runs after cargo-tests pass so we don't burn minutes building the
-    # extension when the Rust side is already broken.
-    needs: test
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -539,10 +640,6 @@ jobs:
           python -m pip install --force-reinstall dist/*.whl
 
       - name: Install Python test extras
-        # We only need the test-extra dependencies — the gam package itself
-        # was already installed from the maturin-built wheel above. Using
-        # `pip install -e .` would rebuild via maturin and replace the wheel
-        # install, so we pull the extras directly instead.
         run: |
           python -m pip install \
             'pytest>=8' 'numpy>=1.26' 'pandas>=2.0' 'pyarrow>=14' \
@@ -557,7 +654,7 @@ jobs:
         # This `pyffi` integration test shells out to `python3 -c "import
         # gamfit"` and compares Rust-engine vs Python-binding fit output. It
         # requires the maturin-built `gamfit._rust` extension installed above,
-        # so it is excluded from the Rust-only `test` job and run here (#1251).
+        # so it is excluded from the Rust-only shards and run here (#1251).
         run: |
           cargo nextest run --all-features \
             --test pyffi \
@@ -567,34 +664,15 @@ jobs:
         run: python -m pytest tests/test_python_api.py -v --tb=short
 
       - name: Run Python tables tests
-        # In-tree pure-Python tests against the gam._tables helpers; no
-        # benchmark binaries or external services are required.
         run: python -m pytest tests/test_tables.py -v --tb=short
 
       - name: Run numeric by-variable predict-clip contract
-        # Full-fit Python contract: a numeric `by=` multiplier of s(x, by=z)
-        # must not be axis-clipped to its training range at predict time, so the
-        # varying-coefficient prediction stays affine in z (z=0 leaves the
-        # baseline; z beyond the training max keeps its slope). Guards the
-        # collect_by_variable_numeric_axes exemption in src/inference/model.rs.
         run: python -m pytest tests/test_bug_hunt_numeric_by_variable_clamped_to_training_range_at_predict.py -v --tb=short
 
       - name: Run curv() constant-curvature sign-recovery contract (#1464)
-        # Full-fit Python contract: hyperbolic (kappa*<0) data must NOT be
-        # recovered as spherical. This is the Python-path guard matching the
-        # Rust e2e owed_1464.rs / bug_hunt_1464_* tests. The file was a
-        # print-only diagnostic (collected nothing) until it was made an
-        # asserting gate; wiring it here is what actually exercises #1464.
         run: python -m pytest tests/test_bug_hunt_curv_smooth_hyperbolic_recovered_as_spherical.py -v --tb=short
 
       - name: Run survival API regression + save/load roundtrip tests
-        # `test_survival_api_regressions.py` covers fit-only smoke checks
-        # across survival likelihood modes; `test_survival_save_load_roundtrip.py`
-        # additionally fits → saves → loads → predicts and asserts the
-        # survival surface matches. That roundtrip is the canary for the
-        # class of bug where the pyffi save path forgets to populate a
-        # field the predict path needs (e.g., the survival-marginal-slope
-        # `survival_time_*` omission fixed in fa7f7b6c).
         run: |
           python -m pytest \
             tests/test_survival_api_regressions.py \
@@ -602,10 +680,6 @@ jobs:
             -v --tb=short
 
       - name: Run benchmark configuration / mapping tests
-        # These are pure-Python contract tests over the bench/ orchestration
-        # scripts (run_suite.py, fuzz_vs_mgcv.py, large_scale/runner.py).
-        # They mock subprocess calls and never invoke the Rust binary, so
-        # they are safe for the standard CI runner.
         run: |
           python -m pytest \
             tests/bench_run_suite_mapping_test.py \
@@ -615,45 +689,14 @@ jobs:
             -v --tb=short
 
       - name: Guard against orphaned Python tests (#1512)
-        # #1512 anti-regression (HARD gate, pure-Python — no Rust extension
-        # needed). The directory-level full-suite step below is what keeps every
-        # tests/test_*.py collected by CI; this meta-test fails if that catch-all
-        # step is ever removed and CI reverts to naming individual files (which
-        # is exactly how 161/166 test files became silent orphans). Running it as
-        # its own hard-gated step means a future workflow regression is caught
-        # with a named-file error instead of silently re-orphaning the suite.
         run: |
           python -m pytest tests/test_ci_no_orphan_python_tests_1512.py -v --tb=short
 
       - name: Run full Python test suite (all test_*.py in tests/)
-        # #1512: testpaths=["tests"] means a bare `pytest` collects everything,
-        # but CI only named ~5 files explicitly, so 161/166 tests/test_*.py ran
-        # in NO job. This DIRECTORY-LEVEL step runs the whole suite so every
-        # current AND future test_*.py is collected automatically — no per-file
-        # workflow line to hand-add. `-m "not slow"` drops the files tagged
-        # @pytest.mark.slow (registered in pyproject.toml) so the long-running
-        # SAE / survival fits do not blow the standard runner's budget; every
-        # other test runs and is visible in the job log.
-        #
-        # `continue-on-error: true` is RETAINED ON PURPOSE — it cannot become a
-        # hard gate. The #1512 triage ran the whole `tests/test_*.py` suite
-        # against a freshly-built gamfit wheel. The orphaned repros split into:
-        #   (a) a large green set — stale fakes/APIs/inputs were fixed so those
-        #       tests now genuinely PASS, and
-        #   (b) ~20 files that document still-OPEN engine bugs and therefore
-        #       FAIL (SAE pyo3 index-out-of-bounds panics #357/#240; SAE-REML
-        #       non-convergence; SAE random_state ignored; #1058 missing
-        #       structure certificate; #1026 recon-parity under-coverage;
-        #       conformal under-coverage; #1464 curvature-sign residual; NUL
-        #       group labels; #913 dispersion routing; #1596 flexible-link;
-        #       #237 duchon column count; sphere-jet lat-gating; #808 survival
-        #       non-convergence; ...).
-        # SPEC.md forbids the XFAIL pattern outright ("a failing test should
-        # always indicate problematic behavior"), so the (b) failures are NOT
-        # masked — they stand red here as the signal of those open bugs. Until
-        # they are fixed at the engine level, this step must stay soft so a real
-        # open-bug repro does not break the whole CI job. Flip to a hard gate
-        # only once the open bugs above are fixed and `-m "not slow"` is green.
+        # continue-on-error RETAINED ON PURPOSE (see #1512): ~20 files document
+        # still-open engine bugs and stand red here as the signal of those bugs;
+        # SPEC.md forbids XFAIL, so they are not masked. Flip to a hard gate once
+        # those open bugs are fixed and `-m "not slow"` is green.
         continue-on-error: true
         run: |
           python -m pytest tests/ \
@@ -662,17 +705,9 @@ jobs:
             -v --tb=short -q
 
       - name: Build gam release binary
-        # The integration scripts below shell out to target/release/gam.
-        # The maturin wheel build above produces the Python extension, not
-        # the CLI binary; we need an explicit cargo build.
         run: cargo build --release -p gam-cli
 
       - name: Run CLI integration scripts (numeric contract checks)
-        # Both scripts now perform numeric contract assertions on top of
-        # exit-code checks: PIT pipeline asserts |z̄| < 0.5 and 0.5 < sd(z) < 1.8;
-        # marginal-slope asserts each prediction column is in [0,1] and not
-        # collapsed to a constant value. A mutation that emits constant or
-        # biased predictions will fail here, not silently exit 0.
         run: |
           python tests/integration_marginal_slope.py
           python tests/integration_pit_pipeline.py
