@@ -2680,24 +2680,38 @@ pub(crate) fn hybrid_collapse_is_load_bearing_and_dominates() {
         }
     }
 
-    // #1026 — the POSITIVE arm of the EV-vs-Θ discrimination. The fixture mixes
-    // a straightened slot (atom 0, Θ → 0) with a genuinely CURVED periodic slot
-    // (atom 1: nonzero higher harmonics ⇒ its decoded image traces a real loop).
-    // A correct classifier must do BOTH: collapse the straight slot to the
-    // linear tail (asserted above) AND keep the curved slot curved while it
-    // earns reconstruction. So at least one adjudicated slot must read a
-    // materially non-zero turning Θ, be kept curved, and carry a strictly
-    // positive training LOAO ΔEV — i.e. a high-Θ atom that earns EV is a genuine
-    // curved family, not a linear direction wearing a curved basis.
-    let curved_earner = report_with_ev.verdicts.iter().find(|v| {
-        v.kept_curved
-            && v.fitted_turning.map(|t| t > 1e-2).unwrap_or(false)
-            && v.train_loao_delta_ev.map(|d| d > 0.0).unwrap_or(false)
-    });
+    // #1026 — the POSITIVE arm of the EV-preservation discrimination. The fixture
+    // mixes a straightened slot (atom 0: its curved fit IS a line, so collapsing
+    // it is lossless — asserted above) with a LOAD-BEARING slot (atom 1: nonzero
+    // higher harmonics make its decoded warp a genuinely non-linear function of
+    // the coordinate, so collapsing it to a straight secant would raise the
+    // reconstruction SSR and DROP EV). The EV-preservation gate keys on exactly
+    // that EV loss (`collapse_ssr_increase`), so a correct adjudication must do
+    // BOTH: release the straight slot to the linear tail AND keep the load-bearing
+    // slot curved while it earns reconstruction. At least one adjudicated slot
+    // must therefore be kept curved and carry a strictly positive training LOAO
+    // ΔEV — a curveable atom doing real reconstruction work the straight tail
+    // cannot capture.
+    //
+    // On Θ: this fixture reconstructs a 1-D target, and a scalar curve has no
+    // geometric turning — the wedge ‖γ' ∧ γ''‖ vanishes identically in one
+    // dimension — so every atom honestly reports Θ = 0 here (pinned finite, not
+    // the historical `None`, by the loop above, which exercises the constant-image
+    // → `Some(0.0)` fix). The geometric Θ-discrimination (high Θ for a real loop,
+    // ≈ 0 for a line) is a ≥ 2-D property and is covered where it is meaningful:
+    // the real-circle `chart_canonicalization::turning_tests` (→ 2π) and the
+    // evidence-level `hybrid_split::tests::turning_residual_selects_curved_on_evidence`.
+    // The gate never reads Θ, so this end-to-end test asserts the EV-axis
+    // discrimination the gate actually performs, not a turning the fixture's
+    // dimensionality cannot exhibit.
+    let curved_earner = report_with_ev
+        .verdicts
+        .iter()
+        .find(|v| v.kept_curved && v.train_loao_delta_ev.map(|d| d > 0.0).unwrap_or(false));
     assert!(
         curved_earner.is_some(),
-        "a genuinely curved slot must be kept curved AND earn positive training LOAO \
-         ΔEV (the high-Θ-earns-EV signature); verdicts = {:?}",
+        "a load-bearing curveable slot must be kept curved AND earn positive training \
+         LOAO ΔEV (collapsing it would drop reconstruction EV); verdicts = {:?}",
         report_with_ev
             .verdicts
             .iter()
@@ -2710,22 +2724,26 @@ pub(crate) fn hybrid_collapse_is_load_bearing_and_dominates() {
             .collect::<Vec<_>>()
     );
 
-    // The discrimination is sharp: the kept-curved earner's turning strictly
-    // exceeds the linear-tail Θ ≈ 0 threshold the collapsed slot reads, so the
-    // (Θ, ΔEV) pair separates the two atom classes on the turning axis.
-    let curved_theta = curved_earner.unwrap().fitted_turning.unwrap();
-    let max_linear_theta = report_with_ev
-        .verdicts
-        .iter()
-        .filter(|v| !v.kept_curved)
-        .filter_map(|v| v.fitted_turning)
-        .fold(0.0_f64, f64::max);
-    assert!(
-        curved_theta > max_linear_theta,
-        "the kept-curved earner's turning Θ = {curved_theta} must exceed every \
-         linear-tail slot's Θ (max {max_linear_theta}) — the EV-vs-Θ axis must \
-         separate curved families from linear tails"
+    // The split is sharp and keyed to the atom identities, not a coincidental
+    // count: the slot we straightened (atom 0) is the one released to the linear
+    // tail, while the untouched load-bearing slot (atom 1) is the one kept curved.
+    // A vacuous "keep everything curved" or "collapse the wrong atom" adjudication
+    // fails one of these halves.
+    assert_eq!(
+        curved_earner.unwrap().atom_name,
+        "periodic1",
+        "the load-bearing (untouched) atom must be the one kept curved"
     );
+    for v in &report_with_ev.verdicts {
+        if !v.kept_curved {
+            assert_eq!(
+                v.atom_name, "periodic0",
+                "only the straightened atom may be released to the linear tail; \
+                 '{}' collapsed unexpectedly",
+                v.atom_name
+            );
+        }
+    }
 }
 
 /// #1233 — the hard `top_k` reconstruction must compose with the #1026 hybrid

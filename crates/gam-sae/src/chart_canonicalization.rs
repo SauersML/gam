@@ -2961,4 +2961,55 @@ mod turning_tests {
             "a straight-line image has zero turning (the linear-tail signature); got {theta:.3e}"
         );
     }
+
+    /// #1610/#1026 — a GLOBALLY constant image (only the DC basis row is
+    /// nonzero) decodes to a single fixed point: `γ'(t) ≡ 0` at every node, so
+    /// the curve is stationary everywhere. A point has no arc to turn through,
+    /// so its total turning is exactly `0` — the ultimate linear-tail signature.
+    /// This is the path the hybrid-collapse witness relies on (a `d = 1` atom
+    /// straightened to its DC component must read `Some(0.0)`, not the historical
+    /// `None`, so its slot can collapse to a legitimate linear tail).
+    #[test]
+    fn constant_image_turning_is_some_zero() {
+        let ev = PeriodicHarmonicEvaluator::new(3).expect("3-basis circle");
+        let mut decoder = Array2::<f64>::zeros((3, 2));
+        // Only the DC (constant) basis row → γ(t) is a fixed point for all t.
+        decoder[[0, 0]] = 0.7;
+        decoder[[0, 1]] = -0.3;
+        let coords = Array1::from_iter((0..=20).map(|i| 0.05 + 0.15 * i as f64 / 20.0));
+        let theta = d1_atom_fitted_turning(&ev, decoder.view(), coords.view())
+            .expect("turning must evaluate")
+            .expect("a globally constant image returns Some(0.0), not None");
+        assert_eq!(
+            theta, 0.0,
+            "a globally constant (all-stationary) image has exactly zero turning"
+        );
+    }
+
+    /// #1610/#1026 — a curve that is stationary at SOME nodes but moving at
+    /// others is a cusp: the unsigned curvature integrand is genuinely
+    /// ill-defined at the stationary node, so the function REFUSES (`None`)
+    /// rather than under-count the sharp turn. Built as an image `∝ cos 2πt` (a
+    /// line through the origin) over a span whose lower endpoint is exactly
+    /// `t = 0`, where `γ' ∝ -sin 2πt` vanishes: that endpoint lands on a grid
+    /// node and is stationary while every interior node moves — the mixed case
+    /// the constant-vs-cusp split must keep conservative.
+    #[test]
+    fn partial_cusp_turning_is_none() {
+        let ev = PeriodicHarmonicEvaluator::new(3).expect("3-basis circle");
+        let mut decoder = Array2::<f64>::zeros((3, 2));
+        decoder[[2, 0]] = 1.0;
+        decoder[[2, 1]] = 2.0;
+        // Span [0, 0.2]: the Simpson grid's lower node sits exactly on t = 0,
+        // where the speed `‖γ'‖ ∝ |sin 2πt|` is zero (stationary), while every
+        // interior node is moving.
+        let coords = Array1::from_iter((0..=20).map(|i| 0.2 * i as f64 / 20.0));
+        let result = d1_atom_fitted_turning(&ev, decoder.view(), coords.view())
+            .expect("turning must evaluate");
+        assert!(
+            result.is_none(),
+            "a curve stationary at some nodes but moving at others (a cusp) must \
+             refuse with None; got {result:?}"
+        );
+    }
 }
