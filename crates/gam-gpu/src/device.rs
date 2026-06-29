@@ -115,3 +115,81 @@ impl GpuDeviceInfo {
             + async_bonus
     }
 }
+
+#[cfg(test)]
+mod nvrtc_arch_tests {
+    use super::GpuCapability;
+
+    fn arch_for(major: i32, minor: i32) -> &'static str {
+        GpuCapability::from_compute_capability(major, minor).nvrtc_arch()
+    }
+
+    /// Parse the numeric `NN` out of an NVRTC `compute_NN` virtual-arch string.
+    fn arch_number(arch: &str) -> i32 {
+        arch.strip_prefix("compute_")
+            .and_then(|n| n.parse::<i32>().ok())
+            .unwrap_or_else(|| panic!("nvrtc_arch must be a `compute_NN` string, got {arch}"))
+    }
+
+    /// #1551 — the exact device-capability → NVRTC virtual-arch mapping the SAE
+    /// double-atomic PCG kernels rely on. A wrong arch here re-introduces the
+    /// "GPU 0%" silent CPU fallback (NVRTC rejecting `atomicAdd(double*,double)`).
+    #[test]
+    fn nvrtc_arch_maps_known_capabilities() {
+        assert_eq!(arch_for(9, 0), "compute_90"); // Hopper H100
+        assert_eq!(arch_for(8, 9), "compute_89"); // Ada L4 / L40
+        assert_eq!(arch_for(8, 6), "compute_86"); // Ampere A10G / 30xx
+        assert_eq!(arch_for(8, 0), "compute_80"); // Ampere A100
+        assert_eq!(arch_for(7, 5), "compute_75"); // Turing T4 (the lead's box)
+        assert_eq!(arch_for(7, 0), "compute_70"); // Volta V100
+        assert_eq!(arch_for(6, 0), "compute_60"); // Pascal P100
+        // Minor variants round to the right major bucket.
+        assert_eq!(arch_for(8, 7), "compute_80"); // Orin -> 8.x bucket
+        assert_eq!(arch_for(7, 2), "compute_70"); // Xavier -> 7.x bucket
+    }
+
+    /// #1551 CRITICAL INVARIANT: every capability gam supports (CC >= 6.0) must
+    /// map to a virtual arch >= `compute_60`, the lowest arch that provides the
+    /// `atomicAdd(double*, double)` overload (added in CC 6.0). Below it the SAE
+    /// matvec kernels fail to NVRTC-compile and the device path silently declines.
+    #[test]
+    fn nvrtc_arch_never_below_double_atomic_floor() {
+        for &(major, minor) in &[
+            (6, 0),
+            (6, 1),
+            (7, 0),
+            (7, 5),
+            (8, 0),
+            (8, 6),
+            (8, 9),
+            (9, 0),
+        ] {
+            let n = arch_number(arch_for(major, minor));
+            assert!(
+                n >= 60,
+                "CC {major}.{minor} mapped to compute_{n}, below the double-atomicAdd \
+                 floor compute_60 — the SAE device PCG would silently fall back to CPU"
+            );
+        }
+    }
+
+    /// Newer-than-known majors must round DOWN to a toolkit-valid arch
+    /// (`compute_90`), never up to an arch the installed NVRTC cannot target
+    /// (which would itself fail to compile and decline the device path).
+    #[test]
+    fn nvrtc_arch_future_capabilities_round_down_to_known() {
+        assert_eq!(arch_for(10, 0), "compute_90");
+        assert_eq!(arch_for(12, 3), "compute_90");
+        // And it stays a valid, double-atomic-capable arch.
+        assert!(arch_number(arch_for(10, 0)) >= 60);
+    }
+
+    /// Sub-6.0 / unknown-low capabilities pin to `compute_60` — the lowest arch
+    /// that still carries the double atomicAdd, so a CC6-era toolkit accepts the
+    /// kernel source rather than declining.
+    #[test]
+    fn nvrtc_arch_below_floor_pins_to_compute_60() {
+        assert_eq!(arch_for(5, 0), "compute_60");
+        assert_eq!(arch_for(3, 5), "compute_60");
+    }
+}
