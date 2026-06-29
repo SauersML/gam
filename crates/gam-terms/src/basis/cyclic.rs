@@ -137,6 +137,34 @@ pub(crate) fn cyclic_distance_1d(x: f64, c: f64, period: f64) -> f64 {
     delta.min(period - delta)
 }
 
+/// Seam-invariant knot anchor (#1593).
+///
+/// `period_start` is a pure GAUGE choice — it only declares where the wrap seam
+/// sits on the loop; the physical data are the same points on the same circle.
+/// Anchoring the uniform cyclic knot grid directly at `start` therefore made the
+/// spline FUNCTION SPACE rotate rigidly with the seam, so a sub-knot change of
+/// `period_start` selected a genuinely different (phase-shifted) basis and the
+/// fitted curve drifted (worst 2.07e-2 of range). The circulant penalty and the
+/// whole-knot rigid rotation are not enough on their own, because an arbitrary
+/// `period_start` lands the seam BETWEEN knots.
+///
+/// The cure is to anchor the knot grid to a canonical phase that does not depend
+/// on `start`: the largest knot-cell boundary at or below `start`,
+/// `anchor = start − start.rem_euclid(h)`. Every cyclic knot then lands on the
+/// fixed absolute grid `{ m·h : m ∈ ℤ }` (h = period / num_basis) regardless of
+/// where the user put the seam, so two `period_start` anchors describe the
+/// IDENTICAL set of periodic basis functions on the circle (up to a circulant
+/// relabel the penalty is invariant to) and the fit is genuinely gauge-invariant.
+#[inline]
+pub(crate) fn cyclic_knot_anchor(start: f64, period: f64, num_basis: usize) -> (f64, f64) {
+    let h = period / num_basis as f64;
+    // Snap `start` DOWN to the nearest multiple of the knot spacing `h` on the
+    // absolute grid through the origin. `rem_euclid` keeps the offset in
+    // `[0, h)` even for negative `start`, so `anchor <= start < anchor + h`.
+    let anchor = start - start.rem_euclid(h);
+    (anchor, h)
+}
+
 pub(crate) fn cyclic_uniform_knot_vector(
     start: f64,
     end: f64,
@@ -144,9 +172,9 @@ pub(crate) fn cyclic_uniform_knot_vector(
     num_basis: usize,
 ) -> Array1<f64> {
     let period = end - start;
-    let h = period / num_basis as f64;
+    let (anchor, h) = cyclic_knot_anchor(start, period, num_basis);
     let total_knots = num_basis + 2 * degree + 1;
-    Array1::from_iter((0..total_knots).map(|i| start + (i as f64 - degree as f64) * h))
+    Array1::from_iter((0..total_knots).map(|i| anchor + (i as f64 - degree as f64) * h))
 }
 
 pub(crate) fn create_cyclic_bspline_basis_dense(
@@ -165,7 +193,14 @@ pub(crate) fn create_cyclic_bspline_basis_dense(
         );
     }
     let period = end - start;
-    let wrapped = data.mapv(|x| wrap_to_period(x, start, period));
+    // Wrap data into the ANCHORED window `[anchor, anchor + period)`, not the raw
+    // `[start, …)`: the knot grid is canonically anchored at `anchor` (#1593,
+    // `cyclic_knot_anchor`) so the data must be folded against the same grid for
+    // the `j % num_basis` cyclic wrap to align. `anchor` differs from `start` by
+    // less than one knot spacing, so this is the same physical representative
+    // window, just snapped to the seam-invariant knot lattice.
+    let (anchor, _) = cyclic_knot_anchor(start, period, num_basis);
+    let wrapped = data.mapv(|x| wrap_to_period(x, anchor, period));
     let knots = cyclic_uniform_knot_vector(start, end, degree, num_basis);
     let (extended, _) = create_basis::<Dense>(
         wrapped.view(),
@@ -186,6 +221,120 @@ pub(crate) fn create_cyclic_bspline_basis_dense(
 #[cfg(test)]
 mod closure_tests {
     use super::*;
+
+    /// DIAGNOSTIC (#1593): under a whole-knot seam shift `start' = start + h`,
+    /// the cyclic basis evaluated on the SAME physical angles must be a rigid
+    /// cyclic permutation of the un-shifted basis: `B'(θ) = B(θ)·P`. If this
+    /// fails, the per-anchor designs are not gauge-related and no constraint can
+    /// restore invariance.
+    #[test]
+    fn cyclic_basis_rigid_rotation_under_whole_knot_shift() {
+        let degree = 3usize;
+        let num_basis = 8usize;
+        let start = 0.0_f64;
+        let period = std::f64::consts::TAU;
+        let h = period / num_basis as f64;
+        let thetas =
+            Array1::from_iter((0..40).map(|i| (i as f64 + 0.3) / 40.0 * period));
+        let (b0, _) =
+            create_cyclic_bspline_basis_dense(thetas.view(), start, start + period, degree, num_basis)
+                .unwrap();
+        let (b1, _) = create_cyclic_bspline_basis_dense(
+            thetas.view(),
+            start + h,
+            start + h + period,
+            degree,
+            num_basis,
+        )
+        .unwrap();
+        // Try every cyclic shift; the best should match to round-off if the
+        // basis rotates rigidly.
+        let mut best = f64::INFINITY;
+        let mut best_shift = 0usize;
+        for shift in 0..num_basis {
+            let mut maxerr = 0.0_f64;
+            for r in 0..b0.nrows() {
+                for j in 0..num_basis {
+                    let permuted = b0[[r, (j + shift) % num_basis]];
+                    maxerr = maxerr.max((b1[[r, j]] - permuted).abs());
+                }
+            }
+            if maxerr < best {
+                best = maxerr;
+                best_shift = shift;
+            }
+        }
+        eprintln!("[cyclic-rigid] best cyclic-shift match err={best:.3e} at shift={best_shift}");
+        assert!(
+            best < 1e-10,
+            "cyclic basis is NOT a rigid cyclic permutation under a whole-knot seam shift: \
+             best max|ΔB| over all {num_basis} shifts = {best:.3e} (shift {best_shift})"
+        );
+    }
+
+    /// GUARD (#1593): the cyclic basis function SPACE must be seam-invariant.
+    /// Under ANY seam shift — including a SUB-knot shift that lands the seam
+    /// between knots — the column span of the cyclic design at the same physical
+    /// angles must be identical (the knot grid is canonically anchored, so the
+    /// basis is the same set of periodic functions, only relabeled). We measure
+    /// span equality by the relative residual of projecting one design onto the
+    /// other's column space.
+    #[test]
+    fn cyclic_basis_span_invariant_to_subknot_seam_shift() {
+        use gam_linalg::faer_ndarray::{fast_ab, fast_ata};
+        let degree = 3usize;
+        let num_basis = 12usize;
+        let period = std::f64::consts::TAU;
+        let h = period / num_basis as f64;
+        let thetas = Array1::from_iter((0..200).map(|i| (i as f64 + 0.123) / 200.0 * period));
+        let reference = {
+            let (b, _) =
+                create_cyclic_bspline_basis_dense(thetas.view(), 0.0, period, degree, num_basis)
+                    .unwrap();
+            b
+        };
+        // Orthonormal basis Q of the reference column span (via its Gram null
+        // complement is overkill; use the design columns directly with an
+        // economy projection through the normal equations).
+        let gram = fast_ata(&reference);
+        // Project each shifted design's columns onto span(reference) and measure
+        // the residual energy fraction; a seam-invariant space leaves ~0 residual.
+        for frac in [0.37_f64, 0.5, 0.81, 1.0, 1.5, 2.8] {
+            let seam = frac * h;
+            let (bs, _) = create_cyclic_bspline_basis_dense(
+                thetas.view(),
+                seam,
+                seam + period,
+                degree,
+                num_basis,
+            )
+            .unwrap();
+            // Least-squares fit of each shifted column by the reference columns:
+            // residual = bs - reference · (gram⁻¹ referenceᵀ bs).
+            let rtb = fast_ab(&reference.t().to_owned(), &bs);
+            let gram_inv = {
+                // Small (num_basis × num_basis) SPD inverse via solve.
+                use faer::Side;
+                use gam_linalg::faer_ndarray::FaerCholesky;
+                let chol = gram.cholesky(Side::Lower).unwrap();
+                let mut id = Array2::<f64>::eye(gram.nrows());
+                chol.solve_mat_in_place(&mut id);
+                id
+            };
+            let coef = fast_ab(&gram_inv, &rtb);
+            let approx = fast_ab(&reference, &coef);
+            let resid = &bs - &approx;
+            let rel = resid.iter().map(|v| v * v).sum::<f64>().sqrt()
+                / bs.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-300);
+            eprintln!("[cyclic-span] seam={seam:.4} (frac {frac}) span residual={rel:.3e}");
+            assert!(
+                rel < 1e-9,
+                "cyclic basis span is NOT seam-invariant at sub-knot shift frac={frac}: \
+                 relative residual {rel:.3e} (the knot grid must anchor to a canonical phase, \
+                 #1593)"
+            );
+        }
+    }
 
     /// At `γ = 0` the closure penalty is the open penalty; at `γ = 1` it is the
     /// cyclic penalty. The wrap piece carries the seam.
