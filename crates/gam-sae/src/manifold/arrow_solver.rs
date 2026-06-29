@@ -173,6 +173,132 @@ impl<'a> DeflatedArrowSolver<'a> {
         Ok(out)
     }
 
+    /// #932 FRONT C — whether the cheap row-local Takahashi selected inverse
+    /// ([`Self::beta_inv`] / [`Self::selected_inverse_row_blocks`]) reproduces
+    /// `solve`'s selected entries EXACTLY. It does so only on the plain bordered
+    /// arrow: when a gauge Woodbury deflation is active (`woodbury_factor`) the
+    /// `solve` output carries the rank-`R` gauge correction the row-local blocks
+    /// omit, and when a #1038 cross-row IBP Woodbury is present the cache's
+    /// per-row factors are the NO-SELF base `H₀'` (not the full operator). In
+    /// either case callers MUST fall back to the per-row `solve` loop — the
+    /// row-local blocks are NOT valid there.
+    pub(crate) fn plain_selected_inverse_available(&self) -> bool {
+        self.woodbury_factor.is_none() && self.cache.cross_row_woodbury.is_none()
+    }
+
+    /// #932 FRONT C — the full `(H⁻¹)_ββ = S⁻¹` block (`K×K`), formed ONCE per
+    /// outer step from the cached dense Schur factor (no per-column full-system
+    /// `solve`). On the plain arrow this equals the `beta_inv` the logdet /
+    /// α-trace consumers used to build with `K` calls to [`Self::solve`] with
+    /// unit β-RHS. ONLY valid when [`Self::plain_selected_inverse_available`].
+    pub(crate) fn beta_inv(&self) -> Result<Array2<f64>, String> {
+        let k = self.cache.k;
+        if k == 0 {
+            return Ok(Array2::<f64>::zeros((0, 0)));
+        }
+        self.cache
+            .schur_inverse_block(0..k)
+            .map_err(|err| format!("DeflatedArrowSolver::beta_inv: {err}"))
+    }
+
+    /// #932 FRONT C — row-local Takahashi selected inverse of the PLAIN bordered
+    /// arrow: returns this row's own `(H⁻¹)_tt` block (`q×q`) and its `(H⁻¹)_tβ`
+    /// block (`q×K`) WITHOUT the O(n) full-system sweep that one
+    /// [`Self::solve`] per unit RHS performs. Mirrors
+    /// `ArrowFactorCache::latent_block_inverse_diagonal` (system.rs) but returns
+    /// the full blocks rather than only the diagonal. With `A_i =
+    /// undamped_factor(i)`, `B_i = H_tβ^(i)`, `G_i = A_i⁻¹ B_i`, `S⁻¹ = beta_inv`:
+    ///
+    /// ```text
+    ///   (H⁻¹)_tt[i,i] = A_i⁻¹ + G_i S⁻¹ G_iᵀ
+    ///   (H⁻¹)_tβ[i]   = −G_i S⁻¹
+    /// ```
+    ///
+    /// Touches ONLY row `i`'s own factor, its `H_tβ^(i)` coupling, and the shared
+    /// `S⁻¹` — O(q·(q+K)) per row, no `n`-sweep. ONLY valid when
+    /// [`Self::plain_selected_inverse_available`]; pass the `S⁻¹` from
+    /// [`Self::beta_inv`].
+    pub(crate) fn selected_inverse_row_blocks(
+        &self,
+        row: usize,
+        beta_inv: &Array2<f64>,
+    ) -> Result<(Array2<f64>, Array2<f64>), String> {
+        let cache = self.cache;
+        let q = cache.row_dims[row];
+        let k = cache.k;
+        let factor = cache.undamped_factor(row);
+
+        // A_i⁻¹ (q×q): solve A_i x = e_j per column.
+        let mut a_inv = Array2::<f64>::zeros((q, q));
+        let mut e_j = Array1::<f64>::zeros(q);
+        for j in 0..q {
+            e_j.fill(0.0);
+            e_j[j] = 1.0;
+            let col = cholesky_solve_vector(factor, e_j.view());
+            for r in 0..q {
+                a_inv[[r, j]] = col[r];
+            }
+        }
+
+        if k == 0 {
+            return Ok((a_inv, Array2::<f64>::zeros((q, 0))));
+        }
+
+        // G_i = A_i⁻¹ B_i (q×K): column c is A_i⁻¹ (B_i e_c), where B_i e_c is the
+        // c-th column of H_tβ^(i) recovered via `apply_htbeta_row`.
+        let mut g = Array2::<f64>::zeros((q, k));
+        let mut e_c = Array1::<f64>::zeros(k);
+        let mut b_col = Array1::<f64>::zeros(q);
+        for c in 0..k {
+            e_c.fill(0.0);
+            e_c[c] = 1.0;
+            b_col.fill(0.0);
+            if !cache.apply_htbeta_row(row, e_c.view(), &mut b_col) {
+                return Err(format!(
+                    "DeflatedArrowSolver::selected_inverse_row_blocks: H_tβ^({row}) apply failed"
+                ));
+            }
+            let g_col = cholesky_solve_vector(factor, b_col.view());
+            for r in 0..q {
+                g[[r, c]] = g_col[r];
+            }
+        }
+
+        // GS = G_i S⁻¹ (q×K).
+        let mut gs = Array2::<f64>::zeros((q, k));
+        for r in 0..q {
+            for m in 0..k {
+                let mut acc = 0.0_f64;
+                for n in 0..k {
+                    acc += g[[r, n]] * beta_inv[[n, m]];
+                }
+                gs[[r, m]] = acc;
+            }
+        }
+
+        // (H⁻¹)_tβ[i] = −G_i S⁻¹ = −GS, layout [col, b].
+        let mut inv_vbeta = Array2::<f64>::zeros((q, k));
+        for col in 0..q {
+            for b in 0..k {
+                inv_vbeta[[col, b]] = -gs[[col, b]];
+            }
+        }
+
+        // (H⁻¹)_tt[i,i] = A_i⁻¹ + G_i S⁻¹ G_iᵀ = A_i⁻¹ + GS·Gᵀ, layout [r, col].
+        let mut inv_vv = a_inv;
+        for r in 0..q {
+            for col in 0..q {
+                let mut acc = 0.0_f64;
+                for m in 0..k {
+                    acc += gs[[r, m]] * g[[col, m]];
+                }
+                inv_vv[[r, col]] += acc;
+            }
+        }
+
+        Ok((inv_vv, inv_vbeta))
+    }
+
     pub(crate) fn latent_inverse_diagonal(&self) -> Result<Array1<f64>, String> {
         if self.woodbury_factor.is_none() {
             return self
@@ -190,6 +316,128 @@ impl<'a> DeflatedArrowSolver<'a> {
             out[idx] = solved.t[idx];
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod selected_inverse_row_blocks_oracle_tests {
+    //! #932 FRONT C oracle: the row-local Takahashi selected-inverse blocks
+    //! ([`DeflatedArrowSolver::selected_inverse_row_blocks`] / [`beta_inv`])
+    //! MUST reproduce the per-row full-system `solve` loop they replace, to
+    //! ≤1e-9, on the plain bordered arrow. This is the gate the logdet /
+    //! α-trace consumers rely on when they take the fast path.
+    use super::*;
+    use gam_solve::arrow_schur::{
+        ArrowFactorSlab, ArrowHtbetaCache, ArrowSolverMode, ArrowUndampedFactors, PcgDiagnostics,
+    };
+    use ndarray::array;
+    use std::sync::Arc;
+
+    /// A plain bordered-arrow cache with a NONZERO `H_tβ` coupling and a PD
+    /// dense Schur factor, so the β-Schur back-substitution genuinely exercises
+    /// the `G S⁻¹ Gᵀ` / `−G S⁻¹` terms (not just the block-diagonal `A⁻¹`). The
+    /// stored factors are lower-Cholesky factors `L` (the represented block is
+    /// `L Lᵀ`); the row-local identity holds for any PD `A`/`S` and any `B`.
+    fn coupled_arrow_cache() -> ArrowFactorCache {
+        let htt = ArrowFactorSlab::from_blocks(vec![
+            array![[1.3_f64, 0.0], [0.4, 1.1]],
+            array![[0.9_f64]],
+        ]);
+        let schur = array![[1.2_f64, 0.0], [0.25, 0.95]];
+        ArrowFactorCache {
+            htt_factors: htt,
+            htt_factors_undamped: ArrowUndampedFactors::SameAsDamped,
+            schur_factor: Some(schur),
+            joint_hessian_log_det: None,
+            solver_mode: ArrowSolverMode::Direct,
+            ridge_t: 0.0,
+            ridge_beta: 0.0,
+            htbeta: ArrowHtbetaCache::Dense {
+                blocks: Arc::from(
+                    vec![
+                        array![[0.5_f64, -0.2], [0.1, 0.4]],
+                        array![[0.3_f64, 0.7]],
+                    ]
+                    .into_boxed_slice(),
+                ),
+                estimated_bytes: 0,
+            },
+            d: 2,
+            row_dims: Arc::from(vec![2usize, 1usize].into_boxed_slice()),
+            row_offsets: Arc::from(vec![0usize, 2usize, 3usize].into_boxed_slice()),
+            k: 2,
+            manifold_mode_fingerprint: 0,
+            row_hessian_fingerprint: 0,
+            pcg_diagnostics: PcgDiagnostics::default(),
+            gauge_deflated_directions: 0,
+            deflated_row_directions: Arc::from(Vec::new()),
+            deflation_row_spectra: Arc::from(Vec::new()),
+            cross_row_woodbury: None,
+        }
+    }
+
+    #[test]
+    fn row_local_blocks_match_per_row_solve() {
+        let cache = coupled_arrow_cache();
+        let solver = DeflatedArrowSolver::plain(&cache);
+        assert!(
+            solver.plain_selected_inverse_available(),
+            "plain cache must take the fast selected-inverse path"
+        );
+        let total_t = cache.delta_t_len();
+        let k = cache.k;
+
+        // β-block `(H⁻¹)_ββ = S⁻¹`: beta_inv() vs the per-column unit-β solve.
+        let beta_inv = solver.beta_inv().expect("beta_inv");
+        let rhs_t_zero = Array1::<f64>::zeros(total_t);
+        for col in 0..k {
+            let mut rhs_beta = Array1::<f64>::zeros(k);
+            rhs_beta[col] = 1.0;
+            let solved = solver
+                .solve(rhs_t_zero.view(), rhs_beta.view())
+                .expect("β solve");
+            for r in 0..k {
+                assert!(
+                    (beta_inv[[r, col]] - solved.beta[r]).abs() <= 1e-9,
+                    "beta_inv[{r},{col}] {} != solve {}",
+                    beta_inv[[r, col]],
+                    solved.beta[r]
+                );
+            }
+        }
+
+        // Per-row `(H⁻¹)_tt` (q×q) and `(H⁻¹)_tβ` (q×K) blocks.
+        let rhs_beta_zero = Array1::<f64>::zeros(k);
+        for row in 0..cache.n_rows() {
+            let q = cache.row_dims[row];
+            let base = cache.row_offsets[row];
+            let (inv_vv, inv_vbeta) = solver
+                .selected_inverse_row_blocks(row, &beta_inv)
+                .expect("row blocks");
+            for col in 0..q {
+                let mut rhs_t = Array1::<f64>::zeros(total_t);
+                rhs_t[base + col] = 1.0;
+                let solved = solver
+                    .solve(rhs_t.view(), rhs_beta_zero.view())
+                    .expect("t solve");
+                for r in 0..q {
+                    assert!(
+                        (inv_vv[[r, col]] - solved.t[base + r]).abs() <= 1e-9,
+                        "inv_vv[{r},{col}] {} != solve {}",
+                        inv_vv[[r, col]],
+                        solved.t[base + r]
+                    );
+                }
+                for b in 0..k {
+                    assert!(
+                        (inv_vbeta[[col, b]] - solved.beta[b]).abs() <= 1e-9,
+                        "inv_vbeta[{col},{b}] {} != solve {}",
+                        inv_vbeta[[col, b]],
+                        solved.beta[b]
+                    );
+                }
+            }
+        }
     }
 }
 
