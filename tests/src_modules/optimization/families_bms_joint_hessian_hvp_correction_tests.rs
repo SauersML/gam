@@ -1376,6 +1376,7 @@ fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
         &penalty_counts,
         Some(&s_logdet_blocks),
         Some(std::sync::Arc::clone(&psi_workspace)),
+        None,
     )
     .expect("per-pair callbacks");
 
