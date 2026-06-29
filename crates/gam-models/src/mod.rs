@@ -14,6 +14,8 @@ extern crate gam_model_kernels;
 // (rustc forbids `crate::`-absolute paths to same-crate `macro_export` macros).
 #[macro_use]
 mod macros;
+#[cfg(test)]
+mod repro_1629;
 
 // `bail_*` shorthands whose error types were relocated to the neutral
 // `gam-problem` crate. Re-exporting the `#[macro_export]` macros here makes

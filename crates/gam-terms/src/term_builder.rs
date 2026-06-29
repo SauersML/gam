@@ -67,7 +67,7 @@ const FACTOR_SMOOTH_DEFAULT_BASIS_DIM: usize = 10;
 /// peak memory independent of the dataset row count.
 const DEFAULT_PCA_CHUNK_SIZE: usize = 4096;
 
-fn default_matern_length_scale(ds: &Dataset, cols: &[usize]) -> f64 {
+fn default_matern_length_scale(ds: &Dataset, cols: &[usize], num_centers: usize) -> f64 {
     let mut diameter2 = 0.0_f64;
     for &col in cols {
         let column = ds.values.column(col);
@@ -83,17 +83,41 @@ fn default_matern_length_scale(ds: &Dataset, cols: &[usize]) -> f64 {
         }
     }
     let diameter = diameter2.sqrt();
-    if diameter.is_finite() && diameter > 0.0 {
-        // #1074: default to the full data diameter (mgcv's `bs="gp"` default
-        // range), NOT a hand-tuned fraction. The old `0.15·diameter` magic
-        // constant existed to dodge high-frequency collapse while the 1-D κ
-        // optimizer was not relied on to pick the range; that masking is removed.
-        // The DEFAULT_MATERN_LENGTH_SCALE_FLOOR guard against a degenerate
-        // (zero-span) domain is a legitimate numerical floor and is kept.
-        diameter.max(DEFAULT_MATERN_LENGTH_SCALE_FLOOR)
-    } else {
-        1.0
+    if !(diameter.is_finite() && diameter > 0.0) {
+        return 1.0;
     }
+    // #1629: seed the κ-optimizer at the basis's NATURAL operating scale — the
+    // typical inter-knot spacing — NOT the full data diameter.
+    //
+    // #1074 had moved this seed to the full diameter (mgcv's `bs="gp"` default
+    // range). That is wrong for *this* engine because of an ordering coupling
+    // mgcv does not have: the cold build BOTH (a) rank-reduces the center set
+    // (`matern_rank_reduce_centers`) and (b) freezes the surviving count into the
+    // identifiability transform — all at this seed length scale, BEFORE the
+    // κ-optimizer runs. At a range as wide as the diameter every Matérn column is
+    // near-constant over the data cloud, so the realized n×K kernel block is
+    // numerically collinear: RRQR prunes the basis to a small fraction of K
+    // (e.g. 200 → 52), the freeze pins that collapsed count, and the optimizer can
+    // never recover the dropped columns. The result is a smoother that resolves
+    // only the lowest-frequency structure (#1629: matern 6× worse than thinplate,
+    // `k=` a no-op because k is pruned before it matters). The diameter is in fact
+    // OUTSIDE the optimizer's own ψ = log κ window (`[2/r_max, 100/r_min]`), so it
+    // was never a reachable operating point anyway.
+    //
+    // For K space-filling centers over a d-dimensional cloud of diameter `D`, the
+    // nearest-neighbour spacing is ≈ D / K^(1/d). Seeding the length scale there
+    // keeps κ·r ≈ O(1) between adjacent centers: every kernel column is distinct,
+    // the block stays full rank, the freeze keeps all K centers, and the κ
+    // multi-start pre-scan + joint [ρ, ψ] solver then tune the range freely across
+    // the full data-derived window (#1074's "let the optimizer pick the range"
+    // intent is preserved — the optimizer simply starts from a non-degenerate
+    // basis instead of a collapsed one).
+    let d = cols.len().max(1);
+    let k = num_centers.max(2) as f64;
+    let spacing = diameter / k.powf(1.0 / d as f64);
+    // Never seed above the diameter (degenerate small-K corner) and never below
+    // the numerical floor that guards a zero-span domain.
+    spacing.min(diameter).max(DEFAULT_MATERN_LENGTH_SCALE_FLOOR)
 }
 
 // ---------------------------------------------------------------------------
@@ -2676,7 +2700,7 @@ pub fn build_smooth_basis(
                     center_strategy,
                     periodic: parse_periodic_axes_option(options, cols.len())?,
                     length_scale: option_f64(options, "length_scale")
-                        .unwrap_or_else(|| default_matern_length_scale(ds, cols)),
+                        .unwrap_or_else(|| default_matern_length_scale(ds, cols, centers)),
                     nu,
                     include_intercept: option_bool(options, "include_intercept").unwrap_or(false),
                     double_penalty: smooth_double_penalty,
