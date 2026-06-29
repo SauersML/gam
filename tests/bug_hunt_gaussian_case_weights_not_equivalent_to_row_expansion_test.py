@@ -73,7 +73,9 @@ def _weighted_vs_expanded(
 
 
 def _confidence_se(model, grid: pd.DataFrame) -> np.ndarray:
-    pred = model.predict(grid, interval="confidence")
+    # `interval=<level>` (a float) turns on the SE-only confidence band; the
+    # returned table gains a `std_error` column scaling as sqrt(phi_hat).
+    pred = model.predict(grid, interval=0.95)
     return np.asarray(pred.std_error, dtype=float)
 
 
