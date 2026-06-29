@@ -38,7 +38,7 @@
 //! the shipped build.
 
 #[cfg(test)]
-pub(crate) mod test_support {
+mod test_support {
     /// Generic second-order jet over a runtime primary count, mirroring the
     /// survival flex `FlexJet` trait. `compose_unary` is the Faà di Bruno
     /// composition `f ∘ self` with the unary derivative stack
