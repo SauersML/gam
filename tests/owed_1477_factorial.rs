@@ -319,39 +319,69 @@ fn fit_cell(
     let formula = format!("y ~ s(x, bs=\"ps\", k={K}, double_penalty={})", dp.flag());
     let result = fit_from_formula(&formula, data, &cfg)
         .unwrap_or_else(|e| panic!("{} {} fit failed: {e:?}", family.label(), dp.label()));
-    let FitResult::Standard(fit) = result else {
-        panic!(
-            "expected a Standard GAM fit for {} {}",
-            family.label(),
-            dp.label()
-        );
-    };
-    let edf_total = fit.fit.edf_total().expect("edf_total available");
-
-    // Rebuild the design on the dense grid and read the fitted mean.
     let col = data.column_map();
     let x_idx = col["x"];
-    let mut grid_mat = Array2::<f64>::zeros((grid.len(), data.headers.len()));
-    for (i, &xv) in grid.iter().enumerate() {
-        grid_mat[[i, x_idx]] = xv;
-    }
-    let grid_design = build_term_collection_design(grid_mat.view(), &fit.resolvedspec)
-        .expect("rebuild design on grid");
-    let eta = grid_design.design.apply(&fit.fit.beta);
-    let mean_on_grid: Vec<f64> = eta.iter().map(|&e| family.mean_from_eta(e)).collect();
 
-    // For the spectral contract we need the constrained-chart penalty matrices
-    // S_c (primary) and P (null-space ridge). Rebuild the design on the TRAINING
-    // abscissae (the centering/identifiability transform — hence `null(S_c)` —
-    // is fixed by the spec, so any evaluation grid yields the same constrained
-    // penalty blocks; we use the training rows to be unambiguous).
-    let penalties = match dp {
-        DoublePenalty::On => Some(extract_constrained_penalties(
-            data,
-            &fit.resolvedspec,
-            x_idx,
-        )),
-        DoublePenalty::Off => None,
+    // A Gaussian-identity, SINGLE-penalty, cubic `ps` smooth (degree 3 = 2·order−1,
+    // free boundary, one smooth, no double penalty) is EXACTLY the shape the #1030
+    // state-space spline scan solves in closed O(n) form, so `fit_from_formula`
+    // legitimately returns it as a `SplineScan` posterior rather than a dense
+    // `Standard` fit (see `spline_scan_fast_path`). That posterior IS the same
+    // Gaussian-identity fit, only in an exact representation, so the dp-off Gaussian
+    // cell reads its truth-recovery quantities — fitted mean and EDF — directly off
+    // the scan. The scan is single-penalty by construction, so it never carries a
+    // null-space ridge and contributes `penalties = None`, matching every dp-off
+    // cell. The double-penalty path is fast-path-ineligible, so a scan must NEVER
+    // appear with `dp = On`; assert that invariant so a future routing change that
+    // diverted a double-penalty fit here (silently dropping the null-space ridge)
+    // would fail loudly instead of fitting the wrong model.
+    let (edf_total, mean_on_grid, penalties) = match result {
+        FitResult::Standard(fit) => {
+            let edf_total = fit.fit.edf_total().expect("edf_total available");
+
+            // Rebuild the design on the dense grid and read the fitted mean.
+            let mut grid_mat = Array2::<f64>::zeros((grid.len(), data.headers.len()));
+            for (i, &xv) in grid.iter().enumerate() {
+                grid_mat[[i, x_idx]] = xv;
+            }
+            let grid_design = build_term_collection_design(grid_mat.view(), &fit.resolvedspec)
+                .expect("rebuild design on grid");
+            let eta = grid_design.design.apply(&fit.fit.beta);
+            let mean_on_grid: Vec<f64> = eta.iter().map(|&e| family.mean_from_eta(e)).collect();
+
+            // For the spectral contract we need the constrained-chart penalty
+            // matrices S_c (primary) and P (null-space ridge). Rebuild the design on
+            // the TRAINING abscissae (the centering/identifiability transform — hence
+            // `null(S_c)` — is fixed by the spec, so any evaluation grid yields the
+            // same constrained penalty blocks; we use the training rows to be
+            // unambiguous).
+            let penalties = match dp {
+                DoublePenalty::On => {
+                    Some(extract_constrained_penalties(data, &fit.resolvedspec, x_idx))
+                }
+                DoublePenalty::Off => None,
+            };
+            (edf_total, mean_on_grid, penalties)
+        }
+        FitResult::SplineScan(scan) => {
+            assert!(
+                matches!(dp, DoublePenalty::Off),
+                "the spline-scan fast path is single-penalty only; a {} {} fit must \
+                 never route through it (it would silently drop the null-space ridge)",
+                family.label(),
+                dp.label()
+            );
+            let mean_on_grid: Vec<f64> = grid
+                .iter()
+                .map(|&x| scan.predict(x).expect("spline-scan grid prediction").0)
+                .collect();
+            (scan.edf(), mean_on_grid, None)
+        }
+        _ => panic!(
+            "expected a Standard or SplineScan GAM fit for {} {}",
+            family.label(),
+            dp.label()
+        ),
     };
 
     CellFit {
