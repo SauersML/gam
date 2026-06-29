@@ -130,6 +130,108 @@ mod tests {
         }
     }
 
+    #[test]
+    pub(crate) fn firth_factored_path_matches_full_operator_oracle_1575() {
+        // #1575 hoisted the β-INDEPENDENT Firth design factor out of the inner
+        // Newton loop: `build_design_factor_with_observation_weights` (η-free,
+        // built once) followed by `pirls_diagnostics_from_factor` (per-η) must
+        // reproduce the full operator rebuilt fresh at each η — the
+        // by-construction equivalence the hoist's correctness rests on. This
+        // pins that equivalence directly (the surrounding tests only exercise
+        // the factored path through end-to-end fits), including the
+        // identifiable-subspace reduction on a RANK-DEFICIENT design and the
+        // design-factor REUSE across multiple η (the whole point of the hoist).
+        use crate::estimate::reml::FirthDenseOperator;
+
+        // Rank-deficient design: col 4 := col 2 + col 3, forcing a structural
+        // null direction so the reduced-space (r = 3 < p = 4) path is taken.
+        let mut x = array![
+            [1.0, -1.2, 0.5, 0.0],
+            [1.0, -0.3, 1.1, 0.0],
+            [1.0, 0.4, -0.6, 0.0],
+            [1.0, 1.1, 0.2, 0.0],
+            [1.0, 1.8, -0.9, 0.0],
+            [1.0, 0.1, 1.4, 0.0],
+        ];
+        for i in 0..x.nrows() {
+            x[[i, 3]] = x[[i, 1]] + x[[i, 2]];
+        }
+        let etas = [
+            array![-1.4, -0.5, 0.2, 0.9, 1.4, 0.0],
+            array![0.3, -2.1, 1.7, -0.8, 0.6, -1.2],
+            array![2.0, 2.0, -2.0, -2.0, 0.5, -0.5],
+        ];
+        let weights = array![1.0, 0.7, 1.3, 0.9, 1.1, 0.4];
+        let logit = InverseLink::Standard(StandardLink::Logit);
+        let cloglog = InverseLink::Standard(StandardLink::CLogLog);
+
+        for link in [&logit, &cloglog] {
+            // Build each design factor ONCE; reuse across every η below.
+            let factor_w = FirthDenseOperator::build_design_factor_with_observation_weights(
+                &x,
+                Some(weights.view()),
+            )
+            .expect("weighted design factor builds");
+            let factor_u =
+                FirthDenseOperator::build_design_factor_with_observation_weights(&x, None)
+                    .expect("unweighted design factor builds");
+
+            for eta in &etas {
+                // Weighted: factored fast path vs full-operator oracle.
+                let (hat_f, logdet_f, shift_f) =
+                    FirthDenseOperator::pirls_diagnostics_from_factor(&factor_w, link, eta)
+                        .expect("factored weighted diagnostics");
+                let (hat_o, logdet_o, shift_o) = compute_jeffreys_pirls_diagnostics(
+                    link,
+                    x.view(),
+                    eta.view(),
+                    weights.view(),
+                )
+                .expect("oracle weighted diagnostics");
+                assert_relative_eq!(logdet_f, logdet_o, epsilon = 1e-12, max_relative = 1e-12);
+                for i in 0..x.nrows() {
+                    assert_relative_eq!(hat_f[i], hat_o[i], epsilon = 1e-12, max_relative = 1e-12);
+                    assert_relative_eq!(
+                        shift_f[i],
+                        shift_o[i],
+                        epsilon = 1e-12,
+                        max_relative = 1e-12
+                    );
+                }
+
+                // Unweighted (`None` branch of the factor builder) vs the full
+                // operator with no observation weights.
+                let (hat_fu, logdet_fu, shift_fu) =
+                    FirthDenseOperator::pirls_diagnostics_from_factor(&factor_u, link, eta)
+                        .expect("factored unweighted diagnostics");
+                let op_u = FirthDenseOperator::build_for_link(link, &x, eta)
+                    .expect("full unweighted operator");
+                assert_relative_eq!(
+                    logdet_fu,
+                    op_u.jeffreys_logdet(),
+                    epsilon = 1e-12,
+                    max_relative = 1e-12
+                );
+                let hat_ou = op_u.pirls_hat_diag();
+                let shift_ou = op_u.pirls_firth_score_shift();
+                for i in 0..x.nrows() {
+                    assert_relative_eq!(
+                        hat_fu[i],
+                        hat_ou[i],
+                        epsilon = 1e-12,
+                        max_relative = 1e-12
+                    );
+                    assert_relative_eq!(
+                        shift_fu[i],
+                        shift_ou[i],
+                        epsilon = 1e-12,
+                        max_relative = 1e-12
+                    );
+                }
+            }
+        }
+    }
+
     /// Calculate scale parameter correctly for different link functions.
     ///
     /// Contract:

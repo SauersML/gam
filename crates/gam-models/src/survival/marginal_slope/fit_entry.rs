@@ -795,6 +795,14 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         derivative_guard: f64,
         probit_scale: f64,
         drops_by_block_initial: (usize, usize, usize),
+        // #979: true when the cutover engaged the W-orthogonal PARTIAL
+        // reduced-logslope reparam (effective Schur Gram) rather than the
+        // full per-term compiler. In that case the post-accept recompile —
+        // which re-runs the FULL per-term compiler — collapses the logslope
+        // channel WHOLESALE by construction, so its drops legitimately differ
+        // from the partial structural drops and must NOT be flagged as a
+        // pilot-curvature trap (that comparison is apples-to-oranges).
+        used_partial_logslope_reduction: bool,
     }
     type SmgsCutoverTuple = (
         gam_linalg::matrix::DesignMatrix,
@@ -984,6 +992,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                     Option<(
                         gam_identifiability::families::compiler::CompiledMap,
                         (usize, usize, usize),
+                        // #979: used_partial_logslope_reduction (see struct doc)
+                        bool,
                     )>,
                     String,
                 > {
@@ -1121,6 +1131,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                             Option<(
                                 gam_identifiability::families::compiler::CompiledMap,
                                 (usize, usize, usize),
+                                // #979: used_partial_logslope_reduction (see struct doc)
+                                bool,
                             )>,
                             String,
                         > {
@@ -1233,7 +1245,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                                                  full-rank by construction — phantom null removed, \
                                                  deadline demoted to backstop",
                                             );
-                                            return Ok(Some((bd_map, (p_time, p_marg, wl))));
+                                            return Ok(Some((bd_map, (p_time, p_marg, wl), true)));
                                         }
                                         Ok(None) => {
                                             // r == p_log (no effective confound to
@@ -1316,7 +1328,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                                              the phantom null direction is projected out — \
                                              deadline demoted to backstop",
                                         );
-                                        Ok(Some((map, (fw_time, fw_marg, fw_log))))
+                                        Ok(Some((map, (fw_time, fw_marg, fw_log), false)))
                                     }
                                     Ok(false) => {
                                         log::warn!(
@@ -1347,7 +1359,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                                      marginal {p_marg}→{fw_marg}, logslope {p_log}→{fw_log}); \
                                      engaging closed-form fast path on the correct quotient",
                                 );
-                                Ok(Some((map, (fw_time, fw_marg, fw_log))))
+                                Ok(Some((map, (fw_time, fw_marg, fw_log), false)))
                             }
                         })();
                         match full_row_hess {
@@ -1363,11 +1375,11 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                             }
                         }
                     } else {
-                        Ok(Some((map, (w_time, w_marg, w_log))))
+                        Ok(Some((map, (w_time, w_marg, w_log), false)))
                     }
                 })();
                 match closed_form {
-                    Ok(Some((map, (wt, wm, wl)))) => {
+                    Ok(Some((map, (wt, wm, wl), used_partial_logslope_reduction))) => {
                         let drops = (
                             p_time.saturating_sub(wt),
                             p_marg.saturating_sub(wm),
@@ -1396,6 +1408,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                             derivative_guard,
                             probit_scale,
                             drops_by_block_initial: drops,
+                            used_partial_logslope_reduction,
                         });
                         if drops.0 + drops.1 + drops.2 == 0 {
                             log::info!(
@@ -2619,6 +2632,35 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             Ok(compiled.drops_by_block)
         })();
         match recompile_result {
+            Ok(drops_post) if ctx.used_partial_logslope_reduction => {
+                // #979: the cutover used the W-orthogonal PARTIAL
+                // reduced-logslope reparam, whose structural drops come from
+                // the effective Schur Gram (keep `wl` surviving directions).
+                // The recompile above re-runs the FULL per-term compiler, which
+                // by construction collapses the WHOLE logslope channel — that
+                // is exactly the over-collapse the partial reparam routes
+                // around, so a logslope-drop difference here is EXPECTED and
+                // healthy, not a pilot-curvature trap. Confirm the full
+                // compiler still over-collapses logslope at converged β (the
+                // confound persists, so the partial reparam was the right
+                // call) and log it at info without crying wolf.
+                let confound_persists = drops_post.2 > ctx.drops_by_block_initial.2;
+                log::info!(
+                    "[smgs phase-4b recompile-after-accept] #979 partial reduced-logslope \
+                     reparam: structural drops=(time={}, marginal={}, logslope={}); full per-term \
+                     recompile at converged β drops=(time={}, marginal={}, logslope={}) — the \
+                     full compiler {} over-collapses logslope, as expected for the partial \
+                     reparam (no pilot-curvature trap); elapsed={:.3}s",
+                    ctx.drops_by_block_initial.0,
+                    ctx.drops_by_block_initial.1,
+                    ctx.drops_by_block_initial.2,
+                    drops_post.0,
+                    drops_post.1,
+                    drops_post.2,
+                    if confound_persists { "still" } else { "no longer" },
+                    recompile_started.elapsed().as_secs_f64(),
+                );
+            }
             Ok(drops_post) => {
                 if drops_post == ctx.drops_by_block_initial {
                     log::debug!(
