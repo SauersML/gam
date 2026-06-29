@@ -373,11 +373,13 @@ fn build_atom_candidates(
     // genuine common-evidence comparison (#1202).
     let mut curved_rss = 0.0_f64;
     let mut linear_rss = 0.0_f64;
+    let mut signal_energy = 0.0_f64;
     for i in 0..n {
         let a = assign[i];
         let dt = coords[i] - t_bar;
         for j in 0..p {
             let y = target_resid[[i, j]];
+            signal_energy += y * y;
             let r_curved = y - a * decoded[[i, j]];
             curved_rss += r_curved * r_curved;
             let r_linear = y - a * (b0[j] + dt * b1[j]);
@@ -385,16 +387,26 @@ fn build_atom_candidates(
         }
     }
 
-    // Gaussian-reconstruction deviance: the residual objective `½ RSS` the
-    // Laplace normalizer is added to. The curved arm pays `½·curved_rss` (how
-    // well its fitted curve explains the residual) plus its larger `M·p`
-    // parameter price; the linear arm pays `½·linear_rss` plus a `2·p` price.
-    // Because the curved family's `Θ = 0` member equals the linear prediction,
-    // `curved_rss ≤ linear_rss` whenever the fitted curve is at least as good a
-    // residual fit as its own straight projection — the match-or-beat floor — and
-    // the argmin trades that data-fit gain against the curvature parameter price.
-    let curved_residual_objective = 0.5 * curved_rss;
-    let linear_residual_objective = 0.5 * linear_rss;
+    // #1610 — PROFILED-VARIANCE (scale-invariant) data-fit objective. Fixing the
+    // Gaussian noise variance at σ²≡1 left the deviance as the raw `½·RSS` in
+    // output-amplitude units; on a small / low-amplitude fixture that term (~0.02
+    // between the arms) is dwarfed by the ~log|H| Laplace complexity (~0.75), so
+    // the argmin over-collapses a genuinely-curved, high-EV atom to a straight
+    // line and the reconstruction loses real variance (EV 1.0 → 0.748). Profiling
+    // σ² out of the Gaussian evidence (reference prior on the variance) replaces
+    // `½·RSS` with `(ν/2)·log(RSS)`, ν = the scalar-residual count the two arms
+    // share. This is scale-invariant — a uniform rescaling of the response shifts
+    // both arms by the same constant — so the data-fit comparison is now
+    // commensurate with the dimensionless `½·log|H|` complexity. A curved atom
+    // whose curve genuinely beats its straight projection (`curved_rss ≪
+    // linear_rss`) now keeps its curve; a truly-straight atom (`curved_rss ≈
+    // linear_rss`) still yields to the cheaper linear arm and collapses losslessly.
+    // The RSS is floored at a tiny fraction of the signal energy so a (near-)exact
+    // fit gives a finite, not `-∞`, objective.
+    let nu = (n * p) as f64;
+    let rss_floor = 1e-12 * signal_energy.max(f64::MIN_POSITIVE);
+    let curved_residual_objective = 0.5 * nu * curved_rss.max(rss_floor).ln();
+    let linear_residual_objective = 0.5 * nu * linear_rss.max(rss_floor).ln();
 
     // Linear candidate parameter price: intercept + slope per output channel.
     let linear_num_params = 2 * p;
