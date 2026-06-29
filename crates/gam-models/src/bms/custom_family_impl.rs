@@ -478,6 +478,34 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 axes.push(self.resolve_psi_axis_spec(derivative_blocks, block_idx, local_idx)?);
                 psi_locations.push((block_idx, local_idx));
             }
+            // EXPLICIT Firth VALUE ψ-derivative context (gam#1607). The outer LAML
+            // cost folds `−Φ(β̂)` where `Φ = ½ log|Z_Jᵀ H_info Z_J|₊` (gated). The
+            // hypercoord reference path (`build_psi_hyper_coords`, whose `coord.a`
+            // this batched `objective_theta[idx]` must match) subtracts the explicit
+            // ψ-derivative `−∂_ψΦ` per axis; this batched override dropped it,
+            // leaving the ψ objective term short by the full Firth value motion.
+            // Rebuild the SAME `(Z_J, H_info)` context the reference uses: the
+            // joint-Jeffreys span is the full block-diagonal identity (every block
+            // contributes `I_{p_block}`, see `build_joint_jeffreys_subspace`), so on
+            // the joint coefficient space `Z_J = I_total`, and `H_info` is the data
+            // joint Hessian. `None` unless the family uses the Jeffreys term and
+            // exposes a dense joint information, so non-Jeffreys families are
+            // byte-unchanged.
+            let jeffreys_hphi_ctx: Option<(Array2<f64>, Array2<f64>)> = if self
+                .joint_jeffreys_term_required()
+                && derivative_blocks.iter().any(|block| !block.is_empty())
+            {
+                match self.joint_jeffreys_information_with_specs(block_states, specs)? {
+                    Some(h_info)
+                        if h_info.nrows() == total && h_info.ncols() == total =>
+                    {
+                        Some((Array2::<f64>::eye(total), h_info))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
             let psi_terms = self.run_psi_row_pass_for_axes(block_states, cache, options, &axes)?;
             if psi_terms.len() != psi_dim {
                 return Err(format!(
@@ -515,10 +543,84 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 let s_psi_beta_local = s_psi_local.dot(&beta_block);
                 objective_theta[idx] =
                     terms.objective_psi + 0.5 * beta_block.dot(&s_psi_beta_local);
+                // EXPLICIT Firth VALUE ψ-derivative `−∂_ψΦ` (gam#1607), mirroring
+                // the hypercoord reference exactly. `∂_ψ H_info|_β` is the family's
+                // ψ-Hessian derivative — the materialized operator when the row pass
+                // streams it, else the dense `hessian_psi`. The helper returns `0.0`
+                // when the conditioning gate skips the term, so a clean fit is
+                // byte-unchanged.
+                let firth_pert_info: Option<Array2<f64>> = if jeffreys_hphi_ctx.is_some() {
+                    if let Some(op) = terms.hessian_psi_operator.as_ref() {
+                        Some(op.mul_mat(&Array2::<f64>::eye(total)))
+                    } else if terms.hessian_psi.nrows() == total
+                        && terms.hessian_psi.ncols() == total
+                    {
+                        Some(terms.hessian_psi.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let (Some((z_j, h_joint)), Some(pert_info)) =
+                    (jeffreys_hphi_ctx.as_ref(), firth_pert_info.as_ref())
+                {
+                    let phi_psi =
+                        gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_phi_explicit_param_derivative(
+                            h_joint.view(),
+                            z_j.view(),
+                            pert_info,
+                        )?;
+                    objective_theta[idx] -= phi_psi;
+                }
                 let mut rhs = terms.score_psi.clone();
                 {
                     let mut rhs_block = rhs.slice_mut(s![start..end]);
                     rhs_block += &s_psi_beta_local;
+                }
+                // EXPLICIT Firth Hessian β-COUPLING `−∂_β∂_ψΦ` (gam#1607), mirroring
+                // the hypercoord reference (`build_psi_hyper_coords`, `g[a] -= ...`).
+                // The outer mode-response uses the coord score `g_ψ = ∂_β∂_ψV|_β`;
+                // the Firth value `−Φ(β̂)` contributes `−∂_β∂_ψΦ` to it (β̂ moves with
+                // ψ as the length-scale reshapes the design). Dropping it left the
+                // psi DIRECTION `v = −H⁻¹g` short, so the correction-trace channel of
+                // `trace_h_inv_hdot` disagreed with the reference (≈ rel 2e-3). The
+                // per-β-axis mixed second derivative consumes the same family
+                // directional derivatives the `∂_ψH_Φ` curvature term uses; the helper
+                // returns `0.0` under the conditioning gate so a clean fit is
+                // byte-unchanged.
+                if let (Some((z_j, h_joint)), Some(pert_info)) =
+                    (jeffreys_hphi_ctx.as_ref(), firth_pert_info.as_ref())
+                {
+                    for a_idx in 0..total {
+                        let mut e_a = Array1::<f64>::zeros(total);
+                        e_a[a_idx] = 1.0;
+                        let hdot_a = self
+                            .joint_jeffreys_information_directional_derivative_with_specs(
+                                block_states,
+                                specs,
+                                &e_a,
+                            )?;
+                        let psi_hdot_a = self
+                            .exact_newton_joint_psihessian_directional_derivative(
+                                block_states,
+                                specs,
+                                derivative_blocks,
+                                psi_index,
+                                &e_a,
+                            )?;
+                        if let (Some(hdot_a), Some(psi_hdot_a)) = (hdot_a, psi_hdot_a) {
+                            let phi_psi_beta_a =
+                                gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_phi_explicit_param_second_derivative(
+                                    h_joint.view(),
+                                    z_j.view(),
+                                    pert_info,
+                                    &hdot_a,
+                                    &psi_hdot_a,
+                                )?;
+                            rhs[a_idx] -= phi_psi_beta_a;
+                        }
+                    }
                 }
                 let v = spectral.solve(&rhs);
                 directions.column_mut(idx).assign(&(-&v));
