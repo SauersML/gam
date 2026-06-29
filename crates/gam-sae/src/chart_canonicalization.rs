@@ -2363,6 +2363,11 @@ pub fn d1_atom_fitted_turning(
     }
     // Per-node curvature integrand f(t) = ‖γ'∧γ''‖/‖γ'‖² (= κ·‖γ'‖).
     let mut integrand = vec![0.0_f64; nodes];
+    // Distinguish a GLOBALLY constant image (every node stationary → a degenerate
+    // point with total turning exactly 0) from a curve that is stationary at only
+    // SOME nodes (a genuine cusp whose turning is ill-defined there, refused).
+    let mut any_moving = false;
+    let mut any_stationary = false;
     let mut g1 = vec![0.0_f64; p];
     let mut g2 = vec![0.0_f64; p];
     for node in 0..nodes {
@@ -2393,11 +2398,15 @@ pub fn d1_atom_fitted_turning(
             dot += g1[j] * g2[j];
         }
         if !(n1 > 0.0) {
-            // Zero speed at a node: the curve is momentarily stationary in this
-            // chart; the curvature integrand is undefined there. A genuinely
-            // collapsed curve has no honest turning.
-            return Ok(None);
+            // Zero speed at this node: the arc-length measure `ds = ‖γ'‖dt`
+            // vanishes here, so this node contributes zero turning regardless of
+            // κ. Record it and continue; the all-stationary (constant image) vs
+            // mixed (cusp) cases are resolved after the loop.
+            any_stationary = true;
+            integrand[node] = 0.0;
+            continue;
         }
+        any_moving = true;
         // Wedge norm² = ‖γ'‖²‖γ''‖² − ⟨γ',γ''⟩² (Lagrange identity); clamp tiny
         // negative round-off to 0 before the sqrt.
         let raw_wedge_sq = n1 * n2 - dot * dot;
@@ -2411,6 +2420,19 @@ pub fn d1_atom_fitted_turning(
         if !integrand[node].is_finite() {
             return Ok(None);
         }
+    }
+    if !any_moving {
+        // The decoded image never moves over the coordinate span: a degenerate
+        // single point (e.g. a `d = 1` atom straightened to its constant DC
+        // component). A point has no arc to turn through, so its total turning is
+        // exactly 0 — the ultimate linear-tail signature — not "undefined".
+        return Ok(Some(0.0));
+    }
+    if any_stationary {
+        // Stationary at SOME nodes but moving at others: a cusp where the turning
+        // integrand is genuinely ill-defined. Refuse rather than under-count the
+        // sharp turn (the historical conservative behavior for a partial cusp).
+        return Ok(None);
     }
     // Composite Simpson over `cells` cells: each cell [2i, 2i+1, 2i+2] gets
     // (h/3)(f0 + 4 f_mid + f1).

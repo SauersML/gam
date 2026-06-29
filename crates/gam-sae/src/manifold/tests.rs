@@ -2761,6 +2761,30 @@ pub(crate) fn topk_reconstruction_composes_with_hybrid_collapse() {
         "atom 0 must have collapsed to a linear image for this regression"
     );
 
+    // #1233 WITNESS. The straightened atom is a CONSTANT (its periodic basis row 0
+    // is the DC term), so its fitted linear image equals its own curve and
+    // collapsing it is a numerical no-op — on its own it cannot exercise the
+    // collapse-aware reconstruction. Install a genuinely SLOPED straight image
+    // into the collapsed slot: still a line (zero turning — a legitimate linear
+    // tail, NOT the EV-losing over-collapse the gate prevents), but now
+    // `b₀ + (t − t̄)·b₁` differs from the constant curve by a real, per-row,
+    // measurable amount. The collapse-aware reconstruction MUST decode THIS image,
+    // so the composition / engagement assertions below become non-vacuous: they
+    // would fail if the top-k path skipped the collapse or decoded a different
+    // image.
+    const WITNESS_SLOPE: f64 = 0.4;
+    {
+        let report = term.hybrid_split_report.as_mut().unwrap();
+        let img = report
+            .verdicts
+            .iter_mut()
+            .find_map(|v| v.linear_image.as_mut())
+            .expect("the collapsed slot must carry a linear image to install a witness into");
+        for slope in img.b1.iter_mut() {
+            *slope += WITNESS_SLOPE;
+        }
+    }
+
     // `top_k == K` keeps every atom: the projected assignment matrix IS the full
     // soft assignment, so the projected (collapse-aware) reconstruction must
     // match the production collapsed `fitted()` bit-for-bit.
@@ -2813,11 +2837,37 @@ pub(crate) fn oos_linear_images_drive_collapsed_reconstruction() {
         .expect("hybrid split report computes")
         .expect("eligible d=1 atoms present a report");
 
-    // Harvest the trained linear images (clones) BEFORE installing the report,
-    // so the report can be moved into the term to genuinely engage the train-side
-    // collapse — emulating a fresh OOS term that knows the decoder but not the
-    // in-fit report.
-    let images: Vec<_> = report
+    // Install the report so `fitted()` reconstructs the verdict-linear slot by its
+    // straight sub-model (the train-side collapsed reconstruction).
+    term.hybrid_split_report = Some(report);
+
+    // #1228 WITNESS. The straightened atom is a CONSTANT (periodic basis row 0 is
+    // the DC term), so its fitted linear image equals its own curve and collapsing
+    // it changes nothing — the train-vs-OOS threading could not be observed.
+    // Install a genuinely SLOPED straight image into the collapsed slot: still a
+    // line (zero turning — a legitimate linear tail, NOT the EV-losing
+    // over-collapse the gate prevents), but now it differs from the constant curve
+    // by a real, measurable amount, so the train-side collapse is non-trivial and
+    // the OOS reproduction below genuinely exercises the image threading.
+    const WITNESS_SLOPE: f64 = 0.4;
+    {
+        let report = term.hybrid_split_report.as_mut().unwrap();
+        let img = report
+            .verdicts
+            .iter_mut()
+            .find_map(|v| v.linear_image.as_mut())
+            .expect("the collapsed slot must carry a linear image to install a witness into");
+        for slope in img.b1.iter_mut() {
+            *slope += WITNESS_SLOPE;
+        }
+    }
+
+    // Harvest the trained (witness-sloped) linear images to thread to a fresh OOS
+    // term that knows the decoder but not the in-fit report, then drop the report.
+    let images: Vec<_> = term
+        .hybrid_split_report
+        .as_ref()
+        .unwrap()
         .verdicts
         .iter()
         .filter_map(|v| v.linear_image.clone())
@@ -2826,10 +2876,6 @@ pub(crate) fn oos_linear_images_drive_collapsed_reconstruction() {
         !images.is_empty(),
         "the straight slot must yield at least one linear image to thread to OOS"
     );
-    // Install the report so `fitted()` reconstructs the verdict-linear slot by its
-    // straight sub-model (the train-side collapsed reconstruction). Without this
-    // the comparison below is all-curved vs all-curved and silently vacuous.
-    term.hybrid_split_report = Some(report);
     let collapsed_with_report = term.fitted();
     term.hybrid_split_report = None;
 

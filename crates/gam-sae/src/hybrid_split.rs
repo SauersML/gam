@@ -261,6 +261,68 @@ pub struct SaeHybridSplitReport {
 /// never adjudicated on a fabricated deviance.
 const MIN_ROWS_FOR_LINEAR_FIT: usize = 3;
 
+/// #1610/#1026 — EV-PRESERVATION gate tolerance: a `d = 1` slot may collapse to
+/// its linear tail only if doing so costs at most this fraction of the target's
+/// total (centered) variance in full-reconstruction explained variance. The
+/// evidence argmin trades data-fit against the curved arm's parameter price in
+/// `NLE` units, but on a small / low-amplitude fixture that trade can prefer the
+/// cheaper line even when the curve carries real reconstruction signal — the
+/// collapse then DROPS EV (the observed 1.0 → 0.748 over-collapse). This gate is
+/// a direct guard on the quantity that actually regressed: the per-atom collapse
+/// EV impact equals `(linear_rss − curved_rss)/SST_full` exactly (collapsing
+/// atom `k` raises the full reconstruction SSR by `linear_rss − curved_rss` and
+/// the full target variance `SST_full` is fixed), so a collapse is vetoed when it
+/// would lose more than this fraction. EV is a dimensionless quantity in `[0,1]`,
+/// so an absolute EV-loss tolerance is itself scale-invariant — it does not
+/// reintroduce the scale-incommensurability that sank the evidence-reformulation
+/// attempt. A genuinely straight atom (the curved fit IS its own line) loses
+/// `≈ 0` EV and still collapses losslessly; only a curve doing real
+/// reconstruction work (loss `≫ 1e-3`) is kept. `1e-3` = 0.1% of total variance:
+/// comfortably above f64 round-off on an exact-line collapse yet far below any
+/// material EV loss, so it separates the lossless and load-bearing regimes
+/// without tuning.
+const SAE_HYBRID_COLLAPSE_MAX_EV_LOSS: f64 = 1.0e-3;
+
+/// The full-reconstruction SSR INCREASE from collapsing one `d = 1` atom to its
+/// fitted straight sub-model: `linear_rss − curved_rss`, where both arms are
+/// scored against the atom's leave-this-atom-out response residual `y_resp`
+/// (`target_resid`) exactly as [`build_atom_candidates`] scores them. Because the
+/// full reconstruction differs from the collapsed one ONLY in this atom's
+/// contribution (`a_k·γ_k` → `a_k·line`) on its assigned rows, this scalar is the
+/// exact amount the full reconstruction's SSR rises when the slot is collapsed;
+/// dividing by the fixed total target variance gives the full-EV loss the
+/// EV-preservation gate keys on. Positive ⇒ the curve out-fits its straight
+/// projection (collapsing hurts); `≤ 0` ⇒ the line is at least as good (collapse
+/// is lossless or improving, never gated). Mirrors the `curved_rss` / `linear_rss`
+/// accumulation in [`build_atom_candidates`] bit-for-bit so the gate and the
+/// evidence comparison see the same residuals.
+fn collapse_ssr_increase(
+    coords: ArrayView1<'_, f64>,
+    assign: ArrayView1<'_, f64>,
+    decoded: ArrayView2<'_, f64>,
+    target_resid: ArrayView2<'_, f64>,
+    t_bar: f64,
+    b0: &Array1<f64>,
+    b1: &Array1<f64>,
+) -> f64 {
+    let n = assign.len();
+    let p = target_resid.ncols();
+    let mut curved_rss = 0.0_f64;
+    let mut linear_rss = 0.0_f64;
+    for i in 0..n {
+        let a = assign[i];
+        let dt = coords[i] - t_bar;
+        for j in 0..p {
+            let y = target_resid[[i, j]];
+            let r_curved = y - a * decoded[[i, j]];
+            curved_rss += r_curved * r_curved;
+            let r_linear = y - a * (b0[j] + dt * b1[j]);
+            linear_rss += r_linear * r_linear;
+        }
+    }
+    linear_rss - curved_rss
+}
+
 /// Build the curved + linear candidates for ONE fitted `d = 1` atom and return
 /// them as `(linear, curved, (t̄, b₀, b₁))`, or `None` if the atom cannot present
 /// an honest pair (too few rows, degenerate coordinate span, or non-finite
@@ -615,6 +677,10 @@ pub fn build_hybrid_split_report<'a, C, W, D, R, M, E>(
     mut target_resid_for: R,
     mut manifold_for: M,
     mut delta_ev_for: E,
+    // #1026 — the full target's total (column-centered) variance `SST_full`, the
+    // fixed denominator of the EV-preservation gate. `≤ 0` / non-finite disables
+    // the gate (a degenerate, varianceless target has no EV to preserve).
+    total_centered_variance: f64,
 ) -> Result<Option<SaeHybridSplitReport>, String>
 where
     C: FnMut(usize) -> Array1<f64>,
@@ -685,8 +751,30 @@ where
             fitted_turning,
         ) {
             Some((linear, curved, (t_bar, b0, b1))) => {
+                // #1026 EV-PRESERVATION gate. Collapsing this slot raises the full
+                // reconstruction SSR by `linear_rss − curved_rss`; if that is more
+                // than `SAE_HYBRID_COLLAPSE_MAX_EV_LOSS` of the fixed total target
+                // variance the collapse would DROP reconstruction EV materially, so
+                // veto it by presenting only the curved candidate (the selector must
+                // keep curved). A lossless / improving collapse (`≤ 0`) and a
+                // negligible one stay free to collapse — EV-neutral cases (the
+                // top-k / birth-topology lines) are untouched. Only curveable charts
+                // are gated; a euclidean chart never had a curved option.
+                let collapse_loses_ev = total_centered_variance.is_finite()
+                    && total_centered_variance > 0.0
+                    && collapse_ssr_increase(
+                        coords.view(),
+                        assign.view(),
+                        decoded.view(),
+                        target_resid.view(),
+                        t_bar,
+                        &b0,
+                        &b1,
+                    ) > SAE_HYBRID_COLLAPSE_MAX_EV_LOSS * total_centered_variance;
                 let slot = if manifold.is_euclidean() {
                     vec![linear]
+                } else if collapse_loses_ev {
+                    vec![curved]
                 } else {
                     vec![linear, curved]
                 };

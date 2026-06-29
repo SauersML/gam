@@ -2464,6 +2464,25 @@ impl SaeManifoldTerm {
         let manifold_for = |atom_idx: usize| -> gam_terms::latent::LatentManifold {
             self.assignment.coords[atom_idx].manifold().clone()
         };
+        // #1026 EV-preservation gate denominator: the full target's total
+        // column-centered variance `SST_full` (the SAME `sst` the reconstruction
+        // EV is measured against), so the gate vetoes any collapse that would drop
+        // full-reconstruction EV by more than its tolerance.
+        let total_centered_variance = {
+            let mut tss = 0.0_f64;
+            for col in 0..p {
+                let mut mean = 0.0_f64;
+                for row in 0..n {
+                    mean += target[[row, col]];
+                }
+                mean /= n as f64;
+                for row in 0..n {
+                    let c = target[[row, col]] - mean;
+                    tss += c * c;
+                }
+            }
+            tss
+        };
         crate::hybrid_split::build_hybrid_split_report(
             &self.atoms,
             eligible.into_iter(),
@@ -2473,6 +2492,7 @@ impl SaeManifoldTerm {
             target_resid_for,
             manifold_for,
             delta_ev_for,
+            total_centered_variance,
         )
     }
 
