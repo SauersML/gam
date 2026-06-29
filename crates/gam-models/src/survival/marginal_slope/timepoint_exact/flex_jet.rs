@@ -4792,28 +4792,31 @@ mod hand_vs_jet_bench_tests {
     /// `b17785d2a~1` `flex_sensitivity.rs`): sparse single-pass grad loop +
     /// upper-triangle Hessian loop reading the timepoint `*_u`/`*_uv` ndarrays
     /// directly (NO contiguous copy). Pays its own 2×logΦ + 2×neglog-deriv calls.
-    #[allow(clippy::too_many_arguments)]
-    fn hand_vgh(
-        eta0: f64,
-        eta0_u: &Array1<f64>,
-        eta0_uv: &Array2<f64>,
-        eta1: f64,
-        eta1_u: &Array1<f64>,
-        eta1_uv: &Array2<f64>,
-        chi1: f64,
-        chi1_u: &Array1<f64>,
-        chi1_uv: &Array2<f64>,
-        d1: f64,
-        d1_u: &Array1<f64>,
-        d1_uv: &Array2<f64>,
-        q1: f64,
-        qd1: f64,
-        wi: f64,
-        di: f64,
-        q1_idx: usize,
-        qd1_idx: usize,
-        p: usize,
-    ) -> (f64, Array1<f64>, Array2<f64>) {
+    /// Takes the packed [`Row`] fixture directly so the two reference paths share
+    /// one argument shape (and stay under the arg-count lint without silencing it).
+    fn hand_vgh(row: &Row, p: usize) -> (f64, Array1<f64>, Array2<f64>) {
+        let (
+            eta0,
+            eta0_u,
+            eta0_uv,
+            eta1,
+            eta1_u,
+            eta1_uv,
+            chi1,
+            chi1_u,
+            chi1_uv,
+            d1,
+            d1_u,
+            d1_uv,
+            q1,
+            qd1,
+            wi,
+            di,
+            q1_idx,
+            qd1_idx,
+        ) = row;
+        let (eta0, eta1, chi1, d1, q1, qd1, wi, di, q1_idx, qd1_idx) =
+            (*eta0, *eta1, *chi1, *d1, *q1, *qd1, *wi, *di, *q1_idx, *qd1_idx);
         let (log_surv0, _) = signed_probit_logcdf_and_mills_ratio(-eta0);
         let (log_surv1, _) = signed_probit_logcdf_and_mills_ratio(-eta1);
         let (entry_k1, entry_k2, _, _) =
@@ -4875,29 +4878,31 @@ mod hand_vs_jet_bench_tests {
 
     /// The SHIPPED JET path: surv stacks + the `fused_inputs_from_view` contiguous
     /// copies + `fused_row_nll_jet2` (the exact body of the `want_hess` branch of
-    /// `flex_row_nll_value_grad_hess`).
-    #[allow(clippy::too_many_arguments)]
-    fn jet_vgh(
-        eta0: f64,
-        eta0_u: &Array1<f64>,
-        eta0_uv: &Array2<f64>,
-        eta1: f64,
-        eta1_u: &Array1<f64>,
-        eta1_uv: &Array2<f64>,
-        chi1: f64,
-        chi1_u: &Array1<f64>,
-        chi1_uv: &Array2<f64>,
-        d1: f64,
-        d1_u: &Array1<f64>,
-        d1_uv: &Array2<f64>,
-        q1: f64,
-        qd1: f64,
-        wi: f64,
-        di: f64,
-        q1_idx: usize,
-        qd1_idx: usize,
-        p: usize,
-    ) -> (f64, Array1<f64>, Array2<f64>) {
+    /// `flex_row_nll_value_grad_hess`). Takes the packed [`Row`] fixture directly,
+    /// mirroring [`hand_vgh`].
+    fn jet_vgh(row: &Row, p: usize) -> (f64, Array1<f64>, Array2<f64>) {
+        let (
+            eta0,
+            eta0_u,
+            eta0_uv,
+            eta1,
+            eta1_u,
+            eta1_uv,
+            chi1,
+            chi1_u,
+            chi1_uv,
+            d1,
+            d1_u,
+            d1_uv,
+            q1,
+            qd1,
+            wi,
+            di,
+            q1_idx,
+            qd1_idx,
+        ) = row;
+        let (eta0, eta1, chi1, d1, q1, qd1, wi, di, q1_idx, qd1_idx) =
+            (*eta0, *eta1, *chi1, *d1, *q1, *qd1, *wi, *di, *q1_idx, *qd1_idx);
         let surv0 = surv_stack(eta0).unwrap();
         let surv1 = surv_stack(eta1).unwrap();
         let (e0g, e0h) = fused_inputs_from_view(eta0_u.view(), eta0_uv.view(), p);
@@ -4997,14 +5002,8 @@ mod hand_vs_jet_bench_tests {
             let mut rows: Vec<Row> = Vec::new();
             for _ in 0..256 {
                 let r = make_row(p, &mut st);
-                let (h_v, h_g, h_h) = hand_vgh(
-                    r.0, &r.1, &r.2, r.3, &r.4, &r.5, r.6, &r.7, &r.8, r.9, &r.10, &r.11, r.12,
-                    r.13, r.14, r.15, r.16, r.17, p,
-                );
-                let (j_v, j_g, j_h) = jet_vgh(
-                    r.0, &r.1, &r.2, r.3, &r.4, &r.5, r.6, &r.7, &r.8, r.9, &r.10, &r.11, r.12,
-                    r.13, r.14, r.15, r.16, r.17, p,
-                );
+                let (h_v, h_g, h_h) = hand_vgh(&r, p);
+                let (j_v, j_g, j_h) = jet_vgh(&r, p);
                 max_diff = max_diff.max((h_v - j_v).abs());
                 for u in 0..p {
                     max_diff = max_diff.max((h_g[u] - j_g[u]).abs());
@@ -5022,26 +5021,16 @@ mod hand_vs_jet_bench_tests {
             let iters = 200_000usize / p;
             let n = rows.len();
             for r in &rows {
-                let (_, g, h) = hand_vgh(
-                    r.0, &r.1, &r.2, r.3, &r.4, &r.5, r.6, &r.7, &r.8, r.9, &r.10, &r.11, r.12,
-                    r.13, r.14, r.15, r.16, r.17, p,
-                );
+                let (_, g, h) = hand_vgh(r, p);
                 black_box((g, h));
-                let (_, g, h) = jet_vgh(
-                    r.0, &r.1, &r.2, r.3, &r.4, &r.5, r.6, &r.7, &r.8, r.9, &r.10, &r.11, r.12,
-                    r.13, r.14, r.15, r.16, r.17, p,
-                );
+                let (_, g, h) = jet_vgh(r, p);
                 black_box((g, h));
             }
 
             let t0 = Instant::now();
             for k in 0..iters {
                 let r = &rows[k % n];
-                let out = hand_vgh(
-                    black_box(r.0), &r.1, &r.2, black_box(r.3), &r.4, &r.5, black_box(r.6), &r.7,
-                    &r.8, black_box(r.9), &r.10, &r.11, black_box(r.12), black_box(r.13),
-                    black_box(r.14), black_box(r.15), r.16, r.17, p,
-                );
+                let out = hand_vgh(black_box(r), p);
                 black_box(out);
             }
             let hand_ns = t0.elapsed().as_nanos() as f64 / iters as f64;
@@ -5049,11 +5038,7 @@ mod hand_vs_jet_bench_tests {
             let t1 = Instant::now();
             for k in 0..iters {
                 let r = &rows[k % n];
-                let out = jet_vgh(
-                    black_box(r.0), &r.1, &r.2, black_box(r.3), &r.4, &r.5, black_box(r.6), &r.7,
-                    &r.8, black_box(r.9), &r.10, &r.11, black_box(r.12), black_box(r.13),
-                    black_box(r.14), black_box(r.15), r.16, r.17, p,
-                );
+                let out = jet_vgh(black_box(r), p);
                 black_box(out);
             }
             let jet_ns = t1.elapsed().as_nanos() as f64 / iters as f64;
