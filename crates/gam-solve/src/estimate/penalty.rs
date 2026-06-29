@@ -504,3 +504,133 @@ pub(crate) fn scaled_covariance(cov: Array2<f64>, phi: f64) -> Array2<f64> {
         cov * phi
     }
 }
+
+#[cfg(test)]
+mod weighted_gram_backtransform_tests {
+    use super::*;
+    use ndarray::{Array1, Array2};
+
+    /// Build the conditioned (internal-basis) design `X_int` from an
+    /// original-basis design `X_orig` by applying the same per-column
+    /// centering/scaling that `ParametricColumnConditioning` derived from
+    /// `X_orig`. `X_int = X_orig · M` (so `η = X_orig·β_orig = X_int·β_int`).
+    fn condition_design(
+        cond: &ParametricColumnConditioning,
+        x_orig: &Array2<f64>,
+    ) -> Array2<f64> {
+        let mut x_int = x_orig.clone();
+        let intercept = cond.intercept_idx.map(|idx| x_orig.column(idx).to_owned());
+        for &(j, mean, scale) in &cond.columns {
+            let mut col = x_int.column_mut(j);
+            if mean != 0.0
+                && let Some(ic) = intercept.as_ref()
+            {
+                col -= &(ic * mean);
+            }
+            if scale != 1.0 {
+                col.mapv_inplace(|v| v / scale);
+            }
+        }
+        x_int
+    }
+
+    fn weighted_gram(x: &Array2<f64>, w: &Array1<f64>) -> Array2<f64> {
+        // XᵀWX with W = diag(w).
+        let xw = x * &w.view().insert_axis(ndarray::Axis(1));
+        x.t().dot(&xw)
+    }
+
+    /// The crux of issue #1622: the weighted Gram `X'WX` is a genuine congruence
+    /// object under column-conditioning, transforming by the SAME map as the
+    /// penalized Hessian. Back-transforming the internal-basis Gram with
+    /// `backtransform_penalized_hessian` (`M⁻ᵀ·(·)·M⁻¹`) must reproduce the
+    /// original-basis Gram `X_origᵀ W X_orig` exactly — which is what lets
+    /// `debiased_functional` recover `S(λ)·β` and the WPS correction recover
+    /// `tr(X'WX·Σ_ρ)` for models carrying a parametric term. Before the fix the
+    /// Gram was nulled here, so this identity could never be exercised.
+    #[test]
+    fn backtransformed_internal_gram_equals_original_basis_gram() {
+        // p = 3: intercept (col 0) + two non-constant parametric covariates that
+        // both get centered AND scaled (distinct means / spreads).
+        let n = 40usize;
+        let mut x_orig = Array2::<f64>::ones((n, 3));
+        for i in 0..n {
+            let t = i as f64;
+            x_orig[[i, 1]] = 3.0 + 0.5 * t; // mean ≈ 12.75, nonzero spread
+            x_orig[[i, 2]] = -7.0 + (t * 0.31).sin() * 4.0;
+        }
+        // Heteroscedastic positive weights so the test is not secretly W = I.
+        let w = Array1::from_shape_fn(n, |i| 0.25 + (i as f64 * 0.137).cos().abs());
+
+        let design = DesignMatrix::from(x_orig.clone());
+        let cond = ParametricColumnConditioning::from_column_indices(&design, &[0, 1, 2]);
+        assert!(cond.is_active(), "parametric columns must trigger conditioning");
+        assert_eq!(cond.intercept_idx, Some(0));
+        assert_eq!(cond.columns.len(), 2, "cols 1 and 2 are conditioned");
+
+        let x_int = condition_design(&cond, &x_orig);
+        let gram_int = weighted_gram(&x_int, &w);
+        let gram_orig_expected = weighted_gram(&x_orig, &w);
+
+        let gram_orig_actual = cond.backtransform_penalized_hessian(&gram_int);
+
+        let max_err = gram_orig_actual
+            .iter()
+            .zip(gram_orig_expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_err < 1e-9,
+            "back-transformed internal Gram must equal X_origᵀWX_orig; max |Δ| = {max_err:e}\n\
+             actual=\n{gram_orig_actual:?}\nexpected=\n{gram_orig_expected:?}"
+        );
+    }
+
+    /// `tr(X'WX · Σ_ρ)` (the WPS corrected-EDF term) is congruence-invariant:
+    /// computing it from the internal-basis Gram with the internal-basis
+    /// covariance gives the identical value as from the back-transformed
+    /// original-basis pair. This is why restoring the Gram cannot perturb the
+    /// corrected EDF for pure-smooth models while finally making it correct for
+    /// parametric ones.
+    #[test]
+    fn wps_trace_is_invariant_under_backtransform() {
+        let n = 24usize;
+        let mut x_orig = Array2::<f64>::ones((n, 3));
+        for i in 0..n {
+            let t = i as f64;
+            x_orig[[i, 1]] = 1.0 + 0.7 * t;
+            x_orig[[i, 2]] = (t * 0.21).cos() * 2.5 - 0.4 * t;
+        }
+        let w = Array1::from_shape_fn(n, |i| 0.5 + (i as f64 * 0.09).sin().abs());
+
+        let design = DesignMatrix::from(x_orig.clone());
+        let cond = ParametricColumnConditioning::from_column_indices(&design, &[0, 1, 2]);
+
+        let x_int = condition_design(&cond, &x_orig);
+        let gram_int = weighted_gram(&x_int, &w);
+
+        // Arbitrary SPD smoothing-uncertainty covariance Σ in the internal
+        // basis; back-transform as a COVARIANCE (M·Σ·Mᵀ) — the companion map to
+        // the Gram's congruence — via left_multiply_by_m / right_multiply_by_m_transpose.
+        let mut sigma_int = Array2::<f64>::eye(3) * 0.3;
+        sigma_int[[1, 2]] = 0.05;
+        sigma_int[[2, 1]] = 0.05;
+
+        let gram_orig = cond.backtransform_penalized_hessian(&gram_int);
+        let sigma_orig =
+            cond.right_multiply_by_m_transpose(&cond.left_multiply_by_m(&sigma_int));
+
+        let trace = |a: &Array2<f64>, b: &Array2<f64>| -> f64 {
+            let k = a.nrows();
+            (0..k)
+                .map(|i| (0..k).map(|j| a[[i, j]] * b[[j, i]]).sum::<f64>())
+                .sum()
+        };
+        let t_int = trace(&gram_int, &sigma_int);
+        let t_orig = trace(&gram_orig, &sigma_orig);
+        assert!(
+            (t_int - t_orig).abs() < 1e-9,
+            "tr(X'WX·Σ) must be congruence-invariant: internal={t_int} original={t_orig}"
+        );
+    }
+}
