@@ -172,6 +172,43 @@ impl SurvivalKktRefusalReport {
     }
 }
 
+/// The six effective per-row designs that chain the stacked block layouts
+/// into the survival primary state `(q0, q1, qd1, g)`: the time columns
+/// (`dq0`/`dq1`/`dqd1` driving `q0`/`q1`/`qd1`), the marginal columns (`m_dq`
+/// driving `q0` and `q1`, `m_dqd1` driving `qd1`), and the logslope columns
+/// (`g_dg` driving `g`). Grouped because every assembly threads the same six
+/// matrices together as one effective metric.
+#[derive(Clone, Copy)]
+pub(crate) struct SurvivalEffectiveDesigns<'a> {
+    pub(crate) dq0: &'a Array2<f64>,
+    pub(crate) dq1: &'a Array2<f64>,
+    pub(crate) dqd1: &'a Array2<f64>,
+    pub(crate) m_dq: &'a Array2<f64>,
+    pub(crate) m_dqd1: &'a Array2<f64>,
+    pub(crate) g_dg: &'a Array2<f64>,
+}
+
+/// Per-row pilot operating point: the linearisation primary state
+/// `(q0, q1, qd1, g)` paired with the observation columns `(z, weights,
+/// event)` the survival row kernel needs to evaluate the score there.
+#[derive(Clone, Copy)]
+pub(crate) struct SurvivalPilotRows<'a> {
+    pub(crate) q0: &'a Array1<f64>,
+    pub(crate) q1: &'a Array1<f64>,
+    pub(crate) qd1: &'a Array1<f64>,
+    pub(crate) g: &'a Array1<f64>,
+    pub(crate) z: &'a Array1<f64>,
+    pub(crate) weights: &'a Array1<f64>,
+    pub(crate) event: &'a Array1<f64>,
+}
+
+/// Link-kernel scalars shared by the survival row primary evaluation.
+#[derive(Clone, Copy)]
+pub(crate) struct SurvivalLinkParams {
+    pub(crate) derivative_guard: f64,
+    pub(crate) probit_scale: f64,
+}
+
 /// Assemble the joint penalized Hessian `M = Σ_i J_iᵀ H_i J_i + S` and the
 /// joint score `g = Σ_i J_iᵀ grad_i` at a fixed operating point.
 ///
@@ -187,18 +224,20 @@ impl SurvivalKktRefusalReport {
 /// is the unit-weight block-diagonal penalty (its NULLSPACE is what makes a
 /// confounded direction unidentifiable for ALL smoothing parameters, so unit
 /// weights suffice to expose the phantom).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn assemble_joint_penalized_hessian_and_score(
-    dq0: &Array2<f64>,
-    dq1: &Array2<f64>,
-    dqd1: &Array2<f64>,
-    m_dq: &Array2<f64>,
-    m_dqd1: &Array2<f64>,
-    g_dg: &Array2<f64>,
+    designs: SurvivalEffectiveDesigns<'_>,
     row_hess: &Array3<f64>,
     row_grad: &Array2<f64>,
     s_total: &Array2<f64>,
 ) -> Result<(Array2<f64>, Array1<f64>), String> {
+    let SurvivalEffectiveDesigns {
+        dq0,
+        dq1,
+        dqd1,
+        m_dq,
+        m_dqd1,
+        g_dg,
+    } = designs;
     let n = dq0.nrows();
     let p_time = dq0.ncols();
     let p_marg = m_dq.ncols();
@@ -391,40 +430,38 @@ pub(crate) fn build_refusal_report_from_hessian(
 /// End-to-end report: assemble `M`/`g` from the effective designs + per-row
 /// derivatives + unit penalty, then gate. Convenience wrapper used by the
 /// fit-entry fallback and the unit tests.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn survival_kkt_refusal_report_from_designs(
-    dq0: &Array2<f64>,
-    dq1: &Array2<f64>,
-    dqd1: &Array2<f64>,
-    m_dq: &Array2<f64>,
-    m_dqd1: &Array2<f64>,
-    g_dg: &Array2<f64>,
+    designs: SurvivalEffectiveDesigns<'_>,
     row_hess: &Array3<f64>,
     row_grad: &Array2<f64>,
     s_total: &Array2<f64>,
     step: f64,
 ) -> Result<SurvivalKktRefusalReport, String> {
-    let (m, g) = assemble_joint_penalized_hessian_and_score(
-        dq0, dq1, dqd1, m_dq, m_dqd1, g_dg, row_hess, row_grad, s_total,
-    )?;
+    let (m, g) =
+        assemble_joint_penalized_hessian_and_score(designs, row_hess, row_grad, s_total)?;
     build_refusal_report_from_hessian(&m, &g, step)
 }
 
 /// Per-row gradient `(n × 4)` of the survival neg-log-likelihood at the pilot
 /// primary state, in `(q0, q1, qd1, g)` order — the score companion to
 /// [`SurvivalRowHessian::from_pilot_primary_state`].
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn survival_row_gradient_from_pilot_primary_state(
-    q0: &Array1<f64>,
-    q1: &Array1<f64>,
-    qd1: &Array1<f64>,
-    g: &Array1<f64>,
-    z: &Array1<f64>,
-    weights: &Array1<f64>,
-    event: &Array1<f64>,
-    derivative_guard: f64,
-    probit_scale: f64,
+    rows: SurvivalPilotRows<'_>,
+    link: SurvivalLinkParams,
 ) -> Result<Array2<f64>, String> {
+    let SurvivalPilotRows {
+        q0,
+        q1,
+        qd1,
+        g,
+        z,
+        weights,
+        event,
+    } = rows;
+    let SurvivalLinkParams {
+        derivative_guard,
+        probit_scale,
+    } = link;
     let n = q0.len();
     for (name, len) in [
         ("q1", q1.len()),
@@ -556,43 +593,18 @@ pub(crate) fn dense_block_penalty_from_blockwise(
 /// and an already-assembled unit block penalty `s_total`. Computes the per-row
 /// score internally (the gradient companion to the row Hessian) and gates each
 /// near-null direction at trust radius `step`.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn survival_kkt_refusal_report_at_pilot(
-    dq0: &Array2<f64>,
-    dq1: &Array2<f64>,
-    dqd1: &Array2<f64>,
-    m_dq: &Array2<f64>,
-    m_dqd1: &Array2<f64>,
-    g_dg: &Array2<f64>,
+    designs: SurvivalEffectiveDesigns<'_>,
     row_hess: &SurvivalRowHessian,
-    q0_pilot: &Array1<f64>,
-    q1_pilot: &Array1<f64>,
-    qd1_pilot: &Array1<f64>,
-    g_pilot: &Array1<f64>,
-    z: &Array1<f64>,
-    weights: &Array1<f64>,
-    event: &Array1<f64>,
-    derivative_guard: f64,
-    probit_scale: f64,
+    rows: SurvivalPilotRows<'_>,
+    link: SurvivalLinkParams,
     s_total: &Array2<f64>,
     step: f64,
 ) -> Result<SurvivalKktRefusalReport, String> {
     use gam_identifiability::families::compiler::RowHessian;
-    let row_grad = survival_row_gradient_from_pilot_primary_state(
-        q0_pilot,
-        q1_pilot,
-        qd1_pilot,
-        g_pilot,
-        z,
-        weights,
-        event,
-        derivative_guard,
-        probit_scale,
-    )?;
+    let row_grad = survival_row_gradient_from_pilot_primary_state(rows, link)?;
     let h_tensor = row_hess.evaluate_full();
-    survival_kkt_refusal_report_from_designs(
-        dq0, dq1, dqd1, m_dq, m_dqd1, g_dg, &h_tensor, &row_grad, s_total, step,
-    )
+    survival_kkt_refusal_report_from_designs(designs, &h_tensor, &row_grad, s_total, step)
 }
 
 #[cfg(test)]
@@ -665,7 +677,17 @@ mod tests {
         }
         let s_total = Array2::<f64>::zeros((p_marg + p_log, p_marg + p_log));
         let report = survival_kkt_refusal_report_from_designs(
-            &dq0, &dq1, &dqd1, &m_dq, &m_dqd1, &g_dg, &row_hess, &row_grad, &s_total,
+            SurvivalEffectiveDesigns {
+                dq0: &dq0,
+                dq1: &dq1,
+                dqd1: &dqd1,
+                m_dq: &m_dq,
+                m_dqd1: &m_dqd1,
+                g_dg: &g_dg,
+            },
+            &row_hess,
+            &row_grad,
+            &s_total,
             KKT_PHANTOM_TRUST_RADIUS,
         )
         .expect("report builds");
@@ -724,7 +746,17 @@ mod tests {
         }
         let s_total = Array2::<f64>::zeros((p_marg + p_log, p_marg + p_log));
         let report = survival_kkt_refusal_report_from_designs(
-            &dq0, &dq1, &dqd1, &m_dq, &m_dqd1, &g_dg, &row_hess, &row_grad, &s_total,
+            SurvivalEffectiveDesigns {
+                dq0: &dq0,
+                dq1: &dq1,
+                dqd1: &dqd1,
+                m_dq: &m_dq,
+                m_dqd1: &m_dqd1,
+                g_dg: &g_dg,
+            },
+            &row_hess,
+            &row_grad,
+            &s_total,
             KKT_PHANTOM_TRUST_RADIUS,
         )
         .expect("report builds");
@@ -769,7 +801,17 @@ mod tests {
         let row_grad = Array2::<f64>::zeros((n, K_SURVIVAL));
         let s_total = Array2::<f64>::zeros((p_marg + p_log, p_marg + p_log));
         let report = survival_kkt_refusal_report_from_designs(
-            &dq0, &dq1, &dqd1, &marg, &m_dqd1, &logb, &row_hess, &row_grad, &s_total,
+            SurvivalEffectiveDesigns {
+                dq0: &dq0,
+                dq1: &dq1,
+                dqd1: &dqd1,
+                m_dq: &marg,
+                m_dqd1: &m_dqd1,
+                g_dg: &logb,
+            },
+            &row_hess,
+            &row_grad,
+            &s_total,
             KKT_PHANTOM_TRUST_RADIUS,
         )
         .expect("report builds");
@@ -812,7 +854,17 @@ mod tests {
         // both, so none is near-null.
         let s_total = Array2::<f64>::zeros((p_marg + p_log, p_marg + p_log));
         let report = survival_kkt_refusal_report_from_designs(
-            &dq0, &dq1, &dqd1, &marg, &m_dqd1, &logb, &row_hess, &row_grad, &s_total,
+            SurvivalEffectiveDesigns {
+                dq0: &dq0,
+                dq1: &dq1,
+                dqd1: &dqd1,
+                m_dq: &marg,
+                m_dqd1: &m_dqd1,
+                g_dg: &logb,
+            },
+            &row_hess,
+            &row_grad,
+            &s_total,
             KKT_PHANTOM_TRUST_RADIUS,
         )
         .expect("report builds");
