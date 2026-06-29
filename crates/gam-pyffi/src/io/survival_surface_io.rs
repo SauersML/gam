@@ -1020,4 +1020,101 @@ mod tests {
                 .expect_err("decreasing cumulative must error");
         assert!(err.contains("non-decreasing"), "unexpected error: {err}");
     }
+
+    // ---- issue #965 / completing #1595: unified extrapolation policy on the
+    //      pure CSV/chunk interpolation kernel. A single monotone-increasing
+    //      grid 0..2 with the surface row equal to the grid values so the
+    //      interior interpolant is the identity (easy to reason about). ----
+
+    fn unit_grid() -> (Vec<f64>, Vec<f64>, Vec<usize>) {
+        // grid = [0, 1, 2], surface row = [0, 1, 2] (already sorted).
+        let surface_values = vec![0.0, 1.0, 2.0];
+        let sorted_grid = vec![0.0, 1.0, 2.0];
+        let sorted_indices = vec![0usize, 1, 2];
+        (surface_values, sorted_grid, sorted_indices)
+    }
+
+    fn interp(query: f64, left: Option<f64>, right: Option<f64>, inf: Option<f64>) -> f64 {
+        let (surface_values, sorted_grid, sorted_indices) = unit_grid();
+        survival_csv_interpolate(
+            &surface_values,
+            sorted_grid.len(),
+            &sorted_grid,
+            &sorted_indices,
+            0,
+            query,
+            left,
+            right,
+            inf,
+        )
+    }
+
+    #[test]
+    fn csv_interpolate_below_grid_honors_left_asymptote() {
+        // Survival surface: S(t) = 1 strictly before the modeled support, even
+        // when the grid endpoint value is 0 (issue #965: negative predict-query
+        // times must extrapolate to the boundary, not be rejected).
+        assert_eq!(interp(-2.0, Some(1.0), None, Some(0.0)), 1.0);
+        // The grid boundary itself stays continuous (uses the grid value, not
+        // the override).
+        assert_eq!(interp(0.0, Some(1.0), None, Some(0.0)), 0.0);
+    }
+
+    #[test]
+    fn csv_interpolate_finite_past_grid_flat_clamps() {
+        // #1595: a FINITE time past the last grid point flat-clamps to the last
+        // grid value (right_value = None), it does NOT jump to the +inf
+        // asymptote. Here the last grid value is 2.0.
+        assert_eq!(interp(100.0, Some(1.0), None, Some(0.0)), 2.0);
+        // Grid endpoint itself is continuous.
+        assert_eq!(interp(2.0, Some(1.0), None, Some(0.0)), 2.0);
+    }
+
+    #[test]
+    fn csv_interpolate_plus_infinity_uses_genuine_asymptote() {
+        // #965: t == +inf is the genuine asymptote, distinct from the finite
+        // flat-clamp. Survival -> 0, cumulative hazard -> +inf.
+        assert_eq!(interp(f64::INFINITY, Some(1.0), None, Some(0.0)), 0.0);
+        let h = interp(f64::INFINITY, Some(0.0), None, Some(f64::INFINITY));
+        assert!(h.is_infinite() && h > 0.0, "H(+inf) must be +inf, got {h}");
+    }
+
+    #[test]
+    fn csv_interpolate_no_asymptote_kinds_fall_back_to_endpoint() {
+        // hazard / survival_se carry None on every edge: both the finite
+        // past-grid extrapolation and +inf fall back to the nearest endpoint.
+        assert_eq!(interp(-2.0, None, None, None), 0.0); // first grid value
+        assert_eq!(interp(100.0, None, None, None), 2.0); // last grid value
+        assert_eq!(interp(f64::INFINITY, None, None, None), 2.0); // last grid value
+    }
+
+    #[test]
+    fn csv_interpolate_interior_is_linear() {
+        // Sanity: interior query interpolates linearly (identity surface).
+        assert!((interp(0.5, Some(1.0), None, Some(0.0)) - 0.5).abs() < 1e-12);
+        assert!((interp(1.5, Some(1.0), None, Some(0.0)) - 1.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn csv_interpolate_nan_query_propagates() {
+        assert!(interp(f64::NAN, Some(1.0), None, Some(0.0)).is_nan());
+    }
+
+    // ---- issue #965: the exponential parametric fallback is defined on all of
+    //      R, with the genuine +inf asymptote distinguished from t <= 0. ----
+
+    #[test]
+    fn exponential_survival_negative_time_is_one() {
+        // S(t) = P(T > t): everyone is still at risk before the origin.
+        assert_eq!(exponential_survival_at(2.0, -5.0), 1.0);
+        // Even an overflowing hazard must not produce exp(-inf * -5) = +inf.
+        assert_eq!(exponential_survival_at(f64::MAX, -1.0), 1.0);
+    }
+
+    #[test]
+    fn exponential_survival_plus_infinity_is_zero_for_positive_hazard() {
+        assert_eq!(exponential_survival_at(2.0, f64::INFINITY), 0.0);
+        // Degenerate zero hazard: nobody ever fails, so S stays 1 even at +inf.
+        assert_eq!(exponential_survival_at(0.0, f64::INFINITY), 1.0);
+    }
 }
