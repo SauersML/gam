@@ -7662,4 +7662,129 @@ mod firth_hessian_direction_reuse_tests {
             }
         }
     }
+
+    // A wider logit design with k=4 penalties, exercising the Rayon-fanned
+    // first-derivative (h_i), eye-cache, and O(k²) second-derivative pair loops
+    // of `tk_hessian_rho_canonical_logit` (#1575). With 4 penalties the pair loop
+    // alone has 10 upper-triangle passes spread across the pool.
+    fn synthetic_logit_setup_k4() -> (
+        Array2<f64>,
+        Array1<f64>,
+        super::super::FirthDenseOperator,
+        Vec<CanonicalPenalty>,
+        Vec<f64>,
+    ) {
+        let n = 96usize;
+        let p = 9usize;
+        let mut x = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            let t = (i as f64) / (n as f64 - 1.0);
+            x[[i, 0]] = 1.0;
+            x[[i, 1]] = t;
+            x[[i, 2]] = t * t;
+            x[[i, 3]] = (3.0 * t).sin();
+            x[[i, 4]] = (2.0 * t).cos();
+            x[[i, 5]] = (t - 0.5).abs();
+            x[[i, 6]] = (5.0 * t).sin();
+            x[[i, 7]] = (4.0 * t).cos();
+            x[[i, 8]] = t * t * t;
+        }
+        let beta = Array1::from(vec![0.2_f64, -0.4, 0.3, 0.1, -0.2, 0.15, 0.05, -0.1, 0.12]);
+        let eta = x.dot(&beta);
+        let op = super::super::FirthDenseOperator::build_for_link(
+            &InverseLink::Standard(StandardLink::Logit),
+            &x,
+            &eta,
+        )
+        .expect("firth operator");
+
+        // Four block-local canonical penalties (k = 4) over disjoint coordinate
+        // ranges (cols 1..2, 3..4, 5..6, 7..8).
+        let mut penalties = Vec::with_capacity(4);
+        for (a, b) in [(1usize, 2usize), (3, 4), (5, 6), (7, 8)] {
+            let mut root = Array2::<f64>::zeros((2, p));
+            root[[0, a]] = 1.0;
+            root[[1, b]] = 1.0;
+            penalties.push(CanonicalPenalty::from_dense_root(root, p));
+        }
+        let lambdas = vec![0.7_f64, 1.3, 0.5, 1.1];
+        (x, beta, op, penalties, lambdas)
+    }
+
+    fn tk_hessian_for_k4_setup(
+        x: &Array2<f64>,
+        beta: &Array1<f64>,
+        op: &super::super::FirthDenseOperator,
+        penalties: &[CanonicalPenalty],
+        lambdas: &[f64],
+    ) -> Array2<f64> {
+        let n = x.nrows();
+        let p = x.ncols();
+        let c_array = Array1::from_elem(n, 0.05_f64);
+        let d_array = Array1::from_elem(n, -0.02_f64);
+        let e_array = Array1::from_elem(n, 0.01_f64);
+        let f_array = Array1::from_elem(n, -0.005_f64);
+        let xtwx = RemlState::tk_xt_diag_x(x, &op.pirls_hat_diag());
+        let mut h = xtwx;
+        for d in 0..p {
+            h[[d, d]] += 1.0;
+        }
+        let h_solver = h.clone();
+        let h_inv_solve = move |rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
+            let sol = gam_linalg::utils::solve_symmetric_vector_with_floor(&h_solver, rhs, 1e-10)
+                .expect("well-conditioned SPD solve");
+            Ok(sol)
+        };
+        RemlState::tk_hessian_rho_canonical_logit(
+            x, &c_array, &d_array, &e_array, &f_array, penalties, lambdas, beta, Some(op),
+            &h_inv_solve,
+        )
+        .expect("tk hessian")
+    }
+
+    // The #1575 Rayon fan-out of the first-derivative / eye-cache / pair loops
+    // must not perturb the assembled Firth outer Hessian: repeated evaluation is
+    // BIT-IDENTICAL (no race / mis-indexed write-back), and the result is
+    // symmetric and finite. Determinism across repeats is the load-bearing guard
+    // — a parallel write-back bug would surface as run-to-run drift or asymmetry.
+    #[test]
+    fn tk_hessian_rho_canonical_logit_firth_is_deterministic_under_parallel_fanout_k4() {
+        let (x, beta, op, penalties, lambdas) = synthetic_logit_setup_k4();
+        let k = penalties.len();
+        let first = tk_hessian_for_k4_setup(&x, &beta, &op, &penalties, &lambdas);
+        assert_eq!(first.dim(), (k, k));
+        assert!(
+            first.iter().all(|v| v.is_finite()),
+            "Firth outer Hessian must be finite: {first:?}"
+        );
+        // Symmetric to working precision (each (i,j) and (j,i) cell is filled from
+        // the same pair pass, so this also pins the index-ordered write-back).
+        for i in 0..k {
+            for j in 0..k {
+                assert!(
+                    (first[[i, j]] - first[[j, i]]).abs() <= 1e-9,
+                    "Firth outer Hessian must be symmetric: ({i},{j}) {} vs {}",
+                    first[[i, j]],
+                    first[[j, i]]
+                );
+            }
+        }
+        // Re-run several times: the Rayon-fanned assembly must return BYTE-FOR-BYTE
+        // the same matrix every time (the inner faer GEMMs are pinned to Par::Seq
+        // inside with_nested_parallel, and the reduction is index-ordered).
+        for rep in 0..4 {
+            let again = tk_hessian_for_k4_setup(&x, &beta, &op, &penalties, &lambdas);
+            assert_eq!(
+                first.mapv(|v| v.to_bits()),
+                again.mapv(|v| v.to_bits()),
+                "parallel-fanned Firth outer Hessian must be bit-identical across runs (rep {rep})"
+            );
+        }
+        // Sanity: the off-diagonal mixed second derivatives are non-trivial, so the
+        // O(k²) pair loop is doing real work (not returning zeros).
+        assert!(
+            (0..k).any(|i| (0..k).any(|j| i != j && first[[i, j]].abs() > 0.0)),
+            "k=4 Firth outer Hessian should have non-zero mixed second derivatives"
+        );
+    }
 }
