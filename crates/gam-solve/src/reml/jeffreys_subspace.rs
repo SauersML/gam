@@ -482,6 +482,73 @@ pub(crate) fn conditioning_gate_weight_grad(lambda_min: f64, lambda_max: f64) ->
     }
 }
 
+/// Second partials `(∂²G/∂λ_min², ∂²G/∂λ_min∂λ_max, ∂²G/∂λ_max²)` of the
+/// conditioning gate weight `G = max(w_abs, w_rel)` (see [`conditioning_gate_weight`]).
+///
+/// Companion to [`conditioning_gate_weight_grad`]: just as the first-order gate
+/// motion `G'` is part of the EXACT outer hypergradient when a ψ hyperparameter
+/// reshapes the design (gam#1607), the gate *curvature* `G''` is part of the EXACT
+/// outer ψψ Hessian of the value `Φ = G·U`. The cubic smoothstep is C¹ but its
+/// second derivative is non-zero on the open transition band, so dropping `G''`
+/// desyncs the analytic outer Hessian from its own (already gate-aware) gradient
+/// exactly inside that band. Returns `(0, 0, 0)` on the saturated / degenerate
+/// branches where `G` is locally affine (so the outer drift stays byte-unchanged on
+/// every fully-active or well-conditioned fit, matching the `_grad` early returns).
+pub(crate) fn conditioning_gate_weight_hess(lambda_min: f64, lambda_max: f64) -> (f64, f64, f64) {
+    if lambda_max <= 0.0 || !lambda_min.is_finite() {
+        return (0.0, 0.0, 0.0);
+    }
+    // `ramp_down`'s value, first, and second derivative. On the open band
+    // (`under < x < clear`): `d/dx = −6 t (1−t)/span`, `d²/dx² = −6 (1−2t)/span²`.
+    // Both derivatives are `0` at/outside the knots (the value is C¹; the second
+    // derivative jumps at the knots but is evaluated only in the smooth interior).
+    #[inline]
+    fn ramp_down_value_d1_d2(x: f64, under: f64, clear: f64) -> (f64, f64, f64) {
+        if x <= under || x >= clear {
+            let v = if x <= under { 1.0 } else { 0.0 };
+            return (v, 0.0, 0.0);
+        }
+        let span = clear - under;
+        let t = (x - under) / span;
+        let value = 1.0 - t * t * (3.0 - 2.0 * t);
+        let d1 = -6.0 * t * (1.0 - t) / span;
+        let d2 = -6.0 * (1.0 - 2.0 * t) / (span * span);
+        (value, d1, d2)
+    }
+    let (w_abs, _dw_abs, d2w_abs) = ramp_down_value_d1_d2(
+        lambda_min,
+        CONDITIONING_GATE_ABSOLUTE,
+        CONDITIONING_GATE_ABSOLUTE_CLEAR,
+    );
+    let ratio = (lambda_min / lambda_max).max(f64::MIN_POSITIVE);
+    let (w_rel, dw_rel_dr, d2w_rel_dr2) = ramp_down_value_d1_d2(
+        ratio.log10(),
+        CONDITIONING_GATE_RELATIVE.log10(),
+        CONDITIONING_GATE_RELATIVE_CLEAR.log10(),
+    );
+    // Same active-branch selection as `conditioning_gate_weight_grad` (resolve the
+    // measure-zero tie to `w_abs`), so gradient and Hessian agree on which sub-weight
+    // is differentiated.
+    if w_abs >= w_rel {
+        // Absolute branch depends on `λ_min` only.
+        (d2w_abs, 0.0, 0.0)
+    } else {
+        // Relative branch through `r = log₁₀(λ_min/λ_max)`. With
+        // `r_min = ∂r/∂λ_min = 1/(λ_min ln10)`, `r_max = ∂r/∂λ_max = −1/(λ_max ln10)`,
+        // `∂²r/∂λ_min² = −1/(λ_min² ln10)`, `∂²r/∂λ_max² = 1/(λ_max² ln10)`,
+        // `∂²r/∂λ_min∂λ_max = 0`, the chain rule
+        // `G_ab = w'' · r_a r_b + w' · r_ab` gives:
+        let ln10 = std::f64::consts::LN_10;
+        let r_min = 1.0 / (lambda_min * ln10);
+        let r_max = -1.0 / (lambda_max * ln10);
+        let g_mm = d2w_rel_dr2 * r_min * r_min + dw_rel_dr * (-1.0 / (lambda_min * lambda_min * ln10));
+        let g_mm_max = d2w_rel_dr2 * r_min * r_max; // ∂²r/∂λ_min∂λ_max = 0
+        let g_max_max =
+            d2w_rel_dr2 * r_max * r_max + dw_rel_dr * (1.0 / (lambda_max * lambda_max * ln10));
+        (g_mm, g_mm_max, g_max_max)
+    }
+}
+
 /// Below this joint dimension the dense reduced eigendecomposition in
 /// [`joint_jeffreys_term`] is itself cheap (`O(p³)` with `p` in the tens — e.g.
 /// the BMS-probit `p≈51` fit), so the matrix-free pre-check below would only add
@@ -1471,13 +1538,19 @@ pub fn joint_jeffreys_phi_explicit_param_derivative(
 /// second directional derivative
 ///   `U_ij = ½[ Σ_k d_k W_kk + Σ_{kl} Ψ_kl (Ṽ_i)_kl (Ṽ_j)_kl ]`
 /// (Daleckii–Krein; `d = g'`, `Ψ` its divided-difference kernel — the SAME pieces
-/// [`joint_jeffreys_term`]'s `H_Φ` uses). The gate enters as
-///   `∂²Φ = G·U_ij + G'_i·U_j + G'_j·U_i`
-/// with `U_a = ½ Σ_k d_k (Ṽ_a)_kk` the per-axis spectral value derivatives and
-/// `G'_a` the gate motion (the gate Hessian `G''` — a smooth-band second-order
-/// effect the value path treats as a soft switch — is omitted, exactly as the
-/// β-curvature `second_order_curvature` treats the gate as locally constant).
-/// Floor motion is held fixed to match that same curvature convention.
+/// [`joint_jeffreys_term`]'s `H_Φ` uses). The gate `G = G(λ_min, λ_max)` enters via
+/// the full product rule
+///   `∂²Φ = G·U_ij + G'_i·U_j + G'_j·U_i + G''_ij·U`
+/// with `U_a = ½ Σ_k d_k (Ṽ_a)_kk` the per-axis spectral value derivatives, `G'_a`
+/// the gate motion, `U = ½ Σ_k g(λ_k)` the ungated spectral value, and the gate
+/// curvature `G''_ij = Σ_ab G_ab (∂_i λ_a)(∂_j λ_b) + G'_min ∂²_ij λ_min +
+/// G'_max ∂²_ij λ_max` (`a,b ∈ {min,max}`; `∂²λ` the second-order simple-eigenvalue
+/// perturbation). Keeping `G''` makes this the EXACT second derivative of `Φ = G·U`,
+/// consistent with the gate-aware first derivative
+/// [`joint_jeffreys_phi_explicit_param_derivative`]; it is non-zero only inside the
+/// gate's smooth transition band and vanishes on every saturated/well-conditioned
+/// fit. Floor motion is held fixed (the floor-response is itself second order in the
+/// relative regime, and outside the band the gate already zeroes the whole term).
 pub fn joint_jeffreys_phi_explicit_param_second_derivative(
     h_joint: ArrayView2<'_, f64>,
     z_j: ArrayView2<'_, f64>,
@@ -1572,7 +1645,58 @@ pub fn joint_jeffreys_phi_explicit_param_second_derivative(
         gate_grad_min * a_i[[idx_min, idx_min]] + gate_grad_max * a_i[[idx_max, idx_max]];
     let gate_dot_j =
         gate_grad_min * a_j[[idx_min, idx_min]] + gate_grad_max * a_j[[idx_max, idx_max]];
-    Ok(gate_weight * u_ij + gate_dot_i * u_j + gate_dot_j * u_i)
+    // Gate CURVATURE term `G''_ij · U` of `Φ = G·U` (the remaining second-order
+    // product-rule piece beyond `G·U_ij + G'_i·U_j + G'_j·U_i`). `G` depends on the
+    // params only through the extreme eigenvalues `(λ_min, λ_max)`, so by the chain
+    // rule `G''_ij = Σ_{a,b∈{min,max}} G_ab · (∂_i λ_a)(∂_j λ_b)
+    //                + G'_min · ∂²_ij λ_min + G'_max · ∂²_ij λ_max`,
+    // with `G_ab` the gate second partials and `∂²_ij λ_n` the second-order
+    // (simple-eigenvalue) perturbation `W_nn + Σ_{l≠n}[(A_i)_nl(A_j)_nl +
+    // (A_j)_nl(A_i)_nl]/(λ_n − λ_l)`. Multiplied by the ungated spectral value
+    // `U = ½ Σ_k g(λ_k)`. Zero on every saturated/well-conditioned branch (all gate
+    // partials vanish there), so byte-unchanged off the transition band.
+    let (gate_hess_min_min, gate_hess_min_max, gate_hess_max_max) =
+        conditioning_gate_weight_hess(lambda_min, lambda_max);
+    // Second-order perturbation of a simple extreme eigenvalue `λ_n`. Near-degenerate
+    // couplings (gap below a tiny relative floor) are skipped: the extreme eigenvalue
+    // is then not classically twice-differentiable, exactly the simple-spectrum regime
+    // the first-order gate motion already assumes — and the omitted coupling is gated
+    // by the (small) gate curvature, so the conservative skip cannot blow up.
+    let gap_floor = 1e-12 * lambda_max.max(1.0);
+    let second_eig_pert = |n: usize| -> f64 {
+        let mut acc = w[[n, n]];
+        for l in 0..m {
+            if l == n {
+                continue;
+            }
+            let gap = evals[n] - evals[l];
+            if gap.abs() <= gap_floor {
+                continue;
+            }
+            acc += (a_i[[n, l]] * a_j[[n, l]] + a_j[[n, l]] * a_i[[n, l]]) / gap;
+        }
+        acc
+    };
+    let d2_lmin = second_eig_pert(idx_min);
+    let d2_lmax = second_eig_pert(idx_max);
+    let dlmin_i = a_i[[idx_min, idx_min]];
+    let dlmin_j = a_j[[idx_min, idx_min]];
+    let dlmax_i = a_i[[idx_max, idx_max]];
+    let dlmax_j = a_j[[idx_max, idx_max]];
+    let gate_hess_ij = gate_hess_min_min * dlmin_i * dlmin_j
+        + gate_hess_max_max * dlmax_i * dlmax_j
+        + gate_hess_min_max * (dlmin_i * dlmax_j + dlmax_i * dlmin_j)
+        + gate_grad_min * d2_lmin
+        + gate_grad_max * d2_lmax;
+    let phi_ungated = 0.5
+        * evals
+            .iter()
+            .map(|&lam| jeffreys_antiderivative(lam, floor))
+            .sum::<f64>();
+    Ok(gate_weight * u_ij
+        + gate_dot_i * u_j
+        + gate_dot_j * u_i
+        + gate_hess_ij * phi_ungated)
 }
 
 /// β-FIXED PREPARED BASE for the joint-Jeffreys curvature perturbation derivative.
@@ -2933,6 +3057,56 @@ mod tests {
             assert!(
                 (fd_dlmax - g_dlmax).abs() <= 1e-4 * g_dlmax.abs().max(1.0),
                 "∂G/∂λ_max desync at (λ_min={lmin}, λ_max={lmax}): fd={fd_dlmax} analytic={g_dlmax}"
+            );
+        }
+    }
+
+    #[test]
+    pub(crate) fn conditioning_gate_weight_hess_matches_finite_difference() {
+        // Same branch coverage as the gradient FD test: the Hessian's three second
+        // partials are checked against central differences of `conditioning_gate_weight_grad`
+        // (which is itself FD-validated against the value above).
+        //  - absolute-active: only ∂²/∂λ_min² is non-zero (G depends on λ_min alone);
+        //  - relative-active: all three partials vary (G through log10(λ_min/λ_max));
+        //  - saturated: every partial is 0.
+        let configs: [(f64, f64); 6] = [
+            (8.0, 1.0e9),            // absolute band mid (w_rel = 0)
+            (4.0, 1.0e9),            // absolute band lower-mid
+            (12.0, 1.0e9),           // absolute band upper-mid
+            (100.0, 100.0 / 1.0e-7), // relative band mid (w_abs = 0, ratio = 1e-7)
+            (0.05, 1.0e9),           // saturated: w_abs = 1 (λ_min < 1), w_rel = 0
+            (1.0e3, 1.0e3 / 1.0e-9), // saturated: ratio = 1e-9 < relative-clear ⇒ w_rel = 1
+        ];
+        for &(lmin, lmax) in &configs {
+            let (h_mm, h_mx, h_xx) = conditioning_gate_weight_hess(lmin, lmax);
+
+            // ∂²G/∂λ_min² via central difference of ∂G/∂λ_min.
+            let hmin = 1e-6 * lmin.abs().max(1e-3);
+            let fd_mm = (conditioning_gate_weight_grad(lmin + hmin, lmax).0
+                - conditioning_gate_weight_grad(lmin - hmin, lmax).0)
+                / (2.0 * hmin);
+            assert!(
+                (fd_mm - h_mm).abs() <= 1e-3 * h_mm.abs().max(1.0),
+                "∂²G/∂λ_min² desync at (λ_min={lmin}, λ_max={lmax}): fd={fd_mm} analytic={h_mm}"
+            );
+
+            // ∂²G/∂λ_max² via central difference of ∂G/∂λ_max.
+            let hmax = 1e-6 * lmax.abs().max(1e-3);
+            let fd_xx = (conditioning_gate_weight_grad(lmin, lmax + hmax).1
+                - conditioning_gate_weight_grad(lmin, lmax - hmax).1)
+                / (2.0 * hmax);
+            assert!(
+                (fd_xx - h_xx).abs() <= 1e-3 * h_xx.abs().max(1.0),
+                "∂²G/∂λ_max² desync at (λ_min={lmin}, λ_max={lmax}): fd={fd_xx} analytic={h_xx}"
+            );
+
+            // ∂²G/∂λ_min∂λ_max via central difference of ∂G/∂λ_min in λ_max.
+            let fd_mx = (conditioning_gate_weight_grad(lmin, lmax + hmax).0
+                - conditioning_gate_weight_grad(lmin, lmax - hmax).0)
+                / (2.0 * hmax);
+            assert!(
+                (fd_mx - h_mx).abs() <= 1e-3 * h_mx.abs().max(1.0),
+                "∂²G/∂λ_min∂λ_max desync at (λ_min={lmin}, λ_max={lmax}): fd={fd_mx} analytic={h_mx}"
             );
         }
     }
