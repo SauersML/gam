@@ -3310,6 +3310,33 @@ fn bounded_prior_terms(theta: f64, prior: &BoundedCoefficientPriorSpec) -> (f64,
     (logp, grad, neghess, neghess_derivative)
 }
 
+/// Assemble the per-observation IRLS state for a standard exponential-family
+/// GLM from the inverse-link jet (`d1 = dμ/dη`, `d2`, `d3`) and the
+/// log-likelihood derivatives in `μ` (`lmu = ∂l/∂μ`, `lmumu`, `lmumumu`) plus
+/// the mean-variance `var = V(μ)`. Mirrors the Binomial general arm EXACTLY
+/// (#1615/#1616): expected Fisher weight `(dμ/dη)²/V(μ)`, observed
+/// negative-Hessian in `η`, and its `η`-derivative. Canonical-link self-check:
+/// for a canonical link the observed neg-Hessian equals the Fisher weight
+/// (e.g. Poisson-log → both `= w·μ`), which this construction reproduces.
+#[inline]
+fn glm_eta_observation_state(
+    w: f64,
+    lmu: f64,
+    lmumu: f64,
+    lmumumu: f64,
+    var: f64,
+    d1: f64,
+    d2: f64,
+    d3: f64,
+    mu_deriv_eps: f64,
+) -> (f64, f64, f64, f64) {
+    let score = w * lmu * d1;
+    let fisherweight = (w * d1 * d1 / var).max(mu_deriv_eps);
+    let neghessian = -w * (lmumu * d1 * d1 + lmu * d2);
+    let neghessian_deriv = -w * (lmumumu * d1 * d1 * d1 + 3.0 * lmumu * d1 * d2 + lmu * d3);
+    (score, fisherweight, neghessian, neghessian_deriv)
+}
+
 fn evaluate_standard_familyobservations(
     family: LikelihoodSpec,
     latent_cloglog_state: Option<&LatentCLogLogState>,
@@ -3399,19 +3426,87 @@ fn evaluate_standard_familyobservations(
                 log_likelihood += w * (yi * mu_i.ln() + (1.0 - yi) * (1.0 - mu_i).ln());
             }
             (ResponseFamily::Poisson, _) => {
-                crate::bail_invalid_estim!(
-                    "bounded linear terms are not supported for PoissonLog fits"
+                // l(μ) = y·ln μ − μ (drop ln y! const) ⇒ lmu = y/μ − 1,
+                // lmumu = −y/μ², lmumumu = 2y/μ³, V(μ) = μ. #1615/#1616.
+                let strategy_spec = LikelihoodSpec {
+                    response: family.response.clone(),
+                    link: family.link.clone(),
+                };
+                let jet = strategy_for_spec(&strategy_spec).inverse_link_jet(eta_i)?;
+                let mu_i = jet.mu.max(PROB_EPS);
+                let d1 = jet.d1.max(MU_DERIV_EPS);
+                let var = mu_i;
+                let lmu = yi / mu_i - 1.0;
+                let lmumu = -yi / (mu_i * mu_i);
+                let lmumumu = 2.0 * yi / (mu_i * mu_i * mu_i);
+                let (s, f, nh, nhd) = glm_eta_observation_state(
+                    w, lmu, lmumu, lmumumu, var, d1, jet.d2, jet.d3, MU_DERIV_EPS,
                 );
+                mu[i] = mu_i;
+                score[i] = s;
+                fisherweight[i] = f;
+                neghessian_eta[i] = nh;
+                neghessian_eta_derivative[i] = nhd;
+                log_likelihood += w * (yi * mu_i.ln() - mu_i);
             }
-            (ResponseFamily::Tweedie { .. }, _) => {
-                crate::bail_invalid_estim!(
-                    "bounded linear terms are not supported for Tweedie fits"
+            (ResponseFamily::Tweedie { p }, _) => {
+                // Fixed-p Tweedie quasi-likelihood: ∂Q/∂μ = (y−μ)/V, V(μ) = μ^p.
+                // lmu = (y−μ)μ^{−p};  lmumu = −μ^{−p} − p(y−μ)μ^{−p−1};
+                // lmumumu = 2p·μ^{−p−1} + p(p+1)(y−μ)μ^{−p−2};
+                // Q = y·μ^{1−p}/(1−p) − μ^{2−p}/(2−p). #1615/#1616.
+                let p = *p;
+                let strategy_spec = LikelihoodSpec {
+                    response: family.response.clone(),
+                    link: family.link.clone(),
+                };
+                let jet = strategy_for_spec(&strategy_spec).inverse_link_jet(eta_i)?;
+                let mu_i = jet.mu.max(PROB_EPS);
+                let d1 = jet.d1.max(MU_DERIV_EPS);
+                let var = mu_i.powf(p);
+                let resid = yi - mu_i;
+                let lmu = resid / var;
+                let lmumu = -mu_i.powf(-p) - p * resid * mu_i.powf(-p - 1.0);
+                let lmumumu =
+                    2.0 * p * mu_i.powf(-p - 1.0) + p * (p + 1.0) * resid * mu_i.powf(-p - 2.0);
+                let (s, f, nh, nhd) = glm_eta_observation_state(
+                    w, lmu, lmumu, lmumumu, var, d1, jet.d2, jet.d3, MU_DERIV_EPS,
                 );
+                mu[i] = mu_i;
+                score[i] = s;
+                fisherweight[i] = f;
+                neghessian_eta[i] = nh;
+                neghessian_eta_derivative[i] = nhd;
+                // Quasi-log-likelihood (p ≠ 1, 2 in the supported compound range).
+                log_likelihood += w
+                    * (yi * mu_i.powf(1.0 - p) / (1.0 - p) - mu_i.powf(2.0 - p) / (2.0 - p));
             }
-            (ResponseFamily::NegativeBinomial { .. }, _) => {
-                crate::bail_invalid_estim!(
-                    "bounded linear terms are not supported for NegativeBinomial fits"
+            (ResponseFamily::NegativeBinomial { theta, .. }, _) => {
+                // l(μ) = y·ln μ − (y+θ)·ln(μ+θ) (drop μ-independent terms) ⇒
+                // lmu = y/μ − (y+θ)/(μ+θ), lmumu = −y/μ² + (y+θ)/(μ+θ)²,
+                // lmumumu = 2y/μ³ − 2(y+θ)/(μ+θ)³, V(μ) = μ + μ²/θ. #1615/#1616.
+                let theta = (*theta).max(PROB_EPS);
+                let strategy_spec = LikelihoodSpec {
+                    response: family.response.clone(),
+                    link: family.link.clone(),
+                };
+                let jet = strategy_for_spec(&strategy_spec).inverse_link_jet(eta_i)?;
+                let mu_i = jet.mu.max(PROB_EPS);
+                let d1 = jet.d1.max(MU_DERIV_EPS);
+                let mu_plus = mu_i + theta;
+                let var = mu_i + mu_i * mu_i / theta;
+                let lmu = yi / mu_i - (yi + theta) / mu_plus;
+                let lmumu = -yi / (mu_i * mu_i) + (yi + theta) / (mu_plus * mu_plus);
+                let lmumumu =
+                    2.0 * yi / (mu_i * mu_i * mu_i) - 2.0 * (yi + theta) / (mu_plus * mu_plus * mu_plus);
+                let (s, f, nh, nhd) = glm_eta_observation_state(
+                    w, lmu, lmumu, lmumumu, var, d1, jet.d2, jet.d3, MU_DERIV_EPS,
                 );
+                mu[i] = mu_i;
+                score[i] = s;
+                fisherweight[i] = f;
+                neghessian_eta[i] = nh;
+                neghessian_eta_derivative[i] = nhd;
+                log_likelihood += w * (yi * mu_i.ln() - (yi + theta) * mu_plus.ln());
             }
             (ResponseFamily::Beta { .. }, _) => {
                 crate::bail_invalid_estim!(
@@ -3419,9 +3514,30 @@ fn evaluate_standard_familyobservations(
                 );
             }
             (ResponseFamily::Gamma, _) => {
-                crate::bail_invalid_estim!(
-                    "bounded linear terms are not supported for GammaLog fits"
+                // Unit-dispersion Gamma kernel l(μ) = −y/μ − ln μ ⇒
+                // lmu = y/μ² − 1/μ, lmumu = −2y/μ³ + 1/μ²,
+                // lmumumu = 6y/μ⁴ − 2/μ³, V(μ) = μ². #1615/#1616.
+                let strategy_spec = LikelihoodSpec {
+                    response: family.response.clone(),
+                    link: family.link.clone(),
+                };
+                let jet = strategy_for_spec(&strategy_spec).inverse_link_jet(eta_i)?;
+                let mu_i = jet.mu.max(PROB_EPS);
+                let d1 = jet.d1.max(MU_DERIV_EPS);
+                let var = mu_i * mu_i;
+                let lmu = yi / (mu_i * mu_i) - 1.0 / mu_i;
+                let lmumu = -2.0 * yi / (mu_i * mu_i * mu_i) + 1.0 / (mu_i * mu_i);
+                let lmumumu =
+                    6.0 * yi / (mu_i * mu_i * mu_i * mu_i) - 2.0 / (mu_i * mu_i * mu_i);
+                let (s, f, nh, nhd) = glm_eta_observation_state(
+                    w, lmu, lmumu, lmumumu, var, d1, jet.d2, jet.d3, MU_DERIV_EPS,
                 );
+                mu[i] = mu_i;
+                score[i] = s;
+                fisherweight[i] = f;
+                neghessian_eta[i] = nh;
+                neghessian_eta_derivative[i] = nhd;
+                log_likelihood += w * (-(yi / mu_i) - mu_i.ln());
             }
             (ResponseFamily::RoystonParmar, _) => {
                 crate::bail_invalid_estim!(
@@ -6562,4 +6678,88 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
         });
     }
     Ok(Some(entries))
+}
+
+#[cfg(test)]
+mod glm_eta_observation_fd_tests {
+    //! #1615/#1616: the non-Gaussian GLM arms of `evaluate_standard_familyobservations`
+    //! (Poisson / Gamma / NegativeBinomial / Tweedie) must have a self-consistent
+    //! derivative tower: `score = ∂ℓ/∂η`, `neghessian_eta = −∂(score)/∂η`, and
+    //! `neghessian_eta_derivative = ∂(neghessian_eta)/∂η`. Pin each against central
+    //! finite differences of the assembled log-likelihood / score.
+    use super::*;
+
+    fn one_obs(spec: &LikelihoodSpec, y: f64, eta: f64) -> StandardFamilyObservationState {
+        let yv = Array1::from_vec(vec![y]);
+        let wv = Array1::from_vec(vec![1.0]);
+        let ev = Array1::from_vec(vec![eta]);
+        evaluate_standard_familyobservations(spec.clone(), None, None, None, &yv, &wv, &ev)
+            .expect("standard family observation state assembles")
+    }
+
+    fn check_fd(label: &str, spec: &LikelihoodSpec, y: f64, eta: f64) {
+        let h = 1e-5;
+        let s0 = one_obs(spec, y, eta);
+        let sp = one_obs(spec, y, eta + h);
+        let sm = one_obs(spec, y, eta - h);
+
+        // score = d(log_likelihood)/d(eta)
+        let score_fd = (sp.log_likelihood - sm.log_likelihood) / (2.0 * h);
+        let score = s0.score[0];
+        assert!(
+            (score - score_fd).abs() <= 1e-4 * (1.0 + score.abs()),
+            "{label}: score {score} vs FD {score_fd}"
+        );
+
+        // neghessian_eta = -d(score)/d(eta)
+        let neghess_fd = -(sp.score[0] - sm.score[0]) / (2.0 * h);
+        let neghess = s0.neghessian_eta[0];
+        assert!(
+            (neghess - neghess_fd).abs() <= 1e-3 * (1.0 + neghess.abs()),
+            "{label}: neghessian_eta {neghess} vs FD {neghess_fd}"
+        );
+
+        // neghessian_eta_derivative = d(neghessian_eta)/d(eta)
+        let nhd_fd = (sp.neghessian_eta[0] - sm.neghessian_eta[0]) / (2.0 * h);
+        let nhd = s0.neghessian_eta_derivative[0];
+        assert!(
+            (nhd - nhd_fd).abs() <= 1e-2 * (1.0 + nhd.abs()),
+            "{label}: neghessian_eta_derivative {nhd} vs FD {nhd_fd}"
+        );
+    }
+
+    #[test]
+    fn poisson_gamma_nb_tweedie_arms_match_finite_differences_1615_1616() {
+        let log = InverseLink::Standard(StandardLink::Log);
+        let poisson = LikelihoodSpec {
+            response: ResponseFamily::Poisson,
+            link: log.clone(),
+        };
+        check_fd("poisson y=3", &poisson, 3.0, 0.4);
+        check_fd("poisson y=0", &poisson, 0.0, -0.2);
+
+        let gamma = LikelihoodSpec {
+            response: ResponseFamily::Gamma,
+            link: log.clone(),
+        };
+        check_fd("gamma y=2.5", &gamma, 2.5, 0.3);
+        check_fd("gamma y=0.7", &gamma, 0.7, -0.1);
+
+        let nb = LikelihoodSpec {
+            response: ResponseFamily::NegativeBinomial {
+                theta: 1.5,
+                theta_fixed: true,
+            },
+            link: log.clone(),
+        };
+        check_fd("negbin y=4", &nb, 4.0, 0.5);
+        check_fd("negbin y=0", &nb, 0.0, -0.3);
+
+        let tweedie = LikelihoodSpec {
+            response: ResponseFamily::Tweedie { p: 1.5 },
+            link: log.clone(),
+        };
+        check_fd("tweedie y=2", &tweedie, 2.0, 0.25);
+        check_fd("tweedie y=0.5", &tweedie, 0.5, -0.15);
+    }
 }
