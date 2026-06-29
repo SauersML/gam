@@ -296,7 +296,9 @@ pub(crate) fn sae_separation_barrier_override() -> Option<f64> {
 }
 
 /// Set the process-global SAE separation-barrier strength override (one wheel,
-/// many configs). `sep_strength` is NaN to clear back to the compiled default.
+/// many configs). `sep_strength` is NaN to clear the override back to the
+/// data-derived μ_C (`K / reachable_rank`); there is no compiled-constant
+/// default any more.
 /// The amplitude (keep-alive) barrier and its active-atom gate were removed
 /// (surplus features are allowed to die into a ridge-parked state), so this
 /// takes only the separation strength. Called from the gamfit Python FFI.

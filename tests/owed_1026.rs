@@ -193,11 +193,13 @@ fn decoder_repulsion_conditions_collapse_direction_1026() {
     // direction; orthogonal decoders engage no repulsion. The atom-1-block
     // smoothness curvature is identical across the two cases by construction, so
     // the strictly positive gap is the repulsion alone. The per-pair weight is
-    // the #1610 energy-normalized `sae_decoder_repulsion_strength()/(‖B_j‖²_F·‖B_k‖²_F)`
-    // (= 1e-3 / (2·2) here, since each collinear decoder has ‖B‖²_F = 2) at full
-    // collinearity, and the quadratic form on a 2-row unit probe is O(weight) ≈
-    // 2.5e-4 — assert a margin well clear of rounding but below the analytic value
-    // so the gate engaging is the load-bearing assertion, not a brittle exact number.
+    // the #1610 energy-normalized `decoder_repulsion_strength()/(‖B_j‖²_F·‖B_k‖²_F)`
+    // — i.e. `SAE_DECODER_REPULSION_BARRIER_RATIO · μ_C` over the squared decoder
+    // energies — at full collinearity, a small strictly-positive O(μ_rep) quantity.
+    // Since #1610 made μ_C data-derived (`K / reachable_rank`) rather than the old
+    // frozen `10.0`, the exact magnitude now tracks the fixture's overcompleteness,
+    // so we assert only a margin well clear of rounding but below the analytic
+    // value — the gate engaging is the load-bearing assertion, not a brittle number.
     assert!(
         q_col.is_finite() && q_orth.is_finite(),
         "penalty quadratic forms must be finite: collinear={q_col}, orthogonal={q_orth}"
