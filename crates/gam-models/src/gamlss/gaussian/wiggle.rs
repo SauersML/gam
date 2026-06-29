@@ -2027,16 +2027,8 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         }
         let mut config = crate::seeding::SeedConfig::default();
         config.risk_profile = crate::seeding::SeedRiskProfile::GaussianLocationScale;
-        // Same anti-over-smoothing widening as the non-wiggle family: fully
-        // solve more of the grid and deepen the screening proxy so the flexible
-        // (low-λ) log-σ basin is not screened out by the over-smoothed seed's
-        // near-flat Fisher surface looking cheapest at a shallow cap. Provably
-        // non-worsening under lowest-cost keep-best. See
-        // `GaussianLocationScaleFamily::outer_seed_config` for the full
-        // rationale.
-        config.max_seeds = 8;
-        config.seed_budget = 4;
-        config.screen_max_inner_iterations = 16;
+        config.max_seeds = 4;
+        config.seed_budget = 2;
         config
     }
 

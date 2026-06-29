@@ -1123,31 +1123,8 @@ impl CustomFamily for GaussianLocationScaleFamily {
         }
         let mut config = crate::seeding::SeedConfig::default();
         config.risk_profile = crate::seeding::SeedRiskProfile::GaussianLocationScale;
-        // The flexible (low-λ) scale basin is the one that traces the variance
-        // envelope; the over-smoothed (high-λ) scale seed collapses log-σ into
-        // its penalty null space (#684/#686, pearson≈0.69). Both are present in
-        // the GaussianLocationScale grid (the negative global shifts reach the
-        // low-λ basin), so the only way the over-smoothed seed wins is if the
-        // capped-screening proxy mis-ranks it cheapest: an over-smoothed log-σ
-        // block has a near-flat Fisher surface and "converges" within a handful
-        // of inner cycles, while the flexible block needs more iterations to
-        // reach its (lower-cost) heteroscedastic fit, so under a shallow
-        // `screen_max_inner_iterations` cap the flexible seed looks expensive
-        // and falls outside the fully-solved `seed_budget` set.
-        //
-        // Defeat the mis-rank two ways, both provably non-worsening under the
-        // lowest-cost keep-best this profile uses (`uses_lowest_cost_keep_best`,
-        // which adopts a candidate only when it scores strictly better):
-        //   1. Widen the candidate grid and fully-solve more of it so the
-        //      flexible-scale basin is actually evaluated at full inner depth
-        //      rather than screened out.
-        //   2. Deepen the screening proxy so the flexible seed's cost is
-        //      measured after it has had room to descend toward its
-        //      heteroscedastic optimum, instead of being judged at iteration 3
-        //      where the over-smoothed seed's flat surface looks cheapest.
-        config.max_seeds = 8;
-        config.seed_budget = 4;
-        config.screen_max_inner_iterations = 16;
+        config.max_seeds = 4;
+        config.seed_budget = 2;
         config
     }
 
