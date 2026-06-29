@@ -1394,16 +1394,29 @@ impl<'a> RemlState<'a> {
             None => Vec::new(),
         };
 
-        let mut h_i = Vec::with_capacity(k);
-        for idx in 0..k {
-            let diag = c_array * &eta_i[idx];
-            let mut h = &a_mats[idx] + &Self::tk_xt_diag_x(x_dense, &diag);
-            if let Some(op) = firth_op {
-                h -= &op.hphi_direction(&firth_dir_i[idx]);
-            }
-            gam_linalg::matrix::symmetrize_in_place(&mut h);
-            h_i.push(h);
-        }
+        // First-derivative blocks H'[idx] — k independent full-data passes, each
+        // dominated (Firth path) by the O(n·r²·p) `hphi_direction` reduced-Gram
+        // apply. Fan across Rayon with the nested-BLAS guard (see the pair loop
+        // below); index-ordered collection keeps `h_i` identical to the serial
+        // loop, and the inner GEMMs are already `Par::Seq` at fixture scale so the
+        // assembled blocks are bit-for-bit unchanged (#1575).
+        let h_i: Vec<Array2<f64>> = {
+            use rayon::prelude::*;
+            (0..k)
+                .into_par_iter()
+                .map(|idx| {
+                    gam_problem::with_nested_parallel(|| {
+                        let diag = c_array * &eta_i[idx];
+                        let mut h = &a_mats[idx] + &Self::tk_xt_diag_x(x_dense, &diag);
+                        if let Some(op) = firth_op {
+                            h -= &op.hphi_direction(&firth_dir_i[idx]);
+                        }
+                        gam_linalg::matrix::symmetrize_in_place(&mut h);
+                        h
+                    })
+                })
+                .collect()
+        };
 
         // The mixed second directional derivative D²H_φ[u,v] is evaluated for
         // every (i,j) penalty pair below against the SAME identity rhs. Its
