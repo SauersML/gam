@@ -379,15 +379,25 @@ pub fn trace_penalty_covariance_in_orthogonal_basis(
 /// (mass-zeroing negative or non-finite eigenvalues) hid construction bugs and
 /// changed the optimisation objective downstream.
 ///
-/// `C_EPS_P_FACTOR = 64` chooses the multiplier `c` in
-/// `tol = c * eps_machine * p * scale`: 64 absorbs the rounding accumulated in a
-/// symmetric eigendecomposition of a moderate-dimension matrix while still
-/// rejecting the 1e-12 * scale magnitudes that previously slipped through.
+/// The acceptance tolerance is the larger of a machine-ε floor
+/// (`C_EPS_P_FACTOR * eps_machine * p * scale`, with `C_EPS_P_FACTOR = 64`
+/// absorbing the rounding accumulated in a symmetric eigendecomposition of a
+/// moderate-dimension matrix) and a relative "numerically PSD" floor
+/// `REL_PSD_FLOOR * scale`. The latter dominates for large high-rank penalties
+/// assembled / reparameterized at extreme λ, where roundoff produces
+/// ~1e-11-relative negative eigenvalues that are PSD to any reasonable precision
+/// yet exceeded the bare ~12×ε machine floor and spuriously failed the inner
+/// P-IRLS solve (#1619). Genuine indefiniteness is O(1) relative and is still
+/// rejected far above either floor.
 fn classify_eigenvalues_strict(
     eigenvalues: &mut [f64],
     context: &str,
 ) -> Result<(), EstimationError> {
     const C_EPS_P_FACTOR: f64 = 64.0;
+    // Standard "numerically PSD" relative threshold (~sqrt(machine ε)). A negative
+    // eigenvalue smaller than this fraction of the spectrum scale is roundoff, not
+    // genuine negative curvature, and is snapped to zero rather than rejected.
+    const REL_PSD_FLOOR: f64 = 1.0e-8;
     let p = eigenvalues.len();
 
     let mut scale = 0.0_f64;
@@ -404,10 +414,14 @@ fn classify_eigenvalues_strict(
 
     // p * eps captures the rounding floor of a symmetric eigendecomposition of a
     // p-dimensional matrix; multiplying by `scale` lifts the floor to the actual
-    // magnitude of the spectrum. The constant `C_EPS_P_FACTOR` provides headroom
-    // for the residual rounding in subsequent matmuls.
-    let tolerance =
-        (C_EPS_P_FACTOR * f64::EPSILON * (p.max(1) as f64) * scale).max(f64::MIN_POSITIVE);
+    // magnitude of the spectrum. For large high-rank penalties assembled at
+    // extreme λ this machine floor (~12×ε relative) is tighter than the roundoff
+    // actually produced, so we take the larger of it and a relative numerically-PSD
+    // floor `REL_PSD_FLOOR * scale` (#1619).
+    let machine_floor = C_EPS_P_FACTOR * f64::EPSILON * (p.max(1) as f64) * scale;
+    let tolerance = machine_floor
+        .max(REL_PSD_FLOOR * scale)
+        .max(f64::MIN_POSITIVE);
 
     for (idx, val) in eigenvalues.iter_mut().enumerate() {
         if val.abs() <= tolerance {
@@ -3536,6 +3550,30 @@ mod tests {
         // The roundoff eigenvalue is snapped to exact zero.
         assert_eq!(eigs[2], 0.0);
         // Strictly positive entries must be preserved.
+        assert!(eigs[0] > 0.0 && eigs[1] > 0.0 && eigs[3] > 0.0);
+    }
+
+    #[test]
+    fn classify_strict_accepts_extreme_lambda_assembly_noise_1619() {
+        // #1619: high-rank thin-plate / Duchon penalties (p≈200) assembled and
+        // reparameterized at extreme λ produce float-noise negative eigenvalues at
+        // ~1e-11 relative to the spectrum scale (~1e13 there). The bare machine-ε
+        // floor (~12×ε relative ≈ 1e-12) rejected these as "indefinite" and
+        // spuriously failed the inner P-IRLS solve. They are PSD to numerical
+        // precision and must be snapped to zero, not rejected.
+        let scale = 8.509e12_f64;
+        // Worst (eig, scale) pair observed in the issue: eig/scale ≈ -7.7e-11.
+        let noise = -6.546e2_f64;
+        assert!(
+            (noise.abs() / scale) < 1.0e-10,
+            "fixture must reproduce the ~1e-11-relative noise from #1619"
+        );
+        let mut eigs = vec![scale, 0.5 * scale, noise, 0.1 * scale];
+        classify_eigenvalues_strict(&mut eigs, "range penalty block")
+            .expect("a ~1e-11-relative roundoff-negative eigenvalue must be accepted (#1619)");
+        // The roundoff-negative eigenvalue is snapped to exact zero.
+        assert_eq!(eigs[2], 0.0);
+        // Strictly positive entries are preserved.
         assert!(eigs[0] > 0.0 && eigs[1] > 0.0 && eigs[3] > 0.0);
     }
 
