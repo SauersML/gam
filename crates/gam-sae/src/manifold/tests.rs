@@ -2142,7 +2142,6 @@ pub(crate) fn separation_barrier_is_collapse_prevention_not_bandaid_1522() {
 /// chosen squared alignment `c² = cos²θ` (`dec0 = e0`, `dec1 = (cosθ, sinθ, 0)`),
 /// co-firing under softmax so the separation barrier's coactivation `q_01 > 0`.
 /// The shared regression fixture for the collinearity-gate guards below.
-#[cfg(test)]
 fn aligned_two_atom_term_with_c2(c2: f64) -> SaeManifoldTerm {
     let coords0 = array![[0.05], [0.20], [0.55], [0.80], [0.35], [0.65]];
     let coords1 = array![[0.15], [0.30], [0.65], [0.90], [0.45], [0.10]];
