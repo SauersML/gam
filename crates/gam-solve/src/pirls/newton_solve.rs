@@ -462,40 +462,6 @@ pub(super) fn jeffreys_pirls_diagnostics_from_factor(
     FirthDenseOperator::pirls_diagnostics_from_factor(factor, link, &eta.to_owned())
 }
 
-// Test-only since #1575: the production inner-PIRLS path memoizes the
-// β-independent design factor and calls `jeffreys_pirls_diagnostics_from_factor`
-// instead of rebuilding the full operator every Newton iteration. This
-// full-operator reference builder is retained for the operator-equivalence unit
-// tests (it exercises `pirls_hat_diag` / `pirls_firth_score_shift`).
-#[cfg(test)]
-pub(super) fn compute_jeffreys_pirls_diagnostics(
-    link: &InverseLink,
-    x_design: ArrayView2<f64>,
-    eta: ArrayView1<f64>,
-    observation_weights: ArrayView1<f64>,
-) -> Result<(Array1<f64>, f64, Array1<f64>), EstimationError> {
-    // PIRLS must use the same identifiable-subspace Jeffreys functional as the
-    // outer REML code:
-    //   Φ(β) = 0.5 log|Xᵀ W(η) X|_+.
-    // The operator below is the single source of truth for the Jeffreys scalar
-    // value, the PIRLS hat-diagonal, AND the working-response score shift the
-    // inner solve applies. The Fisher working weight `W(η)` is evaluated for the
-    // resolved inverse link; `StandardLink::Logit` reproduces the released logit
-    // diagnostics exactly while non-canonical links (probit, cloglog) get the
-    // correct link-general shift instead of the logit-pinned `(½ − μ)` term.
-    let op = FirthDenseOperator::build_with_observation_weights_for_link(
-        link,
-        &x_design.to_owned(),
-        &eta.to_owned(),
-        observation_weights,
-    )?;
-    Ok((
-        op.pirls_hat_diag(),
-        op.jeffreys_logdet(),
-        op.pirls_firth_score_shift(),
-    ))
-}
-
 pub(crate) fn ensure_positive_definitewithridge(
     hess: &mut Array2<f64>,
     label: &str,

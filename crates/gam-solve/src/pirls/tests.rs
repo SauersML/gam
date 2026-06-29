@@ -15,7 +15,7 @@ mod tests {
     use super::{
         LinearInequalityConstraints, PenaltyConfig, PirlsConfig, PirlsLinearSolvePath,
         PirlsProblem, PirlsWorkspace, WorkingDerivativeBuffersMut, bernoulli_geometry_from_jet,
-        calculate_deviance, compute_constraint_kkt_diagnostics, compute_jeffreys_pirls_diagnostics,
+        calculate_deviance, compute_constraint_kkt_diagnostics,
         compute_observed_hessian_curvature_arrays, fit_model_for_fixed_rho,
         select_active_set_release, should_log_pirls_decision_summary,
         should_use_sparse_native_pirls, solve_newton_directionwith_linear_constraints,
@@ -33,6 +33,30 @@ mod tests {
     };
     use approx::assert_relative_eq;
     use faer::sparse::{SparseColMat, Triplet};
+
+    // Full-operator Firth/Jeffreys diagnostics reference (#1575): bit-identical to
+    // the production `jeffreys_pirls_diagnostics_from_factor` fast path, used here
+    // as the operator-equivalence oracle. Lives in this test module (its only
+    // consumer) rather than as a `#[cfg(test)]`-gated production fn.
+    fn compute_jeffreys_pirls_diagnostics(
+        link: &InverseLink,
+        x_design: ArrayView2<f64>,
+        eta: ArrayView1<f64>,
+        observation_weights: ArrayView1<f64>,
+    ) -> Result<(Array1<f64>, f64, Array1<f64>), EstimationError> {
+        use crate::reml::firth::FirthDenseOperator;
+        let op = FirthDenseOperator::build_with_observation_weights_for_link(
+            link,
+            &x_design.to_owned(),
+            &eta.to_owned(),
+            observation_weights,
+        )?;
+        Ok((
+            op.pirls_hat_diag(),
+            op.jeffreys_logdet(),
+            op.pirls_firth_score_shift(),
+        ))
+    }
     use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ShapeBuilder, array};
 
     #[test]
