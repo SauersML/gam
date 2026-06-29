@@ -1431,34 +1431,61 @@ impl<'a> RemlState<'a> {
                 beta_ij[j][i] = bij;
             }
         }
-        for i in 0..k {
-            for j in 0..=i {
-                let eta_ij = gam_linalg::faer_ndarray::fast_av(x_dense, &beta_ij[i][j]);
-                let diag = c_array * &eta_ij + &(d_array * &(&eta_i[i] * &eta_i[j]));
-                let mut h = Self::tk_xt_diag_x(x_dense, &diag);
-                if i == j {
-                    h += &a_mats[i];
-                }
-                if let Some(op) = firth_op {
-                    let dir_ij = op.direction_from_deta(eta_ij);
-                    h -= &op.hphi_direction(&dir_ij);
-                    // Reuse the per-penalty directions built once above and the
-                    // single-index second-derivative sub-blocks cached once above,
-                    // instead of rebuilding them for every (i,j) pair (#1575).
-                    let cache = firth_second_eye_cache
-                        .as_ref()
-                        .expect("firth second-direction eye cache present when firth_op is Some");
-                    h -= &op.hphisecond_direction_apply_eye_cached(
-                        cache,
-                        &firth_dir_i,
-                        i,
-                        j,
-                    );
-                }
-                gam_linalg::matrix::symmetrize_in_place(&mut h);
-                h_ij[i][j] = h.clone();
-                h_ij[j][i] = h;
-            }
+        // Mixed second-derivative blocks H''[i,j] for every upper-triangle pair.
+        // Each pair is an INDEPENDENT full-data pass — its cost is dominated, for
+        // the default-ON binomial/logit Firth path, by ~5 O(n·r²·p) reduced
+        // Hadamard-Gram applies inside `hphisecond_direction_apply_eye_cached`
+        // (#1575). The pairs share only immutable state (`op`, the cached
+        // directions/eye-blocks, `beta_ij`, the derivative arrays), so we fan the
+        // `k(k+1)/2` pairs across the Rayon pool; the `with_nested_parallel` guard
+        // pins each pair's faer GEMMs to `Par::Seq`, spreading the pairs over
+        // cores without rayon×faer oversubscription. The cheap reduction back into
+        // `h_ij` stays serial in index order, so the result is identical to the
+        // original double `for` loop. At the small regression-fixture scales the
+        // inner GEMMs are already `Par::Seq` (below faer's flop threshold), so
+        // forcing seq there changes nothing and the assembled blocks are
+        // bit-for-bit unchanged; the win is purely on the large-n perf path.
+        let h_pairs: Vec<(usize, usize)> =
+            (0..k).flat_map(|i| (0..=i).map(move |j| (i, j))).collect();
+        let h_blocks: Vec<Array2<f64>> = {
+            use rayon::prelude::*;
+            h_pairs
+                .par_iter()
+                .map(|&(i, j)| {
+                    gam_problem::with_nested_parallel(|| {
+                        let eta_ij = gam_linalg::faer_ndarray::fast_av(x_dense, &beta_ij[i][j]);
+                        let diag =
+                            c_array * &eta_ij + &(d_array * &(&eta_i[i] * &eta_i[j]));
+                        let mut h = Self::tk_xt_diag_x(x_dense, &diag);
+                        if i == j {
+                            h += &a_mats[i];
+                        }
+                        if let Some(op) = firth_op {
+                            let dir_ij = op.direction_from_deta(eta_ij);
+                            h -= &op.hphi_direction(&dir_ij);
+                            // Reuse the per-penalty directions built once above and
+                            // the single-index second-derivative sub-blocks cached
+                            // once above, instead of rebuilding them per (i,j) pair
+                            // (#1575).
+                            let cache = firth_second_eye_cache.as_ref().expect(
+                                "firth second-direction eye cache present when firth_op is Some",
+                            );
+                            h -= &op.hphisecond_direction_apply_eye_cached(
+                                cache,
+                                &firth_dir_i,
+                                i,
+                                j,
+                            );
+                        }
+                        gam_linalg::matrix::symmetrize_in_place(&mut h);
+                        h
+                    })
+                })
+                .collect()
+        };
+        for (&(i, j), h) in h_pairs.iter().zip(h_blocks.into_iter()) {
+            h_ij[i][j] = h.clone();
+            h_ij[j][i] = h;
         }
 
         let mut k_i = Vec::with_capacity(k);
