@@ -4764,87 +4764,9 @@ mod empirical_flex_jet_oracle_tests {
         }
     }
 
-    /// #932 timing baseline (investigation only, ignored by default): measures
-    /// ns/row of the hand path `compute_row_analytic_flex_from_parts_into`
-    /// (need_hessian=true) versus the naive per-op-alloc `Jet2` single-source
-    /// `empirical_flex_row_nll_jet2` on the SAME representative flex fixture, so
-    /// the #932 "jet must be measurably faster" constraint can be quantified.
-    /// Run with: `cargo test -p gam-models --release flex_handpath_vs_jet2_timing_932 -- --ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn flex_handpath_vs_jet2_timing_932() {
-        use std::time::Instant;
-        let fx = make_fixture(false); // link-dev block
-        let r = fx.primary.total;
-        let q0 = 0.2_f64;
-        let b0 = 0.35_f64;
-        let mut p0 = vec![0.0; r];
-        p0[fx.primary.q] = q0;
-        p0[fx.primary.logslope] = b0;
-        let dev_range = fx.primary.w.clone().unwrap();
-        for (k, i) in dev_range.clone().enumerate() {
-            p0[i] = fx.beta_dev[k];
-        }
-        let scale = fx.family.probit_frailty_scale();
-        let beta: Array1<f64> = Array1::from_iter(dev_range.clone().map(|i| p0[i]));
-        let marginal = bernoulli_marginal_link_map(
-            &InverseLink::Standard(gam_problem::StandardLink::Probit),
-            q0,
-        )
-        .expect("link map");
-        let intercept = witness_intercept(&fx, marginal.mu, b0, &beta, scale);
-        let mut m_a = 0.0;
-        for (node, weight) in fx.grid.pairs() {
-            m_a += weight * witness_normal_pdf(witness_eta(&fx, intercept, b0, &beta, node, scale));
-        }
-        let row_ctx = BernoulliMarginalSlopeRowExactContext {
-            intercept,
-            m_a,
-            intercept_fast_path: false,
-            degree9_cells: None,
-        };
-
-        let iters = 100_000usize;
-
-        // --- Hand path (value + gradient + Hessian). ---
-        let mut scratch =
-            crate::bms::hessian_paths::BernoulliMarginalSlopeFlexRowScratch::new(r);
-        let mut acc = 0.0_f64;
-        for _ in 0..1000 {
-            acc += fx
-                .family
-                .compute_row_analytic_flex_from_parts_into(
-                    0, &fx.primary, q0, b0, None, Some(&beta), &row_ctx, None, None, true,
-                    &mut scratch,
-                )
-                .expect("hand path");
-        }
-        let t0 = Instant::now();
-        for _ in 0..iters {
-            acc += fx
-                .family
-                .compute_row_analytic_flex_from_parts_into(
-                    0, &fx.primary, q0, b0, None, Some(&beta), &row_ctx, None, None, true,
-                    &mut scratch,
-                )
-                .expect("hand path");
-        }
-        let hand_ns = t0.elapsed().as_nanos() as f64 / iters as f64;
-
-        // --- Naive Jet2 single-source path (value + gradient + Hessian). ---
-        let mut acc2 = 0.0_f64;
-        for _ in 0..1000 {
-            acc2 += empirical_flex_row_nll_jet2(&fx, &p0).v;
-        }
-        let t1 = Instant::now();
-        for _ in 0..iters {
-            acc2 += empirical_flex_row_nll_jet2(&fx, &p0).v;
-        }
-        let jet_ns = t1.elapsed().as_nanos() as f64 / iters as f64;
-
-        eprintln!(
-            "#932 flex timing  r={r}  iters={iters}\n  hand_path  = {hand_ns:.1} ns/row\n  jet2_naive = {jet_ns:.1} ns/row\n  ratio jet2/hand = {:.2}x  (acc={acc:.3}, acc2={acc2:.3})",
-            jet_ns / hand_ns
-        );
-    }
+    // (Removed the `#[ignore]`d `flex_handpath_vs_jet2_timing_932` micro-benchmark:
+    // it asserted nothing — tripping both the `#[ignore]` and assertion-less-test
+    // ban rules — and the value/grad/Hessian agreement it implicitly exercised is
+    // already locked by `empirical_flex_row_nll_jet2_matches_hand_path_932` above.
+    // Environment-dependent ns/row measurements belong in `bench/`, not unit tests.)
 }

@@ -2601,15 +2601,15 @@ mod jet_tower_oracle_tests {
         }
     }
 
-    /// Perf certificate (#932): the shipped jet value/grad/Hessian kernel vs the
-    /// original HAND path. `#[ignore]` (timing is environment-dependent, not a
-    /// CI gate) — run with
-    /// `cargo test -p gam-models --release bench_rigid_vgh_jet_vs_hand -- --ignored --nocapture`.
+    /// Correctness certificate (#932): the shipped jet value/grad/Hessian kernel
+    /// (`rigid_standard_normal_row_kernel`) must agree bit-for-bit with the
+    /// original HAND path (`hand_rigid_vgh`) it replaced, on every representative
+    /// row. (The earlier `#[ignore]`d timing variant only asserted nothing and so
+    /// tripped both the `#[ignore]` and assertion-less-test ban rules; the
+    /// environment-dependent ns/row measurement belongs in `bench/`, not a unit
+    /// test. The deterministic agreement contract is what guards the cutover.)
     #[test]
-    #[ignore = "timing benchmark; run manually with --ignored --nocapture"]
-    fn bench_rigid_vgh_jet_vs_hand() {
-        use std::hint::black_box;
-        use std::time::Instant;
+    fn rigid_vgh_jet_matches_hand_bit_identical() {
         let eta = [0.3_f64, -0.7, 0.05, 0.9, -1.2, 2.1, -2.4];
         let g = [0.2_f64, -0.5, 0.35, -0.15, 0.6, 0.45, -0.55];
         let z = [0.4_f64, -1.1, 0.0, 0.7, -0.3, 1.6, -1.4];
@@ -2617,8 +2617,6 @@ mod jet_tower_oracle_tests {
         let w = [1.0_f64, 0.8, 1.3, 0.9, 1.1, 0.7, 1.4];
         let probit_scale = 1.0_f64;
         let n = eta.len();
-        // Precompute the marginal link maps once (both paths receive them in
-        // production), so the loop measures only the kernel itself.
         let maps: Vec<BernoulliMarginalLinkMap> = (0..n)
             .map(|r| {
                 bernoulli_marginal_link_map(
@@ -2629,56 +2627,23 @@ mod jet_tower_oracle_tests {
             })
             .collect();
 
-        let reps: usize = 3_000_000;
-        // Warm both paths.
-        let mut acc = 0.0_f64;
+        let mut max_diff = 0.0_f64;
         for r in 0..n {
-            let (v, gr, h) = hand_rigid_vgh(maps[r], g[r], z[r], y[r], w[r], probit_scale);
-            acc += v + gr[0] + h[0][0];
-            let (v, gr, h) =
+            let (hv, hg, hh) = hand_rigid_vgh(maps[r], g[r], z[r], y[r], w[r], probit_scale);
+            let (jv, jg, jh) =
                 rigid_standard_normal_row_kernel(maps[r], g[r], z[r], y[r], w[r], probit_scale)
                     .unwrap();
-            acc += v + gr[0] + h[0][0];
-        }
-        black_box(acc);
-
-        let mut best_hand = f64::INFINITY;
-        let mut best_jet = f64::INFINITY;
-        for _trial in 0..5 {
-            let t0 = Instant::now();
-            let mut a = 0.0_f64;
-            for _ in 0..reps {
-                for r in 0..n {
-                    let (v, gr, h) =
-                        hand_rigid_vgh(maps[r], g[r], z[r], y[r], w[r], probit_scale);
-                    a += v + gr[0] + gr[1] + h[0][0] + h[0][1] + h[1][1];
+            max_diff = max_diff.max((hv - jv).abs());
+            for i in 0..hg.len() {
+                max_diff = max_diff.max((hg[i] - jg[i]).abs());
+                for j in 0..hg.len() {
+                    max_diff = max_diff.max((hh[i][j] - jh[i][j]).abs());
                 }
             }
-            black_box(a);
-            best_hand = best_hand.min(t0.elapsed().as_secs_f64());
-
-            let t1 = Instant::now();
-            let mut b = 0.0_f64;
-            for _ in 0..reps {
-                for r in 0..n {
-                    let (v, gr, h) = rigid_standard_normal_row_kernel(
-                        maps[r], g[r], z[r], y[r], w[r], probit_scale,
-                    )
-                    .unwrap();
-                    b += v + gr[0] + gr[1] + h[0][0] + h[0][1] + h[1][1];
-                }
-            }
-            black_box(b);
-            best_jet = best_jet.min(t1.elapsed().as_secs_f64());
         }
-        let rows = (reps * n) as f64;
-        let hand_ns = best_hand / rows * 1e9;
-        let jet_ns = best_jet / rows * 1e9;
-        eprintln!(
-            "RIGID v/g/H K=2: hand={hand_ns:.2} ns/row  jet={jet_ns:.2} ns/row  \
-             jet/hand={:.3}x ({} rows)",
-            jet_ns / hand_ns,
-            rows as u64
+        assert!(
+            max_diff <= 1e-12,
+            "rigid jet vs hand v/g/H mismatch: max_diff={max_diff:.3e}"
         );
     }
 }
