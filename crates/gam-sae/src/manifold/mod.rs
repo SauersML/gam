@@ -160,6 +160,9 @@ mod tests_deflation_traces_780;
 mod tests_isometry_exact_hvp_majorizer_457;
 
 #[cfg(test)]
+mod tests_collapse_bar_reachable_rank_1610;
+
+#[cfg(test)]
 mod sae_contract_probe_tests;
 
 #[cfg(test)]
