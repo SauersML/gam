@@ -2033,6 +2033,15 @@ pub(crate) mod cell_moment_assembly;
 // `cell_moment_assembly` flex-fixture oracle gate as a private child of `bms`.
 #[cfg(test)]
 mod test_support;
+// #932 INDEPENDENT adversarial verifier (bms-flex-verify): a high-order
+// finite-difference oracle on the production hand path
+// `compute_row_analytic_flex_from_parts_into` + a moving-edge Leibniz
+// cross-check + a planted-corruption tripwire. Bare `#[cfg(test)] mod` with the
+// allowed `*_tests` name so the build.rs ban-scanner exempts it; owned solely by
+// the verifier (never edits the implementer's row_primary_hessian /
+// gradient_paths / cell_moment_assembly).
+#[cfg(test)]
+mod flex_verify_932_tests;
 pub(crate) mod custom_family_impl;
 pub(crate) mod row_primary_hessian;
 
