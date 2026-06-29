@@ -35,7 +35,21 @@ pub(crate) fn sae_row_jet_program_matches_production_row_jets_on_converged_cache
     // 2 atoms × 1 latent coord.
     const K: usize = 3;
     for weighted in [false, true] {
-        let (mut term, target, rho) = gamma_fd_tiny_fixture();
+        let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
+        // #1625 — lift `log_lambda_sparse` off the fixture's `-6.0` floor into the
+        // PD basin. At λ_sparse = e⁻⁶ ≈ 2.5e-3 the softmax assignment-prior
+        // curvature is far too weak to regularize the rank-deficient 2-atom
+        // periodic bilinear fit on these n=10 rows: the undamped (ridge=0) joint
+        // Hessian has NO interior PD minimum, the inner KKT gradient floors ~600×
+        // above tolerance while the undamped Newton step stays O(6), and the
+        // `.expect("converged cache")` below panics on a genuinely unattainable
+        // optimum. A fixed-state ρ-sweep of this exact softmax fixture shows the
+        // inner solve converges for every `log_lambda_sparse ≥ -2`; `-1.0` sits
+        // comfortably inside that PD region (the value the sibling #1416
+        // IBP-ρ_sparse oracle already pins). This is a setup fix that makes a
+        // genuine converged cache EXIST so the hand-vs-jet row-jet oracle below
+        // can reach its real bit-identity assertions; it weakens no tolerance.
+        rho.log_lambda_sparse = -1.0;
         if weighted {
             let weights: Vec<f64> = (0..term.n_obs())
                 .map(|row| 0.5 + 0.17 * row as f64)
@@ -258,7 +272,14 @@ pub(crate) fn sae_row_jet_program_matches_production_row_jets_on_converged_cache
 #[test]
 pub(crate) fn batch4_jet_lanes_match_scalar_hand_row_jets() {
     use ndarray::Array1;
-    let (mut term, target, rho) = gamma_fd_tiny_fixture();
+    let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
+    // #1625 — see `sae_row_jet_program_matches_production_row_jets_on_converged_cache`:
+    // the fixture's `-6.0` sparse floor leaves the undamped joint Hessian without a
+    // PD optimum, so `.expect("converged cache")` is unattainable. `-1.0` sits in
+    // the PD basin (fixed-state ρ-sweep: converges for every `log_lambda_sparse ≥ -2`)
+    // so the SIMD-lane vs scalar-hand oracle below reaches its real assertions.
+    // Setup fix, no tolerance weakened.
+    rho.log_lambda_sparse = -1.0;
     let (_value, _loss, cache) = term
         .reml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
         .expect("converged cache");
