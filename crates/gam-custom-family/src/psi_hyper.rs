@@ -116,13 +116,96 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
             let beta_block = beta_flat.slice(ndarray::s![start..end]);
             let s_psi_beta_local = s_psi_local.dot(&beta_block);
             let a_penalty_quadratic = 0.5 * beta_block.dot(&s_psi_beta_local);
-            let a = psi_terms.objective_psi + a_penalty_quadratic;
+            let mut a = psi_terms.objective_psi + a_penalty_quadratic;
+
+            // EXPLICIT Firth VALUE ψ-derivative (gam#1607). The outer LAML cost folds
+            // `−Φ(β̂)` where `Φ = ½ log|Z_Jᵀ H_info Z_J|₊` (gated), and the Jeffreys
+            // information `H_info` is the data joint Hessian — so for a ψ hyperparameter
+            // that reshapes the design (matern/duchon length-scale) it depends on ψ
+            // EXPLICITLY, with `∂_ψ H_info|_β` the family's ψ-Hessian derivative (the
+            // dense `hessian_psi`, or the materialized operator when the workspace path
+            // streams it). The companion CURVATURE term `∂_ψ H_Φ` is added to the dense
+            // drift below (gam#854); but the VALUE term `−∂_ψΦ` was dropped on EVERY ψ
+            // axis (and entirely on the operator path), leaving the outer ψ-gradient
+            // short by the full Firth value motion (dominant on the spatial axis). The
+            // helper returns `0.0` when the conditioning gate skips the term, so a clean
+            // / well-conditioned fit is byte-unchanged.
+            // `∂_ψ H_info|_β` (the explicit ψ-derivative of the Jeffreys information),
+            // materialized once and reused for BOTH the VALUE gradient term `−∂_ψΦ`
+            // (here) and the Hessian β-coupling term `−∂_β∂_ψΦ` (the score below).
+            let firth_pert_info: Option<Array2<f64>> = if jeffreys_hphi_ctx.is_some() {
+                if let Some(op) = psi_terms.hessian_psi_operator.as_ref() {
+                    Some(op.mul_mat(&ndarray::Array2::<f64>::eye(total)))
+                } else if psi_terms.hessian_psi.nrows() == total
+                    && psi_terms.hessian_psi.ncols() == total
+                {
+                    Some(psi_terms.hessian_psi.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let (Some((z_j, h_joint)), Some(pert_info)) =
+                (jeffreys_hphi_ctx.as_ref(), firth_pert_info.as_ref())
+            {
+                let phi_psi =
+                    gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_phi_explicit_param_derivative(
+                        h_joint.view(),
+                        z_j.view(),
+                        pert_info,
+                    )?;
+                a -= phi_psi;
+            }
             // Embed s_psi_beta into full p-vector for the score.
             let mut s_psi_beta = Array1::zeros(total);
             s_psi_beta
                 .slice_mut(ndarray::s![start..end])
                 .assign(&s_psi_beta_local);
-            let g = &psi_terms.score_psi + &s_psi_beta;
+            let mut g = &psi_terms.score_psi + &s_psi_beta;
+
+            // EXPLICIT Firth Hessian β-COUPLING (gam#1607). The outer Hessian's
+            // mode-response term is `−g_ψ·β̇`, with the coord score `g_ψ = ∂_β∂_ψV|_β`.
+            // The Firth value `−Φ(β̂)` contributes `−∂_β∂_ψΦ` to that score (β̂ moves
+            // with ψ as the length-scale reshapes the design, so the Firth value's
+            // ψ-gradient has a genuine β-response), EXACTLY mirroring the ρ-coord path
+            // (`g_j -= gphi_τ`, gam#854/#979). The per-β-axis mixed second derivative
+            // `∂_β_a∂_ψΦ` is the validated explicit second-derivative helper applied to
+            // the perturbation pair `(∂_ψH_info, ∂_β_a H_info = Hdot[e_a])` with mixed
+            // `∂_ψ∂_β_a H_info = ∂_ψHdot[e_a]` — the SAME family directional derivatives
+            // the `∂_ψH_Φ` curvature term consumes. The helper returns `0.0` when the
+            // conditioning gate skips the term, so a clean fit is byte-unchanged.
+            if let (Some((z_j, h_joint)), Some(pert_info)) =
+                (jeffreys_hphi_ctx.as_ref(), firth_pert_info.as_ref())
+            {
+                for a_idx in 0..total {
+                    let mut e_a = Array1::<f64>::zeros(total);
+                    e_a[a_idx] = 1.0;
+                    let hdot_a = family.joint_jeffreys_information_directional_derivative_with_specs(
+                        synced_states,
+                        specs,
+                        &e_a,
+                    )?;
+                    let psi_hdot_a = family.exact_newton_joint_psihessian_directional_derivative(
+                        synced_states,
+                        specs,
+                        derivative_blocks,
+                        psi_global,
+                        &e_a,
+                    )?;
+                    if let (Some(hdot_a), Some(psi_hdot_a)) = (hdot_a, psi_hdot_a) {
+                        let phi_psi_beta_a =
+                            gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_phi_explicit_param_second_derivative(
+                                h_joint.view(),
+                                z_j.view(),
+                                pert_info,
+                                &hdot_a,
+                                &psi_hdot_a,
+                            )?;
+                        g[a_idx] -= phi_psi_beta_a;
+                    }
+                }
+            }
             let ld_s = if let Some(blocks) = s_logdet_blocks {
                 blocks[block_idx].tau_gradient_component(&s_psi_local)
             } else {
@@ -228,6 +311,38 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
 /// `pub(crate)` so the #740 in-crate gate
 /// `bernoulli_contracted_psi_hook_matches_per_pair_with_penalty` can assert the
 /// generic penalty fold here equals `Σ_j α_j · build_psi_pair_callbacks().ext_ext(i, j)`.
+///
+/// Build the `(Z_J, H_info)` joint-Jeffreys/Firth context (gam#1607), mirroring
+/// the inline construction in [`build_psi_hyper_coords`]. Returns `None` unless
+/// the family uses the joint-Jeffreys term and exposes a dense joint Hessian, so
+/// every non-Jeffreys / operator-only family is byte-unchanged.
+pub fn build_jeffreys_hphi_ctx<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: &F,
+    synced_states: &[ParameterBlockState],
+    specs: &[ParameterBlockSpec],
+    derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+    total: usize,
+) -> Result<Option<(Array2<f64>, Array2<f64>)>, String> {
+    if family.joint_jeffreys_term_required()
+        && derivative_blocks.iter().any(|block| !block.is_empty())
+    {
+        let ranges = block_param_ranges(specs);
+        Ok(match (
+            build_joint_jeffreys_subspace(specs, &ranges)?,
+            family.joint_jeffreys_information_with_specs(synced_states, specs)?,
+        ) {
+            (Some(z), Some(h))
+                if z.nrows() == total && h.nrows() == total && h.ncols() == total =>
+            {
+                Some((z, h))
+            }
+            _ => None,
+        })
+    } else {
+        Ok(None)
+    }
+}
+
 pub fn build_contracted_psi_hook(
     specs: &[ParameterBlockSpec],
     derivative_blocks: SharedDerivativeBlocks,
@@ -236,6 +351,7 @@ pub fn build_contracted_psi_hook(
     penalty_counts: &[usize],
     s_logdet_blocks: Option<&[PenaltyPseudologdet]>,
     psi_workspace: Option<Arc<dyn ExactNewtonJointPsiWorkspace>>,
+    jeffreys_ctx: Option<(Array2<f64>, Array2<f64>)>,
 ) -> Result<Option<ContractedPsiSecondOrderFn>, String> {
     // The contraction is a representation/cost choice for the family likelihood
     // ψψ second-order; without a contracted family kernel there is nothing to
@@ -313,6 +429,72 @@ pub fn build_contracted_psi_hook(
 
     let derivative_blocks = Arc::clone(&derivative_blocks);
 
+    // EXPLICIT Firth/Jeffreys ψψ VALUE second derivative context (gam#1607). The
+    // outer LAML cost folds `−Φ(β̂)` with `Φ = ½ log|Z_Jᵀ H_info Z_J|₊` (gated),
+    // and for a ψ length-scale that reshapes the design `H_info` depends on ψ
+    // EXPLICITLY. The outer-Hessian ψψ block therefore needs the explicit second
+    // derivative `−∂²_ψΦ` folded into each per-direction `objective[i]` (the
+    // companion to the value gradient term `−∂_ψΦ` wired in
+    // `build_psi_hyper_coords`). The exact contracted form for output row `i` and
+    // applied ψ-direction `ψ(α)` is `−∂_{ψ_i}∂_{ψ(α)}Φ`, which the validated
+    // Daleckii–Krein helper computes bilinearly from the three perturbations
+    // `∂_{ψ_i}H_info`, `∂_{ψ(α)}H_info = Σ_j α_j ∂_{ψ_j}H_info`, and
+    // `∂_{ψ_i}∂_{ψ(α)}H_info` (the contracted likelihood `hessian[i]`). We
+    // precompute the per-axis first derivatives `∂_{ψ_j}H_info` here (β-fixed,
+    // data-only — no penalty drift, matching the unpenalized Jeffreys info).
+    // `None` (no Jeffreys term, or first-order terms unavailable) leaves a clean
+    // / well-conditioned fit byte-unchanged.
+    let firth_ctx: Option<(Arc<Array2<f64>>, Arc<Array2<f64>>, Arc<Vec<Array2<f64>>>)> =
+        match jeffreys_ctx {
+            Some((z_j, h_joint))
+                if z_j.nrows() == total && h_joint.nrows() == total && h_joint.ncols() == total =>
+            {
+                let first_terms: Option<Vec<ExactNewtonJointPsiTerms>> =
+                    match workspace.first_order_terms_all()? {
+                        Some(all) if all.len() == psi_dim => Some(all),
+                        _ => {
+                            let mut per_axis = Vec::with_capacity(psi_dim);
+                            let mut ok = true;
+                            for j in 0..psi_dim {
+                                match workspace.first_order_terms(j)? {
+                                    Some(t) => per_axis.push(t),
+                                    None => {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if ok { Some(per_axis) } else { None }
+                        }
+                    };
+                match first_terms {
+                    Some(terms) => {
+                        let mut pert_first: Vec<Array2<f64>> = Vec::with_capacity(psi_dim);
+                        let mut ok = true;
+                        for t in &terms {
+                            if let Some(op) = t.hessian_psi_operator.as_ref() {
+                                pert_first.push(op.mul_mat(&Array2::<f64>::eye(total)));
+                            } else if t.hessian_psi.nrows() == total
+                                && t.hessian_psi.ncols() == total
+                            {
+                                pert_first.push(t.hessian_psi.clone());
+                            } else {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if ok {
+                            Some((Arc::new(z_j), Arc::new(h_joint), Arc::new(pert_first)))
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                }
+            }
+            _ => None,
+        };
+
     let hook = move |alpha_psi: &[f64]| -> Result<Option<ContractedPsiSecondOrder>, String> {
         if alpha_psi.len() != psi_dim {
             return Err(format!(
@@ -382,6 +564,35 @@ pub fn build_contracted_psi_hook(
                 let mut slot = score_local.slice_mut(s![axis_i.start..axis_i.end]);
                 slot += &s_beta;
             }
+            // EXPLICIT Firth/Jeffreys ψψ VALUE second derivative (gam#1607):
+            //   objective[i] -= ∂_{ψ_i}∂_{ψ(α)}Φ
+            // computed from the β-fixed perturbations `∂_{ψ_i}H_info` (pert_first[i]),
+            // `∂_{ψ(α)}H_info = Σ_j α_j ∂_{ψ_j}H_info`, and the contracted likelihood
+            // second derivative `∂_{ψ_i}∂_{ψ(α)}H_info` (= `hessian[i]` BEFORE the
+            // penalty drift below — the Jeffreys info is the unpenalized data
+            // Hessian, so the `S_{ψ_i ψ_j}` motion must NOT enter it).
+            if let Some((z_j, h_joint, pert_first)) = firth_ctx.as_ref() {
+                let pert_i_alpha = match &hessian[i] {
+                    DriftDerivResult::Dense(m) => m.clone(),
+                    DriftDerivResult::Operator(op) => op.mul_mat(&Array2::<f64>::eye(total)),
+                };
+                let mut pert_alpha = Array2::<f64>::zeros((total, total));
+                for (j, &aj) in alpha_psi.iter().enumerate() {
+                    if aj != 0.0 {
+                        pert_alpha.scaled_add(aj, &pert_first[j]);
+                    }
+                }
+                let phi_psi_psi =
+                    gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_phi_explicit_param_second_derivative(
+                        h_joint.view(),
+                        z_j.view(),
+                        &pert_first[i],
+                        &pert_alpha,
+                        &pert_i_alpha,
+                    )?;
+                objective[i] -= phi_psi_psi;
+            }
+
             // hessian[i] += S_{ψi ψ(α)} as a block-local drift (matches the
             // ext_ext `b_operator` BlockLocalDrift composite).
             let block_drift: Arc<dyn HyperOperator> = Arc::new(BlockLocalDrift {
@@ -1284,6 +1495,13 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
                     // matvec. `None` (no contracted family kernel) keeps the exact
                     // per-pair `ext_ext_fn` path. Built before the drift callback
                     // moves `psi_workspace`.
+                    let contracted_jeffreys_ctx = build_jeffreys_hphi_ctx(
+                        family,
+                        synced_joint_states.as_ref(),
+                        specs,
+                        derivative_blocks.as_ref(),
+                        beta_flat.len(),
+                    )?;
                     let contracted_psi_fn = build_contracted_psi_hook(
                         specs,
                         Arc::clone(&derivative_blocks),
@@ -1292,6 +1510,7 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
                         penalty_counts,
                         s_logdet_blocks.as_deref(),
                         psi_workspace.clone(),
+                        contracted_jeffreys_ctx,
                     )?;
                     let drift_fn = build_psi_drift_deriv_callback(
                         family,

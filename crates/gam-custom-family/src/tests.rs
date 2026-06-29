@@ -2109,6 +2109,7 @@ pub(crate) fn contracted_psi_hook_declines_partial_axis_coverage_before_pair_tab
         &[0],
         None,
         Some(Arc::new(PartialContractedPsiWorkspace)),
+        None,
     )
     .expect("partial contracted psi hook probe should not error");
 
@@ -2189,6 +2190,7 @@ pub(crate) fn contracted_psi_hook_rejects_wrong_score_width_before_installing_op
         &[0],
         None,
         Some(Arc::new(WrongScoreWidthPsiWorkspace)),
+        None,
     ) {
         Ok(_) => panic!("wrong contracted score width must be rejected before hook install"),
         Err(err) => err,

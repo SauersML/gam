@@ -1387,6 +1387,7 @@ fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
         &penalty_counts,
         Some(&s_logdet_blocks),
         Some(std::sync::Arc::clone(&psi_workspace)),
+        None,
     )
     .expect("contracted hook build")
     .expect("contracted hook some (likelihood kernel available)");
@@ -1503,6 +1504,7 @@ fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
         &penalty_counts,
         Some(&s_logdet_blocks),
         Some(std::sync::Arc::clone(&psi_workspace)),
+        None,
     )
     .expect("no-penalty hook build")
     .expect("no-penalty hook some");
