@@ -4639,4 +4639,127 @@ mod empirical_flex_jet_oracle_tests {
             }
         }
     }
+
+    /// #932 P3 GATE (step 1, direct hand-vs-jet certificate): the single-source
+    /// runtime-jet flex row NLL ([`empirical_flex_row_nll_jet2`]) reproduces the
+    /// production HAND path `compute_row_analytic_flex_from_parts_into` — value,
+    /// dense `r`-gradient, AND full `r×r` Hessian — to ≤1e-9 on the
+    /// empirical-grid branch (the branch the empirical fixture routes the hand
+    /// path through). This pins the jet against the EXACT function the cutover
+    /// will replace, exercising the entire shared assembly the hand path runs:
+    /// the calibration moments `f_u/f_au/f_uv/f_aa`, the implicit-function-theorem
+    /// intercept lift `a(θ)` (`a_u`/`a_uv`), the observed-index chain
+    /// `η_u = χ·a_u + ρ` / `η_uv = χ·a_uv + η_aa·a_u·a_v + τ_u·a_v + a_u·τ_v + r_uv`,
+    /// and the signed-probit Mills finalization — over r ~ 2 + basis_dim primaries
+    /// with score-warp OR link-wiggle active, deaths (y=1) at the observed row.
+    /// A dropped IFT / Leibniz / Faà di Bruno term in either path blows the bound.
+    #[test]
+    fn empirical_flex_row_nll_jet2_matches_hand_path_932() {
+        for is_score_warp in [true, false] {
+            let fx = make_fixture(is_score_warp);
+            let r = fx.primary.total;
+            let q0 = 0.2_f64;
+            let b0 = 0.35_f64;
+            let mut p0 = vec![0.0; r];
+            p0[fx.primary.q] = q0;
+            p0[fx.primary.logslope] = b0;
+            let dev_range = if is_score_warp {
+                fx.primary.h.clone().unwrap()
+            } else {
+                fx.primary.w.clone().unwrap()
+            };
+            for (k, i) in dev_range.clone().enumerate() {
+                p0[i] = fx.beta_dev[k];
+            }
+            let label = if is_score_warp { "score-warp" } else { "link-dev" };
+
+            let beta: Array1<f64> = Array1::from_iter(dev_range.clone().map(|i| p0[i]));
+            let (beta_h, beta_w) = if is_score_warp {
+                (Some(&beta), None)
+            } else {
+                (None, Some(&beta))
+            };
+            let scale = fx.family.probit_frailty_scale();
+            let marginal = bernoulli_marginal_link_map(
+                &InverseLink::Standard(gam_problem::StandardLink::Probit),
+                q0,
+            )
+            .expect("link map");
+
+            // Converged scalar intercept root (the IFT/lift order-0 anchor) and the
+            // calibration Jacobian F_a = Σ_k π_k φ(η₀)·∂η/∂a — the exact `m_a` the
+            // hand IFT divides by, computed identically to the jet's internal F_a.
+            let a0 = witness_intercept(&fx, marginal.mu, b0, &beta, scale);
+            let basis_arg = |node: f64| -> f64 {
+                if is_score_warp {
+                    node
+                } else {
+                    a0 + b0 * node
+                }
+            };
+            let mut f_a = 0.0_f64;
+            for (node, weight) in fx.grid.pairs() {
+                let eta0 = witness_eta(&fx, a0, b0, &beta, node, scale);
+                let eta0_a = if is_score_warp {
+                    scale
+                } else {
+                    let stacks = witness_basis_stacks_at(&fx, basis_arg(node));
+                    let mut s = 1.0_f64;
+                    for (j, stack) in stacks.iter().enumerate() {
+                        s += beta[j] * stack[1];
+                    }
+                    scale * s
+                };
+                f_a += weight * witness_normal_pdf(eta0) * eta0_a;
+            }
+            let row_ctx = BernoulliMarginalSlopeRowExactContext {
+                intercept: a0,
+                m_a: f_a,
+                intercept_fast_path: false,
+                degree9_cells: None,
+            };
+
+            let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(r);
+            let neglog = fx
+                .family
+                .compute_row_analytic_flex_from_parts_into(
+                    0,
+                    &fx.primary,
+                    q0,
+                    b0,
+                    beta_h,
+                    beta_w,
+                    &row_ctx,
+                    None,
+                    None,
+                    true,
+                    &mut scratch,
+                )
+                .expect("hand flex path");
+
+            let jet = empirical_flex_row_nll_jet2(&fx, &p0);
+
+            assert!(
+                (neglog - jet.v).abs() <= 1e-9 * jet.v.abs().max(1.0),
+                "{label} value: hand {neglog:+.12e} != jet {:+.12e}",
+                jet.v,
+            );
+            for u in 0..r {
+                assert!(
+                    (scratch.grad[u] - jet.g[u]).abs() <= 1e-9 * jet.g[u].abs().max(1.0),
+                    "{label} grad[{u}]: hand {:+.12e} != jet {:+.12e}",
+                    scratch.grad[u],
+                    jet.g[u],
+                );
+                for v in 0..r {
+                    let h_hand = scratch.hess[[u, v]];
+                    let h_jet = jet.h[u * r + v];
+                    assert!(
+                        (h_hand - h_jet).abs() <= 1e-9 * h_jet.abs().max(1.0),
+                        "{label} hess[{u},{v}]: hand {h_hand:+.12e} != jet {h_jet:+.12e}"
+                    );
+                }
+            }
+        }
+    }
 }
