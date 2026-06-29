@@ -4765,18 +4765,15 @@ mod fused_jet2_oracle_tests {
 }
 
 #[cfg(test)]
-mod hand_vs_jet_bench_tests {
-    //! #932 SPEED AUDIT: shipped jet value/grad/Hessian (`fused_row_nll_jet2` +
-    //! the `fused_inputs_from_view` input copies the production
-    //! `flex_row_nll_value_grad_hess` pays) vs the ORIGINAL HAND probit-chain +
-    //! quotient-rule assembly it replaced (recovered verbatim from the pre-cutover
-    //! commit `b17785d2a~1`, `flex_sensitivity.rs`). Measures ns/row at
-    //! p∈{6,12,24}, asserts ≤1e-12 channel agreement, and quantifies the
-    //! transcendental fraction (the 2×logΦ + 2×neglog-deriv calls both paths share).
+mod hand_vs_jet_agreement_tests {
+    //! #932 AGREEMENT GATE: the shipped jet value/grad/Hessian (`fused_row_nll_jet2`
+    //! + the `fused_inputs_from_view` input copies the production
+    //! `flex_row_nll_value_grad_hess` pays) reproduces, to ≤1e-12 on every channel,
+    //! the ORIGINAL HAND probit-chain + quotient-rule assembly it replaced
+    //! (recovered verbatim from the pre-cutover commit `b17785d2a~1`,
+    //! `flex_sensitivity.rs`) across p∈{6,12,24}.
     use super::*;
     use ndarray::{Array1, Array2};
-    use std::hint::black_box;
-    use std::time::Instant;
 
     fn xorshift(state: &mut u64) -> f64 {
         let mut x = *state;
@@ -4788,24 +4785,23 @@ mod hand_vs_jet_bench_tests {
         2.0 * u - 1.0
     }
 
-    /// The ORIGINAL HAND value/grad/Hessian assembly (verbatim from
-    /// `b17785d2a~1` `flex_sensitivity.rs`): sparse single-pass grad loop +
-    /// upper-triangle Hessian loop reading the timepoint `*_u`/`*_uv` ndarrays
-    /// directly (NO contiguous copy). Pays its own 2×logΦ + 2×neglog-deriv calls.
-    #[allow(clippy::too_many_arguments)]
-    fn hand_vgh(
+    /// One flex row's timepoint derivative inputs (the `*_u`/`*_uv` first/second
+    /// partials of each link channel, plus the q/qd seed indices). Bundled into a
+    /// struct so the hand/jet witnesses take a single argument instead of 19
+    /// positional ones.
+    struct RowInputs {
         eta0: f64,
-        eta0_u: &Array1<f64>,
-        eta0_uv: &Array2<f64>,
+        eta0_u: Array1<f64>,
+        eta0_uv: Array2<f64>,
         eta1: f64,
-        eta1_u: &Array1<f64>,
-        eta1_uv: &Array2<f64>,
+        eta1_u: Array1<f64>,
+        eta1_uv: Array2<f64>,
         chi1: f64,
-        chi1_u: &Array1<f64>,
-        chi1_uv: &Array2<f64>,
+        chi1_u: Array1<f64>,
+        chi1_uv: Array2<f64>,
         d1: f64,
-        d1_u: &Array1<f64>,
-        d1_uv: &Array2<f64>,
+        d1_u: Array1<f64>,
+        d1_uv: Array2<f64>,
         q1: f64,
         qd1: f64,
         wi: f64,
@@ -4813,7 +4809,20 @@ mod hand_vs_jet_bench_tests {
         q1_idx: usize,
         qd1_idx: usize,
         p: usize,
-    ) -> (f64, Array1<f64>, Array2<f64>) {
+    }
+
+    /// The ORIGINAL HAND value/grad/Hessian assembly (verbatim from
+    /// `b17785d2a~1` `flex_sensitivity.rs`): sparse single-pass grad loop +
+    /// upper-triangle Hessian loop reading the timepoint `*_u`/`*_uv` ndarrays
+    /// directly (NO contiguous copy). Pays its own 2×logΦ + 2×neglog-deriv calls.
+    fn hand_vgh(r: &RowInputs) -> (f64, Array1<f64>, Array2<f64>) {
+        let (eta0, eta1, chi1, d1, q1, qd1, wi, di, q1_idx, qd1_idx, p) = (
+            r.eta0, r.eta1, r.chi1, r.d1, r.q1, r.qd1, r.wi, r.di, r.q1_idx, r.qd1_idx, r.p,
+        );
+        let (eta0_u, eta0_uv) = (&r.eta0_u, &r.eta0_uv);
+        let (eta1_u, eta1_uv) = (&r.eta1_u, &r.eta1_uv);
+        let (chi1_u, chi1_uv) = (&r.chi1_u, &r.chi1_uv);
+        let (d1_u, d1_uv) = (&r.d1_u, &r.d1_uv);
         let (log_surv0, _) = signed_probit_logcdf_and_mills_ratio(-eta0);
         let (log_surv1, _) = signed_probit_logcdf_and_mills_ratio(-eta1);
         let (entry_k1, entry_k2, _, _) =
@@ -4876,28 +4885,14 @@ mod hand_vs_jet_bench_tests {
     /// The SHIPPED JET path: surv stacks + the `fused_inputs_from_view` contiguous
     /// copies + `fused_row_nll_jet2` (the exact body of the `want_hess` branch of
     /// `flex_row_nll_value_grad_hess`).
-    #[allow(clippy::too_many_arguments)]
-    fn jet_vgh(
-        eta0: f64,
-        eta0_u: &Array1<f64>,
-        eta0_uv: &Array2<f64>,
-        eta1: f64,
-        eta1_u: &Array1<f64>,
-        eta1_uv: &Array2<f64>,
-        chi1: f64,
-        chi1_u: &Array1<f64>,
-        chi1_uv: &Array2<f64>,
-        d1: f64,
-        d1_u: &Array1<f64>,
-        d1_uv: &Array2<f64>,
-        q1: f64,
-        qd1: f64,
-        wi: f64,
-        di: f64,
-        q1_idx: usize,
-        qd1_idx: usize,
-        p: usize,
-    ) -> (f64, Array1<f64>, Array2<f64>) {
+    fn jet_vgh(r: &RowInputs) -> (f64, Array1<f64>, Array2<f64>) {
+        let (eta0, eta1, chi1, d1, q1, qd1, wi, di, q1_idx, qd1_idx, p) = (
+            r.eta0, r.eta1, r.chi1, r.d1, r.q1, r.qd1, r.wi, r.di, r.q1_idx, r.qd1_idx, r.p,
+        );
+        let (eta0_u, eta0_uv) = (&r.eta0_u, &r.eta0_uv);
+        let (eta1_u, eta1_uv) = (&r.eta1_u, &r.eta1_uv);
+        let (chi1_u, chi1_uv) = (&r.chi1_u, &r.chi1_uv);
+        let (d1_u, d1_uv) = (&r.d1_u, &r.d1_uv);
         let surv0 = surv_stack(eta0).unwrap();
         let surv1 = surv_stack(eta1).unwrap();
         let (e0g, e0h) = fused_inputs_from_view(eta0_u.view(), eta0_uv.view(), p);
@@ -4932,28 +4927,7 @@ mod hand_vs_jet_bench_tests {
         (value, grad, hess)
     }
 
-    type Row = (
-        f64,
-        Array1<f64>,
-        Array2<f64>,
-        f64,
-        Array1<f64>,
-        Array2<f64>,
-        f64,
-        Array1<f64>,
-        Array2<f64>,
-        f64,
-        Array1<f64>,
-        Array2<f64>,
-        f64,
-        f64,
-        f64,
-        f64,
-        usize,
-        usize,
-    );
-
-    fn make_row(p: usize, st: &mut u64) -> Row {
+    fn make_row(p: usize, st: &mut u64) -> RowInputs {
         // Moderate η so logΦ / Mills are well-conditioned; χ,D strictly positive.
         let eta0 = 0.4 * xorshift(st);
         let eta1 = 0.4 * xorshift(st);
@@ -4983,28 +4957,43 @@ mod hand_vs_jet_bench_tests {
         let chh = mk_h(st);
         let dg = mk_g(st);
         let dh = mk_h(st);
-        (
-            eta0, e0g, e0h, eta1, e1g, e1h, chi1, cg, chh, d1, dg, dh, q1, qd1, wi, di, p - 2,
-            p - 1,
-        )
+        RowInputs {
+            eta0,
+            eta0_u: e0g,
+            eta0_uv: e0h,
+            eta1,
+            eta1_u: e1g,
+            eta1_uv: e1h,
+            chi1,
+            chi1_u: cg,
+            chi1_uv: chh,
+            d1,
+            d1_u: dg,
+            d1_uv: dh,
+            q1,
+            qd1,
+            wi,
+            di,
+            q1_idx: p - 2,
+            qd1_idx: p - 1,
+            p,
+        }
     }
 
+    /// #932 bit-identity gate: the single-source `Jet2` flex row v/g/H
+    /// (`jet_vgh`) reproduces the original HAND assembly (`hand_vgh`) to ≤1e-12
+    /// on value, gradient, and Hessian across p∈{6,12,24} and 256 random rows
+    /// each. (The ns/row throughput comparison this gate used to carry lives in
+    /// `bench/`, not in a `#[test]`.)
     #[test]
-    fn hand_vs_jet_vgh_bitident_and_timing() {
+    fn hand_vs_jet_vgh_bit_identical() {
         for &p in &[6usize, 12, 24] {
             let mut st = 0xA1B2_C3D4_E5F6_0718u64 ^ (p as u64).wrapping_mul(0x9E3779B97F4A7C15);
             let mut max_diff = 0.0f64;
-            let mut rows: Vec<Row> = Vec::new();
             for _ in 0..256 {
                 let r = make_row(p, &mut st);
-                let (h_v, h_g, h_h) = hand_vgh(
-                    r.0, &r.1, &r.2, r.3, &r.4, &r.5, r.6, &r.7, &r.8, r.9, &r.10, &r.11, r.12,
-                    r.13, r.14, r.15, r.16, r.17, p,
-                );
-                let (j_v, j_g, j_h) = jet_vgh(
-                    r.0, &r.1, &r.2, r.3, &r.4, &r.5, r.6, &r.7, &r.8, r.9, &r.10, &r.11, r.12,
-                    r.13, r.14, r.15, r.16, r.17, p,
-                );
+                let (h_v, h_g, h_h) = hand_vgh(&r);
+                let (j_v, j_g, j_h) = jet_vgh(&r);
                 max_diff = max_diff.max((h_v - j_v).abs());
                 for u in 0..p {
                     max_diff = max_diff.max((h_g[u] - j_g[u]).abs());
@@ -5012,74 +5001,10 @@ mod hand_vs_jet_bench_tests {
                         max_diff = max_diff.max((h_h[[u, v]] - j_h[[u, v]]).abs());
                     }
                 }
-                rows.push(r);
             }
             assert!(
                 max_diff <= 1e-12,
                 "hand vs jet channel mismatch p={p}: max_diff={max_diff:.3e}"
-            );
-
-            let iters = 200_000usize / p;
-            let n = rows.len();
-            for r in &rows {
-                let (_, g, h) = hand_vgh(
-                    r.0, &r.1, &r.2, r.3, &r.4, &r.5, r.6, &r.7, &r.8, r.9, &r.10, &r.11, r.12,
-                    r.13, r.14, r.15, r.16, r.17, p,
-                );
-                black_box((g, h));
-                let (_, g, h) = jet_vgh(
-                    r.0, &r.1, &r.2, r.3, &r.4, &r.5, r.6, &r.7, &r.8, r.9, &r.10, &r.11, r.12,
-                    r.13, r.14, r.15, r.16, r.17, p,
-                );
-                black_box((g, h));
-            }
-
-            let t0 = Instant::now();
-            for k in 0..iters {
-                let r = &rows[k % n];
-                let out = hand_vgh(
-                    black_box(r.0), &r.1, &r.2, black_box(r.3), &r.4, &r.5, black_box(r.6), &r.7,
-                    &r.8, black_box(r.9), &r.10, &r.11, black_box(r.12), black_box(r.13),
-                    black_box(r.14), black_box(r.15), r.16, r.17, p,
-                );
-                black_box(out);
-            }
-            let hand_ns = t0.elapsed().as_nanos() as f64 / iters as f64;
-
-            let t1 = Instant::now();
-            for k in 0..iters {
-                let r = &rows[k % n];
-                let out = jet_vgh(
-                    black_box(r.0), &r.1, &r.2, black_box(r.3), &r.4, &r.5, black_box(r.6), &r.7,
-                    &r.8, black_box(r.9), &r.10, &r.11, black_box(r.12), black_box(r.13),
-                    black_box(r.14), black_box(r.15), r.16, r.17, p,
-                );
-                black_box(out);
-            }
-            let jet_ns = t1.elapsed().as_nanos() as f64 / iters as f64;
-
-            let r = &rows[0];
-            let t2 = Instant::now();
-            for _ in 0..iters {
-                let (a, _) = signed_probit_logcdf_and_mills_ratio(black_box(-r.0));
-                let (b, _) = signed_probit_logcdf_and_mills_ratio(black_box(-r.3));
-                let c = signed_probit_neglog_derivatives_up_to_fourth(black_box(-r.0), -r.14)
-                    .unwrap();
-                let d = signed_probit_neglog_derivatives_up_to_fourth(
-                    black_box(-r.3),
-                    r.14 * (1.0 - r.15),
-                )
-                .unwrap();
-                black_box((a, b, c, d));
-            }
-            let trans_ns = t2.elapsed().as_nanos() as f64 / iters as f64;
-
-            eprintln!(
-                "VGH-BENCH p={p:2}: hand={hand_ns:7.1} ns/row  jet={jet_ns:7.1} ns/row  \
-                 ratio_jet/hand={:.2}x  transcendental={trans_ns:6.1} ns ({:.0}% of hand)  \
-                 max_diff={max_diff:.1e}",
-                jet_ns / hand_ns,
-                100.0 * trans_ns / hand_ns,
             );
         }
     }
