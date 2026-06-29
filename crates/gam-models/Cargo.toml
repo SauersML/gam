@@ -1,6 +1,6 @@
 [package]
 name = "gam-models"
-version = "0.3.131"
+version = "0.3.132"
 edition = "2024"
 description = "Model families (GAMLSS, survival location-scale, BMS) for the gam penalized-likelihood engine"
 license = "AGPL-3.0-or-later"
@@ -12,20 +12,20 @@ warnings = "deny"
 
 [dependencies]
 faer = "0.24.0"
-gam-data = { path = "../gam-data", version = "=0.3.131" }
-gam-geometry = { path = "../gam-geometry", version = "=0.3.131" }
-gam-gpu = { path = "../gam-gpu", version = "=0.3.131" }
-gam-custom-family = { path = "../gam-custom-family", version = "=0.3.131" }
-gam-identifiability = { path = "../gam-identifiability", version = "=0.3.131" }
-gam-linalg = { path = "../gam-linalg", version = "=0.3.131" }
-gam-math = { path = "../gam-math", version = "=0.3.131" }
-gam-model-api = { path = "../gam-model-api", version = "=0.3.131" }
-gam-model-kernels = { path = "../gam-model-kernels", version = "=0.3.131" }
-gam-problem = { path = "../gam-problem", version = "=0.3.131" }
-gam-runtime = { path = "../gam-runtime", version = "=0.3.131" }
-gam-solve = { path = "../gam-solve", version = "=0.3.131" }
-gam-spec = { path = "../gam-spec", version = "=0.3.131" }
-gam-terms = { path = "../gam-terms", version = "=0.3.131" }
+gam-data = { path = "../gam-data", version = "=0.3.132" }
+gam-geometry = { path = "../gam-geometry", version = "=0.3.132" }
+gam-gpu = { path = "../gam-gpu", version = "=0.3.132" }
+gam-custom-family = { path = "../gam-custom-family", version = "=0.3.132" }
+gam-identifiability = { path = "../gam-identifiability", version = "=0.3.132" }
+gam-linalg = { path = "../gam-linalg", version = "=0.3.132" }
+gam-math = { path = "../gam-math", version = "=0.3.132" }
+gam-model-api = { path = "../gam-model-api", version = "=0.3.132" }
+gam-model-kernels = { path = "../gam-model-kernels", version = "=0.3.132" }
+gam-problem = { path = "../gam-problem", version = "=0.3.132" }
+gam-runtime = { path = "../gam-runtime", version = "=0.3.132" }
+gam-solve = { path = "../gam-solve", version = "=0.3.132" }
+gam-spec = { path = "../gam-spec", version = "=0.3.132" }
+gam-terms = { path = "../gam-terms", version = "=0.3.132" }
 libm = "0.2.16"
 log = "0.4.29"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }

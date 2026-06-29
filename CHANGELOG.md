@@ -1,3 +1,74 @@
+## v0.3.132 — gam 0.3.132 / gamfit 0.1.234 (2026-06-29)
+
+crates.io + PyPI release of the non-Gaussian-family, survival-identifiability,
+and convergence-hardening wave landed since gam 0.3.131 / gamfit 0.1.233. The
+headline fixes make GP/interval-coefficient smooths fittable under the
+exponential-family GLMs that previously rejected them, stop the survival
+marginal-slope hang at its root, and remove the Tweedie smoothing boundary bias.
+The `gamfit` Python API surface is unchanged — these broaden and correct the
+behavior reachable through the existing API.
+
+**Non-Gaussian standard-family terms (#1615, #1616)**
+- `matern(x, z)` GP smooths and `bounded(x, min, max)` interval-coefficient
+  terms now fit under Poisson, Gamma, Negative-Binomial, and Tweedie families.
+  The standard-family observation builder previously had only Gaussian/Binomial
+  arms and hard-aborted ("not supported for …") once the coefficient search
+  reached any other family; it now derives the score, Fisher weight, observed
+  η-Hessian, and its η-derivative analytically for each. (Beta remains
+  deferred — its 3rd μ-derivative needs the tetragamma — and still bails.)
+
+**Survival marginal-slope identifiability (#979)**
+- Survival `marginal-slope` fits that shared a spatial basis between the
+  marginal and log-slope channels could run to the outer wall-clock timeout: the
+  full row-Hessian compile attributed the entire shared surface to the
+  log-slope block and collapsed it, leaving a quadratically-flat near-null
+  direction the inner joint-Newton could never certify. A W-orthogonal *partial*
+  reduced-log-slope reparam now drops only the marginal-explained log-slope
+  directions and keeps the survivors, so the joint penalised Hessian is
+  full-rank by construction and the outer deadline is demoted to a pure
+  backstop. (This release also adds direct unit coverage of the new reparam and
+  silences a false "pilot-curvature trap" warning it emitted on every success.)
+
+**Tweedie smoothing (#1477)**
+- Tweedie `s(x)` P-spline fits no longer ship a right-boundary blow-up /
+  EDF-inflated biased mean: the dispersion φ is now held fixed across the
+  smoothing-parameter search (matching mgcv and the existing Negative-Binomial θ
+  handling), making the REML criterion stationary. Reported dispersion and
+  standard errors are unchanged — φ is still refreshed at the final fit.
+
+**GAMLSS Gaussian location-scale (#1561)**
+- Gaussian location-scale (and its wiggle variant) now select the flexible
+  low-λ log-σ basin instead of over-smoothing the scale predictor; the deeper
+  seed screening can no longer discard the heteroscedastic fit via the
+  over-smoothed seed's flat-Fisher "looks-cheap-early" proxy. The keep-best
+  rule is unchanged (lowest-cost), so the result is provably non-worsening.
+
+**Cyclic smooths (#1593)**
+- A cyclic/periodic smooth's fitted curve is now invariant to the arbitrary
+  `period_start` phase origin (worst drift ~2e-2 of signal range → ~1e-10): the
+  uniform cyclic knot grid is anchored to a canonical lattice rather than
+  rigidly to the user's seam, and the dense and streaming evaluators wrap data
+  into the same shifted window so fit- and predict-time designs agree.
+
+**SAE manifold penalties (#1610, #1026)**
+- The SAE separation-barrier strength `μ_C` is now data-derived from dictionary
+  overcompleteness (`K / reachable_rank`) and dimensionless, so it is invariant
+  under a global corpus rescaling instead of the hand-picked constant `10.0`;
+  the decoder-repulsion strength tracks it as a fixed fraction.
+
+**Firth/Jeffreys REML performance (#1575)**
+- Binomial/logit REML with Firth/Jeffreys bias reduction is substantially
+  faster: the β-independent design factor (Gram, identifiable-subspace
+  eigendecomposition, reduced design) is built once per inner P-IRLS solve
+  instead of every Newton iteration, and the seed-screening prepass uses a
+  coarse inner tolerance. Converged fit results are unchanged (now pinned by a
+  direct factored-vs-full-operator equivalence test).
+
+**Regression guards**
+- Reference-free guards added for competing-risks CIF invariance to cause-label
+  permutation (#1593, Rust + Python) and 2-D thin-plate truth recovery (#1074),
+  so those properties stay protected on CI nodes without mgcv/R.
+
 ## v0.3.131 — gam 0.3.131 / gamfit 0.1.233 (2026-06-29)
 
 crates.io + PyPI release of the generation-contract, structured-additive-model
