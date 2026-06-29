@@ -8154,7 +8154,6 @@ impl SaeManifoldTerm {
                 jet_window_next = self.refill_jet_window(
                     rho,
                     jet_window_next,
-                    n,
                     cache,
                     &second_jets,
                     &border,
@@ -8532,8 +8531,7 @@ impl SaeManifoldTerm {
     // [#780 line-count gate] The per-row jet / reconstruction-channel cluster
     // (`reconstruction_row_program_for_logdet`, the const-generic
     // reconstruction / β-border channel fills and their dynamic dispatchers,
-    // `row_jets_for_logdet`, `row_jets_for_logdet_batch4`, `batch4_assemble`,
-    // and `refill_jet_window`) lives in the sibling
+    // `row_jets_for_logdet`, and `refill_jet_window`) lives in the sibling
     // `construction_row_jet_logdet_channels.rs` file, inlined via `include!`
     // below at module scope as a second `impl SaeManifoldTerm` block. Splitting
     // it out keeps this tracked file under the 10k limit; `include!` preserves
@@ -8839,7 +8837,6 @@ impl SaeManifoldTerm {
                 jet_window_next = self.refill_jet_window(
                     rho,
                     jet_window_next,
-                    n,
                     cache,
                     &second_jets,
                     &border,
@@ -9198,7 +9195,6 @@ impl SaeManifoldTerm {
                 jet_window_next = self.refill_jet_window(
                     rho,
                     jet_window_next,
-                    n,
                     cache,
                     &second_jets,
                     &border,
