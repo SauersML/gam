@@ -2004,7 +2004,12 @@ extern "C" __global__ void arrow_sae_sparse_g_matvec(
     for (int lj = 0; lj < m_j; ++lj) {
         acc += data[dbase + li * m_j + lj] * x[(cbase + lj) * p + oc];
     }
-    out[(rbase + li) * p + oc] += acc;
+    // #1017 — a row atom co-occurs with multiple column atoms, so several
+    // concurrent (atom_i, atom_j) blocks (blockIdx.y) write the SAME output
+    // element `out[(rbase+li)*p+oc]`. A plain `+=` races and loses updates
+    // (silently-wrong Schur matvec); accumulate atomically. `double` atomicAdd
+    // needs sm_60+, guaranteed by the NVRTC arch pin (#1551).
+    atomicAdd(&out[(rbase + li) * p + oc], acc);
 }
 
 extern "C" __global__ void arrow_sae_gather_u(
@@ -2225,7 +2230,11 @@ extern "C" __global__ void arrow_sae_frame_g_matvec(
         }
         acc += g * inner;
     }
-    out[oi + li * ri + a] += acc;
+    // #1017 — same race as `arrow_sae_sparse_g_matvec`: atom i is the row atom of
+    // multiple co-occurring (i,j) frame blocks running concurrently on
+    // blockIdx.y, all targeting `out[oi+li*ri+a]`. Accumulate atomically so the
+    // framed G⊗W matvec is correct (the CPU oracle sums these sequentially).
+    atomicAdd(&out[oi + li * ri + a], acc);
 }
 
 /* Per-row reduced-Schur subtraction with a DENSE cross-block H_tβ^(i).
