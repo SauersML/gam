@@ -106,7 +106,7 @@ fn logit_fit_options(nullspace_dims: Vec<usize>) -> FitOptions {
         tol: 1e-7,
         nullspace_dims,
         linear_constraints: None,
-        firth_bias_reduction: false,
+        firth_bias_reduction: std::env::var("FIRTH").as_deref() == Ok("1"),
         adaptive_regularization: None,
         penalty_shrinkage_floor: None,
         rho_prior: Default::default(),
@@ -177,9 +177,11 @@ fn build_and_fit(n: usize, k: usize) {
     let dt = t0.elapsed();
 
     println!(
-        "PSPLINE_1575 n={n:6} k={k} p={p}  time={:8.3}s  outer_cost_evals={:5}  reml_score={:.6}  edf={:.4}  grad={:?}  conv={}  lambdas={:?}",
+        "PSPLINE_1575 n={n:6} k={k} p={p}  time={:8.3}s  outer_cost_evals={:5}  inner_pirls_solves={:5}  firth={}  reml_score={:.6}  edf={:.4}  grad={:?}  conv={}  lambdas={:?}",
         dt.as_secs_f64(),
         fit.outer_cost_evals,
+        fit.inner_pirls_solves,
+        std::env::var("FIRTH").as_deref() == Ok("1"),
         fit.reml_score,
         fit.edf_total().unwrap_or(f64::NAN),
         fit.outer_gradient_norm,
