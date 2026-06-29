@@ -176,11 +176,11 @@ pub(crate) const SAE_FINAL_DECODER_POLISH_PROJECTION_RESOLUTION: usize = 256;
 
 pub(crate) const SAE_SEED_DISPERSION_FLOOR: f64 = 1.0e-12;
 
-/// #1026 decoder-repulsion conditioner strength. Small fixed weight on the
-/// collinearity-gated cross-decoder repulsion that injects POSITIVE curvature in
-/// the inter-atom co-collapse direction. It is a conditioner/separator, not a
-/// primary objective term: it is identically zero (value, gradient, curvature)
-/// unless two atom decoders exceed
+/// #1026/#1610 decoder-repulsion conditioner strength as a DIMENSIONLESS ratio of
+/// the primary separation-barrier strength. The collinearity-gated cross-decoder
+/// repulsion injects POSITIVE curvature in the inter-atom co-collapse direction.
+/// It is a conditioner/separator, not a primary objective term: it is identically
+/// zero (value, gradient, curvature) unless two atom decoders exceed
 /// [`SAE_DECODER_REPULSION_COLLINEARITY_GATE`], so it is a strict no-op for
 /// well-separated atoms and for `K = 1`. Without it the SAE joint inner Newton
 /// solve has NO inter-atom repulsion (data-fit is independent per atom given the
@@ -188,7 +188,43 @@ pub(crate) const SAE_SEED_DISPERSION_FLOOR: f64 = 1.0e-12;
 /// onto the same decoder direction, the per-row `H_tt` block goes near-singular,
 /// the reduced β-Schur over-subtracts and goes indefinite, and the inner solve
 /// never converges (#1026).
-pub(crate) const SAE_DECODER_REPULSION_STRENGTH: f64 = 1.0e-3;
+///
+/// #1610 — the previous value was an absolute `1e-3` whose magnitude was NOT
+/// derived: it was four orders below the separation barrier (`10.0`) with no
+/// stated relationship, and it weighted the un-normalized cross-Gram energy
+/// `‖B_jB_kᵀ‖²_F = c_jk²·‖B_j‖²_F·‖B_k‖²_F`, so the repulsion's force on the
+/// collinearity `c_jk²` scaled with the decoder energy `‖B_j‖²_F·‖B_k‖²_F` while
+/// the separation barrier's force on the SAME `c_jk²` was scale-free. The `1e-3`
+/// was therefore implicitly absorbing the decoder-energy units at one assumed
+/// corpus scale — exactly the unprincipled, non-generalizing hand-pick #1610
+/// flags. The fix (see [`super::penalties::SaeManifoldTerm::refresh_decoder_repulsion_gate`])
+/// normalizes the per-pair weight by `‖B_j‖²_F·‖B_k‖²_F`, so the repulsion now
+/// penalizes the SAME dimensionless collinearity `c_jk² ∈ [0,1]` the separation
+/// barrier does. With both terms acting on the dimensionless `c_jk²`, the
+/// repulsion strength is a pure dimensionless ratio of the barrier strength:
+///
+///   `μ_rep = SAE_DECODER_REPULSION_BARRIER_RATIO · μ_sep`.
+///
+/// The repulsion is a SUBDOMINANT conditioner — the separation barrier is the
+/// primary anti-collapse cure (it DIVERGES at `c²→1`; the repulsion is a finite
+/// PSD quadratic). The ratio `1e-4` keeps the repulsion four orders below the
+/// barrier BY DESIGN (so it conditions the indefinite directions without fighting
+/// the barrier's restoring force), and at the canonical unit decoder scale
+/// (`‖B_k‖²_F ≈ 1`) the effective per-pair weight `μ_sep·1e-4 = 10·1e-4 = 1e-3`
+/// reduces EXACTLY to the historical absolute constant, so unit-scale fits are
+/// byte-unchanged. Unlike the old absolute `1e-3` this engages identically at any
+/// corpus scale.
+pub(crate) const SAE_DECODER_REPULSION_BARRIER_RATIO: f64 = 1.0e-4;
+
+/// #1610 derived decoder-repulsion strength: a dimensionless fraction
+/// [`SAE_DECODER_REPULSION_BARRIER_RATIO`] of the (possibly runtime-overridden)
+/// separation-barrier strength. Single source for the energy-normalized per-pair
+/// repulsion weight. Tracks any `set_sae_barrier_overrides` sweep of the barrier
+/// so the conditioner stays a fixed fraction of the primary barrier under a
+/// parameter sweep, rather than a frozen independent magic number.
+pub(crate) fn sae_decoder_repulsion_strength() -> f64 {
+    SAE_DECODER_REPULSION_BARRIER_RATIO * sae_separation_barrier_strength()
+}
 
 /// #1026 normalized collinearity score
 /// `s_jk = ‖B_jB_kᵀ‖²_F / (‖B_j‖²_F·‖B_k‖²_F)` at/above which the decoder
@@ -444,8 +480,10 @@ pub struct SaeManifoldTerm {
     /// #1026 decoder-repulsion gate, frozen per assembly (lagged-diffusivity
     /// discipline, exactly like [`SaeManifoldAtom::smooth_penalty`]): the
     /// symmetric `(K, K)` matrix of collinearity gate weights
-    /// `gate(s_jk)·SAE_DECODER_REPULSION_STRENGTH` computed from the decoder
-    /// state at assembly entry. Both the assembly (gradient into `gb`, PSD
+    /// `gate(s_jk)·sae_decoder_repulsion_strength()/(‖B_j‖²_F·‖B_k‖²_F)` computed
+    /// from the decoder state at assembly entry (#1610: energy-normalized, so the
+    /// realized penalty is a function of the dimensionless collinearity `c_jk²`
+    /// alone). Both the assembly (gradient into `gb`, PSD
     /// curvature into `hbb`) and the line-search value path
     /// ([`Self::penalized_objective_total`]) read THIS frozen gate, so the
     /// repulsion's value, gradient, and curvature stay mutually consistent

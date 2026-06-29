@@ -2283,6 +2283,126 @@ fn separation_barrier_collapse_prevention_is_scale_invariant_1610() {
     );
 }
 
+/// #1610 — the decoder-repulsion collapse-prevention conditioner must be
+/// PRINCIPLED, not a hand-picked absolute magic constant:
+///   1. its strength is a DERIVED dimensionless fraction of the primary
+///      separation-barrier strength (`μ_rep = ratio · μ_sep`), not an
+///      independent `1e-3`; and
+///   2. after the #1610 energy normalization the realized repulsion penalty is a
+///      function of the dimensionless collinearity `c_jk² ∈ [0,1]` ALONE, so it
+///      is INVARIANT under a global corpus rescaling `B_k → s·B_k`.
+///
+/// Property (2) is the property the OLD absolute constant VIOLATED: it weighted
+/// the un-normalized cross-Gram energy `‖B_jB_kᵀ‖²_F = c²·‖B_j‖²_F·‖B_k‖²_F`, so
+/// the repulsion value scaled as `s⁴` under a rescaling by `s` while the
+/// collapse geometry (`c²`, the gate) was identical — the same scale bug #1610
+/// fixed for the separation barrier's norm floor. The test builds a fixed,
+/// near-collinear (gate-engaged) K=2 fixture and asserts the repulsion value is
+/// equal across decoder scales spanning 13 orders of magnitude. With the old
+/// `½·STRENGTH·c²·s⁴` weighting these would differ by `s⁴` (up to `1e52`), so
+/// this fails before the normalization and passes after.
+#[test]
+pub(crate) fn decoder_repulsion_strength_is_derived_and_scale_invariant_1610() {
+    // (1) Strength is a DERIVED fraction of the barrier strength, not an
+    // independent absolute constant. (No global-state mutation: pure algebra.)
+    let expected = SAE_DECODER_REPULSION_BARRIER_RATIO * sae_separation_barrier_strength();
+    assert_eq!(
+        sae_decoder_repulsion_strength(),
+        expected,
+        "repulsion strength must be the derived fraction {SAE_DECODER_REPULSION_BARRIER_RATIO} \
+         of the separation-barrier strength {}, got {}",
+        sae_separation_barrier_strength(),
+        sae_decoder_repulsion_strength(),
+    );
+    // At the canonical unit decoder scale the effective per-pair weight reduces
+    // EXACTLY to the historical absolute `1e-3` (10.0 · 1e-4), so unit-scale fits
+    // are byte-unchanged — the normalization is a re-parameterization, not a
+    // behavioral change at unit scale.
+    assert_eq!(
+        sae_decoder_repulsion_strength(),
+        1.0e-3,
+        "at the default barrier strength the derived repulsion strength must reduce \
+         to the historical 1e-3"
+    );
+
+    // (2) End-to-end scale invariance of the repulsion value.
+    let coords0 = array![[0.05], [0.20], [0.55], [0.80], [0.35], [0.65]];
+    let coords1 = array![[0.15], [0.30], [0.65], [0.90], [0.45], [0.10]];
+    let (phi0, jet0) = periodic_basis(&coords0);
+    let (phi1, jet1) = periodic_basis(&coords1);
+    let logits = array![
+        [0.7, -0.2],
+        [0.1, 0.4],
+        [-0.3, 0.5],
+        [0.6, -0.1],
+        [0.2, 0.3],
+        [0.4, 0.1]
+    ];
+    // Two atoms whose decoders are NEAR-collinear (cosine 0.9 ⇒ c² = 0.81, above
+    // the 0.5 gate but strictly < 1), so the gate is partially engaged and the
+    // penalty is strictly positive and finite. Rank-1 decoders (only row 0
+    // nonzero) keep `‖B_k‖²_F` trivial to reason about: at scale `s`,
+    // `‖B_0‖²_F = ‖B_1‖²_F = s²` and `c² = 0.81` (scale-free).
+    let build_at_scale = |s: f64| {
+        let mut dec0 = Array2::<f64>::zeros((3, 3));
+        dec0[[0, 0]] = s;
+        let mut dec1 = Array2::<f64>::zeros((3, 3));
+        dec1[[0, 0]] = 0.9 * s;
+        dec1[[0, 1]] = (1.0 - 0.9 * 0.9_f64).sqrt() * s; // ‖row‖ = s, cosine with dec0 = 0.9
+        let make = |name: &str, phi: Array2<f64>, jet: Array3<f64>, decoder: Array2<f64>| {
+            SaeManifoldAtom::new(
+                name,
+                SaeAtomBasisKind::Periodic,
+                1,
+                phi,
+                jet,
+                decoder,
+                Array2::<f64>::eye(3),
+            )
+            .unwrap()
+            .with_basis_evaluator(Arc::new(TestPeriodicEvaluator))
+        };
+        let atom0 = make("rep0", phi0.clone(), jet0.clone(), dec0);
+        let atom1 = make("rep1", phi1.clone(), jet1.clone(), dec1);
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            logits.clone(),
+            vec![coords0.clone(), coords1.clone()],
+            vec![
+                LatentManifold::Circle { period: 1.0 },
+                LatentManifold::Circle { period: 1.0 },
+            ],
+            AssignmentMode::softmax(0.8),
+        )
+        .unwrap();
+        let mut term = SaeManifoldTerm::new(vec![atom0, atom1], assignment).unwrap();
+        term.refresh_decoder_repulsion_gate();
+        term
+    };
+
+    let value_unit = build_at_scale(1.0).decoder_repulsion_value(1.0);
+    assert!(
+        value_unit > 0.0 && value_unit.is_finite(),
+        "near-collinear gate-engaged pair must yield a positive finite repulsion \
+         value at unit scale, got {value_unit}"
+    );
+    // Same collapse geometry (c², gate identical) at a tiny and a huge corpus
+    // scale: the energy-normalized penalty is invariant. The OLD un-normalized
+    // weighting would scale these by s⁴ = 1e-28 and 1e24 respectively.
+    let value_tiny = build_at_scale(1.0e-7).decoder_repulsion_value(1.0);
+    let value_huge = build_at_scale(1.0e6).decoder_repulsion_value(1.0);
+    let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(f64::MIN_POSITIVE);
+    assert!(
+        rel(value_tiny, value_unit) <= 1e-9,
+        "repulsion value must be scale-invariant: unit={value_unit} tiny={value_tiny} \
+         (old absolute constant scaled this by s⁴)"
+    );
+    assert!(
+        rel(value_huge, value_unit) <= 1e-9,
+        "repulsion value must be scale-invariant: unit={value_unit} huge={value_huge} \
+         (old absolute constant scaled this by s⁴)"
+    );
+}
+
 /// #976 distinct-basin lever: the co-collapse multi-start reseed must read a
 /// DIFFERENT principal subspace on each retry. The PC-pair rotation offset (=
 /// the 0-based retry index) shifts which residual PC pair each periodic atom

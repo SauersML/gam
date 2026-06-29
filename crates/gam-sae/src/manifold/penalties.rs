@@ -85,7 +85,8 @@ impl SaeManifoldTerm {
     /// frozen here at assembly entry so the assembly's gradient/curvature and the
     /// line-search value path use the same gate even as trial decoders move.
     ///
-    /// The per-pair weight is `SAE_DECODER_REPULSION_STRENGTH · gate(s_jk)` with
+    /// The per-pair weight is
+    /// `sae_decoder_repulsion_strength() · gate(s_jk) / (‖B_j‖²_F·‖B_k‖²_F)` with
     /// the normalized collinearity score
     /// `s_jk = ‖B_jB_kᵀ‖²_F / (‖B_j‖²_F·‖B_k‖²_F)` and a C1 smoothstep gate that
     /// is exactly 0 below [`SAE_DECODER_REPULSION_COLLINEARITY_GATE`]. The gate is
@@ -153,7 +154,21 @@ impl SaeManifoldTerm {
                 t * t * (3.0 - 2.0 * t)
             };
             if gate_value > 0.0 {
-                let w = SAE_DECODER_REPULSION_STRENGTH * gate_value;
+                // #1610 — energy-NORMALIZED per-pair weight. The repulsion operator
+                // weights the un-normalized cross-Gram energy
+                // `‖B_jB_kᵀ‖²_F = c_jk²·‖B_j‖²_F·‖B_k‖²_F`, so dividing the weight by
+                // `‖B_j‖²_F·‖B_k‖²_F` makes the realized per-pair penalty
+                // `½·STRENGTH·gate·c_jk²` — a function of the DIMENSIONLESS
+                // collinearity `c_jk² ∈ [0,1]` alone, identical in form to the
+                // separation barrier and invariant under a global corpus rescaling
+                // (every `‖B_k‖²_F` scales by `s²`, exactly cancelling the `s⁴` in
+                // the cross-Gram energy). `norm_sq[j], norm_sq[k] > 0` is guaranteed
+                // by the scale guard above. The strength is a derived dimensionless
+                // fraction of the primary separation-barrier strength
+                // (`sae_decoder_repulsion_strength`), not an independent magic
+                // constant; at unit decoder scale it reduces to the historical `1e-3`.
+                let w =
+                    sae_decoder_repulsion_strength() * gate_value / (norm_sq[j] * norm_sq[k]);
                 gate.push((j, k, w));
             }
         }
@@ -178,8 +193,9 @@ impl SaeManifoldTerm {
         }
         // The operator multiplies its quadratic by `weight·pair_weight`; we want
         // the effective per-pair weight to be exactly the gate weight (which
-        // already folds in SAE_DECODER_REPULSION_STRENGTH), so pass weight=1 and
-        // feed the frozen gate directly as the sparse symmetrized pair list.
+        // already folds in the #1610 energy-normalized
+        // `sae_decoder_repulsion_strength()/(‖B_j‖²_F·‖B_k‖²_F)`), so pass weight=1
+        // and feed the frozen gate directly as the sparse symmetrized pair list.
         DecoderIncoherencePenalty::new_sparse(
             PsiSlice {
                 range: 0..m_total * p,
