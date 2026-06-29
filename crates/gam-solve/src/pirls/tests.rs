@@ -44,7 +44,7 @@ mod tests {
         eta: ArrayView1<f64>,
         observation_weights: ArrayView1<f64>,
     ) -> Result<(Array1<f64>, f64, Array1<f64>), EstimationError> {
-        use crate::reml::firth::FirthDenseOperator;
+        use crate::estimate::reml::FirthDenseOperator;
         let op = FirthDenseOperator::build_with_observation_weights_for_link(
             link,
             &x_design.to_owned(),
