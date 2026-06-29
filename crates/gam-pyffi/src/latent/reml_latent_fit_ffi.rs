@@ -3671,11 +3671,49 @@ fn model_debiased_functional_json_impl(
          refit with a smaller basis (dense fits only)"
             .to_string()
     })?;
-    let xwx = saved_fit.weighted_gram().ok_or_else(|| {
-        "debiased_functional: model does not carry the weighted Gram X'WX; \
-         refit with a smaller basis (dense fits only)"
-            .to_string()
-    })?;
+    // Gaussian/identity is the only supported family (enforced below for the
+    // score chain). Hoist that check here because the weighted-Gram fallback
+    // (#1622) is only valid for the profiled-Gaussian weight convention.
+    let family = model.likelihood();
+    let is_gaussian_identity = matches!(family.response, ResponseFamily::Gaussian)
+        && matches!(family.link, InverseLink::Standard(StandardLink::Identity));
+    // Fast path: the weighted Gram X'WX was stored by the REML posterior block.
+    // Fallback (#1622): the parametric-term fit path leaves `weighted_gram` at
+    // its `None` default, so reconstruct X'WX from the already-rebuilt dense
+    // design. For a profiled Gaussian/identity fit the stored penalized Hessian
+    // is H = XᵀWX + S(λ) with W = diag(prior weights) (scale-free; the penalty
+    // is added UNSCALED — see optimizer.rs `cov_scale` contract), so
+    // X'WX = Xᵀ diag(w) X exactly and S(λ) = H − X'WX is recovered consistently
+    // (for an unpenalized `y ~ x` this gives S(λ)=0, i.e. X'WX == H).
+    let xwx_owned: ndarray::Array2<f64> = match saved_fit.weighted_gram() {
+        Some(g) => g.clone(),
+        None => {
+            if !is_gaussian_identity {
+                return Err(format!(
+                    "debiased_functional: model does not carry the weighted Gram X'WX and \
+                     it can only be reconstructed for Gaussian/identity models; this model \
+                     uses family='{}'",
+                    family.pretty_name()
+                ));
+            }
+            let xref = x.as_ref();
+            let w = standard.weights.view();
+            if w.len() != xref.nrows() {
+                return Err(format!(
+                    "debiased_functional: prior-weight length {} does not match design rows {}",
+                    w.len(),
+                    xref.nrows()
+                ));
+            }
+            // Xᵀ diag(w) X = (diag(w) X)ᵀ X.
+            let mut wx = xref.to_owned();
+            for (mut row, &wi) in wx.outer_iter_mut().zip(w.iter()) {
+                row.mapv_inplace(|v| v * wi);
+            }
+            wx.t().dot(xref)
+        }
+    };
+    let xwx = &xwx_owned;
     let beta = saved_fit.beta_flat();
     if beta.len() != x.ncols() {
         return Err(format!(
@@ -3696,9 +3734,6 @@ fn model_debiased_functional_json_impl(
     let y = standard.y.view();
     let n = x.nrows();
     let p = x.ncols();
-    let family = model.likelihood();
-    let is_gaussian_identity = matches!(family.response, ResponseFamily::Gaussian)
-        && matches!(family.link, InverseLink::Standard(StandardLink::Identity));
     if !is_gaussian_identity {
         return Err(format!(
             "debiased_functional: currently only supported for Gaussian/identity models; \
