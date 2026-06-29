@@ -1,3 +1,69 @@
+## v0.3.131 — gam 0.3.131 / gamfit 0.1.233 (2026-06-29)
+
+crates.io + PyPI release of the generation-contract, structured-additive-model
+(SAE) collapse-prevention, and Firth/Jeffreys outer-LAML wave landed since gam
+0.3.130 / gamfit 0.1.232. The headline fix completes the response-scale
+`generate` contract for conditional transformation-normal (CTM) models; the rest
+hardens REML/LAML convergence and the SAE penalty stack. The `gamfit` Python API
+surface is unchanged.
+
+**Conditional transformation-normal models (#1613)**
+- `gam generate` on a CTM model drew synthetic responses on the *latent* N(0,1)
+  scale: it required the outcome column `y`, and the per-row mean of the draws
+  moved the *wrong way* with the covariate. It now draws genuine response-scale
+  `Y` by inverting each row's monotone transform on a standard-normal quadrature,
+  so the draws track `E[Y|x]` (verified: a fit to `E[Y|x] = 2 + 0.9x` centers its
+  `x = −1, 0, 1` draws on the increasing sequence, no `y` column required). This
+  completes the predict/generate response-scale contract begun in #1612.
+
+**Firth/Jeffreys outer LAML (#1607)**
+- For a ψ hyperparameter that reshapes the design (Matérn/Duchon length-scale),
+  the joint-Jeffreys penalty `Φ = ½ log|Zᵀ H Z|₊` depends on ψ explicitly, but the
+  BMS batched outer gradient dropped both the value term `−∂_ψΦ` and its β-coupling
+  `−∂_β∂_ψΦ`. Both are now folded into the outer LAML gradient and Hessian, gated
+  on `joint_jeffreys_term_required()` so well-conditioned/non-Jeffreys fits stay
+  byte-identical.
+- The explicit-parameter ψψ second derivative now carries the full
+  conditioning-gate curvature `G''·U` (not just the gate motion `G'`), making it
+  the exact second derivative of the gated value and consistent with its own
+  gate-aware gradient inside the gate's transition band.
+- A homoscedastic (flat) scale ridge could exhaust the coupled joint-Newton budget
+  while genuinely converged on the identifiable subspace; the convergence
+  certificate now also admits the objective-plateau precondition
+  (`Δobj ≤ objective_tol`) alongside the residual-stall window, both still gating
+  the rigorous Newton-decrement bound.
+
+**SAE manifold penalties (#1610, #1017)**
+- Decoder-repulsion collapse-prevention strength is now *derived* from the
+  separation-barrier strength and energy-normalized, so it is scale-invariant
+  rather than a hand-tuned absolute constant; the separation-barrier collapse
+  norm-floor is likewise data-relative (to `maxₖ‖Bₖ‖²`) instead of an absolute
+  magic number. Collapse-prevention curvature is engaged on the matrix-free/framed
+  production path.
+- The co-collapse acceptance bar is now calibrated against the dictionary's
+  *reachable* geometric rank `Σₖ rank(Φₖ)` (read from each chart design alone, not
+  the decoder magnitude) instead of the nominal coefficient count `Σₖ basis_sizeₖ`,
+  which over-stated what a curved nonlinear dictionary can span and biased the
+  linear PCA ceiling high. The bar can only move down from the old value.
+- (GPU) The SAE G-matvec output accumulation now uses `atomicAdd`, fixing a data
+  race when multiple blocks accumulate into the same output element for
+  co-occurring row atoms.
+
+**Other fixes**
+- #1074: the Gaussian over-smoothing seed safety-net now extends past the
+  screening cap, curing weak-signal spatial over-fit.
+- #979: a *measured* KKT-refusal gate for the survival marginal-slope phantom null
+  direction — projection engages only when a near-null direction is a measured
+  phantom (zero gradient residual), never when it is genuinely driven, demoting the
+  wall-clock deadline from load-bearing to a backstop.
+- #1605: the `sz` factor smooth is exempted from owner-residualization.
+
+**Performance (#1575)**
+- Multi-slot outer-eval LRU reuses revisited ρ-points across the REML outer loop;
+  redundant per-penalty Firth directions are hoisted out of the O(k²) TK
+  outer-Hessian loop; SIMD 4-row batch kernels for the binomial location-scale
+  directional derivatives.
+
 ## v0.3.130 — gam 0.3.130 / gamfit 0.1.232 (2026-06-28)
 
 crates.io + PyPI release of the prediction/generation-contract and
