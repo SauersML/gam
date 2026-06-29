@@ -261,6 +261,10 @@ path = "examples/sae_hillclimb_envelope_1017.rs"
 name = "cyl_family_repro"
 path = "examples/cyl_family_repro.rs"
 
+[[example]]
+name = "binomial_pspline_perf_1575"
+path = "examples/binomial_pspline_perf_1575.rs"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
