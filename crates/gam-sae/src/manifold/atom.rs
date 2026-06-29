@@ -795,6 +795,55 @@ impl SaeManifoldAtom {
         Ok(sv.iter().filter(|&&v| v > tol).count())
     }
 
+    /// #1610 — the GEOMETRICALLY REACHABLE output rank of this atom's decoded
+    /// image, used to calibrate the co-collapse acceptance bar against what the
+    /// dictionary can actually span (instead of the nominal coefficient count).
+    ///
+    /// The decoded image of the atom over its active rows is `Φ_k B_k`
+    /// (`n × p`), whose column space lies inside `colspan(Φ_k) · B_k`. Its
+    /// dimension is therefore bounded by `rank(Φ_k)` — the number of linearly
+    /// independent directions the CHART (the realized basis evaluations on the
+    /// current latent coordinates) produces, capped by the output dimension `p`.
+    /// Crucially this is computed from the chart design `Φ_k` ALONE, **not** the
+    /// decoder magnitude `B_k`: a curved `latent_dim = d` atom whose chart image
+    /// is rank-deficient on the actual sample (few distinct coordinates, a
+    /// degenerate chart, or a genuinely lower-dimensional realized image) reaches
+    /// fewer linear directions than its nominal `basis_size()`, while a
+    /// co-collapsed atom whose decoder norm → 0 still reports its full geometric
+    /// reach (so the collapse guard keyed on this rank does NOT silently disable
+    /// itself at the very state it must catch). `rank(Φ_k) ≤ basis_size()`
+    /// always, so this can only LOWER the (linearly biased-high) PCA ceiling the
+    /// collapse bar uses — the #1610 "nonlinear dict vs linear PCA ceiling" fix.
+    ///
+    /// Returns `0` for an empty/degenerate chart (no rows, no columns, or a
+    /// zero/non-finite design); SVD failure is surfaced as an error so the
+    /// caller can fall back to the nominal count rather than silently key on a
+    /// meaningless rank.
+    pub fn realized_chart_image_rank(&self) -> Result<usize, String> {
+        let m = self.basis_size();
+        let n = self.n_obs();
+        let p = self.output_dim();
+        if m == 0 || n == 0 || p == 0 {
+            return Ok(0);
+        }
+        if !self.basis_values.iter().all(|v| v.is_finite()) {
+            return Ok(0);
+        }
+        let (_u, sv, _vt) = self
+            .basis_values
+            .svd(false, false)
+            .map_err(|e| format!("SaeManifoldAtom::realized_chart_image_rank: SVD failed: {e}"))?;
+        let max_sv = sv.iter().copied().fold(0.0_f64, f64::max);
+        if !(max_sv > 0.0) {
+            return Ok(0);
+        }
+        let tol = SAE_MANIFOLD_SPECTRAL_RANK_CUTOFF * max_sv;
+        // The reachable output rank is bounded by both the chart's realized rank
+        // and the output dimension `p` (a chart can never span more output
+        // directions than the decoder has columns).
+        Ok(sv.iter().filter(|&&v| v > tol).count().min(p))
+    }
+
     /// Rank that should be carried by the low-rank Grassmann decoder frame for
     /// the current decoder, or `None` when the full-`B` representation is still
     /// the intended path. This is the exact activation predicate:

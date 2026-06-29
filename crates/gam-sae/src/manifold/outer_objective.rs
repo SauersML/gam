@@ -100,6 +100,48 @@ pub(crate) fn collapse_ev_bar(target: ArrayView2<'_, f64>, dictionary_rank: usiz
     }
 }
 
+/// #1610 — the GEOMETRICALLY REACHABLE linear rank of a dictionary, used as the
+/// rank `q` at which the co-collapse bar evaluates its PCA / Eckart-Young EV
+/// ceiling (`collapse_ev_bar(target, reachable_dictionary_rank(...))`).
+///
+/// The collapse bar compares a fit against the best EV a rank-`q` LINEAR
+/// dictionary could reach. The previous `q = Σ_k basis_size_k` (nominal
+/// coefficient count) is biased HIGH for a NONLINEAR dictionary: a curved
+/// `latent_dim = d` atom decoded through a smooth chart does not linearly span
+/// all `basis_size_k` of its coefficient directions in the output — its decoded
+/// image `Φ_k B_k` lies inside `colspan(Φ_k)`, whose dimension is the realized
+/// chart rank `rank(Φ_k) ≤ basis_size_k`. Summing the per-atom REALIZED chart
+/// ranks (each capped at the output dim `p`) gives the linear dimension the
+/// dictionary's union of chart images can actually reach on this sample, which
+/// is the principled rank for the linear PCA ceiling that the bar uses.
+///
+/// `rank(Φ_k)` is read from the CHART design alone (not the decoder magnitude),
+/// so a co-collapsed atom (`‖B_k‖ → 0`) still reports its full geometric reach
+/// — the collapse guard must NOT silently lower its own bar at the very
+/// degenerate state it exists to catch. Because each per-atom term is
+/// `≤ basis_size_k`, the reachable rank is `≤ Σ_k basis_size_k`, so the bar can
+/// only move DOWN from the old (biased-high) value, never up. When any atom's
+/// chart rank is un-computable (SVD failure) the function falls back to that
+/// atom's nominal `basis_size_k` for that atom only, so a numerical failure
+/// degrades to the historical behavior rather than corrupting the rank. The
+/// total is capped at the data rank `min(n, p)`.
+pub(crate) fn reachable_dictionary_rank(
+    atoms: &[SaeManifoldAtom],
+    n: usize,
+    p: usize,
+) -> usize {
+    let reachable: usize = atoms
+        .iter()
+        .map(|atom| match atom.realized_chart_image_rank() {
+            Ok(r) => r,
+            // SVD failure on this atom's chart: fall back to the nominal count
+            // (capped at p) for this atom only, never poisoning the sum.
+            Err(_) => atom.basis_size().min(p),
+        })
+        .sum();
+    reachable.min(n).min(p)
+}
+
 /// #1207 — observable telemetry for the amortized warm-start (Design A). The
 /// warm-start is advisory (a transient atlas-build / encode refusal must not
 /// abort the criterion), so its failures were previously discarded with `.ok()`

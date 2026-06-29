@@ -1591,13 +1591,18 @@ impl SaeManifoldTerm {
         // `pca_ev_ceiling` returns non-finite and we fall back to the absolute
         // [`SAE_FIT_DATA_COLLAPSE_EV_FLOOR`] so the guard never keys on a
         // meaningless bar.
-        let dictionary_rank = self
-            .atoms
-            .iter()
-            .map(|atom| atom.basis_size())
-            .sum::<usize>()
-            .min(n)
-            .min(p);
+        //
+        // #1610 — the rank `q` at which the linear PCA ceiling is taken is the
+        // dictionary's GEOMETRICALLY REACHABLE rank (`Σ_k rank(Φ_k)` capped at
+        // `min(n,p)`), not the nominal coefficient count `Σ_k basis_size_k`. A
+        // curved atom's decoded image spans only `rank(Φ_k) ≤ basis_size_k`
+        // linear directions, so the old nominal count over-stated what the
+        // NONLINEAR dictionary can reach and biased the linear PCA ceiling high
+        // (and hence the bar). The reachable rank is read from the chart designs
+        // alone, so a co-collapsed dictionary still reports full geometric reach
+        // and the guard does not lower its own bar at the collapse it must catch.
+        let dictionary_rank =
+            crate::manifold::outer_objective::reachable_dictionary_rank(&self.atoms, n, p);
         let ev_floor =
             crate::manifold::outer_objective::collapse_ev_bar(target, dictionary_rank);
         if !(ev.is_finite() && ev <= ev_floor) {
@@ -2150,13 +2155,13 @@ impl SaeManifoldTerm {
             // solve own that case), as is any EV above the bar (a healthy fit).
             let n = self.n_obs();
             let p = target.ncols();
-            let dictionary_rank = self
-                .atoms
-                .iter()
-                .map(|atom| atom.basis_size())
-                .sum::<usize>()
-                .min(n)
-                .min(p);
+            // #1610 — calibrate the linear PCA ceiling against the dictionary's
+            // GEOMETRICALLY REACHABLE rank (`Σ_k rank(Φ_k)`), not the nominal
+            // coefficient count `Σ_k basis_size_k` (biased high for a nonlinear
+            // dictionary). Shared with the fitted-data collapse acceptance check
+            // so both verdicts key on the same reachable-rank bar.
+            let dictionary_rank =
+                crate::manifold::outer_objective::reachable_dictionary_rank(&self.atoms, n, p);
             let ev_floor = crate::manifold::outer_objective::collapse_ev_bar(
                 target,
                 dictionary_rank,
