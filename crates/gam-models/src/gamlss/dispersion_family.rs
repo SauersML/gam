@@ -163,6 +163,13 @@ pub(super) const DISPERSION_ETA_CLAMP: f64 = 30.0;
 /// of this floor; it only conditions the inner solve.
 pub(super) const DISPERSION_MIN_CURVATURE: f64 = 1e-12;
 
+/// Row count above which the per-row dispersion-kernel map fans out across
+/// rayon workers (only when not already running on a worker, to avoid nested
+/// oversubscription). Below it the serial map beats the fork/join overhead.
+/// Mirrors the row-chunk guard in
+/// [`row_coeff_operator`](super::gaussian::row_coeff_operator).
+const DISPERSION_PARALLEL_ROW_THRESHOLD: usize = 1024;
+
 /// Per-row working quantities for both channels at the current `(η_μ, η_d)`.
 pub(super) struct DispersionRowKernel {
     pub(super) loglik: f64,
@@ -817,14 +824,41 @@ impl CustomFamily for DispersionGlmLocationScaleFamily {
                 self.weights.len()
             ));
         }
-        let mut log_likelihood = 0.0;
         let mut mean_weights = Array1::<f64>::zeros(n);
         let mut mean_response = Array1::<f64>::zeros(n);
         let mut disp_weights = Array1::<f64>::zeros(n);
         let mut disp_response = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let row =
-                dispersion_row_kernel(self.kind, self.y[i], eta_mu[i], eta_d[i], self.weights[i]);
+
+        // `dispersion_row_kernel` is a pure, row-independent map — each row reads
+        // only `y[i]`/`eta_mu[i]`/`eta_d[i]`/`weights[i]` and writes nothing
+        // shared — and it is transcendental-heavy (per-row digamma/trigamma
+        // derivative stacks), so the per-row evaluation is embarrassingly
+        // row-parallel. Materialize the per-row kernels (in parallel for large
+        // `n` when not already on a rayon worker; mirrors the
+        // `row_coeff_operator` guard), then reduce SERIALLY in index order so
+        // the log-likelihood sum is bit-identical to the old serial loop — no
+        // float reassociation. The reduction touches no transcendentals, so the
+        // parallel kernel map captures essentially all the savings.
+        let kernels: Vec<DispersionRowKernel> = if rayon::current_thread_index().is_none()
+            && n > DISPERSION_PARALLEL_ROW_THRESHOLD
+        {
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    dispersion_row_kernel(self.kind, self.y[i], eta_mu[i], eta_d[i], self.weights[i])
+                })
+                .collect()
+        } else {
+            (0..n)
+                .map(|i| {
+                    dispersion_row_kernel(self.kind, self.y[i], eta_mu[i], eta_d[i], self.weights[i])
+                })
+                .collect()
+        };
+
+        let mut log_likelihood = 0.0;
+        for (i, row) in kernels.into_iter().enumerate() {
             if row.loglik.is_finite() {
                 log_likelihood += row.loglik;
             }
@@ -846,14 +880,34 @@ impl CustomFamily for DispersionGlmLocationScaleFamily {
         validate_block_count::<GamlssError>(self.kind.family_tag(), 2, block_states.len())?;
         let eta_mu = &block_states[Self::BLOCK_MEAN].eta;
         let eta_d = &block_states[Self::BLOCK_DISP].eta;
+        let n = self.y.len();
+        // #1591 prune: the objective needs only the row log-likelihood, so each
+        // row evaluates the value channel alone (`to_bits`-identical to
+        // `dispersion_row_kernel(..).loglik`), skipping every gradient/Hessian
+        // and digamma/trigamma derivative-stack evaluation. That value-only map
+        // is still a pure, row-independent per-row `ln_gamma` evaluation, so it
+        // is row-parallel; fan it out (large `n`, off a rayon worker) into a
+        // per-row buffer, then sum SERIALLY in index order to keep the objective
+        // bit-identical to the serial loop (no float reassociation).
+        let per_row: Vec<f64> = if rayon::current_thread_index().is_none()
+            && n > DISPERSION_PARALLEL_ROW_THRESHOLD
+        {
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    dispersion_row_loglik(self.kind, self.y[i], eta_mu[i], eta_d[i], self.weights[i])
+                })
+                .collect()
+        } else {
+            (0..n)
+                .map(|i| {
+                    dispersion_row_loglik(self.kind, self.y[i], eta_mu[i], eta_d[i], self.weights[i])
+                })
+                .collect()
+        };
         let mut ll = 0.0;
-        for i in 0..self.y.len() {
-            // #1591 prune: the objective needs only the row log-likelihood, so
-            // evaluate the value channel alone (`to_bits`-identical to
-            // `dispersion_row_kernel(..).loglik`) and skip every gradient,
-            // Hessian and digamma/trigamma derivative-stack evaluation.
-            let loglik =
-                dispersion_row_loglik(self.kind, self.y[i], eta_mu[i], eta_d[i], self.weights[i]);
+        for loglik in per_row {
             if loglik.is_finite() {
                 ll += loglik;
             }
@@ -934,9 +988,40 @@ impl CustomFamily for DispersionGlmLocationScaleFamily {
             ));
         };
 
-        let cross_weights = Array1::from_shape_fn(n, |i| {
-            dispersion_row_cross_weight(self.kind, self.y[i], eta_mu[i], eta_d[i], self.weights[i])
-        });
+        // Per-row mixed `(η_μ, η_d)` weight; for Beta this is a full `Order2<2>`
+        // tower per row (the orthogonal members return 0 cheaply). Row-
+        // independent, so fan it out for large `n` (off a rayon worker) into a
+        // per-row buffer — index-ordered, no reduction, so byte-identical to the
+        // serial `from_shape_fn`.
+        let cross_weights = if rayon::current_thread_index().is_none()
+            && n > DISPERSION_PARALLEL_ROW_THRESHOLD
+        {
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            Array1::from_vec(
+                (0..n)
+                    .into_par_iter()
+                    .map(|i| {
+                        dispersion_row_cross_weight(
+                            self.kind,
+                            self.y[i],
+                            eta_mu[i],
+                            eta_d[i],
+                            self.weights[i],
+                        )
+                    })
+                    .collect::<Vec<f64>>(),
+            )
+        } else {
+            Array1::from_shape_fn(n, |i| {
+                dispersion_row_cross_weight(
+                    self.kind,
+                    self.y[i],
+                    eta_mu[i],
+                    eta_d[i],
+                    self.weights[i],
+                )
+            })
+        };
         let mean_spec = &specs[Self::BLOCK_MEAN];
         let disp_spec = &specs[Self::BLOCK_DISP];
         if mean_spec.design.nrows() != n || disp_spec.design.nrows() != n {
@@ -1599,6 +1684,118 @@ mod tests {
         for kind in cases {
             let got = dispersion_row_cross_weight(kind, 1.25, 0.2, -0.3, 2.0);
             assert_close(kind.family_tag(), got, 0.0, 1e-12);
+        }
+    }
+
+    /// Speed-path guard (#932): `evaluate` / `log_likelihood_only` materialize
+    /// the row-kernel map in parallel for large `n`, then reduce SERIALLY in
+    /// index order. This pins the parallel output (log-likelihood + both
+    /// blocks' working response/weight vectors) to a hand-rolled serial
+    /// reference so CI catches any reassociation or row-misindex regression.
+    /// `n` sits well above `DISPERSION_PARALLEL_ROW_THRESHOLD`, and the test
+    /// runs on the main thread (not a rayon worker), so the parallel branch is
+    /// the one exercised. Because the reduction order is preserved the match is
+    /// in fact bit-exact; the `1e-9` band is the contract floor.
+    #[test]
+    pub(crate) fn parallel_evaluate_matches_serial_reference() {
+        let n = DISPERSION_PARALLEL_ROW_THRESHOLD * 3 + 7;
+        // Deterministic LCG row data (no rng dependency).
+        let mut state: u64 = 0xD1B5_4A32_D192_ED03;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 11) as f64) / ((1u64 << 53) as f64)
+        };
+
+        for kind in [
+            DispersionFamilyKind::NegativeBinomial,
+            DispersionFamilyKind::Gamma,
+            DispersionFamilyKind::Beta,
+            DispersionFamilyKind::Tweedie { p: 1.5 },
+        ] {
+            let y = Array1::from_shape_fn(n, |_| match kind {
+                DispersionFamilyKind::Beta => 1e-3 + (1.0 - 2e-3) * next(),
+                DispersionFamilyKind::NegativeBinomial => (next() * 12.0).floor(),
+                _ => 0.05 + 8.0 * next(),
+            });
+            let weights = Array1::from_shape_fn(n, |_| 0.25 + 2.0 * next());
+            let eta_mu = Array1::from_shape_fn(n, |_| -1.0 + 2.0 * next());
+            let eta_d = Array1::from_shape_fn(n, |_| -1.0 + 2.0 * next());
+
+            let family = DispersionGlmLocationScaleFamily {
+                kind,
+                y: y.clone(),
+                weights: weights.clone(),
+            };
+            let states = vec![
+                ParameterBlockState {
+                    beta: Array1::zeros(0),
+                    eta: eta_mu.clone(),
+                },
+                ParameterBlockState {
+                    beta: Array1::zeros(0),
+                    eta: eta_d.clone(),
+                },
+            ];
+
+            // Serial reference, computed exactly as the pre-parallel loop did.
+            let mut ll_ref = 0.0;
+            let mut mw_ref = Array1::<f64>::zeros(n);
+            let mut mr_ref = Array1::<f64>::zeros(n);
+            let mut dw_ref = Array1::<f64>::zeros(n);
+            let mut dr_ref = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let row = dispersion_row_kernel(kind, y[i], eta_mu[i], eta_d[i], weights[i]);
+                if row.loglik.is_finite() {
+                    ll_ref += row.loglik;
+                }
+                mw_ref[i] = row.mean_weight.max(0.0);
+                mr_ref[i] = row.mean_response;
+                dw_ref[i] = row.disp_weight.max(0.0);
+                dr_ref[i] = row.disp_response;
+            }
+
+            let eval = family.evaluate(&states).expect("parallel evaluate");
+            assert_close(
+                &format!("{kind:?} evaluate log-likelihood"),
+                eval.log_likelihood,
+                ll_ref,
+                1e-9,
+            );
+
+            let BlockWorkingSet::Diagonal {
+                working_response: mr,
+                working_weights: mw,
+            } = &eval.blockworking_sets[0]
+            else {
+                panic!("mean block not diagonal");
+            };
+            let BlockWorkingSet::Diagonal {
+                working_response: dr,
+                working_weights: dw,
+            } = &eval.blockworking_sets[1]
+            else {
+                panic!("dispersion block not diagonal");
+            };
+            for i in 0..n {
+                assert_close("mean weight", mw[i], mw_ref[i], 1e-9);
+                assert_close("mean response", mr[i], mr_ref[i], 1e-9);
+                assert_close("disp weight", dw[i], dw_ref[i], 1e-9);
+                assert_close("disp response", dr[i], dr_ref[i], 1e-9);
+            }
+
+            // `log_likelihood_only` takes the same parallel-then-serial-sum
+            // path; its value-only kernel is bit-identical to evaluate's loglik.
+            let ll_only = family
+                .log_likelihood_only(&states)
+                .expect("parallel log_likelihood_only");
+            assert_close(
+                &format!("{kind:?} log_likelihood_only"),
+                ll_only,
+                ll_ref,
+                1e-9,
+            );
         }
     }
 }
