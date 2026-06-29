@@ -501,7 +501,7 @@ fn kernel_should_parallelize(n: usize, p: usize) -> bool {
 /// no throughput cost.
 #[inline(always)]
 fn fma_dot(a: &[f64], b: &[f64]) -> f64 {
-    assert_eq!(a.len(), b.len());
+    assert_eq!(a.len(), b.len(), "fma_dot: operand length mismatch");
     let mut sum = [0.0f64; FMA_LANES];
     let mut comp = [0.0f64; FMA_LANES];
     let mut ca = a.chunks_exact(FMA_LANES);
@@ -545,9 +545,9 @@ fn fma_dot(a: &[f64], b: &[f64]) -> f64 {
 /// `v` (len `p`). Each output row is an independent [`fma_dot`]; rows fan out
 /// in chunks across the Rayon pool when the work is large.
 fn fast_av_rowmajor_into(x_all: &[f64], v: &[f64], n: usize, p: usize, out: &mut [f64]) {
-    assert_eq!(x_all.len(), n * p);
-    assert_eq!(v.len(), p);
-    assert_eq!(out.len(), n);
+    assert_eq!(x_all.len(), n * p, "fast_av_rowmajor_into: x_all length");
+    assert_eq!(v.len(), p, "fast_av_rowmajor_into: v length");
+    assert_eq!(out.len(), n, "fast_av_rowmajor_into: out length");
     if kernel_should_parallelize(n, p) {
         use rayon::prelude::*;
         out.par_chunks_mut(AV_PAR_CHUNK_ROWS)
@@ -593,9 +593,9 @@ fn pairwise_sum_into(parts: &[Vec<f64>], out: &mut [f64]) {
 /// better-conditioned than a single running sum over all `n` rows and trivially
 /// parallel across blocks.
 fn fast_atv_rowmajor_into(x_all: &[f64], v: &[f64], n: usize, p: usize, out: &mut [f64]) {
-    assert_eq!(x_all.len(), n * p);
-    assert_eq!(v.len(), n);
-    assert_eq!(out.len(), p);
+    assert_eq!(x_all.len(), n * p, "fast_atv_rowmajor_into: x_all length");
+    assert_eq!(v.len(), n, "fast_atv_rowmajor_into: v length");
+    assert_eq!(out.len(), p, "fast_atv_rowmajor_into: out length");
     let nblocks = n.div_ceil(ATV_BLOCK_ROWS);
 
     let block_partial = |b: usize| -> Vec<f64> {

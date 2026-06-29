@@ -5173,8 +5173,13 @@ mod contraction_symmetry_tests {
         out
     }
 
-    fn check_bit_identical<const K: usize>(seed: u64, n: usize) {
+    /// Returns the number of bit-equality comparisons performed (`n·K·K·2`), so
+    /// the caller can assert the intended workload actually ran: a generic
+    /// (turbofish) helper call hides its internal assertions, so the count is
+    /// surfaced and checked at the call site.
+    fn check_bit_identical<const K: usize>(seed: u64, n: usize) -> usize {
         let mut r = Rng(seed);
+        let mut checks = 0usize;
         for _ in 0..n {
             let t = rand_sym4::<K>(&mut r);
             let dir: [f64; K] = std::array::from_fn(|_| r.s());
@@ -5196,9 +5201,11 @@ mod contraction_symmetry_tests {
                         t4_full[a][b].to_bits(),
                         "fourth K={K} [{a}][{b}]"
                     );
+                    checks += 2;
                 }
             }
         }
+        checks
     }
 
     /// The output-symmetric contraction is BIT-IDENTICAL to the full nest across
@@ -5206,10 +5213,13 @@ mod contraction_symmetry_tests {
     /// are unchanged; this is a pure speed-only optimization).
     #[test]
     fn contraction_symmetry_is_bit_identical_to_full_nest() {
-        check_bit_identical::<2>(0x0000_0002_C0FF_EE01, 1000);
-        check_bit_identical::<3>(0x0000_0003_C0FF_EE01, 800);
-        check_bit_identical::<4>(0x0000_0004_C0FF_EE01, 600);
-        check_bit_identical::<9>(0x0000_0009_C0FF_EE01, 300);
+        let checks = check_bit_identical::<2>(0x0000_0002_C0FF_EE01, 1000)
+            + check_bit_identical::<3>(0x0000_0003_C0FF_EE01, 800)
+            + check_bit_identical::<4>(0x0000_0004_C0FF_EE01, 600)
+            + check_bit_identical::<9>(0x0000_0009_C0FF_EE01, 300);
+        // Guards against the loops silently not running (e.g. a zeroed count):
+        // 1000·2²·2 + 800·3²·2 + 600·4²·2 + 300·9²·2.
+        assert_eq!(checks, 8000 + 14400 + 19200 + 48600);
     }
 
     /// Measure the wall-clock of the output-symmetric contraction vs the full
