@@ -1374,6 +1374,20 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
         // ∂²/∂p_a∂p_b directly. Bit-identical to `row_nll_tower(row)?` value/grad/
         // Hessian by the `survival_ls_joint_row_kernel_agrees_with_jet_tower_program_all_channels`
         // oracle (≤ 1e-9).
+        //
+        // PERF GUARD (#932 speed audit, measured CPU): this dense `Order2<9>`
+        // v/g/H definition is ORACLE-PINNED but currently GATED OFF in production
+        // — `row_kernel_joint_hessian_supported()` returns `false`, so the joint
+        // Hessian ships the bespoke sparse `assemble_joint_hessian_from_quantities`
+        // instead. It is kept gated off on purpose: the dense jet is ~3.8–5.3×
+        // SLOWER than that bespoke sparse assembler (standalone ns/row + `--emit
+        // asm` op counts), because a dense order-2 tower over 9 channels cannot
+        // recover the 3-functionally-independent-index × ≤5-touched-channel
+        // sparsity the bespoke chain rule hard-codes — this is inherent, not a
+        // tuning gap. DO NOT flip `row_kernel_joint_hessian_supported()` to `true`
+        // (or otherwise route the production joint Hessian through this dense
+        // `Order2<9>` row kernel) without FIRST replacing this with a
+        // sparsity-aware packed jet; doing so as-is is a 3.8–5.3× regression.
         let (p, kernel) = self.row_nll_inputs(row)?;
         let vars: [Order2<SLS_ROW_K>; SLS_ROW_K] =
             std::array::from_fn(|a| Order2::variable(p[a], a));
@@ -1690,6 +1704,18 @@ impl SurvivalLocationScaleFamily {
         // bespoke path is the derivative path that currently tracks the
         // survival location-scale likelihood for every supported residual
         // distribution and time-varying channel layout.
+        //
+        // PERF GUARD (#932 speed audit, measured CPU): returning `false` here is
+        // also a deliberate SPEED decision, not only a coverage one. Routing the
+        // joint Hessian through the dense `Order2<9>` single-source row kernel
+        // (`RowKernel<9>::row_kernel`) is ~3.8–5.3× SLOWER than this bespoke
+        // sparse `assemble_joint_hessian_from_quantities` (standalone ns/row +
+        // `--emit asm` op counts): a dense order-2 tower over 9 channels cannot
+        // recover the 3-functionally-independent-index × ≤5-touched-channel
+        // sparsity the bespoke assembler hard-codes. DO NOT return `true` (or
+        // otherwise enable the dense `Order2<9>` joint-Hessian path) without
+        // FIRST replacing the dense row kernel with a sparsity-aware packed jet;
+        // flipping this as-is is a 3.8–5.3× regression on the live fit hot path.
         false
     }
 
