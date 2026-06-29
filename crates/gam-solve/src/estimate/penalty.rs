@@ -414,15 +414,34 @@ impl ParametricColumnConditioning {
                 .beta_covariance_frequentist
                 .take()
                 .map(|cov| self.backtransform_covariance(&cov));
-            // The influence matrix is a mixed linear operator, not a covariance
-            // or Hessian. Drop it across column-conditioning transforms rather
-            // than applying the wrong congruence map.
+            // The influence matrix `F = H⁻¹·X'WX` is a mixed linear operator
+            // (it transforms by SIMILARITY `F_orig = M·F_int·M⁻¹`, not
+            // congruence). We do not carry the similarity primitive here, so
+            // drop `F` rather than applying the wrong map; downstream code can
+            // reconstruct it from the (now-preserved) original-basis `H` and
+            // `X'WX` when it needs it.
             inf.coefficient_influence = None;
-            // X'WX is a congruence object under column-conditioning transforms;
-            // its companion `F` is dropped here, so drop the stored Gram too and
-            // let the WPS correction fall back to the conditional EDF rather than
-            // applying a mismatched congruence map.
-            inf.weighted_gram = None;
+            // X'WX is a genuine congruence object under column-conditioning —
+            // it transforms by EXACTLY the same map as the penalized Hessian
+            // `H` (both are `Mᵀ·(·)_orig·M` internally, so `(·)_orig =
+            // M⁻ᵀ·(·)_int·M⁻¹`): from `X_int = X_orig·M` we get
+            // `X_intᵀ·W·X_int = Mᵀ·(X_orgᵀ·W·X_org)·M`. The Hessian is
+            // back-transformed two lines above; back-transform the Gram with the
+            // identical congruence so it survives in the original basis. This
+            // keeps `X'WX = H − S(λ)` consistent (both factors mapped the same
+            // way), restores the exact WPS corrected-EDF term `tr(X'WX·Σ_ρ)`
+            // for every model carrying a parametric (non-intercept) term — that
+            // trace is congruence-invariant, so it matches the internal-basis
+            // value bit-for-bit — and lets the debiased-functional Riesz engine
+            // recover `S(λ)·β` (issue #1622) instead of aborting on a missing
+            // Gram. Previously this was unconditionally nulled, silently
+            // degrading the corrected EDF to its conditional fallback and making
+            // `debiased_functional` unavailable for the entire `y ~ x` /
+            // `y ~ s(x) + z` class of Gaussian models.
+            inf.weighted_gram = inf
+                .weighted_gram
+                .take()
+                .map(|g| self.backtransform_penalized_hessian(&g));
             inf.bias_correction_beta = inf
                 .bias_correction_beta
                 .take()
