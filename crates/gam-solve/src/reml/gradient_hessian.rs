@@ -1378,13 +1378,28 @@ impl<'a> RemlState<'a> {
             eta_i.push(ei);
         }
 
+        // Each per-penalty Firth direction depends only on eta_i[idx] (the
+        // β-direction δη for penalty idx), so it is constant across both the
+        // h_i loop below and every (i,j) pair in the second-derivative loop.
+        // Building it once here avoids the O(k²) redundant rebuilds that
+        // hphisecond_direction_apply otherwise triggered (each rebuild is an
+        // O(n·r²) reduced-Gram), which dominate the Firth outer-Hessian cost
+        // for binomial/logit REML (#1575). This is exact: direction_from_deta
+        // is a pure function of (op, eta_i[idx]).
+        let firth_dir_i: Vec<super::FirthDirection> = match firth_op {
+            Some(op) => eta_i
+                .iter()
+                .map(|e| op.direction_from_deta(e.clone()))
+                .collect(),
+            None => Vec::new(),
+        };
+
         let mut h_i = Vec::with_capacity(k);
         for idx in 0..k {
             let diag = c_array * &eta_i[idx];
             let mut h = &a_mats[idx] + &Self::tk_xt_diag_x(x_dense, &diag);
             if let Some(op) = firth_op {
-                let dir = op.direction_from_deta(eta_i[idx].clone());
-                h -= &op.hphi_direction(&dir);
+                h -= &op.hphi_direction(&firth_dir_i[idx]);
             }
             gam_linalg::matrix::symmetrize_in_place(&mut h);
             h_i.push(h);
@@ -1419,10 +1434,14 @@ impl<'a> RemlState<'a> {
                 if let Some(op) = firth_op {
                     let dir_ij = op.direction_from_deta(eta_ij);
                     h -= &op.hphi_direction(&dir_ij);
-                    let dir_i = op.direction_from_deta(eta_i[i].clone());
-                    let dir_j = op.direction_from_deta(eta_i[j].clone());
+                    // Reuse the per-penalty directions built once above instead
+                    // of rebuilding dir_i/dir_j for every (i,j) pair (#1575).
                     let eye = Array2::<f64>::eye(p);
-                    h -= &op.hphisecond_direction_apply(&dir_i, &dir_j, &eye);
+                    h -= &op.hphisecond_direction_apply(
+                        &firth_dir_i[i],
+                        &firth_dir_i[j],
+                        &eye,
+                    );
                 }
                 gam_linalg::matrix::symmetrize_in_place(&mut h);
                 h_ij[i][j] = h.clone();
@@ -7321,4 +7340,161 @@ pub(crate) fn predict_warm_start_beta_ift_from_mode_response_cols(
         Coefficients::new(predicted),
         IftPredictionOutcome::Predicted,
     ))
+}
+
+#[cfg(test)]
+mod firth_hessian_direction_reuse_tests {
+    use super::*;
+    use gam_problem::{InverseLink, StandardLink};
+    use gam_terms::construction::CanonicalPenalty;
+    use ndarray::{Array1, Array2};
+
+    // Small deterministic logit design used to exercise the Firth outer-Hessian
+    // direction path that #1575 made redundant-free.
+    fn synthetic_logit_setup() -> (
+        Array2<f64>,
+        Array1<f64>,
+        super::super::FirthDenseOperator,
+        Vec<CanonicalPenalty>,
+        Vec<f64>,
+    ) {
+        let n = 24usize;
+        let p = 6usize;
+        let mut x = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            let t = (i as f64) / (n as f64 - 1.0);
+            x[[i, 0]] = 1.0;
+            x[[i, 1]] = t;
+            x[[i, 2]] = t * t;
+            x[[i, 3]] = (3.0 * t).sin();
+            x[[i, 4]] = (2.0 * t).cos();
+            x[[i, 5]] = (t - 0.5).abs();
+        }
+        // A bounded β keeps η finite so the logit weights are strictly positive
+        // (the regime the Firth reduced-Fisher operator is built for).
+        let beta = Array1::from(vec![0.2_f64, -0.4, 0.3, 0.1, -0.2, 0.15]);
+        let eta = x.dot(&beta);
+        let op = super::super::FirthDenseOperator::build_for_link(
+            &InverseLink::Standard(StandardLink::Logit),
+            &x,
+            &eta,
+        )
+        .expect("firth operator");
+
+        // Two block-local canonical penalties (k = 2) over disjoint coordinate
+        // ranges, mirroring how distinct smooths map onto coefficient blocks.
+        let mut root_a = Array2::<f64>::zeros((2, p));
+        root_a[[0, 1]] = 1.0;
+        root_a[[1, 2]] = 1.0;
+        let mut root_b = Array2::<f64>::zeros((2, p));
+        root_b[[0, 3]] = 1.0;
+        root_b[[1, 4]] = 1.0;
+        let penalties = vec![
+            CanonicalPenalty::from_dense_root(root_a, p),
+            CanonicalPenalty::from_dense_root(root_b, p),
+        ];
+        let lambdas = vec![0.7_f64, 1.3_f64];
+        (x, beta, op, penalties, lambdas)
+    }
+
+    // The #1575 fix replaces per-(i,j)-pair rebuilds of the per-penalty Firth
+    // directions with a single precomputed reuse. This locks in the invariant
+    // that makes the substitution exact: a reused FirthDirection feeds
+    // hphisecond_direction_apply to the same bits as a freshly rebuilt one.
+    #[test]
+    fn reused_firth_direction_matches_freshly_rebuilt_second_derivative() {
+        let (x, _beta, op, _pen, _lam) = synthetic_logit_setup();
+        let p = x.ncols();
+        // Two distinct β-directions, exactly as eta_i[i]/eta_i[j] would be.
+        let deta_i = x.dot(&Array1::from(vec![0.5, -0.1, 0.2, 0.0, 0.3, -0.4]));
+        let deta_j = x.dot(&Array1::from(vec![-0.2, 0.4, -0.3, 0.1, 0.0, 0.25]));
+
+        // Reuse path (what the fixed loop does): build each direction once.
+        let dir_i_once = op.direction_from_deta(deta_i.clone());
+        let dir_j_once = op.direction_from_deta(deta_j.clone());
+        let eye = Array2::<f64>::eye(p);
+        let reused = op.hphisecond_direction_apply(&dir_i_once, &dir_j_once, &eye);
+
+        // Rebuild path (the pre-fix loop body): build fresh directions per use.
+        let fresh = op.hphisecond_direction_apply(
+            &op.direction_from_deta(deta_i.clone()),
+            &op.direction_from_deta(deta_j.clone()),
+            &eye,
+        );
+
+        assert_eq!(
+            reused, fresh,
+            "reusing a precomputed FirthDirection must be bit-identical to rebuilding it"
+        );
+        // Sanity: the operator is doing real work (not returning zeros).
+        assert!(
+            reused.iter().any(|v| v.abs() > 0.0),
+            "second directional derivative should be non-trivial"
+        );
+        assert!(
+            reused.iter().all(|v| v.is_finite()),
+            "second directional derivative must be finite"
+        );
+    }
+
+    // Drives the full changed function end-to-end and checks the Firth outer
+    // Hessian it produces is symmetric and finite. Exercises the precompute-
+    // -and-reuse path for every (i,j) pair (k=2 -> 3 pairs, each reusing the
+    // 2 precomputed directions).
+    #[test]
+    fn tk_hessian_rho_canonical_logit_firth_is_symmetric_and_finite() {
+        let (x, beta, op, penalties, lambdas) = synthetic_logit_setup();
+        let n = x.nrows();
+        // Tierney-Kadane derivative arrays for the canonical logit working
+        // model; any smooth bounded values suffice to exercise the assembly.
+        let c_array = Array1::from_elem(n, 0.05_f64);
+        let d_array = Array1::from_elem(n, -0.02_f64);
+        let e_array = Array1::from_elem(n, 0.01_f64);
+        let f_array = Array1::from_elem(n, -0.005_f64);
+
+        // An explicit SPD H to invert: Xᵀ diag(w) X + ridge, solved via faer.
+        let p = x.ncols();
+        let xtwx = RemlState::tk_xt_diag_x(&x, &op.pirls_hat_diag());
+        let mut h = xtwx;
+        for d in 0..p {
+            h[[d, d]] += 1.0;
+        }
+        let h_solver = h.clone();
+        let h_inv_solve = move |rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
+            let sol = gam_linalg::utils::solve_symmetric_vector_with_floor(&h_solver, rhs, 1e-10)
+                .expect("well-conditioned SPD solve");
+            Ok(sol)
+        };
+
+        let hess = RemlState::tk_hessian_rho_canonical_logit(
+            &x,
+            &c_array,
+            &d_array,
+            &e_array,
+            &f_array,
+            &penalties,
+            &lambdas,
+            &beta,
+            Some(&op),
+            &h_inv_solve,
+        )
+        .expect("tk hessian");
+
+        let k = penalties.len();
+        assert_eq!(hess.dim(), (k, k));
+        assert!(
+            hess.iter().all(|v| v.is_finite()),
+            "Firth outer Hessian must be finite: {hess:?}"
+        );
+        for i in 0..k {
+            for j in 0..k {
+                assert!(
+                    (hess[[i, j]] - hess[[j, i]]).abs() <= 1e-9,
+                    "Firth outer Hessian must be symmetric: ({i},{j}) {} vs {}",
+                    hess[[i, j]],
+                    hess[[j, i]]
+                );
+            }
+        }
+    }
 }
