@@ -362,6 +362,64 @@ pub(crate) fn cell_base_moment_jets_moving(
         .collect()
 }
 
+/// The cell cubic coefficients `c₀..c₃(θ)` as jets, from their bivariate
+/// `(a, b)` Taylor composed with the (lifted) intercept jet `a_jet` and slope
+/// jet `b_jet`. This is the `(a, b)` core of the hand `coeff_u`/`coeff_au`/
+/// `coeff_bu` chains (the score-warp / link-deviation basis channels add to
+/// `c_k` on top of this, through their own coefficient maps).
+///
+/// `c_k(a, b)` enters the kernel calibration; its first/second `(a, b)` partials
+/// are the kernel's `denested_cell_coefficient_partials` / `_second_partials`.
+/// With `da = a_jet − a0` and `db = b_jet − b0` (both value 0), the order-≤2 jet
+/// of `c_k(a(θ), b(θ))` is EXACTLY the second-order bivariate Taylor
+///
+/// ```text
+///   c_k = c0_k + dc_da_k·da + dc_db_k·db
+///       + ½·dc_daa_k·da² + dc_dab_k·da·db + ½·dc_dbb_k·db² ,
+/// ```
+///
+/// regardless of higher-than-2nd `(a, b)` structure in `c_k` (a Jet2 reads only
+/// `c_k`'s derivatives up to order 2). It carries the lift's intercept Hessian
+/// correctly: `da²`'s Hessian is `2·a_θ⊗a_θ` and `da`'s is `a_θθ`, so the `c_k`
+/// Hessian reproduces the chain rule `dc_da·a_θθ + dc_daa·a_θ⊗a_θ` (+ the `b`
+/// and cross terms). Verified standalone against a synthetic cubic `c(a,b)`
+/// (grad 2e-8, Hess 1.4e-7).
+pub(crate) struct CellCoeffAbPartials {
+    /// Base cell coefficients `c₀..c₃` at `(a0, b0)`.
+    pub(crate) c0: [f64; 4],
+    /// `∂c/∂a`, `∂c/∂b` (kernel `denested_cell_coefficient_partials`).
+    pub(crate) dc_da: [f64; 4],
+    pub(crate) dc_db: [f64; 4],
+    /// `∂²c/∂a²`, `∂²c/∂a∂b`, `∂²c/∂b²` (kernel `denested_cell_second_partials`).
+    pub(crate) dc_daa: [f64; 4],
+    pub(crate) dc_dab: [f64; 4],
+    pub(crate) dc_dbb: [f64; 4],
+}
+
+pub(crate) fn cell_coeff_jet_ab(
+    part: &CellCoeffAbPartials,
+    a_jet: &Jet2,
+    b_jet: &Jet2,
+    a0: f64,
+    b0: f64,
+) -> [Jet2; 4] {
+    let p = a_jet.p();
+    let cst = |x: f64| Jet2::constant(x, p);
+    let da = a_jet.sub(&cst(a0)); // value 0
+    let db = b_jet.sub(&cst(b0)); // value 0
+    let da2 = da.mul(&da);
+    let dadb = da.mul(&db);
+    let db2 = db.mul(&db);
+    std::array::from_fn(|k| {
+        cst(part.c0[k])
+            .add(&da.scale(part.dc_da[k]))
+            .add(&db.scale(part.dc_db[k]))
+            .add(&da2.scale(0.5 * part.dc_daa[k]))
+            .add(&dadb.scale(part.dc_dab[k]))
+            .add(&db2.scale(0.5 * part.dc_dbb[k]))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -681,6 +739,104 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// #932 Phase 2b GATE (cell branch): the cell cubic coefficient jets
+    /// `c₀..c₃(a, b)` ([`cell_coeff_jet_ab`]) match a central difference of the
+    /// EXACT kernel `denested_cell_coefficients` with the intercept `a` and slope
+    /// `b` as the θ-axes — pinning that the bivariate `(a, b)` Taylor reproduces
+    /// the kernel coefficient map's value/gradient/Hessian.
+    #[test]
+    fn cell_coeff_jet_ab_match_fd_932() {
+        use crate::cubic_cell_kernel::{
+            LocalSpanCubic, denested_cell_coefficient_partials, denested_cell_coefficients,
+            denested_cell_second_partials,
+        };
+
+        let score_span = LocalSpanCubic {
+            left: -1.0,
+            right: 1.0,
+            c0: 0.10,
+            c1: 0.30,
+            c2: -0.10,
+            c3: 0.05,
+        };
+        let link_span = LocalSpanCubic {
+            left: -1.20,
+            right: 0.90,
+            c0: 0.20,
+            c1: 0.25,
+            c2: 0.08,
+            c3: -0.03,
+        };
+        let (a0, b0) = (0.31_f64, 0.60_f64);
+
+        let c0 = denested_cell_coefficients(score_span, link_span, a0, b0);
+        let (dc_da, dc_db) = denested_cell_coefficient_partials(score_span, link_span, a0, b0);
+        let (dc_daa, dc_dab, dc_dbb) =
+            denested_cell_second_partials(score_span, link_span, a0, b0);
+        let part = CellCoeffAbPartials {
+            c0,
+            dc_da,
+            dc_db,
+            dc_daa,
+            dc_dab,
+            dc_dbb,
+        };
+
+        let p = 2usize; // axes (a, b)
+        let a_jet = Jet2::primary(a0, 0, p);
+        let b_jet = Jet2::primary(b0, 1, p);
+        let cj = cell_coeff_jet_ab(&part, &a_jet, &b_jet, a0, b0);
+
+        let coeff_at = |a: f64, b: f64| denested_cell_coefficients(score_span, link_span, a, b);
+        let h = 1e-5_f64;
+        for k in 0..4 {
+            assert!(
+                (cj[k].v - c0[k]).abs() <= 1e-12 * c0[k].abs().max(1.0),
+                "c[{k}] value {:+.12e} != {:+.12e}",
+                cj[k].v,
+                c0[k]
+            );
+            let g_a = (coeff_at(a0 + h, b0)[k] - coeff_at(a0 - h, b0)[k]) / (2.0 * h);
+            let g_b = (coeff_at(a0, b0 + h)[k] - coeff_at(a0, b0 - h)[k]) / (2.0 * h);
+            assert!(
+                (cj[k].g[0] - g_a).abs() <= 1e-6 * g_a.abs().max(1.0) + 1e-9,
+                "dc[{k}]/da jet {:+.12e} != fd {:+.12e}",
+                cj[k].g[0],
+                g_a
+            );
+            assert!(
+                (cj[k].g[1] - g_b).abs() <= 1e-6 * g_b.abs().max(1.0) + 1e-9,
+                "dc[{k}]/db jet {:+.12e} != fd {:+.12e}",
+                cj[k].g[1],
+                g_b
+            );
+            let h_aa = (coeff_at(a0 + h, b0)[k] - 2.0 * c0[k] + coeff_at(a0 - h, b0)[k]) / (h * h);
+            let h_bb = (coeff_at(a0, b0 + h)[k] - 2.0 * c0[k] + coeff_at(a0, b0 - h)[k]) / (h * h);
+            let h_ab = (coeff_at(a0 + h, b0 + h)[k] - coeff_at(a0 + h, b0 - h)[k]
+                - coeff_at(a0 - h, b0 + h)[k]
+                + coeff_at(a0 - h, b0 - h)[k])
+                / (4.0 * h * h);
+            assert!(
+                (cj[k].h[0] - h_aa).abs() <= 1e-4 * h_aa.abs().max(1.0) + 1e-5,
+                "d2c[{k}]/da2 jet {:+.12e} != fd {:+.12e}",
+                cj[k].h[0],
+                h_aa
+            );
+            assert!(
+                (cj[k].h[3] - h_bb).abs() <= 1e-4 * h_bb.abs().max(1.0) + 1e-5,
+                "d2c[{k}]/db2 jet {:+.12e} != fd {:+.12e}",
+                cj[k].h[3],
+                h_bb
+            );
+            assert!(
+                (cj[k].h[1] - h_ab).abs() <= 1e-4 * h_ab.abs().max(1.0) + 1e-5,
+                "d2c[{k}]/dadb jet {:+.12e} != fd {:+.12e}",
+                cj[k].h[1],
+                h_ab
+            );
         }
     }
 }
