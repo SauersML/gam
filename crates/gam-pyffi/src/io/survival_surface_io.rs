@@ -237,7 +237,6 @@ fn write_csv_field(writer: &mut BufWriter<File>, value: &str) -> std::io::Result
     writer.write_all(b"\"")
 }
 
-#[allow(clippy::too_many_arguments)]
 fn survival_csv_interpolate(
     surface_values: &[f64],
     n_cols: usize,
