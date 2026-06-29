@@ -86,7 +86,7 @@ impl SaeManifoldTerm {
     /// line-search value path use the same gate even as trial decoders move.
     ///
     /// The per-pair weight is
-    /// `sae_decoder_repulsion_strength() · gate(s_jk) / (‖B_j‖²_F·‖B_k‖²_F)` with
+    /// `decoder_repulsion_strength() · gate(s_jk) / (‖B_j‖²_F·‖B_k‖²_F)` with
     /// the normalized collinearity score
     /// `s_jk = ‖B_jB_kᵀ‖²_F / (‖B_j‖²_F·‖B_k‖²_F)` and a C1 smoothstep gate that
     /// is exactly 0 below [`SAE_DECODER_REPULSION_COLLINEARITY_GATE`]. The gate is
@@ -118,6 +118,9 @@ impl SaeManifoldTerm {
         let candidates = self.barrier_coactive_pairs();
         let mut gate: Vec<(usize, usize, f64)> = Vec::new();
         let s0 = SAE_DECODER_REPULSION_COLLINEARITY_GATE;
+        // #1610 data-derived strength, hoisted (μ_C is a per-dictionary scalar,
+        // not per-pair); the gate is refreshed once per assembly.
+        let repulsion_strength = self.decoder_repulsion_strength();
         for (j, k, _qjk) in candidates {
             // Both decoders need a usable scale; a ~zero decoder has no
             // direction to be collinear with, so leave the pair at 0 (the
@@ -165,10 +168,9 @@ impl SaeManifoldTerm {
                 // the cross-Gram energy). `norm_sq[j], norm_sq[k] > 0` is guaranteed
                 // by the scale guard above. The strength is a derived dimensionless
                 // fraction of the primary separation-barrier strength
-                // (`sae_decoder_repulsion_strength`), not an independent magic
+                // (`decoder_repulsion_strength`), not an independent magic
                 // constant; at unit decoder scale it reduces to the historical `1e-3`.
-                let w =
-                    sae_decoder_repulsion_strength() * gate_value / (norm_sq[j] * norm_sq[k]);
+                let w = repulsion_strength * gate_value / (norm_sq[j] * norm_sq[k]);
                 gate.push((j, k, w));
             }
         }
@@ -194,7 +196,7 @@ impl SaeManifoldTerm {
         // The operator multiplies its quadratic by `weight·pair_weight`; we want
         // the effective per-pair weight to be exactly the gate weight (which
         // already folds in the #1610 energy-normalized
-        // `sae_decoder_repulsion_strength()/(‖B_j‖²_F·‖B_k‖²_F)`), so pass weight=1
+        // `decoder_repulsion_strength()/(‖B_j‖²_F·‖B_k‖²_F)`), so pass weight=1
         // and feed the frozen gate directly as the sparse symmetrized pair list.
         DecoderIncoherencePenalty::new_sparse(
             PsiSlice {
@@ -381,12 +383,91 @@ impl SaeManifoldTerm {
         rel * rel * max_norm_sq
     }
 
+    /// #1610 — the dictionary's NOMINAL reachable linear rank: the linear
+    /// dimension the union of the atoms' chart images can span on this sample,
+    /// `min(Σ_k min(M_k, p), n, p)`. This is the cheap (SVD-free) form of
+    /// [`super::outer_objective::reachable_dictionary_rank`]: it uses each atom's
+    /// nominal coefficient count `M_k` (capped at the output dim `p`) instead of
+    /// the realized chart-image rank. The realized (SVD) rank is what the collapse
+    /// THRESHOLD keys on — it must not over-state a curved atom's linear reach —
+    /// but the barrier STRENGTH below only needs a coarse overcompleteness scalar,
+    /// so it deliberately uses the nominal count (exactly the value
+    /// `reachable_dictionary_rank` itself falls back to when an atom's chart SVD is
+    /// un-computable) and avoids a per-line-search-trial SVD over the `n × M_k`
+    /// chart designs. `0` only for a degenerate empty term.
+    pub(crate) fn nominal_reachable_rank(&self) -> usize {
+        let p = self.output_dim();
+        let n = self.n_obs();
+        if p == 0 || n == 0 {
+            return 0;
+        }
+        let sum: usize = self.atoms.iter().map(|atom| atom.basis_size().min(p)).sum();
+        sum.min(n).min(p)
+    }
+
+    /// #1026/#1522/#1610 — DATA-DERIVED separation-barrier strength `μ_C`.
+    ///
+    /// The barrier is `P_sep = -μ_C · Σ_{j<k} q_jk · log(1 - c_jk² + ε)` on the
+    /// NORMALIZED decoder shapes `U_k = B_k/‖B_k‖`, `c_jk² = ‖U_jU_kᵀ‖²_F`
+    /// (squared principal-angle cosine ∈ [0,1]), weighted by the normalized
+    /// coactivation `q_jk ∈ [0,1]`. Its force `∂P/∂c_jk = 2μ_C q_jk c/(1-c²+ε)`
+    /// DIVERGES as two coactive atoms align (`c→1`) and is exactly 0 at
+    /// orthogonality; it sees only the SHAPE, so it does not switch off at small
+    /// amplitude.
+    ///
+    /// #1610 — the strength is no longer the hand-picked absolute `10.0` (a
+    /// magnitude matched to no problem scale; the old constant only "worked" at a
+    /// unit corpus scale). The documented collapse mechanism (see `term.rs`
+    /// ~`SaeManifoldTerm` doc: two atoms drift onto ONE decoder direction "at
+    /// `K ≥ 4` on real residual geometry") is driven by OVERCOMPLETENESS — collapse
+    /// pressure rises precisely as the atom count `K` outruns the linear rank the
+    /// corpus can actually support — so the anti-collinearity barrier's stiffness
+    /// is keyed to that same overcompleteness:
+    ///
+    ///   `μ_C = K / reachable_rank`.
+    ///
+    /// This is (a) DIMENSIONLESS — a ratio of counts/ranks — so the barrier value
+    /// stays invariant under a global corpus rescaling `B_k → s·B_k` (the same
+    /// scale-free property the #1610 norm-floor and energy-normalized repulsion
+    /// already guarantee, since `c_jk²` and `q_jk` are scale-free); (b)
+    /// DATA-DERIVED — the reachable rank is read from the actual chart/coefficient
+    /// geometry (the established #1610 quantity), not a frozen constant; and (c)
+    /// PRINCIPLED — an exactly-complete dictionary (`K = rank`) gets the
+    /// unit-information barrier `μ_C = 1`, while a `q`-times-overcomplete dictionary
+    /// gets `μ_C = q`, so the barrier strengthens exactly where the collapse it
+    /// prevents is driven from. The interior-point `1/(1-c²+ε)` divergence supplies
+    /// the restoring force near alignment regardless of the prefactor (the old doc
+    /// already noted "a large flat-region prefactor is unnecessary"), so keying the
+    /// O(1) prefactor to the overcompleteness — rather than freezing it at 10 —
+    /// removes the magic without losing the barrier near the collapse boundary.
+    ///
+    /// The process-global runtime override (`set_sae_barrier_overrides`, used by
+    /// the Python FFI to sweep `μ_C` from one compiled wheel) takes precedence:
+    /// when set, it is the absolute `μ_C` and the derived value is bypassed.
+    pub(crate) fn separation_barrier_strength(&self) -> f64 {
+        if let Some(over) = sae_separation_barrier_override() {
+            return over;
+        }
+        let rank = self.nominal_reachable_rank().max(1);
+        (self.k_atoms() as f64) / (rank as f64)
+    }
+
+    /// #1610 derived decoder-repulsion strength: a dimensionless fraction
+    /// [`SAE_DECODER_REPULSION_BARRIER_RATIO`] of the data-derived (or
+    /// runtime-overridden) separation-barrier strength `μ_C`. Single source for
+    /// the energy-normalized per-pair repulsion weight, so the subdominant
+    /// conditioner stays a fixed fraction of the primary barrier under any sweep
+    /// of `μ_C`, rather than a frozen independent magic number.
+    pub(crate) fn decoder_repulsion_strength(&self) -> f64 {
+        SAE_DECODER_REPULSION_BARRIER_RATIO * self.separation_barrier_strength()
+    }
+
     /// #1026/#1522 SEPARATION barrier value
     /// `P_sep = -μ_C · Σ_{j<k} q_jk · log(1 - c_jk² + ε)` on the normalized
     /// shapes. Diverges as two coactive atoms align (`c_jk² → 1`); exactly 0 when
     /// their shapes are orthogonal. 0 for `K<2`.
     pub(crate) fn separation_barrier_value(&self, penalty_scale: f64) -> f64 {
-        let mu = penalty_scale * sae_separation_barrier_strength();
+        let mu = penalty_scale * self.separation_barrier_strength();
         if mu == 0.0 {
             return 0.0;
         }
@@ -455,7 +536,7 @@ impl SaeManifoldTerm {
         dense_beta_curvature: bool,
         atom_curv: &mut [f64],
     ) -> bool {
-        let mu = penalty_scale * sae_separation_barrier_strength();
+        let mu = penalty_scale * self.separation_barrier_strength();
         if mu == 0.0 {
             return false;
         }

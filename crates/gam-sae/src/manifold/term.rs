@@ -230,15 +230,11 @@ pub(crate) const SAE_SEED_DISPERSION_FLOOR: f64 = 1.0e-12;
 /// corpus scale.
 pub(crate) const SAE_DECODER_REPULSION_BARRIER_RATIO: f64 = 1.0e-4;
 
-/// #1610 derived decoder-repulsion strength: a dimensionless fraction
-/// [`SAE_DECODER_REPULSION_BARRIER_RATIO`] of the (possibly runtime-overridden)
-/// separation-barrier strength. Single source for the energy-normalized per-pair
-/// repulsion weight. Tracks any `set_sae_barrier_overrides` sweep of the barrier
-/// so the conditioner stays a fixed fraction of the primary barrier under a
-/// parameter sweep, rather than a frozen independent magic number.
-pub(crate) fn sae_decoder_repulsion_strength() -> f64 {
-    SAE_DECODER_REPULSION_BARRIER_RATIO * sae_separation_barrier_strength()
-}
+// The derived decoder-repulsion strength is a dimensionless fraction
+// [`SAE_DECODER_REPULSION_BARRIER_RATIO`] of the data-derived (possibly
+// runtime-overridden) separation-barrier strength μ_C; it is computed on the
+// term itself (it needs the dictionary's overcompleteness, not a global
+// constant) — see [`super::penalties::SaeManifoldTerm::decoder_repulsion_strength`].
 
 /// #1026 normalized collinearity score
 /// `s_jk = ‖B_jB_kᵀ‖²_F / (‖B_j‖²_F·‖B_k‖²_F)` at/above which the decoder
@@ -276,10 +272,10 @@ pub(crate) const SAE_COACTIVE_RELATIVE_MASS_FLOOR: f64 = 1.0e-3;
 // collapse boundary, so the inner Newton can never reach it.
 
 // #1026/#1522 — RUNTIME separation-barrier-strength override. Read through the
-// accessor below instead of the raw const so a SINGLE compiled wheel can sweep
-// μ_sep from Python (`set_sae_barrier_overrides`) without recompiling. A
-// quiet-NaN sentinel means "unset → use the compiled default const", so 0.0
-// remains a legitimate swept value (barrier disabled). The amplitude
+// accessor below so a SINGLE compiled wheel can sweep μ_sep from Python
+// (`set_sae_barrier_overrides`) without recompiling. A quiet-NaN sentinel means
+// "unset → derive μ_C from the problem" (the data-derived overcompleteness
+// ratio), so 0.0 remains a legitimate swept value (barrier disabled). The amplitude
 // (keep-alive) barrier was removed: an over-complete dictionary's surplus
 // features SHOULD die, and a dead atom's decoder block is parked into a
 // well-conditioned state by the inner per-row Tikhonov ridge — forcing the
@@ -287,14 +283,16 @@ pub(crate) const SAE_COACTIVE_RELATIVE_MASS_FLOOR: f64 = 1.0e-3;
 // death. So there is no amplitude strength or active-atom gate to override.
 static SAE_SEP_STRENGTH_OVERRIDE_BITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0x7ff8_0000_0000_0000);
-pub(crate) fn sae_separation_barrier_strength() -> f64 {
+/// #1026/#1522/#1610 — read the process-global separation-barrier-strength
+/// override, or `None` when unset. `None` ⇒ the data-derived μ_C (the
+/// overcompleteness ratio from
+/// [`super::penalties::SaeManifoldTerm::separation_barrier_strength`]) is used.
+/// A quiet-NaN sentinel means "unset → derive from the problem"; `0.0` stays a
+/// legitimate swept value (barrier disabled).
+pub(crate) fn sae_separation_barrier_override() -> Option<f64> {
     let v =
         f64::from_bits(SAE_SEP_STRENGTH_OVERRIDE_BITS.load(std::sync::atomic::Ordering::Relaxed));
-    if v.is_nan() {
-        SAE_SEPARATION_BARRIER_STRENGTH
-    } else {
-        v
-    }
+    if v.is_nan() { None } else { Some(v) }
 }
 
 /// Set the process-global SAE separation-barrier strength override (one wheel,
@@ -307,21 +305,13 @@ pub fn set_sae_barrier_overrides(sep_strength: f64) {
         .store(sep_strength.to_bits(), std::sync::atomic::Ordering::Relaxed);
 }
 
-/// #1026/#1522 SEPARATION barrier strength `μ_C`. Penalty
-/// `P_sep = -μ_C · Σ_{j<k} q_jk · log(1 - c_jk² + ε)` on the NORMALIZED decoder
-/// shapes `U_k = B_k/‖B_k‖`, `c_jk² = ‖U_jU_kᵀ‖²_F` (squared principal-angle
-/// cosine ∈ [0,1]), weighted by the normalized coactivation
-/// `q_jk = (Σ_i a_ij a_ik)/sqrt(Σa_ij²·Σa_ik²) ∈ [0,1]`. Force on `c_jk`
-/// `∂P/∂c_jk = 2μ_C q_jk c_jk/(1-c_jk²+ε)` DIVERGES as atoms align (`c_jk→1`) and
-/// is exactly 0 when `c_jk = 0` — and, unlike the threshold repulsion, it does
-/// NOT switch off at small amplitude (it sees only the SHAPE `U_k`).
-///
-/// `10` — the separation force already DIVERGES near alignment (`1/(1-c²+ε)`),
-/// so a large flat-region prefactor is unnecessary and only adds outer-objective
-/// stiffness away from collapse. (This is the sole remaining barrier; the
-/// amplitude keep-alive barrier was removed — surplus features in an
-/// over-complete dictionary are allowed to die into a ridge-parked state.)
-pub(crate) const SAE_SEPARATION_BARRIER_STRENGTH: f64 = 10.0;
+// #1026/#1522/#1610 — the SEPARATION barrier strength `μ_C` is NO LONGER a
+// hand-picked absolute constant (it was `10.0`, matched to no problem scale).
+// It is now DATA-DERIVED from the dictionary's overcompleteness — see the full
+// derivation on [`super::penalties::SaeManifoldTerm::separation_barrier_strength`]
+// (the penalty form `P_sep = -μ_C Σ q_jk log(1-c²+ε)` on the normalized decoder
+// shapes is documented there). The runtime override
+// (`set_sae_barrier_overrides`) still takes precedence over the derived value.
 
 /// #1026/#1522 SEPARATION barrier softening `ε` in `log(1 - c_jk² + ε)`. Bounds
 /// the barrier (and its PSD majorizer) at the exact-alignment limit `c_jk² = 1`.
@@ -494,7 +484,7 @@ pub struct SaeManifoldTerm {
     /// #1026 decoder-repulsion gate, frozen per assembly (lagged-diffusivity
     /// discipline, exactly like [`SaeManifoldAtom::smooth_penalty`]): the
     /// symmetric `(K, K)` matrix of collinearity gate weights
-    /// `gate(s_jk)·sae_decoder_repulsion_strength()/(‖B_j‖²_F·‖B_k‖²_F)` computed
+    /// `gate(s_jk)·decoder_repulsion_strength()/(‖B_j‖²_F·‖B_k‖²_F)` computed
     /// from the decoder state at assembly entry (#1610: energy-normalized, so the
     /// realized penalty is a function of the dimensionless collinearity `c_jk²`
     /// alone). Both the assembly (gradient into `gb`, PSD

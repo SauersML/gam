@@ -2303,27 +2303,10 @@ fn separation_barrier_collapse_prevention_is_scale_invariant_1610() {
 /// this fails before the normalization and passes after.
 #[test]
 pub(crate) fn decoder_repulsion_strength_is_derived_and_scale_invariant_1610() {
-    // (1) Strength is a DERIVED fraction of the barrier strength, not an
-    // independent absolute constant. (No global-state mutation: pure algebra.)
-    let expected = SAE_DECODER_REPULSION_BARRIER_RATIO * sae_separation_barrier_strength();
-    assert_eq!(
-        sae_decoder_repulsion_strength(),
-        expected,
-        "repulsion strength must be the derived fraction {SAE_DECODER_REPULSION_BARRIER_RATIO} \
-         of the separation-barrier strength {}, got {}",
-        sae_separation_barrier_strength(),
-        sae_decoder_repulsion_strength(),
-    );
-    // At the canonical unit decoder scale the effective per-pair weight reduces
-    // EXACTLY to the historical absolute `1e-3` (10.0 · 1e-4), so unit-scale fits
-    // are byte-unchanged — the normalization is a re-parameterization, not a
-    // behavioral change at unit scale.
-    assert_eq!(
-        sae_decoder_repulsion_strength(),
-        1.0e-3,
-        "at the default barrier strength the derived repulsion strength must reduce \
-         to the historical 1e-3"
-    );
+    // (1) Strength is a DERIVED dimensionless fraction of the data-derived
+    // separation-barrier strength μ_C, not an independent absolute constant.
+    // (Checked on a constructed term below, after the fixture builder — μ_C is
+    // now a per-dictionary quantity, K / reachable_rank, not a global constant.)
 
     // (2) End-to-end scale invariance of the repulsion value.
     let coords0 = array![[0.05], [0.20], [0.55], [0.80], [0.35], [0.65]];
@@ -2378,6 +2361,31 @@ pub(crate) fn decoder_repulsion_strength_is_derived_and_scale_invariant_1610() {
         term.refresh_decoder_repulsion_gate();
         term
     };
+
+    // (1) — the repulsion strength is the derived fraction
+    // `SAE_DECODER_REPULSION_BARRIER_RATIO · μ_C` of the data-derived barrier
+    // strength, and μ_C is itself derived from the dictionary's overcompleteness
+    // (K / reachable_rank), NOT a hand-picked magnitude. Checked on a constructed
+    // unit-scale term (μ_C is now a per-term quantity).
+    let unit_term = build_at_scale(1.0);
+    let expected =
+        SAE_DECODER_REPULSION_BARRIER_RATIO * unit_term.separation_barrier_strength();
+    assert_eq!(
+        unit_term.decoder_repulsion_strength(),
+        expected,
+        "repulsion strength must be the derived fraction {SAE_DECODER_REPULSION_BARRIER_RATIO} \
+         of the data-derived separation-barrier strength {}, got {}",
+        unit_term.separation_barrier_strength(),
+        unit_term.decoder_repulsion_strength(),
+    );
+    let rank = unit_term.nominal_reachable_rank().max(1);
+    assert_eq!(
+        unit_term.separation_barrier_strength(),
+        (unit_term.k_atoms() as f64) / (rank as f64),
+        "μ_C must be the data-derived overcompleteness ratio K/reachable_rank \
+         (K={}, reachable_rank={rank}), not a frozen absolute constant",
+        unit_term.k_atoms(),
+    );
 
     let value_unit = build_at_scale(1.0).decoder_repulsion_value(1.0);
     assert!(
@@ -2805,8 +2813,10 @@ pub(crate) fn oos_linear_images_drive_collapsed_reconstruction() {
         .expect("hybrid split report computes")
         .expect("eligible d=1 atoms present a report");
 
-    // Harvest the trained linear images, then drop the report — emulating a
-    // fresh OOS term that knows the decoder but not the in-fit report.
+    // Harvest the trained linear images (clones) BEFORE installing the report,
+    // so the report can be moved into the term to genuinely engage the train-side
+    // collapse — emulating a fresh OOS term that knows the decoder but not the
+    // in-fit report.
     let images: Vec<_> = report
         .verdicts
         .iter()
@@ -2816,6 +2826,10 @@ pub(crate) fn oos_linear_images_drive_collapsed_reconstruction() {
         !images.is_empty(),
         "the straight slot must yield at least one linear image to thread to OOS"
     );
+    // Install the report so `fitted()` reconstructs the verdict-linear slot by its
+    // straight sub-model (the train-side collapsed reconstruction). Without this
+    // the comparison below is all-curved vs all-curved and silently vacuous.
+    term.hybrid_split_report = Some(report);
     let collapsed_with_report = term.fitted();
     term.hybrid_split_report = None;
 
