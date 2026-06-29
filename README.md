@@ -23,7 +23,8 @@ marginal-slope variant for calibrated risk scores, and a latent-cloglog
 form), Poisson, negative-binomial, Gamma, Beta, Tweedie, multinomial-logit,
 conditional transformation-normal, Royston-Parmar, and parametric /
 semi-parametric survival in six likelihood modes (transformation, Weibull,
-location-scale, marginal-slope, and latent-Gaussian frailty). Firth /
+location-scale, marginal-slope, and latent-Gaussian frailty in `latent`
+and `latent-binary` forms). Firth /
 Jeffreys bias reduction handles separation in binomial fits.
 
 Supported term types in formulas: parametric terms, univariate smooths
