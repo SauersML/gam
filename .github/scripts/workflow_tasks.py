@@ -161,10 +161,20 @@ def download_artifacts(target_name, out_dir_arg):
         return
 
     for a in shard_artifacts:
-        subprocess.run(
-            ["gh", "api", a["archive_download_url"], ">", "artifact.zip"],
-            shell=True, check=True
-        )
+        # `gh api <archive_download_url>` follows the redirect and streams the
+        # zip bytes to stdout; capture that stdout straight into the file.
+        # The previous form passed a LIST with `shell=True`, which on POSIX
+        # runs only argv[0] (`gh`) as the shell command and hands the rest to
+        # it as positional params ($0, $1, …) — so it executed a bare `gh`
+        # (which prints help and exits 0), the `>` redirect and `artifact.zip`
+        # were never honored, and the file never existed. ZipFile then raised
+        # FileNotFoundError, failing every bench shard before it could run.
+        with open("artifact.zip", "wb") as fh:
+            subprocess.run(
+                ["gh", "api", a["archive_download_url"]],
+                check=True,
+                stdout=fh,
+            )
         with zipfile.ZipFile("artifact.zip") as zf:
             zf.extractall(out_dir)
         os.remove("artifact.zip")
