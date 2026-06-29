@@ -5233,10 +5233,30 @@ impl SaeManifoldTerm {
                     self.project_dense_penalty_to_factored(sys.hbb.view(), &frame_projection);
                 ops.push(Arc::new(DensePenaltyOp(hbb_c)));
             } else if beta_penalty_assembly.deferred_factored {
-                let registry =
-                    analytic_penalties.expect("deferred beta curvature requires registry");
-                let hbb_c = self.build_factored_beta_penalty_curvature(
-                    registry,
+                // Registry Beta-tier curvature deferred to factored-space probing.
+                // The registry may be absent when `deferred_factored` was set ONLY
+                // by the frozen-gate decoder repulsion (which is
+                // registry-independent), so start from a zero factored block in
+                // that case instead of unwrapping.
+                let mut hbb_c = match analytic_penalties {
+                    Some(registry) => self.build_factored_beta_penalty_curvature(
+                        registry,
+                        penalty_scale,
+                        &frame_projection,
+                    ),
+                    None => Array2::<f64>::zeros((
+                        frame_projection.border_dim(),
+                        frame_projection.border_dim(),
+                    )),
+                };
+                // #1610 — the frozen-gate decoder repulsion's PSD majorizer was
+                // dropped on this matrix-free/framed path (only its gradient was
+                // applied). Project it into the factored block via the same
+                // `psd_majorizer_hvp` + frame-projection probe pattern the registry
+                // DecoderIncoherence uses, so the collapse-prevention curvature
+                // reaches the operator here too. No-op when no repulsion is active.
+                self.add_factored_repulsion_curvature(
+                    &mut hbb_c,
                     penalty_scale,
                     &frame_projection,
                 );
@@ -5605,6 +5625,48 @@ impl SaeManifoldTerm {
             }
         }
         assert_eq!(p, self.output_dim());
+    }
+
+    /// #1610 — project the frozen-gate decoder-repulsion PSD majorizer into the
+    /// factored β block `hbb_c`. Mirrors the `DecoderIncoherence` arm of
+    /// [`Self::add_factored_beta_penalty_curvature_for_penalty`] but sources the
+    /// penalty from [`Self::live_decoder_repulsion_penalty`] (registry-independent,
+    /// collinearity-gated), so the repulsion curvature reaches the operator on the
+    /// matrix-free/framed path where the dense `sys.hbb` write is unused. No-op
+    /// when no repulsion is active.
+    pub(crate) fn add_factored_repulsion_curvature(
+        &self,
+        hbb_c: &mut Array2<f64>,
+        penalty_scale: f64,
+        projection: &FrameProjection,
+    ) {
+        let Some(per_fit) = self.live_decoder_repulsion_penalty() else {
+            return;
+        };
+        let beta_dim = self.beta_dim();
+        let target_beta = self.flatten_beta();
+        // The repulsion penalty is non-learnable; its strength is already folded
+        // into the frozen gate (see `live_decoder_repulsion_penalty`), so the rho
+        // slice is empty/inert.
+        let rho_local = Array1::<f64>::zeros(0);
+        let mut probe = Array1::<f64>::zeros(beta_dim);
+        for k in 0..self.atoms.len() {
+            for basis_col in 0..projection.basis_sizes[k] {
+                for frame_col in 0..projection.ranks[k] {
+                    probe.fill(0.0);
+                    projection.lift_axis_into(&mut probe, k, basis_col, frame_col);
+                    let col =
+                        projection.border_offsets[k] + basis_col * projection.ranks[k] + frame_col;
+                    let hv =
+                        per_fit.psd_majorizer_hvp(target_beta.view(), rho_local.view(), probe.view());
+                    projection
+                        .project_border_vec(hv.view())
+                        .iter()
+                        .enumerate()
+                        .for_each(|(row, &v)| hbb_c[[row, col]] += penalty_scale * v);
+                }
+            }
+        }
     }
 
     pub(crate) fn ext_coord_matrix(&self) -> Array2<f64> {
