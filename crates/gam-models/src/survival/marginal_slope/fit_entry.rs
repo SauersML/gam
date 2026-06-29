@@ -1154,14 +1154,121 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                             if let Some(real) = smgs_deleted_required_channel_reason(
                                 p_time, p_marg, p_log, fw_time, fw_marg, fw_log,
                             ) {
-                                log::warn!(
-                                    "[smgs phase-4b compiled-map] full row-Hessian compile also \
-                                     deletes channel {real} (time {p_time}→{fw_time}, \
-                                     marginal {p_marg}→{fw_marg}, logslope {p_log}→{fw_log}); \
-                                     alias is genuine — using the unreduced design and leaving \
-                                     the near-null direction to Jeffreys conditioning",
-                                );
-                                Ok(None)
+                                // #979 residual phantom-null path. The full 4×4
+                                // row-Hessian quotient ALSO collapses a required
+                                // channel: the effective metric is genuinely
+                                // rank-deficient here. Historically this fell back
+                                // to the UNREDUCED design + Jeffreys, leaving a
+                                // quadratically-flat near-null direction in the
+                                // joint penalized Hessian — the inner solve could
+                                // not certify stationarity, so the outer wall-clock
+                                // deadline became load-bearing rather than a pure
+                                // backstop.
+                                //
+                                // Instead, MEASURE before deciding. Assemble the
+                                // joint penalized Hessian M = JᵀHJ + S and the
+                                // joint score g at the pilot, eigendecompose, and
+                                // for every near-null direction v measure the
+                                // gradient residual r = |vᵀg|. Accept the
+                                // channel-collapsing reduction (projecting that
+                                // direction away) ONLY when every near-null
+                                // direction is an empirical phantom — r ≤ λ·step,
+                                // i.e. the optimizer would converge it in under one
+                                // trust step, so projecting it changes neither the
+                                // optimum nor hides non-stationarity. If any
+                                // near-null direction carries real non-stationarity
+                                // (r > λ·step, e.g. a near-separating pull), or the
+                                // collapsed channel is the spatial TIME block, we
+                                // refuse to project and keep the conservative
+                                // unreduced + Jeffreys fallback (the deadline still
+                                // backstops). This is the gate that prevents the
+                                // reward-hacking failure mode of silently deleting
+                                // a direction the model genuinely needs — exactly
+                                // the regression a naive nullspace-shrink caused on
+                                // the n ≥ 1000 spatial path.
+                                let gate = (|| -> Result<bool, String> {
+                                    // Protect the spatial/time path: only the
+                                    // marginal↔logslope confound is eligible for
+                                    // measured projection here.
+                                    if real == "time" {
+                                        return Ok(false);
+                                    }
+                                    let time_pen = dense_block_penalty_from_dense_list(
+                                        &spec.time_block.penalties,
+                                        p_time,
+                                    )?;
+                                    let marg_pen = dense_block_penalty_from_blockwise(
+                                        &marginal_design.penalties,
+                                        p_marg,
+                                    )?;
+                                    let log_pen = dense_block_penalty_from_blockwise(
+                                        &logslope_design.penalties,
+                                        p_log,
+                                    )?;
+                                    let s_total = assemble_unit_block_penalty(
+                                        p_time, p_marg, p_log, &time_pen, &marg_pen, &log_pen,
+                                    )?;
+                                    let report = survival_kkt_refusal_report_at_pilot(
+                                        &dq0,
+                                        &dq1,
+                                        &dqd1,
+                                        &m_dq,
+                                        &m_dqd1,
+                                        &g_dg,
+                                        &row_hess,
+                                        &q0_pilot,
+                                        &q1_pilot,
+                                        &qd1_pilot,
+                                        &g_pilot,
+                                        &z_primary,
+                                        &spec.weights,
+                                        &spec.event_target,
+                                        derivative_guard,
+                                        probit_scale,
+                                        &s_total,
+                                        KKT_PHANTOM_TRUST_RADIUS,
+                                    )?;
+                                    log::info!(
+                                        "[smgs phase-4b kkt-refusal] channel={real} {}",
+                                        report.summary(),
+                                    );
+                                    Ok(report.all_near_null_are_phantom())
+                                })();
+                                match gate {
+                                    Ok(true) => {
+                                        log::info!(
+                                            "[smgs phase-4b compiled-map] #979: full row-Hessian \
+                                             collapses channel {real} (time {p_time}→{fw_time}, \
+                                             marginal {p_marg}→{fw_marg}, logslope {p_log}→{fw_log}), \
+                                             but the joint penalized Hessian's near-null \
+                                             direction(s) are MEASURED phantoms (gradient residual \
+                                             ≤ λ·step); engaging the channel-reduced quotient so \
+                                             the phantom null direction is projected out — \
+                                             deadline demoted to backstop",
+                                        );
+                                        Ok(Some((map, (fw_time, fw_marg, fw_log))))
+                                    }
+                                    Ok(false) => {
+                                        log::warn!(
+                                            "[smgs phase-4b compiled-map] full row-Hessian compile \
+                                             also deletes channel {real} (time {p_time}→{fw_time}, \
+                                             marginal {p_marg}→{fw_marg}, logslope {p_log}→{fw_log}); \
+                                             the near-null direction carries real non-stationarity \
+                                             (or is the spatial time block) — refusing to project; \
+                                             using the unreduced design and leaving the near-null \
+                                             direction to Jeffreys conditioning",
+                                        );
+                                        Ok(None)
+                                    }
+                                    Err(reason) => {
+                                        log::warn!(
+                                            "[smgs phase-4b compiled-map] KKT-refusal measurement \
+                                             failed ({reason}); conservatively using the unreduced \
+                                             design for channel {real}",
+                                        );
+                                        Ok(None)
+                                    }
+                                }
                             } else {
                                 log::info!(
                                     "[smgs phase-4b compiled-map] #741: η₁-only metric falsely \
