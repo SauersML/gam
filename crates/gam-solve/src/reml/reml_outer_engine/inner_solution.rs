@@ -134,8 +134,39 @@ pub struct InnerSolution<'dp> {
     pub rho_prior: gam_problem::RhoPrior,
 
     // === Model dimensions ===
-    /// Number of observations.
+    /// Number of positive-weight rows physically present in the design.
+    ///
+    /// This is the literal row count (`#{i : wᵢ > 0}`), used for work-size
+    /// estimation and route logging — quantities that scale with how many
+    /// distinct rows the per-observation scans actually touch. It is **not**
+    /// the dispersion denominator: for that, see [`Self::dispersion_effective_n`].
+    /// With no weights / all weights equal the two coincide.
     pub n_observations: usize,
+
+    /// Effective sample size `Σ wᵢ` (over positive-weight rows) for the
+    /// profiled-dispersion denominator.
+    ///
+    /// `weights` are documented frequency / case weights: a row observed with
+    /// weight `w` contributes `w` copies to the likelihood, so it must count as
+    /// `w` observations — not one — wherever an observation *count* enters the
+    /// statistics. The profiled Gaussian scale is `φ̂ = D_p / (n_eff − M_p)` with
+    /// `D_p = Σ wᵢ rᵢ² + penalty`; the numerator already carries total mass
+    /// `≈ Σ wᵢ`, so the denominator must use the same `Σ wᵢ` for the fit to be
+    /// **exactly** equivalent to the row-expanded data (each row repeated `wᵢ`
+    /// times). Using the row count `n₊` instead inflates `φ̂` by `Σw/n₊`, which
+    /// shrinks/over-smooths the REML λ-selection (#1617) and inflates every
+    /// reported standard error by `sqrt(Σw/n₊)` (#1618).
+    ///
+    /// `Σ wᵢ` is also the *only* weight summary invariant under the
+    /// `w = c ⇔ c-fold replication` equivalence (the row count and the per-row
+    /// geometric mean are not — see `RemlState::rho_weight_anchor`).
+    ///
+    /// Consumed **only** by the `ProfiledGaussian` dispersion arm. The
+    /// `Fixed`-dispersion arm (Poisson, binomial, Gamma, …) never reads it, so
+    /// those families are unaffected. Defaults to `n_observations as f64`, which
+    /// is exactly `Σ wᵢ` when every positive weight is 1 — the overwhelming
+    /// common case — keeping unweighted fits byte-identical.
+    pub dispersion_effective_n: f64,
 
     /// M_p: dimension of the penalty null space (unpenalized coefficients).
     pub nullspace_dim: f64,
@@ -523,6 +554,11 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             rho_curvature_scale: self.rho_curvature_scale,
             rho_prior: self.rho_prior,
             n_observations: self.n_observations,
+            // Default to the literal row count; the only caller that sets a
+            // genuine `Σ wᵢ ≠ n₊` (the profiled-Gaussian assembly) overrides
+            // this post-build via `RemlState::dispersion_effective_n`, exactly
+            // as it overrides `gaussian_weight_log_sum_half` / `dp_floor_scale`.
+            dispersion_effective_n: self.n_observations as f64,
             nullspace_dim,
             gaussian_weight_log_sum_half: self.gaussian_weight_log_sum_half,
             dp_floor_scale: self.dp_floor_scale,
