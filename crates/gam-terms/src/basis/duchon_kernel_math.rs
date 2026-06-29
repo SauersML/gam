@@ -2110,9 +2110,22 @@ pub(crate) fn pairwise_distance_bounds(points: ArrayView2<'_, f64>) -> Option<(f
 /// exactly the regime (κ → ∞ ⇒ degenerate kernel) that we want the outer
 /// optimizer to avoid anyway.
 ///
-/// Sampling is deterministic stride (points indexed 0, stride, 2·stride, …).
-/// For a cap of `K = 1024` and n up to ~10⁹ this yields O(K²·d) work per
-/// call — a few hundred μs. For n < K the exact pairwise is used.
+/// Sampling picks `K = 1024` indices spaced evenly across the FULL index range
+/// `[0, n-1]` (endpoints included): `idx(s) = round(s·(n-1)/(K-1))`. For a cap
+/// of `K = 1024` and n up to ~10⁹ this yields O(K²·d) work per call — a few
+/// hundred μs. For n ≤ K the exact pairwise is used.
+///
+/// #1033: spanning the full range (rather than the contiguous prefix `0,
+/// stride, …, (K-1)·stride` that an integer `stride = n/K` produces — which
+/// floors to `1` for every n in `(K, 2K]` and so visits only indices `0..K`,
+/// dropping the entire tail of the cloud) is what makes the diameter estimate
+/// `r_max_hat` n-STABLE. The κ/ψ window is derived once from `r_max_hat`
+/// (`psi_lo = ln(diameter_fraction / r_max_hat)`); a prefix-sampled `r_max_hat`
+/// shrinks with the prefix's spatial extent as n crosses `K`, which silently
+/// makes the outer optimizer's box — and therefore its whole trajectory —
+/// n-dependent. Even spacing keeps `r_max_hat` ≈ the true cloud diameter at
+/// every n, so the sufficient-statistic outer loop touches the same ψ window
+/// regardless of n.
 pub(crate) fn pairwise_distance_bounds_sampled(points: ArrayView2<'_, f64>) -> Option<(f64, f64)> {
     const K_CAP: usize = 1024;
     let n = points.nrows();
@@ -2123,18 +2136,20 @@ pub(crate) fn pairwise_distance_bounds_sampled(points: ArrayView2<'_, f64>) -> O
     if n <= K_CAP {
         return pairwise_distance_bounds(points);
     }
-    // Deterministic stride sampling: pick K_CAP evenly spaced indices.
-    // This preserves any spatial stratification already present in the
-    // data ordering (large-scale data is typically in insertion order, not
-    // spatially stratified, so stride sampling is effectively uniform).
-    let stride = n / K_CAP;
-    let k = K_CAP; // exactly K_CAP samples by construction (stride rounds down)
+    // Evenly spaced indices spanning `[0, n-1]` inclusive (n > K_CAP ⇒ k = K_CAP
+    // ≥ 2, so the denominator is positive and `idx(0)=0`, `idx(k-1)=n-1`). The
+    // spacing `(n-1)/(k-1) > 1`, so distinct `s` map to distinct rows; any rare
+    // rounding collision is harmless (the `r > 0.0` guard drops a zero pair).
+    let k = K_CAP;
+    let denom = (k - 1) as f64;
+    let span = (n - 1) as f64;
+    let sample_index = |s: usize| -> usize { ((s as f64) * span / denom).round() as usize };
     let mut r_min = f64::INFINITY;
     let mut r_max = 0.0_f64;
     for i_idx in 0..k {
-        let i = i_idx * stride;
+        let i = sample_index(i_idx);
         for j_idx in (i_idx + 1)..k {
-            let j = j_idx * stride;
+            let j = sample_index(j_idx);
             let r = stable_euclidean_norm((0..d).map(|c| points[[i, c]] - points[[j, c]]));
             if r.is_finite() && r > 0.0 {
                 r_min = r_min.min(r);
@@ -2154,6 +2169,82 @@ mod duchon_hybrid_psd_tests {
     use super::*;
     use faer::Side;
     use gam_linalg::faer_ndarray::FaerEigh;
+
+    /// #1033: the capped-sample diameter estimate must be n-STABLE on a fixed
+    /// point cloud. A uniform grid on `[-3, 3]` has a fixed true diameter (6.0)
+    /// and minimum spacing that shrinks like `6/(n-1)` regardless of how finely
+    /// it is sampled. The κ/ψ window is derived ONCE from `r_max_hat`, so if the
+    /// sampler underestimates the diameter as n crosses the `K_CAP = 1024`
+    /// threshold (the old `stride = n/K` prefix bug visited only indices
+    /// `0..K`, i.e. the LEFT HALF of the domain for n in `(1024, 2048]`,
+    /// halving `r_max_hat`), the outer optimizer's box — and hence its whole
+    /// trajectory — becomes n-dependent, which is exactly the invariant #1033
+    /// forbids. This pins `r_max_hat ≈ 6.0` across the threshold.
+    #[test]
+    fn sampled_diameter_is_n_stable_across_cap_threshold() {
+        let grid = |n: usize| -> Array2<f64> {
+            let mut x = Array2::<f64>::zeros((n, 1));
+            for i in 0..n {
+                x[[i, 0]] = (i as f64) / (n as f64 - 1.0) * 6.0 - 3.0;
+            }
+            x
+        };
+        // Below the cap (exact), straddling it, and well above it.
+        let exact_diam = 6.0_f64;
+        let mut last_rmax: Option<f64> = None;
+        for &n in &[1000usize, 1025, 1500, 2000, 4000, 50_000] {
+            let x = grid(n);
+            let (r_min, r_max) =
+                pairwise_distance_bounds_sampled(x.view()).expect("bounds for dense grid");
+            // The sampled diameter must stay within 1% of the true 6.0 at every
+            // n — NOT collapse to ~3.0 as the prefix bug did for n in (1024,2048].
+            assert!(
+                (r_max - exact_diam).abs() <= 0.01 * exact_diam,
+                "sampled r_max at n={n} = {r_max:.6} drifted from the true diameter \
+                 {exact_diam:.6}: the diameter estimate is n-dependent (#1033)"
+            );
+            // Cross-n stability: consecutive n's must agree on r_max to <2%.
+            if let Some(prev) = last_rmax {
+                let rel = (r_max - prev).abs() / exact_diam;
+                assert!(
+                    rel <= 0.02,
+                    "sampled r_max jumped {rel:.4} (rel) between n steps near n={n}: \
+                     {prev:.6} -> {r_max:.6}; outer-loop box is not n-stable (#1033)"
+                );
+            }
+            last_rmax = Some(r_max);
+            // r_min is positive and finite (the floor used for the high-κ ceiling).
+            assert!(r_min.is_finite() && r_min > 0.0, "r_min must be positive at n={n}");
+        }
+    }
+
+    /// The sampler's chosen indices must span the FULL range `[0, n-1]`
+    /// (endpoints included) — the property that makes the diameter estimate
+    /// stable. Reconstruct the index set the implementation uses and assert it
+    /// reaches both ends with no contiguous-prefix clustering.
+    #[test]
+    fn sampled_indices_span_full_range() {
+        const K_CAP: usize = 1024;
+        let n = 2000usize; // stride = n/K_CAP would floor to 1 → prefix bug regime
+        let k = K_CAP;
+        let denom = (k - 1) as f64;
+        let span = (n - 1) as f64;
+        let idx = |s: usize| -> usize { ((s as f64) * span / denom).round() as usize };
+        assert_eq!(idx(0), 0, "first sample must be index 0");
+        assert_eq!(idx(k - 1), n - 1, "last sample must be the final index n-1");
+        // The largest gap between consecutive samples must be ≈ (n-1)/(k-1),
+        // i.e. roughly 2 here — NOT a single dense prefix followed by a void.
+        let mut max_gap = 0usize;
+        for s in 1..k {
+            max_gap = max_gap.max(idx(s) - idx(s - 1));
+        }
+        assert!(
+            max_gap <= 2,
+            "evenly-spaced samples should step by ~{:.2}; saw a gap of {max_gap} \
+             (prefix clustering would leave one huge gap)",
+            span / denom
+        );
+    }
 
     /// Deterministic, well-separated centers on `[-1, 1]^d` (a Halton-style
     /// low-discrepancy lattice over the radical-inverse base sequence). Mirrors
