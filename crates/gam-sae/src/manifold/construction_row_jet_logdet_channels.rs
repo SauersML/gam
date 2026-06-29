@@ -284,6 +284,270 @@ impl SaeManifoldTerm {
         dispatch!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
     }
 
+    /// `∂²g_k/∂t_{ik,axis_a}∂t_{ik,axis_b}` for one row/atom: the decoded second
+    /// derivative, packed as `Σ_b ∂²Φ_b·B_{b,c}` over output columns. Recovered
+    /// verbatim from 8404ff658^ (the commit before the #932 jet cutover) for the
+    /// reinstated hand `row_jets_for_logdet` path.
+    fn decoded_second_row(
+        atom: &SaeManifoldAtom,
+        second_jet: &Array4<f64>,
+        row: usize,
+        axis_a: usize,
+        axis_b: usize,
+        out: &mut [f64],
+    ) {
+        out.fill(0.0);
+        for basis_col in 0..atom.basis_size() {
+            let d2phi = second_jet[[row, basis_col, axis_a, axis_b]];
+            if d2phi == 0.0 {
+                continue;
+            }
+            for out_col in 0..atom.output_dim() {
+                out[out_col] += d2phi * atom.decoder_coefficients[[basis_col, out_col]];
+            }
+        }
+    }
+
+    /// HAND reconstruction + β-border channels for the SOFTMAX gate — the
+    /// closed-form arithmetic recovered VERBATIM from 8404ff658^ (the commit
+    /// before the #932 Taylor-jet cutover). The jet that briefly replaced this is
+    /// a measured 25–57× throughput regression on the REML/log-det trace loop
+    /// (two independent standalone audits, bit-identical to ≤1.4e-15; see
+    /// `scratchpad/sae_recon_bench.rs`), so the hand form is reinstated as the
+    /// production path for the dominant softmax mode.
+    ///
+    /// The jet is RETAINED as the bit-identity oracle, NOT deleted: the program
+    /// tower (`SaeReconstructionRowProgram::reconstruction_column` /
+    /// `reconstruction_all_columns_packed` / `beta_border_tower`, plus the SIMD
+    /// `reconstruction_all_columns_batch4`) is cross-checked against this hand
+    /// arithmetic to ≤1e-9 (value/grad) / ≤1e-8 (Hessian) by
+    /// `sae_row_jet_program_matches_production_row_jets_on_converged_cache` (on a
+    /// real converged cache, weighted + unweighted √w arms) and by the
+    /// `row_jet_program` unit oracles (incl. the planted-cross-block-sign-flip
+    /// #736 guard) — keeping this single-source hand path guarded against the
+    /// forgotten-channel bug class.
+    ///
+    /// Softmax-only: the per-atom-logistic (IBP / JumpReLU) modes keep the jet
+    /// path (their hand gate prior diverged from the live ordered-geometric
+    /// prior, so routing them through the jet is the value-preserving choice).
+    #[allow(clippy::too_many_arguments)]
+    fn fill_row_jets_hand_softmax(
+        &self,
+        row: usize,
+        vars: &[SaeLocalRowVar],
+        assignments: ArrayView1<'_, f64>,
+        second_jets: &[Array4<f64>],
+        border: &[SaeBorderChannel],
+        inv_tau: f64,
+        sqrt_row_w: f64,
+        first: &mut [Vec<f64>],
+        second: &mut [Vec<Vec<f64>>],
+        beta: &mut [Vec<f64>],
+        beta_deriv: &mut [Vec<Vec<f64>>],
+        beta_l_deriv: &mut [Vec<Vec<f64>>],
+    ) {
+        let p = self.output_dim();
+        let q = vars.len();
+        let k_atoms = self.k_atoms();
+
+        // Softmax gate derivatives (closed form; NO exps — the K softmax values
+        // `assignments` are precomputed upstream).
+        let mut dz = vec![vec![0.0_f64; k_atoms]; q];
+        let mut d2z = vec![vec![vec![0.0_f64; k_atoms]; q]; q];
+        for (a_idx, var_a) in vars.iter().enumerate() {
+            let SaeLocalRowVar::Logit { atom: j } = *var_a else {
+                continue;
+            };
+            for k in 0..k_atoms {
+                let indicator = if k == j { 1.0 } else { 0.0 };
+                dz[a_idx][k] = assignments[k] * (indicator - assignments[j]) * inv_tau;
+            }
+        }
+        for (a_idx, var_a) in vars.iter().enumerate() {
+            let SaeLocalRowVar::Logit { atom: j } = *var_a else {
+                continue;
+            };
+            for (b_idx, var_b) in vars.iter().enumerate() {
+                let SaeLocalRowVar::Logit { atom: l } = *var_b else {
+                    continue;
+                };
+                for k in 0..k_atoms {
+                    let ikl = if k == l { 1.0 } else { 0.0 };
+                    let ikj = if k == j { 1.0 } else { 0.0 };
+                    let ijl = if j == l { 1.0 } else { 0.0 };
+                    d2z[a_idx][b_idx][k] = assignments[k]
+                        * ((ikl - assignments[l]) * (ikj - assignments[j])
+                            - assignments[j] * (ijl - assignments[l]))
+                        * inv_tau
+                        * inv_tau;
+                }
+            }
+        }
+
+        // decoded value / first / second derivatives per atom (from the SAME
+        // production tensors `basis_values` / `basis_jacobian` / `second_jets` /
+        // `decoder_coefficients` the jet reads).
+        let mut decoded = vec![vec![0.0_f64; p]; k_atoms];
+        let mut d1: Vec<Vec<Vec<f64>>> = self
+            .atoms
+            .iter()
+            .map(|atom| vec![vec![0.0_f64; p]; atom.latent_dim])
+            .collect();
+        let mut d2: Vec<Vec<Vec<Vec<f64>>>> = self
+            .atoms
+            .iter()
+            .map(|atom| vec![vec![vec![0.0_f64; p]; atom.latent_dim]; atom.latent_dim])
+            .collect();
+        let mut scratch = vec![0.0_f64; p];
+        for k in 0..k_atoms {
+            self.atoms[k].fill_decoded_row(row, &mut decoded[k]);
+            for axis in 0..self.atoms[k].latent_dim {
+                self.atoms[k].fill_decoded_derivative_row(row, axis, &mut d1[k][axis]);
+            }
+            for axis_a in 0..self.atoms[k].latent_dim {
+                for axis_b in 0..self.atoms[k].latent_dim {
+                    Self::decoded_second_row(
+                        &self.atoms[k],
+                        &second_jets[k],
+                        row,
+                        axis_a,
+                        axis_b,
+                        &mut scratch,
+                    );
+                    d2[k][axis_a][axis_b].clone_from_slice(&scratch);
+                }
+            }
+        }
+
+        // first channel: ∂ẑ_c/∂ℓ_j = Σ_k dz[j][k]·decoded[k][c] (logit primary);
+        // ∂ẑ_c/∂t_{k,axis} = ζ_k·d1[k][axis][c] (coord primary). √w-scaled.
+        for (idx, var) in vars.iter().enumerate() {
+            match *var {
+                SaeLocalRowVar::Logit { .. } => {
+                    for k in 0..k_atoms {
+                        let coeff = dz[idx][k] * sqrt_row_w;
+                        if coeff == 0.0 {
+                            continue;
+                        }
+                        for out_col in 0..p {
+                            first[idx][out_col] += coeff * decoded[k][out_col];
+                        }
+                    }
+                }
+                SaeLocalRowVar::Coord { atom, axis } => {
+                    let coeff = assignments[atom] * sqrt_row_w;
+                    for out_col in 0..p {
+                        first[idx][out_col] = coeff * d1[atom][axis][out_col];
+                    }
+                }
+            }
+        }
+
+        // second channel — block-sparse: the cross-atom coord×coord blocks are
+        // structural zeros and are NOT computed (the hand form's advantage over
+        // the jet's dense K×K Hessian).
+        for a in 0..q {
+            for b in 0..q {
+                match (vars[a], vars[b]) {
+                    (SaeLocalRowVar::Logit { .. }, SaeLocalRowVar::Logit { .. }) => {
+                        for k in 0..k_atoms {
+                            let coeff = d2z[a][b][k] * sqrt_row_w;
+                            if coeff == 0.0 {
+                                continue;
+                            }
+                            for out_col in 0..p {
+                                second[a][b][out_col] += coeff * decoded[k][out_col];
+                            }
+                        }
+                    }
+                    (SaeLocalRowVar::Logit { .. }, SaeLocalRowVar::Coord { atom, axis }) => {
+                        let coeff = dz[a][atom] * sqrt_row_w;
+                        for out_col in 0..p {
+                            second[a][b][out_col] = coeff * d1[atom][axis][out_col];
+                        }
+                    }
+                    (SaeLocalRowVar::Coord { atom, axis }, SaeLocalRowVar::Logit { .. }) => {
+                        let coeff = dz[b][atom] * sqrt_row_w;
+                        for out_col in 0..p {
+                            second[a][b][out_col] = coeff * d1[atom][axis][out_col];
+                        }
+                    }
+                    (
+                        SaeLocalRowVar::Coord {
+                            atom: atom_a,
+                            axis: axis_a,
+                        },
+                        SaeLocalRowVar::Coord {
+                            atom: atom_b,
+                            axis: axis_b,
+                        },
+                    ) if atom_a == atom_b => {
+                        let coeff = assignments[atom_a] * sqrt_row_w;
+                        for out_col in 0..p {
+                            second[a][b][out_col] = coeff * d2[atom_a][axis_a][axis_b][out_col];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // β BORDER CHANNELS: one free decoder coefficient whose per-row
+        // contribution to output column `c` is ζ_k(ℓ)·Φ_b(t_k)·output_c — linear
+        // in β. `beta` is the value channel; `beta_deriv` / `beta_l_deriv` are the
+        // identical mixed ∂²ẑ_c/∂β∂p_a channel (both filled the same because the
+        // map is linear in β).
+        for (beta_pos, channel) in border.iter().enumerate() {
+            let atom = channel.atom;
+            let phi = self.atoms[atom].basis_values[[row, channel.basis_col]];
+            let base = assignments[atom] * phi * sqrt_row_w;
+            for out_col in 0..p {
+                beta[beta_pos][out_col] = base * channel.output[out_col];
+            }
+            for (var_idx, var) in vars.iter().enumerate() {
+                let scalar = match *var {
+                    SaeLocalRowVar::Logit { .. } => dz[var_idx][atom] * phi * sqrt_row_w,
+                    SaeLocalRowVar::Coord {
+                        atom: coord_atom,
+                        axis,
+                    } if coord_atom == atom => {
+                        assignments[atom]
+                            * self.atoms[atom].basis_jacobian[[row, channel.basis_col, axis]]
+                            * sqrt_row_w
+                    }
+                    _ => 0.0,
+                };
+                if scalar != 0.0 {
+                    for out_col in 0..p {
+                        beta_deriv[var_idx][beta_pos][out_col] = scalar * channel.output[out_col];
+                    }
+                }
+                let scalar_l = match *var {
+                    SaeLocalRowVar::Logit { .. } => {
+                        dz[var_idx][atom]
+                            * self.atoms[atom].basis_values[[row, channel.basis_col]]
+                            * sqrt_row_w
+                    }
+                    SaeLocalRowVar::Coord {
+                        atom: coord_atom,
+                        axis,
+                    } if coord_atom == atom => {
+                        assignments[atom]
+                            * self.atoms[atom].basis_jacobian[[row, channel.basis_col, axis]]
+                            * sqrt_row_w
+                    }
+                    _ => 0.0,
+                };
+                if scalar_l != 0.0 {
+                    for out_col in 0..p {
+                        beta_l_deriv[var_idx][beta_pos][out_col] =
+                            scalar_l * channel.output[out_col];
+                    }
+                }
+            }
+        }
+    }
+
     pub(crate) fn row_jets_for_logdet(
         &self,
         rho: &SaeManifoldRho,
@@ -301,38 +565,60 @@ impl SaeManifoldTerm {
             .map_or(1.0, |w| w[row].sqrt());
         let mut first = vec![vec![0.0_f64; p]; q];
         let mut second = vec![vec![vec![0.0_f64; p]; q]; q];
-        let program =
-            self.reconstruction_row_program_for_logdet(rho, row, &vars, assignments, second_jets)?;
-        Self::fill_reconstruction_channels_from_program_dynamic(
-            &program,
-            sqrt_row_w,
-            &mut first,
-            &mut second,
-        )?;
-
-        // β BORDER CHANNELS (#932): single-sourced through the SAME
-        // reconstruction row program used above. A β border channel is one free
-        // decoder coefficient whose per-row contribution to output column `c` is
-        // ζ_k(ℓ)·Φ_b(t_k)·output_c — linear in β — so the value channel is
-        // `beta_border_tower.v · output_c` and the mixed ∂²ẑ_c/∂β∂p_a channel
-        // (both `beta_deriv` and `beta_l_deriv`, identical because the map is
-        // linear in β) is `beta_border_tower.g[a] · output_c`. The former hand
-        // packing — with its own gate first-derivative recursion
-        // (`gate_first_derivatives_for_row`) and term-by-term basis/jacobian
-        // reads — is replaced by the tower, which carries every gate/basis
-        // derivative automatically and is pinned to the prior hand path by
-        // `sae_row_jet_program_matches_production_row_jets_on_converged_cache`.
         let mut beta = vec![vec![0.0_f64; p]; border.len()];
         let mut beta_deriv = vec![vec![vec![0.0_f64; p]; border.len()]; q];
         let mut beta_l_deriv = vec![vec![vec![0.0_f64; p]; border.len()]; q];
-        Self::fill_beta_border_channels_from_program_dynamic(
-            &program,
-            sqrt_row_w,
-            border,
-            &mut beta,
-            &mut beta_deriv,
-            &mut beta_l_deriv,
-        )?;
+
+        match self.assignment.mode {
+            AssignmentMode::Softmax { temperature, .. } => {
+                // HAND PATH (#932 revert): closed-form reconstruction + β-border
+                // channels, ~25–57× faster than the Tower jet it replaced and
+                // bit-identical (≤1.4e-15). The jet is retained as the oracle that
+                // pins this arithmetic (see `fill_row_jets_hand_softmax`).
+                let inv_tau = 1.0 / temperature;
+                self.fill_row_jets_hand_softmax(
+                    row,
+                    &vars,
+                    assignments,
+                    second_jets,
+                    border,
+                    inv_tau,
+                    sqrt_row_w,
+                    &mut first,
+                    &mut second,
+                    &mut beta,
+                    &mut beta_deriv,
+                    &mut beta_l_deriv,
+                );
+            }
+            AssignmentMode::IBPMap { .. } | AssignmentMode::JumpReLU { .. } => {
+                // PER-ATOM-LOGISTIC modes keep the jet path: value-preserving
+                // (their hand gate prior diverged from the live ordered-geometric
+                // prior, and the batched SIMD speedup that motivated the revert is
+                // softmax-only anyway).
+                let program = self.reconstruction_row_program_for_logdet(
+                    rho,
+                    row,
+                    &vars,
+                    assignments,
+                    second_jets,
+                )?;
+                Self::fill_reconstruction_channels_from_program_dynamic(
+                    &program,
+                    sqrt_row_w,
+                    &mut first,
+                    &mut second,
+                )?;
+                Self::fill_beta_border_channels_from_program_dynamic(
+                    &program,
+                    sqrt_row_w,
+                    border,
+                    &mut beta,
+                    &mut beta_deriv,
+                    &mut beta_l_deriv,
+                )?;
+            }
+        }
 
         Ok(SaeRowJets {
             vars,
@@ -345,14 +631,20 @@ impl SaeManifoldTerm {
     }
 
     /// Build [`SaeRowJets`] for FOUR rows at once via the 4-row SIMD batch
-    /// (#932), returning `None` (so the caller falls back to the scalar per-row
-    /// `row_jets_for_logdet`) when the four rows are not softmax-aligned (same
+    /// (#932), returning `None` when the four rows are not softmax-aligned (same
     /// primary layout / temperature). Each lane's `SaeRowJets` is BIT-IDENTICAL
     /// to `row_jets_for_logdet` on that row: the batch primitives
     /// (`reconstruction_all_columns_batch4` / `beta_border_order1_batch4`) are
     /// proven lane-`i` `to_bits`-identical to the scalar `*_packed` paths, and the
     /// `√w` / `output_c` scaling here mirrors the scalar fills term-for-term.
-    fn row_jets_for_logdet_batch4(
+    ///
+    /// DEMOTED TO ORACLE (#932 revert): no longer on the production hot path —
+    /// `refill_jet_window` now builds the hand `row_jets_for_logdet` per row (the
+    /// jet was a 25–57× regression). Retained `#[cfg(test)]` so the jet stays a
+    /// live cross-check of the hand path
+    /// (`batch4_jet_lanes_match_scalar_hand_row_jets`).
+    #[cfg(test)]
+    pub(crate) fn row_jets_for_logdet_batch4(
         &self,
         rho: &SaeManifoldRho,
         rows: [usize; 4],
@@ -398,7 +690,8 @@ impl SaeManifoldTerm {
     /// Assemble the four lanes of a SIMD batch into per-row [`SaeRowJets`],
     /// applying the identical `√w` / `output_c` scaling the scalar fills use.
     /// Returns `None` if the rows are not batchable (the batch primitives
-    /// decline), so the caller can fall back to scalar.
+    /// decline). Test-only oracle helper for `row_jets_for_logdet_batch4`.
+    #[cfg(test)]
     fn batch4_assemble<const K: usize>(
         rows: [&crate::row_jet_program::SaeReconstructionRowProgram; 4],
         vars_each: &[Vec<SaeLocalRowVar>],
@@ -463,33 +756,25 @@ impl SaeManifoldTerm {
         Ok(Some(arr))
     }
 
-    /// Refill the bounded (≤4-row) look-ahead jet window starting at `start`,
-    /// using the 4-row SIMD batch when the next four rows are softmax-aligned and
-    /// falling back to one scalar row otherwise (also the `<4` remainder).
-    /// Returns the next unbuilt row index. Bit-identical to per-row
-    /// `row_jets_for_logdet` either way.
+    /// Refill the bounded look-ahead jet window with the next row's
+    /// [`SaeRowJets`], built by the hand `row_jets_for_logdet`. Returns the next
+    /// unbuilt row index.
+    ///
+    /// #932 revert: the previous 4-row SIMD-batch fast path
+    /// (`row_jets_for_logdet_batch4`) is a 25–57× throughput regression versus
+    /// the hand closed form, so production builds one hand row per refill. The
+    /// window machinery is retained (the call sites still drain one row at a
+    /// time) and `n` / `cache` stay in the signature for the unchanged callers.
     fn refill_jet_window(
         &self,
         rho: &SaeManifoldRho,
         start: usize,
-        n: usize,
+        _n: usize,
         cache: &ArrowFactorCache,
         second_jets: &[Array4<f64>],
         border: &[SaeBorderChannel],
         window: &mut std::collections::VecDeque<SaeRowJets>,
     ) -> Result<usize, String> {
-        if start + 4 <= n {
-            if let Some(batch) = self.row_jets_for_logdet_batch4(
-                rho,
-                [start, start + 1, start + 2, start + 3],
-                cache,
-                second_jets,
-                border,
-            )? {
-                window.extend(batch);
-                return Ok(start + 4);
-            }
-        }
         let vars = self.row_vars_for_cache_row(start, cache)?;
         let mut a = Array1::<f64>::zeros(self.k_atoms());
         self.assignment.try_assignments_row_for_rho_into(
