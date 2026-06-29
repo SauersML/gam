@@ -69,8 +69,8 @@ pub(crate) struct RankedCandidate {
 /// `k×k` Hessian in row-major order (assumed symmetric), `delta = ρ − ρ₀`.
 fn surrogate_cost(v0: f64, grad: &[f64], hess_rowmajor: &[f64], delta: &[f64]) -> f64 {
     let k = grad.len();
-    debug_assert_eq!(delta.len(), k);
-    debug_assert_eq!(hess_rowmajor.len(), k * k);
+    assert_eq!(delta.len(), k);
+    assert_eq!(hess_rowmajor.len(), k * k);
     let mut lin = 0.0_f64;
     for i in 0..k {
         lin += grad[i] * delta[i];
@@ -99,9 +99,9 @@ impl BasinReference {
     /// Build a reference from k-dim sufficient statistics. `hess` must be `k×k`
     /// with `k = rho0.len() = grad.len()`.
     pub(crate) fn new(rho0: Array1<f64>, v0: f64, grad: Array1<f64>, hess: Array2<f64>) -> Self {
-        debug_assert_eq!(grad.len(), rho0.len());
-        debug_assert_eq!(hess.nrows(), rho0.len());
-        debug_assert_eq!(hess.ncols(), rho0.len());
+        assert_eq!(grad.len(), rho0.len());
+        assert_eq!(hess.nrows(), rho0.len());
+        assert_eq!(hess.ncols(), rho0.len());
         Self {
             rho0,
             v0,

@@ -93,7 +93,7 @@ fn second_difference_penalty(k: usize) -> Array2<f64> {
     d.t().dot(&d)
 }
 
-fn logit_fit_options(nullspace_dims: Vec<usize>) -> FitOptions {
+fn logit_fit_options(nullspace_dims: Vec<usize>, firth: bool) -> FitOptions {
     FitOptions {
         latent_cloglog: None,
         mixture_link: None,
@@ -106,7 +106,7 @@ fn logit_fit_options(nullspace_dims: Vec<usize>) -> FitOptions {
         tol: 1e-7,
         nullspace_dims,
         linear_constraints: None,
-        firth_bias_reduction: std::env::var("FIRTH").as_deref() == Ok("1"),
+        firth_bias_reduction: firth,
         adaptive_regularization: None,
         penalty_shrinkage_floor: None,
         rho_prior: Default::default(),
@@ -116,7 +116,7 @@ fn logit_fit_options(nullspace_dims: Vec<usize>) -> FitOptions {
     }
 }
 
-fn build_and_fit(n: usize, k: usize) {
+fn build_and_fit(n: usize, k: usize, firth: bool) {
     let n_smooth = 3usize;
     let p = 1 + n_smooth * k;
     let mut rng = Lcg::new(100 + n as u64);
@@ -171,7 +171,7 @@ fn build_and_fit(n: usize, k: usize) {
             ResponseFamily::Binomial,
             InverseLink::Standard(StandardLink::Logit),
         ),
-        &logit_fit_options(nullspace),
+        &logit_fit_options(nullspace, firth),
     )
     .expect("p-spline logit REML fit should succeed");
     let dt = t0.elapsed();
@@ -181,7 +181,7 @@ fn build_and_fit(n: usize, k: usize) {
         dt.as_secs_f64(),
         fit.outer_cost_evals,
         fit.inner_pirls_solves,
-        std::env::var("FIRTH").as_deref() == Ok("1"),
+        firth,
         fit.reml_score,
         fit.edf_total().unwrap_or(f64::NAN),
         fit.outer_gradient_norm,
@@ -200,7 +200,11 @@ fn main() {
     } else {
         ns
     };
+    // #1575 is a firth-on vs firth-off cost comparison, so measure BOTH regimes
+    // for every n in one run rather than gating one of them behind an opt-in
+    // environment flag.
     for n in ns {
-        build_and_fit(n, 10);
+        build_and_fit(n, 10, false);
+        build_and_fit(n, 10, true);
     }
 }

@@ -12,8 +12,8 @@
 /// (k×k, row-major, assumed symmetric); `delta` is ρ − ρ₀ (length k).
 fn surrogate_cost(v0: f64, grad: &[f64], hess_rowmajor: &[f64], delta: &[f64]) -> f64 {
     let k = grad.len();
-    debug_assert_eq!(delta.len(), k);
-    debug_assert_eq!(hess_rowmajor.len(), k * k);
+    assert_eq!(delta.len(), k);
+    assert_eq!(hess_rowmajor.len(), k * k);
     let mut lin = 0.0_f64;
     for i in 0..k {
         lin += grad[i] * delta[i];
