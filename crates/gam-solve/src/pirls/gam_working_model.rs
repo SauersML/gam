@@ -98,6 +98,16 @@ pub(crate) struct GamWorkingModel<'a> {
     /// Set once the frozen-W first-step Gram has been consumed, so subsequent
     /// inner iterations restream `XᵀWX` from the (moving) working weights.
     pub(crate) glm_first_step_gram_consumed: bool,
+    /// β-independent (design-only) factor of the Firth/Jeffreys operator,
+    /// memoized for the lifetime of this inner P-IRLS solve (#1575). The design
+    /// and prior weights are constant across the inner Newton iterations while
+    /// `η` changes every iteration, so the O(n·p²) Gram, the O(p³) identifiable-
+    /// subspace eigendecomposition, and the n×p design clones are computed once
+    /// here and reused; only the cheap per-`η` reduced Fisher / hat-diagonal
+    /// remainder is rebuilt per iteration. Lazily filled on the first Firth
+    /// diagnostic build and reused thereafter; a fresh working model is built
+    /// per inner solve so it refreshes naturally when the design changes.
+    pub(crate) firth_design_factor: Option<Arc<FirthDesignFactor>>,
 }
 
 pub(crate) struct GamModelFinalState {
@@ -192,6 +202,7 @@ impl<'a> GamWorkingModel<'a> {
             quadctx,
             glm_first_step_gram,
             glm_first_step_gram_consumed: false,
+            firth_design_factor: None,
         }
     }
 
@@ -200,6 +211,68 @@ impl<'a> GamWorkingModel<'a> {
     pub(crate) fn with_covariate_se(mut self, se: Array1<f64>) -> Self {
         self.covariate_se = Some(se);
         self
+    }
+
+    /// Build (once) and return the β-independent Firth/Jeffreys design factor for
+    /// the current coordinate design (#1575). The factor is materialized in the
+    /// SAME coefficient basis the inner objective is optimized in — transformed
+    /// (`x_transformed`/`X·Qs`) when a reparameterization is in effect, original
+    /// otherwise — exactly as the previous per-iteration diagnostics path. It is
+    /// memoized on the working model and reused across the inner Newton
+    /// iterations of this solve, since the design and prior weights are constant
+    /// for the model's lifetime.
+    fn ensure_firth_design_factor(
+        &mut self,
+    ) -> Result<Arc<FirthDesignFactor>, EstimationError> {
+        if let Some(factor) = &self.firth_design_factor {
+            return Ok(factor.clone());
+        }
+        let factor = match &self.coordinate_design {
+            WorkingCoordinateDesign::TransformedExplicit {
+                x_transformed,
+                x_csr,
+            } => {
+                if x_transformed.as_sparse().is_some() {
+                    let csr = x_csr.as_ref().ok_or_else(|| {
+                        EstimationError::InvalidInput(
+                            "missing CSR cache for sparse transformed design".to_string(),
+                        )
+                    })?;
+                    build_firth_design_factor_sparse(csr, self.priorweights)?
+                } else {
+                    let x_dense_cow = x_transformed.to_dense_cow();
+                    build_firth_design_factor_dense(x_dense_cow.view(), self.priorweights)?
+                }
+            }
+            WorkingCoordinateDesign::TransformedImplicit { transform } => {
+                // Materialize X·Qs on demand so the factor lives in the same
+                // transformed basis as the inner objective.
+                let x_t_dense =
+                    fast_ab(&self.x_original.to_dense(), &transform.materialize_dense());
+                build_firth_design_factor_dense(x_t_dense.view(), self.priorweights)?
+            }
+            WorkingCoordinateDesign::OriginalSparseNative => {
+                if self.x_original.as_sparse().is_some() {
+                    let csr = self.x_original_csr.as_ref().ok_or_else(|| {
+                        EstimationError::InvalidInput(
+                            "missing CSR cache for sparse original design".to_string(),
+                        )
+                    })?;
+                    build_firth_design_factor_sparse(csr, self.priorweights)?
+                } else {
+                    let x_dense = self
+                        .x_original
+                        .try_to_dense_arc(
+                            "Firth diagnostics require dense access to the original design",
+                        )
+                        .map_err(EstimationError::InvalidInput)?;
+                    build_firth_design_factor_dense(x_dense.view(), self.priorweights)?
+                }
+            }
+        };
+        let factor = Arc::new(factor);
+        self.firth_design_factor = Some(factor.clone());
+        Ok(factor)
     }
 
     /// Convert the working model into its final state for outer REML consumption.
@@ -894,77 +967,21 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             //
             // Rule: use X_transformed if available; fall back to X_original only
             // when PIRLS is operating directly in the original basis.
-            let (hat_diag, jeffreys_logdet, firth_score_shift) = match &self.coordinate_design {
-                WorkingCoordinateDesign::TransformedExplicit {
-                    x_transformed,
-                    x_csr,
-                } => {
-                    if x_transformed.as_sparse().is_some() {
-                        let csr = x_csr.as_ref().ok_or_else(|| {
-                            EstimationError::InvalidInput(
-                                "missing CSR cache for sparse transformed design".to_string(),
-                            )
-                        })?;
-                        compute_jeffreys_pirls_diagnostics_sparse(
-                            &self.link_kind,
-                            csr,
-                            self.workspace.eta_buf.view(),
-                            self.priorweights,
-                        )?
-                    } else {
-                        let x_dense_cow = x_transformed.to_dense_cow();
-                        compute_jeffreys_pirls_diagnostics(
-                            &self.link_kind,
-                            x_dense_cow.view(),
-                            self.workspace.eta_buf.view(),
-                            self.priorweights,
-                        )?
-                    }
-                }
-                WorkingCoordinateDesign::TransformedImplicit { transform } => {
-                    // Jeffreys/Firth MUST use a consistent basis. TransformedImplicit
-                    // stores s_transformed in the Qs basis, so we need X in that
-                    // same basis.  Materialize X·Qs on demand (Firth models are
-                    // typically small clinical logistic regressions).
-                    let x_t_dense =
-                        fast_ab(&self.x_original.to_dense(), &transform.materialize_dense());
-                    compute_jeffreys_pirls_diagnostics(
-                        &self.link_kind,
-                        x_t_dense.view(),
-                        self.workspace.eta_buf.view(),
-                        self.priorweights,
-                    )?
-                }
-                WorkingCoordinateDesign::OriginalSparseNative => {
-                    // s_transformed is in original coords here (qs = I).
-                    if self.x_original.as_sparse().is_some() {
-                        let csr = self.x_original_csr.as_ref().ok_or_else(|| {
-                            EstimationError::InvalidInput(
-                                "missing CSR cache for sparse original design".to_string(),
-                            )
-                        })?;
-                        compute_jeffreys_pirls_diagnostics_sparse(
-                            &self.link_kind,
-                            csr,
-                            self.workspace.eta_buf.view(),
-                            self.priorweights,
-                        )?
-                    } else {
-                        let x_dense = self
-                            .x_original
-                            .try_to_dense_arc(
-                                "Firth diagnostics require dense access to the original design",
-                            )
-                            .map_err(EstimationError::InvalidInput)?;
-                        compute_jeffreys_pirls_diagnostics(
-                            &self.link_kind,
-                            x_dense.view(),
-                            self.workspace.eta_buf.view(),
-                            self.priorweights,
-                        )?
-                    }
-                }
-            };
+            //
+            // #1575: the design and prior weights are constant across the inner
+            // Newton iterations of this solve, so the β-independent Firth design
+            // factor (Gram, identifiable basis Q, reduced design X_r, retained
+            // spectrum S_r) is built once and memoized; only the cheap per-η
+            // reduced-Fisher/hat-diagonal remainder is rebuilt here. The factor
+            // is built in the correct (transformed) coefficient basis exactly as
+            // the per-iteration diagnostics path used to.
+            let factor = self.ensure_firth_design_factor()?;
+            let (hat_diag, jeffreys_logdet, firth_score_shift) =
+                jeffreys_pirls_diagnostics_from_factor(
+                    &factor,
+                    &self.link_kind,
+                    self.workspace.eta_buf.view(),
+                )?;
             firth = FirthDiagnostics::Active {
                 jeffreys_logdet,
                 hat_diag: hat_diag.clone(),

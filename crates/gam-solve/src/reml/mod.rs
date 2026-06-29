@@ -4378,6 +4378,42 @@ pub struct FirthDenseOperator {
     pub(crate) p_b_base: Array2<f64>,
 }
 
+/// β-independent (design-only) factor of the Firth/Jeffreys operator.
+///
+/// Everything stored here depends ONLY on the fixed design `X` and the fixed
+/// prior/observation weights `a_i` — NOT on the current linear predictor `η`
+/// (i.e. NOT on β). For a single inner PIRLS solve the design and prior weights
+/// are constant while `η` changes every Newton iteration, so this factor can be
+/// built once per solve and reused, hoisting the O(n·p²) Gram, the O(p³)
+/// identifiable-subspace eigendecomposition, and the two n×p design clones out
+/// of the per-iteration hot path (#1575).
+///
+/// The β-dependent remainder (Fisher weights `w(η)`, reduced Fisher
+/// `I_r = X_rᵀ W X_r`, its inverse `K_r`, the hat diagonal `h`, and the
+/// half-log-determinant) is rebuilt per iteration from this factor via
+/// [`FirthDenseOperator::build_from_design_factor`] (full operator) or
+/// [`FirthDenseOperator::pirls_diagnostics_from_factor`] (the three PIRLS
+/// diagnostics only). Both reproduce the un-hoisted build bit-for-bit.
+#[derive(Clone)]
+pub(crate) struct FirthDesignFactor {
+    // Raw design and its transpose (the operator stores owned copies).
+    pub(crate) x_dense: Array2<f64>,
+    pub(crate) x_dense_t: Array2<f64>,
+    // Orthonormal identifiable-subspace basis Q of (A^{1/2} X)ᵀ(A^{1/2} X).
+    pub(crate) q_basis: Array2<f64>,
+    // Reduced identifiable design X_r = A^{1/2} X Q.
+    pub(crate) x_reduced: Array2<f64>,
+    // Fixed case-weight square roots (sqrt(a_i)), if any.
+    pub(crate) observation_weight_sqrt: Option<Array1<f64>>,
+    // Retained positive spectrum of the design Gram = S_r diagonal.
+    pub(crate) metric_spectrum: Array1<f64>,
+    // diag(S_r^{-1}); precomputed reciprocal of `metric_spectrum`.
+    pub(crate) x_metric_reduced_inv_diag: Array1<f64>,
+    // rank r = ncols(q_basis); n = nrows(x_dense).
+    pub(crate) r: usize,
+    pub(crate) n: usize,
+}
+
 #[derive(Clone)]
 pub(crate) struct FirthDirection {
     pub(crate) deta: Array1<f64>,

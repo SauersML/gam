@@ -8,7 +8,7 @@
 
 pub(crate) use crate::estimate::EstimationError;
 
-pub(crate) use crate::estimate::reml::FirthDenseOperator;
+pub(crate) use crate::estimate::reml::{FirthDenseOperator, FirthDesignFactor};
 
 pub(crate) use gam_linalg::faer_ndarray::{
     FaerCholesky, FaerEigh, FaerLinalgError, FaerSymmetricFactor, array1_to_col_matmut, fast_ab,
