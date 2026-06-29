@@ -261,17 +261,6 @@ pub struct SaeHybridSplitReport {
 /// never adjudicated on a fabricated deviance.
 const MIN_ROWS_FOR_LINEAR_FIT: usize = 3;
 
-/// #1610 dominance-floor slack. The linear arm may only WIN a curveable slot when
-/// its straight sub-model's residual RSS is within this relative slack of the
-/// curve's. A genuine linear-tail atom fits the line essentially as well as the
-/// curve (`linear_rss ≈ curved_rss`); a genuinely-curved, high-EV atom has
-/// `linear_rss` materially larger, and collapsing it to a line drops real
-/// reconstruction EV below the curved — violating the match-or-beat dominance
-/// floor the #1026 report contract guarantees. The slack tolerates fit/numerical
-/// noise and near-straight (`Θ ≈ 0`) curves while blocking the over-collapse of a
-/// genuinely curved atom.
-const LINEAR_DOMINANCE_RSS_SLACK: f64 = 0.05;
-
 /// Build the curved + linear candidates for ONE fitted `d = 1` atom and return
 /// them as `(linear, curved, (t̄, b₀, b₁))`, or `None` if the atom cannot present
 /// an honest pair (too few rows, degenerate coordinate span, or non-finite
@@ -384,13 +373,11 @@ fn build_atom_candidates(
     // genuine common-evidence comparison (#1202).
     let mut curved_rss = 0.0_f64;
     let mut linear_rss = 0.0_f64;
-    let mut signal_energy = 0.0_f64;
     for i in 0..n {
         let a = assign[i];
         let dt = coords[i] - t_bar;
         for j in 0..p {
             let y = target_resid[[i, j]];
-            signal_energy += y * y;
             let r_curved = y - a * decoded[[i, j]];
             curved_rss += r_curved * r_curved;
             let r_linear = y - a * (b0[j] + dt * b1[j]);
@@ -398,26 +385,16 @@ fn build_atom_candidates(
         }
     }
 
-    // #1610 — PROFILED-VARIANCE (scale-invariant) data-fit objective. Fixing the
-    // Gaussian noise variance at σ²≡1 left the deviance as the raw `½·RSS` in
-    // output-amplitude units; on a small / low-amplitude fixture that term (~0.02
-    // between the arms) is dwarfed by the ~log|H| Laplace complexity (~0.75), so
-    // the argmin over-collapses a genuinely-curved, high-EV atom to a straight
-    // line and the reconstruction loses real variance (EV 1.0 → 0.748). Profiling
-    // σ² out of the Gaussian evidence (reference prior on the variance) replaces
-    // `½·RSS` with `(ν/2)·log(RSS)`, ν = the scalar-residual count the two arms
-    // share. This is scale-invariant — a uniform rescaling of the response shifts
-    // both arms by the same constant — so the data-fit comparison is now
-    // commensurate with the dimensionless `½·log|H|` complexity. A curved atom
-    // whose curve genuinely beats its straight projection (`curved_rss ≪
-    // linear_rss`) now keeps its curve; a truly-straight atom (`curved_rss ≈
-    // linear_rss`) still yields to the cheaper linear arm and collapses losslessly.
-    // The RSS is floored at a tiny fraction of the signal energy so a (near-)exact
-    // fit gives a finite, not `-∞`, objective.
-    let nu = (n * p) as f64;
-    let rss_floor = 1e-12 * signal_energy.max(f64::MIN_POSITIVE);
-    let curved_residual_objective = 0.5 * nu * curved_rss.max(rss_floor).ln();
-    let linear_residual_objective = 0.5 * nu * linear_rss.max(rss_floor).ln();
+    // Gaussian-reconstruction deviance: the residual objective `½ RSS` the
+    // Laplace normalizer is added to. The curved arm pays `½·curved_rss` (how
+    // well its fitted curve explains the residual) plus its larger `M·p`
+    // parameter price; the linear arm pays `½·linear_rss` plus a `2·p` price.
+    // Because the curved family's `Θ = 0` member equals the linear prediction,
+    // `curved_rss ≤ linear_rss` whenever the fitted curve is at least as good a
+    // residual fit as its own straight projection — the match-or-beat floor — and
+    // the argmin trades that data-fit gain against the curvature parameter price.
+    let curved_residual_objective = 0.5 * curved_rss;
+    let linear_residual_objective = 0.5 * linear_rss;
 
     // Linear candidate parameter price: intercept + slope per output channel.
     let linear_num_params = 2 * p;
@@ -463,23 +440,10 @@ fn build_atom_candidates(
     // smoothing-penalty logdet (the intrinsic smoothness penalty is
     // reparameterization-invariant and identical in expectation across the two
     // parameterizations of the same image).
-    let mut linear_nle = reduced_laplace_nle(linear_residual_objective, linear_log_det_h);
+    let linear_nle = reduced_laplace_nle(linear_residual_objective, linear_log_det_h);
     let curved_nle = reduced_laplace_nle(curved_residual_objective, curved_log_det_h);
     if !(linear_nle.is_finite() && curved_nle.is_finite()) {
         return None;
-    }
-
-    // #1610 dominance-floor guard (see `LINEAR_DOMINANCE_RSS_SLACK`). The Laplace
-    // NLE trades data-fit against complexity with σ²≡1; on a small / low-amplitude
-    // fixture the complexity term can dwarf a real data-fit gain and select the
-    // straight arm for a genuinely-curved atom — collapsing it to a line then
-    // drops reconstruction EV below the curved (the diagnostic case: a curved atom
-    // earning 0.84 EV collapsed to a line, EV 1.0 → 0.748). When the straight
-    // arm is a materially worse residual fit than the curve, price it just past
-    // the curved arm so the per-slot selection keeps the curve. A true linear-tail
-    // atom (`linear_rss ≈ curved_rss`) is unaffected, so genuine collapses stand.
-    if linear_rss > curved_rss * (1.0 + LINEAR_DOMINANCE_RSS_SLACK) {
-        linear_nle = linear_nle.max(curved_nle + curved_nle.abs() * 1e-6 + 1e-9);
     }
 
     let linear = HybridAtomCandidate::linear(linear_nle, linear_num_params);
