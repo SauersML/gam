@@ -27,6 +27,7 @@ mod tests {
     use crate::mixture_link::{InverseLinkJet as MixtureInverseLinkJet, state_fromspec};
     use gam_math::probability::standard_normal_quantile;
     use crate::active_set;
+    use crate::estimate::EstimationError;
     use gam_problem::{
         Coefficients, GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkComponent, LinkFunction,
         LogSmoothingParamsView, MIN_WEIGHT, MixtureLinkSpec, ResponseFamily, StandardLink,
