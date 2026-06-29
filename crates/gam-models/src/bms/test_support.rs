@@ -280,6 +280,88 @@ pub(crate) fn cell_base_moment_jets(
         .collect()
 }
 
+/// Leibniz **edge sliver** jet for one θ-moving cell edge: the order-≤2 jet of
+/// `∫_{zE0}^{zE(θ)} zⁿ·e^{−q(z;θ)} dz`, the thin moving-boundary contribution a
+/// θ-moving edge (`zE = (τ−a)/b` link crossing) adds on top of the fixed-domain
+/// interior moments.
+///
+/// With `δ = zE(θ) − zE0` (value 0) the integral Taylor-expands in `δ`; for an
+/// order-≤2 jet only two terms survive (`δᵏ`, `k ≥ 3`, has zero value/grad/Hess):
+///
+/// ```text
+///   sliver = g_jet·δ + ½·g_z(zE0)·δ²
+/// ```
+///
+/// `g_jet = zE0ⁿ·e^{−q(zE0;θ)}` is the integrand at the FIXED edge point carried
+/// as a jet (its `e^{−Δq}` θ-motion supplies the `g′_θ ⊗ δ′` cross-Hessian — `g`
+/// MUST be a jet); `g_z(zE0)` is the SCALAR `z`-derivative
+/// `(n·zE0^{n−1} − zE0ⁿ·q_z)·e^{−q}`, `q_z = z + η·η′(z)` (it only rides `δ²`,
+/// already second order, so the scalar value suffices). Verified to order 2
+/// against a moving-domain quadrature (grad rel-err 7e-11, Hess 6e-7).
+pub(crate) fn edge_sliver_jet(
+    n: usize,
+    c_jets: &[Jet2; 4],
+    c0_scalar: [f64; 4],
+    ze_jet: &Jet2,
+    ze0: f64,
+) -> Jet2 {
+    let p = c_jets[0].p();
+    let cst = |x: f64| Jet2::constant(x, p);
+    // δη(zE0) = Σₖ δcₖ·zE0ᵏ  (jet, value 0).
+    let mut deta = cst(0.0);
+    let mut z_pow = 1.0_f64;
+    for k in 0..4 {
+        deta = deta.add(&c_jets[k].sub(&cst(c0_scalar[k])).scale(z_pow));
+        z_pow *= ze0;
+    }
+    let eta0 =
+        c0_scalar[0] + c0_scalar[1] * ze0 + c0_scalar[2] * ze0 * ze0 + c0_scalar[3] * ze0 * ze0 * ze0;
+    // Δq(zE0) = η₀·δη + ½·δη²  (jet, value 0); e^{−Δq} = 1 − Δq + ½Δq².
+    let dq = deta.scale(eta0).add(&deta.mul(&deta).scale(0.5));
+    let edq = cst(1.0).sub(&dq).add(&dq.mul(&dq).scale(0.5));
+    let q0 = 0.5 * (ze0 * ze0 + eta0 * eta0);
+    let g0 = ze0.powi(n as i32) * (-q0).exp();
+    let g_jet = edq.scale(g0); // zⁿ·e^{−q} at zE0, as a jet over θ.
+    let delta = ze_jet.sub(&cst(ze0)); // value 0.
+    // g_z(zE0) scalar: q_z = z + η·η′(z), η′ = c1 + 2c2 z + 3c3 z².
+    let eta_p = c0_scalar[1] + 2.0 * c0_scalar[2] * ze0 + 3.0 * c0_scalar[3] * ze0 * ze0;
+    let q_z = ze0 + eta0 * eta_p;
+    let z_nm1 = if n == 0 {
+        0.0
+    } else {
+        (n as f64) * ze0.powi(n as i32 - 1)
+    };
+    let g_z = (z_nm1 - ze0.powi(n as i32) * q_z) * (-q0).exp();
+    g_jet.mul(&delta).add(&delta.mul(&delta).scale(0.5 * g_z))
+}
+
+/// Cell base-moment jets over a **θ-moving** domain `[zL(θ), zR(θ)]`:
+/// `Mₙ(θ) = interior_{[zL0,zR0]}(θ) + sliverₙ(zR) − sliverₙ(zL)`. The interior is
+/// the fixed-domain [`cell_base_moment_jets`] (the `e^{−Δq}` expansion over the
+/// base edges); each θ-moving edge adds its Leibniz [`edge_sliver_jet`]. Use this
+/// for cells whose edges are link-knot crossings `z = (τ−a)/b` that move with the
+/// (lifted) intercept and slope; pass `cell_base_moment_jets` directly for cells
+/// with fixed (`±∞` / fixed-knot) edges.
+pub(crate) fn cell_base_moment_jets_moving(
+    c_jets: &[Jet2; 4],
+    c0_scalar: [f64; 4],
+    scalar_moments: &[f64],
+    max_n: usize,
+    zl_jet: &Jet2,
+    zl0: f64,
+    zr_jet: &Jet2,
+    zr0: f64,
+) -> Vec<Jet2> {
+    let interior = cell_base_moment_jets(c_jets, c0_scalar, scalar_moments, max_n);
+    (0..=max_n)
+        .map(|n| {
+            let s_r = edge_sliver_jet(n, c_jets, c0_scalar, zr_jet, zr0);
+            let s_l = edge_sliver_jet(n, c_jets, c0_scalar, zl_jet, zl0);
+            interior[n].add(&s_r).sub(&s_l)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,6 +577,105 @@ mod tests {
                     assert!(
                         (m_jets[n].h[k * p + l] - fd_h).abs() <= 1e-3 * fd_h.abs().max(1.0) + 1e-6,
                         "d2M[{n}]/dc[{k}]dc[{l}] jet {:+.12e} != fd {:+.12e}",
+                        m_jets[n].h[k * p + l],
+                        fd_h
+                    );
+                }
+            }
+        }
+    }
+
+    /// #932 Phase 2b GATE (cell branch, MOVING domain): the runtime-jet moving
+    /// base moments `Mₙ(θ)` (fixed interior + Leibniz edge slivers) match a
+    /// central difference of `evaluate_cell_moments` with BOTH the cell cubic
+    /// coefficients `c₀..c₃` AND the cell edges `left`/`right` as θ-axes (6 axes).
+    /// Pins the moving-boundary flux ([`edge_sliver_jet`]) and its cross-coupling
+    /// with the interior `e^{−Δq}` motion (the `c × edge` Hessian block) at order
+    /// 2 — a dropped or mis-signed sliver would blow the bound.
+    #[test]
+    fn cell_base_moment_jets_moving_match_fd_932() {
+        use crate::cubic_cell_kernel::{DenestedCubicCell, evaluate_cell_moments};
+
+        let base_c = [0.10_f64, 0.50, -0.20, 0.10];
+        let (zl0, zr0) = (-0.80_f64, 0.70_f64);
+        let max_n = 4usize;
+        let scalar_deg = max_n + 12;
+        // θ = [c₀, c₁, c₂, c₃, left, right] (6 axes).
+        let p = 6usize;
+        let base6 = [base_c[0], base_c[1], base_c[2], base_c[3], zl0, zr0];
+        let cell_of = |t: [f64; 6]| DenestedCubicCell {
+            left: t[4],
+            right: t[5],
+            c0: t[0],
+            c1: t[1],
+            c2: t[2],
+            c3: t[3],
+        };
+        let moments_at = |t: [f64; 6]| -> Vec<f64> {
+            evaluate_cell_moments(cell_of(t), scalar_deg)
+                .expect("cell moments")
+                .moments
+                .into_vec()
+        };
+
+        // Interior scalar base moments over the FIXED base domain [zl0, zr0].
+        let scalar_moments = moments_at(base6);
+        let c_jets: [Jet2; 4] = std::array::from_fn(|k| Jet2::primary(base_c[k], k, p));
+        let zl_jet = Jet2::primary(zl0, 4, p);
+        let zr_jet = Jet2::primary(zr0, 5, p);
+        let m_jets = cell_base_moment_jets_moving(
+            &c_jets,
+            base_c,
+            &scalar_moments,
+            max_n,
+            &zl_jet,
+            zl0,
+            &zr_jet,
+            zr0,
+        );
+
+        for n in 0..=max_n {
+            assert!(
+                (m_jets[n].v - scalar_moments[n]).abs() <= 1e-12 * scalar_moments[n].abs().max(1.0),
+                "moving M[{n}] value {:+.12e} != scalar {:+.12e}",
+                m_jets[n].v,
+                scalar_moments[n]
+            );
+        }
+
+        let h = 1e-4_f64;
+        for n in 0..=max_n {
+            for k in 0..p {
+                let mut tp = base6;
+                let mut tm = base6;
+                tp[k] += h;
+                tm[k] -= h;
+                let fd_g = (moments_at(tp)[n] - moments_at(tm)[n]) / (2.0 * h);
+                assert!(
+                    (m_jets[n].g[k] - fd_g).abs() <= 1e-5 * fd_g.abs().max(1.0) + 1e-9,
+                    "moving dM[{n}]/dθ[{k}] jet {:+.12e} != fd {:+.12e}",
+                    m_jets[n].g[k],
+                    fd_g
+                );
+                for l in 0..p {
+                    let mut tpp = base6;
+                    let mut tpm = base6;
+                    let mut tmp = base6;
+                    let mut tmm = base6;
+                    tpp[k] += h;
+                    tpp[l] += h;
+                    tpm[k] += h;
+                    tpm[l] -= h;
+                    tmp[k] -= h;
+                    tmp[l] += h;
+                    tmm[k] -= h;
+                    tmm[l] -= h;
+                    let fd_h = (moments_at(tpp)[n] - moments_at(tpm)[n] - moments_at(tmp)[n]
+                        + moments_at(tmm)[n])
+                        / (4.0 * h * h);
+                    assert!(
+                        (m_jets[n].h[k * p + l] - fd_h).abs() <= 2e-3 * fd_h.abs().max(1.0) + 1e-6,
+                        "moving d2M[{n}]/dθ[{k}]dθ[{l}] jet {:+.12e} != fd {:+.12e}",
                         m_jets[n].h[k * p + l],
                         fd_h
                     );
