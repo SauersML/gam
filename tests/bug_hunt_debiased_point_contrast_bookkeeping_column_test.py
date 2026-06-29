@@ -116,3 +116,57 @@ def test_estimate_is_invariant_to_unreferenced_column_presence() -> None:
     # Same data + formula; the bookkeeping column is inert, so the fits — hence
     # m(x0) — agree to well under fitting tolerance.
     assert abs(est_plain - est_extra) < 1e-6, (est_plain, est_extra)
+
+
+def test_multiple_bookkeeping_columns_far_from_placeholder() -> None:
+    """Two unreferenced bookkeeping columns (one categorical, one continuous),
+    with the predictor's domain far from the ``"0"`` placeholder, must not
+    perturb the estimate — proving the placeholder genuinely never reaches the
+    mean design rather than merely encoding to a harmless small value."""
+    rng = np.random.default_rng(747474)
+    n = 600
+    x = rng.uniform(5.0, 10.0, n)  # far from the "0" placeholder
+    y = 2.0 * x + rng.normal(0.0, 0.1, n)
+    ident = rng.choice(["p", "q", "r"], size=n)
+    note = rng.uniform(100.0, 200.0, n)
+    # A categorical bookkeeping column BEFORE the response, and a continuous one
+    # after the predictor — both unreferenced by `y ~ s(x)`.
+    df = pd.DataFrame(
+        {"id": pd.Categorical(ident), "y": y, "x": x, "note": note}
+    )
+    model = gamfit.fit(df, "y ~ s(x)")
+
+    res = model.debiased_functional(df, target="point", x0={"x": 7.0})
+    expected = _predict_at(model, {"x": 7.0})
+    assert abs(res["theta_plugin"] - expected) < 1e-5, (res, expected)
+
+
+def test_contrast_over_categorical_predictor_with_bookkeeping_column() -> None:
+    """A contrast over a genuine categorical PREDICTOR (group b vs a at fixed x)
+    must match ``predict(x0) - predict(x1)`` while an unreferenced bookkeeping
+    column rides along — the predictor is strict-encoded (real level), the
+    bookkeeping column lenient-encoded (placeholder)."""
+    rng = np.random.default_rng(858585)
+    n = 600
+    x = rng.uniform(0.0, 1.0, n)
+    grp = rng.choice(["a", "b"], size=n)
+    y = np.sin(2.0 * np.pi * x) + (grp == "b") * 0.7 + rng.normal(0.0, 0.1, n)
+    tag = rng.choice(["t1", "t2", "t3"], size=n)  # inert bookkeeping factor
+    df = pd.DataFrame(
+        {"y": y, "x": x, "group": pd.Categorical(grp), "tag": pd.Categorical(tag)}
+    )
+    model = gamfit.fit(df, "y ~ s(x) + group")
+
+    res = model.debiased_functional(
+        df, target="contrast", x0={"x": 0.5, "group": "b"}, x1={"x": 0.5, "group": "a"}
+    )
+
+    def _pred(g: str) -> float:
+        frame = pd.DataFrame(
+            {"x": [0.5], "group": pd.Categorical([g], categories=["a", "b"])}
+        )
+        return float(np.asarray(model.predict(frame)).ravel()[0])
+
+    expected = _pred("b") - _pred("a")
+    assert abs(expected) > 0.3, expected
+    assert abs(res["theta_plugin"] - expected) < 1e-5, (res, expected)
