@@ -4400,4 +4400,243 @@ mod empirical_flex_jet_oracle_tests {
             fourth[[q, b]]
         );
     }
+
+    // ----------------------------------------------------------------------
+    // #932 BMS flex single-source (P2/P3): the empirical-grid flex row NLL
+    // value/gradient/Hessian read off ONE runtime-dimension jet — the
+    // calibrated intercept a(θ) lifted directly in the jet by the
+    // implicit-function-theorem operator, the observed signed-probit NLL
+    // composed on top — instead of the hand intercept/slope derivative chains
+    // of `compute_row_analytic_flex_from_parts_into`. This is the runtime
+    // analogue of the rigid `empirical_rigid_row_nll_jet` and mirrors the
+    // exact `flex_tower_witness` term-for-term (Tower4 -> runtime Jet2), so the
+    // gate below pins it to the SAME analytic derivatives the production hand
+    // path produces — at machine precision, no finite-difference truncation.
+
+    /// Observed-index jet `η(a; node) = scale·(a + b·node + warp)` over the `r`
+    /// runtime primaries, the deviation basis entering exactly as the model
+    /// (score-warp: `b·Σβⱼ·Φⱼ(node)`; link-dev: `Σβⱼ·Φⱼ(u)`, `u = a + b·node`).
+    /// `a_jet` is the (lifted or seeded) intercept jet; `b_jet` / `beta_jets`
+    /// are the seeded slope / deviation-coefficient primaries. Reuses
+    /// [`witness_basis_stacks_at`] for the per-column basis derivative stacks so
+    /// it samples the SAME spline branch the exact tower witness does.
+    fn flex_eta_row_jet2(
+        fx: &FlexFixture,
+        a_jet: &crate::bms::test_support::Jet2,
+        b_jet: &crate::bms::test_support::Jet2,
+        beta_jets: &[crate::bms::test_support::Jet2],
+        node: f64,
+        node_arg: f64,
+        scale: f64,
+    ) -> crate::bms::test_support::Jet2 {
+        use crate::bms::test_support::{Jet2, RuntimeJet};
+        let r = a_jet.p();
+        let stacks = witness_basis_stacks_at(fx, node_arg);
+        if fx.is_score_warp {
+            // inside = a + b·(node + Σⱼ βⱼ·Φⱼ(node)); Φⱼ(node) is a constant.
+            let mut warp = Jet2::constant(0.0, r);
+            for (j, stack) in stacks.iter().enumerate() {
+                warp = warp.add(&beta_jets[j].scale(stack[0]));
+            }
+            let inside = a_jet.add(&b_jet.mul(&warp.add(&Jet2::constant(node, r))));
+            inside.scale(scale)
+        } else {
+            // u = a + b·node; warp = Σⱼ βⱼ·Φⱼ(u); inside = u + warp.
+            let u = a_jet.add(&b_jet.scale(node));
+            let mut warp = Jet2::constant(0.0, r);
+            for (j, stack) in stacks.iter().enumerate() {
+                warp = warp.add(&beta_jets[j].mul(&u.compose_unary(*stack)));
+            }
+            let inside = u.add(&warp);
+            inside.scale(scale)
+        }
+    }
+
+    /// Single-source empirical-grid flex row NLL `(value, gradient, Hessian)`
+    /// over the flat primary vector `p = [q, b, β...]` (length `primary.total`),
+    /// produced entirely by the runtime-dimension jet: the calibration
+    /// `F(a, θ) = −μ(q) + Σ_k π_k Φ(η(a; x_k)) = 0` lifts the intercept `a(θ)`
+    /// directly in the jet via [`filtered_implicit_solve_jet2`]; the observed
+    /// signed-probit NLL `−w·logΦ((2y−1)·η)` is then composed on top. No hand
+    /// intercept/slope derivative formulas.
+    fn empirical_flex_row_nll_jet2(
+        fx: &FlexFixture,
+        p0: &[f64],
+    ) -> crate::bms::test_support::Jet2 {
+        use crate::bms::test_support::{Jet2, RuntimeJet, filtered_implicit_solve_jet2};
+        let r = fx.primary.total;
+        let q0 = p0[fx.primary.q];
+        let b0 = p0[fx.primary.logslope];
+        let dev_range = if fx.is_score_warp {
+            fx.primary.h.clone().unwrap()
+        } else {
+            fx.primary.w.clone().unwrap()
+        };
+        let beta: Vec<f64> = dev_range.clone().map(|i| p0[i]).collect();
+        let scale = fx.family.probit_frailty_scale();
+        let marginal = bernoulli_marginal_link_map(
+            &InverseLink::Standard(gam_problem::StandardLink::Probit),
+            q0,
+        )
+        .expect("flex jet2 link map");
+
+        // Converged scalar intercept root (the lift's order-0 anchor) from the
+        // independent bracketed solve — shares no jet code with the lift.
+        let a0 = witness_intercept(fx, marginal.mu, b0, &Array1::from(beta.clone()), scale);
+
+        // Seeded primaries: q at slot `primary.q`, b at `primary.logslope`, each
+        // βⱼ at its own deviation slot. q enters the row NLL ONLY through the
+        // calibrated intercept (μ(q) is the calibration target), so it is seeded
+        // for the calibration but never added to the observed index directly.
+        let q_jet = Jet2::primary(q0, fx.primary.q, r);
+        let b_jet = Jet2::primary(b0, fx.primary.logslope, r);
+        let beta_jets: Vec<Jet2> = dev_range
+            .clone()
+            .map(|i| Jet2::primary(p0[i], i, r))
+            .collect();
+        let neg_mu = q_jet
+            .compose_unary([
+                marginal.mu,
+                marginal.mu1,
+                marginal.mu2,
+                marginal.mu3,
+                marginal.mu4,
+            ])
+            .scale(-1.0);
+
+        let basis_arg = |node: f64| -> f64 {
+            if fx.is_score_warp {
+                node
+            } else {
+                a0 + b0 * node
+            }
+        };
+
+        // Calibration Jacobian F_a at the root: Σ_k π_k φ(η₀)·∂η/∂a. The score-
+        // warp basis is a-independent (∂η/∂a = scale); the link-deviation basis
+        // rides the observed index u = a + b·node (∂η/∂a = scale·(1 + Σβⱼ·Φⱼ′)).
+        let mut f_a = 0.0_f64;
+        for (node, weight) in fx.grid.pairs() {
+            let eta0 = witness_eta(fx, a0, b0, &Array1::from(beta.clone()), node, scale);
+            let eta0_a = if fx.is_score_warp {
+                scale
+            } else {
+                let stacks = witness_basis_stacks_at(fx, basis_arg(node));
+                let mut s = 1.0_f64;
+                for (j, stack) in stacks.iter().enumerate() {
+                    s += beta[j] * stack[1];
+                }
+                scale * s
+            };
+            f_a += weight * witness_normal_pdf(eta0) * eta0_a;
+        }
+        assert!(
+            f_a.is_finite() && f_a > 0.0,
+            "flex jet2: non-positive calibration Jacobian F_a={f_a}"
+        );
+        let inv_fa = 1.0 / f_a;
+
+        // Lift a(θ) directly in the jet: F(a, θ) = −μ(q) + Σ_k π_k Φ(η(a; x_k)).
+        let constraint = |a: &Jet2| -> Jet2 {
+            let mut acc = neg_mu.clone();
+            for (node, weight) in fx.grid.pairs() {
+                let eta = flex_eta_row_jet2(fx, a, &b_jet, &beta_jets, node, basis_arg(node), scale);
+                let cdf = eta.compose_unary(unary_derivatives_normal_cdf(eta.value()));
+                acc = acc.add(&cdf.scale(weight));
+            }
+            acc
+        };
+        let a_jet = filtered_implicit_solve_jet2(a0, inv_fa, 2, r, constraint);
+
+        // Observed signed-probit NLL through the SAME scalar kernel production
+        // uses: η = a(θ) + b·z + warp, ℓ = −w·logΦ((2y−1)·η).
+        let z = fx.family.z[0];
+        let eta_obs = flex_eta_row_jet2(fx, &a_jet, &b_jet, &beta_jets, z, basis_arg(z), scale);
+        let signed = eta_obs.scale(2.0 * fx.family.y[0] - 1.0);
+        let stack = signed_probit_neglog_unary_stack(signed.value(), fx.family.weights[0]);
+        signed.compose_unary(stack)
+    }
+
+    /// #932 P2/P3 GATE: the single-source runtime-jet flex row NLL matches the
+    /// exact `Tower4<3>` witness on the representative `(q, b, β₀)` block at
+    /// machine precision (value/gradient/Hessian), its value matches the fully
+    /// independent scalar NLL, and its full gradient (every β column) matches a
+    /// central-difference of the scalar NLL. A dropped/incorrect implicit-diff,
+    /// Leibniz, or Faà di Bruno term would blow the 1e-9 tower bound.
+    #[test]
+    fn empirical_flex_row_nll_jet2_matches_tower_and_scalar_932() {
+        for is_score_warp in [true, false] {
+            let fx = make_fixture(is_score_warp);
+            let r = fx.primary.total;
+            let q0 = 0.2_f64;
+            let b0 = 0.35_f64;
+            let mut p0 = vec![0.0; r];
+            p0[fx.primary.q] = q0;
+            p0[fx.primary.logslope] = b0;
+            let dev_range = if is_score_warp {
+                fx.primary.h.clone().unwrap()
+            } else {
+                fx.primary.w.clone().unwrap()
+            };
+            for (k, i) in dev_range.clone().enumerate() {
+                p0[i] = fx.beta_dev[k];
+            }
+            let q = fx.primary.q;
+            let b = fx.primary.logslope;
+            let dev0 = dev_range.start;
+            let label = if is_score_warp { "score-warp" } else { "link-dev" };
+
+            let jet = empirical_flex_row_nll_jet2(&fx, &p0);
+            let tower = flex_tower_witness(&fx, &p0);
+            let v_scalar = witness_nll(&fx, &p0);
+
+            // Value vs the fully independent scalar NLL (shares no jet code).
+            assert!(
+                (jet.v - v_scalar).abs() <= 1e-9 * v_scalar.abs().max(1.0),
+                "{label} jet value {:+.12e} != scalar witness {v_scalar:+.12e}",
+                jet.v,
+            );
+
+            // Value / gradient / Hessian vs the exact tower on the (q, b, β₀)
+            // block — every cross channel (q×b, b×β, β×β, and the calibration
+            // coupling q×* through the lifted intercept).
+            assert!(
+                (jet.v - tower.v).abs() <= 1e-9 * tower.v.abs().max(1.0),
+                "{label} jet value vs tower",
+            );
+            let axes = [q, b, dev0];
+            for &u in axes.iter() {
+                let gu = tower_channel(&fx, &tower, &[u]);
+                assert!(
+                    (jet.g[u] - gu).abs() <= 1e-9 * gu.abs().max(1.0),
+                    "{label} grad[{u}] {:+.12e} != tower {gu:+.12e}",
+                    jet.g[u],
+                );
+                for &v in axes.iter() {
+                    let huv = tower_channel(&fx, &tower, &[u, v]);
+                    assert!(
+                        (jet.h[u * r + v] - huv).abs() <= 1e-9 * huv.abs().max(1.0),
+                        "{label} hess[{u},{v}] {:+.12e} != tower {huv:+.12e}",
+                        jet.h[u * r + v],
+                    );
+                }
+            }
+
+            // Full gradient (including every β column the tower holds constant)
+            // vs a central difference of the independent scalar NLL.
+            let step = 1e-5_f64;
+            for i in 0..r {
+                let mut pp = p0.clone();
+                let mut pm = p0.clone();
+                pp[i] += step;
+                pm[i] -= step;
+                let fd = (witness_nll(&fx, &pp) - witness_nll(&fx, &pm)) / (2.0 * step);
+                assert!(
+                    (jet.g[i] - fd).abs() <= 1e-5 * fd.abs().max(1.0) + 1e-8,
+                    "{label} grad[{i}] {:+.12e} != fd {fd:+.12e}",
+                    jet.g[i],
+                );
+            }
+        }
+    }
 }

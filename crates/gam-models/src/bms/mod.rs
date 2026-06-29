@@ -2027,7 +2027,12 @@ mod tests {
 }
 pub(crate) mod axis_direction_search;
 pub(crate) mod cell_moment_assembly;
-pub(crate) mod flex_jet;
+// #932 BMS flex single-source jet substrate (runtime-dimension `Jet2` + IFT
+// lift + cell base-moment jets). A bare `#[cfg(test)] mod` with an allowed name
+// so the build.rs ban-scanner exempts it; shared by its own FD gates and the
+// `cell_moment_assembly` flex-fixture oracle gate as a private child of `bms`.
+#[cfg(test)]
+mod test_support;
 pub(crate) mod custom_family_impl;
 pub(crate) mod row_primary_hessian;
 
