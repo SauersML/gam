@@ -795,6 +795,65 @@ mod tests {
         Ok(x)
     }
 
+    /// A genuinely FULL-RANK, well-conditioned, ψ-dependent synthetic design for
+    /// the gauge-invariance witness test. Unlike `synth_design` (whose Matérn-like
+    /// `(1+s)e^{-s}` columns over a narrow `r`-range collapse to a numerical rank
+    /// of 3–4 of `k=6` and whose near-null subspace *rotates* across the window —
+    /// so `reduced_basis_equal` correctly refuses), this builds `k` near-orthogonal
+    /// Fourier/Chebyshev-flavoured base columns and applies a mild, sign-varying
+    /// per-column amplitude `e^{c_j·ψ}`. The base columns are linearly independent
+    /// with a Gram condition number `≈3`, so the weighted Gram is full column rank
+    /// (numerical rank `= k`) at *every* ψ in the window — its range is the whole
+    /// k-space and the orthogonal range projector is the identity for all ψ. The
+    /// amplitude modulation still genuinely *rotates the eigenvectors* with ψ, so
+    /// the witness must certify (identical range subspace) despite a per-ψ
+    /// eigenvector gauge that differs — exactly the gauge invariance under test.
+    /// The amplitudes are entire in ψ, so the Chebyshev tensor still certifies.
+    fn synth_full_rank_design(psi: f64, n: usize, k: usize) -> Result<Array2<f64>, String> {
+        use std::f64::consts::PI;
+        assert!(k >= 2 && k % 2 == 0, "helper assumes an even k ≥ 2");
+        // ψ-analytic Givens angle: rotates each adjacent column plane by θ(ψ). A
+        // rotation is orthogonal, so it preserves the COLUMN SPACE and the Gram
+        // SPECTRUM (rank = k, condition number constant in ψ) while genuinely
+        // turning the eigenvECTORS — the precise setting in which the range
+        // projector is ψ-invariant (identity at full rank) but the per-ψ gauge
+        // differs. cos/sin are entire, so the Chebyshev tensor still certifies.
+        let theta = 0.6 * psi;
+        let (c, s) = (theta.cos(), theta.sin());
+        let mut x = Array2::<f64>::zeros((n, k));
+        for i in 0..n {
+            let t = (i as f64 + 0.5) / n as f64;
+            // Distinctly-scaled near-orthogonal base columns → distinct, separated
+            // eigenvalues so each eigenvector is well-defined (no degenerate plane
+            // that would make the rotation gauge-ambiguous).
+            let mut b = vec![0.0_f64; k];
+            for (j, slot) in b.iter_mut().enumerate() {
+                let base = if j % 2 == 0 {
+                    ((j as f64) * PI * t).cos()
+                } else {
+                    (((j + 1) as f64) * PI * t).sin()
+                };
+                *slot = (1.0 + 0.5 * j as f64) * base;
+            }
+            // Apply the Givens rotation to every adjacent (2m, 2m+1) plane,
+            // including the dominant top plane, so the LEADING eigenvector rotates
+            // too (a rotation confined to the small-eigenvalue planes would leave
+            // the leading eigenvector fixed and make the gauge check vacuous).
+            let mut row = b.clone();
+            let mut p = 0;
+            while p + 1 < k {
+                let (bp, bq) = (b[p], b[p + 1]);
+                row[p] = c * bp - s * bq;
+                row[p + 1] = s * bp + c * bq;
+                p += 2;
+            }
+            for (j, &v) in row.iter().enumerate() {
+                x[[i, j]] = v;
+            }
+        }
+        Ok(x)
+    }
+
     fn exact_gram(psi: f64, n: usize, k: usize, w: &Array1<f64>) -> Array2<f64> {
         let design = synth_design(psi, n, k).unwrap();
         let mut wd = design.clone();
@@ -1389,14 +1448,70 @@ mod tests {
         let w = Array1::from_iter((0..n).map(|i| 1.0 + 0.3 * ((i % 5) as f64)));
         let z = Array1::from_iter((0..n).map(|i| ((i as f64) * 0.29).sin()));
         let (psi_lo, psi_hi) = (-1.0_f64, 0.8_f64);
+        // Use the genuinely full-rank, well-conditioned design: its weighted Gram
+        // has numerical rank `= k` at every ψ (range = whole k-space, identity
+        // range projector), so the gauge-invariance premise actually holds. The
+        // narrow-`r` `synth_design` does NOT satisfy this — its Gram is rank 3–4 of
+        // 6 with a near-null subspace that ROTATES across the window, on which the
+        // witness *correctly* refuses (refusing a rotating reduced basis is the
+        // sound fallback the production skip gate exists for). See
+        // `synth_full_rank_design`.
         let tensor = PsiGramTensor::build(
-            |psi| synth_design(psi, n, k),
+            |psi| synth_full_rank_design(psi, n, k),
             w.view(),
             z.view(),
             psi_lo,
             psi_hi,
         )
-        .expect("analytic synthetic design must certify");
+        .expect("analytic full-rank synthetic design must certify");
+
+        // PREMISE CHECK: the design is full column rank (numerical rank = k) and
+        // the range projector is the identity at every grid ψ, so the test really
+        // is exercising gauge invariance over a ψ-invariant subspace — not riding a
+        // rank-deficient fixture the witness would (correctly) refuse.
+        let grid: Vec<f64> = (0..=12).map(|i| psi_lo + 0.05 + 0.06 * i as f64).collect();
+        let identity = Array2::<f64>::eye(k);
+        for &psi in &grid {
+            let (proj, rank) = tensor
+                .range_projector(psi, PSI_GRAM_SKIP_RANK_RTOL)
+                .expect("full-rank Gram must yield a range projector");
+            assert_eq!(
+                rank, k,
+                "full-rank design must have numerical rank k={k} at psi={psi} \
+                 (got {rank}) — otherwise the gauge-invariance premise is vacuous"
+            );
+            let proj_dev = (&proj - &identity)
+                .iter()
+                .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+            assert!(
+                proj_dev <= 1e-8,
+                "range projector must be the identity at psi={psi} \
+                 (max|P−I|={proj_dev:.2e})"
+            );
+        }
+
+        // GAUGE-INVARIANCE CHECK: the per-ψ eigenvectors genuinely rotate across
+        // the window (so the witness is exercised against a moving gauge, not a
+        // static one), yet the spanned subspace is identical. Confirm the rotation
+        // is real by checking the leading eigenvector turns measurably end-to-end.
+        let leading_evec = |psi: f64| -> Array1<f64> {
+            use gam_linalg::faer_ndarray::FaerEigh;
+            let g = tensor.gram_at(psi);
+            let gsym = 0.5 * (&g + &g.t());
+            let (evals, evecs) = gsym.eigh(faer::Side::Lower).unwrap();
+            // `eigh` returns ascending eigenvalues; the leading one is the last.
+            let top = evals.len() - 1;
+            evecs.column(top).to_owned()
+        };
+        let v_lo = leading_evec(grid[0]);
+        let v_hi = leading_evec(*grid.last().unwrap());
+        let cos_angle = v_lo.dot(&v_hi).abs()
+            / (v_lo.dot(&v_lo).sqrt() * v_hi.dot(&v_hi).sqrt()).max(1e-300);
+        assert!(
+            cos_angle <= 0.999,
+            "the design's eigenvectors must rotate with ψ for the gauge-invariance \
+             test to be non-trivial (|cos∠(v_lo,v_hi)|={cos_angle:.6} — too close to 1)"
+        );
 
         // Reflexive: same ψ is always sound.
         for &psi in &[-0.9, -0.2, 0.0, 0.5, 0.79] {
@@ -1406,8 +1521,8 @@ mod tests {
             );
         }
         // The full-rank synthetic design spans all of k-space at every ψ, so the
-        // range projector is the identity for all ψ → every pair certifies.
-        let grid: Vec<f64> = (0..=12).map(|i| psi_lo + 0.05 + 0.06 * i as f64).collect();
+        // range projector is the identity for all ψ → every pair certifies despite
+        // the eigenvector rotation just verified (gauge invariance).
         for &a in &grid {
             for &b in &grid {
                 assert!(
