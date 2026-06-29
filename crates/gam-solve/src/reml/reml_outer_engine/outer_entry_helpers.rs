@@ -393,8 +393,7 @@ pub(crate) fn efs_profiling(solution: &InnerSolution<'_>) -> (f64, f64) {
         DispersionHandling::ProfiledGaussian => {
             let dp_raw = -2.0 * solution.log_likelihood + solution.penalty_quadratic;
             let (dp_c, dp_cgrad, _) = smooth_floor_dp(dp_raw, solution.dp_floor_scale);
-            // Σ wᵢ effective sample size (see `InnerSolution::dispersion_effective_n`).
-            let denom = (solution.dispersion_effective_n - solution.nullspace_dim).max(DENOM_RIDGE);
+            let denom = (solution.n_observations as f64 - solution.nullspace_dim).max(DENOM_RIDGE);
             (dp_c / denom, dp_cgrad)
         }
         DispersionHandling::Fixed { phi, .. } => (*phi, 0.0),
@@ -935,7 +934,6 @@ pub(crate) fn try_tangent_projected_evaluate(
                 rho_curvature_scale: solution.rho_curvature_scale,
                 rho_prior: solution.rho_prior.clone(),
                 n_observations: solution.n_observations,
-                dispersion_effective_n: solution.dispersion_effective_n,
                 nullspace_dim: solution.nullspace_dim,
                 gaussian_weight_log_sum_half: solution.gaussian_weight_log_sum_half,
                 dp_floor_scale: solution.dp_floor_scale,
@@ -1060,7 +1058,6 @@ pub(crate) fn try_tangent_projected_evaluate(
         rho_curvature_scale: solution.rho_curvature_scale,
         rho_prior: solution.rho_prior.clone(),
         n_observations: solution.n_observations,
-        dispersion_effective_n: solution.dispersion_effective_n,
         nullspace_dim: solution.nullspace_dim,
         gaussian_weight_log_sum_half: solution.gaussian_weight_log_sum_half,
         dp_floor_scale: solution.dp_floor_scale,
