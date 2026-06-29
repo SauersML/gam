@@ -124,3 +124,87 @@ fn survival_marginal_slope_returns_bounded_not_hang_979() {
         ),
     }
 }
+
+/// gam#979 ROOT-CAUSE regression: the ill-posed survival marginal-slope shape
+/// (marginal and logslope share the SAME duchon spatial basis → a structural
+/// marginal↔logslope confound that historically left a quadratically-flat
+/// near-null direction in the joint penalised Hessian) must now GENUINELY
+/// CONVERGE — i.e. the inner joint-Newton certifies stationarity on its own and
+/// the fit returns a usable result with the wall-clock deadline effectively
+/// DISARMED (set far above any honest convergence time), so the deadline is a
+/// pure backstop rather than the load-bearing stop.
+///
+/// The fix removes the confound BY CONSTRUCTION: a W-orthogonal PARTIAL
+/// reduced-logslope reparam (the proven-correct BMS effective-Schur-Gram
+/// construction ported into survival's per-row 4×4 Hessian metric) drops only
+/// the marginal-explained logslope directions, keeping the surviving ones, so
+/// `M = JᵀHJ + S` is full-rank with no runtime projection.
+///
+/// Distinction from `survival_marginal_slope_returns_bounded_not_hang_979`
+/// (which accepts Ok OR a catchable error): this test REQUIRES `Ok` (a real
+/// fit) AND that the fit finished STRICTLY BELOW the (generous) budget — proving
+/// the deadline did not fire. Before the fix the same shape ground until the
+/// deadline returned a best-so-far/error iterate at ~budget; that now fails the
+/// `secs < budget - margin` assertion.
+#[test]
+fn survival_marginal_slope_converges_with_deadline_disarmed_979() {
+    init_parallelism();
+    let n = 1200usize;
+    let centers = 12usize;
+    // Generous budget that an honest convergence finishes far below. If the
+    // root-cause confound were still present, the fit would grind to ~budget and
+    // the `secs < budget - margin` assertion below would fail.
+    let budget_secs = 900.0_f64;
+    let margin_secs = 180.0_f64;
+    let data = build_dataset(n);
+    let pcs: Vec<String> = (0..N_PCS).map(|i| format!("PC{}", i + 1)).collect();
+    let duchon = format!("duchon({}, centers={}, order=1)", pcs.join(", "), centers);
+    let formula = format!("Surv(entry_age, exit_age, event) ~ {} + sex", duchon);
+    let config = FitConfig {
+        survival_likelihood: "marginal-slope".to_string(),
+        z_column: Some("prs_z".to_string()),
+        // logslope shares the SAME duchon basis as the marginal score surface —
+        // this is the structural marginal↔logslope confound #979 is about.
+        logslope_formula: Some(duchon),
+        baseline_target: "linear".to_string(),
+        gpu_policy: gam::gpu::GpuPolicy::Off,
+        outer_wall_clock_budget_secs: Some(budget_secs),
+        ..FitConfig::default()
+    };
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let start = Instant::now();
+        let outcome = fit_from_formula(&formula, &data, &config);
+        let ok = outcome.is_ok();
+        let err = outcome.err().map(|e| e.to_string());
+        tx.send((ok, err, start.elapsed().as_secs_f64())).ok();
+    });
+
+    // Hard limit comfortably above the budget so a true hang still fails (rather
+    // than hanging the suite) while leaving room for post-fit cleanup.
+    let hard_limit = Duration::from_secs_f64(budget_secs + 240.0);
+    match rx.recv_timeout(hard_limit) {
+        Ok((ok, err, secs)) => {
+            eprintln!(
+                "[979-converge] survival fit returned in {secs:.1}s (ok={ok}, err={err:?})"
+            );
+            assert!(
+                ok,
+                "ill-posed survival marginal-slope fit did NOT genuinely converge to a usable \
+                 result (err={err:?}) — #979 root-cause regression: the marginal↔logslope \
+                 confound must be removed by construction so the joint-Newton certifies"
+            );
+            assert!(
+                secs < budget_secs - margin_secs,
+                "ill-posed survival marginal-slope fit took {secs:.1}s with a {budget_secs:.0}s \
+                 budget — it ground until ~the deadline instead of self-certifying convergence; \
+                 the wall-clock deadline is still load-bearing (#979 root-cause regression)"
+            );
+        }
+        Err(_) => panic!(
+            "survival marginal-slope fit did NOT return within {}s — #979 regression (hung)",
+            budget_secs + 240.0
+        ),
+    }
+}

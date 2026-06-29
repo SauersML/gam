@@ -1186,6 +1186,70 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                                 // a direction the model genuinely needs — exactly
                                 // the regression a naive nullspace-shrink caused on
                                 // the n ≥ 1000 spatial path.
+                                //
+                                // #979 ROOT-CAUSE FIX (preferred over the gate
+                                // below): when the COLLAPSED channel is logslope,
+                                // first try a W-orthogonal PARTIAL reduced-logslope
+                                // reparam — the proven-correct BMS construction
+                                // (`bms::block_specs::reduced_logslope_transform_effective`)
+                                // ported into survival's per-row 4×4 Hessian metric
+                                // (`survival_reduced_logslope_transform_effective`).
+                                // The full per-term compiler deletes the WHOLE
+                                // logslope channel because its priority-ordered RRQR
+                                // attributes every shared marginal↔logslope direction
+                                // to the lowest-priority logslope block. The effective
+                                // Schur Gram instead removes from logslope ONLY the
+                                // directions W-explained by the marginal span, KEEPS
+                                // the `r` surviving directions, and leaves marginal/
+                                // time untouched. The joint penalised Hessian
+                                // M = JᵀHJ + S is then full-rank BY CONSTRUCTION — the
+                                // 2e14 marginal↔logslope phantom null is gone, the
+                                // inner joint-Newton certifies on its own, and the
+                                // wall-clock deadline is demoted to a pure backstop.
+                                // Only the logslope confound is eligible here (the
+                                // spatial time block is protected by the gate below).
+                                if real == "logslope" {
+                                    use crate::survival::marginal_slope::identifiability::{
+                                        survival_block_diagonal_logslope_map,
+                                        survival_reduced_logslope_transform_effective,
+                                    };
+                                    match survival_reduced_logslope_transform_effective(
+                                        m_dq.view(),
+                                        g_dg.view(),
+                                        &row_hess,
+                                    ) {
+                                        Ok(Some(t_log)) => {
+                                            let wl = t_log.ncols();
+                                            let bd_map = survival_block_diagonal_logslope_map(
+                                                p_time, p_marg, &t_log,
+                                            );
+                                            log::info!(
+                                                "[smgs phase-4b compiled-map] #979: full row-Hessian \
+                                                 collapses the logslope channel ({p_log}→0), but the \
+                                                 W-orthogonal effective Schur Gram keeps {wl}/{p_log} \
+                                                 surviving logslope directions; engaging the BMS-style \
+                                                 PARTIAL reduced-logslope reparam (marginal/time pass \
+                                                 through unchanged) so the joint penalised Hessian is \
+                                                 full-rank by construction — phantom null removed, \
+                                                 deadline demoted to backstop",
+                                            );
+                                            return Ok(Some((bd_map, (p_time, p_marg, wl))));
+                                        }
+                                        Ok(None) => {
+                                            // r == p_log (no effective confound to
+                                            // remove) or r == 0 (whole logslope image
+                                            // in the marginal span). Fall through to
+                                            // the measured-phantom gate below.
+                                        }
+                                        Err(reason) => {
+                                            log::warn!(
+                                                "[smgs phase-4b compiled-map] #979 partial \
+                                                 reduced-logslope reparam unavailable ({reason}); \
+                                                 falling back to the measured-phantom gate",
+                                            );
+                                        }
+                                    }
+                                }
                                 let gate = (|| -> Result<bool, String> {
                                     // Protect the spatial/time path: only the
                                     // marginal↔logslope confound is eligible for
