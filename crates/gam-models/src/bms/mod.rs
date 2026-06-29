@@ -2027,6 +2027,7 @@ mod tests {
 }
 pub(crate) mod axis_direction_search;
 pub(crate) mod cell_moment_assembly;
+pub(crate) mod flex_jet;
 pub(crate) mod custom_family_impl;
 pub(crate) mod row_primary_hessian;
 
