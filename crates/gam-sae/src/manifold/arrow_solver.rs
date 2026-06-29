@@ -320,7 +320,7 @@ impl<'a> DeflatedArrowSolver<'a> {
 }
 
 #[cfg(test)]
-mod selected_inverse_row_blocks_oracle {
+mod selected_inverse_row_blocks_oracle_tests {
     //! #932 FRONT C oracle: the row-local Takahashi selected-inverse blocks
     //! ([`DeflatedArrowSolver::selected_inverse_row_blocks`] / [`beta_inv`])
     //! MUST reproduce the per-row full-system `solve` loop they replace, to
