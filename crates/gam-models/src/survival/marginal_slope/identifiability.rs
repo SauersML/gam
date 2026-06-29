@@ -2468,4 +2468,143 @@ mod tests {
             }
         }
     }
+
+    // ----- #979 effective reduced-logslope confound removal -----------------
+    //
+    // Direct unit coverage of the two numerical routines added for #979,
+    // mirroring the BMS reference cuts
+    // (`bms::block_specs` `effective_reduction_*`): the scalar weight
+    // contraction off the per-row 4×4 Hessian, and the block-diagonal map
+    // assembly. The 900s end-to-end `survival_marginal_slope_converges_*`
+    // guard exercises the same path but is slow and data-dependent; these pin
+    // the distinguishing logic deterministically.
+
+    /// Constant per-row 4×4 PSD Hessian carrying ONLY the (q0, g) coupling,
+    /// channel order (q0, q1, qd1, g): `H[0,0]=h00`, `H[0,3]=H[3,0]=h03`,
+    /// `H[3,3]=h33`, all else zero. The effective scalar weights the
+    /// contraction reads are then `w_mm=h00`, `w_mg=h03`, `w_gg=h33`. The
+    /// 2×2 (q0,g) block `[[h00,h03],[h03,h33]]` is PSD when `h00·h33 ≥ h03²`.
+    fn const_row_hess_q0g(n: usize, h00: f64, h03: f64, h33: f64) -> SurvivalRowHessian {
+        let mut h = Array3::<f64>::zeros((n, K_SURVIVAL, K_SURVIVAL));
+        for i in 0..n {
+            h[[i, 0, 0]] = h00;
+            h[[i, 0, 3]] = h03;
+            h[[i, 3, 0]] = h03;
+            h[[i, 3, 3]] = h33;
+        }
+        SurvivalRowHessian::from_full(h)
+    }
+
+    #[test]
+    fn survival_reduced_logslope_drops_confounded_keeps_free_979() {
+        // p_m=1 marginal column m; p_log=2 logslope columns [l1, l2] with
+        // l1 == m (an exact rank-1 (q0,g) confound: h00·h33 = h03²) so l1 is
+        // fully marginal-explained, and l2 ⊥ m with 100× the energy so it is
+        // unambiguously free. The effective Schur Gram must drop ONLY the
+        // confounded direction: 0 < r == 1 < p_log == 2.
+        let n = 4;
+        let row_hess = const_row_hess_q0g(n, 2.0, 2.0, 2.0); // (q0,g) = [[2,2],[2,2]], rank-1
+        let marg = Array2::from_shape_vec((n, 1), vec![1.0, 1.0, 1.0, 1.0]).unwrap();
+        // l1 = m (confounded); l2 = [10,-10,10,-10] (Euclidean-orthogonal to m,
+        // ‖l2‖² = 400 ≫ ‖m‖² = 4, so Gtt's free eigenvalue ≫ tol).
+        let log =
+            Array2::from_shape_vec((n, 2), vec![1.0, 10.0, 1.0, -10.0, 1.0, 10.0, 1.0, -10.0])
+                .unwrap();
+        let t = survival_reduced_logslope_transform_effective(marg.view(), log.view(), &row_hess)
+            .expect("contraction must succeed")
+            .expect("a partial confound must yield a reduced transform");
+        assert_eq!(t.dim(), (2, 1), "exactly one logslope direction survives");
+        // The kept eigenvector is the free column ≈ e2 (up to sign); the
+        // confounded e1 component is dropped.
+        assert!(
+            t[[0, 0]].abs() < 1e-6,
+            "confounded (e1) direction must be dropped, got {}",
+            t[[0, 0]]
+        );
+        assert!(
+            (t[[1, 0]].abs() - 1.0).abs() < 1e-6,
+            "free (e2) direction must be kept as a unit vector, got {}",
+            t[[1, 0]]
+        );
+    }
+
+    #[test]
+    fn survival_reduced_logslope_fully_confounded_returns_none_979() {
+        // A single logslope column equal to the marginal column under the exact
+        // rank-1 (q0,g) confound: the whole effective logslope image lies in the
+        // marginal span. The conservative ridge floors the residual eigenvalue at
+        // energy_scale·TOL/(1+TOL) < tol, so r == 0 → Ok(None) (keep the raw
+        // design, defer to the measured-phantom gate).
+        let n = 4;
+        let row_hess = const_row_hess_q0g(n, 2.0, 2.0, 2.0);
+        let marg = Array2::from_shape_vec((n, 1), vec![1.0, 1.0, 1.0, 1.0]).unwrap();
+        let log = marg.clone();
+        let out =
+            survival_reduced_logslope_transform_effective(marg.view(), log.view(), &row_hess)
+                .expect("contraction must succeed");
+        assert!(
+            out.is_none(),
+            "a fully marginal-explained logslope column reduces to nothing → keep raw"
+        );
+    }
+
+    #[test]
+    fn survival_reduced_logslope_no_confound_returns_none_979() {
+        // No marginal↔logslope cross weight (h03 = 0): the channels are
+        // W-orthogonal, so every logslope direction is free (r == p_log) and
+        // there is nothing to remove → Ok(None).
+        let n = 4;
+        let row_hess = const_row_hess_q0g(n, 2.0, 0.0, 2.0);
+        let marg = Array2::from_shape_vec((n, 1), vec![1.0, 1.0, 1.0, 1.0]).unwrap();
+        let log =
+            Array2::from_shape_vec((n, 2), vec![1.0, 10.0, 1.0, -10.0, 1.0, 10.0, 1.0, -10.0])
+                .unwrap();
+        let out =
+            survival_reduced_logslope_transform_effective(marg.view(), log.view(), &row_hess)
+                .expect("contraction must succeed");
+        assert!(out.is_none(), "W-orthogonal channels need no reduction → keep raw");
+    }
+
+    #[test]
+    fn survival_block_diagonal_logslope_map_is_identity_on_time_and_marginal_979() {
+        // Time (p=2) and marginal (p=3) blocks pass through as identities; only
+        // the logslope block (raw p_log=4) is reparameterised by t_log (4×2).
+        let p_time = 2;
+        let p_marg = 3;
+        let t_log = Array2::from_shape_fn((4, 2), |(i, j)| 1.0 + (i * 2 + j) as f64);
+        let map = survival_block_diagonal_logslope_map(p_time, p_marg, &t_log);
+
+        assert_eq!(map.raw_block_ranges, vec![0..2, 2..5, 5..9]);
+        assert_eq!(map.compiled_block_ranges, vec![0..2, 2..5, 5..7]);
+        assert_eq!(map.raw_from_compiled.dim(), (9, 7));
+
+        let t = &map.raw_from_compiled;
+        // V_time = I2.
+        for i in 0..p_time {
+            for j in 0..p_time {
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!((t[[i, j]] - want).abs() < 1e-14, "V_time[{i},{j}]");
+            }
+        }
+        // V_marg = I3.
+        for i in 0..p_marg {
+            for j in 0..p_marg {
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!((t[[p_time + i, p_time + j]] - want).abs() < 1e-14, "V_marg[{i},{j}]");
+            }
+        }
+        // V_log = t_log.
+        for i in 0..4 {
+            for j in 0..2 {
+                assert!(
+                    (t[[p_time + p_marg + i, p_time + p_marg + j]] - t_log[[i, j]]).abs() < 1e-14,
+                    "V_log[{i},{j}]"
+                );
+            }
+        }
+        // No cross-block bleed: the only nonzeros are the two identities and the
+        // t_log block (every t_log entry here is nonzero).
+        let nnz = t.iter().filter(|&&v| v != 0.0).count();
+        assert_eq!(nnz, p_time + p_marg + t_log.iter().filter(|&&v| v != 0.0).count());
+    }
 }
