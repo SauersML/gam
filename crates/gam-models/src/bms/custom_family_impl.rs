@@ -485,6 +485,22 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                     psi_terms.len()
                 ));
             }
+            // EXPLICIT Firth VALUE ψ-derivative (gam#1607). This batched override is
+            // the ValueAndGradient outer-gradient path; the contracted/hypercoord
+            // gradient (`build_psi_hyper_coords`) folds `−∂_ψΦ` into each ψ coord's
+            // objective, so this path MUST carry the identical term or the batched
+            // outer gradient diverges from the hypercoord gradient (and from the
+            // centered FD of the now-Firth-corrected value the operator-HVP Hessian
+            // is validated against). Built once from the same `(Z_J, H_info)` pieces
+            // and gated identically: `None` for non-Jeffreys families and `0.0` when
+            // the conditioning gate skips the term, so clean fits are byte-unchanged.
+            let jeffreys_hphi_ctx = crate::custom_family::build_jeffreys_hphi_ctx(
+                self,
+                block_states,
+                specs,
+                derivative_blocks,
+                total,
+            )?;
             for (psi_index, ((block_idx, local_idx), terms)) in psi_locations
                 .into_iter()
                 .zip(psi_terms.into_iter())
@@ -515,6 +531,30 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 let s_psi_beta_local = s_psi_local.dot(&beta_block);
                 objective_theta[idx] =
                     terms.objective_psi + 0.5 * beta_block.dot(&s_psi_beta_local);
+                if let Some((z_j, h_joint)) = jeffreys_hphi_ctx.as_ref() {
+                    // `∂_ψ H_info|_β`: the explicit ψ-derivative of the Jeffreys
+                    // information (the dense ψ-Hessian, or the materialized
+                    // operator when the row pass streams it), matching exactly the
+                    // perturbation `build_psi_hyper_coords` contracts.
+                    let pert_info: Option<Array2<f64>> =
+                        if let Some(op) = terms.hessian_psi_operator.as_ref() {
+                            Some(op.mul_mat(&Array2::<f64>::eye(total)))
+                        } else if terms.hessian_psi.nrows() == total
+                            && terms.hessian_psi.ncols() == total
+                        {
+                            Some(terms.hessian_psi.clone())
+                        } else {
+                            None
+                        };
+                    if let Some(pert_info) = pert_info.as_ref() {
+                        let phi_psi = gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_phi_explicit_param_derivative(
+                            h_joint.view(),
+                            z_j.view(),
+                            pert_info,
+                        )?;
+                        objective_theta[idx] -= phi_psi;
+                    }
+                }
                 let mut rhs = terms.score_psi.clone();
                 {
                     let mut rhs_block = rhs.slice_mut(s![start..end]);
@@ -530,6 +570,16 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 }
                 trace_h_inv_hdot[idx] +=
                     spectral.trace_logdet_block_local(&s_psi_local, 1.0, start, end);
+                // NOTE (gam#1607): the hypercoord path's Firth ψ-CURVATURE drift
+                // `∂_ψ H_Φ` is added ONLY on `build_psi_hyper_coords`' dense drift
+                // branch; for this BMS row-pass the ψ-Hessian arrives in OPERATOR form
+                // and `build_psi_hyper_coords` takes its operator branch too, which
+                // carries NO `∂_ψ H_Φ` term — so this batched override must likewise
+                // omit it. The residual `trace_h_inv_hdot` gap between the batched and
+                // hypercoord paths (~2e-3 here) is a SEPARATE, non-Firth discrepancy
+                // between the two ψ-Hessian term sources (`run_psi_row_pass_for_axes`
+                // vs `workspace.first_order_terms`), tracked under #1607 — NOT a missing
+                // Firth curvature (adding one drives the gap larger, the wrong way).
                 trace_s_pinv_sdot[idx] =
                     penalty_logdet_blocks[block_idx].tau_gradient_component(&s_psi_local);
             }
