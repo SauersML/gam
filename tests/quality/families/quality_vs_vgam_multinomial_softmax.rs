@@ -440,7 +440,7 @@ fn gam_multinomial_softmax_recovers_true_simplex() {
     // term collapsed. This catches an over-shrunk fit that still happens to pass
     // the truth-RMSE/match-or-beat bars on the pinned draw.
     let edf_per_penalty = model
-        .edf_per_class
+        .edf_per_penalty
         .as_ref()
         .expect("multinomial fit must report per-penalty EDF (inference computed)");
     assert_eq!(

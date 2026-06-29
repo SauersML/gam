@@ -126,4 +126,45 @@ fn multinomial_edf_per_class_is_per_class_not_per_block_overcount() {
         "Σ edf_per_class = {total} should exceed the m={m} unpenalized intercepts for a \
          genuine per-class smooth fit"
     );
+
+    // (4) PER-PENALTY companion vector: distinct from the per-class total above.
+    //     `edf_per_penalty` carries ONE entry per smoothing parameter (length =
+    //     Σ lambdas_per_block = lambdas.len()), each the clamped per-block trace
+    //     EDF `rank(S_k) − λ_k·tr(H⁻¹ S_k)` ∈ [0, rank(S_k)]. For this
+    //     double-penalty fixture (≥2 blocks per class) it is STRICTLY LONGER than
+    //     the per-class vector — that length gap is exactly what makes it a
+    //     separate field rather than a reshaping of `edf_per_class`.
+    let edf_pen = model
+        .edf_per_penalty
+        .as_ref()
+        .expect("REML multinomial fit must report per-penalty EDF");
+    let n_pen: usize = model.lambdas_per_block.iter().sum();
+    assert_eq!(
+        edf_pen.len(),
+        n_pen,
+        "edf_per_penalty must carry one entry per smoothing parameter \
+         (Σ lambdas_per_block={n_pen}), not the per-class count K-1={m}. \
+         edf_per_penalty={edf_pen:?}"
+    );
+    assert_eq!(
+        edf_pen.len(),
+        model.lambdas.len(),
+        "edf_per_penalty must be aligned 1:1 with the flat lambdas vector"
+    );
+    assert!(
+        edf_pen.len() > edf.len(),
+        "with a double-penalty smooth the per-penalty vector ({}) must be strictly \
+         longer than the per-class vector ({}) — they are genuinely different shapes",
+        edf_pen.len(),
+        edf.len()
+    );
+    // Each per-penalty EDF is a single penalty block's trace EDF, bounded by the
+    // block rank, which cannot exceed the class's own coefficient count.
+    for (k, &e) in edf_pen.iter().enumerate() {
+        assert!(
+            e.is_finite() && e >= 0.0 && e <= p_per_class as f64 + 1e-6,
+            "penalty {k} EDF {e} out of [0, p_per_class={p_per_class}] — a single penalty \
+             block's trace EDF cannot exceed the class coefficient count"
+        );
+    }
 }
