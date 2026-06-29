@@ -71,7 +71,7 @@ use crate::vector_response::{
 };
 use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
 use gam_solve::pirls::dense_block_xtwx;
-use gam_problem::{DenseMatrixHyperOperator, HyperOperator};
+use gam_problem::HyperOperator;
 use ndarray::{Array1, Array2, Array3, ArrayView2};
 use std::sync::{Arc, Mutex};
 
@@ -927,6 +927,12 @@ impl MultinomialFamily {
     /// are identical for every `d_j` at a frozen beta. Sharing that row sweep is
     /// the #1082 penguin lever; the old path rebuilt the softmax jet and dense
     /// Gram once per outer coordinate.
+    ///
+    /// #932 cutover: this dense block assembly is no longer on the production
+    /// outer-Hessian path (the matrix-free `MultinomialDirectionalHyperOperator`
+    /// replaced it). It is retained, `cfg(test)`-only, as the reference the
+    /// ≤1e-10 parity oracle contracts the matrix-free operator against.
+    #[cfg(test)]
     fn assemble_directional_derivatives_from_probs(
         &self,
         probs_full: ArrayView2<'_, f64>,
@@ -1049,6 +1055,10 @@ impl MultinomialFamily {
     /// the same softmax probabilities and design Gram scatter for every pair.
     /// This fused path keeps the singular formula but amortizes the row walk
     /// across the whole `K(K+1)/2` pair batch (#1082).
+    ///
+    /// #932 cutover: `cfg(test)`-only, retained as the parity oracle's dense
+    /// reference (see `assemble_directional_derivatives_from_probs`).
+    #[cfg(test)]
     fn assemble_second_directional_derivatives_from_probs(
         &self,
         probs_full: ArrayView2<'_, f64>,
@@ -1188,6 +1198,180 @@ impl MultinomialFamily {
             })
             .collect();
         Ok(out)
+    }
+
+    /// Per-row `M×M` first-directional Fisher jet `Ĵ[row]` from frozen row
+    /// probabilities (issue #932 matrix-free port).
+    ///
+    /// This is the *un-scattered* kernel of
+    /// `assemble_directional_derivatives_from_probs`: it returns the
+    /// per-row `M×M` block `Ĵ[row,a,b]` such that the dense directional
+    /// derivative is exactly `B_d[(a,i),(b,j)] = Σ_row Ĵ[row,a,b]·X[row,i]·X[row,j]`.
+    /// The per-row arithmetic (`d_η`, `s`, `dp`, `jaa`, `jab`) is byte-identical
+    /// to the dense assembly, so a matrix-free contraction against `Ĵ` reproduces
+    /// the dense `Fᵀ B_d F` projection up to the associativity of the row sum.
+    fn directional_fisher_jet_rows(
+        &self,
+        probs_full: ArrayView2<'_, f64>,
+        direction: &Array1<f64>,
+    ) -> Array3<f64> {
+        let n = self.weights.len();
+        let p = self.design.ncols();
+        let m = self.active_classes();
+        let design = self.design.view();
+        let mut out = Array3::<f64>::zeros((n, m, m));
+        let mut d_eta = vec![0.0_f64; m];
+        let mut dp = vec![0.0_f64; m];
+        for row in 0..n {
+            let w = self.weights[row];
+            if w == 0.0 {
+                continue;
+            }
+            let mut s = 0.0_f64;
+            for a in 0..m {
+                let base = a * p;
+                let mut eta_dir = 0.0_f64;
+                for i in 0..p {
+                    eta_dir += design[[row, i]] * direction[base + i];
+                }
+                d_eta[a] = eta_dir;
+                s += probs_full[[row, a]] * eta_dir;
+            }
+            for a in 0..m {
+                dp[a] = probs_full[[row, a]] * (d_eta[a] - s);
+            }
+            for a in 0..m {
+                let pa = probs_full[[row, a]];
+                out[[row, a, a]] = w * (dp[a] - 2.0 * dp[a] * pa);
+                for b in (a + 1)..m {
+                    let pb = probs_full[[row, b]];
+                    let off = w * (-(dp[a] * pb + pa * dp[b]));
+                    out[[row, a, b]] = off;
+                    out[[row, b, a]] = off;
+                }
+            }
+        }
+        out
+    }
+
+    /// Per-row `M×M` second-directional Fisher jet from frozen row probabilities
+    /// (issue #932 matrix-free port). The un-scattered kernel of
+    /// `assemble_second_directional_derivatives_from_probs`, with
+    /// per-row arithmetic byte-identical to the dense assembly so the
+    /// matrix-free `Fᵀ B_{uv} F` projection matches the dense path up to row-sum
+    /// associativity.
+    fn second_directional_fisher_jet_rows(
+        &self,
+        probs_full: ArrayView2<'_, f64>,
+        u: &Array1<f64>,
+        v: &Array1<f64>,
+    ) -> Array3<f64> {
+        let n = self.weights.len();
+        let p = self.design.ncols();
+        let m = self.active_classes();
+        let design = self.design.view();
+        let mut out = Array3::<f64>::zeros((n, m, m));
+        let mut d_eta_u = vec![0.0_f64; m];
+        let mut d_eta_v = vec![0.0_f64; m];
+        let mut dp_u = vec![0.0_f64; m];
+        let mut dp_v = vec![0.0_f64; m];
+        let mut ddp = vec![0.0_f64; m];
+        for row in 0..n {
+            let w = self.weights[row];
+            if w == 0.0 {
+                continue;
+            }
+            let mut s_u = 0.0_f64;
+            let mut s_v = 0.0_f64;
+            for a in 0..m {
+                let base = a * p;
+                let mut eta_u = 0.0_f64;
+                let mut eta_v = 0.0_f64;
+                for i in 0..p {
+                    let x = design[[row, i]];
+                    eta_u += x * u[base + i];
+                    eta_v += x * v[base + i];
+                }
+                d_eta_u[a] = eta_u;
+                d_eta_v[a] = eta_v;
+                s_u += probs_full[[row, a]] * eta_u;
+                s_v += probs_full[[row, a]] * eta_v;
+            }
+            for a in 0..m {
+                let pa = probs_full[[row, a]];
+                dp_u[a] = pa * (d_eta_u[a] - s_u);
+                dp_v[a] = pa * (d_eta_v[a] - s_v);
+            }
+            let mut ds_u_dv = 0.0_f64;
+            for a in 0..m {
+                ds_u_dv += dp_v[a] * d_eta_u[a];
+            }
+            for a in 0..m {
+                let pa = probs_full[[row, a]];
+                ddp[a] = dp_v[a] * (d_eta_u[a] - s_u) - pa * ds_u_dv;
+            }
+            for a in 0..m {
+                let pa = probs_full[[row, a]];
+                out[[row, a, a]] = w * (ddp[a] - 2.0 * ddp[a] * pa - 2.0 * dp_u[a] * dp_v[a]);
+                for b in (a + 1)..m {
+                    let pb = probs_full[[row, b]];
+                    let off =
+                        w * (-(ddp[a] * pb + dp_u[a] * dp_v[b] + dp_v[a] * dp_u[b] + pa * ddp[b]));
+                    out[[row, a, b]] = off;
+                    out[[row, b, a]] = off;
+                }
+            }
+        }
+        out
+    }
+
+    /// Build the matrix-free first-directional joint-Hessian operator (#932).
+    /// Validates the direction length identically to the dense assembly and
+    /// stores only the per-row `M×M` jet, so the operator's `Fᵀ B_d F`
+    /// projection reproduces the dense `DenseMatrixHyperOperator` value to
+    /// floating-point reassociation.
+    fn directional_hyper_operator(
+        &self,
+        probs_full: ArrayView2<'_, f64>,
+        direction: &Array1<f64>,
+    ) -> Result<MultinomialDirectionalHyperOperator, String> {
+        let dim = self.beta_flat_dim();
+        if direction.len() != dim {
+            return Err(format!(
+                "MultinomialFamily matrix-free direction length {} != (K-1)·P = {dim}",
+                direction.len()
+            ));
+        }
+        Ok(MultinomialDirectionalHyperOperator {
+            design: Arc::clone(&self.design),
+            jet: self.directional_fisher_jet_rows(probs_full, direction),
+            m: self.active_classes(),
+            p: self.design.ncols(),
+        })
+    }
+
+    /// Build the matrix-free second-directional joint-Hessian operator (#932),
+    /// the second-order sibling of [`Self::directional_hyper_operator`].
+    fn second_directional_hyper_operator(
+        &self,
+        probs_full: ArrayView2<'_, f64>,
+        u: &Array1<f64>,
+        v: &Array1<f64>,
+    ) -> Result<MultinomialDirectionalHyperOperator, String> {
+        let dim = self.beta_flat_dim();
+        if u.len() != dim || v.len() != dim {
+            return Err(format!(
+                "MultinomialFamily matrix-free second-directional pair lengths {} and {} != (K-1)·P = {dim}",
+                u.len(),
+                v.len()
+            ));
+        }
+        Ok(MultinomialDirectionalHyperOperator {
+            design: Arc::clone(&self.design),
+            jet: self.second_directional_fisher_jet_rows(probs_full, u, v),
+            m: self.active_classes(),
+            p: self.design.ncols(),
+        })
     }
 
     /// Second directional derivative kernel `D²_β H[d_u, d_v]`. Built by
@@ -1945,13 +2129,20 @@ impl ExactNewtonJointHessianWorkspace for MultinomialHessianWorkspace {
         &self,
         d_beta_flats: &[Array1<f64>],
     ) -> Result<Vec<Option<Arc<dyn HyperOperator>>>, String> {
-        self.family
-            .assemble_directional_derivatives_from_probs(self.probs.view(), d_beta_flats)?
-            .into_iter()
-            .map(|matrix| {
-                Some(Arc::new(DenseMatrixHyperOperator { matrix }) as Arc<dyn HyperOperator>)
+        // #932 cutover: the matrix-free `MultinomialDirectionalHyperOperator` is
+        // the sole production path. It stores only the per-row `M×M` Fisher jet
+        // and contracts against the design on the fly, never materializing the
+        // dense `(M·P)×(M·P)` block matrix nor paying the generic dense
+        // projection — the multinomial analogue of the primary-GLM matrix-free
+        // `trace_projected_factor_all_axes_with_xf`.
+        let probs = self.probs.view();
+        d_beta_flats
+            .iter()
+            .map(|direction| {
+                self.family
+                    .directional_hyper_operator(probs, direction)
+                    .map(|op| Some(Arc::new(op) as Arc<dyn HyperOperator>))
             })
-            .map(Ok)
             .collect()
     }
 
@@ -1972,14 +2163,195 @@ impl ExactNewtonJointHessianWorkspace for MultinomialHessianWorkspace {
         &self,
         d_beta_pairs: &[(Array1<f64>, Array1<f64>)],
     ) -> Result<Vec<Option<Arc<dyn HyperOperator>>>, String> {
-        self.family
-            .assemble_second_directional_derivatives_from_probs(self.probs.view(), d_beta_pairs)?
-            .into_iter()
-            .map(|matrix| {
-                Some(Arc::new(DenseMatrixHyperOperator { matrix }) as Arc<dyn HyperOperator>)
+        // #932 cutover: matrix-free second-directional operator is the sole
+        // production path (see `directional_derivative_operators`).
+        let probs = self.probs.view();
+        d_beta_pairs
+            .iter()
+            .map(|(u, v)| {
+                self.family
+                    .second_directional_hyper_operator(probs, u, v)
+                    .map(|op| Some(Arc::new(op) as Arc<dyn HyperOperator>))
             })
-            .map(Ok)
             .collect()
+    }
+}
+
+/// Matrix-free directional / second-directional joint-Hessian operator for the
+/// multinomial-logit family (issue #932) — the sole production path for the
+/// outer-Hessian directional terms (the dense `DenseMatrixHyperOperator`
+/// assembly was cut over to this operator).
+///
+/// The former dense path (`assemble_directional_derivatives_from_probs` →
+/// `DenseMatrixHyperOperator`, now retained only as the parity oracle's
+/// reference) materializes the full `(M·P)×(M·P)` block matrix
+///
+/// ```text
+///   B_d[(a,i),(b,j)] = Σ_row Ĵ[row,a,b] · X[row,i] · X[row,j]
+/// ```
+///
+/// (an `O(N·M²·P²)` assembly) and then runs the generic dense projection
+/// `Fᵀ B_d F` (an `O((M·P)²·rank)` GEMM pair). This operator instead stores only
+/// the cheap per-row `M×M` Fisher jet `Ĵ` (`O(N·M²)`) and contracts against the
+/// design on the fly — the multinomial analogue of the primary-GLM matrix-free
+/// `ImplicitHyperOperator::trace_projected_factor_all_axes_with_xf`: precompute
+/// `X·F` once per projection, contract per row over the `M×M` jet, and never
+/// build the `(M·P)²` matrix or pay the dense projection. The projected matrix is
+///
+/// ```text
+///   (Fᵀ B_d F)[k,l] = Σ_row Σ_{a,b} Ĵ[row,a,b] · g[row,a,k] · g[row,b,l],
+///   where  g[row,a,k] = Σ_i X[row,i] · F[a·P+i, k].
+/// ```
+///
+/// `is_implicit()` is `false` so the outer kernel treats this exactly like the
+/// dense operator it replaces — the exact projected/trace path, never the
+/// stochastic Hutch++ estimator (which would violate the ≤1e-10 contract).
+struct MultinomialDirectionalHyperOperator {
+    /// Shared `N×P` design (zero-copy clone of the family's `Arc`).
+    design: Arc<Array2<f64>>,
+    /// Per-row `M×M` Fisher-derivative jet `Ĵ[row]` (symmetric in `a,b`).
+    jet: Array3<f64>,
+    /// Active class count `M = K−1`.
+    m: usize,
+    /// Per-class feature count `P`.
+    p: usize,
+}
+
+impl HyperOperator for MultinomialDirectionalHyperOperator {
+    fn dim(&self) -> usize {
+        self.m * self.p
+    }
+
+    fn as_any(&self) -> &(dyn std::any::Any + 'static) {
+        self
+    }
+
+    fn is_implicit(&self) -> bool {
+        false
+    }
+
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+        let dim = self.m * self.p;
+        assert_eq!(v.len(), dim);
+        let design = self.design.view();
+        let n = design.nrows();
+        let (m, p) = (self.m, self.p);
+        let mut out = Array1::<f64>::zeros(dim);
+        let mut t = vec![0.0_f64; m];
+        let mut u = vec![0.0_f64; m];
+        for row in 0..n {
+            // t[b] = X[row] · v_block_b
+            for b in 0..m {
+                let base = b * p;
+                let mut acc = 0.0_f64;
+                for i in 0..p {
+                    acc += design[[row, i]] * v[base + i];
+                }
+                t[b] = acc;
+            }
+            // u[a] = Σ_b Ĵ[row,a,b] · t[b]
+            for a in 0..m {
+                let mut acc = 0.0_f64;
+                for b in 0..m {
+                    acc += self.jet[[row, a, b]] * t[b];
+                }
+                u[a] = acc;
+            }
+            // out[a·P+i] += u[a] · X[row,i]
+            for a in 0..m {
+                let ua = u[a];
+                if ua == 0.0 {
+                    continue;
+                }
+                let base = a * p;
+                for i in 0..p {
+                    out[base + i] += ua * design[[row, i]];
+                }
+            }
+        }
+        out
+    }
+
+    fn projected_matrix(&self, factor: &Array2<f64>) -> Array2<f64> {
+        let dim = self.m * self.p;
+        assert_eq!(factor.nrows(), dim);
+        let rank = factor.ncols();
+        let design = self.design.view();
+        let n = design.nrows();
+        let (m, p) = (self.m, self.p);
+        let mut out = Array2::<f64>::zeros((rank, rank));
+        // g[a,k]  = X[row] · F_block_a[:,k]
+        // jg[a,l] = Σ_b Ĵ[row,a,b] · g[b,l]
+        let mut g = Array2::<f64>::zeros((m, rank));
+        let mut jg = Array2::<f64>::zeros((m, rank));
+        for row in 0..n {
+            for a in 0..m {
+                let base = a * p;
+                for k in 0..rank {
+                    let mut acc = 0.0_f64;
+                    for i in 0..p {
+                        acc += design[[row, i]] * factor[[base + i, k]];
+                    }
+                    g[[a, k]] = acc;
+                }
+            }
+            for a in 0..m {
+                for l in 0..rank {
+                    let mut acc = 0.0_f64;
+                    for b in 0..m {
+                        acc += self.jet[[row, a, b]] * g[[b, l]];
+                    }
+                    jg[[a, l]] = acc;
+                }
+            }
+            for k in 0..rank {
+                for l in 0..rank {
+                    let mut acc = 0.0_f64;
+                    for a in 0..m {
+                        acc += g[[a, k]] * jg[[a, l]];
+                    }
+                    out[[k, l]] += acc;
+                }
+            }
+        }
+        out
+    }
+
+    fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
+        // tr(Fᵀ B_d F) — exact, matching the dense `dense_trace_projected_factor`.
+        self.projected_matrix(factor).diag().sum()
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        // B_d[(a,i),(b,j)] = Σ_row Ĵ[row,a,b] · X[row,i] · X[row,j].
+        let dim = self.m * self.p;
+        let design = self.design.view();
+        let n = design.nrows();
+        let (m, p) = (self.m, self.p);
+        let mut out = Array2::<f64>::zeros((dim, dim));
+        for row in 0..n {
+            for a in 0..m {
+                for b in 0..m {
+                    let jab = self.jet[[row, a, b]];
+                    if jab == 0.0 {
+                        continue;
+                    }
+                    let ra = a * p;
+                    let rb = b * p;
+                    for i in 0..p {
+                        let xi = design[[row, i]];
+                        if xi == 0.0 {
+                            continue;
+                        }
+                        let scaled = jab * xi;
+                        for j in 0..p {
+                            out[[ra + i, rb + j]] += scaled * design[[row, j]];
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
 }
 
@@ -2000,6 +2372,7 @@ mod tests {
     //!    onto the class farthest from the reference and the saved-model
     //!    `class_levels` order survives unchanged.
     use super::*;
+    use gam_problem::DenseMatrixHyperOperator;
     use ndarray::array;
 
     impl MultinomialFamily {
@@ -2589,6 +2962,148 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Issue #932 ORACLE: the matrix-free directional / second-directional
+    /// joint-Hessian operator must reproduce the dense
+    /// `DenseMatrixHyperOperator` path to ≤1e-10 on every consumed surface —
+    /// the full projected matrix `Fᵀ B F`, its trace, the matvec `B·v`, and the
+    /// dense materialization `B`. This pins the #932 cutover's strict
+    /// outer-Hessian parity contract: the matrix-free operator is now the sole
+    /// production path, so this oracle (and the existing batched-operator tests
+    /// that exercise `to_dense`) are the regression guard against any drift.
+    #[test]
+    fn matrix_free_directional_operator_matches_dense_oracle() {
+        // A few representative small fits (the operator path fires for small
+        // `total_rho_dim`): vary N, P, K and the projection rank.
+        for &(n, p, k, rank) in &[(11, 4, 3, 2), (9, 5, 4, 3), (13, 3, 5, 4), (7, 6, 3, 1)] {
+            let family = toy_family(n, p, k);
+            let m = family.active_classes();
+            let dim = m * p;
+            let design = family.design.view();
+            let block_states: Vec<ParameterBlockState> = (0..m)
+                .map(|a| {
+                    let beta = Array1::<f64>::from_shape_fn(p, |i| {
+                        0.13 * ((a + 2) as f64) - 0.08 * ((i + 1) as f64).cos()
+                    });
+                    let eta = Array1::<f64>::from_shape_fn(n, |row| {
+                        (0..p).map(|i| design[[row, i]] * beta[i]).sum()
+                    });
+                    ParameterBlockState { beta, eta }
+                })
+                .collect();
+            let eta = family
+                .collect_eta_matrix(&block_states)
+                .expect("eta collection must succeed");
+            let probs = family.row_probabilities(eta.view());
+
+            // Representative dense factor F (dim × rank) and a probe vector.
+            let factor = Array2::<f64>::from_shape_fn((dim, rank), |(r, c)| {
+                0.41 * ((r + 2 * c + 1) as f64).sin() - 0.12 * ((3 * r + c + 2) as f64).cos()
+            });
+            let probe = Array1::<f64>::from_shape_fn(dim, |idx| {
+                0.27 * ((idx + 1) as f64).sin() + 0.05 * ((idx + 3) as f64).cos()
+            });
+
+            let directions: Vec<Array1<f64>> = (0..4)
+                .map(|seed| {
+                    Array1::<f64>::from_shape_fn(dim, |idx| {
+                        0.29 * ((seed + idx + 1) as f64).sin()
+                            - 0.06 * ((2 * seed + idx + 2) as f64).cos()
+                    })
+                })
+                .collect();
+
+            // First-directional: dense vs matrix-free.
+            let dense_mats = family
+                .assemble_directional_derivatives_from_probs(probs.view(), &directions)
+                .expect("dense directional assembly must succeed");
+            for (idx, direction) in directions.iter().enumerate() {
+                let dense = DenseMatrixHyperOperator {
+                    matrix: dense_mats[idx].clone(),
+                };
+                let mf = family
+                    .directional_hyper_operator(probs.view(), direction)
+                    .expect("matrix-free directional operator must build");
+                assert_oracle_parity(&dense, &mf, &factor, &probe, &format!("dir {idx} n={n} p={p} k={k}"));
+            }
+
+            // Second-directional: dense vs matrix-free.
+            let pairs: Vec<(Array1<f64>, Array1<f64>)> = (0..3)
+                .map(|seed| {
+                    let u = Array1::<f64>::from_shape_fn(dim, |idx| {
+                        0.21 * ((seed + idx + 1) as f64).sin()
+                    });
+                    let v = Array1::<f64>::from_shape_fn(dim, |idx| {
+                        -0.18 * ((seed + 2 * idx + 4) as f64).cos()
+                    });
+                    (u, v)
+                })
+                .collect();
+            let dense_pairs = family
+                .assemble_second_directional_derivatives_from_probs(probs.view(), &pairs)
+                .expect("dense second-directional assembly must succeed");
+            for (idx, (u, v)) in pairs.iter().enumerate() {
+                let dense = DenseMatrixHyperOperator {
+                    matrix: dense_pairs[idx].clone(),
+                };
+                let mf = family
+                    .second_directional_hyper_operator(probs.view(), u, v)
+                    .expect("matrix-free second-directional operator must build");
+                assert_oracle_parity(&dense, &mf, &factor, &probe, &format!("pair {idx} n={n} p={p} k={k}"));
+            }
+        }
+    }
+
+    /// Assert dense-vs-matrix-free parity on every consumed surface to ≤1e-10.
+    fn assert_oracle_parity(
+        dense: &DenseMatrixHyperOperator,
+        mf: &MultinomialDirectionalHyperOperator,
+        factor: &Array2<f64>,
+        probe: &Array1<f64>,
+        ctx: &str,
+    ) {
+        assert_eq!(dense.dim(), mf.dim(), "{ctx}: dim mismatch");
+
+        // Full projected matrix Fᵀ B F — the surface the consumer needs in full.
+        let pd = dense.projected_matrix(factor);
+        let pm = mf.projected_matrix(factor);
+        for ((r, c), &a) in pd.indexed_iter() {
+            let b = pm[[r, c]];
+            assert!(
+                (a - b).abs() <= 1e-10 * (1.0 + a.abs()),
+                "{ctx}: projected_matrix[{r},{c}] dense {a} != matrix-free {b}"
+            );
+        }
+
+        // Trace of the projection.
+        let td = dense.trace_projected_factor(factor);
+        let tm = mf.trace_projected_factor(factor);
+        assert!(
+            (td - tm).abs() <= 1e-10 * (1.0 + td.abs()),
+            "{ctx}: trace dense {td} != matrix-free {tm}"
+        );
+
+        // Matvec B·v.
+        let bvd = dense.mul_vec(probe);
+        let bvm = mf.mul_vec(probe);
+        for (idx, (&a, &b)) in bvd.iter().zip(bvm.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 1e-10 * (1.0 + a.abs()),
+                "{ctx}: mul_vec[{idx}] dense {a} != matrix-free {b}"
+            );
+        }
+
+        // Dense materialization B.
+        let dd = dense.to_dense();
+        let dm = mf.to_dense();
+        for ((r, c), &a) in dd.indexed_iter() {
+            let b = dm[[r, c]];
+            assert!(
+                (a - b).abs() <= 1e-10 * (1.0 + a.abs()),
+                "{ctx}: to_dense[{r},{c}] dense {a} != matrix-free {b}"
+            );
         }
     }
 
