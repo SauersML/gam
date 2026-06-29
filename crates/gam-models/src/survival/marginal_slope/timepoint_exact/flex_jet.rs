@@ -4763,3 +4763,324 @@ mod fused_jet2_oracle_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod hand_vs_jet_bench_tests {
+    //! #932 SPEED AUDIT: shipped jet value/grad/Hessian (`fused_row_nll_jet2` +
+    //! the `fused_inputs_from_view` input copies the production
+    //! `flex_row_nll_value_grad_hess` pays) vs the ORIGINAL HAND probit-chain +
+    //! quotient-rule assembly it replaced (recovered verbatim from the pre-cutover
+    //! commit `b17785d2a~1`, `flex_sensitivity.rs`). Measures ns/row at
+    //! p∈{6,12,24}, asserts ≤1e-12 channel agreement, and quantifies the
+    //! transcendental fraction (the 2×logΦ + 2×neglog-deriv calls both paths share).
+    use super::*;
+    use ndarray::{Array1, Array2};
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    fn xorshift(state: &mut u64) -> f64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        let u = (x >> 11) as f64 / ((1u64 << 53) as f64);
+        2.0 * u - 1.0
+    }
+
+    /// The ORIGINAL HAND value/grad/Hessian assembly (verbatim from
+    /// `b17785d2a~1` `flex_sensitivity.rs`): sparse single-pass grad loop +
+    /// upper-triangle Hessian loop reading the timepoint `*_u`/`*_uv` ndarrays
+    /// directly (NO contiguous copy). Pays its own 2×logΦ + 2×neglog-deriv calls.
+    #[allow(clippy::too_many_arguments)]
+    fn hand_vgh(
+        eta0: f64,
+        eta0_u: &Array1<f64>,
+        eta0_uv: &Array2<f64>,
+        eta1: f64,
+        eta1_u: &Array1<f64>,
+        eta1_uv: &Array2<f64>,
+        chi1: f64,
+        chi1_u: &Array1<f64>,
+        chi1_uv: &Array2<f64>,
+        d1: f64,
+        d1_u: &Array1<f64>,
+        d1_uv: &Array2<f64>,
+        q1: f64,
+        qd1: f64,
+        wi: f64,
+        di: f64,
+        q1_idx: usize,
+        qd1_idx: usize,
+        p: usize,
+    ) -> (f64, Array1<f64>, Array2<f64>) {
+        let (log_surv0, _) = signed_probit_logcdf_and_mills_ratio(-eta0);
+        let (log_surv1, _) = signed_probit_logcdf_and_mills_ratio(-eta1);
+        let (entry_k1, entry_k2, _, _) =
+            signed_probit_neglog_derivatives_up_to_fourth(-eta0, -wi).unwrap();
+        let (exit_k1, exit_k2, _, _) =
+            signed_probit_neglog_derivatives_up_to_fourth(-eta1, wi * (1.0 - di)).unwrap();
+
+        let log_phi_eta1 = -0.5 * (eta1 * eta1 + std::f64::consts::TAU.ln());
+        let log_phi_q1 = -0.5 * (q1 * q1 + std::f64::consts::TAU.ln());
+        let row_nll = wi
+            * (log_surv0 - (1.0 - di) * log_surv1 - di * log_phi_eta1 - di * chi1.ln()
+                - di * log_phi_q1
+                + di * d1.ln()
+                - di * qd1.ln());
+
+        let mut grad = Array1::<f64>::zeros(p);
+        let mut hess = Array2::<f64>::zeros((p, p));
+        let entry_u1 = -entry_k1;
+        let entry_u2 = entry_k2;
+        let exit_surv_u1 = -exit_k1;
+        let exit_surv_u2 = exit_k2;
+
+        for u in 0..p {
+            grad[u] += entry_u1 * eta0_u[u];
+            grad[u] += exit_surv_u1 * eta1_u[u];
+            grad[u] += wi * di * eta1 * eta1_u[u];
+            grad[u] -= wi * di * chi1_u[u] / chi1;
+            if u == q1_idx {
+                grad[u] += wi * di * q1;
+            }
+            grad[u] += wi * di * d1_u[u] / d1;
+            if u == qd1_idx {
+                grad[u] -= wi * di / qd1;
+            }
+        }
+
+        for u in 0..p {
+            for v in u..p {
+                let mut value = 0.0;
+                value += entry_u2 * eta0_u[u] * eta0_u[v] + entry_u1 * eta0_uv[[u, v]];
+                value += exit_surv_u2 * eta1_u[u] * eta1_u[v] + exit_surv_u1 * eta1_uv[[u, v]];
+                value += wi * di * (eta1_u[u] * eta1_u[v] + eta1 * eta1_uv[[u, v]]);
+                value -= wi
+                    * di
+                    * (chi1_uv[[u, v]] / chi1 - (chi1_u[u] * chi1_u[v]) / (chi1 * chi1));
+                if u == q1_idx && v == q1_idx {
+                    value += wi * di;
+                }
+                value += wi * di * (d1_uv[[u, v]] / d1 - (d1_u[u] * d1_u[v]) / (d1 * d1));
+                if u == qd1_idx && v == qd1_idx {
+                    value += wi * di / (qd1 * qd1);
+                }
+                hess[[u, v]] = value;
+                hess[[v, u]] = value;
+            }
+        }
+        (row_nll, grad, hess)
+    }
+
+    /// The SHIPPED JET path: surv stacks + the `fused_inputs_from_view` contiguous
+    /// copies + `fused_row_nll_jet2` (the exact body of the `want_hess` branch of
+    /// `flex_row_nll_value_grad_hess`).
+    #[allow(clippy::too_many_arguments)]
+    fn jet_vgh(
+        eta0: f64,
+        eta0_u: &Array1<f64>,
+        eta0_uv: &Array2<f64>,
+        eta1: f64,
+        eta1_u: &Array1<f64>,
+        eta1_uv: &Array2<f64>,
+        chi1: f64,
+        chi1_u: &Array1<f64>,
+        chi1_uv: &Array2<f64>,
+        d1: f64,
+        d1_u: &Array1<f64>,
+        d1_uv: &Array2<f64>,
+        q1: f64,
+        qd1: f64,
+        wi: f64,
+        di: f64,
+        q1_idx: usize,
+        qd1_idx: usize,
+        p: usize,
+    ) -> (f64, Array1<f64>, Array2<f64>) {
+        let surv0 = surv_stack(eta0).unwrap();
+        let surv1 = surv_stack(eta1).unwrap();
+        let (e0g, e0h) = fused_inputs_from_view(eta0_u.view(), eta0_uv.view(), p);
+        let (e1g, e1h) = fused_inputs_from_view(eta1_u.view(), eta1_uv.view(), p);
+        let (cg, ch) = fused_inputs_from_view(chi1_u.view(), chi1_uv.view(), p);
+        let (dg, dh) = fused_inputs_from_view(d1_u.view(), d1_uv.view(), p);
+        let zero_h = vec![0.0; p * p];
+        let mut q1_g = vec![0.0; p];
+        if q1_idx < p {
+            q1_g[q1_idx] = 1.0;
+        }
+        let mut qd1_g = vec![0.0; p];
+        if qd1_idx < p {
+            qd1_g[qd1_idx] = 1.0;
+        }
+        let out = fused_row_nll_jet2(
+            &FusedSrc { v: eta0, g: &e0g, h: &e0h },
+            &FusedSrc { v: eta1, g: &e1g, h: &e1h },
+            &FusedSrc { v: chi1, g: &cg, h: &ch },
+            &FusedSrc { v: d1, g: &dg, h: &dh },
+            &FusedSrc { v: q1, g: &q1_g, h: &zero_h },
+            &FusedSrc { v: qd1, g: &qd1_g, h: &zero_h },
+            surv0,
+            surv1,
+            wi,
+            di,
+            p,
+        );
+        let value = out.v + wi * di * std::f64::consts::TAU.ln();
+        let grad = Array1::from(out.g);
+        let hess = Array2::from_shape_vec((p, p), out.h).unwrap();
+        (value, grad, hess)
+    }
+
+    type Row = (
+        f64,
+        Array1<f64>,
+        Array2<f64>,
+        f64,
+        Array1<f64>,
+        Array2<f64>,
+        f64,
+        Array1<f64>,
+        Array2<f64>,
+        f64,
+        Array1<f64>,
+        Array2<f64>,
+        f64,
+        f64,
+        f64,
+        f64,
+        usize,
+        usize,
+    );
+
+    fn make_row(p: usize, st: &mut u64) -> Row {
+        // Moderate η so logΦ / Mills are well-conditioned; χ,D strictly positive.
+        let eta0 = 0.4 * xorshift(st);
+        let eta1 = 0.4 * xorshift(st);
+        let chi1 = 1.5 + 0.4 * xorshift(st);
+        let d1 = 1.5 + 0.4 * xorshift(st);
+        let q1 = 0.8 + 0.3 * xorshift(st);
+        let qd1 = 1.2 + 0.3 * xorshift(st);
+        let wi = 0.7 + (xorshift(st) + 1.0).abs();
+        let di = if xorshift(st) > -0.3 { 1.0 } else { 0.0 };
+        let mk_g = |st: &mut u64| Array1::from_iter((0..p).map(|_| 0.5 * xorshift(st)));
+        let mk_h = |st: &mut u64| {
+            let mut h = Array2::<f64>::zeros((p, p));
+            for i in 0..p {
+                for j in i..p {
+                    let x = 0.3 * xorshift(st);
+                    h[[i, j]] = x;
+                    h[[j, i]] = x;
+                }
+            }
+            h
+        };
+        let e0g = mk_g(st);
+        let e0h = mk_h(st);
+        let e1g = mk_g(st);
+        let e1h = mk_h(st);
+        let cg = mk_g(st);
+        let chh = mk_h(st);
+        let dg = mk_g(st);
+        let dh = mk_h(st);
+        (
+            eta0, e0g, e0h, eta1, e1g, e1h, chi1, cg, chh, d1, dg, dh, q1, qd1, wi, di, p - 2,
+            p - 1,
+        )
+    }
+
+    #[test]
+    fn hand_vs_jet_vgh_bitident_and_timing() {
+        for &p in &[6usize, 12, 24] {
+            let mut st = 0xA1B2_C3D4_E5F6_0718u64 ^ (p as u64).wrapping_mul(0x9E3779B97F4A7C15);
+            let mut max_diff = 0.0f64;
+            let mut rows: Vec<Row> = Vec::new();
+            for _ in 0..256 {
+                let r = make_row(p, &mut st);
+                let (h_v, h_g, h_h) = hand_vgh(
+                    r.0, &r.1, &r.2, r.3, &r.4, &r.5, r.6, &r.7, &r.8, r.9, &r.10, &r.11, r.12,
+                    r.13, r.14, r.15, r.16, r.17, p,
+                );
+                let (j_v, j_g, j_h) = jet_vgh(
+                    r.0, &r.1, &r.2, r.3, &r.4, &r.5, r.6, &r.7, &r.8, r.9, &r.10, &r.11, r.12,
+                    r.13, r.14, r.15, r.16, r.17, p,
+                );
+                max_diff = max_diff.max((h_v - j_v).abs());
+                for u in 0..p {
+                    max_diff = max_diff.max((h_g[u] - j_g[u]).abs());
+                    for v in 0..p {
+                        max_diff = max_diff.max((h_h[[u, v]] - j_h[[u, v]]).abs());
+                    }
+                }
+                rows.push(r);
+            }
+            assert!(
+                max_diff <= 1e-12,
+                "hand vs jet channel mismatch p={p}: max_diff={max_diff:.3e}"
+            );
+
+            let iters = 200_000usize / p;
+            let n = rows.len();
+            for r in &rows {
+                let (_, g, h) = hand_vgh(
+                    r.0, &r.1, &r.2, r.3, &r.4, &r.5, r.6, &r.7, &r.8, r.9, &r.10, &r.11, r.12,
+                    r.13, r.14, r.15, r.16, r.17, p,
+                );
+                black_box((g, h));
+                let (_, g, h) = jet_vgh(
+                    r.0, &r.1, &r.2, r.3, &r.4, &r.5, r.6, &r.7, &r.8, r.9, &r.10, &r.11, r.12,
+                    r.13, r.14, r.15, r.16, r.17, p,
+                );
+                black_box((g, h));
+            }
+
+            let t0 = Instant::now();
+            for k in 0..iters {
+                let r = &rows[k % n];
+                let out = hand_vgh(
+                    black_box(r.0), &r.1, &r.2, black_box(r.3), &r.4, &r.5, black_box(r.6), &r.7,
+                    &r.8, black_box(r.9), &r.10, &r.11, black_box(r.12), black_box(r.13),
+                    black_box(r.14), black_box(r.15), r.16, r.17, p,
+                );
+                black_box(out);
+            }
+            let hand_ns = t0.elapsed().as_nanos() as f64 / iters as f64;
+
+            let t1 = Instant::now();
+            for k in 0..iters {
+                let r = &rows[k % n];
+                let out = jet_vgh(
+                    black_box(r.0), &r.1, &r.2, black_box(r.3), &r.4, &r.5, black_box(r.6), &r.7,
+                    &r.8, black_box(r.9), &r.10, &r.11, black_box(r.12), black_box(r.13),
+                    black_box(r.14), black_box(r.15), r.16, r.17, p,
+                );
+                black_box(out);
+            }
+            let jet_ns = t1.elapsed().as_nanos() as f64 / iters as f64;
+
+            let r = &rows[0];
+            let t2 = Instant::now();
+            for _ in 0..iters {
+                let (a, _) = signed_probit_logcdf_and_mills_ratio(black_box(-r.0));
+                let (b, _) = signed_probit_logcdf_and_mills_ratio(black_box(-r.3));
+                let c = signed_probit_neglog_derivatives_up_to_fourth(black_box(-r.0), -r.14)
+                    .unwrap();
+                let d = signed_probit_neglog_derivatives_up_to_fourth(
+                    black_box(-r.3),
+                    r.14 * (1.0 - r.15),
+                )
+                .unwrap();
+                black_box((a, b, c, d));
+            }
+            let trans_ns = t2.elapsed().as_nanos() as f64 / iters as f64;
+
+            eprintln!(
+                "VGH-BENCH p={p:2}: hand={hand_ns:7.1} ns/row  jet={jet_ns:7.1} ns/row  \
+                 ratio_jet/hand={:.2}x  transcendental={trans_ns:6.1} ns ({:.0}% of hand)  \
+                 max_diff={max_diff:.1e}",
+                jet_ns / hand_ns,
+                100.0 * trans_ns / hand_ns,
+            );
+        }
+    }
+}
