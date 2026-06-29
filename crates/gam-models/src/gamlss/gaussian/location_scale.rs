@@ -1078,11 +1078,18 @@ impl FamilyChannelHessian for GaussianLocationScaleChannelHessian {
 }
 
 impl CustomFamily for GaussianLocationScaleFamily {
-    /// The Gaussian location-scale joint Hessian depends on β because the
-    /// cross-block (μ,log σ) and (log σ,log σ) blocks contain the residual
-    /// r = y − μ (via the row scalars m = r·w and n = r²·w), which changes
-    /// when β_μ moves.  The (μ,μ) block weight w = 1/σ² also depends on
-    /// β_{log σ}.  This override is essential for correct M_j[u] drift
+    /// The Gaussian location-scale joint curvature is the EXACT FISHER
+    /// (expected) information, which is block-diagonal: μ ⊥ log σ so the
+    /// cross block E[H_{μ,log σ}] ≡ 0, the (μ,μ) block weight is a/σ², and the
+    /// (log σ,log σ) block weight is 2κ²a (κ = dlog σ/dη); see
+    /// `gaussian_locscale_fisher_joint_row_coeffs` and #684/#566. (The earlier
+    /// observed Hessian — with residual-dependent row scalars m = r·w, n = r²·w
+    /// in the cross and (log σ,log σ) blocks — was replaced by this Fisher
+    /// information; the row scalars still carry m/n but the curvature
+    /// constructor discards them.) Both Fisher weights depend on β through the
+    /// scale predictor (σ = σ(η_{log σ}), κ = κ(η_{log σ})), so the curvature
+    /// moves when β_{log σ} moves — hence this override is `true`. It does NOT
+    /// depend on β_μ. The β-dependence is essential for correct M_j[u] drift
     /// corrections when ψ hyperparameters move the design matrices.
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
         true
