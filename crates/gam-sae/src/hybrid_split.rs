@@ -261,6 +261,17 @@ pub struct SaeHybridSplitReport {
 /// never adjudicated on a fabricated deviance.
 const MIN_ROWS_FOR_LINEAR_FIT: usize = 3;
 
+/// #1610 dominance-floor slack. The linear arm may only WIN a curveable slot when
+/// its straight sub-model's residual RSS is within this relative slack of the
+/// curve's. A genuine linear-tail atom fits the line essentially as well as the
+/// curve (`linear_rss ≈ curved_rss`); a genuinely-curved, high-EV atom has
+/// `linear_rss` materially larger, and collapsing it to a line drops real
+/// reconstruction EV below the curved — violating the match-or-beat dominance
+/// floor the #1026 report contract guarantees. The slack tolerates fit/numerical
+/// noise and near-straight (`Θ ≈ 0`) curves while blocking the over-collapse of a
+/// genuinely curved atom.
+const LINEAR_DOMINANCE_RSS_SLACK: f64 = 0.05;
+
 /// Build the curved + linear candidates for ONE fitted `d = 1` atom and return
 /// them as `(linear, curved, (t̄, b₀, b₁))`, or `None` if the atom cannot present
 /// an honest pair (too few rows, degenerate coordinate span, or non-finite
@@ -452,10 +463,23 @@ fn build_atom_candidates(
     // smoothing-penalty logdet (the intrinsic smoothness penalty is
     // reparameterization-invariant and identical in expectation across the two
     // parameterizations of the same image).
-    let linear_nle = reduced_laplace_nle(linear_residual_objective, linear_log_det_h);
+    let mut linear_nle = reduced_laplace_nle(linear_residual_objective, linear_log_det_h);
     let curved_nle = reduced_laplace_nle(curved_residual_objective, curved_log_det_h);
     if !(linear_nle.is_finite() && curved_nle.is_finite()) {
         return None;
+    }
+
+    // #1610 dominance-floor guard (see `LINEAR_DOMINANCE_RSS_SLACK`). The Laplace
+    // NLE trades data-fit against complexity with σ²≡1; on a small / low-amplitude
+    // fixture the complexity term can dwarf a real data-fit gain and select the
+    // straight arm for a genuinely-curved atom — collapsing it to a line then
+    // drops reconstruction EV below the curved (the diagnostic case: a curved atom
+    // earning 0.84 EV collapsed to a line, EV 1.0 → 0.748). When the straight
+    // arm is a materially worse residual fit than the curve, price it just past
+    // the curved arm so the per-slot selection keeps the curve. A true linear-tail
+    // atom (`linear_rss ≈ curved_rss`) is unaffected, so genuine collapses stand.
+    if linear_rss > curved_rss * (1.0 + LINEAR_DOMINANCE_RSS_SLACK) {
+        linear_nle = linear_nle.max(curved_nle + curved_nle.abs() * 1e-6 + 1e-9);
     }
 
     let linear = HybridAtomCandidate::linear(linear_nle, linear_num_params);
