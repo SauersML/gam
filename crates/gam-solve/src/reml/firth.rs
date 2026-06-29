@@ -1139,7 +1139,6 @@ impl FirthDenseOperator {
             // p_u_b_rhs / pv_b_rhs: depends only on this direction's a_u_reduced.
             pu_qv.push(self.apply_p_u_to_matrix(&d.a_u_reduced, &qv));
         }
-        let _ = qv;
         FirthSecondDirEyeCache {
             eye,
             eta_rhs,
