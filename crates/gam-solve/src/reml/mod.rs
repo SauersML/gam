@@ -1044,7 +1044,7 @@ mod tests {
         }
         // Cache is exactly full; key[0] is the least-recently-used.
         assert_eq!(
-            cache.outer_eval_lru.read().unwrap().len(),
+            cache.outer_eval_lru.read().unwrap().entries.len(),
             OUTER_EVAL_LRU_CAPACITY
         );
         // One more distinct key evicts the LRU (key[0]).
@@ -1053,7 +1053,7 @@ mod tests {
         let eval_overflow = make_eval(42.0);
         cache.store_outer_eval(&key_overflow, &eval_overflow);
         assert_eq!(
-            cache.outer_eval_lru.read().unwrap().len(),
+            cache.outer_eval_lru.read().unwrap().entries.len(),
             OUTER_EVAL_LRU_CAPACITY,
             "capacity must stay bounded"
         );
@@ -4891,11 +4891,6 @@ impl OuterEvalLru {
 
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.entries.len()
     }
 }
 
