@@ -1,3 +1,52 @@
+## v0.3.133 — gam 0.3.133 / gamfit 0.1.235 (2026-06-29)
+
+crates.io + PyPI release of the SAE reconstruction-fidelity, penalty-spectrum
+robustness, and Firth-performance wave landed since gam 0.3.132 / gamfit 0.1.234.
+The headline changes stop the SAE hybrid collapse from over-simplifying a
+genuinely curved atom, remove a spurious P-IRLS rejection on high-rank smooths at
+extreme λ, and cut the dominant cost of the Firth/Jeffreys outer Hessian. The
+`gamfit` Python API surface is unchanged — these correct and accelerate the
+behavior reachable through the existing API.
+
+**SAE hybrid-collapse EV preservation (#1610, #1026)**
+- A curveable `d = 1` atom that is doing real reconstruction work is no longer
+  collapsed to its straight linear tail. The hybrid-split selector now gates each
+  collapse on the reconstruction explained variance it would cost, vetoing a
+  collapse that would raise the full reconstruction SSR by more than 1e-3 of the
+  target's total centered variance (the observed 1.0 → 0.748 EV over-collapse on
+  small, low-amplitude fixtures). Lossless / EV-neutral collapses still collapse
+  freely. As part of the same fix a degenerate all-stationary atom image now
+  reports zero total turning (a point has no arc to turn through) instead of
+  refusing, while a partial cusp still refuses — both pinned by new geometry
+  regression tests, and the integration test now asserts the EV-axis
+  discrimination the gate actually performs.
+
+**Penalty-spectrum PSD floor (#1619)**
+- A high-rank thin-plate / Duchon penalty (p ≈ 200) assembled and reparameterized
+  at extreme λ during REML no longer fails the inner P-IRLS solve on roundoff: the
+  strict PSD classifier now accepts a negative eigenvalue up to the larger of the
+  machine-ε floor and a relative numerically-PSD floor (1e-8·scale ≈ √ε), snapping
+  it to zero. Genuine indefiniteness is O(1) relative and is still rejected far
+  above either floor.
+
+**Firth/Jeffreys REML performance (#1575)**
+- The default-on Firth/Jeffreys outer REML Hessian for binomial/logit is
+  substantially faster: the single-index sub-blocks of the exact Tierney-Kadane
+  mixed second directional derivative — previously rebuilt for every one of the
+  k(k+1)/2 penalty pairs against the same identity right-hand side — are now
+  precomputed once per direction and reused across all pairs (~37% fewer of the
+  dominant O(n·r²·p) applies at k = 6). The converged β/λ/EDF/score are unchanged,
+  pinned bit-for-bit by a cached-vs-per-pair oracle test.
+
+**Gaussian weighted prior-weight semantics (#1617, #1618)**
+- The intended Gaussian `weights` convention is locked down by a contract test:
+  for a fixed-dispersion family (Poisson) a weighted fit reproduces the
+  row-expanded fit exactly, while a Gaussian identity-link fit treats `weights` as
+  prior (inverse-variance) weights — rescale-invariant under w → c·w and *not*
+  equivalent to row replication (its profiled scale divides by the row count,
+  matching mgcv / Wood 2017 §6.2.7). Net behavior is unchanged; this rebuts the
+  #1617/#1618 false-premise reports and prevents silent drift.
+
 ## v0.3.132 — gam 0.3.132 / gamfit 0.1.234 (2026-06-29)
 
 crates.io + PyPI release of the non-Gaussian-family, survival-identifiability,

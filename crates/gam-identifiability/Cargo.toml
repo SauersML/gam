@@ -1,6 +1,6 @@
 [package]
 name = "gam-identifiability"
-version = "0.3.132"
+version = "0.3.133"
 edition = "2024"
 description = "Design identifiability auditing and rank reduction for the gam penalized-likelihood engine"
 license = "AGPL-3.0-or-later"
@@ -11,11 +11,11 @@ warnings = "deny"
 
 [dependencies]
 faer = "0.24.0"
-gam-gpu = { path = "../gam-gpu", version = "=0.3.132" }
-gam-linalg = { path = "../gam-linalg", version = "=0.3.132" }
-gam-math = { path = "../gam-math", version = "=0.3.132" }
-gam-problem = { path = "../gam-problem", version = "=0.3.132" }
-gam-runtime = { path = "../gam-runtime", version = "=0.3.132" }
+gam-gpu = { path = "../gam-gpu", version = "=0.3.133" }
+gam-linalg = { path = "../gam-linalg", version = "=0.3.133" }
+gam-math = { path = "../gam-math", version = "=0.3.133" }
+gam-problem = { path = "../gam-problem", version = "=0.3.133" }
+gam-runtime = { path = "../gam-runtime", version = "=0.3.133" }
 log = "0.4.29"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 rayon = "1.12.0"
