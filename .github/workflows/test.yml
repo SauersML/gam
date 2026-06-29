@@ -219,11 +219,15 @@ jobs:
           main_count=0; pyffi_count=0
           cargo nextest list --archive-file nx.tar.zst --workspace-remap . \
             2>/dev/null | tee nextest-list.log | tail -n 5 || true
-          main_count="$(grep -cE '^\s' nextest-list.log || echo 0)"
+          # grep -c prints the count (0 when no match) but EXITS 1 on zero
+          # matches; a `|| echo 0` here would APPEND a second line, making
+          # main_count="0\n0" and breaking the arithmetic below. Take the first
+          # line and default to 0 instead.
+          main_count="$(grep -cE '^\s' nextest-list.log 2>/dev/null | head -n1)"; main_count="${main_count:-0}"
           if [ -f nx-pyffi.tar.zst ]; then
             cargo nextest list --archive-file nx-pyffi.tar.zst --workspace-remap . \
               2>/dev/null > nextest-list-pyffi.log || true
-            pyffi_count="$(grep -cE '^\s' nextest-list-pyffi.log || echo 0)"
+            pyffi_count="$(grep -cE '^\s' nextest-list-pyffi.log 2>/dev/null | head -n1)"; pyffi_count="${pyffi_count:-0}"
           fi
           total=$(( main_count + pyffi_count ))
           echo "test_count=${total}" >> "$GITHUB_OUTPUT"
@@ -638,6 +642,15 @@ jobs:
           rm -rf dist
           maturin build --release -i python3 -o dist
           python -m pip install --force-reinstall dist/*.whl
+          # The pyffi parity test and the pytest steps run from the repo ROOT,
+          # where the source ./gamfit/ package shadows the installed wheel on
+          # sys.path (cwd is searched first). The source tree has no compiled
+          # extension, so `import gamfit._rust` fails (ModuleNotFoundError). Copy
+          # the just-built extension from the installed wheel into the source tree
+          # so the cwd-shadowed import resolves the real module.
+          SITE="$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+          cp "$SITE"/gamfit/_rust*.so gamfit/ 2>/dev/null || true
+          ls -la gamfit/_rust*.so || { echo "::error::compiled gamfit._rust extension not found in $SITE/gamfit after wheel install"; exit 1; }
 
       - name: Install Python test extras
         run: |
