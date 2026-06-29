@@ -258,7 +258,7 @@ pub(crate) fn sae_row_jet_program_matches_production_row_jets_on_converged_cache
 #[test]
 pub(crate) fn batch4_jet_lanes_match_scalar_hand_row_jets() {
     use ndarray::Array1;
-    let (term, target, rho) = gamma_fd_tiny_fixture();
+    let (mut term, target, rho) = gamma_fd_tiny_fixture();
     let (_value, _loss, cache) = term
         .reml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
         .expect("converged cache");
