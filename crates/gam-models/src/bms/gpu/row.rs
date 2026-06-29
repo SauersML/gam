@@ -752,11 +752,20 @@ impl RowKernelBackend {
                         ROW_KERNEL_BODY,
                     ]
                     .concat();
-                    let ptx = cudarc::nvrtc::compile_ptx(row_kernel_source).map_err(|err| {
-                        GpuError::DriverCallFailed {
+                    // #1551: route through the project's single arch-aware NVRTC
+                    // entry point instead of bare `cudarc::nvrtc::compile_ptx`.
+                    // `compile_ptx_arch` pins `--gpu-architecture` to the selected
+                    // device's compute capability and supplies the standard CUDA
+                    // include paths; bare `compile_ptx` uses NVRTC's default
+                    // virtual arch with no includes. The row kernel's 64-bit
+                    // `atomic_add_f64` (atomicCAS emulation) compiles best against
+                    // the real device arch, and this keeps every BMS-flex compile
+                    // site consistent with the SAE arrow/Schur kernels that do
+                    // require the sm_60 pin for native `atomicAdd(double*,double)`.
+                    let ptx = gam_gpu::device_cache::compile_ptx_arch(&row_kernel_source)
+                        .map_err(|err| GpuError::DriverCallFailed {
                             reason: format!("bms_flex_row NVRTC compile failed: {err}"),
-                        }
-                    })?;
+                        })?;
                     let module =
                         parts
                             .ctx
@@ -1837,11 +1846,13 @@ impl HvpKernelBackend {
         BACKEND
             .get_or_init(|| {
                 gam_gpu::backend_probe::probe_backend_with_compile("bms_flex_row hvp", |parts| {
-                    let ptx = cudarc::nvrtc::compile_ptx(HVP_KERNEL_SOURCE).map_err(|err| {
-                        GpuError::DriverCallFailed {
+                    // #1551: arch-aware compile (see launch_bms_flex_row_kernel) —
+                    // pin `--gpu-architecture` to the device capability and supply
+                    // the standard include paths via the shared NVRTC entry point.
+                    let ptx = gam_gpu::device_cache::compile_ptx_arch(HVP_KERNEL_SOURCE)
+                        .map_err(|err| GpuError::DriverCallFailed {
                             reason: format!("bms_flex_row hvp NVRTC compile failed: {err}"),
-                        }
-                    })?;
+                        })?;
                     let module =
                         parts
                             .ctx

@@ -157,7 +157,12 @@ mod pcg_device {
                         )
                     })?;
                     let stream = ctx.default_stream();
-                    let ptx = cudarc::nvrtc::compile_ptx(PCG_KERNEL_SOURCE)
+                    // #1551: arch-aware compile via the project's shared NVRTC
+                    // entry point — pin `--gpu-architecture` to the device
+                    // capability and supply the standard CUDA include paths,
+                    // instead of bare `cudarc::nvrtc::compile_ptx` (NVRTC default
+                    // arch, no includes).
+                    let ptx = gam_gpu::device_cache::compile_ptx_arch(PCG_KERNEL_SOURCE)
                         .map_err(|err| format!("pcg NVRTC compile failed: {err}"))?;
                     let module = ctx
                         .load_module(ptx)
