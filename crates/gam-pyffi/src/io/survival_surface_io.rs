@@ -108,7 +108,7 @@ pub(crate) fn interpolate_survival_surface<'py>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (grid, surface, query, clip_lo, clip_hi, left_value = None, right_value = None))]
+#[pyo3(signature = (grid, surface, query, clip_lo, clip_hi, left_value = None, right_value = None, inf_value = None))]
 pub(crate) fn interpolate_rows<'py>(
     py: Python<'py>,
     grid: PyReadonlyArray1<'py, f64>,
@@ -118,6 +118,7 @@ pub(crate) fn interpolate_rows<'py>(
     clip_hi: Option<f64>,
     left_value: Option<f64>,
     right_value: Option<f64>,
+    inf_value: Option<f64>,
 ) -> PyResult<Bound<'py, PyArray2<f64>>> {
     let grid_view = grid.as_array();
     let surface_view = surface.as_array();
@@ -153,6 +154,14 @@ pub(crate) fn interpolate_rows<'py>(
             for (query_idx, query_value) in query_values.iter().copied().enumerate() {
                 let mut interpolated = if query_value.is_nan() {
                     f64::NAN
+                } else if query_value == f64::INFINITY {
+                    // `t -> +inf` asymptote, distinct from the finite past-grid
+                    // flat-clamp (#1595): survival surfaces continue to
+                    // `S(+inf) = 0`, cumulative hazard to `H(+inf) = +inf`.
+                    // Surfaces with no canonical asymptote (`hazard`,
+                    // `survival_se`) pass `None` and fall back to the
+                    // nearest-endpoint value (issue #965).
+                    inf_value.unwrap_or(surface_row[sorted_indices[n_grid - 1]])
                 } else if query_value <= sorted_grid[0] {
                     // Below-grid extrapolation: callers (e.g. survival surfaces)
                     // can supply an explicit asymptotic `left_value` so that
@@ -228,6 +237,7 @@ fn write_csv_field(writer: &mut BufWriter<File>, value: &str) -> std::io::Result
     writer.write_all(b"\"")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn survival_csv_interpolate(
     surface_values: &[f64],
     n_cols: usize,
@@ -237,12 +247,19 @@ fn survival_csv_interpolate(
     query_value: f64,
     left_value: Option<f64>,
     right_value: Option<f64>,
+    inf_value: Option<f64>,
 ) -> f64 {
     if query_value.is_nan() {
         return f64::NAN;
     }
     let n_grid = sorted_grid.len();
     let row_offset = row_idx * n_cols;
+    if query_value == f64::INFINITY {
+        // `t -> +inf` asymptote, distinct from the finite past-grid flat-clamp
+        // (#1595): `S(+inf) = 0`, `H(+inf) = +inf`; no-asymptote surfaces fall
+        // back to the nearest endpoint (issue #965).
+        return inf_value.unwrap_or(surface_values[row_offset + sorted_indices[n_grid - 1]]);
+    }
     if query_value <= sorted_grid[0] {
         if query_value < sorted_grid[0] {
             left_value.unwrap_or(surface_values[row_offset + sorted_indices[0]])
@@ -297,15 +314,27 @@ pub(crate) fn survival_chunk_iter_collect<'py>(
     time_grid_chunk: usize,
 ) -> PyResult<Py<PyArray2<f64>>> {
     // Mirror the asymptotic-extrapolation policy in
-    // `gamfit._survival._SURVIVAL_EXTRAPOLATION`: survival surfaces are
-    // continued to S(t<=0)=1 and S(t->inf)=0 outside the modeled grid, and
-    // cumulative hazard mirrors that via H(t<=0)=0. Hazards and standard
-    // errors have no canonical asymptote, so they keep nearest-endpoint
-    // behavior (signaled by `None`/`None`).
-    let (kind_left_value, kind_right_value): (Option<f64>, Option<f64>) = match kind {
-        "survival" => (Some(1.0), Some(0.0)),
-        "cumulative_hazard" => (Some(0.0), None),
-        "hazard" | "survival_se" => (None, None),
+    // `gamfit._survival._SURVIVAL_EXTRAPOLATION` EXACTLY so the dense
+    // auto-chunked path and the small non-chunked path agree past the grid
+    // (issue #965 / completing #1595):
+    //   * left edge (`t <= t_min`): `S = 1`, `H = 0` -- unambiguous boundary.
+    //   * right edge (finite `t > t_max`): flat-clamp to the last grid value
+    //     (`right_value = None`). Forcing `S -> 0` here (the old hardcoded
+    //     `Some(0.0)`) contradicted the non-chunked path and broke the
+    //     `S(t) = exp(-H(t))` identity past the grid (#1595): it made `S` jump
+    //     to 0 while `H` stayed finite.
+    //   * `t == +inf`: the genuine asymptote `S = 0`, `H = +inf` (carried by
+    //     `kind_inf_value`, separate from the finite flat-clamp).
+    // Hazards and standard errors have no canonical asymptote, so they keep
+    // nearest-endpoint behavior on every edge (`None`).
+    let (kind_left_value, kind_right_value, kind_inf_value): (
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+    ) = match kind {
+        "survival" => (Some(1.0), None, Some(0.0)),
+        "cumulative_hazard" => (Some(0.0), None, Some(f64::INFINITY)),
+        "hazard" | "survival_se" => (None, None, None),
         other => {
             return Err(py_value_error(format!(
                 "unknown survival surface kind '{other}'"
@@ -366,6 +395,7 @@ pub(crate) fn survival_chunk_iter_collect<'py>(
                             times_values[time_idx],
                             kind_left_value,
                             kind_right_value,
+                            kind_inf_value,
                         );
                         values[out_row_start + time_idx] =
                             clip_survival_surface_value(interpolated, clip_lo, clip_hi);
@@ -470,7 +500,11 @@ pub(crate) fn write_survival_csv(
                             &sorted_indices,
                             row_idx,
                             *query_value,
+                            // Same unified policy as the query path (#965):
+                            // S(t<=0)=1, finite past-grid flat-clamp (None),
+                            // S(+inf)=0.
                             Some(1.0),
+                            None,
                             Some(0.0),
                         )
                         .clamp(0.0, 1.0);
@@ -514,20 +548,27 @@ pub(crate) fn survival_coerce_times<'py>(
             "survival prediction requires at least one time".to_string(),
         ));
     }
-    // The Rust prediction core requires finite, non-negative times (see
-    // `src/families/survival_predict.rs` time-grid validation: `!t.is_finite()
-    // || t < 0.0` is rejected). The FFI validator must enforce the same
-    // contract so the two representations agree (issue #965): a negative time
-    // is meaningless for a survival/hazard surface and would otherwise produce
-    // `exp(-hazard * t) > 1` in the parametric fallback or a left-extrapolated
-    // `1` from a saved surface, depending purely on representation.
+    // This is the prediction-QUERY coercion (callers: `survival_at` /
+    // `hazard_at` / `cumulative_hazard_at` / `competing_risks_cif`), NOT the
+    // fit-time observed-time validator. The survival function `S(t) = P(T > t)`
+    // is defined for every real `t`: below the support `S(t <= 0) = 1`, and in
+    // the limit `S(+inf) = 0` (mirrored by `H(t <= 0) = 0`, `H(+inf) = +inf`).
+    // So a negative or `+inf` query is a legitimate boundary evaluation, not an
+    // error (issue #965): the earlier `finite && >= 0` reject conflated this
+    // query path with the core fit-time grid validation
+    // (`crates/gam-models/src/survival/predict.rs`), where rejecting negative
+    // *observed* times is correct. The downstream interpolation/parametric
+    // kernels apply the single boundary policy `t <= 0 => S = 1, H = 0` and the
+    // explicit `+inf` asymptote, so neither the `exp(-hazard * t) > 1` value nor
+    // a representation-dependent answer can arise. Only `NaN` is rejected: it
+    // carries no order and no defined survival value.
     if let Some((idx, value)) = values
         .iter()
         .enumerate()
-        .find(|(_, value)| !value.is_finite() || **value < 0.0)
+        .find(|(_, value)| value.is_nan())
     {
         return Err(py_value_error(format!(
-            "survival prediction times must be finite and non-negative (index {idx} = {value})"
+            "survival prediction times must not be NaN (index {idx} = {value})"
         )));
     }
     Ok(Array1::from_vec(values).into_pyarray(py).unbind())
@@ -733,8 +774,17 @@ pub(crate) fn survival_cumulative_from_survival<'py>(
 /// evaluates `(-inf * 0) = NaN`, then `exp(NaN) = NaN`, even though every
 /// survival function satisfies `S(0) = 1` (issue #965).
 fn exponential_survival_at(hazard: f64, t: f64) -> f64 {
-    if t == 0.0 {
+    // `S(t) = P(T > t)` for the constant-hazard exponential fallback is defined
+    // on all of R (issue #965): below the origin everyone is still at risk, so
+    // `S(t <= 0) = 1` exactly (this also avoids the `exp(-hazard * t) > 1`
+    // impossibility for `t < 0` and the `inf * 0 = NaN` case at `t = 0` when
+    // `hazard` overflowed). At `t = +inf`, `S = 0` for any positive hazard.
+    if t <= 0.0 {
         return 1.0;
+    }
+    if t == f64::INFINITY {
+        // exp(-hazard * inf): 0 for hazard > 0, 1 for a degenerate zero hazard.
+        return if hazard > 0.0 { 0.0 } else { 1.0 };
     }
     (-hazard * t).exp()
 }
