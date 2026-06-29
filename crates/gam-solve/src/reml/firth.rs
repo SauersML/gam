@@ -28,6 +28,24 @@ struct FirthReducedCore {
     h_diag: Array1<f64>,
 }
 
+/// Single-index sub-blocks of the exact mixed second directional derivative
+/// `D²H_φ[u,v]`, precomputed once against the fixed `eye` rhs used by the
+/// exact-Hessian TK outer loop. See
+/// [`FirthDenseOperator::tk_second_direction_eye_cache`] (#1575).
+pub(crate) struct FirthSecondDirEyeCache {
+    /// The fixed identity rhs (`p×p`), kept so per-pair `fast_ab(.., &eye)`
+    /// matmuls reproduce the original byte-for-byte.
+    eye: Array2<f64>,
+    /// `X·I` — index-independent.
+    eta_rhs: Array2<f64>,
+    /// `(Bᵀ P B-base)·I` — index-independent.
+    p_b_rhs: Array2<f64>,
+    /// Per-direction `apply_hadamard_gram(eta_rhs ⊙ b_uvec_i)`.
+    p_bx: Vec<Array2<f64>>,
+    /// Per-direction `apply_p_u(a_u_reduced_i, w' ⊙ eta_rhs)`.
+    pu_qv: Vec<Array2<f64>>,
+}
+
 impl<'a> RemlState<'a> {
     pub(crate) fn xt_diag_x_dense_into(
         x: &Array2<f64>,
@@ -1077,6 +1095,156 @@ impl FirthDenseOperator {
             self.left_scaled_xt(&self.w1, &p_uv_rhs),
         ];
         let mut d2_j2 = Array2::<f64>::zeros((p, rhs.ncols()));
+        for term in d2_terms {
+            d2_j2 += &term;
+        }
+
+        0.5 * (diag_term - d2_j2)
+    }
+
+    /// Precompute, for a FIXED identity rhs, every sub-block of the mixed second
+    /// directional derivative `D²H_φ[u,v]` that depends on a SINGLE direction
+    /// index (or on nothing but the operator). The exact-Hessian TK outer loop
+    /// (`tk_hessian_rho_canonical_logit`) evaluates `hphisecond_direction_apply`
+    /// for every one of the `k(k+1)/2` penalty pairs against the same `eye` rhs;
+    /// the four heavy single-index reduced Hadamard-Gram applies inside it
+    /// (`p_bu_rhs`/`p_bv_rhs` and `p_u_b_rhs`/`pv_b_rhs`) therefore have only `k`
+    /// distinct values but were rebuilt `O(k²)` times. Caching them once per
+    /// index here turns that into `O(k)` of those O(n·r²·p) applies, with the
+    /// per-pair work limited to the genuinely mixed (`u`,`v`) blocks. This is
+    /// exact: each cached block is a pure function of `(operator, direction[i])`
+    /// for the fixed `eye` rhs, so the contraction it feeds is bit-identical to
+    /// `hphisecond_direction_apply(.., &eye)` (#1575).
+    pub(crate) fn tk_second_direction_eye_cache(
+        &self,
+        dirs: &[FirthDirection],
+    ) -> FirthSecondDirEyeCache {
+        let p = self.x_dense.ncols();
+        let eye = Array2::<f64>::eye(p);
+        // eta_rhs = X·I and qv = w' ⊙ eta_rhs are rhs-only (index-independent).
+        let eta_rhs = fast_ab(&self.x_dense, &eye);
+        let qv = &eta_rhs * &self.w1.view().insert_axis(Axis(1));
+        // p_b_rhs = (Bᵀ P B-base)·I is rhs-only; precompute it once.
+        let p_b_rhs = fast_ab(&self.p_b_base, &eye);
+        let mut p_bx = Vec::with_capacity(dirs.len());
+        let mut pu_qv = Vec::with_capacity(dirs.len());
+        for d in dirs {
+            // p_b{u,v}_rhs: depends only on this direction's b_uvec (and eta_rhs).
+            p_bx.push(RemlState::apply_hadamard_gram_to_matrix(
+                &self.x_reduced,
+                &self.k_reduced,
+                &self.k_reduced,
+                &(&eta_rhs * &d.b_uvec.view().insert_axis(Axis(1))),
+            ));
+            // p_u_b_rhs / pv_b_rhs: depends only on this direction's a_u_reduced.
+            pu_qv.push(self.apply_p_u_to_matrix(&d.a_u_reduced, &qv));
+        }
+        let _ = qv;
+        FirthSecondDirEyeCache {
+            eye,
+            eta_rhs,
+            p_b_rhs,
+            p_bx,
+            pu_qv,
+        }
+    }
+
+    /// Exact mixed second directional derivative `D²H_φ[u,v]` against the fixed
+    /// `eye` rhs, reusing the single-index sub-blocks precomputed once by
+    /// [`Self::tk_second_direction_eye_cache`]. Bit-identical to
+    /// `hphisecond_direction_apply(&dirs[i], &dirs[j], &Array2::eye(p))`; only
+    /// the redundant per-pair recomputation of the single-index blocks is
+    /// removed (#1575).
+    pub(crate) fn hphisecond_direction_apply_eye_cached(
+        &self,
+        cache: &FirthSecondDirEyeCache,
+        dirs: &[FirthDirection],
+        i: usize,
+        j: usize,
+    ) -> Array2<f64> {
+        let u = &dirs[i];
+        let v = &dirs[j];
+        let p = self.x_dense.ncols();
+        let cols = cache.eta_rhs.ncols();
+        if p == 0 || cols == 0 {
+            return Array2::<f64>::zeros((p, cols));
+        }
+        let deta_uv = &u.deta * &v.deta;
+        let s_uv = &self.w2 * &deta_uv;
+        let g_uv_reduced = RemlState::reducedweighted_gram(&self.x_reduced, &s_uv);
+        let k_g_uv = self.k_reduced.dot(&g_uv_reduced);
+        let k_gv = self.k_reduced.dot(&v.g_u_reduced);
+        let k_g_u = self.k_reduced.dot(&u.g_u_reduced);
+        let a_uv_reduced = k_g_uv.dot(&self.k_reduced)
+            - k_gv.dot(&k_g_u).dot(&self.k_reduced)
+            - k_g_u.dot(&k_gv).dot(&self.k_reduced);
+        let d2h = -RemlState::reduced_diag_gram(&self.x_reduced, &a_uv_reduced);
+        let c_uv = &(&(&self.w4 * &deta_uv) * &self.h_diag)
+            + &(&self.w3 * &(&u.deta * &v.dh))
+            + &(&self.w3 * &(&v.deta * &u.dh))
+            + &(&self.w2 * &d2h);
+
+        let eta_rhs = &cache.eta_rhs;
+        let diag_term = fast_ab(
+            &self.x_dense_t,
+            &(eta_rhs * &c_uv.view().insert_axis(Axis(1))),
+        );
+
+        let b_uvvec = &self.w3 * &deta_uv;
+        let b_uv_base = &self.x_dense * &b_uvvec.view().insert_axis(Axis(1));
+
+        // Single-index blocks reused from the cache (the O(k²)→O(k) win).
+        let p_b_rhs = &cache.p_b_rhs;
+        let p_bu_rhs = &cache.p_bx[i];
+        let p_bv_rhs = &cache.p_bx[j];
+        let p_u_b_rhs = &cache.pu_qv[i];
+        let pv_b_rhs = &cache.pu_qv[j];
+
+        // Genuinely mixed (u,v) blocks — must be rebuilt per pair.
+        let p_buv_base = RemlState::apply_hadamard_gram_to_matrix(
+            &self.x_reduced,
+            &self.k_reduced,
+            &self.k_reduced,
+            &b_uv_base,
+        );
+        let p_buv_rhs = fast_ab(&p_buv_base, &cache.eye);
+
+        let pv_bu_rhs = self.apply_p_u_to_matrix(
+            &v.a_u_reduced,
+            &(eta_rhs * &u.b_uvec.view().insert_axis(Axis(1))),
+        );
+        let p_u_bv_rhs = self.apply_p_u_to_matrix(
+            &u.a_u_reduced,
+            &(eta_rhs * &v.b_uvec.view().insert_axis(Axis(1))),
+        );
+
+        let p_nu_nv_base = RemlState::apply_hadamard_gram_to_matrix(
+            &self.x_reduced,
+            &u.a_u_reduced,
+            &v.a_u_reduced,
+            &self.b_base,
+        );
+        let p_hw_nuv_base = RemlState::apply_hadamard_gram_to_matrix(
+            &self.x_reduced,
+            &self.k_reduced,
+            &a_uv_reduced,
+            &self.b_base,
+        );
+        let p_uv_base = 2.0 * p_nu_nv_base - 2.0 * p_hw_nuv_base;
+        let p_uv_rhs = fast_ab(&p_uv_base, &cache.eye);
+
+        let d2_terms = [
+            self.left_scaled_xt(&b_uvvec, p_b_rhs),
+            self.left_scaled_xt(&self.w1, &p_buv_rhs),
+            self.left_scaled_xt(&u.b_uvec, p_bv_rhs),
+            self.left_scaled_xt(&v.b_uvec, p_bu_rhs),
+            self.left_scaled_xt(&u.b_uvec, pv_b_rhs),
+            self.left_scaled_xt(&self.w1, &pv_bu_rhs),
+            self.left_scaled_xt(&v.b_uvec, p_u_b_rhs),
+            self.left_scaled_xt(&self.w1, &p_u_bv_rhs),
+            self.left_scaled_xt(&self.w1, &p_uv_rhs),
+        ];
+        let mut d2_j2 = Array2::<f64>::zeros((p, cols));
         for term in d2_terms {
             d2_j2 += &term;
         }
@@ -3047,6 +3215,62 @@ mod tests {
             hess.column_mut(j).assign(&col);
         }
         hess
+    }
+
+    /// #1575: the cached single-index second-direction path
+    /// (`tk_second_direction_eye_cache` + `hphisecond_direction_apply_eye_cached`)
+    /// must be BIT-IDENTICAL to the per-pair `hphisecond_direction_apply(.., &eye)`
+    /// it replaces in the exact-Hessian TK outer loop. This locks the work-elision
+    /// invariant: it removes redundant O(n·r²·p) reduced Hadamard-Gram applies, it
+    /// must NOT change a single bit of the resulting Hessian contribution.
+    #[test]
+    fn hphisecond_eye_cached_matches_per_pair_bit_identical_1575() {
+        // A 6×3 logit design with a few distinct η directions (mirrors the
+        // multi-smooth penalty directions the TK loop contracts over).
+        let x = array![
+            [1.0, -1.10, 0.35],
+            [1.0, -0.40, -0.65],
+            [1.0, 0.15, 0.20],
+            [1.0, 0.80, -0.45],
+            [1.0, 1.25, 0.70],
+            [1.0, -0.55, 0.95],
+        ];
+        let beta = array![0.20, -0.55, 0.30];
+        let op = build_link_firth_op(StandardLink::Logit, &x, &beta);
+        let p = x.ncols();
+
+        // Three β-direction δη vectors playing the role of eta_i[idx].
+        let deta_list = [
+            x.dot(&array![0.9, -0.3, 0.2]),
+            x.dot(&array![-0.4, 0.7, 0.1]),
+            x.dot(&array![0.1, 0.2, -0.8]),
+        ];
+        let dirs: Vec<FirthDirection> = deta_list
+            .iter()
+            .map(|d| op.direction_from_deta(d.clone()))
+            .collect();
+
+        let eye = Array2::<f64>::eye(p);
+        let cache = op.tk_second_direction_eye_cache(&dirs);
+        for i in 0..dirs.len() {
+            for j in 0..=i {
+                let reference = op.hphisecond_direction_apply(&dirs[i], &dirs[j], &eye);
+                let cached = op.hphisecond_direction_apply_eye_cached(&cache, &dirs, i, j);
+                assert_eq!(
+                    reference.dim(),
+                    cached.dim(),
+                    "shape mismatch at pair ({i},{j})"
+                );
+                for (a, b) in reference.iter().zip(cached.iter()) {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "cached D²H_φ[{i},{j}] is not bit-identical to per-pair: \
+                         reference={a}, cached={b}"
+                    );
+                }
+            }
+        }
     }
 
     /// A fixed, well-conditioned full-rank design (deterministic, no RNG).

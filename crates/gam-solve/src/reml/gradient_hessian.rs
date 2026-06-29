@@ -1405,6 +1405,14 @@ impl<'a> RemlState<'a> {
             h_i.push(h);
         }
 
+        // The mixed second directional derivative D²H_φ[u,v] is evaluated for
+        // every (i,j) penalty pair below against the SAME identity rhs. Its
+        // single-index sub-blocks therefore have only k distinct values; cache
+        // them once here so the O(k²) pair loop reuses them instead of rebuilding
+        // an O(n·r²·p) reduced Hadamard-Gram for each pair. Exact / bit-identical
+        // to per-pair hphisecond_direction_apply(.., &eye) (#1575).
+        let firth_second_eye_cache = firth_op.map(|op| op.tk_second_direction_eye_cache(&firth_dir_i));
+
         let mut beta_ij: Vec<Vec<Array1<f64>>> = (0..k)
             .map(|_| (0..k).map(|_| Array1::<f64>::zeros(p)).collect())
             .collect();
@@ -1434,13 +1442,17 @@ impl<'a> RemlState<'a> {
                 if let Some(op) = firth_op {
                     let dir_ij = op.direction_from_deta(eta_ij);
                     h -= &op.hphi_direction(&dir_ij);
-                    // Reuse the per-penalty directions built once above instead
-                    // of rebuilding dir_i/dir_j for every (i,j) pair (#1575).
-                    let eye = Array2::<f64>::eye(p);
-                    h -= &op.hphisecond_direction_apply(
-                        &firth_dir_i[i],
-                        &firth_dir_i[j],
-                        &eye,
+                    // Reuse the per-penalty directions built once above and the
+                    // single-index second-derivative sub-blocks cached once above,
+                    // instead of rebuilding them for every (i,j) pair (#1575).
+                    let cache = firth_second_eye_cache
+                        .as_ref()
+                        .expect("firth second-direction eye cache present when firth_op is Some");
+                    h -= &op.hphisecond_direction_apply_eye_cached(
+                        cache,
+                        &firth_dir_i,
+                        i,
+                        j,
                     );
                 }
                 gam_linalg::matrix::symmetrize_in_place(&mut h);

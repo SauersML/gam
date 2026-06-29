@@ -253,3 +253,80 @@ fn binomial_logit_reml_outer_work_bounded_1575() {
         fit.inner_pirls_solves
     );
 }
+
+/// #1575: with Firth/Jeffreys bias reduction ON (the DEFAULT for binomial/logit
+/// at n ≤ 20000, which mgcv never pays), the dominant outer cost is the exact
+/// Tierney-Kadane LAML-Hessian Firth directional derivatives. Their O(k²) pair
+/// loop now reuses single-index reduced Hadamard-Gram sub-blocks cached once per
+/// direction (bit-identical work elision, locked by the firth.rs oracle test).
+///
+/// This drives the REAL Firth-ON outer-Hessian path end-to-end on a small
+/// 3-smooth fit and asserts it (a) converges to a genuine REML stationary point
+/// and (b) finishes within a sane outer-work budget — guarding that the cached
+/// path stays wired and the Firth fit does not regress toward the bug regime.
+#[test]
+fn binomial_logit_reml_firth_on_outer_work_bounded_1575() {
+    let (x, y, s_list) = build_logit_three_smooth_problem();
+    let n = x.nrows();
+    let weights = Array1::ones(n);
+    let offset = Array1::zeros(n);
+
+    let mut opts = logit_fit_options();
+    opts.firth_bias_reduction = true; // exercise the Firth TK outer-Hessian path
+
+    let fit = fit_gam(
+        x.view(),
+        y.view(),
+        weights.view(),
+        offset.view(),
+        &s_list,
+        LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(StandardLink::Logit),
+        ),
+        &opts,
+    )
+    .expect("3-smooth Firth-ON logit REML fit should succeed");
+
+    // Correctness: finite fit, converged, EDF in the structurally valid band.
+    assert!(fit.reml_score.is_finite(), "reml_score must be finite");
+    assert!(fit.beta.iter().all(|b| b.is_finite()), "beta must be finite");
+    let edf = fit
+        .edf_total()
+        .expect("inference EDF must be present for an inference fit");
+    assert!(
+        (4.0..=16.0).contains(&edf),
+        "Firth-ON edf {edf} outside structurally valid band [4, 16]"
+    );
+    assert!(
+        fit.outer_converged,
+        "Firth-ON outer REML optimizer must certify convergence"
+    );
+    if let Some(g) = fit.outer_gradient_norm {
+        let bound = (1.0e-3 * (1.0 + fit.reml_score.abs())).min(1.0);
+        assert!(
+            g <= bound,
+            "Firth-ON final outer gradient norm {g} exceeds score-relative \
+             stationarity bound {bound}"
+        );
+    }
+
+    eprintln!(
+        "RECORD_1575_FIRTH reml_score={:.10} edf={:.10} outer_cost_evals={} inner_pirls_solves={} converged={}",
+        fit.reml_score, edf, fit.outer_cost_evals, fit.inner_pirls_solves, fit.outer_converged
+    );
+
+    // Outer-work budget: the Firth path does more per-eval work but the eval/solve
+    // COUNTS should stay in the same healthy regime as the Firth-off fit (the
+    // cached-block change cuts per-eval cost, not the converged trajectory).
+    assert!(
+        fit.outer_cost_evals > 0 && fit.outer_cost_evals < 80,
+        "Firth-ON outer cost evals {} outside sane budget (blow-up = regression)",
+        fit.outer_cost_evals
+    );
+    assert!(
+        fit.inner_pirls_solves > 0 && fit.inner_pirls_solves < 200,
+        "Firth-ON inner P-IRLS solves {} outside sane budget",
+        fit.inner_pirls_solves
+    );
+}
