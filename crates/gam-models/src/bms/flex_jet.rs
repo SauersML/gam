@@ -203,6 +203,85 @@ pub(crate) mod test_support {
         }
         a
     }
+
+    /// Polynomial convolution `out[i+j] += a[i]·b[j]` over jet coefficients
+    /// (the jet image of multiplying two `z`-polynomials with jet coefficients).
+    /// `out.len() = a.len() + b.len() − 1`.
+    pub(crate) fn poly_conv_jet(a: &[Jet2], b: &[Jet2], p: usize) -> Vec<Jet2> {
+        let mut out = vec![Jet2::constant(0.0, p); a.len() + b.len() - 1];
+        for (i, ai) in a.iter().enumerate() {
+            for (j, bj) in b.iter().enumerate() {
+                out[i + j] = out[i + j].add(&ai.mul(bj));
+            }
+        }
+        out
+    }
+
+    /// Interior **base-moment jets** `Mₙ(θ) = ∫_{zL}^{zR} zⁿ·e^{−q(z;θ)} dz` over
+    /// the FIXED cell domain `[zL, zR]`, carried over the runtime jet. The latent
+    /// weight is `e^{−q}`, `q(z) = ½(z² + η(z)²)`, `η(z) = Σₖ cₖ·zᵏ` the cell
+    /// cubic. Only `η` (hence `q`) depends on θ, through the coefficient jets
+    /// `cₖ(θ)`:
+    ///
+    /// ```text
+    ///   Mₙ(θ) = ∫ zⁿ e^{−q₀} · e^{−Δq} dz ,   Δq = q − q₀ = ½(η² − η₀²)
+    ///         = η₀·δη + ½·δη² ,                δη = η − η₀ = Σₖ δcₖ·zᵏ  (value 0)
+    /// ```
+    ///
+    /// `Δq` has zero value channel, so for an order-≤2 jet the exponential
+    /// truncates exactly: `e^{−Δq} = 1 − Δq + ½·Δq²` (every `Δqᵏ`, `k ≥ 3`, has
+    /// zero value / gradient / Hessian). Writing `e^{−Δq} = Σₘ Sₘ·zᵐ` with jet
+    /// coefficients `Sₘ`, the moment integral collapses onto the SCALAR base
+    /// moments `M⁰ₖ = ∫ zᵏ e^{−q₀} dz`:
+    ///
+    /// ```text
+    ///   Mₙ(θ) = Σₘ Sₘ · M⁰_{n+m} .
+    /// ```
+    ///
+    /// `c_jets` are the cell coefficients `c₀..c₃` as jets of θ; `c0_scalar` their
+    /// base values; `scalar_moments` the base moments `M⁰ₖ`. `δη`/`η₀` are
+    /// degree 3, so `Δq` is degree 6 and `Δq²` degree 12 — `scalar_moments` must
+    /// hold indices up to `max_n + 12`. Returns `M₀..M_{max_n}` as jets. This is
+    /// the FIXED-domain interior piece; cells with a θ-moving edge
+    /// (`z = (τ−a)/b` link crossings) add a separate Leibniz sliver.
+    pub(crate) fn cell_base_moment_jets(
+        c_jets: &[Jet2; 4],
+        c0_scalar: [f64; 4],
+        scalar_moments: &[f64],
+        max_n: usize,
+    ) -> Vec<Jet2> {
+        let p = c_jets[0].p();
+        let cst = |x: f64| Jet2::constant(x, p);
+        // δcₖ = cₖ(θ) − cₖ⁰ (value 0), and η₀ as constant jets.
+        let dc: [Jet2; 4] = std::array::from_fn(|k| c_jets[k].sub(&cst(c0_scalar[k])));
+        let eta0: [Jet2; 4] = std::array::from_fn(|k| cst(c0_scalar[k]));
+        // Δq = η₀·δη + ½·δη²  (degree-6 jet polynomial, 7 coefficients).
+        let eta0_deta = poly_conv_jet(&eta0, &dc, p);
+        let deta_sq = poly_conv_jet(&dc, &dc, p);
+        let mut dq: Vec<Jet2> = (0..eta0_deta.len())
+            .map(|m| eta0_deta[m].add(&deta_sq[m].scale(0.5)))
+            .collect();
+        // e^{−Δq} = 1 − Δq + ½·Δq²  (degree-12 jet polynomial S, 13 coefficients).
+        let dq_sq = poly_conv_jet(&dq, &dq, p);
+        // S starts as −Δq + ½Δq² (pad Δq up to the degree of Δq²), then +1 const.
+        let s_len = dq_sq.len();
+        dq.resize(s_len, cst(0.0));
+        let mut s_poly: Vec<Jet2> = (0..s_len)
+            .map(|m| dq[m].scale(-1.0).add(&dq_sq[m].scale(0.5)))
+            .collect();
+        s_poly[0] = s_poly[0].add(&cst(1.0));
+        // Mₙ(θ) = Σₘ Sₘ · M⁰_{n+m}.
+        (0..=max_n)
+            .map(|n| {
+                let mut acc = cst(0.0);
+                for (m, s_m) in s_poly.iter().enumerate() {
+                    let mom = scalar_moments[n + m];
+                    acc = acc.add(&s_m.scale(mom));
+                }
+                acc
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -359,5 +438,96 @@ mod tests {
         );
         // Hessian symmetry.
         assert!((a_jet.h[1] - a_jet.h[p]).abs() < 1e-14);
+    }
+
+    /// #932 Phase 2b GATE (cell branch, interior): the runtime-jet base moments
+    /// `Mₙ(θ)` match a central difference of the EXACT kernel moment evaluator
+    /// (`evaluate_cell_moments`) with the cell cubic coefficients `c₀..c₃` as the
+    /// θ-axes, over the FIXED cell domain. Pins the `e^{−Δq}` interior expansion
+    /// (the part the survival flex `base_moment_jets` carries) independent of the
+    /// moving-edge sliver. A wrong Δq fold or a dropped `½Δq²` Hessian term would
+    /// blow the bound by orders.
+    #[test]
+    fn cell_base_moment_jets_match_fd_932() {
+        use crate::cubic_cell_kernel::{DenestedCubicCell, evaluate_cell_moments};
+
+        // Well-conditioned interior cell: finite domain, small cubic so q stays
+        // bounded and the higher moments do not overflow.
+        let base = [0.10_f64, 0.50, -0.20, 0.10];
+        let (left, right) = (-0.80_f64, 0.70_f64);
+        let cell = |c: [f64; 4]| DenestedCubicCell {
+            left,
+            right,
+            c0: c[0],
+            c1: c[1],
+            c2: c[2],
+            c3: c[3],
+        };
+        let max_n = 4usize;
+        // Δq is degree 6, Δq² degree 12 ⇒ need scalar moments up to max_n + 12.
+        let scalar_deg = max_n + 12;
+        let moments_at = |c: [f64; 4]| -> Vec<f64> {
+            evaluate_cell_moments(cell(c), scalar_deg)
+                .expect("cell moments")
+                .moments
+                .into_vec()
+        };
+
+        // Seed each cell coefficient as its own primary (p = 4 axes).
+        let p = 4usize;
+        let c_jets: [Jet2; 4] = std::array::from_fn(|k| Jet2::primary(base[k], k, p));
+        let scalar_moments = moments_at(base);
+        let m_jets = cell_base_moment_jets(&c_jets, base, &scalar_moments, max_n);
+
+        // Value: jet M_n value equals the scalar base moment M⁰_n.
+        for n in 0..=max_n {
+            assert!(
+                (m_jets[n].v - scalar_moments[n]).abs() <= 1e-12 * scalar_moments[n].abs().max(1.0),
+                "M[{n}] value {:+.12e} != scalar {:+.12e}",
+                m_jets[n].v,
+                scalar_moments[n]
+            );
+        }
+
+        // Gradient / Hessian vs central differences of evaluate_cell_moments.
+        let h = 1e-4_f64;
+        for n in 0..=max_n {
+            for k in 0..p {
+                let mut cp = base;
+                let mut cm = base;
+                cp[k] += h;
+                cm[k] -= h;
+                let fd_g = (moments_at(cp)[n] - moments_at(cm)[n]) / (2.0 * h);
+                assert!(
+                    (m_jets[n].g[k] - fd_g).abs() <= 1e-5 * fd_g.abs().max(1.0) + 1e-9,
+                    "dM[{n}]/dc[{k}] jet {:+.12e} != fd {:+.12e}",
+                    m_jets[n].g[k],
+                    fd_g
+                );
+                for l in 0..p {
+                    let mut cpp = base;
+                    let mut cpm = base;
+                    let mut cmp = base;
+                    let mut cmm = base;
+                    cpp[k] += h;
+                    cpp[l] += h;
+                    cpm[k] += h;
+                    cpm[l] -= h;
+                    cmp[k] -= h;
+                    cmp[l] += h;
+                    cmm[k] -= h;
+                    cmm[l] -= h;
+                    let fd_h = (moments_at(cpp)[n] - moments_at(cpm)[n] - moments_at(cmp)[n]
+                        + moments_at(cmm)[n])
+                        / (4.0 * h * h);
+                    assert!(
+                        (m_jets[n].h[k * p + l] - fd_h).abs() <= 1e-3 * fd_h.abs().max(1.0) + 1e-6,
+                        "d2M[{n}]/dc[{k}]dc[{l}] jet {:+.12e} != fd {:+.12e}",
+                        m_jets[n].h[k * p + l],
+                        fd_h
+                    );
+                }
+            }
+        }
     }
 }
