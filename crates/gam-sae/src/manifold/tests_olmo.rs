@@ -75,8 +75,7 @@ pub(crate) fn real_data_torus_seed_term(
 /// real fixture.
 #[test]
 pub(crate) fn olmo_real_curvature_anchor_is_positive_definite() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/data/olmo_mixedlayer_pca64_768.npy");
+    let path = olmo_fixture_path("olmo_mixedlayer_pca64_768.npy");
     let z = read_npy_f32_2d(&path);
     assert_eq!(z.dim(), (768, 64), "real OLMo fixture shape");
     // Small REAL slice (K=2 d=2 torus, 160 rows) so the per-row curvature-anchor
@@ -207,8 +206,7 @@ pub(crate) fn olmo_real_curvature_anchor_is_positive_definite() {
 ///     threshold (a genuinely degenerate fit is always caught).
 #[test]
 pub(crate) fn olmo_real_outer_fit_does_not_pin_at_collapse_sentinel() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/data/olmo_mixedlayer_pca64_768.npy");
+    let path = olmo_fixture_path("olmo_mixedlayer_pca64_768.npy");
     let z = read_npy_f32_2d(&path);
     assert_eq!(z.dim(), (768, 64), "real OLMo fixture shape");
     // This is a fast, SOLVE-FREE check of the arrival-floor logic on genuine
@@ -393,6 +391,26 @@ pub(crate) fn olmo_real_outer_fit_does_not_pin_at_collapse_sentinel() {
 
     // Guard the sentinel constant the fix exists to avoid pinning the loop at.
     assert_eq!(SAE_FIT_DATA_COLLAPSE_COST, 1.0e12);
+}
+
+/// Resolve a committed OLMo activation fixture (`tests/data/<name>`) regardless
+/// of where the test binary's `CARGO_MANIFEST_DIR` lands. The fixtures live at
+/// the WORKSPACE-ROOT `tests/data/`, but `CARGO_MANIFEST_DIR` for this crate is
+/// `crates/gam-sae`, so the crate-relative `tests/data/` does not exist —
+/// every fixture must be reached via the `../../tests/data/` workspace-root
+/// fallback. Some sites historically hard-coded only the crate-relative path
+/// (no fallback), so those tests panicked with a missing-file error on EVERY
+/// fresh checkout — a silent XFAIL the SPEC forbids. Route all fixture loads
+/// through this single resolver so the path can never desync again: it prefers
+/// the crate-relative location (if a tree ever stages fixtures there) and falls
+/// back to the workspace root.
+pub(crate) fn olmo_fixture_path(name: &str) -> std::path::PathBuf {
+    let mani = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let crate_rel = mani.join("tests/data").join(name);
+    if crate_rel.exists() {
+        return crate_rel;
+    }
+    mani.join("../../tests/data").join(name)
 }
 
 /// Read a 2-D float32 (`<f4`) C-contiguous `.npy` into an `Array2<f64>`.
@@ -588,11 +606,7 @@ pub(crate) fn fit_data_collapse_bar_is_data_derived_not_absolute_floor_1522() {
 /// the real OLMo l18 slice (256-chart torus) so multi-chart routing is exercised.
 #[test]
 pub(crate) fn fast_encode_matches_per_row_warm_start() {
-    let mani = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut path = mani.join("tests/data/olmo_l18_pca64_635.npy");
-    if !path.exists() {
-        path = mani.join("../../tests/data/olmo_l18_pca64_635.npy");
-    }
+    let path = olmo_fixture_path("olmo_l18_pca64_635.npy");
     let z = read_npy_f32_2d(&path);
     let n = z.nrows();
     let k = 1usize;
@@ -669,11 +683,7 @@ pub(crate) fn fast_encode_matches_per_row_warm_start() {
 /// OLMo l18 slice so multi-chart routing + real curvature are exercised.
 #[test]
 pub(crate) fn fast_reconstruct_matches_per_row_decode() {
-    let mani = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut path = mani.join("tests/data/olmo_l18_pca64_635.npy");
-    if !path.exists() {
-        path = mani.join("../../tests/data/olmo_l18_pca64_635.npy");
-    }
+    let path = olmo_fixture_path("olmo_l18_pca64_635.npy");
     let z = read_npy_f32_2d(&path);
     let n = z.nrows();
     let p = z.ncols();
@@ -867,11 +877,7 @@ fn fast_forward_is_accuracy_parity_with_certified() {
 /// correlated neighbour rows across train↔test — see the structure_harvest
 /// estimation/eval split rationale). Returns (z_train, z_test).
 pub(crate) fn olmo_l18_oos_split() -> (Array2<f64>, Array2<f64>) {
-    let mani = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut path = mani.join("tests/data/olmo_l18_pca64_635.npy");
-    if !path.exists() {
-        path = mani.join("../../tests/data/olmo_l18_pca64_635.npy");
-    }
+    let path = olmo_fixture_path("olmo_l18_pca64_635.npy");
     let z = read_npy_f32_2d(&path);
     let n = z.nrows();
     let n_tr = (n * 6) / 10;
