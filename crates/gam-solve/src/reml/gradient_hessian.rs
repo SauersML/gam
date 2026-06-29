@@ -6119,9 +6119,37 @@ impl<'a> RemlState<'a> {
             if outer_cap > 0 {
                 pirls_config.max_iterations = pirls_config.max_iterations.min(outer_cap);
             }
-            if pirls_config.max_iterations != original_cap {
+            // Seed-screening prepass: rank candidate ρ by a CHEAP partial fit,
+            // never a full PIRLS-to-production-tolerance solve. The iteration cap
+            // above bounds the unconstrained case, but it is deliberately NOT
+            // applied to the inequality-constrained active-set solve (#1380), and
+            // the screening cascade's uncapped final stage
+            // (`SEED_SCREENING_UNCAPPED`) lifts the cap entirely when every capped
+            // stage collapsed — both then run the inner solve all the way to the
+            // tight production inner tolerance just to score a starting basin,
+            // which at large `n` is the dominant #1033/#1575/#1082 prepass cost.
+            // Loosen the inner convergence tolerance to a coarse screening floor
+            // so the solve terminates as soon as the penalized-deviance proxy is
+            // resolved to ranking accuracy. The proxy stays ρ-comparable because
+            // EVERY candidate is judged at the identical coarse tolerance, exactly
+            // as it is judged at the identical iteration cap. Only ever loosens
+            // (`max`), never tightens, so a caller already running a coarser inner
+            // solve keeps it. The winning seed's real fit and every multistart
+            // full solve run with `in_screening == false`, so the converged
+            // optimum (and its bit-results) is byte-for-byte unchanged — this
+            // touches only which seed the descent starts from.
+            if in_screening {
+                pirls_config.convergence_tolerance = pirls_config
+                    .convergence_tolerance
+                    .max(SEED_SCREENING_INNER_CONVERGENCE_TOLERANCE);
+            }
+            if pirls_config.max_iterations != original_cap
+                || (in_screening
+                    && pirls_config.convergence_tolerance
+                        > self.config.pirls_convergence_tolerance)
+            {
                 log::debug!(
-                    "[PIRLS cap] inner_max_iterations={} (full={} screening={} outer={})",
+                    "[PIRLS cap] inner_max_iterations={} (full={} screening={} outer={}) inner_tol={:.1e} (full_tol={:.1e})",
                     pirls_config.max_iterations,
                     original_cap,
                     if screening_iteration_cap_applies {
@@ -6130,6 +6158,8 @@ impl<'a> RemlState<'a> {
                         -1
                     },
                     if outer_cap > 0 { outer_cap as i64 } else { -1 },
+                    pirls_config.convergence_tolerance,
+                    self.config.pirls_convergence_tolerance,
                 );
             }
             pirls_config.link_kind = self.runtime_inverse_link();
@@ -6778,6 +6808,21 @@ impl<'a> RemlState<'a> {
         }
     }
 }
+
+/// Coarse inner-PIRLS convergence tolerance used ONLY while the outer
+/// seed-screening prepass ranks candidate ρ (`in_screening == true`). The
+/// prepass needs a ρ-comparable penalized-deviance proxy, not a converged fit:
+/// a coarse `1e-3` inner solve resolves the basin ranking at a small fraction
+/// of the Newton iterations a tight production tolerance (`~1e-8`) demands,
+/// which is the dominant prepass cost at large `n` (#1033/#1575/#1082) on the
+/// two paths the screening iteration cap does NOT bound — the inequality-
+/// constrained active-set solve (#1380, cap deliberately disabled) and the
+/// cascade's uncapped final stage. It is applied with `max`, so it can only
+/// loosen a tighter production tolerance and never tightens a coarser one, and
+/// it is scoped to screening solves alone: the winning seed's real fit and
+/// every multistart full solve run with `in_screening == false`, so the
+/// converged REML/LAML optimum and its bit-results are unchanged.
+pub(crate) const SEED_SCREENING_INNER_CONVERGENCE_TOLERANCE: f64 = 1e-3;
 
 /// Default cap on |Δρ_k| beyond which the IFT linear predictor rejects.
 /// Δρ = log(λ_new / λ_old); 2.0 corresponds to a 7.4× change in λ along
