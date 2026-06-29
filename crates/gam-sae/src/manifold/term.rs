@@ -277,12 +277,27 @@ pub(crate) const SAE_SEPARATION_BARRIER_STRENGTH: f64 = 10.0;
 /// the barrier (and its PSD majorizer) at the exact-alignment limit `c_jk² = 1`.
 pub(crate) const SAE_SEPARATION_BARRIER_EPS: f64 = 1.0e-6;
 
-/// #1026/#1522 decoder-norm floor below which an atom is treated as inactive /
-/// shape-undefined for the SEPARATION barrier (its `U_k` is ill-conditioned). The
-/// AMPLITUDE barrier is what restores such an atom; the separation barrier simply
-/// abstains for the pair until the amplitude barrier has lifted the norm above
-/// this floor.
-pub(crate) const SAE_BARRIER_ACTIVE_NORM_FLOOR: f64 = 1.0e-6;
+/// #1026/#1522/#1610 RELATIVE decoder-norm floor below which an atom is treated
+/// as inactive / shape-undefined for the SEPARATION barrier (its `U_k` is
+/// ill-conditioned). The separation barrier abstains for a pair until the
+/// decoder norm is lifted above the floor.
+///
+/// #1610 — this is a RELATIVE fraction of the live dictionary's largest decoder
+/// energy (`max_k ‖B_k‖_F`), NOT an absolute magnitude. The previous absolute
+/// `1e-6` floor was NOT scale-invariant: the SAE decoders inherit the scale of
+/// the activations being modeled, so under a global rescaling of the corpus by a
+/// factor `s` every decoder norm scales by `s` while the absolute floor stayed
+/// fixed — on a corpus whose natural decoder scale is below `1e-6` the barrier
+/// spuriously abstained on EVERY pair (collapse prevention silently disabled),
+/// and on a corpus scaled far above it the floor was inert. Keying the floor to
+/// `max_k ‖B_k‖²_F` makes the abstain set scale-free: it depends only on the
+/// RATIO of an atom's energy to the dictionary's, so collapse prevention engages
+/// identically regardless of the corpus scale. At the canonical unit decoder
+/// scale (`max_k ‖B_k‖²_F ≈ 1`) it reduces to the historical `1e-6` floor.
+/// Consumed via [`super::penalties::barrier_norm_floor_sq`], the single source
+/// for both the barrier value and its gradient/curvature, so the line-search
+/// value never desyncs from the step.
+pub(crate) const SAE_BARRIER_ACTIVE_NORM_REL_FLOOR: f64 = 1.0e-6;
 
 /// Full SAE-manifold term.
 #[derive(Debug)]

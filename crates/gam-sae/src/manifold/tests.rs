@@ -2138,6 +2138,150 @@ pub(crate) fn separation_barrier_is_collapse_prevention_not_bandaid_1522() {
     );
 }
 
+/// #1610 — the separation-barrier collapse-threshold (the decoder-norm floor
+/// below which an atom is shape-undefined and the barrier abstains) must be
+/// DATA-DERIVED / scale-invariant, not an absolute magic constant.
+///
+/// Direct-helper arm: `barrier_norm_floor_sq` is exactly
+/// `SAE_BARRIER_ACTIVE_NORM_REL_FLOOR² · max_k ‖B_k‖²_F`, equivariant under a
+/// global rescaling of the decoders by `s²`, and reduces to the historical
+/// absolute `1e-6²` floor at unit decoder scale (`max ‖B_k‖²_F = 1`). The
+/// all-zero dictionary yields `0` (no live shape).
+#[test]
+fn barrier_norm_floor_is_data_derived_scale_invariant_1610() {
+    // max ‖B_k‖²_F = 4.0 ⇒ floor² = (1e-6)²·4 = 4e-12.
+    let norm_sq = [1.0_f64, 4.0, 0.25];
+    let floor = SaeManifoldTerm::barrier_norm_floor_sq(&norm_sq);
+    let rel = SAE_BARRIER_ACTIVE_NORM_REL_FLOOR;
+    assert!(
+        (floor - rel * rel * 4.0).abs() <= 1e-30,
+        "floor² must be rel²·max‖B_k‖²_F = {}, got {floor}",
+        rel * rel * 4.0
+    );
+    // At the canonical unit decoder scale this reduces to the historical 1e-6
+    // absolute floor (floor² = 1e-12), so existing unit-scale fits are unchanged.
+    let unit = SaeManifoldTerm::barrier_norm_floor_sq(&[1.0]);
+    assert!(
+        (unit - 1.0e-12).abs() <= 1e-27,
+        "at unit decoder scale the floor must equal the historical 1e-6² = 1e-12, got {unit}"
+    );
+    // Equivariance: scaling every ‖B_k‖²_F by s² scales the floor² by s².
+    for &s2 in &[1.0e-12_f64, 1.0e6, 9.0] {
+        let scaled: Vec<f64> = norm_sq.iter().map(|v| v * s2).collect();
+        let f_scaled = SaeManifoldTerm::barrier_norm_floor_sq(&scaled);
+        assert!(
+            (f_scaled - s2 * floor).abs() <= s2 * floor * 1e-9 + 1e-30,
+            "floor² must scale by s² under a global ‖B‖² rescaling: s²={s2}, \
+             expected {}, got {f_scaled}",
+            s2 * floor
+        );
+    }
+    // All-zero dictionary: no live atom to be a shape ⇒ floor 0 (the exactly-0
+    // self-norm check abstains every pair anyway).
+    assert_eq!(SaeManifoldTerm::barrier_norm_floor_sq(&[0.0, 0.0]), 0.0);
+}
+
+/// #1610 — END-TO-END scale invariance of collapse prevention: the separation
+/// barrier penalizes the SHAPE alignment `c²` weighted by the (normalized)
+/// coactivation `q`, both of which are scale-free, so the barrier VALUE is
+/// invariant under a global rescaling of the decoders. The OLD absolute
+/// `1e-6` norm floor broke this: a corpus whose natural decoder scale fell below
+/// the floor had its decoders classified as shape-undefined and collapse
+/// prevention was silently disabled (value → 0). With the data-derived relative
+/// floor the barrier engages identically at any decoder scale.
+#[test]
+fn separation_barrier_collapse_prevention_is_scale_invariant_1610() {
+    let coords0 = array![[0.05], [0.20], [0.55], [0.80], [0.35], [0.65]];
+    let coords1 = array![[0.15], [0.30], [0.65], [0.90], [0.45], [0.10]];
+    let (phi0, jet0) = periodic_basis(&coords0);
+    let (phi1, jet1) = periodic_basis(&coords1);
+    let logits = array![
+        [0.7, -0.2],
+        [0.1, 0.4],
+        [-0.3, 0.5],
+        [0.6, -0.1],
+        [0.2, 0.3],
+        [0.4, 0.1]
+    ];
+    let row_decoder = |r: [f64; 3]| {
+        let mut d = Array2::<f64>::zeros((3, 3));
+        d[[0, 0]] = r[0];
+        d[[0, 1]] = r[1];
+        d[[0, 2]] = r[2];
+        d
+    };
+    // Aligned (c² = 0.8), co-firing under softmax — the collapse-prone pair.
+    let dir0 = [1.0, 0.0, 0.0];
+    let dir1 = [0.894_427_191, 0.447_213_595, 0.0];
+    let build_at_scale = |s: f64| {
+        let scale_row = |r: [f64; 3]| [r[0] * s, r[1] * s, r[2] * s];
+        let make = |name: &str, phi: Array2<f64>, jet: Array3<f64>, decoder: Array2<f64>| {
+            SaeManifoldAtom::new(
+                name,
+                SaeAtomBasisKind::Periodic,
+                1,
+                phi,
+                jet,
+                decoder,
+                Array2::<f64>::eye(3),
+            )
+            .unwrap()
+            .with_basis_evaluator(Arc::new(TestPeriodicEvaluator))
+        };
+        let atom0 = make(
+            "p0",
+            phi0.clone(),
+            jet0.clone(),
+            row_decoder(scale_row(dir0)),
+        );
+        let atom1 = make(
+            "p1",
+            phi1.clone(),
+            jet1.clone(),
+            row_decoder(scale_row(dir1)),
+        );
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            logits.clone(),
+            vec![coords0.clone(), coords1.clone()],
+            vec![
+                LatentManifold::Circle { period: 1.0 },
+                LatentManifold::Circle { period: 1.0 },
+            ],
+            AssignmentMode::softmax(0.8),
+        )
+        .unwrap();
+        SaeManifoldTerm::new(vec![atom0, atom1], assignment).unwrap()
+    };
+
+    // Unit scale: the barrier engages and penalizes the aligned pair.
+    let value_unit = build_at_scale(1.0).separation_barrier_value(1.0);
+    assert!(
+        value_unit > 0.0,
+        "barrier must engage on the aligned, co-firing pair at unit scale, got {value_unit}"
+    );
+    // Tiny scale: decoder entries ~1e-7 ⇒ ‖B_k‖²_F ~1e-14 < the OLD absolute
+    // floor² (1e-12). Under the old absolute floor the barrier would have
+    // abstained (value 0 — collapse prevention disabled). The data-derived floor
+    // keeps it engaged with the SAME value (c² and q are scale-free).
+    let value_tiny = build_at_scale(1.0e-7).separation_barrier_value(1.0);
+    assert!(
+        value_tiny > 0.0,
+        "data-derived floor must keep collapse prevention ENGAGED at a tiny decoder \
+         scale where the old absolute 1e-6 floor disabled it, got {value_tiny}"
+    );
+    assert!(
+        (value_tiny - value_unit).abs() <= value_unit.abs() * 1e-9,
+        "the barrier value is scale-free (shape + coactivation only): unit={value_unit} \
+         must equal tiny-scale={value_tiny}"
+    );
+    // And a HUGE scale leaves it unchanged too (symmetry of the invariance).
+    let value_huge = build_at_scale(1.0e6).separation_barrier_value(1.0);
+    assert!(
+        (value_huge - value_unit).abs() <= value_unit.abs() * 1e-9,
+        "barrier value must be invariant at large decoder scale too: unit={value_unit} \
+         huge={value_huge}"
+    );
+}
 
 /// #976 distinct-basin lever: the co-collapse multi-start reseed must read a
 /// DIFFERENT principal subspace on each retry. The PC-pair rotation offset (=

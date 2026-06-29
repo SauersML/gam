@@ -343,6 +343,28 @@ impl SaeManifoldTerm {
         pairs
     }
 
+    /// #1610 — data-derived (scale-invariant) decoder-norm-squared floor below
+    /// which an atom is shape-undefined for the separation barrier. The floor is
+    /// `SAE_BARRIER_ACTIVE_NORM_REL_FLOOR² · max_k ‖B_k‖²_F`, a fixed fraction of
+    /// the live dictionary's largest decoder energy, so under a global rescaling
+    /// of the corpus (hence the decoders) by `s²` both an atom's `‖B_k‖²_F` and
+    /// this floor scale by `s²` and the abstain set is unchanged — unlike the old
+    /// absolute `1e-6²` floor, which silently disabled collapse prevention on a
+    /// corpus whose natural decoder scale fell below it. `norm_sq[k] = ‖B_k‖²_F`.
+    /// Returns 0 when the whole dictionary is ~0 (no live atom to be a shape for,
+    /// so every pair abstains via the exactly-`0` self-norm check either way).
+    /// Both [`Self::separation_barrier_value`] and
+    /// [`Self::add_sae_separation_barrier`] source the floor here so value and
+    /// gradient/curvature use the identical abstain set across the line search.
+    pub(crate) fn barrier_norm_floor_sq(norm_sq: &[f64]) -> f64 {
+        let max_norm_sq = norm_sq.iter().copied().fold(0.0_f64, f64::max);
+        if !(max_norm_sq > 0.0) {
+            return 0.0;
+        }
+        let rel = SAE_BARRIER_ACTIVE_NORM_REL_FLOOR;
+        rel * rel * max_norm_sq
+    }
+
     /// #1026/#1522 SEPARATION barrier value
     /// `P_sep = -μ_C · Σ_{j<k} q_jk · log(1 - c_jk² + ε)` on the normalized
     /// shapes. Diverges as two coactive atoms align (`c_jk² → 1`); exactly 0 when
@@ -357,12 +379,12 @@ impl SaeManifoldTerm {
             return 0.0;
         }
         let eps = SAE_SEPARATION_BARRIER_EPS;
-        let floor2 = SAE_BARRIER_ACTIVE_NORM_FLOOR * SAE_BARRIER_ACTIVE_NORM_FLOOR;
         let norm_sq: Vec<f64> = self
             .atoms
             .iter()
             .map(|atom| atom.decoder_coefficients.iter().map(|v| v * v).sum::<f64>())
             .collect();
+        let floor2 = Self::barrier_norm_floor_sq(&norm_sq);
         let mut acc = 0.0_f64;
         for (j, k, qjk) in self.barrier_coactive_pairs() {
             if norm_sq[j] <= floor2 || norm_sq[k] <= floor2 {
@@ -426,7 +448,6 @@ impl SaeManifoldTerm {
             return false;
         }
         let eps = SAE_SEPARATION_BARRIER_EPS;
-        let floor2 = SAE_BARRIER_ACTIVE_NORM_FLOOR * SAE_BARRIER_ACTIVE_NORM_FLOOR;
         let p = self.output_dim();
         let offsets = self.beta_offsets();
         let norm_sq: Vec<f64> = self
@@ -434,6 +455,7 @@ impl SaeManifoldTerm {
             .iter()
             .map(|atom| atom.decoder_coefficients.iter().map(|v| v * v).sum::<f64>())
             .collect();
+        let floor2 = Self::barrier_norm_floor_sq(&norm_sq);
         let mut wrote = false;
         for (j, k, qjk) in self.barrier_coactive_pairs() {
             if norm_sq[j] <= floor2 || norm_sq[k] <= floor2 {
