@@ -7760,20 +7760,47 @@ pub(crate) fn diagonal_latent_cache(diagonal: &[f64]) -> ArrowFactorCache {
 pub(crate) fn outer_gradient_solver_rejects_near_singular_cache_without_matching_gauge() {
     let cache = near_singular_outer_gradient_cache();
     let obj = warmstart_test_objective();
+
+    // The raw conditioning gate is what names the ill-conditioned joint Hessian
+    // and reports the pivot ratio + floor. Pin that message HERE, at its source
+    // (`outer_gradient_conditioning_error`), so the diagnostic stays covered even
+    // though the solver below now re-classifies the gauge-degenerate case.
+    let conditioning_err = match SaeManifoldTerm::outer_gradient_conditioning_error(&cache) {
+        Err(err) => err.to_string(),
+        Ok(()) => panic!("near-singular cache must trip the pivot-ratio conditioning gate"),
+    };
+    assert!(
+        conditioning_err.contains("joint Hessian numerically singular"),
+        "conditioning gate must name the ill-conditioned joint Hessian; got: {conditioning_err}"
+    );
+    assert!(
+        conditioning_err.contains("min/max pivot ratio") && conditioning_err.contains("floor"),
+        "conditioning gate must report the pivot ratio and floor; got: {conditioning_err}"
+    );
+
+    // #1436 (commit 21c49d14b): when the conditioning gate fires but NO chart
+    // gauge / decoder-β-null / decoder-channel-null candidate can be recovered to
+    // deflate the flat subspace, the flatness is genuinely OUTSIDE the gauge orbit
+    // — a distinct, more specific diagnosis the solver surfaces as
+    // `OuterGradientError::NonIdentifiable` (rather than echoing the raw
+    // pivot-ratio `IllConditioned` trip). Both classes are FD-eligible, so the
+    // recovery behaviour is unchanged; only the diagnostic is sharper. This is the
+    // exact "without a matching gauge" path the test name describes.
     let err = match obj
         .term
         .outer_gradient_arrow_solver(&cache, &obj.current_rho.lambda_smooth_vec())
     {
-        Err(err) => err.to_string(),
+        Err(err) => err,
         Ok(..) => panic!("near-singular evidence factor without a matching gauge must reject"),
     };
     assert!(
-        err.contains("joint Hessian numerically singular"),
-        "guard error must name the ill-conditioned joint Hessian; got: {err}"
+        matches!(err, OuterGradientError::NonIdentifiable { .. }),
+        "no-deflatable-direction rejection must be the NonIdentifiable diagnosis; got: {err}"
     );
+    let err = err.to_string();
     assert!(
-        err.contains("min/max pivot ratio") && err.contains("floor"),
-        "guard error must report the pivot ratio and floor; got: {err}"
+        err.contains("no deflatable gauge/decoder-null direction"),
+        "guard error must name the absent deflation candidate; got: {err}"
     );
 }
 
