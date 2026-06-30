@@ -232,3 +232,4 @@ pub(crate) fn learnable_ibp_alpha_logdet_trace_matches_dense_fd_1417() {
          {data_trace:.3e}"
     );
 }
+
