@@ -1,6 +1,6 @@
 [package]
 name = "gam-data"
-version = "0.3.135"
+version = "0.3.136"
 edition = "2024"
 rust-version = "1.93"
 description = "Data ingestion and encoding foundation crate for the gam penalized-likelihood engine"
