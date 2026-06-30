@@ -1734,12 +1734,112 @@ pub fn fit_penalized_multinomial_formula(
     // now carries one λ per smooth term, so a single λ per class would discard
     // the independent per-term selection that fixes #561. `lambdas_per_block`
     // segments the flat vector by class so callers can recover per-term λ.
-    let lambdas_per_block: Vec<usize> = fit.blocks.iter().map(|b| b.lambdas.len()).collect();
-    let lambdas_flat: Vec<f64> = fit
-        .blocks
-        .iter()
-        .flat_map(|b| b.lambdas.iter().copied())
-        .collect();
+    // ── gam#1587/#561 joint-penalty reconstruction ───────────────────────────
+    // Under the #1587 centered-metric architecture every active class block
+    // leaves its per-block penalty list EMPTY — the entire fit's smoothing rides
+    // on a single full-width JOINT penalty `S_λ = Σ_t λ_t (M ⊗ S_t)` whose one
+    // shared `λ_t` per smooth component is selected by the outer REML loop and
+    // surfaced on `fit.artifacts.joint_log_lambdas`. So `fit.blocks[a].lambdas`
+    // is `[]`, the inference layer's per-block trace channel is empty, and the
+    // older per-block reporting (`lambdas_per_block = [0, 0]`, `edf_per_class =
+    // None`, …) collapsed (#561 reopen).
+    //
+    // Reconstruct the per-(class, component) λ and the influence-matrix EDF
+    // directly from the selected joint `λ_t` and the COUPLED penalty
+    // `S_λ = Σ_t λ_t (M ⊗ S_t)` (NOT a block-diagonal `Σ_t λ_{a,t} S_t`: the
+    // centered metric `M` couples classes off the block diagonal, so a
+    // block-diagonal `S_λ` would mis-state both the influence matrix and every
+    // trace). With `H⁻¹ = fit.covariance_conditional` now assembled WITH the
+    // joint penalty (the `compute_joint_covariance` fix), the influence matrix is
+    // exactly `F = I − H⁻¹ S_λ`, its per-class diagonal-block trace is the honest
+    // per-class EDF, and `Σ_a edf_a = tr(F) = edf_total`.
+    let joint_recon = fit.artifacts.joint_log_lambdas.as_ref().and_then(|jll| {
+        let n_components = penalties_arc.len();
+        if jll.len() != n_components || n_components == 0 {
+            return None;
+        }
+        let expected_joint = p_per_class.saturating_mul(m);
+        let hinv = fit
+            .covariance_conditional
+            .as_ref()
+            .filter(|c| c.nrows() == expected_joint && c.ncols() == expected_joint)?;
+        // The coupled joint penalty components `M ⊗ S_t` at the selected `λ_t`,
+        // in raw stacked (class-major) coordinates — exactly the operator the
+        // inner solve and the now-fixed covariance path penalize with.
+        let joint_specs = family.centered_joint_penalty_specs();
+        if joint_specs.len() != n_components {
+            return None;
+        }
+        let lam: Vec<f64> = jll.iter().map(|&l| l.exp()).collect();
+        // Per-component `H⁻¹ (M ⊗ S_t)` (full mp×mp), reused for both the joint
+        // influence matrix and the per-(class, component) trace decomposition.
+        let mut hinv_st: Vec<Array2<f64>> = Vec::with_capacity(n_components);
+        for spec in &joint_specs {
+            if spec.matrix.nrows() != expected_joint || spec.matrix.ncols() != expected_joint {
+                return None;
+            }
+            hinv_st.push(hinv.dot(&spec.matrix));
+        }
+        // F = I − H⁻¹ S_λ = I − Σ_t λ_t H⁻¹ (M ⊗ S_t).
+        let mut f = Array2::<f64>::eye(expected_joint);
+        for (t, hs) in hinv_st.iter().enumerate() {
+            f.scaled_add(-lam[t], hs);
+        }
+        // Per-class diagonal-block trace of F (the honest per-class EDF), and the
+        // per-(class, component) penalty trace `tr_{a,t} = λ_t · Σ_{i∈class a}
+        // (H⁻¹ (M⊗S_t))[i,i]` for the per-penalty EDF rollup.
+        let mut edf_per_class = Vec::with_capacity(m);
+        // class-major per-penalty EDF (class 0's components, then class 1's, …),
+        // aligned 1:1 with the flat per-component λ replicated per class.
+        let mut edf_per_penalty = Vec::with_capacity(m * n_components);
+        for a in 0..m {
+            let base = a * p_per_class;
+            let mut class_trace = 0.0_f64;
+            for t in 0..n_components {
+                let mut tr_at = 0.0_f64;
+                for i in 0..p_per_class {
+                    tr_at += hinv_st[t][[base + i, base + i]];
+                }
+                tr_at *= lam[t];
+                class_trace += tr_at;
+                // A single component's per-class trace EDF `rank(S_t) − tr_{a,t}`,
+                // bounded by its local rank (≤ p_per_class).
+                let ns_t = nullspace_dims_arc.get(t).copied().unwrap_or(0);
+                let rank_t = (p_per_class as f64 - ns_t as f64).max(0.0);
+                edf_per_penalty.push((rank_t - tr_at).clamp(0.0, p_per_class as f64));
+            }
+            edf_per_class
+                .push((p_per_class as f64 - class_trace).clamp(0.0, p_per_class as f64));
+        }
+        Some((f, edf_per_class, edf_per_penalty, n_components, lam))
+    });
+
+    // Flatten every (class, component) smoothing parameter in class-major order.
+    // Under the joint-penalty architecture each active class carries the SAME
+    // per-component λ set (the centered metric ties `λ_t` across classes for
+    // reference-class invariance), so the flat vector is the selected `λ_t`
+    // replicated `K-1` times and `lambdas_per_block = [n_components; K-1]`. When
+    // the joint reconstruction is unavailable (legacy fixed-λ path or absent
+    // covariance) fall back to the raw — now empty — per-block λ lists.
+    let (lambdas_per_block, lambdas_flat): (Vec<usize>, Vec<f64>) = match joint_recon.as_ref() {
+        Some((_, _, _, n_components, lam)) => {
+            let per_block = vec![*n_components; m];
+            let mut flat = Vec::with_capacity(m * n_components);
+            for _ in 0..m {
+                flat.extend(lam.iter().copied());
+            }
+            (per_block, flat)
+        }
+        None => {
+            let per_block: Vec<usize> = fit.blocks.iter().map(|b| b.lambdas.len()).collect();
+            let flat: Vec<f64> = fit
+                .blocks
+                .iter()
+                .flat_map(|b| b.lambdas.iter().copied())
+                .collect();
+            (per_block, flat)
+        }
+    };
     // Per-active-class effective degrees of freedom, length `K-1`, summing to
     // the model `edf_total`. The REML inference block reports `edf_by_block` as
     // ONE entry per *penalty block* (per (class, term, penalty)), each computed
@@ -1761,25 +1861,29 @@ pub fn fit_penalized_multinomial_formula(
     // segmentation `lambdas_flat` uses). Fall back to `None` when the trace
     // channel is unavailable or mis-shaped (legacy fixed-λ path), exactly as the
     // raw `edf_by_block` map did before.
-    let edf_per_class = fit.inference.as_ref().and_then(|info| {
-        let traces = &info.penalty_block_trace;
-        if traces.len() != lambdas_per_block.iter().sum::<usize>() {
-            // Trace channel absent or not aligned with the per-class block
-            // segmentation — cannot assemble an honest per-class EDF.
-            return None;
-        }
-        let mut per_class = Vec::with_capacity(m);
-        let mut cursor = 0usize;
-        for &n_blocks in &lambdas_per_block {
-            let class_trace: f64 = traces[cursor..cursor + n_blocks].iter().sum();
-            // `tr(F)` over a class block ∈ [0, p_per_class]; clamp away
-            // round-off so a reported EDF can never be negative or exceed the
-            // class's own coefficient count.
-            per_class.push((p_per_class as f64 - class_trace).clamp(0.0, p_per_class as f64));
-            cursor += n_blocks;
-        }
-        Some(per_class)
-    });
+    let edf_per_class = joint_recon
+        .as_ref()
+        .map(|(_, epc, _, _, _)| epc.clone())
+        .or_else(|| {
+            // Legacy per-block trace path (fixed-λ / pre-#1587 fits whose
+            // smoothing is still carried per block). Segment the block-major
+            // `penalty_block_trace` by `lambdas_per_block`, exactly as before.
+            fit.inference.as_ref().and_then(|info| {
+                let traces = &info.penalty_block_trace;
+                if traces.len() != lambdas_per_block.iter().sum::<usize>() {
+                    return None;
+                }
+                let mut per_class = Vec::with_capacity(m);
+                let mut cursor = 0usize;
+                for &n_blocks in &lambdas_per_block {
+                    let class_trace: f64 = traces[cursor..cursor + n_blocks].iter().sum();
+                    per_class
+                        .push((p_per_class as f64 - class_trace).clamp(0.0, p_per_class as f64));
+                    cursor += n_blocks;
+                }
+                Some(per_class)
+            })
+        });
     // Per-PENALTY EDF: the inference layer's `edf_by_block` is already the
     // clamped per-penalty-block trace EDF `rank(S_k) − λ_k·tr(H⁻¹ S_k)`, one
     // entry per smoothing parameter and block-major aligned 1:1 with the flat
@@ -1789,17 +1893,25 @@ pub fn fit_penalized_multinomial_formula(
     // total: with double-penalty smooths `Σ_k rank(S_k) > p_per_class`, so the
     // entries deliberately need not sum to the model EDF (the per-class field
     // carries that contract instead).
-    let edf_per_penalty = fit.inference.as_ref().and_then(|info| {
-        if info.edf_by_block.len() != lambdas_flat.len() {
-            return None;
-        }
-        Some(
-            info.edf_by_block
-                .iter()
-                .map(|&e| e.max(0.0))
-                .collect::<Vec<f64>>(),
-        )
-    });
+    let edf_per_penalty = joint_recon
+        .as_ref()
+        .map(|(_, _, epp, _, _)| epp.clone())
+        .or_else(|| {
+            // Legacy per-block path: the inference layer's `edf_by_block` is
+            // already the clamped per-penalty-block trace EDF, aligned 1:1 with
+            // the flat `lambdas`.
+            fit.inference.as_ref().and_then(|info| {
+                if info.edf_by_block.len() != lambdas_flat.len() {
+                    return None;
+                }
+                Some(
+                    info.edf_by_block
+                        .iter()
+                        .map(|&e| e.max(0.0))
+                        .collect::<Vec<f64>>(),
+                )
+            })
+        });
     let coefficients_flat: Vec<f64> = coefficients_active.iter().copied().collect();
 
     // #1101: surface the joint Laplace posterior covariance `H⁻¹` (block-ordered
@@ -1862,46 +1974,52 @@ pub fn fit_penalized_multinomial_formula(
     // The influence matrix `F = H⁻¹ X'WX = H⁻¹(H − S_λ) = I − H⁻¹ S_λ`. The
     // exact-Newton multinomial blocks carry no IRLS pseudo-data, so the generic
     // inference path does not export `coefficient_influence`; reconstruct it
-    // exactly here from the joint covariance `H⁻¹` (above) and the REML-selected
-    // per-(class, term) `λ` scaling the shared penalties. Block-diagonal `S_λ`:
-    // class `a`'s block is `Σ_t λ_{a,t} · S_t`, embedded at `a·P .. (a+1)·P`.
-    let coefficient_influence_flat = fit
-        .covariance_conditional
-        .as_ref()
-        .filter(|c| c.nrows() == expected_joint && c.ncols() == expected_joint)
-        .and_then(|hinv| {
-            if fit.blocks.len() != m {
-                return None;
-            }
-            // Joint S_λ (block-diagonal across active classes).
-            let mut s_lambda = Array2::<f64>::zeros((expected_joint, expected_joint));
-            for (a, block) in fit.blocks.iter().enumerate() {
-                if block.lambdas.len() != penalties_arc.len() {
+    // exactly here. Under the #1587 joint-penalty architecture the penalty is the
+    // COUPLED centered metric `S_λ = Σ_t λ_t (M ⊗ S_t)` (off the class-block
+    // diagonal), already assembled in `joint_recon` above, so reuse that exact
+    // `F`. Only fall back to the legacy block-diagonal `Σ_t λ_{a,t} S_t`
+    // reconstruction when the joint reconstruction is unavailable (pre-#1587
+    // per-block fits whose class blocks still carry their own penalties).
+    let coefficient_influence_flat = match joint_recon.as_ref() {
+        Some((f, _, _, _, _)) => Some(f.iter().copied().collect::<Vec<f64>>()),
+        None => fit
+            .covariance_conditional
+            .as_ref()
+            .filter(|c| c.nrows() == expected_joint && c.ncols() == expected_joint)
+            .and_then(|hinv| {
+                if fit.blocks.len() != m {
                     return None;
                 }
-                let base = a * p_per_class;
-                for (t, pen) in penalties_arc.iter().enumerate() {
-                    let lam = block.lambdas[t];
-                    if lam == 0.0 {
-                        continue;
-                    }
-                    let dense = pen.to_dense();
-                    if dense.nrows() != p_per_class || dense.ncols() != p_per_class {
+                // Joint S_λ (block-diagonal across active classes).
+                let mut s_lambda = Array2::<f64>::zeros((expected_joint, expected_joint));
+                for (a, block) in fit.blocks.iter().enumerate() {
+                    if block.lambdas.len() != penalties_arc.len() {
                         return None;
                     }
-                    for i in 0..p_per_class {
-                        for j in 0..p_per_class {
-                            s_lambda[[base + i, base + j]] += lam * dense[[i, j]];
+                    let base = a * p_per_class;
+                    for (t, pen) in penalties_arc.iter().enumerate() {
+                        let lam = block.lambdas[t];
+                        if lam == 0.0 {
+                            continue;
+                        }
+                        let dense = pen.to_dense();
+                        if dense.nrows() != p_per_class || dense.ncols() != p_per_class {
+                            return None;
+                        }
+                        for i in 0..p_per_class {
+                            for j in 0..p_per_class {
+                                s_lambda[[base + i, base + j]] += lam * dense[[i, j]];
+                            }
                         }
                     }
                 }
-            }
-            // F = I − H⁻¹ S_λ.
-            let hinv_s = hinv.dot(&s_lambda);
-            let mut f = Array2::<f64>::eye(expected_joint);
-            f -= &hinv_s;
-            Some(f.iter().copied().collect::<Vec<f64>>())
-        });
+                // F = I − H⁻¹ S_λ.
+                let hinv_s = hinv.dot(&s_lambda);
+                let mut f = Array2::<f64>::eye(expected_joint);
+                f -= &hinv_s;
+                Some(f.iter().copied().collect::<Vec<f64>>())
+            }),
+    };
 
     // Per-(smooth term) coefficient span within a single class block, deduped by
     // col_range (the #561 double-penalty migration emits two penalty blocks per

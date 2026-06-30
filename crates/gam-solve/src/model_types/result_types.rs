@@ -834,6 +834,16 @@ pub struct FitArtifacts {
     /// re-derivable, so it is not serialized.
     #[serde(default, skip_serializing, skip_deserializing)]
     pub rho_covariance: Option<Array2<f64>>,
+    /// Selected per-component log-smoothing parameters of the full-width JOINT
+    /// penalty (gam#1587/#561). Families whose smoothing is carried by a joint
+    /// penalty (the multinomial centered `Σ_t λ_t (M ⊗ S_t)` metric) leave their
+    /// per-block penalty lists — and hence [`UnifiedFitResult::lambdas`] — empty,
+    /// so the only place the converged `ρ_t` survives is here. `None` for every
+    /// per-block-only family. Re-derivable from a refit, so not serialized; it is
+    /// consumed by the multinomial reporting path to reconstruct per-(class,term)
+    /// λ, per-class EDF, and the influence matrix `F = I − H⁻¹ S_λ`.
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub joint_log_lambdas: Option<Array1<f64>>,
 }
 
 impl std::fmt::Debug for FitArtifacts {
@@ -859,6 +869,10 @@ impl std::fmt::Debug for FitArtifacts {
             .field(
                 "rho_covariance",
                 &self.rho_covariance.as_ref().map(|m| m.dim()),
+            )
+            .field(
+                "joint_log_lambdas",
+                &self.joint_log_lambdas.as_ref().map(|v| v.len()),
             )
             .finish()
     }

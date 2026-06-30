@@ -189,6 +189,12 @@ pub struct BlockwiseFitResultParts {
     /// where `penalty_trace[k] = λ_k·tr(H⁻¹S_k)` feeds the per-term EDF
     /// decomposition `|coeff_range| − Σ tr_k` (issue #1219).
     pub precomputed_edf: Option<(f64, Vec<f64>, Vec<f64>, Vec<f64>)>,
+    /// Selected per-component log-smoothing parameters of the full-width JOINT
+    /// penalty at ρ* (gam#1587/#561). Surfaced on `FitArtifacts.joint_log_lambdas`
+    /// so a joint-penalized family (the multinomial centered metric) can recover
+    /// its converged smoothing — the per-block `lambdas` are empty for it. `None`
+    /// for every per-block-only family.
+    pub joint_log_lambdas: Option<Array1<f64>>,
 }
 
 pub(crate) fn validate_parameter_block_state_finiteness(
@@ -437,6 +443,7 @@ pub fn blockwise_fit_from_parts(
         outer_converged,
         geometry,
         precomputed_edf,
+        joint_log_lambdas,
     } = parts;
 
     if block_states.is_empty() {
@@ -687,6 +694,7 @@ pub fn blockwise_fit_from_parts(
         artifacts: gam_solve::model_types::FitArtifacts {
             pirls: None,
             criterion_certificate,
+            joint_log_lambdas,
             ..Default::default()
         },
         inner_cycles,

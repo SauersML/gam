@@ -1071,6 +1071,21 @@ pub(crate) fn compute_joint_covariance<F: CustomFamily + Clone + Send + Sync + '
         h.slice_mut(ndarray::s![start..end, start..end])
             .scaled_add(1.0, &s_lambda);
     }
+    // gam#1587/#561: families whose smoothing is carried by a full-width JOINT
+    // penalty (the multinomial centered `Σ_t λ_t (M ⊗ S_t)` metric) leave their
+    // per-block penalty lists empty — every block above contributes nothing — so
+    // the exported posterior precision MUST also add the joint contribution
+    // `Σ_t exp(ρ_t) S_t` at the SAME selected `ρ_t` the inner solve used. Without
+    // this the reported covariance is the UNPENALIZED `H_lik⁻¹` (standard errors
+    // silently too wide) and the EDF trace `tr(H⁻¹ S_λ)` reads zero (no smoothing
+    // spent), even though `fit_custom_family` threads the joint bundle through
+    // `options` for exactly this reason. A no-op for every per-block-only family
+    // (`joint_penalties` is `None`).
+    if let Some(bundle) = options.joint_penalties.as_deref()
+        && !bundle.is_empty()
+    {
+        bundle.add_to_matrix(&mut h);
+    }
     symmetrize_dense_in_place(&mut h);
     if use_exact_newton_strict_spd(family) {
         // #748: the strict posterior precision is `H + S_λ` AT THE CONVERGED
@@ -1136,6 +1151,7 @@ pub(crate) fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'st
     specs: &[ParameterBlockSpec],
     states: &[ParameterBlockState],
     per_block_log_lambdas: &[Array1<f64>],
+    options: &BlockwiseFitOptions,
 ) -> Result<Option<FitGeometry>, String> {
     if specs.len() != per_block_log_lambdas.len() {
         return Ok(None);
@@ -1194,6 +1210,18 @@ pub(crate) fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'st
         for (k, s) in spec.penalties.iter().enumerate() {
             let s_dense = s.as_dense_cow();
             h.scaled_add(lambdas[k], &*s_dense);
+        }
+        // gam#1587/#561: add the full-width JOINT penalty (the multinomial
+        // centered `Σ_t λ_t (M ⊗ S_t)`) at the selected `ρ_t` so the exported
+        // geometry's penalized Hessian matches the inner-converged operator and
+        // the trace EDF `tr(H⁻¹ S_λ)` is non-zero. No-op for per-block-only
+        // families. (Single-block joint penalties are unusual but handled for
+        // symmetry with the multi-block branch.)
+        if let Some(bundle) = options.joint_penalties.as_deref()
+            && !bundle.is_empty()
+            && h.nrows() == bundle.specs.first().map(|s| s.dim()).unwrap_or(h.nrows())
+        {
+            bundle.add_to_matrix(&mut h);
         }
         // Exact-Newton families may return a Hessian assembled from directional
         // callbacks whose off-diagonal entries differ by floating-point order
@@ -1256,6 +1284,17 @@ pub(crate) fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'st
                 return Ok(None);
             }
         }
+    }
+    // gam#1587/#561: add the full-width JOINT penalty `Σ_t exp(ρ_t) S_t` at the
+    // selected `ρ_t`. The multinomial centered metric carries ALL of a fit's
+    // smoothing here (its per-block penalty lists are empty), so without this the
+    // exported geometry is the unpenalized likelihood Hessian and the trace EDF
+    // reads as the full coefficient count (no smoothing spent). No-op for the
+    // per-block-only families (`joint_penalties` is `None`).
+    if let Some(bundle) = options.joint_penalties.as_deref()
+        && !bundle.is_empty()
+    {
+        bundle.add_to_matrix(&mut h);
     }
     let working_len = states.first().map(|state| state.eta.len()).unwrap_or(0);
     Ok(Some(FitGeometry {
