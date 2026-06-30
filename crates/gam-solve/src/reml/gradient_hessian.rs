@@ -1386,7 +1386,25 @@ impl<'a> RemlState<'a> {
         // O(n·r²) reduced-Gram), which dominate the Firth outer-Hessian cost
         // for binomial/logit REML (#1575). This is exact: direction_from_deta
         // is a pure function of (op, eta_i[idx]).
+        //
+        // The k builds are independent and each pays two O(n·r²) reduced-Gram
+        // GEMMs (`reducedweighted_gram` + `reduced_diag_gram`), so — as with the
+        // h_i / h_ij loops below — fan them across the Rayon pool when there is
+        // more than one direction AND more than one thread, with the
+        // `with_nested_parallel` guard pinning each build's faer GEMMs to
+        // `Par::Seq` (no rayon×faer oversubscription). Index-ordered collection
+        // keeps the Vec identical to the serial build; at fixture scale the
+        // inner GEMMs are already `Par::Seq`, so the bits are unchanged (#1575).
         let firth_dir_i: Vec<super::FirthDirection> = match firth_op {
+            Some(op) if k > 1 && rayon::current_num_threads() > 1 => {
+                use rayon::prelude::*;
+                eta_i
+                    .par_iter()
+                    .map(|e| {
+                        gam_problem::with_nested_parallel(|| op.direction_from_deta(e.clone()))
+                    })
+                    .collect()
+            }
             Some(op) => eta_i
                 .iter()
                 .map(|e| op.direction_from_deta(e.clone()))
