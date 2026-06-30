@@ -1133,7 +1133,10 @@ fn parse_period_origins(
 
 /// Parse a per-axis periodic flag list for tensor smooths. Accepts three forms:
 /// - `periodic=true` / `periodic=false` (scalar applied to every axis),
-/// - `periodic=[true, false, ...]` (one flag per axis, length `dim`), and
+/// - `periodic=[true, false, ...]` (one flag per axis, length `dim`),
+/// - `periodic=c(1, 1)` / `c(0, 0)` (a length-`dim` 0/1 mask, mgcv's
+///   per-margin spelling — distinguished from an axis-index list by the
+///   repeated 0/1 value), and
 /// - `periodic=[0, 2, ...]` (axis indices that are periodic; others are not).
 ///
 /// `boundary=[..., "periodic"/"cyclic"/"cc", ...]` may also flip individual
@@ -1161,7 +1164,25 @@ fn parse_tensor_periodic_axes(
                             "true" | "yes" | "y" | "false" | "no" | "n" | "none"
                         )
                     });
-                if all_bool {
+                // mgcv writes per-margin flag vectors as `periodic=c(1,1)` /
+                // `periodic=c(0,0)` — a length-`dim` mask where each entry is a
+                // 0/1 flag for THAT margin, not an axis index. A bare axis-index
+                // list (`periodic=[0,1]`, `periodic=[0]`) lists DISTINCT margin
+                // indices to turn on. The two collide only when the list is all
+                // 0/1 of length `dim`; disambiguate by the repeated-value
+                // signature `c(1,1)`/`c(0,0)` (a valid axis-index set never
+                // repeats an index), which is the canonical mask spelling. This
+                // is what makes the leading tensor margin honor its periodic flag
+                // (#1751: `periodic=c(1,1)` previously parsed `1,1` as axis
+                // indices, marking only axis 1 and dropping axis 0).
+                let all_zero_one = !entries.is_empty()
+                    && entries.iter().all(|v| v == "0" || v == "1");
+                let has_repeat = {
+                    let mut seen = std::collections::BTreeSet::new();
+                    !entries.iter().all(|v| seen.insert(v.clone()))
+                };
+                let numeric_mask = all_zero_one && entries.len() == dim && has_repeat;
+                if all_bool || numeric_mask {
                     if entries.len() != dim {
                         return Err(format!(
                             "periodic list length {} must match smooth dimension {}",
@@ -1170,7 +1191,7 @@ fn parse_tensor_periodic_axes(
                         ));
                     }
                     for (i, v) in entries.iter().enumerate() {
-                        axes[i] = matches!(v.as_str(), "true" | "yes" | "y");
+                        axes[i] = matches!(v.as_str(), "true" | "yes" | "y" | "1");
                     }
                 } else {
                     for axis_raw in entries {
@@ -1193,6 +1214,28 @@ fn parse_tensor_periodic_axes(
         if boundary.len() == dim {
             for (axis, value) in boundary.iter().enumerate() {
                 if matches!(value.as_str(), "periodic" | "cyclic" | "cc") {
+                    axes[axis] = true;
+                }
+            }
+        }
+    }
+    // A per-margin basis vector (`bs=c('cc','ps')` / `type=[...]`) declares each
+    // margin's basis family, and a cyclic family (`cc`/`cp`/`cyclic`) makes THAT
+    // margin periodic — exactly as the 1-D `s(x, bs='cc')` smooth wraps its lone
+    // axis. Without this, the per-margin `cc` token was validated but discarded:
+    // every `bs=c(...)` spelling collapsed to the same open B-spline tensor
+    // (#1752). Only honor the vector form here; a scalar `bs='cc'` on a tensor is
+    // ambiguous about which margins wrap, so it does not flip any axis on.
+    if let Some(raw) = options.get("bs").or_else(|| options.get("type"))
+        && bs_selector_is_vector(raw)
+    {
+        let per_margin = parse_option_list(raw);
+        if per_margin.len() == dim {
+            for (axis, margin_bs) in per_margin.iter().enumerate() {
+                if matches!(
+                    canonicalize_smooth_type(margin_bs),
+                    "cc" | "cp" | "cyclic"
+                ) {
                     axes[axis] = true;
                 }
             }
@@ -3072,13 +3115,36 @@ pub fn build_smooth_basis(
                 }
                 let effective_degree = degree.min(k_axis - 1).max(1);
                 let effective_penalty_order = penalty_order.min(effective_degree);
+                // A `cc`/`cp`/`cyclic` per-margin basis declares periodicity
+                // without necessarily supplying a `period=`: mgcv's `bs="cc"`
+                // wraps at the covariate's observed data range. Mirror the 1-D
+                // cyclic fallback (`parse_periodic_domain_1d`) here so a bare
+                // `te(x, z, bs=c('cc','cc'))` wraps each margin on its own
+                // [min, max] span instead of hard-erroring (#1752).
+                let margin_is_cc = matches!(
+                    canonicalize_smooth_type(per_axis_bs[axis].as_deref().unwrap_or("")),
+                    "cc" | "cp" | "cyclic"
+                );
                 let (knotspec, boundary, axis_period) = if periodic_axes[axis] {
-                    let period_value = periods_opt[axis].ok_or_else(|| {
-                        format!(
-                            "tensor smooth axis {axis} is periodic but no period was supplied; \
-                             pass period=<value> (scalar) or period=[..., <value>, ...]"
-                        )
-                    })?;
+                    let period_value = match periods_opt[axis] {
+                        Some(p) => p,
+                        None if margin_is_cc => {
+                            let span = data_max - data_min;
+                            if !span.is_finite() || span <= 0.0 {
+                                return Err(format!(
+                                    "tensor smooth axis {axis}: cyclic margin has a degenerate \
+                                     data range [{data_min}, {data_max}]; pass period=<value>"
+                                ));
+                            }
+                            span
+                        }
+                        None => {
+                            return Err(format!(
+                                "tensor smooth axis {axis} is periodic but no period was supplied; \
+                                 pass period=<value> (scalar) or period=[..., <value>, ...]"
+                            ));
+                        }
+                    };
                     if !period_value.is_finite() || period_value <= 0.0 {
                         return Err(format!(
                             "tensor smooth axis {axis}: period must be a positive finite value, got {period_value}"
