@@ -145,3 +145,11 @@ include!("iso_kappa_reml_gradient_fd_tests.rs");
 // orphaning story — driver deps live HERE post-carve. Self-contained
 // `#[cfg(test)] mod`, so it adds nothing to the non-test build.
 include!("spatial_length_scale_monotone_tests.rs");
+// #1264/#1033 re-home: the production ψ-Gram fast-path skip guard
+// (`reduced_basis_equal` soundness, β̂ vs streamed to 1e-6) and the #1033
+// forced-rotation frontier measurement. Same #1601 orphaning story as the two
+// siblings above — its private driver deps live HERE post-carve, and the
+// monolith `include!` in `gam_terms::smooth::tests` was commented out and never
+// relocated, so both guards compiled into NO binary. Self-contained
+// `#[cfg(test)] mod`, so it adds nothing to the non-test build.
+include!("psi_gram_tensor_fast_path_tests.rs");

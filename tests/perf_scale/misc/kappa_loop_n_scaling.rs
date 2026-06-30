@@ -463,6 +463,24 @@ fn install_nfree_reset_logger() {
 }
 
 #[test]
+fn zzz_diag_n16000_reset_reasons() {
+    install_nfree_reset_logger();
+    let (aniso, bounds) = (false, (1e-2, 1e2));
+    let _ = run_fit(1000, true, aniso, bounds);
+    let r = run_kappa_trial_seconds(16_000, aniso, bounds).unwrap();
+    let t = r.kappa_timing.unwrap();
+    eprintln!(
+        "[diag-16k] resets={} miss(shape/value/grad/pen/rev)={}/{}/{}/{}/{}",
+        t.slow_path_resets,
+        t.nfree_miss_shape,
+        t.nfree_miss_value,
+        t.nfree_miss_gradient,
+        t.nfree_miss_penalty,
+        t.nfree_miss_revision,
+    );
+}
+
+#[test]
 fn kappa_micro_2point_n_independence() {
     install_nfree_reset_logger();
     let (aniso, bounds) = (false, (1e-2, 1e2));
