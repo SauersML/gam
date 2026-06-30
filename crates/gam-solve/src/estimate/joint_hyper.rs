@@ -519,14 +519,14 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             .is_some_and(|t| t.contains(psi))
     }
 
-    /// DEBUG ONLY: the attached `PsiGramTensor` (the Chebyshev-interpolated
+    /// DEBUG: the attached `PsiGramTensor` (the Chebyshev-interpolated
     /// `G(ψ)`/`b(ψ)` surface installed by `build_and_set_psi_gram_tensor`), if
     /// any. Exposes the `pub(crate)` field as a cloned `Arc` so the #1601-orphaned
-    /// design-assembly regression guards re-homed into gam-models can compare the
-    /// interpolated Gram/RHS against the streamed-exact surface. Gated to the
-    /// `test-diagnostics` feature (and gam-solve's own `cfg(test)`); never in a
-    /// production build.
-    #[cfg(any(test, feature = "test-diagnostics"))]
+    /// design-assembly regression guards re-homed into the separate gam-models
+    /// crate can compare the interpolated Gram/RHS against the streamed-exact
+    /// surface. `pub` and compiled unconditionally — feature gating is banned in
+    /// this workspace, and a read-only `Arc` clone accessor the production path
+    /// never calls is inert by construction.
     pub fn psi_gram_tensor_arc(
         &self,
     ) -> Option<std::sync::Arc<crate::psi_gram_tensor::PsiGramTensor>> {

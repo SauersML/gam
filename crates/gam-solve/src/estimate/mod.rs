@@ -127,9 +127,12 @@ mod continuous_order_tests;
 mod estimate_policy_tests;
 #[cfg(test)]
 mod invert_regularized_rho_hessian_tests;
-// Debug-only FD probes on `ExternalJointHyperEvaluator`. Compiled under
-// gam-solve's own `cfg(test)` AND under the `test-diagnostics` feature so the
-// #1601-orphaned design-assembly regression guards re-homed into gam-models
-// (a dev-dependency edge) can reach `debug_full_h`. Never in a production build.
-#[cfg(any(test, feature = "test-diagnostics"))]
-mod tests_diagnostics;
+// Finite-difference debug probes on `ExternalJointHyperEvaluator`
+// (`debug_full_h`). These are `pub` inherent methods so the #1601-orphaned
+// design-assembly regression guards re-homed into gam-models (a separate crate)
+// can drive the dense effective-Hessian / projected-logdet surface against
+// centered finite differences. The module is compiled unconditionally — feature
+// gating is banned in this workspace (build.rs ban-scanner), and a `pub` helper
+// that is never called on the production path is inert by construction rather
+// than excluded by an opt-in flag.
+mod hessian_fd_probes;

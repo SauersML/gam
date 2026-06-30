@@ -46,12 +46,6 @@ cudarc = { version = "0.19.6", default-features = false, features = ["std", "dri
 [dev-dependencies]
 approx = "0.5.1"
 csv = "1.4.0"
-# Re-declare gam-solve on the dev edge with `test-diagnostics` so the #1601-orphaned
-# design-assembly regression guards re-homed into this crate can reach the debug-only
-# FD probes (`debug_full_h`, `psi_gram_tensor_arc`). Cargo unifies this feature into
-# the single gam-solve build for `cargo test`; a production `cargo build` does not
-# pull the dev-dependency graph, so the probes stay out of release artifacts.
-gam-solve = { path = "../gam-solve", version = "=0.3.135", features = ["test-diagnostics"] }
 gam-test-support = { path = "../gam-test-support" }
 num-dual = "0.13.6"
 tempfile = "3.27.0"

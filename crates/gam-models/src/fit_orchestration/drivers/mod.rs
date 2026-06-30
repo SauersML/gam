@@ -167,3 +167,10 @@ include!("matern_nfree_rekey_topology_tests.rs");
 // `tests/src_modules/` tree was `mod`'d into no binary). Self-contained
 // `#[cfg(test)] mod`.
 include!("design_assembly_constraint_tests.rs");
+// #1601 relocation debt: the LAST of the three orphaned smooth test files — 48
+// adaptive / bounded / pure-Duchon / Charbonnier regression guards. Same story:
+// commented out of `gam_terms::smooth::tests` by #1601 "for relocation" and
+// parked in the `tests/src_modules/` tree that compiled into no binary. Re-homed
+// here where its `build_term_collection_design` / freeze / SAS-link-state /
+// joint-hyper FD deps resolve post-#1521 carve. Self-contained `#[cfg(test)] mod`.
+include!("adaptive_bounded_duchon_tests.rs");

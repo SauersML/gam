@@ -610,7 +610,10 @@ fn spatial_log_kappa_bounds_from_options(
     )
 }
 
-fn two_block_exact_joint_hyper_setup(
+// `pub(super)` so the sibling re-homed fixture `adaptive_bounded_duchon_tests`
+// (the other #1601 orphan that shared this monolith helper) resolves it through
+// the `drivers` parent scope instead of duplicating the setup.
+pub(super) fn two_block_exact_joint_hyper_setup(
     meanspec: &TermCollectionSpec,
     noisespec: &TermCollectionSpec,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
@@ -819,7 +822,9 @@ fn kronecker_penalty_system_logdet_matches_dense_reference() {
     );
 }
 
-fn assert_term_collection_designs_match(
+// `pub(super)` — shared with the sibling `adaptive_bounded_duchon_tests` #1601
+// re-home (its freeze/cache-rebuild pins compare two designs column-for-column).
+pub(super) fn assert_term_collection_designs_match(
     left: &TermCollectionDesign,
     right: &TermCollectionDesign,
     label: &str,
@@ -3274,7 +3279,11 @@ fn spatial_length_scale_optimization_monotone_improves_or_keeps_score_for_matern
 /// flat gradient/Hessian; trivial EFS) and returns the resolved result.
 /// Shared verbatim across the Matérn- and Duchon-freezing pins; only the
 /// final `.expect` diagnostic differs, passed via `expect_msg`.
-fn run_two_block_exact_joint_optimize(
+///
+/// `pub(super)` so the sibling `adaptive_bounded_duchon_tests` #1601 re-home
+/// (its `exact_joint_two_block_spatial_length_scale_freezes_duchon_centers` pin)
+/// shares the single definition through the `drivers` parent scope.
+pub(super) fn run_two_block_exact_joint_optimize(
     data: ArrayView2<'_, f64>,
     meanspec: &TermCollectionSpec,
     noisespec: &TermCollectionSpec,
