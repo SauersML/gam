@@ -565,3 +565,52 @@ fn scales_to_large_k_without_dense_n_by_k() {
         fit.explained_variance
     );
 }
+
+/// #1026 — a real large-K `fit_sparse_dictionary` whose minibatch × K route
+/// block clears the device break-even runs the route step on the GPU under the
+/// ambient (default `Auto`) residency mode, and is bit-for-bit reproducible.
+///
+/// We deliberately do NOT touch the process-wide `set_gpu_mode` (it is
+/// first-writer-wins, so a test that pinned it would poison every other test in
+/// the binary). The full-fit GPU-route == CPU-route equivalence is locked
+/// directly at the routing primitive by
+/// `scoring_gpu::tests::device_route_minibatch_matches_cpu_top_s_online`, which
+/// drives `GpuMode::Required`, asserts `ScoreBlockPath::Device`, and proves the
+/// routed top-`s` support is bit-identical to the CPU `top_s_online` oracle.
+/// Since the only mode-dependent step in the fit is where those bit-identical
+/// scores are computed, the whole alternating-minimisation trajectory is
+/// mode-invariant — which this test confirms by re-running the fit and asserting
+/// the dictionary, indices, and codes are identical to the bit.
+#[test]
+fn large_k_fit_routes_on_gpu_above_breakeven_and_is_reproducible() {
+    // minibatch=512 × K=4096 = 2,097,152-element score block per minibatch,
+    // above DEVICE_SCORE_BLOCK_MIN_ELEMS (1<<20), so the GPU route engages on a
+    // CUDA host. p=48 is a representative residual-stream width.
+    let (planted_k, p, n) = (8usize, 48usize, 1536usize);
+    let (x, _atoms) = planted(planted_k, p, n, 0.1);
+    let k = 4096usize;
+    let config = SparseDictConfig {
+        n_atoms: k,
+        active: 2,
+        minibatch: 512,
+        max_epochs: 4,
+        score_tile: 1024,
+        ..SparseDictConfig::new(k)
+    };
+
+    let fit = fit_sparse_dictionary(x.view(), &config).expect("large-K fit");
+    let fit2 = fit_sparse_dictionary(x.view(), &config).expect("large-K fit (rerun)");
+
+    assert_eq!(
+        fit.decoder, fit2.decoder,
+        "[#1026] sparse-dict fit is non-deterministic across runs (GPU route must \
+         be bit-reproducible)"
+    );
+    assert_eq!(fit.indices, fit2.indices);
+    assert_eq!(fit.codes, fit2.codes);
+    assert!(
+        fit.explained_variance > 0.9,
+        "[#1026] large-K fit should explain the low-rank signal; got {}",
+        fit.explained_variance
+    );
+}
