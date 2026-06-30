@@ -924,6 +924,20 @@ fn parse_periodic_axes_option(
         return Ok(None);
     };
     let mut periods = parse_periods_option(options, dim)?.unwrap_or_else(|| vec![None; dim]);
+    // Boolean forms (`periodic=true/yes/y`, `periodic=false/no/n`) mirror the
+    // B-spline `parse_periodic_axes` grammar (gam#1676): the spatial smooths
+    // (thin-plate / Duchon / Matérn) accepted only an explicit axis-index list
+    // and rejected the boolean, so `duchon(theta, periodic=true)` hard-errored
+    // with "invalid periodic axis 'true'" even though the documented and
+    // B-spline-supported boolean form is the natural way to mark a 1-D cyclic
+    // smooth. `true` marks every axis periodic (period taken from an explicit
+    // `period=` if given, else auto-derived from the data span by the periodic
+    // builders); `false` is plain non-periodic.
+    match raw_axes.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "y" => return Ok(Some(periods)),
+        "false" | "no" | "n" => return Ok(None),
+        _ => {}
+    }
     let axes = split_list_option(raw_axes);
     if axes.is_empty() {
         return Ok(Some(periods));
