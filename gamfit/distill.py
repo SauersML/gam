@@ -373,7 +373,17 @@ def encode_with_fallback(
         alpha=encoder.alpha,
         jumprelu_threshold=encoder.jumprelu_threshold,
     )
-    exact_payload = model._oos_payload(x, t_init=t_init, a_init=logits_init)
+    # #1166 — the acceptance gate MUST be cold-started. The "exact" reference
+    # probe is solved with NO `t_init`/`a_init`, so it is the canonical
+    # feature map that the public `encode(X)` returns and that
+    # `distill_encoder` calibrated the tolerances against (`converged_latents`,
+    # itself a cold `_oos_payload`). A warm-started probe seeded from the
+    # encoder's own guess (`t_init=t_init, a_init=logits_init`) would bias the
+    # finite-iteration Newton refinement toward that guess, so `assign_err` /
+    # `coord_err` would be measured against a moving reference and systematically
+    # under-estimated — the self-referential gate of #1166. Cold-starting keeps
+    # the gate measuring the encoder against the same fixed solve everywhere.
+    exact_payload = model._oos_payload(x)
     exact_assign = np.asarray(exact_payload["assignments_z"], dtype=np.float64)
     exact_coords = _pad_coords(
         [np.asarray(atom["on_atom_coords_t"], dtype=np.float64) for atom in exact_payload["atoms"]],
