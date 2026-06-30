@@ -389,7 +389,32 @@ impl Gauge {
             "Gauge::restrict_design: design has {} columns, expected raw width {raw_total}",
             raw_design.ncols(),
         );
+        // A trivial section (`T = I`) leaves the design untouched: `X·I = X`
+        // bit-for-bit (every off-diagonal `T` entry is an exact zero, the
+        // diagonal an exact one, so the reduction is the identity map). The
+        // unconstrained Wahba sphere chart hits this on every build, and the
+        // skipped GEMM is an `(n × w)·(w × w)` product — ~0.8 s of host
+        // matrixmultiply at production shapes (n ≳ 1e5, w ~ 200). Detecting
+        // identity costs O(w²), negligible beside the O(n·w²) it elides.
+        if self.t_full_is_identity() {
+            return raw_design.to_owned();
+        }
         fast_ab(raw_design, &self.t_full)
+    }
+
+    /// Whether the lift `T` is the exact identity (square with unit diagonal
+    /// and zero off-diagonal). When true, `restrict_design`/`restrict_penalty`
+    /// are no-ops and skip their GEMMs. The comparison is exact equality, not
+    /// a tolerance — only a literal identity short-circuits, so the fast path
+    /// is always bit-identical to the full product.
+    fn t_full_is_identity(&self) -> bool {
+        let (r, c) = self.t_full.dim();
+        if r != c {
+            return false;
+        }
+        self.t_full
+            .indexed_iter()
+            .all(|((i, j), &v)| v == if i == j { 1.0 } else { 0.0 })
     }
 
     /// Compose a raw design and offset with the affine section:
@@ -424,6 +449,11 @@ impl Gauge {
             "Gauge::restrict_penalty: matrix has shape {:?}, expected ({raw_total}, {raw_total})",
             raw_penalty.dim(),
         );
+        // `Tᵀ S T = S` exactly when `T = I` (see `restrict_design`). Skip the
+        // two `(w × w)·(w × w)` products on the unconstrained chart.
+        if self.t_full_is_identity() {
+            return raw_penalty.to_owned();
+        }
         let t_s = fast_atb(&self.t_full, raw_penalty);
         fast_ab(&t_s, &self.t_full)
     }
@@ -558,6 +588,55 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn identity_section_short_circuits_restrict_bit_exactly() {
+        // A trivial section must restrict design/penalty to the *exact* input,
+        // matching the full GEMM bit-for-bit while skipping it.
+        let gauge = Gauge::identity(&[4]);
+        assert!(gauge.t_full_is_identity());
+
+        // An irregular design with values that would perturb under a real GEMM
+        // if any rounding crept in.
+        let raw_design = Array2::<f64>::from_shape_fn((7, 4), |(i, j)| {
+            ((i as f64) * 0.3 - (j as f64) * 1.7).sin() * 1.000000001
+        });
+        let restricted = gauge.restrict_design(&raw_design);
+        // Bit-exact equality with the input (the identity map).
+        assert_eq!(restricted, raw_design);
+        // And bit-exact with the full product it elides.
+        let via_gemm = fast_ab(&raw_design, &gauge.t_full);
+        assert_eq!(restricted, via_gemm);
+
+        let raw_penalty = Array2::<f64>::from_shape_fn((4, 4), |(i, j)| {
+            (i as f64 + 1.0) * (j as f64 + 2.0) * 0.111
+        });
+        let restricted_pen = gauge.restrict_penalty(&raw_penalty);
+        assert_eq!(restricted_pen, raw_penalty);
+        let pen_via_gemm = fast_ab(&fast_atb(&gauge.t_full, &raw_penalty), &gauge.t_full);
+        assert_eq!(restricted_pen, pen_via_gemm);
+    }
+
+    #[test]
+    fn non_identity_section_is_not_short_circuited() {
+        // A real reparametrisation must NOT take the identity fast path.
+        let mut t = Array2::<f64>::eye(3);
+        t[[0, 1]] = 0.5;
+        let gauge = Gauge::from_t(t.clone(), &[3], &[3]);
+        assert!(!gauge.t_full_is_identity());
+        let raw = Array2::<f64>::from_shape_fn((5, 3), |(i, j)| i as f64 + j as f64 * 0.25);
+        let restricted = gauge.restrict_design(&raw);
+        assert_eq!(restricted, fast_ab(&raw, &t));
+    }
+
+    #[test]
+    fn rectangular_section_is_not_identity() {
+        // A tall centring section is square-free and must never be mistaken
+        // for the identity (it removes a direction).
+        let z = Array2::<f64>::from_shape_vec((3, 2), vec![1.0, 0.0, 0.0, 1.0, -1.0, -1.0]).unwrap();
+        let gauge = Gauge::sum_to_zero(z);
+        assert!(!gauge.t_full_is_identity());
     }
 
     #[test]
