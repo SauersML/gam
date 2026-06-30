@@ -364,7 +364,15 @@ fn build_wahba_decomposed_design(
     radians: bool,
     decomposition: &WahbaLowDegreeDecomposition,
 ) -> Array2<f64> {
-    let mut kernel_design = raw_kernel_design.dot(&decomposition.kernel_basis);
+    // `(n × m) · (m × k)` reduction of the raw finite-center kernel onto the
+    // penalized RKHS chart. At production sphere shapes (n ≳ 1e5, m ~ 200) this
+    // is the single largest host cost in the basis build — ~1 s of generic
+    // matrixmultiply — so route it through `fast_ab`, which dispatches to the
+    // cuBLAS GEMM when the workload clears the policy flop floor and otherwise
+    // falls back to the identical faer/SIMD path. Bit-for-bit identical on the
+    // CPU branch; device GEMM differs only by IEEE reduction order, well inside
+    // the documented Wahba parity tolerance.
+    let mut kernel_design = fast_ab(&raw_kernel_design, &decomposition.kernel_basis);
     match (
         &decomposition.low_degree_centers,
         &decomposition.kernel_low_projection,
@@ -381,6 +389,8 @@ fn build_wahba_decomposed_design(
                 "low-degree spherical harmonic design width must match its centers"
             );
             let low_design = raw_low;
+            // `(n × low) · (low × k)` — `low` is tiny (3 for degree 1), so this
+            // stays on the host SIMD path; `.dot` is fine here.
             kernel_design -= &low_design.dot(kernel_low_projection);
             hstack_dense(kernel_design.view(), low_design.view())
         }
