@@ -18,7 +18,7 @@
 
 use std::sync::OnceLock;
 
-use ndarray::{Array2, ArrayView2, ShapeBuilder};
+use ndarray::{Array2, ArrayView2};
 
 use gam_gpu::gpu_error::GpuError;
 #[cfg(target_os = "linux")]
