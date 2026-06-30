@@ -1736,6 +1736,10 @@ pub(crate) fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>
             total,
             options,
             inner.joint_workspace.clone(),
+            // The EFS evaluator always assembles the first-order (gradient)
+            // fixed-point terms; the third-derivative directional cache is the
+            // one it consumes (gam#979).
+            EvalMode::ValueAndGradient,
         )? {
             let JointHessianBundle {
                 source: h_joint_unpen,
