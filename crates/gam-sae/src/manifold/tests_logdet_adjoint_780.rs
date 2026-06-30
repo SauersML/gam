@@ -7,6 +7,240 @@
 use super::*;
 use super::tests::{fixed_state_logdet, gamma_fd_tiny_fixture};
 
+/// #1416 exact NUMERICAL ORACLE for the IBP cross-row log-det derivatives.
+///
+/// The issue pins a two-row, one-column interior example with a clean,
+/// independently-derivable closed form: `α = 1.8`, `τ = 0.8`,
+/// `ℓ = (0.2, −0.4)`, and a DATA curvature of exactly `1.2·I` on the two
+/// (one-per-row) logit slots. The full joint Hessian is then
+/// `H = 1.2·I + H_p`, where the IBP prior column Hessian is
+/// `H_p = d·J Jᵀ + diag(s·c)` with `J_i = ∂z_i/∂ℓ_i`, `c_i = ∂²z_i/∂ℓ_i²`,
+/// `s` the column score, and `d = ∂s/∂M` (`= w·s'` at unit weight). The
+/// cross-row rank-one `d·J Jᵀ` couples the two rows, and its off-diagonal is
+/// what the pre-#1416 diagonal-only contractions dropped.
+///
+/// Oracle values (computed by hand from the closed form; reproduced bit-for-bit
+/// by the production penalty channels):
+///   * ρ-trace half-trace `½ tr(H⁻¹ H_p) = −0.1609707929`
+///     (diagonal-only buggy code gives `−0.1436656628`),
+///   * logit adjoint `∂/∂ℓ_2 log|H| = −0.0498935387`
+///     (diagonal-only buggy code gives `−0.0355527958`).
+///
+/// To exercise the REAL derivative code paths (`assignment_log_strength_hessian_trace`
+/// for the ρ-trace and `logdet_theta_adjoint` for the logit adjoint) on EXACTLY
+/// this `H`, we drive the production arrow-Schur assembly directly: a 2-row,
+/// K=1 IBP term carries the logits, and a hand-built [`ArrowSchurSystem`] with
+/// one 1×1 logit slot per row, base diagonal `H₀ = 1.2 + (H_p)_ii`, and the
+/// installed [`IbpCrossRowSource`] (the same source the live assembly emits) is
+/// factored through `solve_arrow_newton_step_with_options`. The solver downdates
+/// the rank-one self term and layers the exact Woodbury correction, so the
+/// factored cache reconstructs `H = 1.2·I + H_p` to roundoff — the one operator
+/// the value, log-det, ρ-trace, and θ-adjoint all differentiate. The diagonal-only
+/// pre-fix contractions FAIL these tight (1e-7) assertions; the cross-row passes
+/// pass them.
+fn ibp_1416_oracle_term() -> (SaeManifoldTerm, SaeManifoldRho) {
+    // A single trivial K=1 atom only supplies `assignment` (logits / mode) to the
+    // derivative code; its decoder/coords are never read by the IBP logit-slot
+    // contractions, and the cache layout below is hand-built, not assembled from
+    // this atom. n = 2, p = 1.
+    let n = 2usize;
+    let p = 1usize;
+    let m = 3usize;
+    // A periodic-harmonic atom supplies the second-jet evaluator the θ-adjoint
+    // needs, but its decoder is ZERO so the data Gauss-Newton block is identically
+    // zero: the logit and coord slots are decoupled, and the data curvature on the
+    // logit slots is injected by hand (1.2·I) in the cache builders below. The
+    // coords are nonzero arbitrary phases (their jets are real, just multiplied by
+    // the zero decoder).
+    let coords = Array2::from_shape_vec((n, 1), vec![0.15_f64, 0.65_f64]).unwrap();
+    let evaluator = std::sync::Arc::new(PeriodicHarmonicEvaluator::new(m).unwrap());
+    // ZERO basis values AND zero decoder: the θ-adjoint reconstructs the data
+    // Gauss-Newton jets from the atom's stored `basis_values`/decoder, so zeroing
+    // BOTH makes every data jet (`jets.first`/`second`/`beta`) vanish. The data
+    // block is then identically zero and `H` is block-diagonal across the logit,
+    // coord, and β slots — leaving the IBP assignment-prior logit channels as the
+    // sole live source for the logit-slot adjoint, on exactly the oracle `H`.
+    let atom = SaeManifoldAtom::new(
+        "ibp1416",
+        SaeAtomBasisKind::Periodic,
+        1,
+        Array2::<f64>::zeros((n, m)),
+        Array3::<f64>::zeros((n, m, 1)),
+        Array2::<f64>::zeros((m, p)),
+        Array2::<f64>::eye(m),
+    )
+    .unwrap()
+    .with_basis_second_jet(evaluator);
+    let logits = Array2::from_shape_vec((n, 1), vec![0.2_f64, -0.4_f64]).unwrap();
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        logits,
+        vec![coords],
+        vec![LatentManifold::Circle { period: 1.0 }],
+        // alpha = 1.8, tau = 0.8, fixed alpha.
+        AssignmentMode::ibp_map(0.8, 1.8, false),
+    )
+    .unwrap();
+    let term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+    // log_lambda_sparse = 0 ⇒ λ_sparse = 1 ⇒ the IBP penalty weight w = 1 (the
+    // oracle's unit weight). The single atom carries a one-element ARD vector.
+    let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::from_vec(vec![0.0])]);
+    (term, rho)
+}
+
+/// Build the factored `ArrowFactorCache` for `H = 1.2·I + H_p` on the two
+/// logit slots, using the production IBP source + Woodbury machinery. Each row
+/// contributes ONE latent slot (its logit); the per-row base diagonal is the
+/// FULL `H₀ = 1.2 + (H_p)_ii` (the solver downdates the rank-one self term and
+/// re-adds the full `d·J Jᵀ` through the Woodbury carrier).
+fn ibp_1416_oracle_cache(term: &SaeManifoldTerm, rho: &SaeManifoldRho) -> ArrowFactorCache {
+    let n = term.n_obs();
+    let channels = ibp_assignment_third_channels(&term.assignment, rho)
+        .expect("channels")
+        .expect("IBP mode must yield cross-row channels");
+    // Full per-row IBP prior diagonal `(H_p)_ii = d·J_i² + s·c_i`, where the
+    // diagonal `hessian_diag` already carries `d·J_i² + s·c_i` for IBP. Use the
+    // penalty's assembled diagonal so the base matches the live assembly exactly.
+    let hdiag = assignment_prior_log_strength_hdiag(&term.assignment, rho).expect("hdiag");
+    let data_curv = 1.2_f64;
+    let mut sys = ArrowSchurSystem::new(n, 1, 0);
+    for row in 0..n {
+        // `hdiag[row*K + 0]` is the assignment prior's full logit-slot curvature
+        // `(H_p)_ii`; add the data curvature 1.2 to form the full `H₀` diagonal.
+        sys.rows[row].htt[[0, 0]] = data_curv + hdiag[row];
+    }
+    // IBP source: rank R = 1, coefficient d_0 = w·s'_0 = cross_row_d[0]; the two
+    // entries place `J_i = z_jac[i]` at row i's logit slot (global index i).
+    let entries: Vec<(usize, usize, f64)> = (0..n).map(|i| (i, 0usize, channels.z_jac[i])).collect();
+    let source = IbpCrossRowSource {
+        r: 1,
+        d: channels.cross_row_d.clone(),
+        entries,
+    };
+    sys.set_ibp_cross_row_source(source);
+    let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+    let (_dt, _db, cache) =
+        solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options).expect("factor H");
+    cache
+}
+
+/// Coord-aware variant of [`ibp_1416_oracle_cache`] for the θ-adjoint, which
+/// (unlike the ρ-trace) walks the per-row jets and therefore needs the row's
+/// coordinate slot present in the cache layout. Each row carries TWO latent
+/// slots: the logit (local pos 0) and the atom's one coordinate (local pos 1).
+/// The decoder is zero (see `ibp_1416_oracle_term`), so there is NO data
+/// coupling between the logit and coord slots: the joint `H` is block-diagonal,
+/// the logit 2×2 sub-block is exactly `1.2·I + H_p` (the issue's oracle `H`),
+/// and the coord slots carry an independent PD curvature. Because `∂H/∂ℓ_w`
+/// touches only the logit block and `H` is block-diagonal, the logit-adjoint
+/// entry equals `tr((1.2·I+H_p)⁻¹ ∂(1.2·I+H_p)/∂ℓ_w)` — exactly the issue's
+/// `∂log|H|/∂ℓ` — independent of the coord curvature value.
+fn ibp_1416_oracle_cache_with_coord(
+    term: &SaeManifoldTerm,
+    rho: &SaeManifoldRho,
+) -> ArrowFactorCache {
+    let n = term.n_obs();
+    let channels = ibp_assignment_third_channels(&term.assignment, rho)
+        .expect("channels")
+        .expect("IBP mode must yield cross-row channels");
+    let hdiag = assignment_prior_log_strength_hdiag(&term.assignment, rho).expect("hdiag");
+    let data_curv = 1.2_f64;
+    // d = 2 latent slots per row ([logit, coord]); the decoder border carries
+    // `border_dim = Σ_atoms m·p` channels so `border_channels_for_cache` (which
+    // the θ-adjoint calls) matches `cache.k`. The decoder is zero, so the t↔β
+    // coupling (`htbeta`) is zero and `H` stays block-diagonal across {logit,
+    // coord} and β; `H_ββ = I` is an independent PD constant block whose log-det
+    // is invariant under ℓ — it cancels in the logit derivative and the FD.
+    let border_dim = term.factored_border_dim();
+    let mut sys = ArrowSchurSystem::new(n, 2, border_dim);
+    for c in 0..border_dim {
+        sys.hbb[[c, c]] = 1.0;
+    }
+    for row in 0..n {
+        sys.rows[row].htt[[0, 0]] = data_curv + hdiag[row]; // logit: full H₀ diagonal
+        sys.rows[row].htt[[1, 1]] = 1.0; // coord: independent PD curvature
+        // htbeta stays zero (decoder is zero ⇒ no t↔β data coupling).
+    }
+    // IBP source entries place `J_i` at row i's LOGIT slot, global index 2·i.
+    let entries: Vec<(usize, usize, f64)> = (0..n)
+        .map(|i| (2 * i, 0usize, channels.z_jac[i]))
+        .collect();
+    let source = IbpCrossRowSource {
+        r: 1,
+        d: channels.cross_row_d.clone(),
+        entries,
+    };
+    sys.set_ibp_cross_row_source(source);
+    let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+    let (_dt, _db, cache) =
+        solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options).expect("factor H");
+    cache
+}
+
+#[test]
+pub(crate) fn ibp_rho_trace_matches_exact_numerical_oracle_1416() {
+    let (term, rho) = ibp_1416_oracle_term();
+    let cache = ibp_1416_oracle_cache(&term, &rho);
+    let solver = DeflatedArrowSolver::plain(&cache);
+
+    // The real ρ-trace contraction returns `½ tr(H⁻¹ ∂H_p/∂ρ) = ½ tr(H⁻¹ H_p)`
+    // for fixed alpha (the whole IBP prior scales with λ_sparse = eᵖ).
+    let analytic = term
+        .assignment_log_strength_hessian_trace(&rho, &cache, &solver)
+        .expect("rho-trace");
+
+    // Exact closed-form oracle from issue #1416 (the FULL half-trace, including
+    // the cross-row off-diagonal `½ d Σ_{i≠j}(H⁻¹)_{ij} J_i J_j`). The
+    // diagonal-only pre-fix code returns -0.1436656628, which fails this.
+    const ORACLE: f64 = -0.1609707929;
+    assert!(
+        (analytic - ORACLE).abs() <= 1.0e-7,
+        "IBP ρ-trace exact oracle: analytic={analytic:.10e}, oracle={ORACLE:.10e} \
+         (diagonal-only pre-#1416 bug returns -0.1436656628)"
+    );
+}
+
+#[test]
+pub(crate) fn ibp_logit_adjoint_matches_exact_numerical_oracle_1416() {
+    let (term, rho) = ibp_1416_oracle_term();
+    let cache = ibp_1416_oracle_cache_with_coord(&term, &rho);
+    let solver = DeflatedArrowSolver::plain(&cache);
+
+    // The real θ-adjoint returns Γ = tr(H⁻¹ ∂H/∂θ) = ∂log|H|/∂θ over the inner
+    // variables. Row-1's logit slot is local position 0 of its block, global
+    // t-index `row_offsets[1]`.
+    let gamma = term
+        .logdet_theta_adjoint(&rho, &cache, &solver)
+        .expect("theta-adjoint");
+    let analytic = gamma.t[cache.row_offsets[1]];
+
+    // Exact closed-form oracle from issue #1416 for the second logit. The
+    // diagonal-only pre-fix code returns -0.0355527958, which fails this.
+    const ORACLE: f64 = -0.0498935387;
+    assert!(
+        (analytic - ORACLE).abs() <= 1.0e-7,
+        "IBP logit adjoint exact oracle ∂/∂ℓ_2 log|H|: analytic={analytic:.10e}, \
+         oracle={ORACLE:.10e} (diagonal-only pre-#1416 bug returns -0.0355527958)"
+    );
+
+    // Cross-check the analytic adjoint against a central finite difference of the
+    // joint log|H| w.r.t. ℓ_2, holding the rest of the state fixed. The cache is
+    // rebuilt at each perturbed logit (its base + Woodbury both depend on ℓ_2),
+    // so this FD differentiates the SAME `H = 1.2·I + H_p` the adjoint does.
+    let fd_logdet = |dl: f64| -> f64 {
+        let mut t = term.clone();
+        t.assignment.logits[[1, 0]] += dl;
+        let c = ibp_1416_oracle_cache_with_coord(&t, &rho);
+        let (tt, beta) = c.arrow_log_det();
+        tt + beta.unwrap_or(0.0)
+    };
+    let h = 1.0e-6;
+    let fd = (fd_logdet(h) - fd_logdet(-h)) / (2.0 * h);
+    assert!(
+        (fd - analytic).abs() <= 1.0e-5,
+        "IBP logit adjoint vs FD of log|H|: fd={fd:.8e}, analytic={analytic:.8e}"
+    );
+}
+
 #[test]
 pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_on_tiny_fixture() {
     let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
