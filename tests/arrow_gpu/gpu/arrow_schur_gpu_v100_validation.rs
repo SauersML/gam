@@ -412,18 +412,44 @@ fn arrow_schur_gpu_ridge_bump_required_on_non_pd_row_recovers_after_bump() {
              have factored at ridge=0"
         ),
     };
-    // Re-launch at ridge_t = bump. The poisoned row is `-I`; the shifted
-    // `htt + bump·I = (bump − 1)·I`, which only becomes PD once `bump > 1`.
-    // The Ceres-style escalation already returns a `bump ≥ 1024·√ε ≈ 4.8e-5`
-    // baseline, so we may need a few geometric doublings. Iterate up to ten
-    // doublings — math block 3 §16 caps the escalation chain at ten before
-    // declaring the system genuinely rank-deficient.
+    // Re-launch at ridge_t = bump and escalate exactly as the production LM
+    // loop (`solve_with_lm_escalation_inner`) does. The poisoned row is `-I`;
+    // the deficit-aware Gershgorin bump now lifts that single block PAST its
+    // λ_min = −1 deficit on the first retry, so `htt + bump·I ≈ (bump − 1)·I`
+    // is genuinely positive definite (bump ≈ 1 + 1024·√ε). But a block that is
+    // only *barely* PD is still perfectly conditioned locally (κ = 1 for a
+    // scalar multiple of I) while its inverse is huge: `Y₂ = L₂⁻¹B₂` is
+    // amplified by ≈ 1/√(bump−1) ≈ 256×, which drives the REDUCED Schur
+    // complement `S_β = H_ββ + ρ_β I − Σ Yᵀ Y` strongly indefinite. That is a
+    // legitimate `SchurFactorFailed`, NOT a per-row defect — and the dense CPU
+    // reference fails identically at the very same ridge (verified below by the
+    // `Err` arm of `solve_arrow_newton_step_dense_reference`). The system only
+    // becomes globally PD once the ridge grows the block to O(1) (ridge ≈ 2).
+    //
+    // Production treats BOTH `RidgeBumpRequired` (per-row non-PD) and
+    // `SchurFactorFailed` (reduced-Schur non-PD) as ridge-recoverable
+    // (newton_step.rs `recoverable` match), geometrically growing a proximal
+    // ridge on either. We mirror that here. Iterate up to ten escalations —
+    // math block 3 §16 caps the chain at ten before declaring the system
+    // genuinely rank-deficient.
     let mut ridge = bump;
     for attempt in 0..10 {
-        match solve_arrow_newton_step(&sys, ridge, ridge_beta) {
+        let device = solve_arrow_newton_step(&sys, ridge, ridge_beta);
+        // Parity oracle: the dense CPU reference must agree with the device on
+        // BOTH success and failure at this ridge. If the device declined, the
+        // reference must also decline (otherwise the device dropped a step the
+        // CPU could take); if the device succeeded, the reference must succeed
+        // and match it to 1e-10.
+        let reference = solve_arrow_newton_step_dense_reference(&sys, ridge, ridge_beta);
+        match device {
             Ok(got) => {
-                let expected = solve_arrow_newton_step_dense_reference(&sys, ridge, ridge_beta)
-                    .expect("dense reference Cholesky must succeed at sufficiently large ridge");
+                let expected = reference.unwrap_or_else(|e| {
+                    panic!(
+                        "[arrow_schur_gpu_v100/ridge_bump_required] device solved at \
+                         ridge={ridge:e} but dense CPU reference failed ({e}) — the \
+                         device produced a step the parity oracle rejects"
+                    )
+                });
                 assert_solution_matches(
                     "arrow_schur_gpu_v100/ridge_bump_required/recovered",
                     sys.rows.len(),
@@ -435,10 +461,29 @@ fn arrow_schur_gpu_ridge_bump_required_on_non_pd_row_recovers_after_bump() {
                 );
                 return;
             }
+            // Per-row block still non-PD: take the suggested deficit-aware bump.
             Err(ArrowSchurGpuFailure::RidgeBumpRequired {
                 bump: next_bump, ..
             }) => {
+                assert!(
+                    reference.is_err(),
+                    "[arrow_schur_gpu_v100/ridge_bump_required] device wanted a ridge \
+                     bump at ridge={ridge:e} but the dense CPU reference factored — \
+                     parity violation"
+                );
                 ridge = (ridge + next_bump).max(ridge * 2.0);
+            }
+            // Reduced Schur non-PD at a barely-PD per-row ridge: a genuine,
+            // ridge-recoverable condition (the dense reference fails identically),
+            // so grow the ridge geometrically exactly as the production LM loop.
+            Err(ArrowSchurGpuFailure::SchurFactorFailed { .. }) => {
+                assert!(
+                    reference.is_err(),
+                    "[arrow_schur_gpu_v100/ridge_bump_required] device reported a \
+                     non-PD reduced Schur at ridge={ridge:e} but the dense CPU \
+                     reference factored — parity violation"
+                );
+                ridge *= 2.0;
             }
             // Runtime present + floor-clearing fixture ⇒ decline is a real fault.
             Err(ArrowSchurGpuFailure::Unavailable) => panic!(
