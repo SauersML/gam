@@ -2198,3 +2198,61 @@ fn issue_1191_shape_constrained_monotone_fits_through_shared_driver() {
         "fitted coefficients must be finite (no ALO-NaN seed rejection)"
     );
 }
+
+/// Regression for #1767: a non-default `survival_likelihood` on a non-survival
+/// response (no `Surv(...)` wrapper) used to be silently discarded, degrading
+/// the requested survival model to an ordinary Gaussian GAM. It must now error.
+fn nonsurvival_gaussian_dataset() -> Dataset {
+    // A simple smooth signal with enough rows for a stable `s(x)` fit. The
+    // response column is named `time` to mirror the issue's
+    // `time ~ s(x)` formula (a bare column, *not* `Surv(time, event)`).
+    let n = 48usize;
+    let mut records: Vec<csv::StringRecord> = Vec::with_capacity(n);
+    for i in 0..n {
+        let x = -2.0 + 4.0 * (i as f64) / ((n - 1) as f64);
+        let time = 0.7 * x + 0.3 * (1.3 * x).sin();
+        records.push(csv::StringRecord::from(vec![
+            format!("{time:.17e}"),
+            format!("{x:.17e}"),
+        ]));
+    }
+    gam_data::encode_recordswith_inferred_schema(
+        vec!["time".to_string(), "x".to_string()],
+        records,
+    )
+    .expect("encode non-survival gaussian dataset")
+}
+
+#[test]
+fn survival_likelihood_rejected_on_nonsurvival_response() {
+    let data = nonsurvival_gaussian_dataset();
+    let mut config = FitConfig::default();
+    // Explicitly request a survival likelihood mode *without* a Surv(...) LHS.
+    config.survival_likelihood = "weibull".to_string();
+
+    let err = materialize("time ~ s(x)", &data, &config)
+        .err()
+        .expect("a non-default survival_likelihood on a non-survival response must error (#1767)");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("survival_likelihood"),
+        "error must name the offending knob, got: {msg}"
+    );
+    assert!(
+        msg.contains("Surv(...)"),
+        "error must point the user at the Surv(...) wrapper, got: {msg}"
+    );
+}
+
+#[test]
+fn default_survival_likelihood_allowed_on_nonsurvival_response() {
+    // Positive control: the default ("transformation") mode is indistinguishable
+    // from "unset" and must NOT be rejected, so the guard isn't over-broad.
+    let data = nonsurvival_gaussian_dataset();
+    let config = FitConfig::default();
+    assert_eq!(config.survival_likelihood, "transformation");
+
+    materialize("time ~ s(x)", &data, &config)
+        .expect("default survival_likelihood must still materialize an ordinary GAM (#1767)");
+}

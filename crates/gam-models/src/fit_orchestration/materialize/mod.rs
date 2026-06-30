@@ -30,7 +30,7 @@ pub(crate) use terms::{
 pub(crate) use transformation::materialize_transformation_normal;
 pub(crate) use validation::{
     reject_marginal_slope_controls_for_transformation_normal,
-    reject_survival_only_terms_for_nonsurvival,
+    reject_survival_likelihood_for_nonsurvival, reject_survival_only_terms_for_nonsurvival,
 };
 
 use latent::*;

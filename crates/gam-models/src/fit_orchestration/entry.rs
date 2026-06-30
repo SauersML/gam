@@ -1103,6 +1103,12 @@ pub fn materialize<'a>(
         // chokepoint for all non-survival paths — mirroring the symmetric
         // auxiliary-formula rejection in `validate_auxiliary_formula_controls`.
         reject_survival_only_terms_for_nonsurvival(&parsed)?;
+        // Symmetrically, the `config.survival_likelihood` *knob* selects a
+        // survival likelihood mode read only by `materialize_survival`. On this
+        // non-survival branch a non-default value (e.g. "weibull") would be
+        // discarded and the fit would silently degrade to an ordinary GAM
+        // (#1767). Reject it at the same chokepoint.
+        reject_survival_likelihood_for_nonsurvival(config)?;
         if config.transformation_normal {
             // Issue #789A: a Bernoulli marginal-slope request with
             // `transformation_normal=true` used to dispatch as a CTN fit while

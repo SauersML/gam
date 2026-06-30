@@ -55,6 +55,44 @@ pub(crate) fn reject_survival_only_terms_for_nonsurvival(
     Ok(())
 }
 
+/// Reject a non-default `config.survival_likelihood` when the response is not
+/// `Surv(...)`.
+///
+/// `survival_likelihood` selects the survival likelihood mode
+/// (`"location-scale"`, `"weibull"`, `"marginal-slope"`, `"latent"`,
+/// `"latent-binary"`, …) and is read *exclusively* inside `materialize_survival`.
+/// When the main formula has no `Surv(...)` response the survival materializer is
+/// never reached, so a survival-only knob like
+/// `survival_likelihood="weibull"` is parsed, validated, and then dropped on the
+/// floor — the request silently degrades to an ordinary Gaussian GAM (#1767),
+/// the same silent-no-op contract violation as the survival-only *terms* guarded
+/// by [`reject_survival_only_terms_for_nonsurvival`].
+///
+/// The default value is `"transformation"`, which is indistinguishable from
+/// "unset", so it (and only it) is allowed through here; every other,
+/// explicitly-requested mode is a configuration error and is rejected with the
+/// same phrasing the survival-only-term path uses.
+pub(crate) fn reject_survival_likelihood_for_nonsurvival(
+    config: &FitConfig,
+) -> Result<(), WorkflowError> {
+    let mode = config.survival_likelihood.trim();
+    // `"transformation"` is the default and is indistinguishable from "unset",
+    // so it is the only mode permitted on a non-survival response.
+    if mode.eq_ignore_ascii_case("transformation") {
+        return Ok(());
+    }
+    Err(WorkflowError::InvalidConfig {
+        reason: format!(
+            "survival_likelihood=\"{mode}\" is only supported in the main survival formula \
+             (a formula with a Surv(...) response); it selects a survival likelihood mode that \
+             is read exclusively by the survival fit path, so for a non-survival response it is \
+             meaningless and would otherwise be silently ignored (the requested survival model \
+             would degrade to an ordinary GAM). Wrap the response in Surv(...) or drop the \
+             survival_likelihood configuration."
+        ),
+    })
+}
+
 /// Reject an *explicitly requested* `linkwiggle(...)` term when the resolved
 /// response family is not binomial.
 ///
