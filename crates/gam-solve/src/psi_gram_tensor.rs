@@ -422,12 +422,14 @@ impl PsiGramTensor {
                 }
             }
             // Weighted Gram / RHS at this node, then the n×k design is dropped.
+            // RHS uses the prebuilt `wz = W z` (same factoring as the exact
+            // streamed path) so the retained series is bit-faithful to it.
             let mut wd = design.clone();
             for (mut row, &w) in wd.outer_iter_mut().zip(weights.iter()) {
                 row.mapv_inplace(|v| v * w);
             }
             node_grams.push(design.t().dot(&wd));
-            node_rhs.push(wd.t().dot(&z));
+            node_rhs.push(design.t().dot(&wz));
         }
         let (_n, k) = dims.expect("node ladder rung m≥1 yields at least one design");
         // First-kind discrete orthogonality of the Chebyshev nodes.
