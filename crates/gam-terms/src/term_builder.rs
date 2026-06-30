@@ -5302,12 +5302,24 @@ mod tests {
         )
         .expect("build fs factor smooth");
 
-        // The marginal wiggliness penalty count (one per marginal penalty) is the
-        // SAME for sz and fs; the difference of interest is the null-space ridges.
-        // `fs` adds one rank-1 ridge per marginal null direction. After the fix
-        // `sz` must add the SAME number of null-space ridges, so its total
-        // penalty count must equal `fs`'s. Before the fix `sz` had strictly fewer
-        // penalties (only the wiggliness penalties), so this assertion fails.
+        // Penalty structure (#1074 + #1605). `fs` is the exchangeable
+        // random-effect smooth: all `L` level blocks share ONE wiggliness λ per
+        // marginal penalty, plus one rank-1 null-space ridge per marginal null
+        // direction (the #1605 double penalty). `sz` is the sum-to-zero factor
+        // smooth and mgcv's `smooth.construct.sz` emits ONE penalty matrix PER
+        // LEVEL — `L` independent curvature smoothing parameters — so REML can
+        // shrink a low-amplitude group's deviation hard while leaving a busy
+        // group nearly unpenalized. We mirror that: the single marginal
+        // wiggliness penalty is split into its `L` independent zero-sum-contrast
+        // summands (`L-1` free per-group blocks `(e_k e_kᵀ)⊗S` + the reference
+        // coupling block `(11ᵀ)⊗S`), each carrying its own λ, and the null-space
+        // ridges stay POOLED (the per-group intercept/slope shrinkage mgcv pools
+        // under one variance even for `sz`).
+        //
+        // So with `nw` marginal wiggliness penalties and `nn` marginal null
+        // directions: fs has `nw + nn` penalties; sz has `L·nw + nn`. sz must
+        // therefore carry strictly MORE penalties than fs (the per-group split),
+        // and the surplus must be exactly `(L-1)·nw`.
         let n_levels = sz_spec
             .group_frozen_levels
             .as_ref()
@@ -5315,26 +5327,43 @@ mod tests {
             .unwrap_or(4);
         assert!(n_levels >= 3, "test needs >=3 groups, got {n_levels}");
 
+        // fs = nw + nn  ⇒  nn = fs_penalties - nw. The marginal has nw==1
+        // wiggliness penalty (a single difference/curvature operator), so the
+        // per-group split adds exactly (L-1)·nw = (L-1) extra penalties on top of
+        // fs's count.
+        let nw = 1usize; // one marginal wiggliness penalty for the B-spline marginal
+        let expected_sz = fs_built.penalties.len() + (n_levels - 1) * nw;
         assert_eq!(
             sz_built.penalties.len(),
+            expected_sz,
+            "sz must split its wiggliness penalty per level (#1074): expected \
+             fs_count {} + (L-1)·nw {} = {}, but sz had {}",
             fs_built.penalties.len(),
-            "sz must carry the same number of penalties as fs (wiggliness + one \
-             null-space ridge per marginal null direction); sz had {} (only the \
-             wiggliness penalties => null space unpenalized => over-smoothed), fs \
-             had {}",
+            (n_levels - 1) * nw,
+            expected_sz,
+            sz_built.penalties.len(),
+        );
+        assert!(
+            sz_built.penalties.len() > fs_built.penalties.len(),
+            "sz must carry strictly more penalties than fs after the per-group \
+             split (sz={}, fs={})",
             sz_built.penalties.len(),
             fs_built.penalties.len(),
         );
 
-        // There must be at least one extra null-space ridge beyond the wiggliness
-        // penalty (a cubic-regression marginal has a 2-D {const, linear} null
-        // space). This is the structural property that lets REML keep the
-        // deviation curvature un-over-smoothed.
+        // The null-space ridges must still be present (the #1605 property that
+        // keeps the deviation curvature un-over-smoothed). After removing the `L`
+        // per-group wiggliness blocks, the remainder are the pooled null ridges,
+        // and there must be at least one (a B-spline marginal has a non-empty
+        // {const, linear} null space).
+        let n_wiggliness = n_levels * nw; // L per-group blocks
         assert!(
-            sz_built.penalties.len() >= 2,
-            "sz deviation block carries no null-space ridge (penalties={}); the \
-             null space is unpenalized and REML over-smooths the deviations",
+            sz_built.penalties.len() > n_wiggliness,
+            "sz deviation block carries no null-space ridge (penalties={}, \
+             wiggliness blocks={}); the null space is unpenalized and REML \
+             over-smooths the deviations",
             sz_built.penalties.len(),
+            n_wiggliness,
         );
 
         // The zero-sum constraint must be preserved: the sz design must stay the
