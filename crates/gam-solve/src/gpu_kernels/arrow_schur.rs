@@ -2980,9 +2980,15 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
                     d_buf[base + r] = value;
                 }
             }
-            // B_i in P_MAX×R_TEMPLATE strided block.
+            // B_i in P_MAX×R_TEMPLATE strided block. The per-row (per-i) block
+            // stride is `p_max · r_template` (matching the `b_buf` allocation
+            // above and the kernel's `b_stack`/`y_out` layout), NOT
+            // `p_max · p_max`: using the D-block multiplier here overflows the
+            // buffer whenever `p_max > r_template` (e.g. d=30→p_max=32,
+            // k=5→r_template=5). The within-block element offset stays
+            // column-major `col·p_max + r` (P_MAX rows per column).
             for col in 0..k {
-                let base = (i * p_max + col) * p_max;
+                let base = (i * r_template + col) * p_max;
                 for r in 0..d {
                     b_buf[base + r] = row.htbeta[[r, col]];
                 }

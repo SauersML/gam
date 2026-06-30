@@ -567,6 +567,37 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         self.psi_gram_tensor.is_some()
     }
 
+    /// Shared handle to the installed certified ψ-Gram tensor, if any (#1033
+    /// instrumentation accessor). Used by the re-homed fast-path diagnostic to
+    /// read the interpolated Gram/RHS at a trial ψ (`gram_at` / `rhs_at`) for
+    /// the interpolation-residual attribution ladder, without the
+    /// cross-crate-private field access the pre-#1521 monolith test relied on.
+    pub fn psi_gram_tensor_handle(
+        &self,
+    ) -> Option<std::sync::Arc<crate::psi_gram_tensor::PsiGramTensor>> {
+        self.psi_gram_tensor.clone()
+    }
+
+    /// The installed tensor's certified value window `[psi_lo, psi_hi]`, if any
+    /// (#1033 instrumentation accessor).
+    pub fn psi_gram_window(&self) -> Option<(f64, f64)> {
+        self.psi_gram_tensor.as_ref().map(|t| t.psi_window())
+    }
+
+    /// Lowest ψ at/above which the installed tensor's conditioned Gram holds its
+    /// maximal numerical rank — the floor below which the design-revision skip's
+    /// `reduced_basis_equal` witness must (soundly) refuse because the reduced
+    /// basis collapses/rotates. `None` when no tensor is installed or the rank is
+    /// already maximal across the whole window. The κ caller lifts the optimizer's
+    /// lower bound to this n-FREE floor so every in-window trial stays on the
+    /// design-realization skip (#1033). See
+    /// [`crate::psi_gram_tensor::PsiGramTensor::rank_stable_psi_floor`].
+    pub fn psi_gram_rank_stable_floor(&self, psi_anchor: f64) -> Option<f64> {
+        self.psi_gram_tensor
+            .as_ref()
+            .and_then(|t| t.rank_stable_psi_floor(psi_anchor))
+    }
+
     /// Return the most-recently converged inner β from the last PIRLS solve, if
     /// it is finite and the right dimension. Used by `SpatialJointContext` to
     /// warm-start successive outer evaluations instead of cold-starting PIRLS
@@ -827,6 +858,37 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
                 }
             }
             return Ok(hyper_dirs);
+        }
+
+        // #1033 frontier diagnostic: this is the O(n) slow-path reset. When it
+        // fires on the single-ψ spatial path while a tensor is installed, log WHY
+        // the n-free skip was refused — trial ψ, pinning ψ, both k-space numerical
+        // ranks, and the subspace (principal-angle) distance — so a reset can be
+        // attributed to a genuine in-window reduced-basis ROTATION (constant rank,
+        // subspace moved past `PSI_GRAM_SKIP_PROJ_ATOL`) versus a rank COLLAPSE the
+        // rank-stable floor should have excluded. Purely k-space (O(k³)), no rows.
+        if let Some(tensor) = self.psi_gram_tensor.as_ref()
+            && theta.len() == rho_dim + 1
+        {
+            let psi = theta[rho_dim];
+            let trial_rank = tensor.gram_numerical_rank(psi);
+            let (ref_rank, subspace_dist, accepts) = match self.last_reset_psi {
+                Some(psi_ref) if tensor.contains(psi_ref) => (
+                    tensor.gram_numerical_rank(psi_ref),
+                    tensor.reduced_basis_subspace_distance(psi_ref, psi),
+                    tensor.reduced_basis_equal(psi_ref, psi),
+                ),
+                _ => (None, None, false),
+            };
+            log::info!(
+                "[NFREE-RESET] n_rows={} trial_psi={psi:.6} ref_psi={:?} trial_rank={trial_rank:?} \
+                 ref_rank={ref_rank:?} subspace_dist={subspace_dist:?} witness_accepts={accepts} \
+                 covers_value={} covers_skip={}",
+                self.reml_state.x().nrows(),
+                self.last_reset_psi,
+                tensor.contains(psi),
+                self.psi_gram_tensor_covers_skip(psi),
+            );
         }
 
         let specs: Vec<PenaltySpec> = s_list.iter().map(PenaltySpec::from_blockwise_ref).collect();

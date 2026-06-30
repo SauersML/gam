@@ -406,8 +406,83 @@ fn kappa_outer_loop_is_n_independent_fast_ladder() {
 /// Finishes in seconds — a development-loop probe, NOT the close gate (the full
 /// 1k→16k/320k ladders are). No bar tightening here vs the headline ≤8× / flat
 /// reset contract; this just surfaces the ratio fast.
+/// Minimal stderr logger so the #1033 `[NFREE-RESET ...]` info diagnostics
+/// emitted by the solver's reset lanes surface in the micro probe's output. Only
+/// forwards records whose message starts with `[NFREE-RESET` to keep the trace
+/// readable; everything else is dropped. Installed once per test process (nextest
+/// isolates test binaries per process, so `set_logger` cannot race).
+struct NfreeResetLogger {
+    file: std::sync::Mutex<std::fs::File>,
+}
+impl log::Log for NfreeResetLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Info
+    }
+    fn log(&self, record: &log::Record) {
+        use std::io::Write;
+        let msg = format!("{}", record.args());
+        if msg.starts_with("[NFREE-RESET")
+            || msg.starts_with("[KAPPA-PHASE-SUMMARY")
+            || msg.starts_with("[KAPPA-PHASE-PRIME")
+            || msg.starts_with("[KAPPA-PHASE-FLOOR")
+        {
+            if let Ok(mut f) = self.file.lock() {
+                let _ = writeln!(f, "{msg}");
+                let _ = f.flush();
+            }
+        }
+    }
+    fn flush(&self) {
+        if let Ok(mut f) = self.file.lock() {
+            use std::io::Write;
+            let _ = f.flush();
+        }
+    }
+}
+
+static NFREE_RESET_LOGGER: std::sync::OnceLock<NfreeResetLogger> = std::sync::OnceLock::new();
+
+fn install_nfree_reset_logger() {
+    // Route the solver's `[NFREE-RESET ...]` info diagnostics to a file
+    // (`/tmp/nfree_trace.log`), bypassing nextest's stdout/stderr buffering
+    // which silently drops the early reset-time records. Idempotent: the
+    // `OnceLock` + `set_logger` error-swallow make repeated calls safe.
+    let logger = NFREE_RESET_LOGGER.get_or_init(|| {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open("/tmp/nfree_trace.log")
+            .expect("open nfree trace log");
+        NfreeResetLogger {
+            file: std::sync::Mutex::new(file),
+        }
+    });
+    let _ = log::set_logger(logger);
+    log::set_max_level(log::LevelFilter::Info);
+}
+
+#[test]
+fn zzz_diag_n16000_reset_reasons() {
+    install_nfree_reset_logger();
+    let (aniso, bounds) = (false, (1e-2, 1e2));
+    let _ = run_fit(1000, true, aniso, bounds);
+    let r = run_kappa_trial_seconds(16_000, aniso, bounds).unwrap();
+    let t = r.kappa_timing.unwrap();
+    eprintln!(
+        "[diag-16k] resets={} miss(shape/value/grad/pen/rev)={}/{}/{}/{}/{}",
+        t.slow_path_resets,
+        t.nfree_miss_shape,
+        t.nfree_miss_value,
+        t.nfree_miss_gradient,
+        t.nfree_miss_penalty,
+        t.nfree_miss_revision,
+    );
+}
+
 #[test]
 fn kappa_micro_2point_n_independence() {
+    install_nfree_reset_logger();
     let (aniso, bounds) = (false, (1e-2, 1e2));
     let warm = run_fit(1000, true, aniso, bounds)
         .unwrap_or_else(|reason| panic!("[kappa-micro] warm iso-κ fit failed ({reason})"));

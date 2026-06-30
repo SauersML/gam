@@ -1,3 +1,93 @@
+## v0.3.135 — gam 0.3.135 / gamfit 0.1.237 (2026-06-30)
+
+crates.io + PyPI release of the post-0.3.134 correctness-and-performance wave.
+A broad set of smoothing/REML, survival, geometry and inference bugs are fixed
+at the root, several hot paths are made meaningfully faster, and the `gamfit`
+Python surface gains additive SAE keyword aliases. Everything reachable through
+the existing API stays backward-compatible.
+
+### Smoothing / REML fixes
+- **#1654 — convex/concave shape smooths no longer park in the linear corner.**
+  The double-penalty nullspace ridge under the order-2 box reparameterization
+  was rebuilt from scratch instead of transformed by the same congruence
+  `S ↦ TᵀST` as the wiggliness penalty, decoupling the level/slope and
+  wiggliness scales and driving curvature-constrained fits to a near-straight
+  line (EDF ≈ 1.5) for a seed/`k`-specific subset. The exact congruence is
+  restored for the curvature ridge; the monotone path keeps its #509 projector.
+- **#509 — monotone REML λ-search no longer parks at the integer seed.** The
+  cost-stall guard keyed its keep-descending escape on a fixed absolute gradient
+  ceiling, so a shape-constrained inner solve with a non-binding constraint
+  stalled near the seed while the projected gradient still descended strongly
+  (over-smoothing already-monotone data). The escape is now scaled to the score.
+- **#1629 — Matérn smooths no longer over-smooth 2-D surfaces.** Matérn now
+  routes through the same length-scale auto-init sentinel as thin-plate so the
+  basis seeds the resolving regime instead of a degenerate global scale.
+- **#1676 — `scale_dimensions=True` now engages anisotropy for thin-plate.** A
+  multi-axis `tp` term is rewritten to its mathematically-equivalent anisotropic
+  s=0 Duchon twin (the thin-plate kernel `r^{2m−d}` is the s=0 Duchon kernel), so
+  per-axis tension ARD engages exactly as for `duchon()`/`matern()` instead of
+  the flag being a silent no-op. Default (flag off) and 1-D `tp` are unchanged.
+- **#1269 — thin-plate basis is exactly translation-invariant.** The strict
+  basis-conditioning gate is split out and pinned at the bit level.
+- **#1476 — double-penalty no longer over-shrinks a supported smooth.** A budget-
+  exhaustion best-feasible substitution used a bare early `return` that bypassed
+  the multi-start keep-best loop and could ship a degenerate box corner; it now
+  flows through keep-best as a non-converged candidate.
+- **#1033 — the κ/ψ smoothing window is now n-invariant.** Even-spaced capped
+  diameter sampling and a rank-stable ψ floor anchored at the optimizer seed kill
+  an n-dependent shift in the outer optimizer's box.
+- **#901 — iso-κ joint-REML outer-gradient FD oracles re-homed and verified.**
+
+### Survival fixes
+- **#965 — survival FFI rejects negative times; `S(0)=1`.** Negative/NaN/Inf
+  times are rejected at the Python→Rust boundary and the parametric fallback
+  guards the `exp(-∞·0)=NaN` origin case.
+- **#1595 — survival/cumulative-hazard extrapolation policy threaded into the
+  dense Rust FFI kernels**, so `S=exp(-H)` holds past the grid in both the
+  chunked and CSV paths.
+- **#392/#369 — fit-to-completion guards restored for non-linear survival
+  baselines** (real convergence asserted across all baseline targets).
+
+### Inference / families fixes
+- **#332 — near-constant Gaussian response is rejected with a clean error**
+  instead of producing a degenerate fit.
+- **#1655 — the GPD tail estimator accepts light (k<0) tails** (σ from the
+  un-shrunk k, matching ArviZ/loo) instead of returning `None`.
+- **#1621 — debiased point/contrast prediction handles inert categorical
+  bookkeeping columns** via lenient encoding for non-required columns.
+- **#1101 — the multinomial per-class probability-SE calibration test** is
+  replaced with a valid over-refit calibration (the prior test was statistically
+  degenerate).
+- **#1561 — the final location-scale β̂ refit at ρ\* is seeded warm from the
+  outer optimum** instead of cold, fixing a basin-fragility KKT cert-refusal
+  crash on stiff two-block fits.
+
+### Geometry
+- **#1637 — genuine Stiefel canonical-metric logarithm for k≥2**, anchored to
+  Y⊥ to kill spurious π rotations, with an exhaustive `Log∘Exp=id` sweep and a
+  square-input completion guard.
+- **#1661 — CLR `simplex_exp_map` rejects a non-finite tangent** with an error
+  instead of returning `Ok(NaN)`.
+
+### Python (`gamfit`)
+- **#159/#160/#178 — additive SAE keyword aliases**: `assignment` /
+  `assignment_prior`, `K` / `n_atoms`, and `random_state` wiring, resolved
+  end-to-end into the Rust FFI with eager conflict detection.
+
+### Performance (value-preserving)
+- **#1575** cuts the Firth/Jeffreys outer-Hessian cost on binomial/logit REML.
+- **#759** restores the rayon parallel reduction in `trace_product_sparse`.
+- **#1082** brings the competing-risks CIF quality case from 439 s to 122 s by
+  not expanding the ρ₀ offset on an untagged inner-failure pre-warm.
+- **reml Jeffreys drift** GEMM-izes the H_Φ curvature-drift contraction (was a
+  bounds-checked scalar triple loop dominating competing-risks Weibull fits).
+- **#1033 / #979** make the ψ-gram a true sufficient-statistic reduction and
+  bound the marginal-slope continuation pre-warm.
+
+### Known-limitation note
+The GAMLSS location-scale engine/reference parity and inner-solve convergence
+cluster (#1607) remains under active work; those `gam-models` tests are not yet
+green and no user-facing API depends on them.
 ## v0.3.134 — gam 0.3.134 / gamfit 0.1.236 (2026-06-29)
 
 crates.io + PyPI release of the post-0.3.133 correctness-and-performance wave:
@@ -3866,3 +3956,5 @@ publish paths.
   including Duchon/Matern basis coverage, sparse-native REML paths, probit
   location-scale warm starts, model-consistency fixes, and the first Rust CI
   workflow.
+
+<!-- agent #1641: investigating logdet_theta_adjoint IBP theta-adjoint vs dense FD; WIP -->

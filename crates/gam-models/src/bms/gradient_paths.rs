@@ -2600,6 +2600,12 @@ mod jet_tower_oracle_tests {
             }
         }
     }
+
+    // NOTE: the hand-vs-jet timing microbench (`bench_rigid_vgh_jet_vs_hand`)
+    // was removed — `#[ignore]`d timing benches are banned by `build.rs`, and
+    // the kernel's *correctness* against the hand chain is already pinned by the
+    // non-ignored `rigid_bernoulli_row_kernel_matches_hand_chain_witness` above.
+    // Timing belongs in `bench/`, not in a `#[test]`.
 }
 
 #[cfg(test)]

@@ -228,6 +228,23 @@ pub(crate) const FLAT_VALLEY_STALL_GRAD_CEILING: f64 = 5.0;
 /// `FLAT_VALLEY_STALL_GRAD_CEILING`) does not.
 pub(crate) const FLAT_VALLEY_CONVERGED_REL_GRAD: f64 = 1.0e-3;
 
+/// Multiplicative margin above the certified-stationary band
+/// (`score_relative_grad_bound`) below which a cost stall is treated as a genuine
+/// flat-valley FLOOR and halted directly, and above which it is treated as a
+/// NON-stationary stall that is granted a [`CostStallVerdict::StuckKeepDescending`]
+/// escape (#509). A stall whose residual gradient is within this factor of the
+/// band is "essentially at the band" — descending further is not worth burning an
+/// escape — so it halts; a stall meaningfully above the band still has real
+/// feasible descent and is allowed to climb out. Set to `1.5×`: a stall within
+/// 50% of the certified band is "essentially flat" and halts directly (preserving
+/// the #1477 weakly-identified flat-valley floors, which floor AT their band), while
+/// a stall well clear of the band — the #509 monotone seed-park floors at |g| ≈ 2
+/// on a score ≈ 599 (band ≈ 0.6 ⇒ trigger ≈ 0.9, so 2 > 0.9 keeps descending) and
+/// the #1426 stuck overfit at |g| ≈ 11 — is granted escapes. Capped at
+/// `FLAT_VALLEY_STALL_GRAD_CEILING` so a very large score never raises the trigger
+/// above the legacy ceiling.
+pub(crate) const FLAT_VALLEY_STALL_ESCAPE_MARGIN: f64 = 1.5;
+
 /// Absolute cap on [`FLAT_VALLEY_CONVERGED_REL_GRAD`]'s score-relative bound.
 /// Without it a fit with a very large `|score|` would license certifying a large
 /// projected gradient; capping at `1.0` keeps the certified band a genuinely
@@ -602,21 +619,47 @@ impl CostStallGuard {
             }
             return CostStallVerdict::Converged;
         }
-        // #1426: distinguish a genuine flat-valley FLOOR (residual modestly
-        // above tolerance — the surface really has flattened) from a *stuck*
-        // stall whose residual gradient is far above tolerance. A residual far
-        // above `FLAT_VALLEY_STALL_GRAD_CEILING` cannot be a flat valley: the
-        // surface is steep, yet no line-search step makes cost progress because
-        // the inner PIRLS did not converge at this ρ and the cached cost and the
-        // analytic gradient are inconsistent. Halting-and-shipping there yields
-        // the near-unpenalized full-basis overfit. Refuse to halt: reset the
-        // no-improvement window so the optimizer keeps descending (the inner
+        // Distinguish a genuine flat-valley FLOOR (residual at its irreducible
+        // band — the surface really HAS flattened, so no further descent is
+        // available) from a NON-stationary stall whose residual gradient still
+        // points to real feasible descent. The window filled, but a gradient
+        // meaningfully above the certified-stationary band proves there IS a
+        // descent direction left — the stall is an artifact of small per-step
+        // cost progress, not of a flat surface. Two regimes produce such a stall:
+        //
+        //   * #1426 — the inner PIRLS hit its iteration cap at the under-penalized
+        //     (λ→0) ridge, so the cached cost is a half-fit artifact and the
+        //     analytic gradient (|g| ≈ 11) is inconsistent with it.
+        //   * #509 — a shape-constrained (box-reparam β=Tγ) smooth whose inequality
+        //     constraint is NON-binding: the constrained active-set inner solve is
+        //     near-smooth but the cumulative-sum coordinate change makes the cost
+        //     improve by less than the relative floor over the window near the
+        //     integer seed, even though the projected gradient (|g| ≈ 2) still
+        //     descends strongly toward the well-penalized REML optimum (verified:
+        //     λ_wiggle 20 → 83, EDF 8.4 → 6.9, score −599 → −618, |g| → 1e-11).
+        //
+        // Both are cured the same way: refuse to halt and grant an escape — reset
+        // the no-improvement window so the optimizer keeps descending (the inner
         // solve runs to tighter tolerance at the next iterate, restoring a
-        // trustworthy gradient and letting it find the well-penalized optimum),
-        // for a bounded number of escapes before falling back to a halt.
-        let far_above_tolerance =
-            best_grad_norm.is_finite() && best_grad_norm > FLAT_VALLEY_STALL_GRAD_CEILING;
-        if far_above_tolerance && self.stuck_escapes < STUCK_STALL_MAX_ESCAPES {
+        // trustworthy gradient), for a bounded number of escapes before falling
+        // back to a halt. The OLD gate keyed the escape on a fixed absolute
+        // `FLAT_VALLEY_STALL_GRAD_CEILING = 5.0`, which let any stall in the
+        // (certified-band, 5.0] residual band halt as a "flat valley" even though
+        // its gradient still descended — silently parking the #509 monotone fit at
+        // its seed (|g| ≈ 2 < 5.0). Keying the escape on the SCORE-RELATIVE
+        // certified-stationary band instead (the same band that certifies
+        // `converged` above, with a modest multiplicative margin so a stall sitting
+        // essentially AT the band still halts directly rather than burning escapes)
+        // makes the distinction scale-correct: a genuinely flat valley floors at
+        // the band and halts after the escape budget, while a non-stationary stall
+        // descends to true stationarity. The `FLAT_VALLEY_STALL_GRAD_CEILING` caps
+        // the trigger so a very large score can never raise it above the legacy
+        // ceiling — the #1426 stuck regime (|g| ≈ 11) is always granted escapes.
+        let keep_descending_threshold = (FLAT_VALLEY_STALL_ESCAPE_MARGIN * score_relative_grad_bound)
+            .min(FLAT_VALLEY_STALL_GRAD_CEILING);
+        let non_stationary_stall =
+            best_grad_norm.is_finite() && best_grad_norm > keep_descending_threshold;
+        if non_stationary_stall && self.stuck_escapes < STUCK_STALL_MAX_ESCAPES {
             self.stuck_escapes = self.stuck_escapes.saturating_add(1);
             // Reset BOTH no-progress streaks: the optimizer should be allowed a
             // fresh window of accepted/infeasible steps to climb out of the

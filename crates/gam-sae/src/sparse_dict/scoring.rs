@@ -7,7 +7,7 @@
 //! online top-`s` selector, and discarding it. Peak score memory is therefore
 //! `rows × tile`, independent of `K`.
 
-use ndarray::{ArrayView1, ArrayView2};
+use ndarray::{ArrayView1, ArrayView2, Axis};
 
 /// Online "keep the `s` largest-magnitude scores seen so far" selector for a
 /// single row. Selection is by `|score|` (the dictionary atoms are unit-norm,
@@ -129,5 +129,49 @@ impl TileScorer {
         decoder: ArrayView2<'_, f32>,
     ) -> Vec<(u32, f32)> {
         top_s_online(row, decoder, self.active, self.tile)
+    }
+
+    /// Top-`active` atoms for every row of a minibatch `rows` (`B × P`) against
+    /// `decoder` (`K × P`), scored a column tile at a time via a batched GEMM.
+    ///
+    /// This is the implementation that delivers the module's promise: the score
+    /// block formed at any instant is `B × tile` (peak `rows × tile`,
+    /// independent of `K`), and each tile is a single `(B × P)·(P × tile)`
+    /// matrix multiply rather than `B × tile` scalar dot loops. The online
+    /// top-`s` selector sees the atoms in the same global order as
+    /// [`Self::route_row`] (tile 0 first, ascending atom index). The GEMM
+    /// contracts the same `P` terms but `matrixmultiply` may accumulate them in
+    /// a blocked order, so the per-atom scores agree with the row-at-a-time path
+    /// only to f32 rounding; where two atoms tie within that rounding the two
+    /// paths may select different members of the tie (interchangeable for the
+    /// reconstruction, which is why the fit stays minibatch-invariant rather
+    /// than bit-identical). Returns one `(atom, score)` shortlist per row, in row
+    /// order.
+    pub fn route_minibatch(
+        &self,
+        rows: ArrayView2<'_, f32>,
+        decoder: ArrayView2<'_, f32>,
+    ) -> Vec<Vec<(u32, f32)>> {
+        let b = rows.nrows();
+        let k = decoder.nrows();
+        let mut selectors: Vec<TopSSelector> =
+            (0..b).map(|_| TopSSelector::new(self.active)).collect();
+
+        let mut start = 0usize;
+        while start < k {
+            let end = (start + self.tile).min(k);
+            // `decoder` tile is `tile × P`; transpose to `P × tile` so the GEMM
+            // produces the `B × tile` score block directly (rows × atoms).
+            let tile_block = decoder.slice(ndarray::s![start..end, ..]);
+            let scores = rows.dot(&tile_block.t()); // (B × P)·(P × tile) = B × tile
+            for (local, score_col) in scores.axis_iter(Axis(1)).enumerate() {
+                let atom = (start + local) as u32;
+                for (row_idx, &sc) in score_col.iter().enumerate() {
+                    selectors[row_idx].offer(atom, sc);
+                }
+            }
+            start = end;
+        }
+        selectors.into_iter().map(TopSSelector::finish).collect()
     }
 }
