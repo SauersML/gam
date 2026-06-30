@@ -2115,6 +2115,49 @@ impl GlmLikelihoodSpec {
         }
         self
     }
+
+    /// Produce a copy of this spec with the Gamma shape `k = 1/φ` PINNED at
+    /// `shape` for the duration of the smoothing-parameter (λ) search (#1074).
+    /// Converts an `EstimatedGammaShape` scale into the statistically-identical
+    /// `FixedGammaShape` form, which gates off the per-inner-solve shape refresh
+    /// in `GamWorkingModel::update_with_curvature` (its guard is
+    /// `gamma_shape_is_estimated()`, which `FixedGammaShape` does not satisfy)
+    /// while leaving every weight / deviance / log-likelihood expression
+    /// unchanged (they read the shape through `gamma_shape()` / `fixed_phi()`,
+    /// which `FixedGammaShape` answers identically).
+    ///
+    /// Rationale: with the shape estimated, the inner solver re-derives it from
+    /// each outer iterate's *warm-start* η (the converged-η MLE
+    /// `k̂` solving `ln k − ψ(k) = mean[y/μ − ln(y/μ) − 1]`). The Gamma working
+    /// weight is `W = prior·k` and the omitting-constants log-likelihood is
+    /// `ℓ(β̂) = −k·½·D(ρ)` (the `k`-dependent saturated normalizer is dropped,
+    /// #359), so a `k` that swings 2×↔ with the warm-start η makes BOTH the
+    /// likelihood-curvature `H = k·XᵀX + λS` and the data-fit term `k·½D` jump
+    /// discontinuously with ρ — the REML criterion `V(ρ)` develops deterministic
+    /// spikes between the smooth basin floors (e.g. a flat warm-start η at a
+    /// just-rejected over-smoothed trial gives `k≈2.3`, the fitted-surface η at
+    /// the neighbor gives `k≈4.7`, doubling `−ℓ` with β̂ essentially unchanged).
+    /// The analytic outer gradient holds `k` fixed, so it can never agree with
+    /// the realized cost's `k(ρ)` motion: the projected gradient floors at
+    /// `O(|∂k/∂ρ|·½D)` and the ARC descent stalls on a weakly-identified valley,
+    /// railing `λ` to the over-smoothed corner (the #1074 te/Gamma tensor
+    /// under-recovery). Holding `k` fixed across the λ-search makes
+    /// `F(ρ) = REML(ρ, k_frozen)` a genuine stationary function of ρ, exactly as
+    /// the sibling Tweedie-φ (#1477) and NB-θ (#1082) freezes do, and as mgcv
+    /// does (it fixes the scale across the smoothness search for the scale-free
+    /// Gamma mean). `k` is still ML-refreshed at the single final reported fit
+    /// (the `refine_dispersion_at_converged_eta = true` accept-fit), so the
+    /// reported dispersion / SEs remain the converged-η estimate. No-op for
+    /// non-Gamma families and for a user-fixed shape.
+    #[inline]
+    pub fn with_gamma_shape_frozen_for_search(mut self, shape: f64) -> Self {
+        if matches!(self.spec.response, ResponseFamily::Gamma)
+            && self.scale.gamma_shape_is_estimated()
+        {
+            self.scale = LikelihoodScaleMetadata::FixedGammaShape { shape };
+        }
+        self
+    }
 }
 
 #[cfg(test)]
