@@ -495,6 +495,35 @@ impl SaeManifoldTerm {
     /// O(1) prefactor to the overcompleteness — rather than freezing it at 10 —
     /// removes the magic without losing the barrier near the collapse boundary.
     ///
+    /// #1610 — why the strength is a dimensionless geometry ratio and NOT a
+    /// marginal-likelihood (REML) selection. A REML/evidence-selected penalty
+    /// weight `λ` is, by definition, the data-vs-prior balance `λ ∝ σ²_resid /
+    /// τ²_prior`: its optimum scales with the data/decoder MAGNITUDE (the
+    /// reconstruction Hessian's scale). The separation barrier, by contrast, was
+    /// deliberately made SCALE-INVARIANT in `8381579f2`/`fc20443d2` — it acts on
+    /// the scale-free `c_jk²` (principal-angle cosine) and `q_jk`, and the
+    /// `barrier_norm_floor_sq` abstain set is a pure energy RATIO — so the same
+    /// collapse geometry is penalised identically under a global rescale
+    /// `B_k → s·B_k` (locked by `separation_barrier_collapse_prevention_is_scale_invariant_1610`).
+    /// These two requirements are in direct tension: a fully REML-derived `μ_C`
+    /// would re-introduce the decoder-energy units the scale-invariance work
+    /// removed. Scale-invariance is the requirement that holds (an SAE decoder
+    /// inherits the activations' arbitrary scale; the anti-collapse geometry must
+    /// not), so the strength MUST be a dimensionless quantity read from the
+    /// dictionary geometry, not a scale-bearing REML balance. Among such
+    /// dimensionless invariants, `K / reachable_rank` is the one keyed to the
+    /// DOCUMENTED collapse driver (overcompleteness — see the `term.rs`
+    /// `SaeManifoldTerm` doc: atoms co-collapse "at `K ≥ 4` … as the atom count
+    /// outruns the linear rank the corpus supports"), giving the unit-information
+    /// barrier `μ_C = 1` at exact completeness and `μ_C = q` at `q×`
+    /// overcompleteness. It is therefore principled (collapse-driver-keyed), not
+    /// an arbitrary magic prefactor. The only data-faithful refinement available
+    /// — keying the rank on the realized chart-image ranks `Σ_k rank(Φ_k)` the
+    /// collapse BAR already uses, instead of the nominal coefficient counts — is
+    /// deliberately declined HERE (see `nominal_reachable_rank`) because it costs
+    /// a per-line-search-trial SVD over the `n × M_k` chart designs; it stays a
+    /// coarse overcompleteness scalar while the THRESHOLD pays for the exact rank.
+    ///
     /// The process-global runtime override (`set_sae_barrier_overrides`, used by
     /// the Python FFI to sweep `μ_C` from one compiled wheel) takes precedence:
     /// when set, it is the absolute `μ_C` and the derived value is bypassed.
