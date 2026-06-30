@@ -1818,6 +1818,99 @@ impl<'a> RemlState<'a> {
         Ok(result)
     }
 
+    /// ρ-independent certificate that the Gaussian-identity ALO-stabilization
+    /// augmentation can never activate on this surface (#1689). See the
+    /// `alo_provably_inactive` field docs for the monotone-bound derivation.
+    /// Computed at most once and memoized. Returns `false` (not certified)
+    /// whenever the bound is not strictly below the activation threshold or the
+    /// unpenalized Gram is not factorizable — in either case the caller falls
+    /// through to the exact per-evaluation gate, preserving prior behavior.
+    pub(crate) fn alo_provably_inactive_certificate(&self) -> Result<bool, EstimationError> {
+        if let Some(cached) = *self.alo_provably_inactive.read().unwrap() {
+            return Ok(cached);
+        }
+        let verdict = self.compute_alo_provably_inactive();
+        *self.alo_provably_inactive.write().unwrap() = Some(verdict);
+        Ok(verdict)
+    }
+
+    /// Compute the non-activation certificate. The leverage `xᵢᵀ H⁻¹ xᵢ` is
+    /// invariant under any invertible column reparameterization, so this works
+    /// in the original design basis with the fixed Gaussian-identity weights.
+    fn compute_alo_provably_inactive(&self) -> bool {
+        let x = match self
+            .x
+            .try_to_dense_arc("ALO non-activation certificate requires dense design")
+        {
+            Ok(x) => x,
+            Err(_) => return false,
+        };
+        let n = x.nrows();
+        let p = x.ncols();
+        if n == 0 || p == 0 || self.weights.len() != n {
+            return false;
+        }
+        // Unpenalized weighted Gram G = XᵀWX with the fixed prior weights (which
+        // for Gaussian identity equal the converged Hessian weights W_H). Any
+        // non-finite or negative weight makes the bound uncertifiable.
+        let mut gram = Array2::<f64>::zeros((p, p));
+        for i in 0..n {
+            let wi = self.weights[i];
+            if !wi.is_finite() || wi < 0.0 {
+                return false;
+            }
+            if wi == 0.0 {
+                continue;
+            }
+            for a in 0..p {
+                let xa = wi * x[[i, a]];
+                for b in a..p {
+                    gram[[a, b]] += xa * x[[i, b]];
+                }
+            }
+        }
+        for a in 0..p {
+            for b in 0..a {
+                gram[[a, b]] = gram[[b, a]];
+            }
+        }
+        let factor = match StableSolver::new("ALO non-activation certificate").factorize(&gram) {
+            Ok(factor) => factor,
+            // Rank-deficient / ill-conditioned unpenalized Gram: the monotone
+            // bound `H_λ⁻¹ ⪯ (XᵀWX)⁻¹` degenerates, so we cannot certify. Fall
+            // through to the exact per-evaluation gate.
+            Err(_) => return false,
+        };
+        let mut gram_inv = Array2::<f64>::eye(p);
+        let mut gram_inv_view = array2_to_matmut(&mut gram_inv);
+        factor.solve_in_place(gram_inv_view.as_mut());
+        // h̄_i = w_i · xᵢᵀ G⁻¹ xᵢ ≥ h_i for every ρ. If max_i h̄_i stays strictly
+        // below the activation threshold, no ρ can trip the leverage gate.
+        for i in 0..n {
+            let wi = self.weights[i];
+            if wi <= 0.0 {
+                continue;
+            }
+            let mut quad = 0.0f64;
+            for a in 0..p {
+                let xa = x[[i, a]];
+                if xa == 0.0 {
+                    continue;
+                }
+                let mut row_acc = 0.0f64;
+                for b in 0..p {
+                    row_acc += gram_inv[[a, b]] * x[[i, b]];
+                }
+                quad = xa.mul_add(row_acc, quad);
+            }
+            let hbar = wi * quad;
+            if !hbar.is_finite() || hbar >= ALO_MAX_LEVERAGE_THRESHOLD {
+                return false;
+            }
+        }
+        true
+    }
+
     pub(crate) fn alo_stabilization_eval(
         &self,
         rho: &Array1<f64>,
@@ -1876,6 +1969,24 @@ impl<'a> RemlState<'a> {
         // restoring `te()` to the same per-eval cost profile as `duchon`/`matern`.
         let edf = bundle.pirls_result.edf;
         if edf.is_finite() && edf > ALO_EDF_FRACTION_SATURATION * (n as f64) {
+            return Ok(None);
+        }
+        // ρ-independent non-activation certificate (#1689). The augmentation can
+        // only engage when some row's *penalized* leverage
+        //   h_i = w_i · xᵢᵀ H_λ⁻¹ xᵢ ,   H_λ = XᵀWX + S_λ + ridge·I
+        // reaches `ALO_MAX_LEVERAGE_THRESHOLD`. Since `S_λ + ridge·I ⪰ 0`,
+        // `H_λ ⪰ XᵀWX`, hence `H_λ⁻¹ ⪯ (XᵀWX)⁻¹` and
+        //   h_i ≤ w_i · xᵢᵀ (XᵀWX)⁻¹ xᵢ =: h̄_i,
+        // the *unpenalized* weighted hat diagonal. For Gaussian identity (the
+        // only family reaching here) W is the fixed prior-weight diagonal, so h̄
+        // is independent of ρ and of the smoothing search. If max_i h̄_i is below
+        // the activation threshold, no ρ can trip the leverage gate, so the
+        // augmentation provably never engages and the per-outer-evaluation
+        // O(n·p²) ALO diagnostic (otherwise computed and discarded on EVERY cost
+        // and gradient evaluation — the dominant cost of ordinary P-spline /
+        // thin-plate Gaussian fits, #1689) is skipped with zero behavioral
+        // change. Computed lazily, at most once per surface.
+        if self.alo_provably_inactive_certificate()? {
             return Ok(None);
         }
         // Graceful degradation when the ALO diagnostic itself is not computable

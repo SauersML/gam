@@ -3815,6 +3815,7 @@ impl<'a> RemlState<'a> {
             glm_first_step_gram: RwLock::new(None),
             flat_glm_first_step_gram: RwLock::new(None),
             alo_frozen_nuisance: RwLock::new(None),
+            alo_provably_inactive: RwLock::new(None),
             persistent_warm_start_key: RwLock::new(None),
             persistent_latent_values_fingerprint: None,
             persistent_latent_values_cache: RwLock::new(PersistentLatentValuesCache::default()),
