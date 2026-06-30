@@ -31,3 +31,6 @@ Note: profiled_theta_hvp_outer_hessian_matches_fd... (Cluster 5) lives in tests/
 - (B) Cluster 4-gaussian: principled σ-floor decision — make reference & engine consistent.
 - (C) Cluster 2: envelope logdet-trace term (risky, prior regressions).
 - (D) Cluster 3: deep architectural.
+
+## Issue #1607 cont. (wiggle separation + batched gradient)
+Branch off main after #1658 merged. Spatial fullhessian fix already landed.
