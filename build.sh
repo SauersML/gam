@@ -44,31 +44,26 @@ if [[ -z "${CARGO_BUILD_JOBS:-}" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Compiler cache (sccache): a content-addressed warm dependency cache shared by
-# every agent tree on this box. sccache keys on preprocessed source + compiler
-# version + flags, so it is immune to the absolute-path / mtime churn that makes
-# a copied target/ dir worthless across machines. The heavy deps (faer, burn,
-# arrow, nalgebra, ndarray, …) are non-incremental and cache perfectly; the gam
-# crate itself keeps CARGO_INCREMENTAL for tight local item-reuse (sccache just
-# passes incremental compiles through uncached — the two compose, they don't
-# fight). First build after enabling is a one-time full rebuild (the rustc
-# wrapper changes cargo's fingerprint); every cold tree after that is warm.
+# INCREMENTAL-FIRST (the whole point of the crate split). The fleet hammers ONE
+# shared, warm target/ dir: editing a single crate must recompile only THAT crate
+# (item-level incremental) + relink — tens of seconds — NOT a 500-800s full
+# rebuild of the gam monolith. That is exactly what CARGO_INCREMENTAL=1 (set
+# above) buys, and it is the reason the workspace is split into crates.
 #
-# Wired via cargo's own `--config build.rustc-wrapper` (below) rather than the
-# RUSTC_WRAPPER env var: it is per-invocation and conditional, so a tree without
-# sccache still builds, and we set no environment. The on-disk cache lives in
-# sccache's default store; point it at a shared backend by exporting SCCACHE_DIR
-# or SCCACHE_BUCKET in your shell (sccache reads those natively — that is also
-# how you'd share one cache between this box and CI). Opt out: GAM_NO_SCCACHE=1.
+# sccache is DISABLED by default here because it actively defeats that: sccache
+# rejects incremental compilation ("prohibited"), so turning it on forces
+# CARGO_INCREMENTAL=0 and every edit becomes a FULL crate recompile. On this
+# single warm tree sccache also bought nothing — its dep artifacts are already
+# resident in target/ and reused via cargo's own fingerprints (measured: ~0%
+# sccache hit rate, 100% miss, pure overhead). sccache only helps COLD/throwaway
+# trees (fresh clones, CI) that don't share target/. Opt back in there with
+# GAM_USE_SCCACHE=1 (which trades incremental away on purpose).
 # ---------------------------------------------------------------------------
 CARGO=(cargo)
-if [[ -z "${GAM_NO_SCCACHE:-}" ]]; then
-  # Auto-install once if missing — a cold cache shouldn't be the steady state.
-  # Best-effort + idempotent: a single attempt is marked so we never re-hammer a
-  # package manager on every build. Delete .buildd/.sccache_tried to force a retry.
+if [[ -n "${GAM_USE_SCCACHE:-}" ]]; then
   if ! command -v sccache >/dev/null 2>&1 && [[ ! -f "$S/.sccache_tried" ]]; then
     : >"$S/.sccache_tried"
-    echo "[build.sh] sccache not found — installing it for a shared warm dep cache…" >&2
+    echo "[build.sh] sccache requested but not found — installing…" >&2
     {
       if command -v brew >/dev/null 2>&1; then brew install sccache
       elif command -v cargo >/dev/null 2>&1; then cargo install sccache --locked
@@ -77,9 +72,7 @@ if [[ -z "${GAM_NO_SCCACHE:-}" ]]; then
   fi
   if command -v sccache >/dev/null 2>&1; then
     CARGO+=(--config 'build.rustc-wrapper="sccache"')
-    # sccache rejects incremental compilation ("prohibited") and cannot cache
-    # it anyway; disable incremental whenever the sccache wrapper is active.
-    export CARGO_INCREMENTAL=0
+    export CARGO_INCREMENTAL=0   # sccache forbids incremental; cold-tree mode only
   fi
 fi
 # Compact one-line cache summary, in the same telemetry spirit as history.log.
