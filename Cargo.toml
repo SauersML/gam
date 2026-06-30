@@ -1,6 +1,6 @@
 [package]
 name = "gam"
-version = "0.3.134"
+version = "0.3.136"
 edition = "2024"
 rust-version = "1.93"
 autobins = false
@@ -93,30 +93,30 @@ libm = "0.2.16"
 # registry versions. The exact `=` pin keeps the family lock-stepped: a given
 # `gam` release only ever builds against the foundation crates it was compiled
 # against (their cross-crate surface is internal and unstable).
-gam-data = { path = "crates/gam-data", version = "=0.3.134" }
-gam-math = { path = "crates/gam-math", version = "=0.3.134" }
-gam-problem = { path = "crates/gam-problem", version = "=0.3.134" }
-gam-spec = { path = "crates/gam-spec", version = "=0.3.134" }
-gam-runtime = { path = "crates/gam-runtime", version = "=0.3.134" }
-gam-linalg = { path = "crates/gam-linalg", version = "=0.3.134" }
-gam-geometry = { path = "crates/gam-geometry", version = "=0.3.134" }
-gam-model-api = { path = "crates/gam-model-api", version = "=0.3.134" }
-gam-gpu = { path = "crates/gam-gpu", version = "=0.3.134" }
-gam-identifiability = { path = "crates/gam-identifiability", version = "=0.3.134" }
-gam-terms = { path = "crates/gam-terms", version = "=0.3.134" }
-gam-solve = { path = "crates/gam-solve", version = "=0.3.134" }
-gam-models = { path = "crates/gam-models", version = "=0.3.134" }
-gam-inference = { path = "crates/gam-inference", version = "=0.3.134" }
-gam-report = { path = "crates/gam-report", version = "=0.3.134" }
-gam-config = { path = "crates/gam-config", version = "=0.3.134" }
-gam-sae = { path = "crates/gam-sae", version = "=0.3.134" }
+gam-data = { path = "crates/gam-data", version = "=0.3.136" }
+gam-math = { path = "crates/gam-math", version = "=0.3.136" }
+gam-problem = { path = "crates/gam-problem", version = "=0.3.136" }
+gam-spec = { path = "crates/gam-spec", version = "=0.3.136" }
+gam-runtime = { path = "crates/gam-runtime", version = "=0.3.136" }
+gam-linalg = { path = "crates/gam-linalg", version = "=0.3.136" }
+gam-geometry = { path = "crates/gam-geometry", version = "=0.3.136" }
+gam-model-api = { path = "crates/gam-model-api", version = "=0.3.136" }
+gam-gpu = { path = "crates/gam-gpu", version = "=0.3.136" }
+gam-identifiability = { path = "crates/gam-identifiability", version = "=0.3.136" }
+gam-terms = { path = "crates/gam-terms", version = "=0.3.136" }
+gam-solve = { path = "crates/gam-solve", version = "=0.3.136" }
+gam-models = { path = "crates/gam-models", version = "=0.3.136" }
+gam-inference = { path = "crates/gam-inference", version = "=0.3.136" }
+gam-report = { path = "crates/gam-report", version = "=0.3.136" }
+gam-config = { path = "crates/gam-config", version = "=0.3.136" }
+gam-sae = { path = "crates/gam-sae", version = "=0.3.136" }
 # Shared test-support helpers (FD harness, fixtures, reference-tool + CLI
 # harnesses) carved into their own crate under #1521 so the workspace's other
 # crates can reach them cross-crate from their `#[cfg(test)]` modules. The root
 # `gam` crate re-exports it as `gam::test_support` (and re-exports its
 # `#[macro_export]` macros) so the integration tests under `tests/` keep their
 # `gam::test_support::*` / `gam::gam_binary!` paths unchanged.
-gam-test-support = { path = "crates/gam-test-support", version = "=0.3.134" }
+gam-test-support = { path = "crates/gam-test-support", version = "=0.3.136" }
 pest = "2.8.6"
 pest_derive = "2.8.6"
 arrow = { version = "54", default-features = false, features = ["ffi"] }
@@ -281,6 +281,21 @@ codegen-units = 1
 # preinstalled-toolchain wipe yields on a given runner image.
 [profile.test]
 debug = "line-tables-only"
+# Optimize the WORKSPACE crates in test builds, not just the dependencies below.
+# The heaviest single `#[test]` solver fits — the #979 survival marginal-slope
+# and #1593 competing-risks CIF regressions — spend their time in the gam-*
+# workspace numerical crates (orchestration, survival/joint-Newton, REML/PIRLS,
+# the per-row Hessian assembly), NOT in third-party kernels. Cargo's
+# `package."*"` glob (below) only reaches dependencies, so leaving the base test
+# profile at opt-level 0 left that workspace hot path unoptimized; on slower CI
+# runners those fits ran long enough to cross nextest's 600s per-test kill and
+# fail as opaque SIGKILL timeouts. opt-level 2 here keeps numerical results
+# identical (Rust does not enable fast-math, and the dependency kernels were
+# already optimized) and does NOT reintroduce the DWARF disk cliff — that is
+# governed by `debug` above, independent of opt-level — so it is a pure runtime
+# win that lets those solver-bound tests finish and self-report well inside the
+# per-test cap.
+opt-level = 2
 
 # Dev/`maturin develop` profile — same rationale as [profile.test]. Cargo's
 # default dev profile emits full DWARF (`debug = 2`), which is what lets
@@ -291,16 +306,20 @@ debug = "line-tables-only"
 [profile.dev]
 debug = "line-tables-only"
 
-# Dependencies carry most numeric inner loops in dev builds
+# Dependencies carry most numeric inner loops in DEV builds
 # (faer/matrixmultiply GEMM tiles, ndarray kernels, rayon): compile THEM
 # optimized while the workspace crate stays cheap for edit/compile iteration.
-# Test builds keep the workspace crate at Cargo's default opt level so local
-# runners do not materialize a huge optimized `gam` test artifact; the numeric
-# dependency kernels below still compile optimized, which is the hot-loop win
-# without the disk cliff.
+# The dev profile keeps the workspace crate at Cargo's default opt level so
+# local `maturin develop` / `cargo build` iteration does not materialize a huge
+# optimized `gam` artifact; the numeric dependency kernels below still compile
+# optimized, which is the hot-loop win without the iteration tax.
 [profile.dev.package."*"]
 opt-level = 2
 
+# Test builds optimize the workspace crates too (see opt-level on [profile.test]
+# above); this glob additionally optimizes the third-party numeric kernels, so
+# the whole test hot path — workspace solver code plus dependency kernels — runs
+# optimized.
 [profile.test.package."*"]
 opt-level = 2
 

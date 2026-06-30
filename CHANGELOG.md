@@ -1,3 +1,194 @@
+## v0.3.136 — gam 0.3.136 / gamfit 0.1.238 (2026-06-30)
+
+crates.io + PyPI release of the post-0.3.135 correctness wave. A cluster of
+smoothing/basis, REML-convergence, structure-search, geometry, survival and
+inference bugs are fixed at the root, each with a regression test. Everything
+reachable through the existing API stays backward-compatible; two changes adjust
+default basis sizing toward mgcv (a wigglier fit is still one explicit `k=`
+away).
+
+### Smoothing / basis fixes
+- **#1680 — the default univariate smooth basis is capped mgcv-like.**
+  `heuristic_knots_for_column` grew the default B-spline basis with `n` (20
+  internal knots / a 24-function cubic basis for any column with ≥80 unique
+  values; the `n^{1/3}` ceiling only engaged above ~8000 unique values, so it was
+  dead in practice). That over-rich default over-parameterized weak-signal
+  additive fits and let the outer REML optimizer leak truth into surplus columns
+  the penalty could not shrink (truth-RMSE ≈0.39 vs mgcv's ≈0.09 on a
+  near-collinear 4-smooth n=120 fit). The default is now a flat 8 internal knots
+  (basis dim ≈12, close to mgcv's univariate `k=10`); columns with ≤32 unique
+  values keep their previous knot count exactly, and an explicit `k=` always
+  wins. Same defect class as the thin-plate over-sizing in #1074.
+- **#1731 — Matérn realized basis now grows with requested `k`.** The auto length
+  scale was seeded `k`-blind (`max_range/√n`), so once the requested centers
+  packed denser than that fixed scale could resolve, neighbouring radial bases
+  went numerically collinear and the #755 rank-reduce guard dropped them — the
+  basis saturated and even *decreased* for large `k` (`k=150 → 104` realized).
+  The auto length scale is now density-adaptive (`max_range/√max(n,k)`, the same
+  fill-distance law the Duchon promotion uses): bit-identical to the old seed
+  whenever `n ≥ k`, and shrinking with `k` past that so the centers stay
+  independent (`k=150 → 150`). Only the auto sentinel is touched; an explicit
+  length scale is never overridden and the rank-reduce guard remains the
+  last-resort degenerate-data net.
+
+### REML / optimizer
+- **#1033 — the κ/ψ smoothing window is n-invariant at BOTH edges.** The κ line
+  search could overshoot ABOVE the maximal-rank band to a ψ where the conditioned
+  Gram drops rank, soundly refusing the n-free design-realization skip and
+  tripping two O(n) `reset_surface` passes (the n=16000 fast-ladder regression).
+  A symmetric `rank_stable_psi_ceiling` (the twin of the existing low-edge floor)
+  now clamps the optimizer's ψ upper bound to the top of the maximal-rank band —
+  a pure O(nodes·k³) k-space property, inherently n-independent. The κ-optimum
+  lives inside the band, so the clamp only excludes over-fit length scales.
+- **#1690 — a Gamma flat-valley REML stall is no longer mis-reported as
+  non-converged.** A single-smooth `s(x,k=12)` n=600 Gamma+log fit reaches the
+  genuine optimum but the in-loop cost-stall guard sampled a warm-start-sensitive
+  ρ-gradient just above its score-relative bound and halted non-converged, which
+  in turn triggered wasted deterministic-replay ARC retries (the actionable slice
+  of "Gamma ~7× slower than mgcv at equal accuracy"). `outer_converged` is now
+  reconciled against the authoritative gradient of the fit actually shipped, gated
+  strictly on the flat-valley stop reason; a genuinely non-stationary floor (and
+  the #1426 stuck overfit, |g|≈11 ≫ bound) still reports non-converged.
+
+### SAE structure search
+- **#1556 — birth/fission no longer panics.** Structure-search grow moves bumped
+  the dictionary size and `ρ.log_ard` but left `ρ.log_lambda_smooth` at the old
+  length, so the next `assemble_arrow_schur` indexed out of bounds. Both grow
+  paths now push an inherited per-atom smoothness strength (born inherits atom 0;
+  a fissioned child inherits its parent), and `assemble_arrow_schur` validates the
+  length so any future grow path that forgets surfaces a clear `Err`.
+- **#977/#1026 — the born-atom topology race is scored by proper REML.** The birth
+  race scored each candidate basis with a hand-rolled `½·SSE + ½·log|H|` Laplace
+  term at a stamped `λ=1` on the raw curvature Gram — not commensurable across
+  bases, so a periodic basis's `(2π)⁴` curvature energy lost a perfect circle to a
+  straight line (and a cylinder to a sphere). Candidates are now scored by a
+  rank-aware REML/LAML with an estimated λ̂, so the heterogeneous-dictionary races
+  pick the topology the evidence supports.
+
+### Geometry / linear algebra
+- **#1641 — IBP θ-adjoint cross-row Woodbury logdet channel corrected.** The
+  cross-row Woodbury pass in `logdet_theta_adjoint` carried a spurious ½ (a
+  ρ-trace convention) while differentiating the full `log|H|`, dropped the factor
+  of 2 on the symmetric u-changing term, and double-counted the `i=j` self
+  curvature already handled by the diagonal channels. The pass now restricts to
+  the `i≠j` off-diagonal with full-trace coefficients, mirroring the known-good
+  #1416 ρ-trace cross-row pass and matching the dense finite-difference oracle.
+
+### Survival
+- **#1717 — `survival_at(t|x)` is invariant to the placeholder time column.** The
+  default 64-point survival grid floored its upper edge to the training support
+  but let a large placeholder exit stretch it past, coarsening every in-range cell
+  and drifting the interpolation off the true curve (up to ~14%). When the fitted
+  model carries a training-time upper bound the grid now spans exactly that
+  support; query times beyond it are handled by extrapolation (#1595), not by the
+  grid. The dual of #896.
+
+### Inference
+- **#1722 — Beta posterior credible intervals are no longer ~4-5× too narrow.**
+  `laplace_gaussian_fallback` rescaled draws by `dispersion().sqrt_phi()`, but
+  Beta's IRLS working weight already folds φ into the stored penalized Hessian, so
+  `Vb = H⁻¹` needs no extra dispersion factor. The per-draw scale is now the
+  coefficient-covariance scale `summary()`'s Wald SE is built from — `σ̂²` for a
+  profiled Gaussian (a no-op for Gaussian/location-scale/survival) and `1.0` for
+  Beta and the other fixed-scale families, fixing only Beta.
+
+### Internal / CI
+- The `[profile.test]` base now optimizes the workspace numerical crates
+  (`opt-level = 2`), not just dependencies, so the heaviest solver-bound tests
+  (#979 survival, #1593 competing-risks) finish inside nextest's 600s per-test
+  cap instead of dying as opaque SIGKILL timeouts. Numerically identical.
+- `build.sh`'s inner timeout is overridable via `GAM_BUILD_TIMEOUT`.
+
+## v0.3.135 — gam 0.3.135 / gamfit 0.1.237 (2026-06-30)
+
+crates.io + PyPI release of the post-0.3.134 correctness-and-performance wave.
+A broad set of smoothing/REML, survival, geometry and inference bugs are fixed
+at the root, several hot paths are made meaningfully faster, and the `gamfit`
+Python surface gains additive SAE keyword aliases. Everything reachable through
+the existing API stays backward-compatible.
+
+### Smoothing / REML fixes
+- **#1654 — convex/concave shape smooths no longer park in the linear corner.**
+  The double-penalty nullspace ridge under the order-2 box reparameterization
+  was rebuilt from scratch instead of transformed by the same congruence
+  `S ↦ TᵀST` as the wiggliness penalty, decoupling the level/slope and
+  wiggliness scales and driving curvature-constrained fits to a near-straight
+  line (EDF ≈ 1.5) for a seed/`k`-specific subset. The exact congruence is
+  restored for the curvature ridge; the monotone path keeps its #509 projector.
+- **#509 — monotone REML λ-search no longer parks at the integer seed.** The
+  cost-stall guard keyed its keep-descending escape on a fixed absolute gradient
+  ceiling, so a shape-constrained inner solve with a non-binding constraint
+  stalled near the seed while the projected gradient still descended strongly
+  (over-smoothing already-monotone data). The escape is now scaled to the score.
+- **#1629 — Matérn smooths no longer over-smooth 2-D surfaces.** Matérn now
+  routes through the same length-scale auto-init sentinel as thin-plate so the
+  basis seeds the resolving regime instead of a degenerate global scale.
+- **#1676 — `scale_dimensions=True` now engages anisotropy for thin-plate.** A
+  multi-axis `tp` term is rewritten to its mathematically-equivalent anisotropic
+  s=0 Duchon twin (the thin-plate kernel `r^{2m−d}` is the s=0 Duchon kernel), so
+  per-axis tension ARD engages exactly as for `duchon()`/`matern()` instead of
+  the flag being a silent no-op. Default (flag off) and 1-D `tp` are unchanged.
+- **#1269 — thin-plate basis is exactly translation-invariant.** The strict
+  basis-conditioning gate is split out and pinned at the bit level.
+- **#1476 — double-penalty no longer over-shrinks a supported smooth.** A budget-
+  exhaustion best-feasible substitution used a bare early `return` that bypassed
+  the multi-start keep-best loop and could ship a degenerate box corner; it now
+  flows through keep-best as a non-converged candidate.
+- **#1033 — the κ/ψ smoothing window is now n-invariant.** Even-spaced capped
+  diameter sampling and a rank-stable ψ floor anchored at the optimizer seed kill
+  an n-dependent shift in the outer optimizer's box.
+- **#901 — iso-κ joint-REML outer-gradient FD oracles re-homed and verified.**
+
+### Survival fixes
+- **#965 — survival FFI rejects negative times; `S(0)=1`.** Negative/NaN/Inf
+  times are rejected at the Python→Rust boundary and the parametric fallback
+  guards the `exp(-∞·0)=NaN` origin case.
+- **#1595 — survival/cumulative-hazard extrapolation policy threaded into the
+  dense Rust FFI kernels**, so `S=exp(-H)` holds past the grid in both the
+  chunked and CSV paths.
+- **#392/#369 — fit-to-completion guards restored for non-linear survival
+  baselines** (real convergence asserted across all baseline targets).
+
+### Inference / families fixes
+- **#332 — near-constant Gaussian response is rejected with a clean error**
+  instead of producing a degenerate fit.
+- **#1655 — the GPD tail estimator accepts light (k<0) tails** (σ from the
+  un-shrunk k, matching ArviZ/loo) instead of returning `None`.
+- **#1621 — debiased point/contrast prediction handles inert categorical
+  bookkeeping columns** via lenient encoding for non-required columns.
+- **#1101 — the multinomial per-class probability-SE calibration test** is
+  replaced with a valid over-refit calibration (the prior test was statistically
+  degenerate).
+- **#1561 — the final location-scale β̂ refit at ρ\* is seeded warm from the
+  outer optimum** instead of cold, fixing a basin-fragility KKT cert-refusal
+  crash on stiff two-block fits.
+
+### Geometry
+- **#1637 — genuine Stiefel canonical-metric logarithm for k≥2**, anchored to
+  Y⊥ to kill spurious π rotations, with an exhaustive `Log∘Exp=id` sweep and a
+  square-input completion guard.
+- **#1661 — CLR `simplex_exp_map` rejects a non-finite tangent** with an error
+  instead of returning `Ok(NaN)`.
+
+### Python (`gamfit`)
+- **#159/#160/#178 — additive SAE keyword aliases**: `assignment` /
+  `assignment_prior`, `K` / `n_atoms`, and `random_state` wiring, resolved
+  end-to-end into the Rust FFI with eager conflict detection.
+
+### Performance (value-preserving)
+- **#1575** cuts the Firth/Jeffreys outer-Hessian cost on binomial/logit REML.
+- **#759** restores the rayon parallel reduction in `trace_product_sparse`.
+- **#1082** brings the competing-risks CIF quality case from 439 s to 122 s by
+  not expanding the ρ₀ offset on an untagged inner-failure pre-warm.
+- **reml Jeffreys drift** GEMM-izes the H_Φ curvature-drift contraction (was a
+  bounds-checked scalar triple loop dominating competing-risks Weibull fits).
+- **#1033 / #979** make the ψ-gram a true sufficient-statistic reduction and
+  bound the marginal-slope continuation pre-warm.
+
+### Known-limitation note
+The GAMLSS location-scale engine/reference parity and inner-solve convergence
+cluster (#1607) remains under active work; those `gam-models` tests are not yet
+green and no user-facing API depends on them.
 ## v0.3.134 — gam 0.3.134 / gamfit 0.1.236 (2026-06-29)
 
 crates.io + PyPI release of the post-0.3.133 correctness-and-performance wave:

@@ -1,6 +1,6 @@
 [package]
 name = "gam-solve"
-version = "0.3.134"
+version = "0.3.136"
 edition = "2024"
 description = "REML/LAML outer solver and PIRLS inner engine for the gam penalized-likelihood engine"
 license = "AGPL-3.0-or-later"
@@ -14,16 +14,16 @@ warnings = "deny"
 [dependencies]
 dyn-stack = "0.13.2"
 faer = "0.24.0"
-gam-geometry = { path = "../gam-geometry", version = "=0.3.134" }
-gam-gpu = { path = "../gam-gpu", version = "=0.3.134" }
-gam-identifiability = { path = "../gam-identifiability", version = "=0.3.134" }
-gam-linalg = { path = "../gam-linalg", version = "=0.3.134" }
-gam-math = { path = "../gam-math", version = "=0.3.134" }
-gam-model-api = { path = "../gam-model-api", version = "=0.3.134" }
-gam-problem = { path = "../gam-problem", version = "=0.3.134" }
-gam-runtime = { path = "../gam-runtime", version = "=0.3.134" }
-gam-spec = { path = "../gam-spec", version = "=0.3.134" }
-gam-terms = { path = "../gam-terms", version = "=0.3.134" }
+gam-geometry = { path = "../gam-geometry", version = "=0.3.136" }
+gam-gpu = { path = "../gam-gpu", version = "=0.3.136" }
+gam-identifiability = { path = "../gam-identifiability", version = "=0.3.136" }
+gam-linalg = { path = "../gam-linalg", version = "=0.3.136" }
+gam-math = { path = "../gam-math", version = "=0.3.136" }
+gam-model-api = { path = "../gam-model-api", version = "=0.3.136" }
+gam-problem = { path = "../gam-problem", version = "=0.3.136" }
+gam-runtime = { path = "../gam-runtime", version = "=0.3.136" }
+gam-spec = { path = "../gam-spec", version = "=0.3.136" }
+gam-terms = { path = "../gam-terms", version = "=0.3.136" }
 log = "0.4.29"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 opt = "0.5.2"

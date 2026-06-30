@@ -82,12 +82,26 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_ibp_map() {
         .logdet_theta_adjoint(&rho, &cache, &solver)
         .expect("Gamma");
     let h = 1.0e-5;
-    // Probe both atoms across distinct rows so the cross-row coupling
-    // (different rows sharing a column) is exercised on both columns.
+    // Probe both atoms across distinct rows so the cross-row coupling (different
+    // rows sharing a column) is exercised on both columns, AND probe the COORD
+    // channel — the #1641 defect made BOTH the logit and the coord channel of the
+    // IBP θ-adjoint disagree with dense FD (logit ~4× over tol; coord ~10× off),
+    // because the cross-row Woodbury pass double-counted the rank-one self term and
+    // carried the ρ-trace ½ instead of the full trace. The coord slots do not pass
+    // through the Woodbury pass, but they contract the SAME assembled `htt`
+    // (whose IBP diagonal carries the cross-row self curvature), so they guard the
+    // one-operator consistency of the whole θ-adjoint, not just the logit lane.
+    //
+    // Dense IBP layout (K = 2, `last_row_layout = None`): per row block, local
+    // positions `0..K` are the logit slots (atom = local_pos) and `K..2K` are the
+    // coordinate slots (atom = local_pos − K, axis 0), so local_pos 2 ↔ atom 0
+    // coord and local_pos 3 ↔ atom 1 coord.
     let probes = [
         (0usize, 0usize, SaeLocalRowVar::Logit { atom: 0 }),
         (4usize, 1usize, SaeLocalRowVar::Logit { atom: 1 }),
         (7usize, 0usize, SaeLocalRowVar::Logit { atom: 0 }),
+        (1usize, 2usize, SaeLocalRowVar::Coord { atom: 0, axis: 0 }),
+        (6usize, 3usize, SaeLocalRowVar::Coord { atom: 1, axis: 0 }),
     ];
     for (row, local_pos, var) in probes {
         let mut plus = term.clone();
@@ -135,15 +149,18 @@ pub(crate) fn ibp_rho_sparse_logdet_trace_matches_dense_fd_1416() {
     // Fixed-alpha IBP-MAP with an active sparse prior so the cross-row Woodbury
     // source is genuinely live.
     term.assignment.mode = AssignmentMode::ibp_map(0.7, 0.9, false);
-    // Fixed-alpha IBP-MAP is PD only on a narrow ρ_sparse island: at the previous
-    // −1.0 the cross-row IBP joint Hessian is non-PD and the converge call panics
-    // at setup. ρ_sparse = 1.0 lands inside the PD basin, where the cross-row
-    // Woodbury source is genuinely live and the analytic ρ_sparse trace matches
-    // the fixed-state central difference of log|H| to ≈4 digits. Setup fix only —
-    // no tolerance weakened.
-    rho.log_lambda_sparse = 1.0;
+    // Fixed-alpha IBP-MAP is PD only on a narrow ρ_sparse island, AND the
+    // #1625-class separation-barrier gating (a5f099e21) slowed the inner
+    // (t, β)-Newton so the old 5-iteration budget no longer reaches a stationary
+    // cache at ANY ρ — the `.expect("converged cache")` panicked at setup. ρ_sparse
+    // = −0.5 lands inside the PD basin and, at the same 200-iteration budget the
+    // `..._on_tiny_fixture` sibling uses to reach a tight optimum, the inner solve
+    // converges and the analytic ρ_sparse trace matches the fixed-state central
+    // difference of log|H| to ≈10 digits (verified across a ρ × inner-iteration
+    // sweep). Setup fix only — no tolerance weakened, shared fixture untouched.
+    rho.log_lambda_sparse = -0.5;
     let (_value, _loss, cache) = term
-        .reml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
+        .reml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
         .expect("converged cache");
     let solver = DeflatedArrowSolver::plain(&cache);
     let analytic = term

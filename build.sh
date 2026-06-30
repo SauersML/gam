@@ -68,7 +68,12 @@ sccache_summary() {
     | sed 's/^[[:space:]]*/[sccache] /' >&2 || true
 }
 
-TIMEOUT=1800
+# Inner wall-clock cap for the build / test-run lane. Defaults to 30 min, which
+# covers every routine build and the vast majority of tests. A few legitimate
+# multi-n perf-acceptance sweeps (e.g. the #1033 κ-loop ladder fitting n up to
+# 320k) genuinely run longer; override with GAM_BUILD_TIMEOUT=<seconds> for those
+# without forking the shared gate. Routine callers are unaffected.
+TIMEOUT="${GAM_BUILD_TIMEOUT:-1800}"
 MIN_FREE_GB="${MIN_FREE_GB:-8}"
 now() { date +%H:%M:%S; }; ep() { date +%s; }
 

@@ -145,13 +145,43 @@ pub(crate) fn continuation_prewarm_step_budget(
         .p_coefficients
         .unwrap_or(0);
     let multi_seed_cascade = seed_count > seed_budget.max(1);
-    let expensive_shape =
-        p_coefficients >= EXPENSIVE_PREWARM_COEFF_DIM || cap.n_params >= EXPENSIVE_PREWARM_RHO_DIM;
+    // An "expensive shape" for pre-warm bounding is ANY problem at or past the
+    // #979 per-step cost cliff. The legacy gate (p ≥ 24 or rho dim ≥ 4) MISSED
+    // the marginal-slope cliff: two `matern/duchon(centers=K)` formulas give
+    // p ≈ 2K, so the centers≈8 cliff lands at p ≈ 16 — below the legacy p ≥ 24
+    // tier and below the rho-dim ≥ 4 tier (two formulas ⇒ rho_dim ≈ 2). Without
+    // the cliff term `base_budget` stayed at the full PATH_BUDGET (64) and the
+    // ONLY thing that bounded the cold walk was the inverse-p `cost_scaled_*`
+    // taper (64 → ~12 at p = 16). Twelve multi-second inner solves is still the
+    // ~108s the owner measured under parallel (all-cold) load, while a sequential
+    // rerun that happened to hit the persisted warm-start cache skipped it
+    // entirely — so the SAME inputs were "seconds vs intractable" purely as a
+    // function of disk-cache/scheduling state (#979 Experiment-2). Folding the
+    // cost cliff into `expensive_shape` collapses the cold base to the small
+    // bounded tier at the cliff, making the fired magnitude a deterministic
+    // function of the PROBLEM (p_coefficients, rho dim) — the warm-start cache
+    // hit then only ever turns the bounded tier into a redundant skip-to-0,
+    // never the difference between bounded and unbounded.
+    let expensive_shape = p_coefficients >= EXPENSIVE_PREWARM_COEFF_DIM
+        || p_coefficients >= PREWARM_COST_CLIFF_COEFF_DIM
+        || cap.n_params >= EXPENSIVE_PREWARM_RHO_DIM;
 
-    // Shape-derived base budget: the legacy "expensive shape" tiers. This caps
-    // the pre-warm only once the problem is large enough to declare an
-    // expensive shape (p ≥ 24 or rho dim ≥ 4).
-    let base_budget = if multi_seed_cascade && expensive_shape {
+    // True once the coefficient dim is at or past the #979 per-step cost cliff,
+    // where each inner joint-Newton solve is already multi-second. This is the
+    // regime where the cold pre-warm became intractable (~108s for ~12 steps at
+    // the centers≈8 cliff), so the cold base is bounded by the SMALL documented
+    // tier (`MULTI_SEED_PREWARM_BUDGET`) here — NOT the larger
+    // `SINGLE_EXPENSIVE_PREWARM_BUDGET` — before the inverse-p taper scales it
+    // down further. The taper alone (from a base of 64) left 12 steps at the
+    // cliff; capping the base to the small tier first brings the cold magnitude
+    // to the owner's 4–6 / `MULTI_SEED_PREWARM_BUDGET` "small number" intent.
+    let past_cost_cliff = p_coefficients >= PREWARM_COST_CLIFF_COEFF_DIM;
+
+    // Shape-derived base budget: the legacy "expensive shape" tiers, with the
+    // #979 cost cliff bounding the cold base to the small tier. This caps the
+    // pre-warm once the problem is large enough to declare an expensive shape
+    // (p ≥ 24, p ≥ the cost cliff, or rho dim ≥ 4).
+    let base_budget = if past_cost_cliff || (multi_seed_cascade && expensive_shape) {
         MULTI_SEED_PREWARM_BUDGET.min(default_budget)
     } else if expensive_shape {
         SINGLE_EXPENSIVE_PREWARM_BUDGET.min(default_budget)
@@ -1153,31 +1183,56 @@ pub(crate) fn run_outer_with_plan(
                             // (#1355); here it covers the budget-exhaustion exit.
                             let best_exit =
                                 cost_stall_exit.lock().ok().and_then(|slot| slot.clone());
-                            if let Some(best) = best_exit {
-                                let last_value = last_solution.final_value;
-                                let best_is_strictly_better = best.value.is_finite()
-                                    && (!last_value.is_finite() || best.value < last_value);
-                                if best_is_strictly_better {
+                            // The best-feasible-iterate substitution must produce
+                            // THIS seed's `result` (an expression that feeds the
+                            // multi-start keep-best below), NOT short-circuit the
+                            // whole function with a bare `return`. A bare `return`
+                            // here discards any CONVERGED fit an earlier seed already
+                            // stored in `best`: on a #1476 concurvity double-penalty
+                            // surface the flexible slot-0 seed converges to the
+                            // genuine interior optimum (cost ~133), then the promoted
+                            // heavy slot-1 seed (#1426) budget-exhausts on the
+                            // null-space annihilation shelf and its best-feasible
+                            // iterate is a degenerate box corner with a SPURIOUSLY
+                            // LOWER cached cost (~65, projected |g| ≫ tol — an invalid
+                            // REML the line search could not improve). Returning it
+                            // directly shipped that corner (edf_total→1, the supported
+                            // smooth annihilated) even though keep-best already held
+                            // the converged optimum. Flowing it through keep-best as a
+                            // NON-converged candidate lets `candidate_improves_best`
+                            // reject it (a converged best always beats a non-converged
+                            // candidate). When this seed is the ONLY one (the original
+                            // single-start #1371 case) `best` is still None, so
+                            // keep-best adopts it unchanged — that behavior is
+                            // preserved byte-for-byte.
+                            match best_exit {
+                                Some(best)
+                                    if best.value.is_finite()
+                                        && (!last_solution.final_value.is_finite()
+                                            || best.value < last_solution.final_value) =>
+                                {
                                     log::warn!(
                                         "[OUTER] {context}: ARC budget-exhaustion last iterate \
                                          (value={:.6e}) is worse than the best feasible iterate \
-                                         seen (value={:.6e}); returning the best iterate so a \
+                                         seen (value={:.6e}); substituting the best iterate so a \
                                          degenerate box-corner does not over-shrink a supported \
-                                         penalty direction (#1371).",
-                                        last_value,
+                                         penalty direction (#1371). The substituted iterate flows \
+                                         through the multi-start keep-best as a non-converged \
+                                         candidate so an earlier converged seed still wins (#1476).",
+                                        last_solution.final_value,
                                         best.value,
                                     );
-                                    return Ok(outer_result_with_gradient_norm(
+                                    Ok(outer_result_with_gradient_norm(
                                         best.rho,
                                         best.value,
                                         best.iterations,
                                         Some(best.grad_norm),
                                         false,
                                         *the_plan,
-                                    ));
+                                    ))
                                 }
+                                _ => Ok(solution_into_outer_result(*last_solution, false, *the_plan)),
                             }
-                            Ok(solution_into_outer_result(*last_solution, false, *the_plan))
                         }
                         Err(ArcError::ObjectiveFailed { message })
                             if message == COST_STALL_CONVERGED_SENTINEL =>

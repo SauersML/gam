@@ -1,6 +1,6 @@
 [package]
 name = "gam-geometry"
-version = "0.3.134"
+version = "0.3.136"
 edition = "2024"
 rust-version = "1.93"
 description = "Riemannian-manifold geometry (charts, exp/log maps, Fréchet means, curvature estimands) for the gam penalized-likelihood engine"
@@ -13,7 +13,7 @@ warnings = "deny"
 [dependencies]
 faer = "0.24.0"
 libm = "0.2.16"
-gam-linalg = { path = "../gam-linalg", version = "=0.3.134" }
-gam-math = { path = "../gam-math", version = "=0.3.134" }
+gam-linalg = { path = "../gam-linalg", version = "=0.3.136" }
+gam-math = { path = "../gam-math", version = "=0.3.136" }
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 wide = "0.7"

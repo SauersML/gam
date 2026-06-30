@@ -3415,6 +3415,37 @@ impl SaeManifoldTerm {
         Ok(value)
     }
 
+    /// Whether assembling `registry` will scatter an isometry Gauss-Newton
+    /// cross-block (`H_tβ`) into the per-row dense `htbeta` slabs.
+    ///
+    /// `add_sae_isometry_metric_gn_blocks` writes the coupled cross-block (and
+    /// flips on `activate_dense_htbeta_supplement`) only when (a) the registry
+    /// carries an `Isometry` penalty and (b) the atom's chart
+    /// `preserves_isometry_cross_block_coherence` (flat charts — `Euclidean`,
+    /// `Circle`, and flat products — keep the full `μ AᵀA` coupling; curved /
+    /// boundary charts drop it to stay PSD). On the non-frames matrix-free path
+    /// the data-fit cross-block is carried by the Kronecker row operator and the
+    /// per-row `htbeta` slab is allocated at zero width (#1406/#1407 anti-leak),
+    /// so this dense isometry supplement has nowhere to land unless the slab is
+    /// widened to the full `beta_dim`. This predicate decides exactly that. The
+    /// effective isometry weight `μ` is NOT consulted here: a near-zero `μ`
+    /// short-circuits the per-row write, but the slab must still exist so the
+    /// solver's `htbeta_dense_supplement` read is well-shaped.
+    pub(crate) fn registry_writes_dense_isometry_cross_block(
+        &self,
+        registry: &AnalyticPenaltyRegistry,
+    ) -> bool {
+        registry
+            .penalties
+            .iter()
+            .any(|p| matches!(p, AnalyticPenaltyKind::Isometry(_)))
+            && self
+                .assignment
+                .coords
+                .iter()
+                .any(|coord| coord.manifold().preserves_isometry_cross_block_coherence())
+    }
+
     /// Extra analytic-penalty energy that has no native `SaeManifoldLoss`
     /// component but is part of the penalized objective ranked by the SAE
     /// Laplace/REML criterion.
@@ -3652,6 +3683,18 @@ impl SaeManifoldTerm {
             return Err(format!(
                 "SaeManifoldTerm::assemble_arrow_schur: log_ard length {} != K {}",
                 rho.log_ard.len(),
+                self.k_atoms()
+            ));
+        }
+        // `lambda_smooth` is indexed per-atom in the smoothness gradient/curvature
+        // assembly (`lambda_smooth[atom_idx]`); a too-short vector (e.g. a growth
+        // move that grew `k_atoms()` without extending ρ — #1556) would panic deep
+        // in the assembly loop with an opaque index-out-of-bounds. Validate it here
+        // alongside `log_ard` so the contract violation surfaces as a clear Err.
+        if rho.log_lambda_smooth.len() != self.k_atoms() {
+            return Err(format!(
+                "SaeManifoldTerm::assemble_arrow_schur: log_lambda_smooth length {} != K {}",
+                rho.log_lambda_smooth.len(),
                 self.k_atoms()
             ));
         }
@@ -3958,11 +4001,32 @@ impl SaeManifoldTerm {
         // touches `block.htbeta`. Allocating it at `beta_dim = K·M·p` there is the
         // ~6 TiB high-K leak (#1405/#1406): allocate ZERO columns instead. Frames
         // still use the (much smaller) factored border width.
-        let row_htbeta_dim = if frames_engaged && !fixed_decoder {
+        // #795/#1406/#1407: the non-frames matrix-free path normally holds a
+        // ZERO-width per-row cross-block slab — the data-fit `H_tβ` is carried by
+        // the Kronecker row operator (`set_row_htbeta_operator`), and allocating
+        // the dense slab at `beta_dim = K·M·p` is the high-K memory leak. But an
+        // ISOMETRY penalty on a coherence-preserving (flat) chart scatters an
+        // ADDITIONAL Gauss-Newton cross-block into the dense per-row `htbeta`
+        // slab and flips on `activate_dense_htbeta_supplement` — dropping it would
+        // leave the Newton system block-diagonal and forfeit the strong `t↔B`
+        // isometry coupling the circle fit needs to reach KKT stationarity (#795).
+        // So on the non-frames path widen the slab to `beta_dim` exactly when that
+        // dense supplement will be written, and keep zero width otherwise.
+        let dense_isometry_cross_block = !fixed_decoder
+            && analytic_penalties
+                .map(|registry| self.registry_writes_dense_isometry_cross_block(registry))
+                .unwrap_or(false);
+        let row_htbeta_dim = if fixed_decoder {
+            // Fixed-decoder mode skips the β tier entirely.
+            0
+        } else if frames_engaged {
             self.factored_border_dim()
+        } else if dense_isometry_cross_block {
+            // Matrix-free data-fit cross-block + dense isometry supplement: the
+            // supplement is written/read in the full-`B` β coordinate system.
+            beta_dim
         } else {
-            // #1406/#1407: matrix-free path and fixed-decoder mode hold no dense
-            // cross-block slab (fixed-decoder skips the β tier entirely).
+            // Matrix-free path with no dense cross-block supplement.
             0
         };
         // Build the Arrow-Schur system: heterogeneous row dims when a compact
@@ -6270,7 +6334,11 @@ impl SaeManifoldTerm {
         // β off the seed), so we factor exactly once at the frozen iterate and
         // return that undamped cache without invoking the stationarity gate.
         // The caller has already run `run_joint_fit_arrow_schur(..., 0, ...)`,
-        // which left the seed untouched, so `self` is at the warm-start β here.
+        // which under the `max_iter == 0` freeze (gam#577/#579, #850) runs ONLY
+        // the β-neutral basis refresh and returns the loss without touching β —
+        // it skips the rank-reduction, frame activation, re-seed guards, and the
+        // #1026 decoder-LSQ polish that would otherwise refit β off the seed — so
+        // `self` is at the warm-start β here.
         if inner_max_iter == 0 {
             let sys = self
                 .assemble_arrow_schur(target, rho, registry)
@@ -9116,30 +9184,53 @@ impl SaeManifoldTerm {
                 gamma_t[t_index] += col_coeff[atom] * channels.z_jac[row * k_atoms + atom];
             }
 
-            // #1416: the EXACT cross-row Woodbury derivative of Γ. The assembled
-            // `H` carries the per-column rank-one block `W_k = d_k·u_k u_kᵀ` with
-            // `u_k` the J-weighted column indicator (`u_k[slot(i,k)] = J_ik`) and
-            // `d_k = w·s'_k` (`cross_row_d[k]`). Both `d_k` (through `M_k`) and the
-            // `u_k` entries (through `ℓ_ik`) depend on the logits, so
+            // #1416 / #1641: the EXACT cross-row Woodbury derivative of Γ. The
+            // assembled `H` carries the per-column rank-one block
+            // `W_k = d_k·u_k u_kᵀ` with `u_k` the J-weighted column indicator
+            // (`u_k[slot(i,k)] = J_ik`) and `d_k = w·s'_k` (`cross_row_d[k]`). Both
+            // `d_k` (through `M_k`) and the `u_k` entries (through `ℓ_ik`) depend on
+            // the logits, so
             //   ∂W_k/∂ℓ_wk = dd_k·J_wk·u_k u_kᵀ
             //               + d_k·c_wk·(e_w u_kᵀ + u_k e_wᵀ),
             // where `dd_k = ∂d_k/∂M_k = w·s''_k` (`cross_row_dd[k]`),
             // `c_wk = ∂J_wk/∂ℓ_wk` (`logit_curvature`), and `e_w` is the unit
-            // vector at row `w`'s logit-`k` slot. Contracting `½ tr(H⁻¹ ∂W_k/∂ℓ_wk)`:
-            //   Γ_wk += ½·dd_k·J_wk·(u_kᵀ H⁻¹ u_k)        (term A: e·J_w·(JᵀH⁻¹J))
-            //         +    d_k·c_wk·(H⁻¹ u_k)_{slot(w,k)}  (term B: 2d·c_w·(H⁻¹J)_w).
-            // Both `u_kᵀ H⁻¹ u_k = (JᵀH⁻¹J)_k` and the vector `(H⁻¹ u_k) = (H⁻¹J)_·k`
-            // come from ONE solve per column, `x_k = H⁻¹ u_k` — so the adjoint
-            // differentiates the SAME `H = H₀ + Σ_k W_k` the value/logdet use,
-            // closing the one-operator contract on the rank-one block too.
+            // vector at row `w`'s logit-`k` slot.
+            //
+            // The θ-adjoint contracts the FULL trace `Γ_wk = tr(H⁻¹ ∂H/∂ℓ_wk)`
+            // (NOT the `½ tr` the ρ-trace uses — `fixed_state_logdet` differentiates
+            // the full `log|H|`, and the per-row blocks above contract `inv_vv·dh`
+            // with no ½). Critically, the `i=j` self curvature `w·s'_k·J_ik²` of the
+            // rank-one block lives on the assembled `htt` DIAGONAL `H_ik`, so its
+            // derivative is ALREADY differentiated by the row-local
+            // `local_logit_third` channel (direct-z, `i=w`) and the `m_channel`
+            // column pass (via `M_k`) above. This Woodbury pass must therefore add
+            // ONLY the off-diagonal `i≠j` remainder — otherwise the self term is
+            // double-counted (the #1641 defect: the pre-fix pass summed the full
+            // `u_k u_kᵀ` including `i=j`, AND carried the ρ-trace ½, AND dropped the
+            // factor 2 on the symmetric `e_w u_kᵀ + u_k e_wᵀ` term). Excluding `i=j`
+            // is also why this pass needs no deflation correction: it contracts only
+            // DISTINCT rows, off any single-row `vᵢ`'s support (matching the
+            // #1416 ρ-trace cross-row pass).
+            //
+            // Contracting `tr(H⁻¹ ∂W_k/∂ℓ_wk)` over `i≠j` only:
+            //   Γ_wk += dd_k·J_wk·( u_kᵀ H⁻¹ u_k − Σ_i P_ii·J_ik² )       (term A)
+            //         + 2·d_k·c_wk·( (H⁻¹ u_k)_{slot(w,k)} − P_ww·J_wk )  (term B),
+            // where `P_ii = (H⁻¹)_{slot(i,k),slot(i,k)}` is the selected-inverse
+            // diagonal recorded in `ibp_logit_sites`. The subtracted self pieces are
+            // exactly the `i=j` terms the diagonal channels own. Both `u_kᵀ H⁻¹ u_k`
+            // and `(H⁻¹ u_k)` come from ONE solve per column, `x_k = H⁻¹ u_k` — so
+            // the adjoint differentiates the SAME `H = H₀ + Σ_k W_k` the
+            // value/logdet use, closing the one-operator contract on the rank-one
+            // block too.
             //
             // Group the column sites once (the layout is mode-agnostic: dense or
-            // compact, `ibp_logit_sites` already carries each active logit's
-            // global t-index), then per column build `u_k`, solve, and distribute.
+            // compact, `ibp_logit_sites` already carries each active logit's global
+            // t-index and selected-inverse diagonal), then per column build `u_k`,
+            // solve, and distribute.
             let total_t = cache.delta_t_len();
-            let mut col_sites: Vec<Vec<(usize, usize)>> = vec![Vec::new(); k_atoms];
-            for &(row, atom, t_index, _inv_diag) in &ibp_logit_sites {
-                col_sites[atom].push((row, t_index));
+            let mut col_sites: Vec<Vec<(usize, usize, f64)>> = vec![Vec::new(); k_atoms];
+            for &(row, atom, t_index, inv_diag) in &ibp_logit_sites {
+                col_sites[atom].push((row, t_index, inv_diag));
             }
             for atom in 0..k_atoms {
                 let d_k = channels.cross_row_d[atom];
@@ -9150,22 +9241,28 @@ impl SaeManifoldTerm {
                 // u_k as a full t-RHS: J at each active logit-k slot.
                 let mut rhs_t = Array1::<f64>::zeros(total_t);
                 let rhs_beta = Array1::<f64>::zeros(cache.k);
-                for &(row, t_index) in &col_sites[atom] {
+                for &(row, t_index, _inv_diag) in &col_sites[atom] {
                     rhs_t[t_index] = channels.z_jac[row * k_atoms + atom];
                 }
                 let x_k = solver.solve(rhs_t.view(), rhs_beta.view()).map_err(|err| {
                     format!("logdet_theta_adjoint: IBP cross-row Woodbury solve: {err}")
                 })?;
-                // (JᵀH⁻¹J)_k = u_kᵀ x_k.
+                // (JᵀH⁻¹J)_k = u_kᵀ x_k, and the `i=j` self quadratic
+                // Σ_i P_ii·J_ik² the diagonal channels already own.
                 let mut jt_hinv_j = 0.0_f64;
-                for &(row, t_index) in &col_sites[atom] {
-                    jt_hinv_j += channels.z_jac[row * k_atoms + atom] * x_k.t[t_index];
+                let mut self_quad = 0.0_f64;
+                for &(row, t_index, inv_diag) in &col_sites[atom] {
+                    let j_ik = channels.z_jac[row * k_atoms + atom];
+                    jt_hinv_j += j_ik * x_k.t[t_index];
+                    self_quad += inv_diag * j_ik * j_ik;
                 }
-                for &(row, t_index) in &col_sites[atom] {
+                for &(row, t_index, inv_diag) in &col_sites[atom] {
                     let j_wk = channels.z_jac[row * k_atoms + atom];
                     let c_wk = channels.logit_curvature[row * k_atoms + atom];
-                    // term A + term B.
-                    gamma_t[t_index] += 0.5 * dd_k * j_wk * jt_hinv_j + d_k * c_wk * x_k.t[t_index];
+                    // term A (off-diagonal dd) + term B (off-diagonal d·c), both with
+                    // their `i=j` self piece removed (owned by the diagonal channels).
+                    gamma_t[t_index] += dd_k * j_wk * (jt_hinv_j - self_quad)
+                        + 2.0 * d_k * c_wk * (x_k.t[t_index] - inv_diag * j_wk);
                 }
             }
         }

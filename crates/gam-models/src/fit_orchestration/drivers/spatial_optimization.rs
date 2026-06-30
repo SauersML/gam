@@ -3938,6 +3938,26 @@ fn run_exact_joint_spatial_optimization(
     // off-window trials, or any other ineligibility silently keep the exact
     // streamed path (same numbers, the tensor is certified to
     // PSI_GRAM_SPOT_RTOL against the exact rebuild).
+    // #1033 (rank-stable κ-floor): set to the lowest ψ at which the certified
+    // tensor's conditioned Gram holds maximal numerical rank. Below it the
+    // reduced basis collapses/rotates and the design-realization skip is SOUNDLY
+    // refused (→ O(n) reset_surface); the κ window floor `ln(2/r_max)` lands
+    // inside that degenerate sliver and DRIFTS with n through the sample-std
+    // standardization, so n=2000's line search re-enters the slow lane while
+    // n=1000's does not. Lifting the optimizer's lower bound to this n-FREE
+    // (k-space) floor keeps every in-window trial on the fast path for all n,
+    // and only excludes over-smoothed length scales the `2/r_max` geometry floor
+    // already meant to exclude (the κ-optimum lives well above it).
+    let mut psi_rank_stable_floor: Option<f64> = None;
+    // #1033 (rank-stable κ-ceiling): symmetric twin of the floor. The conditioned
+    // Gram is rank-deficient at the HIGH window edge too (the longest-frequency
+    // radial mode goes collinear), so a line-search overshoot above the maximal-
+    // rank band soundly refuses the design-realization skip → O(n) reset_surface,
+    // and the deficient pinning ψ it records makes the NEXT in-band trial reset a
+    // second time. Clamping the optimizer's UPPER bound to this n-free k-space
+    // ceiling keeps every trial inside the band. The κ-optimum lives well inside
+    // it, so the clamp only excludes over-fit (too-short) length scales.
+    let mut psi_rank_stable_ceiling: Option<f64> = None;
     let nfree_penalty_capable = coord_dim == 1
         && family.is_gaussian_identity()
         && ctx.cache.supports_nfree_penalty_rekey();
@@ -3968,6 +3988,61 @@ fn run_exact_joint_spatial_optimization(
                 "[{label}] certified ψ-gram tensor over [{psi_lo:.3}, {psi_hi:.3}]: \
                  in-window trials assemble Gaussian sufficient statistics n-free"
             );
+            // #1033: read the n-free rank-stable κ-floor off the k-space tensor.
+            // Only lift INTO the window (never below psi_lo, never above the seed
+            // ψ — the seed is the geometric-mean midpoint and is well clear of the
+            // degenerate band), so the optimizer never starts outside its bounds.
+            let psi_anchor = theta0[rho_dim];
+            psi_rank_stable_floor = evaluator
+                .psi_gram_rank_stable_floor(psi_anchor)
+                .filter(|&f| f.is_finite() && f > psi_lo && f < psi_anchor);
+            log::info!(
+                "[KAPPA-PHASE-FLOOR] n_rows={} psi_lo={psi_lo:.6} psi_anchor={psi_anchor:.6} \
+                 rank_stable_floor={:?} lifted={}",
+                data.nrows(),
+                evaluator.psi_gram_rank_stable_floor(psi_anchor),
+                psi_rank_stable_floor.is_some(),
+            );
+            if let Some(floor) = psi_rank_stable_floor {
+                log::info!(
+                    "[{label}] rank-stable κ-floor ψ_floor={floor:.6} > window floor \
+                     ψ_lo={psi_lo:.6}: lifting the optimizer lower bound to keep every \
+                     in-window trial on the n-free design-realization skip (#1033). The \
+                     conditioned Gram is rank-deficient below ψ_floor (longest-length-scale \
+                     radial mode collapses into the nullspace), where the skip is soundly \
+                     refused; that band drifts with n via the sample-std standardization, \
+                     so this n-free k-space floor is the n-independent fix."
+                );
+            }
+            // #1033: read the n-free rank-stable κ-CEILING (symmetric twin of the
+            // floor). Only clamp INTO the window (strictly below psi_hi, strictly
+            // above the seed ψ — the seed is the geometric-mean midpoint, well
+            // inside the maximal-rank band), so the optimizer never starts outside
+            // its bounds. This is the fix for the n=16000 fast-ladder resets: the
+            // line search overshot to ψ≈1.0 (rank 11→10 at the high edge), tripping
+            // two O(n) reset_surface calls; clamping the upper bound keeps the
+            // search inside the band where the n-free skip stays sound.
+            psi_rank_stable_ceiling = evaluator
+                .psi_gram_rank_stable_ceiling(psi_anchor)
+                .filter(|&c| c.is_finite() && c < psi_hi && c > psi_anchor);
+            log::info!(
+                "[KAPPA-PHASE-CEIL] n_rows={} psi_hi={psi_hi:.6} psi_anchor={psi_anchor:.6} \
+                 rank_stable_ceiling={:?} clamped={}",
+                data.nrows(),
+                evaluator.psi_gram_rank_stable_ceiling(psi_anchor),
+                psi_rank_stable_ceiling.is_some(),
+            );
+            if let Some(ceiling) = psi_rank_stable_ceiling {
+                log::info!(
+                    "[{label}] rank-stable κ-ceiling ψ_ceil={ceiling:.6} < window ceiling \
+                     ψ_hi={psi_hi:.6}: clamping the optimizer upper bound to keep every \
+                     in-window trial on the n-free design-realization skip (#1033). The \
+                     conditioned Gram is rank-deficient above ψ_ceil (longest-frequency \
+                     radial mode goes collinear), where the skip is soundly refused; a \
+                     line-search overshoot there trips the O(n) reset_surface lane (and the \
+                     deficient pinning ψ it records resets the next in-band trial too)."
+                );
+            }
             let gradient_covers_full_window = evaluator.psi_gram_tensor_covers_gradient(psi_lo)
                 && evaluator.psi_gram_tensor_covers_gradient(psi_hi);
             if gradient_covers_full_window {
@@ -4133,7 +4208,8 @@ fn run_exact_joint_spatial_optimization(
     let kphase_prime_start = std::time::Instant::now();
     drop(ctx.eval_full(theta0, kphase_prime_order, analytic_outer_hessian_available)?);
     log::info!(
-        "[KAPPA-PHASE-PRIME] order={:?} elapsed_s={:.4} slow_path_resets_total={} design_revision={}",
+        "[KAPPA-PHASE-PRIME] n_rows={} order={:?} elapsed_s={:.4} slow_path_resets_total={} design_revision={}",
+        data.nrows(),
         kphase_prime_order,
         kphase_prime_start.elapsed().as_secs_f64(),
         ctx.evaluator.slow_path_reset_count(),
@@ -4157,6 +4233,39 @@ fn run_exact_joint_spatial_optimization(
     let kphase_log_kappa_dim = coord_dim;
     let kphase_slow_resets_start = ctx.evaluator.slow_path_reset_count();
     let kphase_design_revision_start = ctx.cache.design_revision();
+
+    // #1033: lift the ψ (log-κ) lower bound to the n-free rank-stable floor so the
+    // optimizer never line-searches into the rank-deficient sliver where the
+    // design-realization skip is soundly refused (→ O(n) reset_surface). The lift
+    // touches ONLY the single design-moving ψ coordinate at `rho_dim`; all ρ
+    // bounds are untouched. `psi_rank_stable_floor` is already constrained to lie
+    // strictly inside `(psi_lo, theta0[rho_dim])`, so theta0 stays feasible.
+    let lower_effective: std::borrow::Cow<'_, Array1<f64>> = match psi_rank_stable_floor {
+        Some(floor) if coord_dim == 1 && floor > lower[rho_dim] => {
+            let mut lifted = lower.clone();
+            lifted[rho_dim] = floor;
+            std::borrow::Cow::Owned(lifted)
+        }
+        _ => std::borrow::Cow::Borrowed(lower),
+    };
+    let lower = lower_effective.as_ref();
+
+    // #1033: clamp the ψ (log-κ) upper bound DOWN to the n-free rank-stable ceiling
+    // so the optimizer never line-searches into the high-edge rank-deficient sliver
+    // where the design-realization skip is soundly refused (→ O(n) reset_surface,
+    // plus a second reset from the deficient pinning ψ). Touches ONLY the single
+    // design-moving ψ coordinate at `rho_dim`; all ρ bounds are untouched.
+    // `psi_rank_stable_ceiling` is already constrained to lie strictly inside
+    // `(theta0[rho_dim], psi_hi)`, so theta0 stays feasible.
+    let upper_effective: std::borrow::Cow<'_, Array1<f64>> = match psi_rank_stable_ceiling {
+        Some(ceiling) if coord_dim == 1 && ceiling < upper[rho_dim] => {
+            let mut clamped = upper.clone();
+            clamped[rho_dim] = ceiling;
+            std::borrow::Cow::Owned(clamped)
+        }
+        _ => std::borrow::Cow::Borrowed(upper),
+    };
+    let upper = upper_effective.as_ref();
 
     let problem = exact_joint_multistart_outer_problem(
         theta0,
@@ -4398,7 +4507,8 @@ fn run_exact_joint_spatial_optimization(
         .design_revision()
         .saturating_sub(kphase_design_revision_start);
     log::info!(
-        "[KAPPA-PHASE-SUMMARY] log_kappa_dim={} n_cost={} cost_total_s={:.4} n_eval={} eval_total_s={:.4} n_efs={} efs_total_s={:.4} slow_path_resets={} design_revision_delta={} nfree_miss_shape={} nfree_miss_value={} nfree_miss_gradient={} nfree_miss_penalty={} nfree_miss_revision={} nfree_miss_second_order={} nfree_miss_other={} optim_total_s={:.4}",
+        "[KAPPA-PHASE-SUMMARY] n_rows={} log_kappa_dim={} n_cost={} cost_total_s={:.4} n_eval={} eval_total_s={:.4} n_efs={} efs_total_s={:.4} slow_path_resets={} design_revision_delta={} nfree_miss_shape={} nfree_miss_value={} nfree_miss_gradient={} nfree_miss_penalty={} nfree_miss_revision={} nfree_miss_second_order={} nfree_miss_other={} optim_total_s={:.4}",
+        data.nrows(),
         kphase_log_kappa_dim,
         kphase_cost_calls.get(),
         kphase_cost_total_s.get(),

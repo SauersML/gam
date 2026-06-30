@@ -666,7 +666,7 @@ impl LocationScaleWorkflowAdapter for BinomialLocationScaleWorkflow {
 /// location-scale path, so the standardized fit is identical whether the
 /// request arrives from the library (`fit_from_formula` →
 /// `materialize_location_scale`), the FFI marshaller, or the CLI.
-fn gaussian_response_sample_std(v: ArrayView1<'_, f64>) -> f64 {
+pub(crate) fn gaussian_response_sample_std(v: ArrayView1<'_, f64>) -> f64 {
     if v.is_empty() {
         return 0.0;
     }
@@ -711,7 +711,7 @@ fn gaussian_response_sample_std(v: ArrayView1<'_, f64>) -> f64 {
 /// observe raw-unit coefficients with **no** additional per-call rescaling,
 /// which is what keeps the σ-floor scale-relative (κ ≈ 1) without leaving the
 /// reconstruction half-applied in any one path.
-fn rescale_gaussian_location_scale_to_raw(
+pub(crate) fn rescale_gaussian_location_scale_to_raw(
     result: &mut GaussianLocationScaleFitResult,
     response_scale: f64,
 ) {
