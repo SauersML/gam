@@ -285,6 +285,7 @@ fn clip_survival_surface_value(mut value: f64, clip_lo: Option<f64>, clip_hi: Op
 }
 
 #[pyfunction]
+#[pyo3(signature = (grid, surface, times, kind, clip_lo, clip_hi, people_chunk, time_grid_chunk, left_value = None, right_value = None))]
 pub(crate) fn survival_chunk_iter_collect<'py>(
     py: Python<'py>,
     grid: PyReadonlyArray1<'py, f64>,
@@ -295,23 +296,27 @@ pub(crate) fn survival_chunk_iter_collect<'py>(
     clip_hi: Option<f64>,
     people_chunk: usize,
     time_grid_chunk: usize,
+    left_value: Option<f64>,
+    right_value: Option<f64>,
 ) -> PyResult<Py<PyArray2<f64>>> {
-    // Mirror the asymptotic-extrapolation policy in
-    // `gamfit._survival._SURVIVAL_EXTRAPOLATION`: survival surfaces are
-    // continued to S(t<=0)=1 and S(t->inf)=0 outside the modeled grid, and
-    // cumulative hazard mirrors that via H(t<=0)=0. Hazards and standard
-    // errors have no canonical asymptote, so they keep nearest-endpoint
-    // behavior (signaled by `None`/`None`).
-    let (kind_left_value, kind_right_value): (Option<f64>, Option<f64>) = match kind {
-        "survival" => (Some(1.0), Some(0.0)),
-        "cumulative_hazard" => (Some(0.0), None),
-        "hazard" | "survival_se" => (None, None),
+    // The asymptotic-extrapolation policy is owned by
+    // `gamfit._survival._SURVIVAL_EXTRAPOLATION` and threaded in as
+    // `left_value`/`right_value` — Python is the single source of truth so this
+    // dense path cannot drift from the in-process `_interpolate_rows` path (the
+    // #1595 bug: a stale hardcoded `S(t->inf)=0` here re-broke S(t)=exp(-H(t))
+    // past the grid for large queries while cumulative hazard flat-clamped).
+    // `None` on either side means nearest-endpoint (flat-clamp) extrapolation.
+    let (kind_left_value, kind_right_value) = (left_value, right_value);
+    // `kind` is still validated so an unknown surface name is a hard error
+    // rather than a silent flat-clamp.
+    match kind {
+        "survival" | "cumulative_hazard" | "hazard" | "survival_se" => {}
         other => {
             return Err(py_value_error(format!(
                 "unknown survival surface kind '{other}'"
             )));
         }
-    };
+    }
     if people_chunk == 0 {
         return Err(py_value_error("people_chunk must be positive".to_string()));
     }
@@ -382,6 +387,7 @@ pub(crate) fn survival_chunk_iter_collect<'py>(
 }
 
 #[pyfunction]
+#[pyo3(signature = (path, grid, surface, times, id_column, row_ids, people_chunk, time_grid_chunk, left_value = None, right_value = None))]
 pub(crate) fn write_survival_csv(
     py: Python<'_>,
     path: &str,
@@ -392,6 +398,8 @@ pub(crate) fn write_survival_csv(
     row_ids: Option<Vec<String>>,
     people_chunk: usize,
     time_grid_chunk: usize,
+    left_value: Option<f64>,
+    right_value: Option<f64>,
 ) -> PyResult<String> {
     if people_chunk == 0 {
         return Err(py_value_error("people_chunk must be positive".to_string()));
@@ -463,6 +471,12 @@ pub(crate) fn write_survival_csv(
                 let time_stop = (time_start + time_grid_chunk).min(times_values.len());
                 for row_idx in row_start..row_stop {
                     for query_value in &times_values[time_start..time_stop] {
+                        // Extrapolation policy threaded from
+                        // `gamfit._survival._SURVIVAL_EXTRAPOLATION` (single
+                        // source of truth): S(t<=0)=1 below the grid, and
+                        // flat-clamp to S(t_max) above it (`right_value` is
+                        // `None`), so the CSV agrees with `survival_at()` and
+                        // preserves S(t)=exp(-H(t)) past the grid (#1595).
                         let survival = survival_csv_interpolate(
                             &surface_values,
                             n_cols,
@@ -470,8 +484,8 @@ pub(crate) fn write_survival_csv(
                             &sorted_indices,
                             row_idx,
                             *query_value,
-                            Some(1.0),
-                            Some(0.0),
+                            left_value,
+                            right_value,
                         )
                         .clamp(0.0, 1.0);
                         match (id_column.as_ref(), row_ids.as_ref()) {
