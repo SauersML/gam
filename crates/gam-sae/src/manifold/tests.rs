@@ -3801,28 +3801,58 @@ pub(crate) fn refine_iteration_limit_probe_budget_never_extends() {
     );
 }
 
+/// #1117/#1273 — a cold (off-optimum) two-atom periodic fit whose undamped
+/// per-row `H_tt` is non-PD off the gauge orbit. Production must NOT refuse the
+/// factor and fall back to a ρ-dependent ridge-damped retry (the desyncing
+/// bias #1117 removed); instead the evidence factor conditions the flat/negative
+/// direction by **quotient pseudo-determinant deflation** — the closed-form
+/// rotation/phase gauge (`gauge_deflated_directions`, unit stiffness → log 1 = 0)
+/// plus per-row spectral discovery for the intrinsic-deficiency direction the
+/// gauge does not span (`deflation_row_spectra`). The resulting cold cache is
+/// already a valid factor, and the refined dense / streaming REML criteria
+/// agree bit-for-bit (#847) on the value the deflated evidence produces.
 #[test]
-pub(crate) fn reml_retries_refinement_after_non_pd_undamped_evidence_factor() {
+pub(crate) fn reml_conditions_non_pd_undamped_evidence_factor_by_deflation() {
     let (mut term0, target, rho) = small_two_atom_periodic_term();
     let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
     let cold_sys = term0
         .assemble_arrow_schur(target.view(), &rho, None)
         .unwrap();
-    let cold_factor = solve_arrow_newton_step_with_options(&cold_sys, 0.0, 0.0, &options);
-    let cold_err = match cold_factor {
-        Err(err) => err,
-        Ok(_) => panic!("fixture must start with a non-PD undamped evidence row factor"),
-    };
+    // The undamped (ridge = 0) evidence factor of the cold system: a genuinely
+    // non-PD per-row `H_tt` must be CONDITIONED in place by gauge + spectral
+    // deflation rather than refused. (Before #1117/#1273 this refused with an
+    // "H_tt is non-PD at base ridge" error and forced a ρ-dependent ridge retry.)
+    let (_, _, cold_cache) = solve_arrow_newton_step_with_options(&cold_sys, 0.0, 0.0, &options)
+        .expect("undamped cold evidence factor must condition the non-PD H_tt by deflation");
     assert!(
-        SaeManifoldTerm::is_undamped_evidence_row_non_pd(&cold_err),
-        "fixture must start with a genuine evidence-mode non-PD row factor; got {cold_err}",
+        cold_cache.gauge_deflated_directions > 0,
+        "the two circle atoms' rotation/phase gauge orbit must be deflated at unit \
+         stiffness (log 1 = 0), not ridge-damped; got {} gauge directions",
+        cold_cache.gauge_deflated_directions,
     );
+    assert!(
+        cold_cache.deflation_row_spectra.iter().flatten().any(|s| {
+            // A spectrally-deflated direction is one whose raw (genuine) curvature
+            // eigenvalue was stiffened to the unit-stiffness conditioned value.
+            s.raw_evals
+                .iter()
+                .zip(s.cond_evals.iter())
+                .any(|(raw, cond)| (raw - cond).abs() > 1.0e-9)
+        }),
+        "at least one per-row H_tt must carry a spectrally-deflated \
+         negative/flat direction the closed-form gauge orbit does not span",
+    );
+    // The conditioned cold cache is already a valid undamped factor with a
+    // finite Laplace log-determinant — no ridge bias injected.
+    let cold_log_det =
+        arrow_log_det_from_cache(&cold_cache).expect("conditioned cold cache carries a log-det");
+    assert!(cold_log_det.is_finite());
 
     let mut full = term0.clone();
     let mut streaming = term0;
     let (full_cost, full_loss, cache) = full
         .reml_criterion_with_cache(target.view(), &rho, None, 1, 0.25, 1.0e-4, 1.0e-4)
-        .expect("dense REML must refine through the cold non-PD evidence factor");
+        .expect("dense REML must condition the cold non-PD evidence factor");
     let log_det = arrow_log_det_from_cache(&cache).expect("refined cache must carry log-det");
     assert!(full_cost.is_finite());
     assert!(full_loss.total().is_finite());
@@ -3830,7 +3860,7 @@ pub(crate) fn reml_retries_refinement_after_non_pd_undamped_evidence_factor() {
 
     let (stream_cost, stream_loss) = streaming
         .reml_criterion_streaming_exact(target.view(), &rho, None, 1, 0.25, 1.0e-4, 1.0e-4)
-        .expect("streaming REML must share the dense refinement retry");
+        .expect("streaming REML must share the dense deflation-conditioned value");
     assert_abs_diff_eq!(stream_cost, full_cost, epsilon = 1.0e-8);
     assert_abs_diff_eq!(stream_loss.total(), full_loss.total(), epsilon = 1.0e-8);
 }
@@ -7767,13 +7797,19 @@ pub(crate) fn outer_gradient_solver_rejects_near_singular_cache_without_matching
         Err(err) => err.to_string(),
         Ok(..) => panic!("near-singular evidence factor without a matching gauge must reject"),
     };
+    // The near-singular joint Hessian trips the conditioning guard, but with NO
+    // deflatable gauge orbit or decoder-null direction the solver cannot attribute
+    // the flatness to a reparametrisation freedom — so it rejects with the precise
+    // `NonIdentifiable` diagnosis (strictly more informative than the generic
+    // pivot-ratio message), naming the missing deflatable direction.
     assert!(
-        err.contains("joint Hessian numerically singular"),
-        "guard error must name the ill-conditioned joint Hessian; got: {err}"
+        err.contains("non-identifiable"),
+        "guard error must report the non-identifiable joint Hessian; got: {err}"
     );
     assert!(
-        err.contains("min/max pivot ratio") && err.contains("floor"),
-        "guard error must report the pivot ratio and floor; got: {err}"
+        err.contains("near-singular joint Hessian")
+            && err.contains("no deflatable gauge/decoder-null direction"),
+        "guard error must name the near-singular Hessian and the missing deflatable direction; got: {err}"
     );
 }
 
