@@ -3808,14 +3808,34 @@ pub(crate) fn reml_retries_refinement_after_non_pd_undamped_evidence_factor() {
     let cold_sys = term0
         .assemble_arrow_schur(target.view(), &rho, None)
         .unwrap();
-    let cold_factor = solve_arrow_newton_step_with_options(&cold_sys, 0.0, 0.0, &options);
-    let cold_err = match cold_factor {
-        Err(err) => err,
-        Ok(_) => panic!("fixture must start with a non-PD undamped evidence row factor"),
-    };
+    // Fixture precondition: the COLD (off-optimum) seed has a genuinely non-PD
+    // per-row undamped evidence block (two atoms' periodic decoders specialise in
+    // opposite directions, so the logit-block Schur complement goes indefinite).
+    // Before #1117 the undamped (`ridge = 0`) factor REFUSED this with
+    // `PerRowFactorFailed` and the criterion recovered by refining the inner
+    // state. #1117 (`factor_spectral_deflated_evidence_row`) now conditions the
+    // block the principled way at the COLD state too: it discovers the
+    // negative/flat eigen-direction and stiffens it to UNIT curvature (eigenvalue
+    // → +1, contributing a ρ-independent log 1 = 0), so the undamped solve returns
+    // `Ok` carrying recorded per-row deflation spectra instead of refusing. The
+    // block is STILL non-PD; it is now spectrally deflated rather than rejected.
+    // Pin THAT contract: the cold solve succeeds and reports the deflated
+    // indefinite directions it had to condition (a stronger statement than the old
+    // bare-`Err` precondition — it proves both that the seed is genuinely
+    // indefinite AND that the #1117 deflation engaged).
+    let (.., cold_cache) = solve_arrow_newton_step_with_options(&cold_sys, 0.0, 0.0, &options)
+        .expect("cold undamped evidence factor must be spectrally conditioned (#1117), not refused");
+    let cold_deflated_rows = cold_cache
+        .deflation_row_spectra
+        .iter()
+        .filter(|spectrum| spectrum.is_some())
+        .count();
     assert!(
-        SaeManifoldTerm::is_undamped_evidence_row_non_pd(&cold_err),
-        "fixture must start with a genuine evidence-mode non-PD row factor; got {cold_err}",
+        cold_deflated_rows > 0 || cold_cache.gauge_deflated_directions > 0,
+        "fixture must start with a genuine non-PD evidence block that #1117 spectral \
+         unit-stiffness deflation had to condition; got no deflated row spectra and \
+         {} gauge directions",
+        cold_cache.gauge_deflated_directions,
     );
 
     let mut full = term0.clone();
@@ -5077,7 +5097,22 @@ pub(crate) fn sae_row_layout_from_dense_weights_large_k_work_scales_with_active(
     assert_eq!(compact_work, n * (2 * cap) * (2 * cap));
     let dense_q = 2 * k_atoms;
     let dense_work = n * dense_q * dense_q;
-    assert!(compact_work < dense_work / 1_000_000_000);
+    // The work ratio is EXACTLY `(2K)² / (2·cap)² = (K/cap)²` (the `n` token
+    // factor cancels), so for K = 100 000, cap = 8 the compact path is
+    // `12500² = 156_250_000`× cheaper. Pin that exact astronomical factor — a
+    // strictly stronger guard than the previous `< dense_work / 1e9`, whose
+    // arbitrary 1e9 divisor exceeded the true 1.5625e8 ratio and made the
+    // assertion unsatisfiable for these dimensions.
+    let work_ratio = (k_atoms / cap) * (k_atoms / cap);
+    assert_eq!(
+        dense_work / compact_work,
+        work_ratio,
+        "compact row-layout work must be exactly (K/cap)² below dense full-K work"
+    );
+    assert!(
+        work_ratio >= 100_000_000,
+        "the compact path must be astronomically (≥1e8×) cheaper than dense full-K"
+    );
 }
 
 /// #1407 — fixed-decoder assembly must skip the ENTIRE decoder β tier. The
@@ -7760,20 +7795,47 @@ pub(crate) fn diagonal_latent_cache(diagonal: &[f64]) -> ArrowFactorCache {
 pub(crate) fn outer_gradient_solver_rejects_near_singular_cache_without_matching_gauge() {
     let cache = near_singular_outer_gradient_cache();
     let obj = warmstart_test_objective();
+
+    // The raw conditioning gate is what names the ill-conditioned joint Hessian
+    // and reports the pivot ratio + floor. Pin that message HERE, at its source
+    // (`outer_gradient_conditioning_error`), so the diagnostic stays covered even
+    // though the solver below now re-classifies the gauge-degenerate case.
+    let conditioning_err = match SaeManifoldTerm::outer_gradient_conditioning_error(&cache) {
+        Err(err) => err.to_string(),
+        Ok(()) => panic!("near-singular cache must trip the pivot-ratio conditioning gate"),
+    };
+    assert!(
+        conditioning_err.contains("joint Hessian numerically singular"),
+        "conditioning gate must name the ill-conditioned joint Hessian; got: {conditioning_err}"
+    );
+    assert!(
+        conditioning_err.contains("min/max pivot ratio") && conditioning_err.contains("floor"),
+        "conditioning gate must report the pivot ratio and floor; got: {conditioning_err}"
+    );
+
+    // #1436 (commit 21c49d14b): when the conditioning gate fires but NO chart
+    // gauge / decoder-β-null / decoder-channel-null candidate can be recovered to
+    // deflate the flat subspace, the flatness is genuinely OUTSIDE the gauge orbit
+    // — a distinct, more specific diagnosis the solver surfaces as
+    // `OuterGradientError::NonIdentifiable` (rather than echoing the raw
+    // pivot-ratio `IllConditioned` trip). Both classes are FD-eligible, so the
+    // recovery behaviour is unchanged; only the diagnostic is sharper. This is the
+    // exact "without a matching gauge" path the test name describes.
     let err = match obj
         .term
         .outer_gradient_arrow_solver(&cache, &obj.current_rho.lambda_smooth_vec())
     {
-        Err(err) => err.to_string(),
+        Err(err) => err,
         Ok(..) => panic!("near-singular evidence factor without a matching gauge must reject"),
     };
     assert!(
-        err.contains("joint Hessian numerically singular"),
-        "guard error must name the ill-conditioned joint Hessian; got: {err}"
+        matches!(err, OuterGradientError::NonIdentifiable { .. }),
+        "no-deflatable-direction rejection must be the NonIdentifiable diagnosis; got: {err}"
     );
+    let err = err.to_string();
     assert!(
-        err.contains("min/max pivot ratio") && err.contains("floor"),
-        "guard error must report the pivot ratio and floor; got: {err}"
+        err.contains("no deflatable gauge/decoder-null direction"),
+        "guard error must name the absent deflation candidate; got: {err}"
     );
 }
 
