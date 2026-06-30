@@ -102,3 +102,30 @@ ROOT CAUSE (two layers):
    orders. NOT a bug (NonAffineFinite GL branch agrees to ≤2e-15). Replaced the
    flat rel≤1e-11 gate with a per-order band rel_tol(k)=1e-12·10^(k/3).
 Verified PASS on Tesla V100 sm_70 (compiles, all 3 branches run, parity holds).
+
+## RECONCILIATION (2026-06-30) — rebased onto main's #1686 (FMA-contraction fix)
+Main landed #1686 ("NVRTC FMA-contraction breaks GPU↔CPU parity, fmad default
+on"): it set `opts.fmad = Some(false)` in the shared `nvrtc_compile_options()`
+and routed survival_rowjet through `compile_ptx_arch` instead of bare
+`compile_ptx`. Rebased my branch on top — clean, no conflicts (my cubic_cell
+also already routes through compile_ptx_arch, so it inherits fmad=false too).
+
+Re-measured the survival row-jet device-vs-CPU drift on the V100 with fmad=false
+ACTIVE (diagnostic `device_vs_cpu_channel_drift_report`, /tmp/rowjet_drift.txt):
+```
+  channel  fmad=true (pre-#1686)   fmad=false (post-#1686)
+  value    ~1.48e-10               1.48e-10   (≈unchanged, already tiny)
+  grad     ~8.18e-10               8.18e-10
+  hess     ~8.79e-9                8.79e-9
+  third     5.09e-8                5.09e-8    (BIT-IDENTICAL to 4 sig figs)
+  fourth    4.54e-8                4.54e-8    (BIT-IDENTICAL)
+```
+KEY INSIGHT refining #1686's narrative: FMA was the dominant source for the
+LOW-order channels (value/grad/hess) — #1686 genuinely helps there. But the
+third/fourth channels are UNCHANGED: their 5e-8 floor is *transcendental* drift
+(CUDA erfc/erfcx/exp vs host libm) amplified ~5e8× through the order-4 jet, which
+`--fmad=false` cannot touch. So my magnitude-scaled per-channel band is NOT
+redundant with #1686 — it is COMPLEMENTARY: #1686 removes the FMA component, the
+band absorbs the irreducible transcendental component. A flat 1e-9 gate would
+STILL fail post-#1686 (third 5.09e-8 > 1e-9). Updated module + PARITY_RTOL
+docstrings to record this split. All 14 gate tests PASS post-rebase on V100.

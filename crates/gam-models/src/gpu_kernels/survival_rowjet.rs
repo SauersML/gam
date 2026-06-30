@@ -28,17 +28,33 @@
 //!
 //! The device kernel runs the SAME seeded-jet arithmetic as the CPU jet (pinned
 //! line-for-line by the host-oracle `*_tests` module on every box), so the
-//! CPU↔device residual is NOT an algebra mismatch — it is irreducible
-//! transcendental drift: CUDA's `erfc`/`exp`/`sqrt` differ from the host libm at
-//! the ULP level, and that ε is amplified through the order-4 jet chain into the
-//! high-order channels. Measured on a **Tesla V100 (sm_70)** the drift,
-//! normalized to each channel's magnitude, is ≤1.2e-9 (worst: third channel
-//! 5.09e-8 against a channel scale of 42.5). The parity gate
-//! (`tests::device_matches_cpu_when_available`, and the fail-loud device-only
-//! sweep) is therefore a per-channel `atol + rtol·channel_scale` band, NOT a
-//! flat absolute tolerance — see `tests::PARITY_RTOL` for why a flat `1e-9`
-//! absolute bound was wrong (it ignored derivative-order amplification) and why
-//! the magnitude-scaled band still catches any real bug with ~80× headroom.
+//! CPU↔device residual is NOT an algebra mismatch. After #1686 disabled NVRTC
+//! FMA contraction (`--fmad=false`, applied here because this kernel now
+//! compiles through `device_cache::compile_ptx_arch`, the shared arch+fmad
+//! options), TWO distinct floors remain, with very different magnitudes:
+//!
+//!   * **Low-order channels (value/grad/hess)** — FMA contraction WAS the
+//!     dominant source here, so `--fmad=false` tightened them sharply. Measured
+//!     on a **Tesla V100 (sm_70)**: value 1.5e-10, grad 8.2e-10, hess 8.8e-9
+//!     absolute (≤1.1e-1 normalized to channel magnitude).
+//!   * **High-order channels (third/fourth)** — dominated by *transcendental*
+//!     drift, NOT FMA: CUDA's `erfc`/`erfcx`/`exp`/`sqrt` differ from the host
+//!     libm at the ULP level, and that ε is amplified ~5e8× through the order-4
+//!     seeded-jet chain. `--fmad=false` leaves these essentially unchanged
+//!     (third 5.09e-8, fourth 4.54e-8 absolute — bit-identical to the
+//!     pre-#1686 measurement to 4 sig figs), confirming FMA was never their
+//!     root cause. Normalized to channel magnitude they are ≤1.2e-9 (third) and
+//!     bounded by the magnitude-scaled band below (fourth).
+//!
+//! The parity gate (`tests::device_matches_cpu_when_available`, and the
+//! fail-loud device-only sweep) is therefore a per-channel
+//! `atol + rtol·channel_scale` band, NOT a flat absolute tolerance — see
+//! `tests::PARITY_RTOL` for why a flat `1e-9` absolute bound was wrong (it
+//! ignored both derivative-order amplification AND the transcendental floor
+//! that #1686's FMA fix cannot reach) and why the magnitude-scaled band still
+//! catches any real algebra bug with comfortable headroom. This band is
+//! *complementary* to #1686, not redundant: #1686 removes the FMA component,
+//! the band absorbs the irreducible transcendental component.
 //!
 //! # Single source, exactly
 //!
@@ -562,12 +578,17 @@ mod tests {
     ///
     /// The device kernel runs the SAME seeded-jet arithmetic as the CPU jet
     /// (pinned line-for-line by the host-oracle `*_tests` module on every box),
-    /// so the residual is NOT an algebra mismatch — it is irreducible
-    /// transcendental drift: CUDA's `erfc`/`exp`/`sqrt` differ from the host
-    /// libm at the ULP level, and that ε is amplified through the order-4 jet
-    /// chain (`logΦ`, the Mills `k1..k4` polynomial, the `c=√(1+(s·g)²cov)`
-    /// composition) into the high-order channels. Measured on a Tesla V100
-    /// (sm_70), the drift, **normalized to each channel's magnitude**, is:
+    /// so the residual is NOT an algebra mismatch. With NVRTC FMA contraction
+    /// now disabled (#1686, `--fmad=false`), the residual splits into a tight
+    /// low-order floor (FMA was its dominant source, so the fix shrank it) and
+    /// an irreducible transcendental floor in the high-order channels: CUDA's
+    /// `erfc`/`erfcx`/`exp`/`sqrt` differ from the host libm at the ULP level,
+    /// and that ε is amplified through the order-4 jet chain (`logΦ`, the Mills
+    /// `k1..k4` polynomial, the `c=√(1+(s·g)²cov)` composition) into the
+    /// third/fourth channels — which `--fmad=false` leaves unchanged (5.09e-8 /
+    /// 4.54e-8, bit-identical to the pre-#1686 measurement). Measured on a
+    /// Tesla V100 (sm_70), the drift, **normalized to each channel's
+    /// magnitude**, is:
     ///
     /// ```text
     ///   channel  worst |Δ|     channel max|cpu|   |Δ|/scale
@@ -791,7 +812,8 @@ mod tests {
         // abs/(ATOL+RTOL*|cpu|) so a value >1 means the band would fail.
         const ATOL: f64 = 1e-9;
         const RTOL: f64 = 1e-6;
-        let report = |name: &str, c: &[f64], d: &[f64], stride: usize| {
+        let mut lines: Vec<String> = Vec::new();
+        let report = |lines: &mut Vec<String>, name: &str, c: &[f64], d: &[f64], stride: usize| {
             let mut max_abs = 0.0_f64;
             let mut cpu_at_max_abs = 0.0_f64;
             let mut worst_abs_row = 0usize;
@@ -816,26 +838,31 @@ mod tests {
                     worst_norm_cpu = *x;
                 }
             }
-            eprintln!(
+            let line = format!(
                 "[#415 drift] {name:<7} max_abs={max_abs:.3e} (|cpu|={:.3e}, row {worst_abs_row}) \
                  chan_max|cpu|={chan_max_mag:.3e}  worst_norm(atol={ATOL:.0e},rtol={RTOL:.0e})\
                  ={max_norm:.3e} (row {worst_norm_row}, abs={worst_norm_abs:.3e}, |cpu|={:.3e})",
                 cpu_at_max_abs.abs(),
                 worst_norm_cpu.abs()
             );
+            eprintln!("{line}");
+            lines.push(line);
             (max_abs, max_norm)
         };
+        lines.push("=== device-only vs CPU (isolates kernel arithmetic) ===".to_string());
         eprintln!("=== device-only vs CPU (isolates kernel arithmetic) ===");
-        report("value", &cpu.value, &dev.value, 1);
-        report("grad", &cpu.grad, &dev.grad, 4);
-        report("hess", &cpu.hess, &dev.hess, 16);
-        report("third", &cpu.third, &dev.third, 16);
-        report("fourth", &cpu.fourth, &dev.fourth, 16);
+        report(&mut lines, "value", &cpu.value, &dev.value, 1);
+        report(&mut lines, "grad", &cpu.grad, &dev.grad, 4);
+        report(&mut lines, "hess", &cpu.hess, &dev.hess, 16);
+        report(&mut lines, "third", &cpu.third, &dev.third, 16);
+        report(&mut lines, "fourth", &cpu.fourth, &dev.fourth, 16);
+        lines.push("=== dispatcher vs CPU (what the gate sees) ===".to_string());
         eprintln!("=== dispatcher vs CPU (what the gate sees) ===");
-        report("value", &cpu.value, &got.value, 1);
-        report("grad", &cpu.grad, &got.grad, 4);
-        report("hess", &cpu.hess, &got.hess, 16);
-        report("third", &cpu.third, &got.third, 16);
-        report("fourth", &cpu.fourth, &got.fourth, 16);
+        report(&mut lines, "value", &cpu.value, &got.value, 1);
+        report(&mut lines, "grad", &cpu.grad, &got.grad, 4);
+        report(&mut lines, "hess", &cpu.hess, &got.hess, 16);
+        report(&mut lines, "third", &cpu.third, &got.third, 16);
+        report(&mut lines, "fourth", &cpu.fourth, &got.fourth, 16);
+        let _ = std::fs::write("/tmp/rowjet_drift.txt", lines.join("\n") + "\n");
     }
 }
