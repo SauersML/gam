@@ -8514,11 +8514,12 @@ fn fitted_rho_penalty_components(
 /// 2. For each penalized smooth term, refit a null model with that term dropped
 ///    from the spec; `W = max(2(ℓ_full − ℓ_null), 0)`.
 /// 3. The reference d.f. `d` is the Wood truncation `tr(F)²/tr(F²)` on the
-///    term's influence block (falling back to the term EDF) — the same `ref_df`
-///    the summary Wald row reports — floored at the term EDF, since this LR test
-///    drops the whole term (null space included) so `d ≥ edf` always (the
-///    `edf1 ≥ edf` invariant the non-symmetric `tr(F²)` can violate at a
-///    shrunk-to-null collapse; see the inline note at the `ref_df` binding).
+///    term's influence block (the same `ref_df` the summary Wald row reports),
+///    floored at `max(edf, null_dim, 1)`: this LR test drops the whole term, so
+///    `d` is at least the dimension the term spans when present (its null-space
+///    dimension, never below 1). The non-symmetric `tr(F²)` can collapse toward
+///    0 at a shrunk-to-null fit and violate that bound — see the inline note at
+///    the `ref_df` binding.
 /// 4. When the family has closed-form cumulant jets, evaluate Lawley's ε at the
 ///    **null** linear predictor (an expectation evaluated at the null fit), fold
 ///    the full λ-scaled penalty `S_λ` into the information, and Bartlett-correct
@@ -8603,28 +8604,34 @@ pub fn smooth_term_lr_inference_forspec(
         // is not materialised. (Same per-block over-count class as the multinomial
         // `edf_per_class` fix.)
         let edf = full.fit.per_term_edf(coeff_range.clone(), block_start, k);
-        // χ² reference d.f. for the whole-term LR test. The statistic W tests
-        // the term — its UNPENALIZED linear null space included — present vs
-        // entirely absent, so the reference d.f. must be at least the term's
-        // effective d.f. `edf` (which is ≥ the null-space dimension, ≥ 1 for an
-        // ordinary penalized smooth). The Wood truncation `tr(F)²/tr(F²)` is the
-        // "edf1" Wood (2013) reference and satisfies `edf1 ≥ edf` analytically,
-        // BUT the coefficient influence `F = H⁻¹X'WX` is NON-symmetric, and as
-        // REML shrinks a term onto its null space (`edf → 1.0`) the off-diagonal
-        // coupling in the term block blows up: `tr(F²) = Σ_ij F_ij F_ji` runs
-        // away (~1e12) while `tr(F) = edf` stays ~1, so `tr(F)²/tr(F²)` collapses
-        // to ~0. Referencing a positive `W` against `χ²_{~0}` then reports a flat,
-        // shrunk-to-null term as MAXIMALLY significant (`p ~ 1e-12`) — a Type-I
-        // error decided by a degenerate reference d.f., not the data (#1766).
-        // Floor at `edf` to enforce the `edf1 ≥ edf` invariant the degenerate
-        // `tr(F²)` violates: in calibrated fits the Wood d.f. already exceeds
-        // `edf`, so the floor binds ONLY on the collapse and leaves working
-        // (and high-power) fits byte-identical.
-        let ref_df = match wood_reference_df(influence, &coeff_range) {
-            Some(wood) => wood.max(edf),
-            None => edf,
-        }
-        .max(1e-12);
+        // The term's unpenalized null-space dimension — the polynomial
+        // directions (constant/linear/…) a penalized smooth always carries when
+        // present, which no roughness penalty can shrink. This is the minimum
+        // effective dimension a "term present vs entirely absent" LR test can
+        // possibly have; flooring the reference d.f. below it is meaningless.
+        let null_dim: usize = design_term.nullspace_dims.iter().sum();
+        // χ² reference d.f. for the whole-term LR test. The statistic W tests the
+        // term present vs entirely absent, so the reference d.f. must be at least
+        // the dimension the term spans when present — i.e. at least its null-space
+        // dimension, and never below 1 (you cannot test "is this function present"
+        // with fewer than one degree of freedom). The Wood truncation
+        // `tr(F)²/tr(F²)` is the Wood (2013) "edf1" reference and satisfies
+        // `edf1 ≥ edf` analytically, BUT the coefficient influence
+        // `F = H⁻¹X'WX` is NON-symmetric, and as REML shrinks a term onto its
+        // null space the off-diagonal coupling in the term block blows up:
+        // `tr(F²) = Σ_ij F_ij F_ji` runs away (~1e12) while `tr(F) = edf` stays
+        // small, so `tr(F)²/tr(F²)` collapses toward 0. Referencing a positive
+        // `W` against `χ²_{~0}` then reports a flat, shrunk-to-null term as
+        // MAXIMALLY significant (`p ~ 1e-12`) — a Type-I error decided by a
+        // degenerate reference d.f., not the data (#1766). Floor at
+        // `max(edf, null_dim, 1)`: in calibrated and high-power fits the Wood
+        // d.f. already dominates, so the floor binds ONLY on the degenerate
+        // collapse and leaves those fits byte-identical.
+        let ref_df = wood_reference_df(influence, &coeff_range)
+            .unwrap_or(0.0)
+            .max(edf)
+            .max(null_dim.max(1) as f64)
+            .max(1e-12);
         if !(ref_df.is_finite() && ref_df > 0.0) {
             continue;
         }
