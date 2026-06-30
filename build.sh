@@ -206,7 +206,8 @@ serve_cache() {  # args: label — restore the cached log, record, finish in ~0s
   finish "$code" "$label"
 }
 serve_request_result() {  # args: label request-hash — serve another live caller's result
-  local label="$1" reqhash="$2" dir="$REQDIR/$reqhash" code
+  local label="$1" reqhash="$2" dir code
+  dir="$REQDIR/$reqhash"
   [[ -f "$dir/code" ]] || { echo "[build.sh] active duplicate produced no cached/stable result — retry"; exit 75; }
   cp -f "$dir/log" "$LOG" 2>/dev/null || : >"$LOG"
   code="$(cat "$dir/code")"; DUR=0
@@ -215,7 +216,8 @@ serve_request_result() {  # args: label request-hash — serve another live call
   finish "$code" "$label"
 }
 write_cached_request_result() {  # args: request-hash — publish CACHE as live result
-  local reqhash="$1" dir="$REQDIR/$reqhash"
+  local reqhash="$1" dir
+  dir="$REQDIR/$reqhash"
   mkdir -p "$dir"
   cp -f "$CACHE/log" "$dir/log.tmp" 2>/dev/null && mv -f "$dir/log.tmp" "$dir/log"
   cp -f "$CACHE/code" "$dir/code.tmp" 2>/dev/null && mv -f "$dir/code.tmp" "$dir/code"
@@ -290,7 +292,8 @@ write_cache() {
   printf '%s' "$code" >"$CACHE/code.tmp" && mv -f "$CACHE/code.tmp" "$CACHE/code"
 }
 write_request_result() {  # args: request-hash
-  local reqhash="$1" dir="$REQDIR/$reqhash"
+  local reqhash="$1" dir
+  dir="$REQDIR/$reqhash"
   mkdir -p "$dir"
   cp -f "$LOG" "$dir/log.tmp" 2>/dev/null && mv -f "$dir/log.tmp" "$dir/log"
   printf '%s' "$code" >"$dir/code.tmp" && mv -f "$dir/code.tmp" "$dir/code"
