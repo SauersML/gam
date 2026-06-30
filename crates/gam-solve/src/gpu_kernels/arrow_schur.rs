@@ -139,6 +139,9 @@ fn ridge_bump_to_make_pd(htt: ArrayView2<'_, f64>, ridge_t: f64) -> f64 {
 /// is already present, the Gershgorin bound is taken at `ridge_t = 0` and the
 /// returned value is still the ADDITIONAL bump to add on top of the current
 /// ridge. Returns the scale-only floor when `block` is mis-sized.
+// Used only by the linux CUDA path (`mod cuda`) and the unit test below; on a
+// non-linux non-test build it has no caller, so gate it to exactly where it's used.
+#[cfg(any(target_os = "linux", test))]
 #[must_use]
 fn ridge_bump_to_make_pd_colmajor(block: &[f64], d: usize) -> f64 {
     if d == 0 || block.len() < d * d {
