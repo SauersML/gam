@@ -23,11 +23,48 @@ use gam::basis::{
     CenterStrategy, DuchonNullspaceOrder, PenaltySource, SpatialIdentifiability,
     ThinPlateBasisSpec, build_duchon_basis,
 };
-use gam::smooth::{ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec};
-use ndarray::Array2;
+use gam::estimate::FitOptions;
+use gam::smooth::{
+    ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec,
+    fit_term_collection_forspec,
+};
+use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
+use ndarray::{Array1, Array2};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand_distr::{Distribution, Uniform};
+use rand_distr::{Distribution, Normal, Uniform};
+
+fn gaussian_identity_likelihood() -> LikelihoodSpec {
+    LikelihoodSpec::new(
+        ResponseFamily::Gaussian,
+        InverseLink::Standard(StandardLink::Identity),
+    )
+}
+
+/// `FitOptions` with everything off, matching the minimal config the sibling
+/// Duchon/Matérn `scale_dimensions` integration tests use.
+fn minimal_fit_options() -> FitOptions {
+    FitOptions {
+        latent_cloglog: None,
+        mixture_link: None,
+        optimize_mixture: false,
+        sas_link: None,
+        optimize_sas: false,
+        compute_inference: false,
+        skip_rho_posterior_inference: false,
+        max_iter: 24,
+        tol: 1e-4,
+        nullspace_dims: vec![],
+        linear_constraints: None,
+        firth_bias_reduction: false,
+        adaptive_regularization: None,
+        penalty_shrinkage_floor: None,
+        rho_prior: Default::default(),
+        kronecker_penalty_system: None,
+        kronecker_factored: None,
+        persist_warm_start_disk: false,
+    }
+}
 
 fn synthetic_data(n: usize, d: usize, seed: u64) -> Array2<f64> {
     let mut rng = StdRng::seed_from_u64(seed);
@@ -161,5 +198,117 @@ fn thin_plate_without_scale_dimensions_stays_canonical_thin_plate() {
             SmoothBasisSpec::ThinPlate { .. }
         ),
         "without scale_dimensions the term must stay canonical thin-plate"
+    );
+}
+
+/// End-to-end fit regression for the issue's actual symptom. The issue repro
+/// is a `gamfit.fit(..., scale_dimensions=True)` on a strongly anisotropic
+/// surface (fast in `x1`, near-linear in `x2`) that came back *bit-for-bit
+/// identical* to the default fit (`max|pred_on − pred_off| = 0.000e+00`) for
+/// `thinplate(...)` while `duchon()`/`matern()` changed materially.
+///
+/// This test reproduces that at the Rust core behind the kwarg
+/// (`enable_scale_dimensions` → `fit_term_collection_forspec`): the same 2-D
+/// thin-plate term is fit once on the default path and once after
+/// `enable_scale_dimensions`, and the two fits must now *differ* (the flag
+/// genuinely engages) instead of being identical (the silent no-op).
+#[test]
+fn thin_plate_scale_dimensions_changes_the_fit_on_anisotropic_data() {
+    let n = 600usize;
+    // Strongly anisotropic surface mirroring the issue: a fast oscillation in
+    // x1, a near-linear trend in x2. The default isotropic TPS must trade off a
+    // single curvature scale across both axes; the anisotropic rewrite can
+    // tension x2 down independently.
+    let mut rng = StdRng::seed_from_u64(1);
+    let unit = Uniform::new(0.0_f64, 1.0).expect("uniform params valid");
+    let noise = Normal::new(0.0, 0.12).expect("normal params valid");
+    let mut x = Array2::<f64>::zeros((n, 2));
+    let mut y = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let x1 = unit.sample(&mut rng);
+        let x2 = unit.sample(&mut rng);
+        x[[i, 0]] = x1;
+        x[[i, 1]] = x2;
+        let truth = (2.0 * std::f64::consts::PI * 3.0 * x1).sin() + 0.4 * x2;
+        y[i] = truth + noise.sample(&mut rng);
+    }
+
+    let weights = Array1::ones(n);
+    let offset = Array1::zeros(n);
+    let opts = minimal_fit_options();
+
+    // A standalone fit has only an implicit intercept, so the spatial smooth
+    // must be orthogonalized against it (the formula pipeline's default) or its
+    // polynomial null-space constant aliases the intercept and the unpenalized
+    // design is rank-deficient. The spec-rewrite tests above use the bare
+    // `None` helper because they never fit.
+    let thin_plate_fit_term = |num_centers: usize| {
+        let mut spec = thin_plate_term(2, num_centers);
+        if let SmoothBasisSpec::ThinPlate { spec: tp, .. } = &mut spec.smooth_terms[0].basis {
+            tp.identifiability = SpatialIdentifiability::OrthogonalToParametric;
+        }
+        spec
+    };
+
+    // (1) Default path — canonical thin-plate, scale_dimensions off.
+    let spec_off = thin_plate_fit_term(40);
+    let fit_off = fit_term_collection_forspec(
+        x.view(),
+        y.view(),
+        weights.view(),
+        offset.view(),
+        &spec_off,
+        gaussian_identity_likelihood(),
+        &opts,
+    )
+    .expect("default thin-plate fit completes");
+    let pred_off = fit_off.design.design.to_dense().dot(&fit_off.fit.beta) + &offset;
+
+    // (2) scale_dimensions=True — the same term after the rewrite.
+    let mut spec_on = thin_plate_fit_term(40);
+    gam::term_builder::enable_scale_dimensions(&mut spec_on);
+    let fit_on = fit_term_collection_forspec(
+        x.view(),
+        y.view(),
+        weights.view(),
+        offset.view(),
+        &spec_on,
+        gaussian_identity_likelihood(),
+        &opts,
+    )
+    .expect("scale_dimensions thin-plate fit completes");
+    let pred_on = fit_on.design.design.to_dense().dot(&fit_on.fit.beta) + &offset;
+
+    assert!(
+        pred_on.iter().all(|v| v.is_finite()) && fit_on.fit.beta.iter().all(|v| v.is_finite()),
+        "anisotropic thin-plate fit must be finite"
+    );
+
+    // The issue's core symptom: the two fits were bit-for-bit identical
+    // (max|diff| = 0). `scale_dimensions` must genuinely change the fit now.
+    let max_abs_diff = pred_on
+        .iter()
+        .zip(pred_off.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        max_abs_diff > 1e-6,
+        "scale_dimensions=True must change the thin-plate fit on anisotropic data \
+         (issue #1676: was a silent no-op, max|diff| = 0); got max|diff| = {max_abs_diff:.3e}"
+    );
+
+    // And the anisotropic fit must still explain the surface (no degenerate
+    // retreat to a near-constant fit): beat mean-only by a wide margin.
+    let y_mean = y.mean().unwrap_or(0.0);
+    let sse_on: f64 = pred_on
+        .iter()
+        .zip(y.iter())
+        .map(|(p, t)| (p - t).powi(2))
+        .sum();
+    let sse_baseline: f64 = y.iter().map(|&v| (v - y_mean).powi(2)).sum();
+    assert!(
+        sse_on < 0.5 * sse_baseline,
+        "anisotropic thin-plate fit must explain the anisotropic surface \
+         (beat mean-only by ≥50%): sse_on={sse_on:.6e}, sse_baseline={sse_baseline:.6e}"
     );
 }
