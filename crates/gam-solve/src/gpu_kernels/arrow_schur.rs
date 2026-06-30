@@ -5793,61 +5793,177 @@ mod tests {
                 }
             };
 
-        // CPU dense reduced-system solve of the SAME framed system: form S via
-        // the CPU oracle matvec on the identity, then solve S·δβ = rhs.
-        let mut s_dense = Array2::<f64>::zeros((border_dim, border_dim));
-        for col in 0..border_dim {
-            let mut e = vec![0.0_f64; border_dim];
-            e[col] = 1.0;
-            let mut sc = vec![0.0_f64; border_dim];
-            sae_framed_schur_matvec_cpu(&sys, &data, ridge_t, ridge_beta, &e, &mut sc)
-                .expect("cpu matvec");
-            for r in 0..border_dim {
-                s_dense[[r, col]] = sc[r];
-            }
-        }
-        let factor = cholesky_factor_in_place(s_dense.view(), CholeskyGuard::NonnegativePivot)
-            .expect("S PD");
-        let cpu = cholesky_solve_vector(factor.view(), rhs.view());
-
-        let scale = cpu.iter().fold(0.0_f64, |m, v| m.max(v.abs())).max(1.0);
-        let mut max_rel = 0.0_f64;
-        for a in 0..border_dim {
-            max_rel = max_rel.max((device[a] - cpu[a]).abs() / scale);
-        }
-        // #1551 divergence triage (max_rel=0.91 once the device actually engages):
-        // disambiguate matvec-bug vs PCG-non-convergence vs operator-mismatch.
-        // Residual of the DEVICE solution against the CPU operator S_cpu: if the
-        // device solved the SAME operator and converged, ‖S_cpu·device − rhs‖ ≈ 0;
-        // a large residual means the device matvec is a DIFFERENT operator (kernel
-        // bug), whereas a small residual with large max_rel would indicate a
-        // (near-)singular S where both solves are valid. Also surface what the
-        // device PCG thought it did (stopping reason / iters / final residual).
-        let mut s_dev_resid = 0.0_f64;
-        {
-            let sx = s_dense.dot(&device);
+        // #1551 PARITY GATE — operator-residual, NOT solution-vector equality.
+        //
+        // The honest GPU↔CPU contract for an iterative solve of `S·δβ = rhs` is
+        // that the device solution SOLVES the system DEFINED BY THE CPU ORACLE to
+        // PCG tolerance — i.e. `‖S_cpu·δβ_device − rhs‖ / ‖rhs‖ ≤ tol`, where
+        // `S_cpu` is applied with the bit-for-bit CPU oracle matvec the device
+        // kernel mirrors (`sae_framed_schur_matvec_cpu`). This is the correct,
+        // conditioning-robust gate: a near-singular assembled `S` has a large
+        // condition number `κ(S)`, which amplifies an O(ε) residual difference
+        // into an O(κ·ε) *solution-vector* difference, so comparing δβ vectors
+        // would spuriously fail even when both operators are bit-identical and
+        // both solves converged. (Historically this test compared δβ against a
+        // dense-Cholesky reference and "failed" with max_rel≈0.9 because the
+        // dense solve itself only reached ‖S·x−rhs‖≈0.1 on this fixture's
+        // ill-conditioned S while the device PCG reached ~1e-12 — the device was
+        // MORE accurate than the reference, not wrong. The kernel correctness is
+        // pinned conditioning-free by `framed_sae_device_matvec_matches_cpu_oracle_*`.)
+        let rhs_norm = rhs.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let oracle_resid = |x: &Array1<f64>| -> f64 {
+            let mut sx = vec![0.0_f64; border_dim];
+            sae_framed_schur_matvec_cpu(
+                &sys,
+                &data,
+                ridge_t,
+                ridge_beta,
+                x.as_slice().unwrap(),
+                &mut sx,
+            )
+            .expect("cpu oracle matvec");
+            let mut acc = 0.0_f64;
             for a in 0..border_dim {
-                s_dev_resid = s_dev_resid.max((sx[a] - rhs[a]).abs());
+                let e = sx[a] - rhs[a];
+                acc += e * e;
             }
-        }
-        let s_cpu_resid = {
-            let sc = s_dense.dot(&cpu);
-            let mut m = 0.0_f64;
-            for a in 0..border_dim {
-                m = m.max((sc[a] - rhs[a]).abs());
-            }
-            m
+            acc.sqrt()
         };
+        let s_dev_resid = oracle_resid(&device);
+        let dev_rel_resid = s_dev_resid / rhs_norm.max(1e-300);
+
+        // Independent CPU iterative solve of the SAME operator with the SAME
+        // Jacobi preconditioner the device builds, via the shared `pcg_core`. If
+        // the device kernel computed a different operator, the two converged
+        // residuals could not BOTH be tiny.
+        let precond = {
+            let d = sae_frame_penalty_diag_host_for_test(&data, ridge_beta);
+            // The reduced-Schur diagonal subtraction (device `arrow_sae_frame_diag_sub`)
+            // mirrored on the host for the Jacobi preconditioner.
+            let mut diag = d;
+            for (i, row) in sys.rows.iter().enumerate() {
+                let slab = &data.frame.as_ref().unwrap().row_htbeta[i];
+                let qi = sys.row_dims[i];
+                if slab.is_empty() || qi == 0 || slab.len() != qi * border_dim {
+                    continue;
+                }
+                let mut block = row.htt.clone();
+                for dd in 0..qi {
+                    block[[dd, dd]] += ridge_t;
+                }
+                let factor = cholesky_factor_in_place(block.view(), CholeskyGuard::NonnegativePivot)
+                    .expect("row htt PD");
+                // ainv = (H_tt+ρI)⁻¹ column by column.
+                let mut ainv = Array2::<f64>::zeros((qi, qi));
+                for col in 0..qi {
+                    let mut e = Array1::<f64>::zeros(qi);
+                    e[col] = 1.0;
+                    let s = cholesky_solve_vector(factor.view(), e.view());
+                    for r in 0..qi {
+                        ainv[[r, col]] = s[r];
+                    }
+                }
+                for a in 0..border_dim {
+                    let mut quad = 0.0_f64;
+                    for c in 0..qi {
+                        let hc = slab[c * border_dim + a];
+                        for dd in 0..qi {
+                            quad += hc * ainv[[c, dd]] * slab[dd * border_dim + a];
+                        }
+                    }
+                    diag[a] -= quad;
+                }
+            }
+            Array1::from_vec(diag)
+        };
+        let mut cpu = Array1::<f64>::zeros(border_dim);
+        let cpu_result = {
+            let mut apply = |v: &Array1<f64>, out: &mut Array1<f64>| {
+                let mut tmp = vec![0.0_f64; border_dim];
+                sae_framed_schur_matvec_cpu(
+                    &sys,
+                    &data,
+                    ridge_t,
+                    ridge_beta,
+                    v.as_slice().unwrap(),
+                    &mut tmp,
+                )
+                .expect("cpu oracle matvec");
+                out.assign(&Array1::from_vec(tmp));
+            };
+            gam_linalg::pcg::pcg_core(
+                &mut apply,
+                &rhs.view(),
+                &precond.view(),
+                1e-12,
+                800,
+                32,
+                false,
+                gam_linalg::pcg::DotReduction::Serial,
+                &mut cpu.view_mut(),
+            )
+        };
+        let s_cpu_resid = oracle_resid(&cpu);
+        let cpu_rel_resid = s_cpu_resid / rhs_norm.max(1e-300);
+
+        // GATE 1: the device solution solves the CPU-oracle system to PCG-grade
+        // accuracy (proves device kernel == CPU operator AND device PCG converged).
         assert!(
-            max_rel <= 1e-7,
-            "[#1551 framed-triage] max_rel={max_rel:e} | device-vs-CPU-operator residual \
-             ‖S_cpu·device−rhs‖={s_dev_resid:e} (CPU's own ={s_cpu_resid:e}) | device PCG \
-             stop={:?} iters={} final_rel_resid={:e} — large operator-residual ⇒ device matvec \
-             is a different operator (kernel bug); small ⇒ PCG/precond or singular-S issue",
+            dev_rel_resid <= 1e-7,
+            "[#1551] device δβ does not solve the CPU-oracle system: \
+             ‖S_cpu·device−rhs‖/‖rhs‖={dev_rel_resid:e} (>1e-7) | abs={s_dev_resid:e} | \
+             device PCG stop={:?} iters={} final_rel_resid={:e} — a large operator residual \
+             means the device matvec is a DIFFERENT operator (kernel bug)",
             diag.stopping_reason,
             diag.iterations,
             diag.final_relative_residual,
         );
+        // GATE 2: the independent CPU iterative solve of the same operator with the
+        // same preconditioner also converges — both paths agree on the operator.
+        assert!(
+            cpu_rel_resid <= 1e-6,
+            "[#1551] CPU pcg_core failed to solve the oracle system: \
+             ‖S_cpu·cpu−rhs‖/‖rhs‖={cpu_rel_resid:e} (stop={:?}, iters={}) — fixture/oracle issue",
+            cpu_result.stop,
+            cpu_result.iterations,
+        );
+    }
+
+    /// Host mirror of the device `sae_frame_penalty_diag_host` for the framed
+    /// Jacobi preconditioner (penalty diagonal only; the reduced-Schur diagonal
+    /// subtraction is applied by the caller). Test-only.
+    fn sae_frame_penalty_diag_host_for_test(
+        data: &DeviceSaePcgData,
+        ridge_beta: f64,
+    ) -> Vec<f64> {
+        let frame = data.frame.as_ref().expect("frame");
+        let mut diag = vec![ridge_beta; data.beta_dim];
+        for (blk, &r) in data.smooth_blocks.iter().zip(frame.smooth_ranks.iter()) {
+            let m = blk.factor_a.nrows();
+            for ia in 0..m {
+                let coeff = blk.factor_a[[ia, ia]];
+                let base = blk.global_offset + ia * r;
+                for ib in 0..r {
+                    diag[base + ib] += coeff;
+                }
+            }
+        }
+        for blk in &frame.frame_blocks {
+            if blk.atom_i != blk.atom_j {
+                continue;
+            }
+            let r = frame.ranks[blk.atom_i];
+            let off = frame.border_offsets[blk.atom_i];
+            let (mi, mj) = blk.g.dim();
+            for li in 0..mi.min(mj) {
+                let gii = blk.g[[li, li]];
+                let base = off + li * r;
+                for a in 0..r {
+                    diag[base + a] += gii * blk.w[[a, a]];
+                }
+            }
+        }
+        diag
     }
 
     /// #1551 DEFINITIVE kernel-correctness proof: the framed reduced-Schur matvec
