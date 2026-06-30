@@ -6262,7 +6262,11 @@ impl SaeManifoldTerm {
         // β off the seed), so we factor exactly once at the frozen iterate and
         // return that undamped cache without invoking the stationarity gate.
         // The caller has already run `run_joint_fit_arrow_schur(..., 0, ...)`,
-        // which left the seed untouched, so `self` is at the warm-start β here.
+        // which under the `max_iter == 0` freeze (gam#577/#579, #850) runs ONLY
+        // the β-neutral basis refresh and returns the loss without touching β —
+        // it skips the rank-reduction, frame activation, re-seed guards, and the
+        // #1026 decoder-LSQ polish that would otherwise refit β off the seed — so
+        // `self` is at the warm-start β here.
         if inner_max_iter == 0 {
             let sys = self
                 .assemble_arrow_schur(target, rho, registry)
