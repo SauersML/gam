@@ -1438,6 +1438,89 @@ mod runaway_tests {
             "the inner solve failed while already carrying a separation-scale predictor"
         ));
     }
+
+    /// Regression lock for gam#370: the pre-fit identifiability audit evaluates
+    /// every block's effective Jacobian at the empty/zero β with
+    /// `family_scalars: None`. The BMS marginal and logslope blocks own the
+    /// logslope design + offset, so `g_i = offset_s[i]` (the fitted logslope
+    /// baseline, generically nonzero) at β = 0 — and the old code hard-errored
+    /// ("requires BmsFamilyScalars when beta != 0 … got family_scalars: None")
+    /// because it read `any_nonzero_g` and demanded a caller-supplied scalar it
+    /// could in fact reconstruct itself. Both blocks must now self-compute the
+    /// closed-form `c_i = sqrt(1 + (s·g_i)²)` (and the logslope factor) from
+    /// owned data and return a finite Jacobian, NOT an error. This makes every
+    /// `logslope_formula` / `linkwiggle(...)` BMS fit reachable through the
+    /// Python `gamfit.fit` API (the audit no longer aborts before the fit).
+    #[test]
+    pub(crate) fn bms_block_jacobians_self_compute_at_audit_empty_beta_nonzero_logslope_baseline() {
+        use std::sync::Arc;
+        let n = 4usize;
+        let marginal =
+            Arc::new(Array2::<f64>::from_shape_vec((n, 1), vec![1.0, 1.0, 1.0, 1.0]).unwrap());
+        let logslope =
+            Arc::new(Array2::<f64>::from_shape_vec((n, 1), vec![1.0, 1.0, 1.0, 1.0]).unwrap());
+        let offset_m = Array1::<f64>::zeros(n);
+        // Nonzero logslope baseline absorbed into offset_s — the exact pooled
+        // probit pilot value that is "essentially never exactly 0".
+        let g_baseline = 0.3_f64;
+        let offset_s = Array1::<f64>::from_elem(n, g_baseline);
+        let z = Arc::new(Array1::from_vec(vec![-0.7, 0.2, 0.9, 1.4]));
+        let s = 1.0_f64;
+
+        // The pre-fit audit linearization state: EMPTY β, no family scalars.
+        let beta: Vec<f64> = Vec::new();
+        let state = FamilyLinearizationState {
+            beta: &beta,
+            family_scalars: None,
+            channel_hessian: None,
+            probit_frailty_scale: s,
+        };
+
+        let marginal_jac = BmsMarginalJacobian::new(
+            Arc::clone(&marginal),
+            Arc::clone(&logslope),
+            offset_m.clone(),
+            offset_s.clone(),
+            1,
+        );
+        let j_m = marginal_jac
+            .effective_jacobian_rows(&state, 0..n)
+            .expect("BMS marginal Jacobian must self-compute at audit empty β (gam#370)");
+        // ∂η_i/∂β_m = c_i · M[i,:], c_i = sqrt(1 + (s·g_baseline)²), M[i,0]=1.
+        let c_expected = (1.0 + (s * g_baseline).powi(2)).sqrt();
+        assert_eq!(j_m.dim(), (n, 1));
+        for i in 0..n {
+            assert!(
+                (j_m[[i, 0]] - c_expected).abs() < 1e-12,
+                "marginal J[{i}] = {} != closed-form c_i = {c_expected}",
+                j_m[[i, 0]]
+            );
+        }
+
+        let logslope_jac = BmsLogslopeJacobian::new(
+            Arc::clone(&marginal),
+            Arc::clone(&logslope),
+            offset_m,
+            offset_s,
+            Arc::clone(&z),
+            1,
+        );
+        let j_s = logslope_jac
+            .effective_jacobian_rows(&state, 0..n)
+            .expect("BMS logslope Jacobian must self-compute at audit empty β (gam#370)");
+        // ∂η_i/∂β_s = (q_i·s²·g_i/c_i + s·z_i)·G[i,:]; at empty β, q_i = 0 and
+        // g_i = g_baseline, so the factor is s²·0·… + s·z_i = s·z_i (G[i,0]=1).
+        assert_eq!(j_s.dim(), (n, 1));
+        for i in 0..n {
+            let expected = s * z[i];
+            assert!(
+                (j_s[[i, 0]] - expected).abs() < 1e-12,
+                "logslope J[{i}] = {} != closed-form factor {expected}",
+                j_s[[i, 0]]
+            );
+            assert!(j_s[[i, 0]].is_finite());
+        }
+    }
 }
 
 pub(crate) fn build_marginal_blockspec_bms(

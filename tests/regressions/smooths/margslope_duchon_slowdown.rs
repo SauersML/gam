@@ -75,6 +75,76 @@ fn duchon2_smooth(name: &str, centers: usize) -> SmoothTermSpec {
     }
 }
 
+fn duchon2_smooth_aniso(name: &str, centers: usize, aniso: bool) -> SmoothTermSpec {
+    let mut s = duchon2_smooth(name, centers);
+    if let SmoothBasisSpec::Duchon { spec, .. } = &mut s.basis {
+        spec.aniso_log_scales = if aniso { Some(vec![0.0; 2]) } else { None };
+    }
+    s
+}
+
+#[test]
+#[ignore]
+fn measure_duchon_gauss_scaling_TEMP() {
+    gam::init_parallelism();
+    for &(n, centers, aniso) in &[
+        (500usize, 10usize, true),
+        (500, 60, true),
+        (500, 111, true),
+        (500, 111, false),
+        (1000, 111, true),
+    ] {
+        let (data, _z, y) = simulate(n);
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![duchon2_smooth_aniso("f_pc", centers, aniso)],
+        };
+        let weights = Array1::ones(n);
+        let offset = Array1::zeros(n);
+        let start = Instant::now();
+        let result = gam::smooth::fit_term_collection_forspec(
+            data.view(),
+            y.view(),
+            weights.view(),
+            offset.view(),
+            &spec,
+            LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(StandardLink::Identity),
+            ),
+            &FitOptions {
+                latent_cloglog: None,
+                mixture_link: None,
+                optimize_mixture: false,
+                sas_link: None,
+                optimize_sas: false,
+                compute_inference: false,
+                skip_rho_posterior_inference: true,
+                max_iter: 60,
+                tol: 1e-6,
+                nullspace_dims: vec![],
+                linear_constraints: None,
+                firth_bias_reduction: false,
+                adaptive_regularization: None,
+                penalty_shrinkage_floor: None,
+                rho_prior: Default::default(),
+                kronecker_penalty_system: None,
+                kronecker_factored: None,
+                persist_warm_start_disk: false,
+            },
+        );
+        let elapsed = start.elapsed().as_secs_f64();
+        match result {
+            Ok(f) => eprintln!(
+                "[MEASURE] n={n} centers={centers} aniso={aniso} elapsed={elapsed:.2}s outer={} inner={} p={}",
+                f.fit.outer_iterations, f.fit.inner_cycles, f.fit.beta.len()
+            ),
+            Err(e) => eprintln!("[MEASURE] n={n} centers={centers} aniso={aniso} elapsed={elapsed:.2}s ERR={e}"),
+        }
+    }
+}
+
 fn erf_approx(x: f64) -> f64 {
     let a1 = 0.254829592;
     let a2 = -0.284496736;

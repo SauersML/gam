@@ -7867,11 +7867,17 @@ impl SaeManifoldTerm {
         // mis-attributes the (un-deflated) Woodbury self curvature's derivative to
         // the deflated subspace. For non-IBP modes there is no Woodbury source and
         // the self term is `0` (the deflated block IS the full block).
-        let cross_channels = if self.last_row_layout.is_none() {
-            ibp_assignment_third_channels(&self.assignment, rho)?
-        } else {
-            None
-        };
+        // #1416 (compact-layout completion): the IBP cross-row Woodbury source is
+        // installed for BOTH the dense and the compact (#1420 top-`k`) layouts (see
+        // `set_ibp_cross_row_source`, which emits `(g_base + pos, atom, z'_ik)` for
+        // the active set under a compact layout), so the deflated base `H₀'` is the
+        // no-self block in BOTH layouts. The self-curvature downdate below must
+        // therefore run regardless of layout — gating it to the dense path (the
+        // pre-fix bug) left the compact deflation correction differentiating the
+        // un-downdated full block. For non-IBP modes `ibp_assignment_third_channels`
+        // returns `None`, there is no Woodbury source, and `self_curv` is
+        // identically 0 (the deflated block IS the full block).
+        let cross_channels = ibp_assignment_third_channels(&self.assignment, rho)?;
         let learnable_alpha = matches!(
             self.assignment.mode,
             AssignmentMode::IBPMap {
@@ -7965,72 +7971,99 @@ impl SaeManifoldTerm {
         // #1416: the IBP prior Hessian is `H_p = d·J Jᵀ + diag(s, c)`, where the
         // rank-one `d·J Jᵀ` couples EVERY row pair `(i, j)` in a column `k`
         // through the shared empirical mass `M_k`. The assembled `H` carries the
-        // full `H_full = H₀' + U D Uᵀ` (Woodbury, construction.rs:4710-4752), and
+        // full `H_full = H₀' + U D Uᵀ` (Woodbury, `set_ibp_cross_row_source`), and
         // for fixed alpha the entire IBP prior scales with `λ = eᵖ`, so
         // `∂H_p/∂ρ = H_p`. The diagonal loop above already captures the `i = j`
         // self terms (the `d·J_ik²` summand lives in `hdiag`); this pass adds the
         // omitted off-diagonal `½·d_k·Σ_{i≠j}(H⁻¹)_{ik,jk}·J_ik·J_jk`. Only IBP
         // has the cross-row rank-one source; for other diagonal modes
         // `ibp_assignment_third_channels` returns `None` and the trace stays the
-        // pure diagonal contraction. (IBP fixed-alpha uses the dense `None`
-        // layout, so atom `k`'s logit slot is local position `k`.)
-        if self.last_row_layout.is_none() {
-            if let Some(channels) = ibp_assignment_third_channels(&self.assignment, rho)? {
-                let n = self.n_obs();
-                let total_t = cache.delta_t_len();
-                // This trace is ½ ∂log|H|/∂ρ. For FIXED-α IBP the whole prior
-                // scales with λ=eᵖ so ∂H_p/∂ρ = H_p and the rank-one coefficient
-                // is the VALUE `cross_row_d[k] = w·s'_k`. For LEARNABLE-α this trace
-                // is ½ ∂log|H|/∂logα, and the rank-one block's logα-derivative is
-                // `∂d_k/∂logα = w·∂s'_k/∂logα` (`cross_row_d_logalpha[k]`) — the same
-                // α-derivative the DIAGONAL channel (`hessian_diag_log_alpha_derivative`)
-                // already uses. Using the value `s'_k` here (the pre-fix bug) made the
-                // off-diagonal inconsistent with the diagonal and the α-gradient wrong.
-                let learnable_alpha = matches!(
-                    self.assignment.mode,
-                    AssignmentMode::IBPMap {
-                        learnable_alpha: true,
-                        ..
-                    }
-                );
-                let mut cross = 0.0_f64;
-                for k in 0..k_atoms {
-                    let d_k = if learnable_alpha {
-                        channels.cross_row_d_logalpha[k]
-                    } else {
-                        channels.cross_row_d[k]
-                    };
-                    if d_k == 0.0 {
-                        continue;
-                    }
-                    for i in 0..n {
-                        let j_ik = channels.z_jac[i * k_atoms + k];
-                        if j_ik == 0.0 {
-                            continue;
-                        }
-                        // (H⁻¹) column at row `i`'s logit-`k` slot.
-                        let mut rhs_t = Array1::<f64>::zeros(total_t);
-                        let rhs_beta = Array1::<f64>::zeros(cache.k);
-                        rhs_t[cache.row_offsets[i] + k] = 1.0;
-                        let solved =
-                            solver.solve(rhs_t.view(), rhs_beta.view()).map_err(|err| {
-                                format!("assignment_log_strength_hessian_trace: {err}")
-                            })?;
-                        for j in 0..n {
-                            if j == i {
-                                continue;
-                            }
-                            let j_jk = channels.z_jac[j * k_atoms + k];
-                            if j_jk == 0.0 {
-                                continue;
-                            }
-                            let inv_ij = solved.t[cache.row_offsets[j] + k];
-                            cross += d_k * inv_ij * j_ik * j_jk;
+        // pure diagonal contraction.
+        //
+        // #1416 (compact completion): this pass is LAYOUT-AGNOSTIC. Under the dense
+        // layout atom `k`'s logit slot is local position `k`
+        // (`row_offsets[i] + k`); under the compact (#1420 top-`k`) layout only the
+        // row's active atoms carry coordinates and atom `k` lives at local position
+        // `pos` of `active_atoms[row]` (`row_offsets[i] + pos`). The Woodbury source
+        // and the θ-adjoint already use this active-slot mapping, so gating the
+        // cross-row pass to the dense layout (the pre-fix bug) dropped the
+        // off-diagonal term from `∂log|H|/∂ρ` whenever the budget/`top_k` engaged
+        // the compact layout. We build per-column active sites `(row, t_index)` once
+        // — exactly the θ-adjoint `col_sites` construction — then contract the
+        // off-diagonal `i ≠ j` remainder with one solve per active site.
+        if let Some(channels) = cross_channels.as_ref() {
+            let n = self.n_obs();
+            let total_t = cache.delta_t_len();
+            // This trace is ½ ∂log|H|/∂ρ. For FIXED-α IBP the whole prior
+            // scales with λ=eᵖ so ∂H_p/∂ρ = H_p and the rank-one coefficient
+            // is the VALUE `cross_row_d[k] = w·s'_k`. For LEARNABLE-α this trace
+            // is ½ ∂log|H|/∂logα, and the rank-one block's logα-derivative is
+            // `∂d_k/∂logα = w·∂s'_k/∂logα` (`cross_row_d_logalpha[k]`) — the same
+            // α-derivative the DIAGONAL channel (`hessian_diag_log_alpha_derivative`)
+            // already uses. Using the value `s'_k` here (the pre-fix bug) made the
+            // off-diagonal inconsistent with the diagonal and the α-gradient wrong.
+            let learnable_alpha = matches!(
+                self.assignment.mode,
+                AssignmentMode::IBPMap {
+                    learnable_alpha: true,
+                    ..
+                }
+            );
+            // Per-column active sites `(row, global t-index)`. Layout-agnostic.
+            let mut col_sites: Vec<Vec<(usize, usize)>> = vec![Vec::new(); k_atoms];
+            match self.last_row_layout {
+                Some(ref layout) => {
+                    for row in 0..n {
+                        let base = cache.row_offsets[row];
+                        for (pos, &atom) in layout.active_atoms[row].iter().enumerate() {
+                            col_sites[atom].push((row, base + pos));
                         }
                     }
                 }
-                trace += cross;
+                None => {
+                    for row in 0..n {
+                        let base = cache.row_offsets[row];
+                        for k in 0..k_atoms {
+                            col_sites[k].push((row, base + k));
+                        }
+                    }
+                }
             }
+            let mut cross = 0.0_f64;
+            for k in 0..k_atoms {
+                let d_k = if learnable_alpha {
+                    channels.cross_row_d_logalpha[k]
+                } else {
+                    channels.cross_row_d[k]
+                };
+                if d_k == 0.0 || col_sites[k].len() < 2 {
+                    continue;
+                }
+                for &(i, t_i) in &col_sites[k] {
+                    let j_ik = channels.z_jac[i * k_atoms + k];
+                    if j_ik == 0.0 {
+                        continue;
+                    }
+                    // (H⁻¹) column at row `i`'s active logit-`k` slot.
+                    let mut rhs_t = Array1::<f64>::zeros(total_t);
+                    let rhs_beta = Array1::<f64>::zeros(cache.k);
+                    rhs_t[t_i] = 1.0;
+                    let solved = solver.solve(rhs_t.view(), rhs_beta.view()).map_err(|err| {
+                        format!("assignment_log_strength_hessian_trace: {err}")
+                    })?;
+                    for &(j, t_j) in &col_sites[k] {
+                        if j == i {
+                            continue;
+                        }
+                        let j_jk = channels.z_jac[j * k_atoms + k];
+                        if j_jk == 0.0 {
+                            continue;
+                        }
+                        cross += d_k * solved.t[t_j] * j_ik * j_jk;
+                    }
+                }
+            }
+            trace += cross;
         }
         Ok(0.5 * trace)
     }

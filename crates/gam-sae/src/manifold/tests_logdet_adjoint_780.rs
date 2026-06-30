@@ -314,3 +314,88 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_ibp_map_learnable_alpha_
         );
     }
 }
+
+/// #1416 (compact-layout completion) — the IBP cross-row ρ-trace
+/// (`assignment_log_strength_hessian_trace`) must add the
+/// `½ d_k Σ_{i≠j}(H⁻¹)_{ij} J_i J_j` off-diagonal term under the COMPACT
+/// (#1420 top-`k`) row layout, not only the dense layout. The cross-row Woodbury
+/// source is installed for both layouts and the θ-adjoint already differentiates
+/// both, but the ρ-trace cross-row pass (and the deflation self-curvature
+/// downdate) were gated `if last_row_layout.is_none()` — so whenever the budget /
+/// `top_k` engaged the compact layout the ρ-gradient of `log|H|` silently dropped
+/// the cross-row term.
+///
+/// A FULL-SUPPORT compact layout (every row active for both atoms) is
+/// geometrically IDENTICAL to dense — same logit slots, same assembled `H` — so
+/// its `½ ∂log|H|/∂ρ_sparse` must equal both the dense analytic trace and the
+/// dense fixed-state central difference. Before the fix the compact trace skipped
+/// the cross-row pass and diverged from both; the sibling
+/// `ibp_rho_sparse_logdet_trace_matches_dense_fd_1416` confirms the dropped
+/// off-diagonal term is genuinely nonzero at this ρ (max|d_k| ≈ 0.21), so this
+/// equality is non-vacuous.
+#[test]
+pub(crate) fn ibp_rho_sparse_logdet_trace_compact_layout_matches_dense_1416() {
+    let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
+    term.assignment.mode = AssignmentMode::ibp_map(0.7, 0.9, false);
+    // Same solidly-PD island the dense sibling pins (ρ_sparse ∈ [−1.0, −0.4]).
+    rho.log_lambda_sparse = -0.8;
+
+    // Converge the inner fit. The tiny fixture's dense Gram is far under the host
+    // budget, so production keeps the dense layout (`last_row_layout = None`);
+    // this also mutates `term` to the converged (t, β, logit) state.
+    let (_value, _loss, dense_cache) = term
+        .reml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
+        .expect("dense converged cache");
+    let dense_solver = DeflatedArrowSolver::plain(&dense_cache);
+    let analytic_dense = term
+        .assignment_log_strength_hessian_trace(&rho, &dense_cache, &dense_solver)
+        .expect("dense rho_sparse trace");
+
+    // Re-assemble the SAME converged state under a forced full-support compact
+    // layout, factor it, and recompute the ρ-trace. `assemble_arrow_schur_inner`
+    // sets `last_row_layout = Some(layout)`, so the trace takes the compact path.
+    let n = target.nrows();
+    let coord_dims = vec![1usize, 1usize];
+    let coord_offsets = term.assignment.coord_offsets();
+    let full_active: Vec<Vec<usize>> = (0..n).map(|_| vec![0usize, 1usize]).collect();
+    let layout = SaeRowLayout::from_active_atoms(full_active, coord_dims, coord_offsets);
+    let probe = SAE_DENSE_BETA_PENALTY_PROBE_MAX_DIM;
+    let sys = term
+        .assemble_arrow_schur_inner(target.view(), &rho, None, 1.0, probe, Some(Some(layout)))
+        .expect("full-support compact assembly");
+    let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+    let (_dt, _db, compact_cache) =
+        solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options).expect("compact factor");
+    let compact_solver = DeflatedArrowSolver::plain(&compact_cache);
+    let analytic_compact = term
+        .assignment_log_strength_hessian_trace(&rho, &compact_cache, &compact_solver)
+        .expect("compact rho_sparse trace");
+
+    // Full-support compact must reproduce the dense trace to roundoff.
+    let struct_tol = 1.0e-7 * (1.0 + analytic_dense.abs());
+    assert!(
+        (analytic_dense - analytic_compact).abs() <= struct_tol,
+        "compact-layout IBP ρ_sparse logdet trace must equal the dense trace on \
+         full support: dense={analytic_dense:.10e}, compact={analytic_compact:.10e}"
+    );
+
+    // And the compact trace must independently match the dense fixed-state central
+    // difference of log|H| (the full ½ ∂log|H|/∂ρ_sparse including the cross-row
+    // off-diagonal) — FD-validating the compact path itself, not just the
+    // dense/compact equality.
+    let h = 1.0e-5;
+    let mut rho_plus = rho.clone();
+    let mut rho_minus = rho.clone();
+    rho_plus.log_lambda_sparse += h;
+    rho_minus.log_lambda_sparse -= h;
+    let fd_half = 0.5
+        * (fixed_state_logdet(term.clone(), &target, &rho_plus)
+            - fixed_state_logdet(term.clone(), &target, &rho_minus))
+        / (2.0 * h);
+    let fd_tol = 3.0e-3 * (1.0 + fd_half.abs().max(analytic_compact.abs()));
+    assert!(
+        (fd_half - analytic_compact).abs() <= fd_tol,
+        "compact-layout IBP ρ_sparse logdet trace vs dense FD: \
+         fd(½∂log|H|/∂ρ)={fd_half:.8e}, compact analytic={analytic_compact:.8e}"
+    );
+}

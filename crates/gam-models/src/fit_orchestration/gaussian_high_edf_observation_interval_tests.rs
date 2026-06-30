@@ -182,6 +182,148 @@ fn gaussian_smooth_observation_interval_covers_nominal_1765() {
     );
 }
 
+/// The #1765 REPRO truth: a genuinely NON-additive (x1·x2 interaction) surface
+/// `cos(3·x1)·sin(3·x2) + x3²`. An additive `s(x1)+s(x2)+s(x3)` basis cannot
+/// represent the product term, so the fit carries irreducible structural bias.
+fn truth_interaction(a: f64, b: f64, c: f64) -> f64 {
+    (3.0 * a).cos() * (3.0 * b).sin() + c * c
+}
+
+/// Diagnostic measurement of the EXACT issue repro (additive fit to the
+/// interaction truth). Prints edf, σ̂, the residual-df scale identity, held-out
+/// coverage, PIT KS, and the systematic-bias-vs-scale decomposition so the
+/// root cause of the reported undercoverage can be read off directly. Run with
+/// `--nocapture`. The only hard assertion is the SCALE IDENTITY
+/// `σ̂² == RSS_train/(n − edf)` — the quantity #1765 is actually about.
+#[test]
+fn additive_fit_to_interaction_truth_scale_diagnostic_1765() {
+    let n = 2500usize;
+    let n_test = 1000usize;
+    let noise_sd = 0.01f64;
+    let z95 = 1.959964_f64;
+
+    let mut rng = StdRng::seed_from_u64(42);
+    let unif = Uniform::new(0.0_f64, 1.0).unwrap();
+    let noise = Normal::new(0.0, noise_sd).unwrap();
+
+    let headers: Vec<String> = ["x1", "x2", "x3", "y"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let mut rows = Vec::with_capacity(n);
+    let mut train_coords = Vec::with_capacity(n);
+    let mut train_y = Vec::with_capacity(n);
+    for _ in 0..n {
+        let a = unif.sample(&mut rng);
+        let b = unif.sample(&mut rng);
+        let c = unif.sample(&mut rng);
+        let y = truth_interaction(a, b, c) + noise.sample(&mut rng);
+        rows.push(StringRecord::from(vec![
+            a.to_string(),
+            b.to_string(),
+            c.to_string(),
+            y.to_string(),
+        ]));
+        train_coords.push((a, b, c));
+        train_y.push(y);
+    }
+    let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode");
+    let col = ds.column_map();
+    let (i1, i2, i3) = (col["x1"], col["x2"], col["x3"]);
+
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula("y ~ smooth(x1) + smooth(x2) + smooth(x3)", &ds, &cfg)
+        .expect("3-smooth gaussian fit");
+    let StandardFitResult {
+        fit, resolvedspec, ..
+    } = match result {
+        FitResult::Standard(s) => s,
+        _ => panic!("expected Standard fit"),
+    };
+
+    let edf = fit.edf_total().expect("edf_total");
+    let sigma = fit.standard_deviation;
+
+    // Training-design RSS and the residual-df scale identity.
+    let mut train_mat = Array2::<f64>::zeros((n, ds.headers.len()));
+    for (k, &(a, b, c)) in train_coords.iter().enumerate() {
+        train_mat[[k, i1]] = a;
+        train_mat[[k, i2]] = b;
+        train_mat[[k, i3]] = c;
+    }
+    let train_design =
+        build_term_collection_design(train_mat.view(), &resolvedspec).expect("train design");
+    let train_fitted: Array1<f64> = train_design.design.matrixvectormultiply(&fit.beta);
+    let rss: f64 = train_y
+        .iter()
+        .zip(train_fitted.iter())
+        .map(|(&yi, &fi)| (yi - fi).powi(2))
+        .sum();
+    let sigma2_residual_df = rss / (n as f64 - edf);
+
+    // Held-out coverage + PIT, and the systematic mean-bias RMSE (truth − μ̂).
+    let mut test_mat = Array2::<f64>::zeros((n_test, ds.headers.len()));
+    let mut coords = Vec::with_capacity(n_test);
+    for i in 0..n_test {
+        let a = unif.sample(&mut rng);
+        let b = unif.sample(&mut rng);
+        let c = unif.sample(&mut rng);
+        test_mat[[i, i1]] = a;
+        test_mat[[i, i2]] = b;
+        test_mat[[i, i3]] = c;
+        coords.push((a, b, c));
+    }
+    let eval = build_term_collection_design(test_mat.view(), &resolvedspec).expect("eval design");
+    let mu: Array1<f64> = eval.design.matrixvectormultiply(&fit.beta);
+
+    let mut hits = 0usize;
+    let mut pit = Vec::with_capacity(n_test);
+    let mut bias_sq = 0.0f64;
+    for i in 0..n_test {
+        let (a, b, c) = coords[i];
+        let truth_i = truth_interaction(a, b, c);
+        bias_sq += (truth_i - mu[i]).powi(2);
+        let y_obs = truth_i + noise.sample(&mut rng);
+        if (y_obs - mu[i]).abs() <= z95 * sigma {
+            hits += 1;
+        }
+        let u = 0.5 * (1.0 + libm_erf((y_obs - mu[i]) / (sigma * std::f64::consts::SQRT_2)));
+        pit.push(u);
+    }
+    let coverage = hits as f64 / n_test as f64;
+    let ks = ks_vs_uniform(pit);
+    let bias_rmse = (bias_sq / n_test as f64).sqrt();
+
+    eprintln!(
+        "#1765 REPRO (additive fit, interaction truth): n={n} edf={edf:.1} \
+         sigma_hat={sigma:.5} (true noise {noise_sd})"
+    );
+    eprintln!(
+        "#1765 REPRO scale: RSS={rss:.4} sigma_hat^2={:.8} RSS/(n-edf)={sigma2_residual_df:.8}",
+        sigma * sigma
+    );
+    eprintln!(
+        "#1765 REPRO held-out: coverage={coverage:.3} PIT_KS={ks:.4} \
+         held_out_mean_bias_RMSE={bias_rmse:.5} (= {:.1}x sigma_hat)",
+        bias_rmse / sigma.max(1e-12)
+    );
+
+    // The ONLY contract this test pins: the Gaussian scale is the residual-df
+    // estimator, regardless of model specification. Coverage/KS/bias are printed
+    // for diagnosis (an additive model on an interaction truth cannot cover by
+    // any tool; the scale formula is nonetheless correct).
+    let rel = (sigma * sigma - sigma2_residual_df).abs() / sigma2_residual_df.max(1e-18);
+    assert!(
+        rel < 1e-2,
+        "σ̂²={:.10} must equal RSS/(n-edf)={sigma2_residual_df:.10} (rel={rel:.4}) \
+         even under misspecification (#1765 scale identity)",
+        sigma * sigma
+    );
+}
+
 /// Error function via a rational approximation (Abramowitz & Stegun 7.1.26),
 /// accurate to ~1e-7 — enough for the PIT KS guard. Avoids a libm dependency.
 fn libm_erf(x: f64) -> f64 {

@@ -1039,6 +1039,50 @@ fn predict_multinomial_intervals_pyfunc<'py>(
     Ok(out.unbind())
 }
 
+/// Draw posterior-predictive replicate class assignments for a saved
+/// multinomial model on fresh rows (#1101). Each of `n_draws` replicates samples
+/// every row's class from `Categorical(softmax(X·β̂))` — the plug-in predictive
+/// (categorical observation noise around the fitted mean). Returns a dict with
+/// `draws` (an `(n_draws, N_new)` int64 array of class INDICES `0..K`) and
+/// `class_levels` (the label list those indices index). Deterministic in `seed`.
+#[pyfunction(signature = (model_bytes, headers, rows, n_draws, seed = 0))]
+fn posterior_predict_multinomial_pyfunc<'py>(
+    py: Python<'py>,
+    model_bytes: Vec<u8>,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    n_draws: usize,
+    seed: u64,
+) -> PyResult<Py<PyDict>> {
+    let (draws, class_levels) = detach_pyresult(py, "posterior_predict_multinomial", move || {
+        let envelope: MultinomialModelEnvelope =
+            serde_json::from_slice(&model_bytes).map_err(|err| {
+                py_value_error(format!("failed to deserialize multinomial model: {err}"))
+            })?;
+        if envelope.model_class != "multinomial" {
+            return Err(py_value_error(format!(
+                "posterior_predict_multinomial: model_class = {:?}, expected 'multinomial'",
+                envelope.model_class
+            )));
+        }
+        let dataset = dataset_with_inferred_schema(headers, rows).map_err(py_value_error)?;
+        let draws = gam::families::multinomial::posterior_predict_multinomial_formula(
+            &envelope.saved,
+            &dataset,
+            n_draws,
+            seed,
+        )
+        .map_err(estimation_error_to_pyerr)?;
+        // Map u32 class indices to i64 for a natural numpy integer dtype.
+        let draws_i64 = draws.mapv(|v| v as i64);
+        Ok((draws_i64, envelope.saved.class_levels.clone()))
+    })?;
+    let out = PyDict::new(py);
+    out.set_item("draws", draws.into_pyarray(py))?;
+    out.set_item("class_levels", class_levels)?;
+    Ok(out.unbind())
+}
+
 /// Wood rank-truncated Wald smooth-significance table for a saved multinomial
 /// model (#1101). Returns a list of dicts, one per `(active class, smooth term)`:
 /// `class`, `term`, `edf`, `ref_df`, `statistic`, `p_value`. Empty when the

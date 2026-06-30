@@ -338,22 +338,31 @@ fi
 # --tests`) once before you push to catch any downstream breakage.
 if [[ "${1:-}" == "changed" || "${1:-}" == "crate" ]]; then
   mode="$1"; shift
-  declare -A _seen; _crates=(); _root=0
+  # NB: macOS ships bash 3.2 (no associative arrays / `declare -A`). Dedup with a
+  # plain indexed array + linear membership check, guarding empty-array expansion
+  # under `set -u` via the `${arr[@]+...}` idiom.
+  _crates=(); _root=0
+  _add_crate() {
+    local x
+    if [[ ${#_crates[@]} -gt 0 ]]; then
+      for x in "${_crates[@]}"; do [[ "$x" == "$1" ]] && return 0; done
+    fi
+    _crates+=("$1")
+  }
   if [[ "$mode" == "crate" ]]; then
     if [[ $# -eq 0 ]]; then echo "[build.sh] usage: ./build.sh crate <name> [name…]" >&2; exit 64; fi
-    for c in "$@"; do _seen["$c"]=1; done
+    for c in "$@"; do _add_crate "$c"; done
   else
     # Parse `git status --porcelain` (handles renames "old -> new" by taking new).
     while IFS= read -r line; do
       [[ -z "$line" ]] && continue
       f="${line:3}"; [[ "$f" == *" -> "* ]] && f="${f##* -> }"
       case "$f" in
-        crates/*/*) c="${f#crates/}"; c="${c%%/*}"; _seen["$c"]=1 ;;
+        crates/*/*) c="${f#crates/}"; c="${c%%/*}"; _add_crate "$c" ;;
         src/*|Cargo.toml|Cargo.lock|tests/*) _root=1 ;;
       esac
     done < <(git -C "$REPO" status --porcelain 2>/dev/null)
   fi
-  for c in "${!_seen[@]}"; do _crates+=("$c"); done
   if [[ "$_root" == 1 || ${#_crates[@]} -eq 0 ]]; then
     REQ="check --workspace --lib"; CMD=("${CARGO[@]}" check --workspace --lib)
     [[ "$mode" == "changed" ]] && echo "[build.sh] scoped 'changed': root/test/Cargo change (or no crate diff) → full workspace check" >&2

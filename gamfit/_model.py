@@ -1404,6 +1404,59 @@ class MultinomialModel:
         """
         return self.predict(data, interval="confidence").std_error
 
+    def posterior_predict(
+        self,
+        data: Any,
+        *,
+        n_draws: int = 100,
+        seed: int = 0,
+    ) -> Any:
+        """Draw posterior-predictive replicate class labels at ``data`` (#1101).
+
+        Each of the ``n_draws`` rows is a fresh synthetic class-label vector
+        drawn from the fitted predictive distribution — every row's label is
+        sampled from ``Categorical(softmax(X·beta_hat))`` (the plug-in
+        categorical observation noise around the fitted mean). This is the
+        multinomial analogue of :meth:`Model.sample_replicates` and the engine
+        for posterior-predictive checks and synthetic-data generation.
+
+        Parameters
+        ----------
+        data : table-like
+            New rows in any format accepted by :meth:`predict`. Must cover every
+            predictor referenced by the fitted formula (the response column, if
+            present, is ignored).
+        n_draws : int, default 100
+            Number of replicate label vectors to draw.
+        seed : int, default 0
+            Seed for the deterministic draw stream; the same
+            ``(data, n_draws, seed)`` reproduce bit-identically.
+
+        Returns
+        -------
+        numpy.ndarray
+            An ``(n_draws, n_rows)`` object array of class labels (strings from
+            :attr:`classes_`).
+        """
+        import numpy as np
+
+        n_draws = int(n_draws)
+        if n_draws < 1:
+            raise ValueError(f"n_draws must be >= 1, got {n_draws}")
+        headers, rows, _ = normalize_table(data)
+        try:
+            out = rust_module().posterior_predict_multinomial_pyfunc(
+                self._model_bytes, headers, rows, n_draws, int(seed)
+            )
+        except Exception as exc:
+            raise map_exception(exc) from exc
+        idx = np.asarray(out["draws"])
+        levels = list(out["class_levels"])
+        labels = np.empty(idx.shape, dtype=object)
+        for c, name in enumerate(levels):
+            labels[idx == c] = name
+        return labels
+
     def smooth_significance(self) -> list[dict]:
         """Wood rank-truncated Wald smooth-term significance table (#1101).
 

@@ -5758,6 +5758,266 @@ mod tests {
         );
     }
 
+    /// #1017/#1026 — large-K, many-atom, dense-cross-pair parity for the framed
+    /// SAE reduced-Schur CPU oracle. The small `framed_sae_schur_matvec_matches_dense_reference`
+    /// pins `border_dim=14`/3 atoms/1 cross pair; the interactions that only
+    /// appear at scale — variable per-atom `r_k` (mixed framed `r_k<p` and
+    /// un-framed `r_k=p`), the prefix-sum `border_offsets`, and dense cross-atom
+    /// `W_ij` coupling across MANY co-occurring `frame_blocks` and many `row_htbeta`
+    /// slabs — were validated only on the A100. This pins the CPU oracle (and
+    /// therefore the device kernel it mirrors) against the dense reduced Schur at
+    /// 40 atoms / `border_dim≈240` / a neighbour-coupled cross-pair set, on CPU.
+    #[test]
+    fn framed_sae_schur_matvec_matches_dense_reference_large_k_1026() {
+        use crate::arrow_schur::{
+            BetaPenaltyOp, DeviceSaeFrameData, DeviceSaePcgData, DeviceSaeSmoothBlock,
+            FactoredFrameGBlock, FactoredFrameKroneckerOp, IdentityRightKroneckerPenaltyOp,
+        };
+
+        let p = 12usize;
+        let n_atoms = 40usize;
+        // Variable per-atom rank: most atoms are genuinely framed (r_k<p), every
+        // fifth atom is un-framed (r_k=p, U=I_p — the within-atom G⊗I_r collapse).
+        let ranks: Vec<usize> = (0..n_atoms)
+            .map(|k| if k % 5 == 0 { p } else { 2 + (k % 3) })
+            .collect();
+        let basis_sizes: Vec<usize> = (0..n_atoms).map(|k| 1 + (k % 3)).collect();
+        let mut border_offsets = Vec::with_capacity(n_atoms);
+        let mut acc = 0usize;
+        for k in 0..n_atoms {
+            border_offsets.push(acc);
+            acc += basis_sizes[k] * ranks[k];
+        }
+        let border_dim = acc;
+
+        let mut state = 0x0bad_c0de_dead_beefu64;
+        let mut sample = || -> f64 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f64) / ((1u64 << 31) as f64) - 1.0
+        };
+
+        // Per-atom frames U_k (p × r_k); un-framed atom (r=p) uses U = I_p.
+        let mut frames: Vec<Array2<f64>> = Vec::with_capacity(n_atoms);
+        for k in 0..n_atoms {
+            let r = ranks[k];
+            let mut u = Array2::<f64>::zeros((p, r));
+            for i in 0..p {
+                for j in 0..r {
+                    u[[i, j]] = if r == p {
+                        if i == j { 1.0 } else { 0.0 }
+                    } else {
+                        sample()
+                    };
+                }
+            }
+            frames.push(u);
+        }
+        let w_of = |i: usize, j: usize| -> Array2<f64> {
+            let (ui, uj) = (&frames[i], &frames[j]);
+            let (ri, rj) = (ranks[i], ranks[j]);
+            let mut w = Array2::<f64>::zeros((ri, rj));
+            for a in 0..ri {
+                for b in 0..rj {
+                    let mut s = 0.0;
+                    for c in 0..p {
+                        s += ui[[c, a]] * uj[[c, b]];
+                    }
+                    w[[a, b]] = s;
+                }
+            }
+            w
+        };
+
+        // Co-occurring data-fit blocks: every diagonal pair + each neighbour pair
+        // (k,k+1) and its transpose — dense cross coupling across the whole border.
+        let mut pairs: Vec<(usize, usize)> = Vec::new();
+        for k in 0..n_atoms {
+            pairs.push((k, k));
+        }
+        for k in 0..n_atoms - 1 {
+            pairs.push((k, k + 1));
+            pairs.push((k + 1, k));
+        }
+        pairs.sort_unstable();
+        let mut frame_blocks: Vec<FactoredFrameGBlock> = Vec::new();
+        for &(i, j) in &pairs {
+            let (mi, mj) = (basis_sizes[i], basis_sizes[j]);
+            let mut g = Array2::<f64>::zeros((mi, mj));
+            for r in 0..mi {
+                for c in 0..mj {
+                    g[[r, c]] = 0.3 * sample();
+                }
+            }
+            if i == j {
+                for r in 0..mi.min(mj) {
+                    g[[r, r]] += mi as f64 + 2.0;
+                }
+            }
+            frame_blocks.push(FactoredFrameGBlock {
+                atom_i: i,
+                atom_j: j,
+                g,
+                w: w_of(i, j),
+            });
+        }
+
+        // Smooth blocks λ S_k (M_k × M_k), SPD.
+        let mut smooth_blocks: Vec<DeviceSaeSmoothBlock> = Vec::with_capacity(n_atoms);
+        let mut smooth_ranks: Vec<usize> = Vec::with_capacity(n_atoms);
+        for k in 0..n_atoms {
+            let m = basis_sizes[k];
+            let mut a = Array2::<f64>::zeros((m, m));
+            for r in 0..m {
+                for c in 0..m {
+                    a[[r, c]] = 0.2 * sample();
+                }
+            }
+            let mut s = a.t().dot(&a);
+            for r in 0..m {
+                s[[r, r]] += 1.0;
+            }
+            smooth_blocks.push(DeviceSaeSmoothBlock {
+                global_offset: border_offsets[k],
+                factor_a: s,
+            });
+            smooth_ranks.push(ranks[k]);
+        }
+
+        // n rows with SPD htt and full-width (q × border_dim) htbeta slabs.
+        let n = 8usize;
+        let q = 3usize;
+        let mut sys = ArrowSchurSystem::new(n, q, border_dim);
+        let mut row_htbeta: Vec<Vec<f64>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut a = Array2::<f64>::zeros((q, q));
+            for r in 0..q {
+                for c in 0..q {
+                    a[[r, c]] = sample();
+                }
+            }
+            let mut htt = a.t().dot(&a);
+            for r in 0..q {
+                htt[[r, r]] += q as f64 + 1.0;
+            }
+            sys.rows[i].htt = htt;
+            let mut slab = vec![0.0_f64; q * border_dim];
+            for c in 0..q {
+                for col in 0..border_dim {
+                    let v = 0.15 * sample();
+                    slab[c * border_dim + col] = v;
+                    sys.rows[i].htbeta[[c, col]] = v;
+                }
+            }
+            row_htbeta.push(slab);
+        }
+
+        // Dense H_ββ from the SAME penalty ops (data-fit + smooth), so the dense
+        // reference S matches the device penalty side exactly.
+        let data_op =
+            FactoredFrameKroneckerOp::new(ranks.clone(), basis_sizes.clone(), frame_blocks.clone())
+                .expect("frame op");
+        let mut hbb = data_op.to_dense();
+        for k in 0..n_atoms {
+            let op = IdentityRightKroneckerPenaltyOp {
+                factor_a: smooth_blocks[k].factor_a.clone(),
+                p: ranks[k],
+                global_offset: border_offsets[k],
+                k: border_dim,
+            };
+            let d = op.to_dense();
+            for r in 0..border_dim {
+                for c in 0..border_dim {
+                    hbb[[r, c]] += d[[r, c]];
+                }
+            }
+        }
+        sys.hbb = hbb;
+
+        let data = DeviceSaePcgData {
+            p,
+            beta_dim: border_dim,
+            a_phi: std::sync::Arc::from(Vec::new().into_boxed_slice()),
+            local_jac: std::sync::Arc::from(Vec::new().into_boxed_slice()),
+            smooth_blocks,
+            sparse_g_blocks: Vec::new(),
+            frame: Some(DeviceSaeFrameData {
+                ranks: ranks.clone(),
+                basis_sizes: basis_sizes.clone(),
+                border_offsets: border_offsets.clone(),
+                frame_blocks,
+                smooth_ranks,
+                row_htbeta,
+            }),
+        };
+
+        let ridge_t = 1e-7;
+        let ridge_beta = 1e-6;
+
+        // Dense reference reduced Schur S = (hbb + ridge_beta I) - Σ_i htbetaᵀ (htt+ridge_t I)⁻¹ htbeta.
+        let mut s_dense = sys.hbb.clone();
+        for r in 0..border_dim {
+            s_dense[[r, r]] += ridge_beta;
+        }
+        for row in &sys.rows {
+            let mut htt = row.htt.clone();
+            for d in 0..q {
+                htt[[d, d]] += ridge_t;
+            }
+            let factor = cholesky_factor_in_place(htt.view(), CholeskyGuard::NonnegativePivot)
+                .expect("htt PD");
+            let mut y = Array2::<f64>::zeros((q, border_dim));
+            for col in 0..border_dim {
+                let mut e = Array1::<f64>::zeros(q);
+                for r in 0..q {
+                    e[r] = row.htbeta[[r, col]];
+                }
+                let solved = cholesky_solve_vector(factor.view(), e.view());
+                for r in 0..q {
+                    y[[r, col]] = solved[r];
+                }
+            }
+            for r in 0..border_dim {
+                for c in 0..border_dim {
+                    let mut acc = 0.0;
+                    for d in 0..q {
+                        acc += row.htbeta[[d, r]] * y[[d, c]];
+                    }
+                    s_dense[[r, c]] -= acc;
+                }
+            }
+        }
+
+        let mut max_rel = 0.0_f64;
+        for trial in 0..4 {
+            let x: Vec<f64> = (0..border_dim)
+                .map(|a| 0.3 * ((a as f64 + trial as f64) * 0.21).cos() - 0.1)
+                .collect();
+            let mut got = vec![0.0_f64; border_dim];
+            sae_framed_schur_matvec_cpu(&sys, &data, ridge_t, ridge_beta, &x, &mut got)
+                .expect("framed matvec");
+            let mut want = vec![0.0_f64; border_dim];
+            for r in 0..border_dim {
+                let mut acc = 0.0;
+                for c in 0..border_dim {
+                    acc += s_dense[[r, c]] * x[c];
+                }
+                want[r] = acc;
+            }
+            let scale = want.iter().fold(0.0_f64, |m, v| m.max(v.abs())).max(1.0);
+            for a in 0..border_dim {
+                let rel = (got[a] - want[a]).abs() / scale;
+                max_rel = max_rel.max(rel);
+            }
+        }
+        assert!(
+            max_rel <= 1e-10,
+            "large-K framed SAE Schur matvec vs dense reference diverged: \
+             max_rel={max_rel:e} (n_atoms={n_atoms}, border_dim={border_dim})"
+        );
+    }
+
     /// #1017/#1026 GPU arm: when a CUDA device admits the framed SAE PCG, its
     /// solved `δβ` must match the CPU dense reduced-system solve of the SAME
     /// framed system (size-independent — a small device validates the kernel).

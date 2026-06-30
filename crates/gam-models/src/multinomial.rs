@@ -1018,6 +1018,48 @@ impl MultinomialSavedModel {
         }
         out
     }
+
+    /// Draw `n_draws` posterior-predictive replicate class assignments at fresh
+    /// rows (#1101). Each draw independently samples every row's class from
+    /// `Categorical(p_row)` with `p = softmax(X·β̂)` — the plug-in predictive
+    /// distribution, i.e. the multinomial observation noise wrapped around the
+    /// fitted mean (the categorical analogue of the scalar families'
+    /// `sample_replicates`). The returned `(n_draws, N)` matrix holds class
+    /// INDICES `0..K`, aligned to [`Self::class_levels`]. The draw stream is a
+    /// `StdRng` seeded by `seed`, so `(x_new, n_draws, seed)` reproduce
+    /// bit-identically — the engine for posterior-predictive checks and
+    /// simulation-based calibration. `x_new` must have `self.p_per_class`
+    /// columns (built from the same `resolved_termspec` as fit time).
+    pub fn sample_replicate_classes(
+        &self,
+        x_new: ArrayView2<'_, f64>,
+        n_draws: usize,
+        seed: u64,
+    ) -> Array2<u32> {
+        use rand::{Rng, SeedableRng};
+        let probs = self.predict_probabilities(x_new);
+        let n = probs.nrows();
+        let k = probs.ncols();
+        let mut out = Array2::<u32>::zeros((n_draws, n));
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        for d in 0..n_draws {
+            for row in 0..n {
+                let u: f64 = rng.random::<f64>();
+                // Inverse-CDF categorical draw over the K simplex weights.
+                let mut acc = 0.0_f64;
+                let mut chosen = k - 1; // numerical fallback = reference class
+                for c in 0..k {
+                    acc += probs[[row, c]];
+                    if u < acc {
+                        chosen = c;
+                        break;
+                    }
+                }
+                out[[d, row]] = chosen as u32;
+            }
+        }
+        out
+    }
 }
 
 /// One row of the multinomial smooth-significance table (#1101): the Wood
@@ -2106,23 +2148,19 @@ pub fn fit_penalized_multinomial_formula(
     })
 }
 
-/// Replay the saved termspec to build the predict-time design on a fresh
-/// dataset, then evaluate softmax probabilities. The predict dataset must carry
-/// the same feature columns the training data did, matched **by name** — it need
-/// not reproduce the training column order, and in particular need not carry the
-/// response column (prediction is for label-free new data).
-pub fn predict_multinomial_formula(
+/// Replay the saved termspec to build the predict-time dense design `X` on a
+/// fresh dataset, realigning feature columns **by name** so the predict frame
+/// need not reproduce the training column order or carry the response column.
+/// Shared by every multinomial predict path (probabilities, SE bands, and the
+/// posterior-predictive replicate draws).
+fn build_multinomial_predict_design(
     model: &MultinomialSavedModel,
     data: &EncodedDataset,
 ) -> Result<Array2<f64>, EstimationError> {
     // The saved termspec stores feature columns as absolute indices into the
-    // *training* table `[response, features...]`. Replaying it verbatim only
-    // works if the predict frame reproduces that exact layout — i.e. carries the
-    // (unknown, at predict time) response column in the same position. Realign
-    // the indices onto this dataset's columns by name instead, so prediction
-    // works on label-free new data exactly as every other family's predict path
-    // does. The response column is simply never referenced by any term, so its
-    // absence is a non-issue once resolution is by name (issue #803).
+    // *training* table `[response, features...]`. Realign them onto this
+    // dataset's columns by name, so prediction works on label-free new data
+    // (the response column is never referenced by any term; issue #803).
     let predict_columns = data.column_map();
     let realigned = model.resolved_termspec.remap_feature_columns(
         |index| -> Result<usize, EstimationError> {
@@ -2153,7 +2191,40 @@ pub fn predict_multinomial_formula(
             model.p_per_class
         );
     }
+    Ok(x_dense)
+}
+
+/// Replay the saved termspec to build the predict-time design on a fresh
+/// dataset, then evaluate softmax probabilities. The predict dataset must carry
+/// the same feature columns the training data did, matched **by name** — it need
+/// not reproduce the training column order, and in particular need not carry the
+/// response column (prediction is for label-free new data).
+pub fn predict_multinomial_formula(
+    model: &MultinomialSavedModel,
+    data: &EncodedDataset,
+) -> Result<Array2<f64>, EstimationError> {
+    let x_dense = build_multinomial_predict_design(model, data)?;
     Ok(model.predict_probabilities(x_dense.view()))
+}
+
+/// Draw `n_draws` posterior-predictive replicate class-label assignments for a
+/// saved multinomial model on fresh data (#1101). Rebuilds the predict design
+/// exactly as [`predict_multinomial_formula`], then samples each row's class
+/// from `Categorical(softmax(X·β̂))` (see
+/// [`MultinomialSavedModel::sample_replicate_classes`]). Returns an
+/// `(n_draws, N)` matrix of class INDICES `0..K` aligned to `model.class_levels`,
+/// deterministic in `seed`.
+pub fn posterior_predict_multinomial_formula(
+    model: &MultinomialSavedModel,
+    data: &EncodedDataset,
+    n_draws: usize,
+    seed: u64,
+) -> Result<Array2<u32>, EstimationError> {
+    if n_draws == 0 {
+        crate::bail_invalid_estim!("multinomial posterior_predict: n_draws must be >= 1");
+    }
+    let x_dense = build_multinomial_predict_design(model, data)?;
+    Ok(model.sample_replicate_classes(x_dense.view(), n_draws, seed))
 }
 
 /// Predict class probabilities AND delta-method per-class probability standard
@@ -2167,36 +2238,7 @@ pub fn predict_multinomial_formula_with_se(
     model: &MultinomialSavedModel,
     data: &EncodedDataset,
 ) -> Result<(Array2<f64>, Option<Array2<f64>>), EstimationError> {
-    let predict_columns = data.column_map();
-    let realigned = model.resolved_termspec.remap_feature_columns(
-        |index| -> Result<usize, EstimationError> {
-            let name = model.training_headers.get(index).ok_or_else(|| {
-                EstimationError::InvalidInput(format!(
-                    "multinomial predict: saved training column index {index} is out of bounds \
-                     for {} training headers",
-                    model.training_headers.len()
-                ))
-            })?;
-            resolve_role_col(&predict_columns, name, "feature")
-                .map_err(|err| EstimationError::InvalidInput(err.to_string()))
-        },
-    )?;
-    let design = build_term_collection_design(data.values.view(), &realigned).map_err(|err| {
-        EstimationError::InvalidInput(format!(
-            "multinomial predict: rebuild design from saved termspec: {err}"
-        ))
-    })?;
-    let x_dense = design
-        .design
-        .try_to_dense_by_chunks("multinomial predict design")
-        .map_err(EstimationError::InvalidInput)?;
-    if x_dense.ncols() != model.p_per_class {
-        crate::bail_invalid_estim!(
-            "multinomial predict: predict design has {} cols, saved model expects {}",
-            x_dense.ncols(),
-            model.p_per_class
-        );
-    }
+    let x_dense = build_multinomial_predict_design(model, data)?;
     Ok(model.predict_probabilities_with_se(x_dense.view()))
 }
 
