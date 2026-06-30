@@ -342,35 +342,57 @@ pub(super) fn solve_penalized_least_squares_implicit(
         );
     }
 
-    // 4. Ridge stabilization. Augment both sides by the ridge so the
-    // stabilization is a Tikhonov regularization centered at the prior
-    // mean target: (H + δI) β = r + δ μ. The prior_mean_target is zero
-    // when no penalty block carries a non-zero prior mean, so this is a
-    // no-op in the common case but recovers `β = μ` exactly on
-    // X'WX = 0 / X'Wz = 0 problems where the data carries no information.
-    let nugget = FIXED_STABILIZATION_RIDGE;
-    let mut regularizedhessian = penalized_hessian.clone();
-    if nugget > 0.0 {
-        for i in 0..p_dim {
-            regularizedhessian[[i, i]] += nugget;
+    // 4. Ridge stabilization — CONDITIONAL, matching the sparse path
+    // (`ensure_sparse_positive_definitewithridge`) and the dense Newton path
+    // (`ensure_positive_definitewithridge`). A penalized Hessian assembled from
+    // `XᵀWX + S_λ` is mathematically PSD; a fixed tiny nugget is only needed to
+    // cure round-off when the bare matrix narrowly fails Cholesky. Applying the
+    // nugget UNCONDITIONALLY (the previous behaviour) made β̂ the stationary
+    // point of the RIDGED objective `½βᵀ(H+δI)β`, so the inner residual was
+    // `Xᵀu − S_λβ̂ = δβ̂` rather than 0. The outer REML ψ-gradient differentiates
+    // the BARE objective via the envelope theorem (it assumes exact
+    // stationarity), so the gratuitous δ broke the envelope identity: the
+    // analytic datafit derivative `a` was short by `½·δ·βᵀ(dβ̂/dψ)` and the
+    // β-independent `log|H|` term was differentiated on the un-ridged surface
+    // while the criterion VALUE used `log|H+δI|`. For the Matérn iso-κ joint
+    // REML at θ₀ (`TransformedQs` frame, δ_eff ≈ 1.75e-6 in the original basis)
+    // this is exactly the residual outer-gradient↔FD DESYNC of #1122 (gap
+    // 2.565e-2, with `cos(Xᵀu−S_λβ̂, β̂) = 1.0000` pinning the residual to the
+    // ridge gradient). Try the bare matrix first so the well-conditioned common
+    // case carries NO ridge (`ridge_used = 0`) and the envelope identity holds
+    // exactly; fall back to the Tikhonov nugget only when the bare factorization
+    // actually fails. The augmented RHS `r + δμ` keeps the fallback a Tikhonov
+    // regularization centered at the prior-mean target.
+    let bare_factor = StableSolver::new("pirls implicit pls")
+        .factorize(&penalized_hessian)
+        .ok();
+    let (factor, ridge_used) = if let Some(factor) = bare_factor {
+        (factor, 0.0)
+    } else {
+        let nugget = FIXED_STABILIZATION_RIDGE;
+        let mut regularizedhessian = penalized_hessian.clone();
+        if nugget > 0.0 {
+            for i in 0..p_dim {
+                regularizedhessian[[i, i]] += nugget;
+            }
         }
-    }
-    let ridge_used = nugget;
+        let factor = StableSolver::new("pirls implicit pls")
+            .factorize(&regularizedhessian)
+            .map_err(EstimationError::LinearSystemSolveFailed)?;
+        (factor, nugget)
+    };
 
     // 5. Solve
     if workspace.rhs_full.len() != p_dim {
         workspace.rhs_full = Array1::zeros(p_dim);
     }
     workspace.rhs_full.assign(&workspace.vec_buf_p);
-    if nugget > 0.0 {
+    if ridge_used > 0.0 {
         let prior_mean_target = penalty.prior_mean_target();
         if prior_mean_target.len() == p_dim {
-            workspace.rhs_full.scaled_add(nugget, prior_mean_target);
+            workspace.rhs_full.scaled_add(ridge_used, prior_mean_target);
         }
     }
-    let factor = StableSolver::new("pirls implicit pls")
-        .factorize(&regularizedhessian)
-        .map_err(EstimationError::LinearSystemSolveFailed)?;
     let mut rhsview = array1_to_col_matmut(&mut workspace.rhs_full);
     factor.solve_in_place(rhsview.as_mut());
     if !array_is_finite(&workspace.rhs_full) {

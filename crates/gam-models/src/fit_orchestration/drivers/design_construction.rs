@@ -6676,7 +6676,17 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
             if let Some(s) = input_scales {
                 apply_input_standardization(&mut x, s);
             }
-            build_matern_basis_log_kappa_aniso_derivatives(x.view(), spec)
+            // #1122: the realized Matérn design always carries the operator
+            // {mass, tension, stiffness} penalty triplet (`build_term` overrides
+            // the `double_penalty` kernel penalty via
+            // `matern_operator_penalty_triplet_from_metadata`). The per-axis
+            // κ-gradient must differentiate that SAME triplet, not the kernel
+            // double-penalty blocks, or the analytic `tr(S⁺ Ṡ)` desyncs from the
+            // FD of the criterion's operator-triplet `log|Sλ|₊` (the iso-axis
+            // analogue is handled in `try_build_spatial_term_log_kappa_derivative`).
+            let mut spec_operator = spec.clone();
+            spec_operator.double_penalty = false;
+            build_matern_basis_log_kappa_aniso_derivatives(x.view(), &spec_operator)
                 .map_err(EstimationError::from)?
         }
         // Measure-jet: the grouped dial coordinates ride the same per-axis
