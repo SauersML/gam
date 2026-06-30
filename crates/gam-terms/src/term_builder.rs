@@ -4936,6 +4936,64 @@ mod tests {
         );
     }
 
+    /// #1776 / #1752: a bare doubly-cyclic tensor `te(x, z, bs=c('cc','cc'))`
+    /// with NO explicit `period=` must build — each cyclic margin wraps on its
+    /// own observed `[min, max]` data span (mirroring mgcv's `bs="cc"` and the
+    /// 1-D cyclic fallback), instead of hard-erroring "periodic but requires an
+    /// explicit period". The periodic-radial refactor (c8c3192fa) replaced that
+    /// fallback with an unconditional `period=`-required error and orphaned the
+    /// `margin_is_cc` binding that drives it (the #1776 dead-binding `-D
+    /// warnings` build break). This pins the restored data-range derivation so a
+    /// regression that drops the `None if margin_is_cc` branch trips here, fast,
+    /// with no fit/optimizer in the loop.
+    #[test]
+    fn bare_doubly_cyclic_tensor_derives_period_from_data_range_1776() {
+        let ds = continuous_dataset(
+            &["y", "x", "z"],
+            (0..40)
+                .map(|i| {
+                    let x = i as f64 / 39.0;
+                    let z = ((i * 7) % 40) as f64 / 39.0;
+                    vec![x.sin() + z.cos(), x, z]
+                })
+                .collect(),
+        );
+
+        let parsed = parse_formula("y ~ te(x, z, bs=c('cc','cc'))")
+            .expect("parse doubly-cyclic tensor formula");
+        let col_map = ds.column_map();
+        let mut notes = Vec::new();
+        // Must NOT hard-error: the bare cyclic margins derive their period from
+        // the observed data range (the restored #1752 fallback).
+        let terms = build_termspec(
+            &parsed.terms,
+            &ds,
+            &col_map,
+            &mut notes,
+            &ResourcePolicy::default_library(),
+        )
+        .expect(
+            "bare cc-cc tensor must build via the data-range period fallback (#1776/#1752), \
+             not hard-error on a missing explicit period",
+        );
+        let SmoothBasisSpec::TensorBSpline { spec, .. } = &terms.smooth_terms[0].basis else {
+            panic!("expected tensor smooth");
+        };
+        assert_eq!(
+            spec.marginalspecs.len(),
+            2,
+            "te(x, z) builds exactly two tensor margins"
+        );
+        for (axis, marginal) in spec.marginalspecs.iter().enumerate() {
+            assert!(
+                matches!(marginal.knotspec, BSplineKnotSpec::PeriodicUniform { .. }),
+                "cyclic margin {axis} must build a periodic (wrapped) knotspec from the \
+                 data range, got {:?}",
+                marginal.knotspec
+            );
+        }
+    }
+
     #[test]
     fn parse_cylinder_periodic_options_match_requested_forms() {
         let mut opts = BTreeMap::new();
