@@ -1167,6 +1167,13 @@ pub fn reml_laml_evaluate(
         // Only ρ coordinates carry an upper box bound; ψ/ext never freeze here.
         let mut active = upper_active_rho.clone();
         active.extend(std::iter::repeat_n(false, ext_dim));
+        // The KKT-correction self-derivative term `δ_ij·C_i` is non-zero only
+        // for coordinates whose r_i and A_i scale multiplicatively with their
+        // own coordinate. ρ coordinates do (`λ_i = exp(ρ_i)` ⇒ `∂_ρᵢrᵢ = rᵢ`,
+        // `∂_ρᵢAᵢ = Aᵢ`); ψ/ext coordinates feed a FROZEN drift (`∂A = 0`) and
+        // an affine score, so their second self-derivative is zero here.
+        let mut exponential_self_coupling = vec![true; k];
+        exponential_self_coupling.extend(std::iter::repeat_n(false, ext_dim));
         let subspace = solution.penalty_subspace_trace.as_deref();
         Some(compute_kkt_residual_theta_corrections(
             hop,
@@ -1176,6 +1183,7 @@ pub fn reml_laml_evaluate(
             r,
             mode == EvalMode::ValueGradientHessian,
             &active,
+            &exponential_self_coupling,
         )?)
     } else {
         None

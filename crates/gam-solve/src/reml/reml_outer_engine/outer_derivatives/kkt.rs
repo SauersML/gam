@@ -45,18 +45,29 @@ pub(crate) struct KktThetaCorrections {
 /// `drift_apply(i, v) = A_i v` closure, so the SAME algebra produces every
 /// block — there is no separate ρ-only and ψ-only code path to drift apart.
 ///
-/// With `q = K r` and frozen first derivatives over this correction layer:
+/// With `q = K r` and the FIRST derivatives of the correction layer:
 ///   C_i  = −r_iᵀ q + ½ qᵀ A_i q,
-///   q_j  = K(r_j − A_j q),
-///   C_ij = −r_iᵀ q_j + q_jᵀ A_i q.
-/// Coordinate-curvature terms such as `∂²r/∂ρ²` and `∂²H/∂ρ²` belong to the
-/// outer pair assembly (`pair_a` / `h2_trace`) that already differentiates the
-/// log-λ coordinate map. Adding them again here over-corrects the ρρ diagonal.
-/// The dense/operator outer Hessian already carries the exact-KKT profile term
-/// `−r_iᵀ K r_j` for EVERY block (ρρ via the penalty profile, ρψ/ψψ via the
-/// IFT profile `a_iᵀ K a_j` in `outer_hessian_entry`), valid only at `r = 0`,
-/// so the correction adds back `r_iᵀ K r_j + C_ij`; the additive block vanishes
-/// identically at exact KKT (`r = 0 ⇒ q = 0`).
+///   q_j  = ∂_θⱼ q = K(r_j − A_j q),
+///   C_ij = −r_iᵀ q_j + q_jᵀ A_i q  +  δ_ij·[−(∂_ir_i)ᵀq + ½qᵀ(∂_iA_i)q].
+/// The bracketed diagonal term is the SECOND self-derivative of the correction
+/// (`∂²_θᵢ r` and `∂²_θᵢ H`), and it is non-zero precisely for coordinates whose
+/// score-derivative and drift scale MULTIPLICATIVELY with their own coordinate.
+/// The ρ coordinates are exactly such: `λᵢ = exp(ρᵢ)`, so `rᵢ = λᵢSᵢβ̂` and
+/// `Aᵢ = λᵢSᵢ` both obey `∂_ρᵢ rᵢ = rᵢ` and `∂_ρᵢ Aᵢ = Aᵢ`, which collapses the
+/// bracket to exactly `Cᵢ` (the gradient correction already computed at this
+/// coordinate). `exponential_self_coupling[i]` flags those coordinates; for an
+/// affine/frozen coordinate (`r`, `A` linear in θ ⇒ `∂²r = ∂²H = 0`, e.g. the
+/// ψ/ext frozen-drift block whose genuine second order lives elsewhere) the
+/// bracket is zero and the flag is `false`.
+///
+/// This self-derivative term is NOT carried by the outer pair assembly: with no
+/// KKT residual there is no correction `C(θ)` at all, so its curvature can only
+/// enter through this block. The dense/operator outer Hessian carries the
+/// exact-KKT profile term `−r_iᵀ K r_j` for EVERY block (ρρ via the penalty
+/// profile, ρψ/ψψ via the IFT profile `a_iᵀ K a_j` in `outer_hessian_entry`),
+/// valid only at `r = 0`, so the correction adds back `r_iᵀ K r_j + C_ij`; the
+/// additive block vanishes identically at exact KKT (`r = 0 ⇒ q = 0`, and the
+/// diagonal self-term is `Cᵢ = 0` there too).
 ///
 /// `active[i]` masks a coordinate at an active upper box bound (only ρ
 /// coordinates can be masked; the ψ entries are always `false`): a masked
@@ -70,6 +81,7 @@ pub(crate) fn compute_kkt_residual_theta_corrections<F>(
     residual: &Array1<f64>,
     include_hessian: bool,
     active: &[bool],
+    exponential_self_coupling: &[bool],
 ) -> Result<KktThetaCorrections, String>
 where
     F: Fn(usize, &Array1<f64>) -> Array1<f64>,
@@ -86,6 +98,16 @@ where
             reason: format!(
                 "KKT theta correction active-bound mask mismatch: mask={} coords={}",
                 active.len(),
+                m
+            ),
+        }
+        .into());
+    }
+    if exponential_self_coupling.len() != m {
+        return Err(RemlError::DimensionMismatch {
+            reason: format!(
+                "KKT theta correction self-coupling mask mismatch: mask={} coords={}",
+                exponential_self_coupling.len(),
                 m
             ),
         }
@@ -172,7 +194,18 @@ where
         for i in 0..m {
             for j in i..m {
                 let raw = if i == j {
-                    entry(i, j)
+                    // Diagonal: add the second self-derivative `δ_ij·C_i` for
+                    // coordinates whose r_i and A_i scale multiplicatively with
+                    // their own coordinate (λ = exp(ρ)); `gradient[i]` already
+                    // equals `C_i = −r_iᵀq + ½qᵀA_iq`, and `∂_ρᵢrᵢ = rᵢ`,
+                    // `∂_ρᵢAᵢ = Aᵢ` collapse the bracket to exactly C_i. Affine/
+                    // frozen coordinates (`∂²r = ∂²H = 0`) get no such term.
+                    let self_term = if exponential_self_coupling[i] && !active[i] {
+                        gradient[i]
+                    } else {
+                        0.0
+                    };
+                    entry(i, j) + self_term
                 } else {
                     0.5 * (entry(i, j) + entry(j, i))
                 };
