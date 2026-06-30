@@ -91,27 +91,37 @@ fn default_matern_length_scale(ds: &Dataset, cols: &[usize], num_centers: usize)
     //
     // #1074 had moved this seed to the full diameter (mgcv's `bs="gp"` default
     // range). That is wrong for *this* engine because of an ordering coupling
-    // mgcv does not have: the cold build BOTH (a) rank-reduces the center set
-    // (`matern_rank_reduce_centers`) and (b) freezes the surviving count into the
-    // identifiability transform — all at this seed length scale, BEFORE the
-    // κ-optimizer runs. At a range as wide as the diameter every Matérn column is
-    // near-constant over the data cloud, so the realized n×K kernel block is
-    // numerically collinear: RRQR prunes the basis to a small fraction of K
-    // (e.g. 200 → 52), the freeze pins that collapsed count, and the optimizer can
-    // never recover the dropped columns. The result is a smoother that resolves
-    // only the lowest-frequency structure (#1629: matern 6× worse than thinplate,
-    // `k=` a no-op because k is pruned before it matters). The diameter is in fact
-    // OUTSIDE the optimizer's own ψ = log κ window (`[2/r_max, 100/r_min]`), so it
-    // was never a reachable operating point anyway.
+    // mgcv does not have: the cold build evaluates the K Matérn kernel columns at
+    // this seed length scale, realizes the design over the n data rows, and
+    // applies the parametric-orthogonality identifiability transform
+    // (`MaternIdentifiability::CenterSumToZero` ⇒ `smooth_requires_parametric_-`
+    // `orthogonality`) — whose spectral whitener (`positive_spectral_whitener_-`
+    // `from_gram`) is RANK-REVEALING on the realized design Gram — all BEFORE the
+    // κ-optimizer runs, and the surviving column count is then frozen into the
+    // transform.
+    //
+    // At a range as wide as the diameter every Matérn column is near-constant over
+    // the data cloud, so the realized n×K design Gram is numerically rank-deficient
+    // (rank ≈ K/4). The whitener legitimately drops the collapsed directions
+    // (e.g. 199 → 50 realized design columns; verified empirically through
+    // `build_term_collection_design`), the freeze pins that collapsed count, and
+    // the optimizer can never recover the dropped columns. The result is a smoother
+    // that resolves only the lowest-frequency structure (#1629: matern 6× worse
+    // than thinplate, `k=` a near no-op because the realized rank — not k — caps
+    // the basis). NOTE: the per-center `matern_rank_reduce_centers` RRQR is NOT the
+    // culprit here — it reports full rank (K) even at the diameter seed; the
+    // collapse is entirely in the realized-design orthogonality whitener. The
+    // diameter is in fact OUTSIDE the optimizer's own ψ = log κ window
+    // (`[2/r_max, 100/r_min]`), so it was never a reachable operating point anyway.
     //
     // For K space-filling centers over a d-dimensional cloud of diameter `D`, the
     // nearest-neighbour spacing is ≈ D / K^(1/d). Seeding the length scale there
     // keeps κ·r ≈ O(1) between adjacent centers: every kernel column is distinct,
-    // the block stays full rank, the freeze keeps all K centers, and the κ
-    // multi-start pre-scan + joint [ρ, ψ] solver then tune the range freely across
-    // the full data-derived window (#1074's "let the optimizer pick the range"
-    // intent is preserved — the optimizer simply starts from a non-degenerate
-    // basis instead of a collapsed one).
+    // the realized design Gram stays full rank, the whitener + freeze keep all K
+    // columns, and the κ multi-start pre-scan + joint [ρ, ψ] solver then tune the
+    // range freely across the full data-derived window (#1074's "let the optimizer
+    // pick the range" intent is preserved — the optimizer simply starts from a
+    // non-degenerate basis instead of a collapsed one).
     let d = cols.len().max(1);
     let k = num_centers.max(2) as f64;
     let spacing = diameter / k.powf(1.0 / d as f64);
@@ -4905,6 +4915,58 @@ mod tests {
                 "parsed {raw:?} as {parsed:?}, expected {expected:?}"
             );
         }
+    }
+
+    /// #1629: the default Matérn κ seed must be the basis's natural operating
+    /// scale (≈ inter-knot spacing `D / K^(1/d)`), NOT the full data diameter.
+    /// At the diameter the cold kernel block is numerically collinear and the
+    /// rank-reduction collapses the basis before the κ-optimizer ever runs.
+    #[test]
+    fn default_matern_length_scale_seeds_at_inter_knot_spacing_not_diameter() {
+        // A 2-D cloud on [-3, 3]^2: diameter ≈ 6√2 ≈ 8.49.
+        let rows: Vec<Vec<f64>> = (0..400)
+            .map(|i| {
+                let a = -3.0 + 6.0 * (i as f64) / 399.0;
+                let b = 3.0 - 6.0 * ((i * 7 % 400) as f64) / 399.0;
+                vec![a, b, 0.0]
+            })
+            .collect();
+        let ds = continuous_dataset(&["x1", "x2", "y"], rows);
+        let cols = [0usize, 1usize];
+        let diameter = (2.0_f64 * 6.0 * 6.0).sqrt();
+
+        // With K = 200 centers over d = 2, the spacing seed is D / 200^(1/2) ≈
+        // 0.60 — over an order of magnitude below the diameter, and well inside
+        // the κ-optimizer's data-derived ψ window.
+        let k = 200usize;
+        let ls = default_matern_length_scale(&ds, &cols, k);
+        let expected = diameter / (k as f64).powf(0.5);
+        assert!(
+            (ls - expected).abs() <= 1e-9 * expected,
+            "seed {ls} != inter-knot spacing {expected}"
+        );
+        assert!(
+            ls < 0.2 * diameter,
+            "seed {ls} is not far below the diameter {diameter} — the #1629 \
+             rank-collapse seed regressed"
+        );
+
+        // Fewer centers ⇒ wider spacing ⇒ longer seed (monotone), but never
+        // above the diameter even in the tiny-K corner.
+        let ls_small_k = default_matern_length_scale(&ds, &cols, 4);
+        assert!(ls_small_k > ls, "spacing seed must grow as K shrinks");
+        assert!(
+            ls_small_k <= diameter,
+            "seed must never exceed the data diameter"
+        );
+
+        // Degenerate (zero-span) domain falls back to 1.0, not NaN/0.
+        let flat = continuous_dataset(
+            &["x1", "x2", "y"],
+            (0..8).map(|_| vec![1.0, 2.0, 0.0]).collect(),
+        );
+        let ls_flat = default_matern_length_scale(&flat, &cols, 50);
+        assert_eq!(ls_flat, 1.0, "zero-span domain must fall back to 1.0");
     }
 
     #[test]
