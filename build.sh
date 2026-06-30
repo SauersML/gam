@@ -133,19 +133,21 @@ record() { # args: req dedup exit dur
 #
 # Every cacheable request (warm-lib build / check / test / nextest / clippy / …)
 # is keyed on
-#       KEY = sha1( normalized-request-args + tree content hash ).
+#       KEY = sha1( request-args + tree content hash ).
 # The tree hash makes the key source-sensitive: the SAME command on the SAME
 # source serves the cached exit code + log in ~0s (HIT) and recompiles nothing;
 # any *.rs / *.toml / Cargo.lock edit changes the hash → a fresh run (MISS).
 #
-# Coalescing: two agents issuing the SAME request concurrently share ONE run —
-# the first becomes the leader (per-key lock) and executes once under the global
-# build lock; the rest block on the per-key lock and then serve the leader's
-# result (COALESCED) instead of re-running it. DIFFERENT requests still serialize
-# through the global lock (one cargo at a time — the small-RAM invariant) but
-# never duplicate each other's work. This generalises the old warm-lib-only
-# dedup to test runs too: re-running the same `nextest run X` on unchanged source
-# is now free, and a swarm of agents asking for it runs it exactly once.
+# Coalescing: two agents issuing the SAME live request concurrently share ONE
+# run, even if unrelated source edits happen while they are queued. The first
+# becomes the request leader and executes once under the global build lock; the
+# rest block on the request lock and then serve the leader's result
+# (COALESCED_REQUEST) instead of taking another global-lock turn. DIFFERENT
+# requests still serialize through the global lock (one cargo at a time — the
+# small-RAM invariant) but never duplicate each other's work. This generalises
+# the old warm-lib-only dedup to test runs too: re-running the same `nextest run
+# X` on unchanged source is now free, and a swarm of agents asking for it runs it
+# exactly once.
 #
 # Transient outcomes (timeout 124 / signal ≥128, e.g. an OOM-SIGKILL) are NEVER
 # cached; the caller (and any coalesced followers) get exit 75 = "retry".
@@ -157,18 +159,36 @@ record() { # args: req dedup exit dur
 #                                  a test that depends on a non-*.rs data fixture
 #                                  the tree hash does not cover.
 # ---------------------------------------------------------------------------
-CACHEDIR="$S/cache"; KEYDIR="$S/keys"; mkdir -p "$CACHEDIR" "$KEYDIR"
+CACHEDIR="$S/cache"; REQDIR="$S/requests"; mkdir -p "$CACHEDIR" "$REQDIR"
 # Best-effort prune of stale cache/lock entries (>7 days) so .buildd stays bounded.
-find "$CACHEDIR" "$KEYDIR" -mindepth 1 -maxdepth 1 -mtime +7 -exec rm -rf {} + 2>/dev/null || true
+find "$CACHEDIR" "$REQDIR" -mindepth 1 -maxdepth 1 -mtime +7 -exec rm -rf {} + 2>/dev/null || true
 
+# `stat` flags differ by OS: macOS uses -f, GNU/Linux uses -c. Detect once.
+if stat -f '%m' "$REPO" >/dev/null 2>&1; then STAT_ARGS=(-f '%m %z %N'); else STAT_ARGS=(-c '%Y %s %n'); fi
 tree_hash() {
-  # Include Cargo.lock so a dependency bump invalidates the cache (else a stale
-  # result could be served after deps changed but no *.rs did).
-  { find "$REPO/src" "$REPO/tests" "$REPO/crates" -type f \( -name '*.rs' -o -name '*.toml' \) -print0 2>/dev/null \
-      | sort -z | xargs -0 shasum 2>/dev/null
-    shasum "$REPO/Cargo.toml" "$REPO/Cargo.lock" 2>/dev/null; } | shasum | cut -d' ' -f1
+  # Source signature from file METADATA (mtime+size+path), NOT content. A full
+  # content shasum reads every one of ~1.8k files (~0.4s) on EACH call; with a
+  # swarm of agents that's N concurrent whole-repo reads before the lock — a
+  # self-inflicted IO/CPU storm. stat-only is ~10x cheaper, and since any normal
+  # edit bumps mtime (and Cargo.lock is included so dep bumps invalidate) an agent
+  # always sees its own change. Set GAM_CONTENT_HASH=1 to force exact content hash.
+  if [[ -n "${GAM_CONTENT_HASH:-}" ]]; then
+    { find "$REPO/src" "$REPO/tests" "$REPO/crates" -type f \( -name '*.rs' -o -name '*.toml' \) -print0 2>/dev/null \
+        | sort -z | xargs -0 shasum 2>/dev/null
+      shasum "$REPO/Cargo.toml" "$REPO/Cargo.lock" 2>/dev/null; } | shasum | cut -d' ' -f1
+  else
+    { find "$REPO/src" "$REPO/tests" "$REPO/crates" -type f \( -name '*.rs' -o -name '*.toml' \) -print0 2>/dev/null \
+        | sort -z | xargs -0 stat "${STAT_ARGS[@]}" 2>/dev/null
+      stat "${STAT_ARGS[@]}" "$REPO/Cargo.toml" "$REPO/Cargo.lock" 2>/dev/null; } | shasum | cut -d' ' -f1
+  fi
 }
 sha_str() { printf '%s' "$1" | shasum | cut -d' ' -f1; }
+normalize_req() {
+  # Canonical request identity for LIVE coalescing. Persistent cache keys remain
+  # content-sensitive; this only decides whether two currently in-flight callers
+  # are asking the same cargo question and should share one global-lock turn.
+  printf '%s' "$1" | awk '{$1=$1; print}'
+}
 
 finish() {  # args: code label — print the standard summary + log tail, then exit
   local code="$1" label="$2"
@@ -184,6 +204,21 @@ serve_cache() {  # args: label — restore the cached log, record, finish in ~0s
   code="$(cat "$CACHE/code")"; DUR=0
   record "$REQ" "$label" "$code" 0
   finish "$code" "$label"
+}
+serve_request_result() {  # args: label request-hash — serve another live caller's result
+  local label="$1" reqhash="$2" dir="$REQDIR/$reqhash" code
+  [[ -f "$dir/code" ]] || { echo "[build.sh] active duplicate produced no cached/stable result — retry"; exit 75; }
+  cp -f "$dir/log" "$LOG" 2>/dev/null || : >"$LOG"
+  code="$(cat "$dir/code")"; DUR=0
+  [[ "$code" == "75" ]] && { echo "[build.sh] active duplicate was transient — retry"; exit 75; }
+  record "$REQ" "$label" "$code" 0
+  finish "$code" "$label"
+}
+write_cached_request_result() {  # args: request-hash — publish CACHE as live result
+  local reqhash="$1" dir="$REQDIR/$reqhash"
+  mkdir -p "$dir"
+  cp -f "$CACHE/log" "$dir/log.tmp" 2>/dev/null && mv -f "$dir/log.tmp" "$dir/log"
+  cp -f "$CACHE/code" "$dir/code.tmp" 2>/dev/null && mv -f "$dir/code.tmp" "$dir/code"
 }
 # Available-RAM probe (GiB). macOS: free+inactive+speculative pages; Linux:
 # MemAvailable. Returns nonzero if it can't tell (callers then proceed).
@@ -254,10 +289,45 @@ write_cache() {
   cp -f "$LOG" "$CACHE/log.tmp" 2>/dev/null && mv -f "$CACHE/log.tmp" "$CACHE/log"
   printf '%s' "$code" >"$CACHE/code.tmp" && mv -f "$CACHE/code.tmp" "$CACHE/code"
 }
+write_request_result() {  # args: request-hash
+  local reqhash="$1" dir="$REQDIR/$reqhash"
+  mkdir -p "$dir"
+  cp -f "$LOG" "$dir/log.tmp" 2>/dev/null && mv -f "$dir/log.tmp" "$dir/log"
+  printf '%s' "$code" >"$dir/code.tmp" && mv -f "$dir/code.tmp" "$dir/code"
+}
+
+# ---- build-superset subsumption ---------------------------------------------
+# A green FULL lib compile (`build --lib` / `check --workspace --lib`, no -p
+# restriction) proves EVERY workspace crate's lib compiles — so it subsumes any
+# scoped `check -p X --lib`. On such a success we drop a per-tree marker; scoped
+# lib-compile requests for the same tree then short-circuit to exit 0 instead of
+# each taking a global cargo turn. One full build draining the queue satisfies all
+# the per-crate checks stacked behind it. (Tests/clippy/feature builds are NOT
+# subsumable — they compile/run more than the lib.)
+is_lib_compile() {  # CMD is a pure lib *compilation* (no test/extra-target/feature)?
+  local a sub=""
+  for a in "${CMD[@]}"; do
+    case "$a" in
+      check|build) sub=1 ;;
+      test|nextest|run|bench|clippy|doc|miri|--tests|--all-targets|--bins|--bin|--examples|--example|--benches|--features|--all-features|--release|maturin) return 1 ;;
+    esac
+  done
+  [[ -n "$sub" ]]
+}
+is_full_lib_compile() {  # …and spans the whole workspace (no -p restriction)?
+  is_lib_compile || return 1
+  local a has_p="" has_ws=""
+  for a in "${CMD[@]}"; do
+    [[ "$a" == "-p" || "$a" == "--package" ]] && has_p=1
+    [[ "$a" == "--workspace" || "$a" == "--all" ]] && has_ws=1
+  done
+  [[ -n "$has_ws" || -z "$has_p" ]]
+}
 
 # The engine: REQ, CMD[], and CACHEABLE must be set by the caller before calling.
 run_request() {
-  local TREE KEY
+  local TREE KEY REQNORM REQHASH
+  REQNORM="$(normalize_req "$REQ")"; REQHASH="$(sha_str "$REQNORM")"
   TREE="$(tree_hash)"; KEY="$(sha_str "$REQ"$'\n'"$TREE")"
   CACHE="$CACHEDIR/$KEY"
 
@@ -267,42 +337,61 @@ run_request() {
     if is_transient; then
       record "$REQ" "FORCE(transient)" "$code" "$DUR"; echo "TRANSIENT FAILURE ($code, OOM/timeout) — retry"; exit 75
     fi
-    write_cache; record "$REQ" "FORCE" "$code" "$DUR"; finish "$code" "FORCE"
+    write_cache; { (( code == 0 )) && is_full_lib_compile && : >"$CACHEDIR/super.$TREE"; } || true
+    record "$REQ" "FORCE" "$code" "$DUR"; finish "$code" "FORCE"
+  fi
+
+  # Non-cacheable requests and explicit no-cache runs must execute for their
+  # side effects or fresh observations. They still use the global cargo lock, but
+  # they do not serve a prior live caller's result.
+  if [[ "${CACHEABLE:-1}" != 1 || -n "${GAM_NO_CACHE:-}" ]]; then
+    run_under_global_lock
+    if is_transient; then
+      record "$REQ" "n/a(transient)" "$code" "$DUR"; echo "TRANSIENT FAILURE ($code, OOM/timeout) — retry"; exit 75
+    fi
+    record "$REQ" "n/a" "$code" "$DUR"; finish "$code" "n/a"
+  fi
+
+  # Build-superset subsumption: if a full green lib compile already covered this
+  # exact tree, this scoped lib compile is guaranteed to pass — serve 0, no turn.
+  if is_lib_compile && [[ -f "$CACHEDIR/super.$TREE" ]]; then
+    : >"$LOG"; code=0; DUR=0; record "$REQ" "SUBSUMED" 0 0; finish 0 "SUBSUMED"
   fi
 
   # Fast path: a cached result for this exact (args, source) — serve with no lock.
-  if [[ "${CACHEABLE:-1}" == 1 && -z "${GAM_NO_CACHE:-}" && -f "$CACHE/code" ]]; then
+  if [[ -f "$CACHE/code" ]]; then
     serve_cache "HIT"
   fi
 
-  # Contend for leadership of this key; followers coalesce behind the leader.
-  exec 8>"$KEYDIR/$KEY.lock"
-  if flock -n -x 8; then
-    # Leader. Re-check the cache under the key lock (a prior leader may have just
-    # finished between our fast-path read and acquiring the lock).
-    if [[ "${CACHEABLE:-1}" == 1 && -z "${GAM_NO_CACHE:-}" && -f "$CACHE/code" ]]; then
-      flock -u 8; serve_cache "HIT"
-    fi
-    run_under_global_lock
-    if is_transient; then
-      record "$REQ" "MISS(transient)" "$code" "$DUR"; flock -u 8
-      echo "TRANSIENT FAILURE ($code, OOM/timeout) — retry"; exit 75
-    fi
-    write_cache; record "$REQ" "MISS" "$code" "$DUR"; flock -u 8
-    finish "$code" "MISS"
-  else
-    # Follower: a leader is running this exact request right now. Wait for it,
-    # then serve its result rather than re-running.
-    flock -x 8
-    if [[ "${CACHEABLE:-1}" == 1 && -z "${GAM_NO_CACHE:-}" && -f "$CACHE/code" ]]; then
-      flock -u 8; serve_cache "COALESCED"
-    fi
-    # Leader produced no cache (transient failure, or a non-cacheable request) —
-    # don't pile a duplicate run onto the box; signal retry.
-    flock -u 8
-    echo "[build.sh] coalesced behind a leader that produced no cached result — retry"
-    exit 75
+  # Live duplicate coalescing is request-keyed, not tree-keyed. In a shared tree,
+  # unrelated edits can change TREE while several agents are already waiting for
+  # the same build/test request; without this lock they each become a separate
+  # content key and all queue behind the global cargo lock. The leader executes
+  # once; followers serve its result and do not consume another global turn.
+  exec 7>"$REQDIR/$REQHASH.lock"
+  if ! flock -n -x 7; then
+    flock -x 7
+    flock -u 7
+    serve_request_result "COALESCED_REQUEST" "$REQHASH"
   fi
+  rm -rf "$REQDIR/$REQHASH"
+  mkdir -p "$REQDIR/$REQHASH"
+
+  # Request leader. Re-check the content cache under the request lock (a prior
+  # leader may have just finished between our fast-path read and acquiring it).
+  if [[ "${CACHEABLE:-1}" == 1 && -z "${GAM_NO_CACHE:-}" && -f "$CACHE/code" ]]; then
+    write_cached_request_result "$REQHASH"; flock -u 7; serve_cache "HIT"
+  fi
+  run_under_global_lock
+  if is_transient; then
+    code=75; write_request_result "$REQHASH"
+    record "$REQ" "MISS(transient)" "$code" "$DUR"; flock -u 7
+    echo "TRANSIENT FAILURE ($code, OOM/timeout) — retry"; exit 75
+  fi
+  write_cache; write_request_result "$REQHASH"
+  { (( code == 0 )) && is_full_lib_compile && : >"$CACHEDIR/super.$TREE"; } || true
+  record "$REQ" "MISS" "$code" "$DUR"; flock -u 7
+  finish "$code" "MISS"
 }
 
 # ---- maturin lane: `./build.sh maturin [extra maturin args]` ----
