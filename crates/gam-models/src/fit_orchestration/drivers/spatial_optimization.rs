@@ -72,6 +72,21 @@ fn try_build_spatial_term_log_kappa_derivative(
                 spec_local.length_scale =
                     compensate_length_scale_for_standardization(spec.length_scale, s);
             }
+            // The realized Matérn DESIGN penalty is ALWAYS the operator-collocation
+            // {mass, tension, stiffness} triplet — the term-collection assembler
+            // overrides whatever `double_penalty` produced at the basis level with
+            // `matern_operator_penalty_triplet_from_metadata` (see
+            // `gam_terms::smooth::term_specs`, "The Matérn design ALWAYS uses the
+            // operator-collocation … triplet"; #1074/#1270). The ψ=log κ outer
+            // gradient must differentiate the SAME penalty the REML cost is built
+            // on, so the derivative is forced onto the operator-triplet path here.
+            // Honoring `double_penalty: true` instead returned the kernel-Gram
+            // double-penalty ψ-derivatives — a penalty the design does NOT carry —
+            // which desynced the analytic iso-κ gradient from the cost's FD and
+            // stalled the κ-optimizer at its iteration cap with a large residual
+            // gradient (#1122). `double_penalty: false` reproduces the operator
+            // triplet exactly (verified: the 2-D iso-κ FD matches to ~1e-9).
+            spec_local.double_penalty = false;
             build_matern_basis_log_kappa_derivatives(x.view(), &spec_local)
                 .map_err(EstimationError::from)?
         }
@@ -4117,6 +4132,16 @@ fn run_exact_joint_spatial_optimization(
          analytic_grad={analytic_outer_hessian_available} n_total={n_total} \
          theta_dim={theta_dim} rho_dim={rho_dim} psi_dim={coord_dim}"
     );
+    log::warn!(
+        "[OUTER-FD-AUDIT/spatial-exact-joint] THETA0-DIAG theta0={:?}",
+        theta0.to_vec()
+    );
+    if let Err(werr) = std::fs::write(
+        "/tmp/gam_theta0_dump.txt",
+        format!("theta0={:?}\nrho_dim={rho_dim}\n", theta0.to_vec()),
+    ) {
+        log::warn!("[OUTER-FD-AUDIT/spatial-exact-joint] theta0 dump failed: {werr}");
+    }
     if outer_fd_audit_eligible {
         // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
         let audit = (|| -> Result<gam_solve::rho_optimizer::OuterGradientFdAudit, String> {
@@ -4159,6 +4184,189 @@ fn run_exact_joint_spatial_optimization(
         match audit {
             Ok(audit) => audit.log_verdict("spatial-exact-joint"),
             Err(e) => log::warn!("[OUTER-FD-AUDIT/spatial-exact-joint] skipped: {e}"),
+        }
+
+        // TEMP #1122 diagnostic: fine-grained h-sweep on the LAST (psi) axis at
+        // theta0, to separate FD truncation (gap ∝ h²) from a genuine gradient
+        // error (h-flat floor). Removed before merge.
+        {
+            // fd-ok: #1122 diagnostic h-sweep, audit-only
+            let psi_idx = theta0.len() - 1;
+            let analytic_psi = ctx
+                .eval_full(theta0, OuterEvalOrder::ValueAndGradient, analytic_outer_hessian_available)
+                .ok()
+                .map(|(_, g, _)| g[psi_idx]);
+            if let Some(ag) = analytic_psi {
+                for &hh in &[1e-2_f64, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7] {
+                    let mut tp = theta0.clone();
+                    tp[psi_idx] += hh;
+                    let mut tm = theta0.clone();
+                    tm[psi_idx] -= hh;
+                    let vp = ctx.eval_full(&tp, OuterEvalOrder::Value, false).ok().map(|(v, _, _)| v);
+                    let vm = ctx.eval_full(&tm, OuterEvalOrder::Value, false).ok().map(|(v, _, _)| v);
+                    if let (Some(vp), Some(vm)) = (vp, vm) {
+                        let fd = (vp - vm) / (2.0 * hh);
+                        log::warn!(
+                            "[OUTER-FD-AUDIT/spatial-exact-joint] PSI-HSWEEP h={hh:.0e} fd={fd:+.10e} analytic={ag:+.10e} gap={:.3e}",
+                            (ag - fd).abs()
+                        );
+                    }
+                }
+            }
+            // END-FD-OK
+        }
+
+        // TEMP #1122 diagnostic: CLEAN-LANE sweep. Bypass `eval_full` entirely
+        // and drive `evaluate_joint_reml_outer_eval_at_theta` exactly like the
+        // fast harness `iso_kappa_matern_2d_psi_fd_step_sweep_diagnostic` does:
+        // fresh `ensure_theta` on every probe, `warm_beta=None`,
+        // `design_revision=None`, hyper_dirs freshly rebuilt. The harness is
+        // internally consistent to 4.5e-9 there; if THIS in-production clean lane
+        // is also clean while `eval_full` shows the 0.16% h-flat gap, the desync
+        // lives in `eval_full`'s warm-start / staging / design-revision
+        // machinery, NOT the derivative formula. Removed before merge.
+        {
+            // fd-ok: #1122 diagnostic clean-lane sweep, audit-only
+            let psi_idx = theta0.len() - 1;
+            let clean_eval = |ctx: &mut SpatialJointContext<'_>,
+                              theta: &Array1<f64>,
+                              order: OuterEvalOrder|
+             -> Option<(f64, Array1<f64>)> {
+                ctx.cache.ensure_theta(theta).ok()?;
+                let hyper_dirs = ctx
+                    .cache
+                    .hyper_dirs_for_current_design(ctx.data, ctx.kind)
+                    .ok()?;
+                ctx.evaluator.stage_glm_first_step_gram(None);
+                ctx.evaluator.stage_glm_psi_gram_deriv(None);
+                let (v, g, _h) = evaluate_joint_reml_outer_eval_at_theta(
+                    &mut ctx.evaluator,
+                    ctx.cache.design(),
+                    theta,
+                    ctx.rho_dim,
+                    hyper_dirs,
+                    None,
+                    order,
+                    None,
+                )
+                .ok()?;
+                Some((v, g))
+            };
+            if let Some((_, g)) =
+                clean_eval(&mut ctx, theta0, OuterEvalOrder::ValueAndGradient)
+            {
+                let ag = g[psi_idx];
+                for &hh in &[1e-3_f64, 1e-4, 1e-5] {
+                    let mut tp = theta0.clone();
+                    tp[psi_idx] += hh;
+                    let mut tm = theta0.clone();
+                    tm[psi_idx] -= hh;
+                    let vp = clean_eval(&mut ctx, &tp, OuterEvalOrder::Value).map(|(v, _)| v);
+                    let vm = clean_eval(&mut ctx, &tm, OuterEvalOrder::Value).map(|(v, _)| v);
+                    if let (Some(vp), Some(vm)) = (vp, vm) {
+                        let fd = (vp - vm) / (2.0 * hh);
+                        log::warn!(
+                            "[OUTER-FD-AUDIT/spatial-exact-joint] PSI-CLEANLANE h={hh:.0e} fd={fd:+.10e} analytic={ag:+.10e} gap={:.3e}",
+                            (ag - fd).abs()
+                        );
+                    }
+                }
+            }
+            // END-FD-OK
+        }
+
+        // TEMP #1122 diagnostic: DESIGN FINGERPRINT. Dump the realized design /
+        // penalty topology at θ₀ so it can be diffed against the fast harness
+        // (which is internally consistent but evaluates a DIFFERENT objective:
+        // V≈16.31 vs production ≈16.11). The mirror gap must be a structural
+        // difference in the frozen design — penalty count/shapes, identifiability
+        // transform, design dims, or the analytic ∂X/∂ψ, ∂S/∂ψ themselves.
+        // Removed before merge.
+        {
+            // fd-ok: #1122 diagnostic fingerprint, audit-only
+            let v0_prod = ctx
+                .eval_full(theta0, OuterEvalOrder::Value, false)
+                .ok()
+                .map(|(v, _, _)| v);
+            if ctx.cache.ensure_theta(theta0).is_ok() {
+                let design = ctx.cache.design();
+                let mut buf = String::new();
+                buf.push_str(&format!("PROD V(theta0)={:?}\n", v0_prod));
+                buf.push_str(&format!(
+                    "PROD design.design dims = ({}, {})\n",
+                    design.design.nrows(),
+                    design.design.ncols()
+                ));
+                buf.push_str(&format!("PROD n_penalties = {}\n", design.penalties.len()));
+                for (pi, p) in design.penalties.iter().enumerate() {
+                    let fro: f64 = p.local.iter().map(|v| v * v).sum::<f64>().sqrt();
+                    buf.push_str(&format!(
+                        "PROD penalty[{pi}] col_range={:?} local_dims={:?} hint={:?} fro={fro:.10e}\n",
+                        p.col_range, p.local.dim(), p.structure_hint
+                    ));
+                }
+                buf.push_str(&format!(
+                    "PROD nullspace_dims = {:?}\n",
+                    design.nullspace_dims
+                ));
+                // Identifiability + spec geometry of the frozen spatial term.
+                for &ti in ctx.cache.spatial_terms.iter() {
+                    if let Some(t) = ctx.cache.spec().smooth_terms.get(ti) {
+                        buf.push_str(&format!(
+                            "PROD term[{ti}] basis_kind={}\n",
+                            match &t.basis {
+                                gam_terms::smooth::SmoothBasisSpec::Matern { spec, .. } => format!(
+                                    "Matern{{nu={:?}, ls={:.8}, dp={}, ident={}, aniso={:?}, centers_kind={}}}",
+                                    spec.nu,
+                                    spec.length_scale,
+                                    spec.double_penalty,
+                                    match &spec.identifiability {
+                                        gam_terms::basis::MaternIdentifiability::FrozenTransform { transform, nullspace_shrinkage_survived } =>
+                                            format!("FrozenTransform{{z_dims={:?}, survived={:?}}}", transform.dim(), nullspace_shrinkage_survived),
+                                        other => format!("{other:?}"),
+                                    },
+                                    spec.aniso_log_scales,
+                                    match &spec.center_strategy {
+                                        gam_terms::basis::CenterStrategy::UserProvided(c) => format!("UserProvided(n={})", c.nrows()),
+                                        other => format!("{other:?}"),
+                                    },
+                                ),
+                                other => format!("{other:?}"),
+                            }
+                        ));
+                    }
+                }
+                // input_scales + center checksum of the frozen spatial term.
+                for &ti in ctx.cache.spatial_terms.iter() {
+                    if let Some(t) = ctx.cache.design().smooth.terms.get(ti) {
+                        if let gam_terms::basis::BasisMetadata::Matern {
+                            centers, input_scales, length_scale, ..
+                        } = &t.metadata
+                        {
+                            let csum: f64 = centers.iter().map(|v| v.abs()).sum();
+                            let c00 = centers.get((0, 0)).copied().unwrap_or(f64::NAN);
+                            let c01 = centers.get((0, 1)).copied().unwrap_or(f64::NAN);
+                            buf.push_str(&format!(
+                                "PROD meta.Matern length_scale={length_scale:.10} input_scales={input_scales:?} centers_abs_sum={csum:.10e} c[0,0]={c00:.10} c[0,1]={c01:.10}\n"
+                            ));
+                        }
+                    }
+                }
+                let x_abs_sum: f64 = design.design.to_dense().iter().map(|v| v.abs()).sum();
+                let x_nrows = design.design.nrows();
+                buf.push_str(&format!("PROD X_abs_sum={x_abs_sum:.10e} nrows={x_nrows}\n"));
+                // Analytic ψ-direction derivative fingerprint at θ₀.
+                if let Ok(dirs) = ctx.cache.hyper_dirs_for_current_design(ctx.data, ctx.kind) {
+                    buf.push_str(&format!("PROD n_hyper_dirs = {}\n", dirs.len()));
+                }
+                if let Err(werr) = std::fs::write("/tmp/gam_prod_fingerprint.txt", &buf) {
+                    log::warn!("[OUTER-FD-AUDIT/spatial-exact-joint] fingerprint dump failed: {werr}");
+                }
+                for line in buf.lines() {
+                    log::warn!("[OUTER-FD-AUDIT/spatial-exact-joint] FINGERPRINT {line}");
+                }
+            }
+            // END-FD-OK
         }
     }
 

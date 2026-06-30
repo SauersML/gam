@@ -6522,7 +6522,18 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
             if let Some(s) = input_scales {
                 apply_input_standardization(&mut x, s);
             }
-            build_matern_basis_log_kappa_aniso_derivatives(x.view(), spec)
+            // Mirror the realized-design penalty: the Matérn design ALWAYS uses
+            // the operator-collocation triplet, never the kernel-Gram
+            // double-penalty (`matern_operator_penalty_triplet_from_metadata`;
+            // #1074/#1270). The per-axis η outer gradient must differentiate the
+            // same penalty the cost is built on, so force the operator path here
+            // exactly as the isotropic ψ-derivative does in `spatial_optimization`
+            // — otherwise `double_penalty: true` returns kernel-Gram η-derivatives
+            // the design does not carry, desyncing the gradient from the cost FD
+            // (#1122).
+            let mut spec_local = spec.clone();
+            spec_local.double_penalty = false;
+            build_matern_basis_log_kappa_aniso_derivatives(x.view(), &spec_local)
                 .map_err(EstimationError::from)?
         }
         // Measure-jet: the grouped dial coordinates ride the same per-axis
