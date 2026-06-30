@@ -532,20 +532,6 @@ impl PsiGramTensor {
     /// it isolates exactly the subspace identity the skip needs, not an arbitrary
     /// eigenvector rotation). Returns `None` if the Gram is non-finite or its
     /// symmetric eigendecomposition fails.
-    /// (λ_min, λ_max) of the assembled Gram at `psi` — #1033 diagnostic only.
-    fn gram_eigs_brief(&self, psi: f64) -> Option<(f64, f64)> {
-        use gam_linalg::faer_ndarray::FaerEigh;
-        let g = self.gram_at(psi);
-        if g.iter().any(|v| !v.is_finite()) {
-            return None;
-        }
-        let gsym = 0.5 * (&g + &g.t());
-        let (evals, _) = gsym.eigh(faer::Side::Lower).ok()?;
-        let lmin = evals.iter().cloned().fold(f64::INFINITY, f64::min);
-        let lmax = evals.iter().cloned().fold(0.0_f64, f64::max);
-        Some((lmin, lmax))
-    }
-
     fn range_projector(&self, psi: f64, rank_rtol: f64) -> Option<(Array2<f64>, usize)> {
         use gam_linalg::faer_ndarray::FaerEigh;
         let g = self.gram_at(psi);
@@ -630,22 +616,6 @@ impl PsiGramTensor {
         let Some((p_new, r_new)) = self.range_projector(psi_new, PSI_GRAM_SKIP_RANK_RTOL) else {
             return false;
         };
-        if log::log_enabled!(log::Level::Info) {
-            let dist = subspace_spectral_distance(&(&p_ref - &p_new));
-            let verdict = r_ref == r_new
-                && dist.map(|d| d <= PSI_GRAM_SKIP_PROJ_ATOL).unwrap_or(false);
-            log::info!(
-                "[NFREE-RESET basis] psi_ref={psi_ref:.6} psi_new={psi_new:.6} \
-                 r_ref={r_ref} r_new={r_new} k={} subspace_dist={:?} atol={:.1e} \
-                 rank_rtol={:.1e} verdict={verdict} eig_ref={:?} eig_new={:?}",
-                self.k,
-                dist,
-                PSI_GRAM_SKIP_PROJ_ATOL,
-                PSI_GRAM_SKIP_RANK_RTOL,
-                self.gram_eigs_brief(psi_ref),
-                self.gram_eigs_brief(psi_new),
-            );
-        }
         if r_ref != r_new {
             return false;
         }
