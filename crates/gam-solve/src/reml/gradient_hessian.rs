@@ -1615,13 +1615,38 @@ impl<'a> RemlState<'a> {
         let ki_x: Vec<Vec<Array1<f64>>> = (0..k)
             .map(|a| rows.iter().map(|xr| k_i[a].dot(xr)).collect())
             .collect();
-        let kij_x: Vec<Vec<Vec<Array1<f64>>>> = (0..k)
-            .map(|a| {
-                (0..k)
-                    .map(|b| rows.iter().map(|xr| k_ij[a][b].dot(xr)).collect())
-                    .collect()
-            })
-            .collect();
+        // `kmat_x` (n·p) and `ki_x` (k·n·p, with n·p ≤ FIRTH_MAX_LINEAR_WORK)
+        // are always cheap to hold, but the mixed cache `kij_x` is k²·n·p and
+        // the Firth gate does NOT bound k (the smooth count), so a many-smooth
+        // model could blow memory the original inline loop never allocated.
+        // Materialize it only when it fits a fixed budget; otherwise fall back
+        // to recomputing `k_ij[a][b]·xⱼ` inline (the original arithmetic, so
+        // still bit-identical — just without the O(n²)→O(n) reuse on the mixed
+        // blocks). 64M f64 ≈ 512 MB ceiling.
+        const TK_KIJ_CACHE_MAX_ELEMS: usize = 64 * 1024 * 1024;
+        let kij_x: Option<Vec<Vec<Vec<Array1<f64>>>>> =
+            if k.saturating_mul(k).saturating_mul(n).saturating_mul(p) <= TK_KIJ_CACHE_MAX_ELEMS {
+                Some(
+                    (0..k)
+                        .map(|a| {
+                            (0..k)
+                                .map(|b| rows.iter().map(|xr| k_ij[a][b].dot(xr)).collect())
+                                .collect()
+                        })
+                        .collect(),
+                )
+            } else {
+                None
+            };
+        // xᵢ · (Kᵢⱼ xⱼ): read the cached row-local matvec when present, else
+        // recompute it inline. Both forms call the identical `Matrix::dot`, so
+        // the scalar is bit-for-bit the same either way (#1575).
+        let kij_bilinear = |a: usize, b: usize, xi: &Array1<f64>, jrow: usize| -> f64 {
+            match &kij_x {
+                Some(cache) => xi.dot(&cache[a][b][jrow]),
+                None => xi.dot(&k_ij[a][b].dot(&rows[jrow])),
+            }
+        };
 
         let mut hdiag = Vec::with_capacity(n);
         for row in 0..n {
@@ -1632,7 +1657,7 @@ impl<'a> RemlState<'a> {
             }
             for a in 0..k {
                 for b in 0..k {
-                    jet.h[[a, b]] = x.dot(&kij_x[a][b][row]);
+                    jet.h[[a, b]] = kij_bilinear(a, b, x, row);
                 }
             }
             hdiag.push(jet);
@@ -1677,7 +1702,7 @@ impl<'a> RemlState<'a> {
                 }
                 for a in 0..k {
                     for b in 0..k {
-                        kg.h[[a, b]] = xi.dot(&kij_x[a][b][jrow]);
+                        kg.h[[a, b]] = kij_bilinear(a, b, xi, jrow);
                     }
                 }
                 let term = cjet[irow]
