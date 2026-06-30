@@ -33,19 +33,26 @@ runs:
         toolchain: 1.93.0
         components: ${{ inputs.components }}
 
+    # v0.0.10 bundles a current sccache whose GitHub Actions Cache backend
+    # speaks the new cache service API. The old @v0.0.6 left sccache unable to
+    # reach the backend ("Our services aren't available"/"cache backend
+    # unreachable"), so RUSTC_WRAPPER was never set and EVERY run compiled fully
+    # cold — no cross-run build caching at all. This restores it.
     - name: Set up sccache
-      uses: mozilla-actions/sccache-action@v0.0.6
+      uses: mozilla-actions/sccache-action@v0.0.10
 
     - name: Enable sccache only if its cache backend is reachable
       shell: bash
       run: |
         if sccache --start-server; then
           echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          echo "sccache server up — compiler cache active (GitHub Actions backend)."
         else
           echo "::warning::sccache cache backend unreachable; compiling without the compiler cache"
         fi
 
+    # Caches the cargo registry + git deps across runs (gh-native Actions cache).
     - name: Cache cargo artifacts
-      uses: Swatinem/rust-cache@v2
+      uses: Swatinem/rust-cache@v2.9.1
       with:
         cache-targets: ${{ inputs.cache-targets }}

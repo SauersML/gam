@@ -65,6 +65,7 @@ fn tweedie_sample(mu: f64, p: f64, phi: f64, rng: &mut StdRng) -> f64 {
 #[test]
 fn gam_tensor_te_2d_tweedie_matches_mgcv() {
     init_parallelism();
+    gam::progress_log::init_logging();
 
     // ---- synthetic Tweedie truth on the unit square ------------------------
     // eta_true = 2.0 + sin(pi*x)*cos(pi*z) (a genuine interaction); mu = exp(eta)
@@ -149,16 +150,32 @@ fn gam_tensor_te_2d_tweedie_matches_mgcv() {
                  family = Tweedie(p = 1.5, link = "log"), method = "REML")
         emit("eta", as.numeric(predict(m, type = "link")))
         emit("edf", sum(m$edf))
+        emit("scale", m$scale)
+        emit("sp", as.numeric(m$sp))
         "#,
     );
     let mgcv_eta = r.vector("eta");
     let mgcv_edf = r.scalar("edf");
+    let mgcv_scale = r.scalar("scale");
+    let mgcv_sp = r.vector("sp");
+    eprintln!("[diag] mgcv tweedie: scale={mgcv_scale:.6} sp={mgcv_sp:?}");
     assert_eq!(mgcv_eta.len(), N, "mgcv linear-predictor length mismatch");
 
     // ---- OBJECTIVE METRICS -------------------------------------------------
     let gam_eta_err = rmse(&gam_eta, &eta_true);
     let mgcv_eta_err = rmse(mgcv_eta, &eta_true);
     let gam_mu_err = rmse(&gam_mu, &mu_true);
+    let gam_edf = fit.fit.edf_total().unwrap_or(f64::NAN);
+    eprintln!(
+        "[diag] gam tweedie: outer_converged={} outer_iterations={} grad_norm={:?} reml_score={:.6} gam_phi={:.6}",
+        fit.fit.outer_converged,
+        fit.fit.outer_iterations,
+        fit.fit.outer_gradient_norm,
+        fit.fit.reml_score,
+        fit.fit.dispersion_phi(),
+    );
+    eprintln!("[diag] gam tweedie lambdas={:?}", fit.fit.lambdas.to_vec());
+    eprintln!("[diag] gam tweedie likelihood_scale={:?}", fit.fit.likelihood_scale);
 
     // Context only (NOT a pass criterion): closeness of the two fitted surfaces.
     let rel_to_mgcv = relative_l2(&gam_eta, mgcv_eta);
@@ -166,6 +183,7 @@ fn gam_tensor_te_2d_tweedie_matches_mgcv() {
 
     eprintln!(
         "te(x,z) Tweedie/log p={P}: n={N} zeros={zeros} phi={PHI} mgcv_edf={mgcv_edf:.3} \
+         gam_edf={gam_edf:.3} \
          rmse_mu(gam,truth)={gam_mu_err:.4} noise_sigma={noise_sigma:.4} \
          rmse_eta(gam)={gam_eta_err:.4} rmse_eta(mgcv)={mgcv_eta_err:.4} \
          [context] rel_l2(gam,mgcv)={rel_to_mgcv:.4} pearson(gam,mgcv)={corr_to_mgcv:.5}"

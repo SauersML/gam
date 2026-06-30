@@ -134,3 +134,29 @@ pub struct FittedTermCollectionWithSpec {
 
 include!("design_construction.rs");
 include!("spatial_optimization.rs");
+// #901 re-home: the end-to-end iso-κ joint REML outer-gradient FD oracles on
+// real Duchon/Matérn smooths. Authored in the pre-#1521 monolith, orphaned out
+// of the build by #1601 (its private driver deps live HERE post-carve, not in
+// `gam_terms::smooth` where the `include!` was commented out). The file is a
+// self-contained `#[cfg(test)] mod`, so it adds nothing to the non-test build.
+include!("iso_kappa_reml_gradient_fd_tests.rs");
+// #901 re-home: the Matérn κ-optimizer convergence/monotone gates the issue
+// listed as stalling on the wrong projected-logdet gradient. Same #1601
+// orphaning story — driver deps live HERE post-carve. Self-contained
+// `#[cfg(test)] mod`, so it adds nothing to the non-test build.
+include!("spatial_length_scale_monotone_tests.rs");
+// #1264/#1033 re-home: the production ψ-Gram fast-path skip guard
+// (`reduced_basis_equal` soundness, β̂ vs streamed to 1e-6) and the #1033
+// forced-rotation frontier measurement. Same #1601 orphaning story as the two
+// siblings above — its private driver deps live HERE post-carve, and the
+// monolith `include!` in `gam_terms::smooth::tests` was commented out and never
+// relocated, so both guards compiled into NO binary. Self-contained
+// `#[cfg(test)] mod`, so it adds nothing to the non-test build.
+include!("psi_gram_tensor_fast_path_tests.rs");
+// #901 re-home: the custom-family ADAPTIVE-ψ projected-logdet REML
+// hypergradient + outer-Hessian FD oracle on a real `SpatialAdaptiveExactFamily`
+// — the half of #901 the engine fix (joint_jeffreys_information_depends_on_psi)
+// directly targets, plus the #426 unified-dispatch parity pin. Same #1601
+// orphaning story as the two oracles above; driver deps live HERE post-carve.
+// Self-contained `#[cfg(test)] mod`, so it adds nothing to the non-test build.
+include!("spatial_adaptive_hyper_fd_tests.rs");

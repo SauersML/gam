@@ -25,6 +25,7 @@ use gam::smooth::build_term_collection_design;
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 fn fit_and_predict_on_grid(formula: &str, x: &[f64], y: &[f64]) -> Vec<f64> {
     let n = x.len();
@@ -32,11 +33,19 @@ fn fit_and_predict_on_grid(formula: &str, x: &[f64], y: &[f64]) -> Vec<f64> {
     for i in 0..n {
         csv.push_str(&format!("{:.17e},{:.17e}\n", x[i], y[i]));
     }
+    // The cargo test harness runs every #[test] in this binary on parallel
+    // threads of ONE process, and each test fits multiple times. A temp path
+    // keyed only on `process::id()` + `n` (all tests here use n=400) collides
+    // across tests, so one thread's `remove_file` races another thread's read.
+    // A per-call atomic counter makes the path unique across every invocation.
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let unique = SEQ.fetch_add(1, Ordering::Relaxed);
     let mut tmp = std::env::temp_dir();
     tmp.push(format!(
-        "gam_monotone_binding_{}_{}.csv",
+        "gam_monotone_binding_{}_{}_{}.csv",
         std::process::id(),
-        n
+        n,
+        unique
     ));
     {
         let mut f = std::fs::File::create(&tmp).expect("create synthetic csv");
@@ -72,11 +81,21 @@ fn range_of(v: &[f64]) -> f64 {
     hi - lo
 }
 
-/// Largest downward drop across the dense grid (0 if perfectly non-decreasing).
-fn worst_decrease(v: &[f64]) -> f64 {
-    v.windows(2)
-        .map(|w| (w[0] - w[1]).max(0.0))
-        .fold(0.0_f64, f64::max)
+/// Total downward variation across the dense grid: the sum of every downward
+/// step (0 iff perfectly non-decreasing).
+///
+/// This is the right "is the fit genuinely non-monotone?" measure: it equals how
+/// far the function *descends* in total, independent of how that descent is
+/// distributed across grid steps. The earlier per-step "worst single drop"
+/// metric was fragile — for a clean unimodal fit the steepest single step is
+/// only `|f'|·Δx ≈ π·0.01 ≈ 0.03` on this 101-point grid, so any improvement to
+/// the unconstrained smoother that removed boundary overshoot pushed the worst
+/// single drop below a `0.1·range` bar even though the fit still falls by the
+/// full signal range over the descending half. Cumulative descent is invariant
+/// to grid resolution and to spurious boundary wiggle, so it certifies the
+/// binding precondition robustly.
+fn total_descent(v: &[f64]) -> f64 {
+    v.windows(2).map(|w| (w[0] - w[1]).max(0.0)).sum()
 }
 
 #[test]
@@ -123,13 +142,15 @@ fn monotone_increasing_shape_binds_on_non_monotone_data() {
         free_range > 0.5,
         "unconstrained s(x,k=12) should span the sin hump, got range {free_range:.4}"
     );
-    // The unconstrained fit must actually fall somewhere, so the monotone
-    // constraint has something to bind against (otherwise this test would
-    // degenerate into the non-binding case).
+    // The unconstrained fit must genuinely descend, so the monotone constraint
+    // has something to bind against (otherwise this test would degenerate into
+    // the non-binding case). A sin hump falls back by the full signal range on
+    // its descending half, so its total downward variation is ≈ `free_range`;
+    // requiring `> 0.5·range` is a wide, smoother-agnostic margin.
     assert!(
-        worst_decrease(&p_free) > 0.1 * free_range,
-        "unconstrained sin-hump fit should be clearly non-monotone (worst drop {:.4} of range {:.4})",
-        worst_decrease(&p_free),
+        total_descent(&p_free) > 0.5 * free_range,
+        "unconstrained sin-hump fit should be clearly non-monotone (total descent {:.4} of range {:.4})",
+        total_descent(&p_free),
         free_range
     );
 
@@ -158,6 +179,125 @@ fn monotone_increasing_shape_binds_on_non_monotone_data() {
     assert!(
         mono_range > 0.5,
         "monotone fit collapsed under a binding constraint: range {mono_range:.4}"
+    );
+
+    // The constraint must genuinely BIND, not merely be satisfied by chance:
+    // the unconstrained fit falls back to ≈0 at the right endpoint, while a
+    // non-decreasing fit is forced to hold its plateau there. So at the right
+    // edge the monotone fit must sit well above the unconstrained fit. This is
+    // the positive signature that the active-set QP actually activated the
+    // monotonicity rows and reshaped the solution (a regression that silently
+    // dropped the constraints — e.g. the unconstrained Gaussian-Identity
+    // short-circuit of #509 — would make `p_mono ≈ p_free` and fail here).
+    let tail = p_mono.len() - 1;
+    assert!(
+        p_mono[tail] - p_free[tail] > 0.25 * free_range,
+        "monotone constraint did not bind: at the right edge mono={:.4} vs free={:.4} \
+         (gap must exceed 0.25·range={:.4})",
+        p_mono[tail],
+        p_free[tail],
+        0.25 * free_range
+    );
+}
+
+/// Total upward variation across the dense grid: the sum of every upward step
+/// (0 iff perfectly non-increasing). The sign-flipped twin of [`total_descent`],
+/// used to certify the binding precondition for a *decreasing* constraint.
+fn total_ascent(v: &[f64]) -> f64 {
+    v.windows(2).map(|w| (w[1] - w[0]).max(0.0)).sum()
+}
+
+#[test]
+fn monotone_decreasing_shape_binds_on_non_monotone_data() {
+    init_parallelism();
+
+    // The sign-flipped twin of `monotone_increasing_shape_binds_on_non_monotone_data`.
+    // The same sin(pi x) hump is non-monotone, but now a `monotone_decreasing`
+    // constraint binds on the *rising* half [0,0.5]: the feasible fit must start
+    // at its plateau and never rise. This exercises the `sign = -1` arm of the
+    // box reparameterization (`shape_order_and_sign` → order 1, sign −1), which
+    // the increasing test never touches; a regression that mishandled the sign
+    // (e.g. flipping the cone the wrong way, or silently dropping it) would make
+    // the constrained fit either rise like the unconstrained one or collapse.
+    let n = 400usize;
+    let mut state: u64 = 11;
+    let mut next_unit = move || -> f64 {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        (z >> 11) as f64 / (1u64 << 53) as f64
+    };
+
+    let mut x = vec![0.0f64; n];
+    for xi in x.iter_mut() {
+        *xi = next_unit();
+    }
+    x.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let y: Vec<f64> = x
+        .iter()
+        .map(|&xi| {
+            let u1 = next_unit().max(1e-300);
+            let u2 = next_unit();
+            let noise = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+            (std::f64::consts::PI * xi).sin() + 0.05 * noise
+        })
+        .collect();
+
+    // ---- sanity: the unconstrained smooth genuinely rises (the hump) --------
+    let p_free = fit_and_predict_on_grid("y ~ s(x, k=12)", &x, &y);
+    let free_range = range_of(&p_free);
+    assert!(
+        p_free.iter().all(|v| v.is_finite()),
+        "unconstrained prediction must be finite"
+    );
+    assert!(
+        free_range > 0.5,
+        "unconstrained s(x,k=12) should span the sin hump, got range {free_range:.4}"
+    );
+    assert!(
+        total_ascent(&p_free) > 0.5 * free_range,
+        "unconstrained sin-hump fit should clearly rise (total ascent {:.4} of range {:.4})",
+        total_ascent(&p_free),
+        free_range
+    );
+
+    // ---- the fix under test: monotone_decreasing on a hump (binding) --------
+    let p_mono = fit_and_predict_on_grid("y ~ s(x, k=12, shape=monotone_decreasing)", &x, &y);
+    assert!(
+        p_mono.iter().all(|v| v.is_finite()),
+        "monotone prediction must be finite"
+    );
+
+    // Non-increasing on the dense grid (small numerical slack).
+    let grid_step_tol = 1e-6 * free_range.max(1.0);
+    for w in p_mono.windows(2) {
+        assert!(
+            w[0] - w[1] >= -grid_step_tol,
+            "monotone_decreasing fit must be non-increasing: rose by {:.3e}",
+            w[1] - w[0]
+        );
+    }
+
+    // Not collapsed to a flat constant.
+    let mono_range = range_of(&p_mono);
+    assert!(
+        mono_range > 0.5,
+        "monotone-decreasing fit collapsed under a binding constraint: range {mono_range:.4}"
+    );
+
+    // The constraint must genuinely BIND: the unconstrained fit starts near 0 at
+    // the left edge, while a non-increasing fit must hold its plateau there. So
+    // at the left edge the monotone fit must sit well above the unconstrained
+    // fit — the positive signature that the sign=−1 cone rows were activated.
+    assert!(
+        p_mono[0] - p_free[0] > 0.25 * free_range,
+        "monotone-decreasing constraint did not bind: at the left edge mono={:.4} vs free={:.4} \
+         (gap must exceed 0.25·range={:.4})",
+        p_mono[0],
+        p_free[0],
+        0.25 * free_range
     );
 }
 

@@ -719,7 +719,47 @@ impl ResponseFamily {
                     kind,
                 })
             }
-            Self::Gaussian => Ok(()),
+            Self::Gaussian => {
+                // A Gaussian fit's marginal REML log-likelihood carries a
+                // `−n/2·log σ²` term; for an effectively-constant response the
+                // ML scale `σ → 0` drives it to `+∞`, so the outer objective
+                // rejects every seed with "reml_score must be finite, got inf"
+                // (#332). Reject pre-fit when the two-pass, mean-centred sample
+                // sd is at or below `GAUSSIAN_MIN_SAMPLE_SD`. Fewer than two
+                // observations carries no estimable scale degeneracy (the
+                // sample-size gate handles too-small data), and any non-finite
+                // value is left to the dedicated finiteness checks rather than
+                // poisoning the sd, so it is skipped here.
+                let mut count = 0usize;
+                let mut mean = 0.0f64;
+                for &yi in y.iter() {
+                    if !yi.is_finite() {
+                        return Ok(());
+                    }
+                    count += 1;
+                    mean += yi;
+                }
+                if count < 2 {
+                    return Ok(());
+                }
+                mean /= count as f64;
+                let mut sumsq = 0.0f64;
+                for &yi in y.iter() {
+                    let d = yi - mean;
+                    sumsq += d * d;
+                }
+                let sample_sd = (sumsq / (count as f64 - 1.0)).sqrt();
+                if sample_sd <= GAUSSIAN_MIN_SAMPLE_SD {
+                    return Err(ResponseDegeneracy {
+                        family_label: self.response_support_label(),
+                        kind: ResponseDegeneracyKind::GaussianNearConstant {
+                            sample_sd,
+                            min_sd: GAUSSIAN_MIN_SAMPLE_SD,
+                        },
+                    });
+                }
+                Ok(())
+            }
             Self::Poisson
             | Self::Tweedie { .. }
             | Self::NegativeBinomial { .. }
@@ -856,6 +896,19 @@ impl std::error::Error for ResponseSupportViolation {}
 /// three layers agree on exactly which responses are admissible.
 pub const BINOMIAL_BINARY_TOL: f64 = 1.0e-12;
 
+/// Minimum admissible sample standard deviation for a `Gaussian` response.
+///
+/// A response whose two-pass, mean-centred sample sd is at or below this
+/// threshold is *effectively constant* in `f64` arithmetic: the marginal REML
+/// log-likelihood carries a `−n/2·log σ²` term that diverges to `+∞` as the
+/// fitted scale `σ → 0`, so the outer objective rejects every seed with
+/// `reml_score must be finite, got inf` (#332). The bound is chosen well below
+/// any well-conditioned scientific signal (genuine data has sd many orders of
+/// magnitude larger) yet above the f64 round-off floor, so it never trips a
+/// real fit while catching responses that carry no signal (e.g. a column read
+/// in the wrong scale, or a constant accidentally fed as the response).
+pub const GAUSSIAN_MIN_SAMPLE_SD: f64 = 1.0e-10;
+
 /// Round tolerance for recognising an integer-valued (count) response.
 ///
 /// `infer_from_response` classifies a numeric response as a Poisson count when
@@ -876,6 +929,18 @@ pub enum ResponseDegeneracyKind {
     BinomialAllZeros,
     /// Bernoulli / Binomial response with every observed value equal to 1.
     BinomialAllOnes,
+    /// Gaussian response that is effectively constant in `f64` arithmetic
+    /// (sample standard deviation at or below [`GAUSSIAN_MIN_SAMPLE_SD`]). The
+    /// marginal REML log-likelihood `−n/2·log σ²` diverges to `+∞` as the
+    /// fitted scale `σ → 0`, so every outer evaluation rejects with a
+    /// non-finite score. Carries the observed `sample_sd` and the `min_sd`
+    /// threshold so the message can quote both verbatim (#332).
+    GaussianNearConstant {
+        /// The two-pass, mean-centred sample standard deviation of the response.
+        sample_sd: f64,
+        /// The rejection threshold ([`GAUSSIAN_MIN_SAMPLE_SD`]).
+        min_sd: f64,
+    },
 }
 
 /// Degenerate-response detail produced by
@@ -912,6 +977,15 @@ impl ResponseDegeneracy {
                  is not finite. Fix: ensure the response contains at least one 0 and \
                  at least one 1 (e.g. drop the offending subgroup, or refit on a pooled \
                  sample that includes both classes).",
+                family = self.family_label,
+                name = response_name,
+            ),
+            ResponseDegeneracyKind::GaussianNearConstant { sample_sd, min_sd } => format!(
+                "{family} response '{name}' is effectively constant (sample sd ~ {sample_sd:.3e} \
+                 <= {min_sd:.0e}); the marginal REML log-likelihood −n/2·log σ² diverges to \
+                 +∞ as σ → 0. Fix: check the response column units (is it being read in the \
+                 right scale?), centre/rescale the response, or drop the column if it carries \
+                 no signal.",
                 family = self.family_label,
                 name = response_name,
             ),
@@ -2115,6 +2189,49 @@ impl GlmLikelihoodSpec {
         }
         self
     }
+
+    /// Produce a copy of this spec with the Gamma shape `k = 1/φ` PINNED at
+    /// `shape` for the duration of the smoothing-parameter (λ) search (#1074).
+    /// Converts an `EstimatedGammaShape` scale into the statistically-identical
+    /// `FixedGammaShape` form, which gates off the per-inner-solve shape refresh
+    /// in `GamWorkingModel::update_with_curvature` (its guard is
+    /// `gamma_shape_is_estimated()`, which `FixedGammaShape` does not satisfy)
+    /// while leaving every weight / deviance / log-likelihood expression
+    /// unchanged (they read the shape through `gamma_shape()` / `fixed_phi()`,
+    /// which `FixedGammaShape` answers identically).
+    ///
+    /// Rationale: with the shape estimated, the inner solver re-derives it from
+    /// each outer iterate's *warm-start* η (the converged-η MLE
+    /// `k̂` solving `ln k − ψ(k) = mean[y/μ − ln(y/μ) − 1]`). The Gamma working
+    /// weight is `W = prior·k` and the omitting-constants log-likelihood is
+    /// `ℓ(β̂) = −k·½·D(ρ)` (the `k`-dependent saturated normalizer is dropped,
+    /// #359), so a `k` that swings 2×↔ with the warm-start η makes BOTH the
+    /// likelihood-curvature `H = k·XᵀX + λS` and the data-fit term `k·½D` jump
+    /// discontinuously with ρ — the REML criterion `V(ρ)` develops deterministic
+    /// spikes between the smooth basin floors (e.g. a flat warm-start η at a
+    /// just-rejected over-smoothed trial gives `k≈2.3`, the fitted-surface η at
+    /// the neighbor gives `k≈4.7`, doubling `−ℓ` with β̂ essentially unchanged).
+    /// The analytic outer gradient holds `k` fixed, so it can never agree with
+    /// the realized cost's `k(ρ)` motion: the projected gradient floors at
+    /// `O(|∂k/∂ρ|·½D)` and the ARC descent stalls on a weakly-identified valley,
+    /// railing `λ` to the over-smoothed corner (the #1074 te/Gamma tensor
+    /// under-recovery). Holding `k` fixed across the λ-search makes
+    /// `F(ρ) = REML(ρ, k_frozen)` a genuine stationary function of ρ, exactly as
+    /// the sibling Tweedie-φ (#1477) and NB-θ (#1082) freezes do, and as mgcv
+    /// does (it fixes the scale across the smoothness search for the scale-free
+    /// Gamma mean). `k` is still ML-refreshed at the single final reported fit
+    /// (the `refine_dispersion_at_converged_eta = true` accept-fit), so the
+    /// reported dispersion / SEs remain the converged-η estimate. No-op for
+    /// non-Gamma families and for a user-fixed shape.
+    #[inline]
+    pub fn with_gamma_shape_frozen_for_search(mut self, shape: f64) -> Self {
+        if matches!(self.spec.response, ResponseFamily::Gamma)
+            && self.scale.gamma_shape_is_estimated()
+        {
+            self.scale = LikelihoodScaleMetadata::FixedGammaShape { shape };
+        }
+        self
+    }
 }
 
 #[cfg(test)]
@@ -2544,9 +2661,76 @@ mod tests {
     }
 
     #[test]
-    fn gaussian_degeneracy_always_ok() {
+    fn gaussian_degeneracy_exactly_constant_errors() {
+        // An exactly-constant response has sample sd 0 ⇒ the marginal
+        // `−n/2·log σ²` diverges; the guard must reject it pre-fit (#332).
         let y = arr1(&[1.0_f64, 1.0, 1.0]);
-        assert!(ResponseFamily::Gaussian.validate_response_degeneracy(y.view()).is_ok());
+        let err = ResponseFamily::Gaussian
+            .validate_response_degeneracy(y.view())
+            .expect_err("exactly-constant Gaussian response must be rejected");
+        assert!(matches!(
+            err.kind,
+            ResponseDegeneracyKind::GaussianNearConstant { .. }
+        ));
+    }
+
+    #[test]
+    fn gaussian_degeneracy_near_constant_reproducer_errors() {
+        // The issue reproducer: a response with sd ~ 1e-13, well below the
+        // `1e-10` floor, so the REML score blows up to +inf without the guard.
+        let y = arr1(&[
+            5.0_f64,
+            5.0 + 1.0e-13,
+            5.0 - 1.0e-13,
+            5.0 + 2.0e-13,
+            5.0 - 2.0e-13,
+        ]);
+        let err = ResponseFamily::Gaussian
+            .validate_response_degeneracy(y.view())
+            .expect_err("near-constant Gaussian response must be rejected");
+        match err.kind {
+            ResponseDegeneracyKind::GaussianNearConstant { sample_sd, min_sd } => {
+                assert!(
+                    sample_sd <= min_sd,
+                    "guard must fire only when sample_sd ({sample_sd:.3e}) <= min_sd ({min_sd:.0e})"
+                );
+                assert_eq!(min_sd, GAUSSIAN_MIN_SAMPLE_SD);
+                // The message quotes both numbers verbatim.
+                let msg = err.message_for("y");
+                assert!(msg.contains("effectively constant"), "msg = {msg}");
+            }
+            other => panic!("expected GaussianNearConstant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gaussian_degeneracy_well_conditioned_ok() {
+        // A genuinely varying response (sd ~ O(1)) is never tripped.
+        let y = arr1(&[-2.0_f64, 0.5, 1.7, 3.0, -1.1, 2.2]);
+        assert!(ResponseFamily::Gaussian
+            .validate_response_degeneracy(y.view())
+            .is_ok());
+    }
+
+    #[test]
+    fn gaussian_degeneracy_small_signal_above_floor_ok() {
+        // sd ~ 1e-6 is small but far above the 1e-10 floor: a legitimately
+        // small-but-real signal (e.g. a finely-resolved measurement) must fit,
+        // so the guard must not over-reject.
+        let y = arr1(&[1.0_f64, 1.0 + 1.0e-6, 1.0 - 1.0e-6, 1.0 + 2.0e-6]);
+        assert!(ResponseFamily::Gaussian
+            .validate_response_degeneracy(y.view())
+            .is_ok());
+    }
+
+    #[test]
+    fn gaussian_degeneracy_single_observation_ok() {
+        // Fewer than two observations carries no estimable scale degeneracy;
+        // the sample-size gate handles too-small data separately.
+        let y = arr1(&[42.0_f64]);
+        assert!(ResponseFamily::Gaussian
+            .validate_response_degeneracy(y.view())
+            .is_ok());
     }
 
     // -----------------------------------------------------------------------

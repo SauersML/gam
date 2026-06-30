@@ -32,6 +32,16 @@ const REL_TOL: f64 = 1.0e-5;
 const REL_FLOOR: f64 = 1.0e-8;
 const ABS_TOL: f64 = 1.0e-9;
 
+// #1255 noise-matched bar for the non-canonical (probit) GLM-REML outer-gradient
+// row. The binomial/probit inner PIRLS solve leaves an O(1e-7..1e-8) noise floor
+// on V(ρ); a tight 5e-6 central step over that floor is dominated by noise. A
+// wider central step (the standard √(round-off)/curvature trade-off) lifts the FD
+// signal cleanly above the floor, and the bar is set to match the residual
+// truncation+noise budget. This is NOT a weakened exact-arithmetic bar — a wrong
+// analytic gradient disagrees by O(1) relative, orders of magnitude above this.
+const PROBIT_REML_FD_STEP: f64 = 1.0e-3;
+const PROBIT_REML_REL_TOL: f64 = 2.0e-3;
+
 struct GradientChannel {
     name: &'static str,
     analytic: Vec<f64>,
@@ -41,9 +51,19 @@ struct GradientChannel {
 struct ContractRow {
     name: &'static str,
     run: fn() -> Vec<GradientChannel>,
+    /// Per-row relative-agreement bar. Defaults to `REL_TOL` (1e-5) for rows
+    /// whose value surface is FD-smooth to near f64 round-off (exact
+    /// Gaussian-identity inner solve, or a well-conditioned LAML mode). A
+    /// non-canonical GLM-REML row (binomial/probit) carries an irreducible
+    /// O(1e-7..1e-8) inner-PIRLS noise floor on V(ρ), so its FD reference cannot
+    /// be made tight to 1e-5 even with a well-conditioned, non-separable fixture
+    /// — it gets a noise-matched (wider-step) bar instead of being dropped. The
+    /// bar is still a real contract: a wrong analytic gradient is off by O(1)
+    /// relative, far above any noise-matched threshold. See #1255.
+    rel_tol: f64,
 }
 
-fn assert_channel(row: &str, channel: &GradientChannel) {
+fn assert_channel(row: &str, channel: &GradientChannel, rel_tol: f64) {
     assert_eq!(
         channel.analytic.len(),
         channel.fd.len(),
@@ -61,9 +81,9 @@ fn assert_channel(row: &str, channel: &GradientChannel) {
         let rel = (analytic - fd).abs() / analytic.abs().max(fd.abs()).max(REL_FLOOR);
         let abs = (analytic - fd).abs();
         assert!(
-            abs < ABS_TOL || rel < REL_TOL,
+            abs < ABS_TOL || rel < rel_tol,
             "{row}/{}[{idx}] gradient is not the differential of the value: \
-             analytic={analytic:.12e} fd={fd:.12e} abs={abs:.3e} rel={rel:.3e}",
+             analytic={analytic:.12e} fd={fd:.12e} abs={abs:.3e} rel={rel:.3e} (bar={rel_tol:.1e})",
             channel.name
         );
     }
@@ -71,44 +91,64 @@ fn assert_channel(row: &str, channel: &GradientChannel) {
 
 #[test]
 fn gradient_is_differential_contract_gate() {
-    // Every row here is FD-validated at the tight exact-arithmetic bar
-    // (REL_TOL = 1e-5). That bar is only meaningful when the value surface
+    // Each row asserts that the analytic gradient is the differential of the
+    // value surface, at a per-row bar (`ContractRow::rel_tol`). Most rows use
+    // the tight exact-arithmetic bar (REL_TOL = 1e-5), which is meaningful when
     // V(ρ)/objective is FD-smooth to near f64 round-off — i.e. the inner solve
-    // is exact (Gaussian-identity) or converges to a well-conditioned mode
-    // (survival/custom-family/gamlss LAML). A binomial / NON-CANONICAL-link
-    // (e.g. probit) GLM-REML outer gradient is deliberately NOT a row here:
-    // its inner PIRLS solve leaves an O(1e-7..1e-8) noise floor on V(ρ) that no
-    // ρ, sample size, or FD step drives below ~1e-4 relative, so a 1e-5 FD gate
-    // is structurally unattainable for it (the analytic gradient is correct —
-    // it brackets the FD at every step — but the FD reference cannot be made
-    // tight enough to assert agreement at 1e-5). That exact gradient is instead
-    // covered by `objective_gradient_consistency_universal`, which validates
-    // the probit/Firth REML gradient at the appropriate 1e-4..1e-3 tolerance
-    // with a noise-matched 1e-5 step. See #1255.
+    // is exact (Gaussian-identity) or converges to a well-conditioned LAML mode
+    // (survival/custom-family/gamlss).
+    //
+    // #1255: the non-canonical (probit) GLM-REML row is NOT exempt — it is
+    // present, on a non-separable well-conditioned fixture, at a noise-matched
+    // bar (`PROBIT_REML_REL_TOL`) with a wider FD step (`PROBIT_REML_FD_STEP`).
+    // Its inner PIRLS solve leaves an O(1e-7..1e-8) noise floor on V(ρ), so a
+    // 5e-6 step over that floor is pure noise; the wider step lifts the FD signal
+    // above the floor. The analytic gradient is correct (it brackets the FD), and
+    // a WRONG gradient is off by O(1) relative — far above the noise-matched bar
+    // — so this still genuinely gates the binomial/probit nullspace path (whose
+    // original #1255 symptom was an out-of-bounds index panic). That same gradient
+    // is additionally covered by `objective_gradient_consistency_universal`.
     let rows = [
         ContractRow {
             name: "sae/euclidean-line",
             run: sae_euclidean_line_row,
+            rel_tol: REL_TOL,
         },
         ContractRow {
             name: "sae/k2-periodic-overlap",
             run: sae_k2_periodic_overlap_row,
+            rel_tol: REL_TOL,
         },
         ContractRow {
             name: "glm-reml/duchon-901-rank-deficient",
             run: glm_reml_outer_row,
+            rel_tol: REL_TOL,
+        },
+        // #1255: the non-canonical (probit) GLM-REML outer gradient. Previously
+        // DELETED from this gate (commit 92e840dc3) rather than fixed, leaving the
+        // binomial/probit nullspace path — the one whose original symptom was an
+        // OOB index panic — ungated. Restored here on a NON-separable,
+        // well-conditioned fixture with a noise-matched FD step + bar, so the
+        // path is exercised again at a sound tolerance instead of being absent.
+        ContractRow {
+            name: "glm-reml/binomial-noncanonical-outer",
+            run: glm_reml_binomial_noncanonical_outer_row,
+            rel_tol: PROBIT_REML_REL_TOL,
         },
         ContractRow {
             name: "survival/laml-net-single-block",
             run: survival_laml_net_single_block_row,
+            rel_tol: REL_TOL,
         },
         ContractRow {
             name: "custom-family/joint-laml-penalized-quadratic",
             run: custom_family_joint_laml_penalized_quadratic_row,
+            rel_tol: REL_TOL,
         },
         ContractRow {
             name: "gamlss/gaussian-dispersion",
             run: gamlss_gaussian_dispersion_row,
+            rel_tol: REL_TOL,
         },
     ];
 
@@ -120,7 +160,7 @@ fn gradient_is_differential_contract_gate() {
             row.name
         );
         for channel in channels {
-            assert_channel(row.name, &channel);
+            assert_channel(row.name, &channel, row.rel_tol);
         }
     }
 }
@@ -492,6 +532,127 @@ fn glm_reml_outer_row() -> Vec<GradientChannel> {
         .expect("GLM REML f-")
         .0;
         fd.push((fp - fm) / (2.0 * OUTER_FD_STEP));
+    }
+    vec![GradientChannel {
+        name: "rho",
+        analytic: analytic.to_vec(),
+        fd,
+    }]
+}
+
+/// #1255: non-canonical (probit-link) binomial GLM-REML outer-gradient row.
+///
+/// This row was deleted by 92e840dc3 because its ORIGINAL fixture built a
+/// perfectly-separable response (`sin(πz)+0.3cos(3z) > 0`), which drives the
+/// probit MLE to the boundary (|η| ~ 1e2–1e3) and leaves V(ρ) too noisy for a
+/// tight 5e-6 FD reference. The honest fix (proposed in the issue itself) is to
+/// restore the row on a NON-separable, well-conditioned fixture at a
+/// noise-matched FD step + bar — NOT to drop the only coverage of the
+/// binomial/probit nullspace path whose symptom was an OOB index panic.
+///
+/// The response here is generated from a smooth probability bounded into
+/// [0.2, 0.8] and thresholded against a deterministic low-discrepancy sequence,
+/// so the two classes OVERLAP across the whole covariate range (no separating
+/// hyperplane in the degree-6 design). The probit MLE stays interior and the
+/// inner PIRLS solve is well conditioned; the residual O(1e-7..1e-8) noise floor
+/// on V(ρ) is cleared by the wider `PROBIT_REML_FD_STEP`.
+fn glm_reml_binomial_noncanonical_outer_row() -> Vec<GradientChannel> {
+    let n = 240usize;
+    let k = 6usize;
+    let p = 1 + 2 * k;
+    let mut x = Array2::<f64>::zeros((n, p));
+    let mut y = Array1::<f64>::zeros(n);
+    // Golden-ratio low-discrepancy sequence in (0,1): deterministic, equidistributed,
+    // and uncorrelated with the smooth signal, so labels overlap (non-separable).
+    let inv_phi = 2.0 / (1.0 + 5.0_f64.sqrt()); // 1/φ ≈ 0.618…
+    for i in 0..n {
+        x[[i, 0]] = 1.0;
+        let z = -1.0 + 2.0 * i as f64 / (n as f64 - 1.0);
+        let mut acc = 1.0;
+        for j in 0..k {
+            acc *= z;
+            x[[i, 1 + j]] = acc;
+            x[[i, 1 + k + j]] = acc + 1.0e-3 * ((i + j) as f64).sin();
+        }
+        // Smooth signal mapped into a MODERATE probability band [0.2, 0.8] so
+        // neither tail saturates: p = 0.5 + 0.3·sin(πz)·cos(z).
+        let signal = (std::f64::consts::PI * z).sin() * z.cos();
+        let prob = 0.5 + 0.3 * signal;
+        // Deterministic threshold from the golden sequence → overlapping labels.
+        let u = (0.5 + (i as f64) * inv_phi).fract();
+        y[i] = if u < prob { 1.0 } else { 0.0 };
+    }
+    let weights = Array1::<f64>::ones(n);
+    let offset = Array1::<f64>::zeros(n);
+    let penalties = vec![
+        BlockwisePenalty::new(1..(1 + k), second_difference_penalty(k)),
+        BlockwisePenalty::new((1 + k)..p, second_difference_penalty(k)),
+    ];
+    let opts = ExternalOptimOptions {
+        latent_cloglog: None,
+        mixture_link: None,
+        optimize_mixture: false,
+        sas_link: None,
+        optimize_sas: false,
+        family: LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(StandardLink::Probit),
+        ),
+        compute_inference: true,
+        skip_rho_posterior_inference: false,
+        max_iter: 300,
+        tol: 1.0e-12,
+        nullspace_dims: vec![2, 2],
+        linear_constraints: None,
+        firth_bias_reduction: None,
+        penalty_shrinkage_floor: None,
+        rho_prior: Default::default(),
+        kronecker_penalty_system: None,
+        kronecker_factored: None,
+        persist_warm_start_disk: false,
+    };
+    // Moderate-smoothing ρ: keeps the fit away from both the λ→0 (interpolating,
+    // ill-conditioned) and λ→∞ (degenerate null-space) corners.
+    let rho = array![0.6, 0.65];
+    let analytic = evaluate_externalgradient(
+        y.view(),
+        weights.view(),
+        x.clone(),
+        offset.view(),
+        &penalties,
+        &opts,
+        &rho,
+    )
+    .expect("binomial GLM REML gradient");
+    let mut fd = Vec::new();
+    for j in 0..rho.len() {
+        let mut plus = rho.clone();
+        plus[j] += PROBIT_REML_FD_STEP;
+        let mut minus = rho.clone();
+        minus[j] -= PROBIT_REML_FD_STEP;
+        let fp = evaluate_externalcost_andridge(
+            y.view(),
+            weights.view(),
+            x.clone(),
+            offset.view(),
+            &penalties,
+            &opts,
+            &plus,
+        )
+        .expect("binomial GLM REML f+")
+        .0;
+        let fm = evaluate_externalcost_andridge(
+            y.view(),
+            weights.view(),
+            x.clone(),
+            offset.view(),
+            &penalties,
+            &opts,
+            &minus,
+        )
+        .expect("binomial GLM REML f-")
+        .0;
+        fd.push((fp - fm) / (2.0 * PROBIT_REML_FD_STEP));
     }
     vec![GradientChannel {
         name: "rho",

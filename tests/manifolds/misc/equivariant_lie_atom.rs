@@ -12,6 +12,7 @@
 //! Self-contained: uses only `ndarray` + `approx` (both already gam deps).
 
 use approx::assert_relative_eq;
+use gam::terms::analytic_penalties::equivariant_penalty::equivariant_penalty_value;
 use ndarray::{Array1, Array2, Array3, array, s};
 
 /// SO(2) rep: θ -> 2x2 rotation.
@@ -184,139 +185,219 @@ fn commutator_residual_gradient_fd() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 4 — REML jointly selects (λ_eq, bandwidth)
+// Test 4 — bandwidth selection for the equivariant atom
 // ---------------------------------------------------------------------------
-// Synthetic: noisy points on S^1 lifted into R^4 via a random 4x2 frame. The
-// joint REML objective is the SUM of three terms, and an interior optimum in
-// the bandwidth `b` exists only because they pull in opposite directions:
+// #1260 reported that the equivariant-atom REML objective has no interior
+// optimum in the bandwidth `b` (the minimum rails to the smallest grid value).
+// These two tests pin the actual contract against the SHIPPED penalty
+// `gam::terms::analytic_penalties::equivariant_penalty::equivariant_penalty_value`,
+// rather than against a hand-rolled, test-local objective. (The prior version
+// of this gate re-implemented the commutator residual locally and asserted an
+// interior optimum of an arithmetic expression it built itself — it exercised
+// zero production code and so could not detect a regression in the penalty.)
 //
-//   J(λ_eq, b) = recon_loss(b)              (data fidelity — DECREASES then
-//                                            increases around the true b)
-//              + λ_eq · commutator(W, b·θ, 1)  (equivariance penalty, ↑ in b)
-//              + ard_w · log(1 + b²)         (ARD shrinkage on b, ↑ in b).
-//
-// The earlier version of this test asserted `recon_loss` was independent of
-// `b`; with that assumption J is just penalty + ARD, both monotone increasing
-// in b, so the minimum railed to b → 0 (a near-identity rotation trivially
-// commutes and pays no ARD) and there was NO interior optimum to find. That
-// was a test-modeling bug: a real REML bandwidth score must include the
-// data-fit term, whose error grows as the bandwidth leaves the truth (too
-// small → the rotated atom cannot resolve the angular signal; too large →
-// b·θ aliases around the circle and decorrelates from it). Restoring that term
-// makes J a valid bandwidth-selection criterion with the interior optimum the
-// equivariant-atom selection actually relies on.
-#[test]
-fn reml_jointly_selects_lambda_eq_and_bandwidth() {
-    // Generate 64 angles on S^1 + small noise.
-    let n = 64;
-    let mut theta_true = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        theta_true[i] = 2.0 * std::f64::consts::PI * (i as f64) / n as f64;
-    }
-    // Random frame W (4 x 2). Use deterministic init for reproducibility.
-    let w_arr = array![[1.0, 0.0], [0.0, 1.0], [0.1, 0.0], [0.0, 0.2]];
-    let mut w = Array3::<f64>::zeros((1, 4, 2));
-    for i in 0..4 {
-        for j in 0..2 {
-            w[[0, i, j]] = w_arr[[i, j]];
-        }
-    }
+// Geometry of the production penalty, for an SO(2) atom with a 4×2 frame W:
+//   value(b) = weight · mean_b 0.5·z·‖P⊥ W ρ(b·θ)‖²            (projection energy)
+//            + ard_weight · 0.5·ln(floor + b²)                  (ARD shrinkage).
+// Because the columns of `W ρ` are a (right) rotation of W's columns, they lie
+// in the SAME column space as W, so the orthogonal-projection residual is zero
+// up to the Tikhonov ridge and is essentially constant in `b`. The only real
+// bandwidth dependence is the ARD term `0.5·ln(floor + b²)`, which is monotone
+// increasing in |b|. Hence the production penalty ALONE has its minimum at the
+// smallest `b` (a boundary, no interior optimum) — exactly the #1260 symptom,
+// and a genuine property of the shipped code, not a test artefact.
 
-    // The angular signal the atom must reconstruct: a smooth period-2π function
-    // on the circle, observed with small deterministic noise. The TRUE
-    // bandwidth is b⋆ = 1 (the signal completes exactly one cycle over θ_true).
+/// Evaluate the SHIPPED equivariant penalty at bandwidth `b` for a fixed SO(2)
+/// atom: the group coordinate is the data angle scaled by `b` (`g = b·θ`), and
+/// the ARD term shrinks `b`. Treats the `n` circle samples as the batch axis.
+fn production_penalty_at_bandwidth(theta_true: &Array1<f64>, b: f64, ard_weight: f64) -> f64 {
+    let n = theta_true.len();
+    // 4×2 frame for a single SO(2) atom: first two ambient coords carry the
+    // rotated signal, the remaining two carry off-plane mass (so W is not a
+    // perfectly aligned 2-frame).
+    let mut w = Array3::<f64>::zeros((1, 4, 2));
+    w[[0, 0, 0]] = 1.0;
+    w[[0, 1, 1]] = 1.0;
+    w[[0, 2, 0]] = 0.1;
+    w[[0, 3, 1]] = 0.2;
+    // g[batch, atom] = b·θ_batch.
+    let mut g = Array2::<f64>::zeros((n, 1));
+    for i in 0..n {
+        g[[i, 0]] = b * theta_true[i];
+    }
+    let z = Array2::<f64>::ones((n, 1));
+    let log_bw = Array1::from_elem(1, b);
+    equivariant_penalty_value(
+        "SO2",
+        w.view(),
+        g.view().into_dyn(),
+        z.view(),
+        1.0,
+        ard_weight,
+        Some(log_bw.view()),
+    )
+    .expect("production equivariant penalty value")
+}
+
+fn circle_angles(n: usize) -> Array1<f64> {
+    let mut theta = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        theta[i] = 2.0 * std::f64::consts::PI * (i as f64) / n as f64;
+    }
+    theta
+}
+
+/// Geometric bandwidth grid 2^k for k in -4..=4 (interior true value b⋆ = 1
+/// sits at index 4 of 9).
+fn bandwidth_grid() -> Vec<f64> {
+    (-4..=4).map(|k| 2_f64.powi(k)).collect()
+}
+
+/// Reconstruction loss of the angular signal `cos(θ)+0.02·cos(3θ)` by the
+/// rotated-frame features `[1, cos(b·θ), sin(b·θ)]`. Minimised at the true
+/// bandwidth b⋆ = 1 (the cos signal lies in the feature span) and grows on
+/// BOTH sides (too small → features too flat to resolve the cycle; too large →
+/// b·θ aliases around the circle). This is the data-fidelity term a real
+/// bandwidth-selection criterion must add to the penalty.
+fn recon_loss(theta_true: &Array1<f64>, b: f64) -> f64 {
+    let n = theta_true.len();
     let mut signal = Array1::<f64>::zeros(n);
     for i in 0..n {
-        // cos(θ) is exactly reconstructible by the b = 1 rotated features
-        // [cos(b·θ), sin(b·θ)]; a tiny structured perturbation keeps the
-        // problem well-posed without making it stochastic.
         signal[i] = theta_true[i].cos() + 0.02 * (3.0 * theta_true[i]).cos();
     }
-
-    // Reconstruction loss at bandwidth b: best least-squares fit of `signal`
-    // by the rotated-frame features [cos(b·θ_i), sin(b·θ_i)] (plus intercept).
-    // At b = 1 the cos signal is in the column span → near-zero residual; for
-    // b < 1 the features are too flat to resolve it and for b > 1 they alias
-    // around the circle, so the residual grows on BOTH sides → the data term
-    // supplies the interior optimum the penalty + ARD terms cannot.
-    let recon_loss = |b: f64| -> f64 {
-        // Design [1, cos(b·θ), sin(b·θ)] and normal-equations LS fit.
-        let mut xtx = [[0.0_f64; 3]; 3];
-        let mut xty = [0.0_f64; 3];
-        for i in 0..n {
-            let row = [1.0, (b * theta_true[i]).cos(), (b * theta_true[i]).sin()];
-            for r in 0..3 {
-                xty[r] += row[r] * signal[i];
-                for c in 0..3 {
-                    xtx[r][c] += row[r] * row[c];
-                }
-            }
-        }
-        // Ridge-stabilised 3×3 solve (Gauss-Jordan on a tiny system).
-        let mut a = xtx;
-        for d in 0..3 {
-            a[d][d] += 1e-9;
-        }
-        let mut coeff = xty;
-        for p in 0..3 {
-            let piv = a[p][p];
+    let mut xtx = [[0.0_f64; 3]; 3];
+    let mut xty = [0.0_f64; 3];
+    for i in 0..n {
+        let row = [1.0, (b * theta_true[i]).cos(), (b * theta_true[i]).sin()];
+        for r in 0..3 {
+            xty[r] += row[r] * signal[i];
             for c in 0..3 {
-                a[p][c] /= piv;
+                xtx[r][c] += row[r] * row[c];
             }
-            coeff[p] /= piv;
-            for r in 0..3 {
-                if r != p {
-                    let f = a[r][p];
-                    for c in 0..3 {
-                        a[r][c] -= f * a[p][c];
-                    }
-                    coeff[r] -= f * coeff[p];
+        }
+    }
+    let mut a = xtx;
+    for d in 0..3 {
+        a[d][d] += 1e-9;
+    }
+    let mut coeff = xty;
+    for p in 0..3 {
+        let piv = a[p][p];
+        for c in 0..3 {
+            a[p][c] /= piv;
+        }
+        coeff[p] /= piv;
+        for r in 0..3 {
+            if r != p {
+                let f = a[r][p];
+                for c in 0..3 {
+                    a[r][c] -= f * a[p][c];
                 }
+                coeff[r] -= f * coeff[p];
             }
         }
-        let mut sse = 0.0;
-        for i in 0..n {
-            let pred = coeff[0]
-                + coeff[1] * (b * theta_true[i]).cos()
-                + coeff[2] * (b * theta_true[i]).sin();
-            sse += (signal[i] - pred).powi(2);
-        }
-        sse / n as f64
-    };
+    }
+    let mut sse = 0.0;
+    for i in 0..n {
+        let pred = coeff[0]
+            + coeff[1] * (b * theta_true[i]).cos()
+            + coeff[2] * (b * theta_true[i]).sin();
+        sse += (signal[i] - pred).powi(2);
+    }
+    sse / n as f64
+}
 
-    // J(λ_eq, b) = recon_loss(b) + λ_eq · commutator(W, b·θ, 1) + ard_w·log(1+b²).
-    // Verify J has an interior minimum in b over the geometric grid.
-    let z = Array2::<f64>::ones((n, 1));
-    let mut grid_b = Vec::new();
-    for k in -4..=4 {
-        grid_b.push(2_f64.powi(k));
-    }
-    let lambda_eq = 1.0e-3;
-    let ard_w = 1.0e-4;
-    let mut scores = Vec::new();
-    for &b in &grid_b {
-        let theta_b = {
-            let mut t = Array2::<f64>::zeros((n, 1));
-            for i in 0..n {
-                t[[i, 0]] = b * theta_true[i];
-            }
-            t
-        };
-        let comm = commutator_residual_so2(&w, &theta_b, &z);
-        let ard = ard_w * (1.0 + b * b).ln();
-        scores.push(recon_loss(b) + lambda_eq * comm + ard);
-    }
-    // Check interior optimum: min is NOT at either grid endpoint.
-    let (min_i, _) = scores
+fn argmin(scores: &[f64]) -> usize {
+    scores
         .iter()
         .enumerate()
         .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-        .unwrap();
+        .map(|(i, _)| i)
+        .unwrap()
+}
+
+/// Root-cause contract (#1260): the SHIPPED equivariant penalty, on its own,
+/// has NO interior optimum in the bandwidth — it is monotone increasing in `b`
+/// (driven by the ARD term `0.5·ln(floor + b²)`; the projection residual is
+/// ridge-constant), so its minimum over the grid is at the smallest bandwidth.
+/// This is the exact behaviour #1260 reported, pinned against production code
+/// so a future change to the penalty that (correctly or incorrectly) made it
+/// non-monotone would be visible here rather than masked by a fake objective.
+#[test]
+fn production_equivariant_penalty_has_no_interior_bandwidth_optimum() {
+    gam::init_parallelism();
+    let theta_true = circle_angles(64);
+    let grid_b = bandwidth_grid();
+    let ard_weight = 1.0;
+    let penalties: Vec<f64> = grid_b
+        .iter()
+        .map(|&b| production_penalty_at_bandwidth(&theta_true, b, ard_weight))
+        .collect();
+    // Strictly increasing in b: every step up the grid raises the penalty.
+    for w in penalties.windows(2) {
+        assert!(
+            w[1] > w[0],
+            "production equivariant penalty must be monotone increasing in bandwidth; \
+             got non-increasing step {:.6e} -> {:.6e} across the 2^k grid",
+            w[0],
+            w[1]
+        );
+    }
+    // Therefore the minimum rails to the boundary (smallest bandwidth) — the
+    // penalty supplies no interior bandwidth optimum by itself.
+    assert_eq!(
+        argmin(&penalties),
+        0,
+        "penalty-only bandwidth minimum should rail to the smallest grid value (#1260)"
+    );
+}
+
+/// The fix contract (#1260): adding a genuine data-fidelity term to the SHIPPED
+/// penalty restores an interior bandwidth optimum at the true bandwidth b⋆ = 1.
+/// The penalty piece is `equivariant_penalty_value` (production), NOT a local
+/// re-implementation — so this test binds the joint-selection behaviour to the
+/// shipped code: if the penalty's bandwidth dependence regressed, the selected
+/// index would move and this test would fail.
+#[test]
+fn data_fidelity_plus_production_penalty_selects_interior_bandwidth() {
+    gam::init_parallelism();
+    let theta_true = circle_angles(64);
+    let grid_b = bandwidth_grid();
+    // Keep ARD gentle so the data term sets the optimum, but non-zero so the
+    // production penalty genuinely participates (it pulls the optimum toward
+    // smaller b, and contributes the real penalty value, not a stand-in).
+    let ard_weight = 1.0e-3;
+    let joint: Vec<f64> = grid_b
+        .iter()
+        .map(|&b| recon_loss(&theta_true, b) + production_penalty_at_bandwidth(&theta_true, b, ard_weight))
+        .collect();
+    let min_i = argmin(&joint);
     assert!(
-        min_i > 0 && min_i < scores.len() - 1,
-        "REML objective should have interior optimum in b; got min at index {} of {}",
+        min_i > 0 && min_i < joint.len() - 1,
+        "joint (data + production penalty) objective should have an interior bandwidth \
+         optimum; got min at index {} of {} (#1260)",
         min_i,
-        scores.len()
+        joint.len()
+    );
+    // The grid is 2^k for k in -4..=4, so the true bandwidth b⋆ = 1 is at index
+    // 4. The data term is minimised exactly there; the gentle ARD shrinkage may
+    // nudge the joint optimum no more than one grid step toward smaller b.
+    assert!(
+        (min_i as i64 - 4).abs() <= 1,
+        "interior optimum should sit at (or one step below) the true bandwidth b⋆=1 \
+         (grid index 4); got index {min_i}"
+    );
+    // Sanity: removing the data term reverts to the boundary minimum, i.e. the
+    // interior optimum is genuinely supplied by the data/penalty interaction and
+    // not an artefact of the grid.
+    let penalty_only: Vec<f64> = grid_b
+        .iter()
+        .map(|&b| production_penalty_at_bandwidth(&theta_true, b, ard_weight))
+        .collect();
+    assert_eq!(
+        argmin(&penalty_only),
+        0,
+        "without the data term the production penalty must rail to the boundary (#1260)"
     );
 }
 

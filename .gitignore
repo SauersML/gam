@@ -209,6 +209,8 @@ gam-target*/
 gam_env.sh
 *.trace
 scratchpad/*
+.agent-notes/*
+.agent/*
 
 # cluster / SLURM infra is NOT part of this repo. Cluster sbatch scripts, absolute
 # scratch paths, and SLURM directives live under /Users/user/ (e.g.
@@ -219,3 +221,6 @@ scripts/*verify*fresh*.sh
 
 # local CARGO_HOME cache (multi-agent build), never commit
 .cargo/
+
+# agent working notes, never commit
+.agent/

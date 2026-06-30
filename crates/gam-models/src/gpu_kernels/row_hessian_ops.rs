@@ -277,7 +277,12 @@ impl RowOpsBackend {
                     )
                 })?;
                 let stream = ctx.default_stream();
-                let ptx = cudarc::nvrtc::compile_ptx(ROW_KERNEL_SOURCE)
+                // Shared arch+fmad options (NOT bare `compile_ptx`): #1686's
+                // `--fmad=false` keeps the matvec / diag reductions
+                // bit-comparable to the separately-rounded CPU oracle, and the
+                // #1551 arch pin keys the kernel to the device's real compute
+                // capability instead of NVRTC's pre-sm_60 default.
+                let ptx = gam_gpu::device_cache::compile_ptx_arch(ROW_KERNEL_SOURCE)
                     .map_err(|err| gpu_err!("row_hessian_ops NVRTC compile failed: {err}"))?;
                 let module = ctx
                     .load_module(ptx)

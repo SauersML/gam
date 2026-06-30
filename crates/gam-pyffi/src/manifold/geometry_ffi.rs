@@ -3686,6 +3686,30 @@ fn identifiability_check_json(input: &str) -> PyResult<String> {
     gam::identifiability::precondition::identifiability_check_json(input).map_err(py_value_error)
 }
 
+/// Set the solver's stderr log verbosity at runtime from Python.
+///
+/// The extension installs the logger at the quiet `warn` default on import
+/// (#1688), so the per-iteration solver trace (`[OUTER …]`, `[KAPPA-PHASE …]`,
+/// the `[#1271-diag]` REML logdet dump, etc.) is suppressed — that stream also
+/// carries real per-evaluation compute (eigendecompositions), not just I/O, so
+/// quieting it speeds fits as well as silencing them. Call
+/// `gam._rust.set_log_level("info")` (or `debug`/`trace`) to opt back into the
+/// full trace; `off`/`error`/`warn` quiet it further. The accepted spellings
+/// are the standard `log` level names (case-insensitive); an unrecognized value
+/// raises `ValueError`.
+#[pyfunction]
+fn set_log_level(level: &str) -> PyResult<()> {
+    match gam::solver::progress_log::parse_level_directive(level) {
+        Some(filter) => {
+            gam::solver::progress_log::init_logging_at(filter);
+            Ok(())
+        }
+        None => Err(py_value_error(format!(
+            "unrecognized log level {level:?}; expected one of off|error|warn|info|debug|trace"
+        ))),
+    }
+}
+
 #[pymodule(name = "_rust", gil_used = false)]
 fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     gam::init_parallelism();
@@ -3940,6 +3964,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sklearn_fit_metadata, module)?)?;
     module.add_function(wrap_pyfunction!(build_info, module)?)?;
     module.add_function(wrap_pyfunction!(identifiability_check_json, module)?)?;
+    module.add_function(wrap_pyfunction!(set_log_level, module)?)?;
     module.add_function(wrap_pyfunction!(interpolate_survival_surface, module)?)?;
     module.add_function(wrap_pyfunction!(interpolate_rows, module)?)?;
     module.add_function(wrap_pyfunction!(survival_chunk_iter_collect, module)?)?;

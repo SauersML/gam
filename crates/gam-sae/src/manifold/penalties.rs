@@ -177,6 +177,60 @@ impl SaeManifoldTerm {
         self.decoder_repulsion_gate = if gate.is_empty() { None } else { Some(gate) };
     }
 
+    /// #1625 — freeze the SEPARATION barrier's normalized-coactivation weights
+    /// `q_jk` at assembly entry, the analog of [`Self::refresh_decoder_repulsion_gate`]
+    /// for the #1522 collapse-prevention barrier.
+    ///
+    /// The barrier energy `P_sep = μ_C·Σ_{j<k} −q_jk·log(1−c_jk²+ε)` weights the
+    /// per-pair decoder-shape repulsion by the routing coactivation
+    /// `q_jk = (Σ_i a_ij a_ik)/√(Σa_ij²·Σa_ik²)`. That coactivation is a function
+    /// of the assignment masses `a_ik` (hence the logits the inner Newton solve
+    /// moves), but the barrier's gradient assembly differentiates ONLY the decoder
+    /// shape `c_jk²` — it consumes `q_jk` as a constant multiplicative weight (the
+    /// `α = μ q_jk/(1−c²+ε)` prefactor). Recomputing `q_jk` from the trial logits
+    /// in the line-search VALUE while the GRADIENT held it fixed is a value/gradient
+    /// desync: the value sees a logit force the Newton step never modelled, so the
+    /// inner solve cannot reach KKT stationarity in the logit block and the undamped
+    /// evidence solve refuses to rank an off-optimum Laplace criterion (#1625). It
+    /// is also the WRONG semantics for a collapse-prevention barrier — an atom pair
+    /// must separate its decoder SHAPES, not merely route apart to dodge the
+    /// measurement, or the decoders could collapse while the routing hides it.
+    ///
+    /// Freezing `q_jk` here (lagged-diffusivity, at the SAME chokepoint as the
+    /// smoothness Gram and the repulsion gate) makes the barrier a pure function of
+    /// the decoder shapes within a Newton step: value, gradient, and curvature all
+    /// read this frozen weight, so they stay mutually consistent across the line
+    /// search while the decoder cross-Gram `c_jk²` still moves with the trial. The
+    /// weight is refreshed every assembly, so across outer iterations it tracks the
+    /// converging routing exactly (a self-consistent fixed point), never lagging by
+    /// more than the one in-flight step the repulsion gate also lags. `None` when no
+    /// pair co-fires (the strict no-op); the value/gradient seams fall back to the
+    /// live coactivation in that case so standalone (non-line-search) calls are
+    /// unaffected.
+    pub(crate) fn refresh_barrier_coactivation_gate(&mut self) {
+        if self.k_atoms() < 2 {
+            self.barrier_coactivation_gate = None;
+            return;
+        }
+        let pairs = self.barrier_coactive_pairs();
+        self.barrier_coactivation_gate = if pairs.is_empty() { None } else { Some(pairs) };
+    }
+
+    /// #1625 — the SEPARATION barrier's coactivation pairs `(j, k, q_jk)`,
+    /// preferring the per-assembly FROZEN weights ([`Self::barrier_coactivation_gate`])
+    /// when present so the value and gradient seams differentiate the SAME `q_jk`
+    /// across a Newton step (see [`Self::refresh_barrier_coactivation_gate`]). Falls
+    /// back to the LIVE [`Self::barrier_coactive_pairs`] for standalone calls made
+    /// outside an inner-solve assembly (e.g. the #1522 prevention-vs-bandaid test
+    /// and the owed-1026 FD battery), which evaluate value and gradient at one and
+    /// the same state and so are self-consistent either way.
+    pub(crate) fn barrier_coactivation_pairs(&self) -> Vec<(usize, usize, f64)> {
+        match &self.barrier_coactivation_gate {
+            Some(pairs) => pairs.clone(),
+            None => self.barrier_coactive_pairs(),
+        }
+    }
+
     /// #1026 — build the [`DecoderIncoherencePenalty`] operator for the frozen
     /// repulsion gate, or `None` when no repulsion is active. Reuses the existing
     /// analytic gradient + PSD majorizer; only the gate (fed as `coactivation`)
@@ -462,10 +516,41 @@ impl SaeManifoldTerm {
         SAE_DECODER_REPULSION_BARRIER_RATIO * self.separation_barrier_strength()
     }
 
-    /// #1026/#1522 SEPARATION barrier value
-    /// `P_sep = -μ_C · Σ_{j<k} q_jk · log(1 - c_jk² + ε)` on the normalized
-    /// shapes. Diverges as two coactive atoms align (`c_jk² → 1`); exactly 0 when
-    /// their shapes are orthogonal. 0 for `K<2`.
+    /// #1625 — the SEPARATION barrier's C1 collinearity gate
+    /// `w(c²) ∈ [0,1]` and its derivative `w'(c²)`, evaluated together so the
+    /// value and the analytic gradient/curvature differentiate one shared
+    /// smoothstep. Exactly `(0, 0)` below
+    /// [`SAE_SEPARATION_BARRIER_COLLINEARITY_GATE`] `s0` (the barrier is a strict
+    /// no-op on well-separated atoms), ramping as the Hermite smoothstep
+    /// `w = t²(3−2t)`, `t = (c²−s0)/(1−s0)`, to `(1, 0)` at `c² = 1` — so the
+    /// barrier's interior-point divergence `−log(1−c²+ε)` is recovered at the
+    /// collapse limit while moderate collinearity is untaxed. `w'` carries the
+    /// chain-rule `dt/dc² = 1/(1−s0)` so the returned pair is the exact gradient of
+    /// the SAME `w` the value uses (no value/gradient desync across the line
+    /// search). Mirrors the decoder-repulsion smoothstep in
+    /// [`Self::refresh_decoder_repulsion_gate`].
+    fn separation_barrier_gate(c2: f64) -> (f64, f64) {
+        let s0 = SAE_SEPARATION_BARRIER_COLLINEARITY_GATE;
+        if c2 <= s0 {
+            return (0.0, 0.0);
+        }
+        let span = 1.0 - s0;
+        if !(span > 0.0) {
+            // Degenerate gate (s0 ≥ 1): treat as fully engaged with no ramp.
+            return (1.0, 0.0);
+        }
+        let t = ((c2 - s0) / span).min(1.0);
+        let w = t * t * (3.0 - 2.0 * t);
+        // dw/dc² = (6t − 6t²) · dt/dc² = 6t(1−t)/span; flat (0) once t saturates.
+        let dw = if t >= 1.0 { 0.0 } else { 6.0 * t * (1.0 - t) / span };
+        (w, dw)
+    }
+
+    /// #1026/#1522/#1625 SEPARATION barrier value
+    /// `P_sep = -μ_C · Σ_{j<k} q_jk · w(c_jk²) · log(1 - c_jk² + ε)` on the
+    /// normalized shapes, with the #1625 collinearity gate `w(c²)`. Diverges as two
+    /// coactive atoms align (`c_jk² → 1`); exactly 0 below the gate (distinct
+    /// atoms feel no force). 0 for `K<2`.
     pub(crate) fn separation_barrier_value(&self, penalty_scale: f64) -> f64 {
         let mu = penalty_scale * self.separation_barrier_strength();
         if mu == 0.0 {
@@ -483,13 +568,21 @@ impl SaeManifoldTerm {
             .collect();
         let floor2 = Self::barrier_norm_floor_sq(&norm_sq);
         let mut acc = 0.0_f64;
-        for (j, k, qjk) in self.barrier_coactive_pairs() {
+        // #1625 — read the FROZEN coactivation `q_jk` (falls back to live when no
+        // assembly has frozen it) so this value matches the gradient the line
+        // search is testing against; the decoder shape `c_jk²` below is still the
+        // LIVE cross-Gram, moving with the trial decoders exactly as intended.
+        for (j, k, qjk) in self.barrier_coactivation_pairs() {
             if norm_sq[j] <= floor2 || norm_sq[k] <= floor2 {
                 continue;
             }
             let c2 = self.barrier_cross_shape_energy(j, k) / (norm_sq[j] * norm_sq[k]);
+            let (gate, _dgate) = Self::separation_barrier_gate(c2);
+            if gate == 0.0 {
+                continue;
+            }
             let arg = (1.0 - c2 + eps).max(eps);
-            acc += -qjk * arg.ln();
+            acc += -qjk * gate * arg.ln();
         }
         mu * acc
     }
@@ -554,7 +647,12 @@ impl SaeManifoldTerm {
             .collect();
         let floor2 = Self::barrier_norm_floor_sq(&norm_sq);
         let mut wrote = false;
-        for (j, k, qjk) in self.barrier_coactive_pairs() {
+        // #1625 — use the FROZEN coactivation `q_jk` (lagged at assembly entry) as
+        // the constant per-pair weight, matching the value path. The decoder cross
+        // matrix / `c_jk²` below are the LIVE decoders, so the assembled force still
+        // tracks the trial shape; only the routing weight is held fixed within the
+        // step, which is why no logit-block gradient is owed for this term.
+        for (j, k, qjk) in self.barrier_coactivation_pairs() {
             if norm_sq[j] <= floor2 || norm_sq[k] <= floor2 {
                 continue;
             }
@@ -580,7 +678,19 @@ impl SaeManifoldTerm {
             }
             let g: f64 = cross.iter().map(|v| v * v).sum();
             let c2 = g / (nj2 * nk2);
-            let alpha = mu * qjk / ((1.0 - c2 + eps).max(eps));
+            // #1625 — collinearity-gated barrier `P = -μ q w(c²) log(1-c²+ε)`.
+            // Its force is `α = ∂P/∂c² = μ q [ w(c²)/(1-c²+ε) - w'(c²)·log(1-c²+ε) ]`
+            // (product rule through the smoothstep). Both summands are ≥ 0 — `w,w' ≥ 0`,
+            // `log(1-c²+ε) ≤ 0` — so `α ≥ 0` and the gradient direction `∂c²/∂B` is
+            // unchanged from the ungated form (the gate only scales the magnitude and
+            // zeros it below the threshold). The ungated `μ q/(1-c²+ε)` is the special
+            // case `w≡1, w'≡0`. Below the gate `w=w'=0 ⇒ α=0`, a strict no-op.
+            let (gate, dgate) = Self::separation_barrier_gate(c2);
+            if gate == 0.0 {
+                continue;
+            }
+            let arg = (1.0 - c2 + eps).max(eps);
+            let alpha = mu * qjk * (gate / arg - dgate * arg.ln());
             let inv = 1.0 / (nj2 * nk2);
             let off_j = offsets[j];
             let off_k = offsets[k];
@@ -1309,7 +1419,30 @@ impl SaeManifoldTerm {
         // rho.exp()` overflows to `inf` for `rho ≳ 709`, and the downstream
         // `inf · jacobian` / `inf · 0.0` then injects NaN into the GN curvature
         // block and β-penalty, poisoning the joint solve (#742, Issue 4).
-        let mu = resolve_learnable_weight(corrected.scalar_weight, rho_local[corrected.rho_index]);
+        //
+        // #795 scale-invariant curvature: the value / gradient paths penalize
+        // the SCALE-INVARIANT residual `R_n = g_n/gbar − g^ref_n` (normalized by
+        // the shared `gbar = mean tr(g)/d`), so the assembled gradient is free
+        // of the decoder magnitude. This Gauss-Newton block, however, is built
+        // below from the RAW weighted Jacobian `wj ∝ ‖B‖`, so `AᵀA ∝ ‖B‖⁴` — it
+        // is the GN block of the UN-normalized `½μ‖g_n − g^ref‖²`. Pairing a
+        // scale-free gradient with a `‖B‖⁴` curvature collapses the joint Newton
+        // step (`H⁻¹g ∝ ‖B‖⁻⁴`) as the decoder grows, the proximal ridge
+        // saturates at 1e15, and every trial step is rejected — the exact #795
+        // failure. The Gauss-Newton block of the NORMALIZED residual is the raw
+        // block times `1/gbar²` (freezing the shared normalizer, the same
+        // convention `normalized_metric_state`'s majorizer uses): a positive
+        // scalar on an already-PSD Gram block, so the Schur complement stays PSD,
+        // and `1/gbar² ∝ ‖B‖⁻⁴` exactly cancels the raw `‖B‖⁴`. Fold it into `mu`
+        // so every `mu * acc` write below carries it. `gbar` is read from the
+        // penalty (the single source of truth shared with the gradient); if it
+        // is unavailable/degenerate we skip the block rather than write a
+        // mis-scaled one.
+        let mu_raw = resolve_learnable_weight(corrected.scalar_weight, rho_local[corrected.rho_index]);
+        let Some(gbar) = corrected.metric_normalizer(d) else {
+            return;
+        };
+        let mu = mu_raw / (gbar * gbar);
         // A negligible (or non-finite) effective isometry weight contributes a
         // zero curvature block; writing zeros would still flip the solver onto
         // the dense-supplement Schur path (and invalidate caches) for no model
@@ -1554,7 +1687,25 @@ impl SaeManifoldTerm {
         // rho.exp()` overflows to `inf` for `rho ≳ 709`, and the downstream
         // `inf · jacobian` / `inf · 0.0` then injects NaN into the GN curvature
         // block and β-penalty, poisoning the joint solve (#742, Issue 4).
-        let mu = resolve_learnable_weight(corrected.scalar_weight, rho_local[corrected.rho_index]);
+        //
+        // #795 scale-invariant curvature (decoder β block): the `gb` gradient
+        // accumulated above routes through the gbar-normalized
+        // `grad_jacobian`, so it is free of the decoder magnitude. This dense
+        // `hbb` Gauss-Newton block is the decoder-side pullback of the SAME raw
+        // `wj`-built block as the coord-side `htt` (`add_sae_isometry_metric_gn_blocks`),
+        // so it scales ∝‖B‖⁴ and would re-introduce the #795 step collapse on
+        // the β tier. Fold the same `1/gbar²` frozen-normalizer factor in here
+        // so the decoder curvature matches its scale-free gradient. PSD-
+        // preserving (positive scalar on a PSD Gram block); skip on a degenerate
+        // normalizer rather than write a mis-scaled block.
+        let mu_raw = resolve_learnable_weight(corrected.scalar_weight, rho_local[corrected.rho_index]);
+        let Some(gbar) = corrected.metric_normalizer(d) else {
+            return;
+        };
+        let mu = mu_raw / (gbar * gbar);
+        if !(mu.is_finite() && mu > 0.0) {
+            return;
+        }
         let mut metric_jvp = Array2::<f64>::zeros((d, d));
         let mut jac_hvp = Array2::<f64>::zeros((p, d));
         let mut beta_hvp = Array2::<f64>::zeros((m, p));

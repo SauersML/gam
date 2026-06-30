@@ -3565,3 +3565,218 @@ pub fn build_matern_collocation_operator_matrices(
         polynomial_block_cols: usize::from(include_intercept),
     })
 }
+
+#[cfg(test)]
+mod matern_basis_size_tests {
+    use super::*;
+
+    /// Deterministic n×2 standardized-style cloud, matching the issue's setup
+    /// (standardized inputs, default length_scale ≈ 1.0). A low-discrepancy
+    /// additive-recurrence sequence in [0,1)² is pushed through the inverse
+    /// standard-normal CDF so the marginals are ~N(0,1): most mass sits in a
+    /// tight ±2 core where centers pack densely. No RNG seeds. This is the cloud
+    /// on which the FIXED-length-scale kernel goes numerically collinear as `k`
+    /// grows (the #1731 cap), exactly as it does on real standardized data.
+    fn standardized_2d_cloud(n: usize) -> Array2<f64> {
+        // Acklam's rational approximation to the inverse standard-normal CDF.
+        // Accurate to ~1e-9 over (0,1); plenty for generating a test cloud.
+        fn inv_norm_cdf(p: f64) -> f64 {
+            let a = [
+                -3.969_683_028_665_376e1,
+                2.209_460_984_245_205e2,
+                -2.759_285_104_469_687e2,
+                1.383_577_518_672_690e2,
+                -3.066_479_806_614_716e1,
+                2.506_628_277_459_239e0,
+            ];
+            let b = [
+                -5.447_609_879_822_406e1,
+                1.615_858_368_580_409e2,
+                -1.556_989_798_598_866e2,
+                6.680_131_188_771_972e1,
+                -1.328_068_155_288_572e1,
+            ];
+            let c = [
+                -7.784_894_002_430_293e-3,
+                -3.223_964_580_411_365e-1,
+                -2.400_758_277_161_838e0,
+                -2.549_732_539_343_734e0,
+                4.374_664_141_464_968e0,
+                2.938_163_982_698_783e0,
+            ];
+            let d = [
+                7.784_695_709_041_462e-3,
+                3.224_671_290_700_398e-1,
+                2.445_134_137_142_996e0,
+                3.754_408_661_907_416e0,
+            ];
+            let plow = 0.024_25;
+            let phigh = 1.0 - plow;
+            if p < plow {
+                let q = (-2.0 * p.ln()).sqrt();
+                (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5])
+                    / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
+            } else if p <= phigh {
+                let q = p - 0.5;
+                let r = q * q;
+                (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q
+                    / (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1.0)
+            } else {
+                let q = (-2.0 * (1.0 - p).ln()).sqrt();
+                -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5])
+                    / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
+            }
+        }
+        let mut data = Array2::<f64>::zeros((n, 2));
+        let g1 = 0.754_877_666_246_692_8_f64;
+        let g2 = 0.569_840_290_998_021_2_f64;
+        for i in 0..n {
+            let t = (i + 1) as f64;
+            let u1 = (t * g1).fract().clamp(1e-6, 1.0 - 1e-6);
+            let u2 = (t * g2).fract().clamp(1e-6, 1.0 - 1e-6);
+            data[[i, 0]] = inv_norm_cdf(u1);
+            data[[i, 1]] = inv_norm_cdf(u2);
+        }
+        data
+    }
+
+    /// A `k`-point quasi-uniform grid of centers over the standardized core
+    /// `[-2.5, 2.5]²`. Using an explicit center grid (rather than
+    /// `FarthestPoint`, which can never select more centers than data rows) lets
+    /// us request center counts that genuinely stress the kernel's numerical
+    /// rank at a fixed length scale — the exact regime of #1731.
+    fn center_grid(k: usize) -> Array2<f64> {
+        let side = (k as f64).sqrt().ceil() as usize;
+        let mut pts = Vec::with_capacity(k);
+        let lo = -2.5_f64;
+        let hi = 2.5_f64;
+        'outer: for i in 0..side {
+            for j in 0..side {
+                if pts.len() == k {
+                    break 'outer;
+                }
+                let fx = if side <= 1 {
+                    0.5
+                } else {
+                    i as f64 / (side - 1) as f64
+                };
+                let fy = if side <= 1 {
+                    0.5
+                } else {
+                    j as f64 / (side - 1) as f64
+                };
+                pts.push([lo + fx * (hi - lo), lo + fy * (hi - lo)]);
+            }
+        }
+        let mut out = Array2::<f64>::zeros((pts.len(), 2));
+        for (r, p) in pts.iter().enumerate() {
+            out[[r, 0]] = p[0];
+            out[[r, 1]] = p[1];
+        }
+        out
+    }
+
+    /// Centers surviving `matern_rank_reduce_centers` for a dense `k`-center
+    /// grid over the data cloud `data`, evaluated at `length_scale`. This is the
+    /// realized basis width before identifiability (the column count the design
+    /// carries), so it is the quantity #1731 reports as "basis_cols".
+    fn surviving_centers(data: ArrayView2<'_, f64>, k: usize, length_scale: f64) -> usize {
+        let centers = center_grid(k);
+        matern_rank_reduce_centers(data, &centers, length_scale, MaternNu::FiveHalves, None)
+            .map(|reduced| reduced.nrows())
+            .expect("rank reduce succeeds")
+    }
+
+    /// Regression for #1731: requesting more Matérn centers must realize more
+    /// (numerically independent) basis columns.
+    ///
+    /// At a FIXED length scale the realized basis saturates in numerical rank and
+    /// then *decreases* as `k` grows (the centers pack denser than the kernel can
+    /// resolve, so `matern_rank_reduce_centers` drops them) — `k` becomes a
+    /// no-op or even anti-helpful. The density-adaptive auto length scale
+    /// (`auto_initial_length_scale_for_centers`) shrinks with the center spacing,
+    /// so a richer `k` keeps producing more independent columns.
+    ///
+    /// This test FAILS before the fix (fixed-scale cap) and PASSES after
+    /// (density-adaptive seed grows monotonically with `k`).
+    #[test]
+    fn matern_basis_grows_with_requested_k() {
+        let n = 500;
+        let data = standardized_2d_cloud(n);
+        let ks = [20usize, 40, 60, 100, 150];
+
+        // Fixed-length-scale baseline (the bug): a scale several times the
+        // standardized data extent — the over-smoothed regime #1731 describes. At
+        // this fixed scale the realized basis SATURATES in numerical rank and
+        // then DECREASES as k grows (k becomes a no-op / anti-helpful).
+        let fixed_ls = 40.0;
+        let fixed: Vec<usize> = ks
+            .iter()
+            .map(|&k| surviving_centers(data.view(), k, fixed_ls))
+            .collect();
+
+        // Sanity: the fixed scale really does exhibit the bug on this cloud —
+        // the realized basis caps well below the requested k (so a test that
+        // relied on the fixed scale would FAIL the "grows with k" contract
+        // below). This is the pre-fix behavior the density-adaptive seed fixes.
+        let fixed_last_dbg = *fixed.last().unwrap();
+        assert!(
+            fixed_last_dbg < *ks.last().unwrap(),
+            "expected the FIXED length scale to cap the basis below k (the #1731 bug); \
+             got fixed={fixed:?} for ks={ks:?}"
+        );
+
+        // Density-adaptive auto length scale: this is the fix. It is derived from
+        // the center grid's own range/density, exactly as `matern(.., k=K)` now
+        // seeds the kernel through the planner's auto-init.
+        let adaptive: Vec<usize> = ks
+            .iter()
+            .map(|&k| {
+                let centers = center_grid(k);
+                let ls = crate::smooth::auto_initial_length_scale_for_centers(
+                    centers.view(),
+                    &[0, 1],
+                    k,
+                );
+                surviving_centers(data.view(), k, ls)
+            })
+            .collect();
+
+        eprintln!(
+            "MATERN_BASIS_COLS ks={ks:?} FIXED_LS={fixed_ls} fixed={fixed:?} adaptive={adaptive:?}"
+        );
+
+        // The discriminating contract: the adaptive basis grows monotonically.
+        for w in adaptive.windows(2) {
+            assert!(
+                w[1] >= w[0],
+                "adaptive Matérn basis must not shrink as k grows: {ks:?} -> {adaptive:?}"
+            );
+        }
+
+        // Each adaptive width must reach ≥ 0.9·min(k, n_limit): up to the data
+        // cloud's own support the density-adaptive seed realizes nearly the full
+        // requested center count instead of the fixed-scale cap.
+        for (&k, &c) in ks.iter().zip(adaptive.iter()) {
+            let ceiling = k.min(n);
+            let target = (ceiling as f64 * 0.9).floor() as usize;
+            assert!(
+                c >= target,
+                "adaptive Matérn basis for k={k} realized only {c} centers, expected ≥ {target} \
+                 (adaptive={adaptive:?} for ks={ks:?})"
+            );
+        }
+
+        // The fix must strictly beat the fixed-scale cap in the over-specified
+        // band. At k=150 the fixed scale has saturated/decreased well below k,
+        // while the adaptive scale keeps (nearly) all requested centers.
+        let k_last = *ks.last().unwrap();
+        let fixed_last = *fixed.last().unwrap();
+        let adaptive_last = *adaptive.last().unwrap();
+        assert!(
+            adaptive_last > fixed_last,
+            "density-adaptive seed must realize MORE centers than the fixed-scale cap at \
+             k={k_last}: fixed={fixed_last} adaptive={adaptive_last}"
+        );
+    }
+}

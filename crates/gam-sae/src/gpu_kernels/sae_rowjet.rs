@@ -348,6 +348,102 @@ pub fn sae_row_jets_softmax(
     sae_row_jets_cpu_softmax(rows, k, p, inv_tau)
 }
 
+/// Which path produced a [`SaeRowJetChannels`] result. Returned by the
+/// fail-loud entry point so a caller (and the parity tests) can ASSERT the
+/// device genuinely engaged instead of silently falling back to the CPU — the
+/// recurring #1026/#1551 failure mode where "GPU" code reports success while
+/// every row was actually contracted on the host (GPU 0%).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaeRowJetPath {
+    /// The NVRTC `sae_rowjet_softmax` kernel compiled and ran on the device.
+    Device,
+    /// The host `Order2<K>` jet ran (no Linux / no CUDA runtime / below the
+    /// `DEVICE_ROW_THRESHOLD` launch break-even).
+    Cpu,
+}
+
+/// Fail-loud, residency-aware entry point (the #1026 / #1551 charter gate).
+///
+/// Unlike [`sae_row_jets_softmax`], which silently swallows any device error
+/// and degrades to the CPU (correct for [`GpuMode::Auto`], but it leaves the
+/// caller unable to tell the device from a host fallback), this honours the
+/// process-wide [`GpuMode`] residency contract:
+///
+/// * [`GpuMode::Required`] — the device MUST run. No CUDA runtime, an NVRTC
+///   compile failure on this arch, a launch fault, or a batch below the launch
+///   break-even all return `Err(GpuError)` instead of quietly running on the
+///   CPU. This is what makes the GPU path *provable*: a `Required` caller that
+///   gets `Ok` knows the kernel ran on the device.
+/// * [`GpuMode::Auto`] — opportunistic: use the device when admitted and the
+///   batch clears the break-even, else fall back to the CPU. Returns
+///   `Ok((channels, SaeRowJetPath::Cpu))` on fallback (never `Err`), preserving
+///   [`sae_row_jets_softmax`]'s behaviour while still reporting which path ran.
+/// * [`GpuMode::Off`] — always the CPU; returns `Ok((_, Cpu))`.
+///
+/// Both paths run the SAME unified [`Order2<K>`] jet, so when the device runs
+/// its channels match the CPU oracle to round-off (proven ≤1e-9; the parity
+/// tests assert it on this box's real V100).
+///
+/// # Errors
+/// Returns [`GpuError`] when [`GpuMode::Required`] is set but the device path
+/// cannot run (no runtime, NVRTC/arch failure, launch fault, or a batch below
+/// [`DEVICE_ROW_THRESHOLD`]).
+pub fn sae_row_jets_softmax_required(
+    rows: &[SaeSoftmaxRowInputs],
+    k: usize,
+    p: usize,
+    inv_tau: f64,
+    mode: gam_gpu::GpuMode,
+) -> Result<(SaeRowJetChannels, SaeRowJetPath), gam_gpu::GpuError> {
+    use gam_gpu::GpuMode;
+
+    if mode == GpuMode::Off {
+        return Ok((
+            sae_row_jets_cpu_softmax(rows, k, p, inv_tau),
+            SaeRowJetPath::Cpu,
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let below_breakeven = rows.len() < DEVICE_ROW_THRESHOLD;
+        if mode == GpuMode::Required && below_breakeven {
+            return Err(gam_gpu::gpu_err!(
+                "sae_rowjet GpuMode::Required: batch of {} rows is below the device \
+                 launch break-even (DEVICE_ROW_THRESHOLD={DEVICE_ROW_THRESHOLD}); \
+                 refusing to silently run on the CPU",
+                rows.len()
+            ));
+        }
+        if !below_breakeven {
+            match device::sae_row_jets_softmax_device(rows, k, p, inv_tau) {
+                Ok(out) => return Ok((out, SaeRowJetPath::Device)),
+                Err(err) => {
+                    if mode == GpuMode::Required {
+                        // Fail loud: do NOT degrade to the CPU under Required.
+                        return Err(err);
+                    }
+                    // Auto: fall through to the CPU (accelerator, not oracle).
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        if mode == GpuMode::Required {
+            return Err(gam_gpu::gpu_err!(
+                "sae_rowjet GpuMode::Required: no CUDA device on a non-Linux host"
+            ));
+        }
+    }
+
+    Ok((
+        sae_row_jets_cpu_softmax(rows, k, p, inv_tau),
+        SaeRowJetPath::Cpu,
+    ))
+}
+
 /// Contract the per-row reconstruction jet channels into the Gauss-Newton data
 /// curvature the arrow-Schur logdet consumer factorises:
 /// `H_tt[a][b] = Σ_c first[a][c]·first[b][c]` (the `⟨J_a, J_b⟩` block #932
@@ -417,7 +513,14 @@ mod device {
             }
         }
         let src = softmax_kernel_source(k, p);
-        let ptx = cudarc::nvrtc::compile_ptx(&src)
+        // Compile through the shared arch+fmad options (NOT bare `compile_ptx`).
+        // #1686 set `--fmad=false` there so this softmax seeded-jet tower is
+        // FMA-free and bit-comparable to the separately-rounded CPU oracle
+        // `sae_row_jets_cpu_softmax`; bare `compile_ptx` leaves NVRTC at
+        // `--fmad=true` (fuses `a*b+c` into one rounding) and omits the #1551
+        // `--gpu-architecture` pin. Same parity-correctness fix #1686 applied to
+        // survival_rowjet; this is the SAE sibling of that derivative tower.
+        let ptx = gam_gpu::device_cache::compile_ptx_arch(&src)
             .gpu_ctx_with(|err| format!("sae_rowjet NVRTC compile (K={k}, P={p}): {err}"))?;
         let module = b.ctx.load_module(ptx).gpu_ctx("sae_rowjet module load")?;
         if let Ok(mut guard) = b.modules.lock() {
@@ -640,16 +743,39 @@ mod tests {
         let rows = fixture(DEVICE_ROW_THRESHOLD + 64, k, p);
         let cpu = sae_row_jets_cpu_softmax(&rows, k, p, inv_tau);
         let got = sae_row_jets_softmax(&rows, k, p, inv_tau);
-        let mut maxabs = 0.0_f64;
-        for (x, y) in cpu.first.iter().zip(&got.first) {
-            maxabs = maxabs.max((x - y).abs());
-        }
-        for (x, y) in cpu.second.iter().zip(&got.second) {
-            maxabs = maxabs.max((x - y).abs());
-        }
+        let max_diff = |a: &SaeRowJetChannels, b: &SaeRowJetChannels| {
+            let mut m = 0.0_f64;
+            for (x, y) in a.first.iter().zip(&b.first) {
+                m = m.max((x - y).abs());
+            }
+            for (x, y) in a.second.iter().zip(&b.second) {
+                m = m.max((x - y).abs());
+            }
+            m
+        };
+        let maxabs = max_diff(&cpu, &got);
         assert!(
             maxabs <= 1e-9,
             "device vs CPU row-jet max abs diff {maxabs} > 1e-9"
         );
+
+        // ANTI-FALSE-GREEN (#415/#1175): the assert above passes trivially as
+        // CPU==CPU when no GPU is present — a dead/declined kernel would never
+        // be caught. So when a runtime IS admitted, call the device entry
+        // DIRECTLY (no silent fall-through to CPU) and require it to actually
+        // run and match the oracle. With #1686's --fmad=false now applied to
+        // this kernel (it compiles through `compile_ptx_arch`), the measured
+        // device-vs-CPU drift on a V100 is ~1.7e-16 — the FMA-free softmax
+        // seeded-jet is round-off-floor tight, far inside the 1e-9 gate.
+        if gam_gpu::device_runtime::GpuRuntime::global().is_some() {
+            let dev = device::sae_row_jets_softmax_device(&rows, k, p, inv_tau)
+                .expect("admitted GPU runtime must run the sae_rowjet device kernel, not fall back");
+            let dev_diff = max_diff(&cpu, &dev);
+            assert!(
+                dev_diff <= 1e-9,
+                "device-only sae row-jet vs CPU max abs diff {dev_diff} > 1e-9 \
+                 (kernel ran but drifted — check the softmax jet recurrence)"
+            );
+        }
     }
 }

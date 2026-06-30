@@ -31,6 +31,7 @@ import numpy as np
 import pandas as pd
 
 import gamfit
+from gamfit._survival import DENSE_SURVIVAL_AUTO_CHUNK_CELLS
 
 
 def _make_dataset() -> pd.DataFrame:
@@ -109,4 +110,80 @@ def test_survival_at_consistent_with_cumulative_hazard_beyond_support(
     assert abs(survival[1] - survival[2]) < 1e-4, (
         f"[{likelihood}] survival jumps at the grid edge: "
         f"S(t_max)={survival[1]:.6f} -> S(t_max+eps)={survival[2]:.6f}"
+    )
+
+
+def test_survival_at_consistent_beyond_support_on_dense_chunk_path() -> None:
+    """Same identity, but forced through the dense auto-chunk FFI kernel.
+
+    ``cumulative_hazard_at`` / ``survival_at`` interpolate through one of two
+    code paths chosen purely by query size: the in-process ``_interpolate_rows``
+    helper for small queries, and the chunked Rust kernel
+    ``survival_chunk_iter_collect`` once ``n_rows * n_times`` crosses
+    ``DENSE_SURVIVAL_AUTO_CHUNK_CELLS`` (1M cells). The original #1595 fix only
+    corrected the Python extrapolation policy and the small-query path; the
+    dense kernel kept a *hardcoded* ``S(t->inf)=0`` while cumulative hazard
+    flat-clamped, so the very same ``S(t)=exp(-H(t))`` identity silently broke
+    again for large queries -- and no regression test crossed the threshold to
+    catch it. This test deliberately sizes the query past the threshold so the
+    dense kernel is exercised.
+    """
+    df = _make_dataset()
+    model = gamfit.fit(df, "Surv(entry, exit, event) ~ age", survival_likelihood="weibull")
+
+    # Pick a row count and time count whose product clears the 1M-cell dense
+    # auto-chunk threshold so the chunked Rust kernel (not _interpolate_rows) is
+    # the path under test. ~3000 people x ~350 times = ~1.05M cells.
+    n_people = 3000
+    rng = np.random.default_rng(7)
+    predict_df = pd.DataFrame(
+        {
+            "entry": np.zeros(n_people),
+            "exit": np.full(n_people, 5.0),
+            "event": np.ones(n_people, dtype=int),
+            "age": rng.uniform(40.0, 75.0, n_people),
+        }
+    )
+    pred = model.predict(predict_df)
+
+    t_max = float(np.asarray(pred.times).max())
+    assert t_max > 12.0, f"unexpectedly small fitted grid: t_max={t_max}"
+
+    # Straddle below / at / just past / well past t_max, then pad with in-grid
+    # query times so the total cell count crosses the dense threshold.
+    straddle = np.array([0.5 * t_max, t_max, t_max + 1e-3, t_max + 5.0, t_max + 20.0])
+    n_times = (DENSE_SURVIVAL_AUTO_CHUNK_CELLS // n_people) + 50
+    n_pad = max(0, n_times - straddle.size)
+    pad = np.linspace(1e-3, t_max - 1e-3, n_pad)
+    ts = np.concatenate([straddle, pad])
+
+    assert n_people * ts.size > DENSE_SURVIVAL_AUTO_CHUNK_CELLS, (
+        "test misconfigured: query does not cross the dense auto-chunk threshold "
+        f"({n_people} x {ts.size} = {n_people * ts.size} <= "
+        f"{DENSE_SURVIVAL_AUTO_CHUNK_CELLS})"
+    )
+
+    survival = np.asarray(pred.survival_at(ts))
+    cum_haz = np.asarray(pred.cumulative_hazard_at(ts))
+    survival_from_haz = np.exp(-cum_haz)
+
+    # Identity over the WHOLE dense surface (every person, every time).
+    max_gap = float(np.max(np.abs(survival - survival_from_haz)))
+    assert max_gap < 1e-4, (
+        f"dense chunk path violates S(t)=exp(-H(t)): max gap = {max_gap:.6f}"
+    )
+
+    # Focus the asymptote assertions on the straddle columns (indices 0..4).
+    past_grid = straddle > t_max
+    s_straddle = survival[:, : straddle.size]
+    h_straddle = cum_haz[:, : straddle.size]
+    assert np.all(np.isfinite(h_straddle[:, past_grid])), (
+        "dense path: cumulative hazard went non-finite past the grid"
+    )
+    assert np.all(s_straddle[:, past_grid] > 1e-6), (
+        "dense path: survival collapsed to ~0 past the grid while H stayed finite"
+    )
+    # No jump at the grid edge: S(t_max) ~= S(t_max + eps) for every row.
+    assert np.max(np.abs(s_straddle[:, 1] - s_straddle[:, 2])) < 1e-4, (
+        "dense path: survival jumps at the grid edge"
     )

@@ -6,7 +6,7 @@
 //! objective contract.
 
 use super::tests::{
-    TestPeriodicEvaluator, diagonal_latent_cache, periodic_basis,
+    TestPeriodicEvaluator, diagonal_latent_cache, periodic_basis, warmstart_test_objective,
     warmstart_test_objective_with_evaluator,
 };
 use super::*;
@@ -61,18 +61,111 @@ pub(crate) fn euclidean_line_contract_fixture() -> (SaeManifoldTerm, Array2<f64>
     (term, z, rho)
 }
 
-pub(crate) fn assert_contract_close(label: &str, analytic: f64, finite_difference: f64) {
-    let rel = (analytic - finite_difference).abs()
-        / finite_difference.abs().max(analytic.abs()).max(1.0e-12);
+/// Compare an analytic derivative against a centered finite difference with a
+/// combined relative + absolute tolerance.
+///
+/// A centered FD `(f₊ − f₋)/(2h)` is the difference of two nearly-equal values
+/// divided by the small `2h`, so its **roundoff floor** is `≈ ε·|f|/h`,
+/// independent of how small the true derivative is. At a near-stationary
+/// coordinate (gradient `≈ 1e-6` on an objective of magnitude `≈ 1e2`, `h=1e-6`)
+/// that floor is `≈ 1e-8`, i.e. `~0.1%` of the derivative — so a relative-only
+/// `1e-5` gate cannot be met by FD however correct the analytic value is. The
+/// `fd_roundoff_floor` (computed by the caller from the actual `|f₊|`, `|f₋|`
+/// and `h`) admits exactly that unavoidable cancellation error and nothing more;
+/// for derivatives well above the floor the gate stays the strict `1e-5`
+/// relative contract.
+pub(crate) fn assert_contract_close_with_floor(
+    label: &str,
+    analytic: f64,
+    finite_difference: f64,
+    fd_roundoff_floor: f64,
+) {
+    let abs_diff = (analytic - finite_difference).abs();
+    let scale = finite_difference.abs().max(analytic.abs());
+    let tol = 1.0e-5 * scale + fd_roundoff_floor;
+    let rel = abs_diff / scale.max(1.0e-12);
     assert!(
-        rel < 1.0e-5,
-        "{label}: analytic={analytic:.12e} fd={finite_difference:.12e} rel={rel:.3e}"
+        abs_diff <= tol,
+        "{label}: analytic={analytic:.12e} fd={finite_difference:.12e} \
+         rel={rel:.3e} abs_diff={abs_diff:.3e} tol={tol:.3e} \
+         (fd_roundoff_floor={fd_roundoff_floor:.3e})"
+    );
+}
+
+/// Roundoff floor of a centered finite difference `(f₊ − f₋)/(2h)`: the
+/// catastrophic-cancellation error `≈ ε·max(|f₊|,|f₋|)/(2h)`, scaled by a small
+/// safety constant. This is the largest absolute error the FD reference can
+/// carry purely from f64 rounding of the objective evaluations, so it is the
+/// correct absolute floor for the contract comparison at near-stationary points.
+pub(crate) fn fd_roundoff_floor(f_plus: f64, f_minus: f64, h: f64) -> f64 {
+    const SAFETY: f64 = 16.0;
+    SAFETY * f64::EPSILON * f_plus.abs().max(f_minus.abs()) / (2.0 * h)
+}
+
+/// Verify the analytic decoder gradient block `sys.gb` matches a centered FD of
+/// the penalized objective for one `(basis_col, out_col)` coefficient, with the
+/// roundoff-floor-aware tolerance. Factored out so the contract can be pinned on
+/// BOTH the full width-3 monomial design (pre-fit) and the rank-reduced design
+/// the joint solve collapses to (post-fit), which travel through different jet
+/// paths (`EuclideanPatchEvaluator` vs `SubspaceReducedEvaluator`).
+fn assert_decoder_gradient_matches_fd(
+    term: &mut SaeManifoldTerm,
+    z: &Array2<f64>,
+    rho: &SaeManifoldRho,
+    basis_col: usize,
+    out_col: usize,
+    p: usize,
+    h: f64,
+) {
+    let sys = term
+        .assemble_arrow_schur(z.view(), rho, None)
+        .expect("decoder assemble");
+    assert_eq!(sys.k, term.beta_dim());
+    let beta_idx = basis_col * p + out_col;
+    let analytic = sys.gb[beta_idx];
+    let base = term.atoms[0].decoder_coefficients[[basis_col, out_col]];
+
+    term.atoms[0].decoder_coefficients[[basis_col, out_col]] = base + h;
+    let f_plus = term
+        .penalized_objective_total(z.view(), rho, None, 1.0)
+        .expect("decoder f+");
+    term.atoms[0].decoder_coefficients[[basis_col, out_col]] = base - h;
+    let f_minus = term
+        .penalized_objective_total(z.view(), rho, None, 1.0)
+        .expect("decoder f-");
+    term.atoms[0].decoder_coefficients[[basis_col, out_col]] = base;
+
+    let fd = (f_plus - f_minus) / (2.0 * h);
+    assert_contract_close_with_floor(
+        &format!("CONTRACT decoder ({basis_col},{out_col})"),
+        analytic,
+        fd,
+        fd_roundoff_floor(f_plus, f_minus, h),
     );
 }
 
 #[test]
 pub(crate) fn euclidean_line_decoder_gradient_matches_penalized_objective_fd() {
     let (mut term, z, mut rho) = euclidean_line_contract_fixture();
+    let p = term.output_dim();
+    let h = 1.0e-6;
+
+    // (A) The genuine DEGREE-2 decoder-gradient contract, on the full width-3
+    // `[1, t, t²]` monomial design BEFORE the joint solve runs. The fixture is
+    // near-linear, so once the inner solve drives the latent `t` into a narrow
+    // range the rank-revealing reduction (`reduce_atoms_to_data_supported_rank`,
+    // #1117) legitimately collapses this basis to its data-supported rank — but
+    // at the seed the t² column is still present, so this is where the degree-2
+    // `∂/∂B` contract through `EuclideanPatchEvaluator`'s jets is exercised.
+    assert_eq!(
+        term.atoms[0].basis_size(),
+        3,
+        "the degree-2 euclidean fixture must seed a width-3 [1,t,t²] basis"
+    );
+    for (basis_col, out_col) in [(0usize, 0usize), (1, 3), (2, 7)] {
+        assert_decoder_gradient_matches_fd(&mut term, &z, &rho, basis_col, out_col, p, h);
+    }
+
     let ridge = 1.0e-6;
     for step in 0..6 {
         let loss = term
@@ -130,35 +223,33 @@ pub(crate) fn euclidean_line_decoder_gradient_matches_penalized_objective_fd() {
             .expect("restore refresh");
 
         let fd = (f_plus - f_minus) / (2.0 * h);
-        assert_contract_close(&format!("CONTRACT coord row {row}"), analytic, fd);
-    }
-
-    let sys_decoder = term
-        .assemble_arrow_schur(z.view(), &rho, None)
-        .expect("decoder assemble");
-    assert_eq!(sys_decoder.k, term.beta_dim());
-    let p = term.output_dim();
-    for (basis_col, out_col) in [(0usize, 0usize), (1, 3), (2, 7)] {
-        let beta_idx = basis_col * p + out_col;
-        let analytic = sys_decoder.gb[beta_idx];
-        let base = term.atoms[0].decoder_coefficients[[basis_col, out_col]];
-
-        term.atoms[0].decoder_coefficients[[basis_col, out_col]] = base + h;
-        let f_plus = term
-            .penalized_objective_total(z.view(), &rho, None, 1.0)
-            .expect("decoder f+");
-        term.atoms[0].decoder_coefficients[[basis_col, out_col]] = base - h;
-        let f_minus = term
-            .penalized_objective_total(z.view(), &rho, None, 1.0)
-            .expect("decoder f-");
-        term.atoms[0].decoder_coefficients[[basis_col, out_col]] = base;
-
-        let fd = (f_plus - f_minus) / (2.0 * h);
-        assert_contract_close(
-            &format!("CONTRACT decoder ({basis_col},{out_col})"),
+        assert_contract_close_with_floor(
+            &format!("CONTRACT coord row {row}"),
             analytic,
             fd,
+            fd_roundoff_floor(f_plus, f_minus, h),
         );
+    }
+
+    // (B) The post-fit decoder-gradient contract on the ACTUAL fitted basis.
+    // On this near-linear fixture the rank-revealing reduction (#1117) collapses
+    // the width-3 `[1, t, t²]` design to its data-supported rank once the joint
+    // solve narrows the latent `t` range — so the decoder coefficients now live
+    // on the reduced subspace and the jets travel through the
+    // `SubspaceReducedEvaluator`. We pin the same `∂/∂B`↔FD contract over the
+    // REDUCED width (`basis_size()` after the fit), not the stale width-3 layout:
+    // the gradient block must remain correct through the reduced-jet path.
+    let fitted_m = term.atoms[0].basis_size();
+    assert!(
+        fitted_m >= 1 && fitted_m <= 3,
+        "fitted euclidean basis width must be in [1,3]; got {fitted_m}"
+    );
+    // Exercise every retained basis column against a representative output channel
+    // spread (first / middle / last), clamped to the fitted width.
+    for basis_col in 0..fitted_m {
+        for &out_col in &[0usize, p / 2, p - 1] {
+            assert_decoder_gradient_matches_fd(&mut term, &z, &rho, basis_col, out_col, p, h);
+        }
     }
 }
 
@@ -439,6 +530,214 @@ fn circle_phase_gap(a: f64, b: f64) -> f64 {
     let raw = (a - b).abs();
     raw.min((raw - raw.floor()).abs())
         .min((1.0 - raw.fract()).abs())
+}
+
+/// #795 — the SAE-assembled isometry Gauss-Newton curvature must be
+/// decoder-scale-invariant, matching its already-scale-free gradient.
+///
+/// The isometry value/gradient penalize the SCALE-INVARIANT normalized residual
+/// `R_n = g_n/gbar − g^ref_n`, so they are free of the decoder magnitude `‖B‖`.
+/// But the arrow-Schur curvature blocks (`htt`/`htbeta`/`hbb`) are built from
+/// the RAW weighted Jacobian `wj ∝ ‖B‖`, i.e. the Gauss-Newton block of the
+/// UN-normalized `½μ‖g_n − g^ref‖²`, which scales ∝‖B‖⁴. Pairing a scale-free
+/// gradient with a ‖B‖⁴ curvature collapses the joint Newton step as the decoder
+/// grows and the proximal ridge saturates at 1e15 — the #795 failure. The fix
+/// folds the frozen-normalizer factor `1/gbar²` into the curvature so it is the
+/// GN block of the normalized residual; `1/gbar² ∝ ‖B‖⁻⁴` cancels the raw `‖B‖⁴`.
+///
+/// This pins the cancellation directly on the production assembly: scaling the
+/// decoder (hence the target, so the well-fit residual is unchanged) by λ leaves
+/// the ISOLATED isometry curvature contribution `htt(with) − htt(without)`
+/// invariant, while WITHOUT the fix it would scale ∝λ⁴ (≈10⁴× at λ=10).
+#[test]
+fn sae_isometry_assembled_curvature_is_decoder_scale_invariant() {
+    use gam_terms::analytic_penalties::{
+        AnalyticPenaltyKind, AnalyticPenaltyRegistry, IsometryPenalty, PsiSlice,
+    };
+    let n = 24usize;
+    let p = 4usize;
+    let coords = Array2::from_shape_fn((n, 1), |(row, _)| (row as f64 + 0.5) / n as f64);
+    let (phi, jet) = periodic_basis(&coords);
+    let m = phi.ncols();
+    let base_decoder = Array2::from_shape_fn((m, p), |(b, c)| {
+        let scale = 1.0 / (1.0 + b as f64);
+        scale * ((b as f64 + 1.0) * (c as f64 + 1.0)).cos()
+    });
+
+    let isometry_curvature_norm = |lambda: f64| -> f64 {
+        let decoder = &base_decoder * lambda;
+        let atom = SaeManifoldAtom::new(
+            "iso_scale",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi.clone(),
+            jet.clone(),
+            decoder.clone(),
+            Array2::<f64>::eye(m),
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+        // Target is the exact decoded curve at this scale, so the well-fit
+        // residual (and thus the data-fit curvature) is the same shape at every
+        // λ — only the isometry block carries the scale dependence we probe.
+        let target = phi.dot(&decoder);
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((n, 1)),
+            vec![coords.clone()],
+            vec![LatentManifold::Circle { period: 1.0 }],
+            AssignmentMode::softmax(1.0),
+        )
+        .unwrap();
+        let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+
+        let mut registry = AnalyticPenaltyRegistry::new();
+        registry.push(AnalyticPenaltyKind::Isometry(Arc::new(
+            IsometryPenalty::new_euclidean(PsiSlice::full(n, Some(1)), 1),
+        )));
+        let rho = SaeManifoldRho::new(0.0, 0.8_f64.ln(), vec![array![1.0_f64.ln()]]);
+
+        // Isolate the isometry contribution to the coordinate curvature: the
+        // data-fit `htt` legitimately grows with the target scale, so we
+        // difference assemble-with-isometry against assemble-without.
+        let sys = term
+            .assemble_arrow_schur(target.view(), &rho, Some(&registry))
+            .expect("assemble with isometry succeeds");
+        let bare = term
+            .assemble_arrow_schur(target.view(), &rho, None)
+            .expect("bare assemble succeeds");
+        let mut htt_iso = 0.0_f64;
+        for (r, b) in sys.rows.iter().zip(bare.rows.iter()) {
+            for (v, bv) in r.htt.iter().zip(b.htt.iter()) {
+                htt_iso += (v - bv) * (v - bv);
+            }
+        }
+        htt_iso.sqrt()
+    };
+
+    let base = isometry_curvature_norm(1.0);
+    assert!(
+        base > 1.0,
+        "the planted-circle fixture must produce a non-trivial isometry \
+         curvature block to make the scale test meaningful; got {base:.3e}"
+    );
+    for &lambda in &[3.0_f64, 10.0, 50.0] {
+        let scaled = isometry_curvature_norm(lambda);
+        let rel = (scaled - base).abs() / base;
+        assert!(
+            rel < 1.0e-6,
+            "SAE-assembled isometry curvature must be decoder-scale-invariant \
+             (#795): λ=1 → {base:.6e}, λ={lambda} → {scaled:.6e} (rel diff {rel:.3e}). \
+             A λ-dependent block is the un-normalized ‖B‖⁴ Gauss-Newton curvature \
+             whose mismatch with the scale-free gradient saturates the proximal \
+             ridge at 1e15."
+        );
+    }
+}
+
+/// #795 — the end-to-end joint `(t, β)` fit with the isometry gauge ENABLED must
+/// CONVERGE at every decoder scale, not just hold the scale-invariance property of
+/// a single assembled step.
+///
+/// This is the user-visible symptom the issue reports: with the un-normalized
+/// ‖B‖⁴ curvature, a large planted decoder makes the isometry Gauss-Newton block
+/// dominate the well-conditioned data-fit block by orders of magnitude, the
+/// arrow-Schur row blocks lose positive-definiteness, and the proximal ridge
+/// escalates to its 1e15 saturation without ever taking a productive Newton step —
+/// the fit stalls far from stationarity. With the `1/gbar²` fold the isometry
+/// block tracks the (scale-free) gradient, so the same handful of full-Newton
+/// steps reach the planted circle at λ=1 AND at λ=25. We assert a finite converged
+/// loss and a SCALE-INVARIANT reconstruction error (the fit recovers the same
+/// circle regardless of decoder magnitude) across scales.
+#[test]
+fn sae_isometry_joint_fit_converges_across_decoder_scales() {
+    use gam_terms::analytic_penalties::{
+        AnalyticPenaltyKind, AnalyticPenaltyRegistry, IsometryPenalty, PsiSlice,
+    };
+    let n = 24usize;
+    let p = 4usize;
+    let coords = Array2::from_shape_fn((n, 1), |(row, _)| (row as f64 + 0.5) / n as f64);
+    let (phi, jet) = periodic_basis(&coords);
+    let m = phi.ncols();
+    let base_decoder = Array2::from_shape_fn((m, p), |(b, c)| {
+        let scale = 1.0 / (1.0 + b as f64);
+        scale * ((b as f64 + 1.0) * (c as f64 + 1.0)).cos()
+    });
+
+    // Returns the converged relative reconstruction error ‖Φ(t̂)·B̂ − target‖/‖target‖
+    // for a joint fit run with the isometry gauge ON at the given decoder scale.
+    let converged_recon_rel = |lambda: f64| -> f64 {
+        let decoder = &base_decoder * lambda;
+        let atom = SaeManifoldAtom::new(
+            "iso_converge",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi.clone(),
+            jet.clone(),
+            decoder.clone(),
+            Array2::<f64>::eye(m),
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+        let target = phi.dot(&decoder);
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((n, 1)),
+            vec![coords.clone()],
+            vec![LatentManifold::Circle { period: 1.0 }],
+            AssignmentMode::softmax(1.0),
+        )
+        .unwrap();
+        let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+
+        let mut registry = AnalyticPenaltyRegistry::new();
+        registry.push(AnalyticPenaltyKind::Isometry(Arc::new(
+            IsometryPenalty::new_euclidean(PsiSlice::full(n, Some(1)), 1),
+        )));
+        let mut rho = SaeManifoldRho::new(0.0, 0.8_f64.ln(), vec![array![1.0_f64.ln()]]);
+
+        let loss = term
+            .run_joint_fit_arrow_schur(
+                target.view(),
+                &mut rho,
+                Some(&registry),
+                12,
+                1.0,
+                1.0e-4,
+                1.0e-4,
+            )
+            .expect("joint fit with isometry gauge ON must converge at every decoder scale");
+        assert!(
+            loss.total().is_finite(),
+            "converged loss must be finite at λ={lambda}, got {}",
+            loss.total()
+        );
+
+        let recon = term.try_fitted_for_rho(&rho).expect("fitted reconstruction exists");
+        let mut num = 0.0_f64;
+        let mut den = 0.0_f64;
+        for (r, t) in recon.iter().zip(target.iter()) {
+            num += (r - t) * (r - t);
+            den += t * t;
+        }
+        (num / den).sqrt()
+    };
+
+    let base = converged_recon_rel(1.0);
+    assert!(
+        base < 1.0e-3,
+        "the joint fit must recover the planted circle at unit scale; rel recon {base:.3e}"
+    );
+    // The un-normalized curvature would make the larger-decoder fits stall (the
+    // ridge saturates and the recon error stays O(1)); the fix keeps the recovered
+    // circle scale-invariant.
+    for &lambda in &[5.0_f64, 25.0] {
+        let scaled = converged_recon_rel(lambda);
+        assert!(
+            scaled < 1.0e-3,
+            "joint fit with isometry ON must converge to the planted circle at \
+             λ={lambda} (rel recon {scaled:.3e}); a non-converging fit is the #795 \
+             ridge-saturation symptom of the un-normalized ‖B‖⁴ curvature."
+        );
+    }
 }
 
 /// #1206 — the gradient lane's `(cost, gradient)` pair must be SELF-CONSISTENT
@@ -1513,4 +1812,53 @@ fn robust_norm_row_weights_rebalances_heavy_tailed_objective() {
     let flat = Array2::<f64>::from_elem((4, p), 2.0);
     let wf = SaeManifoldTerm::robust_norm_row_weights(flat.view(), 1.0).unwrap();
     assert!(wf.iter().all(|&x| (x - 1.0).abs() < 1e-12), "flat norms → uniform weights");
+}
+
+/// Driver-level freeze invariant (#850). The outer-objective test
+/// `seed_inner_state_installs_and_reuses_matching_beta` exercises the freeze
+/// through `OuterObjective::eval`; this one pins it at the exact seam where the
+/// bug lived: `run_joint_fit_arrow_schur` itself.
+///
+/// At `max_iter == 0` the joint solve is a verbatim FREEZE of the warm-started
+/// `(t, β)` — it must run no β-mutating stage. The regression was that the
+/// driver still ran the entry-stage re-seed guards and the #1026 post-loop
+/// decoder-LSQ polish, which refit β to the unpenalised least-squares argmin
+/// and committed it. We seed a β deliberately OFF that argmin (the pristine
+/// decoder differs from the data-optimal one), run a zero-iteration joint fit,
+/// and assert β is byte-for-byte unchanged. Before the fix the polish moved it.
+#[test]
+pub(crate) fn run_joint_fit_max_iter_zero_freezes_beta_verbatim() {
+    let mut term = warmstart_test_objective().term;
+    let dim = term.beta_dim();
+    // A distinctive seed that differs from the term's pristine decoder, so the
+    // unpenalised LSQ polish (had it run) would have a strict decrease to chase.
+    let pristine = term.flatten_beta();
+    let seed: Array1<f64> = Array1::from_shape_fn(dim, |i| pristine[i] + 0.5 + 0.01 * (i as f64));
+    assert!(
+        (&seed - &pristine).iter().any(|d| d.abs() > 1e-6),
+        "seed must differ from the pristine β for the freeze check to be meaningful"
+    );
+    term.set_flat_beta(seed.view())
+        .expect("length-matching β must install");
+
+    // Target matches `warmstart_test_objective`'s 4×1 signal.
+    let target = array![[0.20_f64], [-0.10], [0.30], [0.05]];
+    let mut rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)]);
+    // max_iter == 0 ⇒ verbatim freeze: no Newton step, no guard, no polish.
+    let loss = term
+        .run_joint_fit_arrow_schur(target.view(), &mut rho, None, 0, 1.0, 1.0e-6, 1.0e-6)
+        .expect("zero-iteration joint fit at the warm-started β must succeed");
+    assert!(
+        loss.total().is_finite(),
+        "frozen-state loss must be finite; got {}",
+        loss.total()
+    );
+
+    let frozen = term.flatten_beta();
+    for (i, (&f, &s)) in frozen.iter().zip(seed.iter()).enumerate() {
+        assert!(
+            (f - s).abs() < 1e-12,
+            "max_iter==0 must freeze β verbatim at coord {i}: frozen {f} != seed {s} (#850)"
+        );
+    }
 }

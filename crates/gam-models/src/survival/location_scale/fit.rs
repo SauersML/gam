@@ -101,6 +101,7 @@ pub(crate) fn fit_reduced_parametric_aft(
             outer_converged: true,
             geometry,
             precomputed_edf: None,
+            joint_log_lambdas: None,
         },
         &assembly_specs,
     )

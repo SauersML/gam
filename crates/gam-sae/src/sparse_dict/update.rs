@@ -15,8 +15,90 @@
 use super::codes::{SparseCode, solve_row_codes};
 use super::scoring::TileScorer;
 use super::{SparseDictConfig, SparseDictFit};
-use ndarray::{Array2, ArrayView2};
+use ndarray::{Array2, ArrayView2, Axis};
+use rayon::prelude::*;
 use std::collections::HashMap;
+
+/// Route + sparse-code every row of `x`, processing the rows in minibatches of
+/// `config.minibatch` so the peak score working set is `minibatch × score_tile`
+/// (never `N × K`). Within a minibatch the rows are routed by one batched GEMM
+/// per column tile ([`TileScorer::route_minibatch`]) and the per-row active-set
+/// code solves run in parallel. The returned `Vec<SparseCode>` is in global row
+/// order, identical to a serial row-at-a-time pass up to f32 GEMM rounding.
+fn route_and_code_all(
+    x: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
+    scorer: &TileScorer,
+    s: usize,
+    code_ridge: f32,
+    minibatch: usize,
+) -> Vec<SparseCode> {
+    let n = x.nrows();
+    let batch = minibatch.max(1);
+    let mut codes: Vec<SparseCode> = Vec::with_capacity(n);
+    let mut start = 0usize;
+    while start < n {
+        let end = (start + batch).min(n);
+        let block = x.slice(ndarray::s![start..end, ..]);
+        let active_lists = route_block(block, decoder, scorer);
+        // Per-row code solves are independent; fan them out over the minibatch.
+        let mut block_codes: Vec<SparseCode> = block
+            .axis_iter(Axis(0))
+            .into_par_iter()
+            .zip(active_lists.into_par_iter())
+            .map(|(row, active)| solve_row_codes(row, decoder, &active, s, code_ridge))
+            .collect();
+        codes.append(&mut block_codes);
+        start = end;
+    }
+    codes
+}
+
+/// Route one minibatch `block` (`B × P`) against `decoder` (`K × P`), returning
+/// each row's top-`s` `(atom, score)` shortlist.
+///
+/// The routing — the `N×K×P` scale-K hot loop the whole lane is built around —
+/// is GPU-offloaded when the process admits a device (Linux + CUDA runtime + a
+/// `B × K` block above the device break-even), auto-derived at runtime from
+/// [`gam_gpu::gpu_mode`] (the charter forbids gating behind a build feature). The
+/// device walks `K` in atom-column tiles so peak score memory stays `B × tile`,
+/// independent of `K` — the same no-`N×K` discipline as the CPU path. The score
+/// block is bit-identical to the CPU per-row `top_s_online` (the kernel forbids
+/// FMA contraction), so the GPU routing equals the row-at-a-time oracle exactly.
+///
+/// The universal fallback (non-Linux, [`gam_gpu::GpuMode::Off`], below
+/// break-even, or any device fault under [`gam_gpu::GpuMode::Auto`]) is the
+/// parallel CPU GEMM router [`TileScorer::route_minibatch`]. We pass
+/// [`gam_gpu::GpuMode::Auto`] — never `Required` — because a real fit must run on
+/// any box; the fit is robust to which router ran (it is minibatch-invariant, see
+/// [`TileScorer::route_minibatch`]).
+fn route_block(
+    block: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
+    scorer: &TileScorer,
+) -> Vec<Vec<(u32, f32)>> {
+    #[cfg(target_os = "linux")]
+    {
+        if gam_gpu::gpu_mode() != gam_gpu::GpuMode::Off {
+            // Auto: the router runs on the device when admitted and the block
+            // clears the break-even, else it returns the CPU path internally; we
+            // only adopt its result when the DEVICE actually produced it, and
+            // otherwise use the faster parallel CPU GEMM below.
+            if let Ok((routed, super::scoring_gpu::ScoreBlockPath::Device)) =
+                super::scoring_gpu::route_minibatch_required(
+                    block,
+                    decoder,
+                    scorer.active,
+                    scorer.tile,
+                    gam_gpu::GpuMode::Auto,
+                )
+            {
+                return routed;
+            }
+        }
+    }
+    scorer.route_minibatch(block, decoder)
+}
 
 pub(super) fn run(
     x: ArrayView2<'_, f32>,
@@ -32,7 +114,6 @@ pub(super) fn run(
     unit_norm_rows(&mut decoder);
 
     let scorer = TileScorer::new(s, config.score_tile);
-    let mut codes: Vec<SparseCode> = Vec::with_capacity(n);
     let mut prev_ev = f64::NEG_INFINITY;
     let mut converged = false;
     let mut epochs_run = 0usize;
@@ -40,18 +121,20 @@ pub(super) fn run(
     for epoch in 0..config.max_epochs {
         epochs_run = epoch + 1;
 
-        // (a)+(b) route + sparse codes for every row, in minibatches.
-        codes.clear();
-        for row in x.outer_iter() {
-            let active = scorer.route_row(row, decoder.view());
-            codes.push(solve_row_codes(
-                row,
-                decoder.view(),
-                &active,
-                s,
-                config.code_ridge,
-            ));
-        }
+        // (a)+(b) route + sparse codes for every row, in minibatches: each
+        // minibatch is routed by one batched score block per column tile (peak
+        // score working set `minibatch × score_tile`, never `N × K`) — on the GPU
+        // when the process admits a device and the block clears the break-even,
+        // else the parallel CPU GEMM — and its per-row active-set code solves run
+        // in parallel.
+        let codes = route_and_code_all(
+            x,
+            decoder.view(),
+            &scorer,
+            s,
+            config.code_ridge,
+            config.minibatch,
+        );
 
         // (c) decoder refresh from the sparse normal equations, streamed by
         // minibatch into the per-atom accumulators.
@@ -71,17 +154,14 @@ pub(super) fn run(
 
     // Re-route once against the final, unit-normed decoder so the stored codes
     // match the returned dictionary exactly.
-    codes.clear();
-    for row in x.outer_iter() {
-        let active = scorer.route_row(row, decoder.view());
-        codes.push(solve_row_codes(
-            row,
-            decoder.view(),
-            &active,
-            s,
-            config.code_ridge,
-        ));
-    }
+    let codes = route_and_code_all(
+        x,
+        decoder.view(),
+        &scorer,
+        s,
+        config.code_ridge,
+        config.minibatch,
+    );
     let final_ev = explained_variance(x, &codes, decoder.view());
 
     let (indices, code_mat) = pack_codes(&codes, n, s);

@@ -8,6 +8,14 @@ use super::*;
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Command,
+
+    /// Solver log verbosity: `off|error|warn|info|debug|trace`. Defaults to the
+    /// quiet `warn` level (#1688) — pass `--log-level info` to opt back into the
+    /// full per-iteration solver trace (`[OUTER …]`, `[KAPPA-PHASE …]`, etc.).
+    /// An unrecognized value falls back to the verbose `info` stream the user
+    /// clearly intended rather than being silently swallowed.
+    #[arg(long, global = true, value_name = "LEVEL")]
+    pub(crate) log_level: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]

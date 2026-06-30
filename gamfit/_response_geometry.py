@@ -28,22 +28,60 @@ def _np():
     return np
 
 
+def _composition_rows(np: Any, values: Any) -> tuple[Any, bool]:
+    """Marshal a composition argument to the ``(rows, parts)`` 2-D layout the
+    Rust FFI requires, recording whether the caller passed a single composition.
+
+    The compositional primitives (``closure`` / ``clr`` / ``alr``) are defined
+    on a *single* composition, and the rest of the NumPy-facing surface accepts a
+    1-D vector of points, so ``clr([0.2, 0.3, 0.5])`` is the natural call. But the
+    ``#[pyfunction]`` signatures take a 2-D ``PyReadonlyArray2`` only, so a 1-D
+    argument used to surface as the opaque ``TypeError: 'ndarray' object is not an
+    instance of 'ndarray'``. We promote a 1-D composition to a single
+    ``(1, parts)`` row here and let the caller squeeze the result back to 1-D, so
+    the single-composition result matches the corresponding row of the 2-D batch
+    call.
+    """
+    arr = np.asarray(values, dtype=float)
+    if arr.ndim == 1:
+        return arr.reshape(1, -1), True
+    return arr, False
+
+
 def closure(values: Any) -> Any:
-    """Normalize rows onto the probability simplex."""
+    """Normalize rows onto the probability simplex.
+
+    Accepts either a 2-D ``(rows, parts)`` batch or a single 1-D composition; a
+    1-D input yields 1-D coordinates matching the corresponding batch row.
+    """
     np = _np()
-    return _ffi("response_geometry_closure", np.asarray(values, dtype=float))
+    rows, was_1d = _composition_rows(np, values)
+    out = _ffi("response_geometry_closure", rows)
+    return np.asarray(out)[0] if was_1d else out
 
 
 def clr(values: Any) -> Any:
-    """Centered log-ratio coordinates for positive compositions."""
+    """Centered log-ratio coordinates for positive compositions.
+
+    Accepts either a 2-D ``(rows, parts)`` batch or a single 1-D composition; a
+    1-D input yields 1-D coordinates matching the corresponding batch row.
+    """
     np = _np()
-    return _ffi("response_geometry_clr", np.asarray(values, dtype=float))
+    rows, was_1d = _composition_rows(np, values)
+    out = _ffi("response_geometry_clr", rows)
+    return np.asarray(out)[0] if was_1d else out
 
 
 def alr(values: Any, *, reference: int = -1) -> Any:
-    """Additive log-ratio coordinates for positive compositions."""
+    """Additive log-ratio coordinates for positive compositions.
+
+    Accepts either a 2-D ``(rows, parts)`` batch or a single 1-D composition; a
+    1-D input yields 1-D coordinates matching the corresponding batch row.
+    """
     np = _np()
-    return _ffi("response_geometry_alr", np.asarray(values, dtype=float), int(reference))
+    rows, was_1d = _composition_rows(np, values)
+    out = _ffi("response_geometry_alr", rows, int(reference))
+    return np.asarray(out)[0] if was_1d else out
 
 
 def inverse_alr(coords: Any, *, reference: int = -1) -> Any:

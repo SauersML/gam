@@ -206,7 +206,11 @@ fn reml_outer_iter_reduction_cyclic_1d_deterministic_betas_match_tightly() {
 fn reml_outer_iter_reduction_bc_anchored_deterministic_betas_match_tightly() {
     init_parallelism();
     let data = data_bc(N);
-    let formula = "y ~ bc(x, anchor=0)";
+    // Endpoint boundary conditions are an OPTION on s(), not a term function:
+    // there is no `bc(...)` term (the parser rejects it as unknown). Exercise
+    // the anchored-endpoint reparameterized smooth via the supported syntax so
+    // the determinism contract actually fits instead of failing at parse time.
+    let formula = "y ~ s(x, bc=anchored)";
     let beta_a = fit_beta(formula, &data);
     let beta_b = fit_beta(formula, &data);
     let diff = beta_max_abs_diff(&beta_a, &beta_b);

@@ -802,7 +802,11 @@ pub trait CustomFamily {
         );
         assert_rho_matches_specs(rho, specs, "batched outer gradient terms");
         assert_valid_options(options, "batched outer gradient terms");
-        validate_hessian_workspace_ready(&hessian_workspace, "batched outer gradient terms")?;
+        validate_hessian_workspace_ready(
+            &hessian_workspace,
+            "batched outer gradient terms",
+            gam_problem::EvalMode::ValueAndGradient,
+        )?;
         Ok(None)
     }
 
@@ -831,7 +835,11 @@ pub trait CustomFamily {
             "batched outer Hessian terms",
         );
         assert_rho_matches_specs(rho, specs, "batched outer Hessian terms");
-        validate_hessian_workspace_ready(&hessian_workspace, "batched outer Hessian terms")?;
+        validate_hessian_workspace_ready(
+            &hessian_workspace,
+            "batched outer Hessian terms",
+            gam_problem::EvalMode::ValueGradientHessian,
+        )?;
         Ok(self
             .outer_hyper_hessian_operator(specs)
             .map(|operator| BatchedOuterHessianTerms {
@@ -1381,6 +1389,34 @@ pub trait CustomFamily {
     /// (gam#1020). When this returns `false` the pre-checks are bypassed and
     /// the exact expected-information gate always runs.
     fn joint_jeffreys_information_matches_observed_hessian(&self) -> bool {
+        true
+    }
+
+    /// Whether [`Self::joint_jeffreys_information_with_specs`] depends EXPLICITLY
+    /// on the ψ hyperparameters — i.e. whether `∂_ψ H_info|_β ≠ 0`.
+    ///
+    /// The outer-REML hypergradient folds three Firth/Jeffreys terms keyed off
+    /// the EXPLICIT ψ-derivative of the Jeffreys information `H_info` (gam#1607):
+    /// the value motion `−∂_ψ Φ`, its β-coupling `−∂_β∂_ψ Φ`, and the curvature
+    /// drift `∂_ψ H_Φ`. The engine forms `∂_ψ H_info|_β` from the family's
+    /// `exact_newton_joint_psi_terms` (`hessian_psi`), which is `∂_ψ H_joint|_β`
+    /// — correct ONLY when `H_info ≡ H_joint`.
+    ///
+    /// Default `true`: matches the historical contract where the Jeffreys
+    /// information IS the joint Newton Hessian and a length-scale ψ reshapes the
+    /// design, so `∂_ψ H_info = ∂_ψ H_joint = hessian_psi ≠ 0`.
+    ///
+    /// A family returns `false` when its Jeffreys information is the pure
+    /// LIKELIHOOD Fisher information AND its ψ are penalty/prior hyperparameters
+    /// that leave the design (hence the data information) fixed — then
+    /// `∂_ψ H_info|_β ≡ 0`, the three explicit-ψ terms vanish identically, and
+    /// the `hessian_psi = ∂_ψ(penalty)` the engine would otherwise substitute is
+    /// the WRONG perturbation (it is the penalty's, not the information's,
+    /// ψ-derivative). The implicit β-mode-response of `Φ` (the operator `H_Φ`
+    /// and its `D_β H_Φ[β̇]` drift, which depend on ψ only THROUGH β̂) is
+    /// unaffected by this flag and still folded. Spatial-adaptive Charbonnier
+    /// (Gaussian-identity, λ/ε penalty hyperparameters) returns `false`.
+    fn joint_jeffreys_information_depends_on_psi(&self) -> bool {
         true
     }
 

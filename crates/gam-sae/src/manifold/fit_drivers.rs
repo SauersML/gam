@@ -3079,6 +3079,31 @@ impl SaeManifoldTerm {
         }
         self.refresh_basis_from_current_coords()
             .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
+        // #850 / gam#577 / gam#579 — `max_iter == 0` is a genuine FREEZE of the
+        // warm-started inner `(t, β)` state, a verbatim reuse and NOT a
+        // convergence request. The caller (`reml_criterion_with_cache_refine_policy`
+        // / `reml_criterion_streaming_exact`) runs this with `max_iter == 0`
+        // precisely to hold β at the seed, then factors once at that frozen
+        // iterate (`converge_inner_for_undamped_logdet`'s `inner_max_iter == 0`
+        // branch). Everything below — the rank-reduction reparametrization, the
+        // decoder-frame activation, the #1003/#976 active-mass / decoder-norm
+        // re-seed guards, and especially the #1026 post-loop decoder-LSQ polish —
+        // can MOVE β off the seed: the polish refits the decoder to the
+        // unpenalised least-squares argmin and commits it whenever the warm-start
+        // arrives off that argmin (i.e. for any genuine continuation seed). That
+        // silently broke the warm-start reuse the continuation walk depends on
+        // (the regression test `seed_inner_state_installs_and_reuses_matching_beta`
+        // published a refined hint instead of the seed). So at a zero-iteration
+        // freeze we run ONLY the β-neutral basis refresh above and return the loss
+        // at the untouched warm-start state. The state is already structurally
+        // prepared by the full solve that produced it: any rank reduction
+        // (`SubspaceReducedEvaluator`) and decoder frames it needs are persistent
+        // on the atoms, so re-running those entry stages here would at best be a
+        // no-op and at worst reparametrize the frozen β — neither is wanted under
+        // the freeze contract.
+        if max_iter == 0 {
+            return self.loss(target, rho);
+        }
         // #1117 root-cause fix — rank-revealing adaptive basis depth, applied
         // FIRST (before frame activation, the identifiability audit, and the
         // outer loop) so every downstream stage sees a full-rank design. A
@@ -3541,7 +3566,19 @@ impl SaeManifoldTerm {
         // current_state` writes the full-`B` decoder directly, which would desync the
         // factored frames the inner solve and `apply_newton_step` rely on; the
         // homotopy-arrival polish makes the same conservative choice.
-        if !self.frames_active() {
+        //
+        // GATE on `max_iter > 0`: `max_iter == 0` is the documented verbatim
+        // warm-start FREEZE (gam#577/#579, #850 — see
+        // `converge_inner_for_undamped_logdet`), where the caller hands in a
+        // seeded `(t, β)` and asks for a single factor at exactly that iterate
+        // WITHOUT moving it. The polish is a decoder least-squares solve, so
+        // running it on a freeze would silently overwrite the warm-started β
+        // with the data-optimal refit — breaking the verbatim-reuse contract the
+        // continuation pre-warm depends on for its speedup (the cold-vs-warm
+        // hint would always equal the cold LSQ decoder, never the seed). A freeze
+        // is by definition not a convergence request, so there is no
+        // under-converged decoder to rescue here.
+        if max_iter > 0 && !self.frames_active() {
             let mut best_objective =
                 self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
             if best_objective.is_finite() {

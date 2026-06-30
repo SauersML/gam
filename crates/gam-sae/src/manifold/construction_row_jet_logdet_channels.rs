@@ -652,39 +652,44 @@ mod batch4_oracle_tests {
         /// `refill_jet_window` now builds the hand `row_jets_for_logdet` per row (the
         /// jet was a 25–57× regression). Retained as the live cross-check of the hand
         /// path (`batch4_jet_lanes_match_scalar_hand_row_jets`).
-    pub(crate) fn row_jets_for_logdet_batch4(
-        &self,
-        rho: &SaeManifoldRho,
-        rows: [usize; 4],
-        cache: &ArrowFactorCache,
-        second_jets: &[Array4<f64>],
-        border: &[SaeBorderChannel],
-    ) -> Result<Option<[SaeRowJets; 4]>, String> {
-        let p = self.output_dim();
-        let k_atoms = self.k_atoms();
-        let mut progs: Vec<crate::row_jet_program::SaeReconstructionRowProgram> =
-            Vec::with_capacity(4);
-        let mut vars_each: Vec<Vec<SaeLocalRowVar>> = Vec::with_capacity(4);
-        let mut sqrt_w = [1.0_f64; 4];
-        for (i, &row) in rows.iter().enumerate() {
-            let vars = self.row_vars_for_cache_row(row, cache)?;
-            let mut a = Array1::<f64>::zeros(k_atoms);
-            self.assignment.try_assignments_row_for_rho_into(
-                row,
-                rho,
-                a.as_slice_mut().expect("contiguous assignment scratch"),
-            )?;
-            let prog =
-                self.reconstruction_row_program_for_logdet(rho, row, &vars, a.view(), second_jets)?;
-            sqrt_w[i] = self
-                .row_loss_weights
-                .as_deref()
-                .map_or(1.0, |w| w[row].sqrt());
-            vars_each.push(vars);
-            progs.push(prog);
-        }
-        let refs = [&progs[0], &progs[1], &progs[2], &progs[3]];
-        macro_rules! dispatch {
+        pub(crate) fn row_jets_for_logdet_batch4(
+            &self,
+            rho: &SaeManifoldRho,
+            rows: [usize; 4],
+            cache: &ArrowFactorCache,
+            second_jets: &[Array4<f64>],
+            border: &[SaeBorderChannel],
+        ) -> Result<Option<[SaeRowJets; 4]>, String> {
+            let p = self.output_dim();
+            let k_atoms = self.k_atoms();
+            let mut progs: Vec<crate::row_jet_program::SaeReconstructionRowProgram> =
+                Vec::with_capacity(4);
+            let mut vars_each: Vec<Vec<SaeLocalRowVar>> = Vec::with_capacity(4);
+            let mut sqrt_w = [1.0_f64; 4];
+            for (i, &row) in rows.iter().enumerate() {
+                let vars = self.row_vars_for_cache_row(row, cache)?;
+                let mut a = Array1::<f64>::zeros(k_atoms);
+                self.assignment.try_assignments_row_for_rho_into(
+                    row,
+                    rho,
+                    a.as_slice_mut().expect("contiguous assignment scratch"),
+                )?;
+                let prog = self.reconstruction_row_program_for_logdet(
+                    rho,
+                    row,
+                    &vars,
+                    a.view(),
+                    second_jets,
+                )?;
+                sqrt_w[i] = self
+                    .row_loss_weights
+                    .as_deref()
+                    .map_or(1.0, |w| w[row].sqrt());
+                vars_each.push(vars);
+                progs.push(prog);
+            }
+            let refs = [&progs[0], &progs[1], &progs[2], &progs[3]];
+            macro_rules! dispatch {
             ($($k:literal),* $(,)?) => {
                 match progs[0].n_primaries {
                     $( $k => Self::batch4_assemble::<$k>(refs, &vars_each, &sqrt_w, border, p), )*
@@ -692,76 +697,78 @@ mod batch4_oracle_tests {
                 }
             };
         }
-        dispatch!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
-    }
-
-    /// Assemble the four lanes of a SIMD batch into per-row [`SaeRowJets`],
-    /// applying the identical `√w` / `output_c` scaling the scalar fills use.
-    /// Returns `None` if the rows are not batchable (the batch primitives
-    /// decline). Test-only oracle helper for `row_jets_for_logdet_batch4`.
-    fn batch4_assemble<const K: usize>(
-        rows: [&crate::row_jet_program::SaeReconstructionRowProgram; 4],
-        vars_each: &[Vec<SaeLocalRowVar>],
-        sqrt_w: &[f64; 4],
-        border: &[SaeBorderChannel],
-        p: usize,
-    ) -> Result<Option<[SaeRowJets; 4]>, String> {
-        use crate::row_jet_program::SaeReconstructionRowProgram;
-        let recon = match SaeReconstructionRowProgram::reconstruction_all_columns_batch4::<K>(rows) {
-            Some(r) => r,
-            None => return Ok(None),
-        };
-        let chans: Vec<(usize, usize)> = border.iter().map(|c| (c.atom, c.basis_col)).collect();
-        let bjets = match SaeReconstructionRowProgram::beta_border_order1_batch4::<K>(rows, &chans) {
-            Some(b) => b,
-            None => return Ok(None),
-        };
-        let mut outs: Vec<SaeRowJets> = Vec::with_capacity(4);
-        for lane in 0..4 {
-            let sqrt = sqrt_w[lane];
-            let mut first = vec![vec![0.0_f64; p]; K];
-            let mut second = vec![vec![vec![0.0_f64; p]; K]; K];
-            for (out_col, tower) in recon[lane].iter().enumerate() {
-                let g = tower.g();
-                let h = tower.h();
-                for a in 0..K {
-                    first[a][out_col] = sqrt * g[a];
-                    for b in 0..K {
-                        second[a][b][out_col] = sqrt * h[a][b];
-                    }
-                }
-            }
-            let mut beta = vec![vec![0.0_f64; p]; border.len()];
-            let mut beta_deriv = vec![vec![vec![0.0_f64; p]; border.len()]; K];
-            let mut beta_l_deriv = vec![vec![vec![0.0_f64; p]; border.len()]; K];
-            for (beta_pos, channel) in border.iter().enumerate() {
-                let s = &bjets[lane][beta_pos];
-                let s_v = s.value();
-                let s_g = s.g();
-                for out_col in 0..p {
-                    let out_c = channel.output[out_col];
-                    beta[beta_pos][out_col] = sqrt * s_v * out_c;
-                    for a in 0..K {
-                        let mixed = sqrt * s_g[a] * out_c;
-                        beta_deriv[a][beta_pos][out_col] = mixed;
-                        beta_l_deriv[a][beta_pos][out_col] = mixed;
-                    }
-                }
-            }
-            outs.push(SaeRowJets {
-                vars: vars_each[lane].clone(),
-                first,
-                second,
-                beta,
-                beta_deriv,
-                beta_l_deriv,
-            });
+            dispatch!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
         }
-        let arr: [SaeRowJets; 4] = outs
-            .try_into()
-            .map_err(|_| "batch4_assemble produced wrong lane count".to_string())?;
-        Ok(Some(arr))
-    }
+
+        /// Assemble the four lanes of a SIMD batch into per-row [`SaeRowJets`],
+        /// applying the identical `√w` / `output_c` scaling the scalar fills use.
+        /// Returns `None` if the rows are not batchable (the batch primitives
+        /// decline). Test-only oracle helper for `row_jets_for_logdet_batch4`.
+        fn batch4_assemble<const K: usize>(
+            rows: [&crate::row_jet_program::SaeReconstructionRowProgram; 4],
+            vars_each: &[Vec<SaeLocalRowVar>],
+            sqrt_w: &[f64; 4],
+            border: &[SaeBorderChannel],
+            p: usize,
+        ) -> Result<Option<[SaeRowJets; 4]>, String> {
+            use crate::row_jet_program::SaeReconstructionRowProgram;
+            let recon =
+                match SaeReconstructionRowProgram::reconstruction_all_columns_batch4::<K>(rows) {
+                    Some(r) => r,
+                    None => return Ok(None),
+                };
+            let chans: Vec<(usize, usize)> = border.iter().map(|c| (c.atom, c.basis_col)).collect();
+            let bjets =
+                match SaeReconstructionRowProgram::beta_border_order1_batch4::<K>(rows, &chans) {
+                    Some(b) => b,
+                    None => return Ok(None),
+                };
+            let mut outs: Vec<SaeRowJets> = Vec::with_capacity(4);
+            for lane in 0..4 {
+                let sqrt = sqrt_w[lane];
+                let mut first = vec![vec![0.0_f64; p]; K];
+                let mut second = vec![vec![vec![0.0_f64; p]; K]; K];
+                for (out_col, tower) in recon[lane].iter().enumerate() {
+                    let g = tower.g();
+                    let h = tower.h();
+                    for a in 0..K {
+                        first[a][out_col] = sqrt * g[a];
+                        for b in 0..K {
+                            second[a][b][out_col] = sqrt * h[a][b];
+                        }
+                    }
+                }
+                let mut beta = vec![vec![0.0_f64; p]; border.len()];
+                let mut beta_deriv = vec![vec![vec![0.0_f64; p]; border.len()]; K];
+                let mut beta_l_deriv = vec![vec![vec![0.0_f64; p]; border.len()]; K];
+                for (beta_pos, channel) in border.iter().enumerate() {
+                    let s = &bjets[lane][beta_pos];
+                    let s_v = s.value();
+                    let s_g = s.g();
+                    for out_col in 0..p {
+                        let out_c = channel.output[out_col];
+                        beta[beta_pos][out_col] = sqrt * s_v * out_c;
+                        for a in 0..K {
+                            let mixed = sqrt * s_g[a] * out_c;
+                            beta_deriv[a][beta_pos][out_col] = mixed;
+                            beta_l_deriv[a][beta_pos][out_col] = mixed;
+                        }
+                    }
+                }
+                outs.push(SaeRowJets {
+                    vars: vars_each[lane].clone(),
+                    first,
+                    second,
+                    beta,
+                    beta_deriv,
+                    beta_l_deriv,
+                });
+            }
+            let arr: [SaeRowJets; 4] = outs
+                .try_into()
+                .map_err(|_| "batch4_assemble produced wrong lane count".to_string())?;
+            Ok(Some(arr))
+        }
     }
 }
 

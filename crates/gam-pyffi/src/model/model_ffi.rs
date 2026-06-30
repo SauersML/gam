@@ -252,6 +252,15 @@ struct SummaryPayload {
     /// it ranks on (issue #1362). Optional for forward/backward compatibility.
     #[serde(skip_serializing_if = "Option::is_none")]
     log_likelihood: Option<f64>,
+    /// Number of observations the fit was trained on. Carried so `compare_models`
+    /// can REFUSE to rank fits made on different-sized (hence different) data:
+    /// `−2·loglik` / REML evidence grow with `n`, so a score gap between two fits
+    /// with different `n` is not a Bayes factor (#1384 sibling — the same
+    /// fail-loud contract as the family guard). Sourced from the IRLS working-set
+    /// length; `None` for fit paths that do not retain the working geometry (e.g.
+    /// O(n) spline-scan models), which the guard then treats as unconstrained.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    n_obs: Option<usize>,
     reml_score: f64,
     raw_reml_score: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1143,17 +1152,24 @@ fn default_survival_time_grid(
     if !observed {
         return Ok(None);
     }
-    // Anchor the grid's upper edge to the training time support so a small
-    // prediction-frame `exit` placeholder cannot truncate the surface below the
-    // fitted range (issue #896). The grid still extends to the prediction
-    // frame's own max exit when that is larger (the caller is explicitly asking
-    // about those later times). When the model carries no training-time signal
-    // the prediction-frame range is used alone, exactly as before.
+    // Anchor the grid's upper edge to the fitted model's training time support,
+    // independent of the prediction-frame `exit` placeholder. The placeholder is
+    // a semantically meaningless response value that `survival_at` ignores (it
+    // supplies its own query times), so it must neither truncate the surface
+    // below the fitted range (a SMALL placeholder — issue #896) nor stretch the
+    // fixed 64-point uniform grid past the fitted range (a LARGE placeholder,
+    // which coarsens every in-range cell and drifts interpolated `survival_at`
+    // values — issue #1717). When the training time support is known, it CAPS
+    // (and floors) `hi` to that bound regardless of the placeholder; query times
+    // legitimately beyond the support are handled by `survival_at`'s
+    // extrapolation (#1595), not by the grid. When the model carries no
+    // training-time signal (e.g. legacy models) the prediction-frame range is
+    // used alone, exactly as before.
     if let Some(bytes) = model_bytes.as_deref()
         && let Some(training_hi) = saved_survival_training_time_upper_bound(bytes)
         && training_hi.is_finite()
     {
-        hi = hi.max(training_hi);
+        hi = training_hi;
     }
     if hi <= lo {
         let lo_display = python_float_display(lo);
@@ -3537,6 +3553,10 @@ const LOG_LIK_KEYS: &[&str] = &["log_likelihood", "loglik", "log_lik"];
 // (#1384). `family_name` is the SummaryPayload field; the aliases cover a
 // dict / .evidence object that exposes it under a shorter key.
 const FAMILY_KEYS: &[&str] = &["family_name", "family"];
+// Observation count, used only by the compare_models comparability guard. `n_obs`
+// is the SummaryPayload field; the aliases cover a dict / .evidence object that
+// exposes it under a longer name.
+const NUM_OBS_KEYS: &[&str] = &["n_obs", "n_observations", "num_observations", "nobs"];
 
 const PENALTY_RANK_KEYS: &[&str] = &["penalty_rank", "rank_s", "rank_S", "cache_penalty_rank"];
 
@@ -3629,6 +3649,7 @@ fn compare_reml_fits(
             edf: extract_edf_from_view(py, &view)?,
             log_lik: extract_log_lik_from_view(&view)?,
             family: extract_family_from_view(&view)?,
+            n_obs: extract_n_obs_from_view(&view)?,
         });
     }
 
@@ -3825,6 +3846,16 @@ fn extract_log_lik_from_view(view: &RemlFitView<'_>) -> PyResult<Option<f64>> {
 /// which the guard treats as unconstrained.
 fn extract_family_from_view(view: &RemlFitView<'_>) -> PyResult<Option<String>> {
     extract_string_metadata_from_view(view, FAMILY_KEYS)
+}
+
+/// Observation count of a candidate fit, for the compare_models cross-`n`
+/// comparability guard. `None` when the fit does not expose one (legacy payloads
+/// / O(n) scan smoothers), which the guard treats as unconstrained. A
+/// non-finite or negative value is dropped to `None` rather than truncated.
+fn extract_n_obs_from_view(view: &RemlFitView<'_>) -> PyResult<Option<usize>> {
+    Ok(extract_float_metadata_from_view(view, NUM_OBS_KEYS)?
+        .filter(|value| value.is_finite() && *value >= 1.0)
+        .map(|value| value as usize))
 }
 
 /// String-valued metadata lookup over the same SavedSummary-JSON / PythonObject

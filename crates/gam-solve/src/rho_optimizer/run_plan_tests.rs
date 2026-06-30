@@ -1353,10 +1353,15 @@ fn analytic_route_unavailable_hessian_is_fatal() {
 #[test]
 fn arc_bridge_cost_stall_certifies_at_bound_separation() {
     // A flat objective at the lower bound `rho = -10` whose raw gradient is a
-    // constant `g = -1` (points further DOWN, out of the feasible box): the
-    // projected KKT residual there is 0, so a stall is a CONVERGED optimum —
-    // exactly the separation signature (the REML score has bottomed out but the
-    // unprojected gradient keeps pushing λ→0 forever).
+    // constant `g = +1`: its descent step `-g = -1` points further DOWN, out of
+    // the feasible box, so under the corrected KKT projection (#1074, a14b71220)
+    // it is the infeasible bound-multiplier pull and projects to 0. The projected
+    // KKT residual there is 0, so a stall is a CONVERGED optimum — exactly the
+    // separation signature (the REML score has bottomed out but the unprojected
+    // gradient keeps pushing λ→0 forever). NOTE: a NEGATIVE gradient at a lower
+    // bound is FEASIBLE interior descent (step `-g = +1` points back into the
+    // box) and is retained by the projection — it would (correctly) report
+    // NON-converged, which is why the fixture uses `+1`.
     let lo = array![-10.0];
     let hi = array![10.0];
     let problem = OuterProblem::new(1)
@@ -1374,9 +1379,9 @@ fn arc_bridge_cost_stall_certifies_at_bound_separation() {
             Ok(OuterEval {
                 // Constant cost: the score has flat-lined (separation valley).
                 cost: 1.0,
-                // Gradient points out of the lower bound; raw norm = 1 forever,
-                // but the bound-projected residual at rho=-10 is 0.
-                gradient: array![-1.0],
+                // Gradient's descent step points out of the lower bound; raw norm
+                // = 1 forever, but the bound-projected residual at rho=-10 is 0.
+                gradient: array![1.0],
                 hessian: match order {
                     OuterEvalOrder::ValueGradientHessian => HessianResult::Analytic(array![[1.0]]),
                     _ => HessianResult::Unavailable,
@@ -1453,8 +1458,10 @@ fn arc_bridge_cost_stall_halts_on_kkt_stationary_bound_descent() {
     let lo = array![-10.0];
     let hi = array![10.0];
     // Strictly-decreasing cost so the cost-improvement test alone would NEVER
-    // fire; the gradient points out of the lower bound (raw |g|=1, projected
-    // KKT residual at rho=-10 is 0), so the halt rides on stationarity.
+    // fire; the gradient's descent step points out of the lower bound (`g = +1`,
+    // step `-g = -1` exits the box), so under the corrected KKT projection
+    // (#1074, a14b71220) it projects to 0 (raw |g|=1, projected KKT residual at
+    // rho=-10 is 0) and the halt rides on stationarity.
     let step = std::cell::Cell::new(0u32);
     let problem = OuterProblem::new(1)
         .with_gradient(Derivative::Analytic)
@@ -1474,9 +1481,9 @@ fn arc_bridge_cost_stall_halts_on_kkt_stationary_bound_descent() {
                 // Monotonically decreasing by far more than the rel-tol floor:
                 // a pure cost-stall test could never fill its window here.
                 cost: 1.0 - (k as f64),
-                // Out-of-bounds gradient at the lower bound: raw norm = 1 forever,
-                // bound-projected residual = 0 (KKT-stationary).
-                gradient: array![-1.0],
+                // Gradient whose descent step exits the lower bound: raw norm = 1
+                // forever, bound-projected residual = 0 (KKT-stationary).
+                gradient: array![1.0],
                 hessian: match order {
                     OuterEvalOrder::ValueGradientHessian => HessianResult::Analytic(array![[1.0]]),
                     _ => HessianResult::Unavailable,
@@ -1686,7 +1693,6 @@ fn arc_cost_stall_guard_uses_cached_initial_sample_as_feasible_best() {
 #[test]
 fn bfgs_bridge_halts_infeasible_probe_run_back_to_cached_seed() {
     let seed = array![0.0];
-    let trial = array![1.0];
     let problem = OuterProblem::new(1).with_gradient(Derivative::Analytic);
     let mut obj = problem.build_objective_with_eval_order(
         (),
@@ -1719,8 +1725,16 @@ fn bfgs_bridge_halts_infeasible_probe_run_back_to_cached_seed() {
         consecutive_probe_refusals: 0,
     };
 
+    // A real BFGS line search probes a *sequence of distinct* trial ρ along its
+    // search direction, not one point repeated. The bridge caches each probed ρ
+    // bit-exactly (`value_probe_cache`/`same_outer_point`) and short-circuits an
+    // exact repeat WITHOUT re-entering the cost-stall guard — so re-probing a
+    // single fixed ρ would only ever register ONE infeasible observation and the
+    // streak could never fill the window. Walk distinct points (1.0, 2.0, …) so
+    // each probe is a fresh guard observation, exactly as the line search does.
     let mut sentinel_fired = false;
-    for _ in 0..(COST_STALL_WINDOW + 2) {
+    for i in 0..(COST_STALL_WINDOW + 2) {
+        let trial = array![1.0 + i as f64];
         match ZerothOrderObjective::eval_cost(&mut bridge, &trial) {
             Ok(cost) => panic!("infeasible probe unexpectedly returned finite cost {cost}"),
             Err(ObjectiveEvalError::Fatal { message }) => {
@@ -1925,19 +1939,40 @@ fn cost_stall_far_above_tolerance_keeps_descending_not_flat_valley() {
     );
 }
 
-/// #1426 companion: a GENUINE flat-valley floor — cost flatlined AND the
-/// projected gradient is only modestly above tolerance (well below the ceiling)
-/// — must still halt as a `FlatValleyStall` (the legitimately-flat REML surface
-/// of #1082/#1237). The #1426 escape must not weaken that path.
+/// #1426 companion (revised for the #509 score-relative escape gate): a GENUINE
+/// flat-valley floor — cost flatlined AND the projected gradient has floored at
+/// its irreducible band, i.e. only modestly above the SCORE-RELATIVE
+/// certified-stationary bound — must still halt as a `FlatValleyStall` (the
+/// legitimately-flat REML surface of #1082/#1237). The keep-descending escape
+/// must not weaken that path.
+///
+/// The discriminator is now score-relative, not the legacy fixed absolute
+/// `FLAT_VALLEY_STALL_GRAD_CEILING`: a stall whose residual is within
+/// `FLAT_VALLEY_STALL_ESCAPE_MARGIN` of `score_relative_grad_bound` is "essentially
+/// at the band" and halts directly. With a realistic REML score (`|value| ≈ 1e3`)
+/// the band caps at `FLAT_VALLEY_CONVERGED_ABS_GRAD_CAP = 1.0`, so a residual of
+/// `1.2` sits just above the certify band (not converged) yet within `1.5×` of it
+/// (a true floor) and must halt. This is the legitimately-flat case; the #509
+/// monotone seed-park instead floors WELL clear of the band (|g| ≈ 2 on a band ≈
+/// 0.6) and is granted escapes — covered by
+/// `cost_stall_above_score_relative_band_keeps_descending`.
 #[test]
 fn cost_stall_modestly_above_tolerance_still_halts_as_flat_valley() {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
     let mut guard = CostStallGuard::new(1.0e-6, 3, 1.0e-3, exit.clone());
     let seed = array![0.0, 0.0];
-    // Residual modestly above tolerance but BELOW the ceiling: a real flat
-    // valley floor (the surface has genuinely flattened).
-    let valley_grad = FLAT_VALLEY_STALL_GRAD_CEILING * 0.5;
-    guard.observe_seed(&seed, 10.0, valley_grad);
+    // Realistic REML score scale so the score-relative band caps at 1.0.
+    let score = -1.0e3;
+    // Residual just above the certified band (1.0) but within the 1.5× escape
+    // margin (1.5): a real flat-valley floor — the surface has genuinely
+    // flattened and no escape will drive the residual lower.
+    let valley_grad = 1.2;
+    assert!(
+        valley_grad > FLAT_VALLEY_CONVERGED_ABS_GRAD_CAP
+            && valley_grad < FLAT_VALLEY_STALL_ESCAPE_MARGIN * FLAT_VALLEY_CONVERGED_ABS_GRAD_CAP,
+        "test premise: a flat-valley floor sits just above the certify band, within the escape margin"
+    );
+    guard.observe_seed(&seed, score, valley_grad);
 
     let probe = array![-10.0, -10.0];
     let _ = guard.observe_infeasible(&probe);
@@ -1945,11 +1980,46 @@ fn cost_stall_modestly_above_tolerance_still_halts_as_flat_valley() {
     let verdict = guard.observe_infeasible(&probe);
     assert!(
         matches!(verdict, CostStallVerdict::FlatValleyStall { .. }),
-        "a modest residual below the ceiling is a genuine flat-valley floor and \
-         must halt as before (#1082/#1237 unaffected by the #1426 fix)"
+        "a residual at the score-relative band is a genuine flat-valley floor and \
+         must halt as before (#1082/#1237 unaffected). Got {:?}",
+        std::mem::discriminant(&verdict)
     );
     let published = exit.lock().unwrap().take().expect("best published");
     assert!(!published.converged);
+}
+
+/// #509 regression: a cost stall at an INTERIOR ρ whose projected gradient is
+/// well clear of the score-relative certified-stationary band still has a genuine
+/// feasible descent direction and must NOT be halted as a flat valley — it must
+/// keep descending. A shape-constrained (box-reparam β=Tγ) smooth whose inequality
+/// is non-binding stalls this way near the integer seed: the cumulative-sum
+/// coordinate change makes per-step cost progress fall below the relative floor for
+/// a window even though the projected gradient (|g| ≈ 2 on a score ≈ 600, band ≈
+/// 0.6) still descends strongly toward the well-penalized REML optimum. The legacy
+/// fixed `FLAT_VALLEY_STALL_GRAD_CEILING = 5.0` halted it (2 < 5) and parked the
+/// fit at its seed; the score-relative escape gate keeps it descending.
+#[test]
+fn cost_stall_above_score_relative_band_keeps_descending() {
+    let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
+    let mut guard = CostStallGuard::new(1.0e-6, 3, 1.0e-3, exit.clone());
+    let seed = array![3.0, -3.0];
+    let score = -6.0e2;
+    // Well above the certified band (≈ 0.6 = 1e-3·600) and above the 1.5× escape
+    // margin (≈ 0.9), but BELOW the legacy fixed ceiling (5.0) — exactly the band
+    // the old gate falsely halted.
+    let descending_grad = 2.0;
+    guard.observe_seed(&seed, score, descending_grad);
+
+    let probe = array![-10.0, -10.0];
+    let _ = guard.observe_infeasible(&probe);
+    let _ = guard.observe_infeasible(&probe);
+    let verdict = guard.observe_infeasible(&probe);
+    assert!(
+        matches!(verdict, CostStallVerdict::StuckKeepDescending { .. }),
+        "an interior stall well clear of the score-relative band has feasible \
+         descent left and must keep descending, not halt (#509). Got {:?}",
+        std::mem::discriminant(&verdict)
+    );
 }
 
 #[test]
@@ -2820,8 +2890,19 @@ fn run_nonconverged_arc_stays_on_arc_after_budget_retry_ladder() {
     // steps on x^4 contract the gradient by ~3× per attempt, so
     // the halving gate passes and both retries proceed; ARC still
     // cannot reach the optimum in three single-iter attempts.
+    //
+    // The risk profile MUST be `Gaussian` here: `effective_seed_budget`
+    // floors ARC+GeneralizedLinear to 2 (#1074/#1426 — a GLM needs ≥2
+    // seeds to find the heavily-penalized basin), which would defeat the
+    // `seed_budget == 1` screening-skip and let the always-injected neutral
+    // baseline seed `[0.0]` (the EXACT global minimum of x⁴, cost 0) be
+    // screened in and win — ARC would then start already-optimal and report
+    // converged in 0 iters, never exercising the ladder. Gaussian keeps the
+    // effective budget at 1 so `initial_rho = [5.0]` is the sole authoritative
+    // start and the budget-bump retry ladder is genuinely exercised.
     let mut seed_config = gam_problem::SeedConfig::default();
     seed_config.seed_budget = 1;
+    seed_config.risk_profile = gam_problem::SeedRiskProfile::Gaussian;
     let (_d, session) = tmp_cache_session("nonconverged-arc-cache");
     let problem = OuterProblem::new(1)
         .with_gradient(Derivative::Analytic)
@@ -2865,6 +2946,16 @@ fn run_nonconverged_arc_stays_on_arc_after_budget_retry_ladder() {
         !result.converged,
         "test fixture is engineered so the ladder cannot converge; \
              converged=true would mean the fixture stopped exercising the ladder"
+    );
+    // The ladder must have genuinely stepped away from neither the optimum
+    // (rho=0, where x⁴ is stationary) nor stalled at the seed: ARC contracts
+    // toward 0 but cannot reach it in the single-iter budget, so the reported
+    // ρ is strictly between the optimum and the [5.0] start.
+    assert!(
+        result.rho[0].abs() > 1.0e-6 && result.rho[0] < 5.0,
+        "the budget ladder must have made partial progress from the [5.0] seed \
+         toward the x⁴ optimum without reaching it; got rho={:?}",
+        result.rho.to_vec()
     );
 }
 
@@ -3333,10 +3424,22 @@ fn run_screening_reorders_expensive_generated_seeds_before_full_startup_eval() {
         .run(&mut obj, "screening should reorder expensive seeds")
         .expect("screened startup should reach the best generated seed");
     assert_eq!(result.rho, valid_seed);
+    let started_snapshot: Vec<Array1<f64>> = started.lock().unwrap().clone();
+    // The interior-extreme promotion (#1074/#1373/#1426) reserves slot 0 for the
+    // most-flexible interior seed and slot 1 for the heaviest, so screening's
+    // cost rank resumes at slot 2. (This promotion runs INSIDE
+    // `rank_seeds_with_screening`, so its footprint at slots 0/1 — here the
+    // generator's `[0.0]` and `[12.0]`, NOT the raw generator-first `[1.0]` — is
+    // itself proof that screening ran.) The lowest-cost generated seed must lead
+    // that reorderable tail: screening moved it ahead of the other equal-or-
+    // higher-cost seeds it is allowed to reorder, exactly as the original "front"
+    // assertion intended before the promotion reserved the first two slots.
     assert_eq!(
-        started.lock().unwrap().first().cloned(),
+        started_snapshot.get(2).cloned(),
         Some(valid_seed),
-        "screening should move the lowest-cost seed to the front before full startup eval",
+        "screening should rank the lowest-cost seed at the head of the reorderable \
+         tail (slots 0/1 are reserved for the promoted flexible/heaviest seeds); \
+         started order was {started_snapshot:?}",
     );
     assert_eq!(screening_cap.load(std::sync::atomic::Ordering::Relaxed), 0);
 }
@@ -3346,7 +3449,16 @@ fn initial_rho_with_single_seed_budget_skips_expensive_screening() {
     let mut seed_config = gam_problem::SeedConfig::default();
     seed_config.max_seeds = 4;
     seed_config.seed_budget = 1;
-    seed_config.risk_profile = gam_problem::SeedRiskProfile::GeneralizedLinear;
+    // This test asserts the `initial_rho + seed_budget==1` screening-skip
+    // (`explicit_initial_rho_owns_single_seed_budget`) fires. That skip keys off
+    // the EFFECTIVE budget, not the requested one. `effective_seed_budget` floors
+    // `(Arc, GeneralizedLinear)` to 2 (#1074/#1426 — a GLM needs ≥2 seeds to also
+    // reach the heavily-penalized basin), so a GeneralizedLinear fixture would
+    // have effective budget 2, the `seed_budget == 1` skip guard would be false,
+    // and screening would run (the observed 5 screening solves). Pin the fixture
+    // to Gaussian, whose effective budget equals the requested 1, so the skip is
+    // genuinely exercised — the behaviour this test is meant to guard.
+    seed_config.risk_profile = gam_problem::SeedRiskProfile::Gaussian;
     let screening_cap = Arc::new(AtomicUsize::new(0));
     let screening_calls = Arc::new(AtomicUsize::new(0));
     let initial_seed = array![9.0];
@@ -3464,10 +3576,19 @@ fn run_screening_reorders_bfgs_seeds_before_full_startup_eval() {
         .expect("screened BFGS startup should reach the best generated seed");
     assert_eq!(result.plan_used.solver, Solver::Bfgs);
     assert_eq!(result.rho, valid_seed);
+    let started_snapshot: Vec<Array1<f64>> = started.lock().unwrap().clone();
+    // As in the analytic-gradient sibling test: the interior-extreme promotion
+    // (#1074/#1373/#1426) reserves slot 0 (most-flexible interior seed) and slot 1
+    // (heaviest interior seed — here the screened-in initial ρ=9.0), so screening's
+    // cost rank resumes at slot 2. The lowest-cost generated seed must lead that
+    // reorderable tail — screening moved it ahead of every other equal-or-higher-
+    // cost seed it is allowed to reorder.
     assert_eq!(
-        started.lock().unwrap().first().cloned(),
+        started_snapshot.get(2).cloned(),
         Some(valid_seed),
-        "BFGS screening should move the lowest-cost seed to the front before full startup eval",
+        "BFGS screening should rank the lowest-cost seed at the head of the \
+         reorderable tail (slots 0/1 are reserved for the promoted flexible/heaviest \
+         seeds); started order was {started_snapshot:?}",
     );
     assert!(
         screening_calls.load(Ordering::Relaxed) > 1,
@@ -4507,13 +4628,23 @@ fn cached_rho_is_prepended_as_first_seed() {
             seen.lock().unwrap().push(theta.clone());
             Ok((theta[0] - 2.5).powi(2))
         },
-        |_: &mut Arc<Mutex<Vec<Array1<f64>>>>, theta: &Array1<f64>| {
-            Ok(OuterEval {
-                cost: (theta[0] - 2.5).powi(2),
-                gradient: array![2.0 * (theta[0] - 2.5)],
-                hessian: HessianResult::Unavailable,
-                inner_beta_hint: None,
-            })
+        {
+            let seen = seen.clone();
+            move |_: &mut Arc<Mutex<Vec<Array1<f64>>>>, theta: &Array1<f64>| {
+                // Record full-eval points too: startup now performs a DIRECT full
+                // evaluation at the seed (the `run_starts_solver_with_direct_startup_eval`
+                // contract) routed through THIS eval path, not a separate cost-screening
+                // pass. The cached rho is consumed by that startup eval, so a recorder
+                // that watched only the cost closure never saw the exact cached ρ — it
+                // only caught the later line-search cost probes clustered near it.
+                seen.lock().unwrap().push(theta.clone());
+                Ok(OuterEval {
+                    cost: (theta[0] - 2.5).powi(2),
+                    gradient: array![2.0 * (theta[0] - 2.5)],
+                    hessian: HessianResult::Unavailable,
+                    inner_beta_hint: None,
+                })
+            }
         },
         None::<fn(&mut Arc<Mutex<Vec<Array1<f64>>>>)>,
         None::<
@@ -4807,6 +4938,81 @@ fn prewarm_budget_scales_down_past_cost_cliff() {
             "above-cliff pre-warm work budget·p={} must stay bounded by ~{} (p={p})",
             b * p,
             PREWARM_COST_BUDGET_COEFF_PRODUCT
+        );
+    }
+}
+
+/// gam#979 — the continuation pre-warm fire/collapse magnitude must be a
+/// DETERMINISTIC function of the PROBLEM, never of disk-cache / parallel-load
+/// state, and at or past the per-step cost cliff the COLD (fired) budget must be
+/// bounded by the small documented `MULTI_SEED_PREWARM_BUDGET` tier.
+///
+/// The bug (#979 Experiment-2): a representative two-formula marginal-slope fit
+/// at the centers≈8 cliff (p ≈ 16) FIRED a ~12-step cold pre-warm of multi-second
+/// inner solves (~108s) under parallel/all-cold load, but a sequential rerun that
+/// happened to hit the persisted warm-start disk cache skipped it entirely (~4.5s).
+/// Identical inputs, "seconds vs intractable", decided by load/timing — because
+/// the only thing bounding the cold walk was the inverse-p taper from a base of
+/// PATH_BUDGET (64 → 12), and the only thing making it fast was the load-sensitive
+/// cache hit. This pins the two structural properties the fix establishes, with
+/// EXACT (`<=`, not approximate) ceilings:
+///
+///   1. For every representative marginal-slope cliff config (centers ≈ 8..12,
+///      p ≈ {16, 20, 24}), the COLD (`warm_start_cache_hit = false`) pre-warm
+///      step budget is `<= MULTI_SEED_PREWARM_BUDGET` (the owner's small "4–6"
+///      intent), so the fired walk can never blow up to the 12-step / ~108s cliff.
+///   2. The warm-start cache hit can only ever REDUCE the budget (to a redundant
+///      skip-to-0), never decide bounded-vs-unbounded: `warm_budget <= cold_budget`
+///      and the worst case is the deterministic, already-bounded cold budget. So
+///      the fire/collapse magnitude does NOT depend on the load-sensitive flag.
+#[test]
+fn prewarm_cold_budget_is_bounded_and_load_independent_at_cliff_979() {
+    // Two `basis(centers=K)` formulas give p ≈ 2K, so the centers≈8 cliff lands
+    // at p ≈ 16 and centers≈12 at p ≈ 24. n_params (rho dim) is a small 2 — the
+    // legacy "expensive shape" gate (p ≥ 24 or rho dim ≥ 4) does NOT fire here,
+    // which is exactly why the pre-fix cold base stayed at PATH_BUDGET.
+    for p in [16usize, 20, 24] {
+        let (cold_cfg, cap) = prewarm_config_for_p(p);
+        assert!(
+            !cold_cfg.warm_start_cache_hit,
+            "the cold config must report no cache hit (p={p})"
+        );
+        let cold_budget = continuation_prewarm_step_budget(&cold_cfg, &cap, 1, 1);
+
+        // (1) The COLD fired budget is bounded by the small documented tier —
+        //     EXACTLY `<= MULTI_SEED_PREWARM_BUDGET`, not the larger
+        //     `SINGLE_EXPENSIVE_PREWARM_BUDGET` and certainly not PATH_BUDGET.
+        //     Pre-fix this was 12 at p=16 (PATH_BUDGET-tapered) and the test fails.
+        assert!(
+            cold_budget <= MULTI_SEED_PREWARM_BUDGET,
+            "cold pre-warm budget {cold_budget} must be <= MULTI_SEED_PREWARM_BUDGET \
+             ({MULTI_SEED_PREWARM_BUDGET}) at the #979 cliff (p={p}); a larger fired \
+             budget is the ~108s centers≈8 cold blowup"
+        );
+        // Still a real anneal (capping must not regress seed-continuation accuracy).
+        assert!(
+            cold_budget >= PREWARM_MIN_SCALED_BUDGET,
+            "cold pre-warm budget {cold_budget} must stay >= {PREWARM_MIN_SCALED_BUDGET} \
+             so the warmed β is near-optimal (p={p})"
+        );
+
+        // (2) The warm-start cache hit is a redundant skip layered ON TOP of an
+        //     already-bounded cold budget: flipping the load-sensitive flag can
+        //     only ever REDUCE work (to 0), never turn bounded into unbounded.
+        let warm_cfg = OuterConfig {
+            warm_start_cache_hit: true,
+            ..cold_cfg
+        };
+        let warm_budget = continuation_prewarm_step_budget(&warm_cfg, &cap, 1, 1);
+        assert_eq!(
+            warm_budget, 0,
+            "a warm-start cache hit must skip the redundant pre-warm (p={p})"
+        );
+        assert!(
+            warm_budget <= cold_budget,
+            "the load-sensitive cache flag must only ever reduce the pre-warm budget \
+             ({warm_budget} <= {cold_budget}); it must never be the difference between \
+             a bounded and an unbounded fired walk (p={p})"
         );
     }
 }

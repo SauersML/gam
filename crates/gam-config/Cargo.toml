@@ -1,6 +1,6 @@
 [package]
 name = "gam-config"
-version = "0.3.133"
+version = "0.3.137"
 edition = "2024"
 rust-version = "1.93"
 description = "Shared JSON to FitConfig resolver for the gam CLI and Python FFI"
@@ -10,11 +10,11 @@ license = "AGPL-3.0-or-later"
 warnings = "deny"
 
 [dependencies]
-gam-problem = { path = "../gam-problem", version = "=0.3.133" }
-gam-solve = { path = "../gam-solve", version = "=0.3.133" }
-gam-models = { path = "../gam-models", version = "=0.3.133" }
-gam-gpu = { path = "../gam-gpu", version = "=0.3.133" }
-gam-inference = { path = "../gam-inference", version = "=0.3.133" }
+gam-problem = { path = "../gam-problem", version = "=0.3.137" }
+gam-solve = { path = "../gam-solve", version = "=0.3.137" }
+gam-models = { path = "../gam-models", version = "=0.3.137" }
+gam-gpu = { path = "../gam-gpu", version = "=0.3.137" }
+gam-inference = { path = "../gam-inference", version = "=0.3.137" }
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149", features = ["float_roundtrip"] }

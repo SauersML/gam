@@ -16,7 +16,7 @@
 //!
 //! On non-Linux builds the entire module degrades to a CPU-fallback shim.
 
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, ArrayView2};
 
 use gam_linalg::triangular::{CholeskyGuard, cholesky_factor_in_place, cholesky_solve_vector};
 use crate::arrow_schur::{ArrowSchurSystem, DeviceSaePcgData, PcgDiagnostics};
@@ -54,19 +54,117 @@ pub enum ArrowSchurGpuFailure {
     },
 }
 
-/// Safety-margin multiplier on `√(machine ε)` for the diagonal ridge bump
-/// suggested when a local block fails Cholesky.
+/// Relative rounding margin (multiplier on `diag_scale · √ε`) added on top of
+/// the deficit-clearing shift in [`ridge_bump_to_make_pd`].
 ///
-/// The estimated bump is `diag_scale · |pivot| · √ε · RIDGE_BUMP_EPS_MARGIN`.
-/// A bare `diag_scale · √ε` ridge is the smallest perturbation that makes a
-/// marginally-indefinite block PD in exact arithmetic, but a single retry at
-/// that magnitude is routinely re-rejected by the next POTRF because the
-/// rounding error of forming `D + ridge·I` and re-factoring is itself O(√ε).
-/// The 1024× headroom (≈ 2¹⁰, i.e. ten extra bits below the f64 mantissa's
-/// 52) clears the pivot on the first retry without materially perturbing the
-/// curvature the Newton step sees. Shared by the per-row scalar path and the
-/// batched-tile path so both suggest an identical bump.
+/// The exact shift `-(λ_min)` makes a block PD in exact arithmetic, but a
+/// single retry at precisely that magnitude is routinely re-rejected by the
+/// next POTRF because the rounding error of forming `D + ridge·I` and
+/// re-factoring is itself O(√ε). The 1024× headroom (≈ 2¹⁰, ten extra bits
+/// below the f64 mantissa's 52) clears the pivot on the first retry without
+/// materially perturbing the curvature the Newton step sees. Shared by every
+/// per-row / batched / fused producer so they suggest a consistent bump.
 const RIDGE_BUMP_EPS_MARGIN: f64 = 1024.0;
+
+/// Diagonal ridge bump that is GUARANTEED to make `H_tt + (ridge_t + bump)·I`
+/// positive definite for a *symmetric* per-row block, sized from the block's
+/// own entries rather than from the factorization's pivot index.
+///
+/// # Why the old `scale · |pivot| · √ε · 1024` estimate is wrong
+///
+/// The batched/fused device paths derive the suggested bump from the
+/// factorization "pivot" — but cuSOLVER's `potrf` (and the NVRTC kernel's
+/// status code) report the failing pivot as a **1-based row index**, NOT the
+/// magnitude of the negative pivot. A block that is indefinite by `O(1)`
+/// (e.g. `H_tt = -I`, whose smallest eigenvalue is `-1`) then yields the same
+/// `bump ≈ √ε · 1024 ≈ 1.5e-5` as a block that is indefinite by `O(√ε)`. The
+/// outer LM escalation, which retries at `ridge_t + bump` and grows
+/// geometrically with a bounded step count, can never lift a strongly
+/// indefinite block out of the negative regime, so the solve fails to recover
+/// even though the block is trivially regularizable. (Surfaced by the V100
+/// `ridge_bump_required_on_non_pd_row_recovers_after_bump` validation test.)
+///
+/// # The bound
+///
+/// By the Gershgorin circle theorem every eigenvalue `λ` of the symmetric
+/// matrix `A = H_tt` satisfies, for some row `i`,
+///   `λ ≥ A[i,i] − Σ_{j≠i} |A[i,j]|`,
+/// so `λ_min(A) ≥ min_i ( A[i,i] − Σ_{j≠i} |A[i,j]| ) =: g` (the most negative
+/// Gershgorin left edge). Adding `t·I` shifts every eigenvalue up by `t`, so
+/// `A + t·I` is PD as soon as `t > -g`. We are already sitting at `ridge_t`, so
+/// the ADDITIONAL bump needed is `-(g + ridge_t)` when that is positive. We add
+/// a relative safety margin (`√ε · scale · 1024`, the same headroom the legacy
+/// estimate used) so the re-factored, rounding-perturbed block clears the pivot
+/// on the first retry, and a `max(1)`-scaled floor so a marginally-indefinite
+/// block still gets a strictly positive, non-vanishing bump.
+///
+/// The returned value is the bump to ADD to the current `ridge_t`. It is always
+/// strictly positive (the caller only constructs `RidgeBumpRequired` on an
+/// actual non-PD failure, but the bound is defensive regardless).
+#[must_use]
+fn ridge_bump_to_make_pd(htt: ArrayView2<'_, f64>, ridge_t: f64) -> f64 {
+    let d = htt.nrows();
+    // Diagonal magnitude scale (also the legacy `scale`), and the most-negative
+    // Gershgorin left edge `g = min_i (A_ii − Σ_{j≠i} |A_ij|)`.
+    let mut scale = 1.0_f64;
+    let mut min_gershgorin_edge = f64::INFINITY;
+    for i in 0..d {
+        let diag = htt[[i, i]];
+        scale = scale.max(diag.abs());
+        let mut off_sum = 0.0_f64;
+        for j in 0..d {
+            if j != i {
+                off_sum += htt[[i, j]].abs();
+            }
+        }
+        min_gershgorin_edge = min_gershgorin_edge.min(diag - off_sum);
+    }
+    if !min_gershgorin_edge.is_finite() {
+        // d == 0 (no rows) or non-finite entries: fall back to the scale-only
+        // floor so the caller still gets a strictly positive bump.
+        return scale * f64::EPSILON.sqrt() * RIDGE_BUMP_EPS_MARGIN;
+    }
+    // Additional shift needed so `λ_min(A) + ridge_t + bump > 0`, i.e.
+    // `bump > -(min_gershgorin_edge + ridge_t)`.
+    let deficit = -(min_gershgorin_edge + ridge_t);
+    let margin = scale * f64::EPSILON.sqrt() * RIDGE_BUMP_EPS_MARGIN;
+    // Lift past the deficit (when positive) plus a rounding margin; never below
+    // the scale-relative floor so a marginal block still moves.
+    deficit.max(0.0) + margin
+}
+
+/// [`ridge_bump_to_make_pd`] for a `d × d` symmetric block stored column-major
+/// in a flat slice with the current ridge ALREADY baked into the diagonal
+/// (the device packers emit `D = H_tt + ridge_t·I` this way). Because the shift
+/// is already present, the Gershgorin bound is taken at `ridge_t = 0` and the
+/// returned value is still the ADDITIONAL bump to add on top of the current
+/// ridge. Returns the scale-only floor when `block` is mis-sized.
+#[must_use]
+fn ridge_bump_to_make_pd_colmajor(block: &[f64], d: usize) -> f64 {
+    if d == 0 || block.len() < d * d {
+        return f64::EPSILON.sqrt() * RIDGE_BUMP_EPS_MARGIN;
+    }
+    // Column-major: element (row r, col c) at block[c*d + r]. The matrix is
+    // symmetric, so reading by column gives the same Gershgorin edges as by row.
+    let mut scale = 1.0_f64;
+    let mut min_gershgorin_edge = f64::INFINITY;
+    for i in 0..d {
+        let diag = block[i * d + i];
+        scale = scale.max(diag.abs());
+        let mut off_sum = 0.0_f64;
+        for j in 0..d {
+            if j != i {
+                off_sum += block[j * d + i].abs();
+            }
+        }
+        min_gershgorin_edge = min_gershgorin_edge.min(diag - off_sum);
+    }
+    let margin = scale * f64::EPSILON.sqrt() * RIDGE_BUMP_EPS_MARGIN;
+    if !min_gershgorin_edge.is_finite() {
+        return margin;
+    }
+    (-min_gershgorin_edge).max(0.0) + margin
+}
 
 /// Entry point: attempt the fully device-resident Arrow-Schur Newton solve.
 /// Returns `Err(ArrowSchurGpuFailure::Unavailable)` to indicate "device path
@@ -472,16 +570,12 @@ fn build_row_procedural_matvec(
         }
         let factor = cholesky_factor_in_place(block.view(), CholeskyGuard::NonnegativePivot)
             .ok_or_else(|| {
-                let scale = row
-                    .htt
-                    .diag()
-                    .iter()
-                    .map(|v| v.abs())
-                    .fold(0.0_f64, f64::max)
-                    .max(1.0);
+                // Deficit-aware bump from the block's own entries (Gershgorin),
+                // so the outer LM escalation lifts a strongly-indefinite block
+                // out of the negative regime in one retry.
                 ArrowSchurGpuFailure::RidgeBumpRequired {
                     row: i,
-                    bump: scale * f64::EPSILON.sqrt() * RIDGE_BUMP_EPS_MARGIN,
+                    bump: ridge_bump_to_make_pd(row.htt.view(), ridge_t),
                 }
             })?;
         factors.push(factor);
@@ -732,6 +826,39 @@ pub fn solve_sae_matrix_free_pcg(
     }
 }
 
+/// #1551 kernel-isolating parity probe: run the framed reduced-Schur matvec
+/// `out = S·x` exactly once on the device and return it (no PCG, no offload-floor
+/// gate). The test suite diffs this element-wise against the CPU oracle
+/// [`sae_framed_schur_matvec_cpu`] to prove the GPU kernel computes the SAME
+/// operator — a check that is independent of solver conditioning (unlike a
+/// solved-`δβ` comparison, which can diverge purely because dense Cholesky and
+/// iterative PCG resolve an ill-conditioned `S` to different accuracies). On a
+/// non-CUDA host this returns `Unavailable` so the caller skips cleanly.
+#[doc(hidden)]
+pub fn framed_schur_matvec_once_on_device(
+    sys: &ArrowSchurSystem,
+    data: &DeviceSaePcgData,
+    ridge_t: f64,
+    ridge_beta: f64,
+    x: &Array1<f64>,
+) -> Result<Array1<f64>, ArrowSchurGpuFailure> {
+    if sys.k != data.beta_dim || x.len() != data.beta_dim || data.p == 0 {
+        return Err(ArrowSchurGpuFailure::Unavailable);
+    }
+    if data.frame.is_none() {
+        return Err(ArrowSchurGpuFailure::Unavailable);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (ridge_t, ridge_beta);
+        Err(ArrowSchurGpuFailure::Unavailable)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        cuda::framed_schur_matvec_once_on_device(sys, data, ridge_t, ridge_beta, x)
+    }
+}
+
 /// Reference dense back-end used by tests and as the fallback when the
 /// GPU declines. Kept here (not in `arrow_schur_gpu.rs`) so the validation
 /// suite has one canonical baseline.
@@ -961,7 +1088,6 @@ mod cuda {
         d_block: Vec<f64>, // d*d
         b_block: Vec<f64>, // d*k
         g_vec: Vec<f64>,   // d
-        diag_scale: f64,   // |diag(H_tt)| scale for the ridge-bump diagnostic
         // Forward outputs, kept on the host for the back-sub pass.
         l_block: Vec<f64>, // d*d lower factor, column-major
         u_vec: Vec<f64>,   // d   (= L^{-1} g)
@@ -1031,18 +1157,10 @@ mod cuda {
             let mut b_block = Vec::with_capacity(d * k);
             let mut g_vec = Vec::with_capacity(d);
             pack_block(row, ridge_t, d, k, &mut d_block, &mut b_block, &mut g_vec);
-            let diag_scale = row
-                .htt
-                .diag()
-                .iter()
-                .map(|v| v.abs())
-                .fold(0.0_f64, f64::max)
-                .max(1.0);
             slots.push(RowSlot {
                 d_block,
                 b_block,
                 g_vec,
-                diag_scale,
                 l_block: Vec::new(),
                 u_vec: Vec::new(),
                 y_block: Vec::new(),
@@ -1214,15 +1332,16 @@ mod cuda {
         let mut g_dev = stream.clone_htod(&g_host).ok()?;
 
         // Batched POTRF; a non-PD block records its bump and stops the tile.
+        // The bump is deficit-aware (Gershgorin lower bound on λ_min of the
+        // already-ridged `d_block`), NOT derived from the cuSOLVER `info` —
+        // which is a 1-based pivot ROW INDEX, not a pivot magnitude — so a
+        // strongly-indefinite block recovers in one outer-loop retry.
         let info_host = potrf_batched(&solver, &stream, d, m, &mut d_dev).ok()?;
         if let Some(local) = info_host.iter().position(|info| *info != 0) {
-            let pivot = info_host[local];
-            tile[local].bump = Some(
-                tile[local].diag_scale
-                    * (f64::from(pivot).abs()).max(1.0)
-                    * f64::EPSILON.sqrt()
-                    * super::RIDGE_BUMP_EPS_MARGIN,
-            );
+            tile[local].bump = Some(super::ridge_bump_to_make_pd_colmajor(
+                &tile[local].d_block,
+                d,
+            ));
             return Some(());
         }
 
@@ -1345,17 +1464,12 @@ mod cuda {
         // is the single-device leaf the split dispatches per tile.
         let info_host = potrf_batched(&solver, &stream, d, n, &mut d_dev)?;
         if let Some(idx) = info_host.iter().position(|info| *info != 0) {
-            let pivot = info_host[idx];
-            let scale = sys.rows[idx]
-                .htt
-                .diag()
-                .iter()
-                .map(|v| v.abs())
-                .fold(0.0_f64, f64::max)
-                .max(1.0);
+            // `info` is cuSOLVER's 1-based pivot ROW INDEX, not a magnitude;
+            // size the bump from the block's own entries (Gershgorin λ_min
+            // bound) so a strongly-indefinite block recovers in one retry.
             return Err(ArrowSchurGpuFailure::RidgeBumpRequired {
                 row: idx,
-                bump: scale * (pivot.abs() as f64).max(1.0) * f64::EPSILON.sqrt() * 1024.0,
+                bump: super::ridge_bump_to_make_pd(sys.rows[idx].htt.view(), ridge_t),
             });
         }
 
@@ -2598,16 +2712,11 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
                 gam_linalg::triangular::CholeskyGuard::NonnegativePivot,
             )
             .ok_or_else(|| {
-                let scale = row
-                    .htt
-                    .diag()
-                    .iter()
-                    .map(|v| v.abs())
-                    .fold(0.0_f64, f64::max)
-                    .max(1.0);
+                // Deficit-aware bump (Gershgorin λ_min bound) so a strongly
+                // indefinite per-row block recovers in one outer-loop retry.
                 ArrowSchurGpuFailure::RidgeBumpRequired {
                     row: row_idx,
-                    bump: scale * f64::EPSILON.sqrt() * super::RIDGE_BUMP_EPS_MARGIN,
+                    bump: super::ridge_bump_to_make_pd(row.htt.view(), ridge_t),
                 }
             })?;
             for col in 0..q {
@@ -2980,9 +3089,15 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
                     d_buf[base + r] = value;
                 }
             }
-            // B_i in P_MAX×R_TEMPLATE strided block.
+            // B_i in P_MAX×R_TEMPLATE strided block. The per-row (per-i) block
+            // stride is `p_max · r_template` (matching the `b_buf` allocation
+            // above and the kernel's `b_stack`/`y_out` layout), NOT
+            // `p_max · p_max`: using the D-block multiplier here overflows the
+            // buffer whenever `p_max > r_template` (e.g. d=30→p_max=32,
+            // k=5→r_template=5). The within-block element offset stays
+            // column-major `col·p_max + r` (P_MAX rows per column).
             for col in 0..k {
-                let base = (i * p_max + col) * p_max;
+                let base = (i * r_template + col) * p_max;
                 for r in 0..d {
                     b_buf[base + r] = row.htbeta[[r, col]];
                 }
@@ -3081,17 +3196,12 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
             // POTRF(D) → L_i, kept resident in l_dev.
             let info_host = potrf_batched(&solver, &stream, d, n, &mut l_dev)?;
             if let Some(idx) = info_host.iter().position(|info| *info != 0) {
-                let pivot = info_host[idx];
-                let scale = sys.rows[idx]
-                    .htt
-                    .diag()
-                    .iter()
-                    .map(|v| v.abs())
-                    .fold(0.0_f64, f64::max)
-                    .max(1.0);
+                // cuSOLVER `info` is a 1-based pivot row index; size the bump
+                // from the block (Gershgorin λ_min bound) so a strongly
+                // indefinite block recovers in one retry.
                 return Err(ArrowSchurGpuFailure::RidgeBumpRequired {
                     row: idx,
-                    bump: scale * (pivot.abs() as f64).max(1.0) * f64::EPSILON.sqrt() * 1024.0,
+                    bump: super::ridge_bump_to_make_pd(sys.rows[idx].htt.view(), ridge_t),
                 });
             }
 
@@ -3378,17 +3488,12 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
             .clone_dtoh(&status_dev)
             .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
         if let Some(row) = status_host.iter().position(|s| *s != 0) {
-            let pivot = status_host[row];
-            let scale = sys.rows[row]
-                .htt
-                .diag()
-                .iter()
-                .map(|v| v.abs())
-                .fold(0.0_f64, f64::max)
-                .max(1.0);
+            // The NVRTC kernel's status code is a 1-based pivot row index, not
+            // a magnitude; size the bump from the block (Gershgorin λ_min
+            // bound) so a strongly indefinite block recovers in one retry.
             return Err(ArrowSchurGpuFailure::RidgeBumpRequired {
                 row,
-                bump: scale * (pivot.abs() as f64).max(1.0) * f64::EPSILON.sqrt() * 1024.0,
+                bump: super::ridge_bump_to_make_pd(sys.rows[row].htt.view(), ridge_t),
             });
         }
 
@@ -3626,17 +3731,12 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
             .clone_dtoh(&status_dev)
             .map_err(|_| super::ArrowSchurGpuFailure::Unavailable)?;
         if let Some(row) = status_host.iter().position(|s| *s != 0) {
-            let pivot = status_host[row];
-            let scale = sys.rows[row]
-                .htt
-                .diag()
-                .iter()
-                .map(|v| v.abs())
-                .fold(0.0_f64, f64::max)
-                .max(1.0);
+            // Status code is a 1-based pivot row index, not a magnitude; size
+            // the bump from the block (Gershgorin λ_min bound) so a strongly
+            // indefinite block recovers in one retry.
             return Err(super::ArrowSchurGpuFailure::RidgeBumpRequired {
                 row,
-                bump: scale * (pivot.abs() as f64).max(1.0) * f64::EPSILON.sqrt() * 1024.0,
+                bump: super::ridge_bump_to_make_pd(sys.rows[row].htt.view(), ridge_t),
             });
         }
 
@@ -3866,16 +3966,11 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
                 gam_linalg::triangular::CholeskyGuard::NonnegativePivot,
             )
             .ok_or_else(|| {
-                let scale = row
-                    .htt
-                    .diag()
-                    .iter()
-                    .map(|v| v.abs())
-                    .fold(0.0_f64, f64::max)
-                    .max(1.0);
+                // Deficit-aware bump (Gershgorin λ_min bound) so a strongly
+                // indefinite per-row block recovers in one outer-loop retry.
                 ArrowSchurGpuFailure::RidgeBumpRequired {
                     row: i,
-                    bump: scale * f64::EPSILON.sqrt() * super::RIDGE_BUMP_EPS_MARGIN,
+                    bump: super::ridge_bump_to_make_pd(row.htt.view(), ridge_t),
                 }
             })?;
             for col in 0..q {
@@ -4127,6 +4222,62 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         unsafe { b.launch(cfg) }
             .map(drop)
             .map_err(|_| ArrowSchurGpuFailure::Unavailable)
+    }
+
+    /// #1551 kernel-isolating seam: evaluate the framed reduced-Schur matvec
+    /// `out = S·x` EXACTLY ONCE on the device (no PCG, no offload-floor gate) and
+    /// return `out`. This is the parity probe the test harness diffs against the
+    /// CPU oracle [`super::sae_framed_schur_matvec_cpu`] element-by-element, so a
+    /// kernel/marshalling defect is exposed directly — independent of how the
+    /// iterative solver behaves on an ill-conditioned assembled `S` (where dense
+    /// Cholesky and PCG legitimately disagree at the solution level). Declines
+    /// (`Unavailable`) only when CUDA is genuinely absent so the test skips
+    /// cleanly off-device; it deliberately does NOT consult the offload policy so
+    /// even a tiny verifiable fixture runs on the GPU.
+    pub(super) fn framed_schur_matvec_once_on_device(
+        sys: &ArrowSchurSystem,
+        data: &DeviceSaePcgData,
+        ridge_t: f64,
+        ridge_beta: f64,
+        x: &Array1<f64>,
+    ) -> Result<Array1<f64>, ArrowSchurGpuFailure> {
+        let k = x.len();
+        if k == 0 || data.beta_dim != k || sys.k != k {
+            return Err(ArrowSchurGpuFailure::Unavailable);
+        }
+        let frame = data
+            .frame
+            .as_ref()
+            .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        // No offload-policy filter here: the seam exists to validate the kernel on
+        // ANY device, including the smallest hand-checkable fixture.
+        let runtime = gam_gpu::device_runtime::GpuRuntime::global()
+            .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let ctx = gam_gpu::device_runtime::cuda_context_for(runtime.selected_device().ordinal)
+            .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let stream = ctx
+            .new_stream()
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let vector_module = pcg_vector_module(&ctx)?;
+        let mut buffers = flatten_device_sae_frame_data(sys, data, frame, ridge_t, &stream)?;
+        let x_dev = stream
+            .clone_htod(x.as_slice().ok_or(ArrowSchurGpuFailure::Unavailable)?)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let mut out_dev = stream
+            .alloc_zeros::<f64>(k)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        launch_sae_frame_matvec(
+            &stream,
+            vector_module,
+            &mut buffers,
+            &x_dev,
+            &mut out_dev,
+            ridge_beta,
+        )?;
+        let out = stream
+            .clone_dtoh(&out_dev)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        Ok(Array1::from_vec(out))
     }
 
     pub(super) fn solve_sae_matrix_free_pcg_framed(
@@ -4989,6 +5140,102 @@ mod tests {
         sys
     }
 
+    /// The Gershgorin ridge bump must actually make a known-indefinite block PD
+    /// on the first retry — the whole point of #1711. Verified directly by
+    /// re-factoring `H_tt + (ridge_t + bump)·I` with the same Cholesky guard the
+    /// device readback uses, for blocks whose `λ_min` is known in closed form.
+    #[test]
+    fn ridge_bump_makes_known_indefinite_blocks_pd() {
+        // `cholesky_factor_in_place` / `CholeskyGuard` are already in scope via
+        // `super::*` (imported at the top of the module).
+        // A few blocks with a CLOSED-FORM smallest eigenvalue, all at ridge_t=0.
+        // (label, matrix, λ_min) — the bump must clear each one.
+        let neg_identity = Array2::<f64>::from_diag(&Array1::from_elem(8, -1.0)); // λ_min = -1
+        let scaled_neg = Array2::<f64>::from_diag(&Array1::from_elem(4, -250.0)); // λ_min = -250
+        // Symmetric 2×2 [[1, 2], [2, 1]] has eigenvalues 3 and -1 → indefinite.
+        let mut indef2 = Array2::<f64>::zeros((2, 2));
+        indef2[[0, 0]] = 1.0;
+        indef2[[1, 1]] = 1.0;
+        indef2[[0, 1]] = 2.0;
+        indef2[[1, 0]] = 2.0;
+        // A genuinely PD block must get a bump that is the bare rounding margin
+        // only (deficit 0), and must still factor — the helper is defensive.
+        let pd = Array2::<f64>::from_diag(&Array1::from_elem(3, 5.0));
+
+        for (label, block) in [
+            ("-I (λ_min=-1)", neg_identity),
+            ("-250·I (λ_min=-250)", scaled_neg),
+            ("[[1,2],[2,1]] (λ_min=-1)", indef2),
+            ("5·I (PD)", pd),
+        ] {
+            let ridge_t = 0.0;
+            let bump = ridge_bump_to_make_pd(block.view(), ridge_t);
+            assert!(
+                bump > 0.0 && bump.is_finite(),
+                "[{label}] bump must be strictly positive and finite, got {bump:e}"
+            );
+            let d = block.nrows();
+            let mut shifted = block.clone();
+            for i in 0..d {
+                shifted[[i, i]] += ridge_t + bump;
+            }
+            assert!(
+                cholesky_factor_in_place(shifted.view(), CholeskyGuard::NonnegativePivot).is_some(),
+                "[{label}] H_tt + (ridge_t + bump={bump:e})·I must be PD after the \
+                 Gershgorin bump, but the Cholesky still rejected it"
+            );
+        }
+    }
+
+    /// The column-major variant (multi-GPU tile path) must agree with the
+    /// row-major helper for a symmetric block, since Gershgorin edges are
+    /// invariant under reading the symmetric matrix by row vs by column. The
+    /// colmajor variant takes the bound at ridge_t=0 (the ridge is already baked
+    /// into the diagonal it reads), so compare against `ridge_bump_to_make_pd`
+    /// with `ridge_t = 0`.
+    #[test]
+    fn ridge_bump_colmajor_matches_rowmajor_for_symmetric_block() {
+        // Symmetric 3×3 with a negative-definite-ish diagonal and off-diagonals.
+        let mut a = Array2::<f64>::zeros((3, 3));
+        a[[0, 0]] = -2.0;
+        a[[1, 1]] = 0.5;
+        a[[2, 2]] = 1.0;
+        a[[0, 1]] = 0.3;
+        a[[1, 0]] = 0.3;
+        a[[1, 2]] = -0.4;
+        a[[2, 1]] = -0.4;
+        a[[0, 2]] = 0.1;
+        a[[2, 0]] = 0.1;
+
+        let row_major_bump = ridge_bump_to_make_pd(a.view(), 0.0);
+
+        // Flatten column-major: block[c*d + r] = a[[r, c]].
+        let d = 3;
+        let mut col_major = vec![0.0_f64; d * d];
+        for c in 0..d {
+            for r in 0..d {
+                col_major[c * d + r] = a[[r, c]];
+            }
+        }
+        let col_major_bump = ridge_bump_to_make_pd_colmajor(&col_major, d);
+
+        assert!(
+            (row_major_bump - col_major_bump).abs() <= 1e-12 * row_major_bump.max(1.0),
+            "colmajor bump {col_major_bump:e} must match rowmajor bump \
+             {row_major_bump:e} for a symmetric block"
+        );
+
+        // And the bump must actually make it PD (sanity, same as the row-major test).
+        let mut shifted = a.clone();
+        for i in 0..d {
+            shifted[[i, i]] += col_major_bump;
+        }
+        assert!(
+            cholesky_factor_in_place(shifted.view(), CholeskyGuard::NonnegativePivot).is_some(),
+            "colmajor Gershgorin bump must make the symmetric block PD"
+        );
+    }
+
     fn device_pcg_fixture(k: usize) -> (Array2<f64>, Array1<f64>) {
         let mut s = Array2::<f64>::zeros((k, k));
         for row in 0..k {
@@ -5704,60 +5951,405 @@ mod tests {
                 }
             };
 
-        // CPU dense reduced-system solve of the SAME framed system: form S via
-        // the CPU oracle matvec on the identity, then solve S·δβ = rhs.
-        let mut s_dense = Array2::<f64>::zeros((border_dim, border_dim));
-        for col in 0..border_dim {
-            let mut e = vec![0.0_f64; border_dim];
-            e[col] = 1.0;
-            let mut sc = vec![0.0_f64; border_dim];
-            sae_framed_schur_matvec_cpu(&sys, &data, ridge_t, ridge_beta, &e, &mut sc)
-                .expect("cpu matvec");
-            for r in 0..border_dim {
-                s_dense[[r, col]] = sc[r];
-            }
-        }
-        let factor = cholesky_factor_in_place(s_dense.view(), CholeskyGuard::NonnegativePivot)
-            .expect("S PD");
-        let cpu = cholesky_solve_vector(factor.view(), rhs.view());
-
-        let scale = cpu.iter().fold(0.0_f64, |m, v| m.max(v.abs())).max(1.0);
-        let mut max_rel = 0.0_f64;
-        for a in 0..border_dim {
-            max_rel = max_rel.max((device[a] - cpu[a]).abs() / scale);
-        }
-        // #1551 divergence triage (max_rel=0.91 once the device actually engages):
-        // disambiguate matvec-bug vs PCG-non-convergence vs operator-mismatch.
-        // Residual of the DEVICE solution against the CPU operator S_cpu: if the
-        // device solved the SAME operator and converged, ‖S_cpu·device − rhs‖ ≈ 0;
-        // a large residual means the device matvec is a DIFFERENT operator (kernel
-        // bug), whereas a small residual with large max_rel would indicate a
-        // (near-)singular S where both solves are valid. Also surface what the
-        // device PCG thought it did (stopping reason / iters / final residual).
-        let mut s_dev_resid = 0.0_f64;
-        {
-            let sx = s_dense.dot(&device);
+        // #1551 PARITY GATE — operator-residual, NOT solution-vector equality.
+        //
+        // The honest GPU↔CPU contract for an iterative solve of `S·δβ = rhs` is
+        // that the device solution SOLVES the system DEFINED BY THE CPU ORACLE to
+        // PCG tolerance — i.e. `‖S_cpu·δβ_device − rhs‖ / ‖rhs‖ ≤ tol`, where
+        // `S_cpu` is applied with the bit-for-bit CPU oracle matvec the device
+        // kernel mirrors (`sae_framed_schur_matvec_cpu`). This is the correct,
+        // conditioning-robust gate: a near-singular assembled `S` has a large
+        // condition number `κ(S)`, which amplifies an O(ε) residual difference
+        // into an O(κ·ε) *solution-vector* difference, so comparing δβ vectors
+        // would spuriously fail even when both operators are bit-identical and
+        // both solves converged. (Historically this test compared δβ against a
+        // dense-Cholesky reference and "failed" with max_rel≈0.9 because the
+        // dense solve itself only reached ‖S·x−rhs‖≈0.1 on this fixture's
+        // ill-conditioned S while the device PCG reached ~1e-12 — the device was
+        // MORE accurate than the reference, not wrong. The kernel correctness is
+        // pinned conditioning-free by `framed_sae_device_matvec_matches_cpu_oracle_*`.)
+        let rhs_norm = rhs.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let oracle_resid = |x: &Array1<f64>| -> f64 {
+            let mut sx = vec![0.0_f64; border_dim];
+            sae_framed_schur_matvec_cpu(
+                &sys,
+                &data,
+                ridge_t,
+                ridge_beta,
+                x.as_slice().unwrap(),
+                &mut sx,
+            )
+            .expect("cpu oracle matvec");
+            let mut acc = 0.0_f64;
             for a in 0..border_dim {
-                s_dev_resid = s_dev_resid.max((sx[a] - rhs[a]).abs());
+                let e = sx[a] - rhs[a];
+                acc += e * e;
             }
-        }
-        let s_cpu_resid = {
-            let sc = s_dense.dot(&cpu);
-            let mut m = 0.0_f64;
-            for a in 0..border_dim {
-                m = m.max((sc[a] - rhs[a]).abs());
-            }
-            m
+            acc.sqrt()
         };
+        let s_dev_resid = oracle_resid(&device);
+        let dev_rel_resid = s_dev_resid / rhs_norm.max(1e-300);
+
+        // Independent CPU iterative solve of the SAME operator with the SAME
+        // Jacobi preconditioner the device builds, via the shared `pcg_core`. If
+        // the device kernel computed a different operator, the two converged
+        // residuals could not BOTH be tiny.
+        let precond = {
+            let d = sae_frame_penalty_diag_host_for_test(&data, ridge_beta);
+            // The reduced-Schur diagonal subtraction (device `arrow_sae_frame_diag_sub`)
+            // mirrored on the host for the Jacobi preconditioner.
+            let mut diag = d;
+            for (i, row) in sys.rows.iter().enumerate() {
+                let slab = &data.frame.as_ref().unwrap().row_htbeta[i];
+                let qi = sys.row_dims[i];
+                if slab.is_empty() || qi == 0 || slab.len() != qi * border_dim {
+                    continue;
+                }
+                let mut block = row.htt.clone();
+                for dd in 0..qi {
+                    block[[dd, dd]] += ridge_t;
+                }
+                let factor = cholesky_factor_in_place(block.view(), CholeskyGuard::NonnegativePivot)
+                    .expect("row htt PD");
+                // ainv = (H_tt+ρI)⁻¹ column by column.
+                let mut ainv = Array2::<f64>::zeros((qi, qi));
+                for col in 0..qi {
+                    let mut e = Array1::<f64>::zeros(qi);
+                    e[col] = 1.0;
+                    let s = cholesky_solve_vector(factor.view(), e.view());
+                    for r in 0..qi {
+                        ainv[[r, col]] = s[r];
+                    }
+                }
+                for a in 0..border_dim {
+                    let mut quad = 0.0_f64;
+                    for c in 0..qi {
+                        let hc = slab[c * border_dim + a];
+                        for dd in 0..qi {
+                            quad += hc * ainv[[c, dd]] * slab[dd * border_dim + a];
+                        }
+                    }
+                    diag[a] -= quad;
+                }
+            }
+            Array1::from_vec(diag)
+        };
+        let mut cpu = Array1::<f64>::zeros(border_dim);
+        let cpu_result = {
+            let mut apply = |v: &Array1<f64>, out: &mut Array1<f64>| {
+                let mut tmp = vec![0.0_f64; border_dim];
+                sae_framed_schur_matvec_cpu(
+                    &sys,
+                    &data,
+                    ridge_t,
+                    ridge_beta,
+                    v.as_slice().unwrap(),
+                    &mut tmp,
+                )
+                .expect("cpu oracle matvec");
+                out.assign(&Array1::from_vec(tmp));
+            };
+            gam_linalg::pcg::pcg_core(
+                &mut apply,
+                &rhs.view(),
+                &precond.view(),
+                1e-12,
+                800,
+                32,
+                false,
+                gam_linalg::pcg::DotReduction::Serial,
+                &mut cpu.view_mut(),
+            )
+        };
+        let s_cpu_resid = oracle_resid(&cpu);
+        let cpu_rel_resid = s_cpu_resid / rhs_norm.max(1e-300);
+
+        // GATE 1: the device solution solves the CPU-oracle system to PCG-grade
+        // accuracy (proves device kernel == CPU operator AND device PCG converged).
         assert!(
-            max_rel <= 1e-7,
-            "[#1551 framed-triage] max_rel={max_rel:e} | device-vs-CPU-operator residual \
-             ‖S_cpu·device−rhs‖={s_dev_resid:e} (CPU's own ={s_cpu_resid:e}) | device PCG \
-             stop={:?} iters={} final_rel_resid={:e} — large operator-residual ⇒ device matvec \
-             is a different operator (kernel bug); small ⇒ PCG/precond or singular-S issue",
+            dev_rel_resid <= 1e-7,
+            "[#1551] device δβ does not solve the CPU-oracle system: \
+             ‖S_cpu·device−rhs‖/‖rhs‖={dev_rel_resid:e} (>1e-7) | abs={s_dev_resid:e} | \
+             device PCG stop={:?} iters={} final_rel_resid={:e} — a large operator residual \
+             means the device matvec is a DIFFERENT operator (kernel bug)",
             diag.stopping_reason,
             diag.iterations,
             diag.final_relative_residual,
         );
+        // GATE 2: the independent CPU iterative solve of the same operator with the
+        // same preconditioner also converges — both paths agree on the operator.
+        assert!(
+            cpu_rel_resid <= 1e-6,
+            "[#1551] CPU pcg_core failed to solve the oracle system: \
+             ‖S_cpu·cpu−rhs‖/‖rhs‖={cpu_rel_resid:e} (stop={:?}, iters={}) — fixture/oracle issue",
+            cpu_result.stop,
+            cpu_result.iterations,
+        );
+    }
+
+    /// Host mirror of the device `sae_frame_penalty_diag_host` for the framed
+    /// Jacobi preconditioner (penalty diagonal only; the reduced-Schur diagonal
+    /// subtraction is applied by the caller). Test-only.
+    fn sae_frame_penalty_diag_host_for_test(
+        data: &DeviceSaePcgData,
+        ridge_beta: f64,
+    ) -> Vec<f64> {
+        let frame = data.frame.as_ref().expect("frame");
+        let mut diag = vec![ridge_beta; data.beta_dim];
+        for (blk, &r) in data.smooth_blocks.iter().zip(frame.smooth_ranks.iter()) {
+            let m = blk.factor_a.nrows();
+            for ia in 0..m {
+                let coeff = blk.factor_a[[ia, ia]];
+                let base = blk.global_offset + ia * r;
+                for ib in 0..r {
+                    diag[base + ib] += coeff;
+                }
+            }
+        }
+        for blk in &frame.frame_blocks {
+            if blk.atom_i != blk.atom_j {
+                continue;
+            }
+            let r = frame.ranks[blk.atom_i];
+            let off = frame.border_offsets[blk.atom_i];
+            let (mi, mj) = blk.g.dim();
+            for li in 0..mi.min(mj) {
+                let gii = blk.g[[li, li]];
+                let base = off + li * r;
+                for a in 0..r {
+                    diag[base + a] += gii * blk.w[[a, a]];
+                }
+            }
+        }
+        diag
+    }
+
+    /// #1551 DEFINITIVE kernel-correctness proof: the framed reduced-Schur matvec
+    /// `out = S·x` must agree with the CPU oracle [`sae_framed_schur_matvec_cpu`]
+    /// element-wise, for several independent `x`, to ≤ 1e-9. This is the parity
+    /// gate that actually localizes a kernel/marshalling defect — unlike a
+    /// solved-`δβ` comparison, it does NOT route through a linear solve, so it is
+    /// independent of the conditioning of the assembled `S` (a near-singular `S`
+    /// can make a dense-Cholesky vector and an iterative-PCG vector disagree at
+    /// the *solution* level even when both operators are bit-correct; the
+    /// operator itself must still match here). Fails loud if CUDA is present but
+    /// the device matvec declines; skips cleanly only when no device exists.
+    #[test]
+    fn framed_sae_device_matvec_matches_cpu_oracle_when_cuda_admits() {
+        use crate::arrow_schur::{
+            DeviceSaeFrameData, DeviceSaePcgData, DeviceSaeSmoothBlock, FactoredFrameGBlock,
+        };
+
+        // Hand-checkable frame fixture: a mix of framed (r<p) and identity-ride
+        // (r==p) atoms, a few off-diagonal cross blocks, dense per-row H_tβ.
+        let p = 6usize;
+        let n_atoms = 8usize;
+        let ranks: Vec<usize> = (0..n_atoms)
+            .map(|k| if k % 2 == 0 { 3usize } else { p })
+            .collect();
+        let basis_sizes: Vec<usize> = (0..n_atoms).map(|_| 3usize).collect();
+        let mut border_offsets = Vec::with_capacity(n_atoms);
+        let mut acc = 0usize;
+        for k in 0..n_atoms {
+            border_offsets.push(acc);
+            acc += basis_sizes[k] * ranks[k];
+        }
+        let border_dim = acc;
+
+        let mut state = 0x1551_0017_1026_0922u64;
+        let mut sample = || -> f64 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f64) / ((1u64 << 31) as f64) - 1.0
+        };
+        let mut frames: Vec<Array2<f64>> = Vec::new();
+        for k in 0..n_atoms {
+            let r = ranks[k];
+            let mut u = Array2::<f64>::zeros((p, r));
+            for i in 0..p {
+                for j in 0..r {
+                    u[[i, j]] = if r == p && i == j {
+                        1.0
+                    } else if r == p {
+                        0.0
+                    } else {
+                        sample()
+                    };
+                }
+            }
+            frames.push(u);
+        }
+        let w_of = |i: usize, j: usize| {
+            let (ui, uj) = (&frames[i], &frames[j]);
+            let (ri, rj) = (ranks[i], ranks[j]);
+            let mut w = Array2::<f64>::zeros((ri, rj));
+            for a in 0..ri {
+                for b in 0..rj {
+                    let mut s = 0.0;
+                    for c in 0..p {
+                        s += ui[[c, a]] * uj[[c, b]];
+                    }
+                    w[[a, b]] = s;
+                }
+            }
+            w
+        };
+        let mut pairs: Vec<(usize, usize)> = (0..n_atoms).map(|k| (k, k)).collect();
+        for &(i, j) in &[(0usize, 1usize), (2, 4), (3, 6)] {
+            pairs.push((i, j));
+            pairs.push((j, i));
+        }
+        let mut frame_blocks = Vec::new();
+        for &(i, j) in &pairs {
+            let (mi, mj) = (basis_sizes[i], basis_sizes[j]);
+            let mut g = Array2::<f64>::zeros((mi, mj));
+            for r in 0..mi {
+                for c in 0..mj {
+                    g[[r, c]] = 0.25 * sample();
+                }
+            }
+            if i == j {
+                for r in 0..mi.min(mj) {
+                    g[[r, r]] += mi as f64 + 2.0;
+                }
+            }
+            frame_blocks.push(FactoredFrameGBlock {
+                atom_i: i,
+                atom_j: j,
+                g,
+                w: w_of(i, j),
+            });
+        }
+        let mut smooth_blocks = Vec::new();
+        let mut smooth_ranks = Vec::new();
+        for k in 0..n_atoms {
+            let m = basis_sizes[k];
+            let mut a = Array2::<f64>::zeros((m, m));
+            for r in 0..m {
+                for c in 0..m {
+                    a[[r, c]] = 0.2 * sample();
+                }
+            }
+            let mut s = a.t().dot(&a);
+            for r in 0..m {
+                s[[r, r]] += 1.0;
+            }
+            smooth_blocks.push(DeviceSaeSmoothBlock {
+                global_offset: border_offsets[k],
+                factor_a: s,
+            });
+            smooth_ranks.push(ranks[k]);
+        }
+        // Modest row count: this seam bypasses the offload floor, so we keep the
+        // fixture small and the per-row reduced-Schur term well-scaled — the
+        // matvec parity does not depend on the assembled-S conditioning at all.
+        let n = 32usize;
+        let q = 4usize;
+        let mut sys = ArrowSchurSystem::new(n, q, border_dim);
+        let mut row_htbeta = Vec::new();
+        for i in 0..n {
+            let mut a = Array2::<f64>::zeros((q, q));
+            for r in 0..q {
+                for c in 0..q {
+                    a[[r, c]] = sample();
+                }
+            }
+            let mut htt = a.t().dot(&a);
+            for r in 0..q {
+                htt[[r, r]] += q as f64 + 1.0;
+            }
+            sys.rows[i].htt = htt;
+            let mut slab = vec![0.0_f64; q * border_dim];
+            for c in 0..q {
+                for col in 0..border_dim {
+                    let v = 0.3 * sample();
+                    slab[c * border_dim + col] = v;
+                    sys.rows[i].htbeta[[c, col]] = v;
+                }
+            }
+            row_htbeta.push(slab);
+        }
+        let ridge_t = 1e-7;
+        let ridge_beta = 1e-6;
+        let data = DeviceSaePcgData {
+            p,
+            beta_dim: border_dim,
+            a_phi: std::sync::Arc::from(Vec::new().into_boxed_slice()),
+            local_jac: std::sync::Arc::from(Vec::new().into_boxed_slice()),
+            smooth_blocks,
+            sparse_g_blocks: Vec::new(),
+            frame: Some(DeviceSaeFrameData {
+                ranks: ranks.clone(),
+                basis_sizes: basis_sizes.clone(),
+                border_offsets: border_offsets.clone(),
+                frame_blocks,
+                smooth_ranks,
+                row_htbeta,
+            }),
+        };
+
+        // Several independent probe vectors x, including unit axes and dense
+        // random — a marshalling stride/offset bug shows up as a per-component
+        // mismatch on at least one.
+        let mut probes: Vec<Array1<f64>> = Vec::new();
+        probes.push(Array1::from_shape_fn(border_dim, |a| {
+            ((a as f64 + 1.0) * 0.37).sin()
+        }));
+        probes.push(Array1::from_shape_fn(border_dim, |_| sample()));
+        for axis in [0usize, border_dim / 3, border_dim - 1] {
+            let mut e = Array1::<f64>::zeros(border_dim);
+            e[axis] = 1.0;
+            probes.push(e);
+        }
+
+        let mut any_ran = false;
+        let mut worst = 0.0_f64;
+        for (pi, x) in probes.iter().enumerate() {
+            let device = match super::framed_schur_matvec_once_on_device(
+                &sys, &data, ridge_t, ridge_beta, x,
+            ) {
+                Ok(out) => out,
+                Err(failure) => {
+                    // Fail loud: a present CUDA device that declines this seam
+                    // (which deliberately ignores the offload floor) means the
+                    // framed matvec kernel does not run on GPU.
+                    assert!(
+                        gam_gpu::device_runtime::GpuRuntime::global().is_none(),
+                        "#1551: CUDA device present but the framed device matvec \
+                         declined/faulted (probe {pi}, tag: {failure:?}) — the kernel \
+                         does not run on GPU"
+                    );
+                    return;
+                }
+            };
+            any_ran = true;
+            let mut cpu = vec![0.0_f64; border_dim];
+            sae_framed_schur_matvec_cpu(&sys, &data, ridge_t, ridge_beta, x.as_slice().unwrap(), &mut cpu)
+                .expect("cpu oracle matvec");
+            let scale = cpu.iter().fold(0.0_f64, |m, v| m.max(v.abs())).max(1.0);
+            for a in 0..border_dim {
+                let rel = (device[a] - cpu[a]).abs() / scale;
+                worst = worst.max(rel);
+                assert!(
+                    rel <= 1e-9,
+                    "[#1551 matvec-parity] probe {pi} component {a}: device={:e} cpu={:e} \
+                     rel={rel:e} (>1e-9) — framed S·x kernel diverges from the CPU oracle",
+                    device[a],
+                    cpu[a],
+                );
+            }
+        }
+        if any_ran {
+            // Positive on-device confirmation: the framed matvec ran on the GPU
+            // and matched the CPU oracle across every probe. (1e-9 is far above
+            // the ~1e-13 fp64 GEMV round-off; a structural marshalling bug would
+            // be O(1).)
+            assert!(
+                gam_gpu::device_runtime::GpuRuntime::global().is_some(),
+                "#1551: matvec ran but no GPU runtime — unexpected"
+            );
+            assert!(worst <= 1e-9, "framed matvec parity worst rel = {worst:e}");
+        }
     }
 }

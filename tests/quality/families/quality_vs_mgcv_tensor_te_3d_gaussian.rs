@@ -139,32 +139,38 @@ fn gam_te_3d_recovers_nonadditive_surface() {
         .expect("rebuild 3-D tensor design at training points");
     let gam_fitted: Vec<f64> = design.design.apply(&fit.fit.beta).to_vec();
 
-    // [#1074 DIAGNOSTIC] additive-vs-tensor: does gam recover the additive truth
-    // better with an additive model than with te()? Isolates te()-construction
-    // (tensor interaction handling) from the marginal basis quality.
-    for diag_formula in [
-        "y ~ s(x1, k=5) + s(x2, k=5) + s(x3, k=5)",
-        "y ~ te(x1, x2, x3, k=8)",
-    ] {
-        if let Ok(FitResult::Standard(df)) = fit_from_formula(diag_formula, &ds, &cfg) {
-            let dd = build_term_collection_design(grid.view(), &df.resolvedspec).unwrap();
-            let dfit: Vec<f64> = dd.design.apply(&df.fit.beta).to_vec();
-            let drmse = {
-                let m = dfit
-                    .iter()
-                    .zip(y.iter())
-                    .map(|(a, b)| (a - b) * (a - b))
-                    .sum::<f64>()
-                    / dfit.len() as f64;
-                m.sqrt()
-            };
-            eprintln!(
-                "[#1074-te3d-diag] {diag_formula} :: edf={:.3} converged={} rmse_vs_truth={:.5}",
-                df.fit.edf_total().unwrap_or(f64::NAN),
-                df.fit.outer_converged,
-                drmse,
-            );
-        }
+    // [#1074 DIAGNOSTIC] additive-vs-tensor: does gam recover the additive part
+    // of the truth with a purely additive model? Isolates the te()-construction
+    // (tensor-interaction handling) from the marginal basis quality — an additive
+    // model CANNOT represent the sin(2πx1)·x2·x3 cross term, so its residual
+    // rmse_vs_truth is exactly the interaction energy the te() smooth must add.
+    //
+    // NOTE: this used to also fit `te(x1,x2,x3,k=8)` as a "higher-k drives the
+    // floor toward 0" cross-check, but that 8³=512-coefficient 3-D tensor on
+    // n=384 rows is the steep 3-D-tensor cost cliff tracked in #1082 — it runs
+    // for >15 min of CPU and SIGTERM-ed this whole test before the (passing)
+    // assertions below ever ran. The k=5 `cr` floor is established analytically
+    // in the assertion comment and confirmed by mgcv landing at the identical
+    // rmse, so the hanging higher-k fit added nothing the assertion needs.
+    let diag_formula = "y ~ s(x1, k=5) + s(x2, k=5) + s(x3, k=5)";
+    if let Ok(FitResult::Standard(df)) = fit_from_formula(diag_formula, &ds, &cfg) {
+        let dd = build_term_collection_design(grid.view(), &df.resolvedspec).unwrap();
+        let dfit: Vec<f64> = dd.design.apply(&df.fit.beta).to_vec();
+        let drmse = {
+            let m = dfit
+                .iter()
+                .zip(y.iter())
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum::<f64>()
+                / dfit.len() as f64;
+            m.sqrt()
+        };
+        eprintln!(
+            "[#1074-te3d-diag] {diag_formula} :: edf={:.3} converged={} rmse_vs_truth={:.5}",
+            df.fit.edf_total().unwrap_or(f64::NAN),
+            df.fit.outer_converged,
+            drmse,
+        );
     }
 
     // ---- fit the SAME model with mgcv (the mature reference) --------------
@@ -216,18 +222,21 @@ fn gam_te_3d_recovers_nonadditive_surface() {
     // and mgcv — the gold-standard reference with the identical k=5 cr margins —
     // lands at the SAME 0.79% (gam_rmse == mgcv_rmse to 4 d.p., rel_l2≈6e-4).
     // The original "well under 0.5%" bar was therefore below the basis floor and
-    // unreachable by ANY correct cr implementation at k=5 (mgcv included); the
-    // diagnostic above confirms k=8 margins drive RMSE to ~0 (the surface IS
-    // representable at higher k). We assert recovery to within 1.0% of the
-    // amplitude: comfortably above the verified k=5 cr floor yet still tight
-    // enough that a dropped margin / wrong Kronecker order (which leaves the
-    // x1:x2:x3 cross term unrecovered) blows past it. The match-or-beat-mgcv
-    // assertion below pins the accuracy claim to the mature reference itself.
+    // unreachable by ANY correct cr implementation at k=5 (mgcv included). The
+    // surface IS representable at higher k (raising the margin toward an
+    // interpolant drives the floor toward 0), but fitting an 8³ tensor inline to
+    // demonstrate that hangs on the #1082 3-D cost cliff, so we rely on the
+    // analytic floor + the bit-for-bit mgcv agreement instead. We assert recovery
+    // to within 1.0% of the amplitude: comfortably above the verified k=5 cr
+    // floor yet still tight enough that a dropped margin / wrong Kronecker order
+    // (which leaves the x1:x2:x3 cross term unrecovered) blows past it. The
+    // match-or-beat-mgcv assertion below pins the accuracy claim to the mature
+    // reference itself.
     let recovery_bar = 0.010 * signal_range;
     assert!(
         gam_rmse <= recovery_bar,
         "gam fails to recover the 3-D tensor surface: rmse={gam_rmse:.5} > bar={recovery_bar:.5} \
-         (0.5% of signal_range={signal_range:.4})"
+         (1.0% of signal_range={signal_range:.4})"
     );
 
     // SECONDARY claim: match-or-beat the mature reference ON ACCURACY. gam's

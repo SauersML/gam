@@ -971,12 +971,39 @@ impl<'a> RemlState<'a> {
         // `beta.len()` that `InnerSolutionBuilder::build` asserts. The Hessian
         // operator and `e_for_logdet` are already projected by the caller; this
         // moves the penalty roots in lockstep (`R_k → R_k z`).
+        //
+        // Frame consistency (#509 second face): the free basis `z`, the
+        // projected Hessian `ZᵀHZ`, the projected design `XZ`, and the reduced
+        // `β = Zᵀβ_transformed` all live in the TRANSFORMED (post-Qs / post
+        // box-reparam `T`) PIRLS frame. The penalty coordinates feed the inner
+        // penalty quadratic `½βᵀS_kβ` and the IFT mode-response RHS `S_kβ`, so
+        // they must live in that same transformed frame; otherwise a
+        // non-orthogonal reparameterization (cumulative-sum `T` and the
+        // stabilizing `Qs` for a monotone box-reparam smooth) desyncs the outer
+        // gradient from the cost (analytic ≠ central-difference) and the Arc
+        // trust-region rejects every step. `build_penalty_coords()` returns the
+        // ORIGINAL-frame (pre-Qs) roots; under an active set, project the
+        // TRANSFORMED-frame `reparam_result.canonical_transformed` roots instead
+        // (the same per-component roots the projected `log|S|₊` derivatives now
+        // read). When `Qs = I` (no reparameterization) the two frames coincide,
+        // so this is a no-op for the ordinary active-set paths.
         let penalty_coords = match free_basis {
-            Some(z) => self
-                .build_penalty_coords()
-                .iter()
-                .map(|coord| coord.project_into_subspace(z))
-                .collect(),
+            Some(z) => {
+                let original_coords = self.build_penalty_coords();
+                let transformed = &pirls_result.reparam_result.canonical_transformed;
+                let base_coords: Vec<_> = if transformed.len() == original_coords.len() {
+                    transformed
+                        .iter()
+                        .map(|cp| cp.to_penalty_coordinate())
+                        .collect()
+                } else {
+                    original_coords
+                };
+                base_coords
+                    .iter()
+                    .map(|coord| coord.project_into_subspace(z))
+                    .collect()
+            }
             None => self.build_penalty_coords(),
         };
         super::assembly::InnerAssembly {
@@ -1861,6 +1888,29 @@ impl<'a> RemlState<'a> {
         }
         let n = self.y.len();
         if n < ALO_STABILIZATION_MIN_N {
+            return Ok(None);
+        }
+        // #1033 n-free κ-loop: when the inner Gaussian solve was served by the
+        // ψ-keyed sufficient-statistic Gram cache (`row_prediction_is_stale`),
+        // the surface's realized rows — `x_transformed`, `finalmu`, the working
+        // weights — are FROZEN at the pinning ψ of the last `reset_surface`, NOT
+        // this trial's ψ. `compute_alo_diagnostics_from_pirls` would (a) cost a
+        // full O(n·k) leverage pass (the dense design materialization + n hat
+        // values `h_ii = w_i x_iᵀ H⁻¹ x_i`) on EVERY in-window κ-trial — the last
+        // O(n) term defeating the issue's sufficient-statistic invariant — and
+        // (b) read those stale rows, so the leverage it returns describes the
+        // wrong ψ. The stabilizer is an OUTER-OPTIMIZER aid, never part of the
+        // genuine REML/LAML criterion (see the header comment), so skipping it on
+        // the stale-row lane changes no fitted result: the slow-path anchor (one
+        // realization per design revision) still carries a non-stale cache and
+        // keeps the leverage barrier engaged at the pinning ψ. Gate strictly on
+        // the installed cache being the stale-row tensor cache, so every
+        // realized-design eval (slow path, off-window, non-Gaussian) keeps the
+        // exact augmentation.
+        if self
+            .installed_gaussian_fixed_cache()
+            .is_some_and(|cache| cache.row_prediction_is_stale)
+        {
             return Ok(None);
         }
         // Suppress the stabilizer on near-saturated / over-parameterized designs

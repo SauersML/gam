@@ -100,6 +100,17 @@ impl PyAtomBirthGate {
         matches!(self.gate.verdict(), GateVerdict::Certified { .. })
     }
 
+    /// The realized time-to-certification: the shard count at which the running
+    /// supremum first crossed `1/alpha`, or `None` if it never has. This is the
+    /// first-passage time the design budget predicts; it is recorded SEPARATELY
+    /// from the absorbed-shard count, which keeps growing past the crossing
+    /// (absorption does not stop, so the dictionary-level e-BH certificate can
+    /// clear its higher multiplicity bar).
+    #[getter]
+    fn certified_at_step(&self) -> Option<usize> {
+        self.gate.certified_at_step()
+    }
+
     /// The current verdict: `{"verdict": "certified"|"contested", "log_e",
     /// "e_value", "alpha"}`. A contested gate has not *disproven* the atom —
     /// it has failed to prove it; its `log_e` is the value the dictionary-level

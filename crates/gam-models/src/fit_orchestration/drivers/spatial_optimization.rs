@@ -2351,6 +2351,14 @@ fn prescan_isotropic_spatial_range_seed(
             if set_spatial_length_scale(&mut probe, term_idx, ls).is_err() {
                 continue;
             }
+            // Each probe MUST run an independent, cold ρ-optimization: the
+            // strict-improvement ranking below only compares apples-to-apples if
+            // every grid point reaches its own ρ* from the same neutral start.
+            // Warm-starting a probe from the previous (adjacent-κ) probe's λ
+            // biases its ρ-optimum toward the neighbour's basin and corrupts the
+            // ranking — it re-strands the ν=3/2 fit in the long-range
+            // over-smoothing basin (boundary recovery regression). So this is a
+            // cold `fit_term_collection_forspec`, deliberately not warm-started.
             let fit = match fit_term_collection_forspec(
                 data,
                 y,
@@ -2383,6 +2391,133 @@ fn prescan_isotropic_spatial_range_seed(
         }
     }
     Ok(overrides)
+}
+
+/// Fractions of each isotropic term's data-derived ψ window used as joint-solve
+/// restart seeds in the #1688 multistart rescue. They run from the long-range
+/// (stiff) corner at `0.0` through the short-range (flexible) corner at `1.0`,
+/// deliberately spanning BOTH local basins of the multimodal `[ρ, ψ]` REML
+/// surface so a restart lands in the global basin regardless of which side the
+/// auto-seed stranded the primary solve on. Five points keep the rare-trigger
+/// cost bounded while guaranteeing a seed in the long-range half (which the
+/// profiled-REML pre-scan systematically under-ranks for the roughest kernels).
+const JOINT_RESTART_WINDOW_FRACTIONS: [f64; 5] = [0.0, 0.2, 0.45, 0.7, 1.0];
+
+/// #1688 joint-solve multistart from a single ψ-window fraction.
+///
+/// Re-seeds every isotropic spatial term's length scale to `ℓ = exp(−ψ)` at the
+/// requested `fraction` of its data-derived ψ window, then runs the FULL
+/// baseline → freeze → joint `[ρ, ψ]` sequence at that geometry and returns the
+/// realized result with its certified REML score. This is the same machinery the
+/// primary path runs — only the seed differs — so a candidate it returns is a
+/// genuine production fit, never a heuristic stand-in.
+///
+/// Returns `Ok(None)` only when the seed geometry is non-constructible (e.g. a
+/// baseline fit that errors at an extreme range, or no free length scale after
+/// the freeze-time basis promotion); callers treat that as "this restart point
+/// is infeasible, skip it" rather than failing the fit. When the joint refine
+/// itself yields no usable candidate, the seed's frozen baseline geometry is a
+/// valid κ-optimized result (ρ profiled at the fixed seeded κ) and is returned.
+fn joint_solve_from_window_fraction(
+    data: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    base_spec: &TermCollectionSpec,
+    spatial_terms: &[usize],
+    fraction: f64,
+    family: &LikelihoodSpec,
+    options: &FitOptions,
+    baseline_options: &FitOptions,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
+) -> Result<Option<(FittedTermCollectionWithSpec, f64)>, EstimationError> {
+    let mut seed_spec = base_spec.clone();
+    let mut any_set = false;
+    for &term_idx in spatial_terms {
+        if get_spatial_length_scale(&seed_spec, term_idx).is_none() {
+            continue;
+        }
+        let (psi_lo, psi_hi) = spatial_term_psi_bounds(data, &seed_spec, term_idx, kappa_options);
+        if !(psi_lo.is_finite() && psi_hi.is_finite()) || psi_hi <= psi_lo {
+            continue;
+        }
+        let psi = psi_lo + (psi_hi - psi_lo) * fraction;
+        let ls = (-psi).exp();
+        if !ls.is_finite() || ls <= 0.0 {
+            continue;
+        }
+        if set_spatial_length_scale(&mut seed_spec, term_idx, ls).is_ok() {
+            any_set = true;
+        }
+    }
+    if !any_set {
+        return Ok(None);
+    }
+    // Baseline at the seeded geometry: this both supplies the joint solver's ρ
+    // seed / frozen-baseline fallback AND becomes the returned candidate if the
+    // joint refine is unavailable. A non-constructible seed geometry is skipped.
+    let seed_best = match fit_term_collection_forspec(
+        data,
+        y,
+        weights,
+        offset,
+        &seed_spec,
+        family.clone(),
+        baseline_options,
+    ) {
+        Ok(fit) => fit,
+        Err(_) => return Ok(None),
+    };
+    let seed_spec = freeze_term_collection_from_design(&seed_spec, &seed_best.design)?;
+    // The freeze can promote ThinPlate → pure Duchon (no free length scale);
+    // refresh the eligible-term list exactly as the primary path does.
+    let seed_terms = spatial_length_scale_term_indices(&seed_spec);
+    if seed_terms.is_empty() {
+        let score = fit_score(&seed_best.fit);
+        return Ok(Some((
+            FittedTermCollectionWithSpec {
+                fit: seed_best.fit,
+                design: seed_best.design,
+                resolvedspec: seed_spec,
+                adaptive_diagnostics: seed_best.adaptive_diagnostics,
+                kappa_timing: None,
+            },
+            score,
+        )));
+    }
+    let joint = try_exact_joint_spatial_length_scale_optimization(
+        data,
+        y,
+        weights,
+        offset,
+        &seed_spec,
+        &seed_best,
+        family.clone(),
+        options,
+        kappa_options,
+        &seed_terms,
+    )?;
+    match joint {
+        Some(fit) => {
+            let score = fit_score(&fit.fit);
+            Ok(Some((fit, score)))
+        }
+        // Joint refine unavailable for this seed; its frozen baseline geometry
+        // is itself a valid κ-optimized fit, so return that as the candidate.
+        None => {
+            let score = fit_score(&seed_best.fit);
+            Ok(Some((
+                FittedTermCollectionWithSpec {
+                    fit: seed_best.fit,
+                    design: seed_best.design,
+                    resolvedspec: seed_spec,
+                    adaptive_diagnostics: seed_best.adaptive_diagnostics,
+                    kappa_timing: None,
+                },
+                score,
+            )))
+        }
+    }
 }
 
 fn try_exact_joint_spatial_length_scale_optimization(
@@ -3938,6 +4073,26 @@ fn run_exact_joint_spatial_optimization(
     // off-window trials, or any other ineligibility silently keep the exact
     // streamed path (same numbers, the tensor is certified to
     // PSI_GRAM_SPOT_RTOL against the exact rebuild).
+    // #1033 (rank-stable κ-floor): set to the lowest ψ at which the certified
+    // tensor's conditioned Gram holds maximal numerical rank. Below it the
+    // reduced basis collapses/rotates and the design-realization skip is SOUNDLY
+    // refused (→ O(n) reset_surface); the κ window floor `ln(2/r_max)` lands
+    // inside that degenerate sliver and DRIFTS with n through the sample-std
+    // standardization, so n=2000's line search re-enters the slow lane while
+    // n=1000's does not. Lifting the optimizer's lower bound to this n-FREE
+    // (k-space) floor keeps every in-window trial on the fast path for all n,
+    // and only excludes over-smoothed length scales the `2/r_max` geometry floor
+    // already meant to exclude (the κ-optimum lives well above it).
+    let mut psi_rank_stable_floor: Option<f64> = None;
+    // #1033 (rank-stable κ-ceiling): symmetric twin of the floor. The conditioned
+    // Gram is rank-deficient at the HIGH window edge too (the longest-frequency
+    // radial mode goes collinear), so a line-search overshoot above the maximal-
+    // rank band soundly refuses the design-realization skip → O(n) reset_surface,
+    // and the deficient pinning ψ it records makes the NEXT in-band trial reset a
+    // second time. Clamping the optimizer's UPPER bound to this n-free k-space
+    // ceiling keeps every trial inside the band. The κ-optimum lives well inside
+    // it, so the clamp only excludes over-fit (too-short) length scales.
+    let mut psi_rank_stable_ceiling: Option<f64> = None;
     let nfree_penalty_capable = coord_dim == 1
         && family.is_gaussian_identity()
         && ctx.cache.supports_nfree_penalty_rekey();
@@ -3968,6 +4123,61 @@ fn run_exact_joint_spatial_optimization(
                 "[{label}] certified ψ-gram tensor over [{psi_lo:.3}, {psi_hi:.3}]: \
                  in-window trials assemble Gaussian sufficient statistics n-free"
             );
+            // #1033: read the n-free rank-stable κ-floor off the k-space tensor.
+            // Only lift INTO the window (never below psi_lo, never above the seed
+            // ψ — the seed is the geometric-mean midpoint and is well clear of the
+            // degenerate band), so the optimizer never starts outside its bounds.
+            let psi_anchor = theta0[rho_dim];
+            psi_rank_stable_floor = evaluator
+                .psi_gram_rank_stable_floor(psi_anchor)
+                .filter(|&f| f.is_finite() && f > psi_lo && f < psi_anchor);
+            log::info!(
+                "[KAPPA-PHASE-FLOOR] n_rows={} psi_lo={psi_lo:.6} psi_anchor={psi_anchor:.6} \
+                 rank_stable_floor={:?} lifted={}",
+                data.nrows(),
+                evaluator.psi_gram_rank_stable_floor(psi_anchor),
+                psi_rank_stable_floor.is_some(),
+            );
+            if let Some(floor) = psi_rank_stable_floor {
+                log::info!(
+                    "[{label}] rank-stable κ-floor ψ_floor={floor:.6} > window floor \
+                     ψ_lo={psi_lo:.6}: lifting the optimizer lower bound to keep every \
+                     in-window trial on the n-free design-realization skip (#1033). The \
+                     conditioned Gram is rank-deficient below ψ_floor (longest-length-scale \
+                     radial mode collapses into the nullspace), where the skip is soundly \
+                     refused; that band drifts with n via the sample-std standardization, \
+                     so this n-free k-space floor is the n-independent fix."
+                );
+            }
+            // #1033: read the n-free rank-stable κ-CEILING (symmetric twin of the
+            // floor). Only clamp INTO the window (strictly below psi_hi, strictly
+            // above the seed ψ — the seed is the geometric-mean midpoint, well
+            // inside the maximal-rank band), so the optimizer never starts outside
+            // its bounds. This is the fix for the n=16000 fast-ladder resets: the
+            // line search overshot to ψ≈1.0 (rank 11→10 at the high edge), tripping
+            // two O(n) reset_surface calls; clamping the upper bound keeps the
+            // search inside the band where the n-free skip stays sound.
+            psi_rank_stable_ceiling = evaluator
+                .psi_gram_rank_stable_ceiling(psi_anchor)
+                .filter(|&c| c.is_finite() && c < psi_hi && c > psi_anchor);
+            log::info!(
+                "[KAPPA-PHASE-CEIL] n_rows={} psi_hi={psi_hi:.6} psi_anchor={psi_anchor:.6} \
+                 rank_stable_ceiling={:?} clamped={}",
+                data.nrows(),
+                evaluator.psi_gram_rank_stable_ceiling(psi_anchor),
+                psi_rank_stable_ceiling.is_some(),
+            );
+            if let Some(ceiling) = psi_rank_stable_ceiling {
+                log::info!(
+                    "[{label}] rank-stable κ-ceiling ψ_ceil={ceiling:.6} < window ceiling \
+                     ψ_hi={psi_hi:.6}: clamping the optimizer upper bound to keep every \
+                     in-window trial on the n-free design-realization skip (#1033). The \
+                     conditioned Gram is rank-deficient above ψ_ceil (longest-frequency \
+                     radial mode goes collinear), where the skip is soundly refused; a \
+                     line-search overshoot there trips the O(n) reset_surface lane (and the \
+                     deficient pinning ψ it records resets the next in-band trial too)."
+                );
+            }
             let gradient_covers_full_window = evaluator.psi_gram_tensor_covers_gradient(psi_lo)
                 && evaluator.psi_gram_tensor_covers_gradient(psi_hi);
             if gradient_covers_full_window {
@@ -4068,14 +4278,26 @@ fn run_exact_joint_spatial_optimization(
     // Gated strictly to diagnostic-sized problems (auto-derived from the
     // realized (n, θ_dim), no flag) so it never taxes a production fit. The
     // same gate the n-block driver uses.
+    //
+    // #1688: the audit's whole output is a logged verdict (`log_verdict`,
+    // below) — it never feeds the optimizer — yet it costs `1 + 2·theta_dim`
+    // extra full REML evaluations (one `ValueGradientHessian` plus a central
+    // pair of `ValueOnly` per coordinate). On the common small spatial fit
+    // (n≤4000, the gate ceiling) that is a real fraction of total fit time
+    // spent purely to produce a diagnostic that is suppressed at the default
+    // `Warn` verbosity anyway. So additionally gate on `Info` being enabled:
+    // the gradient-FD-audit regression tests install an `Info` logger and keep
+    // exercising it; an ordinary production fit at the quiet default skips the
+    // extra evals entirely.
     // FD-OK: FD-audit of the analytic outer gradient (small-problem gate, never feeds the optimizer)
     const OUTER_FD_AUDIT_MAX_N: usize = 4_000; // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
     const OUTER_FD_AUDIT_MAX_THETA_DIM: usize = 32; // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
     let n_total = data.nrows();
-    let outer_fd_audit_eligible = analytic_outer_hessian_available // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
+    let outer_fd_audit_eligible = log::log_enabled!(log::Level::Info) // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
+        && analytic_outer_hessian_available // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
         && n_total <= OUTER_FD_AUDIT_MAX_N // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
         && theta_dim <= OUTER_FD_AUDIT_MAX_THETA_DIM; // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
-    log::warn!(
+    log::info!(
         "[OUTER-FD-AUDIT/spatial-exact-joint] gate eligible={outer_fd_audit_eligible} \
          analytic_grad={analytic_outer_hessian_available} n_total={n_total} \
          theta_dim={theta_dim} rho_dim={rho_dim} psi_dim={coord_dim}"
@@ -4133,7 +4355,8 @@ fn run_exact_joint_spatial_optimization(
     let kphase_prime_start = std::time::Instant::now();
     drop(ctx.eval_full(theta0, kphase_prime_order, analytic_outer_hessian_available)?);
     log::info!(
-        "[KAPPA-PHASE-PRIME] order={:?} elapsed_s={:.4} slow_path_resets_total={} design_revision={}",
+        "[KAPPA-PHASE-PRIME] n_rows={} order={:?} elapsed_s={:.4} slow_path_resets_total={} design_revision={}",
+        data.nrows(),
         kphase_prime_order,
         kphase_prime_start.elapsed().as_secs_f64(),
         ctx.evaluator.slow_path_reset_count(),
@@ -4157,6 +4380,39 @@ fn run_exact_joint_spatial_optimization(
     let kphase_log_kappa_dim = coord_dim;
     let kphase_slow_resets_start = ctx.evaluator.slow_path_reset_count();
     let kphase_design_revision_start = ctx.cache.design_revision();
+
+    // #1033: lift the ψ (log-κ) lower bound to the n-free rank-stable floor so the
+    // optimizer never line-searches into the rank-deficient sliver where the
+    // design-realization skip is soundly refused (→ O(n) reset_surface). The lift
+    // touches ONLY the single design-moving ψ coordinate at `rho_dim`; all ρ
+    // bounds are untouched. `psi_rank_stable_floor` is already constrained to lie
+    // strictly inside `(psi_lo, theta0[rho_dim])`, so theta0 stays feasible.
+    let lower_effective: std::borrow::Cow<'_, Array1<f64>> = match psi_rank_stable_floor {
+        Some(floor) if coord_dim == 1 && floor > lower[rho_dim] => {
+            let mut lifted = lower.clone();
+            lifted[rho_dim] = floor;
+            std::borrow::Cow::Owned(lifted)
+        }
+        _ => std::borrow::Cow::Borrowed(lower),
+    };
+    let lower = lower_effective.as_ref();
+
+    // #1033: clamp the ψ (log-κ) upper bound DOWN to the n-free rank-stable ceiling
+    // so the optimizer never line-searches into the high-edge rank-deficient sliver
+    // where the design-realization skip is soundly refused (→ O(n) reset_surface,
+    // plus a second reset from the deficient pinning ψ). Touches ONLY the single
+    // design-moving ψ coordinate at `rho_dim`; all ρ bounds are untouched.
+    // `psi_rank_stable_ceiling` is already constrained to lie strictly inside
+    // `(theta0[rho_dim], psi_hi)`, so theta0 stays feasible.
+    let upper_effective: std::borrow::Cow<'_, Array1<f64>> = match psi_rank_stable_ceiling {
+        Some(ceiling) if coord_dim == 1 && ceiling < upper[rho_dim] => {
+            let mut clamped = upper.clone();
+            clamped[rho_dim] = ceiling;
+            std::borrow::Cow::Owned(clamped)
+        }
+        _ => std::borrow::Cow::Borrowed(upper),
+    };
+    let upper = upper_effective.as_ref();
 
     let problem = exact_joint_multistart_outer_problem(
         theta0,
@@ -4398,7 +4654,8 @@ fn run_exact_joint_spatial_optimization(
         .design_revision()
         .saturating_sub(kphase_design_revision_start);
     log::info!(
-        "[KAPPA-PHASE-SUMMARY] log_kappa_dim={} n_cost={} cost_total_s={:.4} n_eval={} eval_total_s={:.4} n_efs={} efs_total_s={:.4} slow_path_resets={} design_revision_delta={} nfree_miss_shape={} nfree_miss_value={} nfree_miss_gradient={} nfree_miss_penalty={} nfree_miss_revision={} nfree_miss_second_order={} nfree_miss_other={} optim_total_s={:.4}",
+        "[KAPPA-PHASE-SUMMARY] n_rows={} log_kappa_dim={} n_cost={} cost_total_s={:.4} n_eval={} eval_total_s={:.4} n_efs={} efs_total_s={:.4} slow_path_resets={} design_revision_delta={} nfree_miss_shape={} nfree_miss_value={} nfree_miss_gradient={} nfree_miss_penalty={} nfree_miss_revision={} nfree_miss_second_order={} nfree_miss_other={} optim_total_s={:.4}",
+        data.nrows(),
         kphase_log_kappa_dim,
         kphase_cost_calls.get(),
         kphase_cost_total_s.get(),
@@ -8052,6 +8309,16 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
     if !initial_score.is_finite() {
         log::debug!("[spatial-kappa] initial profiled score is non-finite");
     }
+    // #1688: snapshot the per-term seed length scales the joint solve starts
+    // from. If the joint solve neither improves the score NOR moves the geometry
+    // off these values, it stalled and kept the frozen baseline — the precise
+    // signature that triggers the ψ-window multistart rescue below. (A joint
+    // solve that genuinely converged to its seed basin still moves ψ off the
+    // exact seed, so this distinguishes a stall from a healthy local optimum.)
+    let seed_length_scales: Vec<(usize, f64)> = spatial_terms
+        .iter()
+        .filter_map(|&t| get_spatial_length_scale(&resolvedspec, t).map(|ls| (t, ls)))
+        .collect();
     let joint_result = try_exact_joint_spatial_length_scale_optimization(
         data,
         y.view(),
@@ -8098,6 +8365,113 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
     } else {
         require_successful_spatial_optimization_result(initial_score, joint_result)?
     };
+
+    // #1688: conditional joint-solve MULTISTART rescue.
+    //
+    // The joint [ρ, ψ] REML surface of an isotropic radial GP smooth is genuinely
+    // multimodal in the kernel range, and the local ARC/BFGS solver descends into
+    // whichever basin holds its seed. When the auto-seed (`max_range/√n`, the
+    // wiggly side since #1629) lands in a flat valley between the two basins, the
+    // local solver STALLS — it returns NonConverged at a large gradient and keeps
+    // the frozen baseline geometry, so the realized score never improves on the
+    // seed's profiled REML (the observed ν=3/2 boundary over-smoothing: edge RMSE
+    // 4× the interior, REML ~7 nats worse than the reachable global basin).
+    //
+    // The #1074 pre-scan does not rescue this case: it ranks restart seeds by
+    // FIXED-κ profiled REML (ρ-opt at fixed ψ), which is a poor predictor of the
+    // JOINT outcome reachable from a seed — the global-basin seeds score WORSE on
+    // the profiled proxy than the stalled auto-seed basin, so the strict-
+    // improvement gate adopts none of them. The only honest ranking is the
+    // realized joint REML itself.
+    //
+    // So: only when the primary joint solve produced NO REML improvement over its
+    // baseline (the exact stall signature) do we re-run the full baseline → joint
+    // sequence from a handful of seeds spanning the data-derived ψ window (long-
+    // range corner through short-range corner) and keep the best REALIZED joint
+    // score. This fires on a vanishing fraction of fits — a healthy joint solve
+    // that moves ψ off the seed improves the score and skips the rescue entirely,
+    // so the matern/GP fast path #1688 is about keeps its speed. Isotropic/non-CC
+    // only: anisotropic and constant-curvature terms carry their own seeding.
+    let exact_joint = {
+        let primary_score = fit_score(&exact_joint.fit);
+        let improved = primary_score.is_finite()
+            && initial_score.is_finite()
+            && primary_score < initial_score - 1e-7 * initial_score.abs().max(1.0);
+        // Base the eligibility checks and the restart seeds on the realized
+        // (frozen, κ-optimized) spec the primary path produced: it carries the
+        // same term structure with resolved centers, and the parent `resolvedspec`
+        // has already been moved into `exact_joint` on the pre-scan fallback path.
+        let base_spec = exact_joint.resolvedspec.clone();
+        // Did the joint solve keep the frozen baseline geometry (no length scale
+        // moved off its seed)? That, combined with no score gain, is the stall.
+        let geometry_unchanged = !seed_length_scales.is_empty()
+            && seed_length_scales.iter().all(|&(t, seed_ls)| {
+                get_spatial_length_scale(&base_spec, t)
+                    .is_some_and(|ls| (ls - seed_ls).abs() <= 1e-6 * seed_ls.abs().max(1.0))
+            });
+        let eligible = !improved
+            && geometry_unchanged
+            && !has_aniso_terms(&base_spec, &spatial_terms)
+            && constant_curvature_term_indices(&base_spec).is_empty()
+            && spatial_terms
+                .iter()
+                .any(|&t| get_spatial_length_scale(&base_spec, t).is_some());
+        if eligible {
+            log::info!(
+                "[spatial-kappa] #1688 joint solve stalled at REML {primary_score:.5} \
+                 (no improvement over baseline {initial_score:.5}); running ψ-window \
+                 multistart rescue across {} seeds",
+                JOINT_RESTART_WINDOW_FRACTIONS.len(),
+            );
+            let mut best_fit = exact_joint;
+            // Lower REML is better; the incumbent is the primary stalled result.
+            let mut best_score = primary_score;
+            for &fraction in JOINT_RESTART_WINDOW_FRACTIONS.iter() {
+                match joint_solve_from_window_fraction(
+                    data,
+                    y.view(),
+                    weights.view(),
+                    offset.view(),
+                    &base_spec,
+                    &spatial_terms,
+                    fraction,
+                    &family,
+                    options,
+                    &baseline_options,
+                    kappa_options,
+                ) {
+                    Ok(Some((candidate, score))) => {
+                        if score.is_finite()
+                            && (!best_score.is_finite()
+                                || score < best_score - 1e-7 * best_score.abs().max(1.0))
+                        {
+                            log::info!(
+                                "[spatial-kappa] #1688 multistart seed (ψ-window {fraction:.2}) \
+                                 reached REML {score:.5}, improving on {best_score:.5}",
+                            );
+                            best_score = score;
+                            best_fit = candidate;
+                        }
+                    }
+                    // Infeasible seed geometry — skip this restart point.
+                    Ok(None) => {}
+                    // A restart's full re-fit can hit a genuine fatal error; the
+                    // incumbent (the primary result) is already valid, so log and
+                    // keep going rather than sinking the whole fit on one seed.
+                    Err(e) => {
+                        log::info!(
+                            "[spatial-kappa] #1688 multistart seed (ψ-window {fraction:.2}) \
+                             failed ({e}); skipping"
+                        );
+                    }
+                }
+            }
+            best_fit
+        } else {
+            exact_joint
+        }
+    };
+
     log_spatial_aniso_scales(&exact_joint.resolvedspec);
     Ok(exact_joint)
 }
@@ -8404,8 +8778,12 @@ fn fitted_rho_penalty_components(
 /// 2. For each penalized smooth term, refit a null model with that term dropped
 ///    from the spec; `W = max(2(ℓ_full − ℓ_null), 0)`.
 /// 3. The reference d.f. `d` is the Wood truncation `tr(F)²/tr(F²)` on the
-///    term's influence block (falling back to the term EDF) — the same `ref_df`
-///    the summary Wald row reports.
+///    term's influence block (the same `ref_df` the summary Wald row reports),
+///    floored at `max(edf, null_dim, 1)`: this LR test drops the whole term, so
+///    `d` is at least the dimension the term spans when present (its null-space
+///    dimension, never below 1). The non-symmetric `tr(F²)` can collapse toward
+///    0 at a shrunk-to-null fit and violate that bound — see the inline note at
+///    the `ref_df` binding.
 /// 4. When the family has closed-form cumulant jets, evaluate Lawley's ε at the
 ///    **null** linear predictor (an expectation evaluated at the null fit), fold
 ///    the full λ-scaled penalty `S_λ` into the information, and Bartlett-correct
@@ -8490,7 +8868,34 @@ pub fn smooth_term_lr_inference_forspec(
         // is not materialised. (Same per-block over-count class as the multinomial
         // `edf_per_class` fix.)
         let edf = full.fit.per_term_edf(coeff_range.clone(), block_start, k);
-        let ref_df = wood_reference_df(influence, &coeff_range).unwrap_or(edf.max(1e-12));
+        // The term's unpenalized null-space dimension — the polynomial
+        // directions (constant/linear/…) a penalized smooth always carries when
+        // present, which no roughness penalty can shrink. This is the minimum
+        // effective dimension a "term present vs entirely absent" LR test can
+        // possibly have; flooring the reference d.f. below it is meaningless.
+        let null_dim: usize = design_term.nullspace_dims.iter().sum();
+        // χ² reference d.f. for the whole-term LR test. The statistic W tests the
+        // term present vs entirely absent, so the reference d.f. must be at least
+        // the dimension the term spans when present — i.e. at least its null-space
+        // dimension, and never below 1 (you cannot test "is this function present"
+        // with fewer than one degree of freedom). The Wood truncation
+        // `tr(F)²/tr(F²)` is the Wood (2013) "edf1" reference and satisfies
+        // `edf1 ≥ edf` analytically, BUT the coefficient influence
+        // `F = H⁻¹X'WX` is NON-symmetric, and as REML shrinks a term onto its
+        // null space the off-diagonal coupling in the term block blows up:
+        // `tr(F²) = Σ_ij F_ij F_ji` runs away (~1e12) while `tr(F) = edf` stays
+        // small, so `tr(F)²/tr(F²)` collapses toward 0. Referencing a positive
+        // `W` against `χ²_{~0}` then reports a flat, shrunk-to-null term as
+        // MAXIMALLY significant (`p ~ 1e-12`) — a Type-I error decided by a
+        // degenerate reference d.f., not the data (#1766). Floor at
+        // `max(edf, null_dim, 1)`: in calibrated and high-power fits the Wood
+        // d.f. already dominates, so the floor binds ONLY on the degenerate
+        // collapse and leaves those fits byte-identical.
+        let ref_df = wood_reference_df(influence, &coeff_range)
+            .unwrap_or(0.0)
+            .max(edf)
+            .max(null_dim.max(1) as f64)
+            .max(1e-12);
         if !(ref_df.is_finite() && ref_df > 0.0) {
             continue;
         }

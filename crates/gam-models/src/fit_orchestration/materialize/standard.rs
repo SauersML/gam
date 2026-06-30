@@ -71,7 +71,7 @@ pub(crate) fn materialize_standard<'a>(
         term_data,
         gam_runtime::resource::ProblemHints::default(),
     );
-    let spec = build_termspec_with_geometry_and_overrides(
+    let mut spec = build_termspec_with_geometry_and_overrides(
         &term_parsed.terms,
         term_data,
         &term_col_map,
@@ -80,6 +80,14 @@ pub(crate) fn materialize_standard<'a>(
         &policy,
         config.smooth_overrides.as_ref(),
     )?;
+    // #1074: the Duchon default penalty is a Hilbert scale (curvature +
+    // mass/tension operator dials). REML deselects the lower orders faithfully
+    // only in the ProfiledGaussian arm; under a fixed-dispersion GLM the LAML
+    // criterion mis-rewards the near-full-rank operator-Gram blocks for
+    // over-shrinking the mean. Drop them for non-Gaussian-identity fits so the
+    // default matches mgcv's single-curvature `bs="ds"`; the Gaussian path is
+    // untouched and keeps the full scale.
+    gate_duchon_operator_penalties_for_family(&mut spec, &family);
 
     // Sample size vs basis-rank gate (#309). Each smooth basis answers
     // `min_sample_rows()` for itself; this helper just sums and compares.

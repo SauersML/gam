@@ -216,14 +216,34 @@ impl GpuRuntime {
     pub fn global() -> Option<&'static Self> {
         static RUNTIME: OnceLock<Option<GpuRuntime>> = OnceLock::new();
         RUNTIME
-            .get_or_init(|| match Self::probe() {
-                Ok(runtime) => runtime,
-                Err(err) => {
-                    let reason = err.to_string();
-                    Self::record_cpu_reason(reason.clone());
-                    diagnostics::log_cuda_disabled(&reason);
-                    None
+            .get_or_init(|| {
+                let runtime = match Self::probe() {
+                    Ok(runtime) => runtime,
+                    Err(err) => {
+                        let reason = err.to_string();
+                        Self::record_cpu_reason(reason.clone());
+                        diagnostics::log_cuda_disabled(&reason);
+                        None
+                    }
+                };
+                // Install the dense-GEMM dispatch hook exactly when a usable
+                // device was probed. Without this, `gam_linalg::faer_ndarray::fast_ab`
+                // (and the `fast_atb`/`fast_av`/`xt_diag_x` family) never sees a
+                // dispatcher — `gpu_dispatch()` stays `None` — so every dense
+                // product in the engine silently runs on the CPU even when the
+                // V100 is present and the workload clears the policy flop floor.
+                // The hook is a first-write-wins `OnceLock` keyed only on the
+                // presence of a runtime; registering it here, inside the same
+                // `get_or_init` that decides the runtime, guarantees it is
+                // installed before any `fast_ab` caller can observe a `Some`
+                // runtime. The policy gate inside each `try_*` still decides
+                // CPU-vs-GPU per call, so small products are unaffected.
+                if runtime.is_some() {
+                    gam_linalg::gpu_hook::register_gpu_dispatch(Box::new(
+                        super::linalg_dispatch::CudaGemmDispatch,
+                    ));
                 }
+                runtime
             })
             .as_ref()
     }

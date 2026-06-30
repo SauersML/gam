@@ -10,6 +10,12 @@
 //! their numeric checks behind `device_resident()`, so they never ran the device
 //! path on real hardware; this one is not skipped off-the-narrow-shape and asserts
 //! the wide-border (k >> n*d) device solve plus end-to-end device-fit convergence.
+//!
+//! Linux-only: this test uses the Linux-targeted `cudarc` dependency and the
+//! `#[cfg(target_os = "linux")]` `cuda_context_for` directly, so it is gated to
+//! Linux (CI is Linux; it still skips at runtime on CPU-only hosts). Without the
+//! gate it fails to compile on macOS, where `cudarc`/`cuda_context_for` do not exist.
+#![cfg(target_os = "linux")]
 
 use cudarc::cublas::CudaBlas;
 use gam::gpu::device_runtime::{GpuRuntime, cuda_context_for};

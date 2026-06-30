@@ -157,6 +157,12 @@ mod tests_row_jet_and_outer_objective_780;
 mod tests_deflation_traces_780;
 
 #[cfg(test)]
+mod tests_logdet_adjoint_780;
+
+#[cfg(test)]
+mod tests_pen_fd_780;
+
+#[cfg(test)]
 mod tests_isometry_exact_hvp_majorizer_457;
 
 #[cfg(test)]

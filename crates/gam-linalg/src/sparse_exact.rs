@@ -1333,6 +1333,112 @@ mod tests {
         approx_eq(sfactor.logdet, logdet_dense, 1e-10);
     }
 
+    // ── trace_product_sparse (rayon parallel reduction, #759) ─────────────────
+
+    /// Dense reference tr(H^{-1} S) computed by a completely different code path:
+    /// an explicit dense Cholesky-based inverse and an elementwise double sum.
+    fn dense_trace_ref(h: &Array2<f64>, s: &Array2<f64>) -> f64 {
+        let n = h.nrows();
+        let chol = h.cholesky(Side::Lower).unwrap();
+        let mut h_inv = Array2::<f64>::zeros((n, n));
+        for j in 0..n {
+            let mut rhs = Array1::<f64>::zeros(n);
+            rhs[j] = 1.0;
+            let col = chol.solvevec(&rhs);
+            for i in 0..n {
+                h_inv[[i, j]] = col[i];
+            }
+        }
+        // tr(H^{-1} S) = sum_ij (H^{-1})_ij S_ij  (S symmetric here).
+        let mut trace = 0.0;
+        for i in 0..n {
+            for j in 0..n {
+                trace += h_inv[[i, j]] * s[[i, j]];
+            }
+        }
+        trace
+    }
+
+    #[test]
+    fn trace_product_sparse_matches_dense_small() {
+        // Small SPD H with off-diagonal structure; S has off-diagonal and
+        // off-H-pattern entries, forcing exact-inverse column solves.
+        let h = array![
+            [4.0, 0.2, 0.0, 0.0],
+            [0.2, 3.0, 0.1, 0.0],
+            [0.0, 0.1, 2.5, 0.3],
+            [0.0, 0.0, 0.3, 2.0]
+        ];
+        // S includes entry (0,3)/(3,0) which is OUTSIDE H's sparsity pattern,
+        // so trace_product_sparse must recover it via a cached column solve.
+        let s = array![
+            [1.0, 0.5, 0.0, 0.7],
+            [0.5, 2.0, 0.3, 0.0],
+            [0.0, 0.3, 1.5, 0.4],
+            [0.7, 0.0, 0.4, 3.0]
+        ];
+
+        let h_sparse = dense_to_sparse_symmetric_upper(&h, ZERO_TOL).unwrap();
+        let sfactor = factorize_simplicial(&h_sparse).unwrap();
+        let taka = TakahashiInverse::compute(&sfactor).unwrap();
+
+        // Full symmetric storage for S (both triangles).
+        let s_sparse = dense_to_sparse(&s, ZERO_TOL).unwrap();
+        let got = taka.trace_product_sparse(&s_sparse);
+        let expected = dense_trace_ref(&h, &s);
+
+        let rel = (got - expected).abs() / expected.abs().max(1.0);
+        assert!(
+            rel <= 1e-9,
+            "trace mismatch: got={got:.15e}, expected={expected:.15e}, rel={rel:.3e}"
+        );
+    }
+
+    #[test]
+    fn trace_product_sparse_matches_dense_large_parallel() {
+        // ~40 columns so the rayon reduction fans out across threads.
+        let n = 40usize;
+        let mut h = Array2::<f64>::zeros((n, n));
+        let mut s = Array2::<f64>::zeros((n, n));
+        for i in 0..n {
+            // Strongly diagonally dominant => SPD.
+            h[[i, i]] = (n as f64) + 5.0 + (i as f64) * 0.1;
+            s[[i, i]] = 1.0 + (i as f64) * 0.05;
+        }
+        // Tridiagonal-ish off-diagonals for H (its sparsity pattern).
+        for i in 0..n - 1 {
+            let v = 0.3 + 0.01 * (i as f64);
+            h[[i, i + 1]] = v;
+            h[[i + 1, i]] = v;
+        }
+        // S off-diagonals deliberately reach OUTSIDE H's tridiagonal pattern
+        // (stride-3 and a couple of long-range entries) so that many distinct
+        // columns require concurrent cache-miss exact-inverse solves.
+        for i in 0..n - 3 {
+            let v = 0.2 + 0.005 * (i as f64);
+            s[[i, i + 3]] = v;
+            s[[i + 3, i]] = v;
+        }
+        s[[0, n - 1]] = 0.4;
+        s[[n - 1, 0]] = 0.4;
+        s[[2, n - 5]] = 0.25;
+        s[[n - 5, 2]] = 0.25;
+
+        let h_sparse = dense_to_sparse_symmetric_upper(&h, ZERO_TOL).unwrap();
+        let sfactor = factorize_simplicial(&h_sparse).unwrap();
+        let taka = TakahashiInverse::compute(&sfactor).unwrap();
+
+        let s_sparse = dense_to_sparse(&s, ZERO_TOL).unwrap();
+        let got = taka.trace_product_sparse(&s_sparse);
+        let expected = dense_trace_ref(&h, &s);
+
+        let rel = (got - expected).abs() / expected.abs().max(1.0);
+        assert!(
+            rel <= 1e-9,
+            "trace mismatch (n={n}): got={got:.15e}, expected={expected:.15e}, rel={rel:.3e}"
+        );
+    }
+
     // ── solve_sparse_spdmulti / solve_sparse_spdmulti_rows ───────────────────
 
     #[test]

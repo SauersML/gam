@@ -1441,10 +1441,10 @@ where
                     // term selected out) strictly LOWERS the model's total EDF; a
                     // concurvity TRANSFER (#1476: one null-space shrinks but its
                     // correlated partner absorbs the signal via the inner β re-solve)
-                    // INFLATES it. Pure REML alone marginally prefers the transfer on
-                    // a flat concurvity ridge — exactly the allocation the degeneracy
-                    // prior exists to forbid — so the escape must additionally refuse
-                    // any adoption that does not reduce total EDF.
+                    // does NOT lower it. Pure REML alone marginally prefers the
+                    // transfer on a flat concurvity ridge — exactly the allocation the
+                    // degeneracy prior exists to forbid — so the escape additionally
+                    // refuses any adoption that does not reduce total EDF.
                     let edf_conv = reml_state
                         .obtain_eval_bundle(&strategy_result.rho)
                         .ok()
@@ -1465,52 +1465,146 @@ where
                         }
                         Some(c - prior)
                     };
-                    // Ascending over-smoothing grid in ABSOLUTE ρ (toward the
-                    // shrink-out rail at `RHO_BOUND`); only values strictly above a
-                    // coordinate's current ρ are over-smoothing candidates. Bounded:
-                    // at most 2 · |select| · 6 inner solves, and only fires when a
-                    // null-space coordinate is actually held below the rail.
-                    let rho_upper = crate::estimate::RHO_BOUND;
-                    const OUTWARD_GRID: [f64; 6] = [6.0, 9.0, 12.0, 18.0, 24.0, 30.0];
+                    // PER-TERM shrink-out search (gam#1266), the OUTWARD-direction dual
+                    // of the #1074 inward escape. The unit of an mgcv `select = TRUE`
+                    // shrink-out is the WHOLE SMOOTH TERM, not a single ρ-coordinate:
+                    // the term's effective d.f. is shared between its wiggliness
+                    // penalty and its `DoublePenaltyNullspace` shrinkage ridge, and the
+                    // bulk of the EDF of an only-mildly-penalized term lives in its
+                    // WIGGLINESS coordinate. Over-smoothing the null-space coordinate
+                    // ALONE (the previous behaviour) leaves the wiggliness coordinate
+                    // moderate, so the constrained reparametrization lets the basis
+                    // re-absorb the same EDF elsewhere — the term never actually
+                    // selects out, and pushing that lone coordinate to the λ rail only
+                    // injects a numerical EDF-saturation artifact. The genuine
+                    // shrink-out drives BOTH of a term's coordinates UP TOGETHER to a
+                    // MODERATE level, removing the whole smooth.
+                    //
+                    // Build term groups from the canonical penalties' `col_range`
+                    // (every penalty of one smooth shares its coefficient column
+                    // range), seeded from each well-determined null-space selection
+                    // coordinate. Over-smooth each candidate group jointly across a
+                    // MODERATE band that stops short of the λ-explosion rail (≈ ρ 24+,
+                    // where the inner reparametrization saturates total EDF toward `p`
+                    // and reports a spuriously-low deviance that is pure numerical
+                    // overfit, not a shrink-out). Adopt a group's move only if a COLD
+                    // re-score confirms it BOTH strictly lowers pure data-REML AND does
+                    // not increase the model's total inner EDF:
+                    //   * UNSUPPORTED, uncorrelated term (#1266 `s(z)`): over-smoothing
+                    //     the whole term drops total EDF (z carries no signal, nothing
+                    //     absorbs it) AND lowers pure REML → the escape fires, EDF → 0.
+                    //   * SUPPORTED term (#1371 slope / #1476 correlated `s(x1),s(x2)`):
+                    //     over-smoothing a real partial effect dumps its variance into
+                    //     σ̂², so pure REML strictly RISES across the whole moderate
+                    //     band → rejected on the pure-REML test alone (the concurvity
+                    //     "transfer" only looks cheap at the saturation rail, which the
+                    //     moderate band excludes), and the EDF guard backstops it.
+                    //
+                    // SCOPE: eligible groups are exactly those seeded by a
+                    // well-determined relaxed null-space degeneracy coordinate
+                    // (`is_nullspace_degeneracy_prior`, gated by `n ≥ 2·p`). This
+                    // EXCLUDES the under-determined regime (`n < 2·p`, #1392 `p > n`),
+                    // where the null-space prior is the AGGRESSIVE PC select-out — a
+                    // deliberate, load-bearing push onto a genuinely-flat REML score
+                    // that this data-REML search would undo.
+                    let term_key: Vec<(usize, usize)> = canonical_shared
+                        .iter()
+                        .map(|cp| (cp.col_range.start, cp.col_range.end))
+                        .collect();
+                    // Distinct term groups seeded by a selection coordinate, in first
+                    // appearance order; each group is the full set of penalty
+                    // coordinates sharing the seed's coefficient column range.
+                    let mut groups: Vec<Vec<usize>> = Vec::new();
+                    let mut seen_keys: Vec<(usize, usize)> = Vec::new();
+                    for &sc in &select_coords {
+                        let Some(key) = term_key.get(sc).copied() else {
+                            continue;
+                        };
+                        if seen_keys.contains(&key) {
+                            continue;
+                        }
+                        seen_keys.push(key);
+                        let group: Vec<usize> = (0..strategy_result.rho.len())
+                            .filter(|&i| term_key.get(i).copied() == Some(key))
+                            .collect();
+                        if !group.is_empty() {
+                            groups.push(group);
+                        }
+                    }
+                    // Moderate over-smoothing band: high enough to remove a genuinely
+                    // unsupported smooth, but strictly below the λ-explosion rail
+                    // (`RHO_BOUND` = 30) where total EDF saturates numerically. The
+                    // empirical separation between a real #1266 shrink-out and a
+                    // #1476 concurvity ridge is wide and clean inside [15, 21].
+                    const SHRINK_BAND: [f64; 3] = [15.0, 18.0, 21.0];
                     let mut best_rho = strategy_result.rho.clone();
                     let mut best_pure = base_pure;
+                    let mut best_edf = edf_conv;
                     let mut improved = false;
-                    for _pass in 0..2 {
-                        let mut pass_improved = false;
-                        for &coord in &select_coords {
-                            let mut local_best = best_rho.clone();
-                            let mut local_pure = best_pure;
-                            for &cand in &OUTWARD_GRID {
-                                let target = cand.min(rho_upper);
-                                if target <= best_rho[coord] + 1e-9 {
-                                    continue;
-                                }
-                                let mut probe = best_rho.clone();
-                                probe[coord] = target;
-                                if let Some(c) = pure_reml(&probe)
-                                    && c < local_pure - 1e-6 * (1.0 + local_pure.abs())
-                                {
-                                    local_pure = c;
-                                    local_best = probe;
+                    for group in &groups {
+                        // Warm pure-REML screen over the band; remember the
+                        // most-improving level for this group.
+                        let mut group_best: Option<(Array1<f64>, f64)> = None;
+                        for &lvl in &SHRINK_BAND {
+                            let mut probe = best_rho.clone();
+                            let mut raised = false;
+                            for &i in group {
+                                if lvl > probe[i] + 1e-9 {
+                                    probe[i] = lvl;
+                                    raised = true;
                                 }
                             }
-                            if local_pure < best_pure - 1e-6 * (1.0 + best_pure.abs()) {
-                                best_rho = local_best;
-                                best_pure = local_pure;
-                                improved = true;
-                                pass_improved = true;
+                            if !raised {
+                                continue;
+                            }
+                            if let Some(c) = pure_reml(&probe)
+                                && c < best_pure - 1e-6 * (1.0 + best_pure.abs())
+                                && group_best.as_ref().is_none_or(|(_, gp)| c < *gp)
+                            {
+                                group_best = Some((probe, c));
                             }
                         }
-                        if !pass_improved {
-                            break;
+                        // COLD-confirm the group's best candidate on BOTH axes (the
+                        // warm probes ran off each other's inner warm starts — the
+                        // #1074 lesson): pure REML strictly down AND total EDF not up.
+                        let Some((cand, _)) = group_best else { continue };
+                        reml_state.reset_outer_seed_state();
+                        let cold_pen = reml_state.compute_cost(&cand);
+                        let cold_pure = cold_pen.as_ref().ok().and_then(|&c| {
+                            c.is_finite().then(|| {
+                                c - reml_state.configured_rho_prior_atom(&cand).cost()
+                                    - reml_state.soft_rho_guard_prior_atom(&cand).cost()
+                            })
+                        });
+                        let cand_edf = reml_state
+                            .obtain_eval_bundle(&cand)
+                            .ok()
+                            .map(|b| b.pirls_result.edf);
+                        let parsimonious = match (cand_edf, best_edf) {
+                            (Some(ec), Some(eb)) => ec <= eb + 1e-6,
+                            _ => false,
+                        };
+                        if let Some(cp) = cold_pure
+                            && cp.is_finite()
+                            && cp < best_pure - 1e-6 * (1.0 + best_pure.abs())
+                            && parsimonious
+                        {
+                            best_rho = cand;
+                            best_pure = cp;
+                            best_edf = cand_edf;
+                            improved = true;
                         }
                     }
                     if improved {
-                        // COLD confirmation (mirror of #1074): the warm grid probes
-                        // ran off each other's inner warm starts and can report a
-                        // spuriously-low cost. Clear the inner cache and re-score the
-                        // candidate cold; adopt only if its PURE REML STILL strictly
-                        // beats the authoritative converged baseline.
+                        // Each accepted group move was already cold-confirmed strictly
+                        // cheaper AND parsimonious against the running point, so the
+                        // final `best_rho` strictly beats the converged baseline on
+                        // pure REML without inflating total EDF. Re-score it cold once
+                        // more to install β̂ and recover the PENALIZED cost there (the
+                        // last cold eval in the loop need not have landed on
+                        // `best_rho`), then adopt it as the objective so the cached
+                        // inner state and `final_value` agree with the adopted ρ for
+                        // the downstream cap-guard / assembly.
                         reml_state.reset_outer_seed_state();
                         let cold_penalized = reml_state.compute_cost(&best_rho);
                         let cold_pure = cold_penalized.as_ref().ok().and_then(|&c| {
@@ -1519,42 +1613,24 @@ where
                                     - reml_state.soft_rho_guard_prior_atom(&best_rho).cost()
                             })
                         });
-                        // Total inner EDF at the candidate (cached from the cold eval).
-                        // The PARSIMONY guard: a genuine shrink-out must not INCREASE
-                        // the model's effective dimension (see `edf_conv`). When either
-                        // EDF is unavailable, refuse the adoption — a shrink that can't
-                        // be certified parsimonious is not worth the #1476 risk.
-                        let edf_best = reml_state
-                            .obtain_eval_bundle(&best_rho)
-                            .ok()
-                            .map(|b| b.pirls_result.edf);
-                        let edf_non_increasing = match (edf_best, edf_conv) {
-                            (Some(eb), Some(ec)) => eb <= ec + 1e-6,
-                            _ => false,
-                        };
                         if let (Ok(penalized), Some(cold_pure)) = (cold_penalized, cold_pure)
                             && cold_pure.is_finite()
                             && cold_pure < base_pure - 1e-6 * (1.0 + base_pure.abs())
-                            && edf_non_increasing
                         {
-                            // β̂ already installed at `best_rho` by the cold eval above.
-                            // Report the PENALIZED cost there as the objective so the
-                            // cached inner state and `final_value` agree with the
-                            // adopted ρ for the downstream cap-guard / assembly.
                             log::info!(
                                 "[OUTER] #1266 null-space shrink-out escape: pure REML \
                              {base_pure:.6e} → {cold_pure:.6e} (cold-confirmed), total \
-                             EDF {edf_conv:?} → {edf_best:?} (parsimonious) by \
-                             over-smoothing {} selection coord(s); adopting the \
-                             shrink-out ρ (penalized cost {penalized:.6e})",
-                                select_coords.len()
+                             EDF {edf_conv:?} → {best_edf:?} (parsimonious) by \
+                             over-smoothing whole selection term(s); adopting the \
+                             shrink-out ρ (penalized cost {penalized:.6e})"
                             );
                             strategy_result.rho = best_rho;
                             strategy_result.final_value = penalized;
                         } else {
-                            // The improvement did not survive a cold re-score (or the
-                            // re-score failed) — a warm-start artifact. Keep the
-                            // certified ρ and restore its inner state.
+                            // The assembled point did not survive its final cold
+                            // re-score (or the re-score failed) — a warm-start
+                            // artifact. Keep the certified ρ and restore its inner
+                            // state.
                             reml_state.reset_outer_seed_state();
                             reml_state.compute_cost(&strategy_result.rho)?;
                         }
@@ -2546,6 +2622,57 @@ where
         outer_result.final_grad_norm.unwrap_or(0.0)
     };
 
+    // #1690: reconcile the convergence flag with the AUTHORITATIVE gradient of the
+    // fit we actually ship.
+    //
+    // `outer_result.converged` was decided by the in-loop cost-stall guard from
+    // the projected gradient it saw at the best-by-cost iterate DURING the ρ
+    // search. On a family whose dispersion is profiled into the inner working
+    // weight (Gamma log-link re-estimates the shape every solve) that reading is
+    // warm-start sensitive: at a weakly-identified flat ρ-valley the inner P-IRLS
+    // fixed point — and therefore the analytic ρ-gradient — depends on the β the
+    // solve started from. The guard can then halt `converged=false` on a point
+    // that is in fact stationary, because the gradient it sampled mid-search sat
+    // just above the score-relative bound. The accept-fit above (line ~2034,
+    // `refine_dispersion=true`) lands on the β actually reported and
+    // `compute_gradient` re-measures the ρ-gradient there — this `finalgrad_norm`
+    // is the value surfaced as `outer_gradient_norm`. When that authoritative
+    // gradient clears the SAME score-relative stationarity bound the in-loop guard
+    // uses (`FLAT_VALLEY_CONVERGED_REL_GRAD·(1+|score|)`, capped at
+    // `FLAT_VALLEY_CONVERGED_ABS_GRAD_CAP`), the halt was a false negative: certify
+    // converged. A genuinely non-stationary valley floor — and the #1426 stuck
+    // overfit, whose honest |g|≈11 ≫ bound — never clears it, so its
+    // non-convergence stands. The reconciliation is gated on the flat-valley stop
+    // reason so no other non-convergence path (max-iters, line-search collapse) is
+    // affected.
+    let outer_converged = {
+        let mut converged = outer_result.converged;
+        if !converged
+            && matches!(
+                outer_result.operator_stop_reason,
+                Some(crate::rho_optimizer::OperatorTrustRegionStopReason::CostStallFlatValley)
+            )
+            && finalgrad_norm.is_finite()
+        {
+            let score_relative_bound = (crate::rho_optimizer::FLAT_VALLEY_CONVERGED_REL_GRAD
+                * (1.0 + outer_result.final_value.abs()))
+            .min(crate::rho_optimizer::FLAT_VALLEY_CONVERGED_ABS_GRAD_CAP);
+            if finalgrad_norm <= score_relative_bound {
+                log::info!(
+                    "[OUTER] flat-valley cost-stall RE-CERTIFIED converged: the authoritative \
+                     gradient at the shipped θ̂ (|g|={:.3e}) clears the score-relative \
+                     stationarity bound ({:.3e}); the in-loop halt rode on a warm-start-sensitive \
+                     gradient readout on a flat ρ-valley (score={:.6e}).",
+                    finalgrad_norm,
+                    score_relative_bound,
+                    outer_result.final_value,
+                );
+                converged = true;
+            }
+        }
+        converged
+    };
+
     if opts.compute_inference {
         penalized_hessian = map_hessian_to_original_basis(&pirls_res)?;
         let p_cov = penalized_hessian.nrows();
@@ -2857,7 +2984,7 @@ where
         standard_deviation,
         iterations: iters,
         finalgrad_norm,
-        outer_converged: outer_result.converged,
+        outer_converged,
         pirls_status,
         deviance: pirls_res.deviance,
         stable_penalty_term: pirls_res.stable_penalty_term,

@@ -344,9 +344,45 @@ impl PsiGramTensor {
         psi_hi: f64,
         m: usize,
     ) -> BuildOutcome {
-        // First-kind Chebyshev nodes (no endpoints) and exact design slabs.
+        // #1033 (sufficient-statistic build): the one-time pass must ITSELF be a
+        // sufficient-statistic reduction — it may touch the n data rows once, but
+        // it must never hold or arithmetically process O(n) objects m times. The
+        // earlier build expanded m design-space Chebyshev coefficient SLABS
+        // (`X_d = (γ_d/m) Σ_i X(ψ_i) T_d(x_i)`, each n×k) purely to run a
+        // pre-filter tail certificate, holding all m exact designs AND all m slabs
+        // resident — O(m·n·k) memory (≈157 GB at n=320k, m=513, k=12) and an
+        // O(m²·n·k) coefficient sum that dominated the whole fit's wall-clock and
+        // made the n=320k acceptance sweep un-runnable. None of that O(n) work is
+        // retained: the tensor keeps only the k×k Gram series. So STREAM each
+        // exact node design straight into its weighted k×k sufficient statistic
+        // (Gram `X(ψ_i)ᵀW X(ψ_i)` and RHS `X(ψ_i)ᵀW z`) and DISCARD it before the
+        // next node. Peak memory is O(m·k² + n·k) (one design at a time) and the
+        // only row work is the single O(m·n·k²) node-statistic pass.
         let mut nodes_x = vec![0.0_f64; m];
-        let mut designs: Vec<Array2<f64>> = Vec::with_capacity(m);
+        let mut node_grams: Vec<Array2<f64>> = Vec::with_capacity(m);
+        let mut node_rhs: Vec<Array1<f64>> = Vec::with_capacity(m);
+
+        // Weighted response (n-vector) and zᵀWz, formed once over the data rows.
+        if weights.len() != z.len() || z.is_empty() {
+            return BuildOutcome::EvalFailed(format!(
+                "incompatible build inputs: weights.len()={}, z.len()={}",
+                weights.len(),
+                z.len()
+            ));
+        }
+        let mut wz = Array1::<f64>::zeros(z.len());
+        let mut zt_w_z = 0.0_f64;
+        let mut zt_w_z_comp = 0.0_f64;
+        for ((slot, &w), &zv) in wz.iter_mut().zip(weights.iter()).zip(z.iter()) {
+            *slot = w * zv;
+            let add = w * zv * zv;
+            let y = add - zt_w_z_comp;
+            let t = zt_w_z + y;
+            zt_w_z_comp = (t - zt_w_z) - y;
+            zt_w_z = t;
+        }
+
+        let mut dims: Option<(usize, usize)> = None;
         for (i, x_slot) in nodes_x.iter_mut().enumerate() {
             let x = (std::f64::consts::PI * (2 * i + 1) as f64 / (2 * m) as f64).cos();
             *x_slot = x;
@@ -364,91 +400,30 @@ impl PsiGramTensor {
                     "design at node ψ={psi:.6} contains a non-finite entry"
                 ));
             }
-            designs.push(design);
-        }
-        let (n, k) = designs[0].dim();
-        if designs.iter().any(|d| d.dim() != (n, k)) {
-            return BuildOutcome::EvalFailed(format!(
-                "design dimensions vary across ψ nodes (first node is {n}×{k})"
-            ));
-        }
-        if weights.len() != n || z.len() != n || n == 0 || k == 0 {
-            return BuildOutcome::EvalFailed(format!(
-                "incompatible build inputs: design {n}×{k}, weights.len()={}, z.len()={}",
-                weights.len(),
-                z.len()
-            ));
-        }
-        // First-kind discrete orthogonality: coefficient slabs
-        //   X_d = (γ_d / m) Σ_i X(ψ_i) T_d(x_i),  γ_0 = 1, γ_d = 2.
-        let t_at_nodes: Vec<Vec<f64>> = nodes_x.iter().map(|&x| cheb_t(x, m)).collect();
-        let mut coeff_slabs: Vec<Array2<f64>> = Vec::with_capacity(m);
-        for d in 0..m {
-            let gamma = if d == 0 { 1.0 } else { 2.0 };
-            let mut slab = Array2::<f64>::zeros((n, k));
-            let mut slab_comp = Array2::<f64>::zeros((n, k));
-            for (i, design) in designs.iter().enumerate() {
-                let wgt = gamma / m as f64 * t_at_nodes[i][d];
-                kahan_scaled_add_array2(&mut slab, &mut slab_comp, wgt, design);
-            }
-            coeff_slabs.push(slab);
-        }
-        // Tail-decay certificate per design column: the trailing quarter of the
-        // coefficient slabs must fall below [`PSI_GRAM_CERT_RTOL`] × column
-        // scale.
-        //
-        // #1216: on the WIDE STANDARDIZED geometry default 1-D fits use (#1215)
-        // the per-column Chebyshev tail decays cleanly but GEOMETRICALLY-SLOWLY
-        // (measured ~3.2e-8 at m=33, ~2.3e-11 at m=65 — a ~1300×/doubling decay,
-        // NOT a floor). The previous over-tight 1e-12 bar refused at m=65 and the
-        // n-free fast path never attached. The certificate is a cheap
-        // NECESSARY-CONDITION pre-filter whose job is to guarantee the ASSEMBLED
-        // Gram is accurate enough; that accuracy is authoritatively enforced by
-        // the off-node `spot_check` (`PSI_GRAM_SPOT_RTOL`, on the assembled Gram
-        // against an exact rebuild). Sizing the pre-filter to
-        // [`PSI_GRAM_CERT_RTOL`] = 1e-9 lets the (geometrically-decaying) design
-        // certify at m=65, and the ladder's m=129 rung drives the residual to
-        // ~1.7e-14 so the inner penalized solve's conditioning-amplified β̂ stays
-        // bit-tight. A design that is genuinely non-analytic (a true kink) floors
-        // ORDERS above this and is refused, with the spot-check as the hard
-        // backstop.
-        let mut col_scale = vec![0.0_f64; k];
-        for slab in &coeff_slabs {
-            for (j, scale) in col_scale.iter_mut().enumerate() {
-                for i in 0..n {
-                    *scale = scale.max(slab[[i, j]].abs());
+            let (dn, dk) = design.dim();
+            match dims {
+                None => {
+                    if weights.len() != dn || z.len() != dn || dn == 0 || dk == 0 {
+                        return BuildOutcome::EvalFailed(format!(
+                            "incompatible build inputs: design {dn}×{dk}, weights.len()={}, z.len()={}",
+                            weights.len(),
+                            z.len()
+                        ));
+                    }
+                    dims = Some((dn, dk));
                 }
-            }
-        }
-        let tail_start = m - (m / 4).max(1);
-        for slab in coeff_slabs.iter().skip(tail_start) {
-            for (j, &scale) in col_scale.iter().enumerate() {
-                let bound = PSI_GRAM_CERT_RTOL * scale.max(1e-300);
-                for i in 0..n {
-                    if slab[[i, j]].abs() > bound {
-                        return BuildOutcome::TailNotCertified;
+                Some((n0, k0)) => {
+                    if (dn, dk) != (n0, k0) {
+                        return BuildOutcome::EvalFailed(format!(
+                            "design dimensions vary across ψ nodes (first node is {n0}×{k0}, \
+                             node ψ={psi:.6} is {dn}×{dk})"
+                        ));
                     }
                 }
             }
-        }
-        let mut wz = Array1::<f64>::zeros(z.len());
-        let mut zt_w_z = 0.0_f64;
-        let mut zt_w_z_comp = 0.0_f64;
-        for ((slot, &w), &zv) in wz.iter_mut().zip(weights.iter()).zip(z.iter()) {
-            *slot = w * zv;
-            let add = w * zv * zv;
-            let y = add - zt_w_z_comp;
-            let t = zt_w_z + y;
-            zt_w_z_comp = (t - zt_w_z) - y;
-            zt_w_z = t;
-        }
-        // One-time exact node sufficient statistics, then a first-kind DCT in ψ.
-        // This still pays all row work only during build, but the retained series
-        // approximates G(ψ) and c(ψ) directly instead of multiplying two
-        // separately truncated design series.
-        let mut node_grams: Vec<Array2<f64>> = Vec::with_capacity(m);
-        let mut node_rhs: Vec<Array1<f64>> = Vec::with_capacity(m);
-        for design in &designs {
+            // Weighted Gram / RHS at this node, then the n×k design is dropped.
+            // RHS uses the prebuilt `wz = W z` (same factoring as the exact
+            // streamed path) so the retained series is bit-faithful to it.
             let mut wd = design.clone();
             for (mut row, &w) in wd.outer_iter_mut().zip(weights.iter()) {
                 row.mapv_inplace(|v| v * w);
@@ -456,6 +431,9 @@ impl PsiGramTensor {
             node_grams.push(design.t().dot(&wd));
             node_rhs.push(design.t().dot(&wz));
         }
+        let (_n, k) = dims.expect("node ladder rung m≥1 yields at least one design");
+        // First-kind discrete orthogonality of the Chebyshev nodes.
+        let t_at_nodes: Vec<Vec<f64>> = nodes_x.iter().map(|&x| cheb_t(x, m)).collect();
         let mut gram: Vec<Array2<f64>> = (0..m).map(|_| Array2::<f64>::zeros((k, k))).collect();
         let mut gram_comp: Vec<Array2<f64>> =
             (0..m).map(|_| Array2::<f64>::zeros((k, k))).collect();
@@ -471,8 +449,43 @@ impl PsiGramTensor {
         }
         drop(node_grams);
         drop(node_rhs);
-        drop(designs);
-        drop(coeff_slabs);
+
+        // Tail-decay certificate, now in k-SPACE on the RETAINED Gram/RHS series
+        // rather than the discarded design slabs.
+        //
+        // The series the per-trial path actually evaluates is the assembled Gram
+        // `G(ψ) = Σ_d gram[d] T_d(x(ψ))` and RHS `c(ψ) = Σ_d rhs[d] T_d(x(ψ))`;
+        // their Chebyshev coefficients are exactly what govern the truncated
+        // reconstruction error, so the cheap NECESSARY-CONDITION pre-filter
+        // belongs on THEM, not on the design X(ψ) (whose coefficients only bound
+        // G's tail indirectly, and at O(m·n·k) cost). The trailing quarter of the
+        // Gram (and RHS) coefficient slabs must fall below [`PSI_GRAM_CERT_RTOL`]
+        // × series scale.
+        //
+        // #1216: on the WIDE STANDARDIZED geometry default 1-D fits use (#1215)
+        // the tail decays cleanly but GEOMETRICALLY-SLOWLY, so the m=513 top rung
+        // is sized to drive the residual far below the bar. The certificate stays
+        // a necessary pre-filter; accuracy is authoritatively enforced by the
+        // off-node `spot_check` (`PSI_GRAM_SPOT_RTOL`, assembled Gram vs an exact
+        // rebuild). A genuinely non-analytic design (a true kink) floors ORDERS
+        // above this — its Gram series tail does NOT decay — and is refused here,
+        // with the spot-check as the hard backstop.
+        let gram_scale = gram.iter().fold(0.0_f64, |acc, slab| {
+            acc.max(slab.iter().fold(0.0_f64, |a, &v| a.max(v.abs())))
+        });
+        let rhs_scale = rhs.iter().fold(0.0_f64, |acc, slab| {
+            acc.max(slab.iter().fold(0.0_f64, |a, &v| a.max(v.abs())))
+        });
+        let tail_start = m - (m / 4).max(1);
+        let gram_bound = PSI_GRAM_CERT_RTOL * gram_scale.max(1e-300);
+        let rhs_bound = PSI_GRAM_CERT_RTOL * rhs_scale.max(1e-300);
+        for d in tail_start..m {
+            if gram[d].iter().any(|&v| v.abs() > gram_bound)
+                || rhs[d].iter().any(|&v| v.abs() > rhs_bound)
+            {
+                return BuildOutcome::TailNotCertified;
+            }
+        }
         BuildOutcome::Candidate(Self {
             psi_lo,
             psi_hi,
@@ -642,9 +655,173 @@ impl PsiGramTensor {
             .unwrap_or(false)
     }
 
+    /// The gauge-invariant subspace distance `‖P(ψ_ref) − P(ψ_new)‖₂ = sin θ_max`
+    /// between the two conditioned-Gram range subspaces — the exact quantity
+    /// [`Self::reduced_basis_equal`] thresholds against `PSI_GRAM_SKIP_PROJ_ATOL`.
+    /// Exposed for #1033 frontier instrumentation so a refused n-free skip can be
+    /// attributed to a genuine in-window basis ROTATION (this distance exceeds the
+    /// tolerance at equal rank) versus a rank change. Returns `None` for an
+    /// off-window ψ, an equal-ψ pair, a rank mismatch, or an eigendecomp failure.
+    /// Purely k-space (O(k³)) — independent of n.
+    pub fn reduced_basis_subspace_distance(&self, psi_ref: f64, psi_new: f64) -> Option<f64> {
+        if !(self.contains(psi_ref) && self.contains(psi_new)) {
+            return None;
+        }
+        if psi_ref == psi_new {
+            return Some(0.0);
+        }
+        let (p_ref, r_ref) = self.range_projector(psi_ref, PSI_GRAM_SKIP_RANK_RTOL)?;
+        let (p_new, r_new) = self.range_projector(psi_new, PSI_GRAM_SKIP_RANK_RTOL)?;
+        if r_ref != r_new {
+            return None;
+        }
+        let diff = &p_ref - &p_new;
+        subspace_spectral_distance(&diff)
+    }
+
+    /// Numerical rank of the conditioned Gram `XᵀWX(ψ)` at `psi`, under the same
+    /// relative cutoff (`PSI_GRAM_SKIP_RANK_RTOL`·λ_max) the design-revision skip's
+    /// `reduced_basis_equal` witness uses. Returns `None` for an off-window /
+    /// non-finite / all-zero Gram. Purely k-space (O(k³)) — independent of n.
+    pub fn gram_numerical_rank(&self, psi: f64) -> Option<usize> {
+        if !self.contains(psi) {
+            return None;
+        }
+        self.range_projector(psi, PSI_GRAM_SKIP_RANK_RTOL)
+            .map(|(_, rank)| rank)
+    }
+
+    /// Lower edge of the contiguous ψ-band, ANCHORED at `psi_anchor`, over which
+    /// the conditioned Gram `XᵀWX(ψ)` holds the SAME numerical rank it has at the
+    /// anchor — i.e. the ψ-floor below which the design-revision skip's
+    /// `reduced_basis_equal` witness must (soundly) refuse, because the range
+    /// subspace collapses as the longest-length-scale radial mode drops under the
+    /// rank cutoff. Lifting the κ-optimizer's lower bound to this floor keeps every
+    /// in-window trial on the n-free fast path and is inherently n-INDEPENDENT: the
+    /// rank is a property of the k×k tensor, not of the sample size (#1033).
+    ///
+    /// Anchoring at `psi_anchor` (the optimizer's ψ seed) is essential: the
+    /// conditioned Gram is rank-deficient at BOTH window ends on production radial
+    /// geometry — at small ψ the longest-scale mode collapses into the polynomial
+    /// nullspace, and at very large ψ every radial column goes collinear with it.
+    /// The maximal-rank region is therefore a middle BAND, and the κ-optimum lives
+    /// inside it. We walk DOWN from the anchor on a fixed k-space grid and return
+    /// the lowest ψ still at the anchor's rank (stopping at the first node that
+    /// differs). Purely O(nodes·k³) — no row access.
+    ///
+    /// Returns `None` when the band already reaches `psi_lo` (no lift needed), when
+    /// the anchor is off-window / rank-indeterminate, or when the window is empty.
+    pub fn rank_stable_psi_floor(&self, psi_anchor: f64) -> Option<f64> {
+        // Fixed k-space grid over the window. 96 nodes resolves the rank cliff
+        // (~1 ψ-decade wide on production Duchon geometry) far finer than the
+        // optimizer's ~ln2 step; the whole scan is O(nodes·k³), independent of n.
+        const NODES: usize = 96;
+        if !(self.psi_hi > self.psi_lo) {
+            return None;
+        }
+        let span = self.psi_hi - self.psi_lo;
+        let psi_at = |i: usize| self.psi_lo + span * (i as f64) / ((NODES - 1) as f64);
+        let ranks: Vec<Option<usize>> =
+            (0..NODES).map(|i| self.gram_numerical_rank(psi_at(i))).collect();
+        // Target the MAXIMAL numerical rank attained anywhere in the window — the
+        // full-rank "good" geometry the skip certifies. Anchoring on the seed's own
+        // rank would be fragile if the seed happened to land in a deficient spot;
+        // the window-max is the rank the κ-optimum's neighbourhood must hold.
+        let max_rank = ranks.iter().filter_map(|r| *r).max()?;
+        // Map the anchor to the nearest grid node, then snap UP to the nearest node
+        // at maximal rank (so the band edge is measured from inside the good band
+        // even if the seed sits just below the cliff). If no max-rank node exists
+        // at/above the anchor, there is nothing to protect below it.
+        let anchor = psi_anchor.clamp(self.psi_lo, self.psi_hi);
+        let anchor_idx = (((anchor - self.psi_lo) / span) * ((NODES - 1) as f64))
+            .round()
+            .clamp(0.0, (NODES - 1) as f64) as usize;
+        let band_idx = (anchor_idx..NODES).find(|&i| ranks[i] == Some(max_rank))?;
+        // Walk DOWN from the band node; the floor is the lowest node from which
+        // every node up to it holds `max_rank`. Stop at the first node below.
+        let mut floor_idx = band_idx;
+        for i in (0..band_idx).rev() {
+            if ranks[i] == Some(max_rank) {
+                floor_idx = i;
+            } else {
+                break;
+            }
+        }
+        if floor_idx == 0 {
+            // The maximal-rank band already reaches `psi_lo` — no lift needed.
+            None
+        } else {
+            Some(psi_at(floor_idx))
+        }
+    }
+
+    /// Upper edge of the contiguous maximal-rank ψ-band, the symmetric twin of
+    /// [`Self::rank_stable_psi_floor`] (#1033). The conditioned Gram `XᵀWX(ψ)` is
+    /// rank-deficient at BOTH window ends — at small ψ the longest-length-scale
+    /// radial mode collapses into the polynomial nullspace, and at very large ψ
+    /// every radial column goes collinear with the low-frequency mode, so the
+    /// maximal-rank region is a middle BAND. The optimizer's line search can
+    /// OVERSHOOT above that band (e.g. ψ≈1.0 on production Duchon geometry), where
+    /// the design-realization skip's `reduced_basis_equal` witness must soundly
+    /// refuse (the range subspace dropped a dimension) → an O(n) `reset_surface`,
+    /// AND the pinning ψ recorded at that reset is itself rank-deficient, so the
+    /// NEXT in-band trial mismatches its reference and resets a SECOND time. Both
+    /// resets vanish once the optimizer's UPPER bound is clamped down to this
+    /// n-free k-space ceiling, keeping every trial inside the maximal-rank band.
+    ///
+    /// Walks UP from the anchor on the same fixed k-space grid as the floor and
+    /// returns the highest ψ still at the window's maximal numerical rank
+    /// (stopping at the first node above that differs). Purely O(nodes·k³) — no
+    /// row access, inherently n-INDEPENDENT (rank is a property of the k×k tensor).
+    ///
+    /// Returns `None` when the band already reaches `psi_hi` (no clamp needed),
+    /// when the anchor is off-window / rank-indeterminate, or when the window is
+    /// empty.
+    pub fn rank_stable_psi_ceiling(&self, psi_anchor: f64) -> Option<f64> {
+        // Same grid + max-rank target + anchor→band snap as `rank_stable_psi_floor`
+        // so the floor and ceiling bracket the SAME contiguous maximal-rank band.
+        const NODES: usize = 96;
+        if !(self.psi_hi > self.psi_lo) {
+            return None;
+        }
+        let span = self.psi_hi - self.psi_lo;
+        let psi_at = |i: usize| self.psi_lo + span * (i as f64) / ((NODES - 1) as f64);
+        let ranks: Vec<Option<usize>> =
+            (0..NODES).map(|i| self.gram_numerical_rank(psi_at(i))).collect();
+        let max_rank = ranks.iter().filter_map(|r| *r).max()?;
+        let anchor = psi_anchor.clamp(self.psi_lo, self.psi_hi);
+        let anchor_idx = (((anchor - self.psi_lo) / span) * ((NODES - 1) as f64))
+            .round()
+            .clamp(0.0, (NODES - 1) as f64) as usize;
+        // Snap to the nearest max-rank node at/below the anchor (the mirror of the
+        // floor's snap-UP), so the band edge is measured from inside the good band.
+        let band_idx = (0..=anchor_idx).rev().find(|&i| ranks[i] == Some(max_rank))?;
+        // Walk UP from the band node; the ceiling is the highest node from which
+        // every node down to it holds `max_rank`. Stop at the first node above.
+        let mut ceil_idx = band_idx;
+        for i in (band_idx + 1)..NODES {
+            if ranks[i] == Some(max_rank) {
+                ceil_idx = i;
+            } else {
+                break;
+            }
+        }
+        if ceil_idx == NODES - 1 {
+            // The maximal-rank band already reaches `psi_hi` — no clamp needed.
+            None
+        } else {
+            Some(psi_at(ceil_idx))
+        }
+    }
+
     /// True when `psi` lies inside the certified window.
     pub fn contains(&self, psi: f64) -> bool {
         psi.is_finite() && psi >= self.psi_lo && psi <= self.psi_hi
+    }
+
+    /// The certified value window `[psi_lo, psi_hi]` (#1033 instrumentation).
+    pub fn psi_window(&self) -> (f64, f64) {
+        (self.psi_lo, self.psi_hi)
     }
 
     /// True when `psi` lies inside the certified gradient window where the
@@ -795,6 +972,65 @@ mod tests {
         Ok(x)
     }
 
+    /// A genuinely FULL-RANK, well-conditioned, ψ-dependent synthetic design for
+    /// the gauge-invariance witness test. Unlike `synth_design` (whose Matérn-like
+    /// `(1+s)e^{-s}` columns over a narrow `r`-range collapse to a numerical rank
+    /// of 3–4 of `k=6` and whose near-null subspace *rotates* across the window —
+    /// so `reduced_basis_equal` correctly refuses), this builds `k` near-orthogonal
+    /// Fourier/Chebyshev-flavoured base columns and applies a mild, sign-varying
+    /// per-column amplitude `e^{c_j·ψ}`. The base columns are linearly independent
+    /// with a Gram condition number `≈3`, so the weighted Gram is full column rank
+    /// (numerical rank `= k`) at *every* ψ in the window — its range is the whole
+    /// k-space and the orthogonal range projector is the identity for all ψ. The
+    /// amplitude modulation still genuinely *rotates the eigenvectors* with ψ, so
+    /// the witness must certify (identical range subspace) despite a per-ψ
+    /// eigenvector gauge that differs — exactly the gauge invariance under test.
+    /// The amplitudes are entire in ψ, so the Chebyshev tensor still certifies.
+    fn synth_full_rank_design(psi: f64, n: usize, k: usize) -> Result<Array2<f64>, String> {
+        use std::f64::consts::PI;
+        assert!(k >= 2 && k % 2 == 0, "helper assumes an even k ≥ 2");
+        // ψ-analytic Givens angle: rotates each adjacent column plane by θ(ψ). A
+        // rotation is orthogonal, so it preserves the COLUMN SPACE and the Gram
+        // SPECTRUM (rank = k, condition number constant in ψ) while genuinely
+        // turning the eigenvECTORS — the precise setting in which the range
+        // projector is ψ-invariant (identity at full rank) but the per-ψ gauge
+        // differs. cos/sin are entire, so the Chebyshev tensor still certifies.
+        let theta = 0.6 * psi;
+        let (c, s) = (theta.cos(), theta.sin());
+        let mut x = Array2::<f64>::zeros((n, k));
+        for i in 0..n {
+            let t = (i as f64 + 0.5) / n as f64;
+            // Distinctly-scaled near-orthogonal base columns → distinct, separated
+            // eigenvalues so each eigenvector is well-defined (no degenerate plane
+            // that would make the rotation gauge-ambiguous).
+            let mut b = vec![0.0_f64; k];
+            for (j, slot) in b.iter_mut().enumerate() {
+                let base = if j % 2 == 0 {
+                    ((j as f64) * PI * t).cos()
+                } else {
+                    (((j + 1) as f64) * PI * t).sin()
+                };
+                *slot = (1.0 + 0.5 * j as f64) * base;
+            }
+            // Apply the Givens rotation to every adjacent (2m, 2m+1) plane,
+            // including the dominant top plane, so the LEADING eigenvector rotates
+            // too (a rotation confined to the small-eigenvalue planes would leave
+            // the leading eigenvector fixed and make the gauge check vacuous).
+            let mut row = b.clone();
+            let mut p = 0;
+            while p + 1 < k {
+                let (bp, bq) = (b[p], b[p + 1]);
+                row[p] = c * bp - s * bq;
+                row[p + 1] = s * bp + c * bq;
+                p += 2;
+            }
+            for (j, &v) in row.iter().enumerate() {
+                x[[i, j]] = v;
+            }
+        }
+        Ok(x)
+    }
+
     fn exact_gram(psi: f64, n: usize, k: usize, w: &Array1<f64>) -> Array2<f64> {
         let design = synth_design(psi, n, k).unwrap();
         let mut wd = design.clone();
@@ -935,6 +1171,209 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #1033 rank-stable κ-floor: the conditioned radial Gram goes numerically
+    /// rank-deficient at the LARGE-length-scale (small-ψ) window edge — the
+    /// `synth_design` Matérn columns over a narrow `r`-range collapse toward the
+    /// polynomial nullspace there. `rank_stable_psi_floor` must (a) detect that the
+    /// maximal-rank band does NOT reach `psi_lo` and return a floor strictly inside
+    /// the window, (b) report that floor as the lower edge of the maximal-rank band
+    /// containing the seed, and (c) be a pure k-space property — IDENTICAL whether
+    /// the tensor was built from n=200 or n=4000 rows (the n-independence the κ
+    /// outer loop relies on). A design that is full-rank across the whole window
+    /// must return `None` (no lift needed).
+    #[test]
+    fn rank_stable_psi_floor_is_inside_window_and_n_independent() {
+        let k = 7usize;
+        // Window spanning the small-ψ rank cliff. Kept moderate so the Chebyshev
+        // ladder certifies at a low rung (the build is the only n-pass; a wide
+        // window forces high rungs = many design realizations = slow test).
+        let (psi_lo, psi_hi) = (-1.6_f64, 1.0_f64);
+        let build_at = |n: usize| {
+            let w = Array1::from_iter((0..n).map(|i| 1.0 + 0.5 * ((i % 3) as f64)));
+            let z = Array1::from_iter((0..n).map(|i| ((i as f64) * 0.37).sin()));
+            PsiGramTensor::build(|psi| synth_design(psi, n, k), w.view(), z.view(), psi_lo, psi_hi)
+                .expect("analytic synthetic design must certify")
+        };
+
+        let t_small = build_at(120);
+        // Seed at the well-conditioned (small-length-scale) window end — the
+        // κ-optimum's neighbourhood, guaranteed to be at the window-maximal rank
+        // (the synthetic radial design's rank rises toward large ψ). The floor is
+        // the lower edge of the maximal-rank band reaching this seed.
+        let seed = psi_hi;
+        let floor_small = t_small.rank_stable_psi_floor(seed);
+
+        // (a) the band does not reach psi_lo → a floor is returned, strictly inside.
+        let floor = floor_small.expect("collapsing-rank design must lift the floor off psi_lo");
+        assert!(
+            floor > psi_lo && floor <= seed,
+            "floor {floor} must lie in (psi_lo {psi_lo}, seed {seed}]"
+        );
+
+        // (b) below the floor the Gram is rank-deficient relative to the seed; at/
+        // above the floor it holds the window-maximal rank. Verify the rank at the
+        // floor equals the rank at the seed, and the rank just below the floor is
+        // strictly lower (the floor is a genuine rank edge, not an interior node).
+        let rank_at = |psi: f64| t_small.gram_numerical_rank(psi).unwrap();
+        let max_rank = rank_at(seed);
+        assert_eq!(
+            rank_at(floor),
+            max_rank,
+            "the floor must sit at the window-maximal rank"
+        );
+        let probe_below = floor - 0.25;
+        if t_small.contains(probe_below) {
+            assert!(
+                rank_at(probe_below) < max_rank,
+                "rank just below the floor ({}) must drop under the band rank {max_rank}",
+                rank_at(probe_below)
+            );
+        }
+
+        // (c) n-independence: the floor from a 5× larger build must match to grid
+        // resolution. The tensor is certified to the same Chebyshev tolerance, so
+        // the k-space rank structure — hence the floor — is the same object.
+        let t_big = build_at(1000);
+        let floor_big = t_big
+            .rank_stable_psi_floor(seed)
+            .expect("the rank cliff is an n-free property; the big build must also lift");
+        let grid_step = (psi_hi - psi_lo) / 95.0; // NODES - 1 = 95
+        assert!(
+            (floor_small.unwrap() - floor_big).abs() <= 1.5 * grid_step,
+            "rank-stable floor must be n-independent: n=200 → {}, n=4000 → {floor_big} \
+             (grid step {grid_step})",
+            floor_small.unwrap()
+        );
+
+        // A genuinely full-rank, well-conditioned design across the window needs no
+        // lift → None. `synth_full_rank_design` requires an even k.
+        let n = 200usize;
+        let kk = 6usize;
+        let w = Array1::from_iter((0..n).map(|i| 1.0 + 0.5 * ((i % 3) as f64)));
+        let z = Array1::from_iter((0..n).map(|i| ((i as f64) * 0.29).cos()));
+        let full = PsiGramTensor::build(
+            |psi| synth_full_rank_design(psi, n, kk),
+            w.view(),
+            z.view(),
+            psi_lo,
+            psi_hi,
+        )
+        .expect("full-rank design must certify");
+        assert!(
+            full.rank_stable_psi_floor(seed).is_none(),
+            "a window-wide full-rank design must not lift the floor"
+        );
+    }
+
+    /// #1033 (rank-stable κ-CEILING): the symmetric twin of the floor test. The
+    /// `synth_design` radial columns `(1+s)e^{-s}` with `s = r·e^ψ` collapse at the
+    /// HIGH ψ edge — every column decays toward zero as `s→∞`, so the conditioned
+    /// Gram drops rank near `psi_hi`. `rank_stable_psi_ceiling` must (a) detect that
+    /// the maximal-rank band does NOT reach `psi_hi` and return a ceiling strictly
+    /// inside the window, (b) report that ceiling as the upper edge of the band
+    /// containing the seed (rank at the ceiling = window-maximal, rank just above it
+    /// strictly lower), and (c) be a pure k-space property — IDENTICAL whether built
+    /// from few or many rows (the n-independence the κ outer loop relies on). A
+    /// design full-rank up to `psi_hi` must return `None` (no clamp needed). This is
+    /// the regression guard for the n=16000 fast-ladder resets: the κ line search
+    /// overshot above the band to a rank-deficient ψ and tripped two O(n) resets.
+    #[test]
+    fn rank_stable_psi_ceiling_is_inside_window_and_n_independent() {
+        let k = 7usize;
+        // `synth_design`'s radial Gram rank RISES with ψ (the columns separate as
+        // s = r·e^ψ grows), so it collapses at the LOW edge — the floor's setting.
+        // To exercise the CEILING we feed the ψ-REFLECTED design `synth_design(-ψ)`,
+        // whose rank instead collapses at the HIGH edge (rank 7→3 as ψ→psi_hi),
+        // exactly the high-edge degeneracy the κ-ceiling guards against. Seed at a
+        // window-maximal-rank node (located by a coarse scan, not assumed at an
+        // edge); the ceiling is the upper edge of the maximal-rank band.
+        let (psi_lo, psi_hi) = (-2.6_f64, 1.0_f64);
+        let build_at = |n: usize| {
+            let w = Array1::from_iter((0..n).map(|i| 1.0 + 0.5 * ((i % 3) as f64)));
+            let z = Array1::from_iter((0..n).map(|i| ((i as f64) * 0.41).cos()));
+            PsiGramTensor::build(|psi| synth_design(-psi, n, k), w.view(), z.view(), psi_lo, psi_hi)
+                .expect("analytic synthetic design must certify")
+        };
+
+        let t_small = build_at(120);
+        let rank_at = |psi: f64| t_small.gram_numerical_rank(psi).unwrap();
+        let scan: Vec<(f64, usize)> = (0..96)
+            .map(|i| {
+                let p = psi_lo + (psi_hi - psi_lo) * (i as f64) / 95.0;
+                (p, rank_at(p))
+            })
+            .collect();
+        let window_max_rank = scan.iter().map(|&(_, r)| r).max().unwrap();
+        let seed = scan
+            .iter()
+            .find(|&&(_, r)| r == window_max_rank)
+            .map(|&(p, _)| p)
+            .expect("some node must hold the window-maximal rank");
+        let ceil_small = t_small.rank_stable_psi_ceiling(seed);
+
+        // (a) the band does not reach psi_hi → a ceiling is returned, strictly inside.
+        let ceiling =
+            ceil_small.expect("high-edge-collapsing design must clamp the ceiling off psi_hi");
+        assert!(
+            ceiling < psi_hi && ceiling >= seed,
+            "ceiling {ceiling} must lie in [seed {seed}, psi_hi {psi_hi})"
+        );
+
+        // (b) at/below the ceiling the Gram holds the window-maximal rank; above it
+        // the rank drops. The ceiling is a genuine rank edge, not an interior node.
+        let max_rank = window_max_rank;
+        assert_eq!(
+            rank_at(seed),
+            max_rank,
+            "the seed must sit at the window-maximal rank"
+        );
+        assert_eq!(
+            rank_at(ceiling),
+            max_rank,
+            "the ceiling must sit at the window-maximal rank"
+        );
+        let probe_above = ceiling + 0.25;
+        if t_small.contains(probe_above) {
+            assert!(
+                rank_at(probe_above) < max_rank,
+                "rank just above the ceiling ({}) must drop under the band rank {max_rank}",
+                rank_at(probe_above)
+            );
+        }
+
+        // (c) n-independence: the ceiling from a larger build matches to grid
+        // resolution — the rank cliff is an n-free k-space property.
+        let t_big = build_at(1000);
+        let ceil_big = t_big
+            .rank_stable_psi_ceiling(seed)
+            .expect("the rank cliff is an n-free property; the big build must also clamp");
+        let grid_step = (psi_hi - psi_lo) / 95.0; // NODES - 1 = 95
+        assert!(
+            (ceil_small.unwrap() - ceil_big).abs() <= 1.5 * grid_step,
+            "rank-stable ceiling must be n-independent: n=120 → {}, n=1000 → {ceil_big} \
+             (grid step {grid_step})",
+            ceil_small.unwrap()
+        );
+
+        // A genuinely full-rank design across the window needs no clamp → None.
+        let n = 200usize;
+        let kk = 6usize;
+        let w = Array1::from_iter((0..n).map(|i| 1.0 + 0.5 * ((i % 3) as f64)));
+        let z = Array1::from_iter((0..n).map(|i| ((i as f64) * 0.23).sin()));
+        let full = PsiGramTensor::build(
+            |psi| synth_full_rank_design(psi, n, kk),
+            w.view(),
+            z.view(),
+            psi_lo,
+            psi_hi,
+        )
+        .expect("full-rank design must certify");
+        assert!(
+            full.rank_stable_psi_ceiling(seed).is_none(),
+            "a window-wide full-rank design must not clamp the ceiling"
+        );
     }
 
     /// #1033 n-independence invariant (structural, build-free, bit-tight):
@@ -1389,14 +1828,70 @@ mod tests {
         let w = Array1::from_iter((0..n).map(|i| 1.0 + 0.3 * ((i % 5) as f64)));
         let z = Array1::from_iter((0..n).map(|i| ((i as f64) * 0.29).sin()));
         let (psi_lo, psi_hi) = (-1.0_f64, 0.8_f64);
+        // Use the genuinely full-rank, well-conditioned design: its weighted Gram
+        // has numerical rank `= k` at every ψ (range = whole k-space, identity
+        // range projector), so the gauge-invariance premise actually holds. The
+        // narrow-`r` `synth_design` does NOT satisfy this — its Gram is rank 3–4 of
+        // 6 with a near-null subspace that ROTATES across the window, on which the
+        // witness *correctly* refuses (refusing a rotating reduced basis is the
+        // sound fallback the production skip gate exists for). See
+        // `synth_full_rank_design`.
         let tensor = PsiGramTensor::build(
-            |psi| synth_design(psi, n, k),
+            |psi| synth_full_rank_design(psi, n, k),
             w.view(),
             z.view(),
             psi_lo,
             psi_hi,
         )
-        .expect("analytic synthetic design must certify");
+        .expect("analytic full-rank synthetic design must certify");
+
+        // PREMISE CHECK: the design is full column rank (numerical rank = k) and
+        // the range projector is the identity at every grid ψ, so the test really
+        // is exercising gauge invariance over a ψ-invariant subspace — not riding a
+        // rank-deficient fixture the witness would (correctly) refuse.
+        let grid: Vec<f64> = (0..=12).map(|i| psi_lo + 0.05 + 0.06 * i as f64).collect();
+        let identity = Array2::<f64>::eye(k);
+        for &psi in &grid {
+            let (proj, rank) = tensor
+                .range_projector(psi, PSI_GRAM_SKIP_RANK_RTOL)
+                .expect("full-rank Gram must yield a range projector");
+            assert_eq!(
+                rank, k,
+                "full-rank design must have numerical rank k={k} at psi={psi} \
+                 (got {rank}) — otherwise the gauge-invariance premise is vacuous"
+            );
+            let proj_dev = (&proj - &identity)
+                .iter()
+                .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+            assert!(
+                proj_dev <= 1e-8,
+                "range projector must be the identity at psi={psi} \
+                 (max|P−I|={proj_dev:.2e})"
+            );
+        }
+
+        // GAUGE-INVARIANCE CHECK: the per-ψ eigenvectors genuinely rotate across
+        // the window (so the witness is exercised against a moving gauge, not a
+        // static one), yet the spanned subspace is identical. Confirm the rotation
+        // is real by checking the leading eigenvector turns measurably end-to-end.
+        let leading_evec = |psi: f64| -> Array1<f64> {
+            use gam_linalg::faer_ndarray::FaerEigh;
+            let g = tensor.gram_at(psi);
+            let gsym = 0.5 * (&g + &g.t());
+            let (evals, evecs) = gsym.eigh(faer::Side::Lower).unwrap();
+            // `eigh` returns ascending eigenvalues; the leading one is the last.
+            let top = evals.len() - 1;
+            evecs.column(top).to_owned()
+        };
+        let v_lo = leading_evec(grid[0]);
+        let v_hi = leading_evec(*grid.last().unwrap());
+        let cos_angle = v_lo.dot(&v_hi).abs()
+            / (v_lo.dot(&v_lo).sqrt() * v_hi.dot(&v_hi).sqrt()).max(1e-300);
+        assert!(
+            cos_angle <= 0.999,
+            "the design's eigenvectors must rotate with ψ for the gauge-invariance \
+             test to be non-trivial (|cos∠(v_lo,v_hi)|={cos_angle:.6} — too close to 1)"
+        );
 
         // Reflexive: same ψ is always sound.
         for &psi in &[-0.9, -0.2, 0.0, 0.5, 0.79] {
@@ -1406,8 +1901,8 @@ mod tests {
             );
         }
         // The full-rank synthetic design spans all of k-space at every ψ, so the
-        // range projector is the identity for all ψ → every pair certifies.
-        let grid: Vec<f64> = (0..=12).map(|i| psi_lo + 0.05 + 0.06 * i as f64).collect();
+        // range projector is the identity for all ψ → every pair certifies despite
+        // the eigenvector rotation just verified (gauge invariance).
         for &a in &grid {
             for &b in &grid {
                 assert!(

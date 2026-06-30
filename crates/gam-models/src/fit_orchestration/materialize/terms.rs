@@ -34,6 +34,66 @@ pub(crate) fn build_termspec_with_geometry_and_overrides(
     Ok(spec)
 }
 
+/// Drop the Duchon *operator* penalties (the collocation-Gram mass `Σ(f−f̄)²`
+/// and tension `Σ‖∇f‖²` lower-order blocks) for any fit that is NOT
+/// Gaussian-identity, leaving only the exact RKHS-curvature `Primary` Gram and
+/// the polynomial-nullspace trend ridge.
+///
+/// WHY (#1074). The Duchon default penalty is a Hilbert scale: curvature
+/// (`Primary`) plus the lower-order mass/tension operator dials, each carrying
+/// its own smoothing parameter that REML/LAML is meant to deselect when the
+/// data don't support it. That deselection is faithful only in the
+/// **ProfiledGaussian** REML arm, where the dispersion `φ̂` is profiled out and
+/// the penalty's contribution to the criterion is scale-flat: an unsupported
+/// operator block simply rails its `λ→∞` and drops out at no cost. In every
+/// **fixed-dispersion** GLM arm (`φ=1`: Poisson/log, Binomial/logit, …) the
+/// penalized-likelihood term enters at full weight, so the near-full-rank
+/// operator-Gram blocks are *rewarded* by the LAML criterion for over-shrinking
+/// the fit — a genuine criterion optimum, not an optimizer miss (same
+/// ProfiledGaussian-vs-fixed-φ asymmetry as #1373). The result is systematic
+/// under-recovery of the true mean (the `duchon(x,k)` Poisson regime missed
+/// mgcv's `bs="ds"` recovery by 1.36×).
+///
+/// mgcv's `bs="ds"` carries a *single* curvature penalty — it never ships the
+/// mass/tension operator overlay — so dropping those blocks for the GLM path
+/// makes gam's default penalty structurally match the mature reference exactly,
+/// removing only a block the fixed-φ criterion mis-rewards. The Gaussian path
+/// is untouched: it keeps the full Hilbert scale and correctly deselects the
+/// lower orders via profiled REML (and the cyclic-duchon / tps Gaussian fits
+/// stay bit-identical). No new knob, REML/LAML stays always-on, no FD.
+pub(crate) fn gate_duchon_operator_penalties_for_family(
+    spec: &mut TermCollectionSpec,
+    family: &gam_spec::LikelihoodSpec,
+) {
+    if family.is_gaussian_identity() {
+        return;
+    }
+    for term in spec.smooth_terms.iter_mut() {
+        disable_duchon_operator_penalties_in_basis(&mut term.basis);
+    }
+}
+
+fn disable_duchon_operator_penalties_in_basis(
+    basis: &mut gam_terms::smooth::SmoothBasisSpec,
+) {
+    use gam_terms::smooth::SmoothBasisSpec;
+    match basis {
+        SmoothBasisSpec::Duchon { spec, .. } => {
+            // Keep `Primary` curvature + nullspace ridge (the mgcv `bs="ds"`
+            // structure); silence the collocation-Gram lower orders.
+            spec.operator_penalties = gam_terms::basis::DuchonOperatorPenaltySpec::all_disabled();
+        }
+        SmoothBasisSpec::ByVariable { inner, .. }
+        | SmoothBasisSpec::FactorSumToZero { inner, .. } => {
+            disable_duchon_operator_penalties_in_basis(inner);
+        }
+        SmoothBasisSpec::BySmooth { smooth, .. } => {
+            disable_duchon_operator_penalties_in_basis(smooth);
+        }
+        _ => {}
+    }
+}
+
 fn linear_term_training_column(
     data: &Dataset,
     term: &LinearTermSpec,

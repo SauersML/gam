@@ -111,6 +111,11 @@ pub(crate) struct BlockwiseFitAssembly<'a> {
     pub(crate) outer_gradient_norm: Option<f64>,
     pub(crate) criterion_certificate: Option<gam_solve::rho_optimizer::CriterionCertificate>,
     pub(crate) outer_converged: bool,
+    /// Selected per-component log-smoothing parameters of the full-width JOINT
+    /// penalty at ρ* (gam#1587/#561), surfaced on `FitArtifacts` so a
+    /// joint-penalized family (the multinomial centered metric) can recover its
+    /// converged smoothing. `None` for every per-block-only family.
+    pub(crate) joint_log_lambdas: Option<Array1<f64>>,
     pub(crate) context: &'static str,
 }
 
@@ -129,6 +134,7 @@ pub(crate) fn assemble_custom_family_fit_result(
         outer_gradient_norm,
         criterion_certificate,
         outer_converged,
+        joint_log_lambdas,
         context,
     } = assembly;
     let lambdas = rho_physical.mapv(f64::exp);
@@ -165,6 +171,7 @@ pub(crate) fn assemble_custom_family_fit_result(
             outer_converged,
             geometry,
             precomputed_edf,
+            joint_log_lambdas,
         },
         result_specs,
     )
@@ -758,11 +765,12 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         } else {
             0.0
         };
-        let geometry = compute_joint_geometry(family, specs, &inner.block_states, &per_block)
-            .map_err(|reason| CustomFamilyError::Optimization {
-                context: "fit_custom_family no-smoothing joint geometry",
-                reason,
-            })?;
+        let geometry =
+            compute_joint_geometry(family, specs, &inner.block_states, &per_block, options)
+                .map_err(|reason| CustomFamilyError::Optimization {
+                    context: "fit_custom_family no-smoothing joint geometry",
+                    reason,
+                })?;
         let penalized_objective = checked_penalizedobjective(
             inner.log_likelihood,
             inner.penalty_value,
@@ -805,6 +813,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 outer_gradient_norm: None,
                 criterion_certificate: None,
                 outer_converged: inner_converged,
+                joint_log_lambdas: None,
                 context: "fit_custom_family no-smoothing result assembly",
             },
         );
@@ -851,6 +860,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 outer_gradient_norm: Some(0.0),
                 criterion_certificate: None,
                 outer_converged: inner_converged,
+                joint_log_lambdas: None,
                 context: "fit_custom_family one-cycle result assembly",
             },
         );
@@ -1535,11 +1545,35 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     screening_cap.store(0, Ordering::Relaxed);
 
     let per_block = split_labeled_log_lambdas(&rho_star, &label_layout)?;
-    let final_seed = obj
-        .state
-        .warm_cache
-        .clone()
-        .filter(|seed| warm_start_matches_block_log_lambdas(seed, &per_block));
+    // Seed the final β̂ refit at ρ* from the outer optimizer's warm cache.
+    //
+    // When the cache's ρ bit-matches ρ* the seed is passed whole: the inner
+    // solve's same-ρ fast path reuses the cached converged mode (logdets,
+    // penalty, active constraints) directly.
+    //
+    // When it does NOT match (the last accepted outer eval sat at a nearby
+    // trial ρ, not ρ*), the ρ-specific `cached_inner` is invalid and MUST NOT
+    // be reused — but the converged block β at that nearby ρ is still the best
+    // available continuation seed for the final refit's coupled joint Newton.
+    // Previously the whole seed was dropped to `None` here, forcing the refit
+    // to COLD-START from the family-default β. On a stiff two-block
+    // location-scale basin that cold start can diverge even though the outer
+    // search already certified ρ*: with a `bs='tp', k>=20` scale smooth the
+    // refit drove the *mean* block to |β|~10 and aborted with a KKT
+    // cert-refusal (`phantom_multiplier_with_well_conditioned_H`), while
+    // k=25 — a different, more forgiving basin — converged. Keeping the β
+    // continuation (and active sets) seeds the refit at the outer optimum so
+    // the coupled Newton opens next to its solution instead of cold (#1561).
+    // The inner solve already re-gates cache-mode reuse on its own
+    // `warm_start_matches_block_log_lambdas` check, so stripping `cached_inner`
+    // here is the belt-and-suspenders guarantee that a mismatched-ρ seed
+    // contributes ONLY its β/active-set continuation, never a stale mode.
+    let final_seed = obj.state.warm_cache.clone().map(|mut seed| {
+        if !warm_start_matches_block_log_lambdas(&seed, &per_block) {
+            seed.cached_inner = None;
+        }
+        seed
+    });
     let mut final_options = options.clone();
     final_options.outer_inner_max_iterations = None;
     // gam#1587: the final β̂ refit must apply the same full-width joint penalty
@@ -1636,12 +1670,16 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         &final_options,
     )?;
 
-    let geometry = compute_joint_geometry(family, specs, &inner.block_states, &per_block).map_err(
-        |reason| CustomFamilyError::Optimization {
-            context: "fit_custom_family joint geometry",
-            reason,
-        },
-    )?;
+    // gam#1587/#561: pass `final_options` (carrying the joint penalty bundle at
+    // the selected ρ*) so the exported geometry's penalized Hessian — and the
+    // trace EDF derived from it — includes the full-width centered penalty,
+    // matching the covariance path above and the inner-converged mode.
+    let geometry =
+        compute_joint_geometry(family, specs, &inner.block_states, &per_block, &final_options)
+            .map_err(|reason| CustomFamilyError::Optimization {
+                context: "fit_custom_family joint geometry",
+                reason,
+            })?;
     let penalized_objective = inner_penalized_objective(
         &inner,
         include_exact_newton_logdet_h(family, options),
@@ -1823,6 +1861,15 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     }
     let rho_star_physical = expand_labeled_log_lambdas(&rho_star, &label_layout)?;
     let outer_converged = !nonconvergence_escalation;
+    // gam#1587/#561: a family whose smoothing rides on the full-width JOINT
+    // penalty (the multinomial centered `Σ_t λ_t (M ⊗ S_t)` metric) leaves its
+    // per-block penalty lists — and hence the physical `rho_physical`/`lambdas`
+    // expansion above — EMPTY, so the selected per-component `ρ_t` would be lost
+    // at assembly. Surface it on `FitArtifacts.joint_log_lambdas` so the
+    // reporting path can rebuild per-(class, term) λ and the influence-matrix
+    // EDF. `None` (no allocation) for every per-block-only family.
+    let joint_log_lambdas = (!label_layout.joint_specs.is_empty())
+        .then(|| Array1::from(label_layout.joint_log_lambdas(&rho_star)));
     assemble_custom_family_fit_result(
         inner,
         BlockwiseFitAssembly {
@@ -1836,6 +1883,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             outer_gradient_norm: outer_grad_norm,
             criterion_certificate: outer_certificate,
             outer_converged,
+            joint_log_lambdas,
             context: "fit_custom_family result assembly",
         },
     )
@@ -1871,12 +1919,13 @@ pub fn fit_custom_family_fixed_log_lambdas<
     refresh_all_block_etas(family, specs, &mut inner.block_states)?;
     let covariance_conditional =
         compute_joint_covariance_required(family, specs, &inner.block_states, &per_block, options)?;
-    let geometry = compute_joint_geometry(family, specs, &inner.block_states, &per_block).map_err(
-        |reason| CustomFamilyError::Optimization {
-            context: "fit_custom_family_fixed_log_lambdas joint geometry",
-            reason,
-        },
-    )?;
+    let geometry =
+        compute_joint_geometry(family, specs, &inner.block_states, &per_block, options).map_err(
+            |reason| CustomFamilyError::Optimization {
+                context: "fit_custom_family_fixed_log_lambdas joint geometry",
+                reason,
+            },
+        )?;
     let penalized_objective = inner_penalized_objective(
         &inner,
         include_exact_newton_logdet_h(family, options),
@@ -1900,6 +1949,7 @@ pub fn fit_custom_family_fixed_log_lambdas<
             outer_gradient_norm,
             criterion_certificate: None,
             outer_converged,
+            joint_log_lambdas: None,
             context: "fit_custom_family_fixed_log_lambdas result assembly",
         },
     )

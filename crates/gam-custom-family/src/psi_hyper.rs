@@ -77,6 +77,17 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
         None
     };
 
+    // Whether the Jeffreys information `H_info` depends EXPLICITLY on ψ
+    // (gam#1607). When `false` (penalty/prior ψ that leave the design — hence
+    // the likelihood Fisher information — fixed, e.g. spatial-adaptive
+    // Charbonnier), `∂_ψ H_info|_β ≡ 0`, so the three explicit-ψ Firth terms
+    // (`−∂_ψΦ`, `−∂_β∂_ψΦ`, `∂_ψ H_Φ`) vanish identically and must NOT be formed
+    // from `hessian_psi` (which is `∂_ψ(penalty)`, the WRONG perturbation —
+    // the penalty's ψ-derivative, not the information's). The implicit
+    // β-mode-response of `Φ` (the operator `H_Φ` and its `D_β H_Φ[β̇]` drift)
+    // is independent of this flag and stays folded.
+    let jeffreys_info_depends_on_psi = family.joint_jeffreys_information_depends_on_psi();
+
     for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
         let (start, end) = ranges[block_idx];
         let p_block = end - start;
@@ -133,7 +144,9 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
             // `∂_ψ H_info|_β` (the explicit ψ-derivative of the Jeffreys information),
             // materialized once and reused for BOTH the VALUE gradient term `−∂_ψΦ`
             // (here) and the Hessian β-coupling term `−∂_β∂_ψΦ` (the score below).
-            let firth_pert_info: Option<Array2<f64>> = if jeffreys_hphi_ctx.is_some() {
+            let firth_pert_info: Option<Array2<f64>> = if jeffreys_hphi_ctx.is_some()
+                && jeffreys_info_depends_on_psi
+            {
                 if let Some(op) = psi_terms.hessian_psi_operator.as_ref() {
                     Some(op.mul_mat(&ndarray::Array2::<f64>::eye(total)))
                 } else if psi_terms.hessian_psi.nrows() == total
@@ -238,7 +251,9 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // returns zeros when the conditioning gate skips the term or the
                 // family lacks the exact directional derivatives, so a clean /
                 // well-conditioned fit is byte-unchanged.
-                if let Some((z_j, h_joint)) = jeffreys_hphi_ctx.as_ref() {
+                if let Some((z_j, h_joint)) =
+                    jeffreys_hphi_ctx.as_ref().filter(|_| jeffreys_info_depends_on_psi)
+                {
                     let explicit_hphi =
                         gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_hphi_explicit_param_derivative(
                             h_joint.view(),
@@ -1328,9 +1343,10 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
             )?,
         };
         // Outer-eval entry: prime per-row jet caches before the ext-coord
-        // par_iter — see `warm_up_outer_caches` doc.
+        // par_iter — see `warm_up_outer_caches_for_mode` doc. gam#979: only the
+        // caches this `eval_mode` consumes are primed.
         if let Some(workspace) = hessian_workspace.as_ref() {
-            workspace.warm_up_outer_caches()?;
+            workspace.warm_up_outer_caches_for_mode(eval_mode)?;
         }
         let (
             h_joint_unpen,
@@ -1594,13 +1610,29 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
                     // `ext_ext_fn` and the contracted hook so whichever ψψ Hessian
                     // path the outer solver uses carries the `−∂²_ψΦ` term matching
                     // the gradient term `−∂_ψΦ` from `build_psi_hyper_coords`.
-                    let jeffreys_ctx = build_jeffreys_hphi_ctx(
-                        family,
-                        synced_joint_states.as_ref(),
-                        specs,
-                        derivative_blocks.as_ref(),
-                        beta_flat.len(),
-                    )?;
+                    // gam#1607 / #901: the explicit-ψ Firth ψψ VALUE second
+                    // derivative `−∂²_ψΦ` is the second-order analogue of the
+                    // gradient term `−∂_ψΦ`. It is only well-defined when the
+                    // Jeffreys information actually carries explicit ψ-dependence
+                    // (`H_info ≡ H_joint`, length-scale ψ reshaping the design).
+                    // For families whose Jeffreys info is the data Fisher
+                    // information `XᵀWX` and whose ψ are penalty hyperparameters
+                    // (design `X` fixed → `∂_ψ H_info ≡ 0`), the engine would form
+                    // the second derivative from the WRONG perturbation
+                    // `∂²_ψ(penalty)`; suppress the context so both the per-pair
+                    // and contracted ψψ Hessian paths drop `−∂²_ψΦ` (true value 0),
+                    // mirroring the gradient-side gating in `build_psi_hyper_coords`.
+                    let jeffreys_ctx = if family.joint_jeffreys_information_depends_on_psi() {
+                        build_jeffreys_hphi_ctx(
+                            family,
+                            synced_joint_states.as_ref(),
+                            specs,
+                            derivative_blocks.as_ref(),
+                            beta_flat.len(),
+                        )?
+                    } else {
+                        None
+                    };
                     let (ext_ext_fn, rho_ext_fn) = build_psi_pair_callbacks(
                         family,
                         synced_joint_states.as_ref(),
@@ -1869,6 +1901,11 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
                     total,
                     options,
                     inner.joint_workspace.clone(),
+                    // The bundle's directional closures feed only the
+                    // `EvalMode::ValueOnly` `joint_outer_evaluate` below — the
+                    // gradient is supplied by the family's batched terms — so
+                    // no directional jet cache needs priming (gam#979).
+                    EvalMode::ValueOnly,
                 )?
             {
                 let mut gradient = Array1::<f64>::zeros(expected);
@@ -1976,6 +2013,11 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
         total,
         options,
         inner.joint_workspace.clone(),
+        // gam#979: this bundle drives the unified evaluator at the caller's
+        // requested `eval_mode`, so prime exactly the directional caches that
+        // mode consumes (none for value-only line-search / seed-screen probes,
+        // third-only for the first-order gradient, both for the outer Hessian).
+        eval_mode,
     )? {
         let JointHessianBundle {
             source: h_joint_unpen,
@@ -2605,9 +2647,11 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_internal_shared<
         options,
     )?;
     // Outer-eval entry: prime per-row jet caches before the ext-coord
-    // par_iter — see `warm_up_outer_caches` doc.
+    // par_iter — see `warm_up_outer_caches_for_mode` doc. The EFS evaluator
+    // always assembles the first-order fixed-point gradient terms, so it
+    // consumes the third-derivative directional cache (gam#979).
     if let Some(workspace) = hessian_workspace.as_ref() {
-        workspace.warm_up_outer_caches()?;
+        workspace.warm_up_outer_caches_for_mode(EvalMode::ValueAndGradient)?;
     }
     let (
         h_joint_unpen,
