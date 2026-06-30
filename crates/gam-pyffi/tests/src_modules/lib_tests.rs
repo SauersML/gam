@@ -1385,9 +1385,9 @@ fn sae_decoder_lsq_init_produces_nontrivial_seed() {
 /// Regression test for issue #629: the cold-start residual seed must break
 /// the symmetric saddle of a uniform logit init by preferring, per row, the
 /// atom whose seed geometry best reconstructs that row. Planted: two
-/// periodic atoms with distinct seed phases driving disjoint output blocks
-/// with known one-hot routing. The seed logits must (a) not be uniform and
-/// (b) argmax-route most rows to their generating atom.
+/// periodic atoms with distinct seed frequencies driving disjoint output
+/// blocks with known one-hot routing. The seed logits must (a) not be uniform
+/// and (b) argmax-route most rows to their generating atom.
 #[test]
 fn sae_residual_seed_logits_breaks_symmetry_and_routes() {
     use ndarray::Array3;
@@ -1396,9 +1396,16 @@ fn sae_residual_seed_logits_breaks_symmetry_and_routes() {
     let k = 2usize;
     let m = 3usize;
     let two_pi = std::f64::consts::TAU;
-    // Distinct seed phase per atom — mimics the PCA seed handing each
-    // periodic atom a different coordinate frame.
-    let phase = [0.0_f64, 0.3_f64];
+    // Distinct seed *frequency* per atom. A phase shift alone leaves the
+    // {1, sin, cos} column space invariant — sin/cos of a shifted argument are
+    // linear combinations of the unshifted pair — so two phase-shifted periodic
+    // atoms would span the identical subspace, the independent per-atom LSQ fits
+    // would produce bit-identical residuals, and the residual seed could not
+    // tell them apart (every logit collapses to exactly zero). Distinct
+    // harmonics give the atoms genuinely different geometries, so a row's
+    // generating atom reconstructs it strictly better than the off-atom whose
+    // basis cannot represent that frequency at all.
+    let harmonic = [1.0_f64, 2.0_f64];
     // Deterministic pseudo-random latent + balanced shuffled routing.
     let mut t = vec![0.0_f64; n];
     let mut assign = vec![0usize; n];
@@ -1421,7 +1428,7 @@ fn sae_residual_seed_logits_breaks_symmetry_and_routes() {
     let mut basis = Array3::<f64>::zeros((k, n, m));
     for atom_idx in 0..k {
         for i in 0..n {
-            let a = two_pi * (t[i] + phase[atom_idx]);
+            let a = two_pi * harmonic[atom_idx] * t[i];
             basis[[atom_idx, i, 0]] = 1.0;
             basis[[atom_idx, i, 1]] = a.sin();
             basis[[atom_idx, i, 2]] = a.cos();
