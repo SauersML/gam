@@ -61,18 +61,111 @@ pub(crate) fn euclidean_line_contract_fixture() -> (SaeManifoldTerm, Array2<f64>
     (term, z, rho)
 }
 
-pub(crate) fn assert_contract_close(label: &str, analytic: f64, finite_difference: f64) {
-    let rel = (analytic - finite_difference).abs()
-        / finite_difference.abs().max(analytic.abs()).max(1.0e-12);
+/// Compare an analytic derivative against a centered finite difference with a
+/// combined relative + absolute tolerance.
+///
+/// A centered FD `(f₊ − f₋)/(2h)` is the difference of two nearly-equal values
+/// divided by the small `2h`, so its **roundoff floor** is `≈ ε·|f|/h`,
+/// independent of how small the true derivative is. At a near-stationary
+/// coordinate (gradient `≈ 1e-6` on an objective of magnitude `≈ 1e2`, `h=1e-6`)
+/// that floor is `≈ 1e-8`, i.e. `~0.1%` of the derivative — so a relative-only
+/// `1e-5` gate cannot be met by FD however correct the analytic value is. The
+/// `fd_roundoff_floor` (computed by the caller from the actual `|f₊|`, `|f₋|`
+/// and `h`) admits exactly that unavoidable cancellation error and nothing more;
+/// for derivatives well above the floor the gate stays the strict `1e-5`
+/// relative contract.
+pub(crate) fn assert_contract_close_with_floor(
+    label: &str,
+    analytic: f64,
+    finite_difference: f64,
+    fd_roundoff_floor: f64,
+) {
+    let abs_diff = (analytic - finite_difference).abs();
+    let scale = finite_difference.abs().max(analytic.abs());
+    let tol = 1.0e-5 * scale + fd_roundoff_floor;
+    let rel = abs_diff / scale.max(1.0e-12);
     assert!(
-        rel < 1.0e-5,
-        "{label}: analytic={analytic:.12e} fd={finite_difference:.12e} rel={rel:.3e}"
+        abs_diff <= tol,
+        "{label}: analytic={analytic:.12e} fd={finite_difference:.12e} \
+         rel={rel:.3e} abs_diff={abs_diff:.3e} tol={tol:.3e} \
+         (fd_roundoff_floor={fd_roundoff_floor:.3e})"
+    );
+}
+
+/// Roundoff floor of a centered finite difference `(f₊ − f₋)/(2h)`: the
+/// catastrophic-cancellation error `≈ ε·max(|f₊|,|f₋|)/(2h)`, scaled by a small
+/// safety constant. This is the largest absolute error the FD reference can
+/// carry purely from f64 rounding of the objective evaluations, so it is the
+/// correct absolute floor for the contract comparison at near-stationary points.
+pub(crate) fn fd_roundoff_floor(f_plus: f64, f_minus: f64, h: f64) -> f64 {
+    const SAFETY: f64 = 16.0;
+    SAFETY * f64::EPSILON * f_plus.abs().max(f_minus.abs()) / (2.0 * h)
+}
+
+/// Verify the analytic decoder gradient block `sys.gb` matches a centered FD of
+/// the penalized objective for one `(basis_col, out_col)` coefficient, with the
+/// roundoff-floor-aware tolerance. Factored out so the contract can be pinned on
+/// BOTH the full width-3 monomial design (pre-fit) and the rank-reduced design
+/// the joint solve collapses to (post-fit), which travel through different jet
+/// paths (`EuclideanPatchEvaluator` vs `SubspaceReducedEvaluator`).
+fn assert_decoder_gradient_matches_fd(
+    term: &mut SaeManifoldTerm,
+    z: &Array2<f64>,
+    rho: &SaeManifoldRho,
+    basis_col: usize,
+    out_col: usize,
+    p: usize,
+    h: f64,
+) {
+    let sys = term
+        .assemble_arrow_schur(z.view(), rho, None)
+        .expect("decoder assemble");
+    assert_eq!(sys.k, term.beta_dim());
+    let beta_idx = basis_col * p + out_col;
+    let analytic = sys.gb[beta_idx];
+    let base = term.atoms[0].decoder_coefficients[[basis_col, out_col]];
+
+    term.atoms[0].decoder_coefficients[[basis_col, out_col]] = base + h;
+    let f_plus = term
+        .penalized_objective_total(z.view(), rho, None, 1.0)
+        .expect("decoder f+");
+    term.atoms[0].decoder_coefficients[[basis_col, out_col]] = base - h;
+    let f_minus = term
+        .penalized_objective_total(z.view(), rho, None, 1.0)
+        .expect("decoder f-");
+    term.atoms[0].decoder_coefficients[[basis_col, out_col]] = base;
+
+    let fd = (f_plus - f_minus) / (2.0 * h);
+    assert_contract_close_with_floor(
+        &format!("CONTRACT decoder ({basis_col},{out_col})"),
+        analytic,
+        fd,
+        fd_roundoff_floor(f_plus, f_minus, h),
     );
 }
 
 #[test]
 pub(crate) fn euclidean_line_decoder_gradient_matches_penalized_objective_fd() {
     let (mut term, z, mut rho) = euclidean_line_contract_fixture();
+    let p = term.output_dim();
+    let h = 1.0e-6;
+
+    // (A) The genuine DEGREE-2 decoder-gradient contract, on the full width-3
+    // `[1, t, t²]` monomial design BEFORE the joint solve runs. The fixture is
+    // near-linear, so once the inner solve drives the latent `t` into a narrow
+    // range the rank-revealing reduction (`reduce_atoms_to_data_supported_rank`,
+    // #1117) legitimately collapses this basis to its data-supported rank — but
+    // at the seed the t² column is still present, so this is where the degree-2
+    // `∂/∂B` contract through `EuclideanPatchEvaluator`'s jets is exercised.
+    assert_eq!(
+        term.atoms[0].basis_size(),
+        3,
+        "the degree-2 euclidean fixture must seed a width-3 [1,t,t²] basis"
+    );
+    for (basis_col, out_col) in [(0usize, 0usize), (1, 3), (2, 7)] {
+        assert_decoder_gradient_matches_fd(&mut term, &z, &rho, basis_col, out_col, p, h);
+    }
+
     let ridge = 1.0e-6;
     for step in 0..6 {
         let loss = term
@@ -130,35 +223,33 @@ pub(crate) fn euclidean_line_decoder_gradient_matches_penalized_objective_fd() {
             .expect("restore refresh");
 
         let fd = (f_plus - f_minus) / (2.0 * h);
-        assert_contract_close(&format!("CONTRACT coord row {row}"), analytic, fd);
-    }
-
-    let sys_decoder = term
-        .assemble_arrow_schur(z.view(), &rho, None)
-        .expect("decoder assemble");
-    assert_eq!(sys_decoder.k, term.beta_dim());
-    let p = term.output_dim();
-    for (basis_col, out_col) in [(0usize, 0usize), (1, 3), (2, 7)] {
-        let beta_idx = basis_col * p + out_col;
-        let analytic = sys_decoder.gb[beta_idx];
-        let base = term.atoms[0].decoder_coefficients[[basis_col, out_col]];
-
-        term.atoms[0].decoder_coefficients[[basis_col, out_col]] = base + h;
-        let f_plus = term
-            .penalized_objective_total(z.view(), &rho, None, 1.0)
-            .expect("decoder f+");
-        term.atoms[0].decoder_coefficients[[basis_col, out_col]] = base - h;
-        let f_minus = term
-            .penalized_objective_total(z.view(), &rho, None, 1.0)
-            .expect("decoder f-");
-        term.atoms[0].decoder_coefficients[[basis_col, out_col]] = base;
-
-        let fd = (f_plus - f_minus) / (2.0 * h);
-        assert_contract_close(
-            &format!("CONTRACT decoder ({basis_col},{out_col})"),
+        assert_contract_close_with_floor(
+            &format!("CONTRACT coord row {row}"),
             analytic,
             fd,
+            fd_roundoff_floor(f_plus, f_minus, h),
         );
+    }
+
+    // (B) The post-fit decoder-gradient contract on the ACTUAL fitted basis.
+    // On this near-linear fixture the rank-revealing reduction (#1117) collapses
+    // the width-3 `[1, t, t²]` design to its data-supported rank once the joint
+    // solve narrows the latent `t` range — so the decoder coefficients now live
+    // on the reduced subspace and the jets travel through the
+    // `SubspaceReducedEvaluator`. We pin the same `∂/∂B`↔FD contract over the
+    // REDUCED width (`basis_size()` after the fit), not the stale width-3 layout:
+    // the gradient block must remain correct through the reduced-jet path.
+    let fitted_m = term.atoms[0].basis_size();
+    assert!(
+        fitted_m >= 1 && fitted_m <= 3,
+        "fitted euclidean basis width must be in [1,3]; got {fitted_m}"
+    );
+    // Exercise every retained basis column against a representative output channel
+    // spread (first / middle / last), clamped to the fitted width.
+    for basis_col in 0..fitted_m {
+        for &out_col in &[0usize, p / 2, p - 1] {
+            assert_decoder_gradient_matches_fd(&mut term, &z, &rho, basis_col, out_col, p, h);
+        }
     }
 }
 
