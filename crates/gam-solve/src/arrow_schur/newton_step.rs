@@ -219,7 +219,19 @@ pub fn solve_arrow_newton_step_core(
                 // must NOT claim device execution here — flag it as a host procedural
                 // matvec instead. `used_device_arrow` stays reserved for the genuinely
                 // device-executed Direct and device-resident PCG paths.
-                diagnostics.injected_host_procedural_matvec = true;
+                //
+                // BUT the re-entered solve may itself have taken the genuinely
+                // device-resident SAE PCG branch (`device_sae_pcg` present + the
+                // offload gate cleared) and returned `used_device_arrow == true`
+                // WITHOUT ever consuming the injected host matvec — in that case the
+                // host closure did not run, so stamping the host-procedural flag
+                // would emit a contradictory diagnostic (#1209 treats the two as
+                // mutually exclusive: one says "matvec ran on the host", the other
+                // "the solve ran on the device"). Only claim the host procedural
+                // matvec when the device-resident path did NOT serve this step.
+                if !diagnostics.used_device_arrow {
+                    diagnostics.injected_host_procedural_matvec = true;
+                }
                 (step.delta_t, step.delta_beta, diagnostics)
             },
         );
@@ -1722,33 +1734,75 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
                         .pcg
                         .relative_tolerance
                         .max(options.trust_region.steihaug_relative_tolerance);
-                    if let Ok((delta, mut diag)) =
-                        crate::gpu_kernels::arrow_schur::solve_sae_matrix_free_pcg(
-                            sys,
-                            device_data.as_ref(),
-                            ridge_t,
-                            ridge_beta,
-                            &rhs_beta,
-                            max_iterations,
-                            relative_tolerance,
-                        )
-                    {
-                        diag.used_device_arrow = true;
-                        return Ok(ArrowNewtonStepArtifacts {
-                            delta_t: back_substitute_delta_t(
-                                sys,
-                                &htt_factors,
-                                delta.view(),
-                                &backend,
-                            ),
-                            delta_beta: delta,
-                            htt_factors,
-                            schur_factor: None,
-                            pcg_diagnostics: diag,
-                            gauge_deflated_directions,
-                            deflated_row_directions,
-                            deflation_row_spectra,
-                        });
+                    // #1209/#1551 fail-loud routing — classify the device result
+                    // EXACTLY as the Direct seam (`try_device_arrow_direct_sae_pcg`)
+                    // does, never with a bare `if let Ok` that swallows hard faults.
+                    // A `SchurFactorFailed` / `RidgeBumpRequired` here is a REAL
+                    // numerical signal the LM escalation must respond to (bump the
+                    // ridge and retry); silently falling through to the CPU
+                    // `steihaug_pcg_auto` on those would (a) hide a device kernel
+                    // fault behind a CPU result flagged `used_device_arrow=false`
+                    // (the #1551 0%-GPU regression the issue is about — this is the
+                    // large-K InexactPCG regime where the device matters MOST), and
+                    // (b) continue on a possibly-wrong step instead of escalating.
+                    // Only a genuine "device declined" (`Unavailable` /
+                    // `GpuRequiresDenseSystem` / transient) falls through to CPU.
+                    match crate::gpu_kernels::arrow_schur::solve_sae_matrix_free_pcg(
+                        sys,
+                        device_data.as_ref(),
+                        ridge_t,
+                        ridge_beta,
+                        &rhs_beta,
+                        max_iterations,
+                        relative_tolerance,
+                    ) {
+                        Ok((delta, mut diag)) => {
+                            diag.used_device_arrow = true;
+                            return Ok(ArrowNewtonStepArtifacts {
+                                delta_t: back_substitute_delta_t(
+                                    sys,
+                                    &htt_factors,
+                                    delta.view(),
+                                    &backend,
+                                ),
+                                delta_beta: delta,
+                                htt_factors,
+                                schur_factor: None,
+                                pcg_diagnostics: diag,
+                                gauge_deflated_directions,
+                                deflated_row_directions,
+                                deflation_row_spectra,
+                            });
+                        }
+                        // Non-PD per-row block → surface the matching CPU error so
+                        // the LM loop bumps `ridge_t` and retries (NOT a silent CPU
+                        // step on stale curvature).
+                        Err(
+                            crate::gpu_kernels::arrow_schur::ArrowSchurGpuFailure::RidgeBumpRequired {
+                                row,
+                                bump,
+                            },
+                        ) => {
+                            return Err(ArrowSchurError::PerRowFactorFailed {
+                                row,
+                                reason: format!(
+                                    "device SAE matrix-free PCG per-row block non-PD; \
+                                     suggested ridge bump {bump:e}"
+                                ),
+                            });
+                        }
+                        // Non-PD reduced Schur → surface so LM escalation responds.
+                        Err(
+                            crate::gpu_kernels::arrow_schur::ArrowSchurGpuFailure::SchurFactorFailed {
+                                reason,
+                            },
+                        ) => {
+                            return Err(ArrowSchurError::SchurFactorFailed { reason });
+                        }
+                        // Unavailable / framed-mismatch / transient ⇒ the device
+                        // genuinely declined; fall through to the CPU PCG path
+                        // transparently (`used_device_arrow` stays false — honest).
+                        Err(_) => {}
                     }
                 }
             }
