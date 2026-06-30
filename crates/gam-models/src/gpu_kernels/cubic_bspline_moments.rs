@@ -854,7 +854,11 @@ impl CubicMomentBackend {
             }
         }
         let src = src_factory();
-        let ptx = cudarc::nvrtc::compile_ptx(&src).gpu_ctx_with(|err| {
+        // Shared arch+fmad options (NOT bare `compile_ptx`): #1686's
+        // `--fmad=false` keeps the GL-quadrature moment reductions
+        // bit-comparable to the separately-rounded CPU reference, and the #1551
+        // arch pin keys the kernel to the device's real compute capability.
+        let ptx = gam_gpu::device_cache::compile_ptx_arch(&src).gpu_ctx_with(|err| {
             format!(
                 "tetrahedral_moments NVRTC compile (D={}, NBETA={}, NALPHA={}): {err}",
                 key.d, key.nbeta, key.nalpha
@@ -883,7 +887,11 @@ impl CubicMomentBackend {
             }
         }
         let src = src_factory();
-        let ptx = cudarc::nvrtc::compile_ptx(&src).gpu_ctx_with(|err| {
+        // Shared arch+fmad options (NOT bare `compile_ptx`): #1686's
+        // `--fmad=false` keeps the hex-tensor moment reductions bit-comparable
+        // to the separately-rounded CPU reference, and the #1551 arch pin keys
+        // the kernel to the device's real compute capability.
+        let ptx = gam_gpu::device_cache::compile_ptx_arch(&src).gpu_ctx_with(|err| {
             format!(
                 "cubic_bspline_moments NVRTC compile (D={}, AMAX={}, NALPHA={}): {err}",
                 key.d, key.amax, key.nalpha
