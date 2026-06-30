@@ -502,6 +502,100 @@ fn competing_risks_weibull_fit_is_reachable_1590() {
     );
 }
 
+/// #1561 incidental bug: the Gaussian location-scale joint fit must not abort
+/// (panic or hard-error) when the scale smooth is requested at a larger basis
+/// size (`bs='tp', k>=20`). The owner's #1561 investigation reported a
+/// joint-Newton crash there (`phantom_multiplier_with_well_conditioned_H`,
+/// carrying-block μ) — a KKT-refusal robustness failure that is independent of
+/// the (research-grade) scale-block λ-selection metric. A valid model spec
+/// must always either fit or return a catchable error, never panic. This
+/// reproduction fits the #1561 heteroscedastic-sinusoid fixture with the scale
+/// formula at k=25 and asserts the call returns (Ok or Err) without panicking
+/// and without bubbling the KKT cert-refusal diagnosis as a user-facing abort.
+#[test]
+fn issue_1561_locscale_large_scale_basis_does_not_crash_joint_newton() {
+    let n = 200usize;
+    let two_pi = 2.0 * std::f64::consts::PI;
+
+    // Same seed-42 LCG fixture as the gating metric test, reproduced tool-free.
+    let mut state: u64 = 42;
+    let mut next_unit = || -> f64 {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((state >> 11) as f64) / ((1u64 << 53) as f64)
+    };
+    let mut x: Vec<f64> = (0..n).map(|_| next_unit()).collect();
+    x.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mut z: Vec<f64> = Vec::with_capacity(n);
+    while z.len() < n {
+        let u1 = next_unit().max(1e-300);
+        let u2 = next_unit();
+        let r = (-2.0 * u1.ln()).sqrt();
+        z.push(r * (two_pi * u2).cos());
+        if z.len() < n {
+            z.push(r * (two_pi * u2).sin());
+        }
+    }
+    let mu_true = |t: f64| (two_pi * t).sin();
+    let sigma_true = |t: f64| 0.1 + 0.2 * (two_pi * t).sin();
+    let y: Vec<f64> = (0..n)
+        .map(|i| mu_true(x[i]) + sigma_true(x[i]) * z[i])
+        .collect();
+
+    let td = tempdir().expect("tempdir");
+    let data_path = td.path().join("locscale.csv");
+    let mut csv = String::from("x,y\n");
+    for i in 0..n {
+        csv.push_str(&format!("{:.17e},{:.17e}\n", x[i], y[i]));
+    }
+    fs::write(&data_path, csv).expect("write locscale csv");
+    let data = load_dataset_projected(&data_path, &["x".to_string(), "y".to_string()])
+        .expect("load locscale dataset");
+
+    // Sweep the scale-basis size across and above the k>=20 boundary the owner
+    // reported as the joint-Newton crash region. Each must fit (Ok) without
+    // panicking and without bubbling the KKT cert-refusal as a user abort.
+    for k in [20usize, 25, 30] {
+        let config = FitConfig {
+            family: Some("gaussian".to_string()),
+            noise_formula: Some(format!("1 + s(x, bs='tp', k={k})")),
+            ..FitConfig::default()
+        };
+
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::fit_orchestration::entry::fit_from_formula("y ~ s(x, bs='tp')", &data, &config)
+        }));
+        let result = caught.unwrap_or_else(|_| {
+            panic!(
+                "#1561: location-scale fit with a k={k} scale smooth PANICKED inside the \
+                 joint-Newton solver; a valid model spec must fit or return a catchable error, \
+                 never unwind"
+            )
+        });
+        match result {
+            Ok(_) => {}
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    !msg.contains("phantom_multiplier_with_well_conditioned_H"),
+                    "#1561: location-scale fit with a k={k} scale smooth bubbled a KKT \
+                     cert-refusal (phantom_multiplier_with_well_conditioned_H) as a user-facing \
+                     abort; the joint solver must recover (rho-anneal/seed-retry) on a \
+                     well-conditioned penalized Hessian instead of refusing. Got: {msg}"
+                );
+                // Any other error is still a fit-quality/spec issue, not the
+                // robustness crash this guard targets — surface it so the guard
+                // stays honest about what it does and does not cover.
+                panic!(
+                    "#1561: location-scale fit with a k={k} scale smooth returned an unexpected \
+                     error (not the targeted KKT crash): {msg}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn issue_789_transformation_normal_rejects_marginal_slope_controls_before_dispatch() {
     let data = workflow_test_dataset();

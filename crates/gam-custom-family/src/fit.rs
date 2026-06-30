@@ -1535,11 +1535,35 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     screening_cap.store(0, Ordering::Relaxed);
 
     let per_block = split_labeled_log_lambdas(&rho_star, &label_layout)?;
-    let final_seed = obj
-        .state
-        .warm_cache
-        .clone()
-        .filter(|seed| warm_start_matches_block_log_lambdas(seed, &per_block));
+    // Seed the final β̂ refit at ρ* from the outer optimizer's warm cache.
+    //
+    // When the cache's ρ bit-matches ρ* the seed is passed whole: the inner
+    // solve's same-ρ fast path reuses the cached converged mode (logdets,
+    // penalty, active constraints) directly.
+    //
+    // When it does NOT match (the last accepted outer eval sat at a nearby
+    // trial ρ, not ρ*), the ρ-specific `cached_inner` is invalid and MUST NOT
+    // be reused — but the converged block β at that nearby ρ is still the best
+    // available continuation seed for the final refit's coupled joint Newton.
+    // Previously the whole seed was dropped to `None` here, forcing the refit
+    // to COLD-START from the family-default β. On a stiff two-block
+    // location-scale basin that cold start can diverge even though the outer
+    // search already certified ρ*: with a `bs='tp', k>=20` scale smooth the
+    // refit drove the *mean* block to |β|~10 and aborted with a KKT
+    // cert-refusal (`phantom_multiplier_with_well_conditioned_H`), while
+    // k=25 — a different, more forgiving basin — converged. Keeping the β
+    // continuation (and active sets) seeds the refit at the outer optimum so
+    // the coupled Newton opens next to its solution instead of cold (#1561).
+    // The inner solve already re-gates cache-mode reuse on its own
+    // `warm_start_matches_block_log_lambdas` check, so stripping `cached_inner`
+    // here is the belt-and-suspenders guarantee that a mismatched-ρ seed
+    // contributes ONLY its β/active-set continuation, never a stale mode.
+    let final_seed = obj.state.warm_cache.clone().map(|mut seed| {
+        if !warm_start_matches_block_log_lambdas(&seed, &per_block) {
+            seed.cached_inner = None;
+        }
+        seed
+    });
     let mut final_options = options.clone();
     final_options.outer_inner_max_iterations = None;
     // gam#1587: the final β̂ refit must apply the same full-width joint penalty
