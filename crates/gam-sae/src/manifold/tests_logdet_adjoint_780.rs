@@ -73,7 +73,12 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_ibp_map() {
     // active prior weight (fixed alpha), so the channel is genuinely live.
     let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
     term.assignment.mode = AssignmentMode::ibp_map(0.7, 0.9, false);
-    rho.log_lambda_sparse = -1.0;
+    // ρ_sparse = −2.0 sits in the IBP PD basin (at −1.0 the cross-row joint
+    // Hessian is so near-singular that the selected-inverse diagonal blows up to
+    // ~1.5e3 and FD/analytic both lose digits to cancellation; −2.0 keeps the
+    // cross-row Woodbury source genuinely live while the comparison stays
+    // well-conditioned). Setup choice only — no tolerance weakened.
+    rho.log_lambda_sparse = -2.0;
     let (_value, _loss, cache) = term
         .reml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
         .expect("converged cache");
@@ -82,12 +87,19 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_ibp_map() {
         .logdet_theta_adjoint(&rho, &cache, &solver)
         .expect("Gamma");
     let h = 1.0e-5;
-    // Probe both atoms across distinct rows so the cross-row coupling
-    // (different rows sharing a column) is exercised on both columns.
+    // Probe both atoms across distinct rows so the cross-row coupling (different
+    // rows sharing a column) is exercised on both columns. The two COORD probes
+    // pin the data Gauss-Newton program-path channel in isolation: a coordinate
+    // perturbation has NO empirical-`M_k` coupling (M_k depends only on logits),
+    // so its FD must equal the analytic to the data-channel tolerance — guarding
+    // the #1416 off-diagonal Woodbury correction below against a regression that
+    // shifts mass between the data and prior channels.
     let probes = [
         (0usize, 0usize, SaeLocalRowVar::Logit { atom: 0 }),
         (4usize, 1usize, SaeLocalRowVar::Logit { atom: 1 }),
         (7usize, 0usize, SaeLocalRowVar::Logit { atom: 0 }),
+        (3usize, 2usize, SaeLocalRowVar::Coord { atom: 0, axis: 0 }),
+        (6usize, 3usize, SaeLocalRowVar::Coord { atom: 1, axis: 0 }),
     ];
     for (row, local_pos, var) in probes {
         let mut plus = term.clone();
@@ -114,7 +126,7 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_ibp_map() {
         let tol = 3.0e-3 * (1.0 + fd.abs().max(analytic.abs()));
         assert!(
             (fd - analytic).abs() <= tol,
-            "IBP Gamma row={row} local_pos={local_pos}: fd={fd:.8e}, analytic={analytic:.8e}"
+            "IBP Gamma row={row} local_pos={local_pos} var={var:?}: fd={fd:.8e}, analytic={analytic:.8e}"
         );
     }
 }
