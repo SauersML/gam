@@ -1282,20 +1282,35 @@ mod tests {
     #[test]
     fn rank_stable_psi_ceiling_is_inside_window_and_n_independent() {
         let k = 7usize;
-        // Window reaching well past the high-ψ collapse (s = r·e^ψ → ∞ ⇒ every
-        // radial column → 0). Seeded at the LOW, well-conditioned end where the
-        // synthetic radial design holds maximal rank; the ceiling is the upper edge
-        // of the maximal-rank band reaching that seed.
-        let (psi_lo, psi_hi) = (-1.0_f64, 2.6_f64);
+        // `synth_design`'s radial Gram rank RISES with ψ (the columns separate as
+        // s = r·e^ψ grows), so it collapses at the LOW edge — the floor's setting.
+        // To exercise the CEILING we feed the ψ-REFLECTED design `synth_design(-ψ)`,
+        // whose rank instead collapses at the HIGH edge (rank 7→3 as ψ→psi_hi),
+        // exactly the high-edge degeneracy the κ-ceiling guards against. Seed at a
+        // window-maximal-rank node (located by a coarse scan, not assumed at an
+        // edge); the ceiling is the upper edge of the maximal-rank band.
+        let (psi_lo, psi_hi) = (-2.6_f64, 1.0_f64);
         let build_at = |n: usize| {
             let w = Array1::from_iter((0..n).map(|i| 1.0 + 0.5 * ((i % 3) as f64)));
             let z = Array1::from_iter((0..n).map(|i| ((i as f64) * 0.41).cos()));
-            PsiGramTensor::build(|psi| synth_design(psi, n, k), w.view(), z.view(), psi_lo, psi_hi)
+            PsiGramTensor::build(|psi| synth_design(-psi, n, k), w.view(), z.view(), psi_lo, psi_hi)
                 .expect("analytic synthetic design must certify")
         };
 
         let t_small = build_at(120);
-        let seed = psi_lo;
+        let rank_at = |psi: f64| t_small.gram_numerical_rank(psi).unwrap();
+        let scan: Vec<(f64, usize)> = (0..96)
+            .map(|i| {
+                let p = psi_lo + (psi_hi - psi_lo) * (i as f64) / 95.0;
+                (p, rank_at(p))
+            })
+            .collect();
+        let window_max_rank = scan.iter().map(|&(_, r)| r).max().unwrap();
+        let seed = scan
+            .iter()
+            .find(|&&(_, r)| r == window_max_rank)
+            .map(|&(p, _)| p)
+            .expect("some node must hold the window-maximal rank");
         let ceil_small = t_small.rank_stable_psi_ceiling(seed);
 
         // (a) the band does not reach psi_hi → a ceiling is returned, strictly inside.
@@ -1308,8 +1323,12 @@ mod tests {
 
         // (b) at/below the ceiling the Gram holds the window-maximal rank; above it
         // the rank drops. The ceiling is a genuine rank edge, not an interior node.
-        let rank_at = |psi: f64| t_small.gram_numerical_rank(psi).unwrap();
-        let max_rank = rank_at(seed);
+        let max_rank = window_max_rank;
+        assert_eq!(
+            rank_at(seed),
+            max_rank,
+            "the seed must sit at the window-maximal rank"
+        );
         assert_eq!(
             rank_at(ceiling),
             max_rank,
