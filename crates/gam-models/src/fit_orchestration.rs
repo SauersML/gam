@@ -155,6 +155,9 @@ mod fit;
 mod materialize;
 mod request;
 
+#[cfg(test)]
+mod gaussian_high_edf_observation_interval_tests;
+
 pub use entry::*;
 pub use error::*;
 pub(crate) use fit::*;
