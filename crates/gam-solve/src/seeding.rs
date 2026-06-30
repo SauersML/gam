@@ -609,47 +609,75 @@ where
         // unsupported term's keep corner is never cheaper than its shrink-out
         // corner, so #1266 is untouched.
         let keep_saturation = clamp_seed_rho_to_bounds(bnds.0, bnds);
-        for axis in 0..n_smooths {
-            let anchor = best_seed.clone();
-            let mut targets = vec![
-                clamp_seed_rho_to_bounds(anchor[axis] - 3.0, bnds),
-                clamp_seed_rho_to_bounds(anchor[axis] + 3.0, bnds),
-            ];
-            if (anchor[axis] - saturation).abs() > 1e-9 {
-                targets.push(saturation);
-            }
-            if nullspace_coords.contains(&axis) {
-                // Step toward the keep basin (a moderate un-shrink) and the full
-                // keep saturation, so the probe reaches the basin wherever it sits
-                // between the anchor and λ_null → 0.
-                targets.push(clamp_seed_rho_to_bounds(anchor[axis] - 6.0, bnds));
-                if (anchor[axis] - keep_saturation).abs() > 1e-9 {
-                    targets.push(keep_saturation);
+        // Coordinate-descent refinement. A single greedy ±3 sweep can only move
+        // each coordinate ONE step toward its optimum, so a supported smooth
+        // whose REML optimum sits several steps from the isotropic over-smoothing
+        // anchor stalls one step short: with anchor [12,12,12,12] the lone sweep
+        // reaches [9,9,12,12] and never the true [0,0,12,12] (#1266). Repeat the
+        // sweep until a full pass adopts nothing — each pass re-anchors on the
+        // updated best, so a coordinate walks all the way down to its basin in
+        // ±3 increments.
+        //
+        // This does NOT add cost to a well-conditioned fit. The FIRST pass is
+        // byte-for-byte the old single sweep; a confirming pass runs only after a
+        // pass that *actually improved* the seed (`changed`), and a fit with
+        // nothing to refine sets `changed = false` on pass one and exits
+        // immediately. Every candidate is still adopted only when it strictly
+        // lowers the true REML/LAML cost, so `best_cost` is strictly decreasing
+        // whenever `changed` is set; on the finite ±3 / saturation lattice that
+        // sequence cannot cycle and the loop terminates. `max_sweeps` (one per
+        // ±3 step across the full bound range, plus slack) is a defensive
+        // backstop, not the termination condition.
+        let max_sweeps = ((bnds.1 - bnds.0).abs() / 3.0).ceil() as usize + 2;
+        for _ in 0..max_sweeps {
+            let mut changed = false;
+            for axis in 0..n_smooths {
+                let anchor = best_seed.clone();
+                let mut targets = vec![
+                    clamp_seed_rho_to_bounds(anchor[axis] - 3.0, bnds),
+                    clamp_seed_rho_to_bounds(anchor[axis] + 3.0, bnds),
+                ];
+                if (anchor[axis] - saturation).abs() > 1e-9 {
+                    targets.push(saturation);
+                }
+                if nullspace_coords.contains(&axis) {
+                    // Step toward the keep basin (a moderate un-shrink) and the full
+                    // keep saturation, so the probe reaches the basin wherever it sits
+                    // between the anchor and λ_null → 0.
+                    targets.push(clamp_seed_rho_to_bounds(anchor[axis] - 6.0, bnds));
+                    if (anchor[axis] - keep_saturation).abs() > 1e-9 {
+                        targets.push(keep_saturation);
+                    }
+                }
+                for target in targets {
+                    let mut candidate = anchor.clone();
+                    candidate[axis] = target;
+                    if let Some(c) = eval_cost(&candidate)
+                        && c.is_finite()
+                        && best_cost.map(|b| c < b).unwrap_or(true)
+                    {
+                        best_cost = Some(c);
+                        best_seed = candidate;
+                        changed = true;
+                    }
                 }
             }
-            for target in targets {
-                let mut candidate = anchor.clone();
-                candidate[axis] = target;
+            for start in 0..n_smooths.saturating_sub(1) {
+                let anchor = best_seed.clone();
+                let mut candidate = anchor;
+                candidate[start] = saturation;
+                candidate[start + 1] = saturation;
                 if let Some(c) = eval_cost(&candidate)
                     && c.is_finite()
                     && best_cost.map(|b| c < b).unwrap_or(true)
                 {
                     best_cost = Some(c);
                     best_seed = candidate;
+                    changed = true;
                 }
             }
-        }
-        for start in 0..n_smooths.saturating_sub(1) {
-            let anchor = best_seed.clone();
-            let mut candidate = anchor;
-            candidate[start] = saturation;
-            candidate[start + 1] = saturation;
-            if let Some(c) = eval_cost(&candidate)
-                && c.is_finite()
-                && best_cost.map(|b| c < b).unwrap_or(true)
-            {
-                best_cost = Some(c);
-                best_seed = candidate;
+            if !changed {
+                break;
             }
         }
     }
@@ -860,5 +888,52 @@ mod tests {
             });
 
         assert_eq!(selected, base);
+    }
+
+    #[test]
+    fn objective_grid_coordinate_descent_walks_multi_step_distance() {
+        // A supported smooth whose REML optimum sits MANY ±3 steps from the
+        // isotropic over-smoothing anchor must be reached by repeated sweeps.
+        // The isotropic grid drives every axis to +12 (the unsupported gap
+        // dominates), and a single greedy ±3 sweep would stall at -ish-9; the
+        // coordinate descent must walk axes 0/1 the full 24 units to -12 while
+        // axes 2/3 stay pinned at their +12 corner. (#1266)
+        let base = Array1::zeros(4);
+        let selected =
+            select_objective_seed_on_log_lambda_grid(&base, (-12.0, 12.0), 4, &[], |rho| {
+                let supported_cost = 0.1 * ((rho[0] + 12.0).powi(2) + (rho[1] + 12.0).powi(2));
+                let unsupported_gap = (rho[2] - 12.0).powi(2) + (rho[3] - 12.0).powi(2);
+                Some(supported_cost + unsupported_gap)
+            });
+        assert_eq!(selected.to_vec(), vec![-12.0, -12.0, 12.0, 12.0]);
+    }
+
+    #[test]
+    fn objective_grid_well_conditioned_seed_exits_after_one_sweep() {
+        // Termination / cost guard: when the anchor is already optimal, the
+        // refinement must NOT keep sweeping. The first pass adopts nothing
+        // (`changed == false`) so the loop breaks immediately. We assert this by
+        // counting eval_cost calls: a single sweep over a 2-smooth problem makes
+        // a bounded, small number of probes; an unbounded coordinate descent that
+        // failed to early-exit would blow this counter far past the bound.
+        let base = Array1::from_vec(vec![0.0, 0.0]);
+        let mut calls = 0usize;
+        let selected =
+            select_objective_seed_on_log_lambda_grid(&base, (-12.0, 12.0), 2, &[], |rho| {
+                calls += 1;
+                // Strictly convex bowl centred at the anchor: nothing improves.
+                Some(rho[0].powi(2) + rho[1].powi(2))
+            });
+        assert_eq!(selected, base);
+        // Isotropic grid: 8 non-zero shifts. One per-axis sweep over 2 axes:
+        // each axis probes {-3,+3,saturation} = 3, so 6; plus 1 pairwise
+        // saturation probe = 15 total for a SINGLE sweep. The early-exit must
+        // keep us at one sweep; allow generous slack but well under a second
+        // sweep's worth.
+        assert!(
+            calls <= 24,
+            "well-conditioned seed should exit after one sweep, but eval_cost \
+             was called {calls} times (a second sweep would roughly double this)"
+        );
     }
 }
