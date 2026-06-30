@@ -5082,25 +5082,46 @@ pub(crate) fn sae_row_layout_from_dense_weights_large_k_work_scales_with_active(
 pub(crate) fn fixed_decoder_assembly_skips_beta_tier_1407() {
     let (mut term, target, rho) = small_two_atom_periodic_term();
 
-    // Full joint assembly: the β tier IS built (dense hbb materialised).
+    // Full joint assembly: the β tier IS built — its curvature is carried by the
+    // matrix-free `CompositePenaltyOp` (smoothness `λ S_k ⊗ I_p` + the data-fit
+    // `G ⊗ I_p` Gauss-Newton block; plus the dense `hbb` residual only when an
+    // analytic Beta-tier penalty fired). The dense `hbb` buffer is then RECLAIMED
+    // back into the term's reusable `border_hbb_workspace` (a pooling
+    // optimisation), so `sys.hbb` is `0×0` on BOTH paths — the load-bearing
+    // β-tier observable is the installed `penalty_op`, NOT `hbb.dim()`.
     let full = term
         .assemble_arrow_schur(target.view(), &rho, None)
         .expect("full joint assemble_arrow_schur");
     assert!(
-        full.hbb.dim().0 > 0 && full.hbb.dim().1 > 0,
-        "full joint assembly must materialise a non-empty dense β-Hessian hbb; \
-         got {:?}",
-        full.hbb.dim()
+        full.penalty_op.is_some(),
+        "full joint assembly must install the β-tier curvature operator \
+         (matrix-free smoothness + G⊗I data-fit block)"
+    );
+    assert_eq!(
+        full.k,
+        term.beta_dim(),
+        "full joint assembly must carry the full β-tier width"
+    );
+    assert!(
+        full.gb.len() == term.beta_dim() && full.gb.iter().all(|v| v.is_finite()),
+        "full joint assembly must carry a finite β-tier gradient gb of width beta_dim"
     );
     let n_rows = full.rows.len();
 
-    // Fixed-decoder assembly on the SAME term/ρ: the β tier is elided.
+    // Fixed-decoder assembly on the SAME term/ρ: the β tier is elided — the
+    // function returns the block-diagonal per-row system before any β-curvature
+    // operator / β-penalty is installed, so NO `penalty_op` is present.
     term.fixed_decoder_assembly = true;
     let fixed = term
         .assemble_arrow_schur(target.view(), &rho, None)
         .expect("fixed-decoder assemble_arrow_schur");
     term.fixed_decoder_assembly = false;
 
+    assert!(
+        fixed.penalty_op.is_none(),
+        "fixed-decoder assembly must install NO β-tier curvature operator (the β \
+         tier is dead work when the decoder is frozen)"
+    );
     assert_eq!(
         fixed.hbb.dim(),
         (0, 0),
