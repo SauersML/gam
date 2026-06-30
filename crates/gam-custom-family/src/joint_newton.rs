@@ -3087,9 +3087,13 @@ mod trust_region_subproblem_tests {
     #[test]
     pub(crate) fn weakly_identified_real_mode_blocks_premature_certification() {
         // λ_max = 1, p = 2 ⇒ numerical_floor = 1·√2·ε ≈ 3.1e-16,
-        // null_cutoff = max(rank_tol·1, floor) = rank_tol (≈ 1e-7).
-        // γ = 1e-10 is in the WEAK band: above numerical_floor, below null_cutoff.
-        let h = array![[1.0, 0.0], [0.0, 1e-10]];
+        // null_cutoff = max(rank_tol·λ_max, floor) = KKT_REFUSAL_RANK_TOL = 1e-10.
+        // γ = 1e-12 is in the WEAK band: above numerical_floor, below null_cutoff.
+        // (γ must sit STRICTLY below null_cutoff — a γ placed *at* the 1e-10
+        // cutoff lands on the `|γ| <= null_cutoff` boundary, where eigh round-off
+        // can return it marginally above and the raw decrement would wrongly keep
+        // it, inflating the decrement to c²/(2γ) instead of excluding the mode.)
+        let h = array![[1.0, 0.0], [0.0, 1e-12]];
         let rhs = array![1.0, 0.5];
         let d = array![1.0, 1.0];
         let spec = WhitenedHessianSpectrum::decompose(&h, &rhs, &d, KKT_REFUSAL_RANK_TOL).unwrap();
@@ -3101,7 +3105,7 @@ mod trust_region_subproblem_tests {
             "raw decrement excludes the weak mode; got {raw}"
         );
 
-        // ...but its real achievable improvement c²/(2γ) = 0.25/(2·1e-10) is huge,
+        // ...but its real achievable improvement c²/(2γ) = 0.25/(2·1e-12) is huge,
         // so the conditioning-robust decrement is large and blocks the certificate.
         let weak = spec.weakly_identified_decrement();
         assert!(
