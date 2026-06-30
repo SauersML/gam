@@ -72,11 +72,21 @@ fn range_of(v: &[f64]) -> f64 {
     hi - lo
 }
 
-/// Largest downward drop across the dense grid (0 if perfectly non-decreasing).
-fn worst_decrease(v: &[f64]) -> f64 {
-    v.windows(2)
-        .map(|w| (w[0] - w[1]).max(0.0))
-        .fold(0.0_f64, f64::max)
+/// Total downward variation across the dense grid: the sum of every downward
+/// step (0 iff perfectly non-decreasing).
+///
+/// This is the right "is the fit genuinely non-monotone?" measure: it equals how
+/// far the function *descends* in total, independent of how that descent is
+/// distributed across grid steps. The earlier per-step "worst single drop"
+/// metric was fragile — for a clean unimodal fit the steepest single step is
+/// only `|f'|·Δx ≈ π·0.01 ≈ 0.03` on this 101-point grid, so any improvement to
+/// the unconstrained smoother that removed boundary overshoot pushed the worst
+/// single drop below a `0.1·range` bar even though the fit still falls by the
+/// full signal range over the descending half. Cumulative descent is invariant
+/// to grid resolution and to spurious boundary wiggle, so it certifies the
+/// binding precondition robustly.
+fn total_descent(v: &[f64]) -> f64 {
+    v.windows(2).map(|w| (w[0] - w[1]).max(0.0)).sum()
 }
 
 #[test]
@@ -123,13 +133,15 @@ fn monotone_increasing_shape_binds_on_non_monotone_data() {
         free_range > 0.5,
         "unconstrained s(x,k=12) should span the sin hump, got range {free_range:.4}"
     );
-    // The unconstrained fit must actually fall somewhere, so the monotone
-    // constraint has something to bind against (otherwise this test would
-    // degenerate into the non-binding case).
+    // The unconstrained fit must genuinely descend, so the monotone constraint
+    // has something to bind against (otherwise this test would degenerate into
+    // the non-binding case). A sin hump falls back by the full signal range on
+    // its descending half, so its total downward variation is ≈ `free_range`;
+    // requiring `> 0.5·range` is a wide, smoother-agnostic margin.
     assert!(
-        worst_decrease(&p_free) > 0.1 * free_range,
-        "unconstrained sin-hump fit should be clearly non-monotone (worst drop {:.4} of range {:.4})",
-        worst_decrease(&p_free),
+        total_descent(&p_free) > 0.5 * free_range,
+        "unconstrained sin-hump fit should be clearly non-monotone (total descent {:.4} of range {:.4})",
+        total_descent(&p_free),
         free_range
     );
 
@@ -158,6 +170,24 @@ fn monotone_increasing_shape_binds_on_non_monotone_data() {
     assert!(
         mono_range > 0.5,
         "monotone fit collapsed under a binding constraint: range {mono_range:.4}"
+    );
+
+    // The constraint must genuinely BIND, not merely be satisfied by chance:
+    // the unconstrained fit falls back to ≈0 at the right endpoint, while a
+    // non-decreasing fit is forced to hold its plateau there. So at the right
+    // edge the monotone fit must sit well above the unconstrained fit. This is
+    // the positive signature that the active-set QP actually activated the
+    // monotonicity rows and reshaped the solution (a regression that silently
+    // dropped the constraints — e.g. the unconstrained Gaussian-Identity
+    // short-circuit of #509 — would make `p_mono ≈ p_free` and fail here).
+    let tail = p_mono.len() - 1;
+    assert!(
+        p_mono[tail] - p_free[tail] > 0.25 * free_range,
+        "monotone constraint did not bind: at the right edge mono={:.4} vs free={:.4} \
+         (gap must exceed 0.25·range={:.4})",
+        p_mono[tail],
+        p_free[tail],
+        0.25 * free_range
     );
 }
 
