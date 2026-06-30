@@ -913,6 +913,206 @@ pub(crate) fn matrix_exp(a: &Array2<f64>) -> GeometryResult<Array2<f64>> {
     Ok(result)
 }
 
+/// Principal real logarithm of a real **orthogonal** matrix `V`, returned as
+/// the skew-symmetric `S` with `exp(S) = V`.
+///
+/// Rather than reach for a general (Schur-based) matrix logarithm — which the
+/// linear-algebra backend does not expose — this exploits the structure of an
+/// orthogonal matrix. Split `V = M + K` into its symmetric and skew parts
+///
+/// ```text
+///   M = ½(V + Vᵀ)   (symmetric, eigenvalues cos θⱼ ∈ [−1, 1])
+///   K = ½(V − Vᵀ)   (skew)
+/// ```
+///
+/// For an orthogonal (hence normal) `V`, `M` and `K` are both polynomials in
+/// `V`, so they **commute** and are simultaneously block-diagonalizable. In an
+/// eigenbasis `Q` of the symmetric `M` (which the self-adjoint eigensolver
+/// returns), `K̃ = QᵀKQ` is block-diagonal across distinct eigenvalues of `M`.
+/// On each 2-D rotation plane `M` has the degenerate eigenvalue `cos θ` and `K`
+/// acts as a skew `[[0,−sin θ],[sin θ,0]]`, whose principal logarithm is the
+/// same skew matrix scaled by `θ / sin θ`. Because `cos θ ↦ θ = arccos(cos θ)`
+/// is single-valued on `(0, π)`, the scale `c(λ) = arccos(λ)/√(1−λ²)` is a
+/// well-defined function of the eigenvalue `λ` of `M`, independent of the
+/// arbitrary in-plane basis the eigensolver picks. The whole logarithm is then
+///
+/// ```text
+///   S = Q · (c(λ̄ᵢⱼ) ⊙ K̃) · Qᵀ ,    λ̄ᵢⱼ = ½(λᵢ + λⱼ),
+/// ```
+///
+/// the element-wise scaling being exact on-block (where `λᵢ = λⱼ`) and
+/// multiplying a numerically-zero entry off-block (where `K̃ᵢⱼ ≈ 0` because the
+/// blocks are decoupled). The scaling is symmetric in `(i, j)`, so `S` stays
+/// skew.
+///
+/// An eigenvalue `λ → −1` is a rotation by `π`: the geodesic to that point is
+/// not unique (it is the cut locus / beyond the injectivity radius), so the
+/// principal logarithm does not exist. We refuse rather than return a value
+/// that silently picks one of the two equal-length geodesics.
+pub(crate) fn skew_log_orthogonal(v: &Array2<f64>) -> GeometryResult<Array2<f64>> {
+    use faer::Side;
+    use gam_linalg::faer_ndarray::{FaerEigh, fast_ab, fast_abt, fast_atb};
+
+    let n = v.nrows();
+    if v.ncols() != n {
+        return Err(GeometryError::InvalidPoint(
+            "matrix logarithm requires a square matrix",
+        ));
+    }
+    if !v.iter().all(|x| x.is_finite()) {
+        return Err(GeometryError::InvalidPoint(
+            "matrix logarithm requires finite entries",
+        ));
+    }
+    let mut m = Array2::<f64>::zeros((n, n));
+    let mut k = Array2::<f64>::zeros((n, n));
+    for i in 0..n {
+        for j in 0..n {
+            m[[i, j]] = 0.5 * (v[[i, j]] + v[[j, i]]);
+            k[[i, j]] = 0.5 * (v[[i, j]] - v[[j, i]]);
+        }
+    }
+    let (evals, q) = m.eigh(Side::Lower).map_err(|_| {
+        GeometryError::Singular("matrix logarithm: symmetric eigendecomposition failed")
+    })?;
+    // A rotation by π (eigenvalue −1 of V) is the cut locus: the logarithm is
+    // not single-valued there. Detect it from M's spectrum directly — on such a
+    // plane sin θ = 0 so K carries no signal and an element-wise scaling would
+    // silently drop the π rotation.
+    const CUT_LOCUS_EPS: f64 = 1.0e-7;
+    if evals.iter().any(|&lam| lam <= -1.0 + CUT_LOCUS_EPS) {
+        return Err(GeometryError::Unsupported(
+            "matrix logarithm undefined: rotation angle at π (beyond the injectivity radius)",
+        ));
+    }
+    let kt = fast_ab(&fast_atb(&q, &k), &q); // K̃ = Qᵀ K Q
+    let mut st = Array2::<f64>::zeros((n, n));
+    for i in 0..n {
+        for j in 0..n {
+            let lam = (0.5 * (evals[i] + evals[j])).clamp(-1.0, 1.0);
+            let sin_theta = (1.0 - lam * lam).max(0.0).sqrt();
+            // c(λ) = θ / sin θ, with the removable singularity at θ = 0
+            // (λ = 1) taken in the limit c → 1.
+            let scale = if sin_theta <= 1.0e-9 {
+                1.0
+            } else {
+                lam.acos() / sin_theta
+            };
+            st[[i, j]] = scale * kt[[i, j]];
+        }
+    }
+    let s = fast_abt(&fast_ab(&q, &st), &q); // Q S̃ Qᵀ
+    // Project out the rounding-level symmetric part so the result is exactly
+    // skew, as the logarithm of an orthogonal matrix must be.
+    let mut out = Array2::<f64>::zeros((n, n));
+    for i in 0..n {
+        for j in 0..n {
+            out[[i, j]] = 0.5 * (s[[i, j]] - s[[j, i]]);
+        }
+    }
+    Ok(out)
+}
+
+/// Complete the `m × p` matrix `cols` (assumed to have orthonormal columns) to
+/// a full `m × m` orthogonal matrix `[cols | C]`, returning the completion in
+/// place: the first `p` columns are `cols`, the remaining `m − p` are an
+/// orthonormal basis of the orthogonal complement of `cols`'s column space.
+///
+/// The complement is built by Gram–Schmidt-ing the standard axes `e₀ … e_{m−1}`
+/// (in order) against the accumulated columns, with one reorthogonalization
+/// pass for numerical safety. Taking the axes in order means that when `cols`
+/// is `[Iₚ; 0]` the completion is exactly `[0; I_{m−p}]`, so the assembled
+/// matrix is the identity — the property the Stiefel logarithm relies on to
+/// start its iteration near `I₂ₚ` for nearby frames. The result is forced into
+/// `SO(m)` (determinant `+1`) by flipping the sign of the last completion
+/// column when needed, so its principal logarithm is skew-symmetric.
+pub(crate) fn orthonormal_completion(cols: &Array2<f64>) -> Array2<f64> {
+    let m = cols.nrows();
+    let p = cols.ncols();
+    let mut basis = Array2::<f64>::zeros((m, m));
+    for j in 0..p {
+        for i in 0..m {
+            basis[[i, j]] = cols[[i, j]];
+        }
+    }
+    let mut filled = p;
+    let mut axis = 0usize;
+    while filled < m && axis < m {
+        let mut f = Array1::<f64>::zeros(m);
+        f[axis] = 1.0;
+        // Two Gram–Schmidt passes against the columns accepted so far.
+        for _ in 0..2 {
+            for c in 0..filled {
+                let col = basis.column(c);
+                let proj = dot(col, f.view());
+                for i in 0..m {
+                    f[i] -= proj * basis[[i, c]];
+                }
+            }
+        }
+        let nrm = norm(f.view());
+        if nrm > GEOMETRY_EPS {
+            for i in 0..m {
+                basis[[i, filled]] = f[i] / nrm;
+            }
+            filled += 1;
+        }
+        axis += 1;
+    }
+    // Force det = +1 so the completion lies in SO(m) and its principal log is
+    // skew. det of an orthogonal matrix is ±1; flip the last *appended* column
+    // if −1. When nothing was appended (`p == m`, e.g. a square input) the
+    // input columns are returned untouched — flipping one would corrupt the
+    // caller's frame, and a square input's orientation is the caller's to own.
+    if filled == m && m > p && matrix_det(&basis) < 0.0 {
+        for i in 0..m {
+            basis[[i, m - 1]] = -basis[[i, m - 1]];
+        }
+    }
+    basis
+}
+
+/// Determinant via Gaussian elimination with partial pivoting. Used only for
+/// small orientation checks (e.g. forcing a completion into `SO(n)`); not a
+/// hot path.
+pub(crate) fn matrix_det(a: &Array2<f64>) -> f64 {
+    let n = a.nrows();
+    if n == 0 || a.ncols() != n {
+        return 1.0;
+    }
+    let mut lu = a.clone();
+    let mut det = 1.0_f64;
+    for col in 0..n {
+        // Partial pivot.
+        let mut pivot = col;
+        let mut best = lu[[col, col]].abs();
+        for r in (col + 1)..n {
+            let v = lu[[r, col]].abs();
+            if v > best {
+                best = v;
+                pivot = r;
+            }
+        }
+        if best == 0.0 {
+            return 0.0;
+        }
+        if pivot != col {
+            for c in 0..n {
+                lu.swap([col, c], [pivot, c]);
+            }
+            det = -det;
+        }
+        det *= lu[[col, col]];
+        for r in (col + 1)..n {
+            let factor = lu[[r, col]] / lu[[col, col]];
+            for c in col..n {
+                lu[[r, c]] -= factor * lu[[col, c]];
+            }
+        }
+    }
+    det
+}
+
 /// Cholesky factor `L` of a symmetric positive-definite matrix (`A = L Lᵀ`).
 ///
 /// This is a *positive-definiteness* test, not a conditioning test: a genuine
@@ -1111,6 +1311,96 @@ mod qr_thin_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod matrix_log_tests {
+    use super::{matrix_exp, orthonormal_completion, skew_log_orthogonal};
+    use ndarray::Array2;
+
+    /// `exp(skew_log_orthogonal(V)) = V` for a block-diagonal rotation built
+    /// from two planes — including one with angle θ > π/2, which an
+    /// `arcsin`-only scheme (no `cos θ` disambiguation) would get wrong.
+    #[test]
+    fn log_then_exp_recovers_rotation() {
+        // 5×5 orthogonal: rotation by 2.3 rad in (0,1), by 0.4 rad in (2,3),
+        // identity on axis 4.
+        let mut v = Array2::<f64>::zeros((5, 5));
+        let (c0, s0) = (2.3_f64.cos(), 2.3_f64.sin());
+        let (c1, s1) = (0.4_f64.cos(), 0.4_f64.sin());
+        v[[0, 0]] = c0;
+        v[[0, 1]] = -s0;
+        v[[1, 0]] = s0;
+        v[[1, 1]] = c0;
+        v[[2, 2]] = c1;
+        v[[2, 3]] = -s1;
+        v[[3, 2]] = s1;
+        v[[3, 3]] = c1;
+        v[[4, 4]] = 1.0;
+        let s = skew_log_orthogonal(&v).expect("log of rotation");
+        // S must be skew.
+        for i in 0..5 {
+            for j in 0..5 {
+                assert!(
+                    (s[[i, j]] + s[[j, i]]).abs() < 1e-12,
+                    "log not skew at ({i},{j})"
+                );
+            }
+        }
+        let back = matrix_exp(&s).expect("exp of skew");
+        let mut worst = 0.0_f64;
+        for i in 0..5 {
+            for j in 0..5 {
+                worst = worst.max((back[[i, j]] - v[[i, j]]).abs());
+            }
+        }
+        assert!(worst < 1e-10, "exp∘log != id for rotation: {worst:.3e}");
+    }
+
+    /// A rotation by exactly π (eigenvalue −1) is the cut locus: the logarithm
+    /// is not single-valued and must be refused, not silently dropped.
+    #[test]
+    fn log_refuses_pi_rotation() {
+        // Rotation by π in the (0,1) plane: diag block [[-1,0],[0,-1]].
+        let mut v = Array2::<f64>::zeros((3, 3));
+        v[[0, 0]] = -1.0;
+        v[[1, 1]] = -1.0;
+        v[[2, 2]] = 1.0;
+        assert!(
+            skew_log_orthogonal(&v).is_err(),
+            "π rotation must be refused as the cut locus"
+        );
+    }
+
+    /// Completing an `m×p` orthonormal block must yield an `SO(m)` matrix whose
+    /// first `p` columns are the input, and a square (`p==m`) input must be
+    /// returned untouched (never sign-flipped).
+    #[test]
+    fn completion_is_orthogonal_and_preserves_input() {
+        // 4×2 orthonormal block.
+        let mut cols = Array2::<f64>::zeros((4, 2));
+        cols[[0, 0]] = 1.0;
+        cols[[1, 1]] = 1.0;
+        let full = orthonormal_completion(&cols);
+        let gram = full.t().dot(&full);
+        for i in 0..4 {
+            for j in 0..4 {
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!((gram[[i, j]] - want).abs() < 1e-12, "not orthogonal");
+            }
+        }
+        for j in 0..2 {
+            for i in 0..4 {
+                assert!((full[[i, j]] - cols[[i, j]]).abs() < 1e-14, "input column changed");
+            }
+        }
+        // Square input with det −1 must be returned verbatim (no flip).
+        let mut sq = Array2::<f64>::zeros((2, 2));
+        sq[[0, 0]] = 1.0;
+        sq[[1, 1]] = -1.0; // det = −1
+        let out = orthonormal_completion(&sq);
+        assert!((out[[1, 1]] + 1.0).abs() < 1e-14, "square input was modified");
     }
 }
 

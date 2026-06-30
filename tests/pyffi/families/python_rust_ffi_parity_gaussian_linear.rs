@@ -39,7 +39,7 @@ for i in range(n):
     x=-1.0+2.0*i/(n-1)
     y=0.5+1.25*x
     rows.append({'x':x,'y':y})
-m=gamfit.fit('y ~ x', rows, family='gaussian')
+m=gamfit.fit(rows, 'y ~ x', family='gaussian')
 s=m.summary()
 p=m.predict(rows, interval=0.95)
 out={
