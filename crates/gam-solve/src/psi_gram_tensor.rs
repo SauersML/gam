@@ -655,6 +655,30 @@ impl PsiGramTensor {
             .unwrap_or(false)
     }
 
+    /// The gauge-invariant subspace distance `‖P(ψ_ref) − P(ψ_new)‖₂ = sin θ_max`
+    /// between the two conditioned-Gram range subspaces — the exact quantity
+    /// [`Self::reduced_basis_equal`] thresholds against `PSI_GRAM_SKIP_PROJ_ATOL`.
+    /// Exposed for #1033 frontier instrumentation so a refused n-free skip can be
+    /// attributed to a genuine in-window basis ROTATION (this distance exceeds the
+    /// tolerance at equal rank) versus a rank change. Returns `None` for an
+    /// off-window ψ, an equal-ψ pair, a rank mismatch, or an eigendecomp failure.
+    /// Purely k-space (O(k³)) — independent of n.
+    pub fn reduced_basis_subspace_distance(&self, psi_ref: f64, psi_new: f64) -> Option<f64> {
+        if !(self.contains(psi_ref) && self.contains(psi_new)) {
+            return None;
+        }
+        if psi_ref == psi_new {
+            return Some(0.0);
+        }
+        let (p_ref, r_ref) = self.range_projector(psi_ref, PSI_GRAM_SKIP_RANK_RTOL)?;
+        let (p_new, r_new) = self.range_projector(psi_new, PSI_GRAM_SKIP_RANK_RTOL)?;
+        if r_ref != r_new {
+            return None;
+        }
+        let diff = &p_ref - &p_new;
+        subspace_spectral_distance(&diff)
+    }
+
     /// Numerical rank of the conditioned Gram `XᵀWX(ψ)` at `psi`, under the same
     /// relative cutoff (`PSI_GRAM_SKIP_RANK_RTOL`·λ_max) the design-revision skip's
     /// `reduced_basis_equal` witness uses. Returns `None` for an off-window /

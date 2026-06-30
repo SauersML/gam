@@ -7690,11 +7690,22 @@ fn saved_linkwiggle_runtime_rejects_partial_metadata() {
 
 #[test]
 fn heuristic_knots_for_column_uses_uniquevalue_rule() {
+    // Few unique values → `unique/4` clamped up to the 4-knot floor.
     let col = array![0.0, 0.0, 1.0, 1.0, 2.0, 3.0, 4.0, 5.0];
     assert_eq!(unique_count_column(col.view()), 6);
     assert_eq!(heuristic_knots_for_column(col.view()), 4);
+    // Many unique values → clamped to the flat mgcv-like default cap of 8
+    // internal knots (cubic basis ≈ 12 functions), NOT grown with n. A larger
+    // column used to return 20 internal knots (a 24-function basis); that
+    // over-rich default over-parameterized weak-signal additive fits and the
+    // penalty could not shrink it away cleanly (gam#1680). The cap is flat in n:
+    // users opt *in* to a wigglier fit by raising `k` explicitly.
     let bigger = Array1::from_iter((0..200).map(|v| v as f64));
-    assert_eq!(heuristic_knots_for_column(bigger.view()), 20);
+    assert_eq!(heuristic_knots_for_column(bigger.view()), 8);
+    // The 32-unique boundary is exactly where `unique/4` meets the cap, so
+    // columns at or below it keep their previous knot count unchanged.
+    let boundary = Array1::from_iter((0..32).map(|v| v as f64));
+    assert_eq!(heuristic_knots_for_column(boundary.view()), 8);
 }
 
 #[test]
