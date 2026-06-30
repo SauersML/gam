@@ -40,3 +40,22 @@ device PCG stop=Converged iters=74 final_rel_resid=9.65e-13
 
 ## Next: rigorously confirm conditioning is the cause; fix the parity oracle to be
 ## a sound CPU comparison (CPU-PCG with same matvec, or well-conditioned fixture).
+
+## RESOLVED on V100 — framed SAE device PCG now GREEN
+All three framed device tests PASS on Tesla V100 sm_70:
+- framed_sae_device_matvec_matches_cpu_oracle_when_cuda_admits (NEW, conditioning-free) ✅
+- framed_sae_device_pcg_matches_cpu_when_cuda_admits (was FAILING; fixed gate) ✅
+- framed_sae_device_matvec_stage_diff_tiny_1551 ✅
+
+Root cause of the historic "framed kernel 91% wrong / resid 18.5":
+- The CURRENT kernel computes the correct operator (matvec parity ≤1e-9, conditioning-free).
+- The OLD test asserted solution-VECTOR equality vs a dense-Cholesky reference. On the
+  fixture's near-singular S, κ(S) amplifies O(ε) residual diffs to O(κ·ε) vector diffs.
+  The dense ref itself only reached ‖S·x−rhs‖≈0.1 while device PCG reached ~1e-12 — the
+  device was MORE accurate, not wrong.
+Fix: gate on OPERATOR RESIDUAL (device δβ must solve the CPU-oracle system to PCG tol)
+  + an independent CPU pcg_core solve of the same operator/preconditioner. Both converge.
+
+GPU engagement proven via nvidia-smi dmon (312MB fb resident, SM util spikes 2-8%).
+
+## Next: dense reduced-β path, #1209 honest routing, run full gpu suite.
