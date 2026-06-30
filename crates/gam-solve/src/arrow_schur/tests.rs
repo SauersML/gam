@@ -3289,20 +3289,15 @@ pub(crate) fn sae_structured_system(
     (sys, a_phi, local_jac)
 }
 
-/// #1551 PRODUCTION ENGAGEMENT — end-to-end on a GPU host the SAE Direct inner
-/// solve must run on the DEVICE (`used_device_arrow == true`) and match the CPU
-/// dense reference Newton step. This is the test the issue asked for: it drives
-/// the public production entry `solve_arrow_newton_step_artifacts` with a
-/// device-equipped matrix-free SAE system whose `(n, k, d, cg_iters)` clears the
-/// reduced-Schur offload gate, so on a CUDA box `try_device_arrow_direct_sae_pcg`
-/// engages. On a non-CUDA host it skips cleanly (the seam declines → bit-identical
-/// CPU path); on a CUDA host it FAILS LOUD if the device path does not engage.
-#[test]
-pub(crate) fn sae_direct_inner_solve_engages_device_and_matches_cpu_1551() {
-    // Shape: k = n_atoms·p = 8·8 = 64 ≥ DEVICE_LOOP_MIN_P (32); the work
-    // predicate n·(2·d·k + d²)·cg_iters clears MATVEC_OFFLOAD_FLOPS_MIN by orders
-    // of magnitude (cg_iters defaults to 200). Modest n keeps the CPU reference
-    // and dense parity check cheap.
+/// Build a WELL-POSED device-equipped SAE system for the end-to-end engagement
+/// parity tests: PD reduced Schur, matching device/dense `H_ββ`, materialized
+/// cross-block `H_tβ`, and deterministic nonzero gradients. Shared by the Direct
+/// and InexactPCG engagement tests so both exercise the identical operator.
+///
+/// Shape `k = n_atoms·p = 64 ≥ DEVICE_LOOP_MIN_P (32)`; the work predicate
+/// `n·(2·d·k + d²)·cg_iters` clears `MATVEC_OFFLOAD_FLOPS_MIN` by orders of
+/// magnitude. Modest `n` keeps the CPU reference + dense parity check cheap.
+pub(crate) fn well_posed_device_sae_system_1551() -> (ArrowSchurSystem, usize, usize) {
     let n = 512usize;
     let q = 4usize; // per-row latent depth d
     let p = 8usize;
@@ -3393,6 +3388,20 @@ pub(crate) fn sae_direct_inner_solve_engages_device_and_matches_cpu_1551() {
     for a in 0..sys.k {
         sys.gb[a] = 0.05 * ((a as f64 + 1.0) * 0.021).cos() - 0.02;
     }
+    (sys, n, q)
+}
+
+/// #1551 PRODUCTION ENGAGEMENT — end-to-end on a GPU host the SAE Direct inner
+/// solve must run on the DEVICE (`used_device_arrow == true`) and match the CPU
+/// dense reference Newton step. This is the test the issue asked for: it drives
+/// the public production entry `solve_arrow_newton_step_artifacts` with a
+/// device-equipped matrix-free SAE system whose `(n, k, d, cg_iters)` clears the
+/// reduced-Schur offload gate, so on a CUDA box `try_device_arrow_direct_sae_pcg`
+/// engages. On a non-CUDA host it skips cleanly (the seam declines → bit-identical
+/// CPU path); on a CUDA host it FAILS LOUD if the device path does not engage.
+#[test]
+pub(crate) fn sae_direct_inner_solve_engages_device_and_matches_cpu_1551() {
+    let (sys, n, q) = well_posed_device_sae_system_1551();
 
     let policy = gam_gpu::policy::GpuDispatchPolicy::default();
     assert!(
@@ -3461,6 +3470,100 @@ pub(crate) fn sae_direct_inner_solve_engages_device_and_matches_cpu_1551() {
     assert!(
         max_dt_rel <= 1e-7,
         "#1551 SAE Direct Δt parity vs dense reference: max_rel={max_dt_rel:e} (>1e-7)"
+    );
+}
+
+/// #1551/#1209 PRODUCTION ENGAGEMENT (InexactPCG mode) — the LARGE-K regime
+/// (`K > DIRECT_SOLVE_MAX_K`) that `ArrowSolverMode::automatic` routes to
+/// `InexactPCG`, which is where the device matters MOST. The InexactPCG branch
+/// of `solve_arrow_newton_step_core` runs the device matrix-free SAE PCG when the
+/// trust radius is unbounded (the SAE inner-solve default). This pins TWO
+/// contracts the Direct test cannot:
+///   1. ENGAGEMENT (`used_device_arrow == true` on a CUDA host) for the InexactPCG
+///      seam specifically — a separate code path from the Direct seam.
+///   2. FAIL-LOUD routing (#1209): the branch must NOT swallow a device kernel
+///      fault and silently continue on the CPU with `used_device_arrow == false`.
+///      A genuine `Unavailable` decline still falls through transparently.
+/// Parity vs the dense reference holds on every host (CPU oracle == device).
+#[test]
+pub(crate) fn sae_inexact_pcg_inner_solve_engages_device_and_matches_cpu_1551() {
+    let (sys, n, q) = well_posed_device_sae_system_1551();
+
+    let policy = gam_gpu::policy::GpuDispatchPolicy::default();
+    assert!(
+        policy.reduced_schur_matvec_should_offload(n, sys.k, q, DEFAULT_PCG_MAX_ITERATIONS),
+        "fixture must clear the reduced-Schur offload gate so the device path is eligible"
+    );
+
+    // `inexact_pcg()` defaults to an unbounded trust radius (f64::INFINITY), so the
+    // device matrix-free SAE PCG branch of `solve_arrow_newton_step_core` is the
+    // one exercised here (NOT the Direct seam).
+    let options = ArrowSolveOptions::inexact_pcg();
+    assert_eq!(
+        options.trust_region.radius,
+        f64::INFINITY,
+        "InexactPCG default must keep the unbounded trust radius that authorizes the \
+         device matrix-free SAE PCG branch"
+    );
+    let ridge_t = 1e-7;
+    let ridge_beta = 1e-6;
+
+    let artifacts = solve_arrow_newton_step_artifacts(&sys, ridge_t, ridge_beta, &options)
+        .expect("SAE InexactPCG artifacts solve");
+
+    if gam_gpu::device_runtime::GpuRuntime::global().is_none() {
+        assert!(
+            !artifacts.pcg_diagnostics.used_device_arrow,
+            "no CUDA device present, yet the InexactPCG step was flagged device-served"
+        );
+    } else {
+        // CUDA present + the fixture clears the gate ⇒ the InexactPCG inner solve
+        // MUST run on the device. After the #1209/#1551 fail-loud routing fix, a
+        // device kernel fault would surface as an Err (caught by `.expect` above);
+        // a genuine decline would fall through to CPU. Either way a silent
+        // device→CPU fallback under a healthy device is the failure we forbid.
+        assert!(
+            artifacts.pcg_diagnostics.used_device_arrow,
+            "#1551: CUDA device present and the offload gate cleared, but the SAE \
+             InexactPCG inner solve did NOT engage the device \
+             (used_device_arrow=false) — the device path silently fell back to CPU"
+        );
+    }
+
+    // Parity (holds on every host): the produced Newton step must match the dense
+    // joint-system reference, exactly as in the Direct test (same well-posed system).
+    let reference = crate::gpu_kernels::arrow_schur::solve_arrow_newton_step_dense_reference(
+        &sys, ridge_t, ridge_beta,
+    )
+    .expect("dense reference solve");
+    let db_scale = reference
+        .delta_beta
+        .iter()
+        .fold(0.0_f64, |m, &v| m.max(v.abs()))
+        .max(1.0);
+    let mut max_db_rel = 0.0_f64;
+    for a in 0..sys.k {
+        max_db_rel =
+            max_db_rel.max((artifacts.delta_beta[a] - reference.delta_beta[a]).abs() / db_scale);
+    }
+    assert!(
+        max_db_rel <= 1e-7,
+        "#1551 SAE InexactPCG Δβ parity vs dense reference: max_rel={max_db_rel:e} (>1e-7) \
+         (device-served={})",
+        artifacts.pcg_diagnostics.used_device_arrow
+    );
+    let dt_scale = reference
+        .delta_t
+        .iter()
+        .fold(0.0_f64, |m, &v| m.max(v.abs()))
+        .max(1.0);
+    let mut max_dt_rel = 0.0_f64;
+    for i in 0..artifacts.delta_t.len() {
+        max_dt_rel = max_dt_rel.max((artifacts.delta_t[i] - reference.delta_t[i]).abs() / dt_scale);
+    }
+    assert!(
+        max_dt_rel <= 1e-7,
+        "#1551 SAE InexactPCG Δt parity vs dense reference: max_rel={max_dt_rel:e} (>1e-7)"
     );
 }
 
