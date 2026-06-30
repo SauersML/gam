@@ -529,10 +529,33 @@ pub(crate) fn run_path(
                 // rather than expanding into an even more oversmoothed
                 // regime where the alias persists.
                 InnerFailure::IdentifiabilityFailure { .. } => PathOutcome::Propagate(failure),
-                // RankDeficientHPen at ρ₀ → definitely expand. Other
-                // failures at the most oversmoothed point are also
-                // unusual (we're in the strongly-convex regime);
-                // treat as "expand ρ₀ and retry" rather than give up.
+                // Generic, untagged inner non-convergence at ρ₀ (e.g. a
+                // linear-constrained Newton active-set that stays feasible but
+                // cannot certify KKT because the penalty gradient λ₀·Sβ at the
+                // most-oversmoothed start swamps the inequality multipliers).
+                // This is a *monotone-in-λ₀ conditioning* failure: every ρ₀
+                // expansion DOUBLES the oversmoothing offset and makes the
+                // penalty-vs-constraint imbalance strictly worse, so the
+                // catch-all "expand and retry" below would re-run the same
+                // ~p·m·4-iteration active-set thrash at each of
+                // OVERSMOOTH_RETRY_MAX escalating offsets before failing anyway
+                // (#1082: ~290s of pure waste on the K=2 competing-risks fit,
+                // where two of four λ pin at the box bound). The mid-walk
+                // classifier already routes `InnerFailure::Other` to
+                // `Propagate` for exactly this reason; do the same at ρ₀ so the
+                // pre-warm gives up after ONE start instead of four. Propagate
+                // is non-structural here (`ContinuationFailure::is_structural`
+                // inspects the underlying `Other`), so the caller still falls
+                // through to the cold seed eval — identical outcome, a quarter
+                // of the cost.
+                InnerFailure::Other(_) => PathOutcome::Propagate(failure),
+                // RankDeficientHPen at ρ₀ → definitely expand (more penalty
+                // curvature fills the block's polynomial null space, the one
+                // failure mode oversmoothing genuinely repairs). Budget /
+                // trust-region / phantom-multiplier refusals at the most
+                // oversmoothed point are unusual (we're nominally in the
+                // strongly-convex regime); treat those as "expand ρ₀ and retry"
+                // rather than give up.
                 _ => PathOutcome::ExpandRhoZero(failure),
             });
         }
@@ -1032,6 +1055,63 @@ mod tests {
             outcome.err(),
         );
         assert!(obj.rho_history.len() >= 3);
+    }
+
+    #[test]
+    pub(crate) fn untagged_inner_failure_at_rho_zero_does_not_expand_offset() {
+        // #1082: a generic, untagged inner non-convergence at ρ₀ (here the
+        // verbatim "linear-constrained Newton active-set failed to converge"
+        // string the K=2 competing-risks fit emits — it carries NO
+        // `diagnosis:` tag, so `classify_inner_error` lands on
+        // `InnerFailure::Other`) must give up after ONE oversmoothed start.
+        // It must NOT cycle through OVERSMOOTH_RETRY_MAX ρ₀ expansions: every
+        // expansion doubles the oversmoothing offset and re-runs the same
+        // expensive active-set thrash at a strictly worse penalty/constraint
+        // imbalance (~290s wasted on the real fit). The failure is
+        // non-structural, so the seed-loop caller still falls through to the
+        // cold seed eval.
+        let target = rho(&[0.0]);
+        let upper = rho(&[10.0]);
+        // Fail at EVERY ρ₀ the schedule could try. Pre-fix this objective would
+        // be re-entered OVERSMOOTH_RETRY_MAX+1 times (offset 3.47→6.93→13.86→
+        // 27.7), so 4 distinct ρ₀ evals would be recorded; post-fix exactly 1.
+        let responses: Vec<ScriptedResponse> = (0..8)
+            .map(|_| {
+                ScriptedResponse::Fail(
+                    "custom-family invalid input in custom-family string boundary: \
+                     Parameter constraint violation: linear-constrained Newton active-set \
+                     failed to converge; max(Aβ-b violation)=8.853e-18 at row 137; \
+                     KKT[primal=8.853e-18, dual=9.297e2, comp=1.290e-14, stat=2.046e4, \
+                     active=3/900]",
+                )
+            })
+            .collect();
+        let mut obj = ScriptedObjective::new(1, responses);
+        let err = prime_outer_seed_with_budget(&mut obj, &target, &upper, PATH_BUDGET)
+            .expect_err("untagged ρ₀ failure must surface, not loop");
+        // Propagate (not PathStuck): the eval0 router now treats `Other` the
+        // same way the mid-walk `classify_action` already does.
+        assert!(
+            matches!(
+                err,
+                ContinuationFailure::StructuralPropagate(InnerFailure::Other(_))
+            ),
+            "expected StructuralPropagate(Other), got {err:?}",
+        );
+        // is_structural() stays FALSE for `Other`, so the caller falls through
+        // to the cold seed eval rather than disqualifying the seed.
+        assert!(
+            !err.is_structural(),
+            "an untagged active-set non-convergence is a warm-start property, \
+             not a structural seed defect; the cold eval must still judge it",
+        );
+        // The crux: exactly ONE ρ₀ inner eval, not OVERSMOOTH_RETRY_MAX+1.
+        assert_eq!(
+            obj.rho_history.len(),
+            1,
+            "must give up after a single oversmoothed start; doubling ρ₀ only \
+             worsens the penalty/constraint imbalance",
+        );
     }
 
     #[test]
