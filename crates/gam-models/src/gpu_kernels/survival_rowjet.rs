@@ -620,6 +620,127 @@ mod tests {
         assert_channel_parity("fourth", &cpu.fourth, &got.fourth);
     }
 
+    /// Edge-regime fixture: rows deliberately placed in the hard corners of the
+    /// probit Mills-ratio stack, where erfc/erfcx differ most between host libm
+    /// and CUDA and the seeded-jet amplification is largest. Covers
+    /// censored/event × entry-present, deep negative tails (logΦ underflow
+    /// regime), tiny and large covariance, near-zero slope, large scale, zero
+    /// weight (the early-out branch), and the erfcx asymptotic cutover (|η|>26).
+    fn edge_fixture() -> Vec<SurvivalRowInputs> {
+        let mut rows = Vec::new();
+        let push = |rows: &mut Vec<SurvivalRowInputs>, p: [f64; 4], w, d, z, c| {
+            rows.push(SurvivalRowInputs {
+                primaries: p,
+                wi: w,
+                di: d,
+                z_sum: z,
+                cov_ones: c,
+            });
+        };
+        // interior, event & censored
+        push(&mut rows, [-0.4, 0.6, 0.9, 0.3], 1.0, 1.0, 0.2, 0.5);
+        push(&mut rows, [-0.4, 0.6, 0.9, 0.3], 1.0, 0.0, 0.2, 0.5);
+        // deep negative probit tail (logΦ(−η)→ asymptotic / Mills tail)
+        push(&mut rows, [8.0, 9.0, 1.2, 2.5], 1.0, 0.0, -3.0, 1.0);
+        push(&mut rows, [-8.0, -9.0, 1.2, -2.5], 1.0, 1.0, 3.0, 1.0);
+        // erfcx asymptotic cutover region (argument near/above 26)
+        push(&mut rows, [40.0, 41.0, 0.7, 3.0], 1.0, 0.0, 0.0, 2.0);
+        // tiny covariance (c ≈ 1, derivative of √ near flat)
+        push(&mut rows, [-0.3, 0.5, 0.8, 1.5], 1.0, 1.0, 0.4, 1e-10);
+        // large covariance + large scale (c large, strong coupling)
+        push(&mut rows, [-0.2, 0.4, 1.1, 4.0], 1.0, 1.0, 0.1, 50.0);
+        // near-zero slope (og→0, opb2→1)
+        push(&mut rows, [-0.5, 0.3, 0.6, 1e-9], 1.0, 0.0, 0.7, 0.9);
+        // zero weight (the w==0 early-out: every channel 0)
+        push(&mut rows, [-0.5, 0.3, 0.6, 0.4], 0.0, 1.0, 0.7, 0.9);
+        // small positive qd1 (log(ad1) near its valid edge)
+        push(&mut rows, [-0.5, 0.3, 1e-3, 0.4], 1.0, 1.0, 0.2, 0.6);
+        rows
+    }
+
+    /// #415 core deliverable — **fail loud, never silently degrade.** On a GPU
+    /// box the device path MUST run; this calls `survival_rigid_row_jets_device_only`
+    /// (which never falls back) and asserts it both (a) succeeds — no silent
+    /// NVRTC-declined / wrong-arch / launch-failure swallowed by the dispatcher —
+    /// and (b) matches the CPU oracle within the principled per-channel band, for
+    /// BOTH the t4 and the no-t4 kernel variants and across the edge-regime sweep.
+    ///
+    /// When no CUDA device is present the device-only path returns `Err`, which
+    /// is the legitimate state on a CPU-only box — so the test SKIPS with a clear
+    /// log there. Set `GAM_REQUIRE_GPU=1` (CI on the GPU runner) to turn that skip
+    /// into a HARD failure: a box that is supposed to have a GPU but can't run the
+    /// kernel must break the build, not pass on the CPU.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn device_only_path_runs_and_matches_cpu_fail_loud() {
+        let require_gpu = std::env::var("GAM_REQUIRE_GPU").is_ok_and(|v| v != "0" && !v.is_empty());
+
+        // Two batches: enough rows to amortise the launch, in both the interior
+        // (smooth) and edge (transcendental-stress) regimes. The edge batch is
+        // padded by tiling so it crosses DEVICE_ROW_THRESHOLD.
+        let interior = fixture(DEVICE_ROW_THRESHOLD + 777);
+        let edge_unit = edge_fixture();
+        let reps = (DEVICE_ROW_THRESHOLD + 999).div_ceil(edge_unit.len());
+        let edge: Vec<_> = edge_unit
+            .iter()
+            .cloned()
+            .cycle()
+            .take(reps * edge_unit.len())
+            .collect();
+
+        // Variant matrix: (label, dir_u, dir_v). All-zero (u,v) selects the
+        // `survival_rowjet_no_t4` kernel (fourth channel ≡ 0); nonzero selects
+        // the full `survival_rowjet`. Cover both so neither entry point rots.
+        let zero = [0.0_f64; 4];
+        let variants: [(&str, &[f64; 4], &[f64; 4]); 2] =
+            [("t4", &DIRU, &DIRV), ("no_t4", &zero, &zero)];
+
+        let mut ran_on_device = false;
+        for (regime, rows) in [("interior", &interior), ("edge", &edge)] {
+            for (vlabel, du, dv) in variants {
+                let dev = match survival_rigid_row_jets_device_only(rows, 0.7, &DIR, du, dv) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        if require_gpu {
+                            panic!(
+                                "GAM_REQUIRE_GPU set but survival_rowjet device path \
+                                 ({regime}/{vlabel}) could not run: {e}"
+                            );
+                        }
+                        eprintln!(
+                            "[#415] no CUDA device ({regime}/{vlabel}) — skipping device-only \
+                             parity (set GAM_REQUIRE_GPU=1 to make this a hard failure): {e}"
+                        );
+                        continue;
+                    }
+                };
+                ran_on_device = true;
+                let cpu = survival_rigid_row_jets_cpu(rows, 0.7, &DIR, du, dv);
+                assert_channel_parity(&format!("{regime}/{vlabel}/value"), &cpu.value, &dev.value);
+                assert_channel_parity(&format!("{regime}/{vlabel}/grad"), &cpu.grad, &dev.grad);
+                assert_channel_parity(&format!("{regime}/{vlabel}/hess"), &cpu.hess, &dev.hess);
+                assert_channel_parity(&format!("{regime}/{vlabel}/third"), &cpu.third, &dev.third);
+                assert_channel_parity(
+                    &format!("{regime}/{vlabel}/fourth"),
+                    &cpu.fourth,
+                    &dev.fourth,
+                );
+                // The no_t4 variant must yield an exactly-zero fourth channel
+                // (the kernel writes 0.0), and the CPU oracle agrees because
+                // (u,v)=0 contracts the fourth tensor to zero.
+                if vlabel == "no_t4" {
+                    assert!(
+                        dev.fourth.iter().all(|&x| x == 0.0),
+                        "no_t4 kernel must write an all-zero fourth channel"
+                    );
+                }
+            }
+        }
+        if ran_on_device {
+            eprintln!("[#415] device-only parity PASSED on GPU for all regimes × variants");
+        }
+    }
+
     /// Diagnostic (#415/#1175): localize CPU↔device drift per channel as both
     /// absolute and relative error, and report the worst offending row's inputs.
     /// Not a gate — `--ignored` so it only runs when explicitly requested on a
