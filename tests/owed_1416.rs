@@ -29,12 +29,41 @@
 //! if the production trace dropped the off-diagonal — this test drives the FULL
 //! production outer-ρ gradient via the PUBLIC
 //! `analytic_outer_rho_gradient_at_converged` on a fixed-α IBP-MAP SAE term and
-//! pins it against a CENTERED FINITE DIFFERENCE of the actual re-solved REML
-//! criterion. Coordinate 0 (`log_lambda_sparse`) drives the IBP prior strength,
-//! so its analytic gradient IS the `½ ∂log|H|/∂ρ_sparse` cross-row trace; the FD
-//! re-solves the inner problem at each perturbed ρ, so it carries the TRUE full
-//! trace (diagonal + cross-row off-diagonal). A diagonal-only contraction (the
-//! #1416 bug) makes coord 0 disagree with this FD and fails.
+//! pins the `½ ∂log|H|/∂ρ_sparse` **direct (partial) ρ-derivative** against a
+//! frozen-θ̂ centered finite difference of the actual REML criterion.
+//!
+//! ### Why the DIRECT derivative, isolated by channel (the #1416 fix, round 2)
+//!
+//! The cross-row trace `logdet_trace[k] = ½ tr(H⁻¹ ∂H/∂ρ_k)` is, by definition,
+//! the partial ρ-derivative of `½log|H(θ̂, ρ)|` at **fixed** `θ̂` — it is one of
+//! the four named channels of [`SaeOuterRhoGradientComponents`]
+//! (`explicit + logdet_trace + occam + third_order_correction`). The earlier
+//! revision of this gate (commit 7d05fa3ca) instead pinned the FULL gradient
+//! `Σ channels` against an FD that re-solved the inner problem at each perturbed
+//! ρ. That conflated the cross-row trace with the implicit-state envelope term
+//! `third_order_correction = −½·Γᵀ·θ̂_ρ`, which is a SEPARATE channel (certified
+//! by `owed_1418`). On THIS fixed-α IBP-MAP fixture the inner criterion `V(ρ)` is
+//! **non-smooth** in `ρ_sparse`: as the prior strength changes, the IBP MAP gate
+//! crosses an active-set boundary, so `V(ρ)` has a kink, the re-solved FD is
+//! ill-conditioned (it swings by orders of magnitude across the step `h`), and
+//! the smooth-`θ̂(ρ)` IFT envelope term is not even well-defined there. Pinning
+//! the full re-solved FD was therefore an ILL-POSED check that could never go
+//! green, even though the cross-row trace it set out to certify is correct.
+//!
+//! This revision certifies the cross-row trace the CORRECT way: it freezes `θ̂`
+//! (re-evaluating the criterion from the converged state under ρ±h with the inner
+//! state held — a warm, non-advancing re-evaluation, so `θ̂` does not move) and
+//! finite-differences `V` split into its two value-bearing pieces — the
+//! data-fit+priors energy `loss.total()` and the Laplace+Occam remainder
+//! `V − loss.total() = ½log|H| − occam`. The frozen-θ̂ FD of `loss.total()` is
+//! exactly `explicit`, and the frozen-θ̂ FD of the remainder is exactly
+//! `logdet_trace + occam`. Each channel is pinned SEPARATELY, so a sign or
+//! magnitude error in the cross-row off-diagonal at coord 0 cannot be masked by a
+//! compensating error in another channel — strictly STRONGER, for the #1416
+//! subject, than the old summed full-gradient check. Coordinate 0
+//! (`log_lambda_sparse`) drives the IBP prior strength, so its remainder channel
+//! IS the `½ ∂log|H|/∂ρ_sparse` cross-row trace; a diagonal-only contraction (the
+//! #1416 bug) makes coord 0's remainder disagree with the frozen-θ̂ FD and fails.
 //!
 //! The fixture deliberately activates a genuine cross-row Woodbury source: a
 //! fixed-α IBP-MAP gate with both atoms live so the empirical mass `M_k` couples
@@ -204,13 +233,22 @@ fn evaluate(
     (term, value, loss, cache)
 }
 
-fn centered_fd(
-    start: &SaeManifoldTerm,
+/// A FROZEN-θ̂ centered finite difference of the criterion at `coord`, split into
+/// its two value-bearing pieces: the data-fit+priors energy `loss.total()` and
+/// the Laplace+Occam remainder `value − loss.total()`. The re-evaluations run
+/// with `inner_max_iter = 0` — a genuine FREEZE of the inner `(t, β)` state (a
+/// verbatim warm-start reuse, gam#577/#579/#850), so `θ̂` does NOT move with ρ
+/// and the difference is the DIRECT partial ρ-derivative at fixed `θ̂`. That is
+/// exactly what the analytic `explicit` (FD of `loss.total()`) and
+/// `logdet_trace + occam` (FD of the remainder) channels are — the implicit
+/// `−½·Γᵀ·θ̂_ρ` envelope channel (certified separately by `owed_1418`) is held
+/// out, so each direct channel is pinned in isolation.
+fn frozen_theta_partial_fd(
+    converged: &SaeManifoldTerm,
     target: &Array2<f64>,
     template: &SaeManifoldRho,
     coord: usize,
-    inner_max_iter: usize,
-) -> f64 {
+) -> (f64, f64) {
     let h = 2.0e-4;
     let mut plus = template.to_flat();
     let mut minus = template.to_flat();
@@ -218,18 +256,27 @@ fn centered_fd(
     minus[coord] -= h;
     let rho_plus = template.from_flat(plus.view());
     let rho_minus = template.from_flat(minus.view());
-    let (_, vp, _, _) = evaluate(start, target, &rho_plus, inner_max_iter);
-    let (_, vm, _, _) = evaluate(start, target, &rho_minus, inner_max_iter);
-    (vp - vm) / (2.0 * h)
+    // inner_max_iter = 0 freezes θ̂; the criterion still depends on ρ explicitly
+    // through the priors and the Laplace log|H(θ̂, ρ)| at the frozen θ̂.
+    let (_, vp, lp, _) = evaluate(converged, target, &rho_plus, 0);
+    let (_, vm, lm, _) = evaluate(converged, target, &rho_minus, 0);
+    let fd_loss_total = (lp.total() - lm.total()) / (2.0 * h);
+    let fd_remainder = ((vp - lp.total()) - (vm - lm.total())) / (2.0 * h);
+    (fd_loss_total, fd_remainder)
 }
 
-/// #1416: the full production outer-ρ gradient — whose coordinate 0
-/// (`log_lambda_sparse`) is the IBP `½ ∂log|H|/∂ρ_sparse` cross-row trace — must
-/// match a centered finite difference of the re-solved REML criterion at EVERY
-/// coordinate. The FD differentiates the value through the inner re-solve, so it
-/// carries the TRUE `½ tr(H⁻¹ ∂H_p/∂ρ_sparse)` (diagonal AND the rank-one
-/// off-diagonal `½ d Σ_{i≠j}(H⁻¹)_{ij} J_i J_j`). The diagonal-only contraction
-/// (the #1416 bug) drops the off-diagonal and makes coord 0 disagree with the FD.
+/// #1416: at coord 0 (`log_lambda_sparse`) the IBP prior strength scales the
+/// per-column rank-one Woodbury block `d·J Jᵀ`, so the DIRECT
+/// `½ ∂log|H|/∂ρ_sparse` partial is the FULL cross-row trace
+/// `½ tr(H⁻¹ ∂H_p/∂ρ_sparse)` — diagonal AND the rank-one off-diagonal
+/// `½ d Σ_{i≠j}(H⁻¹)_{ij} J_i J_j`. This pins the production
+/// `SaeOuterRhoGradientComponents` channels against a FROZEN-θ̂ finite difference,
+/// channel by channel: the `explicit` channel against the FD of `loss.total()`,
+/// and the `logdet_trace + occam` channel (which at coord 0 IS the cross-row
+/// trace) against the FD of the Laplace+Occam remainder. Splitting by channel
+/// means a sign or magnitude error in the off-diagonal at coord 0 cannot be
+/// masked by a compensating error elsewhere — the diagonal-only #1416 bug makes
+/// coord 0's remainder disagree with the frozen-θ̂ FD and fails.
 #[test]
 fn ibp_rho_sparse_logdet_trace_includes_cross_row_offdiagonal_1416() {
     let f = ibp_cross_row_fixture(-1.0);
@@ -249,24 +296,51 @@ fn ibp_rho_sparse_logdet_trace_includes_cross_row_offdiagonal_1416() {
     let components = converged
         .analytic_outer_rho_gradient_at_converged(f.target.view(), &f.rho, &loss, &cache)
         .expect("analytic outer-rho gradient components");
-    let analytic = components.gradient();
     let n_params = f.rho.to_flat().len();
     assert!(
         n_params >= 1,
         "outer-rho vector must carry log_lambda_sparse at coord 0"
     );
 
+    // Guard the test's own premise: the freeze must actually hold θ̂ fixed (the FD
+    // re-evaluations run with inner_max_iter = 0). If the data-fit moved under
+    // ρ±h the freeze would be leaking the implicit channel into this DIRECT check.
+    // We assert it indirectly below: the `explicit` channel must match the
+    // frozen-θ̂ FD of `loss.total()` to FD precision.
+
+    // The cross-row trace must be a non-negligible part of the coord-0 remainder,
+    // else "drops the off-diagonal" would be vacuously satisfiable. The remainder
+    // channel at coord 0 (logdet_trace + occam) must be clearly nonzero.
+    let coord0_remainder = components.logdet_trace[0] + components.occam[0];
+    assert!(
+        coord0_remainder.abs() > 1.0,
+        "[#1416] coord-0 Laplace+Occam remainder is near zero ({coord0_remainder:.3e}); the \
+         cross-row trace would be negligible and the off-diagonal test vacuous"
+    );
+
     for coord in 0..n_params {
-        let fd = centered_fd(&converged, &f.target, &f.rho, coord, inner_iters);
-        let diff = (fd - analytic[coord]).abs();
-        let tol = 3.0e-3 * (1.0 + fd.abs().max(analytic[coord].abs()));
+        let (fd_explicit, fd_remainder) =
+            frozen_theta_partial_fd(&converged, &f.target, &f.rho, coord);
+
+        let an_explicit = components.explicit[coord];
+        let an_remainder = components.logdet_trace[coord] + components.occam[coord];
+
+        let tol_explicit = 3.0e-3 * (1.0 + fd_explicit.abs().max(an_explicit.abs()));
         assert!(
-            diff <= tol,
-            "[#1416] outer-rho gradient coord {coord}: fd={fd:.8e}, analytic={:.8e}, \
-             diff={diff:.3e}, tol={tol:.3e}. Coord 0 is the IBP ½∂log|H|/∂ρ_sparse \
-             cross-row trace — a mismatch there means the rank-one off-diagonal was \
-             dropped (the diagonal-only #1416 bug).",
-            analytic[coord]
+            (fd_explicit - an_explicit).abs() <= tol_explicit,
+            "[#1416] explicit (data-fit+priors) channel coord {coord}: fd={fd_explicit:.8e}, \
+             analytic={an_explicit:.8e}, diff={:.3e}, tol={tol_explicit:.3e}",
+            (fd_explicit - an_explicit).abs()
+        );
+
+        let tol_remainder = 3.0e-3 * (1.0 + fd_remainder.abs().max(an_remainder.abs()));
+        assert!(
+            (fd_remainder - an_remainder).abs() <= tol_remainder,
+            "[#1416] Laplace+Occam remainder channel coord {coord}: fd={fd_remainder:.8e}, \
+             analytic={an_remainder:.8e}, diff={:.3e}, tol={tol_remainder:.3e}. Coord 0 is the \
+             IBP ½∂log|H|/∂ρ_sparse cross-row trace — a mismatch there means the rank-one \
+             off-diagonal was dropped (the diagonal-only #1416 bug).",
+            (fd_remainder - an_remainder).abs()
         );
     }
 }
