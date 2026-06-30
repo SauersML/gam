@@ -5369,6 +5369,25 @@ pub(crate) struct RemlState<'a> {
     /// same fixed-weight objective the cost evaluates.
     pub(crate) alo_frozen_nuisance: RwLock<Option<AloFrozenNuisance>>,
 
+    /// ρ-independent certificate that the Gaussian-identity ALO-stabilization
+    /// augmentation can never activate on this surface (#1689).
+    ///
+    /// The augmentation engages only when some row's *penalized* leverage
+    /// `h_i = w_i · xᵢᵀ H_λ⁻¹ xᵢ` reaches `ALO_MAX_LEVERAGE_THRESHOLD`, where
+    /// `H_λ = XᵀWX + S_λ + ridge·I ⪰ XᵀWX`. Because `S_λ + ridge·I ⪰ 0` we have
+    /// `H_λ⁻¹ ⪯ (XᵀWX)⁻¹`, so `h_i ≤ w_i · xᵢᵀ (XᵀWX)⁻¹ xᵢ` — the *unpenalized*
+    /// weighted hat diagonal, which (for Gaussian identity, where W is the fixed
+    /// prior-weight diagonal) is independent of ρ. If the max of that bound is
+    /// below the activation threshold, no ρ can trip the gate, so the entire
+    /// per-outer-evaluation O(n·p²) ALO leverage diagnostic — recomputed and
+    /// discarded on every cost/gradient eval otherwise — is skipped.
+    ///
+    /// `Some(true)`  → provably inactive everywhere, skip the diagnostic.
+    /// `Some(false)` → bound is ≥ threshold or XᵀWX is rank-deficient/ill-
+    ///                 conditioned (bound not certifiable); fall through to the
+    ///                 exact per-eval gate. Computed lazily, at most once.
+    pub(crate) alo_provably_inactive: RwLock<Option<bool>>,
+
     /// Stable disk-cache key for the current realized REML surface. Computed
     /// lazily because it hashes the row-chunked design and data vectors.
     pub(crate) persistent_warm_start_key: RwLock<Option<String>>,

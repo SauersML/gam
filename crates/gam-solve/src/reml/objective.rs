@@ -1845,6 +1845,40 @@ impl<'a> RemlState<'a> {
         Ok(result)
     }
 
+    /// ρ-independent certificate that the Gaussian-identity ALO-stabilization
+    /// augmentation can never activate on this surface (#1689). See the
+    /// `alo_provably_inactive` field docs for the monotone-bound derivation.
+    /// Computed at most once and memoized. Returns `false` (not certified)
+    /// whenever the bound is not strictly below the activation threshold or the
+    /// unpenalized Gram is not factorizable — in either case the caller falls
+    /// through to the exact per-evaluation gate, preserving prior behavior.
+    pub(crate) fn alo_provably_inactive_certificate(&self) -> Result<bool, EstimationError> {
+        if let Some(cached) = *self.alo_provably_inactive.read().unwrap() {
+            return Ok(cached);
+        }
+        let verdict = self.compute_alo_provably_inactive();
+        *self.alo_provably_inactive.write().unwrap() = Some(verdict);
+        Ok(verdict)
+    }
+
+    /// Compute the non-activation certificate. The leverage `xᵢᵀ H⁻¹ xᵢ` is
+    /// invariant under any invertible column reparameterization, so this works
+    /// in the original design basis with the fixed Gaussian-identity weights.
+    fn compute_alo_provably_inactive(&self) -> bool {
+        let x = match self
+            .x
+            .try_to_dense_arc("ALO non-activation certificate requires dense design")
+        {
+            Ok(x) => x,
+            Err(_) => return false,
+        };
+        unpenalized_hat_bound_below_threshold(
+            x.as_ref(),
+            self.weights,
+            ALO_MAX_LEVERAGE_THRESHOLD,
+        )
+    }
+
     pub(crate) fn alo_stabilization_eval(
         &self,
         rho: &Array1<f64>,
@@ -1926,6 +1960,24 @@ impl<'a> RemlState<'a> {
         // restoring `te()` to the same per-eval cost profile as `duchon`/`matern`.
         let edf = bundle.pirls_result.edf;
         if edf.is_finite() && edf > ALO_EDF_FRACTION_SATURATION * (n as f64) {
+            return Ok(None);
+        }
+        // ρ-independent non-activation certificate (#1689). The augmentation can
+        // only engage when some row's *penalized* leverage
+        //   h_i = w_i · xᵢᵀ H_λ⁻¹ xᵢ ,   H_λ = XᵀWX + S_λ + ridge·I
+        // reaches `ALO_MAX_LEVERAGE_THRESHOLD`. Since `S_λ + ridge·I ⪰ 0`,
+        // `H_λ ⪰ XᵀWX`, hence `H_λ⁻¹ ⪯ (XᵀWX)⁻¹` and
+        //   h_i ≤ w_i · xᵢᵀ (XᵀWX)⁻¹ xᵢ =: h̄_i,
+        // the *unpenalized* weighted hat diagonal. For Gaussian identity (the
+        // only family reaching here) W is the fixed prior-weight diagonal, so h̄
+        // is independent of ρ and of the smoothing search. If max_i h̄_i is below
+        // the activation threshold, no ρ can trip the leverage gate, so the
+        // augmentation provably never engages and the per-outer-evaluation
+        // O(n·p²) ALO diagnostic (otherwise computed and discarded on EVERY cost
+        // and gradient evaluation — the dominant cost of ordinary P-spline /
+        // thin-plate Gaussian fits, #1689) is skipped with zero behavioral
+        // change. Computed lazily, at most once per surface.
+        if self.alo_provably_inactive_certificate()? {
             return Ok(None);
         }
         // Graceful degradation when the ALO diagnostic itself is not computable
@@ -3415,6 +3467,93 @@ impl<'a> RemlState<'a> {
     }
 }
 
+/// ρ-independent certificate that the Gaussian-identity ALO-stabilization
+/// augmentation can never activate (#1689).
+///
+/// The augmentation engages only when some row's *penalized* leverage
+/// `h_i = w_i · xᵢᵀ H_λ⁻¹ xᵢ` reaches `threshold`, where the penalized Hessian
+/// `H_λ = XᵀWX + S_λ + ridge·I ⪰ XᵀWX` (the penalty and ridge are PSD). By
+/// Loewner monotonicity `H_λ⁻¹ ⪯ (XᵀWX)⁻¹`, so for every ρ
+/// `h_i ≤ w_i · xᵢᵀ (XᵀWX)⁻¹ xᵢ =: h̄_i`, the *unpenalized* weighted hat
+/// diagonal. Returns `true` iff `max_i h̄_i < threshold` — in which case no ρ
+/// can trip the activation gate. Returns `false` (cannot certify) when the
+/// design is empty, the weights are inconsistent / non-finite / negative, the
+/// unpenalized weighted Gram `XᵀWX` is not factorizable (the bound degenerates),
+/// or the bound reaches the threshold. A `false` result is never wrong — the
+/// caller then falls through to the exact per-evaluation leverage gate.
+///
+/// The leverage `xᵢᵀ H⁻¹ xᵢ` is invariant under invertible column
+/// reparameterization, so this may be evaluated in the original design basis
+/// with the fixed prior weights `W` (for Gaussian identity these equal the
+/// converged Hessian weights and are independent of ρ).
+pub(crate) fn unpenalized_hat_bound_below_threshold(
+    x: &Array2<f64>,
+    weights: ArrayView1<'_, f64>,
+    threshold: f64,
+) -> bool {
+    let n = x.nrows();
+    let p = x.ncols();
+    if n == 0 || p == 0 || weights.len() != n {
+        return false;
+    }
+    // Unpenalized weighted Gram G = XᵀWX. Any non-finite or negative weight
+    // makes the monotone bound uncertifiable.
+    let mut gram = Array2::<f64>::zeros((p, p));
+    for i in 0..n {
+        let wi = weights[i];
+        if !wi.is_finite() || wi < 0.0 {
+            return false;
+        }
+        if wi == 0.0 {
+            continue;
+        }
+        for a in 0..p {
+            let xa = wi * x[[i, a]];
+            for b in a..p {
+                gram[[a, b]] += xa * x[[i, b]];
+            }
+        }
+    }
+    for a in 0..p {
+        for b in 0..a {
+            gram[[a, b]] = gram[[b, a]];
+        }
+    }
+    let factor = match StableSolver::new("ALO non-activation certificate").factorize(&gram) {
+        Ok(factor) => factor,
+        // Rank-deficient / ill-conditioned unpenalized Gram: the monotone bound
+        // degenerates, so we cannot certify.
+        Err(_) => return false,
+    };
+    let mut gram_inv = Array2::<f64>::eye(p);
+    let mut gram_inv_view = array2_to_matmut(&mut gram_inv);
+    factor.solve_in_place(gram_inv_view.as_mut());
+    // h̄_i = w_i · xᵢᵀ G⁻¹ xᵢ ≥ h_i for every ρ.
+    for i in 0..n {
+        let wi = weights[i];
+        if wi <= 0.0 {
+            continue;
+        }
+        let mut quad = 0.0f64;
+        for a in 0..p {
+            let xa = x[[i, a]];
+            if xa == 0.0 {
+                continue;
+            }
+            let mut row_acc = 0.0f64;
+            for b in 0..p {
+                row_acc += gram_inv[[a, b]] * x[[i, b]];
+            }
+            quad = xa.mul_add(row_acc, quad);
+        }
+        let hbar = wi * quad;
+        if !hbar.is_finite() || hbar >= threshold {
+            return false;
+        }
+    }
+    true
+}
+
 pub(crate) fn positive_penalty_rank_and_logdet(eigenvalues: &[f64]) -> (usize, f64) {
     let threshold = super::reml_outer_engine::positive_eigenvalue_threshold(eigenvalues);
     let rank = eigenvalues.iter().filter(|&&ev| ev > threshold).count();
@@ -3439,6 +3578,120 @@ mod tk_math_tests {
     use faer::Side;
     use ndarray::array;
     use num_dual::{Dual3_64, Dual64, DualNum, third_derivative};
+
+    /// The unpenalized hat bound h̄_i = w_i·xᵢᵀ(XᵀWX)⁻¹xᵢ must dominate the
+    /// penalized leverage h_i(λ) = w_i·xᵢᵀ(XᵀWX + λS)⁻¹xᵢ for EVERY λ ≥ 0 and
+    /// every row — the soundness property the #1689 non-activation certificate
+    /// relies on. We check it against the exact penalized leverage at a spread
+    /// of λ on a deterministic design, so a future change that breaks the
+    /// monotone-bound direction reddens here rather than silently skipping a
+    /// stabilization that should have engaged.
+    #[test]
+    pub(crate) fn unpenalized_hat_bound_dominates_penalized_leverage_for_all_lambda() {
+        let n = 40usize;
+        let p = 5usize;
+        // Deterministic, well-conditioned design + a PSD penalty S = DᵀD.
+        let x = Array2::from_shape_fn((n, p), |(i, j)| {
+            let t = i as f64 / (n as f64 - 1.0);
+            (1.7 * t * (j as f64 + 1.0) + 0.3 * j as f64).sin() + 0.11 * (j as f64)
+        });
+        let weights = Array1::from_shape_fn(n, |i| 0.4 + 0.5 * ((i as f64) * 0.21).sin().abs());
+        let mut s = Array2::<f64>::zeros((p, p));
+        for k in 0..p - 1 {
+            // second-difference-like penalty block contribution
+            s[[k, k]] += 1.0;
+            s[[k + 1, k + 1]] += 1.0;
+            s[[k, k + 1]] -= 1.0;
+            s[[k + 1, k]] -= 1.0;
+        }
+        // Unpenalized weighted Gram and its bound diagonal.
+        let mut gram0 = Array2::<f64>::zeros((p, p));
+        for i in 0..n {
+            for a in 0..p {
+                for b in 0..p {
+                    gram0[[a, b]] += weights[i] * x[[i, a]] * x[[i, b]];
+                }
+            }
+        }
+        let g0_factor = StableSolver::new("test gram0").factorize(&gram0).unwrap();
+        let mut g0_inv = Array2::<f64>::eye(p);
+        let mut g0_inv_v = array2_to_matmut(&mut g0_inv);
+        g0_factor.solve_in_place(g0_inv_v.as_mut());
+        let hbar: Vec<f64> = (0..n)
+            .map(|i| {
+                let mut q = 0.0;
+                for a in 0..p {
+                    for b in 0..p {
+                        q += x[[i, a]] * g0_inv[[a, b]] * x[[i, b]];
+                    }
+                }
+                weights[i] * q
+            })
+            .collect();
+        // For every λ ≥ 0 the penalized leverage must not exceed the bound.
+        for &lambda in &[0.0_f64, 0.5, 2.0, 17.0, 1.0e3, 1.0e6] {
+            let mut h = gram0.clone();
+            for a in 0..p {
+                for b in 0..p {
+                    h[[a, b]] += lambda * s[[a, b]];
+                }
+            }
+            let factor = StableSolver::new("test penalized H").factorize(&h).unwrap();
+            let mut h_inv = Array2::<f64>::eye(p);
+            let mut h_inv_v = array2_to_matmut(&mut h_inv);
+            factor.solve_in_place(h_inv_v.as_mut());
+            for i in 0..n {
+                let mut q = 0.0;
+                for a in 0..p {
+                    for b in 0..p {
+                        q += x[[i, a]] * h_inv[[a, b]] * x[[i, b]];
+                    }
+                }
+                let h_i = weights[i] * q;
+                assert!(
+                    h_i <= hbar[i] + 1e-9,
+                    "penalized leverage h_{i}(λ={lambda})={h_i:.6} exceeded unpenalized \
+                     bound h̄={:.6}; monotone certificate would be unsound",
+                    hbar[i]
+                );
+            }
+        }
+
+        // A threshold safely above every h̄ certifies inactivity; one below the
+        // observed maximum must refuse to certify.
+        let max_hbar = hbar.iter().cloned().fold(0.0_f64, f64::max);
+        assert!(
+            unpenalized_hat_bound_below_threshold(&x, weights.view(), max_hbar + 0.05),
+            "bound below a generous threshold must certify inactivity"
+        );
+        assert!(
+            !unpenalized_hat_bound_below_threshold(&x, weights.view(), max_hbar * 0.5),
+            "a threshold under the max bound must NOT certify (would skip a live gate)"
+        );
+    }
+
+    /// A near-isolated row (its own near-orthogonal basis column) drives the
+    /// unpenalized hat bound to ≈ 1, so the certificate must refuse to certify
+    /// and fall through to the exact gate — the high-leverage regime the ALO
+    /// stabilization exists to handle.
+    #[test]
+    pub(crate) fn high_leverage_row_is_not_certified_inactive() {
+        let n = 12usize;
+        let p = 3usize;
+        let mut x = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            x[[i, 0]] = 1.0;
+            x[[i, 1]] = i as f64 / (n as f64 - 1.0);
+        }
+        // Third column is a near-indicator for the last row only: that row gets
+        // (near-)unit leverage in the unpenalized fit.
+        x[[n - 1, 2]] = 1.0;
+        let weights = Array1::<f64>::ones(n);
+        assert!(
+            !unpenalized_hat_bound_below_threshold(&x, weights.view(), 0.80),
+            "a near-unit-leverage row must not be certified inactive"
+        );
+    }
 
     #[test]
     pub(crate) fn firth_default_pc_prior_fills_flat_holes() {
