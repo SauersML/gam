@@ -4704,6 +4704,7 @@ mod tests {
                 rho_posterior_certificate: None,
                 rho_posterior_escalation: None,
                 rho_covariance: None,
+                joint_log_lambdas: None,
             },
             inner_cycles: 0,
         }
