@@ -67,3 +67,16 @@ Fix:
 
 Proven on Tesla V100 sm_70: NVRTC compiles survival_rowjet_kernel.cu, both
 kernels launch & run, all 7 module tests PASS (2 of them exercise the GPU).
+
+## FINDING 2 (2026-06-30) — survival_flex step6 entrypoint test was GPU-box-broken
+`survival::marginal_slope::gpu::step6_tests::flex_entrypoints_fold_supplied_step6_rows_before_backend_gate`
+used bit-exact `assert_eq!`, but on a GPU box the gradient/hvp/dense-hessian
+entrypoints route the step6 fold through the device kernel `survival_flex_step6_rows`,
+whose per-row `M=H_p·J` contraction reassociates + uses FMA → ~2e-16 drift.
+- On a CPU-only box (CI) the host fold runs → assert_eq passes → the device path
+  shipped untested by THIS test. Same #415/#1175 latent-GPU-only-failure genus.
+- Fixed: replaced assert_eq! with a relative band (atol+rtol·(1+|x|), rtol=1e-12),
+  matching the sibling `step6_device_contraction_matches_cpu_reference`.
+- Corrected two "bit-for-bit / to the last ULP" comments that the V100 falsifies
+  (FMA/reassociation in the device contraction).
+- Verified PASS on V100 (failed before, passes after).

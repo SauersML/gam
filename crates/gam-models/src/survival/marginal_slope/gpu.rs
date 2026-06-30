@@ -1297,14 +1297,17 @@ pub fn pullback_step6_joint_beta(
 //     grad_row[j]   = Σ_a J[a,j] · g_p[a]                       (∈ ℝ^p)
 //     hess_row[j,k] = Σ_a Σ_b J[a,j] · H_p[a,b] · J[b,k]        (∈ ℝ^{p×p})
 //
-// using the identical blocked `M = H_p · J` intermediate the host uses, so each
-// row's partial is bit-for-bit what the host computes for that row.  The per-row
+// using the same blocked `M = H_p · J` intermediate the host uses.  The per-row
 // partials are copied back and summed on the host **in row order** — matching the
-// host reference's sequential row accumulation — so the device total agrees with
-// `pullback_step6_joint_beta` to the last ULP (the row-NLL is summed the same
-// way).  The expensive O(r²p + r·p²) per-row contraction runs on the device; the
-// cheap O(n·p²) deterministic row reduction stays on the host to preserve the
-// exact CPU summation order.
+// host reference's sequential row accumulation — so the cross-row reduction order
+// is identical.  The device total therefore agrees with `pullback_step6_joint_beta`
+// to a small multiple of ULP, NOT bit-for-bit: the per-row `M = H_p·J` inner
+// products reassociate and the device contracts them with fused multiply-add
+// (FMA), so the last bit differs from the host's separate-rounding scalar loop
+// (measured ~2e-16 on a Tesla V100). That is a #1175 reassociation/FMA difference,
+// not an algebra mismatch; parity tests therefore use a relative band, not
+// `assert_eq!`.  The expensive O(r²p + r·p²) per-row contraction runs on the
+// device; the cheap O(n·p²) row reduction stays on the host in CPU order.
 //
 // Concatenated SoA layout (host builds once, uploads once):
 //   * `g_p_flat`  — Σ_rows r_row  primary-gradient scalars, row-major.
@@ -1485,11 +1488,13 @@ extern "C" __global__ void survival_flex_step6_rows(
 
 /// Device Step-6 joint-β contraction.  Returns `Ok(None)` on non-Linux / no-CUDA
 /// builds (caller folds on the host via [`pullback_step6_joint_beta`]); returns
-/// the bit-exact `(nll, grad, hess)` on a healthy CUDA device.
+/// `(nll, grad, hess)` agreeing with the host reference to a small ULP multiple
+/// on a healthy CUDA device (NOT bit-exact — the per-row contraction reassociates
+/// and uses FMA; see the Step-6 device section comment and #1175).
 ///
 /// The per-row dense contraction (`Jᵀ g_p`, `Jᵀ H_p J`) runs on the GPU; the
-/// per-row partials are summed on the host in row order so the result matches the
-/// host reference to the last ULP.  The dense Hessian is symmetrized with the
+/// per-row partials are summed on the host in row order so the cross-row reduction
+/// order matches the host reference.  The dense Hessian is symmetrized with the
 /// same averaging pass the host uses.
 pub fn try_device_step6_joint_beta(
     rows: &[SurvivalFlexStep6RowPullback<'_>],
@@ -2646,25 +2651,55 @@ mod step6_tests {
         let (expected_nll, expected_grad, expected_hess) =
             pullback_step6_joint_beta(&step6_rows, p).expect("reference step6");
 
+        // Parity band (#415 / #1175): the host `pullback_step6_joint_beta`
+        // reference sums each row's contraction in a fixed scalar order; on a
+        // CUDA host the entry points route the SAME contraction through the
+        // device kernel `survival_flex_step6_rows`, whose per-row `M = H_p·J`
+        // reduction reassociates and uses fused multiply-add. That is an
+        // irreducible ~ULP reassociation difference, NOT an algebra mismatch, so
+        // a bit-exact `assert_eq!` is wrong on a GPU box (it fails by ~2e-16).
+        // Use a relative band `atol + rtol·(1+|expected|)` — the SAME principle
+        // as the sibling `step6_device_contraction_matches_cpu_reference` — which
+        // a real contraction bug (O(value)) would still blow through.
+        const ATOL: f64 = 1e-12;
+        const RTOL: f64 = 1e-12;
+        let close = |got: f64, want: f64, what: &str| {
+            let tol = ATOL + RTOL * (1.0 + want.abs());
+            assert!(
+                (got - want).abs() <= tol,
+                "{what}: got {got} vs want {want} (|Δ|={:.3e} > tol {tol:.3e})",
+                (got - want).abs()
+            );
+        };
+
         let inputs = minimal_gpu_row_inputs(n, p, &beta, &q0, &q1, &qd1, &z, &g, &weights, &event);
         let (nll, grad) = try_survival_flex_gradient(inputs, None, Some(&step6_rows))
             .expect("gradient entrypoint")
             .expect("step6 gradient should be assembled before backend gate");
-        assert_eq!(nll, expected_nll);
-        assert_eq!(grad, expected_grad);
+        close(nll, expected_nll, "nll");
+        for k in 0..p {
+            close(grad[k], expected_grad[k], &format!("grad[{k}]"));
+        }
 
         let v = vec![0.25, -0.5, 0.75, -1.0];
         let inputs = minimal_gpu_row_inputs(n, p, &beta, &q0, &q1, &qd1, &z, &g, &weights, &event);
         let hv = try_survival_flex_hvp(inputs, &v, Some(&step6_rows))
             .expect("hvp entrypoint")
             .expect("step6 hvp should be assembled before backend gate");
-        assert_eq!(hv, expected_hess.dot(&Array1::from(v)));
+        let expected_hv = expected_hess.dot(&Array1::from(v));
+        for k in 0..p {
+            close(hv[k], expected_hv[k], &format!("hv[{k}]"));
+        }
 
         let inputs = minimal_gpu_row_inputs(n, p, &beta, &q0, &q1, &qd1, &z, &g, &weights, &event);
         let hess = try_survival_flex_dense_hessian(inputs, None, Some(&step6_rows))
             .expect("dense hessian entrypoint")
             .expect("step6 dense Hessian should be assembled before backend gate");
-        assert_eq!(hess, expected_hess);
+        for a in 0..p {
+            for b in 0..p {
+                close(hess[[a, b]], expected_hess[[a, b]], &format!("hess[{a},{b}]"));
+            }
+        }
     }
 
     /// Build a deterministic, varied Step-6 batch (mixed r per row, sparse
