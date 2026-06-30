@@ -20,10 +20,25 @@
 //! On an A100 the per-row jet is embarrassingly parallel and the `erfc`/`erfcx`
 //! are hardware f64 special functions. Measured (aga13 A100, full f64, no
 //! fast-math, n=8e6): **~500× kernel-only** over the 16-thread CPU jet and
-//! **~160× end-to-end** with the on-device reduction; **device == CPU to 4.7e-12**
-//! over every channel (`v`, `g[4]`, `H[16]`, contracted third `[16]`, contracted
-//! fourth `[16]`). The standalone measurement prototype lives at
+//! **~160× end-to-end** with the on-device reduction. The standalone
+//! measurement prototype lives at
 //! `src/gpu/proto/survival_marginal_slope_jet_932.cu`.
+//!
+//! # CPU↔device parity (#415 / #1175)
+//!
+//! The device kernel runs the SAME seeded-jet arithmetic as the CPU jet (pinned
+//! line-for-line by the host-oracle `*_tests` module on every box), so the
+//! CPU↔device residual is NOT an algebra mismatch — it is irreducible
+//! transcendental drift: CUDA's `erfc`/`exp`/`sqrt` differ from the host libm at
+//! the ULP level, and that ε is amplified through the order-4 jet chain into the
+//! high-order channels. Measured on a **Tesla V100 (sm_70)** the drift,
+//! normalized to each channel's magnitude, is ≤1.2e-9 (worst: third channel
+//! 5.09e-8 against a channel scale of 42.5). The parity gate
+//! (`tests::device_matches_cpu_when_available`, and the fail-loud device-only
+//! sweep) is therefore a per-channel `atol + rtol·channel_scale` band, NOT a
+//! flat absolute tolerance — see `tests::PARITY_RTOL` for why a flat `1e-9`
+//! absolute bound was wrong (it ignored derivative-order amplification) and why
+//! the magnitude-scaled band still catches any real bug with ~80× headroom.
 //!
 //! # Single source, exactly
 //!
@@ -182,8 +197,10 @@ pub fn survival_rigid_row_jets_cpu(
 /// General entry point: compute every row's order-≤2 + contracted third/fourth
 /// channels, on the GPU when a CUDA device is admitted and the batch is large
 /// enough to amortise the launch, else on the CPU. Both paths run the SAME
-/// unified jet, so the result is identical (proven ≤1e-9; measured 4.7e-12 on the
-/// A100). On ANY device error the CPU path runs — no fragility.
+/// unified jet, so the result agrees within the per-channel magnitude-scaled
+/// parity band (irreducible transcendental drift only — see the module docs and
+/// `tests::PARITY_RTOL`; worst measured ≤1.2e-9 relative on a V100). On ANY
+/// device error the CPU path runs — no fragility.
 #[must_use]
 pub fn survival_rigid_row_jets(
     rows: &[SurvivalRowInputs],
