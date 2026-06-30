@@ -16,7 +16,7 @@
 //!
 //! On non-Linux builds the entire module degrades to a CPU-fallback shim.
 
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, ArrayView2};
 
 use gam_linalg::triangular::{CholeskyGuard, cholesky_factor_in_place, cholesky_solve_vector};
 use crate::arrow_schur::{ArrowSchurSystem, DeviceSaePcgData, PcgDiagnostics};
@@ -54,19 +54,117 @@ pub enum ArrowSchurGpuFailure {
     },
 }
 
-/// Safety-margin multiplier on `√(machine ε)` for the diagonal ridge bump
-/// suggested when a local block fails Cholesky.
+/// Relative rounding margin (multiplier on `diag_scale · √ε`) added on top of
+/// the deficit-clearing shift in [`ridge_bump_to_make_pd`].
 ///
-/// The estimated bump is `diag_scale · |pivot| · √ε · RIDGE_BUMP_EPS_MARGIN`.
-/// A bare `diag_scale · √ε` ridge is the smallest perturbation that makes a
-/// marginally-indefinite block PD in exact arithmetic, but a single retry at
-/// that magnitude is routinely re-rejected by the next POTRF because the
-/// rounding error of forming `D + ridge·I` and re-factoring is itself O(√ε).
-/// The 1024× headroom (≈ 2¹⁰, i.e. ten extra bits below the f64 mantissa's
-/// 52) clears the pivot on the first retry without materially perturbing the
-/// curvature the Newton step sees. Shared by the per-row scalar path and the
-/// batched-tile path so both suggest an identical bump.
+/// The exact shift `-(λ_min)` makes a block PD in exact arithmetic, but a
+/// single retry at precisely that magnitude is routinely re-rejected by the
+/// next POTRF because the rounding error of forming `D + ridge·I` and
+/// re-factoring is itself O(√ε). The 1024× headroom (≈ 2¹⁰, ten extra bits
+/// below the f64 mantissa's 52) clears the pivot on the first retry without
+/// materially perturbing the curvature the Newton step sees. Shared by every
+/// per-row / batched / fused producer so they suggest a consistent bump.
 const RIDGE_BUMP_EPS_MARGIN: f64 = 1024.0;
+
+/// Diagonal ridge bump that is GUARANTEED to make `H_tt + (ridge_t + bump)·I`
+/// positive definite for a *symmetric* per-row block, sized from the block's
+/// own entries rather than from the factorization's pivot index.
+///
+/// # Why the old `scale · |pivot| · √ε · 1024` estimate is wrong
+///
+/// The batched/fused device paths derive the suggested bump from the
+/// factorization "pivot" — but cuSOLVER's `potrf` (and the NVRTC kernel's
+/// status code) report the failing pivot as a **1-based row index**, NOT the
+/// magnitude of the negative pivot. A block that is indefinite by `O(1)`
+/// (e.g. `H_tt = -I`, whose smallest eigenvalue is `-1`) then yields the same
+/// `bump ≈ √ε · 1024 ≈ 1.5e-5` as a block that is indefinite by `O(√ε)`. The
+/// outer LM escalation, which retries at `ridge_t + bump` and grows
+/// geometrically with a bounded step count, can never lift a strongly
+/// indefinite block out of the negative regime, so the solve fails to recover
+/// even though the block is trivially regularizable. (Surfaced by the V100
+/// `ridge_bump_required_on_non_pd_row_recovers_after_bump` validation test.)
+///
+/// # The bound
+///
+/// By the Gershgorin circle theorem every eigenvalue `λ` of the symmetric
+/// matrix `A = H_tt` satisfies, for some row `i`,
+///   `λ ≥ A[i,i] − Σ_{j≠i} |A[i,j]|`,
+/// so `λ_min(A) ≥ min_i ( A[i,i] − Σ_{j≠i} |A[i,j]| ) =: g` (the most negative
+/// Gershgorin left edge). Adding `t·I` shifts every eigenvalue up by `t`, so
+/// `A + t·I` is PD as soon as `t > -g`. We are already sitting at `ridge_t`, so
+/// the ADDITIONAL bump needed is `-(g + ridge_t)` when that is positive. We add
+/// a relative safety margin (`√ε · scale · 1024`, the same headroom the legacy
+/// estimate used) so the re-factored, rounding-perturbed block clears the pivot
+/// on the first retry, and a `max(1)`-scaled floor so a marginally-indefinite
+/// block still gets a strictly positive, non-vanishing bump.
+///
+/// The returned value is the bump to ADD to the current `ridge_t`. It is always
+/// strictly positive (the caller only constructs `RidgeBumpRequired` on an
+/// actual non-PD failure, but the bound is defensive regardless).
+#[must_use]
+fn ridge_bump_to_make_pd(htt: ArrayView2<'_, f64>, ridge_t: f64) -> f64 {
+    let d = htt.nrows();
+    // Diagonal magnitude scale (also the legacy `scale`), and the most-negative
+    // Gershgorin left edge `g = min_i (A_ii − Σ_{j≠i} |A_ij|)`.
+    let mut scale = 1.0_f64;
+    let mut min_gershgorin_edge = f64::INFINITY;
+    for i in 0..d {
+        let diag = htt[[i, i]];
+        scale = scale.max(diag.abs());
+        let mut off_sum = 0.0_f64;
+        for j in 0..d {
+            if j != i {
+                off_sum += htt[[i, j]].abs();
+            }
+        }
+        min_gershgorin_edge = min_gershgorin_edge.min(diag - off_sum);
+    }
+    if !min_gershgorin_edge.is_finite() {
+        // d == 0 (no rows) or non-finite entries: fall back to the scale-only
+        // floor so the caller still gets a strictly positive bump.
+        return scale * f64::EPSILON.sqrt() * RIDGE_BUMP_EPS_MARGIN;
+    }
+    // Additional shift needed so `λ_min(A) + ridge_t + bump > 0`, i.e.
+    // `bump > -(min_gershgorin_edge + ridge_t)`.
+    let deficit = -(min_gershgorin_edge + ridge_t);
+    let margin = scale * f64::EPSILON.sqrt() * RIDGE_BUMP_EPS_MARGIN;
+    // Lift past the deficit (when positive) plus a rounding margin; never below
+    // the scale-relative floor so a marginal block still moves.
+    deficit.max(0.0) + margin
+}
+
+/// [`ridge_bump_to_make_pd`] for a `d × d` symmetric block stored column-major
+/// in a flat slice with the current ridge ALREADY baked into the diagonal
+/// (the device packers emit `D = H_tt + ridge_t·I` this way). Because the shift
+/// is already present, the Gershgorin bound is taken at `ridge_t = 0` and the
+/// returned value is still the ADDITIONAL bump to add on top of the current
+/// ridge. Returns the scale-only floor when `block` is mis-sized.
+#[must_use]
+fn ridge_bump_to_make_pd_colmajor(block: &[f64], d: usize) -> f64 {
+    if d == 0 || block.len() < d * d {
+        return f64::EPSILON.sqrt() * RIDGE_BUMP_EPS_MARGIN;
+    }
+    // Column-major: element (row r, col c) at block[c*d + r]. The matrix is
+    // symmetric, so reading by column gives the same Gershgorin edges as by row.
+    let mut scale = 1.0_f64;
+    let mut min_gershgorin_edge = f64::INFINITY;
+    for i in 0..d {
+        let diag = block[i * d + i];
+        scale = scale.max(diag.abs());
+        let mut off_sum = 0.0_f64;
+        for j in 0..d {
+            if j != i {
+                off_sum += block[j * d + i].abs();
+            }
+        }
+        min_gershgorin_edge = min_gershgorin_edge.min(diag - off_sum);
+    }
+    let margin = scale * f64::EPSILON.sqrt() * RIDGE_BUMP_EPS_MARGIN;
+    if !min_gershgorin_edge.is_finite() {
+        return margin;
+    }
+    (-min_gershgorin_edge).max(0.0) + margin
+}
 
 /// Entry point: attempt the fully device-resident Arrow-Schur Newton solve.
 /// Returns `Err(ArrowSchurGpuFailure::Unavailable)` to indicate "device path
@@ -472,16 +570,12 @@ fn build_row_procedural_matvec(
         }
         let factor = cholesky_factor_in_place(block.view(), CholeskyGuard::NonnegativePivot)
             .ok_or_else(|| {
-                let scale = row
-                    .htt
-                    .diag()
-                    .iter()
-                    .map(|v| v.abs())
-                    .fold(0.0_f64, f64::max)
-                    .max(1.0);
+                // Deficit-aware bump from the block's own entries (Gershgorin),
+                // so the outer LM escalation lifts a strongly-indefinite block
+                // out of the negative regime in one retry.
                 ArrowSchurGpuFailure::RidgeBumpRequired {
                     row: i,
-                    bump: scale * f64::EPSILON.sqrt() * RIDGE_BUMP_EPS_MARGIN,
+                    bump: ridge_bump_to_make_pd(row.htt.view(), ridge_t),
                 }
             })?;
         factors.push(factor);
@@ -961,7 +1055,6 @@ mod cuda {
         d_block: Vec<f64>, // d*d
         b_block: Vec<f64>, // d*k
         g_vec: Vec<f64>,   // d
-        diag_scale: f64,   // |diag(H_tt)| scale for the ridge-bump diagnostic
         // Forward outputs, kept on the host for the back-sub pass.
         l_block: Vec<f64>, // d*d lower factor, column-major
         u_vec: Vec<f64>,   // d   (= L^{-1} g)
@@ -1031,18 +1124,10 @@ mod cuda {
             let mut b_block = Vec::with_capacity(d * k);
             let mut g_vec = Vec::with_capacity(d);
             pack_block(row, ridge_t, d, k, &mut d_block, &mut b_block, &mut g_vec);
-            let diag_scale = row
-                .htt
-                .diag()
-                .iter()
-                .map(|v| v.abs())
-                .fold(0.0_f64, f64::max)
-                .max(1.0);
             slots.push(RowSlot {
                 d_block,
                 b_block,
                 g_vec,
-                diag_scale,
                 l_block: Vec::new(),
                 u_vec: Vec::new(),
                 y_block: Vec::new(),
@@ -1214,15 +1299,16 @@ mod cuda {
         let mut g_dev = stream.clone_htod(&g_host).ok()?;
 
         // Batched POTRF; a non-PD block records its bump and stops the tile.
+        // The bump is deficit-aware (Gershgorin lower bound on λ_min of the
+        // already-ridged `d_block`), NOT derived from the cuSOLVER `info` —
+        // which is a 1-based pivot ROW INDEX, not a pivot magnitude — so a
+        // strongly-indefinite block recovers in one outer-loop retry.
         let info_host = potrf_batched(&solver, &stream, d, m, &mut d_dev).ok()?;
         if let Some(local) = info_host.iter().position(|info| *info != 0) {
-            let pivot = info_host[local];
-            tile[local].bump = Some(
-                tile[local].diag_scale
-                    * (f64::from(pivot).abs()).max(1.0)
-                    * f64::EPSILON.sqrt()
-                    * super::RIDGE_BUMP_EPS_MARGIN,
-            );
+            tile[local].bump = Some(super::ridge_bump_to_make_pd_colmajor(
+                &tile[local].d_block,
+                d,
+            ));
             return Some(());
         }
 
@@ -1345,17 +1431,12 @@ mod cuda {
         // is the single-device leaf the split dispatches per tile.
         let info_host = potrf_batched(&solver, &stream, d, n, &mut d_dev)?;
         if let Some(idx) = info_host.iter().position(|info| *info != 0) {
-            let pivot = info_host[idx];
-            let scale = sys.rows[idx]
-                .htt
-                .diag()
-                .iter()
-                .map(|v| v.abs())
-                .fold(0.0_f64, f64::max)
-                .max(1.0);
+            // `info` is cuSOLVER's 1-based pivot ROW INDEX, not a magnitude;
+            // size the bump from the block's own entries (Gershgorin λ_min
+            // bound) so a strongly-indefinite block recovers in one retry.
             return Err(ArrowSchurGpuFailure::RidgeBumpRequired {
                 row: idx,
-                bump: scale * (pivot.abs() as f64).max(1.0) * f64::EPSILON.sqrt() * 1024.0,
+                bump: super::ridge_bump_to_make_pd(sys.rows[idx].htt.view(), ridge_t),
             });
         }
 
@@ -2598,16 +2679,11 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
                 gam_linalg::triangular::CholeskyGuard::NonnegativePivot,
             )
             .ok_or_else(|| {
-                let scale = row
-                    .htt
-                    .diag()
-                    .iter()
-                    .map(|v| v.abs())
-                    .fold(0.0_f64, f64::max)
-                    .max(1.0);
+                // Deficit-aware bump (Gershgorin λ_min bound) so a strongly
+                // indefinite per-row block recovers in one outer-loop retry.
                 ArrowSchurGpuFailure::RidgeBumpRequired {
                     row: row_idx,
-                    bump: scale * f64::EPSILON.sqrt() * super::RIDGE_BUMP_EPS_MARGIN,
+                    bump: super::ridge_bump_to_make_pd(row.htt.view(), ridge_t),
                 }
             })?;
             for col in 0..q {
@@ -3087,17 +3163,12 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
             // POTRF(D) → L_i, kept resident in l_dev.
             let info_host = potrf_batched(&solver, &stream, d, n, &mut l_dev)?;
             if let Some(idx) = info_host.iter().position(|info| *info != 0) {
-                let pivot = info_host[idx];
-                let scale = sys.rows[idx]
-                    .htt
-                    .diag()
-                    .iter()
-                    .map(|v| v.abs())
-                    .fold(0.0_f64, f64::max)
-                    .max(1.0);
+                // cuSOLVER `info` is a 1-based pivot row index; size the bump
+                // from the block (Gershgorin λ_min bound) so a strongly
+                // indefinite block recovers in one retry.
                 return Err(ArrowSchurGpuFailure::RidgeBumpRequired {
                     row: idx,
-                    bump: scale * (pivot.abs() as f64).max(1.0) * f64::EPSILON.sqrt() * 1024.0,
+                    bump: super::ridge_bump_to_make_pd(sys.rows[idx].htt.view(), ridge_t),
                 });
             }
 
@@ -3384,17 +3455,12 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
             .clone_dtoh(&status_dev)
             .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
         if let Some(row) = status_host.iter().position(|s| *s != 0) {
-            let pivot = status_host[row];
-            let scale = sys.rows[row]
-                .htt
-                .diag()
-                .iter()
-                .map(|v| v.abs())
-                .fold(0.0_f64, f64::max)
-                .max(1.0);
+            // The NVRTC kernel's status code is a 1-based pivot row index, not
+            // a magnitude; size the bump from the block (Gershgorin λ_min
+            // bound) so a strongly indefinite block recovers in one retry.
             return Err(ArrowSchurGpuFailure::RidgeBumpRequired {
                 row,
-                bump: scale * (pivot.abs() as f64).max(1.0) * f64::EPSILON.sqrt() * 1024.0,
+                bump: super::ridge_bump_to_make_pd(sys.rows[row].htt.view(), ridge_t),
             });
         }
 
@@ -3632,17 +3698,12 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
             .clone_dtoh(&status_dev)
             .map_err(|_| super::ArrowSchurGpuFailure::Unavailable)?;
         if let Some(row) = status_host.iter().position(|s| *s != 0) {
-            let pivot = status_host[row];
-            let scale = sys.rows[row]
-                .htt
-                .diag()
-                .iter()
-                .map(|v| v.abs())
-                .fold(0.0_f64, f64::max)
-                .max(1.0);
+            // Status code is a 1-based pivot row index, not a magnitude; size
+            // the bump from the block (Gershgorin λ_min bound) so a strongly
+            // indefinite block recovers in one retry.
             return Err(super::ArrowSchurGpuFailure::RidgeBumpRequired {
                 row,
-                bump: scale * (pivot.abs() as f64).max(1.0) * f64::EPSILON.sqrt() * 1024.0,
+                bump: super::ridge_bump_to_make_pd(sys.rows[row].htt.view(), ridge_t),
             });
         }
 
@@ -3872,16 +3933,11 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
                 gam_linalg::triangular::CholeskyGuard::NonnegativePivot,
             )
             .ok_or_else(|| {
-                let scale = row
-                    .htt
-                    .diag()
-                    .iter()
-                    .map(|v| v.abs())
-                    .fold(0.0_f64, f64::max)
-                    .max(1.0);
+                // Deficit-aware bump (Gershgorin λ_min bound) so a strongly
+                // indefinite per-row block recovers in one outer-loop retry.
                 ArrowSchurGpuFailure::RidgeBumpRequired {
                     row: i,
-                    bump: scale * f64::EPSILON.sqrt() * super::RIDGE_BUMP_EPS_MARGIN,
+                    bump: super::ridge_bump_to_make_pd(row.htt.view(), ridge_t),
                 }
             })?;
             for col in 0..q {
