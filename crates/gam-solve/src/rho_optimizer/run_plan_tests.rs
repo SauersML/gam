@@ -1932,19 +1932,40 @@ fn cost_stall_far_above_tolerance_keeps_descending_not_flat_valley() {
     );
 }
 
-/// #1426 companion: a GENUINE flat-valley floor — cost flatlined AND the
-/// projected gradient is only modestly above tolerance (well below the ceiling)
-/// — must still halt as a `FlatValleyStall` (the legitimately-flat REML surface
-/// of #1082/#1237). The #1426 escape must not weaken that path.
+/// #1426 companion (revised for the #509 score-relative escape gate): a GENUINE
+/// flat-valley floor — cost flatlined AND the projected gradient has floored at
+/// its irreducible band, i.e. only modestly above the SCORE-RELATIVE
+/// certified-stationary bound — must still halt as a `FlatValleyStall` (the
+/// legitimately-flat REML surface of #1082/#1237). The keep-descending escape
+/// must not weaken that path.
+///
+/// The discriminator is now score-relative, not the legacy fixed absolute
+/// `FLAT_VALLEY_STALL_GRAD_CEILING`: a stall whose residual is within
+/// `FLAT_VALLEY_STALL_ESCAPE_MARGIN` of `score_relative_grad_bound` is "essentially
+/// at the band" and halts directly. With a realistic REML score (`|value| ≈ 1e3`)
+/// the band caps at `FLAT_VALLEY_CONVERGED_ABS_GRAD_CAP = 1.0`, so a residual of
+/// `1.2` sits just above the certify band (not converged) yet within `1.5×` of it
+/// (a true floor) and must halt. This is the legitimately-flat case; the #509
+/// monotone seed-park instead floors WELL clear of the band (|g| ≈ 2 on a band ≈
+/// 0.6) and is granted escapes — covered by
+/// `cost_stall_above_score_relative_band_keeps_descending`.
 #[test]
 fn cost_stall_modestly_above_tolerance_still_halts_as_flat_valley() {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
     let mut guard = CostStallGuard::new(1.0e-6, 3, 1.0e-3, exit.clone());
     let seed = array![0.0, 0.0];
-    // Residual modestly above tolerance but BELOW the ceiling: a real flat
-    // valley floor (the surface has genuinely flattened).
-    let valley_grad = FLAT_VALLEY_STALL_GRAD_CEILING * 0.5;
-    guard.observe_seed(&seed, 10.0, valley_grad);
+    // Realistic REML score scale so the score-relative band caps at 1.0.
+    let score = -1.0e3;
+    // Residual just above the certified band (1.0) but within the 1.5× escape
+    // margin (1.5): a real flat-valley floor — the surface has genuinely
+    // flattened and no escape will drive the residual lower.
+    let valley_grad = 1.2;
+    assert!(
+        valley_grad > FLAT_VALLEY_CONVERGED_ABS_GRAD_CAP
+            && valley_grad < FLAT_VALLEY_STALL_ESCAPE_MARGIN * FLAT_VALLEY_CONVERGED_ABS_GRAD_CAP,
+        "test premise: a flat-valley floor sits just above the certify band, within the escape margin"
+    );
+    guard.observe_seed(&seed, score, valley_grad);
 
     let probe = array![-10.0, -10.0];
     let _ = guard.observe_infeasible(&probe);
@@ -1952,11 +1973,46 @@ fn cost_stall_modestly_above_tolerance_still_halts_as_flat_valley() {
     let verdict = guard.observe_infeasible(&probe);
     assert!(
         matches!(verdict, CostStallVerdict::FlatValleyStall { .. }),
-        "a modest residual below the ceiling is a genuine flat-valley floor and \
-         must halt as before (#1082/#1237 unaffected by the #1426 fix)"
+        "a residual at the score-relative band is a genuine flat-valley floor and \
+         must halt as before (#1082/#1237 unaffected). Got {:?}",
+        std::mem::discriminant(&verdict)
     );
     let published = exit.lock().unwrap().take().expect("best published");
     assert!(!published.converged);
+}
+
+/// #509 regression: a cost stall at an INTERIOR ρ whose projected gradient is
+/// well clear of the score-relative certified-stationary band still has a genuine
+/// feasible descent direction and must NOT be halted as a flat valley — it must
+/// keep descending. A shape-constrained (box-reparam β=Tγ) smooth whose inequality
+/// is non-binding stalls this way near the integer seed: the cumulative-sum
+/// coordinate change makes per-step cost progress fall below the relative floor for
+/// a window even though the projected gradient (|g| ≈ 2 on a score ≈ 600, band ≈
+/// 0.6) still descends strongly toward the well-penalized REML optimum. The legacy
+/// fixed `FLAT_VALLEY_STALL_GRAD_CEILING = 5.0` halted it (2 < 5) and parked the
+/// fit at its seed; the score-relative escape gate keeps it descending.
+#[test]
+fn cost_stall_above_score_relative_band_keeps_descending() {
+    let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
+    let mut guard = CostStallGuard::new(1.0e-6, 3, 1.0e-3, exit.clone());
+    let seed = array![3.0, -3.0];
+    let score = -6.0e2;
+    // Well above the certified band (≈ 0.6 = 1e-3·600) and above the 1.5× escape
+    // margin (≈ 0.9), but BELOW the legacy fixed ceiling (5.0) — exactly the band
+    // the old gate falsely halted.
+    let descending_grad = 2.0;
+    guard.observe_seed(&seed, score, descending_grad);
+
+    let probe = array![-10.0, -10.0];
+    let _ = guard.observe_infeasible(&probe);
+    let _ = guard.observe_infeasible(&probe);
+    let verdict = guard.observe_infeasible(&probe);
+    assert!(
+        matches!(verdict, CostStallVerdict::StuckKeepDescending { .. }),
+        "an interior stall well clear of the score-relative band has feasible \
+         descent left and must keep descending, not halt (#509). Got {:?}",
+        std::mem::discriminant(&verdict)
+    );
 }
 
 #[test]
