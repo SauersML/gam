@@ -912,53 +912,6 @@ where
             } else {
                 problem
             };
-            // #1074 DIAGNOSTIC (log-gated, no behavior change unless the crate
-            // logger is installed): sweep each outer log-λ coordinate over a grid
-            // while holding the others at the baseline, logging the REML cost. Used
-            // to decide whether the spatial range railing is an interior optimum the
-            // optimizer misses (optimizer bug) or a genuine criterion preference for
-            // λ→∞ (criterion). Placed BEFORE the objective takes its `&mut
-            // reml_state` borrow so the immutable `compute_cost` reads are valid.
-            // Emitted at warn level so the default-installed crate logger (Info)
-            // prints it without a level change (the ban-scanner forbids direct
-            // stderr printing and process-env reads).
-            if log::log_enabled!(log::Level::Warn) {
-                let grid = [
-                    -5.0_f64, -2.0, 0.0, 2.0, 5.0, 8.0, 10.0, 12.0, 16.0, 20.0, 25.0, 30.0,
-                ];
-                let mut baselines: Vec<(&str, Array1<f64>)> =
-                    vec![("zeros", Array1::<f64>::zeros(k))];
-                if k == 4 {
-                    baselines.push(("conv", Array1::from(vec![9.0_f64, 30.0, 12.0, 30.0])));
-                }
-                if k == 2 {
-                    baselines.push(("conv6", Array1::from(vec![6.0_f64, 6.0])));
-                }
-                for (label, baseline) in &baselines {
-                    log::warn!("[#1074-sweep] k={k} baseline={label}={baseline:?}");
-                    for coord in 0..k {
-                        let mut line = format!("[#1074-sweep:{label}] coord={coord}:");
-                        for &rho in &grid {
-                            let mut p = baseline.clone();
-                            p[coord] = rho;
-                            let cg = reml_state.compute_cost_and_gradient(&p).ok();
-                            let cell = match cg {
-                                Some((c, g)) => {
-                                    format!(
-                                        "{c:.4}(g{}={:.3e})",
-                                        coord,
-                                        g.get(coord).copied().unwrap_or(f64::NAN)
-                                    )
-                                }
-                                None => "ERR".to_string(),
-                            };
-                            line.push_str(&format!(" {rho:.0}->{cell}"));
-                        }
-                        log::warn!("{line}");
-                    }
-                }
-            }
-
             // Attach the outer-loop cache session. The session shares its
             // realized-fit-context key with the inner beta record (different
             // payload namespace), so a SIGKILL mid-outer-iter leaves both the
