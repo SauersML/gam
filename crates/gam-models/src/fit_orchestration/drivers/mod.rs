@@ -145,3 +145,8 @@ include!("iso_kappa_reml_gradient_fd_tests.rs");
 // orphaning story — driver deps live HERE post-carve. Self-contained
 // `#[cfg(test)] mod`, so it adds nothing to the non-test build.
 include!("spatial_length_scale_monotone_tests.rs");
+// #901 re-home: the spatial-adaptive joint REML hyper-derivative FD oracles the
+// issue listed as failing (envelope hypergradient + exact outer-Hessian vs FD,
+// and the dispatch-surface parity check). Same #1601 orphaning; driver deps
+// live HERE post-carve. Self-contained `#[cfg(test)] mod`.
+include!("spatial_adaptive_hyper_fd_tests.rs");
