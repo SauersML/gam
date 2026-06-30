@@ -505,14 +505,25 @@ pub(crate) fn search_strategy_exposes_fixed_and_sweep_values() {
 /// audit's K==1 special-case bug.
 #[test]
 pub(crate) fn k1_gate_modes_do_not_pin_assignment_to_one() {
-    // IBP-MAP, K=1: σ(0/τ)·π_0 = 0.5·1 = 0.5 (not 1.0).
+    // IBP-MAP, K=1: σ(0/τ)·π_0. Since #614 the stick-breaking prior shrinks
+    // EVERY atom by one Beta(α,1) stick mean — including the first — so the
+    // truncated mean is `π_0 = α/(α+1)`, NOT the old unshrunk `π_0 = 1` (that
+    // left atom 0 unshrunk and broke α's role as a concentration). With α=1,
+    // τ=1, l=0 the gate is therefore `σ(0)·(1/2) = 0.5·0.5 = 0.25`. The point
+    // of this case is unchanged: the K=1 gate is NOT pinned to 1.0 (the
+    // Softmax-only collapse), it is the genuine sigmoid×prior product.
     let ibp = SaeAssignment::from_blocks_with_mode(
         array![[0.0]],
         vec![array![[0.0]]],
         AssignmentMode::ibp_map(1.0, 1.0, false),
     )
     .unwrap();
-    assert_abs_diff_eq!(ibp.try_assignments_row(0).unwrap()[0], 0.5, epsilon = 1e-9);
+    let ibp_gate = ibp.try_assignments_row(0).unwrap()[0];
+    assert_abs_diff_eq!(ibp_gate, 0.25, epsilon = 1e-9);
+    assert!(
+        (ibp_gate - 1.0).abs() > 1e-6,
+        "K=1 IBP-MAP must not pin the gate to 1.0"
+    );
 
     // JumpReLU, K=1, logit below threshold: hard-gated off (not 1.0).
     let jr = SaeAssignment::from_blocks_with_mode(
