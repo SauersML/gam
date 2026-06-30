@@ -141,6 +141,21 @@ mod linux {
     fn nvrtc_compile_options() -> CompileOptions {
         let mut opts = CompileOptions::default();
         opts.include_paths = nvrtc_include_paths();
+        // GPU↔CPU PARITY: disable FMA contraction. NVRTC's default is
+        // `--fmad=true`, which fuses `a*b + c` into a single fused multiply-add
+        // (ONE rounding). The CPU oracle computes `a*b` then `+ c` as two
+        // SEPARATELY-rounded f64 ops. For shallow kernels the gap is ~1 ULP;
+        // for deep derivative towers (the survival/SAE seeded jets, whose
+        // Hessian + contracted third/fourth channels chain dozens of mul/add
+        // steps) the per-op FMA divergence accumulates to ~5e-8 — enough to
+        // blow a 1e-9 parity gate on a real device (measured on a V100,
+        // compute 7.0: survival_rowjet device-vs-CPU max abs diff 5.09e-8).
+        // `--use_fast_math` was already off, but that does NOT imply fmad off
+        // (use_fast_math only ADDS fmad=true; the converse default is still
+        // on). Pinning fmad=false makes every shared-options kernel
+        // bit-comparable to the separately-rounded CPU path. `Option::None`
+        // would defer to NVRTC's `true` default, so we set it explicitly.
+        opts.fmad = Some(false);
         // #1551: pin the NVRTC virtual arch to the selected device's compute
         // capability. Without it NVRTC defaults below sm_60, where the
         // `atomicAdd(double*, double)` overload is absent — so kernels using
