@@ -273,6 +273,11 @@ class SurvivalPrediction:
         left_value, right_value = _extrapolation_for(kind)
         if self._should_auto_chunk_dense(surface.shape[0], times_arr.size):
             clip_lo, clip_hi = clip
+            # Thread the asymptotic-extrapolation policy through so the dense
+            # path uses the SAME S(t<=0)/S(t->inf) law as the in-process
+            # `_interpolate_rows` branch below (#1595): a previously-hardcoded
+            # `S(t->inf)=0` in the Rust chunk kernel re-broke S(t)=exp(-H(t))
+            # past the grid for large queries.
             return rust_module().survival_chunk_iter_collect(
                 grid,
                 surface,
@@ -282,6 +287,8 @@ class SurvivalPrediction:
                 clip_hi,
                 DEFAULT_SURVIVAL_PEOPLE_CHUNK,
                 DEFAULT_SURVIVAL_TIME_GRID_CHUNK,
+                left_value,
+                right_value,
             )
         return _interpolate_rows(
             grid,
@@ -503,6 +510,10 @@ class SurvivalPrediction:
         grid, surface = self._ffi_surface("survival")
         if grid is not None and surface is not None:
             include_ids = self.id_column is not None and self.row_ids is not None
+            # Same extrapolation law as the in-memory survival path (#1595):
+            # S(t<=0)=1, S(t->inf) flat-held at the last fitted value, never
+            # forced to 0. The Rust CSV writer used to hardcode (1.0, 0.0).
+            left_value, right_value = _extrapolation_for("survival")
             return str(
                 rust_module().write_survival_csv(
                     str(path),
@@ -513,6 +524,8 @@ class SurvivalPrediction:
                     list(self.row_ids) if include_ids else None,
                     people_chunk,
                     time_grid_chunk,
+                    left_value,
+                    right_value,
                 )
             )
 

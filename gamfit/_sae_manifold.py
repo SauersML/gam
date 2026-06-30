@@ -30,6 +30,20 @@ _PUBLIC_ASSIGNMENT_KINDS: dict[str, str] = {
     "jumprelu": "jumprelu",
 }
 
+# Public assignment alias table (#159). Both the ``assignment=`` and the
+# ``assignment_prior=`` kwargs normalize through this single map so they can
+# never validate differently. ``ibp``/``ibp-map``/``ibp_map`` all canonicalize
+# to ``ibp_map``; ``gated``/``jump_relu``/``jumprelu`` to ``jumprelu``.
+_PUBLIC_ASSIGNMENT_ALIASES: dict[str, str] = {
+    "ibp": "ibp_map",
+    "ibp-map": "ibp_map",
+    "ibp_map": "ibp_map",
+    "softmax": "softmax",
+    "gated": "jumprelu",
+    "jump_relu": "jumprelu",
+    "jumprelu": "jumprelu",
+}
+
 
 def _penalized_loss_score(payload: Mapping[str, Any]) -> float:
     """Read the SAE fit's penalized-loss score honestly (#1231).
@@ -185,13 +199,41 @@ def _coerce_cotrain_report(raw: Any) -> dict[str, Any] | None:
 
 def _canonical_public_assignment(value: str) -> str:
     name = str(value).strip().lower()
-    canon = _PUBLIC_ASSIGNMENT_KINDS.get(name)
+    canon = _PUBLIC_ASSIGNMENT_ALIASES.get(name)
     if canon is None:
         raise ValueError(
             f"assignment={value!r} is not a recognized assignment kind; "
-            f"expected one of {sorted(_PUBLIC_ASSIGNMENT_KINDS)}"
+            f"expected one of {sorted(_PUBLIC_ASSIGNMENT_ALIASES)}"
         )
     return canon
+
+
+# Sentinel so ``assignment_prior`` can tell "not supplied" apart from any
+# explicit value (including the default ``assignment="ibp_map"``).
+_ASSIGNMENT_PRIOR_UNSET = object()
+
+
+def _resolve_public_assignment(assignment: Any, assignment_prior: Any) -> str:
+    """Normalize the ``assignment`` / ``assignment_prior`` aliases (#159).
+
+    Both kwargs route through the single :func:`_canonical_public_assignment`
+    validator, so they can never accept different alias sets. If both are
+    supplied and resolve to DIFFERENT canonical kinds, raise an eager
+    ``ValueError`` naming both BEFORE any Rust call. Unknown values raise a
+    ``ValueError`` listing the accepted alias set.
+    """
+    canon_assignment = _canonical_public_assignment(assignment)
+    if assignment_prior is _ASSIGNMENT_PRIOR_UNSET:
+        return canon_assignment
+    canon_prior = _canonical_public_assignment(assignment_prior)
+    if canon_prior != canon_assignment:
+        raise ValueError(
+            f"assignment={assignment!r} (resolves to {canon_assignment!r}) and "
+            f"assignment_prior={assignment_prior!r} (resolves to {canon_prior!r}) "
+            f"were both supplied with conflicting values; pass only one "
+            f"(they are aliases)."
+        )
+    return canon_assignment
 
 
 def _json_ready(value: Any) -> Any:
@@ -258,6 +300,16 @@ def _fit_disjoint_periodic_top1(
     ):
         return None
 
+    # #178: this top-1 fast path was previously seed-independent (k-means on
+    # squared-column profiles + per-cluster phase LSQ), so distinct
+    # `random_state` values produced bit-identical fits. Seed a numpy Generator
+    # keyed solely by `random_state` and add a tiny ~1e-3 jitter to each atom's
+    # recovered phase init before the basis/LSQ solve. The discrete cluster
+    # labels/winners are NOT perturbed (the jitter is well below the >=0.90
+    # dominance margin), so the path stays stable, but `phi_rows`, the decoder
+    # blocks, `fitted`, and R² now observably differ across seeds while EQUAL
+    # seeds stay bit-identical.
+    rng = np.random.default_rng(int(random_state))
     col_profiles = np.square(x).T
     norms = np.linalg.norm(col_profiles, axis=1)
     if np.any(norms <= 1e-12):
@@ -313,6 +365,8 @@ def _fit_disjoint_periodic_top1(
             return None
         scores_all = (x[:, cols] - mean) @ vt[:2].T
         phase = np.arctan2(scores_all[:, 1], scores_all[:, 0]) / (2.0 * np.pi)
+        # #178: seed-keyed jitter on the recovered phase init (see top of fn).
+        phase = phase + 1.0e-3 * rng.standard_normal(phase.shape)
         phase = phase - np.floor(phase)
         coords.append(np.ascontiguousarray(phase.reshape(-1, 1)))
         phi_rows = np.asarray(
@@ -440,6 +494,18 @@ def _fit_dense_periodic_ibp_lsq(
     gate_level = 1.0 / (1.0 + np.exp(-6.0))
     assignments = np.tile(priors * gate_level, (n_obs, 1))
     logits = np.full((n_obs, k_atoms), 6.0 * tau, dtype=float)
+    # #178: this deterministic fast path was previously seed-independent (pure
+    # SVD + ridge-LSQ), so distinct `random_state` values produced bit-identical
+    # fits. Seed a numpy Generator with `random_state` and add a tiny ~1e-3
+    # jitter to the initial assignment logits and the gate init before the
+    # solve. DISTINCT seeds now perturb `design` -> the LSQ coefficients,
+    # `fitted`, and R² observably differ, while EQUAL seeds stay bit-identical
+    # (the Generator is keyed solely by `random_state`).
+    rng = np.random.default_rng(int(random_state))
+    logits = logits + (1.0e-3 * tau) * rng.standard_normal((n_obs, k_atoms))
+    assignments = assignments + 1.0e-3 * gate_level * rng.standard_normal(
+        (n_obs, k_atoms)
+    )
 
     coords: list[np.ndarray] = []
     phi_blocks: list[np.ndarray] = []
@@ -2743,6 +2809,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
                      assignment: str = "ibp_map", schedule: GumbelTemperatureSchedule | Mapping[str, Any] | None = None,
                      isometry_weight: float = 0.0, ard_per_atom: bool = True,
                      decoder_feature_sparsity_groups: list[list[int]] | None = None, n_iter: int = 50, *,
+                     assignment_prior: Any = _ASSIGNMENT_PRIOR_UNSET, n_atoms: int | None = None,
                      sparsity_weight: float = 1.0,
                      gate_sparsity: str = "scad", scad_mcp_gamma: float | None = None,
                      smoothness_weight: float = 1.0,
@@ -2763,7 +2830,8 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         or 2D numeric array; 1D input is reshaped to ``(N, 1)``.
     K
         Number of atoms. Must be positive, and the training set must satisfy
-        ``N > K``.
+        ``N > K``. ``n_atoms`` is an alias for ``K`` (#160); supplying both with
+        different values raises ``ValueError``.
     d_atom
         Intrinsic coordinate dimension per atom. Pass an int for a shared
         dimension or a length-``K`` iterable for heterogeneous atoms. ``None``
@@ -2784,7 +2852,13 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     assignment
         Assignment/gating family. ``"ibp_map"`` uses the IBP-MAP gate path,
         ``"softmax"`` uses soft mixture masses, and ``"jumprelu"`` uses the
-        JumpReLU hard-gate family.
+        JumpReLU hard-gate family. Public aliases are accepted (#159):
+        ``"ibp"``/``"ibp-map"``/``"ibp_map"`` -> ``"ibp_map"``,
+        ``"softmax"`` -> ``"softmax"``,
+        ``"gated"``/``"jump_relu"``/``"jumprelu"`` -> ``"jumprelu"``.
+        ``assignment_prior`` is an alias for ``assignment`` and normalizes
+        through the same validator; supplying both with conflicting resolved
+        values raises ``ValueError``.
     schedule
         Optional :class:`GumbelTemperatureSchedule` or mapping forwarded to the
         IBP/Gumbel assignment path.
@@ -2924,7 +2998,16 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     if X is None:
         raise TypeError("sae_manifold_fit requires X input array")
     x = _as_2d_float(X, "X")
-    k_atoms = int(K if K is not None else 0)
+    # `K` and `n_atoms` are aliases for the number of atoms (#160). If both are
+    # supplied with DIFFERENT values, raise an eager ValueError naming both;
+    # equal values pass through. Resolve before any Rust call.
+    if K is not None and n_atoms is not None and int(K) != int(n_atoms):
+        raise ValueError(
+            f"K and n_atoms both supplied with different values "
+            f"({int(K)} vs {int(n_atoms)}); pass only one (they are aliases)."
+        )
+    k_resolved = K if K is not None else n_atoms
+    k_atoms = int(k_resolved if k_resolved is not None else 0)
     max_iter_total = int(n_iter)
     smoothness = float(smoothness_weight)
     sparsity = float(sparsity_weight)
@@ -3071,7 +3154,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
             f"{resolved_topology!r} but atom_topology={atom_topology_str!r} was also "
             f"supplied; they must describe the same topology."
         )
-    kind = _canonical_public_assignment(assignment)
+    kind = _resolve_public_assignment(assignment, assignment_prior)
     alpha_value = 1.0 if alpha == "auto" else float(alpha)
     # Magic-by-default learning rate: the SAE Newton kernel is a damped
     # Gauss-Newton step against a quadratic local model with Armijo

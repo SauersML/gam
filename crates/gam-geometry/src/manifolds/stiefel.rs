@@ -2,7 +2,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::manifold::{
     GeometryError, GeometryResult, RiemannianManifold, check_len, flatten, from_flat, identity,
-    matrix_exp, orthonormal_completion, qr_thin, skew_log_orthogonal, sym,
+    matrix_det, matrix_exp, orthonormal_completion, qr_thin, skew_log_orthogonal, sym,
     tangent_basis_metric_orthonormal,
 };
 use crate::manifolds::sphere::SphereManifold;
@@ -465,29 +465,82 @@ fn stiefel_canonical_log(
 
     let c_dim = n - k; // dimension of the normal space spanned by Y⊥
 
-    // [Y | Y⊥] ∈ SO(n); Y⊥ is the last `c_dim` columns.
-    let completion = orthonormal_completion(y); // n×n
+    // Orthonormal frame `[Y | Y⊥] ∈ SO(n)`; `Y⊥` is the last `c_dim` columns.
+    let frame_y = orthonormal_completion(y); // n×n
     let mut y_perp = Array2::<f64>::zeros((n, c_dim));
     for j in 0..c_dim {
         for i in 0..n {
-            y_perp[[i, j]] = completion[[i, k + j]];
+            y_perp[[i, j]] = frame_y[[i, k + j]];
         }
     }
 
-    // Target in the [Y Y⊥] basis: P = [M; B₀], orthonormal n×k columns.
-    let m = fast_atb(y, y_target); // k×k
-    let b0 = fast_atb(&y_perp, y_target); // c_dim×k
-    let mut p = Array2::<f64>::zeros((n, k));
-    for j in 0..k {
-        for i in 0..k {
-            p[[i, j]] = m[[i, j]];
+    // Build the matching frame `[Ỹ | Ỹ⊥] ∈ SO(n)` whose complement `Ỹ⊥` is the
+    // image of `Y⊥` projected off `Ỹ` and re-orthonormalized. Completing `Ỹ`
+    // with *standard axes* (as a generic completion would) yields an arbitrary
+    // basis that can turn `V₀` into a reflection (a −1 eigenvalue / π rotation)
+    // even for nearby frames; anchoring the completion to `Y⊥` instead makes
+    // `V₀ = [Y Y⊥]ᵀ [Ỹ Ỹ⊥] → I` as `Ỹ → Y`, so its principal logarithm is the
+    // small geodesic generator the iteration expects.
+    let yt_yperp = fast_atb(y_target, &y_perp); // k×c_dim
+    let mut y_perp_t = &y_perp - &fast_ab(y_target, &yt_yperp); // (I − ỸỸᵀ)Y⊥
+    // Modified Gram–Schmidt to re-orthonormalize the projected columns,
+    // re-projecting against Ỹ each pass for numerical safety.
+    for j in 0..c_dim {
+        for _pass in 0..2 {
+            // Orthogonalize column j against Ỹ.
+            for col in 0..k {
+                let mut dot = 0.0_f64;
+                for i in 0..n {
+                    dot += y_target[[i, col]] * y_perp_t[[i, j]];
+                }
+                for i in 0..n {
+                    y_perp_t[[i, j]] -= dot * y_target[[i, col]];
+                }
+            }
+            // Orthogonalize against earlier complement columns.
+            for prev in 0..j {
+                let mut dot = 0.0_f64;
+                for i in 0..n {
+                    dot += y_perp_t[[i, prev]] * y_perp_t[[i, j]];
+                }
+                for i in 0..n {
+                    y_perp_t[[i, j]] -= dot * y_perp_t[[i, prev]];
+                }
+            }
         }
-        for i in 0..c_dim {
-            p[[k + i, j]] = b0[[i, j]];
+        let mut nrm = 0.0_f64;
+        for i in 0..n {
+            nrm += y_perp_t[[i, j]] * y_perp_t[[i, j]];
+        }
+        let nrm = nrm.sqrt();
+        if nrm > 1.0e-12 {
+            for i in 0..n {
+                y_perp_t[[i, j]] /= nrm;
+            }
         }
     }
-    // Complete P (n×k, orthonormal columns) to V ∈ SO(n).
-    let mut v = orthonormal_completion(&p);
+
+    // Assemble the full frame [Ỹ | Ỹ⊥] and force it into SO(n) so that
+    // V₀ = [Y Y⊥]ᵀ [Ỹ Ỹ⊥] has det +1 (no spurious −1 eigenvalue). Flipping the
+    // last complement column flips the determinant and leaves V₀'s first k
+    // columns (= [M; B₀], independent of Ỹ⊥) unchanged.
+    let mut frame_yt = Array2::<f64>::zeros((n, n));
+    for j in 0..k {
+        for i in 0..n {
+            frame_yt[[i, j]] = y_target[[i, j]];
+        }
+    }
+    for j in 0..c_dim {
+        for i in 0..n {
+            frame_yt[[i, k + j]] = y_perp_t[[i, j]];
+        }
+    }
+    if c_dim >= 1 && matrix_det(&frame_yt) < 0.0 {
+        for i in 0..n {
+            frame_yt[[i, n - 1]] = -frame_yt[[i, n - 1]];
+        }
+    }
+    let mut v = fast_atb(&frame_y, &frame_yt); // n×n, first k columns = [M; B₀]
 
     const MAX_ITER: usize = 100;
     const TOL: f64 = 1.0e-13;
@@ -609,7 +662,7 @@ mod tangent_basis_tests {
 #[cfg(test)]
 mod stiefel_tests {
     use super::StiefelManifold;
-    use crate::manifold::{GeometryError, RiemannianManifold};
+    use crate::manifold::{GeometryError, RiemannianManifold, from_flat};
     use ndarray::{Array1, Array2};
 
     #[test]
@@ -672,6 +725,63 @@ mod stiefel_tests {
             worst = worst.max((back[i] - y_target[i]).abs());
         }
         assert!(worst < 1e-9, "Exp∘Log != id: max|Ŷ − Ỹ| = {worst:.3e}");
+    }
+
+    /// Exhaustive `Log_Y(Exp_Y(Δ)) = Δ` sweep across `(n, k)` regimes and a
+    /// range of tangent magnitudes, with deterministic pseudo-random tangents.
+    /// This stresses the genuinely iterative `C → 0` loop (for `c_dim ≥ 2` the
+    /// lower-right block is non-trivially skew and several iterations run),
+    /// not just the near-identity one-shot, and covers both `n < 2k` (St(3,2),
+    /// St(5,3)) and `n ≥ 2k` (St(4,2), St(6,2), St(7,3)).
+    #[test]
+    fn log_inverts_exp_sweep_all_regimes() {
+        // Tiny deterministic LCG so the test is reproducible without `rand`.
+        let mut state: u64 = 0x9e3779b97f4a7c15;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 11) as f64) / ((1u64 << 53) as f64) * 2.0 - 1.0 // ∈ (−1, 1)
+        };
+        for &(k, n) in &[(2usize, 3usize), (2, 4), (2, 5), (2, 6), (3, 5), (3, 7)] {
+            let st = StiefelManifold::new(k, n).unwrap();
+            // Base frame: first k standard axes, row-major n×k flatten.
+            let mut y = Array1::<f64>::zeros(n * k);
+            for j in 0..k {
+                y[j * k + j] = 1.0;
+            }
+            for &scale in &[0.05_f64, 0.3, 0.7, 1.1] {
+                let raw: Array1<f64> = (0..n * k).map(|_| next()).collect();
+                let mut delta = st.project_tangent(y.view(), raw.view()).unwrap();
+                // Normalize to the requested canonical magnitude.
+                let g = st.metric_tensor(y.view()).unwrap();
+                let gd = g.dot(&delta);
+                let nrm = (0..delta.len()).map(|i| delta[i] * gd[i]).sum::<f64>().sqrt();
+                if nrm > 1e-12 {
+                    delta.mapv_inplace(|x| x * scale / nrm);
+                }
+                let target = st.exp_map(y.view(), delta.view()).unwrap();
+                // Target must be a valid frame.
+                let yt = from_flat(target.view(), n, k).unwrap();
+                let gram = yt.t().dot(&yt);
+                for a in 0..k {
+                    for b in 0..k {
+                        let want = if a == b { 1.0 } else { 0.0 };
+                        assert!(
+                            (gram[[a, b]] - want).abs() < 1e-10,
+                            "St({n},{k}) exp off-manifold"
+                        );
+                    }
+                }
+                let recovered = st.log_map(y.view(), target.view()).unwrap();
+                let mut worst = 0.0_f64;
+                for i in 0..delta.len() {
+                    worst = worst.max((recovered[i] - delta[i]).abs());
+                }
+                assert!(
+                    worst < 1e-8,
+                    "St({n},{k}) Log∘Exp != id at scale {scale}: max err {worst:.3e}"
+                );
+            }
+        }
     }
 
     /// `Log_Y(Y) = 0`: the logarithm of a point to itself is the zero tangent.
