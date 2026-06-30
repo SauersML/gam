@@ -1296,13 +1296,22 @@ fn sae_decoder_lsq_init_produces_nontrivial_seed() {
     let p = 4usize;
     let k = 2usize;
     let m = 3usize;
+    // Plant a signal that lies entirely in the span the seed atoms can
+    // represent: each atom's basis is {1, sin(a+φ), cos(a+φ)}, so the joint
+    // design's column space is exactly the DC+fundamental subspace
+    // span{1, sin a, cos a}. Every output column below is a linear combination
+    // of those three, so a non-trivial seed must reconstruct Z almost
+    // perfectly. (The previous planting injected a pure second harmonic
+    // sin/cos(2a) into two of the four columns — energy the fundamental basis
+    // can *never* represent, capping the achievable R² at exactly 0.50 and
+    // making the `r2 > 0.5` bar unsatisfiable for any seed.)
     let mut z = Array2::<f64>::zeros((n, p));
     for i in 0..n {
         let a = 2.0 * std::f64::consts::PI * (i as f64) / (n as f64);
         z[[i, 0]] = a.sin();
         z[[i, 1]] = a.cos();
-        z[[i, 2]] = (2.0 * a).sin();
-        z[[i, 3]] = (2.0 * a).cos();
+        z[[i, 2]] = 0.5 + 0.8 * a.sin();
+        z[[i, 3]] = a.cos() - 0.4 * a.sin();
     }
     // Build padded basis_values (K, N, M_max=m).
     let mut basis = Array3::<f64>::zeros((k, n, m));
@@ -1341,9 +1350,16 @@ fn sae_decoder_lsq_init_produces_nontrivial_seed() {
         "LSQ-seeded decoder should be non-trivial; max |B| = {max_abs:.6}"
     );
 
-    // The seeded reconstruction must explain at least some of Z. With
-    // IBP-MAP iter-0 weights a_k = 0.5 for every k, fitted[i,:] =
-    // 0.5 * Σ_k Phi_k[i,:] · B_k.
+    // The seeded reconstruction must explain (essentially all of) Z. The seed
+    // decoder is fit by joint LSQ at the IBP-MAP iter-0 assignment weights
+    // a_k = σ(0/τ)·π_k = 0.5·(α/(α+1))^{k+1}, i.e. the *actual* forward map of
+    // `ibp_map_row` at the zero initial logits — NOT a flat 0.5 per atom (the
+    // stick-breaking prior π_k shrinks each successive atom, so for K=2,
+    // α=1 the weights are [0.25, 0.125]). The iter-0 reconstruction the joint
+    // Newton driver sees is therefore Σ_k a_k · Phi_k[i,:] · B_k evaluated at
+    // these same weights; reconstructing at a flat 0.5 would scale each atom
+    // block by 0.5/a_k (2× and 4× here) and spuriously blow up the residual.
+    let a_init = gam::terms::sae::manifold::ibp_map_row(logits.row(0), 0.7, 1.0);
     let mut fitted = Array2::<f64>::zeros((n, p));
     for i in 0..n {
         for j in 0..p {
@@ -1353,7 +1369,7 @@ fn sae_decoder_lsq_init_produces_nontrivial_seed() {
                 for col in 0..m {
                     atom_out += basis[[atom_idx, i, col]] * decoder[[atom_idx, col, j]];
                 }
-                acc += 0.5 * atom_out;
+                acc += a_init[atom_idx] * atom_out;
             }
             fitted[[i, j]] = acc;
         }
@@ -1369,17 +1385,27 @@ fn sae_decoder_lsq_init_produces_nontrivial_seed() {
     }
     let r2 = 1.0 - ssr / sst.max(1.0e-12);
     assert!(
-        r2 > 0.5,
-        "LSQ-seeded iter-0 reconstruction R² = {r2:.4} should explain most of the signal"
+        r2 > 0.95,
+        "LSQ-seeded iter-0 reconstruction R² = {r2:.4} should explain nearly all of the \
+         representable signal"
     );
 }
 
 /// Regression test for issue #629: the cold-start residual seed must break
 /// the symmetric saddle of a uniform logit init by preferring, per row, the
 /// atom whose seed geometry best reconstructs that row. Planted: two
-/// periodic atoms with distinct seed phases driving disjoint output blocks
-/// with known one-hot routing. The seed logits must (a) not be uniform and
-/// (b) argmax-route most rows to their generating atom.
+/// periodic atoms with distinct seed *frequencies* driving disjoint output
+/// blocks with known one-hot routing. The seed logits must (a) not be uniform
+/// and (b) argmax-route most rows to their generating atom.
+///
+/// The atoms must have genuinely distinct column spaces for the per-atom
+/// residual fit to separate them. A pure *phase* shift does NOT: the basis
+/// {1, sin(a+φ), cos(a+φ)} is an orthogonal rotation of {1, sin a, cos a}, so
+/// both phases span the identical DC+fundamental subspace and every per-atom
+/// independent LSQ projects onto the same space — bit-identical fits, identical
+/// per-row residuals, and an exactly uniform (zero-gap) logit field. Distinct
+/// frequencies (fundamental vs. second harmonic) span orthogonal subspaces, so
+/// each atom reconstructs only the rows it generated.
 #[test]
 fn sae_residual_seed_logits_breaks_symmetry_and_routes() {
     use ndarray::Array3;
@@ -1388,9 +1414,10 @@ fn sae_residual_seed_logits_breaks_symmetry_and_routes() {
     let k = 2usize;
     let m = 3usize;
     let two_pi = std::f64::consts::TAU;
-    // Distinct seed phase per atom — mimics the PCA seed handing each
-    // periodic atom a different coordinate frame.
-    let phase = [0.0_f64, 0.3_f64];
+    // Distinct seed frequency per atom — atom 0 is the fundamental, atom 1 the
+    // second harmonic. Their basis column spaces are orthogonal over the
+    // sample, so the per-atom residual fit can actually route.
+    let freq = [1.0_f64, 2.0_f64];
     // Deterministic pseudo-random latent + balanced shuffled routing.
     let mut t = vec![0.0_f64; n];
     let mut assign = vec![0usize; n];
@@ -1413,7 +1440,7 @@ fn sae_residual_seed_logits_breaks_symmetry_and_routes() {
     let mut basis = Array3::<f64>::zeros((k, n, m));
     for atom_idx in 0..k {
         for i in 0..n {
-            let a = two_pi * (t[i] + phase[atom_idx]);
+            let a = two_pi * freq[atom_idx] * t[i];
             basis[[atom_idx, i, 0]] = 1.0;
             basis[[atom_idx, i, 1]] = a.sin();
             basis[[atom_idx, i, 2]] = a.cos();
