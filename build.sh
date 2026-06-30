@@ -253,7 +253,19 @@ is_transient() {
   (( code == 124 )) && return 0        # timeout(1) wall-clock kill
   (( code >= 128 )) && return 0        # killed by a signal directly
   (( code == 0 ))   && return 1
-  grep -qiE 'signal: 9|SIGKILL|process did not exit successfully.*signal|: Killed|out of memory|Cannot allocate memory|memory allocation of .* bytes failed|LLVM ERROR: out of memory' "$LOG" 2>/dev/null
+  grep -qiE 'signal: 9|SIGKILL|process did not exit successfully.*signal|: Killed|out of memory|Cannot allocate memory|memory allocation of .* bytes failed|LLVM ERROR: out of memory' "$LOG" 2>/dev/null \
+    || is_incremental_corruption
+}
+# Incremental-state corruption: a CONCURRENT cargo (another session / a codex
+# launchd job that bypasses this single-flight gate) touching the same target/
+# dir can delete target/debug/incremental mid-build, yielding "failed to
+# create query cache" / "failed to move dependency graph … No such file or
+# directory". That is an INFRASTRUCTURE failure, not a code error — treat it as
+# transient and wipe the incremental dir before retrying so the rebuild starts
+# from clean incremental state.
+is_incremental_corruption() {
+  (( code == 0 )) && return 1
+  grep -qiE 'failed to (create|move|open|read|write).*(query cache|dependency graph|incremental)|incremental compilation.*(No such file|cannot|failed)|query-cache\.bin|dep-graph\.(part\.)?bin' "$LOG" 2>/dev/null
 }
 # Run CMD under the global single-flight lock with a memory gate + auto-retry on
 # transient (OOM/timeout) failures. Holds the lock across retries so we stay next
@@ -268,7 +280,12 @@ run_under_global_lock() {
     t0=$(ep); timeout "$TIMEOUT" "${CMD[@]}" >"$LOG" 2>&1; code=$?; DUR=$(( $(ep)-t0 ))
     if is_transient; then
       if (( attempt < max )); then
-        echo "[build.sh] transient failure (OOM/timeout, exit $code) attempt $attempt/$max — backing off for memory, retrying…" >&2
+        if is_incremental_corruption; then
+          echo "[build.sh] incremental-state corruption (concurrent cargo on target/) attempt $attempt/$max — wiping target/debug/incremental + retrying…" >&2
+          rm -rf "$REPO/target/debug/incremental" 2>/dev/null || true
+        else
+          echo "[build.sh] transient failure (OOM/timeout, exit $code) attempt $attempt/$max — backing off for memory, retrying…" >&2
+        fi
         sleep $(( attempt * 12 )); continue
       fi
       echo "[build.sh] still transiently failing (exit $code) after $max attempts — giving up this round." >&2
