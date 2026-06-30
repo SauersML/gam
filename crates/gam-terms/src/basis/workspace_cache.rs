@@ -665,6 +665,43 @@ pub fn spherical_wahba_kernel_matrix_with_kind(
 ) -> Result<Array2<f64>, BasisError> {
     validate_lat_lon_matrix(data, "spherical spline data", radians)?;
     validate_lat_lon_matrix(centers, "spherical spline centers", radians)?;
+    // GPU fast path for the truncated-spectral kernels. The CPU SIMD loop
+    // (`spherical_wahba_kernel_matrix_cpu`) is the bit-defining oracle; the
+    // device only engages when `sphere_kernel_decision` admits the work (large
+    // `n·m`, `lmax ≤ 200`, memory budget). `None` ⇒ quiet CPU route (closed-form
+    // variant, no device, or below threshold); `Some(Err)` ⇒ admitted device
+    // failed ⇒ surface it (never a silent CPU degrade — the engagement-failure
+    // class this path kills).
+    if let Some(gpu_result) = crate::basis::sphere_gpu::try_build_truncated_kernel_matrix_gpu(
+        data,
+        centers,
+        penalty_order,
+        radians,
+        kernel,
+    ) {
+        let gpu_matrix = gpu_result.map_err(|err| {
+            BasisError::InvalidInput(format!(
+                "spherical spline GPU truncated kernel was admitted but failed on device: {err}"
+            ))
+        })?;
+        return Ok(gpu_matrix);
+    }
+    spherical_wahba_kernel_matrix_cpu(data, centers, penalty_order, radians, kernel)
+}
+
+/// CPU oracle for the Wahba S² kernel design matrix — the bit-defining
+/// reference the GPU truncated path is held to. Always evaluates on host,
+/// regardless of the GPU dispatch decision, so parity tests and any caller that
+/// needs the deterministic reference can bypass device routing entirely.
+pub fn spherical_wahba_kernel_matrix_cpu(
+    data: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    penalty_order: usize,
+    radians: bool,
+    kernel: SphereWahbaKernel,
+) -> Result<Array2<f64>, BasisError> {
+    validate_lat_lon_matrix(data, "spherical spline data", radians)?;
+    validate_lat_lon_matrix(centers, "spherical spline centers", radians)?;
     let n = data.nrows();
     let k = centers.nrows();
     let deg = if radians {

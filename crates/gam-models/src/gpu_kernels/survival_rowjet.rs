@@ -265,7 +265,14 @@ mod device {
                 return Ok(m.clone());
             }
         }
-        let ptx = cudarc::nvrtc::compile_ptx(SURVIVAL_ROWJET_SOURCE)
+        // Compile through the shared arch+fmad options (NOT bare `compile_ptx`,
+        // which leaves NVRTC at `--fmad=true` and no `--gpu-architecture` pin).
+        // FMA contraction must be off so the deep seeded-jet tower is
+        // bit-comparable to the separately-rounded CPU oracle — bare
+        // `compile_ptx` made this kernel miss the 1e-9 parity gate by ~5e-8 on
+        // a V100. The arch pin keeps the kernel keyed to the device's real
+        // compute capability rather than NVRTC's default.
+        let ptx = gam_gpu::device_cache::compile_ptx_arch(SURVIVAL_ROWJET_SOURCE)
             .gpu_ctx_with(|err| format!("survival_rowjet NVRTC compile: {err}"))?;
         let m = b
             .ctx

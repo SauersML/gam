@@ -664,7 +664,14 @@ fn log_leverage_diagnostics(leverage: &Array1<f64>, phi: f64) {
     let a_p99 = percentile_from_sorted(&finite_leverage, LEVERAGE_PERCENTILES[2]);
     let a_max = finite_leverage.last().copied().unwrap_or(0.0);
 
-    log::warn!(
+    // Routine per-ALO leverage summary: a diagnostic snapshot, not an
+    // anomaly. Emitted at `info!` so it is visible under `GAM_LOG=info` but
+    // silent at the default `Warn` level (genuine anomalies — invalid / very
+    // high leverage — are logged at `warn!` above and stay visible). This
+    // line fires once per ALO computation, which recurs across the outer
+    // smoothing loop, so at `warn!` it was a dominant source of stderr noise
+    // on perfectly healthy fits (#1689).
+    log::info!(
         "[GAM ALO] leverage: n={}, mean={:.3e}, median={:.3e}, p95={:.3e}, p99={:.3e}, max={:.3e}",
         n,
         a_mean,
@@ -673,7 +680,7 @@ fn log_leverage_diagnostics(leverage: &Array1<f64>, phi: f64) {
         a_p99,
         a_max
     );
-    log::warn!(
+    log::info!(
         "[GAM ALO] high-leverage: a>0.90: {:.2}%, a>0.95: {:.2}%, a>0.99: {:.2}%, dispersion phi={:.3e}",
         100.0 * (threshold_counts[0] as f64) / n as f64,
         100.0 * (threshold_counts[1] as f64) / n as f64,

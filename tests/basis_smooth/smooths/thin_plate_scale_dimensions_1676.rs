@@ -20,10 +20,12 @@
 //!   * WITHOUT `scale_dimensions` a `tp` term stays canonical thin-plate.
 
 use gam::basis::{
-    CenterStrategy, DuchonNullspaceOrder, PenaltySource, SmoothBasisSpec, SpatialIdentifiability,
-    ThinPlateBasisSpec, build_duchon_basis,
+    CenterStrategy, DuchonNullspaceOrder, PenaltySource, SpatialIdentifiability, ThinPlateBasisSpec,
+    build_duchon_basis,
 };
-use gam::smooth::{ShapeConstraint, SmoothTermSpec, TermCollectionSpec};
+use gam::smooth::{
+    ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec,
+};
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;

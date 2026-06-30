@@ -3866,3 +3866,5 @@ publish paths.
   including Duchon/Matern basis coverage, sparse-native REML paths, probit
   location-scale warm starts, model-consistency fixes, and the first Rust CI
   workflow.
+
+<!-- agent #1641: investigating logdet_theta_adjoint IBP theta-adjoint vs dense FD; WIP -->
