@@ -397,17 +397,44 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
     deflated_row_directions: &[Vec<Array1<f64>>],
     deflation_row_spectra: &[Option<RowDeflationSpectrum>],
 ) -> Option<Result<ArrowNewtonStepArtifacts, ArrowSchurError>> {
+    // #1017 device-engagement trace: emitted through the `log` crate at debug
+    // level so a perf/triage run (`RUST_LOG=gam_solve=debug`) can see EXACTLY why
+    // the production SAE Direct inner solve declined the device instead of
+    // silently dropping to a multi-minute dense CPU Cholesky. No-op (a level
+    // check) at the default log level, so production pays nothing.
+    macro_rules! trace_decline {
+        ($($arg:tt)*) => {
+            log::debug!("arrow-schur device SAE Direct PCG declined: {}", format!($($arg)*));
+        };
+    }
     if options.mode != ArrowSolverMode::Direct {
+        trace_decline!("mode != Direct (mode={:?})", options.mode);
         return None;
     }
     // Only the matrix-free SAE system carries device PCG frames; a dense Direct
     // system routes through `try_device_arrow_direct` instead.
-    let device_data = sys.device_sae_pcg.as_ref()?;
+    let Some(device_data) = sys.device_sae_pcg.as_ref() else {
+        trace_decline!(
+            "no device_sae_pcg data on system (n={}, k={}, d={})",
+            sys.rows.len(),
+            sys.k,
+            sys.d
+        );
+        return None;
+    };
     // Cross-row penalties / streaming are not on this matrix-free PCG path.
     if !sys.cross_row_penalties.is_empty() || options.streaming_chunk_size.is_some() {
+        trace_decline!(
+            "cross_row_penalties={} or streaming_chunk_size={:?}",
+            sys.cross_row_penalties.len(),
+            options.streaming_chunk_size
+        );
         return None;
     }
-    let runtime = gam_gpu::device_runtime::GpuRuntime::global()?;
+    let Some(runtime) = gam_gpu::device_runtime::GpuRuntime::global() else {
+        trace_decline!("no GpuRuntime::global() (CPU-only host or probe failed)");
+        return None;
+    };
     // CG-amortised work gate (same predicate the InexactPCG matvec-offload site
     // uses): the SAE reduced-Schur apply is `O(n · k · d)` reused over the CG
     // iteration budget, so it registers the real batched arithmetic the cold
@@ -420,8 +447,22 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
         .policy()
         .reduced_schur_matvec_should_offload(sys.rows.len(), sys.k, sys.d, cg_iters)
     {
+        trace_decline!(
+            "offload predicate rejected shape (n={}, k={}, d={}, cg_iters={})",
+            sys.rows.len(),
+            sys.k,
+            sys.d,
+            cg_iters
+        );
         return None;
     }
+    log::debug!(
+        "arrow-schur device SAE Direct PCG ENGAGING device (n={}, k={}, d={}, frame={})",
+        sys.rows.len(),
+        sys.k,
+        sys.d,
+        device_data.frame.is_some()
+    );
     // Direct mode = exact full step: run the unbounded device PCG to a tight
     // tolerance and a high iteration ceiling so it converges to the same step the
     // dense Direct factorization yields. The control floor here is independent of
@@ -500,7 +541,10 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
         }) => Some(Err(ArrowSchurError::SchurFactorFailed { reason })),
         // Unavailable / transient / framed-mismatch all mean "device declined" —
         // fall through to the CPU dense Direct path transparently.
-        Err(_) => None,
+        Err(other) => {
+            trace_decline!("device kernel returned {:?} — falling back to CPU dense", other);
+            None
+        }
     }
 }
 
