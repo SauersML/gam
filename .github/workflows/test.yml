@@ -213,6 +213,18 @@ jobs:
       - name: Count discovered tests (completeness evidence)
         id: count
         if: ${{ steps.archive.outputs.archived == 'true' }}
+        # EVIDENCE ONLY — this step must NEVER fail the build job. The in-shell
+        # `set +e` + `exit 0` below only guards against the COMMANDS exiting
+        # non-zero; it cannot protect against the step PROCESS being killed by a
+        # signal. `cargo nextest list` materializes the full multi-thousand-test
+        # list in memory and was OOM-killed on the 16-GB runner, so `exit 0` was
+        # never reached, the step failed, and — because a failed build job skips
+        # the gated archive uploads below and `rust-test` (`needs: build`) — the
+        # ENTIRE test matrix was skipped while `aggregate` reported 0 failures
+        # (tests not running mis-reported as green). `continue-on-error` is the
+        # only mechanism that truly makes a step non-gating regardless of HOW it
+        # exits, which is exactly this evidence step's documented contract.
+        continue-on-error: true
         shell: bash
         run: |
           # EVIDENCE ONLY — this step must NEVER fail the build. GitHub runs the
@@ -241,9 +253,14 @@ jobs:
           } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
           exit 0   # evidence step never gates the build
 
+      # The prebuilt archive is the critical artifact of this build-once/run-many
+      # design: the run-shards have nothing to execute without it. Upload it
+      # whenever it was produced, regardless of any earlier evidence/metadata
+      # step's outcome (`always()`), so a non-gating step can never strand the
+      # whole test matrix with no binaries to download.
       - name: Upload workspace test archive
         uses: actions/upload-artifact@v4
-        if: ${{ steps.archive.outputs.archived == 'true' }}
+        if: ${{ always() && steps.archive.outputs.archived == 'true' }}
         with:
           name: nx-archive
           path: nx.tar.zst
@@ -252,6 +269,7 @@ jobs:
 
       - name: Upload gam-pyffi test archive
         uses: actions/upload-artifact@v4
+        if: ${{ always() }}
         with:
           name: nx-pyffi-archive
           path: nx-pyffi.tar.zst
