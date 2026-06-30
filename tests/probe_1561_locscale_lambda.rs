@@ -52,7 +52,7 @@ fn data(n: usize) -> (Vec<f64>, Vec<f64>) {
     (x, y)
 }
 
-fn run_case(label: &str, mean_formula: &str, noise_formula: &str, n: usize) {
+fn run_case(label: &str, mean_formula: &str, noise_formula: &str, n: usize) -> f64 {
     let (x, y) = data(n);
     let headers = vec!["x".to_string(), "y".to_string()];
     let rows: Vec<csv::StringRecord> = x
@@ -70,12 +70,12 @@ fn run_case(label: &str, mean_formula: &str, noise_formula: &str, n: usize) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("[{label}] FIT ERROR: {e}");
-            return;
+            return f64::NAN;
         }
     };
     let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult { fit, .. }) = result else {
         eprintln!("[{label}] not a location-scale fit");
-        return;
+        return f64::NAN;
     };
 
     let beta_loc = fit
@@ -124,13 +124,18 @@ fn run_case(label: &str, mean_formula: &str, noise_formula: &str, n: usize) {
         (vec![], vec![], vec![], f64::NAN)
     };
 
+    let fmt_vec = |v: &[f64]| v.iter().map(|x| format!("{x:.4}")).collect::<Vec<_>>().join(",");
+    let lambdas_s = fmt_vec(&lambdas);
+    let log_lambdas_s = fmt_vec(&log_lambdas);
+    let edf_s = fmt_vec(&edf_by_block);
     eprintln!(
         "[{label}] pearson={corr:.5} rmse_ls={rmse_ls:.5} rmse_mu={rmse_mu:.5} \
-         | lambdas={lambdas:?} log_lambdas={log_lambdas:?} \
-         | edf_by_block={edf_by_block:?} edf_total={edf_total:.3} \
+         | lambdas=[{lambdas_s}] log_lambdas=[{log_lambdas_s}] \
+         | edf_by_block=[{edf_s}] edf_total={edf_total:.3} \
          | outer_conv={} iters={}",
         fit.fit.outer_converged, fit.fit.outer_iterations
     );
+    corr
 }
 
 #[test]
@@ -139,19 +144,38 @@ fn probe_1561_locscale_penalty_configs() {
     let n = 200;
     eprintln!("=== #1561 probe: Gaussian location-scale log-sigma recovery (n={n}) ===");
     // Baseline: default (double_penalty=true on both blocks).
-    run_case("default", "y ~ s(x, bs='tp')", "1 + s(x, bs='tp')", n);
+    let default_corr = run_case("default", "y ~ s(x, bs='tp')", "1 + s(x, bs='tp')", n);
     // Scale block WITHOUT null-space double penalty (mgcv gaulss select=FALSE).
-    run_case(
+    let scale_nodbl_corr = run_case(
         "scale_nodbl",
         "y ~ s(x, bs='tp')",
         "1 + s(x, bs='tp', double_penalty=false)",
         n,
     );
     // BOTH blocks without null-space double penalty.
-    run_case(
+    let both_nodbl_corr = run_case(
         "both_nodbl",
         "y ~ s(x, bs='tp', double_penalty=false)",
         "1 + s(x, bs='tp', double_penalty=false)",
         n,
     );
+
+    // Sanity invariant (real regression guard): every location-scale config must
+    // FIT and recover a finite, non-degenerate log-σ↔truth correlation — a NaN or
+    // a collapse to 0 means the joint μ+σ fit broke, independent of the #1561
+    // over-smoothing question this probe investigates.
+    for (label, c) in [
+        ("default", default_corr),
+        ("scale_nodbl", scale_nodbl_corr),
+        ("both_nodbl", both_nodbl_corr),
+    ] {
+        assert!(
+            c.is_finite(),
+            "#1561 probe: {label} produced a non-finite log-σ pearson ({c}) — location-scale fit broke"
+        );
+        assert!(
+            c > 0.0,
+            "#1561 probe: {label} log-σ pearson {c:.4} <= 0 — fitted scale surface is anti-correlated/degenerate"
+        );
+    }
 }
