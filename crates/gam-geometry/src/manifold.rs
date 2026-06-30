@@ -1060,8 +1060,11 @@ pub(crate) fn orthonormal_completion(cols: &Array2<f64>) -> Array2<f64> {
         axis += 1;
     }
     // Force det = +1 so the completion lies in SO(m) and its principal log is
-    // skew. det of an orthogonal matrix is ±1; flip the last column if −1.
-    if filled == m && m > 0 && matrix_det(&basis) < 0.0 {
+    // skew. det of an orthogonal matrix is ±1; flip the last *appended* column
+    // if −1. When nothing was appended (`p == m`, e.g. a square input) the
+    // input columns are returned untouched — flipping one would corrupt the
+    // caller's frame, and a square input's orientation is the caller's to own.
+    if filled == m && m > p && matrix_det(&basis) < 0.0 {
         for i in 0..m {
             basis[[i, m - 1]] = -basis[[i, m - 1]];
         }
@@ -1308,6 +1311,96 @@ mod qr_thin_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod matrix_log_tests {
+    use super::{matrix_exp, orthonormal_completion, skew_log_orthogonal};
+    use ndarray::Array2;
+
+    /// `exp(skew_log_orthogonal(V)) = V` for a block-diagonal rotation built
+    /// from two planes — including one with angle θ > π/2, which an
+    /// `arcsin`-only scheme (no `cos θ` disambiguation) would get wrong.
+    #[test]
+    fn log_then_exp_recovers_rotation() {
+        // 5×5 orthogonal: rotation by 2.3 rad in (0,1), by 0.4 rad in (2,3),
+        // identity on axis 4.
+        let mut v = Array2::<f64>::zeros((5, 5));
+        let (c0, s0) = (2.3_f64.cos(), 2.3_f64.sin());
+        let (c1, s1) = (0.4_f64.cos(), 0.4_f64.sin());
+        v[[0, 0]] = c0;
+        v[[0, 1]] = -s0;
+        v[[1, 0]] = s0;
+        v[[1, 1]] = c0;
+        v[[2, 2]] = c1;
+        v[[2, 3]] = -s1;
+        v[[3, 2]] = s1;
+        v[[3, 3]] = c1;
+        v[[4, 4]] = 1.0;
+        let s = skew_log_orthogonal(&v).expect("log of rotation");
+        // S must be skew.
+        for i in 0..5 {
+            for j in 0..5 {
+                assert!(
+                    (s[[i, j]] + s[[j, i]]).abs() < 1e-12,
+                    "log not skew at ({i},{j})"
+                );
+            }
+        }
+        let back = matrix_exp(&s).expect("exp of skew");
+        let mut worst = 0.0_f64;
+        for i in 0..5 {
+            for j in 0..5 {
+                worst = worst.max((back[[i, j]] - v[[i, j]]).abs());
+            }
+        }
+        assert!(worst < 1e-10, "exp∘log != id for rotation: {worst:.3e}");
+    }
+
+    /// A rotation by exactly π (eigenvalue −1) is the cut locus: the logarithm
+    /// is not single-valued and must be refused, not silently dropped.
+    #[test]
+    fn log_refuses_pi_rotation() {
+        // Rotation by π in the (0,1) plane: diag block [[-1,0],[0,-1]].
+        let mut v = Array2::<f64>::zeros((3, 3));
+        v[[0, 0]] = -1.0;
+        v[[1, 1]] = -1.0;
+        v[[2, 2]] = 1.0;
+        assert!(
+            skew_log_orthogonal(&v).is_err(),
+            "π rotation must be refused as the cut locus"
+        );
+    }
+
+    /// Completing an `m×p` orthonormal block must yield an `SO(m)` matrix whose
+    /// first `p` columns are the input, and a square (`p==m`) input must be
+    /// returned untouched (never sign-flipped).
+    #[test]
+    fn completion_is_orthogonal_and_preserves_input() {
+        // 4×2 orthonormal block.
+        let mut cols = Array2::<f64>::zeros((4, 2));
+        cols[[0, 0]] = 1.0;
+        cols[[1, 1]] = 1.0;
+        let full = orthonormal_completion(&cols);
+        let gram = full.t().dot(&full);
+        for i in 0..4 {
+            for j in 0..4 {
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!((gram[[i, j]] - want).abs() < 1e-12, "not orthogonal");
+            }
+        }
+        for j in 0..2 {
+            for i in 0..4 {
+                assert!((full[[i, j]] - cols[[i, j]]).abs() < 1e-14, "input column changed");
+            }
+        }
+        // Square input with det −1 must be returned verbatim (no flip).
+        let mut sq = Array2::<f64>::zeros((2, 2));
+        sq[[0, 0]] = 1.0;
+        sq[[1, 1]] = -1.0; // det = −1
+        let out = orthonormal_completion(&sq);
+        assert!((out[[1, 1]] + 1.0).abs() < 1e-14, "square input was modified");
     }
 }
 
