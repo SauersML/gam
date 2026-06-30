@@ -27,6 +27,7 @@ mod sae_manifold_sphere_torus_topologies;
 mod sae_outer_gradient_fd_gate;
 mod sae_replicate_gauge_agreement;
 mod sae_residual_gauge;
+mod sae_rowjet_gpu_kscale_parity;
 mod sae_sphere_chart_canonicalization;
 mod sae_streaming_arrow_schur_contract;
 mod sae_structure_ladder_bottom_rungs;
