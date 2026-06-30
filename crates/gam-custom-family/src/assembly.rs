@@ -683,6 +683,7 @@ fn assembled_operator_fingerprint(
     beta_flat: &Array1<f64>,
     h_joint_unpen: &JointHessianSource,
     scaled_s_lambdas: &[Array2<f64>],
+    scaled_joint_penalty: Option<&Array2<f64>>,
     robust_jeffreys_hphi_for_operator: Option<&Array2<f64>>,
     ranges: &[(usize, usize)],
     total: usize,
@@ -723,6 +724,24 @@ fn assembled_operator_fingerprint(
             1u8.hash(&mut hasher);
             hphi.dim().hash(&mut hasher);
             for &v in hphi.iter() {
+                hash_f64(v, &mut hasher);
+            }
+        }
+        None => 0u8.hash(&mut hasher),
+    }
+    // gam#1587/#561: the full-width joint penalty `Σ_t λ_t (M⊗S_t)` is part of
+    // the assembled operator `H + S_λ`, but its λ live in the OUTER ρ
+    // coordinates, NOT in the physical `rho` hashed above (which is empty when
+    // the family rides entirely on joint penalties, e.g. multinomial). Without
+    // hashing the joint penalty's content, two outer evaluations at different
+    // joint λ but a coincident β̂ collide on the same fingerprint and the second
+    // reuses the first's STALE operator — the silent gam#1395 logdet divergence.
+    // Hash presence + content so the cache key tracks the joint λ exactly.
+    match scaled_joint_penalty {
+        Some(joint) => {
+            1u8.hash(&mut hasher);
+            joint.dim().hash(&mut hasher);
+            for &v in joint.iter() {
                 hash_f64(v, &mut hasher);
             }
         }
@@ -991,6 +1010,7 @@ pub(crate) fn joint_outer_evaluate(
         beta_flat,
         &h_joint_unpen,
         &scaled_s_lambdas,
+        scaled_joint_penalty.as_ref(),
         robust_jeffreys_hphi_for_operator.as_ref(),
         ranges,
         total,
@@ -1295,7 +1315,25 @@ pub(crate) fn joint_outer_evaluate(
     };
     let hessian_logdet_correction = hessian_logdet_correction + projected_logdet_correction;
 
+    // gam#1587/#561: `unified_joint_cost_gradient` appends one coordinate per
+    // full-width joint penalty (the centered `M⊗S_t` multinomial penalty) AFTER
+    // the per-block ρ coordinates — the returned gradient/Hessian have length
+    // `rho.len() + n_joint + ext`. The dimension contract validated below was
+    // written before #1587 and omitted `n_joint`, so for any family whose
+    // smoothing rides ENTIRELY on joint penalties (multinomial: per-block
+    // penalties are emptied, so `rho.len() == 0`) every outer ρ-evaluation
+    // returned a length-`n_joint` gradient against an `expected == 0` and was
+    // rejected at startup validation — silently killing the entire REML/LAML
+    // smoothing-parameter search (λ pinned at its seed, EDF near-unpenalized).
+    // Count the joint coordinates so the contract matches the gradient the
+    // evaluator actually produces.
+    let n_joint = options
+        .joint_penalties
+        .as_deref()
+        .map(|bundle| bundle.len())
+        .unwrap_or(0);
     let expected_theta_dim = rho.len()
+        + n_joint
         + ext_bundle
             .as_ref()
             .map(|bundle| bundle.coords.len())
