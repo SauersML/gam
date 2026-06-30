@@ -30,7 +30,6 @@ def _no_row_block_probe(monkeypatch):
 def test_isometry_weight_changes_payload(monkeypatch):
     _no_row_block_probe(monkeypatch)
     common = dict(
-        ard_per_atom=False,
         gate_sparsity="l1",
         sparsity_weight=0.0,
         scad_mcp_gamma=3.7,
@@ -63,7 +62,6 @@ def test_isometry_weight_zero_omits_descriptor(monkeypatch):
     _no_row_block_probe(monkeypatch)
     payload = sae._build_analytic_penalties_payload(
         isometry_weight=0.0,
-        ard_per_atom=False,
         gate_sparsity="l1",
         sparsity_weight=0.0,
         scad_mcp_gamma=3.7,
@@ -84,7 +82,6 @@ def test_decoder_incoherence_payload_builder_default_is_on_for_multi_atom(monkey
     _no_row_block_probe(monkeypatch)
     payload = sae._build_analytic_penalties_payload(
         isometry_weight=0.0,
-        ard_per_atom=False,
         gate_sparsity="l1",
         sparsity_weight=0.0,
         scad_mcp_gamma=3.7,
@@ -281,17 +278,16 @@ class _FakeRustModule:
         initial_logits=None,
         initial_coords=None,
         jumprelu_threshold=0.0,
+        native_ard_enabled=True,
         **_forward_compat_kwargs,
     ):
-        # ARD-per-atom is now plumbed as an `{"kind": "ard"}` analytic-penalty
-        # descriptor rather than a dedicated `native_ard_enabled` FFI flag.
-        if analytic_penalties is None:
-            self.last_native_ard_enabled = False
-        else:
-            items = json.loads(str(analytic_penalties))
-            self.last_native_ard_enabled = any(
-                str(it.get("kind")) == "ard" for it in items
-            )
+        # #240: `ard_per_atom` controls ARD via the dedicated `native_ard_enabled`
+        # FFI flag (the switch that sizes/drops each atom's `log_ard` precisions),
+        # NOT via a registry `{"kind": "ard"}` descriptor. The registry `ard`
+        # penalty is deliberately skipped on every SAE objective path, so plumbing
+        # the flag through the descriptor was a silent no-op (issue #240). Read the
+        # real flag the facade now forwards.
+        self.last_native_ard_enabled = bool(native_ard_enabled)
         z = np.asarray(z, dtype=float)
         n_obs, p_out = z.shape
         k_atoms = len(atom_basis)
