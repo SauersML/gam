@@ -1,6 +1,7 @@
 mod beta_phi_smooth_plus_parametric;
 mod by_factor_smooth_column_not_loaded_from_cli;
 mod concave_shape_smooth_depends_on_warm_start_store;
+mod convex_shape_smooth_parks_in_linear_corner_1654;
 mod cyclic_bs_cc_outer_loop_terminates;
 mod cyclic_period_option;
 mod double_penalty_concurvity_collapse_1476;

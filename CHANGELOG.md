@@ -1,3 +1,65 @@
+## v0.3.134 — gam 0.3.134 / gamfit 0.1.236 (2026-06-29)
+
+crates.io + PyPI release of the post-0.3.133 correctness-and-performance wave:
+two user-visible inference/prediction bugs are fixed, the multinomial save model
+gains a first-class per-penalty EDF channel, and the Firth/Jeffreys REML and SAE
+log-det hot paths are substantially faster while staying numerically identical.
+The `gamfit` Python API surface is additive only — multinomial model metadata now
+carries `edf_per_penalty`; everything else reachable through the existing API is
+unchanged.
+
+**debiased_functional restored for parametric-term Gaussian models (#1622)**
+- `debiased_functional` no longer aborts with "model does not carry the weighted
+  Gram X'WX" on every Gaussian model that has a parametric (non-intercept) term
+  (`y ~ x`, `y ~ s(x) + z`). Under column-conditioning the weighted Gram `X'WX`
+  is a genuine congruence object — it transforms by exactly the same map as the
+  penalized Hessian — so it is now back-transformed into the original basis
+  rather than unconditionally dropped, letting the debiased-functional Riesz
+  engine recover `S(λ)·β`. The same fix restores the exact WPS corrected-EDF term
+  `tr(X'WX·Σ_ρ)` (congruence-invariant, so it matches the internal-basis value
+  bit-for-bit) for the whole `y ~ x` / `y ~ s(x) + z` class.
+
+**Point/contrast prediction under the full training schema (#1621)**
+- The `x0` design for point and contrast predictions is now built under the full
+  training schema, so predictions no longer mis-align when the prediction frame
+  carries fewer terms than the fitted model.
+
+**Multinomial per-penalty EDF is now first-class (#1219, #715)**
+- `MultinomialSavedModel` gains an `edf_per_penalty` field (one entry per
+  smoothing parameter, `rank(S_k) − λ_k·tr(H⁻¹ S_k)` clamped to `[0, rank]`),
+  surfaced through the Python multinomial metadata. Previously the per-class
+  `edf_per_class` field was overloaded to also answer per-penalty collapse
+  detection; with double-penalty smooths the two vectors have different lengths,
+  so one consumer always read a wrong-length vector. Both quantities are now
+  independently correct.
+
+**Firth/Jeffreys REML performance (#1575)**
+- Binomial/logit REML with default-on Firth/Jeffreys bias reduction no longer
+  rebuilds the entire `FirthDenseOperator` (the O(n·p²) design Gram, the O(p³)
+  identifiable-subspace eigendecomposition, the design clones) on every inner
+  Newton iteration. The β-independent design factor is built once per PIRLS solve
+  and memoized; only the per-η reduced core is rebuilt. The converged β/λ/EDF/score
+  are bit-for-bit unchanged, pinned by an operator-equivalence oracle.
+
+**SAE log-det trace performance (#932)**
+- The SAE reconstruction log-det / α-trace channels are back on the hand
+  closed-form `row_jets_for_logdet` (a measured 25–57× throughput win over the
+  Taylor-jet cutover, bit-identical to ≤1.4e-15), with row-local Takahashi
+  selected-inverse fast paths layered on top. The Taylor jet is retained as a
+  `#[cfg(test)]` correctness oracle, not deleted.
+
+**BMS Firth/Jeffreys outer-gradient correctness (#1607)**
+- The explicit Firth/Jeffreys value ψ-derivative is now carried on the BMS
+  batched outer-gradient path, so its `objective_theta` matches the hypercoord
+  gradient (and the centered FD of the Firth-corrected outer value) for Jeffreys
+  BMS spatial fits.
+
+**Build / test hygiene**
+- A wave of test-infrastructure hardening across gam-math, gam-linalg, gam-sae,
+  and the multinomial/dispersion oracles (visible assertions, oracle relocation,
+  removal of `let _` / ignored-bench laundering), and the SAE row-jet oracle
+  fixtures are lifted into the PD basin (#1625) so they converge and assert.
+
 ## v0.3.133 — gam 0.3.133 / gamfit 0.1.235 (2026-06-29)
 
 crates.io + PyPI release of the SAE reconstruction-fidelity, penalty-spectrum
@@ -3804,3 +3866,5 @@ publish paths.
   including Duchon/Matern basis coverage, sparse-native REML paths, probit
   location-scale warm starts, model-consistency fixes, and the first Rust CI
   workflow.
+
+<!-- agent #1641: investigating logdet_theta_adjoint IBP theta-adjoint vs dense FD; WIP -->

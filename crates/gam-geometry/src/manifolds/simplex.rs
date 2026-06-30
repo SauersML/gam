@@ -252,6 +252,11 @@ pub fn simplex_exp_map(
     let base2 = Array2::from_shape_fn((1, base.len()), |(_, j)| base[j]);
     let base_comp = closure(base2.view())?;
     let d = base_comp.ncols();
+    if let Some(((row, col), value)) = tangent.indexed_iter().find(|(_, v)| !v.is_finite()) {
+        return Err(format!(
+            "simplex exp map tangent must contain only finite values; got {value} at ({row}, {col})"
+        ));
+    }
     match coord {
         SimplexCoord::Clr => {
             if tangent.ncols() != d {
@@ -473,6 +478,26 @@ mod tests {
             err.contains("strictly positive"),
             "error must explain the positivity domain; got {err}"
         );
+    }
+
+    /// CLR exp map handed a non-finite tangent at a valid interior base must
+    /// error rather than silently produce NaN components. The ALR branch already
+    /// rejects such input; this enforces the same for CLR.
+    #[test]
+    fn clr_exp_map_nonfinite_tangent_errors() {
+        let base: Array1<f64> = array![0.25, 0.45, 0.30];
+        let tangent = array![[f64::INFINITY, 0.0_f64, 0.0]];
+        let err = simplex_exp_map(tangent.view(), base.view(), SimplexCoord::Clr, 0)
+            .expect_err("non-finite CLR tangent must be rejected, not yield NaN");
+        assert!(
+            err.contains("finite"),
+            "error must explain the finiteness requirement; got {err}"
+        );
+
+        // The ALR analogue must keep erroring as well.
+        let alr_tangent = array![[f64::INFINITY, 0.0_f64]];
+        simplex_exp_map(alr_tangent.view(), base.view(), SimplexCoord::Alr, 0)
+            .expect_err("non-finite ALR tangent must be rejected");
     }
 
     /// CLR log map followed by exp map at the same interior base recovers the

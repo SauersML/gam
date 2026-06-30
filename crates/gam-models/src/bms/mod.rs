@@ -1,6 +1,6 @@
 use crate::custom_family::{
     BatchedOuterGradientTerms, BlockEffectiveJacobian, BlockWorkingSet, BlockwiseFitOptions,
-    CustomFamily, CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation,
+    CustomFamily, CustomFamilyWarmStart, EvalMode, ExactNewtonJointGradientEvaluation,
     ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
     ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace, FamilyEvaluation,
     FamilyLinearizationState, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,

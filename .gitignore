@@ -219,3 +219,6 @@ scripts/*verify*fresh*.sh
 
 # local CARGO_HOME cache (multi-agent build), never commit
 .cargo/
+
+# agent working notes, never commit
+.agent/

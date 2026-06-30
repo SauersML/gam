@@ -18,7 +18,7 @@ use crate::basis::{
     SpatialIdentifiability, SphereMethod, SphereWahbaKernel, SphericalSplineBasisSpec,
     SphericalSplineIdentifiability, ThinPlateBasisSpec, auto_spatial_center_strategy,
     default_num_centers, default_spatial_center_strategy, default_spherical_harmonic_degree,
-    plan_spatial_basis,
+    plan_spatial_basis, thin_plate_penalty_order,
 };
 use crate::inference::formula_dsl::{
     ParsedTerm, SmoothKind, option_bool, option_f64, option_f64_strict, option_usize,
@@ -33,10 +33,6 @@ use crate::smooth::{
 use gam_problem::types::ColIdx;
 use gam_data::{ColumnKindTag, DataError, EncodedDataset as Dataset};
 use gam_runtime::resource::ResourcePolicy;
-
-/// Floor on the derived default Matérn length scale, guarding against a zero or
-/// vanishingly small scale when the data span is degenerate.
-const DEFAULT_MATERN_LENGTH_SCALE_FLOOR: f64 = 1e-6;
 
 /// Default B-spline degree when a smooth's `degree=` option is absent. Cubic
 /// (degree 3) is the standard GAM convention: C² continuity with a low knot
@@ -66,69 +62,6 @@ const FACTOR_SMOOTH_DEFAULT_BASIS_DIM: usize = 10;
 /// `chunk_size=` option is absent. Streams the design in row blocks to bound
 /// peak memory independent of the dataset row count.
 const DEFAULT_PCA_CHUNK_SIZE: usize = 4096;
-
-fn default_matern_length_scale(ds: &Dataset, cols: &[usize], num_centers: usize) -> f64 {
-    let mut diameter2 = 0.0_f64;
-    for &col in cols {
-        let column = ds.values.column(col);
-        let mut lo = f64::INFINITY;
-        let mut hi = f64::NEG_INFINITY;
-        for &value in column.iter().filter(|v| v.is_finite()) {
-            lo = lo.min(value);
-            hi = hi.max(value);
-        }
-        if lo.is_finite() && hi.is_finite() && hi > lo {
-            let span = hi - lo;
-            diameter2 += span * span;
-        }
-    }
-    let diameter = diameter2.sqrt();
-    if !(diameter.is_finite() && diameter > 0.0) {
-        return 1.0;
-    }
-    // #1629: seed the κ-optimizer at the basis's NATURAL operating scale — the
-    // typical inter-knot spacing — NOT the full data diameter.
-    //
-    // #1074 had moved this seed to the full diameter (mgcv's `bs="gp"` default
-    // range). That is wrong for *this* engine because of an ordering coupling
-    // mgcv does not have: the cold build evaluates the K Matérn kernel columns at
-    // this seed length scale, realizes the design over the n data rows, and
-    // applies the parametric-orthogonality identifiability transform
-    // (`MaternIdentifiability::CenterSumToZero` ⇒ `smooth_requires_parametric_-`
-    // `orthogonality`) — whose spectral whitener (`positive_spectral_whitener_-`
-    // `from_gram`) is RANK-REVEALING on the realized design Gram — all BEFORE the
-    // κ-optimizer runs, and the surviving column count is then frozen into the
-    // transform.
-    //
-    // At a range as wide as the diameter every Matérn column is near-constant over
-    // the data cloud, so the realized n×K design Gram is numerically rank-deficient
-    // (rank ≈ K/4). The whitener legitimately drops the collapsed directions
-    // (e.g. 199 → 50 realized design columns; verified empirically through
-    // `build_term_collection_design`), the freeze pins that collapsed count, and
-    // the optimizer can never recover the dropped columns. The result is a smoother
-    // that resolves only the lowest-frequency structure (#1629: matern 6× worse
-    // than thinplate, `k=` a near no-op because the realized rank — not k — caps
-    // the basis). NOTE: the per-center `matern_rank_reduce_centers` RRQR is NOT the
-    // culprit here — it reports full rank (K) even at the diameter seed; the
-    // collapse is entirely in the realized-design orthogonality whitener. The
-    // diameter is in fact OUTSIDE the optimizer's own ψ = log κ window
-    // (`[2/r_max, 100/r_min]`), so it was never a reachable operating point anyway.
-    //
-    // For K space-filling centers over a d-dimensional cloud of diameter `D`, the
-    // nearest-neighbour spacing is ≈ D / K^(1/d). Seeding the length scale there
-    // keeps κ·r ≈ O(1) between adjacent centers: every kernel column is distinct,
-    // the realized design Gram stays full rank, the whitener + freeze keep all K
-    // columns, and the κ multi-start pre-scan + joint [ρ, ψ] solver then tune the
-    // range freely across the full data-derived window (#1074's "let the optimizer
-    // pick the range" intent is preserved — the optimizer simply starts from a
-    // non-degenerate basis instead of a collapsed one).
-    let d = cols.len().max(1);
-    let k = num_centers.max(2) as f64;
-    let spacing = diameter / k.powf(1.0 / d as f64);
-    // Never seed above the diameter (degenerate small-K corner) and never below
-    // the numerical floor that guards a zero-span domain.
-    spacing.min(diameter).max(DEFAULT_MATERN_LENGTH_SCALE_FLOOR)
-}
 
 // ---------------------------------------------------------------------------
 // Typed errors
@@ -2709,8 +2642,24 @@ pub fn build_smooth_basis(
                 spec: MaternBasisSpec {
                     center_strategy,
                     periodic: parse_periodic_axes_option(options, cols.len())?,
-                    length_scale: option_f64(options, "length_scale")
-                        .unwrap_or_else(|| default_matern_length_scale(ds, cols, centers)),
+                    // Sentinel: leave at 0.0 when the user didn't pass an
+                    // explicit length_scale so the planner's
+                    // `auto_init_length_scale_in_place` can replace it with the
+                    // SAME data-derived wiggly-side initialization the thin-plate
+                    // path uses (`max_range / sqrt(n)`), then let the κ-optimizer
+                    // refine from there.
+                    //
+                    // gam#1629: the previous `default_matern_length_scale` seeded
+                    // the FULL data diameter — the maximally over-smoothed corner.
+                    // Because that value is non-zero, the `0.0`-gated auto-init was
+                    // a no-op for Matérn, so the κ-optimizer started in the flat
+                    // over-smoothed basin and parked there, leaving high-frequency
+                    // 2-D surfaces unresolved (truth-RMSE ~6× worse than
+                    // thin-plate/tensor on identical data, and insensitive to `k`).
+                    // Routing Matérn through the same `0.0` sentinel as thin-plate
+                    // (see the ThinPlate branch above) starts REML in the resolving
+                    // regime it can actually escape from.
+                    length_scale: option_f64(options, "length_scale").unwrap_or(0.0),
                     nu,
                     include_intercept: option_bool(options, "include_intercept").unwrap_or(false),
                     double_penalty: smooth_double_penalty,
@@ -3350,6 +3299,13 @@ pub fn build_smooth_basis(
 /// Initialise per-axis anisotropic log-scales on eligible spatial smooth specs.
 pub fn enable_scale_dimensions(spec: &mut TermCollectionSpec) {
     for smooth in spec.smooth_terms.iter_mut() {
+        // A multi-axis thin-plate term cannot carry per-axis anisotropy on its
+        // single curvature penalty, so `scale_dimensions` was historically a
+        // silent no-op for `bs="tp"` (gam#1676). Rewrite it to the
+        // mathematically-equivalent anisotropic s=0 Duchon spline first; the
+        // Duchon arm below then sees an already-seeded `aniso_log_scales` and
+        // leaves it untouched.
+        promote_thin_plate_for_scale_dimensions(&mut smooth.basis);
         match &mut smooth.basis {
             SmoothBasisSpec::Matern {
                 feature_cols,
@@ -3374,6 +3330,94 @@ pub fn enable_scale_dimensions(spec: &mut TermCollectionSpec) {
             _ => {}
         }
     }
+}
+
+/// Rewrite a multi-axis thin-plate term into the mathematically-equivalent
+/// anisotropic s=0 Duchon spline so that `scale_dimensions` genuinely engages
+/// (gam#1676).
+///
+/// ## Why a rewrite rather than a new field on the TPS builder
+///
+/// A canonical thin-plate regression spline carries a *single* curvature
+/// penalty — the exact `∫|Dᵐ f|²` reproducing-kernel Gram. That penalty has no
+/// per-axis structure to make one direction more or less relevant than another,
+/// so per-axis anisotropy (`scale_dimensions`) cannot be expressed on it. The
+/// flag was therefore a silent no-op for `bs="tp"` while it engaged for
+/// `duchon()`/`matern()`.
+///
+/// The thin-plate kernel `r^{2m−d}` (the `r²·log r` log-case in even `d`) is
+/// *exactly* the s=0 Duchon kernel (`DuchonBasisSpec::power = 0`,
+/// `length_scale = None`) at the matching polynomial null-space order
+/// `m = thin_plate_penalty_order(d)`. The Duchon polyharmonic family already
+/// carries the per-axis tension ARD that `scale_dimensions` requests: its
+/// isotropic first-order roughness penalty `Σ‖∇f‖²` splits into `d` directional
+/// penalties `Σ(∂f/∂x_a)²`, each with its own REML `λ_a`
+/// (`duchon_operator_penalty_candidates`). So the well-posed *anisotropic
+/// thin-plate spline is the anisotropic s=0 Duchon spline*. Rewriting to that
+/// representation reuses the battle-tested Duchon anisotropy / ψ-derivative /
+/// freeze / predict machinery instead of duplicating it onto the TPS metadata
+/// path, and keeps the polyharmonic family internally consistent. The codebase
+/// already promotes infeasible-`k` TPS to Duchon for the same reason (the
+/// canonical TPS single curvature penalty cannot deliver a requested
+/// capability); per-axis anisotropy is another such capability.
+///
+/// This fires *only* when the user opts into `scale_dimensions`; the default
+/// thin-plate path (`scale_dimensions` off) is left bit-for-bit unchanged.
+/// A 1-D thin-plate term is left untouched — anisotropy is meaningless on a
+/// single axis (its `Σ η = 0` contrast vector is empty), exactly as for a 1-D
+/// Matérn/Duchon term.
+fn promote_thin_plate_for_scale_dimensions(basis: &mut SmoothBasisSpec) {
+    let SmoothBasisSpec::ThinPlate {
+        feature_cols,
+        spec,
+        input_scales,
+    } = &*basis
+    else {
+        return;
+    };
+    let d = feature_cols.len();
+    if d <= 1 {
+        return;
+    }
+    // m = thin_plate_penalty_order(d) is the TPS penalty order; the Duchon
+    // null-space order naming is `Zero → m=1`, `Linear → m=2`,
+    // `Degree(g) → m=g+1`, so the s=0 Duchon kernel exponent
+    // `2(p+s) − d = 2m − d` reproduces the TPS kernel exactly.
+    let m = thin_plate_penalty_order(d);
+    let nullspace_order = match m {
+        0 | 1 => DuchonNullspaceOrder::Zero,
+        2 => DuchonNullspaceOrder::Linear,
+        _ => DuchonNullspaceOrder::Degree(m - 1),
+    };
+    let duchon_spec = DuchonBasisSpec {
+        center_strategy: spec.center_strategy.clone(),
+        periodic: spec.periodic.clone(),
+        // Pure, scale-free Duchon — the thin-plate kernel has no length scale
+        // (a global TPS kernel scale is non-identifiable once REML learns the
+        // smoothing penalty: gam#718/#721/#731/#732). The per-axis relevance
+        // the user asked for is carried by the tension-ARD `λ_a`, not a κ axis.
+        length_scale: None,
+        // s = 0  ⇒  thin-plate kernel `r^{2m−d}`.
+        power: 0.0,
+        nullspace_order,
+        identifiability: spec.identifiability.clone(),
+        // All-zero geometry seed sentinel: `auto_seed_aniso_contrasts` resolves
+        // it from the (standardized) knot cloud, and the per-axis tension split
+        // engages on `aniso.is_some()`.
+        aniso_log_scales: Some(vec![0.0; d]),
+        operator_penalties: DuchonOperatorPenaltySpec::default(),
+        boundary: OneDimensionalBoundary::Open,
+        radial_reparam: None,
+    };
+    let feature_cols = feature_cols.clone();
+    let input_scales = input_scales.clone();
+    // All borrows of `*basis` (the `&*basis` destructure above) end with the
+    // clones on the two preceding lines, so the reassignment is sound.
+    *basis = SmoothBasisSpec::Duchon {
+        feature_cols,
+        spec: duchon_spec,
+        input_scales,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -4437,6 +4481,90 @@ mod tests {
         );
     }
 
+    /// gam#1629: a default 2-D `matern(x1, x2)` (no explicit `length_scale`)
+    /// must leave the length-scale at the `0.0` auto sentinel — NOT the full
+    /// data diameter — so the planner's `auto_init_length_scale_in_place` seeds
+    /// it on the wiggly/resolving side (`max_range / sqrt(n)`), the same regime
+    /// thin-plate uses. The previous `default_matern_length_scale` returned the
+    /// full diameter, which is non-zero, so the `0.0`-gated auto-init was a
+    /// no-op and the κ-optimizer started in the over-smoothed corner and parked
+    /// there (truth-RMSE ~6× worse than thin-plate/tensor on identical
+    /// high-frequency 2-D surfaces, insensitive to `k`). This pins the corrected
+    /// seed geometry without a fit/optimizer in the loop.
+    #[test]
+    fn default_matern_2d_seeds_resolving_length_scale_not_overscaled_diameter() {
+        // A fine multi-frequency 2-D grid (the #1629 reproduction shape): the
+        // data diameter is O(1.4) in each axis; the resolving seed must be far
+        // smaller than the diameter so high-frequency structure stays reachable.
+        let side = 24usize; // n = 576
+        let mut rows: Vec<Vec<f64>> = Vec::with_capacity(side * side);
+        for i in 0..side {
+            for j in 0..side {
+                let x1 = i as f64 / (side - 1) as f64; // [0, 1]
+                let x2 = j as f64 / (side - 1) as f64; // [0, 1]
+                let y = (6.0 * x1).sin() * (6.0 * x2).cos();
+                rows.push(vec![y, x1, x2]);
+            }
+        }
+        let n = rows.len();
+        let ds = continuous_dataset(&["y", "x1", "x2"], rows);
+
+        let mut options = BTreeMap::new();
+        options.insert("bs".to_string(), "gp".to_string()); // gp ⇒ Matérn
+        let mut notes = Vec::new();
+        let mut basis = build_smooth_basis(
+            SmoothKind::S,
+            &["x1".to_string(), "x2".to_string()],
+            &[1, 2],
+            &options,
+            &ds,
+            &mut notes,
+            &ResourcePolicy::default_library(),
+            1,
+        )
+        .expect("build default 2-D matern smooth");
+
+        // (1) The builder must emit the auto sentinel, not a baked-in diameter.
+        let (feature_cols, seeded_length_scale) = match &basis {
+            SmoothBasisSpec::Matern {
+                feature_cols, spec, ..
+            } => (feature_cols.clone(), spec.length_scale),
+            other => panic!("expected Matern basis, got {other:?}"),
+        };
+        assert_eq!(
+            seeded_length_scale, 0.0,
+            "default matern() must leave length_scale at the 0.0 auto sentinel \
+             (got {seeded_length_scale}); a non-zero diameter default re-enters the \
+             over-smoothed basin and disables the planner's wiggly-side auto-init",
+        );
+
+        // (2) After the shared auto-init runs, the realized length-scale must
+        // land in the resolving regime: `max_range / sqrt(n)`, far below the
+        // data diameter. This is the seed the κ-optimizer starts REML from.
+        crate::smooth::auto_init_length_scale_in_basis(ds.values.view(), &mut basis);
+        let realized = match &basis {
+            SmoothBasisSpec::Matern { spec, .. } => spec.length_scale,
+            other => panic!("expected Matern basis after auto-init, got {other:?}"),
+        };
+        let expected =
+            crate::smooth::auto_initial_length_scale(ds.values.view(), &feature_cols);
+        assert!(
+            (realized - expected).abs() <= 1e-12,
+            "auto-init must seed the wiggly-side length scale max_range/sqrt(n) \
+             (expected {expected}, got {realized})",
+        );
+
+        // Sanity: the resolving seed is well below the per-axis range (≈1.0).
+        // Before the fix the seed was the full diameter (≈√2 ≈ 1.414); the
+        // resolving seed here is ≈ 1.0 / sqrt(576) ≈ 0.042, ~30× smaller.
+        let max_range = 1.0_f64; // each axis spans [0, 1]
+        assert!(
+            realized < max_range / 4.0,
+            "matern seed length_scale {realized} must be in the resolving regime, \
+             not the over-smoothed diameter corner (n={n}, max_range≈{max_range})",
+        );
+    }
+
     fn inferred_tensor_basis_product(ds: &Dataset) -> usize {
         let parsed = parse_formula("y ~ te(theta, h)").expect("parse tensor formula");
         let col_map = ds.column_map();
@@ -4915,58 +5043,6 @@ mod tests {
                 "parsed {raw:?} as {parsed:?}, expected {expected:?}"
             );
         }
-    }
-
-    /// #1629: the default Matérn κ seed must be the basis's natural operating
-    /// scale (≈ inter-knot spacing `D / K^(1/d)`), NOT the full data diameter.
-    /// At the diameter the cold kernel block is numerically collinear and the
-    /// rank-reduction collapses the basis before the κ-optimizer ever runs.
-    #[test]
-    fn default_matern_length_scale_seeds_at_inter_knot_spacing_not_diameter() {
-        // A 2-D cloud on [-3, 3]^2: diameter ≈ 6√2 ≈ 8.49.
-        let rows: Vec<Vec<f64>> = (0..400)
-            .map(|i| {
-                let a = -3.0 + 6.0 * (i as f64) / 399.0;
-                let b = 3.0 - 6.0 * ((i * 7 % 400) as f64) / 399.0;
-                vec![a, b, 0.0]
-            })
-            .collect();
-        let ds = continuous_dataset(&["x1", "x2", "y"], rows);
-        let cols = [0usize, 1usize];
-        let diameter = (2.0_f64 * 6.0 * 6.0).sqrt();
-
-        // With K = 200 centers over d = 2, the spacing seed is D / 200^(1/2) ≈
-        // 0.60 — over an order of magnitude below the diameter, and well inside
-        // the κ-optimizer's data-derived ψ window.
-        let k = 200usize;
-        let ls = default_matern_length_scale(&ds, &cols, k);
-        let expected = diameter / (k as f64).powf(0.5);
-        assert!(
-            (ls - expected).abs() <= 1e-9 * expected,
-            "seed {ls} != inter-knot spacing {expected}"
-        );
-        assert!(
-            ls < 0.2 * diameter,
-            "seed {ls} is not far below the diameter {diameter} — the #1629 \
-             rank-collapse seed regressed"
-        );
-
-        // Fewer centers ⇒ wider spacing ⇒ longer seed (monotone), but never
-        // above the diameter even in the tiny-K corner.
-        let ls_small_k = default_matern_length_scale(&ds, &cols, 4);
-        assert!(ls_small_k > ls, "spacing seed must grow as K shrinks");
-        assert!(
-            ls_small_k <= diameter,
-            "seed must never exceed the data diameter"
-        );
-
-        // Degenerate (zero-span) domain falls back to 1.0, not NaN/0.
-        let flat = continuous_dataset(
-            &["x1", "x2", "y"],
-            (0..8).map(|_| vec![1.0, 2.0, 0.0]).collect(),
-        );
-        let ls_flat = default_matern_length_scale(&flat, &cols, 50);
-        assert_eq!(ls_flat, 1.0, "zero-span domain must fall back to 1.0");
     }
 
     #[test]

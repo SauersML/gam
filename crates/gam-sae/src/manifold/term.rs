@@ -319,6 +319,34 @@ pub fn set_sae_barrier_overrides(sep_strength: f64) {
 /// the barrier (and its PSD majorizer) at the exact-alignment limit `c_jk² = 1`.
 pub(crate) const SAE_SEPARATION_BARRIER_EPS: f64 = 1.0e-6;
 
+/// #1625 — normalized collinearity `c_jk² = ‖U_jU_kᵀ‖²_F ∈ [0,1]` at/above which
+/// the SEPARATION barrier engages, the analog of
+/// [`SAE_DECODER_REPULSION_COLLINEARITY_GATE`] for the primary anti-collapse
+/// barrier. A C1 smoothstep ramps the barrier from exactly 0 at this threshold to
+/// full strength (and the interior-point divergence) as `c_jk² → 1`, so the
+/// barrier is a genuine COLLAPSE-prevention force — active only once two coactive
+/// atoms are materially aligned — rather than a global orthogonality prior that
+/// taxes every distinct-but-correlated pair.
+///
+/// WHY a gate at all (the ungated `−log(1−c²+ε)` was the #1625 stall): the
+/// interior-point shape has force `∂P/∂c² = 1/(1−c²+ε) ≈ 1` even at MODERATE
+/// collinearity, so two genuinely-distinct atoms (e.g. `c² = 0.36`, a 53° angle —
+/// nowhere near the `c² → 1` collapse) feel an O(1) separating force that, on a
+/// well-specified fit whose data residual is near zero, DOMINATES the objective and
+/// drags the decoders off the data optimum. The inner (t, β) Newton then has to
+/// chase a barrier-shifted optimum it converges to only slowly, and
+/// `reml_criterion`'s undamped-PD inner solve never reaches KKT stationarity —
+/// the #1625 "inner solve did not converge" refusal. Gating the barrier to the
+/// near-collapse regime (`c² ≳ 0.5`) leaves well-separated dictionaries at their
+/// data optimum (so they converge) while preserving the divergent restoring force
+/// exactly where collapse happens (`c² → 1`).
+///
+/// Chosen equal to the repulsion gate (`0.5`): the two anti-collapse terms then
+/// engage on the same near-collinear pair set, the barrier as the divergent
+/// interior-point core and the repulsion as its subdominant conditioner. Pairs
+/// below `0.5` (≥ 45° apart) are not collapsing and need no anti-collapse force.
+pub(crate) const SAE_SEPARATION_BARRIER_COLLINEARITY_GATE: f64 = 0.5;
+
 /// #1026/#1522/#1610 RELATIVE decoder-norm floor below which an atom is treated
 /// as inactive / shape-undefined for the SEPARATION barrier (its `U_k` is
 /// ill-conditioned). The separation barrier abstains for a pair until the
@@ -504,6 +532,26 @@ pub struct SaeManifoldTerm {
     /// (above the collinearity gate) ever carry a nonzero weight, so this list is
     /// tiny even at large `K` — never the dense `K×K` matrix (8 GiB at K=32768).
     pub(crate) decoder_repulsion_gate: Option<Vec<(usize, usize, f64)>>,
+    /// #1625 — the SEPARATION barrier's frozen normalized-coactivation weights
+    /// `q_jk`, the analog of [`Self::decoder_repulsion_gate`] for the #1522
+    /// collapse-prevention barrier. The barrier energy
+    /// `P_sep = μ_C·Σ_{j<k} −q_jk·log(1−c_jk²+ε)` is weighted by the normalized
+    /// coactivation `q_jk = (Σ_i a_ij a_ik)/√(Σa_ij²·Σa_ik²)`, which is a function
+    /// of the assignment masses `a_ik` (hence the logits). The barrier's GRADIENT
+    /// assembly ([`Self::add_sae_separation_barrier`]) treats `q_jk` as a constant
+    /// multiplicative weight (it differentiates only the decoder shape `c_jk²`), so
+    /// for value/gradient consistency the VALUE path
+    /// ([`Self::separation_barrier_value`], read by the line-search
+    /// [`Self::penalized_objective_total`]) MUST read the SAME `q_jk` the gradient
+    /// used — not recompute it from the trial logits the line search moves.
+    /// Freezing it here at assembly entry (lagged-diffusivity, exactly like the
+    /// smoothness Gram and the repulsion gate) makes the barrier a pure function of
+    /// the decoder shapes within a Newton step, so it exerts NO phantom force on
+    /// the routing and the inner solve reaches true KKT stationarity. `None` when
+    /// no pair co-fires (`K < 2`, or a fully-disjoint routing — the strict no-op);
+    /// callers fall back to the live coactivation in that case. Transient: not part
+    /// of the persisted term identity (Clone starts `None`, rebuilt next assembly).
+    pub(crate) barrier_coactivation_gate: Option<Vec<(usize, usize, f64)>>,
     /// #1026: the load-bearing curved-vs-linear hybrid-split verdict, computed
     /// once in [`Self::canonicalize_charts_post_fit`] after the joint fit
     /// converges. Each eligible `d = 1` atom's fitted curved image is adjudicated
@@ -566,6 +614,9 @@ impl Clone for SaeManifoldTerm {
             best_cocollapse_incumbent: None,
             // Transient per-assembly frozen gate — rebuilt at the next assembly.
             decoder_repulsion_gate: None,
+            // #1625 — transient per-assembly frozen barrier coactivation; rebuilt
+            // at the next assembly, exactly like the repulsion gate above.
+            barrier_coactivation_gate: None,
             hybrid_split_report: self.hybrid_split_report.clone(),
             atom_inner_fits: self.atom_inner_fits.clone(),
             oos_linear_images: self.oos_linear_images.clone(),
