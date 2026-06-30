@@ -2498,6 +2498,15 @@ mod tests {
             apply_structure_move(&term, &rho, &StructureMove::Fission { atom: 0 }, &[]).unwrap();
         assert_eq!(fissioned.k_atoms(), k0 + 1);
         assert_eq!(fissioned_rho.log_ard.len(), k0 + 1);
+        // Every length-K ρ vector the penalty assembler indexes by atom must
+        // grow with K, not just `log_ard`. `log_lambda_smooth` is read as
+        // `lambda_smooth[atom_idx]` in construction.rs; a stale length-K vector
+        // panics out of bounds on the K-th (new) atom (#357).
+        assert_eq!(
+            fissioned_rho.log_lambda_smooth.len(),
+            fissioned.k_atoms(),
+            "fission must grow per-atom log_lambda_smooth in lockstep with K"
+        );
 
         // Fusion: K unchanged, atom b demoted to ~0 routing.
         let (fused, _) =
@@ -2557,6 +2566,53 @@ mod tests {
             "born atom must reconstruct the residual-factor image (penalized fit); \
              max |Φ_born·B_born − Φ_template·factor_dir| = {max_recon_err:.3e} (> 1e-3)"
         );
+    }
+
+    /// #357 regression: after a structure move that GROWS the atom count
+    /// (fission/birth), the returned ρ's per-atom `log_lambda_smooth` must be
+    /// length-K so the penalty assembler's `lambda_smooth[atom_idx]` read does
+    /// not panic out of bounds. Before the fix `duplicate_atom`/`born_atom`
+    /// pushed only `log_ard`, leaving `log_lambda_smooth` one short — the next
+    /// `assemble_arrow_schur_inner` panicked with `index out of bounds: the len
+    /// is K but the index is K` (construction.rs `scaled_s[[i,j]] =
+    /// lambda_smooth[atom_idx] * s_ij`). This drives the REAL assembly so it
+    /// fails on the buggy path, not just on a length assertion.
+    #[test]
+    fn grown_atom_count_assembles_without_lambda_smooth_oob_357() {
+        let n = 16usize;
+        let active: Vec<Vec<bool>> = (0..n).map(|row| vec![true, row % 2 == 0]).collect();
+        let (term, rho) = planted_term(&active);
+        let target = Array2::<f64>::from_shape_fn((n, term.output_dim()), |(row, col)| {
+            0.1 * (row as f64) - 0.05 * (col as f64)
+        });
+
+        // Fission grows K by one.
+        let (fissioned, fissioned_rho) =
+            apply_structure_move(&term, &rho, &StructureMove::Fission { atom: 0 }, &[]).unwrap();
+        assert_eq!(fissioned_rho.log_lambda_smooth.len(), fissioned.k_atoms());
+        // The assembly indexes lambda_smooth[atom_idx] for every atom; on the
+        // pre-fix ρ this panicked out of bounds for the new K-th atom.
+        let mut fissioned = fissioned;
+        fissioned
+            .assemble_arrow_schur_scaled(target.view(), &fissioned_rho, None, 1.0)
+            .expect("post-fission assembly must not panic or error on the grown atom set");
+
+        // Birth grows K by one and must assemble too.
+        let p = term.output_dim();
+        let m = term.atoms[0].basis_size();
+        let mut decoder = Array2::<f64>::zeros((m, p));
+        decoder[[0, 0]] = 0.5;
+        let (born, born_rho) = apply_structure_move(
+            &term,
+            &rho,
+            &StructureMove::Birth { candidate: 0 },
+            &[decoder],
+        )
+        .unwrap();
+        assert_eq!(born_rho.log_lambda_smooth.len(), born.k_atoms());
+        let mut born = born;
+        born.assemble_arrow_schur_scaled(target.view(), &born_rho, None, 1.0)
+            .expect("post-birth assembly must not panic or error on the grown atom set");
     }
 
     /// Ledger byte-determinism oracle (#997): two runs of the round driver over
