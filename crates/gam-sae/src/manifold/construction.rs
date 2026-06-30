@@ -4518,33 +4518,35 @@ impl SaeManifoldTerm {
                         // For compact layout: position `j` = active_atoms index.
                         // For dense layout: position `atom_idx` directly.
                         //
-                        // H-consistency note (#1006 audit). This `assignment_hdiag` is the
-                        // assignment channel's raw diagonal curvature, added un-majorized. It
-                        // is exact for JumpReLU and exact within each IBP row/column diagonal,
-                        // but it is a deliberate diagonal approximation for two full-Hessian
-                        // structures that the current factorization does not yet carry (#1038):
+                        // H-consistency note (#1006 audit / #1416 update). This
+                        // `assignment_hdiag` is the assignment channel's raw diagonal
+                        // curvature, added un-majorized. It is exact for JumpReLU and exact
+                        // within each IBP row/column diagonal, and stores ONLY the diagonal of
+                        // two full-Hessian structures — but those off-diagonal structures are
+                        // now carried elsewhere, not dropped:
                         //
                         //   * softmax entropy has dense within-row Hessian
                         //     H_kj = (λ/τ²) a_k[δ_kj(m-L_k-1) + a_j(L_k+L_j+1-2m)];
-                        //     this block stores only its diagonal.
+                        //     this diagonal stores its Gershgorin Loewner majorizer (#1419).
                         //   * IBP empirical-π has cross-row rank-one terms per column
-                        //     H_(i,k),(j,k) = w score_derivative_k z'_ik z'_jk for i != j;
-                        //     this row-local block stores only the diagonal/self-row part.
-                        //     The exact scalar `D`-coefficient `d_k = w·s'_k` is now
-                        //     surfaced as `IbpHessianDiagThirdChannels::cross_row_d`
-                        //     (FD-verified against ∂²value/∂ℓ_ik∂ℓ_jk in
+                        //     H_(i,k),(j,k) = w score_derivative_k z'_ik z'_jk for i != j.
+                        //     This per-row diagonal stores only the diagonal/self-row part;
+                        //     the FULL rank-one cross-row block `U D Uᵀ` is now INSTALLED as a
+                        //     separate Woodbury source by `set_ibp_cross_row_source` (#1038),
+                        //     so the assembled operator is `H_full = H₀' + U D Uᵀ` on the
+                        //     NO-SELF base `H₀' = H₀ − Σ_k d_k diag(z'_ik²)` (self term
+                        //     downdated, see `IbpCrossRowSource::self_term_downdate`). The
+                        //     scalar `D`-coefficient `d_k = w·s'_k` is
+                        //     `IbpHessianDiagThirdChannels::cross_row_d` (FD-verified against
+                        //     ∂²value/∂ℓ_ik∂ℓ_jk in
                         //     `ibp_cross_row_woodbury_d_matches_full_off_diagonal_hessian`),
-                        //     and `z_jac` carries `u_k`'s entries `z'_ik`. The exact
-                        //     determinant-lemma consumer is
-                        //     log det(I_K + D UᵀH₀'⁻¹U) on the NO-SELF base
-                        //     H₀' = H₀ − Σ_k d_k diag(z'_ik²) — which requires re-factoring
-                        //     the per-row logit-slot diagonal (a factorization-side change
-                        //     in `solver::arrow_schur`, outside this assembly chokepoint).
+                        //     and `z_jac` carries `u_k`'s entries `z'_ik`.
                         //
-                        // The criterion's log|H| and Γ adjoint differentiate this same
-                        // assembled diagonal/quasi-Laplace Hessian, so value and gradient stay
-                        // on one branch. A future dense-row softmax or IBP Woodbury correction
-                        // must update both assembly and the θ-adjoint together.
+                        // The criterion's log|H| and Γ adjoint differentiate this SAME
+                        // `H_full`: the ρ-trace adds the cross-row off-diagonal in
+                        // `assignment_log_strength_hessian_trace` (#1416, dense AND compact
+                        // layouts) and the θ-adjoint adds it in `logdet_theta_adjoint`
+                        // (#1416/#1641), so value and gradient stay on one operator.
                         let assignment_base = row * k_atoms;
                         if let Some(layout) = row_layout.as_ref() {
                             let active = &layout.active_atoms[row];
@@ -8002,13 +8004,7 @@ impl SaeManifoldTerm {
             // α-derivative the DIAGONAL channel (`hessian_diag_log_alpha_derivative`)
             // already uses. Using the value `s'_k` here (the pre-fix bug) made the
             // off-diagonal inconsistent with the diagonal and the α-gradient wrong.
-            let learnable_alpha = matches!(
-                self.assignment.mode,
-                AssignmentMode::IBPMap {
-                    learnable_alpha: true,
-                    ..
-                }
-            );
+            // (`learnable_alpha` is the same flag the self-curvature downdate uses.)
             // Per-column active sites `(row, global t-index)`. Layout-agnostic.
             let mut col_sites: Vec<Vec<(usize, usize)>> = vec![Vec::new(); k_atoms];
             match self.last_row_layout {
