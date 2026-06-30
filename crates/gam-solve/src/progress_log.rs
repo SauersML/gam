@@ -167,12 +167,41 @@ fn log_level_from_overrides(gam_log: Option<&str>, rust_log: Option<&str>) -> Le
         .unwrap_or(DEFAULT_LOG_LEVEL)
 }
 
+/// Map a caller-supplied verbosity spelling onto a [`LevelFilter`]. Wraps the
+/// internal [`parse_log_level`] for out-of-crate callers (the CLI `--log-level`
+/// flag, the Python `set_log_level` shim). Returns `None` for blank/unrecognized
+/// input so the caller decides the fallback rather than guessing here.
+pub fn parse_level_directive(raw: &str) -> Option<LevelFilter> {
+    parse_log_level(raw)
+}
+
+/// The quiet out-of-the-box verbosity, exposed so callers that want the
+/// documented default after an explicit-level path can name it instead of
+/// hardcoding `Warn`.
+pub const fn default_log_level() -> LevelFilter {
+    DEFAULT_LOG_LEVEL
+}
+
 pub fn init_logging() {
+    init_logging_at(resolve_log_level());
+}
+
+/// Install the stderr logger at an explicit verbosity. Idempotent in the sense
+/// that the first caller wins the global `log` backend registration; **every**
+/// call (re-)applies the requested max level, so an embedding can call
+/// `init_logging()` early and later raise the level via `init_logging_at` (e.g.
+/// the Python `set_log_level` shim) without losing the override. This is how a
+/// caller opts back into the verbose `Info`/`debug`/`trace` solver trace that
+/// the `Warn` default suppresses for performance (#1688).
+pub fn init_logging_at(level: LevelFilter) {
     LOG_START.get_or_init(Instant::now);
-    let level = resolve_log_level();
-    if log::set_logger(&LOGGER).is_ok() {
-        log::set_max_level(level);
+    // First caller wins the backend registration; an already-installed logger
+    // is fine — we still want to (re-)apply the requested level below, so do
+    // not gate `set_max_level` on the registration result.
+    if log::set_logger(&LOGGER).is_err() {
+        // backend already installed by an earlier call — fall through.
     }
+    log::set_max_level(level);
     // Log the GPU backend inventory once at startup so the "are GPUs being
     // used?" answer is visible at the top of the log, before any solver
     // dispatch site lazily checks for device support.
@@ -225,6 +254,21 @@ mod tests {
             log_level_from_overrides(Some("yes"), Some("loud")),
             DEFAULT_LOG_LEVEL
         );
+    }
+
+    #[test]
+    fn parse_level_directive_matches_internal_parser() {
+        // The public out-of-crate entry point must behave exactly like the
+        // internal parser the env-precedence helper uses.
+        for spelling in ["off", "error", "warn", "info", "debug", "trace", "", "garbage"] {
+            assert_eq!(parse_level_directive(spelling), parse_log_level(spelling));
+        }
+    }
+
+    #[test]
+    fn default_log_level_accessor_matches_const() {
+        assert_eq!(default_log_level(), DEFAULT_LOG_LEVEL);
+        assert_eq!(default_log_level(), LevelFilter::Warn);
     }
 
     #[test]
