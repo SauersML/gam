@@ -1153,31 +1153,56 @@ pub(crate) fn run_outer_with_plan(
                             // (#1355); here it covers the budget-exhaustion exit.
                             let best_exit =
                                 cost_stall_exit.lock().ok().and_then(|slot| slot.clone());
-                            if let Some(best) = best_exit {
-                                let last_value = last_solution.final_value;
-                                let best_is_strictly_better = best.value.is_finite()
-                                    && (!last_value.is_finite() || best.value < last_value);
-                                if best_is_strictly_better {
+                            // The best-feasible-iterate substitution must produce
+                            // THIS seed's `result` (an expression that feeds the
+                            // multi-start keep-best below), NOT short-circuit the
+                            // whole function with a bare `return`. A bare `return`
+                            // here discards any CONVERGED fit an earlier seed already
+                            // stored in `best`: on a #1476 concurvity double-penalty
+                            // surface the flexible slot-0 seed converges to the
+                            // genuine interior optimum (cost ~133), then the promoted
+                            // heavy slot-1 seed (#1426) budget-exhausts on the
+                            // null-space annihilation shelf and its best-feasible
+                            // iterate is a degenerate box corner with a SPURIOUSLY
+                            // LOWER cached cost (~65, projected |g| ≫ tol — an invalid
+                            // REML the line search could not improve). Returning it
+                            // directly shipped that corner (edf_total→1, the supported
+                            // smooth annihilated) even though keep-best already held
+                            // the converged optimum. Flowing it through keep-best as a
+                            // NON-converged candidate lets `candidate_improves_best`
+                            // reject it (a converged best always beats a non-converged
+                            // candidate). When this seed is the ONLY one (the original
+                            // single-start #1371 case) `best` is still None, so
+                            // keep-best adopts it unchanged — that behavior is
+                            // preserved byte-for-byte.
+                            match best_exit {
+                                Some(best)
+                                    if best.value.is_finite()
+                                        && (!last_solution.final_value.is_finite()
+                                            || best.value < last_solution.final_value) =>
+                                {
                                     log::warn!(
                                         "[OUTER] {context}: ARC budget-exhaustion last iterate \
                                          (value={:.6e}) is worse than the best feasible iterate \
-                                         seen (value={:.6e}); returning the best iterate so a \
+                                         seen (value={:.6e}); substituting the best iterate so a \
                                          degenerate box-corner does not over-shrink a supported \
-                                         penalty direction (#1371).",
-                                        last_value,
+                                         penalty direction (#1371). The substituted iterate flows \
+                                         through the multi-start keep-best as a non-converged \
+                                         candidate so an earlier converged seed still wins (#1476).",
+                                        last_solution.final_value,
                                         best.value,
                                     );
-                                    return Ok(outer_result_with_gradient_norm(
+                                    Ok(outer_result_with_gradient_norm(
                                         best.rho,
                                         best.value,
                                         best.iterations,
                                         Some(best.grad_norm),
                                         false,
                                         *the_plan,
-                                    ));
+                                    ))
                                 }
+                                _ => Ok(solution_into_outer_result(*last_solution, false, *the_plan)),
                             }
-                            Ok(solution_into_outer_result(*last_solution, false, *the_plan))
                         }
                         Err(ArcError::ObjectiveFailed { message })
                             if message == COST_STALL_CONVERGED_SENTINEL =>

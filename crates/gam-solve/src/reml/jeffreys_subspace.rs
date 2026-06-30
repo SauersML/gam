@@ -2214,16 +2214,22 @@ impl JeffreysHphiDriftBase {
         }
 
         // δH_Φ_raw[a,b] = −½ (⟨vec(δΨ∘Ṽ_a + Ψ∘δṼ_a), vec(Ṽ_b)⟩ + ⟨vec(Ψ∘Ṽ_a), vec(δṼ_b)⟩).
-        // Mathematically symmetric in (a, b); assembled symmetrically for exactness.
+        // Each inner product is a contraction over the m·m flattened columns, so the
+        // whole (a,b) block is the pair of row-Gram products
+        //   acc[a,b] = (dw_rows · a_rowsᵀ)[a,b] + (aw_rows · da_rowsᵀ)[a,b].
+        // Assemble it with two BLAS-3 GEMMs rather than the former O(p²·m²) scalar
+        // triple loop: that loop's per-element ndarray index arithmetic was the
+        // measured hot spot of the whole survival/competing-risks fit (#979 drift),
+        // dominating wall-clock and driving the bounded-time regressions to their
+        // deadlines. The GEMM form is the same arithmetic with a cache- and
+        // BLAS-friendly reduction order. Mathematically symmetric in (a, b); we still
+        // mirror the upper triangle so the stored result is exactly symmetric (the
+        // GEMM need not return a bit-symmetric product).
+        let gram = dw_rows.dot(&a_rows.t()) + aw_rows.dot(&da_rows.t()); // p × p
         let mut out = Array2::<f64>::zeros((p, p));
         for a in 0..p {
             for b in a..p {
-                let mut acc = 0.0;
-                for col in 0..(m * m) {
-                    acc += dw_rows[[a, col]] * a_rows[[b, col]]
-                        + aw_rows[[a, col]] * da_rows[[b, col]];
-                }
-                let value = -0.5 * acc;
+                let value = -0.5 * gram[[a, b]];
                 out[[a, b]] = value;
                 out[[b, a]] = value;
             }

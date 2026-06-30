@@ -70,6 +70,7 @@ mod t2_tensor_penalty_decomposition;
 mod te_tensor_2d_hifreq_quality;
 mod tensor_3d_smooth_robust;
 mod tensor_clamped_margin;
+mod thin_plate_scale_dimensions_1676;
 mod thinplate_double_penalty_constrained_chart;
 mod ti_tensor_interaction_smooth;
 mod tp_single_penalty_edf_repro_1271;

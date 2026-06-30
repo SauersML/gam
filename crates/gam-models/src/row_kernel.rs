@@ -24,7 +24,7 @@ use crate::custom_family::{
 use gam_linalg::faer_ndarray::fast_ab;
 use gam_linalg::matrix::DesignMatrix;
 use crate::util::loop_progress::LoopProgress;
-use gam_problem::{HyperOperator, ProjectedFactorCache, ProjectedFactorKey};
+use gam_problem::{EvalMode, HyperOperator, ProjectedFactorCache, ProjectedFactorKey};
 use ndarray::{Array1, Array2, ArrayView2, s};
 use rayon::prelude::*;
 use std::sync::Arc;
@@ -271,8 +271,21 @@ pub trait RowKernel<const K: usize>: Send + Sync {
     /// cache builder's own `par_iter` collapses to a single worker — the
     /// other seven threads are parked on the cache `OnceLock`. Default impl
     /// is a no-op for kernels with no per-row jet cache to prime.
-    fn warm_up_directional_caches(&self) -> Result<(), String> {
-        Ok(())
+    ///
+    /// `eval_mode` bounds which caches are worth priming (gam#979): a
+    /// [`EvalMode::ValueOnly`] eval reads neither directional cache, a
+    /// [`EvalMode::ValueAndGradient`] eval reads only the third-derivative
+    /// (`row_third_contracted`) cache, and only [`EvalMode::ValueGradientHessian`]
+    /// reads the fourth-derivative (`row_fourth_contracted`) cache. Priming a
+    /// cache the mode never touches is wasted O(n) work; under-priming is safe
+    /// because each cache is a lazy `get_or_compute`.
+    fn warm_up_directional_caches(&self, eval_mode: EvalMode) -> Result<(), String> {
+        // Default: no per-row jet cache to prime, for any mode.
+        match eval_mode {
+            EvalMode::ValueOnly
+            | EvalMode::ValueAndGradient
+            | EvalMode::ValueGradientHessian => Ok(()),
+        }
     }
 
     /// Optional batched all-rows `(nll, grad, hess)` fast path for the full-data
@@ -1039,7 +1052,8 @@ pub fn row_kernel_directional_derivative_generic<const K: usize>(
 ) -> Result<Array2<f64>, String> {
     let n = kern.n_rows();
     let p = kern.n_coefficients();
-    kern.warm_up_directional_caches()?;
+    // First directional derivative consumes only the third-derivative cache.
+    kern.warm_up_directional_caches(EvalMode::ValueAndGradient)?;
     rows.par_try_reduce_fold(
         n,
         || Array2::<f64>::zeros((p, p)),
@@ -1114,7 +1128,9 @@ pub fn row_kernel_second_directional_derivative<const K: usize>(
 ) -> Result<Array2<f64>, String> {
     let n = kern.n_rows();
     let p = kern.n_coefficients();
-    kern.warm_up_directional_caches()?;
+    // Second directional derivative consumes the fourth-derivative cache (and
+    // its third-derivative prerequisite): full outer-Hessian priming.
+    kern.warm_up_directional_caches(EvalMode::ValueGradientHessian)?;
     rows.par_try_reduce_fold(
         n,
         || Array2::<f64>::zeros((p, p)),
@@ -1927,14 +1943,29 @@ impl<const K: usize, T: RowKernel<K>> RowKernelHessianWorkspace<K, T> {
 impl<const K: usize, T: RowKernel<K> + 'static> ExactNewtonJointHessianWorkspace
     for RowKernelHessianWorkspace<K, T>
 {
-    fn warm_up_outer_caches(&self) -> Result<(), String> {
+    fn warm_up_outer_caches_for_mode(&self, eval_mode: EvalMode) -> Result<(), String> {
         // Forward to the kernel: any per-row third/fourth-contracted jet
         // cache it keeps gets primed here, at the top-level rayon site
         // where the outer-eval `compute_dh`/`compute_d2h` closures are
         // wired up. Called exactly once per outer iter, far outside the
         // ext-coord `par_iter`, so the cache build's `par_iter` enjoys
         // full 8-core parallelism instead of a single lock-holder worker.
-        self.kern.warm_up_directional_caches()
+        //
+        // gam#979: forward `eval_mode` so a value-only probe (line search,
+        // seed screen, continuation pre-warm) primes nothing, and a
+        // first-order (`ValueAndGradient`) eval primes only the third-
+        // derivative cache its `coord_corrections` trace consumes — skipping
+        // the fourth-derivative outer-Hessian cache that only `ValueGradientHessian`
+        // reads. At biobank scale this is the dominant per-eval `O(n)` jet pass.
+        self.kern.warm_up_directional_caches(eval_mode)
+    }
+
+    fn warm_up_outer_caches(&self) -> Result<(), String> {
+        // Mode-blind back-compat entry: prime every directional cache the
+        // kernel keeps (legacy contract). Mode-aware callers route through
+        // `warm_up_outer_caches_for_mode` instead.
+        self.kern
+            .warm_up_directional_caches(EvalMode::ValueGradientHessian)
     }
 
     fn joint_log_likelihood_evaluation(&self) -> Result<Option<f64>, String> {

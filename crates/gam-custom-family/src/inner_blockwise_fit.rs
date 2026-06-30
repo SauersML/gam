@@ -1754,7 +1754,23 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                                     family, &states, specs, h_info, z_joint, false,
                                 )?
                             {
-                                lhs_true += &completion;
+                                // TRUST-REGION GATE (gam#1607): fold the completion
+                                // only when `H_Φ + completion` stays PSD. In the
+                                // near-separable regime the `−½ tr(K·D_ab)` remainder
+                                // explodes negative and cancels `H_Φ`, leaving the
+                                // augmented inner Hessian strongly indefinite. The
+                                // trust-region spectral solve below would reflect those
+                                // negative modes, but that turns the quadratic endgame
+                                // back into a reflected-descent crawl that plateaus
+                                // above the certificate tolerance ("inner solve exited
+                                // before convergence"). Keeping the bounded PSD `H_Φ`
+                                // model preserves the linear-but-monotone endgame the
+                                // divided-difference solve already certifies.
+                                if custom_family_jeffreys_completion_preserves_psd(
+                                    hphi, &completion,
+                                ) {
+                                    lhs_true += &completion;
+                                }
                             }
                         }
                         // Single metric-whitened eigendecomposition drives BOTH the

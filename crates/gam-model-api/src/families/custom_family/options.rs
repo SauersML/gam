@@ -136,10 +136,11 @@ pub(crate) fn assert_rho_matches_specs(
 pub(crate) fn validate_hessian_workspace_ready(
     hessian_workspace: &Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     context: &str,
+    eval_mode: gam_problem::EvalMode,
 ) -> Result<(), String> {
     if let Some(workspace) = hessian_workspace.as_ref() {
         workspace
-            .warm_up_outer_caches()
+            .warm_up_outer_caches_for_mode(eval_mode)
             .map_err(|err| format!("{context}: failed to warm Hessian workspace caches: {err}"))?;
     }
     Ok(())
