@@ -134,3 +134,14 @@ pub struct FittedTermCollectionWithSpec {
 
 include!("design_construction.rs");
 include!("spatial_optimization.rs");
+// #901 re-home: the end-to-end iso-κ joint REML outer-gradient FD oracles on
+// real Duchon/Matérn smooths. Authored in the pre-#1521 monolith, orphaned out
+// of the build by #1601 (its private driver deps live HERE post-carve, not in
+// `gam_terms::smooth` where the `include!` was commented out). The file is a
+// self-contained `#[cfg(test)] mod`, so it adds nothing to the non-test build.
+include!("iso_kappa_reml_gradient_fd_tests.rs");
+// #901 re-home: the Matérn κ-optimizer convergence/monotone gates the issue
+// listed as stalling on the wrong projected-logdet gradient. Same #1601
+// orphaning story — driver deps live HERE post-carve. Self-contained
+// `#[cfg(test)] mod`, so it adds nothing to the non-test build.
+include!("spatial_length_scale_monotone_tests.rs");

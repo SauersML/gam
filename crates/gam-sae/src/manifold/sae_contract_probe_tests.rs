@@ -6,7 +6,7 @@
 //! objective contract.
 
 use super::tests::{
-    TestPeriodicEvaluator, diagonal_latent_cache, periodic_basis,
+    TestPeriodicEvaluator, diagonal_latent_cache, periodic_basis, warmstart_test_objective,
     warmstart_test_objective_with_evaluator,
 };
 use super::*;
@@ -1513,4 +1513,53 @@ fn robust_norm_row_weights_rebalances_heavy_tailed_objective() {
     let flat = Array2::<f64>::from_elem((4, p), 2.0);
     let wf = SaeManifoldTerm::robust_norm_row_weights(flat.view(), 1.0).unwrap();
     assert!(wf.iter().all(|&x| (x - 1.0).abs() < 1e-12), "flat norms → uniform weights");
+}
+
+/// Driver-level freeze invariant (#850). The outer-objective test
+/// `seed_inner_state_installs_and_reuses_matching_beta` exercises the freeze
+/// through `OuterObjective::eval`; this one pins it at the exact seam where the
+/// bug lived: `run_joint_fit_arrow_schur` itself.
+///
+/// At `max_iter == 0` the joint solve is a verbatim FREEZE of the warm-started
+/// `(t, β)` — it must run no β-mutating stage. The regression was that the
+/// driver still ran the entry-stage re-seed guards and the #1026 post-loop
+/// decoder-LSQ polish, which refit β to the unpenalised least-squares argmin
+/// and committed it. We seed a β deliberately OFF that argmin (the pristine
+/// decoder differs from the data-optimal one), run a zero-iteration joint fit,
+/// and assert β is byte-for-byte unchanged. Before the fix the polish moved it.
+#[test]
+pub(crate) fn run_joint_fit_max_iter_zero_freezes_beta_verbatim() {
+    let mut term = warmstart_test_objective().term;
+    let dim = term.beta_dim();
+    // A distinctive seed that differs from the term's pristine decoder, so the
+    // unpenalised LSQ polish (had it run) would have a strict decrease to chase.
+    let pristine = term.flatten_beta();
+    let seed: Array1<f64> = Array1::from_shape_fn(dim, |i| pristine[i] + 0.5 + 0.01 * (i as f64));
+    assert!(
+        (&seed - &pristine).iter().any(|d| d.abs() > 1e-6),
+        "seed must differ from the pristine β for the freeze check to be meaningful"
+    );
+    term.set_flat_beta(seed.view())
+        .expect("length-matching β must install");
+
+    // Target matches `warmstart_test_objective`'s 4×1 signal.
+    let target = array![[0.20_f64], [-0.10], [0.30], [0.05]];
+    let mut rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)]);
+    // max_iter == 0 ⇒ verbatim freeze: no Newton step, no guard, no polish.
+    let loss = term
+        .run_joint_fit_arrow_schur(target.view(), &mut rho, None, 0, 1.0, 1.0e-6, 1.0e-6)
+        .expect("zero-iteration joint fit at the warm-started β must succeed");
+    assert!(
+        loss.total().is_finite(),
+        "frozen-state loss must be finite; got {}",
+        loss.total()
+    );
+
+    let frozen = term.flatten_beta();
+    for (i, (&f, &s)) in frozen.iter().zip(seed.iter()).enumerate() {
+        assert!(
+            (f - s).abs() < 1e-12,
+            "max_iter==0 must freeze β verbatim at coord {i}: frozen {f} != seed {s} (#850)"
+        );
+    }
 }
