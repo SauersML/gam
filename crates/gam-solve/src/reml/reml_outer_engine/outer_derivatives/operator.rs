@@ -477,9 +477,11 @@ impl UnifiedOuterHessianOperator {
         };
 
         // Cheap adjoint shortcut: works for both full-Hessian and projected
-        // (subspace) regimes because §10 populates `leverage`/`adjoint_z_c`
-        // with the projected `h^{G,proj}` and `K · v` under subspace, and
-        // the identity tr(Kernel · C[u]) = uᵀ Xᵀ(c ⊙ h^G) carries through.
+        // (subspace) regimes because the build populates `leverage` with the
+        // projected `h^{G,proj}` under subspace while `adjoint_z_c = H⁻¹ · v`
+        // stays a full solve, and the identity
+        // tr(Kernel · C[u]) = uᵀ Xᵀ(c ⊙ h^G) = rhsᵀ H⁻¹ Xᵀ(c ⊙ h^G) carries
+        // through (the projection lives entirely in the leverage `h^G`).
         let z_c = self.adjoint_z_c.as_ref().ok_or_else(|| {
             "missing adjoint trace cache for scalar outer Hessian operator".to_string()
         })?;
@@ -1490,28 +1492,26 @@ pub(crate) fn build_outer_hessian_operator(
     };
 
     // Leverage and the scalar-GLM adjoint-z_c cache support both the
-    // full-Hessian and projected-subspace paths.  Under subspace,
+    // full-Hessian and projected-subspace paths.  The trace is
+    //   tr(Kernel · C[u]) = Σ_r c_r (Xu)_r (X Kernel Xᵀ)_rr
+    //                     = uᵀ · Xᵀ(c ⊙ h^G),   h^G = diag(X Kernel Xᵀ),
+    // with the SECOND mode response `u = β̈ = H⁻¹ rhs` solved with the FULL
+    // inner inverse in EVERY regime (it is an IFT stationarity derivative in
+    // full β-space — see `compute_ift_correction_trace`'s slow path and
+    // `compute_adjoint_z_c`).  Substituting,
+    //   tr(Kernel · C[u]) = rhsᵀ H⁻¹ Xᵀ(c ⊙ h^G) = rhsᵀ · z_c,
+    //   z_c = H⁻¹ · Xᵀ(c ⊙ h^G),
+    // so `scalar_correction_trace` can take the cheap branch `rhs · z_c`
+    // instead of materialising the second-derivative correction.  The
+    // PROJECTION enters ONLY through the leverage: under subspace,
     //   h^{G,proj}_i = Xᵢᵀ · K · Xᵢ                  (K = U_S H_proj⁻¹ U_Sᵀ)
-    //   u            = K · rhs                       (mirrors
-    //                                                  `compute_ift_correction_trace`
-    //                                                  slow path and the
-    //                                                  per-coord v computation
-    //                                                  above)
-    //   z_c^{proj}   = K · Xᵀ(c ⊙ h^{G,proj})
-    // and the adjoint identity
-    //   tr(K · C[u]) = uᵀ · Xᵀ(c ⊙ h^{G,proj})
-    //               = (K rhs)ᵀ · Xᵀ(c ⊙ h^{G,proj})
-    //               = rhsᵀ · K · Xᵀ(c ⊙ h^{G,proj})
-    //               = rhsᵀ · z_c^{proj}
-    // lets `scalar_correction_trace` take the cheap branch
-    // `rhs · z_c^{proj}` instead of materialising the second-derivative
-    // correction.  Both the leverage AND the adjoint vector must swap to
-    // their projected forms — gating only one (the historical bug) made the
-    // operator path's `scalar_correction_trace` compute
-    // `rhsᵀ H⁻¹ Xᵀ(c⊙h^{G,proj})` while `compute_ift_correction_trace`
-    // computes `rhsᵀ K · X'(c⊙h^{G,proj})`, so the operator-form Hessian
-    // disagreed with the dense path materialisation in the regression
-    // `projected_operator_hessian_matches_dense_subspace_trace`.
+    // while the solve in `compute_adjoint_z_c` stays `H⁻¹`.  A previous version
+    // ALSO projected the solve (`z_c = K · Xᵀ(c⊙h^{G,proj})`), making this path
+    // compute `rhsᵀ K Xᵀ(c⊙h^{G,proj})` while the dense materialisation
+    // correctly traces `tr(K · C[H⁻¹ rhs]) = rhsᵀ H⁻¹ Xᵀ(c⊙h^{G,proj})` — the
+    // `projected_operator_hessian_matches_dense_subspace_trace` /
+    // `outer_hessian_operator_matvec_matches_dense_subspace_with_null_alpha`
+    // regressions.  Only the leverage is projected; the solve is not.
     let leverage = if incl_logdet_h {
         match &kernel {
             OuterHessianDerivativeKernel::Gaussian => None,
@@ -1541,7 +1541,6 @@ pub(crate) fn build_outer_hessian_operator(
                 },
                 hop.as_ref(),
                 h_g,
-                subspace,
             )?),
             _ => None,
         }

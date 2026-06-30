@@ -222,12 +222,7 @@ pub(crate) fn compute_outer_hessian(
     };
     let adjoint_z_c = if incl_logdet_h {
         match (glm_ingredients.as_ref(), leverage.as_ref()) {
-            (Some(ing), Some(h_g)) => Some(compute_adjoint_z_c(
-                ing,
-                hop,
-                h_g,
-                solution.penalty_subspace_trace.as_deref(),
-            )?),
+            (Some(ing), Some(h_g)) => Some(compute_adjoint_z_c(ing, hop, h_g)?),
             _ => None,
         }
     } else {

@@ -1913,7 +1913,7 @@ pub(crate) fn test_compute_adjoint_z_c_streaming_matches_dense_reference() {
         }
         h_dense[i] = acc;
     }
-    let streamed = compute_adjoint_z_c(&ing, &hop, &h_dense, None).expect("adjoint path");
+    let streamed = compute_adjoint_z_c(&ing, &hop, &h_dense).expect("adjoint path");
 
     let mut t = h_dense.clone();
     Zip::from(&mut t)
