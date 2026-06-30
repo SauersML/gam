@@ -6,8 +6,37 @@ use super::*;
 #[command(version)]
 #[command(arg_required_else_help = true)]
 pub(crate) struct Cli {
+    /// Increase log verbosity (repeatable): default shows warnings/errors,
+    /// `-v` adds the per-iteration solver progress (`info`), `-vv` adds
+    /// `debug`, `-vvv` adds `trace`. Mutually exclusive with `--quiet`.
+    #[arg(
+        short = 'v',
+        long = "verbose",
+        action = clap::ArgAction::Count,
+        global = true,
+        conflicts_with = "quiet"
+    )]
+    pub(crate) verbose: u8,
+    /// Decrease log verbosity (repeatable): `-q` shows only errors, `-qq`
+    /// silences logging entirely. Mutually exclusive with `--verbose`.
+    #[arg(
+        short = 'q',
+        long = "quiet",
+        action = clap::ArgAction::Count,
+        global = true
+    )]
+    pub(crate) quiet: u8,
     #[command(subcommand)]
     pub(crate) command: Command,
+}
+
+impl Cli {
+    /// Net verbosity delta to feed [`gam::progress_log::level_from_verbosity_delta`]:
+    /// positive for `-v`, negative for `-q`. The two are mutually exclusive at
+    /// the clap layer, so at most one is non-zero.
+    pub(crate) fn verbosity_delta(&self) -> i32 {
+        i32::from(self.verbose) - i32::from(self.quiet)
+    }
 }
 
 #[derive(Subcommand, Debug)]

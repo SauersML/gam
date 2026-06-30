@@ -313,7 +313,9 @@ fn run() -> CliResult<()> {
     // Parse first so `--help` / `--version` exit cleanly without spawning the
     // runtime-threads INFO line clap can't suppress.
     let cli = Cli::parse();
-    gam::progress_log::init_logging();
+    gam::progress_log::init_logging_with_level(gam::progress_log::level_from_verbosity_delta(
+        cli.verbosity_delta(),
+    ));
     log::info!(
         "[STAGE] runtime threads | rayon_current_num_threads={} | std_available_parallelism={}",
         rayon::current_num_threads(),
