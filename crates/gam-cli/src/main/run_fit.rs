@@ -1102,7 +1102,7 @@ pub(crate) fn run_fit_expectile(
         compact_fit_result_for_batch(&mut saved_fit);
         let mut payload = FittedModelPayload::new(
             MODEL_PAYLOAD_VERSION,
-            formula_text,
+            formula_text.to_string(),
             ModelKind::Standard,
             FittedFamily::Standard {
                 likelihood: family.clone(),
