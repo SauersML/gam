@@ -153,3 +153,10 @@ include!("spatial_length_scale_monotone_tests.rs");
 // relocated, so both guards compiled into NO binary. Self-contained
 // `#[cfg(test)] mod`, so it adds nothing to the non-test build.
 include!("psi_gram_tensor_fast_path_tests.rs");
+// #901 re-home: the custom-family ADAPTIVE-ψ projected-logdet REML
+// hypergradient + outer-Hessian FD oracle on a real `SpatialAdaptiveExactFamily`
+// — the half of #901 the engine fix (joint_jeffreys_information_depends_on_psi)
+// directly targets, plus the #426 unified-dispatch parity pin. Same #1601
+// orphaning story as the two oracles above; driver deps live HERE post-carve.
+// Self-contained `#[cfg(test)] mod`, so it adds nothing to the non-test build.
+include!("spatial_adaptive_hyper_fd_tests.rs");

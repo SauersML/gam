@@ -1529,7 +1529,18 @@ fn difference_smooth_json_impl(model_bytes: &[u8], request_json: &str) -> Result
         let dataset_right = dataset_with_model_schema(&model, &headers, &rows_right)?;
         let xl = design_matrix_dense(&model, dataset_left)?;
         let xr = design_matrix_dense(&model, dataset_right)?;
-        let mut xd = &xr - &xl;
+        // Sign contract: `xl` is built from `level_1` (`row_left`) and `xr` from
+        // `level_2` (`row_right`), and every output row is labelled
+        // `level_1`/`level_2`. A user reads the pair `(level_1, level_2)` as the
+        // contrast `ŝ(level_1) − ŝ(level_2)` (the mgcv `plot_diff(model, a, b)`
+        // convention). The design difference must therefore be
+        // `design(level_1) − design(level_2)`, so `diff = xd·β = f(level_1) −
+        // f(level_2)` carries the labelled sign. Forming `&xr - &xl` returned the
+        // negation `f(level_2) − f(level_1)` while the row still said
+        // `level_1`/`level_2` (correlation −1 with `predict(level_1) −
+        // predict(level_2)`). The variance below is the quadratic form `xdᵀ Σ xd`,
+        // invariant to this sign, so only the reported centre flips.
+        let mut xd = &xl - &xr;
         if request.marginalise_random {
             // The compared factor is itself fitted as a random_effect term, so its
             // columns appear in `random_ranges`. Marginalising random effects is meant
@@ -2270,6 +2281,10 @@ fn scan_summary_payload(model: &FittedModel, scan: &ScanIntrospection) -> Summar
         // Scan-routed models do not retain the λ-comparable log-likelihood, so
         // leave `log_likelihood` unset.
         log_likelihood: None,
+        // The O(n) smoother does not retain the IRLS working set, and its
+        // `reml_cost` is explicitly within-fit (not cross-model comparable), so
+        // leave `n_obs` unset — `compare_models` treats it as unconstrained.
+        n_obs: None,
         // null_dim is left unset: the scan does not compute the penalized-Hessian
         // null-space logdet the TK normalizer needs, so `comparable_reml_score`
         // returns the raw cost unchanged (and `evidence()` stays well-defined).
@@ -2335,6 +2350,12 @@ fn summary_json_impl(model_bytes: &[u8]) -> Result<String, String> {
         deployment_extensions: model.payload().deployment_extensions.clone(),
         deviance: fit.deviance,
         log_likelihood: Some(fit.log_likelihood),
+        // Observation count from the IRLS working set (same source the Wald χ²
+        // n-dependence reads). Lets `compare_models` reject cross-`n` comparisons.
+        n_obs: fit
+            .geometry
+            .as_ref()
+            .map(|geom| geom.working_response.len()),
         reml_score,
         raw_reml_score,
         null_space_logdet: fit.artifacts.null_space_logdet,
