@@ -1951,7 +1951,7 @@ pub(crate) fn psi_drift_deriv_workspace_preserves_block_local_operator() {
     impl CustomFamily for ZeroFamily {
         fn evaluate(
             &self,
-            block_states: &[ParameterBlockState],
+            _: &[ParameterBlockState],
         ) -> Result<FamilyEvaluation, String> {
             Ok(FamilyEvaluation {
                 log_likelihood: 0.0,
@@ -2217,8 +2217,8 @@ pub(crate) fn custom_family_outer_derivatives_respects_missing_second_order_capa
 
         fn exact_outer_derivative_order(
             &self,
-            block_specs: &[ParameterBlockSpec],
-            options: &BlockwiseFitOptions,
+            _: &[ParameterBlockSpec],
+            _: &BlockwiseFitOptions,
         ) -> ExactOuterDerivativeOrder {
             ExactOuterDerivativeOrder::First
         }
@@ -6329,14 +6329,14 @@ pub(crate) fn exact_newton_dh_closure_rejects_non_finite_directional_derivative(
 
         fn exact_newton_joint_hessian(
             &self,
-            block_states: &[ParameterBlockState],
+            _: &[ParameterBlockState],
         ) -> Result<Option<Array2<f64>>, String> {
             Ok(Some(array![[1.0]]))
         }
 
         fn exact_newton_joint_hessian_directional_derivative(
             &self,
-            block_states: &[ParameterBlockState],
+            _: &[ParameterBlockState],
             arr: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
             assert!(arr.iter().all(|v| !v.is_nan()));
