@@ -39,5 +39,24 @@ internally. A column-major-slice variant covers the multi-GPU tile path.
 - SAE device PCG host Cholesky ×2                         → ridge_bump_to_make_pd
 - multi-GPU tile batched POTRF (info index)               → ridge_bump_to_make_pd_colmajor
 
-## Verification log
-- (pending build + V100 run)
+## Verification log (Tesla V100-SXM2-32GB, CC 7.0, CUDA_VISIBLE_DEVICES=6)
+- Rebased onto fresh main (after peer fixed the #1696 env::var ban break, c54156bc2).
+- `./build.sh` clean under `warnings = "deny"` (removed now-dead `RowSlot.diag_scale`).
+- `arrow_schur_gpu_ridge_bump_required_on_non_pd_row_recovers_after_bump`: FAIL → PASS.
+  - Root cause of the residual failure after the per-row bump: the deficit-aware
+    bump correctly lifts the `-I` block PAST λ_min=-1, so it factors as a barely-PD
+    `(bump-1)*I ~ 1.5e-5*I` block. Locally κ=1, but `Y_2=L_2^-1 B_2` is amplified
+    ~256×, driving the REDUCED Schur `S_β` strongly indefinite → legitimate
+    `SchurFactorFailed`. The dense CPU reference fails identically at that ridge.
+  - Production `solve_with_lm_escalation_inner` treats BOTH RidgeBumpRequired and
+    SchurFactorFailed as ridge-recoverable; the test's manual loop only handled the
+    former. Fixed the test to mirror production and to assert dense-CPU parity on
+    the failure path at every escalation step.
+- Full V100 suite (minus slow hill_climb): 7/7 PASS — baseline, multi_size,
+  ridge_escalation, log_det, dense_reference, ridge_bump_required, fused_layer_d.
+- GPU engagement: `nvidia-smi dmon -s um -i 6` caught SM 3%, fb 86→312 MB on
+  device 6 during the suite (idle baseline 1 MB) — device path genuinely ran, no
+  silent CPU fallback (every test fail-louds on Unavailable with a runtime present).
+- CPU↔GPU parity: every passing test asserts the device step matches the dense
+  CPU reference to 1e-10; CPU path unchanged.
+- PR: #1711.
