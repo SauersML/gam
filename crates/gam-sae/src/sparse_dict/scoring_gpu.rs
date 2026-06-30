@@ -512,6 +512,71 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn device_route_at_issue_target_k_32k_is_bit_identical() {
+        // #1026 HEADLINE SCALE. The issue is about "large linear SAEs" — K up to
+        // ~32_000. Our other parity test pins K=4096; this one drives the router
+        // at the issue's actual target width (K=32_768) to prove the device path
+        // not only engages but stays BIT-IDENTICAL to the per-row CPU oracle at
+        // the scale where the 1e4–1e6× hardware gap the issue tracks lives. m is
+        // kept modest (256) so the 256×32_768 = 8.4M-element block clears the
+        // device break-even by 8× while the host buffers stay ~34 MB.
+        use crate::sparse_dict::scoring::top_s_online;
+
+        let m = 256usize;
+        let k = 32_768usize; // 256 * 32_768 = 8,388,608 >> DEVICE_SCORE_BLOCK_MIN_ELEMS
+        let p = 64usize;
+        let s = 4usize;
+        let tile = 2048usize;
+        assert!(m * k >= DEVICE_SCORE_BLOCK_MIN_ELEMS);
+        let (rows, atoms) = fixture(m, k, p);
+
+        let cpu: Vec<Vec<(u32, f32)>> = rows
+            .outer_iter()
+            .map(|row| top_s_online(row, atoms.view(), s, tile))
+            .collect();
+
+        match route_minibatch_required(rows.view(), atoms.view(), s, tile, gam_gpu::GpuMode::Required)
+        {
+            Ok((routed, path)) => {
+                assert_eq!(
+                    path,
+                    ScoreBlockPath::Device,
+                    "Required succeeded at K=32k but reported CPU — device did not engage"
+                );
+                assert_eq!(routed.len(), cpu.len());
+                for (r, (dev_sel, cpu_sel)) in routed.iter().zip(&cpu).enumerate() {
+                    assert_eq!(dev_sel.len(), cpu_sel.len(), "row {r}: selection length differs");
+                    for (j, ((da, ds), (ca, cs))) in dev_sel.iter().zip(cpu_sel).enumerate() {
+                        assert_eq!(da, ca, "K=32k row {r} slot {j}: atom differs dev={da} cpu={ca}");
+                        assert_eq!(
+                            ds.to_bits(),
+                            cs.to_bits(),
+                            "K=32k row {r} slot {j}: score bits differ dev={ds} cpu={cs}"
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                assert!(
+                    gam_gpu::GpuRuntime::global().is_none(),
+                    "Required errored at K=32k despite a live CUDA runtime: {err}"
+                );
+                let (routed, path) = route_minibatch_required(
+                    rows.view(),
+                    atoms.view(),
+                    s,
+                    tile,
+                    gam_gpu::GpuMode::Auto,
+                )
+                .expect("Auto must not error on a device-absent host");
+                assert_eq!(path, ScoreBlockPath::Cpu);
+                assert_eq!(routed, cpu);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn device_score_block_is_bit_identical_to_cpu_when_available() {
         // Exactness gate. The block MUST clear DEVICE_SCORE_BLOCK_MIN_ELEMS so
         // the device path is actually admitted (a sub-break-even block would
