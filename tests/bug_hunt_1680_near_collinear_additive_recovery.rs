@@ -160,20 +160,65 @@ fn diag_near_collinear_lambdas_edf() {
             "y ~ smooth(x1,k={k})+smooth(x2,k={k})+smooth(x3,k={k})+smooth(x4,k={k})"
         ),
     };
-    for kopt in [None, Some(8usize), Some(10), Some(12), Some(15), Some(20)] {
+    for kopt in [None, Some(10usize), Some(20)] {
         let formula = mk(kopt);
         let formula = formula.as_str();
         let mut sum = 0.0;
-        eprintln!("=== k={kopt:?} ===");
         for seed in [0u64, 1, 2, 3] {
             let (train, _pts) = gen_data(120, seed);
             let pred = fit_and_predict_formula(formula, &train, &test_pts);
-            let rmse = truth_rmse(&pred, &test_pts);
-            sum += rmse;
-            eprintln!("       seed={seed} truth-RMSE={rmse:.4}");
+            sum += truth_rmse(&pred, &test_pts);
         }
-        eprintln!("=== k={kopt:?} MEAN truth-RMSE={:.4} ===", sum / 4.0);
+        eprintln!("[collinear ρ=0.985] k={kopt:?} MEAN truth-RMSE={:.4}", sum / 4.0);
     }
+
+    // Control: SAME truth, but x2/x3 are INDEPENDENT (no collinearity). If the
+    // over-rich default basis is bad universally, this breaks too; if it only
+    // breaks under collinearity, this stays clean.
+    let indep_test = gen_indep(600, 99).1;
+    for kopt in [None, Some(10usize), Some(20)] {
+        let formula = mk(kopt);
+        let formula = formula.as_str();
+        let mut sum = 0.0;
+        for seed in [0u64, 1, 2, 3] {
+            let (train, _pts) = gen_indep(120, seed);
+            let pred = fit_and_predict_formula(formula, &train, &indep_test);
+            sum += truth_rmse(&pred, &indep_test);
+        }
+        eprintln!("[independent      ] k={kopt:?} MEAN truth-RMSE={:.4}", sum / 4.0);
+    }
+}
+
+/// Same truth as `gen_data` but `x2`, `x3` are independent `U(-2,2)` — no
+/// collinearity. Used as the discriminating control.
+fn gen_indep(n: usize, seed: u64) -> (gam::data::EncodedDataset, Vec<RowPoint>) {
+    let mut rng = SplitMix64::new(seed);
+    let mut rows: Vec<StringRecord> = Vec::with_capacity(n);
+    let mut pts = Vec::with_capacity(n);
+    for _ in 0..n {
+        let x1 = rng.unif_pm2();
+        let x2 = rng.unif_pm2();
+        let x3 = rng.unif_pm2();
+        let x4 = rng.unif_pm2();
+        let t = truth(x1, x4);
+        let y = t + 0.3 * rng.normal();
+        rows.push(StringRecord::from(vec![
+            x1.to_string(),
+            x2.to_string(),
+            x3.to_string(),
+            x4.to_string(),
+            y.to_string(),
+        ]));
+        pts.push((x1, x2, x3, x4, t));
+    }
+    let headers = ["x1", "x2", "x3", "x4", "y"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    (
+        encode_recordswith_inferred_schema(headers, rows).expect("encode dataset"),
+        pts,
+    )
 }
 
 /// Same as `fit_and_predict` but with a caller-supplied formula.

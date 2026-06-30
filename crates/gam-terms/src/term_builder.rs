@@ -3555,14 +3555,39 @@ fn min_per_group_unique_count(
         .max(1)
 }
 
-/// Per-column knot count from the unique-value count, with the same n^(1/3)
-/// ceiling growth as `heuristic_knots` so per-column smooths can support more
-/// detail at large scale. The 4-knot floor stays put because we still need
-/// enough basis functions to fit a non-trivial smooth at all.
+/// Default internal-knot count for an *additive* univariate smooth, derived
+/// from the column's unique-value count.
+///
+/// The basis dimension is `internal_knots + degree + 1`, so the cap below maps
+/// to a default cubic basis of ~12 functions — deliberately close to mgcv's
+/// univariate default (`k = 10`). A penalized smooth controls its wiggliness
+/// through the *penalty*, not the basis size: REML/LAML shrinks a too-rich
+/// basis toward the null, but it cannot do so cleanly when the basis is so
+/// over-sized that the design becomes weakly identified. Growing the basis with
+/// `n` (the old `n^(1/3)`-ceilinged `unique/4` rule, which pinned to 20 internal
+/// knots ⇒ a 24-function basis for any column with ≥80 unique values) therefore
+/// *hurts* recovery on finite, weak-signal fits: a 4-smooth additive model on
+/// n=120 asks for ~92 coefficients, the outer optimizer stalls on the resulting
+/// flat two-penalty (range + null-space) REML surface, and the truth leaks into
+/// surplus columns the penalty can't shrink away (gam#1680; the same defect was
+/// documented for thin-plate fields in gam#1074). A k-sweep on the #1680 design
+/// confirms a basis of ~10–15 recovers truth at RMSE ≈ 0.12 while the old
+/// 24-function default lands at ≈ 0.39 (~3× worse) — *whether or not* the
+/// covariates are collinear, so this is basis over-richness, not collinearity.
+///
+/// The cap is flat in `n`: a user who genuinely needs a wigglier fit raises `k`
+/// explicitly (mgcv's contract — opt *in* to more flexibility), and the SPEC
+/// requires the default to allow recovering the null rather than forcing the
+/// user to opt out of overfitting. The 4-knot floor stays put because we still
+/// need enough basis functions to fit a non-trivial smooth at all, and the
+/// `unique/4` growth below the cap keeps small/sparse columns (n ≤ 32, where
+/// `unique/4 ≤ 8`) on exactly their previous knot count.
 pub fn heuristic_knots_for_column(col: ArrayView1<'_, f64>) -> usize {
+    /// Default cubic basis ≈ `MAX_DEFAULT_INTERNAL_KNOTS + degree + 1` = 12
+    /// functions, matching mgcv's lean univariate default.
+    const MAX_DEFAULT_INTERNAL_KNOTS: usize = 8;
     let unique = unique_count_column(col);
-    let ceiling = ((unique as f64).cbrt() as usize).max(20);
-    (unique / 4).clamp(4, ceiling)
+    (unique / 4).clamp(4, MAX_DEFAULT_INTERNAL_KNOTS)
 }
 
 /// Per-margin basis sizes for a tensor-product smooth (`te`/`ti`/`t2`).
