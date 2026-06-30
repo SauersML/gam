@@ -1,4 +1,4 @@
-//! Bug hunt #1680: near-collinear (~0.985) additive smooths — gamfit recovers
+//! Bug hunt #1680: an additive model with several univariate smooths recovers
 //! the true function far worse than it should at small n.
 //!
 //! Setup mirrors the issue: an additive model with FOUR univariate smooths where
@@ -7,21 +7,29 @@
 //! independent signal. A well-regularized additive REML fit should shrink the
 //! `x2`/`x3` nuisance smooths out (their information about `y` is fully explained
 //! by `x1`) and recover the truth cleanly. mgcv (`select=TRUE`, REML) gets
-//! truth-RMSE ≈ 0.09 at n=120; the issue reports gamfit at ≈ 0.37 — ~4× worse.
+//! truth-RMSE ≈ 0.09 at n=120; the issue reported gamfit at ≈ 0.37 — ~4× worse.
 //!
-//! The near-rank-1 `x1`/`x2`/`x3` block makes the joint additive design nearly
-//! degenerate. The penalized-fit / λ-selection then has a flat REML valley along
-//! the directions that trade curvature between the three collinear smooths, and
-//! the optimizer can land at a solution that leaks the `x1` signal into the
-//! `x2`/`x3` nuisance smooths — inflating truth-RMSE even though the in-sample
-//! fit is fine. This is mechanistically adjacent to the double-penalty
-//! null-space pathologies (#1266 / #1371) and the additive term-order
-//! non-invariance (`bug_hunt_additive_smooth_fit_depends_on_term_order`).
+//! ROOT CAUSE (proven by the `diag_*` control below, NOT collinearity): the
+//! default univariate B-spline basis grew with `n`. `heuristic_knots_for_column`
+//! returned 20 internal knots — a 24-function cubic basis — for any column with
+//! ≥80 unique values. A 4-smooth model on n=120 therefore asked for ~92
+//! coefficients; the outer REML optimizer stalled on the flat range+null-space
+//! penalty surface and leaked the signal into surplus columns the penalty could
+//! not shrink away. The discriminating control fits the SAME truth with `x2`/`x3`
+//! made *independent* of `x1` (no collinearity): it breaks **even worse** with
+//! the over-rich default (mean truth-RMSE 0.52 vs 0.39), so the defect is basis
+//! over-richness, not the near-rank-1 block. A k-sweep confirms a basis of ~10–15
+//! recovers truth at RMSE ≈ 0.12 either way. The fix caps the default univariate
+//! basis at an mgcv-like ~12 functions (`heuristic_knots_for_column`), flat in n.
+//! This is the same defect class as the thin-plate over-sizing in #1074, and it
+//! is mechanistically adjacent to the double-penalty null-space pathologies
+//! (#1266 / #1371) and the additive term-order non-invariance
+//! (`bug_hunt_additive_smooth_fit_depends_on_term_order`).
 //!
 //! The test fits the 4-smooth additive model on a small training sample, predicts
 //! on a large independent test sample, and asserts the truth-RMSE is within a
 //! generous multiple of the noise floor — i.e. the fit actually recovers the
-//! signal rather than smearing it across the collinear block.
+//! signal rather than smearing it across the over-rich bases.
 
 use csv::StringRecord;
 use gam::smooth::build_term_collection_design;
@@ -305,8 +313,39 @@ fn near_collinear_additive_recovers_truth_small_n() {
     assert!(
         mean <= MAX_MEAN_RMSE,
         "near-collinear additive fit recovers truth poorly: mean truth-RMSE {mean:.4} over seeds \
-         {SEEDS:?} exceeds {MAX_MEAN_RMSE:.2} (mgcv select=TRUE REML ≈ 0.09). The near-rank-1 \
-         x1/x2/x3 block destabilizes the penalized fit / λ-selection so the x1 signal leaks into \
-         the collinear nuisance smooths (#1680)."
+         {SEEDS:?} exceeds {MAX_MEAN_RMSE:.2} (mgcv select=TRUE REML ≈ 0.09). The over-rich default \
+         univariate basis over-parameterizes the weak-signal additive fit so the x1 signal leaks \
+         into surplus columns the penalty cannot shrink away (#1680)."
+    );
+}
+
+#[test]
+fn near_collinear_additive_recovers_truth_n400() {
+    // The issue's second data point: at n=400 gamfit was ~1.5× mgcv (0.080 vs
+    // 0.052). With the leaner default basis the gap should close to roughly
+    // mgcv's ballpark. mgcv reaches ≈ 0.05 here; assert a generous 0.09 mean.
+    const N_TRAIN: usize = 400;
+    const SEEDS: [u64; 4] = [0, 1, 2, 3];
+    const MAX_MEAN_RMSE: f64 = 0.09;
+
+    let (_test_data, test_pts) = gen_data(600, 99);
+
+    let mut sum = 0.0_f64;
+    let mut worst = 0.0_f64;
+    for seed in SEEDS {
+        let (train, _train_pts) = gen_data(N_TRAIN, seed);
+        let pred = fit_and_predict(&train, &test_pts);
+        let rmse = truth_rmse(&pred, &test_pts);
+        eprintln!("[#1680] n={N_TRAIN} seed={seed} truth-RMSE={rmse:.4}");
+        sum += rmse;
+        worst = worst.max(rmse);
+    }
+    let mean = sum / SEEDS.len() as f64;
+    eprintln!("[#1680] n={N_TRAIN} mean truth-RMSE={mean:.4} worst={worst:.4}");
+
+    assert!(
+        mean <= MAX_MEAN_RMSE,
+        "additive fit at n={N_TRAIN} recovers truth poorly: mean truth-RMSE {mean:.4} over seeds \
+         {SEEDS:?} exceeds {MAX_MEAN_RMSE:.2} (mgcv select=TRUE REML ≈ 0.05) (#1680)."
     );
 }
