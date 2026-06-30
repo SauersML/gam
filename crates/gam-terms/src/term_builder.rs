@@ -1201,6 +1201,45 @@ fn parse_tensor_periodic_axes(
     Ok(axes)
 }
 
+/// Reject endpoint boundary conditions (`clamped`/`anchored`) requested on a
+/// tensor-product margin.
+///
+/// Tensor smooths support `bc=`/`boundary=` only for *periodic* margin
+/// selection (`periodic`/`cyclic`/`cc`), which [`parse_tensor_periodic_axes`]
+/// consumes. Endpoint boundary conditions are a 1-D B-spline structural
+/// reparameterization and are NOT implemented for tensor margins, but the
+/// periodic-axes parser silently ignores every non-periodic token — so
+/// `te(x, y, bc=['clamped', 'natural'])` used to be accepted as a no-op and
+/// fit an ordinary unconstrained tensor, dropping the user's clamp without a
+/// word. Surface it as a clean, explicit error instead of a silent drop. The
+/// inert margin tokens (`natural`/`free`/`none`/empty) and the periodic
+/// selectors are accepted; anything else is an unsupported endpoint BC.
+fn reject_tensor_endpoint_boundary_conditions(
+    options: &BTreeMap<String, String>,
+    dim: usize,
+) -> Result<(), String> {
+    let Some(raw) = options.get("boundary").or_else(|| options.get("bc")) else {
+        return Ok(());
+    };
+    let entries = parse_option_list(raw);
+    for (axis, value) in entries.iter().enumerate() {
+        let inert = matches!(
+            value.as_str(),
+            "natural" | "free" | "none" | "" | "periodic" | "cyclic" | "cc"
+        );
+        if !inert {
+            return Err(TermBuilderError::unsupported_feature(format!(
+                "tensor smooth margin {axis} endpoint boundary condition '{value}' is not supported \
+                 (got bc/boundary={raw:?} on a {dim}-D tensor); tensor margins accept only periodic \
+                 selection (periodic/cyclic/cc) or the inert natural/free token. Apply clamped/anchored \
+                 endpoint boundary conditions with a 1-D s(x, bc=...) term instead."
+            ))
+            .to_string());
+        }
+    }
+    Ok(())
+}
+
 fn tensor_k_axis_option_axis(
     key: &str,
     cols: &[usize],
@@ -2954,6 +2993,7 @@ pub fn build_smooth_basis(
                 }
             }
             let periodic_axes = parse_tensor_periodic_axes(options, dim)?;
+            reject_tensor_endpoint_boundary_conditions(options, dim)?;
             let periods_opt = parse_periods(options, &periodic_axes)?;
             let origins_opt = parse_period_origins(options, &periodic_axes)?;
             let degree = option_usize(options, "degree").unwrap_or(DEFAULT_BSPLINE_DEGREE);
