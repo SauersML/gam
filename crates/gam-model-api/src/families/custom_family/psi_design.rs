@@ -5,7 +5,7 @@
 //! and the exact-Newton joint-ψ term carriers + workspace traits.
 
 use crate::families::custom_family::family_trait::ExactNewtonJointGradientEvaluation;
-use gam_problem::{CustomFamilyError, DenseMatrixHyperOperator, HyperOperator};
+use gam_problem::{CustomFamilyError, DenseMatrixHyperOperator, EvalMode, HyperOperator};
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
 
@@ -38,6 +38,42 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
     /// Deliberately not called from PIRLS-side workspaces (which never
     /// invoke `directional_derivative_operator` and would pay the prime
     /// cost without ever consuming the cache).
+    ///
+    /// `eval_mode` bounds *which* caches are worth priming for the eval that
+    /// is about to run (gam#979 — large-scale margslope line-search /
+    /// seed-screen cost):
+    ///   * [`EvalMode::ValueOnly`] consumes **no** directional cache — the
+    ///     objective is read straight off the converged inner mode — so a
+    ///     value-only probe (line search, seed screen, continuation pre-warm)
+    ///     should prime nothing.
+    ///   * [`EvalMode::ValueAndGradient`] consumes only the **first** (third-
+    ///     derivative) directional cache, which feeds the REML/LAML gradient's
+    ///     `coord_corrections` IFT-drift trace.
+    ///   * [`EvalMode::ValueGradientHessian`] additionally consumes the
+    ///     **second** (fourth-derivative) directional cache used by the outer
+    ///     Hessian's second-directional pass.
+    /// Priming a cache the mode never reads is pure wasted O(n) work, so under-
+    /// priming is always safe: every cache is a lazy `get_or_compute`, so a
+    /// later consumer (if any) still builds it on demand — just without the
+    /// top-level-rayon fan-out this hook would have given it.
+    fn warm_up_outer_caches_for_mode(&self, eval_mode: EvalMode) -> Result<(), String> {
+        // Legacy default: prime everything (matches the historic
+        // `warm_up_outer_caches` contract) for any workspace that has not
+        // opted into mode-aware priming. Every mode falls through to the same
+        // mode-blind prime; mode-aware workspaces override this method to skip
+        // caches the requested mode never reads.
+        match eval_mode {
+            EvalMode::ValueOnly
+            | EvalMode::ValueAndGradient
+            | EvalMode::ValueGradientHessian => self.warm_up_outer_caches(),
+        }
+    }
+
+    /// Mode-blind warm-up retained for back-compat: primes every directional
+    /// cache the workspace keeps. Production call sites should prefer
+    /// [`Self::warm_up_outer_caches_for_mode`] so value-only probes skip the
+    /// prime entirely. Default impl is a no-op for workspaces with no per-row
+    /// jet cache.
     fn warm_up_outer_caches(&self) -> Result<(), String> {
         Ok(())
     }

@@ -508,6 +508,7 @@ pub(crate) fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + 
     total: usize,
     options: &BlockwiseFitOptions,
     preferred_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+    eval_mode: EvalMode,
 ) -> Result<Option<JointHessianBundle<'a>>, String> {
     // Path 1: exact Newton joint Hessian (preferred).
     let beta_flat = flatten_state_betas(block_states, specs);
@@ -531,8 +532,12 @@ pub(crate) fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + 
     // `par_iter` enjoys full thread-pool parallelism. PIRLS-side workspace
     // construction skips this priming because PIRLS never invokes
     // `directional_derivative_operator`.
+    //
+    // gam#979: pass `eval_mode` so a value-only probe primes nothing and a
+    // first-order eval primes only the gradient's third-derivative cache —
+    // the dominant per-eval O(n) jet pass at biobank scale.
     if let Some(workspace) = hessian_workspace.as_ref() {
-        workspace.warm_up_outer_caches()?;
+        workspace.warm_up_outer_caches_for_mode(eval_mode)?;
     }
     if let Some(curvature) = family.exact_newton_outer_curvature(block_states)? {
         let h_joint_unpen = JointHessianSource::Dense(symmetrized_square_matrix(
