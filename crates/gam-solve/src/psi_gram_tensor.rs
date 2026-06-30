@@ -344,9 +344,45 @@ impl PsiGramTensor {
         psi_hi: f64,
         m: usize,
     ) -> BuildOutcome {
-        // First-kind Chebyshev nodes (no endpoints) and exact design slabs.
+        // #1033 (sufficient-statistic build): the one-time pass must ITSELF be a
+        // sufficient-statistic reduction — it may touch the n data rows once, but
+        // it must never hold or arithmetically process O(n) objects m times. The
+        // earlier build expanded m design-space Chebyshev coefficient SLABS
+        // (`X_d = (γ_d/m) Σ_i X(ψ_i) T_d(x_i)`, each n×k) purely to run a
+        // pre-filter tail certificate, holding all m exact designs AND all m slabs
+        // resident — O(m·n·k) memory (≈157 GB at n=320k, m=513, k=12) and an
+        // O(m²·n·k) coefficient sum that dominated the whole fit's wall-clock and
+        // made the n=320k acceptance sweep un-runnable. None of that O(n) work is
+        // retained: the tensor keeps only the k×k Gram series. So STREAM each
+        // exact node design straight into its weighted k×k sufficient statistic
+        // (Gram `X(ψ_i)ᵀW X(ψ_i)` and RHS `X(ψ_i)ᵀW z`) and DISCARD it before the
+        // next node. Peak memory is O(m·k² + n·k) (one design at a time) and the
+        // only row work is the single O(m·n·k²) node-statistic pass.
         let mut nodes_x = vec![0.0_f64; m];
-        let mut designs: Vec<Array2<f64>> = Vec::with_capacity(m);
+        let mut node_grams: Vec<Array2<f64>> = Vec::with_capacity(m);
+        let mut node_rhs: Vec<Array1<f64>> = Vec::with_capacity(m);
+
+        // Weighted response (n-vector) and zᵀWz, formed once over the data rows.
+        if weights.len() != z.len() || z.is_empty() {
+            return BuildOutcome::EvalFailed(format!(
+                "incompatible build inputs: weights.len()={}, z.len()={}",
+                weights.len(),
+                z.len()
+            ));
+        }
+        let mut wz = Array1::<f64>::zeros(z.len());
+        let mut zt_w_z = 0.0_f64;
+        let mut zt_w_z_comp = 0.0_f64;
+        for ((slot, &w), &zv) in wz.iter_mut().zip(weights.iter()).zip(z.iter()) {
+            *slot = w * zv;
+            let add = w * zv * zv;
+            let y = add - zt_w_z_comp;
+            let t = zt_w_z + y;
+            zt_w_z_comp = (t - zt_w_z) - y;
+            zt_w_z = t;
+        }
+
+        let mut dims: Option<(usize, usize)> = None;
         for (i, x_slot) in nodes_x.iter_mut().enumerate() {
             let x = (std::f64::consts::PI * (2 * i + 1) as f64 / (2 * m) as f64).cos();
             *x_slot = x;
@@ -364,98 +400,38 @@ impl PsiGramTensor {
                     "design at node ψ={psi:.6} contains a non-finite entry"
                 ));
             }
-            designs.push(design);
-        }
-        let (n, k) = designs[0].dim();
-        if designs.iter().any(|d| d.dim() != (n, k)) {
-            return BuildOutcome::EvalFailed(format!(
-                "design dimensions vary across ψ nodes (first node is {n}×{k})"
-            ));
-        }
-        if weights.len() != n || z.len() != n || n == 0 || k == 0 {
-            return BuildOutcome::EvalFailed(format!(
-                "incompatible build inputs: design {n}×{k}, weights.len()={}, z.len()={}",
-                weights.len(),
-                z.len()
-            ));
-        }
-        // First-kind discrete orthogonality: coefficient slabs
-        //   X_d = (γ_d / m) Σ_i X(ψ_i) T_d(x_i),  γ_0 = 1, γ_d = 2.
-        let t_at_nodes: Vec<Vec<f64>> = nodes_x.iter().map(|&x| cheb_t(x, m)).collect();
-        let mut coeff_slabs: Vec<Array2<f64>> = Vec::with_capacity(m);
-        for d in 0..m {
-            let gamma = if d == 0 { 1.0 } else { 2.0 };
-            let mut slab = Array2::<f64>::zeros((n, k));
-            let mut slab_comp = Array2::<f64>::zeros((n, k));
-            for (i, design) in designs.iter().enumerate() {
-                let wgt = gamma / m as f64 * t_at_nodes[i][d];
-                kahan_scaled_add_array2(&mut slab, &mut slab_comp, wgt, design);
-            }
-            coeff_slabs.push(slab);
-        }
-        // Tail-decay certificate per design column: the trailing quarter of the
-        // coefficient slabs must fall below [`PSI_GRAM_CERT_RTOL`] × column
-        // scale.
-        //
-        // #1216: on the WIDE STANDARDIZED geometry default 1-D fits use (#1215)
-        // the per-column Chebyshev tail decays cleanly but GEOMETRICALLY-SLOWLY
-        // (measured ~3.2e-8 at m=33, ~2.3e-11 at m=65 — a ~1300×/doubling decay,
-        // NOT a floor). The previous over-tight 1e-12 bar refused at m=65 and the
-        // n-free fast path never attached. The certificate is a cheap
-        // NECESSARY-CONDITION pre-filter whose job is to guarantee the ASSEMBLED
-        // Gram is accurate enough; that accuracy is authoritatively enforced by
-        // the off-node `spot_check` (`PSI_GRAM_SPOT_RTOL`, on the assembled Gram
-        // against an exact rebuild). Sizing the pre-filter to
-        // [`PSI_GRAM_CERT_RTOL`] = 1e-9 lets the (geometrically-decaying) design
-        // certify at m=65, and the ladder's m=129 rung drives the residual to
-        // ~1.7e-14 so the inner penalized solve's conditioning-amplified β̂ stays
-        // bit-tight. A design that is genuinely non-analytic (a true kink) floors
-        // ORDERS above this and is refused, with the spot-check as the hard
-        // backstop.
-        let mut col_scale = vec![0.0_f64; k];
-        for slab in &coeff_slabs {
-            for (j, scale) in col_scale.iter_mut().enumerate() {
-                for i in 0..n {
-                    *scale = scale.max(slab[[i, j]].abs());
+            let (dn, dk) = design.dim();
+            match dims {
+                None => {
+                    if weights.len() != dn || z.len() != dn || dn == 0 || dk == 0 {
+                        return BuildOutcome::EvalFailed(format!(
+                            "incompatible build inputs: design {dn}×{dk}, weights.len()={}, z.len()={}",
+                            weights.len(),
+                            z.len()
+                        ));
+                    }
+                    dims = Some((dn, dk));
                 }
-            }
-        }
-        let tail_start = m - (m / 4).max(1);
-        for slab in coeff_slabs.iter().skip(tail_start) {
-            for (j, &scale) in col_scale.iter().enumerate() {
-                let bound = PSI_GRAM_CERT_RTOL * scale.max(1e-300);
-                for i in 0..n {
-                    if slab[[i, j]].abs() > bound {
-                        return BuildOutcome::TailNotCertified;
+                Some((n0, k0)) => {
+                    if (dn, dk) != (n0, k0) {
+                        return BuildOutcome::EvalFailed(format!(
+                            "design dimensions vary across ψ nodes (first node is {n0}×{k0}, \
+                             node ψ={psi:.6} is {dn}×{dk})"
+                        ));
                     }
                 }
             }
-        }
-        let mut wz = Array1::<f64>::zeros(z.len());
-        let mut zt_w_z = 0.0_f64;
-        let mut zt_w_z_comp = 0.0_f64;
-        for ((slot, &w), &zv) in wz.iter_mut().zip(weights.iter()).zip(z.iter()) {
-            *slot = w * zv;
-            let add = w * zv * zv;
-            let y = add - zt_w_z_comp;
-            let t = zt_w_z + y;
-            zt_w_z_comp = (t - zt_w_z) - y;
-            zt_w_z = t;
-        }
-        // One-time exact node sufficient statistics, then a first-kind DCT in ψ.
-        // This still pays all row work only during build, but the retained series
-        // approximates G(ψ) and c(ψ) directly instead of multiplying two
-        // separately truncated design series.
-        let mut node_grams: Vec<Array2<f64>> = Vec::with_capacity(m);
-        let mut node_rhs: Vec<Array1<f64>> = Vec::with_capacity(m);
-        for design in &designs {
+            // Weighted Gram / RHS at this node, then the n×k design is dropped.
             let mut wd = design.clone();
             for (mut row, &w) in wd.outer_iter_mut().zip(weights.iter()) {
                 row.mapv_inplace(|v| v * w);
             }
             node_grams.push(design.t().dot(&wd));
-            node_rhs.push(design.t().dot(&wz));
+            node_rhs.push(wd.t().dot(&z));
         }
+        let (_n, k) = dims.expect("node ladder rung m≥1 yields at least one design");
+        // First-kind discrete orthogonality of the Chebyshev nodes.
+        let t_at_nodes: Vec<Vec<f64>> = nodes_x.iter().map(|&x| cheb_t(x, m)).collect();
         let mut gram: Vec<Array2<f64>> = (0..m).map(|_| Array2::<f64>::zeros((k, k))).collect();
         let mut gram_comp: Vec<Array2<f64>> =
             (0..m).map(|_| Array2::<f64>::zeros((k, k))).collect();
@@ -471,8 +447,43 @@ impl PsiGramTensor {
         }
         drop(node_grams);
         drop(node_rhs);
-        drop(designs);
-        drop(coeff_slabs);
+
+        // Tail-decay certificate, now in k-SPACE on the RETAINED Gram/RHS series
+        // rather than the discarded design slabs.
+        //
+        // The series the per-trial path actually evaluates is the assembled Gram
+        // `G(ψ) = Σ_d gram[d] T_d(x(ψ))` and RHS `c(ψ) = Σ_d rhs[d] T_d(x(ψ))`;
+        // their Chebyshev coefficients are exactly what govern the truncated
+        // reconstruction error, so the cheap NECESSARY-CONDITION pre-filter
+        // belongs on THEM, not on the design X(ψ) (whose coefficients only bound
+        // G's tail indirectly, and at O(m·n·k) cost). The trailing quarter of the
+        // Gram (and RHS) coefficient slabs must fall below [`PSI_GRAM_CERT_RTOL`]
+        // × series scale.
+        //
+        // #1216: on the WIDE STANDARDIZED geometry default 1-D fits use (#1215)
+        // the tail decays cleanly but GEOMETRICALLY-SLOWLY, so the m=513 top rung
+        // is sized to drive the residual far below the bar. The certificate stays
+        // a necessary pre-filter; accuracy is authoritatively enforced by the
+        // off-node `spot_check` (`PSI_GRAM_SPOT_RTOL`, assembled Gram vs an exact
+        // rebuild). A genuinely non-analytic design (a true kink) floors ORDERS
+        // above this — its Gram series tail does NOT decay — and is refused here,
+        // with the spot-check as the hard backstop.
+        let gram_scale = gram.iter().fold(0.0_f64, |acc, slab| {
+            acc.max(slab.iter().fold(0.0_f64, |a, &v| a.max(v.abs())))
+        });
+        let rhs_scale = rhs.iter().fold(0.0_f64, |acc, slab| {
+            acc.max(slab.iter().fold(0.0_f64, |a, &v| a.max(v.abs())))
+        });
+        let tail_start = m - (m / 4).max(1);
+        let gram_bound = PSI_GRAM_CERT_RTOL * gram_scale.max(1e-300);
+        let rhs_bound = PSI_GRAM_CERT_RTOL * rhs_scale.max(1e-300);
+        for d in tail_start..m {
+            if gram[d].iter().any(|&v| v.abs() > gram_bound)
+                || rhs[d].iter().any(|&v| v.abs() > rhs_bound)
+            {
+                return BuildOutcome::TailNotCertified;
+            }
+        }
         BuildOutcome::Candidate(Self {
             psi_lo,
             psi_hi,
