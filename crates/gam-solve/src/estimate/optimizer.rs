@@ -1407,19 +1407,71 @@ where
             // score that stripping would undo.
             {
                 let well_determined = n_design_rows >= 2 * p;
+                // ELIGIBLE COORDINATES: every RELAXED smoothing coordinate in the
+                // well-determined `Independent` prior — BOTH the null-space
+                // shrinkage selection coordinate (`is_nullspace_degeneracy_prior`,
+                // the wide `Normal(0,15)` degeneracy breaker) AND the BENDING
+                // (wiggliness) coordinate (relaxed to `Flat`).
+                //
+                // The bending coordinate is the load-bearing addition (#1266
+                // "Half A"). `relax_smoothing_rho_prior` frees a well-determined
+                // B-spline-family smooth's bending log-λ to `Flat` so that pure
+                // REML — not the prior — picks it (matching mgcv). On linear /
+                // weakly-curved data pure REML wants λ_bend → ∞ (the bending
+                // 2nd-difference penalty annihilates {1, x}, so a huge λ_bend
+                // removes only spurious wiggle and leaves the linear null space
+                // at EDF 2). MEASURED: a flat-prior-everywhere fit rails λ_bend to
+                // 1e9–1e13 and lands EDF ≈ 2.00 on every seed. But the production
+                // `Independent` prior also places the `Normal(0,15)` degeneracy
+                // breaker on the SAME term's null-space coordinate; that prior's
+                // curvature perturbs the JOINT outer BFGS so it certifies
+                // termination with λ_bend still at a moderate ≈2e5 (EDF ≈ 3–5) —
+                // the bending coordinate stalls short of its own pure-REML optimum.
+                // The escape line-searches it the rest of the way OUT on the pure
+                // (prior-stripped) REML cost, with the SAME self-validating guards
+                // used for the null coordinate (strict pure-REML improvement +
+                // total-EDF-non-increase + cold confirmation):
+                //   * LINEAR / weakly-curved smooth (#1266 Half A, #1271): pure
+                //     REML strictly descends toward λ_bend → ∞ and total EDF drops
+                //     (only spurious wiggle is removed) → the escape fires, EDF → 2.
+                //   * GENUINELY WIGGLY smooth (the supported `s(x)` on `sin(6x)`):
+                //     pure REML has an interior optimum in λ_bend, so over-smoothing
+                //     strictly RAISES it (real curvature dumped into σ̂²) → no strict
+                //     improvement → exact no-op. The supported signal is preserved.
+                // Within an `Independent` prior a per-coordinate `Flat` is, by
+                // construction, exactly a relaxed bending coordinate: a fully-`Flat`
+                // BASE prior is returned un-wrapped (never `Independent`), so the
+                // only way a coordinate reads `Flat` inside `Independent` is the
+                // relaxation having freed it.
                 let select_coords: Vec<usize> = if well_determined {
-                    match reml_state.effective_rho_prior().as_ref() {
-                        gam_problem::RhoPrior::Independent(per_coord) => {
-                            (0..strategy_result.rho.len())
-                                .filter(|&i| {
-                                    per_coord.get(i).is_some_and(
-                                        gam_terms::smooth::is_nullspace_degeneracy_prior,
-                                    )
+                    // The BENDING (range-space wiggliness) coordinates are those the
+                    // orchestration relaxed to `Flat` — recovered from the CONFIGURED
+                    // prior's firth-default mask (in the post-resolution
+                    // `effective_rho_prior` a `Flat` coordinate has been rewritten to
+                    // the firth-default `PenalizedComplexity` and is no longer
+                    // distinguishable as relaxed). The NULL-SPACE shrinkage selection
+                    // coordinates carry the wide `Normal(0,15)` degeneracy breaker,
+                    // detected on the effective prior.
+                    let bend_mask = reml_state.firth_default_coord_mask(strategy_result.rho.len());
+                    let null_is_degeneracy: Vec<bool> =
+                        match reml_state.effective_rho_prior().as_ref() {
+                            gam_problem::RhoPrior::Independent(per_coord) => (0..strategy_result
+                                .rho
+                                .len())
+                                .map(|i| {
+                                    per_coord.get(i).is_some_and(|p| {
+                                        gam_terms::smooth::is_nullspace_degeneracy_prior(p)
+                                    })
                                 })
-                                .collect()
-                        }
-                        _ => Vec::new(),
-                    }
+                                .collect(),
+                            _ => vec![false; strategy_result.rho.len()],
+                        };
+                    (0..strategy_result.rho.len())
+                        .filter(|&i| {
+                            bend_mask.get(i).copied().unwrap_or(false)
+                                || null_is_degeneracy.get(i).copied().unwrap_or(false)
+                        })
+                        .collect()
                 } else {
                     Vec::new()
                 };
@@ -1435,6 +1487,18 @@ where
                         .cost();
                 let base_pure = strategy_result.final_value - conv_prior;
                 if !select_coords.is_empty() && base_pure.is_finite() && conv_prior.is_finite() {
+                    // Drop the coarse inner-PIRLS cap the outer-aware schedule left
+                    // behind (path #3: a fast-converging outer loop ends on a 5/10/20
+                    // inner-iteration cap, not the full budget). Every escape
+                    // evaluation below — `edf_conv`, the cold over-smoothing probes,
+                    // and `edf_best` — MUST run the inner β to full tolerance, else
+                    // the EDF read at a high-λ shrink-out point is a coarse-cap
+                    // artifact (β not converged → EDF spuriously railed near the
+                    // interpolation limit), which would make the parsimony guard
+                    // veto a genuine shrink-out. Resetting the cap here makes
+                    // `compute_cost` / `obtain_eval_bundle` solve to `tol`.
+                    reml_state.outer_inner_cap.store(0, Ordering::Relaxed);
+                    reml_state.reset_outer_seed_state();
                     // Converged-point total inner EDF, for the PARSIMONY guard below.
                     // The inner P-IRLS solve at the converged ρ is cached, so this is
                     // free. A genuine #1266 shrink-out (an UNSUPPORTED, uncorrelated
@@ -1465,6 +1529,13 @@ where
                         }
                         Some(c - prior)
                     };
+                    // Re-establish the pure-REML baseline at FULL inner tolerance (the
+                    // cap was just dropped above). The pre-cap-reset `base_pure` from
+                    // `final_value` may carry a coarse-cap inner solve; re-scoring the
+                    // converged ρ here makes the strict-improvement test below compare
+                    // converged-vs-converged costs. Falls back to the prior `base_pure`
+                    // if the re-score is unavailable.
+                    let base_pure = pure_reml(&strategy_result.rho).unwrap_or(base_pure);
                     // Ascending over-smoothing grid in ABSOLUTE ρ (toward the
                     // shrink-out rail at `RHO_BOUND`); only values strictly above a
                     // coordinate's current ρ are over-smoothing candidates. Bounded:
@@ -1472,37 +1543,79 @@ where
                     // null-space coordinate is actually held below the rail.
                     let rho_upper = crate::estimate::RHO_BOUND;
                     const OUTWARD_GRID: [f64; 6] = [6.0, 9.0, 12.0, 18.0, 24.0, 30.0];
+                    // INDEPENDENT COLD per-coordinate over-smoothing search.
+                    //
+                    // Each candidate is scored from a FRESHLY-RESET inner state with
+                    // ONLY ONE selection coordinate raised above its converged ρ. This
+                    // is essential for a MULTI-TERM fit (#1266 Half B: `s(x)+s(z)` with
+                    // a SUPPORTED wiggly `s(x)` beside an UNSUPPORTED `s(z)`):
+                    //   * over-smoothing a coordinate of the SUPPORTED term strictly
+                    //     RAISES pure REML (real signal dumped into σ̂²) → rejected;
+                    //   * over-smoothing the UNSUPPORTED term's null-space coordinate
+                    //     strictly LOWERS pure REML (its penalty-determinant cost was
+                    //     not buying any fit) → accepted, shrinking that term out.
+                    // The earlier WARM coupled coordinate-descent bundled the two: its
+                    // warm-start pollution manufactured a spurious joint cliff that
+                    // raised the supported term's λ too, producing an interpolating
+                    // (EDF-inflated) point the parsimony guard then vetoed — so an
+                    // unsupported term that pure REML genuinely wants shrunk was left
+                    // under-shrunk. Scoring each coordinate independently AND cold
+                    // isolates exactly the coordinates pure REML wants over-smoothed.
+                    //
+                    // Cost: at most |select|·|grid| cold inner solves, only on a
+                    // well-determined relaxed double-penalty fit after convergence.
+                    let pure_reml_cold = |rho: &Array1<f64>| -> Option<f64> {
+                        reml_state.reset_outer_seed_state();
+                        pure_reml(rho)
+                    };
                     let mut best_rho = strategy_result.rho.clone();
-                    let mut best_pure = base_pure;
                     let mut improved = false;
-                    for _pass in 0..2 {
-                        let mut pass_improved = false;
-                        for &coord in &select_coords {
-                            let mut local_best = best_rho.clone();
-                            let mut local_pure = best_pure;
-                            for &cand in &OUTWARD_GRID {
-                                let target = cand.min(rho_upper);
-                                if target <= best_rho[coord] + 1e-9 {
-                                    continue;
-                                }
-                                let mut probe = best_rho.clone();
-                                probe[coord] = target;
-                                if let Some(c) = pure_reml(&probe)
-                                    && c < local_pure - 1e-6 * (1.0 + local_pure.abs())
-                                {
-                                    local_pure = c;
-                                    local_best = probe;
-                                }
+                    for &coord in &select_coords {
+                        let mut coord_target = strategy_result.rho[coord];
+                        // A coordinate's over-smoothing is accepted only if, scored
+                        // COLD with that single coordinate raised from the converged ρ:
+                        //   (1) pure REML strictly beats the converged pure baseline
+                        //       (distinguishes a SUPPORTED term — over-smoothing raises
+                        //       its cost — from an UNSUPPORTED one), AND
+                        //   (2) the total inner EDF does NOT exceed the converged EDF.
+                        // Guard (2) is BOTH the #1476 parsimony rule (over-smoothing a
+                        // coordinate adds shrinkage, so it can only LOWER total EDF; a
+                        // reported INCREASE is a concurvity transfer that must be
+                        // refused) AND a numerical-sanity filter: at the ρ rail
+                        // (λ ≳ 1e10) the hat-matrix EDF trace loses precision and
+                        // reports a spurious EDF far above the design's column count.
+                        // Rejecting any EDF-increasing probe discards exactly those
+                        // numerically-broken rail rungs while keeping the stable ones
+                        // (λ ≲ 1e8 already annihilates any unsupported direction), so
+                        // the deepest numerically-sound shrink is selected.
+                        let mut coord_pure = base_pure;
+                        for &cand in &OUTWARD_GRID {
+                            let target = cand.min(rho_upper);
+                            if target <= strategy_result.rho[coord] + 1e-9 {
+                                continue;
                             }
-                            if local_pure < best_pure - 1e-6 * (1.0 + best_pure.abs()) {
-                                best_rho = local_best;
-                                best_pure = local_pure;
-                                improved = true;
-                                pass_improved = true;
+                            let mut probe = strategy_result.rho.clone();
+                            probe[coord] = target;
+                            let c = pure_reml_cold(&probe);
+                            let edf_here = reml_state
+                                .obtain_eval_bundle(&probe)
+                                .ok()
+                                .map(|b| b.pirls_result.edf);
+                            let edf_sane = match (edf_here, edf_conv) {
+                                (Some(e), Some(ec)) => e.is_finite() && e <= ec + 1e-6,
+                                _ => false,
+                            };
+                            if let Some(c) = c
+                                && edf_sane
+                                && c < coord_pure - 1e-6 * (1.0 + coord_pure.abs())
+                            {
+                                coord_pure = c;
+                                coord_target = target;
                             }
                         }
-                        if !pass_improved {
-                            break;
+                        if coord_target > strategy_result.rho[coord] + 1e-9 {
+                            best_rho[coord] = coord_target;
+                            improved = true;
                         }
                     }
                     if improved {
