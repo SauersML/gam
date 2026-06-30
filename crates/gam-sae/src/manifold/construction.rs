@@ -3686,6 +3686,18 @@ impl SaeManifoldTerm {
                 self.k_atoms()
             ));
         }
+        // `lambda_smooth` is indexed per-atom in the smoothness gradient/curvature
+        // assembly (`lambda_smooth[atom_idx]`); a too-short vector (e.g. a growth
+        // move that grew `k_atoms()` without extending ρ — #1556) would panic deep
+        // in the assembly loop with an opaque index-out-of-bounds. Validate it here
+        // alongside `log_ard` so the contract violation surfaces as a clear Err.
+        if rho.log_lambda_smooth.len() != self.k_atoms() {
+            return Err(format!(
+                "SaeManifoldTerm::assemble_arrow_schur: log_lambda_smooth length {} != K {}",
+                rho.log_lambda_smooth.len(),
+                self.k_atoms()
+            ));
+        }
         for (atom_idx, coord) in self.assignment.coords.iter().enumerate() {
             let ard_len = rho.log_ard[atom_idx].len();
             let d = coord.latent_dim();
