@@ -30,6 +30,25 @@ fn sae_set_ibp_alpha(alpha: f64) {
     gam::terms::sae::assignment::set_ibp_alpha_override(alpha);
 }
 
+/// #1689 — adjust the process-global stderr log verbosity at runtime. The
+/// extension installs the logger at module import defaulting to `warn` (a fit
+/// no longer floods stderr with thousands of per-iteration progress lines); a
+/// caller that wants the chatter back opts in with
+/// `gamfit.set_log_level("info")` (or `debug`/`trace`), and `off`/`silent`
+/// quiets it entirely. Accepts the standard `off|error|warn|info|debug|trace`
+/// spellings (case-insensitive); an unrecognized value raises `ValueError`.
+#[pyfunction]
+fn set_log_level(level: &str) -> PyResult<()> {
+    let parsed = gam::solver::progress_log::parse_log_level(level).ok_or_else(|| {
+        py_value_error(format!(
+            "unrecognized log level {level:?}; expected one of \
+             off|error|warn|info|debug|trace"
+        ))
+    })?;
+    gam::solver::progress_log::set_log_level(parsed);
+    Ok(())
+}
+
 #[pyfunction(signature = (points, mode = "kneedle", knee_slope_fraction = 0.10, complexity_penalty = 0.05, flat_span_tol = 1.0e-6))]
 fn sae_select_k(
     py: Python<'_>,
@@ -4177,6 +4196,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(equivariant_gauge_companion_loss, module)?)?;
     module.add_function(wrap_pyfunction!(sae_set_barrier_overrides, module)?)?;
     module.add_function(wrap_pyfunction!(sae_set_ibp_alpha, module)?)?;
+    module.add_function(wrap_pyfunction!(set_log_level, module)?)?;
     module.add_function(wrap_pyfunction!(sae_select_k, module)?)?;
     module.add_function(wrap_pyfunction!(sae_auto_k_recommendation, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit, module)?)?;

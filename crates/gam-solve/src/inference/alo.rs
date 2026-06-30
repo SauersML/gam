@@ -665,8 +665,9 @@ fn log_leverage_diagnostics(leverage: &Array1<f64>, phi: f64) {
     let a_max = finite_leverage.last().copied().unwrap_or(0.0);
 
     // Routine per-ALO leverage summary: a diagnostic snapshot, not an
-    // anomaly. Emitted at `info!` so it is visible under `GAM_LOG=info` but
-    // silent at the default `Warn` level (genuine anomalies — invalid / very
+    // anomaly. Emitted at `info!` so it is visible when the host raises
+    // verbosity (CLI `-v`; `gamfit.set_log_level("info")`) but silent at the
+    // default `Warn` level (genuine anomalies — invalid / very
     // high leverage — are logged at `warn!` above and stay visible). This
     // line fires once per ALO computation, which recurs across the outer
     // smoothing loop, so at `warn!` it was a dominant source of stderr noise

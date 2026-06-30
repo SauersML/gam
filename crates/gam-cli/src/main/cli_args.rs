@@ -8,6 +8,35 @@ use super::*;
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Command,
+    /// Increase stderr log verbosity (repeatable): `-v` = info, `-vv` = debug,
+    /// `-vvv` = trace. The default is quiet (warnings + errors only) so a fit
+    /// doesn't flood the terminal with per-iteration progress chatter (#1689).
+    #[arg(
+        short = 'v',
+        long = "verbose",
+        action = clap::ArgAction::Count,
+        global = true,
+        conflicts_with = "quiet"
+    )]
+    pub(crate) verbose: u8,
+    /// Decrease stderr log verbosity (repeatable): `-q` = errors only,
+    /// `-qq` = silent. Mutually exclusive with `-v`.
+    #[arg(
+        short = 'q',
+        long = "quiet",
+        action = clap::ArgAction::Count,
+        global = true
+    )]
+    pub(crate) quiet: u8,
+}
+
+impl Cli {
+    /// Signed verbosity delta relative to the default level: positive for each
+    /// `-v`, negative for each `-q`. Fed to
+    /// [`gam::progress_log::level_from_verbosity_delta`].
+    pub(crate) fn verbosity_delta(&self) -> i32 {
+        i32::from(self.verbose) - i32::from(self.quiet)
+    }
 }
 
 #[derive(Subcommand, Debug)]
