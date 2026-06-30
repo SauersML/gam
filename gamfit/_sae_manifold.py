@@ -24,10 +24,20 @@ _ASSIGNMENT_KINDS: dict[str, str] = {
     "jumprelu": "jumprelu",
 }
 
+# Public assignment-kind aliases (issue #159). Every spelling a user may pass
+# to either `assignment=` or `assignment_prior=` normalizes to one canonical
+# Rust kind through `_canonical_public_assignment`, so the two kwargs share ONE
+# validator and one alias table — `assignment_prior="ibp"` behaves identically
+# to `assignment="ibp"`. The bare canonical names are included so the table is
+# its own identity map.
 _PUBLIC_ASSIGNMENT_KINDS: dict[str, str] = {
     "ibp_map": "ibp_map",
+    "ibp": "ibp_map",
+    "ibp-map": "ibp_map",
     "softmax": "softmax",
     "jumprelu": "jumprelu",
+    "jump_relu": "jumprelu",
+    "gated": "jumprelu",
 }
 
 
@@ -2737,12 +2747,17 @@ def gumbel_reciprocal_iter_schedule(tau_start: float, tau_min: float, iter_count
 
 
 _TOPOLOGY_UNSET: Any = object()
+# Sentinel for kwarg aliases that must distinguish "not supplied" from any
+# real value (including 0 / "") so conflict detection only fires when BOTH
+# members of an alias pair were actually passed (issues #159, #160).
+_ALIAS_UNSET: Any = object()
 
 
 def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_topology: Any = _TOPOLOGY_UNSET,
                      assignment: str = "ibp_map", schedule: GumbelTemperatureSchedule | Mapping[str, Any] | None = None,
                      isometry_weight: float = 0.0, ard_per_atom: bool = True,
                      decoder_feature_sparsity_groups: list[list[int]] | None = None, n_iter: int = 50, *,
+                     assignment_prior: Any = _ALIAS_UNSET, n_atoms: Any = _ALIAS_UNSET,
                      sparsity_weight: float = 1.0,
                      gate_sparsity: str = "scad", scad_mcp_gamma: float | None = None,
                      smoothness_weight: float = 1.0,
@@ -2763,7 +2778,11 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         or 2D numeric array; 1D input is reshaped to ``(N, 1)``.
     K
         Number of atoms. Must be positive, and the training set must satisfy
-        ``N > K``.
+        ``N > K``. ``n_atoms`` is an exact alias; supplying both with different
+        values raises ``ValueError`` (issue #160).
+    n_atoms
+        Alias for ``K`` (issue #160). Pass at most one of ``K`` / ``n_atoms``;
+        if both are given they must be equal.
     d_atom
         Intrinsic coordinate dimension per atom. Pass an int for a shared
         dimension or a length-``K`` iterable for heterogeneous atoms. ``None``
@@ -2784,7 +2803,16 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     assignment
         Assignment/gating family. ``"ibp_map"`` uses the IBP-MAP gate path,
         ``"softmax"`` uses soft mixture masses, and ``"jumprelu"`` uses the
-        JumpReLU hard-gate family.
+        JumpReLU hard-gate family. Aliases are accepted and normalized:
+        ``"ibp"`` / ``"ibp-map"`` → ``"ibp_map"``, ``"gated"`` / ``"jump_relu"``
+        → ``"jumprelu"``. ``assignment_prior`` is an exact alias for this
+        argument (issue #159).
+    assignment_prior
+        Alias for ``assignment`` (issue #159); normalized through the same
+        validator, so ``assignment_prior="ibp"`` behaves identically to
+        ``assignment="ibp"``. Pass at most one of ``assignment`` /
+        ``assignment_prior``; supplying both with values that resolve to
+        different canonical kinds raises ``ValueError``.
     schedule
         Optional :class:`GumbelTemperatureSchedule` or mapping forwarded to the
         IBP/Gumbel assignment path.
@@ -2924,6 +2952,39 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     if X is None:
         raise TypeError("sae_manifold_fit requires X input array")
     x = _as_2d_float(X, "X")
+
+    # ---- kwarg-alias resolution (issues #159, #160) ----------------------
+    # `assignment` / `assignment_prior` and `K` / `n_atoms` are documented
+    # aliases. Resolve each pair through ONE code path so the two spellings
+    # behave identically, and raise an eager `ValueError` naming both when
+    # they are supplied with conflicting values — never let a conflict slip
+    # silently into Rust (which previously surfaced as a cryptic Schur
+    # Cholesky failure for assignment, or an ambiguous silent winner for K).
+    if assignment_prior is not _ALIAS_UNSET:
+        prior_kind = _canonical_public_assignment(assignment_prior)
+        # `assignment` carries the default "ibp_map" when the caller did not
+        # pass it, so only treat it as a real conflict if the canonical kinds
+        # actually disagree.
+        assignment_kind_resolved = _canonical_public_assignment(assignment)
+        if prior_kind != assignment_kind_resolved:
+            raise ValueError(
+                "sae_manifold_fit: assignment and assignment_prior both supplied "
+                f"with conflicting values ({assignment!r} -> {assignment_kind_resolved!r} "
+                f"vs {assignment_prior!r} -> {prior_kind!r}); pass only one "
+                "(they are aliases)."
+            )
+        assignment = assignment_prior
+    if n_atoms is not _ALIAS_UNSET:
+        n_atoms_int = int(n_atoms)
+        if K is not None and int(K) != n_atoms_int:
+            raise ValueError(
+                f"sae_manifold_fit: K and n_atoms both supplied with different "
+                f"values ({int(K)} vs {n_atoms_int}); pass only one "
+                "(they are aliases)."
+            )
+        K = n_atoms_int
+    # ----------------------------------------------------------------------
+
     k_atoms = int(K if K is not None else 0)
     max_iter_total = int(n_iter)
     smoothness = float(smoothness_weight)
