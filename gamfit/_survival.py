@@ -114,6 +114,13 @@ def competing_risks_cif(
         cumulative_hazards,
         names,
     )
+    # The FFI returns the cause-specific CIFs as a Python list of per-endpoint
+    # ``(n_rows, n_times)`` arrays; stack them into a single dense
+    # ``(n_endpoints, n_rows, n_times)`` array so the dataclass field exposes a
+    # numpy surface (``.shape``, ``.sum(axis=0)``) like ``overall_survival``.
+    import numpy as np
+
+    cif = np.asarray(cif, dtype=float)
     return CompetingRisksCIF(
         times=times_arr,
         cif=cif,
@@ -254,6 +261,19 @@ class SurvivalPrediction:
             )
         return self._survival_block(params, times_arr)
 
+    def failure_at(self, times: Any) -> Any:
+        """Failure probability ``F(t) = 1 - S(t)`` at the requested times.
+
+        The complement of :meth:`survival_at`, sharing the same surface
+        interpolation / auto-chunking and ``(n_rows, n_times)`` layout. For a
+        single-event model this is the cumulative incidence of the modeled
+        event.
+        """
+        import numpy as np
+
+        survival = np.asarray(self.survival_at(times), dtype=float)
+        return 1.0 - survival
+
     def survival_se_at(self, times: Any) -> Any | None:
         if self.survival_se is None:
             return None
@@ -284,8 +304,6 @@ class SurvivalPrediction:
                 clip_hi,
                 DEFAULT_SURVIVAL_PEOPLE_CHUNK,
                 DEFAULT_SURVIVAL_TIME_GRID_CHUNK,
-                left_value,
-                right_value,
             )
         return _interpolate_rows(
             grid,

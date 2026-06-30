@@ -925,7 +925,11 @@ fn extract_row_ids(
                 "row {row_idx} is missing id_column '{id_column}' at index {index}"
             ))
         })?;
-        row_ids.push(value.clone());
+        // A string/categorical id column arrives sentinel-prefixed from the
+        // Python `normalize_table` layer (#1317 leading-NUL marks dtype intent).
+        // The passthrough must echo the user's original label, so strip the
+        // sentinel exactly as the level-inference path does before recording it.
+        row_ids.push(gam::data::strip_categorical_sentinel(value).0.to_string());
     }
     Ok(Some(row_ids))
 }
