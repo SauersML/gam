@@ -4445,20 +4445,13 @@ pub fn plan_joint_spatial_centers_for_term_blocks(
     Ok(planned_blocks)
 }
 
-/// Compute a data-driven initial length scale from the per-axis range of the
-/// feature columns. The heuristic `max_range / sqrt(n)` puts the kernel on
-/// the wiggly side of REML's basin so the optimizer can grow it back if the
-/// signal is smooth, but is small enough that high-frequency truths remain
-/// reachable for smoother kernels (ν ≥ 5/2). Clamped to a tiny positive
-/// floor so degenerate constant-input columns can't produce 0.
-pub fn auto_initial_length_scale(data: ArrayView2<'_, f64>, feature_cols: &[usize]) -> f64 {
-    /// Tiny positive floor for the auto length scale, guarding against a zero
-    /// kernel range when every feature column is (near-)constant.
-    const LENGTH_SCALE_FLOOR: f64 = 1e-6;
-    let n = data.nrows();
-    if n == 0 || feature_cols.is_empty() {
-        return 1.0;
-    }
+/// Tiny positive floor for the auto length scale, guarding against a zero
+/// kernel range when every feature column is (near-)constant.
+const AUTO_LENGTH_SCALE_FLOOR: f64 = 1e-6;
+
+/// Widest per-axis range of the selected feature columns. Returns `None` when
+/// every selected column is constant / non-finite (no usable spatial scale).
+fn feature_columns_max_range(data: ArrayView2<'_, f64>, feature_cols: &[usize]) -> Option<f64> {
     let mut max_range = 0.0_f64;
     for &c in feature_cols {
         if c >= data.ncols() {
@@ -4484,11 +4477,87 @@ pub fn auto_initial_length_scale(data: ArrayView2<'_, f64>, feature_cols: &[usiz
             }
         }
     }
-    if !max_range.is_finite() || max_range <= 0.0 {
+    if max_range.is_finite() && max_range > 0.0 {
+        Some(max_range)
+    } else {
+        None
+    }
+}
+
+/// Compute a data-driven initial length scale from the per-axis range of the
+/// feature columns. The heuristic `max_range / sqrt(n)` puts the kernel on
+/// the wiggly side of REML's basin so the optimizer can grow it back if the
+/// signal is smooth, but is small enough that high-frequency truths remain
+/// reachable for smoother kernels (ν ≥ 5/2). Clamped to a tiny positive
+/// floor so degenerate constant-input columns can't produce 0.
+pub fn auto_initial_length_scale(data: ArrayView2<'_, f64>, feature_cols: &[usize]) -> f64 {
+    let n = data.nrows();
+    if n == 0 || feature_cols.is_empty() {
         return 1.0;
     }
+    let Some(max_range) = feature_columns_max_range(data, feature_cols) else {
+        return 1.0;
+    };
     let init = max_range / (n as f64).sqrt();
-    init.max(LENGTH_SCALE_FLOOR).min(max_range)
+    init.max(AUTO_LENGTH_SCALE_FLOOR).min(max_range)
+}
+
+/// Density-adaptive auto length scale for a kernel basis with `num_centers`
+/// requested centers (#1731).
+///
+/// The plain [`auto_initial_length_scale`] seed `max_range / sqrt(n)` is the
+/// fill distance of the *n data points*; it is independent of the requested
+/// center count `k`. For a radial kernel at a FIXED length scale, packing more
+/// centers into the same cloud makes neighbouring basis functions overlap and
+/// go numerically collinear, so the realized basis saturates in rank (the
+/// `matern_rank_reduce_centers` cap) and a richer `k` becomes a no-op — or even
+/// shrinks the basis. The kernel stays well-conditioned only while the length
+/// scale tracks the *center* spacing, not the data spacing.
+///
+/// We seed the length scale at the fill distance of `max(n, k)` points,
+/// `max_range / sqrt(max(n, k))`. When `n ≥ k` (the usual case) this is exactly
+/// the existing `max_range / sqrt(n)` seed, so every current result and small-`k`
+/// basis size is preserved bit-for-bit (in every covariate dimension). When
+/// `k > n` (a dense center request on a small cloud, the regime where an
+/// `n`-sized seed sits above the center spacing and over-smooths the centers
+/// into collinearity) the seed shrinks with `k` to the center spacing, keeping
+/// the requested centers numerically independent. This is the Matérn analogue of
+/// the Duchon-promotion "length_scale from center spacing" rule
+/// (`hybrid_duchon_promotion_length_scale`).
+pub fn auto_initial_length_scale_for_centers(
+    data: ArrayView2<'_, f64>,
+    feature_cols: &[usize],
+    num_centers: usize,
+) -> f64 {
+    let n = data.nrows();
+    if n == 0 || feature_cols.is_empty() {
+        return 1.0;
+    }
+    let Some(max_range) = feature_columns_max_range(data, feature_cols) else {
+        return 1.0;
+    };
+    // Resolution density: at least the data points, but no coarser than the
+    // center spacing once more centers than data are requested. Using the same
+    // `sqrt` fill-distance law as `auto_initial_length_scale` keeps the seed
+    // bit-identical whenever `n ≥ num_centers` (every dimension), and only
+    // shrinks it — never grows it — when `num_centers > n`.
+    let resolution_points = n.max(num_centers).max(1) as f64;
+    let spacing = max_range / resolution_points.sqrt();
+    spacing.max(AUTO_LENGTH_SCALE_FLOOR).min(max_range)
+}
+
+/// Requested center count encoded by a [`CenterStrategy`], if it carries an
+/// explicit count (used to make the Matérn auto length scale density-adaptive).
+fn center_strategy_requested_count(strategy: &CenterStrategy) -> Option<usize> {
+    match strategy {
+        CenterStrategy::Auto(inner) => center_strategy_requested_count(inner),
+        CenterStrategy::UserProvided(centers) => Some(centers.nrows()),
+        CenterStrategy::EqualMass { num_centers }
+        | CenterStrategy::EqualMassCovarRepresentative { num_centers }
+        | CenterStrategy::FarthestPoint { num_centers }
+        | CenterStrategy::KMeans { num_centers, .. } => Some(*num_centers),
+        CenterStrategy::UniformGrid { .. } => None,
+    }
 }
 
 /// Walk a term and, if it is a Matern or thin-plate smooth whose length_scale
@@ -4516,7 +4585,18 @@ pub fn auto_init_length_scale_in_basis(data: ArrayView2<'_, f64>, basis: &mut Sm
             feature_cols, spec, ..
         } => {
             if spec.length_scale == 0.0 {
-                spec.length_scale = auto_initial_length_scale(data, feature_cols);
+                // Density-adaptive seed (#1731): when the requested center count
+                // is known, scale the auto length scale with the *center*
+                // spacing so a richer `k` stays numerically full-rank instead of
+                // saturating against `matern_rank_reduce_centers`. For `n ≥ k`
+                // (the usual case) this is identical to the plain `max_range /
+                // sqrt(n)` seed in 2-D, so small-`k` results are unchanged. The
+                // unconstrained / non-explicit `UniformGrid` strategy falls back
+                // to the plain seed.
+                spec.length_scale = match center_strategy_requested_count(&spec.center_strategy) {
+                    Some(k) => auto_initial_length_scale_for_centers(data, feature_cols, k),
+                    None => auto_initial_length_scale(data, feature_cols),
+                };
             }
         }
         SmoothBasisSpec::ThinPlate {
