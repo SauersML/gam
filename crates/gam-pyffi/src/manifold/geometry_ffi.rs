@@ -3686,12 +3686,26 @@ fn identifiability_check_json(input: &str) -> PyResult<String> {
     gam::identifiability::precondition::identifiability_check_json(input).map_err(py_value_error)
 }
 
+/// Set the Rust solver's stderr log verbosity at runtime. Accepts the standard
+/// level names (`off`, `error`, `warn`, `info`, `debug`, `trace`,
+/// case-insensitive). The default is `warn`; pass `info` to restore the full
+/// per-iteration solver trace, or `off` to silence everything. An unrecognized
+/// level enables the verbose `info` stream rather than failing.
+#[pyfunction]
+fn set_log_level(level: &str) {
+    let resolved = gam::solver::progress_log::parse_level_directive(level)
+        .unwrap_or(gam::solver::progress_log::DEFAULT_LOG_LEVEL);
+    gam::solver::progress_log::init_logging_at(resolved);
+}
+
 #[pymodule(name = "_rust", gil_used = false)]
 fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     gam::init_parallelism();
-    // Install the same stderr logger used by the CLI so long-running Rust
-    // solver phases (including survival marginal-slope joint-Newton cycles)
-    // are visible from Python without requiring a separate shell.
+    // Install the same stderr logger used by the CLI. It defaults to the quiet
+    // `warn` level (#1688): the per-evaluation `info` diagnostic stream (which a
+    // single small fit can emit tens of thousands of lines of, some of it
+    // backed by real per-iteration eigendecompositions) stays off unless the
+    // caller opts in via `gamfit._rust.set_log_level("info")`.
     gam::solver::progress_log::init_logging();
     // Background process monitor: emits a `[process-monitor] elapsed=… rss=…`
     // line every 60s for the life of the process, so silent stretches
@@ -3922,6 +3936,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<StiefelManifold>()?;
     module.add_class::<SpdManifold>()?;
     module.add_class::<ProductManifold>()?;
+    module.add_function(wrap_pyfunction!(set_log_level, module)?)?;
     module.add_function(wrap_pyfunction!(fit_penalized_multinomial_pyfunc, module)?)?;
     module.add_function(wrap_pyfunction!(fit_multinomial_formula_pyfunc, module)?)?;
     module.add_function(wrap_pyfunction!(

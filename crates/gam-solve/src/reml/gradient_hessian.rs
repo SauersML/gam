@@ -187,7 +187,12 @@ impl<'a> RemlState<'a> {
         let [s_inner, s_linear, s_trace] = if let Some(sensitivities) = sensitivity_estimate {
             sensitivities
         } else {
-            log::warn!("[HGB] sensitivity_unavailable falling_back_to_per_channel");
+            // Routine per-evaluation fallback (fires whenever the cross-channel
+            // sensitivity estimate is unavailable, i.e. nearly every early
+            // iteration) — not an anomaly. Keep it for `debug` tracing but off
+            // the default `warn` stream so it does not re-create the #1688
+            // firehose.
+            log::debug!("[HGB] sensitivity_unavailable falling_back_to_per_channel");
             [S_INNER_INIT, S_LINEAR_INIT, S_TRACE_INIT]
         };
 

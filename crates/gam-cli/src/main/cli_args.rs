@@ -6,6 +6,12 @@ use super::*;
 #[command(version)]
 #[command(arg_required_else_help = true)]
 pub(crate) struct Cli {
+    /// Solver log verbosity written to stderr: off, error, warn (default),
+    /// info, debug, trace. The default (`warn`) suppresses the per-iteration
+    /// solver diagnostic firehose (`[OUTER]`, `[GAM ALO]`, `[KAPPA-PHASE]`,
+    /// `[#1271-diag]`, …); pass `--log-level info` to restore the full trace.
+    #[arg(long, global = true, value_name = "LEVEL")]
+    pub(crate) log_level: Option<String>,
     #[command(subcommand)]
     pub(crate) command: Command,
 }

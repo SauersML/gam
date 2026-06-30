@@ -313,7 +313,16 @@ fn run() -> CliResult<()> {
     // Parse first so `--help` / `--version` exit cleanly without spawning the
     // runtime-threads INFO line clap can't suppress.
     let cli = Cli::parse();
-    gam::progress_log::init_logging();
+    // Honor an explicit `--log-level`; otherwise the logger installs at its
+    // quiet `Warn` default (#1688). An unparseable level falls back to the
+    // verbose `Info` stream the user clearly intended.
+    match cli.log_level.as_deref() {
+        Some(raw) => gam::progress_log::init_logging_at(
+            gam::progress_log::parse_level_directive(raw)
+                .unwrap_or(gam::progress_log::DEFAULT_LOG_LEVEL),
+        ),
+        None => gam::progress_log::init_logging(),
+    }
     log::info!(
         "[STAGE] runtime threads | rayon_current_num_threads={} | std_available_parallelism={}",
         rayon::current_num_threads(),
