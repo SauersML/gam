@@ -661,6 +661,40 @@ fn run(shape: Shape) -> Result<(), String> {
         ),
     );
 
+    // The device-vs-CPU speedup stages run FIRST: they use their own tractable,
+    // self-contained resident fixture (`qwen_non_gating_fixture`) plus an in-stage
+    // CPU reference, so they must not be gated behind the full-system dense Direct
+    // solve below — which forms a dense `beta_dim × beta_dim` reduced Schur and at
+    // qwen `beta_dim=98304` is a 77 GB allocation that wedges the host (issue
+    // #1017: the dense-Schur log-det is the very gap the device path targets).
+    if fixture.shape.name == "qwen" {
+        run_device_pcg(&fixture.shape)?;
+        run_device_inner_iter(&fixture.shape)?;
+        run_device_fit(&fixture.shape)?;
+    }
+
+    // Full-system dense Direct solve. Skipped loud (not silently) when the dense
+    // reduced Schur `beta_dim × beta_dim` would exceed a sane host budget — at that
+    // scale only the matrix-free device PCG (exercised in the stages above) is
+    // viable, and forcing the dense factorization here would OOM-kill the harness.
+    const DENSE_SCHUR_F64_BYTES_BUDGET: usize = 4 * 1024 * 1024 * 1024; // 4 GiB
+    let dense_schur_bytes = beta_dim.saturating_mul(beta_dim).saturating_mul(8);
+    if dense_schur_bytes > DENSE_SCHUR_F64_BYTES_BUDGET {
+        print_stage(
+            &fixture.shape,
+            "inner_newton_solve",
+            0.0,
+            &format!(
+                "status=skipped reason=\"dense reduced Schur {beta_dim}x{beta_dim} = {} MiB > {} MiB budget; \
+                 use the matrix-free device PCG stages above\" beta_dim={beta_dim}",
+                dense_schur_bytes / (1024 * 1024),
+                DENSE_SCHUR_F64_BYTES_BUDGET / (1024 * 1024),
+            ),
+        );
+        print_stage(&fixture.shape, "total", ms(total_start), "");
+        return Ok(());
+    }
+
     let start = Instant::now();
     let (_delta_t, _delta_beta, solve_diag) = assembled
         .solve_with_options(
@@ -675,12 +709,6 @@ fn run(shape: Shape) -> Result<(), String> {
         ms(start),
         &format!("pcg_iterations={}", solve_diag.iterations),
     );
-
-    if fixture.shape.name == "qwen" {
-        run_device_pcg(&fixture.shape)?;
-        run_device_inner_iter(&fixture.shape)?;
-        run_device_fit(&fixture.shape)?;
-    }
 
     let mut term_for_criterion = fixture.term.clone();
     let start = Instant::now();
