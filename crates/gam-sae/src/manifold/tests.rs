@@ -3808,14 +3808,34 @@ pub(crate) fn reml_retries_refinement_after_non_pd_undamped_evidence_factor() {
     let cold_sys = term0
         .assemble_arrow_schur(target.view(), &rho, None)
         .unwrap();
-    let cold_factor = solve_arrow_newton_step_with_options(&cold_sys, 0.0, 0.0, &options);
-    let cold_err = match cold_factor {
-        Err(err) => err,
-        Ok(_) => panic!("fixture must start with a non-PD undamped evidence row factor"),
-    };
+    // Fixture precondition: the COLD (off-optimum) seed has a genuinely non-PD
+    // per-row undamped evidence block (two atoms' periodic decoders specialise in
+    // opposite directions, so the logit-block Schur complement goes indefinite).
+    // Before #1117 the undamped (`ridge = 0`) factor REFUSED this with
+    // `PerRowFactorFailed` and the criterion recovered by refining the inner
+    // state. #1117 (`factor_spectral_deflated_evidence_row`) now conditions the
+    // block the principled way at the COLD state too: it discovers the
+    // negative/flat eigen-direction and stiffens it to UNIT curvature (eigenvalue
+    // → +1, contributing a ρ-independent log 1 = 0), so the undamped solve returns
+    // `Ok` carrying recorded per-row deflation spectra instead of refusing. The
+    // block is STILL non-PD; it is now spectrally deflated rather than rejected.
+    // Pin THAT contract: the cold solve succeeds and reports the deflated
+    // indefinite directions it had to condition (a stronger statement than the old
+    // bare-`Err` precondition — it proves both that the seed is genuinely
+    // indefinite AND that the #1117 deflation engaged).
+    let (.., cold_cache) = solve_arrow_newton_step_with_options(&cold_sys, 0.0, 0.0, &options)
+        .expect("cold undamped evidence factor must be spectrally conditioned (#1117), not refused");
+    let cold_deflated_rows = cold_cache
+        .deflation_row_spectra
+        .iter()
+        .filter(|spectrum| spectrum.is_some())
+        .count();
     assert!(
-        SaeManifoldTerm::is_undamped_evidence_row_non_pd(&cold_err),
-        "fixture must start with a genuine evidence-mode non-PD row factor; got {cold_err}",
+        cold_deflated_rows > 0 || cold_cache.gauge_deflated_directions > 0,
+        "fixture must start with a genuine non-PD evidence block that #1117 spectral \
+         unit-stiffness deflation had to condition; got no deflated row spectra and \
+         {} gauge directions",
+        cold_cache.gauge_deflated_directions,
     );
 
     let mut full = term0.clone();
