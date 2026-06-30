@@ -59,3 +59,11 @@ Fix: gate on OPERATOR RESIDUAL (device δβ must solve the CPU-oracle system to 
 GPU engagement proven via nvidia-smi dmon (312MB fb resident, SM util spikes 2-8%).
 
 ## Next: dense reduced-β path, #1209 honest routing, run full gpu suite.
+
+## Pre-existing CPU failure (NOT mine, out of GPU scope)
+`arrow_schur::tests::arrow_schur_matches_dense_reference_2x2` FAILS on main @ e128441cd,
+deterministically, single-threaded. It `assert_eq!`s delta_beta (non-streaming) vs
+delta_beta_stream (streaming chunk_size=1) — they differ in the LAST ULP (~4e-16 rel),
+a brittle exact-equality assertion over two summation orderings. File is
+crates/gam-solve/src/arrow_schur/tests.rs (I never touched it). Noted on PR; belongs to
+a CPU-path owner, not this GPU PR.
