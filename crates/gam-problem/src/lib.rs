@@ -995,6 +995,18 @@ pub struct HyperCoordPair {
     pub ld_s: f64,
 }
 
+/// Shared-ownership callback computing a second-order fixed-β
+/// [`HyperCoordPair`] for a coordinate pair `(i, j)`.
+///
+/// `Arc` (not `Box`) so the same callback can be cloned into a derived
+/// `InnerSolution` — notably the tangent-projected solution built under active
+/// inequality constraints, which must carry the very same pair callbacks
+/// through to `ValueGradientHessian` outer-Hessian assembly. The pair objects
+/// are p-space; every consumer contracts them through the (possibly
+/// tangent-wrapped) Hessian operator, which applies the `ZᵀMZ` / `Z H_T⁻¹ Zᵀ`
+/// projection internally, so a clone-through is mathematically exact.
+pub type HyperCoordPairFn = Arc<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>;
+
 impl HyperCoordPair {
     pub fn zero() -> Self {
         Self {
@@ -1046,6 +1058,16 @@ impl DriftDerivResult {
 
 pub type FixedDriftDerivFn =
     Box<dyn Fn(usize, &Array1<f64>) -> Option<DriftDerivResult> + Send + Sync>;
+
+/// Shared-ownership form of [`FixedDriftDerivFn`] used for `InnerSolution`
+/// storage, so the same `M_i[u] = D_β B_i[u]` callback can be cloned into a
+/// derived (tangent-projected) solution. Construction sites still hand back a
+/// `Box` ([`FixedDriftDerivFn`]); storage re-tags it via `Arc::from` (free).
+/// The drift `M` is a p-space matrix that every consumer contracts through the
+/// (tangent-wrapped) Hessian operator's `trace_logdet_*`, so the clone-through
+/// is exact under projection.
+pub type SharedFixedDriftDerivFn =
+    Arc<dyn Fn(usize, &Array1<f64>) -> Option<DriftDerivResult> + Send + Sync>;
 
 pub struct ContractedPsiSecondOrder {
     pub objective: Array1<f64>,

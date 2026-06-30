@@ -2051,14 +2051,14 @@ pub(crate) fn operator_hessian_matches_dense_with_operator_drifts_and_extended_g
             tk_eta_fixed: None,
             tk_x_fixed: None,
         }],
-        ext_coord_pair_fn: Some(Box::new(|_, _| HyperCoordPair {
+        ext_coord_pair_fn: Some(Arc::new(|_, _| HyperCoordPair {
             a: 0.09,
             g: array![0.16, -0.12],
             b_mat: array![[0.08, 0.03], [0.03, -0.04]],
             b_operator: None,
             ld_s: -0.05,
         })),
-        rho_ext_pair_fn: Some(Box::new(|_, _| HyperCoordPair {
+        rho_ext_pair_fn: Some(Arc::new(|_, _| HyperCoordPair {
             a: -0.14,
             g: array![-0.18, 0.22],
             b_mat: array![[0.05, -0.02], [-0.02, 0.07]],
@@ -2213,14 +2213,14 @@ pub(crate) fn operator_hessian_with_contracted_psi_hook_matches_per_pair_dense()
                 tk_eta_fixed: None,
                 tk_x_fixed: None,
             }],
-            ext_coord_pair_fn: Some(Box::new(move |_, _| HyperCoordPair {
+            ext_coord_pair_fn: Some(Arc::new(move |_, _| HyperCoordPair {
                 a: psi_pair_a,
                 g: array![0.16, -0.12],
                 b_mat: pair_b_for_dense.clone(),
                 b_operator: None,
                 ld_s: psi_pair_ld_s,
             })),
-            rho_ext_pair_fn: Some(Box::new(|_, _| HyperCoordPair {
+            rho_ext_pair_fn: Some(Arc::new(|_, _| HyperCoordPair {
                 a: -0.14,
                 g: array![-0.18, 0.22],
                 b_mat: array![[0.05, -0.02], [-0.02, 0.07]],
@@ -2352,7 +2352,7 @@ pub(crate) fn operator_hessian_with_contracted_psi_hook_matches_per_pair_dense()
     // term2-only: zero the ψψ second drift (pair.b_mat) → removes base_h2 ψψ.
     let dense_no_base = {
         let mut sol = build_solution(false);
-        sol.ext_coord_pair_fn = Some(Box::new(move |_, _| HyperCoordPair {
+        sol.ext_coord_pair_fn = Some(Arc::new(move |_, _| HyperCoordPair {
             a: psi_pair_a,
             g: array![0.16, -0.12],
             b_mat: Array2::zeros((2, 2)),
@@ -2432,7 +2432,7 @@ pub(crate) fn operator_hessian_with_contracted_psi_hook_matches_per_pair_dense()
     let dense_without_psi_score_hvp = {
         let mut sol = build_solution(false);
         let pair_b_for_zero_score = psi_pair_b.clone();
-        sol.ext_coord_pair_fn = Some(Box::new(move |_, _| HyperCoordPair {
+        sol.ext_coord_pair_fn = Some(Arc::new(move |_, _| HyperCoordPair {
             a: psi_pair_a,
             g: Array1::zeros(2),
             b_mat: pair_b_for_zero_score.clone(),
@@ -2799,14 +2799,14 @@ pub(crate) fn projected_operator_hessian_matches_dense_subspace_trace() {
             tk_eta_fixed: None,
             tk_x_fixed: None,
         }],
-        ext_coord_pair_fn: Some(Box::new(|_, _| HyperCoordPair {
+        ext_coord_pair_fn: Some(Arc::new(|_, _| HyperCoordPair {
             a: 0.09,
             g: array![0.16, -0.12],
             b_mat: array![[0.08, 0.03], [0.03, -0.04]],
             b_operator: None,
             ld_s: -0.05,
         })),
-        rho_ext_pair_fn: Some(Box::new(|_, _| HyperCoordPair {
+        rho_ext_pair_fn: Some(Arc::new(|_, _| HyperCoordPair {
             a: -0.14,
             g: array![-0.18, 0.22],
             b_mat: array![[0.05, -0.02], [-0.02, 0.07]],

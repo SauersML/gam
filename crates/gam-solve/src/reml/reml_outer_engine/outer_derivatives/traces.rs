@@ -245,7 +245,7 @@ pub(crate) fn compute_drift_deriv_traces(
     ext_j: Option<usize>,
     beta_i: &Array1<f64>,
     beta_j: &Array1<f64>,
-    fixed_drift_deriv: Option<&FixedDriftDerivFn>,
+    fixed_drift_deriv: Option<&SharedFixedDriftDerivFn>,
     subspace: Option<&PenaltySubspaceTrace>,
 ) -> f64 {
     let trace_via = |result: DriftDerivResult| -> f64 {
