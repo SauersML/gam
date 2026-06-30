@@ -49,3 +49,10 @@ addressed instances, not the pattern, so it keeps regressing.
 - Move the two `cfg(test)` multinomial oracle methods into the existing
   `#[cfg(test)] mod tests` impl block (the sanctioned location).
 - Then sweep the rest of the range for genuinely-improperly-closed bugs.
+
+## #1515 — count-family degenerate-response guard (reopen)
+
+Reopened: gamfit.fit accepts an all-zero Poisson/NB response (saturated η̂=log(0)=−∞)
+while the binomial path and the CLI reject the analogous all-zero/all-one case.
+Fix: extend ResponseFamily::validate_response_degeneracy (gam-spec, the shared
+core guard both fit entry points already call) to reject all-zero count responses.
