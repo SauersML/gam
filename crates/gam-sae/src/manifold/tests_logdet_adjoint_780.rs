@@ -147,13 +147,14 @@ pub(crate) fn ibp_rho_sparse_logdet_trace_matches_dense_fd_1416() {
     // Fixed-alpha IBP-MAP with an active sparse prior so the cross-row Woodbury
     // source is genuinely live.
     term.assignment.mode = AssignmentMode::ibp_map(0.7, 0.9, false);
-    // Fixed-alpha IBP-MAP is PD only on a narrow ρ_sparse island: at the previous
-    // −1.0 the cross-row IBP joint Hessian is non-PD and the converge call panics
-    // at setup. ρ_sparse = 1.0 lands inside the PD basin, where the cross-row
-    // Woodbury source is genuinely live and the analytic ρ_sparse trace matches
-    // the fixed-state central difference of log|H| to ≈4 digits. Setup fix only —
-    // no tolerance weakened.
-    rho.log_lambda_sparse = 1.0;
+    // Fixed-alpha IBP-MAP is PD only on a narrow ρ_sparse island: at ρ_sparse = 1.0
+    // the cross-row IBP joint Hessian is non-PD (the Schur Cholesky hits a negative
+    // pivot) and the converge call fails at setup. ρ_sparse = −2.0 lands inside the
+    // PD basin (the same value the sibling `..._matches_dense_fd_ibp_map` adjoint
+    // test pins on this fixture), where the cross-row Woodbury source is genuinely
+    // live and the analytic ρ_sparse trace matches the fixed-state central
+    // difference of log|H|. Setup fix only — no tolerance weakened.
+    rho.log_lambda_sparse = -2.0;
     let (_value, _loss, cache) = term
         .reml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
         .expect("converged cache");
