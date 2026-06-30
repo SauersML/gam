@@ -72,6 +72,54 @@ fn try_build_spatial_term_log_kappa_derivative(
                 spec_local.length_scale =
                     compensate_length_scale_for_standardization(spec.length_scale, s);
             }
+            // #1122: the realized Matérn DESIGN always carries the operator
+            // {mass, tension, stiffness} penalty triplet — `build_term`
+            // unconditionally overrides whatever penalty the `double_penalty`
+            // flag produced with `matern_operator_penalty_triplet_from_metadata`
+            // (see term_specs.rs). The κ-gradient's ψ-derivative penalty blocks
+            // MUST be assembled against that SAME parameterization, or the outer
+            // REML criterion's `−½ log|Sλ|₊` (built from the operator triplet)
+            // is differentiated by a `∂Sλ/∂ψ` from a DIFFERENT penalty family
+            // (the kernel-Gram `Primary` + nullspace-shrinkage blocks). That
+            // mismatch made the analytic `tr(S⁺ Ṡ)` ≈ −1 while the FD of the
+            // true triplet-`log|Sλ|₊` was ≈ −29 — a ~30× DESYNC on the log-κ
+            // coordinate that stalled the joint REML at its iteration cap. Force
+            // the operator-triplet ψ-derivative arm here (the FD-verified
+            // `build_matern_operator_penalty_psi_derivatives` path, which the
+            // fast-path n-free re-key `canonical_penalty_derivatives_at_psi`
+            // already routes through) so value and gradient share one penalty
+            // parameterization and one block count.
+            spec_local.double_penalty = false;
+            // TEMP-SPECDUMP-1122: report whether production's gradient spec is
+            // frozen (UserProvided centers + FrozenTransform) the way the value
+            // design is, or still carries Auto/CenterSumToZero (⇒ X_τ re-derives
+            // a DIFFERENT geometry than the value design → frame desync). REMOVE.
+            {
+                let cs = match &spec_local.center_strategy {
+                    gam_terms::basis::CenterStrategy::UserProvided(c) => {
+                        format!("UserProvided({})", c.nrows())
+                    }
+                    gam_terms::basis::CenterStrategy::FarthestPoint { num_centers } => {
+                        format!("FarthestPoint({num_centers})")
+                    }
+                    gam_terms::basis::CenterStrategy::Auto(_) => "Auto".to_string(),
+                    other => format!("{:?}", std::mem::discriminant(other)),
+                };
+                let id = match &spec_local.identifiability {
+                    gam_terms::basis::MaternIdentifiability::FrozenTransform { .. } => {
+                        "FrozenTransform"
+                    }
+                    gam_terms::basis::MaternIdentifiability::CenterSumToZero => "CenterSumToZero",
+                    _ => "other",
+                };
+                log::warn!(
+                    "[OUTER-FD-AUDIT SPECDUMP-1122] center_strategy={cs} identifiability={id} \
+                     length_scale={:.6} nu={:?} aniso={:?}",
+                    spec_local.length_scale,
+                    spec_local.nu,
+                    spec_local.aniso_log_scales.is_some(),
+                );
+            }
             build_matern_basis_log_kappa_derivatives(x.view(), &spec_local)
                 .map_err(EstimationError::from)?
         }
@@ -138,6 +186,240 @@ fn try_build_spatial_term_log_kappa_derivative(
     assert!(local_implicit_first_unused.is_none());
     assert!(local_implicit_second_unused.is_none());
 
+    // TEMP-XPSIFD-1122: FD-check the analytic local_x_psi against the value
+    // design in the EXACT production spec (incl. rank-reduced centers), the one
+    // gap the standalone unit test missed (its reduction never fired). REMOVE.
+    if let SmoothBasisSpec::Matern {
+        feature_cols,
+        spec,
+        input_scales,
+    } = &termspec.basis
+    {
+        let mut xf = select_columns(data, feature_cols).map_err(EstimationError::from)?;
+        let mut sp = spec.clone();
+        if let Some(s) = input_scales {
+            apply_input_standardization(&mut xf, s.as_slice());
+            sp.length_scale =
+                compensate_length_scale_for_standardization(spec.length_scale, s.as_slice());
+        }
+        sp.double_penalty = false;
+        // ψ = log κ = -log(length_scale). value design at ψ+δ uses ls*exp(-δ).
+        let ls0 = sp.length_scale;
+        let h = 1e-6_f64;
+        let value_design = |delta: f64| -> Option<Array2<f64>> {
+            let mut s2 = sp.clone();
+            s2.length_scale = ls0 * (-delta).exp();
+            gam_terms::basis::build_matern_basis(xf.view(), &s2)
+                .ok()
+                .map(|b| b.design.to_dense())
+        };
+        if let (Some(dp), Some(dm)) = (value_design(h), value_design(-h)) {
+            if dp.shape() == local_x_psi.shape() {
+                let num = (&dp - &dm) / (2.0 * h);
+                let err = (&local_x_psi - &num)
+                    .mapv(f64::abs)
+                    .iter()
+                    .fold(0.0_f64, |a, &b| a.max(b));
+                let anorm = local_x_psi.iter().map(|v| v * v).sum::<f64>().sqrt();
+                log::warn!(
+                    "[OUTER-FD-AUDIT XPSIFD-1122] x_psi_max_abs_err={err:.3e} |x_psi|={anorm:.3e} \
+                     shape={:?} centers_frozen={}",
+                    local_x_psi.shape(),
+                    match &sp.center_strategy {
+                        gam_terms::basis::CenterStrategy::UserProvided(c) => c.nrows(),
+                        _ => 0,
+                    },
+                );
+                // TEMP-XDESIGN-1122: compare the value-rebuild design (value_at(0))
+                // against the REALIZED design block H is built from. If they differ,
+                // H lives in a different frame than X_τ → β-independent log|H| gap.
+                if let Some(d0) = value_design(0.0) {
+                    let p_total = design.design.ncols();
+                    let smooth_start =
+                        p_total.saturating_sub(design.smooth.total_smooth_cols());
+                    let g0 = smooth_start + smooth_term.coeff_range.start;
+                    let g1 = smooth_start + smooth_term.coeff_range.end;
+                    let realized = design.design.to_dense();
+                    if g1 <= realized.ncols() && d0.ncols() == (g1 - g0) {
+                        let block = realized.slice(ndarray::s![.., g0..g1]).to_owned();
+                        let dmax = (&block - &d0)
+                            .mapv(f64::abs)
+                            .iter()
+                            .fold(0.0_f64, |a, &b| a.max(b));
+                        // also test value-rebuild vs realized with column-sign / Q?
+                        let bnorm = block.iter().map(|v| v * v).sum::<f64>().sqrt();
+                        let d0norm = d0.iter().map(|v| v * v).sum::<f64>().sqrt();
+                        log::warn!(
+                            "[OUTER-FD-AUDIT XDESIGN-1122] realized_vs_valuebuild_max_abs={dmax:.3e} \
+                             |realized_block|={bnorm:.4e} |value_build|={d0norm:.4e} \
+                             block_shape={:?} g0={g0} g1={g1} p_total={p_total}",
+                            block.shape(),
+                        );
+                    } else {
+                        log::warn!(
+                            "[OUTER-FD-AUDIT XDESIGN-1122] shape/range mismatch realized_cols={} g0={g0} g1={g1} d0_cols={}",
+                            realized.ncols(),
+                            d0.ncols()
+                        );
+                    }
+                }
+            } else {
+                log::warn!(
+                    "[OUTER-FD-AUDIT XPSIFD-1122] shape mismatch analytic={:?} value={:?}",
+                    local_x_psi.shape(),
+                    dp.shape()
+                );
+            }
+        }
+    }
+
+    // TEMP-SPSIFD-1122: FD-check the analytic summed S_τ (`local_s_psi`) against
+    // a central difference of the REALIZED operator-triplet penalty across ψ in
+    // the frozen production frame. The H-side log|H| gap is β-independent, so it
+    // can ONLY be an S_τ error; `ld_s=½tr(Sλ⁺S_τ)` matches FD while the H-side
+    // `tr(H⁻¹S_τ)` does not ⇒ the error must live in Sλ's NULLSPACE (annihilated
+    // by the pseudo-inverse). The forward penalty is built from frozen metadata
+    // via `matern_operator_penalty_triplet_from_metadata`, so we differentiate
+    // THAT (the exact quantity the criterion's H/Sλ are assembled from) by FD and
+    // compare per-block and summed. REMOVE.
+    {
+        use gam_terms::smooth::matern_operator_penalty_triplet_at_length_scale;
+        if let BasisMetadata::Matern {
+            centers,
+            length_scale,
+            periodic,
+            nu,
+            include_intercept,
+            identifiability_transform,
+            aniso_log_scales,
+            input_scales,
+            ..
+        } = &smooth_term.metadata
+        {
+            // Effective (σ_geom-compensated, standardized-frame) length scale the
+            // realized design's kernel + penalty were built against — EXACTLY the
+            // `penalty_length_scale` `matern_operator_penalty_triplet_from_metadata`
+            // computes.
+            let ls_eff = match input_scales.as_deref() {
+                Some(s) => compensate_length_scale_for_standardization(*length_scale, s),
+                None => *length_scale,
+            };
+            // ψ = log κ = −log ℓ_eff. Sum the active triplet at a shifted ψ.
+            let h = 1e-6_f64;
+            let summed_at = |delta: f64| -> Option<Array2<f64>> {
+                let ls = ls_eff * (-delta).exp();
+                let (mats, _ranks, _info) = matern_operator_penalty_triplet_at_length_scale(
+                    centers.view(),
+                    periodic.as_deref(),
+                    identifiability_transform.as_ref(),
+                    *nu,
+                    *include_intercept,
+                    aniso_log_scales.as_deref(),
+                    ls,
+                )
+                .ok()?;
+                let p = mats.first().map(|m: &Array2<f64>| m.nrows()).unwrap_or(0);
+                let mut acc = Array2::<f64>::zeros((p, p));
+                for m in &mats {
+                    if m.shape() == acc.shape() {
+                        acc += m;
+                    }
+                }
+                Some(acc)
+            };
+            let analytic_sum = local_s_psi.iter().fold(
+                Array2::<f64>::zeros((
+                    smooth_term.coeff_range.len(),
+                    smooth_term.coeff_range.len(),
+                )),
+                |acc, m| {
+                    if m.shape() == acc.shape() {
+                        acc + m
+                    } else {
+                        acc
+                    }
+                },
+            );
+            if let (Some(sp), Some(sm), Some(s0)) =
+                (summed_at(h), summed_at(-h), summed_at(0.0))
+            {
+                if sp.shape() == analytic_sum.shape() {
+                    let num = (&sp - &sm) / (2.0 * h);
+                    let err = (&analytic_sum - &num)
+                        .mapv(f64::abs)
+                        .iter()
+                        .fold(0.0_f64, |a, &b| a.max(b));
+                    let anorm = analytic_sum.iter().map(|v| v * v).sum::<f64>().sqrt();
+                    let nnorm = num.iter().map(|v| v * v).sum::<f64>().sqrt();
+                    // Nullspace-projected error: FD vs analytic contracted with the
+                    // realized-penalty nullspace. We approximate the nullspace by
+                    // the smallest eigenvectors of S0 (summed realized penalty).
+                    log::warn!(
+                        "[OUTER-FD-AUDIT SPSIFD-1122] s_psi_max_abs_err={err:.3e} \
+                         |analytic|={anorm:.3e} |fd|={nnorm:.3e} blocks={} \
+                         shape={:?} |S0|={:.3e}",
+                        local_s_psi.len(),
+                        analytic_sum.shape(),
+                        s0.iter().map(|v| v * v).sum::<f64>().sqrt(),
+                    );
+                    // Per-block FD: differentiate each triplet block separately so a
+                    // single offending block (mass vs tension vs stiffness) is named.
+                    let per_block = |delta: f64| -> Option<Vec<Array2<f64>>> {
+                        let ls = ls_eff * (-delta).exp();
+                        matern_operator_penalty_triplet_at_length_scale(
+                            centers.view(),
+                            periodic.as_deref(),
+                            identifiability_transform.as_ref(),
+                            *nu,
+                            *include_intercept,
+                            aniso_log_scales.as_deref(),
+                            ls,
+                        )
+                        .ok()
+                        .map(|(m, _, _)| m)
+                    };
+                    if let (Some(bp), Some(bm)) = (per_block(h), per_block(-h)) {
+                        for (bi, (ap, am)) in bp.iter().zip(bm.iter()).enumerate() {
+                            if bi < local_s_psi.len()
+                                && ap.shape() == local_s_psi[bi].shape()
+                            {
+                                let bnum = (ap - am) / (2.0 * h);
+                                let berr = (&local_s_psi[bi] - &bnum)
+                                    .mapv(f64::abs)
+                                    .iter()
+                                    .fold(0.0_f64, |a, &b| a.max(b));
+                                let banorm =
+                                    local_s_psi[bi].iter().map(|v| v * v).sum::<f64>().sqrt();
+                                log::warn!(
+                                    "[OUTER-FD-AUDIT SPSIFD-1122 BLOCK] block={bi} max_abs_err={berr:.3e} |analytic|={banorm:.3e}"
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    log::warn!(
+                        "[OUTER-FD-AUDIT SPSIFD-1122] shape mismatch analytic={:?} fd={:?}",
+                        analytic_sum.shape(),
+                        sp.shape()
+                    );
+                }
+            }
+        }
+    }
+
+    // TEMP-ROT-1122: report whether the analytic ψ-derivative path applies a
+    // joint-null rotation that the (frozen-identifiability) value rebuild omits.
+    log::warn!(
+        "[OUTER-FD-AUDIT TEMP-ROT-1122] analytic joint_null_rotation={} nullity={} x_psi={}x{}",
+        smooth_term.joint_null_rotation.is_some(),
+        smooth_term
+            .joint_null_rotation
+            .as_ref()
+            .map(|r| r.joint_nullity)
+            .unwrap_or(0),
+        local_x_psi.nrows(),
+        local_x_psi.ncols(),
+    );
     if let Some(rotation) = smooth_term.joint_null_rotation.as_ref() {
         let q = &rotation.rotation;
         if let Some(op) = implicit_operator.take() {
@@ -3446,6 +3728,13 @@ impl<'d> SpatialJointContext<'d> {
                     && self.evaluator.supports_nfree_penalty_rekey()
                     && nfree_fast_path_revision.is_some()
         };
+        // TEMP-SKIPOFF-1122: force the exact streamed surface to test whether the
+        // n-free ψ-Gram Chebyshev interpolant is the source of the #1122 H-side
+        // FD-vs-analytic gap. REMOVE.
+        let skip_design_realization = false && skip_design_realization;
+        log::warn!(
+            "[OUTER-FD-AUDIT TEMP-SKIPOFF-1122] skip_design_realization={skip_design_realization}"
+        );
         if skip_design_realization {
             log::debug!(
                 "[STAGE] {} eval_full at psi={:.6}: skipping n×k design re-realization \
@@ -4159,6 +4448,71 @@ fn run_exact_joint_spatial_optimization(
         match audit {
             Ok(audit) => audit.log_verdict("spatial-exact-joint"),
             Err(e) => log::warn!("[OUTER-FD-AUDIT/spatial-exact-joint] skipped: {e}"),
+        }
+        // TEMP-HSWEEP-1122: manual central-FD h-sweep of the last (psi_kappa[0])
+        // coordinate to separate FD truncation / inner-solver noise from a true
+        // analytic gradient error. REMOVE before commit.
+        {
+            use gam_solve::estimate::reml::reml_outer_engine::LAST_COST_ATOMS_1122;
+            log::warn!("[OUTER-FD-AUDIT TEMP-HSWEEP-1122] ENTER block theta0_len={}", theta0.len());
+            let i = theta0.len() - 1;
+            let read_atoms = || LAST_COST_ATOMS_1122.lock().ok().and_then(|g| *g);
+            // HSWEEP-DPC: sweep h over decades and report fd_dpc/2 (the datafit
+            // envelope-derivative atom) so we can see whether the FD CONVERGES to
+            // the analytic `a` (⇒ FD truncation / inner-noise, analytic correct)
+            // or stays pinned at a constant offset (⇒ true analytic error).
+            for hd in [1e-3_f64, 1e-4, 3e-5, 1e-5] {
+                let mut tp = theta0.clone();
+                tp[i] += hd;
+                let mut tm = theta0.clone();
+                tm[i] -= hd;
+                let vp = ctx.eval_full(&tp, OuterEvalOrder::Value, analytic_outer_hessian_available);
+                let ap = read_atoms();
+                let vm = ctx.eval_full(&tm, OuterEvalOrder::Value, analytic_outer_hessian_available);
+                let am = read_atoms();
+                if let (Ok(_), Ok(_), Some(ap), Some(am)) = (vp, vm, ap, am) {
+                    let fd_dpc = (ap[3] - am[3]) / (2.0 * hd);
+                    let fd_ldh = (ap[1] - am[1]) / (2.0 * hd);
+                    let fd_lds = (ap[2] - am[2]) / (2.0 * hd);
+                    log::warn!(
+                        "[OUTER-FD-AUDIT TEMP-HSWEEP-1122 DPC] h={hd:.1e} fd_dpc/2={:.10e} fd_ldh={fd_ldh:.8e} fd_lds={fd_lds:.8e}",
+                        0.5 * fd_dpc
+                    );
+                }
+            }
+            let h = 1e-4_f64;
+            let mut tp = theta0.clone();
+            tp[i] += h;
+            let mut tm = theta0.clone();
+            tm[i] -= h;
+            let vp = ctx.eval_full(&tp, OuterEvalOrder::Value, analytic_outer_hessian_available);
+            let ap = read_atoms();
+            let vm = ctx.eval_full(&tm, OuterEvalOrder::Value, analytic_outer_hessian_available);
+            let am = read_atoms();
+            let ga = ctx
+                .eval_full(theta0, OuterEvalOrder::ValueGradientHessian, analytic_outer_hessian_available)
+                .ok()
+                .map(|(_, g, _)| g[i]);
+            if let (Ok((vp, _, _)), Ok((vm, _, _)), Some(ap), Some(am)) = (vp, vm, ap, am) {
+                let fd_cost = (vp - vm) / (2.0 * h);
+                let fd_ldh = (ap[1] - am[1]) / (2.0 * h);
+                let fd_lds = (ap[2] - am[2]) / (2.0 * h);
+                let fd_dpc = (ap[3] - am[3]) / (2.0 * h);
+                let fd_penq = (ap[6] - am[6]) / (2.0 * h);
+                let denom = ap[5];
+                let dp_c0 = 0.5 * (ap[3] + am[3]);
+                let fd_phiterm = (denom / 2.0) * (fd_dpc / dp_c0);
+                log::warn!(
+                    "[OUTER-FD-AUDIT TEMP-HSWEEP-1122] i={i} h={h:.1e} fd_cost={fd_cost:.8e} analytic={:.8e} gap={:.3e} | 0.5*fd_ldh={:.8e} -0.5*fd_lds={:.8e} fd_phiterm={fd_phiterm:.8e} | fd_ldh={fd_ldh:.6e} fd_lds={fd_lds:.6e} fd_dpc={fd_dpc:.6e} fd_penq={fd_penq:.6e} reconstructed={:.8e}",
+                    ga.unwrap_or(f64::NAN),
+                    (fd_cost - ga.unwrap_or(f64::NAN)).abs(),
+                    0.5 * fd_ldh,
+                    -0.5 * fd_lds,
+                    0.5 * fd_ldh - 0.5 * fd_lds + fd_phiterm,
+                );
+            } else {
+                log::warn!("[OUTER-FD-AUDIT TEMP-HSWEEP-1122] EVAL_ERR or no atoms captured");
+            }
         }
     }
 

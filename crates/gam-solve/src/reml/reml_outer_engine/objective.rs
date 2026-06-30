@@ -2,6 +2,12 @@ use super::*;
 use crate::estimate::reml::atoms::CriterionAtom;
 use crate::estimate::smooth_floor_dp;
 
+// TEMP-ATOMS-1122: last-write-wins capture of the ProfiledGaussian cost atoms,
+// read by the HSWEEP after eval_full returns (the final converged evaluate wins).
+// [cost, log_det_h, log_det_s, dp_c, phi, denom, pen_quad]. REMOVE before commit.
+pub static LAST_COST_ATOMS_1122: std::sync::Mutex<Option<[f64; 7]>> =
+    std::sync::Mutex::new(None);
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  The single evaluator
 // ═══════════════════════════════════════════════════════════════════════════
@@ -148,6 +154,11 @@ pub fn reml_laml_evaluate(
                 + 0.5 * (log_det_h - log_det_s)
                 + (denom / 2.0) * (2.0 * std::f64::consts::PI * phi).ln()
                 - solution.gaussian_weight_log_sum_half;
+
+            // TEMP-ATOMS-1122: last-write-wins capture; HSWEEP reads after return.
+            if let Ok(mut g) = LAST_COST_ATOMS_1122.lock() {
+                *g = Some([cost, log_det_h, log_det_s, dp_c, phi, denom, penalty_quad_value]);
+            }
 
             (cost, phi, dp_cgrad, dp_cgrad2)
         }
@@ -1262,6 +1273,19 @@ pub fn reml_laml_evaluate(
                 "[EXT-GRAD] ext_idx={} value={:+.6e} coord.a={:+.6e} trace_logdet={:+.6e} ld_s={:+.6e} incl_h={} incl_s={}",
                 ext_idx, value, coord.a, trace_logdet_i, coord.ld_s, incl_logdet_h, incl_logdet_s
             );
+            // TEMP-EXTDECOMP-1122: analytic atom split matching the HSWEEP FD atoms.
+            // penalty_term(datafit/phi) + 0.5*trace_logdet(H-side) - 0.5*ld_s(penalty). REMOVE.
+            {
+                let pt = match &solution.dispersion {
+                    DispersionHandling::ProfiledGaussian => dp_cgrad * coord.a / profiled_scale,
+                    DispersionHandling::Fixed { .. } => coord.a,
+                };
+                log::warn!(
+                    "[OUTER-FD-AUDIT EXTDECOMP-1122] ext_idx={} value={:+.8e} penalty_term={:+.8e} half_trace_logdet={:+.8e} neg_half_ld_s={:+.8e} | a={:+.6e} trace_logdet={:+.6e} ld_s={:+.6e}",
+                    ext_idx, value, pt, 0.5 * trace_logdet_i, -0.5 * coord.ld_s,
+                    coord.a, trace_logdet_i, coord.ld_s
+                );
+            }
             log::info!(
                 "[STAGE] reml_laml ext_coord_trace ext_idx={} elapsed={:.3}s",
                 ext_idx,

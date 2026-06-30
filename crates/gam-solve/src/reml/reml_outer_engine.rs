@@ -207,6 +207,9 @@ pub use hessian_operator_trait::*;
 pub use hyper_operator::*;
 pub use inner_solution::*;
 pub(crate) use objective::*;
+// TEMP-ATOMS-1122: cross-crate accessor for the cost-atom capture used by the
+// #1122 HSWEEP decomposition in gam-models. REMOVE before commit.
+pub use objective::LAST_COST_ATOMS_1122;
 pub(crate) use outer_derivatives::*;
 // Re-surface the outer-Hessian routing predicates/thresholds at the flat
 // `reml_outer_engine` namespace for the #1521-carve cross-crate family tests.

@@ -26,7 +26,7 @@ use gam_linalg::faer_ndarray::FaerSymmetricFactor;
 use gam_linalg::sparse_exact::{
     factorize_sparse_spd, solve_sparse_spd_into, sparse_symmetric_upper_matvec_public,
 };
-use gam_linalg::utils::{array_is_finite, inf_norm};
+use gam_linalg::utils::{StableSolver, array_is_finite, inf_norm};
 use crate::loop_guard::{FlatStreak, IterationBound, LoopVerdict, RejectEscalator};
 use gam_problem::Coefficients;
 use faer::sparse::SparseColMat;
@@ -1996,6 +1996,127 @@ where
         max_iterations: options.max_iterations,
         last_change: lastgradient_norm,
     })?;
+
+    // ── Undamped Newton polish (#1122) ──────────────────────────────────────
+    //
+    // Convergence is certified by `certifies_kkt` / the Newton-decrement bound,
+    // both of which are *relative* tests. For a Gaussian-identity (exactly
+    // quadratic) problem they fire at the very first accepted LM step — while
+    // the cold-start damping `loop_lambda` (default 1e-6) is still folded into
+    // the solve. The accepted iterate therefore satisfies the *damped* normal
+    // equations `(H + λ_lm·D²)β̂ = X'Wz`, not the bare `Hβ̂ = X'Wz`, leaving a
+    // stationarity residual
+    //
+    //     g_bare = Hβ̂ − X'Wz = λ_lm·D²·β̂ ≈ δ·β̂,   δ ≈ λ_lm·mean(diag H),
+    //
+    // which is parallel to β̂ and tiny (here ‖g‖≈2e-5, δ≈1.7e-6). The inner
+    // solver's own contract (see the iter-loop note: "LM ridge + step-halving
+    // schedule are inactive at convergence; fixed point is exact Newton") and
+    // `WorkingState::near_stationary_kkt`'s comment both call this out as the
+    // LM-ridge bias. Inner-only it is negligible; but the OUTER REML gradient
+    // is assembled by the envelope theorem `∂V/∂ψ = ∂V/∂ψ|_β̂` which assumes
+    // EXACT stationarity. Any residual `g_bare` makes the analytic outer
+    // gradient omit the term `g_bare·(dβ̂/dψ)` that a finite difference of the
+    // criterion (which re-solves PIRLS at ψ±h) does see — the #1122 iso-κ
+    // Matérn DESYNC, amplified by the profiled-REML datafit prefactor
+    // `(denom/2)·(dp_c'/dp_c)` (~259 at θ₀).
+    //
+    // Restore the documented invariant: take ONE exact, *undamped* (λ=0)
+    // Newton step `β̂ ← β̂ − H⁻¹ g_bare` on the bare penalized Hessian once the
+    // loop has converged. For a quadratic problem this lands on the exact
+    // optimum (g_bare → 0); for a genuinely nonlinear family it is a pure
+    // Newton refinement of an already-converged point. It is gated on three
+    // safety conditions so it can NEVER worsen a fit:
+    //   (1) unconstrained only — a constrained KKT point carries multipliers,
+    //       so its residual is not a plain gradient to be zeroed;
+    //   (2) the bare Hessian factorizes (PD) and the step is finite;
+    //   (3) the re-evaluated state STRICTLY reduces the stationarity residual.
+    // Condition (3) makes the polish Pareto-safe: a fit that is already
+    // machine-stationary (residual at round-off) sees no accepted step, so
+    // existing golden values are untouched; only LM-ridge-biased iterates move.
+    let polish_allowed = options.linear_constraints.is_none()
+        && options.coefficient_lower_bounds.is_none()
+        && options.arrow_schur.is_none();
+    if polish_allowed {
+        if let Some(bare_h) = state.hessian.as_dense() {
+            let g_norm_before = constrained_stationarity_norm(
+                &state.gradient,
+                beta.as_ref(),
+                None,
+                None,
+            );
+            // Only bother when there is a residual worth removing and the
+            // gradient/Hessian are finite — skip the work for already-exact fits.
+            let bare_finite = state.gradient.iter().all(|v| v.is_finite())
+                && bare_h.iter().all(|v| v.is_finite());
+            if g_norm_before > 0.0 && bare_finite {
+                // `solve_direction_with_dense_factor` returns the Newton
+                // DIRECTION d = −H⁻¹g (sign already applied), so the polished
+                // iterate is β̂ + d. Factorize the BARE (undamped) penalized
+                // Hessian — `state.hessian` carries no LM ridge (the damping
+                // lived only on the throwaway `regularized` clone in the loop).
+                let direction = StableSolver::new("pirls undamped newton polish")
+                    .factorize(bare_h)
+                    .ok()
+                    .map(|factor| {
+                        let mut d = Array1::<f64>::zeros(state.gradient.len());
+                        solve_direction_with_dense_factor(&factor, &state.gradient, &mut d);
+                        d
+                    });
+                if let Some(direction) = direction {
+                    let step_finite = direction.iter().all(|v| v.is_finite());
+                    // Guard against a runaway step: an exact Newton refinement
+                    // of a converged iterate is small relative to ‖β̂‖. A large
+                    // step signals a near-singular bare H (the LM damping was
+                    // load-bearing) — decline rather than risk a worse point.
+                    let beta_norm_sq = beta.as_ref().dot(beta.as_ref());
+                    let step_norm_sq = direction.dot(&direction);
+                    let step_reasonable = step_finite
+                        && (step_norm_sq <= 0.25 * beta_norm_sq.max(1.0));
+                    if step_reasonable {
+                        let polished: Array1<f64> = beta.as_ref() + &direction;
+                        if polished.iter().all(|v| v.is_finite()) {
+                            let polished_beta = Coefficients::new(polished);
+                            if let Ok(polished_state) = model
+                                .update_with_curvature(&polished_beta, state.hessian_curvature)
+                            {
+                                let g_norm_after = constrained_stationarity_norm(
+                                    &polished_state.gradient,
+                                    polished_beta.as_ref(),
+                                    None,
+                                    None,
+                                );
+                                // Commit ONLY on a strict improvement, and only
+                                // when the polished objective did not increase
+                                // (a quadratic Newton step cannot increase F, so
+                                // this rejects only nonlinear-family overshoot).
+                                let obj_before = penalizedobjective(&state);
+                                let obj_after = penalizedobjective(&polished_state);
+                                let objective_ok = !obj_after.is_finite()
+                                    || !obj_before.is_finite()
+                                    || obj_after <= obj_before
+                                        + obj_before.abs().max(1.0) * 1e-12;
+                                if g_norm_after.is_finite()
+                                    && g_norm_after < g_norm_before
+                                    && objective_ok
+                                {
+                                    log::debug!(
+                                        "[PIRLS] undamped Newton polish (#1122): \
+                                         ‖g‖ {g_norm_before:.3e} → {g_norm_after:.3e} \
+                                         (‖step‖={:.3e})",
+                                        step_norm_sq.sqrt()
+                                    );
+                                    beta = polished_beta;
+                                    state = polished_state;
+                                    lastgradient_norm = g_norm_after;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Post-loop rescue: use the constrained stationarity residual in the
     // current PIRLS basis, not the raw gradient norm.
