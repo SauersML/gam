@@ -3342,6 +3342,20 @@ fn run_screening_reorders_expensive_generated_seeds_before_full_startup_eval() {
 }
 
 #[test]
+fn zzz_probe_seed_count_for_screening_test() {
+    let mut seed_config = gam_problem::SeedConfig::default();
+    seed_config.max_seeds = 4;
+    seed_config.seed_budget = 2;
+    seed_config.risk_profile = gam_problem::SeedRiskProfile::GeneralizedLinear;
+    let seeds = crate::seeding::generate_rho_candidates(1, None, &seed_config);
+    eprintln!("PROBE: generated {} seeds:", seeds.len());
+    for s in &seeds {
+        eprintln!("PROBE:   {:?}", s.to_vec());
+    }
+    eprintln!("PROBE: last = {:?}", seeds.last().map(|s| s.to_vec()));
+}
+
+#[test]
 fn initial_rho_with_single_seed_budget_skips_expensive_screening() {
     let mut seed_config = gam_problem::SeedConfig::default();
     seed_config.max_seeds = 4;
