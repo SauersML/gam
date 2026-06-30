@@ -52,6 +52,12 @@
 
 use crate::survival::marginal_slope::row_kernel::RigidRowInputs;
 
+// #415 parity-lock: a host transcription of the device `.cu` seeded-jet
+// arithmetic, pinned to the production CPU jet on every box. Declared bare
+// (the whole file is `#![cfg(test)]`) with a `*_tests` name so the build.rs
+// ban-scanner exempts the test-only substrate — see `bms::test_support`.
+mod survival_rowjet_host_oracle_tests;
+
 /// Per-row order-≤2 + contracted third/fourth channels for a batch of rows,
 /// flattened row-major. `K = 4` (the rigid survival primaries `q0,q1,qd1,g`).
 ///
