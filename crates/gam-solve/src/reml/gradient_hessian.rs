@@ -536,11 +536,40 @@ impl<'a> RemlState<'a> {
             && !self.canonical_penalties.is_empty()
             && self.canonical_penalties.len() == rho.len()
         {
-            let projected_roots: Vec<Array2<f64>> = self
-                .canonical_penalties
-                .iter()
-                .map(|penalty| penalty.full_width_root().dot(z))
-                .collect();
+            // Frame consistency (#509 second face / completes #1380 & #1654).
+            // The active-constraint free basis `z` is built from
+            // `pr.linear_constraints_transformed` / `pr.beta_transformed`, so it
+            // lives in the TRANSFORMED (post-Qs, and post box-reparam `T`) PIRLS
+            // frame — the same frame as the Hessian side `h_for_operator = ZᵀHZ`
+            // and `e_for_logdet = E_transformed·Z`. The penalty roots projected
+            // here MUST live in that same transformed frame, otherwise
+            // `Zᵀ S Z` mixes two coordinate systems and `log|S|₊` (and its
+            // ρ-derivatives) desync from the projected `log|H|` whenever the
+            // reparameterization is non-orthogonal. `self.canonical_penalties`
+            // are the ORIGINAL-frame (pre-Qs) block-local roots; for a
+            // shape-constrained smooth under the box reparameterization the
+            // cumulative-sum `T` and the stabilizing `Qs` are both non-orthogonal,
+            // so the original-frame projection produced a wrong outer REML
+            // gradient (verified analytic ≠ central-difference), the Arc
+            // trust-region rejected every step, and the monotone fit parked at
+            // its under-smoothed seed. Use the TRANSFORMED-frame canonical roots
+            // (`reparam_result.canonical_transformed`, the same per-component
+            // roots every other transformed-frame penalty assembly reads) so both
+            // halves of the LAML pair live in `range(Z)` of one frame. The roots
+            // are orthogonal-invariant when `Qs = I` (no reparameterization), so
+            // this is a no-op for the unconstrained / non-reparameterized paths.
+            let transformed = &bundle.pirls_result.reparam_result.canonical_transformed;
+            let projected_roots: Vec<Array2<f64>> = if transformed.len() == rho.len() {
+                transformed
+                    .iter()
+                    .map(|penalty| penalty.full_width_root().dot(z))
+                    .collect()
+            } else {
+                self.canonical_penalties
+                    .iter()
+                    .map(|penalty| penalty.full_width_root().dot(z))
+                    .collect()
+            };
             let (value, penalty_rank, det1, det2_full) = self
                 .structural_penalty_logdet_value_and_derivatives(
                     &projected_roots,
