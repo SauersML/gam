@@ -557,7 +557,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python3 .github/scripts/workflow_tasks.py download_artifacts bench_ bench/artifacts
+          python3 .github/scripts/workflow_tasks.py download_artifacts bench- bench/artifacts
 
       - name: Merge shard JSON outputs
         shell: bash

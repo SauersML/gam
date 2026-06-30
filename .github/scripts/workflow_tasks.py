@@ -154,7 +154,16 @@ def download_artifacts(target_name, out_dir_arg):
     if target_name == "bench-runtime":
         shard_artifacts = [a for a in artifacts if a["name"] == "bench-runtime"]
     else:
-        shard_artifacts = [a for a in artifacts if a["name"].startswith(target_name)]
+        # Shard result artifacts are named `bench-<scenario>`; the heavy
+        # `bench-runtime` toolchain bundle shares the `bench-` prefix but is
+        # NOT a result shard, so exclude it from prefix matches (the aggregate
+        # passes `bench-` to collect every shard without dragging the runtime
+        # bundle back down).
+        shard_artifacts = [
+            a
+            for a in artifacts
+            if a["name"].startswith(target_name) and a["name"] != "bench-runtime"
+        ]
     
     if not shard_artifacts:
         print(f"no artifacts matching {target_name}")
@@ -206,54 +215,72 @@ def format_results():
             return "ok"
         return f"failed: {row.get('error', 'unknown error')}"
 
+    # Each `bench-<scenario>` shard artifact extracts to a `<scenario>.json`
+    # file holding ONE shard payload of the shape `bench/run_suite.py` writes:
+    #   {"created_at_utc": ..., "evaluation": {...}, "results": [<row>, ...]}
+    # where every row is one per-contender measurement (scenario_name,
+    # contender, status, fit_sec, predict_sec, metric columns). The merged
+    # `results.nightly.json` must therefore be a dict carrying the FLATTENED
+    # list of those rows under a "results" key — that is exactly what
+    # `bench/generate_figures.py` (`payload["results"]`) and the nightly
+    # dashboard consume. Recurse + shape-filter the downloaded tree so the
+    # merge is robust to however upload-artifact nested the file inside its
+    # zip, and so a stray non-shard JSON cannot derail the merge.
     root = pathlib.Path("bench/artifacts")
-    results = []
-    for p in root.glob("bench_*.json"):
+    rows = []
+    shard_files = 0
+    for p in sorted(root.rglob("*.json")):
         try:
-            results.append(json.loads(p.read_text()))
+            payload = json.loads(p.read_text())
         except Exception as e:
             print(f"Failed to load {p}: {e}")
+            continue
+        if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+            continue
+        rows.extend(payload["results"])
+        shard_files += 1
 
-    results.sort(key=lambda r: r.get("scenario", ""))
-    
+    merged = {
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "results": rows,
+    }
     with open("bench/results.nightly.json", "w") as f:
-        json.dump(results, f, indent=2)
-    print(f"saved {len(results)} merged results to bench/results.nightly.json")
+        json.dump(merged, f, indent=2)
+    print(
+        f"merged {len(rows)} contender rows from {shard_files} shard file(s) "
+        "into bench/results.nightly.json"
+    )
 
     run_url = f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}"
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    
+
     lines = [
         "## Benchmark Summary",
         f"Run: {run_url}",
         f"Generated: {timestamp}",
+        f"Merged {len(rows)} contender rows from {shard_files} scenario shard(s).",
         "",
-        "| Scenario | Status | N | P | K | Time (s) | Mem (MB) | Epochs | MSE |",
-        "|----------|--------|---|---|---|----------|----------|--------|-----|",
+        "| Scenario | Contender | Status | Fit (s) | Predict (s) |",
+        "|----------|-----------|--------|---------|-------------|",
     ]
-    
-    for r in results:
-        scen = r.get("scenario", "unknown")
+
+    for r in sorted(
+        rows, key=lambda r: (str(r.get("scenario_name", "")), str(r.get("contender", "")))
+    ):
+        scen = r.get("scenario_name", "unknown")
+        contender = r.get("contender", "unknown")
         stat = fmt_status(r)
-        
-        meta = r.get("metadata", {})
-        n_val = meta.get("n", "—")
-        p_val = meta.get("p", "—")
-        k_val = meta.get("k", "—")
-        
-        metrics = r.get("metrics", {})
-        time_val = fmt_num(metrics.get("time_seconds"))
-        mem_val = fmt_num(metrics.get("memory_peak_mb"), digits=1)
-        epochs = metrics.get("epochs", "—")
-        mse_val = fmt_num(metrics.get("mse_train"))
-        
-        lines.append(f"| {scen} | {stat} | {n_val} | {p_val} | {k_val} | {time_val} | {mem_val} | {epochs} | {mse_val} |")
-    
+        fit_s = fmt_num(r.get("fit_sec"), digits=2)
+        pred_s = fmt_num(r.get("predict_sec"), digits=2)
+        lines.append(f"| {scen} | {contender} | {stat} | {fit_s} | {pred_s} |")
+
     summary = "\n".join(lines)
     print(summary)
-    
-    with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
-        f.write(summary + "\n")
+
+    step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if step_summary:
+        with open(step_summary, "a") as f:
+            f.write(summary + "\n")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
