@@ -1361,6 +1361,37 @@ mod tests {
     }
 
     #[test]
+    fn stiefel_k2_round_trip_and_mean_n_lt_2k() {
+        // St(3, 2): three orthonormal 2-frames in ℝ³ clustered near [e0, e1],
+        // exercising the genuine canonical-metric logarithm (k ≥ 2) through the
+        // full Karcher-mean → log → exp round trip. This is the n < 2k regime
+        // (n = 3 < 2k = 4) where the economical 2k-block form is rank-deficient.
+        // Before the k ≥ 2 Stiefel logarithm existed this aborted in
+        // Fréchet-mean init with a misleading cut-locus error (#1637).
+        let (c2, s2) = (0.2_f64.cos(), 0.2_f64.sin());
+        let (c1, s1) = (0.15_f64.cos(), 0.15_f64.sin());
+        let values = array![
+            [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            [c2, 0.0, 0.0, 1.0, s2, 0.0],
+            [1.0, 0.0, 0.0, c1, 0.0, s1],
+        ];
+        round_trip(ResponseManifold::Stiefel { k: 2, n: 3 }, values);
+    }
+
+    #[test]
+    fn stiefel_k2_round_trip_and_mean_n_ge_2k() {
+        // St(4, 2): the n ≥ 2k regime (n = 4 = 2k), clustered 2-frames in ℝ⁴.
+        let (c0, s0) = (0.1_f64.cos(), 0.1_f64.sin());
+        let (c1, s1) = (0.12_f64.cos(), 0.12_f64.sin());
+        let values = array![
+            [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            [c0, 0.0, 0.0, 1.0, s0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, c1, 0.0, 0.0, 0.0, s1],
+        ];
+        round_trip(ResponseManifold::Stiefel { k: 2, n: 4 }, values);
+    }
+
+    #[test]
     fn poincare_round_trip_and_mean() {
         let values = array![[0.1, 0.2], [-0.3, 0.1], [0.2, -0.25],];
         round_trip(
