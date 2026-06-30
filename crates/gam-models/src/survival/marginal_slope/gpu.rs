@@ -844,11 +844,14 @@ impl SurvivalFlexGpuBackend {
             return existing.clone();
         }
         let result = (|| {
-            let ptx = cudarc::nvrtc::compile_ptx(SURVIVAL_FLEX_INTERCEPT_SOLVE_SOURCE).map_err(
-                |err| GpuError::DriverCallFailed {
+            // Shared arch+fmad options (NOT bare `compile_ptx`): #1686's
+            // `--fmad=false` keeps the Newton intercept solve bit-comparable to
+            // the CPU path, and the #1551 arch pin keys the kernel to the real
+            // device compute capability rather than NVRTC's pre-sm_60 default.
+            let ptx = gam_gpu::device_cache::compile_ptx_arch(SURVIVAL_FLEX_INTERCEPT_SOLVE_SOURCE)
+                .map_err(|err| GpuError::DriverCallFailed {
                     reason: format!("survival_flex intercept-solve NVRTC compile: {err}"),
-                },
-            )?;
+                })?;
             self.inner
                 .ctx
                 .load_module(ptx)
@@ -1302,11 +1305,15 @@ pub fn pullback_step6_joint_beta(
 // host reference's sequential row accumulation — so the cross-row reduction order
 // is identical.  The device total therefore agrees with `pullback_step6_joint_beta`
 // to a small multiple of ULP, NOT bit-for-bit: the per-row `M = H_p·J` inner
-// products reassociate and the device contracts them with fused multiply-add
-// (FMA), so the last bit differs from the host's separate-rounding scalar loop
-// (measured ~2e-16 on a Tesla V100). That is a #1175 reassociation/FMA difference,
-// not an algebra mismatch; parity tests therefore use a relative band, not
-// `assert_eq!`.  The expensive O(r²p + r·p²) per-row contraction runs on the
+// products reassociate (the device sums each contraction in a different order
+// than the host's separate-rounding scalar loop), so the last bits differ
+// (measured worst abs ~2.8e-14 on a Tesla V100). This is the residual AFTER
+// #1686 disabled NVRTC FMA contraction (this module now compiles through
+// `device_cache::compile_ptx_arch`, so `--fmad=false`): the drift is therefore
+// pure reassociation, NOT FMA — fmad=false did not remove it. A #1175
+// floating-point-order difference, not an algebra mismatch; parity tests
+// therefore use a relative band, not `assert_eq!`.  The expensive
+// O(r²p + r·p²) per-row contraction runs on the
 // device; the cheap O(n·p²) row reduction stays on the host in CPU order.
 //
 // Concatenated SoA layout (host builds once, uploads once):
@@ -1489,8 +1496,9 @@ extern "C" __global__ void survival_flex_step6_rows(
 /// Device Step-6 joint-β contraction.  Returns `Ok(None)` on non-Linux / no-CUDA
 /// builds (caller folds on the host via [`pullback_step6_joint_beta`]); returns
 /// `(nll, grad, hess)` agreeing with the host reference to a small ULP multiple
-/// on a healthy CUDA device (NOT bit-exact — the per-row contraction reassociates
-/// and uses FMA; see the Step-6 device section comment and #1175).
+/// on a healthy CUDA device (NOT bit-exact — the per-row contraction reassociates;
+/// FMA is off under #1686's --fmad=false, so the residual is pure reassociation,
+/// see the Step-6 device section comment and #1175).
 ///
 /// The per-row dense contraction (`Jᵀ g_p`, `Jᵀ H_p J`) runs on the GPU; the
 /// per-row partials are summed on the host in row order so the cross-row reduction
@@ -1538,11 +1546,19 @@ impl SurvivalFlexGpuBackend {
             return existing.clone();
         }
         let result = (|| {
-            let ptx = cudarc::nvrtc::compile_ptx(SURVIVAL_FLEX_STEP6_SOURCE).map_err(|err| {
-                GpuError::DriverCallFailed {
+            // Compile through the shared arch+fmad options (NOT bare
+            // `compile_ptx`). #1686 set `--fmad=false` in those options so the
+            // per-row `M = H_p·J` contraction is FMA-free and bit-comparable to
+            // the separately-rounded CPU pullback `pullback_step6_joint_beta`;
+            // bare `compile_ptx` leaves NVRTC at `--fmad=true`, fusing `a*b+c`
+            // into one rounding and drifting ~2e-16 from the CPU oracle. The
+            // arch pin (#1551) keys the kernel to the device's real compute
+            // capability instead of NVRTC's pre-sm_60 default.
+            let ptx = gam_gpu::device_cache::compile_ptx_arch(SURVIVAL_FLEX_STEP6_SOURCE).map_err(
+                |err| GpuError::DriverCallFailed {
                     reason: format!("survival_flex step6 NVRTC compile: {err}"),
-                }
-            })?;
+                },
+            )?;
             self.inner
                 .ctx
                 .load_module(ptx)
@@ -2655,9 +2671,10 @@ mod step6_tests {
         // reference sums each row's contraction in a fixed scalar order; on a
         // CUDA host the entry points route the SAME contraction through the
         // device kernel `survival_flex_step6_rows`, whose per-row `M = H_p·J`
-        // reduction reassociates and uses fused multiply-add. That is an
-        // irreducible ~ULP reassociation difference, NOT an algebra mismatch, so
-        // a bit-exact `assert_eq!` is wrong on a GPU box (it fails by ~2e-16).
+        // reduction reassociates (sums in a different order). FMA is off under
+        // #1686's --fmad=false, so that is an irreducible ~ULP reassociation
+        // difference, NOT an algebra mismatch, so a bit-exact `assert_eq!` is
+        // wrong on a GPU box (it fails by ~2.8e-14 measured on a V100).
         // Use a relative band `atol + rtol·(1+|expected|)` — the SAME principle
         // as the sibling `step6_device_contraction_matches_cpu_reference` — which
         // a real contraction bug (O(value)) would still blow through.
@@ -2778,9 +2795,12 @@ mod step6_tests {
 
         match try_device_step6_joint_beta(&rows, p).expect("device step6") {
             Some((gpu_nll, gpu_grad, gpu_hess)) => {
-                // Bit-tight: the per-row contraction uses the same blocked
+                // Near-tight: the per-row contraction uses the same blocked
                 // M=H_pJ order and rows are summed in order, so the only slack is
                 // FP non-associativity inside each output's per-element reduction.
+                // With #1686's --fmad=false active the FMA component is gone;
+                // the residual is pure reassociation (measured worst abs 2.8e-14
+                // on a V100), well inside the band below.
                 let tol = 1e-12;
                 assert!(
                     (gpu_nll - cpu_nll).abs() <= tol * (1.0 + cpu_nll.abs()),

@@ -80,6 +80,15 @@ whose per-row `M=H_p·J` contraction reassociates + uses FMA → ~2e-16 drift.
 - Corrected two "bit-for-bit / to the last ULP" comments that the V100 falsifies
   (FMA/reassociation in the device contraction).
 - Verified PASS on V100 (failed before, passes after).
+- POST-#1686 (2026-06-30): both step6 + intercept-solve kernels were STILL on
+  bare `compile_ptx` (fmad=true, no arch pin) — #1686 only fixed survival_rowjet.
+  Routed both through `compile_ptx_arch` so they inherit #1686's fmad=false +
+  the #1551 arch pin (neither uses atomicAdd/includes, so no silent-fallback
+  risk, but fmad=true left the M=H_p·J contraction needlessly FMA-fused).
+  Re-measured step6 device-vs-CPU worst abs drift with fmad=false: 2.84e-14 —
+  NOT bit-exact, so the residual is pure REASSOCIATION (different reduction
+  order), not FMA. Corrected the comments crediting FMA. Band unchanged
+  (atol+rtol·(1+|x|), rtol=1e-12; 2.8e-14 sits ~comfortably inside).
 
 ## FINDING 3 (2026-06-30) — cubic_cell device kernel NVRTC-broke on every GPU box
 `gpu_kernels::cubic_cell::device::tests::cubic_cell_device_residency_matches_cpu_all_branches`
