@@ -178,6 +178,86 @@ pub fn score_block_required(
     Ok((score_block_cpu(rows, atoms), ScoreBlockPath::Cpu))
 }
 
+/// Route a whole minibatch of rows against the full decoder, returning each
+/// row's top-`s` `(atom, score)` selection — BIT-IDENTICAL to calling
+/// [`super::scoring::top_s_online`] per row, but with the `m × K` score block
+/// computed in one device launch when admitted.
+///
+/// The selection ([`super::scoring::TopSSelector`]) is single-sourced on the
+/// CPU and fed the device scores in ascending atom order — the SAME order
+/// `top_s_online` folds them (tiles ascending, atoms-within-tile ascending). The
+/// selector's result depends only on the offered `(atom, score)` pairs, and the
+/// scores are bit-identical (the kernel forbids FMA contraction), so the routed
+/// support matches the CPU oracle exactly regardless of which path computed the
+/// block.
+///
+/// Falls back to the per-row CPU `top_s_online` under [`gam_gpu::GpuMode::Off`],
+/// below the device break-even, or on any device error under
+/// [`gam_gpu::GpuMode::Auto`]; under [`gam_gpu::GpuMode::Required`] a device
+/// failure is propagated. The returned [`ScoreBlockPath`] reports which path ran.
+///
+/// # Errors
+/// Returns [`gam_gpu::GpuError`] when [`gam_gpu::GpuMode::Required`] is set but
+/// the device path cannot run for this minibatch.
+pub fn route_minibatch_required(
+    rows: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
+    s: usize,
+    tile: usize,
+    mode: gam_gpu::GpuMode,
+) -> Result<(Vec<Vec<(u32, f32)>>, ScoreBlockPath), gam_gpu::GpuError> {
+    use super::scoring::{TopSSelector, top_s_online};
+
+    let m = rows.nrows();
+    let k = decoder.nrows();
+
+    // CPU per-row path (bit-identical oracle), used for Off / below break-even /
+    // Auto device-error fallback.
+    let cpu_route = || -> Vec<Vec<(u32, f32)>> {
+        rows.outer_iter()
+            .map(|row| top_s_online(row, decoder, s, tile))
+            .collect()
+    };
+
+    if mode == gam_gpu::GpuMode::Off {
+        return Ok((cpu_route(), ScoreBlockPath::Cpu));
+    }
+
+    let (block, path) = match score_block_required(rows, decoder, mode) {
+        Ok(out) => out,
+        Err(err) => {
+            if mode == gam_gpu::GpuMode::Required {
+                return Err(err);
+            }
+            // Auto with a non-Required error already degrades inside
+            // score_block_required, so this arm is unreachable in practice; keep
+            // it total for safety.
+            return Ok((cpu_route(), ScoreBlockPath::Cpu));
+        }
+    };
+
+    if path == ScoreBlockPath::Cpu {
+        // Below break-even (or Off): the per-row tiled path is cheaper and is the
+        // exact same arithmetic — use it directly rather than re-folding a block
+        // the device never produced.
+        return Ok((cpu_route(), ScoreBlockPath::Cpu));
+    }
+
+    // Device block: fold each row's K scores into a selector in ASCENDING atom
+    // order (the order top_s_online uses), giving a bit-identical selection.
+    let routed = (0..m)
+        .map(|r| {
+            let mut sel = TopSSelector::new(s);
+            let base = r * k;
+            for (a, score) in block[base..base + k].iter().enumerate() {
+                sel.offer(a as u32, *score);
+            }
+            sel.finish()
+        })
+        .collect();
+    Ok((routed, ScoreBlockPath::Device))
+}
+
 mod device {
     use super::score_block_kernel_source;
     use gam_gpu::gpu_error::{GpuError, GpuResultExt};
@@ -355,6 +435,79 @@ mod tests {
         score_row_tile(rows.row(0), atoms.view(), 0, &mut sel);
         let picked = sel.finish();
         assert!(picked.len() <= 3 && !picked.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn device_route_minibatch_matches_cpu_top_s_online() {
+        // The router primitive the fit loop actually calls. The m×K block MUST
+        // clear DEVICE_SCORE_BLOCK_MIN_ELEMS so the device path is admitted. On a
+        // CUDA host we drive Required (silent CPU fallback = hard failure) and
+        // assert the routed top-s support EQUALS the per-row CPU `top_s_online`
+        // oracle exactly — same atoms, same bit-identical scores, same order.
+        use crate::sparse_dict::scoring::top_s_online;
+
+        let m = 512usize;
+        let k = 4096usize; // 512*4096 = 2,097,152 >= DEVICE_SCORE_BLOCK_MIN_ELEMS
+        let p = 48usize;
+        let s = 4usize;
+        let tile = 1024usize;
+        assert!(m * k >= DEVICE_SCORE_BLOCK_MIN_ELEMS);
+        let (rows, atoms) = fixture(m, k, p);
+
+        let cpu: Vec<Vec<(u32, f32)>> = rows
+            .outer_iter()
+            .map(|row| top_s_online(row, atoms.view(), s, tile))
+            .collect();
+
+        match route_minibatch_required(
+            rows.view(),
+            atoms.view(),
+            s,
+            tile,
+            gam_gpu::GpuMode::Required,
+        ) {
+            Ok((routed, path)) => {
+                assert_eq!(
+                    path,
+                    ScoreBlockPath::Device,
+                    "Required succeeded but reported CPU — device did not engage"
+                );
+                assert_eq!(routed.len(), cpu.len());
+                for (r, (dev_sel, cpu_sel)) in routed.iter().zip(&cpu).enumerate() {
+                    assert_eq!(
+                        dev_sel.len(),
+                        cpu_sel.len(),
+                        "row {r}: selection length differs"
+                    );
+                    for (j, ((da, ds), (ca, cs))) in dev_sel.iter().zip(cpu_sel).enumerate() {
+                        assert_eq!(da, ca, "row {r} slot {j}: atom differs dev={da} cpu={ca}");
+                        assert_eq!(
+                            ds.to_bits(),
+                            cs.to_bits(),
+                            "row {r} slot {j}: score bits differ dev={ds} cpu={cs}"
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                assert!(
+                    gam_gpu::GpuRuntime::global().is_none(),
+                    "Required errored despite a live CUDA runtime: {err}"
+                );
+                // Device absent: Auto must reproduce the CPU oracle exactly.
+                let (routed, path) = route_minibatch_required(
+                    rows.view(),
+                    atoms.view(),
+                    s,
+                    tile,
+                    gam_gpu::GpuMode::Auto,
+                )
+                .expect("Auto must not error on a device-absent host");
+                assert_eq!(path, ScoreBlockPath::Cpu);
+                assert_eq!(routed, cpu);
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
