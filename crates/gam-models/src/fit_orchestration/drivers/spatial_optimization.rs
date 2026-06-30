@@ -4601,7 +4601,6 @@ fn run_exact_joint_spatial_optimization(
             Ok(audit) => audit.log_verdict("spatial-exact-joint"),
             Err(e) => log::warn!("[OUTER-FD-AUDIT/spatial-exact-joint] skipped: {e}"),
         }
-        }
     }
 
     let kphase_prime_order = if analytic_outer_hessian_available && !suppress_outer_hessian_for_nfree {
