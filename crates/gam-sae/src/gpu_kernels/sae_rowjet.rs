@@ -348,6 +348,102 @@ pub fn sae_row_jets_softmax(
     sae_row_jets_cpu_softmax(rows, k, p, inv_tau)
 }
 
+/// Which path produced a [`SaeRowJetChannels`] result. Returned by the
+/// fail-loud entry point so a caller (and the parity tests) can ASSERT the
+/// device genuinely engaged instead of silently falling back to the CPU — the
+/// recurring #1026/#1551 failure mode where "GPU" code reports success while
+/// every row was actually contracted on the host (GPU 0%).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaeRowJetPath {
+    /// The NVRTC `sae_rowjet_softmax` kernel compiled and ran on the device.
+    Device,
+    /// The host `Order2<K>` jet ran (no Linux / no CUDA runtime / below the
+    /// `DEVICE_ROW_THRESHOLD` launch break-even).
+    Cpu,
+}
+
+/// Fail-loud, residency-aware entry point (the #1026 / #1551 charter gate).
+///
+/// Unlike [`sae_row_jets_softmax`], which silently swallows any device error
+/// and degrades to the CPU (correct for [`GpuMode::Auto`], but it leaves the
+/// caller unable to tell the device from a host fallback), this honours the
+/// process-wide [`GpuMode`] residency contract:
+///
+/// * [`GpuMode::Required`] — the device MUST run. No CUDA runtime, an NVRTC
+///   compile failure on this arch, a launch fault, or a batch below the launch
+///   break-even all return `Err(GpuError)` instead of quietly running on the
+///   CPU. This is what makes the GPU path *provable*: a `Required` caller that
+///   gets `Ok` knows the kernel ran on the device.
+/// * [`GpuMode::Auto`] — opportunistic: use the device when admitted and the
+///   batch clears the break-even, else fall back to the CPU. Returns
+///   `Ok((channels, SaeRowJetPath::Cpu))` on fallback (never `Err`), preserving
+///   [`sae_row_jets_softmax`]'s behaviour while still reporting which path ran.
+/// * [`GpuMode::Off`] — always the CPU; returns `Ok((_, Cpu))`.
+///
+/// Both paths run the SAME unified [`Order2<K>`] jet, so when the device runs
+/// its channels match the CPU oracle to round-off (proven ≤1e-9; the parity
+/// tests assert it on this box's real V100).
+///
+/// # Errors
+/// Returns [`GpuError`] when [`GpuMode::Required`] is set but the device path
+/// cannot run (no runtime, NVRTC/arch failure, launch fault, or a batch below
+/// [`DEVICE_ROW_THRESHOLD`]).
+pub fn sae_row_jets_softmax_required(
+    rows: &[SaeSoftmaxRowInputs],
+    k: usize,
+    p: usize,
+    inv_tau: f64,
+    mode: gam_gpu::GpuMode,
+) -> Result<(SaeRowJetChannels, SaeRowJetPath), gam_gpu::GpuError> {
+    use gam_gpu::GpuMode;
+
+    if mode == GpuMode::Off {
+        return Ok((
+            sae_row_jets_cpu_softmax(rows, k, p, inv_tau),
+            SaeRowJetPath::Cpu,
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let below_breakeven = rows.len() < DEVICE_ROW_THRESHOLD;
+        if mode == GpuMode::Required && below_breakeven {
+            return Err(gam_gpu::gpu_err!(
+                "sae_rowjet GpuMode::Required: batch of {} rows is below the device \
+                 launch break-even (DEVICE_ROW_THRESHOLD={DEVICE_ROW_THRESHOLD}); \
+                 refusing to silently run on the CPU",
+                rows.len()
+            ));
+        }
+        if !below_breakeven {
+            match device::sae_row_jets_softmax_device(rows, k, p, inv_tau) {
+                Ok(out) => return Ok((out, SaeRowJetPath::Device)),
+                Err(err) => {
+                    if mode == GpuMode::Required {
+                        // Fail loud: do NOT degrade to the CPU under Required.
+                        return Err(err);
+                    }
+                    // Auto: fall through to the CPU (accelerator, not oracle).
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        if mode == GpuMode::Required {
+            return Err(gam_gpu::gpu_err!(
+                "sae_rowjet GpuMode::Required: no CUDA device on a non-Linux host"
+            ));
+        }
+    }
+
+    Ok((
+        sae_row_jets_cpu_softmax(rows, k, p, inv_tau),
+        SaeRowJetPath::Cpu,
+    ))
+}
+
 /// Contract the per-row reconstruction jet channels into the Gauss-Newton data
 /// curvature the arrow-Schur logdet consumer factorises:
 /// `H_tt[a][b] = Σ_c first[a][c]·first[b][c]` (the `⟨J_a, J_b⟩` block #932
