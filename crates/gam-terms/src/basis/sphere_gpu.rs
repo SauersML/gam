@@ -654,14 +654,17 @@ impl SphereGpuBackend {
                 return Ok(existing.clone());
             }
         }
-        // CompileOptions in cudarc 0.19 takes `arch: Option<&'static str>`
-        // which we cannot satisfy with a runtime-built string. Prepend the
-        // `LMAX` macro directly to the source so the NVRTC compile is a
-        // pure `compile_ptx`, matching the sibling kernels' invocation
-        // pattern. The kernel itself targets the device the driver
-        // reports (Volta+).
+        // Prepend the `LMAX` macro directly to the source, then compile through
+        // the shared arch+fmad options (`compile_ptx_arch`). #1686's
+        // `--fmad=false` keeps the spherical-harmonic evaluation bit-comparable
+        // to the separately-rounded CPU reference; the #1551 arch pin keys the
+        // kernel to the device's real compute capability. (The arch is resolved
+        // internally via `nvrtc_arch()` from a `&'static str` table, so the old
+        // "cannot satisfy arch with a runtime string" limitation no longer
+        // applies — the LMAX specialization rides in the source, the arch in
+        // the options.)
         let src = format!("#define LMAX {}\n{}", key.lmax, KERNEL_TEMPLATE);
-        let ptx = cudarc::nvrtc::compile_ptx(&src).gpu_ctx_with(|err| {
+        let ptx = gam_gpu::device_cache::compile_ptx_arch(&src).gpu_ctx_with(|err| {
             format!(
                 "sphere NVRTC compile (kind={}, lmax={}): {err}",
                 key.kind.tag(),
@@ -2128,6 +2131,53 @@ mod sphere_gpu_tests {
         assert_eq!(x_s_cpu.dim(), (n, p));
         assert_eq!(x_s_gpu.dim(), (n, p));
 
+        // PRIMARY GPU-OUTPUT PARITY (#1175): the only path-dependent quantity is
+        // the GPU kernel matrix `K(data, centers)` → `x_s`. THIS is the genuine
+        // device output and it must match the CPU kernel essentially bit-tight.
+        // The downstream β is the solution of an ill-conditioned normal-equation
+        // system that AMPLIFIES this difference by cond(XᵀX+λS) (see below), so
+        // β is the wrong surface to gate at a flat 1e-9 — it tests the
+        // conditioning of a SHARED CPU solve, not the GPU. Gate the GPU output
+        // (x_s) tight; gate β with a condition-aware band; gate ŷ (the
+        // customer-visible prediction) tight.
+        let mut raw_xs_delta = 0.0_f64;
+        let mut xs_scale = 0.0_f64;
+        for (a, b) in x_s_cpu.iter().zip(x_s_gpu.iter()) {
+            raw_xs_delta = raw_xs_delta.max((a - b).abs());
+            xs_scale = xs_scale.max(a.abs());
+        }
+        // Condition number of A = XᵀX + λS (CPU path) via symmetric eigvals;
+        // this is the factor that maps the x_s difference into the β difference.
+        let cond = {
+            use gam_linalg::faer_ndarray::FaerEigh;
+            let xtx = x_s_cpu.t().dot(&x_s_cpu);
+            let mut a = xtx;
+            for i in 0..p {
+                for j in 0..p {
+                    a[(i, j)] += lambda * s_full[(i, j)];
+                }
+            }
+            let (mut lo, mut hi) = (f64::INFINITY, 0.0_f64);
+            if let Ok((vals, _)) = a.eigh(faer::Side::Lower) {
+                for &v in vals.iter() {
+                    lo = lo.min(v);
+                    hi = hi.max(v);
+                }
+            }
+            hi / lo.max(1e-300)
+        };
+        // GPU kernel output must be bit-tight to the CPU oracle: measured on a
+        // V100 the raw design parity is ~1e-16 (one ULP, rel ~1.2e-15). Gate at
+        // a small ULP-scaled band — a real kernel bug perturbs x_s at O(scale),
+        // 14+ orders above this floor.
+        assert!(
+            raw_xs_delta <= 1e-12 * xs_scale.max(1.0),
+            "GPU vs CPU sphere design matrix max |Δ| = {raw_xs_delta:.3e} > {:.3e} \
+             (scale {xs_scale:.3e}) — the kernel itself drifted (this is the genuine \
+             GPU output, NOT a conditioning artifact)",
+            1e-12 * xs_scale.max(1.0)
+        );
+
         // Deterministic synthetic response. The intent is to give the
         // penalised LS solve a non-trivial right-hand side; any smooth
         // function of the lat/lon is fine. Use a fixed-seed pseudo-
@@ -2189,16 +2239,39 @@ mod sphere_gpu_tests {
 
         eprintln!(
             "[sphere_gpu fit parity] n={n} m={m} p={p} lmax={lmax} λ={lambda:.1e} \
+             raw_xs|Δ|={raw_xs_delta:.3e} cond={cond:.3e} \
              max|Δβ|={max_beta_delta:.3e} max|Δŷ|={max_fit_delta:.3e}"
         );
 
-        assert!(
-            max_beta_delta <= 1.0e-9,
-            "GPU vs CPU truncated-spectral coefficient max |Δ| = {max_beta_delta:.3e} > 1e-9"
-        );
+        // FITTED VALUES (the customer-visible prediction) must be tight. ŷ is a
+        // well-conditioned functional of the data even when β is not (the
+        // ill-conditioned directions of A correspond to β components that x_s
+        // barely projects onto, so they cancel in ŷ = x_s·β). Measured on a
+        // V100: max|Δŷ| ~7.6e-11. Gate tight — this is the quantity that
+        // actually matters and it does NOT inherit the conditioning blow-up.
         assert!(
             max_fit_delta <= 1.0e-9,
             "GPU vs CPU truncated-spectral fitted-value max |Δ| = {max_fit_delta:.3e} > 1e-9"
+        );
+
+        // COEFFICIENTS: β = A⁻¹ Xᵀy with A = XᵀX + λS. Standard perturbation
+        // theory bounds the relative coefficient error by cond(A) times the
+        // relative input (x_s) error: ‖Δβ‖/‖β‖ ≲ cond(A)·‖Δx_s‖/‖x_s‖. With the
+        // GPU/CPU x_s difference at the ULP floor (~1e-16 relative) and
+        // cond(A) ≈ 5e7 on this fixture, β legitimately differs by ~1e-7 — NOT
+        // a kernel bug (the raw design parity gate above already proved the GPU
+        // output is bit-tight). A flat 1e-9 β gate is therefore wrong: it
+        // measures the conditioning of the SHARED CPU solve, not the GPU. Gate
+        // β against the condition-aware bound with 16× headroom; a genuine
+        // kernel defect would already have been caught upstream by the raw x_s
+        // gate (which has no conditioning amplification).
+        let beta_tol = (1e-15 * cond * (1.0 + xs_scale)).max(1e-9) * 16.0;
+        assert!(
+            max_beta_delta <= beta_tol,
+            "GPU vs CPU truncated-spectral coefficient max |Δ| = {max_beta_delta:.3e} > \
+             condition-aware tol {beta_tol:.3e} (cond={cond:.3e}). Raw design parity is \
+             {raw_xs_delta:.3e}; a drift THIS much larger than cond·ULP is a real solve/kernel \
+             mismatch, not conditioning."
         );
     }
 }
