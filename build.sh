@@ -185,12 +185,66 @@ serve_cache() {  # args: label — restore the cached log, record, finish in ~0s
   record "$REQ" "$label" "$code" 0
   finish "$code" "$label"
 }
-# Run CMD under the global single-flight lock; sets globals code + DUR + $LOG.
+# Available-RAM probe (GiB). macOS: free+inactive+speculative pages; Linux:
+# MemAvailable. Returns nonzero if it can't tell (callers then proceed).
+current_free_gb() {
+  local pg free inact spec stats
+  if pg=$(sysctl -n hw.pagesize 2>/dev/null); then
+    stats=$(vm_stat 2>/dev/null) || return 1
+    free=$(awk '/Pages free/{gsub(/\./,"",$3);print $3}' <<<"$stats")
+    inact=$(awk '/Pages inactive/{gsub(/\./,"",$3);print $3}' <<<"$stats")
+    spec=$(awk '/Pages speculative/{gsub(/\./,"",$3);print $3}' <<<"$stats")
+    [[ -z "$free" ]] && return 1
+    echo $(( ( ( ${free:-0} + ${inact:-0} + ${spec:-0} ) * pg ) / 1073741824 )); return 0
+  elif [[ -r /proc/meminfo ]]; then
+    awk '/MemAvailable/{print int($2/1048576); f=1} END{exit !f}' /proc/meminfo; return $?
+  fi
+  return 1
+}
+# Block until the box has enough free RAM to start a compile, so we WAIT for a
+# concurrent build (gam or foreign — polars/gnomon/another toolchain that our
+# lock can't serialize) to free memory instead of launching into an OOM-SIGKILL.
+# Bounded: after MEM_WAIT_MAX we proceed anyway and let the retry loop cope.
+wait_for_memory() {
+  local need="${GAM_MIN_FREE_RAM_GB:-3}" maxw="${GAM_MEM_WAIT_MAX:-300}" waited=0 fg
+  while :; do
+    fg=$(current_free_gb) || return 0          # can't measure → just proceed
+    [[ "$fg" -ge "$need" ]] && return 0
+    (( waited >= maxw )) && { echo "[build.sh] proceeding with only ${fg}G free after ${waited}s wait (<${need}G)" >&2; return 0; }
+    (( waited % 30 == 0 )) && echo "[build.sh] waiting for RAM headroom: ${fg}G free, need ${need}G (other builds running)…" >&2
+    sleep 6; waited=$((waited+6))
+  done
+}
+# An OOM-SIGKILL of a child rustc makes cargo exit 101 (NOT 137) with
+# "(signal: 9, SIGKILL)" in its output — indistinguishable from a real compile
+# error by exit code alone. Detect timeout / direct-signal / OOM and treat them
+# as TRANSIENT: never cached, auto-retried. Uses globals: code, $LOG.
+is_transient() {
+  (( code == 124 )) && return 0        # timeout(1) wall-clock kill
+  (( code >= 128 )) && return 0        # killed by a signal directly
+  (( code == 0 ))   && return 1
+  grep -qiE 'signal: 9|SIGKILL|process did not exit successfully.*signal|: Killed|out of memory|Cannot allocate memory|memory allocation of .* bytes failed|LLVM ERROR: out of memory' "$LOG" 2>/dev/null
+}
+# Run CMD under the global single-flight lock with a memory gate + auto-retry on
+# transient (OOM/timeout) failures. Holds the lock across retries so we stay next
+# in line. Sets globals code + DUR + $LOG.
 run_under_global_lock() {
   exec 9>"$LOCK"; flock -x 9
   cd "$REPO" || exit 1
-  local t0; t0=$(ep)
-  timeout "$TIMEOUT" "${CMD[@]}" >"$LOG" 2>&1; code=$?; DUR=$(( $(ep)-t0 ))
+  local attempt=0 max="${GAM_BUILD_RETRIES:-3}" t0
+  while :; do
+    attempt=$((attempt+1))
+    wait_for_memory
+    t0=$(ep); timeout "$TIMEOUT" "${CMD[@]}" >"$LOG" 2>&1; code=$?; DUR=$(( $(ep)-t0 ))
+    if is_transient; then
+      if (( attempt < max )); then
+        echo "[build.sh] transient failure (OOM/timeout, exit $code) attempt $attempt/$max — backing off for memory, retrying…" >&2
+        sleep $(( attempt * 12 )); continue
+      fi
+      echo "[build.sh] still transiently failing (exit $code) after $max attempts — giving up this round." >&2
+    fi
+    break
+  done
   flock -u 9
 }
 # Atomically commit code+log to the cache (log first, code file is the commit marker).
@@ -210,8 +264,8 @@ run_request() {
   # Forced run: skip cache-read + coalescing, execute, then refresh the cache.
   if [[ -n "${GAM_FORCE:-}" ]]; then
     run_under_global_lock
-    if (( code == 124 || code >= 128 )); then
-      record "$REQ" "FORCE(transient)" "$code" "$DUR"; echo "TRANSIENT FAILURE ($code) — retry"; exit 75
+    if is_transient; then
+      record "$REQ" "FORCE(transient)" "$code" "$DUR"; echo "TRANSIENT FAILURE ($code, OOM/timeout) — retry"; exit 75
     fi
     write_cache; record "$REQ" "FORCE" "$code" "$DUR"; finish "$code" "FORCE"
   fi
@@ -230,9 +284,9 @@ run_request() {
       flock -u 8; serve_cache "HIT"
     fi
     run_under_global_lock
-    if (( code == 124 || code >= 128 )); then
+    if is_transient; then
       record "$REQ" "MISS(transient)" "$code" "$DUR"; flock -u 8
-      echo "TRANSIENT FAILURE ($code) — retry"; exit 75
+      echo "TRANSIENT FAILURE ($code, OOM/timeout) — retry"; exit 75
     fi
     write_cache; record "$REQ" "MISS" "$code" "$DUR"; flock -u 8
     finish "$code" "MISS"
