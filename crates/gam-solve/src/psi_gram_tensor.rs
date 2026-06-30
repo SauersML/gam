@@ -714,24 +714,34 @@ impl PsiGramTensor {
         }
         let span = self.psi_hi - self.psi_lo;
         let psi_at = |i: usize| self.psi_lo + span * (i as f64) / ((NODES - 1) as f64);
-        // Clamp the anchor into the window, then map it to the nearest grid node.
+        let ranks: Vec<Option<usize>> =
+            (0..NODES).map(|i| self.gram_numerical_rank(psi_at(i))).collect();
+        // Target the MAXIMAL numerical rank attained anywhere in the window — the
+        // full-rank "good" geometry the skip certifies. Anchoring on the seed's own
+        // rank would be fragile if the seed happened to land in a deficient spot;
+        // the window-max is the rank the κ-optimum's neighbourhood must hold.
+        let max_rank = ranks.iter().filter_map(|r| *r).max()?;
+        // Map the anchor to the nearest grid node, then snap UP to the nearest node
+        // at maximal rank (so the band edge is measured from inside the good band
+        // even if the seed sits just below the cliff). If no max-rank node exists
+        // at/above the anchor, there is nothing to protect below it.
         let anchor = psi_anchor.clamp(self.psi_lo, self.psi_hi);
         let anchor_idx = (((anchor - self.psi_lo) / span) * ((NODES - 1) as f64))
             .round()
             .clamp(0.0, (NODES - 1) as f64) as usize;
-        let anchor_rank = self.gram_numerical_rank(psi_at(anchor_idx))?;
-        // Walk DOWN from the anchor; the floor is the lowest node from which every
-        // node up to the anchor holds `anchor_rank`. Stop at the first node below.
-        let mut floor_idx = anchor_idx;
-        for i in (0..anchor_idx).rev() {
-            if self.gram_numerical_rank(psi_at(i)) == Some(anchor_rank) {
+        let band_idx = (anchor_idx..NODES).find(|&i| ranks[i] == Some(max_rank))?;
+        // Walk DOWN from the band node; the floor is the lowest node from which
+        // every node up to it holds `max_rank`. Stop at the first node below.
+        let mut floor_idx = band_idx;
+        for i in (0..band_idx).rev() {
+            if ranks[i] == Some(max_rank) {
                 floor_idx = i;
             } else {
                 break;
             }
         }
         if floor_idx == 0 {
-            // The anchor's rank band already reaches `psi_lo` — no lift needed.
+            // The maximal-rank band already reaches `psi_lo` — no lift needed.
             None
         } else {
             Some(psi_at(floor_idx))
@@ -1095,6 +1105,100 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #1033 rank-stable κ-floor: the conditioned radial Gram goes numerically
+    /// rank-deficient at the LARGE-length-scale (small-ψ) window edge — the
+    /// `synth_design` Matérn columns over a narrow `r`-range collapse toward the
+    /// polynomial nullspace there. `rank_stable_psi_floor` must (a) detect that the
+    /// maximal-rank band does NOT reach `psi_lo` and return a floor strictly inside
+    /// the window, (b) report that floor as the lower edge of the maximal-rank band
+    /// containing the seed, and (c) be a pure k-space property — IDENTICAL whether
+    /// the tensor was built from n=200 or n=4000 rows (the n-independence the κ
+    /// outer loop relies on). A design that is full-rank across the whole window
+    /// must return `None` (no lift needed).
+    #[test]
+    fn rank_stable_psi_floor_is_inside_window_and_n_independent() {
+        let k = 7usize;
+        // Window spanning the small-ψ rank cliff. Kept moderate so the Chebyshev
+        // ladder certifies at a low rung (the build is the only n-pass; a wide
+        // window forces high rungs = many design realizations = slow test).
+        let (psi_lo, psi_hi) = (-1.6_f64, 1.0_f64);
+        let build_at = |n: usize| {
+            let w = Array1::from_iter((0..n).map(|i| 1.0 + 0.5 * ((i % 3) as f64)));
+            let z = Array1::from_iter((0..n).map(|i| ((i as f64) * 0.37).sin()));
+            PsiGramTensor::build(|psi| synth_design(psi, n, k), w.view(), z.view(), psi_lo, psi_hi)
+                .expect("analytic synthetic design must certify")
+        };
+
+        let t_small = build_at(120);
+        // Seed at the well-conditioned (small-length-scale) window end — the
+        // κ-optimum's neighbourhood, guaranteed to be at the window-maximal rank
+        // (the synthetic radial design's rank rises toward large ψ). The floor is
+        // the lower edge of the maximal-rank band reaching this seed.
+        let seed = psi_hi;
+        let floor_small = t_small.rank_stable_psi_floor(seed);
+
+        // (a) the band does not reach psi_lo → a floor is returned, strictly inside.
+        let floor = floor_small.expect("collapsing-rank design must lift the floor off psi_lo");
+        assert!(
+            floor > psi_lo && floor <= seed,
+            "floor {floor} must lie in (psi_lo {psi_lo}, seed {seed}]"
+        );
+
+        // (b) below the floor the Gram is rank-deficient relative to the seed; at/
+        // above the floor it holds the window-maximal rank. Verify the rank at the
+        // floor equals the rank at the seed, and the rank just below the floor is
+        // strictly lower (the floor is a genuine rank edge, not an interior node).
+        let rank_at = |psi: f64| t_small.gram_numerical_rank(psi).unwrap();
+        let max_rank = rank_at(seed);
+        assert_eq!(
+            rank_at(floor),
+            max_rank,
+            "the floor must sit at the window-maximal rank"
+        );
+        let probe_below = floor - 0.25;
+        if t_small.contains(probe_below) {
+            assert!(
+                rank_at(probe_below) < max_rank,
+                "rank just below the floor ({}) must drop under the band rank {max_rank}",
+                rank_at(probe_below)
+            );
+        }
+
+        // (c) n-independence: the floor from a 5× larger build must match to grid
+        // resolution. The tensor is certified to the same Chebyshev tolerance, so
+        // the k-space rank structure — hence the floor — is the same object.
+        let t_big = build_at(1000);
+        let floor_big = t_big
+            .rank_stable_psi_floor(seed)
+            .expect("the rank cliff is an n-free property; the big build must also lift");
+        let grid_step = (psi_hi - psi_lo) / 95.0; // NODES - 1 = 95
+        assert!(
+            (floor_small.unwrap() - floor_big).abs() <= 1.5 * grid_step,
+            "rank-stable floor must be n-independent: n=200 → {}, n=4000 → {floor_big} \
+             (grid step {grid_step})",
+            floor_small.unwrap()
+        );
+
+        // A genuinely full-rank, well-conditioned design across the window needs no
+        // lift → None. `synth_full_rank_design` requires an even k.
+        let n = 200usize;
+        let kk = 6usize;
+        let w = Array1::from_iter((0..n).map(|i| 1.0 + 0.5 * ((i % 3) as f64)));
+        let z = Array1::from_iter((0..n).map(|i| ((i as f64) * 0.29).cos()));
+        let full = PsiGramTensor::build(
+            |psi| synth_full_rank_design(psi, n, kk),
+            w.view(),
+            z.view(),
+            psi_lo,
+            psi_hi,
+        )
+        .expect("full-rank design must certify");
+        assert!(
+            full.rank_stable_psi_floor(seed).is_none(),
+            "a window-wide full-rank design must not lift the floor"
+        );
     }
 
     /// #1033 n-independence invariant (structural, build-free, bit-tight):
