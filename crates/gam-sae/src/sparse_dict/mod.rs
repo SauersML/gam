@@ -28,6 +28,8 @@
 
 mod codes;
 mod scoring;
+#[cfg(target_os = "linux")]
+mod scoring_gpu;
 mod update;
 
 #[cfg(test)]
@@ -35,6 +37,10 @@ mod tests;
 
 pub use codes::SparseCode;
 pub use scoring::{TileScorer, top_s_online};
+#[cfg(target_os = "linux")]
+pub use scoring_gpu::{
+    DEVICE_SCORE_BLOCK_MIN_ELEMS, ScoreBlockPath, score_block_cpu, score_block_required,
+};
 
 use ndarray::{Array2, ArrayView2};
 
