@@ -1994,9 +1994,11 @@ def test_gaussian_reml_fit_all_shape_constraints_do_not_panic(kind: str) -> None
     )
 
     # The constrained fit must actually respect the requested shape on the
-    # fitted curve (sorted in x), not merely avoid the panic.
+    # fitted curve, not merely avoid the panic.
     tol = 1e-5 * (np.abs(fitted).max() + 1.0)
     if kind == "monotone_increasing":
+        # Monotonicity is spacing-invariant: f increasing <=> consecutive
+        # differences >= 0 regardless of how the x's are spaced.
         diffs = np.diff(fitted)
         assert (diffs >= -tol).all(), (
             f"monotone_increasing violated; min diff={diffs.min()}"
@@ -2006,16 +2008,32 @@ def test_gaussian_reml_fit_all_shape_constraints_do_not_panic(kind: str) -> None
         assert (diffs <= tol).all(), (
             f"monotone_decreasing violated; max diff={diffs.max()}"
         )
-    elif kind == "convex":
-        second = np.diff(fitted, n=2)
-        assert (second >= -tol).all(), (
-            f"convex violated; min second-diff={second.min()}"
+    else:
+        # Convexity/concavity is a property of the FUNCTION and must be tested
+        # on a *uniform* grid. The plain second difference
+        # f(x_{i+2}) - 2 f(x_{i+1}) + f(x_i) only certifies convexity when the
+        # abscissae are evenly spaced; on the raw (sorted-uniform) sample the
+        # gap ratio here is ~1e5, and a genuinely convex function has *negative*
+        # plain second differences across such unevenly spaced triples
+        # (e.g. x^2 at x=0, 0.9, 1 gives 1 - 2*0.81 + 0 = -0.62). The shape
+        # constraint enforces curvature via the Greville-spaced divided second
+        # difference (control-polygon convexity), so evaluate the fitted curve
+        # on a uniform grid spanning the data and check the second difference
+        # there.
+        grid = np.linspace(float(x.min()), float(x.max()), 200)
+        curve = np.asarray(
+            model.predict(pd.DataFrame({"x": grid})), dtype=float
         )
-    else:  # concave
-        second = np.diff(fitted, n=2)
-        assert (second <= tol).all(), (
-            f"concave violated; max second-diff={second.max()}"
-        )
+        gtol = 1e-5 * (np.abs(curve).max() + 1.0)
+        second = np.diff(curve, n=2)
+        if kind == "convex":
+            assert (second >= -gtol).all(), (
+                f"convex violated; min second-diff={second.min()}"
+            )
+        else:  # concave
+            assert (second <= gtol).all(), (
+                f"concave violated; max second-diff={second.max()}"
+            )
 
 
 def test_gaussian_reml_fit_with_constraints_forward_no_constraints_matches_unconstrained() -> None:
