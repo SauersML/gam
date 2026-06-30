@@ -598,6 +598,21 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             .and_then(|t| t.rank_stable_psi_floor(psi_anchor))
     }
 
+    /// Highest ψ at/below which the installed tensor's conditioned Gram holds its
+    /// maximal numerical rank — the ceiling above which the design-revision skip's
+    /// `reduced_basis_equal` witness must (soundly) refuse because the longest-
+    /// frequency radial mode goes collinear and the reduced basis drops a
+    /// dimension. `None` when no tensor is installed or the rank stays maximal up
+    /// to `psi_hi`. The κ caller clamps the optimizer's upper bound to this n-FREE
+    /// ceiling so a line-search overshoot never leaves the maximal-rank band and
+    /// trips the O(n) `reset_surface` lane (#1033). See
+    /// [`crate::psi_gram_tensor::PsiGramTensor::rank_stable_psi_ceiling`].
+    pub fn psi_gram_rank_stable_ceiling(&self, psi_anchor: f64) -> Option<f64> {
+        self.psi_gram_tensor
+            .as_ref()
+            .and_then(|t| t.rank_stable_psi_ceiling(psi_anchor))
+    }
+
     /// Return the most-recently converged inner β from the last PIRLS solve, if
     /// it is finite and the right dimension. Used by `SpatialJointContext` to
     /// warm-start successive outer evaluations instead of cold-starting PIRLS

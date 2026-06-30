@@ -755,6 +755,65 @@ impl PsiGramTensor {
         }
     }
 
+    /// Upper edge of the contiguous maximal-rank ψ-band, the symmetric twin of
+    /// [`Self::rank_stable_psi_floor`] (#1033). The conditioned Gram `XᵀWX(ψ)` is
+    /// rank-deficient at BOTH window ends — at small ψ the longest-length-scale
+    /// radial mode collapses into the polynomial nullspace, and at very large ψ
+    /// every radial column goes collinear with the low-frequency mode, so the
+    /// maximal-rank region is a middle BAND. The optimizer's line search can
+    /// OVERSHOOT above that band (e.g. ψ≈1.0 on production Duchon geometry), where
+    /// the design-realization skip's `reduced_basis_equal` witness must soundly
+    /// refuse (the range subspace dropped a dimension) → an O(n) `reset_surface`,
+    /// AND the pinning ψ recorded at that reset is itself rank-deficient, so the
+    /// NEXT in-band trial mismatches its reference and resets a SECOND time. Both
+    /// resets vanish once the optimizer's UPPER bound is clamped down to this
+    /// n-free k-space ceiling, keeping every trial inside the maximal-rank band.
+    ///
+    /// Walks UP from the anchor on the same fixed k-space grid as the floor and
+    /// returns the highest ψ still at the window's maximal numerical rank
+    /// (stopping at the first node above that differs). Purely O(nodes·k³) — no
+    /// row access, inherently n-INDEPENDENT (rank is a property of the k×k tensor).
+    ///
+    /// Returns `None` when the band already reaches `psi_hi` (no clamp needed),
+    /// when the anchor is off-window / rank-indeterminate, or when the window is
+    /// empty.
+    pub fn rank_stable_psi_ceiling(&self, psi_anchor: f64) -> Option<f64> {
+        // Same grid + max-rank target + anchor→band snap as `rank_stable_psi_floor`
+        // so the floor and ceiling bracket the SAME contiguous maximal-rank band.
+        const NODES: usize = 96;
+        if !(self.psi_hi > self.psi_lo) {
+            return None;
+        }
+        let span = self.psi_hi - self.psi_lo;
+        let psi_at = |i: usize| self.psi_lo + span * (i as f64) / ((NODES - 1) as f64);
+        let ranks: Vec<Option<usize>> =
+            (0..NODES).map(|i| self.gram_numerical_rank(psi_at(i))).collect();
+        let max_rank = ranks.iter().filter_map(|r| *r).max()?;
+        let anchor = psi_anchor.clamp(self.psi_lo, self.psi_hi);
+        let anchor_idx = (((anchor - self.psi_lo) / span) * ((NODES - 1) as f64))
+            .round()
+            .clamp(0.0, (NODES - 1) as f64) as usize;
+        // Snap to the nearest max-rank node at/below the anchor (the mirror of the
+        // floor's snap-UP), so the band edge is measured from inside the good band.
+        let band_idx = (0..=anchor_idx).rev().find(|&i| ranks[i] == Some(max_rank))?;
+        // Walk UP from the band node; the ceiling is the highest node from which
+        // every node down to it holds `max_rank`. Stop at the first node above.
+        let mut ceil_idx = band_idx;
+        for i in (band_idx + 1)..NODES {
+            if ranks[i] == Some(max_rank) {
+                ceil_idx = i;
+            } else {
+                break;
+            }
+        }
+        if ceil_idx == NODES - 1 {
+            // The maximal-rank band already reaches `psi_hi` — no clamp needed.
+            None
+        } else {
+            Some(psi_at(ceil_idx))
+        }
+    }
+
     /// True when `psi` lies inside the certified window.
     pub fn contains(&self, psi: f64) -> bool {
         psi.is_finite() && psi >= self.psi_lo && psi <= self.psi_hi
