@@ -3566,7 +3566,19 @@ impl SaeManifoldTerm {
         // current_state` writes the full-`B` decoder directly, which would desync the
         // factored frames the inner solve and `apply_newton_step` rely on; the
         // homotopy-arrival polish makes the same conservative choice.
-        if !self.frames_active() {
+        //
+        // GATE on `max_iter > 0`: `max_iter == 0` is the documented verbatim
+        // warm-start FREEZE (gam#577/#579, #850 — see
+        // `converge_inner_for_undamped_logdet`), where the caller hands in a
+        // seeded `(t, β)` and asks for a single factor at exactly that iterate
+        // WITHOUT moving it. The polish is a decoder least-squares solve, so
+        // running it on a freeze would silently overwrite the warm-started β
+        // with the data-optimal refit — breaking the verbatim-reuse contract the
+        // continuation pre-warm depends on for its speedup (the cold-vs-warm
+        // hint would always equal the cold LSQ decoder, never the seed). A freeze
+        // is by definition not a convergence request, so there is no
+        // under-converged decoder to rescue here.
+        if max_iter > 0 && !self.frames_active() {
             let mut best_objective =
                 self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
             if best_objective.is_finite() {
