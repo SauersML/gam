@@ -1496,7 +1496,8 @@ fn rigid_row_kernel_sparse_wrong_mask_panics_932() {
         qd1_lower: -1.0,
     };
     let vars: [SparseOrder2<WRONG>; 4] = std::array::from_fn(|a| SparseOrder2::variable(p[a], a));
-    rigid_row_nll(&vars, &inputs);
+    rigid_row_nll(&vars, &inputs)
+        .expect("rigid_row_nll must panic on the wrong static-sparsity mask before it can return");
 }
 
 #[test]
