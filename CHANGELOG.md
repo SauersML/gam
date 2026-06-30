@@ -1,3 +1,60 @@
+## v0.3.137 — gam 0.3.137 / gamfit 0.1.239 (2026-06-30)
+
+crates.io + PyPI release of the post-0.3.136 correctness wave. Shape-constrained
+REML, adaptive-ψ custom families, and three user-facing API contracts are fixed
+at the root, each with a regression test; one inner-loop hot path is made
+n-free. Everything reachable through the existing API stays
+backward-compatible.
+
+### REML / fitting correctness
+- **#509 — monotone shape-constrained smooth no longer over-smooths.** The outer
+  REML for a `shape=monotone_increasing` (box-reparam) smooth projected the
+  penalty roots in the ORIGINAL (pre-`Qs`) frame while the Hessian half of the
+  LAML pair lived in the TRANSFORMED (post box-reparam `T`, post-`Qs`) frame, so
+  under the non-orthogonal cumulative-sum reparameterization `ZᵀSZ` mixed two
+  coordinate systems, the analytic outer gradient disagreed with finite
+  differences, the trust region rejected every step, and the fit parked at its
+  under-smoothed seed (mono RMSE > free RMSE on already-monotone data). Both
+  halves now live in one transformed frame (the no-op identity when `Qs = I`), so
+  the non-binding monotone fit recovers the truth as well as the unconstrained
+  fit. Also hardens the binding-constraint regression and removes a
+  parallel-test temp-CSV race.
+- **#901 — adaptive-ψ custom families: data-only Jeffreys information + ψ-gated
+  Firth.** The projected-logdet REML gradient now matches finite differences for
+  spatial-adaptive-hyper custom families, with a 659-line FD agreement suite.
+
+### Contrast / compositional / comparison API
+- **`Model.difference_smooth` sign corrected.** A pair `(level_1, level_2)` now
+  returns `ŝ(level_1) − ŝ(level_2)` (the mgcv `plot_diff` convention); the design
+  difference was previously formed as `design(level_2) − design(level_1)`, so the
+  reported contrast was the exact negation of its `level_1`/`level_2` row labels.
+  The confidence band (a quadratic form) is unchanged.
+- **`gamfit.clr` / `alr` / `closure` accept a single 1-D composition.** The
+  natural call `clr([0.2, 0.3, 0.5])` raised an opaque
+  `TypeError: 'ndarray' object is not an instance of 'ndarray'` because the FFI
+  only accepted a 2-D `(rows, parts)` array; a 1-D composition is now promoted to
+  a single row and returned as 1-D coordinates matching the batch row.
+- **`compare_models` refuses cross-`n` comparisons.** AIC / REML-LAML evidence
+  scales with the observation count, so comparing two same-family fits on
+  different-sized data (e.g. n=500 vs n=100) used to declare the smaller-`n` model
+  the winner by a Bayes factor ~1e14–1e18. It now fails loud on mismatched `n`,
+  mirroring the existing different-family guard; fits that do not record `n`
+  (legacy / O(n) scan payloads) stay unconstrained.
+
+### Performance
+- **#1033 — n-free κ-trial lane.** The ALO leverage-barrier stabilizer (an
+  outer-optimizer aid, never part of the REML/LAML criterion) is skipped on the
+  ψ-keyed sufficient-statistic cache lane whose realized rows are frozen at the
+  pinning ψ, removing an O(n·k) hat-value pass per in-window κ-trial without
+  changing any fitted result.
+
+### Test hardening
+- #1260 binds the equivariant-atom bandwidth gate to the shipped penalty
+  (replacing a vacuous self-objective test); #1261 restores the oversmoothed-λ
+  regime for the average-derivative one-step gate after penalty renormalization;
+  the joint-Newton weak-band mode is placed strictly inside the rank band; #855
+  restores the tight SAS dβ/dε observed-Jacobian FD guard.
+
 ## v0.3.136 — gam 0.3.136 / gamfit 0.1.238 (2026-06-30)
 
 crates.io + PyPI release of the post-0.3.135 correctness wave. A cluster of

@@ -1,6 +1,6 @@
 [package]
 name = "gam-inference"
-version = "0.3.136"
+version = "0.3.137"
 edition = "2024"
 rust-version = "1.93"
 description = "Posterior sampling, HMC/NUTS, Polya-Gamma, and inference diagnostics for the gam engine"
@@ -10,16 +10,16 @@ license = "AGPL-3.0-or-later"
 warnings = "deny"
 
 [dependencies]
-gam-data = { path = "../gam-data", version = "=0.3.136" }
-gam-runtime = { path = "../gam-runtime", version = "=0.3.136" }
-gam-math = { path = "../gam-math", version = "=0.3.136" }
-gam-linalg = { path = "../gam-linalg", version = "=0.3.136" }
-gam-problem = { path = "../gam-problem", version = "=0.3.136" }
-gam-gpu = { path = "../gam-gpu", version = "=0.3.136" }
-gam-terms = { path = "../gam-terms", version = "=0.3.136" }
-gam-solve = { path = "../gam-solve", version = "=0.3.136" }
-gam-models = { path = "../gam-models", version = "=0.3.136" }
-gam-sae = { path = "../gam-sae", version = "=0.3.136" }
+gam-data = { path = "../gam-data", version = "=0.3.137" }
+gam-runtime = { path = "../gam-runtime", version = "=0.3.137" }
+gam-math = { path = "../gam-math", version = "=0.3.137" }
+gam-linalg = { path = "../gam-linalg", version = "=0.3.137" }
+gam-problem = { path = "../gam-problem", version = "=0.3.137" }
+gam-gpu = { path = "../gam-gpu", version = "=0.3.137" }
+gam-terms = { path = "../gam-terms", version = "=0.3.137" }
+gam-solve = { path = "../gam-solve", version = "=0.3.137" }
+gam-models = { path = "../gam-models", version = "=0.3.137" }
+gam-sae = { path = "../gam-sae", version = "=0.3.137" }
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 rayon = "1.12.0"
 rand = "0.10.1"
