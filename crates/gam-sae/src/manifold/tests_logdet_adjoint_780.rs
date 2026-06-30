@@ -82,12 +82,26 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_ibp_map() {
         .logdet_theta_adjoint(&rho, &cache, &solver)
         .expect("Gamma");
     let h = 1.0e-5;
-    // Probe both atoms across distinct rows so the cross-row coupling
-    // (different rows sharing a column) is exercised on both columns.
+    // Probe both atoms across distinct rows so the cross-row coupling (different
+    // rows sharing a column) is exercised on both columns, AND probe the COORD
+    // channel — the #1641 defect made BOTH the logit and the coord channel of the
+    // IBP θ-adjoint disagree with dense FD (logit ~4× over tol; coord ~10× off),
+    // because the cross-row Woodbury pass double-counted the rank-one self term and
+    // carried the ρ-trace ½ instead of the full trace. The coord slots do not pass
+    // through the Woodbury pass, but they contract the SAME assembled `htt`
+    // (whose IBP diagonal carries the cross-row self curvature), so they guard the
+    // one-operator consistency of the whole θ-adjoint, not just the logit lane.
+    //
+    // Dense IBP layout (K = 2, `last_row_layout = None`): per row block, local
+    // positions `0..K` are the logit slots (atom = local_pos) and `K..2K` are the
+    // coordinate slots (atom = local_pos − K, axis 0), so local_pos 2 ↔ atom 0
+    // coord and local_pos 3 ↔ atom 1 coord.
     let probes = [
         (0usize, 0usize, SaeLocalRowVar::Logit { atom: 0 }),
         (4usize, 1usize, SaeLocalRowVar::Logit { atom: 1 }),
         (7usize, 0usize, SaeLocalRowVar::Logit { atom: 0 }),
+        (1usize, 2usize, SaeLocalRowVar::Coord { atom: 0, axis: 0 }),
+        (6usize, 3usize, SaeLocalRowVar::Coord { atom: 1, axis: 0 }),
     ];
     for (row, local_pos, var) in probes {
         let mut plus = term.clone();
