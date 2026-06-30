@@ -55,8 +55,12 @@ fn planted_design(n: usize, p: usize) -> Array2<f64> {
 /// device result).
 #[test]
 fn device_resident_solve_matches_cpu_oracle() {
-    // A GPU-profitable wide-decoder shape that clears the Gram work gate.
-    let (n, p) = (2_000usize, 2_048usize);
+    // A GPU-profitable shape that clears the XtDiagX work gate
+    // (2·n·p² = 2·2000·512² ≈ 1.0e9 ≫ the 1e8 flop floor) while keeping the
+    // O(n·p²) CPU-oracle Gram cheap enough for CI. The wide-border shapes are
+    // exercised for *throughput* in the other test; parity only needs the
+    // device path to engage, not the largest p.
+    let (n, p) = (2_000usize, 512usize);
     let x = planted_design(n, p);
     let mut s = 0x988_5ae_e0c0_de01u64;
     let w = Array1::from_shape_fn(n, |_| lcg(&mut s).abs() + 1e-3);
@@ -66,10 +70,14 @@ fn device_resident_solve_matches_cpu_oracle() {
     let handle = match ResidentDesignGram::try_new(x.view()) {
         Some(h) => h,
         None => {
+            // A device-profitable shape (2·n·p² ≈ 1.0e9 ≫ the 1e8 flop floor)
+            // declining is only legitimate on a CPU-only host. If a CUDA device
+            // is present and the resident gram still declines, that is false
+            // routing — fail loud rather than silently skip the parity check.
             assert!(
-                !device_present()
-                    || ResidentDesignGram::try_new(x.view()).is_none(),
-                "device present but resident gram declined a GPU-profitable shape"
+                !device_present(),
+                "a CUDA device is present but ResidentDesignGram declined a GPU-profitable \
+                 shape (n={n}, p={p}, 2·n·p²≈1.0e9 ≫ the 1e8 flop floor) — false GPU routing"
             );
             eprintln!("device_resident_solve_matches_cpu_oracle: no device — skipped");
             return;
@@ -83,11 +91,12 @@ fn device_resident_solve_matches_cpu_oracle() {
 
     assert_eq!(gpu_beta.len(), cpu_beta.len());
     // Tolerance: the two solves differ only by IEEE-754 reduction order in the
-    // Gram and the triangular solves (device fused POTRF/TRSM vs host
-    // left-looking Cholesky). For a p=2048, well-conditioned ridge=1e-3 system
-    // with O(0.05)-scale entries, accumulated reduction-order drift across the
-    // p² Gram dot-products and the two triangular sweeps stays well under 1e-6
-    // relative. We assert a conservative absolute+relative bound on β.
+    // Gram and the triangular solves (device cuSOLVER POTRF + cuBLAS TRSM vs
+    // host left-looking Cholesky). For this well-conditioned ridge=1e-3, p=512
+    // system with O(0.05)-scale entries, accumulated reduction-order drift
+    // across the p² Gram dot-products and the two triangular sweeps stays well
+    // under 1e-6 relative (measured ~1e-14 on the V100). We assert a
+    // conservative absolute+relative bound on β.
     let mut max_abs = 0.0_f64;
     let mut max_rel = 0.0_f64;
     for (g, c) in gpu_beta.iter().zip(cpu_beta.iter()) {
