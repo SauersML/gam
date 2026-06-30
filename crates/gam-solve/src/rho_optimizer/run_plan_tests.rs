@@ -4839,6 +4839,81 @@ fn prewarm_budget_scales_down_past_cost_cliff() {
     }
 }
 
+/// gam#979 — the continuation pre-warm fire/collapse magnitude must be a
+/// DETERMINISTIC function of the PROBLEM, never of disk-cache / parallel-load
+/// state, and at or past the per-step cost cliff the COLD (fired) budget must be
+/// bounded by the small documented `MULTI_SEED_PREWARM_BUDGET` tier.
+///
+/// The bug (#979 Experiment-2): a representative two-formula marginal-slope fit
+/// at the centers≈8 cliff (p ≈ 16) FIRED a ~12-step cold pre-warm of multi-second
+/// inner solves (~108s) under parallel/all-cold load, but a sequential rerun that
+/// happened to hit the persisted warm-start disk cache skipped it entirely (~4.5s).
+/// Identical inputs, "seconds vs intractable", decided by load/timing — because
+/// the only thing bounding the cold walk was the inverse-p taper from a base of
+/// PATH_BUDGET (64 → 12), and the only thing making it fast was the load-sensitive
+/// cache hit. This pins the two structural properties the fix establishes, with
+/// EXACT (`<=`, not approximate) ceilings:
+///
+///   1. For every representative marginal-slope cliff config (centers ≈ 8..12,
+///      p ≈ {16, 20, 24}), the COLD (`warm_start_cache_hit = false`) pre-warm
+///      step budget is `<= MULTI_SEED_PREWARM_BUDGET` (the owner's small "4–6"
+///      intent), so the fired walk can never blow up to the 12-step / ~108s cliff.
+///   2. The warm-start cache hit can only ever REDUCE the budget (to a redundant
+///      skip-to-0), never decide bounded-vs-unbounded: `warm_budget <= cold_budget`
+///      and the worst case is the deterministic, already-bounded cold budget. So
+///      the fire/collapse magnitude does NOT depend on the load-sensitive flag.
+#[test]
+fn prewarm_cold_budget_is_bounded_and_load_independent_at_cliff_979() {
+    // Two `basis(centers=K)` formulas give p ≈ 2K, so the centers≈8 cliff lands
+    // at p ≈ 16 and centers≈12 at p ≈ 24. n_params (rho dim) is a small 2 — the
+    // legacy "expensive shape" gate (p ≥ 24 or rho dim ≥ 4) does NOT fire here,
+    // which is exactly why the pre-fix cold base stayed at PATH_BUDGET.
+    for p in [16usize, 20, 24] {
+        let (cold_cfg, cap) = prewarm_config_for_p(p);
+        assert!(
+            !cold_cfg.warm_start_cache_hit,
+            "the cold config must report no cache hit (p={p})"
+        );
+        let cold_budget = continuation_prewarm_step_budget(&cold_cfg, &cap, 1, 1);
+
+        // (1) The COLD fired budget is bounded by the small documented tier —
+        //     EXACTLY `<= MULTI_SEED_PREWARM_BUDGET`, not the larger
+        //     `SINGLE_EXPENSIVE_PREWARM_BUDGET` and certainly not PATH_BUDGET.
+        //     Pre-fix this was 12 at p=16 (PATH_BUDGET-tapered) and the test fails.
+        assert!(
+            cold_budget <= MULTI_SEED_PREWARM_BUDGET,
+            "cold pre-warm budget {cold_budget} must be <= MULTI_SEED_PREWARM_BUDGET \
+             ({MULTI_SEED_PREWARM_BUDGET}) at the #979 cliff (p={p}); a larger fired \
+             budget is the ~108s centers≈8 cold blowup"
+        );
+        // Still a real anneal (capping must not regress seed-continuation accuracy).
+        assert!(
+            cold_budget >= PREWARM_MIN_SCALED_BUDGET,
+            "cold pre-warm budget {cold_budget} must stay >= {PREWARM_MIN_SCALED_BUDGET} \
+             so the warmed β is near-optimal (p={p})"
+        );
+
+        // (2) The warm-start cache hit is a redundant skip layered ON TOP of an
+        //     already-bounded cold budget: flipping the load-sensitive flag can
+        //     only ever REDUCE work (to 0), never turn bounded into unbounded.
+        let warm_cfg = OuterConfig {
+            warm_start_cache_hit: true,
+            ..cold_cfg
+        };
+        let warm_budget = continuation_prewarm_step_budget(&warm_cfg, &cap, 1, 1);
+        assert_eq!(
+            warm_budget, 0,
+            "a warm-start cache hit must skip the redundant pre-warm (p={p})"
+        );
+        assert!(
+            warm_budget <= cold_budget,
+            "the load-sensitive cache flag must only ever reduce the pre-warm budget \
+             ({warm_budget} <= {cold_budget}); it must never be the difference between \
+             a bounded and an unbounded fired walk (p={p})"
+        );
+    }
+}
+
 /// The cost-scaling helper is the identity below the cliff and never returns
 /// zero (the pre-warm must always run at least its floor of legs on a cold
 /// fit, so capping cannot regress the seed-continuation accuracy).

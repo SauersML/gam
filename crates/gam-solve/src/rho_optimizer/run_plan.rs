@@ -145,13 +145,43 @@ pub(crate) fn continuation_prewarm_step_budget(
         .p_coefficients
         .unwrap_or(0);
     let multi_seed_cascade = seed_count > seed_budget.max(1);
-    let expensive_shape =
-        p_coefficients >= EXPENSIVE_PREWARM_COEFF_DIM || cap.n_params >= EXPENSIVE_PREWARM_RHO_DIM;
+    // An "expensive shape" for pre-warm bounding is ANY problem at or past the
+    // #979 per-step cost cliff. The legacy gate (p ≥ 24 or rho dim ≥ 4) MISSED
+    // the marginal-slope cliff: two `matern/duchon(centers=K)` formulas give
+    // p ≈ 2K, so the centers≈8 cliff lands at p ≈ 16 — below the legacy p ≥ 24
+    // tier and below the rho-dim ≥ 4 tier (two formulas ⇒ rho_dim ≈ 2). Without
+    // the cliff term `base_budget` stayed at the full PATH_BUDGET (64) and the
+    // ONLY thing that bounded the cold walk was the inverse-p `cost_scaled_*`
+    // taper (64 → ~12 at p = 16). Twelve multi-second inner solves is still the
+    // ~108s the owner measured under parallel (all-cold) load, while a sequential
+    // rerun that happened to hit the persisted warm-start cache skipped it
+    // entirely — so the SAME inputs were "seconds vs intractable" purely as a
+    // function of disk-cache/scheduling state (#979 Experiment-2). Folding the
+    // cost cliff into `expensive_shape` collapses the cold base to the small
+    // bounded tier at the cliff, making the fired magnitude a deterministic
+    // function of the PROBLEM (p_coefficients, rho dim) — the warm-start cache
+    // hit then only ever turns the bounded tier into a redundant skip-to-0,
+    // never the difference between bounded and unbounded.
+    let expensive_shape = p_coefficients >= EXPENSIVE_PREWARM_COEFF_DIM
+        || p_coefficients >= PREWARM_COST_CLIFF_COEFF_DIM
+        || cap.n_params >= EXPENSIVE_PREWARM_RHO_DIM;
 
-    // Shape-derived base budget: the legacy "expensive shape" tiers. This caps
-    // the pre-warm only once the problem is large enough to declare an
-    // expensive shape (p ≥ 24 or rho dim ≥ 4).
-    let base_budget = if multi_seed_cascade && expensive_shape {
+    // True once the coefficient dim is at or past the #979 per-step cost cliff,
+    // where each inner joint-Newton solve is already multi-second. This is the
+    // regime where the cold pre-warm became intractable (~108s for ~12 steps at
+    // the centers≈8 cliff), so the cold base is bounded by the SMALL documented
+    // tier (`MULTI_SEED_PREWARM_BUDGET`) here — NOT the larger
+    // `SINGLE_EXPENSIVE_PREWARM_BUDGET` — before the inverse-p taper scales it
+    // down further. The taper alone (from a base of 64) left 12 steps at the
+    // cliff; capping the base to the small tier first brings the cold magnitude
+    // to the owner's 4–6 / `MULTI_SEED_PREWARM_BUDGET` "small number" intent.
+    let past_cost_cliff = p_coefficients >= PREWARM_COST_CLIFF_COEFF_DIM;
+
+    // Shape-derived base budget: the legacy "expensive shape" tiers, with the
+    // #979 cost cliff bounding the cold base to the small tier. This caps the
+    // pre-warm once the problem is large enough to declare an expensive shape
+    // (p ≥ 24, p ≥ the cost cliff, or rho dim ≥ 4).
+    let base_budget = if past_cost_cliff || (multi_seed_cascade && expensive_shape) {
         MULTI_SEED_PREWARM_BUDGET.min(default_budget)
     } else if expensive_shape {
         SINGLE_EXPENSIVE_PREWARM_BUDGET.min(default_budget)
