@@ -256,14 +256,46 @@ fn bms_rigid_nonzero_logslope_offset_audit_fits_in_time_370() {
     assert_full_fit(&out, elapsed, false);
 }
 
-// NOTE: the FLEX full-fit guard (score_warp + link_dev + a nonzero log-slope
-// offset) is intentionally NOT yet wired in this commit. Restoring it surfaced
-// a *live* regression of the exact symptom #370 was filed on: that
-// configuration does not crash (the #367 audit fix holds) but the outer fit
-// fails to converge and spins indefinitely — reproduced even at n=40, so it is
-// an outer-iteration non-termination on the flex path, not solver scaling. The
-// flex `fit_model` guard is added in a follow-up commit together with that fix,
-// so the shared test suite never carries a hanging test (issue #370).
+// ---------------------------------------------------------------------------
+// Why the FLEX full-fit guard is NOT wired into the shared suite (issue #370)
+// ---------------------------------------------------------------------------
+//
+// The flex configuration (`score_warp` + `link_dev`) does *not* crash — the
+// #367 audit self-compute fix holds, and the rigid full-fit guard above
+// exercises the same audit driver end to end. But restoring a flex `fit_model`
+// guard surfaced a *live* regression of the exact symptom #370 was filed on (a
+// >600s timeout): the flex fit does not hang in a single unbounded loop; it
+// *stalls* and burns the entire outer×inner budget (default 60×1200) at
+// ~20s/cycle, which presents as an effectively non-terminating fit.
+//
+// Diagnosis (captured with iteration budgets capped to 8×8 and a small,
+// realistic log-slope offset of 0.15, so this is NOT an artifact of a forced
+// large offset):
+//
+//   [PIRLS/joint-Newton terminal] converged=false terminator=budget-exhausted
+//     best_residual_inf=3.918e1 (tol=1.411e-5)  last_obj_change_below_tol=false
+//   last_newton_math={old_kkt=3.918e1, linearized_next=3.918e1,
+//     actual=+3.046e-9, pred=+3.139e-9, rho=+9.704e-1, scalar_relerr=9.280e-11,
+//     step_inf=1.498e-10, proposal_inf=1.026e0}
+//   block_grad_inf=[5.709, 13.105, 0.732, 0.984]  (block 1 = scalar logslope)
+//
+// The objective is numerically flat (|Δobj| ~ 3e-9 ≪ tol) yet the KKT residual
+// is pinned at ~3.9e1 — the iterate is stalled at a *non-KKT* point, so more
+// budget cannot rescue it. The Newton model is exact for the objective
+// (rho≈0.97, scalar_relerr≈1e-10), but the full proposal step (proposal_inf≈1)
+// is predicted to leave the KKT residual unchanged (`linearized_next == old_kkt`)
+// and is shrunk to ~1e-10 by the line search every cycle. The dominant unmoved
+// gradient lives in the width-1 logslope-intercept block (|g|∞≈13), a very stiff
+// direction whose Newton step is negligible against a large diagonal Hessian.
+// This is a joint-Newton convergence defect on the BMS flex deviation-block
+// path — a separate, deeper bug than the #367 audit crash this file pins.
+//
+// Shipping a flex `fit_model` test now would add a test that runs until SIGTERM
+// to the shared suite, which the build's no-hang policy forbids. The flex guard
+// is therefore withheld until the stall is fixed; #370 stays open tracking it.
+// The rigid full-fit guard + the callback pin below fully protect against the
+// #367 audit-crash regression that #1146 deleted, which is the regression this
+// reopened issue is about.
 
 /// Fast callback-level pin at the exact `beta = []` audit boundary: both BMS
 /// Jacobian callbacks must self-compute their row scalars (q_i, g_i, c_i, z_i)
