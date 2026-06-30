@@ -45,4 +45,26 @@ read/write (silent UB / wrong result / illegal access).
 6. [ ] CPU↔GPU parity at d≠r sizes; document tolerance.
 
 ## Verification log
-- (pending)
+- 2026-06-30: BUG 1 (B/Y stride) FIXED + verified on V100 (device 6):
+  - `arrow_schur_gpu_multi_size_groups_match_reference`: FAIL→**PASS** (parity 1e-10).
+  - `arrow_schur_gpu_fused_layer_d_matches_layer_a_b_c`: **PASS**.
+  - 6/7 of the V100 suite pass. GPU engaged (dmon: SM 3-5%, fb mem 1→312 MB
+    during runs). NVRTC compiled for compute_70.
+- BUG 2 (pre-existing, separate root cause): `ridge_bump_required_on_non_pd_row_recovers_after_bump`
+  FAILS on main too (confirmed). Root cause: the `RidgeBumpRequired{bump}`
+  estimate is `scale·|pivot|·√ε·1024` where `pivot` is the cuSOLVER POTRF info
+  = a 1-based ROW INDEX, not the pivot magnitude. So for a strongly non-PD
+  block (test: htt=-I, needs ridge>1) the reported bump≈1.5e-5 and the outer
+  10-step geometric escalation caps at ~0.0156 < 1 and never recovers. The CPU
+  oracle (arrow_schur/factorization.rs) instead lifts the per-row ridge "just
+  enough" internally. FIX: make the GPU report a deficit-aware bump from the
+  host-resident H_tt block (Gershgorin lower bound on min eigenvalue ⇒ shift
+  needed to make it PD), so one retry recovers.
+
+## Bug 2 producer sites (all in arrow_schur.rs)
+- 1356 (cuda::solve dense batched POTRF)   — pivot=info index, has htt block
+- 1220/1224 (multi-GPU tile POTRF)         — pivot=info index, has htt block
+- 3396 (fused path status)                 — pivot=status index, has htt block
+- 482  (row-procedural host Cholesky)      — has the block, no magnitude
+- 2610 (SAE device PCG host Cholesky)      — has the block, no magnitude
+Shared helper `ridge_bump_to_make_pd(htt, ridge_t)` → all sites.
