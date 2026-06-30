@@ -144,3 +144,38 @@ redundant with #1686 — it is COMPLEMENTARY: #1686 removes the FMA component, t
 band absorbs the irreducible transcendental component. A flat 1e-9 gate would
 STILL fail post-#1686 (third 5.09e-8 > 1e-9). Updated module + PARITY_RTOL
 docstrings to record this split. All 14 gate tests PASS post-rebase on V100.
+
+## FINDING 4 (2026-06-30) — repo-wide fmad=false sweep (#1686 only fixed rowjet)
+#1686 set fmad=false in the SHARED nvrtc options but only re-routed ONE kernel
+(survival_rowjet) off bare `compile_ptx`. Every other bare-compile_ptx kernel
+still got fmad=true. Swept all of them in the GPU lane and routed the
+parity-sensitive ones through `compile_ptx_arch` (fmad=false + #1551 arch pin):
+- survival_flex step6 (`M=H_p·J`) + intercept-solve  — measured step6 drift
+  2.84e-14 under fmad=false: NOT bit-exact ⇒ pure REASSOCIATION, not FMA.
+  Corrected comments crediting FMA; band unchanged.
+- sae_rowjet (softmax seeded-jet, sibling of survival_rowjet) — drift
+  2.78e-16→1.67e-16; added an anti-false-green device-only assertion so a dead
+  kernel can't pass as CPU==CPU.
+- row_hessian_ops, cubic_bspline_moments (hex+tet) — routed for consistency.
+- sphere_gpu — routed; the stale "can't set arch with a runtime string" comment
+  is obsolete (compile_ptx_arch resolves arch internally).
+None of these use atomicAdd/#include, so none had the #1551 silent-fallback
+compile bug — but all were needlessly FMA-fused against the CPU oracle.
+
+## FINDING 5 (2026-06-30) — sphere fit-parity gated conditioning, not the GPU
+`sphere_gpu_end_to_end_fit_parity_vs_cpu_truncated` FAILED on the V100
+(max|Δβ|=1.177e-7 > 1e-9), pre-existing (fails with my changes reverted; fmad
+unchanged). Instrumented it: the GENUINE GPU output — the raw kernel design
+matrix K(data,centers)·Z — matches the CPU oracle to 9.7e-17 (one ULP, rel
+1.2e-15). The test instead gated β = (XᵀX+λS)⁻¹Xᵀy, and cond(XᵀX+λS)=5.2e7 on
+this fixture. Perturbation theory: ‖Δβ‖/‖β‖ ≲ cond·‖Δx_s‖/‖x_s‖ = 5e7·1e-16 ≈
+5e-9·‖β‖ → ~1e-7 absolute. The customer-visible ŷ=x_s·β stays at 7.6e-11 (the
+ill-conditioned directions cancel). So the flat 1e-9 β gate measured the
+conditioning of the SHARED CPU solve, not the GPU kernel.
+Fix (test made STRONGER): gate raw x_s bit-tight (1e-12·scale), gate ŷ at 1e-9,
+gate β against a condition-aware bound cond·ULP·16. A real kernel bug perturbs
+x_s at O(scale=0.08), 14 orders above the raw gate.
+OUT OF LANE (not touched): the two sphere PERFORMANCE hill-climb tests
+(ratio≥20x/≥10x) fail on this box (GPU 12.5s vs CPU 8.7s, GPU idle ⇒ genuine,
+not contention). Those are #1687's WIP perf gates — flagged on #1687, NOT
+weakened here.
