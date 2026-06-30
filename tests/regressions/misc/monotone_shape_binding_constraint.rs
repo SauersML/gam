@@ -25,6 +25,7 @@ use gam::smooth::build_term_collection_design;
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 fn fit_and_predict_on_grid(formula: &str, x: &[f64], y: &[f64]) -> Vec<f64> {
     let n = x.len();
@@ -32,11 +33,19 @@ fn fit_and_predict_on_grid(formula: &str, x: &[f64], y: &[f64]) -> Vec<f64> {
     for i in 0..n {
         csv.push_str(&format!("{:.17e},{:.17e}\n", x[i], y[i]));
     }
+    // The cargo test harness runs every #[test] in this binary on parallel
+    // threads of ONE process, and each test fits multiple times. A temp path
+    // keyed only on `process::id()` + `n` (all tests here use n=400) collides
+    // across tests, so one thread's `remove_file` races another thread's read.
+    // A per-call atomic counter makes the path unique across every invocation.
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let unique = SEQ.fetch_add(1, Ordering::Relaxed);
     let mut tmp = std::env::temp_dir();
     tmp.push(format!(
-        "gam_monotone_binding_{}_{}.csv",
+        "gam_monotone_binding_{}_{}_{}.csv",
         std::process::id(),
-        n
+        n,
+        unique
     ));
     {
         let mut f = std::fs::File::create(&tmp).expect("create synthetic csv");
