@@ -41,12 +41,11 @@
 
 use std::sync::Arc;
 
-use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
+use gam_solve::gaussian_reml::gaussian_reml_multi_closed_form;
 use gam_solve::inference::residual_factor::{ResidualFactorInput, StructuredResidualModel};
 use gam_terms::inference::structure_evidence::{ClaimKind, StructureLedger};
-use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh};
 use gam_solve::structure_search::{
     CollapseAction, MoveBudget, MoveProposal, SearchLedger, SearchOutcome, StructureMove, search,
 };
@@ -809,6 +808,17 @@ fn duplicate_atom(
     } else {
         child_rho.log_ard.push(Array1::<f64>::zeros(0));
     }
+    // The fissioned child inherits the PARENT atom's per-atom smoothness strength
+    // (#1556). As with `log_ard`, failing to grow `log_lambda_smooth` in step with
+    // `k_atoms()` makes the next `assemble_arrow_schur` panic on the per-atom
+    // `lambda_smooth[atom_idx]` index (out of bounds).
+    let inherited_smooth = child_rho
+        .log_lambda_smooth
+        .get(parent)
+        .or_else(|| child_rho.log_lambda_smooth.first())
+        .copied()
+        .unwrap_or(0.0);
+    child_rho.log_lambda_smooth.push(inherited_smooth);
     Ok((child, child_rho))
 }
 
@@ -824,13 +834,6 @@ fn duplicate_atom(
 // dictionary the learner discovers is therefore genuinely heterogeneous: a born
 // atom on a circular residual gets a circle, one on a straight residual a line.
 // ===========================================================================
-
-/// Ridge on the candidate-fit normal equations, added to the intrinsic roughness
-/// Gram so the per-candidate penalized least-squares solve is well-posed even on
-/// a near-degenerate residual image. Small relative to the design scale (the
-/// reconstruction target is the already-fit residual factor, O(1)) — it pins the
-/// solve, it does not shape the verdict (every candidate pays the same ridge).
-const TOPOLOGY_FIT_RIDGE: f64 = 1e-6;
 
 /// One realized candidate of the birth topology race: the fitted evaluator, its
 /// penalized-least-squares decoder against the birth target, the chart manifold
@@ -1032,28 +1035,32 @@ fn topology_candidates_for_dim(
 }
 
 /// Fit one topology candidate to the birth target `Y` (`n × p`) over `weights`
-/// (`n`, the candidate's per-row reconstruction mass) by penalized least
-/// squares, and return its TK evidence inputs + the realized fit handle.
+/// (`n`, the candidate's per-row reconstruction mass) by PROPER closed-form
+/// Gaussian REML, and return its TK evidence inputs + the realized fit handle.
 ///
-/// The reduced per-atom Gaussian-reconstruction evidence is computed on EXACTLY
-/// the scale the #1026 curved-vs-linear rung and the smooth-term topology race
-/// use, so it is commensurable under the shared TK normalizer:
+/// The per-atom Gaussian-reconstruction evidence is the marginal likelihood the
+/// solver's [`gaussian_reml_multi_closed_form`] returns at the REML-optimal
+/// smoothing strength λ̂ — the SAME REML/LAML quantity every smooth term is
+/// scored by, so it is commensurable under the shared TK normalizer:
 ///
-/// * `raw_reml = ½·(weighted residual SSE) + ½·log|Φᵀ W Φ + S|` — the rank-aware
-///   Laplace negative log evidence of the penalized fit (data-fit deviance + the
-///   Hessian logdet that prices the parameters against the effective sample).
-/// * `null_dim` / `null_space_logdet` — the roughness Gram's null space (the
-///   unpenalized polynomial/constant directions) and its Hessian logdet over that
-///   null space, the gauge-invariance term the TK normalizer subtracts.
-/// * `effective_dim = tr[(Φᵀ W Φ + S)⁻¹ Φᵀ W Φ]` — the penalized effective degrees
-///   of freedom, the per-effective-dim scale's denominator.
+/// * `raw_reml` — the rank-aware closed-form REML score
+///   `½d·(log|Φᵀ W Φ + λ̂S| − log|λ̂S|₊) + dispersion` at the estimated λ̂. Unlike
+///   a fixed-λ, unit-dispersion Laplace term, this (a) estimates λ per candidate
+///   on its own basis (SPEC: REML/LAML always, never a hand-set λ) and (b) prices
+///   complexity with the penalty pseudo-determinant on a cross-basis-comparable
+///   scale, so a perfect periodic fit to a circle beats a poor cubic-patch fit.
+/// * `null_dim = 0` / `null_space_logdet = None` — the closed-form REML score is
+///   ALREADY null-space-restricted (rank-aware), so the TK normalizer must not
+///   re-subtract a gauge term; we report no null space to avoid double-counting.
+/// * `effective_dim = tr[(Φᵀ W Φ + λ̂S)⁻¹ Φᵀ W Φ]` — the penalized effective
+///   degrees of freedom the solver returns (`edf`), the per-effective-dim scale's
+///   denominator.
 fn fit_topology_candidate(
     spec: &TopologyCandidateSpec,
     target: ArrayView2<'_, f64>,
     weights: ArrayView1<'_, f64>,
 ) -> Result<TopologyAutoFitEvidence<TopologyRaceFit>, String> {
     let n = target.nrows();
-    let p = target.ncols();
     let (phi, jet) = spec.evaluator.evaluate(spec.coords.view())?;
     let m = phi.ncols();
     if phi.nrows() != n {
@@ -1069,9 +1076,9 @@ fn fit_topology_candidate(
         ));
     }
 
-    // Weighted normal equations Φᵀ W Φ and Φᵀ W Y, plus the weighted total mass.
-    let mut gram = Array2::<f64>::zeros((m, m)); // Φᵀ W Φ
-    let mut rhs = Array2::<f64>::zeros((m, p)); // Φᵀ W Y
+    // Validate the per-row reconstruction mass and reject a degenerate
+    // (zero-total-mass) birth target — the closed-form REML below needs a
+    // positive weighted sample to estimate a dispersion.
     let mut w_sum = 0.0_f64;
     for row in 0..n {
         let w = weights[row];
@@ -1079,25 +1086,6 @@ fn fit_topology_candidate(
             return Err("fit_topology_candidate: weights must be finite and non-negative".into());
         }
         w_sum += w;
-        if w == 0.0 {
-            continue;
-        }
-        for a in 0..m {
-            let pa = phi[[row, a]];
-            let wpa = w * pa;
-            for b in a..m {
-                gram[[a, b]] += wpa * phi[[row, b]];
-            }
-            for out in 0..p {
-                rhs[[a, out]] += wpa * target[[row, out]];
-            }
-        }
-    }
-    // Symmetrize the upper triangle into the lower.
-    for a in 0..m {
-        for b in (a + 1)..m {
-            gram[[b, a]] = gram[[a, b]];
-        }
     }
     if !(w_sum > 0.0 && w_sum.is_finite()) {
         return Err("fit_topology_candidate: degenerate (zero-mass) birth target".into());
@@ -1139,141 +1127,57 @@ fn fit_topology_candidate(
         }
     }
 
-    // Penalized normal-equations matrix H = Φᵀ W Φ + S(+ridge). The roughness Gram
-    // is decoder-independent (a property of the basis), so the solve does not
-    // chase its own decoder.
-    let mut h = gram.clone();
-    for a in 0..m {
-        for b in 0..m {
-            h[[a, b]] += s_raw[[a, b]];
-        }
-        h[[a, a]] += TOPOLOGY_FIT_RIDGE;
-    }
-    let h_chol = h
-        .cholesky(Side::Lower)
-        .map_err(|e| format!("fit_topology_candidate: penalized Hessian Cholesky: {e:?}"))?;
-    let decoder = h_chol.solve_mat(&rhs); // (ΦᵀWΦ + S)⁻¹ Φᵀ W Y, m × p
-
-    // Weighted residual SSE of the penalized reconstruction.
-    let mut sse = 0.0_f64;
-    for row in 0..n {
-        let w = weights[row];
-        if w == 0.0 {
-            continue;
-        }
-        for out in 0..p {
-            let mut pred = 0.0_f64;
-            for a in 0..m {
-                pred += phi[[row, a]] * decoder[[a, out]];
-            }
-            let r = target[[row, out]] - pred;
-            sse += w * r * r;
-        }
-    }
-
-    // Hessian logdet (the parameter price). H is SPD (ridge + Gram), so its
-    // logdet is 2·Σ log(diag(L)) of its Cholesky — but FaerCholeskyFactor exposes
-    // only solves, so recompute the logdet from the symmetric eigenvalues, which
-    // we also need for the null-space accounting.
-    let (h_evals, _h_evecs) = h
-        .eigh(Side::Lower)
-        .map_err(|e| format!("fit_topology_candidate: Hessian eigendecomposition: {e:?}"))?;
-    let mut log_det_h = 0.0_f64;
-    for &ev in &h_evals {
-        if !(ev > 0.0) {
-            return Err("fit_topology_candidate: penalized Hessian not positive definite".into());
-        }
-        log_det_h += ev.ln();
-    }
-
-    // Rank-aware Laplace negative log evidence on the smooth-rung scale:
-    // ½·SSE (the Gaussian deviance, unit dispersion — the constant cancels in the
-    // TK race) + ½·log|H|.
+    // Score each candidate by its PROPER closed-form Gaussian REML evidence
+    // (#977/#1026), NOT a hand-rolled fixed-λ Laplace term. The previous score
+    // (`½·SSE + ½·log|H|` at a stamped λ = 1, unit dispersion) was wrong on two
+    // counts, and they conspired to make a perfect circle lose to a line:
     //
-    // NOTE (#1374, the `−½·log|S_pen|+` penalty pseudo-determinant is
-    // INTENTIONALLY OMITTED): a within-model marginal likelihood also carries
-    // `−½·log|S_pen|+` (see `solver::evidence::laplace_evidence`). It is left out
-    // HERE because this `raw_reml` is consumed ONLY by the cross-BASIS born-atom
-    // topology race (`select_topology_with_fit` → `tk_normalized_score`,
-    // `PerEffectiveDim`-normalized), never as a single-model evidence.
-    // `log|S_pen|+` is computed per-candidate from each basis's OWN penalty, whose
-    // eigenvalue scale is basis-arbitrary (a circle's curvature penalty is not on
-    // the same scale as a line's), so it is NOT commensurable across competing
-    // topologies — adding it flips the cross-basis winner (it broke
-    // `birth_topology_race_assigns_circle_vs_line_by_evidence`). Cross-candidate
-    // complexity is already priced by the per-effective-dim scale, so the correct
-    // race score on this path is `½·SSE + ½·log|H|`.
-    let raw_reml = 0.5 * sse + 0.5 * log_det_h;
-
-    // Null space of the roughness Gram S (the unpenalized constant/polynomial
-    // directions): null_dim = nullity(S), and the null-space Hessian logdet is
-    // the logdet of H restricted to ker(S). Over ker(S), H = Φᵀ W Φ (+ridge) — the
-    // data curvature of the unpenalized directions, which is what the TK
-    // normalizer prices to make cross-topology scores gauge-invariant.
-    let (s_evals, s_evecs) = s_raw
-        .eigh(Side::Lower)
-        .map_err(|e| format!("fit_topology_candidate: penalty eigendecomposition: {e:?}"))?;
-    let s_max = s_evals.iter().fold(0.0_f64, |acc, &v| acc.max(v));
-    let s_tol = 1e-9 * (1.0 + s_max);
-    let null_cols: Vec<usize> = s_evals
-        .iter()
-        .enumerate()
-        .filter(|&(_, &v)| v <= s_tol)
-        .map(|(i, _)| i)
-        .collect();
-    let null_dim = null_cols.len();
-    let null_space_logdet = if null_dim == 0 {
-        None
-    } else {
-        // H restricted to ker(S): Uᵀ H U where U are the null eigenvectors.
-        let mut h_null = Array2::<f64>::zeros((null_dim, null_dim));
-        for (ii, &ci) in null_cols.iter().enumerate() {
-            // H · u_ci
-            let mut hu = Array1::<f64>::zeros(m);
-            for a in 0..m {
-                let mut acc = 0.0_f64;
-                for b in 0..m {
-                    acc += h[[a, b]] * s_evecs[[b, ci]];
-                }
-                hu[a] = acc;
-            }
-            for (jj, &cj) in null_cols.iter().enumerate() {
-                let mut acc = 0.0_f64;
-                for a in 0..m {
-                    acc += s_evecs[[a, cj]] * hu[a];
-                }
-                h_null[[ii, jj]] = acc;
-            }
-        }
-        let (hn_evals, _) = h_null
-            .eigh(Side::Lower)
-            .map_err(|e| format!("fit_topology_candidate: null-space Hessian eigh: {e:?}"))?;
-        let mut ld = 0.0_f64;
-        for &ev in &hn_evals {
-            if !(ev > 0.0) {
-                return Err(
-                    "fit_topology_candidate: null-space Hessian not positive definite".into(),
-                );
-            }
-            ld += ev.ln();
-        }
-        Some(ld)
-    };
-
-    // Effective degrees of freedom tr[H⁻¹ (Φᵀ W Φ)] = Σ_a (H⁻¹ Gram)_{aa}.
-    let h_inv_gram = h_chol.solve_mat(&gram); // H⁻¹ (Φᵀ W Φ), m × m
-    let mut effective_dim = 0.0_f64;
-    for a in 0..m {
-        effective_dim += h_inv_gram[[a, a]];
+    //   1. λ = 1 is NOT commensurable across bases. A periodic basis's curvature
+    //      energy for a `cos(2πt)` harmonic scales like `(2π)⁴ ≈ 1.6e3` the data
+    //      Gram, so a unit-λ penalty CRUSHES the very harmonics that reconstruct a
+    //      circle exactly, while the barely-curved cubic patch is left essentially
+    //      unpenalized. SPEC also forbids a hand-set smoothing strength — λ must be
+    //      REML/LAML-estimated, ALWAYS.
+    //   2. Unit dispersion (`½·SSE`) does not reward a near-perfect fit. The
+    //      profiled-dispersion REML deviance `½ν·log(σ̂²)` rewards a basis that
+    //      drives σ̂² → 0 (the circle's exact harmonic fit) far more strongly,
+    //      which is what makes the contest honest, and `½·log|H| − ½·log|λS|₊`
+    //      prices complexity on a scale that is comparable across bases (the
+    //      penalty pseudo-determinant the old score dropped is what restores
+    //      commensurability).
+    //
+    // `gaussian_reml_multi_closed_form` returns exactly this: the marginal-
+    // likelihood-optimal λ̂ for each candidate on its OWN basis, the penalized
+    // decoder at λ̂, the rank-aware REML score (`½d·(log|H| − log|λS|₊) +
+    // dispersion`, already null-space-restricted), and the effective degrees of
+    // freedom `tr[(ΦᵀWΦ + λS)⁻¹ ΦᵀWΦ]`. We feed `reml_score` as `raw_reml` and
+    // `edf` as `effective_dim`, and report `null_dim = 0` so the TK normalizer does
+    // NOT re-subtract a null-space term the REML score already integrated out.
+    let reml_fit = gaussian_reml_multi_closed_form(
+        phi.view(),
+        target,
+        s_raw.view(),
+        Some(weights),
+        None,
+    )
+    .map_err(|e| format!("fit_topology_candidate: REML evidence: {e:?}"))?;
+    let lambda = reml_fit.lambda;
+    if !(lambda.is_finite() && lambda >= 0.0) {
+        return Err(format!(
+            "fit_topology_candidate: REML returned a non-finite/negative λ ({lambda})"
+        ));
     }
+    let raw_reml = reml_fit.reml_score;
+    if !raw_reml.is_finite() {
+        return Err("fit_topology_candidate: non-finite REML score".into());
+    }
+    let decoder = reml_fit.coefficients.clone(); // penalized fit at λ̂, m × p
+    let mut effective_dim = reml_fit.edf;
     if !(effective_dim.is_finite() && effective_dim > 0.0) {
         // A fully-penalized fit (no effective parameters) cannot be scored on the
         // per-effective-dim scale; floor at a single effective parameter so the
-        // race still ranks it (the data-fit term dominates the verdict anyway).
+        // race still ranks it (the REML deviance dominates the verdict anyway).
         effective_dim = 1.0;
-    }
-    if !raw_reml.is_finite() {
-        return Err("fit_topology_candidate: non-finite raw REML".into());
     }
 
     // The born atom is seeded with the RAW roughness Gram; `SaeManifoldAtom::new`
@@ -1284,8 +1188,13 @@ fn fit_topology_candidate(
     Ok(TopologyAutoFitEvidence {
         topology_name: spec.kind.as_str().to_string(),
         raw_reml,
-        null_dim: null_dim as f64,
-        null_space_logdet,
+        // The closed-form REML score is ALREADY restricted to the penalty's range
+        // complement (rank-aware: `log|λS|₊` over the non-null directions, the null
+        // space integrated out), so the TK null-space normalizer must NOT fire
+        // again — pass `null_dim = 0` (its `null_space_logdet` branch is then
+        // skipped) so we don't double-count the gauge directions.
+        null_dim: 0.0,
+        null_space_logdet: None,
         effective_dim,
         n_obs: n,
         fit_handle: TopologyRaceFit {
@@ -1328,10 +1237,20 @@ fn race_birth_topology(
         // The race is over EXACTLY the candidate set we built; do not let the
         // selector's constant-curvature fuse drop one — pass them through as-is.
         candidates: specs.iter().map(|s| s.kind).collect(),
-        // Per-effective-dim normalization so a low-parameter line and a
-        // high-parameter sphere are compared on the same per-parameter scale (the
-        // smooth-term race default).
-        score_scale: TopologyScoreScale::PerEffectiveDim,
+        // PER-OBSERVATION normalization (a common `n` divisor across candidates).
+        // The candidate scores are now PROPER closed-form REML marginal
+        // likelihoods (see `fit_topology_candidate`), which ALREADY price model
+        // complexity through `log|H| − log|λS|₊` + the profiled dispersion. The
+        // older `PerEffectiveDim` scale was calibrated for the previous hand-rolled
+        // POSITIVE cost (`½·SSE + ½·log|H|`, which grew with model size and needed
+        // per-parameter normalization); applied to a proper (negative) evidence it
+        // DOUBLE-COUNTS complexity and inverts the ranking for higher-parameter
+        // bases — e.g. a cylinder that fits a cylindrical residual best (most
+        // negative evidence) would lose to a sphere purely because it spends more
+        // effective dimensions. A common-`n` divisor preserves the raw
+        // marginal-likelihood ranking the Bayesian evidence is designed to support,
+        // so the genuinely-best-fitting topology wins.
+        score_scale: TopologyScoreScale::PerObservation,
         latent: None,
     };
     // Index the realized specs by kind so the fit closure can find the right
@@ -1545,6 +1464,14 @@ fn born_atom(
         .cloned()
         .unwrap_or_else(|| Array1::<f64>::zeros(0));
     child_rho.log_ard.push(inherited);
+    // ρ carries a PER-ATOM smoothness strength `log_lambda_smooth[k]` (#1556),
+    // and `assemble_arrow_schur` indexes it by atom (`lambda_smooth[atom_idx]`).
+    // Growing the dictionary without growing this vector leaves `k_atoms()`
+    // ahead of `log_lambda_smooth.len()` and the next assemble panics with an
+    // out-of-bounds index. The born atom inherits the template atom's smoothness
+    // strength (atom 0), matching the `log_ard` inheritance just above.
+    let inherited_smooth = child_rho.log_lambda_smooth.first().copied().unwrap_or(0.0);
+    child_rho.log_lambda_smooth.push(inherited_smooth);
     Ok((child, child_rho))
 }
 
@@ -2589,11 +2516,22 @@ mod tests {
         let dead_assign = dead.assignment.assignments();
         assert!(dead_assign.column(1).iter().all(|&m| m < 1e-6));
 
-        // Birth: K grows, new atom carries the supplied residual-factor decoder.
+        // Birth: K grows, and the new atom RECONSTRUCTS the residual-factor image.
+        //
+        // Since the #977 topology RACE, a born atom no longer carries the raw
+        // `factor_dir` coefficients verbatim: its topology is chosen by evidence
+        // and its decoder is the winning basis's penalized least-squares fit to the
+        // birth target `Y = Φ_template · factor_dir` (so the raw coefficient
+        // `[[0,0]]` is shrunk by the fit ridge — `0.6999…`, not exactly `0.7`).
+        // The structural invariant the move must preserve is therefore
+        // RECONSTRUCTION PARITY, not coefficient identity: the born atom, evaluated
+        // on its own coordinates with its own (raced) basis, must reproduce the
+        // birth-target image to within the small fit ridge.
         let p = term.output_dim();
         let m = term.atoms[0].basis_size();
         let mut decoder = Array2::<f64>::zeros((m, p));
         decoder[[0, 0]] = 0.7;
+        let birth_target = term.atoms[0].basis_values.dot(&decoder); // Φ_template · factor_dir
         let (born, born_rho) = apply_structure_move(
             &term,
             &rho,
@@ -2603,7 +2541,22 @@ mod tests {
         .unwrap();
         assert_eq!(born.k_atoms(), k0 + 1);
         assert_eq!(born_rho.log_ard.len(), k0 + 1);
-        assert_eq!(born.atoms[k0].decoder_coefficients[[0, 0]], 0.7);
+        // ρ's per-atom smoothness vector must grow in step with K (the #1556
+        // contract `assemble_arrow_schur` validates); a stale-length vector would
+        // panic the next assemble on the per-atom `lambda_smooth[atom_idx]` index.
+        assert_eq!(born_rho.log_lambda_smooth.len(), k0 + 1);
+        let born_atom = &born.atoms[k0];
+        let born_image = born_atom.basis_values.dot(&born_atom.decoder_coefficients);
+        assert_eq!(born_image.dim(), birth_target.dim());
+        let mut max_recon_err = 0.0_f64;
+        for (a, b) in born_image.iter().zip(birth_target.iter()) {
+            max_recon_err = max_recon_err.max((a - b).abs());
+        }
+        assert!(
+            max_recon_err < 1e-3,
+            "born atom must reconstruct the residual-factor image (penalized fit); \
+             max |Φ_born·B_born − Φ_template·factor_dir| = {max_recon_err:.3e} (> 1e-3)"
+        );
     }
 
     /// Ledger byte-determinism oracle (#997): two runs of the round driver over
