@@ -567,4 +567,55 @@ mod tests {
             "survival device vs CPU row-jet max abs diff {maxabs} > 1e-9"
         );
     }
+
+    /// Diagnostic (#415/#1175): localize CPU↔device drift per channel as both
+    /// absolute and relative error, and report the worst offending row's inputs.
+    /// Not a gate — `--ignored` so it only runs when explicitly requested on a
+    /// GPU box. Used to decide between a code fix and a principled mixed tol.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "diagnostic; run explicitly on a GPU box"]
+    fn device_vs_cpu_channel_drift_report() {
+        let rows = fixture(DEVICE_ROW_THRESHOLD + 1024);
+        let cpu = survival_rigid_row_jets_cpu(&rows, 0.7, &DIR, &DIRU, &DIRV);
+        let got = survival_rigid_row_jets(&rows, 0.7, &DIR, &DIRU, &DIRV);
+        // The dispatcher must have actually run the device path.
+        let dev = survival_rigid_row_jets_device_only(&rows, 0.7, &DIR, &DIRU, &DIRV)
+            .expect("device path must run on a GPU box");
+        let report = |name: &str, c: &[f64], d: &[f64], stride: usize| {
+            let mut max_abs = 0.0_f64;
+            let mut max_rel = 0.0_f64;
+            let mut worst_abs_row = 0usize;
+            let mut worst_rel_row = 0usize;
+            for (i, (x, y)) in c.iter().zip(d).enumerate() {
+                let abs = (x - y).abs();
+                let rel = abs / (x.abs().max(y.abs()).max(1e-300));
+                if abs > max_abs {
+                    max_abs = abs;
+                    worst_abs_row = i / stride;
+                }
+                if rel > max_rel {
+                    max_rel = rel;
+                    worst_rel_row = i / stride;
+                }
+            }
+            eprintln!(
+                "[#415 drift] {name:<7} max_abs={max_abs:.3e} (row {worst_abs_row}) \
+                 max_rel={max_rel:.3e} (row {worst_rel_row})"
+            );
+            (max_abs, max_rel)
+        };
+        eprintln!("=== device-only vs CPU (isolates kernel arithmetic) ===");
+        report("value", &cpu.value, &dev.value, 1);
+        report("grad", &cpu.grad, &dev.grad, 4);
+        report("hess", &cpu.hess, &dev.hess, 16);
+        report("third", &cpu.third, &dev.third, 16);
+        report("fourth", &cpu.fourth, &dev.fourth, 16);
+        eprintln!("=== dispatcher vs CPU (what the gate sees) ===");
+        report("value", &cpu.value, &got.value, 1);
+        report("grad", &cpu.grad, &got.grad, 4);
+        report("hess", &cpu.hess, &got.hess, 16);
+        report("third", &cpu.third, &got.third, 16);
+        report("fourth", &cpu.fourth, &got.fourth, 16);
+    }
 }
