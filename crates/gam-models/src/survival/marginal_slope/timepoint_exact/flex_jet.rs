@@ -4792,8 +4792,8 @@ mod hand_vs_jet_bench_tests {
     /// `b17785d2a~1` `flex_sensitivity.rs`): sparse single-pass grad loop +
     /// upper-triangle Hessian loop reading the timepoint `*_u`/`*_uv` ndarrays
     /// directly (NO contiguous copy). Pays its own 2×logΦ + 2×neglog-deriv calls.
-    fn hand_vgh(r: &Row, p: usize) -> (f64, Array1<f64>, Array2<f64>) {
-        let (
+    fn hand_vgh(row: &Row, p: usize) -> (f64, Array1<f64>, Array2<f64>) {
+        let Row {
             eta0,
             eta0_u,
             eta0_uv,
@@ -4812,9 +4812,10 @@ mod hand_vs_jet_bench_tests {
             di,
             q1_idx,
             qd1_idx,
-        ) = r;
-        let (eta0, eta1, chi1, d1, q1, qd1, wi, di, q1_idx, qd1_idx) =
-            (*eta0, *eta1, *chi1, *d1, *q1, *qd1, *wi, *di, *q1_idx, *qd1_idx);
+        } = row;
+        let (eta0, eta1, chi1, d1, q1, qd1, wi, di) =
+            (*eta0, *eta1, *chi1, *d1, *q1, *qd1, *wi, *di);
+        let (q1_idx, qd1_idx) = (*q1_idx, *qd1_idx);
         let (log_surv0, _) = signed_probit_logcdf_and_mills_ratio(-eta0);
         let (log_surv1, _) = signed_probit_logcdf_and_mills_ratio(-eta1);
         let (entry_k1, entry_k2, _, _) =
@@ -4877,8 +4878,8 @@ mod hand_vs_jet_bench_tests {
     /// The SHIPPED JET path: surv stacks + the `fused_inputs_from_view` contiguous
     /// copies + `fused_row_nll_jet2` (the exact body of the `want_hess` branch of
     /// `flex_row_nll_value_grad_hess`).
-    fn jet_vgh(r: &Row, p: usize) -> (f64, Array1<f64>, Array2<f64>) {
-        let (
+    fn jet_vgh(row: &Row, p: usize) -> (f64, Array1<f64>, Array2<f64>) {
+        let Row {
             eta0,
             eta0_u,
             eta0_uv,
@@ -4897,9 +4898,10 @@ mod hand_vs_jet_bench_tests {
             di,
             q1_idx,
             qd1_idx,
-        ) = r;
-        let (eta0, eta1, chi1, d1, q1, qd1, wi, di, q1_idx, qd1_idx) =
-            (*eta0, *eta1, *chi1, *d1, *q1, *qd1, *wi, *di, *q1_idx, *qd1_idx);
+        } = row;
+        let (eta0, eta1, chi1, d1, q1, qd1, wi, di) =
+            (*eta0, *eta1, *chi1, *d1, *q1, *qd1, *wi, *di);
+        let (q1_idx, qd1_idx) = (*q1_idx, *qd1_idx);
         let surv0 = surv_stack(eta0).unwrap();
         let surv1 = surv_stack(eta1).unwrap();
         let (e0g, e0h) = fused_inputs_from_view(eta0_u.view(), eta0_uv.view(), p);
@@ -4934,26 +4936,31 @@ mod hand_vs_jet_bench_tests {
         (value, grad, hess)
     }
 
-    type Row = (
-        f64,
-        Array1<f64>,
-        Array2<f64>,
-        f64,
-        Array1<f64>,
-        Array2<f64>,
-        f64,
-        Array1<f64>,
-        Array2<f64>,
-        f64,
-        Array1<f64>,
-        Array2<f64>,
-        f64,
-        f64,
-        f64,
-        f64,
-        usize,
-        usize,
-    );
+    /// One synthetic flex row: timepoint value/grad/Hessian tensors for the four
+    /// jet sources (`eta0`, `eta1`, `chi1`, `d1`) plus the scalar `q1`/`qd1`
+    /// values, their primary slots, and the row weight/event. Bundled into a
+    /// struct so the hand/jet kernels take one borrow instead of 19 positional
+    /// arguments.
+    struct Row {
+        eta0: f64,
+        eta0_u: Array1<f64>,
+        eta0_uv: Array2<f64>,
+        eta1: f64,
+        eta1_u: Array1<f64>,
+        eta1_uv: Array2<f64>,
+        chi1: f64,
+        chi1_u: Array1<f64>,
+        chi1_uv: Array2<f64>,
+        d1: f64,
+        d1_u: Array1<f64>,
+        d1_uv: Array2<f64>,
+        q1: f64,
+        qd1: f64,
+        wi: f64,
+        di: f64,
+        q1_idx: usize,
+        qd1_idx: usize,
+    }
 
     fn make_row(p: usize, st: &mut u64) -> Row {
         // Moderate η so logΦ / Mills are well-conditioned; χ,D strictly positive.
@@ -4985,10 +4992,26 @@ mod hand_vs_jet_bench_tests {
         let chh = mk_h(st);
         let dg = mk_g(st);
         let dh = mk_h(st);
-        (
-            eta0, e0g, e0h, eta1, e1g, e1h, chi1, cg, chh, d1, dg, dh, q1, qd1, wi, di, p - 2,
-            p - 1,
-        )
+        Row {
+            eta0,
+            eta0_u: e0g,
+            eta0_uv: e0h,
+            eta1,
+            eta1_u: e1g,
+            eta1_uv: e1h,
+            chi1,
+            chi1_u: cg,
+            chi1_uv: chh,
+            d1,
+            d1_u: dg,
+            d1_uv: dh,
+            q1,
+            qd1,
+            wi,
+            di,
+            q1_idx: p - 2,
+            qd1_idx: p - 1,
+        }
     }
 
     #[test]
@@ -5027,8 +5050,7 @@ mod hand_vs_jet_bench_tests {
             let t0 = Instant::now();
             for k in 0..iters {
                 let r = &rows[k % n];
-                black_box(&r);
-                let out = hand_vgh(r, p);
+                let out = hand_vgh(black_box(r), p);
                 black_box(out);
             }
             let hand_ns = t0.elapsed().as_nanos() as f64 / iters as f64;
@@ -5036,8 +5058,7 @@ mod hand_vs_jet_bench_tests {
             let t1 = Instant::now();
             for k in 0..iters {
                 let r = &rows[k % n];
-                black_box(&r);
-                let out = jet_vgh(r, p);
+                let out = jet_vgh(black_box(r), p);
                 black_box(out);
             }
             let jet_ns = t1.elapsed().as_nanos() as f64 / iters as f64;
@@ -5045,13 +5066,13 @@ mod hand_vs_jet_bench_tests {
             let r = &rows[0];
             let t2 = Instant::now();
             for _ in 0..iters {
-                let (a, _) = signed_probit_logcdf_and_mills_ratio(black_box(-r.0));
-                let (b, _) = signed_probit_logcdf_and_mills_ratio(black_box(-r.3));
-                let c = signed_probit_neglog_derivatives_up_to_fourth(black_box(-r.0), -r.14)
+                let (a, _) = signed_probit_logcdf_and_mills_ratio(black_box(-r.eta0));
+                let (b, _) = signed_probit_logcdf_and_mills_ratio(black_box(-r.eta1));
+                let c = signed_probit_neglog_derivatives_up_to_fourth(black_box(-r.eta0), -r.wi)
                     .unwrap();
                 let d = signed_probit_neglog_derivatives_up_to_fourth(
-                    black_box(-r.3),
-                    r.14 * (1.0 - r.15),
+                    black_box(-r.eta1),
+                    r.wi * (1.0 - r.di),
                 )
                 .unwrap();
                 black_box((a, b, c, d));

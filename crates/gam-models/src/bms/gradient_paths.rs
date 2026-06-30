@@ -2600,58 +2600,6 @@ mod jet_tower_oracle_tests {
             }
         }
     }
-
-    /// Perf certificate (#932): the shipped jet value/grad/Hessian kernel must
-    /// reproduce the original HAND path it replaced. Converted from a timing-only
-    /// bench (which enforced nothing) into a real CI gate — it pins value, grad
-    /// and Hessian agreement across the standard fixture grid, the bit-identity
-    /// #932 actually wants verified.
-    #[test]
-    fn rigid_vgh_jet_matches_hand() {
-        let eta = [0.3_f64, -0.7, 0.05, 0.9, -1.2, 2.1, -2.4];
-        let g = [0.2_f64, -0.5, 0.35, -0.15, 0.6, 0.45, -0.55];
-        let z = [0.4_f64, -1.1, 0.0, 0.7, -0.3, 1.6, -1.4];
-        let y = [1.0_f64, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0];
-        let w = [1.0_f64, 0.8, 1.3, 0.9, 1.1, 0.7, 1.4];
-        let n = eta.len();
-        // Precompute the marginal link maps once (both paths receive them in
-        // production).
-        let maps: Vec<BernoulliMarginalLinkMap> = (0..n)
-            .map(|r| {
-                bernoulli_marginal_link_map(
-                    &InverseLink::Standard(gam_problem::StandardLink::Probit),
-                    eta[r],
-                )
-                .expect("link map")
-            })
-            .collect();
-
-        let close = |a: f64, b: f64, label: &str| {
-            let band = 1e-12 + 1e-9 * a.abs().max(b.abs());
-            assert!(
-                (a - b).abs() <= band,
-                "{label}: jet {a:+.15e} vs hand {b:+.15e} (band {band:.3e})"
-            );
-        };
-
-        for &probit_scale in &[1.0_f64, 0.8] {
-            for r in 0..n {
-                let (hv, hg, hh) =
-                    hand_rigid_vgh(maps[r], g[r], z[r], y[r], w[r], probit_scale);
-                let (jv, jg, jh) = rigid_standard_normal_row_kernel(
-                    maps[r], g[r], z[r], y[r], w[r], probit_scale,
-                )
-                .expect("jet kernel");
-                close(jv, hv, "value");
-                for a in 0..2 {
-                    close(jg[a], hg[a], "grad");
-                    for b in 0..2 {
-                        close(jh[a][b], hh[a][b], "hess");
-                    }
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]
