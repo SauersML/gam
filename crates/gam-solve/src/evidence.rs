@@ -1528,6 +1528,14 @@ pub struct RemlCandidate {
     /// #1384). `None` for legacy payloads that did not record it — those are not
     /// guarded (back-compatible), but every current FFI candidate carries it.
     pub family: Option<String>,
+    /// Number of observations the fit was trained on. Carried so
+    /// `compare_reml_fits` can REFUSE to rank fits made on a different number of
+    /// observations (hence different data): `−2·loglik` and the REML/LAML
+    /// evidence grow with `n`, so a score difference between two fits with
+    /// different `n` is not a Bayes factor — the same incomparability the family
+    /// guard already rejects. `None` for payloads that do not record it (legacy /
+    /// O(n) scan smoothers), which the guard treats as unconstrained.
+    pub n_obs: Option<usize>,
 }
 
 impl RemlCandidate {
@@ -1622,6 +1630,35 @@ pub fn compare_reml_fits(mut candidates: Vec<RemlCandidate>) -> Result<RemlCompa
                     Some(prev) if prev != fam => {
                         return Err(format!(
                             "compare_models: cannot compare fits of different response families                              ('{prev}' vs '{fam}'); their REML/LAML evidence scores are on                              incomparable base measures. Compare models fit to the same response                              under the same family."
+                        ));
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+    // Fail-loud comparability guard (#1384 sibling): AIC / REML-LAML evidence are
+    // only comparable across fits of the SAME response on the SAME observations.
+    // `−2·loglik` (and the marginal-likelihood headline) grow with the number of
+    // observations `n`, so two fits with different `n` live on incomparable
+    // scales and their score gap is not a Bayes factor — comparing an n=500 and
+    // an n=100 fit of the same DGP otherwise declares the n=100 model the winner
+    // purely because fewer points give a less-negative total log-likelihood.
+    // Refuse when two candidates carry DIFFERENT observation counts. Candidates
+    // with no count (`None`, legacy / O(n) scan payloads) are unconstrained, so
+    // this never spuriously rejects a fit that simply did not record `n`.
+    {
+        let mut seen_n: Option<usize> = None;
+        for cand in &candidates {
+            if let Some(n) = cand.n_obs {
+                match seen_n {
+                    None => seen_n = Some(n),
+                    Some(prev) if prev != n => {
+                        return Err(format!(
+                            "compare_models: cannot compare fits made on a different number of \
+                             observations (n={prev} vs n={n}); AIC / REML-LAML evidence scales \
+                             with the sample size, so their score difference is not a Bayes \
+                             factor. Compare models fit to the same response on the same data."
                         ));
                     }
                     Some(_) => {}
@@ -3160,6 +3197,7 @@ mod tests {
             edf: Some(edf),
             log_lik: Some(0.0),
             family: Some("gaussian".to_string()),
+            n_obs: Some(100),
         };
         // raw REML : m2 (41.605) < m1 (53.748) < m3 (120.011)
         // AIC=2*edf: m1 (100)    < m2 (102)    < m3 (130)
@@ -3913,6 +3951,7 @@ mod tests {
             edf: Some(edf),
             log_lik: Some(log_lik),
             family: None,
+            n_obs: None,
         }
     }
 
@@ -3933,6 +3972,7 @@ mod tests {
             edf: Some(6.0),
             log_lik: None,
             family: None,
+            n_obs: None,
         };
         assert_eq!(c.ranking_score(), 151.28);
     }
@@ -3986,5 +4026,45 @@ mod tests {
             cmp.winner, "big",
             "compare_models must retain power: the relevant smooth's model must win"
         );
+    }
+
+    #[test]
+    fn compare_models_rejects_mismatched_observation_counts() {
+        // Two same-family fits on different-sized data are not comparable by
+        // AIC / evidence; the comparison must fail loud, mirroring the family
+        // guard, rather than declare a sample-size-driven winner.
+        let with_n = |name: &str, n: usize| RemlCandidate {
+            index: 0,
+            name: name.to_string(),
+            score: 100.0,
+            edf: Some(5.0),
+            log_lik: Some(-40.0),
+            family: Some("gaussian".to_string()),
+            n_obs: Some(n),
+        };
+        let err = compare_reml_fits(vec![with_n("big", 500), with_n("small", 100)])
+            .expect_err("cross-n comparison must be rejected");
+        assert!(
+            err.contains("number of observations") && err.contains("500") && err.contains("100"),
+            "n-guard error should name the incomparable counts, got: {err}"
+        );
+
+        // Same n is comparable.
+        compare_reml_fits(vec![with_n("a", 250), with_n("b", 250)])
+            .expect("same-n comparison must succeed");
+
+        // A missing count (`None`) is unconstrained: it must not block a
+        // comparison against a fit that does carry one (legacy / scan payloads).
+        let without_n = RemlCandidate {
+            index: 0,
+            name: "legacy".to_string(),
+            score: 90.0,
+            edf: Some(4.0),
+            log_lik: Some(-35.0),
+            family: Some("gaussian".to_string()),
+            n_obs: None,
+        };
+        compare_reml_fits(vec![with_n("counted", 500), without_n])
+            .expect("an unconstrained (None) count must not trip the guard");
     }
 }

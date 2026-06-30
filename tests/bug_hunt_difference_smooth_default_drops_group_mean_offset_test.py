@@ -12,6 +12,13 @@ With the fix, `group_means=True` is honoured over `marginalise_random` for the
 compared factor's own columns, so the default difference smooth recovers BOTH
 the level difference and the wiggle difference, matching the model's own
 predicted between-group difference `predict(B) - predict(A)`.
+
+Sign convention: a pair `(level_1, level_2)` yields the contrast
+`ŝ(level_1) - ŝ(level_2)` (mgcv's `plot_diff(model, level_1, level_2)`; see the
+companion `bug_hunt_difference_smooth_sign_inverted_test.py`). We therefore
+request `pairs=[("B", "A")]` so the recovered `diff` equals `predict(B) -
+predict(A)` (≈ +offset here); the magnitude — not the chosen direction — is what
+the #1121 offset-recovery contract pins.
 """
 
 from __future__ import annotations
@@ -44,7 +51,8 @@ def test_default_difference_smooth_recovers_group_mean_offset() -> None:
     model = gamfit.fit(df, "y ~ s(x) + g")
 
     # Default arguments: marginalise_random=True, group_means=True.
-    d = model.difference_smooth(view="x", group="g", pairs=[("A", "B")], n=30)
+    # Pair (B, A) ⇒ diff = ŝ(B) − ŝ(A) = predict(B) − predict(A) ≈ +offset.
+    d = model.difference_smooth(view="x", group="g", pairs=[("B", "A")], n=30)
     grid = d["x"].to_numpy()
     diff = d["diff"].to_numpy()
 
@@ -79,11 +87,11 @@ def test_marginalise_random_false_matches_default() -> None:
     df = _frame()
     model = gamfit.fit(df, "y ~ s(x) + g")
 
-    default = model.difference_smooth(view="x", group="g", pairs=[("A", "B")], n=30)
+    default = model.difference_smooth(view="x", group="g", pairs=[("B", "A")], n=30)
     explicit = model.difference_smooth(
         view="x",
         group="g",
-        pairs=[("A", "B")],
+        pairs=[("B", "A")],
         n=30,
         marginalise_random=False,
     )
