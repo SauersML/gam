@@ -90,7 +90,11 @@ sccache_summary() {
 # 320k) genuinely run longer; override with GAM_BUILD_TIMEOUT=<seconds> for those
 # without forking the shared gate. Routine callers are unaffected.
 TIMEOUT="${GAM_BUILD_TIMEOUT:-1800}"
-MIN_FREE_GB="${MIN_FREE_GB:-8}"
+MIN_FREE_GB="${MIN_FREE_GB:-4}"   # incremental DEBUG builds write small deltas + a
+# modest link (not a full release link), so an 8G headroom is overkill and on this
+# disk-tight shared box it refused every build at ~7G free. 4G covers an incremental
+# umbrella link; disk_guard's <3G near-ENOSPC backstop (drops deps+incremental) is the
+# real corruption guard. Raise via MIN_FREE_GB=<n> on a box doing full release builds.
 now() { date +%H:%M:%S; }; ep() { date +%s; }
 
 # Preflight: bail FAST instead of dying at link with ENOSPC (which also corrupts
