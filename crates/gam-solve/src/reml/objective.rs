@@ -1890,6 +1890,29 @@ impl<'a> RemlState<'a> {
         if n < ALO_STABILIZATION_MIN_N {
             return Ok(None);
         }
+        // #1033 n-free κ-loop: when the inner Gaussian solve was served by the
+        // ψ-keyed sufficient-statistic Gram cache (`row_prediction_is_stale`),
+        // the surface's realized rows — `x_transformed`, `finalmu`, the working
+        // weights — are FROZEN at the pinning ψ of the last `reset_surface`, NOT
+        // this trial's ψ. `compute_alo_diagnostics_from_pirls` would (a) cost a
+        // full O(n·k) leverage pass (the dense design materialization + n hat
+        // values `h_ii = w_i x_iᵀ H⁻¹ x_i`) on EVERY in-window κ-trial — the last
+        // O(n) term defeating the issue's sufficient-statistic invariant — and
+        // (b) read those stale rows, so the leverage it returns describes the
+        // wrong ψ. The stabilizer is an OUTER-OPTIMIZER aid, never part of the
+        // genuine REML/LAML criterion (see the header comment), so skipping it on
+        // the stale-row lane changes no fitted result: the slow-path anchor (one
+        // realization per design revision) still carries a non-stale cache and
+        // keeps the leverage barrier engaged at the pinning ψ. Gate strictly on
+        // the installed cache being the stale-row tensor cache, so every
+        // realized-design eval (slow path, off-window, non-Gaussian) keeps the
+        // exact augmentation.
+        if self
+            .installed_gaussian_fixed_cache()
+            .is_some_and(|cache| cache.row_prediction_is_stale)
+        {
+            return Ok(None);
+        }
         // Suppress the stabilizer on near-saturated / over-parameterized designs
         // (e.g. small-n tensor-product `te()` whose marginal-product column count
         // rivals n). There leverage is high for *every* row from basis geometry,
