@@ -424,6 +424,7 @@ impl log::Log for NfreeResetLogger {
         if msg.starts_with("[NFREE-RESET")
             || msg.starts_with("[KAPPA-PHASE-SUMMARY")
             || msg.starts_with("[KAPPA-PHASE-PRIME")
+            || msg.starts_with("[KAPPA-PHASE-FLOOR")
         {
             if let Ok(mut f) = self.file.lock() {
                 let _ = writeln!(f, "{msg}");

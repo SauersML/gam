@@ -598,10 +598,10 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     /// lower bound to this n-FREE floor so every in-window trial stays on the
     /// design-realization skip (#1033). See
     /// [`crate::psi_gram_tensor::PsiGramTensor::rank_stable_psi_floor`].
-    pub fn psi_gram_rank_stable_floor(&self) -> Option<f64> {
+    pub fn psi_gram_rank_stable_floor(&self, psi_anchor: f64) -> Option<f64> {
         self.psi_gram_tensor
             .as_ref()
-            .and_then(|t| t.rank_stable_psi_floor())
+            .and_then(|t| t.rank_stable_psi_floor(psi_anchor))
     }
 
     /// Return the most-recently converged inner β from the last PIRLS solve, if

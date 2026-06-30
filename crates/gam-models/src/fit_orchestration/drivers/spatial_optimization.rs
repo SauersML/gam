@@ -3983,9 +3983,17 @@ fn run_exact_joint_spatial_optimization(
             // Only lift INTO the window (never below psi_lo, never above the seed
             // ψ — the seed is the geometric-mean midpoint and is well clear of the
             // degenerate band), so the optimizer never starts outside its bounds.
-            psi_rank_stable_floor = evaluator.psi_gram_rank_stable_floor().filter(|&f| {
-                f.is_finite() && f > psi_lo && f < theta0[rho_dim]
-            });
+            let psi_anchor = theta0[rho_dim];
+            psi_rank_stable_floor = evaluator
+                .psi_gram_rank_stable_floor(psi_anchor)
+                .filter(|&f| f.is_finite() && f > psi_lo && f < psi_anchor);
+            log::info!(
+                "[KAPPA-PHASE-FLOOR] n_rows={} psi_lo={psi_lo:.6} psi_anchor={psi_anchor:.6} \
+                 rank_stable_floor={:?} lifted={}",
+                data.nrows(),
+                evaluator.psi_gram_rank_stable_floor(psi_anchor),
+                psi_rank_stable_floor.is_some(),
+            );
             if let Some(floor) = psi_rank_stable_floor {
                 log::info!(
                     "[{label}] rank-stable κ-floor ψ_floor={floor:.6} > window floor \

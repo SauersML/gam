@@ -684,46 +684,54 @@ impl PsiGramTensor {
             .map(|(_, rank)| rank)
     }
 
-    /// Lowest ψ at or above which the conditioned Gram `XᵀWX(ψ)` holds its MAXIMAL
-    /// numerical rank across the certified window — i.e. the ψ-floor below which
-    /// the design-revision skip's `reduced_basis_equal` witness must refuse (the
-    /// range subspace collapses / rotates as the longest-length-scale radial mode
-    /// drops under the rank cutoff). Restricting the κ-optimizer's lower bound to
-    /// this floor keeps every in-window trial on the n-free fast path and is
-    /// inherently n-INDEPENDENT: the rank is a property of the k×k tensor, not of
-    /// the sample size (#1033).
+    /// Lower edge of the contiguous ψ-band, ANCHORED at `psi_anchor`, over which
+    /// the conditioned Gram `XᵀWX(ψ)` holds the SAME numerical rank it has at the
+    /// anchor — i.e. the ψ-floor below which the design-revision skip's
+    /// `reduced_basis_equal` witness must (soundly) refuse, because the range
+    /// subspace collapses as the longest-length-scale radial mode drops under the
+    /// rank cutoff. Lifting the κ-optimizer's lower bound to this floor keeps every
+    /// in-window trial on the n-free fast path and is inherently n-INDEPENDENT: the
+    /// rank is a property of the k×k tensor, not of the sample size (#1033).
     ///
-    /// Scans the window on a fixed k-space grid (no row access), finds the maximal
-    /// rank attained, then returns the smallest ψ such that the rank is maximal at
-    /// EVERY grid node from there to `psi_hi` (so a transient full-rank node inside
-    /// the degenerate band does not lower the floor). Returns `None` when the rank
-    /// is maximal across the whole window already (no floor lift needed) or when
-    /// the Gram never certifies a rank.
-    pub fn rank_stable_psi_floor(&self) -> Option<f64> {
-        // Fixed k-space grid over the window. 64 nodes resolves the rank cliff
-        // (which spans ~1 ψ-decade on production Duchon geometry) far finer than
-        // the optimizer's ~ln2 step, and the whole scan is O(nodes·k³), n-free.
-        const NODES: usize = 64;
+    /// Anchoring at `psi_anchor` (the optimizer's ψ seed) is essential: the
+    /// conditioned Gram is rank-deficient at BOTH window ends on production radial
+    /// geometry — at small ψ the longest-scale mode collapses into the polynomial
+    /// nullspace, and at very large ψ every radial column goes collinear with it.
+    /// The maximal-rank region is therefore a middle BAND, and the κ-optimum lives
+    /// inside it. We walk DOWN from the anchor on a fixed k-space grid and return
+    /// the lowest ψ still at the anchor's rank (stopping at the first node that
+    /// differs). Purely O(nodes·k³) — no row access.
+    ///
+    /// Returns `None` when the band already reaches `psi_lo` (no lift needed), when
+    /// the anchor is off-window / rank-indeterminate, or when the window is empty.
+    pub fn rank_stable_psi_floor(&self, psi_anchor: f64) -> Option<f64> {
+        // Fixed k-space grid over the window. 96 nodes resolves the rank cliff
+        // (~1 ψ-decade wide on production Duchon geometry) far finer than the
+        // optimizer's ~ln2 step; the whole scan is O(nodes·k³), independent of n.
+        const NODES: usize = 96;
         if !(self.psi_hi > self.psi_lo) {
             return None;
         }
         let span = self.psi_hi - self.psi_lo;
         let psi_at = |i: usize| self.psi_lo + span * (i as f64) / ((NODES - 1) as f64);
-        let ranks: Vec<Option<usize>> =
-            (0..NODES).map(|i| self.gram_numerical_rank(psi_at(i))).collect();
-        let max_rank = ranks.iter().filter_map(|r| *r).max()?;
-        // Walk DOWN from psi_hi; the floor is the lowest node from which every
-        // higher node is at maximal rank. Stop at the first node that drops below.
-        let mut floor_idx = NODES - 1;
-        for i in (0..NODES).rev() {
-            if ranks[i] == Some(max_rank) {
+        // Clamp the anchor into the window, then map it to the nearest grid node.
+        let anchor = psi_anchor.clamp(self.psi_lo, self.psi_hi);
+        let anchor_idx = (((anchor - self.psi_lo) / span) * ((NODES - 1) as f64))
+            .round()
+            .clamp(0.0, (NODES - 1) as f64) as usize;
+        let anchor_rank = self.gram_numerical_rank(psi_at(anchor_idx))?;
+        // Walk DOWN from the anchor; the floor is the lowest node from which every
+        // node up to the anchor holds `anchor_rank`. Stop at the first node below.
+        let mut floor_idx = anchor_idx;
+        for i in (0..anchor_idx).rev() {
+            if self.gram_numerical_rank(psi_at(i)) == Some(anchor_rank) {
                 floor_idx = i;
             } else {
                 break;
             }
         }
         if floor_idx == 0 {
-            // Rank is maximal across the entire window — no lift needed.
+            // The anchor's rank band already reaches `psi_lo` — no lift needed.
             None
         } else {
             Some(psi_at(floor_idx))
