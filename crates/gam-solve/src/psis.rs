@@ -170,9 +170,20 @@ pub fn fit_gpd_moments(excesses: &[f64]) -> Option<(f64, f64)> {
     }
 
     let k_raw = profile_shape(b_post, &x)?;
-    // Shrink toward 0.5 by `PRIOR_K` pseudo-observations.
+    // The GPD scale is fixed by the fitted `b_post` and the *profile* shape that
+    // generated it: `σ = −k(b_post)/b_post`. This is positive by construction for
+    // a genuine tail, because the admissible profile shape `k_raw = mean log(1 −
+    // b·xᵢ)` always carries the opposite sign of `b_post` (every `1 − b·xᵢ ∈ (0,
+    // 1)` for `b_post > 0`, so `k_raw < 0`; symmetrically `k_raw > 0` for
+    // `b_post < 0`). Computing σ here, before the shape is shrunk, mirrors
+    // loo/ArviZ and keeps the sign relationship intact: a light tail (`k_raw < 0`)
+    // yields `σ > 0` rather than being rejected.
+    let sigma = -k_raw / b_post;
+    // Shrink only the *reported* shape toward 0.5 by `PRIOR_K` pseudo-observations.
+    // This affects the diagnostic value alone, never the scale's validity, so the
+    // weak toward-0.5 prior can no longer flip `k`'s sign relative to `b_post` and
+    // spuriously reject a perfectly valid light-tail fit.
     let k = (nf * k_raw + PRIOR_K * 0.5) / (nf + PRIOR_K);
-    let sigma = -k / b_post;
     if !(k.is_finite() && sigma.is_finite() && sigma > 0.0) {
         return None;
     }
