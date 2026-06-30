@@ -14,17 +14,27 @@
 //! (geometric) coordinates, consistent with the solver's contract, so the
 //! refusal no longer fires and the fit proceeds.
 //!
-//! SCOPE: this test guards the ABORT regression only — that the clamped fit
-//! completes and returns finite predictions. It does NOT assert interior
-//! fit quality, because a separate, deeper, deterministic defect remains:
-//! REML over-smooths to the λ-ceiling whenever a linear inequality
-//! constraint is active, so the returned clamped fit is near-constant
-//! (interior RMSE ≈ 0.77 vs ≈ 0.02 unconstrained). That degeneracy is
-//! independent of the vertical offset — the same collapse occurs on
-//! `sin(2πx) + 0.3` (see `bc_fit_quality_sanity.rs`, currently failing) —
-//! so the issue's premise that the +0.3 variant "fits without trouble" is
-//! empirically false. The over-smoothing is tracked as the remaining work
-//! on #500; conflating it with the abort in one assertion would be wrong.
+//! SCOPE: this test guards two things, both of which the #500 reopen confirmed
+//! are now genuinely fixed (the original close left the SECOND one unguarded):
+//!   1. the ABORT regression — the clamped fit must COMPLETE, not refuse every
+//!      seed during outer startup validation; and
+//!   2. interior fit QUALITY — the returned clamped smooth must actually track
+//!      the signal, not collapse to a near-constant.
+//!
+//! When this issue was first closed, only (1) was fixed and (2) was explicitly
+//! deferred with the claim that "REML over-smooths to the λ-ceiling whenever a
+//! linear inequality constraint is active, so the returned clamped fit is
+//! near-constant (interior RMSE ≈ 0.77 vs ≈ 0.02 unconstrained)". That claim
+//! is no longer true: `bc=clamped` no longer lowers to a runtime active-set
+//! inequality at all — since #1238 it is a *structural nullspace
+//! reparameterization* (the pinned endpoint-derivative DOF is removed from the
+//! basis before the solver sees it), so the smooth fits on the ordinary
+//! unconstrained REML path and recovers the interior at ≈ unconstrained
+//! quality. The deferred degeneracy was fixed but left UNGUARDED — a future
+//! regression in the constrained-chart penalty geometry would silently
+//! re-collapse the clamped fit with nothing red. This test now pins the
+//! quality so the fix cannot rot. (The sibling `bc_fit_quality_sanity.rs`
+//! pins the same contract on the `+0.3`-offset dataset.)
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
@@ -134,15 +144,31 @@ fn clamped_zero_offset_sine_does_not_abort_startup_validation() {
         "clamped fit produced non-finite predictions"
     );
 
-    // Informational only (NOT asserted): the unconstrained reference and the
-    // clamped interior RMSE. The clamped value is expected to be poor here
-    // (≈0.77, near-constant) because of the separate, deeper REML
-    // over-smoothing-under-constraints degeneracy documented in the module
-    // header and tracked as the remaining work on #500. Asserting quality
-    // here would conflate two distinct bugs.
+    // QUALITY GATE (the part the original close left unguarded): the clamped
+    // smooth must recover the interior signal at ≈ unconstrained quality, NOT
+    // collapse to the λ-ceiling near-constant the original triage feared.
+    // Since #1238 `bc=clamped` is a structural nullspace reparameterization —
+    // the pinned endpoint-derivative DOF is removed from the basis before the
+    // solver runs — so the fit takes the ordinary unconstrained REML path and
+    // the interior RMSE tracks the free fit within a small multiple.
+    //
+    // Concrete numbers at this seed/n: free ≈ 0.018, clamped ≈ 0.022. We assert
+    // a generous bar (clamped ≤ 5× free, and an absolute ceiling of 0.10) so the
+    // test is robust to platform FP drift yet still RED if the fit ever
+    // re-collapses toward the ≈0.77 near-constant degeneracy.
     let rmse_free = rmse(&fit_and_probe("y ~ s(x, k=12)", &data, &eval_xs), &eval_xs);
     let rmse_clamped = rmse(&pred_clamped, &eval_xs);
-    eprintln!(
-        "[bc-500] free={rmse_free:.4} clamped={rmse_clamped:.4} (clamped quality tracked separately)"
+    eprintln!("[bc-500] free={rmse_free:.4} clamped={rmse_clamped:.4}");
+    assert!(
+        rmse_clamped <= 0.10,
+        "#500 quality regression: clamped interior RMSE={rmse_clamped:.4} exceeds the 0.10 \
+         absolute ceiling — the structural bc=clamped reparameterization appears to have \
+         re-collapsed toward the old λ-ceiling near-constant (≈0.77) degeneracy"
+    );
+    assert!(
+        rmse_clamped <= 5.0 * rmse_free,
+        "#500 quality regression: clamped RMSE={rmse_clamped:.4} is more than 5× the \
+         unconstrained reference RMSE={rmse_free:.4}; the clamped fit is no longer tracking \
+         the interior signal at unconstrained quality"
     );
 }
