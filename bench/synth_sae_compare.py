@@ -316,17 +316,17 @@ def _score_manifold(
 ) -> ModelResult:
     t0 = time.perf_counter()
     fit = gamfit.sae_manifold_fit(
-        Z=train_x,
+        X=train_x,
         n_atoms=atoms,
-        atom_basis=basis,
-        atom_dim=atom_dim,
+        atom_topology=basis,
+        d_atom=atom_dim,
         assignment="softmax",
         top_k=top_k,
         isometry_weight=0.0,
         ard_per_atom=False,
         sparsity_weight=0.01,
         smoothness_weight=0.01,
-        max_iter=max_iter,
+        n_iter=max_iter,
         learning_rate=learning_rate,
         random_state=seed,
     )
