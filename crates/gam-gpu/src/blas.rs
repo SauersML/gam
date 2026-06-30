@@ -22,7 +22,9 @@ pub fn blas_backend_status() -> super::CudaBackendStatus {
 mod cuda_impl {
     use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis};
 
-    use crate::driver::{from_col_major, to_col_major, to_i32};
+    use crate::driver::{
+        array_from_row_major, from_col_major, to_col_major, to_i32, to_row_major,
+    };
 
     use super::super::device_runtime::GpuRuntime;
     use cudarc::cublas::sys::{
@@ -572,35 +574,60 @@ mod cuda_impl {
             return None;
         }
         let (stream, blas) = stream_and_blas_for(ordinal)?;
-        let a_col = to_col_major(&a);
-        let b_col = to_col_major(&b);
-        let a_dev = stream.clone_htod(&*a_col).ok()?;
-        let b_dev = stream.clone_htod(&*b_col).ok()?;
+        // Host-transpose-free path. The row-major output buffer of
+        // `C = op(A)·op(B)` (shape m×n) is bit-identical to the column-major
+        // buffer of `Cᵀ = op(B)ᵀ·op(A)ᵀ` (shape n×m). A row-major buffer,
+        // reinterpreted column-major, is already the transpose of its logical
+        // matrix — so uploading `a`/`b` row-major (a borrow when C-contiguous)
+        // gives cuBLAS `Aᵀ`/`Bᵀ` for free, and downloading straight into a
+        // row-major `Array2` skips the result permutation too. This removes the
+        // two O(rows·cols) scalar `to_col_major`/`from_col_major` passes that
+        // dominated tall-skinny GEMMs (e.g. the 200000×200 Wahba design
+        // reduction) and made the device path slower than the host SIMD GEMM.
+        //
+        // Uploading the row-major buffer of an `(r×c)` array and declaring it
+        // column-major with leading dim `c` hands cuBLAS exactly that array's
+        // transpose (a `(c×r)` col-major matrix). So with
+        //   X = b's row-major buffer  → col-major X = bᵀ  (rows = b_cols),
+        //   Y = a's row-major buffer  → col-major Y = aᵀ  (rows = a_cols),
+        // cuBLAS's `out = opX(X)·opY(Y)` yields `Cᵀ` when
+        //   opX = trans_b ? T : N,   opY = trans_a ? T : N,
+        //   (M,N,K) = (n, m, k),   lda = b_cols, ldb = a_cols, ldc = n.
+        // The column-major `Cᵀ` buffer (n rows) is bit-identical to the
+        // row-major `C` buffer (m×n), so the download wraps with no permute.
+        let b_rm = to_row_major(&b);
+        let a_rm = to_row_major(&a);
+        let x_dev = stream.clone_htod(&*b_rm).ok()?;
+        let y_dev = stream.clone_htod(&*a_rm).ok()?;
         let mut out_dev = stream.alloc_zeros::<f64>(m.checked_mul(n)?).ok()?;
         let cfg = GemmConfig::<f64> {
-            transa: if trans_a {
+            transa: if trans_b {
                 cublasOperation_t::CUBLAS_OP_T
             } else {
                 cublasOperation_t::CUBLAS_OP_N
             },
-            transb: if trans_b {
+            transb: if trans_a {
                 cublasOperation_t::CUBLAS_OP_T
             } else {
                 cublasOperation_t::CUBLAS_OP_N
             },
-            m: to_i32(m)?,
-            n: to_i32(n)?,
+            m: to_i32(n)?,
+            n: to_i32(m)?,
             k: to_i32(k_a)?,
             alpha: 1.0,
-            lda: to_i32(a_rows)?,
-            ldb: to_i32(b_rows)?,
+            // Leading dim of each physically-stored col-major operand =
+            // its row count: B̌ has `b_cols` rows, Ǎ has `a_cols` rows.
+            lda: to_i32(b_cols)?,
+            ldb: to_i32(a_cols)?,
             beta: 0.0,
-            ldc: to_i32(m)?,
+            ldc: to_i32(n)?,
         };
-        // SAFETY: buffers are column-major with dimensions validated above.
-        unsafe { blas.gemm(cfg, &a_dev, &b_dev, &mut out_dev) }.ok()?;
-        let out_col = stream.clone_dtoh(&out_dev).ok()?;
-        from_col_major(&out_col, m, n)
+        // SAFETY: dims validated above; buffers carry exactly the row counts
+        // declared as leading dimensions.
+        unsafe { blas.gemm(cfg, &x_dev, &y_dev, &mut out_dev) }.ok()?;
+        // `out_dev` is `Cᵀ` column-major == `C` row-major: wrap with no permute.
+        let out_rm = stream.clone_dtoh(&out_dev).ok()?;
+        array_from_row_major(out_rm, m, n)
     }
 
     /// Broadcast-B batched GEMM on a specific device ordinal. The caller

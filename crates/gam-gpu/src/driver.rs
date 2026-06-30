@@ -539,6 +539,48 @@ pub fn to_col_major<'a, S: Data<Elem = f64>>(a: &'a ArrayBase<S, Ix2>) -> Cow<'a
     Cow::Owned(out)
 }
 
+/// Borrow (or pack) a 2D array's buffer in ROW-major (C) order.
+///
+/// The col-major dual of [`to_col_major`]: when the input is already
+/// C-contiguous its raw buffer IS the row-major flat layout, so this borrows
+/// it with no allocation or copy. Non-contiguous / F-order inputs are packed
+/// row by row.
+///
+/// This is the host-transpose-free upload path. A row-major `(r × c)` buffer,
+/// reinterpreted as a column-major buffer, is exactly the transpose `(c × r)`
+/// of the logical matrix — which is what the swapped-operand cuBLAS GEMM
+/// (`Cᵀ = Bᵀ·Aᵀ`) consumes, letting both the design upload and the result
+/// download skip the O(r·c) scalar permutation that dominated tall-skinny
+/// GEMMs on the host.
+pub fn to_row_major<'a, S: Data<Elem = f64>>(a: &'a ArrayBase<S, Ix2>) -> Cow<'a, [f64]> {
+    let (rows, cols) = a.dim();
+    let strides = a.strides();
+    // C-order contiguous: row stride == cols, column stride == 1.
+    if rows > 0
+        && cols > 0
+        && strides[1] == 1
+        && strides[0] == cols as isize
+        && let Some(slice) = a.as_slice_memory_order()
+    {
+        return Cow::Borrowed(slice);
+    }
+    let mut out: Vec<f64> = Vec::with_capacity(rows.saturating_mul(cols));
+    for row in 0..rows {
+        out.extend(a.row(row).iter().copied());
+    }
+    Cow::Owned(out)
+}
+
+/// Wrap a row-major flat buffer of shape `(rows, cols)` as an `Array2<f64>`
+/// without permutation. The buffer is consumed (no copy when its length
+/// matches). Returns `None` on a length mismatch.
+pub fn array_from_row_major(values: Vec<f64>, rows: usize, cols: usize) -> Option<Array2<f64>> {
+    if values.len() != rows.checked_mul(cols)? {
+        return None;
+    }
+    Array2::from_shape_vec((rows, cols), values).ok()
+}
+
 /// Convert a column-major flat buffer back into row-major `Array2<f64>`.
 pub fn from_col_major_inplace(values: &[f64], out: &mut Array2<f64>) -> Option<()> {
     let (rows, cols) = out.dim();
