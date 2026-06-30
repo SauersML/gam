@@ -809,6 +809,17 @@ fn duplicate_atom(
     } else {
         child_rho.log_ard.push(Array1::<f64>::zeros(0));
     }
+    // The fissioned child inherits the PARENT atom's per-atom smoothness strength
+    // (#1556). As with `log_ard`, failing to grow `log_lambda_smooth` in step with
+    // `k_atoms()` makes the next `assemble_arrow_schur` panic on the per-atom
+    // `lambda_smooth[atom_idx]` index (out of bounds).
+    let inherited_smooth = child_rho
+        .log_lambda_smooth
+        .get(parent)
+        .or_else(|| child_rho.log_lambda_smooth.first())
+        .copied()
+        .unwrap_or(0.0);
+    child_rho.log_lambda_smooth.push(inherited_smooth);
     Ok((child, child_rho))
 }
 
@@ -1545,6 +1556,14 @@ fn born_atom(
         .cloned()
         .unwrap_or_else(|| Array1::<f64>::zeros(0));
     child_rho.log_ard.push(inherited);
+    // ρ carries a PER-ATOM smoothness strength `log_lambda_smooth[k]` (#1556),
+    // and `assemble_arrow_schur` indexes it by atom (`lambda_smooth[atom_idx]`).
+    // Growing the dictionary without growing this vector leaves `k_atoms()`
+    // ahead of `log_lambda_smooth.len()` and the next assemble panics with an
+    // out-of-bounds index. The born atom inherits the template atom's smoothness
+    // strength (atom 0), matching the `log_ard` inheritance just above.
+    let inherited_smooth = child_rho.log_lambda_smooth.first().copied().unwrap_or(0.0);
+    child_rho.log_lambda_smooth.push(inherited_smooth);
     Ok((child, child_rho))
 }
 
@@ -2589,11 +2608,22 @@ mod tests {
         let dead_assign = dead.assignment.assignments();
         assert!(dead_assign.column(1).iter().all(|&m| m < 1e-6));
 
-        // Birth: K grows, new atom carries the supplied residual-factor decoder.
+        // Birth: K grows, and the new atom RECONSTRUCTS the residual-factor image.
+        //
+        // Since the #977 topology RACE, a born atom no longer carries the raw
+        // `factor_dir` coefficients verbatim: its topology is chosen by evidence
+        // and its decoder is the winning basis's penalized least-squares fit to the
+        // birth target `Y = Φ_template · factor_dir` (so the raw coefficient
+        // `[[0,0]]` is shrunk by the fit ridge — `0.6999…`, not exactly `0.7`).
+        // The structural invariant the move must preserve is therefore
+        // RECONSTRUCTION PARITY, not coefficient identity: the born atom, evaluated
+        // on its own coordinates with its own (raced) basis, must reproduce the
+        // birth-target image to within the small fit ridge.
         let p = term.output_dim();
         let m = term.atoms[0].basis_size();
         let mut decoder = Array2::<f64>::zeros((m, p));
         decoder[[0, 0]] = 0.7;
+        let birth_target = term.atoms[0].basis_values.dot(&decoder); // Φ_template · factor_dir
         let (born, born_rho) = apply_structure_move(
             &term,
             &rho,
@@ -2603,7 +2633,22 @@ mod tests {
         .unwrap();
         assert_eq!(born.k_atoms(), k0 + 1);
         assert_eq!(born_rho.log_ard.len(), k0 + 1);
-        assert_eq!(born.atoms[k0].decoder_coefficients[[0, 0]], 0.7);
+        // ρ's per-atom smoothness vector must grow in step with K (the #1556
+        // contract `assemble_arrow_schur` validates); a stale-length vector would
+        // panic the next assemble on the per-atom `lambda_smooth[atom_idx]` index.
+        assert_eq!(born_rho.log_lambda_smooth.len(), k0 + 1);
+        let born_atom = &born.atoms[k0];
+        let born_image = born_atom.basis_values.dot(&born_atom.decoder_coefficients);
+        assert_eq!(born_image.dim(), birth_target.dim());
+        let mut max_recon_err = 0.0_f64;
+        for (a, b) in born_image.iter().zip(birth_target.iter()) {
+            max_recon_err = max_recon_err.max((a - b).abs());
+        }
+        assert!(
+            max_recon_err < 1e-3,
+            "born atom must reconstruct the residual-factor image (penalized fit); \
+             max |Φ_born·B_born − Φ_template·factor_dir| = {max_recon_err:.3e} (> 1e-3)"
+        );
     }
 
     /// Ledger byte-determinism oracle (#997): two runs of the round driver over
