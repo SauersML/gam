@@ -635,6 +635,20 @@ mod tests {
         assert_channel_parity("hess", &cpu.hess, &got.hess);
         assert_channel_parity("third", &cpu.third, &got.third);
         assert_channel_parity("fourth", &cpu.fourth, &got.fourth);
+
+        // Anti-false-green: if a CUDA runtime is present the dispatcher MUST have
+        // exercised the device kernel above (n > DEVICE_ROW_THRESHOLD), not the
+        // silent CPU fallback. Prove the device path itself runs and matches —
+        // otherwise this gate would pass on CPU==CPU even with a dead kernel.
+        if gam_gpu::device_runtime::GpuRuntime::global().is_some() {
+            let dev = survival_rigid_row_jets_device_only(&rows, 0.7, &DIR, &DIRU, &DIRV)
+                .expect("CUDA runtime present but survival_rowjet device path could not run");
+            assert_channel_parity("device value", &cpu.value, &dev.value);
+            assert_channel_parity("device grad", &cpu.grad, &dev.grad);
+            assert_channel_parity("device hess", &cpu.hess, &dev.hess);
+            assert_channel_parity("device third", &cpu.third, &dev.third);
+            assert_channel_parity("device fourth", &cpu.fourth, &dev.fourth);
+        }
     }
 
     /// Edge-regime fixture: rows deliberately placed in the hard corners of the
