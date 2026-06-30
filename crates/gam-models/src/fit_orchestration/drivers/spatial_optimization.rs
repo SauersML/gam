@@ -2351,6 +2351,14 @@ fn prescan_isotropic_spatial_range_seed(
             if set_spatial_length_scale(&mut probe, term_idx, ls).is_err() {
                 continue;
             }
+            // Each probe MUST run an independent, cold ρ-optimization: the
+            // strict-improvement ranking below only compares apples-to-apples if
+            // every grid point reaches its own ρ* from the same neutral start.
+            // Warm-starting a probe from the previous (adjacent-κ) probe's λ
+            // biases its ρ-optimum toward the neighbour's basin and corrupts the
+            // ranking — it re-strands the ν=3/2 fit in the long-range
+            // over-smoothing basin (boundary recovery regression). So this is a
+            // cold `fit_term_collection_forspec`, deliberately not warm-started.
             let fit = match fit_term_collection_forspec(
                 data,
                 y,
@@ -4105,14 +4113,26 @@ fn run_exact_joint_spatial_optimization(
     // Gated strictly to diagnostic-sized problems (auto-derived from the
     // realized (n, θ_dim), no flag) so it never taxes a production fit. The
     // same gate the n-block driver uses.
+    //
+    // #1688: the audit's whole output is a logged verdict (`log_verdict`,
+    // below) — it never feeds the optimizer — yet it costs `1 + 2·theta_dim`
+    // extra full REML evaluations (one `ValueGradientHessian` plus a central
+    // pair of `ValueOnly` per coordinate). On the common small spatial fit
+    // (n≤4000, the gate ceiling) that is a real fraction of total fit time
+    // spent purely to produce a diagnostic that is suppressed at the default
+    // `Warn` verbosity anyway. So additionally gate on `Info` being enabled:
+    // the gradient-FD-audit regression tests install an `Info` logger and keep
+    // exercising it; an ordinary production fit at the quiet default skips the
+    // extra evals entirely.
     // FD-OK: FD-audit of the analytic outer gradient (small-problem gate, never feeds the optimizer)
     const OUTER_FD_AUDIT_MAX_N: usize = 4_000; // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
     const OUTER_FD_AUDIT_MAX_THETA_DIM: usize = 32; // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
     let n_total = data.nrows();
-    let outer_fd_audit_eligible = analytic_outer_hessian_available // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
+    let outer_fd_audit_eligible = log::log_enabled!(log::Level::Info) // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
+        && analytic_outer_hessian_available // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
         && n_total <= OUTER_FD_AUDIT_MAX_N // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
         && theta_dim <= OUTER_FD_AUDIT_MAX_THETA_DIM; // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
-    log::warn!(
+    log::info!(
         "[OUTER-FD-AUDIT/spatial-exact-joint] gate eligible={outer_fd_audit_eligible} \
          analytic_grad={analytic_outer_hessian_available} n_total={n_total} \
          theta_dim={theta_dim} rho_dim={rho_dim} psi_dim={coord_dim}"
