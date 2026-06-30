@@ -947,10 +947,12 @@ fn parse_periodic_axes_option(
     // Scalar boolean: `periodic=true` / `periodic=false`.
     if axes.len() == 1 && is_bool(&axes[0]) {
         if !is_truthy(&axes[0]) {
-            return Ok(Some(vec![None; dim]));
+            // Non-periodic: return None so the 1-D builder (which routes on
+            // `spec.periodic.is_some()`) does NOT take the periodic path.
+            return Ok(None);
         }
         // Every axis periodic; honor any explicit per-axis period, else leave
-        // `None` for the builder to derive from the center span.
+        // `None` for the caller (formula arm) / builder to derive the span.
         return Ok(Some(periods));
     }
 
@@ -961,6 +963,9 @@ fn parse_periodic_axes_option(
                 "periodic flag list length {} must match smooth dimension {dim}",
                 axes.len()
             ));
+        }
+        if !axes.iter().any(|a| is_truthy(a)) {
+            return Ok(None);
         }
         for (i, a) in axes.iter().enumerate() {
             if !is_truthy(a) {
