@@ -6,4 +6,7 @@
 
 // include!("../../../../tests/src_modules/smooths/smooth_design_assembly_constraint_tests.rs");
 // include!("../../../../tests/src_modules/smooths/smooth_adaptive_bounded_duchon_tests.rs");
-// include!("../../../../tests/src_modules/smooths/smooth_matern_nfree_rekey_topology_tests.rs");
+// #1274: the Matérn n-free re-key topology tests were re-homed into
+// `gam-models` (`fit_orchestration/drivers/matern_nfree_rekey_topology_tests.rs`)
+// — they need the gam-models-private `FrozenTermCollectionIncrementalRealizer`
+// that gam-terms cannot see, so they never compiled here. Reference removed.
