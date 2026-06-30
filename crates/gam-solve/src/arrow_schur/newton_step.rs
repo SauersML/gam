@@ -219,7 +219,19 @@ pub fn solve_arrow_newton_step_core(
                 // must NOT claim device execution here — flag it as a host procedural
                 // matvec instead. `used_device_arrow` stays reserved for the genuinely
                 // device-executed Direct and device-resident PCG paths.
-                diagnostics.injected_host_procedural_matvec = true;
+                //
+                // BUT the re-entered solve may itself have taken the genuinely
+                // device-resident SAE PCG branch (`device_sae_pcg` present + the
+                // offload gate cleared) and returned `used_device_arrow == true`
+                // WITHOUT ever consuming the injected host matvec — in that case the
+                // host closure did not run, so stamping the host-procedural flag
+                // would emit a contradictory diagnostic (#1209 treats the two as
+                // mutually exclusive: one says "matvec ran on the host", the other
+                // "the solve ran on the device"). Only claim the host procedural
+                // matvec when the device-resident path did NOT serve this step.
+                if !diagnostics.used_device_arrow {
+                    diagnostics.injected_host_procedural_matvec = true;
+                }
                 (step.delta_t, step.delta_beta, diagnostics)
             },
         );

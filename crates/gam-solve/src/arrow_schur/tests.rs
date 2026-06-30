@@ -3567,6 +3567,65 @@ pub(crate) fn sae_inexact_pcg_inner_solve_engages_device_and_matches_cpu_1551() 
     );
 }
 
+/// #1209 MUTUAL EXCLUSION — `used_device_arrow` (the matvec/solve genuinely ran
+/// on the device) and `injected_host_procedural_matvec` (a host Rust/Rayon
+/// reduced-Schur matvec closure was injected and ran on the CPU) describe
+/// MUTUALLY EXCLUSIVE execution facts: a single solve cannot have run its matvec
+/// both on the device and on the host. The production core entry
+/// `solve_arrow_newton_step_core` injects a host procedural matvec via
+/// `maybe_inject_gpu_schur_matvec` for an admitted InexactPCG SAE system — but
+/// the re-entered solve may itself take the genuinely device-resident SAE PCG
+/// branch (`device_sae_pcg` present) and never consume that injected closure. A
+/// naive unconditional stamp would then report BOTH flags (a contradiction, and
+/// an `injected_host_procedural_matvec` that is simply wrong — the matvec ran on
+/// the device). This pins that the two flags are never simultaneously set,
+/// driven through the public production path on a CUDA host.
+#[test]
+pub(crate) fn device_arrow_and_host_procedural_matvec_flags_are_mutually_exclusive_1209() {
+    let (sys, _n, _q) = well_posed_device_sae_system_1551();
+    let ridge_t = 1e-7;
+    let ridge_beta = 1e-6;
+
+    // Exercise the explicit InexactPCG entry (the one that injects a host
+    // procedural matvec via `maybe_inject_gpu_schur_matvec`) and the Direct entry
+    // through the public core.
+    let on_cuda = gam_gpu::device_runtime::GpuRuntime::global().is_some();
+    let mut inexact_used_device = false;
+    for options in [
+        ArrowSolveOptions::inexact_pcg(),
+        ArrowSolveOptions::direct(),
+    ] {
+        let mode = options.mode;
+        let (_dt, _db, diag) = solve_arrow_newton_step_core(&sys, ridge_t, ridge_beta, &options)
+            .expect("core solve");
+        assert!(
+            !(diag.used_device_arrow && diag.injected_host_procedural_matvec),
+            "#1209: used_device_arrow and injected_host_procedural_matvec are mutually \
+             exclusive execution facts but BOTH were set (mode={mode:?}) — a single solve \
+             cannot run its reduced-Schur matvec on the device AND as a host procedural \
+             closure"
+        );
+        if mode == ArrowSolverMode::InexactPCG && diag.used_device_arrow {
+            inexact_used_device = true;
+        }
+    }
+
+    // NON-VACUITY: on a CUDA host the InexactPCG path is EXACTLY the regression
+    // scenario — `maybe_inject_gpu_schur_matvec` injects a host matvec AND the
+    // re-entered solve takes the device-resident SAE PCG branch. If the device
+    // branch never engaged the mutual-exclusion assertion would pass trivially,
+    // so confirm the contradictory pre-condition (device-served InexactPCG) was
+    // actually reached. (The injection itself fires whenever the offload gate
+    // clears, which the well-posed fixture is built to do.)
+    if on_cuda {
+        assert!(
+            inexact_used_device,
+            "#1209: fixture must reach the device-served InexactPCG path on a CUDA host \
+             so the mutual-exclusion check is non-vacuous"
+        );
+    }
+}
+
 /// The CPU-resident SAE reduced-Schur matvec (#1017) must compute the SAME
 /// `S·x` as the generic per-row `apply → solve → transpose` path, up to f64
 /// reassociation. This is the residency correctness gate: a resident matvec
