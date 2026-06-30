@@ -3184,7 +3184,6 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     # previously these knobs only populated `primitive_names` metadata.
     analytic_penalties_json = _build_analytic_penalties_payload(
         isometry_weight=isometry_weight,
-        ard_per_atom=ard_per_atom,
         gate_sparsity=gate_sparsity_kind,
         sparsity_weight=sparsity,
         scad_mcp_gamma=scad_mcp_gamma_value,
@@ -3306,6 +3305,18 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         initial_logits=logits_init,
         initial_coords=coords_init,
         jumprelu_threshold=float(jumprelu_threshold),
+        # #240: `ard_per_atom` is the user-facing ARD switch. The ONLY thing that
+        # actually enables/disables ARD in the SAE objective is the native
+        # `ArdAxisPrior`, gated by `native_ard_enabled` (it sizes each atom's
+        # `log_ard` to `d` when on, length-0 when off, adding/removing those
+        # per-atom precisions from the outer ρ search and the inner Arrow-Schur
+        # prior). The registry `{"kind":"ard"}` descriptor is deliberately a
+        # no-op on every SAE path (`AnalyticPenaltyKind::Ard(_)` is skipped in
+        # both the gradient assembly and the value total — the native prior is
+        # the single source of truth, avoiding a double-counted, period-
+        # discontinuous ½λt² energy). So route the flag to the switch that works
+        # instead of leaving it a dead toggle (bit-identical fits on/off).
+        native_ard_enabled=bool(ard_per_atom),
         fisher_factors=None if fisher_shard is None else fisher_shard[0],
         fisher_mass_residual=None if fisher_shard is None else fisher_shard[1],
         fisher_provenance=None if fisher_shard is None else fisher_shard[2],
@@ -3355,7 +3366,6 @@ def _require_sae_row_block_penalty(kind: str, kwarg: str) -> None:
 def _build_analytic_penalties_payload(
     *,
     isometry_weight: float,
-    ard_per_atom: bool,
     decoder_feature_sparsity_groups: list[list[int]] | None,
     block_orthogonality_weight: float,
     d_max: int,
@@ -3371,9 +3381,12 @@ def _build_analytic_penalties_payload(
     """Translate the SAE regularizer knobs into the analytic-penalty JSON
     payload consumed by ``sae_manifold_fit_minimal``.
 
-    The SAE regularizer knobs route through ``src/terms/sae_manifold.rs``.
-    ``ard_per_atom``, ``isometry_weight``, and ``block_orthogonality_weight``
-    target the row-block driver ("t" latent block).
+    The SAE regularizer knobs route through ``crates/gam-sae``.
+    ``isometry_weight`` and ``block_orthogonality_weight`` target the row-block
+    driver ("t" latent block). ``ard_per_atom`` is NOT a registry descriptor:
+    it routes to the native ``ArdAxisPrior`` via the ``native_ard_enabled`` FFI
+    flag (see ``sae_manifold_fit``), since the registry ``ard`` penalty is
+    intentionally skipped on every SAE path.
     ``gate_sparsity="scad"`` or ``"mcp"`` emits the row-block
     ``scad_mcp`` descriptor on the same "t" block, using ``sparsity_weight`` as
     its non-convex sparsity strength. The default ``"l1"`` emits no analytic
@@ -3395,9 +3408,15 @@ def _build_analytic_penalties_payload(
     values penalized.
     """
     items: list[dict[str, Any]] = []
-    if bool(ard_per_atom):
-        _require_sae_row_block_penalty("ard", "ard_per_atom")
-        items.append({"kind": "ard", "target": "t"})
+    # #240: `ard_per_atom` does NOT emit a registry `ard` descriptor. The SAE
+    # objective deliberately skips `AnalyticPenaltyKind::Ard(_)` on every path
+    # (gradient assembly AND value total) because the native `ArdAxisPrior` is
+    # the single source of truth for the per-atom coordinate precision — a
+    # registry `½λt²` ridge would double-count it and is period-discontinuous on
+    # the circular bases. The flag is instead routed to `native_ard_enabled` at
+    # the FFI call (see `sae_manifold_fit`), which sizes / drops each atom's
+    # `log_ard` precisions. Emitting a descriptor here would be a guaranteed
+    # no-op (the exact issue-#240 silent-no-op anti-pattern).
     if gate_sparsity in {"scad", "mcp"} and float(sparsity_weight) > 0.0:
         _require_sae_row_block_penalty("scad_mcp", "gate_sparsity")
         items.append({
