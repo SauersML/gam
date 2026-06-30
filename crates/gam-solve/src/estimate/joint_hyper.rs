@@ -567,6 +567,26 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         self.psi_gram_tensor.is_some()
     }
 
+    /// The installed tensor's certified value window `[psi_lo, psi_hi]`, if any
+    /// (#1033 instrumentation accessor).
+    pub fn psi_gram_window(&self) -> Option<(f64, f64)> {
+        self.psi_gram_tensor.as_ref().map(|t| t.psi_window())
+    }
+
+    /// Lowest ψ at/above which the installed tensor's conditioned Gram holds its
+    /// maximal numerical rank — the floor below which the design-revision skip's
+    /// `reduced_basis_equal` witness must (soundly) refuse because the reduced
+    /// basis collapses/rotates. `None` when no tensor is installed or the rank is
+    /// already maximal across the whole window. The κ caller lifts the optimizer's
+    /// lower bound to this n-FREE floor so every in-window trial stays on the
+    /// design-realization skip (#1033). See
+    /// [`crate::psi_gram_tensor::PsiGramTensor::rank_stable_psi_floor`].
+    pub fn psi_gram_rank_stable_floor(&self, psi_anchor: f64) -> Option<f64> {
+        self.psi_gram_tensor
+            .as_ref()
+            .and_then(|t| t.rank_stable_psi_floor(psi_anchor))
+    }
+
     /// Return the most-recently converged inner β from the last PIRLS solve, if
     /// it is finite and the right dimension. Used by `SpatialJointContext` to
     /// warm-start successive outer evaluations instead of cold-starting PIRLS

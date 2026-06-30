@@ -18,7 +18,7 @@ use crate::basis::{
     SpatialIdentifiability, SphereMethod, SphereWahbaKernel, SphericalSplineBasisSpec,
     SphericalSplineIdentifiability, ThinPlateBasisSpec, auto_spatial_center_strategy,
     default_num_centers, default_spatial_center_strategy, default_spherical_harmonic_degree,
-    plan_spatial_basis,
+    plan_spatial_basis, thin_plate_penalty_order,
 };
 use crate::inference::formula_dsl::{
     ParsedTerm, SmoothKind, option_bool, option_f64, option_f64_strict, option_usize,
@@ -3299,6 +3299,13 @@ pub fn build_smooth_basis(
 /// Initialise per-axis anisotropic log-scales on eligible spatial smooth specs.
 pub fn enable_scale_dimensions(spec: &mut TermCollectionSpec) {
     for smooth in spec.smooth_terms.iter_mut() {
+        // A multi-axis thin-plate term cannot carry per-axis anisotropy on its
+        // single curvature penalty, so `scale_dimensions` was historically a
+        // silent no-op for `bs="tp"` (gam#1676). Rewrite it to the
+        // mathematically-equivalent anisotropic s=0 Duchon spline first; the
+        // Duchon arm below then sees an already-seeded `aniso_log_scales` and
+        // leaves it untouched.
+        promote_thin_plate_for_scale_dimensions(&mut smooth.basis);
         match &mut smooth.basis {
             SmoothBasisSpec::Matern {
                 feature_cols,
@@ -3323,6 +3330,94 @@ pub fn enable_scale_dimensions(spec: &mut TermCollectionSpec) {
             _ => {}
         }
     }
+}
+
+/// Rewrite a multi-axis thin-plate term into the mathematically-equivalent
+/// anisotropic s=0 Duchon spline so that `scale_dimensions` genuinely engages
+/// (gam#1676).
+///
+/// ## Why a rewrite rather than a new field on the TPS builder
+///
+/// A canonical thin-plate regression spline carries a *single* curvature
+/// penalty — the exact `∫|Dᵐ f|²` reproducing-kernel Gram. That penalty has no
+/// per-axis structure to make one direction more or less relevant than another,
+/// so per-axis anisotropy (`scale_dimensions`) cannot be expressed on it. The
+/// flag was therefore a silent no-op for `bs="tp"` while it engaged for
+/// `duchon()`/`matern()`.
+///
+/// The thin-plate kernel `r^{2m−d}` (the `r²·log r` log-case in even `d`) is
+/// *exactly* the s=0 Duchon kernel (`DuchonBasisSpec::power = 0`,
+/// `length_scale = None`) at the matching polynomial null-space order
+/// `m = thin_plate_penalty_order(d)`. The Duchon polyharmonic family already
+/// carries the per-axis tension ARD that `scale_dimensions` requests: its
+/// isotropic first-order roughness penalty `Σ‖∇f‖²` splits into `d` directional
+/// penalties `Σ(∂f/∂x_a)²`, each with its own REML `λ_a`
+/// (`duchon_operator_penalty_candidates`). So the well-posed *anisotropic
+/// thin-plate spline is the anisotropic s=0 Duchon spline*. Rewriting to that
+/// representation reuses the battle-tested Duchon anisotropy / ψ-derivative /
+/// freeze / predict machinery instead of duplicating it onto the TPS metadata
+/// path, and keeps the polyharmonic family internally consistent. The codebase
+/// already promotes infeasible-`k` TPS to Duchon for the same reason (the
+/// canonical TPS single curvature penalty cannot deliver a requested
+/// capability); per-axis anisotropy is another such capability.
+///
+/// This fires *only* when the user opts into `scale_dimensions`; the default
+/// thin-plate path (`scale_dimensions` off) is left bit-for-bit unchanged.
+/// A 1-D thin-plate term is left untouched — anisotropy is meaningless on a
+/// single axis (its `Σ η = 0` contrast vector is empty), exactly as for a 1-D
+/// Matérn/Duchon term.
+fn promote_thin_plate_for_scale_dimensions(basis: &mut SmoothBasisSpec) {
+    let SmoothBasisSpec::ThinPlate {
+        feature_cols,
+        spec,
+        input_scales,
+    } = &*basis
+    else {
+        return;
+    };
+    let d = feature_cols.len();
+    if d <= 1 {
+        return;
+    }
+    // m = thin_plate_penalty_order(d) is the TPS penalty order; the Duchon
+    // null-space order naming is `Zero → m=1`, `Linear → m=2`,
+    // `Degree(g) → m=g+1`, so the s=0 Duchon kernel exponent
+    // `2(p+s) − d = 2m − d` reproduces the TPS kernel exactly.
+    let m = thin_plate_penalty_order(d);
+    let nullspace_order = match m {
+        0 | 1 => DuchonNullspaceOrder::Zero,
+        2 => DuchonNullspaceOrder::Linear,
+        _ => DuchonNullspaceOrder::Degree(m - 1),
+    };
+    let duchon_spec = DuchonBasisSpec {
+        center_strategy: spec.center_strategy.clone(),
+        periodic: spec.periodic.clone(),
+        // Pure, scale-free Duchon — the thin-plate kernel has no length scale
+        // (a global TPS kernel scale is non-identifiable once REML learns the
+        // smoothing penalty: gam#718/#721/#731/#732). The per-axis relevance
+        // the user asked for is carried by the tension-ARD `λ_a`, not a κ axis.
+        length_scale: None,
+        // s = 0  ⇒  thin-plate kernel `r^{2m−d}`.
+        power: 0.0,
+        nullspace_order,
+        identifiability: spec.identifiability.clone(),
+        // All-zero geometry seed sentinel: `auto_seed_aniso_contrasts` resolves
+        // it from the (standardized) knot cloud, and the per-axis tension split
+        // engages on `aniso.is_some()`.
+        aniso_log_scales: Some(vec![0.0; d]),
+        operator_penalties: DuchonOperatorPenaltySpec::default(),
+        boundary: OneDimensionalBoundary::Open,
+        radial_reparam: None,
+    };
+    let feature_cols = feature_cols.clone();
+    let input_scales = input_scales.clone();
+    // All borrows of `*basis` (the `&*basis` destructure above) end with the
+    // clones on the two preceding lines, so the reassignment is sound.
+    *basis = SmoothBasisSpec::Duchon {
+        feature_cols,
+        spec: duchon_spec,
+        input_scales,
+    };
 }
 
 // ---------------------------------------------------------------------------

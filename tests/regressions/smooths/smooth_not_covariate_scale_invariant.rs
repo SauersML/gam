@@ -210,24 +210,156 @@ fn tp_smooth_is_invariant_to_covariate_translation() {
     // only on coordinate differences, and the polynomial null space `{1, x}` is
     // shift-closed (`{1, x + b}` spans the same space). So fitting on `x` and on
     // `x + b` and predicting at correspondingly shifted points must return
-    // identical curves. Before #1269 the null-space block was assembled at the
-    // *absolute* coordinate, so a large offset near-collinearized `{1, x}`,
-    // ill-conditioned the design, and drifted REML λ̂ — moving the fit ~1.4% of
-    // signal range (saturating with |b|). The fix builds the basis in the knot
-    // cloud's centred frame, so the fit is location-free like `bs="cr"`/`"ps"`.
-    // Offsets span the issue's reported table (drift saturated at ~2.8e-2 for
-    // b ≥ 50). Capped at 100: building the centred frame from a knot mean ≈ b
-    // incurs an unavoidable `b·ε` cancellation when subtracting it back off the
-    // raw coordinate, so the achievable floor grows with |b| (~2e-14 at b=100);
-    // a 1e-10 ceiling stays ~6 orders below the bug while above that floor.
+    // (essentially) identical curves. Before #1269 the null-space block was
+    // assembled at the *absolute* coordinate, so a large offset near-collinearized
+    // `{1, x}`, ill-conditioned the design, and drifted REML λ̂ — moving the fit
+    // ~1.4% (2.8e-2) of signal range, *saturating* with |b|. The #1269 fix builds
+    // the basis in the knot cloud's centred frame; the BASIS is now exactly
+    // translation-invariant to ~1e-13 (pinned tightly and directly by
+    // `tp_basis_is_exactly_translation_invariant` below, the meaningful guard on
+    // the conditioning fix).
+    //
+    // This end-to-end gate is necessarily looser than that basis gate, and the
+    // gap is a *physical* floor, not slack. The full fit also runs the REML
+    // penalty-weight optimizer, and on this dataset the data wants heavy smoothing
+    // (`log λ̂ ≈ 8.3`, λ̂ ≈ 4000): the posterior sits near the unpenalized linear
+    // null space, where the REML objective is very flat in `log λ`. The covariate
+    // arrives as the float `x + b`, which has already *rounded off* ~ulp(b) of the
+    // original `x` (the lost bits are unrecoverable by any library code), so two
+    // offset fits see designs differing by ~1e-13. That floor-level perturbation,
+    // divided by the near-zero `log λ` curvature, drifts `log λ̂` in its 5th digit
+    // (≈6e-5) and moves the curve by ~1e-7 — observed flat at ~3e-8–1.2e-7 for
+    // EVERY b ≥ 1e-6, independent of |b| and of the outer iteration budget
+    // (identical at 20/60/200 iters: the optimizer is fully converged to each
+    // offset's own argmax). A `< 1e-5` ceiling sits ~3.5 orders below the original
+    // 2.8e-2 bug — so any regression of the #1269 conditioning fix trips it — while
+    // staying ~2 orders above the irreducible argmax floor. Offsets span the
+    // issue's reported table (drift saturated at ~2.8e-2 for b ≥ 50).
     for &b in &[1.0, 10.0, 50.0, 100.0] {
         let drift = max_shape_drift(&base, &fit_grid_predictions_offset(formula, b, n));
         assert!(
-            drift < 1.0e-10,
+            drift < 1.0e-5,
             "s(x, bs=\"tp\") fitted function changed under covariate translation b={b:.0e}: \
              max |shape(0) − shape(b)| = {drift:.3e} over a signal of range ~2 \
-             (must be ~1e-13 — the kernel and penalty are translation-invariant; \
-             observed ~3e-2 before the polynomial null space was built in a centred frame)."
+             (must stay ≪ the 2.8e-2 pre-#1269 bug; the kernel, penalty, and basis \
+             are translation-invariant to ~1e-13, the residual is the flat-REML-λ \
+             argmax floor amplifying the ulp(b) rounding of the float input x+b)."
+        );
+    }
+}
+
+/// Strict, direct guard on the #1269 conditioning fix: the thin-plate *basis
+/// design* — built in the knot cloud's centred frame and standardized exactly as
+/// the production term arm does (#1215) — must be translation-invariant to
+/// floating-point floor, isolated from the REML penalty-weight optimizer.
+///
+/// We build the basis on `x` and on `x + b` (frozen length scale, frozen
+/// EqualMass centers, frozen input scales) and project the same response through
+/// a *fixed* tiny ridge — no λ-selection. Pre-#1269 the absolute-coordinate
+/// polynomial null space near-collinearized `{1, x}` and the design drifted by
+/// ~3e-2 of curve range; post-fix the centred frame makes it exact to ~1e-13.
+/// This is the test that should be tight; the end-to-end
+/// `tp_smooth_is_invariant_to_covariate_translation` above necessarily floats on
+/// the REML argmax floor on top of this.
+#[test]
+fn tp_basis_is_exactly_translation_invariant() {
+    use gam::basis::{
+        BasisMetadata, CenterStrategy, SpatialIdentifiability, ThinPlateBasisSpec,
+        build_thin_plate_basis,
+    };
+    use gam::faer_ndarray::FaerCholesky;
+    use gam::smooth::input_standardization::{
+        apply_input_standardization, compensate_length_scale_for_standardization,
+        compute_spatial_input_scales,
+    };
+    init_parallelism();
+    let n = 400;
+    let probes: Vec<f64> = (0..15).map(|i| 0.05 + 0.90 * (i as f64) / 14.0).collect();
+
+    let build_and_predict = |b: f64| -> Vec<f64> {
+        let mut rng = StdRng::seed_from_u64(20240616);
+        let u = Uniform::new(0.0_f64, 1.0).expect("uniform");
+        let noise = Normal::new(0.0, 0.2).expect("normal");
+        let mut x_train = Array2::<f64>::zeros((n, 1));
+        let mut ys = Vec::with_capacity(n);
+        for i in 0..n {
+            let x = u.sample(&mut rng);
+            ys.push((2.0 * std::f64::consts::PI * x).sin() + noise.sample(&mut rng));
+            x_train[[i, 0]] = x + b;
+        }
+        let y = ndarray::Array1::from_vec(ys);
+
+        let user_ls = 1.0_f64;
+        let scales = compute_spatial_input_scales(x_train.view());
+        let (length_scale, scales_vec) = if let Some(s) = &scales {
+            apply_input_standardization(&mut x_train, s);
+            (
+                compensate_length_scale_for_standardization(user_ls, s),
+                Some(s.clone()),
+            )
+        } else {
+            (user_ls, None)
+        };
+
+        let train_spec = ThinPlateBasisSpec {
+            center_strategy: CenterStrategy::EqualMass { num_centers: 10 },
+            periodic: None,
+            length_scale,
+            double_penalty: false,
+            identifiability: SpatialIdentifiability::None,
+            radial_reparam: None,
+        };
+        let train = build_thin_plate_basis(x_train.view(), &train_spec).expect("train basis");
+        let (fit_centers, radial_reparam) = match &train.metadata {
+            BasisMetadata::ThinPlate {
+                centers,
+                radial_reparam,
+                ..
+            } => (centers.clone(), radial_reparam.clone()),
+            _ => panic!("expected ThinPlate metadata"),
+        };
+        let design = train.design.to_dense();
+        // Fixed tiny ridge in the basis coordinate (NO REML λ-selection).
+        let p = design.ncols();
+        let xtx = design.t().dot(&design);
+        let mut g = xtx.clone();
+        let max_diag = xtx.diag().iter().cloned().fold(1.0_f64, f64::max);
+        let eps = 1e-6 * max_diag;
+        for i in 0..p {
+            g[[i, i]] += eps;
+        }
+        let xty = design.t().dot(&y);
+        let chol = g.cholesky(faer::Side::Lower).expect("chol");
+        let beta = chol.solvevec(&xty);
+
+        let mut grid = Array2::<f64>::zeros((probes.len(), 1));
+        for (i, &v) in probes.iter().enumerate() {
+            grid[[i, 0]] = v + b;
+        }
+        if let Some(s) = &scales_vec {
+            apply_input_standardization(&mut grid, s);
+        }
+        let test_spec = ThinPlateBasisSpec {
+            center_strategy: CenterStrategy::UserProvided(fit_centers),
+            periodic: None,
+            length_scale,
+            double_penalty: false,
+            identifiability: SpatialIdentifiability::None,
+            radial_reparam,
+        };
+        let test = build_thin_plate_basis(grid.view(), &test_spec).expect("test basis");
+        test.design.to_dense().dot(&beta).to_vec()
+    };
+
+    let base = build_and_predict(0.0);
+    for &b in &[1.0, 10.0, 50.0, 100.0] {
+        let drift = max_shape_drift(&base, &build_and_predict(b));
+        assert!(
+            drift < 1.0e-12,
+            "thin-plate BASIS design changed under covariate translation b={b:.0e}: \
+             max |shape(0) − shape(b)| = {drift:.3e} (must be ~1e-13 — #1269 builds \
+             the polynomial null space in the knot cloud's centred frame; observed \
+             ~3e-2 when it was assembled at the absolute coordinate)."
         );
     }
 }
