@@ -502,6 +502,100 @@ fn competing_risks_weibull_fit_is_reachable_1590() {
     );
 }
 
+/// #1561 incidental bug: the Gaussian location-scale joint fit must not abort
+/// (panic or hard-error) when the scale smooth is requested at a larger basis
+/// size (`bs='tp', k>=20`). The owner's #1561 investigation reported a
+/// joint-Newton crash there (`phantom_multiplier_with_well_conditioned_H`,
+/// carrying-block μ) — a KKT-refusal robustness failure that is independent of
+/// the (research-grade) scale-block λ-selection metric. A valid model spec
+/// must always either fit or return a catchable error, never panic. This
+/// reproduction fits the #1561 heteroscedastic-sinusoid fixture with the scale
+/// formula at k=25 and asserts the call returns (Ok or Err) without panicking
+/// and without bubbling the KKT cert-refusal diagnosis as a user-facing abort.
+#[test]
+fn issue_1561_locscale_large_scale_basis_does_not_crash_joint_newton() {
+    let n = 200usize;
+    let two_pi = 2.0 * std::f64::consts::PI;
+
+    // Same seed-42 LCG fixture as the gating metric test, reproduced tool-free.
+    let mut state: u64 = 42;
+    let mut next_unit = || -> f64 {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((state >> 11) as f64) / ((1u64 << 53) as f64)
+    };
+    let mut x: Vec<f64> = (0..n).map(|_| next_unit()).collect();
+    x.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mut z: Vec<f64> = Vec::with_capacity(n);
+    while z.len() < n {
+        let u1 = next_unit().max(1e-300);
+        let u2 = next_unit();
+        let r = (-2.0 * u1.ln()).sqrt();
+        z.push(r * (two_pi * u2).cos());
+        if z.len() < n {
+            z.push(r * (two_pi * u2).sin());
+        }
+    }
+    let mu_true = |t: f64| (two_pi * t).sin();
+    let sigma_true = |t: f64| 0.1 + 0.2 * (two_pi * t).sin();
+    let y: Vec<f64> = (0..n)
+        .map(|i| mu_true(x[i]) + sigma_true(x[i]) * z[i])
+        .collect();
+
+    let td = tempdir().expect("tempdir");
+    let data_path = td.path().join("locscale.csv");
+    let mut csv = String::from("x,y\n");
+    for i in 0..n {
+        csv.push_str(&format!("{:.17e},{:.17e}\n", x[i], y[i]));
+    }
+    fs::write(&data_path, csv).expect("write locscale csv");
+    let data = load_dataset_projected(&data_path, &["x".to_string(), "y".to_string()])
+        .expect("load locscale dataset");
+
+    // Sweep the scale-basis size across and above the k>=20 boundary the owner
+    // reported as the joint-Newton crash region. Each must fit (Ok) without
+    // panicking and without bubbling the KKT cert-refusal as a user abort.
+    for k in [20usize, 25, 30] {
+        let config = FitConfig {
+            family: Some("gaussian".to_string()),
+            noise_formula: Some(format!("1 + s(x, bs='tp', k={k})")),
+            ..FitConfig::default()
+        };
+
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::fit_orchestration::entry::fit_from_formula("y ~ s(x, bs='tp')", &data, &config)
+        }));
+        let result = caught.unwrap_or_else(|_| {
+            panic!(
+                "#1561: location-scale fit with a k={k} scale smooth PANICKED inside the \
+                 joint-Newton solver; a valid model spec must fit or return a catchable error, \
+                 never unwind"
+            )
+        });
+        match result {
+            Ok(_) => {}
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    !msg.contains("phantom_multiplier_with_well_conditioned_H"),
+                    "#1561: location-scale fit with a k={k} scale smooth bubbled a KKT \
+                     cert-refusal (phantom_multiplier_with_well_conditioned_H) as a user-facing \
+                     abort; the joint solver must recover (rho-anneal/seed-retry) on a \
+                     well-conditioned penalized Hessian instead of refusing. Got: {msg}"
+                );
+                // Any other error is still a fit-quality/spec issue, not the
+                // robustness crash this guard targets — surface it so the guard
+                // stays honest about what it does and does not cover.
+                panic!(
+                    "#1561: location-scale fit with a k={k} scale smooth returned an unexpected \
+                     error (not the targeted KKT crash): {msg}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn issue_789_transformation_normal_rejects_marginal_slope_controls_before_dispatch() {
     let data = workflow_test_dataset();
@@ -1593,6 +1687,95 @@ fn assert_beta_link_wiggle_match(
     }
 }
 
+/// Standardize a Gaussian location-scale spec by the same response factor the
+/// engine applies internally (`fit_gaussian_location_scale_model`): fit on
+/// `y / s` and `mean_offset / s` so the fixed log-σ soft floor is scale-relative
+/// (#884). Returns the factor `s` used (1.0 ⇒ no standardization needed).
+///
+/// This lets the reference flow exercise the *identical* model contract as the
+/// engine — both standardize, fit the longhand pilot/refit terms, then rescale
+/// back to raw units — so the engine-vs-reference equivalence stays an honest
+/// orchestration check rather than comparing two different σ-floor models.
+fn standardize_gaussian_spec_like_engine(spec: &mut GaussianLocationScaleTermSpec) -> f64 {
+    let s = gaussian_response_sample_std(spec.y.view()).max(1e-6);
+    if s != 1.0 {
+        spec.y.mapv_inplace(|v| v / s);
+        spec.mean_offset.mapv_inplace(|v| v / s);
+    }
+    s
+}
+
+/// Reference Gaussian no-wiggle fit through the longhand terms path, wrapped in
+/// the same standardize→fit→rescale envelope the engine wrapper applies.
+fn reference_gaussian_no_wiggle(
+    data: ArrayView2<'_, f64>,
+    mut spec: GaussianLocationScaleTermSpec,
+    options: &BlockwiseFitOptions,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
+) -> GaussianLocationScaleFitResult {
+    let s = standardize_gaussian_spec_like_engine(&mut spec);
+    let fit = fit_gaussian_location_scale_terms(data, spec, options, kappa_options)
+        .expect("reference gaussian no-wiggle terms fit");
+    let mut result = GaussianLocationScaleFitResult {
+        fit,
+        wiggle_knots: None,
+        wiggle_degree: None,
+        beta_link_wiggle: None,
+        response_scale: 1.0,
+    };
+    rescale_gaussian_location_scale_to_raw(&mut result, s);
+    result
+}
+
+/// Reference Gaussian wiggle fit (pilot → basis selection → refit → assemble)
+/// through the longhand terms path, under the engine's standardization envelope.
+fn reference_gaussian_wiggle(
+    data: ArrayView2<'_, f64>,
+    mut spec: GaussianLocationScaleTermSpec,
+    wiggle_cfg: &LinkWiggleConfig,
+    options: &BlockwiseFitOptions,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
+) -> GaussianLocationScaleFitResult {
+    let s = standardize_gaussian_spec_like_engine(&mut spec);
+    let ref_pilot = fit_gaussian_location_scale_terms(data, spec.clone(), options, kappa_options)
+        .expect("reference gaussian pilot");
+    let ref_basis = select_gaussian_location_scale_link_wiggle_basis_from_pilot(
+        &ref_pilot,
+        &WiggleBlockConfig {
+            degree: wiggle_cfg.degree,
+            num_internal_knots: wiggle_cfg.num_internal_knots,
+            penalty_order: 2,
+            double_penalty: wiggle_cfg.double_penalty,
+        },
+        &wiggle_cfg.penalty_orders,
+    )
+    .expect("reference gaussian wiggle basis selection");
+    let ref_solved = fit_gaussian_location_scale_terms_with_selected_wiggle(
+        data,
+        spec,
+        ref_basis,
+        options,
+        kappa_options,
+    )
+    .expect("reference gaussian wiggle refit");
+
+    let beta_link_wiggle = ref_solved
+        .fit
+        .fit
+        .block_states
+        .get(2)
+        .map(|b| b.beta.to_vec());
+    let mut result = GaussianLocationScaleFitResult {
+        fit: ref_solved.fit,
+        wiggle_knots: Some(ref_solved.wiggle_knots),
+        wiggle_degree: Some(ref_solved.wiggle_degree),
+        beta_link_wiggle,
+        response_scale: 1.0,
+    };
+    rescale_gaussian_location_scale_to_raw(&mut result, s);
+    result
+}
+
 #[test]
 fn gaussian_location_scale_engine_matches_reference_flow() {
     let data = gaussian_location_scale_dataset();
@@ -1624,12 +1807,11 @@ fn gaussian_location_scale_engine_matches_reference_flow() {
     })
     .expect("engine gaussian no-wiggle fit");
     let reference_plain =
-        fit_gaussian_location_scale_terms(req_data, spec.clone(), &options, &kappa_options)
-            .expect("reference gaussian no-wiggle fit");
+        reference_gaussian_no_wiggle(req_data, spec.clone(), &options, &kappa_options);
     assert_block_states_match(
         "gaussian/no-wiggle",
         &engine_plain.fit.fit,
-        &reference_plain.fit,
+        &reference_plain.fit.fit,
     );
     assert!(engine_plain.wiggle_knots.is_none());
     assert!(engine_plain.wiggle_degree.is_none());
@@ -1646,29 +1828,12 @@ fn gaussian_location_scale_engine_matches_reference_flow() {
     })
     .expect("engine gaussian wiggle fit");
 
-    // Reference: the exact pre-unification hand-rolled sequence.
-    let ref_pilot =
-        fit_gaussian_location_scale_terms(req_data, spec.clone(), &options, &kappa_options)
-            .expect("reference gaussian pilot");
-    let ref_basis = select_gaussian_location_scale_link_wiggle_basis_from_pilot(
-        &ref_pilot,
-        &WiggleBlockConfig {
-            degree: wiggle_cfg.degree,
-            num_internal_knots: wiggle_cfg.num_internal_knots,
-            penalty_order: 2,
-            double_penalty: wiggle_cfg.double_penalty,
-        },
-        &wiggle_cfg.penalty_orders,
-    )
-    .expect("reference gaussian wiggle basis selection");
-    let ref_solved = fit_gaussian_location_scale_terms_with_selected_wiggle(
-        req_data,
-        spec.clone(),
-        ref_basis,
-        &options,
-        &kappa_options,
-    )
-    .expect("reference gaussian wiggle refit");
+    // Reference: the exact pre-unification hand-rolled sequence, wrapped in the
+    // same standardize→fit→rescale envelope the engine applies (#884), so the
+    // two paths compare the same σ-floor model rather than diverging on the
+    // raw-vs-scale-relative floor.
+    let ref_solved =
+        reference_gaussian_wiggle(req_data, spec.clone(), &wiggle_cfg, &options, &kappa_options);
 
     assert_block_states_match(
         "gaussian/wiggle",
@@ -1677,23 +1842,23 @@ fn gaussian_location_scale_engine_matches_reference_flow() {
     );
     assert_eq!(
         engine_wiggle.wiggle_degree,
-        Some(ref_solved.wiggle_degree),
+        ref_solved.wiggle_degree,
         "gaussian wiggle degree must match the reference refit"
     );
     let engine_knots = engine_wiggle
         .wiggle_knots
         .as_ref()
         .expect("engine gaussian wiggle knots present");
+    let ref_knots = ref_solved
+        .wiggle_knots
+        .as_ref()
+        .expect("reference gaussian wiggle knots present");
     assert_eq!(
         engine_knots.len(),
-        ref_solved.wiggle_knots.len(),
+        ref_knots.len(),
         "gaussian wiggle knot count must match the reference refit"
     );
-    for (k, (&ek, &rk)) in engine_knots
-        .iter()
-        .zip(ref_solved.wiggle_knots.iter())
-        .enumerate()
-    {
+    for (k, (&ek, &rk)) in engine_knots.iter().zip(ref_knots.iter()).enumerate() {
         assert!(
             (ek - rk).abs() <= 1e-12 * (1.0 + rk.abs()),
             "gaussian wiggle knot {k} diverged: engine {ek:.17e} vs reference {rk:.17e}"
@@ -1701,12 +1866,7 @@ fn gaussian_location_scale_engine_matches_reference_flow() {
     }
     // `beta_link_wiggle` is block 2 of the refit; the engine must extract it
     // exactly as the reference would read it off the same fit.
-    let ref_beta_link_wiggle = ref_solved
-        .fit
-        .fit
-        .block_states
-        .get(2)
-        .map(|b| b.beta.to_vec());
+    let ref_beta_link_wiggle = ref_solved.beta_link_wiggle.clone();
     assert_beta_link_wiggle_match(
         "gaussian",
         &engine_wiggle.beta_link_wiggle,

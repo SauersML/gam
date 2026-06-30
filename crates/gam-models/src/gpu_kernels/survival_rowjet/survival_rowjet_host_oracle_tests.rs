@@ -33,14 +33,24 @@
 //!     device .cu kernel
 //! ```
 //!
-//! The host oracle is a transcription of the `.cu`, so when the `.cu` JS1/JS2
-//! algebra is edited the transcription must be edited in lockstep to keep this
-//! test green — and any edit that breaks the device math (without a matching
-//! CPU-jet change) is caught HERE, on the CPU build, instead of slipping
-//! through to the GPU box. A coarse byte-fingerprint test
-//! ([`device_kernel_source_matches_transcription_fingerprint`]) makes the
-//! lockstep requirement explicit: touching the `.cu` arithmetic without
-//! revisiting this transcription fails the build with a pointer to this file.
+//! The host oracle is a hand-maintained transcription of the `.cu`, so when the
+//! `.cu` JS1/JS2 algebra is edited the transcription must be edited in lockstep
+//! to keep this test green. Two distinct guarantees, with distinct reach:
+//!
+//!   * STRUCTURAL drift (a JS1/JS2 operation renamed, removed, or split) is
+//!     caught HERE, on the CPU build, by the coarse name-fingerprint test
+//!     ([`device_kernel_source_matches_transcription_fingerprint`]): if the `.cu`
+//!     no longer defines an op the host transcription mirrors, the build fails
+//!     with a pointer to this file.
+//!   * An IN-PLACE arithmetic edit to a `.cu` op body (e.g. a `+`→`-` sign flip
+//!     or a dropped Leibniz term inside `js2_mul`'s `huv` recurrence) leaves every
+//!     op name present, so the name-fingerprint does NOT catch it. Such an edit is
+//!     caught on the CPU build only if the host transcription below is updated in
+//!     lockstep; the un-mirrored `.cu` arithmetic itself is pinned numerically
+//!     only on a GPU box, by `super::tests::device_matches_cpu_when_available`
+//!     (the `.cu` cannot be NVRTC-compiled on a CPU-only runner). The
+//!     name-fingerprint is therefore a lockstep *reminder* for the common
+//!     structural case, not a complete in-place-edit lock on CPU CI.
 
 #![cfg(test)]
 

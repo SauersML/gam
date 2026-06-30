@@ -1143,17 +1143,24 @@ fn default_survival_time_grid(
     if !observed {
         return Ok(None);
     }
-    // Anchor the grid's upper edge to the training time support so a small
-    // prediction-frame `exit` placeholder cannot truncate the surface below the
-    // fitted range (issue #896). The grid still extends to the prediction
-    // frame's own max exit when that is larger (the caller is explicitly asking
-    // about those later times). When the model carries no training-time signal
-    // the prediction-frame range is used alone, exactly as before.
+    // Anchor the grid's upper edge to the fitted model's training time support,
+    // independent of the prediction-frame `exit` placeholder. The placeholder is
+    // a semantically meaningless response value that `survival_at` ignores (it
+    // supplies its own query times), so it must neither truncate the surface
+    // below the fitted range (a SMALL placeholder — issue #896) nor stretch the
+    // fixed 64-point uniform grid past the fitted range (a LARGE placeholder,
+    // which coarsens every in-range cell and drifts interpolated `survival_at`
+    // values — issue #1717). When the training time support is known, it CAPS
+    // (and floors) `hi` to that bound regardless of the placeholder; query times
+    // legitimately beyond the support are handled by `survival_at`'s
+    // extrapolation (#1595), not by the grid. When the model carries no
+    // training-time signal (e.g. legacy models) the prediction-frame range is
+    // used alone, exactly as before.
     if let Some(bytes) = model_bytes.as_deref()
         && let Some(training_hi) = saved_survival_training_time_upper_bound(bytes)
         && training_hi.is_finite()
     {
-        hi = hi.max(training_hi);
+        hi = training_hi;
     }
     if hi <= lo {
         let lo_display = python_float_display(lo);

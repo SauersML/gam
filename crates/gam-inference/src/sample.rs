@@ -321,7 +321,6 @@ pub fn laplace_gaussian_fallback(
     cfg: &NutsConfig,
     rationale: &'static str,
 ) -> Result<NutsResult, String> {
-    use gam_problem::dispersion_cov::DispersionExt as _;
     // Defense in depth: this is `pub`, so guard the same degenerate
     // draw/chain counts the NUTS / PG paths reject (issue #399) rather than
     // papering over `n_chains == 0` / `n_samples == 0` with `.max(1)`, which
@@ -341,14 +340,23 @@ pub fn laplace_gaussian_fallback(
              refit with exact geometry export to enable posterior sampling for this class."
         )
     })?;
-    // `penalized_hessian` is stored unscaled (no φ). To draw Laplace
-    // approximations of `N(mode, φ·H⁻¹)` we solve `Lᵀ δ = ε` (so
-    // `Var(δ) = H⁻¹`) and then rescale by √φ. For families with
-    // `Dispersion::Known(1.0)` (Binomial / Poisson) this is a no-op;
-    // for Gaussian / Gamma it restores the φ-scaled posterior
-    // covariance that the Wald-style intervals downstream assume.
-    let dispersion = fit.dispersion().unwrap_or_default();
-    let sqrt_phi = dispersion.sqrt_phi();
+    // `penalized_hessian` is stored unscaled. To draw Laplace
+    // approximations of `N(mode, cov_scale·H⁻¹)` we solve `Lᵀ δ = ε` (so
+    // `Var(δ) = H⁻¹`) and then rescale by `√cov_scale`, where `cov_scale`
+    // is the *coefficient-covariance* scale the fit uses for `Vb` — exactly
+    // the quantity `summary()`'s Wald SE is built from. This is `σ̂²` for a
+    // profiled Gaussian and `1.0` for every family whose IRLS working weight
+    // already folds the dispersion / full Fisher information into the stored
+    // `H` (Binomial / Poisson / Gamma / Beta / Negative-Binomial / Tweedie),
+    // so `Vb = H⁻¹` needs no extra dispersion factor. Using the dispersion's
+    // `√φ` here instead would double-count the dispersion for Beta, whose
+    // `dispersion()` is `Known(1/(1+φ))` even though its `cov_scale` is `1.0`,
+    // shrinking every posterior SD by `√(1/(1+φ))` (gam#1722). For the
+    // profiled Gaussian `cov_scale == σ̂² == φ`, so this matches the previous
+    // `√φ` behaviour exactly; it only changes (fixes) Beta. This keeps the
+    // draw spread identical to the reported `summary().std_error`, like the
+    // sibling bounded-coefficient path (gam#1514).
+    let sqrt_cov_scale = fit.coefficient_covariance_scale().max(0.0).sqrt();
     if h.nrows() != p || h.ncols() != p {
         return Err(format!(
             "{rationale}: penalised Hessian is {}x{}, expected {}x{}",
@@ -383,10 +391,11 @@ pub fn laplace_gaussian_fallback(
             }
             back_substitution_lower_transpose_guarded_into(&l, &eps, &mut delta);
             for i in 0..p {
-                // `delta` has covariance H⁻¹; multiplying by √φ produces a
-                // draw with covariance φ·H⁻¹, matching the φ-scaled
-                // posterior covariance `Vb` the rest of inference assumes.
-                samples[(k, i)] = mode[i] + sqrt_phi * delta[i];
+                // `delta` has covariance H⁻¹; multiplying by `√cov_scale`
+                // produces a draw with covariance `cov_scale·H⁻¹`, matching
+                // the coefficient covariance `Vb` the rest of inference (and
+                // `summary()`'s Wald SE) assumes.
+                samples[(k, i)] = mode[i] + sqrt_cov_scale * delta[i];
             }
         }
     }
