@@ -1267,6 +1267,96 @@ mod tests {
         );
     }
 
+    /// #1033 (rank-stable κ-CEILING): the symmetric twin of the floor test. The
+    /// `synth_design` radial columns `(1+s)e^{-s}` with `s = r·e^ψ` collapse at the
+    /// HIGH ψ edge — every column decays toward zero as `s→∞`, so the conditioned
+    /// Gram drops rank near `psi_hi`. `rank_stable_psi_ceiling` must (a) detect that
+    /// the maximal-rank band does NOT reach `psi_hi` and return a ceiling strictly
+    /// inside the window, (b) report that ceiling as the upper edge of the band
+    /// containing the seed (rank at the ceiling = window-maximal, rank just above it
+    /// strictly lower), and (c) be a pure k-space property — IDENTICAL whether built
+    /// from few or many rows (the n-independence the κ outer loop relies on). A
+    /// design full-rank up to `psi_hi` must return `None` (no clamp needed). This is
+    /// the regression guard for the n=16000 fast-ladder resets: the κ line search
+    /// overshot above the band to a rank-deficient ψ and tripped two O(n) resets.
+    #[test]
+    fn rank_stable_psi_ceiling_is_inside_window_and_n_independent() {
+        let k = 7usize;
+        // Window reaching well past the high-ψ collapse (s = r·e^ψ → ∞ ⇒ every
+        // radial column → 0). Seeded at the LOW, well-conditioned end where the
+        // synthetic radial design holds maximal rank; the ceiling is the upper edge
+        // of the maximal-rank band reaching that seed.
+        let (psi_lo, psi_hi) = (-1.0_f64, 2.6_f64);
+        let build_at = |n: usize| {
+            let w = Array1::from_iter((0..n).map(|i| 1.0 + 0.5 * ((i % 3) as f64)));
+            let z = Array1::from_iter((0..n).map(|i| ((i as f64) * 0.41).cos()));
+            PsiGramTensor::build(|psi| synth_design(psi, n, k), w.view(), z.view(), psi_lo, psi_hi)
+                .expect("analytic synthetic design must certify")
+        };
+
+        let t_small = build_at(120);
+        let seed = psi_lo;
+        let ceil_small = t_small.rank_stable_psi_ceiling(seed);
+
+        // (a) the band does not reach psi_hi → a ceiling is returned, strictly inside.
+        let ceiling =
+            ceil_small.expect("high-edge-collapsing design must clamp the ceiling off psi_hi");
+        assert!(
+            ceiling < psi_hi && ceiling >= seed,
+            "ceiling {ceiling} must lie in [seed {seed}, psi_hi {psi_hi})"
+        );
+
+        // (b) at/below the ceiling the Gram holds the window-maximal rank; above it
+        // the rank drops. The ceiling is a genuine rank edge, not an interior node.
+        let rank_at = |psi: f64| t_small.gram_numerical_rank(psi).unwrap();
+        let max_rank = rank_at(seed);
+        assert_eq!(
+            rank_at(ceiling),
+            max_rank,
+            "the ceiling must sit at the window-maximal rank"
+        );
+        let probe_above = ceiling + 0.25;
+        if t_small.contains(probe_above) {
+            assert!(
+                rank_at(probe_above) < max_rank,
+                "rank just above the ceiling ({}) must drop under the band rank {max_rank}",
+                rank_at(probe_above)
+            );
+        }
+
+        // (c) n-independence: the ceiling from a larger build matches to grid
+        // resolution — the rank cliff is an n-free k-space property.
+        let t_big = build_at(1000);
+        let ceil_big = t_big
+            .rank_stable_psi_ceiling(seed)
+            .expect("the rank cliff is an n-free property; the big build must also clamp");
+        let grid_step = (psi_hi - psi_lo) / 95.0; // NODES - 1 = 95
+        assert!(
+            (ceil_small.unwrap() - ceil_big).abs() <= 1.5 * grid_step,
+            "rank-stable ceiling must be n-independent: n=120 → {}, n=1000 → {ceil_big} \
+             (grid step {grid_step})",
+            ceil_small.unwrap()
+        );
+
+        // A genuinely full-rank design across the window needs no clamp → None.
+        let n = 200usize;
+        let kk = 6usize;
+        let w = Array1::from_iter((0..n).map(|i| 1.0 + 0.5 * ((i % 3) as f64)));
+        let z = Array1::from_iter((0..n).map(|i| ((i as f64) * 0.23).sin()));
+        let full = PsiGramTensor::build(
+            |psi| synth_full_rank_design(psi, n, kk),
+            w.view(),
+            z.view(),
+            psi_lo,
+            psi_hi,
+        )
+        .expect("full-rank design must certify");
+        assert!(
+            full.rank_stable_psi_ceiling(seed).is_none(),
+            "a window-wide full-rank design must not clamp the ceiling"
+        );
+    }
+
     /// #1033 n-independence invariant (structural, build-free, bit-tight):
     /// after the one-time `build` n-pass, EVERY per-trial accessor the certified
     /// κ/ψ outer-loop hot path consumes — the value `(gram_at, rhs_at)`, the
