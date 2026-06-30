@@ -957,8 +957,45 @@ fn parse_periodic_axes_option(
         return Ok(None);
     };
     let mut periods = parse_periods_option(options, dim)?.unwrap_or_else(|| vec![None; dim]);
+    // Scalar boolean form (`periodic=true` / `false`, `yes` / `no`) applies to
+    // every axis — the documented per-axis-flag broadcast (see the doc on
+    // `parse_periodic_axes`, the tensor sibling that already accepts it). A
+    // 1-D `duchon(x, periodic=true)` lands here: the cyclic *domain* is then
+    // resolved from the data range by `parse_cyclic_boundary` (the 1-D builder
+    // consults `boundary` first), so a finite explicit period is NOT required —
+    // we only need to NOT mis-read "true" as an axis index (#1074). `false`
+    // means no axis is periodic.
+    let lowered = raw_axes.trim().to_ascii_lowercase();
+    match lowered.as_str() {
+        "true" | "yes" | "y" => return Ok(Some(periods)),
+        "false" | "no" | "n" => return Ok(Some(vec![None; dim])),
+        _ => {}
+    }
     let axes = split_list_option(raw_axes);
     if axes.is_empty() {
+        return Ok(Some(periods));
+    }
+    // A per-axis boolean list (`periodic=[true, false, ...]`) marks which axes
+    // are periodic without naming indices; map it onto the period slots (a
+    // `true` axis keeps its `parse_periods_option` value, which may be `None`
+    // and is then inferred downstream). This mirrors the tensor parser's
+    // `[true, false]` form so `te(...)` and `duchon(...)` agree.
+    if axes
+        .iter()
+        .all(|a| matches!(a.trim().to_ascii_lowercase().as_str(), "true" | "false" | "yes" | "no" | "y" | "n"))
+    {
+        if axes.len() != dim {
+            return Err(format!(
+                "periodic flag list length {} must match smooth dimension {dim}",
+                axes.len()
+            ));
+        }
+        for (i, a) in axes.iter().enumerate() {
+            let on = matches!(a.trim().to_ascii_lowercase().as_str(), "true" | "yes" | "y");
+            if !on {
+                periods[i] = None;
+            }
+        }
         return Ok(Some(periods));
     }
     for a in axes {

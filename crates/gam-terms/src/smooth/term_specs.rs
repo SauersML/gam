@@ -7411,6 +7411,26 @@ pub fn build_single_local_smooth_term(
             };
             let mut spec_local = spec.clone();
             spec_local.length_scale = length_scale_eff;
+            // The Duchon input axis is standardized in place above (`x → x/σ`,
+            // scale-only, no centering). A 1-D cyclic boundary `[start, end)`
+            // declared in ORIGINAL covariate units must move into that same
+            // standardized frame, or the modular wrap in
+            // `build_cyclic_duchon_basis_1dwithworkspace` folds the standardized
+            // coordinate against an original-unit period: the seam never closes
+            // and the basis silently degrades to non-periodic (#1074:
+            // `duchon(x, periodic=true)` predictions diverged across the wrap,
+            // f(0) ≠ f(2π)). Rescale by the same 1/σ applied to the data so
+            // training and predict share one periodic geometry.
+            if let (Some(s), crate::basis::OneDimensionalBoundary::Cyclic { start, end }) =
+                (scales.as_ref(), spec_local.boundary.clone())
+                && s.len() == 1
+                && s[0] > 0.0
+            {
+                spec_local.boundary = crate::basis::OneDimensionalBoundary::Cyclic {
+                    start: start / s[0],
+                    end: end / s[0],
+                };
+            }
             if matches!(
                 spec_local.identifiability,
                 SpatialIdentifiability::OrthogonalToParametric
