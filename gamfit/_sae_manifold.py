@@ -236,6 +236,46 @@ def _resolve_public_assignment(assignment: Any, assignment_prior: Any) -> str:
     return canon_assignment
 
 
+# Seed-keyed init jitter for the closed-form fast paths (issue #178). The Rust
+# `sae_manifold_fit_minimal` path perturbs the cold initial assignment logits by
+# `±SAE_RANDOM_STATE_LOGIT_JITTER` using a 64-bit wrapping Lehmer LCG keyed by
+# `random_state`, so distinct seeds explore different Newton trajectories while a
+# fixed seed stays bit-identical. The Python closed-form periodic fast paths
+# (`_fit_disjoint_periodic_top1` / `_fit_dense_periodic_ibp_lsq`) build their
+# init deterministically from an SVD and never reach that Rust code, so they
+# silently ignored `random_state` entirely (every seed produced the same fit).
+# Mirror the EXACT same LCG + jitter here so the two paths honour one seed
+# contract: the jitter perturbs the assignment masses (and, downstream, the
+# decoder LSQ that is weighted by them), which is the closed-form analogue of
+# jittering the assignment logits.
+_LCG_MULT = 6364136223846793005
+_LCG_ADD = 1442695040888963407
+_U64_MASK = (1 << 64) - 1
+# 2**-53, matching the Rust `f64::from_bits(0x3CA0000000000000)` top-53-bit map.
+_TWO_POW_NEG_53 = float.fromhex("0x1.0p-53")
+SAE_RANDOM_STATE_LOGIT_JITTER = 1.0e-3
+
+
+def _seeded_unit_jitter(random_state: int, shape: tuple[int, ...]) -> np.ndarray:
+    """Deterministic ``shape`` array of values in ``[-1, 1)`` keyed by ``random_state``.
+
+    Reproduces the per-element Lehmer LCG stream the Rust SAE init uses
+    (``crates/gam-pyffi/src/latent/latent_basis_and_sae_ffi.rs``): a fixed seed
+    yields a bit-identical stream, distinct seeds yield decorrelated streams.
+    """
+    count = 1
+    for dim in shape:
+        count *= int(dim)
+    out = np.empty(count, dtype=np.float64)
+    state = (int(random_state) & _U64_MASK)
+    state = (state * _LCG_MULT + _LCG_ADD) & _U64_MASK
+    for i in range(count):
+        state = (state * _LCG_MULT + _LCG_ADD) & _U64_MASK
+        u = float(state >> 11) * _TWO_POW_NEG_53
+        out[i] = 2.0 * u - 1.0
+    return out.reshape(shape)
+
+
 def _json_ready(value: Any) -> Any:
     if isinstance(value, np.ndarray):
         return value.tolist()
@@ -365,8 +405,14 @@ def _fit_disjoint_periodic_top1(
             return None
         scores_all = (x[:, cols] - mean) @ vt[:2].T
         phase = np.arctan2(scores_all[:, 1], scores_all[:, 0]) / (2.0 * np.pi)
-        # #178: seed-keyed jitter on the recovered phase init (see top of fn).
-        phase = phase + 1.0e-3 * rng.standard_normal(phase.shape)
+        # Seed-keyed init jitter (issue #178): same deterministic LCG stream as
+        # the Rust init and the dense fast path, applied per-atom to the phase
+        # so distinct `random_state` values diverge and equal seeds stay
+        # bit-identical. The winners/labels (hard top-1 structure) are kept
+        # seed-stable; only the within-atom chart coordinate is perturbed.
+        phase = phase + SAE_RANDOM_STATE_LOGIT_JITTER * _seeded_unit_jitter(
+            random_state * 2 + k + 1, (n_obs,)
+        )
         phase = phase - np.floor(phase)
         coords.append(np.ascontiguousarray(phase.reshape(-1, 1)))
         phi_rows = np.asarray(
@@ -491,27 +537,36 @@ def _fit_dense_periodic_ibp_lsq(
     # matching the Rust closed form `ordered_geometric_shrinkage_prior` (#614).
     ratio = alpha / (alpha + 1.0)
     priors = np.asarray([ratio ** (k + 1) for k in range(k_atoms)], dtype=float)
-    gate_level = 1.0 / (1.0 + np.exp(-6.0))
-    assignments = np.tile(priors * gate_level, (n_obs, 1))
-    logits = np.full((n_obs, k_atoms), 6.0 * tau, dtype=float)
-    # #178: this deterministic fast path was previously seed-independent (pure
-    # SVD + ridge-LSQ), so distinct `random_state` values produced bit-identical
-    # fits. Seed a numpy Generator with `random_state` and add a tiny ~1e-3
-    # jitter to the initial assignment logits and the gate init before the
-    # solve. DISTINCT seeds now perturb `design` -> the LSQ coefficients,
-    # `fitted`, and R² observably differ, while EQUAL seeds stay bit-identical
-    # (the Generator is keyed solely by `random_state`).
-    rng = np.random.default_rng(int(random_state))
-    logits = logits + (1.0e-3 * tau) * rng.standard_normal((n_obs, k_atoms))
-    assignments = assignments + 1.0e-3 * gate_level * rng.standard_normal(
-        (n_obs, k_atoms)
+    # Seed-keyed init jitter on the assignment logits (issue #178), mirroring
+    # the Rust `sae_manifold_fit_minimal` cold-logit jitter: the base logit is
+    # `6*tau` for every (row, atom); add `±SAE_RANDOM_STATE_LOGIT_JITTER` from
+    # the deterministic LCG stream and map back through the sigmoid gate so the
+    # per-row assignment masses (and the masses that weight the decoder LSQ
+    # design below) actually depend on `random_state`. A fixed seed reproduces
+    # the stream exactly, so determinism is preserved.
+    logit_jitter = SAE_RANDOM_STATE_LOGIT_JITTER * _seeded_unit_jitter(
+        random_state, (n_obs, k_atoms)
     )
+    logits = (6.0 * tau) + logit_jitter
+    gate = 1.0 / (1.0 + np.exp(-(6.0 + logit_jitter)))
+    assignments = priors[None, :] * gate
 
+    # Seed-keyed init jitter (issue #178). The SVD-derived phase init is
+    # otherwise seed-independent, so `random_state` was a no-op on this path.
+    # Perturb the latent phase coordinate with the same deterministic LCG the
+    # Rust init uses (in turn units, since this chart parameterizes the circle
+    # by [0, 1)); this propagates through the basis design and the decoder LSQ
+    # so distinct seeds yield observably different fits while a fixed seed stays
+    # bit-identical.
+    phase_jitter = SAE_RANDOM_STATE_LOGIT_JITTER * _seeded_unit_jitter(
+        random_state, (n_obs, k_atoms)
+    )
     coords: list[np.ndarray] = []
     phi_blocks: list[np.ndarray] = []
     for atom_idx in range(k_atoms):
         pair = centered @ vt[2 * atom_idx : 2 * atom_idx + 2].T
         phase = np.arctan2(pair[:, 1], pair[:, 0]) / (2.0 * np.pi)
+        phase = phase + phase_jitter[:, atom_idx]
         phase = phase - np.floor(phase)
         coord = np.ascontiguousarray(phase.reshape(-1, 1))
         coords.append(coord)
