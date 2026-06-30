@@ -84,6 +84,24 @@ Full `gpu_kernels::arrow_schur` suite (17 tests) GREEN; `arrow_schur::tests` 57 
 (the only failure is the pre-existing 2x2 brittleness below — proven identical on
 clean merge-base e128441cd, owned by PR #1650 which already edits that test file).
 
+## #1209 fail-loud + honest-routing hardening (beyond the original blocker)
+1. InexactPCG device seam (newton_step.rs:1715) silently swallowed ALL
+   `solve_sae_matrix_free_pcg` errors via a bare `if let Ok` → CPU fallback with
+   used_device_arrow=false. This is the K>2000 regime `automatic` routes to (where
+   the device matters MOST). Fixed: classify exactly like the Direct seam
+   (RidgeBumpRequired/SchurFactorFailed surface as ArrowSchurError; only Unavailable
+   falls through). Test `sae_inexact_pcg_inner_solve_engages_device_and_matches_cpu_1551`.
+2. Contradictory diagnostics: `solve_arrow_newton_step_core` unconditionally stamped
+   `injected_host_procedural_matvec=true` after injecting a host matvec — but the
+   re-entry can take the device-resident SAE PCG branch (used_device_arrow=true)
+   without consuming the host closure → BOTH flags set (mutually exclusive per #1209).
+   Fixed: only stamp host-procedural when !used_device_arrow. Test
+   `device_arrow_and_host_procedural_matvec_flags_are_mutually_exclusive_1209` (with a
+   non-vacuity guard proving the device-served InexactPCG path is reached on CUDA).
+
+Final suite: `arrow_schur` (incl gpu_kernels) 70 pass / 1 fail; the only failure is
+the pre-existing 2x2 brittleness below. All four new tests GREEN on V100.
+
 ## Pre-existing CPU failure (NOT mine, out of GPU scope)
 `arrow_schur::tests::arrow_schur_matches_dense_reference_2x2` FAILS on main @ e128441cd,
 deterministically, single-threaded. It `assert_eq!`s delta_beta (non-streaming) vs
