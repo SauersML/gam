@@ -269,6 +269,49 @@ if [[ "${1:-}" == "maturin" ]]; then
   finish "$code" "n/a"
 fi
 
+# ---- scoped lane: compile ONLY the crate(s) an agent touched -----------------
+# The workspace is split into crates precisely so a fleet of agents don't each
+# recompile everything. `cargo check -p <crate>` rebuilds only that crate (its
+# dependencies are already warm in target/ + sccache; its *dependents* are not
+# touched), and `check` skips codegen/link entirely — far faster and far lighter
+# on RAM than a full `build --lib`. Two forms:
+#   ./build.sh changed         # auto-detect changed crates from `git status` and
+#                              #   check just those (falls back to a full
+#                              #   workspace check if root src/ or Cargo.* changed)
+#   ./build.sh crate A B …     # check exactly the named crate(s)
+# Both are content-dedup'd + coalesced like every other request. Use these for
+# tight iteration; run a full `./build.sh` (or `./build.sh check --workspace
+# --tests`) once before you push to catch any downstream breakage.
+if [[ "${1:-}" == "changed" || "${1:-}" == "crate" ]]; then
+  mode="$1"; shift
+  declare -A _seen; _crates=(); _root=0
+  if [[ "$mode" == "crate" ]]; then
+    if [[ $# -eq 0 ]]; then echo "[build.sh] usage: ./build.sh crate <name> [name…]" >&2; exit 64; fi
+    for c in "$@"; do _seen["$c"]=1; done
+  else
+    # Parse `git status --porcelain` (handles renames "old -> new" by taking new).
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      f="${line:3}"; [[ "$f" == *" -> "* ]] && f="${f##* -> }"
+      case "$f" in
+        crates/*/*) c="${f#crates/}"; c="${c%%/*}"; _seen["$c"]=1 ;;
+        src/*|Cargo.toml|Cargo.lock|tests/*) _root=1 ;;
+      esac
+    done < <(git -C "$REPO" status --porcelain 2>/dev/null)
+  fi
+  for c in "${!_seen[@]}"; do _crates+=("$c"); done
+  if [[ "$_root" == 1 || ${#_crates[@]} -eq 0 ]]; then
+    REQ="check --workspace --lib"; CMD=("${CARGO[@]}" check --workspace --lib)
+    [[ "$mode" == "changed" ]] && echo "[build.sh] scoped 'changed': root/test/Cargo change (or no crate diff) → full workspace check" >&2
+  else
+    _pflags=(); for c in "${_crates[@]}"; do _pflags+=(-p "$c"); done
+    REQ="check ${_pflags[*]} --lib"; CMD=("${CARGO[@]}" check "${_pflags[@]}" --lib)
+    echo "[build.sh] scoped: checking only ${_crates[*]}" >&2
+  fi
+  CACHEABLE=1
+  run_request
+fi
+
 # ---- args lane: test / check / nextest / clippy / build-with-args (cacheable) ----
 if [[ $# -gt 0 ]]; then
   REQ="$*"
