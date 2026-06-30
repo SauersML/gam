@@ -60,6 +60,30 @@ GPU engagement proven via nvidia-smi dmon (312MB fb resident, SM util spikes 2-8
 
 ## Next: dense reduced-β path, #1209 honest routing, run full gpu suite.
 
+## END-TO-END PRODUCTION ENGAGEMENT TEST — GREEN on V100
+`sae_direct_inner_solve_engages_device_and_matches_cpu_1551` PASSES on Tesla V100:
+- Drives the PUBLIC production entry `solve_arrow_newton_step_artifacts` with a
+  device-equipped SAE system (n=512, k=64) that clears the offload gate.
+- HARD ASSERTS `used_device_arrow == true` on a CUDA host (fail-loud #1551 contract:
+  a silent CPU fallback FAILS the test). Engagement re-confirmed via nvidia-smi dmon
+  (312MB fb resident during the run).
+- Δβ/Δt parity vs `solve_arrow_newton_step_dense_reference` within 1e-7.
+
+Two fixture defects fixed to get a SOUND parity gate (NOT loosened):
+1. Reduced Schur not PD — device non-framed H_ββ comes from `data.sparse_g_blocks`
+   (G⊗I_p), NOT `sys.hbb`; fixture left them empty so H_ββ≈ρ·I and the n=512-row
+   Schur subtraction went indefinite (device CORRECTLY failed loud). Installed a
+   dominant-diagonal H_ββ as 1×1 SparseGBlocks AND mirrored it in sys.hbb.
+2. Parity oracle decoupled — the dense reference reads `row.htbeta` directly; the
+   fixture shipped coupling ONLY as a matrix-free operator (row.htbeta all-zeros),
+   so the reference solved a DECOUPLED system. Materialized the operator into each
+   row.htbeta (exact unit-column probe), htbeta_dense_supplement OFF so the
+   matrix-free apply is unchanged. All three paths now encode one H_tβ.
+
+Full `gpu_kernels::arrow_schur` suite (17 tests) GREEN; `arrow_schur::tests` 57 pass
+(the only failure is the pre-existing 2x2 brittleness below — proven identical on
+clean merge-base e128441cd, owned by PR #1650 which already edits that test file).
+
 ## Pre-existing CPU failure (NOT mine, out of GPU scope)
 `arrow_schur::tests::arrow_schur_matches_dense_reference_2x2` FAILS on main @ e128441cd,
 deterministically, single-threaded. It `assert_eq!`s delta_beta (non-streaming) vs
