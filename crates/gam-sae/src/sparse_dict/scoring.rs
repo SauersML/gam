@@ -139,11 +139,14 @@ impl TileScorer {
     /// independent of `K`), and each tile is a single `(B × P)·(P × tile)`
     /// matrix multiply rather than `B × tile` scalar dot loops. The online
     /// top-`s` selector sees the atoms in the same global order as
-    /// [`Self::route_row`] (tile 0 first, ascending atom index), so the
-    /// shortlist agrees with the row-at-a-time path; the GEMM contracts the same
-    /// `P` terms but `matrixmultiply` may accumulate them in a blocked order, so
-    /// scores agree to f32 rounding rather than bit-for-bit. Returns one
-    /// `(atom, score)` shortlist per row, in row order.
+    /// [`Self::route_row`] (tile 0 first, ascending atom index). The GEMM
+    /// contracts the same `P` terms but `matrixmultiply` may accumulate them in
+    /// a blocked order, so the per-atom scores agree with the row-at-a-time path
+    /// only to f32 rounding; where two atoms tie within that rounding the two
+    /// paths may select different members of the tie (interchangeable for the
+    /// reconstruction, which is why the fit stays minibatch-invariant rather
+    /// than bit-identical). Returns one `(atom, score)` shortlist per row, in row
+    /// order.
     pub fn route_minibatch(
         &self,
         rows: ArrayView2<'_, f32>,
