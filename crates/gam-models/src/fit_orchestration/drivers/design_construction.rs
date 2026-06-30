@@ -4480,6 +4480,148 @@ impl CustomFamily for SpatialAdaptiveExactFamily {
         true
     }
 
+    // Jeffreys/Firth information = the LIKELIHOOD Fisher information only
+    // (`Xᵀ W X`, `W = −ℓ''(η)`), NOT the penalized joint Newton Hessian
+    // `Xᵀ W X + ∂²_β penalty` the trait default (`exact_newton_joint_hessian`)
+    // returns. Two reasons, both load-bearing for the #901 outer-REML
+    // hypergradient:
+    //
+    //   1. CONTRACT. Jeffreys' prior is `Φ = ½ log|I(β)|₊` with `I` the
+    //      likelihood information; the adaptive Charbonnier term is the PRIOR,
+    //      not the likelihood, so folding its curvature into `I` is a
+    //      category error (the trait doc on `joint_jeffreys_information_with_specs`
+    //      spells this out — "Jeffreys' prior is defined from expected
+    //      information").
+    //
+    //   2. θ-CONSISTENCY. With the full span `Z_J = I`, the reduced
+    //      information IS `I(β)`. If the penalty Hessian `S_λ,ε(θ)` rode along,
+    //      `Φ` would depend on the smoothing hyperparameters `θ = (log λ, log ε)`
+    //      EXPLICITLY through `S_λ,ε`. The outer gradient then needs `−∂_θ Φ`
+    //      (psi_hyper's `phi_psi`), computed from the EXACT, UNGATED, UNFLOORED
+    //      `joint_jeffreys_phi_explicit_param_derivative`, whereas the LAML cost
+    //      folds the GATED + spectrally-FLOORED value `Φ` and a
+    //      divided-difference `H_Φ` that omits its second-order completion.
+    //      Those two describe different functions, so the analytic
+    //      hypergradient disagreed with the central-difference reference by
+    //      exactly that penalty-driven `∂_θ Φ` — the residual scaling with the
+    //      Charbonnier group dimension (mass 1, tension 2, curvature 4) the
+    //      #901 fixture pinned. `Xᵀ W X` carries NO `θ` dependence, so
+    //      `∂_θ Φ ≡ 0` and the term contributes only its genuine β-mode-response
+    //      (which the envelope identity already accounts for), restoring
+    //      analytic-vs-FD agreement to f64 grade.
+    //
+    // For Gaussian identity `W ≡ 1`, so this is the constant data Gram `XᵀX`,
+    // which is also β-independent — its β-directional derivatives below are
+    // therefore zero, matching the exact Fisher-information geometry. On a
+    // genuinely near-separating non-Gaussian fit the data information still
+    // shrinks where the conditioning gate arms, so the self-limiting Firth
+    // bound is preserved exactly where it is needed.
+    fn joint_jeffreys_information_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<Array2<f64>>, String> {
+        let spec = expect_single_blockspec(specs, "spatial adaptive exact family")?;
+        let beta = &expect_single_block_state(block_states, "spatial adaptive exact family")?.beta;
+        if spec.design.ncols() != beta.len() {
+            return Err(SmoothError::dimension_mismatch(format!(
+                "spatial adaptive Jeffreys information: spec design has {} columns, beta has {}",
+                spec.design.ncols(),
+                beta.len()
+            ))
+            .into());
+        }
+        let eval = self.exact_evaluation(beta)?;
+        Ok(Some(xt_diag_x_dense(
+            self.design.view(),
+            eval.obs.neghessian_eta.view(),
+        )?))
+    }
+
+    fn joint_jeffreys_information_directional_derivative_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        // `D_β(Xᵀ W X)[u] = Xᵀ diag(W'(η) (X u)) X`, with `W = −ℓ''(η)` and
+        // `W' = neghessian_eta_derivative`. Mirrors the data-block term of
+        // `exacthessian_directional_derivative_from_evaluation`, MINUS the
+        // penalty contribution (the penalty is not part of the likelihood
+        // information). Zero for the constant-weight (Gaussian-identity) path.
+        let spec = expect_single_blockspec(specs, "spatial adaptive exact family")?;
+        let beta = &expect_single_block_state(block_states, "spatial adaptive exact family")?.beta;
+        if spec.design.ncols() != d_beta_flat.len() {
+            return Err(SmoothError::dimension_mismatch(format!(
+                "spatial adaptive Jeffreys directional derivative: spec design has {} columns, direction has {}",
+                spec.design.ncols(),
+                d_beta_flat.len()
+            ))
+            .into());
+        }
+        let eval = self.exact_evaluation(beta)?;
+        let d_eta = gam_linalg::faer_ndarray::fast_av(self.design.as_ref(), d_beta_flat);
+        Ok(Some(xt_diag_x_dense(
+            self.design.view(),
+            (&eval.obs.neghessian_eta_derivative * &d_eta).view(),
+        )?))
+    }
+
+    fn joint_jeffreys_information_second_directional_derivative_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_u_flat: &Array1<f64>,
+        d_betav_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        // `D²_β(Xᵀ W X)[u, v] = Xᵀ diag(W''(η) (X u) (X v)) X`. The observation
+        // state exposes `W` and `W'` but not `W''`, so this is exact only on the
+        // constant-weight path (`W' ≡ 0 ⇒ W'' ≡ 0`, the zero matrix), matching
+        // the guard in `exacthessian_second_directional_derivative_from_evaluation`.
+        // On a varying-weight family we return `None` so the divided-difference
+        // completion degrades safely rather than to a wrong value.
+        let spec = expect_single_blockspec(specs, "spatial adaptive exact family")?;
+        let beta = &expect_single_block_state(block_states, "spatial adaptive exact family")?.beta;
+        if spec.design.ncols() != beta.len()
+            || d_beta_u_flat.len() != beta.len()
+            || d_betav_flat.len() != beta.len()
+        {
+            return Err(SmoothError::dimension_mismatch(format!(
+                "spatial adaptive Jeffreys second-direction length mismatch: spec cols={}, dirs=({}, {}), expected {}",
+                spec.design.ncols(),
+                d_beta_u_flat.len(),
+                d_betav_flat.len(),
+                beta.len()
+            ))
+            .into());
+        }
+        let eval = self.exact_evaluation(beta)?;
+        if eval.obs.neghessian_eta_derivative.iter().any(|&w| w != 0.0) {
+            return Ok(None);
+        }
+        Ok(Some(Array2::<f64>::zeros((beta.len(), beta.len()))))
+    }
+
+    fn joint_jeffreys_information_matches_observed_hessian(&self) -> bool {
+        // The Jeffreys information above is the LIKELIHOOD Fisher information,
+        // which differs from the penalized observed joint Newton Hessian, so the
+        // observed-Hessian conditioning pre-check must NOT certify a skip from it
+        // (gam#1020 expected-information caveat).
+        false
+    }
+
+    fn joint_jeffreys_information_depends_on_psi(&self) -> bool {
+        // The Jeffreys information is the data Fisher information `Xᵀ W X`, whose
+        // explicit ψ-dependence is zero: the smoothing hyperparameters
+        // ψ = (log λ, log ε) act only through the adaptive Charbonnier PENALTY,
+        // never the design `X`, so `∂_ψ (Xᵀ W X)|_β ≡ 0`. Returning `false`
+        // suppresses the three explicit-ψ Firth terms the outer engine would
+        // otherwise form from `∂_ψ(penalty)` (the wrong perturbation), which is
+        // exactly the spurious hypergradient bias the #901 fixture pinned. The
+        // implicit β-mode-response of `Φ` is unaffected and still folded.
+        false
+    }
+
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         let beta = &expect_single_block_state(block_states, "spatial adaptive exact family")?.beta;
         let eval = self.exact_evaluation(beta)?;
@@ -4765,6 +4907,18 @@ fn expect_single_block_state<'a>(
         block_states.len(),
     )?;
     Ok(&block_states[0])
+}
+
+fn expect_single_blockspec<'a>(
+    specs: &'a [ParameterBlockSpec],
+    family_name: &str,
+) -> Result<&'a ParameterBlockSpec, String> {
+    crate::block_layout::block_count::validate_block_count::<SmoothError>(
+        family_name,
+        1,
+        specs.len(),
+    )?;
+    Ok(&specs[0])
 }
 
 fn expect_block_idx_zero(block_idx: usize, family_name: &str, context: &str) -> Result<(), String> {
