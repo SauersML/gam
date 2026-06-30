@@ -374,8 +374,12 @@ mod device {
         // Row-major contiguous host buffers (handles non-contiguous views).
         let rows_host: Vec<f32> = rows.iter().copied().collect();
         let atoms_host: Vec<f32> = atoms.iter().copied().collect();
-        debug_assert_eq!(rows_host.len(), n_rows * p);
-        debug_assert_eq!(atoms_host.len(), n_atoms * p);
+        assert_eq!(rows_host.len(), n_rows * p, "score-block rows flatten length");
+        assert_eq!(
+            atoms_host.len(),
+            n_atoms * p,
+            "score-block atoms flatten length"
+        );
 
         let rows_dev = stream
             .clone_htod(&rows_host)
