@@ -14,7 +14,6 @@ pub(crate) fn compute_adjoint_z_c(
     ing: &ScalarGlmIngredients<'_>,
     hop: &dyn HessianOperator,
     leverage: &Array1<f64>,
-    subspace: Option<&PenaltySubspaceTrace>,
 ) -> Result<Array1<f64>, String> {
     let mut weighted = Array1::<f64>::zeros(ing.c_array.len());
     Zip::from(&mut weighted)
@@ -24,33 +23,39 @@ pub(crate) fn compute_adjoint_z_c(
     // Matrix-free Xᵀ · weighted via DesignMatrix transpose-apply, so
     // operator-backed (Lazy) designs at large scale never densify.
     let v = ing.x.transpose_vector_multiply(&weighted);
-    // Adjoint identity: tr(Kernel · C[u]) = uᵀ · Xᵀ(c ⊙ h^G), where the
-    // kernel and the leverage `h^G` must come from the SAME operator.
+    // Adjoint shortcut for tr(Kernel · C[u]) where C[u] = Xᵀ diag(c ⊙ Xu) X
+    // and u = β̈ is the SECOND mode response. Expanding the trace,
     //
-    //   * Full-Hessian regime: Kernel = G_ε(H), leverage = diag(X G_ε(H) Xᵀ),
-    //     mode response u = H⁻¹ rhs, and the cheap shortcut reads
-    //     `rhs · z_c` with z_c = H⁻¹ · X'(c⊙h^G).
-    //   * Projected-subspace regime (rank-deficient LAML fix): Kernel = K,
-    //     leverage = h^{G,proj} = diag(X K Xᵀ). This adjoint `z_c` is a
-    //     TRACE-side quantity, so it carries the projected `K`; it is NOT the
-    //     β̈ mode response (which is solved with the full `H⁻¹` even here — see
-    //     `compute_ift_correction_trace`'s slow path). For the shortcut to hold
-    //     the adjoint must satisfy `rhs · z_c = (K rhs)ᵀ X'(c⊙h^{G,proj})
-    //                                     = rhsᵀ K · X'(c⊙h^{G,proj})`,
-    //     i.e. z_c^{proj} = K · X'(c ⊙ h^{G,proj}). Routing through
-    //     `hop.solve` here produces H⁻¹ · X'(c ⊙ h^{G,proj}) instead and
-    //     `scalar_correction_trace` then computes
-    //     `rhsᵀ H⁻¹ X'(c⊙h^{G,proj})` while the dense path's
-    //     `compute_ift_correction_trace` computes
-    //     `rhsᵀ K · X'(c⊙h^{G,proj})`, so the operator-form Hessian
-    //     disagrees with `compute_outer_hessian`'s materialisation on every
-    //     non-trivial subspace direction (the
-    //     `projected_operator_hessian_matches_dense_subspace_trace`
-    //     regression).
-    match subspace {
-        Some(kernel) => Ok(kernel.apply_pseudo_inverse(&v)),
-        None => Ok(hop.solve(&v)),
-    }
+    //     tr(Kernel · C[u]) = Σ_r c_r (Xu)_r (X Kernel Xᵀ)_rr
+    //                       = uᵀ Xᵀ (c ⊙ h^G),   h^G = diag(X Kernel Xᵀ),
+    //
+    // and the mode response is `u = β̈ = H⁻¹ rhs` — solved with the FULL inner
+    // inverse `hop.solve` in EVERY regime (it is an IFT stationarity derivative
+    // living in full β-space; see `compute_ift_correction_trace`'s slow path and
+    // `penalty_coordinate.rs`). Substituting,
+    //
+    //     tr(Kernel · C[u]) = rhsᵀ H⁻¹ Xᵀ(c ⊙ h^G) = rhsᵀ · z_c,
+    //     z_c = H⁻¹ · Xᵀ(c ⊙ h^G).
+    //
+    // The PROJECTION enters ONLY through the leverage `h^G`, never through the
+    // solve:
+    //   * Full-Hessian regime: Kernel = G_ε(H), h^G = diag(X G_ε(H) Xᵀ).
+    //   * Projected-subspace regime (rank-deficient LAML fix): Kernel = K, the
+    //     caller passes h^{G,proj} = diag(X K Xᵀ); the solve stays `H⁻¹`.
+    //
+    // A previous version routed the projected regime through
+    // `K · Xᵀ(c⊙h^{G,proj})` (the projected pseudo-inverse) instead of
+    // `H⁻¹ · …`. That made `scalar_correction_trace` compute
+    // `rhsᵀ K Xᵀ(c⊙h^{G,proj})` while the dense path's
+    // `compute_ift_correction_trace` materialisation correctly traces
+    // `tr(K · C[H⁻¹ rhs]) = rhsᵀ H⁻¹ Xᵀ(c⊙h^{G,proj})`, so the operator-form
+    // Hessian disagreed with `compute_outer_hessian` on every non-trivial
+    // subspace direction (the
+    // `projected_operator_hessian_matches_dense_subspace_trace` /
+    // `outer_hessian_operator_matvec_matches_dense_subspace_with_null_alpha`
+    // regressions). The solve is `H⁻¹` regardless of regime; only the leverage
+    // is projected.
+    Ok(hop.solve(&v))
 }
 
 /// Compute the fourth-derivative trace: tr(G_ε(H) Xᵀ diag(d ⊙ (Xvₖ)(Xvₗ)) X).

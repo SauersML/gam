@@ -372,6 +372,17 @@ pub struct AtomBirthGate {
     /// The level the certificate is claimed at; fixed at construction so a
     /// verdict can never be shopped across α after seeing the evidence.
     alpha: f64,
+    /// First-passage time: the shard count at which the running supremum
+    /// first crossed the single-hypothesis Ville bar `ln(1/α)`. `None` until
+    /// the crossing happens. This is the realized *time-to-certification* —
+    /// the design-relevant quantity (`expected_resolution_budget`) — recorded
+    /// SEPARATELY from the running evidence so that absorption can continue
+    /// past the crossing without losing the crossing time. By Ville the
+    /// crossing is permanent (it is a property of the running sup), so this is
+    /// monotone: once `Some`, never reset. `#[serde(default)]` keeps gates
+    /// persisted before this field was added (#973 resumability) loadable.
+    #[serde(default)]
+    certified_at_step: Option<usize>,
 }
 
 impl AtomBirthGate {
@@ -384,11 +395,24 @@ impl AtomBirthGate {
         Ok(Self {
             test: PredictablePluginEProcess::new(),
             alpha,
+            certified_at_step: None,
         })
     }
 
     pub fn alpha(&self) -> f64 {
         self.alpha
+    }
+
+    /// The realized time-to-certification: the shard count at which the
+    /// running supremum first crossed `ln(1/α)`, or `None` if it never did.
+    /// This is the first-passage time the design budget
+    /// ([`expected_resolution_budget`]) predicts — distinct from
+    /// [`EProcess::steps`] (total shards absorbed), which keeps growing after
+    /// the crossing because absorption does not stop (continuing to accumulate
+    /// is what lets the dictionary-level e-BH certificate clear its higher
+    /// multiplicity bar `ln(m/(α·k))`).
+    pub fn certified_at_step(&self) -> Option<usize> {
+        self.certified_at_step
     }
 
     /// Absorb one shard's split-likelihood ratio (see type-level contract).
@@ -398,7 +422,14 @@ impl AtomBirthGate {
         log_lik_null_sup_on_shard: f64,
     ) -> Result<(), String> {
         self.test
-            .try_absorb_batch(log_lik_alternative_prefit, log_lik_null_sup_on_shard)
+            .try_absorb_batch(log_lik_alternative_prefit, log_lik_null_sup_on_shard)?;
+        // Record the first-passage time once, the step the running sup first
+        // crosses the single-hypothesis bar. `rejects_at` reads the running
+        // maximum, so this latches permanently even if later evidence retreats.
+        if self.certified_at_step.is_none() && self.test.process.rejects_at(self.alpha) {
+            self.certified_at_step = Some(self.test.process.steps());
+        }
+        Ok(())
     }
 
     pub fn absorb_shard(
@@ -442,11 +473,31 @@ impl AtomBirthGate {
 ///
 /// `initial_alternative` is the K+1 fit from data BEFORE the stream (or a
 /// prior-driven init; validity never depends on its quality — a bad init
-/// only costs power). Stops absorbing early once certified (the crossing
-/// is permanent; further shards only cost compute), but still folds the
-/// remaining shards into the alternative so the returned state has seen
-/// the whole stream. Returns the gate (verdict + resumable evidence) and
-/// the final alternative state.
+/// only costs power). Absorbs EVERY shard's evidence into the e-process — it
+/// does NOT stop at the single-hypothesis Ville crossing. An earlier
+/// early-stop ("the crossing is permanent; further shards only cost compute")
+/// conflated two distinct bars:
+///   * the per-move VERDICT ([`AtomBirthGate::verdict`] via
+///     [`EProcess::rejects_at`]) tests the running SUPREMUM against the
+///     single-hypothesis bar `ln(1/α)`, where the crossing is indeed
+///     permanent and the realized crossing step is captured separately in
+///     [`AtomBirthGate::certified_at_step`]; but
+///   * the dictionary-level CERTIFICATE ([`StructureLedger::certify`] →
+///     [`e_benjamini_hochberg`]) consumes the CURRENT log e-value
+///     ([`EProcess::current_e_value_log`]) under a multiplicity correction
+///     whose bar `ln(m/(α·k))` is strictly higher for m > 1 claims.
+/// Stopping at the single-hypothesis bar banked just enough evidence for the
+/// move's own verdict but starved the FDR certificate, so a genuinely real
+/// atom (e.g. 0.8 nats/shard × 10 shards = 8 nats) failed e-BH confirmation
+/// against a second claim (bar `ln(2/0.05) ≈ 3.69`) even though it cleared
+/// its own `ln(1/0.05) ≈ 3.00` bar — it carried ample evidence but the early
+/// stop threw the surplus away. Continuing to absorb is always sound: the
+/// e-process is a supermartingale under H0, so additional
+/// conditionally-valid increments preserve validity, and the predictability
+/// contract is untouched (the alternative is still evaluated before it is
+/// refit with each shard). Returns the gate (verdict + resumable evidence,
+/// with `certified_at_step` holding the realized time-to-certification) and
+/// the final alternative state, which has seen the whole stream.
 pub fn run_atom_birth_gate<S, A>(
     alpha: f64,
     initial_alternative: A,
@@ -458,11 +509,9 @@ pub fn run_atom_birth_gate<S, A>(
     let mut gate = AtomBirthGate::new(alpha)?;
     let mut alt = initial_alternative;
     for shard in shards {
-        if !matches!(gate.verdict(), GateVerdict::Certified { .. }) {
-            let log_lik_alt = alternative_log_lik(&alt, &shard);
-            let log_lik_null = null_sup_log_lik(&shard);
-            gate.try_absorb_shard(log_lik_alt, log_lik_null)?;
-        }
+        let log_lik_alt = alternative_log_lik(&alt, &shard);
+        let log_lik_null = null_sup_log_lik(&shard);
+        gate.try_absorb_shard(log_lik_alt, log_lik_null)?;
         alt = refit_alternative(alt, &shard);
     }
     Ok((gate, alt))
@@ -1207,34 +1256,46 @@ mod tests {
     }
 
     /// POWER STUDY, alternative side, through the orchestration harness:
-    /// a planted K+1-th atom worth 0.5 nats/shard certifies in
-    /// ⌈log(1/α)/0.5⌉ = 6 shards — matching the design-time
-    /// `expected_resolution_budget` — after which the gate stops absorbing
-    /// (the crossing is permanent) while the alternative keeps refitting
-    /// on the remaining shards.
+    /// a planted K+1-th atom worth 0.5 nats/shard CROSSES the single-hypothesis
+    /// Ville bar in ⌈log(1/α)/0.5⌉ = 6 shards — the realized
+    /// time-to-certification matching the design-time
+    /// `expected_resolution_budget`. The gate keeps absorbing past the
+    /// crossing (the crossing time is latched in `certified_at_step`, so it is
+    /// not lost), banking the full stream's evidence — which is exactly what
+    /// the dictionary-level e-BH certificate needs to clear its higher
+    /// multiplicity bar. The alternative refits on every shard regardless.
     #[test]
     fn power_study_planted_atom_certifies_at_the_predicted_budget() {
         let growth = 0.5f64;
+        let n_shards = 20usize;
         let (gate, alt_state) = run_atom_birth_gate(
             0.05,
             0usize, // alt state = number of shards folded into the fit
-            0..20usize,
+            0..n_shards,
             |_, _| -99.5, // prefit alternative log-lik on the shard
             |_| -100.0,   // honest null sup on the shard
             |folded, _| folded + 1,
         )
         .expect("valid alpha");
 
+        // Full-stream evidence is banked: 0.5 nats/shard × 20 shards = 10 nats,
+        // far past the single-hypothesis bar — this surplus is what the e-BH
+        // dictionary certificate consumes against its `ln(m/(α·k))` bar.
         match gate.verdict() {
-            GateVerdict::Certified { log_e } => assert!((log_e - 3.0).abs() < 1e-12),
+            GateVerdict::Certified { log_e } => {
+                assert!((log_e - growth * n_shards as f64).abs() < 1e-12)
+            }
             v => panic!("planted atom must certify, got {v:?}"),
         }
-        // Realized time-to-certification == the design-time budget, rounded up.
+        // Realized time-to-certification (first-passage of the running sup over
+        // `ln(1/α)`) == the design-time budget, rounded up.
         let budget = expected_resolution_budget(0.05, growth).expect("budget");
-        assert_eq!(gate.test.process.steps(), budget.ceil() as usize);
-        assert_eq!(gate.test.process.steps(), 6);
-        // The alternative state saw the whole stream despite early stopping.
-        assert_eq!(alt_state, 20);
+        assert_eq!(gate.certified_at_step(), Some(budget.ceil() as usize));
+        assert_eq!(gate.certified_at_step(), Some(6));
+        // Absorption does NOT stop at the crossing: every shard is banked.
+        assert_eq!(gate.test.process.steps(), n_shards);
+        // The alternative state saw the whole stream.
+        assert_eq!(alt_state, n_shards);
     }
 
     /// Work-plan step 4, closed end-to-end: a contested claim gets a probe
