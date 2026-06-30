@@ -20,6 +20,20 @@ S="$REPO/.buildd"; mkdir -p "$S"
 LOCK="$S/build.lock"; LOG="$S/last.log"; RESULT="$S/last.code"; HASHFILE="$S/last.hash"; HIST="$S/history.log"
 export CARGO_TARGET_DIR="$REPO/target" CARGO_INCREMENTAL=1   # item-granularity reuse
 
+# Memory-safe parallelism cap. Heavy non-incremental deps (faer, nano-gemm, gemm,
+# burn) spawn one rustc per crate; on a small-RAM box (e.g. 8 GB) the default
+# -j<ncpu> codegen fan-out OOMs and the kernel SIGKILLs rustc (signal 9) mid-link,
+# which looks like a spurious "could not compile faer". Cap concurrent codegen so
+# the build is slow-but-survivable. Override with CARGO_BUILD_JOBS=<n> in your env
+# (a big-RAM box / cluster can raise it). Default keys off detected RAM.
+if [[ -z "${CARGO_BUILD_JOBS:-}" ]]; then
+  mem_gb=""
+  if mb=$(sysctl -n hw.memsize 2>/dev/null); then mem_gb=$(( mb / 1073741824 ))   # macOS
+  elif km=$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null); then mem_gb=$(( km / 1048576 )); fi
+  if [[ -n "$mem_gb" && "$mem_gb" -le 10 ]]; then export CARGO_BUILD_JOBS=2
+  elif [[ -n "$mem_gb" && "$mem_gb" -le 18 ]]; then export CARGO_BUILD_JOBS=4; fi
+fi
+
 # ---------------------------------------------------------------------------
 # Compiler cache (sccache): a content-addressed warm dependency cache shared by
 # every agent tree on this box. sccache keys on preprocessed source + compiler
