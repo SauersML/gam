@@ -30,3 +30,15 @@ done on a box WITHOUT a GPU.
 
 ## Progress log
 - (start) branch created, plan written.
+
+## FINDING 1 (2026-06-30) — device kernel RUNS on V100 but parity FAILS
+- nextest `device_matches_cpu_when_available` on V100 (sm_70):
+  NVRTC compiled `survival_rowjet_kernel.cu`, kernel launched & executed
+  (diff is non-zero ⇒ device path engaged, NOT the CPU fallback). ✅ engagement proven.
+- BUT parity gate FAILED: `max abs diff 5.09e-8 > 1e-9`.
+  Docstring/issue claim 4.7e-12 on A100. So either:
+    (a) transcendental drift (CPU libm erfc vs CUDA erfc) amplified through the
+        seeded-jet recurrences into the high-order (third/fourth) channels — #1175, or
+    (b) a genuine arithmetic mismatch.
+- Next: per-channel abs+rel diagnostic to localize the worst offender, then set a
+  PRINCIPLED tolerance (mixed abs+rel) or fix the source of drift.
