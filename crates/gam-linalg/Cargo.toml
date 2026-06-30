@@ -1,6 +1,6 @@
 [package]
 name = "gam-linalg"
-version = "0.3.137"
+version = "0.3.138"
 edition = "2024"
 rust-version = "1.93"
 description = "Dense/sparse linear-algebra and ridge-solver foundation for the gam penalized-likelihood engine"
@@ -13,7 +13,7 @@ warnings = "deny"
 [dependencies]
 dyn-stack = "0.13.2"
 faer = "0.24.0"
-gam-runtime = { path = "../gam-runtime", version = "=0.3.137" }
+gam-runtime = { path = "../gam-runtime", version = "=0.3.138" }
 log = "0.4.29"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 rayon = "1.12.0"

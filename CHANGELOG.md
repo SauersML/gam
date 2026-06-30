@@ -1,3 +1,94 @@
+## v0.3.138 — gam 0.3.138 / gamfit 0.1.240 (2026-06-30)
+
+crates.io + PyPI release of the post-0.3.137 correctness wave. A cluster of
+silent-no-op and frame-consistency bugs are fixed at the root — each with a
+regression test — the monotone shape-constrained REML fix is completed for its
+binding-constraint face, several GPU paths are proven bit-identical to CPU, the
+Gaussian P-spline/thin-plate objective gains fast paths, and two latent
+build-breakers (an unused import and eight hygiene-gate violations that would
+have failed the wheel build mid-flight) are cleared. Everything reachable
+through the existing API stays backward-compatible.
+
+### Fitting / inference correctness
+- **Tensor smooths honor per-margin periodicity and `bs=c(...)`.** A `te(...)`
+  mixing periodic and non-periodic marginals (or per-margin basis overrides via
+  `bs=c(...)`) built every marginal from the first margin's spec; each marginal
+  now carries its own periodicity and basis kind (#1751, #1752).
+- **`smooth_significance()` LR p-value no longer collapses to ~0.** When a smooth
+  shrinks onto its linear null space the reference degrees of freedom could fall
+  to zero, collapsing the likelihood-ratio p-value; the reference d.f. is now
+  floored at the term's null-space dimension (≥ its EDF), keeping the null
+  false-positive rate calibrated (#1766).
+- **`survival_likelihood=` is rejected on a non-`Surv()` response (#1767).** A
+  request like `fit(data, "time ~ s(x)", survival_likelihood="weibull")` used to
+  drop the knob silently and fit an ordinary Gaussian GAM on the raw event-time
+  column. It now fails loud at materialization, symmetric to the `family=`
+  survival guard and the survival-only formula-term guard (#371).
+- **Monotone shape-constrained smooth — binding-constraint face (#509).** The
+  outer REML/LAML analytic gradient is now frame-consistent with the cost even
+  when the monotonicity constraint binds at the inner optimum, so a monotone fit
+  on already-monotone data no longer parks at its under-smoothed seed. Completes
+  the #509 fix begun in 0.3.137.
+- **`ard_per_atom` is wired to the native ARD prior (#240).** The SAE flag was a
+  silent no-op (a registry penalty deliberately skipped on every SAE path); it
+  now toggles `native_ard_enabled`, observable in the born-atom count and fitted
+  coordinates.
+- **Multinomial per-class λ/EDF rebuilt from the joint penalty (#561); endpoint
+  `bc=clamped` interior-quality guarded and tensor endpoint BCs rejected (#500);
+  per-atom `log_lambda_smooth` grows when a structure move grows K (#357);
+  irrelevant double-penalty smooths select out via per-term shrink (#1266); the
+  distilled-encoder honesty probe is cold-started (#1166); the objective-grid
+  per-axis seed refinement reaches asymmetric corners.**
+
+### SAE
+- **Closed-form fast paths honor `random_state` (#178)** via a deterministic LCG
+  mirrored between Python and Rust.
+- **Scale-invariant isometry Gauss–Newton curvature; the gauge is re-enabled
+  (#795). Log-det θ-adjoint cross-row Woodbury off-diagonal corrected
+  (#1625/#1416); barrier strength derived from REML evidence (#1610);
+  device-resident Direct-solve engagement with symmetric Schur fixtures
+  (#1017/#1551).**
+
+### Survival
+- **Predict-query times accept negative and `+inf` (#965)** as boundary
+  evaluations instead of raising.
+
+### Performance
+- **Gaussian P-spline / thin-plate fit perf-core (#1689):** REML-objective fast
+  paths with a profile-test guard.
+- **Sphere (S²) GPU dtoh path:** pinned + parallel transpose + buffer pool
+  (#1709); the 40M-element transpose in `to_host_array` removed (GPU
+  6.6s→0.27s, #1741); decomposition GEMM routed through `fast_ab` (#1738).
+- **`trace_product_sparse` rayon parallelization restored (#759); gauge identity
+  section short-circuited in `restrict_design`/penalty (#1737); dense-GEMM device
+  dispatch registered and made transpose-free (#1735); Matérn/GP κ-loop sped up
+  with the verbosity flag (`gam._rust.set_log_level`) re-exposed (#1688); wiggle
+  separation bound + batched REML gradient (#1607).**
+
+### GPU parity / robustness
+- SAE reconstruction CPU↔GPU bit-identity via row-jet K-scale + sparse-route
+  (#1026); honest fail-loud routing (#1209); proven GPU↔CPU parity on V100 with
+  principled bands + fmad sweep (#415, #1175); CI-fast parity, fail-loud oracle,
+  and false-routing guard (#1412, #988); arrow-Schur NVRTC arch-pin and
+  deficit-aware Gershgorin ridge bump for non-PD rows.
+
+### Build / test hardening
+- **Un-RED the workspace build.** Removed an unused `ShapeBuilder` import in
+  `gam-terms` (a `warnings = "deny"` hard error left by the #1709 sphere-GPU
+  work) and cleared eight `build.rs` ban-scanner violations across
+  `gam-solve`/`gam-models`/`tests` (a `let _` discard, two `#[ignore]`d GPU
+  diagnostics, a `GAM_REQUIRE_GPU` env read, a mis-named `#[cfg(test)]` module,
+  and a three-`assert!(true)` scratch test file). Both gates would have failed
+  the wheel build ~12 min in; they had slipped through CI because the heavy
+  build job self-throttles and kept getting skipped under the steady commit
+  stream.
+- Concurrency guards (`OnceLock`-in-rayon #1253, `nested_prefix` dispatch #1254)
+  made behavioral and workspace-wide; `scale_dimensions` anisotropy validated for
+  `thinplate()` (#1676); numerous orphaned smooth / Matérn / SO(3) / SAS / BMS
+  test guards re-homed and bound to production penalties (#1601, #1274, #1629,
+  #855, #388, #370, #1260, #1261, #1246, #1255, #1091); Test-shard CI timeout
+  raised to the 6h runner max.
+
 ## v0.3.137 — gam 0.3.137 / gamfit 0.1.239 (2026-06-30)
 
 crates.io + PyPI release of the post-0.3.136 correctness wave. Shape-constrained
