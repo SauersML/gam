@@ -34,10 +34,6 @@ use gam_problem::types::ColIdx;
 use gam_data::{ColumnKindTag, DataError, EncodedDataset as Dataset};
 use gam_runtime::resource::ResourcePolicy;
 
-/// Floor on the derived default Matérn length scale, guarding against a zero or
-/// vanishingly small scale when the data span is degenerate.
-const DEFAULT_MATERN_LENGTH_SCALE_FLOOR: f64 = 1e-6;
-
 /// Default B-spline degree when a smooth's `degree=` option is absent. Cubic
 /// (degree 3) is the standard GAM convention: C² continuity with a low knot
 /// count.
@@ -66,35 +62,6 @@ const FACTOR_SMOOTH_DEFAULT_BASIS_DIM: usize = 10;
 /// `chunk_size=` option is absent. Streams the design in row blocks to bound
 /// peak memory independent of the dataset row count.
 const DEFAULT_PCA_CHUNK_SIZE: usize = 4096;
-
-fn default_matern_length_scale(ds: &Dataset, cols: &[usize]) -> f64 {
-    let mut diameter2 = 0.0_f64;
-    for &col in cols {
-        let column = ds.values.column(col);
-        let mut lo = f64::INFINITY;
-        let mut hi = f64::NEG_INFINITY;
-        for &value in column.iter().filter(|v| v.is_finite()) {
-            lo = lo.min(value);
-            hi = hi.max(value);
-        }
-        if lo.is_finite() && hi.is_finite() && hi > lo {
-            let span = hi - lo;
-            diameter2 += span * span;
-        }
-    }
-    let diameter = diameter2.sqrt();
-    if diameter.is_finite() && diameter > 0.0 {
-        // #1074: default to the full data diameter (mgcv's `bs="gp"` default
-        // range), NOT a hand-tuned fraction. The old `0.15·diameter` magic
-        // constant existed to dodge high-frequency collapse while the 1-D κ
-        // optimizer was not relied on to pick the range; that masking is removed.
-        // The DEFAULT_MATERN_LENGTH_SCALE_FLOOR guard against a degenerate
-        // (zero-span) domain is a legitimate numerical floor and is kept.
-        diameter.max(DEFAULT_MATERN_LENGTH_SCALE_FLOOR)
-    } else {
-        1.0
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Typed errors
@@ -2675,8 +2642,24 @@ pub fn build_smooth_basis(
                 spec: MaternBasisSpec {
                     center_strategy,
                     periodic: parse_periodic_axes_option(options, cols.len())?,
-                    length_scale: option_f64(options, "length_scale")
-                        .unwrap_or_else(|| default_matern_length_scale(ds, cols)),
+                    // Sentinel: leave at 0.0 when the user didn't pass an
+                    // explicit length_scale so the planner's
+                    // `auto_init_length_scale_in_place` can replace it with the
+                    // SAME data-derived wiggly-side initialization the thin-plate
+                    // path uses (`max_range / sqrt(n)`), then let the κ-optimizer
+                    // refine from there.
+                    //
+                    // gam#1629: the previous `default_matern_length_scale` seeded
+                    // the FULL data diameter — the maximally over-smoothed corner.
+                    // Because that value is non-zero, the `0.0`-gated auto-init was
+                    // a no-op for Matérn, so the κ-optimizer started in the flat
+                    // over-smoothed basin and parked there, leaving high-frequency
+                    // 2-D surfaces unresolved (truth-RMSE ~6× worse than
+                    // thin-plate/tensor on identical data, and insensitive to `k`).
+                    // Routing Matérn through the same `0.0` sentinel as thin-plate
+                    // (see the ThinPlate branch above) starts REML in the resolving
+                    // regime it can actually escape from.
+                    length_scale: option_f64(options, "length_scale").unwrap_or(0.0),
                     nu,
                     include_intercept: option_bool(options, "include_intercept").unwrap_or(false),
                     double_penalty: smooth_double_penalty,
@@ -4400,6 +4383,90 @@ mod tests {
         assert!(
             centers >= 1,
             "default univariate tp must still build a usable basis (centers={centers})",
+        );
+    }
+
+    /// gam#1629: a default 2-D `matern(x1, x2)` (no explicit `length_scale`)
+    /// must leave the length-scale at the `0.0` auto sentinel — NOT the full
+    /// data diameter — so the planner's `auto_init_length_scale_in_place` seeds
+    /// it on the wiggly/resolving side (`max_range / sqrt(n)`), the same regime
+    /// thin-plate uses. The previous `default_matern_length_scale` returned the
+    /// full diameter, which is non-zero, so the `0.0`-gated auto-init was a
+    /// no-op and the κ-optimizer started in the over-smoothed corner and parked
+    /// there (truth-RMSE ~6× worse than thin-plate/tensor on identical
+    /// high-frequency 2-D surfaces, insensitive to `k`). This pins the corrected
+    /// seed geometry without a fit/optimizer in the loop.
+    #[test]
+    fn default_matern_2d_seeds_resolving_length_scale_not_overscaled_diameter() {
+        // A fine multi-frequency 2-D grid (the #1629 reproduction shape): the
+        // data diameter is O(1.4) in each axis; the resolving seed must be far
+        // smaller than the diameter so high-frequency structure stays reachable.
+        let side = 24usize; // n = 576
+        let mut rows: Vec<Vec<f64>> = Vec::with_capacity(side * side);
+        for i in 0..side {
+            for j in 0..side {
+                let x1 = i as f64 / (side - 1) as f64; // [0, 1]
+                let x2 = j as f64 / (side - 1) as f64; // [0, 1]
+                let y = (6.0 * x1).sin() * (6.0 * x2).cos();
+                rows.push(vec![y, x1, x2]);
+            }
+        }
+        let n = rows.len();
+        let ds = continuous_dataset(&["y", "x1", "x2"], rows);
+
+        let mut options = BTreeMap::new();
+        options.insert("bs".to_string(), "gp".to_string()); // gp ⇒ Matérn
+        let mut notes = Vec::new();
+        let mut basis = build_smooth_basis(
+            SmoothKind::S,
+            &["x1".to_string(), "x2".to_string()],
+            &[1, 2],
+            &options,
+            &ds,
+            &mut notes,
+            &ResourcePolicy::default_library(),
+            1,
+        )
+        .expect("build default 2-D matern smooth");
+
+        // (1) The builder must emit the auto sentinel, not a baked-in diameter.
+        let (feature_cols, seeded_length_scale) = match &basis {
+            SmoothBasisSpec::Matern {
+                feature_cols, spec, ..
+            } => (feature_cols.clone(), spec.length_scale),
+            other => panic!("expected Matern basis, got {other:?}"),
+        };
+        assert_eq!(
+            seeded_length_scale, 0.0,
+            "default matern() must leave length_scale at the 0.0 auto sentinel \
+             (got {seeded_length_scale}); a non-zero diameter default re-enters the \
+             over-smoothed basin and disables the planner's wiggly-side auto-init",
+        );
+
+        // (2) After the shared auto-init runs, the realized length-scale must
+        // land in the resolving regime: `max_range / sqrt(n)`, far below the
+        // data diameter. This is the seed the κ-optimizer starts REML from.
+        crate::smooth::auto_init_length_scale_in_basis(ds.values.view(), &mut basis);
+        let realized = match &basis {
+            SmoothBasisSpec::Matern { spec, .. } => spec.length_scale,
+            other => panic!("expected Matern basis after auto-init, got {other:?}"),
+        };
+        let expected =
+            crate::smooth::auto_initial_length_scale(ds.values.view(), &feature_cols);
+        assert!(
+            (realized - expected).abs() <= 1e-12,
+            "auto-init must seed the wiggly-side length scale max_range/sqrt(n) \
+             (expected {expected}, got {realized})",
+        );
+
+        // Sanity: the resolving seed is well below the per-axis range (≈1.0).
+        // Before the fix the seed was the full diameter (≈√2 ≈ 1.414); the
+        // resolving seed here is ≈ 1.0 / sqrt(576) ≈ 0.042, ~30× smaller.
+        let max_range = 1.0_f64; // each axis spans [0, 1]
+        assert!(
+            realized < max_range / 4.0,
+            "matern seed length_scale {realized} must be in the resolving regime, \
+             not the over-smoothed diameter corner (n={n}, max_range≈{max_range})",
         );
     }
 
