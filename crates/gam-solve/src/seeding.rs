@@ -609,34 +609,56 @@ where
         // unsupported term's keep corner is never cheaper than its shrink-out
         // corner, so #1266 is untouched.
         let keep_saturation = clamp_seed_rho_to_bounds(bnds.0, bnds);
-        for axis in 0..n_smooths {
-            let anchor = best_seed.clone();
-            let mut targets = vec![
-                clamp_seed_rho_to_bounds(anchor[axis] - 3.0, bnds),
-                clamp_seed_rho_to_bounds(anchor[axis] + 3.0, bnds),
-            ];
-            if (anchor[axis] - saturation).abs() > 1e-9 {
-                targets.push(saturation);
-            }
-            if nullspace_coords.contains(&axis) {
-                // Step toward the keep basin (a moderate un-shrink) and the full
-                // keep saturation, so the probe reaches the basin wherever it sits
-                // between the anchor and λ_null → 0.
-                targets.push(clamp_seed_rho_to_bounds(anchor[axis] - 6.0, bnds));
-                if (anchor[axis] - keep_saturation).abs() > 1e-9 {
-                    targets.push(keep_saturation);
+        // Coordinate descent over the per-axis grid line. A single pass takes at
+        // most one ±3 step from the isotropic anchor, so when that anchor sits at
+        // a corner (e.g. fully over-smoothed because one penalty block dominates
+        // the cost) it cannot carry the remaining coordinates the several grid
+        // intervals back to their own optimum: the grid could express "saturate
+        // all" or "saturate none", but not the asymmetric "saturate s(z), keep
+        // s(x)" corner the Marra–Wood null-space cases need (#1266/#1548).
+        // Re-anchoring on `best_seed` and sweeping until a full pass yields no
+        // improvement lets the existing safe ±3 steps compound into a full
+        // traversal. The step set is unchanged, so no new (potentially
+        // inner-cap-overfit) low-λ probe is introduced — the keep direction stays
+        // gated to null-space coordinates — and every move remains criterion-
+        // ranked against the true REML/LAML cost, so the sweep can only lower it.
+        let span = (bnds.1 - bnds.0).abs();
+        let max_sweeps = (span / 3.0).ceil() as usize + 2;
+        for _ in 0..max_sweeps {
+            let mut improved = false;
+            for axis in 0..n_smooths {
+                let anchor = best_seed.clone();
+                let mut targets = vec![
+                    clamp_seed_rho_to_bounds(anchor[axis] - 3.0, bnds),
+                    clamp_seed_rho_to_bounds(anchor[axis] + 3.0, bnds),
+                ];
+                if (anchor[axis] - saturation).abs() > 1e-9 {
+                    targets.push(saturation);
+                }
+                if nullspace_coords.contains(&axis) {
+                    // Step toward the keep basin (a moderate un-shrink) and the full
+                    // keep saturation, so the probe reaches the basin wherever it sits
+                    // between the anchor and λ_null → 0.
+                    targets.push(clamp_seed_rho_to_bounds(anchor[axis] - 6.0, bnds));
+                    if (anchor[axis] - keep_saturation).abs() > 1e-9 {
+                        targets.push(keep_saturation);
+                    }
+                }
+                for target in targets {
+                    let mut candidate = anchor.clone();
+                    candidate[axis] = target;
+                    if let Some(c) = eval_cost(&candidate)
+                        && c.is_finite()
+                        && best_cost.map(|b| c < b).unwrap_or(true)
+                    {
+                        best_cost = Some(c);
+                        best_seed = candidate;
+                        improved = true;
+                    }
                 }
             }
-            for target in targets {
-                let mut candidate = anchor.clone();
-                candidate[axis] = target;
-                if let Some(c) = eval_cost(&candidate)
-                    && c.is_finite()
-                    && best_cost.map(|b| c < b).unwrap_or(true)
-                {
-                    best_cost = Some(c);
-                    best_seed = candidate;
-                }
+            if !improved {
+                break;
             }
         }
         for start in 0..n_smooths.saturating_sub(1) {
