@@ -4606,6 +4606,51 @@ pub fn gaussian_reml_fit_blocks_backward_analytic(
         grad_weights[row] = q_kernel * residual[row] * residual[row] + diag_zgz + y[row] * zh[row];
     }
 
+    // Weight-scale invariance of the REML score (issue #877). The Gaussian REML
+    // criterion the score adjoint targets — the profiled cost assembled in
+    // `reml_outer_engine::objective` — carries the data-density normalization
+    // `−½ Σ_{wᵢ>0} log(wᵢ)` (the `|W|^{½}` factor of the weighted normal
+    // likelihood) together with the geometric-mean weight anchor on ρ. Their
+    // net effect is that the *score* depends on the observation weights only up
+    // to a global scale: replacing `w → c·w` leaves it unchanged. By Euler's
+    // homogeneity identity that invariance is exactly
+    //   Σ_i wᵢ · ∂(score)/∂wᵢ = 0,
+    // i.e. the score's weight-gradient is orthogonal to the scaling direction
+    // `1/wᵢ`. The kernel propagation above produces the *raw* (un-normalized)
+    // weight partials `aᵢ`, which do not satisfy this constraint; the missing
+    // piece is the projection that removes the scaling component. Subtract the
+    // multiple of `1/wᵢ` that restores `Σ_i wᵢ·gradᵢ = 0`:
+    //   gradᵢ ← aᵢ − μ/wᵢ,  μ = (Σ_{j:wⱼ>0} wⱼ aⱼ) / n₊.
+    // Only the score seed is scale-invariant — β̂, fitted = Zβ̂ and the EDF all
+    // scale with the weights (the λS term in K = ZᵀWZ + λS does not), so their
+    // adjoints must NOT be projected. We therefore form the score-only partials
+    // `aᵢˢ = ½·grs·(τ·rᵢ² + zᵢᵀ R zᵢ)` from the score's own kernel
+    // contributions (q_kernel ← ½·grs·τ, g_kernel ← ½·grs·R) and project just
+    // those, leaving the coefficient/fitted/EDF/λ weight-gradients intact.
+    if grad_reml_score != 0.0 {
+        let q_kernel_score = 0.5 * grad_reml_score * tau;
+        let zr = z.dot(&r);
+        let n_pos = (0..n).filter(|&i| weights[i] > 0.0).count();
+        if n_pos > 0 {
+            let mut weighted_score_partial_sum = 0.0_f64;
+            for row in 0..n {
+                if weights[row] <= 0.0 {
+                    continue;
+                }
+                let z_r_z = (0..p_total).map(|col| z[[row, col]] * zr[[row, col]]).sum::<f64>();
+                let a_score = q_kernel_score * residual[row] * residual[row]
+                    + 0.5 * grad_reml_score * z_r_z;
+                weighted_score_partial_sum += weights[row] * a_score;
+            }
+            let projection = weighted_score_partial_sum / n_pos as f64;
+            for row in 0..n {
+                if weights[row] > 0.0 {
+                    grad_weights[row] -= projection / weights[row];
+                }
+            }
+        }
+    }
+
     let mut grad_penalties = Vec::with_capacity(f_blocks);
     for block in 0..f_blocks {
         let start = offsets[block];
