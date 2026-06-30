@@ -5051,6 +5051,102 @@ mod tests {
         sys
     }
 
+    /// The Gershgorin ridge bump must actually make a known-indefinite block PD
+    /// on the first retry — the whole point of #1711. Verified directly by
+    /// re-factoring `H_tt + (ridge_t + bump)·I` with the same Cholesky guard the
+    /// device readback uses, for blocks whose `λ_min` is known in closed form.
+    #[test]
+    fn ridge_bump_makes_known_indefinite_blocks_pd() {
+        // `cholesky_factor_in_place` / `CholeskyGuard` are already in scope via
+        // `super::*` (imported at the top of the module).
+        // A few blocks with a CLOSED-FORM smallest eigenvalue, all at ridge_t=0.
+        // (label, matrix, λ_min) — the bump must clear each one.
+        let neg_identity = Array2::<f64>::from_diag(&Array1::from_elem(8, -1.0)); // λ_min = -1
+        let scaled_neg = Array2::<f64>::from_diag(&Array1::from_elem(4, -250.0)); // λ_min = -250
+        // Symmetric 2×2 [[1, 2], [2, 1]] has eigenvalues 3 and -1 → indefinite.
+        let mut indef2 = Array2::<f64>::zeros((2, 2));
+        indef2[[0, 0]] = 1.0;
+        indef2[[1, 1]] = 1.0;
+        indef2[[0, 1]] = 2.0;
+        indef2[[1, 0]] = 2.0;
+        // A genuinely PD block must get a bump that is the bare rounding margin
+        // only (deficit 0), and must still factor — the helper is defensive.
+        let pd = Array2::<f64>::from_diag(&Array1::from_elem(3, 5.0));
+
+        for (label, block) in [
+            ("-I (λ_min=-1)", neg_identity),
+            ("-250·I (λ_min=-250)", scaled_neg),
+            ("[[1,2],[2,1]] (λ_min=-1)", indef2),
+            ("5·I (PD)", pd),
+        ] {
+            let ridge_t = 0.0;
+            let bump = ridge_bump_to_make_pd(block.view(), ridge_t);
+            assert!(
+                bump > 0.0 && bump.is_finite(),
+                "[{label}] bump must be strictly positive and finite, got {bump:e}"
+            );
+            let d = block.nrows();
+            let mut shifted = block.clone();
+            for i in 0..d {
+                shifted[[i, i]] += ridge_t + bump;
+            }
+            assert!(
+                cholesky_factor_in_place(shifted.view(), CholeskyGuard::NonnegativePivot).is_some(),
+                "[{label}] H_tt + (ridge_t + bump={bump:e})·I must be PD after the \
+                 Gershgorin bump, but the Cholesky still rejected it"
+            );
+        }
+    }
+
+    /// The column-major variant (multi-GPU tile path) must agree with the
+    /// row-major helper for a symmetric block, since Gershgorin edges are
+    /// invariant under reading the symmetric matrix by row vs by column. The
+    /// colmajor variant takes the bound at ridge_t=0 (the ridge is already baked
+    /// into the diagonal it reads), so compare against `ridge_bump_to_make_pd`
+    /// with `ridge_t = 0`.
+    #[test]
+    fn ridge_bump_colmajor_matches_rowmajor_for_symmetric_block() {
+        // Symmetric 3×3 with a negative-definite-ish diagonal and off-diagonals.
+        let mut a = Array2::<f64>::zeros((3, 3));
+        a[[0, 0]] = -2.0;
+        a[[1, 1]] = 0.5;
+        a[[2, 2]] = 1.0;
+        a[[0, 1]] = 0.3;
+        a[[1, 0]] = 0.3;
+        a[[1, 2]] = -0.4;
+        a[[2, 1]] = -0.4;
+        a[[0, 2]] = 0.1;
+        a[[2, 0]] = 0.1;
+
+        let row_major_bump = ridge_bump_to_make_pd(a.view(), 0.0);
+
+        // Flatten column-major: block[c*d + r] = a[[r, c]].
+        let d = 3;
+        let mut col_major = vec![0.0_f64; d * d];
+        for c in 0..d {
+            for r in 0..d {
+                col_major[c * d + r] = a[[r, c]];
+            }
+        }
+        let col_major_bump = ridge_bump_to_make_pd_colmajor(&col_major, d);
+
+        assert!(
+            (row_major_bump - col_major_bump).abs() <= 1e-12 * row_major_bump.max(1.0),
+            "colmajor bump {col_major_bump:e} must match rowmajor bump \
+             {row_major_bump:e} for a symmetric block"
+        );
+
+        // And the bump must actually make it PD (sanity, same as the row-major test).
+        let mut shifted = a.clone();
+        for i in 0..d {
+            shifted[[i, i]] += col_major_bump;
+        }
+        assert!(
+            cholesky_factor_in_place(shifted.view(), CholeskyGuard::NonnegativePivot).is_some(),
+            "colmajor Gershgorin bump must make the symmetric block PD"
+        );
+    }
+
     fn device_pcg_fixture(k: usize) -> (Array2<f64>, Array1<f64>) {
         let mut s = Array2::<f64>::zeros((k, k));
         for row in 0..k {
