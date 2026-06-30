@@ -4763,4 +4763,11 @@ mod empirical_flex_jet_oracle_tests {
             }
         }
     }
+
+    // NOTE: the #932 hand-vs-jet2 timing baseline (`flex_handpath_vs_jet2_timing_932`)
+    // was removed — `#[ignore]`d timing benches are banned by `build.rs`. The
+    // *correctness* of `empirical_flex_row_nll_jet2` against the production hand
+    // path `compute_row_analytic_flex_from_parts_into` is already pinned by the
+    // non-ignored `empirical_flex_row_nll_jet2_matches_hand_path_932` above.
+    // Throughput quantification belongs in `bench/`, not in a `#[test]`.
 }

@@ -7862,7 +7862,25 @@ mod firth_hessian_direction_reuse_tests {
     fn tk_hessian_rho_canonical_logit_firth_is_deterministic_under_parallel_fanout_k4() {
         let (x, beta, op, penalties, lambdas) = synthetic_logit_setup_k4();
         let k = penalties.len();
-        let first = tk_hessian_for_k4_setup(&x, &beta, &op, &penalties, &lambdas);
+        // The fan-out this test guards is gated on `rayon::current_num_threads() > 1`
+        // (the `Some(op) if k > 1 && current_num_threads() > 1`, `fan_units`, and
+        // `fan_pairs` branches in this module). On a single-core runner or under
+        // `RAYON_NUM_THREADS=1` that gate is false and the assembly silently takes
+        // the SERIAL path — so without pinning a multi-threaded pool the
+        // determinism guard would be vacuous (it would "pass" while exercising none
+        // of the parallel write-back it is named for). Run every assembly inside a
+        // dedicated >1-thread pool so the parallel path is guaranteed regardless of
+        // the ambient environment.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("build a 4-thread pool for the fan-out determinism guard");
+        assert!(
+            pool.current_num_threads() > 1,
+            "the #1575 fan-out guard requires a >1-thread pool to be non-vacuous"
+        );
+        let run = || pool.install(|| tk_hessian_for_k4_setup(&x, &beta, &op, &penalties, &lambdas));
+        let first = run();
         assert_eq!(first.dim(), (k, k));
         assert!(
             first.iter().all(|v| v.is_finite()),
@@ -7884,7 +7902,7 @@ mod firth_hessian_direction_reuse_tests {
         // the same matrix every time (the inner faer GEMMs are pinned to Par::Seq
         // inside with_nested_parallel, and the reduction is index-ordered).
         for rep in 0..4 {
-            let again = tk_hessian_for_k4_setup(&x, &beta, &op, &penalties, &lambdas);
+            let again = run();
             assert_eq!(
                 first.mapv(|v| v.to_bits()),
                 again.mapv(|v| v.to_bits()),

@@ -25,6 +25,7 @@ pub mod device;
 pub mod device_cache;
 pub mod driver;
 pub mod device_runtime;
+pub mod encode_throughput;
 pub mod linalg_dispatch;
 pub mod memory;
 pub mod numerics_device;
