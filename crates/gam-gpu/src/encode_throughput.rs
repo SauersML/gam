@@ -188,18 +188,18 @@ pub fn cpu_oracle_normal_equations_solve(
     assert_eq!(w.len(), n, "w must have one entry per design row");
     assert_eq!(rhs.len(), p, "rhs must have one entry per border column");
 
-    // Gram = Xᵀ diag(w) X + ridge·I, formed in f64.
-    let mut gram = Array2::<f64>::zeros((p, p));
-    for a in 0..p {
-        for b in a..p {
-            let mut acc = 0.0_f64;
-            for i in 0..n {
-                acc += x[[i, a]] * w[i] * x[[i, b]];
-            }
-            gram[[a, b]] = acc;
-            gram[[b, a]] = acc;
+    // Gram = Xᵀ diag(w) X + ridge·I, formed in f64 as (√w⊙X)ᵀ(√w⊙X) via the
+    // BLAS-backed `dot` (the scalar triple loop is O(n·p²) and dominates the
+    // oracle at p in the thousands). Folding √w into both factors keeps the
+    // weighting exact: row i contributes wᵢ·xᵢₐ·xᵢᵦ as (√wᵢxᵢₐ)(√wᵢxᵢᵦ).
+    let mut xw = x.to_owned();
+    for i in 0..n {
+        let sw = w[i].sqrt();
+        for a in 0..p {
+            xw[[i, a]] *= sw;
         }
     }
+    let mut gram = xw.t().dot(&xw);
     for j in 0..p {
         gram[[j, j]] += ridge;
     }
