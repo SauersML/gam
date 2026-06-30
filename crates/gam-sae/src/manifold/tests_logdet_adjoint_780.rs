@@ -149,16 +149,17 @@ pub(crate) fn ibp_rho_sparse_logdet_trace_matches_dense_fd_1416() {
     // Fixed-alpha IBP-MAP with an active sparse prior so the cross-row Woodbury
     // source is genuinely live.
     term.assignment.mode = AssignmentMode::ibp_map(0.7, 0.9, false);
-    // Fixed-alpha IBP-MAP is PD only on a narrow ρ_sparse island, AND the
-    // #1625-class separation-barrier gating (a5f099e21) slowed the inner
-    // (t, β)-Newton so the old 5-iteration budget no longer reaches a stationary
-    // cache at ANY ρ — the `.expect("converged cache")` panicked at setup. ρ_sparse
-    // = −0.5 lands inside the PD basin and, at the same 200-iteration budget the
-    // `..._on_tiny_fixture` sibling uses to reach a tight optimum, the inner solve
-    // converges and the analytic ρ_sparse trace matches the fixed-state central
-    // difference of log|H| to ≈10 digits (verified across a ρ × inner-iteration
-    // sweep). Setup fix only — no tolerance weakened, shared fixture untouched.
-    rho.log_lambda_sparse = -0.5;
+    // Fixed-alpha IBP-MAP is PD only on a JAGGED ρ_sparse landscape on this n=10
+    // periodic-bilinear fixture: most values (including the previously-pinned 1.0,
+    // which a `log_lambda_sparse`-sweep shows is non-PD — the converge call panics
+    // with "Schur complement Cholesky failed: non-PD pivot") leave the undamped
+    // joint Hessian indefinite at setup. The contiguous island ρ_sparse ∈
+    // [−1.0, −0.4] is solidly PD, and −0.8 sits in its interior: it converges to
+    // the SAME PD cache for every inner budget (iter ∈ {5…40}), the cross-row
+    // Woodbury source is genuinely live there (max|d_k| ≈ 0.21), and the analytic
+    // ρ_sparse trace matches the fixed-state central difference of log|H| to ≈10
+    // digits. Setup fix only — no tolerance weakened.
+    rho.log_lambda_sparse = -0.8;
     let (_value, _loss, cache) = term
         .reml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
         .expect("converged cache");
@@ -248,4 +249,68 @@ pub(crate) fn learnable_ibp_alpha_logdet_trace_matches_dense_fd_1417() {
         "the #1417 data-Hessian alpha trace must be a live nonzero term; got \
          {data_trace:.3e}"
     );
+}
+
+
+
+/// #1625 (scope expansion) — the LEARNABLE-α IBP-MAP logit θ-adjoint. This is
+/// the cross-row Woodbury logit channel of `Γ = tr(H⁻¹ ∂H/∂ℓ)` under
+/// `learnable_alpha = true`, a path the fixed-alpha `..._ibp_map` sibling never
+/// exercises. Under learnable α the resolved weight convention flips (`weight`
+/// stays 1.0 and `log_lambda_sparse` drives `α` via `resolve_learnable_weight`
+/// instead of scaling the prior), so the per-column Woodbury coefficient
+/// `d_k = w·s'_k` and its mass-derivative `dd_k = w·s''_k` take DIFFERENT numeric
+/// values than the fixed-alpha path — yet a single logit perturbation holds α
+/// fixed (it only moves `M_k` and the local `z`), so the same off-diagonal
+/// cross-row contraction must hold.
+///
+/// The comparison point must EXIST and be STATIONARY: like the indefinite-basin
+/// diagnosis driving the whole #1625 fix, the analytic
+/// `Γ = tr(H⁻¹ ∂H/∂θ)` equals the fixed-state central difference of `log|H|`
+/// only at a CONVERGED inner cache. A short inner budget (e.g. `iter = 5`) leaves
+/// (t, β) non-stationary, and `fixed_state_logdet` (which re-solves with
+/// `iter = 0`) then differences `log|H|` about a different state, manufacturing a
+/// spurious O(several-%) mismatch that does NOT shrink with the FD step — the
+/// tell that it is a state desync, not truncation. Converging the inner solve
+/// (`iter = 200`, tol `1e-8`) makes Γ and the FD share one stationary state, and
+/// the learnable-α logit adjoint then matches to ≈6 digits.
+#[test]
+pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_ibp_map_learnable_alpha_1625() {
+    let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
+    term.assignment.mode = AssignmentMode::ibp_map(0.7, 0.9, true);
+    // ρ₀ = 0.6 drives a PD learnable-α cache on this fixture (a sweep shows the
+    // default 0.1 and ρ₀ ≤ −0.8 are non-PD for learnable α); the cross-row
+    // Woodbury source is genuinely live there.
+    rho.log_lambda_sparse = 0.6;
+    let (_value, _loss, cache) = term
+        .reml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-8, 1.0e-8)
+        .expect("converged learnable-α cache");
+    let solver = DeflatedArrowSolver::plain(&cache);
+    let gamma = term
+        .logdet_theta_adjoint(&rho, &cache, &solver)
+        .expect("Gamma");
+    let h = 1.0e-5;
+    // Probe both atoms across distinct rows so the cross-row coupling (different
+    // rows sharing a column) is exercised on both columns under learnable α.
+    let probes = [
+        (0usize, 0usize, 0usize),
+        (4usize, 1usize, 1usize),
+        (7usize, 0usize, 0usize),
+    ];
+    for (row, local_pos, atom) in probes {
+        let mut plus = term.clone();
+        let mut minus = term.clone();
+        plus.assignment.logits[[row, atom]] += h;
+        minus.assignment.logits[[row, atom]] -= h;
+        let fd = (fixed_state_logdet(plus, &target, &rho)
+            - fixed_state_logdet(minus, &target, &rho))
+            / (2.0 * h);
+        let analytic = gamma.t[cache.row_offsets[row] + local_pos];
+        let tol = 3.0e-3 * (1.0 + fd.abs().max(analytic.abs()));
+        assert!(
+            (fd - analytic).abs() <= tol,
+            "learnable-α IBP Gamma row={row} local_pos={local_pos}: \
+             fd={fd:.8e}, analytic={analytic:.8e}"
+        );
+    }
 }

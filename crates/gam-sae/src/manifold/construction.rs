@@ -9246,9 +9246,24 @@ impl SaeManifoldTerm {
             // block too.
             //
             // Group the column sites once (the layout is mode-agnostic: dense or
-            // compact, `ibp_logit_sites` already carries each active logit's global
-            // t-index and selected-inverse diagonal), then per column build `u_k`,
-            // solve, and distribute.
+            // compact, `ibp_logit_sites` already carries each active logit's
+            // global t-index AND its selected-inverse diagonal `G_ii`), then per
+            // column build `u_k`, solve, and distribute the OFF-DIAGONAL remainder.
+            //
+            // #1416 FIX: the diagonal (`i = w`) parts of term A and term B are
+            // ALREADY supplied — `diag(term A) = dd_k·J_w·Σ_i G_ii·J_i²` by the
+            // `m_channel` column pass above (whose `m_channel = w·(s''·J² + s'·c)`
+            // carries the `s''·J²` self piece), and `diag(term B) = 2·d_k·c_w·G_ww·J_w`
+            // by the inline `local_logit_third` self channel (whose
+            // `s'·2J·∂_z J` piece is exactly that). So this pass must add ONLY the
+            // cross-row off-diagonal remainder; double-counting the diagonal here
+            // (the pre-fix `0.5·dd·J·uᵀGu + d·c·x_w` form, which is neither the
+            // full nor the off-diagonal value) desynced the θ-adjoint from the FD
+            // of `log|H|`. The exact `tr(H⁻¹ ∂W_k/∂ℓ_wk)` is
+            //   Γ_wk += dd_k·J_wk·(uᵀ G u − Σ_i G_ii·J_ik²)   (term A, off-diagonal)
+            //         + 2·d_k·c_wk·((G u)_w − G_ww·J_wk)        (term B, off-diagonal),
+            // with `uᵀGu = Σ_i J_ik·(Gu)_i`, `(Gu) = x_k = H⁻¹ u_k` from one solve,
+            // and `G_ii` the per-site selected-inverse diagonal.
             let total_t = cache.delta_t_len();
             let mut col_sites: Vec<Vec<(usize, usize, f64)>> = vec![Vec::new(); k_atoms];
             for &(row, atom, t_index, inv_diag) in &ibp_logit_sites {
@@ -9263,28 +9278,30 @@ impl SaeManifoldTerm {
                 // u_k as a full t-RHS: J at each active logit-k slot.
                 let mut rhs_t = Array1::<f64>::zeros(total_t);
                 let rhs_beta = Array1::<f64>::zeros(cache.k);
-                for &(row, t_index, _inv_diag) in &col_sites[atom] {
+                for &(row, t_index, _g) in &col_sites[atom] {
                     rhs_t[t_index] = channels.z_jac[row * k_atoms + atom];
                 }
                 let x_k = solver.solve(rhs_t.view(), rhs_beta.view()).map_err(|err| {
                     format!("logdet_theta_adjoint: IBP cross-row Woodbury solve: {err}")
                 })?;
-                // (JᵀH⁻¹J)_k = u_kᵀ x_k, and the `i=j` self quadratic
-                // Σ_i P_ii·J_ik² the diagonal channels already own.
+                // (JᵀH⁻¹J)_k = u_kᵀ x_k, and the diagonal `Σ_i G_ii·J_ik²` that the
+                // `m_channel` pass already counted (subtract it from term A so this
+                // pass holds only the off-diagonal `i ≠ j` remainder).
                 let mut jt_hinv_j = 0.0_f64;
-                let mut self_quad = 0.0_f64;
-                for &(row, t_index, inv_diag) in &col_sites[atom] {
-                    let j_ik = channels.z_jac[row * k_atoms + atom];
-                    jt_hinv_j += j_ik * x_k.t[t_index];
-                    self_quad += inv_diag * j_ik * j_ik;
+                let mut diag_jt_g_j = 0.0_f64;
+                for &(row, t_index, g_ii) in &col_sites[atom] {
+                    let j = channels.z_jac[row * k_atoms + atom];
+                    jt_hinv_j += j * x_k.t[t_index];
+                    diag_jt_g_j += g_ii * j * j;
                 }
-                for &(row, t_index, inv_diag) in &col_sites[atom] {
+                let off_diag_a = jt_hinv_j - diag_jt_g_j;
+                for &(row, t_index, g_ii) in &col_sites[atom] {
                     let j_wk = channels.z_jac[row * k_atoms + atom];
                     let c_wk = channels.logit_curvature[row * k_atoms + atom];
-                    // term A (off-diagonal dd) + term B (off-diagonal d·c), both with
-                    // their `i=j` self piece removed (owned by the diagonal channels).
-                    gamma_t[t_index] += dd_k * j_wk * (jt_hinv_j - self_quad)
-                        + 2.0 * d_k * c_wk * (x_k.t[t_index] - inv_diag * j_wk);
+                    // term A (off-diagonal) + term B (off-diagonal); the inline /
+                    // `m_channel` passes already added the diagonal parts.
+                    let off_diag_b = x_k.t[t_index] - g_ii * j_wk;
+                    gamma_t[t_index] += dd_k * j_wk * off_diag_a + 2.0 * d_k * c_wk * off_diag_b;
                 }
             }
         }
