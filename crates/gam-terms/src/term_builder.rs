@@ -3247,20 +3247,44 @@ pub fn build_smooth_basis(
                     "cc" | "cp" | "cyclic"
                 );
                 let (knotspec, boundary, axis_period) = if periodic_axes[axis] {
-                    let period_value = periods_opt[axis].ok_or_else(|| {
-                        format!(
-                            "tensor smooth axis {axis} is periodic but requires an explicit \
-                             period: pass period=<value> (scalar) or period=[..., <value>, ...]. \
-                             Deriving the period from the observed data range is sample-dependent \
-                             (off-by-ε seam), so it is not inferred."
-                        )
-                    })?;
-                    if !period_value.is_finite() || period_value <= 0.0 {
-                        return Err(format!(
-                            "tensor smooth axis {axis}: period must be a positive finite value, got {period_value}"
-                        ));
-                    }
-                    let domain_start = origins_opt[axis].unwrap_or(data_min);
+                    // A `cc`/`cp`/`cyclic` per-margin basis declares periodicity
+                    // without necessarily supplying a `period=`; in that case wrap
+                    // at the covariate's observed [min, max] span, mirroring the
+                    // 1-D cyclic fallback (`parse_periodic_domain_1d`) so a bare
+                    // `te(x, z, bs=c('cc','cc'))` wraps each margin on its own
+                    // range instead of hard-erroring (#1752). An axis made
+                    // periodic by an explicit `periodic=`/`boundary=` selector
+                    // (not a cyclic margin basis) still requires an explicit
+                    // `period=`: a data-derived period there is a sample-dependent
+                    // off-by-ε seam and is not inferred.
+                    let (domain_start, period_value) = match periods_opt[axis] {
+                        Some(period_value) => {
+                            if !period_value.is_finite() || period_value <= 0.0 {
+                                return Err(format!(
+                                    "tensor smooth axis {axis}: period must be a positive finite value, got {period_value}"
+                                ));
+                            }
+                            (origins_opt[axis].unwrap_or(data_min), period_value)
+                        }
+                        None if margin_is_cc => {
+                            let span = data_max - data_min;
+                            if !span.is_finite() || span <= 0.0 {
+                                return Err(format!(
+                                    "tensor smooth axis {axis}: cyclic margin requires a positive \
+                                     observed data range to derive its period, got [{data_min}, {data_max}]"
+                                ));
+                            }
+                            (origins_opt[axis].unwrap_or(data_min), span)
+                        }
+                        None => {
+                            return Err(format!(
+                                "tensor smooth axis {axis} is periodic but requires an explicit \
+                                 period: pass period=<value> (scalar) or period=[..., <value>, ...]. \
+                                 Deriving the period from the observed data range is sample-dependent \
+                                 (off-by-ε seam), so it is not inferred."
+                            ));
+                        }
+                    };
                     let domain_end = domain_start + period_value;
                     (
                         BSplineKnotSpec::PeriodicUniform {

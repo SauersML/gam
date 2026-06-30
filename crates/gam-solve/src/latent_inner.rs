@@ -497,7 +497,7 @@ mod tests {
         fn assemble(
             &mut self,
             arr: ArrayView1<'_, f64>,
-            _latent_coords: &LatentCoordValues,
+            _: &LatentCoordValues,
         ) -> Result<ArrowSchurSystem, String> {
             assert!(arr.iter().all(|v| !v.is_nan()));
             let mut sys = ArrowSchurSystem::new(self.n, self.d, self.k);
@@ -515,7 +515,7 @@ mod tests {
         fn objective(
             &mut self,
             arr: ArrayView1<'_, f64>,
-            _latent_coords: &LatentCoordValues,
+            _: &LatentCoordValues,
         ) -> Result<f64, String> {
             assert!(arr.iter().all(|v| !v.is_nan()));
             Ok(0.0)

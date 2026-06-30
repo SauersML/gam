@@ -94,21 +94,17 @@ fn iso_kappa_fd_variant_driver(
     for i in 0..n {
         let t = i as f64 / (n as f64 - 1.0);
         data[[i, 0]] = t;
-        let (eta, _t2) = if two_d {
+        let eta = if two_d {
             // A low-discrepancy second axis (golden-ratio fill) keeps the 2-D
             // cloud well-spread, and a genuinely 2-D truth exercises both the
             // signal and the cross-axis curvature blocks.
             let t2 = (i as f64 * 0.618_033_988_749_894_9).fract();
             data[[i, 1]] = t2;
-            let eta = 1.4 * (2.0 * std::f64::consts::PI * t).sin()
+            1.4 * (2.0 * std::f64::consts::PI * t).sin()
                 + 0.9 * (2.0 * std::f64::consts::PI * t2).cos()
-                + 0.5 * (t - 0.5);
-            (eta, t2)
+                + 0.5 * (t - 0.5)
         } else {
-            (
-                1.4 * (2.0 * std::f64::consts::PI * t).sin() + 0.5 * (t - 0.5),
-                0.0,
-            )
+            1.4 * (2.0 * std::f64::consts::PI * t).sin() + 0.5 * (t - 0.5)
         };
         let raw = eta + 0.7 * (3.7 * (i as f64) + 1.0).sin();
         y[i] = if family.is_gaussian_identity() {

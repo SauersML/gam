@@ -195,11 +195,6 @@ fn matern_2d_iso_kappa_outer_gradient_matches_fd() {
     }
 
     let lines = CAPTURE.lock().unwrap().clone();
-    // TEMP-1122-DUMP: persist all captured audit lines so the HSWEEP atom
-    // decomposition survives build.sh's stderr filter.
-    {
-        std::fs::write("/tmp/iso_capture.txt", lines.join("\n")).ok();
-    }
     let gate: Vec<&String> = lines
         .iter()
         .filter(|l| l.contains("gate eligible="))
