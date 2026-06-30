@@ -61,13 +61,23 @@ const HEADER: &str = r#"// AUTO-GENERATED CUDA C++ source for the de-nested cubi
 // butterflies. For affine and affine-tail cells lane 0 runs the closed-form
 // q'-recurrence and broadcasts via __shfl_sync.
 
-#include <stdint.h>
+// We deliberately do NOT `#include <stdint.h>`. NVRTC compiles with no usable
+// C library: even when invoked with `--include-path=/usr/include` (the
+// arch-aware compile path) the system <stdint.h> transitively pulls in
+// <gnu/stubs.h> → <gnu/stubs-32.h>, which is absent on boxes without 32-bit dev
+// libs, aborting the JIT with "cannot open source file gnu/stubs-32.h". The
+// kernel only needs two fixed-width integer types, and the CUDA device ABI
+// fixes their widths (`unsigned char` = 8, `unsigned int` = 32), so we typedef
+// them inline — self-contained, no host headers, robust across boxes. This
+// mirrors the inline `CUDART_INF` below (same "NVRTC has no headers" reason).
+typedef unsigned char  uint8_t;
+typedef unsigned int   uint32_t;
 
 // CUDART_INF normally comes from the CUDA math-constants header, but that
-// header is not on NVRTC's default search path (NVRTC is invoked with no -I),
-// so pulling it in aborts the JIT compile with "could not open source file".
-// Define the one symbol we use inline instead, matching the CUDA header's own
-// value. __longlong_as_double is an always-available NVRTC builtin (no header).
+// header is not on NVRTC's default search path, so pulling it in aborts the JIT
+// compile with "could not open source file". Define the one symbol we use
+// inline instead, matching the CUDA header's own value. __longlong_as_double is
+// an always-available NVRTC builtin (no header).
 #define CUDART_INF (__longlong_as_double(0x7ff0000000000000ULL))
 
 #define STATUS_OK              0

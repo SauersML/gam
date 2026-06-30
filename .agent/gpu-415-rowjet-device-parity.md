@@ -80,3 +80,25 @@ whose per-row `M=H_p·J` contraction reassociates + uses FMA → ~2e-16 drift.
 - Corrected two "bit-for-bit / to the last ULP" comments that the V100 falsifies
   (FMA/reassociation in the device contraction).
 - Verified PASS on V100 (failed before, passes after).
+
+## FINDING 3 (2026-06-30) — cubic_cell device kernel NVRTC-broke on every GPU box
+`gpu_kernels::cubic_cell::device::tests::cubic_cell_device_residency_matches_cpu_all_branches`
+failed on the V100 with:
+  "cubic_cell NVRTC compile (degree=9) failed: ... could not open source file stdint.h"
+ROOT CAUSE (two layers):
+1. cubic_cell compiled via the BARE `cudarc::nvrtc::compile_ptx` (no -I, no arch),
+   while the kernel does `#include <stdint.h>`. NVRTC has no include search path
+   → catastrophic compile error → device path silently fell back to CPU on EVERY
+   GPU box (the #1551 silent-fallback genus, in cubic_cell).
+   FIX: route through `gam_gpu::device_cache::compile_ptx_arch` (the shared
+   arch-aware compile the repo standardized on — sets -I AND --gpu-architecture).
+2. Even with -I, system <stdint.h> drags in gnu/stubs-32.h (absent w/o 32-bit
+   dev libs) → still fails. The kernel needs only uint8_t/uint32_t and the CUDA
+   device ABI fixes their widths, so typedef them inline (mirrors the existing
+   inline CUDART_INF pattern). No host headers.
+3. After the kernel RUNS: parity drift at degree 21 (Affine branch) up to
+   1.5e-6 relative — the forward moment recurrence M_{n+1}=(n·M_{n-1}−d0·M_n−B_n)/d1
+   is ill-conditioned, so CPU-serial vs GPU-FMA round-off compounds ~×10³ per +6
+   orders. NOT a bug (NonAffineFinite GL branch agrees to ≤2e-15). Replaced the
+   flat rel≤1e-11 gate with a per-order band rel_tol(k)=1e-12·10^(k/3).
+Verified PASS on Tesla V100 sm_70 (compiles, all 3 branches run, parity holds).
