@@ -3833,6 +3833,7 @@ impl<'a> RemlState<'a> {
             last_pirls_lm_lambda: Arc::new(AtomicU64::new(0)),
             frozen_negbin_theta: Arc::new(AtomicU64::new(0)),
             frozen_tweedie_phi: Arc::new(AtomicU64::new(0)),
+            frozen_gamma_shape: Arc::new(AtomicU64::new(0)),
             last_ift_prediction_residual: Arc::new(AtomicU64::new(IFT_RESIDUAL_NO_SIGNAL_BITS)),
             last_pirls_accept_rho: Arc::new(AtomicU64::new(IFT_RESIDUAL_NO_SIGNAL_BITS)),
             ift_cached_factor: RwLock::new(None),
@@ -3935,6 +3936,10 @@ impl<'a> RemlState<'a> {
         // seed fit on the PREVIOUS design; re-freeze it from the new surface's
         // own seed. `0` = "not yet frozen".
         self.frozen_tweedie_phi.store(0, Ordering::Relaxed);
+        // The λ-search frozen Gamma shape (#1074) is likewise computed from the
+        // seed fit on the PREVIOUS design; re-freeze it from the new surface's
+        // own seed. `0` = "not yet frozen".
+        self.frozen_gamma_shape.store(0, Ordering::Relaxed);
         Ok(())
     }
 
@@ -6374,6 +6379,34 @@ impl<'a> RemlState<'a> {
                     }
                 }
             }
+            // Gamma λ-search shape freeze (#1074). Same drift mechanism as the NB
+            // θ and Tweedie φ freezes above: with the shape `k` estimated, the
+            // inner solver re-derives it from each outer iterate's warm-start η,
+            // so `k` — and through it BOTH the Gamma curvature `H = k·XᵀX + λS`
+            // and the data-fit `−ℓ = k·½D` (the `k`-saturated normalizer is
+            // dropped, #359) — jumps with ρ. The realized REML cost then develops
+            // deterministic spikes (a flat warm-start η at a just-rejected
+            // over-smoothed trial gives a small `k`, the fitted-surface η at the
+            // neighbor a ~2× larger one), the analytic outer gradient (which
+            // holds `k` fixed) can never match the cost's `k(ρ)` motion, the
+            // projected gradient floors well above tolerance, and the ARC descent
+            // stalls and rails λ to the over-smoothed corner (the #1074 te/Gamma
+            // tensor under-recovery). Pin every λ-search inner solve to the first
+            // converged solve's MLE `k` so `F(ρ) = REML(ρ, k_frozen)` is
+            // stationary in ρ; `k` is still refreshed at the single final
+            // reported fit. No effect on non-Gamma or user-fixed-shape specs.
+            if pirls_config.likelihood.scale.gamma_shape_is_estimated() {
+                let frozen_bits = self.frozen_gamma_shape.load(Ordering::Relaxed);
+                if frozen_bits != 0 {
+                    let frozen_shape = f64::from_bits(frozen_bits);
+                    if frozen_shape.is_finite() && frozen_shape > 0.0 {
+                        pirls_config.likelihood = pirls_config
+                            .likelihood
+                            .clone()
+                            .with_gamma_shape_frozen_for_search(frozen_shape);
+                    }
+                }
+            }
             // Levenberg-Marquardt damping warm-start. Read the cached
             // λ from the previous successful PIRLS solve at this
             // surface (0 = no hint), and seed the inner solver. The
@@ -6576,6 +6609,32 @@ impl<'a> RemlState<'a> {
             log::info!(
                 "[OUTER] tweedie λ-search φ frozen at {phi:.6e} (#1477); \
                  outer LAML criterion now stationary in ρ"
+            );
+        }
+        // Capture the data-driven Gamma shape `k = 1/φ` from the first converged
+        // non-screening λ-search solve and freeze it for the rest of the search
+        // (#1074), exactly as for the NB θ and Tweedie φ above. The first solve
+        // estimated `k` from the seed η via the converged-η Gamma-shape MLE (this
+        // branch only runs when no frozen value exists yet), so the captured
+        // value is the seed-fit `k` the estimated path would have used — we
+        // simply stop letting it drift with each warm-start η (which makes both
+        // the curvature `H = k·XᵀX + λS` and the data-fit `k·½D` jump with ρ and
+        // rails λ to the over-smoothed corner) on subsequent outer evaluations.
+        if !in_screening
+            && pirls_result.likelihood.scale.gamma_shape_is_estimated()
+            && self.frozen_gamma_shape.load(Ordering::Relaxed) == 0
+            && matches!(
+                pirls_result.status,
+                pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum
+            )
+            && let Some(shape) = pirls_result.likelihood.gamma_shape()
+            && shape.is_finite()
+            && shape > 0.0
+        {
+            self.frozen_gamma_shape.store(shape.to_bits(), Ordering::Relaxed);
+            log::info!(
+                "[OUTER] gamma λ-search shape frozen at {shape:.6e} (#1074); \
+                 outer REML criterion now stationary in ρ"
             );
         }
         // Under seed screening the inner solver is intentionally given a tiny
@@ -6887,6 +6946,22 @@ impl<'a> RemlState<'a> {
                         .likelihood
                         .clone()
                         .with_tweedie_phi_frozen_for_search(frozen_phi);
+                }
+            }
+        }
+        // Pin the same λ-search-frozen Gamma shape the outer loop converged under
+        // (#1074), so the rho-uncertainty sigma-point criterion is evaluated on
+        // the identical stationary surface F(ρ) = REML(ρ, k_frozen) rather than
+        // re-estimating `k` at each off-trajectory σ-point.
+        if pirls_config.likelihood.scale.gamma_shape_is_estimated() {
+            let frozen_bits = self.frozen_gamma_shape.load(Ordering::Relaxed);
+            if frozen_bits != 0 {
+                let frozen_shape = f64::from_bits(frozen_bits);
+                if frozen_shape.is_finite() && frozen_shape > 0.0 {
+                    pirls_config.likelihood = pirls_config
+                        .likelihood
+                        .clone()
+                        .with_gamma_shape_frozen_for_search(frozen_shape);
                 }
             }
         }

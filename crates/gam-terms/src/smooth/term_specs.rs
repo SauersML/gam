@@ -7111,37 +7111,97 @@ pub fn build_single_local_smooth_term(
             // space. With `L-1` free deviation blocks and the reference level
             // `d_L = -Σ_{k<L} d_k`, the marginal penalty summed over ALL `L`
             // levels, `Σ_{k=1}^{L} d_kᵀ S d_k`, expands to the `(I + 11ᵀ) ⊗ S`
-            // contrast form (factor 2 on the diagonal blocks, 1 off-diagonal) —
-            // the exact penalty the zero-sum reparameterization induces.
-            let stz_contrast_penalty = |s_inner: &Array2<f64>| -> Array2<f64> {
+            // contrast form (factor 2 on the diagonal blocks, 1 off-diagonal).
+            //
+            // PER-GROUP SMOOTHING PARAMETERS (#1074). mgcv's `bs="sz"` does NOT
+            // pool that sum under one λ: `smooth.construct.sz` emits ONE penalty
+            // matrix per factor level (here 6 separate `S`s, each with its own
+            // smoothing parameter), so REML can shrink a low-amplitude group's
+            // deviation curve hard while leaving a high-amplitude group nearly
+            // unpenalized. A single shared wiggliness λ (the old construction)
+            // forces every group to the SAME curvature budget, so a group whose
+            // true curve is flat drags curvature into the noise of the busy
+            // groups and vice-versa — systematic truth-recovery loss even when
+            // the pooled total edf matches mgcv's (the observed `sz` 1.23× gap).
+            //
+            // We mirror mgcv exactly by splitting the per-marginal penalty
+            // `Σ_{k=1}^{L} d_kᵀ S d_k` back into its `L` independent
+            // rank-controlled summands BEFORE mapping to the contrast space, each
+            // carrying its own λ:
+            //   * level k < L (free block):  `d_kᵀ S d_k` → block-diagonal
+            //     `(e_k e_kᵀ) ⊗ S`  (only the (k,k) block is `S`).
+            //   * level L (reference):       `d_Lᵀ S d_L = (Σ_{j<L} d_j)ᵀ S (·)`
+            //     → the fully-coupled `(11ᵀ) ⊗ S` block.
+            // Summed at equal λ these `L` blocks recover the old `(I + 11ᵀ) ⊗ S`
+            // exactly (`Σ_k e_k e_kᵀ = I`), so this is a strict generalization:
+            // the pooled fit is still reachable, REML only GAINS the freedom to
+            // spend curvature per group. The zero-sum reparameterization (hence
+            // the `sz` vs `fs` identifiability) is untouched.
+            //
+            // `which_level ∈ 0..=l_minus_one`: `< l_minus_one` selects the single
+            // free deviation block; `== l_minus_one` selects the reference-level
+            // coupling block.
+            let stz_per_group_penalty = |s_inner: &Array2<f64>, which_level: usize| -> Array2<f64> {
                 let mut s_big = Array2::<f64>::zeros((p * l_minus_one, p * l_minus_one));
-                for a in 0..l_minus_one {
-                    for b in 0..l_minus_one {
-                        let factor = if a == b { 2.0 } else { 1.0 };
-                        let mut block = s_big.slice_mut(s![a * p..(a + 1) * p, b * p..(b + 1) * p]);
-                        block.assign(&s_inner.mapv(|v| v * factor));
+                if which_level < l_minus_one {
+                    // (e_k e_kᵀ) ⊗ S: a single diagonal block.
+                    let k = which_level;
+                    let mut block = s_big.slice_mut(s![k * p..(k + 1) * p, k * p..(k + 1) * p]);
+                    block.assign(s_inner);
+                } else {
+                    // (11ᵀ) ⊗ S: every block (diagonal and off-diagonal) is S.
+                    for a in 0..l_minus_one {
+                        for b in 0..l_minus_one {
+                            let mut block =
+                                s_big.slice_mut(s![a * p..(a + 1) * p, b * p..(b + 1) * p]);
+                            block.assign(s_inner);
+                        }
                     }
                 }
                 s_big
             };
             // One nullspace-dim entry per emitted penalty (must stay parallel to
-            // `penalties`); the wiggliness blocks inherit the marginal nullity
-            // scaled by `l_minus_one`, the null ridges record their own nullity.
+            // `penalties`). Each per-group wiggliness block carries the marginal's
+            // OWN nullity (a rank-`p` block touching a single level for the free
+            // blocks; the coupling block is rank-`p` over the diagonal sum), and
+            // the null ridges below record their own nullity.
             let mut nullspaces = Vec::<usize>::with_capacity(penalties.capacity());
             for (penalty_pos, s_inner) in inner_built.penalties.iter().enumerate() {
-                let (s_big, factor_smooth_scale) =
-                    normalize_penalty_in_constrained_space(&stz_contrast_penalty(s_inner));
                 let info_idx = active_penalty_indices[penalty_pos];
-                inner_built.penaltyinfo[info_idx].normalization_scale *= factor_smooth_scale;
-                penalties.push(s_big);
-                nullspaces.push(
-                    inner_built
-                        .nullspaces
-                        .get(penalty_pos)
-                        .copied()
-                        .unwrap_or(0)
-                        .saturating_mul(l_minus_one),
-                );
+                let base_info = inner_built.penaltyinfo[info_idx].clone();
+                let marginal_nullity = inner_built.nullspaces.get(penalty_pos).copied().unwrap_or(0);
+                // Emit `L` independent per-level blocks for this marginal penalty.
+                for which_level in 0..=l_minus_one {
+                    let raw = stz_per_group_penalty(s_inner, which_level);
+                    let (s_big, group_scale) = normalize_penalty_in_constrained_space(&raw);
+                    let block = crate::basis::analyze_penalty_block_with_op(&s_big, None)?;
+                    if block.rank == 0 {
+                        continue;
+                    }
+                    if which_level == 0 {
+                        // Reuse the marginal's own info slot for the first block so
+                        // the existing normalization bookkeeping stays attached.
+                        inner_built.penaltyinfo[info_idx].normalization_scale *= group_scale;
+                        inner_built.penaltyinfo[info_idx].original_index = penalties.len();
+                        inner_built.penaltyinfo[info_idx].effective_rank = block.rank;
+                        inner_built.penaltyinfo[info_idx].nullspace_dim_hint = block.nullity;
+                    } else {
+                        let mut info = base_info.clone();
+                        info.original_index = penalties.len();
+                        info.normalization_scale = base_info.normalization_scale * group_scale;
+                        info.effective_rank = block.rank;
+                        info.nullspace_dim_hint = block.nullity;
+                        info.kronecker_factors = None;
+                        inner_built.penaltyinfo.push(info);
+                    }
+                    penalties.push(block.sym_penalty);
+                    // The coupling block (which_level == l_minus_one) spans the
+                    // marginal range on the diagonal-sum direction; the free
+                    // blocks touch one level. Both leave the marginal null space
+                    // unpenalized, recorded here so the null ridges below complete
+                    // the double penalty.
+                    nullspaces.push(marginal_nullity);
+                }
             }
 
             // Null-space ridge, mirroring the `bs="fs"` double-penalty
@@ -7172,8 +7232,24 @@ pub fn build_single_local_smooth_term(
                             p_k[[a, b]] = zk[a] * zk[b];
                         }
                     }
+                    // Null ridges stay POOLED (the `(I + 11ᵀ) ⊗ z_k z_kᵀ` form):
+                    // they govern the per-group intercept/slope shrinkage, which
+                    // mgcv pools under one variance even for `sz`; only the
+                    // curvature (wiggliness) penalty is split per group above.
+                    let stz_pooled_null = {
+                        let mut s_big = Array2::<f64>::zeros((p * l_minus_one, p * l_minus_one));
+                        for a in 0..l_minus_one {
+                            for b in 0..l_minus_one {
+                                let factor = if a == b { 2.0 } else { 1.0 };
+                                let mut block =
+                                    s_big.slice_mut(s![a * p..(a + 1) * p, b * p..(b + 1) * p]);
+                                block.assign(&p_k.mapv(|v| v * factor));
+                            }
+                        }
+                        s_big
+                    };
                     let (s_null, null_scale) =
-                        normalize_penalty_in_constrained_space(&stz_contrast_penalty(&p_k));
+                        normalize_penalty_in_constrained_space(&stz_pooled_null);
                     let null_block = crate::basis::analyze_penalty_block_with_op(&s_null, None)?;
                     if null_block.rank > 0 {
                         let original_index = penalties.len();
@@ -7491,6 +7567,26 @@ pub fn build_single_local_smooth_term(
             };
             let mut spec_local = spec.clone();
             spec_local.length_scale = length_scale_eff;
+            // The Duchon input axis is standardized in place above (`x → x/σ`,
+            // scale-only, no centering). A 1-D cyclic boundary `[start, end)`
+            // declared in ORIGINAL covariate units must move into that same
+            // standardized frame, or the modular wrap in
+            // `build_cyclic_duchon_basis_1dwithworkspace` folds the standardized
+            // coordinate against an original-unit period: the seam never closes
+            // and the basis silently degrades to non-periodic (#1074:
+            // `duchon(x, periodic=true)` predictions diverged across the wrap,
+            // f(0) ≠ f(2π)). Rescale by the same 1/σ applied to the data so
+            // training and predict share one periodic geometry.
+            if let (Some(s), crate::basis::OneDimensionalBoundary::Cyclic { start, end }) =
+                (scales.as_ref(), spec_local.boundary.clone())
+                && s.len() == 1
+                && s[0] > 0.0
+            {
+                spec_local.boundary = crate::basis::OneDimensionalBoundary::Cyclic {
+                    start: start / s[0],
+                    end: end / s[0],
+                };
+            }
             if matches!(
                 spec_local.identifiability,
                 SpatialIdentifiability::OrthogonalToParametric

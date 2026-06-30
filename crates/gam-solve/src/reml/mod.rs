@@ -5214,6 +5214,24 @@ pub(crate) struct RemlState<'a> {
     /// Pearson-refreshes `phi` at the converged η. Reset on `reset_surface`.
     pub(crate) frozen_tweedie_phi: Arc<AtomicU64>,
 
+    /// Gamma shape `k = 1/φ` frozen for the smoothing-parameter (λ) search
+    /// (#1074), bit-packed `f64` (`f64::to_bits`). `0` (the default) signals
+    /// "not yet frozen". On the first non-screening λ-search inner solve of an
+    /// estimated-shape Gamma fit, the seed's converged-η MLE `k̂` is captured
+    /// once and stored here; every subsequent λ-search evaluation pins the inner
+    /// solve to this value via
+    /// `GlmLikelihoodSpec::with_gamma_shape_frozen_for_search`, so the REML
+    /// criterion `F(ρ) = REML(ρ, k_frozen)` is a stationary function of ρ. With
+    /// `k` estimated the inner solver re-derives it from each warm-start η, and
+    /// because the Gamma working weight is `W = prior·k` and the
+    /// omitting-constants log-likelihood is `−k·½D`, a `k` swinging with η makes
+    /// BOTH the curvature `H = k·XᵀX + λS` and the data-fit `k·½D` jump with ρ —
+    /// the criterion grows deterministic spikes that floor the projected
+    /// gradient and rail `λ` to the over-smoothed corner (the #1074 te/Gamma
+    /// tensor under-recovery). The single final reported fit still ML-refreshes
+    /// `k` at the converged η. Reset on `reset_surface`.
+    pub(crate) frozen_gamma_shape: Arc<AtomicU64>,
+
     /// Last observed IFT-prediction residual (`‖β_converged − β_predicted‖
     /// / ‖β_converged‖`) from the most recent non-screening solve where
     /// the predictor was actually consumed. Bit-packed `f64` (low 64

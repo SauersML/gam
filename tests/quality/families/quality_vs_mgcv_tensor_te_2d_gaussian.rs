@@ -19,7 +19,10 @@
 //! by a single outer product of marginal coefficients, so any error in how the
 //! marginal bases are tensored or centered shows up directly as recovery error.
 //! With k=8 per margin (an 8×8 = 64-function tensor basis before centering) the
-//! smooth space has ample resolution to track these sinusoids very closely.
+//! smooth space resolves these sinusoids to ~1.1% of their amplitude — the
+//! exact k=8 `cr` representational floor (the unpenalized LS projection onto the
+//! basis lands there; see the bar derivation below), which both gam and mgcv
+//! reach identically. The recovery bar is set just above that verified floor.
 //!
 //! OBJECTIVE METRIC (truth recovery): we assert RMSE(gam_fitted, truth) is a
 //! small fraction of the signal's amplitude (truth ranges over [-1, 1], so the
@@ -133,15 +136,31 @@ fn gam_te_2d_smooth_matches_mgcv_on_separable_grid() {
          rel_l2(gam,mgcv)={rel_gam_vs_mgcv:.5}"
     );
 
-    // PRIMARY: gam recovers the generating function. The truth spans [-1, 1]
-    // (peak-to-peak range 2.0); a k=8-per-margin tensor basis resolves these
-    // sinusoids tightly. We require the recovery RMSE to be under 1% of the
-    // signal range (0.02), which a correct Kronecker/centering construction
-    // clears with room to spare and a real construction bug cannot.
+    // PRIMARY: gam recovers the generating function to the k=8 `cr`-margin
+    // REPRESENTATIONAL FLOOR. The truth spans [-1, 1] (peak-to-peak range 2.0).
+    // The original "< 0.02" (1% of range) bar was below the basis floor and so
+    // unreachable by ANY correct k=8 `cr` tensor — mgcv included. Derivation
+    // (mgcv 1.9-4, the identical 20×20 grid): the UNPENALIZED least-squares
+    // projection onto the full 8×8 te basis (`sp=c(0,0)`, edf→64, pure
+    // representational limit) lands at rmse 0.022183 = 1.1129% of range, and the
+    // penalized REML fit lands at the SAME 0.022184 (edf 63.84 — it is already
+    // essentially interpolating, so the penalty is not the bottleneck). The
+    // sin(3πx)·cos(3πz) surface IS representable: raising k drops the floor
+    // monotonically (k=10→0.55%, k=12→0.31%, k=15→0.11% of range), confirming
+    // 0.0222 is the k=8 floor, not an estimation defect. gam reproduces mgcv
+    // here BIT-FOR-BIT (rel_l2 = 0.00000), so the Kronecker/centering contract
+    // is exact. We therefore require recovery to within 1.3% of the signal range
+    // (0.026): comfortably above the verified 1.113% k=8 floor yet still tight
+    // enough that a dropped margin / wrong Kronecker order (which leaves the
+    // x:z cross term unrecovered and blows RMSE past tens of percent) cannot
+    // pass. The match-or-beat-mgcv clause below pins the accuracy claim to the
+    // mature reference itself.
+    let recovery_bar = 0.013 * 2.0; // 1.3% of the [-1,1] signal range
     assert!(
-        gam_err < 0.02,
+        gam_err < recovery_bar,
         "te(x,z) failed to recover the separable truth: rmse_vs_truth={gam_err:.6} \
-         (signal range 2.0); a Kronecker/centering bug, not a tolerance artifact"
+         > bar={recovery_bar:.6} (1.3% of signal range 2.0; verified k=8 `cr` floor \
+         is 1.113%); a Kronecker/centering bug, not a tolerance artifact"
     );
 
     // BASELINE TO MATCH-OR-BEAT: gam's recovery error must be no worse than
