@@ -2313,7 +2313,7 @@ mod tests {
             // allocation (those are paid once per process, not per inner
             // iteration). The production inner loop pays them once and then runs
             // MANY solves, which is exactly the regime this assertion guards.
-            let _ = frame
+            frame
                 .solve_gradient(&gradients[0].0, &gradients[0].1)
                 .expect("resident warm-up solve");
             {
@@ -2327,7 +2327,7 @@ mod tests {
                     *gb = gradients[0].1[j];
                 }
                 sys.refresh_row_hessian_fingerprint();
-                let _ = crate::gpu_kernels::arrow_schur::solve_arrow_newton_step(&sys, 0.0, 0.0)
+                crate::gpu_kernels::arrow_schur::solve_arrow_newton_step(&sys, 0.0, 0.0)
                     .expect("reupload warm-up solve");
             }
 

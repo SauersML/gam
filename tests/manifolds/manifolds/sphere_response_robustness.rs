@@ -131,5 +131,5 @@ fn sphere_duplicate_points_different_y_does_not_crash() {
     }
     let data = encode_recordswith_inferred_schema(headers, rows).expect("encode");
     eprintln!("[sphere-dup]");
-    let (_mean, _mn, _mx) = fit_predict("y ~ sphere(lat, lon, k=20)", data);
+    fit_predict("y ~ sphere(lat, lon, k=20)", data);
 }

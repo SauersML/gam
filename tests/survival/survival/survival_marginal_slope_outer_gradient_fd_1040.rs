@@ -220,7 +220,7 @@ fn run_basis(basis_term: &str) {
     };
 
     eprintln!("[FD-DIAG] starting survival-MS fit: n={N} formula={formula:?}");
-    let _ = fit_from_formula(&formula, &data, &config);
+    fit_from_formula(&formula, &data, &config).ok();
 
     let lines = CAPTURE.lock().unwrap().clone();
     let verdict: Vec<&String> = lines.iter().filter(|l| l.contains("VERDICT=")).collect();

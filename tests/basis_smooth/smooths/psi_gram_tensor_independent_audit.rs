@@ -269,14 +269,14 @@ fn per_trial_accessors_are_n_independent() {
             let psi = lo + (hi - lo) * (i as f64) / (m as f64 - 1.0);
             let g = tensor.gram_at(psi);
             g_shape = (g.nrows(), g.ncols());
-            let _r = tensor.rhs_at(psi);
-            let _dg = tensor.dgram_dpsi(psi);
-            let _dr = tensor.drhs_dpsi(psi);
-            let _d2g = tensor.d2gram_dpsi2(psi);
-            let _d2r = tensor.d2rhs_dpsi2(psi);
-            let _cache = tensor.gaussian_fixed_cache_at(psi);
+            tensor.rhs_at(psi);
+            tensor.dgram_dpsi(psi);
+            tensor.drhs_dpsi(psi);
+            tensor.d2gram_dpsi2(psi);
+            tensor.d2rhs_dpsi2(psi);
+            tensor.gaussian_fixed_cache_at(psi);
             // Witness assembly is also n-free k-space work.
-            let _ = tensor.reduced_basis_equal(lo, psi);
+            tensor.reduced_basis_equal(lo, psi);
         }
         // Per-trial eval calls AFTER build.
         let per_trial_calls = calls.get() - after_build;
@@ -352,16 +352,6 @@ fn witness_accept_implies_bit_identity_and_refuses_subspace_change() {
     let (psi_lo, psi_hi) = (-1.6_f64, -0.8_f64);
     let tensor = PsiGramTensor::build(design.clone(), w.view(), z.view(), psi_lo, psi_hi)
         .expect("smooth ε(ψ) design certifies (analytic, no kink)");
-
-    let rank_at = |psi: f64| -> usize {
-        // PSI_GRAM_SKIP_RANK_RTOL is private; re-derive the rank via the witness's
-        // own acceptance against a known full-rank reference instead. Simpler:
-        // probe via reduced_basis_equal transitions. We instead detect the rank
-        // boundary by scanning where same-side acceptance breaks.
-        let _ = psi;
-        0
-    };
-    let _ = rank_at;
 
     // Locate a straddling pair by bisection on witness acceptance from the low end.
     let psi_low = psi_lo + 0.05;

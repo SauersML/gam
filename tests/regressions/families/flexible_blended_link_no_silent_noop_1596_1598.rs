@@ -147,7 +147,6 @@ fn blended_mixture_link_threads_spec_not_wiring_abort_1598() {
             // Probit's CDF can saturate; just confirm we reached a real solver
             // diagnostic (anything other than the wiring guard is acceptable as
             // a clear, actionable error per the issue's contract).
-            let _ = msg;
         }
     }
 }

@@ -1670,7 +1670,7 @@ mod tests {
         }
 
         let t_gpu_start = std::time::Instant::now();
-        let _gpu = draw_batch(PolyaGammaBatchInput {
+        draw_batch(PolyaGammaBatchInput {
             shapes: shapes.view(),
             tilts: tilts.view(),
             seed,
@@ -1679,7 +1679,7 @@ mod tests {
         let dt_gpu = t_gpu_start.elapsed().as_secs_f64();
 
         let t_cpu_start = std::time::Instant::now();
-        let _cpu = draw_batch_cpu(&PolyaGammaBatchInput {
+        draw_batch_cpu(&PolyaGammaBatchInput {
             shapes: shapes.view(),
             tilts: tilts.view(),
             seed,
@@ -1730,7 +1730,7 @@ mod tests {
         .expect("warm");
 
         let t_gpu = std::time::Instant::now();
-        let _g = draw_batch(PolyaGammaBatchInput {
+        draw_batch(PolyaGammaBatchInput {
             shapes: shapes.view(),
             tilts: tilts.view(),
             seed,
@@ -1739,7 +1739,7 @@ mod tests {
         let dt_gpu = t_gpu.elapsed().as_secs_f64();
 
         let t_cpu = std::time::Instant::now();
-        let _c = draw_batch_cpu(&PolyaGammaBatchInput {
+        draw_batch_cpu(&PolyaGammaBatchInput {
             shapes: shapes.view(),
             tilts: tilts.view(),
             seed,

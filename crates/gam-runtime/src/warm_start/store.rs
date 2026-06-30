@@ -1213,7 +1213,7 @@ mod tests {
     fn roundtrip_save_then_lookup() {
         let (_d, store) = temp_store();
         let key = key_for("roundtrip");
-        let _id = store
+        store
             .save(
                 &key,
                 b"hello-warm",

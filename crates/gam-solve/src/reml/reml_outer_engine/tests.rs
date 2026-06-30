@@ -921,16 +921,16 @@ pub(crate) fn projected_factor_cache_lru_evicts_oldest_under_budget() {
 
     let make = |seed: u64| -> Array2<f64> { Array2::from_elem((4, 8), seed as f64) };
 
-    let _a = cache.get_or_insert_with(make_factor_key(1), || make(1));
-    let _b = cache.get_or_insert_with(make_factor_key(2), || make(2));
+    cache.get_or_insert_with(make_factor_key(1), || make(1));
+    cache.get_or_insert_with(make_factor_key(2), || make(2));
     assert_eq!(cache.len(), 2);
     assert_eq!(cache.total_bytes(), entry_bytes * 2);
 
     // Bump `a`'s recency so it survives the next eviction.
-    let _a_again = cache.get_or_insert_with(make_factor_key(1), || make(1));
+    cache.get_or_insert_with(make_factor_key(1), || make(1));
 
     // Inserting `c` must evict `b` (oldest), not `a` (most recent).
-    let _c = cache.get_or_insert_with(make_factor_key(3), || make(3));
+    cache.get_or_insert_with(make_factor_key(3), || make(3));
     assert_eq!(cache.len(), 2);
     assert_eq!(cache.total_bytes(), entry_bytes * 2);
 

@@ -351,7 +351,7 @@ fn alo_eta_tilde_matches_exact_loo_binomial_logit() {
             "recovered frozen-λ geometry must satisfy the full-data stationarity \
              condition Σ(μ̂−y)x + Sβ̂ ≈ 0: ‖grad‖={g0:.3e}"
         );
-        let _ = eta_recon;
+        assert_eq!(eta_recon.len(), n);
     }
 
     // Full-data converged linear predictor η̂_i = o_i + x_iᵀ β̂ (the fixed-point

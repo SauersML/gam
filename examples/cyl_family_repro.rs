@@ -384,7 +384,7 @@ fn main() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let _ = fit_and_predict_eta(
+    fit_and_predict_eta(
         "y ~ te(theta, h, periodic=[0], period=[6.283185307179586, None], k=4)",
         &data,
         &gcfg,

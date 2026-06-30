@@ -245,7 +245,10 @@ fn producer_decoder_covariance_matches_dense_reference() {
             diag0 > 0.0,
             "covariance diagonal must be positive; got {diag0}"
         );
-        let _ = &beta_ref.slice(s![.., d]);
+        assert!(
+            beta_ref.slice(s![.., d]).iter().all(|v| v.is_finite()),
+            "reference coefficient column {d} must be finite"
+        );
     }
 }
 

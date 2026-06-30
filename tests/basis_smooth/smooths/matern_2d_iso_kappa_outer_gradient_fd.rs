@@ -169,7 +169,7 @@ fn aniso_signal_dataset(n: usize) -> (Array2<f64>, Array1<f64>) {
 /// penalty-quad — with the default double-penalty (nullspace shrinkage) active.
 #[test]
 fn matern_2d_iso_kappa_outer_gradient_matches_fd() {
-    let _guard = TEST_LOG_LOCK.lock().unwrap();
+    let guard = TEST_LOG_LOCK.lock().unwrap();
     init();
     if let Ok(mut g) = CAPTURE.lock() {
         g.clear();
@@ -260,6 +260,7 @@ fn matern_2d_iso_kappa_outer_gradient_matches_fd() {
             gap / scale
         );
     }
+    drop(guard);
 }
 
 /// #1259: at the symmetric anisotropic Matérn init, the FULL outer REML
@@ -269,7 +270,7 @@ fn matern_2d_iso_kappa_outer_gradient_matches_fd() {
 /// perturbations, so the optimizer has a real descent direction at theta0.
 #[test]
 fn aniso_matern_theta0_eta_contrast_gradient_is_fd_visible() {
-    let _guard = TEST_LOG_LOCK.lock().unwrap();
+    let guard = TEST_LOG_LOCK.lock().unwrap();
     init();
     if let Ok(mut g) = CAPTURE.lock() {
         g.clear();
@@ -419,6 +420,7 @@ fn aniso_matern_theta0_eta_contrast_gradient_is_fd_visible() {
         "theta0 analytic eta contrast must point toward increasing the signal-axis eta; \
          got g_signal-g_noise={analytic_contrast:.6e}"
     );
+    drop(guard);
 }
 
 /// #1270 regression: a single `matern(x1, x2)` 2-D smooth must fit an ordinary
@@ -442,7 +444,7 @@ fn aniso_matern_theta0_eta_contrast_gradient_is_fd_visible() {
 /// IntegrationError, post-fix it converges.
 #[test]
 fn matern_2d_smooth_fits_ordinary_surface_full_outer_loop() {
-    let _guard = TEST_LOG_LOCK.lock().unwrap();
+    let guard = TEST_LOG_LOCK.lock().unwrap();
     init();
     let data = build_dataset(160, 0.05, 0x1270_0001_2D5Eu64);
     let config = FitConfig {
@@ -473,4 +475,5 @@ fn matern_2d_smooth_fits_ordinary_surface_full_outer_loop() {
         "duchon(x1,x2) control must fit (it always did): {:?}",
         duchon.err()
     );
+    drop(guard);
 }

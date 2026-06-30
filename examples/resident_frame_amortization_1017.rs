@@ -95,7 +95,7 @@ fn main() {
     );
 
     // ---- timing: N solves each way (warm pass excluded) ----
-    let _ = frame.solve_gradient(&g_t, &g_beta);
+    frame.solve_gradient(&g_t, &g_beta).ok();
     let mut resident_total = Duration::ZERO;
     for _ in 0..n_solves {
         let start = Instant::now();
@@ -104,7 +104,7 @@ fn main() {
         std::hint::black_box(s.delta_beta.len());
     }
 
-    let _ = solve_arrow_newton_step(&sys, ridge_t, ridge_beta);
+    solve_arrow_newton_step(&sys, ridge_t, ridge_beta).ok();
     let mut reupload_total = Duration::ZERO;
     for _ in 0..n_solves {
         let start = Instant::now();

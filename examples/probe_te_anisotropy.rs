@@ -137,11 +137,10 @@ fn main() {
     let n = xtr.len();
     let noise = 0.2;
     // f wiggly in x, flat in z; g is the swap.
-    let f = |x: f64, _z: f64| (5.0 * x).sin();
+    // Only the `*_full` variants (with the small cross-axis term) synthesize
+    // the responses; the pure-axis f/g forms are illustrative comments.
     let f_full = |x: f64, z: f64| (5.0 * x).sin() + 0.15 * z;
-    let g = |_x: f64, z: f64| (5.0 * z).sin();
     let g_full = |x: f64, z: f64| 0.15 * x + (5.0 * z).sin();
-    let _ = (f, g);
     println!(
         "te(x,z,k=[10,10]) ANISOTROPY: f wiggly-in-x flat-in-z; g=swap. n_train={n}, noise={noise}"
     );

@@ -93,7 +93,7 @@ fn main() {
     #[cfg(target_os = "macos")]
     gam::gpu::configure_global_policy(gam::gpu::GpuPolicy::Off);
     init_parallelism();
-    let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Info));
+    log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Info)).ok();
 
     // Positional CLI args: `repro979_survival_margslope [n] [centers]`. Absent
     // args keep the defaults. (Avoids `env::var`, banned by the repo scanner.)

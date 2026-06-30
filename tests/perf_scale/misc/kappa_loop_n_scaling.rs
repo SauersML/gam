@@ -437,15 +437,15 @@ impl log::Log for NfreeResetLogger {
             || msg.starts_with("[KAPPA-PHASE-CEIL")
         {
             if let Ok(mut f) = self.file.lock() {
-                let _ = writeln!(f, "{msg}");
-                let _ = f.flush();
+                writeln!(f, "{msg}").ok();
+                f.flush().ok();
             }
         }
     }
     fn flush(&self) {
         if let Ok(mut f) = self.file.lock() {
             use std::io::Write;
-            let _ = f.flush();
+            f.flush().ok();
         }
     }
 }
@@ -468,7 +468,7 @@ fn install_nfree_reset_logger() {
             file: std::sync::Mutex::new(file),
         }
     });
-    let _ = log::set_logger(logger);
+    log::set_logger(logger).ok();
     log::set_max_level(log::LevelFilter::Info);
 }
 
@@ -476,7 +476,7 @@ fn install_nfree_reset_logger() {
 fn zzz_diag_n16000_reset_reasons() {
     install_nfree_reset_logger();
     let (aniso, bounds) = (false, (1e-2, 1e2));
-    let _ = run_fit(1000, true, aniso, bounds);
+    run_fit(1000, true, aniso, bounds).ok();
     let r = run_kappa_trial_seconds(16_000, aniso, bounds).unwrap();
     let t = r.kappa_timing.unwrap();
     eprintln!(

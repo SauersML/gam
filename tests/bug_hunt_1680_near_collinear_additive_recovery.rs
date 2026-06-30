@@ -302,8 +302,8 @@ fn near_collinear_additive_recovers_truth_small_n() {
     // below the issue's broken 0.37.
     const MAX_MEAN_RMSE: f64 = 0.18;
 
-    let (test_data, test_pts) = gen_data(600, 99);
-    let _ = test_data; // test covariates come from `test_pts`
+    // test covariates come from `test_pts`; the dataset arm is unused here.
+    let (_test_data, test_pts) = gen_data(600, 99);
 
     let mut sum = 0.0_f64;
     let mut worst = 0.0_f64;

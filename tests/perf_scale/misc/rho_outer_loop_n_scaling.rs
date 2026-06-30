@@ -175,7 +175,7 @@ fn run_fit(n: usize, outer_iters: usize) -> Result<f64, String> {
 fn rho_outer_loop_is_n_independent() {
     // Prime caches / JIT-warm allocator behaviour with a throwaway small fit so
     // the first timed point isn't penalised by one-time process warmup.
-    let _ = run_fit(2_000, 1);
+    run_fit(2_000, 1).ok();
 
     let ns = [20_000usize, 80_000, 320_000];
     let full_outer = 30usize; // exercise the full ρ search

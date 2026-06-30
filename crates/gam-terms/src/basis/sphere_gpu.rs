@@ -2143,7 +2143,7 @@ mod sphere_gpu_tests {
         // Measure GPU.
         let t0 = std::time::Instant::now();
         let dev = build_kernel_matrix_device(inputs_warm.clone()).expect("gpu kernel matrix");
-        let _host_gpu = dev.to_host_array().expect("dtoh");
+        dev.to_host_array().expect("dtoh");
         let gpu_secs = t0.elapsed().as_secs_f64();
 
         // Measure CPU. Must call the explicit host oracle
@@ -2153,7 +2153,7 @@ mod sphere_gpu_tests {
         // engagement wiring), so timing it here would compare GPU-vs-GPU and
         // collapse the ratio to ~1×. The oracle always evaluates on host.
         let t1 = std::time::Instant::now();
-        let _cpu = crate::basis::spherical_wahba_kernel_matrix_cpu(
+        crate::basis::spherical_wahba_kernel_matrix_cpu(
             data_ll.view(),
             centers_ll.view(),
             penalty_order,
@@ -2239,7 +2239,7 @@ mod sphere_gpu_tests {
             SphereWahbaKernel::SobolevTruncated { lmax },
         )
         .expect("cpu raw");
-        let _design_cpu = raw_cpu.dot(&z);
+        raw_cpu.dot(&z);
         let cpu_secs = t1.elapsed().as_secs_f64();
 
         let ratio = cpu_secs / gpu_secs.max(1e-9);

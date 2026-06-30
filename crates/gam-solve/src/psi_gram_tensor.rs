@@ -1431,16 +1431,16 @@ mod tests {
             let psi = lo + (hi - lo) * (i as f64) / (m as f64 - 1.0);
             assert!(tensor.contains(psi));
             // Value lane.
-            let _g = tensor.gram_at(psi);
-            let _r = tensor.rhs_at(psi);
+            tensor.gram_at(psi);
+            tensor.rhs_at(psi);
             // Gradient lane.
-            let _dg = tensor.dgram_dpsi(psi);
-            let _dr = tensor.drhs_dpsi(psi);
+            tensor.dgram_dpsi(psi);
+            tensor.drhs_dpsi(psi);
             // Hessian-channel curvature.
-            let _d2g = tensor.d2gram_dpsi2(psi);
-            let _d2r = tensor.d2rhs_dpsi2(psi);
+            tensor.d2gram_dpsi2(psi);
+            tensor.d2rhs_dpsi2(psi);
             // Inner-solver bridge (the GaussianFixedCache the PLS fast path reads).
-            let _cache = tensor.gaussian_fixed_cache_at(psi);
+            tensor.gaussian_fixed_cache_at(psi);
         }
 
         assert_eq!(

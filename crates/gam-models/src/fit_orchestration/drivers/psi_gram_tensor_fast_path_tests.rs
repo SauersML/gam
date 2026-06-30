@@ -867,7 +867,7 @@ fn psi_gram_skip_forced_rotation_beta_error_ladder_diag() {
         // Re-pin at ψ_A after each forced trial so every measurement is a move
         // off the SAME reference (a forced skip does not advance the pin, but a
         // streamed-cache realize did; restore the tensor cache's surface).
-        let _ = eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_a), true);
+        eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_a), true);
     }
     eprintln!(
         "[DIAG1033-FORCE] worst forced-skip β̂rel across the move ladder = {worst_forced:.3e} \

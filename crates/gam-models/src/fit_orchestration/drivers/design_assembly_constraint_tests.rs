@@ -4759,7 +4759,7 @@ fn psi_gram_tensor_e2e_kappa_optimum_matches_streamed() {
         )
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "hyper_dirs build", e))
         .expect("hyper_dirs present");
-        let (_c, _g, _h) = evaluate_joint_reml_outer_eval_at_theta(
+        evaluate_joint_reml_outer_eval_at_theta(
             evaluator,
             cache.design(),
             theta,

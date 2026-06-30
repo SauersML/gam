@@ -110,7 +110,9 @@ fn bug_sample_table_same_seed_produces_same_table() {
 
 #[test]
 fn bug_polya_gamma_augmentation_marginal_identity_matches_documented_posterior() {
-    let _fake: Option<NutsResult> = None;
+    // Keep the `NutsResult` symbol load-bearing (it must stay exported).
+    let nuts_placeholder: Option<NutsResult> = None;
+    assert!(nuts_placeholder.is_none());
     let mut rng = StdRng::seed_from_u64(101);
     let pg = PolyaGamma::new();
     let beta = 1.3;

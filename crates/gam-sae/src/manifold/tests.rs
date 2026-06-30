@@ -2362,8 +2362,7 @@ fn separation_barrier_value_frozen_coactivation_invariant_to_logit_moves_1625() 
         vec![Array1::from_vec(vec![-2.0]), Array1::from_vec(vec![-2.0])],
     );
     // Assemble once to FREEZE the coactivation gate at the current logits.
-    let _ = term
-        .assemble_arrow_schur(target.view(), &rho, None)
+    term.assemble_arrow_schur(target.view(), &rho, None)
         .expect("assemble freezes the barrier coactivation");
     let value_before = term.separation_barrier_value(1.0);
     assert!(value_before > 0.0, "aligned pair must have a live barrier");

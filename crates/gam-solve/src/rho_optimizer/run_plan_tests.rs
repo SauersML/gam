@@ -1844,7 +1844,7 @@ fn constrained_stationary_probe_keeps_better_incumbent() {
 
     // Driving the no-improvement window to its limit halts on the GOOD
     // incumbent, never on the collapse corner.
-    let _ = guard.observe_constrained_stationary(&collapse_corner, 587.84, 0.0, true);
+    guard.observe_constrained_stationary(&collapse_corner, 587.84, 0.0, true);
     let final_verdict = guard.observe_constrained_stationary(&collapse_corner, 587.84, 0.0, true);
     assert!(
         !matches!(final_verdict, CostStallVerdict::Continue),
@@ -1915,8 +1915,8 @@ fn cost_stall_far_above_tolerance_keeps_descending_not_flat_valley() {
     let mut last = verdict;
     for _ in 0..(STUCK_STALL_MAX_ESCAPES + 3) {
         // Re-fill the window each round (each escape reset it).
-        let _ = guard.observe_infeasible(&probe);
-        let _ = guard.observe_infeasible(&probe);
+        guard.observe_infeasible(&probe);
+        guard.observe_infeasible(&probe);
         last = guard.observe_infeasible(&probe);
         if matches!(last, CostStallVerdict::FlatValleyStall { .. }) {
             break;
@@ -1975,8 +1975,8 @@ fn cost_stall_modestly_above_tolerance_still_halts_as_flat_valley() {
     guard.observe_seed(&seed, score, valley_grad);
 
     let probe = array![-10.0, -10.0];
-    let _ = guard.observe_infeasible(&probe);
-    let _ = guard.observe_infeasible(&probe);
+    guard.observe_infeasible(&probe);
+    guard.observe_infeasible(&probe);
     let verdict = guard.observe_infeasible(&probe);
     assert!(
         matches!(verdict, CostStallVerdict::FlatValleyStall { .. }),
@@ -2011,8 +2011,8 @@ fn cost_stall_above_score_relative_band_keeps_descending() {
     guard.observe_seed(&seed, score, descending_grad);
 
     let probe = array![-10.0, -10.0];
-    let _ = guard.observe_infeasible(&probe);
-    let _ = guard.observe_infeasible(&probe);
+    guard.observe_infeasible(&probe);
+    guard.observe_infeasible(&probe);
     let verdict = guard.observe_infeasible(&probe);
     assert!(
         matches!(verdict, CostStallVerdict::StuckKeepDescending { .. }),

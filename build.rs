@@ -3710,12 +3710,14 @@ fn scan_for_let_underscore(root: &Path, dir: &Path, offenders: &mut Vec<(PathBuf
         if !content.contains("let ") {
             return;
         }
-        let mask = compute_test_mask(content, rel);
+        // The `let _` ban is STRICT EVERYWHERE — test code included (no test
+        // mask). A discarded binding silences the type system's unused-value
+        // feedback just as harmfully in a test as in production: a test that
+        // `let _ = foo()`s away a `Result` stops asserting `foo` succeeded.
+        // Bind a real name and read it, assert on it, or call the expression
+        // for its effect without a binding.
         let stripped_lines = strip_file_lines(content);
         for (idx, line) in content.lines().enumerate() {
-            if mask.get(idx).copied().unwrap_or(false) {
-                continue;
-            }
             let stripped = stripped_lines.get(idx).map(String::as_str).unwrap_or(line);
             if stripped_line_has_let_underscore(stripped) {
                 offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));

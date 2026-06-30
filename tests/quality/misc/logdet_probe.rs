@@ -91,7 +91,7 @@ fn diag_1271_dump_reml_logdet_internals() {
     // `set_logger` fails if another logger is already installed; ignore that
     // (still works if the other logger forwards, and the panic-dump fallback
     // below prints whatever we have).
-    let _ = log::set_logger(&LOGGER);
+    log::set_logger(&LOGGER).ok();
     log::set_max_level(log::LevelFilter::Info);
 
     let cfg = FitConfig {

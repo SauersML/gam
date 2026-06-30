@@ -175,7 +175,7 @@ fn main() -> std::process::ExitCode {
         term.beta_dim(),
         term.assignment.row_block_dim()
     );
-    let _ = std::io::stdout().flush();
+    std::io::stdout().flush().ok();
 
     // The bar is 1.56s; anything past 10s already fails by >6x, so don't wait it
     // out. Run the whole fit on a worker thread and have main wait with a 10s
@@ -199,8 +199,8 @@ fn main() -> std::process::ExitCode {
             Ok(s) => s,
             Err(e) => {
                 println!("FULLCOLOR_1017 assemble FAILED: {e}");
-                let _ = std::io::stdout().flush();
-                let _ = tx.send(());
+                std::io::stdout().flush().ok();
+                tx.send(()).ok();
                 return;
             }
         };
@@ -212,7 +212,7 @@ fn main() -> std::process::ExitCode {
             sys.rows.len(),
             delta(&a0, &a1)
         );
-        let _ = std::io::stdout().flush();
+        std::io::stdout().flush().ok();
 
         // Second assemble: is the 9s one-time setup or a per-inner-iter cost? The
         // production inner Newton re-assembles every iteration.
@@ -221,7 +221,7 @@ fn main() -> std::process::ExitCode {
             let sys2 = t.assemble_arrow_schur(target.view(), &rho, Some(&registry));
             let a2_ms = start.elapsed().as_secs_f64() * 1e3;
             println!("FULLCOLOR_1017 assemble2 ms={a2_ms:.3} ok={}", sys2.is_ok());
-            let _ = std::io::stdout().flush();
+            std::io::stdout().flush().ok();
         }
 
         // ---- Stage C: InexactPCG (PRODUCTION path) with capped iterations to
@@ -248,24 +248,24 @@ fn main() -> std::process::ExitCode {
                 ),
                 Err(e) => println!("FULLCOLOR_1017 solve_inexact_pcg cap={cap} FAILED: {e}"),
             }
-            let _ = std::io::stdout().flush();
+            std::io::stdout().flush().ok();
         }
 
         println!("FULLCOLOR_1017 DONE");
-        let _ = std::io::stdout().flush();
-        let _ = tx.send(());
+        std::io::stdout().flush().ok();
+        tx.send(()).ok();
     });
 
     // Diagnostic cap (single solves, not the full fit): 45s headroom to capture
     // even a slow InexactPCG number. Returning from main terminates the process.
     match rx.recv_timeout(Duration::from_secs(45)) {
         Ok(()) => {
-            let _ = worker.join();
+            worker.join().ok();
             std::process::ExitCode::SUCCESS
         }
         Err(_) => {
             println!("FULLCOLOR_1017 KILLED_OVER_45S (a single solve exceeded 45s — aborting)");
-            let _ = std::io::stdout().flush();
+            std::io::stdout().flush().ok();
             std::process::ExitCode::from(1)
         }
     }

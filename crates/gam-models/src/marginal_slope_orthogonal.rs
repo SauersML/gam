@@ -568,7 +568,7 @@ mod tests {
     #[should_panic(expected = "pilot_beta0 length must equal Jacobian rows")]
     fn influence_block_design_panics_on_pilot_length_mismatch() {
         let jac = jac_from(array![[1.0], [2.0]]);
-        let _ = influence_block_design(&jac, &array![1.0], 1.0);
+        influence_block_design(&jac, &array![1.0], 1.0);
     }
 
     // ---- residualize_influence_columns ----

@@ -214,7 +214,7 @@ fn bug_cell_moment_scratch_resize_corrupts_existing_entries() {
             .expect("first scratch evaluation should succeed");
         first.moments.to_vec()
     };
-    let _second = evaluate_cell_moments_with_scratch(cell_b, 3, &mut scratch)
+    evaluate_cell_moments_with_scratch(cell_b, 3, &mut scratch)
         .expect("second scratch evaluation should succeed");
     let fresh = evaluate_cell_moments(cell_a, 14).expect("fresh moment evaluation should succeed");
     for i in 0..snap.len() {

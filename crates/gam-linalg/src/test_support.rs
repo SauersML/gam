@@ -120,6 +120,6 @@ mod tests {
     #[should_panic(expected = "operator-backed design")]
     fn no_densify_design_rejects_materialization() {
         let design = no_densify_design(array![[1.0, 2.0], [3.0, 4.0]]);
-        let _ = design.as_dense_cow();
+        design.as_dense_cow();
     }
 }

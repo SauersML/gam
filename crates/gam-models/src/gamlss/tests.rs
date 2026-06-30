@@ -624,7 +624,6 @@ pub(crate) fn hand_dispersion_row_kernel(
             // The score `s_theta` is unchanged (the working response carries the
             // exact score, so the optimum is identical). `tpy` is retained only
             // for the score; the observed-curvature terms are dropped.
-            let _ = tpy;
             let info_theta = hand_trigamma(theta) - hand_trigamma(tpm) - 1.0 / theta + 1.0 / tpm;
             let info_pos = info_theta.max(DISPERSION_MIN_CURVATURE);
             DispersionRowKernel {

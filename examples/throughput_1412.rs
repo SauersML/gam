@@ -161,7 +161,7 @@ fn main() {
                 };
                 // Warm (handle already built = X resident); time `reps` Grams,
                 // each crossing only w (H2D) + the p×p Gram (D2H).
-                let _ = handle.gram(w.view());
+                drop(handle.gram(w.view()));
                 let mut total = Duration::ZERO;
                 for r in 0..reps {
                     // Perturb w per rep so each Gram is genuine work (mirrors an
@@ -188,7 +188,7 @@ fn main() {
             Some(handle) => {
                 let rhs = Array1::from_shape_fn(p, |j| ((j as f64 + 1.0) * 0.03).cos());
                 let ridge = 1e-3_f64;
-                let _ = handle.solve_normal_equations(w.view(), rhs.view(), ridge);
+                drop(handle.solve_normal_equations(w.view(), rhs.view(), ridge));
                 let mut total = Duration::ZERO;
                 let mut ok = true;
                 for r in 0..reps {

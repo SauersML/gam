@@ -592,8 +592,8 @@ fn run() -> Result<(), String> {
     let mut cfg = Config::default();
     let mut single: Option<(usize, usize)> = None;
 
-    let mut args = env::args();
-    let _program = args.next();
+    // Skip argv[0] (the program name); only the flags after it matter.
+    let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--n0" => cfg.n0 = parse_usize("--n0", args.next())?,

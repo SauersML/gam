@@ -4216,10 +4216,9 @@ mod tests {
         // Built ONCE in tower arithmetic so every (z^i θ^j) partial is exact.
         let z_var = Tower4::<3>::variable(z0, 0);
         let t0_var = Tower4::<3>::variable(th0[0], 1);
-        // θ₁ does not enter G/Φ here, but seed it so the jet carries the full
-        // K1 frame (its Φ-derivatives are zero; the z_edge chain supplies all θ₁
-        // motion through slot 0).
-        let _t1_var = Tower4::<3>::variable(th0[1], 2);
+        // θ₁ does not enter G/Φ here (its Φ-derivatives are zero; the z_edge
+        // chain supplies all θ₁ motion through slot 0), so the K1 frame's θ₁
+        // slot is intentionally left unseeded.
         let phi_jet = ((z_var * t0_var).exp() - 1.0) / t0_var;
         // Sanity: slot-0 first derivative of Φ IS G(z₀;θ₀).
         assert!(
@@ -4874,7 +4873,12 @@ mod rowjet_bridge_tests {
             // (c) the Order2 scalar IS a RowJet via the blanket.
             let o2: [Order2<2>; 2] =
                 std::array::from_fn(|a| <Order2<2> as RowJet<2>>::variable(base[a], a));
-            let _ = prog.body(&[0], &o2);
+            let via_order2 = prog.body(&[0], &o2);
+            assert_eq!(
+                via_order2.0.v.to_bits(),
+                via_rowjet.v.to_bits(),
+                "Order2 blanket value channel must match the dense Tower4 program body"
+            );
         }
     }
 
