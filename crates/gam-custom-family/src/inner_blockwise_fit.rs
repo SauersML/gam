@@ -617,6 +617,36 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         const LINEAR_RATE_PROJECTION_CAP: usize = 100;
         let mut residual_rate_history: std::collections::VecDeque<f64> =
             std::collections::VecDeque::with_capacity(LINEAR_RATE_WINDOW + 1);
+        // Trailing window of the Φ-augmented merit objective, parallel to
+        // `residual_rate_history`, for the merit-descent veto on the two
+        // residual-trend stall guards (gam#1607 binomial location-scale-WIGGLE).
+        //
+        // Both residual-trend guards below (flat-residual no-improve, and the
+        // slow-geometric-rate projection) use the trend of the KKT *residual*
+        // as a proxy for "can this solve still reach tol in a practical
+        // budget". On the wiggle family that proxy is unsound: the model
+        // carries an exact additive gauge null (the threshold βₜ and the
+        // wiggle-intercept `βwᵀB(q₀)` both shift q = q₀ + Bᵀβw), and as the
+        // dynamic basis `B(q₀)` re-anchors during PIRLS the KKT residual is
+        // genuinely NON-monotone — it humps up (0.2→0.4) for ~150 cycles
+        // before descending to tol — even though the merit objective the line
+        // search actually minimizes descends monotonically the whole way and
+        // the solve DOES converge (measured: cycle 638, β bounded ≈1.9). A
+        // residual-trend guard then reads the transient rise as "diverging /
+        // can't reach tol" and bails ~cycle 40, handing the outer optimizer a
+        // false non-convergence (the #1607 wiggle fullhessian failure).
+        //
+        // The merit is the real Lyapunov function: a descending merit IS
+        // progress, regardless of the residual's transient shape. So veto a
+        // residual-trend stall exit while the merit is still descending
+        // robustly over the SAME trailing window. This preserves termination —
+        // the merit is bounded below and monotone-nonincreasing under the
+        // line search, so it cannot keep clearing a fixed relative-descent bar
+        // forever; once it genuinely flattens (the true #979 survival stall:
+        // ~1e-5 steps ⇒ merit flat to f64) the veto lifts and the guard fires
+        // exactly as before.
+        let mut merit_window: std::collections::VecDeque<f64> =
+            std::collections::VecDeque::with_capacity(LINEAR_RATE_WINDOW + 1);
         // Fully-rejected stall guard. The residual-stall guard below
         // (post-grad-reload) only fires on cycles that produced an accepted
         // step, because every termination check it gates lives after the
@@ -4880,6 +4910,45 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 }
                 residual_rate_history.push_back(residual);
             }
+            // Trailing window of the Φ-augmented merit, kept in lockstep with
+            // `residual_rate_history` so its front is the merit exactly
+            // LINEAR_RATE_WINDOW cycles back. Powers the merit-descent veto on
+            // the two residual-trend stall guards below (gam#1607 wiggle).
+            if lastobjective.is_finite() {
+                if merit_window.len() > LINEAR_RATE_WINDOW {
+                    merit_window.pop_front();
+                }
+                merit_window.push_back(lastobjective);
+            }
+            // Is the merit still descending robustly across the trailing
+            // window? A residual-trend stall verdict is premature while it is:
+            // the line search is making real progress on the actual objective,
+            // and the KKT residual's transient non-monotonicity (the wiggle
+            // gauge-null re-anchoring, gam#1607) is not evidence of being
+            // stuck. "Robustly" = the merit dropped by more than the
+            // accumulated objective tolerance over the window — i.e. by more
+            // than the convergence machinery would call flat — so a merit that
+            // has genuinely plateaued (the #979 survival stall, ~1e-5 steps ⇒
+            // merit flat to f64) does NOT clear the bar and the guard fires as
+            // before. The per-cycle `objective_tol` (relative, scale-aware) is
+            // the natural unit; require the window drop to exceed
+            // LINEAR_RATE_WINDOW × objective_tol so a window of merely
+            // tolerance-scale dithering counts as flat.
+            let merit_still_descending_over_window = || -> bool {
+                if merit_window.len() <= LINEAR_RATE_WINDOW {
+                    // Not enough history yet to judge a window-scale trend;
+                    // don't veto on partial information (the guards have their
+                    // own RESIDUAL_STALL_MIN_CYCLES floor anyway).
+                    return false;
+                }
+                let oldest = *merit_window.front().unwrap();
+                let newest = *merit_window.back().unwrap();
+                if !oldest.is_finite() || !newest.is_finite() {
+                    return false;
+                }
+                let drop = oldest - newest;
+                drop > (LINEAR_RATE_WINDOW as f64) * objective_tol
+            };
             if cycle + 1 >= RESIDUAL_STALL_MIN_CYCLES
                 && cycles_since_residual_improved >= RESIDUAL_STALL_NO_IMPROVE_CYCLES
                 && tr_clamped_during_stall
@@ -5139,6 +5208,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 && residual > residual_tol
                 && cycle + 1 >= RESIDUAL_STALL_MIN_CYCLES
                 && cycles_since_residual_improved >= RESIDUAL_STALL_NO_IMPROVE_CYCLES
+                && !merit_still_descending_over_window()
             {
                 log::warn!(
                     "[PIRLS/joint-Newton convergence] cycle {:>3} | flat-residual stall early-exit (gam#1040): residual={:.3e} (tol={:.3e}) best_seen={:.3e} stalled {} cycles with steps inside the trust region (tr_clamped={}) and no acceptance certificate satisfied; the residual is neither trending toward KKT nor stationary on the identifiable subspace, so returning unconverged with finite β instead of grinding to inner_max_cycles={}.",
@@ -5180,6 +5250,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 && residual > residual_tol
                 && cycle + 1 >= RESIDUAL_STALL_MIN_CYCLES
                 && residual_rate_history.len() > LINEAR_RATE_WINDOW
+                && !merit_still_descending_over_window()
             {
                 let oldest = *residual_rate_history.front().unwrap();
                 // Single source of truth for the slow-geometric-rate projection
