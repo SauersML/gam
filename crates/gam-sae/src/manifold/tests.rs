@@ -6704,6 +6704,15 @@ pub(crate) fn assert_second_jet_matches_central_difference<E: SaeBasisSecondJet>
 /// magnitude-scaled tolerance is used because the harmonic third derivatives
 /// scale like `freq³` (≈ thousands for the higher harmonics), so a pure
 /// absolute bound would be meaningless at the top of the range.
+///
+/// The numerical reference is a **4th-order** 5-point central difference
+/// `(−f₊₂ + 8f₊ − 8f₋ + f₋₂)/(12h)` rather than the 2-point `(f₊−f₋)/(2h)`. The
+/// 2-point stencil carries an `O(h²)` truncation error that, for a cubic line
+/// factor (`t³`) whose true mixed third derivative is exactly 0 at `t=0`, is
+/// `≈ 1.6e-6` at `h=1e-4` — above the `abs_tol=1e-6` floor, so it spuriously
+/// failed an analytically-correct zero. The 5-point stencil is `O(h⁴)` (and
+/// EXACT for polynomials up to degree 4, so it returns 0 to rounding on the
+/// monomial line factors), which is the honest reference for this contract.
 pub(crate) fn assert_third_jet_matches_central_difference<E: SaeBasisThirdJet>(
     evaluator: &E,
     coords: Array2<f64>,
@@ -6719,18 +6728,26 @@ pub(crate) fn assert_third_jet_matches_central_difference<E: SaeBasisThirdJet>(
     assert_eq!((n_rows, n_basis, latent_dim, latent_dim), second.dim());
     for row in 0..n_rows {
         for axis_e in 0..latent_dim {
+            let mut plus2 = coords.clone();
             let mut plus = coords.clone();
             let mut minus = coords.clone();
+            let mut minus2 = coords.clone();
+            plus2[[row, axis_e]] += 2.0 * epsilon;
             plus[[row, axis_e]] += epsilon;
             minus[[row, axis_e]] -= epsilon;
+            minus2[[row, axis_e]] -= 2.0 * epsilon;
+            let second_plus2 = evaluator.second_jet(plus2.view())?;
             let second_plus = evaluator.second_jet(plus.view())?;
             let second_minus = evaluator.second_jet(minus.view())?;
+            let second_minus2 = evaluator.second_jet(minus2.view())?;
             for basis in 0..n_basis {
                 for axis_a in 0..latent_dim {
                     for axis_c in 0..latent_dim {
-                        let fd = (second_plus[[row, basis, axis_a, axis_c]]
-                            - second_minus[[row, basis, axis_a, axis_c]])
-                            / (2.0 * epsilon);
+                        let fd = (-second_plus2[[row, basis, axis_a, axis_c]]
+                            + 8.0 * second_plus[[row, basis, axis_a, axis_c]]
+                            - 8.0 * second_minus[[row, basis, axis_a, axis_c]]
+                            + second_minus2[[row, basis, axis_a, axis_c]])
+                            / (12.0 * epsilon);
                         let analytic = third[[row, basis, axis_a, axis_c, axis_e]];
                         let error = (analytic - fd).abs();
                         let threshold = abs_tol + rel_tol * analytic.abs().max(fd.abs());
