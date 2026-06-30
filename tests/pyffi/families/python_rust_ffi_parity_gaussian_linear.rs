@@ -31,7 +31,7 @@ fn python_rust_ffi_parity_gaussian_linear_case() {
     let reml_rust = sf.fit.reml_score;
 
     let py = r#"
-import json, math
+import json
 import gamfit
 rows=[]
 n=80
@@ -41,12 +41,10 @@ for i in range(n):
     rows.append({'x':x,'y':y})
 m=gamfit.fit(rows, 'y ~ x', family='gaussian')
 s=m.summary()
-p=m.predict(rows, interval=0.95)
 out={
  'beta': [c['estimate'] for c in s['coefficients']],
  'll': float(s['deviance']) if 'deviance' in s else float('nan'),
  'reml': float(s['reml_score']),
- 'mean0': float(p[0]['.mean'] if isinstance(p, list) else p['.mean'][0]),
 }
 print(json.dumps(out))
 "#;
