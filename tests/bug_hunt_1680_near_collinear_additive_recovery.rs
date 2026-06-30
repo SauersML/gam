@@ -157,44 +157,52 @@ fn fit_and_predict(
     pred.mean.to_vec()
 }
 
-/// Diagnostic: print per-term λ̂ and EDF for the 4-smooth additive fit.
+/// The discriminating control that pins the root cause: the bug is the over-rich
+/// DEFAULT basis, NOT the near-collinearity. We fit the SAME truth with the same
+/// *default* `smooth(...)` terms on two designs — the issue's ρ=0.985 collinear
+/// design and a control where `x2`/`x3` are INDEPENDENT of `x1` — and require
+/// BOTH to recover truth. Before the basis-dimension cap the independent control
+/// recovered *worse* than the collinear one (mean truth-RMSE ≈ 0.52 vs ≈ 0.39),
+/// which is the proof the defect was basis over-richness rather than the
+/// near-rank-1 block. Both now land near mgcv's ballpark (≈ 0.12) with the
+/// default basis, so a regression that re-inflates the default would turn this
+/// red on the independent design even if the collinear test somehow survived.
 #[test]
-fn diag_near_collinear_lambdas_edf() {
-    // Sweep basis size to isolate the basis-dimension effect.
-    let test_pts = gen_data(600, 99).1;
-    let mk = |k: Option<usize>| match k {
-        None => "y ~ smooth(x1)+smooth(x2)+smooth(x3)+smooth(x4)".to_string(),
-        Some(k) => format!(
-            "y ~ smooth(x1,k={k})+smooth(x2,k={k})+smooth(x3,k={k})+smooth(x4,k={k})"
-        ),
-    };
-    for kopt in [None, Some(10usize), Some(20)] {
-        let formula = mk(kopt);
-        let formula = formula.as_str();
-        let mut sum = 0.0;
-        for seed in [0u64, 1, 2, 3] {
-            let (train, _pts) = gen_data(120, seed);
-            let pred = fit_and_predict_formula(formula, &train, &test_pts);
-            sum += truth_rmse(&pred, &test_pts);
-        }
-        eprintln!("[collinear ρ=0.985] k={kopt:?} MEAN truth-RMSE={:.4}", sum / 4.0);
-    }
+fn near_collinear_is_basis_richness_not_collinearity() {
+    const SEEDS: [u64; 4] = [0, 1, 2, 3];
+    // Same generous threshold as the small-n test: 2× mgcv, far below broken.
+    const MAX_MEAN_RMSE: f64 = 0.18;
+    let formula = "y ~ smooth(x1)+smooth(x2)+smooth(x3)+smooth(x4)";
 
-    // Control: SAME truth, but x2/x3 are INDEPENDENT (no collinearity). If the
-    // over-rich default basis is bad universally, this breaks too; if it only
-    // breaks under collinearity, this stays clean.
-    let indep_test = gen_indep(600, 99).1;
-    for kopt in [None, Some(10usize), Some(20)] {
-        let formula = mk(kopt);
-        let formula = formula.as_str();
-        let mut sum = 0.0;
-        for seed in [0u64, 1, 2, 3] {
-            let (train, _pts) = gen_indep(120, seed);
-            let pred = fit_and_predict_formula(formula, &train, &indep_test);
-            sum += truth_rmse(&pred, &indep_test);
-        }
-        eprintln!("[independent      ] k={kopt:?} MEAN truth-RMSE={:.4}", sum / 4.0);
+    let collinear_test = gen_data(600, 99).1;
+    let mut collinear_sum = 0.0;
+    for seed in SEEDS {
+        let (train, _) = gen_data(120, seed);
+        let pred = fit_and_predict_formula(formula, &train, &collinear_test);
+        collinear_sum += truth_rmse(&pred, &collinear_test);
     }
+    let collinear_mean = collinear_sum / SEEDS.len() as f64;
+
+    let indep_test = gen_indep(600, 99).1;
+    let mut indep_sum = 0.0;
+    for seed in SEEDS {
+        let (train, _) = gen_indep(120, seed);
+        let pred = fit_and_predict_formula(formula, &train, &indep_test);
+        indep_sum += truth_rmse(&pred, &indep_test);
+    }
+    let indep_mean = indep_sum / SEEDS.len() as f64;
+
+    eprintln!(
+        "[#1680] default-basis mean truth-RMSE: collinear ρ=0.985 = {collinear_mean:.4}, \
+         independent = {indep_mean:.4}"
+    );
+
+    assert!(
+        collinear_mean <= MAX_MEAN_RMSE && indep_mean <= MAX_MEAN_RMSE,
+        "default-basis additive recovery is poor: collinear mean {collinear_mean:.4}, independent \
+         mean {indep_mean:.4} (threshold {MAX_MEAN_RMSE:.2}). The independent control breaking \
+         proves the defect is over-rich DEFAULT basis dimension, not the near-rank-1 block (#1680)."
+    );
 }
 
 /// Same truth as `gen_data` but `x2`, `x3` are independent `U(-2,2)` — no
