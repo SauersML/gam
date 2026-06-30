@@ -31,5 +31,25 @@ Driver IS up now (was down at PR open). Verified device path is REAL:
   try_device_arrow_direct_sae_pcg → reduced_schur_matvec_should_offload) ARE present
   in newton_step.rs (the "documented not edited" note from the issue is now closed).
 
+### BREAKTHROUGH — framed device PCG fixed + on-GPU #1551 gate committed
+
+The framed device PCG "fault" was never in the kernel. Root cause: the test
+FIXTURES built an ASYMMETRIC reduced-Schur operator (cross frame blocks
+`g_{ij}`/`g_{ji}` sampled independently; diagonal `g_{kk}` a full random matrix).
+`S` is a Hessian → symmetric by construction; the asymmetry made the lower-
+triangle Cholesky reference an INVALID oracle (it solved the symmetrised system,
+own residual 0.1) while the device PCG converged correctly against the full
+operator (op-resid 3.6e-12). V100 evidence:
+- `framed_sae_device_pcg_matches_cpu_when_cuda_admits` PASSES (322 MiB resident).
+- `device_resident_pcg_matches_cpu_reference_when_cuda_admits` (full-B) PASSES.
+- **`sae_direct_mode_device_engages_on_gpu_1551` (NEW committed test) PASSES**:
+  production Direct SAE solve sets `used_device_arrow=true`; device step vs CPU
+  dense-joint reference max|Δt|=4.2e-16, max|Δβ|=5.9e-14; log-det finite.
+
+Fixes: symmetric fixtures (`g_{kk}` symmetrised, `g_{ji}=g_{ij}ᵀ`) in both the
+in-crate test and tests/owed_1551; explicit `max|S-Sᵀ|` symmetry guard before the
+Cholesky oracle; re-enabled the on-GPU engagement gate as a real `#[test]`.
+
 Next: run sae_perf_harness color/qwen to capture device vs CPU speedup numbers;
+address the dense-Schur-for-logdet path at large k (line ~501 newton_step.rs);
 extend GPU test coverage and perf gate.

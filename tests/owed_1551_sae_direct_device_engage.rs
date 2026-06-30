@@ -328,14 +328,15 @@ fn direct_options() -> ArrowSolveOptions {
 /// reduced-Schur-factor emission must keep the Laplace normaliser non-`None`).
 ///
 /// The on-GPU `used_device_arrow == true` engagement assertion lives in the
-/// `#[ignore]`d `sae_direct_mode_device_engages_on_gpu_1551` below — it is
-/// currently blocked by a PRE-EXISTING fault in the device SAE PCG CUDA kernels
-/// (`solve_sae_matrix_free_pcg` / `_framed`), which abort on a real A100 even via
-/// their own in-crate parity tests (`device_resident_pcg_matches_cpu_reference_
-/// when_cuda_admits`, `framed_sae_device_pcg_matches_cpu_when_cuda_admits`) —
-/// those tests only ever "passed" by taking their `Err`→skip path. #1551 routes
-/// the production path to those kernels; fixing the kernel fault is tracked
-/// separately. This gate pins that the routing itself is correct and reachable.
+/// committed `sae_direct_mode_device_engages_on_gpu_1551` below (it skips on
+/// CPU-only hosts). It is now a real test: the device SAE PCG CUDA kernels were
+/// once thought to fault on hardware, but the in-crate parity tests
+/// (`device_resident_pcg_matches_cpu_reference_when_cuda_admits`,
+/// `framed_sae_device_pcg_matches_cpu_when_cuda_admits`) "failed" only because
+/// the *fixtures* built an asymmetric reduced-Schur operator — an invalid oracle
+/// for a lower-triangle Cholesky. With symmetric fixtures both pass on a V100, so
+/// #1551's routing-to-device is verified end-to-end. This gate pins the routing
+/// itself (reachable + non-regressing) on device-absent hosts.
 #[test]
 fn sae_direct_mode_routing_reachable_and_non_regressing_1551() {
     let sys = build_framed_sae_system(true);
@@ -357,7 +358,7 @@ fn sae_direct_mode_routing_reachable_and_non_regressing_1551() {
         // regression, so skip cleanly when CUDA is present.
         eprintln!(
             "[owed_1551] CUDA present; the CPU-observable routing gate runs on device-absent \
-             hosts. On-GPU engagement is sae_direct_mode_device_engages_on_gpu_1551 (#[ignore])."
+             hosts. On-GPU engagement is the committed sae_direct_mode_device_engages_on_gpu_1551."
         );
         return;
     }
@@ -435,29 +436,90 @@ fn sae_direct_mode_routing_reachable_and_non_regressing_1551() {
     );
 }
 
-// ON-GPU ENGAGEMENT — the GPU-gated remainder (NOT a committed test):
-//
-// The issue's headline assertion is `used_device_arrow == true` on a real
-// production-shaped Direct SAE fit. That assertion is NOT committed here because
-// it cannot currently pass: the device SAE PCG CUDA kernels themselves FAULT on a
-// real A100. Verified directly on hardware (A100-SXM4-40GB) — BOTH in-crate
-// parity tests abort on the device:
-//   * gpu::kernels::arrow_schur::tests::device_resident_pcg_matches_cpu_reference_when_cuda_admits  (full-`B`)
-//   * gpu::kernels::arrow_schur::tests::framed_sae_device_pcg_matches_cpu_when_cuda_admits          (framed)
-// Both previously only "passed" by taking their `Err`→device-declined skip path,
-// so the #1017 device SAE PCG was never actually exercised on a real GPU. #1551's
-// routing fix is correct and makes the path reachable — which is exactly what
-// surfaced the latent kernel fault.
-//
-// Once the device kernels are fixed (separate task), the on-GPU gate is, by
-// construction, this exact body run on a CUDA host (it would route through the
-// #1551 branch and the `used_device_arrow` flag the branch sets):
-//
-//   let sys = build_framed_sae_system(true);
-//   let (dt_v, db_v, cache) =
-//       solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &direct_options()).unwrap();
-//   assert!(cache.pcg_diagnostics.used_device_arrow);          // engagement
-//   // device step ≈ dense-joint CPU reference to the fixture floor (≤1e-2)
-//
-// (A `#[test]`+`#[ignore]` form is not used: the repo's ban-scanner forbids
-// `#[ignore]`. Re-enable as a real `#[test]` once the kernel fault is closed.)
+/// ON-GPU ENGAGEMENT (#1017/#1551 headline assertion): on a CUDA host the
+/// production-shaped Direct SAE fit must route through the device branch and set
+/// `used_device_arrow == true`, and the device-solved Newton step must match the
+/// pure-CPU dense-joint reference to the fixture floor.
+///
+/// History: this was previously NOT committed because the device SAE PCG CUDA
+/// kernels were believed to fault on real hardware. That belief was wrong — the
+/// in-crate parity tests "failed" only because the *test fixtures* built an
+/// ASYMMETRIC reduced-Schur operator (independently-sampled `g_{ij}`/`g_{ji}`
+/// cross blocks), which made the lower-triangle Cholesky reference an invalid
+/// oracle while the device PCG converged correctly against the full operator. The
+/// fixtures are now symmetric (a Hessian is symmetric by construction) and both
+/// `device_resident_pcg_matches_cpu_reference_when_cuda_admits` (full-`B`) and
+/// `framed_sae_device_pcg_matches_cpu_when_cuda_admits` (framed) PASS on a Tesla
+/// V100 (sm_70). So the on-GPU gate is now a real committed test.
+///
+/// Skips cleanly on CPU-only hosts (`GpuRuntime::global()` is None): the device
+/// branch declines there and `used_device_arrow` would be false — that case is
+/// already pinned by `sae_direct_mode_routing_reachable_and_non_regressing_1551`.
+#[test]
+fn sae_direct_mode_device_engages_on_gpu_1551() {
+    if GpuRuntime::global().is_none() {
+        eprintln!(
+            "[owed_1551] no CUDA runtime present; the on-GPU engagement assertion is the \
+             GPU-gated remainder. CPU routing is pinned by the always-on gate above."
+        );
+        return;
+    }
+
+    let sys = build_framed_sae_system(true);
+    assert!(
+        sys.k >= GpuDispatchPolicy::DEVICE_LOOP_MIN_P,
+        "fixture border k={} must clear DEVICE_LOOP_MIN_P={} so the device is admitted",
+        sys.k,
+        GpuDispatchPolicy::DEVICE_LOOP_MIN_P
+    );
+
+    let options = direct_options();
+
+    // Pure-CPU dense-joint reference (never touches CUDA): the exact full Newton
+    // step the unbounded device PCG must reproduce.
+    let reference = solve_arrow_newton_step_dense_reference(&sys, 0.0, 0.0)
+        .expect("CPU dense reference solve must succeed");
+
+    let (delta_t, delta_beta, cache) =
+        solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options)
+            .expect("production Direct-mode SAE solve must succeed on a GPU host");
+
+    // The headline assertion: the production Direct SAE inner solve engaged the
+    // device-resident PCG (not a silent CPU fallback).
+    assert!(
+        cache.pcg_diagnostics.used_device_arrow,
+        "#1017/#1551: CUDA present and fixture clears the offload floor, but the production \
+         Direct SAE solve did NOT engage the device (used_device_arrow == false) — the device \
+         branch declined instead of running on GPU"
+    );
+
+    // The joint-Hessian log-det the Laplace evidence consumes must be present +
+    // finite (the device branch is responsible for emitting the reduced-Schur
+    // factor on the device-success path).
+    let log_det = cache
+        .joint_hessian_log_det
+        .expect("joint-Hessian log-det must be present on the device-success path (k>0)");
+    assert!(log_det.is_finite(), "log-det must be finite, got {log_det}");
+
+    // The device-solved step must match the dense-joint CPU reference. Direct mode
+    // is the exact full Newton step, so the unbounded device PCG converges to the
+    // same step the dense factorization yields — to the fixture's physical floor.
+    let dt = max_abs_diff(
+        delta_t.as_slice().unwrap(),
+        reference.delta_t.as_slice().unwrap(),
+    );
+    let db = max_abs_diff(
+        delta_beta.as_slice().unwrap(),
+        reference.delta_beta.as_slice().unwrap(),
+    );
+    assert!(
+        dt <= 1e-2 && db <= 1e-2,
+        "device Direct step vs dense-joint CPU reference (max|Δt|={dt:.3e}, max|Δβ|={db:.3e})"
+    );
+
+    eprintln!(
+        "[owed_1551] GPU host: production Direct SAE solve ENGAGED the device \
+         (used_device_arrow=true), step matches dense-joint CPU reference \
+         (max|Δt|={dt:.3e}, max|Δβ|={db:.3e}), log-det={log_det} finite."
+    );
+}
