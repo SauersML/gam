@@ -3415,6 +3415,37 @@ impl SaeManifoldTerm {
         Ok(value)
     }
 
+    /// Whether assembling `registry` will scatter an isometry Gauss-Newton
+    /// cross-block (`H_tβ`) into the per-row dense `htbeta` slabs.
+    ///
+    /// `add_sae_isometry_metric_gn_blocks` writes the coupled cross-block (and
+    /// flips on `activate_dense_htbeta_supplement`) only when (a) the registry
+    /// carries an `Isometry` penalty and (b) the atom's chart
+    /// `preserves_isometry_cross_block_coherence` (flat charts — `Euclidean`,
+    /// `Circle`, and flat products — keep the full `μ AᵀA` coupling; curved /
+    /// boundary charts drop it to stay PSD). On the non-frames matrix-free path
+    /// the data-fit cross-block is carried by the Kronecker row operator and the
+    /// per-row `htbeta` slab is allocated at zero width (#1406/#1407 anti-leak),
+    /// so this dense isometry supplement has nowhere to land unless the slab is
+    /// widened to the full `beta_dim`. This predicate decides exactly that. The
+    /// effective isometry weight `μ` is NOT consulted here: a near-zero `μ`
+    /// short-circuits the per-row write, but the slab must still exist so the
+    /// solver's `htbeta_dense_supplement` read is well-shaped.
+    pub(crate) fn registry_writes_dense_isometry_cross_block(
+        &self,
+        registry: &AnalyticPenaltyRegistry,
+    ) -> bool {
+        registry
+            .penalties
+            .iter()
+            .any(|p| matches!(p, AnalyticPenaltyKind::Isometry(_)))
+            && self
+                .assignment
+                .coords
+                .iter()
+                .any(|coord| coord.manifold().preserves_isometry_cross_block_coherence())
+    }
+
     /// Extra analytic-penalty energy that has no native `SaeManifoldLoss`
     /// component but is part of the penalized objective ranked by the SAE
     /// Laplace/REML criterion.
@@ -3958,11 +3989,32 @@ impl SaeManifoldTerm {
         // touches `block.htbeta`. Allocating it at `beta_dim = K·M·p` there is the
         // ~6 TiB high-K leak (#1405/#1406): allocate ZERO columns instead. Frames
         // still use the (much smaller) factored border width.
-        let row_htbeta_dim = if frames_engaged && !fixed_decoder {
+        // #795/#1406/#1407: the non-frames matrix-free path normally holds a
+        // ZERO-width per-row cross-block slab — the data-fit `H_tβ` is carried by
+        // the Kronecker row operator (`set_row_htbeta_operator`), and allocating
+        // the dense slab at `beta_dim = K·M·p` is the high-K memory leak. But an
+        // ISOMETRY penalty on a coherence-preserving (flat) chart scatters an
+        // ADDITIONAL Gauss-Newton cross-block into the dense per-row `htbeta`
+        // slab and flips on `activate_dense_htbeta_supplement` — dropping it would
+        // leave the Newton system block-diagonal and forfeit the strong `t↔B`
+        // isometry coupling the circle fit needs to reach KKT stationarity (#795).
+        // So on the non-frames path widen the slab to `beta_dim` exactly when that
+        // dense supplement will be written, and keep zero width otherwise.
+        let dense_isometry_cross_block = !fixed_decoder
+            && analytic_penalties
+                .map(|registry| self.registry_writes_dense_isometry_cross_block(registry))
+                .unwrap_or(false);
+        let row_htbeta_dim = if fixed_decoder {
+            // Fixed-decoder mode skips the β tier entirely.
+            0
+        } else if frames_engaged {
             self.factored_border_dim()
+        } else if dense_isometry_cross_block {
+            // Matrix-free data-fit cross-block + dense isometry supplement: the
+            // supplement is written/read in the full-`B` β coordinate system.
+            beta_dim
         } else {
-            // #1406/#1407: matrix-free path and fixed-decoder mode hold no dense
-            // cross-block slab (fixed-decoder skips the β tier entirely).
+            // Matrix-free path with no dense cross-block supplement.
             0
         };
         // Build the Arrow-Schur system: heterogeneous row dims when a compact
