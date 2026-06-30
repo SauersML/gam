@@ -604,6 +604,7 @@ fn location_scale_fit_args(
     noise_formula: &str,
 ) -> FitArgs {
     FitArgs {
+        expectile_tau: None,
         data,
         formula_positional: formula.to_string(),
         predict_noise: Some(noise_formula.to_string()),
@@ -1223,6 +1224,7 @@ fn cli_surv_predict_noise_routes_to_survival_location_scale() {
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "write survival training csv", e));
 
     run_fit(FitArgs {
+        expectile_tau: None,
         data: train_path.clone(),
         formula_positional: "Surv(entry, exit, event) ~ 1".to_string(),
         predict_noise: Some("1".to_string()),
@@ -1443,6 +1445,7 @@ fn cli_bernoulli_marginal_slope_fit_saves_covariance_so_default_predict_succeeds
     write_bernoulli_marginal_slope_train_csv(&train_path);
 
     run_fit(FitArgs {
+        expectile_tau: None,
         data: train_path.clone(),
         formula_positional: "y ~ x".to_string(),
         predict_noise: None,
@@ -1536,6 +1539,7 @@ fn cli_bernoulli_marginal_slope_rejects_z_column_in_main_formula() {
     write_bernoulli_marginal_slope_train_csv(&train_path);
 
     let err = run_fit(FitArgs {
+        expectile_tau: None,
         data: train_path,
         formula_positional: "y ~ x + z".to_string(),
         predict_noise: None,
@@ -1585,6 +1589,7 @@ fn cli_bernoulli_marginal_slope_rejects_z_column_in_logslope_formula() {
     write_bernoulli_marginal_slope_train_csv(&train_path);
 
     let err = run_fit(FitArgs {
+        expectile_tau: None,
         data: train_path,
         formula_positional: "y ~ x".to_string(),
         predict_noise: None,
@@ -1855,6 +1860,7 @@ fn cli_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "write training csv", e));
 
     let fit_args = FitArgs {
+        expectile_tau: None,
         data: train_path.clone(),
         formula_positional: "y ~ x1 + x2".to_string(),
         predict_noise: None,
@@ -1940,6 +1946,7 @@ fn cli_fit_saves_covariance_so_default_binomial_predict_succeeds() {
 /// cap-guard regression tests below.
 fn binomial_link_fit_args(data: PathBuf, out: PathBuf, formula: &str) -> FitArgs {
     FitArgs {
+        expectile_tau: None,
         data,
         formula_positional: formula.to_string(),
         predict_noise: None,
@@ -2082,6 +2089,7 @@ fn cli_firth_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "write training csv", e));
 
     let fit_args = FitArgs {
+        expectile_tau: None,
         data: train_path.clone(),
         // Firth bias-reduction is only implemented for the binomial logit
         // likelihood. The auto-detect default for binary responses is

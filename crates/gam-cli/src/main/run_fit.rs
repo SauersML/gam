@@ -66,6 +66,7 @@ pub(crate) fn fit_config_from_fit_args(args: &FitArgs) -> Result<FitConfig, Stri
 pub(crate) fn fit_config_from_survival_args(args: &SurvivalArgs) -> Result<FitConfig, String> {
     crate::config_resolve::resolve_cli_fit_config(crate::config_resolve::CliFitConfigInput {
         family: None,
+        expectile_tau: None,
         negative_binomial_theta: None,
         link: args.link.clone(),
         flexible_link: false,
@@ -2205,6 +2206,7 @@ pub(crate) fn family_arg_name(arg: FamilyArg) -> &'static str {
         FamilyArg::Beta => "beta",
         FamilyArg::RoystonParmar => "royston-parmar",
         FamilyArg::TransformationNormal => "transformation-normal",
+        FamilyArg::Expectile => "expectile",
     }
 }
 
