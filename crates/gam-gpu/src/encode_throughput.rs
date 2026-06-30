@@ -211,7 +211,18 @@ pub fn cpu_oracle_normal_equations_solve(
         for s in 0..j {
             diag -= l[[j, s]] * l[[j, s]];
         }
-        let ljj = diag.max(0.0).sqrt();
+        // The oracle exists to be the truth the device is checked against, so a
+        // non-PD pivot must fail loudly here rather than clamp to 0 and launder
+        // a divide-by-zero into a silent NaN in the back-substitution. For the
+        // ridge·I + XᵀWX systems this is called on (ridge > 0, w > 0) the pivot
+        // is always strictly positive; a non-positive pivot means the caller
+        // passed a degenerate system and parity would be meaningless.
+        assert!(
+            diag > 0.0,
+            "cpu_oracle: non-positive Cholesky pivot {diag:.3e} at index {j} — \
+             the Gram is not positive-definite (need ridge>0 and w>0)"
+        );
+        let ljj = diag.sqrt();
         l[[j, j]] = ljj;
         for i in (j + 1)..p {
             let mut off = gram[[i, j]];

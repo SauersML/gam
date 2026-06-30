@@ -91,11 +91,12 @@ fn device_resident_solve_matches_cpu_oracle() {
 
     assert_eq!(gpu_beta.len(), cpu_beta.len());
     // Tolerance: the two solves differ only by IEEE-754 reduction order in the
-    // Gram and the triangular solves (device fused POTRF/TRSM vs host
-    // left-looking Cholesky). For a p=2048, well-conditioned ridge=1e-3 system
-    // with O(0.05)-scale entries, accumulated reduction-order drift across the
-    // p² Gram dot-products and the two triangular sweeps stays well under 1e-6
-    // relative. We assert a conservative absolute+relative bound on β.
+    // Gram and the triangular solves (device cuSOLVER POTRF + cuBLAS TRSM vs
+    // host left-looking Cholesky). For this well-conditioned ridge=1e-3, p=512
+    // system with O(0.05)-scale entries, accumulated reduction-order drift
+    // across the p² Gram dot-products and the two triangular sweeps stays well
+    // under 1e-6 relative (measured ~1e-14 on the V100). We assert a
+    // conservative absolute+relative bound on β.
     let mut max_abs = 0.0_f64;
     let mut max_rel = 0.0_f64;
     for (g, c) in gpu_beta.iter().zip(cpu_beta.iter()) {
