@@ -3310,6 +3310,79 @@ pub(crate) fn sae_direct_inner_solve_engages_device_and_matches_cpu_1551() {
     let m_active = 4usize;
     let (mut sys, _a_phi, _jac) = sae_structured_system(n, q, p, n_atoms, m_active);
 
+    // The device non-framed `H_ββ` is assembled from `data.sparse_g_blocks` (as
+    // `G ⊗ I_p`), NOT from `sys.hbb` (which only the dense reference reads). For a
+    // sound parity fixture the two MUST encode the same matrix. In
+    // `sae_structured_system` each atom owns `p` consecutive β slots (μ-space
+    // index = atom, so `m_i = 1`), so a dominant diagonal `H_ββ` is one 1×1
+    // `SparseGBlock` per atom. Make it strongly diagonally dominant so the reduced
+    // Schur `S = (H_ββ + ρI) − Σ_i H_βt^(i)(H_tt^(i)+ρI)⁻¹ H_tβ^(i)` stays PD once
+    // the n=512-row subtraction accumulates (otherwise the device correctly fails
+    // loud on a non-positive Schur Jacobi diagonal — that fail-loud IS the #1551
+    // contract, just not what this parity fixture is exercising).
+    let hbb_diag = (n as f64) + 1000.0;
+    let mut sparse_g_blocks = Vec::with_capacity(n_atoms);
+    let mut new_hbb = Array2::<f64>::zeros((sys.k, sys.k));
+    for atom in 0..n_atoms {
+        sparse_g_blocks.push(SparseGBlock {
+            row_off: atom,
+            col_off: atom,
+            data: ndarray::array![[hbb_diag]],
+        });
+        // `G ⊗ I_p`: the 1×1 μ-block at (atom, atom) puts `hbb_diag` on the
+        // diagonal of all p channels of this atom's β slots.
+        for c in 0..p {
+            new_hbb[[atom * p + c, atom * p + c]] = hbb_diag;
+        }
+    }
+    sys.hbb = new_hbb;
+    // Reinstall the device payload carrying the matching sparse-G data Hessian.
+    {
+        let device = sys
+            .device_sae_pcg
+            .as_ref()
+            .expect("fixture installs device data");
+        let new_device = DeviceSaePcgData {
+            p: device.p,
+            beta_dim: device.beta_dim,
+            a_phi: std::sync::Arc::clone(&device.a_phi),
+            local_jac: std::sync::Arc::clone(&device.local_jac),
+            smooth_blocks: device.smooth_blocks.clone(),
+            sparse_g_blocks,
+            frame: None,
+        };
+        sys.set_device_sae_pcg_data(new_device);
+    }
+
+    // PARITY-ORACLE CONSISTENCY: `solve_arrow_newton_step_dense_reference` reads
+    // the cross-block `H_tβ` from `row.htbeta` DIRECTLY — it does not invoke the
+    // installed `htbeta_matvec` operator. But `sae_structured_system` ships the
+    // coupling ONLY as that matrix-free operator (`row.htbeta` is all-zeros), so
+    // an unmaterialized fixture makes the dense reference solve a DECOUPLED system
+    // (H_tβ ≡ 0) while the device solves the true coupled one — the parity gap is
+    // then the omitted coupling term, not a kernel/conditioning artifact. Materialize
+    // the operator into each `row.htbeta` (exact for a linear operator: probe with
+    // unit columns). With `htbeta_dense_supplement == false` the production apply
+    // (`sys_htbeta_apply_row`) still uses the operator ONLY, so the device/CPU
+    // matrix-free path is unchanged; the dense reference now reads the identical
+    // operator. All three paths (device PCG, CPU reduced, dense reference) then
+    // encode one and the same `H_tβ`.
+    assert!(
+        !sys.htbeta_dense_supplement,
+        "fixture must keep dense-supplement OFF so the matrix-free apply uses the \
+         operator only (row.htbeta is the dense ECHO for the reference, not a second \
+         additive slab)"
+    );
+    let materialized: Vec<Array2<f64>> = (0..sys.rows.len())
+        .map(|i| {
+            sys_htbeta_materialize_row(&sys, i, &sys.rows[i])
+                .expect("materialize row H_tβ from installed operator")
+        })
+        .collect();
+    for (i, mat) in materialized.into_iter().enumerate() {
+        sys.rows[i].htbeta = mat;
+    }
+
     // The fixture ships zero gradients (trivial zero step); install deterministic
     // nonzero g_t / g_β so the solved Δ is a real, discriminating vector.
     for (i, row) in sys.rows.iter_mut().enumerate() {
