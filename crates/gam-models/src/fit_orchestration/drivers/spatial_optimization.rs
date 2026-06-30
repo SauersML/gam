@@ -2393,6 +2393,133 @@ fn prescan_isotropic_spatial_range_seed(
     Ok(overrides)
 }
 
+/// Fractions of each isotropic term's data-derived ψ window used as joint-solve
+/// restart seeds in the #1688 multistart rescue. They run from the long-range
+/// (stiff) corner at `0.0` through the short-range (flexible) corner at `1.0`,
+/// deliberately spanning BOTH local basins of the multimodal `[ρ, ψ]` REML
+/// surface so a restart lands in the global basin regardless of which side the
+/// auto-seed stranded the primary solve on. Five points keep the rare-trigger
+/// cost bounded while guaranteeing a seed in the long-range half (which the
+/// profiled-REML pre-scan systematically under-ranks for the roughest kernels).
+const JOINT_RESTART_WINDOW_FRACTIONS: [f64; 5] = [0.0, 0.2, 0.45, 0.7, 1.0];
+
+/// #1688 joint-solve multistart from a single ψ-window fraction.
+///
+/// Re-seeds every isotropic spatial term's length scale to `ℓ = exp(−ψ)` at the
+/// requested `fraction` of its data-derived ψ window, then runs the FULL
+/// baseline → freeze → joint `[ρ, ψ]` sequence at that geometry and returns the
+/// realized result with its certified REML score. This is the same machinery the
+/// primary path runs — only the seed differs — so a candidate it returns is a
+/// genuine production fit, never a heuristic stand-in.
+///
+/// Returns `Ok(None)` only when the seed geometry is non-constructible (e.g. a
+/// baseline fit that errors at an extreme range, or no free length scale after
+/// the freeze-time basis promotion); callers treat that as "this restart point
+/// is infeasible, skip it" rather than failing the fit. When the joint refine
+/// itself yields no usable candidate, the seed's frozen baseline geometry is a
+/// valid κ-optimized result (ρ profiled at the fixed seeded κ) and is returned.
+fn joint_solve_from_window_fraction(
+    data: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    base_spec: &TermCollectionSpec,
+    spatial_terms: &[usize],
+    fraction: f64,
+    family: &LikelihoodSpec,
+    options: &FitOptions,
+    baseline_options: &FitOptions,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
+) -> Result<Option<(FittedTermCollectionWithSpec, f64)>, EstimationError> {
+    let mut seed_spec = base_spec.clone();
+    let mut any_set = false;
+    for &term_idx in spatial_terms {
+        if get_spatial_length_scale(&seed_spec, term_idx).is_none() {
+            continue;
+        }
+        let (psi_lo, psi_hi) = spatial_term_psi_bounds(data, &seed_spec, term_idx, kappa_options);
+        if !(psi_lo.is_finite() && psi_hi.is_finite()) || psi_hi <= psi_lo {
+            continue;
+        }
+        let psi = psi_lo + (psi_hi - psi_lo) * fraction;
+        let ls = (-psi).exp();
+        if !ls.is_finite() || ls <= 0.0 {
+            continue;
+        }
+        if set_spatial_length_scale(&mut seed_spec, term_idx, ls).is_ok() {
+            any_set = true;
+        }
+    }
+    if !any_set {
+        return Ok(None);
+    }
+    // Baseline at the seeded geometry: this both supplies the joint solver's ρ
+    // seed / frozen-baseline fallback AND becomes the returned candidate if the
+    // joint refine is unavailable. A non-constructible seed geometry is skipped.
+    let seed_best = match fit_term_collection_forspec(
+        data,
+        y,
+        weights,
+        offset,
+        &seed_spec,
+        family.clone(),
+        baseline_options,
+    ) {
+        Ok(fit) => fit,
+        Err(_) => return Ok(None),
+    };
+    let seed_spec = freeze_term_collection_from_design(&seed_spec, &seed_best.design)?;
+    // The freeze can promote ThinPlate → pure Duchon (no free length scale);
+    // refresh the eligible-term list exactly as the primary path does.
+    let seed_terms = spatial_length_scale_term_indices(&seed_spec);
+    if seed_terms.is_empty() {
+        let score = fit_score(&seed_best.fit);
+        return Ok(Some((
+            FittedTermCollectionWithSpec {
+                fit: seed_best.fit,
+                design: seed_best.design,
+                resolvedspec: seed_spec,
+                adaptive_diagnostics: seed_best.adaptive_diagnostics,
+                kappa_timing: None,
+            },
+            score,
+        )));
+    }
+    let joint = try_exact_joint_spatial_length_scale_optimization(
+        data,
+        y,
+        weights,
+        offset,
+        &seed_spec,
+        &seed_best,
+        family.clone(),
+        options,
+        kappa_options,
+        &seed_terms,
+    )?;
+    match joint {
+        Some(fit) => {
+            let score = fit_score(&fit.fit);
+            Ok(Some((fit, score)))
+        }
+        // Joint refine unavailable for this seed; its frozen baseline geometry
+        // is itself a valid κ-optimized fit, so return that as the candidate.
+        None => {
+            let score = fit_score(&seed_best.fit);
+            Ok(Some((
+                FittedTermCollectionWithSpec {
+                    fit: seed_best.fit,
+                    design: seed_best.design,
+                    resolvedspec: seed_spec,
+                    adaptive_diagnostics: seed_best.adaptive_diagnostics,
+                    kappa_timing: None,
+                },
+                score,
+            )))
+        }
+    }
+}
+
 fn try_exact_joint_spatial_length_scale_optimization(
     data: ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
@@ -8127,6 +8254,16 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
     if !initial_score.is_finite() {
         log::debug!("[spatial-kappa] initial profiled score is non-finite");
     }
+    // #1688: snapshot the per-term seed length scales the joint solve starts
+    // from. If the joint solve neither improves the score NOR moves the geometry
+    // off these values, it stalled and kept the frozen baseline — the precise
+    // signature that triggers the ψ-window multistart rescue below. (A joint
+    // solve that genuinely converged to its seed basin still moves ψ off the
+    // exact seed, so this distinguishes a stall from a healthy local optimum.)
+    let seed_length_scales: Vec<(usize, f64)> = spatial_terms
+        .iter()
+        .filter_map(|&t| get_spatial_length_scale(&resolvedspec, t).map(|ls| (t, ls)))
+        .collect();
     let joint_result = try_exact_joint_spatial_length_scale_optimization(
         data,
         y.view(),
@@ -8173,6 +8310,113 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
     } else {
         require_successful_spatial_optimization_result(initial_score, joint_result)?
     };
+
+    // #1688: conditional joint-solve MULTISTART rescue.
+    //
+    // The joint [ρ, ψ] REML surface of an isotropic radial GP smooth is genuinely
+    // multimodal in the kernel range, and the local ARC/BFGS solver descends into
+    // whichever basin holds its seed. When the auto-seed (`max_range/√n`, the
+    // wiggly side since #1629) lands in a flat valley between the two basins, the
+    // local solver STALLS — it returns NonConverged at a large gradient and keeps
+    // the frozen baseline geometry, so the realized score never improves on the
+    // seed's profiled REML (the observed ν=3/2 boundary over-smoothing: edge RMSE
+    // 4× the interior, REML ~7 nats worse than the reachable global basin).
+    //
+    // The #1074 pre-scan does not rescue this case: it ranks restart seeds by
+    // FIXED-κ profiled REML (ρ-opt at fixed ψ), which is a poor predictor of the
+    // JOINT outcome reachable from a seed — the global-basin seeds score WORSE on
+    // the profiled proxy than the stalled auto-seed basin, so the strict-
+    // improvement gate adopts none of them. The only honest ranking is the
+    // realized joint REML itself.
+    //
+    // So: only when the primary joint solve produced NO REML improvement over its
+    // baseline (the exact stall signature) do we re-run the full baseline → joint
+    // sequence from a handful of seeds spanning the data-derived ψ window (long-
+    // range corner through short-range corner) and keep the best REALIZED joint
+    // score. This fires on a vanishing fraction of fits — a healthy joint solve
+    // that moves ψ off the seed improves the score and skips the rescue entirely,
+    // so the matern/GP fast path #1688 is about keeps its speed. Isotropic/non-CC
+    // only: anisotropic and constant-curvature terms carry their own seeding.
+    let exact_joint = {
+        let primary_score = fit_score(&exact_joint.fit);
+        let improved = primary_score.is_finite()
+            && initial_score.is_finite()
+            && primary_score < initial_score - 1e-7 * initial_score.abs().max(1.0);
+        // Base the eligibility checks and the restart seeds on the realized
+        // (frozen, κ-optimized) spec the primary path produced: it carries the
+        // same term structure with resolved centers, and the parent `resolvedspec`
+        // has already been moved into `exact_joint` on the pre-scan fallback path.
+        let base_spec = exact_joint.resolvedspec.clone();
+        // Did the joint solve keep the frozen baseline geometry (no length scale
+        // moved off its seed)? That, combined with no score gain, is the stall.
+        let geometry_unchanged = !seed_length_scales.is_empty()
+            && seed_length_scales.iter().all(|&(t, seed_ls)| {
+                get_spatial_length_scale(&base_spec, t)
+                    .is_some_and(|ls| (ls - seed_ls).abs() <= 1e-6 * seed_ls.abs().max(1.0))
+            });
+        let eligible = !improved
+            && geometry_unchanged
+            && !has_aniso_terms(&base_spec, &spatial_terms)
+            && constant_curvature_term_indices(&base_spec).is_empty()
+            && spatial_terms
+                .iter()
+                .any(|&t| get_spatial_length_scale(&base_spec, t).is_some());
+        if eligible {
+            log::info!(
+                "[spatial-kappa] #1688 joint solve stalled at REML {primary_score:.5} \
+                 (no improvement over baseline {initial_score:.5}); running ψ-window \
+                 multistart rescue across {} seeds",
+                JOINT_RESTART_WINDOW_FRACTIONS.len(),
+            );
+            let mut best_fit = exact_joint;
+            // Lower REML is better; the incumbent is the primary stalled result.
+            let mut best_score = primary_score;
+            for &fraction in JOINT_RESTART_WINDOW_FRACTIONS.iter() {
+                match joint_solve_from_window_fraction(
+                    data,
+                    y.view(),
+                    weights.view(),
+                    offset.view(),
+                    &base_spec,
+                    &spatial_terms,
+                    fraction,
+                    &family,
+                    options,
+                    &baseline_options,
+                    kappa_options,
+                ) {
+                    Ok(Some((candidate, score))) => {
+                        if score.is_finite()
+                            && (!best_score.is_finite()
+                                || score < best_score - 1e-7 * best_score.abs().max(1.0))
+                        {
+                            log::info!(
+                                "[spatial-kappa] #1688 multistart seed (ψ-window {fraction:.2}) \
+                                 reached REML {score:.5}, improving on {best_score:.5}",
+                            );
+                            best_score = score;
+                            best_fit = candidate;
+                        }
+                    }
+                    // Infeasible seed geometry — skip this restart point.
+                    Ok(None) => {}
+                    // A restart's full re-fit can hit a genuine fatal error; the
+                    // incumbent (the primary result) is already valid, so log and
+                    // keep going rather than sinking the whole fit on one seed.
+                    Err(e) => {
+                        log::info!(
+                            "[spatial-kappa] #1688 multistart seed (ψ-window {fraction:.2}) \
+                             failed ({e}); skipping"
+                        );
+                    }
+                }
+            }
+            best_fit
+        } else {
+            exact_joint
+        }
+    };
+
     log_spatial_aniso_scales(&exact_joint.resolvedspec);
     Ok(exact_joint)
 }
