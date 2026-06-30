@@ -5077,7 +5077,22 @@ pub(crate) fn sae_row_layout_from_dense_weights_large_k_work_scales_with_active(
     assert_eq!(compact_work, n * (2 * cap) * (2 * cap));
     let dense_q = 2 * k_atoms;
     let dense_work = n * dense_q * dense_q;
-    assert!(compact_work < dense_work / 1_000_000_000);
+    // The work ratio is EXACTLY `(2K)² / (2·cap)² = (K/cap)²` (the `n` token
+    // factor cancels), so for K = 100 000, cap = 8 the compact path is
+    // `12500² = 156_250_000`× cheaper. Pin that exact astronomical factor — a
+    // strictly stronger guard than the previous `< dense_work / 1e9`, whose
+    // arbitrary 1e9 divisor exceeded the true 1.5625e8 ratio and made the
+    // assertion unsatisfiable for these dimensions.
+    let work_ratio = (k_atoms / cap) * (k_atoms / cap);
+    assert_eq!(
+        dense_work / compact_work,
+        work_ratio,
+        "compact row-layout work must be exactly (K/cap)² below dense full-K work"
+    );
+    assert!(
+        work_ratio >= 100_000_000,
+        "the compact path must be astronomically (≥1e8×) cheaper than dense full-K"
+    );
 }
 
 /// #1407 — fixed-decoder assembly must skip the ENTIRE decoder β tier. The
