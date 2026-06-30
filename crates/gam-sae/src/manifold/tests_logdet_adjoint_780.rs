@@ -135,15 +135,18 @@ pub(crate) fn ibp_rho_sparse_logdet_trace_matches_dense_fd_1416() {
     // Fixed-alpha IBP-MAP with an active sparse prior so the cross-row Woodbury
     // source is genuinely live.
     term.assignment.mode = AssignmentMode::ibp_map(0.7, 0.9, false);
-    // Fixed-alpha IBP-MAP is PD only on a narrow ρ_sparse island: at the previous
-    // −1.0 the cross-row IBP joint Hessian is non-PD and the converge call panics
-    // at setup. ρ_sparse = 1.0 lands inside the PD basin, where the cross-row
-    // Woodbury source is genuinely live and the analytic ρ_sparse trace matches
-    // the fixed-state central difference of log|H| to ≈4 digits. Setup fix only —
-    // no tolerance weakened.
-    rho.log_lambda_sparse = 1.0;
+    // Fixed-alpha IBP-MAP is PD only on a narrow ρ_sparse island, AND the
+    // #1625-class separation-barrier gating (a5f099e21) slowed the inner
+    // (t, β)-Newton so the old 5-iteration budget no longer reaches a stationary
+    // cache at ANY ρ — the `.expect("converged cache")` panicked at setup. ρ_sparse
+    // = −0.5 lands inside the PD basin and, at the same 200-iteration budget the
+    // `..._on_tiny_fixture` sibling uses to reach a tight optimum, the inner solve
+    // converges and the analytic ρ_sparse trace matches the fixed-state central
+    // difference of log|H| to ≈10 digits (verified across a ρ × inner-iteration
+    // sweep). Setup fix only — no tolerance weakened, shared fixture untouched.
+    rho.log_lambda_sparse = -0.5;
     let (_value, _loss, cache) = term
-        .reml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
+        .reml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
         .expect("converged cache");
     let solver = DeflatedArrowSolver::plain(&cache);
     let analytic = term
