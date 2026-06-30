@@ -18,9 +18,16 @@ This test asserts, for a known smooth, that:
 * ``average_derivative`` recovers the analytic mean derivative.
 
 Two functions are checked to be robust to the accidental value==derivative
-coincidence: ``f(x) = sin(2*pi*x)`` (mean derivative = mean 2*pi*cos(2*pi*x),
-sign-distinct from the mean value) and ``f(x) = x**2`` on ``[0, 2]`` (mean
+coincidence: ``f(x) = sin(pi*x)`` on ``[0, 1]`` — a *half* period, so its mean
+value ``E[sin(pi*x)] = 2/pi ~= 0.637`` is well-separated from its mean
+derivative ``E[pi*cos(pi*x)] ~= 0`` — and ``f(x) = x**2`` on ``[0, 2]`` (mean
 derivative = E[2x] ~= 2.0, value ~= 1.34) exactly as filed in #1120.
+
+(Earlier this used ``sin(2*pi*x)`` over a *full* period, where BOTH the mean
+value and the mean derivative are ~0; the "derivative is far from the value"
+assertion was then mathematically unsatisfiable even when the code is correct,
+so it flagged correct behavior — a banned XFAIL-by-accident. A half period
+separates the two truths honestly without weakening the #1120 check.)
 """
 
 from __future__ import annotations
@@ -42,16 +49,20 @@ def test_average_derivative_recovers_sin_derivative_not_value() -> None:
     rng = np.random.default_rng(7)
     n = 2000
     x = rng.uniform(0.0, 1.0, n)
-    # f(x) = sin(2*pi*x); f'(x) = 2*pi*cos(2*pi*x).
-    y = np.sin(2.0 * np.pi * x) + rng.normal(0.0, 0.05, n)
+    # f(x) = sin(pi*x) on [0, 1] (a HALF period); f'(x) = pi*cos(pi*x).
+    # Mean value E[sin(pi*x)] = 2/pi ~= 0.637 is well-separated from the mean
+    # derivative E[pi*cos(pi*x)] ~= 0, so "derivative is far from the value"
+    # below is a genuine, satisfiable check (unlike a full sin(2*pi*x) period,
+    # where both truths are ~0 and the assertion can never hold).
+    y = np.sin(np.pi * x) + rng.normal(0.0, 0.05, n)
     df = pd.DataFrame({"x": x, "y": y})
     model = gamfit.fit(df, "y ~ s(x)")
 
     ad = model.debiased_functional(df, target="average_derivative")
     av = model.debiased_functional(df, target="average_value")
 
-    truth_deriv = float(np.mean(2.0 * np.pi * np.cos(2.0 * np.pi * x)))
-    truth_value = float(np.mean(np.sin(2.0 * np.pi * x)))
+    truth_deriv = float(np.mean(np.pi * np.cos(np.pi * x)))
+    truth_value = float(np.mean(np.sin(np.pi * x)))
 
     # (a) The two estimands must NOT be identical (the #1120 symptom).
     assert abs(ad["theta_debiased"] - av["theta_debiased"]) > 1e-3, (

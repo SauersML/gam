@@ -652,8 +652,28 @@ pub(crate) fn arrow_schur_matches_dense_reference_2x2() {
     let (delta_t_stream, delta_beta_stream, _diag_stream) = sys
         .solve_with_options(0.0, 0.0, &streaming_options)
         .expect("streaming arrow-schur solve");
-    assert_eq!(delta_beta, delta_beta_stream);
-    assert_eq!(delta_t, delta_t_stream);
+    // The streaming/residency reduced-Schur solve runs CERTIFIED MIXED PRECISION
+    // by default (#1014: κ-gated f32 factor + f64 residual refinement, automatic
+    // f64 fallback). It is f64-ACCURATE — the residual refinement drives the
+    // reported step to full double precision — but it is NOT bit-identical to the
+    // pure-f64 `direct()` path, because the f32 factor reorders the floating-point
+    // accumulation. So compare to a tight ULP-scale tolerance, not `assert_eq!`
+    // (the old bit-identity assertion predates the #1014 mixed-precision default).
+    let stream_atol = 1e-12;
+    for (a, (&d_direct, &d_stream)) in delta_beta.iter().zip(delta_beta_stream.iter()).enumerate() {
+        assert!(
+            (d_direct - d_stream).abs() <= stream_atol * (1.0 + d_direct.abs()),
+            "Δβ[{a}] streaming vs direct mismatch beyond certified-mixed tolerance: \
+             direct {d_direct} vs streaming {d_stream}"
+        );
+    }
+    for (i, (&d_direct, &d_stream)) in delta_t.iter().zip(delta_t_stream.iter()).enumerate() {
+        assert!(
+            (d_direct - d_stream).abs() <= stream_atol * (1.0 + d_direct.abs()),
+            "Δt[{i}] streaming vs direct mismatch beyond certified-mixed tolerance: \
+             direct {d_direct} vs streaming {d_stream}"
+        );
+    }
 
     // Build dense reference: order is [β; t_0; t_1] = K + N·d entries.
     let total = k + n * d;
@@ -701,6 +721,29 @@ pub(crate) fn arrow_schur_matches_dense_reference_2x2() {
             assert!(
                 (dense - arrow).abs() < 1e-10,
                 "t[{i},{a}] mismatch: dense {dense} vs arrow {arrow}"
+            );
+        }
+    }
+    // The certified-mixed streaming solve must ALSO match the dense reference to
+    // the same 1e-10 accuracy bar (its residual refinement drives Δ to full f64
+    // accuracy): it is a distinct accuracy assertion from the streaming-vs-direct
+    // ULP check above, and pins that the mixed-precision path is genuinely
+    // f64-accurate against ground truth, not merely close to the direct path.
+    for a in 0..k {
+        assert!(
+            (xref[a] - delta_beta_stream[a]).abs() < 1e-10,
+            "β[{a}] streaming mismatch vs dense ref: dense {} vs streaming {}",
+            xref[a],
+            delta_beta_stream[a]
+        );
+    }
+    for i in 0..n {
+        for a in 0..d {
+            let dense = xref[k + i * d + a];
+            let arrow = delta_t_stream[i * d + a];
+            assert!(
+                (dense - arrow).abs() < 1e-10,
+                "t[{i},{a}] streaming mismatch vs dense ref: dense {dense} vs streaming {arrow}"
             );
         }
     }

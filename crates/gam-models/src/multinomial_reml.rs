@@ -2120,7 +2120,7 @@ mod tests {
         ///
         /// #932 cutover: this dense block assembly is no longer on the production
         /// outer-Hessian path (the matrix-free `MultinomialDirectionalHyperOperator`
-        /// replaced it). It is retained, `cfg(test)`-only, as the reference the
+        /// replaced it). It lives here in the test module as the reference the
         /// ≤1e-10 parity oracle contracts the matrix-free operator against.
         fn assemble_directional_derivatives_from_probs(
             &self,
@@ -2245,7 +2245,7 @@ mod tests {
         /// This fused path keeps the singular formula but amortizes the row walk
         /// across the whole `K(K+1)/2` pair batch (#1082).
         ///
-        /// #932 cutover: `cfg(test)`-only, retained as the parity oracle's dense
+        /// #932 cutover: test-module reference, the parity oracle's dense
         /// reference (see `assemble_directional_derivatives_from_probs`).
         fn assemble_second_directional_derivatives_from_probs(
             &self,

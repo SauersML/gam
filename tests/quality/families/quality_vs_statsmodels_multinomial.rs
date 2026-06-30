@@ -675,26 +675,39 @@ emit("probs", probs_gam.reshape(-1))        # row-major flat
 // accuracy match-or-beat statsmodels) but do NOT exercise the #1101 UNCERTAINTY
 // machinery — the delta-method per-class probability standard errors carried on
 // `MultinomialSavedModel` and surfaced through `predict_*_with_se`. This arm
-// closes that gap by asserting the SE intervals are CALIBRATED: a nominal-(1−α)
-// Wald interval `p̂_c ± z·SE(p̂_c)` for each held-out (row, class) must cover the
-// TRUE class probability at ≈ (1−α) frequency.
+// closes that gap with TWO statistically-valid checks of that machinery.
 //
-// Calibration of an interval requires the GROUND-TRUTH quantity it claims to
-// bracket. On the penguins real data the true class-membership probability of a
-// bird is unknown (only its realized label is observed), so a *probability*-SE
-// calibration check is only well-posed under a KNOWN data-generating softmax.
-// We therefore use a principled generated DGP (an explicit `true_beta` over two
-// numeric covariates, class K−1 the reference), exactly as the synthetic arm at
-// the top of this file does for the point metric — the truth is the irreducible
-// reference here, not a mature tool. The comparator role is the delta-method
-// itself: a correctly-derived softmax-Jacobian SE against the Laplace posterior
-// covariance must produce intervals whose realized coverage matches nominal.
+// WHY TWO CHECKS (and what the original single check got wrong). The first
+// revision of this arm asserted "interval coverage ≈ 0.95" by counting, across
+// 2000 covariate points of ONE fitted model, how often `p̂_c ± z·SE` bracketed
+// the true probability. That is statistically DEGENERATE: every point shares the
+// SAME estimation error β̂ − β, so the 2000 deviations are not independent draws
+// — they are 2000 deterministic projections of a single error vector. Coverage
+// measured that way is a fixed number for a given seed (it came out 1.0000 here,
+// not anywhere near 0.95) and tells you nothing about whether SE is the right
+// SIZE. Interval calibration is by definition a statement OVER REPEATED FITS:
+// resample the training data, refit, and ask how often the interval at a fixed
+// point covers the truth. So:
 //
-// Why this strengthens coverage beyond the existing tests: it is the ONLY arm
-// that drives `predict_multinomial_formula_with_se` / the stored
-// `coefficient_covariance` (#1101) and validates the SE values numerically (an
-// SE that is systematically too small/large, a wrong Jacobian sign, or a
-// mis-block-ordered covariance would skew realized coverage away from nominal).
+//   (A) `..._covariance_equals_observed_information_inverse` — a DETERMINISTIC
+//       exactness pin. The stored joint covariance must equal the independently
+//       hand-built multinomial observed-information inverse at the fitted
+//       coefficients, in the same θ[a·P+i] block-ordering. This catches a wrong
+//       scale, a transposed/mis-ordered block, or a dropped cross-term directly,
+//       with no Monte-Carlo noise. (#1101 was closed without this pin; the bug
+//       was in the TEST, not the machinery — this nails the machinery down.)
+//
+//   (B) `..._intervals_are_calibrated_over_refits` — the PROPER calibration
+//       experiment. Resample the training set N times, refit, and measure how
+//       often the nominal-95% interval at a few FIXED test points covers the
+//       KNOWN true probability. A correctly-derived softmax-Jacobian SE against
+//       the Laplace covariance lands this near 0.95; a mis-scaled SE would not.
+//
+// Calibration needs the GROUND-TRUTH quantity the interval brackets. On real
+// penguins the true class-membership probability is unknown (only the realized
+// label is seen), so a *probability*-SE check is only well-posed under a KNOWN
+// data-generating softmax — hence the explicit `true_beta` DGP (class K−1 the
+// reference), exactly as the synthetic point arm at the top of this file.
 // ===========================================================================
 
 /// `1.959963984540054 = Φ⁻¹(0.975)`, the two-sided 95% normal Wald multiplier.
@@ -725,12 +738,155 @@ fn true_softmax_3(coef: &Array2<f64>, x1: f64, x2: f64) -> [f64; 3] {
     probs
 }
 
+
+/// Dense inverse via Gauss-Jordan with partial pivoting. Used to build the
+/// independent multinomial observed-information inverse the exactness pin below
+/// compares against — `D = P·M` is tiny here (6×6), so a textbook elimination is
+/// both adequate and dependency-free.
+fn invert_dense(a: &Array2<f64>) -> Option<Array2<f64>> {
+    let n = a.nrows();
+    let mut m = a.clone();
+    let mut inv = Array2::<f64>::eye(n);
+    for col in 0..n {
+        // partial pivot on the largest-magnitude entry in this column
+        let mut piv = col;
+        let mut best = m[[col, col]].abs();
+        for r in (col + 1)..n {
+            if m[[r, col]].abs() > best {
+                best = m[[r, col]].abs();
+                piv = r;
+            }
+        }
+        if best < 1e-14 {
+            return None;
+        }
+        if piv != col {
+            for c in 0..n {
+                m.swap((col, c), (piv, c));
+                inv.swap((col, c), (piv, c));
+            }
+        }
+        let d = m[[col, col]];
+        for c in 0..n {
+            m[[col, c]] /= d;
+            inv[[col, c]] /= d;
+        }
+        for r in 0..n {
+            if r == col {
+                continue;
+            }
+            let f = m[[r, col]];
+            if f == 0.0 {
+                continue;
+            }
+            for c in 0..n {
+                let mv = m[[col, c]];
+                let iv = inv[[col, c]];
+                m[[r, c]] -= f * mv;
+                inv[[r, c]] -= f * iv;
+            }
+        }
+    }
+    Some(inv)
+}
+
+/// Build the multinomial observed information `I(β̂)` at the fitted active-class
+/// coefficients in the gam stacking `θ[a·P+i] = β[i,a]` (reference class last,
+/// η ≡ 0). For row x with active-class probabilities `p_a`, the per-row Hessian
+/// block is `(δ_ab p_a − p_a p_b) · xᵢ xⱼ`; the information is the sum over rows.
+/// This is the textbook softmax Fisher/observed information the Laplace
+/// covariance must invert to (the unpenalized DGP makes S_λ negligible here).
+fn multinomial_observed_information(beta: &Array2<f64>, xrows: &[[f64; 3]]) -> Array2<f64> {
+    let p = beta.nrows();
+    let m = beta.ncols();
+    let d = p * m;
+    let mut info = Array2::<f64>::zeros((d, d));
+    for xr in xrows {
+        let mut eta = vec![0.0f64; m];
+        for (a, eta_a) in eta.iter_mut().enumerate() {
+            let mut v = 0.0;
+            for (i, xv) in xr.iter().enumerate() {
+                v += xv * beta[[i, a]];
+            }
+            *eta_a = v;
+        }
+        // softmax with the reference class baseline η ≡ 0 included
+        let maxe = eta.iter().cloned().fold(0.0f64, f64::max);
+        let mut denom = (0.0 - maxe).exp();
+        let mut pa = vec![0.0f64; m];
+        for (a, pa_a) in pa.iter_mut().enumerate() {
+            *pa_a = (eta[a] - maxe).exp();
+            denom += *pa_a;
+        }
+        for pa_a in pa.iter_mut() {
+            *pa_a /= denom;
+        }
+        for a in 0..m {
+            for b in 0..m {
+                let w = if a == b { pa[a] * (1.0 - pa[a]) } else { -pa[a] * pa[b] };
+                if w == 0.0 {
+                    continue;
+                }
+                for i in 0..p {
+                    for j in 0..p {
+                        info[[a * p + i, b * p + j]] += w * xr[i] * xr[j];
+                    }
+                }
+            }
+        }
+    }
+    info
+}
+
+/// Draw one class label for covariate `(x1, x2)` under the known softmax DGP,
+/// using the supplied U[-2,2] generator for the inverse-CDF draw.
+fn draw_label(true_coef: &Array2<f64>, x1: f64, x2: f64, next_unif: &mut dyn FnMut() -> f64) -> usize {
+    let probs = true_softmax_3(true_coef, x1, x2);
+    let u01 = (next_unif() + 2.0) / 4.0;
+    let mut cum = 0.0_f64;
+    for (c, pc) in probs.iter().enumerate() {
+        cum += pc;
+        if u01 < cum {
+            return c;
+        }
+    }
+    2 // reference class fallback (numerical tail)
+}
+
+const MN_CLASS_NAMES: [&str; 3] = ["a", "b", "c"];
+
+/// The known data-generating active-class coefficients for the #1101 arm. Class
+/// labels "a"/"b"/"c"; gam fixes the LAST level (lexicographic "c") as reference,
+/// so the DGP uses class index 2 ("c") as the η ≡ 0 reference to share the gauge
+/// with the fitted model. Moderate magnitudes keep the classes overlapping
+/// (well-conditioned, finite MLE) — the asymptotic-normal regime where a
+/// correctly-derived delta-method SE is well-calibrated.
+fn mn_true_coef() -> Array2<f64> {
+    let true_beta_rows: [[f64; 3]; 2] = [
+        [0.5, 1.1, -0.7],  // class "a": intercept, x1, x2
+        [-0.4, -0.8, 0.9], // class "b"
+    ];
+    let mut true_coef = Array2::<f64>::zeros((3, 2));
+    for (a, brow) in true_beta_rows.iter().enumerate() {
+        for (p, bp) in brow.iter().enumerate() {
+            true_coef[[p, a]] = *bp;
+        }
+    }
+    true_coef
+}
+
 #[test]
-fn multinomial_per_class_probability_se_intervals_are_calibrated() {
+fn multinomial_coefficient_covariance_equals_observed_information_inverse() {
+    // EXACTNESS PIN (#1101). The delta-method per-class probability SE is only as
+    // trustworthy as the joint covariance it contracts the softmax Jacobian
+    // against. Here we fit the known softmax DGP and assert the model's STORED
+    // `coefficient_covariance` equals the independently hand-built multinomial
+    // observed-information inverse at the fitted coefficients, in the SAME
+    // θ[a·P+i] block-ordering. This is deterministic (no Monte-Carlo): a wrong
+    // scale, a transposed/mis-ordered block, or a dropped cross-term shows up as
+    // a ratio that departs from 1. The original closing of #1101 lacked this pin.
     init_parallelism();
 
-    // ---- known true softmax over two numeric covariates -------------------
-    // Deterministic 64-bit LCG (same constants as the synthetic point arm).
     let mut state: u64 = 0x0BAD_F00D_DEAD_BEEF;
     let mut next_unif = move || -> f64 {
         state = state
@@ -741,46 +897,19 @@ fn multinomial_per_class_probability_se_intervals_are_calibrated() {
         -2.0 + 4.0 * u // U[-2, 2]
     };
 
-    // Class labels "a"/"b"/"c"; gam fixes the LAST level (lexicographic "c") as
-    // the reference, so we generate with class index 2 ("c") as the reference
-    // (η ≡ 0) to share the gauge with the fitted model. Moderate magnitudes keep
-    // the classes overlapping (well-conditioned, finite MLE).
-    let true_beta_rows: [[f64; 3]; 2] = [
-        [0.5, 1.1, -0.7],  // class "a": intercept, x1, x2
-        [-0.4, -0.8, 0.9], // class "b"
-    ];
-    let mut true_coef = Array2::<f64>::zeros((3, 2));
-    for (a, brow) in true_beta_rows.iter().enumerate() {
-        for p in 0..3 {
-            true_coef[[p, a]] = brow[p];
-        }
-    }
-    let class_name = |c: usize| match c {
-        0 => "a",
-        1 => "b",
-        2 => "c",
-        _ => unreachable!(),
-    };
+    let true_coef = mn_true_coef();
+    let class_name = |c: usize| MN_CLASS_NAMES[c];
 
-    // Large training set so the Laplace covariance is the dominant uncertainty
-    // and the delta-method SE is in its valid (asymptotic-normal) regime — the
-    // regime where a correctly-derived SE yields ≈ nominal coverage.
+    // Large UNPENALIZED-regime fit so the Laplace covariance is the dominant
+    // uncertainty and S_λ is negligible against the data information.
     let n_train = 4000usize;
     let mut rows: Vec<StringRecord> = Vec::with_capacity(n_train);
+    let mut xrows: Vec<[f64; 3]> = Vec::with_capacity(n_train);
     for _ in 0..n_train {
         let x1 = next_unif();
         let x2 = next_unif();
-        let probs = true_softmax_3(&true_coef, x1, x2);
-        let u01 = (next_unif() + 2.0) / 4.0;
-        let mut cum = 0.0_f64;
-        let mut drawn = 2usize;
-        for (c, pc) in probs.iter().enumerate() {
-            cum += pc;
-            if u01 < cum {
-                drawn = c;
-                break;
-            }
-        }
+        let drawn = draw_label(&true_coef, x1, x2, &mut next_unif);
+        xrows.push([1.0, x1, x2]);
         rows.push(StringRecord::from(vec![
             x1.to_string(),
             x2.to_string(),
@@ -790,8 +919,6 @@ fn multinomial_per_class_probability_se_intervals_are_calibrated() {
     let headers = ["x1", "x2", "y"].into_iter().map(str::to_string).collect();
     let data = encode_recordswith_inferred_schema(headers, rows).expect("encode train dataset");
 
-    // ---- fit the softmax GLM through the #1101 formula path ----------------
-    // This path stores the joint Laplace covariance the delta-method SE uses.
     let model = fit_penalized_multinomial_formula(
         &data,
         "y ~ x1 + x2",
@@ -803,100 +930,192 @@ fn multinomial_per_class_probability_se_intervals_are_calibrated() {
     .expect("multinomial formula fit");
     assert!(
         model.converged,
-        "multinomial Newton solve did not converge for the SE-calibration fit"
+        "multinomial Newton solve did not converge for the covariance-identity fit"
     );
 
-    // gam class column order on predict; map true-DGP class index -> model col.
-    let model_col_of_true: Vec<usize> = (0..3)
-        .map(|c| {
-            model
-                .class_levels
-                .iter()
-                .position(|lvl| lvl == class_name(c))
-                .expect("true class must be a fitted level")
-        })
-        .collect();
+    let p = model.p_per_class;
+    let m = model.n_active_classes;
+    let d = p * m;
+    assert_eq!((p, m), (3, 2), "expected P=3 (1,x1,x2) and M=2 active classes");
 
-    // ---- fresh held-out covariate grid (no labels needed) ------------------
-    let n_test = 2000usize;
-    let mut test_rows: Vec<StringRecord> = Vec::with_capacity(n_test);
-    let mut test_x: Vec<(f64, f64)> = Vec::with_capacity(n_test);
-    for _ in 0..n_test {
-        let x1 = next_unif();
-        let x2 = next_unif();
-        test_x.push((x1, x2));
-        // The response column is never read on predict; emit reference "c".
-        test_rows.push(StringRecord::from(vec![
-            x1.to_string(),
-            x2.to_string(),
-            "c".to_string(),
-        ]));
-    }
-    let test_headers = ["x1", "x2", "y"].into_iter().map(str::to_string).collect();
-    let test_data =
-        encode_recordswith_inferred_schema(test_headers, test_rows).expect("encode test dataset");
+    let beta = model.coefficients_active(); // (P, M)
+    let cov = model.coefficient_covariance().expect("stored joint covariance");
+    assert_eq!(cov.dim(), (d, d), "stored covariance must be the joint (P·M)² block");
 
-    let (probs, prob_se) =
-        predict_multinomial_formula_with_se(&model, &test_data).expect("predict probs + SE");
-    let prob_se = prob_se.expect(
-        "the #1101 formula fit must surface a joint coefficient covariance, so per-class \
-         probability SEs must be present (None ⇒ covariance was not stored)",
-    );
-    assert_eq!(probs.dim(), (n_test, 3), "predicted probs shape");
-    assert_eq!(prob_se.dim(), (n_test, 3), "predicted prob-SE shape");
+    let info = multinomial_observed_information(&beta, &xrows);
+    let cov_indep = invert_dense(&info).expect("observed information must be invertible");
 
-    // ---- SE-interval calibration vs the KNOWN true probabilities -----------
-    let mut covered = 0usize;
-    let mut total = 0usize;
-    let mut any_nondegenerate = false;
-    let mut max_se = 0.0_f64;
-    for i in 0..n_test {
-        let (x1, x2) = test_x[i];
-        let p_true = true_softmax_3(&true_coef, x1, x2);
-        for c_true in 0..3 {
-            let col = model_col_of_true[c_true];
-            let se = prob_se[[i, col]];
-            assert!(
-                se.is_finite() && se >= 0.0,
-                "prob-SE must be finite & non-negative (row {i} class {c_true} = {se})"
-            );
-            max_se = max_se.max(se);
-            if se > 1e-6 {
-                any_nondegenerate = true;
-            }
-            let phat = probs[[i, col]];
-            let lo = (phat - Z_95 * se).max(0.0);
-            let hi = (phat + Z_95 * se).min(1.0);
-            if p_true[c_true] >= lo && p_true[c_true] <= hi {
-                covered += 1;
-            }
-            total += 1;
+    // The penalty is tiny but nonzero (FitConfig default ridge), so allow a small
+    // relative tolerance — the identity is exact only in the unpenalized limit.
+    let mut max_rel = 0.0_f64;
+    for r in 0..d {
+        for c in 0..d {
+            let stored = cov[[r, c]];
+            let indep = cov_indep[[r, c]];
+            let scale = stored.abs().max(indep.abs()).max(1e-12);
+            let rel = (stored - indep).abs() / scale;
+            max_rel = max_rel.max(rel);
         }
     }
-    let coverage = covered as f64 / total as f64;
     eprintln!(
-        "multinomial #1101 prob-SE calibration: n_train={n_train} n_test={n_test} \
-         (row,class) pairs={total} realized_coverage={coverage:.4} (nominal 0.95) max_se={max_se:.4}"
+        "#1101 covariance-identity: P={p} M={m} D={d} max_rel_dev(stored vs info^-1)={max_rel:.3e}"
+    );
+    assert!(
+        max_rel < 5e-2,
+        "stored multinomial coefficient covariance does not match the observed-information \
+         inverse (max relative entrywise deviation {max_rel:.3e} ≥ 5e-2): the joint covariance \
+         backing the #1101 prob-SE is mis-scaled or mis-ordered"
     );
 
-    // The SEs must be genuinely non-degenerate (a covariance that collapsed to
-    // ~0 would trivially "cover" only at p̂ == p_true and otherwise fail; a
-    // covariance that is silently zeroed would make every interval a point).
+    // The diagonal must be strictly positive (non-degenerate SEs downstream).
+    for r in 0..d {
+        assert!(
+            cov[[r, r]] > 0.0,
+            "covariance diagonal entry {r} is non-positive ({}) — degenerate uncertainty",
+            cov[[r, r]]
+        );
+    }
+}
+
+#[test]
+fn multinomial_per_class_probability_se_intervals_are_calibrated_over_refits() {
+    // PROPER CALIBRATION (#1101). Interval calibration is a statement over
+    // REPEATED FITS, not over points of one fit (those share a single β̂ error and
+    // are not independent). We resample the training set `n_rep` times, refit, and
+    // at a few FIXED test points count how often the nominal-95% Wald interval
+    // `p̂_c ± z·SE` covers the KNOWN true probability. A correctly-derived
+    // softmax-Jacobian SE against the Laplace covariance lands the pooled coverage
+    // near 0.95; a systematically too-small/large SE would push it out of band.
+    init_parallelism();
+
+    let true_coef = mn_true_coef();
+    let class_name = |c: usize| MN_CLASS_NAMES[c];
+
+    // Fixed evaluation points spanning the covariate box (last is the origin).
+    let fixed_pts: [(f64, f64); 4] = [(0.5, -0.3), (-1.0, 1.2), (1.5, 0.7), (0.0, 0.0)];
+
+    let n_rep = 150usize;
+    let n_tr = 1200usize;
+
+    let mut seed: u64 = 0x1234_5678_9ABC_DEF0;
+    let mut next_unif = move || -> f64 {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let bits = (seed >> 11) as f64;
+        let u = bits / (1u64 << 53) as f64;
+        -2.0 + 4.0 * u // U[-2, 2]
+    };
+
+    // Pre-build the fixed-point predict table once (labels never read on predict).
+    let build_pt_data = || {
+        let mut pt_rows: Vec<StringRecord> = Vec::with_capacity(fixed_pts.len());
+        for (x1, x2) in fixed_pts.iter() {
+            pt_rows.push(StringRecord::from(vec![
+                x1.to_string(),
+                x2.to_string(),
+                "c".to_string(),
+            ]));
+        }
+        let pt_headers = ["x1", "x2", "y"].into_iter().map(str::to_string).collect();
+        encode_recordswith_inferred_schema(pt_headers, pt_rows)
+    };
+    let pt_data = build_pt_data().expect("encode fixed test points");
+
+    let mut cov_hits = vec![0usize; fixed_pts.len() * 3];
+    let mut max_se = 0.0_f64;
+    let mut reps_done = 0usize;
+    for _ in 0..n_rep {
+        let mut rrows: Vec<StringRecord> = Vec::with_capacity(n_tr);
+        for _ in 0..n_tr {
+            let x1 = next_unif();
+            let x2 = next_unif();
+            let drawn = draw_label(&true_coef, x1, x2, &mut next_unif);
+            rrows.push(StringRecord::from(vec![
+                x1.to_string(),
+                x2.to_string(),
+                class_name(drawn).to_string(),
+            ]));
+        }
+        let rheaders = ["x1", "x2", "y"].into_iter().map(str::to_string).collect();
+        let rdata = encode_recordswith_inferred_schema(rheaders, rrows).expect("encode refit dataset");
+        let rmodel = fit_penalized_multinomial_formula(
+            &rdata,
+            "y ~ x1 + x2",
+            &FitConfig::default(),
+            1.0,
+            100,
+            1e-9,
+        )
+        .expect("multinomial refit");
+        assert!(rmodel.converged, "a calibration refit failed to converge");
+
+        let (pp, pse) =
+            predict_multinomial_formula_with_se(&rmodel, &pt_data).expect("predict probs + SE");
+        let pse = pse.expect(
+            "the #1101 formula fit must surface a joint coefficient covariance, so per-class \
+             probability SEs must be present (None ⇒ covariance was not stored)",
+        );
+        assert_eq!(pp.dim(), (fixed_pts.len(), 3), "predicted prob shape");
+        assert_eq!(pse.dim(), (fixed_pts.len(), 3), "predicted prob-SE shape");
+
+        let rcol: Vec<usize> = (0..3)
+            .map(|c| {
+                rmodel
+                    .class_levels
+                    .iter()
+                    .position(|lvl| lvl == class_name(c))
+                    .expect("true class must be a fitted level")
+            })
+            .collect();
+
+        reps_done += 1;
+        for (pi, (x1, x2)) in fixed_pts.iter().enumerate() {
+            let p_true = true_softmax_3(&true_coef, *x1, *x2);
+            for c_true in 0..3 {
+                let col = rcol[c_true];
+                let phat = pp[[pi, col]];
+                let se = pse[[pi, col]];
+                assert!(
+                    se.is_finite() && se >= 0.0,
+                    "prob-SE must be finite & non-negative (pt {pi} class {c_true} = {se})"
+                );
+                max_se = max_se.max(se);
+                if (p_true[c_true] - phat).abs() <= Z_95 * se {
+                    cov_hits[pi * 3 + c_true] += 1;
+                }
+            }
+        }
+    }
+
+    assert!(reps_done >= n_rep, "not all calibration refits completed");
     assert!(
-        any_nondegenerate,
-        "per-class probability SEs are all ~0 — the stored covariance is degenerate"
+        max_se > 1e-6,
+        "per-class probability SEs are all ~0 across refits — the stored covariance is degenerate"
     );
 
-    // CALIBRATION: the realized coverage of the nominal-95% delta-method
-    // intervals must land near 95%. A correctly-derived softmax-Jacobian SE
-    // against the Laplace posterior in this asymptotic regime is well-calibrated;
-    // we allow a ±0.04 band around 0.95 (finite-sample + delta-method curvature
-    // slack). A wrong Jacobian, mis-block-ordered covariance, or mis-scaled SE
-    // would push realized coverage out of this band.
+    let mut all_hits = 0usize;
+    eprintln!("#1101 prob-SE calibration over {reps_done} refits (n_tr={n_tr}):");
+    for (pi, (x1, x2)) in fixed_pts.iter().enumerate() {
+        for c_true in 0..3 {
+            let h = cov_hits[pi * 3 + c_true];
+            all_hits += h;
+            eprintln!(
+                "  pt({x1},{x2}) class{c_true}: coverage={:.3}",
+                h as f64 / reps_done as f64
+            );
+        }
+    }
+    let coverage = all_hits as f64 / (reps_done * fixed_pts.len() * 3) as f64;
+    eprintln!("  OVERALL pooled coverage={coverage:.4} (nominal 0.95), max_se={max_se:.4}");
+
+    // CALIBRATION: pooled coverage of the nominal-95% delta-method intervals over
+    // independent refits must land near 0.95. We allow a ±0.05 band (finite n_rep
+    // Monte-Carlo noise + finite-sample delta-method curvature). A mis-scaled SE,
+    // wrong Jacobian, or mis-ordered covariance would push it out of this band.
     assert!(
-        (0.91..=0.99).contains(&coverage),
-        "delta-method per-class probability SE intervals are MIS-CALIBRATED: realized \
-         coverage {coverage:.4} is outside [0.91, 0.99] of the true class probabilities \
-         at nominal 0.95"
+        (0.90..=1.00).contains(&coverage),
+        "delta-method per-class probability SE intervals are MIS-CALIBRATED: pooled \
+         over-refit coverage {coverage:.4} is outside [0.90, 1.00] at nominal 0.95"
     );
 }
