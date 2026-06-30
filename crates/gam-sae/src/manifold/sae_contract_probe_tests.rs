@@ -634,6 +634,112 @@ fn sae_isometry_assembled_curvature_is_decoder_scale_invariant() {
     }
 }
 
+/// #795 — the end-to-end joint `(t, β)` fit with the isometry gauge ENABLED must
+/// CONVERGE at every decoder scale, not just hold the scale-invariance property of
+/// a single assembled step.
+///
+/// This is the user-visible symptom the issue reports: with the un-normalized
+/// ‖B‖⁴ curvature, a large planted decoder makes the isometry Gauss-Newton block
+/// dominate the well-conditioned data-fit block by orders of magnitude, the
+/// arrow-Schur row blocks lose positive-definiteness, and the proximal ridge
+/// escalates to its 1e15 saturation without ever taking a productive Newton step —
+/// the fit stalls far from stationarity. With the `1/gbar²` fold the isometry
+/// block tracks the (scale-free) gradient, so the same handful of full-Newton
+/// steps reach the planted circle at λ=1 AND at λ=25. We assert a finite converged
+/// loss and a SCALE-INVARIANT reconstruction error (the fit recovers the same
+/// circle regardless of decoder magnitude) across scales.
+#[test]
+fn sae_isometry_joint_fit_converges_across_decoder_scales() {
+    use gam_terms::analytic_penalties::{
+        AnalyticPenaltyKind, AnalyticPenaltyRegistry, IsometryPenalty, PsiSlice,
+    };
+    let n = 24usize;
+    let p = 4usize;
+    let coords = Array2::from_shape_fn((n, 1), |(row, _)| (row as f64 + 0.5) / n as f64);
+    let (phi, jet) = periodic_basis(&coords);
+    let m = phi.ncols();
+    let base_decoder = Array2::from_shape_fn((m, p), |(b, c)| {
+        let scale = 1.0 / (1.0 + b as f64);
+        scale * ((b as f64 + 1.0) * (c as f64 + 1.0)).cos()
+    });
+
+    // Returns the converged relative reconstruction error ‖Φ(t̂)·B̂ − target‖/‖target‖
+    // for a joint fit run with the isometry gauge ON at the given decoder scale.
+    let converged_recon_rel = |lambda: f64| -> f64 {
+        let decoder = &base_decoder * lambda;
+        let atom = SaeManifoldAtom::new(
+            "iso_converge",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi.clone(),
+            jet.clone(),
+            decoder.clone(),
+            Array2::<f64>::eye(m),
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+        let target = phi.dot(&decoder);
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((n, 1)),
+            vec![coords.clone()],
+            vec![LatentManifold::Circle { period: 1.0 }],
+            AssignmentMode::softmax(1.0),
+        )
+        .unwrap();
+        let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+
+        let mut registry = AnalyticPenaltyRegistry::new();
+        registry.push(AnalyticPenaltyKind::Isometry(Arc::new(
+            IsometryPenalty::new_euclidean(PsiSlice::full(n, Some(1)), 1),
+        )));
+        let mut rho = SaeManifoldRho::new(0.0, 0.8_f64.ln(), vec![array![1.0_f64.ln()]]);
+
+        let loss = term
+            .run_joint_fit_arrow_schur(
+                target.view(),
+                &mut rho,
+                Some(&registry),
+                12,
+                1.0,
+                1.0e-4,
+                1.0e-4,
+            )
+            .expect("joint fit with isometry gauge ON must converge at every decoder scale");
+        assert!(
+            loss.total().is_finite(),
+            "converged loss must be finite at λ={lambda}, got {}",
+            loss.total()
+        );
+
+        let recon = term.try_fitted_for_rho(&rho).expect("fitted reconstruction exists");
+        let mut num = 0.0_f64;
+        let mut den = 0.0_f64;
+        for (r, t) in recon.iter().zip(target.iter()) {
+            num += (r - t) * (r - t);
+            den += t * t;
+        }
+        (num / den).sqrt()
+    };
+
+    let base = converged_recon_rel(1.0);
+    assert!(
+        base < 1.0e-3,
+        "the joint fit must recover the planted circle at unit scale; rel recon {base:.3e}"
+    );
+    // The un-normalized curvature would make the larger-decoder fits stall (the
+    // ridge saturates and the recon error stays O(1)); the fix keeps the recovered
+    // circle scale-invariant.
+    for &lambda in &[5.0_f64, 25.0] {
+        let scaled = converged_recon_rel(lambda);
+        assert!(
+            scaled < 1.0e-3,
+            "joint fit with isometry ON must converge to the planted circle at \
+             λ={lambda} (rel recon {scaled:.3e}); a non-converging fit is the #795 \
+             ridge-saturation symptom of the un-normalized ‖B‖⁴ curvature."
+        );
+    }
+}
+
 /// #1206 — the gradient lane's `(cost, gradient)` pair must be SELF-CONSISTENT
 /// for the outer BFGS Armijo line search. The amortized-encoder consistency
 /// fold `c(ρ)` (#1154) has no analytic gradient (under Design A the exact
