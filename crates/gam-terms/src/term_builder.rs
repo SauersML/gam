@@ -2358,6 +2358,11 @@ pub fn build_smooth_basis(
                     "__by_col",
                     "identifiability",
                     "by",
+                    "periodic",
+                    "cyclic",
+                    "period",
+                    "period_start",
+                    "period_end",
                     "scale_dims",
                 ],
             )?;
@@ -2738,6 +2743,11 @@ pub fn build_smooth_basis(
                     "__by_col",
                     "identifiability",
                     "by",
+                    "periodic",
+                    "cyclic",
+                    "period",
+                    "period_start",
+                    "period_end",
                     "scale_dims",
                 ],
             )?;
@@ -4812,6 +4822,73 @@ mod tests {
             "matern seed length_scale {realized} must be in the resolving regime, \
              not the over-smoothed diameter corner (n={n}, max_range≈{max_range})",
         );
+    }
+
+    /// gam#1778: `matern(..., periodic=true)` and `thinplate(..., periodic=true)`
+    /// must be ACCEPTED. The squash-merge that wired periodic support into the
+    /// matern/thinplate basis specs forgot to add the periodic option keys to
+    /// those two builders' `validate_known_options` whitelists (only `duchon`
+    /// got both), so `periodic=`/`period=`/`cyclic=`/`period_start=`/`period_end=`
+    /// were rejected as unknown options even though the spec/builder consume them.
+    /// Before the whitelist fix this returned an "unknown option" error.
+    #[test]
+    fn matern_and_thinplate_accept_periodic_option() {
+        let n = 200usize;
+        let rows: Vec<Vec<f64>> = (0..n)
+            .map(|i| {
+                let x = -3.0 + 6.0 * (i as f64) / ((n - 1) as f64);
+                vec![x.sin(), x]
+            })
+            .collect();
+        let ds = continuous_dataset(&["y", "x"], rows);
+
+        // matern() with periodic=true must build without an unknown-option error.
+        let mut matern_opts = BTreeMap::new();
+        matern_opts.insert("bs".to_string(), "gp".to_string()); // gp ⇒ Matérn
+        matern_opts.insert("periodic".to_string(), "true".to_string());
+        let mut notes = Vec::new();
+        let matern_basis = build_smooth_basis(
+            SmoothKind::S,
+            &["x".to_string()],
+            &[1],
+            &matern_opts,
+            &ds,
+            &mut notes,
+            &ResourcePolicy::default_library(),
+            1,
+        )
+        .expect("matern(x, periodic=true) must be accepted");
+        match &matern_basis {
+            SmoothBasisSpec::Matern { spec, .. } => assert!(
+                spec.periodic.is_some(),
+                "periodic=true must thread a Some(periodic) into the matern spec",
+            ),
+            other => panic!("expected Matern basis, got {other:?}"),
+        }
+
+        // thinplate()/tps() with periodic=true must likewise be accepted.
+        let mut tps_opts = BTreeMap::new();
+        tps_opts.insert("bs".to_string(), "tp".to_string());
+        tps_opts.insert("periodic".to_string(), "true".to_string());
+        let mut notes = Vec::new();
+        let tps_basis = build_smooth_basis(
+            SmoothKind::S,
+            &["x".to_string()],
+            &[1],
+            &tps_opts,
+            &ds,
+            &mut notes,
+            &ResourcePolicy::default_library(),
+            1,
+        )
+        .expect("thinplate(x, periodic=true) must be accepted");
+        match &tps_basis {
+            SmoothBasisSpec::ThinPlate { spec, .. } => assert!(
+                spec.periodic.is_some(),
+                "periodic=true must thread a Some(periodic) into the thinplate spec",
+            ),
+            other => panic!("expected ThinPlate basis, got {other:?}"),
+        }
     }
 
     fn inferred_tensor_basis_product(ds: &Dataset) -> usize {

@@ -131,6 +131,12 @@ pub struct ResolvedFitConfig {
 
 pub struct CliFitConfigInput {
     pub family: Option<String>,
+    /// Expectile asymmetry `τ ∈ (0, 1)` for `--family expectile`. The CLI family
+    /// flag is a fixed value-enum that cannot carry the inline `expectile(τ)`
+    /// asymmetry the string form accepts, so the CLI pins `τ` through this
+    /// separate `--expectile-tau` field; it rides into `FitConfig::expectile_tau`
+    /// and is read by the shared expectile dispatch seam (#1777).
+    pub expectile_tau: Option<f64>,
     pub negative_binomial_theta: Option<f64>,
     pub link: Option<String>,
     pub flexible_link: bool,
@@ -296,6 +302,7 @@ fn resolve_json_fit_config(json_config: JsonFitConfig) -> Result<ResolvedFitConf
 pub fn resolve_cli_fit_config(input: CliFitConfigInput) -> Result<FitConfig, String> {
     let mut fit_config = FitConfig::default();
     fit_config.family = input.family;
+    fit_config.expectile_tau = input.expectile_tau;
     fit_config.negative_binomial_theta = input.negative_binomial_theta;
     fit_config.link = input.link;
     fit_config.flexible_link = input.flexible_link;
@@ -947,6 +954,7 @@ mod tests {
     fn base_cli() -> CliFitConfigInput {
         CliFitConfigInput {
             family: None,
+            expectile_tau: None,
             negative_binomial_theta: None,
             link: None,
             flexible_link: false,

@@ -101,6 +101,11 @@ pub(crate) struct FitArgs {
     /// Fixed size/overdispersion parameter for `--family negative-binomial`.
     #[arg(long = "negative-binomial-theta", value_parser = parse_positive_f64_cli)]
     pub(crate) negative_binomial_theta: Option<f64>,
+    /// Expectile asymmetry `τ ∈ (0, 1)` for `--family expectile` (default 0.5,
+    /// the ordinary mean). `τ > 0.5` fits an upper expectile, `τ < 0.5` a lower
+    /// one — the smooth analogue of a quantile.
+    #[arg(long = "expectile-tau", value_parser = parse_probability_open_cli)]
+    pub(crate) expectile_tau: Option<f64>,
     /// Survival likelihood mode for Surv(...) formulas.
     #[arg(long = "survival-likelihood", default_value = "transformation", value_parser = crate::config_resolve::parse_survival_likelihood_cli)]
     pub(crate) survival_likelihood: String,
@@ -376,6 +381,7 @@ pub(crate) enum FamilyArg {
     Beta,
     RoystonParmar,
     TransformationNormal,
+    Expectile,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, Eq, PartialEq)]
