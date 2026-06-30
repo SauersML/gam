@@ -13,7 +13,19 @@ use super::*;
 /// softly reduced when the data can't support the count (rather than erroring
 /// like an explicit count would). Smooths the user sized explicitly, and the
 /// non-radial bases (B-spline, cyclic, tensor) which already default modestly
-/// via knot counts, are deliberately left untouched.
+/// via knot counts, are left untouched by the *center* cap.
+///
+/// Separately (#1561), this also defaults the Marra & Wood null-space "double"
+/// penalty OFF for a secondary smooth. That penalty is a term-*selection* device:
+/// it shrinks a smooth toward its constant null space so a whole term can be
+/// penalized out of the model. Defaulting it ON for a distributional predictor —
+/// whose entire purpose is to model variation in that parameter — biases the fit
+/// toward homoscedasticity and collapses the recovered log-sigma surface (the
+/// #1561 over-smoothing). mgcv's `gaulss` defaults `select=FALSE` for exactly this
+/// reason, and gam already defaults it off for the `sz` deviation smooth (gam#700);
+/// this extends the same principle to the scale block's ordinary smooths. Only the
+/// bases that DEFAULT the penalty on (`bspline`/`tps`/`matern`/`duchon`) are
+/// affected, and an explicit user `double_penalty=` always wins.
 pub(super) fn apply_secondary_predictor_basis_parsimony(terms: &mut [ParsedTerm], n_rows: usize) {
     for term in terms.iter_mut() {
         if let ParsedTerm::Smooth {
@@ -24,6 +36,16 @@ pub(super) fn apply_secondary_predictor_basis_parsimony(terms: &mut [ParsedTerm]
         } = term
         {
             let canonical = resolve_smooth_type_name(*kind, vars.len(), options);
+
+            // #1561: drop the null-space double penalty by default on the scale /
+            // distributional block so REML can resolve genuine parameter variation
+            // instead of over-shrinking it toward the homoscedastic null space.
+            if matches!(canonical.as_str(), "bspline" | "tps" | "matern" | "duchon") {
+                options
+                    .entry("double_penalty".to_string())
+                    .or_insert_with(|| "false".to_string());
+            }
+
             if !smooth_type_uses_spatial_center_heuristic(&canonical)
                 || has_explicit_countwith_basis_alias(options, "centers")
             {
