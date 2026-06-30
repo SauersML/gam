@@ -442,6 +442,119 @@ pub fn sphere_kernel_decision(n: usize, m: usize, lmax: usize) -> GpuDecision {
     )
 }
 
+/// Map a truncated `SphereWahbaKernel` variant onto the device kernel kind +
+/// truncation degree. Only the two *truncated* spectral variants have an exact
+/// device counterpart (the closed-form `Sobolev`/`Pseudo` variants use
+/// polylogarithms / deep-`L` series the device kernel does not evaluate), so
+/// `Sobolev`/`Pseudo` return `None` and stay on the CPU closed-form path.
+#[must_use]
+pub fn truncated_device_kind(
+    kernel: crate::basis::SphereWahbaKernel,
+) -> Option<(SphereSpectralKernelKind, u16)> {
+    use crate::basis::SphereWahbaKernel;
+    match kernel {
+        SphereWahbaKernel::SobolevTruncated { lmax } => {
+            Some((SphereSpectralKernelKind::Sobolev, lmax))
+        }
+        SphereWahbaKernel::PseudoTruncated { lmax } => {
+            Some((SphereSpectralKernelKind::Pseudo, lmax))
+        }
+        SphereWahbaKernel::Sobolev | SphereWahbaKernel::Pseudo => None,
+    }
+}
+
+/// Production entry: build the raw `(n × m)` truncated-spectral Wahba kernel
+/// design matrix on the GPU when [`sphere_kernel_decision`] admits the device,
+/// returning `None` to signal the caller to use its CPU oracle.
+///
+/// Contract:
+///   * Returns `None` when the kernel is a non-truncated closed-form variant
+///     (no exact device counterpart), or when the dispatch decision keeps the
+///     work on the CPU (`!use_gpu`). The caller then runs the bit-defining CPU
+///     path. This is the **only** quiet-CPU route and it is taken *before* any
+///     device call — never as a silent fallback after a device failure.
+///   * Returns `Some(Ok(matrix))` with the device-computed host array when the
+///     device path ran and matches the CPU truncated recurrence to roundoff
+///     (proven by the parity tests). `gam_gpu::policy` keeps the same `c_ℓ`
+///     array and the same Legendre 3-term recurrence on both sides.
+///   * Returns `Some(Err(_))` when the device was *admitted* but the launch /
+///     NVRTC compile / copy-back failed — a hard error the caller must surface,
+///     NOT degrade to CPU. Fail-loud once admitted (the recurring silent-CPU
+///     fallback is the bug this path exists to kill).
+///
+/// `data` / `centers` are `(_, 2)` lat/lon matrices (degrees unless
+/// `radians`), matching `spherical_wahba_kernel_matrix_with_kind`.
+pub fn try_build_truncated_kernel_matrix_gpu(
+    data: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    penalty_order: usize,
+    radians: bool,
+    kernel: crate::basis::SphereWahbaKernel,
+) -> Option<Result<Array2<f64>, GpuError>> {
+    let (kind, lmax) = truncated_device_kind(kernel)?;
+    let n = data.nrows();
+    let m = centers.nrows();
+    if n == 0 || m == 0 || lmax == 0 {
+        return None;
+    }
+    let decision = sphere_kernel_decision(n, m, lmax as usize);
+    if !decision.use_gpu {
+        // Either backend-not-compiled, runtime-unavailable, or below the
+        // device-work threshold. Quiet CPU route, taken before any device call.
+        return None;
+    }
+    // Admitted: from here a failure is a hard error, never a silent CPU degrade.
+    Some(build_truncated_kernel_matrix_gpu_admitted(
+        data,
+        centers,
+        penalty_order,
+        radians,
+        kind,
+        lmax,
+    ))
+}
+
+/// Run the admitted device build for `try_build_truncated_kernel_matrix_gpu`.
+/// Separated so the admission decision (which returns `None` for the CPU route)
+/// stays distinct from the fail-loud device execution (which returns `Err`).
+fn build_truncated_kernel_matrix_gpu_admitted(
+    data: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    penalty_order: usize,
+    radians: bool,
+    kind: SphereSpectralKernelKind,
+    lmax: u16,
+) -> Result<Array2<f64>, GpuError> {
+    let n = data.nrows();
+    let m = centers.nrows();
+    let data_xyz = latlon_to_xyz_host(data, radians)
+        .map_err(|reason| GpuError::DriverCallFailed { reason })?;
+    let centers_xyz = latlon_to_xyz_host(centers, radians)
+        .map_err(|reason| GpuError::DriverCallFailed { reason })?;
+    // Single-source the coefficients: the same `c_ℓ` array the CPU truncated
+    // recurrence consumes (`wahba_sphere_kernel_from_cos_kind`) is uploaded to
+    // the device, so CPU and GPU evaluate an identical zonal series.
+    let coeffs = kind.coefficients(lmax as usize, penalty_order);
+    let inputs = S2KernelBuildInputs {
+        n,
+        m,
+        lmax: lmax as usize,
+        data_xyz: &data_xyz,
+        centers_xyz: &centers_xyz,
+        coeffs: &coeffs,
+        kind,
+        layout: DeviceMatrixLayout::ColumnMajor,
+    };
+    let device_matrix = build_kernel_matrix_device(inputs)?;
+    let out = device_matrix.to_host_array()?;
+    if out.iter().any(|v| !v.is_finite()) {
+        return Err(GpuError::DriverCallFailed {
+            reason: "sphere GPU truncated kernel produced a non-finite value".to_string(),
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(target_os = "linux")]
 struct SphereGpuContext {
     ctx: Arc<CudaContext>,
@@ -1513,15 +1626,19 @@ mod sphere_gpu_tests {
         );
     }
 
-    /// V100-only end-to-end dispatch parity: drive
-    /// `build_spherical_spline_basis` with a `SobolevTruncated` spec on
-    /// a workload large enough to trigger `sphere_kernel_decision().use_gpu`,
-    /// then re-build with the CPU-only `Sobolev` (deep-spectral) kernel
-    /// is **not** what we compare to — the GPU exactly matches the
-    /// `SobolevTruncated` CPU path, so the comparison is
-    /// truncated-on-GPU vs truncated-on-CPU. Down-stream PIRLS/REML
-    /// consumes the design verbatim so element-wise design parity at
-    /// ≤ 1e-9 implies fit parity at the same tolerance.
+    /// V100-only end-to-end DISPATCH parity: prove the *production* kernel
+    /// builder (`spherical_wahba_kernel_matrix_with_kind`) actually engages the
+    /// device on a GPU-eligible truncated-spectral shape, and that the device
+    /// result matches the CPU oracle (`spherical_wahba_kernel_matrix_cpu`) to
+    /// roundoff. This is the engagement + parity gate the prior version of this
+    /// test never exercised: it called `build_spherical_spline_basis` (which did
+    /// not route to the GPU at all) and then compared the *decomposed* design
+    /// against the *raw* kernel matrix, so it diverged by construction
+    /// (rel |Δ| = 2.0) regardless of any device behaviour.
+    ///
+    /// Downstream PIRLS/REML consumes the kernel design through the same
+    /// deterministic low-degree decomposition for both backends, so element-wise
+    /// raw-kernel parity at ≤ 1e-9 implies full-design + fit parity.
     #[test]
     fn sphere_gpu_end_to_end_dispatch_parity_vs_cpu_truncated() {
         let Some(_runtime) = gam_gpu::device_runtime::GpuRuntime::global() else {
@@ -1535,57 +1652,55 @@ mod sphere_gpu_tests {
             .expect("[sphere_gpu test] backend probe must succeed on a CUDA host");
         use crate::basis::{
             CenterStrategy, SphereMethod, SphericalSplineBasisSpec, SphericalSplineIdentifiability,
-            build_spherical_spline_basis, sobolev_s2_truncated_coefficients,
+            build_spherical_spline_basis, spherical_wahba_kernel_matrix_cpu,
+            spherical_wahba_kernel_matrix_with_kind,
         };
-        drop(sobolev_s2_truncated_coefficients(1, 1));
 
         // (n=10_000, m=200) → n·m = 2_000_000 ≥ 1_000_000 → GPU eligible.
         let data = small_latlon_grid(100, 100);
         let lmax: u16 = 30;
         let penalty_order = 2usize;
-        let spec_gpu = SphericalSplineBasisSpec {
-            center_strategy: CenterStrategy::FarthestPoint { num_centers: 200 },
-            penalty_order,
-            double_penalty: false,
-            radians: false,
-            method: SphereMethod::Wahba,
-            max_degree: None,
-            wahba_kernel: SphereWahbaKernel::SobolevTruncated { lmax },
-            identifiability: SphericalSplineIdentifiability::CenterSumToZero,
-        };
-        let result_gpu = build_spherical_spline_basis(data.view(), &spec_gpu)
-            .expect("GPU-eligible build_spherical_spline_basis succeeds");
-
-        // Re-run with the same spec but bypass the GPU by shrinking
-        // `n·m` below the 1e6 gate is not possible without changing data
-        // shape, so instead we materialise the CPU-truncated reference
-        // design by calling the public CPU helper directly with the same
-        // centers that the GPU build chose. The centers are deterministic
-        // (farthest-point with the same seed = leftmost-lowest lat/lon),
-        // so we can rebuild them.
         let centers =
             crate::basis::select_spherical_farthest_point_centers(data.view(), 200, false)
                 .expect("centers");
-        let raw_cpu = spherical_wahba_kernel_matrix_with_kind(
+        let n = data.nrows();
+        let m = centers.nrows();
+
+        // The device MUST be admitted for this shape, otherwise this test would
+        // silently exercise the CPU path on both sides and prove nothing about
+        // engagement. Fail loud if the dispatch decision declines the GPU.
+        let decision = sphere_kernel_decision(n, m, lmax as usize);
+        assert!(
+            decision.use_gpu,
+            "expected GPU dispatch for (n={n}, m={m}, lmax={lmax}); decision said CPU \
+             (reason={}); the engagement gate regressed",
+            decision.reason
+        );
+
+        // Production dispatcher: engages the device for this admitted shape.
+        let gpu_kernel = spherical_wahba_kernel_matrix_with_kind(
             data.view(),
             centers.view(),
             penalty_order,
             false,
             SphereWahbaKernel::SobolevTruncated { lmax },
         )
-        .expect("cpu raw design");
+        .expect("GPU-eligible production kernel build succeeds");
 
-        // The build keeps raw Wahba center coefficients unless a frozen
-        // realized-design transform is supplied.
-        let z = Array2::<f64>::eye(centers.nrows());
-        let cpu_design = raw_cpu.dot(&z);
+        // CPU oracle: forced host evaluation regardless of dispatch decision.
+        let cpu_kernel = spherical_wahba_kernel_matrix_cpu(
+            data.view(),
+            centers.view(),
+            penalty_order,
+            false,
+            SphereWahbaKernel::SobolevTruncated { lmax },
+        )
+        .expect("cpu oracle kernel build succeeds");
 
-        let gpu_design = result_gpu.design.as_dense().expect("dense design").clone();
-
-        assert_eq!(gpu_design.dim(), cpu_design.dim());
+        assert_eq!(gpu_kernel.dim(), cpu_kernel.dim());
         let mut max_abs = 0.0_f64;
         let mut max_rel = 0.0_f64;
-        for ((g, c), _) in gpu_design.iter().zip(cpu_design.iter()).zip(0..) {
+        for (g, c) in gpu_kernel.iter().zip(cpu_kernel.iter()) {
             let d = (g - c).abs();
             if d > max_abs {
                 max_abs = d;
@@ -1598,7 +1713,30 @@ mod sphere_gpu_tests {
         }
         assert!(
             max_rel < 1e-9,
-            "end-to-end design parity max relative |Δ| = {max_rel:.3e} >= 1e-9 (abs {max_abs:.3e})"
+            "GPU-dispatch vs CPU-oracle kernel parity max relative |Δ| = {max_rel:.3e} \
+             >= 1e-9 (abs {max_abs:.3e})"
+        );
+
+        // End-to-end smoke: the full design build (which routes its large
+        // data×centers kernel through the engaged device) produces a finite,
+        // correctly-shaped design with the expected number of rows.
+        let spec_gpu = SphericalSplineBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 200 },
+            penalty_order,
+            double_penalty: false,
+            radians: false,
+            method: SphereMethod::Wahba,
+            max_degree: None,
+            wahba_kernel: SphereWahbaKernel::SobolevTruncated { lmax },
+            identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+        };
+        let result_gpu = build_spherical_spline_basis(data.view(), &spec_gpu)
+            .expect("GPU-eligible build_spherical_spline_basis succeeds");
+        let design = result_gpu.design.as_dense().expect("dense design");
+        assert_eq!(design.nrows(), n, "design row count must match data rows");
+        assert!(
+            design.iter().all(|v| v.is_finite()),
+            "engaged-device spherical design must be finite"
         );
     }
 
