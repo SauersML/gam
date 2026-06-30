@@ -50,6 +50,29 @@ Fixes: symmetric fixtures (`g_{kk}` symmetrised, `g_{ji}=g_{ij}ᵀ`) in both the
 in-crate test and tests/owed_1551; explicit `max|S-Sᵀ|` symmetry guard before the
 Cholesky oracle; re-enabled the on-GPU engagement gate as a real `#[test]`.
 
-Next: run sae_perf_harness color/qwen to capture device vs CPU speedup numbers;
-address the dense-Schur-for-logdet path at large k (line ~501 newton_step.rs);
-extend GPU test coverage and perf gate.
+### Perf numbers captured + dense-Schur OOM guarded (PR #1724)
+
+qwen device-vs-CPU on V100 (GPU 100% util, 3556 MiB resident):
+- device_inner_iter: CPU 54719ms -> 1083ms = **50.5x**  (parity 1.8e-12)
+- device_fit:        CPU 57215ms -> 3571ms = **16.0x**  (parity 2.4e-17)
+- device_multiplex:  seq 28460ms -> 5585ms =  **5.1x**  (bit-identical)
+(device_pcg micro k=2048/7-iters is launch-latency-bound, expected.)
+
+The qwen `inner_newton_solve` forms a dense beta_dim×beta_dim Schur = 77GB at
+beta_dim=98304 (the #1017 gap). Two guards added:
+- harness: device stages run first; full dense solve skipped LOUD above 4GiB.
+- `build_dense_schur_direct`: refuses dense k×k above an 8GiB host budget with an
+  actionable SchurFactorFailed (CPU+device Direct paths), never OOM-kills.
+  Test: build_dense_schur_direct_refuses_oversize_border_1017.
+
+Also fixed a PRE-EXISTING bit-exact float assert in
+arrow_schur_matches_dense_reference_2x2 (fails on clean main; streaming vs
+one-shot differ at ~4e-16) -> 1e-12 relative tol. All 58 arrow_schur lib tests
+pass.
+
+### STILL OPEN (next agent)
+The proper #1017 follow-up: matrix-free determinant-lemma joint log-det so the
+device-success path doesn't route through `build_dense_schur_direct` at all
+(R = Σ q_i = n·d << k capacitance). Research-grade for arbitrary structured
+penalty ops; unverifiable at 77GB on a 32GB V100. Build on existing
+`cross_row_woodbury_log_det`/capacitance infra; parity-gate at feasible k first.
