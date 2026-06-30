@@ -55,8 +55,12 @@ fn planted_design(n: usize, p: usize) -> Array2<f64> {
 /// device result).
 #[test]
 fn device_resident_solve_matches_cpu_oracle() {
-    // A GPU-profitable wide-decoder shape that clears the Gram work gate.
-    let (n, p) = (2_000usize, 2_048usize);
+    // A GPU-profitable shape that clears the XtDiagX work gate
+    // (2·n·p² = 2·2000·512² ≈ 1.0e9 ≫ the 1e8 flop floor) while keeping the
+    // O(n·p²) CPU-oracle Gram cheap enough for CI. The wide-border shapes are
+    // exercised for *throughput* in the other test; parity only needs the
+    // device path to engage, not the largest p.
+    let (n, p) = (2_000usize, 512usize);
     let x = planted_design(n, p);
     let mut s = 0x988_5ae_e0c0_de01u64;
     let w = Array1::from_shape_fn(n, |_| lcg(&mut s).abs() + 1e-3);
