@@ -4,6 +4,13 @@
 
 use super::*;
 
+/// Host budget for a dense reduced Schur `k × k` f64 matrix (#1017). Above this
+/// the dense assembly is refused with a loud `SchurFactorFailed` rather than
+/// OOM-killing the host. 8 GiB ⇒ `k ≈ 32768`; every currently-feasible SAE border
+/// (k ≤ 5120 ⇒ 0.2 GiB) is well under it, while the qwen LLM border (k = 98304 ⇒
+/// 77 GiB) is correctly rejected as matrix-free-only.
+pub(crate) const DENSE_SCHUR_BYTES_BUDGET: u128 = 8 * 1024 * 1024 * 1024;
+
 /// Reduce one contiguous device tile's rows into a private `-Σ leftᵀ·right`
 /// partial (`k×k`).
 ///
@@ -261,6 +268,26 @@ pub(crate) fn build_dense_schur_direct<B: BatchedBlockSolver + Sync>(
     if op.dim() != k {
         return Err(ArrowSchurError::SchurFactorFailed {
             reason: "Direct BA requires a K×K shared H_ββ penalty operator".to_string(),
+        });
+    }
+    // Fail LOUD, never OOM-kill (#1017): the dense reduced Schur is `k × k` f64.
+    // At SAE LLM borders (qwen `k = 98304` ⇒ 77 GiB) materialising it would crash
+    // the host. The matrix-free device PCG already solves the *step* without it
+    // (`try_device_arrow_direct_sae_pcg`); only the joint-Hessian log-det still
+    // routes here. A matrix-free determinant-lemma log-det (the proper follow-up)
+    // is not yet wired, so refuse the allocation with an actionable error rather
+    // than degrading silently into an OOM. The budget is generous so every
+    // currently-feasible border (k ≤ 5120 ⇒ 0.2 GiB) is unaffected.
+    let dense_bytes = (k as u128).saturating_mul(k as u128).saturating_mul(8);
+    if dense_bytes > DENSE_SCHUR_BYTES_BUDGET {
+        return Err(ArrowSchurError::SchurFactorFailed {
+            reason: format!(
+                "dense reduced Schur is {k}×{k} f64 = {} MiB, exceeding the {} MiB host budget; \
+                 this border is matrix-free-only (the device PCG solves the step without the dense \
+                 Schur) and a matrix-free determinant-lemma log-det is the required follow-up",
+                dense_bytes / (1024 * 1024),
+                DENSE_SCHUR_BYTES_BUDGET / (1024 * 1024),
+            ),
         });
     }
     let mut schur = op.to_dense();

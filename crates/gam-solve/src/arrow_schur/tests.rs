@@ -4607,3 +4607,62 @@ pub(crate) fn arrow_operator_infinity_norm_matches_dense_assembly() {
         (got - want).abs() / scale
     );
 }
+
+/// #1017 fail-loud guard: at an SAE LLM-scale border the dense reduced Schur is a
+/// `k × k` f64 matrix (qwen `k = 98304` ⇒ 77 GiB). `build_dense_schur_direct` must
+/// REFUSE that allocation with a `SchurFactorFailed` carrying an actionable
+/// message — never OOM-kill the host by silently degrading into the dense
+/// factorization. The matrix-free device PCG solves the *step* without the dense
+/// Schur; only the joint log-det still routes here, and the proper follow-up is a
+/// matrix-free determinant-lemma log-det.
+///
+/// The system uses an empty dense `hbb` plus a cheap structured penalty op, so the
+/// guard is checked BEFORE any `k × k` allocation — the test itself never tries to
+/// allocate 77 GiB.
+#[test]
+pub(crate) fn build_dense_schur_direct_refuses_oversize_border_1017() {
+    use crate::arrow_schur::prelude::SharedBetaMatvec;
+    use std::sync::Arc;
+
+    // k chosen so k×k×8 bytes > the 8 GiB budget (k=40000 ⇒ ~11.9 GiB) while the
+    // structured op keeps the actual allocation tiny.
+    let k = 40_000usize;
+    let n = 2usize;
+    let d = 2usize;
+    let mut sys = ArrowSchurSystem::new_with_empty_hbb_and_htbeta_cols(n, d, k, k);
+    for row in sys.rows.iter_mut() {
+        for a in 0..d {
+            row.htt[[a, a]] = 3.0;
+        }
+    }
+    // Cheap structured penalty op (identity scaled): matvec + diagonal only, no
+    // dense materialization. Its presence makes `effective_penalty_op()` return
+    // the Arc without densifying, so the guard fires before any k×k buffer.
+    let matvec: SharedBetaMatvec = Arc::new(|x: ArrayView1<'_, f64>, out: &mut Array1<f64>| {
+        for a in 0..out.len() {
+            out[a] = x[a];
+        }
+    });
+    sys.set_penalty_op(Arc::new(MatvecDiagPenaltyOp::new(
+        k,
+        matvec,
+        Array1::<f64>::ones(k),
+    )));
+
+    let backend = CpuBatchedBlockSolver;
+    let htt_factors = backend
+        .factor_blocks(&sys.rows, 0.0, d, false)
+        .expect("SPD per-row blocks must factor");
+
+    let err = build_dense_schur_direct(&sys, &htt_factors, 1e-6, &backend)
+        .expect_err("oversize border must be refused, not allocated");
+    match err {
+        ArrowSchurError::SchurFactorFailed { reason } => {
+            assert!(
+                reason.contains("host budget") && reason.contains("matrix-free"),
+                "refusal must be actionable (border-too-large, matrix-free-only): {reason}"
+            );
+        }
+        other => panic!("expected SchurFactorFailed for oversize border, got {other:?}"),
+    }
+}
