@@ -58,10 +58,19 @@ fn spec_1d(aniso: bool) -> TermCollectionSpec {
     // realization skip fires and the BFGS-routing arm (#1033 b437d9ff2) engages.
     //
     // NOT Matérn: the realized Matérn design carries the operator-triplet penalty
-    // (mass/tension/stiffness), which the n-free re-key cannot reproduce, so #1270
-    // (d69b52e66) deliberately drops Matérn from `supports_nfree_penalty_rekey` →
-    // the skip is permanently disabled for Matérn and every trial re-realizes the
-    // O(n) design. Measuring n-independence on Matérn would test a basis the n-free
+    // (mass/tension/stiffness). The n-free re-key CAN in fact reproduce that triplet
+    // byte-exactly across ψ (the #1274 gate
+    // `matern_2d_nfree_penalty_rekey_is_byte_exact_but_design_skip_is_not_admitted`
+    // pins this to <1e-10), so the historical "the re-key cannot reproduce the
+    // operator triplet" rationale was wrong. The real reason Matérn is excluded from
+    // `supports_nfree_penalty_rekey` (the #1033 6a5a2e1 re-admission was reverted by
+    // feb0eb50b, #1274) is twofold: (1) the #1264 `reduced_basis_equal` design-skip
+    // gate refuses Matérn's rotating collocation geometry, so the O(n) design re-
+    // realization still fires per trial even with the penalty re-keyed — no speed
+    // win; and (2) re-admitting Matérn perturbs the selected fit enough to miss the
+    // truth-recovery bar (the `matern_nu_sweep_uniform_quality_on_sin1` probe goes
+    // slower AND fails when Matérn is admitted). So Matérn stays on the exact slow
+    // re-key path. Measuring n-independence on Matérn would test a basis the n-free
     // architecture intentionally does NOT cover. This is exactly the config the
     // passing bit-identity gate `psi_gram_tensor_fast_path_skips_n_row_lane_and_
     // matches_streamed` uses to exercise the armed skip.

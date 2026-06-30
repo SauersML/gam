@@ -160,3 +160,11 @@ include!("psi_gram_tensor_fast_path_tests.rs");
 // orphaning story as the two oracles above; driver deps live HERE post-carve.
 // Self-contained `#[cfg(test)] mod`, so it adds nothing to the non-test build.
 include!("spatial_adaptive_hyper_fd_tests.rs");
+// #1274 re-home: the Matérn n-free penalty re-key topology/byte-identity gates.
+// Authored in the pre-#1521 monolith under `tests/src_modules/smooths/`, they
+// were orphaned by #1601 (the `gam_terms::smooth::tests` `include!` was
+// commented out and the body needs the gam-models-private
+// `FrozenTermCollectionIncrementalRealizer`), so the #1274 guard compiled
+// nowhere. Re-homed HERE where the private realizer lives; self-contained
+// `#[cfg(test)] mod`, so it adds nothing to the non-test build.
+include!("matern_nfree_rekey_topology_tests.rs");
