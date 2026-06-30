@@ -7,25 +7,34 @@
 //! the convex cone where every second divided difference is zero, i.e. an exactly
 //! linear fit) and never escapes.
 //!
-//! ## What was wrong (incomplete #1380 fix)
+//! ## What was wrong (double-penalty ridge broke the box-reparam congruence)
 //!
-//! When the active shape/box constraint binds, the LAML penalty log-determinant
-//! `log|S|₊` must be evaluated on the SAME constraint-free subspace `Z` as the
-//! Hessian side `log|H|`. The #1380 fix projected the penalty roots onto `Z`
-//! (`reml/gradient_hessian.rs::dense_penalty_logdet_derivs`) — but it projected
-//! `RemlState::canonical_penalties`, the ORIGINAL-frame (pre-Qs) block-local
-//! penalties, while `Z` itself is built from `pr.linear_constraints_transformed`
-//! / `pr.beta_transformed` and therefore lives in the TRANSFORMED (Qs) frame.
-//! Constrained smooths always take the dense `TransformedQs` PIRLS path
-//! (`should_use_sparse_native_pirls` rejects any fit with lower bounds / linear
-//! inequalities), where `Qs ≠ I`, so `Zᵀ S_original Z` mixed two coordinate
-//! systems. `log|S|₊` and the projected `log|H|` then grew at MISMATCHED rates
-//! as λ → ∞, leaving the `½(log|H| − log|S|₊)` LAML pair with an unbounded
-//! descent toward the high-λ ceiling — the spurious linear-corner attractor the
-//! #1380 fix was supposed to remove. The fix projects the TRANSFORMED-frame
-//! `reparam_result.canonical_transformed` roots instead (the same per-component
-//! roots every other transformed-frame penalty assembly reads), so both halves
-//! of the pair live in `range(Z)` of one frame.
+//! A convex/concave shape constraint puts the smooth on the box-reparameterized
+//! PIRLS path: the coefficients are written `β = Tγ` where `T` is the order-2
+//! Greville-scaled second *divided*-difference transform
+//! (`convex_divided_difference_transform_matrix`). A reparameterization must
+//! leave the penalized REML fit invariant, which requires EVERY penalty block to
+//! transform by the SAME congruence `S ↦ TᵀST`. The wiggliness penalty did; but
+//! the double-penalty nullspace ridge (`PenaltySource::DoublePenaltyNullspace`,
+//! which shrinks the unpenalized level/slope null space) was instead rebuilt
+//! from scratch in `gam-terms::smooth::term_specs::build_single_local_smooth_term`
+//! as the orthonormal null-space projector of `TᵀST` — a γ-space ridge whose
+//! null face matches in subspace but is measured in the γ inner product, not the
+//! congruence image of the β-space ridge. Because the two penalty blocks are then
+//! independently Frobenius-normalized, the from-scratch projector silently
+//! re-weights the level/slope shrinkage relative to the wiggliness penalty,
+//! decoupling their scales. The distorted REML λ landscape drove the
+//! curvature-constrained smooth into the flat linear corner (curvature ≈ 0,
+//! EDF ≈ 1.5) for a seed/basis-dimension–specific subset of fits at the default
+//! and several explicit `k`, even though an unconstrained `s(x)` on the same data
+//! recovers the convex truth at EDF ≈ 4.
+//!
+//! The fix restores the exact congruence `Tᵀ R_β T` for the order-2 (curvature)
+//! ridge so the box reparameterization stays a true invertible change of
+//! coordinates and both penalty blocks live in one inner product. The order-1
+//! (monotone) cumulative-sum transform keeps the from-scratch projector rebuild,
+//! which the #509 over-smoothing fix introduced for its fast-growing
+//! conditioning.
 //!
 //! ## The assertion
 //!
