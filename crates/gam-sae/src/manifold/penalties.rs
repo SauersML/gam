@@ -1419,7 +1419,30 @@ impl SaeManifoldTerm {
         // rho.exp()` overflows to `inf` for `rho ≳ 709`, and the downstream
         // `inf · jacobian` / `inf · 0.0` then injects NaN into the GN curvature
         // block and β-penalty, poisoning the joint solve (#742, Issue 4).
-        let mu = resolve_learnable_weight(corrected.scalar_weight, rho_local[corrected.rho_index]);
+        //
+        // #795 scale-invariant curvature: the value / gradient paths penalize
+        // the SCALE-INVARIANT residual `R_n = g_n/gbar − g^ref_n` (normalized by
+        // the shared `gbar = mean tr(g)/d`), so the assembled gradient is free
+        // of the decoder magnitude. This Gauss-Newton block, however, is built
+        // below from the RAW weighted Jacobian `wj ∝ ‖B‖`, so `AᵀA ∝ ‖B‖⁴` — it
+        // is the GN block of the UN-normalized `½μ‖g_n − g^ref‖²`. Pairing a
+        // scale-free gradient with a `‖B‖⁴` curvature collapses the joint Newton
+        // step (`H⁻¹g ∝ ‖B‖⁻⁴`) as the decoder grows, the proximal ridge
+        // saturates at 1e15, and every trial step is rejected — the exact #795
+        // failure. The Gauss-Newton block of the NORMALIZED residual is the raw
+        // block times `1/gbar²` (freezing the shared normalizer, the same
+        // convention `normalized_metric_state`'s majorizer uses): a positive
+        // scalar on an already-PSD Gram block, so the Schur complement stays PSD,
+        // and `1/gbar² ∝ ‖B‖⁻⁴` exactly cancels the raw `‖B‖⁴`. Fold it into `mu`
+        // so every `mu * acc` write below carries it. `gbar` is read from the
+        // penalty (the single source of truth shared with the gradient); if it
+        // is unavailable/degenerate we skip the block rather than write a
+        // mis-scaled one.
+        let mu_raw = resolve_learnable_weight(corrected.scalar_weight, rho_local[corrected.rho_index]);
+        let Some(gbar) = corrected.metric_normalizer(d) else {
+            return;
+        };
+        let mu = mu_raw / (gbar * gbar);
         // A negligible (or non-finite) effective isometry weight contributes a
         // zero curvature block; writing zeros would still flip the solver onto
         // the dense-supplement Schur path (and invalidate caches) for no model
@@ -1664,7 +1687,25 @@ impl SaeManifoldTerm {
         // rho.exp()` overflows to `inf` for `rho ≳ 709`, and the downstream
         // `inf · jacobian` / `inf · 0.0` then injects NaN into the GN curvature
         // block and β-penalty, poisoning the joint solve (#742, Issue 4).
-        let mu = resolve_learnable_weight(corrected.scalar_weight, rho_local[corrected.rho_index]);
+        //
+        // #795 scale-invariant curvature (decoder β block): the `gb` gradient
+        // accumulated above routes through the gbar-normalized
+        // `grad_jacobian`, so it is free of the decoder magnitude. This dense
+        // `hbb` Gauss-Newton block is the decoder-side pullback of the SAME raw
+        // `wj`-built block as the coord-side `htt` (`add_sae_isometry_metric_gn_blocks`),
+        // so it scales ∝‖B‖⁴ and would re-introduce the #795 step collapse on
+        // the β tier. Fold the same `1/gbar²` frozen-normalizer factor in here
+        // so the decoder curvature matches its scale-free gradient. PSD-
+        // preserving (positive scalar on a PSD Gram block); skip on a degenerate
+        // normalizer rather than write a mis-scaled block.
+        let mu_raw = resolve_learnable_weight(corrected.scalar_weight, rho_local[corrected.rho_index]);
+        let Some(gbar) = corrected.metric_normalizer(d) else {
+            return;
+        };
+        let mu = mu_raw / (gbar * gbar);
+        if !(mu.is_finite() && mu > 0.0) {
+            return;
+        }
         let mut metric_jvp = Array2::<f64>::zeros((d, d));
         let mut jac_hvp = Array2::<f64>::zeros((p, d));
         let mut beta_hvp = Array2::<f64>::zeros((m, p));

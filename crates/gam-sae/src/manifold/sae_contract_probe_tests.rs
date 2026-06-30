@@ -532,6 +532,108 @@ fn circle_phase_gap(a: f64, b: f64) -> f64 {
         .min((1.0 - raw.fract()).abs())
 }
 
+/// #795 — the SAE-assembled isometry Gauss-Newton curvature must be
+/// decoder-scale-invariant, matching its already-scale-free gradient.
+///
+/// The isometry value/gradient penalize the SCALE-INVARIANT normalized residual
+/// `R_n = g_n/gbar − g^ref_n`, so they are free of the decoder magnitude `‖B‖`.
+/// But the arrow-Schur curvature blocks (`htt`/`htbeta`/`hbb`) are built from
+/// the RAW weighted Jacobian `wj ∝ ‖B‖`, i.e. the Gauss-Newton block of the
+/// UN-normalized `½μ‖g_n − g^ref‖²`, which scales ∝‖B‖⁴. Pairing a scale-free
+/// gradient with a ‖B‖⁴ curvature collapses the joint Newton step as the decoder
+/// grows and the proximal ridge saturates at 1e15 — the #795 failure. The fix
+/// folds the frozen-normalizer factor `1/gbar²` into the curvature so it is the
+/// GN block of the normalized residual; `1/gbar² ∝ ‖B‖⁻⁴` cancels the raw `‖B‖⁴`.
+///
+/// This pins the cancellation directly on the production assembly: scaling the
+/// decoder (hence the target, so the well-fit residual is unchanged) by λ leaves
+/// the ISOLATED isometry curvature contribution `htt(with) − htt(without)`
+/// invariant, while WITHOUT the fix it would scale ∝λ⁴ (≈10⁴× at λ=10).
+#[test]
+fn sae_isometry_assembled_curvature_is_decoder_scale_invariant() {
+    use gam_terms::analytic_penalties::{
+        AnalyticPenaltyKind, AnalyticPenaltyRegistry, IsometryPenalty, PsiSlice,
+    };
+    let n = 24usize;
+    let p = 4usize;
+    let coords = Array2::from_shape_fn((n, 1), |(row, _)| (row as f64 + 0.5) / n as f64);
+    let (phi, jet) = periodic_basis(&coords);
+    let m = phi.ncols();
+    let base_decoder = Array2::from_shape_fn((m, p), |(b, c)| {
+        let scale = 1.0 / (1.0 + b as f64);
+        scale * ((b as f64 + 1.0) * (c as f64 + 1.0)).cos()
+    });
+
+    let isometry_curvature_norm = |lambda: f64| -> f64 {
+        let decoder = &base_decoder * lambda;
+        let atom = SaeManifoldAtom::new(
+            "iso_scale",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi.clone(),
+            jet.clone(),
+            decoder.clone(),
+            Array2::<f64>::eye(m),
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+        // Target is the exact decoded curve at this scale, so the well-fit
+        // residual (and thus the data-fit curvature) is the same shape at every
+        // λ — only the isometry block carries the scale dependence we probe.
+        let target = phi.dot(&decoder);
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((n, 1)),
+            vec![coords.clone()],
+            vec![LatentManifold::Circle { period: 1.0 }],
+            AssignmentMode::softmax(1.0),
+        )
+        .unwrap();
+        let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+
+        let mut registry = AnalyticPenaltyRegistry::new();
+        registry.push(AnalyticPenaltyKind::Isometry(Arc::new(
+            IsometryPenalty::new_euclidean(PsiSlice::full(n, Some(1)), 1),
+        )));
+        let rho = SaeManifoldRho::new(0.0, 0.8_f64.ln(), vec![array![1.0_f64.ln()]]);
+
+        // Isolate the isometry contribution to the coordinate curvature: the
+        // data-fit `htt` legitimately grows with the target scale, so we
+        // difference assemble-with-isometry against assemble-without.
+        let sys = term
+            .assemble_arrow_schur(target.view(), &rho, Some(&registry))
+            .expect("assemble with isometry succeeds");
+        let bare = term
+            .assemble_arrow_schur(target.view(), &rho, None)
+            .expect("bare assemble succeeds");
+        let mut htt_iso = 0.0_f64;
+        for (r, b) in sys.rows.iter().zip(bare.rows.iter()) {
+            for (v, bv) in r.htt.iter().zip(b.htt.iter()) {
+                htt_iso += (v - bv) * (v - bv);
+            }
+        }
+        htt_iso.sqrt()
+    };
+
+    let base = isometry_curvature_norm(1.0);
+    assert!(
+        base > 1.0,
+        "the planted-circle fixture must produce a non-trivial isometry \
+         curvature block to make the scale test meaningful; got {base:.3e}"
+    );
+    for &lambda in &[3.0_f64, 10.0, 50.0] {
+        let scaled = isometry_curvature_norm(lambda);
+        let rel = (scaled - base).abs() / base;
+        assert!(
+            rel < 1.0e-6,
+            "SAE-assembled isometry curvature must be decoder-scale-invariant \
+             (#795): λ=1 → {base:.6e}, λ={lambda} → {scaled:.6e} (rel diff {rel:.3e}). \
+             A λ-dependent block is the un-normalized ‖B‖⁴ Gauss-Newton curvature \
+             whose mismatch with the scale-free gradient saturates the proximal \
+             ridge at 1e15."
+        );
+    }
+}
+
 /// #1206 — the gradient lane's `(cost, gradient)` pair must be SELF-CONSISTENT
 /// for the outer BFGS Armijo line search. The amortized-encoder consistency
 /// fold `c(ρ)` (#1154) has no analytic gradient (under Design A the exact
