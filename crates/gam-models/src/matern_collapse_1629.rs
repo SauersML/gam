@@ -116,19 +116,46 @@ fn matern_cold_design_does_not_collapse_and_k_has_effect_1629() {
          thinplate ({thinplate} cols), not a small fraction of it (#1629 6× gap)"
     );
 
-    // `k=150` must actually shrink the resolved basis relative to the default
-    // k=200 — pre-fix both rails collapsed to ~51/53 so `k=` was a no-op.
-    let matern_k150 = cold_design_cols("y ~ matern(x1, x2, k=150)", &ds, &cfg);
+    // tensor() was the OTHER good reference in #1629 (matern 6× worse than BOTH
+    // thinplate AND tensor). It uses a different basis construction entirely, so
+    // checking matern against it too guards against a thinplate-specific fluke.
+    let tensor = cold_design_cols("y ~ tensor(x1, x2)", &ds, &cfg);
     assert!(
-        matern_k150 >= 130,
-        "matern(x1, x2, k=150) cold design collapsed to {matern_k150} columns; \
-         expected ~150 (#1629)"
+        matern_default + 40 >= tensor,
+        "matern(x1, x2) ({matern_default} cols) must resolve a basis comparable to \
+         tensor ({tensor} cols), not a small fraction of it (#1629 6× gap)"
     );
+
+    // `k=` must be a LIVE knob, monotone in the requested dimension — pre-fix the
+    // realized rank (not k) capped the basis, so every k collapsed to ~51/53 and
+    // `k=` was a no-op. Sweep a descending progression and require the resolved
+    // width to track it: each smaller k resolves a strictly smaller basis, and
+    // each stays near its requested size (no collapse to the old ~50 floor).
+    let mut prev = matern_default;
+    for &k in &[150usize, 100, 60] {
+        let cols = cold_design_cols(&format!("y ~ matern(x1, x2, k={k})"), &ds, &cfg);
+        assert!(
+            cols + 25 >= k,
+            "matern(x1, x2, k={k}) cold design collapsed to {cols} columns; \
+             expected ~{k} (#1629: realized rank, not k, was capping the basis)"
+        );
+        assert!(
+            cols < prev,
+            "matern k={k} ({cols} cols) must resolve a strictly smaller basis than the \
+             next-larger k ({prev} cols); pre-fix `k=` had no effect because every \
+             rail collapsed to the same realized rank (#1629)"
+        );
+        prev = cols;
+    }
+
+    // nu= must not reintroduce the collapse: a rougher kernel (nu=3/2) still has
+    // to resolve a full-rank basis, since the seed/whitener/freeze interaction
+    // that drove #1629 is independent of the smoothness order.
+    let matern_nu32 = cold_design_cols("y ~ matern(x1, x2, nu=3/2)", &ds, &cfg);
     assert!(
-        matern_k150 < matern_default,
-        "k=150 ({matern_k150} cols) must resolve a strictly smaller basis than the \
-         default k=200 ({matern_default} cols); pre-fix `k=` had no effect because \
-         both collapsed to the same realized rank (#1629)"
+        matern_nu32 >= 180,
+        "matern(x1, x2, nu=3/2) cold design collapsed to {matern_nu32} columns; \
+         the #1629 basis-collapse must not depend on the Matérn smoothness order"
     );
 }
 
