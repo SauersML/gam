@@ -897,6 +897,38 @@ impl IsometryPenalty {
         Some(g_all)
     }
 
+    /// The scale normalizer `gbar = (1 / (N d)) Σ_n tr(g_n)` of the cached
+    /// pullback metric — the single shared denominator the scale-invariant
+    /// gauge divides every per-row metric by.
+    ///
+    /// `value` / `grad_*` / `hvp` consume this implicitly through
+    /// [`Self::normalized_metric_state`]; the SAE arrow-Schur assembly cannot
+    /// (it builds explicit per-row `htt` / `htbeta` / `hbb` curvature blocks
+    /// from the raw pullback `g_n`, not through the trait operators), so it
+    /// reads `gbar` here and folds `1/gbar²` into its Gauss-Newton curvature.
+    /// That `1/gbar²` factor is exactly the frozen-normalizer Gauss-Newton
+    /// block of the normalized residual `R_n = g_n/gbar − g^ref_n`: the raw
+    /// block (the GN block of the *un-normalized* `½μ‖g_n − g^ref‖²`) scales
+    /// ∝‖B‖⁴ in the decoder magnitude while the normalized gradient is
+    /// scale-free, so without the factor the joint Newton step collapses and
+    /// the proximal ridge saturates at 1e15 (#795). It stays PSD (a positive
+    /// scalar on an already-PSD Gram block), so the Schur complement is
+    /// unaffected. `None` when the metric is unavailable or degenerate, mirror-
+    /// ing `normalized_metric_state`'s non-positive-normalizer guard.
+    pub fn metric_normalizer(&self, latent_dim: usize) -> Option<f64> {
+        let g = self.pullback_metric(latent_dim)?;
+        let n_obs = g.nrows();
+        let trace_denominator = (n_obs * latent_dim) as f64;
+        let mut trace_sum = 0.0;
+        for n in 0..n_obs {
+            for a in 0..latent_dim {
+                trace_sum += g[[n, a * latent_dim + a]];
+            }
+        }
+        let normalizer = trace_sum / trace_denominator;
+        (normalizer.is_finite() && normalizer > f64::MIN_POSITIVE).then_some(normalizer)
+    }
+
     /// Reference metric per row for the normalized pullback metric, `(n_obs, d*d)`.
     fn reference_metric(&self, n_obs: usize, d: usize) -> CowArray<'_, f64, Ix2> {
         match &self.reference {

@@ -34,6 +34,83 @@ fn isometry_value_is_decoder_scale_invariant() {
     assert_abs_diff_eq!(value, scaled_value, epsilon = 1e-10);
 }
 
+/// #795 — the scale invariance the issue's fix (a) requires is NOT a
+/// value-only property: the gradient `∂P/∂t`, the exact Hessian-vector product
+/// `∇²P·v`, and the Gauss-Newton majorizer must ALL be invariant under a decoder
+/// rescale, or the SAE joint Newton solve pairs a scale-free gradient with a
+/// scale-dependent curvature and the proximal ridge saturates at 1e15.
+///
+/// A decoder rescale `B → λB` scales both the model Jacobian `J = (∂Φ/∂t)·B` and
+/// its second jet `H = ∂J/∂t` linearly by λ. The pullback metric `g = JᵀJ ∝ λ²`
+/// and the shared normalizer `gbar ∝ λ²`, so the normalized residual
+/// `R = g/gbar − g_ref` — and therefore `P`, `∂P/∂t`, and `∇²P` — are invariant.
+/// (`grad_jacobian = ∂P/∂J` instead scales ∝1/λ, since `P` is invariant while
+/// `J` grew by λ; this is checked too.) The prior guard
+/// `isometry_value_is_decoder_scale_invariant` covered only `value`.
+#[test]
+fn isometry_grad_hvp_majorizer_are_decoder_scale_invariant() {
+    let (n_obs, p, d, j, h) = isometry_gn_fixture();
+    let n = n_obs * d;
+    let target = PsiSlice::full(n, Some(d));
+    let rho = array![0.0_f64];
+    let t = Array1::<f64>::zeros(n);
+    let probes = [
+        array![0.4_f64, -1.1, 0.7, 0.3, -0.5, 0.9],
+        array![-2.3_f64, 0.6, -0.1, 1.4, 0.8, -1.7],
+    ];
+
+    let lambda = 6.5_f64;
+    let j_scaled = Arc::new(&*j * lambda);
+    let h_scaled = Arc::new(&*h * lambda);
+
+    let base = IsometryPenalty::new_euclidean(target.clone(), p);
+    base.refresh_caches(Some(j.clone()), Some(h.clone()));
+    let scaled = IsometryPenalty::new_euclidean(target.clone(), p);
+    scaled.refresh_caches(Some(j_scaled), Some(h_scaled));
+
+    // value (re-pinned here alongside the rest, on the GN fixture).
+    assert_abs_diff_eq!(
+        base.value(t.view(), rho.view()),
+        scaled.value(t.view(), rho.view()),
+        epsilon = 1e-10
+    );
+
+    // grad_target (∂P/∂t): invariant.
+    let g0 = base.grad_target(t.view(), rho.view());
+    let g1 = scaled.grad_target(t.view(), rho.view());
+    assert!(g0.iter().any(|x| x.abs() > 1e-9), "grad must be non-trivial");
+    for i in 0..n {
+        assert_abs_diff_eq!(g0[i], g1[i], epsilon = 1e-9);
+    }
+
+    // hvp (∇²P·v) and psd_majorizer_hvp (GN block · v): both invariant.
+    for v in &probes {
+        let hv0 = base.hvp(t.view(), rho.view(), v.view());
+        let hv1 = scaled.hvp(t.view(), rho.view(), v.view());
+        let gn0 = base.psd_majorizer_hvp(t.view(), rho.view(), v.view());
+        let gn1 = scaled.psd_majorizer_hvp(t.view(), rho.view(), v.view());
+        assert!(
+            gn0.iter().any(|x| x.abs() > 1e-9),
+            "majorizer must be non-trivial"
+        );
+        for i in 0..n {
+            assert_abs_diff_eq!(hv0[i], hv1[i], epsilon = 1e-8);
+            assert_abs_diff_eq!(gn0[i], gn1[i], epsilon = 1e-8);
+        }
+    }
+
+    // grad_jacobian (∂P/∂J): scales ∝1/λ (P invariant, J grew by λ).
+    let gj0 = base.grad_jacobian(t.view(), rho.view());
+    let gj1 = scaled.grad_jacobian(t.view(), rho.view());
+    assert!(
+        gj0.iter().any(|x| x.abs() > 1e-9),
+        "grad_jacobian must be non-trivial"
+    );
+    for (a, b) in gj0.iter().zip(gj1.iter()) {
+        assert_abs_diff_eq!(a / lambda, *b, epsilon = 1e-9);
+    }
+}
+
 #[test]
 fn ard_value_matches_quadratic_form() {
     let d = 2;

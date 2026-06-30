@@ -5,17 +5,23 @@ quickstart must converge with the shipped default regularizer settings.
 one planted circle, K=1, d=1 — caused by the old absolute-speed isometry
 penalty: its energy scaled as ``decoder⁴``, so during the joint solve it
 exploded and saturated the arrow-Schur proximal ridge at 1e15, rejecting every
-trial step. The current pin normalizes ``g = JᵀJ`` by mean trace before
-comparing to identity, removing the decoder-scale coupling. The default stays
-off until the positive-pin cold-start acceptance below passes.
+trial step. The fix has two parts: (a) the pin normalizes ``g = JᵀJ`` by mean
+trace before comparing to identity AND folds the frozen normalizer ``1 / gbar²``
+into the assembled Gauss-Newton curvature, so the value, gradient, AND curvature
+are all decoder-scale-invariant (the ``‖B‖⁴`` Gram block cancels the ``‖B‖⁻⁴``
+normalizer); and (b) the outer-REML row-gauge evidence-deflation guard no longer
+charges its reversal budget on a BOUNDED low-amplitude flicker of the per-row
+near-null count (the circle fit flickers 150↔147 on N=200), only on a
+wide-amplitude runaway. With both fixes the gauge is enabled by default
+(``isometry_weight=1.0``).
 
 The existing public-API tests fit this same geometry but pass
 ``isometry_weight=0.0`` *explicitly*, so they would survive a future change to
 the default while the documented quickstart silently broke again. This test
 deliberately constructs the fit **without** naming
 ``isometry_weight`` — exactly the documented quickstart pattern — so it pins the
-default itself. The xfail test below records the desired default-on acceptance:
-convergence, an honest near-2π chart span, and a rotation/isometry residual
+default itself. The second test pins the default-on acceptance the issue asked
+for: convergence, an honest near-2π chart span, and a rotation/isometry residual
 gauge rather than Diff escalation.
 """
 
@@ -70,9 +76,12 @@ def test_single_circle_quickstart_converges_with_default_regularizers() -> None:
     assert np.isfinite(fit.reconstruction_r2), "reconstruction R² is non-finite"
 
 
-# #1512 / SPEC.md (xfail is never allowed): this stands FAILING as the signal —
-# positive normalized isometry still fails cold startup after the curvature walk
-# bifurcates and fallback seed validation jumps to the target isometry weight.
+# #795 — the default-on acceptance: a positive isometry pin must recover an
+# honest full-circle chart span and report the rotation/isometry residual gauge.
+# This previously stood FAILING (the curvature walk bifurcated and the proximal
+# ridge saturated); it now passes once the assembled GN curvature carries the
+# `1/gbar²` scale-invariance fold and the deflation guard tolerates bounded
+# flicker.
 def test_single_circle_positive_isometry_recovers_honest_chart_span() -> None:
     z = _planted_circle()
     with warnings.catch_warnings():

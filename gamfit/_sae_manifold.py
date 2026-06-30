@@ -2807,7 +2807,7 @@ _TOPOLOGY_UNSET: Any = object()
 
 def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_topology: Any = _TOPOLOGY_UNSET,
                      assignment: str = "ibp_map", schedule: GumbelTemperatureSchedule | Mapping[str, Any] | None = None,
-                     isometry_weight: float = 0.0, ard_per_atom: bool = True,
+                     isometry_weight: float = 1.0, ard_per_atom: bool = True,
                      decoder_feature_sparsity_groups: list[list[int]] | None = None, n_iter: int = 50, *,
                      assignment_prior: Any = _ASSIGNMENT_PRIOR_UNSET, n_atoms: int | None = None,
                      sparsity_weight: float = 1.0,
@@ -2864,12 +2864,17 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         IBP/Gumbel assignment path.
     isometry_weight
         Weight for ``IsometryPenalty`` on the latent coordinate block. Defaults
-        to ``0.0`` (off). The Rust core compares ``g / gbar`` with the identity
+        to ``1.0`` (on). The Rust core compares ``g / gbar`` with the identity
         metric, where ``g = JᵀJ`` and ``gbar`` is the mean pullback trace per
         latent dimension, so the pin encourages a unit-average-speed chart
-        without coupling to decoder scale (issue #795). Positive weights remain
-        opt-in until the cold-start continuation accepts the planted-circle
-        default-on chart-pin test. Issue #673 (resolved): the decoder smoothness
+        without coupling to decoder scale (issue #795). The gauge is enabled by
+        default now that both the value/gradient AND the Gauss-Newton curvature
+        the joint solve majorizes with are decoder-scale-invariant (the
+        curvature folds the frozen normalizer ``1 / gbar²`` so the ``‖B‖⁴``
+        Gram block exactly cancels the ``‖B‖⁻⁴`` of the normalizer); the
+        planted-circle default-on fit converges at every decoder scale instead
+        of stalling at the proximal-ridge saturation. Set ``0.0`` to disable.
+        Issue #673 (resolved): the decoder smoothness
         penalty is reparameterized by the pulled-back metric ``g = JᵀJ`` in the
         Rust core, so the roughness — and the ``reml_score`` topology evidence —
         is gauge-invariant under reparameterization of the latent coordinate
@@ -3118,11 +3123,17 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     # complementary regularizer that drives g -> I for an interpretable
     # near-arc-length chart; turning it off does not make `reml_score`
     # gauge-dependent, so there is nothing to warn about.
-    # NOTE(#795): isometry still defaults OFF. The Rust penalty now normalizes
-    # g = J^T J by the mean trace per latent dimension before comparing to I, so
-    # the chart pin no longer scales as decoder^4; however, the planted-circle
-    # default-on acceptance still fails after the curvature walk bifurcates and
-    # fallback seed validation jumps to the target isometry weight.
+    # NOTE(#795): isometry now defaults ON. The Rust penalty normalizes
+    # g = J^T J by the mean trace per latent dimension (`gbar`) before comparing
+    # to I, so the value and gradient no longer scale as decoder^4. The earlier
+    # curvature-walk bifurcation that forced the stopgap default-off was the
+    # SAE arrow-Schur Gauss-Newton curvature: it was assembled from the raw
+    # weighted Jacobian (∝‖B‖⁴) while the gradient was scale-free, so a large
+    # decoder collapsed the joint Newton step and the proximal ridge saturated
+    # at 1e15. The assembled curvature now folds the frozen normalizer
+    # `1 / gbar² (∝‖B‖⁻⁴)` into htt/htbeta/hbb, exactly cancelling the ‖B‖⁴
+    # Gram block, so the planted-circle default-on fit converges at every decoder
+    # scale (see `sae_isometry_joint_fit_converges_across_decoder_scales`).
     # Eager nuclear_norm_weight validation (issue #672). `0.0` is the canonical
     # "no rank penalty" baseline; reject negative / non-finite values so the
     # descriptor builder does not surface a cryptic Rust error.
