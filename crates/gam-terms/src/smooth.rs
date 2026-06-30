@@ -33,7 +33,8 @@ pub use self::structure_analysis::{
 mod term_design;
 pub use term_design::{
     build_term_collection_derivative_design, build_term_collection_design,
-    build_term_collection_design_inner, term_collection_has_one_sided_anchored_bspline,
+    build_term_collection_design_inner, orthogonality_relative_residual_for_design,
+    smooth_intrinsic_parametric_feature_cols, term_collection_has_one_sided_anchored_bspline,
 };
 
 // Spec→spec freezer relocated DOWN from gam-models `fit_orchestration/drivers/

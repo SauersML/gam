@@ -168,3 +168,18 @@ include!("spatial_adaptive_hyper_fd_tests.rs");
 // nowhere. Re-homed HERE where the private realizer lives; self-contained
 // `#[cfg(test)] mod`, so it adds nothing to the non-test build.
 include!("matern_nfree_rekey_topology_tests.rs");
+// #1601 relocation debt: the 88 design-assembly / constraint / IFT-cache
+// regression guards. Same orphaning story as the siblings above — their
+// `build_term_collection_design` / freeze / incremental-realizer / tensor+streamed
+// eval deps live HERE post-#1521 carve, but #1601 commented the include! out of
+// `gam_terms::smooth::tests` "for relocation" that never happened (the parked
+// `tests/src_modules/` tree was `mod`'d into no binary). Self-contained
+// `#[cfg(test)] mod`.
+include!("design_assembly_constraint_tests.rs");
+// #1601 relocation debt: the LAST of the three orphaned smooth test files — 48
+// adaptive / bounded / pure-Duchon / Charbonnier regression guards. Same story:
+// commented out of `gam_terms::smooth::tests` by #1601 "for relocation" and
+// parked in the `tests/src_modules/` tree that compiled into no binary. Re-homed
+// here where its `build_term_collection_design` / freeze / SAS-link-state /
+// joint-hyper FD deps resolve post-#1521 carve. Self-contained `#[cfg(test)] mod`.
+include!("adaptive_bounded_duchon_tests.rs");

@@ -10,7 +10,6 @@ rust-version = "1.93"
 [lints.rust]
 warnings = "deny"
 
-
 [dependencies]
 dyn-stack = "0.13.2"
 faer = "0.24.0"

@@ -7373,17 +7373,38 @@ pub fn build_single_local_smooth_term(
                     length_scale,
                     ..
                 } => {
+                    // Auto-promotion (canonical TPS infeasible at this (d, k)).
+                    // Since #1091 the promotion does NOT forward the incoming
+                    // σ_geom-compensated `spec_local.length_scale` to the Duchon
+                    // builder — it DISCARDS it and substitutes the geometric mean
+                    // of the center pairwise distances (`promotion_length_scale`,
+                    // the natural radial-kernel scale where κ·r ≈ O(1)). So the
+                    // realized kernel bandwidth recorded in this metadata bears no
+                    // fixed relation to the user's `spec.length_scale`; clobbering
+                    // it to the user-facing value (the pre-#1091 behavior) makes
+                    // freeze→replay re-derive `compensate(spec.length_scale, σ) ≠
+                    // promotion_length_scale`, evaluating the kernel at the wrong
+                    // bandwidth and corrupting the replayed design (#1091 broke the
+                    // e7ff5ed83 freeze contract for the auto-promoted path).
+                    //
+                    // The freeze→replay round trip rebuilds through the Duchon arm,
+                    // which re-applies σ_geom compensation:
+                    //   replay_eff = compensate(metadata.length_scale, σ)
+                    //              = metadata.length_scale / σ_geom.
+                    // For replay_eff to reproduce the realized `promotion_length_scale`
+                    // we must store the UN-compensated value `promotion_length_scale
+                    // · σ_geom`. `compensate(1.0, σ) = 1/σ_geom`, so divide the
+                    // realized scale by it to multiply back through σ_geom. With no
+                    // standardization (`scales == None`) replay does not compensate,
+                    // so the realized value is kept verbatim.
+                    if let (Some(s), Some(realized)) = (scales.as_ref(), *length_scale) {
+                        let inv_sigma_geom =
+                            compensate_length_scale_for_standardization(1.0, s);
+                        if inv_sigma_geom.is_finite() && inv_sigma_geom > 0.0 {
+                            *length_scale = Some(realized / inv_sigma_geom);
+                        }
+                    }
                     *ms = scales;
-                    // The ThinPlate auto-promotion path delegates to
-                    // `build_duchon_basis` with `Some(spec_local.length_scale)`,
-                    // which is the σ_geom-compensated value. The metadata
-                    // therefore records the compensated kernel range, but the
-                    // freeze→replay round trip plugs that value back into a
-                    // user-facing `DuchonBasisSpec.length_scale` whose builder
-                    // applies the σ_geom compensation a second time. Restore
-                    // the user-facing scale here so replay re-compensates
-                    // exactly once and reproduces the realized fit-time basis.
-                    *length_scale = Some(spec.length_scale);
                 }
                 _ => {}
             }

@@ -519,6 +519,20 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             .is_some_and(|t| t.contains(psi))
     }
 
+    /// DEBUG: the attached `PsiGramTensor` (the Chebyshev-interpolated
+    /// `G(ψ)`/`b(ψ)` surface installed by `build_and_set_psi_gram_tensor`), if
+    /// any. Exposes the `pub(crate)` field as a cloned `Arc` so the #1601-orphaned
+    /// design-assembly regression guards re-homed into the separate gam-models
+    /// crate can compare the interpolated Gram/RHS against the streamed-exact
+    /// surface. `pub` and compiled unconditionally — feature gating is banned in
+    /// this workspace, and a read-only `Arc` clone accessor the production path
+    /// never calls is inert by construction.
+    pub fn psi_gram_tensor_arc(
+        &self,
+    ) -> Option<std::sync::Arc<crate::psi_gram_tensor::PsiGramTensor>> {
+        self.psi_gram_tensor.clone()
+    }
+
     /// True when the design-realization SKIP to `psi` is β̂-SOUND given the
     /// reference surface pinned at the last slow-path reset (#1264). Restored
     /// after the "stale-penalty-not-stale-basis" theory was empirically refuted:

@@ -343,7 +343,11 @@ pub(crate) fn outer_ift_residual_energy_cache() -> &'static Mutex<HashMap<Vec<u6
     OUTER_IFT_RESIDUAL_ENERGY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub(crate) fn record_current_outer_iter_for_ift(iter: u64) {
+// `pub` (paired with `current_outer_iter` below) so the IFT design-cache
+// memo-invalidation regression guard re-homed into gam-models by #1601 can drive
+// the outer-iteration counter through the canonical `outer_eval` module path.
+// Test-harness-only writer; the production caller is the in-crate outer loop.
+pub fn record_current_outer_iter_for_ift(iter: u64) {
     OUTER_IFT_RESIDUAL_ENERGY_ITER.store(iter, Ordering::Relaxed);
 }
 

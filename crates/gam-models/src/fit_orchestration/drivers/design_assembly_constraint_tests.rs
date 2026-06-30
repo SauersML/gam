@@ -1,17 +1,40 @@
-use super::*;
-use crate::basis::{
-    BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
-    BSplineIdentifiability, BSplineKnotSpec, BasisOptions, CenterStrategy, Dense, DuchonBasisSpec,
-    DuchonNullspaceOrder, DuchonOperatorPenaltySpec, KnotSource, MaternBasisSpec,
-    MaternIdentifiability, MaternNu, SpatialIdentifiability, ThinPlateBasisSpec,
-};
-use crate::estimate::AdaptiveRegularizationOptions;
-use crate::faer_ndarray::{FaerEigh, FaerSvd};
-use crate::solver::rho_optimizer::OuterEvalOrder;
-use ndarray::{Axis, array};
-use rand::RngExt;
-use rand::SeedableRng;
-use rand::rngs::StdRng;
+// #1601 relocation debt — re-homed from the pre-#1521 monolith fixture
+// `tests/src_modules/smooths/smooth_design_assembly_constraint_tests.rs`. #1601
+// (commit 28bab3753) unbroke the `gam-terms --lib` test build by commenting out
+// the `include!` of this file in `gam_terms::smooth::tests` (gam-solve/gam-models
+// depend on gam-terms, so its `crate::solver`/`crate::estimate` bodies can never
+// compile there) and parked the body "for relocation". The relocation never
+// happened: `tests/src_modules/` was `mod`'d into NO test binary, so these 88
+// design-assembly / constraint / IFT-cache regression guards have been silently
+// dead since #1601. They belong HERE: their private driver deps
+// (`build_term_collection_design`, `freeze_term_collection_from_design`,
+// `FrozenTermCollectionIncrementalRealizer`, `canonical_penalties_at*`, the
+// tensor/streamed eval closures) live in this `drivers` module post-carve, and
+// the cross-crate `crate::` paths the fixture used are rewritten to their carved
+// homes (`gam_solve::`, `gam_terms::`, `gam_problem::`, `gam_linalg::`,
+// `gam_model_api::`). Self-contained `#[cfg(test)] mod`, so it adds nothing to
+// the non-test build.
+#[cfg(test)]
+mod design_assembly_constraint_tests {
+    use super::*;
+    // The bespoke basis spec types this fixture builds designs from. `CenterStrategy`
+    // and `MaternIdentifiability` already arrive via `super::*` (the drivers'
+    // explicit `gam_terms::basis` import), so re-listing them here would collide
+    // (E0252); every other name is pulled in explicitly.
+    use gam_terms::basis::{
+        BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
+        BSplineIdentifiability, BSplineKnotSpec, BasisOptions, Dense, DuchonBasisSpec,
+        DuchonNullspaceOrder, DuchonOperatorPenaltySpec, KnotSource, MaternBasisSpec,
+        MaternNu, OneDimensionalBoundary, SpatialIdentifiability, SphericalSplineBasisSpec,
+        ThinPlateBasisSpec, build_bspline_basis_1d,
+    };
+    use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd};
+    use gam_model_api::OuterEvalOrder;
+    use ndarray::{Axis, array};
+    use rand::RngExt as _;
+    use rand::SeedableRng as _;
+    use rand::rngs::StdRng;
+
 
 /// A minimal frozen 1-D B-spline basis at `feature_col`, used to exercise
 /// the column-remap walk without standing up a full fit.
@@ -283,11 +306,25 @@ fn collect_feature_columns(spec: &TermCollectionSpec) -> Vec<usize> {
 }
 
 #[test]
-fn bspline_boundary_conditions_emit_paired_equality_constraints() {
+fn bspline_nonzero_anchor_rejected_homogeneous_pin_baked_structurally() {
+    // #1238 (commit 091830200) changed the B-spline endpoint-boundary contract:
+    // Anchored (Hermite C1: value+slope) and Clamped (slope) endpoints are now
+    // BAKED into the raw coefficient chart as a structural nullspace
+    // reparameterization (build the constraint rows, form their nullspace
+    // transform, apply it to design+penalties, compose it into the stored
+    // identifiability transform so the pinned functionals are structurally zero
+    // and the constrained columns are dropped) — they are no longer emitted as a
+    // `linear_constraints` equality block, and ONLY homogeneous (value≈0) anchors
+    // are representable. This fixture was authored against the pre-#1238 contract
+    // (boundaries → linear equality constraints, non-zero anchors allowed) and
+    // orphaned out of every test binary by #1601, so it silently encoded the dead
+    // contract. Re-homed here it pins the CURRENT contract: non-zero anchors
+    // REJECTED, homogeneous pins baked structurally (no linear constraints,
+    // columns dropped, endpoint functionals structurally zero in the chart).
     let x = Array1::linspace(0.0, 1.0, 25);
     let data = x.clone().insert_axis(Axis(1));
-    let spec = SmoothTermSpec {
-        name: "s(x, bc_left=anchored, anchor_left=2, bc_right=clamped)".to_string(),
+    let mk = |left, right| SmoothTermSpec {
+        name: "s(x, anchored_left, clamped_right)".to_string(),
         basis: SmoothBasisSpec::BSpline1D {
             feature_col: 0,
             spec: BSplineBasisSpec {
@@ -299,49 +336,127 @@ fn bspline_boundary_conditions_emit_paired_equality_constraints() {
                 },
                 double_penalty: false,
                 identifiability: BSplineIdentifiability::None,
-                boundary_conditions: BSplineBoundaryConditions {
-                    left: BSplineEndpointBoundaryCondition::Anchored { value: 2.0 },
-                    right: BSplineEndpointBoundaryCondition::Clamped,
-                },
+                boundary_conditions: BSplineBoundaryConditions { left, right },
                 boundary: OneDimensionalBoundary::Open,
             },
         },
         shape: ShapeConstraint::None,
         joint_null_rotation: None,
     };
-    let design = build_smooth_design(data.view(), &[spec]).unwrap_or_else(|e| panic!("{} failed: {:?}", "boundary design", e));
-    let constraints = design
-        .linear_constraints
-        .as_ref()
-        .unwrap_or_else(|| panic!("{} failed", "boundary constraints"));
-    assert_eq!(constraints.a.nrows(), 4);
-    assert_eq!(constraints.a.ncols(), design.total_smooth_cols());
-    assert_eq!(constraints.b.to_vec(), vec![2.0, -2.0, 0.0, -0.0]);
 
-    let metadata = &design.terms[0].metadata;
-    let BasisMetadata::BSpline1D { knots, .. } = metadata else {
+    // A non-zero anchor is no longer representable as a homogeneous structural
+    // pin: the builder must reject it with the specific InvalidInput (#1238).
+    let err = build_smooth_design(
+        data.view(),
+        &[mk(
+            BSplineEndpointBoundaryCondition::Anchored { value: 2.0 },
+            BSplineEndpointBoundaryCondition::Clamped,
+        )],
+    )
+    .expect_err("non-zero anchor must be rejected post-#1238");
+    match err {
+        gam_terms::basis::BasisError::InvalidInput(msg) => assert!(
+            msg.contains("anchored B-spline boundary value must be zero"),
+            "unexpected rejection message: {msg}"
+        ),
+        other => panic!("expected InvalidInput for non-zero anchor, got {other:?}"),
+    }
+
+    // Reference free basis fixes the raw column count (8 columns here).
+    let free = build_smooth_design(
+        data.view(),
+        &[mk(
+            BSplineEndpointBoundaryCondition::Free,
+            BSplineEndpointBoundaryCondition::Free,
+        )],
+    )
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "free basis builds", e));
+    let raw_cols = free.total_smooth_cols();
+    assert_eq!(raw_cols, 8);
+
+    // Homogeneous Anchored{0.0} (Hermite value+slope) left + Clamped (slope)
+    // right is now BAKED into the coefficient chart. Three structural rows (left
+    // value, left slope, right slope) are dropped, so the design loses exactly
+    // three columns and carries NO linear constraints.
+    let design = build_smooth_design(
+        data.view(),
+        &[mk(
+            BSplineEndpointBoundaryCondition::Anchored { value: 0.0 },
+            BSplineEndpointBoundaryCondition::Clamped,
+        )],
+    )
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "homogeneous anchored/clamped basis builds", e));
+    assert!(
+        design.linear_constraints.is_none(),
+        "boundary conditions are baked structurally, not emitted as linear constraints"
+    );
+    assert_eq!(
+        design.total_smooth_cols(),
+        raw_cols - 3,
+        "left value+slope and right slope pins drop three raw columns"
+    );
+
+    let BasisMetadata::BSpline1D {
+        knots,
+        identifiability_transform,
+        ..
+    } = &design.terms[0].metadata
+    else {
         panic!("expected B-spline metadata");
     };
-    let (left_value, _) = crate::basis::create_basis::<Dense>(
+    let z = identifiability_transform
+        .as_ref()
+        .unwrap_or_else(|| panic!("{} failed", "baked boundary transform recorded for replay"));
+    assert_eq!(z.nrows(), raw_cols);
+    assert_eq!(z.ncols(), design.total_smooth_cols());
+
+    // PROVE the endpoint is structurally pinned in the constrained chart:
+    // evaluate the RAW basis at each endpoint, push it through the stored
+    // transform Z, and confirm the pinned functionals vanish.
+    //   left value:  B(0)  · Z ≈ 0
+    //   left slope:  B'(0) · Z ≈ 0   (Anchored = Hermite C1: value + slope)
+    //   right slope: B'(1) · Z ≈ 0   (Clamped)
+    let (left_value, _) = gam_terms::basis::create_basis::<Dense>(
         array![0.0].view(),
         KnotSource::Provided(knots.view()),
         3,
         BasisOptions::value(),
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "left endpoint basis", e));
-    let (right_slope, _) = crate::basis::create_basis::<Dense>(
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "left endpoint value basis", e));
+    let (left_slope, _) = gam_terms::basis::create_basis::<Dense>(
+        array![0.0].view(),
+        KnotSource::Provided(knots.view()),
+        3,
+        BasisOptions::first_derivative(),
+    )
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "left endpoint derivative basis", e));
+    let (right_slope, _) = gam_terms::basis::create_basis::<Dense>(
         array![1.0].view(),
         KnotSource::Provided(knots.view()),
         3,
         BasisOptions::first_derivative(),
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "right endpoint derivative", e));
-    for j in 0..constraints.a.ncols() {
-        assert!((constraints.a[[0, j]] - left_value[[0, j]]).abs() < 1e-12);
-        assert!((constraints.a[[1, j]] + left_value[[0, j]]).abs() < 1e-12);
-        assert!((constraints.a[[2, j]] - right_slope[[0, j]]).abs() < 1e-12);
-        assert!((constraints.a[[3, j]] + right_slope[[0, j]]).abs() < 1e-12);
-    }
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "right endpoint derivative basis", e));
+
+    let baked_left_value = left_value.row(0).dot(z);
+    let baked_left_slope = left_slope.row(0).dot(z);
+    let baked_right_slope = right_slope.row(0).dot(z);
+    let maxabs = |v: &Array1<f64>| v.iter().fold(0.0_f64, |a, &x| a.max(x.abs()));
+    assert!(
+        maxabs(&baked_left_value) < 1e-10,
+        "left endpoint value must be structurally pinned to zero, got {:e}",
+        maxabs(&baked_left_value)
+    );
+    assert!(
+        maxabs(&baked_left_slope) < 1e-10,
+        "left endpoint slope (Hermite C1) must be structurally pinned to zero, got {:e}",
+        maxabs(&baked_left_slope)
+    );
+    assert!(
+        maxabs(&baked_right_slope) < 1e-10,
+        "right endpoint slope (Clamped) must be structurally pinned to zero, got {:e}",
+        maxabs(&baked_right_slope)
+    );
 }
 
 #[test]
@@ -380,33 +495,62 @@ fn bspline_boundary_conditions_follow_frozen_identifiability_transform() {
         joint_null_rotation: None,
     };
     let design = build_smooth_design(data.view(), &[spec]).unwrap_or_else(|e| panic!("{} failed: {:?}", "boundary design", e));
-    let constraints = design
-        .linear_constraints
-        .as_ref()
-        .unwrap_or_else(|| panic!("{} failed", "boundary constraints"));
-    assert_eq!(constraints.a.nrows(), 2);
-    assert_eq!(constraints.a.ncols(), raw_cols - 1);
-    let BasisMetadata::BSpline1D { knots, .. } = &design.terms[0].metadata else {
+
+    // #1238: boundaries are baked, not emitted as linear constraints.
+    assert!(
+        design.linear_constraints.is_none(),
+        "frozen-transform boundary smooth emits no linear constraints"
+    );
+
+    // A FrozenTransform already maps from the RAW knot basis with the endpoint
+    // projection baked in at fit time, so the builder MUST NOT re-run the
+    // boundary nullspace step (re-projecting would shrink the basis a second
+    // time). The shipped design therefore has exactly `z.ncols()` columns and the
+    // stored identifiability transform is `z` verbatim.
+    assert_eq!(design.total_smooth_cols(), raw_cols - 1);
+    let BasisMetadata::BSpline1D {
+        knots,
+        identifiability_transform,
+        ..
+    } = &design.terms[0].metadata
+    else {
         panic!("expected B-spline metadata");
     };
-    let (left_value, _) = crate::basis::create_basis::<Dense>(
-        array![0.0].view(),
+    let stored = identifiability_transform
+        .as_ref()
+        .unwrap_or_else(|| panic!("{} failed", "frozen transform recorded in metadata"));
+    assert_eq!(stored.dim(), z.dim());
+    for ((i, j), &v) in z.indexed_iter() {
+        assert!(
+            (stored[[i, j]] - v).abs() < 1e-12,
+            "stored transform must equal the frozen transform verbatim at [{i},{j}]"
+        );
+    }
+
+    // The constrained design equals the RAW basis times the frozen transform
+    // (B·z): the frozen transform alone governs the chart, no double-projection.
+    let (raw_basis, _) = gam_terms::basis::create_basis::<Dense>(
+        data.column(0),
         KnotSource::Provided(knots.view()),
         3,
         BasisOptions::value(),
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "left endpoint basis", e));
-    let expected = left_value.row(0).to_owned().dot(&z);
-    for j in 0..expected.len() {
-        assert!((constraints.a[[0, j]] - expected[j]).abs() < 1e-12);
-        assert!((constraints.a[[1, j]] + expected[j]).abs() < 1e-12);
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "raw basis", e));
+    let expected_design = raw_basis.dot(&z);
+    let shipped = design.term_designs[0].to_dense();
+    assert_eq!(shipped.dim(), expected_design.dim());
+    for ((i, j), &v) in expected_design.indexed_iter() {
+        assert!(
+            (shipped[[i, j]] - v).abs() < 1e-9,
+            "shipped design must equal raw basis · frozen transform at [{i},{j}]"
+        );
     }
 }
 
 fn assert_spatial_derivative_width(
     label: &str,
     dense: &Array2<f64>,
-    implicit: Option<&crate::terms::basis::ImplicitDesignPsiDerivative>,
+    implicit: Option<&gam_terms::basis::ImplicitDesignPsiDerivative>,
     expected: usize,
 ) {
     if let Some(op) = implicit {
@@ -466,7 +610,10 @@ fn spatial_log_kappa_bounds_from_options(
     )
 }
 
-fn two_block_exact_joint_hyper_setup(
+// `pub(super)` so the sibling re-homed fixture `adaptive_bounded_duchon_tests`
+// (the other #1601 orphan that shared this monolith helper) resolves it through
+// the `drivers` parent scope instead of duplicating the setup.
+pub(super) fn two_block_exact_joint_hyper_setup(
     meanspec: &TermCollectionSpec,
     noisespec: &TermCollectionSpec,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
@@ -566,7 +713,7 @@ fn dense_kronecker_pseudo_logdet_reference(
             } else {
                 Array2::<f64>::eye(other_penalty.nrows())
             };
-            kron_term = crate::construction::kronecker_product(&kron_term, &factor);
+            kron_term = gam_terms::construction::kronecker_product(&kron_term, &factor);
         }
         s_dense.scaled_add(lambdas[axis], &kron_term);
     }
@@ -598,7 +745,7 @@ fn dense_kronecker_pseudo_logdet_reference(
             } else {
                 Array2::<f64>::eye(other_penalty.nrows())
             };
-            kron_term = crate::construction::kronecker_product(&kron_term, &factor);
+            kron_term = gam_terms::construction::kronecker_product(&kron_term, &factor);
         }
         for &eig_idx in &positive_indices {
             let eigval = evals_dense[eig_idx];
@@ -615,7 +762,7 @@ fn dense_kronecker_pseudo_logdet_reference(
                     } else {
                         Array2::<f64>::eye(inner_penalty.nrows())
                     };
-                    other_kron = crate::construction::kronecker_product(&other_kron, &factor);
+                    other_kron = gam_terms::construction::kronecker_product(&other_kron, &factor);
                 }
                 let other_projected = other_kron.dot(&eigvec);
                 let cl = lambdas[other_axis] * eigvec.dot(&other_projected);
@@ -675,7 +822,9 @@ fn kronecker_penalty_system_logdet_matches_dense_reference() {
     );
 }
 
-fn assert_term_collection_designs_match(
+// `pub(super)` — shared with the sibling `adaptive_bounded_duchon_tests` #1601
+// re-home (its freeze/cache-rebuild pins compare two designs column-for-column).
+pub(super) fn assert_term_collection_designs_match(
     left: &TermCollectionDesign,
     right: &TermCollectionDesign,
     label: &str,
@@ -834,10 +983,23 @@ fn smooth_design_assembles_terms_and_penalties() {
     let sd = build_smooth_design(data.view(), &terms).unwrap();
     assert_eq!(sd.nrows(), data.nrows());
     assert_eq!(sd.terms.len(), 2);
-    // bspline double-penalty is folded into its primary block; tps
-    // double-penalty still contributes two blocks (bending + nullspace ridge).
-    assert_eq!(sd.penalties.len(), 3);
-    assert_eq!(sd.nullspace_dims.len(), 3);
+    // Each double-penalty term contributes two penalty blocks, so a
+    // double-penalty bspline + a double-penalty tps yields four blocks total.
+    //
+    // The bspline emits its Marra & Wood (2011) null-space shrinkage `ZZᵀ` as a
+    // SEPARATE REML coordinate (Primary bending + DoublePenaltyNullspace ridge),
+    // both Frobenius-normalized so the second smoothing parameter λ_nullspace is
+    // identifiable — `bspline_penalty_candidates` in gam-terms. The transient
+    // "fold into the primary block" experiment (41e5ffc44) was reverted the same
+    // day under the SAME issue by 2b4765120 ("fix(#1266): restore identified
+    // two-lambda bspline double penalty"), because the folded single-coordinate
+    // form let REML weaken the wiggliness penalty and inflate EDF; the shipped
+    // contract since #1266/#1365 is the two-coordinate normalized form. The free
+    // (default-boundary) bspline here takes that path (`is_free()` is true), so it
+    // contributes two blocks. The tps double-penalty likewise contributes two
+    // (bending + nullspace ridge). 2 + 2 = 4.
+    assert_eq!(sd.penalties.len(), 4);
+    assert_eq!(sd.nullspace_dims.len(), 4);
     for bp in &sd.penalties {
         assert_eq!(bp.local.nrows(), bp.block_size());
         assert_eq!(bp.local.ncols(), bp.block_size());
@@ -1948,7 +2110,7 @@ fn spatial_option5_preserves_lazy_thin_plate_terms_at_large_scale() {
     let design = build_term_collection_design(data.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "large option-5 design", e));
     assert!(matches!(
         &design.smooth.term_designs[0],
-        DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::Lazy(_))
+        DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::Lazy(_))
     ));
     let mut c = Array2::<f64>::zeros((n, 2));
     c.column_mut(0).fill(1.0);
@@ -2636,9 +2798,9 @@ fn centered_tensor_penalties_canonicalize_in_transformed_basis_width() {
     let penalty_specs = design
         .penalties
         .iter()
-        .map(crate::estimate::PenaltySpec::from_blockwise_ref)
+        .map(PenaltySpec::from_blockwise_ref)
         .collect::<Vec<_>>();
-    let (canonical, _) = crate::terms::construction::canonicalize_penalty_specs(
+    let (canonical, _) = gam_terms::construction::canonicalize_penalty_specs(
         &penalty_specs,
         &design.nullspace_dims,
         design.design.ncols(),
@@ -3117,7 +3279,11 @@ fn spatial_length_scale_optimization_monotone_improves_or_keeps_score_for_matern
 /// flat gradient/Hessian; trivial EFS) and returns the resolved result.
 /// Shared verbatim across the Matérn- and Duchon-freezing pins; only the
 /// final `.expect` diagnostic differs, passed via `expect_msg`.
-fn run_two_block_exact_joint_optimize(
+///
+/// `pub(super)` so the sibling `adaptive_bounded_duchon_tests` #1601 re-home
+/// (its `exact_joint_two_block_spatial_length_scale_freezes_duchon_centers` pin)
+/// shares the single definition through the `drivers` parent scope.
+pub(super) fn run_two_block_exact_joint_optimize(
     data: ArrayView2<'_, f64>,
     meanspec: &TermCollectionSpec,
     noisespec: &TermCollectionSpec,
@@ -3135,8 +3301,8 @@ fn run_two_block_exact_joint_optimize(
 
     let mean_terms = spatial_length_scale_term_indices(meanspec);
     let noise_terms = spatial_length_scale_term_indices(noisespec);
-    let policy = crate::families::custom_family::OuterDerivativePolicy {
-        capability: crate::families::custom_family::ExactOuterDerivativeOrder::Second,
+    let policy = gam_model_api::families::custom_family::OuterDerivativePolicy {
+        capability: gam_problem::ExactOuterDerivativeOrder::Second,
         predicted_hessian_work: 0,
         predicted_gradient_work: 0,
         // Test-style construction with zero predicted work — these
@@ -3150,7 +3316,7 @@ fn run_two_block_exact_joint_optimize(
         &[mean_terms, noise_terms],
         &kappa_options,
         &joint_setup,
-        crate::seeding::SeedRiskProfile::Gaussian,
+        gam_problem::SeedRiskProfile::Gaussian,
         true,
         true,
         false,
@@ -3173,13 +3339,13 @@ fn run_two_block_exact_joint_optimize(
                 Array1::zeros(theta_dim),
                 if matches!(
                     eval_mode,
-                    crate::solver::estimate::reml::reml_outer_engine::EvalMode::ValueGradientHessian
+                    gam_solve::estimate::reml::reml_outer_engine::EvalMode::ValueGradientHessian
                 ) {
-                    crate::solver::rho_optimizer::HessianResult::Analytic(Array2::zeros((
+                    gam_problem::HessianResult::Analytic(Array2::zeros((
                         theta_dim, theta_dim,
                     )))
                 } else {
-                    crate::solver::rho_optimizer::HessianResult::Unavailable
+                    gam_problem::HessianResult::Unavailable
                 },
             ))
         },
@@ -3187,7 +3353,7 @@ fn run_two_block_exact_joint_optimize(
             assert_eq!(theta.len(), theta_dim);
             assert_eq!(specs.len(), 2);
             assert!(!designs.is_empty());
-            Ok(crate::solver::rho_optimizer::EfsEval {
+            Ok(gam_problem::EfsEval {
                 cost: 0.0,
                 steps: vec![0.0; theta_dim],
                 beta: None,
@@ -3197,7 +3363,7 @@ fn run_two_block_exact_joint_optimize(
                 logdet_enclosure_gap: None,
             })
         },
-        |_beta: &Array1<f64>| Ok(crate::solver::rho_optimizer::SeedOutcome::NoSlot),
+        |_beta: &Array1<f64>| Ok(gam_solve::rho_optimizer::SeedOutcome::NoSlot),
     )
     .unwrap_or_else(|e| panic!("{} failed: {:?}", expect_msg, e))
 }
@@ -3387,7 +3553,7 @@ fn spatial_aniso_joint_exact_hessian_materializes_small_case() {
         dims_per_term,
     )
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "single-block cache", e));
-    let mut evaluator = crate::estimate::ExternalJointHyperEvaluator::new(
+    let mut evaluator = gam_solve::estimate::ExternalJointHyperEvaluator::new(
         y.view(),
         weights.view(),
         &design.design,
@@ -3400,8 +3566,8 @@ fn spatial_aniso_joint_exact_hessian_materializes_small_case() {
 
     let eval_at = |theta: &Array1<f64>,
                    cache: &mut SingleBlockExactJointDesignCache<'_>,
-                   evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>,
-                   order: crate::solver::rho_optimizer::OuterEvalOrder| {
+                   evaluator: &mut gam_solve::estimate::ExternalJointHyperEvaluator<'_>,
+                   order: gam_model_api::OuterEvalOrder| {
         cache.ensure_theta(theta).unwrap_or_else(|e| panic!("{} failed: {:?}", "theta applied", e));
         let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
             data.view(),
@@ -3428,7 +3594,7 @@ fn spatial_aniso_joint_exact_hessian_materializes_small_case() {
         &theta,
         &mut cache,
         &mut evaluator,
-        crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian,
+        gam_model_api::OuterEvalOrder::ValueGradientHessian,
     );
     let hessian = hessian_result
         .materialize_dense()
@@ -3468,6 +3634,7 @@ fn iso_kappa_duchon_binomial_probit_joint_gradient_matches_finite_difference() {
         80,
         LikelihoodSpec::binomial_probit(),
         false,
+        false,
     );
     assert!(
         pass,
@@ -3486,6 +3653,7 @@ fn iso_kappa_fd_variant_driver(
     n: usize,
     family: LikelihoodSpec,
     skip_psi: bool,
+    well_conditioned: bool,
 ) -> (bool, f64, Vec<String>) {
     let mut data = Array2::<f64>::zeros((n, 1));
     let mut y = Array1::<f64>::zeros(n);
@@ -3496,6 +3664,23 @@ fn iso_kappa_fd_variant_driver(
         let raw = eta + 0.7 * (3.7 * (i as f64) + 1.0).sin();
         y[i] = if family.is_gaussian_identity() {
             raw
+        } else if well_conditioned {
+            // Smooth, non-separating Bernoulli labels: a deterministic
+            // logistic-probability threshold against a fixed phase grid keeps
+            // the fitted μ away from {0,1} so the inner Newton system — and the
+            // cubic-curvature ψ-trace built from it — stays well-conditioned.
+            // The separating `raw > 0` generator below drives max|η|≈8.8 at
+            // n=20, where the GLM cubic-curvature ψ-trace amplifies the inner
+            // PIRLS KKT residual floor (~2e-6) by ~1.5e3 into a ~1e-2
+            // analytic-vs-FD gap. That gap is a conditioning artifact of BOTH
+            // sides (FD and analytic differentiate through the same ill-
+            // conditioned inner solve), NOT a gradient error — the projected-
+            // logdet REML ψ-gradient kernel itself is exact, matching FD to
+            // ~6e-7 on these balanced labels (this mirrors the #901 fix in
+            // `iso_kappa_reml_gradient_fd_tests`).
+            let p = 1.0 / (1.0 + (-0.6 * (2.0 * std::f64::consts::PI * t).sin()).exp());
+            let u = 0.5 * ((5.0 * (i as f64) + 0.5).sin() + 1.0);
+            if u < p { 1.0 } else { 0.0 }
         } else if raw > 0.0 {
             1.0
         } else {
@@ -3582,7 +3767,7 @@ fn iso_kappa_fd_variant_driver(
         dims_per_term.clone(),
     )
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "single-block cache", e));
-    let mut evaluator = crate::estimate::ExternalJointHyperEvaluator::new(
+    let mut evaluator = gam_solve::estimate::ExternalJointHyperEvaluator::new(
         y.view(),
         weights.view(),
         &frozen_design.design,
@@ -3595,7 +3780,7 @@ fn iso_kappa_fd_variant_driver(
 
     let cost_at = |theta: &Array1<f64>,
                    cache: &mut SingleBlockExactJointDesignCache<'_>,
-                   evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>|
+                   evaluator: &mut gam_solve::estimate::ExternalJointHyperEvaluator<'_>|
      -> f64 {
         cache.ensure_theta(theta).unwrap_or_else(|e| panic!("{} failed: {:?}", "ensure_theta", e));
         let design = cache.design();
@@ -3616,7 +3801,7 @@ fn iso_kappa_fd_variant_driver(
 
     let analytic_at = |theta: &Array1<f64>,
                        cache: &mut SingleBlockExactJointDesignCache<'_>,
-                       evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>|
+                       evaluator: &mut gam_solve::estimate::ExternalJointHyperEvaluator<'_>|
      -> (f64, Array1<f64>) {
         cache.ensure_theta(theta).expect("ensure_theta");
         let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
@@ -3634,7 +3819,7 @@ fn iso_kappa_fd_variant_driver(
             rho_dim,
             hyper_dirs,
             None,
-            crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient,
+            gam_model_api::OuterEvalOrder::ValueAndGradient,
             None,
         )
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "outer eval", e));
@@ -3730,6 +3915,7 @@ fn iso_kappa_duchon_gaussian_identity_fd() {
         80,
         LikelihoodSpec::gaussian_identity(),
         false,
+        false,
     );
     assert!(
         pass,
@@ -3754,6 +3940,7 @@ fn iso_kappa_matern_gaussian_identity_fd() {
         "matern_gaussian",
         80,
         LikelihoodSpec::gaussian_identity(),
+        false,
         false,
     );
     assert!(
@@ -3954,7 +4141,7 @@ fn exact_spatial_joint_engine_aniso_iso_parity_1d() {
 /// actually attaches here (`assert!(attached)`).
 #[test]
 fn psi_gram_tensor_lane_matches_streamed_reml_cost_and_gradient() {
-    use crate::solver::rho_optimizer::OuterEvalOrder;
+    use gam_model_api::OuterEvalOrder;
 
     // ── 1-D isotropic Duchon Gaussian fixture, n = 600. coord_dim == 1
     // routes through the exact-joint spatial optimizer's tensor gate; the
@@ -4071,7 +4258,7 @@ fn psi_gram_tensor_lane_matches_streamed_reml_cost_and_gradient() {
     };
     let external_opts = external_opts_for_design(&family, &frozen_design, &fit_opts);
 
-    let mut streamed_eval = crate::estimate::ExternalJointHyperEvaluator::new(
+    let mut streamed_eval = gam_solve::estimate::ExternalJointHyperEvaluator::new(
         y.view(),
         weights.view(),
         &frozen_design.design,
@@ -4082,7 +4269,7 @@ fn psi_gram_tensor_lane_matches_streamed_reml_cost_and_gradient() {
     )
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "streamed evaluator", e));
 
-    let mut tensor_eval = crate::estimate::ExternalJointHyperEvaluator::new(
+    let mut tensor_eval = gam_solve::estimate::ExternalJointHyperEvaluator::new(
         y.view(),
         weights.view(),
         &frozen_design.design,
@@ -4148,12 +4335,12 @@ fn psi_gram_tensor_lane_matches_streamed_reml_cost_and_gradient() {
     // Evaluate cost + gradient (+ optional Hessian) from both lanes at one θ.
     // When `with_hessian` is true the Hessian (if analytic) is returned as
     // Some(H); the caller compares it pair-wise across lanes.
-    let eval_one = |evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>,
+    let eval_one = |evaluator: &mut gam_solve::estimate::ExternalJointHyperEvaluator<'_>,
                     cache: &mut SingleBlockExactJointDesignCache<'_>,
                     theta: &Array1<f64>,
                     with_hessian: bool|
      -> (f64, Array1<f64>, Option<Array2<f64>>) {
-        use crate::solver::rho_optimizer::HessianResult;
+        use gam_problem::HessianResult;
         cache.ensure_theta(theta).unwrap_or_else(|e| panic!("{} failed: {:?}", "ensure_theta", e));
         let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
             data.view(),
@@ -4410,7 +4597,7 @@ fn psi_gram_tensor_e2e_kappa_optimum_matches_streamed() {
     );
 
     let make_eval = || {
-        crate::estimate::ExternalJointHyperEvaluator::new(
+        gam_solve::estimate::ExternalJointHyperEvaluator::new(
             y.view(),
             weights.view(),
             &frozen_design.design,
@@ -4559,7 +4746,7 @@ fn psi_gram_tensor_e2e_kappa_optimum_matches_streamed() {
         Array1::<f64>::from_elem(rho_dim, 1.5),
     ];
     let mut worst_beta_abs = 0.0_f64;
-    let beta_one = |evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>,
+    let beta_one = |evaluator: &mut gam_solve::estimate::ExternalJointHyperEvaluator<'_>,
                     cache: &mut SingleBlockExactJointDesignCache<'_>,
                     theta: &Array1<f64>|
      -> Array1<f64> {
@@ -4664,7 +4851,7 @@ fn psi_gram_tensor_e2e_kappa_optimum_matches_streamed() {
 /// keeps β̂ bit-tight while regaining the n-free skip where it is sound.
 #[test]
 fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
-    use crate::solver::rho_optimizer::OuterEvalOrder;
+    use gam_model_api::OuterEvalOrder;
 
     // Same 1-D Duchon Gaussian fixture as the e2e κ-optimum test (n = 600).
     let n = 600usize;
@@ -4761,7 +4948,7 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     );
 
     let make_eval = || {
-        crate::estimate::ExternalJointHyperEvaluator::new(
+        gam_solve::estimate::ExternalJointHyperEvaluator::new(
             y.view(),
             weights.view(),
             &frozen_design.design,
@@ -4861,7 +5048,7 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     // is staged. The contract is both performance and soundness: admitted moved
     // probes must not re-enter `reset_surface`, and their converged β̂ must match
     // a fresh streamed slow-path solve to < 1e-6.
-    let eval_tensor = |evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>,
+    let eval_tensor = |evaluator: &mut gam_solve::estimate::ExternalJointHyperEvaluator<'_>,
                        cache: &mut SingleBlockExactJointDesignCache<'_>,
                        theta: &Array1<f64>,
                        realize: bool|
@@ -4987,7 +5174,7 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     // the reference the fast path must reproduce.
     let mut streamed_eval = make_eval();
     let mut stream_cache = make_cache();
-    let beta_streamed = |evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>,
+    let beta_streamed = |evaluator: &mut gam_solve::estimate::ExternalJointHyperEvaluator<'_>,
                          cache: &mut SingleBlockExactJointDesignCache<'_>,
                          theta: &Array1<f64>|
      -> Array1<f64> {
@@ -5097,7 +5284,7 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
 ///     not a gate tweak. Either way the number pins the frontier.
 #[test]
 fn psi_gram_skip_forced_rotation_beta_error_ladder_diag() {
-    use crate::solver::rho_optimizer::OuterEvalOrder;
+    use gam_model_api::OuterEvalOrder;
 
     let n = 600usize;
     let mut data = Array2::<f64>::zeros((n, 1));
@@ -5189,7 +5376,7 @@ fn psi_gram_skip_forced_rotation_beta_error_ladder_diag() {
     );
 
     let make_eval = || {
-        crate::estimate::ExternalJointHyperEvaluator::new(
+        gam_solve::estimate::ExternalJointHyperEvaluator::new(
             y.view(),
             weights.view(),
             &frozen_design.design,
@@ -5245,7 +5432,7 @@ fn psi_gram_skip_forced_rotation_beta_error_ladder_diag() {
         theta
     };
 
-    let eval_tensor = |evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>,
+    let eval_tensor = |evaluator: &mut gam_solve::estimate::ExternalJointHyperEvaluator<'_>,
                        cache: &mut SingleBlockExactJointDesignCache<'_>,
                        theta: &Array1<f64>,
                        realize: bool|
@@ -5282,7 +5469,7 @@ fn psi_gram_skip_forced_rotation_beta_error_ladder_diag() {
     // Fresh streamed reference (always re-realizes ⇒ exact n-row solve).
     let mut streamed_eval = make_eval();
     let mut stream_cache = make_cache();
-    let beta_streamed = |evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>,
+    let beta_streamed = |evaluator: &mut gam_solve::estimate::ExternalJointHyperEvaluator<'_>,
                          cache: &mut SingleBlockExactJointDesignCache<'_>,
                          theta: &Array1<f64>|
      -> Array1<f64> {
@@ -5386,10 +5573,8 @@ fn psi_gram_skip_forced_rotation_beta_error_ladder_diag() {
     // Clone the tensor Arc so the Gram accessor does not hold a borrow of
     // `tensor_eval` across the loop's `&mut tensor_eval` eval calls.
     let tensor_arc = tensor_eval
-        .psi_gram_tensor
-        .as_ref()
-        .unwrap_or_else(|| panic!("{} failed", "tensor attached"))
-        .clone();
+        .psi_gram_tensor_arc()
+        .unwrap_or_else(|| panic!("{} failed", "tensor attached"));
     let tensor_gram_at = |psi: f64| -> Array2<f64> { tensor_arc.gram_at(psi) };
     let tensor_rhs_at = |psi: f64| -> Array1<f64> { tensor_arc.rhs_at(psi) };
     let g_interp_a = tensor_gram_at(psi_a);
@@ -5449,7 +5634,7 @@ fn psi_gram_skip_forced_rotation_beta_error_ladder_diag() {
         // p×p sums of the block-local matrices placed at their col_range.
         let p_cols = stream_cache.design().design.ncols();
         let to_dense_canonical =
-            |pens: &[crate::construction::CanonicalPenalty]| -> Array2<f64> {
+            |pens: &[gam_terms::construction::CanonicalPenalty]| -> Array2<f64> {
                 let mut s = Array2::<f64>::zeros((p_cols, p_cols));
                 for cp in pens {
                     let r = &cp.col_range;
@@ -5485,7 +5670,7 @@ fn psi_gram_skip_forced_rotation_beta_error_ladder_diag() {
         // Re-pin at ψ_A after each forced trial so every measurement is a move
         // off the SAME reference (a forced skip does not advance the pin, but a
         // streamed-cache realize did; restore the tensor cache's surface).
-        let _ = eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_a), true);
+        drop(eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_a), true));
     }
     eprintln!(
         "[DIAG1033-FORCE] worst forced-skip β̂rel across the move ladder = {worst_forced:.3e} \
@@ -5504,7 +5689,7 @@ fn psi_gram_skip_forced_rotation_beta_error_ladder_diag() {
 #[test]
 fn iso_kappa_duchon_binomial_logit_fd() {
     let (pass, worst, violations) =
-        iso_kappa_fd_variant_driver("duchon_logit", 80, LikelihoodSpec::binomial_logit(), false);
+        iso_kappa_fd_variant_driver("duchon_logit", 80, LikelihoodSpec::binomial_logit(), false, false);
     assert!(
         pass,
         "BinomialLogit FD failed; worst_psi_rel={worst:.3e}\n  {}",
@@ -5520,11 +5705,22 @@ fn iso_kappa_duchon_binomial_logit_fd() {
 
 #[test]
 fn iso_kappa_duchon_n_smaller_fd() {
+    // Well-conditioned labels (`well_conditioned = true`): at n=20 the SEPARATING
+    // label generator drives the inner probit fit to max|η|≈8.8, where the GLM
+    // cubic-curvature ψ-trace amplifies the inner PIRLS KKT floor (~2e-6) by
+    // ~1.5e3 into a ~1e-2 analytic-vs-FD gap. That is a conditioning artifact of
+    // BOTH sides, not a gradient error — the #901 projected-logdet ψ-gradient
+    // kernel is exact, matching FD to ~6e-7 on balanced labels. This mirrors the
+    // already-passing `iso_kappa_reml_gradient_fd_tests::iso_kappa_duchon_n_smaller_fd`
+    // companion (which added the same `well_conditioned` switch under #901); the
+    // re-homed copy predated that fix and used the separating generator, so it
+    // tripped the strict 5e-3 bar with worst≈7.7e-3.
     let (pass, worst, violations) = iso_kappa_fd_variant_driver(
         "duchon_probit_n20",
         20,
         LikelihoodSpec::binomial_probit(),
         false,
+        true,
     );
     assert!(
         pass,
@@ -5540,6 +5736,7 @@ fn iso_kappa_duchon_no_psi_fd() {
         80,
         LikelihoodSpec::binomial_probit(),
         true,
+        false,
     );
     assert!(
         pass,
@@ -5668,7 +5865,7 @@ fn iso_kappa_duchon_outer_gradient_matches_centered_fd() {
         dims_per_term.clone(),
     )
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "cache", e));
-    let mut evaluator = crate::estimate::ExternalJointHyperEvaluator::new(
+    let mut evaluator = gam_solve::estimate::ExternalJointHyperEvaluator::new(
         y.view(),
         weights.view(),
         &frozen_design.design,
@@ -5684,9 +5881,9 @@ fn iso_kappa_duchon_outer_gradient_matches_centered_fd() {
 
     let eval_at =
         |theta: &Array1<f64>,
-         order: crate::solver::rho_optimizer::OuterEvalOrder,
+         order: gam_model_api::OuterEvalOrder,
          cache: &mut SingleBlockExactJointDesignCache<'_>,
-         evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>| {
+         evaluator: &mut gam_solve::estimate::ExternalJointHyperEvaluator<'_>| {
             cache.ensure_theta(theta).unwrap_or_else(|e| panic!("{} failed: {:?}", "ensure_theta", e));
             let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
                 data.view(),
@@ -5711,7 +5908,7 @@ fn iso_kappa_duchon_outer_gradient_matches_centered_fd() {
 
     let (cost_at_zero, grad_at_zero, _hess) = eval_at(
         &theta_zero,
-        crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient,
+        gam_model_api::OuterEvalOrder::ValueAndGradient,
         &mut cache,
         &mut evaluator,
     );
@@ -5724,13 +5921,13 @@ fn iso_kappa_duchon_outer_gradient_matches_centered_fd() {
     theta_m[psi_idx] -= h;
     let (cost_p, _, _) = eval_at(
         &theta_p,
-        crate::solver::rho_optimizer::OuterEvalOrder::Value,
+        gam_model_api::OuterEvalOrder::Value,
         &mut cache,
         &mut evaluator,
     );
     let (cost_m, _, _) = eval_at(
         &theta_m,
-        crate::solver::rho_optimizer::OuterEvalOrder::Value,
+        gam_model_api::OuterEvalOrder::Value,
         &mut cache,
         &mut evaluator,
     );
@@ -5816,7 +6013,7 @@ fn duchon_probit_pirls_determinism_at_zero() {
         dims_per_term.clone(),
     )
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "cache", e));
-    let mut evaluator = crate::estimate::ExternalJointHyperEvaluator::new(
+    let mut evaluator = gam_solve::estimate::ExternalJointHyperEvaluator::new(
         y.view(),
         weights.view(),
         &frozen_design.design,
@@ -5865,9 +6062,9 @@ fn duchon_probit_pirls_determinism_at_zero() {
 
 #[test]
 fn spatial_aniso_joint_large_psi_dim_keeps_second_order_route() {
-    let cap = crate::solver::rho_optimizer::OuterCapability {
-        gradient: crate::solver::rho_optimizer::Derivative::Analytic,
-        hessian: crate::solver::rho_optimizer::DeclaredHessianForm::Either,
+    let cap = gam_solve::rho_optimizer::OuterCapability {
+        gradient: gam_problem::Derivative::Analytic,
+        hessian: gam_problem::DeclaredHessianForm::Either,
         n_params: 40,
         psi_dim: 31,
         fixed_point_available: true,
@@ -5875,11 +6072,11 @@ fn spatial_aniso_joint_large_psi_dim_keeps_second_order_route() {
         prefer_gradient_only: false,
         disable_fixed_point: false,
     };
-    let route = crate::solver::rho_optimizer::plan(&cap);
-    assert_eq!(route.solver, crate::solver::rho_optimizer::Solver::Arc);
+    let route = gam_solve::rho_optimizer::plan(&cap);
+    assert_eq!(route.solver, gam_solve::rho_optimizer::Solver::Arc);
     assert_eq!(
         route.hessian_source,
-        crate::solver::rho_optimizer::HessianSource::Analytic
+        gam_solve::rho_optimizer::HessianSource::Analytic
     );
     assert!(route.routing_log_line().contains("matrix-free=false"));
 }
@@ -6245,8 +6442,8 @@ fn exact_joint_two_block_no_spatial_fast_path_returns_fully_frozen_specs() {
     assert!(mean_terms.is_empty());
     assert!(noise_terms.is_empty());
 
-    let policy = crate::families::custom_family::OuterDerivativePolicy {
-        capability: crate::families::custom_family::ExactOuterDerivativeOrder::Second,
+    let policy = gam_model_api::families::custom_family::OuterDerivativePolicy {
+        capability: gam_problem::ExactOuterDerivativeOrder::Second,
         predicted_hessian_work: 0,
         predicted_gradient_work: 0,
         // Test-style construction with zero predicted work — these
@@ -6260,7 +6457,7 @@ fn exact_joint_two_block_no_spatial_fast_path_returns_fully_frozen_specs() {
         &[mean_terms, noise_terms],
         &kappa_options,
         &joint_setup,
-        crate::seeding::SeedRiskProfile::Gaussian,
+        gam_problem::SeedRiskProfile::Gaussian,
         true,
         true,
         false,
@@ -6281,13 +6478,13 @@ fn exact_joint_two_block_no_spatial_fast_path_returns_fully_frozen_specs() {
                 Array1::zeros(theta_dim),
                 if matches!(
                     eval_mode,
-                    crate::solver::estimate::reml::reml_outer_engine::EvalMode::ValueGradientHessian
+                    gam_solve::estimate::reml::reml_outer_engine::EvalMode::ValueGradientHessian
                 ) {
-                    crate::solver::rho_optimizer::HessianResult::Analytic(Array2::zeros((
+                    gam_problem::HessianResult::Analytic(Array2::zeros((
                         theta_dim, theta_dim,
                     )))
                 } else {
-                    crate::solver::rho_optimizer::HessianResult::Unavailable
+                    gam_problem::HessianResult::Unavailable
                 },
             ))
         },
@@ -6295,7 +6492,7 @@ fn exact_joint_two_block_no_spatial_fast_path_returns_fully_frozen_specs() {
             assert_eq!(theta.len(), theta_dim);
             assert_eq!(specs.len(), 2);
             assert_eq!(designs.len(), 2);
-            Ok(crate::solver::rho_optimizer::EfsEval {
+            Ok(gam_problem::EfsEval {
                 cost: 0.0,
                 steps: vec![0.0; theta_dim],
                 beta: None,
@@ -6305,7 +6502,7 @@ fn exact_joint_two_block_no_spatial_fast_path_returns_fully_frozen_specs() {
                 logdet_enclosure_gap: None,
             })
         },
-        |_beta: &Array1<f64>| Ok(crate::solver::rho_optimizer::SeedOutcome::NoSlot),
+        |_beta: &Array1<f64>| Ok(gam_solve::rho_optimizer::SeedOutcome::NoSlot),
     )
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "exact joint no-spatial fast path should succeed", e));
 
@@ -6574,7 +6771,7 @@ fn two_block_exact_joint_design_cache_clears_memo_on_theta_change() {
     let eval = (
         2.25,
         Array1::<f64>::ones(theta0.len()),
-        crate::solver::rho_optimizer::HessianResult::Analytic(Array2::<f64>::eye(theta0.len())),
+        gam_problem::HessianResult::Analytic(Array2::<f64>::eye(theta0.len())),
     );
     cache.store_eval(eval.clone());
     let cached_eval = cache.memoized_eval(&theta0).unwrap_or_else(|| panic!("{} failed", "cached eval"));
@@ -6690,7 +6887,7 @@ fn single_block_exact_joint_design_cache_clears_memo_on_theta_change() {
     let eval = (
         0.5,
         Array1::<f64>::ones(theta0.len()),
-        crate::solver::rho_optimizer::HessianResult::Analytic(Array2::<f64>::eye(theta0.len())),
+        gam_problem::HessianResult::Analytic(Array2::<f64>::eye(theta0.len())),
     );
     cache.store_eval_at(&theta0, eval.clone());
     let cached_eval = cache.memoized_eval(&theta0).unwrap_or_else(|| panic!("{} failed", "cached eval"));
@@ -6725,10 +6922,10 @@ fn single_block_exact_joint_design_cache_clears_memo_on_theta_change() {
 fn single_block_latent_coord_design_cache_invalidates_memo_on_outer_iter_advance() {
     // Pins θ and re-evaluates after current_outer_iter() advances; the
     // scheduled penalty weight at that θ has changed, so the memo must miss.
-    use crate::solver::estimate::reml::outer_eval::{
+    use gam_solve::estimate::reml::outer_eval::{
         current_outer_iter, record_current_outer_iter_for_ift,
     };
-    use crate::terms::latent::{LatentCoordValues, LatentIdMode, LatentManifold};
+    use gam_terms::latent::{LatentCoordValues, LatentIdMode, LatentManifold};
 
     let n = 16usize;
     let latent_dim = 1usize;
@@ -6774,11 +6971,11 @@ fn single_block_latent_coord_design_cache_invalidates_memo_on_outer_iter_advance
     ));
     let latent = StandardLatentCoordConfig {
         values: latent_values,
-        term_index: crate::types::SmoothTermIdx::new(0),
+        term_index: gam_problem::SmoothTermIdx::new(0),
         feature_cols: vec![0],
         manifold: LatentManifold::Euclidean,
         manifold_auto: false,
-        retraction_registry: crate::solver::latent_cache::LatentRetractionRegistry::default(),
+        retraction_registry: gam_problem::LatentRetractionRegistry::default(),
         analytic_penalties: None,
     };
 
@@ -6800,7 +6997,7 @@ fn single_block_latent_coord_design_cache_invalidates_memo_on_outer_iter_advance
     let eval = (
         1.25_f64,
         Array1::<f64>::from_elem(theta.len(), 0.5),
-        crate::solver::rho_optimizer::HessianResult::Analytic(Array2::<f64>::eye(theta.len())),
+        gam_problem::HessianResult::Analytic(Array2::<f64>::eye(theta.len())),
     );
     cache.store_eval(eval.clone());
 
@@ -6905,7 +7102,7 @@ fn external_joint_evaluator_reuse_matches_fresh_state_after_theta_update() {
         dims_per_term,
     )
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "single-block cache", e));
-    let mut reused = crate::estimate::ExternalJointHyperEvaluator::new(
+    let mut reused = gam_solve::estimate::ExternalJointHyperEvaluator::new(
         y.view(),
         weights.view(),
         &design.design,
@@ -6919,7 +7116,7 @@ fn external_joint_evaluator_reuse_matches_fresh_state_after_theta_update() {
     let compare_eval =
         |theta: &Array1<f64>,
          cache: &mut SingleBlockExactJointDesignCache<'_>,
-         reused: &mut crate::estimate::ExternalJointHyperEvaluator<'_>| {
+         reused: &mut gam_solve::estimate::ExternalJointHyperEvaluator<'_>| {
             cache.ensure_theta(theta).unwrap_or_else(|e| panic!("{} failed: {:?}", "theta applied", e));
 
             let build_hyper_dirs = || {
@@ -6940,7 +7137,7 @@ fn external_joint_evaluator_reuse_matches_fresh_state_after_theta_update() {
                 rho_dim,
                 build_hyper_dirs(),
                 None,
-                crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian,
+                gam_model_api::OuterEvalOrder::ValueGradientHessian,
                 None,
             )
             .expect("reused eval");
@@ -6950,7 +7147,7 @@ fn external_joint_evaluator_reuse_matches_fresh_state_after_theta_update() {
                 cache.design(),
                 &fit_opts,
             );
-            let mut fresh = crate::estimate::ExternalJointHyperEvaluator::new(
+            let mut fresh = gam_solve::estimate::ExternalJointHyperEvaluator::new(
                 y.view(),
                 weights.view(),
                 &cache.design().design,
@@ -6967,7 +7164,7 @@ fn external_joint_evaluator_reuse_matches_fresh_state_after_theta_update() {
                 rho_dim,
                 build_hyper_dirs(),
                 None,
-                crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian,
+                gam_model_api::OuterEvalOrder::ValueGradientHessian,
                 None,
             )
             .unwrap_or_else(|e| panic!("{} failed: {:?}", "fresh eval", e));
@@ -7007,7 +7204,7 @@ fn external_joint_evaluator_reuse_matches_fresh_state_after_theta_update() {
             )
             .unwrap_or_else(|e| panic!("{} failed: {:?}", "reused EFS eval", e));
 
-            let mut fresh_efs_eval = crate::estimate::ExternalJointHyperEvaluator::new(
+            let mut fresh_efs_eval = gam_solve::estimate::ExternalJointHyperEvaluator::new(
                 y.view(),
                 weights.view(),
                 &cache.design().design,
@@ -7175,7 +7372,7 @@ fn exact_thin_plate_log_kappa_derivative_uses_feature_columns_only() {
         } => {
             let x =
                 select_columns(data.view(), feature_cols).unwrap_or_else(|e| panic!("{} failed: {:?}", "select ThinPlate feature cols", e));
-            crate::basis::build_thin_plate_basis_log_kappa_derivative(x.view(), spec)
+            gam_terms::basis::build_thin_plate_basis_log_kappa_derivative(x.view(), spec)
                 .unwrap_or_else(|e| panic!("{} failed: {:?}", "direct ThinPlate derivative should build", e))
         }
         _ => panic!("expected ThinPlate term"),
@@ -7190,7 +7387,7 @@ fn exact_thin_plate_log_kappa_derivative_uses_feature_columns_only() {
         } => {
             let x =
                 select_columns(data.view(), feature_cols).expect("select ThinPlate feature cols");
-            crate::basis::build_thin_plate_basis_log_kappasecond_derivative(x.view(), spec)
+            gam_terms::basis::build_thin_plate_basis_log_kappasecond_derivative(x.view(), spec)
                 .unwrap_or_else(|e| panic!("{} failed: {:?}", "direct ThinPlate second derivative should build", e))
         }
         _ => panic!("expected ThinPlate term"),
@@ -7282,7 +7479,7 @@ fn exact_duchon_log_kappa_derivative_uses_feature_columns_only() {
             feature_cols, spec, ..
         } => {
             let x = select_columns(data.view(), feature_cols).unwrap_or_else(|e| panic!("{} failed: {:?}", "select Duchon feature cols", e));
-            crate::basis::build_duchon_basis_log_kappa_derivatives(x.view(), spec)
+            gam_terms::basis::build_duchon_basis_log_kappa_derivatives(x.view(), spec)
                 .unwrap_or_else(|e| panic!("{} failed: {:?}", "direct Duchon derivative bundle should build", e))
         }
         _ => panic!("expected Duchon term"),
@@ -7613,7 +7810,7 @@ fn pure_duchon_scale_dimensions_seed_geometry_but_enroll_no_hyper_axis() {
         }],
     };
 
-    crate::term_builder::enable_scale_dimensions(&mut spec);
+    gam_terms::term_builder::enable_scale_dimensions(&mut spec);
     // Duchon anisotropy η is a fixed, geometry-derived basis parameter,
     // never a REML hyper axis (see `spatial_term_supports_hyper_optimization`).
     // `scale_dims` seeds the per-axis metric on the spec, but a pure Duchon
@@ -8039,4 +8236,5 @@ fn spatial_anisotropy_pilot_initializer_seeds_geometry_without_fit() {
         }
         _ => panic!("expected Matern term"),
     }
+}
 }
