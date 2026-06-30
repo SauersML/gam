@@ -133,12 +133,23 @@ fn make_data(seed: u64) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
 /// the truth essentially as well as `double_penalty=False` on the SAME data and
 /// basis (mgcv's select=TRUE/FALSE ratio is ≈1.00×). Pre-fix #1476 lands the
 /// median dp=True/dp=False ratio at ~2.17× (worst-seed up to 5×).
+///
+/// The seed set deliberately spans seeds 1_476_011..=1_476_026, which INCLUDES
+/// the two catastrophic-collapse seeds 1_476_020 and 1_476_021. Those two are
+/// the ones the original 6-seed window (…011..016) silently missed: on them the
+/// promoted heavy slot-1 seed (#1426) budget-exhausts on the null-space
+/// annihilation shelf and — before the fix — the ARC budget-exhaustion guard's
+/// bare `return` shipped that degenerate box corner (dp/sp ratio 3.1 / 4.3,
+/// edf_total collapsing to 16.5 / 1.0) even though keep-best already held the
+/// converged interior optimum. Keeping them in the permanent gate ensures the
+/// multi-start keep-best regression can never silently reappear.
 #[test]
 fn double_penalty_does_not_over_shrink_supported_smooth_under_concurvity() {
     init_parallelism();
 
-    let seeds: [u64; 6] = [
-        1_476_011, 1_476_012, 1_476_013, 1_476_014, 1_476_015, 1_476_016,
+    let seeds: [u64; 16] = [
+        1_476_011, 1_476_012, 1_476_013, 1_476_014, 1_476_015, 1_476_016, 1_476_017, 1_476_018,
+        1_476_019, 1_476_020, 1_476_021, 1_476_022, 1_476_023, 1_476_024, 1_476_025, 1_476_026,
     ];
     let mut ratios = Vec::new();
     let mut worst = (0u64, 0.0f64);
@@ -165,20 +176,27 @@ fn double_penalty_does_not_over_shrink_supported_smooth_under_concurvity() {
     );
 
     // A correct selection penalty leaves a supported smooth alone: mgcv's
-    // select=TRUE / select=FALSE ratio on this data is ≈1.00×. Allow gam a
-    // modest 25% median slack and a 1.6× worst-seed ceiling — the pre-fix
-    // default lands median ~2.17× and worst ~5×.
+    // select=TRUE / select=FALSE ratio on this data is ≈1.00×. Post-fix the
+    // 16-seed sweep lands median ≈1.01× and worst ≈1.07× (including the formerly
+    // catastrophic seeds 020/021, which were 3.1×/4.3×). Allow a modest 15%
+    // median slack and a 1.35× worst-seed ceiling: tight enough that a
+    // reappearance of the keep-best regression (which shipped 3–5× corners) or a
+    // milder systematic over-shrink (the rejected symmetric-prior over-strength
+    // experiment pushed median to ~1.31×) trips the gate, with headroom for
+    // per-seed REML/noise jitter.
     assert!(
-        median <= 1.25,
+        median <= 1.15,
         "double_penalty over-shrinks a supported smooth under concurvity: median \
-         dp=True/dp=False rmse ratio = {median:.2}× (want ≤ 1.25×). The default \
+         dp=True/dp=False rmse ratio = {median:.2}× (want ≤ 1.15×). The default \
          selection penalty is damaging a genuinely-supported null-space component \
-         (#1476, residual after the projector + λ-rail fixes)."
+         (#1476, residual after the projector + λ-rail + keep-best fixes)."
     );
     assert!(
-        worst.1 <= 1.6,
+        worst.1 <= 1.35,
         "double_penalty over-shrinks a supported smooth on the worst seed {}: \
-         dp=True/dp=False rmse ratio = {:.2}× (want ≤ 1.6×) (#1476).",
+         dp=True/dp=False rmse ratio = {:.2}× (want ≤ 1.35×) (#1476). A ratio in \
+         the 3–5× range means the ARC budget-exhaustion guard is again discarding \
+         an earlier converged seed for a degenerate box corner.",
         worst.0,
         worst.1
     );
