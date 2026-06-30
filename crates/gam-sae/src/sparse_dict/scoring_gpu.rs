@@ -15,9 +15,12 @@
 //! per-row online top-`s` selectors. The selection logic itself
 //! ([`super::scoring::TopSSelector`]) stays single-sourced on the CPU: the
 //! device returns the score block, the host folds it into the SAME selectors,
-//! and discards it. Peak host score memory is `rows × tile`, independent of
-//! `K` — the lane's memory discipline is preserved, the GPU just does the
-//! `O(rows·tile·P)` multiply-accumulate that dominates.
+//! and discards it. The minibatch router [`route_minibatch_required`] walks the
+//! whole `K`-wide dictionary in atom-column tiles (each launch's block capped at
+//! `GPU_ROUTE_TILE_ELEMS`), so peak host/device score memory is `rows × tile`,
+//! **independent of `K`** — the lane's no-`N×K` memory discipline is preserved
+//! on the device exactly as on the CPU; the GPU just does the `O(rows·tile·P)`
+//! multiply-accumulate that dominates.
 //!
 //! # Bit-exact parity (the gate, not a tolerance)
 //!
@@ -178,18 +181,31 @@ pub fn score_block_required(
     Ok((score_block_cpu(rows, atoms), ScoreBlockPath::Cpu))
 }
 
+/// Peak score elements per device launch for the tiled GPU router. The router
+/// NEVER materialises the whole `m × K` block: it walks `K` in atom-column tiles
+/// sized so each launch's `m × cols` block stays under this cap (~2M f32 ≈ 8 MB
+/// host + 8 MB device), then discards it after folding. This keeps peak score
+/// memory bounded **independent of `K`** — the same discipline the CPU lane
+/// ([`super::scoring::top_s_online`]) keeps with its `rows × tile` column tiles —
+/// so a `K ≈ 32_000` fit does not balloon a `device alloc` linearly in `K`.
+const GPU_ROUTE_TILE_ELEMS: usize = 1 << 21;
+
 /// Route a whole minibatch of rows against the full decoder, returning each
 /// row's top-`s` `(atom, score)` selection — BIT-IDENTICAL to calling
-/// [`super::scoring::top_s_online`] per row, but with the `m × K` score block
-/// computed in one device launch when admitted.
+/// [`super::scoring::top_s_online`] per row, but with the score block computed on
+/// the device (in `K`-tiled launches) when admitted.
 ///
-/// The selection ([`super::scoring::TopSSelector`]) is single-sourced on the
-/// CPU and fed the device scores in ascending atom order — the SAME order
-/// `top_s_online` folds them (tiles ascending, atoms-within-tile ascending). The
-/// selector's result depends only on the offered `(atom, score)` pairs, and the
-/// scores are bit-identical (the kernel forbids FMA contraction), so the routed
-/// support matches the CPU oracle exactly regardless of which path computed the
-/// block.
+/// The selection ([`super::scoring::TopSSelector`]) is single-sourced on the CPU
+/// and fed the device scores in ascending atom order. `TopSSelector` keeps the
+/// top-`s` by `(|score| desc, atom asc)` — a strict total order on the unique
+/// atom indices — so the selected set is independent of the order or the tiling
+/// in which candidates are offered. Combined with bit-identical scores (the
+/// kernel forbids FMA contraction), the routed support matches the CPU oracle
+/// **exactly**, whichever path and whatever GPU tile width computed the block.
+///
+/// Memory: the `m × K` block is never formed whole — `K` is walked in tiles of
+/// at most `GPU_ROUTE_TILE_ELEMS / m` atom-columns, each launched, folded, and
+/// discarded, so peak score memory is `m × tile_cols`, independent of `K`.
 ///
 /// Falls back to the per-row CPU `top_s_online` under [`gam_gpu::GpuMode::Off`],
 /// below the device break-even, or on any device error under
@@ -223,38 +239,60 @@ pub fn route_minibatch_required(
         return Ok((cpu_route(), ScoreBlockPath::Cpu));
     }
 
-    let (block, path) = match score_block_required(rows, decoder, mode) {
-        Ok(out) => out,
-        Err(err) => {
-            if mode == gam_gpu::GpuMode::Required {
-                return Err(err);
-            }
-            // Auto with a non-Required error already degrades inside
-            // score_block_required, so this arm is unreachable in practice; keep
-            // it total for safety.
-            return Ok((cpu_route(), ScoreBlockPath::Cpu));
+    // Engagement is decided on the TOTAL work `m × K` (that is what justifies the
+    // device's fixed launch cost), but the launches themselves are K-tiled so the
+    // buffers never grow with K.
+    let elems = m.saturating_mul(k);
+    let below_breakeven = elems < DEVICE_SCORE_BLOCK_MIN_ELEMS;
+    if below_breakeven {
+        if mode == gam_gpu::GpuMode::Required {
+            return Err(gam_gpu::gpu_err!(
+                "route_minibatch GpuMode::Required: block of {m}×{k} = {elems} elems is below \
+                 the device launch break-even (DEVICE_SCORE_BLOCK_MIN_ELEMS={DEVICE_SCORE_BLOCK_MIN_ELEMS}); \
+                 refusing to silently run on the CPU"
+            ));
         }
-    };
-
-    if path == ScoreBlockPath::Cpu {
-        // Below break-even (or Off): the per-row tiled path is cheaper and is the
-        // exact same arithmetic — use it directly rather than re-folding a block
-        // the device never produced.
+        return Ok((cpu_route(), ScoreBlockPath::Cpu));
+    }
+    if m == 0 || k == 0 {
         return Ok((cpu_route(), ScoreBlockPath::Cpu));
     }
 
-    // Device block: fold each row's K scores into a selector in ASCENDING atom
-    // order (the order top_s_online uses), giving a bit-identical selection.
-    let routed = (0..m)
-        .map(|r| {
-            let mut sel = TopSSelector::new(s);
-            let base = r * k;
-            for (a, score) in block[base..base + k].iter().enumerate() {
-                sel.offer(a as u32, *score);
+    // Atom-columns per device launch: bound the per-launch block to
+    // GPU_ROUTE_TILE_ELEMS, at least one column, never more than K.
+    let tile_cols = (GPU_ROUTE_TILE_ELEMS / m).clamp(1, k);
+
+    // Per-row online selectors; each device tile's scores are folded in ascending
+    // global atom order (offset + ascending local), and the selector's result is
+    // tile-order-invariant, so the support is bit-identical to top_s_online.
+    let mut selectors: Vec<TopSSelector> = (0..m).map(|_| TopSSelector::new(s)).collect();
+    let mut start = 0usize;
+    while start < k {
+        let end = (start + tile_cols).min(k);
+        let atoms_tile = decoder.slice(ndarray::s![start..end, ..]);
+        match device::score_block_device(rows, atoms_tile) {
+            Ok(block) => {
+                let cols = end - start;
+                for (r, sel) in selectors.iter_mut().enumerate() {
+                    let base = r * cols;
+                    for (local, score) in block[base..base + cols].iter().enumerate() {
+                        sel.offer((start + local) as u32, *score);
+                    }
+                }
             }
-            sel.finish()
-        })
-        .collect();
+            Err(err) => {
+                if mode == gam_gpu::GpuMode::Required {
+                    return Err(err);
+                }
+                // Auto: the device faulted mid-route; discard partial selectors and
+                // run the exact CPU oracle for the whole minibatch.
+                return Ok((cpu_route(), ScoreBlockPath::Cpu));
+            }
+        }
+        start = end;
+    }
+
+    let routed = selectors.into_iter().map(TopSSelector::finish).collect();
     Ok((routed, ScoreBlockPath::Device))
 }
 
