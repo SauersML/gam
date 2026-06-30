@@ -171,6 +171,60 @@ pub(crate) fn trivial_k1_euclidean_term() -> SaeManifoldTerm {
     SaeManifoldTerm::new(vec![atom], assignment).unwrap()
 }
 
+/// #795 (second root cause) — a BOUNDED low-amplitude flicker of the per-row
+/// gauge-deflation count is benign jitter, NOT the oscillating-quotient
+/// pathology, so it must re-anchor freely no matter how many times it reverses.
+///
+/// The count is an O(N) per-row sum of near-null evidence directions; a handful
+/// of rows sitting right at the deflation floor cross it back and forth as the
+/// ρ-walk nudges the conditioning, reversing direction every step while staying
+/// within a few of a large level (the single-planted-circle fit flickers
+/// 150<->147 on N=200). Each such change is evidence-neutral (a deflated
+/// direction contributes the ρ-independent `log 1 = 0` to `½log|H|` either way),
+/// so re-anchoring is exactly correct and the fit must not be refused. The
+/// bare-reversal guard charged the budget on every one of these and aborted the
+/// simplest possible manifold-SAE fit (isometry on OR off) — this pins that a
+/// sustained small-amplitude flicker survives indefinitely.
+#[test]
+pub(crate) fn evidence_gauge_deflation_count_bounded_flicker_reanchors_freely() {
+    let mut term = trivial_k1_euclidean_term();
+    // Pin the expected count at a realistic large level (like the circle fit).
+    term.record_evidence_gauge_deflation_count(150).unwrap();
+    // A sustained 150<->147 flicker reverses direction on EVERY step — far more
+    // reversals than the K=1 budget of 6 — yet the amplitude (3) is well inside
+    // the relative jitter band (150/4 = 37), so none charge the budget.
+    let flicker = [147usize, 150, 147, 150, 147, 150, 147, 150, 147, 150, 147, 150, 147, 150];
+    for &c in &flicker {
+        term.record_evidence_gauge_deflation_count(c)
+            .expect("a bounded low-amplitude flicker must re-anchor, never abort");
+    }
+    assert_eq!(
+        term.evidence_gauge_deflation_reanchors, 0,
+        "a flicker inside the relative jitter band charges no reversals"
+    );
+    assert_eq!(
+        term.expected_evidence_gauge_deflated_directions,
+        Some(150),
+        "the comparison re-anchors to the latest observed count"
+    );
+
+    // But a WIDE-amplitude oscillation at the SAME level is still the runaway
+    // pathology and must still be refused: 150<->40 swings ~73% of the level.
+    let mut term2 = trivial_k1_euclidean_term();
+    term2.record_evidence_gauge_deflation_count(150).unwrap();
+    let mut errored = false;
+    for &c in &[40usize, 150, 40, 150, 40, 150, 40, 150, 40, 150, 40, 150, 40, 150] {
+        if term2.record_evidence_gauge_deflation_count(c).is_err() {
+            errored = true;
+            break;
+        }
+    }
+    assert!(
+        errored,
+        "a wide-amplitude oscillation must still exhaust the reversal budget"
+    );
+}
+
 /// The #1037 quotient-dimension guard, with #1217 oscillation semantics: the
 /// recorded count of gauge-deflated evidence directions need not be CONSTANT —
 /// it is a per-ROW-summed O(N) count of near-null evidence directions that

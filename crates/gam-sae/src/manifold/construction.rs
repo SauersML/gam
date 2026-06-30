@@ -6248,7 +6248,29 @@ impl SaeManifoldTerm {
                 let is_reversal = self.evidence_gauge_deflation_last_delta_sign != 0
                     && delta_sign != self.evidence_gauge_deflation_last_delta_sign;
                 self.evidence_gauge_deflation_last_delta_sign = delta_sign;
-                if is_reversal {
+                // A reversal alone is NOT the pathology — a BOUNDED flicker of a
+                // few rows crossing the near-null deflation floor reverses
+                // direction every step yet is the discretization jitter of a
+                // continuous evidence spectrum, fully evidence-neutral (each
+                // deflated direction contributes `log 1 = 0` either way). The
+                // genuine "quotient dimension not stabilizing" pathology is a
+                // WIDE-amplitude oscillation: a substantial FRACTION of the
+                // dimension flipping back and forth. The count is an O(N) per-row
+                // sum, so the discriminator must be the reversal AMPLITUDE
+                // relative to the dimension level, not the bare reversal. Charge
+                // the reversal budget only when a reversal's step exceeds a
+                // relative jitter band; a converged-but-flickering fit (e.g.
+                // 150<->147 on N=200, ~2% of the level) re-anchors freely while a
+                // true runaway (e.g. 9<->2, ~80% of the level) still trips every
+                // reversal and exhausts the budget. This was the second #795 root
+                // cause: the single-planted-circle fit's per-row count flickers
+                // 150<->147 near the deflation floor, so the bare-reversal guard
+                // refused the simplest possible fit — with the isometry gauge ON
+                // *or* OFF — long before the gauge magnitude mattered.
+                let amplitude = expected.abs_diff(count);
+                let level = expected.max(count);
+                let jitter_band = (level / 4).max(2);
+                if is_reversal && amplitude > jitter_band {
                     self.evidence_gauge_deflation_reanchors += 1;
                 }
                 let reversal_budget = self
