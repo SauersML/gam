@@ -221,6 +221,7 @@ impl SaeManifoldTerm {
             dictionary_cocollapse_reseeds: 0,
             best_cocollapse_incumbent: None,
             decoder_repulsion_gate: None,
+            barrier_coactivation_gate: None,
             hybrid_split_report: None,
             atom_inner_fits: None,
             oos_linear_images: None,
@@ -3680,6 +3681,13 @@ impl SaeManifoldTerm {
         // gradient/curvature (assembled below) and its value (read by the
         // line-search `penalized_objective_total`) share one frozen gate.
         self.refresh_decoder_repulsion_gate();
+        // #1625 — freeze the SEPARATION barrier's normalized-coactivation `q_jk`
+        // at the same chokepoint. The barrier weights its decoder-shape repulsion
+        // by the routing coactivation, but its gradient treats that weight as a
+        // constant; recomputing it from the trial logits in the line-search value
+        // desyncs value vs gradient in the logit block and stalls the inner solve
+        // (#1625). Freezing it here makes value/gradient/curvature consistent.
+        self.refresh_barrier_coactivation_gate();
         let n = self.n_obs();
         let p = self.output_dim();
         let k_atoms = self.k_atoms();

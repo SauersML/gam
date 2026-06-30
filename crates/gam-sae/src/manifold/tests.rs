@@ -2138,6 +2138,183 @@ pub(crate) fn separation_barrier_is_collapse_prevention_not_bandaid_1522() {
     );
 }
 
+/// #1625 — build a 2-atom periodic SAE term whose single-row decoders realize a
+/// chosen squared alignment `c² = cos²θ` (`dec0 = e0`, `dec1 = (cosθ, sinθ, 0)`),
+/// co-firing under softmax so the separation barrier's coactivation `q_01 > 0`.
+/// The shared regression fixture for the collinearity-gate guards below.
+fn aligned_two_atom_term_with_c2(c2: f64) -> SaeManifoldTerm {
+    let coords0 = array![[0.05], [0.20], [0.55], [0.80], [0.35], [0.65]];
+    let coords1 = array![[0.15], [0.30], [0.65], [0.90], [0.45], [0.10]];
+    let (phi0, jet0) = periodic_basis(&coords0);
+    let (phi1, jet1) = periodic_basis(&coords1);
+    let logits = array![
+        [0.7, -0.2],
+        [0.1, 0.4],
+        [-0.3, 0.5],
+        [0.6, -0.1],
+        [0.2, 0.3],
+        [0.4, 0.1]
+    ];
+    let cos = c2.sqrt();
+    let sin = (1.0 - c2).max(0.0).sqrt();
+    let row_decoder = |r: [f64; 3]| {
+        let mut d = Array2::<f64>::zeros((3, 3));
+        d[[0, 0]] = r[0];
+        d[[0, 1]] = r[1];
+        d[[0, 2]] = r[2];
+        d
+    };
+    let make = |name: &str, phi: Array2<f64>, jet: Array3<f64>, decoder: Array2<f64>| {
+        SaeManifoldAtom::new(
+            name,
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi,
+            jet,
+            decoder,
+            Array2::<f64>::eye(3),
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(TestPeriodicEvaluator))
+    };
+    let atom0 = make("periodic0", phi0, jet0, row_decoder([1.0, 0.0, 0.0]));
+    let atom1 = make("periodic1", phi1, jet1, row_decoder([cos, sin, 0.0]));
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        logits,
+        vec![coords0, coords1],
+        vec![
+            LatentManifold::Circle { period: 1.0 },
+            LatentManifold::Circle { period: 1.0 },
+        ],
+        AssignmentMode::softmax(0.8),
+    )
+    .unwrap();
+    SaeManifoldTerm::new(vec![atom0, atom1], assignment).unwrap()
+}
+
+/// #1625 — the separation barrier is a COLLAPSE-prevention barrier, gated to the
+/// near-collinear regime: it must be an exact no-op (value AND gradient identically
+/// zero) at moderate collinearity below
+/// [`SAE_SEPARATION_BARRIER_COLLINEARITY_GATE`], and engage (positive value,
+/// nonzero separating gradient) above it. This is the root-cause guard for the
+/// #1625 stall: the ungated `−log(1−c²+ε)` exerted an O(1) force at moderate `c²`
+/// (e.g. the gamma fixture's `c² = 0.36`, a 53° angle nowhere near collapse), which
+/// dominated a well-specified fit's near-zero data residual, dragged the decoders
+/// off the data optimum, and left the inner (t,β) Newton unable to reach KKT
+/// stationarity for the undamped-PD evidence log-det.
+#[test]
+fn separation_barrier_collinearity_gate_off_below_on_above_1625() {
+    // Below the gate (gamma-fixture-like 53° pair): strict no-op.
+    let below = aligned_two_atom_term_with_c2(0.36);
+    let (v_below, g_below) = below.separation_barrier_value_and_grad_for_test(1.0);
+    assert_eq!(
+        v_below, 0.0,
+        "barrier value must be exactly 0 below the collinearity gate (c²=0.36 < {}), got {v_below}",
+        SAE_SEPARATION_BARRIER_COLLINEARITY_GATE
+    );
+    assert!(
+        g_below.iter().all(|&g| g == 0.0),
+        "barrier gradient must be identically 0 below the gate — distinct atoms feel NO force: {g_below:?}"
+    );
+
+    // Above the gate (genuine near-collapse alignment): engaged.
+    let above = aligned_two_atom_term_with_c2(0.8);
+    let (v_above, g_above) = above.separation_barrier_value_and_grad_for_test(1.0);
+    assert!(
+        v_above > 0.0,
+        "barrier value must be positive above the gate (c²=0.8 > {}), got {v_above}",
+        SAE_SEPARATION_BARRIER_COLLINEARITY_GATE
+    );
+    assert!(
+        g_above.iter().any(|&g| g != 0.0),
+        "barrier must produce a separating gradient above the gate"
+    );
+}
+
+/// #1625 — the GATED barrier's analytic gradient must match the finite difference
+/// of its OWN value, including the smoothstep's `w'(c²)` product-rule term. A
+/// dropped `w'` (treating the gate as a constant weight instead of a function of
+/// `c²`) would pass the on/off guard above but desync value vs gradient on the
+/// ramp — the exact value/gradient-consistency contract the line search relies on.
+/// Evaluated at `c² = 0.7`, strictly on the smoothstep interior (`0.5 < c² < 1`)
+/// where `w'(c²) > 0`, so the product-rule term is load-bearing.
+#[test]
+fn separation_barrier_gated_gradient_matches_fd_1625() {
+    let c2 = 0.7_f64;
+    let cos = c2.sqrt();
+    let sin = (1.0 - c2).sqrt();
+    // Rebuild the term from explicit decoders so we can perturb a single
+    // decoder coefficient and recompute the value.
+    let build = |d1: [f64; 3]| -> SaeManifoldTerm {
+        let mut t = aligned_two_atom_term_with_c2(c2);
+        // Overwrite atom1's decoder row 0 with the perturbed direction.
+        t.atoms[1].decoder_coefficients[[0, 0]] = d1[0];
+        t.atoms[1].decoder_coefficients[[0, 1]] = d1[1];
+        t.atoms[1].decoder_coefficients[[0, 2]] = d1[2];
+        t
+    };
+    let base = build([cos, sin, 0.0]);
+    let (_v, grad) = base.separation_barrier_value_and_grad_for_test(1.0);
+    let offsets = base.beta_offsets();
+    let p = base.output_dim();
+    // FD each of atom1's row-0 decoder coefficients against the value.
+    let h = 1.0e-7;
+    let mut max_rel = 0.0_f64;
+    for o in 0..3 {
+        let mut plus = [cos, sin, 0.0];
+        let mut minus = [cos, sin, 0.0];
+        plus[o] += h;
+        minus[o] -= h;
+        let vp = build(plus).separation_barrier_value(1.0);
+        let vm = build(minus).separation_barrier_value(1.0);
+        let fd = (vp - vm) / (2.0 * h);
+        let analytic = grad[offsets[1] + 0 * p + o];
+        let rel = (fd - analytic).abs() / (1.0 + fd.abs().max(analytic.abs()));
+        max_rel = max_rel.max(rel);
+    }
+    assert!(
+        max_rel < 1.0e-5,
+        "gated barrier analytic ∂P/∂B must match FD of the value (incl. the smoothstep \
+         w'(c²) term) on the ramp: max rel err {max_rel:.3e}"
+    );
+}
+
+/// #1625 — within a Newton step the barrier's normalized coactivation `q_jk` is a
+/// FROZEN weight (the gradient differentiates only the decoder shape `c²`), so the
+/// line-search VALUE must read the same frozen `q` even after the trial logits
+/// move — otherwise value and gradient desync in the logit block (the original
+/// #1625 defect, surfaced as a phantom logit gradient the Newton step never
+/// modelled). After an assembly freezes the coactivation, perturbing a logit must
+/// leave `separation_barrier_value` unchanged (the decoders are untouched, and `q`
+/// is frozen). Uses an aligned (above-gate) term so the barrier is genuinely live.
+#[test]
+fn separation_barrier_value_frozen_coactivation_invariant_to_logit_moves_1625() {
+    let mut term = aligned_two_atom_term_with_c2(0.8);
+    let target = Array2::<f64>::zeros((term.n_obs(), term.output_dim()));
+    let rho = SaeManifoldRho::new(
+        -2.0,
+        -2.0,
+        vec![Array1::from_vec(vec![-2.0]), Array1::from_vec(vec![-2.0])],
+    );
+    // Assemble once to FREEZE the coactivation gate at the current logits.
+    let _ = term
+        .assemble_arrow_schur(target.view(), &rho, None)
+        .expect("assemble freezes the barrier coactivation");
+    let value_before = term.separation_barrier_value(1.0);
+    assert!(value_before > 0.0, "aligned pair must have a live barrier");
+    // Move the logits substantially WITHOUT re-assembling (mimics a line-search
+    // trial). The frozen coactivation must keep the barrier value pinned.
+    for v in term.assignment.logits.iter_mut() {
+        *v += 0.37;
+    }
+    let value_after = term.separation_barrier_value(1.0);
+    assert!(
+        (value_after - value_before).abs() <= 1.0e-12 * (1.0 + value_before.abs()),
+        "frozen coactivation must hold the barrier value across logit moves: \
+         before={value_before:.12e} after={value_after:.12e}"
+    );
+}
+
 /// #1610 — the separation-barrier collapse-threshold (the decoder-norm floor
 /// below which an atom is shape-undefined and the barrier abstains) must be
 /// DATA-DERIVED / scale-invariant, not an absolute magic constant.
@@ -9779,212 +9956,16 @@ pub(crate) fn fixed_state_logdet(
     tt + beta.expect("dense Schur logdet")
 }
 
-#[test]
-pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_on_tiny_fixture() {
-    let (mut term, target, rho) = gamma_fd_tiny_fixture();
-    let (_value, _loss, cache) = term
-        .reml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
-        .expect("converged cache");
-    let solver = DeflatedArrowSolver::plain(&cache);
-    let gamma = term
-        .logdet_theta_adjoint(&rho, &cache, &solver)
-        .expect("Gamma");
-    let h = 1.0e-5;
-    let probes = [
-        (0usize, 0usize, SaeLocalRowVar::Logit { atom: 0 }),
-        (3usize, 1usize, SaeLocalRowVar::Coord { atom: 0, axis: 0 }),
-    ];
-    for (row, local_pos, var) in probes {
-        let mut plus = term.clone();
-        let mut minus = term.clone();
-        match var {
-            SaeLocalRowVar::Logit { atom } => {
-                plus.assignment.logits[[row, atom]] += h;
-                minus.assignment.logits[[row, atom]] -= h;
-            }
-            SaeLocalRowVar::Coord { atom, axis } => {
-                let mut flat_p = plus.assignment.coords[atom].as_flat().clone();
-                let mut flat_m = minus.assignment.coords[atom].as_flat().clone();
-                let idx = row * plus.assignment.coords[atom].latent_dim() + axis;
-                flat_p[idx] += h;
-                flat_m[idx] -= h;
-                plus.assignment.coords[atom].set_flat(flat_p.view());
-                minus.assignment.coords[atom].set_flat(flat_m.view());
-            }
-        }
-        let fd = (fixed_state_logdet(plus, &target, &rho)
-            - fixed_state_logdet(minus, &target, &rho))
-            / (2.0 * h);
-        let analytic = gamma.t[cache.row_offsets[row] + local_pos];
-        let tol = 2.0e-3 * (1.0 + fd.abs().max(analytic.abs()));
-        assert!(
-            (fd - analytic).abs() <= tol,
-            "Gamma row={row} local_pos={local_pos}: fd={fd:.8e}, analytic={analytic:.8e}"
-        );
-    }
-}
-
-#[test]
-pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_ibp_map() {
-    // The #1006 empirical-π third channel: under IBP-MAP, pi_k(M_k) couples
-    // every row of column k, so perturbing one logit shifts EVERY row's
-    // assembled `htt` diagonal in that column. `fixed_state_logdet` rebuilds
-    // H at the perturbed state, so a single-logit FD captures both the
-    // row-local direct-z channel and the global cross-row M_k channel that
-    // `logdet_theta_adjoint` accumulates column-wise. lambda_sparse is the
-    // active prior weight (fixed alpha), so the channel is genuinely live.
-    let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
-    term.assignment.mode = AssignmentMode::ibp_map(0.7, 0.9, false);
-    rho.log_lambda_sparse = -1.0;
-    let (_value, _loss, cache) = term
-        .reml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
-        .expect("converged cache");
-    let solver = DeflatedArrowSolver::plain(&cache);
-    let gamma = term
-        .logdet_theta_adjoint(&rho, &cache, &solver)
-        .expect("Gamma");
-    let h = 1.0e-5;
-    // Probe both atoms across distinct rows so the cross-row coupling
-    // (different rows sharing a column) is exercised on both columns.
-    let probes = [
-        (0usize, 0usize, SaeLocalRowVar::Logit { atom: 0 }),
-        (4usize, 1usize, SaeLocalRowVar::Logit { atom: 1 }),
-        (7usize, 0usize, SaeLocalRowVar::Logit { atom: 0 }),
-    ];
-    for (row, local_pos, var) in probes {
-        let mut plus = term.clone();
-        let mut minus = term.clone();
-        match var {
-            SaeLocalRowVar::Logit { atom } => {
-                plus.assignment.logits[[row, atom]] += h;
-                minus.assignment.logits[[row, atom]] -= h;
-            }
-            SaeLocalRowVar::Coord { atom, axis } => {
-                let mut flat_p = plus.assignment.coords[atom].as_flat().clone();
-                let mut flat_m = minus.assignment.coords[atom].as_flat().clone();
-                let idx = row * plus.assignment.coords[atom].latent_dim() + axis;
-                flat_p[idx] += h;
-                flat_m[idx] -= h;
-                plus.assignment.coords[atom].set_flat(flat_p.view());
-                minus.assignment.coords[atom].set_flat(flat_m.view());
-            }
-        }
-        let fd = (fixed_state_logdet(plus, &target, &rho)
-            - fixed_state_logdet(minus, &target, &rho))
-            / (2.0 * h);
-        let analytic = gamma.t[cache.row_offsets[row] + local_pos];
-        let tol = 3.0e-3 * (1.0 + fd.abs().max(analytic.abs()));
-        assert!(
-            (fd - analytic).abs() <= tol,
-            "IBP Gamma row={row} local_pos={local_pos}: fd={fd:.8e}, analytic={analytic:.8e}"
-        );
-    }
-}
-
-/// #1416 — the IBP fixed-alpha `ρ_sparse`-trace `½ tr(H⁻¹ ∂H_p/∂ρ_sparse)` must
-/// include the FULL cross-row off-diagonal of the rank-one Woodbury source, not
-/// just the diagonal. Under IBP-MAP the per-column empirical-mass `M_k` couples
-/// every row of column `k` through `H_p = d·J Jᵀ + diag(s, c)`, and for fixed
-/// alpha the entire IBP prior scales with `λ_sparse = eᵖ`, so
-/// `∂H_p/∂ρ_sparse = H_p`. The analytic
-/// `assignment_log_strength_hessian_trace` returns `½ ∂log|H|/∂ρ_sparse`; this
-/// pins it against a fixed-state central difference of the joint `log|H|`. A
-/// diagonal-only contraction (the pre-#1416 bug) would miss the
-/// `½ d Σ_{i≠j}(H⁻¹)_{ij} J_i J_j` cross-row term and fail this FD.
-#[test]
-pub(crate) fn ibp_rho_sparse_logdet_trace_matches_dense_fd_1416() {
-    let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
-    // Fixed-alpha IBP-MAP with an active sparse prior so the cross-row Woodbury
-    // source is genuinely live.
-    term.assignment.mode = AssignmentMode::ibp_map(0.7, 0.9, false);
-    rho.log_lambda_sparse = -1.0;
-    let (_value, _loss, cache) = term
-        .reml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
-        .expect("converged cache");
-    let solver = DeflatedArrowSolver::plain(&cache);
-    let analytic = term
-        .assignment_log_strength_hessian_trace(&rho, &cache, &solver)
-        .expect("rho_sparse logdet trace");
-
-    // Fixed-state central difference of log|H| w.r.t. ρ_sparse: vary λ_sparse,
-    // hold (t, β) at the converged state (`fixed_state_logdet` re-assembles H
-    // with inner_max_iter=0). The analytic trace is ½ ∂log|H|/∂ρ_sparse.
-    let h = 1.0e-5;
-    let mut rho_plus = rho.clone();
-    let mut rho_minus = rho.clone();
-    rho_plus.log_lambda_sparse += h;
-    rho_minus.log_lambda_sparse -= h;
-    let fd_half = 0.5
-        * (fixed_state_logdet(term.clone(), &target, &rho_plus)
-            - fixed_state_logdet(term.clone(), &target, &rho_minus))
-        / (2.0 * h);
-    let tol = 3.0e-3 * (1.0 + fd_half.abs().max(analytic.abs()));
-    assert!(
-        (fd_half - analytic).abs() <= tol,
-        "IBP ρ_sparse logdet trace: fd(½∂log|H|/∂ρ)={fd_half:.8e}, \
-         analytic={analytic:.8e}"
-    );
-}
-
-/// #1417 — for LEARNABLE IBP alpha the joint Laplace `log|H|` depends on alpha
-/// not only through the prior Hessian but EXPLICITLY through the data
-/// Gauss-Newton blocks: `a_ik = σ(ℓ/τ)·π_k(α)`, so `H_ββ`, `H_tβ`, `H_tt` all
-/// carry `α`. The complete `½ ∂log|H|/∂logα` is therefore the prior-Hessian
-/// trace (`assignment_log_strength_hessian_trace`) PLUS the data trace
-/// (`learnable_ibp_data_logdet_alpha_trace`, #1417). The learnable-alpha control
-/// is `α(ρ₀) = α_base·e^{ρ₀}` (`resolve_learnable_weight`), so `∂logα/∂ρ₀ = 1`
-/// and a fixed-state central difference of `log|H|` w.r.t. ρ₀ must equal twice
-/// the SUM of both analytic traces. Omitting the data trace (the pre-#1417 bug)
-/// would fail this FD.
-#[test]
-pub(crate) fn learnable_ibp_alpha_logdet_trace_matches_dense_fd_1417() {
-    let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
-    // Learnable-alpha IBP-MAP: ρ₀ (log_lambda_sparse) now drives alpha.
-    term.assignment.mode = AssignmentMode::ibp_map(0.7, 0.9, true);
-    rho.log_lambda_sparse = 0.1;
-    let (_value, _loss, cache) = term
-        .reml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
-        .expect("converged cache");
-    let solver = DeflatedArrowSolver::plain(&cache);
-    // The full ½ ∂log|H|/∂logα = prior trace + data trace, exactly as
-    // `analytic_outer_rho_gradient_components` folds into `logdet_trace[0]`.
-    let prior_trace = term
-        .assignment_log_strength_hessian_trace(&rho, &cache, &solver)
-        .expect("prior-Hessian alpha trace");
-    let data_trace = term
-        .learnable_ibp_data_logdet_alpha_trace(&rho, &cache, &solver)
-        .expect("data-Hessian alpha trace");
-    let analytic = prior_trace + data_trace;
-
-    // Fixed-state central difference of log|H| w.r.t. ρ₀ (= log α offset).
-    let h = 1.0e-5;
-    let mut rho_plus = rho.clone();
-    let mut rho_minus = rho.clone();
-    rho_plus.log_lambda_sparse += h;
-    rho_minus.log_lambda_sparse -= h;
-    let fd_half = 0.5
-        * (fixed_state_logdet(term.clone(), &target, &rho_plus)
-            - fixed_state_logdet(term.clone(), &target, &rho_minus))
-        / (2.0 * h);
-    let tol = 3.0e-3 * (1.0 + fd_half.abs().max(analytic.abs()));
-    assert!(
-        (fd_half - analytic).abs() <= tol,
-        "learnable-α logdet trace: fd(½∂log|H|/∂logα)={fd_half:.8e}, \
-         analytic(prior+data)={analytic:.8e} (prior={prior_trace:.6e}, \
-         data={data_trace:.6e})"
-    );
-    // The data trace must be a genuine, nonzero contribution (the #1417 term the
-    // diagonal-only prior trace omitted) — otherwise the test would pass even if
-    // `learnable_ibp_data_logdet_alpha_trace` returned 0.
-    assert!(
-        data_trace.abs() > 1.0e-9,
-        "the #1417 data-Hessian alpha trace must be a live nonzero term; got \
-         {data_trace:.3e}"
-    );
-}
-
 
 // [#780 line-count gate] The #1557 arrow-Schur parallelism-invariance
 // regression test (`arrow_schur_assembly_is_faer_parallelism_invariant_1557`)
 // was split into the sibling `tests_parallelism_invariance_1557.rs` module
 // (declared in `mod.rs`) to keep this tracked file under the 10k limit.
+//
+// The four stationary-cache `∂log|H|/∂θ` adjoint regression tests
+// (`sae_logdet_theta_adjoint_matches_dense_fd_*`,
+// `ibp_rho_sparse_logdet_trace_matches_dense_fd_1416`,
+// `learnable_ibp_alpha_logdet_trace_matches_dense_fd_1417`) were likewise split
+// into the sibling `tests_logdet_adjoint_780.rs` module for the same gate; they
+// still source the shared `gamma_fd_tiny_fixture` / `fixed_state_logdet`
+// helpers, which remain defined here.

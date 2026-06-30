@@ -7633,16 +7633,55 @@ pub fn build_single_local_smooth_term(
         let mut rebuilt = Vec::with_capacity(penalties_t.len());
         for (s_local, info) in penalties_t.iter().zip(active_penaltyinfo_t.iter()) {
             if matches!(info.source, PenaltySource::DoublePenaltyNullspace) {
-                let s_wiggle_t = transformed_wiggliness.as_ref().ok_or_else(|| {
-                    BasisError::InvalidInput(format!(
-                        "box-reparam term '{}' has a double-penalty ridge but no primary wiggliness penalty to derive its nullspace from",
-                        term.name
-                    ))
-                })?;
-                let ridge = crate::basis::build_nullspace_shrinkage_penalty(s_wiggle_t)?
-                    .map(|shrink| shrink.sym_penalty)
-                    .unwrap_or_else(|| Array2::<f64>::zeros((p_local, p_local)));
-                rebuilt.push(ridge);
+                // #1654: the double-penalty nullspace ridge under the box
+                // reparameterization.
+                //
+                // For the CURVATURE constraints (order == 2, convex/concave) the
+                // box transform `T` is the Greville-scaled second *divided*
+                // difference map (`convex_divided_difference_transform_matrix`).
+                // Rebuilding the ridge from scratch as the orthonormal null-space
+                // projector of `TᵀST` (the #509-era monotone fix below) yields a
+                // γ-space ridge `Z_γ Z_γᵀ` whose null subspace is the affine
+                // (level γ₀ + slope γ₁) face — the SAME subspace targeted in
+                // β-space, but measured in the γ inner product rather than the
+                // β one. A reparameterization `β = Tγ` must leave the penalized
+                // REML fit invariant, which requires every penalty block to
+                // transform by the SAME congruence `S ↦ TᵀST`; the from-scratch
+                // projector rebuild is NOT that congruence, so it silently
+                // re-weights the level/slope shrinkage relative to the wiggliness
+                // penalty (each block is independently Frobenius-normalized just
+                // below, decoupling their scales). The distorted REML λ landscape
+                // then drives the convex/concave smooth into the flat linear
+                // corner (curvature pinned ≈ 0, EDF ≈ 1.5) for a
+                // seed/basis-dimension–specific subset of fits, even though an
+                // unconstrained `s(x)` on the same data recovers the convex truth
+                // at EDF ≈ 4. Restoring the exact congruence `Tᵀ R_β T` for the
+                // ridge keeps the box reparameterization a true invertible
+                // change of coordinates, so the curvature-constrained fit tracks
+                // the unconstrained smoothing instead of over-smoothing
+                // (verified: seed-7/k-20 truth-RMSE 0.31 → 0.045).
+                //
+                // For MONOTONE (order == 1) `T` is the cumulative-sum transform
+                // whose conditioning grows fast with the basis dimension; there
+                // the congruence concentrates an enormous penalty on the leading
+                // γ₀ level coordinate and over-smooths to a flat constant (#509),
+                // which the from-scratch unit-eigenvalue projector rebuild was
+                // introduced to cure. Keep that path for monotone.
+                if order == 2 {
+                    let tt_s = fast_atb(&t, s_local);
+                    rebuilt.push(fast_ab(&tt_s, &t));
+                } else {
+                    let s_wiggle_t = transformed_wiggliness.as_ref().ok_or_else(|| {
+                        BasisError::InvalidInput(format!(
+                            "box-reparam term '{}' has a double-penalty ridge but no primary wiggliness penalty to derive its nullspace from",
+                            term.name
+                        ))
+                    })?;
+                    let ridge = crate::basis::build_nullspace_shrinkage_penalty(s_wiggle_t)?
+                        .map(|shrink| shrink.sym_penalty)
+                        .unwrap_or_else(|| Array2::<f64>::zeros((p_local, p_local)));
+                    rebuilt.push(ridge);
+                }
             } else {
                 let tt_s = fast_atb(&t, s_local);
                 rebuilt.push(fast_ab(&tt_s, &t));

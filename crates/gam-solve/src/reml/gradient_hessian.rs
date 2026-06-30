@@ -1386,7 +1386,25 @@ impl<'a> RemlState<'a> {
         // O(n·r²) reduced-Gram), which dominate the Firth outer-Hessian cost
         // for binomial/logit REML (#1575). This is exact: direction_from_deta
         // is a pure function of (op, eta_i[idx]).
+        //
+        // The k builds are independent and each pays two O(n·r²) reduced-Gram
+        // GEMMs (`reducedweighted_gram` + `reduced_diag_gram`), so — as with the
+        // h_i / h_ij loops below — fan them across the Rayon pool when there is
+        // more than one direction AND more than one thread, with the
+        // `with_nested_parallel` guard pinning each build's faer GEMMs to
+        // `Par::Seq` (no rayon×faer oversubscription). Index-ordered collection
+        // keeps the Vec identical to the serial build; at fixture scale the
+        // inner GEMMs are already `Par::Seq`, so the bits are unchanged (#1575).
         let firth_dir_i: Vec<super::FirthDirection> = match firth_op {
+            Some(op) if k > 1 && rayon::current_num_threads() > 1 => {
+                use rayon::prelude::*;
+                eta_i
+                    .par_iter()
+                    .map(|e| {
+                        gam_problem::with_nested_parallel(|| op.direction_from_deta(e.clone()))
+                    })
+                    .collect()
+            }
             Some(op) => eta_i
                 .iter()
                 .map(|e| op.direction_from_deta(e.clone()))
@@ -1394,16 +1412,39 @@ impl<'a> RemlState<'a> {
             None => Vec::new(),
         };
 
-        let mut h_i = Vec::with_capacity(k);
-        for idx in 0..k {
+        // First-derivative blocks H'[idx] — k independent full-data passes, each
+        // dominated (Firth path) by the O(n·r²·p) `hphi_direction` reduced-Gram
+        // apply.
+        //
+        // When there are several independent passes AND more than one thread, fan
+        // them across Rayon with the nested-BLAS guard (`with_nested_parallel`
+        // pins each pass's faer GEMMs to `Par::Seq`), spreading the passes over
+        // cores without rayon×faer oversubscription. With only one pass (k=1)
+        // there is nothing to spread and pinning the inner GEMMs to `Par::Seq`
+        // would instead STRIP the faer-level parallelism the serial path enjoys,
+        // so we fall back to the plain serial loop, leaving the inner GEMMs free
+        // to use the global pool. Either way the assembled blocks are identical:
+        // index-ordered collection in the parallel arm, and at fixture scale the
+        // inner GEMMs are already `Par::Seq` so the bits are unchanged (#1575).
+        let fan_units = k > 1 && rayon::current_num_threads() > 1;
+        let compute_h_i = |idx: usize| -> Array2<f64> {
             let diag = c_array * &eta_i[idx];
             let mut h = &a_mats[idx] + &Self::tk_xt_diag_x(x_dense, &diag);
             if let Some(op) = firth_op {
                 h -= &op.hphi_direction(&firth_dir_i[idx]);
             }
             gam_linalg::matrix::symmetrize_in_place(&mut h);
-            h_i.push(h);
-        }
+            h
+        };
+        let h_i: Vec<Array2<f64>> = if fan_units {
+            use rayon::prelude::*;
+            (0..k)
+                .into_par_iter()
+                .map(|idx| gam_problem::with_nested_parallel(|| compute_h_i(idx)))
+                .collect()
+        } else {
+            (0..k).map(compute_h_i).collect()
+        };
 
         // The mixed second directional derivative D²H_φ[u,v] is evaluated for
         // every (i,j) penalty pair below against the SAME identity rhs. Its
@@ -1431,34 +1472,60 @@ impl<'a> RemlState<'a> {
                 beta_ij[j][i] = bij;
             }
         }
-        for i in 0..k {
-            for j in 0..=i {
-                let eta_ij = gam_linalg::faer_ndarray::fast_av(x_dense, &beta_ij[i][j]);
-                let diag = c_array * &eta_ij + &(d_array * &(&eta_i[i] * &eta_i[j]));
-                let mut h = Self::tk_xt_diag_x(x_dense, &diag);
-                if i == j {
-                    h += &a_mats[i];
-                }
-                if let Some(op) = firth_op {
-                    let dir_ij = op.direction_from_deta(eta_ij);
-                    h -= &op.hphi_direction(&dir_ij);
-                    // Reuse the per-penalty directions built once above and the
-                    // single-index second-derivative sub-blocks cached once above,
-                    // instead of rebuilding them for every (i,j) pair (#1575).
-                    let cache = firth_second_eye_cache
-                        .as_ref()
-                        .expect("firth second-direction eye cache present when firth_op is Some");
-                    h -= &op.hphisecond_direction_apply_eye_cached(
-                        cache,
-                        &firth_dir_i,
-                        i,
-                        j,
-                    );
-                }
-                gam_linalg::matrix::symmetrize_in_place(&mut h);
-                h_ij[i][j] = h.clone();
-                h_ij[j][i] = h;
+        // Mixed second-derivative blocks H''[i,j] for every upper-triangle pair.
+        // Each pair is an INDEPENDENT full-data pass — its cost is dominated, for
+        // the default-ON binomial/logit Firth path, by ~5 O(n·r²·p) reduced
+        // Hadamard-Gram applies inside `hphisecond_direction_apply_eye_cached`
+        // (#1575). The pairs share only immutable state (`op`, the cached
+        // directions/eye-blocks, `beta_ij`, the derivative arrays), so we fan the
+        // `k(k+1)/2` pairs across the Rayon pool; the `with_nested_parallel` guard
+        // pins each pair's faer GEMMs to `Par::Seq`, spreading the pairs over
+        // cores without rayon×faer oversubscription. The cheap reduction back into
+        // `h_ij` stays serial in index order, so the result is identical to the
+        // original double `for` loop. At the small regression-fixture scales the
+        // inner GEMMs are already `Par::Seq` (below faer's flop threshold), so
+        // forcing seq there changes nothing and the assembled blocks are
+        // bit-for-bit unchanged; the win is purely on the large-n perf path.
+        //
+        // As with `h_i` above, fan out only when there is more than one pair AND
+        // more than one thread; a single pair (k=1) runs serially so the inner
+        // GEMMs keep the global faer pool rather than being pinned to `Par::Seq`.
+        let h_pairs: Vec<(usize, usize)> =
+            (0..k).flat_map(|i| (0..=i).map(move |j| (i, j))).collect();
+        let compute_h_pair = |&(i, j): &(usize, usize)| -> Array2<f64> {
+            let eta_ij = gam_linalg::faer_ndarray::fast_av(x_dense, &beta_ij[i][j]);
+            let diag = c_array * &eta_ij + &(d_array * &(&eta_i[i] * &eta_i[j]));
+            let mut h = Self::tk_xt_diag_x(x_dense, &diag);
+            if i == j {
+                h += &a_mats[i];
             }
+            if let Some(op) = firth_op {
+                let dir_ij = op.direction_from_deta(eta_ij);
+                h -= &op.hphi_direction(&dir_ij);
+                // Reuse the per-penalty directions built once above and the
+                // single-index second-derivative sub-blocks cached once above,
+                // instead of rebuilding them per (i,j) pair (#1575).
+                let cache = firth_second_eye_cache.as_ref().expect(
+                    "firth second-direction eye cache present when firth_op is Some",
+                );
+                h -= &op.hphisecond_direction_apply_eye_cached(cache, &firth_dir_i, i, j);
+            }
+            gam_linalg::matrix::symmetrize_in_place(&mut h);
+            h
+        };
+        let fan_pairs = h_pairs.len() > 1 && rayon::current_num_threads() > 1;
+        let h_blocks: Vec<Array2<f64>> = if fan_pairs {
+            use rayon::prelude::*;
+            h_pairs
+                .par_iter()
+                .map(|pair| gam_problem::with_nested_parallel(|| compute_h_pair(pair)))
+                .collect()
+        } else {
+            h_pairs.iter().map(compute_h_pair).collect()
+        };
+        for (&(i, j), h) in h_pairs.iter().zip(h_blocks.into_iter()) {
+            h_ij[i][j] = h.clone();
+            h_ij[j][i] = h;
         }
 
         let mut k_i = Vec::with_capacity(k);
@@ -1528,16 +1595,69 @@ impl<'a> RemlState<'a> {
             }
         }
 
+        // K xⱼ, Kᵢ xⱼ and Kᵢⱼ xⱼ depend only on the row j, yet the O(n²)
+        // skewness double loop below recomputed each of them afresh for every
+        // outer row i (and the per-row `hdiag` jet computes the very same
+        // matvecs). For the default-ON binomial/logit Firth path this exact TK
+        // Hessian runs at n up to FIRTH_MAX_OBSERVATIONS (20_000), so that inner
+        // O(p²) matvec, repeated n² times, dominates the whole evaluation.
+        //
+        // Hoist the row-local matvecs once here (n gemvs each), so the diagonal
+        // jet and every (i,j) inner iteration reduce to an O(p) `xᵢ · (K xⱼ)`
+        // dot — turning the dominant term from O(n²·(1+k+k²)·p²) into
+        // O(n²·(1+k+k²)·p) plus an O(n·(1+k+k²)·p²) precompute. This is exact:
+        // each cached vector is the identical `Matrix::dot` matvec the inline
+        // code performed, and the irow-outer / jrow-inner accumulation order is
+        // preserved verbatim, so `total` is assembled bit-for-bit unchanged
+        // (the k=4 determinism oracle covers it) (#1575).
+        let rows: Vec<Array1<f64>> = (0..n).map(|r| x_dense.row(r).to_owned()).collect();
+        let kmat_x: Vec<Array1<f64>> = rows.iter().map(|xr| k_mat.dot(xr)).collect();
+        let ki_x: Vec<Vec<Array1<f64>>> = (0..k)
+            .map(|a| rows.iter().map(|xr| k_i[a].dot(xr)).collect())
+            .collect();
+        // `kmat_x` (n·p) and `ki_x` (k·n·p, with n·p ≤ FIRTH_MAX_LINEAR_WORK)
+        // are always cheap to hold, but the mixed cache `kij_x` is k²·n·p and
+        // the Firth gate does NOT bound k (the smooth count), so a many-smooth
+        // model could blow memory the original inline loop never allocated.
+        // Materialize it only when it fits a fixed budget; otherwise fall back
+        // to recomputing `k_ij[a][b]·xⱼ` inline (the original arithmetic, so
+        // still bit-identical — just without the O(n²)→O(n) reuse on the mixed
+        // blocks). 64M f64 ≈ 512 MB ceiling.
+        const TK_KIJ_CACHE_MAX_ELEMS: usize = 64 * 1024 * 1024;
+        let kij_x: Option<Vec<Vec<Vec<Array1<f64>>>>> =
+            if k.saturating_mul(k).saturating_mul(n).saturating_mul(p) <= TK_KIJ_CACHE_MAX_ELEMS {
+                Some(
+                    (0..k)
+                        .map(|a| {
+                            (0..k)
+                                .map(|b| rows.iter().map(|xr| k_ij[a][b].dot(xr)).collect())
+                                .collect()
+                        })
+                        .collect(),
+                )
+            } else {
+                None
+            };
+        // xᵢ · (Kᵢⱼ xⱼ): read the cached row-local matvec when present, else
+        // recompute it inline. Both forms call the identical `Matrix::dot`, so
+        // the scalar is bit-for-bit the same either way (#1575).
+        let kij_bilinear = |a: usize, b: usize, xi: &Array1<f64>, jrow: usize| -> f64 {
+            match &kij_x {
+                Some(cache) => xi.dot(&cache[a][b][jrow]),
+                None => xi.dot(&k_ij[a][b].dot(&rows[jrow])),
+            }
+        };
+
         let mut hdiag = Vec::with_capacity(n);
         for row in 0..n {
-            let x = x_dense.row(row);
-            let mut jet = Jet::constant(x.dot(&k_mat.dot(&x.to_owned())), k);
+            let x = &rows[row];
+            let mut jet = Jet::constant(x.dot(&kmat_x[row]), k);
             for a in 0..k {
-                jet.g[a] = x.dot(&k_i[a].dot(&x.to_owned()));
+                jet.g[a] = x.dot(&ki_x[a][row]);
             }
             for a in 0..k {
                 for b in 0..k {
-                    jet.h[[a, b]] = x.dot(&k_ij[a][b].dot(&x.to_owned()));
+                    jet.h[[a, b]] = kij_bilinear(a, b, x, row);
                 }
             }
             hdiag.push(jet);
@@ -1571,16 +1691,18 @@ impl<'a> RemlState<'a> {
             total = total.add(&djet[row].mul(&hdiag[row].square()).scale(-0.125));
         }
         for irow in 0..n {
-            let xi = x_dense.row(irow).to_owned();
+            let xi = &rows[irow];
             for jrow in 0..n {
-                let xj = x_dense.row(jrow).to_owned();
-                let mut kg = Jet::constant(xi.dot(&k_mat.dot(&xj)), k);
+                // K xⱼ, Kᵢ xⱼ, Kᵢⱼ xⱼ are the hoisted row-local matvecs; the
+                // remaining work is the O(p) dot xᵢ · (· xⱼ), evaluated in the
+                // identical irow-outer/jrow-inner order as before (#1575).
+                let mut kg = Jet::constant(xi.dot(&kmat_x[jrow]), k);
                 for a in 0..k {
-                    kg.g[a] = xi.dot(&k_i[a].dot(&xj));
+                    kg.g[a] = xi.dot(&ki_x[a][jrow]);
                 }
                 for a in 0..k {
                     for b in 0..k {
-                        kg.h[[a, b]] = xi.dot(&k_ij[a][b].dot(&xj));
+                        kg.h[[a, b]] = kij_bilinear(a, b, xi, jrow);
                     }
                 }
                 let term = cjet[irow]
@@ -7621,5 +7743,130 @@ mod firth_hessian_direction_reuse_tests {
                 );
             }
         }
+    }
+
+    // A wider logit design with k=4 penalties, exercising the Rayon-fanned
+    // first-derivative (h_i), eye-cache, and O(k²) second-derivative pair loops
+    // of `tk_hessian_rho_canonical_logit` (#1575). With 4 penalties the pair loop
+    // alone has 10 upper-triangle passes spread across the pool.
+    fn synthetic_logit_setup_k4() -> (
+        Array2<f64>,
+        Array1<f64>,
+        super::super::FirthDenseOperator,
+        Vec<CanonicalPenalty>,
+        Vec<f64>,
+    ) {
+        let n = 96usize;
+        let p = 9usize;
+        let mut x = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            let t = (i as f64) / (n as f64 - 1.0);
+            x[[i, 0]] = 1.0;
+            x[[i, 1]] = t;
+            x[[i, 2]] = t * t;
+            x[[i, 3]] = (3.0 * t).sin();
+            x[[i, 4]] = (2.0 * t).cos();
+            x[[i, 5]] = (t - 0.5).abs();
+            x[[i, 6]] = (5.0 * t).sin();
+            x[[i, 7]] = (4.0 * t).cos();
+            x[[i, 8]] = t * t * t;
+        }
+        let beta = Array1::from(vec![0.2_f64, -0.4, 0.3, 0.1, -0.2, 0.15, 0.05, -0.1, 0.12]);
+        let eta = x.dot(&beta);
+        let op = super::super::FirthDenseOperator::build_for_link(
+            &InverseLink::Standard(StandardLink::Logit),
+            &x,
+            &eta,
+        )
+        .expect("firth operator");
+
+        // Four block-local canonical penalties (k = 4) over disjoint coordinate
+        // ranges (cols 1..2, 3..4, 5..6, 7..8).
+        let mut penalties = Vec::with_capacity(4);
+        for (a, b) in [(1usize, 2usize), (3, 4), (5, 6), (7, 8)] {
+            let mut root = Array2::<f64>::zeros((2, p));
+            root[[0, a]] = 1.0;
+            root[[1, b]] = 1.0;
+            penalties.push(CanonicalPenalty::from_dense_root(root, p));
+        }
+        let lambdas = vec![0.7_f64, 1.3, 0.5, 1.1];
+        (x, beta, op, penalties, lambdas)
+    }
+
+    fn tk_hessian_for_k4_setup(
+        x: &Array2<f64>,
+        beta: &Array1<f64>,
+        op: &super::super::FirthDenseOperator,
+        penalties: &[CanonicalPenalty],
+        lambdas: &[f64],
+    ) -> Array2<f64> {
+        let n = x.nrows();
+        let p = x.ncols();
+        let c_array = Array1::from_elem(n, 0.05_f64);
+        let d_array = Array1::from_elem(n, -0.02_f64);
+        let e_array = Array1::from_elem(n, 0.01_f64);
+        let f_array = Array1::from_elem(n, -0.005_f64);
+        let xtwx = RemlState::tk_xt_diag_x(x, &op.pirls_hat_diag());
+        let mut h = xtwx;
+        for d in 0..p {
+            h[[d, d]] += 1.0;
+        }
+        let h_solver = h.clone();
+        let h_inv_solve = move |rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
+            let sol = gam_linalg::utils::solve_symmetric_vector_with_floor(&h_solver, rhs, 1e-10)
+                .expect("well-conditioned SPD solve");
+            Ok(sol)
+        };
+        RemlState::tk_hessian_rho_canonical_logit(
+            x, &c_array, &d_array, &e_array, &f_array, penalties, lambdas, beta, Some(op),
+            &h_inv_solve,
+        )
+        .expect("tk hessian")
+    }
+
+    // The #1575 Rayon fan-out of the first-derivative / eye-cache / pair loops
+    // must not perturb the assembled Firth outer Hessian: repeated evaluation is
+    // BIT-IDENTICAL (no race / mis-indexed write-back), and the result is
+    // symmetric and finite. Determinism across repeats is the load-bearing guard
+    // — a parallel write-back bug would surface as run-to-run drift or asymmetry.
+    #[test]
+    fn tk_hessian_rho_canonical_logit_firth_is_deterministic_under_parallel_fanout_k4() {
+        let (x, beta, op, penalties, lambdas) = synthetic_logit_setup_k4();
+        let k = penalties.len();
+        let first = tk_hessian_for_k4_setup(&x, &beta, &op, &penalties, &lambdas);
+        assert_eq!(first.dim(), (k, k));
+        assert!(
+            first.iter().all(|v| v.is_finite()),
+            "Firth outer Hessian must be finite: {first:?}"
+        );
+        // Symmetric to working precision (each (i,j) and (j,i) cell is filled from
+        // the same pair pass, so this also pins the index-ordered write-back).
+        for i in 0..k {
+            for j in 0..k {
+                assert!(
+                    (first[[i, j]] - first[[j, i]]).abs() <= 1e-9,
+                    "Firth outer Hessian must be symmetric: ({i},{j}) {} vs {}",
+                    first[[i, j]],
+                    first[[j, i]]
+                );
+            }
+        }
+        // Re-run several times: the Rayon-fanned assembly must return BYTE-FOR-BYTE
+        // the same matrix every time (the inner faer GEMMs are pinned to Par::Seq
+        // inside with_nested_parallel, and the reduction is index-ordered).
+        for rep in 0..4 {
+            let again = tk_hessian_for_k4_setup(&x, &beta, &op, &penalties, &lambdas);
+            assert_eq!(
+                first.mapv(|v| v.to_bits()),
+                again.mapv(|v| v.to_bits()),
+                "parallel-fanned Firth outer Hessian must be bit-identical across runs (rep {rep})"
+            );
+        }
+        // Sanity: the off-diagonal mixed second derivatives are non-trivial, so the
+        // O(k²) pair loop is doing real work (not returning zeros).
+        assert!(
+            (0..k).any(|i| (0..k).any(|j| i != j && first[[i, j]].abs() > 0.0)),
+            "k=4 Firth outer Hessian should have non-zero mixed second derivatives"
+        );
     }
 }

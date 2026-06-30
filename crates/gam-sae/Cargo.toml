@@ -1,6 +1,6 @@
 [package]
 name = "gam-sae"
-version = "0.3.133"
+version = "0.3.134"
 edition = "2024"
 description = "Sparse-autoencoder latent-manifold terms for the gam penalized-likelihood engine"
 license = "AGPL-3.0-or-later"
@@ -9,14 +9,14 @@ rust-version = "1.93"
 
 [dependencies]
 faer = "0.24.0"
-gam-gpu = { path = "../gam-gpu", version = "=0.3.133" }
-gam-identifiability = { path = "../gam-identifiability", version = "=0.3.133" }
-gam-linalg = { path = "../gam-linalg", version = "=0.3.133" }
-gam-math = { path = "../gam-math", version = "=0.3.133" }
-gam-problem = { path = "../gam-problem", version = "=0.3.133" }
-gam-runtime = { path = "../gam-runtime", version = "=0.3.133" }
-gam-solve = { path = "../gam-solve", version = "=0.3.133" }
-gam-terms = { path = "../gam-terms", version = "=0.3.133" }
+gam-gpu = { path = "../gam-gpu", version = "=0.3.134" }
+gam-identifiability = { path = "../gam-identifiability", version = "=0.3.134" }
+gam-linalg = { path = "../gam-linalg", version = "=0.3.134" }
+gam-math = { path = "../gam-math", version = "=0.3.134" }
+gam-problem = { path = "../gam-problem", version = "=0.3.134" }
+gam-runtime = { path = "../gam-runtime", version = "=0.3.134" }
+gam-solve = { path = "../gam-solve", version = "=0.3.134" }
+gam-terms = { path = "../gam-terms", version = "=0.3.134" }
 log = "0.4.29"
 memmap2 = "0.9.10"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
