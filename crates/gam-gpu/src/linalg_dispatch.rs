@@ -891,7 +891,7 @@ pub fn try_solve_upper_triangular_matrix(
 
 #[cfg(test)]
 mod tests {
-    use super::{DispatchOp, route_through_gpu};
+    use super::{DispatchOp, route_through_gpu, try_fast_ab};
     use crate::device_runtime::GpuRuntime;
 
     #[test]
@@ -938,6 +938,149 @@ mod tests {
             route_through_gpu(batched_potrf).is_some(),
             "uniform SAE row blocks should reach the small-dense batched POTRF gate"
         );
+    }
+
+    /// Touching `GpuRuntime::global()` must install the dense-GEMM dispatch
+    /// hook into `gam_linalg`, so a profitable `fast_ab` call routes through
+    /// the device — and the device result must match the CPU oracle within
+    /// IEEE reduction tolerance. This is the regression guard for the bug
+    /// where `CudaGemmDispatch` existed but `register_gpu_dispatch` was never
+    /// called, leaving every engine GEMM silently on the CPU.
+    #[test]
+    fn global_runtime_installs_fast_ab_hook_and_matches_cpu() {
+        use ndarray::Array2;
+
+        let Some(_runtime) = GpuRuntime::global() else {
+            eprintln!("[fast_ab hook] no CUDA runtime - skipping engagement check");
+            return;
+        };
+        // After `global()` returned `Some`, the hook MUST be installed.
+        assert!(
+            gam_linalg::gpu_hook::gpu_dispatch().is_some(),
+            "GpuRuntime::global() returned a device but did not register the \
+             dense-GEMM dispatch hook — fast_ab would silently stay on the CPU"
+        );
+
+        // A profitable GEMM (m=n=k=512 → 2·512³ ≈ 268 MFLOP, above the
+        // 100 MFLOP policy floor) must route to the device. Kept modest so
+        // the debug-build CPU oracle below stays a few seconds, not a minute.
+        let (m, k, n) = (512usize, 512usize, 512usize);
+        assert!(
+            route_through_gpu(DispatchOp::Gemm { m, n, k }).is_some(),
+            "a 268 MFLOP GEMM must clear the policy floor and route to GPU"
+        );
+
+        // Deterministic, well-conditioned operands.
+        let a = Array2::<f64>::from_shape_fn((m, k), |(i, j)| {
+            ((i * 7 + j * 3) % 13) as f64 * 0.01 - 0.06
+        });
+        let b = Array2::<f64>::from_shape_fn((k, n), |(i, j)| {
+            ((i * 5 + j * 11) % 17) as f64 * 0.01 - 0.08
+        });
+
+        // Device result via the dispatch entry point.
+        let gpu = try_fast_ab(a.view(), b.view())
+            .expect("profitable GEMM must produce a device result once admitted");
+
+        // CPU oracle (plain triple loop — independent of faer/matrixmultiply).
+        let mut cpu = Array2::<f64>::zeros((m, n));
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0.0f64;
+                for p in 0..k {
+                    acc += a[[i, p]] * b[[p, j]];
+                }
+                cpu[[i, j]] = acc;
+            }
+        }
+
+        let mut max_abs = 0.0f64;
+        for i in 0..m {
+            for j in 0..n {
+                max_abs = max_abs.max((gpu[[i, j]] - cpu[[i, j]]).abs());
+            }
+        }
+        assert!(
+            max_abs < 1e-9,
+            "device GEMM disagreed with the CPU oracle: max|Δ| = {max_abs:e}"
+        );
+    }
+
+    /// The transpose-free `gemm_cuda` path (`Cᵀ = op(B)ᵀ·op(A)ᵀ`, no host
+    /// `to_col_major`/`from_col_major`) must match a CPU oracle across all
+    /// four `(trans_a, trans_b)` combinations AND non-square, tall-skinny
+    /// shapes — the regime (200000×200 · 200×k) where the host transpose
+    /// previously dominated. This guards the leading-dimension/operand-swap
+    /// derivation against silent index bugs.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn transpose_free_gemm_matches_cpu_all_trans_and_shapes() {
+        use crate::blas::gemm_cuda;
+        use ndarray::Array2;
+
+        let Some(runtime) = GpuRuntime::global() else {
+            eprintln!("[gemm transpose-free] no CUDA runtime - skipping");
+            return;
+        };
+
+        // (rows, inner, cols) logical product dims, deliberately all distinct
+        // and rectangular so any lda/ldb/ldc mix-up surfaces.
+        let cases = [(6usize, 4usize, 5usize), (17, 23, 9), (200, 31, 7)];
+        for (m, k, n) in cases {
+            // Base operands sized for the no-transpose orientation; transposed
+            // variants are built by swapping dims so the logical product is
+            // always (m × n).
+            let mk = Array2::<f64>::from_shape_fn((m, k), |(i, j)| {
+                ((i * 31 + j * 17) % 19) as f64 * 0.013 - 0.11
+            });
+            let km = Array2::<f64>::from_shape_fn((k, m), |(i, j)| {
+                ((i * 13 + j * 29) % 23) as f64 * 0.011 - 0.07
+            });
+            let kn = Array2::<f64>::from_shape_fn((k, n), |(i, j)| {
+                ((i * 7 + j * 5) % 17) as f64 * 0.017 - 0.09
+            });
+            let nk = Array2::<f64>::from_shape_fn((n, k), |(i, j)| {
+                ((i * 19 + j * 11) % 13) as f64 * 0.015 - 0.05
+            });
+
+            for &trans_a in &[false, true] {
+                for &trans_b in &[false, true] {
+                    let a = if trans_a { &km } else { &mk };
+                    let b = if trans_b { &nk } else { &kn };
+
+                    let gpu = gemm_cuda(runtime, a.view(), b.view(), trans_a, trans_b).expect(
+                        "transpose-free device GEMM must produce a result when a device is present",
+                    );
+                    assert_eq!(gpu.dim(), (m, n), "output shape wrong for trans_a={trans_a} trans_b={trans_b} ({m}×{k}×{n})");
+
+                    // CPU oracle on the logically-transposed operands.
+                    let mut cpu = Array2::<f64>::zeros((m, n));
+                    for i in 0..m {
+                        for j in 0..n {
+                            let mut acc = 0.0f64;
+                            for p in 0..k {
+                                let av = if trans_a { a[[p, i]] } else { a[[i, p]] };
+                                let bv = if trans_b { b[[j, p]] } else { b[[p, j]] };
+                                acc += av * bv;
+                            }
+                            cpu[[i, j]] = acc;
+                        }
+                    }
+
+                    let mut max_abs = 0.0f64;
+                    for i in 0..m {
+                        for j in 0..n {
+                            max_abs = max_abs.max((gpu[[i, j]] - cpu[[i, j]]).abs());
+                        }
+                    }
+                    assert!(
+                        max_abs < 1e-9,
+                        "transpose-free GEMM mismatch (trans_a={trans_a} trans_b={trans_b}, \
+                         {m}×{k}×{n}): max|Δ| = {max_abs:e}"
+                    );
+                }
+            }
+        }
     }
 }
 
