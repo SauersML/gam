@@ -17,7 +17,16 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # path into the repo. No-op where absent (e.g. macOS/Homebrew finds BLAS itself).
 [ -f "$HOME/.config/gam-build-env" ] && . "$HOME/.config/gam-build-env"
 S="$REPO/.buildd"; mkdir -p "$S"
-LOCK="$S/build.lock"; LOG="$S/last.log"; RESULT="$S/last.code"; HASHFILE="$S/last.hash"; HIST="$S/history.log"
+# Per-invocation log: concurrent build.sh calls must NOT share one file, or each
+# clobbers the others' cargo output and an agent can't see its own compile errors.
+# Each process writes to its own run.<pid>.log; $LAST is a best-effort "most
+# recent" convenience copy (non-authoritative under concurrency). The reliable
+# channel is this script's STDOUT (the tail printed by finish()), which agents
+# capture directly. A trap removes the private log on exit.
+LOCK="$S/build.lock"; LOG="$S/run.$$.log"; LAST="$S/last.log"; HIST="$S/history.log"
+trap 'rm -f "$LOG" 2>/dev/null' EXIT
+# Prune stale private logs left by killed processes (best-effort).
+find "$S" -maxdepth 1 -name 'run.*.log' -mmin +120 -delete 2>/dev/null || true
 export CARGO_TARGET_DIR="$REPO/target" CARGO_INCREMENTAL=1   # item-granularity reuse
 
 # Memory-safe parallelism cap. Heavy non-incremental deps (faer, nano-gemm, gemm,
@@ -119,68 +128,163 @@ record() { # args: req dedup exit dur
     "$(now)" "\"$req\"" "$dedup" "$n" "$names" "$dur" "$code" >> "$HIST"
 }
 
+# ---------------------------------------------------------------------------
+# Unified coalescing + content-dedup engine (single-flight across the whole box).
+#
+# Every cacheable request (warm-lib build / check / test / nextest / clippy / …)
+# is keyed on
+#       KEY = sha1( normalized-request-args + tree content hash ).
+# The tree hash makes the key source-sensitive: the SAME command on the SAME
+# source serves the cached exit code + log in ~0s (HIT) and recompiles nothing;
+# any *.rs / *.toml / Cargo.lock edit changes the hash → a fresh run (MISS).
+#
+# Coalescing: two agents issuing the SAME request concurrently share ONE run —
+# the first becomes the leader (per-key lock) and executes once under the global
+# build lock; the rest block on the per-key lock and then serve the leader's
+# result (COALESCED) instead of re-running it. DIFFERENT requests still serialize
+# through the global lock (one cargo at a time — the small-RAM invariant) but
+# never duplicate each other's work. This generalises the old warm-lib-only
+# dedup to test runs too: re-running the same `nextest run X` on unchanged source
+# is now free, and a swarm of agents asking for it runs it exactly once.
+#
+# Transient outcomes (timeout 124 / signal ≥128, e.g. an OOM-SIGKILL) are NEVER
+# cached; the caller (and any coalesced followers) get exit 75 = "retry".
+#
+# Escape hatches:  GAM_FORCE=1     bypass cache + coalescing, always execute,
+#                                  then refresh the cache;
+#                  GAM_NO_CACHE=1  neither read nor write the result cache
+#                                  (still single-flight). Use for a flaky test or
+#                                  a test that depends on a non-*.rs data fixture
+#                                  the tree hash does not cover.
+# ---------------------------------------------------------------------------
+CACHEDIR="$S/cache"; KEYDIR="$S/keys"; mkdir -p "$CACHEDIR" "$KEYDIR"
+# Best-effort prune of stale cache/lock entries (>7 days) so .buildd stays bounded.
+find "$CACHEDIR" "$KEYDIR" -mindepth 1 -maxdepth 1 -mtime +7 -exec rm -rf {} + 2>/dev/null || true
+
+tree_hash() {
+  # Include Cargo.lock so a dependency bump invalidates the cache (else a stale
+  # result could be served after deps changed but no *.rs did).
+  { find "$REPO/src" "$REPO/tests" "$REPO/crates" -type f \( -name '*.rs' -o -name '*.toml' \) -print0 2>/dev/null \
+      | sort -z | xargs -0 shasum 2>/dev/null
+    shasum "$REPO/Cargo.toml" "$REPO/Cargo.lock" 2>/dev/null; } | shasum | cut -d' ' -f1
+}
+sha_str() { printf '%s' "$1" | shasum | cut -d' ' -f1; }
+
+finish() {  # args: code label — print the standard summary + log tail, then exit
+  local code="$1" label="$2"
+  cp -f "$LOG" "$LAST" 2>/dev/null || true   # best-effort "latest" snapshot
+  echo "[build.sh] $REQ -> exit $code in ${DUR:-0}s (dedup=$label, recompiled $(compiled_crates | grep -c .) crates)"
+  sccache_summary
+  if [[ "$code" == "0" ]]; then tail -n 30 "$LOG"; else echo "FAILED ($code):"; tail -n 40 "$LOG"; fi
+  exit "$code"
+}
+serve_cache() {  # args: label — restore the cached log, record, finish in ~0s
+  local label="$1" code
+  cp -f "$CACHE/log" "$LOG" 2>/dev/null || : >"$LOG"
+  code="$(cat "$CACHE/code")"; DUR=0
+  record "$REQ" "$label" "$code" 0
+  finish "$code" "$label"
+}
+# Run CMD under the global single-flight lock; sets globals code + DUR + $LOG.
+run_under_global_lock() {
+  exec 9>"$LOCK"; flock -x 9
+  cd "$REPO" || exit 1
+  local t0; t0=$(ep)
+  timeout "$TIMEOUT" "${CMD[@]}" >"$LOG" 2>&1; code=$?; DUR=$(( $(ep)-t0 ))
+  flock -u 9
+}
+# Atomically commit code+log to the cache (log first, code file is the commit marker).
+write_cache() {
+  [[ "${CACHEABLE:-1}" == 1 && -z "${GAM_NO_CACHE:-}" ]] || return 0
+  mkdir -p "$CACHE"
+  cp -f "$LOG" "$CACHE/log.tmp" 2>/dev/null && mv -f "$CACHE/log.tmp" "$CACHE/log"
+  printf '%s' "$code" >"$CACHE/code.tmp" && mv -f "$CACHE/code.tmp" "$CACHE/code"
+}
+
+# The engine: REQ, CMD[], and CACHEABLE must be set by the caller before calling.
+run_request() {
+  local TREE KEY
+  TREE="$(tree_hash)"; KEY="$(sha_str "$REQ"$'\n'"$TREE")"
+  CACHE="$CACHEDIR/$KEY"
+
+  # Forced run: skip cache-read + coalescing, execute, then refresh the cache.
+  if [[ -n "${GAM_FORCE:-}" ]]; then
+    run_under_global_lock
+    if (( code == 124 || code >= 128 )); then
+      record "$REQ" "FORCE(transient)" "$code" "$DUR"; echo "TRANSIENT FAILURE ($code) — retry"; exit 75
+    fi
+    write_cache; record "$REQ" "FORCE" "$code" "$DUR"; finish "$code" "FORCE"
+  fi
+
+  # Fast path: a cached result for this exact (args, source) — serve with no lock.
+  if [[ "${CACHEABLE:-1}" == 1 && -z "${GAM_NO_CACHE:-}" && -f "$CACHE/code" ]]; then
+    serve_cache "HIT"
+  fi
+
+  # Contend for leadership of this key; followers coalesce behind the leader.
+  exec 8>"$KEYDIR/$KEY.lock"
+  if flock -n -x 8; then
+    # Leader. Re-check the cache under the key lock (a prior leader may have just
+    # finished between our fast-path read and acquiring the lock).
+    if [[ "${CACHEABLE:-1}" == 1 && -z "${GAM_NO_CACHE:-}" && -f "$CACHE/code" ]]; then
+      flock -u 8; serve_cache "HIT"
+    fi
+    run_under_global_lock
+    if (( code == 124 || code >= 128 )); then
+      record "$REQ" "MISS(transient)" "$code" "$DUR"; flock -u 8
+      echo "TRANSIENT FAILURE ($code) — retry"; exit 75
+    fi
+    write_cache; record "$REQ" "MISS" "$code" "$DUR"; flock -u 8
+    finish "$code" "MISS"
+  else
+    # Follower: a leader is running this exact request right now. Wait for it,
+    # then serve its result rather than re-running.
+    flock -x 8
+    if [[ "${CACHEABLE:-1}" == 1 && -z "${GAM_NO_CACHE:-}" && -f "$CACHE/code" ]]; then
+      flock -u 8; serve_cache "COALESCED"
+    fi
+    # Leader produced no cache (transient failure, or a non-cacheable request) —
+    # don't pile a duplicate run onto the box; signal retry.
+    flock -u 8
+    echo "[build.sh] coalesced behind a leader that produced no cached result — retry"
+    exit 75
+  fi
+}
+
 # ---- maturin lane: `./build.sh maturin [extra maturin args]` ----
 # Builds the gamfit Python extension through the SAME single-flight lock + sccache
-# warm dep cache as the cargo lanes, so concurrent agents/jobs do not each recompile
-# the heavy dep tree (faer/arrow/burn/…) — the difference between a ~2-min gam-only
-# rebuild and a ~20-min cold one. The cargo lanes wire sccache via `--config
-# build.rustc-wrapper`; maturin runs its own internal cargo, which honours the
-# RUSTC_WRAPPER env form instead, so set that here under the same sccache condition.
+# warm dep cache as the cargo lanes. NOT result-cached: its value is the on-disk
+# side effect (the installed extension), so it always actually runs. The cargo
+# lanes wire sccache via `--config build.rustc-wrapper`; maturin runs its own
+# internal cargo, which honours the RUSTC_WRAPPER env form instead.
 if [[ "${1:-}" == "maturin" ]]; then
   shift
   if command -v sccache >/dev/null 2>&1 && [[ -z "${GAM_NO_SCCACHE:-}" ]]; then
     export RUSTC_WRAPPER="$(command -v sccache)"   # CARGO_INCREMENTAL already 0 above
   fi
   REQ="maturin develop --release $*"
-  exec 9>"$LOCK"; flock -x 9
-  cd "$REPO" || exit 1
-  t0=$(ep); timeout "$TIMEOUT" maturin develop --release "$@" >"$LOG" 2>&1; code=$?; dur=$(( $(ep)-t0 ))
-  record "$REQ" "n/a" "$code" "$dur"
-  flock -u 9
-  echo "[build.sh] $REQ -> exit $code in ${dur}s (recompiled $(compiled_crates | grep -c . ) crates)"
-  sccache_summary
-  tail -n 30 "$LOG"; exit "$code"
+  CMD=(maturin develop --release "$@")
+  run_under_global_lock
+  record "$REQ" "n/a" "$code" "$DUR"
+  finish "$code" "n/a"
 fi
 
-# ---- test-run lane (args present): serialized, reuses warm lib ----
+# ---- args lane: test / check / nextest / clippy / build-with-args (cacheable) ----
 if [[ $# -gt 0 ]]; then
   REQ="$*"
-  exec 9>"$LOCK"; flock -x 9
-  cd "$REPO" || exit 1
-  t0=$(ep); timeout "$TIMEOUT" "${CARGO[@]}" "$@" >"$LOG" 2>&1; code=$?; dur=$(( $(ep)-t0 ))
-  record "$REQ" "n/a" "$code" "$dur"
-  flock -u 9
-  echo "[build.sh] $REQ -> exit $code in ${dur}s (recompiled $(compiled_crates | grep -c . ) crates)"
-  sccache_summary
-  tail -n 30 "$LOG"; exit $code
+  CMD=("${CARGO[@]}" "$@")
+  CACHEABLE=1
+  # Mutating / non-idempotent subcommands must always run (their value is a side
+  # effect, not an exit code) — never serve them from cache.
+  case "${1:-}" in
+    clean|update|fetch|add|remove|rm|publish|install|uninstall|generate-lockfile|new|init|vendor)
+      CACHEABLE=0 ;;
+  esac
+  run_request
 fi
 
 # ---- warm-lib lane (no args): content-dedup ----
-BUILD=("${CARGO[@]}" build --lib)
-tree_hash() {
-  # Include Cargo.lock so a dependency bump invalidates the dedup cache (else a
-  # stale cached result could be served after deps changed but no *.rs did).
-  { find "$REPO/src" "$REPO/tests" "$REPO/crates" -type f \( -name '*.rs' -o -name '*.toml' \) -print0 2>/dev/null \
-      | sort -z | xargs -0 shasum 2>/dev/null
-    shasum "$REPO/Cargo.toml" "$REPO/Cargo.lock" 2>/dev/null; } | shasum | cut -d' ' -f1
-}
-
-exec 9>"$LOCK"; flock -x 9
-cd "$REPO" || exit 1
-HASH="$(tree_hash)"; t0=$(ep)
-if [[ "$HASH" == "$(cat "$HASHFILE" 2>/dev/null)" && -f "$RESULT" ]]; then
-  code="$(cat "$RESULT")"
-  record "LIB" "HIT" "$code" "0"             # exact same code — no rebuild
-else
-  timeout "$TIMEOUT" "${BUILD[@]}" >"$LOG" 2>&1; code=$?; dur=$(( $(ep)-t0 ))
-  if (( code != 124 && code < 128 )); then
-    echo "$code" >"$RESULT"; echo "$HASH" >"$HASHFILE"; record "LIB" "MISS" "$code" "$dur"
-  else
-    record "LIB" "MISS" "$code(transient)" "$dur"
-    flock -u 9; echo "TRANSIENT BUILD FAILURE ($code) — retry"; exit 75
-  fi
-fi
-flock -u 9
-sccache_summary
-if [[ "$code" == "0" ]]; then echo "BUILD OK (latest tree, hash ${HASH:0:12})"; exit 0
-else echo "BUILD FAILED ($code):"; tail -n 40 "$LOG"; exit "$code"; fi
+REQ="LIB"
+CMD=("${CARGO[@]}" build --lib)
+CACHEABLE=1
+run_request
