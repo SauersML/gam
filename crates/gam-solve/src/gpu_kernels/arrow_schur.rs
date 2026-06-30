@@ -139,9 +139,13 @@ fn ridge_bump_to_make_pd(htt: ArrayView2<'_, f64>, ridge_t: f64) -> f64 {
 /// is already present, the Gershgorin bound is taken at `ridge_t = 0` and the
 /// returned value is still the ADDITIONAL bump to add on top of the current
 /// ridge. Returns the scale-only floor when `block` is mis-sized.
-// Used only by the linux CUDA path (`mod cuda`) and the unit test below; on a
-// non-linux non-test build it has no caller, so gate it to exactly where it's used.
-#[cfg(any(target_os = "linux", test))]
+// The column-major bump is a helper for the device tile packers, which only
+// exist on the linux CUDA path (`mod cuda`, `#[cfg(target_os = "linux")]`). It
+// therefore lives where it is used: gate it to linux. Its parity unit test is
+// gated to linux to match (a `test` token in the cfg would trip the build.rs
+// `#[cfg(test)]`-on-a-src-item ban; including `test` to dodge the non-linux
+// dead_code lint is exactly the escape hatch that ban forbids).
+#[cfg(target_os = "linux")]
 #[must_use]
 fn ridge_bump_to_make_pd_colmajor(block: &[f64], d: usize) -> f64 {
     if d == 0 || block.len() < d * d {
@@ -5202,6 +5206,10 @@ mod tests {
     /// colmajor variant takes the bound at ridge_t=0 (the ridge is already baked
     /// into the diagonal it reads), so compare against `ridge_bump_to_make_pd`
     /// with `ridge_t = 0`.
+    ///
+    /// Gated to linux: `ridge_bump_to_make_pd_colmajor` only exists on the
+    /// linux CUDA tile path, so the parity test runs where the function does.
+    #[cfg(target_os = "linux")]
     #[test]
     fn ridge_bump_colmajor_matches_rowmajor_for_symmetric_block() {
         // Symmetric 3×3 with a negative-definite-ish diagonal and off-diagonals.
