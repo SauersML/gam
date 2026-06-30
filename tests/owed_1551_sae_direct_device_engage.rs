@@ -105,13 +105,36 @@ fn build_framed_sae_system(install_device_data: bool) -> ArrowSchurSystem {
         w
     };
 
-    let mut pairs: Vec<(usize, usize)> = (0..n_atoms).map(|k| (k, k)).collect();
-    for &(i, j) in &[(0usize, 1usize), (2, 4), (3, 6)] {
-        pairs.push((i, j));
-        pairs.push((j, i));
-    }
+    // The reduced-Schur operator is SYMMETRIC by construction (it is a Hessian),
+    // so the fixture's frame `g` blocks must obey `g_{ji} = g_{ij}ᵀ` (with
+    // `w_{ji} = w_{ij}ᵀ` already a transpose) and each on-diagonal `g_{kk}` must be
+    // symmetric. Sampling `g_{ij}`/`g_{ji}` independently builds an ASYMMETRIC `S`
+    // that makes CG ill-posed and the lower-triangle Cholesky reference invalid
+    // (issue #1551).
     let mut frame_blocks = Vec::new();
-    for &(i, j) in &pairs {
+    for k in 0..n_atoms {
+        let m = basis_sizes[k];
+        let mut g = Array2::<f64>::zeros((m, m));
+        for r in 0..m {
+            for c in 0..m {
+                g[[r, c]] = 0.25 * sample();
+            }
+        }
+        let mut gsym = Array2::<f64>::zeros((m, m));
+        for r in 0..m {
+            for c in 0..m {
+                gsym[[r, c]] = 0.5 * (g[[r, c]] + g[[c, r]]);
+            }
+            gsym[[r, r]] += m as f64 + 2.0;
+        }
+        frame_blocks.push(FactoredFrameGBlock {
+            atom_i: k,
+            atom_j: k,
+            g: gsym,
+            w: w_of(k, k),
+        });
+    }
+    for &(i, j) in &[(0usize, 1usize), (2, 4), (3, 6)] {
         let (mi, mj) = (basis_sizes[i], basis_sizes[j]);
         let mut g = Array2::<f64>::zeros((mi, mj));
         for r in 0..mi {
@@ -119,16 +142,18 @@ fn build_framed_sae_system(install_device_data: bool) -> ArrowSchurSystem {
                 g[[r, c]] = 0.25 * sample();
             }
         }
-        if i == j {
-            for r in 0..mi.min(mj) {
-                g[[r, r]] += mi as f64 + 2.0;
-            }
-        }
+        let gt = g.t().to_owned();
         frame_blocks.push(FactoredFrameGBlock {
             atom_i: i,
             atom_j: j,
             g,
             w: w_of(i, j),
+        });
+        frame_blocks.push(FactoredFrameGBlock {
+            atom_i: j,
+            atom_j: i,
+            g: gt,
+            w: w_of(j, i),
         });
     }
 

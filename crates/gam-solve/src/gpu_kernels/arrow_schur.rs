@@ -5570,14 +5570,39 @@ mod tests {
             }
             w
         };
-        let mut pairs: Vec<(usize, usize)> = (0..n_atoms).map(|k| (k, k)).collect();
-        // A few off-diagonal cross blocks (symmetric pairs).
-        for &(i, j) in &[(0usize, 1usize), (2, 4), (3, 6)] {
-            pairs.push((i, j));
-            pairs.push((j, i));
-        }
+        // The reduced-Schur operator `S = (Σ g ⊗ UᵀU + smooth) − Σ_i H_βtᵀ H_tt⁻¹ H_tβ`
+        // is SYMMETRIC by construction (it is a Hessian). For the device PCG to be
+        // well-posed and the CPU Cholesky reference to be a valid oracle, the
+        // fixture's frame `g` blocks must therefore obey `g_{ji} = g_{ij}ᵀ` (with
+        // `w_{ji} = U_jᵀU_i = w_{ij}ᵀ` already a transpose), and each on-diagonal
+        // `g_{kk}` must be symmetric. (A prior fixture sampled `g_{ij}`/`g_{ji}`
+        // independently, yielding an ASYMMETRIC `S`: CG still converged against the
+        // full operator while the lower-triangle Cholesky reference silently solved
+        // the symmetrised system — a spurious ~10% parity mismatch, issue #1551.)
         let mut frame_blocks = Vec::new();
-        for &(i, j) in &pairs {
+        for k in 0..n_atoms {
+            let m = basis_sizes[k];
+            let mut g = Array2::<f64>::zeros((m, m));
+            for r in 0..m {
+                for c in 0..m {
+                    g[[r, c]] = 0.25 * sample();
+                }
+            }
+            let mut gsym = Array2::<f64>::zeros((m, m));
+            for r in 0..m {
+                for c in 0..m {
+                    gsym[[r, c]] = 0.5 * (g[[r, c]] + g[[c, r]]);
+                }
+                gsym[[r, r]] += m as f64 + 2.0;
+            }
+            frame_blocks.push(FactoredFrameGBlock {
+                atom_i: k,
+                atom_j: k,
+                g: gsym,
+                w: w_of(k, k),
+            });
+        }
+        for &(i, j) in &[(0usize, 1usize), (2, 4), (3, 6)] {
             let (mi, mj) = (basis_sizes[i], basis_sizes[j]);
             let mut g = Array2::<f64>::zeros((mi, mj));
             for r in 0..mi {
@@ -5585,16 +5610,18 @@ mod tests {
                     g[[r, c]] = 0.25 * sample();
                 }
             }
-            if i == j {
-                for r in 0..mi.min(mj) {
-                    g[[r, r]] += mi as f64 + 2.0;
-                }
-            }
+            let gt = g.t().to_owned();
             frame_blocks.push(FactoredFrameGBlock {
                 atom_i: i,
                 atom_j: j,
                 g,
                 w: w_of(i, j),
+            });
+            frame_blocks.push(FactoredFrameGBlock {
+                atom_i: j,
+                atom_j: i,
+                g: gt,
+                w: w_of(j, i),
             });
         }
         let mut smooth_blocks = Vec::new();
@@ -5717,6 +5744,20 @@ mod tests {
                 s_dense[[r, col]] = sc[r];
             }
         }
+        // The reduced-Schur `S` is symmetric by construction; the Cholesky oracle
+        // reads only the lower triangle, so an asymmetric `S` would silently solve
+        // a different (symmetrised) system than the device PCG iterates. Guard it.
+        let mut max_asym = 0.0_f64;
+        for r in 0..border_dim {
+            for c in (r + 1)..border_dim {
+                max_asym = max_asym.max((s_dense[[r, c]] - s_dense[[c, r]]).abs());
+            }
+        }
+        assert!(
+            max_asym <= 1e-9,
+            "framed reduced-Schur S must be symmetric for the Cholesky oracle \
+             (max|S-Sᵀ|={max_asym:e}); an asymmetric fixture makes the parity check spurious"
+        );
         let factor = cholesky_factor_in_place(s_dense.view(), CholeskyGuard::NonnegativePivot)
             .expect("S PD");
         let cpu = cholesky_solve_vector(factor.view(), rhs.view());
