@@ -72,54 +72,21 @@ fn try_build_spatial_term_log_kappa_derivative(
                 spec_local.length_scale =
                     compensate_length_scale_for_standardization(spec.length_scale, s);
             }
-            // #1122: the realized Matérn DESIGN always carries the operator
-            // {mass, tension, stiffness} penalty triplet — `build_term`
-            // unconditionally overrides whatever penalty the `double_penalty`
-            // flag produced with `matern_operator_penalty_triplet_from_metadata`
-            // (see term_specs.rs). The κ-gradient's ψ-derivative penalty blocks
-            // MUST be assembled against that SAME parameterization, or the outer
-            // REML criterion's `−½ log|Sλ|₊` (built from the operator triplet)
-            // is differentiated by a `∂Sλ/∂ψ` from a DIFFERENT penalty family
-            // (the kernel-Gram `Primary` + nullspace-shrinkage blocks). That
-            // mismatch made the analytic `tr(S⁺ Ṡ)` ≈ −1 while the FD of the
-            // true triplet-`log|Sλ|₊` was ≈ −29 — a ~30× DESYNC on the log-κ
-            // coordinate that stalled the joint REML at its iteration cap. Force
-            // the operator-triplet ψ-derivative arm here (the FD-verified
-            // `build_matern_operator_penalty_psi_derivatives` path, which the
-            // fast-path n-free re-key `canonical_penalty_derivatives_at_psi`
-            // already routes through) so value and gradient share one penalty
-            // parameterization and one block count.
+            // The realized Matérn DESIGN penalty is ALWAYS the operator-collocation
+            // {mass, tension, stiffness} triplet — the term-collection assembler
+            // overrides whatever `double_penalty` produced at the basis level with
+            // `matern_operator_penalty_triplet_from_metadata` (see
+            // `gam_terms::smooth::term_specs`, "The Matérn design ALWAYS uses the
+            // operator-collocation … triplet"; #1074/#1270). The ψ=log κ outer
+            // gradient must differentiate the SAME penalty the REML cost is built
+            // on, so the derivative is forced onto the operator-triplet path here.
+            // Honoring `double_penalty: true` instead returned the kernel-Gram
+            // double-penalty ψ-derivatives — a penalty the design does NOT carry —
+            // which desynced the analytic iso-κ gradient from the cost's FD and
+            // stalled the κ-optimizer at its iteration cap with a large residual
+            // gradient (#1122). `double_penalty: false` reproduces the operator
+            // triplet exactly (verified: the 2-D iso-κ FD matches to ~1e-9).
             spec_local.double_penalty = false;
-            // TEMP-SPECDUMP-1122: report whether production's gradient spec is
-            // frozen (UserProvided centers + FrozenTransform) the way the value
-            // design is, or still carries Auto/CenterSumToZero (⇒ X_τ re-derives
-            // a DIFFERENT geometry than the value design → frame desync). REMOVE.
-            {
-                let cs = match &spec_local.center_strategy {
-                    gam_terms::basis::CenterStrategy::UserProvided(c) => {
-                        format!("UserProvided({})", c.nrows())
-                    }
-                    gam_terms::basis::CenterStrategy::FarthestPoint { num_centers } => {
-                        format!("FarthestPoint({num_centers})")
-                    }
-                    gam_terms::basis::CenterStrategy::Auto(_) => "Auto".to_string(),
-                    other => format!("{:?}", std::mem::discriminant(other)),
-                };
-                let id = match &spec_local.identifiability {
-                    gam_terms::basis::MaternIdentifiability::FrozenTransform { .. } => {
-                        "FrozenTransform"
-                    }
-                    gam_terms::basis::MaternIdentifiability::CenterSumToZero => "CenterSumToZero",
-                    _ => "other",
-                };
-                log::warn!(
-                    "[OUTER-FD-AUDIT SPECDUMP-1122] center_strategy={cs} identifiability={id} \
-                     length_scale={:.6} nu={:?} aniso={:?}",
-                    spec_local.length_scale,
-                    spec_local.nu,
-                    spec_local.aniso_log_scales.is_some(),
-                );
-            }
             build_matern_basis_log_kappa_derivatives(x.view(), &spec_local)
                 .map_err(EstimationError::from)?
         }
@@ -4634,70 +4601,6 @@ fn run_exact_joint_spatial_optimization(
             Ok(audit) => audit.log_verdict("spatial-exact-joint"),
             Err(e) => log::warn!("[OUTER-FD-AUDIT/spatial-exact-joint] skipped: {e}"),
         }
-        // TEMP-HSWEEP-1122: manual central-FD h-sweep of the last (psi_kappa[0])
-        // coordinate to separate FD truncation / inner-solver noise from a true
-        // analytic gradient error. REMOVE before commit.
-        {
-            use gam_solve::estimate::reml::reml_outer_engine::LAST_COST_ATOMS_1122;
-            log::warn!("[OUTER-FD-AUDIT TEMP-HSWEEP-1122] ENTER block theta0_len={}", theta0.len());
-            let i = theta0.len() - 1;
-            let read_atoms = || LAST_COST_ATOMS_1122.lock().ok().and_then(|g| *g);
-            // HSWEEP-DPC: sweep h over decades and report fd_dpc/2 (the datafit
-            // envelope-derivative atom) so we can see whether the FD CONVERGES to
-            // the analytic `a` (⇒ FD truncation / inner-noise, analytic correct)
-            // or stays pinned at a constant offset (⇒ true analytic error).
-            for hd in [1e-3_f64, 1e-4, 3e-5, 1e-5] {
-                let mut tp = theta0.clone();
-                tp[i] += hd;
-                let mut tm = theta0.clone();
-                tm[i] -= hd;
-                let vp = ctx.eval_full(&tp, OuterEvalOrder::Value, analytic_outer_hessian_available);
-                let ap = read_atoms();
-                let vm = ctx.eval_full(&tm, OuterEvalOrder::Value, analytic_outer_hessian_available);
-                let am = read_atoms();
-                if let (Ok(_), Ok(_), Some(ap), Some(am)) = (vp, vm, ap, am) {
-                    let fd_dpc = (ap[3] - am[3]) / (2.0 * hd);
-                    let fd_ldh = (ap[1] - am[1]) / (2.0 * hd);
-                    let fd_lds = (ap[2] - am[2]) / (2.0 * hd);
-                    log::warn!(
-                        "[OUTER-FD-AUDIT TEMP-HSWEEP-1122 DPC] h={hd:.1e} fd_dpc/2={:.10e} fd_ldh={fd_ldh:.8e} fd_lds={fd_lds:.8e}",
-                        0.5 * fd_dpc
-                    );
-                }
-            }
-            let h = 1e-4_f64;
-            let mut tp = theta0.clone();
-            tp[i] += h;
-            let mut tm = theta0.clone();
-            tm[i] -= h;
-            let vp = ctx.eval_full(&tp, OuterEvalOrder::Value, analytic_outer_hessian_available);
-            let ap = read_atoms();
-            let vm = ctx.eval_full(&tm, OuterEvalOrder::Value, analytic_outer_hessian_available);
-            let am = read_atoms();
-            let ga = ctx
-                .eval_full(theta0, OuterEvalOrder::ValueGradientHessian, analytic_outer_hessian_available)
-                .ok()
-                .map(|(_, g, _)| g[i]);
-            if let (Ok((vp, _, _)), Ok((vm, _, _)), Some(ap), Some(am)) = (vp, vm, ap, am) {
-                let fd_cost = (vp - vm) / (2.0 * h);
-                let fd_ldh = (ap[1] - am[1]) / (2.0 * h);
-                let fd_lds = (ap[2] - am[2]) / (2.0 * h);
-                let fd_dpc = (ap[3] - am[3]) / (2.0 * h);
-                let fd_penq = (ap[6] - am[6]) / (2.0 * h);
-                let denom = ap[5];
-                let dp_c0 = 0.5 * (ap[3] + am[3]);
-                let fd_phiterm = (denom / 2.0) * (fd_dpc / dp_c0);
-                log::warn!(
-                    "[OUTER-FD-AUDIT TEMP-HSWEEP-1122] i={i} h={h:.1e} fd_cost={fd_cost:.8e} analytic={:.8e} gap={:.3e} | 0.5*fd_ldh={:.8e} -0.5*fd_lds={:.8e} fd_phiterm={fd_phiterm:.8e} | fd_ldh={fd_ldh:.6e} fd_lds={fd_lds:.6e} fd_dpc={fd_dpc:.6e} fd_penq={fd_penq:.6e} reconstructed={:.8e}",
-                    ga.unwrap_or(f64::NAN),
-                    (fd_cost - ga.unwrap_or(f64::NAN)).abs(),
-                    0.5 * fd_ldh,
-                    -0.5 * fd_lds,
-                    0.5 * fd_ldh - 0.5 * fd_lds + fd_phiterm,
-                );
-            } else {
-                log::warn!("[OUTER-FD-AUDIT TEMP-HSWEEP-1122] EVAL_ERR or no atoms captured");
-            }
         }
     }
 

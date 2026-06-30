@@ -18,20 +18,49 @@ pub struct OuterGradientFdComponent {
     pub index: usize,
     /// Analytic ∂V/∂θ_i returned by the family evaluator.
     pub analytic: f64,
-    /// Central finite-difference of the outer criterion in θ_i.
+    /// Second-order central finite-difference of the outer criterion in θ_i at
+    /// the coarse step `h`. Its leading error is `O(h²)·V'''`, which is large
+    /// on a steeply-curved coordinate (e.g. the Matérn log-κ axis, whose
+    /// operator penalty scales like κ^{2m}, m = ν + d/2).
     pub fd: f64,
+    /// Richardson 4th-order refinement of `fd`, combining the `h` and `h/2`
+    /// central differences to cancel the leading `O(h²)` truncation term
+    /// (residual `O(h⁴)`). Populated ONLY when the coarse `fd` gap looks like it
+    /// might trip the DESYNC band, so clean coordinates stay cheap (2 evals);
+    /// suspicious ones pay 2 extra evals to tell genuine derivative error
+    /// (`h`-independent gap) apart from pure FD truncation (`h²`-shrinking gap).
+    pub fd_refined: Option<f64>,
 }
 
 impl OuterGradientFdComponent {
-    /// Absolute analytic−FD gap.
+    /// The FD estimate that best matches the analytic gradient — the
+    /// Richardson-refined value when it is closer, else the coarse `fd`.
+    ///
+    /// Picking the closer of the two is deliberately CONSERVATIVE for the
+    /// desync verdict: a true derivative bug makes the analytic gradient differ
+    /// from the *true* derivative by an `h`-independent amount, so BOTH the
+    /// coarse and the refined FD (each converging to that true derivative)
+    /// stay far from it — the min gap remains large and DESYNC still fires.
+    /// Only a truncation-dominated gap (where refinement recovers the true
+    /// derivative) collapses, which is exactly the case that must NOT be
+    /// flagged. So `abs_gap` can only shrink vs the coarse-only value: no
+    /// previously-passing audit can regress.
+    pub fn best_fd(&self) -> f64 {
+        match self.fd_refined {
+            Some(r) if (self.analytic - r).abs() < (self.analytic - self.fd).abs() => r,
+            _ => self.fd,
+        }
+    }
+    /// Absolute analytic−FD gap against the best available FD estimate.
     pub fn abs_gap(&self) -> f64 {
-        (self.analytic - self.fd).abs()
+        (self.analytic - self.best_fd()).abs()
     }
     /// analytic/fd ratio (None when fd≈0). A clean −1 signals a sign
     /// convention; a stable constant ≠1 signals a dropped/extra additive term.
     pub fn ratio(&self) -> Option<f64> {
-        if self.fd.abs() > 1e-12 {
-            Some(self.analytic / self.fd)
+        let fd = self.best_fd();
+        if fd.abs() > 1e-12 {
+            Some(self.analytic / fd)
         } else {
             None
         }
@@ -107,14 +136,22 @@ impl OuterGradientFdAudit {
                 .ratio()
                 .map(|r| format!("{r:.4}"))
                 .unwrap_or_else(|| "n/a".to_string());
+            // Report the FD estimate the verdict actually uses (`best_fd`); when
+            // a Richardson refinement was taken, surface both so the log shows
+            // the O(h²)→O(h⁴) truncation collapse explicitly.
+            let refined = match c.fd_refined {
+                Some(r) => format!(" fd_coarse={:.6e} fd_richardson={:.6e}", c.fd, r),
+                None => String::new(),
+            };
             log::warn!(
-                "[OUTER-FD-AUDIT/{context}] block={} i={} analytic={:.6e} fd={:.6e} gap={:.3e} ratio={}",
+                "[OUTER-FD-AUDIT/{context}] block={} i={} analytic={:.6e} fd={:.6e} gap={:.3e} ratio={}{}",
                 c.block,
                 c.index,
                 c.analytic,
-                c.fd,
+                c.best_fd(),
                 c.abs_gap(),
-                ratio
+                ratio,
+                refined,
             );
         }
         if !self.hessian_eigenvalues.is_empty() {
@@ -197,11 +234,39 @@ where
         let (vp, _, _) = eval(&tp, EvalMode::ValueOnly)?;
         let (vm, _, _) = eval(&tm, EvalMode::ValueOnly)?;
         let fd = (vp - vm) / (2.0 * h);
+
+        // Cheap-by-default: only a coordinate whose coarse gap could trip the
+        // DESYNC band earns a Richardson refinement. The leading central-FD
+        // error is `O(h²)·V'''`; on a steeply-curved coordinate (the Matérn
+        // log-κ axis, whose operator penalty scales like κ^{2m}) that
+        // truncation alone can exceed the band even though the analytic
+        // gradient is exact. Combining the `h` and `h/2` central differences as
+        // `D_R = (4·D_{h/2} − D_h)/3` cancels the `O(h²)` term, leaving `O(h⁴)`
+        // — enough to separate truncation (gap collapses) from a real
+        // derivative bug (gap is `h`-independent, so `D_R` stays as far from the
+        // analytic value as `D_h` was). The clean-coordinate path stays at 2
+        // evals; the rare suspicious coordinate pays 2 more.
+        let coarse_gap = (analytic_grad[i] - fd).abs();
+        let desync_band = (1e-3_f64).max(1e-3 * fd.abs().max(1.0));
+        let fd_refined = if coarse_gap > desync_band {
+            let h2 = 0.5 * h;
+            let mut tp2 = theta0.clone();
+            tp2[i] += h2;
+            let mut tm2 = theta0.clone();
+            tm2[i] -= h2;
+            let (vp2, _, _) = eval(&tp2, EvalMode::ValueOnly)?;
+            let (vm2, _, _) = eval(&tm2, EvalMode::ValueOnly)?;
+            let fd_half = (vp2 - vm2) / (2.0 * h2);
+            Some((4.0 * fd_half - fd) / 3.0)
+        } else {
+            None
+        };
         components.push(OuterGradientFdComponent {
             block: block_for_index(i),
             index: i,
             analytic: analytic_grad[i],
             fd,
+            fd_refined,
         });
     }
     let hessian_eigenvalues = match hess.materialize_dense() {

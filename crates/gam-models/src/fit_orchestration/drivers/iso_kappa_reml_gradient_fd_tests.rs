@@ -81,12 +81,36 @@ fn iso_kappa_fd_variant_driver(
     skip_psi: bool,
     well_conditioned: bool,
 ) -> (bool, f64, Vec<String>) {
-    let mut data = Array2::<f64>::zeros((n, 1));
+    // A `"*_2d"` label builds an ordinary 2-D feature cloud (the production
+    // `matern(x1, x2)` regime: operator triplet {mass, tension, stiffness}, with
+    // the per-axis tension and mixed-curvature stiffness blocks that only carry
+    // cross-axis structure when d ≥ 2). This is the fast unit-level reproduction
+    // of the #1122 stall, whose end-to-end pin is
+    // `matern_2d_iso_kappa_outer_gradient_matches_fd`.
+    let two_d = label.ends_with("_2d");
+    let d = if two_d { 2 } else { 1 };
+    let mut data = Array2::<f64>::zeros((n, d));
     let mut y = Array1::<f64>::zeros(n);
     for i in 0..n {
         let t = i as f64 / (n as f64 - 1.0);
         data[[i, 0]] = t;
-        let eta = 1.4 * (2.0 * std::f64::consts::PI * t).sin() + 0.5 * (t - 0.5);
+        let (eta, t2) = if two_d {
+            // A low-discrepancy second axis (golden-ratio fill) keeps the 2-D
+            // cloud well-spread, and a genuinely 2-D truth exercises both the
+            // signal and the cross-axis curvature blocks.
+            let t2 = (i as f64 * 0.618_033_988_749_894_9).fract();
+            data[[i, 1]] = t2;
+            let eta = 1.4 * (2.0 * std::f64::consts::PI * t).sin()
+                + 0.9 * (2.0 * std::f64::consts::PI * t2).cos()
+                + 0.5 * (t - 0.5);
+            (eta, t2)
+        } else {
+            (
+                1.4 * (2.0 * std::f64::consts::PI * t).sin() + 0.5 * (t - 0.5),
+                0.0,
+            )
+        };
+        let _ = t2;
         let raw = eta + 0.7 * (3.7 * (i as f64) + 1.0).sin();
         y[i] = if family.is_gaussian_identity() {
             raw
@@ -114,14 +138,21 @@ fn iso_kappa_fd_variant_driver(
     // `spatial_term_supports_hyper_optimization`).
     let basis = if label.starts_with("matern") {
         SmoothBasisSpec::Matern {
-            feature_cols: vec![0],
+            feature_cols: (0..d).collect(),
             spec: MaternBasisSpec {
                 center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
                 periodic: None,
                 length_scale: 1.0,
                 nu: MaternNu::FiveHalves,
                 include_intercept: false,
-                double_penalty: false,
+                // The realized Matérn design ALWAYS carries the operator triplet
+                // ({mass, tension, stiffness}, see
+                // `matern_operator_penalty_triplet_at_length_scale`); the
+                // `double_penalty` flag selects the COLD-build value-path penalty
+                // but the κ-optimizer re-keys onto the operator triplet either
+                // way. A `"*_dp"` label keeps the production default
+                // `double_penalty: true` to mirror `matern(x1, x2)` exactly.
+                double_penalty: label.contains("_dp"),
                 identifiability: MaternIdentifiability::CenterSumToZero,
                 aniso_log_scales: None,
                 nullspace_shrinkage_survived: None,
@@ -169,10 +200,21 @@ fn iso_kappa_fd_variant_driver(
     let frozen_design = build_term_collection_design(data.view(), &frozen).unwrap_or_else(|e| panic!("{} failed: {:?}", "frozen design", e));
     let spatial_terms = spatial_length_scale_term_indices(&frozen);
     let dims_per_term = spatial_dims_per_term(&frozen, &spatial_terms);
+    // Isotropic κ: one log-κ axis regardless of feature dimension `d` (the 2-D
+    // cloud still enrolls a single isotropic κ, not a per-axis η).
     assert_eq!(dims_per_term, vec![1], "{label}: expect one log-κ axis");
     let rho_dim = frozen_design.penalties.len();
     let psi_dim: usize = dims_per_term.iter().sum();
     assert!(psi_dim >= 1);
+    eprintln!(
+        "[{label} TOPOLOGY] d={d} rho_dim={rho_dim} psi_dim={psi_dim} \
+         penalty_sources={:?}",
+        frozen_design
+            .penalties
+            .iter()
+            .map(|p| p.col_range.clone())
+            .collect::<Vec<_>>()
+    );
 
     let external_opts = external_opts_for_design(&family, &frozen_design, &fit_opts);
     let mut cache = SingleBlockExactJointDesignCache::new(
@@ -367,6 +409,420 @@ fn iso_kappa_matern_gaussian_identity_fd() {
         violations.join("\n  ")
     );
 }
+/// Fast unit-level reproduction of the #1122 stall: an ordinary 2-D
+/// `matern(x1, x2)` Gaussian fit whose isotropic-κ outer REML gradient must
+/// match a central finite difference of the production REML cost. This is the
+/// d=2 analogue of `iso_kappa_matern_gaussian_identity_fd`: the 1-D Matérn
+/// already matched FD, so the desync that stalled the κ-optimizer at its
+/// iteration cap (analytic ≠ FD on `psi_kappa`, #1122) lives in the cross-axis
+/// tension / mixed-curvature stiffness operator blocks that only carry
+/// off-diagonal structure when d ≥ 2.
+#[test]
+fn iso_kappa_matern_2d_gaussian_identity_fd() {
+    let (pass, worst, violations) = iso_kappa_fd_variant_driver(
+        "matern_gaussian_2d",
+        120,
+        LikelihoodSpec::gaussian_identity(),
+        false,
+        false,
+    );
+    assert!(
+        pass,
+        "Matérn 2-D iso-κ Gaussian-identity outer-gradient FD failed (the #1122 \
+             cross-axis operator-penalty ψ-derivative desync); worst_psi_rel={worst:.3e}\n  {}",
+        violations.join("\n  ")
+    );
+}
+
+/// DIAGNOSTIC (#1122): is the residual ~1.6e-3 relative gap in the production
+/// end-to-end audit (`matern_2d_iso_kappa_outer_gradient_matches_fd`,
+/// analytic=16.11 vs fd=16.08 at the small auto-init length scale) a genuine
+/// missing derivative term, or a finite-difference truncation artifact of the
+/// steep κ^{2m} operator penalty at the production-init `log κ ≈ 2.5`?
+///
+/// This sweeps the central-FD step `h` on the ψ=log κ axis at a high-κ θ that
+/// mirrors the production init (the operator triplet scales like κ^{2m} with
+/// m = ν + d/2 = 3.5, so V(ψ) has a large third derivative and the central-FD
+/// truncation error ∝ h²·V''' dominates). A TRUNCATION artifact shrinks ≈ 100×
+/// per 10× shrink in `h` (until the roundoff floor); a REAL derivative bug
+/// leaves an `h`-independent floor. The analytic gradient is computed once;
+/// only `h` changes. This is a diagnostic oracle (FD is sanctioned in tests).
+#[test]
+fn iso_kappa_matern_2d_psi_fd_step_sweep_diagnostic() {
+    use ndarray::Array2 as NdArray2;
+    let n = 150usize;
+    let d = 2usize;
+    // EXACT mirror of the end-to-end gate's dataset
+    // (`matern_2d_iso_kappa_outer_gradient_matches_fd`): uniform-random 2-D
+    // cloud via splitmix64 (seed 0x9A7E_7212_0001), truth sin(2πa)·sin(2πb) +
+    // N(0, 0.05²). Reproducing the same X(ψ) is the only way the fast harness
+    // sees the SAME analytic ψ-gradient (≈ +16.11) and the SAME h-flat gap.
+    let mut st: u64 = 0x9A7E_7212_0001;
+    fn splitmix(s: &mut u64) -> u64 {
+        *s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *s;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    fn next_unit(s: &mut u64) -> f64 {
+        (splitmix(s) >> 11) as f64 / (1u64 << 53) as f64
+    }
+    fn next_gauss(s: &mut u64) -> f64 {
+        let u1 = next_unit(s).max(1.0e-12);
+        let u2 = next_unit(s);
+        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+    }
+    let mut data = NdArray2::<f64>::zeros((n, d));
+    let mut y = Array1::<f64>::zeros(n);
+    let sigma = 0.05;
+    for i in 0..n {
+        let a = next_unit(&mut st);
+        let b = next_unit(&mut st);
+        data[[i, 0]] = a;
+        data[[i, 1]] = b;
+        y[i] = (2.0 * std::f64::consts::PI * a).sin() * (2.0 * std::f64::consts::PI * b).sin()
+            + sigma * next_gauss(&mut st);
+    }
+    let weights = Array1::ones(n);
+    let offset = Array1::zeros(n);
+    // CRITICAL (#1122): the FrozenTransform `Z` and the nullspace-shrinkage
+    // decision are computed ONCE at the BASE length scale the design is frozen
+    // at, then held fixed across the κ-sweep. Production does a pilot ρ-fit /
+    // data re-seed BEFORE freezing, so its frozen base ls is 0.28665832
+    // (ψ_base = −ln(ls) = 1.2494 = the audit θ₀ ψ), NOT the raw
+    // `auto_initial_length_scale` (0.0812 → ψ=2.51). Freezing the harness at the
+    // auto-init ls gave a DIFFERENT `Z` (and a different objective: V≈16.31 vs
+    // production ≈16.11), which is why the fast harness was internally
+    // consistent yet never reproduced the production audit gap. Freeze at the
+    // production base ls so the harness `Z` matches production byte-for-byte and
+    // the probe ψ = 1.2494 lands AT the freeze point.
+    let length_scale = 0.286_658_32_f64;
+    eprintln!("[PSI-SWEEP] length_scale={length_scale:.6} log_kappa={:.4}", -length_scale.ln());
+    // The production default center count for n=150, d=2 is 37 (see
+    // `default_matern_center_count`/`default_num_centers`).
+    let spec = TermCollectionSpec {
+        linear_terms: vec![],
+        random_effect_terms: vec![],
+        smooth_terms: vec![SmoothTermSpec {
+            name: "matern_2d".to_string(),
+            basis: SmoothBasisSpec::Matern {
+                feature_cols: (0..d).collect(),
+                spec: MaternBasisSpec {
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 37 },
+                    periodic: None,
+                    length_scale,
+                    nu: MaternNu::FiveHalves,
+                    include_intercept: false,
+                    double_penalty: true,
+                    identifiability: MaternIdentifiability::CenterSumToZero,
+                    aniso_log_scales: None,
+                    nullspace_shrinkage_survived: None,
+                },
+                input_scales: None,
+            },
+            shape: ShapeConstraint::None,
+            joint_null_rotation: None,
+        }],
+    };
+    let fit_opts = FitOptions {
+        compute_inference: false,
+        max_iter: 200,
+        tol: 1e-12,
+        penalty_shrinkage_floor: None,
+        ..FitOptions::default()
+    };
+    let design = build_term_collection_design(data.view(), &spec).unwrap();
+    let frozen = freeze_term_collection_from_design(&spec, &design).unwrap();
+    let frozen_design = build_term_collection_design(data.view(), &frozen).unwrap();
+    let spatial_terms = spatial_length_scale_term_indices(&frozen);
+    let dims_per_term = spatial_dims_per_term(&frozen, &spatial_terms);
+    let rho_dim = frozen_design.penalties.len();
+    let psi_dim: usize = dims_per_term.iter().sum();
+    let theta_dim = rho_dim + psi_dim;
+    let family = LikelihoodSpec::gaussian_identity();
+    let external_opts = external_opts_for_design(&family, &frozen_design, &fit_opts);
+    let mut cache = SingleBlockExactJointDesignCache::new(
+        data.view(),
+        frozen.clone(),
+        frozen_design.clone(),
+        spatial_terms.clone(),
+        rho_dim,
+        dims_per_term.clone(),
+    )
+    .unwrap();
+    let mut evaluator = gam_solve::estimate::ExternalJointHyperEvaluator::new(
+        y.view(),
+        weights.view(),
+        &frozen_design.design,
+        offset.view(),
+        &frozen_design.penalties,
+        &external_opts,
+        "psi-sweep FD evaluator",
+    )
+    .unwrap();
+
+    // TEMP #1122 diagnostic: HARNESS DESIGN FINGERPRINT, to diff against the
+    // production `/tmp/gam_prod_fingerprint.txt`. The harness is internally
+    // consistent (analytic≈FD to 4.5e-9) but evaluates V≈16.31 while production
+    // evaluates V≈16.11 — so the mirror is structurally imperfect. This dumps
+    // the SAME fields the production FINGERPRINT block dumps. Removed before
+    // merge.
+    {
+        eprintln!("[FINGERPRINT] HARNESS design.design dims = ({}, {})", frozen_design.design.nrows(), frozen_design.design.ncols());
+        eprintln!("[FINGERPRINT] HARNESS n_penalties = {}", frozen_design.penalties.len());
+        for (pi, p) in frozen_design.penalties.iter().enumerate() {
+            let fro: f64 = p.local.iter().map(|v| v * v).sum::<f64>().sqrt();
+            eprintln!(
+                "[FINGERPRINT] HARNESS penalty[{pi}] col_range={:?} local_dims={:?} hint={:?} fro={fro:.10e}",
+                p.col_range, p.local.dim(), p.structure_hint
+            );
+        }
+        eprintln!("[FINGERPRINT] HARNESS nullspace_dims = {:?}", frozen_design.nullspace_dims);
+        for &ti in spatial_terms.iter() {
+            if let Some(t) = frozen.smooth_terms.get(ti) {
+                let s = match &t.basis {
+                    SmoothBasisSpec::Matern { spec, .. } => format!(
+                        "Matern{{nu={:?}, ls={:.8}, dp={}, ident={}, aniso={:?}, centers_kind={}}}",
+                        spec.nu,
+                        spec.length_scale,
+                        spec.double_penalty,
+                        match &spec.identifiability {
+                            MaternIdentifiability::FrozenTransform { transform, nullspace_shrinkage_survived } =>
+                                format!("FrozenTransform{{z_dims={:?}, survived={:?}}}", transform.dim(), nullspace_shrinkage_survived),
+                            other => format!("{other:?}"),
+                        },
+                        spec.aniso_log_scales,
+                        match &spec.center_strategy {
+                            CenterStrategy::UserProvided(c) => format!("UserProvided(n={})", c.nrows()),
+                            other => format!("{other:?}"),
+                        },
+                    ),
+                    other => format!("{other:?}"),
+                };
+                eprintln!("[FINGERPRINT] HARNESS term[{ti}] basis_kind={s}");
+            }
+            if let Some(t) = frozen_design.smooth.terms.get(ti) {
+                if let gam_terms::basis::BasisMetadata::Matern {
+                    centers, input_scales, length_scale, ..
+                } = &t.metadata
+                {
+                    let csum: f64 = centers.iter().map(|v| v.abs()).sum();
+                    let c00 = centers.get((0, 0)).copied().unwrap_or(f64::NAN);
+                    let c01 = centers.get((0, 1)).copied().unwrap_or(f64::NAN);
+                    eprintln!(
+                        "[FINGERPRINT] HARNESS meta.Matern length_scale={length_scale:.10} input_scales={input_scales:?} centers_abs_sum={csum:.10e} c[0,0]={c00:.10} c[0,1]={c01:.10}"
+                    );
+                }
+            }
+        }
+    }
+
+    let cost_at = |theta: &Array1<f64>,
+                   cache: &mut SingleBlockExactJointDesignCache<'_>,
+                   evaluator: &mut gam_solve::estimate::ExternalJointHyperEvaluator<'_>|
+     -> f64 {
+        cache.ensure_theta(theta).unwrap();
+        let design = cache.design();
+        evaluator
+            .evaluate_cost_only(
+                &design.design,
+                &design.penalties,
+                &design.nullspace_dims,
+                design.linear_constraints.clone(),
+                theta,
+                rho_dim,
+                None,
+                "psi-sweep cost-only",
+                None,
+            )
+            .unwrap()
+    };
+    let analytic_at = |theta: &Array1<f64>,
+                       cache: &mut SingleBlockExactJointDesignCache<'_>,
+                       evaluator: &mut gam_solve::estimate::ExternalJointHyperEvaluator<'_>|
+     -> Array1<f64> {
+        cache.ensure_theta(theta).unwrap();
+        let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
+            data.view(),
+            cache.spec(),
+            cache.design(),
+            &cache.spatial_terms,
+        )
+        .unwrap()
+        .expect("hyper dirs present");
+        let (_c, grad, _h) = evaluate_joint_reml_outer_eval_at_theta(
+            evaluator,
+            cache.design(),
+            theta,
+            rho_dim,
+            hyper_dirs,
+            None,
+            gam_solve::rho_optimizer::OuterEvalOrder::ValueAndGradient,
+            None,
+        )
+        .unwrap();
+        grad
+    };
+
+    // θ mirroring the production audit θ₀ captured from the end-to-end gate
+    // (`matern_2d_iso_kappa_outer_gradient_matches_fd`): the warm-started ρ is
+    // strongly negative (λ ≈ e^{-4..-6}, the penalty is nearly OFF, so the
+    // criterion is data-fit + ½log|H+Sλ| dominated) and ψ = log κ ≈ 1.25. This
+    // is the regime that exposed the residual ~1.6e-3 gap; the earlier (ρ=0,
+    // ψ=2.5) probe did not. rho_dim is 3 in both (operator triplet), so the ρ
+    // slots line up; if rho_dim differs we pad with the last value.
+    let prod_rho = [-3.632_687_635_594_657, -5.970_607_752_248_795, -4.804_720_434_766_625];
+    let prod_psi = 1.249_464_308_750_002_1;
+    let mut theta = Array1::<f64>::zeros(theta_dim);
+    for j in 0..rho_dim {
+        theta[j] = prod_rho.get(j).copied().unwrap_or(*prod_rho.last().unwrap());
+    }
+    for k in 0..psi_dim {
+        theta[rho_dim + k] = prod_psi;
+    }
+    eprintln!("[PSI-SWEEP] rho_dim={rho_dim} probing theta={:?}", theta.to_vec());
+    let grad = analytic_at(&theta, &mut cache, &mut evaluator);
+    let psi_idx = rho_dim;
+    let analytic = grad[psi_idx];
+    eprintln!("[PSI-SWEEP] analytic ∂V/∂ψ (ValueAndGradient) = {analytic:+.8e}");
+    {
+        // TEMP #1122: value + data checksums at θ₀, to diff vs production. The
+        // designs now fingerprint-match, but the harness ∂V/∂ψ (≈41) ≠ production
+        // (≈16). Same X/penalty/θ → the COST itself differs: isolate whether it
+        // is the data (y/weights/offset) or the evaluator options.
+        let v0 = cost_at(&theta, &mut cache, &mut evaluator);
+        let y_abs_sum: f64 = y.iter().map(|v| v.abs()).sum();
+        let y0 = y.get(0).copied().unwrap_or(f64::NAN);
+        let xd = cache.design().design.to_dense();
+        let x_abs_sum: f64 = xd.iter().map(|v| v.abs()).sum();
+        let x00 = xd.get((0, 0)).copied().unwrap_or(f64::NAN);
+        let x01 = xd.get((0, 1)).copied().unwrap_or(f64::NAN);
+        let x_row0_sum: f64 = xd.row(0).iter().map(|v| v.abs()).sum();
+        eprintln!(
+            "[FINGERPRINT] HARNESS V(theta0)={v0:.10e} y_abs_sum={y_abs_sum:.10e} y[0]={y0:.10} X_abs_sum={x_abs_sum:.10e} X[0,0]={x00:.10} X[0,1]={x01:.10} X_row0_abs={x_row0_sum:.10e} dims=({},{}) n={n}",
+            xd.nrows(), xd.ncols()
+        );
+    }
+    // The PRODUCTION audit takes its analytic gradient from a
+    // ValueGradientHessian eval, NOT ValueAndGradient. If the ψ-gradient
+    // returned by the two orders differs, the audit differences the value path
+    // against a gradient computed in a different lane → an objective↔gradient
+    // desync that no FD step can close. Probe both at the SAME θ₀.
+    {
+        cache.ensure_theta(&theta).unwrap();
+        let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
+            data.view(),
+            cache.spec(),
+            cache.design(),
+            &cache.spatial_terms,
+        )
+        .unwrap()
+        .expect("hyper dirs present");
+        let (_c, grad_vgh, _h) = evaluate_joint_reml_outer_eval_at_theta(
+            &mut evaluator,
+            cache.design(),
+            &theta,
+            rho_dim,
+            hyper_dirs,
+            None,
+            gam_solve::rho_optimizer::OuterEvalOrder::ValueGradientHessian,
+            None,
+        )
+        .unwrap();
+        eprintln!(
+            "[PSI-SWEEP] analytic ∂V/∂ψ (ValueGradientHessian) = {:+.8e} (delta vs V&G = {:.3e})",
+            grad_vgh[psi_idx],
+            (grad_vgh[psi_idx] - analytic).abs()
+        );
+    }
+    // VALUE oracle #2: the production audit differences `eval_full(Value)` →
+    // `evaluate_joint_reml_outer_eval_at_theta(.., Value)`, NOT
+    // `evaluate_cost_only`. If THIS value path disagrees with the gradient while
+    // `evaluate_cost_only` agrees, the desync is between the two value lanes.
+    let value_via_outer_eval = |theta: &Array1<f64>,
+                                cache: &mut SingleBlockExactJointDesignCache<'_>,
+                                evaluator: &mut gam_solve::estimate::ExternalJointHyperEvaluator<'_>|
+     -> f64 {
+        cache.ensure_theta(theta).unwrap();
+        let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
+            data.view(),
+            cache.spec(),
+            cache.design(),
+            &cache.spatial_terms,
+        )
+        .unwrap()
+        .expect("hyper dirs present");
+        let (c, _g, _h) = evaluate_joint_reml_outer_eval_at_theta(
+            evaluator,
+            cache.design(),
+            theta,
+            rho_dim,
+            hyper_dirs,
+            None,
+            gam_solve::rho_optimizer::OuterEvalOrder::Value,
+            None,
+        )
+        .unwrap();
+        c
+    };
+
+    let mut prev_gap: Option<f64> = None;
+    let mut min_gap = f64::INFINITY;
+    for &h in &[1e-2_f64, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7] {
+        let mut plus = theta.clone();
+        plus[psi_idx] += h;
+        let mut minus = theta.clone();
+        minus[psi_idx] -= h;
+        let cp = cost_at(&plus, &mut cache, &mut evaluator);
+        let cm = cost_at(&minus, &mut cache, &mut evaluator);
+        let fd = (cp - cm) / (2.0 * h);
+        let gap = (analytic - fd).abs();
+        // Second FD using the outer-eval Value lane (the production audit's lane).
+        let cp2 = value_via_outer_eval(&plus, &mut cache, &mut evaluator);
+        let cm2 = value_via_outer_eval(&minus, &mut cache, &mut evaluator);
+        let fd2 = (cp2 - cm2) / (2.0 * h);
+        let gap2 = (analytic - fd2).abs();
+        min_gap = min_gap.min(gap);
+        let shrink = prev_gap.map(|p| p / gap).unwrap_or(f64::NAN);
+        eprintln!(
+            "[PSI-SWEEP] h={h:.0e} fd_costonly={fd:+.8e} gap={gap:.3e} | fd_outereval={fd2:+.8e} gap2={gap2:.3e} shrink={shrink:.2}"
+        );
+        prev_gap = Some(gap);
+    }
+    eprintln!("[PSI-SWEEP] min_gap_over_sweep={min_gap:.3e} analytic={analytic:.8e} (truncation→shrinks ~100×/decade; real bug→h-flat floor)");
+    // The gradient is correct iff some step drives the gap well below the
+    // audit's 1e-3·|fd| DESYNC band — i.e. the residual is FD truncation, not a
+    // missing derivative term. A real derivative bug would floor the gap
+    // regardless of `h`.
+    assert!(
+        min_gap < 5e-3 * analytic.abs().max(1.0),
+        "ψ=log κ outer gradient never matches FD across the h-sweep \
+         (min_gap={min_gap:.3e}, analytic={analytic:.6e}): this is a REAL \
+         derivative bug, not FD truncation"
+    );
+}
+
+/// The production-default (`double_penalty: true`) 2-D Matérn variant. This is
+/// the closest unit-level mirror of `matern(x1, x2)` and isolates whether the
+/// #1122 stall is driven by the double-penalty value-path / re-key topology.
+#[test]
+fn iso_kappa_matern_2d_dp_gaussian_identity_fd() {
+    let (pass, worst, violations) = iso_kappa_fd_variant_driver(
+        "matern_gaussian_2d_dp",
+        120,
+        LikelihoodSpec::gaussian_identity(),
+        false,
+        false,
+    );
+    assert!(
+        pass,
+        "Matérn 2-D double-penalty iso-κ Gaussian-identity outer-gradient FD \
+             failed (the #1122 stall); worst_psi_rel={worst:.3e}\n  {}",
+        violations.join("\n  ")
+    );
+}
+
 #[test]
 fn iso_kappa_duchon_binomial_logit_fd() {
     let (pass, worst, violations) =
