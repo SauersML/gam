@@ -70,10 +70,14 @@ fn device_resident_solve_matches_cpu_oracle() {
     let handle = match ResidentDesignGram::try_new(x.view()) {
         Some(h) => h,
         None => {
+            // A device-profitable shape (2·n·p² ≈ 1.0e9 ≫ the 1e8 flop floor)
+            // declining is only legitimate on a CPU-only host. If a CUDA device
+            // is present and the resident gram still declines, that is false
+            // routing — fail loud rather than silently skip the parity check.
             assert!(
-                !device_present()
-                    || ResidentDesignGram::try_new(x.view()).is_none(),
-                "device present but resident gram declined a GPU-profitable shape"
+                !device_present(),
+                "a CUDA device is present but ResidentDesignGram declined a GPU-profitable \
+                 shape (n={n}, p={p}, 2·n·p²≈1.0e9 ≫ the 1e8 flop floor) — false GPU routing"
             );
             eprintln!("device_resident_solve_matches_cpu_oracle: no device — skipped");
             return;
