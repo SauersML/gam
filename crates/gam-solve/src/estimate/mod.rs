@@ -127,5 +127,9 @@ mod continuous_order_tests;
 mod estimate_policy_tests;
 #[cfg(test)]
 mod invert_regularized_rho_hessian_tests;
-#[cfg(test)]
+// Debug-only FD probes on `ExternalJointHyperEvaluator`. Compiled under
+// gam-solve's own `cfg(test)` AND under the `test-diagnostics` feature so the
+// #1601-orphaned design-assembly regression guards re-homed into gam-models
+// (a dev-dependency edge) can reach `debug_full_h`. Never in a production build.
+#[cfg(any(test, feature = "test-diagnostics"))]
 mod tests_diagnostics;

@@ -10,6 +10,15 @@ rust-version = "1.93"
 [lints.rust]
 warnings = "deny"
 
+[features]
+# Compiles the debug-only finite-difference probes on `ExternalJointHyperEvaluator`
+# (`debug_full_h`, the dense effective-Hessian / projected-logdet accessors) and
+# the `psi_gram_tensor` Arc accessor outside gam-solve's own `cfg(test)` build, so
+# the #1601-orphaned design-assembly regression guards re-homed into gam-models can
+# drive them. Enabled ONLY through gam-models' dev-dependency edge, so a production
+# `cargo build` (where dev-dependencies are absent from the graph) never compiles
+# these probes. Off the production math path by construction.
+test-diagnostics = []
 
 [dependencies]
 dyn-stack = "0.13.2"

@@ -64,6 +64,15 @@ pub(crate) use state_caches::*;
 // (`gam_solve::estimate::reml::outer_eval::current_outer_iter`). The explicit
 // `pub use` overrides the `pub(crate)` glob above for this one accessor.
 pub use state_caches::current_outer_iter;
+// #1601 re-home: the IFT design-cache memo-invalidation regression guard
+// (`single_block_latent_coord_design_cache_invalidates_memo_on_outer_iter_advance`),
+// authored in the pre-#1521 monolith and orphaned out of every test binary by
+// #1601, drives the outer-iteration counter to prove the latent-coord design
+// cache misses after the scheduled penalty weight at the pinned θ moves. It now
+// lives in gam-models (where its `ExternalJointHyperEvaluator` / design-build
+// deps resolve), so the writer must be reachable at the same canonical
+// `outer_eval` module path as its `current_outer_iter` getter sibling.
+pub use state_caches::record_current_outer_iter_for_ift;
 
 #[cfg(test)]
 mod module_path_lock_tests {

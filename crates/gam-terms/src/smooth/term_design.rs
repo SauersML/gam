@@ -820,7 +820,10 @@ fn smooth_has_overlapping_linear_terms(
         .any(|linear| feature_cols.contains(&linear.feature_col))
 }
 
-fn smooth_intrinsic_parametric_feature_cols(
+// `pub` so the #1601-orphaned design-assembly regression guards (re-homed into
+// gam-models) can assert the intrinsic-parametric column resolution against this
+// exact production helper.
+pub fn smooth_intrinsic_parametric_feature_cols(
     linear_terms: &[LinearTermSpec],
     term: &SmoothTermSpec,
 ) -> Vec<usize> {
@@ -2007,7 +2010,10 @@ fn with_identifiability_transform(
     }
 }
 
-fn orthogonality_relative_residual_for_design(
+// `pub` so the #1601-orphaned design-assembly constraint regression guards
+// (re-homed into gam-models) can assert the realized constraint orthogonality
+// residual directly against this exact production helper rather than a copy.
+pub fn orthogonality_relative_residual_for_design(
     design: &DesignMatrix,
     constraint_matrix: ArrayView2<'_, f64>,
 ) -> Result<f64, BasisError> {

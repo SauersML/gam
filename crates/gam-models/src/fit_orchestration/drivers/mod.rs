@@ -159,3 +159,11 @@ include!("psi_gram_tensor_fast_path_tests.rs");
 // post-carve, but #1601 commented the include! out of `gam_terms::smooth::tests`
 // "for relocation" that never finished. Self-contained `#[cfg(test)] mod`.
 include!("matern_nfree_rekey_topology_tests.rs");
+// #1601 relocation debt: the 88 design-assembly / constraint / IFT-cache
+// regression guards. Same orphaning story as the siblings above — their
+// `build_term_collection_design` / freeze / incremental-realizer / tensor+streamed
+// eval deps live HERE post-#1521 carve, but #1601 commented the include! out of
+// `gam_terms::smooth::tests` "for relocation" that never happened (the parked
+// `tests/src_modules/` tree was `mod`'d into no binary). Self-contained
+// `#[cfg(test)] mod`.
+include!("design_assembly_constraint_tests.rs");
