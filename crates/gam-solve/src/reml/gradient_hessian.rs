@@ -1396,26 +1396,36 @@ impl<'a> RemlState<'a> {
 
         // First-derivative blocks H'[idx] — k independent full-data passes, each
         // dominated (Firth path) by the O(n·r²·p) `hphi_direction` reduced-Gram
-        // apply. Fan across Rayon with the nested-BLAS guard (see the pair loop
-        // below); index-ordered collection keeps `h_i` identical to the serial
-        // loop, and the inner GEMMs are already `Par::Seq` at fixture scale so the
-        // assembled blocks are bit-for-bit unchanged (#1575).
-        let h_i: Vec<Array2<f64>> = {
+        // apply.
+        //
+        // When there are several independent passes AND more than one thread, fan
+        // them across Rayon with the nested-BLAS guard (`with_nested_parallel`
+        // pins each pass's faer GEMMs to `Par::Seq`), spreading the passes over
+        // cores without rayon×faer oversubscription. With only one pass (k=1)
+        // there is nothing to spread and pinning the inner GEMMs to `Par::Seq`
+        // would instead STRIP the faer-level parallelism the serial path enjoys,
+        // so we fall back to the plain serial loop, leaving the inner GEMMs free
+        // to use the global pool. Either way the assembled blocks are identical:
+        // index-ordered collection in the parallel arm, and at fixture scale the
+        // inner GEMMs are already `Par::Seq` so the bits are unchanged (#1575).
+        let fan_units = k > 1 && rayon::current_num_threads() > 1;
+        let compute_h_i = |idx: usize| -> Array2<f64> {
+            let diag = c_array * &eta_i[idx];
+            let mut h = &a_mats[idx] + &Self::tk_xt_diag_x(x_dense, &diag);
+            if let Some(op) = firth_op {
+                h -= &op.hphi_direction(&firth_dir_i[idx]);
+            }
+            gam_linalg::matrix::symmetrize_in_place(&mut h);
+            h
+        };
+        let h_i: Vec<Array2<f64>> = if fan_units {
             use rayon::prelude::*;
             (0..k)
                 .into_par_iter()
-                .map(|idx| {
-                    gam_problem::with_nested_parallel(|| {
-                        let diag = c_array * &eta_i[idx];
-                        let mut h = &a_mats[idx] + &Self::tk_xt_diag_x(x_dense, &diag);
-                        if let Some(op) = firth_op {
-                            h -= &op.hphi_direction(&firth_dir_i[idx]);
-                        }
-                        gam_linalg::matrix::symmetrize_in_place(&mut h);
-                        h
-                    })
-                })
+                .map(|idx| gam_problem::with_nested_parallel(|| compute_h_i(idx)))
                 .collect()
+        } else {
+            (0..k).map(compute_h_i).collect()
         };
 
         // The mixed second directional derivative D²H_φ[u,v] is evaluated for
@@ -1458,43 +1468,42 @@ impl<'a> RemlState<'a> {
         // inner GEMMs are already `Par::Seq` (below faer's flop threshold), so
         // forcing seq there changes nothing and the assembled blocks are
         // bit-for-bit unchanged; the win is purely on the large-n perf path.
+        //
+        // As with `h_i` above, fan out only when there is more than one pair AND
+        // more than one thread; a single pair (k=1) runs serially so the inner
+        // GEMMs keep the global faer pool rather than being pinned to `Par::Seq`.
         let h_pairs: Vec<(usize, usize)> =
             (0..k).flat_map(|i| (0..=i).map(move |j| (i, j))).collect();
-        let h_blocks: Vec<Array2<f64>> = {
+        let compute_h_pair = |&(i, j): &(usize, usize)| -> Array2<f64> {
+            let eta_ij = gam_linalg::faer_ndarray::fast_av(x_dense, &beta_ij[i][j]);
+            let diag = c_array * &eta_ij + &(d_array * &(&eta_i[i] * &eta_i[j]));
+            let mut h = Self::tk_xt_diag_x(x_dense, &diag);
+            if i == j {
+                h += &a_mats[i];
+            }
+            if let Some(op) = firth_op {
+                let dir_ij = op.direction_from_deta(eta_ij);
+                h -= &op.hphi_direction(&dir_ij);
+                // Reuse the per-penalty directions built once above and the
+                // single-index second-derivative sub-blocks cached once above,
+                // instead of rebuilding them per (i,j) pair (#1575).
+                let cache = firth_second_eye_cache.as_ref().expect(
+                    "firth second-direction eye cache present when firth_op is Some",
+                );
+                h -= &op.hphisecond_direction_apply_eye_cached(cache, &firth_dir_i, i, j);
+            }
+            gam_linalg::matrix::symmetrize_in_place(&mut h);
+            h
+        };
+        let fan_pairs = h_pairs.len() > 1 && rayon::current_num_threads() > 1;
+        let h_blocks: Vec<Array2<f64>> = if fan_pairs {
             use rayon::prelude::*;
             h_pairs
                 .par_iter()
-                .map(|&(i, j)| {
-                    gam_problem::with_nested_parallel(|| {
-                        let eta_ij = gam_linalg::faer_ndarray::fast_av(x_dense, &beta_ij[i][j]);
-                        let diag =
-                            c_array * &eta_ij + &(d_array * &(&eta_i[i] * &eta_i[j]));
-                        let mut h = Self::tk_xt_diag_x(x_dense, &diag);
-                        if i == j {
-                            h += &a_mats[i];
-                        }
-                        if let Some(op) = firth_op {
-                            let dir_ij = op.direction_from_deta(eta_ij);
-                            h -= &op.hphi_direction(&dir_ij);
-                            // Reuse the per-penalty directions built once above and
-                            // the single-index second-derivative sub-blocks cached
-                            // once above, instead of rebuilding them per (i,j) pair
-                            // (#1575).
-                            let cache = firth_second_eye_cache.as_ref().expect(
-                                "firth second-direction eye cache present when firth_op is Some",
-                            );
-                            h -= &op.hphisecond_direction_apply_eye_cached(
-                                cache,
-                                &firth_dir_i,
-                                i,
-                                j,
-                            );
-                        }
-                        gam_linalg::matrix::symmetrize_in_place(&mut h);
-                        h
-                    })
-                })
+                .map(|pair| gam_problem::with_nested_parallel(|| compute_h_pair(pair)))
                 .collect()
+        } else {
+            h_pairs.iter().map(compute_h_pair).collect()
         };
         for (&(i, j), h) in h_pairs.iter().zip(h_blocks.into_iter()) {
             h_ij[i][j] = h.clone();

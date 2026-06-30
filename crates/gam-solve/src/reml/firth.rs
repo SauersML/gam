@@ -1127,30 +1127,35 @@ impl FirthDenseOperator {
         // p_b_rhs = (Bᵀ P B-base)·I is rhs-only; precompute it once.
         let p_b_rhs = fast_ab(&self.p_b_base, &eye);
         // Each direction's two single-index blocks are independent O(n·r²·p)
-        // reduced Hadamard-Gram applies; fan them across Rayon with the nested-BLAS
-        // guard (inner faer GEMMs pinned to `Par::Seq`, no oversubscription). The
-        // result is collected in direction order, so the cached blocks are
-        // identical to the serial build — bit-for-bit at fixture scale, where the
-        // inner GEMMs are already `Par::Seq` (#1575).
-        let (p_bx, pu_qv): (Vec<Array2<f64>>, Vec<Array2<f64>>) = {
-            use rayon::prelude::*;
-            dirs.par_iter()
-                .map(|d| {
-                    gam_problem::with_nested_parallel(|| {
-                        // p_b{u,v}_rhs: depends only on this direction's b_uvec.
-                        let p_b = RemlState::apply_hadamard_gram_to_matrix(
-                            &self.x_reduced,
-                            &self.k_reduced,
-                            &self.k_reduced,
-                            &(&eta_rhs * &d.b_uvec.view().insert_axis(Axis(1))),
-                        );
-                        // p_u_b_rhs / pv_b_rhs: depends only on a_u_reduced.
-                        let pu = self.apply_p_u_to_matrix(&d.a_u_reduced, &qv);
-                        (p_b, pu)
-                    })
-                })
-                .unzip()
+        // reduced Hadamard-Gram applies. Fan them across Rayon with the nested-BLAS
+        // guard (inner faer GEMMs pinned to `Par::Seq`, no oversubscription) when
+        // there are several directions AND more than one thread; with a single
+        // direction (k=1) run serially so the inner GEMMs keep the global faer
+        // pool instead of being pinned to `Par::Seq`. The result is collected in
+        // direction order either way, so the cached blocks are identical to the
+        // serial build — bit-for-bit at fixture scale, where the inner GEMMs are
+        // already `Par::Seq` (#1575).
+        let compute_blocks = |d: &FirthDirection| -> (Array2<f64>, Array2<f64>) {
+            // p_b{u,v}_rhs: depends only on this direction's b_uvec.
+            let p_b = RemlState::apply_hadamard_gram_to_matrix(
+                &self.x_reduced,
+                &self.k_reduced,
+                &self.k_reduced,
+                &(&eta_rhs * &d.b_uvec.view().insert_axis(Axis(1))),
+            );
+            // p_u_b_rhs / pv_b_rhs: depends only on a_u_reduced.
+            let pu = self.apply_p_u_to_matrix(&d.a_u_reduced, &qv);
+            (p_b, pu)
         };
+        let (p_bx, pu_qv): (Vec<Array2<f64>>, Vec<Array2<f64>>) =
+            if dirs.len() > 1 && rayon::current_num_threads() > 1 {
+                use rayon::prelude::*;
+                dirs.par_iter()
+                    .map(|d| gam_problem::with_nested_parallel(|| compute_blocks(d)))
+                    .unzip()
+            } else {
+                dirs.iter().map(compute_blocks).unzip()
+            };
         FirthSecondDirEyeCache {
             eye,
             eta_rhs,
