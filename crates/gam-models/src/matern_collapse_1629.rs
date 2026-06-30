@@ -1,31 +1,41 @@
 //! Regression test for #1629: `matern(x1, x2)` recovered a fine 2-D surface
 //! ~6× worse than `thinplate()`/`tensor()`, and `k=` had no effect.
 //!
-//! ROOT CAUSE (confirmed empirically through `build_term_collection_design`):
-//! `default_matern_length_scale` seeded the κ-optimizer at the FULL DATA
-//! DIAMETER (set by #1074 to mirror mgcv's `bs="gp"` default range). The cold
-//! build evaluates the K Matérn kernel columns at that seed, realizes the design
-//! over the n data rows, and applies the parametric-orthogonality identifiability
-//! transform — whose spectral whitener is rank-revealing — BEFORE the κ-optimizer
-//! runs, then freezes the surviving column count. At a range as wide as the
-//! diameter every kernel column is near-constant over the cloud, so the realized
-//! design Gram is numerically rank-deficient (≈ K/4) and the whitener legitimately
-//! drops the collapsed directions (e.g. 199 → 50). The freeze pins that collapse,
-//! so the optimizer can never recover the columns and `k=` is a near no-op.
+//! ROOT CAUSE: the cold build evaluates the K Matérn kernel columns at the
+//! default seed length scale, realizes the design over the n data rows, and
+//! applies the parametric-orthogonality identifiability transform — whose
+//! spectral whitener is rank-revealing — BEFORE the κ-optimizer runs, then
+//! freezes the surviving column count. When the seed length scale is as wide as
+//! the full data diameter (the pre-fix default), every kernel column is
+//! near-constant over the cloud, so the realized design Gram is numerically
+//! rank-deficient (≈ K/4) and the whitener legitimately drops the collapsed
+//! directions (e.g. 199 → 50). The freeze pins that collapse, so the κ-optimizer
+//! can never recover the columns and `k=` is a near no-op. The optimizer also
+//! starts in the maximally over-smoothed basin and parks there.
 //!
-//! (Notably the per-center `matern_rank_reduce_centers` RRQR is NOT the culprit:
-//! it reports full rank even at the diameter seed. The collapse is entirely in the
-//! realized-design orthogonality whitener.)
+//! FIX (landed on `main`, NOT in this test module — see `term_builder.rs`
+//! "gam#1629" comment and `term_specs::auto_initial_length_scale`): route Matérn
+//! through the same `length_scale = 0.0` auto-init sentinel that thin-plate uses,
+//! so the planner's `auto_init_length_scale_in_place` replaces it with the
+//! data-derived wiggly-side init `max_range / √n`. That seeds the basis in the
+//! resolving regime — the realized design Gram is full rank, the freeze keeps the
+//! requested columns, and the κ-optimizer refines the range from a non-degenerate
+//! basis it can actually escape from. (My earlier branch proposed an inter-knot
+//! `D/K^(1/d)` seed instead; the owner superseded it with the sentinel approach,
+//! which I rebased onto. These tests guard the BEHAVIOR — full-rank cold design,
+//! `k=` effective, truth-RMSE parity with thin-plate — regardless of which
+//! seeding mechanism delivers it.)
 //!
-//! FIX: seed at the basis's natural operating scale — the inter-knot spacing
-//! `D / K^(1/d)` — so adjacent kernel columns stay distinct, the realized design
-//! Gram is full rank, the freeze keeps all K columns, and the κ-optimizer tunes
-//! the range freely from a non-degenerate basis.
+//! The per-center `matern_rank_reduce_centers` RRQR is NOT the culprit: it
+//! reports full rank even at the diameter seed. The collapse was entirely in the
+//! realized-design orthogonality whitener.
 //!
-//! This test asserts the COLD design (pre-REML) — the exact object the freeze
-//! pins — resolves ~all of its requested basis columns instead of collapsing, and
-//! that `k=` changes the resolved width. It is the fast (~15 s) faithful proxy for
-//! the full-fit truth-RMSE recovery (a full 4-formula fit took >1700 s).
+//! `matern_cold_design_does_not_collapse_and_k_has_effect_1629` asserts the COLD
+//! design (pre-REML) — the exact object the freeze pins — resolves ~all of its
+//! requested basis columns instead of collapsing, and that `k=` changes the
+//! resolved width. It is the fast (~15 s) gate guard. The `#[ignore]`
+//! `matern_truth_rmse_is_comparable_to_thinplate_1629` is the slow end-to-end
+//! proof (full REML fit took >1000 s).
 #![cfg(test)]
 
 use crate::fit_orchestration::{FitConfig, FitRequest, FitResult, fit_from_formula, materialize};
