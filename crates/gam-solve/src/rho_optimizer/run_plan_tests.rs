@@ -1353,10 +1353,15 @@ fn analytic_route_unavailable_hessian_is_fatal() {
 #[test]
 fn arc_bridge_cost_stall_certifies_at_bound_separation() {
     // A flat objective at the lower bound `rho = -10` whose raw gradient is a
-    // constant `g = -1` (points further DOWN, out of the feasible box): the
-    // projected KKT residual there is 0, so a stall is a CONVERGED optimum —
-    // exactly the separation signature (the REML score has bottomed out but the
-    // unprojected gradient keeps pushing λ→0 forever).
+    // constant `g = +1`: its descent step `-g = -1` points further DOWN, out of
+    // the feasible box, so under the corrected KKT projection (#1074, a14b71220)
+    // it is the infeasible bound-multiplier pull and projects to 0. The projected
+    // KKT residual there is 0, so a stall is a CONVERGED optimum — exactly the
+    // separation signature (the REML score has bottomed out but the unprojected
+    // gradient keeps pushing λ→0 forever). NOTE: a NEGATIVE gradient at a lower
+    // bound is FEASIBLE interior descent (step `-g = +1` points back into the
+    // box) and is retained by the projection — it would (correctly) report
+    // NON-converged, which is why the fixture uses `+1`.
     let lo = array![-10.0];
     let hi = array![10.0];
     let problem = OuterProblem::new(1)
@@ -1374,9 +1379,9 @@ fn arc_bridge_cost_stall_certifies_at_bound_separation() {
             Ok(OuterEval {
                 // Constant cost: the score has flat-lined (separation valley).
                 cost: 1.0,
-                // Gradient points out of the lower bound; raw norm = 1 forever,
-                // but the bound-projected residual at rho=-10 is 0.
-                gradient: array![-1.0],
+                // Gradient's descent step points out of the lower bound; raw norm
+                // = 1 forever, but the bound-projected residual at rho=-10 is 0.
+                gradient: array![1.0],
                 hessian: match order {
                     OuterEvalOrder::ValueGradientHessian => HessianResult::Analytic(array![[1.0]]),
                     _ => HessianResult::Unavailable,
@@ -1453,8 +1458,10 @@ fn arc_bridge_cost_stall_halts_on_kkt_stationary_bound_descent() {
     let lo = array![-10.0];
     let hi = array![10.0];
     // Strictly-decreasing cost so the cost-improvement test alone would NEVER
-    // fire; the gradient points out of the lower bound (raw |g|=1, projected
-    // KKT residual at rho=-10 is 0), so the halt rides on stationarity.
+    // fire; the gradient's descent step points out of the lower bound (`g = +1`,
+    // step `-g = -1` exits the box), so under the corrected KKT projection
+    // (#1074, a14b71220) it projects to 0 (raw |g|=1, projected KKT residual at
+    // rho=-10 is 0) and the halt rides on stationarity.
     let step = std::cell::Cell::new(0u32);
     let problem = OuterProblem::new(1)
         .with_gradient(Derivative::Analytic)
@@ -1474,9 +1481,9 @@ fn arc_bridge_cost_stall_halts_on_kkt_stationary_bound_descent() {
                 // Monotonically decreasing by far more than the rel-tol floor:
                 // a pure cost-stall test could never fill its window here.
                 cost: 1.0 - (k as f64),
-                // Out-of-bounds gradient at the lower bound: raw norm = 1 forever,
-                // bound-projected residual = 0 (KKT-stationary).
-                gradient: array![-1.0],
+                // Gradient whose descent step exits the lower bound: raw norm = 1
+                // forever, bound-projected residual = 0 (KKT-stationary).
+                gradient: array![1.0],
                 hessian: match order {
                     OuterEvalOrder::ValueGradientHessian => HessianResult::Analytic(array![[1.0]]),
                     _ => HessianResult::Unavailable,
@@ -2820,8 +2827,19 @@ fn run_nonconverged_arc_stays_on_arc_after_budget_retry_ladder() {
     // steps on x^4 contract the gradient by ~3× per attempt, so
     // the halving gate passes and both retries proceed; ARC still
     // cannot reach the optimum in three single-iter attempts.
+    //
+    // The risk profile MUST be `Gaussian` here: `effective_seed_budget`
+    // floors ARC+GeneralizedLinear to 2 (#1074/#1426 — a GLM needs ≥2
+    // seeds to find the heavily-penalized basin), which would defeat the
+    // `seed_budget == 1` screening-skip and let the always-injected neutral
+    // baseline seed `[0.0]` (the EXACT global minimum of x⁴, cost 0) be
+    // screened in and win — ARC would then start already-optimal and report
+    // converged in 0 iters, never exercising the ladder. Gaussian keeps the
+    // effective budget at 1 so `initial_rho = [5.0]` is the sole authoritative
+    // start and the budget-bump retry ladder is genuinely exercised.
     let mut seed_config = gam_problem::SeedConfig::default();
     seed_config.seed_budget = 1;
+    seed_config.risk_profile = gam_problem::SeedRiskProfile::Gaussian;
     let (_d, session) = tmp_cache_session("nonconverged-arc-cache");
     let problem = OuterProblem::new(1)
         .with_gradient(Derivative::Analytic)
@@ -2865,6 +2883,16 @@ fn run_nonconverged_arc_stays_on_arc_after_budget_retry_ladder() {
         !result.converged,
         "test fixture is engineered so the ladder cannot converge; \
              converged=true would mean the fixture stopped exercising the ladder"
+    );
+    // The ladder must have genuinely stepped away from neither the optimum
+    // (rho=0, where x⁴ is stationary) nor stalled at the seed: ARC contracts
+    // toward 0 but cannot reach it in the single-iter budget, so the reported
+    // ρ is strictly between the optimum and the [5.0] start.
+    assert!(
+        result.rho[0].abs() > 1.0e-6 && result.rho[0] < 5.0,
+        "the budget ladder must have made partial progress from the [5.0] seed \
+         toward the x⁴ optimum without reaching it; got rho={:?}",
+        result.rho.to_vec()
     );
 }
 

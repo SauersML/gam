@@ -802,7 +802,11 @@ pub trait CustomFamily {
         );
         assert_rho_matches_specs(rho, specs, "batched outer gradient terms");
         assert_valid_options(options, "batched outer gradient terms");
-        validate_hessian_workspace_ready(&hessian_workspace, "batched outer gradient terms")?;
+        validate_hessian_workspace_ready(
+            &hessian_workspace,
+            "batched outer gradient terms",
+            gam_problem::EvalMode::ValueAndGradient,
+        )?;
         Ok(None)
     }
 
@@ -831,7 +835,11 @@ pub trait CustomFamily {
             "batched outer Hessian terms",
         );
         assert_rho_matches_specs(rho, specs, "batched outer Hessian terms");
-        validate_hessian_workspace_ready(&hessian_workspace, "batched outer Hessian terms")?;
+        validate_hessian_workspace_ready(
+            &hessian_workspace,
+            "batched outer Hessian terms",
+            gam_problem::EvalMode::ValueGradientHessian,
+        )?;
         Ok(self
             .outer_hyper_hessian_operator(specs)
             .map(|operator| BatchedOuterHessianTerms {

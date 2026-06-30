@@ -1328,9 +1328,10 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
             )?,
         };
         // Outer-eval entry: prime per-row jet caches before the ext-coord
-        // par_iter — see `warm_up_outer_caches` doc.
+        // par_iter — see `warm_up_outer_caches_for_mode` doc. gam#979: only the
+        // caches this `eval_mode` consumes are primed.
         if let Some(workspace) = hessian_workspace.as_ref() {
-            workspace.warm_up_outer_caches()?;
+            workspace.warm_up_outer_caches_for_mode(eval_mode)?;
         }
         let (
             h_joint_unpen,
@@ -1869,6 +1870,11 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
                     total,
                     options,
                     inner.joint_workspace.clone(),
+                    // The bundle's directional closures feed only the
+                    // `EvalMode::ValueOnly` `joint_outer_evaluate` below — the
+                    // gradient is supplied by the family's batched terms — so
+                    // no directional jet cache needs priming (gam#979).
+                    EvalMode::ValueOnly,
                 )?
             {
                 let mut gradient = Array1::<f64>::zeros(expected);
@@ -1976,6 +1982,11 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
         total,
         options,
         inner.joint_workspace.clone(),
+        // gam#979: this bundle drives the unified evaluator at the caller's
+        // requested `eval_mode`, so prime exactly the directional caches that
+        // mode consumes (none for value-only line-search / seed-screen probes,
+        // third-only for the first-order gradient, both for the outer Hessian).
+        eval_mode,
     )? {
         let JointHessianBundle {
             source: h_joint_unpen,
@@ -2605,9 +2616,11 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_internal_shared<
         options,
     )?;
     // Outer-eval entry: prime per-row jet caches before the ext-coord
-    // par_iter — see `warm_up_outer_caches` doc.
+    // par_iter — see `warm_up_outer_caches_for_mode` doc. The EFS evaluator
+    // always assembles the first-order fixed-point gradient terms, so it
+    // consumes the third-derivative directional cache (gam#979).
     if let Some(workspace) = hessian_workspace.as_ref() {
-        workspace.warm_up_outer_caches()?;
+        workspace.warm_up_outer_caches_for_mode(EvalMode::ValueAndGradient)?;
     }
     let (
         h_joint_unpen,

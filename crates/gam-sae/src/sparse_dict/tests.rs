@@ -411,6 +411,138 @@ fn fixed_width_sparse_storage_never_dense_and_reconstructs() {
 }
 
 #[test]
+fn route_minibatch_returns_a_valid_top_s() {
+    // The batched-GEMM minibatch router must return a genuine top-`s` per row:
+    // every selected atom's score (recomputed exactly in f64) is within f32-GEMM
+    // rounding of the true `s`-th-largest |score| cutoff, and the reported score
+    // matches the exact dot product. Where two atoms tie within rounding the
+    // batched and row-at-a-time paths may pick different members of the tie —
+    // that is correct (they are interchangeable) and is exactly why the fit is
+    // minibatch-invariant rather than bit-identical. Non-orthogonal unit atoms
+    // so the scores are generic.
+    let (k, p, n) = (40usize, 11usize, 137usize);
+    let mut decoder = Array2::<f32>::zeros((k, p));
+    for atom in 0..k {
+        for c in 0..p {
+            decoder[[atom, c]] = (((atom * 5 + c * 3 + 1) % 13) as f32 - 6.0) / 6.0;
+        }
+    }
+    // Unit-norm the decoder rows (the trainer always routes against unit atoms).
+    for mut row in decoder.outer_iter_mut() {
+        let nrm: f32 = row.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if nrm > 1.0e-12 {
+            row.mapv_inplace(|v| v / nrm);
+        }
+    }
+    let mut x = Array2::<f32>::zeros((n, p));
+    for row in 0..n {
+        for c in 0..p {
+            x[[row, c]] = (((row * 7 + c * 2 + 3) % 17) as f32 - 8.0) / 4.0;
+        }
+    }
+    let s = 4usize;
+    let scorer = TileScorer::new(s, 7);
+    let batched = scorer.route_minibatch(x.view(), decoder.view());
+    assert_eq!(batched.len(), n);
+
+    // Exact f64 |score| of one row against one atom.
+    let exact_mag = |row: usize, atom: usize| -> f64 {
+        let mut acc = 0.0f64;
+        for c in 0..p {
+            acc += x[[row, c]] as f64 * decoder[[atom, c]] as f64;
+        }
+        acc.abs()
+    };
+    const TOL: f64 = 1.0e-5;
+    for (i, shortlist) in batched.iter().enumerate() {
+        assert_eq!(shortlist.len(), s, "row {i}: shortlist must have width s");
+        // The shortlist's atoms are distinct.
+        let mut seen = std::collections::HashSet::new();
+        for &(atom, _) in shortlist {
+            assert!(seen.insert(atom), "row {i}: atom {atom} selected twice");
+        }
+        // Reported scores match the exact dot product.
+        for &(atom, score) in shortlist {
+            assert!(
+                (score.abs() as f64 - exact_mag(i, atom as usize)).abs() <= TOL,
+                "row {i}: reported |score| {} for atom {atom} != exact {}",
+                score.abs(),
+                exact_mag(i, atom as usize)
+            );
+        }
+        // The true s-th-largest |score| cutoff, computed exactly.
+        let mut all: Vec<f64> = (0..k).map(|a| exact_mag(i, a)).collect();
+        all.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        let cutoff = all[s - 1];
+        // Every selected atom must clear the cutoff up to rounding (a valid top-s).
+        for &(atom, _) in shortlist {
+            assert!(
+                exact_mag(i, atom as usize) + TOL >= cutoff,
+                "row {i}: selected atom {atom} (|score| {}) is below the top-{s} cutoff {cutoff}",
+                exact_mag(i, atom as usize)
+            );
+        }
+        // The shortlist is sorted by descending |score|.
+        for w in shortlist.windows(2) {
+            assert!(
+                w[0].1.abs() + (TOL as f32) >= w[1].1.abs(),
+                "row {i}: shortlist not sorted by descending |score|"
+            );
+        }
+    }
+}
+
+#[test]
+fn fit_is_minibatch_size_invariant() {
+    // The minibatch knob bounds peak working set, NOT the solution. Fitting the
+    // same data with a tiny minibatch (1 row at a time) and with a minibatch that
+    // covers the whole block must produce the same dictionary quality: the
+    // route→code→refresh math is identical, only the score-block tiling changes.
+    let (k, p, n) = (8usize, 12usize, 480usize);
+    let (x, _atoms) = planted(k, p, n, 0.2);
+    let base = SparseDictConfig {
+        n_atoms: k,
+        active: 2,
+        minibatch: 1,
+        max_epochs: 40,
+        score_tile: 16,
+        code_ridge: 1.0e-6,
+        decoder_ridge: 1.0e-6,
+        tolerance: 1.0e-9,
+    };
+    let fit_mb1 = fit_sparse_dictionary(x.view(), &base).expect("minibatch=1 fit");
+    let fit_mbn = fit_sparse_dictionary(
+        x.view(),
+        &SparseDictConfig {
+            minibatch: n,
+            ..base
+        },
+    )
+    .expect("minibatch=N fit");
+    let fit_mb_mid = fit_sparse_dictionary(
+        x.view(),
+        &SparseDictConfig {
+            minibatch: 64,
+            ..base
+        },
+    )
+    .expect("minibatch=64 fit");
+    // Same EV to f32-rounding tolerance regardless of how the rows were batched.
+    assert!(
+        (fit_mb1.explained_variance - fit_mbn.explained_variance).abs() < 1.0e-4,
+        "minibatch=1 EV {} vs minibatch=N EV {} must agree",
+        fit_mb1.explained_variance,
+        fit_mbn.explained_variance
+    );
+    assert!(
+        (fit_mb1.explained_variance - fit_mb_mid.explained_variance).abs() < 1.0e-4,
+        "minibatch=1 EV {} vs minibatch=64 EV {} must agree",
+        fit_mb1.explained_variance,
+        fit_mb_mid.explained_variance
+    );
+}
+
+#[test]
 fn scales_to_large_k_without_dense_n_by_k() {
     // K far larger than the planted rank: trainer must stay correct and never
     // allocate N×K (it would here be 240*2000 floats; the test just checks it

@@ -3587,8 +3587,26 @@ fn debiased_query_design_full_schema(
     // relies on.
     let records = string_records_from_rows(&headers_vec, std::slice::from_ref(&row))?;
     let schema = model.require_data_schema()?;
-    let policy =
-        UnseenCategoryPolicy::encode_unknown_for_columns(model.random_effect_group_columns());
+    // Lenient (unseen-OK) encoding for every column that did NOT receive a real
+    // query value — i.e. every column not in `required`, which is exactly the
+    // set carrying the neutral "0" placeholder (the response + any unreferenced
+    // bookkeeping column). Without this, a training frame that carried an
+    // unrelated CATEGORICAL bookkeeping column (e.g. a `group`/`color`/`id`
+    // label fit under `y ~ s(x)`) would strict-encode that column's "0"
+    // placeholder against the saved levels and abort with `unseen level '0'`,
+    // re-introducing the very #840 foot-gun `predict` avoids by projecting the
+    // frame to the model's columns (`project_frame_to_model_columns`). The
+    // placeholder never reaches the mean design, so encoding it as an unknown
+    // level is harmless and order-preserving. Random-effect group columns stay
+    // lenient too (they may be required yet still want the held-out-group
+    // policy), matching the predict-time encode.
+    let mut lenient: std::collections::HashSet<String> = training_headers
+        .iter()
+        .filter(|h| !required.contains(h.as_str()))
+        .cloned()
+        .collect();
+    lenient.extend(model.random_effect_group_columns());
+    let policy = UnseenCategoryPolicy::encode_unknown_for_columns(lenient);
     let q_dataset = encode_recordswith_schema(headers_vec, records, schema, policy)?;
     let q_design = build_term_collection_design(q_dataset.values.view(), spec)
         .map_err(|e| format!("debiased_functional: {label} design failed: {e}"))?;

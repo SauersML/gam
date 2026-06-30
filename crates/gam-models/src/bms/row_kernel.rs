@@ -402,17 +402,53 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
     /// before any outer `par_iter` enters; subsequent
     /// `row_third_contracted` calls inside the parallel ext-idx sweep then
     /// hit a populated cache and skip straight to a 2×2 contraction.
-    fn warm_up_directional_caches(&self) -> Result<(), String> {
-        // Touch both caches so their parallel builds run here, not later
-        // (nested inside the outer ext-idx par_iter where the lock-holder
-        // thread would have to do each row pass alone).
-        let third_cache_len = self.third_full_cache().len();
-        let fourth_cache_len = self.fourth_full_cache().len();
-        crate::row_kernel::validate_row_kernel_cache_lengths(
-            "bernoulli rigid warm-up",
-            self.family.y.len(),
-            &[("third", third_cache_len), ("fourth", fourth_cache_len)],
-        )
+    fn warm_up_directional_caches(&self, eval_mode: EvalMode) -> Result<(), String> {
+        // gam#979: prime only the caches the eval about to run will consume.
+        //
+        //   * `ValueOnly`            → neither cache (the objective is read off
+        //                              the converged inner mode; no directional
+        //                              contraction is taken). Seed screening,
+        //                              line-search cost probes, and continuation
+        //                              pre-warm are all value-only — at biobank
+        //                              scale each was paying two full `O(n)` jet
+        //                              passes (third + fourth) for tensors it
+        //                              never reads.
+        //   * `ValueAndGradient`     → third-derivative cache only. The REML/LAML
+        //                              gradient's `coord_corrections` IFT-drift
+        //                              trace is a *first* directional derivative
+        //                              (`row_third_contracted`); the BFGS
+        //                              first-order bridge never asks for the
+        //                              outer Hessian, so the fourth cache stays
+        //                              cold for the whole fit.
+        //   * `ValueGradientHessian` → both caches; the outer Hessian's second-
+        //                              directional pass reads `row_fourth_contracted`.
+        //
+        // Under-priming is safe: both caches are lazy `get_or_compute`, so a
+        // later consumer still builds on demand — it just loses this hook's
+        // top-level-rayon fan-out.
+        match eval_mode {
+            EvalMode::ValueOnly => Ok(()),
+            EvalMode::ValueAndGradient => {
+                let third_cache_len = self.third_full_cache().len();
+                crate::row_kernel::validate_row_kernel_cache_lengths(
+                    "bernoulli rigid warm-up",
+                    self.family.y.len(),
+                    &[("third", third_cache_len)],
+                )
+            }
+            EvalMode::ValueGradientHessian => {
+                // Touch both caches so their parallel builds run here, not later
+                // (nested inside the outer ext-idx par_iter where the lock-holder
+                // thread would have to do each row pass alone).
+                let third_cache_len = self.third_full_cache().len();
+                let fourth_cache_len = self.fourth_full_cache().len();
+                crate::row_kernel::validate_row_kernel_cache_lengths(
+                    "bernoulli rigid warm-up",
+                    self.family.y.len(),
+                    &[("third", third_cache_len), ("fourth", fourth_cache_len)],
+                )
+            }
+        }
     }
 
     fn row_fourth_contracted(
