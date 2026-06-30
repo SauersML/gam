@@ -150,8 +150,8 @@ pub(crate) use gam_linalg::matrix::{
 use crate::model_types::{ActiveLinearConstraintBlock, KktResidualSubspace, ProjectedKktResidual};
 pub use gam_problem::{
     ContractedPsiSecondOrderFn, DenseMatrixHyperOperator, DriftDerivResult, EvalMode,
-    FixedDriftDerivFn, HyperCoord, HyperCoordDrift, HyperCoordPair, HyperOperator,
-    ProjectedFactorCache, ProjectedFactorKey, PseudoLogdetMode,
+    FixedDriftDerivFn, HyperCoord, HyperCoordDrift, HyperCoordPair, HyperCoordPairFn, HyperOperator,
+    ProjectedFactorCache, ProjectedFactorKey, PseudoLogdetMode, SharedFixedDriftDerivFn,
 };
 
 // ─────────────────────────────────────────────────────────────────────────

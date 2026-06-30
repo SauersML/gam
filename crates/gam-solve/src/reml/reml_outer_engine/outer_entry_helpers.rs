@@ -1023,25 +1023,30 @@ pub(crate) fn try_tangent_projected_evaluate(
     // `BorrowedDerivProvider` uses for the deriv-provider corrections.
     //
     // The pair callbacks (`ext_coord_pair_fn`, `rho_ext_pair_fn`) return
-    // `HyperCoordPair` objects with p-space `b_mat` / `b_operator`.
-    // `ValueAndGradient` mode does not contract those pair objects (they
-    // only enter outer-Hessian assembly), so they are dropped (set to
-    // `None`) in the projected inner solution — gradient evaluations are
-    // unaffected. `ValueGradientHessian` mode would actually consume the
-    // pair callbacks; the tangent hessian wrapper cannot re-project
-    // their p-space second-drift outputs a posteriori, so refuse that
-    // combination upfront when callbacks are present.
-    if mode == EvalMode::ValueGradientHessian
-        && !solution.ext_coords.is_empty()
-        && (solution.ext_coord_pair_fn.is_some() || solution.rho_ext_pair_fn.is_some())
-    {
-        return Err(
-            "active constraints + ext_coords + mode=ValueGradientHessian not yet supported; \
-             fall back to ValueAndGradient. The ext-coord pair callbacks return p-space \
-             second-drift objects that the tangent hessian wrapper does not re-project."
-                .to_string(),
-        );
-    }
+    // `HyperCoordPair` objects with p-space `b_mat` / `b_operator` / `g`.
+    // `ValueGradientHessian` consumes them in outer-Hessian assembly, but
+    // every consumer contracts them THROUGH the (now tangent-wrapped)
+    // Hessian operator: `b_mat` / `b_operator` enter via
+    // `hop.trace_logdet_gradient` / `hop.trace_logdet_operator`, and the
+    // pair `g` is dotted against the mode-response vectors `coord.v =
+    // hop.solve(rhs)`. The `TangentProjectedHessianOperator` wrapper applies
+    // `Zᵀ·Z` inside exactly those `trace_*` / `solve` methods, so a
+    // clone-through of the pair callbacks is the EXACT second-order analog of
+    // the single-coordinate ext drift / `g` already passed through above for
+    // `ValueAndGradient`. Cloning is cheap and ownership-safe because the
+    // callbacks are now `Arc`-backed ([`HyperCoordPairFn`]).
+    //
+    // The only combination that is still NOT contracted through the wrapper
+    // is the direction-contracted ψψ hook (`contracted_psi_second_order`): it
+    // returns pre-traced `base_h2` scalars that bypass the operator, so it
+    // would need its drifts re-projected at source rather than a posteriori.
+    // That hook is mutually exclusive with the per-pair `ext_coord_pair_fn`
+    // assembly (operator.rs #740), and the active-constraint families that
+    // reach this path use the per-pair callbacks, so we drop the hook (set to
+    // `None`, as the `ValueAndGradient` path already did) and keep the per-pair
+    // callbacks, which the wrapper projects exactly.
+    let projected_ext_coord_pair_fn = solution.ext_coord_pair_fn.clone();
+    let projected_rho_ext_pair_fn = solution.rho_ext_pair_fn.clone();
     let projected = InnerSolution {
         log_likelihood: solution.log_likelihood,
         penalty_quadratic: solution.penalty_quadratic,
@@ -1065,13 +1070,25 @@ pub(crate) fn try_tangent_projected_evaluate(
         // ext_coord g/drift pass-through: projection is applied by the
         // tangent hessian wrapper's trace and solve methods.
         ext_coords: solution.ext_coords.clone(),
-        ext_coord_pair_fn: None,
-        rho_ext_pair_fn: None,
-        // Second-order pair callbacks are dropped on the projected path (same
-        // reason as the ext-coord/rho pair fns: the tangent hessian wrapper
-        // cannot re-project their p-space second-drift outputs).
+        // Pair callbacks pass through (cloned `Arc`s): the tangent hessian
+        // wrapper projects every p-space object they return via `ZᵀMZ` /
+        // `Z H_T⁻¹ Zᵀ` in its `trace_*` / `solve` methods, so this is the exact
+        // second-order analog of the per-coord `g`/`drift` pass-through above.
+        ext_coord_pair_fn: projected_ext_coord_pair_fn,
+        rho_ext_pair_fn: projected_rho_ext_pair_fn,
+        // The direction-contracted ψψ hook returns pre-traced scalars that
+        // bypass the wrapper (it cannot re-project them a posteriori), and it
+        // is mutually exclusive with the per-pair `ext_coord_pair_fn` assembly
+        // (#740). Drop it; the per-pair callbacks above carry the exact ψψ
+        // block under projection.
         contracted_psi_second_order: None,
-        fixed_drift_deriv: None,
+        // The `M_i[u] = D_β B_i[u]` drift is a p-space matrix the wrapper
+        // projects via `ZᵀMZ` in `trace_logdet_*`, and its `β_i`/`β_j`
+        // arguments are mode responses already in range(Z) (`hop.solve`
+        // outputs). Clone it through so the constraint-active families whose
+        // basis depends on β (`b_depends_on_beta`, e.g. the wiggle block) keep
+        // their genuine `m_terms` second-order contribution.
+        fixed_drift_deriv: solution.fixed_drift_deriv.clone(),
         barrier_config: solution.barrier_config.clone(),
         kkt_residual: projected_kkt,
         // Prevents recursion via `try_tangent_projected_evaluate`.

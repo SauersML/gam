@@ -190,14 +190,22 @@ pub struct InnerSolution<'dp> {
     /// of external coordinates (or external × ρ cross pairs).
     /// Arguments: (ext_index_i, ext_index_j) → HyperCoordPair.
     /// When None, the outer Hessian is not computed for extended coordinates.
-    pub ext_coord_pair_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
+    ///
+    /// `Arc`-backed ([`HyperCoordPairFn`]) so a derived solution — notably the
+    /// tangent-projected solution built under active inequality constraints —
+    /// can clone the same callback through to `ValueGradientHessian` assembly.
+    pub ext_coord_pair_fn: Option<HyperCoordPairFn>,
 
     /// Callback for ρ × ext cross pairs: (rho_index, ext_index) → HyperCoordPair.
-    pub rho_ext_pair_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
+    pub rho_ext_pair_fn: Option<HyperCoordPairFn>,
 
     /// M_i[u] = D_β B_i[u] callback for extended coordinates.
     /// Arguments: (ext_index, direction) → correction matrix.
-    pub fixed_drift_deriv: Option<FixedDriftDerivFn>,
+    ///
+    /// `Arc`-backed ([`SharedFixedDriftDerivFn`]) so the tangent-projected
+    /// solution can clone it through — the drift `M` is a p-space matrix the
+    /// wrapper projects via `ZᵀMZ` in `trace_logdet_*`.
+    pub fixed_drift_deriv: Option<SharedFixedDriftDerivFn>,
 
     /// Direction-contracted second-order ψ hook for the profiled θ-HVP (#740).
     /// When present, the outer-Hessian operator builder skips the `K²` per-pair
@@ -263,9 +271,9 @@ pub struct InnerSolutionBuilder<'dp> {
     pub(crate) nullspace_dim_override: Option<f64>,
     // Extended hyperparameter coordinates
     pub(crate) ext_coords: Vec<HyperCoord>,
-    pub(crate) ext_coord_pair_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
-    pub(crate) rho_ext_pair_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
-    pub(crate) fixed_drift_deriv: Option<FixedDriftDerivFn>,
+    pub(crate) ext_coord_pair_fn: Option<HyperCoordPairFn>,
+    pub(crate) rho_ext_pair_fn: Option<HyperCoordPairFn>,
+    pub(crate) fixed_drift_deriv: Option<SharedFixedDriftDerivFn>,
     pub(crate) contracted_psi_second_order: Option<ContractedPsiSecondOrderFn>,
     pub(crate) barrier_config: Option<BarrierConfig>,
     pub(crate) kkt_residual: Option<ProjectedKktResidual>,
@@ -371,7 +379,10 @@ impl<'dp> InnerSolutionBuilder<'dp> {
         mut self,
         f: Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>,
     ) -> Self {
-        self.ext_coord_pair_fn = Some(f);
+        // `Arc::from(Box<dyn …>)` is a zero-cost re-tag of the existing
+        // allocation; storing it as `Arc` lets the projected solution clone
+        // the callback through.
+        self.ext_coord_pair_fn = Some(HyperCoordPairFn::from(f));
         self
     }
 
@@ -379,12 +390,14 @@ impl<'dp> InnerSolutionBuilder<'dp> {
         mut self,
         f: Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>,
     ) -> Self {
-        self.rho_ext_pair_fn = Some(f);
+        self.rho_ext_pair_fn = Some(HyperCoordPairFn::from(f));
         self
     }
 
     pub fn fixed_drift_deriv(mut self, f: FixedDriftDerivFn) -> Self {
-        self.fixed_drift_deriv = Some(f);
+        // `Arc::from(Box<dyn …>)` re-tags the existing allocation for shared
+        // ownership so the projected solution can clone the callback through.
+        self.fixed_drift_deriv = Some(SharedFixedDriftDerivFn::from(f));
         self
     }
 
