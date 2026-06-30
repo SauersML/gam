@@ -137,16 +137,43 @@ impl DeviceS2KernelMatrix {
     /// Copy the device matrix back to the host as a regular ndarray
     /// `(rows × cols)` row-major view. Convenience for tests + parity
     /// comparisons; production paths should keep the matrix resident.
+    ///
+    /// The device matrix is `(ld × cols)` column-major; the host wants
+    /// `(rows × cols)` row-major. Two costs dominate this round-trip on the
+    /// real V100:
+    ///   1. the device→host copy of the full `ld·cols·8 B` payload, and
+    ///   2. the column-major→row-major transpose.
+    /// On Linux the dtoh is staged through a *cacheable* pinned host buffer
+    /// (see [`PinnedF64`]) so the DMA runs at full PCIe bandwidth (~10 GB/s)
+    /// instead of the ~1.3 GB/s the driver achieves staging a pageable
+    /// destination, and the subsequent host reads during the transpose hit
+    /// L1/L2 normally (unlike write-combined pinned memory). The transpose
+    /// itself is the parallel cache-blocked [`col_major_to_row_major_parallel`].
+    #[cfg(target_os = "linux")]
+    pub fn to_host_array(&self) -> Result<Array2<f64>, GpuError> {
+        let needed = self.ld * self.cols;
+        let mut staging = PinnedLease::acquire(self.stream.context(), needed)?;
+        self.stream
+            .memcpy_dtoh(&self.col_major_dev, staging.as_mut_slice())
+            .gpu_ctx("DeviceS2KernelMatrix dtoh (pinned)")?;
+        self.stream
+            .synchronize()
+            .gpu_ctx("DeviceS2KernelMatrix synchronize (pinned)")?;
+        Ok(col_major_to_row_major_parallel(
+            staging.as_slice(),
+            self.rows,
+            self.cols,
+            self.ld,
+        ))
+    }
+
+    #[cfg(not(target_os = "linux"))]
     pub fn to_host_array(&self) -> Result<Array2<f64>, GpuError> {
         let mut col_major = vec![0.0_f64; self.ld * self.cols];
         self.copy_to_host_col_major(&mut col_major)?;
-        let mut out = Array2::<f64>::zeros((self.rows, self.cols));
-        for j in 0..self.cols {
-            for i in 0..self.rows {
-                out[(i, j)] = col_major[j * self.ld + i];
-            }
-        }
-        Ok(out)
+        Ok(col_major_to_row_major_parallel(
+            &col_major, self.rows, self.cols, self.ld,
+        ))
     }
 
     /// Copy the underlying `(ld × cols)` column-major payload to a
@@ -184,6 +211,221 @@ impl DeviceS2KernelMatrix {
         }
         dst.copy_from_slice(&self.col_major_dev);
         Ok(())
+    }
+}
+
+/// Convert a `(ld × cols)` column-major device payload into a row-major
+/// `(rows × cols)` host `Array2`, in parallel with a cache-blocked tiled
+/// transpose.
+///
+/// Entry `(i, j)` lives at `col_major[j * ld + i]` and must land at
+/// `out[i * cols + j]`. A naive scalar `out[(i, j)] = col_major[j*ld+i]`
+/// loop over an `n·m` design (e.g. 200_000 × 200 ⇒ 320 MB) is utterly
+/// cache-hostile — the read stride is `ld` doubles — and measured at ~9 s,
+/// which alone made the GPU path lose to CPU. Here we:
+///   * tile the output rows into blocks small enough that one block's
+///     output stays L2-resident (`BLOCK_ROWS` rows × `cols` doubles),
+///   * read each source column slice contiguously (`col_major[j*ld+r0..]`),
+///   * run the row-blocks across the rayon pool.
+/// Reads are fully sequential per column; writes are bounded to the hot
+/// block. This drops the transpose from seconds to tens of milliseconds.
+fn col_major_to_row_major_parallel(
+    col_major: &[f64],
+    rows: usize,
+    cols: usize,
+    ld: usize,
+) -> Array2<f64> {
+    use rayon::prelude::*;
+
+    assert!(ld >= rows, "ld {ld} must be >= rows {rows}");
+    assert!(
+        col_major.len() >= ld * cols,
+        "col_major len {} < ld*cols {}",
+        col_major.len(),
+        ld * cols
+    );
+
+    // Block size chosen so one output block (BLOCK_ROWS × cols × 8 B) plus the
+    // source column slices stay roughly within L2 for the common `cols ≲ 200`.
+    const BLOCK_ROWS: usize = 128;
+
+    let mut out_flat = vec![0.0_f64; rows * cols];
+    out_flat
+        .par_chunks_mut(BLOCK_ROWS * cols)
+        .enumerate()
+        .for_each(|(block_idx, out_block)| {
+            let r0 = block_idx * BLOCK_ROWS;
+            let block_rows = out_block.len() / cols;
+            for j in 0..cols {
+                let base = j * ld + r0;
+                let src_col = &col_major[base..base + block_rows];
+                // Strided write within the hot block; contiguous column read.
+                for (local_i, &v) in src_col.iter().enumerate() {
+                    out_block[local_i * cols + j] = v;
+                }
+            }
+        });
+
+    Array2::from_shape_vec((rows, cols), out_flat)
+        .expect("row-major buffer has rows*cols elements")
+}
+
+/// RAII handle for a *cacheable* page-locked (pinned) host `f64` buffer.
+///
+/// cudarc's `CudaContext::alloc_pinned` always passes
+/// `CU_MEMHOSTALLOC_WRITECOMBINED`, which is excellent for host→device
+/// uploads but pathological for the host *reads* the transpose performs
+/// (write-combined memory is uncached on the CPU side). For the device→host
+/// return path we instead allocate plain pinned memory (`flags = 0`) directly
+/// via the driver: pinned so the dtoh DMA runs at full PCIe bandwidth, and
+/// cacheable so the parallel transpose can read it through the normal cache
+/// hierarchy. The buffer is freed with `cuMemFreeHost` on drop.
+#[cfg(target_os = "linux")]
+struct PinnedF64 {
+    ptr: *mut f64,
+    len: usize,
+    freed: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl PinnedF64 {
+    /// Allocate `len` cacheable pinned `f64`s. Binds the context to the
+    /// calling thread first (required before any driver allocation call).
+    fn alloc(ctx: &Arc<CudaContext>, len: usize) -> Result<Self, GpuError> {
+        ctx.bind_to_thread()
+            .gpu_ctx("PinnedF64 bind_to_thread")?;
+        let bytes = len
+            .checked_mul(std::mem::size_of::<f64>())
+            .ok_or_else(|| gam_gpu::gpu_err!("PinnedF64: len={len} byte size overflows usize"))?;
+        // flags = 0 ⇒ cacheable pinned (NOT write-combined): fast DMA *and*
+        // fast host reads for the subsequent transpose.
+        // SAFETY: `bytes` is a valid non-overflowing size; the returned host
+        // pointer is owned by this struct and freed exactly once in `drop`.
+        let raw = unsafe { cudarc::driver::result::malloc_host(bytes, 0) }
+            .gpu_ctx("PinnedF64 cuMemHostAlloc")?;
+        let ptr = raw as *mut f64;
+        if ptr.is_null() {
+            gam_gpu::gpu_bail!("PinnedF64: cuMemHostAlloc returned null for {bytes} bytes");
+        }
+        Ok(Self {
+            ptr,
+            len,
+            freed: false,
+        })
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [f64] {
+        // SAFETY: `ptr` points to `len` f64s of live pinned memory owned by
+        // self; the borrow is bounded by `&mut self`.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+
+    fn as_slice(&self) -> &[f64] {
+        // SAFETY: as above; shared borrow bounded by `&self`.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PinnedF64 {
+    fn drop(&mut self) {
+        if self.freed {
+            return;
+        }
+        self.freed = true;
+        // SAFETY: `ptr` was returned by `cuMemHostAlloc` in `alloc` and is
+        // freed exactly once (guarded by `freed`). A free failure during Drop
+        // is unrecoverable here; absorb it (the host process is tearing the
+        // allocation down regardless) without unwinding out of Drop.
+        unsafe { cudarc::driver::result::free_host(self.ptr as *mut std::ffi::c_void) }.ok();
+    }
+}
+
+// SAFETY: `PinnedF64` owns a single raw host allocation. The pointer is only
+// dereferenced by the thread holding the (mutable or shared) borrow; the pool
+// below moves the *handle* between threads while no borrow is outstanding, and
+// the rayon transpose only ever sees a `&[f64]` (already `Send + Sync`). The
+// raw pointer itself is never shared concurrently.
+#[cfg(target_os = "linux")]
+unsafe impl Send for PinnedF64 {}
+
+/// Bounded free-list of cacheable pinned host buffers, keyed by length.
+///
+/// Page-locking 320 MB via `cuMemHostAlloc` costs ~140 ms on the V100 — far
+/// more than the dtoh (~25 ms) it accelerates. During a REML fit the sphere
+/// design matrix is rebuilt and copied back at the *same* `(ld·cols)` size on
+/// every outer iteration, so caching the page-locked buffer turns that 140 ms
+/// into a one-time cost. The pool keeps at most [`PINNED_POOL_MAX_BUFFERS`]
+/// buffers (LRU-ish: oldest dropped first) to bound resident pinned memory.
+#[cfg(target_os = "linux")]
+const PINNED_POOL_MAX_BUFFERS: usize = 4;
+
+#[cfg(target_os = "linux")]
+static PINNED_POOL: OnceLock<Mutex<Vec<PinnedF64>>> = OnceLock::new();
+
+/// RAII lease of a pooled pinned buffer. Returns the buffer to [`PINNED_POOL`]
+/// on drop instead of freeing it, so the next same-size request reuses the
+/// page-locked allocation.
+#[cfg(target_os = "linux")]
+struct PinnedLease {
+    buf: Option<PinnedF64>,
+}
+
+#[cfg(target_os = "linux")]
+impl PinnedLease {
+    /// Acquire a pinned buffer of at least `len` f64s, reusing a pooled one of
+    /// exactly `len` when available, else allocating fresh.
+    fn acquire(ctx: &Arc<CudaContext>, len: usize) -> Result<Self, GpuError> {
+        let pool = PINNED_POOL.get_or_init(|| Mutex::new(Vec::new()));
+        if let Ok(mut guard) = pool.lock() {
+            if let Some(pos) = guard.iter().position(|b| b.len == len) {
+                return Ok(Self {
+                    buf: Some(guard.swap_remove(pos)),
+                });
+            }
+        }
+        Ok(Self {
+            buf: Some(PinnedF64::alloc(ctx, len)?),
+        })
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [f64] {
+        self.buf
+            .as_mut()
+            .expect("PinnedLease buffer present until drop")
+            .as_mut_slice()
+    }
+
+    fn as_slice(&self) -> &[f64] {
+        self.buf
+            .as_ref()
+            .expect("PinnedLease buffer present until drop")
+            .as_slice()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PinnedLease {
+    fn drop(&mut self) {
+        let Some(buf) = self.buf.take() else {
+            return;
+        };
+        if let Some(pool) = PINNED_POOL.get() {
+            if let Ok(mut guard) = pool.lock() {
+                if guard.len() < PINNED_POOL_MAX_BUFFERS {
+                    guard.push(buf);
+                    return;
+                }
+                // Pool full: evict the oldest cached buffer to make room for
+                // this (most-recently-used) one, keeping resident pinned memory
+                // bounded while favouring the hot size.
+                guard.remove(0);
+                guard.push(buf);
+                return;
+            }
+        }
+        // No pool / poisoned lock: fall back to freeing via PinnedF64::drop.
+        drop(buf);
     }
 }
 
@@ -1851,7 +2093,14 @@ mod sphere_gpu_tests {
             kind: SphereSpectralKernelKind::Sobolev,
             layout: DeviceMatrixLayout::ColumnMajor,
         };
-        drop(build_kernel_matrix_device(inputs_warm.clone()).expect("warmup"));
+        // Warm the NVRTC module, first-touch device alloc, AND the pinned
+        // host-staging pool (the page-lock of the (ld·cols)·8 B return buffer
+        // is a ~140 ms one-time cost that production amortizes across the REML
+        // outer loop; warming `to_host_array` here mirrors that steady state).
+        {
+            let warm = build_kernel_matrix_device(inputs_warm.clone()).expect("warmup");
+            drop(warm.to_host_array().expect("warmup to_host"));
+        }
 
         // Measure GPU.
         let t0 = std::time::Instant::now();
@@ -1859,9 +2108,14 @@ mod sphere_gpu_tests {
         let _host_gpu = dev.to_host_array().expect("dtoh");
         let gpu_secs = t0.elapsed().as_secs_f64();
 
-        // Measure CPU (truncated-spectral via the public matrix helper).
+        // Measure CPU. Must call the explicit host oracle
+        // (`spherical_wahba_kernel_matrix_cpu`), NOT the dispatching
+        // `spherical_wahba_kernel_matrix_with_kind`: at this `n·m = 4·10⁷` shape
+        // the dispatcher now ROUTES TO THE GPU (that is the whole point of the
+        // engagement wiring), so timing it here would compare GPU-vs-GPU and
+        // collapse the ratio to ~1×. The oracle always evaluates on host.
         let t1 = std::time::Instant::now();
-        let _cpu = spherical_wahba_kernel_matrix_with_kind(
+        let _cpu = crate::basis::spherical_wahba_kernel_matrix_cpu(
             data_ll.view(),
             centers_ll.view(),
             penalty_order,
@@ -1935,7 +2189,11 @@ mod sphere_gpu_tests {
                 .expect("centers");
         let z = Array2::<f64>::eye(centers.nrows());
         let t1 = std::time::Instant::now();
-        let raw_cpu = spherical_wahba_kernel_matrix_with_kind(
+        // Explicit host oracle: at this shape the dispatcher routes to the GPU,
+        // so the CPU baseline must call `spherical_wahba_kernel_matrix_cpu`
+        // directly — otherwise this would time GPU-vs-GPU and the ratio would
+        // collapse to ~1×.
+        let raw_cpu = crate::basis::spherical_wahba_kernel_matrix_cpu(
             data_ll.view(),
             centers.view(),
             2,
