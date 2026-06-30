@@ -942,30 +942,56 @@ fn parse_periodic_axes_option(
     if axes.is_empty() {
         return Ok(Some(periods));
     }
-    // A per-axis boolean list (`periodic=[true, false, ...]`) marks which axes
-    // are periodic without naming indices; map it onto the period slots (a
-    // `true` axis keeps its `parse_periods_option` value, which may be `None`
-    // and is then inferred downstream). This mirrors the tensor parser's
-    // `[true, false]` form so `te(...)` and `duchon(...)` agree.
-    if axes
-        .iter()
-        .all(|a| matches!(a.trim().to_ascii_lowercase().as_str(), "true" | "false" | "yes" | "no" | "y" | "n"))
-    {
+
+    // Boolean forms `periodic=true` / `periodic=[true, false, ...]`, mirroring
+    // `parse_tensor_periodic_axes`. The radial 1-D builders (`duchon`/`tps`/
+    // `matern`) intentionally DERIVE the wrap period from the closed center
+    // lattice when none is supplied (`prepare_periodic_duchon_centers_1d_with_period`,
+    // gam#580: `None => span`), so a boolean-selected periodic axis legitimately
+    // omits `period`. Without this branch, `duchon(x, periodic=true)`-style
+    // radial formulas failed with the misleading "invalid periodic axis 'true'".
+    let is_bool = |t: &str| {
+        matches!(
+            t.to_ascii_lowercase().as_str(),
+            "true" | "yes" | "y" | "false" | "no" | "n"
+        )
+    };
+    let is_truthy = |t: &str| matches!(t.to_ascii_lowercase().as_str(), "true" | "yes" | "y");
+
+    // Scalar boolean: `periodic=true` / `periodic=false`.
+    if axes.len() == 1 && is_bool(&axes[0]) {
+        if !is_truthy(&axes[0]) {
+            // Non-periodic: return None so the 1-D builder (which routes on
+            // `spec.periodic.is_some()`) does NOT take the periodic path.
+            return Ok(None);
+        }
+        // Every axis periodic; honor any explicit per-axis period, else leave
+        // `None` for the caller (formula arm) / builder to derive the span.
+        return Ok(Some(periods));
+    }
+
+    // Per-axis boolean list: `periodic=[true, false, ...]` (length must match dim).
+    if axes.iter().all(|a| is_bool(a)) {
         if axes.len() != dim {
             return Err(format!(
                 "periodic flag list length {} must match smooth dimension {dim}",
                 axes.len()
             ));
         }
+        if !axes.iter().any(|a| is_truthy(a)) {
+            return Ok(None);
+        }
         for (i, a) in axes.iter().enumerate() {
-            let on = matches!(a.trim().to_ascii_lowercase().as_str(), "true" | "yes" | "y");
-            if !on {
+            if !is_truthy(a) {
                 periods[i] = None;
             }
         }
         return Ok(Some(periods));
     }
-    for a in axes {
+
+    // Index-list form: `periodic=[0, 2]`. Each listed axis must carry an
+    // explicit finite period — an index gives no per-axis span-derive hint.
+    for a in &axes {
         let axis = a
             .parse::<usize>()
             .map_err(|err| format!("invalid periodic axis '{a}': {err}"))?;
@@ -981,8 +1007,8 @@ fn parse_periodic_axes_option(
         }
     }
     // Axes not listed are non-periodic even if period list has a finite placeholder.
-    let listed: std::collections::BTreeSet<usize> = split_list_option(raw_axes)
-        .into_iter()
+    let listed: std::collections::BTreeSet<usize> = axes
+        .iter()
         .filter_map(|a| a.parse::<usize>().ok())
         .collect();
     for i in 0..dim {
@@ -2959,11 +2985,29 @@ pub fn build_smooth_basis(
             // The default is the full Hilbert scale (curvature `Primary` + trend
             // ridge + mass + tension); REML deselects what the data don't support.
             let operator_penalties = DuchonOperatorPenaltySpec::default();
+            // For a 1-D periodic Duchon with no EXPLICIT period, anchor the wrap
+            // to the covariate DATA range rather than letting the basis builder
+            // derive it from the (k-subsampled) center span. The center span is a
+            // strict subset of the data and undershoots the true period, seaming
+            // the curve (f(0) ≠ f(2π)); the data range is the caller's actual
+            // domain. Honors any explicit `period=` (parse_periodic_axes_option
+            // already threaded it) and leaves multi-D / non-periodic untouched.
+            let mut periodic = parse_periodic_axes_option(options, cols.len())?;
+            if cols.len() == 1
+                && let Some(axes) = periodic.as_mut()
+                && axes.len() == 1
+                && axes[0].is_none()
+            {
+                let (minv, maxv) = col_minmax(ds.values.column(cols[0]))?;
+                if maxv > minv {
+                    axes[0] = Some(maxv - minv);
+                }
+            }
             Ok(SmoothBasisSpec::Duchon {
                 feature_cols: cols.to_vec(),
                 spec: DuchonBasisSpec {
                     center_strategy,
-                    periodic: parse_periodic_axes_option(options, cols.len())?,
+                    periodic,
                     length_scale,
                     power,
                     nullspace_order,
@@ -3203,25 +3247,14 @@ pub fn build_smooth_basis(
                     "cc" | "cp" | "cyclic"
                 );
                 let (knotspec, boundary, axis_period) = if periodic_axes[axis] {
-                    let period_value = match periods_opt[axis] {
-                        Some(p) => p,
-                        None if margin_is_cc => {
-                            let span = data_max - data_min;
-                            if !span.is_finite() || span <= 0.0 {
-                                return Err(format!(
-                                    "tensor smooth axis {axis}: cyclic margin has a degenerate \
-                                     data range [{data_min}, {data_max}]; pass period=<value>"
-                                ));
-                            }
-                            span
-                        }
-                        None => {
-                            return Err(format!(
-                                "tensor smooth axis {axis} is periodic but no period was supplied; \
-                                 pass period=<value> (scalar) or period=[..., <value>, ...]"
-                            ));
-                        }
-                    };
+                    let period_value = periods_opt[axis].ok_or_else(|| {
+                        format!(
+                            "tensor smooth axis {axis} is periodic but requires an explicit \
+                             period: pass period=<value> (scalar) or period=[..., <value>, ...]. \
+                             Deriving the period from the observed data range is sample-dependent \
+                             (off-by-ε seam), so it is not inferred."
+                        )
+                    })?;
                     if !period_value.is_finite() || period_value <= 0.0 {
                         return Err(format!(
                             "tensor smooth axis {axis}: period must be a positive finite value, got {period_value}"
@@ -4324,14 +4357,35 @@ pub fn parse_periodic_domain_1d(
     minv: f64,
     maxv: f64,
 ) -> Result<(f64, f64), String> {
-    let start = match option_numeric_expr(options, "period_start")? {
-        Some(v) => v,
-        None => option_numeric_expr(options, "start")?.unwrap_or(minv),
+    let start_opt = match option_numeric_expr(options, "period_start")? {
+        Some(v) => Some(v),
+        None => option_numeric_expr(options, "start")?,
     };
-    let end = match option_numeric_expr(options, "period_end")? {
-        Some(v) => v,
-        None => option_numeric_expr(options, "end")?.unwrap_or(maxv),
+    let end_opt = match option_numeric_expr(options, "period_end")? {
+        Some(v) => Some(v),
+        None => option_numeric_expr(options, "end")?,
     };
+    // Reject the pure data-range fallback. A B-spline periodic smooth that takes
+    // its wrap from the observed [min, max] is sample-dependent and silently
+    // wrong: uniform draws on a true period of 2π land on [ε, 2π−ε], so using
+    // (max−min) as the period seams the curve with an off-by-ε discontinuity and
+    // the fit drifts with the sample. (Unlike the radial closed-lattice Duchon
+    // path, whose centers DO tile a full period, so its span-derive is exact —
+    // see `parse_periodic_axes_option`.) Require the caller to name the period
+    // explicitly via `period=`/`period_end`. The end is only defaulted to `maxv`
+    // when a `period_start`/`start` was given (a half-open declaration); a bare
+    // periodic smooth with neither bound is an error.
+    if end_opt.is_none() && start_opt.is_none() {
+        return Err(
+            "periodic B-spline smooth requires an explicit period: pass period=<value> \
+             (e.g. period=2*pi) or period_start=/period_end=. Deriving the period from the \
+             observed data range is sample-dependent and produces an off-by-ε seam, so it is \
+             not inferred."
+                .to_string(),
+        );
+    }
+    let start = start_opt.unwrap_or(minv);
+    let end = end_opt.unwrap_or(maxv);
     if !(start.is_finite() && end.is_finite()) {
         return Err(format!(
             "periodic smooth domain requires finite endpoints, got ({start}, {end})"
