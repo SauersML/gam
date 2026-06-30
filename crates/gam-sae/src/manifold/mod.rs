@@ -160,6 +160,9 @@ mod tests_deflation_traces_780;
 mod tests_logdet_adjoint_780;
 
 #[cfg(test)]
+mod tests_pen_fd_780;
+
+#[cfg(test)]
 mod tests_isometry_exact_hvp_majorizer_457;
 
 #[cfg(test)]
