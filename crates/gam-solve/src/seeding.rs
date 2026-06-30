@@ -639,17 +639,32 @@ where
                 }
             }
         }
-        for start in 0..n_smooths.saturating_sub(1) {
-            let anchor = best_seed.clone();
-            let mut candidate = anchor;
-            candidate[start] = saturation;
-            candidate[start + 1] = saturation;
-            if let Some(c) = eval_cost(&candidate)
-                && c.is_finite()
-                && best_cost.map(|b| c < b).unwrap_or(true)
-            {
-                best_cost = Some(c);
-                best_seed = candidate;
+        // Adjacent-pair over-smoothing corner: send one term's (mass, tension)
+        // / null-space pair fully to the bound while the SIBLING terms stay
+        // free. Probe this corner from BOTH the refined isotropic best AND the
+        // baseline anchor. Anchoring only on `best_seed` cannot express "shrink
+        // s(z), keep s(x) at its supported λ": the per-axis sweep above drives
+        // every coordinate toward the dominant over-smoothing optimum, so the
+        // kept siblings are already saturated and the genuine "keep the rest at
+        // baseline" corner is unreachable (the unsupported pair gets railed but
+        // the supported pair can never relax back below the ±3 refinement
+        // reach). Including the baseline anchor lets the grid seed exactly the
+        // asymmetric corner #1266 is about — one pair at the bound, the rest at
+        // the supported baseline λ. Both anchors are criterion-ranked (adopted
+        // only on a strict cost decrease), so this never displaces a better
+        // interior optimum and leaves balanced fits byte-identical.
+        for anchor in [best_seed.clone(), baseline_seed.clone()] {
+            for start in 0..n_smooths.saturating_sub(1) {
+                let mut candidate = anchor.clone();
+                candidate[start] = saturation;
+                candidate[start + 1] = saturation;
+                if let Some(c) = eval_cost(&candidate)
+                    && c.is_finite()
+                    && best_cost.map(|b| c < b).unwrap_or(true)
+                {
+                    best_cost = Some(c);
+                    best_seed = candidate;
+                }
             }
         }
     }
