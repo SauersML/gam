@@ -786,16 +786,25 @@ fn materialize_standard_duchon_length_scale_opts_into_hybrid_basis() {
 #[test]
 fn workflow_survival_marginal_slope_routes_logslope_linkwiggle_into_score_warp_only() {
     let data = workflow_test_dataset();
+    // #384: the score-warp / link-deviation runtime is structurally cubic, so
+    // only `degree=3` is realizable on these blocks; non-cubic degrees are
+    // rejected up front (see
+    // `linkwiggle_noncubic_degree_is_rejected_at_the_routing_boundary_issue_384`).
+    // This test exercises the orthogonal routing/metadata contract: the
+    // logslope_formula linkwiggle lands on `score_warp` and the main-formula
+    // linkwiggle on `link_dev`, with knots/penalty orders carried through. The
+    // two blocks are distinguished here by `internal_knots` (9 vs 7) and
+    // `penalty_order` (1 vs 2,3), not by an unrealizable degree.
     let config = FitConfig {
         survival_likelihood: "marginal-slope".to_string(),
         logslope_formula: Some(
-            "1 + linkwiggle(degree=5, internal_knots=7, penalty_order=\"2,3\")".to_string(),
+            "1 + linkwiggle(degree=3, internal_knots=7, penalty_order=\"2,3\")".to_string(),
         ),
         z_column: Some("z".to_string()),
         ..FitConfig::default()
     };
     let materialized = materialize(
-            "Surv(age_entry, age_exit, event) ~ s(bmi) + linkwiggle(degree=4, internal_knots=9, penalty_order=\"1\")",
+            "Surv(age_entry, age_exit, event) ~ s(bmi) + linkwiggle(degree=3, internal_knots=9, penalty_order=\"1\")",
             &data,
             &config,
         )
@@ -811,11 +820,11 @@ fn workflow_survival_marginal_slope_routes_logslope_linkwiggle_into_score_warp_o
 
     let link_dev = request.spec.link_dev.expect("main-formula link-dev");
     let score_warp = request.spec.score_warp.expect("logslope score-warp");
-    assert_eq!(link_dev.degree, 4);
+    assert_eq!(link_dev.degree, 3);
     assert_eq!(link_dev.num_internal_knots, 9);
     assert_eq!(link_dev.penalty_order, 1);
     assert_eq!(link_dev.penalty_orders, vec![1]);
-    assert_eq!(score_warp.degree, 5);
+    assert_eq!(score_warp.degree, 3);
     assert_eq!(score_warp.num_internal_knots, 7);
     assert_eq!(score_warp.penalty_order, 3);
     assert_eq!(score_warp.penalty_orders, vec![2, 3]);
@@ -1289,6 +1298,58 @@ fn materialize_bernoulli_marginal_slope_names_constant_z_column() {
         !msg.contains("requires z with positive finite weighted standard deviation"),
         "workflow should surface the input-style message instead of the generic BMS normalization error: {msg}"
     );
+}
+
+#[test]
+fn linkwiggle_noncubic_degree_is_rejected_at_the_routing_boundary_issue_384() {
+    // #384: the score-warp / link-deviation block is realized by a structurally
+    // *cubic* I-spline runtime, so only `degree == 3` is realizable. The shared
+    // parser stays general (it also feeds the arbitrary-degree `timewiggle` /
+    // location-scale monotone basis), so a non-cubic `linkwiggle(degree=k)`
+    // parses fine — the cubic-only contract must be enforced UP FRONT at the
+    // marginal-slope routing boundary, not deep inside the fit where it
+    // surfaced as a cryptic "structural deviation runtime is cubic; degree must
+    // be 3" IntegrationError after expensive setup.
+    use crate::fit_orchestration::route_marginal_slope_deviation_blocks;
+
+    for deg in [1usize, 2, 4, 10] {
+        let mut options = std::collections::BTreeMap::new();
+        options.insert("degree".to_string(), deg.to_string());
+        options.insert("internal_knots".to_string(), "3".to_string());
+        let raw = format!("linkwiggle(degree={deg}, internal_knots=3)");
+        let spec = parse_linkwiggle_formulaspec(&options, &raw)
+            .expect("non-cubic wiggle degree must still parse at the shared layer");
+        assert_eq!(spec.degree, deg, "parser must carry the degree through verbatim");
+
+        // logslope_formula = linkwiggle(...) is the score-warp route the Python
+        // marginal-slope path uses.
+        let err = route_marginal_slope_deviation_blocks(None, Some(&spec))
+            .expect_err("non-cubic linkwiggle must be rejected before any fit");
+        assert!(
+            err.contains("degree must be 3"),
+            "rejection must name the cubic-only contract, got: {err}"
+        );
+        assert!(
+            err.contains("score-warp"),
+            "rejection must identify the score-warp / link-deviation block, got: {err}"
+        );
+
+        // The main-formula link-deviation route is gated identically.
+        let err_main = route_marginal_slope_deviation_blocks(Some(&spec), None)
+            .expect_err("non-cubic link-deviation must be rejected before any fit");
+        assert!(err_main.contains("degree must be 3"));
+    }
+
+    // The realizable cubic degree routes successfully (no false rejection).
+    let mut cubic_opts = std::collections::BTreeMap::new();
+    cubic_opts.insert("degree".to_string(), "3".to_string());
+    cubic_opts.insert("internal_knots".to_string(), "3".to_string());
+    let cubic = parse_linkwiggle_formulaspec(&cubic_opts, "linkwiggle(degree=3, internal_knots=3)")
+        .expect("cubic linkwiggle parses");
+    let routing = route_marginal_slope_deviation_blocks(None, Some(&cubic))
+        .expect("cubic degree must route without error");
+    assert!(routing.score_warp.is_some());
+    assert_eq!(routing.score_warp.unwrap().degree, 3);
 }
 
 #[test]

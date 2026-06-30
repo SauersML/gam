@@ -101,18 +101,38 @@ fn resolved_wiggle_inverse_link(
 
 fn deviation_block_config_from_formula_linkwiggle(
     wiggle: &LinkWiggleFormulaSpec,
-) -> DeviationBlockConfig {
+) -> Result<DeviationBlockConfig, String> {
+    // #384: the score-warp / link-deviation block is realized by the
+    // structurally *cubic* I-spline `DeviationRuntime` (see
+    // `build_deviation_block_from_knots_and_design_seed` in `bms::family`):
+    // its span tables, C2-continuous construction, and derivative operators
+    // are all hard-wired to cubic, so the only realizable `degree` is 3. The
+    // shared formula parser intentionally stays general (it also feeds the
+    // arbitrary-degree `timewiggle` / location-scale monotone basis), so the
+    // cubic-only contract is enforced here, at the routing boundary that feeds
+    // this runtime — up front, instead of failing deep inside the fit after
+    // expensive setup with a cryptic "degree must be 3" IntegrationError. The
+    // CLI routing twin (`gam-cli::main::model_build`) applies the same guard.
+    if wiggle.degree != 3 {
+        return Err(format!(
+            "linkwiggle() degree must be 3 when routed into the score-warp / \
+             link-deviation block: that runtime is a cubic I-spline and only \
+             supports cubic splines; got degree={}",
+            wiggle.degree
+        ));
+    }
     let defaults = WigglePenaltyConfig::cubic_triple_operator_default();
-    DeviationBlockConfig {
+    Ok(DeviationBlockConfig {
         degree: wiggle.degree,
         num_internal_knots: wiggle.num_internal_knots,
         penalty_order: *wiggle.penalty_orders.iter().max().unwrap_or(&2),
         penalty_orders: wiggle.penalty_orders.clone(),
         double_penalty: wiggle.double_penalty,
         monotonicity_eps: defaults.monotonicity_eps,
-    }
+    })
 }
 
+#[derive(Debug)]
 pub(crate) struct MarginalSlopeDeviationRouting {
     pub(crate) score_warp: Option<DeviationBlockConfig>,
     pub(crate) link_dev: Option<DeviationBlockConfig>,
@@ -123,8 +143,12 @@ pub(crate) fn route_marginal_slope_deviation_blocks(
     logslope_linkwiggle: Option<&LinkWiggleFormulaSpec>,
 ) -> Result<MarginalSlopeDeviationRouting, String> {
     Ok(MarginalSlopeDeviationRouting {
-        score_warp: logslope_linkwiggle.map(deviation_block_config_from_formula_linkwiggle),
-        link_dev: main_linkwiggle.map(deviation_block_config_from_formula_linkwiggle),
+        score_warp: logslope_linkwiggle
+            .map(deviation_block_config_from_formula_linkwiggle)
+            .transpose()?,
+        link_dev: main_linkwiggle
+            .map(deviation_block_config_from_formula_linkwiggle)
+            .transpose()?,
     })
 }
 
