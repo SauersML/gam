@@ -221,8 +221,7 @@ fn second_predictor_response_se_is_not_a_recycled_scalar() {
         emit("implied_var2_cv", sd(implied_var2) / mean(implied_var2))
         emit("true_var2_spread", max(true_var2) / min(true_var2))
         emit("max_rel_err", max(abs(mgcv_resp_se2 - correct_resp_se2) / correct_resp_se2))
-        "#
-        .to_string(),
+        "#,
     );
     let mgcv_implied_cv = r.scalar("implied_var2_cv");
     let mgcv_true_spread = r.scalar("true_var2_spread");
