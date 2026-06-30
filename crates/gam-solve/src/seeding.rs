@@ -783,6 +783,33 @@ mod tests {
     }
 
     #[test]
+    fn objective_grid_repeat_sweep_reaches_multistep_asymmetric_optimum_1266() {
+        // #1266: the per-axis grid refinement must repeat-sweep (coordinate
+        // descent) so the ±3 steps compound into a full traversal. The optimum
+        // here is the asymmetric corner "saturate s(x) high, keep s(z) low":
+        // axis 0 minimized at +9, axis 1 minimized at 0. The cost couples the
+        // axes so the isotropic [d, d] line is minimized at d=3 (best isotropic
+        // anchor [3, 3], cost 45), never at the true optimum. A SINGLE per-axis
+        // pass from [3, 3] can move axis 0 only one +3 step to 6 (reaching
+        // [6, 0], cost 9); only a second sweep carries axis 0 the remaining step
+        // 6 -> 9 to land the true optimum [9, 0], cost 0. The target +9 is an
+        // interior value, so it is reachable by neither the saturation probe
+        // (bound = +12) nor the adjacent-pair corner probe ([12, 12]) — it can
+        // only be found by the repeat-sweep coordinate descent.
+        let base = Array1::zeros(2);
+        let selected =
+            select_objective_seed_on_log_lambda_grid(&base, (-12.0, 12.0), 2, &[], |rho| {
+                Some((rho[0] - 9.0).powi(2) + rho[1].powi(2))
+            });
+        assert_eq!(
+            selected.to_vec(),
+            vec![9.0, 0.0],
+            "repeat-sweep coordinate descent must reach the multi-step \
+             asymmetric interior optimum [9, 0]; a single pass stalls at [6, 0]",
+        );
+    }
+
+    #[test]
     fn three_penalty_seeds_include_nu2_reverse_manifold_triplets() {
         let cfg = SeedConfig::default();
         let seeds = generate_rho_candidates(3, None, &cfg);
