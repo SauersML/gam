@@ -2,7 +2,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::manifold::{
     GeometryError, GeometryResult, RiemannianManifold, check_len, flatten, from_flat, identity,
-    matrix_exp, orthonormal_completion, qr_thin, skew_log_orthogonal, sym,
+    matrix_det, matrix_exp, orthonormal_completion, qr_thin, skew_log_orthogonal, sym,
     tangent_basis_metric_orthonormal,
 };
 use crate::manifolds::sphere::SphereManifold;
@@ -465,29 +465,82 @@ fn stiefel_canonical_log(
 
     let c_dim = n - k; // dimension of the normal space spanned by Y⊥
 
-    // [Y | Y⊥] ∈ SO(n); Y⊥ is the last `c_dim` columns.
-    let completion = orthonormal_completion(y); // n×n
+    // Orthonormal frame `[Y | Y⊥] ∈ SO(n)`; `Y⊥` is the last `c_dim` columns.
+    let frame_y = orthonormal_completion(y); // n×n
     let mut y_perp = Array2::<f64>::zeros((n, c_dim));
     for j in 0..c_dim {
         for i in 0..n {
-            y_perp[[i, j]] = completion[[i, k + j]];
+            y_perp[[i, j]] = frame_y[[i, k + j]];
         }
     }
 
-    // Target in the [Y Y⊥] basis: P = [M; B₀], orthonormal n×k columns.
-    let m = fast_atb(y, y_target); // k×k
-    let b0 = fast_atb(&y_perp, y_target); // c_dim×k
-    let mut p = Array2::<f64>::zeros((n, k));
-    for j in 0..k {
-        for i in 0..k {
-            p[[i, j]] = m[[i, j]];
+    // Build the matching frame `[Ỹ | Ỹ⊥] ∈ SO(n)` whose complement `Ỹ⊥` is the
+    // image of `Y⊥` projected off `Ỹ` and re-orthonormalized. Completing `Ỹ`
+    // with *standard axes* (as a generic completion would) yields an arbitrary
+    // basis that can turn `V₀` into a reflection (a −1 eigenvalue / π rotation)
+    // even for nearby frames; anchoring the completion to `Y⊥` instead makes
+    // `V₀ = [Y Y⊥]ᵀ [Ỹ Ỹ⊥] → I` as `Ỹ → Y`, so its principal logarithm is the
+    // small geodesic generator the iteration expects.
+    let yt_yperp = fast_atb(y_target, &y_perp); // k×c_dim
+    let mut y_perp_t = &y_perp - &fast_ab(y_target, &yt_yperp); // (I − ỸỸᵀ)Y⊥
+    // Modified Gram–Schmidt to re-orthonormalize the projected columns,
+    // re-projecting against Ỹ each pass for numerical safety.
+    for j in 0..c_dim {
+        for _pass in 0..2 {
+            // Orthogonalize column j against Ỹ.
+            for col in 0..k {
+                let mut dot = 0.0_f64;
+                for i in 0..n {
+                    dot += y_target[[i, col]] * y_perp_t[[i, j]];
+                }
+                for i in 0..n {
+                    y_perp_t[[i, j]] -= dot * y_target[[i, col]];
+                }
+            }
+            // Orthogonalize against earlier complement columns.
+            for prev in 0..j {
+                let mut dot = 0.0_f64;
+                for i in 0..n {
+                    dot += y_perp_t[[i, prev]] * y_perp_t[[i, j]];
+                }
+                for i in 0..n {
+                    y_perp_t[[i, j]] -= dot * y_perp_t[[i, prev]];
+                }
+            }
         }
-        for i in 0..c_dim {
-            p[[k + i, j]] = b0[[i, j]];
+        let mut nrm = 0.0_f64;
+        for i in 0..n {
+            nrm += y_perp_t[[i, j]] * y_perp_t[[i, j]];
+        }
+        let nrm = nrm.sqrt();
+        if nrm > 1.0e-12 {
+            for i in 0..n {
+                y_perp_t[[i, j]] /= nrm;
+            }
         }
     }
-    // Complete P (n×k, orthonormal columns) to V ∈ SO(n).
-    let mut v = orthonormal_completion(&p);
+
+    // Assemble the full frame [Ỹ | Ỹ⊥] and force it into SO(n) so that
+    // V₀ = [Y Y⊥]ᵀ [Ỹ Ỹ⊥] has det +1 (no spurious −1 eigenvalue). Flipping the
+    // last complement column flips the determinant and leaves V₀'s first k
+    // columns (= [M; B₀], independent of Ỹ⊥) unchanged.
+    let mut frame_yt = Array2::<f64>::zeros((n, n));
+    for j in 0..k {
+        for i in 0..n {
+            frame_yt[[i, j]] = y_target[[i, j]];
+        }
+    }
+    for j in 0..c_dim {
+        for i in 0..n {
+            frame_yt[[i, k + j]] = y_perp_t[[i, j]];
+        }
+    }
+    if c_dim >= 1 && matrix_det(&frame_yt) < 0.0 {
+        for i in 0..n {
+            frame_yt[[i, n - 1]] = -frame_yt[[i, n - 1]];
+        }
+    }
+    let mut v = fast_atb(&frame_y, &frame_yt); // n×n, first k columns = [M; B₀]
 
     const MAX_ITER: usize = 100;
     const TOL: f64 = 1.0e-13;

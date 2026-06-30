@@ -1070,8 +1070,9 @@ pub(crate) fn orthonormal_completion(cols: &Array2<f64>) -> Array2<f64> {
 }
 
 /// Determinant via Gaussian elimination with partial pivoting. Used only for
-/// the small orientation check in [`orthonormal_completion`]; not a hot path.
-fn matrix_det(a: &Array2<f64>) -> f64 {
+/// small orientation checks (e.g. forcing a completion into `SO(n)`); not a
+/// hot path.
+pub(crate) fn matrix_det(a: &Array2<f64>) -> f64 {
     let n = a.nrows();
     if n == 0 || a.ncols() != n {
         return 1.0;
