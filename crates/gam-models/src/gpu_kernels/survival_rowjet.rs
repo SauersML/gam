@@ -725,7 +725,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn device_only_path_runs_and_matches_cpu_fail_loud() {
-        let require_gpu = std::env::var("GAM_REQUIRE_GPU").is_ok_and(|v| v != "0" && !v.is_empty());
+        // Fail loud only when a CUDA device is actually present (a real runtime
+        // check, not an env-var read — `env::var` is banned crate-wide): on a GPU
+        // box the device path MUST run, while a CI runner with no device skips
+        // gracefully.
+        let require_gpu = gam_gpu::device_runtime::GpuRuntime::global().is_some();
 
         // Two batches: enough rows to amortise the launch, in both the interior
         // (smooth) and edge (transcendental-stress) regimes. The edge batch is
@@ -793,76 +797,4 @@ mod tests {
         }
     }
 
-    /// Diagnostic (#415/#1175): localize CPU↔device drift per channel as both
-    /// absolute and relative error, and report the worst offending row's inputs.
-    /// Not a gate — `--ignored` so it only runs when explicitly requested on a
-    /// GPU box. Used to decide between a code fix and a principled mixed tol.
-    #[cfg(target_os = "linux")]
-    #[test]
-    #[ignore = "diagnostic; run explicitly on a GPU box"]
-    fn device_vs_cpu_channel_drift_report() {
-        let rows = fixture(DEVICE_ROW_THRESHOLD + 1024);
-        let cpu = survival_rigid_row_jets_cpu(&rows, 0.7, &DIR, &DIRU, &DIRV);
-        let got = survival_rigid_row_jets(&rows, 0.7, &DIR, &DIRU, &DIRV);
-        // The dispatcher must have actually run the device path.
-        let dev = survival_rigid_row_jets_device_only(&rows, 0.7, &DIR, &DIRU, &DIRV)
-            .expect("device path must run on a GPU box");
-        // atol/rtol candidate for a principled mixed band: pass iff
-        // abs <= ATOL + RTOL*|cpu|. Report the worst normalized residual
-        // abs/(ATOL+RTOL*|cpu|) so a value >1 means the band would fail.
-        const ATOL: f64 = 1e-9;
-        const RTOL: f64 = 1e-6;
-        let mut lines: Vec<String> = Vec::new();
-        let report = |lines: &mut Vec<String>, name: &str, c: &[f64], d: &[f64], stride: usize| {
-            let mut max_abs = 0.0_f64;
-            let mut cpu_at_max_abs = 0.0_f64;
-            let mut worst_abs_row = 0usize;
-            let mut max_norm = 0.0_f64; // abs / (ATOL + RTOL*|cpu|)
-            let mut worst_norm_row = 0usize;
-            let mut worst_norm_abs = 0.0_f64;
-            let mut worst_norm_cpu = 0.0_f64;
-            let mut chan_max_mag = 0.0_f64;
-            for (i, (x, y)) in c.iter().zip(d).enumerate() {
-                let abs = (x - y).abs();
-                chan_max_mag = chan_max_mag.max(x.abs());
-                if abs > max_abs {
-                    max_abs = abs;
-                    cpu_at_max_abs = *x;
-                    worst_abs_row = i / stride;
-                }
-                let norm = abs / (ATOL + RTOL * x.abs());
-                if norm > max_norm {
-                    max_norm = norm;
-                    worst_norm_row = i / stride;
-                    worst_norm_abs = abs;
-                    worst_norm_cpu = *x;
-                }
-            }
-            let line = format!(
-                "[#415 drift] {name:<7} max_abs={max_abs:.3e} (|cpu|={:.3e}, row {worst_abs_row}) \
-                 chan_max|cpu|={chan_max_mag:.3e}  worst_norm(atol={ATOL:.0e},rtol={RTOL:.0e})\
-                 ={max_norm:.3e} (row {worst_norm_row}, abs={worst_norm_abs:.3e}, |cpu|={:.3e})",
-                cpu_at_max_abs.abs(),
-                worst_norm_cpu.abs()
-            );
-            eprintln!("{line}");
-            lines.push(line);
-            (max_abs, max_norm)
-        };
-        lines.push("=== device-only vs CPU (isolates kernel arithmetic) ===".to_string());
-        eprintln!("=== device-only vs CPU (isolates kernel arithmetic) ===");
-        report(&mut lines, "value", &cpu.value, &dev.value, 1);
-        report(&mut lines, "grad", &cpu.grad, &dev.grad, 4);
-        report(&mut lines, "hess", &cpu.hess, &dev.hess, 16);
-        report(&mut lines, "third", &cpu.third, &dev.third, 16);
-        report(&mut lines, "fourth", &cpu.fourth, &dev.fourth, 16);
-        lines.push("=== dispatcher vs CPU (what the gate sees) ===".to_string());
-        eprintln!("=== dispatcher vs CPU (what the gate sees) ===");
-        report(&mut lines, "value", &cpu.value, &got.value, 1);
-        report(&mut lines, "grad", &cpu.grad, &got.grad, 4);
-        report(&mut lines, "hess", &cpu.hess, &got.hess, 16);
-        report(&mut lines, "third", &cpu.third, &got.third, 16);
-        report(&mut lines, "fourth", &cpu.fourth, &got.fourth, 16);
-        let _ = std::fs::write("/tmp/rowjet_drift.txt", lines.join("\n") + "\n");
-    }
 }

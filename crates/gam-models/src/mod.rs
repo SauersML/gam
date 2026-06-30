@@ -15,7 +15,7 @@ extern crate gam_model_kernels;
 #[macro_use]
 mod macros;
 #[cfg(test)]
-mod matern_collapse_1629;
+mod matern_collapse_1629_tests;
 
 // `bail_*` shorthands whose error types were relocated to the neutral
 // `gam-problem` crate. Re-exporting the `#[macro_export]` macros here makes
