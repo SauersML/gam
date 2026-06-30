@@ -2546,6 +2546,57 @@ where
         outer_result.final_grad_norm.unwrap_or(0.0)
     };
 
+    // #1690: reconcile the convergence flag with the AUTHORITATIVE gradient of the
+    // fit we actually ship.
+    //
+    // `outer_result.converged` was decided by the in-loop cost-stall guard from
+    // the projected gradient it saw at the best-by-cost iterate DURING the ρ
+    // search. On a family whose dispersion is profiled into the inner working
+    // weight (Gamma log-link re-estimates the shape every solve) that reading is
+    // warm-start sensitive: at a weakly-identified flat ρ-valley the inner P-IRLS
+    // fixed point — and therefore the analytic ρ-gradient — depends on the β the
+    // solve started from. The guard can then halt `converged=false` on a point
+    // that is in fact stationary, because the gradient it sampled mid-search sat
+    // just above the score-relative bound. The accept-fit above (line ~2034,
+    // `refine_dispersion=true`) lands on the β actually reported and
+    // `compute_gradient` re-measures the ρ-gradient there — this `finalgrad_norm`
+    // is the value surfaced as `outer_gradient_norm`. When that authoritative
+    // gradient clears the SAME score-relative stationarity bound the in-loop guard
+    // uses (`FLAT_VALLEY_CONVERGED_REL_GRAD·(1+|score|)`, capped at
+    // `FLAT_VALLEY_CONVERGED_ABS_GRAD_CAP`), the halt was a false negative: certify
+    // converged. A genuinely non-stationary valley floor — and the #1426 stuck
+    // overfit, whose honest |g|≈11 ≫ bound — never clears it, so its
+    // non-convergence stands. The reconciliation is gated on the flat-valley stop
+    // reason so no other non-convergence path (max-iters, line-search collapse) is
+    // affected.
+    let outer_converged = {
+        let mut converged = outer_result.converged;
+        if !converged
+            && matches!(
+                outer_result.operator_stop_reason,
+                Some(crate::rho_optimizer::OperatorTrustRegionStopReason::CostStallFlatValley)
+            )
+            && finalgrad_norm.is_finite()
+        {
+            let score_relative_bound = (crate::rho_optimizer::FLAT_VALLEY_CONVERGED_REL_GRAD
+                * (1.0 + outer_result.final_value.abs()))
+            .min(crate::rho_optimizer::FLAT_VALLEY_CONVERGED_ABS_GRAD_CAP);
+            if finalgrad_norm <= score_relative_bound {
+                log::info!(
+                    "[OUTER] flat-valley cost-stall RE-CERTIFIED converged: the authoritative \
+                     gradient at the shipped θ̂ (|g|={:.3e}) clears the score-relative \
+                     stationarity bound ({:.3e}); the in-loop halt rode on a warm-start-sensitive \
+                     gradient readout on a flat ρ-valley (score={:.6e}).",
+                    finalgrad_norm,
+                    score_relative_bound,
+                    outer_result.final_value,
+                );
+                converged = true;
+            }
+        }
+        converged
+    };
+
     if opts.compute_inference {
         penalized_hessian = map_hessian_to_original_basis(&pirls_res)?;
         let p_cov = penalized_hessian.nrows();
@@ -2857,7 +2908,7 @@ where
         standard_deviation,
         iterations: iters,
         finalgrad_norm,
-        outer_converged: outer_result.converged,
+        outer_converged,
         pirls_status,
         deviance: pirls_res.deviance,
         stable_penalty_term: pirls_res.stable_penalty_term,

@@ -1582,7 +1582,26 @@ pub(crate) fn run_outer_uncertified(
                         || arc_retries_left == 0
                         || matches!(
                             result.operator_stop_reason,
-                            Some(OperatorTrustRegionStopReason::RejectFloor)
+                            Some(
+                                OperatorTrustRegionStopReason::RejectFloor
+                                    // #1690: a flat-valley cost-stall is a CONVERGED
+                                    // cost plateau over the whole stall window, not a
+                                    // budget shortfall. The ARC retry only reseeds
+                                    // from the same last ρ with a reset trust radius
+                                    // and the same deterministic operator state, so it
+                                    // replays the identical trajectory and re-halts at
+                                    // the same valley floor with the same |g| (verified
+                                    // on the #1690 Gamma repro: two retries, each
+                                    // returning |g|=0.3646 byte-for-byte). Treat it
+                                    // like `RejectFloor` and stop — the genuine
+                                    // stationarity verdict is reconciled downstream
+                                    // against the authoritative shipped-β gradient
+                                    // (`optimizer.rs`), and a non-stationary floor is
+                                    // still reported non-converged. This skips the
+                                    // wasted full-trajectory replay that dominated the
+                                    // count-family slowdown.
+                                    | OperatorTrustRegionStopReason::CostStallFlatValley
+                            )
                         )
                     {
                         break Ok(result);
