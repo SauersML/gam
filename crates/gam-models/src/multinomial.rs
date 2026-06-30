@@ -1036,7 +1036,7 @@ impl MultinomialSavedModel {
         n_draws: usize,
         seed: u64,
     ) -> Array2<u32> {
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         let probs = self.predict_probabilities(x_new);
         let n = probs.nrows();
         let k = probs.ncols();
