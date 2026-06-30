@@ -493,19 +493,25 @@ mod tests {
                     // That recurrence is mildly ill-conditioned: each step
                     // amplifies the prior rounding error, so the relative gap
                     // between the CPU's serial evaluation and the device's
-                    // FMA-fused evaluation of the SAME recurrence compounds
-                    // geometrically with the moment order k (measured on a
-                    // Tesla V100: ~5e-13 at k=9, ~5e-10 at k=15, ~1.5e-6 at
-                    // k=21 — about ×10³ per +6 orders, i.e. the recurrence's
-                    // own condition growth). This is NOT an algebra mismatch
-                    // (the NonAffineFinite GL-quadrature branch, which has no
-                    // such recurrence, agrees to ≤2e-15); it is irreducible
-                    // round-off in an ill-conditioned recurrence. A flat
+                    // evaluation of the SAME recurrence compounds geometrically
+                    // with the moment order k. Measured on a Tesla V100 (with
+                    // NVRTC `--fmad=false`, i.e. #1686's FMA-contraction fix
+                    // ACTIVE — this kernel compiles through `compile_ptx_arch`):
+                    // Affine ~5e-13 at k=9, ~5e-10 at k=15, ~1.48e-6 at k=21 —
+                    // about ×10³ per +6 orders, i.e. the recurrence's own
+                    // condition growth. Notably this is essentially UNCHANGED
+                    // from the pre-#1686 fmad=true measurement (1.5e-6 at k=21),
+                    // which proves the drift is NOT FMA contraction but pure
+                    // round-off order: CPU-serial vs device evaluation of an
+                    // ill-conditioned recurrence. (Confirmation: the
+                    // NonAffineFinite GL-quadrature branch, which has no such
+                    // recurrence, agrees to ≤2.4e-15 at every degree; the
+                    // AffineTail branch's closed-form path holds ≤8e-16.) A flat
                     // `rel ≤ 1e-11` therefore wrongly fails the high-order
                     // affine moments. Gate each order against a band that
                     // tracks the condition growth with ~10× headroom:
                     //   rel_tol(k) = 1e-12 · 10^(k/3)
-                    // (k=21 → 1e-5, well above the worst 1.5e-6; k=0 → 1e-12).
+                    // (k=21 → 1e-5, well above the worst 1.48e-6; k=0 → 1e-12).
                     // A real bug perturbs a moment by O(value) → rel ~1, which
                     // blows through this band at every order.
                     let rel = abs / want.abs().max(1e-300);

@@ -98,9 +98,15 @@ ROOT CAUSE (two layers):
    inline CUDART_INF pattern). No host headers.
 3. After the kernel RUNS: parity drift at degree 21 (Affine branch) up to
    1.5e-6 relative — the forward moment recurrence M_{n+1}=(n·M_{n-1}−d0·M_n−B_n)/d1
-   is ill-conditioned, so CPU-serial vs GPU-FMA round-off compounds ~×10³ per +6
+   is ill-conditioned, so CPU-serial vs device round-off compounds ~×10³ per +6
    orders. NOT a bug (NonAffineFinite GL branch agrees to ≤2e-15). Replaced the
    flat rel≤1e-11 gate with a per-order band rel_tol(k)=1e-12·10^(k/3).
+   POST-#1686 RE-MEASURE: with fmad=false ACTIVE the Affine k=21 drift is
+   1.478e-6 — essentially UNCHANGED from the fmad=true 1.5e-6. So this drift,
+   like the row-jet third/fourth channels, is NOT FMA contraction; it is pure
+   round-off order in an ill-conditioned recurrence. Corrected the device.rs
+   comment that had credited "FMA-fused evaluation" (the band itself is correct
+   and unchanged: k=21 tol 1e-5 vs worst 1.478e-6, ~7× headroom).
 Verified PASS on Tesla V100 sm_70 (compiles, all 3 branches run, parity holds).
 
 ## RECONCILIATION (2026-06-30) — rebased onto main's #1686 (FMA-contraction fix)
