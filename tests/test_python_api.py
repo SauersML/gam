@@ -120,7 +120,10 @@ def test_build_info_reports_real_extension() -> None:
 
 
 def test_validate_formula_reports_model_metadata() -> None:
-    validation = gamfit.validate_formula(training_rows(), "y ~ x")
+    # Explicit Gaussian family: the toy fixture's integer-shaped y would be
+    # auto-detected as Poisson under #1065, but this test is about generic
+    # metadata reporting for an identity-link Gaussian model.
+    validation = gamfit.validate_formula(training_rows(), "y ~ x", family="gaussian")
 
     assert validation["formula"] == "y ~ x"
     assert validation["model_class"] == "standard"
@@ -130,7 +133,10 @@ def test_validate_formula_reports_model_metadata() -> None:
 
 
 def test_fit_predict_summary_check_report_and_roundtrip(tmp_path: pathlib.Path) -> None:
-    model = gamfit.fit(training_rows(), "y ~ x")
+    # Explicit Gaussian family: the integer-shaped fixture y auto-detects as
+    # Poisson under #1065, but this test exercises identity-link Gaussian
+    # fit/predict/summary/roundtrip behaviour (linear_predictor == mean).
+    model = gamfit.fit(training_rows(), "y ~ x", family="gaussian")
     summary = model.summary()
 
     assert model.formula == "y ~ x"
@@ -260,7 +266,10 @@ def test_group_metadata_roundtrips_through_saved_model(tmp_path: pathlib.Path) -
 
 
 def test_pandas_diagnostics_and_plotting() -> None:
-    model = gamfit.fit(training_frame(), "y ~ x")
+    # Explicit Gaussian family (#1065 would auto-detect Poisson for the
+    # integer-shaped fixture); this test asserts identity-link diagnostics
+    # (rmse < 1e-3, r_squared > 0.999) and pandas plotting.
+    model = gamfit.fit(training_frame(), "y ~ x", family="gaussian")
 
     predicted = model.predict(prediction_frame())
     # Default predict() returns a 1-D mean array regardless of input kind;
@@ -288,7 +297,10 @@ def test_sklearn_regressor_roundtrip() -> None:
     train = training_frame()
     predict = prediction_frame()
 
-    est = GAMRegressor(formula="y ~ x")
+    # Explicit Gaussian family (#1065 auto-detects Poisson for integer y);
+    # this test asserts the sklearn regressor wrapper recovers the linear
+    # truth (score > 0.999) and honours sample weights.
+    est = GAMRegressor(formula="y ~ x", family="gaussian")
     est.fit(train)
     predictions = est.predict(predict)
 
@@ -317,7 +329,9 @@ def test_numpy_inputs_and_outputs() -> None:
     y_train = np.array([1.0, 2.0, 3.0, 4.0])
     x_test = np.array([[1.5], [2.5]])
 
-    est = GAMRegressor(formula="y ~ x0")
+    # Explicit Gaussian family (#1065 auto-detects Poisson for integer y);
+    # this test locks in the numpy IO contract for an identity-link fit.
+    est = GAMRegressor(formula="y ~ x0", family="gaussian")
     est.fit(x_train, y_train)
     pred = est.predict(x_test)
 
@@ -325,7 +339,11 @@ def test_numpy_inputs_and_outputs() -> None:
     assert pred.shape == (2,)
     np.testing.assert_allclose(pred, [2.5, 3.5], atol=1e-3)
 
-    model = gamfit.fit({"x0": x_train[:, 0].tolist(), "y": y_train.tolist()}, "y ~ x0")
+    model = gamfit.fit(
+        {"x0": x_train[:, 0].tolist(), "y": y_train.tolist()},
+        "y ~ x0",
+        family="gaussian",
+    )
     raw = model.predict(x_test, return_type="numpy")
     assert raw.shape == (2, 2)
     # The numpy-return contract is column-ordered (eta, mean). Identity link
