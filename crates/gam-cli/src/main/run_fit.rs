@@ -25,6 +25,7 @@ pub(crate) fn compact_fit_result_for_batch(fit: &mut UnifiedFitResult) {
 pub(crate) fn fit_config_from_fit_args(args: &FitArgs) -> Result<FitConfig, String> {
     crate::config_resolve::resolve_cli_fit_config(crate::config_resolve::CliFitConfigInput {
         family: family_arg_canonical_name(args.family).map(str::to_string),
+        expectile_tau: args.expectile_tau,
         negative_binomial_theta: args.negative_binomial_theta,
         link: None,
         flexible_link: false,
@@ -249,6 +250,25 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
             &y,
             &mut inference_notes,
         );
+    }
+
+    // `--expectile-tau` only has meaning under `--family expectile`; reject the
+    // combination upfront rather than silently ignoring the asymmetry.
+    if args.expectile_tau.is_some() && !matches!(args.family, FamilyArg::Expectile) {
+        return Err(
+            "--expectile-tau requires --family expectile (the asymmetry is only used by the \
+             expectile estimator)"
+                .to_string(),
+        );
+    }
+    // Expectile (Newey–Powell LAWS) family (#1777): an OUTER estimator that wraps
+    // the standard Gaussian-identity GAM with iterative asymmetric reweighting.
+    // It is dispatched here — before `resolve_family`/the standard fit, neither of
+    // which knows the expectile family — through the same shared seam the Python
+    // FFI and the in-process `fit_from_formula` use, so the CLI reaches the same
+    // estimator instead of failing with `unknown family 'expectile'`.
+    if matches!(args.family, FamilyArg::Expectile) {
+        return run_fit_expectile(&args, &ds, &formula_text, &fit_config);
     }
 
     let link_choice = parse_link_choice(effective_link_arg.as_deref(), false)?;
@@ -1011,6 +1031,101 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
     }
 
     emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
+    Ok(())
+}
+
+/// Expectile (Newey–Powell LAWS) standard-GAM fit for the CLI.
+///
+/// Mirrors the dedicated transformation-normal / marginal-slope CLI sub-fits:
+/// it routes through the single shared dispatch seam
+/// [`fit_expectile_if_requested`], which runs the iteratively-reweighted
+/// Gaussian-identity GAM and returns an ordinary [`StandardFitResult`] whose
+/// coefficients ARE the τ-expectile. The fit is reported and persisted as the
+/// Gaussian-identity standard model it is — predict, bands, and persistence work
+/// unchanged. The exact Gaussian jackknife+/full-conformal substrates the
+/// symmetric path attaches are deliberately omitted: their finite-sample
+/// coverage proof needs exchangeable unit-weight rows, which the asymmetric LAWS
+/// weighting breaks, so attaching them would advertise a guarantee the expectile
+/// fit does not hold.
+pub(crate) fn run_fit_expectile(
+    args: &FitArgs,
+    ds: &Dataset,
+    formula_text: &str,
+    fit_config: &FitConfig,
+) -> Result<(), String> {
+    let phase_start = std::time::Instant::now();
+    let tau = args.expectile_tau.unwrap_or(0.5);
+    log::info!(
+        "[PHASE] expectile-LAWS fit start n={} tau={tau}",
+        ds.values.nrows()
+    );
+    let result =
+        gam::families::fit_orchestration::fit_expectile_if_requested(formula_text, ds, fit_config)
+            .map_err(|e| format!("expectile fit failed: {e}"))?
+            .ok_or_else(|| {
+                "internal error: run_fit_expectile entered for a non-expectile family".to_string()
+            })?;
+    log::info!(
+        "[PHASE] expectile-LAWS fit end elapsed={:.3}s",
+        phase_start.elapsed().as_secs_f64()
+    );
+
+    let StandardFitResult {
+        fit,
+        design,
+        resolvedspec,
+        adaptive_diagnostics,
+        saved_link_state,
+        ..
+    } = result;
+    // The inner family is Gaussian-identity; the LAWS coefficients are reported
+    // and persisted as that standard model.
+    let family = fit
+        .likelihood_family
+        .clone()
+        .unwrap_or_else(LikelihoodSpec::gaussian_identity);
+
+    cli_out!(
+        "expectile fit | tau={:.4} | terms={} | edf={:.3} | scale={:.6e}",
+        tau,
+        resolvedspec.smooth_terms.len() + resolvedspec.linear_terms.len(),
+        fit.edf_total().unwrap_or(f64::NAN),
+        fit.dispersion_phi(),
+    );
+
+    if let Some(out) = args.out.as_ref() {
+        let frozenspec = freeze_term_collection_from_design(&resolvedspec, &design)
+            .map_err(|e| e.to_string())?;
+        let mut saved_fit = fit.clone();
+        saved_fit.fitted_link = saved_link_state.clone();
+        compact_fit_result_for_batch(&mut saved_fit);
+        let mut payload = FittedModelPayload::new(
+            MODEL_PAYLOAD_VERSION,
+            formula_text,
+            ModelKind::Standard,
+            FittedFamily::Standard {
+                likelihood: family.clone(),
+                link: StandardLink::try_from(family.link_function()).ok(),
+                latent_cloglog_state: None,
+                mixture_state: saved_mixture_state_from_fit(&saved_fit),
+                sas_state: saved_sas_state_from_fit(&saved_fit),
+            },
+            family.name().to_string(),
+        );
+        payload.unified = Some(saved_fit.clone());
+        payload.fit_result = Some(saved_fit.clone());
+        payload.data_schema = Some(ds.schema.clone());
+        payload.link = inverse_link_from_fitted_link_state(&saved_fit.fitted_link);
+        set_training_feature_metadata_from_dataset(&mut payload, ds);
+        payload.resolved_termspec = Some(frozenspec);
+        payload.adaptive_regularization_diagnostics = adaptive_diagnostics;
+        set_saved_offset_columns(
+            &mut payload,
+            fit_config.offset_column.clone(),
+            fit_config.noise_offset_column.clone(),
+        );
+        write_payload_json(out, payload)?;
+    }
     Ok(())
 }
 

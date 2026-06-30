@@ -15,6 +15,7 @@ pub(crate) fn family_arg_canonical_name(arg: FamilyArg) -> Option<&'static str> 
         FamilyArg::Beta => Some("beta"),
         FamilyArg::RoystonParmar => Some("royston-parmar"),
         FamilyArg::TransformationNormal => Some("transformation-normal"),
+        FamilyArg::Expectile => Some("expectile"),
     }
 }
 

@@ -4857,6 +4857,52 @@ fn fit_dataset_impl(
     if let Some(w) = fisher_rao_w {
         inject_scalar_fisher_rao_weight(&mut dataset, &mut fit_config, w)?;
     }
+    // Expectile (Newey–Powell LAWS) family (#1777): the expectile estimator is an
+    // OUTER driver that wraps the standard Gaussian-identity GAM with iterative
+    // asymmetric reweighting, so it is selected *before* `materialize` (which has
+    // no expectile arm) — exactly as the in-process `fit_from_formula` does. We
+    // route it through the single shared dispatch seam so the Python API reaches
+    // the same estimator the library call does instead of failing with
+    // `unknown family 'expectile(τ)'`. The driver returns an ordinary
+    // `StandardFitResult`, so the persistence payload is built by the same
+    // `build_standard_payload` used for every other standard fit.
+    if let Some(expectile_result) =
+        gam::families::fit_orchestration::fit_expectile_if_requested(
+            &formula,
+            &dataset,
+            &fit_config,
+        )?
+    {
+        let family = expectile_result
+            .fit
+            .likelihood_family
+            .clone()
+            .unwrap_or_else(gam::types::LikelihoodSpec::gaussian_identity);
+        let mut payload = build_standard_payload(
+            formula,
+            &dataset,
+            &fit_config,
+            family,
+            &expectile_result.fit,
+            &expectile_result.design,
+            expectile_result.resolvedspec,
+            expectile_result.adaptive_diagnostics,
+            expectile_result.wiggle_knots.map(|knots| knots.to_vec()),
+            expectile_result.wiggle_degree,
+            expectile_result.wiggle_saved_warp_beta,
+        )?;
+        payload.group_metadata = fit_config.group_metadata.clone();
+        payload.training_table_kind = training_table_kind;
+        // The LAWS driver materializes its inner Gaussian design itself; there are
+        // no outer materialize advisories to carry (matches `fit_from_formula`).
+        payload.inference_notes = Vec::new();
+        let model = FittedModel::from_payload(payload);
+        return serde_json::to_vec(&model).map_err(|err| {
+            gam::families::fit_orchestration::WorkflowError::IntegrationFailed {
+                reason: format!("failed to serialize model: {err}"),
+            }
+        });
+    }
     // Calibrated marginal-slope chain (#461): when a CTN Stage-1 recipe is present
     // (config.ctn_stage1), the marginal-slope materializer cross-fits the CTN and
     // produces the calibrated `z` out-of-fold — no z_column is needed and no

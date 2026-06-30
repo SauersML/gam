@@ -167,7 +167,7 @@ pub(crate) use gam::families::fit_orchestration::{
     DispersionLocationScaleFitRequest, FitConfig, FitRequest, FitResult,
     GaussianLocationScaleFitRequest, LatentBinaryFitRequest, LatentSurvivalFitRequest,
     LinkWiggleConfig, PreparedSurvivalTimeStack, StandardBinomialWiggleConfig, StandardFitRequest,
-    SurvivalLocationScaleFitRequest, SurvivalMarginalSlopeFitRequest,
+    StandardFitResult, SurvivalLocationScaleFitRequest, SurvivalMarginalSlopeFitRequest,
     SurvivalTransformationFitRequest, SurvivalTransformationTermSpec,
     TransformationNormalFitRequest, WorkflowError, fit_model, prepare_survival_time_stack,
     residual_cascade_fast_path, resolve_offset_column, resolve_weight_column,
