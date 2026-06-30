@@ -149,6 +149,75 @@ fn fit_and_predict(
     pred.mean.to_vec()
 }
 
+/// Diagnostic: print per-term λ̂ and EDF for the 4-smooth additive fit.
+#[test]
+fn diag_near_collinear_lambdas_edf() {
+    // Sweep basis size to isolate the basis-dimension effect.
+    let test_pts = gen_data(600, 99).1;
+    let mk = |k: Option<usize>| match k {
+        None => "y ~ smooth(x1)+smooth(x2)+smooth(x3)+smooth(x4)".to_string(),
+        Some(k) => format!(
+            "y ~ smooth(x1,k={k})+smooth(x2,k={k})+smooth(x3,k={k})+smooth(x4,k={k})"
+        ),
+    };
+    for kopt in [None, Some(8usize), Some(10), Some(12), Some(15), Some(20)] {
+        let formula = mk(kopt);
+        let formula = formula.as_str();
+        let mut sum = 0.0;
+        eprintln!("=== k={kopt:?} ===");
+        for seed in [0u64, 1, 2, 3] {
+            let (train, _pts) = gen_data(120, seed);
+            let pred = fit_and_predict_formula(formula, &train, &test_pts);
+            let rmse = truth_rmse(&pred, &test_pts);
+            sum += rmse;
+            eprintln!("       seed={seed} truth-RMSE={rmse:.4}");
+        }
+        eprintln!("=== k={kopt:?} MEAN truth-RMSE={:.4} ===", sum / 4.0);
+    }
+}
+
+/// Same as `fit_and_predict` but with a caller-supplied formula.
+fn fit_and_predict_formula(
+    formula: &str,
+    data: &gam::data::EncodedDataset,
+    pts: &[RowPoint],
+) -> Vec<f64> {
+    let cfg = FitConfig::default();
+    let FitResult::Standard(fit) =
+        fit_from_formula(formula, data, &cfg).expect("standard additive GAM fit")
+    else {
+        panic!("expected a standard Gaussian GAM fit");
+    };
+    let idx = |name: &str| {
+        data.headers
+            .iter()
+            .position(|h| h == name)
+            .unwrap_or_else(|| panic!("{name} column"))
+    };
+    let (i1, i2, i3, i4) = (idx("x1"), idx("x2"), idx("x3"), idx("x4"));
+    let hlen = data.headers.len();
+    let m = pts.len();
+    let mut grid = Array2::<f64>::zeros((m, hlen));
+    for (r, &(x1, x2, x3, x4, _)) in pts.iter().enumerate() {
+        grid[[r, i1]] = x1;
+        grid[[r, i2]] = x2;
+        grid[[r, i3]] = x3;
+        grid[[r, i4]] = x4;
+    }
+    let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
+        .expect("rebuild design");
+    let dense = design.design.to_dense();
+    let family = LikelihoodSpec::new(
+        ResponseFamily::Gaussian,
+        InverseLink::Standard(StandardLink::Identity),
+    );
+    let offset = Array1::<f64>::zeros(m);
+    predict_gam(dense, fit.fit.beta.view(), offset.view(), family)
+        .expect("predict")
+        .mean
+        .to_vec()
+}
+
 fn truth_rmse(pred: &[f64], pts: &[RowPoint]) -> f64 {
     let n = pred.len();
     let sse: f64 = pred
