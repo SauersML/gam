@@ -37,3 +37,14 @@ Newton loop but STILL runs the #1026 post-loop decoder-LSQ polish (3544-3584) wh
 construction.rs:6264 ("left the seed untouched") is false.
 Fix: honor the inner_max_iter==0 freeze contract end-to-end.
 Branch stacked on agent/reopen-932 (main does not build without #1652).
+
+## #901 — projected-logdet REML gradient (re-home orphaned FD gate)
+Fix commit 7a5bfd9b2 exists (intrinsic pseudo-logdet over range(H_pen)). But the
+END-TO-END iso_kappa FD oracles on real Duchon/Matérn smooths — the headline #901
+reproduction — were orphaned out of the build by #1601 (deps live in gam-models
+drivers post-#1521 carve, not gam_terms::smooth where the include! was commented).
+Re-homed into crates/gam-models/.../drivers/iso_kappa_reml_gradient_fd_tests.rs.
+Result: 6/8 pass — ρ grads match FD to 1e-7..1e-5 (NO sign flip), ψ grads to
+1e-3..3e-3 (NO 1e5 blow-up). The issue's an=-7.72e5/fd=+4.0 catastrophe is GONE.
+Open: iso_kappa_duchon_n_smaller_fd (n=20) at worst_psi_rel=7.69e-3 vs tol 5e-3.
+Under investigation: FD conditioning at small n vs residual ψ-grad inaccuracy.
