@@ -1693,7 +1693,6 @@ fn arc_cost_stall_guard_uses_cached_initial_sample_as_feasible_best() {
 #[test]
 fn bfgs_bridge_halts_infeasible_probe_run_back_to_cached_seed() {
     let seed = array![0.0];
-    let trial = array![1.0];
     let problem = OuterProblem::new(1).with_gradient(Derivative::Analytic);
     let mut obj = problem.build_objective_with_eval_order(
         (),
@@ -1726,8 +1725,16 @@ fn bfgs_bridge_halts_infeasible_probe_run_back_to_cached_seed() {
         consecutive_probe_refusals: 0,
     };
 
+    // A real BFGS line search probes a *sequence of distinct* trial ρ along its
+    // search direction, not one point repeated. The bridge caches each probed ρ
+    // bit-exactly (`value_probe_cache`/`same_outer_point`) and short-circuits an
+    // exact repeat WITHOUT re-entering the cost-stall guard — so re-probing a
+    // single fixed ρ would only ever register ONE infeasible observation and the
+    // streak could never fill the window. Walk distinct points (1.0, 2.0, …) so
+    // each probe is a fresh guard observation, exactly as the line search does.
     let mut sentinel_fired = false;
-    for _ in 0..(COST_STALL_WINDOW + 2) {
+    for i in 0..(COST_STALL_WINDOW + 2) {
+        let trial = array![1.0 + i as f64];
         match ZerothOrderObjective::eval_cost(&mut bridge, &trial) {
             Ok(cost) => panic!("infeasible probe unexpectedly returned finite cost {cost}"),
             Err(ObjectiveEvalError::Fatal { message }) => {
@@ -3417,10 +3424,22 @@ fn run_screening_reorders_expensive_generated_seeds_before_full_startup_eval() {
         .run(&mut obj, "screening should reorder expensive seeds")
         .expect("screened startup should reach the best generated seed");
     assert_eq!(result.rho, valid_seed);
+    let started_snapshot: Vec<Array1<f64>> = started.lock().unwrap().clone();
+    // The interior-extreme promotion (#1074/#1373/#1426) reserves slot 0 for the
+    // most-flexible interior seed and slot 1 for the heaviest, so screening's
+    // cost rank resumes at slot 2. (This promotion runs INSIDE
+    // `rank_seeds_with_screening`, so its footprint at slots 0/1 — here the
+    // generator's `[0.0]` and `[12.0]`, NOT the raw generator-first `[1.0]` — is
+    // itself proof that screening ran.) The lowest-cost generated seed must lead
+    // that reorderable tail: screening moved it ahead of the other equal-or-
+    // higher-cost seeds it is allowed to reorder, exactly as the original "front"
+    // assertion intended before the promotion reserved the first two slots.
     assert_eq!(
-        started.lock().unwrap().first().cloned(),
+        started_snapshot.get(2).cloned(),
         Some(valid_seed),
-        "screening should move the lowest-cost seed to the front before full startup eval",
+        "screening should rank the lowest-cost seed at the head of the reorderable \
+         tail (slots 0/1 are reserved for the promoted flexible/heaviest seeds); \
+         started order was {started_snapshot:?}",
     );
     assert_eq!(screening_cap.load(std::sync::atomic::Ordering::Relaxed), 0);
 }
@@ -3430,7 +3449,16 @@ fn initial_rho_with_single_seed_budget_skips_expensive_screening() {
     let mut seed_config = gam_problem::SeedConfig::default();
     seed_config.max_seeds = 4;
     seed_config.seed_budget = 1;
-    seed_config.risk_profile = gam_problem::SeedRiskProfile::GeneralizedLinear;
+    // This test asserts the `initial_rho + seed_budget==1` screening-skip
+    // (`explicit_initial_rho_owns_single_seed_budget`) fires. That skip keys off
+    // the EFFECTIVE budget, not the requested one. `effective_seed_budget` floors
+    // `(Arc, GeneralizedLinear)` to 2 (#1074/#1426 — a GLM needs ≥2 seeds to also
+    // reach the heavily-penalized basin), so a GeneralizedLinear fixture would
+    // have effective budget 2, the `seed_budget == 1` skip guard would be false,
+    // and screening would run (the observed 5 screening solves). Pin the fixture
+    // to Gaussian, whose effective budget equals the requested 1, so the skip is
+    // genuinely exercised — the behaviour this test is meant to guard.
+    seed_config.risk_profile = gam_problem::SeedRiskProfile::Gaussian;
     let screening_cap = Arc::new(AtomicUsize::new(0));
     let screening_calls = Arc::new(AtomicUsize::new(0));
     let initial_seed = array![9.0];
@@ -3548,10 +3576,19 @@ fn run_screening_reorders_bfgs_seeds_before_full_startup_eval() {
         .expect("screened BFGS startup should reach the best generated seed");
     assert_eq!(result.plan_used.solver, Solver::Bfgs);
     assert_eq!(result.rho, valid_seed);
+    let started_snapshot: Vec<Array1<f64>> = started.lock().unwrap().clone();
+    // As in the analytic-gradient sibling test: the interior-extreme promotion
+    // (#1074/#1373/#1426) reserves slot 0 (most-flexible interior seed) and slot 1
+    // (heaviest interior seed — here the screened-in initial ρ=9.0), so screening's
+    // cost rank resumes at slot 2. The lowest-cost generated seed must lead that
+    // reorderable tail — screening moved it ahead of every other equal-or-higher-
+    // cost seed it is allowed to reorder.
     assert_eq!(
-        started.lock().unwrap().first().cloned(),
+        started_snapshot.get(2).cloned(),
         Some(valid_seed),
-        "BFGS screening should move the lowest-cost seed to the front before full startup eval",
+        "BFGS screening should rank the lowest-cost seed at the head of the \
+         reorderable tail (slots 0/1 are reserved for the promoted flexible/heaviest \
+         seeds); started order was {started_snapshot:?}",
     );
     assert!(
         screening_calls.load(Ordering::Relaxed) > 1,
@@ -4591,13 +4628,23 @@ fn cached_rho_is_prepended_as_first_seed() {
             seen.lock().unwrap().push(theta.clone());
             Ok((theta[0] - 2.5).powi(2))
         },
-        |_: &mut Arc<Mutex<Vec<Array1<f64>>>>, theta: &Array1<f64>| {
-            Ok(OuterEval {
-                cost: (theta[0] - 2.5).powi(2),
-                gradient: array![2.0 * (theta[0] - 2.5)],
-                hessian: HessianResult::Unavailable,
-                inner_beta_hint: None,
-            })
+        {
+            let seen = seen.clone();
+            move |_: &mut Arc<Mutex<Vec<Array1<f64>>>>, theta: &Array1<f64>| {
+                // Record full-eval points too: startup now performs a DIRECT full
+                // evaluation at the seed (the `run_starts_solver_with_direct_startup_eval`
+                // contract) routed through THIS eval path, not a separate cost-screening
+                // pass. The cached rho is consumed by that startup eval, so a recorder
+                // that watched only the cost closure never saw the exact cached ρ — it
+                // only caught the later line-search cost probes clustered near it.
+                seen.lock().unwrap().push(theta.clone());
+                Ok(OuterEval {
+                    cost: (theta[0] - 2.5).powi(2),
+                    gradient: array![2.0 * (theta[0] - 2.5)],
+                    hessian: HessianResult::Unavailable,
+                    inner_beta_hint: None,
+                })
+            }
         },
         None::<fn(&mut Arc<Mutex<Vec<Array1<f64>>>>)>,
         None::<
