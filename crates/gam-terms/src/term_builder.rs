@@ -1913,15 +1913,17 @@ pub fn build_smooth_basis(
             // degrees of freedom on: the wrap constraint removes the ordinary
             // boundary wiggle, and the cyclic second-difference penalty leaves
             // only the constant direction (handled by the smooth
-            // identifiability constraint).  Reusing the open-spline default
-            // ceiling (often 20 internal knots, i.e. 24 cyclic coefficients)
-            // gives small binomial/continuation-ratio fits a large penalized
-            // nuisance space whose REML/LAML optimum is driven by finite-sample
-            // Bernoulli noise rather than the low-frequency periodic signal.
-            // Match the mgcv `bs="cc"` spirit: default to a modest cyclic
-            // basis unless the caller explicitly requests `k=...`; high-
-            // frequency periodic structure remains available through that
-            // explicit contract.
+            // identifiability constraint).  An over-rich default would give
+            // small binomial/continuation-ratio fits a large penalized nuisance
+            // space whose REML/LAML optimum is driven by finite-sample Bernoulli
+            // noise rather than the low-frequency periodic signal.  Cap the
+            // cyclic default in the mgcv `bs="cc"` spirit: a modest basis unless
+            // the caller explicitly requests `k=...`; high-frequency periodic
+            // structure remains available through that explicit contract.  Since
+            // gam#1680 lowered the open-spline univariate default to ≈12
+            // functions this cap and the open-spline default coincide, so it now
+            // acts as an explicit floor/guard that keeps the cyclic default lean
+            // even if the open-spline heuristic is later widened.
             let cyclic_default_basis_cap = CYCLIC_DEFAULT_BASIS_DIM.max(degree + 1);
             let default_basis = (default_internal + degree + 1).min(cyclic_default_basis_cap);
             let num_basis = option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"])
@@ -3593,12 +3595,13 @@ pub fn heuristic_knots_for_column(col: ArrayView1<'_, f64>) -> usize {
 /// Per-margin basis sizes for a tensor-product smooth (`te`/`ti`/`t2`).
 ///
 /// The 1-D heuristic [`heuristic_knots_for_column`] is calibrated for an
-/// *additive* margin: a column with ~80 unique values asks for ~20 basis
-/// functions, which is sensible for a single `s(x)` term (≈20 coefficients).
+/// *additive* margin: a well-resolved column asks for the lean univariate
+/// default (≈12 basis functions, the mgcv-like cap of 8 internal knots; see
+/// gam#1680), which is sensible for a single `s(x)` term.
 /// A tensor product, however, multiplies the per-margin sizes:
 /// `p = ∏_d k_d`. Reusing the 1-D rule per margin makes `p` explode with the
-/// tensor dimension — a 3-D `te(x,y,z)` at the 1-D ceiling of 20/margin is
-/// `20³ = 8000` columns, and every REML evaluation pays an O(p³) dense
+/// tensor dimension — a 3-D `te(x,y,z)` at the 1-D ceiling of 12/margin is
+/// `12³ ≈ 1728` columns, and every REML evaluation pays an O(p³) dense
 /// penalty reparameterization (the full-tensor sum-to-zero constraint is not
 /// Kronecker-factorable), turning model selection over tensor candidates into
 /// a multi-minute single-threaded stall (gam#813). It also requests far more
