@@ -5178,6 +5178,28 @@ fn resolve_duchon_hybrid_config(
     max_op: usize,
 ) -> PyResult<DuchonHybridConfig> {
     let requested_nullspace = parse_nullspace_order(nullspace_order)?;
+    // Pure, auto-power requests (no `length_scale`, no explicit `power`) resolve
+    // via the SAME cubic structural default the formula/CLI front-ends use
+    // (`duchon_cubic_default`): an affine (`Linear`) null space plus the
+    // fractional spectral power `s = (d-1)/2`, i.e. the r³ Duchon kernel in every
+    // dimension. This is what keeps the kernel admissible — `2(p+s) = d+1 > d`
+    // with only the `d+1` affine columns — and, crucially, robust to the
+    // center-count-driven null-space degradation that the integer-power operator
+    // resolver below cannot survive: that path escalates the null space to absorb
+    // the pure-mode CPD order at an *integer* `s` (e.g. d=2 ⇒ `Degree(2)`, six
+    // polynomial columns, `s=0`), but on sparse centers the escalated polynomial
+    // block degrades back down while `s` stays put, leaving `2(p+s) ≤ d` and an
+    // inadmissible kernel (gam#880). The integer-power resolver is reserved for
+    // an explicit `power` or the hybrid Matérn-blended kernel (`length_scale`),
+    // whose partial-fraction spectrum is only defined for integer `s`.
+    if length_scale.is_none() && explicit_power.is_none() {
+        let (nullspace_order, power) = duchon_cubic_default(dim);
+        return Ok(DuchonHybridConfig {
+            length_scale,
+            nullspace_order,
+            power,
+        });
+    }
     let (resolved_nullspace, auto_power) =
         resolve_duchon_orders(dim, requested_nullspace, max_op, length_scale);
     let power = explicit_power.unwrap_or(auto_power as f64);
