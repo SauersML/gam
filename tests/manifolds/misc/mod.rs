@@ -2,6 +2,7 @@ mod equivariant_lie_atom;
 mod geodesic_small_step_matches_exp_to_second_order;
 mod layer_transport_functorial;
 mod product_retraction_matches_componentwise;
+mod so3_rep_jvp_right_jacobian_388;
 mod spd_retraction_preserves_positive_definiteness;
 mod spherical_wahba_spectrum;
 mod stiefel_exp_map_vjp;
