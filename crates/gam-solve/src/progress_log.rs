@@ -134,9 +134,10 @@ const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::Warn;
 /// insensitive). An unset or unrecognized value yields the default, so a typo
 /// never silently turns logging fully off or on.
 fn resolve_log_level() -> LevelFilter {
-    let gam_log = std::env::var("GAM_LOG").ok();
-    let rust_log = std::env::var("RUST_LOG").ok();
-    log_level_from_overrides(gam_log.as_deref(), rust_log.as_deref())
+    // Reading env vars in non-test src is banned by build.rs (no env-var gates),
+    // so the active level is the compile-time default. The precedence helper is
+    // retained (and unit-tested) for callers that pass explicit overrides.
+    log_level_from_overrides(None, None)
 }
 
 /// Parse one verbosity spelling into a [`LevelFilter`]. Case-insensitive,
