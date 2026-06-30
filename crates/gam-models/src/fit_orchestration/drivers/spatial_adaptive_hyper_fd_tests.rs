@@ -171,10 +171,10 @@ mod spatial_adaptive_hyper_fd_tests {
         // hence the largest residual ∂F/∂β at a partial solve). Drive the inner
         // solve to f64-grade stationarity so the FD reference is exact.
         let outer_opts = BlockwiseFitOptions {
-            inner_max_cycles: 200,
-            inner_tol: 1e-10,
+            inner_max_cycles: 400,
+            inner_tol: 1e-12,
             outer_max_iter: 30,
-            outer_tol: 1e-10,
+            outer_tol: 1e-12,
             compute_covariance: false,
             ..BlockwiseFitOptions::default()
         };
