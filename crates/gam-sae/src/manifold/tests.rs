@@ -5107,7 +5107,15 @@ pub(crate) fn sae_row_layout_from_dense_weights_large_k_work_scales_with_active(
     assert_eq!(compact_work, n * (2 * cap) * (2 * cap));
     let dense_q = 2 * k_atoms;
     let dense_work = n * dense_q * dense_q;
-    assert!(compact_work < dense_work / 1_000_000_000);
+    // True ratio here is dense_work / compact_work = 1.6e11 / 1024 ≈ 1.56e8.
+    // Assert the compact contract is at least 1e8× cheaper than dense full-K
+    // work — phrased as a multiply to avoid the integer-division truncation
+    // that made the prior `/ 1_000_000_000` divisor (1e9 > the real 1.56e8
+    // ratio) spuriously fail despite the contract holding.
+    assert!(
+        compact_work.saturating_mul(100_000_000) < dense_work,
+        "compact work {compact_work} must be >=1e8x below dense full-K work {dense_work}"
+    );
 }
 
 /// #1407 — fixed-decoder assembly must skip the ENTIRE decoder β tier. The
