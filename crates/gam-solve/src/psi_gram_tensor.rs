@@ -532,6 +532,20 @@ impl PsiGramTensor {
     /// it isolates exactly the subspace identity the skip needs, not an arbitrary
     /// eigenvector rotation). Returns `None` if the Gram is non-finite or its
     /// symmetric eigendecomposition fails.
+    /// (λ_min, λ_max) of the assembled Gram at `psi` — #1033 diagnostic only.
+    fn gram_eigs_brief(&self, psi: f64) -> Option<(f64, f64)> {
+        use gam_linalg::faer_ndarray::FaerEigh;
+        let g = self.gram_at(psi);
+        if g.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
+        let gsym = 0.5 * (&g + &g.t());
+        let (evals, _) = gsym.eigh(faer::Side::Lower).ok()?;
+        let lmin = evals.iter().cloned().fold(f64::INFINITY, f64::min);
+        let lmax = evals.iter().cloned().fold(0.0_f64, f64::max);
+        Some((lmin, lmax))
+    }
+
     fn range_projector(&self, psi: f64, rank_rtol: f64) -> Option<(Array2<f64>, usize)> {
         use gam_linalg::faer_ndarray::FaerEigh;
         let g = self.gram_at(psi);
@@ -616,6 +630,22 @@ impl PsiGramTensor {
         let Some((p_new, r_new)) = self.range_projector(psi_new, PSI_GRAM_SKIP_RANK_RTOL) else {
             return false;
         };
+        if log::log_enabled!(log::Level::Info) {
+            let dist = subspace_spectral_distance(&(&p_ref - &p_new));
+            let verdict = r_ref == r_new
+                && dist.map(|d| d <= PSI_GRAM_SKIP_PROJ_ATOL).unwrap_or(false);
+            log::info!(
+                "[NFREE-RESET basis] psi_ref={psi_ref:.6} psi_new={psi_new:.6} \
+                 r_ref={r_ref} r_new={r_new} k={} subspace_dist={:?} atol={:.1e} \
+                 rank_rtol={:.1e} verdict={verdict} eig_ref={:?} eig_new={:?}",
+                self.k,
+                dist,
+                PSI_GRAM_SKIP_PROJ_ATOL,
+                PSI_GRAM_SKIP_RANK_RTOL,
+                self.gram_eigs_brief(psi_ref),
+                self.gram_eigs_brief(psi_new),
+            );
+        }
         if r_ref != r_new {
             return false;
         }
@@ -642,9 +672,72 @@ impl PsiGramTensor {
             .unwrap_or(false)
     }
 
+    /// Numerical rank of the conditioned Gram `XᵀWX(ψ)` at `psi`, under the same
+    /// relative cutoff (`PSI_GRAM_SKIP_RANK_RTOL`·λ_max) the design-revision skip's
+    /// `reduced_basis_equal` witness uses. Returns `None` for an off-window /
+    /// non-finite / all-zero Gram. Purely k-space (O(k³)) — independent of n.
+    pub fn gram_numerical_rank(&self, psi: f64) -> Option<usize> {
+        if !self.contains(psi) {
+            return None;
+        }
+        self.range_projector(psi, PSI_GRAM_SKIP_RANK_RTOL)
+            .map(|(_, rank)| rank)
+    }
+
+    /// Lowest ψ at or above which the conditioned Gram `XᵀWX(ψ)` holds its MAXIMAL
+    /// numerical rank across the certified window — i.e. the ψ-floor below which
+    /// the design-revision skip's `reduced_basis_equal` witness must refuse (the
+    /// range subspace collapses / rotates as the longest-length-scale radial mode
+    /// drops under the rank cutoff). Restricting the κ-optimizer's lower bound to
+    /// this floor keeps every in-window trial on the n-free fast path and is
+    /// inherently n-INDEPENDENT: the rank is a property of the k×k tensor, not of
+    /// the sample size (#1033).
+    ///
+    /// Scans the window on a fixed k-space grid (no row access), finds the maximal
+    /// rank attained, then returns the smallest ψ such that the rank is maximal at
+    /// EVERY grid node from there to `psi_hi` (so a transient full-rank node inside
+    /// the degenerate band does not lower the floor). Returns `None` when the rank
+    /// is maximal across the whole window already (no floor lift needed) or when
+    /// the Gram never certifies a rank.
+    pub fn rank_stable_psi_floor(&self) -> Option<f64> {
+        // Fixed k-space grid over the window. 64 nodes resolves the rank cliff
+        // (which spans ~1 ψ-decade on production Duchon geometry) far finer than
+        // the optimizer's ~ln2 step, and the whole scan is O(nodes·k³), n-free.
+        const NODES: usize = 64;
+        if !(self.psi_hi > self.psi_lo) {
+            return None;
+        }
+        let span = self.psi_hi - self.psi_lo;
+        let psi_at = |i: usize| self.psi_lo + span * (i as f64) / ((NODES - 1) as f64);
+        let ranks: Vec<Option<usize>> =
+            (0..NODES).map(|i| self.gram_numerical_rank(psi_at(i))).collect();
+        let max_rank = ranks.iter().filter_map(|r| *r).max()?;
+        // Walk DOWN from psi_hi; the floor is the lowest node from which every
+        // higher node is at maximal rank. Stop at the first node that drops below.
+        let mut floor_idx = NODES - 1;
+        for i in (0..NODES).rev() {
+            if ranks[i] == Some(max_rank) {
+                floor_idx = i;
+            } else {
+                break;
+            }
+        }
+        if floor_idx == 0 {
+            // Rank is maximal across the entire window — no lift needed.
+            None
+        } else {
+            Some(psi_at(floor_idx))
+        }
+    }
+
     /// True when `psi` lies inside the certified window.
     pub fn contains(&self, psi: f64) -> bool {
         psi.is_finite() && psi >= self.psi_lo && psi <= self.psi_hi
+    }
+
+    /// The certified value window `[psi_lo, psi_hi]` (#1033 instrumentation).
+    pub fn psi_window(&self) -> (f64, f64) {
+        (self.psi_lo, self.psi_hi)
     }
 
     /// True when `psi` lies inside the certified gradient window where the

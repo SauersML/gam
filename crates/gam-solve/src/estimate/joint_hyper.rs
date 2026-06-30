@@ -538,14 +538,31 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     /// is NOT sufficient — this is the load-bearing #1264 soundness gate.
     pub fn psi_gram_tensor_covers_skip(&self, psi: f64) -> bool {
         let Some(tensor) = self.psi_gram_tensor.as_ref() else {
+            if log::log_enabled!(log::Level::Info) {
+                log::info!("[NFREE-RESET skip] psi={psi:.6} bail=no_tensor");
+            }
             return false;
         };
         if !tensor.contains(psi) {
+            if log::log_enabled!(log::Level::Info) {
+                let (lo, hi) = tensor.psi_window();
+                log::info!(
+                    "[NFREE-RESET skip] psi={psi:.6} bail=psi_off_window window=[{lo:.6},{hi:.6}]"
+                );
+            }
             return false;
         }
         // The pinning ψ must itself be in-window for its reference projector to be
         // a valid comparison point; otherwise refuse (forces the exact slow path).
         let Some(psi_ref) = self.last_reset_psi.filter(|p| tensor.contains(*p)) else {
+            if log::log_enabled!(log::Level::Info) {
+                let (lo, hi) = tensor.psi_window();
+                log::info!(
+                    "[NFREE-RESET skip] psi={psi:.6} bail=no_inwindow_ref \
+                     last_reset_psi={:?} window=[{lo:.6},{hi:.6}]",
+                    self.last_reset_psi,
+                );
+            }
             return false;
         };
         tensor.reduced_basis_equal(psi_ref, psi)
@@ -565,6 +582,26 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
 
     pub fn has_psi_gram_tensor(&self) -> bool {
         self.psi_gram_tensor.is_some()
+    }
+
+    /// The installed tensor's certified value window `[psi_lo, psi_hi]`, if any
+    /// (#1033 instrumentation accessor).
+    pub fn psi_gram_window(&self) -> Option<(f64, f64)> {
+        self.psi_gram_tensor.as_ref().map(|t| t.psi_window())
+    }
+
+    /// Lowest ψ at/above which the installed tensor's conditioned Gram holds its
+    /// maximal numerical rank — the floor below which the design-revision skip's
+    /// `reduced_basis_equal` witness must (soundly) refuse because the reduced
+    /// basis collapses/rotates. `None` when no tensor is installed or the rank is
+    /// already maximal across the whole window. The κ caller lifts the optimizer's
+    /// lower bound to this n-FREE floor so every in-window trial stays on the
+    /// design-realization skip (#1033). See
+    /// [`crate::psi_gram_tensor::PsiGramTensor::rank_stable_psi_floor`].
+    pub fn psi_gram_rank_stable_floor(&self) -> Option<f64> {
+        self.psi_gram_tensor
+            .as_ref()
+            .and_then(|t| t.rank_stable_psi_floor())
     }
 
     /// Return the most-recently converged inner β from the last PIRLS solve, if
@@ -827,6 +864,27 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
                 }
             }
             return Ok(hyper_dirs);
+        }
+
+        if log::log_enabled!(log::Level::Info) {
+            let psi = if theta.len() == rho_dim + 1 {
+                theta[rho_dim]
+            } else {
+                f64::NAN
+            };
+            let (wlo, whi) = self.psi_gram_window().unwrap_or((f64::NAN, f64::NAN));
+            let in_shape = theta.len() == rho_dim + 1;
+            log::info!(
+                "[NFREE-RESET full_eval] psi={psi:.6} window=[{wlo:.6},{whi:.6}] \
+                 covers={} covers_skip={} has_tensor={} theta_len={} rho_dim={rho_dim} \
+                 last_canonical_rev={:?} last_reset_psi={:?}",
+                in_shape && self.psi_gram_tensor_covers(psi),
+                in_shape && self.psi_gram_tensor_covers_skip(psi),
+                self.psi_gram_tensor.is_some(),
+                theta.len(),
+                self.last_canonical_revision,
+                self.last_reset_psi,
+            );
         }
 
         let specs: Vec<PenaltySpec> = s_list.iter().map(PenaltySpec::from_blockwise_ref).collect();
@@ -1146,6 +1204,31 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             .conditioning
             .transform_linear_constraints_to_internal(linear_constraints);
 
+        // #1033 diagnostic: when a cost-only probe MISSES the design-revision
+        // fast path and falls through to the O(n) reset_surface below, log the
+        // exact reason — trial ψ, certified window, value/skip coverage, and the
+        // revision comparison — so the n-scaling regression is attributed to a
+        // concrete cause rather than inferred from aggregate counters.
+        if log::log_enabled!(log::Level::Info) {
+            let psi = if theta.len() == rho_dim + 1 {
+                theta[rho_dim]
+            } else {
+                f64::NAN
+            };
+            let (wlo, whi) = self.psi_gram_window().unwrap_or((f64::NAN, f64::NAN));
+            let in_shape = theta.len() == rho_dim + 1;
+            log::info!(
+                "[NFREE-RESET cost_only] psi={psi:.6} window=[{wlo:.6},{whi:.6}] \
+                 covers={} covers_skip={} has_tensor={} theta_len={} rho_dim={rho_dim} \
+                 design_rev={design_revision:?} last_canonical_rev={:?} last_reset_psi={:?}",
+                in_shape && self.psi_gram_tensor_covers(psi),
+                in_shape && self.psi_gram_tensor_covers_skip(psi),
+                self.psi_gram_tensor.is_some(),
+                theta.len(),
+                self.last_canonical_revision,
+                self.last_reset_psi,
+            );
+        }
         // Cost-only paths do not introduce design drift via hyper_dirs, so
         // the directional-hyper-support check is unnecessary here.
         crate::estimate::reml::RemlState::reset_surface(
