@@ -2827,8 +2827,19 @@ fn run_nonconverged_arc_stays_on_arc_after_budget_retry_ladder() {
     // steps on x^4 contract the gradient by ~3× per attempt, so
     // the halving gate passes and both retries proceed; ARC still
     // cannot reach the optimum in three single-iter attempts.
+    //
+    // The risk profile MUST be `Gaussian` here: `effective_seed_budget`
+    // floors ARC+GeneralizedLinear to 2 (#1074/#1426 — a GLM needs ≥2
+    // seeds to find the heavily-penalized basin), which would defeat the
+    // `seed_budget == 1` screening-skip and let the always-injected neutral
+    // baseline seed `[0.0]` (the EXACT global minimum of x⁴, cost 0) be
+    // screened in and win — ARC would then start already-optimal and report
+    // converged in 0 iters, never exercising the ladder. Gaussian keeps the
+    // effective budget at 1 so `initial_rho = [5.0]` is the sole authoritative
+    // start and the budget-bump retry ladder is genuinely exercised.
     let mut seed_config = gam_problem::SeedConfig::default();
     seed_config.seed_budget = 1;
+    seed_config.risk_profile = gam_problem::SeedRiskProfile::Gaussian;
     let (_d, session) = tmp_cache_session("nonconverged-arc-cache");
     let problem = OuterProblem::new(1)
         .with_gradient(Derivative::Analytic)
@@ -2872,6 +2883,16 @@ fn run_nonconverged_arc_stays_on_arc_after_budget_retry_ladder() {
         !result.converged,
         "test fixture is engineered so the ladder cannot converge; \
              converged=true would mean the fixture stopped exercising the ladder"
+    );
+    // The ladder must have genuinely stepped away from neither the optimum
+    // (rho=0, where x⁴ is stationary) nor stalled at the seed: ARC contracts
+    // toward 0 but cannot reach it in the single-iter budget, so the reported
+    // ρ is strictly between the optimum and the [5.0] start.
+    assert!(
+        result.rho[0].abs() > 1.0e-6 && result.rho[0] < 5.0,
+        "the budget ladder must have made partial progress from the [5.0] seed \
+         toward the x⁴ optimum without reaching it; got rho={:?}",
+        result.rho.to_vec()
     );
 }
 
