@@ -270,14 +270,11 @@ class SurvivalPrediction:
         grid, surface = self._ffi_surface(kind)
         if grid is None or surface is None:
             return None
-        left_value, right_value = _extrapolation_for(kind)
+        left_value, right_value, inf_value = _extrapolation_for(kind)
         if self._should_auto_chunk_dense(surface.shape[0], times_arr.size):
             clip_lo, clip_hi = clip
-            # Thread the asymptotic-extrapolation policy through so the dense
-            # path uses the SAME S(t<=0)/S(t->inf) law as the in-process
-            # `_interpolate_rows` branch below (#1595): a previously-hardcoded
-            # `S(t->inf)=0` in the Rust chunk kernel re-broke S(t)=exp(-H(t))
-            # past the grid for large queries.
+            # The chunked kernel derives its (left, right, inf) policy from
+            # `kind` directly, so it stays in lockstep with the table above.
             return rust_module().survival_chunk_iter_collect(
                 grid,
                 surface,
@@ -297,6 +294,7 @@ class SurvivalPrediction:
             clip=clip,
             left_value=left_value,
             right_value=right_value,
+            inf_value=inf_value,
         )
 
     def _ffi_surface(self, kind: str) -> tuple[Any | None, Any | None]:
@@ -348,7 +346,7 @@ class SurvivalPrediction:
         grid, surface = self._ffi_surface(kind)
         if grid is None or surface is None:
             return None
-        left_value, right_value = _extrapolation_for(kind)
+        left_value, right_value, inf_value = _extrapolation_for(kind)
 
         def block_fn(row_slice: slice, time_slice: slice) -> Any:
             return _interpolate_rows(
@@ -358,6 +356,7 @@ class SurvivalPrediction:
                 clip=clip,
                 left_value=left_value,
                 right_value=right_value,
+                inf_value=inf_value,
             )
 
         return self._surface_chunks(
@@ -791,6 +790,7 @@ def _interpolate_rows(
     clip: tuple[float | None, float | None],
     left_value: float | None = None,
     right_value: float | None = None,
+    inf_value: float | None = None,
 ) -> Any:
     clip_lo, clip_hi = clip
     return rust_module().interpolate_rows(
@@ -800,6 +800,7 @@ def _interpolate_rows(
         clip_lo, clip_hi,
         left_value,
         right_value,
+        inf_value,
     )
 
 
@@ -826,14 +827,24 @@ def _interpolate_rows(
 #
 # Hazard / standard-error surfaces have no canonical asymptote, so they stay on
 # the default nearest-endpoint behavior as well.
+# Each entry is (left_value, right_value, inf_value):
+#   * left_value  -- value for t below the grid (t <= t_min).
+#   * right_value -- value for FINITE t past the top grid node. `None` =>
+#     flat-clamp to the last grid value (the #1595 "no information beyond
+#     support" rule that keeps S(t) = exp(-H(t)) consistent across both views).
+#   * inf_value   -- the genuine t -> +inf asymptote, distinct from the finite
+#     flat-clamp (#965): S(+inf) = 0, H(+inf) = +inf. `None` => nearest endpoint
+#     (hazard / SE surfaces have no canonical asymptote).
 _SURVIVAL_EXTRAPOLATION = {
-    "survival": (1.0, None),
-    "cumulative_hazard": (0.0, None),
+    "survival": (1.0, None, 0.0),
+    "cumulative_hazard": (0.0, None, float("inf")),
 }
 
 
-def _extrapolation_for(kind: str) -> tuple[float | None, float | None]:
-    return _SURVIVAL_EXTRAPOLATION.get(kind, (None, None))
+def _extrapolation_for(
+    kind: str,
+) -> tuple[float | None, float | None, float | None]:
+    return _SURVIVAL_EXTRAPOLATION.get(kind, (None, None, None))
 
 
 __all__ = [
