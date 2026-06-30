@@ -1058,10 +1058,15 @@ fn sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19() {
     let score_m = score_at(theta[1] - 1e-4 * (1.0 + theta[1].abs()));
     let fd_du_raw = (&score_p - &score_m).mapv(|v| v / (2.0 * 1e-4 * (1.0 + theta[1].abs())));
     let du_raw = du_by_eps.mapv(|v| v * d_eps_d_raw);
+    // `du/d(raw ε)` at FIXED η compares an analytic single-row jet channel to a
+    // fixed-η central difference — no PIRLS re-solve, so there is no solver
+    // noise floor. The two agree to ~1e-8; a 1e-5 bound is a meaningful guard
+    // (still ~1000× the observed residual) that would catch a dropped ε-jet
+    // channel without flaking (gam#855).
     gam_test_support::assert_matrix_derivativefd(
         &fd_du_raw.insert_axis(Axis(1)),
         &du_raw.insert_axis(Axis(1)),
-        2e-3,
+        1e-5,
         "sas du / d raw epsilon at fixed eta",
     );
     let rhs = x_t.transpose_vector_multiply(&du_by_eps);
@@ -1139,22 +1144,27 @@ fn sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19() {
     let beta_m = beta_at(theta[1] - fd_h);
     let fd_beta = (&beta_p - &beta_m).mapv(|v| v / (2.0 * fd_h));
 
-    // The two derivative channels feeding this IFT solve — `du/dε` at fixed
-    // η and the score β-Jacobian — are each validated against their own FDs
-    // above / in `sas_true_score_beta_jacobian_matchesfd_at_seed19`. The
-    // composite `dβ/dε = J⁻¹·rhs` is the exact IFT linearization at the
-    // converged β̂, but the FD comparator re-runs PIRLS to convergence at
-    // each perturbed ε, so its `β̂(ε±)` carry the *adaptive* stabilization
-    // ridge, whose magnitude shifts non-smoothly with conditioning across
-    // the ± solves. That solver-only channel (correctly excluded from the
-    // analytic IFT) contaminates the FD by a fixed fraction of the dominant
-    // ~0.22-magnitude component, so a relative bound is the principled
-    // comparison here rather than an absolute one tuned for the small
-    // entries (gam#855).
-    gam_test_support::assert_matrix_derivativefd_rel(
+    // gam#855: the analytic composite `dβ/dε = J⁻¹·rhs` is the exact IFT
+    // linearization at the converged β̂; the FD comparator re-runs PIRLS to
+    // convergence at each perturbed ε. With the ε-derivative channel of the
+    // SAS-reweighted IRLS system fully captured (the original report's missing
+    // channel), the two agree to ~1e-9 here — the well-conditioned n=20 fit
+    // takes NO stabilization ridge (`ridge_used == 0`), so the earlier
+    // "adaptive-ridge contaminates the FD" rationale does not hold and a slack
+    // relative bound would silently re-admit the dropped-channel regression
+    // (its original signature was abs_diff ≈ 3.7e-3). An absolute 1e-5 bar is a
+    // genuine guard: ~1e4× the observed residual yet ~370× tighter than the
+    // original miss, and robust to cross-platform PIRLS-convergence jitter.
+    assert_eq!(
+        pirls_result.ridge_used, 0.0,
+        "well-conditioned n=20 SAS fit must take no stabilization ridge; \
+         a nonzero ridge would mean the IFT Jacobian and the FD re-solve no \
+         longer linearize the same system (gam#855)"
+    );
+    gam_test_support::assert_matrix_derivativefd(
         &fd_beta.insert_axis(Axis(1)),
         &dbeta_exact.insert_axis(Axis(1)),
-        2e-2,
+        1e-5,
         "sas observed-jacobian dbeta / d raw epsilon",
     );
 }
