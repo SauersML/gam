@@ -3289,6 +3289,108 @@ pub(crate) fn sae_structured_system(
     (sys, a_phi, local_jac)
 }
 
+/// #1551 PRODUCTION ENGAGEMENT — end-to-end on a GPU host the SAE Direct inner
+/// solve must run on the DEVICE (`used_device_arrow == true`) and match the CPU
+/// dense reference Newton step. This is the test the issue asked for: it drives
+/// the public production entry `solve_arrow_newton_step_artifacts` with a
+/// device-equipped matrix-free SAE system whose `(n, k, d, cg_iters)` clears the
+/// reduced-Schur offload gate, so on a CUDA box `try_device_arrow_direct_sae_pcg`
+/// engages. On a non-CUDA host it skips cleanly (the seam declines → bit-identical
+/// CPU path); on a CUDA host it FAILS LOUD if the device path does not engage.
+#[test]
+pub(crate) fn sae_direct_inner_solve_engages_device_and_matches_cpu_1551() {
+    // Shape: k = n_atoms·p = 8·8 = 64 ≥ DEVICE_LOOP_MIN_P (32); the work
+    // predicate n·(2·d·k + d²)·cg_iters clears MATVEC_OFFLOAD_FLOPS_MIN by orders
+    // of magnitude (cg_iters defaults to 200). Modest n keeps the CPU reference
+    // and dense parity check cheap.
+    let n = 512usize;
+    let q = 4usize; // per-row latent depth d
+    let p = 8usize;
+    let n_atoms = 8usize;
+    let m_active = 4usize;
+    let (mut sys, _a_phi, _jac) = sae_structured_system(n, q, p, n_atoms, m_active);
+
+    // The fixture ships zero gradients (trivial zero step); install deterministic
+    // nonzero g_t / g_β so the solved Δ is a real, discriminating vector.
+    for (i, row) in sys.rows.iter_mut().enumerate() {
+        for r in 0..q {
+            row.gt[r] = 0.1 * (((i + 1) * (r + 2)) as f64 * 0.013).sin();
+        }
+    }
+    for a in 0..sys.k {
+        sys.gb[a] = 0.05 * ((a as f64 + 1.0) * 0.021).cos() - 0.02;
+    }
+
+    let policy = gam_gpu::policy::GpuDispatchPolicy::default();
+    assert!(
+        policy.reduced_schur_matvec_should_offload(n, sys.k, q, DEFAULT_PCG_MAX_ITERATIONS),
+        "fixture must clear the reduced-Schur offload gate so the device path is eligible"
+    );
+
+    let options = ArrowSolveOptions::direct();
+    let ridge_t = 1e-7;
+    let ridge_beta = 1e-6;
+
+    let artifacts = solve_arrow_newton_step_artifacts(&sys, ridge_t, ridge_beta, &options)
+        .expect("SAE Direct artifacts solve");
+
+    if gam_gpu::device_runtime::GpuRuntime::global().is_none() {
+        // No CUDA device: the seam must have declined and run the CPU path. The
+        // step must NOT be flagged device-served. (Parity below still holds.)
+        assert!(
+            !artifacts.pcg_diagnostics.used_device_arrow,
+            "no CUDA device present, yet the step was flagged device-served"
+        );
+    } else {
+        // CUDA present + the fixture clears the gate ⇒ the production SAE Direct
+        // inner solve MUST have run on the device. A silent CPU fallback here is
+        // exactly the #1551 failure (0% GPU); fail loud.
+        assert!(
+            artifacts.pcg_diagnostics.used_device_arrow,
+            "#1551: CUDA device present and the offload gate cleared, but the SAE \
+             Direct inner solve did NOT engage the device (used_device_arrow=false) \
+             — the device path silently fell back to CPU"
+        );
+    }
+
+    // Parity (holds on every host): the produced Newton step must match the dense
+    // joint-system reference. On a GPU host this is the device==CPU parity gate;
+    // on a CPU host it pins the matrix-free reduced solve to the dense oracle.
+    let reference =
+        crate::gpu_kernels::arrow_schur::solve_arrow_newton_step_dense_reference(
+            &sys, ridge_t, ridge_beta,
+        )
+        .expect("dense reference solve");
+    let db_scale = reference
+        .delta_beta
+        .iter()
+        .fold(0.0_f64, |m, &v| m.max(v.abs()))
+        .max(1.0);
+    let mut max_db_rel = 0.0_f64;
+    for a in 0..sys.k {
+        max_db_rel = max_db_rel.max((artifacts.delta_beta[a] - reference.delta_beta[a]).abs() / db_scale);
+    }
+    assert!(
+        max_db_rel <= 1e-7,
+        "#1551 SAE Direct Δβ parity vs dense reference: max_rel={max_db_rel:e} (>1e-7) \
+         (device-served={})",
+        artifacts.pcg_diagnostics.used_device_arrow
+    );
+    let dt_scale = reference
+        .delta_t
+        .iter()
+        .fold(0.0_f64, |m, &v| m.max(v.abs()))
+        .max(1.0);
+    let mut max_dt_rel = 0.0_f64;
+    for i in 0..artifacts.delta_t.len() {
+        max_dt_rel = max_dt_rel.max((artifacts.delta_t[i] - reference.delta_t[i]).abs() / dt_scale);
+    }
+    assert!(
+        max_dt_rel <= 1e-7,
+        "#1551 SAE Direct Δt parity vs dense reference: max_rel={max_dt_rel:e} (>1e-7)"
+    );
+}
+
 /// The CPU-resident SAE reduced-Schur matvec (#1017) must compute the SAME
 /// `S·x` as the generic per-row `apply → solve → transpose` path, up to f64
 /// reassociation. This is the residency correctness gate: a resident matvec
