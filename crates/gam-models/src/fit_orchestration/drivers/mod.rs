@@ -153,3 +153,9 @@ include!("spatial_length_scale_monotone_tests.rs");
 // relocated, so both guards compiled into NO binary. Self-contained
 // `#[cfg(test)] mod`, so it adds nothing to the non-test build.
 include!("psi_gram_tensor_fast_path_tests.rs");
+// #1601 relocation debt: the #1270/#1033/#1274 Matérn n-free penalty re-key
+// topology gates. Same orphaning story as the #901 siblings above — their
+// `build_term_collection_design` / freeze / incremental-realizer deps live HERE
+// post-carve, but #1601 commented the include! out of `gam_terms::smooth::tests`
+// "for relocation" that never finished. Self-contained `#[cfg(test)] mod`.
+include!("matern_nfree_rekey_topology_tests.rs");
