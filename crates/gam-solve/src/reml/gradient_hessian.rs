@@ -1595,16 +1595,44 @@ impl<'a> RemlState<'a> {
             }
         }
 
+        // K xⱼ, Kᵢ xⱼ and Kᵢⱼ xⱼ depend only on the row j, yet the O(n²)
+        // skewness double loop below recomputed each of them afresh for every
+        // outer row i (and the per-row `hdiag` jet computes the very same
+        // matvecs). For the default-ON binomial/logit Firth path this exact TK
+        // Hessian runs at n up to FIRTH_MAX_OBSERVATIONS (20_000), so that inner
+        // O(p²) matvec, repeated n² times, dominates the whole evaluation.
+        //
+        // Hoist the row-local matvecs once here (n gemvs each), so the diagonal
+        // jet and every (i,j) inner iteration reduce to an O(p) `xᵢ · (K xⱼ)`
+        // dot — turning the dominant term from O(n²·(1+k+k²)·p²) into
+        // O(n²·(1+k+k²)·p) plus an O(n·(1+k+k²)·p²) precompute. This is exact:
+        // each cached vector is the identical `Matrix::dot` matvec the inline
+        // code performed, and the irow-outer / jrow-inner accumulation order is
+        // preserved verbatim, so `total` is assembled bit-for-bit unchanged
+        // (the k=4 determinism oracle covers it) (#1575).
+        let rows: Vec<Array1<f64>> = (0..n).map(|r| x_dense.row(r).to_owned()).collect();
+        let kmat_x: Vec<Array1<f64>> = rows.iter().map(|xr| k_mat.dot(xr)).collect();
+        let ki_x: Vec<Vec<Array1<f64>>> = (0..k)
+            .map(|a| rows.iter().map(|xr| k_i[a].dot(xr)).collect())
+            .collect();
+        let kij_x: Vec<Vec<Vec<Array1<f64>>>> = (0..k)
+            .map(|a| {
+                (0..k)
+                    .map(|b| rows.iter().map(|xr| k_ij[a][b].dot(xr)).collect())
+                    .collect()
+            })
+            .collect();
+
         let mut hdiag = Vec::with_capacity(n);
         for row in 0..n {
-            let x = x_dense.row(row);
-            let mut jet = Jet::constant(x.dot(&k_mat.dot(&x.to_owned())), k);
+            let x = &rows[row];
+            let mut jet = Jet::constant(x.dot(&kmat_x[row]), k);
             for a in 0..k {
-                jet.g[a] = x.dot(&k_i[a].dot(&x.to_owned()));
+                jet.g[a] = x.dot(&ki_x[a][row]);
             }
             for a in 0..k {
                 for b in 0..k {
-                    jet.h[[a, b]] = x.dot(&k_ij[a][b].dot(&x.to_owned()));
+                    jet.h[[a, b]] = x.dot(&kij_x[a][b][row]);
                 }
             }
             hdiag.push(jet);
@@ -1638,16 +1666,18 @@ impl<'a> RemlState<'a> {
             total = total.add(&djet[row].mul(&hdiag[row].square()).scale(-0.125));
         }
         for irow in 0..n {
-            let xi = x_dense.row(irow).to_owned();
+            let xi = &rows[irow];
             for jrow in 0..n {
-                let xj = x_dense.row(jrow).to_owned();
-                let mut kg = Jet::constant(xi.dot(&k_mat.dot(&xj)), k);
+                // K xⱼ, Kᵢ xⱼ, Kᵢⱼ xⱼ are the hoisted row-local matvecs; the
+                // remaining work is the O(p) dot xᵢ · (· xⱼ), evaluated in the
+                // identical irow-outer/jrow-inner order as before (#1575).
+                let mut kg = Jet::constant(xi.dot(&kmat_x[jrow]), k);
                 for a in 0..k {
-                    kg.g[a] = xi.dot(&k_i[a].dot(&xj));
+                    kg.g[a] = xi.dot(&ki_x[a][jrow]);
                 }
                 for a in 0..k {
                     for b in 0..k {
-                        kg.h[[a, b]] = xi.dot(&k_ij[a][b].dot(&xj));
+                        kg.h[[a, b]] = xi.dot(&kij_x[a][b][jrow]);
                     }
                 }
                 let term = cjet[irow]
