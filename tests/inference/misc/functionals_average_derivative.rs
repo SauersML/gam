@@ -102,7 +102,14 @@ fn average_derivative_onestep_corrects_oversmoothed_gaussian_spline() {
     for seed in seeds {
         let (x, y, truth) = draw_sample(seed);
         let (design, derivative_design, penalty) = bspline_design_and_derivative(&x);
-        let (beta, mu, scaled_penalty) = fit_penalized_gaussian(&design, &y, &penalty, 10.0);
+        // λ chosen to put the fit in the *oversmoothed* regime where the plug-in
+        // average derivative is biased toward zero and the one-step correction has
+        // real work to do (see `plugin_violations >= 3` below). The B-spline
+        // roughness penalty is normalized in the constrained frame (#1364/#1365/
+        // #1366), so a literal λ here is far weaker than it was before that
+        // rescale; λ≈1.5e3 reproduces the oversmoothing the original #1261
+        // fixture obtained at the old, un-normalized λ=10.
+        let (beta, mu, scaled_penalty) = fit_penalized_gaussian(&design, &y, &penalty, 1500.0);
         let penalty_beta = penalty_times_beta(scaled_penalty.view(), beta.view());
         let estimate =
             average_derivative_gaussian_identity(&GaussianIdentityAverageDerivativeInput {
