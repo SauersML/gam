@@ -1299,10 +1299,18 @@ fn sae_decoder_lsq_init_produces_nontrivial_seed() {
     let mut z = Array2::<f64>::zeros((n, p));
     for i in 0..n {
         let a = 2.0 * std::f64::consts::PI * (i as f64) / (n as f64);
+        // Every output column is a linear combination of {1, sin a, cos a} —
+        // exactly the column space the 3-column periodic seed basis spans. A
+        // second-harmonic component (sin 2a / cos 2a) is orthogonal to that
+        // basis over the full period and so is unreachable by any decoder built
+        // on it; planting it would cap the achievable R² at the first-harmonic
+        // energy fraction (0.5 here) and the "explain most of the signal"
+        // assertion below could never hold. The seed must be judged on signal
+        // it can actually represent.
         z[[i, 0]] = a.sin();
         z[[i, 1]] = a.cos();
-        z[[i, 2]] = (2.0 * a).sin();
-        z[[i, 3]] = (2.0 * a).cos();
+        z[[i, 2]] = 0.6 * a.sin() - 0.4 * a.cos();
+        z[[i, 3]] = 0.25 + 0.5 * a.cos();
     }
     // Build padded basis_values (K, N, M_max=m).
     let mut basis = Array3::<f64>::zeros((k, n, m));
