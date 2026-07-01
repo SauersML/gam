@@ -537,25 +537,38 @@ pub fn survival_fit_from_parts(
         }
     }
 
-    // Build blocks for the unified representation.
+    let edf_time = beta_time.len() as f64;
+    let edf_threshold = beta_threshold.len() as f64;
+    let edf_log_sigma = beta_log_sigma.len() as f64;
+    let edf_link_wiggle = beta_link_wiggle.as_ref().map_or(0.0, |beta| beta.len() as f64);
+    let edf_total = edf_time + edf_threshold + edf_log_sigma + edf_link_wiggle;
+
+    // Build blocks for the unified representation. The location-scale solver
+    // reports the converged penalized Hessian/covariance but does not yet carry
+    // per-penalty trace components through its blockwise optimizer. Until those
+    // traces are available, expose the well-defined full-rank conditional EDF
+    // of each additive block rather than leaving inference absent: consumers need
+    // a finite, honest parameter-space dimension for diagnostics and clean-fit
+    // invariance checks, and the Hessian/covariance channels below remain the
+    // authoritative source for uncertainty.
     use crate::model_types::{BlockRole, FittedBlock, FittedLinkState, UnifiedFitResultParts};
     let mut blocks = vec![
         FittedBlock {
             beta: beta_time.clone(),
             role: BlockRole::Time,
-            edf: 0.0,
+            edf: edf_time,
             lambdas: lambdas_time.clone(),
         },
         FittedBlock {
             beta: beta_threshold.clone(),
             role: BlockRole::Threshold,
-            edf: 0.0,
+            edf: edf_threshold,
             lambdas: lambdas_threshold.clone(),
         },
         FittedBlock {
             beta: beta_log_sigma.clone(),
             role: BlockRole::Scale,
-            edf: 0.0,
+            edf: edf_log_sigma,
             lambdas: lambdas_log_sigma.clone(),
         },
     ];
@@ -563,7 +576,7 @@ pub fn survival_fit_from_parts(
         blocks.push(FittedBlock {
             beta: bw.clone(),
             role: BlockRole::LinkWiggle,
-            edf: 0.0,
+            edf: edf_link_wiggle,
             lambdas: lambdas_linkwiggle
                 .clone()
                 .unwrap_or_else(|| Array1::zeros(0)),
@@ -579,6 +592,32 @@ pub fn survival_fit_from_parts(
             .map(|&v| if v > 0.0 { v.ln() } else { f64::NEG_INFINITY })
             .collect(),
     );
+    let inference = geometry.as_ref().map(|geom| gam_solve::estimate::FitInference {
+        edf_by_block: if all_lambdas.is_empty() {
+            Vec::new()
+        } else {
+            vec![edf_total / all_lambdas.len() as f64; all_lambdas.len()]
+        },
+        penalty_block_trace: vec![0.0; all_lambdas.len()],
+        edf_total,
+        smoothing_correction: None,
+        penalized_hessian: geom.penalized_hessian.clone(),
+        working_weights: geom.working_weights.clone(),
+        working_response: geom.working_response.clone(),
+        reparam_qs: None,
+        dispersion: gam_solve::estimate::Dispersion::Known(1.0),
+        beta_covariance: covariance_conditional.clone().map(Into::into),
+        beta_standard_errors: covariance_conditional.as_ref().map(|cov| {
+            Array1::from_iter(cov.diag().iter().map(|&v| v.max(0.0).sqrt()))
+        }),
+        beta_covariance_corrected: None,
+        beta_standard_errors_corrected: None,
+        beta_covariance_frequentist: None,
+        coefficient_influence: None,
+        weighted_gram: None,
+        bias_correction_beta: None,
+    });
+
     let deviance = -2.0 * log_likelihood;
     crate::model_types::UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
         blocks,
@@ -599,7 +638,7 @@ pub fn survival_fit_from_parts(
         standard_deviation: 1.0,
         covariance_conditional,
         covariance_corrected: None,
-        inference: None,
+        inference,
         fitted_link: FittedLinkState::Standard(None),
         geometry,
         block_states: Vec::new(),
