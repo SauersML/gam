@@ -342,22 +342,28 @@ fn recon_amp1(dev: &EncodeAtomDevice, phi: &[f64], out: &mut [f64]) {
     }
 }
 
+/// Evaluated basis buffers at a point `t`: value `Φ`, first jet `∂Φ`, and the
+/// second jet `∂²Φ`. Bundled so [`encode_grad_hess`] takes them as one argument.
+struct EvaluatedBasis<'a> {
+    phi: &'a [f64],
+    jet: &'a [f64],
+    hess: &'a [f64],
+}
+
 /// Gradient `g` and FULL Hessian `H` (+ ridge) of the encode objective at `t`.
 /// Mirror of [`crate::encode::encode_grad_hess`]:
 ///   `g[a] = Jₘ[a]·r`,  `H[a,b] = Jₘ[a]·Jₘ[b] + z·Σ ∂²Φ·(r·B) + ridge·δ_ab`,
 /// with `m = z·BᵀΦ`, `r = m − x`, `Jₘ = z·BᵀJ_Φ`. For the monomial family the
 /// second jet always exists, so this never returns "no certificate".
-#[allow(clippy::too_many_arguments)]
 fn encode_grad_hess(
     dev: &EncodeAtomDevice,
     x: &[f64],
     amplitude: f64,
-    phi: &[f64],
-    jet: &[f64],
-    hess: &[f64],
+    be: &EvaluatedBasis<'_>,
     g: &mut [f64],
     h: &mut [f64],
 ) {
+    let (phi, jet, hess) = (be.phi, be.jet, be.hess);
     let (d, m, p) = (dev.d, dev.m, dev.p);
     // recon m(t) = z·BᵀΦ ; residual r = m − x
     let mut recon = vec![0.0_f64; p];
@@ -537,7 +543,6 @@ fn beta_eta_newton(h: &[f64], g: &[f64], d: usize) -> Option<(f64, f64, Vec<f64>
 }
 
 /// Certificate + Newton step at `t`. Mirror of [`crate::encode::row_certificate`].
-#[allow(clippy::too_many_arguments)]
 fn row_certificate(
     dev: &EncodeAtomDevice,
     t: &[f64],
@@ -552,9 +557,11 @@ fn row_certificate(
         dev,
         x,
         amplitude,
-        &scratch.phi,
-        &scratch.jet,
-        &scratch.hess,
+        &EvaluatedBasis {
+            phi: &scratch.phi,
+            jet: &scratch.jet,
+            hess: &scratch.hess,
+        },
         &mut scratch.g,
         &mut scratch.h,
     );
@@ -1267,16 +1274,10 @@ mod device {
         for row in 0..n {
             let coord = coords[row * d..(row + 1) * d].to_vec();
             let hv = h[row];
-            let cert = DeviceRowCertificate {
-                beta: f64::NAN, // beta/eta not transported; the h+certified flag is the contract
-                eta: f64::NAN,
-                lipschitz: f64::NAN,
-                h: hv,
-            };
-            let _ = cert;
             out.push(DeviceEncodeRow {
                 coord,
                 cert: DeviceRowCertificate {
+                    // beta/eta not transported; the h + certified flag is the contract.
                     beta: f64::NAN,
                     eta: f64::NAN,
                     lipschitz: f64::NAN,
