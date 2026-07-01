@@ -8,13 +8,16 @@ pub(crate) fn blockwise_options_from_fit_args()
 
 pub(crate) fn compact_fit_result_for_batch(fit: &mut UnifiedFitResult) {
     if let Some(inf) = fit.inference.as_mut() {
-        // Keep working_weights/response on inference too — `diagnose --alo`
-        // and other post-fit diagnostics consume them; clearing here zeroed
-        // out the ALO geometry path entirely (failing with
-        // "ALO diagnostics require hessian_weights length N; got 0").
-        // reparam_qs is genuinely large (p × p) and not needed at predict
-        // time, so still drop it.
+        // Batch-saved models are prediction artifacts. Drop row-sized working
+        // vectors from both persisted geometry carriers together so the
+        // UnifiedFitResult invariants remain synchronized after compaction.
+        inf.working_weights = Array1::zeros(0);
+        inf.working_response = Array1::zeros(0);
         inf.reparam_qs = None;
+    }
+    if let Some(geom) = fit.geometry.as_mut() {
+        geom.working_weights = Array1::zeros(0);
+        geom.working_response = Array1::zeros(0);
     }
     fit.artifacts = gam::estimate::FitArtifacts {
         pirls: None,
