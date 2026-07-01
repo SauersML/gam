@@ -1548,6 +1548,79 @@ where
                             improved = true;
                         }
                     }
+                    // CURVATURE-ONLY cleanup for supported null-space signals
+                    // (#1859).  The whole-term shrink-out above is deliberately
+                    // rejected when the smooth's penalty null space is supported
+                    // by the data (for example a genuine linear trend): raising
+                    // the null-space ridge would kill real signal.  But the
+                    // Marra-Wood `select=TRUE` decomposition still gives REML an
+                    // independent, legitimate move: raise only the primary
+                    // wiggliness penalty, leaving the supported null-space
+                    // coordinate free.  Without this post-pass the symmetric
+                    // degeneracy prior on the null-space coordinate can leave the
+                    // primary λ at a too-low compromise, so the fitted B-spline
+                    // spends extra curved EDF on data that are already explained
+                    // by the null-space slope.  Accept this move under the same
+                    // objective discipline as the shrink-out escape — cold
+                    // confirmed pure-REML improvement and no total-EDF increase
+                    // — so genuinely nonlinear smooths are untouched.
+                    for group in &groups {
+                        let primary_coords: Vec<usize> = group
+                            .iter()
+                            .copied()
+                            .filter(|i| !select_coords.contains(i))
+                            .collect();
+                        if primary_coords.is_empty() {
+                            continue;
+                        }
+                        let mut group_best: Option<(Array1<f64>, f64)> = None;
+                        for &lvl in &SHRINK_BAND {
+                            let mut probe = best_rho.clone();
+                            let mut raised = false;
+                            for &i in &primary_coords {
+                                if lvl > probe[i] + 1e-9 {
+                                    probe[i] = lvl;
+                                    raised = true;
+                                }
+                            }
+                            if !raised {
+                                continue;
+                            }
+                            if let Some(c) = pure_reml(&probe)
+                                && c < best_pure - 1e-6 * (1.0 + best_pure.abs())
+                                && group_best.as_ref().is_none_or(|(_, gp)| c < *gp)
+                            {
+                                group_best = Some((probe, c));
+                            }
+                        }
+                        let Some((cand, _)) = group_best else { continue };
+                        reml_state.reset_outer_seed_state();
+                        let cold_pen = reml_state.compute_cost(&cand);
+                        let cold_pure = cold_pen.as_ref().ok().and_then(|&c| {
+                            c.is_finite().then(|| {
+                                c - reml_state.configured_rho_prior_atom(&cand).cost()
+                                    - reml_state.soft_rho_guard_prior_atom(&cand).cost()
+                            })
+                        });
+                        let cand_edf = reml_state
+                            .obtain_eval_bundle(&cand)
+                            .ok()
+                            .map(|b| b.pirls_result.edf);
+                        let parsimonious = match (cand_edf, best_edf) {
+                            (Some(ec), Some(eb)) => ec <= eb + 1e-6,
+                            _ => false,
+                        };
+                        if let Some(cp) = cold_pure
+                            && cp.is_finite()
+                            && cp < best_pure - 1e-6 * (1.0 + best_pure.abs())
+                            && parsimonious
+                        {
+                            best_rho = cand;
+                            best_pure = cp;
+                            best_edf = cand_edf;
+                            improved = true;
+                        }
+                    }
                     if improved {
                         // Each accepted group move was already cold-confirmed strictly
                         // cheaper AND parsimonious against the running point, so the
