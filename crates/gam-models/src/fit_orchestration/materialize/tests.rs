@@ -119,6 +119,82 @@ fn survival_marginal_slope_materialize_rejects_z_column_when_logslope_defaults_t
     assert!(err.to_string().contains("main formula"));
 }
 
+/// Regression for #1790: a left-truncated `Surv(entry, exit, event)` fit under
+/// the DEFAULT `transformation` (Royston-Parmar) likelihood must center its
+/// baseline time basis at the robust interior median-exit anchor, NOT the
+/// earliest entry age.
+///
+/// Anchoring at the earliest entry under genuine left truncation
+/// (`entry > 0`) leaves the centered baseline linear-trend column
+/// `X(exit) − X(anchor)` large and one-signed across all rows — the unpenalized
+/// polynomial null space of the time penalty — which inflates the time-block
+/// seed score by orders of magnitude and rails the transformation-survival
+/// smoothing selection into a degenerate, covariate-flat baseline (predicted
+/// cumulative hazard ~10³× too large, survival collapsing to 0, covariate
+/// dependence erased). The marginal-slope path already anchors at the median
+/// exit for exactly this reason (#751); the fix extends that robust anchor to
+/// every time-basis-carrying likelihood whenever the data is left-truncated.
+///
+/// This asserts the resolved `time_anchor` equals the median exit (a robust
+/// interior time) rather than the earliest entry age. Before the fix it was the
+/// earliest entry (0.5); after, the median exit (3.0).
+#[test]
+fn survival_transformation_left_truncated_uses_median_exit_anchor() {
+    let td = tempdir().expect("tempdir");
+    let data_path = td.path().join("left_truncated.csv");
+    // Constant entry = 0.5 (genuine left truncation), five spread exits with an
+    // odd count so the median exit is exactly the middle value 3.0.
+    fs::write(
+        &data_path,
+        "entry,exit,event,x\n\
+         0.5,1.0,1,-0.8\n\
+         0.5,2.0,0,0.4\n\
+         0.5,3.0,1,-0.2\n\
+         0.5,4.0,1,0.7\n\
+         0.5,5.0,0,0.1\n",
+    )
+    .expect("write left-truncated csv");
+    let data = load_dataset_projected(
+        &data_path,
+        &[
+            "entry".to_string(),
+            "exit".to_string(),
+            "event".to_string(),
+            "x".to_string(),
+        ],
+    )
+    .expect("load left-truncated dataset");
+
+    // Default config -> `transformation` (Royston-Parmar) likelihood, the path
+    // the Python `family="survival"` default takes.
+    let config = FitConfig::default();
+    assert_eq!(
+        config.survival_likelihood, "transformation",
+        "test presumes the default survival likelihood is transformation"
+    );
+
+    let materialized = materialize("Surv(entry, exit, event) ~ x", &data, &config)
+        .expect("left-truncated transformation survival should materialize");
+    let FitRequest::SurvivalTransformation(request) = materialized.request else {
+        panic!("expected a survival transformation request under the default likelihood");
+    };
+
+    let anchor = request.spec.time_anchor;
+    // Median of {1,2,3,4,5} exits.
+    let median_exit = 3.0_f64;
+    let earliest_entry = 0.5_f64;
+    assert!(
+        (anchor - median_exit).abs() < 1e-9,
+        "left-truncated transformation fit must center at the robust median-exit \
+         anchor ({median_exit}), got {anchor}; the earliest-entry anchor \
+         ({earliest_entry}) is the #1790 defect that rails the smoothing selection"
+    );
+    assert!(
+        (anchor - earliest_entry).abs() > 1e-6,
+        "anchor must not fall back to the earliest entry age under left truncation"
+    );
+}
+
 #[test]
 fn survival_marginal_slope_matern_logslope_penalties_keep_surface_width() {
     let n = 24usize;
