@@ -162,6 +162,34 @@ record() { # args: req dedup exit dur
     "$(now)" "\"$req\"" "$dedup" "$n" "$names" "$dur" "$code" >> "$HIST"
 }
 
+# ---- lock-free fast-fail pre-flight (the parallel-agent fix) -----------------
+# The authoritative ban-scanner runs INSIDE the cargo compile (the root gam
+# build.rs), so a broken tree only fails AFTER a full recompile — 15-19 min under
+# fleet churn — and holds the single global build lock for that whole DOOMED
+# compile. That is exactly what pileup'd 47 agents in the meltdown: every agent
+# independently recompiled a tree that could never pass, serialized one at a time.
+# Catch the CHEAP, exact, tree-content ban violation here in ~0.3s WITHOUT any
+# lock, so a broken tree fails every agent FAST and IN PARALLEL instead of
+# serializing doomed builds. Only the 10k-line gate goes here — it is exact (wc),
+# has ZERO false-positive risk, and was the recurring meltdown cause; the
+# authoritative build.rs scanner still backstops every other rule. Never caches
+# (the tree can be fixed at any moment). GAM_NO_BANSCAN=1 skips it.
+banscan_fast_fail() {
+  [[ -n "${GAM_NO_BANSCAN:-}" ]] && return 0
+  local over
+  # One `xargs wc` over all tracked *.rs (null-delimited, space-safe) ~0.3s, vs
+  # 1800 per-file wc spawns (~5s). awk drops the "total" lines and flags >10000.
+  over="$(cd "$REPO" && git ls-files -z '*.rs' 2>/dev/null | xargs -0 wc -l 2>/dev/null \
+            | awk '$2!="total" && $1>10000 {printf "  %s: %s lines (limit 10000)\n",$2,$1}')"
+  if [[ -n "$over" ]]; then
+    echo "[build.sh] ban pre-check FAILED (10k-line gate) — failing fast, NO build lock taken:" >&2
+    echo "$over" >&2
+    echo "[build.sh] fix the file(s) above (split into a sibling module); the real build.rs scanner would reject them anyway after a full recompile." >&2
+    : >"$LOG"; echo "ban pre-check: file over 10000-line gate (see stderr)" >>"$LOG"
+    exit 101
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # Unified coalescing + content-dedup engine (single-flight across the whole box).
 #
@@ -447,6 +475,10 @@ is_full_lib_compile() {  # …and spans the whole workspace (no -p restriction)?
 # The engine: REQ, CMD[], and CACHEABLE must be set by the caller before calling.
 run_request() {
   local TREE KEY REQNORM REQHASH
+  # Lock-free fast-fail: reject a tree that can't possibly pass the 10k-line gate
+  # BEFORE taking the global lock or recompiling — this is what keeps a broken
+  # tree from serializing the whole fleet through doomed 15-min compiles.
+  banscan_fast_fail
   REQNORM="$(normalize_req "$REQ")"; REQHASH="$(sha_str "$REQNORM")"
   TREE="$(tree_hash)"; KEY="$(sha_str "$REQ"$'\n'"$TREE")"
   CACHE="$CACHEDIR/$KEY"
