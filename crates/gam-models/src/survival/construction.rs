@@ -3814,6 +3814,109 @@ mod tests {
     }
 
     #[test]
+    fn ispline_time_penalty_is_psd_under_nontrivial_keep_cols() {
+        // PSD-invariant forward guard for the gam#979 survival hang. The I-spline
+        // value-space curvature penalty on the increment coefficients is the
+        // congruence `S_I = Lᵀ S_B[1:,1:] L`. When identifiability drops columns,
+        // the retained block MUST be taken as a PRINCIPAL SUBMATRIX of the FULL
+        // congruence (congruence first, column selection second). The historical
+        // regression assembled the reduced penalty in the wrong order, producing
+        // a strongly INDEFINITE matrix (measured `s0_min_eval = −9.8e7`); an
+        // indefinite time penalty makes `½γᵀ S_I γ` unbounded below, the inner
+        // joint-Newton follows the divergence, and the outer REML never
+        // terminates — the survival marginal-slope hang.
+        //
+        // This test exercises the reduction with a NON-TRIVIAL `keep_cols`
+        // (a proper subset, an interior column dropped) and asserts the assembled
+        // penalty satisfies the PSD contract the fix guarantees. It locks the
+        // invariant on the shipped code path so a future reassembly that
+        // reintroduces an indefinite reduction is caught at construction rather
+        // than silently as an outer-loop hang. (It is a forward invariant lock,
+        // not a bit-exact replay of the removed buggy assembly.)
+        let age_entry = array![1.0_f64, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let age_exit = array![2.0_f64, 3.0, 5.0, 8.0, 13.0, 21.0];
+        let left = 1.0_f64.ln();
+        let right = 21.0_f64.ln();
+        let q1 = left + 0.25 * (right - left);
+        let mid = left + 0.5 * (right - left);
+        let q3 = left + 0.75 * (right - left);
+        // Degree-2 I-spline with three interior knots -> a value-space basis wide
+        // enough to drop an interior column and still leave the reduction
+        // non-trivial (p_time < p_time_full).
+        let knots = array![
+            left, left, left, left, q1, mid, q3, right, right, right, right
+        ];
+
+        // Discover the full basis width by building with all columns retained.
+        let full = build_survival_time_basis(
+            &age_entry,
+            &age_exit,
+            SurvivalTimeBasisConfig::ISpline {
+                degree: 2,
+                knots: knots.clone(),
+                keep_cols: Vec::new(),
+                smooth_lambda: 1e-2,
+            },
+            None,
+        )
+        .expect("build full-width ispline time basis");
+        let p_time_full = full
+            .keep_cols
+            .as_ref()
+            .map(|k| k.len())
+            .unwrap_or_else(|| full.x_exit_time.ncols());
+        assert!(
+            p_time_full >= 3,
+            "test needs at least 3 shape-varying columns to drop an interior one; got {p_time_full}"
+        );
+
+        // Retain everything except one interior column, forcing the
+        // principal-submatrix-of-the-full-congruence path.
+        let keep_cols: Vec<usize> = (0..p_time_full).filter(|&j| j != 1).collect();
+
+        let built = build_survival_time_basis(
+            &age_entry,
+            &age_exit,
+            SurvivalTimeBasisConfig::ISpline {
+                degree: 2,
+                knots,
+                keep_cols: keep_cols.clone(),
+                smooth_lambda: 1e-2,
+            },
+            None,
+        )
+        .expect(
+            "reduced ispline penalty must build (PSD contract must accept the \
+             congruence-first / select-second ordering)",
+        );
+
+        assert_eq!(
+            built.penalties.len(),
+            1,
+            "the ispline time basis should carry exactly one curvature penalty"
+        );
+        let s = &built.penalties[0];
+        assert_eq!(s.nrows(), keep_cols.len());
+        assert_eq!(s.ncols(), keep_cols.len());
+
+        let (evals, _) =
+            gam_linalg::faer_ndarray::FaerEigh::eigh(s, faer::Side::Lower).expect("eigh of penalty");
+        let evals_slice = evals.as_slice().expect("contiguous eigenvalues");
+        let max_abs = evals_slice
+            .iter()
+            .copied()
+            .fold(0.0_f64, |a, b| a.max(b.abs()))
+            .max(1.0);
+        let min_ev = evals_slice.iter().copied().fold(f64::INFINITY, f64::min);
+        let tol = -100.0 * (s.nrows() as f64) * f64::EPSILON * max_abs;
+        assert!(
+            min_ev >= tol,
+            "reduced I-spline time penalty must be PSD (gam#979): min eigenvalue \
+             {min_ev:.3e} < tol {tol:.3e}, max|eig| {max_abs:.3e}"
+        );
+    }
+
+    #[test]
     fn marginal_slope_baseline_maps_gompertz_makeham_survival_to_probit_index() {
         let cfg = SurvivalBaselineConfig {
             target: SurvivalBaselineTarget::GompertzMakeham,
