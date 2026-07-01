@@ -447,6 +447,19 @@ impl ArrowSolveOptions {
         self
     }
 
+    /// Enable the spectral PD-floor on an indefinite reduced Schur (the SAE solve
+    /// path): floor the collapsed / dead-atom directions up to `floor·max(λ)` and
+    /// re-factor instead of hard-erroring. An overcomplete manifold-SAE fit parks
+    /// surplus atoms dead, so the reduced Schur (and the undamped evidence factor
+    /// at the optimum) can have near-zero / slightly-negative eigenvalues on the
+    /// dead subspace; flooring those lets the live subspace's exact Newton /
+    /// log-det proceed instead of aborting the whole fit on a non-PD pivot. `None`
+    /// (default) keeps the strict refusal for BA / non-SAE callers.
+    pub fn with_schur_pd_floor(mut self, floor: f64) -> Self {
+        self.schur_pd_floor = Some(floor);
+        self
+    }
+
     pub fn with_solve_precision_policy(mut self, policy: ArrowSolvePrecisionPolicy) -> Self {
         self.solve_precision = policy;
         self

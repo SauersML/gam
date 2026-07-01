@@ -4059,7 +4059,8 @@ impl SaeManifoldTerm {
         for _ in 0..max_iter {
             self.advance_temperature_schedule()?;
             // ── Pass 1: accumulate the global reduced Schur over β online. ──
-            let options = ArrowSolveOptions::automatic(border_dim);
+            let options = ArrowSolveOptions::automatic(border_dim)
+                .with_schur_pd_floor(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR);
             let mut s_acc = Array2::<f64>::zeros((border_dim, border_dim));
             let mut rhs_acc = Array1::<f64>::zeros(border_dim);
             let mut gb_acc = Array1::<f64>::zeros(border_dim);
