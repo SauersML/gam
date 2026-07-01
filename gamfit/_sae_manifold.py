@@ -360,26 +360,6 @@ _TWO_POW_NEG_53 = float.fromhex("0x1.0p-53")
 SAE_RANDOM_STATE_LOGIT_JITTER = 1.0e-3
 
 
-def _seeded_unit_jitter(random_state: int, shape: tuple[int, ...]) -> np.ndarray:
-    """Deterministic ``shape`` array of values in ``[-1, 1)`` keyed by ``random_state``.
-
-    Reproduces the per-element Lehmer LCG stream the Rust SAE init uses
-    (``crates/gam-pyffi/src/latent/latent_basis_and_sae_ffi.rs``): a fixed seed
-    yields a bit-identical stream, distinct seeds yield decorrelated streams.
-    """
-    count = 1
-    for dim in shape:
-        count *= int(dim)
-    out = np.empty(count, dtype=np.float64)
-    state = (int(random_state) & _U64_MASK)
-    state = (state * _LCG_MULT + _LCG_ADD) & _U64_MASK
-    for i in range(count):
-        state = (state * _LCG_MULT + _LCG_ADD) & _U64_MASK
-        u = float(state >> 11) * _TWO_POW_NEG_53
-        out[i] = 2.0 * u - 1.0
-    return out.reshape(shape)
-
-
 def _json_ready(value: Any) -> Any:
     if isinstance(value, np.ndarray):
         return value.tolist()
@@ -388,28 +368,6 @@ def _json_ready(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_json_ready(v) for v in value]
     return value
-
-
-def _closed_form_trust_diagnostics(assignments: np.ndarray) -> dict[str, Any]:
-    k_atoms = int(assignments.shape[1])
-    n_obs = int(assignments.shape[0])
-    atoms: list[dict[str, Any]] = []
-    trust = np.ones(k_atoms, dtype=float)
-    for atom_idx in range(k_atoms):
-        active = np.asarray(assignments[:, atom_idx] > 1.0e-8, dtype=bool)
-        atoms.append(
-            {
-                "trust_score": 1.0,
-                "sigma_min_tangent": 1.0,
-                "sigma_max_tangent": 1.0,
-                "tangent_condition_score": 1.0,
-                "coverage": float(np.mean(active)) if n_obs else 0.0,
-                "activation_frequency": float(np.mean(active)) if n_obs else 0.0,
-                "untyped": False,
-                "active_token_count": int(np.sum(active)),
-            }
-        )
-    return {"atom_trust": trust, "atoms": atoms}
 
 
 def _functional_basis_params(plan: Mapping[str, Any]) -> dict[str, Any] | None:
