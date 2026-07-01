@@ -74,6 +74,15 @@ fn spec_from_family_link(
     family: LikelihoodSpec,
     link_kind: Option<&InverseLink>,
 ) -> LikelihoodSpec {
+    // Royston-Parmar's linear predictor is the log cumulative hazard itself;
+    // the scalar inverse-link slot is therefore fixed to the identity. Some
+    // fitted-model surfaces can carry a stale/default standard link alongside
+    // the survival response, but prediction must canonicalize that decorative
+    // link away instead of constructing an illegal likelihood cell.
+    if matches!(family.response, ResponseFamily::RoystonParmar) {
+        return LikelihoodSpec::royston_parmar();
+    }
+
     match link_kind {
         Some(link) => LikelihoodSpec::new(family.response, link.clone()),
         None => family,
@@ -2372,11 +2381,7 @@ where
         Some(FittedLinkState::Mixture { state, .. }) => Some(InverseLink::Mixture(state.clone())),
         Some(FittedLinkState::Standard(None)) | None => None,
     };
-    let likelihood = if let Some(link) = link_kind.clone() {
-        LikelihoodSpec::new(family.response.clone(), link)
-    } else {
-        family.clone()
-    };
+    let likelihood = spec_from_family_link(family.clone(), link_kind.as_ref());
     let strategy = strategy_for_spec(&likelihood);
     let mean = apply_family_inverse_link(&eta, &likelihood)?;
 
@@ -2523,7 +2528,7 @@ where
             .map(|i| -> Result<f64, EstimationError> {
                 let se_i = etavar[i].max(0.0).sqrt();
                 let (_, mut meanvar) = strategy.posterior_meanvariance(&quadctx, eta[i], se_i)?;
-                if family.is_binomial_sas()
+                if likelihood.is_binomial_sas()
                     && let Some(cov_theta) = fitted_link_state.as_ref().and_then(|s| match s {
                         FittedLinkState::Sas { covariance, .. } => covariance.as_ref(),
                         _ => None,
@@ -2540,7 +2545,7 @@ where
                     let g = [jets.djet_depsilon.mu, jets.djet_dlog_delta.mu];
                     meanvar += quadratic_form(cov_theta, &g)?;
                 }
-                if family.is_binomial_beta_logistic()
+                if likelihood.is_binomial_beta_logistic()
                     && let Some(cov_theta) = fitted_link_state.as_ref().and_then(|s| match s {
                         FittedLinkState::BetaLogistic { covariance, .. } => covariance.as_ref(),
                         _ => None,
@@ -2560,7 +2565,7 @@ where
                     let g = [jets.djet_depsilon.mu, jets.djet_dlog_delta.mu];
                     meanvar += quadratic_form(cov_theta, &g)?;
                 }
-                if family.is_binomial_mixture()
+                if likelihood.is_binomial_mixture()
                     && let Some(cov_theta) = fitted_link_state.as_ref().and_then(|s| match s {
                         FittedLinkState::Mixture { covariance, .. } => covariance.as_ref(),
                         _ => None,
