@@ -326,26 +326,6 @@ def _resolve_public_assignment(assignment: Any, assignment_prior: Any) -> str:
     return canon_assignment
 
 
-# Seed-keyed init jitter for the closed-form fast paths (issue #178). The Rust
-# `sae_manifold_fit_minimal` path perturbs the cold initial assignment logits by
-# `±SAE_RANDOM_STATE_LOGIT_JITTER` using a 64-bit wrapping Lehmer LCG keyed by
-# `random_state`, so distinct seeds explore different Newton trajectories while a
-# fixed seed stays bit-identical. The Python closed-form periodic fast paths
-# (`_fit_disjoint_periodic_top1` / `_fit_dense_periodic_ibp_lsq`) build their
-# init deterministically from an SVD and never reach that Rust code, so they
-# silently ignored `random_state` entirely (every seed produced the same fit).
-# Mirror the EXACT same LCG + jitter here so the two paths honour one seed
-# contract: the jitter perturbs the assignment masses (and, downstream, the
-# decoder LSQ that is weighted by them), which is the closed-form analogue of
-# jittering the assignment logits.
-_LCG_MULT = 6364136223846793005
-_LCG_ADD = 1442695040888963407
-_U64_MASK = (1 << 64) - 1
-# 2**-53, matching the Rust `f64::from_bits(0x3CA0000000000000)` top-53-bit map.
-_TWO_POW_NEG_53 = float.fromhex("0x1.0p-53")
-SAE_RANDOM_STATE_LOGIT_JITTER = 1.0e-3
-
-
 def _json_ready(value: Any) -> Any:
     if isinstance(value, np.ndarray):
         return value.tolist()
