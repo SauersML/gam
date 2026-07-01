@@ -2324,6 +2324,7 @@ where
     let mut beta_covariance_frequentist = None;
     let mut coefficient_influence = None;
     let mut weighted_gram = None;
+    let mut bias_correction_jacobian = None;
     // Factorization of stabilized Hessian in transformed basis, reused for
     // SE computation via solve-on-demand after dispersion is determined.
     let mut edf_factor: Option<Box<dyn FactorizedSystem>> = None;
@@ -2773,6 +2774,18 @@ where
             }
             let mut s_mat = qs.dot(&s_t).dot(&qs.t());
             gam_linalg::matrix::symmetrize_in_place(&mut s_mat);
+
+            // The frequentist bias-corrected coefficient used by prediction is
+            // β_BC = β̂ + b̂ with b̂ = H⁻¹S(β̂ - μ) at fixed smoothing
+            // parameters. Its fixed-ρ linearization with respect to β̂ is
+            // A = I + H⁻¹S. Credible bands centered at β_BC must use the
+            // covariance of that same estimator, A V Aᵀ; otherwise the center is
+            // debiased but the reported uncertainty remains for the shrunken
+            // penalized mode β̂, producing severely over-narrow bands on heavily
+            // smoothed large-scale Duchon fits (#1870).
+            let mut bc_jac = Array2::<f64>::eye(p_cov);
+            bc_jac += &h_inv.dot(&s_mat);
+            bias_correction_jacobian = Some(bc_jac);
             // Influence matrix F = I − H⁻¹·S(λ) = H⁻¹·X'WX. This is a product
             // of two symmetric matrices and is therefore generally NOT
             // symmetric; it must not be symmetrized — `gam_linalg::matrix::symmetrize_in_place(F)`
@@ -2915,6 +2928,11 @@ where
             (Some(base_cov), Some(corr)) if base_cov.as_array().dim() == corr.dim() => {
                 let mut corrected = base_cov.as_array().clone();
                 corrected += corr;
+                if let Some(a_bc) = bias_correction_jacobian.as_ref()
+                    && a_bc.dim() == corrected.dim()
+                {
+                    corrected = a_bc.dot(&corrected).dot(&a_bc.t());
+                }
                 gam_linalg::matrix::symmetrize_in_place(&mut corrected);
                 Some(corrected)
             }
