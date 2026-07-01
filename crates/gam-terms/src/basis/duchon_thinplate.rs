@@ -448,8 +448,10 @@ fn build_duchon_basis_uncached(
                     // model space the un-fused rebuild would produce.
                     let rotated_kernel = fast_ab(&raw.basis.slice(s![.., 0..kernel_cols]), &v);
                     let poly_block = raw.basis.slice(s![.., kernel_cols..]);
-                    let mut fused =
-                        Array2::<f64>::zeros((raw.basis.nrows(), rotated_kernel.ncols() + poly_block.ncols()));
+                    let mut fused = Array2::<f64>::zeros((
+                        raw.basis.nrows(),
+                        rotated_kernel.ncols() + poly_block.ncols(),
+                    ));
                     fused
                         .slice_mut(s![.., 0..rotated_kernel.ncols()])
                         .assign(&rotated_kernel);
@@ -1527,12 +1529,7 @@ pub(crate) fn create_thin_plate_spline_basis_scaledwithworkspace(
     } else if constrained_kernel_cols == 0 {
         (Array2::<f64>::zeros((0, 0)), Array1::<f64>::zeros(0))
     } else {
-        // #1347: reparameterize in the realized data metric so the bending
-        // spectrum acquires mgcv's cliff (curvature per unit data-variance),
-        // rather than the cliff-less raw knot-Gram spectrum that lets REML buy
-        // near-free wiggle on near-linear data. G_c = (K Z)ᵀ (K Z).
-        let design_gram = symmetrize_penalty(&fast_atb(&kernel_constrained, &kernel_constrained));
-        thin_plate_radial_reparam_data_metric(&omega_constrained, &design_gram)?
+        thin_plate_radial_reparam_from_constrained_penalty(&omega_constrained)?
     };
     let kernel_cols = radial_eigvals.len();
     let total_cols = kernel_cols + poly_cols;
