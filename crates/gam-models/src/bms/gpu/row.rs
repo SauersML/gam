@@ -225,6 +225,7 @@ define_bms_flex_row_kernel_input_types! {
         z_obs,
         y,
         w,
+        e_obs,
         cell_c0,
         cell_c1,
         cell_c2,
@@ -299,6 +300,7 @@ impl<'a> BmsFlexRowKernelInputs<'a> {
         check_len("z_obs", self.z_obs.len(), n)?;
         check_len("y", self.y.len(), n)?;
         check_len("w", self.w.len(), n)?;
+        check_len("e_obs", self.e_obs.len(), n)?;
         check_len("chi_obs", self.chi_obs.len(), n)?;
         check_len("xi_obs", self.xi_obs.len(), n)?;
         check_len("rho_u", self.rho_u.len(), n * self.r)?;
@@ -447,6 +449,7 @@ extern "C" __global__ void bms_flex_row_kernel(
     const double * __restrict__ row_rho,      // [n_rows, r]
     const double * __restrict__ row_tau,      // [n_rows, r]
     const double * __restrict__ row_ruv,      // [n_rows, r*r]
+    const double * __restrict__ row_e_obs,    // [n_rows] observed predictor VALUE
     double       * __restrict__ out_neglog,
     double       * __restrict__ out_grad,
     double       * __restrict__ out_hess)
@@ -691,16 +694,14 @@ extern "C" __global__ void bms_flex_row_kernel(
     double y    = row_y[row];
     double w    = row_w[row];
     double s    = 2.0 * y - 1.0;
-    // The "observed predictor" e_obs is the value (degree-0) term of the
-    // observed jet — same convention as the CPU path. CPU parity:
-    // `e_obs = chi · a_0 + rho_0`... well, no: `bar_e_u` is the *first*
-    // derivative jet, not the value. The observed predictor value comes
-    // from the host pre-evaluation as `rho_u[0]` of the value jet —
-    // pre-baked into the host's `m = s · e_obs` payload. For Stage 2 we
-    // expose it via the `bar_e_u[0]` slot which is `chi·a_0 + rho_0`; the
-    // host wiring lands in the dispatcher wave that bridges this kernel
-    // and the row evaluator in `bernoulli_marginal_slope.rs`.
-    double e_obs = bar_e_u[0];
+    // The "observed predictor" e_obs is the VALUE (degree-0 term) of the
+    // observed jet η(a(θ), θ; z_obs) — NOT `bar_e_u[0]`, which is the u=0
+    // FIRST-derivative jet (`chi·a_0 + rho_0 = dη_obs/dq`). The host packs
+    // the observed value directly in `row_e_obs[row]` (see
+    // `pack_bms_flex_row_kernel_inputs`, `eta_val = eval_coeff4_at(obs.coeff,
+    // z_obs)`), matching the CPU family `compute_row_analytic_flex_from_parts_into`
+    // which forms `signed_margin = s_y · eta_val`. #415 parity lock.
+    double e_obs = row_e_obs[row];
     double m_arg = s * e_obs;
     double log_cdf, lambda;
     log_ndtr_and_mills(m_arg, &log_cdf, &lambda);
@@ -870,6 +871,7 @@ pub(crate) fn launch_linux(
     let d_rho = upload_f64(inputs.rho_u, "rho_u")?;
     let d_tau = upload_f64(inputs.tau_u, "tau_u")?;
     let d_ruv = upload_f64(inputs.r_uv, "r_uv")?;
+    let d_e_obs = upload_f64(inputs.e_obs, "e_obs")?;
 
     let n = inputs.n_rows;
     let r = inputs.r;
@@ -949,6 +951,7 @@ pub(crate) fn launch_linux(
         .arg(&d_rho)
         .arg(&d_tau)
         .arg(&d_ruv)
+        .arg(&d_e_obs)
         .arg(&mut d_neglog)
         .arg(&mut d_grad)
         .arg(&mut d_hess);
@@ -1996,6 +1999,7 @@ pub(crate) fn launch_bms_flex_row_kernel_device_resident(
     let d_rho = upload_f64(inputs.rho_u, "rho_u")?;
     let d_tau = upload_f64(inputs.tau_u, "tau_u")?;
     let d_ruv = upload_f64(inputs.r_uv, "r_uv")?;
+    let d_e_obs = upload_f64(inputs.e_obs, "e_obs")?;
 
     let d_marginal = upload_f64(marginal_design_row_major, "marginal_design")?;
     let d_logslope = upload_f64(logslope_design_row_major, "logslope_design")?;
@@ -2082,6 +2086,7 @@ pub(crate) fn launch_bms_flex_row_kernel_device_resident(
         .arg(&d_rho)
         .arg(&d_tau)
         .arg(&d_ruv)
+        .arg(&d_e_obs)
         .arg(&mut d_neglog)
         .arg(&mut d_grad)
         .arg(&mut d_hess);
@@ -2918,7 +2923,7 @@ pub fn launch_bms_flex_row_dense_block(
 // box + CPU CI (the sibling `mod tests` is linux-gated because it also builds
 // CUDA-only fixture types). `cpu_oracle_outputs` itself is platform-independent.
 #[cfg(test)]
-mod oracle_parity_tests {
+pub(crate) mod oracle_parity_tests {
     use super::*;
 
     // ── CPU oracle that mirrors ROW_KERNEL_BODY bit-for-bit ──────────────────
@@ -3194,7 +3199,11 @@ mod oracle_parity_tests {
             let y = inputs.y[row];
             let w = inputs.w[row];
             let s = 2.0 * y - 1.0;
-            let e_obs = bar_e_u[0];
+            // #415 parity: the observed predictor VALUE is packed directly
+            // (`inputs.e_obs`), matching the CPU family's `signed_margin =
+            // s_y * eta_val`. `bar_e_u[0]` is the u=0 first-derivative jet and
+            // is used only for the gradient/Hessian, never as the Mills margin.
+            let e_obs = inputs.e_obs[row];
             let m_arg = s * e_obs;
             let (log_cdf, lambda) = oracle_log_ndtr_and_mills(m_arg);
             let a_i = -w * s * lambda;
@@ -3236,6 +3245,7 @@ mod tests {
             z_obs: &buffers.z_obs,
             y: &buffers.y,
             w: &buffers.w,
+            e_obs: &buffers.e_obs,
             s_f: 1.0,
             cell_offsets: &buffers.cell_offsets,
             cell_c0: &buffers.cell_c0,
@@ -3266,6 +3276,7 @@ mod tests {
         pub(crate) z_obs: Vec<f64>,
         pub(crate) y: Vec<f64>,
         pub(crate) w: Vec<f64>,
+        pub(crate) e_obs: Vec<f64>,
         pub(crate) cell_offsets: Vec<u32>,
         pub(crate) cell_c0: Vec<f64>,
         pub(crate) cell_c1: Vec<f64>,
@@ -3296,6 +3307,7 @@ mod tests {
             z_obs: vec![0.0; 1],
             y: vec![1.0; 1],
             w: vec![1.0; 1],
+            e_obs: vec![0.15; 1],
             cell_offsets: vec![0, n_cells],
             cell_c0: vec![0.2; cells],
             cell_c1: vec![-0.1; cells],
@@ -3476,6 +3488,7 @@ mod tests {
         let z_obs = (0..n).map(|i| -0.2 + 0.1 * (i as f64)).collect::<Vec<_>>();
         let y = [1.0, 0.0, 1.0, 0.0].to_vec();
         let w = vec![1.0; n];
+        let e_obs = (0..n).map(|i| -0.3 + 0.2 * (i as f64)).collect::<Vec<_>>();
 
         let cell_c0 = (0..total_cells).map(|c| f(c + 1001)).collect::<Vec<_>>();
         let cell_c1 = (0..total_cells)
@@ -3525,6 +3538,7 @@ mod tests {
             z_obs,
             y,
             w,
+            e_obs,
             cell_offsets,
             cell_c0,
             cell_c1,
@@ -3559,6 +3573,7 @@ mod tests {
             z_obs: &buffers.z_obs,
             y: &buffers.y,
             w: &buffers.w,
+            e_obs: &buffers.e_obs,
             s_f: 1.0,
             cell_offsets: &buffers.cell_offsets,
             cell_c0: &buffers.cell_c0,

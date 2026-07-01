@@ -1353,7 +1353,14 @@ impl SaeManifoldOuterObjective {
         // `fd_dir` collapses (or goes negative). Escalate to the full FD gradient
         // only then; well-conditioned fits exit here having paid two evaluations.
         let inv_na = 1.0 / na;
-        let step = 1.0e-4 * (1.0 + flat.iter().fold(0.0_f64, |m, &v| m.max(v.abs())));
+        // The FD step must be LARGE enough that the criterion change `‖g‖·2·step`
+        // exceeds the inner-solve convergence noise (the criterion is evaluated at
+        // a re-solved inner optimum, whose residual KKT slack perturbs the value at
+        // the ~1e-4..1e-6 level). A tiny `1e-4` step buries the true slope in that
+        // noise and yields a spurious ~0 gradient that STALLS the descent; `1e-2`
+        // resolves the slope cleanly while the O(h²) central-difference truncation
+        // stays negligible for a descent direction.
+        let step = 1.0e-2 * (1.0 + flat.iter().fold(0.0_f64, |m, &v| m.max(v.abs())));
         let mut dir_plus = flat.clone();
         let mut dir_minus = flat.clone();
         for i in 0..n {
@@ -1380,7 +1387,9 @@ impl SaeManifoldOuterObjective {
         // from the analytic gradient (cosine < ½, i.e. > 60° apart).
         let mut fd = Array1::<f64>::zeros(n);
         for i in 0..n {
-            let h = 1.0e-4 * (1.0 + flat[i].abs());
+            // Same inner-solve-noise floor as the Stage-1 step: a `1e-2` FD step
+            // keeps the per-coordinate slope well above the re-solve KKT slack.
+            let h = 1.0e-2 * (1.0 + flat[i].abs());
             let mut plus = flat.clone();
             let mut minus = flat.clone();
             plus[i] += h;

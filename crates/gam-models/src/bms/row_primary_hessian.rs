@@ -1136,6 +1136,10 @@ impl BernoulliMarginalSlopeFamily {
         let mut row_zobs = Vec::<f64>::with_capacity(n);
         let mut row_y = Vec::<f64>::with_capacity(n);
         let mut row_w = Vec::<f64>::with_capacity(n);
+        // #415: observed predictor VALUE η(a(θ), θ; z_obs) per row. The device
+        // kernel + `cpu_oracle_outputs` consume this directly as the Mills
+        // margin `s_y·e_obs`, matching the CPU family's `eta_val`.
+        let mut row_e_obs = Vec::<f64>::with_capacity(n);
         let mut row_chi = Vec::<f64>::with_capacity(n);
         let mut row_xi = Vec::<f64>::with_capacity(n);
         let mut row_rho = vec![0.0_f64; n * r];
@@ -1376,8 +1380,12 @@ impl BernoulliMarginalSlopeFamily {
             let obs = self.observed_denested_cell_partials(row, a, b, beta_h, beta_w)?;
             let chi_obs = eval_coeff4_at(&obs.dc_da, z_obs);
             let xi_obs = eval_coeff4_at(&obs.dc_daa, z_obs);
+            // #415: the observed predictor VALUE (degree-0 term), mirroring the
+            // CPU family `eta_val = eval_coeff4_at(&obs.coeff, z_obs)`.
+            let eta_val = eval_coeff4_at(&obs.coeff, z_obs);
             row_chi.push(chi_obs);
             row_xi.push(xi_obs);
+            row_e_obs.push(eta_val);
 
             // g_u_fixed / g_au_fixed / g_bu_fixed at z_obs (score) / u_obs (link).
             // Reset the hoisted buffers to zero before refilling this row.
@@ -1607,6 +1615,7 @@ impl BernoulliMarginalSlopeFamily {
                 z_obs: row_zobs,
                 y: row_y,
                 w: row_w,
+                e_obs: row_e_obs,
                 cell_offsets,
                 cell_c0,
                 cell_c1,
