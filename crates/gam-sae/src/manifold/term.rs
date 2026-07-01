@@ -284,11 +284,11 @@ pub(crate) const SAE_COACTIVE_RELATIVE_MASS_FLOOR: f64 = 1.0e-3;
 static SAE_SEP_STRENGTH_OVERRIDE_BITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0x7ff8_0000_0000_0000);
 /// #1026/#1522/#1610 — read the process-global separation-barrier-strength
-/// override, or `None` when unset. `None` ⇒ the data-derived μ_C (the
-/// overcompleteness ratio from
-/// [`super::penalties::SaeManifoldTerm::separation_barrier_strength`]) is used.
-/// A quiet-NaN sentinel means "unset → derive from the problem"; `0.0` stays a
-/// legitimate swept value (barrier disabled).
+/// override, or `None` when unset. `None` ⇒ the evidence-derived per-pair μ_jk
+/// (the data-fit inseparability strength from
+/// [`super::penalties::SaeManifoldTerm::barrier_pair_strength_with_gates`]) is
+/// used. A quiet-NaN sentinel means "unset → derive from the problem"; `0.0`
+/// stays a legitimate swept value (barrier disabled).
 pub(crate) fn sae_separation_barrier_override() -> Option<f64> {
     let v =
         f64::from_bits(SAE_SEP_STRENGTH_OVERRIDE_BITS.load(std::sync::atomic::Ordering::Relaxed));
@@ -297,8 +297,10 @@ pub(crate) fn sae_separation_barrier_override() -> Option<f64> {
 
 /// Set the process-global SAE separation-barrier strength override (one wheel,
 /// many configs). `sep_strength` is NaN to clear the override back to the
-/// data-derived μ_C (`K / reachable_rank`); there is no compiled-constant
-/// default any more.
+/// evidence-derived per-pair μ_jk (`γ_jk / (1 - γ_jk)`, the data-fit
+/// inseparability strength — see
+/// [`super::penalties::SaeManifoldTerm::barrier_pair_strength_with_gates`]); there
+/// is no compiled-constant default any more.
 /// The amplitude (keep-alive) barrier and its active-atom gate were removed
 /// (surplus features are allowed to die into a ridge-parked state), so this
 /// takes only the separation strength. Called from the gamfit Python FFI.
@@ -315,12 +317,17 @@ pub fn set_sae_barrier_overrides(sep_strength: f64) {
         .store(sep_strength.to_bits(), std::sync::atomic::Ordering::Relaxed);
 }
 
-// #1026/#1522/#1610 — the SEPARATION barrier strength `μ_C` is NO LONGER a
-// hand-picked absolute constant (it was `10.0`, matched to no problem scale).
-// It is now DATA-DERIVED from the dictionary's overcompleteness — see the full
-// derivation on [`super::penalties::SaeManifoldTerm::separation_barrier_strength`]
-// (the penalty form `P_sep = -μ_C Σ q_jk log(1-c²+ε)` on the normalized decoder
-// shapes is documented there). The runtime override
+// #1026/#1522/#1610 — the SEPARATION barrier strength is NO LONGER a hand-picked
+// absolute constant (it was `10.0`, matched to no problem scale), nor the
+// overcompleteness rank ratio `Σ min(M_k,p)/min(n,p)` (a geometry heuristic).
+// It is now EVIDENCE-DERIVED PER PAIR from the reconstruction objective: the
+// data-fit inseparability `γ_jk` (largest canonical correlation of the two atoms'
+// coactivation-weighted chart designs — the quantity that governs whether the
+// joint inner Laplace/REML Hessian stays PD) sets `μ_jk = γ_jk/(1-γ_jk)`. See the
+// full derivation on
+// [`super::penalties::SaeManifoldTerm::barrier_pair_strength_with_gates`] (the
+// penalty form `P_sep = Σ μ_jk q_jk [-log(1-c²+ε)]` on the normalized decoder
+// shapes is documented on `separation_barrier_value`). The runtime override
 // (`set_sae_barrier_overrides`) still takes precedence over the derived value.
 
 /// #1026/#1522 SEPARATION barrier softening `ε` in `log(1 - c_jk² + ε)`. Bounds
@@ -559,7 +566,15 @@ pub struct SaeManifoldTerm {
     /// no pair co-fires (`K < 2`, or a fully-disjoint routing — the strict no-op);
     /// callers fall back to the live coactivation in that case. Transient: not part
     /// of the persisted term identity (Clone starts `None`, rebuilt next assembly).
-    pub(crate) barrier_coactivation_gate: Option<Vec<(usize, usize, f64)>>,
+    /// #1610 — per-assembly FROZEN separation-barrier pairs
+    /// `(j, k, q_jk, μ_jk)`: the co-firing atom indices, their normalized
+    /// coactivation weight `q_jk`, and the EVIDENCE-DERIVED per-pair barrier
+    /// strength `μ_jk` (the data-fit inseparability strength, see
+    /// [`super::penalties::SaeManifoldTerm::barrier_pair_strength`]). Both the
+    /// coactivation and the strength are functions of the frozen design (chart
+    /// basis + routing), so freezing them here keeps the barrier value, gradient,
+    /// and curvature reading the SAME weights across an inner line search.
+    pub(crate) barrier_coactivation_gate: Option<Vec<(usize, usize, f64, f64)>>,
     /// #1026: the load-bearing curved-vs-linear hybrid-split verdict, computed
     /// once in [`Self::canonicalize_charts_post_fit`] after the joint fit
     /// converges. Each eligible `d = 1` atom's fitted curved image is adjudicated

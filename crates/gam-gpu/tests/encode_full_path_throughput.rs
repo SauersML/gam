@@ -47,6 +47,7 @@ use ndarray::{Array1, Array2};
 
 use gam_gpu::device_runtime::GpuRuntime;
 use gam_gpu::encode_throughput::{encode_quality_metrics, FullEncodeThroughput};
+use gam_gpu::policy::EncodeDeploymentDecision;
 use gam_gpu::{GpuError, GpuMode};
 
 use gam_sae::basis::{PeriodicHarmonicEvaluator, SaeBasisEvaluator};
@@ -210,6 +211,29 @@ fn full_exact_encode_throughput_and_correctness() {
         throughput.rows_per_sec > 0.0,
         "the full encode must produce a positive rows/sec, got {}",
         throughput.rows_per_sec
+    );
+
+    // #988 / #1412 — the DEPLOYMENT decision from this FULL-encode measurement.
+    // The measurement is honest (a real CPU rate) but the encode did NOT run on a
+    // device (`device_encode_engaged == false`, because no device-resident exact-
+    // encode kernel exists), so the tri-state decision is `Undetermined` — BLOCKED
+    // on hardware. It is emphatically NOT "surrogate unneeded": that requires a
+    // full-encode DEVICE measurement clearing the 100k rows/sec/GPU target, which
+    // does not exist. A fast CPU number can never move this off `Undetermined`.
+    let decision = EncodeDeploymentDecision::from_device_measurement(
+        throughput.device_encode_engaged,
+        throughput.rows_per_sec,
+    );
+    eprintln!("[full-encode] deployment decision (device-only tri-state): {decision:?}");
+    assert!(
+        decision.is_undetermined(),
+        "#988/#1412: with no device-resident exact-encode kernel the full-encode deployment \
+         decision must be Undetermined (BLOCKED), got {decision:?}"
+    );
+    assert!(
+        !decision.surrogate_unneeded() && !decision.surrogate_justified(),
+        "#988/#1412: a CPU full-encode measurement must neither certify the target nor refute it — \
+         the surrogate decision is BLOCKED on a device measurement, got {decision:?}"
     );
 
     // --- Correctness: reconstruct, then score against the per-row reference. ---

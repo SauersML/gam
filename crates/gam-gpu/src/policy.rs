@@ -339,6 +339,142 @@ impl GpuThroughputVerdict {
     }
 }
 
+/// Why a Stage-3 encode deployment decision could not be made from a real device
+/// measurement (#988, #1412). Each variant is a state in which the
+/// `100_000` rows/sec/GPU target was neither established NOR refuted on a
+/// device — the decision is blocked on hardware, not green-washed from a CPU
+/// proxy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EncodeDecisionBlocked {
+    /// No CUDA device on this host: the exact encode could not be measured on a
+    /// device at all (a CPU rate cannot substitute — that was the #1412 defect).
+    NoDevice,
+    /// A device is present but there is no device-resident *exact-encode* kernel,
+    /// so the FULL per-row encode cannot be measured on the device. (The resident
+    /// normal-equations solve in [`crate::encode_throughput`] is only ONE
+    /// component of the encode, not the encode; a component measurement cannot
+    /// decide the encode surrogate question — #988.)
+    NoDeviceEncodeKernel,
+    /// A device is present and a measurement was attempted, but the device path
+    /// did not engage (false routing) — refused rather than reported as a pass.
+    DeviceNotEngaged,
+}
+
+/// Tri-state Stage-3 encode deployment / amortized-surrogate decision
+/// (#988, #1412).
+///
+/// The decision the throughput gate exists to make is empirical: does the EXACT
+/// per-row encode clear the `100_000` rows/sec/GPU deployment target on a real
+/// device? Only a real device measurement can answer it:
+///   * [`Self::Met`] — a device measurement CLEARED the target: ship the exact
+///     encode; the certified amortized surrogate is NOT needed.
+///   * [`Self::Unmet`] — a device measurement MISSED the target: the certified
+///     amortized surrogate becomes justified.
+///   * [`Self::Undetermined`] — no device measurement is available. The decision
+///     is BLOCKED on hardware; it is neither "surrogate unneeded" nor "surrogate
+///     justified".
+///
+/// The critical anti-green-wash property (#1412): there is NO constructor that
+/// takes a CPU rate. A CPU measurement, however fast, can never move the decision
+/// out of [`Self::Undetermined`]. Projecting a CPU rate through an assumed
+/// CPU→GPU factor to declare the target met was the exact #1412 defect and is
+/// structurally impossible here — [`Self::Met`] / [`Self::Unmet`] come only from
+/// [`Self::from_device_measurement`] with `engaged == true`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum EncodeDeploymentDecision {
+    /// A device measurement established the deployment target.
+    Met {
+        /// The measured device rows/sec that cleared the target.
+        measured_rows_per_sec: f64,
+        /// The target it was compared against.
+        target_rows_per_sec: f64,
+    },
+    /// A device measurement fell short of the deployment target.
+    Unmet {
+        /// The measured device rows/sec that missed the target.
+        measured_rows_per_sec: f64,
+        /// The target it was compared against.
+        target_rows_per_sec: f64,
+    },
+    /// No device measurement is available; the decision is blocked on hardware.
+    Undetermined {
+        /// Why no device measurement could be made.
+        reason: EncodeDecisionBlocked,
+    },
+}
+
+impl EncodeDeploymentDecision {
+    /// The ONLY path to a `Met`/`Unmet` decision: a device measurement that
+    /// actually engaged the device and produced a usable rate. `engaged == false`
+    /// (false routing / CPU decline) or a non-finite / non-positive rate yields
+    /// [`Self::Undetermined`] — never a fabricated pass or fail.
+    #[must_use]
+    pub fn from_device_measurement(engaged: bool, measured_rows_per_sec: f64) -> Self {
+        Self::from_device_measurement_against(
+            engaged,
+            measured_rows_per_sec,
+            GPU_THROUGHPUT_TARGET_ROWS_PER_SEC,
+        )
+    }
+
+    /// [`Self::from_device_measurement`] against an explicit target (for tests
+    /// that probe the decision logic without the global target constant).
+    #[must_use]
+    pub fn from_device_measurement_against(
+        engaged: bool,
+        measured_rows_per_sec: f64,
+        target_rows_per_sec: f64,
+    ) -> Self {
+        let usable = measured_rows_per_sec.is_finite() && measured_rows_per_sec > 0.0;
+        if !engaged || !usable {
+            return Self::Undetermined {
+                reason: EncodeDecisionBlocked::DeviceNotEngaged,
+            };
+        }
+        if measured_rows_per_sec >= target_rows_per_sec {
+            Self::Met {
+                measured_rows_per_sec,
+                target_rows_per_sec,
+            }
+        } else {
+            Self::Unmet {
+                measured_rows_per_sec,
+                target_rows_per_sec,
+            }
+        }
+    }
+
+    /// Construct the blocked decision for a host that cannot measure the exact
+    /// encode on a device. This is the honest CPU-only / no-device-kernel outcome
+    /// — the deployment target is left undetermined rather than projected.
+    #[must_use]
+    pub fn blocked(reason: EncodeDecisionBlocked) -> Self {
+        Self::Undetermined { reason }
+    }
+
+    /// True ONLY when a device measurement cleared the target: the exact encode
+    /// ships and no surrogate is built. Never true from a CPU proxy.
+    #[must_use]
+    pub fn surrogate_unneeded(&self) -> bool {
+        matches!(self, Self::Met { .. })
+    }
+
+    /// True ONLY when a device measurement missed the target: the certified
+    /// amortized surrogate becomes justified. Never true without a measurement.
+    #[must_use]
+    pub fn surrogate_justified(&self) -> bool {
+        matches!(self, Self::Unmet { .. })
+    }
+
+    /// True when no device measurement is available and the decision is blocked
+    /// on hardware (neither [`Self::surrogate_unneeded`] nor
+    /// [`Self::surrogate_justified`]).
+    #[must_use]
+    pub fn is_undetermined(&self) -> bool {
+        matches!(self, Self::Undetermined { .. })
+    }
+}
+
 /// Which `(response, link)` family the Stage 3.3 device-resident PIRLS loop
 /// can evaluate without going through the Level-B raw-body NVRTC path.
 ///
@@ -625,6 +761,80 @@ mod reduced_schur_matvec_offload_tests {
                 lower < actual,
                 "admission lower bound {lower} must undercount actual work {actual} for ({n},{k},{d})"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod encode_deployment_decision_tests {
+    use super::*;
+
+    /// #1412 anti-green-wash core: a CPU rate can NEVER produce a `Met`/`Unmet`
+    /// decision. The only Met/Unmet constructor requires `engaged == true`; a
+    /// CPU-only host has no device measurement, so it can only ever be
+    /// `Undetermined`, no matter how fast the CPU is.
+    #[test]
+    fn cpu_rate_can_never_meet_or_refute_the_target() {
+        // Even a CPU rate a thousand times the target cannot certify the gate:
+        // there is simply no `from_cpu_measurement` — the type has no such door.
+        // The blocked constructor is the only CPU-side option.
+        let cpu_only = EncodeDeploymentDecision::blocked(EncodeDecisionBlocked::NoDevice);
+        assert!(cpu_only.is_undetermined());
+        assert!(!cpu_only.surrogate_unneeded());
+        assert!(!cpu_only.surrogate_justified());
+
+        // A "device" measurement that did not engage (false routing) is refused —
+        // it becomes Undetermined even with a huge rate.
+        let false_routed = EncodeDeploymentDecision::from_device_measurement(false, 1.0e9);
+        assert!(false_routed.is_undetermined());
+        assert!(!false_routed.surrogate_unneeded());
+    }
+
+    #[test]
+    fn engaged_measurement_decides_by_the_number() {
+        let target = GPU_THROUGHPUT_TARGET_ROWS_PER_SEC;
+        // Clears the target => Met => surrogate unneeded.
+        let met = EncodeDeploymentDecision::from_device_measurement(true, target * 2.0);
+        assert!(matches!(met, EncodeDeploymentDecision::Met { .. }));
+        assert!(met.surrogate_unneeded());
+        assert!(!met.surrogate_justified());
+        assert!(!met.is_undetermined());
+
+        // Misses the target => Unmet => surrogate justified.
+        let unmet = EncodeDeploymentDecision::from_device_measurement(true, target * 0.25);
+        assert!(matches!(unmet, EncodeDeploymentDecision::Unmet { .. }));
+        assert!(unmet.surrogate_justified());
+        assert!(!unmet.surrogate_unneeded());
+
+        // Exact boundary meets the target.
+        let boundary = EncodeDeploymentDecision::from_device_measurement(true, target);
+        assert!(boundary.surrogate_unneeded());
+    }
+
+    #[test]
+    fn engaged_but_non_usable_rate_is_undetermined_not_a_pass() {
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let d = EncodeDeploymentDecision::from_device_measurement(true, bad);
+            assert!(
+                d.is_undetermined(),
+                "an engaged-but-unusable rate {bad} must be Undetermined, not a decision"
+            );
+            assert!(!d.surrogate_unneeded());
+            assert!(!d.surrogate_justified());
+        }
+    }
+
+    #[test]
+    fn blocked_reasons_are_all_undetermined() {
+        for reason in [
+            EncodeDecisionBlocked::NoDevice,
+            EncodeDecisionBlocked::NoDeviceEncodeKernel,
+            EncodeDecisionBlocked::DeviceNotEngaged,
+        ] {
+            let d = EncodeDeploymentDecision::blocked(reason);
+            assert!(d.is_undetermined());
+            assert!(!d.surrogate_unneeded());
+            assert!(!d.surrogate_justified());
         }
     }
 }

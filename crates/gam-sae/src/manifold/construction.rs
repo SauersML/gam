@@ -7184,10 +7184,73 @@ impl SaeManifoldTerm {
             self.k_atoms(),
         )?;
         if plan.estimated_dense_schur_bytes > plan.in_core_budget_bytes {
-            return Err(format!(
-                "SaeManifoldTerm::streaming_exact_arrow_log_det: predicted dense reduced Schur {} bytes exceeds budget {} bytes; cost-only matrix-free route is required",
-                plan.estimated_dense_schur_bytes, plan.in_core_budget_bytes
-            ));
+            // #988 memory-matrix-free evidence route. The dense k×k reduced Schur
+            // (≈8 GB at the K=32k manifold border) does NOT fit the in-core
+            // budget, so estimate log|S| via Stochastic Lanczos Quadrature on the
+            // matrix-free `schur_matvec` apply (`gam_solve::arrow_schur::
+            // matrix_free_arrow_evidence_log_det`) instead of assembling +
+            // Cholesky-factoring the dense Schur. Peak memory is the per-row block
+            // storage the inner PCG already holds, not the extra O(k²) dense S.
+            //
+            // Valid for the NON-IBP (softmax / JumpReLU) evidence, whose exact
+            // log-det is `log_det_tt + log_det_schur` with NO cross-row Woodbury
+            // correction. The IBP cross-row term additionally needs
+            // `log det(I_R + D Uᵀ H₀'⁻¹ U)`, which has no matrix-free route yet, so
+            // it keeps refusing (loudly, pointing at the dense resident path).
+            if ibp_assignment_third_channels(&self.assignment, rho)?.is_some() {
+                return Err(format!(
+                    "SaeManifoldTerm::streaming_exact_arrow_log_det: predicted dense reduced Schur \
+                     {} bytes exceeds budget {} bytes and the exact cross-row IBP Woodbury evidence \
+                     has no matrix-free log-det route yet; route IBP-active large-K fits through the \
+                     dense resident ArrowFactorCache::arrow_log_det",
+                    plan.estimated_dense_schur_bytes, plan.in_core_budget_bytes
+                ));
+            }
+            let n_total = self.n_obs();
+            let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+            // Assemble the WHOLE system once (a single "chunk" over all rows) so the
+            // matrix-free reduced-Schur apply `v ↦ S·v` can iterate every row; the
+            // per-row block storage is exactly what the inner solve already holds.
+            let full_logits = self.assignment.logits.slice(s![0..n_total, ..]).to_owned();
+            let full_coords: Vec<Array2<f64>> = self
+                .assignment
+                .coords
+                .iter()
+                .map(|coord| coord.as_matrix().slice(s![0..n_total, ..]).to_owned())
+                .collect();
+            let mut full_chunk = self.materialize_chunk(full_logits, full_coords)?;
+            if let Some(w) = self.row_loss_weights.as_deref() {
+                full_chunk.row_loss_weights = Some(w[0..n_total].to_vec());
+            }
+            // Full penalty (`penalty_scale = 1.0`): one chunk carries the whole
+            // objective, matching the summed per-chunk `(end-start)/n_total` scale.
+            let sys = full_chunk
+                .assemble_arrow_schur_scaled(target, rho, registry, 1.0)
+                .map_err(|err| {
+                    format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}")
+                })?;
+            let (log_det_tt, slq) = matrix_free_arrow_evidence_log_det(
+                &sys,
+                0.0,
+                0.0,
+                &options,
+                SCHUR_SLQ_LOGDET_PROBES,
+                SCHUR_SLQ_LOGDET_LANCZOS_STEPS,
+                SCHUR_SLQ_LOGDET_SEED,
+            )
+            .map_err(|err| {
+                format!(
+                    "SaeManifoldTerm::streaming_exact_arrow_log_det: matrix-free evidence log-det: {err:?}"
+                )
+            })?;
+            if !slq.estimate.is_finite() {
+                return Err(format!(
+                    "SaeManifoldTerm::streaming_exact_arrow_log_det: matrix-free SLQ reduced-Schur \
+                     log|S| non-finite ({})",
+                    slq.estimate
+                ));
+            }
+            return Ok(log_det_tt + slq.estimate);
         }
         let n_total = self.n_obs();
         let chunk_size = plan.chunk_size.min(n_total.max(1));

@@ -351,6 +351,40 @@ fn sae_direct_mode_routing_reachable_and_non_regressing_1551() {
         GpuDispatchPolicy::DEVICE_LOOP_MIN_P
     );
 
+    // Stronger #1551/#1017 proof than the border-floor check alone: assert the
+    // FULL work-based offload predicate the Direct device seam consults
+    // (`try_device_arrow_direct_sae_pcg` → `runtime.policy().
+    // reduced_schur_matvec_should_offload(n, k, d, cg_iters)`) admits this
+    // production-shaped fixture. The predicate is a pure function of shape and
+    // `const` thresholds (device-memory independent), so `GpuDispatchPolicy::
+    // default()` returns the same verdict the live seam would. cg_iters is
+    // derived EXACTLY as the seam derives it from the Direct options. With every
+    // shape gate satisfied, the ONLY thing that declines the device on this host
+    // is `GpuRuntime::global()` being absent (CPU-only) — i.e. on a CUDA host
+    // this same fixture is SELECTED for the device (the on-GPU engagement test
+    // below asserts it then runs).
+    let seam_options = direct_options();
+    let cg_iters = seam_options
+        .pcg
+        .max_iterations
+        .min(seam_options.trust_region.max_iterations);
+    let q_depth = sys.rows.first().map(|r| r.htt.nrows()).unwrap_or(0);
+    assert!(
+        GpuDispatchPolicy::default().reduced_schur_matvec_should_offload(
+            sys.rows.len(),
+            sys.k,
+            q_depth,
+            cg_iters,
+        ),
+        "production-shaped SAE fixture (n={}, k={}, d={}, cg_iters={}) must clear the \
+         reduced-Schur offload predicate so the Direct device seam selects the device \
+         (GPU-absence is then the sole decliner on a CPU host)",
+        sys.rows.len(),
+        sys.k,
+        q_depth,
+        cg_iters,
+    );
+
     if GpuRuntime::global().is_some() {
         // A GPU host would route the production solve to the (currently faulting)
         // device kernel; that on-GPU assertion is the ignored test below. Here we

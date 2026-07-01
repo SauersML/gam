@@ -2604,10 +2604,11 @@ pub(crate) fn decoder_repulsion_strength_is_derived_and_scale_invariant_1610() {
     };
 
     // (1) — the repulsion strength is the derived fraction
-    // `SAE_DECODER_REPULSION_BARRIER_RATIO · μ_C` of the data-derived barrier
-    // strength, and μ_C is itself derived from the dictionary's overcompleteness
-    // (K / reachable_rank), NOT a hand-picked magnitude. Checked on a constructed
-    // unit-scale term (μ_C is now a per-term quantity).
+    // `SAE_DECODER_REPULSION_BARRIER_RATIO · μ_C` of the separation-barrier
+    // strength, and μ_C is itself EVIDENCE-DERIVED — the worst-case data-fit
+    // inseparability strength `γ/(1-γ)` over the co-active pairs (#1610), NOT a
+    // hand-picked magnitude and NOT a rank-count heuristic. Checked on a
+    // constructed unit-scale term (μ_C is a per-term, per-pair quantity).
     let unit_term = build_at_scale(1.0);
     let expected =
         SAE_DECODER_REPULSION_BARRIER_RATIO * unit_term.separation_barrier_strength();
@@ -2615,27 +2616,31 @@ pub(crate) fn decoder_repulsion_strength_is_derived_and_scale_invariant_1610() {
         unit_term.decoder_repulsion_strength(),
         expected,
         "repulsion strength must be the derived fraction {SAE_DECODER_REPULSION_BARRIER_RATIO} \
-         of the data-derived separation-barrier strength {}, got {}",
+         of the evidence-derived separation-barrier strength {}, got {}",
         unit_term.separation_barrier_strength(),
         unit_term.decoder_repulsion_strength(),
     );
-    let demand = unit_term.nominal_rank_demand();
-    let capacity = unit_term.linear_rank_capacity();
-    assert_eq!(
-        unit_term.separation_barrier_strength(),
-        (demand as f64) / (capacity as f64),
-        "μ_C must be the data-derived overcompleteness ratio demand/capacity \
-         (Σ_k min(M_k,p)={demand}, min(n,p)={capacity}), not a frozen absolute constant",
+    // The evidence-derived strength is a strictly positive, finite number for a
+    // genuinely co-active pair (the data-fit couples them, so γ > 0), and it is
+    // NOT the old overcompleteness ratio (which for two periodic M=3 atoms in p=3
+    // was pinned at exactly 2.0). It is the reciprocal-margin `γ/(1-γ)` to the
+    // data-fit's co-collapse boundary, read from the chart design + routing.
+    let mu_c = unit_term.separation_barrier_strength();
+    assert!(
+        mu_c > 0.0 && mu_c.is_finite(),
+        "μ_C must be a positive finite evidence-derived strength for a co-active \
+         pair, got {mu_c}"
     );
-    // The intended semantics: unit strength at true completeness, growing with
-    // overcompleteness. Two periodic M=3 atoms (demand=6) in p=3 (capacity=3) are
-    // 2× overcomplete, so μ_C = 2 — NOT the mis-scaled 1/M = 1/3 the old
-    // K/Σmin(M_k,p) formula gave.
-    assert_eq!(
-        unit_term.separation_barrier_strength(),
-        2.0,
-        "two periodic M=3 atoms crammed into p=3 are 2× overcomplete ⇒ μ_C = 2 \
-         (demand {demand} / capacity {capacity}), not 1/3",
+    // Decoder-scale invariance of the STRENGTH: γ (hence μ_C) is read from the
+    // chart design + routing, not the decoder magnitudes, so rescaling the whole
+    // dictionary leaves the strength unchanged (unlike a REML `λ ∝ σ²/τ²`).
+    let mu_c_tiny = build_at_scale(1.0e-7).separation_barrier_strength();
+    let mu_c_huge = build_at_scale(1.0e6).separation_barrier_strength();
+    let rel_mu = |a: f64, b: f64| (a - b).abs() / b.abs().max(f64::MIN_POSITIVE);
+    assert!(
+        rel_mu(mu_c_tiny, mu_c) <= 1e-9 && rel_mu(mu_c_huge, mu_c) <= 1e-9,
+        "evidence-derived μ_C must be decoder-scale invariant: unit={mu_c} \
+         tiny={mu_c_tiny} huge={mu_c_huge}"
     );
 
     let value_unit = build_at_scale(1.0).decoder_repulsion_value(1.0);
@@ -2659,6 +2664,145 @@ pub(crate) fn decoder_repulsion_strength_is_derived_and_scale_invariant_1610() {
         rel(value_huge, value_unit) <= 1e-9,
         "repulsion value must be scale-invariant: unit={value_unit} huge={value_huge} \
          (old absolute constant scaled this by s⁴)"
+    );
+}
+
+/// #1610 — the separation-barrier strength is EVIDENCE-DERIVED: the per-pair
+/// strength `μ_jk = γ_jk/(1-γ_jk)` is a MONOTONE function of the data-fit
+/// inseparability `γ_jk` (the largest canonical correlation of the two atoms'
+/// coactivation-weighted chart designs — the quantity that decides whether the
+/// joint inner Laplace/REML Hessian stays PD). This replaces the old geometry
+/// heuristic `Σ min(M_k,p)/min(n,p)`, which was blind to the actual design/routing
+/// and so gave the SAME strength to a data-separable pair and a data-degenerate
+/// one. Here two atoms with IDENTICAL chart designs are driven from data-fit
+/// SEPARABLE (disjoint routing ⇒ γ ≈ 0 ⇒ μ ≈ 0) to data-fit DEGENERATE
+/// (overlapping routing on a shared design ⇒ γ → 1 ⇒ μ large), and the strength
+/// must rise accordingly. γ (hence μ) is read from the design + routing only, so
+/// it is decoder-scale free.
+#[test]
+pub(crate) fn barrier_strength_tracks_data_fit_inseparability_1610() {
+    let coords = array![[0.05], [0.20], [0.55], [0.80], [0.35], [0.65]];
+    let (phi, jet) = periodic_basis(&coords);
+    // Two atoms with the SAME chart design (identical Φ) so the ONLY thing that
+    // sets γ is the coactivation-weighted routing overlap we pass in.
+    let make = |name: &str, decoder: Array2<f64>| {
+        SaeManifoldAtom::new(
+            name,
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi.clone(),
+            jet.clone(),
+            decoder,
+            Array2::<f64>::eye(3),
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(TestPeriodicEvaluator))
+    };
+    let mut dec0 = Array2::<f64>::zeros((3, 3));
+    dec0[[0, 0]] = 1.0;
+    let mut dec1 = Array2::<f64>::zeros((3, 3));
+    dec1[[0, 1]] = 1.0;
+    let logits = array![
+        [0.7, -0.2],
+        [0.1, 0.4],
+        [-0.3, 0.5],
+        [0.6, -0.1],
+        [0.2, 0.3],
+        [0.4, 0.1]
+    ];
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        logits,
+        vec![coords.clone(), coords.clone()],
+        vec![
+            LatentManifold::Circle { period: 1.0 },
+            LatentManifold::Circle { period: 1.0 },
+        ],
+        AssignmentMode::softmax(0.8),
+    )
+    .unwrap();
+    let term = SaeManifoldTerm::new(vec![make("a0", dec0), make("a1", dec1)], assignment).unwrap();
+
+    // DISJOINT routing: atom 0 fires only on the first three rows, atom 1 only on
+    // the last three. No row co-fires, so the weighted cross-design Gram is 0 ⇒
+    // γ ≈ 0 ⇒ the data-fit already separates the pair ⇒ μ ≈ 0 (no safeguard owed).
+    let gates_disjoint = array![
+        [1.0, 0.0],
+        [1.0, 0.0],
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [0.0, 1.0],
+        [0.0, 1.0]
+    ];
+    let gamma_sep = term.design_inseparability_with_gates(gates_disjoint.view(), 0, 1);
+    let mu_sep = term.barrier_pair_strength_with_gates(gates_disjoint.view(), 0, 1);
+    assert!(
+        gamma_sep <= 1e-9,
+        "disjoint routing on any design ⇒ data-fit separable ⇒ γ ≈ 0, got {gamma_sep}"
+    );
+    assert!(
+        mu_sep <= 1e-6,
+        "a data-fit-separable pair owes ~no separation barrier, got μ = {mu_sep}"
+    );
+
+    // OVERLAPPING routing on the SHARED design: both atoms fire together on every
+    // row, so the two coactivation-weighted design column spaces COINCIDE ⇒ γ → 1
+    // (the data-fit cannot tell them apart) ⇒ μ = γ/(1-γ) is large.
+    let gates_overlap = array![
+        [1.0, 1.0],
+        [1.0, 1.0],
+        [1.0, 1.0],
+        [1.0, 1.0],
+        [1.0, 1.0],
+        [1.0, 1.0]
+    ];
+    let gamma_deg = term.design_inseparability_with_gates(gates_overlap.view(), 0, 1);
+    let mu_deg = term.barrier_pair_strength_with_gates(gates_overlap.view(), 0, 1);
+    assert!(
+        gamma_deg > 0.999,
+        "identical designs + identical routing ⇒ perfectly inseparable ⇒ γ → 1, got {gamma_deg}"
+    );
+    assert!(
+        mu_deg > mu_sep + 1.0,
+        "the barrier strength MUST rise as the data-fit inseparability rises: \
+         separable μ={mu_sep} vs degenerate μ={mu_deg}"
+    );
+    // μ = γ/(1-γ) exactly (evidence-derived reciprocal margin), no hidden magic.
+    let eps = SAE_SEPARATION_BARRIER_EPS;
+    let expected_deg = gamma_deg / (1.0 - gamma_deg).max(eps);
+    assert!(
+        (mu_deg - expected_deg).abs() <= expected_deg.abs() * 1e-9 + 1e-12,
+        "μ must equal γ/max(1-γ,ε): γ={gamma_deg} expected={expected_deg} got={mu_deg}"
+    );
+
+    // γ (hence μ) is a DESIGN/ROUTING quantity, independent of decoder magnitude:
+    // rescaling the decoders leaves both unchanged.
+    let mut big0 = Array2::<f64>::zeros((3, 3));
+    big0[[0, 0]] = 1.0e6;
+    let mut big1 = Array2::<f64>::zeros((3, 3));
+    big1[[0, 1]] = 1.0e6;
+    let assignment2 = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        array![
+            [0.7, -0.2],
+            [0.1, 0.4],
+            [-0.3, 0.5],
+            [0.6, -0.1],
+            [0.2, 0.3],
+            [0.4, 0.1]
+        ],
+        vec![coords.clone(), coords.clone()],
+        vec![
+            LatentManifold::Circle { period: 1.0 },
+            LatentManifold::Circle { period: 1.0 },
+        ],
+        AssignmentMode::softmax(0.8),
+    )
+    .unwrap();
+    let term_big =
+        SaeManifoldTerm::new(vec![make("a0", big0), make("a1", big1)], assignment2).unwrap();
+    let mu_deg_big = term_big.barrier_pair_strength_with_gates(gates_overlap.view(), 0, 1);
+    assert!(
+        (mu_deg_big - mu_deg).abs() <= mu_deg.abs() * 1e-9,
+        "evidence-derived μ must be decoder-scale invariant: unit={mu_deg} big={mu_deg_big}"
     );
 }
 
@@ -3691,24 +3835,51 @@ pub(crate) fn planted_circle_seed_term(
 }
 
 #[test]
+pub(crate) fn planted_circle_focus_1744() {
+    let assignment_mode = PlantedCircleAssignmentMode::IbpMap;
+    let n = 40usize;
+    let sigma = 0.18_f64;
+    let z = planted_circle_data(n, sigma);
+    let (term, seed_dispersion) = planted_circle_seed_term(z.view(), assignment_mode);
+    let seed_ev = global_ev(z.view(), term.fitted().view());
+    let init_rho = SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![array![0.0]])
+        .seed_scaled_by_dispersion_for_assignment(seed_dispersion, assignment_mode.mode())
+        .unwrap();
+    eprintln!(
+        "FOCUS1744 seed_ev={seed_ev:.4} seed_disp={seed_dispersion:.3e} init_rho=({:.4},{:?},{:?})",
+        init_rho.log_lambda_sparse, init_rho.log_lambda_smooth, init_rho.log_ard
+    );
+    let init_rho_flat = init_rho.to_flat();
+    eprintln!("FOCUS1744 init_rho_flat={init_rho_flat:?}");
+    let n_params = init_rho_flat.len();
+    let mut objective =
+        SaeManifoldOuterObjective::new(term, z.clone(), None, init_rho, 50, 0.04, 1.0e-6, 1.0e-6);
+    gam_solve::rho_optimizer::OuterProblem::new(n_params)
+        .with_initial_rho(init_rho_flat)
+        .run(&mut objective, "SAE planted circle FOCUS1744")
+        .unwrap();
+    let fitted_result = objective.into_fitted();
+    let rho = fitted_result.rho;
+    let ev = global_ev(z.view(), fitted_result.term.fitted().view());
+    eprintln!(
+        "FOCUS1744 final_rho=({:.4},{:?},{:?}) EV={ev:.4}",
+        rho.log_lambda_sparse, rho.log_lambda_smooth, rho.log_ard
+    );
+    assert!(ev.is_finite(), "focused diagnostic produced a non-finite EV");
+}
+
+#[test]
 pub(crate) fn planted_circle_noise_scale_sweep_reaches_high_ev_with_dimensionless_rho_seed() {
     for assignment_mode in [
         PlantedCircleAssignmentMode::Softmax,
         PlantedCircleAssignmentMode::IbpMap,
     ] {
         let assignment_label = assignment_mode.label();
-        for &n in &[40usize] {
-            for &sigma in &[0.05_f64] {
+        for &n in &[40usize, 250usize] {
+            for &sigma in &[0.02_f64, 0.05, 0.18] {
                 let z = planted_circle_data(n, sigma);
                 let (term, seed_dispersion) = planted_circle_seed_term(z.view(), assignment_mode);
                 let seed_ev = global_ev(z.view(), term.fitted().view());
-                {
-                    let a0 = term.assignment.try_assignments_row(0).unwrap();
-                    eprintln!(
-                        "TRACE-SEED mode={assignment_label} n={n} sigma={sigma} seed_ev={seed_ev:.4} seed_phi={seed_dispersion:.4e} gate0={:.5}",
-                        a0[0]
-                    );
-                }
                 let init_rho = SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![array![0.0]])
                     .seed_scaled_by_dispersion_for_assignment(
                         seed_dispersion,
@@ -3736,13 +3907,6 @@ pub(crate) fn planted_circle_noise_scale_sweep_reaches_high_ev_with_dimensionles
                 let rho = fitted_result.rho;
                 let fitted = fitted_term.fitted();
                 let ev = global_ev(z.view(), fitted.view());
-                {
-                    let a0 = fitted_term.assignment.try_assignments_row(0).unwrap();
-                    eprintln!(
-                        "TRACE-FINAL mode={assignment_label} n={n} sigma={sigma} EV={ev:.4} gate0={:.5} rho=({:.4},{:?},{:?})",
-                        a0[0], rho.log_lambda_sparse, rho.log_lambda_smooth, rho.log_ard
-                    );
-                }
                 assert!(
                     ev > 0.95,
                     "planted circle assignment={assignment_label} n={n} sigma={sigma} seed_ev={seed_ev:.4} seed_phi={seed_dispersion:.3e} \

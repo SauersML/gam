@@ -157,6 +157,19 @@ pub(super) fn run(
         // (d) unit-norm projection (identifies code scale) + stable sign.
         unit_norm_rows(&mut decoder);
 
+        // (e) dead-atom revival. Atoms that fired for no row this epoch are re-
+        // seeded onto the current worst-reconstructed rows' residual directions.
+        // Without this, a large dictionary leaves most atoms at their seed (see
+        // the dead counts in the fit report / #1026): effective `K` collapses to a
+        // handful of live atoms, EV is non-monotone in `K`, and the lane never
+        // climbs toward reconstruction parity. Reviving toward high-residual rows
+        // is the standard dead-feature resampling that makes every atom load-
+        // bearing, so adding atoms can only help. It runs only while dead atoms
+        // remain, so a fully-alive small-`K` dictionary is untouched.
+        if revive_dead_atoms(x, &codes, &mut decoder) > 0 {
+            unit_norm_rows(&mut decoder);
+        }
+
         // (a)+(b) FRESH codes against the just-refreshed, unit-normed decoder.
         // These are the codes that define the post-epoch model, so they (i) feed
         // the NEXT epoch's refresh and (ii) score the convergence EV below. This
@@ -405,6 +418,101 @@ fn refresh_decoder(
     let ridge = config.decoder_ridge as f64;
     let eq = assemble_normal_eq(x, codes, k, p);
     solve_decoder(decoder, &eq, ridge);
+}
+
+/// Re-seed atoms that fired for no row this epoch (dead atoms) onto the current
+/// worst-reconstructed rows' residual directions — the "dead-feature resampling"
+/// that lets a large dictionary actually use all `K` atoms (#1026).
+///
+/// Pointing a fresh atom at the largest reconstruction error is the greedy step
+/// that reduces RSS the most; distinct dead atoms take distinct high-residual
+/// rows so revived atoms do not duplicate each other. The residual is computed
+/// under the current (just-refreshed, unit-normed) decoder and the `codes` that
+/// produced this epoch's routing, so it reflects the live model's error. Only the
+/// residual *direction* is installed (raw, un-normed); the caller re-runs the
+/// unit-norm + sign projection. At most one atom is revived per distinct row per
+/// epoch — with more dead atoms than rows the remainder revive on later epochs as
+/// the residual field changes, which is the standard bounded-resample cadence.
+///
+/// Returns the number of atoms revived (0 leaves the decoder untouched, so a
+/// fully-alive small-`K` dictionary pays only the usage scan).
+fn revive_dead_atoms(
+    x: ArrayView2<'_, f32>,
+    codes: &[SparseCode],
+    decoder: &mut Array2<f32>,
+) -> usize {
+    let n = x.nrows();
+    let p = x.ncols();
+    let k = decoder.nrows();
+
+    // Which atoms fired (non-zero code) for at least one row this epoch.
+    let mut alive = vec![false; k];
+    for code in codes.iter() {
+        for (j, &idx) in code.indices.iter().enumerate() {
+            if code.codes[j] != 0.0 {
+                alive[idx as usize] = true;
+            }
+        }
+    }
+    let dead: Vec<usize> = (0..k).filter(|&a| !alive[a]).collect();
+    if dead.is_empty() {
+        return 0;
+    }
+
+    // Per-row residual under the current model, and its squared norm for ranking.
+    let mut resid = Array2::<f32>::zeros((n, p));
+    let mut resid_norm2 = vec![0.0f64; n];
+    for i in 0..n {
+        let xi = x.row(i);
+        let mut ri = resid.row_mut(i);
+        for c in 0..p {
+            ri[c] = xi[c];
+        }
+        let code = &codes[i];
+        for j in 0..code.indices.len() {
+            let cj = code.codes[j];
+            if cj == 0.0 {
+                continue;
+            }
+            let drow = decoder.row(code.indices[j] as usize);
+            for c in 0..p {
+                ri[c] -= cj * drow[c];
+            }
+        }
+        let mut acc = 0.0f64;
+        for c in 0..p {
+            acc += ri[c] as f64 * ri[c] as f64;
+        }
+        resid_norm2[i] = acc;
+    }
+
+    // Rows ranked by descending residual energy (ties by ascending index →
+    // deterministic). Only rows with real residual can seed a useful atom.
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        resid_norm2[b]
+            .partial_cmp(&resid_norm2[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.cmp(&b))
+    });
+
+    let mut revived = 0usize;
+    for (t, &atom) in dead.iter().enumerate() {
+        if t >= n {
+            break; // one atom per distinct row this epoch
+        }
+        let row = order[t];
+        if resid_norm2[row] <= (DEAD_DENOM as f64) {
+            break; // remaining rows are already reconstructed — nothing to seed
+        }
+        let src = resid.row(row);
+        let mut dst = decoder.row_mut(atom);
+        for c in 0..p {
+            dst[c] = src[c];
+        }
+        revived += 1;
+    }
+    revived
 }
 
 /// Solve `(A + ρI) D = B` exactly, writing the solved rows into `decoder`.

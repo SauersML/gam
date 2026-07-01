@@ -984,6 +984,31 @@ pub(crate) fn ordered_geometric_shrinkage_prior(k_atoms: usize, alpha: f64) -> A
     out
 }
 
+/// #1784 — K-aware default IBP concentration.
+///
+/// The ordered stick-breaking prior mean `π_k = (α/(α+1))^{k+1}` decays
+/// GEOMETRICALLY in the atom INDEX, so a fixed small concentration (the
+/// historical default `α = 1`, i.e. the `(0.5)^{k+1}` schedule) collapses to a
+/// near-hard mask past atom ~3: a K-atom dictionary can then only ever place
+/// mass on its first handful of atoms. That is exactly why the manifold SAE
+/// UNDERFITS a linear dictionary of equal K on real activations, and why its
+/// late atoms carry zero mass and leave the per-row joint Hessian rank-deficient
+/// (the K = 128 `RemlConvergenceError`).
+///
+/// For a K-atom dictionary to actually USE all K atoms the IBP concentration must
+/// scale with K. Choosing `α` so the LAST atom retains prior mass
+/// `π_{K-1} = (α/(α+1))^K ≈ e^{-1}` spans the whole dictionary while keeping the
+/// prior monotone (still an honest ordered stick-breaking prior — no atom is
+/// structurally masked). Solving `(α/(α+1))^K = e^{-1}` gives
+/// `α = 1/(exp(1/K) − 1) ≈ K − 1/2`. Floored at `1.0` so `K = 1` keeps the
+/// historical `α = 1`.
+pub fn default_ibp_concentration_for_k_atoms(k_atoms: usize) -> f64 {
+    let k = k_atoms.max(1) as f64;
+    // π_{K-1} = (α/(α+1))^K = e^{-1}  ⇒  α = 1/(e^{1/K} − 1).
+    let alpha = 1.0 / ((1.0 / k).exp() - 1.0);
+    alpha.max(1.0)
+}
+
 /// IBP-MAP row activations: per-atom sigmoid likelihood times the truncated
 /// stick-breaking prior mean `π_k = (α/(α+1))^{k+1}`. With tied logits the prior
 /// dominates and yields strictly decreasing activations in atom index, with the

@@ -17,13 +17,21 @@
 //!     would only add a certification liability.
 //!   * If it does NOT clear the gate, the surrogate becomes justified.
 //!
-//! This test runs on CPU with NO GPU, so it cannot measure the 10^5 rows/sec/GPU
-//! figure directly. Instead it measures the exact CPU batched-encode throughput
-//! and asserts a documented, principled CPU-scaled FLOOR (see
-//! `CPU_THROUGHPUT_FLOOR_ROWS_PER_SEC` below). Meeting the CPU floor is the
-//! evidence that, once the SAME arrow-Schur kernel is dropped onto a GPU batched
-//! path (see the GPU seam comment at the call site), the 10^5 rows/sec/GPU gate
-//! is reachable and the amortized surrogate is unnecessary.
+//! This test runs on CPU with NO GPU, so it CANNOT measure the 10^5 rows/sec/GPU
+//! figure and CANNOT make the surrogate-vs-no-surrogate deployment decision. It
+//! measures the exact CPU batched-encode throughput (as a correctness + perf
+//! regression sentinel only — see `CPU_ENCODE_REGRESSION_FLOOR_ROWS_PER_SEC`) and
+//! records the deployment decision as an honest tri-state
+//! [`gam::gpu::policy::EncodeDeploymentDecision`]: on a CPU-only host it is
+//! `Undetermined` (BLOCKED on hardware), NEVER "surrogate unneeded". Only a real
+//! device measurement can move it to `Met`/`Unmet`.
+//!
+//! HISTORY (#1412, reopened twice): earlier versions projected the CPU rate
+//! through an assumed `CPU_TO_GPU_SCALING = 100.0` and asserted the *projection*
+//! cleared the gate — a CPU number dressed up as a GPU deployment certification.
+//! That fudge is gone: there is no CPU→GPU factor and no CPU-derived surrogate
+//! decision anywhere below. A CPU rate, however fast, cannot make this gate claim
+//! the GPU target is met.
 //!
 //! The benchmark PRINTS the measured rows/sec per K verbatim; the assertion is
 //! the gate, the print is the datum.
@@ -66,32 +74,25 @@ const ENCODE_BATCH_ROWS: usize = 4096;
 const K_SMALL: usize = 64;
 const K_LARGE: usize = 1024;
 
-/// The GPU deployment gate, documented here so the decision rule is explicit in
-/// the assertion site. The CPU floor below is DERIVED from this target divided by
-/// the documented CPU->GPU scaling, so the CPU-floor verdict and the GPU
-/// projection are one and the same decision (see `CPU_TO_GPU_SCALING` and the
-/// consistency assertion at the gate).
-const GPU_DEPLOYMENT_GATE_ROWS_PER_SEC_PER_GPU: f64 = 1.0e5;
+/// The GPU deployment target, documented here purely as the number the DEVICE
+/// measurement is compared against (see the real-device block at the end of the
+/// gate). It is NOT projected from a CPU rate: #1412 was reopened twice precisely
+/// because the deployment decision rested on a CPU measurement scaled by an
+/// assumed CPU→GPU factor. There is no such factor here anymore — the deployment
+/// decision ([`gam::gpu::policy::EncodeDeploymentDecision`]) can only be made from
+/// a real device measurement, and on a CPU-only host it is honestly
+/// `Undetermined` (BLOCKED on hardware), never green.
+const GPU_DEPLOYMENT_TARGET_ROWS_PER_SEC_PER_GPU: f64 = 1.0e5;
 
-/// Documented, openly-conservative CPU->GPU per-row-encode speedup. The
-/// arrow-Schur per-row solve is embarrassingly parallel across rows; a saturated
-/// datacentre GPU (thousands of FP64 lanes + fused POTRF/TRSM) sustains
-/// conservatively >= 2 orders of magnitude over this single-threaded-equivalent
-/// CPU per-row rate. This is the explicit bridge that turns a CPU-only
-/// measurement into a projected GPU rate; the surrogate decision is derived from
-/// whether `rps_cpu * CPU_TO_GPU_SCALING` clears the GPU gate.
-const CPU_TO_GPU_SCALING: f64 = 100.0;
-
-/// **Decision-gate floor (GPU-target-derived).** #1412: the floor is no longer
-/// an arbitrary CPU number — it is exactly `gate / scaling`, the CPU per-row rate
-/// that, under the documented `CPU_TO_GPU_SCALING`, projects to the
-/// `10^5 rows/sec/GPU` deployment gate. So "CPU rate >= floor" is identical to
-/// "projected GPU rate >= gate": the same, sound decision at both dictionary
-/// sizes. (The earlier `2_000 @ K=64, scaled to 125 @ K=1024` floor was the
-/// #1412 defect — 125 rows/sec * any plausible CPU->GPU factor cannot reach
-/// 10^5, so the old K=1024 floor passed while the deployment target was missed.)
-const CPU_THROUGHPUT_FLOOR_ROWS_PER_SEC: f64 =
-    GPU_DEPLOYMENT_GATE_ROWS_PER_SEC_PER_GPU / CPU_TO_GPU_SCALING;
+/// **CPU regression sentinel — NOT a GPU projection.** This is a deliberately
+/// conservative lower bound on the CPU exact-encode rate whose ONLY job is to
+/// catch a catastrophic perf regression or a stalled/dead encode on the CPU
+/// benchmark path. It is explicitly NOT multiplied by any CPU→GPU factor and it
+/// makes NO claim about GPU throughput or the deployment target — that decision
+/// is made solely by the device measurement below. (The removed
+/// `CPU_TO_GPU_SCALING = 100.0` / `gate / scaling` floor was the #1412 defect: it
+/// dressed a CPU number up as a GPU deployment certification.)
+const CPU_ENCODE_REGRESSION_FLOOR_ROWS_PER_SEC: f64 = 100.0;
 
 /// Deterministic Lehmer-style uniform in [0,1) keyed purely by index (no clock).
 fn idx_uniform(seed: u64) -> f64 {
@@ -376,112 +377,111 @@ fn measure_encode_rows_per_sec(k_atoms: usize) -> f64 {
 
 #[test]
 fn sae_encode_throughput_decision_gate() {
-    println!("=== Stage-3 SAE encode throughput benchmark (#988) ===");
-    // #1412 HONESTY: this gate measures a CPU-side per-row encode floor as a
-    // PROXY; it does NOT measure the 100k rows/sec/GPU deployment target and
-    // establishes no CPU→GPU scaling. Clearing the CPU floor is a NECESSARY
-    // (the per-row work is cheap enough to be GPU-amortizable) but NOT a
-    // SUFFICIENT condition for the GPU gate — a real GPU benchmark on the device
-    // seam is required to certify the deployment target. The assertions below
-    // gate only the CPU floor + support-recovery correctness.
+    use gam::gpu::device_runtime::GpuRuntime;
+    use gam::gpu::encode_throughput::{measure_resident_solve_throughput, CANONICAL_ENCODE_SHAPES};
+    use gam::gpu::policy::{EncodeDecisionBlocked, EncodeDeploymentDecision};
+
+    println!("=== Stage-3 SAE encode throughput benchmark (#988 / #1412) ===");
+    // #1412 HONESTY (post-reopen fix): this CPU benchmark does NOT measure the
+    // 100k rows/sec/GPU deployment target and makes NO surrogate decision from a
+    // CPU number. It asserts only what CPU can honestly prove — the exact encode
+    // completes, recovers the planted support, and does not catastrophically
+    // regress (a conservative CPU regression sentinel). The deployment /
+    // surrogate DECISION is a tri-state `EncodeDeploymentDecision` that can reach
+    // `Met`/`Unmet` ONLY from a real device measurement; on this host it is
+    // `Undetermined` (BLOCKED on hardware) and the gate asserts it never
+    // green-washes to "surrogate unneeded".
     //
-    // The CPU rate is also OPTIMISTIC by construction, which is fine for a
-    // necessary-condition proxy but must be stated: the arrow-Schur assembly runs
-    // on the default Rayon pool (multi-core, not a single core); the per-row
-    // coordinates are warm-started near the planted truth; and dictionary build +
-    // warm-start happen before the timer (only the inner Newton loop is timed). So
-    // the measured rows/sec over-states a cold single-core encode — it is a
-    // ceiling on CPU difficulty, not a deployment figure.
+    // The CPU rate is OPTIMISTIC by construction (multi-core Rayon assembly,
+    // warm-started coordinates, setup outside the timer) — one more reason it is
+    // unfit as a GPU projection and is used only as a regression sentinel.
     println!(
-        "GPU deployment gate = {GPU_DEPLOYMENT_GATE_ROWS_PER_SEC_PER_GPU:.0} rows/sec/GPU \
-         (NOT measured here — CPU floor below is a proxy, not a GPU measurement; \
-         no CPU→GPU scaling is established by this test)."
+        "GPU deployment target = {GPU_DEPLOYMENT_TARGET_ROWS_PER_SEC_PER_GPU:.0} rows/sec/GPU \
+         (NOT measured on CPU; NO CPU→GPU projection; the deployment decision is a device-only \
+         tri-state — Undetermined here)."
     );
 
     let rps_small = measure_encode_rows_per_sec(K_SMALL);
     let rps_large = measure_encode_rows_per_sec(K_LARGE);
 
-    // #1412: a SINGLE, GPU-target-derived floor at both dictionary sizes. The
-    // floor is gate/scaling, so "CPU rate >= floor" IS "projected GPU rate >=
-    // gate" — the same sound decision. (The old `2000 @ K=64 -> 125 @ K=1024`
-    // K-scaled floor was the defect: 125 rows/sec cannot project to 10^5 under
-    // any plausible CPU->GPU factor, so the K=1024 floor passed while the
-    // deployment target was missed.)
-    let floor = CPU_THROUGHPUT_FLOOR_ROWS_PER_SEC;
-    let projected_gpu_small = rps_small * CPU_TO_GPU_SCALING;
-    let projected_gpu_large = rps_large * CPU_TO_GPU_SCALING;
-
+    // CPU regression sentinel ONLY — explicitly not a GPU projection and not a
+    // deployment claim. A dead/stalled encode (near-zero rows/sec) fails here;
+    // a healthy encode passes without asserting anything about the GPU target.
+    let floor = CPU_ENCODE_REGRESSION_FLOOR_ROWS_PER_SEC;
     println!(
-        "DECISION: K={K_SMALL} {rps_small:.1} rows/sec (floor {floor:.1}, projected GPU \
-         ~{projected_gpu_small:.0}); K={K_LARGE} {rps_large:.1} rows/sec (floor {floor:.1}, \
-         projected GPU ~{projected_gpu_large:.0}); gate {GPU_DEPLOYMENT_GATE_ROWS_PER_SEC_PER_GPU:.0} \
-         rows/sec/GPU"
+        "CPU-REGRESSION-SENTINEL: K={K_SMALL} {rps_small:.1} rows/sec, K={K_LARGE} {rps_large:.1} \
+         rows/sec (sentinel {floor:.1} rows/sec — regression guard, NOT a GPU projection)"
     );
-    let surrogate_unneeded = rps_small >= floor && rps_large >= floor;
-    println!(
-        "Stage-3 amortized surrogate needed? {}",
-        if surrogate_unneeded {
-            "NO (exact encode projects to clear the GPU gate at both K)"
-        } else {
-            "YES (exact encode below the GPU-target-derived floor)"
-        }
-    );
-
     assert!(
         rps_small >= floor,
-        "K={K_SMALL} exact encode throughput {rps_small:.1} rows/sec is below the \
-         GPU-target-derived floor {floor:.1} rows/sec (= {GPU_DEPLOYMENT_GATE_ROWS_PER_SEC_PER_GPU:.0} \
-         / {CPU_TO_GPU_SCALING:.0}); at a conservative {CPU_TO_GPU_SCALING:.0}x CPU->GPU speedup the \
-         projected GPU throughput ~{projected_gpu_small:.0} rows/sec/GPU misses the deployment gate, \
-         so a certified Stage-3 amortized surrogate becomes justified"
+        "K={K_SMALL} exact CPU encode {rps_small:.1} rows/sec fell below the regression sentinel \
+         {floor:.1} rows/sec — the encode stalled or catastrophically regressed (this is a CPU \
+         perf/liveness guard, NOT a GPU deployment claim)"
     );
     assert!(
         rps_large >= floor,
-        "K={K_LARGE} exact encode throughput {rps_large:.1} rows/sec is below the \
-         GPU-target-derived floor {floor:.1} rows/sec; at a conservative {CPU_TO_GPU_SCALING:.0}x \
-         CPU->GPU speedup the projected GPU throughput ~{projected_gpu_large:.0} rows/sec/GPU misses \
-         the {GPU_DEPLOYMENT_GATE_ROWS_PER_SEC_PER_GPU:.0} rows/sec/GPU gate at the large dictionary, \
-         so a certified Stage-3 amortized surrogate becomes justified"
+        "K={K_LARGE} exact CPU encode {rps_large:.1} rows/sec fell below the regression sentinel \
+         {floor:.1} rows/sec — the encode stalled or catastrophically regressed (this is a CPU \
+         perf/liveness guard, NOT a GPU deployment claim)"
     );
 
-    // Internal consistency: because the floor is gate/scaling, the CPU-floor
-    // verdict and the projected-GPU verdict are the SAME decision. Assert that
-    // identity so a future edit that decouples the floor from the gate (the
-    // #1412 defect) cannot silently reintroduce a CPU floor that passes while the
-    // GPU target is missed.
-    let projection_clears_gate = projected_gpu_small >= GPU_DEPLOYMENT_GATE_ROWS_PER_SEC_PER_GPU
-        && projected_gpu_large >= GPU_DEPLOYMENT_GATE_ROWS_PER_SEC_PER_GPU;
-    assert_eq!(
-        surrogate_unneeded, projection_clears_gate,
-        "#1412: the CPU-floor verdict ({surrogate_unneeded}) and the documented \
-         x{CPU_TO_GPU_SCALING:.0} GPU-projection verdict ({projection_clears_gate}) must be the same \
-         decision (the floor is gate/scaling); a divergence means the floor was decoupled from the \
-         {GPU_DEPLOYMENT_GATE_ROWS_PER_SEC_PER_GPU:.0} rows/sec/GPU gate — the #1412 defect"
-    );
-
-    // #1412 / #988 REAL DEVICE GATE: the CPU floor above is only a NECESSARY
-    // proxy keyed on a hardcoded x100 projection. When an actual CUDA device is
-    // present we replace the *projection* with a *measurement*: run the
-    // production device-resident penalized solve (the #1017 Phase-3 IRLS inner
-    // step) on the device and assert the MEASURED rows/sec establishes the
-    // deployment target on at least one canonical SAE shape. A device that is
-    // present but where the solve never engages is FALSE GPU ROUTING — a hard
-    // failure, not a silent CPU fallback. On a CPU-only host this block is a
-    // no-op (the proxy gate above is all that runs).
-    use gam::gpu::device_runtime::GpuRuntime;
-    use gam::gpu::encode_throughput::{
-        measure_resident_solve_throughput, CANONICAL_ENCODE_SHAPES,
-    };
+    // ── DEPLOYMENT / SURROGATE DECISION (#988, #1412) ──────────────────────
+    //
+    // The decision is empirical and DEVICE-ONLY. Two facts make it `Undetermined`
+    // on essentially every host today:
+    //   1. On a CPU-only host there is no device measurement at all.
+    //   2. Even ON a CUDA device, there is NO device-resident *exact-encode*
+    //      kernel — the production `certified_encode_*` path is host ndarray work,
+    //      and the resident normal-equations solve measured below is only ONE
+    //      COMPONENT of the encode (see `encode_throughput.rs` SCOPE), not the
+    //      full per-row encode. A component measurement cannot decide the encode
+    //      surrogate question (#988).
+    // So the encode deployment decision is `Undetermined`. It is emphatically NOT
+    // "surrogate unneeded": that would require a full-encode device measurement
+    // clearing the target, which does not exist yet.
     let device_present = GpuRuntime::global().map(|r| r.device_count()).unwrap_or(0) > 0;
+    let decision = if device_present {
+        EncodeDeploymentDecision::blocked(EncodeDecisionBlocked::NoDeviceEncodeKernel)
+    } else {
+        EncodeDeploymentDecision::blocked(EncodeDecisionBlocked::NoDevice)
+    };
+    println!("DEPLOYMENT DECISION (full exact encode): {decision:?}");
+    println!(
+        "Stage-3 amortized surrogate: {} — the exact encode is neither proven to clear the target \
+         (no full-encode device measurement) nor proven to miss it; BLOCKED on a device \
+         exact-encode kernel + measurement",
+        if decision.surrogate_unneeded() {
+            "NOT NEEDED"
+        } else if decision.surrogate_justified() {
+            "JUSTIFIED"
+        } else {
+            "UNDETERMINED (BLOCKED)"
+        }
+    );
+    assert!(
+        decision.is_undetermined(),
+        "#1412/#988: with no device exact-encode measurement the deployment decision must be \
+         Undetermined (BLOCKED on hardware), got {decision:?}"
+    );
+    assert!(
+        !decision.surrogate_unneeded(),
+        "#1412: the gate must NOT claim the amortized surrogate is unneeded without a real \
+         full-encode device measurement clearing the target (the reopened green-wash)"
+    );
+
+    // ── COMPONENT MEASUREMENT (device only) ────────────────────────────────
+    //
+    // When a CUDA device is present we STILL measure the resident penalized-solve
+    // COMPONENT and print it — it is real evidence about that inner step — but it
+    // is explicitly NOT the encode decision above. Its `engaged`/`meets_target`
+    // invariants guard against false routing; it never sets `surrogate_unneeded`
+    // for the full encode.
     if device_present {
-        let mut any_engaged = false;
-        let mut best_measured = 0.0_f64;
-        let mut any_meets = false;
         for &shape in CANONICAL_ENCODE_SHAPES {
             let res = measure_resident_solve_throughput(shape, 20);
             println!(
-                "REAL-DEVICE-GATE shape={} n={} p={} engaged={} measured_rows_per_sec={:.0} \
-                 frac_of_target={:.3} meets_target={}",
+                "COMPONENT-RESIDENT-SOLVE shape={} n={} p={} engaged={} measured_rows_per_sec={:.0} \
+                 frac_of_target={:.3} meets_target={} (COMPONENT ONLY — not the full encode decision)",
                 res.shape.label,
                 res.shape.n,
                 res.shape.p,
@@ -490,41 +490,19 @@ fn sae_encode_throughput_decision_gate() {
                 res.verdict.fraction_of_target,
                 res.verdict.meets_target,
             );
-            if res.engaged {
-                any_engaged = true;
-                best_measured = best_measured.max(res.measured_rows_per_sec);
-                any_meets |= res.verdict.meets_target;
-            } else {
+            if !res.engaged {
                 // A non-engaged shape can never be reported as meeting the
-                // target — this is the #1412 anti-fudge invariant at the gate.
+                // target — the #1412 anti-fudge invariant on the component too.
                 assert!(
                     !res.verdict.meets_target,
-                    "REAL-DEVICE-GATE: a non-engaged shape claimed to meet the target (false routing)"
+                    "COMPONENT: a non-engaged shape claimed to meet the target (false routing)"
                 );
             }
         }
-        assert!(
-            any_engaged,
-            "REAL-DEVICE-GATE: a CUDA device is present but the resident solve never engaged on any \
-             canonical SAE shape — false GPU routing (0% GPU is a failure, not a pass)"
-        );
-        assert!(
-            any_meets,
-            "REAL-DEVICE-GATE: device engaged but no canonical shape established the \
-             {GPU_DEPLOYMENT_GATE_ROWS_PER_SEC_PER_GPU:.0} rows/sec/GPU target; best measured \
-             {best_measured:.0} rows/sec/GPU. The deployment target is NOT established by a real \
-             measurement on this device"
-        );
-        println!(
-            "REAL-DEVICE-GATE: deployment target {GPU_DEPLOYMENT_GATE_ROWS_PER_SEC_PER_GPU:.0} \
-             rows/sec/GPU ESTABLISHED by measurement (best {best_measured:.0} rows/sec/GPU) — the \
-             CPU x{CPU_TO_GPU_SCALING:.0} projection is now corroborated by a device measurement, \
-             not assumed"
-        );
     } else {
         println!(
-            "REAL-DEVICE-GATE: no CUDA device — deployment target remains a CPU-proxy PROJECTION \
-             (necessary, not sufficient); a device run is required to certify it"
+            "COMPONENT-RESIDENT-SOLVE: no CUDA device — no component measurement; deployment \
+             decision remains Undetermined (BLOCKED), never a CPU projection"
         );
     }
 }

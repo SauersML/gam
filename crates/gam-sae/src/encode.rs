@@ -671,6 +671,14 @@ pub struct CertifiedChart {
     /// Amplitude-1 chart-center reconstruction `m₁(t_c) = BᵀΦ(t_c)` (length `p`),
     /// the anchor the amortized predictor expands the encode map around.
     pub recon_center: Array1<f64>,
+    /// Precomputed affine-predictor CONSTANT term `base = t_c − A₁·m₁(t_c)` (length
+    /// `d`), so the online amortized encode of a row `x` at amplitude `z` is the
+    /// single mat-vec `t̂ = base + (1/z)·A₁·x` with NO per-row `A₁·m₁` recompute.
+    /// Hoisting this atom-static term offline is what lets the massive-K index-routed
+    /// fast paths run a single allocation-free pass over rows (rather than a per-atom
+    /// GEMM sub-batch that degenerates to one row per group when `K ≫ N`). `None`
+    /// exactly when `amortized_jacobian` is `None` (singular Gauss–Newton block).
+    pub amortized_base: Option<Array1<f64>>,
 }
 
 /// The per-atom encode atlas: a set of certified charts covering the atom's
@@ -1486,6 +1494,7 @@ impl EncodeAtlas {
                         certified_radius: 0.0,
                         amortized_jacobian: None,
                         recon_center: Array1::<f64>::zeros(atom.output_dim()),
+                        amortized_base: None,
                     });
                     continue;
                 }
@@ -1508,6 +1517,11 @@ impl EncodeAtlas {
             } else {
                 region.radius
             };
+            // Precompute the affine-predictor constant `base = t_c − A₁·m₁` (atom-
+            // static), so the online encode is a single `base + (1/z)·A₁·x` mat-vec.
+            let amortized_base = amortized_jacobian
+                .as_ref()
+                .map(|a1| &center - &a1.dot(&recon_center));
             charts.push(CertifiedChart {
                 region,
                 lipschitz,
@@ -1515,6 +1529,7 @@ impl EncodeAtlas {
                 certified_radius,
                 amortized_jacobian,
                 recon_center,
+                amortized_base,
             });
         }
         Ok(AtomEncodeAtlas {
@@ -2104,17 +2119,18 @@ impl EncodeAtlas {
         // zeroed/uncertified — same as `amortized_warm_start` returning `None`).
         struct ChartPredictor<'a> {
             a1: &'a Array2<f64>,
-            base: Array1<f64>,
+            base: &'a Array1<f64>,
         }
         let predictors: Vec<Option<ChartPredictor<'_>>> = valid_charts
             .iter()
             .map(|&c| {
                 let chart = &atom_atlas.charts[c];
-                chart.amortized_jacobian.as_ref().map(|a1| {
-                    let a1_m1 = a1.dot(&chart.recon_center); // (d)
-                    let base = &chart.region.center - &a1_m1; // (d)
-                    ChartPredictor { a1, base }
-                })
+                // `base = t_c − A₁·m₁` is precomputed offline in the atlas; reuse it
+                // (both are `Some` together — singular G-N block ⇒ both `None`).
+                match (chart.amortized_jacobian.as_ref(), chart.amortized_base.as_ref()) {
+                    (Some(a1), Some(base)) => Some(ChartPredictor { a1, base }),
+                    _ => None,
+                }
             })
             .collect();
 
@@ -2471,22 +2487,26 @@ impl EncodeAtlas {
             ));
         }
         let budget = auto_candidate_budget(atoms.len().max(1));
-        // ── Per-row SUBLINEAR routing, grouped by the LSH-best atom. ────────────
-        // MASSIVE-K (K≈32k) throughput hinge. The certified path uses
-        // `route_exact`, but its universal-bound LSH certificate only fires when a
-        // gathered atom sits at the alignment ceiling (≈1.0); for any real
-        // dictionary where no atom perfectly aligns (`alignment < 1`) it ALWAYS
-        // falls through to `brute_force_best_atom` — an O(K) full scan PER ROW,
-        // making the whole encode O(N·K) and dominating at K=32k. This is the SPEED
-        // mode, so it takes the LSH gather's best-aligned atom directly
-        // (`propose` scores only the ~budget gathered candidates → sublinear in K).
-        // The gather's best is the exact global argmax on the overwhelming majority
-        // of rows (high LSH recall); a rare miss is a slightly-suboptimal atom that
-        // the fit-quality floor and the downstream certificate/exact fallback catch
-        // — the documented speed/accuracy tradeoff. This is what makes token-rate
-        // encode against a 32k-atom dictionary sublinear in K.
-        let mut groups: std::collections::HashMap<usize, Vec<usize>> =
-            std::collections::HashMap::new();
+        let mut coords = Array2::<f64>::zeros((n, latent_dim));
+        let mut valid = vec![false; n];
+        // ── Single allocation-free pass: route each row, apply the CACHED predictor.
+        //
+        // Routing sublinearity (massive-K, K≈32k): the certified path uses
+        // `route_exact`, whose universal-bound LSH certificate only fires at the
+        // alignment ceiling (≈1.0); for any real dictionary (`alignment < 1`) it
+        // falls back to `brute_force_best_atom` — an O(K) full scan PER ROW, making
+        // the encode O(N·K). This SPEED path takes the LSH gather's best-aligned atom
+        // directly (`propose` scores only ~budget candidates → O(log K)); a rare miss
+        // is caught by the fit-quality floor + the downstream certificate/exact
+        // fallback (the documented speed/accuracy tradeoff).
+        //
+        // Allocation: the predictor uses only OFFLINE-cached atlas data (per-chart
+        // `recon_center` for routing + `amortized_jacobian`/`amortized_base` for the
+        // `t̂ = base + (1/z)·A₁·x` mat-vec), so NO per-row or per-atom heap buffer is
+        // allocated. This replaces the old per-atom-group GEMM sub-batch — which at
+        // `K ≫ N` degenerated to ONE row per group, so its per-group buffers (x_sub,
+        // recon-centers, predictors) dominated and made the "fast" path allocation-
+        // bound. Now the only per-row allocation is inside `index.propose`.
         for row in 0..n {
             let dir = targets.row(row);
             let proposal = index.propose(sketch, dir, budget, true);
@@ -2494,44 +2514,27 @@ impl EncodeAtlas {
                 continue; // nothing gathered (empty dictionary / probe-dim mismatch)
             };
             // Fit-quality floor: the best gathered atom still fits this row poorly,
-            // or the alignment is NaN (zero-norm row) — leave the row out of every
-            // group so it flags for the exact multi-start fallback.
+            // or the alignment is NaN (zero-norm row) — flag for the exact fallback.
             let alignment = sketch.alignment(best_atom, dir);
             if !alignment.is_finite() || alignment < CANDIDATE_ROUTING_MIN_ALIGNMENT {
                 continue;
             }
-            groups.entry(best_atom).or_default().push(row);
-        }
-
-        let mut coords = Array2::<f64>::zeros((n, latent_dim));
-        let mut valid = vec![false; n];
-        // ── Per-atom batched predictor over each group's rows. ──────────────────
-        for (atom_idx, rows_here) in groups {
-            let atom = atoms.get(atom_idx).ok_or_else(|| {
-                format!("amortized_encode_with_index_fast: proposed atom {atom_idx} out of range")
+            let atom = atoms.get(best_atom).ok_or_else(|| {
+                format!("amortized_encode_with_index_fast: proposed atom {best_atom} out of range")
             })?;
             if atom.latent_dim != latent_dim {
                 return Err(format!(
-                    "amortized_encode_with_index_fast: atom {atom_idx} latent_dim {} != declared \
+                    "amortized_encode_with_index_fast: atom {best_atom} latent_dim {} != declared \
                      {latent_dim}; heterogeneous-dim dictionaries are not supported by this path",
                     atom.latent_dim
                 ));
             }
-            // Gather this group's target rows and amplitudes (contiguous sub-batch).
-            let p = atom.output_dim();
-            let mut x_sub = Array2::<f64>::zeros((rows_here.len(), p));
-            let mut amp_sub = Array1::<f64>::zeros(rows_here.len());
-            for (i, &row) in rows_here.iter().enumerate() {
-                x_sub.row_mut(i).assign(&targets.row(row));
-                amp_sub[i] = amplitudes[row];
-            }
-            let (sub_coords, sub_valid) =
-                self.amortized_encode_batch_fast(atom, atom_idx, x_sub.view(), amp_sub.view())?;
-            for (i, &row) in rows_here.iter().enumerate() {
-                if sub_valid[i] {
-                    coords.row_mut(row).assign(&sub_coords.row(i));
-                    valid[row] = true;
-                }
+            let Some(atom_atlas) = self.atoms.get(best_atom) else {
+                continue; // no atlas for this atom → predictor cannot fire (zeroed)
+            };
+            if amortized_predict_row(atom_atlas, dir, amplitudes[row], latent_dim, coords.row_mut(row))
+            {
+                valid[row] = true;
             }
         }
         Ok((coords, valid))
@@ -2698,6 +2701,65 @@ pub(crate) fn amortized_warm_start(
         }
     }
     Some(t_hat)
+}
+
+/// Single-row amortized predictor against ONE atom's cached atlas, writing the
+/// encoded latent coordinate DIRECTLY into `out` (length `d`) with NO heap
+/// allocation. Routes to the nearest certifiable chart by cached center-
+/// reconstruction distance `‖x − m(t_c)‖²` (matching `amortized_encode_batch_fast`'s
+/// per-chart routing), then applies that chart's precomputed affine predictor
+/// `t̂ = base + (1/z)·A₁·x` (`base = t_c − A₁·m₁` is `chart.amortized_base`).
+///
+/// Returns `false` — leaving `out` at its incoming (zeroed) value — for exactly the
+/// rows `amortized_encode_batch_fast` would flag: no certifiable chart, a nearest
+/// chart with no distilled predictor (singular Gauss–Newton block), or an unusable
+/// amplitude. This is the per-row core of the allocation-free massive-K fast encode.
+pub(crate) fn amortized_predict_row(
+    atom_atlas: &AtomEncodeAtlas,
+    x: ArrayView1<'_, f64>,
+    amplitude: f64,
+    d: usize,
+    mut out: ndarray::ArrayViewMut1<'_, f64>,
+) -> bool {
+    if !(amplitude.is_finite() && amplitude.abs() > 0.0) {
+        return false;
+    }
+    // Nearest certifiable chart by ‖x − recon_center‖² (first-wins on ties, strict
+    // `<` — same argmin as `amortized_encode_batch_fast`'s route_idx; the ‖x‖² term
+    // it drops is row-constant and does not change the argmin).
+    let mut best_ci: Option<usize> = None;
+    let mut best_dist = f64::INFINITY;
+    for (ci, chart) in atom_atlas.charts.iter().enumerate() {
+        if chart.certified_radius <= 0.0 {
+            continue;
+        }
+        let mut dist = 0.0;
+        for (r, xv) in chart.recon_center.iter().zip(x.iter()) {
+            let diff = r - xv;
+            dist += diff * diff;
+        }
+        if dist < best_dist {
+            best_dist = dist;
+            best_ci = Some(ci);
+        }
+    }
+    let Some(ci) = best_ci else {
+        return false;
+    };
+    let chart = &atom_atlas.charts[ci];
+    // The nearest chart must carry a distilled predictor; otherwise flag (zeroed),
+    // exactly as the per-chart `None` branch of `amortized_encode_batch_fast`.
+    let (Some(a1), Some(base)) = (
+        chart.amortized_jacobian.as_ref(),
+        chart.amortized_base.as_ref(),
+    ) else {
+        return false;
+    };
+    let inv_z = 1.0 / amplitude;
+    for axis in 0..d {
+        out[axis] = base[axis] + a1.row(axis).dot(&x) * inv_z;
+    }
+    true
 }
 
 /// The amplitude-1 distilled amortized-encoder Jacobian at a chart center

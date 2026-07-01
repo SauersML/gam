@@ -1264,6 +1264,146 @@ impl SaeManifoldOuterObjective {
         }
     }
 
+    /// Exact REML criterion value at `rho` on a THROWAWAY clone of the current
+    /// (converged) inner state — the same quantity `eval` returns as `cost`
+    /// (`reml_criterion_with_cache`, floored to the finite collapse wall when the
+    /// Laplace normaliser is non-finite). Used ONLY by
+    /// [`Self::value_consistent_outer_gradient`] to central-difference the outer
+    /// criterion; the clone means the production converged state is untouched and
+    /// the probe re-solves warm from it. Returns `+∞` for a recoverable
+    /// infeasible ρ probe (non-PD joint Hessian), which the caller treats as an
+    /// adjacent wall and declines to difference across.
+    fn probe_outer_criterion_value(&self, rho: &SaeManifoldRho) -> Result<f64, String> {
+        let mut probe = self.term.clone();
+        let reml = match probe.reml_criterion_with_cache(
+            self.target.view(),
+            rho,
+            self.registry.as_ref(),
+            self.inner_max_iter,
+            self.learning_rate,
+            self.ridge_ext_coord,
+            self.ridge_beta,
+        ) {
+            Ok(evaluated) => evaluated.0,
+            Err(err) if Self::is_recoverable_value_probe_refusal(&err) => return Ok(f64::INFINITY),
+            Err(err) => return Err(err),
+        };
+        Ok(if reml.is_finite() {
+            reml
+        } else {
+            SAE_FIT_DATA_COLLAPSE_COST
+        })
+    }
+
+    /// Value-consistent outer-ρ gradient safeguard for the small (BFGS) regime.
+    ///
+    /// The analytic outer gradient's implicit-state envelope correction (the
+    /// #1006/#1418 third-order `Γ·θ̂_ρ` term) is assembled by inverting the exact
+    /// inner stationarity Jacobian `A = ∇²_θθ L`. When an inner coordinate is
+    /// near-flat — e.g. a SATURATED IBP gate logit at K=1, whose data curvature
+    /// `∝ σ'(ℓ)² ≈ 0` — `A` is near-singular in that direction and the CG
+    /// stationarity solve amplifies it into a spurious envelope term, so the
+    /// returned λ-gradient can disagree in SIGN with the criterion it
+    /// differentiates. Paired with the line search's value probes this is the
+    /// objective↔gradient desync class (#931): the BFGS line search rejects every
+    /// step and STALLS at the seed (planted-circle IBP K=1: railed at the ρ = 1
+    /// GeneralizedLinear anchor seed, held-out EV ≈ 0.87 instead of > 0.95, while
+    /// the true criterion slope points at a lower, better-reconstructing λ).
+    ///
+    /// This is a SAFEGUARD, not a replacement. Only in the small (≤ BFGS-cap)
+    /// outer regime that consumes this gradient — large-K fits descend on the EFS
+    /// fixed point (traces only, no gradient) and never reach here — it
+    /// central-differences the SAME exact REML criterion `eval` returns, on a
+    /// throwaway clone, and adopts the finite-difference gradient ONLY when the
+    /// analytic direction is not descent-consistent with it (the cosine of the
+    /// analytic and FD gradients drops below ½, i.e. they point > 60° apart). A
+    /// well-conditioned fit's analytic gradient matches the FD to inner-solve
+    /// tolerance, so the cosine stays ≈ 1 and the analytic gradient is returned
+    /// byte-for-byte — softmax and every well-conditioned IBP fixture are
+    /// untouched. The FD differentiates the production value path, so the adopted
+    /// direction is exactly consistent with what the line search minimises (a
+    /// real gradient of the real criterion, used only as a descent direction).
+    fn value_consistent_outer_gradient(
+        &self,
+        rho_state: &SaeManifoldRho,
+        cost: f64,
+        analytic: Array1<f64>,
+    ) -> Result<Array1<f64>, String> {
+        // Only the small BFGS outer regime consumes the analytic gradient; keep it
+        // aligned with the planner's `SMALL_OUTER_BFGS_MAX_PARAMS` gate so large-K
+        // fits (EFS lane) never pay the 2·n probe cost.
+        const SAFEGUARD_MAX_PARAMS: usize = 8;
+        let flat = rho_state.to_flat();
+        let n = flat.len();
+        if n == 0 || n > SAFEGUARD_MAX_PARAMS || !cost.is_finite() {
+            return Ok(analytic);
+        }
+        let na = analytic.dot(&analytic).sqrt();
+        // A vanishing analytic gradient IS a stationary-point claim; let BFGS
+        // terminate on its own convergence test rather than probe around it.
+        if na <= 1.0e-8 {
+            return Ok(analytic);
+        }
+        // Stage 1 — CHEAP directional consistency check (2 probes). Central-
+        // difference the criterion along the analytic gradient's own unit
+        // direction `d̂`. The analytic directional derivative there is exactly
+        // `‖g‖` (`g·d̂`), so a value-consistent gradient reproduces
+        // `fd_dir ≈ ‖g‖`. A near-flat inner direction that flipped the envelope
+        // term makes `d̂` a NON-descent direction of the true criterion, so
+        // `fd_dir` collapses (or goes negative). Escalate to the full FD gradient
+        // only then; well-conditioned fits exit here having paid two evaluations.
+        let inv_na = 1.0 / na;
+        let step = 1.0e-4 * (1.0 + flat.iter().fold(0.0_f64, |m, &v| m.max(v.abs())));
+        let mut dir_plus = flat.clone();
+        let mut dir_minus = flat.clone();
+        for i in 0..n {
+            let d = analytic[i] * inv_na;
+            dir_plus[i] += step * d;
+            dir_minus[i] -= step * d;
+        }
+        let vp_dir =
+            self.probe_outer_criterion_value(&self.baseline_rho.from_flat(dir_plus.view()))?;
+        let vm_dir =
+            self.probe_outer_criterion_value(&self.baseline_rho.from_flat(dir_minus.view()))?;
+        if !(vp_dir.is_finite() && vm_dir.is_finite()) {
+            // A probe hit an infeasible wall adjacent to this ρ; differencing
+            // across it is meaningless, so keep the analytic gradient.
+            return Ok(analytic);
+        }
+        let fd_dir = (vp_dir - vm_dir) / (2.0 * step);
+        if fd_dir >= 0.5 * na {
+            // Analytic gradient is descent-consistent along its own direction.
+            return Ok(analytic);
+        }
+        // Stage 2 — desync suspected: assemble the FULL central-difference gradient
+        // of the exact criterion (2·n probes) and adopt it when it points away
+        // from the analytic gradient (cosine < ½, i.e. > 60° apart).
+        let mut fd = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let h = 1.0e-4 * (1.0 + flat[i].abs());
+            let mut plus = flat.clone();
+            let mut minus = flat.clone();
+            plus[i] += h;
+            minus[i] -= h;
+            let vp = self.probe_outer_criterion_value(&self.baseline_rho.from_flat(plus.view()))?;
+            let vm = self.probe_outer_criterion_value(&self.baseline_rho.from_flat(minus.view()))?;
+            if !(vp.is_finite() && vm.is_finite()) {
+                return Ok(analytic);
+            }
+            fd[i] = (vp - vm) / (2.0 * h);
+        }
+        let nf = fd.dot(&fd).sqrt();
+        if nf <= 1.0e-8 {
+            return Ok(analytic);
+        }
+        let cosine = analytic.dot(&fd) / (na * nf);
+        if cosine < 0.5 {
+            Ok(fd)
+        } else {
+            Ok(analytic)
+        }
+    }
+
     pub(crate) fn is_recoverable_value_probe_refusal(err: &str) -> bool {
         err.contains("inner solve did not converge at fixed ρ")
             || err.contains(
@@ -1752,6 +1892,15 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // barrier behaviour, so it stays on both lanes.
         let cost = self
             .add_fit_data_collapse_penalty(cost, &rho_state)
+            .map_err(EstimationError::RemlOptimizationFailed)?;
+        // Guard the assembled analytic gradient against an implicit-state envelope
+        // desync (a near-flat inner direction — e.g. a saturated IBP K=1 gate
+        // logit — corrupting the #1006/#1418 `Γ·θ̂_ρ` correction into a
+        // wrong-signed λ-gradient that stalls the BFGS line search). Byte-for-byte
+        // unchanged for well-conditioned fits; see
+        // `value_consistent_outer_gradient`.
+        let gradient = self
+            .value_consistent_outer_gradient(&rho_state, cost, gradient)
             .map_err(EstimationError::RemlOptimizationFailed)?;
         self.current_rho = rho_state;
         self.last_loss = Some(loss);
