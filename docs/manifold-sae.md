@@ -305,8 +305,8 @@ the full surface):
 
 Methods: `predict` / `reconstruct(X)`, `encode(X)` (out-of-sample gates),
 `project(X, k)`, `per_atom_latent_for(X)` and `featurize(X)` (coordinates),
-`per_atom_active_set(X)`, `shape_uncertainty(k)`, `coordinate_range(k)`,
-`typical_shape(k)`, `curvature()` / `atom_curvature(k)`, `summary()`,
+`per_atom_active_set(X)`, `shape_uncertainty(k)`,
+`curvature()` / `atom_curvature(k)`, `summary()`,
 `get_decoder()` / `get_anchors()`, and `to_dict` / `from_dict` / `save` /
 `load`.
 
@@ -388,9 +388,11 @@ support into a single `[0, 1]` score:
 ```python
 fit.atom_trust(0)            # scalar trust in [0, 1] for atom 0
 fit.atom_diagnostics(0)      # full per-atom diagnostic dict (tangent condition, ...)
-fit.coordinate_range(0)      # observed min/max/p05/p50/p95 of the atom's coords
-fit.typical_shape(0, quantile_range=(5.0, 95.0), n_sd=1.0)  # central-range curve+band
+fit.shape_uncertainty(0, n_sd=1.96)  # {"coords","mean","sd","lower","upper"} shape band
 ```
+
+The observed coordinate extent of an atom is read directly off
+`fit.coords[k]` (see [Typical coordinate range](#typical-coordinate-range)).
 
 The top-level helpers `gamfit.sae_trust_diagnostics(payload)` and
 `gamfit.atom_trust_scores(diagnostics)` compute the same quantities from a raw
@@ -449,18 +451,10 @@ t = gamfit.layer_transport_fit(coords_from, coords_to,
 ladder = gamfit.layer_transport_ladder(coords, topology="circle", layers=None)
 ```
 
-## Cross-fit alignment
-
-`gamfit.align(fit_a, fit_b)` matches atoms between two independent fits (e.g.
-two seeds, or two checkpoints) so the same latent shape is identified across
-runs — the basis for reproducibility and trajectory analysis.
-
-## Visualization and benchmarking
+## Visualization
 
 `gamfit.plot_atom(fit, k, ax=None)` draws one atom's fitted curve and band;
-`gamfit.plot_fit(fit)` draws the whole dictionary. `gamfit.sae_benchmark(...)`
-runs a single synthetic recovery benchmark and `gamfit.sweep_sae_benchmark()`
-sweeps the coherence/coverage/K/topology grid, returning a list of result rows.
+`gamfit.plot_fit(fit)` draws the whole dictionary.
 
 ## Torch-native SAE: `gamfit.torch.ManifoldSAE`
 

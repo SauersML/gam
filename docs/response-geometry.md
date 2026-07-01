@@ -42,9 +42,11 @@ Pass `response_coordinates="alr"` (or `response_geometry="alr"`) to fit
 a `D − 1` dimensional ALR chart instead of the default `D`-column CLR
 representation. `response_reference=` selects the ALR denominator by
 integer component index and defaults to the last response-column position.
-Because Euclidean ALR is not Aitchison-isometric, the fit path supplies the
-ALR Aitchison Gram as the tangent residual precision when `fisher_rao_w=` is
-not supplied.
+Euclidean ALR is not Aitchison-isometric, so an ALR fit runs in the raw ALR
+frame and its predictions depend on the (arbitrary) reference component unless
+you pass an explicit `fisher_rao_w=` residual metric. For a reference-free
+simplex fit, prefer the default CLR representation (or ILR): both are already
+Aitchison-isometric (`G = I`), so the fit is invariant to the coordinate choice.
 
 `response_geometry="constant_curvature"` first estimates `kappa_hat` from the
 responses, then fits and predicts on `constant_curvature(dim=D,kappa=kappa_hat)`.

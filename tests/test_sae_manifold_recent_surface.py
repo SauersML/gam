@@ -205,12 +205,9 @@ def _captured_penalties(fake: _CapturingRustModule) -> list[dict[str, object]]:
 def test_recent_penalty_knobs_emit_expected_analytic_descriptors(monkeypatch):
     fake = _CapturingRustModule()
     monkeypatch.setattr(sae, "rust_module", lambda: fake)
-    # The closed-form dense-periodic / disjoint-periodic shortcuts solve the fit
-    # without routing the analytic-penalty descriptors through the FFI, so disable
-    # them to observe the `analytic_penalties` payload that `sae_manifold_fit_minimal`
-    # receives.
-    monkeypatch.setattr(sae, "_fit_dense_periodic_ibp_lsq", lambda *a, **k: None)
-    monkeypatch.setattr(sae, "_fit_disjoint_periodic_top1", lambda *a, **k: None)
+    # Every fit now routes through the `sae_manifold_fit_minimal` FFI (the former
+    # numpy closed-form fast paths were removed), so the `analytic_penalties`
+    # payload is always observed on the captured call.
     x = _toy_matrix(n=14, p=4)
 
     fit = gamfit.sae_manifold_fit(
@@ -330,7 +327,10 @@ def test_gate_sparsity_variants_are_accepted_and_described(
     [
         ("ibp_map", "ibp_map"),
         ("softmax", "softmax"),
-        ("jumprelu", "jumprelu"),
+        # #1777 — the hard-sigmoid gate's canonical token is now "threshold_gate";
+        # "jumprelu" is retained as a deprecated alias (the raw spelling survives
+        # only as `assignment_label`).
+        ("jumprelu", "threshold_gate"),
     ],
 )
 def test_assignment_kinds_run_through_facade(monkeypatch, assignment, expected_kind):
@@ -455,7 +455,7 @@ def _multi_atom_surface_fit(x: np.ndarray, monkeypatch) -> gamfit.ManifoldSAE:
     )
 
 
-def test_multi_atom_fresh_fit_populates_uncertainty_and_typical_range_api(monkeypatch):
+def test_multi_atom_fresh_fit_populates_uncertainty_shape_band_api(monkeypatch):
     x = _two_atom_circle_data()
     fit = _multi_atom_surface_fit(x, monkeypatch)
     p = x.shape[1]
@@ -494,27 +494,8 @@ def test_multi_atom_fresh_fit_populates_uncertainty_and_typical_range_api(monkey
         np.testing.assert_allclose(band["lower"], band["mean"] - 2.0 * band["sd"])
         np.testing.assert_allclose(band["upper"], band["mean"] + 2.0 * band["sd"])
 
-        coordinate_range = fit.coordinate_range(atom=atom_k)
-        assert coordinate_range["n"] == x.shape[0]
-        assert coordinate_range["quantile_levels"].shape == (3,)
-        assert coordinate_range["quantiles"].shape == (3, d_k)
-        for name in ("min", "max", "p05", "p50", "median", "p95"):
-            assert coordinate_range[name].shape == (d_k,)
-            assert np.all(np.isfinite(coordinate_range[name]))
-        assert np.all(coordinate_range["p05"] <= coordinate_range["p50"])
-        assert np.all(coordinate_range["p50"] <= coordinate_range["p95"])
-
-        typical = fit.typical_shape(
-            atom=atom_k,
-            quantile_range=(0.0, 100.0),
-            n_sd=1.0,
-        )
-        assert typical["coords"].ndim == 2
-        assert typical["coords"].shape[1] == d_k
-        assert typical["mean"].shape == typical["sd"].shape
-        assert typical["mean"].shape[1] == p
-        assert typical["ambient_mean"].shape == (p,)
-        assert typical["ambient_sd"].shape == (p,)
-        assert typical["posterior_sd_mean"].shape == (p,)
-        assert np.all(np.isfinite(typical["ambient_mean"]))
-        assert np.all(np.isfinite(typical["posterior_sd_mean"]))
+        assert band["coords"].ndim == 2
+        assert band["coords"].shape[1] == d_k
+        assert band["mean"].shape[1] == p
+        assert np.all(np.isfinite(band["mean"]))
+        assert np.all(np.isfinite(band["sd"]))

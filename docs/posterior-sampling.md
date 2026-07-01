@@ -60,11 +60,13 @@ The replicate path uses the saved family and fitted dispersion
 negative-binomial) around the plug-in response mean. It is useful for
 simulation, posterior-predictive checks, and calibration probes.
 
-For a small built-in posterior-predictive check:
+Multinomial models expose the categorical analogue, `posterior_predict`, which
+draws replicate class-label vectors (`Categorical(softmax(X·beta_hat))`) you can
+feed into your own posterior-predictive check:
 
 ```python
-ppc = model.posterior_predictive_check(train_df, n_draws=200, seed=42)
-# keys: mean, sd, min, max
+reps = model.posterior_predict(train_df, n_draws=200, seed=42)
+# shape: (200, n_rows); object array of class labels
 ```
 
 ## Sampler dispatch

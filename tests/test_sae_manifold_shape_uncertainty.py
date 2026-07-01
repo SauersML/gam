@@ -15,7 +15,7 @@ import pytest
 gamfit = pytest.importorskip("gamfit")
 
 
-def test_typical_shape_periodic_payload_decodes_ring_not_chord():
+def test_shape_uncertainty_periodic_payload_decodes_ring_not_chord():
     from gamfit._sae_manifold import ManifoldSAE
 
     n = 250
@@ -94,8 +94,8 @@ def test_typical_shape_periodic_payload_decodes_ring_not_chord():
         tau=0.5,
     )
 
-    typical = fit.typical_shape(atom=0)
-    mean = np.asarray(typical["mean"], dtype=float)
+    band = fit.shape_uncertainty(atom=0)
+    mean = np.asarray(band["mean"], dtype=float)
     radii = np.linalg.norm(mean, axis=1)
     assert np.all((radii >= 0.7) & (radii <= 1.3))
     singular_values = np.linalg.svd(mean - mean.mean(axis=0), compute_uv=False)
@@ -127,7 +127,7 @@ def test_shape_uncertainty_fields_present_and_well_shaped():
     np.testing.assert_allclose(cov, cov.T, atol=1e-8)
     assert np.all(np.diag(cov) >= -1e-12)
 
-    band = fit.shape_band(0)
+    band = fit.shape_uncertainty(0)
     g = band["mean"].shape[0]
     assert band["coords"].shape == (g, 1)
     assert band["mean"].shape == (g, p)
@@ -147,7 +147,7 @@ def test_band_sd_matches_analytic_phi_cov_phi_propagation():
     atom = fit.atoms[0]
     cov = atom.decoder_covariance
     m = atom.decoder_coefficients.shape[0]
-    band = fit.shape_band(0)
+    band = fit.shape_uncertainty(0)
     coords = band["coords"]  # (G, 1)
 
     # Recompute Phi at the band coordinates via the engine's own periodic basis.
@@ -176,7 +176,7 @@ def test_posterior_shape_band_is_tighter_than_data_deviation():
     observation is noisy. They are distinct quantities (issue: uncertainty vs
     typical data deviation)."""
     fit, x = _fit_circle(n=400, noise=0.18, seed=2)
-    band = fit.shape_band(0)
+    band = fit.shape_uncertainty(0)
     data_sd = np.sqrt(float(fit.dispersion))
     median_post_sd = float(np.median(band["sd"]))
     assert median_post_sd > 0.0
@@ -191,8 +191,8 @@ def test_more_data_tightens_the_posterior_band():
     an honest 1/sqrt(N)-style posterior, not a fixed cosmetic ribbon)."""
     fit_small, _ = _fit_circle(n=120, noise=0.18, seed=3)
     fit_big, _ = _fit_circle(n=400, noise=0.18, seed=3)
-    sd_small = float(np.median(fit_small.shape_band(0)["sd"]))
-    sd_big = float(np.median(fit_big.shape_band(0)["sd"]))
+    sd_small = float(np.median(fit_small.shape_uncertainty(0)["sd"]))
+    sd_big = float(np.median(fit_big.shape_uncertainty(0)["sd"]))
     assert sd_big < sd_small, (
         f"posterior band did not shrink with more data: "
         f"median sd {sd_small:.4f} (n=120) -> {sd_big:.4f} (n=400)"

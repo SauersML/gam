@@ -1380,10 +1380,12 @@ class ManifoldSAE:
         the fit installed an output-Fisher metric (``fisher_factors`` was supplied
         to :func:`sae_manifold_fit` and retained on this model); otherwise the
         geometry (``delta`` / ``off_manifold_norm``) is still returned but the dose
-        degrades to ``None`` — not zero. A model recovered via
-        :meth:`from_dict` / :meth:`load` does NOT carry the Fisher arrays
-        (``save`` / ``to_dict`` omit them), so a loaded model always steers
-        geometry-only with ``predicted_nats`` / ``validity_radius`` ``None``.
+        degrades to ``None`` — not zero. The Fisher steering arrays now round-trip
+        through :meth:`to_dict` / :meth:`save`, so a model recovered via
+        :meth:`from_dict` / :meth:`load` reproduces the same dose it had at fit
+        time. Only a legacy dict written before the round-trip was added (or a fit
+        that never installed a Fisher metric) lacks the arrays; such a model
+        steers geometry-only with ``predicted_nats`` / ``validity_radius`` ``None``.
         """
         k = self._atom_index(atom_k)
         t_from_arr = np.ascontiguousarray(np.asarray(t_from, dtype=np.float64).reshape(-1))

@@ -110,15 +110,6 @@ def test_missing_x_raises():
         sae.sae_manifold_fit(K=2)
 
 
-def test_functional_basis_params_clamps_periodic_zero_harmonics():
-    assert sae._functional_basis_params(
-        {"kind": "periodic", "basis_size": 1, "n_harmonics": 0}
-    ) == {"n_harmonics": 1}
-    assert sae._functional_basis_params({"kind": "circle", "basis_size": 0}) == {
-        "n_harmonics": 1
-    }
-
-
 # ---------------------------------------------------------------------------
 # #607 — assignment summary thresholds are mode-specific on the canonical kind.
 # ---------------------------------------------------------------------------
@@ -172,7 +163,7 @@ def _make_fit(kind: str, n_atoms: int = 4) -> sae.ManifoldSAE:
         coords=[np.zeros((1, 1)) for _ in range(n_atoms)],
         decoder_blocks=[np.zeros((1, 1)) for _ in range(n_atoms)],
         basis_specs=["periodic"] * n_atoms,
-        reml_score=0.0,
+        penalized_loss_score=0.0,
         reconstruction_r2=0.0,
         training_mean=np.zeros(1),
         training_data=np.zeros((1, 1)),
@@ -368,7 +359,6 @@ def test_oos_payload_threads_trained_basis_sizes(monkeypatch):
 
 def test_new_sae_helpers_are_importable_and_defaults_are_research_objective():
     assert gamfit.sae_fit is sae.fit
-    assert gamfit.align is sae.align
     assert gamfit.plot is sae.plot
     assert callable(gamfit.sae_trust_diagnostics)
     assert callable(gamfit.atom_trust_scores)
@@ -462,23 +452,6 @@ def test_research_trust_scores_are_assignment_weighted():
     np.testing.assert_allclose(trust["atom"], [0.2, 0.8])
     np.testing.assert_allclose(trust["row"], [0.2, 0.8, 0.5])
     assert trust["per_atom"].shape == (3, 2)
-
-
-def test_alignment_public_api_uses_rich_result():
-    fit_a = _make_fit("softmax", n_atoms=2)
-    fit_b = _make_fit("softmax", n_atoms=2)
-    fit_a.decoder_blocks = [np.eye(2), np.fliplr(np.eye(2))]
-    fit_b.decoder_blocks = [np.fliplr(np.eye(2)), np.eye(2)]
-    for atom, block in zip(fit_a.atoms, fit_a.decoder_blocks):
-        atom.decoder_coefficients = block
-    for atom, block in zip(fit_b.atoms, fit_b.decoder_blocks):
-        atom.decoder_coefficients = block
-
-    aligned = gamfit.align(fit_a, fit_b)
-    assert aligned.assignment == [(0, 1), (1, 0)]
-    payload = aligned.to_dict()
-    assert payload["assignment"] == [[0, 1], [1, 0]]
-    assert "mean_grassmann_distance" in payload["summary"]
 
 
 @pytest.mark.parametrize(

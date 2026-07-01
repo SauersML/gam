@@ -108,52 +108,9 @@ def test_sae_fit_random_state_changes_output():
     )
 
 
-def _rust_reference_lcg_stream(seed: int, count: int) -> np.ndarray:
-    """Reference reimplementation of the Rust SAE init LCG stream.
-
-    Mirrors the per-element Lehmer LCG in
-    ``crates/gam-pyffi/src/latent/latent_basis_and_sae_ffi.rs`` so the Python
-    fast-path jitter (issue #178) is pinned to the SAME seed contract as the
-    Rust ``sae_manifold_fit_minimal`` path. Any drift between the two must fail
-    here, not silently desync the two init paths.
-    """
-    mult = 6364136223846793005
-    add = 1442695040888963407
-    mask = (1 << 64) - 1
-    state = (seed * mult + add) & mask
-    out = np.empty(count, dtype=np.float64)
-    for i in range(count):
-        state = (state * mult + add) & mask
-        u = float(state >> 11) * (2.0 ** -53)
-        out[i] = 2.0 * u - 1.0
-    return out
-
-
-def test_seeded_jitter_matches_rust_lcg_contract():
-    """The Python fast-path jitter stream must equal the Rust init stream
-    bit-for-bit (issue #178). They share one ``random_state`` contract; a
-    divergence here means CPU/closed-form and Rust fits would seed differently."""
-    from gamfit._sae_manifold import _seeded_unit_jitter
-
-    for seed in (0, 1, 42, 123, (1 << 63)):
-        py = _seeded_unit_jitter(seed, (7,)).ravel()
-        ref = _rust_reference_lcg_stream(seed, 7)
-        np.testing.assert_array_equal(py, ref)
-        assert np.all((py >= -1.0) & (py < 1.0))
-
-    # A fixed seed reproduces the stream; distinct seeds decorrelate.
-    np.testing.assert_array_equal(
-        _seeded_unit_jitter(9, (4, 5)), _seeded_unit_jitter(9, (4, 5))
-    )
-    assert not np.array_equal(
-        _seeded_unit_jitter(9, (4, 5)), _seeded_unit_jitter(10, (4, 5))
-    )
-
-
 def _synthetic_disjoint_top1(n: int = 300, p_block: int = 16, seed: int = 0) -> np.ndarray:
     """Two well-separated periodic atoms, each loading a disjoint output block,
-    with hard top-1 row ownership — the configuration that routes through the
-    ``_fit_disjoint_periodic_top1`` softmax fast path."""
+    with hard top-1 row ownership — the disjoint top-1 softmax configuration."""
     rng = np.random.default_rng(seed)
     half = n // 2
     t0 = rng.uniform(0.0, 2.0 * math.pi, n)

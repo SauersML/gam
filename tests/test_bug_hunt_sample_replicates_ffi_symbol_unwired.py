@@ -1,9 +1,9 @@
 """Bug hunt: the documented posterior-predictive replicate API is dead — the
 Python wrapper calls an FFI symbol that was never added to the Rust module.
 
-`gamfit.Model.sample_replicates` and `gamfit.Model.posterior_predictive_check`
-were introduced by commit 5a33b0703 ("feat(#1057): wire generative replicate
-sampling + posterior-predictive checks").  The commit message claims a "New
+`gamfit.Model.sample_replicates` was introduced by commit 5a33b0703
+("feat(#1057): wire generative replicate sampling + posterior-predictive
+checks").  The commit message claims a "New
 pyffi `generative_replicates(model_bytes, headers, rows, n_draws, seed)`" was
 added, but the commit's diff only touched `gamfit/_model.py` and a test — the
 `#[pyfunction] generative_replicates` it describes was never committed to
@@ -32,9 +32,7 @@ generative law is its own ground truth, no reference tool needed):
   * for a Poisson fit every replicate is a non-negative integer (Poisson
     support), and the per-row replicate mean converges to the model's plug-in
     predicted rate `g^{-1}(Xβ̂)` as `n_draws` grows;
-  * draws are seed-deterministic (same seed identical, different seed differs);
-  * `posterior_predictive_check` returns a Bayesian p-value in [0, 1] per
-    statistic.
+  * draws are seed-deterministic (same seed identical, different seed differs).
 
 It fails today at the very first call (missing FFI symbol) and will pass
 unchanged once `generative_replicates` is actually wired into the FFI.
@@ -100,13 +98,3 @@ def test_sample_replicates_is_reachable_and_family_correct() -> None:
     assert np.array_equal(reps_same, reps_again), "same seed must reproduce draws"
     reps_diff = np.asarray(model.sample_replicates(newdata, 256, seed=1), dtype=float)
     assert not np.array_equal(reps_same, reps_diff), "different seed must differ"
-
-
-def test_posterior_predictive_check_returns_pvalues_in_unit_interval() -> None:
-    train = _poisson_frame(600, seed=3)
-    model = gamfit.fit(train, "y ~ s(x)", family="poisson")
-
-    pvals = model.posterior_predictive_check(train, n_draws=300, seed=0)
-    assert isinstance(pvals, dict) and len(pvals) > 0
-    for name, p in pvals.items():
-        assert 0.0 <= float(p) <= 1.0, f"p-value for {name!r} out of [0,1]: {p}"

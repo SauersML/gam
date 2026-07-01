@@ -24,8 +24,10 @@ use super::*;
 /// #1561 over-smoothing). mgcv's `gaulss` defaults `select=FALSE` for exactly this
 /// reason, and gam already defaults it off for the `sz` deviation smooth (gam#700);
 /// this extends the same principle to the scale block's ordinary smooths. Only the
-/// bases that DEFAULT the penalty on (`bspline`/`tps`/`matern`/`duchon`) are
-/// affected, and an explicit user `double_penalty=` always wins.
+/// bases that DEFAULT the Marra & Wood penalty on (`bspline`/`tps`/`matern`) are
+/// affected; `duchon` is excluded because it has no such penalty to disable and its
+/// builder rejects a `double_penalty=` key outright. An explicit user
+/// `double_penalty=` always wins.
 pub(super) fn apply_secondary_predictor_basis_parsimony(terms: &mut [ParsedTerm], n_rows: usize) {
     for term in terms.iter_mut() {
         if let ParsedTerm::Smooth {
@@ -40,7 +42,12 @@ pub(super) fn apply_secondary_predictor_basis_parsimony(terms: &mut [ParsedTerm]
             // #1561: drop the null-space double penalty by default on the scale /
             // distributional block so REML can resolve genuine parameter variation
             // instead of over-shrinking it toward the homoscedastic null space.
-            if matches!(canonical.as_str(), "bspline" | "tps" | "matern" | "duchon") {
+            // `duchon` is intentionally excluded: it carries no Marra & Wood
+            // null-space double penalty to turn off (it ships its own
+            // reproducing-norm penalty plus a null-space ridge) and its builder
+            // rejects a `double_penalty=` key outright, so injecting one here
+            // would abort an otherwise-valid scale-block Duchon fit.
+            if matches!(canonical.as_str(), "bspline" | "tps" | "matern") {
                 options
                     .entry("double_penalty".to_string())
                     .or_insert_with(|| "false".to_string());

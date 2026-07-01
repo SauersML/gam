@@ -973,21 +973,6 @@ See the [Manifold SAE dictionary guide](manifold-sae.md) for the narrative.
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.sae_benchmark
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.sweep_sae_benchmark
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.format_sae_benchmark_markdown
-    options:
-      show_root_heading: true
-      heading_level: 3
-
 ::: gamfit.ManifoldSAE
     options:
       show_root_heading: true
@@ -1261,11 +1246,6 @@ See the [Manifold SAE dictionary guide](manifold-sae.md) for the narrative.
       heading_level: 3
 
 ## Manifold SAE helpers
-
-::: gamfit.align
-    options:
-      show_root_heading: true
-      heading_level: 3
 
 ::: gamfit.featurize
     options:

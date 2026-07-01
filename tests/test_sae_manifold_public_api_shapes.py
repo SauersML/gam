@@ -53,7 +53,7 @@ def _fresh_fit_or_fail(z: np.ndarray):
     return fit
 
 
-def test_per_atom_uncertainty_shape_band_and_coordinate_range_shapes_are_sane():
+def test_per_atom_uncertainty_shape_band_shapes_are_sane():
     z = _circle_data()
     fit = _fresh_fit_or_fail(z)
     p = z.shape[1]
@@ -79,7 +79,6 @@ def test_per_atom_uncertainty_shape_band_and_coordinate_range_shapes_are_sane():
         assert np.all(np.diag(atom.decoder_covariance) >= -1e-10)
 
         band = fit.shape_uncertainty(atom=atom_k, n_sd=1.5)
-        alias = fit.shape_band(atom_k, n_sd=1.5)
         assert set(band) == {"coords", "mean", "sd", "lower", "upper"}
         assert band["coords"].shape == atom.shape_band_coords.shape
         assert band["coords"].ndim == 2
@@ -91,21 +90,6 @@ def test_per_atom_uncertainty_shape_band_and_coordinate_range_shapes_are_sane():
         assert band["mean"].shape[1] == p
         for key in ("coords", "mean", "sd", "lower", "upper"):
             assert np.all(np.isfinite(band[key]))
-            np.testing.assert_allclose(alias[key], band[key])
         assert np.all(band["sd"] >= 0.0)
         np.testing.assert_allclose(band["lower"], band["mean"] - 1.5 * band["sd"])
         np.testing.assert_allclose(band["upper"], band["mean"] + 1.5 * band["sd"])
-
-        coord_range = fit.coordinate_range(atom=atom_k)
-        assert coord_range["n"] == z.shape[0]
-        assert coord_range["quantile_levels"].shape == (3,)
-        assert coord_range["quantiles"].shape == (3, d_k)
-        np.testing.assert_allclose(coord_range["quantile_levels"], [0.05, 0.50, 0.95])
-        for key in ("min", "max", "p05", "p50", "median", "p95"):
-            assert coord_range[key].shape == (d_k,)
-            assert np.all(np.isfinite(coord_range[key]))
-        np.testing.assert_allclose(coord_range["median"], coord_range["p50"])
-        assert np.all(coord_range["min"] <= coord_range["p05"])
-        assert np.all(coord_range["p05"] <= coord_range["p50"])
-        assert np.all(coord_range["p50"] <= coord_range["p95"])
-        assert np.all(coord_range["p95"] <= coord_range["max"])

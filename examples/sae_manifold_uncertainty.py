@@ -1,9 +1,9 @@
-"""Read per-atom posterior shape uncertainty and typical coordinate ranges.
+"""Read per-atom posterior shape uncertainty.
 
 Fresh manifold-SAE fits expose per-atom decoder covariance and a posterior
-shape band through ``shape_uncertainty``. This example prints the coordinate
-range and typical-shape summaries, then plots the fitted mean curve with a
-pointwise mean +/- one posterior standard deviation band.
+shape band through ``shape_uncertainty``. This example prints the shape-band
+summary, then plots the fitted mean curve with a pointwise mean +/- one
+posterior standard deviation band.
 """
 
 from __future__ import annotations
@@ -40,23 +40,14 @@ def main() -> None:
     )
 
     atom = 0
-    coordinate_range = fit.coordinate_range(atom=atom)
     band = fit.shape_uncertainty(atom=atom, n_sd=1.0)
-    typical = fit.typical_shape(atom=atom, quantile_range=(5.0, 95.0), n_sd=1.0)
     covariance = fit.atoms[atom].decoder_covariance
 
-    print("Per-atom uncertainty and typical range")
+    print("Per-atom posterior shape uncertainty")
     print(f"r2={fit.reconstruction_r2:.3f}")
     print(f"decoder_covariance_shape={covariance.shape}")
-    print(
-        "coordinate p05/p50/p95:",
-        np.round(coordinate_range["p05"], 3),
-        np.round(coordinate_range["p50"], 3),
-        np.round(coordinate_range["p95"], 3),
-    )
     print(f"shape band grid={band['coords'].shape} ambient={band['mean'].shape}")
-    print("typical ambient mean:", np.round(typical["ambient_mean"], 3))
-    print("typical posterior sd mean:", np.round(typical["posterior_sd_mean"], 4))
+    print("ambient posterior sd mean:", np.round(band["sd"].mean(axis=0), 4))
 
     order = np.argsort(band["coords"][:, 0])
     coord = band["coords"][order, 0]

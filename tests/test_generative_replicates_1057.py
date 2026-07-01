@@ -1,9 +1,9 @@
 """Posterior-predictive replicate sampling is reachable (#1057).
 
 `src/inference/generative.rs` (GenerativeSpec / sampleobservation_replicates)
-was implemented but had no user entry point. `Model.sample_replicates` and
-`Model.posterior_predictive_check` now surface it: family-aware observation
-draws from the fitted predictive distribution at new data.
+was implemented but had no user entry point. `Model.sample_replicates` now
+surfaces it: family-aware observation draws from the fitted predictive
+distribution at new data.
 
 Objective assertions (no reference tool needed — the generative law IS the
 ground truth):
@@ -12,8 +12,6 @@ ground truth):
     predicted mean as n_draws grows, and the replicate spread tracks the
     fitted residual scale (the noise model is honest).
   - For a Poisson fit, replicates are non-negative integers.
-  - posterior_predictive_check returns Bayesian p-values in [0, 1] that are
-    well-calibrated (near 0.5) when the model is correct.
 """
 from __future__ import annotations
 
@@ -75,16 +73,3 @@ def test_poisson_replicates_are_nonnegative_integers() -> None:
     assert reps.shape == (50, n)
     assert np.all(reps >= 0.0)
     np.testing.assert_array_equal(reps, np.round(reps))
-
-
-def test_posterior_predictive_check_is_calibrated_for_correct_model() -> None:
-    rows = _gaussian_rows(120, seed=11)
-    model = gamfit.fit(rows, "y ~ x")
-    ppc = model.posterior_predictive_check(rows, n_draws=400, seed=2)
-    assert set(ppc) == {"mean", "sd", "min", "max"}
-    for name, p in ppc.items():
-        assert 0.0 <= p <= 1.0, f"{name} p-value out of range: {p}"
-    # A correctly specified Gaussian must not be grossly miscalibrated on its
-    # central moments (mean / sd): the Bayesian p-value should not pin at 0/1.
-    assert 0.02 < ppc["mean"] < 0.98
-    assert 0.02 < ppc["sd"] < 0.98
