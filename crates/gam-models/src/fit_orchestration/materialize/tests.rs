@@ -2261,9 +2261,9 @@ fn monotone_parity_dataset() -> Dataset {
 /// with the CLI's request-specific inputs and asserts the resulting options are
 /// byte-for-byte identical (Debug form, since `FitOptions` is not `PartialEq`)
 /// to the options `materialize` actually puts on the `StandardFitRequest`.
-/// Before #1196 the CLI used `tol: 1e-6` / `skip_rho_posterior_inference:
-/// false` while the formula path used `1e-10`/`true`, so this would have
-/// diverged — the exact class of defect #1191 exposed.
+/// Before #1196 the CLI used `tol: 1e-6` / a separately hand-built
+/// rho-posterior policy while the formula path used `1e-10` / its own policy,
+/// so this would have diverged — the exact class of defect #1191 exposed.
 #[test]
 fn issue_1196_cli_and_formula_standard_fit_options_match() {
     let data = monotone_parity_dataset();
@@ -2296,8 +2296,8 @@ fn issue_1196_cli_and_formula_standard_fit_options_match() {
     // The policy fields that diverged pre-#1196 are now the single-sourced
     // canonical values for BOTH paths.
     assert!(
-        request.options.skip_rho_posterior_inference,
-        "canonical formula/CLI policy skips the live-rho posterior path"
+        !request.options.skip_rho_posterior_inference,
+        "canonical formula/CLI policy keeps the live-rho posterior certificate path enabled"
     );
     assert_eq!(
         request.options.tol, 1e-10,

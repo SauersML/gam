@@ -12,8 +12,8 @@ use super::*;
 /// NOT settable here, so the CLI binary and the Python/PyO3 path cannot resolve
 /// a different optimization policy for the same model (#1196). Before this seam
 /// existed the CLI hand-built `FitOptions` with `tol: 1e-6` /
-/// `skip_rho_posterior_inference: false` while the formula path used
-/// `tol: 1e-10` / `skip_rho_posterior_inference: true`, so the identical model
+/// `skip_rho_posterior_inference: true` while the formula path used
+/// `tol: 1e-10` / the same rho-posterior policy, so the identical model
 /// fit *differently* depending on which entry point you called it from — the
 /// exact class of divergence #1191 surfaced.
 #[derive(Default)]
@@ -55,12 +55,14 @@ pub fn canonical_standard_fit_options(
         // Posterior covariance is always computed so `predict --uncertainty`
         // works for every family (the `COV_MAX_P` diagonal fallback caps cost).
         compute_inference: true,
-        // Formula/CLI fits are the interactive/default path: keep coefficient
-        // covariance and the smoothing correction, but do not run the optional
-        // live-rho posterior certificate/escalation, which can launch NUTS over
-        // rho and turn ordinary fits into sampler benchmarks. Lower-level
-        // callers that explicitly need the rho posterior opt in elsewhere.
-        skip_rho_posterior_inference: true,
+        // Formula/CLI fits are the public standard-fit path. When the fit has
+        // smoothing parameters, keep the live REML objective available long
+        // enough to produce the Tier-0 rho-posterior certificate (and any
+        // mathematically required escalation) from the same criterion that the
+        // optimizer converged on. Superseded/adaptive intermediate fits still
+        // opt out at their call site; lower-level throughput benchmarks can
+        // explicitly opt out through `FitOptions`.
+        skip_rho_posterior_inference: false,
         max_iter: config.outer_max_iter.unwrap_or(200),
         // Outer REML/LAML smoothing-selection tolerance. `1e-10` (effective
         // projected-gradient threshold ≈ 1e-7) resolves λ̂ to optimiser
