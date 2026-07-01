@@ -6957,6 +6957,64 @@ mod exact_joint_seed_config_tests {
     }
 }
 
+#[cfg(test)]
+mod wood_reference_df_tests {
+    use super::*;
+
+    // The whole-term LR reference d.f. (#1766). `wood_reference_df` returns
+    // Wood's smoothing-selection-corrected `edf1 = 2·tr(F) − tr(F²)` on the
+    // coefficient-influence block, NOT the earlier Satterthwaite ratio
+    // `tr(F)²/tr(F²)` that collapsed toward 0 for a boundary-shrunk term.
+
+    #[test]
+    fn edf1_equals_two_trace_minus_trace_of_square() {
+        // A symmetric smoother block with eigenvalues {0.9, 0.4}: a partially
+        // shrunk penalized term. edf = tr = 1.3; tr(F²) = 0.81 + 0.16 = 0.97;
+        // edf1 = 2·1.3 − 0.97 = 1.63. (Diagonal ⇒ block F² trace = Σ λ².)
+        let f = ndarray::array![[0.9_f64, 0.0], [0.0, 0.4]];
+        let got = wood_reference_df(Some(&f), &(0..2)).unwrap();
+        assert!(
+            (got - 1.63).abs() < 1e-12,
+            "edf1 should be 2*tr - tr(F^2) = 1.63, got {got}"
+        );
+        // And it must dominate the raw edf (edf1 >= edf) — the invariant the LR
+        // reference relies on.
+        let edf = 1.3;
+        assert!(got >= edf - 1e-12, "edf1 {got} must be >= edf {edf}");
+    }
+
+    #[test]
+    fn edf1_never_collapses_below_edf_when_offdiagonals_blow_up() {
+        // The #1766 degeneracy: a NON-symmetric influence block whose
+        // off-diagonal coupling makes tr(F²) = Σ_ij F_ij F_ji run away, so the
+        // old Satterthwaite ratio tr(F)²/tr(F²) crashed toward 0. Here tr = 1.0
+        // but tr(F²) = 1·1 + 50·(-50) ... take F with large opposite-sign
+        // off-diagonals so tr(F²) is huge: edf1 = 2·tr − tr(F²) would go very
+        // negative, and the `.max(tr)` guard must floor it back at edf = tr.
+        let f = ndarray::array![[0.5_f64, 40.0], [40.0, 0.5]];
+        let tr = 1.0_f64;
+        let got = wood_reference_df(Some(&f), &(0..2)).unwrap();
+        assert!(
+            got >= tr - 1e-12,
+            "edf1 must be floored at edf (=tr={tr}) even when tr(F^2) explodes, got {got}"
+        );
+        assert!(got.is_finite() && got > 0.0, "edf1 must stay finite/positive");
+    }
+
+    #[test]
+    fn returns_none_on_nonpositive_or_missing_trace() {
+        // No influence matrix at all → None (caller falls back to the
+        // max(edf, null_dim, 1) floor).
+        assert!(wood_reference_df(None, &(0..2)).is_none());
+        // A fully-shrunk block with a non-positive trace → None.
+        let zero = ndarray::array![[0.0_f64, 0.0], [0.0, 0.0]];
+        assert!(wood_reference_df(Some(&zero), &(0..2)).is_none());
+        // An out-of-bounds range → None, never a panic.
+        let f = ndarray::array![[0.5_f64, 0.0], [0.0, 0.5]];
+        assert!(wood_reference_df(Some(&f), &(0..5)).is_none());
+    }
+}
+
 pub(crate) fn exact_joint_multistart_outer_problem(
     theta0: &Array1<f64>,
     lower: &Array1<f64>,
