@@ -613,6 +613,16 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleTimeJacobian 
     fn n_outputs(&self) -> usize {
         3
     }
+
+    fn locks_raw_width_reduction(&self) -> bool {
+        // The time-wiggle Jacobian recomputes a fixed `p_tw`-column monotone
+        // wiggle basis on every evaluation and the family's likelihood reads
+        // the raw-width entry/exit/derivative designs (asserting
+        // `beta.len() == design_derivative_exit.ncols()`). A canonicaliser
+        // column-reduction of this block produces a reduced β the raw-width
+        // family cannot consume, so it must be kept at full raw width.
+        true
+    }
 }
 
 /// n_outputs = 3 stacked Jacobian for the **marginal** block when timewiggle
