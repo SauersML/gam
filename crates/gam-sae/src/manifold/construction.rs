@@ -225,7 +225,37 @@ impl SaeManifoldTerm {
             hybrid_split_report: None,
             atom_inner_fits: None,
             oos_linear_images: None,
+            separation_barrier_strength_override: None,
         })
+    }
+
+    /// #1777 — apply the PER-FIT configuration overrides (the FFI-facing
+    /// [`SaeFitConfig`]) as the source of truth for this term's fit, isolating it
+    /// from the deprecated process-global barrier/α atomics.
+    ///
+    /// Distributes the config to its two authorities: the barrier strength override
+    /// onto the term (read by `separation_barrier_strength`), and the IBP-α
+    /// override onto the assignment (read by
+    /// [`SaeAssignment::resolved_ibp_alpha`]). Any `None` field leaves that axis on
+    /// its historical fallback (process-global override, then the
+    /// data-derived/mode default), so an all-`None` config is a strict no-op. Call
+    /// this after building the term (before the fit) so concurrent fits carrying
+    /// distinct configs stay isolated without any global writes.
+    pub fn set_fit_config(&mut self, config: SaeFitConfig) {
+        self.separation_barrier_strength_override = config.separation_barrier_strength_override;
+        self.assignment
+            .set_ibp_alpha_override(config.ibp_alpha_override);
+    }
+
+    /// #1777 — the per-fit configuration currently in force on this term,
+    /// reconstructed from its two authorities (the term's barrier override and the
+    /// assignment's α override). Round-trips with [`Self::set_fit_config`].
+    #[must_use]
+    pub fn fit_config(&self) -> SaeFitConfig {
+        SaeFitConfig {
+            separation_barrier_strength_override: self.separation_barrier_strength_override,
+            ibp_alpha_override: self.assignment.ibp_alpha_override,
+        }
     }
 
     /// #1408/#1409 — install the optional hard per-row active-atom cap for
@@ -4203,7 +4233,6 @@ impl SaeManifoldTerm {
             AssignmentMode::IBPMap { .. } => {
                 let alpha = self
                     .assignment
-                    .mode
                     .resolved_ibp_alpha(rho)
                     .ok_or_else(|| "IBP assignment alpha resolution failed".to_string())?;
                 Some(ordered_geometric_shrinkage_prior(k_atoms, alpha).to_vec())
@@ -8177,7 +8206,6 @@ impl SaeManifoldTerm {
         };
         let alpha = self
             .assignment
-            .mode
             .resolved_ibp_alpha(rho)
             .ok_or_else(|| "learnable IBP alpha resolution failed".to_string())?;
         let k_atoms = self.k_atoms();
@@ -8356,7 +8384,6 @@ impl SaeManifoldTerm {
         };
         let alpha = self
             .assignment
-            .mode
             .resolved_ibp_alpha(rho)
             .ok_or_else(|| "learnable IBP alpha resolution failed".to_string())?;
         let inv_alpha1 = 1.0 / (alpha + 1.0);
@@ -8561,7 +8588,6 @@ impl SaeManifoldTerm {
         };
         let alpha = self
             .assignment
-            .mode
             .resolved_ibp_alpha(rho)
             .ok_or_else(|| "learnable IBP alpha resolution failed".to_string())?;
         let k_atoms = self.k_atoms();

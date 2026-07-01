@@ -120,7 +120,6 @@ impl SaeManifoldTerm {
             } => {
                 let effective_alpha = self
                     .assignment
-                    .mode
                     .resolved_ibp_alpha(rho)
                     .unwrap_or(alpha);
                 (

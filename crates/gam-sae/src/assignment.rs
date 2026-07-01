@@ -241,19 +241,31 @@ impl AssignmentMode {
         Ok(())
     }
 
-    pub(crate) fn resolved_ibp_alpha(&self, rho: &SaeManifoldRho) -> Option<f64> {
+    /// Resolve the effective truncated-IBP concentration `α` for this mode.
+    ///
+    /// `per_fit_override` is the #1777 PER-FIT override (from
+    /// [`SaeAssignment::ibp_alpha_override`]) and is the SOURCE OF TRUTH when set.
+    /// It falls back to the deprecated process-global [`ibp_alpha_override`] atomic
+    /// only when the per-fit field is unset, then to the mode's own `α` /
+    /// learnable schedule — so nothing breaks, but concurrent fits are isolatable
+    /// via the per-fit field.
+    pub(crate) fn resolved_ibp_alpha(
+        &self,
+        rho: &SaeManifoldRho,
+        per_fit_override: Option<f64>,
+    ) -> Option<f64> {
         match *self {
             AssignmentMode::IBPMap {
                 alpha,
                 learnable_alpha,
                 ..
-            } => Some(if let Some(over) = ibp_alpha_override() {
-                // #1026 — a process-global α override flattens the ordered
-                // geometric prior π_k = (α/(α+1))^{k+1} so all K atoms can
-                // contribute to the reconstruction (the production α=1 gives a
-                // (0.5)^{k+1} schedule that structurally caps atoms 4..K to a few
-                // percent → effective-K≈3). Forces the fixed value, bypassing the
-                // learnable schedule, so a sweep can attribute the EV ceiling.
+            } => Some(if let Some(over) = per_fit_override.or_else(ibp_alpha_override) {
+                // #1777 — the per-fit override (else the deprecated process-global
+                // one) flattens the ordered geometric prior π_k = (α/(α+1))^{k+1}
+                // so all K atoms can contribute to the reconstruction (the
+                // production α=1 gives a (0.5)^{k+1} schedule that structurally
+                // caps atoms 4..K → effective-K≈3). Forces the fixed value,
+                // bypassing the learnable schedule.
                 over
             } else if learnable_alpha {
                 resolve_learnable_weight(alpha, rho.log_lambda_sparse)
@@ -342,6 +354,16 @@ pub struct SaeAssignment {
     /// gates every outer eval — the n-independent-outer-loop lever (#1033). `None`
     /// is the historical free-logit path (bit-identical).
     pub frozen_logits: Option<Array2<f64>>,
+    /// #1777 PER-FIT IBP-α override — the source of truth for the truncated-IBP
+    /// concentration `α` when set, replacing the process-global
+    /// [`set_ibp_alpha_override`] atomic. `Some(α)` forces the fixed value
+    /// (bypassing the learnable schedule), scoped to THIS assignment/fit so
+    /// concurrent in-process fits are isolated. `None` ⇒ fall back to the
+    /// deprecated process-global override, then to the `AssignmentMode`'s own `α` /
+    /// learnable schedule (bit-identical to the historical path when neither
+    /// override is set). Read via [`Self::resolved_ibp_alpha`]; set from the FFI
+    /// through the term's `set_fit_config`.
+    pub ibp_alpha_override: Option<f64>,
 }
 
 impl SaeAssignment {
@@ -389,6 +411,7 @@ impl SaeAssignment {
             mode,
             ungated: vec![false; k],
             frozen_logits: None,
+            ibp_alpha_override: None,
         })
     }
 
@@ -630,12 +653,28 @@ impl SaeAssignment {
         self.try_assignments_row_with_alpha(row, None)
     }
 
+    /// #1777 — the effective truncated-IBP `α` for this assignment at `rho`,
+    /// honoring the PER-FIT [`Self::ibp_alpha_override`] first (source of truth),
+    /// then the deprecated process-global override, then the mode's own schedule.
+    /// The single seam every gate/jet/prior site reads so the per-fit override is
+    /// applied consistently. `None` for non-IBP modes.
+    pub(crate) fn resolved_ibp_alpha(&self, rho: &SaeManifoldRho) -> Option<f64> {
+        self.mode.resolved_ibp_alpha(rho, self.ibp_alpha_override)
+    }
+
+    /// #1777 — install (or clear, with `None`) the PER-FIT IBP-α override on this
+    /// assignment. Source of truth used by [`Self::resolved_ibp_alpha`]; the FFI
+    /// reaches it through the term's `set_fit_config`.
+    pub fn set_ibp_alpha_override(&mut self, alpha: Option<f64>) {
+        self.ibp_alpha_override = alpha;
+    }
+
     pub(crate) fn try_assignments_row_for_rho(
         &self,
         row: usize,
         rho: &SaeManifoldRho,
     ) -> Result<Array1<f64>, String> {
-        self.try_assignments_row_with_alpha(row, self.mode.resolved_ibp_alpha(rho))
+        self.try_assignments_row_with_alpha(row, self.resolved_ibp_alpha(rho))
     }
 
     fn try_assignments_row_with_alpha(
@@ -697,7 +736,7 @@ impl SaeAssignment {
         rho: &SaeManifoldRho,
         out: &mut [f64],
     ) -> Result<(), String> {
-        self.try_assignments_row_with_alpha_into(row, self.mode.resolved_ibp_alpha(rho), out)
+        self.try_assignments_row_with_alpha_into(row, self.resolved_ibp_alpha(rho), out)
     }
 
     /// #1557 — fill-into-caller-buffer twin of [`Self::try_assignments_row_with_alpha`].

@@ -590,6 +590,40 @@ pub struct SaeManifoldTerm {
     /// [`Self::set_hybrid_linear_images`]. Consulted by
     /// [`Self::hybrid_linear_image_map`] so train and OOS share one collapse map.
     pub(crate) oos_linear_images: Option<Vec<crate::hybrid_split::AtomLinearImage>>,
+    /// #1777 PER-FIT separation-barrier strength override `μ_C` — the source of
+    /// truth for the barrier strength when set, replacing the process-global
+    /// [`set_sae_barrier_overrides`] atomic. `Some(μ_C)` forces the absolute
+    /// strength (bypassing the data-derived overcompleteness ratio), scoped to
+    /// THIS term/fit so concurrent in-process fits are isolated; `0.0` disables the
+    /// barrier. `None` ⇒ fall back to the deprecated process-global override, then
+    /// the data-derived strength (bit-identical to the historical path when
+    /// neither override is set). Read via
+    /// [`super::penalties::SaeManifoldTerm::separation_barrier_strength`]; set from
+    /// the FFI through [`SaeManifoldTerm::set_fit_config`]. Carried across clones
+    /// (persisted configuration, like the assignment mode).
+    pub(crate) separation_barrier_strength_override: Option<f64>,
+}
+
+/// #1777 — PER-FIT configuration overrides the FFI sets on a term to isolate a
+/// fit from the deprecated process-global atomics
+/// ([`set_sae_barrier_overrides`] / [`crate::assignment::set_ibp_alpha_override`]).
+///
+/// This is the additive, back-compatible config surface the Python/FFI layer
+/// consumes: build it, then apply it with [`SaeManifoldTerm::set_fit_config`]. Any
+/// `None` field leaves the corresponding axis on its historical fallback
+/// (process-global override, then the compiled/data-derived default), so an
+/// all-`None` config is a strict no-op. Both fields are the SOURCE OF TRUTH for
+/// their axis when `Some`, so two terms carrying different configs produce
+/// correspondingly-different barrier/α WITHOUT touching any global — concurrent
+/// fits are isolatable.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SaeFitConfig {
+    /// Per-fit separation-barrier strength `μ_C`. `Some` bypasses both the global
+    /// override and the data-derived overcompleteness ratio (`0.0` = barrier off).
+    pub separation_barrier_strength_override: Option<f64>,
+    /// Per-fit truncated-IBP concentration `α`. `Some` bypasses both the global
+    /// override and the mode's own `α` / learnable schedule.
+    pub ibp_alpha_override: Option<f64>,
 }
 
 impl Clone for SaeManifoldTerm {
@@ -628,6 +662,9 @@ impl Clone for SaeManifoldTerm {
             hybrid_split_report: self.hybrid_split_report.clone(),
             atom_inner_fits: self.atom_inner_fits.clone(),
             oos_linear_images: self.oos_linear_images.clone(),
+            // #1777 — persisted per-fit config, carried across clones like the
+            // assignment mode so a cloned term keeps the same barrier override.
+            separation_barrier_strength_override: self.separation_barrier_strength_override,
         }
     }
 }
