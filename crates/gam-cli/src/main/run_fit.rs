@@ -1837,15 +1837,13 @@ pub(crate) fn run_fitwith_predict_noise(
     // only need to discriminate on the link.
     let location_scale_link_kind = match &family.link {
         InverseLink::Standard(StandardLink::Logit) => {
-            let spec = mixture_linkspec
-                .ok_or_else(|| {
-                    "binomial blended-inverse-link location-scale fitting requires link(type=blended(...))"
-                        .to_string()
-                })?
-                .clone();
-            let state = state_fromspec(&spec)
-                .map_err(|e| format!("invalid blended link configuration: {e}"))?;
-            InverseLink::Mixture(state)
+            if let Some(spec) = mixture_linkspec.as_ref() {
+                let state = state_fromspec(spec)
+                    .map_err(|e| format!("invalid blended link configuration: {e}"))?;
+                InverseLink::Mixture(state)
+            } else {
+                InverseLink::Standard(StandardLink::Logit)
+            }
         }
         // `resolve_family` already upgrades `LinkFunction::Sas` /
         // `LinkFunction::BetaLogistic` to their state-bearing variants,

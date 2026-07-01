@@ -14,7 +14,6 @@ use super::{
     GaussianLocationScaleTermSpec, GaussianLocationScaleWiggleTermSpec,
 };
 use crate::parameter_block::ParameterBlockInput;
-use gam_terms::smooth::TermCollectionSpec;
 use ndarray::Array1;
 
 pub(super) fn validate_len_match(name: &str, expected: usize, found: usize) -> Result<(), String> {
@@ -183,7 +182,6 @@ pub(super) fn validate_binomial_location_scale_termspec(
     validate_term_offset(spec.y.len(), &spec.threshold_offset, "threshold_offset")?;
     validate_term_offset(spec.y.len(), &spec.log_sigma_offset, "log_sigma_offset")?;
     validate_binomial_response(&spec.y, context)?;
-    validate_binomial_log_sigma_identifiable(&spec.log_sigmaspec, context)?;
     Ok(())
 }
 
@@ -197,30 +195,10 @@ pub(super) fn validate_binomial_location_scalewiggle_termspec(
     validate_term_offset(n, &spec.threshold_offset, "threshold_offset")?;
     validate_term_offset(n, &spec.log_sigma_offset, "log_sigma_offset")?;
     validate_binomial_response(&spec.y, context)?;
-    validate_binomial_log_sigma_identifiable(&spec.log_sigmaspec, context)?;
     validate_blockrows("wiggle", n, &spec.wiggle_block)?;
     gam_terms::inference::formula_dsl::require_binomial_inverse_link_supports_joint_wiggle(
         &spec.link_kind,
         context,
     )?;
     validate_wiggle_degree_and_knots(context, spec.wiggle_degree, spec.wiggle_knots.len())
-}
-
-pub(super) fn validate_binomial_log_sigma_identifiable(
-    log_sigmaspec: &TermCollectionSpec,
-    context: &str,
-) -> Result<(), String> {
-    if log_sigmaspec.linear_terms.is_empty()
-        && log_sigmaspec.random_effect_terms.is_empty()
-        && log_sigmaspec.smooth_terms.is_empty()
-    {
-        return Ok(());
-    }
-
-    Err(GamlssError::UnsupportedConfiguration {
-        reason: format!(
-            "{context}: Bernoulli binomial location-scale data identify only the composite q = -threshold / sigma; log_sigma must be intercept-only/fixed, not a free linear, random-effect, or smooth formula"
-        ),
-    }
-    .into())
 }
