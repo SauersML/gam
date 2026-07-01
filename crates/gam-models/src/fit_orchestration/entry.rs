@@ -658,7 +658,9 @@ fn fit_expectile_laws(
 ///   through the scan would silently drop that penalty and select λ from the
 ///   bending penalty alone, which is exactly the EDF inflation #1266 reports.
 ///   Those fits fall through to the dense two-rho path, which owns both penalties
-///   jointly;
+///   jointly. Natural cubic regression (`bs="cr"`/`"cs"`) terms also fall
+///   through: their knot-value parameterization is a finite-rank regression
+///   spline, not the scan's full smoothing-spline state-space posterior;
 /// - the offset is identically zero and every weight is finite and positive;
 /// - at least 3 distinct finite abscissae (the scan's diffuse rank plus one).
 ///
@@ -754,6 +756,7 @@ pub fn spline_scan_fast_path(request: &StandardFitRequest<'_>) -> Option<SplineS
         || matches!(
             bspec.knotspec,
             gam_terms::basis::BSplineKnotSpec::PeriodicUniform { .. }
+                | gam_terms::basis::BSplineKnotSpec::NaturalCubicRegression { .. }
         )
         // mgcv `bs="cr"`/`"cs"` materialise a `NaturalCubicRegression` value-knot
         // spec: a Lancaster–Salkauskas cubic-regression basis whose columns
