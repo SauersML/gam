@@ -611,6 +611,54 @@ where
     }
 }
 
+/// A predict-path error that remembers whether it is a *schema mismatch*
+/// (the caller's frame is missing a column the fitted model requires) or an
+/// ordinary failure. The prediction FFI historically flattened every failure
+/// to a bare `String`, so a missing-required-column rejection surfaced as the
+/// generic `GamError` instead of the documented `SchemaMismatchError`
+/// (issue #343's typed-error contract). Keeping the two cases distinct lets
+/// [`detach_predict_result`] pick the right Python class without string
+/// sniffing, while any non-schema `?` inside the predict impl still converts
+/// straight through `From<String>`.
+pub(crate) enum PredictError {
+    /// The frame does not carry a column the model needs → `SchemaMismatchError`.
+    SchemaMismatch(String),
+    /// Any other predict failure → `GamError` (a `ValueError` subclass), the
+    /// same class the bare-`String` path produced before.
+    Other(String),
+}
+
+impl From<String> for PredictError {
+    fn from(message: String) -> Self {
+        PredictError::Other(message)
+    }
+}
+
+impl From<PredictError> for String {
+    fn from(err: PredictError) -> Self {
+        match err {
+            PredictError::SchemaMismatch(message) | PredictError::Other(message) => message,
+        }
+    }
+}
+
+/// Predict-path twin of [`detach_py_result`]: releases the GIL, runs the
+/// closure, and maps a [`PredictError`] onto the *typed* Python exception —
+/// `SchemaMismatch` → `SchemaMismatchError`, everything else → `GamError`.
+/// Panics are still surfaced as the context-tagged panic error.
+pub(crate) fn detach_predict_result<T, F>(py: Python<'_>, context: &'static str, f: F) -> PyResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, PredictError> + Send + 'static,
+{
+    match py.detach(move || catch_unwind(AssertUnwindSafe(f))) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(PredictError::SchemaMismatch(message))) => Err(SchemaMismatchError::new_err(message)),
+        Ok(Err(PredictError::Other(message))) => Err(py_value_error(message)),
+        Err(payload) => Err(py_panic_error(context, payload)),
+    }
+}
+
 /// Detach the GIL, run a closure that has already produced a typed
 /// `PyResult<T>` (with the engine→Python class selection baked in), and
 /// preserve panics as `py_panic_error`. This is the chokepoint for call

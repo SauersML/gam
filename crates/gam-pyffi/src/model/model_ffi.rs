@@ -1469,7 +1469,7 @@ fn predict_table(
     rows: Vec<Vec<String>>,
     options_json: Option<String>,
 ) -> PyResult<String> {
-    detach_py_result(py, "predict_table", move || {
+    detach_predict_result(py, "predict_table", move || {
         predict_table_impl(&model_bytes, headers, rows, options_json.as_deref())
     })
 }

@@ -5933,13 +5933,13 @@ fn predict_table_impl(
     headers: Vec<String>,
     rows: Vec<Vec<String>>,
     options_json: Option<&str>,
-) -> Result<String, String> {
+) -> Result<String, PredictError> {
     let model = load_model_impl(model_bytes)?;
     let model_class = model.predict_model_class();
-    let dataset = dataset_with_model_schema(&model, &headers, &rows)?;
+    let dataset = dataset_with_model_schema_typed(&model, &headers, &rows)?;
     drop(rows);
     drop(headers);
-    predict_dataset_impl(&model, model_class, dataset, options_json)
+    predict_dataset_impl(&model, model_class, dataset, options_json).map_err(PredictError::Other)
 }
 
 fn predict_array_impl(
