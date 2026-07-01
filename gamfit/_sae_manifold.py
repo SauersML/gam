@@ -2842,14 +2842,15 @@ class ManifoldSAE:
         disk via :meth:`save` / :func:`gamfit.save`) to recover an object that
         reproduces :meth:`predict` outputs bit-exactly on training data.
 
-        NOT round-tripped: the large Fisher steering arrays (``fisher_factors``,
-        ``fisher_provenance``, ``metric_provenance``, ``fisher_mass_residual``)
-        are deliberately omitted to keep the serialization small. A model
-        recovered from this dict has ``fisher_factors=None``, so :meth:`steer`
-        falls back to geometry-only steering (``delta`` / ``off_manifold_norm``
-        are returned, but ``predicted_nats`` / ``validity_radius`` degrade to
-        ``None``). The posterior shape-band uncertainty arrays are likewise only
-        on a freshly-fit model.
+        Fisher steering state (``fisher_factors``, ``fisher_provenance``,
+        ``metric_provenance``, ``fisher_mass_residual``) IS now round-tripped, so
+        a model recovered from this dict reproduces :meth:`steer`'s output
+        dosimetry (``predicted_nats`` / ``validity_radius``) — not just the
+        geometry-only fallback. For very large ``(N, p, r)`` Fisher shards the
+        inline arrays dominate the JSON size; a future optimisation could move
+        them to a sidecar, but correctness (no dropped state) takes priority here.
+        The posterior shape-band uncertainty arrays are likewise carried when
+        present on a freshly-fit model.
         """
         def _optional_list(value: np.ndarray | None) -> Any:
             return None if value is None else value.tolist()
@@ -2949,13 +2950,22 @@ class ManifoldSAE:
             "structure_certificate": self.structure_certificate_json,
             "cotrain": None if self.cotrain is None else _jsonable(self.cotrain),
             "hybrid_split": None if self.hybrid_split is None else _jsonable(self.hybrid_split),
+            # Fisher steering state — round-tripped so a loaded model keeps its
+            # output-Fisher dosimetry (predicted_nats / validity_radius). Written
+            # as None when the fit was Euclidean (no shard).
+            "fisher_factors": _optional_list(self.fisher_factors),
+            "fisher_provenance": (
+                None if self.fisher_factors is None else str(self.fisher_provenance)
+            ),
+            "metric_provenance": str(self.metric_provenance),
+            "fisher_mass_residual": _optional_list(self.fisher_mass_residual),
         }
 
     def save(self, path: str | Path) -> None:
         """Write this fit to ``path`` as JSON. Round-trips via :func:`gamfit.load`.
 
-        Fisher steering dosimetry is not persisted; see :meth:`to_dict` for the
-        round-trip downgrade (a loaded model steers geometry-only).
+        Fisher steering state is persisted, so a reloaded model reproduces
+        :meth:`steer`'s output dosimetry (see :meth:`to_dict`).
         """
         Path(path).write_text(json.dumps(self.to_dict()))
 
@@ -2964,11 +2974,12 @@ class ManifoldSAE:
         """Reconstruct a :class:`ManifoldSAE` from a :meth:`to_dict` payload.
 
         The recovered model reproduces :meth:`predict` on training data
-        bit-exactly. Fisher steering state (``fisher_factors`` /
+        bit-exactly, AND now restores Fisher steering state (``fisher_factors`` /
         ``fisher_provenance`` / ``metric_provenance`` / ``fisher_mass_residual``)
-        is NOT round-tripped (to_dict omits the large arrays), so the loaded
-        model has ``fisher_factors=None`` and :meth:`steer` degrades to
-        geometry-only (``predicted_nats`` / ``validity_radius`` are ``None``).
+        so :meth:`steer` reproduces its output dosimetry. (Legacy dicts written
+        before Fisher round-tripping simply lack those keys and load with
+        ``fisher_factors=None`` — the old geometry-only behaviour, where
+        ``predicted_nats`` / ``validity_radius`` are ``None``.)
         """
         schema = str(payload["schema"])
         if schema != "gamfit.ManifoldSAE/v1":
@@ -3107,15 +3118,33 @@ class ManifoldSAE:
                 if payload.get("hybrid_split") is None
                 else dict(payload["hybrid_split"])
             ),
+            # Round-trip Fisher steering state (previously dropped on load, which
+            # silently downgraded a loaded model's steer() to geometry-only).
+            fisher_factors=(
+                None
+                if payload.get("fisher_factors") is None
+                else np.ascontiguousarray(np.asarray(payload["fisher_factors"], dtype=float))
+            ),
+            fisher_provenance=(
+                None
+                if payload.get("fisher_provenance") is None
+                else str(payload["fisher_provenance"])
+            ),
+            metric_provenance=str(payload.get("metric_provenance", "Euclidean")),
+            fisher_mass_residual=(
+                None
+                if payload.get("fisher_mass_residual") is None
+                else np.asarray(payload["fisher_mass_residual"], dtype=float)
+            ),
         )
 
     @classmethod
     def load(cls, path: str | Path) -> "ManifoldSAE":
         """Load a fit written by :meth:`save`.
 
-        Fisher steering dosimetry is not restored (see :meth:`from_dict`); a
-        loaded model has ``fisher_factors=None`` and :meth:`steer` degrades to
-        geometry-only.
+        Fisher steering state is restored (see :meth:`from_dict`), so a loaded
+        model reproduces :meth:`steer`'s output dosimetry. (Files written by
+        versions predating Fisher round-tripping load geometry-only.)
         """
         return cls.from_dict(json.loads(Path(path).read_text()))
 
