@@ -27,6 +27,7 @@ mod overlapping_smooth_predict_design_mismatch;
 mod periodic_radial_refactor_cc_margin_and_duchon;
 mod posterior_sampling_box_coefficient_constraint_1507;
 mod posterior_sampling_monotone_shape_constraint_1509;
+mod poisson_monotone_shape_infeasible_silent_1786;
 mod pure_duchon_probit_repro;
 mod quadrature_alo_smooth_test;
 mod regression_scale_basis_parsimony_501;
