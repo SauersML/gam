@@ -4070,6 +4070,11 @@ fn sae_manifold_fit_ibp<'py>(
         None,
         // No per-row design-honesty weights on this convenience IBP entry point.
         None,
+        // No per-fit separation-barrier / IBP-α overrides on this convenience IBP
+        // entry point (#1777): defer to the process-global setter (or the compiled
+        // default), matching how every other override above is left `None` here.
+        None,
+        None,
     )
 }
 
