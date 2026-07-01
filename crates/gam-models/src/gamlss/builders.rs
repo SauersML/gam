@@ -1854,13 +1854,27 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                         *noise_beta_hint_cell.borrow_mut() = Some(beta);
                     }
                     let family = builder.build_family(&designs[0], &designs[1]);
-                    let psiderivative_blocks = builder.build_psiderivative_blocks(
-                        data,
-                        &specs[0],
-                        &specs[1],
-                        &designs[0],
-                        &designs[1],
-                    )?;
+                    let psiderivative_blocks = if matches!(eval_mode, EvalMode::ValueOnly) {
+                        // Cost-only line-search probes need only the profiled
+                        // likelihood at the already-realized θ. The ψ
+                        // derivative payloads are O(n) to assemble and are
+                        // consumed solely by the IFT gradient/Hessian path;
+                        // building them for every backtracking probe made the
+                        // Gaussian location-scale path scale with sample size
+                        // even when the optimizer discarded the derivative
+                        // pieces. Pass empty blocks so the shared evaluator
+                        // performs the same fixed-design inner REML solve
+                        // without derivative-only setup work.
+                        (0..specs.len()).map(|_| Vec::new()).collect()
+                    } else {
+                        builder.build_psiderivative_blocks(
+                            data,
+                            &specs[0],
+                            &specs[1],
+                            &designs[0],
+                            &designs[1],
+                        )?
+                    };
                     let warm_start = hyper_warm_start_cell.borrow().clone();
                     // Forward the κ-staging row set to the family by installing it
                     // on the canonical `outer_score_subsample` option. Inner-PIRLS
