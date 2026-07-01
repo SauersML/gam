@@ -320,6 +320,21 @@ pub(crate) fn build_dense_schur_sqrt_ba<B: BatchedBlockSolver + Sync>(
                 .to_string(),
         });
     }
+    // Same fail-loud host-memory contract as the Direct reduction (#1017).  The
+    // square-root BA route still materialises the same dense `k×k` reduced
+    // Schur; letting this path bypass the budget would preserve an OOM-class
+    // fallback even after Direct learned to refuse matrix-free-only borders.
+    let dense_bytes = (k as u128).saturating_mul(k as u128).saturating_mul(8);
+    if dense_bytes > DENSE_SCHUR_BYTES_BUDGET {
+        return Err(ArrowSchurError::SchurFactorFailed {
+            reason: format!(
+                "square-root BA dense reduced Schur is {k}×{k} f64 = {} MiB, exceeding the \
+                 {} MiB host budget; this border is matrix-free-only",
+                dense_bytes / (1024 * 1024),
+                DENSE_SCHUR_BYTES_BUDGET / (1024 * 1024),
+            ),
+        });
+    }
     let mut schur = op.to_dense();
     for j in 0..k {
         schur[[j, j]] += ridge_beta;
@@ -1011,7 +1026,9 @@ impl SaeResidentReducedSchur {
             }
         }
         // acc += P_iᵀ prod = scatter φ_s · prod into base_s blocks.
-        let acc_slice = acc.as_slice_mut().expect("resident matvec acc must be contiguous");
+        let acc_slice = acc
+            .as_slice_mut()
+            .expect("resident matvec acc must be contiguous");
         for &(base, phi) in support {
             if phi == 0.0 {
                 continue;
@@ -1205,7 +1222,15 @@ pub(crate) fn slq_reduced_schur_log_det<B: BatchedBlockSolver + Sync>(
             // guarded off inside a worker, so there is no nested oversubscription.
             let x = v.to_owned();
             let mut out = Array1::<f64>::zeros(k);
-            schur_matvec(sys, htt_factors, ridge_beta, &x, &mut out, backend, resident);
+            schur_matvec(
+                sys,
+                htt_factors,
+                ridge_beta,
+                &x,
+                &mut out,
+                backend,
+                resident,
+            );
             out
         },
         num_probes,

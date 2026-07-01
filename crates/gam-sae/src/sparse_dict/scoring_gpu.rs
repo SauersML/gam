@@ -332,7 +332,7 @@ mod device {
                 return Ok(m.clone());
             }
         }
-        let ptx = cudarc::nvrtc::compile_ptx(score_block_kernel_source(p))
+        let ptx = gam_gpu::device_cache::compile_ptx_arch(score_block_kernel_source(p))
             .gpu_ctx_with(|err| format!("sparse_dict score-block NVRTC (P={p}): {err}"))?;
         let module = b
             .ctx

@@ -935,7 +935,16 @@ fn parse_periodic_axes_option(
     let lowered = raw_axes.trim().to_ascii_lowercase();
     match lowered.as_str() {
         "true" | "yes" | "y" => return Ok(Some(periods)),
-        "false" | "no" | "n" => return Ok(Some(vec![None; dim])),
+        // `false` means NO axis is periodic. Return `None` — NOT
+        // `Some(vec![None; dim])` — because the radial 1-D consumer treats a
+        // `Some([None])` as "periodicity requested, derive the wrap period from
+        // the data range" (see the Duchon builder arm below, which back-fills
+        // `axes[0] = data_span` for a lone `None`) and the 1-D builder routes on
+        // `spec.periodic.is_some()`. Emitting `Some([None])` here therefore
+        // silently produced a *periodic* smooth for an explicit `periodic=false`
+        // — the exact regression this arm now avoids, matching the bracketed
+        // `[false]` form handled by the per-axis boolean block below.
+        "false" | "no" | "n" => return Ok(None),
         _ => {}
     }
     let axes = split_list_option(raw_axes);
@@ -4922,6 +4931,70 @@ mod tests {
                 "periodic=true must thread a Some(periodic) into the thinplate spec",
             ),
             other => panic!("expected ThinPlate basis, got {other:?}"),
+        }
+    }
+
+    /// Regression: an explicit scalar `periodic=false` on a radial spatial smooth
+    /// must build a NON-periodic basis. The scalar-boolean shortcut used to emit
+    /// `Some(vec![None; dim])`, which the 1-D radial builders route on via
+    /// `spec.periodic.is_some()` (and the Duchon arm even back-fills the data
+    /// range into a lone `None`), so `periodic=false` silently produced a
+    /// *periodic* smooth — the opposite of what was asked. The spec's `periodic`
+    /// field must be `None` for every radial base (matern / thinplate / duchon),
+    /// matching the bracketed `[false]` form.
+    #[test]
+    fn scalar_periodic_false_builds_non_periodic_radial_smooth() {
+        let n = 200usize;
+        let rows: Vec<Vec<f64>> = (0..n)
+            .map(|i| {
+                let x = -3.0 + 6.0 * (i as f64) / ((n - 1) as f64);
+                vec![x.sin(), x]
+            })
+            .collect();
+        let ds = continuous_dataset(&["y", "x"], rows);
+
+        let build = |bs: &str| -> SmoothBasisSpec {
+            let mut opts = BTreeMap::new();
+            opts.insert("bs".to_string(), bs.to_string());
+            opts.insert("periodic".to_string(), "false".to_string());
+            let mut notes = Vec::new();
+            build_smooth_basis(
+                SmoothKind::S,
+                &["x".to_string()],
+                &[1],
+                &opts,
+                &ds,
+                &mut notes,
+                &ResourcePolicy::default_library(),
+                1,
+            )
+            .unwrap_or_else(|e| panic!("s(x, bs={bs}, periodic=false) must be accepted: {e}"))
+        };
+
+        match &build("gp") {
+            SmoothBasisSpec::Matern { spec, .. } => assert!(
+                spec.periodic.is_none(),
+                "periodic=false must leave the matern spec non-periodic, got {:?}",
+                spec.periodic
+            ),
+            other => panic!("expected Matern basis, got {other:?}"),
+        }
+        match &build("tp") {
+            SmoothBasisSpec::ThinPlate { spec, .. } => assert!(
+                spec.periodic.is_none(),
+                "periodic=false must leave the thinplate spec non-periodic, got {:?}",
+                spec.periodic
+            ),
+            other => panic!("expected ThinPlate basis, got {other:?}"),
+        }
+        match &build("duchon") {
+            SmoothBasisSpec::Duchon { spec, .. } => assert!(
+                spec.periodic.is_none(),
+                "periodic=false must leave the duchon spec non-periodic (no data-range \
+                 back-fill), got {:?}",
+                spec.periodic
+            ),
+            other => panic!("expected Duchon basis, got {other:?}"),
         }
     }
 
