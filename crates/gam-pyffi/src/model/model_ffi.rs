@@ -2664,9 +2664,18 @@ fn duchon_function_norm_penalty<'py>(
 /// Build the spherical-spline (S²) basis and matching penalty matrix.
 ///
 /// `points` is an `(N, 2)` array of latitude/longitude pairs (degrees by
-/// default, radians when `radians=True`). `n_centers` controls the number
-/// of Wahba centers (kernel = "sobolev" | "pseudo") or the truncation
-/// degree `L` for kernel = "harmonic" (basis dim = `L * (L + 2)`).
+/// default, radians when `radians=True`). The role of `n_centers` depends on
+/// the kernel:
+///
+/// * `"sobolev"` — the finite Wahba center kernel; `n_centers` is the number
+///   of centers and therefore the basis dimension `K`.
+/// * `"harmonic"` — a truncated spherical-harmonic basis of degree
+///   `L = n_centers` (basis dim `K = L * (L + 2)`).
+/// * `"pseudo"` — the pseudodifferential kernel is resolved by the builder to
+///   the harmonic engine (its low-degree start avoids the finite-center
+///   constant-collision the Wahba chart hits; see `term_design`). Here
+///   `n_centers` is a *target width* that selects a harmonic degree `L`, so
+///   the basis dimension is `K = L * (L + 2)`, not the literal `n_centers`.
 ///
 /// Returns `(design, penalty)` as numpy arrays, with shapes `(N, K)` and
 /// `(K, K)` respectively, where `K` is the chosen basis dimension after

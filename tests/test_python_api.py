@@ -1849,14 +1849,30 @@ def test_sphere_basis_each_kernel_shapes_and_psd() -> None:
         assert design.ndim == 2 and design.shape[0] == n, (
             f"kernel={kernel}: design rows {design.shape[0]} != n {n}"
         )
-        k_expected = (
-            n_centers * (n_centers + 2) if kernel == "harmonic" else n_centers
-        )
-        assert design.shape[1] == k_expected, (
-            f"kernel={kernel}: design cols {design.shape[1]} != {k_expected}"
-        )
-        assert penalty.shape == (k_expected, k_expected), (
-            f"kernel={kernel}: penalty shape {penalty.shape}"
+        k = design.shape[1]
+        if kernel == "sobolev":
+            # Finite Wahba center kernel: exactly one column per requested center.
+            assert k == n_centers, (
+                f"kernel={kernel}: design cols {k} != {n_centers}"
+            )
+        elif kernel == "harmonic":
+            # Truncated real spherical-harmonic basis of degree L = n_centers.
+            assert k == n_centers * (n_centers + 2), (
+                f"kernel={kernel}: design cols {k} != {n_centers * (n_centers + 2)}"
+            )
+        else:
+            # The pseudodifferential kernel is resolved by the Rust builder to
+            # the harmonic engine (see `harmonic_degree_for_wahba_basis_width`
+            # and the #531/#532 identifiability note in term_design.rs): it
+            # spans a full spherical-harmonic space of some degree L, so the
+            # width is L*(L+2) rather than the literal `n_centers`.
+            harmonic_dims = {ell * (ell + 2) for ell in range(1, 64)}
+            assert k in harmonic_dims, (
+                f"kernel={kernel}: design cols {k} is not a spherical-harmonic "
+                f"dimension L*(L+2)"
+            )
+        assert penalty.shape == (k, k), (
+            f"kernel={kernel}: penalty shape {penalty.shape} != ({k}, {k})"
         )
         assert np.all(np.isfinite(design)) and np.all(np.isfinite(penalty)), (
             f"kernel={kernel}: NaN/Inf in basis/penalty"
