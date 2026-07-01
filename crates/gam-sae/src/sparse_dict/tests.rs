@@ -483,7 +483,6 @@ fn dead_atom_revival_keeps_ev_monotone_and_dictionary_alive_in_k() {
 /// `tests/data`). Returns `(rows, cols, data)` in row-major order. Panics with a
 /// clear message on any format it does not handle — this is a measurement
 /// helper, not a general parser.
-#[cfg(test)]
 fn read_npy_f32_2d(path: &str) -> (usize, usize, Vec<f32>) {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     assert!(
@@ -546,7 +545,6 @@ fn read_npy_f32_2d(path: &str) -> (usize, usize, Vec<f32>) {
 /// and the dead fraction small (pre-fix it was non-monotone with the majority of
 /// atoms dead).
 #[test]
-#[ignore = "reads banked tests/data activation slices; run with --run-ignored for #1026 measurement"]
 fn real_olmo_sparse_dict_ev_vs_k_parity() {
     let files = [
         concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/data/olmo_l18_pca64_635.npy"),

@@ -128,8 +128,6 @@ mod estimate_policy_tests;
 #[cfg(test)]
 mod gaussian_high_edf_scale_tests;
 #[cfg(test)]
-mod gaussian_obs_coverage_probe;
-#[cfg(test)]
 mod invert_regularized_rho_hessian_tests;
 // Finite-difference debug probes on `ExternalJointHyperEvaluator`
 // (`debug_full_h`). These are `pub` inherent methods so the #1601-orphaned
