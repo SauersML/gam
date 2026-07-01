@@ -1549,12 +1549,11 @@ pub(crate) fn duchon_operator_penalty_candidates(
     // When per-axis relevance is requested (`scale_dims`) and tension is a
     // collocation-valid active order, the single isotropic gradient penalty
     // `Σ‖∇f‖²` is REPLACED by `dim` per-axis penalties `Σ(∂f/∂x_a)²`, each its
-    // own REML λ_a (ARD: REML shrinks an axis's nonlinear contribution toward
-    // flat only when it does not earn its keep). The isotropic-order penalties
+    // own REML λ_a (ARD: REML shrinks an axis's contribution toward flat only
+    // when it does not earn its keep). The isotropic-order penalties
     // (mass, stiffness) still route through the shared factory; tension is
-    // removed from its spec here and re-emitted per-axis below. The affine
-    // slopes stay in the global trend ridge, so a smooth, linearly-useful axis
-    // keeps its slope while its nonlinear λ_a may grow.
+    // removed from its spec here and re-emitted per-axis below. The D1 block
+    // acts on the whole function basis, including polynomial slopes.
     let split_tension = per_axis_relevance && want_tension;
     let factory_spec = if split_tension {
         let mut spec = effective_spec.clone();
@@ -1603,8 +1602,7 @@ pub(crate) fn duchon_operator_penalty_candidates(
         // `D1` rows are indexed `collocation_i · dim + axis`, so axis `a` owns
         // the strided row set `a, a+dim, a+2·dim, …`. `fast_ata` of that slice
         // is the density-blind support quadrature of `∫(∂f/∂x_a)²` in the final
-        // β-basis (the poly null space is zeroed in `D1`, so this is the
-        // NONLINEAR gradient energy; the affine slope is the trend ridge's job).
+        // β-basis.
         for axis in 0..dim {
             let d1_axis = ops.d1.slice(s![axis..; dim, ..]).to_owned();
             candidates.push(normalize_penalty_candidate(
