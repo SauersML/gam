@@ -3003,6 +3003,53 @@ fn candidate_selection_prefers_lower_cost_within_same_convergence_class() {
     assert!(!candidate_improves_best(&nonconverged_lo, Some(&converged)));
 }
 
+/// #1744: when BOTH multi-start seeds stall short of a stationary point (neither
+/// converged, both trustworthy flat-valley costs), a lower non-converged REML is
+/// only decisive on the SAME flat valley. A candidate that is BOTH more-smoothed
+/// (larger Σρ) AND farther from stationarity (larger residual gradient) than the
+/// flexible incumbent is the over-smoothing overshoot — it must NOT displace the
+/// flexible seed on cost alone. Every other shape still compares on cost.
+#[test]
+fn parsimonious_keep_best_rejects_less_stationary_over_smoothed_nonconverged_seed() {
+    let plan = OuterPlan {
+        solver: Solver::Bfgs,
+        hessian_source: HessianSource::BfgsApprox,
+    };
+    let rho_dim = 3usize;
+
+    // The #1744 signature: flexible incumbent (Σρ<0, closer to stationarity),
+    // over-smoothed candidate (Σρ>0, LOWER REML but LARGER residual gradient).
+    let mut flexible = OuterResult::new(array![-3.91, 0.08, -0.09], 74.40, 1, false, plan);
+    flexible.final_grad_norm = Some(1.12);
+    let mut over_smoothed = OuterResult::new(array![1.00, 0.997, 0.984], 67.30, 1, false, plan);
+    over_smoothed.final_grad_norm = Some(3.29);
+    // Both trustworthy (grad ≤ FLAT_VALLEY_STALL_GRAD_CEILING). The lower-REML
+    // over-smoothed seed must NOT win: more-smoothed AND less-stationary.
+    assert!(
+        !candidate_improves_best_parsimonious(&over_smoothed, Some(&flexible), rho_dim),
+        "a more-smoothed, less-stationary non-converged seed must not displace the flexible incumbent on cost alone"
+    );
+
+    // Symmetry / guard bounds: a more-smoothed candidate that is AT LEAST as
+    // close to stationarity (smaller residual gradient) still wins on lower cost
+    // — the pathology is specifically the LESS-stationary case.
+    let mut over_smoothed_sharper = over_smoothed.clone();
+    over_smoothed_sharper.final_grad_norm = Some(0.5);
+    assert!(
+        candidate_improves_best_parsimonious(&over_smoothed_sharper, Some(&flexible), rho_dim),
+        "a more-smoothed candidate closer to stationarity keeps the lower-cost win"
+    );
+
+    // A less-smoothed (more flexible) non-converged candidate with lower cost
+    // always wins regardless of gradient — the guard only fires on more-smoothed.
+    let mut flexible_lower = OuterResult::new(array![-6.0, -6.0, -6.0], 60.0, 1, false, plan);
+    flexible_lower.final_grad_norm = Some(4.0);
+    assert!(
+        candidate_improves_best_parsimonious(&flexible_lower, Some(&flexible), rho_dim),
+        "a less-smoothed lower-cost candidate is a genuine flexible improvement"
+    );
+}
+
 #[test]
 fn parsimonious_keep_best_breaks_laml_tie_toward_more_smoothing() {
     let plan = OuterPlan {

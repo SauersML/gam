@@ -3887,6 +3887,49 @@ pub(crate) fn planted_circle_focus_1744() {
     );
 }
 
+/// #1744 focused regression guard for the single noise-scale sweep point that
+/// failed: `ibp_map` n=40 σ=0.18. Runs exactly one outer solve from the
+/// dimensionless ρ seed (the same construction the full sweep uses), so it
+/// reproduces the RED (~70s) far faster than the ~400s full sweep.
+///
+/// Before the seed-screening keep-best fix, the default budget-2 multi-start
+/// discarded the flexible (dimensionless-seed) basin (non-converged REML 74.4,
+/// EV 0.96) for the over-smoothed basin (non-converged REML 67.3, EV 0.86,
+/// ρ≈(1.0,0.997,0.984)) purely on the lower REML. The over-smoothed basin is
+/// both more-smoothed and farther from stationarity, so keep-best now retains
+/// the flexible seed. Uses the same 0.95 threshold as the full sweep.
+#[test]
+pub(crate) fn planted_circle_ibp_map_n40_sigma018_reaches_high_ev_1744() {
+    let assignment_mode = PlantedCircleAssignmentMode::IbpMap;
+    let n = 40usize;
+    let sigma = 0.18_f64;
+    let z = planted_circle_data(n, sigma);
+    let (term, seed_dispersion) = planted_circle_seed_term(z.view(), assignment_mode);
+    let seed_ev = global_ev(z.view(), term.fitted().view());
+    let init_rho = SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![array![0.0]])
+        .seed_scaled_by_dispersion_for_assignment(seed_dispersion, assignment_mode.mode())
+        .unwrap();
+    let init_rho_flat = init_rho.to_flat();
+    let n_params = init_rho_flat.len();
+    let mut objective =
+        SaeManifoldOuterObjective::new(term, z.clone(), None, init_rho, 50, 0.04, 1.0e-6, 1.0e-6);
+    gam_solve::rho_optimizer::OuterProblem::new(n_params)
+        .with_initial_rho(init_rho_flat)
+        .run(&mut objective, "SAE planted circle #1744 focused")
+        .unwrap();
+    let fitted_result = objective.into_fitted();
+    let rho = fitted_result.rho;
+    let ev = global_ev(z.view(), fitted_result.term.fitted().view());
+    assert!(
+        ev > 0.95,
+        "focused #1744 fixture (ibp_map n={n} sigma={sigma}) seed_ev={seed_ev:.4} \
+         final_rho=({:.3},{:?},{:?}) EV={ev:.4} should exceed 0.95",
+        rho.log_lambda_sparse,
+        rho.log_lambda_smooth,
+        rho.log_ard
+    );
+}
+
 #[test]
 pub(crate) fn planted_circle_noise_scale_sweep_reaches_high_ev_with_dimensionless_rho_seed() {
     for assignment_mode in [

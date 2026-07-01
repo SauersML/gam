@@ -768,8 +768,41 @@ pub(crate) fn candidate_improves_best_parsimonious(
             match (candidate_trustworthy, best_trustworthy) {
                 (true, false) => true,
                 (false, true) => false,
-                // Both honest flat-valley plateaus: their costs ARE comparable.
-                (true, true) => candidate.final_value < best.final_value,
+                // Both honest flat-valley plateaus: their costs ARE comparable —
+                // EXCEPT for the #1744 over-smoothing overshoot. When BOTH seeds
+                // stall short of a stationary point (neither converged), a lower
+                // cached REML is only decisive when the two seeds are competing on
+                // the SAME flat valley. A candidate that is BOTH more-smoothed
+                // (larger Σρ over the leading smoothing coords) AND farther from
+                // stationarity (a strictly LARGER bound-projected residual
+                // gradient) than the flexible incumbent is not on that valley: it
+                // is the over-smoothed basin's shoulder, whose marginally-lower
+                // REML is bought by collapsing coefficients into the penalty
+                // null-space (on the response scale `exp(η)` this is a far worse
+                // fit — #1744: the IBP-MAP planted circle railed into
+                // ρ≈(1.0,0.997,0.984), EV 0.86, over the flexible ρ≈−4 seed's EV
+                // 0.96, purely because its non-converged REML was 67.3 < 74.4).
+                // Refuse to let that heavier, less-stationary stall displace the
+                // flexible seed on cost alone; every other shape (a less-smoothed
+                // candidate, or one at least as close to stationarity) still wins
+                // on the lower cost, so a genuinely-better flexible basin is
+                // unaffected.
+                (true, true) => {
+                    let candidate_more_smoothed =
+                        smoothing_rho_sum(candidate, rho_dim) > smoothing_rho_sum(best, rho_dim);
+                    let candidate_less_stationary = match (
+                        candidate.final_grad_norm,
+                        best.final_grad_norm,
+                    ) {
+                        (Some(cg), Some(bg)) if cg.is_finite() && bg.is_finite() => cg > bg,
+                        _ => false,
+                    };
+                    if candidate_more_smoothed && candidate_less_stationary {
+                        false
+                    } else {
+                        candidate.final_value < best.final_value
+                    }
+                }
                 // Both stuck PIRLS-capped stalls (#1426): the cached cost is
                 // spuriously low for BOTH, so it cannot break the tie — the
                 // under-penalized λ→0 overfit (EDF ≈ k) carries the LOWER bogus
