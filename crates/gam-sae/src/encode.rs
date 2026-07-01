@@ -2028,37 +2028,37 @@ impl EncodeAtlas {
         let mut coords = Array2::<f64>::zeros((n, d));
         let mut valid = vec![false; n];
 
-        // A missing basis evaluator means the distilled predictor cannot fire for
-        // this atom — every row is uncertified (zeroed), exactly like the per-row
-        // `amortized_encode_row` no-evaluator branch.
-        let Some(evaluator) = atom.basis_evaluator.as_ref().cloned() else {
+        // A missing basis evaluator means this atom never had a well-formed atlas
+        // built here — treat every row as uncertified (zeroed), exactly like the
+        // per-row `amortized_encode_row` no-evaluator branch. (The predictor below
+        // uses only cached atlas data, so no evaluator call is made online.)
+        if atom.basis_evaluator.is_none() {
             return Ok((coords, valid));
-        };
+        }
 
-        // ── Routing recon-centers (one evaluation per chart, batched). ────────
-        // `nearest_chart` routes a row to the chart whose center reconstruction
-        // `m(t_c) = BᵀΦ(t_c)` is closest in ‖·‖², skipping charts with
-        // `certified_radius <= 0`. Evaluate every candidate center ONCE here
-        // (chart count ≪ n) and GEMM the recon, reproducing `nearest_chart`'s
-        // per-chart recon bit-for-bit (same φ·decoder accumulation order).
+        // ── Routing recon-centers (cached, no online basis evaluation). ────────
+        // Routing sends a row to the chart whose center reconstruction
+        // `m(t_c) = BᵀΦ(t_c)` is closest in ‖·‖². Those center reconstructions are
+        // OFFLINE-cached in `chart.recon_center` (bit-identical to re-evaluating the
+        // basis at the fixed centers — same φ·decoder accumulation). Gather the cache
+        // instead of calling `evaluator.evaluate` on every invocation: that per-call
+        // chart-center evaluation was the dominant per-atom-group overhead at massive
+        // K, where N rows scatter across many atoms into tiny groups so a fixed
+        // per-call cost is amortized over only a handful of rows. This is what keeps
+        // the fast index-routed encode near-flat as K grows.
         let valid_charts: Vec<usize> = (0..atom_atlas.charts.len())
             .filter(|&c| atom_atlas.charts[c].certified_radius > 0.0)
             .collect();
         if valid_charts.is_empty() {
             return Ok((coords, valid));
         }
-        // Stack candidate centers (C × d) and evaluate the basis in one call.
-        let mut centers = Array2::<f64>::zeros((valid_charts.len(), d));
+        // recon_centers (C × p): the cached m(t_c) for each certifiable chart.
+        let mut recon_centers = Array2::<f64>::zeros((valid_charts.len(), p));
         for (ci, &c) in valid_charts.iter().enumerate() {
-            centers
+            recon_centers
                 .row_mut(ci)
-                .assign(&atom_atlas.charts[c].region.center);
+                .assign(&atom_atlas.charts[c].recon_center);
         }
-        let (phi_centers, _jet) = evaluator
-            .evaluate(centers.view())
-            .map_err(|err| format!("amortized_encode_batch_fast: center eval: {err}"))?;
-        // recon_centers = Φ_centers · decoder  (C × p), the routing targets.
-        let recon_centers = phi_centers.dot(&atom.decoder_coefficients);
         // Per-chart routing key: route_idx[row] = argmin_c ‖x_row − recon_c‖².
         // ‖x − r‖² = ‖x‖² − 2 x·r + ‖r‖²; the ‖x‖² term is row-constant so the
         // argmin uses S = X·recon_centersᵀ and the per-chart ‖r‖². First chart
