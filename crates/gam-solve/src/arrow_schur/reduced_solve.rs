@@ -320,6 +320,21 @@ pub(crate) fn build_dense_schur_sqrt_ba<B: BatchedBlockSolver + Sync>(
                 .to_string(),
         });
     }
+    // Same fail-loud host-memory contract as the Direct reduction (#1017).  The
+    // square-root BA route still materialises the same dense `k×k` reduced
+    // Schur; letting this path bypass the budget would preserve an OOM-class
+    // fallback even after Direct learned to refuse matrix-free-only borders.
+    let dense_bytes = (k as u128).saturating_mul(k as u128).saturating_mul(8);
+    if dense_bytes > DENSE_SCHUR_BYTES_BUDGET {
+        return Err(ArrowSchurError::SchurFactorFailed {
+            reason: format!(
+                "square-root BA dense reduced Schur is {k}×{k} f64 = {} MiB, exceeding the \
+                 {} MiB host budget; this border is matrix-free-only",
+                dense_bytes / (1024 * 1024),
+                DENSE_SCHUR_BYTES_BUDGET / (1024 * 1024),
+            ),
+        });
+    }
     let mut schur = op.to_dense();
     for j in 0..k {
         schur[[j, j]] += ridge_beta;
@@ -564,68 +579,43 @@ pub(crate) fn spectral_unit_deflated_schur(
     Some(conditioned)
 }
 
-pub(crate) fn solve_dense_reduced_system(
+pub(crate) fn factor_dense_reduced_schur(
     schur: &Array2<f64>,
-    rhs_beta: &Array1<f64>,
-    options: &ArrowSolveOptions,
-    metric_weights: Option<&MetricWeights>,
-) -> Result<(Array1<f64>, Option<Array2<f64>>, PcgDiagnostics), ArrowSchurError> {
-    let factor = match cholesky_lower(schur) {
-        Ok(factor) => factor,
+    schur_pd_floor: Option<f64>,
+    unit_deflate_null_directions: bool,
+) -> Result<(Array2<f64>, Option<Array2<f64>>), ArrowSchurError> {
+    let (factor, floored_schur) = match cholesky_lower(schur) {
+        Ok(factor) => (factor, None),
         Err(e) => {
-            // #1026 — opt-in spectral PD-floor on the indefinite reduced Schur.
-            // When enabled (SAE solve path), condition ONLY the collapsed
-            // directions and re-factor, instead of erroring out and letting the
-            // outer LM loop inflate `ridge_β` over every β direction (the
-            // co-collapse "crawl"). Disabled (default `None`) keeps the strict
-            // refusal so BA / non-SAE callers are bit-for-bit unchanged.
-            match options.schur_pd_floor {
-                Some(relative_floor) => match if options.tolerate_ill_conditioning {
+            // #1026/#1038 — every dense reduced-Schur factorization in the SAE
+            // path must honor the same opt-in spectral floor. Otherwise
+            // auxiliary entry points (mixed precision and cross-row IBP
+            // preconditioning) can reject the collapsed dead-atom subspace even
+            // though the main direct solve would floor it and continue.
+            //
+            // #1803 — Newton-step callers use the Levenberg-Marquardt PD floor
+            // (`spectral_pd_floored_schur`) so `Δβ` is stable. Evidence/log-det
+            // callers (`unit_deflate_null_directions`) instead deflate
+            // quotient/null directions to unit stiffness so they contribute the
+            // ρ-independent `log 1 = 0` to the Laplace normaliser rather than a
+            // ρ-dependent Occam reward for collapsed decoders.
+            match schur_pd_floor {
+                Some(relative_floor) => match if unit_deflate_null_directions {
                     spectral_unit_deflated_schur(schur, relative_floor)
                 } else {
                     spectral_pd_floored_schur(schur, relative_floor)
                 } {
-                    Some(floored) => match cholesky_lower(&floored) {
-                        Ok(factor) => {
-                            // Solve against the floored (PD) Schur. The healthy β
-                            // subspace keeps its exact eigenvalues, so its Δβ is
-                            // the exact Newton component; only the collapsed
-                            // subspace is minimally damped.
-                            let direct =
-                                mixed_precision_reduced_beta(&floored, &factor, rhs_beta, options)
-                                    .unwrap_or_else(|| cholesky_solve_vector(&factor, rhs_beta));
-                            if step_inside_trust_region(
-                                direct.view(),
-                                options.trust_region.radius,
-                                metric_weights,
-                            ) {
-                                return Ok((direct, Some(factor), PcgDiagnostics::default()));
-                            }
-                            let identity = IdentityPreconditioner;
-                            let (delta, diag) = steihaug_dense_system(
-                                &floored,
-                                rhs_beta,
-                                &identity,
-                                &ArrowPcgOptions {
-                                    max_iterations: options.trust_region.max_iterations,
-                                    relative_tolerance: options
-                                        .trust_region
-                                        .steihaug_relative_tolerance,
-                                },
-                                &options.trust_region,
-                                metric_weights,
-                            )?;
-                            return Ok((delta, Some(factor), diag));
-                        }
-                        Err(floored_err) => {
-                            return Err(ArrowSchurError::SchurFactorFailed {
+                    Some(floored) => (
+                        cholesky_lower(&floored).map_err(|floored_err| {
+                            ArrowSchurError::SchurFactorFailed {
                                 reason: format!(
                                     "reduced Schur non-PD ({e}); spectral PD-floor \
                                      reconstruction still non-PD: {floored_err}"
                                 ),
-                            });
-                        }
-                    },
+                            }
+                        })?,
+                        Some(floored),
+                    ),
                     None => {
                         return Err(ArrowSchurError::SchurFactorFailed {
                             reason: format!(
@@ -639,6 +629,37 @@ pub(crate) fn solve_dense_reduced_system(
             }
         }
     };
+    Ok((factor, floored_schur))
+}
+
+pub(crate) fn solve_dense_reduced_system(
+    schur: &Array2<f64>,
+    rhs_beta: &Array1<f64>,
+    options: &ArrowSolveOptions,
+    metric_weights: Option<&MetricWeights>,
+) -> Result<(Array1<f64>, Option<Array2<f64>>, PcgDiagnostics), ArrowSchurError> {
+    let (factor, floored_schur) =
+        factor_dense_reduced_schur(schur, options.schur_pd_floor, options.tolerate_ill_conditioning)?;
+    if let Some(floored) = floored_schur {
+        let direct = mixed_precision_reduced_beta(&floored, &factor, rhs_beta, options)
+            .unwrap_or_else(|| cholesky_solve_vector(&factor, rhs_beta));
+        if step_inside_trust_region(direct.view(), options.trust_region.radius, metric_weights) {
+            return Ok((direct, Some(factor), PcgDiagnostics::default()));
+        }
+        let identity = IdentityPreconditioner;
+        let (delta, diag) = steihaug_dense_system(
+            &floored,
+            rhs_beta,
+            &identity,
+            &ArrowPcgOptions {
+                max_iterations: options.trust_region.max_iterations,
+                relative_tolerance: options.trust_region.steihaug_relative_tolerance,
+            },
+            &options.trust_region,
+            metric_weights,
+        )?;
+        return Ok((delta, Some(factor), diag));
+    }
     // Ill-conditioned-but-PD Schur guard. The per-row factor checks reject
     // any single barely-PD H_tt^(i) block, but the reduced Schur complement
     //     S = H_ββ + ridge_β·I − Σ_i H_tβ^(i)ᵀ (H_tt^(i))⁻¹ H_tβ^(i)

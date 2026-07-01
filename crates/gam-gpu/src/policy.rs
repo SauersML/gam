@@ -174,6 +174,16 @@ impl GpuDispatchPolicy {
     /// drops accordingly.
     pub const MATVEC_OFFLOAD_FLOPS_MIN: u128 = 10_000_000;
 
+    /// Thin-curve (`d_atom = 1`) SAE dictionaries are the common manifold-SAE
+    /// production shape: each per-row frame is a scalar, so the staged device
+    /// payload is much smaller than the general `d > 1` row-frame bundle, while
+    /// the work is still a large batched gather/scatter over `K` atoms and `n`
+    /// rows.  Use a lower admission floor for this scalar-frame regime so a
+    /// realistic token block with a moderately wide curve dictionary is not kept
+    /// on the CPU solely because the conservative general-frame lower-bound
+    /// undercounts the transpose cross term.
+    pub const THIN_CURVE_MATVEC_OFFLOAD_FLOPS_MIN: u128 = 1_000_000;
+
     /// Conservative seed for the reduced-Schur PCG iteration count when the
     /// caller cannot supply a measured budget. InexactPCG on an SAE β-block of
     /// width `k` converges in `O(√κ)` iterations; this floor keeps the work
@@ -280,7 +290,12 @@ impl GpuDispatchPolicy {
         }
         let per_apply = Self::admission_work_lower_bound(n, k, d);
         let total = per_apply.saturating_mul(cg_iters as u128);
-        total >= Self::MATVEC_OFFLOAD_FLOPS_MIN
+        let floor = if d == 1 {
+            Self::THIN_CURVE_MATVEC_OFFLOAD_FLOPS_MIN
+        } else {
+            Self::MATVEC_OFFLOAD_FLOPS_MIN
+        };
+        total >= floor
     }
 }
 
@@ -884,6 +899,19 @@ mod reduced_schur_matvec_offload_tests {
     fn admits_llm_shape_with_one_cg_iter() {
         let pol = GpuDispatchPolicy::default();
         assert!(pol.reduced_schur_matvec_should_offload(2_000, 2_048, 8, 1));
+    }
+
+    /// #1783: the primary manifold-SAE regime is a `d_atom = 1` curve
+    /// dictionary.  Its scalar row frames have much lower staging cost than the
+    /// general framed matvec, so realistic token blocks must not be stranded on
+    /// the CPU merely because the conservative admission lower bound is thin in
+    /// `d`.
+    #[test]
+    fn admits_thin_curve_atoms_at_realistic_scale() {
+        let pol = GpuDispatchPolicy::default();
+        assert!(pol.reduced_schur_matvec_should_offload(24_576, 64, 1, 1));
+        assert!(pol.reduced_schur_matvec_should_offload(40_456, 256, 1, 1));
+        assert!(!pol.reduced_schur_matvec_should_offload(300, 6, 1, 8));
     }
 
     /// Tiny shapes where the host↔device transfer dominates must stay on the

@@ -130,7 +130,19 @@ pub fn sae_pca_seed_initial_coords_with_pc_offset(
                     } else {
                         (0, 0)
                     };
-                    let pc1 = vt.row(pc1_row.min(vt_rows - 1));
+                    // #1893 — OVERCOMPLETE (K ≫ p) generic seeding. Linear
+                    // projection has only `pc_pairs ≈ p/2` distinct PC planes, so
+                    // once atoms outnumber them the old scheme reused a plane with
+                    // only a constant phase shift — a decoder-equivalent DUPLICATE
+                    // that leaves the joint block rank-deficient and drives the
+                    // co-collapse. For every SURPLUS atom (index ≥ pc_pairs) build a
+                    // DISTINCT generic phase plane from a deterministic pseudo-random
+                    // combination of ALL principal directions (a random 2-plane in
+                    // the PC span), so K ≫ p atoms are pairwise distinct for any K.
+                    // Atoms 0..pc_pairs keep their exact PC-pair seed (small-K path
+                    // byte-for-byte unchanged); only wrap-victims are rerouted.
+                    let surplus = pc_pairs >= 1 && k_atoms > pc_pairs && atom_idx >= pc_pairs;
+                    let ncols = centered.ncols();
                     let phase_offset = if pc_pairs > 0 && pc_pairs < k_atoms {
                         atom_idx as f64 / k_atoms as f64
                     } else {
@@ -140,8 +152,43 @@ pub fn sae_pca_seed_initial_coords_with_pc_offset(
                     let s1 = s_vals.get(pc2_row).copied().unwrap_or(0.0).abs();
                     let has_two_dimensional_phase =
                         vt_rows >= 2 && pc2_row != pc1_row && s1 > 1.0e-10 * s0.max(1.0);
-                    if has_two_dimensional_phase {
-                        let pc2 = vt.row(pc2_row.min(vt_rows - 1));
+                    let dir1: Array1<f64>;
+                    let dir2: Array1<f64>;
+                    if surplus {
+                        // splitmix64-seeded weights keyed by (atom_idx, pc):
+                        // reproducible, no RNG crate, distinct per atom.
+                        let mix = |mut z: u64| -> f64 {
+                            z = z.wrapping_add(0x9E3779B97F4A7C15);
+                            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+                            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+                            z ^= z >> 31;
+                            (z as f64 / u64::MAX as f64) * 2.0 - 1.0
+                        };
+                        let mut a = Array1::<f64>::zeros(ncols);
+                        let mut b = Array1::<f64>::zeros(ncols);
+                        for pc in 0..vt_rows {
+                            let row_pc = vt.row(pc);
+                            let key = ((atom_idx as u64) << 20) ^ (pc as u64);
+                            let wa = mix(key);
+                            let wb = mix(key ^ 0xD1B54A32D192ED03);
+                            for c in 0..ncols {
+                                a[c] += wa * row_pc[c];
+                                b[c] += wb * row_pc[c];
+                            }
+                        }
+                        let na = a.dot(&a).sqrt().max(1.0e-12);
+                        let nb = b.dot(&b).sqrt().max(1.0e-12);
+                        a.mapv_inplace(|v| v / na);
+                        b.mapv_inplace(|v| v / nb);
+                        dir1 = a;
+                        dir2 = b;
+                    } else {
+                        dir1 = vt.row(pc1_row.min(vt_rows - 1)).to_owned();
+                        dir2 = vt.row(pc2_row.min(vt_rows - 1)).to_owned();
+                    }
+                    let pc1 = dir1.view();
+                    if surplus || has_two_dimensional_phase {
+                        let pc2 = dir2.view();
                         for row in 0..n_obs {
                             let mut a = 0.0_f64;
                             let mut b = 0.0_f64;
