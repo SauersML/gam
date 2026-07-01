@@ -416,10 +416,19 @@ pub fn default_num_centers(n: usize, d: usize) -> usize {
     /// once `n` exceeds `K_MIN * FLOOR_N_DIVISOR`, so small samples are not
     /// forced up to a dense `K_MIN`-column design.
     const FLOOR_N_DIVISOR: usize = 8;
-    /// Divisor for the conditioning cap: the center count never exceeds `n /
-    /// COND_N_DIVISOR`, keeping the penalty matrices well-conditioned relative
-    /// to the data.
+    /// Divisor for the conditioning cap on ordinary/moderate samples: the
+    /// center count never exceeds `n / COND_N_DIVISOR`, keeping the penalty
+    /// matrices well-conditioned relative to the data.
     const COND_N_DIVISOR: usize = 4;
+    /// Sparse one-dimensional smooths need enough knots/centers to resolve
+    /// multiple oscillations before REML can make a meaningful λ choice. The
+    /// generic `n/4` cap leaves only seven centers at n=30, so the basis itself
+    /// cannot represent a two-cycle signal and the optimizer can only select an
+    /// over-smoothed recovery. In 1-D, kernel/RKHS penalties remain numerically
+    /// stable at a denser `n/2` sparse-sample cap, matching the fill-distance
+    /// requirement without changing large-n memory controls.
+    const SPARSE_1D_COND_N_DIVISOR: usize = 2;
+    const SPARSE_1D_MAX_N: usize = 64;
 
     let d_factor = 1.0 + PER_DIM_GROWTH * (d.max(1) - 1) as f64;
     let raw = (C * d_factor * (n as f64).powf(ALPHA)).ceil() as usize;
@@ -430,9 +439,16 @@ pub fn default_num_centers(n: usize, d: usize) -> usize {
     let floor = K_MIN.min(n / FLOOR_N_DIVISOR);
     let k = raw.clamp(floor, K_MAX);
 
-    // Never exceed n itself; cap at n/COND_N_DIVISOR to keep the penalty
-    // matrices well-conditioned relative to the data.
-    k.min(n).min(n / COND_N_DIVISOR)
+    // Never exceed n itself; cap relative to sample size to keep the penalty
+    // matrices well-conditioned. For sparse one-dimensional recovery use a
+    // denser, still data-proportional cap so the basis has adequate fill
+    // distance before REML chooses λ.
+    let cap_divisor = if d == 1 && n <= SPARSE_1D_MAX_N {
+        SPARSE_1D_COND_N_DIVISOR
+    } else {
+        COND_N_DIVISOR
+    };
+    k.min(n).min(n / cap_divisor)
 }
 
 /// Conservative center count for a *secondary* (distributional) predictor's
@@ -2135,4 +2151,21 @@ pub fn orthogonality_transform_for_design(
     }
     let (constraint_cross, gram) = design_cross_and_gram(design, constraint_matrix, weights)?;
     orthogonality_transform_from_cross_and_gram(&constraint_cross, &gram)
+}
+
+#[cfg(test)]
+mod default_center_tests {
+    use super::default_num_centers;
+
+    #[test]
+    fn sparse_one_dimensional_default_keeps_enough_centers_for_recovery() {
+        assert_eq!(default_num_centers(30, 1), 15);
+        assert_eq!(default_num_centers(64, 1), 32);
+    }
+
+    #[test]
+    fn moderate_samples_keep_historical_quarter_sample_cap() {
+        assert_eq!(default_num_centers(200, 1), 50);
+        assert_eq!(default_num_centers(120, 2), 30);
+    }
 }
