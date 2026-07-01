@@ -92,9 +92,23 @@ fn build_frame(entry: f64) -> gam::data::EncodedDataset {
     encode_recordswith_inferred_schema(headers, rows).expect("encode left-truncated survival frame")
 }
 
+/// Fitted-quality summary of a left-truncated transformation survival fit.
+struct FitSummary {
+    /// Fitted covariate linear-predictor difference `η(X_HI) − η(X_LO)` on the
+    /// log-cumulative-hazard scale (covariate-dependence probe).
+    cov_delta: f64,
+    /// Largest-magnitude fitted time-baseline coefficient. Under the #1791
+    /// degenerate fit the unpenalized I-spline linear-trend column rails to a
+    /// huge value (cumulative hazard inflated ~10³×, `S(t) ≡ 0`); a well-posed
+    /// fit keeps the baseline coefficients O(1–10). This pins non-degeneracy of
+    /// the baseline time-block directly, independent of the covariate probe.
+    time_base_max_abs: f64,
+}
+
 /// Fit the transformation survival model and return the fitted covariate linear
-/// predictor difference `η(X_HI) − η(X_LO)` on the log-cumulative-hazard scale.
-fn fitted_covariate_delta(entry: f64) -> f64 {
+/// predictor difference `η(X_HI) − η(X_LO)` on the log-cumulative-hazard scale
+/// together with the largest-magnitude fitted time-baseline coefficient.
+fn fitted_summary(entry: f64) -> FitSummary {
     let ds = build_frame(entry);
     let cfg = FitConfig {
         survival_likelihood: "transformation".to_string(),
@@ -121,6 +135,10 @@ fn fitted_covariate_delta(entry: f64) -> f64 {
         "beta must carry covariate columns beyond the {time_base} time-basis columns (got {})",
         beta.len()
     );
+    let time_base_max_abs = beta
+        .slice(ndarray::s![..time_base])
+        .iter()
+        .fold(0.0_f64, |acc, &b| acc.max(b.abs()));
     let cov_beta = beta.slice(ndarray::s![time_base..]).to_owned();
 
     // Rebuild the FITTED covariate smooth design at the two probe covariate
@@ -141,19 +159,26 @@ fn fitted_covariate_delta(entry: f64) -> f64 {
         "covariate design width must match fitted covariate coefficient count"
     );
     let eta = design.design.apply(&cov_beta);
-    eta[1] - eta[0]
+    FitSummary {
+        cov_delta: eta[1] - eta[0],
+        time_base_max_abs,
+    }
 }
 
 #[test]
 fn left_truncated_survival_fit_stays_covariate_dependent_1790() {
     init_parallelism();
 
-    let delta_control = fitted_covariate_delta(0.0);
-    let delta_truncated = fitted_covariate_delta(0.05);
+    let control = fitted_summary(0.0);
+    let truncated = fitted_summary(0.05);
+    let delta_control = control.cov_delta;
+    let delta_truncated = truncated.cov_delta;
 
     eprintln!(
         "[#1790] true_delta={TRUE_COVARIATE_DELTA:.4} control(entry=0)={delta_control:.4} \
-         truncated(entry=0.05)={delta_truncated:.4}"
+         truncated(entry=0.05)={delta_truncated:.4} \
+         time_base_max_abs: control={:.4} truncated={:.4}",
+        control.time_base_max_abs, truncated.time_base_max_abs
     );
 
     // Sanity: the well-posed right-censored control recovers a clearly positive
@@ -183,5 +208,26 @@ fn left_truncated_survival_fit_stays_covariate_dependent_1790() {
          control={delta_control:.4} truncated={delta_truncated:.4} \
          (|Δ|={:.4} exceeds tolerance 0.6)",
         (delta_truncated - delta_control).abs()
+    );
+
+    // THE #1791 NON-DEGENERACY PIN. #1790 could pass the covariate probe while the
+    // baseline time-block silently railed (the transformation LAML under-smoothing
+    // that inflates the cumulative hazard ~10³× and drives `S(t) ≡ 0`). Pin the
+    // baseline directly: under left truncation the fitted time-baseline
+    // coefficients must stay bounded and comparable to the well-posed control's,
+    // not blow up into the huge, flat, covariate-independent offset #1791 reports.
+    // A small delayed entry is a small perturbation of the same cohort, so a
+    // generous 4× factor (plus an absolute floor for tiny control baselines)
+    // catches the ~10³× inflation without over-constraining ordinary shrinkage.
+    let baseline_ceiling = (4.0 * control.time_base_max_abs).max(20.0);
+    assert!(
+        truncated.time_base_max_abs <= baseline_ceiling,
+        "left-truncated baseline time-block inflated (#1791): \
+         truncated max|β_time|={:.4} exceeds ceiling {:.4} \
+         (control max|β_time|={:.4}) — the degenerate cumulative-hazard-inflated \
+         baseline that drives S(t)≡0 is forbidden",
+        truncated.time_base_max_abs,
+        baseline_ceiling,
+        control.time_base_max_abs
     );
 }
