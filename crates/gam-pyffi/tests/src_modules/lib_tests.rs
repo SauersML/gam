@@ -1349,9 +1349,21 @@ fn sae_decoder_lsq_init_produces_nontrivial_seed() {
         "LSQ-seeded decoder should be non-trivial; max |B| = {max_abs:.6}"
     );
 
-    // The seeded reconstruction must explain at least some of Z. With
-    // IBP-MAP iter-0 weights a_k = 0.5 for every k, fitted[i,:] =
-    // 0.5 * Σ_k Phi_k[i,:] · B_k.
+    // The seeded reconstruction must explain most of Z under the SAME forward
+    // map the joint LSQ solved against: fitted[i,:] = Σ_k a_k · Phi_k[i,:] · B_k
+    // where a_k is the IBP-MAP activation of the initial (all-zero) logits. For
+    // zero logits the sigmoid gate is σ(0) = 0.5 and the truncated stick-breaking
+    // prior contributes π_k = (α/(α+1))^{k+1}, so a_k = 0.5 · 0.5^{k+1} — i.e.
+    // (0.25, 0.125) here, strictly decreasing in atom index, NOT a flat 0.5.
+    // Reconstructing with the true per-atom weights (rather than an imagined
+    // uniform gate) is what makes this a faithful check of the LSQ seed: the
+    // solver's design columns are a_k · Phi_k, so the fit it returns is only
+    // meaningful when scored back through the same a_k.
+    let a_init = gam::terms::sae::manifold::ibp_map_row(
+        ndarray::Array1::<f64>::zeros(k).view(),
+        0.7, // tau (matches the sae_decoder_lsq_init call above)
+        1.0, // alpha
+    );
     let mut fitted = Array2::<f64>::zeros((n, p));
     for i in 0..n {
         for j in 0..p {
@@ -1361,7 +1373,7 @@ fn sae_decoder_lsq_init_produces_nontrivial_seed() {
                 for col in 0..m {
                     atom_out += basis[[atom_idx, i, col]] * decoder[[atom_idx, col, j]];
                 }
-                acc += 0.5 * atom_out;
+                acc += a_init[atom_idx] * atom_out;
             }
             fitted[[i, j]] = acc;
         }
