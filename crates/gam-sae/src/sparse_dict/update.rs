@@ -314,6 +314,9 @@ fn assemble_normal_eq(
 
     for (row_idx, code) in codes.iter().enumerate() {
         let xi = x.row(row_idx);
+        // Contiguous row slice of the input when possible (standard layout); `None`
+        // only for a non-contiguous view, which takes the strided fallback below.
+        let xi_slice = xi.as_slice();
         for a in 0..code.indices.len() {
             let ca = code.codes[a] as f64;
             if ca == 0.0 {
@@ -322,8 +325,26 @@ fn assemble_normal_eq(
             let ka = code.indices[a];
             diag[ka as usize] += ca * ca;
             let brow = ka as usize;
-            for c in 0..p {
-                b[[brow, c]] += ca * xi[c] as f64;
+            // B_{ka,:} += ca · x_row. Accumulate over contiguous row slices so LLVM
+            // autovectorizes the widening f32→f64 FMA — verified in the emitted code
+            // as unrolled NEON `fcvtl` + `fmul.2d` + `fadd.2d` with the bounds check
+            // hoisted out of the loop (the ndarray 2D-index form defeats that because
+            // the stride is opaque). Bit-identical to the strided form (same values,
+            // same per-`(brow,c)` accumulation order), so determinism is preserved.
+            // `b` is freshly allocated row-major, so its row slice is always `Some`;
+            // the strided arm only runs when the *input* view is non-contiguous.
+            let mut brow_view = b.row_mut(brow);
+            match (brow_view.as_slice_mut(), xi_slice) {
+                (Some(bs), Some(xs)) => {
+                    for (bref, &xv) in bs.iter_mut().zip(xs.iter()) {
+                        *bref += ca * xv as f64;
+                    }
+                }
+                _ => {
+                    for c in 0..p {
+                        brow_view[c] += ca * xi[c] as f64;
+                    }
+                }
             }
             for bsel in (a + 1)..code.indices.len() {
                 let cb = code.codes[bsel] as f64;
