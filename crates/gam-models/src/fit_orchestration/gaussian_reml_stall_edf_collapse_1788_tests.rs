@@ -127,30 +127,6 @@ fn fit_three_smooth(n: usize, seed: u64, noise_sd: f64) -> StallProbe {
     }
 }
 
-/// Diagnostic scan: print the stall fingerprint across seeds so the stall
-/// regime can be located at the Rust level. Not an assertion — used to locate a
-/// stalling seed for the guarded regression below.
-#[test]
-#[ignore = "diagnostic scan; run explicitly to locate a stalling seed"]
-fn scan_1788_stall_seeds() {
-    for seed in 1..=12u64 {
-        for &(n, noise) in &[(600usize, 0.5f64), (600, 1.0), (400, 1.0)] {
-            let p = fit_three_smooth(n, seed, noise);
-            eprintln!(
-                "#1788 scan n={n} noise={noise} seed={seed}: edf_total={:.2} \
-                 by_block={:?} converged={} iters={} lambda_max={:.3e} corr={:.3} active={}",
-                p.edf_total,
-                p.edf_by_block,
-                p.outer_converged,
-                p.outer_iterations,
-                p.lambda_max,
-                p.corr,
-                p.n_active_cols,
-            );
-        }
-    }
-}
-
 /// #1788 core regression: `n=600, noise_sd=0.5, seed=2` deterministically drives
 /// the outer REML into a flat-valley STALL — 200 iters, `λ` railed to ~1.07e13,
 /// `outer_converged == false` — while the returned coefficients stay wiggly (34
