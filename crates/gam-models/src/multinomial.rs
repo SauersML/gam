@@ -439,6 +439,26 @@ fn multinomial_formula_unresolved_probe_separation_evidence(
     }
 }
 
+/// Working-response regularization for the fixed-λ multinomial path when the
+/// ordinary softmax likelihood has separation evidence.
+///
+/// The formula REML path can arm the exact joint Jeffreys/Firth term in the
+/// custom-family objective. The bare fixed-λ vector-GLM path has no outer
+/// custom-family state, but it still should not hard-error after diagnosing
+/// quasi-complete separation: the canonical Jeffreys correction contributes a
+/// positive half-count at empty simplex faces, keeping every class probability
+/// in the interior and restoring finite Fisher curvature in the otherwise
+/// unbounded null directions. Applying the same invariant half-count to each
+/// row's multinomial simplex is the fixed-λ path's local Firth/Jeffreys working
+/// response; it preserves row mass exactly and is used only after the unbiased
+/// solve has exhibited separation-scale, non-converged logits.
+fn multinomial_firth_jeffreys_working_response(y: ArrayView2<'_, f64>) -> Array2<f64> {
+    let (_n, k) = y.dim();
+    let alpha = 0.5_f64;
+    let denom = 1.0 + alpha * k as f64;
+    y.mapv(|v| (v + alpha) / denom)
+}
+
 /// Inputs to [`fit_penalized_multinomial`].
 ///
 /// The penalty matrix `S` is shared across classes; per-class smoothing
@@ -617,6 +637,13 @@ impl MultinomialFitOutputs {
 pub fn fit_penalized_multinomial(
     inputs: MultinomialFitInputs<'_>,
 ) -> Result<MultinomialFitOutputs, EstimationError> {
+    fit_penalized_multinomial_inner(inputs, true)
+}
+
+fn fit_penalized_multinomial_inner(
+    inputs: MultinomialFitInputs<'_>,
+    allow_firth_regularization: bool,
+) -> Result<MultinomialFitOutputs, EstimationError> {
     let MultinomialFitInputs {
         design,
         y_one_hot,
@@ -711,6 +738,22 @@ pub fn fit_penalized_multinomial(
 
     let (max_abs_eta, row_index, active_class_index) = max_abs_eta_location(fit.eta.view());
     if !fit.converged && max_abs_eta >= MULTINOMIAL_SEPARATION_ETA_THRESHOLD {
+        if allow_firth_regularization && fisher_w_override.is_none() {
+            let y_firth = multinomial_firth_jeffreys_working_response(y_one_hot);
+            return fit_penalized_multinomial_inner(
+                MultinomialFitInputs {
+                    design,
+                    y_one_hot: y_firth.view(),
+                    penalty,
+                    lambdas,
+                    row_weights,
+                    fisher_w_override: None,
+                    max_iter,
+                    tol,
+                },
+                false,
+            );
+        }
         return Err(EstimationError::MultinomialSeparationDetected {
             iteration: fit.iterations,
             max_abs_eta,
