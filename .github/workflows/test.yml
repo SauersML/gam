@@ -337,10 +337,35 @@ jobs:
             exit 0
           fi
           status=0
-          # `-E 'not test(...)'`: the root-crate `pyffi` integration binary holds
-          # one test that shells out to `python3 -c "import gamfit"` and needs the
-          # maturin-built extension, which this Rust-only shard does not install.
-          # It runs in the python-tests job instead (#1251).
+          # `-E 'not ...'` filters two families the Rust-only shard cannot run:
+          #
+          #  * `test(python_rust_ffi_parity_gaussian_linear_case)` — the root-crate
+          #    `pyffi` integration binary holds one test that shells out to
+          #    `python3 -c "import gamfit"` and needs the maturin-built extension,
+          #    which this Rust-only shard does not install. It runs in the
+          #    python-tests job instead (#1251).
+          #
+          #  * `binary(=quality)` — the grouped `tests/quality.rs` integration
+          #    target (the `quality_vs_*` reference-comparison suite). Every test
+          #    in it benchmarks gam against a MATURE reference tool (mgcv, gamlss,
+          #    statsmodels, lifelines, …) via the reference harness
+          #    (crates/gam-test-support/src/reference.rs), which shells out to
+          #    Rscript / python3 and — by explicit design — treats a MISSING
+          #    interpreter as a HARD failure, never a silent skip. These shard
+          #    runners install neither R nor the Python reference stack, so the
+          #    entire target could only ever hard-fail with `spawn Rscript
+          #    NotFound` (~200+ guaranteed failures per run) that drown the real
+          #    Rust-side signal this workflow exists to surface. That target is the
+          #    sole, dedicated province of the `Reference Quality Suite` workflow
+          #    (.github/workflows/reference-quality.yml), which provisions the full
+          #    R+Python stack, RUNS every quality test, and classifies a lost
+          #    reference as REF_ERROR — reported but NOT gated, because a missing
+          #    reference environment is not a gam defect. Excluding the target from
+          #    the fast Rust CI RUN keeps that same classification consistent here.
+          #    It is still BUILT in the archive job above, so its compile surface
+          #    is fully gated; only its execution moves to the suite that can
+          #    satisfy it.
+          #
           # `--partition count:i/N` is a pure run-time FILTER over the prebuilt
           # binaries; `--profile ci --config-file` applies the per-test
           # slow-timeouts; `--no-fail-fast` collects every failure in this shard.
@@ -351,7 +376,7 @@ jobs:
             --partition "count:${{ matrix.shard }}/${{ needs.setup.outputs.total }}" \
             --no-fail-fast \
             --test-threads 1 \
-            -E 'not test(python_rust_ffi_parity_gaussian_linear_case)' \
+            -E 'not test(python_rust_ffi_parity_gaussian_linear_case) and not binary(=quality)' \
             2>&1 | tee "$log" || status="${PIPESTATUS[0]}"
           echo "nextest exit status: ${status}"
           # Surface this shard's own pass/fail in the matrix UI; the aggregate
