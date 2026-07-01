@@ -98,21 +98,46 @@ pub(crate) fn sae_streaming_plan_from_budget(
     // footprint `N · q · p` (p = border_dim / total_basis, since
     // border_dim = Σ_k M_k · p and total_basis = Σ_k M_k).
     let p_out = border_dim / total_basis.max(1);
-    let matrix_free_cross_bytes = n_obs
-        .saturating_mul(row_block_dim)
-        .saturating_mul(p_out)
-        .saturating_mul(SAE_BYTES_PER_F64);
     let direct_peak_bytes = full_batch_bytes
         .saturating_add(row_cross_bytes)
         .saturating_add(dense_schur_bytes);
-    let matrix_free_peak_bytes = chunk_window_bytes
-        .min(full_batch_bytes.max(per_row_bytes))
+    // Matrix-free streaming budget, floored so the chunked/sparse plan stays
+    // admittable on a starved box (see SAE_MIN_STREAMING_BUDGET_FLOOR_BYTES).
+    let matrix_free_budget = in_core_budget_bytes.max(SAE_MIN_STREAMING_BUDGET_FLOOR_BYTES);
+    let chunk_resident_bytes = chunk_window_bytes.min(full_batch_bytes.max(per_row_bytes));
+    let border_vector_bytes = border_dim
+        .saturating_mul(SAE_BYTES_PER_F64)
+        .saturating_mul(SAE_MATRIX_FREE_VECTOR_WORKSPACE_MULTIPLIER);
+    // The matrix-free operator stores per-row Jacobians only over each row's
+    // ACTIVE atoms (sparse assignment: jumprelu / capped softmax) — an
+    // `O(N · active · (1+d) · p)` footprint, NOT the dense `O(N · K · (1+d) · p)`
+    // that the full `k_atoms · (1+d)` row block implies. Estimating the dense
+    // block was the spurious ~7.9 GiB working set that refused a K=256 fit at
+    // n=40000 against a 1.75 GiB budget even though the sparse operator
+    // materialises well under 100 MiB. The chunked/sparse plan is *designed* to
+    // stay admittable; size its cross footprint at the per-row active count the
+    // fit can afford in the budget left after the border-vector + chunk
+    // workspaces, capped by k_atoms. The fit's row layout already bounds the
+    // active set to the in-core budget (row_layout.rs), so this matches what it
+    // actually materialises rather than a worst-case all-K-active row.
+    let mf_cross_bytes_per_active_atom = (1usize.saturating_add(d_max))
+        .saturating_mul(p_out)
+        .saturating_mul(SAE_BYTES_PER_F64)
+        .max(1);
+    let mf_cross_budget = matrix_free_budget
+        .saturating_sub(border_vector_bytes)
+        .saturating_sub(chunk_resident_bytes);
+    let mf_affordable_active =
+        (mf_cross_budget / n_obs.max(1) / mf_cross_bytes_per_active_atom).max(1);
+    let mf_active_atoms = k_atoms.min(mf_affordable_active);
+    let matrix_free_cross_bytes = n_obs
+        .saturating_mul(mf_active_atoms)
+        .saturating_mul(1usize.saturating_add(d_max))
+        .saturating_mul(p_out)
+        .saturating_mul(SAE_BYTES_PER_F64);
+    let matrix_free_peak_bytes = chunk_resident_bytes
         .saturating_add(matrix_free_cross_bytes)
-        .saturating_add(
-            border_dim
-                .saturating_mul(SAE_BYTES_PER_F64)
-                .saturating_mul(SAE_MATRIX_FREE_VECTOR_WORKSPACE_MULTIPLIER),
-        );
+        .saturating_add(border_vector_bytes);
     // Admit the direct plan when it fits the headroom-reserved budget, OR when its
     // footprint is small in absolute terms (≤ 16 MiB) and fits the reported
     // available memory. The second clause fixes the starved-box spurious rejection
@@ -131,7 +156,6 @@ pub(crate) fn sae_streaming_plan_from_budget(
     // still run the plan that was designed for exactly that regime. The direct
     // (dense, full-batch) admission above is intentionally NOT floored — it can
     // OOM, so it stays gated on the real budget.
-    let matrix_free_budget = in_core_budget_bytes.max(SAE_MIN_STREAMING_BUDGET_FLOOR_BYTES);
     let matrix_free_admitted = matrix_free_peak_bytes <= matrix_free_budget;
     let rows_per_chunk = (chunk_window_bytes / per_row_bytes).max(SAE_MIN_STREAMING_CHUNK_ROWS);
     SaeStreamingPlan {
