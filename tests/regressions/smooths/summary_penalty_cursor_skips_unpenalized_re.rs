@@ -107,9 +107,12 @@ fn summary_penalty_cursor_matches_actual_penalty_layout() {
         })
         .count();
 
-    // What the summary cursor SKIPS before the first smooth: one slot per
-    // random-effect range, unconditionally (the buggy reconstruction).
-    let summary_cursor_skips = design.random_effect_ranges.len();
+    // What the summary cursor must skip before the first smooth: the actual
+    // leading non-smooth penalty blocks in the flat global penalty layout.
+    // This intentionally differs from the old buggy reconstruction, which
+    // advanced by one slot per random-effect range unconditionally.
+    let summary_cursor_skips = design.leading_penalty_blocks_before_smooth();
+    let buggy_cursor_skips = design.random_effect_ranges.len();
 
     // Sanity: the `by=g` factor really did introduce a random-effect range.
     assert!(
@@ -117,17 +120,22 @@ fn summary_penalty_cursor_matches_actual_penalty_layout() {
         "expected an unpenalized random-effect main effect for the by= factor; \
          random_effect_ranges was empty — formula plumbing changed"
     );
+    assert_ne!(
+        buggy_cursor_skips, leading_re_penalty_blocks,
+        "regression fixture no longer contains an unpenalized random-effect \
+         range; the old one-slot-per-range cursor would not desync"
+    );
 
     // The invariant the summary RELIES ON: the number of random-effect ranges it
-    // skips must equal the number of leading penalty blocks those ranges own.
-    // An unpenalized `by` factor breaks it (range present, no penalty block).
+    // skips must equal the number of leading penalty blocks those ranges own,
+    // not the number of random-effect coefficient ranges.
     assert_eq!(
         summary_cursor_skips, leading_re_penalty_blocks,
-        "summary penalty-cursor desync: the summary advances the penalty cursor \
-         by {summary_cursor_skips} (one per random-effect range) before the first \
-         smooth, but only {leading_re_penalty_blocks} leading penalty blocks \
-         actually belong to random effects. The first smooth's per_term_edf will \
-         read penalty_block_trace[{summary_cursor_skips}..] instead of \
+        "summary penalty-cursor desync: the summary advances the penalty cursor by \
+         {summary_cursor_skips} before the first smooth, but \
+         {leading_re_penalty_blocks} leading penalty blocks actually belong to \
+         random effects. The first smooth's per_term_edf will read \
+         penalty_block_trace[{summary_cursor_skips}..] instead of \
          [{leading_re_penalty_blocks}..], corrupting EDF / ref_df / p-value in the \
          influence-matrix-absent fallback path."
     );

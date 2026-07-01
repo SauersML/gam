@@ -2345,6 +2345,27 @@ pub struct TermCollectionDesign {
 }
 
 impl TermCollectionDesign {
+    /// Number of global penalty blocks that precede the smooth-term penalty
+    /// blocks in the flat smoothing-parameter / EDF-trace layout.
+    ///
+    /// The prefix is not the same as `random_effect_ranges.len()`: unpenalized
+    /// (or empty) random-effect ranges contribute coefficient columns but no
+    /// penalty block. The authoritative layout is the recorded `penaltyinfo`
+    /// sequence assembled alongside `penalties`.
+    pub fn leading_penalty_blocks_before_smooth(&self) -> usize {
+        self.penaltyinfo
+            .iter()
+            .take_while(|info| {
+                matches!(
+                    &info.penalty.source,
+                    crate::basis::PenaltySource::Other(source)
+                        if source == "LinearTermRidge"
+                            || source.starts_with("RandomEffectRidge(")
+                )
+            })
+            .count()
+    }
+
     /// Convert blockwise penalties to `PenaltyMatrix::Blockwise` without
     /// expanding to `p_total × p_total`. This is the preferred path for
     /// family modules that accept `Vec<PenaltyMatrix>`.

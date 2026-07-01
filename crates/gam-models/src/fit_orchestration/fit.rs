@@ -237,10 +237,11 @@ fn guard_untrusted_edf_collapse(
         return;
     };
     edf_total_before = inference.edf_total;
-    // Penalty-block cursor walks the summary block order: random-effect ranges
-    // first, then smooth terms (mirrors `smooth_term_lr_inference_forspec` and the
+    // Penalty-block cursor walks the recorded global block order: any leading
+    // linear ridge and penalized random-effect ridge blocks first, then smooth
+    // terms (mirrors `smooth_term_lr_inference_forspec` and the
     // `build_model_summary` per-term EDF walk).
-    let mut penalty_cursor = design.random_effect_ranges.len();
+    let mut penalty_cursor = design.leading_penalty_blocks_before_smooth();
     // Running change to `Σ edf_by_block`. `edf_total` carries an additional
     // `mp = p − Σ rank_k` offset for the UNPENALIZED columns (e.g. the intercept),
     // so it is NOT `Σ edf_by_block`; applying the same delta preserves that offset.

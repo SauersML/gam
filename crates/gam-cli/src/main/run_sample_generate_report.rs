@@ -729,7 +729,7 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
                 // λ_raw = λ̃ / ||S_raw,ℓ||_F, before the arbitrary Mellin
                 // ε_ℓ^(-2s0)·log_step gauge is folded into the fit-time forms.
                 {
-                    let mut penalty_cursor = design.random_effect_ranges.len();
+                    let mut penalty_cursor = design.leading_penalty_blocks_before_smooth();
                     for term in &design.smooth.terms {
                         let k = term.penalties_local.len();
                         let term_penalty_start = penalty_cursor;
