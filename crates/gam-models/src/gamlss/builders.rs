@@ -1215,11 +1215,9 @@ pub(crate) fn fit_binomial_mean_wiggle(
     //
     // The warp basis `B(η)` is frozen at the current index `η̂` so that
     // `q = η + B(η̂)·β_w` is linear in `(β_η, β_w)` (`∂q/∂η = 1`). To keep the
-    // mean block `X` full and identifiable we fit the warp in the *de-aliased*
-    // coordinate `B̃ = B(η̂)·Z`, where `Z` spans `null(Xᵀ B(η̂))` — the warp
-    // curvature orthogonal to the mean's column space (see
-    // `BinomialMeanWiggleFamily::frozen_warp_design`). We re-freeze at the refit
-    // `η̂` across a few outer iterations until it stops moving.
+    // mean block `X` full and identifiable we fit the warp through the
+    // observation-space residualized design `B⊥ = (I - P_X)B(η̂)`. We re-freeze
+    // at the refit `η̂` across a few outer iterations until it stops moving.
     let x_dense: Array2<f64> = spec.eta_block.design.to_dense();
     let pilot_eta: Array1<f64> = {
         let pilot_beta = spec.eta_block.initial_beta.clone().ok_or_else(|| {
@@ -1246,7 +1244,8 @@ pub(crate) fn fit_binomial_mean_wiggle(
     };
 
     // Original (full-width) warp penalties / nullspace metadata, captured before
-    // `spec.wiggle_block` is consumed. The de-aliased block carries `ZᵀSZ`.
+    // `spec.wiggle_block` is consumed. The residualized block keeps the same
+    // coefficient coordinate and therefore the same penalties.
     let wiggle_penalties_full = spec.wiggle_block.penalties.clone();
     let wiggle_log_lambdas = spec.wiggle_block.initial_log_lambdas.clone();
     let eta_block_input = spec.eta_block.clone();
@@ -1261,27 +1260,78 @@ pub(crate) fn fit_binomial_mean_wiggle(
         frozen_warp_design: None,
     };
 
-    // Build the de-aliased warp block (`B̃ = B·Z`, penalties `ZᵀSZ`) at a frozen
-    // index, returning the block input, the reducing transform `Z`, and `B̃`.
+    // Build the de-aliased warp block at a frozen index.  The identifiable
+    // warp is the part of `B(η̂)` outside the mean column space:
+    //
+    //     B⊥ = (I - P_X) B = B - X A,     A = (XᵀX)^+ XᵀB.
+    //
+    // The previous implementation used `Z = null(XᵀB)` and fitted `B Z`.
+    // That is too strong: when the warp basis has no coefficient combination
+    // exactly orthogonal to `X` (for example a two-column flexible link beside
+    // an intercept+slope mean), it drops every warp coefficient even though
+    // the nonlinear columns of `B(η̂)` have a nonzero residual after projection
+    // onto `X`.  Residualizing in observation space removes only the truly
+    // mean-aliased component and leaves the curved, identifiable link-shape
+    // signal available to the joint solve.
+    //
+    // The returned `A` is used after fitting: because the inner problem used
+    // `Xβ + (B - XA)γ`, while prediction reconstructs the saved warp as
+    // `Xβ_saved + Bγ`, we save `β_saved = β - Aγ`.
     let build_dealiased = |frozen: &Array1<f64>| -> Result<
-        (ParameterBlockInput, Array2<f64>, std::sync::Arc<Array2<f64>>),
+        (
+            ParameterBlockInput,
+            Array2<f64>,
+            Array2<f64>,
+            std::sync::Arc<Array2<f64>>,
+        ),
         String,
     > {
+        use faer::Side;
+        use gam_linalg::faer_ndarray::FaerEigh;
+
         let b_full = family.wiggle_design(frozen.view())?;
-        let btx = b_full.t().dot(&x_dense);
-        let (z, _rank) = gam_linalg::faer_ndarray::rrqr_nullspace_basis(&btx, 1.0e3)
-            .map_err(|e| format!("frozen-basis warp de-aliasing null-space failed: {e}"))?;
-        if z.ncols() == 0 {
+        let xtx = x_dense.t().dot(&x_dense);
+        let xtb = x_dense.t().dot(&b_full);
+        let (evals, evecs) = xtx
+            .eigh(Side::Lower)
+            .map_err(|e| format!("frozen-basis warp de-aliasing mean QR failed: {e}"))?;
+        let max_eval = evals.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+        let cutoff = 1.0e3
+            * f64::EPSILON
+            * (xtx.nrows().max(1) as f64)
+            * max_eval.max(1.0);
+        let mut alias = Array2::<f64>::zeros((x_dense.ncols(), b_full.ncols()));
+        for k in 0..evals.len() {
+            let lam = evals[k];
+            if !lam.is_finite() || lam.abs() <= cutoff {
+                continue;
+            }
+            let uk = evecs.column(k);
+            let uk_xtb = uk.t().dot(&xtb);
+            for i in 0..alias.nrows() {
+                for j in 0..alias.ncols() {
+                    alias[[i, j]] += uk[i] * uk_xtb[j] / lam;
+                }
+            }
+        }
+        let bda = &b_full - &x_dense.dot(&alias);
+        let max_b = b_full.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+        let max_resid = bda.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+        let resid_tol = 1.0e3
+            * f64::EPSILON
+            * (bda.nrows().max(bda.ncols()).max(1) as f64)
+            * max_b.max(1.0);
+        if max_resid <= resid_tol {
             return Err("frozen-basis warp de-aliasing left no identifiable warp \
-                        direction (the mean block already spans the warp)"
+                        direction (the mean block already spans the warp in \
+                        observation space)"
                 .to_string());
         }
-        let bda = b_full.dot(&z);
         let penalties: Vec<crate::model_types::PenaltySpec> = wiggle_penalties_full
             .iter()
             .map(|p| {
                 let s = penalty_spec_to_dense(p, b_full.ncols())?;
-                Ok(crate::model_types::PenaltySpec::Dense(z.t().dot(&s).dot(&z)))
+                Ok(crate::model_types::PenaltySpec::Dense(s))
             })
             .collect::<Result<_, String>>()?;
         let q = bda.ncols();
@@ -1293,7 +1343,7 @@ pub(crate) fn fit_binomial_mean_wiggle(
             initial_log_lambdas: wiggle_log_lambdas.clone(),
             initial_beta: Some(Array1::zeros(q)),
         };
-        Ok((block, z, std::sync::Arc::new(bda)))
+        Ok((block, Array2::<f64>::eye(q), alias, std::sync::Arc::new(bda)))
     };
 
     // True iff the warped link `q = η + B(η)·β_w` is strictly increasing across
@@ -1325,8 +1375,9 @@ pub(crate) fn fit_binomial_mean_wiggle(
     let mut frozen_eta = pilot_eta;
     let mut last_fit: Option<UnifiedFitResult> = None;
     let mut last_reduction: Option<Array2<f64>> = None;
+    let mut last_alias: Option<Array2<f64>> = None;
     for _outer in 0..MAX_FROZEN_OUTER {
-        let (wiggle_block, z, bda) = build_dealiased(&frozen_eta)?;
+        let (wiggle_block, z, alias, bda) = build_dealiased(&frozen_eta)?;
         let blocks = vec![
             eta_block_input.clone().intospec("eta")?,
             wiggle_block.intospec("wiggle")?,
@@ -1343,16 +1394,13 @@ pub(crate) fn fit_binomial_mean_wiggle(
                 "fit_binomial_mean_wiggle: frozen-basis refit did not expose a fitted eta block"
                     .to_string()
             })?;
-        // The fit stays entirely in the reduced, identifiable coordinate `γ`:
-        // the result (top-level `beta`, role-tagged `blocks`, `block_states`,
-        // penalized Hessian, and covariance) is full rank and self-consistent at
-        // width `p_eta + q`. The widened standard-basis warp coefficients
-        // `β_w = Z·γ` form a rank-deficient over-parametrization (the two
-        // mean-aliased directions carry no curvature), so they are NOT folded
-        // back into the result; instead `Z` is returned out-of-band and the
-        // saved model stores `β_w = Z·γ` for the predict runtime, which
-        // reconstructs the warp from the full-width basis as `B(η_new)·β_w`.
+        // The inner fit uses the residualized warp design.  `z` is currently the
+        // identity because residualization, not coefficient dropping, removes the
+        // mean-aliased component; it is still threaded through the existing
+        // saved-warp path so prediction reconstructs from the full I-spline
+        // basis.
         last_reduction = Some(z.clone());
+        last_alias = Some(alias.clone());
         let scale = 1.0
             + frozen_eta
                 .iter()
@@ -1412,7 +1460,7 @@ pub(crate) fn fit_binomial_mean_wiggle(
             const MONO_LOG_LAMBDA_STEP: f64 = 0.75;
             for step in 1..=MAX_MONO_STEPS {
                 let bump = MONO_LOG_LAMBDA_STEP * step as f64;
-                let (mut wb, z2, bda2) = build_dealiased(&frozen_eta)?;
+                let (mut wb, z2, alias2, bda2) = build_dealiased(&frozen_eta)?;
                 let wlen = wb.penalties.len();
                 let wiggle_base: Array1<f64> = if reml_log.len() >= eta_penalty_count + wlen {
                     reml_log
@@ -1443,6 +1491,7 @@ pub(crate) fn fit_binomial_mean_wiggle(
                 if monotone || step == MAX_MONO_STEPS {
                     fit = refit;
                     saved_warp_beta = refit_beta;
+                    last_alias = Some(alias2);
                     break;
                 }
             }
@@ -1457,6 +1506,31 @@ pub(crate) fn fit_binomial_mean_wiggle(
                 return Err("binomial flexible link could not be smoothed to a monotone \
                             (invertible) link over the fitted predictor range"
                     .to_string());
+            }
+        }
+    }
+    if let (Some(alias), Some(beta_w)) = (last_alias.as_ref(), saved_warp_beta.as_ref()) {
+        let gamma = Array1::from_vec(beta_w.clone());
+        if alias.ncols() == gamma.len() && alias.nrows() == eta_block_input.design.ncols() {
+            let shift = alias.dot(&gamma);
+            if let Some(block) = fit.blocks.get_mut(BinomialMeanWiggleFamily::BLOCK_ETA) {
+                if block.beta.len() == shift.len() {
+                    block.beta -= &shift;
+                }
+            }
+            if let Some(state) = fit
+                .block_states
+                .get_mut(BinomialMeanWiggleFamily::BLOCK_ETA)
+            {
+                if state.beta.len() == shift.len() {
+                    state.beta -= &shift;
+                    state.eta = x_dense.dot(&state.beta) + &eta_block_input.offset;
+                }
+            }
+            if fit.beta.len() >= shift.len() {
+                for i in 0..shift.len() {
+                    fit.beta[i] -= shift[i];
+                }
             }
         }
     }
