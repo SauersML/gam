@@ -1,17 +1,13 @@
 use super::*;
 
-// The JumpReLU optimization-inclusion band is the single canonical predicate
-// `crate::assignment::jumprelu_in_optimization_band`, whose support
-// is the machine-precision cutoff `(logit − threshold)/τ > −36` (`σ(−36) ≈
-// 2e-16`). The compact Newton active set below MUST use exactly that band so
-// every coordinate carrying nonzero sparsity-prior value/gradient/Hessian
-// (assembled over the same −36 support in `assignment.rs`, and in the logdet
-// third-derivative adjoint in `construction.rs`) has a Newton row to receive
-// it. A former module-local copy used a tighter `−4·τ` band, which silently
-// dropped coordinates in `(−36τ, −4τ]` from the solve while the prior still put
-// gradient on them — an objective↔gradient desync that stalls the inner Newton
-// fit. That copy and its `JUMPRELU_REACTIVATION_MARGIN` constant are deleted;
-// there is now one band, one source of truth.
+// JumpReLU has two distinct notions of support.  The smooth sparsity prior is
+// assembled over the machine-precision optimization band in
+// `crate::assignment::jumprelu_in_optimization_band`, but the data-fit row
+// block is a compact representation of the hard forward gate itself.  The
+// layout below therefore sizes the per-token Newton block by `logit >
+// threshold`; wide-band prior curvature is kept in the logit tier and must not
+// allocate latent-coordinate slots for atoms whose reconstruction contribution
+// is exactly zero.
 
 /// Per-row active-set layout for sparse SAE assignment (any mode).
 ///
@@ -61,13 +57,11 @@ pub struct SaeRowLayout {
 }
 
 impl SaeRowLayout {
-    /// JumpReLU optimization active set: atoms inside the smooth prior's
-    /// machine-precision support `(logit - threshold)/tau > -36` (see
-    /// [`crate::assignment::jumprelu_in_optimization_band`], the one
-    /// canonical band). This is intentionally wider than the hard forward gate
-    /// `logit > threshold` so gated-off atoms can remain in the Newton system for
-    /// value-consistent prior terms. Their forward reconstruction contribution
-    /// and data-fit logit JVP remain hard-zero while `a_k = 0`.
+    /// JumpReLU compact data-fit active set: exactly the hard forward support
+    /// `logit > threshold`.  The smooth prior still uses the wider
+    /// machine-precision band in `assignment.rs`, but that value-consistency
+    /// support is a logit-prior concern; it must not inflate the compact
+    /// per-token latent-coordinate block from `k_active` back to all `K`.
     pub(crate) fn from_jumprelu(
         n: usize,
         k_atoms: usize,
@@ -78,16 +72,11 @@ impl SaeRowLayout {
         coord_offsets_full: Vec<usize>,
     ) -> Self {
         let mut per_row = Vec::with_capacity(n);
+        let gate_threshold = threshold + 0.0 * temperature.signum();
         for row in 0..n {
             let row_logits = logits.row(row);
             let active: Vec<usize> = (0..k_atoms)
-                .filter(|&k| {
-                    crate::assignment::jumprelu_in_optimization_band(
-                        row_logits[k],
-                        threshold,
-                        temperature,
-                    )
-                })
+                .filter(|&k| row_logits[k] > gate_threshold)
                 .collect();
             per_row.push(active);
         }

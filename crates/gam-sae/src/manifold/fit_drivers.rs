@@ -3851,6 +3851,15 @@ impl SaeManifoldTerm {
         chunk_logits: Array2<f64>,
         chunk_coords: Vec<Array2<f64>>,
     ) -> Result<SaeManifoldTerm, String> {
+        self.materialize_chunk_rows(None, chunk_logits, chunk_coords)
+    }
+
+    fn materialize_chunk_rows(
+        &self,
+        row_range: Option<std::ops::Range<usize>>,
+        chunk_logits: Array2<f64>,
+        chunk_coords: Vec<Array2<f64>>,
+    ) -> Result<SaeManifoldTerm, String> {
         let k_atoms = self.k_atoms();
         if chunk_logits.ncols() != k_atoms {
             return Err(format!(
@@ -3875,15 +3884,36 @@ impl SaeManifoldTerm {
                     atom.latent_dim
                 ));
             }
-            let evaluator = atom.basis_evaluator.as_ref().ok_or_else(|| {
-                format!(
-                    "SaeManifoldTerm::materialize_chunk: atom '{}' has no basis evaluator; a \
-                     streaming fit must re-evaluate Φ(t) at each chunk's coordinates",
-                    atom.name
-                )
-            })?;
-            let (phi, jet) = evaluator.evaluate(coords.view())?;
             let m = atom.basis_size();
+            let (phi, jet, used_precomputed_rows) = if let Some(evaluator) =
+                atom.basis_evaluator.as_ref()
+            {
+                let (phi, jet) = evaluator.evaluate(coords.view())?;
+                (phi, jet, false)
+            } else if let Some(range) = row_range.as_ref() {
+                if range.end > atom.basis_values.nrows()
+                    || range.end > atom.basis_jacobian.shape()[0]
+                    || range.end - range.start != n_chunk
+                {
+                    return Err(format!(
+                        "SaeManifoldTerm::materialize_chunk: atom '{}' precomputed Φ/jet cannot supply rows {:?} for chunk length {n_chunk}",
+                        atom.name, range
+                    ));
+                }
+                let phi = atom.basis_values.slice(s![range.clone(), ..]).to_owned();
+                let jet = atom
+                    .basis_jacobian
+                    .slice(s![range.clone(), .., ..])
+                    .to_owned();
+                (phi, jet, true)
+            } else {
+                return Err(format!(
+                    "SaeManifoldTerm::materialize_chunk: atom '{}' has no basis evaluator; a \
+                     streaming fit must re-evaluate Φ(t) at each chunk's coordinates or supply \
+                     contiguous row slices from precomputed Φ/jet",
+                    atom.name
+                ));
+            };
             if phi.dim() != (n_chunk, m) {
                 return Err(format!(
                     "SaeManifoldTerm::materialize_chunk: atom '{}' evaluator returned Φ {:?}, expected ({n_chunk}, {m})",
@@ -3914,6 +3944,11 @@ impl SaeManifoldTerm {
                 atom.decoder_coefficients.clone(),
                 atom.smooth_penalty_raw.clone(),
             )?;
+            if used_precomputed_rows {
+                chunk_atom.smooth_penalty = atom.smooth_penalty.clone();
+                chunk_atom.smooth_penalty_raw = atom.smooth_penalty_raw.clone();
+                chunk_atom.smooth_penalty_order = atom.smooth_penalty_order;
+            }
             chunk_atom.basis_evaluator = atom.basis_evaluator.clone();
             chunk_atom.basis_second_jet = atom.basis_second_jet.clone();
             // #972 / #977 T1: carry the active Grassmann frame onto the chunk
@@ -4042,7 +4077,7 @@ impl SaeManifoldTerm {
             while start < n_total {
                 let end = (start + chunk_size).min(n_total);
                 let (logits, coords, _z_chunk) = chunk_init(start, end)?;
-                let chunk = self.materialize_chunk(logits, coords)?;
+                let chunk = self.materialize_chunk_rows(Some(start..end), logits, coords)?;
                 chunk.accumulate_decoder_gram(&mut grams);
                 start = end;
             }
@@ -4089,7 +4124,7 @@ impl SaeManifoldTerm {
                         self.output_dim()
                     ));
                 }
-                let mut chunk = self.materialize_chunk(logits, coords)?;
+                let mut chunk = self.materialize_chunk_rows(Some(start..end), logits, coords)?;
                 // #991: inherit the design honesty weight slice (see
                 // streaming_exact_arrow_log_det for the no-renormalize rule).
                 if let Some(w) = self.row_loss_weights.as_deref() {
@@ -4344,7 +4379,7 @@ impl SaeManifoldTerm {
             let n_chunk = end - start;
             let penalty_scale = n_chunk as f64 / n_total as f64;
             let (logits, coords, z_chunk) = chunk_init(start, end)?;
-            let mut chunk = self.materialize_chunk(logits, coords)?;
+            let mut chunk = self.materialize_chunk_rows(Some(start..end), logits, coords)?;
             // #991: inherit the design honesty weight slice (global mean-1
             // normalization preserved; see streaming_exact_arrow_log_det).
             if let Some(w) = self.row_loss_weights.as_deref() {
@@ -4385,7 +4420,7 @@ impl SaeManifoldTerm {
             let n_chunk = end - start;
             let penalty_scale = n_chunk as f64 / n_total as f64;
             let (logits, coords, z_chunk) = chunk_init(start, end)?;
-            let mut chunk = self.materialize_chunk(logits, coords)?;
+            let mut chunk = self.materialize_chunk_rows(Some(start..end), logits, coords)?;
             // #991: inherit the design honesty weight slice (global mean-1
             // normalization preserved; see streaming_exact_arrow_log_det).
             if let Some(w) = self.row_loss_weights.as_deref() {
