@@ -839,6 +839,39 @@ pub(crate) fn exact_newton_joint_stationarity_vector_from_gradient(
     Ok(residual)
 }
 
+/// Compute `Σ_t λ_t (M⊗S_t) · β` — the full-width joint penalty's contribution
+/// to the penalized stationarity condition — from the active `BlockwiseFitOptions`
+/// joint-penalty bundle and the current block betas (stacked class-major).
+///
+/// Returns `None` when the options carry no joint penalty (every per-block-only
+/// family), so the KKT-residual path stays byte-identical there. gam#1587/#561:
+/// the multinomial centered penalty lives ONLY here, so without this term the
+/// inner KKT residual omits the penalty entirely.
+pub(crate) fn joint_penalty_stationarity_score(
+    options: &BlockwiseFitOptions,
+    specs: &[ParameterBlockSpec],
+    states: &[ParameterBlockState],
+) -> Option<Array1<f64>> {
+    let bundle = options.joint_penalties.as_deref()?;
+    if bundle.is_empty() {
+        return None;
+    }
+    let total_p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
+    let mut beta = Array1::<f64>::zeros(total_p);
+    let mut offset = 0usize;
+    for (spec, state) in specs.iter().zip(states.iter()) {
+        let width = spec.design.ncols();
+        if state.beta.len() == width && offset + width <= total_p {
+            beta.slice_mut(ndarray::s![offset..offset + width])
+                .assign(&state.beta);
+        }
+        offset += width;
+    }
+    let mut score = Array1::<f64>::zeros(total_p);
+    bundle.add_apply_into(beta.view(), &mut score);
+    Some(score)
+}
+
 pub(crate) fn exact_newton_joint_projected_stationarity_vector_from_gradient(
     gradient: &Array1<f64>,
     states: &[ParameterBlockState],
@@ -848,6 +881,19 @@ pub(crate) fn exact_newton_joint_projected_stationarity_vector_from_gradient(
     ridge_policy: RidgePolicy,
     block_constraints: &[Option<LinearInequalityConstraints>],
     block_active_sets: Option<&[Option<Vec<usize>>]>,
+    // gam#1587/#561: `Σ_t λ_t (M⊗S_t) · β` — the full-width joint penalty's
+    // contribution to the penalized stationarity condition, in stacked
+    // (class-major) coordinates over the whole `total_p` vector. Families whose
+    // smoothing rides entirely on a JOINT penalty (multinomial: per-block
+    // `s_lambdas` are empty) would otherwise report a KKT residual of
+    // `−gradient` — which at the penalized optimum equals `Sλ_joint·β̂ ≠ 0` — a
+    // large PHANTOM residual that (a) stops the inner solve from certifying on
+    // the raw residual (it falls back to the decrement certificate) and (b)
+    // drives a spurious IFT/KKT cost correction whose ρ-derivative desyncs the
+    // outer REML gradient. Adding this term makes the residual the true
+    // `∇penalized(β̂)`. `None` (no joint penalty) keeps every per-block-only
+    // family byte-identical.
+    joint_penalty_score: Option<&Array1<f64>>,
 ) -> Result<Array1<f64>, String> {
     if states.len() != specs.len()
         || states.len() != s_lambdas.len()
@@ -875,6 +921,15 @@ pub(crate) fn exact_newton_joint_projected_stationarity_vector_from_gradient(
             total_p
         ) }.into());
     }
+    if let Some(js) = joint_penalty_score
+        && js.len() != total_p
+    {
+        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
+            "exact-newton projected stationarity vector from gradient: joint penalty score length mismatch, got {}, expected {}",
+            js.len(),
+            total_p
+        ) }.into());
+    }
 
     let mut residual = Array1::<f64>::zeros(total_p);
     let mut offset = 0usize;
@@ -883,6 +938,9 @@ pub(crate) fn exact_newton_joint_projected_stationarity_vector_from_gradient(
         let start = offset;
         let end = offset + width;
         let mut block = s_lambdas[b].dot(&states[b].beta) - gradient.slice(ndarray::s![start..end]);
+        if let Some(js) = joint_penalty_score {
+            block += &js.slice(ndarray::s![start..end]);
+        }
         if ridge_policy.include_quadratic_penalty && ridge > 0.0 {
             block += &states[b].beta.mapv(|v| ridge * v);
         }
@@ -934,6 +992,7 @@ pub(crate) fn exact_newton_joint_kkt_residual_for_ift<F: CustomFamily + ?Sized>(
     ridge: f64,
     ridge_policy: RidgePolicy,
     block_active_sets: Option<&[Option<Vec<usize>>]>,
+    joint_penalty_score: Option<&Array1<f64>>,
 ) -> Result<Option<ProjectedKktResidual>, String> {
     let eval = family.evaluate(states)?;
     let Some(gradient) = exact_newton_joint_gradient_from_eval(&eval, specs, states)? else {
@@ -949,6 +1008,7 @@ pub(crate) fn exact_newton_joint_kkt_residual_for_ift<F: CustomFamily + ?Sized>(
         ridge_policy,
         &block_constraints,
         block_active_sets,
+        joint_penalty_score,
     )
 }
 
@@ -963,6 +1023,7 @@ pub(crate) fn exact_newton_joint_kkt_residual_for_ift_from_cached_gradient<
     ridge_policy: RidgePolicy,
     block_active_sets: Option<&[Option<Vec<usize>>]>,
     cached_gradient: Option<&Array1<f64>>,
+    joint_penalty_score: Option<&Array1<f64>>,
 ) -> Result<Option<ProjectedKktResidual>, String> {
     if let Some(gradient) = cached_gradient {
         let block_constraints = collect_block_linear_constraints(family, states, specs)?;
@@ -975,6 +1036,7 @@ pub(crate) fn exact_newton_joint_kkt_residual_for_ift_from_cached_gradient<
             ridge_policy,
             &block_constraints,
             block_active_sets,
+            joint_penalty_score,
         );
     }
     exact_newton_joint_kkt_residual_for_ift(
@@ -985,6 +1047,7 @@ pub(crate) fn exact_newton_joint_kkt_residual_for_ift_from_cached_gradient<
         ridge,
         ridge_policy,
         block_active_sets,
+        joint_penalty_score,
     )
 }
 
@@ -997,6 +1060,7 @@ pub(crate) fn exact_newton_joint_projected_kkt_residual_for_ift_from_gradient(
     ridge_policy: RidgePolicy,
     block_constraints: &[Option<LinearInequalityConstraints>],
     block_active_sets: Option<&[Option<Vec<usize>>]>,
+    joint_penalty_score: Option<&Array1<f64>>,
 ) -> Result<Option<ProjectedKktResidual>, String> {
     let residual = exact_newton_joint_projected_stationarity_vector_from_gradient(
         gradient,
@@ -1007,6 +1071,7 @@ pub(crate) fn exact_newton_joint_projected_kkt_residual_for_ift_from_gradient(
         ridge_policy,
         block_constraints,
         block_active_sets,
+        joint_penalty_score,
     )?;
     if residual.iter().all(|v| v.is_finite()) {
         Ok(Some(ProjectedKktResidual::from_active_projected(residual)))

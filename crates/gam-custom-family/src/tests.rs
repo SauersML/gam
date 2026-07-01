@@ -7307,6 +7307,7 @@ pub(crate) fn joint_stationarity_from_gradient_projects_coupled_linear_constrain
         RidgePolicy::explicit_stabilization_full(),
         &[Some(constraints.clone())],
         None,
+        None,
     )
     .expect("KKT residual assembly should succeed")
     .expect("exact-gradient path should produce residual");
@@ -7365,6 +7366,7 @@ pub(crate) fn kkt_residual_uses_cached_joint_gradient_without_re_evaluating_fami
         RidgePolicy::explicit_stabilization_full(),
         None,
         Some(&cached_gradient),
+        None,
     )
     .expect("cached gradient path should not call family.evaluate()")
     .expect("cached gradient should produce a KKT residual");
@@ -7414,6 +7416,7 @@ pub(crate) fn projected_stationarity_vector_uses_penalized_residual_not_raw_scor
         0.0,
         RidgePolicy::explicit_stabilization_full(),
         &[None],
+        None,
         None,
     )
     .expect("projected stationarity residual should assemble");

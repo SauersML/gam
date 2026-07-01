@@ -3382,6 +3382,10 @@ pub(crate) fn compute_kkt_refusal_report(
             ridge_policy,
             block_constraints,
             Some(cached_active_sets),
+            // Diagnostic refusal report only; the joint-penalty score is not in
+            // scope here and the IFT/convergence residuals that must include it
+            // are computed on the paths in inner_blockwise_fit (#561).
+            None,
         )
         .ok()
     });
