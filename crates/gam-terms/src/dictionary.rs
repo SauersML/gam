@@ -44,6 +44,17 @@ pub struct LinearDictionaryConfig {
     pub temperature: f64,
     pub code_ridge: f64,
     pub tolerance: f64,
+    /// K=1 lane only. When `false` (default) the rank-one lane takes the leading
+    /// eigenvector of the UNCENTERED second-moment matrix `XᵀX` (byte-identical to
+    /// historical behavior), which is only a true centered-PCA ceiling when `x` is
+    /// already mean-centered. When `true` the lane subtracts the column mean, takes
+    /// the leading eigenvector of the CENTERED second-moment matrix, fits the
+    /// rank-1 code on the centered data, and adds the mean back — so the reported
+    /// EV (measured against the crate's centered denominator) is a genuine
+    /// centered-PCA ceiling even on uncentered input. Because the reconstruction is
+    /// then affine (mean + rank-1), the returned `fitted` INCLUDES the mean and is
+    /// NOT equal to `assignments.dot(atoms)` in this mode.
+    pub center_rank_one: bool,
 }
 
 impl LinearDictionaryConfig {
@@ -65,6 +76,7 @@ impl Default for LinearDictionaryConfig {
             temperature: DEFAULT_TEMPERATURE,
             code_ridge: DEFAULT_CODE_RIDGE,
             tolerance: DEFAULT_TOLERANCE,
+            center_rank_one: false,
         }
     }
 }
@@ -83,6 +95,22 @@ pub struct LinearDictionaryFit {
     pub top_k: usize,
 }
 
+/// Fit a linear (flat) dictionary by block coordinate descent: each sweep
+/// re-routes rows to atoms (the assignment step) and then refines every atom and
+/// its assignment column by a penalized least-squares update against the residual.
+///
+/// CONTRACT: this is a heuristic coordinate-descent dictionary learner, not a
+/// globally-optimal linear SAE. The coordinate-descent sweep leaves `assignments`
+/// as the per-atom-refined routing from the final sweep (each atom's column is the
+/// LS solve against the residual of the *then-current* dictionary), which is NOT a
+/// fresh global routing against the FINAL atoms. After the loop we therefore run a
+/// FINAL REROUTE (see [`reroute_against_atoms`]): a single fresh global assignment
+/// of every row against the final atoms using the configured rule. We ADOPT that
+/// rerouted routing only when it does not lower EV, so the returned model is the
+/// better of {coordinate-descent routing, fresh global reroute} and is never worse
+/// than before this step. `fitted` and `explained_variance` are always recomputed
+/// from the adopted `assignments`, so the reported EV is exactly the EV of the
+/// model that is returned (honest, and now the better of the two cheap routings).
 pub fn fit_linear_dictionary(
     x: ArrayView2<'_, f64>,
     config: &LinearDictionaryConfig,
@@ -91,7 +119,26 @@ pub fn fit_linear_dictionary(
     if config.n_atoms == 1 {
         return fit_rank_one_pca_lane(x, config);
     }
+    Ok(fit_multi_atom_dictionary(x, config)?.fit)
+}
 
+/// Diagnostics returned by the internal multi-atom solver: the fitted model plus
+/// the EV of the coordinate-descent routing as it stood *before* the final reroute
+/// adoption decision. The reroute-never-regresses invariant is exactly
+/// `fit.explained_variance >= pre_reroute_ev`; exposing both lets the unit tests
+/// assert it without re-running the private routing logic.
+struct MultiAtomDictionaryFit {
+    fit: LinearDictionaryFit,
+    // Read only by the reroute-never-regresses unit test; the production caller
+    // takes `.fit` and discards the diagnostic.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pre_reroute_ev: f64,
+}
+
+fn fit_multi_atom_dictionary(
+    x: ArrayView2<'_, f64>,
+    config: &LinearDictionaryConfig,
+) -> Result<MultiAtomDictionaryFit, String> {
     let top_k = config.top_k.min(config.n_atoms).max(1);
     let mut atoms = initialize_atoms(x, config.n_atoms);
     let mut assignments = Array2::<f64>::zeros((x.nrows(), config.n_atoms));
@@ -103,18 +150,7 @@ pub fn fit_linear_dictionary(
     let mut completed_iterations = 0usize;
 
     for iter in 0..config.max_iter {
-        assignments = match config.assignment {
-            LinearDictionaryAssignment::TopK => {
-                top_k_assignments(x, atoms.view(), top_k, config.code_ridge)?
-            }
-            LinearDictionaryAssignment::Softmax => softmax_assignments(
-                x,
-                atoms.view(),
-                top_k,
-                config.temperature,
-                config.code_ridge,
-            )?,
-        };
+        assignments = reroute_against_atoms(x, atoms.view(), top_k, config)?;
 
         fitted = assignments.dot(&atoms);
         let mut any_reseeded = false;
@@ -143,19 +179,55 @@ pub fn fit_linear_dictionary(
         previous_ev = ev;
     }
 
-    let final_ev = explained_variance(x, fitted.view());
-    Ok(LinearDictionaryFit {
-        atoms,
-        assignments,
-        fitted,
-        lambdas,
-        reml_scores,
-        explained_variance: final_ev,
-        iterations: completed_iterations,
-        converged,
-        assignment: config.assignment,
-        top_k,
+    // FINAL REROUTE: the loop's last assignment step routed rows against the atoms
+    // as they were BEFORE that sweep's per-atom refinement, and the atoms have
+    // since moved. Recompute a fresh global routing of every row against the FINAL
+    // atoms with the configured rule, and ADOPT it only when it does not lower EV —
+    // guaranteeing no regression and keeping assignments / fitted / EV consistent.
+    let pre_reroute_ev = explained_variance(x, fitted.view());
+    let rerouted = reroute_against_atoms(x, atoms.view(), top_k, config)?;
+    let rerouted_fitted = rerouted.dot(&atoms);
+    let rerouted_ev = explained_variance(x, rerouted_fitted.view());
+    let (assignments, fitted, final_ev) = if rerouted_ev >= pre_reroute_ev {
+        (rerouted, rerouted_fitted, rerouted_ev)
+    } else {
+        (assignments, fitted, pre_reroute_ev)
+    };
+
+    Ok(MultiAtomDictionaryFit {
+        fit: LinearDictionaryFit {
+            atoms,
+            assignments,
+            fitted,
+            lambdas,
+            reml_scores,
+            explained_variance: final_ev,
+            iterations: completed_iterations,
+            converged,
+            assignment: config.assignment,
+            top_k,
+        },
+        pre_reroute_ev,
     })
+}
+
+/// Fresh global routing of every row against `atoms` using the configured
+/// assignment rule. This is the single source of truth shared by the
+/// coordinate-descent assignment step and the post-loop final reroute, so both
+/// route identically and the reroute is a true global re-assignment against the
+/// final atoms.
+fn reroute_against_atoms(
+    x: ArrayView2<'_, f64>,
+    atoms: ArrayView2<'_, f64>,
+    top_k: usize,
+    config: &LinearDictionaryConfig,
+) -> Result<Array2<f64>, String> {
+    match config.assignment {
+        LinearDictionaryAssignment::TopK => top_k_assignments(x, atoms, top_k, config.code_ridge),
+        LinearDictionaryAssignment::Softmax => {
+            softmax_assignments(x, atoms, top_k, config.temperature, config.code_ridge)
+        }
+    }
 }
 
 fn validate_inputs(x: ArrayView2<'_, f64>, config: &LinearDictionaryConfig) -> Result<(), String> {
@@ -195,10 +267,28 @@ fn validate_inputs(x: ArrayView2<'_, f64>, config: &LinearDictionaryConfig) -> R
     Ok(())
 }
 
+/// K=1 closed-form lane.
+///
+/// Default (`config.center_rank_one == false`): the leading eigenvector of the
+/// UNCENTERED second-moment matrix `XᵀX`. This is only a true centered-PCA ceiling
+/// when `x` is already mean-centered upstream; the `explained_variance` denominator
+/// IS centered, so on uncentered input the leading `XᵀX` eigenvector can absorb the
+/// mean direction and this lane is a second-moment rank-1 fit rather than the
+/// centered principal component. This branch is byte-identical to historical
+/// behavior.
+///
+/// Centered (`config.center_rank_one == true`): delegates to
+/// [`fit_rank_one_centered_lane`], which subtracts the column mean, takes the
+/// leading eigenvector of the CENTERED second-moment matrix, and adds the mean
+/// back, so the reported EV is a genuine centered-PCA ceiling even on uncentered
+/// input. See that function and [`rank_one_centered_pca_ceiling`] for details.
 fn fit_rank_one_pca_lane(
     x: ArrayView2<'_, f64>,
     config: &LinearDictionaryConfig,
 ) -> Result<LinearDictionaryFit, String> {
+    if config.center_rank_one {
+        return fit_rank_one_centered_lane(x, config);
+    }
     let covariance = x.t().dot(&x);
     let (evals, evecs) = covariance
         .eigh(Side::Lower)
@@ -226,6 +316,111 @@ fn fit_rank_one_pca_lane(
         assignment: config.assignment,
         top_k: 1,
     })
+}
+
+/// Centered K=1 lane (`config.center_rank_one == true`): a genuine centered-PCA
+/// ceiling. Builds a full [`LinearDictionaryFit`] from the shared centered
+/// components — `atoms` is the unit-norm centered principal direction,
+/// `assignments` are the centered rank-1 codes, and `fitted` is the AFFINE
+/// reconstruction `mean + code·atom`, so `explained_variance` (centered
+/// denominator) is a true ceiling. Because the reconstruction is affine, `fitted`
+/// INCLUDES the mean and is NOT `assignments.dot(atoms)` in this mode.
+fn fit_rank_one_centered_lane(
+    x: ArrayView2<'_, f64>,
+    config: &LinearDictionaryConfig,
+) -> Result<LinearDictionaryFit, String> {
+    let CenteredRankOne {
+        atom,
+        codes,
+        fitted,
+        explained_variance: ev,
+    } = centered_rank_one_components(x, config.code_ridge)?;
+    let atoms = atom.insert_axis(Axis(0)).to_owned();
+    let assignments = codes.insert_axis(Axis(1)).to_owned();
+    let score = penalized_reconstruction_loss(x, fitted.view(), config.code_ridge, atoms.view());
+    Ok(LinearDictionaryFit {
+        atoms,
+        assignments,
+        fitted,
+        lambdas: Array1::from_elem(1, config.code_ridge),
+        reml_scores: Array1::from_elem(1, score),
+        explained_variance: ev,
+        iterations: 1.min(config.max_iter),
+        converged: true,
+        assignment: config.assignment,
+        top_k: 1,
+    })
+}
+
+/// Shared components of the centered rank-1 fit, so the public ceiling helper and
+/// the centered K=1 lane compute exactly the same principal direction / codes.
+struct CenteredRankOne {
+    /// Unit-norm centered principal direction (length `p`).
+    atom: Array1<f64>,
+    /// Centered rank-1 codes with the ridge shrink applied (length `n`).
+    codes: Array1<f64>,
+    /// Affine reconstruction `mean + code·atom` (shape `n × p`).
+    fitted: Array2<f64>,
+    /// EV of `fitted` against the crate's centered denominator.
+    explained_variance: f64,
+}
+
+fn centered_rank_one_components(
+    x: ArrayView2<'_, f64>,
+    code_ridge: f64,
+) -> Result<CenteredRankOne, String> {
+    if x.nrows() == 0 || x.ncols() == 0 {
+        return Err("rank_one_centered_pca_ceiling requires a non-empty 2-D matrix".to_string());
+    }
+    if !(code_ridge.is_finite() && code_ridge > 0.0) {
+        return Err(format!(
+            "rank_one_centered_pca_ceiling code_ridge must be finite and positive; got {code_ridge}"
+        ));
+    }
+    let means = x.mean_axis(Axis(0)).expect("non-empty input has means");
+    let centered = &x.to_owned() - &means;
+    let covariance = centered.t().dot(&centered);
+    let (evals, evecs) = covariance
+        .eigh(Side::Lower)
+        .map_err(|err| format!("rank_one_centered_pca_ceiling eigensolve failed: {err}"))?;
+    let last = evals.len() - 1;
+    let mut atom = evecs.column(last).to_owned();
+    orient_vector(&mut atom);
+    let shrink = 1.0 / (1.0 + code_ridge);
+    let mut codes = Array1::<f64>::zeros(x.nrows());
+    let mut fitted = Array2::<f64>::zeros(x.dim());
+    for row in 0..x.nrows() {
+        let code = centered.row(row).dot(&atom) * shrink;
+        codes[row] = code;
+        for col in 0..x.ncols() {
+            fitted[[row, col]] = means[col] + code * atom[col];
+        }
+    }
+    let ev = explained_variance(x, fitted.view());
+    Ok(CenteredRankOne {
+        atom,
+        codes,
+        fitted,
+        explained_variance: ev,
+    })
+}
+
+/// Centered rank-1 PCA ceiling for the K=1 lane, exposed for callers that want the
+/// ceiling reconstruction/EV directly. Subtracts the column means, takes the
+/// leading eigenvector of the CENTERED second-moment matrix, fits the rank-1 code
+/// on the centered data with the same ridge shrink the uncentered lane uses, then
+/// adds the mean back so the reconstruction lives in the original space. Returns
+/// `(fitted, explained_variance)`; the EV is measured against the same centered
+/// denominator as the rest of the crate, so it is directly comparable to (and an
+/// upper bound on) the uncentered lane's EV. Prefer setting
+/// `LinearDictionaryConfig::center_rank_one = true` to route the K=1 lane through
+/// this computation as part of a full [`LinearDictionaryFit`].
+pub fn rank_one_centered_pca_ceiling(
+    x: ArrayView2<'_, f64>,
+    code_ridge: f64,
+) -> Result<(Array2<f64>, f64), String> {
+    let components = centered_rank_one_components(x, code_ridge)?;
+    Ok((components.fitted, components.explained_variance))
 }
 
 fn initialize_atoms(x: ArrayView2<'_, f64>, n_atoms: usize) -> Array2<f64> {
@@ -595,6 +790,7 @@ mod tests {
             temperature: DEFAULT_TEMPERATURE,
             code_ridge: DEFAULT_CODE_RIDGE,
             tolerance: 1.0e-9,
+            center_rank_one: false,
         };
 
         let fit = fit_linear_dictionary(x.view(), &config).expect("linear dictionary fit");
@@ -623,6 +819,7 @@ mod tests {
             temperature: DEFAULT_TEMPERATURE,
             code_ridge: DEFAULT_CODE_RIDGE,
             tolerance: DEFAULT_TOLERANCE,
+            center_rank_one: false,
         };
 
         let fit = fit_linear_dictionary(x.view(), &config).expect("rank-one fit");
@@ -674,6 +871,7 @@ mod tests {
             temperature: DEFAULT_TEMPERATURE,
             code_ridge: DEFAULT_CODE_RIDGE,
             tolerance: 1.0e-9,
+            center_rank_one: false,
         };
         let fit = fit_linear_dictionary(x.view(), &config).expect("orthonormal dictionary fit");
         let live = fit
@@ -689,6 +887,166 @@ mod tests {
             fit.explained_variance > 0.99,
             "K orthonormal rank-1 atoms must be reconstructed at EV > 0.99; got {}",
             fit.explained_variance
+        );
+    }
+
+    #[test]
+    fn final_reroute_never_regresses_and_stays_consistent() {
+        // Planted sparse problem where the coordinate-descent routing and a fresh
+        // global reroute against the final atoms generally differ.
+        let truth = array![
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let mut assignments = Array2::<f64>::zeros((160, 4));
+        for row in 0..160 {
+            let atom = row % 4;
+            assignments[[row, atom]] = 0.7 + 0.01 * ((row / 4) as f64);
+            assignments[[row, (atom + 1) % 4]] = 0.2;
+        }
+        let x = assignments.dot(&truth);
+        let config = LinearDictionaryConfig {
+            n_atoms: 4,
+            max_iter: 40,
+            top_k: 2,
+            assignment: LinearDictionaryAssignment::TopK,
+            temperature: DEFAULT_TEMPERATURE,
+            code_ridge: DEFAULT_CODE_RIDGE,
+            tolerance: 1.0e-9,
+            center_rank_one: false,
+        };
+
+        // Internal solver exposes the pre-reroute (coordinate-descent) EV so we can
+        // assert the no-regression invariant directly.
+        let diag =
+            fit_multi_atom_dictionary(x.view(), &config).expect("multi-atom dictionary fit");
+        assert!(
+            diag.fit.explained_variance >= diag.pre_reroute_ev - 1.0e-12,
+            "final reroute regressed EV: pre={}, returned={}",
+            diag.pre_reroute_ev,
+            diag.fit.explained_variance
+        );
+
+        // Returned fitted must be exactly assignments.dot(atoms) for the adopted
+        // routing, and the reported EV must match that fitted.
+        let recomputed_fitted = diag.fit.assignments.dot(&diag.fit.atoms);
+        for (a, b) in diag.fit.fitted.iter().zip(recomputed_fitted.iter()) {
+            assert_abs_diff_eq!(*a, *b, epsilon = 1.0e-10);
+        }
+        assert_abs_diff_eq!(
+            diag.fit.explained_variance,
+            explained_variance(x.view(), diag.fit.fitted.view()),
+            epsilon = 1.0e-10
+        );
+
+        // Public entry point returns the adopted result and is also self-consistent.
+        let public = fit_linear_dictionary(x.view(), &config).expect("public fit");
+        let public_fitted = public.assignments.dot(&public.atoms);
+        for (a, b) in public.fitted.iter().zip(public_fitted.iter()) {
+            assert_abs_diff_eq!(*a, *b, epsilon = 1.0e-10);
+        }
+    }
+
+    #[test]
+    fn centered_rank_one_ceiling_agrees_when_data_already_centered() {
+        // Build correlated data, then explicitly mean-center it. On centered input
+        // the uncentered XᵀX lane and the centered helper see the same second-moment
+        // matrix, so their EVs must agree.
+        let mut x = Array2::<f64>::zeros((90, 3));
+        for row in 0..90 {
+            let t = (row as f64 - 44.5) / 25.0;
+            x[[row, 0]] = 1.5 * t;
+            x[[row, 1]] = -0.8 * t + 0.02 * (row as f64).cos();
+            x[[row, 2]] = 0.6 * t;
+        }
+        let means = x.mean_axis(Axis(0)).unwrap();
+        let centered = &x - &means;
+
+        let config = LinearDictionaryConfig::new(1);
+        let uncentered = fit_linear_dictionary(centered.view(), &config).expect("rank-one fit");
+        let (_fitted, centered_ev) =
+            rank_one_centered_pca_ceiling(centered.view(), DEFAULT_CODE_RIDGE)
+                .expect("centered ceiling");
+
+        assert_abs_diff_eq!(
+            uncentered.explained_variance,
+            centered_ev,
+            epsilon = 1.0e-9
+        );
+    }
+
+    #[test]
+    fn centered_rank_one_ceiling_beats_uncentered_with_strong_mean() {
+        // Strong column mean (offset) plus a low-variance signal direction: the
+        // uncentered XᵀX lane wastes its single rank on the mean direction and
+        // under-explains the CENTERED variance, while the centered helper recovers
+        // the true principal component and is a genuine, higher centered-PCA ceiling.
+        let mut x = Array2::<f64>::zeros((120, 2));
+        for row in 0..120 {
+            let t = (row as f64 - 59.5) / 60.0; // small spread around the offset
+            x[[row, 0]] = 50.0 + 0.3 * t;
+            x[[row, 1]] = 50.0 - 0.3 * t;
+        }
+        let config = LinearDictionaryConfig::new(1);
+        let uncentered = fit_linear_dictionary(x.view(), &config).expect("rank-one fit");
+        let (fitted, centered_ev) =
+            rank_one_centered_pca_ceiling(x.view(), DEFAULT_CODE_RIDGE).expect("centered ceiling");
+
+        assert!(
+            centered_ev > uncentered.explained_variance + 1.0e-6,
+            "centered ceiling ({centered_ev}) should beat uncentered lane ({}) on strong-mean data",
+            uncentered.explained_variance
+        );
+        // The centered helper's reported EV is consistent with its returned fitted.
+        assert_abs_diff_eq!(
+            centered_ev,
+            explained_variance(x.view(), fitted.view()),
+            epsilon = 1.0e-10
+        );
+    }
+
+    #[test]
+    fn center_rank_one_config_flag_routes_k1_lane_to_centered_ceiling() {
+        // Strong-mean, low-variance-signal data: the default (uncentered) K=1 lane
+        // wastes its single rank on the mean, so setting `center_rank_one = true`
+        // must route the lane through the centered computation and report the
+        // genuine (higher) centered-PCA ceiling — matching the standalone helper.
+        let mut x = Array2::<f64>::zeros((100, 3));
+        for row in 0..100 {
+            let t = (row as f64 - 49.5) / 50.0;
+            x[[row, 0]] = 30.0 + 0.2 * t;
+            x[[row, 1]] = 30.0 - 0.2 * t;
+            x[[row, 2]] = 30.0 + 0.05 * t;
+        }
+
+        let default_config = LinearDictionaryConfig::new(1);
+        assert!(!default_config.center_rank_one, "flag must default to false");
+        let uncentered = fit_linear_dictionary(x.view(), &default_config).expect("uncentered lane");
+
+        let mut centered_config = LinearDictionaryConfig::new(1);
+        centered_config.center_rank_one = true;
+        let centered = fit_linear_dictionary(x.view(), &centered_config).expect("centered lane");
+
+        // The flag actually routes to the centered lane: its EV equals the helper's
+        // centered ceiling and strictly beats the default uncentered lane.
+        let (_fitted, helper_ev) =
+            rank_one_centered_pca_ceiling(x.view(), DEFAULT_CODE_RIDGE).expect("helper ceiling");
+        assert_abs_diff_eq!(centered.explained_variance, helper_ev, epsilon = 1.0e-10);
+        assert!(
+            centered.explained_variance > uncentered.explained_variance + 1.0e-6,
+            "center_rank_one=true ({}) must beat default ({}) on strong-mean data",
+            centered.explained_variance,
+            uncentered.explained_variance
+        );
+        // Centered lane reports the affine reconstruction directly, so its EV is
+        // consistent with the returned `fitted` (which INCLUDES the mean and is not
+        // assignments.dot(atoms) in this mode).
+        assert_abs_diff_eq!(
+            centered.explained_variance,
+            explained_variance(x.view(), centered.fitted.view()),
+            epsilon = 1.0e-10
         );
     }
 
@@ -718,6 +1076,7 @@ mod tests {
             temperature: DEFAULT_TEMPERATURE,
             code_ridge: DEFAULT_CODE_RIDGE,
             tolerance: 1.0e-9,
+            center_rank_one: false,
         };
 
         let fit = fit_linear_dictionary(x.view(), &config).expect("large-K linear dictionary fit");

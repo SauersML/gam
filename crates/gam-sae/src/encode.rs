@@ -86,17 +86,21 @@ pub const KANTOROVICH_THRESHOLD: f64 = 0.5;
 /// short batches inside an outer atom-level fan-out stay sequential.
 pub(crate) const ENCODE_BATCH_PARALLEL_ROW_MIN: usize = 256;
 
-/// Minimum frame alignment `‖Uₖᵀd‖/‖d‖ ∈ [0,1]` the best LSH-gathered atom must
-/// have for an index-routed encode to be TRUSTED (#1026). The in-atom Kantorovich
-/// certificate attests Newton convergence *within* the chosen atom; it does NOT
-/// attest that the LSH gather found the globally-correct atom. Because alignment
-/// is capped at 1, a HIGH best-alignment leaves no room for a materially-better
-/// ungathered atom (the gather is trustworthy), whereas a LOW best-alignment means
-/// the true best atom was likely missed by LSH recall. Rows whose best gathered
-/// atom aligns below this are flagged uncertified and routed to the exact
-/// full-scan fallback — closing the silent-mis-routing hole where a non-empty but
-/// wrong gather certified against a suboptimal atom. Erring toward flagging only
-/// ever adds exact-fallback work (correct, slower); it never certifies a mis-route.
+/// Minimum frame alignment `‖Uₖᵀd‖/‖d‖ ∈ [0,1]` the routed atom must have for an
+/// index-routed encode to be attempted at all — a FIT-QUALITY floor, NOT a
+/// routing-correctness gate (#1026, corrected by the #1777 exact-routing path).
+///
+/// Routing itself is now EXACT: the index-routed encode picks the atom via
+/// [`SaeCandidateIndex::route_exact`], which returns the GLOBAL argmax of the
+/// routing score (the universal-bound LSH fast path, else a full-scan fallback) —
+/// so there is no "missed-better-ungathered-atom" hole left for this constant to
+/// patch. What remains is a different, honest question: even the globally-best
+/// atom may align only weakly with a row (no atom in the dictionary fits it). A
+/// finite alignment below this floor means the best available atom is a poor fit,
+/// so the row is flagged and routed to the exact multi-start fallback rather than
+/// encoded against an atom it barely belongs to. (Previously this same comparison
+/// double-served as a recall proxy; that role is gone — `route_exact` guarantees
+/// recall — leaving only the fit-quality role described here.)
 pub(crate) const CANDIDATE_ROUTING_MIN_ALIGNMENT: f64 = 0.5;
 
 /// Number of nearest charts the CERTIFIED encode refines in before returning the
@@ -2102,13 +2106,17 @@ impl EncodeAtlas {
     /// row, the existing [`SaeCandidateIndex`] (#985/#994) proposes the
     /// best-aligned atom by frame alignment to the row direction; the row is then
     /// encoded against THAT atom's certified chart atlas. This is the production
-    /// routing path — the LSH does sublinear atom selection, the atlas does the
-    /// in-atom nearest-chart routing and the per-row Kantorovich certificate.
+    /// routing path. Atom selection is EXACT (#1777): [`SaeCandidateIndex::route_exact`]
+    /// returns the global argmax of the routing score (the universal-bound LSH fast
+    /// path, else a full-scan fallback) — never a silently-missed ungathered atom —
+    /// and the atlas does the in-atom nearest-chart routing and the per-row
+    /// Kantorovich certificate.
     ///
     /// `atoms[id]` must be aligned with the atlas's `atoms[id]` (same dictionary
     /// order the atlas was built from and the sketch/index were built over).
-    /// A row with no LSH proposal (empty bucket) is flagged uncertified — it
-    /// routes to the exact multi-start fallback, never a silent wrong encode.
+    /// A row over an empty dictionary, or whose globally-best atom aligns below the
+    /// fit-quality floor, is flagged uncertified — it routes to the exact
+    /// multi-start fallback, never a silent wrong encode.
     pub fn certified_encode_with_index<S: AtomFrameSketch + Sync>(
         &self,
         atoms: &[SaeManifoldAtom],
@@ -2138,26 +2146,29 @@ impl EncodeAtlas {
             |range: std::ops::Range<usize>| -> Result<Vec<Option<(Array1<f64>, bool)>>, String> {
                 range
                     .map(|row| {
-                        // The row direction is the (unit-tolerant) target; the LSH
-                        // ranks atoms by how much of that direction lies in each
-                        // atom's column space. `propose` returns the top-`budget`
-                        // atom ids by exact frame alignment.
-                        let proposal = index.propose(sketch, targets.row(row), budget, true);
-                        let Some(&best_atom) = proposal.proposed.first() else {
-                            // No LSH candidate: flag for the exact fallback.
+                        // EXACT routing (#1777): pick the GLOBAL argmax of the
+                        // routing score over the whole dictionary, not merely the
+                        // best LSH-gathered candidate. `route_exact` certifies the
+                        // sublinear gather against the universal `[0,1]` alignment
+                        // bound and falls back to a full scan otherwise, so the
+                        // returned atom is guaranteed to be the globally-best — no
+                        // silently-missed ungathered atom.
+                        let Some(route) =
+                            index.route_exact(sketch, targets.row(row), budget, true)
+                        else {
+                            // Empty dictionary: flag for the exact fallback.
                             return Ok(None);
                         };
-                        // Routing-confidence gate (#1026): the in-atom certificate
-                        // attests convergence WITHIN best_atom, not that best_atom is
-                        // the globally-correct atom. A non-empty but low-alignment
-                        // gather likely missed the true best atom (LSH recall < 1) —
-                        // flag it for the exact fallback rather than silently
-                        // certifying a mis-route. See CANDIDATE_ROUTING_MIN_ALIGNMENT.
-                        // A NaN alignment — a zero-norm target row, ‖d‖ = 0 — must
-                        // also flag for the exact fallback, not slip through `<`.
-                        let routing_alignment = sketch.alignment(best_atom, targets.row(row));
-                        if !routing_alignment.is_finite()
-                            || routing_alignment < CANDIDATE_ROUTING_MIN_ALIGNMENT
+                        let best_atom = route.atom;
+                        // Fit-quality floor: even the globally-best atom may align
+                        // only weakly with this row (no atom fits it). A finite
+                        // alignment below the floor — or a NaN, the zero-norm
+                        // ‖d‖ = 0 row — flags for the exact multi-start fallback
+                        // rather than encoding against a poorly-fitting atom. This is
+                        // a quality gate, not a routing-correctness gate; routing is
+                        // already exact. See CANDIDATE_ROUTING_MIN_ALIGNMENT.
+                        if !route.alignment.is_finite()
+                            || route.alignment < CANDIDATE_ROUTING_MIN_ALIGNMENT
                         {
                             return Ok(None);
                         }
@@ -2256,19 +2267,22 @@ impl EncodeAtlas {
             |range: std::ops::Range<usize>| -> Result<Vec<Option<(Array1<f64>, bool)>>, String> {
                 range
                     .map(|row| {
-                        let proposal = index.propose(sketch, targets.row(row), budget, true);
-                        let Some(&best_atom) = proposal.proposed.first() else {
+                        // EXACT routing (#1777): global argmax of the routing score,
+                        // not just the best LSH-gathered candidate (see
+                        // certified_encode_with_index for the full rationale).
+                        let Some(route) =
+                            index.route_exact(sketch, targets.row(row), budget, true)
+                        else {
                             return Ok(None);
                         };
-                        // Routing-confidence gate (#1026): flag low-alignment gathers
-                        // for the exact fallback so a missed-true-best LSH route is
-                        // never silently certified. See CANDIDATE_ROUTING_MIN_ALIGNMENT
-                        // and certified_encode_with_index for the full rationale.
-                        // A NaN alignment — a zero-norm target row, ‖d‖ = 0 — must
-                        // also flag for the exact fallback, not slip through `<`.
-                        let routing_alignment = sketch.alignment(best_atom, targets.row(row));
-                        if !routing_alignment.is_finite()
-                            || routing_alignment < CANDIDATE_ROUTING_MIN_ALIGNMENT
+                        let best_atom = route.atom;
+                        // Fit-quality floor (not a routing-correctness gate; routing
+                        // is exact): even the globally-best atom may fit a row poorly,
+                        // and a NaN alignment is the zero-norm ‖d‖ = 0 row. Either way
+                        // flag for the exact multi-start fallback. See
+                        // CANDIDATE_ROUTING_MIN_ALIGNMENT.
+                        if !route.alignment.is_finite()
+                            || route.alignment < CANDIDATE_ROUTING_MIN_ALIGNMENT
                         {
                             return Ok(None);
                         }
@@ -2331,17 +2345,17 @@ impl EncodeAtlas {
     ///
     /// `amortized_encode_with_index` routes per row, then runs the per-row
     /// closed-form predictor + Kantorovich certificate + cold cross-check on each
-    /// row independently. This fast variant keeps the SAME sublinear per-row LSH
-    /// routing (cheap — `index.propose` + the alignment gate), but replaces the
-    /// per-row predictor with the GEMM-batched [`Self::amortized_encode_batch_fast`]:
-    /// it GROUPS rows by their proposed atom and runs one batched affine-predictor
-    /// pass per atom-group (a routing GEMM + a predictor GEMM each), reproducing a
-    /// traditional SAE's whole-dictionary `W·x+b` throughput. No per-row
-    /// certificate — this is the speed mode validated as accuracy-parity with the
-    /// certified solve (`fast_forward_is_accuracy_parity_with_certified`).
+    /// row independently. This fast variant keeps the SAME per-row EXACT routing
+    /// (`index.route_exact` + the fit-quality floor), but replaces the per-row
+    /// predictor with the GEMM-batched [`Self::amortized_encode_batch_fast`]:
+    /// it GROUPS rows by their global-argmax atom and runs one batched affine-
+    /// predictor pass per atom-group (a routing GEMM + a predictor GEMM each),
+    /// reproducing a traditional SAE's whole-dictionary `W·x+b` throughput. No
+    /// per-row certificate — this is the speed mode validated as accuracy-parity
+    /// with the certified solve (`fast_forward_is_accuracy_parity_with_certified`).
     ///
     /// Returns the per-row latent coords and a valid-mask: `false` for a row with
-    /// no LSH proposal, a sub-threshold/NaN routing alignment, or one the batched
+    /// an empty dictionary, a sub-threshold/NaN routing alignment, or one the batched
     /// predictor could not fire on (no evaluator / singular Gauss–Newton block /
     /// non-finite-or-zero amplitude). Each row is written exactly once (disjoint
     /// per-atom groups), so the result is independent of group iteration order.
@@ -2362,24 +2376,25 @@ impl EncodeAtlas {
             ));
         }
         let budget = auto_candidate_budget(atoms.len().max(1));
-        // ── Per-row LSH routing (sublinear), grouped by proposed atom. ──────────
+        // ── Per-row EXACT routing (#1777), grouped by the global-argmax atom. ───
         let mut groups: std::collections::HashMap<usize, Vec<usize>> =
             std::collections::HashMap::new();
         for row in 0..n {
-            let proposal = index.propose(sketch, targets.row(row), budget, true);
-            let Some(&best_atom) = proposal.proposed.first() else {
-                continue;
+            // route_exact returns the GLOBAL argmax of the routing score (universal-
+            // bound LSH fast path, else a full scan) — never a silently-missed
+            // ungathered atom.
+            let Some(route) = index.route_exact(sketch, targets.row(row), budget, true) else {
+                continue; // empty dictionary
             };
-            // Same routing-confidence gate as the per-row path: a low-alignment or
-            // NaN (zero-norm row) gather flags the row for the exact fallback, so a
-            // missed-true-best LSH route is never silently encoded.
-            let routing_alignment = sketch.alignment(best_atom, targets.row(row));
-            if !routing_alignment.is_finite()
-                || routing_alignment < CANDIDATE_ROUTING_MIN_ALIGNMENT
+            // Fit-quality floor (routing is already exact): the globally-best atom
+            // still fits this row poorly, or the alignment is NaN (zero-norm row) —
+            // flag for the exact fallback by leaving the row out of every group.
+            if !route.alignment.is_finite()
+                || route.alignment < CANDIDATE_ROUTING_MIN_ALIGNMENT
             {
                 continue;
             }
-            groups.entry(best_atom).or_default().push(row);
+            groups.entry(route.atom).or_default().push(row);
         }
 
         let mut coords = Array2::<f64>::zeros((n, latent_dim));
@@ -2443,17 +2458,18 @@ impl EncodeAtlas {
         let mut groups: std::collections::HashMap<usize, Vec<usize>> =
             std::collections::HashMap::new();
         for row in 0..n {
-            let proposal = index.propose(sketch, targets.row(row), budget, true);
-            let Some(&best_atom) = proposal.proposed.first() else {
-                continue;
+            // EXACT routing (#1777): global argmax of the routing score, not just
+            // the best LSH-gathered candidate.
+            let Some(route) = index.route_exact(sketch, targets.row(row), budget, true) else {
+                continue; // empty dictionary
             };
-            let routing_alignment = sketch.alignment(best_atom, targets.row(row));
-            if !routing_alignment.is_finite()
-                || routing_alignment < CANDIDATE_ROUTING_MIN_ALIGNMENT
+            // Fit-quality floor (routing is already exact); NaN ⇒ zero-norm row.
+            if !route.alignment.is_finite()
+                || route.alignment < CANDIDATE_ROUTING_MIN_ALIGNMENT
             {
                 continue;
             }
-            groups.entry(best_atom).or_default().push(row);
+            groups.entry(route.atom).or_default().push(row);
         }
 
         let mut recon = Array2::<f64>::zeros((n, p));

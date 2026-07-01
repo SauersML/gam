@@ -24,31 +24,45 @@
 //! assigned to atom `k` (assignment mass `a[i,k] = a_k`), the two candidates
 //! predict that residual:
 //!
-//!   * the CURVED candidate predicts `a_k · γ_k(t)` — the atom's actual
-//!     already-fitted contribution; its data-fit deviance is the weighted RSS of
-//!     that contribution against `y_resp`, no longer zero by construction.
+//!   * the CURVED candidate is scored at its CONSTRAINED MINIMUM over the atom's
+//!     decoder coefficients — re-fit on `y_resp` as
+//!     `min_B ‖y_resp − a_k·(Φ(t)·B)‖²` ([`curved_refit_rss`]) — so its data-fit
+//!     deviance is the smallest weighted RSS the curved family can attain on this
+//!     residual at the realized codes, not the possibly-collapsed realized curve.
 //!   * the LINEAR candidate predicts `a_k · (b₀ + (t − t̄)·b₁)`, the best
 //!     weighted least-squares straight line fit to `y_resp` (design column
 //!     scaled by the same assignment mass `a_k`), so its data-fit deviance is the
 //!     weighted RSS of the best line against the SAME residual.
 //!
-//! Because the curved family's `Θ = 0` member reproduces exactly the linear
-//! prediction `a_k·(b₀ + (t − t̄)·b₁)` on this data, linear IS the nested `Θ = 0`
-//! sub-model of the curved family on common data — so the per-slot evidence
-//! argmin is a genuine "match-or-beat" comparison: the curved candidate is
-//! preferred only when its extra curvature lowers the data-fit deviance by more
-//! than its extra Laplace parameter price, and the linear special case wins
-//! whenever a straight line already explains the residual.
+//! ## A genuine NESTED min-vs-min comparison (#1051)
 //!
-//! This replaces the earlier post-hoc curve-simplification diagnostic, in which
-//! both candidates targeted the atom's already-fitted decoded image `γ_k(t)`
-//! (giving the curved arm a free zero residual against itself) rather than the
-//! response data. That version could not nest linear in curved on common data
-//! and so carried no real dominance guarantee (#1202); it is removed. The
-//! comparison here re-fits nothing in the (broken under #1051) euclidean /
-//! multi-atom outer continuation — it scores the already-realized curved
-//! contribution and the closed-form linear lane against the realized residual,
-//! both on the data, with no joint Hessian or continuation spine.
+//! Both arms are now at their constrained minimum on the SAME leave-one-atom-out
+//! residual: the linear arm is the closed-form min-over-lines, and the curved arm
+//! is the min-over-decoders refit ([`curved_refit_rss`]). The linear special case
+//! `a_k·(b₀ + (t−t̄)·b₁)` is a MEMBER of the curved family whenever the straight
+//! lane `[1, (t−t̄)]` lies in the column span of the curved basis `Φ` — exactly for
+//! the interval / line-segment charts (whose basis carries the constant and linear
+//! terms) and to the basis's expressiveness for the periodic charts. So after the
+//! refit `curved_rss ≤ linear_rss` up to the least-squares solver tolerance: the
+//! curved family CANNOT do worse than its own `Θ = 0` sub-model. That is the
+//! nested-dominance property restored here — "curved match-or-beats linear" is now
+//! a floor established by re-optimizing the curved arm, not merely asserted.
+//!
+//! The broken (#1051) euclidean / multi-atom OUTER continuation is deliberately
+//! NOT re-entered: the direct per-atom `d = 1` decoder-only refit at the realized
+//! codes is sufficient to score the curved arm at its constrained minimum. When
+//! `Φ` is unavailable (no evaluator) or the refit solve is degenerate the arm
+//! falls back to the already-realized curve's RSS — an honest degradation, never a
+//! fabricated determinant. The argmin then trades the curved arm's (minimized)
+//! data fit against its larger parameter / complexity price, so a genuinely
+//! curved signal is preferred while a straight-line signal ties and collapses to
+//! the cheaper linear lane.
+//!
+//! This replaces an earlier diagnostic in which both candidates targeted the
+//! atom's already-fitted decoded image `γ_k(t)` (giving the curved arm a free
+//! zero residual against itself, #1202) and its successor which scored the
+//! already-REALIZED curved contribution (a post-fit heuristic that did not
+//! establish nested dominance); the curved arm is now re-fit to its minimum.
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
@@ -58,7 +72,7 @@ use gam_solve::evidence::{
 };
 use gam_terms::latent::LatentManifold;
 use crate::chart_canonicalization::d1_atom_fitted_turning;
-use crate::manifold::SaeManifoldAtom;
+use crate::manifold::{SaeManifoldAtom, solve_design_least_squares};
 
 /// The rank-aware Laplace negative-log-evidence of a reduced per-atom Gaussian
 /// reconstruction sub-model: `residual_objective + ½ log|H|` with no smoothing
@@ -67,6 +81,16 @@ use crate::manifold::SaeManifoldAtom;
 /// Kept inline (rather than routed through `EvidenceLogDetSource`) because both
 /// candidates' Hessian logdets are already the closed-form scalar moments of
 /// their shared design — no factor cache or HVP callback to assemble.
+///
+/// SCALE CAVEAT: this is a FIXED-DISPERSION Laplace / penalized criterion, not a
+/// profiled REML marginal likelihood. It assumes unit dispersion (`σ² = 1`)
+/// after preprocessing — the residual objective is the bare `½ RSS` with no
+/// `RSS/(2σ²)` rescaling and no profiled-over-σ² log-determinant correction. It
+/// is therefore SENSITIVE to the response scale: rescaling `y → s·y` scales the
+/// `residual_objective` (`RSS`) by `s²` but leaves the `½ log|H|` complexity term
+/// unchanged, so the curved-vs-linear trade-off it expresses is not
+/// scale-invariant. Callers must keep the targets on a consistent (preprocessed,
+/// roughly unit-scale) footing for the comparison to mean what it says.
 fn reduced_laplace_nle(residual_objective: f64, log_det_h: f64) -> f64 {
     residual_objective + 0.5 * log_det_h
 }
@@ -281,6 +305,16 @@ const MIN_ROWS_FOR_LINEAR_FIT: usize = 3;
 /// comfortably above f64 round-off on an exact-line collapse yet far below any
 /// material EV loss, so it separates the lossless and load-bearing regimes
 /// without tuning.
+///
+/// PER-ATOM SCOPE: applied per slot, this tolerance bounds only ONE atom's
+/// individual EV loss. It does NOT by itself bound the dictionary-level EV loss
+/// when several atoms collapse at once: the true global RSS change is
+/// `Σ_k Δ_k + 2 Σ_{j<k} <Δrecon_j, Δrecon_k>` — both the accumulation of many
+/// individually-tolerable `Δ_k` AND the cross terms between co-active atoms are
+/// invisible to the per-atom gate. [`build_hybrid_split_report`] adds an
+/// aggregate global guard (interpreting this same fraction as a bound on
+/// `Σ_k max(Δ_k, 0)`) on top of the per-atom gate; see there for what that guard
+/// does and does not prove.
 const SAE_HYBRID_COLLAPSE_MAX_EV_LOSS: f64 = 1.0e-3;
 
 /// The full-reconstruction SSR INCREASE from collapsing one `d = 1` atom to its
@@ -323,13 +357,82 @@ fn collapse_ssr_increase(
     linear_rss - curved_rss
 }
 
+/// #1051/#1026 NESTED MIN — re-fit the curved atom's decoder on the SAME
+/// leave-this-atom-out residual `y_resp` and return its **minimum** weighted
+/// reconstruction RSS at the atom's realized codes.
+///
+/// This is the genuine constrained minimum of the curved family over its free
+/// decoder coefficients `B`:
+///
+/// ```text
+/// min_B Σᵢ ‖ y_resp[i] − a_k·( Φ(t_i)·B ) ‖²   (design = diag(a)·Φ, rhs = y_resp).
+/// ```
+///
+/// It restores the nested-dominance floor `curved_rss ≤ linear_rss`. The linear
+/// special case `a_k·(b₀ + (t−t̄)·b₁)` is itself a member of this family whenever
+/// the straight lane `[1, (t−t̄)]` lies in the column span of the curved basis
+/// `Φ` — exactly (interval / line-segment charts, whose basis carries the
+/// constant and linear terms) or to the basis's expressiveness (the periodic
+/// charts). So `min_B` over `Φ` cannot do WORSE than the best straight line: the
+/// returned RSS is `≤` the linear arm's RSS up to the least-squares solver
+/// tolerance. This is the direct per-atom `d = 1` refit the module owes; the
+/// broken (#1051) euclidean / multi-atom OUTER continuation is deliberately NOT
+/// re-entered — the decoder-only refit at the realized codes is sufficient to
+/// score the curved arm at its constrained minimum.
+///
+/// `phi` is the curved design `Φ(t)` on the atom's rows (`n × M`); `assign` the
+/// per-row mass `a_k` (NOT squared — the design weight is the mass itself, so the
+/// residual is on the SAME footing the linear arm and the joint loss use).
+/// Returns `None` when the solve is degenerate or non-finite; the caller then
+/// falls back to the already-realized curve's RSS rather than fabricate a value.
+fn curved_refit_rss(
+    phi: ArrayView2<'_, f64>,
+    assign: ArrayView1<'_, f64>,
+    target_resid: ArrayView2<'_, f64>,
+) -> Option<f64> {
+    let n = phi.nrows();
+    let m = phi.ncols();
+    let p = target_resid.ncols();
+    if m == 0 || n == 0 || assign.len() != n || target_resid.nrows() != n || p == 0 {
+        return None;
+    }
+    // Weighted design `diag(a)·Φ` (n×M). The refit minimizes ‖diag(a)·Φ·B − y_resp‖²,
+    // so the fitted prediction is diag(a)·Φ·B — the curved contribution `a_k·γ_k`
+    // at its best decoder `B` on this residual.
+    let mut design = Array2::<f64>::zeros((n, m));
+    for i in 0..n {
+        let a = assign[i];
+        if !a.is_finite() {
+            return None;
+        }
+        for c in 0..m {
+            design[[i, c]] = a * phi[[i, c]];
+        }
+    }
+    let b = solve_design_least_squares(design.view(), target_resid).ok()?;
+    if b.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let pred = design.dot(&b);
+    let mut rss = 0.0_f64;
+    for i in 0..n {
+        for j in 0..p {
+            let r = target_resid[[i, j]] - pred[[i, j]];
+            rss += r * r;
+        }
+    }
+    rss.is_finite().then_some(rss)
+}
+
 /// Build the curved + linear candidates for ONE fitted `d = 1` atom and return
 /// them as `(linear, curved, (t̄, b₀, b₁))`, or `None` if the atom cannot present
 /// an honest pair (too few rows, degenerate coordinate span, or non-finite
 /// numbers). Both candidates are scored against the SAME data — the atom's
-/// leave-this-atom-out response residual `y_resp` — so the comparison is a
-/// genuine common-evidence one with linear nested as the curved family's `Θ = 0`
-/// sub-model (#1202).
+/// leave-this-atom-out response residual `y_resp` — at their CONSTRAINED MINIMUM:
+/// the linear arm is the freshly-fit min-over-lines and the curved arm is the
+/// min-over-decoders refit ([`curved_refit_rss`]), so the comparison is a genuine
+/// nested min-vs-min one and `curved_rss ≤ linear_rss` holds up to solver
+/// tolerance for a basis whose span contains the straight lane (#1051).
 ///
 /// Inputs over the atom's assigned rows:
 ///   * `coords` — the fitted on-atom coordinate `t`.
@@ -341,13 +444,14 @@ fn collapse_ssr_increase(
 ///     (`p` cols): the response with every OTHER atom's contribution removed.
 ///     This is the data both candidates fit.
 ///
-/// The curved candidate's data-fit deviance is `½ Σ ‖y_resp − a_k·γ_k‖²` (the
-/// plain reconstruction SSE, matching the joint loss — the mass already lives in
-/// the prediction `a_k·γ_k`); the linear candidate fits the best mass-weighted
-/// straight line to `y_resp` and pays `½ Σ ‖y_resp − a_k·(b₀ + (t − t̄)·b₁)‖²`.
-/// Because the curved family's `Θ = 0` member reproduces the linear prediction
-/// exactly, linear is the nested sub-model and the argmin is the honest
-/// match-or-beat criterion.
+/// The curved candidate's data-fit deviance is `½·min_B Σ ‖y_resp − a_k·(Φ·B)‖²`
+/// (its constrained minimum over the decoder; the mass lives in the prediction);
+/// the linear candidate fits the best mass-weighted straight line to `y_resp` and
+/// pays `½ Σ ‖y_resp − a_k·(b₀ + (t − t̄)·b₁)‖²`. Because the linear prediction is
+/// itself a curved-family member (the straight lane lies in `span(Φ)` for the
+/// eligible charts), the curved arm's minimized RSS is `≤` the linear arm's up to
+/// solver tolerance, so the argmin is a genuine nested min-vs-min dominance
+/// comparison, not a post-fit compression heuristic.
 fn build_atom_candidates(
     coords: ArrayView1<'_, f64>,
     assign: ArrayView1<'_, f64>,
@@ -428,33 +532,47 @@ fn build_atom_candidates(
     }
 
     // Data-fit residual sums of squares of BOTH candidates against `y_resp`, the
-    // common data. The curved candidate predicts the atom's actual mass-scaled
-    // contribution `a_k·γ_k`; the linear candidate predicts the best line
-    // `a_k·(b₀ + (t − t̄)·b₁)`. These are no longer trivially zero for the curved
-    // arm — both are real misfits to the response residual, so the argmin is a
-    // genuine common-evidence comparison (#1202).
-    let mut curved_rss = 0.0_f64;
+    // common data. The linear candidate predicts the best line
+    // `a_k·(b₀ + (t − t̄)·b₁)`; the curved candidate is scored at its CONSTRAINED
+    // MINIMUM over the decoder coefficients (nested min-vs-min, #1051), re-fit on
+    // this same residual — not the possibly-collapsed already-realized curve. We
+    // also carry the realized curve's RSS as the honest fallback when the basis
+    // `Φ` is unavailable or its refit solve is degenerate.
     let mut linear_rss = 0.0_f64;
+    let mut realized_curved_rss = 0.0_f64;
     for i in 0..n {
         let a = assign[i];
         let dt = coords[i] - t_bar;
         for j in 0..p {
             let y = target_resid[[i, j]];
-            let r_curved = y - a * decoded[[i, j]];
-            curved_rss += r_curved * r_curved;
             let r_linear = y - a * (b0[j] + dt * b1[j]);
             linear_rss += r_linear * r_linear;
+            let r_curved = y - a * decoded[[i, j]];
+            realized_curved_rss += r_curved * r_curved;
         }
     }
+    // #1051 NESTED MIN — the curved arm's data fit is `min_B ‖y_resp − diag(a)Φ B‖²`,
+    // its constrained minimum over the decoder. Because the linear lane is a member
+    // of the curved family (the straight columns lie in `span(Φ)` for the eligible
+    // charts), this min-curved RSS is `≤ linear_rss` up to solver tolerance — the
+    // "curved match-or-beats linear" floor. Fall back to the realized curve's RSS
+    // only when Φ is absent or the refit is degenerate.
+    let curved_rss = match curved_phi {
+        Some(phi) if phi.nrows() == n => {
+            curved_refit_rss(phi, assign, target_resid).unwrap_or(realized_curved_rss)
+        }
+        _ => realized_curved_rss,
+    };
 
     // Gaussian-reconstruction deviance: the residual objective `½ RSS` the
     // Laplace normalizer is added to. The curved arm pays `½·curved_rss` (how
-    // well its fitted curve explains the residual) plus its larger `M·p`
+    // well its REALIZED curve explains the residual) plus its larger `M·p`
     // parameter price; the linear arm pays `½·linear_rss` plus a `2·p` price.
-    // Because the curved family's `Θ = 0` member equals the linear prediction,
-    // `curved_rss ≤ linear_rss` whenever the fitted curve is at least as good a
-    // residual fit as its own straight projection — the match-or-beat floor — and
-    // the argmin trades that data-fit gain against the curvature parameter price.
+    // `curved_rss` is the realized (not re-optimized) curve's misfit, so it is NOT
+    // guaranteed `≤ linear_rss`: when the realized curve underperforms its own best
+    // straight projection the cheaper line simply wins. The argmin trades whatever
+    // data-fit the realized curve buys against the curvature parameter price — a
+    // post-fit compression decision, not a nested match-or-beat floor.
     let curved_residual_objective = 0.5 * curved_rss;
     let linear_residual_objective = 0.5 * linear_rss;
 
@@ -655,6 +773,132 @@ fn build_collapse_rescue_linear_image(
     Some((linear, image))
 }
 
+/// #1026 item-2 — one collapsed slot's TRUE dictionary-level reconstruction
+/// change `δ_k[i,j] = a_k·(γ_k(t_i) − line_k(t_i))` over ALL globally-aligned rows
+/// (the caller presents `coords`/`assign`/`decoded`/`image` on the same `n` rows,
+/// so these δ vectors ARE cross-atom aligned and their inner products are the
+/// genuine cross terms). `line_k` is evaluated at the image's own coordinate
+/// (collapse-rescue slots evaluate at their fresh per-row codes via
+/// [`AtomLinearImage::coordinate_for_row`], exactly as the collapsed reconstruction
+/// does). Collapsing atom `k` shifts the full reconstruction residual by `+δ_k`.
+fn slot_delta(
+    coords: &Array1<f64>,
+    assign: &Array1<f64>,
+    decoded: &Array2<f64>,
+    image: &AtomLinearImage,
+) -> Array2<f64> {
+    let n = decoded.nrows();
+    let p = decoded.ncols();
+    let mut d = Array2::<f64>::zeros((n, p));
+    for i in 0..n {
+        let a = assign[i];
+        let coord = image.coordinate_for_row(i, coords[i]);
+        let dt = coord - image.t_bar;
+        for j in 0..p {
+            let line = image.b0[j] + dt * image.b1[j];
+            d[[i, j]] = a * (decoded[[i, j]] - line);
+        }
+    }
+    d
+}
+
+/// #1026 item-2 — the ALL-CURVED global reconstruction residual
+/// `R0 = target − Σ_all a·γ` recovered from any single atom's leave-this-atom-out
+/// residual: `R0 = y_resp_k − a_k·γ_k = target_resid − a_k·decoded`. Identical for
+/// every atom (each `target_resid` adds back exactly that atom's own contribution),
+/// so the caller computes it once from the first slot.
+fn slot_r0(assign: &Array1<f64>, decoded: &Array2<f64>, target_resid: &Array2<f64>) -> Array2<f64> {
+    let n = decoded.nrows();
+    let p = decoded.ncols();
+    let mut r0 = Array2::<f64>::zeros((n, p));
+    for i in 0..n {
+        let a = assign[i];
+        for j in 0..p {
+            r0[[i, j]] = target_resid[[i, j]] - a * decoded[[i, j]];
+        }
+    }
+    r0
+}
+
+/// #1026 item-2 — GLOBAL cross-term collapse guard. Given the collapsed slots'
+/// dictionary-level reconstruction-change vectors `δ_k` (globally row-aligned,
+/// `n × p`) and the all-curved global residual `R0 = target − Σ_all a·γ`, decide
+/// which collapses must revert to curved so the TRUE global reconstruction SSR
+/// increase
+///
+/// ```text
+/// ΔRSS(S) = ‖R0 + Σ_{k∈S} δ_k‖² − ‖R0‖²
+///         = 2⟨R0, Σ_{k∈S} δ_k⟩ + ‖Σ_{k∈S} δ_k‖²
+///         = Σ_{k∈S} Δ_k + 2 Σ_{j<k∈S} ⟨δ_j, δ_k⟩
+/// ```
+///
+/// stays within `global_tol`. Unlike the per-atom / summed-loss guard this
+/// INCLUDES the cross terms `2 Σ_{j<k} ⟨δ_j, δ_k⟩` between simultaneously-collapsed
+/// atoms (correlated collapse errors), which the aggregate `Σ max(Δ_k, 0)` bound is
+/// blind to. `forced` are the always-collapsed δ (euclidean / collapse-rescue slots
+/// with no curved alternative): they stay in the reconstruction but cannot be
+/// rolled back. `eligible` are `(slot, curved_evidence_margin, δ)` for
+/// rollback-eligible collapses. When `ΔRSS` over ALL collapses exceeds tolerance,
+/// the least-justified eligible collapses (largest margin — the most marginal
+/// linear win) are reverted one at a time, RECOMPUTING the true global increase
+/// (cross terms and all) after each revert, until within tolerance or none remain.
+/// Returns the slot indices to revert to curved.
+fn global_collapse_rollback(
+    r0: ArrayView2<'_, f64>,
+    eligible: &[(usize, f64, &Array2<f64>)],
+    forced: &[&Array2<f64>],
+    global_tol: f64,
+) -> Vec<usize> {
+    let (n, p) = r0.dim();
+    // True global SSR increase for the active δ set: 2⟨R0, Σδ⟩ + ‖Σδ‖².
+    let increase = |active: &[&Array2<f64>]| -> f64 {
+        let mut cross = 0.0_f64;
+        let mut self_sq = 0.0_f64;
+        for i in 0..n {
+            for j in 0..p {
+                let mut s = 0.0_f64;
+                for d in active {
+                    s += d[[i, j]];
+                }
+                cross += r0[[i, j]] * s;
+                self_sq += s * s;
+            }
+        }
+        2.0 * cross + self_sq
+    };
+    let mut kept = vec![true; eligible.len()];
+    let build_active = |kept: &[bool]| -> Vec<&Array2<f64>> {
+        let mut v: Vec<&Array2<f64>> = forced.to_vec();
+        for (idx, &(_, _, d)) in eligible.iter().enumerate() {
+            if kept[idx] {
+                v.push(d);
+            }
+        }
+        v
+    };
+    if increase(&build_active(&kept)) <= global_tol {
+        return Vec::new();
+    }
+    // Revert least-justified first: largest curved_evidence_margin (the most
+    // marginal linear win is the cheapest to give back to curved).
+    let mut order: Vec<usize> = (0..eligible.len()).collect();
+    order.sort_by(|&a, &b| {
+        eligible[b]
+            .1
+            .partial_cmp(&eligible[a].1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut reverted = Vec::new();
+    for idx in order {
+        kept[idx] = false;
+        reverted.push(eligible[idx].0);
+        if increase(&build_active(&kept)) <= global_tol {
+            break;
+        }
+    }
+    reverted
+}
+
 /// Assemble the per-atom candidate slots for [`select_hybrid_split`] from the
 /// fitted `d = 1` atoms, run the adjudication, and return the report.
 ///
@@ -703,6 +947,19 @@ where
     // so the geometry/EV pairing is structured report data, not a log line.
     let mut turnings: Vec<Option<f64>> = Vec::new();
     let mut delta_evs: Vec<Option<f64>> = Vec::new();
+    // #1026 item-2 — per-slot collapse loss `Δ_k = linear_rss − curved_rss` for the
+    // GLOBAL EV-preservation guard below. `Some(Δ_k)` for a curveable slot that
+    // retained a curved alternative (so a chosen collapse there can be rolled back);
+    // `None` for euclidean slots (no curved option) and collapse-rescue slots (the
+    // curve was already degenerate — collapsing recovers EV rather than losing it).
+    let mut collapse_loss: Vec<Option<f64>> = Vec::new();
+    // #1026 item-2 — per-slot dictionary-level reconstruction-change vector δ_k
+    // (globally row-aligned n×p), and the all-curved global residual R0 (computed
+    // once from the first slot). These feed the GLOBAL cross-term collapse guard,
+    // which reconstructs the full dictionary with the selected collapses applied
+    // and measures the TRUE global EV degradation (cross terms and all).
+    let mut deltas: Vec<Array2<f64>> = Vec::new();
+    let mut r0: Option<Array2<f64>> = None;
 
     for atom_idx in eligible_d1 {
         let atom = &atoms[atom_idx];
@@ -751,45 +1008,61 @@ where
             fitted_turning,
         ) {
             Some((linear, curved, (t_bar, b0, b1))) => {
-                // #1026 EV-PRESERVATION gate. Collapsing this slot raises the full
-                // reconstruction SSR by `linear_rss − curved_rss`; if that is more
-                // than `SAE_HYBRID_COLLAPSE_MAX_EV_LOSS` of the fixed total target
-                // variance the collapse would DROP reconstruction EV materially, so
-                // veto it by presenting only the curved candidate (the selector must
-                // keep curved). A lossless / improving collapse (`≤ 0`) and a
-                // negligible one stay free to collapse — EV-neutral cases (the
+                // #1026 PER-ATOM EV-PRESERVATION gate. Collapsing this slot raises
+                // the full reconstruction SSR by `linear_rss − curved_rss`; if that
+                // is more than `SAE_HYBRID_COLLAPSE_MAX_EV_LOSS` of the fixed total
+                // target variance the collapse would DROP this ONE atom's EV
+                // materially, so veto it by presenting only the curved candidate (the
+                // selector must keep curved). A lossless / improving collapse (`≤ 0`)
+                // and a negligible one stay free to collapse — EV-neutral cases (the
                 // top-k / birth-topology lines) are untouched. Only curveable charts
-                // are gated; a euclidean chart never had a curved option.
+                // are gated; a euclidean chart never had a curved option. NOTE: this
+                // gate is PER-ATOM only — the accumulation of many small collapses
+                // and the dictionary-level cross terms are handled by the aggregate
+                // guard after selection.
+                let loss = collapse_ssr_increase(
+                    coords.view(),
+                    assign.view(),
+                    decoded.view(),
+                    target_resid.view(),
+                    t_bar,
+                    &b0,
+                    &b1,
+                );
                 let collapse_loses_ev = total_centered_variance.is_finite()
                     && total_centered_variance > 0.0
-                    && collapse_ssr_increase(
-                        coords.view(),
-                        assign.view(),
-                        decoded.view(),
-                        target_resid.view(),
-                        t_bar,
-                        &b0,
-                        &b1,
-                    ) > SAE_HYBRID_COLLAPSE_MAX_EV_LOSS * total_centered_variance;
-                let slot = if manifold.is_euclidean() {
+                    && loss > SAE_HYBRID_COLLAPSE_MAX_EV_LOSS * total_centered_variance;
+                let euclidean = manifold.is_euclidean();
+                let slot = if euclidean {
                     vec![linear]
                 } else if collapse_loses_ev {
                     vec![curved]
                 } else {
                     vec![linear, curved]
                 };
-                slots.push(slot);
-                names.push(atom.name.clone());
-                manifolds.push(manifold);
-                turnings.push(fitted_turning);
-                delta_evs.push(delta_ev_for(atom_idx));
-                linear_images.push(AtomLinearImage {
+                // Build the straight image, then its globally-aligned δ_k for the
+                // GLOBAL cross-term guard, before moving it into the report.
+                let image = AtomLinearImage {
                     atom_idx,
                     t_bar,
                     b0,
                     b1,
                     row_codes: None,
-                });
+                };
+                let delta = slot_delta(&coords, &assign, &decoded, &image);
+                if r0.is_none() {
+                    r0 = Some(slot_r0(&assign, &decoded, &target_resid));
+                }
+                slots.push(slot);
+                // A euclidean slot never had a curved alternative, so its collapse
+                // carries no recoverable EV loss for the global guard; record `None`.
+                collapse_loss.push(if euclidean { None } else { Some(loss) });
+                names.push(atom.name.clone());
+                manifolds.push(manifold);
+                turnings.push(fitted_turning);
+                delta_evs.push(delta_ev_for(atom_idx));
+                deltas.push(delta);
+                linear_images.push(image);
             }
             // #1026 collapse rescue: `build_atom_candidates` refused because the
             // atom's own coordinate collapsed (`s_tt ≈ 0`) — the rank-1 co-collapse
@@ -805,11 +1078,19 @@ where
                 target_resid.view(),
             ) {
                 Some((linear, image)) => {
+                    let delta = slot_delta(&coords, &assign, &decoded, &image);
+                    if r0.is_none() {
+                        r0 = Some(slot_r0(&assign, &decoded, &target_resid));
+                    }
                     slots.push(vec![linear]);
+                    // Forced-linear rescue: the curve was degenerate, so there is no
+                    // curved alternative to roll back to and no recoverable EV loss.
+                    collapse_loss.push(None);
                     names.push(atom.name.clone());
                     manifolds.push(manifold);
                     turnings.push(fitted_turning);
                     delta_evs.push(delta_ev_for(atom_idx));
+                    deltas.push(delta);
                     linear_images.push(image);
                 }
                 None => continue,
@@ -821,7 +1102,61 @@ where
         return Ok(None);
     }
 
-    let selection = select_hybrid_split(&slots)?;
+    let mut selection = select_hybrid_split(&slots)?;
+
+    // #1026 item-2 — GLOBAL CROSS-TERM EV-preservation guard over the SELECTED
+    // collapses.
+    //
+    // The per-atom gate above bounds each atom's individual EV loss, but the TRUE
+    // dictionary-level RSS increase from collapsing a SET of atoms is
+    //   ΔRSS = Σ_k Δ_k + 2 Σ_{j<k} ⟨δ_j, δ_k⟩,
+    // so two effects escape any per-atom or summed-loss bound: (1) the accumulation
+    // of many individually-tolerable `Δ_k`, and (2) the CROSS TERMS between
+    // simultaneously-collapsed atoms. The old aggregate `Σ max(Δ_k, 0)` guard bounded
+    // (1) but was blind to (2): correlated collapse errors whose per-atom losses each
+    // sit under tolerance can still push the true global loss over it.
+    //
+    // Every slot now carries its exact dictionary-level reconstruction-change vector
+    // δ_k (globally row-aligned — the caller presents all per-atom arrays on the same
+    // n rows), so we reconstruct the full dictionary WITH the selected collapse set
+    // applied and measure the real global increase `ΔRSS` DIRECTLY (cross terms
+    // captured), reverting the least-justified collapses until the degradation is
+    // within the same EV tolerance and re-adjudicating so `selection` stays consistent.
+    if total_centered_variance.is_finite() && total_centered_variance > 0.0 {
+        if let Some(r0) = r0.as_ref() {
+            let global_tol = SAE_HYBRID_COLLAPSE_MAX_EV_LOSS * total_centered_variance;
+            // Partition the SELECTED-collapsed slots: rollback-eligible ones (a curved
+            // alternative still present and a finite per-atom loss) vs forced ones
+            // (euclidean / collapse-rescue — no curved fallback, stay collapsed but
+            // still enter the global reconstruction so their cross terms are counted).
+            let mut eligible: Vec<(usize, f64, &Array2<f64>)> = Vec::new();
+            let mut forced: Vec<&Array2<f64>> = Vec::new();
+            for (i, choice) in selection.atoms.iter().enumerate() {
+                if !choice.param.is_linear() {
+                    continue;
+                }
+                let has_curved_alt = slots[i].iter().any(|c| !c.param.is_linear());
+                let loss_finite = collapse_loss[i].map(|l| l.is_finite()).unwrap_or(false);
+                if has_curved_alt && loss_finite {
+                    eligible.push((i, choice.curved_evidence_margin, &deltas[i]));
+                } else {
+                    forced.push(&deltas[i]);
+                }
+            }
+            let reverted = global_collapse_rollback(r0.view(), &eligible, &forced, global_tol);
+            if !reverted.is_empty() {
+                for slot in reverted {
+                    if let Some(curved) =
+                        slots[slot].iter().find(|c| !c.param.is_linear()).copied()
+                    {
+                        slots[slot] = vec![curved];
+                    }
+                }
+                selection = select_hybrid_split(&slots)?;
+            }
+        }
+    }
+
     let verdicts: Vec<AtomHybridVerdict> = names
         .into_iter()
         .zip(selection.atoms.iter().copied())
@@ -1126,6 +1461,134 @@ mod tests {
             (got_dup - want_dup).abs() < 1e-9,
             "rank-deficient curved Gram must report only its positive direction \
              (p·log(2·w_sum) = {want_dup}), got {got_dup}"
+        );
+    }
+
+    /// #1051 NESTED MIN — the curved arm re-fit on the residual match-or-beats the
+    /// best straight line: `curved_refit_rss ≤ best_line_rss` up to solver tolerance
+    /// on a basis whose span contains the straight lane (here `Φ = [1, t, t²]`). A
+    /// genuinely curved (quadratic) signal is STRICTLY preferred by the curved arm,
+    /// while an exactly-straight signal ties near zero (so the cheaper linear lane
+    /// wins downstream). This is the property the realized-curve heuristic could not
+    /// establish: comparing a possibly-collapsed realized curve against min-over-lines
+    /// did NOT guarantee `curved ≤ linear`; re-fitting the curved decoder does.
+    #[test]
+    fn refit_curved_rss_matches_or_beats_best_line_nested() {
+        let n = 40usize;
+        let p = 2usize;
+        let coords =
+            Array1::from_iter((0..n).map(|i| -1.0 + 2.0 * (i as f64) / ((n - 1) as f64)));
+        let assign = Array1::<f64>::ones(n);
+        // Φ = [1, t, t²]: its column span contains the straight lane [1, t], so the
+        // decoder-only curved refit is a proper superset of the line fit.
+        let mut phi = Array2::<f64>::zeros((n, 3));
+        for i in 0..n {
+            phi[[i, 0]] = 1.0;
+            phi[[i, 1]] = coords[i];
+            phi[[i, 2]] = coords[i] * coords[i];
+        }
+        // Best mass-weighted line RSS on `y` (assign = 1): fit design [1, (t − t̄)].
+        let t_bar = coords.iter().sum::<f64>() / n as f64;
+        let best_line_rss = |y: &Array2<f64>| -> f64 {
+            let mut design = Array2::<f64>::zeros((n, 2));
+            for i in 0..n {
+                design[[i, 0]] = 1.0;
+                design[[i, 1]] = coords[i] - t_bar;
+            }
+            let b = solve_design_least_squares(design.view(), y.view()).unwrap();
+            let pred = design.dot(&b);
+            let mut rss = 0.0_f64;
+            for i in 0..n {
+                for j in 0..p {
+                    let r = y[[i, j]] - pred[[i, j]];
+                    rss += r * r;
+                }
+            }
+            rss
+        };
+        // (a) exactly straight, (b) quadratic curve, (c) noisy line.
+        let mut y_line = Array2::<f64>::zeros((n, p));
+        let mut y_curve = Array2::<f64>::zeros((n, p));
+        let mut y_noisy = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            let t = coords[i];
+            y_line[[i, 0]] = 0.4 + 0.6 * t;
+            y_line[[i, 1]] = -0.2 + 1.1 * t;
+            y_curve[[i, 0]] = t * t;
+            y_curve[[i, 1]] = 0.5 - t * t;
+            y_noisy[[i, 0]] = 0.3 + 0.7 * t + 0.05 * (3.0 * t).sin();
+            y_noisy[[i, 1]] = 0.9 * t;
+        }
+        for y in [&y_line, &y_curve, &y_noisy] {
+            let curved = curved_refit_rss(phi.view(), assign.view(), y.view())
+                .expect("non-degenerate refit");
+            let line = best_line_rss(y);
+            assert!(
+                curved <= line + 1e-9 * (1.0 + line),
+                "nested dominance: refit-curved RSS {curved} must be ≤ best-line RSS {line}"
+            );
+        }
+        // A genuinely curved (quadratic) signal is STRICTLY preferred by the curve.
+        let curved_c = curved_refit_rss(phi.view(), assign.view(), y_curve.view()).unwrap();
+        let line_c = best_line_rss(&y_curve);
+        assert!(
+            curved_c < 0.5 * line_c,
+            "a quadratic signal must be far better fit by the curve ({curved_c}) than \
+             by the best line ({line_c})"
+        );
+        // A straight signal ties near zero — collapses to the cheaper linear lane.
+        let curved_l = curved_refit_rss(phi.view(), assign.view(), y_line.view()).unwrap();
+        assert!(
+            curved_l < 1e-18 && best_line_rss(&y_line) < 1e-18,
+            "an exactly-straight signal ties the two arms near zero (curved {curved_l})"
+        );
+    }
+
+    /// #1026 item-2 GLOBAL CROSS-TERM guard: two collapses with CORRELATED
+    /// (parallel) reconstruction-change errors whose per-atom losses each sit under
+    /// tolerance — and whose SUM `Σ Δ_k` is also under tolerance (so the OLD
+    /// aggregate `Σ max(Δ_k,0)` guard would ACCEPT) — but whose cross term
+    /// `2⟨δ_1,δ_2⟩` pushes the TRUE global loss over tolerance. The global guard must
+    /// roll back the least-justified collapse. An ORTHOGONAL control (disjoint
+    /// support) with the same per-atom losses is accepted, isolating the cross term.
+    #[test]
+    fn global_guard_rejects_correlated_collapses_the_aggregate_would_accept() {
+        let n = 4usize;
+        let p = 1usize;
+        // R0 = 0 ⇒ Δ_k = ‖δ_k‖² and ΔRSS(S) = ‖Σ_S δ_k‖² exactly.
+        let r0 = Array2::<f64>::zeros((n, p));
+        // Parallel δ_1 = δ_2 = 1 on all rows: ‖δ_k‖² = 4 each, Σ Δ_k = 8,
+        // ΔRSS_global = ‖δ_1+δ_2‖² = 16.
+        let mut d1 = Array2::<f64>::zeros((n, p));
+        let mut d2 = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            d1[[i, 0]] = 1.0;
+            d2[[i, 0]] = 1.0;
+        }
+        // tol = 10: each per-atom loss 4 ≤ 10, Σ Δ_k = 8 ≤ 10 (aggregate accepts),
+        // but global 16 > 10 (cross term rejects).
+        let global_tol = 10.0_f64;
+        let eligible = vec![(0usize, 0.1_f64, &d1), (1usize, 0.2_f64, &d2)];
+        let forced: Vec<&Array2<f64>> = Vec::new();
+        let reverted = global_collapse_rollback(r0.view(), &eligible, &forced, global_tol);
+        assert_eq!(
+            reverted,
+            vec![1usize],
+            "the global cross-term guard must roll back the least-justified collapse \
+             (largest margin = slot 1) that the summed-loss aggregate (8 ≤ 10) accepts"
+        );
+
+        // ORTHOGONAL control: same per-atom losses (δ on disjoint rows) ⇒ cross term
+        // 0 ⇒ ΔRSS_global = 8 ≤ 10 ⇒ no rollback. Isolates the cross term as the cause.
+        let mut o1 = Array2::<f64>::zeros((n, p));
+        let mut o2 = Array2::<f64>::zeros((n, p));
+        o1[[0, 0]] = 2.0; // ‖o1‖² = 4
+        o2[[2, 0]] = 2.0; // ‖o2‖² = 4, disjoint support
+        let eligible_o = vec![(0usize, 0.1_f64, &o1), (1usize, 0.2_f64, &o2)];
+        let reverted_o = global_collapse_rollback(r0.view(), &eligible_o, &forced, global_tol);
+        assert!(
+            reverted_o.is_empty(),
+            "uncorrelated collapses (cross term 0, global loss 8 ≤ 10) must be accepted"
         );
     }
 

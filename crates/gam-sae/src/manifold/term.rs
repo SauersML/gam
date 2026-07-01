@@ -302,6 +302,14 @@ pub(crate) fn sae_separation_barrier_override() -> Option<f64> {
 /// The amplitude (keep-alive) barrier and its active-atom gate were removed
 /// (surplus features are allowed to die into a ridge-parked state), so this
 /// takes only the separation strength. Called from the gamfit Python FFI.
+///
+/// CONCURRENCY: this is a PROCESS-GLOBAL atomic, so it is NOT safe to use across
+/// concurrent in-process fits — a parallel candidate/rung/layer sweep that sets
+/// different strengths in different threads will leak the override between fits
+/// (last writer wins for all readers). It is intended for a single-fit-at-a-time
+/// CLI/notebook sweep where the process runs one configuration at a time. The
+/// proper fix is to migrate this to a per-fit configuration field threaded
+/// through the solver rather than a global; that refactor is out of scope here.
 pub fn set_sae_barrier_overrides(sep_strength: f64) {
     SAE_SEP_STRENGTH_OVERRIDE_BITS
         .store(sep_strength.to_bits(), std::sync::atomic::Ordering::Relaxed);

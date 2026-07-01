@@ -2502,6 +2502,13 @@ pub struct ArrowFactorCache {
     /// factorization path. REML evidence consumes this directly so the Laplace
     /// normalizer cannot miss the log-det even when later cache consumers only
     /// need solves/traces.
+    ///
+    /// On the matrix-free large-`k` SAE evidence path this is set from the
+    /// Stochastic Lanczos Quadrature reduced-Schur log-determinant (see
+    /// [`Self::undamped_arrow_log_det_with_schur`] and
+    /// [`crate::arrow_schur::slq_logdet`]) so no dense `k × k` Cholesky is ever
+    /// formed; `arrow_log_det_from_cache` reads THIS field first, before any
+    /// `schur_factor` diagonal fallback.
     pub joint_hessian_log_det: Option<f64>,
     /// BA mode used to create this cache.
     pub solver_mode: ArrowSolverMode,
@@ -3247,6 +3254,42 @@ impl ArrowFactorCache {
                 acc += 2.0 * d.ln();
             }
         }
+        let woodbury_correction = self.cross_row_woodbury_log_det();
+        if !woodbury_correction.is_finite() {
+            return None;
+        }
+        Some(acc + woodbury_correction)
+    }
+
+    /// Undamped joint log-determinant `log|H| = Σ_i log|H_tt^(i)| + log|S| +
+    /// log det(I_R + D·M)` using an EXTERNALLY-supplied reduced-Schur term
+    /// `schur_log_det = log|S|` instead of a dense `schur_factor` diagonal sum.
+    ///
+    /// This is the matrix-free large-`k` SAE evidence path: the reduced Schur is
+    /// never Cholesky-factored, so `schur_factor` is `None` and `log|S|` comes
+    /// from Stochastic Lanczos Quadrature ([`crate::arrow_schur::slq_logdet`]).
+    /// The per-row latent-block term and the cross-row IBP Woodbury correction
+    /// are computed exactly as in [`Self::compute_undamped_arrow_log_det`], with
+    /// the same ridge / positivity / finiteness guards, so a non-PD per-row
+    /// factor or a non-finite estimate yields `None` rather than a silent NaN.
+    pub fn undamped_arrow_log_det_with_schur(&self, schur_log_det: f64) -> Option<f64> {
+        if self.ridge_t != 0.0 || self.ridge_beta != 0.0 {
+            return None;
+        }
+        if !schur_log_det.is_finite() {
+            return None;
+        }
+        let mut acc = 0.0_f64;
+        for l in self.undamped_factors_iter() {
+            for i in 0..l.nrows() {
+                let d = l[[i, i]];
+                if d <= 0.0 || !d.is_finite() {
+                    return None;
+                }
+                acc += 2.0 * d.ln();
+            }
+        }
+        acc += schur_log_det;
         let woodbury_correction = self.cross_row_woodbury_log_det();
         if !woodbury_correction.is_finite() {
             return None;

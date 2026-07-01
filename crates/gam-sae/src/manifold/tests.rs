@@ -2619,13 +2619,23 @@ pub(crate) fn decoder_repulsion_strength_is_derived_and_scale_invariant_1610() {
         unit_term.separation_barrier_strength(),
         unit_term.decoder_repulsion_strength(),
     );
-    let rank = unit_term.nominal_reachable_rank().max(1);
+    let demand = unit_term.nominal_rank_demand();
+    let capacity = unit_term.linear_rank_capacity();
     assert_eq!(
         unit_term.separation_barrier_strength(),
-        (unit_term.k_atoms() as f64) / (rank as f64),
-        "μ_C must be the data-derived overcompleteness ratio K/reachable_rank \
-         (K={}, reachable_rank={rank}), not a frozen absolute constant",
-        unit_term.k_atoms(),
+        (demand as f64) / (capacity as f64),
+        "μ_C must be the data-derived overcompleteness ratio demand/capacity \
+         (Σ_k min(M_k,p)={demand}, min(n,p)={capacity}), not a frozen absolute constant",
+    );
+    // The intended semantics: unit strength at true completeness, growing with
+    // overcompleteness. Two periodic M=3 atoms (demand=6) in p=3 (capacity=3) are
+    // 2× overcomplete, so μ_C = 2 — NOT the mis-scaled 1/M = 1/3 the old
+    // K/Σmin(M_k,p) formula gave.
+    assert_eq!(
+        unit_term.separation_barrier_strength(),
+        2.0,
+        "two periodic M=3 atoms crammed into p=3 are 2× overcomplete ⇒ μ_C = 2 \
+         (demand {demand} / capacity {capacity}), not 1/3",
     );
 
     let value_unit = build_at_scale(1.0).decoder_repulsion_value(1.0);

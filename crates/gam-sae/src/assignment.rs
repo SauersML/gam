@@ -89,7 +89,15 @@ pub(crate) fn jumprelu_in_optimization_band(logit: f64, threshold: f64, temperat
 pub enum AssignmentMode {
     /// Row-wise simplex assignment with entropy sparsity.
     Softmax { temperature: f64, sparsity: f64 },
-    /// Deterministic concrete relaxation of a truncated IBP active set.
+    /// Deterministic concrete relaxation of a truncated IBP active set: each
+    /// atom's gate is the INDEPENDENT prior-shrunk activation
+    /// `σ(logit/temperature) · π_k`, with `π_k = (α/(α+1))^{k+1}` the
+    /// stick-breaking prior mean (see [`ibp_map_row`]). These are per-atom gates,
+    /// NOT mixture/simplex responsibilities: they are computed independently per
+    /// column and do NOT sum to 1 across atoms (there is no row normalization).
+    /// Each `a_k ∈ [0, π_k] ⊂ [0, 1)` is the relaxed "atom k is active in this
+    /// row" indicator of a truncated IBP, not a share of a unit reconstruction
+    /// budget.
     IBPMap {
         temperature: f64,
         alpha: f64,
@@ -97,12 +105,18 @@ pub enum AssignmentMode {
     },
     /// Hard-thresholded bounded gate: each atom is off (gate = 0) when its logit
     /// is at or below `threshold`, and on with a threshold-centered shifted
-    /// sigmoid `σ((logit − threshold) / temperature) ∈ [0.5, 1)` above it. This
-    /// is NOT literal JumpReLU `z·1[z>θ]` — the gate carries no magnitude; it is
-    /// a member of the gate family (softmax simplex / IBP sigmoid / this hard
-    /// gate) and stays bounded in [0, 1]. Reconstruction magnitude lives entirely
-    /// in the decoder curve `g_k(t) = φ(t)ᵀ B_k`. The discontinuity at `threshold`
-    /// (0 → 0.5) is the intended "jump".
+    /// sigmoid `σ((logit − threshold) / temperature) ∈ [0.5, 1)` above it.
+    ///
+    /// NAME CAVEAT: despite the `JumpReLU` token (kept for API/Python/test
+    /// stability), this is NOT the literature JumpReLU activation `z·1[z>θ]`,
+    /// which carries the thresholded MAGNITUDE `z`. This mode is a
+    /// thresholded-logistic GATE (a hard-sigmoid gate): it carries no magnitude at
+    /// all — its output is a bounded `[0, 1)` indicator. A name like
+    /// `threshold_gate` or `hard_sigmoid_gate` would describe it more accurately.
+    /// It is a member of the gate family (softmax simplex / IBP sigmoid / this
+    /// hard gate); reconstruction magnitude lives entirely in the decoder curve
+    /// `g_k(t) = φ(t)ᵀ B_k`. The discontinuity at `threshold` (0 → 0.5) is the
+    /// intended "jump".
     JumpReLU { temperature: f64, threshold: f64 },
 }
 
@@ -239,6 +253,16 @@ impl AssignmentMode {
 // #1026 — process-global IBP-α override (NaN sentinel = "unset → use the
 // AssignmentMode's compiled α"). Lets ONE wheel sweep the prior-flattening axis
 // from Python (`sae_set_ibp_alpha`) without recompiling the gam crate.
+//
+// CONCURRENCY WARNING: this is a PROCESS-GLOBAL atomic, not per-fit config. It is
+// read by `ibp_alpha_override` from every IBP assignment evaluation in the
+// process, so setting it affects ALL in-flight fits, not just the caller's. It is
+// therefore UNSAFE to use across concurrent / parallel in-process fits — one
+// fit's sweep value leaks into another's gates. It is safe only for serial,
+// whole-process sweeps (the single-wheel FFI sweep driver it exists for). This
+// should be migrated to per-fit configuration (threaded through `SaeManifoldRho`
+// / the AssignmentMode) before any concurrent multi-fit use; that refactor is
+// cross-cutting (FFI + term plumbing) and deliberately out of scope here.
 static IBP_ALPHA_OVERRIDE_BITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0x7ff8_0000_0000_0000);
 
@@ -253,6 +277,12 @@ pub(crate) fn ibp_alpha_override() -> Option<f64> {
 
 /// Set (or, with a non-finite/non-positive value, clear) the process-global
 /// IBP-α override. Called from the gamfit Python FFI sweep driver.
+///
+/// PROCESS-GLOBAL / NOT CONCURRENCY-SAFE: this mutates one process-wide atomic
+/// read by every IBP assignment in the process. Calling it while any other fit is
+/// running leaks the override into that fit's gates. Use only for serial,
+/// whole-process sweeps; do not use across concurrent in-process fits. See the
+/// `IBP_ALPHA_OVERRIDE_BITS` note on migrating this to per-fit config.
 pub fn set_ibp_alpha_override(alpha: f64) {
     IBP_ALPHA_OVERRIDE_BITS.store(alpha.to_bits(), std::sync::atomic::Ordering::Relaxed);
 }

@@ -6596,17 +6596,34 @@ fn sae_manifold_predict_oos<'py>(
     )
     .map_err(py_value_error)?;
     // #1228 — attach the trained dictionary's hybrid-collapsed straight images so
-    // this OOS term decodes verdict-linear `d = 1` slots by the SAME linear image
-    // the training reconstruction used. Both reconstruction paths below —
-    // `term.fitted()` (→ `try_fitted` → collapse=true) and the top-`k`
-    // `reconstruct_from_assignments(.., true)` — read the collapse policy from
-    // `hybrid_linear_image_map()`, which sources it from `oos_linear_images`.
+    // this OOS term decodes verdict-linear `d = 1` slots by the same `(t_bar, b0,
+    // b1)` linear image the training reconstruction used. Both reconstruction
+    // paths below — `term.fitted()` (→ `try_fitted` → collapse=true) and the
+    // top-`k` `reconstruct_from_assignments(.., true)` — read the collapse policy
+    // from `hybrid_linear_image_map()`, which sources it from `oos_linear_images`.
     // The parameter was previously accepted but never attached, so every held-out
     // reconstruction silently fell back to the all-curved decoder even when the
-    // trained dictionary had collapsed those slots — a train/test decode
-    // mismatch. `row_codes = None`: an ordinary OOS image evaluates at the atom's
-    // own realized coordinate; the per-row collapse-rescue codes are a train-only
-    // degenerate-circle path that does not transfer to held-out rows.
+    // trained dictionary had collapsed those slots — a train/test decode mismatch.
+    //
+    // CONTRACT — `row_codes = None` is the boundary where train and OOS diverge,
+    // and it is NOT "the same linear image" for collapse-rescued atoms. The
+    // collapse rescue (in gam-sae) builds FRESH per-train-row codes from a
+    // residual projection and stores them in `AtomLinearImage.row_codes`, so the
+    // TRAINING reconstruction of a rescued atom uses those residual-projection
+    // coordinates. The Python OOS serialization exports only `(atom_idx, t_bar,
+    // b0, b1)` — the projection direction `v` that generated the per-row codes is
+    // NOT serialized — so here `row_codes` is necessarily `None`. Consequence:
+    //   * collapse-rescue per-row codes are TRAIN-ONLY and DO NOT transfer to OOS;
+    //   * a held-out (OOS) row of a collapse-rescued atom is reconstructed at the
+    //     atom's OWN realized latent coordinate, which is a DIFFERENT (degraded)
+    //     reconstruction than the train-time residual-projection codes — NOT the
+    //     same model;
+    //   * therefore collapse-rescued atoms MUST NOT be counted toward held-out
+    //     (OOS) parity claims; OOS parity is only meaningful for atoms whose
+    //     train and OOS reconstruction coincide (non-rescued ordinary images).
+    // Serializing the projection direction `v` so OOS could rebuild matching
+    // per-row codes is a larger cross-language change and is deliberately out of
+    // scope here.
     if let Some(images) = hybrid_linear_images {
         let images: Vec<gam::terms::sae::hybrid_split::AtomLinearImage> = images
             .into_iter()

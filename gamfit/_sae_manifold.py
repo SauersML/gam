@@ -45,19 +45,123 @@ _PUBLIC_ASSIGNMENT_ALIASES: dict[str, str] = {
 }
 
 
-def _penalized_loss_score(payload: Mapping[str, Any]) -> float:
+def _penalized_loss_score(payload: Mapping[str, Any]) -> float | None:
     """Read the SAE fit's penalized-loss score honestly (#1231).
 
     The Rust FFI surfaces the negative penalized loss under
     ``penalized_loss_score`` (in-sample) / ``oos_penalized_loss`` (fixed-decoder OOS).
+    The closed-form Python shortcut payloads deliberately store ``None`` here (a
+    reconstruction R² lives under ``reconstruction_r2`` instead, since R² is not
+    the same quantity as the negative penalized loss), so ``None`` is a valid,
+    tolerated value and is propagated as-is.
     """
     for key in ("penalized_loss_score", "oos_penalized_loss"):
         if key in payload:
-            return float(payload[key])
+            value = payload[key]
+            return None if value is None else float(value)
     raise KeyError(
         "SAE fit payload is missing a penalized-loss score "
         "(penalized_loss_score / oos_penalized_loss)"
     )
+
+
+def _active_threshold_for_assignment(assignment: str, k_atoms: int) -> float:
+    """Per-assignment-kind 'active atom' threshold for the inclusive (>=) counter.
+
+    The Rust ``sae_manifold_assignment_summary`` (and
+    :meth:`ManifoldSAE.per_atom_active_set`) count an atom active when
+    ``assignment >= threshold`` (INCLUSIVE). To realize the documented
+    strictly-exclusive semantics we return the next representable value above
+    each conceptual cutoff so the boundary case is NOT counted:
+
+      * ``softmax``  -> active if its share strictly EXCEEDS the uniform mass
+        ``1/K``; return ``nextafter(1/K, +inf)`` so an exactly-uniform row counts
+        zero atoms (rather than all ``K``).
+      * ``jumprelu`` -> active if the hard gate is NONZERO (> 0); return a tiny
+        positive value so exact-zero gates are NOT counted.
+      * ``ibp_map``  -> active if it carries responsibility mass above a small
+        positive epsilon (``1e-8``), matching ``_closed_form_trust_diagnostics``
+        (the normalized ``assignments_z`` responsibilities sum to ~1 per row, so
+        a 0.5 bar would collapse ``avg_active_atoms`` once ``K>=2``; #1547).
+
+    This is the single policy shared by :meth:`ManifoldSAE.summary` and
+    :meth:`ManifoldSAE.per_atom_active_set` so they cannot drift.
+    """
+    canon = _canonical_assignment(assignment, "assignment")
+    if canon == "softmax":
+        return float(np.nextafter(1.0 / max(1, int(k_atoms)), np.inf))
+    if canon == "jumprelu":
+        return float(np.finfo(float).tiny)
+    # ibp_map
+    return 1.0e-8
+
+
+def _canonical_n_harmonics(
+    basis_kinds: list[str],
+    raw_n_harmonics: list[int],
+    decoder_widths: list[int],
+) -> list[int]:
+    """Repair stale/degenerate periodic ``n_harmonics`` at ingestion (#1132/N).
+
+    A periodic atom's basis width is ``M = 2H + 1`` with ``H >= 1``. A plan
+    value that collapsed to ``<= 0`` (a born/fissioned atom recovered with a
+    degenerate constant-only width) is floored to the harmonic count implied by
+    the trained decoder width, mirroring ``_functional_basis_params`` /
+    ``_periodic_shape_band``. Canonicalizing ``self._n_harmonics`` at ingestion
+    ensures OOS reconstruct and :meth:`ManifoldSAE.steer` use the recovered
+    value rather than the raw (possibly 0/stale) plan value. Non-periodic atoms
+    pass through unchanged.
+    """
+    out: list[int] = []
+    for bk, h, width in zip(basis_kinds, raw_n_harmonics, decoder_widths):
+        kind = str(bk).lower().replace("-", "_")
+        value = int(h)
+        if kind in {"periodic", "periodic_spline", "circle"} and value <= 0:
+            value = max(1, (int(width) - 1) // 2)
+        out.append(value)
+    return out
+
+
+def _periodic_axis_mask(basis_kind: str, d_k: int) -> np.ndarray:
+    """Boolean ``(d_k,)`` mask of which coordinate axes wrap (are periodic).
+
+    Periodic/circle atoms (``"periodic"``) and tori (``"torus"``) carry all
+    coordinate axes on a circle; cylinders wrap only axis 0 (the periodic axis,
+    axis 1 is an open line). Every other topology is non-periodic. Used by
+    :meth:`ManifoldSAE.coordinate_range` / :meth:`ManifoldSAE.typical_shape` so
+    the normalized-phase coordinates of periodic axes get wrap-aware summaries
+    instead of ordinary linear percentiles.
+    """
+    bk = str(basis_kind).lower().replace("-", "_")
+    mask = np.zeros(int(d_k), dtype=bool)
+    if bk in {"periodic", "periodic_spline", "circle", "torus"}:
+        mask[:] = True
+    elif bk == "cylinder" and int(d_k) >= 1:
+        mask[0] = True
+    return mask
+
+
+def _circular_unwrap_origin(values: np.ndarray, period: float = 1.0) -> float:
+    """Cut point that 'unwraps' phase data with minimal distortion.
+
+    Returns the midpoint of the LARGEST empty gap between sorted phases (the
+    natural low-density seam on the circle). Shifting the data by this origin,
+    ``(v - origin) % period``, places a wrap-straddling cluster (e.g. phases at
+    0.98 and 0.02) into one contiguous block so ordinary order statistics
+    (min/max/percentiles) become wrap-aware. ``0.0`` for <=1 points.
+    """
+    v = np.sort(np.asarray(values, dtype=float).reshape(-1) % period)
+    if v.size <= 1:
+        return 0.0
+    gaps = np.diff(v)
+    wrap_gap = (v[0] + period) - v[-1]
+    all_gaps = np.concatenate([gaps, [wrap_gap]])
+    gi = int(np.argmax(all_gaps))
+    if gi == v.size - 1:
+        origin = (v[-1] + (v[0] + period)) / 2.0
+    else:
+        origin = (v[gi] + v[gi + 1]) / 2.0
+    return float(origin % period)
 
 
 def _e_benjamini_hochberg(log_e_values: list[float], alpha: float) -> list[int]:
@@ -446,7 +550,12 @@ def _fit_disjoint_periodic_top1(
         "assignments_z": assignments,
         "logits": logits,
         "fitted": fitted,
-        "penalized_loss_score": float(rust_module().sae_manifold_reconstruction_r2(x, fitted)),
+        # This closed-form shortcut does NOT minimize the penalized objective, so
+        # it has no honest negative-penalized-loss score (that field is the Rust
+        # path's contract). Store the reconstruction R² under its own key and
+        # leave penalized_loss_score None (#1231 honesty).
+        "reconstruction_r2": float(rust_module().sae_manifold_reconstruction_r2(x, fitted)),
+        "penalized_loss_score": None,
         "chosen_k": 2,
         "atom_plans": [
             {
@@ -635,7 +744,10 @@ def _fit_dense_periodic_ibp_lsq(
         "assignments_z": assignments,
         "logits": logits,
         "fitted": fitted,
-        "penalized_loss_score": score,
+        # Reconstruction R² is not the negative penalized loss; keep it under its
+        # own key and leave penalized_loss_score None for this shortcut (#1231).
+        "reconstruction_r2": score,
+        "penalized_loss_score": None,
         "chosen_k": k_atoms,
         "atom_plans": [
             {
@@ -992,6 +1104,12 @@ def sae_ev_vs_k_frontier(
     ks = _frontier_k_values(k_values)
     sae_kwargs = {} if sae_fit_kwargs is None else dict(sae_fit_kwargs)
     linear_kwargs = {} if linear_fit_kwargs is None else dict(linear_fit_kwargs)
+    # The linear arm is the match-or-beat PCA ceiling; at K=1 the honest ceiling is
+    # the CENTERED principal component (the reconstruction EV denominator is
+    # centered). Default the centered-rank-one lane on so the K=1 baseline is a
+    # genuine ceiling on uncentered activations instead of a mean-absorbing
+    # second-moment fit. It is a no-op for K>1. Callers can override explicitly.
+    linear_kwargs.setdefault("center_rank_one", True)
 
     basis_by_k = {k: _frontier_basis_for_k(hybrid_atom_basis, k) for k in ks}
     d_atom_by_k = {k: _frontier_d_atom_for_k(d_atom, k) for k in ks}
@@ -1220,7 +1338,11 @@ class SaeManifoldAtomFit:
         periodic/circle coordinates are normalized phase coordinates, while
         euclidean/duchon coordinates are raw chart coordinates.
     evidence
-        Fit REML score copied from the full SAE result.
+        The MODEL-level penalized-loss score copied from the full SAE result
+        (the Rust ``penalized_loss_score``). This is NOT a REML / marginal-
+        likelihood score and is NOT atom-specific -- it is the same value for
+        every atom of a given fit. ``None`` for the closed-form shortcut
+        payloads, which do not compute a penalized-loss objective.
     active_dim
         Estimated active intrinsic coordinate dimension for this atom.
     decoder_covariance
@@ -1250,7 +1372,7 @@ class SaeManifoldAtomFit:
     decoder_coefficients: np.ndarray
     assignments: np.ndarray
     coords: np.ndarray
-    evidence: float
+    evidence: float | None
     active_dim: int
     # Posterior shape uncertainty. These fields are ``None`` only when the
     # source payload did not include uncertainty arrays. ``decoder_covariance``
@@ -1288,7 +1410,9 @@ class ManifoldSAE:
     per-atom ``(M_k, p)`` decoder matrices, and ``atoms`` as detailed
     :class:`SaeManifoldAtomFit` payloads. Metadata records the resolved
     ``assignment`` kind, per-atom topology/basis information, score fields
-    (``reml_score``, ``reconstruction_r2``, ``dispersion``), fit controls
+    (``penalized_loss_score`` -- a negative penalized-loss objective, NOT REML;
+    ``reml_score`` is retained as a deprecated read alias --,
+    ``reconstruction_r2``, ``dispersion``), fit controls
     (``alpha``, ``learnable_alpha``, ``tau``, ``top_k``,
     ``jumprelu_threshold``), and cached training data used for exact
     training-set predictions.
@@ -1310,7 +1434,10 @@ class ManifoldSAE:
     coords: list[np.ndarray]
     decoder_blocks: list[np.ndarray]
     basis_specs: list[str]
-    reml_score: float
+    # The Rust FFI's negative penalized-loss score (NOT REML / marginal
+    # likelihood; #1231). ``None`` for closed-form shortcut payloads that do not
+    # compute it. ``reml_score`` is a deprecated read alias (see the property).
+    penalized_loss_score: float | None
     reconstruction_r2: float
     training_mean: np.ndarray
     training_data: np.ndarray
@@ -1449,6 +1576,17 @@ class ManifoldSAE:
         always equals ``len(self.atoms)`` for a resolved fit.
         """
         return int(self.low_level.chosen_k)
+
+    @property
+    def reml_score(self) -> float | None:
+        """DEPRECATED read alias for :attr:`penalized_loss_score` (#1231).
+
+        The Rust FFI surfaces this value as ``penalized_loss_score`` and
+        documents that it is NOT a REML / marginal-likelihood ("evidence")
+        score but a negative penalized-loss objective. Retained as a read-only
+        alias so existing callers keep working.
+        """
+        return self.penalized_loss_score
 
     def __repr__(self) -> str:
         d_atom = int(self.coords[0].shape[1]) if self.coords else 0
@@ -1603,7 +1741,11 @@ class ManifoldSAE:
         kinds = [str(p["kind"]) for p in plans]
         dims = [int(p["latent_dim"]) for p in plans]
         sizes = [int(p["basis_size"]) for p in plans]
-        nharm = [int(p["n_harmonics"]) for p in plans]
+        nharm = _canonical_n_harmonics(
+            kinds,
+            [int(p["n_harmonics"]) for p in plans],
+            [int(a.decoder_coefficients.shape[0]) for a in atoms],
+        )
         centers: list[np.ndarray | None] = [
             None if p["duchon_centers"] is None else np.asarray(p["duchon_centers"], dtype=float)
             for p in plans
@@ -1631,7 +1773,7 @@ class ManifoldSAE:
             primitive_names=["rust_module.sae_manifold_fit_minimal", *penalties],
             fitted=fitted, assignments=assigns, coords=coords,
             decoder_blocks=[a.decoder_coefficients.copy() for a in atoms],
-            basis_specs=kinds, reml_score=score,
+            basis_specs=kinds, penalized_loss_score=score,
             reconstruction_r2=float(rust_module().sae_manifold_reconstruction_r2(x, fitted)),
             training_mean=x.mean(axis=0), training_data=x.copy(), low_level=low,
             low_level_logits=logits,
@@ -1737,9 +1879,11 @@ class ManifoldSAE:
             "e_value": float, "log_e": float, "steps": int, "confirmed": bool,
             "evidence_remaining_nats": float}, ...]}``.
             ``evidence_remaining_nats`` is the anytime-valid budget ``max(0,
-            ln(1/α) − log_e)`` — the additional log-evidence a probe must
-            accumulate before the claim crosses the confirmation threshold (0
-            once already confirmed).
+            ln(m / (alpha*k)) - log_e)`` measured against the SAME rank-aware
+            e-BH threshold the confirmation rule uses (``e_(k) >= m/(alpha*k)``
+            at the claim's descending-log_e rank ``k`` out of ``m`` claims) —
+            the additional log-evidence a probe must accumulate before the claim
+            crosses the confirmation threshold (0 once already confirmed).
         """
         import json
         import math
@@ -1757,10 +1901,20 @@ class ManifoldSAE:
             raise ValueError(f"alpha must lie in (0, 1); got {level}")
         log_e = [float(e["log_e"]) for e in entries]
         confirmed_idx = set(_e_benjamini_hochberg(log_e, level))
-        threshold = math.log(1.0 / level)
+        # Measure the remaining budget against the SAME rank/multiplicity-aware
+        # e-BH threshold the local confirmation helper uses (#984/H): a claim at
+        # descending-log_e rank k (1-based) out of m clears the rule when
+        # log_e >= ln(m) - ln(alpha) - ln(k) == ln(m / (alpha*k)). The previous
+        # ln(1/alpha) threshold dropped the ln(m) - ln(k) term and so understated
+        # the evidence a contested claim still needs.
+        m = len(entries)
+        order = sorted(range(m), key=lambda j: log_e[j], reverse=True)
+        rank_of = {idx: rank0 + 1 for rank0, idx in enumerate(order)}
         claims: list[dict[str, Any]] = []
         for i, entry in enumerate(entries):
             le = float(entry["log_e"])
+            k_rank = rank_of[i]
+            threshold = math.log(m) - math.log(level) - math.log(k_rank)
             claims.append(
                 {
                     "claim_index": i,
@@ -2121,6 +2275,15 @@ class ManifoldSAE:
         from the atom's recovered training coordinates ``coords``. Coordinates
         are in the atom's raw latent-coordinate units. ``quantile_levels`` is
         ``[0.05, 0.50, 0.95]`` and ``quantiles`` has shape ``(3, d_k)``.
+
+        For periodic/circle axes (normalized phase coordinates) the summaries
+        are WRAP-AWARE: order statistics are computed in a rotated frame whose
+        origin sits at the lowest-density seam, then mapped back into the phase
+        range, so a cluster straddling the wrap (e.g. 0.98 / 0.02) yields a
+        tight covering arc instead of a spurious near-full-range interval. The
+        returned ``min``/``p05``/``p50``/``p95``/``max`` of a periodic axis are
+        the covering-arc endpoints and may wrap (``min`` > ``max``). Non-periodic
+        axes keep ordinary linear percentiles.
         """
         k = self._atom_index(atom)
         coords = np.asarray(self.atoms[k].coords, dtype=float)
@@ -2128,12 +2291,37 @@ class ManifoldSAE:
             raise ValueError(
                 f"atom={atom} coords must be a 2D array; got shape {coords.shape}"
             )
-        quantiles = np.percentile(coords, [5.0, 50.0, 95.0], axis=0)
-        p05, p50, p95 = quantiles
+        periodic = _periodic_axis_mask(
+            self._basis_kinds[k] if k < len(self._basis_kinds) else "",
+            coords.shape[1],
+        )
+        d = coords.shape[1]
+        mn = np.empty(d, dtype=float)
+        mx = np.empty(d, dtype=float)
+        p05 = np.empty(d, dtype=float)
+        p50 = np.empty(d, dtype=float)
+        p95 = np.empty(d, dtype=float)
+        for axis in range(d):
+            col = coords[:, axis]
+            if periodic[axis]:
+                origin = _circular_unwrap_origin(col, 1.0)
+                shifted = (col - origin) % 1.0
+                q05, q50, q95 = np.percentile(shifted, [5.0, 50.0, 95.0])
+                p05[axis] = (q05 + origin) % 1.0
+                p50[axis] = (q50 + origin) % 1.0
+                p95[axis] = (q95 + origin) % 1.0
+                mn[axis] = (float(shifted.min()) + origin) % 1.0
+                mx[axis] = (float(shifted.max()) + origin) % 1.0
+            else:
+                q05, q50, q95 = np.percentile(col, [5.0, 50.0, 95.0])
+                p05[axis], p50[axis], p95[axis] = q05, q50, q95
+                mn[axis] = float(col.min())
+                mx[axis] = float(col.max())
+        quantiles = np.vstack([p05, p50, p95])
         return {
             "n": int(coords.shape[0]),
-            "min": np.min(coords, axis=0),
-            "max": np.max(coords, axis=0),
+            "min": mn.copy(),
+            "max": mx.copy(),
             "p05": p05.copy(),
             "p50": p50.copy(),
             "median": p50.copy(),
@@ -2173,7 +2361,6 @@ class ManifoldSAE:
             raise ValueError(
                 f"atom={atom} coords must be a 2D array; got shape {fit_coords.shape}"
             )
-        coord_low, coord_high = np.percentile(fit_coords, [q_low, q_high], axis=0)
         band = self.shape_uncertainty(atom=k, n_sd=n_sd)
         grid = np.asarray(band["coords"], dtype=float)
         if grid.ndim != 2 or grid.shape[1] != fit_coords.shape[1]:
@@ -2181,7 +2368,28 @@ class ManifoldSAE:
                 "shape uncertainty coordinate grid is incompatible with recovered "
                 f"coords: grid shape {grid.shape}, coords shape {fit_coords.shape}"
             )
-        mask = np.all((grid >= coord_low) & (grid <= coord_high), axis=1)
+        # Wrap-aware typical-box membership: for periodic/circle phase axes the
+        # quantile box is computed in a rotated frame (origin at the low-density
+        # seam) so a cluster straddling the wrap defines a tight covering arc;
+        # the grid is rotated by the same per-axis origin before the in-box test.
+        # Non-periodic axes use ordinary linear percentile membership.
+        periodic = _periodic_axis_mask(
+            self._basis_kinds[k] if k < len(self._basis_kinds) else "",
+            fit_coords.shape[1],
+        )
+        mask = np.ones(grid.shape[0], dtype=bool)
+        for axis in range(fit_coords.shape[1]):
+            col = fit_coords[:, axis]
+            gcol = grid[:, axis]
+            if periodic[axis]:
+                origin = _circular_unwrap_origin(col, 1.0)
+                col_s = (col - origin) % 1.0
+                g_s = (gcol - origin) % 1.0
+                lo, hi = np.percentile(col_s, [q_low, q_high])
+                mask &= (g_s >= lo) & (g_s <= hi)
+            else:
+                lo, hi = np.percentile(col, [q_low, q_high])
+                mask &= (gcol >= lo) & (gcol <= hi)
         if not np.any(mask):
             raise ValueError(
                 "shape uncertainty grid has no points inside the requested "
@@ -2496,7 +2704,10 @@ class ManifoldSAE:
         the fit installed an output-Fisher metric (``fisher_factors`` was supplied
         to :func:`sae_manifold_fit` and retained on this model); otherwise the
         geometry (``delta`` / ``off_manifold_norm``) is still returned but the dose
-        degrades to ``None`` — not zero.
+        degrades to ``None`` — not zero. A model recovered via
+        :meth:`from_dict` / :meth:`load` does NOT carry the Fisher arrays
+        (``save`` / ``to_dict`` omit them), so a loaded model always steers
+        geometry-only with ``predicted_nats`` / ``validity_radius`` ``None``.
         """
         k = self._atom_index(atom_k)
         t_from_arr = np.ascontiguousarray(np.asarray(t_from, dtype=np.float64).reshape(-1))
@@ -2539,9 +2750,21 @@ class ManifoldSAE:
 
         On training ``X`` (matched bit-exactly) the cached fit assignments are
         thresholded without re-solving; otherwise the frozen-decoder OOS solve
-        is run on ``X`` and its converged assignments are thresholded."""
+        is run on ``X`` and its converged assignments are thresholded.
+
+        With ``threshold=None`` the per-assignment-kind default policy from
+        :func:`_active_threshold_for_assignment` is used -- the SAME policy
+        :meth:`summary` applies (softmax: just above uniform mass ``1/K``;
+        jumprelu: a tiny positive value so exact-zero gates are inactive;
+        ibp_map: ``1e-8`` responsibility mass). The old flat ``0.5`` default was
+        wrong for every kind (responsibilities sum to ~1 per row, so it
+        collapsed the IBP/jumprelu mask once ``K>=2``)."""
         x = _as_2d_float(X, "X")
-        cut = 0.5 if threshold is None else float(threshold)
+        cut = (
+            _active_threshold_for_assignment(self.assignment, len(self.atoms))
+            if threshold is None
+            else float(threshold)
+        )
         if self._is_training_data(x):
             return self.assignments >= cut
         payload = self._oos_payload(x)
@@ -2576,32 +2799,30 @@ class ManifoldSAE:
         return [c.copy() for c in self.coords]
 
     def summary(self) -> dict[str, Any]:
-        # `self.assignment` is the canonical kind. Active-atom detection is
-        # mode-specific:
-        #   softmax   -> active if its share exceeds the uniform mass 1/K;
-        #   ibp_map   -> active if it carries any responsibility mass (> 1e-8);
-        #   jumprelu  -> active if the (hard) gate is nonzero (> 0).
-        kind = _canonical_assignment(self.assignment, "assignment")
-        if kind == "softmax":
-            threshold = 1.0 / max(1, len(self.atoms))
-        elif kind == "jumprelu":
-            threshold = 0.0
-        else:  # ibp_map
-            # #1547: ``self.assignments`` holds the normalized reconstruction
-            # responsibilities (``assignments_z``), which sum to ~1 across the K
-            # atoms per row -- NOT posterior gates. The per-row max therefore
-            # cannot reach a 0.5 gate bar once K>=2, so a 0.5 threshold collapses
-            # avg_active_atoms to ~0. "Active" for a responsibility array means
-            # mass above a small epsilon, matching ``_closed_form_trust_diagnostics``
-            # (``assignments[:, k] > 1e-8``).
-            threshold = 1.0e-8
+        # Active-atom detection is mode-specific. The Rust counter is INCLUSIVE
+        # (active iff assignment >= threshold), so the threshold is the next
+        # representable value above each conceptual cutoff (see
+        # _active_threshold_for_assignment, the single shared policy):
+        #   softmax   -> active if its share EXCEEDS the uniform mass 1/K
+        #                (an exactly-uniform row must count zero, not all K);
+        #   ibp_map   -> active if it carries responsibility mass (> 1e-8);
+        #   jumprelu  -> active if the (hard) gate is NONZERO (> 0)
+        #                (an exact-zero gate must NOT count as active).
+        threshold = _active_threshold_for_assignment(self.assignment, len(self.atoms))
         avg_active, mean_mass = rust_module().sae_manifold_assignment_summary(self.assignments, threshold)
+        # #1231: the primary key is the honest ``penalized_loss_score`` (a
+        # negative penalized-loss objective, NOT REML / evidence). ``reml_score``
+        # is kept as a deprecated alias key. ``None`` for closed-form shortcuts.
+        score = (
+            None if self.penalized_loss_score is None else float(self.penalized_loss_score)
+        )
         return {
             "K": len(self.atoms),
             "d_atom": int(self.coords[0].shape[1]) if self.coords else 0,
             "atom_topology": self.atom_topology, "assignment": self.assignment,
             "alpha": float(self.alpha), "learnable_alpha": bool(self.learnable_alpha),
-            "reml_score": float(self.reml_score), "reconstruction_r2": float(self.reconstruction_r2),
+            "penalized_loss_score": score, "reml_score": score,
+            "reconstruction_r2": float(self.reconstruction_r2),
             "dispersion": float(self.dispersion),
             "atom_trust": np.asarray(self.diagnostics["atom_trust"], dtype=float).tolist(),
             "untyped_atoms": [
@@ -2620,6 +2841,15 @@ class ManifoldSAE:
         The dict can be passed to :meth:`ManifoldSAE.from_dict` (or written to
         disk via :meth:`save` / :func:`gamfit.save`) to recover an object that
         reproduces :meth:`predict` outputs bit-exactly on training data.
+
+        NOT round-tripped: the large Fisher steering arrays (``fisher_factors``,
+        ``fisher_provenance``, ``metric_provenance``, ``fisher_mass_residual``)
+        are deliberately omitted to keep the serialization small. A model
+        recovered from this dict has ``fisher_factors=None``, so :meth:`steer`
+        falls back to geometry-only steering (``delta`` / ``off_manifold_norm``
+        are returned, but ``predicted_nats`` / ``validity_radius`` degrade to
+        ``None``). The posterior shape-band uncertainty arrays are likewise only
+        on a freshly-fit model.
         """
         def _optional_list(value: np.ndarray | None) -> Any:
             return None if value is None else value.tolist()
@@ -2658,7 +2888,15 @@ class ManifoldSAE:
             "solver_plan": None if self.solver_plan is None else _jsonable(self.solver_plan),
             "primitive_names": list(self.primitive_names),
             "basis_specs": list(self.basis_specs),
-            "reml_score": float(self.reml_score),
+            # #1231: primary key is the honest penalized-loss score; "reml_score"
+            # is a deprecated alias retained for old loaders. ``None`` for
+            # closed-form shortcut payloads that do not compute it.
+            "penalized_loss_score": (
+                None if self.penalized_loss_score is None else float(self.penalized_loss_score)
+            ),
+            "reml_score": (
+                None if self.penalized_loss_score is None else float(self.penalized_loss_score)
+            ),
             "reconstruction_r2": float(self.reconstruction_r2),
             "training_mean": self.training_mean.tolist(),
             "training_data": self.training_data.tolist(),
@@ -2677,7 +2915,7 @@ class ManifoldSAE:
                     "decoder_coefficients": a.decoder_coefficients.tolist(),
                     "assignments": a.assignments.tolist(),
                     "coords": a.coords.tolist(),
-                    "evidence": float(a.evidence),
+                    "evidence": None if a.evidence is None else float(a.evidence),
                     "active_dim": int(a.active_dim),
                     "decoder_covariance": _optional_list(a.decoder_covariance),
                     "shape_band_coords": _optional_list(a.shape_band_coords),
@@ -2714,11 +2952,24 @@ class ManifoldSAE:
         }
 
     def save(self, path: str | Path) -> None:
-        """Write this fit to ``path`` as JSON. Round-trips via :func:`gamfit.load`."""
+        """Write this fit to ``path`` as JSON. Round-trips via :func:`gamfit.load`.
+
+        Fisher steering dosimetry is not persisted; see :meth:`to_dict` for the
+        round-trip downgrade (a loaded model steers geometry-only).
+        """
         Path(path).write_text(json.dumps(self.to_dict()))
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "ManifoldSAE":
+        """Reconstruct a :class:`ManifoldSAE` from a :meth:`to_dict` payload.
+
+        The recovered model reproduces :meth:`predict` on training data
+        bit-exactly. Fisher steering state (``fisher_factors`` /
+        ``fisher_provenance`` / ``metric_provenance`` / ``fisher_mass_residual``)
+        is NOT round-tripped (to_dict omits the large arrays), so the loaded
+        model has ``fisher_factors=None`` and :meth:`steer` degrades to
+        geometry-only (``predicted_nats`` / ``validity_radius`` are ``None``).
+        """
         schema = str(payload["schema"])
         if schema != "gamfit.ManifoldSAE/v1":
             raise ValueError(f"ManifoldSAE.from_dict: unsupported schema {schema!r}")
@@ -2732,7 +2983,7 @@ class ManifoldSAE:
                 decoder_coefficients=np.asarray(a["decoder_coefficients"], dtype=float),
                 assignments=np.asarray(a["assignments"], dtype=float),
                 coords=np.asarray(a["coords"], dtype=float),
-                evidence=float(a["evidence"]),
+                evidence=None if a.get("evidence") is None else float(a["evidence"]),
                 active_dim=int(a["active_dim"]),
                 decoder_covariance=_optional_array(a, "decoder_covariance"),
                 shape_band_coords=_optional_array(a, "shape_band_coords"),
@@ -2752,7 +3003,11 @@ class ManifoldSAE:
         diagnostics = coerce_sae_trust_diagnostics(payload)
         coords = [np.asarray(c, dtype=float) for c in payload["coords"]]
         decoder_blocks = [np.asarray(b, dtype=float) for b in payload["decoder_blocks"]]
-        score = float(payload["reml_score"])
+        # #1231: accept the new primary key, fall back to the deprecated
+        # "reml_score" alias for dicts written by older versions. ``None`` is a
+        # valid value (closed-form shortcut payloads).
+        raw_score = payload.get("penalized_loss_score", payload.get("reml_score"))
+        score = None if raw_score is None else float(raw_score)
         chosen_k = len(atoms)
         low = SaeManifoldFitResult(
             atoms, chosen_k, {chosen_k: score}, {"winner": f"K={chosen_k}"}, fitted, assigns, coords, score,
@@ -2774,7 +3029,7 @@ class ManifoldSAE:
             coords=coords,
             decoder_blocks=decoder_blocks,
             basis_specs=list(payload["basis_specs"]),
-            reml_score=score,
+            penalized_loss_score=score,
             reconstruction_r2=float(payload["reconstruction_r2"]),
             training_mean=np.asarray(payload["training_mean"], dtype=float),
             training_data=np.asarray(payload["training_data"], dtype=float),
@@ -2784,7 +3039,14 @@ class ManifoldSAE:
             _basis_kinds=list(payload["basis_kinds"]),
             _atom_dims=[int(d) for d in payload["atom_dims"]],
             _basis_sizes=[int(s) for s in payload["basis_sizes"]],
-            _n_harmonics=[int(h) for h in payload["n_harmonics"]],
+            # N: canonicalize stale/degenerate periodic n_harmonics on load too,
+            # so a round-tripped model's OOS reconstruct + steer use the recovered
+            # value rather than a raw 0/stale plan value.
+            _n_harmonics=_canonical_n_harmonics(
+                list(payload["basis_kinds"]),
+                [int(h) for h in payload["n_harmonics"]],
+                [int(b.shape[0]) for b in decoder_blocks],
+            ),
             _duchon_centers=centers,
             alpha=float(payload["alpha"]),
             learnable_alpha=bool(payload["learnable_alpha"]),
@@ -2826,6 +3088,13 @@ class ManifoldSAE:
                 else dict(payload["curvature_report"])
             ),
             atom_inference_reports=_coerce_atom_inference(payload.get("atom_inference")),
+            # F: round-trip the unified certificate ledger. to_dict() writes it,
+            # so from_dict() must restore it (previously dropped on load).
+            certificates=(
+                None
+                if payload.get("certificates") is None
+                else dict(payload["certificates"])
+            ),
             structure_certificate_json=(
                 None
                 if payload.get("structure_certificate") is None
@@ -2842,6 +3111,12 @@ class ManifoldSAE:
 
     @classmethod
     def load(cls, path: str | Path) -> "ManifoldSAE":
+        """Load a fit written by :meth:`save`.
+
+        Fisher steering dosimetry is not restored (see :meth:`from_dict`); a
+        loaded model has ``fisher_factors=None`` and :meth:`steer` degrades to
+        geometry-only.
+        """
         return cls.from_dict(json.loads(Path(path).read_text()))
 
 
@@ -2931,12 +3206,12 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         of stalling at the proximal-ridge saturation. Set ``0.0`` to disable.
         Issue #673 (resolved): the decoder smoothness
         penalty is reparameterized by the pulled-back metric ``g = JᵀJ`` in the
-        Rust core, so the roughness — and the ``reml_score`` topology evidence —
-        is gauge-invariant under reparameterization of the latent coordinate
-        ``t`` even with the isometry penalty off. ``IsometryPenalty`` is purely
-        a complementary regularizer when enabled (it drives ``g → I`` for an
-        interpretable, near-arc-length chart); it is not a precondition for
-        comparing ``reml_score`` across topologies.
+        Rust core, so the roughness — and the ``penalized_loss_score`` topology
+        comparison — is gauge-invariant under reparameterization of the latent
+        coordinate ``t`` even with the isometry penalty off. ``IsometryPenalty``
+        is purely a complementary regularizer when enabled (it drives ``g → I``
+        for an interpretable, near-arc-length chart); it is not a precondition
+        for comparing ``penalized_loss_score`` across topologies.
     ard_per_atom
         If true, adds per-atom ARD row-block regularization on the latent
         coordinate block to select active intrinsic coordinates.
@@ -2991,9 +3266,14 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         ``||B_j @ B_k.T||_F^2`` for stored ``(M_k, p_out)`` decoder blocks on
         co-firing atom pairs.
     top_k
-        Optional final assignment support projection. ``None`` and ``0``
-        disable it; integers in ``[1, K]`` keep only the top-k assignment masses
-        per observation and recompute ``fitted`` from that projected support.
+        Optional per-token active-set cap. ``None`` and ``0`` disable it;
+        integers in ``[1, K]`` cap the number of atoms a token may activate. This
+        is a TRAIN-TIME cap folded into the optimization (the engine builds the
+        compact active×active solve over the capped support), not a cosmetic
+        post-fit filter. The engine additionally applies an automatic
+        memory-budget cap: when the dense ``K`` working set would exceed the
+        host/device budget the compact active-set layout engages even without an
+        explicit ``top_k``. ``fitted`` is computed from the (capped) support.
     t_init, a_init
         Warm starts for amortized encoder distillation (#357). ``a_init`` has
         shape ``(N, K)`` and seeds assignment logits. ``t_init`` has shape
@@ -3014,8 +3294,9 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         :func:`gamfit.torch.harvest.load_harvest_shard`, or a raw ``(n, p, r)``
         factor array. Its *presence* installs ``RowMetric::OutputFisher`` for the
         isometry gauge / lens — there is no flag (magic by default). The metric
-        does not whiten the reconstruction likelihood, so with the isometry gauge
-        off (the default) the data-fit is identical to the Euclidean fit; the
+        does not whiten the reconstruction likelihood, so the data-fit is
+        identical to the Euclidean fit regardless of the isometry gauge (which
+        defaults ON, ``isometry_weight=1.0``); the
         result's ``metric_provenance`` reports ``"OutputFisher"`` and the per-row
         ``fisher_mass_residual`` truncation diagnostic rides into the model.
         ``None`` (default) keeps the bit-identical Euclidean path.
@@ -3037,7 +3318,8 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         ``(N, K)``, ``coords`` as per-atom ``(N, d_k)`` arrays,
         ``decoder_blocks`` as per-atom ``(M_k, p)`` decoder matrices,
         ``basis_specs``, ``atom_topology``/``atom_topologies``, ``assignment``
-        and ``assignment_label``, ``reml_score``, ``reconstruction_r2``,
+        and ``assignment_label``, ``penalized_loss_score`` (``reml_score`` is a
+        deprecated read alias), ``reconstruction_r2``,
         ``dispersion``, ``training_mean``, ``training_data``,
         ``low_level_logits``, and fit-control metadata including ``alpha``,
         ``learnable_alpha``, ``tau``, ``sparsity_strength``, ``smoothness``,
@@ -3171,12 +3453,12 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     # decoder smoothness penalty is reparameterized by the decoder pullback
     # metric g = J^T J in the Rust core (arc-length roughness; see
     # `SaeManifoldAtom::refresh_intrinsic_smooth_penalty`), so the roughness —
-    # and therefore the REML Occam / joint-log-det terms that enter
-    # `reml_score` — is invariant under reparameterizing the latent coordinate
-    # t. Topology comparison (e.g. circle vs euclidean) is thus well posed
-    # regardless of `isometry_weight`. `IsometryPenalty` is purely a
+    # and therefore the Occam / joint-log-det terms that enter the
+    # `penalized_loss_score` — is invariant under reparameterizing the latent
+    # coordinate t. Topology comparison (e.g. circle vs euclidean) is thus well
+    # posed regardless of `isometry_weight`. `IsometryPenalty` is purely a
     # complementary regularizer that drives g -> I for an interpretable
-    # near-arc-length chart; turning it off does not make `reml_score`
+    # near-arc-length chart; turning it off does not make `penalized_loss_score`
     # gauge-dependent, so there is nothing to warn about.
     # NOTE(#795): isometry now defaults ON. The Rust penalty normalizes
     # g = J^T J by the mean trace per latent dimension (`gbar`) before comparing
@@ -3214,10 +3496,19 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     atom_topology_str = str(atom_topology) if topology_supplied else "circle"
     bases = _bases(k_atoms, atom_basis, atom_topology_str)
     resolved_topology = _topology_for_bases(bases)
-    if topology_supplied and atom_basis is not None and resolved_topology != atom_topology_str:
+    # O: compare CANONICAL forms on both sides. Comparing the resolved (already
+    # canonical) topology against the RAW user string falsely flagged valid
+    # documented alias pairs (e.g. atom_topology="periodic" + atom_basis=
+    # ["periodic"], where the basis side resolves to "circle").
+    if (
+        topology_supplied
+        and atom_basis is not None
+        and resolved_topology != _canonical_topology(atom_topology_str)
+    ):
         raise ValueError(
             f"sae_manifold_fit: atom_basis={atom_basis!r} resolves to topology "
-            f"{resolved_topology!r} but atom_topology={atom_topology_str!r} was also "
+            f"{resolved_topology!r} but atom_topology={atom_topology_str!r} "
+            f"(canonical {_canonical_topology(atom_topology_str)!r}) was also "
             f"supplied; they must describe the same topology."
         )
     kind = _resolve_public_assignment(assignment, assignment_prior)
@@ -3262,14 +3553,18 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         d_max=max(dims),
         p_out=int(x.shape[1]),
     )
-    # `None` disables top-k gating; anything in `[1, k_atoms]` is forwarded to
-    # the Rust driver, which
-    # projects the final assignments onto a per-row top-k support and
-    # recomputes `fitted` from the projected distribution. The Rust kernel
-    # owns the hard top-k contract end to end — there is no Python-side mask.
-    # Any value outside `[1, k_atoms]` is a caller error rather than a silent
-    # clamp/no-op.
-    if top_k is None:
+    # `None` disables the active-set cap; anything in `[1, k_atoms]` is forwarded
+    # to the Rust driver, which folds the cap into the OPTIMIZATION as a
+    # train-time per-token active-set cap (it builds the compact active×active
+    # solve over the capped support and computes `fitted` from it) — NOT a
+    # cosmetic post-fit projection. The driver also auto-caps the active set when
+    # the dense `K` working set would exceed the memory budget. The Rust kernel
+    # owns the cap contract end to end — there is no Python-side mask. Any value
+    # outside `[1, k_atoms]` is a caller error rather than a silent clamp/no-op.
+    # I: the docstring advertises that both ``None`` and ``0`` disable the
+    # active-set cap. Normalize ``0`` to ``None`` (disabled) BEFORE the
+    # ``[1, K]`` range check so ``top_k=0`` is accepted rather than rejected.
+    if top_k is None or int(top_k) == 0:
         top_k_arg = None
     else:
         top_k_int = int(top_k)
@@ -3311,7 +3606,39 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     # Euclidean response geometry and never reaches the FFI that installs
     # `RowMetric::OutputFisher`. When a WP-D shard is supplied the metric must
     # be honoured, so skip the shortcut and route through the joint FFI fit.
-    if logits_init is None and coords_init is None and fisher_shard is None:
+    #
+    # E: the closed-form shortcuts also solve a PLAIN reconstruction LSQ and do
+    # NOT honour the advanced objective knobs. Firing them under any non-identity
+    # knob would silently ignore that regularization (two differently-regularized
+    # calls returning identical models). Only take a shortcut when EVERY such
+    # component is at its no-op identity; otherwise fall through to the full Rust
+    # joint fit (conservative — when in doubt, use Rust). Guarded components:
+    #   - schedule (no Gumbel anneal)
+    #   - weights / row-loss weights (no sample reweighting)
+    #   - isometry_weight == 0 (no IsometryPenalty)
+    #   - block_orthogonality_weight == 0
+    #   - nuclear_norm_weight == 0 (no embedding-rank shrinkage)
+    #   - decoder_incoherence_weight == 0 (no cross-atom incoherence)
+    #   - decoder_feature_sparsity_groups is None (no decoder group-lasso)
+    #   - no SCAD/MCP coordinate penalty (gate_sparsity l1 OR sparsity == 0)
+    #   - ard_per_atom is False (no ARD intrinsic-dim pruning)
+    fast_path_eligible = (
+        schedule is None
+        and row_loss_weights_arr is None
+        and float(isometry_weight) == 0.0
+        and float(block_orthogonality_weight) == 0.0
+        and float(nuclear_norm_weight) == 0.0
+        and float(decoder_incoherence_weight) == 0.0
+        and decoder_feature_sparsity_groups is None
+        and not (gate_sparsity_kind in {"scad", "mcp"} and sparsity > 0.0)
+        and not ard_per_atom
+    )
+    if (
+        logits_init is None
+        and coords_init is None
+        and fisher_shard is None
+        and fast_path_eligible
+    ):
         separable_fit = _fit_disjoint_periodic_top1(
             x,
             bases=[str(b) for b in bases],
@@ -3675,32 +4002,78 @@ def _normalize_fisher_factors(
 
 
 def _dims(k_atoms: int, d_atom: Any) -> list[int]:
-    if d_atom in (None, "auto"):
+    if d_atom is None or d_atom == "auto":
         return [2] * k_atoms
     if isinstance(d_atom, int):
         return [int(d_atom)] * k_atoms
+    # J: a bare string would otherwise fall through to ``[int(d) for d in d_atom]``
+    # and silently iterate per character (``"12"`` -> ``[1, 2]``). Only the
+    # literal ``"auto"`` is meaningful; reject every other string explicitly.
+    if isinstance(d_atom, str):
+        raise ValueError(
+            f"d_atom string must be 'auto'; got {d_atom!r}. Pass an int or a "
+            "per-atom list of ints."
+        )
     out = [int(d) for d in d_atom]
     if len(out) != k_atoms or min(out, default=0) < 0:
         raise ValueError("d_atom must provide one non-negative dimension per atom")
     return out
 
 
+def _canon_name(name: Any) -> str:
+    """Case-insensitive, ``-``/``_``-interchangeable name normalizer (O).
+
+    String matching for topology / basis names is documented as
+    case-insensitive and treating ``-`` and ``_`` interchangeably.
+    """
+    return str(name).strip().lower().replace("-", "_")
+
+
+# Documented topology / basis ALIAS -> canonical basis kind. Mirrors the alias
+# set in docs/manifold-sae.md (and the names the Rust ``SaeAtomBasisKind``
+# accepts). Centralizing all aliases here keeps the resolution single-source.
 _TOPOLOGY_TO_BASIS = {
-    "circle": "periodic", "periodic": "periodic",
+    "circle": "periodic", "periodic": "periodic", "periodic_spline": "periodic",
     "sphere": "sphere", "torus": "torus",
     "linear": "linear", "linear_rank1": "linear", "affine": "linear",
-    "euclidean": "euclidean",
+    "euclidean": "euclidean", "euclidean_patch": "euclidean",
+    "euclidean_quadratic_patch": "euclidean",
+    "duchon": "duchon",
+    "poincare": "poincare", "hyperbolic": "poincare", "poincare_patch": "poincare",
+    "cylinder": "cylinder",
 }
+# Canonical / aliased basis kind -> canonical topology label.
 _BASIS_TO_TOPOLOGY = {
-    "periodic": "circle", "sphere": "sphere", "torus": "torus",
+    "periodic": "circle", "periodic_spline": "circle", "circle": "circle",
+    "sphere": "sphere", "torus": "torus",
     "linear": "linear", "linear_rank1": "linear", "affine": "linear",
     "duchon": "euclidean", "euclidean": "euclidean", "euclidean_patch": "euclidean",
+    "euclidean_quadratic_patch": "euclidean",
+    "poincare": "poincare", "hyperbolic": "poincare", "poincare_patch": "poincare",
+    "cylinder": "cylinder",
 }
+
+
+def _basis_to_topology(basis: str) -> str:
+    """Canonical topology label for a (possibly aliased) basis kind."""
+    return _BASIS_TO_TOPOLOGY.get(_canon_name(basis), str(basis))
+
+
+def _canonical_topology(name: str) -> str:
+    """Canonical topology label for a (possibly aliased) topology/basis string.
+
+    Resolves through the alias map to the basis kind, then to the canonical
+    topology, so e.g. ``"periodic"`` and ``"circle"`` both canonicalize to
+    ``"circle"``. Unknown (precomputed / caller-supplied) names pass through.
+    """
+    canon = _canon_name(name)
+    basis = _TOPOLOGY_TO_BASIS.get(canon, canon)
+    return _basis_to_topology(basis)
 
 
 def _bases(k_atoms: int, atom_basis: Any, atom_topology: str) -> list[str]:
     if atom_basis is None:
-        atom_basis = _TOPOLOGY_TO_BASIS.get(str(atom_topology), atom_topology)
+        atom_basis = _TOPOLOGY_TO_BASIS.get(_canon_name(atom_topology), atom_topology)
     raw = [atom_basis] * k_atoms if isinstance(atom_basis, str) else list(atom_basis)
     if len(raw) != k_atoms:
         raise ValueError("atom_basis must provide one basis per atom")
@@ -3709,7 +4082,7 @@ def _bases(k_atoms: int, atom_basis: Any, atom_topology: str) -> list[str]:
 
 def _topologies_for_bases(bases: list[str]) -> list[str]:
     """Per-atom topology labels for a resolved bases list (``basis_specs`` order)."""
-    return [_BASIS_TO_TOPOLOGY.get(b, b) for b in bases]
+    return [_basis_to_topology(b) for b in bases]
 
 
 def _topology_for_bases(bases: list[str]) -> str:

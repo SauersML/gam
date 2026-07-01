@@ -1,5 +1,6 @@
-//! Measured device-resident encode throughput for the SAE/LLM batched-solve
-//! shape (#1412, #988, #1017 Phase-3).
+//! Measured device-resident throughput of the SAE/LLM batched-solve COMPONENT —
+//! the resident penalized normal-equations inner solve, NOT the full exact SAE
+//! encode (see the SCOPE section below) (#1412, #988, #1017 Phase-3).
 //!
 //! ## Why this module exists
 //!
@@ -18,6 +19,22 @@
 //! penalized normal equations `(XᵀWX + ridge·I)β = rhs` with the `p×p` Gram and
 //! its Cholesky factor kept DEVICE-RESIDENT, downloading only the `p`-vector
 //! `β` — on the real device, and reports the measured design-rows/sec.
+//!
+//! ## SCOPE — this is a COMPONENT benchmark, not the full exact SAE encode
+//!
+//! What is timed here is the resident penalized normal-equations *inner solve*
+//! `(XᵀWX + ridge·I)β = rhs` ONLY. That is one component of the SAE encode, NOT
+//! the full exact per-row SAE encode, and the measured rate is therefore NOT
+//! evidence for a "batched exact per-row GPU encode" title claim. The full exact
+//! encode would additionally require, per row: active-set routing (which atoms
+//! are live), the per-row latent-coordinate Newton refinement on the manifold,
+//! the assignment/gate (softmax/IBP) solve, and the certificate/fallback +
+//! reconstruction-validation path. None of those are exercised or timed by this
+//! function. Establishing the end-to-end encode-throughput claim requires a
+//! separate benchmark that times the *production encode path itself* (routing +
+//! latent-coordinate Newton + assignment/gate solve + fallback/certificate), not
+//! this inner-solve cell. Treat the number below strictly as the resident
+//! normal-equations inner-solve throughput.
 //!
 //! ## Fail-loud, never false-route
 //!
@@ -254,3 +271,276 @@ pub fn cpu_oracle_normal_equations_solve(
 /// The deployment target, re-exported so callers measuring throughput do not
 /// have to import the policy module directly.
 pub const DEPLOYMENT_TARGET_ROWS_PER_SEC: f64 = GPU_THROUGHPUT_TARGET_ROWS_PER_SEC;
+
+// ===========================================================================
+// FULL exact per-row encode throughput + correctness (#1412 follow-up).
+//
+// The component benchmark above times ONLY the resident normal-equations inner
+// solve `(XᵀWX+ridge·I)β=rhs` and is explicit (see the SCOPE section) that this
+// is NOT the full exact per-row SAE encode. The pieces below are the reusable,
+// gam-sae-free instrument for benchmarking the *full* production encode path
+// end-to-end — active-set/chart routing + per-row latent-coordinate Newton +
+// gate/assignment (amplitude) + Kantorovich certificate/fallback +
+// reconstruction. They live here (CPU-linkable, no `gam-sae` dependency: this
+// crate is *below* `gam-sae`) so the timing harness and the correctness gate
+// are shared, while the driver that actually calls the production
+// `EncodeAtlas::certified_encode_batch` lives in
+// `crates/gam-gpu/tests/encode_full_path_throughput.rs` (a dev-dependency cycle
+// onto `gam-sae`, allowed by cargo for test-only edges).
+//
+// HONEST DEVICE STATUS. There is currently NO device-resident exact-encode
+// kernel: the production `certified_encode_*` path is per-row host ndarray work
+// (the only SAE GPU kernel, `gam_sae::gpu_kernels::sae_rowjet`, accelerates the
+// *fitting* reconstruction-jet tower, not the encode). So the
+// [`FullEncodeThroughput::device_encode_engaged`] flag is `false` even on a GPU
+// host until such a kernel exists. This benchmark therefore does NOT yet
+// substantiate a device "batched exact per-row GPU encode" number — by design,
+// it refuses to fabricate one (the same fail-loud, never-false-route discipline
+// as the component benchmark). What it DOES establish is the real end-to-end
+// encode throughput (CPU today) and a correctness contract — support agreement,
+// coordinate error, reconstruction explained-variance, and fallback rate
+// against the production CPU encode — that any future device encode must match.
+// ===========================================================================
+
+/// End-to-end throughput of the FULL exact per-row encode for one batch.
+///
+/// Distinct from [`ResidentSolveThroughput`] (which times only the inner solve):
+/// `rows_per_sec` here is `n_rows / encode_secs` for the *entire* production
+/// `certified_encode_batch` — routing, per-row Newton, certificate, fallback,
+/// and the per-row reconstruction selection included.
+#[derive(Clone, Copy, Debug)]
+pub struct FullEncodeThroughput {
+    /// Rows encoded in the timed batch.
+    pub n_rows: usize,
+    /// Wall-clock seconds for the full encode of the batch.
+    pub encode_secs: f64,
+    /// `n_rows / encode_secs` (`0.0` for a degenerate / non-positive time).
+    pub rows_per_sec: f64,
+    /// `true` ONLY if a device-resident exact-encode kernel actually ran the
+    /// encode. No such kernel exists yet, so this is `false` even on a GPU host
+    /// — the flag is the false-routing guard that keeps the CPU encode rate from
+    /// ever being reported as a device measurement.
+    pub device_encode_engaged: bool,
+}
+
+impl FullEncodeThroughput {
+    /// Build a throughput record from a measured elapsed time. `engaged` is the
+    /// caller's honest assertion that a device-resident encode kernel produced
+    /// the result; pass `false` for the host encode path.
+    #[must_use]
+    pub fn from_elapsed(n_rows: usize, elapsed: Duration, device_encode_engaged: bool) -> Self {
+        let encode_secs = elapsed.as_secs_f64();
+        let rows_per_sec = if n_rows > 0 && encode_secs > 0.0 {
+            n_rows as f64 / encode_secs
+        } else {
+            0.0
+        };
+        Self {
+            n_rows,
+            encode_secs,
+            rows_per_sec,
+            device_encode_engaged,
+        }
+    }
+}
+
+/// Correctness of an encode result, measured against the production CPU encode
+/// (a per-row reference) and the reconstruction it implies.
+///
+/// Every field is a quantity a "batched exact per-row encode" claim has to
+/// stand on: it must AGREE with the production per-row encode (support +
+/// coordinates), it must RECONSTRUCT the targets (explained variance), and it
+/// must be honest about how many rows it could not certify (fallback rate).
+#[derive(Clone, Copy, Debug)]
+pub struct EncodeQualityMetrics {
+    /// Rows compared.
+    pub n_rows: usize,
+    /// Rows the encode-under-test certified (`h ≤ ½`, exact-into-the-ball).
+    pub certified_rows: usize,
+    /// Fraction of rows the encode-under-test could NOT certify and flagged for
+    /// the multi-start fallback (`1 - certified_rows/n_rows`). This is the
+    /// "fallback rate".
+    pub fallback_rate: f64,
+    /// Fraction of rows whose certificate flag AGREES with the per-row reference
+    /// encode. For a correct batched encode this is `1.0` (the batch is just the
+    /// per-row encode fanned out).
+    pub support_agreement: f64,
+    /// Largest absolute latent-coordinate difference between the encode-under-test
+    /// and the per-row reference encode, over all rows and coordinate dims. A
+    /// correct batched encode matches the per-row encode to round-off (≈ `0`).
+    pub max_coord_abs_err: f64,
+    /// Largest absolute element-wise reconstruction residual `|x̂ − x|` over the
+    /// whole batch (the "amplitude"/reconstruction error in raw output units).
+    pub max_reconstruction_abs_err: f64,
+    /// Reconstruction explained variance `1 − ‖X − X̂‖²_F / ‖X − X̄‖²_F`, with each
+    /// output column centered by its own mean `X̄`. `1.0` is a perfect on-manifold
+    /// reconstruction; `0.0` is no better than the per-column mean.
+    pub reconstruction_ev: f64,
+}
+
+/// Compute [`EncodeQualityMetrics`] for an encode result.
+///
+/// * `coords` / `certified` — the encode UNDER TEST (`n×d` coords, `n` flags).
+/// * `coords_ref` / `certified_ref` — the production per-row reference encode
+///   (the definition of truth the batched/accelerated encode must match).
+/// * `reconstruction` — the decoded reconstruction `x̂` implied by `coords`
+///   (`n×p`, i.e. `amplitudeᵢ · Φ(coordsᵢ) · B`).
+/// * `targets` — the encode inputs `x` (`n×p`).
+///
+/// Panics on a shape mismatch: this is a benchmark/correctness helper and a
+/// mismatched comparison would silently launder a wrong number.
+#[must_use]
+pub fn encode_quality_metrics(
+    coords: ArrayView2<'_, f64>,
+    certified: &[bool],
+    coords_ref: ArrayView2<'_, f64>,
+    certified_ref: &[bool],
+    reconstruction: ArrayView2<'_, f64>,
+    targets: ArrayView2<'_, f64>,
+) -> EncodeQualityMetrics {
+    let (n, d) = coords.dim();
+    assert_eq!(
+        coords_ref.dim(),
+        (n, d),
+        "encode_quality_metrics: reference coords shape {:?} != under-test {:?}",
+        coords_ref.dim(),
+        (n, d)
+    );
+    assert_eq!(certified.len(), n, "certified flags must have one entry per row");
+    assert_eq!(
+        certified_ref.len(),
+        n,
+        "reference certified flags must have one entry per row"
+    );
+    let (nt, p) = targets.dim();
+    assert_eq!(nt, n, "targets must have one row per encoded row");
+    assert_eq!(
+        reconstruction.dim(),
+        (n, p),
+        "reconstruction shape {:?} != targets {:?}",
+        reconstruction.dim(),
+        (n, p)
+    );
+
+    let certified_rows = certified.iter().filter(|c| **c).count();
+    let fallback_rate = if n > 0 {
+        1.0 - certified_rows as f64 / n as f64
+    } else {
+        0.0
+    };
+
+    let agree = certified
+        .iter()
+        .zip(certified_ref.iter())
+        .filter(|(a, b)| a == b)
+        .count();
+    let support_agreement = if n > 0 { agree as f64 / n as f64 } else { 1.0 };
+
+    let mut max_coord_abs_err = 0.0_f64;
+    for i in 0..n {
+        for j in 0..d {
+            max_coord_abs_err = max_coord_abs_err.max((coords[[i, j]] - coords_ref[[i, j]]).abs());
+        }
+    }
+
+    // Reconstruction error + explained variance (per-column centering).
+    let mut max_reconstruction_abs_err = 0.0_f64;
+    let mut ss_res = 0.0_f64;
+    let mut ss_tot = 0.0_f64;
+    for c in 0..p {
+        let mut mean = 0.0_f64;
+        for i in 0..n {
+            mean += targets[[i, c]];
+        }
+        if n > 0 {
+            mean /= n as f64;
+        }
+        for i in 0..n {
+            let resid = reconstruction[[i, c]] - targets[[i, c]];
+            max_reconstruction_abs_err = max_reconstruction_abs_err.max(resid.abs());
+            ss_res += resid * resid;
+            let centered = targets[[i, c]] - mean;
+            ss_tot += centered * centered;
+        }
+    }
+    let reconstruction_ev = if ss_tot > 0.0 {
+        1.0 - ss_res / ss_tot
+    } else {
+        // Degenerate (all targets equal their column mean): a perfect
+        // reconstruction is EV 1, anything else is 0 rather than a NaN.
+        if ss_res == 0.0 { 1.0 } else { 0.0 }
+    };
+
+    EncodeQualityMetrics {
+        n_rows: n,
+        certified_rows,
+        fallback_rate,
+        support_agreement,
+        max_coord_abs_err,
+        max_reconstruction_abs_err,
+        reconstruction_ev,
+    }
+}
+
+#[cfg(test)]
+mod full_encode_metric_tests {
+    use super::*;
+    use ndarray::array;
+
+    #[test]
+    fn throughput_is_rows_over_seconds_and_guards_degenerate_time() {
+        let t = FullEncodeThroughput::from_elapsed(8_000, Duration::from_millis(100), false);
+        assert_eq!(t.n_rows, 8_000);
+        assert!(!t.device_encode_engaged);
+        // 8000 rows / 0.1 s = 80_000 rows/sec.
+        assert!((t.rows_per_sec - 80_000.0).abs() < 1.0, "got {}", t.rows_per_sec);
+        // Zero elapsed is a non-measurement, not an infinite rate.
+        let z = FullEncodeThroughput::from_elapsed(8_000, Duration::ZERO, false);
+        assert_eq!(z.rows_per_sec, 0.0);
+    }
+
+    #[test]
+    fn perfect_match_scores_full_agreement_and_unit_ev() {
+        // Two rows, 1 latent dim, 2 output dims. Reconstruction == targets.
+        let coords = array![[0.10], [0.40]];
+        let targets = array![[1.0, 0.0], [0.0, 1.0]];
+        let m = encode_quality_metrics(
+            coords.view(),
+            &[true, true],
+            coords.view(),
+            &[true, true],
+            targets.view(),
+            targets.view(),
+        );
+        assert_eq!(m.n_rows, 2);
+        assert_eq!(m.certified_rows, 2);
+        assert_eq!(m.fallback_rate, 0.0);
+        assert_eq!(m.support_agreement, 1.0);
+        assert_eq!(m.max_coord_abs_err, 0.0);
+        assert_eq!(m.max_reconstruction_abs_err, 0.0);
+        assert!((m.reconstruction_ev - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn divergence_is_surfaced_in_every_axis() {
+        let coords = array![[0.10], [0.40]];
+        let coords_ref = array![[0.10], [0.50]]; // row 1 differs by 0.10
+        let targets = array![[1.0, 0.0], [0.0, 1.0]];
+        // Reconstruction misses target by 0.25 on one element.
+        let recon = array![[1.0, 0.0], [0.0, 0.75]];
+        let m = encode_quality_metrics(
+            coords.view(),
+            &[true, false], // row 1 uncertified under test
+            coords_ref.view(),
+            &[true, true], // reference certified both
+            recon.view(),
+            targets.view(),
+        );
+        assert_eq!(m.certified_rows, 1);
+        assert!((m.fallback_rate - 0.5).abs() < 1e-12);
+        assert!((m.support_agreement - 0.5).abs() < 1e-12); // row 1 flags disagree
+        assert!((m.max_coord_abs_err - 0.10).abs() < 1e-12);
+        assert!((m.max_reconstruction_abs_err - 0.25).abs() < 1e-12);
+        assert!(m.reconstruction_ev < 1.0);
+    }
+}

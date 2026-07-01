@@ -452,6 +452,12 @@ pub fn system_admits_fused_path(sys: &ArrowSchurSystem) -> bool {
 #[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
 mod test_support {
     use super::*;
+    // `ArrowSchurSystem` is only `use`d at module scope under `cfg(target_os =
+    // "linux")` (line ~49), so `use super::*` does NOT bring it into scope on
+    // macOS. The type itself is un-gated (arrow_schur/system.rs) and the CPU
+    // parity emulator below references it on every OS, so import it explicitly
+    // here to keep the macOS `--tests` build linking.
+    use crate::arrow_schur::ArrowSchurSystem;
 
     /// Why the host-side CPU emulation of the fused Layer D + E pipeline declined.
 /// These mirror the `ArrowSchurGpuFailure` cases the device host raises so the

@@ -25,3 +25,8 @@ cudarc = { version = "0.19.6", default-features = false, features = ["std", "dri
 
 [dev-dependencies]
 gam-problem = { path = "../gam-problem" }
+# Test-only edge: `gam-sae` depends on `gam-gpu` (normal dep), so this back-edge
+# closes a cycle. Cargo permits a dependency cycle as long as at least one edge
+# is dev-only — which this is (it exists solely so the encode-full-path
+# throughput integration test can drive the production `EncodeAtlas` encode).
+gam-sae = { path = "../gam-sae" }

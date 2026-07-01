@@ -575,6 +575,137 @@ impl SaeCandidateIndex {
             misses,
         }
     }
+
+    /// EXACT routing (#1777 / roadmap "real exact-routing guarantee"): return the
+    /// **global argmax** of the routing score over the WHOLE dictionary — the atom
+    /// whose frame best aligns with `direction` — with a guarantee that no
+    /// ungathered atom is silently better.
+    ///
+    /// The sublinear [`Self::propose`] gather is only a HEURISTIC: a gathered atom
+    /// at alignment `0.6` does not rule out an *ungathered* atom at `1.0`, because
+    /// the gather's alignment is a lower bound on the selected atom, never an upper
+    /// bound on the atoms it skipped. So `propose` alone can silently miss the true
+    /// best atom. This method closes that hole and is the path the encode router
+    /// uses.
+    ///
+    /// Correctness mechanism (sound, not heuristic):
+    /// * **LSH fast path with a TRUE upper bound.** The routing score is the frame
+    ///   alignment `‖U_kᵀ d‖ / ‖d‖ ∈ [0, 1]`, so [`ROUTING_ALIGNMENT_UPPER_BOUND`]
+    ///   (`1.0`) is a hard ceiling for *every* atom — gathered or not. If the best
+    ///   gathered candidate already sits within [`ROUTING_CERT_EPS`] of that
+    ///   ceiling, no ungathered atom can beat it: the gathered best is a certified
+    ///   global score-maximizer and we return it WITHOUT a full scan
+    ///   ([`ExactRoute::lsh_certified`] = `true`).
+    /// * **Exact fallback otherwise.** When the gathered best is not certified by
+    ///   that bound (no tighter sound bound on ungathered atoms is available), run
+    ///   the full [`brute_force_best_atom`] scan and return its argmax. This is the
+    ///   ground truth — correctness over speed, exactly the roadmap contract.
+    ///
+    /// In both branches the returned atom has no atom of strictly greater routing
+    /// score anywhere in the dictionary (no silent miss). Returns `None` only for
+    /// an empty dictionary or an all-non-finite scan (a degenerate sketch).
+    pub fn route_exact<S: AtomFrameSketch>(
+        &self,
+        sketch: &S,
+        direction: ArrayView1<f64>,
+        candidate_budget: usize,
+        multiprobe: bool,
+    ) -> Option<ExactRoute> {
+        // Heuristic LSH gather first (sublinear) — the speed fast path.
+        let proposal = self.propose(sketch, direction, candidate_budget, multiprobe);
+        let lsh_best = proposal
+            .proposed
+            .first()
+            .copied()
+            .map(|id| (id, sketch.alignment(id, direction)));
+
+        if let Some((b, a_b)) = lsh_best {
+            if a_b.is_finite() && a_b >= ROUTING_ALIGNMENT_UPPER_BOUND - ROUTING_CERT_EPS {
+                // Universal-bound certificate: the routing score is capped at 1.0
+                // for EVERY atom, so a gathered atom already at the ceiling cannot
+                // be beaten by any ungathered one. Sound global optimality with no
+                // full scan.
+                return Some(ExactRoute {
+                    atom: b,
+                    alignment: a_b,
+                    lsh_certified: true,
+                    lsh_agreed: true,
+                    did_full_scan: false,
+                });
+            }
+        }
+
+        // Not certified by the bound ⇒ the gather might have missed a better
+        // ungathered atom. The only sound recourse without a tighter per-atom upper
+        // bound is the exact full scan: it IS the global argmax.
+        let (atom, alignment) = brute_force_best_atom(sketch, direction)?;
+        let lsh_agreed = lsh_best.is_some_and(|(b, _)| b == atom);
+        Some(ExactRoute {
+            atom,
+            alignment,
+            lsh_certified: false,
+            lsh_agreed,
+            did_full_scan: true,
+        })
+    }
+}
+
+/// Hard upper bound on the routing score (frame alignment) of ANY atom: the
+/// alignment `‖U_kᵀ d‖ / ‖d‖` is the fraction of a direction's energy inside the
+/// atom's column-space, so it lies in `[0, 1]` for every atom, gathered or not.
+/// This is the *true* upper bound that makes [`SaeCandidateIndex::route_exact`]'s
+/// LSH fast path sound: a gathered atom at the ceiling cannot be beaten.
+pub const ROUTING_ALIGNMENT_UPPER_BOUND: f64 = 1.0;
+
+/// Tolerance for certifying the LSH fast path against [`ROUTING_ALIGNMENT_UPPER_BOUND`].
+/// A gathered best within this of the ceiling is treated as a certified global
+/// maximizer (floating-point slack on the `‖·‖`/`‖·‖` ratio).
+pub const ROUTING_CERT_EPS: f64 = 1e-12;
+
+/// Brute-force EXACT global argmax of the routing score (frame alignment) over the
+/// WHOLE dictionary: scan every atom, return `(atom_id, alignment)` of the highest
+/// scorer. Ties break to the LOWEST id (a strict `>` replacement keeps the first
+/// maximizer), matching [`SaeCandidateIndex::propose`]'s id-ascending tie-break so
+/// the two agree atom-for-atom. Non-finite alignments are skipped. Returns `None`
+/// for an empty dictionary (or one whose every atom scored non-finite).
+///
+/// This is `O(K)` per call and is the ground truth [`SaeCandidateIndex::route_exact`]
+/// falls back to whenever the LSH gather is not certified optimal.
+pub fn brute_force_best_atom<S: AtomFrameSketch>(
+    sketch: &S,
+    direction: ArrayView1<f64>,
+) -> Option<(usize, f64)> {
+    let mut best: Option<(usize, f64)> = None;
+    for id in 0..sketch.num_atoms() {
+        let a = sketch.alignment(id, direction);
+        if !a.is_finite() {
+            continue;
+        }
+        match best {
+            Some((_, ba)) if a <= ba => {}
+            _ => best = Some((id, a)),
+        }
+    }
+    best
+}
+
+/// Result of [`SaeCandidateIndex::route_exact`]: the certified-or-exact global
+/// argmax of the routing score for one row, plus how it was obtained.
+#[derive(Clone, Copy, Debug)]
+pub struct ExactRoute {
+    /// The chosen atom id — a GLOBAL routing-score argmax (no atom in the
+    /// dictionary has a strictly greater score). No silent miss.
+    pub atom: usize,
+    /// The chosen atom's exact frame alignment with the row direction.
+    pub alignment: f64,
+    /// `true` ⇒ the LSH fast path certified optimality via the universal upper
+    /// bound (gathered best at the `1.0` ceiling); no full scan was needed.
+    pub lsh_certified: bool,
+    /// Whether the LSH gather's best candidate equalled the returned argmax.
+    /// `true` whenever `lsh_certified`; a diagnostic of the gather's recall.
+    pub lsh_agreed: bool,
+    /// `true` ⇒ the exact `O(K)` fallback scan ran (the LSH bound did not certify).
+    pub did_full_scan: bool,
 }
 
 /// One row's proposal: the budgeted candidate set plus what the budget dropped.
@@ -843,9 +974,13 @@ mod tests {
     }
 
     /// Regression for the routing-confidence gate (#1026): a low-alignment LSH
-    /// route must never be silently certified. `certified_encode_with_index`
-    /// (and the amortized twin) flag a routed row UNCERTIFIED whenever the
-    /// best-aligned proposed atom's frame alignment is below
+    /// route must be flagged for the exact fallback, never trusted by the
+    /// heuristic gate. This gate is a confidence/quality proxy, NOT a
+    /// global-optimality certificate — being at/above the threshold means the
+    /// chosen atom is itself a reasonable fit, it does not prove no better
+    /// ungathered atom exists. `certified_encode_with_index` (and the amortized
+    /// twin) flag a routed row UNCERTIFIED whenever the best-aligned proposed
+    /// atom's frame alignment is below
     /// `encode::CANDIDATE_ROUTING_MIN_ALIGNMENT`. The gate's decision input is
     /// exactly `sketch.alignment(best_atom, target)`; pin it here — with exact,
     /// deterministic linear algebra rather than LSH gather luck — so a future
@@ -890,7 +1025,9 @@ mod tests {
         );
         // The exact predicate the encode gate evaluates per row: a mis-routed
         // (orthogonal) atom falls BELOW the gate → flagged for the exact
-        // fallback; the correctly-routed atom sits AT/ABOVE the gate → trusted.
+        // fallback; the correctly-routed atom sits AT/ABOVE the gate → trusted by
+        // the heuristic gate (a confidence proxy, not a global-optimality
+        // certificate).
         assert!(
             a_wrong < GATE,
             "a mis-routed (orthogonal) atom must fall below the routing gate {GATE}; got {a_wrong}"
@@ -1292,6 +1429,106 @@ mod tests {
         assert!(
             diff < 1e-10,
             "query_sketch(d) must equal the rank-1 atom representative of d: diff {diff:e}"
+        );
+    }
+
+    /// The exact-routing guarantee (#1777 / roadmap): for EVERY row,
+    /// [`SaeCandidateIndex::route_exact`] selects the SAME atom as the brute-force
+    /// full-scan global argmax of the routing score — no silent miss — even on the
+    /// rows where the sublinear LSH gather alone picks a worse atom. This is the
+    /// acceptance contract: production routing == brute-force argmax, by
+    /// construction of the exact fallback.
+    #[test]
+    fn route_exact_matches_brute_force_argmax_with_no_silent_miss() {
+        // ── Arm A: exact-fallback path. Random unit-direction queries against a
+        // frontier-shaped dictionary. A random direction lies fully in no atom's
+        // rank-1 range, so the alignment is < 1 everywhere: the universal-bound
+        // fast path never fires and route_exact must run the exact scan. ──────────
+        let k = 1500usize;
+        let p = 32usize;
+        let (blocks, dirs) = synthetic_dictionary(k, p, 2027);
+        let sketch_dim = 24usize;
+        let sketch =
+            RandomProjectionFrameSketch::from_decoder_blocks(&blocks, sketch_dim, 909).unwrap();
+        let cfg = IndexConfig::auto(sketch_dim, k, 909);
+        let index = SaeCandidateIndex::build(&sketch, cfg).unwrap();
+        let budget = auto_candidate_budget(k);
+
+        let mut rng = StdRng::seed_from_u64(8675309);
+        let n_rows = 300usize;
+        let mut lsh_only_misses = 0usize; // rows where LSH-alone picked a worse atom
+        for _ in 0..n_rows {
+            let d = unit_vec(&mut rng, p);
+
+            // Ground truth: brute-force global argmax.
+            let (truth_atom, truth_align) = brute_force_best_atom(&sketch, d.view())
+                .expect("non-empty dictionary has an argmax");
+
+            // No-silent-miss invariant: nothing in the dictionary beats the truth.
+            for id in 0..k {
+                let a = sketch.alignment(id, d.view());
+                assert!(
+                    a <= truth_align + 1e-12,
+                    "brute force is not the argmax: atom {id} scores {a} > {truth_align}"
+                );
+            }
+
+            // Production exact router must equal the brute-force argmax, exactly.
+            let route = index
+                .route_exact(&sketch, d.view(), budget, cfg.multiprobe)
+                .expect("route_exact returns an argmax for a non-empty dictionary");
+            assert_eq!(
+                route.atom, truth_atom,
+                "route_exact must select the brute-force global argmax"
+            );
+            assert!(
+                (route.alignment - truth_align).abs() < 1e-12,
+                "route_exact alignment {} != brute force {truth_align}",
+                route.alignment
+            );
+            assert!(
+                route.did_full_scan && !route.lsh_certified,
+                "a sub-ceiling row must take the exact-scan fallback, not the bound fast path"
+            );
+
+            // What the OLD heuristic (LSH gather best) alone would have chosen.
+            let proposal = index.propose(&sketch, d.view(), budget, cfg.multiprobe);
+            if let Some(&lsh_best) = proposal.proposed.first() {
+                if lsh_best != truth_atom {
+                    lsh_only_misses += 1;
+                }
+            } else {
+                lsh_only_misses += 1;
+            }
+        }
+        // The fallback is doing real work: the sublinear gather alone DOES silently
+        // miss the global best on a meaningful fraction of rows, and route_exact
+        // recovered every one of them (asserted above, per row).
+        assert!(
+            lsh_only_misses > 0,
+            "test is vacuous: LSH-alone never missed, so the exact fallback was never exercised"
+        );
+
+        // ── Arm B: certified fast path. A query equal to a unique atom's own
+        // column aligns exactly 1.0 with it (the ceiling) and < 1 with all others,
+        // so route_exact certifies optimality via the universal bound — no scan —
+        // and still returns the brute-force argmax. ─────────────────────────────
+        let j = 777usize;
+        let dj = &dirs[j];
+        let (truth_atom, _) = brute_force_best_atom(&sketch, dj.view()).unwrap();
+        assert_eq!(truth_atom, j, "the in-frame column is its own unique argmax");
+        let route = index
+            .route_exact(&sketch, dj.view(), budget, cfg.multiprobe)
+            .unwrap();
+        assert_eq!(route.atom, j, "fast path must still return the global argmax");
+        assert!(
+            route.lsh_certified && !route.did_full_scan,
+            "a ceiling-alignment row must be certified by the universal bound, no scan"
+        );
+        assert!(
+            route.alignment >= ROUTING_ALIGNMENT_UPPER_BOUND - ROUTING_CERT_EPS,
+            "certified alignment must sit at the universal ceiling; got {}",
+            route.alignment
         );
     }
 

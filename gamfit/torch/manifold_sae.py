@@ -121,10 +121,24 @@ class SparsityConfig:
         data = dict(payload)
         sched = data.pop("tau_schedule", None)
         if isinstance(sched, str):
-            kind, start, end = cls._parse_tau_schedule(sched)
-            data["tau_schedule"] = kind
-            data["tau_start"] = start
-            data["tau_min"] = end
+            # A colon-form spec ("linear:4.0->1.0") carries an embedded
+            # start/end and must be parsed; a bare kind ("linear" / "geometric"
+            # / "reciprocal_iter") is already a valid field value and is taken
+            # as-is (parsing it would wrongly demand a ':').
+            if ":" in sched:
+                kind, start, end = cls._parse_tau_schedule(sched)
+                data["tau_schedule"] = kind
+                data["tau_start"] = start
+                data["tau_min"] = end
+            else:
+                kind = sched.strip().lower()
+                if kind not in {"linear", "geometric", "reciprocal_iter"}:
+                    raise ValueError(
+                        "SparsityConfig.tau_schedule must be one of "
+                        "'linear'/'geometric'/'reciprocal_iter' (or a "
+                        f"colon-form spec like 'linear:4.0->1.0'); got {sched!r}"
+                    )
+                data["tau_schedule"] = kind
         elif sched is not None:
             data["tau_schedule"] = str(sched)
         return cls(**data)
@@ -321,24 +335,33 @@ class ManifoldSAEConfig:
         """Map the torch sparsity kind to the closed-form ``assignment`` token.
 
         The closed-form path accepts ``ibp_map``, ``softmax``, and ``jumprelu``.
-        Note that ``softmax_topk`` is **not** mapped to ``softmax``: the torch
-        ``softmax_topk`` layer is an *independent* non-negative top-k gate
-        (softplus magnitude + hard top-k STE) that can turn **all** atoms off,
-        whereas row-``softmax`` is a competitive simplex whose mass always sums
-        to one and can never deselect every atom. Coercing one into the other
-        would make ``.fit()`` optimize a fundamentally different model than
-        backprop. The closest closed-form mode with the same semantics —
-        independent gates that can zero every atom, plus the existing post-hoc
-        hard top-k projection (forwarded via ``top_k`` in :meth:`fit`) — is
-        ``jumprelu`` (independent hard-thresholded gates). So ``softmax_topk``
-        maps to ``jumprelu``, aligning the closed-form objective with the torch
-        independent-topk gate.
+
+        ``softmax_topk`` has **no** faithful closed-form assignment and is
+        rejected rather than coerced. It is neither ``softmax`` (a competitive
+        simplex whose mass always sums to one and can never deselect every atom)
+        nor ``jumprelu`` (a bounded thresholded-logistic gate that carries *no*
+        magnitude): the torch ``softmax_topk`` gate is an *independent*
+        non-negative softplus-magnitude activation with a hard top-k selection
+        that should honor ``target_k``. Silently mapping it to ``jumprelu`` would
+        make ``.fit()`` optimize a fundamentally different family than the torch
+        gate trains. So we refuse here; the user must change the sparsity kind or
+        use the gradient (torch) training path. The remaining kinds correspond
+        genuinely and are mapped through.
         """
+        kind = self.sparsity.kind
+        if kind == "softmax_topk":
+            raise NotImplementedError(
+                "closed-form .fit() has no assignment matching 'softmax_topk' "
+                "semantics: it is neither the competitive 'softmax' simplex nor "
+                "the magnitude-free 'jumprelu' thresholded gate. Use the "
+                "gradient (torch) training path for softmax_topk, or set "
+                "sparsity.kind to 'jumprelu'/'ibp_gumbel' for the closed-form "
+                ".fit() lane."
+            )
         return {
             "ibp_gumbel": "ibp_map",
-            "softmax_topk": "jumprelu",
             "jumprelu": "jumprelu",
-        }[self.sparsity.kind]
+        }[kind]
 
 
 @dataclass(frozen=True, slots=True)
@@ -748,8 +771,11 @@ class _SparsityLayer(nn.Module):
         supplies the sparsity that disentangles atoms. A temperature-scaled
         softplus gives a smooth, strictly-non-negative activation whose hardness
         anneals through the shared ``tau`` schedule (``tau → 0`` ⇒ ReLU). The
-        hard top-k mask is applied with a straight-through estimator so gradients
-        reach the selected atoms' pre-activations.
+        hard top-k mask is applied directly: gradients flow only through the
+        selected activations (no straight-through surrogate on the selection
+        boundary), so unselected atoms receive no reconstruction gradient. (This
+        is deliberate and differs from ``reconstruction_topk_gate``, which does
+        carry an explicit ``hard + soft - soft.detach()`` STE term.)
         """
         act = self._topk_activation(logits)
         hard = act * self._topk_mask(act)
@@ -1148,8 +1174,50 @@ class _SparsityLayer(nn.Module):
             progress = float(min(max(progress, 0.0), 1.0))
             responsibilities = (1.0 - progress) * soft + progress * hard_ste
         else:
-            responsibilities = self._topk_mask(-relative_residual)
+            # Multi-atom (``target_k > 1``) regime: select and gate with the
+            # SIGNED least-squares code so the effective active-atom count honors
+            # ``min(target_k, n_atoms)`` all the way up to a fully dense gate.
+            #
+            # The optimal scalar code for atom ``k`` against row ``x`` is the
+            # projection coefficient ``c = (recon_k · x) / ||recon_k||²``, and the
+            # rank-1 reconstruction it yields, ``c · recon_k``, is the orthogonal
+            # projection of ``x`` onto ``recon_k``'s line — correct for *either*
+            # sign of ``c``. A negative ``c`` is genuine reconstruction signal: it
+            # means the row sits on the opposite phase/side of the atom's curve,
+            # not that the atom is absent. The non-negative ``code`` clamped above
+            # (needed by the heavily-tuned ``target_k == 1`` routing contract,
+            # issue #1282) zeros every atom whose curve projects negatively onto
+            # the row — roughly half of a near-symmetric atom population — so the
+            # *active* count (atoms with a nonzero gate) used to saturate near
+            # ``n_atoms/2`` (measured ~36/64) and the requested ``target_k`` was
+            # silently capped (4..32 honored; 48 and 64 both plateaued ~36/64).
+            #
+            # Scoring AND gating with the signed code removes that cap: residual
+            # selection ranks atoms by their *best achievable* rank-1 fit (a
+            # strong negative projection is a good reconstructor, not the
+            # worst-case ``||x||²`` it scored as under the clamp), and every one of
+            # the ``min(target_k, n_atoms)`` selected atoms then carries genuine
+            # magnitude — so the effective active count tracks ``target_k`` up to a
+            # dense gate. In the sparse regime the top-k selected atoms are the
+            # strong positive-projection ones whose signed and clamped codes
+            # coincide, so the known-good ``k <= 32`` behavior is preserved (the
+            # count is honored exactly as before; selection can only improve the
+            # reconstruction fit). The ``target_k == 1`` path above is untouched
+            # and keeps the non-negative ``code``.
+            signed_code = (per_atom_recon * x.unsqueeze(1)).sum(dim=-1) / denom
+            signed_residual = (
+                (signed_code.unsqueeze(-1) * per_atom_recon - x.unsqueeze(1)) ** 2
+            ).sum(dim=-1)
+            signed_relative_residual = signed_residual / row_scale
+            responsibilities = self._topk_mask(-signed_relative_residual)
+            return signed_code * responsibilities
 
+        # ``target_k == 1`` fall-through (the no-global-anchor residual-EM path).
+        # ``responsibilities`` is the soft→hard one-active-atom blend and ``code``
+        # is the non-negative least-squares magnitude required by that routing
+        # contract (issue #1282), so the single routed atom reports a non-negative
+        # gate. The dense/multi-atom branch above returns its own signed gate and
+        # never reaches this line.
         return code * responsibilities
 
     def _matching_pursuit_commit(
@@ -2069,3 +2137,162 @@ __all__ = [
     "RemlConfig",
     "SparsityConfig",
 ]
+
+
+def _selftest_softmax_topk_multi_atom_honors_target_k() -> None:
+    """The multi-atom (``target_k > 1``) gate honors ``target_k`` up to ``n_atoms``.
+
+    Builds a small ``ManifoldSAE`` (``n_atoms=64``) and, for a sweep of
+    ``target_k`` values spanning the sparse regime (4, 8, 16, 32) and the
+    formerly-capped dense regime (48, 64), measures the mean number of active
+    atoms per row (atoms with a nonzero gated code ``z``) after a forward pass.
+
+    Pre-fix behavior: target_k 4..32 were honored but 48 and 64 both plateaued at
+    ~36/64 active because the non-negative ``code`` clamp zeroed every selected
+    atom whose curve projected negatively onto the row. Post-fix: the multi-atom
+    branch scores and gates with the *signed* least-squares code, so every
+    selected atom carries magnitude and the active count tracks
+    ``min(target_k, n_atoms)`` for every ``target_k`` — including 48 and 64.
+
+    This branch is a pure hard top-k of the signed residual with no temperature
+    dependence, so the count is honored in ``eval()`` at any ``tau`` (no training
+    needed). Raises ``AssertionError`` on regression.
+    """
+    torch.manual_seed(0)
+    n_atoms = 64
+    input_dim = 32
+    n_rows = 128
+
+    measured: dict[int, float] = {}
+    for target_k in (4, 8, 16, 32, 48, 64):
+        cfg = ManifoldSAEConfig(
+            input_dim=input_dim,
+            n_atoms=n_atoms,
+            intrinsic_rank=2,
+            atom_manifold="product",
+            atom_basis="duchon",
+            sparsity=SparsityConfig(kind="softmax_topk", target_k=target_k),
+            dtype=torch.float64,
+        )
+        model = ManifoldSAE(cfg)
+        model.eval()
+        x = torch.randn(n_rows, input_dim, dtype=torch.float64)
+        with torch.no_grad():
+            out = model(x)
+        active_per_row = (out.z != 0).sum(dim=1).to(torch.float64)
+        mean_active = float(active_per_row.mean().item())
+        measured[target_k] = mean_active
+
+        assert torch.isfinite(out.x_hat).all(), (
+            f"reconstruction produced non-finite values at target_k={target_k}"
+        )
+        # The gate selects exactly min(target_k, n_atoms) atoms and every selected
+        # atom now carries a (signed) nonzero code, so the active count should
+        # equal target_k to numerical tolerance (a selected atom is zero only on
+        # the measure-zero event recon·x == 0 exactly).
+        expected = min(target_k, n_atoms)
+        assert abs(mean_active - expected) <= 0.5, (
+            f"target_k={target_k}: mean active/row={mean_active:.3f}, "
+            f"expected ~{expected} (gate not honoring target_k)"
+        )
+
+    # Explicitly assert the formerly-capped dense regime no longer plateaus ~36.
+    for target_k in (48, 64):
+        assert measured[target_k] > 40.0, (
+            f"dense regime regressed: target_k={target_k} gave "
+            f"{measured[target_k]:.3f} active/row (old cap was ~36.2)"
+        )
+
+    summary = "  ".join(f"k={k}->{v:.3f}" for k, v in measured.items())
+    print(f"softmax_topk (k>1) active/row vs target_k: {summary}")
+    print("OK: softmax_topk gate honors target_k up to n_atoms (no ~36/64 cap).")
+
+
+def _selftest_softmax_topk_k1_converges_to_one_active() -> None:
+    """The ``target_k == 1`` router converges to ~1 active atom/row when annealed.
+
+    The ``target_k == 1`` path is a deterministic-annealing (DA) EM router
+    (issue #1282): its forward is a soft→hard interpolation controlled by
+    ``progress = (tau_start - tau) / (tau_start - tau_min)``. At the schedule
+    START (``tau = tau_start``, ``progress = 0``) the forward is deliberately the
+    *soft* responsibility-weighted code — a near-uniform, dense gate — so the
+    M-step can differentiate the atoms from a near-symmetric init instead of
+    latching a random top-1 winner and collapsing (the exact #1282 failure). So
+    an untrained model at ``tau_start`` reports many active atoms *by design*;
+    that is the DA warmup, not a cap.
+
+    The honest bar for a top-1 gate is the ANNEALED schedule that every real
+    training run reaches: as ``tau -> tau_min`` (``progress -> 1``) the forward
+    interpolates to the committed hard top-1 winner — exactly one active atom per
+    row. This test trains a few Adam steps while advancing the temperature to
+    ``tau_min`` and asserts the mean active count collapses to ~1, proving the
+    ~1-active contract is honored without disturbing the DA warmup / anchor / EMA
+    machinery that #1282 relies on.
+    """
+    torch.manual_seed(0)
+    input_dim = 16
+    n_atoms = 8
+    n_rows = 96
+    tau_steps = 40
+
+    cfg = ManifoldSAEConfig(
+        input_dim=input_dim,
+        n_atoms=n_atoms,
+        intrinsic_rank=2,
+        atom_manifold="product",
+        atom_basis="duchon",
+        sparsity=SparsityConfig(
+            kind="softmax_topk", target_k=1, tau_start=4.0, tau_min=1.0, tau_steps=tau_steps
+        ),
+        dtype=torch.float64,
+    )
+    model = ManifoldSAE(cfg)
+    x = torch.randn(n_rows, input_dim, dtype=torch.float64)
+
+    # Warmup count at the schedule start (soft DA phase) — documented, not asserted
+    # to be ~1: this is the intended dense warmup.
+    model.eval()
+    with torch.no_grad():
+        warm = float((model(x).z != 0).sum(dim=1).to(torch.float64).mean().item())
+
+    # Train a few steps while annealing tau -> tau_min (a completed schedule).
+    opt = torch.optim.Adam(model.parameters(), lr=1e-2)
+    model.train()
+    for _ in range(120):
+        opt.zero_grad()
+        out = model(x)
+        loss = ((out.x_hat - x) ** 2).mean()
+        loss.backward()
+        opt.step()
+        model.sparsity.advance_temperature()
+
+    model.eval()
+    with torch.no_grad():
+        out = model(x)
+    mean_active = float((out.z != 0).sum(dim=1).to(torch.float64).mean().item())
+    tau_now = float(model.sparsity.tau.item())
+
+    assert torch.isfinite(out.x_hat).all(), "k=1 reconstruction produced non-finite values"
+    assert abs(tau_now - cfg.sparsity.tau_min) < 1e-9, (
+        f"schedule did not reach tau_min (tau={tau_now}); the honest k=1 bar is annealed"
+    )
+    assert abs(mean_active - 1.0) <= 0.25, (
+        f"target_k=1 did not converge to ~1 active/row: mean active/row={mean_active:.3f} "
+        f"(annealed, tau={tau_now})"
+    )
+
+    print(
+        f"softmax_topk k=1 active/row: warmup(tau_start)={warm:.3f} -> "
+        f"annealed(tau_min)={mean_active:.3f}"
+    )
+    print("OK: target_k=1 honors ~1 active/row at the annealed (honest) bar.")
+
+
+def _selftest_softmax_topk_honors_target_k() -> None:
+    """Run the full ``softmax_topk`` target_k contract self-test (k>1 and k=1)."""
+    _selftest_softmax_topk_multi_atom_honors_target_k()
+    _selftest_softmax_topk_k1_converges_to_one_active()
+
+
+if __name__ == "__main__":
+    _selftest_softmax_topk_honors_target_k()

@@ -52,7 +52,9 @@ EXAMPLE (generic harvested cache):
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
+import multiprocessing
 import time
 
 import numpy as np
@@ -84,16 +86,30 @@ def _load_activations(args: argparse.Namespace) -> np.ndarray:
 
 
 def _pca_project(train: np.ndarray, test: np.ndarray, pcs: int):
-    """PCA fit on TRAIN only; project both; unit-RMS scale from TRAIN only."""
+    """PCA fit on TRAIN only; project both; unit-RMS scale from TRAIN only.
+
+    Also returns r, the held-out (TEST) retained-variance ratio: the fraction of
+    the centered TEST energy that survives the kept-PC projection. EV measured in
+    the PCA-32 coordinate space (EV_Z) overstates a FULL-SPACE reconstruction EV
+    by ~1/r, because the PCA arms can never explain the (1 - r) of the test signal
+    that the projection threw away. The caller multiplies EV_Z by r to recover a
+    full-space EV that is comparable to the official full-space Qwen reference.
+    """
     mean = train.mean(axis=0, keepdims=True)
     tc = train - mean
     # economy SVD on the centered train block; right-singular vectors are the PCs.
     _, _, vt = np.linalg.svd(tc, full_matrices=False)
     comp = vt[:pcs].T  # (D, pcs)
     z_tr = tc @ comp
-    z_te = (test - mean) @ comp
+    # UNSCALED, train-mean-centered test projection (before the unit-RMS rescale):
+    # r is a pure geometry ratio, so it must be computed on the raw projection.
+    tc_te = test - mean
+    z_te = tc_te @ comp
+    proj_energy = float(np.sum(z_te**2))
+    total_energy = float(np.sum(tc_te**2))
+    r = proj_energy / total_energy if total_energy > 0.0 else 1.0
     scale = np.sqrt(np.mean(z_tr**2)) or 1.0
-    return z_tr / scale, z_te / scale
+    return z_tr / scale, z_te / scale, r
 
 
 def _ev(target: np.ndarray, fitted: np.ndarray) -> float:
@@ -117,17 +133,14 @@ def _jsonable(value):
     return value
 
 
-def _fit_ev(
-    z_tr,
-    z_te,
-    k: int,
-    topology: str,
-    seed: int,
-    n_iter: int,
-    max_fit_seconds: float,
-    max_reconstruct_seconds: float,
-) -> tuple[float, float, float, dict | None, list[str]]:
-    """Fit one dictionary through the production engine; return HELD-OUT EV."""
+def _sae_fit_worker(z_tr, z_te, k, topology, seed, n_iter):
+    """TOP-LEVEL (picklable) worker: fit + reconstruct in a child process.
+
+    Lives at module scope so the "spawn" ProcessPoolExecutor can pickle it by
+    qualified name (the child re-imports this module). It returns a plain dict of
+    EVs/timings/diagnostics — everything already json-able — so nothing exotic has
+    to survive the IPC boundary. The PCA arrays z_tr/z_te arrive as numpy arrays.
+    """
     from gamfit import sae_manifold_fit
 
     fit_started = time.perf_counter()
@@ -141,39 +154,110 @@ def _fit_ev(
         random_state=seed,
     )
     fit_seconds = time.perf_counter() - fit_started
-    if fit_seconds > max_fit_seconds:
-        raise SystemExit(
-            f"{topology} K={k} fit exceeded wall-clock guard: "
-            f"{fit_seconds:.1f}s > {max_fit_seconds:.1f}s"
-        )
 
     reconstruct_started = time.perf_counter()
     fitted_test = m.reconstruct(z_te)
     reconstruct_seconds = time.perf_counter() - reconstruct_started
-    if reconstruct_seconds > max_reconstruct_seconds:
-        raise SystemExit(
-            f"{topology} K={k} held-out reconstruct exceeded wall-clock guard: "
-            f"{reconstruct_seconds:.1f}s > {max_reconstruct_seconds:.1f}s"
-        )
+
     # #1026 IN-SAMPLE probe: reconstruct the SAME train rows (same order ⇒ the
     # hybrid-split collapse-rescue's train-indexed fresh codes align) to isolate
     # whether the curved fit's collapse is repaired in-sample, separately from the
     # held-out generalization (which still needs the OOS coordinate projection).
+    train_probe_error = None
     try:
         fitted_train = m.reconstruct(z_tr)
         train_ev = _ev(z_tr, fitted_train)
     except Exception as exc:  # noqa: BLE001 - diagnostic only, never fail the fit
         train_ev = float("nan")
-        print(f"[{topology} K={k}] train-EV probe failed: {exc}", flush=True)
-    print(f"[{topology} K={k}] IN_SAMPLE_EV={train_ev:.4f}  held_out_EV={_ev(z_te, fitted_test):.4f}", flush=True)
+        train_probe_error = str(exc)
+
     hybrid_split = getattr(m, "hybrid_split", None)
     atom_topologies = [str(v) for v in getattr(m, "atom_topologies", [])]
+    return {
+        "test_ev": _ev(z_te, fitted_test),
+        "train_ev": train_ev,
+        "fit_seconds": fit_seconds,
+        "reconstruct_seconds": reconstruct_seconds,
+        "hybrid_split": None if hybrid_split is None else _jsonable(hybrid_split),
+        "atom_topologies": atom_topologies,
+        "train_probe_error": train_probe_error,
+    }
+
+
+def _fit_ev(
+    z_tr,
+    z_te,
+    k: int,
+    topology: str,
+    seed: int,
+    n_iter: int,
+    max_fit_seconds: float,
+    max_reconstruct_seconds: float,
+) -> tuple[float, float, float, dict | None, list[str], bool]:
+    """Fit one dictionary through the production engine; return HELD-OUT EV.
+
+    The real guard is a HARD subprocess timeout: the fit + reconstruct run in a
+    "spawn" child process, and `.result(timeout=...)` interrupts a hung fit (the
+    old post-hoc elapsed checks could only fire AFTER a fit returned, so a wedged
+    solver was never actually interrupted). On timeout the child is terminated and
+    the arm is reported as NaN EV with timed_out=True so the acceptance gate treats
+    it as a blocker. The elapsed checks survive as a secondary (soft) signal only.
+    """
+    hard_timeout = max_fit_seconds + max_reconstruct_seconds
+    ctx = multiprocessing.get_context("spawn")
+    executor = concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=ctx)
+    future = executor.submit(_sae_fit_worker, z_tr, z_te, k, topology, seed, n_iter)
+    try:
+        result = future.result(timeout=hard_timeout)
+    except concurrent.futures.TimeoutError:
+        # Forcibly kill the wedged child; do not wait on it (that would re-hang).
+        for proc in list(getattr(executor, "_processes", {}).values()):
+            try:
+                proc.terminate()
+            except Exception:  # noqa: BLE001 - best-effort kill
+                pass
+        executor.shutdown(wait=False, cancel_futures=True)
+        print(
+            f"[{topology} K={k}] TIMED OUT after {hard_timeout:.1f}s "
+            f"(fit budget {max_fit_seconds:.1f}s + recon {max_reconstruct_seconds:.1f}s); "
+            f"reporting NaN EV and flagging timeout.",
+            flush=True,
+        )
+        return (float("nan"), float("nan"), float("nan"), None, [], True)
+    else:
+        executor.shutdown(wait=False)
+
+    fit_seconds = result["fit_seconds"]
+    reconstruct_seconds = result["reconstruct_seconds"]
+    # Secondary (soft) signal: the subprocess hard-timeout above is the real guard,
+    # but a fit/reconstruct that overran its per-arm budget yet still returned is
+    # worth flagging so a near-miss does not pass unnoticed.
+    if fit_seconds > max_fit_seconds:
+        print(
+            f"[warn] {topology} K={k} fit took {fit_seconds:.1f}s > soft guard "
+            f"{max_fit_seconds:.1f}s (subprocess hard-timeout is the real guard).",
+            flush=True,
+        )
+    if reconstruct_seconds > max_reconstruct_seconds:
+        print(
+            f"[warn] {topology} K={k} reconstruct took {reconstruct_seconds:.1f}s > soft "
+            f"guard {max_reconstruct_seconds:.1f}s (subprocess hard-timeout is the real guard).",
+            flush=True,
+        )
+    if result["train_probe_error"] is not None:
+        print(f"[{topology} K={k}] train-EV probe failed: {result['train_probe_error']}", flush=True)
+    print(
+        f"[{topology} K={k}] IN_SAMPLE_EV={result['train_ev']:.4f}  "
+        f"held_out_EV={result['test_ev']:.4f}",
+        flush=True,
+    )
     return (
-        _ev(z_te, fitted_test),
+        result["test_ev"],
         fit_seconds,
         reconstruct_seconds,
-        None if hybrid_split is None else _jsonable(hybrid_split),
-        atom_topologies,
+        result["hybrid_split"],
+        result["atom_topologies"],
+        False,
     )
 
 
@@ -195,18 +279,46 @@ def _acceptance_report(
     cpu_partial: bool,
     official_reference_ev: float,
 ) -> dict:
+    # All EV comparisons run on the FULL-space values (`*_ev_out` carry r * EV_Z;
+    # see FIX 1 / _pca_project): the official reference is a full-space number, so
+    # parity must be judged in full space, not in PCA-32 coordinate space.
     measured = {int(row["K"]): row for row in rows}
     required = set(REQUIRED_ACCEPTANCE_LADDER)
     missing = sorted(required - set(ladder))
     full_ladder_measured = required.issubset(measured)
-    best_linear = max((float(row["linear_ev_out"]) for row in rows), default=float("nan"))
-    best_hybrid = max((float(row["hybrid_ev_out"]) for row in rows), default=float("nan"))
-    parity_ev = max(best_linear, official_reference_ev)
+
+    def _finite(values):
+        return [v for v in values if np.isfinite(v)]
+
+    finite_linear = _finite([float(row["linear_ev_out"]) for row in rows])
+    finite_hybrid = _finite([float(row["hybrid_ev_out"]) for row in rows])
+    best_linear = max(finite_linear) if finite_linear else float("nan")
+    best_hybrid = max(finite_hybrid) if finite_hybrid else float("nan")
+    # Parity bar = max over the finite comparators (best finite linear arm + the
+    # official full-space reference). The official reference is finite, so this can
+    # never collapse to NaN the way `max(nan, official)` did before.
+    comparators = _finite([best_linear, float(official_reference_ev)])
+    parity_ev = max(comparators) if comparators else float("nan")
+
+    # Closure requires a FINITE linear comparator AND a FINITE hybrid value at every
+    # required rung — a NaN (failed or timed-out) arm cannot silently pass the gate.
+    rungs_missing_finite_linear = [
+        k for k in REQUIRED_ACCEPTANCE_LADDER
+        if k in measured and not np.isfinite(float(measured[k]["linear_ev_out"]))
+    ]
+    rungs_missing_finite_hybrid = [
+        k for k in REQUIRED_ACCEPTANCE_LADDER
+        if k in measured and not np.isfinite(float(measured[k]["hybrid_ev_out"]))
+    ]
+
     closure_allowed = (
         not cpu_partial
         and not missing
         and full_ladder_measured
+        and not rungs_missing_finite_linear
+        and not rungs_missing_finite_hybrid
         and np.isfinite(best_hybrid)
+        and np.isfinite(parity_ev)
         and best_hybrid >= parity_ev
     )
     blocker = None
@@ -216,8 +328,18 @@ def _acceptance_report(
         blocker = f"Missing required acceptance rung(s): {missing}."
     elif not full_ladder_measured:
         blocker = "Required acceptance ladder was requested but did not finish every rung."
+    elif rungs_missing_finite_linear:
+        blocker = (
+            f"No finite linear held-out EV at required rung(s): {rungs_missing_finite_linear}."
+        )
+    elif rungs_missing_finite_hybrid:
+        blocker = (
+            f"No finite curved/hybrid held-out EV at required rung(s): {rungs_missing_finite_hybrid}."
+        )
     elif not np.isfinite(best_hybrid):
         blocker = "No finite curved/hybrid held-out EV was measured."
+    elif not np.isfinite(parity_ev):
+        blocker = "Parity bar is not finite (no finite linear comparator and no finite official reference EV)."
     elif best_hybrid < parity_ev:
         blocker = (
             f"Best curved/hybrid EV {best_hybrid:.6f} is below parity bar "
@@ -231,6 +353,8 @@ def _acceptance_report(
         "best_linear_ev": float(best_linear),
         "best_hybrid_ev": float(best_hybrid),
         "parity_ev_bar": float(parity_ev),
+        "rungs_missing_finite_linear": [int(k) for k in rungs_missing_finite_linear],
+        "rungs_missing_finite_hybrid": [int(k) for k in rungs_missing_finite_hybrid],
         "closure_allowed": bool(closure_allowed),
         "blocker": blocker,
     }
@@ -305,18 +429,25 @@ def main() -> None:
     perm = rng.permutation(n)
     n_test = max(1, int(round(args.test_frac * n)))
     test_idx, train_idx = perm[:n_test], perm[n_test:]
-    z_tr, z_te = _pca_project(x[train_idx], x[test_idx], args.pcs)
+    z_tr, z_te, r = _pca_project(x[train_idx], x[test_idx], args.pcs)
     ladder = list(CPU_PARTIAL_LADDER) if args.cpu_partial else _parse_ladder(args.k_ladder)
 
     print(f"=== #1026 real-data EV-vs-K frontier ===")
     print(f"N={n} (train={len(train_idx)}, test={len(test_idx)}), D={x.shape[1]} -> PCA-{args.pcs}, seed={args.seed}")
+    print(
+        f"PCA held-out retained-variance ratio r={r:.6f}. EV is measured in PCA-{args.pcs} "
+        f"coordinate space (EV_Z); the FULL-space EV reported as *_EV_full = r * EV_Z, because "
+        f"the kept PCs can never explain the {1.0 - r:.6f} of the centered test signal the "
+        f"projection discarded. Closure compares the FULL-space EV against the (full-space) "
+        f"official Qwen W32K reference."
+    )
     if args.cpu_partial:
         print("CPU partial ladder: K={1,2,4,8}. This run cannot close #1026.")
     else:
         print("Acceptance ladder: K={8,32,128,512}; parity bar includes the official Qwen W32K held-out EV.")
     print(
-        f"{'K':>4}  {'hybrid_EV_out':>13}  {'linear_EV_out':>13}  "
-        f"{'(hybrid - linear)':>17}  {'hybrid_s':>9}  {'linear_s':>9}  {'recon_s':>9}"
+        f"{'K':>4}  {'hyb_EV_full':>12}  {'hyb_EV_pca':>11}  {'lin_EV_full':>12}  "
+        f"{'lin_EV_pca':>11}  {'(h-l)_full':>11}  {'hyb_s':>8}  {'lin_s':>8}  {'rec_s':>8}"
     )
     rows = []
     for k in ladder:
@@ -324,7 +455,7 @@ def main() -> None:
         # routing-collapse-protected outer homotopy walk both grow with K, so the
         # budget must scale with K rather than gate every rung on the K=1 time.
         k_max_fit_seconds = args.max_fit_seconds * k
-        ev_h, fit_h, recon_h, hybrid_split, hybrid_topologies = _fit_ev(
+        ev_h_pca, fit_h, recon_h, hybrid_split, hybrid_topologies, hybrid_timed_out = _fit_ev(
             z_tr,
             z_te,
             k,
@@ -340,7 +471,7 @@ def main() -> None:
         # the curved EV-vs-K climb — the #1026 headline measurement — so the
         # linear arm is reported as NaN and the row still prints.
         try:
-            ev_l, fit_l, recon_l, linear_split, linear_topologies = _fit_ev(
+            ev_l_pca, fit_l, recon_l, linear_split, linear_topologies, linear_timed_out = _fit_ev(
                 z_tr,
                 z_te,
                 k,
@@ -352,21 +483,36 @@ def main() -> None:
             )
         except Exception as exc:  # noqa: BLE001 — arm-isolated, reported honestly
             print(f"[linear K={k}] arm failed, reporting NaN: {exc}", flush=True)
-            ev_l, fit_l, recon_l = float("nan"), float("nan"), float("nan")
-            linear_split, linear_topologies = None, None
+            ev_l_pca, fit_l, recon_l = float("nan"), float("nan"), float("nan")
+            linear_split, linear_topologies, linear_timed_out = None, None, False
+        # FULL-space EV = r * EV_Z (see _pca_project): the PCA-space EV is inflated
+        # by ~1/r relative to a full-space reconstruction, so the acceptance gate and
+        # the official-reference parity must use the full-space numbers.
+        ev_h_full = r * ev_h_pca
+        ev_l_full = r * ev_l_pca
         print(
-            f"{k:>4}  {ev_h:>13.6f}  {ev_l:>13.6f}  {ev_h - ev_l:>17.6f}  "
-            f"{fit_h:>9.1f}  {fit_l:>9.1f}  {max(recon_h, recon_l):>9.1f}"
+            f"{k:>4}  {ev_h_full:>12.6f}  {ev_h_pca:>11.6f}  {ev_l_full:>12.6f}  "
+            f"{ev_l_pca:>11.6f}  {ev_h_full - ev_l_full:>11.6f}  "
+            f"{fit_h:>8.1f}  {fit_l:>8.1f}  {max(recon_h, recon_l):>8.1f}"
         )
         rows.append(
             {
                 "K": k,
-                "hybrid_ev_out": ev_h,
-                "linear_ev_out": ev_l,
-                "hybrid_minus_linear": ev_h - ev_l,
+                # `*_ev_out` carry the FULL-space values so the acceptance gate uses them.
+                "hybrid_ev_out": ev_h_full,
+                "linear_ev_out": ev_l_full,
+                "hybrid_ev_out_full": ev_h_full,
+                "linear_ev_out_full": ev_l_full,
+                "hybrid_ev_out_pca": ev_h_pca,
+                "linear_ev_out_pca": ev_l_pca,
+                "pca_retained_var_ratio": float(r),
+                "hybrid_minus_linear": ev_h_full - ev_l_full,
+                "hybrid_minus_linear_pca": ev_h_pca - ev_l_pca,
                 "hybrid_fit_seconds": fit_h,
                 "linear_fit_seconds": fit_l,
                 "max_reconstruct_seconds": max(recon_h, recon_l),
+                "hybrid_timed_out": bool(hybrid_timed_out),
+                "linear_timed_out": bool(linear_timed_out),
                 "hybrid_seed_topology": "circle",
                 "hybrid_atom_topologies": hybrid_topologies,
                 "hybrid_split": hybrid_split,
@@ -378,9 +524,13 @@ def main() -> None:
     print(
         "\nDiscriminating read (issue H_flat vs H_curved): the curved-seeded hybrid should "
         "DOMINATE linear at matched K and CLIMB-then-FLATTEN; pure-linear should keep climbing "
-        "by shattering each curved family into ~Theta/(2*sqrt(2*eps)) secants. Inspect each "
-        "row's hybrid_split.atoms for fitted_turning Θ and LOAO ΔEV; the in-tree predictor for "
-        "this curve is tests/sae/sae_ev_vs_k_frontier.rs."
+        "by shattering each curved family into ~Theta/(2*sqrt(2*eps)) secants. NOTE: that "
+        "~Theta/sqrt(8*eps) count is the MAX-SAGITTA (chord) bound for a fixed worst-case "
+        "deviation eps, NOT the MSE/EV law — an EV-loss budget eps gives a milder ~eps^(-1/4) "
+        "secant count (and the k=1 rank-1-ray case differs again), so read this as a "
+        "qualitative climb-then-flatten vs keep-climbing signature, not an exact EV scaling. "
+        "Inspect each row's hybrid_split.atoms for fitted_turning Θ and LOAO ΔEV; the in-tree "
+        "predictor for this curve is tests/sae/sae_ev_vs_k_frontier.rs."
     )
     acceptance = _acceptance_report(
         rows,
@@ -406,6 +556,7 @@ def main() -> None:
             "test_n": int(len(test_idx)),
             "input_dim": int(x.shape[1]),
             "pcs": int(args.pcs),
+            "pca_retained_var_ratio": float(r),
             "max_rows": args.max_rows,
             "seed": int(args.seed),
             "n_iter": int(args.n_iter),

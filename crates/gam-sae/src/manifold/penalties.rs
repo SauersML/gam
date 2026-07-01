@@ -437,26 +437,35 @@ impl SaeManifoldTerm {
         rel * rel * max_norm_sq
     }
 
-    /// #1610 — the dictionary's NOMINAL reachable linear rank: the linear
-    /// dimension the union of the atoms' chart images can span on this sample,
-    /// `min(Σ_k min(M_k, p), n, p)`. This is the cheap (SVD-free) form of
-    /// [`super::outer_objective::reachable_dictionary_rank`]: it uses each atom's
-    /// nominal coefficient count `M_k` (capped at the output dim `p`) instead of
-    /// the realized chart-image rank. The realized (SVD) rank is what the collapse
-    /// THRESHOLD keys on — it must not over-state a curved atom's linear reach —
-    /// but the barrier STRENGTH below only needs a coarse overcompleteness scalar,
-    /// so it deliberately uses the nominal count (exactly the value
-    /// `reachable_dictionary_rank` itself falls back to when an atom's chart SVD is
-    /// un-computable) and avoids a per-line-search-trial SVD over the `n × M_k`
-    /// chart designs. `0` only for a degenerate empty term.
-    pub(crate) fn nominal_reachable_rank(&self) -> usize {
+    /// #1610 — the dictionary's NOMINAL decoder-rank DEMAND: the total linear rank
+    /// the atoms' chart images WANT to occupy, `Σ_k min(M_k, p)` — each atom's
+    /// coefficient count capped at the output dim (an atom cannot span more than
+    /// `p` output directions). This is the cheap (SVD-free) nominal analog of the
+    /// realized per-atom summands in
+    /// [`super::outer_objective::reachable_dictionary_rank`]; the barrier STRENGTH
+    /// only needs a coarse overcompleteness scalar, so it uses the nominal count
+    /// and avoids a per-line-search-trial SVD over the `n × M_k` chart designs.
+    ///
+    /// UNCAPPED on purpose (unlike the realized reachable rank): the demand is the
+    /// NUMERATOR of the overcompleteness ratio, so capping it at the space capacity
+    /// `min(n, p)` would exactly cancel the overcompleteness the ratio must expose.
+    /// `0` only for a degenerate empty term.
+    pub(crate) fn nominal_rank_demand(&self) -> usize {
         let p = self.output_dim();
         let n = self.n_obs();
         if p == 0 || n == 0 {
             return 0;
         }
-        let sum: usize = self.atoms.iter().map(|atom| atom.basis_size().min(p)).sum();
-        sum.min(n).min(p)
+        self.atoms.iter().map(|atom| atom.basis_size().min(p)).sum()
+    }
+
+    /// #1610 — the linear CAPACITY of the fit: the number of independent output
+    /// directions the sample/output space can actually hold, `min(n, p)` (floored
+    /// at 1 for numerical safety). This is the denominator of the overcompleteness
+    /// ratio — the "true completeness" scale at which the nominal rank demand
+    /// exactly fills the space.
+    pub(crate) fn linear_rank_capacity(&self) -> usize {
+        self.n_obs().min(self.output_dim()).max(1)
     }
 
     /// #1026/#1522/#1610 — DATA-DERIVED separation-barrier strength `μ_C`.
@@ -469,31 +478,41 @@ impl SaeManifoldTerm {
     /// orthogonality; it sees only the SHAPE, so it does not switch off at small
     /// amplitude.
     ///
-    /// #1610 — the strength is no longer the hand-picked absolute `10.0` (a
-    /// magnitude matched to no problem scale; the old constant only "worked" at a
-    /// unit corpus scale). The documented collapse mechanism (see `term.rs`
-    /// ~`SaeManifoldTerm` doc: two atoms drift onto ONE decoder direction "at
-    /// `K ≥ 4` on real residual geometry") is driven by OVERCOMPLETENESS — collapse
-    /// pressure rises precisely as the atom count `K` outruns the linear rank the
-    /// corpus can actually support — so the anti-collinearity barrier's stiffness
-    /// is keyed to that same overcompleteness:
+    /// #1610 — the strength is no longer the hand-picked absolute `10.0`, nor the
+    /// mis-scaled `K / Σ_k min(M_k, p)` (which gave `1/M` — e.g. `1/3` for periodic
+    /// `M = 3` atoms — instead of unit strength at completeness, and did not grow
+    /// with the atom count while the `min(n,p)` cap was slack). The documented
+    /// collapse mechanism (see `term.rs` ~`SaeManifoldTerm` doc: two atoms drift
+    /// onto ONE decoder direction "at `K ≥ 4` on real residual geometry") is driven
+    /// by OVERCOMPLETENESS — collapse pressure rises precisely as the dictionary's
+    /// nominal rank demand outruns the linear rank the corpus can actually support
+    /// — so the barrier stiffness is keyed to that overcompleteness RATIO:
     ///
-    ///   `μ_C = K / reachable_rank`.
+    /// ```text
+    ///   μ_C = nominal_rank_demand / linear_rank_capacity
+    ///       = ( Σ_k min(M_k, p) ) / min(n, p).
+    /// ```
     ///
-    /// This is (a) DIMENSIONLESS — a ratio of counts/ranks — so the barrier value
-    /// stays invariant under a global corpus rescaling `B_k → s·B_k` (the same
-    /// scale-free property the #1610 norm-floor and energy-normalized repulsion
-    /// already guarantee, since `c_jk²` and `q_jk` are scale-free); (b)
-    /// DATA-DERIVED — the reachable rank is read from the actual chart/coefficient
-    /// geometry (the established #1610 quantity), not a frozen constant; and (c)
-    /// PRINCIPLED — an exactly-complete dictionary (`K = rank`) gets the
-    /// unit-information barrier `μ_C = 1`, while a `q`-times-overcomplete dictionary
-    /// gets `μ_C = q`, so the barrier strengthens exactly where the collapse it
-    /// prevents is driven from. The interior-point `1/(1-c²+ε)` divergence supplies
-    /// the restoring force near alignment regardless of the prefactor (the old doc
-    /// already noted "a large flat-region prefactor is unnecessary"), so keying the
-    /// O(1) prefactor to the overcompleteness — rather than freezing it at 10 —
-    /// removes the magic without losing the barrier near the collapse boundary.
+    /// This realizes the intended semantics exactly:
+    ///
+    ///  * `μ_C ≈ 1` at TRUE COMPLETENESS — when the atoms' nominal rank demand just
+    ///    fills the space (`Σ_k min(M_k, p) = min(n, p)`). A single periodic atom
+    ///    (`Φ = [1, sin, cos]`, `M = 3`) in `p = 3` gives `μ_C = 3/3 = 1`.
+    ///  * `μ_C > 1` and GROWING with overcompleteness — two such periodic atoms in
+    ///    `p = 3` give `μ_C = 6/3 = 2` (2× overcomplete); adding atoms raises the
+    ///    demand while the capacity is fixed, so `μ_C` grows with `K` exactly as the
+    ///    collapse pressure does. This is the atom-overcompleteness reading: `K`
+    ///    rank-`r` atoms vs the `capacity/r` independent atom-slots the space holds
+    ///    is `(K·r)/capacity = demand/capacity`.
+    ///  * `μ_C < 1` when the dictionary under-fills the space (no collapse pressure).
+    ///
+    /// It is (a) DIMENSIONLESS — a ratio of ranks — so the barrier value stays
+    /// invariant under a global corpus rescaling `B_k → s·B_k` (`c_jk²` and `q_jk`
+    /// are already scale-free); and (b) DATA-DERIVED — both demand and capacity are
+    /// read from the actual chart/coefficient geometry and the sample/output dims,
+    /// not a frozen constant. Using the NOMINAL (SVD-free) rank demand rather than
+    /// the realized chart-image ranks keeps the strength cheap enough to evaluate on
+    /// every line-search trial while the collapse THRESHOLD pays for the exact rank.
     ///
     /// #1610 — why the strength is a dimensionless geometry ratio and NOT a
     /// marginal-likelihood (REML) selection. A REML/evidence-selected penalty
@@ -507,32 +526,30 @@ impl SaeManifoldTerm {
     /// `B_k → s·B_k` (locked by `separation_barrier_collapse_prevention_is_scale_invariant_1610`).
     /// These two requirements are in direct tension: a fully REML-derived `μ_C`
     /// would re-introduce the decoder-energy units the scale-invariance work
-    /// removed. Scale-invariance is the requirement that holds (an SAE decoder
-    /// inherits the activations' arbitrary scale; the anti-collapse geometry must
-    /// not), so the strength MUST be a dimensionless quantity read from the
-    /// dictionary geometry, not a scale-bearing REML balance. Among such
-    /// dimensionless invariants, `K / reachable_rank` is the one keyed to the
-    /// DOCUMENTED collapse driver (overcompleteness — see the `term.rs`
-    /// `SaeManifoldTerm` doc: atoms co-collapse "at `K ≥ 4` … as the atom count
-    /// outruns the linear rank the corpus supports"), giving the unit-information
-    /// barrier `μ_C = 1` at exact completeness and `μ_C = q` at `q×`
-    /// overcompleteness. It is therefore principled (collapse-driver-keyed), not
-    /// an arbitrary magic prefactor. The only data-faithful refinement available
-    /// — keying the rank on the realized chart-image ranks `Σ_k rank(Φ_k)` the
-    /// collapse BAR already uses, instead of the nominal coefficient counts — is
-    /// deliberately declined HERE (see `nominal_reachable_rank`) because it costs
-    /// a per-line-search-trial SVD over the `n × M_k` chart designs; it stays a
-    /// coarse overcompleteness scalar while the THRESHOLD pays for the exact rank.
+    /// removed. Scale-invariance is the requirement that holds, so the strength MUST
+    /// be a dimensionless quantity read from the dictionary geometry, and the
+    /// overcompleteness ratio `demand/capacity` is the one keyed to the DOCUMENTED
+    /// collapse driver. The interior-point `1/(1-c²+ε)` divergence supplies the
+    /// restoring force near alignment regardless of the prefactor, so keying the
+    /// O(1) prefactor to this ratio — rather than freezing it at 10 — removes the
+    /// magic without losing the barrier near the collapse boundary.
     ///
     /// The process-global runtime override (`set_sae_barrier_overrides`, used by
     /// the Python FFI to sweep `μ_C` from one compiled wheel) takes precedence:
-    /// when set, it is the absolute `μ_C` and the derived value is bypassed.
+    /// when set, it is the absolute `μ_C` and the derived value is bypassed. A
+    /// degenerate empty term (`n = 0` or `p = 0`) has no collapse geometry, so the
+    /// derived strength is `0` (barrier off), and the disabled override `0.0` keeps
+    /// the barrier a strict no-op through the same short-circuit.
     pub(crate) fn separation_barrier_strength(&self) -> f64 {
         if let Some(over) = sae_separation_barrier_override() {
             return over;
         }
-        let rank = self.nominal_reachable_rank().max(1);
-        (self.k_atoms() as f64) / (rank as f64)
+        let demand = self.nominal_rank_demand();
+        if demand == 0 {
+            // Degenerate empty term — no collapse geometry, barrier off.
+            return 0.0;
+        }
+        (demand as f64) / (self.linear_rank_capacity() as f64)
     }
 
     /// #1610 derived decoder-repulsion strength: a dimensionless fraction

@@ -102,6 +102,7 @@ mod newton_step;
 mod penalty_ops;
 mod prelude;
 mod reduced_solve;
+mod slq_logdet;
 mod solve_options;
 mod system;
 
@@ -116,5 +117,6 @@ pub use newton_step::*;
 pub use penalty_ops::*;
 pub use prelude::*;
 pub use reduced_solve::*;
+pub use slq_logdet::*;
 pub use solve_options::*;
 pub use system::*;

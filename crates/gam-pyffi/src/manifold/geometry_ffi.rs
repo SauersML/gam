@@ -4688,7 +4688,8 @@ fn thin_svd_scores<'py>(
     assignment = "top_k",
     temperature = 0.25,
     code_ridge = 1.0e-8,
-    tolerance = 1.0e-7
+    tolerance = 1.0e-7,
+    center_rank_one = false
 ))]
 fn linear_dictionary_fit<'py>(
     py: Python<'py>,
@@ -4700,6 +4701,7 @@ fn linear_dictionary_fit<'py>(
     temperature: f64,
     code_ridge: f64,
     tolerance: f64,
+    center_rank_one: bool,
 ) -> PyResult<Py<PyDict>> {
     let x_values = x.as_array().to_owned();
     let assignment_kind = LinearDictionaryAssignment::parse(assignment).map_err(py_value_error)?;
@@ -4711,6 +4713,7 @@ fn linear_dictionary_fit<'py>(
         temperature,
         code_ridge,
         tolerance,
+        center_rank_one,
     };
     let fit = detach_py_result(py, "linear_dictionary_fit", move || {
         fit_linear_dictionary(x_values.view(), &config)

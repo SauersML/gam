@@ -47,12 +47,12 @@ The full signature, with defaults (keyword-only arguments follow the `*`):
 | `atom_topology` | `"circle"` | global topology string (see table) |
 | `assignment` | `"ibp_map"` | gate kind: `ibp_map` / `softmax` / `jumprelu` |
 | `schedule` | `None` | `GumbelTemperatureSchedule` for annealed gates |
-| `isometry_weight` | `0.0` | unit-speed gauge penalty (off by default) |
+| `isometry_weight` | `1.0` | unit-speed gauge penalty (on by default) |
 | `ard_per_atom` | `True` | ARD pruning of unused coordinate axes |
 | `decoder_feature_sparsity_groups` | `None` | output-feature partition for decoder group-lasso |
 | `n_iter` | `50` | joint-solve iterations |
-| `sparsity_weight` | `1.0` | strength of the gate-sparsity penalty |
-| `gate_sparsity` | `"scad"` | `scad` / `mcp` / `l1` |
+| `sparsity_weight` | `1.0` | strength of the `gate_sparsity` coordinate-shrinkage penalty |
+| `gate_sparsity` | `"scad"` | coordinate (latent `t`-block) magnitude penalty: `scad` / `mcp` / `l1` (a more accurate name would be `coord_sparsity`) |
 | `scad_mcp_gamma` | `None` | SCAD/MCP concavity (defaults SCAD 3.7, MCP 2.5) |
 | `smoothness_weight` | `1.0` | roughness penalty strength |
 | `alpha` | `1.0` | ARD/precision seed (`float` or a string policy) |
@@ -62,7 +62,7 @@ The full signature, with defaults (keyword-only arguments follow the `*`):
 | `nuclear_norm_weight` | `1.0` | embedding-rank selection penalty |
 | `nuclear_norm_max_rank` | `None` | optional cap on the embedding rank |
 | `decoder_incoherence_weight` | `1.0` | cross-atom incoherence (separability lever) |
-| `top_k` | `None` | cap on per-token active atoms, applied as a **post-fit** hard projection (#1409). Under `softmax` assignment the inner solve still optimises all `K` atoms; `top_k` truncates each token's assignments afterward. It is a sparsity cap on the reported support, **not** a reduction of the fit's per-token compute. (Gate-style modes — `jumprelu` / IBP-MAP — engage the compact active-set layout during the fit.) |
+| `top_k` | `None` | cap on per-token active atoms, folded into the **optimization** as a **train-time active-set cap** (#1408/#1419). The engine builds the compact active×active solve over the capped per-token support (for `softmax`, `jumprelu`, and IBP-MAP), so it bounds the fit's per-token compute, not merely the reported support. The engine additionally applies an automatic **memory-budget cap**: when the dense `K` working set would exceed the host/device budget, the compact active-set layout engages even without an explicit `top_k`. `None`/`0` disable the explicit cap. |
 | `t_init` | `None` | coordinate warm start `(K, N, D_max)` |
 | `a_init` | `None` | assignment-logit warm start `(N, K)` |
 | `tau` | `None` | Gumbel-softmax temperature |
@@ -87,7 +87,7 @@ of typed shapes:
 | `duchon` | any | Duchon thin-plate RKHS | open Euclidean patch with the thin-plate roughness Gram |
 | `sphere` | 2 | intrinsic S² (lat, lon) chart | sphere, no pole artefacts |
 | `torus` | 2 (each axis) | doubly-periodic Fourier | torus, seamless on both axes |
-| `cylinder` | 2 | periodic circle axis ⊗ flat line axis | cylinder `S¹ × ℝ`, periodic in axis 0, open in axis 1 |
+| `cylinder` (**discovery-only**) | 2 | periodic circle axis ⊗ flat line axis | cylinder `S¹ × ℝ`, periodic in axis 0, open in axis 1. **Not seedable**: cylinder atoms are birth-discovered by the structure search, not accepted as a closed-form `atom_topology` / `atom_basis` seed (the seed path rejects it). |
 | `poincare` (aliases `hyperbolic`, `poincare_patch`) | any | monomial patch, hyperbolic roughness metric | Poincaré-ball tangent patch at curvature `c = −1` (wiggle measured in hyperbolic arc length) |
 | any other string | any | caller-supplied | `Precomputed`: a precomputed basis you attach yourself |
 
@@ -170,23 +170,26 @@ smoothing weights selected by REML. Each piece plays a distinct role
   count per atom is `fit.atoms[k].active_dim` (also `fit.summary()
   ["active_dims"]`).
 
-- **Isometry gauge** (`isometry_weight=0.0`, **off by default**).
+- **Isometry gauge** (`isometry_weight=1.0`, **on by default**).
   `IsometryPenalty` drives the pulled-back metric
   `g = J^T J` toward a unit-average-speed chart, making `t` easier to read as
-  near arc length when the penalty is enabled. It is no longer required for
-  topology evidence: the Rust core reparameterizes decoder roughness by the
-  pulled-back metric, so `fit.reml_score` is gauge-invariant with
-  `isometry_weight=0.0`.
+  near arc length. It is not required for topology comparison: the Rust core
+  reparameterizes decoder roughness by the pulled-back metric, so
+  `fit.penalized_loss_score` is gauge-invariant under reparameterizing `t`
+  even with `isometry_weight=0.0`. Set the weight to `0.0` to disable the gauge.
 
 - **Smoothness** (`smoothness_weight=1.0`). Roughness penalty on each atom's
   decoded curve, a fixed finite-/cyclic-difference Gram in the latent
   coordinate.
 
-- **Gate sparsity penalty** (`gate_sparsity="scad"` default; `"l1"` /
-  `"mcp"` alternatives). `scad` and `mcp` emit a row-block `ScadMcpPenalty` on
-  the latent block, using `sparsity_weight=` as its strength and
-  `scad_mcp_gamma=` as the concavity/taper (defaults SCAD `3.7`, MCP `2.5`).
-  `l1` keeps the historical assignment-prior sparsity path.
+- **Coordinate-magnitude penalty** (`gate_sparsity="scad"` default; `"l1"` /
+  `"mcp"` alternatives). Despite the parameter name, `scad` and `mcp` do **not**
+  penalize the gate/assignment: they emit a row-block `ScadMcpPenalty` on the
+  latent coordinate (`"t"`) block — coordinate shrinkage *inside* an active atom
+  — using `sparsity_weight=` as its strength and `scad_mcp_gamma=` as the
+  concavity/taper (defaults SCAD `3.7`, MCP `2.5`). A more accurate name for the
+  knob would be `coord_sparsity`. `l1` emits no coordinate penalty and keeps the
+  historical assignment-prior sparsity path.
 
 Two more knobs: `decoder_feature_sparsity_groups=` group-lassoes the decoder
 over a partition of the `p` output features (encouraging each basis function
@@ -298,7 +301,7 @@ the full surface):
 | `coords` | `[ (N, d_k) ]` per-atom per-token coordinates |
 | `decoder_blocks` | `[ (M_k, p) ]` per-atom decoder matrices |
 | `fitted` / `assignments` | `(N, p)` training reconstruction / `(N, K)` gates |
-| `reconstruction_r2` / `reml_score` / `dispersion` | fit-quality / evidence / noise scale |
+| `reconstruction_r2` / `penalized_loss_score` / `dispersion` | fit-quality / negative penalized-loss objective (NOT REML / evidence; `reml_score` is a deprecated read alias) / noise scale |
 
 Methods: `predict` / `reconstruct(X)`, `encode(X)` (out-of-sample gates),
 `project(X, k)`, `per_atom_latent_for(X)` and `featurize(X)` (coordinates),
@@ -325,7 +328,7 @@ gates, stats = fit.encode(X, return_stats=True)
 coords = fit.featurize(X)    # [ (N, d_k) ] per-atom coords (alias of per_atom_latent_for)
 coords = fit.per_atom_latent_for(X)
 active = fit.per_atom_active_set(X, threshold=None)  # (N, K) bool active mask
-proj_k = fit.project(X, atom_k=0)        # (N, p) single-atom reconstruction
+proj_k = fit.project(X, atom_k=0)        # (N, d_k) on-manifold coordinate block for the atom
 latents = fit.converged_latents(X)       # exact solver targets for distillation
 encoder = fit.distill_encoder(X)         # amortized torch encoder from exact solves
 ```
