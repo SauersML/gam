@@ -3225,6 +3225,269 @@ mod oracle_parity_tests {
 
         BmsFlexRowKernelOutputs { neglog, grad, hess }
     }
+
+    // #415 parity lock. This test lives HERE (a descendant of `bms::gpu::row`)
+    // rather than in `bms::row_primary_hessian` because the host oracle
+    // `cpu_oracle_outputs` must live in a PRIVATE `#[cfg(test)]` mod (the
+    // build.rs ban-scanner forbids `#[cfg(test)]` on a non-private mod), so a
+    // sibling module cannot reach it. Nested here, the test sees the private
+    // oracle directly while the packer/CPU-family methods it drives are
+    // `pub(in crate::bms)` and stay reachable. The nested module carries no
+    // `#[cfg(test)]` attribute of its own (it inherits the parent's), so it is
+    // ban-scanner-clean.
+    mod parity_415 {
+        //! #415 parity lock: the GPU-host oracle `cpu_oracle_outputs` (which
+        //! GATES the device row kernel via
+        //! `bms_flex_row_kernel_matches_cpu_oracle_when_cuda_available`) must
+        //! reproduce the CPU family reference
+        //! `compute_row_analytic_flex_from_parts_into` element-for-element, from
+        //! ONE fitted `(family, block_states, cache)`.
+        //!
+        //! Before this test the only ties between the two were (1) an FD lock on
+        //! the outer scalar Mills layer and (2) a string-contains comment guard —
+        //! neither pins the cell-contraction algebra (`F_a`, `F_aa`, `F_au`,
+        //! `F_uv` → value/grad/Hessian). This closes that gap: the SAME fitted
+        //! state is packed into `BmsFlexRowKernelInputs` and run through
+        //! `cpu_oracle_outputs` for all rows, and independently run through the
+        //! CPU family per row; every row value, full gradient, and full r×r
+        //! Hessian must agree to ~1e-10.
+
+        use super::cpu_oracle_outputs;
+        use crate::bms::family::*;
+        use crate::bms::hessian_paths::*;
+        use crate::bms::{exact_kernel, DeviationBlockConfig, LatentMeasureKind};
+        use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix};
+        use gam_problem::{InverseLink, ParameterBlockState, StandardLink};
+        use ndarray::{Array1, Array2};
+        use std::sync::{Arc, Mutex};
+
+        /// Build a small but REAL flex BMS family in the `StandardNormal`
+        /// latent-measure branch with BOTH a score-warp (`p_h > 0`) and a
+        /// link-deviation (`p_w > 0`) block active, plus mixed labels y ∈ {0,1}.
+        /// Ported from the `gradient_paths` flex oracle fixture so the cache is
+        /// populated by the production cell-moment assembly (never hand-faked).
+        fn make_flex_parity_family(
+            n: usize,
+        ) -> (BernoulliMarginalSlopeFamily, Vec<ParameterBlockState>) {
+            let score_seed = Array1::linspace(-2.0, 2.0, n.max(6));
+            let link_seed = Array1::linspace(-1.8, 1.8, n.max(6));
+            let cfg = DeviationBlockConfig {
+                num_internal_knots: 3,
+                ..DeviationBlockConfig::default()
+            };
+            let score_prepared = build_score_warp_deviation_block_from_seed(&score_seed, &cfg)
+                .expect("build score warp block");
+            let link_prepared = build_link_deviation_block_from_knots_design_seed_and_weights(
+                &link_seed, &link_seed, &cfg,
+            )
+            .expect("build link deviation block");
+
+            // Mixed labels y ∈ {0,1} so both s_y = ±1 Mills branches are exercised.
+            let y: Array1<f64> =
+                Array1::from_iter((0..n).map(|i| if (i * 17 + 3) % 7 >= 4 { 1.0 } else { 0.0 }));
+            let weights: Array1<f64> =
+                Array1::from_iter((0..n).map(|i| 0.75 + ((i * 11 + 5) % 5) as f64 * 0.05));
+            let z: Array1<f64> =
+                Array1::from_iter((0..n).map(|i| -1.7 + 3.4 * (i as f64 + 0.5) / n as f64));
+            let marginal_x = Array2::from_shape_fn((n, 2), |(i, j)| {
+                if j == 0 {
+                    1.0
+                } else {
+                    -0.4 + 0.8 * ((i * 19 + 7) % n) as f64 / n as f64
+                }
+            });
+            let logslope_x = Array2::from_shape_fn((n, 2), |(i, j)| {
+                if j == 0 {
+                    1.0
+                } else {
+                    0.3 - 0.6 * ((i * 23 + 11) % n) as f64 / n as f64
+                }
+            });
+
+            let family = BernoulliMarginalSlopeFamily {
+                y: Arc::new(y),
+                weights: Arc::new(weights),
+                z: Arc::new(z.clone()),
+                latent_measure: LatentMeasureKind::StandardNormal,
+                gaussian_frailty_sd: Some(0.15),
+                base_link: InverseLink::Standard(StandardLink::Probit),
+                marginal_design: DesignMatrix::Dense(DenseDesignMatrix::from(marginal_x.clone())),
+                logslope_design: DesignMatrix::Dense(DenseDesignMatrix::from(logslope_x.clone())),
+                score_warp: Some(score_prepared.runtime.clone()),
+                link_dev: Some(link_prepared.runtime.clone()),
+                policy: gam_runtime::resource::ResourcePolicy::default_library(),
+                cell_moment_lru: Arc::new(exact_kernel::CellMomentLruCache::new(1024)),
+                cell_moment_cache_stats: Arc::new(exact_kernel::CellMomentCacheStats::default()),
+                intercept_warm_starts: None,
+                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            };
+
+            let beta_m = Array1::from_vec(vec![0.12, -0.04]);
+            let beta_g = Array1::from_vec(vec![0.35, 0.03]);
+            let beta_h = Array1::from_iter(
+                (0..score_prepared.runtime.basis_dim()).map(|idx| 0.0015 * (idx as f64 + 1.0)),
+            );
+            let beta_w = Array1::from_iter(
+                (0..link_prepared.runtime.basis_dim()).map(|idx| -0.001 * (idx as f64 + 1.0)),
+            );
+            let states = vec![
+                ParameterBlockState {
+                    eta: marginal_x.dot(&beta_m),
+                    beta: beta_m,
+                },
+                ParameterBlockState {
+                    eta: logslope_x.dot(&beta_g),
+                    beta: beta_g,
+                },
+                ParameterBlockState {
+                    beta: beta_h,
+                    eta: Array1::zeros(z.len()),
+                },
+                ParameterBlockState {
+                    beta: beta_w,
+                    eta: Array1::zeros(z.len()),
+                },
+            ];
+            (family, states)
+        }
+
+        /// The non-vacuous #415 lock: pack once, run the host oracle for all
+        /// rows, run the CPU family per row, and assert value/gradient/Hessian
+        /// parity.
+        #[test]
+        fn cpu_oracle_matches_cpu_family_row_analytic_flex_415() {
+            let n = 12usize;
+            let (family, states) = make_flex_parity_family(n);
+            let cache = family
+                .build_exact_eval_cache(&states)
+                .expect("flex exact eval cache");
+
+            // Preconditions that make the lock non-vacuous: the row-cell-moments
+            // bundle (which the oracle consumes) must actually be materialised,
+            // and the deviation blocks must both be present so p_h > 0 AND p_w > 0.
+            assert!(
+                cache.row_cell_moments.is_some(),
+                "#415 fixture must materialise the row-cell-moments bundle; the pack \
+                 and both compared paths read it"
+            );
+            let primary = &cache.primary;
+            let r = primary.total;
+            let p_h = primary.h.as_ref().map(|range| range.len()).unwrap_or(0);
+            let p_w = primary.w.as_ref().map(|range| range.len()).unwrap_or(0);
+            assert!(p_h > 0 && p_w > 0, "#415 fixture must be full-flex: p_h={p_h} p_w={p_w}");
+            assert_eq!(r, 2 + p_h + p_w, "#415 fixture primary layout");
+
+            // Pack the SAME fitted state the CPU family will consume, then run the
+            // GPU host oracle over every row.
+            let owned = family
+                .pack_bms_flex_row_kernel_inputs(&states, &cache)
+                .expect("pack must not error")
+                .expect("pack must succeed for the StandardNormal full-flex fixture");
+            let inputs = owned.as_borrowed();
+            let oracle = cpu_oracle_outputs(&inputs);
+            assert_eq!(oracle.neglog.len(), n);
+            assert_eq!(oracle.grad.len(), n * r);
+            assert_eq!(oracle.hess.len(), n * r * r);
+
+            // Both sides are exact f64 CPU math over the SAME cached moments, so
+            // the only slack is FP summation ordering. Anything looser than this
+            // would hide a real algebraic drift.
+            let tol_abs = 1e-9_f64;
+            let tol_rel = 1e-10_f64;
+
+            let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(r);
+            let mut max_rel = 0.0_f64;
+            let mut checked_labels = [false, false];
+
+            for row in 0..n {
+                let row_ctx = BernoulliMarginalSlopeFamily::row_ctx(&cache, row);
+                let row_moments = cache
+                    .row_cell_moments
+                    .as_ref()
+                    .and_then(|bundle| bundle.row(row, 9));
+                assert!(
+                    row_moments.is_some(),
+                    "row {row} must carry degree-9 cell moments (the oracle reads them)"
+                );
+                let label = family.y[row] as usize;
+                if label < 2 {
+                    checked_labels[label] = true;
+                }
+
+                let value = family
+                    .compute_row_analytic_flex_into_with_moments(
+                        row,
+                        &states,
+                        primary,
+                        row_ctx,
+                        row_moments,
+                        cache.cell_family_forest.as_ref(),
+                        true,
+                        &mut scratch,
+                    )
+                    .expect("cpu family row analytic flex");
+
+                // ── value ────────────────────────────────────────────────────
+                let o_val = oracle.neglog[row];
+                if o_val.is_nan() || value.is_nan() {
+                    assert!(
+                        o_val.is_nan() && value.is_nan(),
+                        "row {row}: NaN parity broke — oracle={o_val} family={value}"
+                    );
+                    continue;
+                }
+                let vd = (o_val - value).abs();
+                let vtol = tol_abs + tol_rel * o_val.abs();
+                max_rel = max_rel.max(vd / o_val.abs().max(1.0));
+                assert!(
+                    vd <= vtol,
+                    "row {row} value drift: oracle={o_val:.17e} family={value:.17e} \
+                     |Δ|={vd:.3e} > tol={vtol:.3e}"
+                );
+
+                // ── gradient ─────────────────────────────────────────────────
+                for u in 0..r {
+                    let o_g = oracle.grad[row * r + u];
+                    let f_g = scratch.grad[u];
+                    let gd = (o_g - f_g).abs();
+                    let gtol = tol_abs + tol_rel * o_g.abs();
+                    max_rel = max_rel.max(gd / o_g.abs().max(1.0));
+                    assert!(
+                        gd <= gtol,
+                        "row {row} grad[{u}] drift: oracle={o_g:.17e} family={f_g:.17e} \
+                         |Δ|={gd:.3e} > tol={gtol:.3e}"
+                    );
+                }
+
+                // ── full r×r Hessian ─────────────────────────────────────────
+                for u in 0..r {
+                    for v in 0..r {
+                        let o_h = oracle.hess[row * r * r + u * r + v];
+                        let f_h = scratch.hess[[u, v]];
+                        let hd = (o_h - f_h).abs();
+                        let htol = tol_abs + tol_rel * o_h.abs();
+                        max_rel = max_rel.max(hd / o_h.abs().max(1.0));
+                        assert!(
+                            hd <= htol,
+                            "row {row} hess[{u},{v}] drift: oracle={o_h:.17e} \
+                             family={f_h:.17e} |Δ|={hd:.3e} > tol={htol:.3e}"
+                        );
+                    }
+                }
+            }
+
+            // Edge coverage: both label branches must have been exercised (the
+            // q-row overrides F_q=-mu_1 / F_qq=-mu_2 and both Mills sign branches).
+            assert!(
+                checked_labels[0] && checked_labels[1],
+                "#415 fixture must exercise both y=0 and y=1 rows: {checked_labels:?}"
+            );
+            eprintln!(
+                "#415 parity lock: n={n} r={r} p_h={p_h} p_w={p_w} max_rel(oracle−family)={max_rel:.3e}"
+            );
+        }
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
