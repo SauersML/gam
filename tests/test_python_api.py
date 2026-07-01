@@ -445,10 +445,19 @@ def test_sklearn_classifier_string_labels_roundtrip() -> None:
     # In-sample accuracy on this logistic problem should clear chance by a
     # wide margin once the labels are encoded correctly; pre-fix the
     # comparison is between '0/1' ints and 'pos/neg' strings, so accuracy is 0.
+    #
+    # The bar is 0.6, not 0.7: with P(y=1|x)=sigmoid(x) on x~U(-2, 2) the
+    # Bayes-optimal (unbeatable) in-sample accuracy is only
+    # (1/2)∫₀² sigmoid(x) dx ≈ 0.717, and the sampling SE at n=200 is ≈0.03, so
+    # a 0.7 bar sits inside sampling noise of the theoretical ceiling and its
+    # pass/fail is decided by the seed rather than by whether the labels were
+    # encoded. 0.6 is ~3.5σ below the ceiling (robust to the seed) while still
+    # cleanly rejecting the pre-fix label-mismatch failure (0.0) and chance
+    # (0.5) — which is the only thing this test is asserting.
     accuracy = float((predicted == y_str).mean())
-    assert accuracy > 0.7, (
+    assert accuracy > 0.6, (
         f"GAMClassifier in-sample accuracy on string labels = {accuracy:.3f}; "
-        "must clear 0.7 once labels are encoded (pre-fix was 0.0)."
+        "must clear 0.6 once labels are encoded (pre-fix was 0.0)."
     )
 
 
@@ -470,10 +479,15 @@ def test_sklearn_classifier_pm1_labels_roundtrip() -> None:
     assert set(np.unique(predicted)).issubset({-1, 1}), (
         f"predict must return labels from classes_; got {np.unique(predicted)!r}"
     )
+    # Bar is 0.6, not 0.7: the Bayes-optimal accuracy for P(y=1|x)=sigmoid(x)
+    # on x~U(-2, 2) is only ≈0.717 (see test_sklearn_classifier_string_labels_
+    # roundtrip), so a 0.7 bar is within sampling noise of the theoretical
+    # ceiling and this seed lands at 0.690. 0.6 still cleanly rejects the
+    # pre-fix label-mismatch failure (0.0) — the actual regression under test.
     accuracy = float((predicted == y_pm).mean())
-    assert accuracy > 0.7, (
+    assert accuracy > 0.6, (
         f"GAMClassifier in-sample accuracy on {{-1, +1}} labels = "
-        f"{accuracy:.3f}; must clear 0.7 once labels are encoded."
+        f"{accuracy:.3f}; must clear 0.6 once labels are encoded."
     )
 
 
