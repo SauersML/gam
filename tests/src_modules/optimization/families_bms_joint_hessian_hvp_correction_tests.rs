@@ -1798,6 +1798,209 @@ fn bernoulli_batched_outer_gradient_matches_hypercoord_path_for_rho_and_psi() {
     }
 }
 
+/// gam#1607 regression, ROOT-CAUSE angle: the workspace's ψψ second derivative
+/// of the joint Hessian (`hessian_psi_psi`, feeding both the LAML `½log|H|`
+/// curvature and the explicit Firth `∂²_ψΦ`) must equal a centered FINITE
+/// DIFFERENCE of its OWN first-order `∂_ψH` across the matern length-scale — the
+/// direct ground truth for the kernel, one level below the full outer-Hessian
+/// gate below. The isotropic-matern `∂²X/∂ψ²` self-second-derivative was being
+/// resolved to ZERO (the aniso `implicit_group_id.is_some()` guard excluded the
+/// ungrouped single-axis diagonal), so `hessian_psi_psi` came out at ~55% of
+/// truth with the cross-block/off-diagonal `J̈` terms missing. This asserts the
+/// full `∂²_ψH` matrix (both the per-pair and #740 contracted paths) matches FD,
+/// on a fixed-β point (the identity is β-fixed, so any β exercises it).
+#[test]
+fn bernoulli_isotropic_matern_psi_psi_joint_hessian_matches_fd_of_first() {
+    use crate::custom_family::PenaltyMatrix;
+    use crate::spatial_psi_bridge::build_block_spatial_psi_derivatives;
+    use gam_terms::basis::{CenterStrategy, MaternBasisSpec, MaternNu};
+    use gam_terms::smooth::{
+        ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, build_term_collection_design,
+        freeze_term_collection_from_design,
+    };
+
+    let n = 120usize;
+    let mut data = Array2::<f64>::zeros((n, 3));
+    for i in 0..n {
+        let x0 = (i as f64 / (n as f64 - 1.0)) * 2.0 - 1.0;
+        let x1 = (0.41 * i as f64).sin() * 0.6 + 0.25 * x0;
+        let xm = (0.23 * i as f64).cos() * 0.8;
+        data[[i, 0]] = x0;
+        data[[i, 1]] = x1;
+        data[[i, 2]] = xm;
+    }
+    let y: Array1<f64> = Array1::from_iter((0..n).map(|i| {
+        let lin = 0.5 + 0.7 * data[[i, 2]] - 0.4 * data[[i, 0]] + 0.3 * data[[i, 1]];
+        let p = 1.0 / (1.0 + (-lin).exp());
+        let u = ((i * 2654435761usize) % 1000) as f64 / 1000.0;
+        if u < p { 1.0 } else { 0.0 }
+    }));
+    let z: Array1<f64> =
+        Array1::from_iter((0..n).map(|i| -1.0 + 2.0 * ((i % 9) as f64 + 0.5) / 9.0));
+    let weights = Array1::from_elem(n, 1.0);
+    let marginal_cov: Array1<f64> = data.column(2).to_owned();
+    let base_length_scale = 1.1_f64;
+    let make_spec = |length_scale: f64| TermCollectionSpec {
+        linear_terms: Vec::new(),
+        random_effect_terms: Vec::new(),
+        smooth_terms: vec![SmoothTermSpec {
+            name: "spatial_logslope".to_string(),
+            basis: SmoothBasisSpec::Matern {
+                feature_cols: vec![0, 1],
+                spec: MaternBasisSpec {
+                    periodic: None,
+                    center_strategy: CenterStrategy::EqualMass { num_centers: 4 },
+                    length_scale,
+                    nu: MaternNu::ThreeHalves,
+                    include_intercept: false,
+                    double_penalty: false,
+                    identifiability: Default::default(),
+                    // Isotropic (single length-scale, no aniso group) — the exact
+                    // configuration whose `∂²X/∂ψ²` diagonal was gated to zero.
+                    aniso_log_scales: None,
+                    nullspace_shrinkage_survived: None,
+                },
+                input_scales: None,
+            },
+            shape: ShapeConstraint::None,
+            joint_null_rotation: None,
+        }],
+    };
+    let base_spec = make_spec(base_length_scale);
+    let base_design =
+        build_term_collection_design(data.view(), &base_spec).expect("base design");
+    let frozen_spec =
+        freeze_term_collection_from_design(&base_spec, &base_design).expect("freeze");
+    let p_log = base_design.design.ncols();
+    let beta_marg = array![0.4_f64, -0.3];
+    let beta_log = Array1::from_shape_fn(p_log, |k| 0.1 * ((k % 3) as f64 - 1.0));
+
+    // Build the workspace's `∂_ψH` (dense) at a given ψ = −log(length_scale)
+    // offset, and (at offset 0) its analytic `∂²_ψH` from BOTH the per-pair and
+    // the #740 contracted paths.
+    let build_at = |psi_offset: f64, want_second: bool| {
+        let mut spec = frozen_spec.clone();
+        if let SmoothBasisSpec::Matern { spec: ms, .. } = &mut spec.smooth_terms[0].basis {
+            ms.length_scale = base_length_scale * (-psi_offset).exp();
+        }
+        let design = build_term_collection_design(data.view(), &spec).expect("design");
+        let logslope_psi = build_block_spatial_psi_derivatives(data.view(), &spec, &design)
+            .expect("psi deriv")
+            .expect("psi deriv rows");
+        let derivative_blocks = vec![Vec::new(), logslope_psi];
+        let marginal_mat =
+            Array2::from_shape_fn((n, 2), |(r, c)| if c == 0 { 1.0 } else { marginal_cov[r] });
+        let marginal_design = DesignMatrix::Dense(
+            gam_linalg::matrix::DenseDesignMatrix::from(marginal_mat.clone()),
+        );
+        let logslope_design = design.design.clone();
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(y.clone()),
+            weights: Arc::new(weights.clone()),
+            z: Arc::new(z.clone()),
+            marginal_design: marginal_design.clone(),
+            logslope_design: logslope_design.clone(),
+            ..default_test_family()
+        };
+        let states = vec![
+            ParameterBlockState {
+                beta: beta_marg.clone(),
+                eta: marginal_mat.dot(&beta_marg),
+            },
+            ParameterBlockState {
+                beta: beta_log.clone(),
+                eta: logslope_design.dot(&beta_log),
+            },
+        ];
+        let penalties: Vec<PenaltyMatrix> = design.penalties_as_penalty_matrix();
+        let mut m_spec = dummy_blockspec(2, n);
+        m_spec.design = marginal_design;
+        let mut l_spec = dummy_blockspec(p_log, n);
+        l_spec.design = logslope_design;
+        l_spec.initial_log_lambdas = Array1::zeros(penalties.len());
+        l_spec.nullspace_dims = design.nullspace_dims.clone();
+        l_spec.penalties = penalties;
+        let specs = vec![m_spec, l_spec];
+        let opts = BlockwiseFitOptions::default();
+        let ws = family
+            .exact_newton_joint_psi_workspace_with_options(
+                &states,
+                &specs,
+                &derivative_blocks,
+                &opts,
+            )
+            .expect("ws")
+            .expect("ws some");
+        let total = p_log + 2;
+        let hpsi = {
+            let t = ws.first_order_terms(0).expect("fo").expect("fo some");
+            match t.hessian_psi_operator.as_ref() {
+                Some(op) => op.mul_mat(&Array2::<f64>::eye(total)),
+                None => t.hessian_psi.clone(),
+            }
+        };
+        let second = if want_second {
+            let dense = |dr: &gam_problem::DriftDerivResult| match dr {
+                gam_problem::DriftDerivResult::Operator(op) => op.to_dense(),
+                gam_problem::DriftDerivResult::Dense(m) => m.clone(),
+            };
+            let contracted = dense(
+                &ws.second_order_terms_contracted(&[1.0])
+                    .expect("so")
+                    .expect("so some")
+                    .hessian[0],
+            );
+            let pair = ws
+                .second_order_terms(0, 0)
+                .expect("pair")
+                .expect("pair some");
+            let pair_dense = pair
+                .hessian_psi_psi_operator
+                .as_ref()
+                .map(|op| op.to_dense())
+                .unwrap_or(pair.hessian_psi_psi);
+            Some((contracted, pair_dense))
+        } else {
+            None
+        };
+        (hpsi, second)
+    };
+
+    let eps = 1e-5;
+    let (_hpsi0, second) = build_at(0.0, true);
+    let (contracted, pair) = second.expect("second-order at 0");
+    let (hpsip, _) = build_at(eps, false);
+    let (hpsim, _) = build_at(-eps, false);
+    let true_second = (&hpsip - &hpsim).mapv(|v| v / (2.0 * eps));
+
+    let fro = |m: &Array2<f64>| m.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let reldiff = |a: &Array2<f64>, b: &Array2<f64>| fro(&(a - b)) / (1.0 + fro(b));
+    // The true `∂²_ψH` here is O(0.9) Frobenius with substantial cross-block and
+    // off-diagonal mass; the pre-fix analytic dropped that to ~0.51 (reldiff
+    // 0.53). Both analytic paths must now track the FD ground truth.
+    assert!(
+        fro(&true_second) > 0.3,
+        "FD ∂²_ψH must be non-degenerate (fro {:.4})",
+        fro(&true_second)
+    );
+    let rd_contracted = reldiff(&contracted, &true_second);
+    let rd_pair = reldiff(&pair, &true_second);
+    assert!(
+        rd_contracted < 2e-4,
+        "#740 contracted ∂²_ψH diverged from centered FD of ∂_ψH: reldiff {rd_contracted:.3e} \
+         (fro analytic {:.5} vs FD {:.5})",
+        fro(&contracted),
+        fro(&true_second)
+    );
+    assert!(
+        rd_pair < 2e-4,
+        "per-pair ∂²_ψH diverged from centered FD of ∂_ψH: reldiff {rd_pair:.3e} \
+         (fro analytic {:.5} vs FD {:.5})",
+        fro(&pair),
+        fro(&true_second)
+    );
+}
+
 /// #740 (option B): the INDEPENDENT ground-truth gate — the analytic outer
 /// Hessian over θ=(ρ,ψ) must equal a CENTERED FINITE DIFFERENCE of the outer
 /// gradient, across pure-ψ AND mixed-ρψ directions, on a real BMS spatial
