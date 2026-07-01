@@ -1048,8 +1048,12 @@ impl SaeManifoldAtom {
             if phi == 0.0 {
                 continue;
             }
-            for out_col in 0..p {
-                out[out_col] += phi * self.decoder_coefficients[[basis_col, out_col]];
+            // Row `basis_col` of the (M×p) decoder is contiguous; iterate it as a
+            // slice-backed view so the axpy has no per-element 2-D index recompute
+            // or bounds check and autovectorizes (hot: per-row × per-atom).
+            let dec = self.decoder_coefficients.row(basis_col);
+            for (o, &d) in out.iter_mut().zip(dec.iter()) {
+                *o += phi * d;
             }
         }
     }
@@ -1076,8 +1080,9 @@ impl SaeManifoldAtom {
             if dphi == 0.0 {
                 continue;
             }
-            for out_col in 0..p {
-                out[out_col] += dphi * self.decoder_coefficients[[basis_col, out_col]];
+            let dec = self.decoder_coefficients.row(basis_col);
+            for (o, &d) in out.iter_mut().zip(dec.iter()) {
+                *o += dphi * d;
             }
         }
     }
@@ -1108,8 +1113,9 @@ impl SaeManifoldAtom {
             if dphi == 0.0 {
                 continue;
             }
-            for out_col in 0..p {
-                out[out_col] += dphi * self.decoder_coefficients[[basis_col, out_col]];
+            let dec = self.decoder_coefficients.row(basis_col);
+            for (o, &d) in out.iter_mut().zip(dec.iter()) {
+                *o += dphi * d;
             }
         }
     }
