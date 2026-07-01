@@ -206,7 +206,7 @@ pub use error::*;
 pub use hessian_operator_trait::*;
 pub use hyper_operator::*;
 pub use inner_solution::*;
-pub(crate) use objective::*;
+pub use objective::*;
 // TEMP-ATOMS-1122: cross-crate accessor for the cost-atom capture used by the
 // #1122 HSWEEP decomposition in gam-models. REMOVE before commit.
 pub use objective::LAST_COST_ATOMS_1122;
