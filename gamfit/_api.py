@@ -2573,27 +2573,6 @@ def _resolve_periodic_position_bspline_knots(
     return np.linspace(origin, origin + period_f, k + 1, dtype=float)
 
 
-def _cyclic_difference_penalty(num_basis: int, order: int = 2) -> Any:
-    """Return ``D.T @ D`` for the cyclic finite-difference operator."""
-    import numpy as np
-
-    k = int(num_basis)
-    order_i = int(order)
-    if k <= 0:
-        raise ValueError(f"num_basis must be positive, got {num_basis}")
-    if order_i <= 0 or order_i >= k:
-        raise ValueError(
-            f"cyclic difference order must be in [1, {k - 1}], got {order}"
-        )
-    d = np.zeros((k, k), dtype=float)
-    rows = np.arange(k)
-    d[rows, rows] = -1.0
-    d[rows, (rows + 1) % k] = 1.0
-    for _ in range(1, order_i):
-        d = d @ d
-    return d.T @ d
-
-
 def gaussian_reml_fit_positions(
     t: Any,
     y: Any,
@@ -4157,8 +4136,11 @@ def _resolve_position_penalty(
             if penalty_kind not in {None, "coefficient-difference", "coefficientdifference", "difference"}:
                 raise ValueError(f"unsupported B-spline penalty {penalty!r}")
             if periodic:
-                k = int(np.asarray(knots_or_centers, dtype=float).size - 1)
-                return _cyclic_difference_penalty(k, order=2)
+                raise ValueError(
+                    "periodic B-spline position penalties are built by the Rust core; "
+                    "fit them through the formula API (gamfit.smooth.PeriodicSplineCurve / "
+                    "basis 'periodic_spline_curve'), which routes the cyclic penalty to Rust."
+                )
             s, _ = smoothness_penalty(knots_or_centers, degree=int(basis_order), order=2)
             return s
         if kind in {"thinplate", "thinplatespline", "tps"}:

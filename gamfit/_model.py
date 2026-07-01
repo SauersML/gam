@@ -651,68 +651,6 @@ class Model:
         except Exception as exc:
             raise map_exception(exc) from exc
 
-    def posterior_predictive_check(
-        self,
-        data: Any,
-        *,
-        n_draws: int = 200,
-        seed: int = 0,
-    ) -> dict[str, float]:
-        """Posterior-predictive Bayesian p-values per discrepancy statistic (#1057).
-
-        Draws ``n_draws`` replicate datasets at ``data`` (which must include the
-        fitted response column), then for each summary statistic ``T`` reports
-        the posterior-predictive p-value ``P(T(y_rep) >= T(y_obs))`` — the
-        fraction of replicates whose statistic is at least as extreme as the
-        observed one. Values near 0 or 1 flag a statistic the model fails to
-        reproduce; values near 0.5 indicate calibration on that statistic.
-
-        Parameters
-        ----------
-        data : table-like
-            New rows including the response column (so ``T(y_obs)`` is defined).
-        n_draws : int, default 200
-            Number of replicate datasets used to estimate each p-value.
-        seed : int, default 0
-            Seed for the deterministic draw stream.
-
-        Returns
-        -------
-        dict[str, float]
-            Bayesian p-value per statistic (``mean``, ``sd``, ``min``, ``max``).
-        """
-        import numpy as np
-
-        response = self.response_name
-        if response is None:
-            raise ValueError(
-                "posterior_predictive_check requires a model with a named response "
-                "column; this model's formula does not expose one"
-            )
-        headers, rows, _ = normalize_table(data)
-        if response not in headers:
-            raise ValueError(
-                f"posterior_predictive_check requires the response column "
-                f"'{response}' in data so the observed statistics are defined"
-            )
-        col = headers.index(response)
-        y_obs = np.asarray([float(r[col]) for r in rows], dtype=float)
-        reps = self.sample_replicates(data, n_draws, seed=seed)
-        reps = np.asarray(reps, dtype=float)
-
-        statistics = {
-            "mean": np.mean,
-            "sd": np.std,
-            "min": np.min,
-            "max": np.max,
-        }
-        out: dict[str, float] = {}
-        for name, fn in statistics.items():
-            t_obs = float(fn(y_obs))
-            t_rep = np.asarray([float(fn(reps[d])) for d in range(reps.shape[0])])
-            out[name] = float(np.mean(t_rep >= t_obs))
-        return out
-
     def design_matrix(self, data: Any) -> Any:
         """Materialised design matrix for ``data`` against the saved model."""
         headers, rows, _ = normalize_table(data)
