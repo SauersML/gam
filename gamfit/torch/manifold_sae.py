@@ -3,10 +3,18 @@
 Atom ``i`` is a 1-D parametric curve in ambient ``R^D`` parameterized by a
 point ``theta_i`` on a manifold ``M`` (Circle, Cylinder, Sphere, Product) and
 a decoder block ``D_i`` of shape ``(K, D)``. A shared encoder maps each input
-``x`` to per-atom on-manifold coordinates ``theta_i(x)`` and a scalar
-amplitude ``amp_i(x)``. The atom's contribution to reconstruction is
+``x`` to per-atom on-manifold coordinates ``theta_i(x)`` and a gate logit
+``l_i(x)``. The atom's contribution to reconstruction is
 
-    amp_i(x) * sum_k phi_k(theta_i(x)) * D_i[k, :]
+    a_i(x) * sum_k phi_k(theta_i(x)) * D_i[k, :]
+
+where ``a_i(x)`` is the Rust-computed sparsity gate. For the closed-form-
+mappable gate families (IBP-Gumbel / JumpReLU) the gate is bounded in
+``[0, 1)`` and all reconstruction magnitude lives in the decoder curves —
+exactly the family the Rust closed-form solve optimizes; there is no separate
+per-token amplitude. The torch-only ``softmax_topk`` lane keeps its
+magnitude-carrying activation (it has no closed-form counterpart and is
+refused by ``closed_form_assignment``).
 
 Architectural rule
 ------------------
@@ -56,6 +64,7 @@ from .penalties import (
     JumpReLUPenalty,
     MonotonicityPenalty,
     ibp_map,
+    jumprelu_bounded_gate,
 )
 
 
@@ -371,12 +380,13 @@ class ManifoldSAEOutput:
     ``amplitudes`` is the **honest** per-atom magnitude the decoder actually
     applied — it equals the reconstruction code ``z`` (so an atom that
     contributes nothing to ``x_hat`` reports a zero amplitude). For the
-    magnitude-carrying gates (``jumprelu`` / ``softmax_topk``) the raw,
-    *pre-mask* softplus activation — which is strictly positive even for atoms
-    the top-k / threshold dropped — is exposed separately as ``raw_magnitudes``
+    gate families the closed form solves (``ibp_gumbel`` / ``jumprelu``) the
+    code IS the bounded Rust gate — magnitude lives in the decoder curves, so
+    there is no distinct raw magnitude and ``raw_magnitudes == z``, matching
+    the closed-form forward. For the torch-only magnitude-carrying
+    ``softmax_topk`` gate the raw, *pre-mask* activation — strictly positive
+    even for atoms the top-k mask dropped — is exposed as ``raw_magnitudes``
     so interpretability code never mistakes a dropped atom for an active one.
-    For IBP-Gumbel the code factorizes as ``z = gate · amp``; there
-    ``raw_magnitudes`` is that separate ``amp`` magnitude.
     """
 
     z: torch.Tensor
@@ -736,8 +746,14 @@ class _SparsityLayer(nn.Module):
             return assignments, logits
         if self.kind == "softmax_topk":
             return self._topk_gate(logits), logits
-        # JumpReLU activation: hard threshold forward, Rust-STE backward.
-        assignments = self._jumprelu.gate(logits)
+        # JumpReLU: the bounded [0, 1) threshold gate the closed-form fit
+        # evaluates (Rust `jumprelu_row`; magnitude lives in the decoder), with
+        # the Rust straight-through surrogate derivative as backward. The
+        # magnitude-carrying `z · 1[z > τ]` activation would train a per-token
+        # amplitude the closed-form family does not have.
+        tau = max(float(self.tau.item()), 1e-6)
+        thresholds = self._jumprelu.effective_thresholds(logits.dtype).to(logits.device)
+        assignments = jumprelu_bounded_gate(logits, thresholds, tau)
         return assignments, logits
 
     def _topk_activation(self, logits: torch.Tensor) -> torch.Tensor:
@@ -1403,21 +1419,6 @@ class _SparsityLayer(nn.Module):
                 bias = bias - bias.mean()
         return log_scores + bias
 
-    def compose_code(self, assignments: torch.Tensor, amp: torch.Tensor) -> torch.Tensor:
-        """Per-atom latent code ``z`` from gate ``assignments`` and ``amp``.
-
-        The factorization depends on the gate's range. The IBP-Gumbel gate is a
-        dimensionless activation probability in ``[0, 1]``, so the code is the
-        gate scaled by the separate non-negative magnitude ``amp`` (``z = gate ·
-        amp``). The JumpReLU and top-k gates are *magnitude-carrying*
-        activations — the gate already equals the SAE code — so multiplying by
-        ``amp`` again would square the magnitude and distort the
-        reconstruction gradient; the gate is returned as the code directly.
-        """
-        if self.kind == "ibp_gumbel":
-            return assignments * amp
-        return assignments
-
     def penalty(self, logits: torch.Tensor) -> torch.Tensor:
         """Rust-backed scalar penalty value at ``logits``."""
         if self.kind == "ibp_gumbel":
@@ -1640,7 +1641,6 @@ class ManifoldSAE(nn.Module):
             self._forward_centers,
         )
         per_atom_recon = torch.einsum("nfk,fkd->nfd", curves, self.decoder_blocks)
-        amp = F_torch.softplus(amp_logits)
         if self.cfg.sparsity.kind == "softmax_topk":
             gate_pre = amp_logits
             # Issue #1282: break expert collapse with an early *committed*
@@ -1655,18 +1655,24 @@ class ManifoldSAE(nn.Module):
                 x, per_atom_recon, step=step
             )
             z = assignments
+            # Honest pre-mask magnitude: the independent non-negative activation
+            # the top-k selection masks, strictly positive even for dropped atoms.
+            raw_magnitudes = self.sparsity._topk_activation(amp_logits)
         else:
+            # IBP-Gumbel / JumpReLU: the code IS the Rust-computed bounded gate,
+            # exactly the family the closed-form fit solves — magnitude lives in
+            # the decoder curves, never in a Python-side per-token amplitude
+            # (which the closed form has no counterpart for).
             assignments, gate_pre = self.sparsity(amp_logits)
-            z = self.sparsity.compose_code(assignments, amp)
+            z = assignments
+            raw_magnitudes = z
         x_hat = (z.unsqueeze(-1) * per_atom_recon).sum(dim=1)
 
         reml_score = torch.tensor(float("nan"), dtype=x.dtype, device=x.device)
         lambdas = torch.exp(self.log_lambda).to(dtype=x.dtype, device=x.device)
 
-        # `amplitudes` is the magnitude the decoder actually used (== z): for the
-        # magnitude-carrying gates z is the top-k/threshold-masked code, so a
-        # dropped atom reports zero, not its raw softplus value. The raw softplus
-        # magnitude is preserved separately as `raw_magnitudes`.
+        # `amplitudes` is the magnitude the decoder actually used (== z), so a
+        # dropped atom reports zero, never its raw pre-mask activation.
         return ManifoldSAEOutput(
             z=z,
             x_hat=x_hat,
@@ -1677,7 +1683,7 @@ class ManifoldSAE(nn.Module):
             assignments=assignments,
             reml_score=reml_score,
             lambdas=lambdas,
-            raw_magnitudes=amp,
+            raw_magnitudes=raw_magnitudes,
         )
 
     def _forward_from_closed_form(self, x: torch.Tensor) -> ManifoldSAEOutput:
