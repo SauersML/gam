@@ -1191,57 +1191,6 @@ class ManifoldSAE:
             )
         return candidates
 
-    def _periodic_top1_projection_payload(self, x: np.ndarray) -> dict[str, Any]:
-        if (
-            len(self.decoder_blocks) != 2
-            or self.top_k != 1
-            or self.assignment != "softmax"
-            or any(kind != "periodic" for kind in self._basis_kinds)
-            or any(int(dim) != 1 for dim in self._atom_dims)
-        ):
-            raise ValueError("periodic top-1 projection is only valid for two 1D periodic softmax atoms")
-        grid = np.linspace(0.0, 1.0, 2048, endpoint=False, dtype=float)
-        phi_grid = np.asarray(
-            rust_module().basis_with_jet(
-                "periodic",
-                np.ascontiguousarray(grid.reshape(-1, 1)),
-                {"n_harmonics": 1},
-            )[0],
-            dtype=float,
-        )
-        errors = np.zeros((x.shape[0], 2), dtype=float)
-        best_coords = np.zeros((2, x.shape[0], 1), dtype=float)
-        best_decoded = np.zeros((2, x.shape[0], x.shape[1]), dtype=float)
-        for atom_idx, decoder in enumerate(self.decoder_blocks):
-            decoded_grid = phi_grid @ np.asarray(decoder, dtype=float)
-            diff = x[:, None, :] - decoded_grid[None, :, :]
-            err_grid = np.sum(diff * diff, axis=2)
-            best_idx = np.argmin(err_grid, axis=1)
-            errors[:, atom_idx] = err_grid[np.arange(x.shape[0]), best_idx]
-            best_coords[atom_idx, :, 0] = grid[best_idx]
-            best_decoded[atom_idx] = decoded_grid[best_idx]
-        winners = np.argmin(errors, axis=1)
-        assignments = np.zeros((x.shape[0], 2), dtype=float)
-        assignments[np.arange(x.shape[0]), winners] = 1.0
-        fitted = best_decoded[winners, np.arange(x.shape[0])]
-        logits = np.full((x.shape[0], 2), -4.0, dtype=float)
-        logits[np.arange(x.shape[0]), winners] = 4.0
-        atoms = []
-        for atom_idx in range(2):
-            atoms.append({
-                "decoder_B": np.asarray(self.decoder_blocks[atom_idx], dtype=float).copy(),
-                "basis_kind": "periodic",
-                "assignments_z": assignments[:, atom_idx].copy(),
-                "on_atom_coords_t": best_coords[atom_idx].copy(),
-                "active_dim": 1,
-            })
-        return {
-            "atoms": atoms,
-            "assignments_z": assignments,
-            "logits": logits,
-            "fitted": fitted,
-        }
-
     def _atom_index(self, atom: int) -> int:
         k = int(atom)
         if k < 0 or k >= len(self.atoms):
@@ -1484,8 +1433,6 @@ class ManifoldSAE:
         """
         x = _as_2d_float(X, "X")
         kind = _canonical_assignment(self.assignment, "assignment")
-        if t_init is None and a_init is None and self._oos_projection_top1:
-            return self._periodic_top1_projection_payload(x)
         if t_init is None and a_init is None:
             coords_init, logits_init = self._nearest_training_latent_seed(x)
         else:
