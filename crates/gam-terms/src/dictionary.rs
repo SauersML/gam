@@ -549,6 +549,34 @@ fn top_k_assignments(
     Ok(assignments)
 }
 
+/// Encode held-out rows `x` (`M x P`) against a frozen dictionary `atoms`
+/// (`K x P`) using the same top-`top_k` ridge least-squares routing the fit
+/// uses against its final atoms. Returns the `(M, K)` sparse code matrix.
+///
+/// This is the out-of-sample `transform`/encode step for a fitted linear
+/// dictionary; the math (top-k selection + active-set ridge solve) lives in
+/// the Rust core so the Python facade stays a thin wrapper.
+pub fn linear_dictionary_transform(
+    x: ArrayView2<'_, f64>,
+    atoms: ArrayView2<'_, f64>,
+    top_k: usize,
+    code_ridge: f64,
+) -> Result<Array2<f64>, String> {
+    let k = atoms.nrows();
+    if k == 0 {
+        return Err("linear_dictionary_transform: dictionary has no atoms".to_string());
+    }
+    if x.ncols() != atoms.ncols() {
+        return Err(format!(
+            "linear_dictionary_transform: X has P={} columns but atoms have P={}",
+            x.ncols(),
+            atoms.ncols()
+        ));
+    }
+    let effective_k = top_k.min(k).max(1);
+    top_k_assignments(x, atoms, effective_k, code_ridge)
+}
+
 fn softmax_assignments(
     x: ArrayView2<'_, f64>,
     atoms: ArrayView2<'_, f64>,

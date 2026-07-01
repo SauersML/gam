@@ -4342,6 +4342,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(partial_supervision_solve, module)?)?;
     module.add_function(wrap_pyfunction!(thin_svd_scores, module)?)?;
     module.add_function(wrap_pyfunction!(linear_dictionary_fit, module)?)?;
+    module.add_function(wrap_pyfunction!(linear_dictionary_transform_ffi, module)?)?;
     module.add_function(wrap_pyfunction!(sparse_dictionary_fit, module)?)?;
     module.add_function(wrap_pyfunction!(
         identifiable_factor_select_weights_array,
@@ -4733,6 +4734,25 @@ fn linear_dictionary_fit<'py>(
     out.set_item("assignment", fit.assignment.as_str())?;
     out.set_item("top_k", fit.top_k)?;
     Ok(out.unbind())
+}
+
+/// Out-of-sample encode: route held-out rows `x` (`M x P`) through a fitted
+/// linear dictionary `atoms` (`K x P`) via the Rust top-`top_k` ridge solve,
+/// returning the `(M, K)` code matrix.
+#[pyfunction(signature = (x, atoms, top_k, code_ridge = 1.0e-8))]
+fn linear_dictionary_transform_ffi<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray2<'py, f64>,
+    atoms: PyReadonlyArray2<'py, f64>,
+    top_k: usize,
+    code_ridge: f64,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let x_values = x.as_array().to_owned();
+    let atoms_values = atoms.as_array().to_owned();
+    let codes = detach_py_result(py, "linear_dictionary_transform", move || {
+        linear_dictionary_transform(x_values.view(), atoms_values.view(), top_k, code_ridge)
+    })?;
+    Ok(codes.into_pyarray(py).unbind())
 }
 
 /// #1026 collapsed linear lane — fit a fixed-`K` **sparse, minibatched** linear

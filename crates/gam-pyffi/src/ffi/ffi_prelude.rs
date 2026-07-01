@@ -162,6 +162,7 @@ pub(crate) use gam::terms::latent::{AuxPriorFamily, aux_prior_targets};
 
 pub(crate) use gam::terms::dictionary::{
     LinearDictionaryAssignment, LinearDictionaryConfig, fit_linear_dictionary,
+    linear_dictionary_transform,
 };
 
 pub(crate) use gam::terms::sae::sparse_dict::{SparseDictConfig, fit_sparse_dictionary};

@@ -56,6 +56,33 @@ class LinearDictionaryFit:
             recon = recon + self.mean
         return np.ascontiguousarray(recon)
 
+    def transform(self, X: Any, top_k: int | None = None) -> np.ndarray:
+        """Encode held-out rows ``X`` (``M x P``) against the fitted dictionary.
+
+        Routes the top-``top_k`` ridge least-squares encode through the Rust
+        core (``linear_dictionary_transform``); Python only applies the affine
+        centering used by the K=1 centered lane. Returns the ``M x K`` codes.
+        """
+        x = _as_2d_float(X, "X")
+        if x.shape[1] != self.atoms.shape[1]:
+            raise ValueError(
+                f"X must have p={self.atoms.shape[1]} columns; got {x.shape[1]}"
+            )
+        k_active = self.top_k if top_k is None else int(top_k)
+        if k_active < 1 or k_active > self.atoms.shape[0]:
+            raise ValueError(
+                f"top_k must be in [1, K={self.atoms.shape[0]}]; got {k_active}"
+            )
+        x_eff = x - self.mean if (self.centered and self.mean is not None) else x
+        codes = rust_module().linear_dictionary_transform_ffi(
+            np.ascontiguousarray(x_eff, dtype=np.float64),
+            np.ascontiguousarray(self.atoms, dtype=np.float64),
+            int(k_active),
+            float(self.code_ridge),
+        )
+        return np.ascontiguousarray(codes)
+
+
 def linear_dictionary_fit(
     X: Any,
     K: int,
