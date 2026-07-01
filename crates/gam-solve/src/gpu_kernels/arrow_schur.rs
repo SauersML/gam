@@ -2016,7 +2016,7 @@ mod cuda {
             key.p_max as usize,
             key.r_template as usize,
         );
-        let ptx = cudarc::nvrtc::compile_ptx(&src).map_err(|err| {
+        let ptx = gam_gpu::device_cache::compile_ptx_arch(&src).map_err(|err| {
             ArrowSchurGpuFailure::SchurFactorFailed {
                 reason: format!(
                     "arrow-schur fused NVRTC compile (p_max={}, r={}): {err}",
