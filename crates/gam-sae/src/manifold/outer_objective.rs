@@ -1413,6 +1413,42 @@ impl SaeManifoldOuterObjective {
         }
     }
 
+    /// #1782 — the finite outer-cost a recoverable infeasible-ρ REFUSAL presents
+    /// to the outer solver's value / gradient lanes, matching the finite collapse
+    /// wall the EFS lane (`efs_step`) already returns for the same refusal class.
+    ///
+    /// The recoverable-refusal classes (non-PD per-row / cross-row joint Hessian,
+    /// non-PD reduced Schur complement, inner non-convergence) mark a ρ whose
+    /// closed-form Laplace evidence is undefined. Historically the value/gradient
+    /// lanes returned `OuterEval::infeasible` (cost `+∞`) so a line-search probe
+    /// that OVERSHOOTS into an adjacent indefinite basin is rejected and the search
+    /// steers back into the PD region. But when the SEED ρ itself (and its whole
+    /// neighbourhood) lands in that refusal class — which happens for softmax /
+    /// jumprelu over near-degenerate multi-atom decoders, and for euclidean/linear
+    /// rank-deficient seeds — EVERY outer probe returned `+∞`, BFGS never accepted
+    /// a gradient step, and the bridge's non-termination guard escalated the
+    /// "globally infeasible neighbourhood" to a FATAL seed rejection → "no
+    /// candidate seeds passed outer startup validation (SAE manifold)". `ibp_map`
+    /// + `circle`'s seed lands in the PD region and never trips it, which is
+    /// exactly why it converged on identical data.
+    ///
+    /// Returning the FINITE collapse wall (`SAE_FIT_DATA_COLLAPSE_COST = 1e12`)
+    /// instead of `+∞` keeps the SAME steering behaviour — the wall is
+    /// astronomically larger than any real REML cost, so the Armijo/Wolfe line
+    /// search still rejects any step into the infeasible basin and backtracks
+    /// toward the feasible region — while giving the outer solver a BOUNDED seed
+    /// sample. The neighbourhood is then a finite barrier rather than an unbounded
+    /// `+∞` desert, so the non-termination guard does not fire and the fit ships
+    /// the best-so-far (seed) dictionary rather than aborting the whole fit. This
+    /// unifies the value/gradient lanes with the EFS lane, which already returns
+    /// this exact finite wall for the identical refusal class (#1782), and with
+    /// the non-finite-Laplace floor `add_fit_data_collapse_penalty` uses (#1217).
+    /// Genuine (non-recoverable) defects still propagate as a hard error above the
+    /// call sites; only the recoverable infeasible-ρ probe reaches this wall.
+    const fn recoverable_refusal_wall_cost() -> f64 {
+        SAE_FIT_DATA_COLLAPSE_COST
+    }
+
     pub(crate) fn is_recoverable_value_probe_refusal(err: &str) -> bool {
         err.contains("inner solve did not converge at fixed ρ")
             || err.contains(
@@ -1802,7 +1838,16 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // derivative-free co-training fold `f+c` (`fold_cotrain = true`).
         match self.evaluate_with_refine_policy(rho.view(), false, true) {
             Ok((cost, _beta)) => Ok(cost),
-            Err(err) if Self::is_recoverable_value_probe_refusal(&err) => Ok(f64::INFINITY),
+            // #1782 — a recoverable infeasible-ρ refusal presents the SAME finite
+            // collapse wall the EFS lane returns, not `+∞`. A finite (huge) wall is
+            // still rejected by the cross-seed / EFS-backtracking comparison this
+            // lane feeds, but it keeps the seed neighbourhood BOUNDED so the outer
+            // bridge's non-termination guard cannot escalate a globally-refused
+            // neighbourhood to a fatal seed rejection (see
+            // `recoverable_refusal_wall_cost`).
+            Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
+                Ok(Self::recoverable_refusal_wall_cost())
+            }
             Err(err) => Err(EstimationError::RemlOptimizationFailed(err)),
         }
     }
@@ -1827,8 +1872,19 @@ impl OuterObjective for SaeManifoldOuterObjective {
             let (cost, _beta_hat) =
                 match self.evaluate_with_refine_policy(rho.view(), false, false) {
                     Ok(evaluated) => evaluated,
+                    // #1782 — recoverable infeasible-ρ refusal → finite collapse
+                    // wall (zero gradient), not `+∞`. The wall still steers the
+                    // outer descent away from the infeasible basin, but keeps the
+                    // seed neighbourhood bounded so a globally-refused seed ships
+                    // the best-so-far dictionary instead of aborting the fit (see
+                    // `recoverable_refusal_wall_cost`).
                     Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
-                        return Ok(OuterEval::infeasible(rho.len()));
+                        return Ok(OuterEval {
+                            cost: Self::recoverable_refusal_wall_cost(),
+                            gradient: Array1::zeros(rho.len()),
+                            hessian: HessianResult::Unavailable,
+                            inner_beta_hint: None,
+                        });
                     }
                     Err(err) => return Err(EstimationError::RemlOptimizationFailed(err)),
                 };
@@ -1891,13 +1947,24 @@ impl OuterObjective for SaeManifoldOuterObjective {
             Ok(evaluated) => evaluated,
             // #1782 — an infeasible-ρ probe (non-PD per-row / cross-row / Schur-
             // complement joint Hessian) has no defined Laplace evidence at this ρ.
-            // Present it to the BFGS/ARC line search as the SAME infeasible wall
-            // the `Value` order returns (`OuterEval::infeasible` → +∞ cost, zero
-            // gradient) so the search steers back into the PD region instead of
-            // aborting the whole outer solve. Genuine (non-recoverable) defects
-            // still hard-error below.
+            // Present it to the BFGS/ARC line search as the SAME finite collapse
+            // wall the `Value` order and the EFS lane (`efs_step`) return (a huge
+            // but BOUNDED cost with a zero gradient) so the search steers back into
+            // the PD region WITHOUT the seed's own gradient eval being an unbounded
+            // `+∞`. An `+∞` seed sample left BFGS with `iter_count == 0` and every
+            // probe infeasible, so the bridge's non-termination guard escalated the
+            // globally-refused neighbourhood to a fatal seed rejection (the softmax
+            // "globally infeasible neighbourhood at seed" abort); the finite wall
+            // keeps the neighbourhood bounded so the fit ships the best-so-far seed
+            // dictionary instead (see `recoverable_refusal_wall_cost`). Genuine
+            // (non-recoverable) defects still hard-error below.
             Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
-                return Ok(OuterEval::infeasible(rho.len()));
+                return Ok(OuterEval {
+                    cost: Self::recoverable_refusal_wall_cost(),
+                    gradient: Array1::zeros(rho.len()),
+                    hessian: HessianResult::Unavailable,
+                    inner_beta_hint: None,
+                });
             }
             Err(err) => return Err(EstimationError::RemlOptimizationFailed(err)),
         };
@@ -2043,8 +2110,21 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 let (cost, _beta_hat) =
                     match self.evaluate_with_refine_policy(rho.view(), false, false) {
                         Ok(evaluated) => evaluated,
+                        // #1782 — recoverable infeasible-ρ refusal → finite collapse
+                        // wall (zero gradient), matching the gradient/EFS lanes. The
+                        // wall still fails the Armijo/Wolfe sufficient-decrease test
+                        // (it dwarfs any real REML cost) so the line search steers
+                        // back into the PD region, but a BOUNDED cost keeps a
+                        // globally-refused seed neighbourhood from tripping the
+                        // bridge's non-termination guard (see
+                        // `recoverable_refusal_wall_cost`).
                         Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
-                            return Ok(OuterEval::infeasible(rho.len()));
+                            return Ok(OuterEval {
+                                cost: Self::recoverable_refusal_wall_cost(),
+                                gradient: Array1::zeros(rho.len()),
+                                hessian: HessianResult::Unavailable,
+                                inner_beta_hint: None,
+                            });
                         }
                         Err(err) => return Err(EstimationError::RemlOptimizationFailed(err)),
                     };
