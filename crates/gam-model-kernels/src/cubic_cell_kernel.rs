@@ -3311,7 +3311,27 @@ fn fill_truncated_gaussian_moments(a: f64, b: f64, out: &mut [f64]) {
 /// stack footprint meaningfully.
 const MAX_AFFINE_ANCHOR_DEGREE: usize = 64;
 
+/// Return normalized raw moments of the affine anchor density on a cell.
+///
+/// The unnormalized primitive is
+/// `∫_left^right z^n exp(-0.5 * (z² + (alpha + beta*z)²)) dz`.  Public anchor
+/// moments are expectations under that primitive's own mass, so `out[0]` is
+/// the identity moment `1.0` whenever the cell has positive finite mass.  The
+/// evaluator paths that need the unnormalized derivative integral call
+/// `affine_anchor_raw_moment_vector` directly.
 pub fn affine_anchor_moment_vector(
+    alpha: f64,
+    beta: f64,
+    left: f64,
+    right: f64,
+    max_degree: usize,
+) -> Vec<f64> {
+    let mut out = affine_anchor_raw_moment_vector(alpha, beta, left, right, max_degree);
+    normalize_affine_anchor_moments(&mut out);
+    out
+}
+
+fn affine_anchor_raw_moment_vector(
     alpha: f64,
     beta: f64,
     left: f64,
@@ -3321,6 +3341,17 @@ pub fn affine_anchor_moment_vector(
     let mut out = vec![0.0; max_degree + 1];
     affine_anchor_moment_vector_into(alpha, beta, left, right, max_degree, &mut out);
     out
+}
+
+fn normalize_affine_anchor_moments(out: &mut [f64]) {
+    let Some(&m0) = out.first() else {
+        return;
+    };
+    if m0.is_finite() && m0 > 0.0 {
+        for moment in out {
+            *moment /= m0;
+        }
+    }
 }
 
 fn affine_anchor_moment_vector_into(
@@ -3422,7 +3453,7 @@ pub fn evaluate_affine_cell_state(
     let alpha = cell.c0;
     let beta = cell.c1;
     let value = affine_value_from_moment_primitive(alpha, beta, cell.left, cell.right);
-    let moments = affine_anchor_moment_vector(alpha, beta, cell.left, cell.right, max_degree);
+    let moments = affine_anchor_raw_moment_vector(alpha, beta, cell.left, cell.right, max_degree);
     Ok(CellMomentState {
         branch: ExactCellBranch::Affine,
         value,
@@ -3436,7 +3467,7 @@ fn evaluate_affine_cell_derivative_state(
 ) -> Result<CellDerivativeMomentState, String> {
     let alpha = cell.c0;
     let beta = cell.c1;
-    let moments = affine_anchor_moment_vector(alpha, beta, cell.left, cell.right, max_degree);
+    let moments = affine_anchor_raw_moment_vector(alpha, beta, cell.left, cell.right, max_degree);
     Ok(CellDerivativeMomentState {
         branch: ExactCellBranch::Affine,
         moments: moments.into(),
@@ -4954,10 +4985,9 @@ mod tests {
     #[test]
     fn affine_anchor_moments_match_whole_line_closed_forms() {
         let out = affine_anchor_moment_vector(0.0, 0.0, f64::NEG_INFINITY, f64::INFINITY, 4);
-        let sqrt_2pi = (2.0 * std::f64::consts::PI).sqrt();
-        assert!((out[0] - sqrt_2pi).abs() < 1e-12);
+        assert!((out[0] - 1.0).abs() < 1e-12);
         assert!(out[1].abs() < 1e-12);
-        assert!((out[2] - sqrt_2pi).abs() < 1e-12);
+        assert!((out[2] - 1.0).abs() < 1e-12);
     }
 
     #[test]
@@ -4967,11 +4997,9 @@ mod tests {
         let out = affine_anchor_moment_vector(alpha, beta, f64::NEG_INFINITY, f64::INFINITY, 4);
         let s = (1.0 + beta * beta).sqrt();
         let mu = -alpha * beta / (1.0 + beta * beta);
-        let scale = (-alpha * alpha / (2.0 * s * s)).exp() / s;
-        let sqrt_2pi = (2.0 * std::f64::consts::PI).sqrt();
-        assert!((out[0] - scale * sqrt_2pi).abs() < 1e-12);
-        assert!((out[1] - scale * sqrt_2pi * mu).abs() < 1e-12);
-        assert!((out[2] - scale * sqrt_2pi * (mu * mu + 1.0 / (s * s))).abs() < 1e-10);
+        assert!((out[0] - 1.0).abs() < 1e-12);
+        assert!((out[1] - mu).abs() < 1e-12);
+        assert!((out[2] - (mu * mu + 1.0 / (s * s))).abs() < 1e-10);
     }
 
     #[test]
