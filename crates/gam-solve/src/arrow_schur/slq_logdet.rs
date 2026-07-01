@@ -52,6 +52,7 @@
 use super::*;
 use gam_linalg::lanczos::{symmetric_lanczos_eigenpairs, SymmetricLanczosOptions};
 use gam_linalg::utils::splitmix64;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 /// Result of a Stochastic Lanczos Quadrature log-determinant estimate.
 #[derive(Debug, Clone, Copy)]
@@ -103,7 +104,7 @@ fn rademacher_into(z: &mut Array1<f64>, probe_seed: u64) {
 /// exceed the dimension) and `num_probes` is treated as at least `1`.
 pub fn slq_logdet(
     dim: usize,
-    matvec: impl Fn(ArrayView1<f64>) -> Array1<f64>,
+    matvec: impl Fn(ArrayView1<f64>) -> Array1<f64> + Sync,
     num_probes: usize,
     lanczos_steps: usize,
     seed: u64,
@@ -118,26 +119,6 @@ pub fn slq_logdet(
     let steps = lanczos_steps.max(1).min(dim);
     let norm_sq = dim as f64; // ‖z‖² for a ±1 Rademacher vector of length `dim`.
 
-    // The workspace Lanczos engine consumes `apply(&[f64], &mut [f64])`; wrap the
-    // ndarray `matvec` closure into that slice contract. Scratch buffers are
-    // reused across probes.
-    let mut in_buf = Array1::<f64>::zeros(dim);
-    let mut apply = |x: &[f64], out: &mut [f64]| -> Result<(), String> {
-        in_buf
-            .as_slice_mut()
-            .expect("contiguous probe input buffer")
-            .copy_from_slice(x);
-        let y = matvec(in_buf.view());
-        if y.len() != dim {
-            return Err(format!(
-                "slq_logdet matvec returned length {}, expected {dim}",
-                y.len()
-            ));
-        }
-        out.copy_from_slice(y.as_slice().expect("contiguous matvec output"));
-        Ok(())
-    };
-
     let lanczos_options = SymmetricLanczosOptions {
         max_steps: steps,
         // Pure SPD log-det quadrature: keep iterating until the Krylov space is
@@ -149,27 +130,58 @@ pub fn slq_logdet(
         full_reorthogonalize: true,
     };
 
-    let mut z = Array1::<f64>::zeros(dim);
-    let mut contributions = Vec::with_capacity(num_probes);
-    for probe in 0..num_probes {
-        let probe_seed = seed.wrapping_add(probe as u64);
-        rademacher_into(&mut z, probe_seed);
-        let start = z.as_slice().expect("contiguous probe vector");
-        let contribution = match symmetric_lanczos_eigenpairs(
-            dim,
-            start,
-            lanczos_options,
-            &mut apply,
-        ) {
-            Ok(pairs) => norm_sq * clamped_log_quadrature(&pairs.eigenvalues, &pairs.eigenvectors),
-            // A Lanczos failure (non-finite matvec / start) cannot be silently
-            // averaged in; the dense-Cholesky gate above this call should have
-            // caught a degenerate operator. Treat it as a zero contribution and
-            // let the std-error widen rather than poisoning the mean with NaN.
-            Err(_) => 0.0,
-        };
-        contributions.push(contribution);
-    }
+    // Each Hutchinson probe is a FULLY INDEPENDENT Lanczos run against the same
+    // read-only (`Sync`) operator, so at the K=32k evidence scale — where SLQ
+    // fires precisely because the operator is large (`num_probes`×`lanczos_steps`
+    // matvecs of an `O(k²)` apply) — the probes fan out across rayon workers for
+    // a near-`num_probes`× wall-clock cut on the dominant matvec work. Each probe
+    // carries its OWN Rademacher vector and matvec input scratch (no shared
+    // mutable state), and the contribution it computes depends only on
+    // `(dim, matvec, probe_seed, options)`, so it is bit-identical to the serial
+    // build. `into_par_iter().collect()` preserves probe order, and the
+    // mean/std-err reduction below runs SERIALLY over that ordered buffer, so the
+    // estimate and std-error are bit-for-bit reproducible for a fixed
+    // `(dim, matvec, num_probes, lanczos_steps, seed)` — the determinism the REML
+    // evidence outer loop requires (see the module `Determinism` note).
+    let matvec = &matvec;
+    let contributions: Vec<f64> = (0..num_probes)
+        .into_par_iter()
+        .map(|probe| {
+            let probe_seed = seed.wrapping_add(probe as u64);
+            let mut z = Array1::<f64>::zeros(dim);
+            rademacher_into(&mut z, probe_seed);
+            // The workspace Lanczos engine consumes `apply(&[f64], &mut [f64])`;
+            // wrap the ndarray `matvec` into that slice contract with a per-probe
+            // input buffer so probes never share mutable scratch.
+            let mut in_buf = Array1::<f64>::zeros(dim);
+            let mut apply = |x: &[f64], out: &mut [f64]| -> Result<(), String> {
+                in_buf
+                    .as_slice_mut()
+                    .expect("contiguous probe input buffer")
+                    .copy_from_slice(x);
+                let y = matvec(in_buf.view());
+                if y.len() != dim {
+                    return Err(format!(
+                        "slq_logdet matvec returned length {}, expected {dim}",
+                        y.len()
+                    ));
+                }
+                out.copy_from_slice(y.as_slice().expect("contiguous matvec output"));
+                Ok(())
+            };
+            let start = z.as_slice().expect("contiguous probe vector");
+            match symmetric_lanczos_eigenpairs(dim, start, lanczos_options, &mut apply) {
+                Ok(pairs) => {
+                    norm_sq * clamped_log_quadrature(&pairs.eigenvalues, &pairs.eigenvectors)
+                }
+                // A Lanczos failure (non-finite matvec / start) cannot be silently
+                // averaged in; the dense-Cholesky gate above this call should have
+                // caught a degenerate operator. Treat it as a zero contribution and
+                // let the std-error widen rather than poisoning the mean with NaN.
+                Err(_) => 0.0,
+            }
+        })
+        .collect();
 
     let n = contributions.len() as f64;
     let mean = contributions.iter().sum::<f64>() / n;
