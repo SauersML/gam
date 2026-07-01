@@ -9286,9 +9286,16 @@ pub fn smooth_term_lr_inference_forspec(
         } else {
             0.0
         };
-        let ref_df = wood_reference_df(influence, &coeff_range)
+        let rho_uncertainty_df = wps_block_uncertainty_df(
+            full.fit.weighted_gram(),
+            full.fit.smoothing_correction(),
+            &coeff_range,
+            family_disp,
+        );
+        let ref_df = (wood_reference_df(influence, &coeff_range)
             .unwrap_or(0.0)
             .max(edf)
+            + rho_uncertainty_df)
             .max(null_dim as f64)
             .max(unconverged_dim_floor)
             .max(1.0);
@@ -9460,6 +9467,40 @@ fn lawley_dispersion_for_family(family: &LikelihoodSpec, fit: &UnifiedFitResult)
             }
         }
         _ => 1.0,
+    }
+}
+
+fn wps_block_uncertainty_df(
+    weighted_gram: Option<&Array2<f64>>,
+    smoothing_correction: Option<&Array2<f64>>,
+    coeff_range: &Range<usize>,
+    phi: f64,
+) -> f64 {
+    let (Some(xwx), Some(corr)) = (weighted_gram, smoothing_correction) else {
+        return 0.0;
+    };
+    let (start, end) = (coeff_range.start, coeff_range.end);
+    if start >= end
+        || end > xwx.nrows()
+        || end > xwx.ncols()
+        || end > corr.nrows()
+        || end > corr.ncols()
+        || !(phi.is_finite() && phi > 0.0)
+    {
+        return 0.0;
+    }
+
+    let mut trace = 0.0;
+    for i in start..end {
+        for j in start..end {
+            trace += xwx[[i, j]] * corr[[j, i]];
+        }
+    }
+    trace /= phi;
+    if trace.is_finite() && trace > 0.0 {
+        trace
+    } else {
+        0.0
     }
 }
 
