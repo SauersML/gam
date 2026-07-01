@@ -2915,12 +2915,13 @@ pub fn build_smooth_basis(
             // cubic kernel `r^3` in 1D. There is no nullspace-order escalation —
             // the structural cubic smoother is well-defined for every dimension.
             //
-            // Explicit `power=...` honors the user's value verbatim against their
-            // requested nullspace order; the kernel validator emits a precise
-            // diagnostic for any inadmissible combination. In the scale-free
-            // (non-hybrid) regime fractional powers are admitted and threaded as
-            // `f64`. The hybrid Duchon-Matérn kernel (`length_scale=Some`) is
-            // restricted to integer powers.
+            // Explicit `power=...` is honored unless it is below the active
+            // operator-collocation floor; in that case resolve the smallest
+            // admissible `(nullspace_order, power)` here so the basis builder does
+            // not fail mid-fit with a low-level D1/D2 kernel-existence error. In
+            // the scale-free (non-hybrid) regime fractional powers are admitted
+            // and threaded as `f64`. The hybrid Duchon-Matérn kernel
+            // (`length_scale=Some`) is restricted to integer powers.
             let (nullspace_order, power) = match parse_duchon_power_policy(options)? {
                 DuchonPowerPolicy::Explicit(req_power) => {
                     if length_scale.is_some() && req_power.fract() != 0.0 {
@@ -2932,7 +2933,36 @@ pub fn build_smooth_basis(
                         ))
                         .to_string());
                     }
-                    (requested_nullspace_order, req_power)
+                    let max_op = crate::basis::duchon_max_active_operator_derivative_order(
+                        &DuchonOperatorPenaltySpec::default(),
+                    );
+                    let (min_nullspace_order, min_power) = crate::basis::resolve_duchon_orders(
+                        cols.len(),
+                        requested_nullspace_order,
+                        max_op,
+                        length_scale,
+                    );
+                    let mut nullspace_order = requested_nullspace_order;
+                    let mut power = req_power;
+                    if req_power < min_power as f64 {
+                        nullspace_order = min_nullspace_order;
+                        power = min_power as f64;
+                        inference_notes.push(format!(
+                            "Duchon smooth '{}' requested order={:?}, power={} in {}D, but the active operator penalties require 2*(p+s) > dimension+{}; Auto-escalated to power={}{}.",
+                            vars.join(", "),
+                            requested_nullspace_order,
+                            req_power,
+                            cols.len(),
+                            max_op,
+                            min_power,
+                            if min_nullspace_order == requested_nullspace_order {
+                                String::new()
+                            } else {
+                                format!(" and nullspace_order={min_nullspace_order:?}")
+                            },
+                        ));
+                    }
+                    (nullspace_order, power)
                 }
                 DuchonPowerPolicy::CubicStructuralDefault => {
                     // Magic cubic rule (REQUEST-LAYER default): no explicit power ⇒
