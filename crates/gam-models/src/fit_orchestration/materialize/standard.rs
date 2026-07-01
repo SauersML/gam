@@ -168,7 +168,7 @@ pub(crate) fn materialize_standard<'a>(
                 .map_err(|e| format!("invalid latent_cloglog state: {e}"))?,
         )
     } else {
-        if config.frailty.is_some() {
+        if config.frailty.as_ref().is_some_and(FrailtySpec::is_active) {
             return Err(WorkflowError::InvalidConfig {
                 reason: format!(
                     "config.frailty is not supported for standard family {:?}; use a frailty-aware family instead",

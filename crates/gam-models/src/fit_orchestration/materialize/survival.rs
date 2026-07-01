@@ -726,7 +726,7 @@ pub(crate) fn materialize_survival<'a>(
     };
     match survival_mode {
         SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull
-            if config.frailty.is_some() =>
+            if config.frailty.as_ref().is_some_and(FrailtySpec::is_active) =>
         {
             return Err(WorkflowError::InvalidConfig {
                 reason: "frailty is not supported for transformation/weibull survival models"
@@ -734,7 +734,9 @@ pub(crate) fn materialize_survival<'a>(
             }
             .into());
         }
-        SurvivalLikelihoodMode::LocationScale if config.frailty.is_some() => {
+        SurvivalLikelihoodMode::LocationScale
+            if config.frailty.as_ref().is_some_and(FrailtySpec::is_active) =>
+        {
             return Err(WorkflowError::InvalidConfig {
                 reason: "config.frailty is not implemented for survival-likelihood=location-scale"
                     .to_string(),

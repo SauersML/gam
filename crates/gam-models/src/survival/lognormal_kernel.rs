@@ -90,6 +90,20 @@ pub enum FrailtySpec {
 }
 
 impl FrailtySpec {
+    /// Whether this spec requests an actual frailty modifier.
+    ///
+    /// [`FrailtySpec::None`] is the canonical "no frailty" value. The CLI/config
+    /// layer normalizes a missing `--frailty-kind` to `Some(FrailtySpec::None)`
+    /// (see `resolve_cli_frailty_spec`), so `Option::is_some` on
+    /// `config.frailty` is NOT a valid test for "the user requested frailty" — it
+    /// fires on the null `Some(FrailtySpec::None)`. Family/mode guards that only
+    /// support the no-frailty case must reject on this predicate instead, or they
+    /// misclassify every ordinary CLI fit as a frailty request.
+    #[inline]
+    pub fn is_active(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+
     /// Validate that this frailty spec is compatible with score_warp/linkwiggle
     /// cubic marginal-slope families.
     ///
