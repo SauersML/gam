@@ -328,6 +328,17 @@ fn main() {
     let mut mechanical_part_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
     scan_for_mechanical_part_files(&manifest_dir, &mut mechanical_part_offenders);
 
+    // Sticky "probation" for files that ever breached the 10k hard limit. Once a
+    // tracked file exceeds MAX_TRACKED_FILE_LINES it is recorded in a committed
+    // ledger and must then be brought below OVERSIZED_PROBATION_FLOOR_LINES (7k)
+    // — not merely back under 10k. This closes the dodge of peeling a thin
+    // tag-along satellite so the parent hovers at ~9,900: redemption requires a
+    // real ~30% cut, i.e. an actual cohesive seam. Files that drop to <=7k are
+    // redeemed and auto-pruned. The ledger is rewritten in place like
+    // ban_history.txt / todo_history.txt.
+    let mut probation_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
+    scan_for_probation_oversized_files(&manifest_dir, &mut probation_offenders);
+
     // Persistent unimplemented/todo/unreachable removal audit. Compares the
     // current set of marker-bearing functions against the on-disk ledger and
     // flags any function whose marker disappeared without a real implementation
@@ -689,6 +700,21 @@ fn main() {
             title: "tracked file over 10k lines (split the file; issue #780 line-count gate)"
                 .to_string(),
             rows: oversized_file_offenders
+                .iter()
+                .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
+                .collect(),
+        });
+    }
+
+    if !probation_offenders.is_empty() {
+        sections.push(Section {
+            title:
+                "oversized-file probation (this file once exceeded 10k lines; it must now reach \
+                    under 7k lines, not merely back under 10k). Shaving to just under the limit — \
+                    or peeling a thin tag-along satellite so the parent keeps hovering near 10k — \
+                    is exactly the dodge this gate closes. Find a real cohesive seam and cut ~30%."
+                    .to_string(),
+            rows: probation_offenders
                 .iter()
                 .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
                 .collect(),
@@ -4259,6 +4285,132 @@ fn count_file_lines(path: &Path) -> std::io::Result<usize> {
             return Ok(line_count);
         }
         line_count += buf[..read].iter().filter(|byte| **byte == b'\n').count();
+    }
+}
+
+/// Committed ledger recording every tracked file that has ever breached the
+/// 10k hard limit and has not yet earned redemption by dropping to <=7k. Like
+/// `ban_history.txt` / `todo_history.txt`, it is auto-managed by build.rs and
+/// must not be hand-edited; each non-comment line is a single repo-relative
+/// path, sorted for clean git merges.
+const OVERSIZED_PROBATION_LEDGER_FILENAME: &str = "oversized_history.txt";
+
+/// A file on probation (once >10k lines) must drop below this to be redeemed.
+/// The 7k floor forces a ~30% cut off the 10k limit — enough that a thin
+/// tag-along satellite cannot satisfy it, so the author must find a real seam.
+const OVERSIZED_PROBATION_FLOOR_LINES: usize = 7_000;
+
+/// Sticky-probation audit. Records any tracked file currently over the 10k hard
+/// limit into the probation ledger, then flags any ledger file still over the
+/// 7k redemption floor. Files that have dropped to <=7k (or are no longer
+/// tracked) are pruned. Emitted probation offenders are only those in the
+/// 7k..=10k band — files still over 10k are already reported by the primary
+/// `scan_for_oversized_tracked_files` gate, so we do not double-report them.
+fn scan_for_probation_oversized_files(
+    root: &Path,
+    offenders: &mut Vec<(PathBuf, usize, String)>,
+) {
+    let ledger_path = root.join(OVERSIZED_PROBATION_LEDGER_FILENAME);
+    let mut ledger = load_probation_ledger(&ledger_path);
+
+    // Current line count for every tracked file, keyed by repo-relative path.
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for rel in collect_repo_files(root) {
+        let path = root.join(rel);
+        let line_count = match count_file_lines(&path) {
+            Ok(line_count) => line_count,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                panic!(
+                    "failed to read repo file for oversized-probation audit: {}: {err}",
+                    rel.display()
+                )
+            }
+        };
+        counts.insert(rel.to_string_lossy().into_owned(), line_count);
+    }
+
+    // Trip: any file currently over the hard limit joins probation.
+    for (key, &line_count) in &counts {
+        if line_count > MAX_TRACKED_FILE_LINES {
+            ledger.insert(key.clone());
+        }
+    }
+
+    // Enforce + prune. Iterate a snapshot so we can mutate `ledger`.
+    for key in ledger.clone() {
+        match counts.get(&key) {
+            // No longer tracked (deleted/renamed) — nothing to enforce; prune.
+            None => {
+                ledger.remove(&key);
+            }
+            // Redeemed: the real ~30% cut landed. Prune.
+            Some(&n) if n <= OVERSIZED_PROBATION_FLOOR_LINES => {
+                ledger.remove(&key);
+            }
+            // Still over 10k — the primary gate reports this; keep on probation
+            // but do not double-report here.
+            Some(&n) if n > MAX_TRACKED_FILE_LINES => {}
+            // In the 7k..=10k band while on probation — this is the dodge.
+            Some(&n) => {
+                offenders.push((
+                    PathBuf::from(&key),
+                    n,
+                    format!(
+                        "{n} lines; on probation after exceeding {MAX_TRACKED_FILE_LINES} — must \
+                         reach at most {OVERSIZED_PROBATION_FLOOR_LINES}"
+                    ),
+                ));
+            }
+        }
+    }
+
+    save_probation_ledger(&ledger_path, &ledger);
+}
+
+fn load_probation_ledger(path: &Path) -> std::collections::BTreeSet<String> {
+    let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return out,
+    };
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        out.insert(trimmed.to_string());
+    }
+    out
+}
+
+fn save_probation_ledger(path: &Path, ledger: &std::collections::BTreeSet<String>) {
+    // Never create an empty ledger file just to hold the header: if nothing has
+    // ever tripped and no file exists yet, leave the tree clean.
+    if ledger.is_empty() && !path.exists() {
+        return;
+    }
+    let mut out = String::new();
+    out.push_str(
+        "# Persistent audit of files that once exceeded the 10k-line hard limit.\n\
+         # Auto-managed by build.rs — do NOT hand-edit. Each non-comment line is a\n\
+         # single repo-relative path currently on probation: it breached 10k lines\n\
+         # and must be brought to at most 7k lines (a real ~30% cut / cohesive\n\
+         # split, not a thin tag-along satellite) before it is auto-pruned here.\n\
+         # Concurrent branches produce additive line-level diffs that union-merge;\n\
+         # the next build re-validates and prunes redeemed entries.\n",
+    );
+    for key in ledger {
+        out.push_str(key);
+        out.push('\n');
+    }
+    match fs::read_to_string(path) {
+        Ok(existing) if existing == out => return,
+        _ => {}
+    }
+    if fs::write(path, out).is_err() {
+        // Non-fatal: write failures (e.g. read-only checkout) leave the ledger
+        // stale rather than failing the build. Future runs retry.
     }
 }
 
