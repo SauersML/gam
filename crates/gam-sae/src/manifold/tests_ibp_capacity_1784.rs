@@ -167,9 +167,20 @@ fn ibp_default_alpha_underfits_but_k_aware_matches_linear_1784() {
         "#1784 K={k}: linear EV={lin:.4}  manifold(alpha=1) EV={ev_alpha1:.4}  manifold(K-aware) EV={ev_kaware:.4}"
     );
 
+    // Margins are calibrated to the deterministic effect at THIS (RAM-safe) scale.
+    // At the original K=32 / N=600 scale the α=1 underfit and K-aware recovery each
+    // cleared ~0.05 EV; shrinking to K=8 / N=64 / num_basis=3 (issue #1784, to keep
+    // the K=128 sibling test off the OOM path) preserves the qualitative ordering
+    // — α=1 (≈0.862) < linear (≈0.893) < K-aware (≈0.908) — but with smaller gaps
+    // (underfit ≈0.031, recovery ≈0.046). The thresholds below sit at roughly half
+    // the observed gap so the strict ordering is enforced with ~2× headroom without
+    // pinning to fragile exact values. The fit is deterministic here (no RNG; the
+    // parallel fold is bit-invariant per #1557), so the headroom guards only
+    // toolchain drift, not run-to-run noise.
+
     // The historical default α=1 must UNDERFIT the linear dictionary.
     assert!(
-        ev_alpha1 + 0.05 < lin,
+        ev_alpha1 + 0.015 < lin,
         "alpha=1 IBP prior should structurally underfit the equal-K linear dictionary \
          (manifold {ev_alpha1:.4} vs linear {lin:.4}) at K={k}"
     );
@@ -183,7 +194,7 @@ fn ibp_default_alpha_underfits_but_k_aware_matches_linear_1784() {
     );
     // And the fix must strictly beat the broken default.
     assert!(
-        ev_kaware > ev_alpha1 + 0.05,
+        ev_kaware > ev_alpha1 + 0.02,
         "K-aware concentration must recover capacity the alpha=1 mask threw away \
          (K-aware {ev_kaware:.4} vs alpha=1 {ev_alpha1:.4})"
     );
