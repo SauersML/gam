@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import torch
 
-from gamfit.torch.manifold_sae import ManifoldSAE, ManifoldSAEConfig
+from gamfit.torch.manifold_sae import ManifoldSAE, ManifoldSAEConfig, SparsityConfig
 
 
 def _selftest_softmax_topk_multi_atom_honors_target_k() -> None:
