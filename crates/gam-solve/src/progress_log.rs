@@ -114,7 +114,8 @@ fn human_elapsed(elapsed: Duration) -> String {
     }
 }
 
-/// Default verbosity when the user has set no environment override.
+/// The quiet out-of-the-box verbosity, applied whenever no explicit level is
+/// requested.
 ///
 /// A single ordinary fit (e.g. a 400-row `s(x)` P-spline) emits thousands of
 /// per-iteration `[OUTER ...]` / `[GAM ALO]` `info!`/`warn!` records. Writing
@@ -125,28 +126,11 @@ fn human_elapsed(elapsed: Duration) -> String {
 /// surface, but the routine progress chatter is silent unless explicitly
 /// requested. Power users opt back in by calling [`set_log_level`] (e.g.
 /// `set_log_level("info")`) or [`log::set_max_level`] directly — verbosity is
-/// set through an explicit API, not a process-global env var (`std::env::var`
-/// is banned crate-wide; see [`resolve_log_level`]).
+/// set through an explicit API, never a process-global env var: `std::env::var`
+/// is banned crate-wide (build.rs substring scanner, `feedback_no_env_vars`
+/// policy), so there is deliberately no `GAM_LOG` / `RUST_LOG` path (one landed
+/// transiently in #1696 and broke the build).
 const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::Warn;
-
-/// Resolve the active log level.
-///
-/// Reading verbosity from the environment (`GAM_LOG` / `RUST_LOG`) is NOT
-/// permitted: `std::env::var` is banned crate-wide (build.rs substring scanner,
-/// `feedback_no_env_vars` policy), because process-global env reads are a hidden
-/// input that makes a library call's behavior depend on ambient state the caller
-/// never passed. An override path landed transiently in #1696 and broke the
-/// build; the supported way to change verbosity is the explicit
-/// [`set_log_level`] entry point (or [`log::set_max_level`] directly), not an
-/// env var. The out-of-the-box level stays [`DEFAULT_LOG_LEVEL`] (`Warn`): a
-/// plain library call from Python gets quiet logs and pays no per-record stderr
-/// cost (#1689), while genuine problems still surface.
-fn resolve_log_level() -> LevelFilter {
-    // Reading env vars in non-test src is banned by build.rs (no env-var gates),
-    // so the active level is the compile-time default. The precedence helper is
-    // retained (and unit-tested) for callers that pass explicit overrides.
-    log_level_from_overrides(None, None)
-}
 
 /// Parse one verbosity spelling into a [`LevelFilter`]. Case-insensitive,
 /// surrounding whitespace ignored. Returns `None` for anything unrecognized so
@@ -183,20 +167,13 @@ pub fn parse_level_directive(raw: &str) -> Option<LevelFilter> {
     parse_log_level(raw)
 }
 
-/// The quiet out-of-the-box verbosity, exposed so callers that want the
-/// documented default after an explicit-level path can name it instead of
-/// hardcoding `Warn`.
-pub const fn default_log_level() -> LevelFilter {
-    DEFAULT_LOG_LEVEL
-}
-
 /// Explicitly set the active log verbosity from a level spelling
 /// (`off|error|warn|info|debug|trace`, case-insensitive). This is the supported
 /// way to raise verbosity above the default — callers pass the level they want
 /// rather than relying on a process-global env var (`std::env::var` is banned
-/// crate-wide; see [`resolve_log_level`]). Returns the [`LevelFilter`] actually
-/// installed (the default when `spelling` is unrecognized, so a typo never
-/// silently disables logging). A no-op-safe wrapper over [`log::set_max_level`].
+/// crate-wide). Returns the [`LevelFilter`] actually installed (the default when
+/// `spelling` is unrecognized, so a typo never silently disables logging). A
+/// no-op-safe wrapper over [`log::set_max_level`].
 pub fn set_log_level(spelling: &str) -> LevelFilter {
     let level = log_level_from_overrides(Some(spelling), None);
     log::set_max_level(level);
@@ -204,7 +181,10 @@ pub fn set_log_level(spelling: &str) -> LevelFilter {
 }
 
 pub fn init_logging() {
-    init_logging_at(resolve_log_level());
+    // No env-override path exists (see `DEFAULT_LOG_LEVEL`), so the out-of-the-box
+    // level IS the compile-time default; an embedding raises it afterwards via
+    // `set_log_level` / `init_logging_at`.
+    init_logging_at(DEFAULT_LOG_LEVEL);
 }
 
 /// Install the stderr logger at an explicit verbosity. Idempotent in the sense
@@ -297,12 +277,6 @@ mod tests {
         for spelling in ["off", "error", "warn", "info", "debug", "trace", "", "garbage"] {
             assert_eq!(parse_level_directive(spelling), parse_log_level(spelling));
         }
-    }
-
-    #[test]
-    fn default_log_level_accessor_matches_const() {
-        assert_eq!(default_log_level(), DEFAULT_LOG_LEVEL);
-        assert_eq!(default_log_level(), LevelFilter::Warn);
     }
 
     #[test]
