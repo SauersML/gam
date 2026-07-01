@@ -636,11 +636,11 @@ pub struct SaeManifoldTerm {
     /// #1777 PER-FIT separation-barrier strength override `μ_C` — the source of
     /// truth for the barrier strength when set, replacing the process-global
     /// [`set_sae_barrier_overrides`] atomic. `Some(μ_C)` forces the absolute
-    /// strength (bypassing the data-derived overcompleteness ratio), scoped to
-    /// THIS term/fit so concurrent in-process fits are isolated; `0.0` disables the
-    /// barrier. `None` ⇒ fall back to the deprecated process-global override, then
-    /// the data-derived strength (bit-identical to the historical path when
-    /// neither override is set). Read via
+    /// strength (bypassing the #1610 evidence-derived per-pair reciprocal-margin
+    /// strengths), scoped to THIS term/fit so concurrent in-process fits are
+    /// isolated; `0.0` disables the barrier. `None` ⇒ fall back to the deprecated
+    /// process-global override, then the evidence-derived strength (bit-identical
+    /// to the historical path when neither override is set). Read via
     /// [`super::penalties::SaeManifoldTerm::separation_barrier_strength`]; set from
     /// the FFI through [`SaeManifoldTerm::set_fit_config`]. Carried across clones
     /// (persisted configuration, like the assignment mode).
@@ -662,7 +662,7 @@ pub struct SaeManifoldTerm {
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct SaeFitConfig {
     /// Per-fit separation-barrier strength `μ_C`. `Some` bypasses both the global
-    /// override and the data-derived overcompleteness ratio (`0.0` = barrier off).
+    /// override and the #1610 evidence-derived per-pair strengths (`0.0` = barrier off).
     pub separation_barrier_strength_override: Option<f64>,
     /// Per-fit truncated-IBP concentration `α`. `Some` bypasses both the global
     /// override and the mode's own `α` / learnable schedule.
