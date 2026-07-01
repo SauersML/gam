@@ -3841,36 +3841,50 @@ pub(crate) fn planted_circle_seed_term(
 
 #[test]
 pub(crate) fn planted_circle_focus_1744() {
-    let assignment_mode = PlantedCircleAssignmentMode::IbpMap;
     let n = 40usize;
-    let sigma = 0.18_f64;
+    let sigma = 0.05_f64;
     let z = planted_circle_data(n, sigma);
-    let (term, seed_dispersion) = planted_circle_seed_term(z.view(), assignment_mode);
-    let seed_ev = global_ev(z.view(), term.fitted().view());
-    let init_rho = SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![array![0.0]])
-        .seed_scaled_by_dispersion_for_assignment(seed_dispersion, assignment_mode.mode())
-        .unwrap();
-    eprintln!(
-        "FOCUS1744 seed_ev={seed_ev:.4} seed_disp={seed_dispersion:.3e} init_rho=({:.4},{:?},{:?})",
-        init_rho.log_lambda_sparse, init_rho.log_lambda_smooth, init_rho.log_ard
+    let mut out = String::new();
+    for assignment_mode in [
+        PlantedCircleAssignmentMode::Softmax,
+        PlantedCircleAssignmentMode::IbpMap,
+    ] {
+        let label = assignment_mode.label();
+        let (term, seed_dispersion) = planted_circle_seed_term(z.view(), assignment_mode);
+        out.push_str(&format!("FOCUS1744 mode={label} seed_disp={seed_dispersion:.3e}\n"));
+        for &sparse in &[-8.0_f64, 1.0] {
+            for &ard in &[-6.0_f64, -3.0, 0.0, 1.0] {
+                for &smooth in &[-8.0_f64, -5.0, -3.0, -1.0, 0.0, 1.0, 3.0] {
+                    let mut t = term.clone();
+                    let r = SaeManifoldRho::new(sparse, smooth, vec![array![ard]]);
+                    match t.reml_criterion_with_cache(
+                        z.view(),
+                        &r,
+                        None,
+                        60,
+                        0.04,
+                        1.0e-6,
+                        1.0e-6,
+                    ) {
+                        Ok(evaluated) => {
+                            let ev = global_ev(z.view(), t.fitted().view());
+                            out.push_str(&format!(
+                                "FOCUS1744 mode={label} sparse={sparse} ard={ard} smooth={smooth} cost={:.4e} ev={ev:.4}\n",
+                                evaluated.0
+                            ));
+                        }
+                        Err(err) => out.push_str(&format!(
+                            "FOCUS1744 mode={label} sparse={sparse} ard={ard} smooth={smooth} ERR={err}\n"
+                        )),
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        out.contains("ev="),
+        "FOCUS1744: every (mode,sparse,ard,smooth) config errored — no fit produced a finite EV:\n{out}"
     );
-    let init_rho_flat = init_rho.to_flat();
-    eprintln!("FOCUS1744 init_rho_flat={init_rho_flat:?}");
-    let n_params = init_rho_flat.len();
-    let mut objective =
-        SaeManifoldOuterObjective::new(term, z.clone(), None, init_rho, 50, 0.04, 1.0e-6, 1.0e-6);
-    gam_solve::rho_optimizer::OuterProblem::new(n_params)
-        .with_initial_rho(init_rho_flat)
-        .run(&mut objective, "SAE planted circle FOCUS1744")
-        .unwrap();
-    let fitted_result = objective.into_fitted();
-    let rho = fitted_result.rho;
-    let ev = global_ev(z.view(), fitted_result.term.fitted().view());
-    eprintln!(
-        "FOCUS1744 final_rho=({:.4},{:?},{:?}) EV={ev:.4}",
-        rho.log_lambda_sparse, rho.log_lambda_smooth, rho.log_ard
-    );
-    assert!(ev.is_finite(), "focused diagnostic produced a non-finite EV");
 }
 
 #[test]

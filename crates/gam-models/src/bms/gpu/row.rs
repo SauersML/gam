@@ -2913,232 +2913,13 @@ pub fn launch_bms_flex_row_dense_block(
 // absent and these tests do not compile — the build.rs ban scanner
 // explicitly rejects `#[cfg(any(..., test))]` on the struct definitions
 // themselves as a dead-code escape hatch.
-#[cfg(all(test, target_os = "linux"))]
-mod tests {
+// #415 parity lock: the CPU host oracle for the BMS-FLEX row kernel lives in a
+// non-linux-gated `#[cfg(test)]` module so it can be exercised on the macOS dev
+// box + CPU CI (the sibling `mod tests` is linux-gated because it also builds
+// CUDA-only fixture types). `cpu_oracle_outputs` itself is platform-independent.
+#[cfg(test)]
+pub(crate) mod oracle_parity_tests {
     use super::*;
-
-    pub(crate) fn minimal_inputs<'a>(buffers: &'a TestBuffers) -> BmsFlexRowKernelInputs<'a> {
-        BmsFlexRowKernelInputs {
-            n_rows: 1,
-            r: 4,
-            p_h: 1,
-            p_w: 1,
-            q: &buffers.q,
-            b: &buffers.b,
-            mu_1: &buffers.mu_1,
-            mu_2: &buffers.mu_2,
-            z_obs: &buffers.z_obs,
-            y: &buffers.y,
-            w: &buffers.w,
-            s_f: 1.0,
-            cell_offsets: &buffers.cell_offsets,
-            cell_c0: &buffers.cell_c0,
-            cell_c1: &buffers.cell_c1,
-            cell_c2: &buffers.cell_c2,
-            cell_c3: &buffers.cell_c3,
-            cell_a: &buffers.cell_a,
-            cell_aa: &buffers.cell_aa,
-            cell_r: &buffers.cell_r,
-            cell_ar: &buffers.cell_ar,
-            cell_sbb: &buffers.cell_sbb,
-            cell_sbh: &buffers.cell_sbh,
-            cell_sbw: &buffers.cell_sbw,
-            cell_moments: CellMomentsSource::Host(&buffers.cell_moments),
-            chi_obs: &buffers.chi_obs,
-            xi_obs: &buffers.xi_obs,
-            rho_u: &buffers.rho_u,
-            tau_u: &buffers.tau_u,
-            r_uv: &buffers.r_uv,
-        }
-    }
-
-    pub(crate) struct TestBuffers {
-        pub(crate) q: Vec<f64>,
-        pub(crate) b: Vec<f64>,
-        pub(crate) mu_1: Vec<f64>,
-        pub(crate) mu_2: Vec<f64>,
-        pub(crate) z_obs: Vec<f64>,
-        pub(crate) y: Vec<f64>,
-        pub(crate) w: Vec<f64>,
-        pub(crate) cell_offsets: Vec<u32>,
-        pub(crate) cell_c0: Vec<f64>,
-        pub(crate) cell_c1: Vec<f64>,
-        pub(crate) cell_c2: Vec<f64>,
-        pub(crate) cell_c3: Vec<f64>,
-        pub(crate) cell_a: Vec<f64>,
-        pub(crate) cell_aa: Vec<f64>,
-        pub(crate) cell_r: Vec<f64>,
-        pub(crate) cell_ar: Vec<f64>,
-        pub(crate) cell_sbb: Vec<f64>,
-        pub(crate) cell_sbh: Vec<f64>,
-        pub(crate) cell_sbw: Vec<f64>,
-        pub(crate) cell_moments: Vec<f64>,
-        pub(crate) chi_obs: Vec<f64>,
-        pub(crate) xi_obs: Vec<f64>,
-        pub(crate) rho_u: Vec<f64>,
-        pub(crate) tau_u: Vec<f64>,
-        pub(crate) r_uv: Vec<f64>,
-    }
-
-    pub(crate) fn make_buffers(n_cells: u32, r: usize, p_h: usize, p_w: usize) -> TestBuffers {
-        let cells = n_cells as usize;
-        TestBuffers {
-            q: vec![0.1; 1],
-            b: vec![0.5; 1],
-            mu_1: vec![0.3; 1],
-            mu_2: vec![0.07; 1],
-            z_obs: vec![0.0; 1],
-            y: vec![1.0; 1],
-            w: vec![1.0; 1],
-            cell_offsets: vec![0, n_cells],
-            cell_c0: vec![0.2; cells],
-            cell_c1: vec![-0.1; cells],
-            cell_c2: vec![0.05; cells],
-            cell_c3: vec![-0.02; cells],
-            cell_a: vec![0.1; cells * 4],
-            cell_aa: vec![0.0; cells * 4],
-            cell_r: vec![0.05; cells * (r - 1) * 4],
-            cell_ar: vec![0.0; cells * (r - 1) * 4],
-            cell_sbb: vec![0.0; cells * 4],
-            cell_sbh: vec![0.0; cells * p_h * 4],
-            cell_sbw: vec![0.0; cells * p_w * 4],
-            cell_moments: vec![1.0; cells * MOMENT_STRIDE],
-            chi_obs: vec![1.0; 1],
-            xi_obs: vec![0.0; 1],
-            rho_u: vec![0.0; r],
-            tau_u: vec![0.0; r],
-            r_uv: vec![0.0; r * r],
-        }
-    }
-
-    #[test]
-    pub(crate) fn validate_accepts_minimal_inputs() {
-        let buffers = make_buffers(2, 4, 1, 1);
-        let inputs = minimal_inputs(&buffers);
-        assert!(inputs.validate().is_ok());
-    }
-
-    #[test]
-    pub(crate) fn validate_rejects_r_above_max() {
-        let r = MAX_R + 1;
-        let p_h = (r - 2) / 2;
-        let p_w = (r - 2) - p_h;
-        let buffers = make_buffers(1, r, p_h, p_w);
-        let bad_inputs = BmsFlexRowKernelInputs {
-            r,
-            p_h,
-            p_w,
-            rho_u: &buffers.rho_u, // length matches `r` we wrote
-            tau_u: &buffers.tau_u,
-            r_uv: &buffers.r_uv,
-            cell_r: &buffers.cell_r,
-            cell_ar: &buffers.cell_ar,
-            cell_sbh: &buffers.cell_sbh,
-            cell_sbw: &buffers.cell_sbw,
-            ..minimal_inputs(&buffers)
-        };
-        let err = bad_inputs.validate().expect_err("r > MAX_R must fail");
-        let msg = err.to_string();
-        assert!(msg.contains("MAX_R"), "expected MAX_R hint, got: {msg}");
-    }
-
-    #[test]
-    pub(crate) fn validate_rejects_mismatched_r_decomposition() {
-        let buffers = make_buffers(1, 4, 1, 1);
-        let bad_inputs = BmsFlexRowKernelInputs {
-            r: 4,
-            p_h: 1,
-            p_w: 2, // inconsistent with r = 4
-            ..minimal_inputs(&buffers)
-        };
-        let err = bad_inputs
-            .validate()
-            .expect_err("inconsistent r vs p_h+p_w must fail");
-        let msg = err.to_string();
-        assert!(msg.contains("p_h"), "got: {msg}");
-        assert!(msg.contains("p_w"), "got: {msg}");
-    }
-
-    #[test]
-    pub(crate) fn validate_rejects_non_monotone_offsets() {
-        // `minimal_inputs` hard-codes `n_rows = 1`, so the CSR-style row
-        // pointer length is `n + 1 = 2`. Pin both `offsets[1] = total_cells`
-        // and `cell_c0.len() = total_cells = 2` from `make_buffers(2, …)`,
-        // then violate monotonicity by setting `offsets[0] > offsets[1]`;
-        // every length / per-cell-count check is satisfied so the only
-        // failure mode left is the monotonicity guard.
-        let mut buffers = make_buffers(2, 4, 1, 1);
-        buffers.cell_offsets = vec![5, 2];
-        let inputs = minimal_inputs(&buffers);
-        let err = inputs
-            .validate()
-            .expect_err("non-monotone offsets must fail");
-        let msg = err.to_string();
-        assert!(msg.contains("monotone"), "got: {msg}");
-    }
-
-    #[test]
-    pub(crate) fn validate_rejects_mismatched_cell_moments_length() {
-        let mut buffers = make_buffers(2, 4, 1, 1);
-        buffers.cell_moments.pop(); // length now 2*10 - 1
-        let inputs = minimal_inputs(&buffers);
-        let err = inputs.validate().expect_err("short cell_moments must fail");
-        let msg = err.to_string();
-        assert!(msg.contains("cell_moments"), "got: {msg}");
-    }
-
-    #[test]
-    pub(crate) fn launch_on_non_linux_reports_driver_library_unavailable() {
-        // Mac/Windows builds must surface a typed `DriverLibraryUnavailable`
-        // rather than panicking or returning Ok. On Linux this test is
-        // skipped because the kernel actually launches.
-        #[cfg(target_os = "linux")]
-        {
-            // Linux builds may or may not have a device; the dispatcher
-            // contract is that without a runtime, probe() returns
-            // DriverLibraryUnavailable. Either outcome (NoDeviceKernel,
-            // DriverLibraryUnavailable, or DriverCallFailed) is acceptable
-            // here; success would mean the kernel actually ran which is a
-            // V100-only outcome we don't gate the unit test on.
-            let buffers = make_buffers(1, 4, 1, 1);
-            let inputs = minimal_inputs(&buffers);
-            match launch_bms_flex_row_kernel(inputs) {
-                Ok(_) => { /* V100 host: real launch */ }
-                Err(GpuError::DriverLibraryUnavailable { .. })
-                | Err(GpuError::DriverCallFailed { .. })
-                | Err(GpuError::DriverSymbolMissing { .. })
-                | Err(GpuError::NoDeviceKernel { .. }) => { /* expected on CPU-only */ }
-                Err(other) => panic!("unexpected GpuError variant: {other:?}"),
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let buffers = make_buffers(1, 4, 1, 1);
-            let inputs = minimal_inputs(&buffers);
-            match launch_bms_flex_row_kernel(inputs) {
-                Err(GpuError::DriverLibraryUnavailable { reason }) => {
-                    assert!(
-                        reason.contains("Linux-only"),
-                        "expected Linux-only hint, got: {reason}"
-                    );
-                }
-                other => panic!("expected DriverLibraryUnavailable on non-Linux, got {other:?}"),
-            }
-        }
-    }
-
-    #[test]
-    pub(crate) fn s_f_must_be_positive_and_finite() {
-        let buffers = make_buffers(1, 4, 1, 1);
-        let mut inputs = minimal_inputs(&buffers);
-        inputs.s_f = 0.0;
-        match launch_bms_flex_row_kernel(inputs) {
-            Err(GpuError::DriverCallFailed { reason }) => {
-                assert!(reason.contains("s_f"), "got: {reason}");
-            }
-            other => panic!("expected DriverCallFailed for s_f=0, got {other:?}"),
-        }
-    }
 
     // ── CPU oracle that mirrors ROW_KERNEL_BODY bit-for-bit ──────────────────
     //
@@ -3435,6 +3216,236 @@ mod tests {
 
         BmsFlexRowKernelOutputs { neglog, grad, hess }
     }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use super::oracle_parity_tests::*;
+
+    pub(crate) fn minimal_inputs<'a>(buffers: &'a TestBuffers) -> BmsFlexRowKernelInputs<'a> {
+        BmsFlexRowKernelInputs {
+            n_rows: 1,
+            r: 4,
+            p_h: 1,
+            p_w: 1,
+            q: &buffers.q,
+            b: &buffers.b,
+            mu_1: &buffers.mu_1,
+            mu_2: &buffers.mu_2,
+            z_obs: &buffers.z_obs,
+            y: &buffers.y,
+            w: &buffers.w,
+            s_f: 1.0,
+            cell_offsets: &buffers.cell_offsets,
+            cell_c0: &buffers.cell_c0,
+            cell_c1: &buffers.cell_c1,
+            cell_c2: &buffers.cell_c2,
+            cell_c3: &buffers.cell_c3,
+            cell_a: &buffers.cell_a,
+            cell_aa: &buffers.cell_aa,
+            cell_r: &buffers.cell_r,
+            cell_ar: &buffers.cell_ar,
+            cell_sbb: &buffers.cell_sbb,
+            cell_sbh: &buffers.cell_sbh,
+            cell_sbw: &buffers.cell_sbw,
+            cell_moments: CellMomentsSource::Host(&buffers.cell_moments),
+            chi_obs: &buffers.chi_obs,
+            xi_obs: &buffers.xi_obs,
+            rho_u: &buffers.rho_u,
+            tau_u: &buffers.tau_u,
+            r_uv: &buffers.r_uv,
+        }
+    }
+
+    pub(crate) struct TestBuffers {
+        pub(crate) q: Vec<f64>,
+        pub(crate) b: Vec<f64>,
+        pub(crate) mu_1: Vec<f64>,
+        pub(crate) mu_2: Vec<f64>,
+        pub(crate) z_obs: Vec<f64>,
+        pub(crate) y: Vec<f64>,
+        pub(crate) w: Vec<f64>,
+        pub(crate) cell_offsets: Vec<u32>,
+        pub(crate) cell_c0: Vec<f64>,
+        pub(crate) cell_c1: Vec<f64>,
+        pub(crate) cell_c2: Vec<f64>,
+        pub(crate) cell_c3: Vec<f64>,
+        pub(crate) cell_a: Vec<f64>,
+        pub(crate) cell_aa: Vec<f64>,
+        pub(crate) cell_r: Vec<f64>,
+        pub(crate) cell_ar: Vec<f64>,
+        pub(crate) cell_sbb: Vec<f64>,
+        pub(crate) cell_sbh: Vec<f64>,
+        pub(crate) cell_sbw: Vec<f64>,
+        pub(crate) cell_moments: Vec<f64>,
+        pub(crate) chi_obs: Vec<f64>,
+        pub(crate) xi_obs: Vec<f64>,
+        pub(crate) rho_u: Vec<f64>,
+        pub(crate) tau_u: Vec<f64>,
+        pub(crate) r_uv: Vec<f64>,
+    }
+
+    pub(crate) fn make_buffers(n_cells: u32, r: usize, p_h: usize, p_w: usize) -> TestBuffers {
+        let cells = n_cells as usize;
+        TestBuffers {
+            q: vec![0.1; 1],
+            b: vec![0.5; 1],
+            mu_1: vec![0.3; 1],
+            mu_2: vec![0.07; 1],
+            z_obs: vec![0.0; 1],
+            y: vec![1.0; 1],
+            w: vec![1.0; 1],
+            cell_offsets: vec![0, n_cells],
+            cell_c0: vec![0.2; cells],
+            cell_c1: vec![-0.1; cells],
+            cell_c2: vec![0.05; cells],
+            cell_c3: vec![-0.02; cells],
+            cell_a: vec![0.1; cells * 4],
+            cell_aa: vec![0.0; cells * 4],
+            cell_r: vec![0.05; cells * (r - 1) * 4],
+            cell_ar: vec![0.0; cells * (r - 1) * 4],
+            cell_sbb: vec![0.0; cells * 4],
+            cell_sbh: vec![0.0; cells * p_h * 4],
+            cell_sbw: vec![0.0; cells * p_w * 4],
+            cell_moments: vec![1.0; cells * MOMENT_STRIDE],
+            chi_obs: vec![1.0; 1],
+            xi_obs: vec![0.0; 1],
+            rho_u: vec![0.0; r],
+            tau_u: vec![0.0; r],
+            r_uv: vec![0.0; r * r],
+        }
+    }
+
+    #[test]
+    pub(crate) fn validate_accepts_minimal_inputs() {
+        let buffers = make_buffers(2, 4, 1, 1);
+        let inputs = minimal_inputs(&buffers);
+        assert!(inputs.validate().is_ok());
+    }
+
+    #[test]
+    pub(crate) fn validate_rejects_r_above_max() {
+        let r = MAX_R + 1;
+        let p_h = (r - 2) / 2;
+        let p_w = (r - 2) - p_h;
+        let buffers = make_buffers(1, r, p_h, p_w);
+        let bad_inputs = BmsFlexRowKernelInputs {
+            r,
+            p_h,
+            p_w,
+            rho_u: &buffers.rho_u, // length matches `r` we wrote
+            tau_u: &buffers.tau_u,
+            r_uv: &buffers.r_uv,
+            cell_r: &buffers.cell_r,
+            cell_ar: &buffers.cell_ar,
+            cell_sbh: &buffers.cell_sbh,
+            cell_sbw: &buffers.cell_sbw,
+            ..minimal_inputs(&buffers)
+        };
+        let err = bad_inputs.validate().expect_err("r > MAX_R must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("MAX_R"), "expected MAX_R hint, got: {msg}");
+    }
+
+    #[test]
+    pub(crate) fn validate_rejects_mismatched_r_decomposition() {
+        let buffers = make_buffers(1, 4, 1, 1);
+        let bad_inputs = BmsFlexRowKernelInputs {
+            r: 4,
+            p_h: 1,
+            p_w: 2, // inconsistent with r = 4
+            ..minimal_inputs(&buffers)
+        };
+        let err = bad_inputs
+            .validate()
+            .expect_err("inconsistent r vs p_h+p_w must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("p_h"), "got: {msg}");
+        assert!(msg.contains("p_w"), "got: {msg}");
+    }
+
+    #[test]
+    pub(crate) fn validate_rejects_non_monotone_offsets() {
+        // `minimal_inputs` hard-codes `n_rows = 1`, so the CSR-style row
+        // pointer length is `n + 1 = 2`. Pin both `offsets[1] = total_cells`
+        // and `cell_c0.len() = total_cells = 2` from `make_buffers(2, …)`,
+        // then violate monotonicity by setting `offsets[0] > offsets[1]`;
+        // every length / per-cell-count check is satisfied so the only
+        // failure mode left is the monotonicity guard.
+        let mut buffers = make_buffers(2, 4, 1, 1);
+        buffers.cell_offsets = vec![5, 2];
+        let inputs = minimal_inputs(&buffers);
+        let err = inputs
+            .validate()
+            .expect_err("non-monotone offsets must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("monotone"), "got: {msg}");
+    }
+
+    #[test]
+    pub(crate) fn validate_rejects_mismatched_cell_moments_length() {
+        let mut buffers = make_buffers(2, 4, 1, 1);
+        buffers.cell_moments.pop(); // length now 2*10 - 1
+        let inputs = minimal_inputs(&buffers);
+        let err = inputs.validate().expect_err("short cell_moments must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("cell_moments"), "got: {msg}");
+    }
+
+    #[test]
+    pub(crate) fn launch_on_non_linux_reports_driver_library_unavailable() {
+        // Mac/Windows builds must surface a typed `DriverLibraryUnavailable`
+        // rather than panicking or returning Ok. On Linux this test is
+        // skipped because the kernel actually launches.
+        #[cfg(target_os = "linux")]
+        {
+            // Linux builds may or may not have a device; the dispatcher
+            // contract is that without a runtime, probe() returns
+            // DriverLibraryUnavailable. Either outcome (NoDeviceKernel,
+            // DriverLibraryUnavailable, or DriverCallFailed) is acceptable
+            // here; success would mean the kernel actually ran which is a
+            // V100-only outcome we don't gate the unit test on.
+            let buffers = make_buffers(1, 4, 1, 1);
+            let inputs = minimal_inputs(&buffers);
+            match launch_bms_flex_row_kernel(inputs) {
+                Ok(_) => { /* V100 host: real launch */ }
+                Err(GpuError::DriverLibraryUnavailable { .. })
+                | Err(GpuError::DriverCallFailed { .. })
+                | Err(GpuError::DriverSymbolMissing { .. })
+                | Err(GpuError::NoDeviceKernel { .. }) => { /* expected on CPU-only */ }
+                Err(other) => panic!("unexpected GpuError variant: {other:?}"),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let buffers = make_buffers(1, 4, 1, 1);
+            let inputs = minimal_inputs(&buffers);
+            match launch_bms_flex_row_kernel(inputs) {
+                Err(GpuError::DriverLibraryUnavailable { reason }) => {
+                    assert!(
+                        reason.contains("Linux-only"),
+                        "expected Linux-only hint, got: {reason}"
+                    );
+                }
+                other => panic!("expected DriverLibraryUnavailable on non-Linux, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    pub(crate) fn s_f_must_be_positive_and_finite() {
+        let buffers = make_buffers(1, 4, 1, 1);
+        let mut inputs = minimal_inputs(&buffers);
+        inputs.s_f = 0.0;
+        match launch_bms_flex_row_kernel(inputs) {
+            Err(GpuError::DriverCallFailed { reason }) => {
+                assert!(reason.contains("s_f"), "got: {reason}");
+            }
+            other => panic!("expected DriverCallFailed for s_f=0, got {other:?}"),
+        }
+    }
+
 
     /// Build a non-trivial fixture: `n = 4` rows, `r = 5` (p_h = 2, p_w = 1),
     /// 2–4 cells per row, distinct values so a structural bug in either path
