@@ -446,10 +446,10 @@ pub fn default_num_centers(n: usize, d: usize) -> usize {
 /// the fitted scale is driven small the *observed* information collapses and
 /// the determinant penalty stops holding the wiggle down (#501). This mirrors
 /// standard GAMLSS/mgcv practice of giving distribution parameters a modest
-/// default (mgcv's `k = 10` for a 1-D `s()`), grown gently with dimensionality
-/// and never exceeding the generous primary-predictor default.
+/// default (mgcv's modest default basis for a 1-D `s()`), grown gently with
+/// dimensionality and never exceeding the generous primary-predictor default.
 pub fn conservative_secondary_centers(n: usize, d: usize) -> usize {
-    const BASE_1D_CENTERS: usize = 10;
+    const BASE_1D_CENTERS: usize = 15;
     let modest = BASE_1D_CENTERS.saturating_mul(d.max(1));
     default_num_centers(n, d).min(modest).max(1)
 }
