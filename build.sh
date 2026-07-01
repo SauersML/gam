@@ -43,6 +43,43 @@ if [[ -z "${CARGO_BUILD_JOBS:-}" ]]; then
   elif [[ -n "$mem_gb" && "$mem_gb" -le 18 ]]; then export CARGO_BUILD_JOBS=4; fi
 fi
 
+# ---- help lane (before any guard, so it works even on a disk/RAM-tight box) ----
+case "${1:-}" in
+  -h|--help|help)
+    cat >&2 <<'EOF'
+build.sh — single-flight build/test gate for the shared gam tree.
+Agents call THIS, never `cargo` directly (it serializes the RAM-heavy compiles so
+a fleet of agents on one warm target/ dir don't OOM-storm each other).
+
+LANES
+  ./build.sh                       warm the gam lib (cargo build --lib), dedup'd
+  ./build.sh crate A [B…]          check ONLY crate(s) A,B… — fast + light, prefer this
+  ./build.sh changed               check just the crates you edited (from git status)
+  ./build.sh nextest run <FILTER>  compile+run tests (compile under lock, exec under run-lock)
+  ./build.sh check --workspace …   any cargo subcommand + args (cacheable)
+  ./build.sh maturin [args]        build+install the gamfit Python extension (release)
+  ./build.sh -h | --help           this help
+
+KEY ENV OVERRIDES
+  CARGO_BUILD_JOBS=<n>     codegen parallelism (auto: ≤10G RAM→2, ≤18G→4; auto-drops
+                          to 1 on an OOM retry). Lower = less peak RAM, slower.
+  GAM_MIN_FREE_RAM_GB=<n>  RAM headroom to wait for before compiling (default 3)
+  GAM_MEM_WAIT_MAX=<s>     max seconds to wait for that RAM, then proceed (default 300)
+  MIN_FREE_GB=<n>          disk-headroom preflight; bails fast instead of ENOSPC (default 4)
+  GAM_BUILD_TIMEOUT=<s>    per-command wall-clock cap (default 1800)
+  GAM_FORCE=1              bypass result cache + coalescing, always run, refresh cache
+  GAM_NO_CACHE=1           don't read/write the result cache (still single-flight)
+  GAM_USE_SCCACHE=1        use sccache (cold trees/CI; trades away incremental)
+  GAM_REMOTE_RUN=<runner>  route builds off-box when local disk is too low
+
+NOTES
+  • Result cache: the same command on unchanged source serves the prior result in ~0s.
+  • Transient OOM/timeout are auto-retried (dropping to -j1) and never cached.
+  • The maturin lane auto-tunes (-j1, LTO off) when FREE RAM is low, to survive the link.
+EOF
+    exit 0 ;;
+esac
+
 # ---------------------------------------------------------------------------
 # INCREMENTAL-FIRST (the whole point of the crate split). The fleet hammers ONE
 # shared, warm target/ dir: editing a single crate must recompile only THAT crate
@@ -304,7 +341,13 @@ is_test_run() {
 # perturbs target/ during the execute phase. GAM_NO_SPLIT=1 forces the old
 # everything-under-one-lock behavior.
 run_under_global_lock() {
-  exec 9>"$LOCK"; flock -x 9
+  exec 9>"$LOCK"
+  # Tell the caller WHY it's blocked instead of hanging silently: try the lock
+  # non-blocking first, and only if another build/test holds it, say so and wait.
+  if ! flock -n -x 9; then
+    echo "[build.sh] waiting for the global build lock — another build/test is compiling (one cargo at a time on this box)…" >&2
+    flock -x 9
+  fi
   cd "$REPO" || exit 1
   local attempt=0 max="${GAM_BUILD_RETRIES:-3}" t0 split=""
   [[ -z "${GAM_NO_SPLIT:-}" ]] && is_test_run && split=1
@@ -323,6 +366,11 @@ run_under_global_lock() {
         if is_incremental_corruption; then
           echo "[build.sh] incremental-state corruption (concurrent cargo on target/) attempt $attempt/$max — wiping target/debug/incremental + retrying…" >&2
           rm -rf "$REPO/target/debug/incremental" 2>/dev/null || true
+        elif [[ "${CARGO_BUILD_JOBS:-0}" != "1" ]]; then
+          # Repeated OOM won't clear by waiting alone — a lower job count has a
+          # strictly lower codegen RAM peak, so shrink to -j1 for the retry.
+          export CARGO_BUILD_JOBS=1
+          echo "[build.sh] transient failure (OOM/timeout, exit $code) attempt $attempt/$max — retrying with CARGO_BUILD_JOBS=1 (lower peak RAM)…" >&2
         else
           echo "[build.sh] transient failure (OOM/timeout, exit $code) attempt $attempt/$max — backing off for memory, retrying…" >&2
         fi
@@ -474,12 +522,43 @@ run_request() {
 # internal cargo, which honours the RUSTC_WRAPPER env form instead.
 if [[ "${1:-}" == "maturin" ]]; then
   shift
+  # `maturin develop` builds for the ACTIVE virtualenv and does NOT accept
+  # --interpreter (that's a `maturin build` flag). Strip it (with its value) so a
+  # caller who passes it by habit gets a clear note, not a cryptic clap error.
+  _margs=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -i|--interpreter)
+        echo "[build.sh maturin] ignoring '$1 ${2:-}' — develop targets the active venv, not --interpreter" >&2
+        shift 2 2>/dev/null || shift ;;
+      *) _margs+=("$1"); shift ;;
+    esac
+  done
+  set -- ${_margs[@]+"${_margs[@]}"}
+  # maturin develop needs a virtualenv (activated, or a repo-local .venv/venv it
+  # can find). Fail with an actionable message instead of a cryptic maturin error.
+  if [[ -z "${VIRTUAL_ENV:-}" && ! -d "$REPO/.venv" && ! -d "$REPO/venv" ]]; then
+    echo "[build.sh maturin] no active virtualenv and no .venv/ in the repo — 'maturin develop' needs one." >&2
+    echo "[build.sh maturin] create it once: python3 -m venv .venv && ./.venv/bin/pip install maturin torch" >&2
+    exit 78
+  fi
   if command -v sccache >/dev/null 2>&1 && [[ -z "${GAM_NO_SCCACHE:-}" ]]; then
     # sccache FORBIDS incremental; the top-of-file default is CARGO_INCREMENTAL=1
     # and the =0 override only runs in the cargo-lane sccache block, NOT here — so
     # the maturin lane must zero it itself or `maturin develop` dies with
     # "sccache: incremental compilation is prohibited".
     export RUSTC_WRAPPER="$(command -v sccache)" CARGO_INCREMENTAL=0
+  fi
+  # A release extension build+link is the heaviest compile here. On a box with
+  # little FREE RAM (regardless of total installed), the default codegen fan-out +
+  # LTO link OOM-SIGKILLs mid-link. Auto-cap to one job and drop LTO so it survives
+  # — slower, marginally less optimized, but it completes. All three stay overridable.
+  _fg=$(current_free_gb 2>/dev/null || echo 99)
+  if [[ "$_fg" =~ ^[0-9]+$ && "$_fg" -lt 5 ]]; then
+    export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
+    export CARGO_PROFILE_RELEASE_LTO="${CARGO_PROFILE_RELEASE_LTO:-false}"
+    export CARGO_PROFILE_RELEASE_CODEGEN_UNITS="${CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-256}"
+    echo "[build.sh maturin] low free RAM (~${_fg}G) → CARGO_BUILD_JOBS=$CARGO_BUILD_JOBS, LTO=$CARGO_PROFILE_RELEASE_LTO, codegen-units=$CARGO_PROFILE_RELEASE_CODEGEN_UNITS (slower, avoids OOM at link)" >&2
   fi
   REQ="maturin develop --release $*"
   CMD=(maturin develop --release "$@")
