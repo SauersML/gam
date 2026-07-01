@@ -1789,6 +1789,21 @@ fn periodic_spline_curve_basis<'py>(
     ))
 }
 
+/// Cyclic `order`-th difference penalty matrix `DᵀD` on `num_basis` closed
+/// periodic B-spline coefficients (the constant vector is its only nullspace
+/// direction). This is the periodic analogue of the P-spline coefficient
+/// penalty and lives entirely in the Rust core.
+#[pyfunction(signature = (num_basis, order = 2))]
+fn cyclic_difference_penalty(
+    py: Python<'_>,
+    num_basis: usize,
+    order: usize,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let penalty = create_cyclic_difference_penalty_matrix(num_basis, order)
+        .map_err(basis_error_to_pyerr)?;
+    Ok(penalty.into_pyarray(py).unbind())
+}
+
 fn build_wrapped_periodic_harmonic_basis_with_jet(
     t: ArrayView1<'_, f64>,
     n_harmonics: usize,

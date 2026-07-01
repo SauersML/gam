@@ -4136,10 +4136,9 @@ def _resolve_position_penalty(
             if penalty_kind not in {None, "coefficient-difference", "coefficientdifference", "difference"}:
                 raise ValueError(f"unsupported B-spline penalty {penalty!r}")
             if periodic:
-                raise ValueError(
-                    "periodic B-spline position penalties are built by the Rust core; "
-                    "fit them through the formula API (gamfit.smooth.PeriodicSplineCurve / "
-                    "basis 'periodic_spline_curve'), which routes the cyclic penalty to Rust."
+                k = int(np.asarray(knots_or_centers, dtype=float).size - 1)
+                return np.asarray(
+                    rust_module().cyclic_difference_penalty(k, 2), dtype=float
                 )
             s, _ = smoothness_penalty(knots_or_centers, degree=int(basis_order), order=2)
             return s
