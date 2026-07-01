@@ -106,6 +106,8 @@ pub(crate) fn validate_survival_location_scale_spec(
         InverseLink::Standard(StandardLink::Logit)
         | InverseLink::Standard(StandardLink::Probit)
         | InverseLink::Standard(StandardLink::CLogLog)
+        | InverseLink::Standard(StandardLink::LogLog)
+        | InverseLink::Standard(StandardLink::Cauchit)
         | InverseLink::Standard(StandardLink::Identity)
         | InverseLink::LatentCLogLog(_)
         | InverseLink::Sas(_)

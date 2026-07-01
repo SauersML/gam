@@ -117,6 +117,8 @@ pub enum LinkFunction {
     Logit,
     Probit,
     CLogLog,
+    LogLog,
+    Cauchit,
     Sas,
     BetaLogistic,
     Identity,
@@ -130,6 +132,8 @@ impl LinkFunction {
             Self::Logit => "logit",
             Self::Probit => "probit",
             Self::CLogLog => "cloglog",
+            Self::LogLog => "loglog",
+            Self::Cauchit => "cauchit",
             Self::Sas => "sas",
             Self::BetaLogistic => "beta-logistic",
             Self::Identity => "identity",
@@ -150,6 +154,8 @@ pub enum StandardLink {
     Logit,
     Probit,
     CLogLog,
+    LogLog,
+    Cauchit,
     Identity,
     Log,
 }
@@ -166,6 +172,8 @@ impl StandardLink {
             Self::Logit => LinkFunction::Logit,
             Self::Probit => LinkFunction::Probit,
             Self::CLogLog => LinkFunction::CLogLog,
+            Self::LogLog => LinkFunction::LogLog,
+            Self::Cauchit => LinkFunction::Cauchit,
             Self::Identity => LinkFunction::Identity,
             Self::Log => LinkFunction::Log,
         }
@@ -208,6 +216,8 @@ impl TryFrom<LinkFunction> for StandardLink {
             LinkFunction::Logit => Ok(Self::Logit),
             LinkFunction::Probit => Ok(Self::Probit),
             LinkFunction::CLogLog => Ok(Self::CLogLog),
+            LinkFunction::LogLog => Ok(Self::LogLog),
+            LinkFunction::Cauchit => Ok(Self::Cauchit),
             LinkFunction::Identity => Ok(Self::Identity),
             LinkFunction::Log => Ok(Self::Log),
             LinkFunction::Sas | LinkFunction::BetaLogistic => {
@@ -314,7 +324,13 @@ impl LatentCLogLogState {
 fn inverse_link_has_fisher_weight_jet(link: &InverseLink) -> bool {
     matches!(
         link,
-        InverseLink::Standard(StandardLink::Logit | StandardLink::Probit | StandardLink::CLogLog,)
+        InverseLink::Standard(
+            StandardLink::Logit
+                | StandardLink::Probit
+                | StandardLink::CLogLog
+                | StandardLink::LogLog
+                | StandardLink::Cauchit,
+        )
             | InverseLink::LatentCLogLog(_)
             | InverseLink::Sas(_)
             | InverseLink::BetaLogistic(_)
@@ -1345,7 +1361,11 @@ impl LikelihoodSpec {
             // identity/log standard links.
             ResponseFamily::Binomial => match link {
                 InverseLink::Standard(
-                    StandardLink::Logit | StandardLink::Probit | StandardLink::CLogLog,
+                    StandardLink::Logit
+                        | StandardLink::Probit
+                        | StandardLink::CLogLog
+                        | StandardLink::LogLog
+                        | StandardLink::Cauchit,
                 ) => true,
                 InverseLink::Standard(StandardLink::Identity | StandardLink::Log) => false,
                 InverseLink::LatentCLogLog(_)
@@ -1789,7 +1809,9 @@ pub fn inverse_link_to_binomial_spec(
     match link {
         InverseLink::Standard(StandardLink::Logit)
         | InverseLink::Standard(StandardLink::Probit)
-        | InverseLink::Standard(StandardLink::CLogLog) => {
+        | InverseLink::Standard(StandardLink::CLogLog)
+        | InverseLink::Standard(StandardLink::LogLog)
+        | InverseLink::Standard(StandardLink::Cauchit) => {
             Ok(LikelihoodSpec::new(ResponseFamily::Binomial, link.clone()))
         }
         InverseLink::LatentCLogLog(_)

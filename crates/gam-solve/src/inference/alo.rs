@@ -464,6 +464,8 @@ fn compute_alo_diagnostics_from_pirls_inner(
         LinkFunction::Logit
         | LinkFunction::Probit
         | LinkFunction::CLogLog
+        | LinkFunction::LogLog
+        | LinkFunction::Cauchit
         | LinkFunction::Sas
         | LinkFunction::BetaLogistic => 1.0,
         LinkFunction::Identity => {

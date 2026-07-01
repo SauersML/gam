@@ -102,6 +102,8 @@ pub fn update_glmvectors(
         LinkFunction::Logit
         | LinkFunction::Probit
         | LinkFunction::CLogLog
+        | LinkFunction::LogLog
+        | LinkFunction::Cauchit
         | LinkFunction::Sas
         | LinkFunction::BetaLogistic => {
             // On logit geometry, freeze higher η-derivatives in nonsmooth
@@ -791,6 +793,8 @@ pub(crate) fn computeworkingweight_derivatives_from_eta(
                             LinkFunction::Logit => eta[i].clamp(-ETA_CLAMP, ETA_CLAMP),
                             LinkFunction::Probit
                             | LinkFunction::CLogLog
+                            | LinkFunction::LogLog
+                            | LinkFunction::Cauchit
                             | LinkFunction::Sas
                             | LinkFunction::BetaLogistic => eta[i].clamp(-30.0, 30.0),
                             LinkFunction::Log => eta[i].clamp(-ETA_CLAMP, ETA_CLAMP),

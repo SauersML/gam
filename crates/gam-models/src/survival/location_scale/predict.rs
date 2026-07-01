@@ -402,6 +402,8 @@ pub(crate) fn validate_predict_inverse_link(
         InverseLink::Standard(StandardLink::Logit)
         | InverseLink::Standard(StandardLink::Probit)
         | InverseLink::Standard(StandardLink::CLogLog)
+        | InverseLink::Standard(StandardLink::LogLog)
+        | InverseLink::Standard(StandardLink::Cauchit)
         | InverseLink::Standard(StandardLink::Identity)
         | InverseLink::LatentCLogLog(_)
         | InverseLink::Sas(_)
@@ -433,6 +435,8 @@ pub(crate) fn inverse_link_survival_probvalue(inverse_link: &InverseLink, eta: f
         InverseLink::Standard(StandardLink::Probit) => probit_survival_value(eta),
         InverseLink::Standard(StandardLink::Logit) => 1.0 / (1.0 + eta.exp()),
         InverseLink::Standard(StandardLink::CLogLog) => (-(eta.exp())).exp(),
+        InverseLink::Standard(StandardLink::LogLog) => 1.0 - (-(-eta).exp()).exp(),
+        InverseLink::Standard(StandardLink::Cauchit) => 0.5 - eta.atan() / std::f64::consts::PI,
         InverseLink::Standard(StandardLink::Identity) => 1.0 - eta,
         InverseLink::Standard(StandardLink::Log) => {
             // SAFETY: survival families register only Probit/Logit/CLogLog/

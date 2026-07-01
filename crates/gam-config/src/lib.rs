@@ -511,17 +511,6 @@ pub fn effective_link_to_standard(
 pub fn parse_survival_inverse_link(
     input: SurvivalInverseLinkInput<'_>,
 ) -> Result<InverseLink, String> {
-    if let Some(raw) = input.link {
-        let name = raw.trim().to_ascii_lowercase();
-        if name == "loglog" || name == "cauchit" {
-            return Err(format!(
-                "survival --link {name} is not supported: cauchit and loglog have no \
-                 LinkFunction representative and cannot be wrapped in a MixtureLinkSpec; \
-                 {}",
-                survival_link_usage()
-            ));
-        }
-    }
     let choice = parse_link_choice(input.link, false).map_err(|err| {
         let err = err.to_string();
         if let Some(raw) = input.link {
@@ -936,7 +925,7 @@ fn validate_resolved_fit_config(config: &FitConfig) -> Result<(), String> {
 }
 
 fn survival_link_usage() -> &'static str {
-    "use identity|logit|probit|cloglog|sas|beta-logistic|blended(...)/mixture(...) or flexible(...)"
+    "use identity|logit|probit|cloglog|loglog|cauchit|sas|beta-logistic|blended(...)/mixture(...) or flexible(...)"
 }
 
 #[cfg(test)]

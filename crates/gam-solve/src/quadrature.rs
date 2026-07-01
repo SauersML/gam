@@ -2719,6 +2719,25 @@ pub fn integrated_inverse_link_mean_and_derivative(
         LinkFunction::Probit => Ok(probit_posterior_meanwith_deriv_exact(mu, sigma)),
         LinkFunction::Logit => logit_posterior_meanwith_deriv_controlled(mu, sigma),
         LinkFunction::CLogLog => Ok(cloglog_posterior_meanwith_deriv_controlled(quadctx, mu, sigma)),
+        LinkFunction::LogLog | LinkFunction::Cauchit => {
+            let component = match link {
+                LinkFunction::LogLog => LinkComponent::LogLog,
+                LinkFunction::Cauchit => LinkComponent::Cauchit,
+                _ => unreachable!("guarded by outer match"),
+            };
+            let (mean, dmean_dmu, _, _) = integrate_normal_ghq_adaptive(quadctx, mu, sigma, |x| {
+                component_point_jet(component, x)
+            });
+            Ok(IntegratedMeanDerivative {
+                mean,
+                dmean_dmu,
+                mode: if sigma <= 1e-10 {
+                    IntegratedExpectationMode::ExactClosedForm
+                } else {
+                    IntegratedExpectationMode::QuadratureFallback
+                },
+            })
+        }
         LinkFunction::Sas => Err(EstimationError::InvalidInput(
             "state-less integrated SAS moments are unsupported; use SAS-aware prediction APIs with explicit (epsilon, log_delta)".to_string(),
         )),
@@ -2794,6 +2813,27 @@ pub fn integrated_inverse_link_jet(
             Ok(integrated_cloglog_inverse_link_jet_controlled(
                 quadctx, mu, sigma,
             ))
+        }
+        LinkFunction::LogLog | LinkFunction::Cauchit => {
+            let component = match link {
+                LinkFunction::LogLog => LinkComponent::LogLog,
+                LinkFunction::Cauchit => LinkComponent::Cauchit,
+                _ => unreachable!("guarded by outer match"),
+            };
+            let (mean, d1, d2, d3) = integrate_normal_ghq_adaptive(quadctx, mu, sigma, |x| {
+                component_point_jet(component, x)
+            });
+            Ok(IntegratedInverseLinkJet {
+                mean,
+                d1,
+                d2,
+                d3,
+                mode: if sigma <= 1e-10 {
+                    IntegratedExpectationMode::ExactClosedForm
+                } else {
+                    IntegratedExpectationMode::QuadratureFallback
+                },
+            })
         }
         LinkFunction::Sas => Err(EstimationError::InvalidInput(
             "state-less integrated SAS jet is unsupported; use SAS-aware prediction APIs with explicit (epsilon, log_delta)".to_string(),

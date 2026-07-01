@@ -3009,12 +3009,14 @@ pub fn parse_linkname(v: &str) -> Result<LinkFunction, FormulaDslError> {
         "logit" | "binomial-logit" => Ok(LinkFunction::Logit),
         "probit" | "binomial-probit" => Ok(LinkFunction::Probit),
         "cloglog" | "binomial-cloglog" => Ok(LinkFunction::CLogLog),
+        "loglog" => Ok(LinkFunction::LogLog),
+        "cauchit" => Ok(LinkFunction::Cauchit),
         "sas" => Ok(LinkFunction::Sas),
         "beta-logistic" => Ok(LinkFunction::BetaLogistic),
         other => Err(FormulaDslError::UnknownIdentifier {
             reason: format!(
                 "unsupported link type '{other}'; \
-                 use one of identity|log|logit|probit|cloglog|binomial-logit|binomial-probit|binomial-cloglog|sas|beta-logistic|blended(...)/mixture(...) or flexible(...). \
+                 use one of identity|log|logit|probit|cloglog|loglog|cauchit|binomial-logit|binomial-probit|binomial-cloglog|sas|beta-logistic|blended(...)/mixture(...) or flexible(...). \
                  Both `--link <type>` (CLI flag) and `link(type=<type>)` (formula term) accept the same set."
             ),
         }),
