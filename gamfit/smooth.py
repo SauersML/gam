@@ -683,11 +683,9 @@ class Sphere(Smooth):
     -----
     Centers are a property of the basis, not of the evaluation set. If the
     user does not supply explicit ``centers``, the descriptor resolves
-    centers on first evaluation: farthest-point sampling from the eval
-    rows when there are at least ``n_centers`` of them, otherwise a
-    deterministic Fibonacci-lattice fallback so that small/test eval sets
-    still work. The resolved centers are then cached and reused for every
-    later evaluation.
+    centers on first evaluation by farthest-point sampling (Rust) from the
+    eval rows, which requires at least ``n_centers`` of them. The resolved
+    centers are then cached and reused for every later evaluation.
 
     Streaming row-chunked evaluation activates automatically when the
     would-be dense basis buffer exceeds ~1 GiB; no opt-in is required.
@@ -730,9 +728,8 @@ class Sphere(Smooth):
         ``None``. For Wahba kernels the resolution order is:
 
         1. User-supplied ``centers``.
-        2. Farthest-point sampling from ``coords`` when it has at least
-           ``n_centers`` rows.
-        3. Deterministic Fibonacci-lattice fallback otherwise.
+        2. Farthest-point sampling (Rust) from ``coords``, which requires
+           at least ``n_centers`` rows (otherwise a clear error is raised).
         """
         if str(self.kernel).lower() == "harmonic":
             return None
@@ -754,17 +751,20 @@ class Sphere(Smooth):
         else:
             n_centers_i = int(self.n_centers)
             pts = np.ascontiguousarray(np.asarray(coords, dtype=np.float64))
-            if pts.shape[0] >= n_centers_i:
-                from . import _api
-
-                ctrs = np.asarray(
-                    _api.rust_module().sphere_select_farthest_point_centers(
-                        pts, n_centers_i, bool(self.radians),
-                    ),
-                    dtype=np.float64,
+            if pts.shape[0] < n_centers_i:
+                raise ValueError(
+                    f"Sphere.evaluate: need at least n_centers={n_centers_i} "
+                    f"evaluation rows to resolve centers, got {pts.shape[0]}. "
+                    "Supply explicit `centers=(K, 2)` for small evaluation sets."
                 )
-            else:
-                ctrs = _fibonacci_sphere_lat_lon(n_centers_i, bool(self.radians))
+            from . import _api
+
+            ctrs = np.asarray(
+                _api.rust_module().sphere_select_farthest_point_centers(
+                    pts, n_centers_i, bool(self.radians),
+                ),
+                dtype=np.float64,
+            )
 
         object.__setattr__(self, "_cached_centers", ctrs)
         return ctrs
@@ -788,31 +788,6 @@ class Sphere(Smooth):
         return out
 
     SUPPORTED_BACKENDS: ClassVar[frozenset[str]] = frozenset({"torch", "numpy", "jax"})
-
-
-def _fibonacci_sphere_lat_lon(n: int, radians: bool) -> Any:
-    """Deterministic quasi-uniform sphere lattice — (n, 2) [lat, lon].
-
-    Golden-angle Fibonacci spiral on S². Used as the default center set
-    when ``Sphere.evaluate`` is called without pre-fit context (eval rows
-    < ``n_centers`` and no user-supplied ``centers``).
-    """
-    import numpy as np
-
-    if n < 2:
-        raise ValueError(f"Sphere needs at least 2 centers; got n_centers={n}")
-    k = np.arange(n, dtype=np.float64)
-    z = 1.0 - (2.0 * k + 1.0) / float(n)
-    z = np.clip(z, -1.0, 1.0)
-    lat_rad = np.arcsin(z)
-    golden_angle = np.pi * (3.0 - np.sqrt(5.0))
-    lon_rad = (k * golden_angle) % (2.0 * np.pi)
-    lon_rad = np.where(lon_rad > np.pi, lon_rad - 2.0 * np.pi, lon_rad)
-    if radians:
-        return np.column_stack([lat_rad, lon_rad]).astype(np.float64)
-    return np.column_stack([np.degrees(lat_rad), np.degrees(lon_rad)]).astype(
-        np.float64
-    )
 
 
 @dataclass(slots=True)

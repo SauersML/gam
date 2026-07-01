@@ -38,8 +38,8 @@ says a principal-manifold / SAE / SAE-manifold engine needs:
   the finite IBP-MAP descriptor on the Rust side.
 * `TopKActivationPenalty`, `JumpReLUPenalty`, and `GatedSAEDecoder` support
   the newer SAE assignment family. `TopKActivationPenalty` / `JumpReLUPenalty`
-  are Rust-backed analytic descriptors; `GatedSAEDecoder` is a small NumPy
-  reference decoder for the gated/JumpreLU contract.
+  are Rust-backed analytic descriptors; `GatedSAEDecoder` is a config-only
+  descriptor that serializes to the Rust gated/JumpReLU decoder contract.
 * `BlockSparsityPenalty` lives on t. Group-lasso smoothed L¹ on predefined
   latent-axis blocks, shrinking whole groups rather than individual entries
   or single ARD axes.
@@ -731,16 +731,20 @@ for _name, _doc in _RUST_WRAPPER_DOCS.items():
 
 @dataclass(frozen=True, slots=True)
 class GatedSAEDecoder:
-    """Standalone NumPy gated SAE decoder with gate and amplitude weights.
+    """Gated SAE decoder descriptor (gate + amplitude weights).
+
+    Configuration-only wrapper: it validates the weight shapes and
+    serializes them to the Rust ``gated_sae_decoder`` descriptor via
+    :meth:`to_rust_descriptor`. All decode math (the gate threshold and the
+    amplitude projection) is evaluated by the Rust kernel when the descriptor
+    is passed into a fit.
 
     Parameters
     ----------
     w_gate:
-        Square gate matrix of shape ``(F, F)``. Gates are
-        ``sigmoid(x @ w_gate.T) > 0.5``.
+        Square gate matrix of shape ``(F, F)``.
     w_amp:
-        Amplitude matrix of shape ``(D, F)``. The decoded output is
-        ``(gate * x) @ w_amp.T``.
+        Amplitude matrix of shape ``(D, F)``.
 
     Raises
     ------
@@ -763,38 +767,12 @@ class GatedSAEDecoder:
         object.__setattr__(self, "w_gate", gate)
         object.__setattr__(self, "w_amp", amp)
 
-    def decode(self, x: Any) -> np.ndarray:
-        """Decode one vector ``(F,)`` or a batch ``(N, F)`` to ``(D,)`` / ``(N, D)``.
-
-        Raises
-        ------
-        ValueError
-            If the input is not one- or two-dimensional with width matching
-            ``w_gate.shape[1]``.
-        """
-        x_arr = np.asarray(x, dtype=float)
-        single = x_arr.ndim == 1
-        x2 = x_arr.reshape(1, -1) if single else x_arr
-        if x2.ndim != 2 or x2.shape[1] != self.w_gate.shape[1]:
-            raise ValueError(
-                f"GatedSAEDecoder.decode expected input dimension {self.w_gate.shape[1]}"
-            )
-        gates = (_sigmoid_numpy(x2 @ self.w_gate.T) > 0.5).astype(float)
-        out = (gates * x2) @ self.w_amp.T
-        return out[0] if single else out
-
     def to_rust_descriptor(self) -> dict[str, Any]:
         return {
             "kind": "gated_sae_decoder",
             "w_gate": self.w_gate.tolist(),
             "w_amp": self.w_amp.tolist(),
         }
-
-
-def _sigmoid_numpy(x: np.ndarray) -> np.ndarray:
-    # Single source of truth: numerics live in Rust (`numerics_sigmoid_stable`).
-    arr = np.ascontiguousarray(x, dtype=float)
-    return _rust_module().numerics_sigmoid_stable(arr)
 
 
 # Sum type for type hints on `gamfit.fit(..., penalties=...)` and similar.
