@@ -727,8 +727,10 @@ impl ResponseFamily {
                 // `−n/2·log σ²` term; for an effectively-constant response the
                 // ML scale `σ → 0` drives it to `+∞`, so the outer objective
                 // rejects every seed with "reml_score must be finite, got inf"
-                // (#332). Reject pre-fit when the two-pass, mean-centred sample
-                // sd is at or below `GAUSSIAN_MIN_SAMPLE_SD`. Fewer than two
+                // (#332). The exact zero-variance case has a well-defined
+                // constant-fit limit and is handled by orchestration before the
+                // solver; reject only non-zero numerical dust whose scale is too
+                // small to support a stable smooth fit. Fewer than two
                 // observations carries no estimable scale degeneracy (the
                 // sample-size gate handles too-small data), and any non-finite
                 // value is left to the dedicated finiteness checks rather than
@@ -745,14 +747,18 @@ impl ResponseFamily {
                 // rejection, whose REML score genuinely diverges to +∞.
                 let mut count = 0usize;
                 let mut mean = 0.0f64;
+                let mut min_y = f64::INFINITY;
+                let mut max_y = f64::NEG_INFINITY;
                 for &yi in y.iter() {
                     if !yi.is_finite() {
                         return Ok(());
                     }
                     count += 1;
                     mean += yi;
+                    min_y = min_y.min(yi);
+                    max_y = max_y.max(yi);
                 }
-                if count < 2 {
+                if count < 2 || min_y == max_y {
                     return Ok(());
                 }
                 mean /= count as f64;
@@ -762,6 +768,7 @@ impl ResponseFamily {
                     sumsq += d * d;
                 }
                 let sample_sd = (sumsq / (count as f64 - 1.0)).sqrt();
+<<<<<<< ours
                 if sample_sd <= GAUSSIAN_MIN_SAMPLE_SD {
                     // Genuine zero variance (all values exactly equal) is the
                     // well-posed constant limit, not the #332 divergence: accept
@@ -770,6 +777,9 @@ impl ResponseFamily {
                     if y.iter().all(|&yi| yi == first) {
                         return Ok(());
                     }
+=======
+                if sample_sd > 0.0 && sample_sd <= GAUSSIAN_MIN_SAMPLE_SD {
+>>>>>>> theirs
                     return Err(ResponseDegeneracy {
                         family_label: self.response_support_label(),
                         kind: ResponseDegeneracyKind::GaussianNearConstant {
@@ -916,15 +926,18 @@ impl std::error::Error for ResponseSupportViolation {}
 /// three layers agree on exactly which responses are admissible.
 pub const BINOMIAL_BINARY_TOL: f64 = 1.0e-12;
 
-/// Minimum admissible sample standard deviation for a `Gaussian` response.
+/// Minimum admissible positive sample standard deviation for a non-constant
+/// `Gaussian` response.
 ///
-/// A response whose two-pass, mean-centred sample sd is at or below this
+/// A response whose two-pass, mean-centred sample sd is positive but at or below
+/// this
 /// threshold is *effectively constant* in `f64` arithmetic: the marginal REML
 /// log-likelihood carries a `−n/2·log σ²` term that diverges to `+∞` as the
 /// fitted scale `σ → 0`, so the outer objective rejects every seed with
 /// `reml_score must be finite, got inf` (#332). The bound is chosen well below
 /// any well-conditioned scientific signal (genuine data has sd many orders of
 /// magnitude larger) yet above the f64 round-off floor, so it never trips a
+<<<<<<< ours
 /// real fit while catching responses that carry no signal (e.g. a column read
 /// in the wrong scale, or a constant accidentally fed as the response).
 ///
@@ -934,6 +947,10 @@ pub const BINOMIAL_BINARY_TOL: f64 = 1.0e-12;
 /// rather than the divergent near-constant case, so it fits (#1856); only a
 /// response that varies below this floor without being exactly constant is
 /// rejected.
+=======
+/// real fit while catching numerically near-constant responses that carry no
+/// stable signal (e.g. a column read in the wrong scale).
+>>>>>>> theirs
 pub const GAUSSIAN_MIN_SAMPLE_SD: f64 = 1.0e-10;
 
 /// Round tolerance for recognising an integer-valued (count) response.
@@ -956,12 +973,15 @@ pub enum ResponseDegeneracyKind {
     BinomialAllZeros,
     /// Bernoulli / Binomial response with every observed value equal to 1.
     BinomialAllOnes,
-    /// Gaussian response that is effectively constant in `f64` arithmetic
-    /// (sample standard deviation at or below [`GAUSSIAN_MIN_SAMPLE_SD`]). The
+    /// Gaussian response that is non-constant but effectively constant in
+    /// `f64` arithmetic (positive sample standard deviation at or below
+    /// [`GAUSSIAN_MIN_SAMPLE_SD`]). The
     /// marginal REML log-likelihood `−n/2·log σ²` diverges to `+∞` as the
     /// fitted scale `σ → 0`, so every outer evaluation rejects with a
     /// non-finite score. Carries the observed `sample_sd` and the `min_sd`
-    /// threshold so the message can quote both verbatim (#332).
+    /// threshold so the message can quote both verbatim (#332). Exactly-constant
+    /// Gaussian responses are a well-posed degenerate limit handled by the
+    /// constant-fit shortcut rather than an error.
     GaussianNearConstant {
         /// The two-pass, mean-centred sample standard deviation of the response.
         sample_sd: f64,
@@ -2689,6 +2709,7 @@ mod tests {
 
     #[test]
     fn gaussian_degeneracy_exactly_constant_ok() {
+<<<<<<< ours
         // A *genuinely* zero-variance response — every value bit-for-bit
         // identical — is the well-posed constant limit, not the #332
         // divergence: the fit collapses to the constant (intercept = the shared
@@ -2696,6 +2717,12 @@ mod tests {
         // fitter return the constant surface (#1856); only a response that
         // varies below the sd floor without being exactly constant keeps the
         // rejection (see `gaussian_degeneracy_near_constant_reproducer_errors`).
+=======
+        // An exactly-constant response has the well-posed Gaussian limit: the
+        // intercept equals the constant and every penalized smooth is zero.
+        // Orchestration handles that shortcut before the solver, so the
+        // degeneracy guard must not reject it pre-fit.
+>>>>>>> theirs
         let y = arr1(&[1.0_f64, 1.0, 1.0]);
         assert!(ResponseFamily::Gaussian
             .validate_response_degeneracy(y.view())
