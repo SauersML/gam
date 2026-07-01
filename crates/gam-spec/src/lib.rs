@@ -570,7 +570,10 @@ impl ResponseFamily {
             Self::Poisson | Self::NegativeBinomial { .. } | Self::Tweedie { .. } => {
                 Some("non-negative response values (y ≥ 0)")
             }
-            Self::Beta { .. } => Some("response values strictly in the open interval (0, 1)"),
+            Self::Beta { .. } => Some(
+                "response values strictly in the open interval (0, 1) \
+                 (a binary {0, 1} response is a Binomial GLM, not Beta; route it through the Binomial family instead)",
+            ),
             Self::Binomial => Some("binary response values (y ∈ {0, 1})"),
             Self::Gaussian | Self::RoystonParmar => None,
         }
@@ -730,6 +733,16 @@ impl ResponseFamily {
                 // sample-size gate handles too-small data), and any non-finite
                 // value is left to the dedicated finiteness checks rather than
                 // poisoning the sd, so it is skipped here.
+                //
+                // Exception (#1856): a *genuinely* zero-variance response —
+                // every observation bit-for-bit identical — is not the
+                // pathological near-constant case above but the well-posed
+                // degenerate limit. The penalized fit collapses cleanly to the
+                // constant (intercept = the shared value, every smooth shrunk
+                // to zero) and predicts that constant, so it must fit rather
+                // than be rejected. Only a response that *varies* below the sd
+                // floor without being exactly constant keeps the #332
+                // rejection, whose REML score genuinely diverges to +∞.
                 let mut count = 0usize;
                 let mut mean = 0.0f64;
                 for &yi in y.iter() {
@@ -750,6 +763,13 @@ impl ResponseFamily {
                 }
                 let sample_sd = (sumsq / (count as f64 - 1.0)).sqrt();
                 if sample_sd <= GAUSSIAN_MIN_SAMPLE_SD {
+                    // Genuine zero variance (all values exactly equal) is the
+                    // well-posed constant limit, not the #332 divergence: accept
+                    // it and let the fitter return the constant surface (#1856).
+                    let first = y[0];
+                    if y.iter().all(|&yi| yi == first) {
+                        return Ok(());
+                    }
                     return Err(ResponseDegeneracy {
                         family_label: self.response_support_label(),
                         kind: ResponseDegeneracyKind::GaussianNearConstant {
@@ -907,6 +927,13 @@ pub const BINOMIAL_BINARY_TOL: f64 = 1.0e-12;
 /// magnitude larger) yet above the f64 round-off floor, so it never trips a
 /// real fit while catching responses that carry no signal (e.g. a column read
 /// in the wrong scale, or a constant accidentally fed as the response).
+///
+/// One case below the floor is *not* rejected: a genuinely zero-variance
+/// response whose values are all bit-for-bit identical. That is the well-posed
+/// constant limit (the fit collapses to the constant, smooths shrunk to zero)
+/// rather than the divergent near-constant case, so it fits (#1856); only a
+/// response that varies below this floor without being exactly constant is
+/// rejected.
 pub const GAUSSIAN_MIN_SAMPLE_SD: f64 = 1.0e-10;
 
 /// Round tolerance for recognising an integer-valued (count) response.
@@ -2661,17 +2688,18 @@ mod tests {
     }
 
     #[test]
-    fn gaussian_degeneracy_exactly_constant_errors() {
-        // An exactly-constant response has sample sd 0 ⇒ the marginal
-        // `−n/2·log σ²` diverges; the guard must reject it pre-fit (#332).
+    fn gaussian_degeneracy_exactly_constant_ok() {
+        // A *genuinely* zero-variance response — every value bit-for-bit
+        // identical — is the well-posed constant limit, not the #332
+        // divergence: the fit collapses to the constant (intercept = the shared
+        // value, smooths shrunk to zero). The guard must accept it and let the
+        // fitter return the constant surface (#1856); only a response that
+        // varies below the sd floor without being exactly constant keeps the
+        // rejection (see `gaussian_degeneracy_near_constant_reproducer_errors`).
         let y = arr1(&[1.0_f64, 1.0, 1.0]);
-        let err = ResponseFamily::Gaussian
+        assert!(ResponseFamily::Gaussian
             .validate_response_degeneracy(y.view())
-            .expect_err("exactly-constant Gaussian response must be rejected");
-        assert!(matches!(
-            err.kind,
-            ResponseDegeneracyKind::GaussianNearConstant { .. }
-        ));
+            .is_ok());
     }
 
     #[test]
