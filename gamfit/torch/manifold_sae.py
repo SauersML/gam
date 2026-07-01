@@ -237,7 +237,7 @@ class ManifoldSAEConfig:
     """Configuration for :class:`ManifoldSAE`."""
 
     input_dim: int
-    n_atoms: int
+    n_atoms: int | None = None
     intrinsic_rank: int = 2
     atom_manifold: Literal["circle", "cylinder", "sphere", "product"] = "circle"
     atom_basis: Literal["duchon", "bspline", "fourier"] = "duchon"
@@ -249,8 +249,24 @@ class ManifoldSAEConfig:
     encoder_hidden: int = 16
     init_scale: float = 0.05
     dtype: Any = field(default=None)
+    # ``K`` is constructor sugar for ``n_atoms`` (the spelling the docs and the
+    # closed-form ``sae_manifold_fit`` API use). It is normalized into
+    # ``n_atoms`` in ``__post_init__`` and stored as ``None`` afterwards, so
+    # ``dataclasses.replace`` round-trips and ``n_atoms`` stays the single
+    # source of truth.
+    K: int | None = None
 
     def __post_init__(self) -> None:
+        if self.K is not None:
+            if self.n_atoms is not None and int(self.n_atoms) != int(self.K):
+                raise ValueError(
+                    f"ManifoldSAEConfig: n_atoms={self.n_atoms} and K={self.K} "
+                    "are aliases and must agree when both are given"
+                )
+            object.__setattr__(self, "n_atoms", int(self.K))
+            object.__setattr__(self, "K", None)
+        if self.n_atoms is None:
+            raise ValueError("ManifoldSAEConfig requires n_atoms (alias: K)")
         if self.input_dim <= 0:
             raise ValueError("ManifoldSAEConfig.input_dim must be > 0")
         if self.n_atoms <= 0:
