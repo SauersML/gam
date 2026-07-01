@@ -1304,6 +1304,129 @@ where
                     }
                 }
             }
+            // #1860/#1476 CONCURVITY NULL-SPACE RAIL GUARD. The wide symmetric
+            // well-determined null-space prior is a degeneracy breaker, not a
+            // selection criterion that should accept the numerical `ρ=RHO_BOUND`
+            // shoulder as a finite smoothing estimate. On correlated supported
+            // smooths, the REML surface is nearly flat in the direction that
+            // transfers affine signal between terms, so a null-space coordinate
+            // can rail without representing a meaningful optimum. Cap only these
+            // well-determined degeneracy-breaker coordinates whose coefficient
+            // block is genuinely concurved with another selected smooth at the top
+            // of the moderate shrink-out band before the #1266 whole-term search
+            // below. Unsupported, uncorrelated terms are left alone so the
+            // whole-term shrink-out can still select them out at the rail.
+            {
+                const NULLSPACE_DEGENERACY_RHO_CEILING: f64 = 21.0;
+                const CONCURVITY_COLUMN_CORR: f64 = 0.2;
+                if n_design_rows >= 2 * p
+                    && let gam_problem::RhoPrior::Independent(per_coord) =
+                        reml_state.effective_rho_prior().as_ref()
+                {
+                    let term_key: Vec<(usize, usize)> = canonical_shared
+                        .iter()
+                        .map(|cp| (cp.col_range.start, cp.col_range.end))
+                        .collect();
+                    let x_concurvity = x_o
+                        .try_to_dense_by_chunks("#1860/#1476 concurvity rail guard")
+                        .ok();
+                    let beta_at_current = reml_state
+                        .obtain_eval_bundle(&strategy_result.rho)
+                        .ok()
+                        .map(|bundle| bundle.pirls_result.beta_transformed.clone());
+                    let term_beta_norm = |coord: usize| -> f64 {
+                        let (Some(beta), Some((a0, a1))) =
+                            (beta_at_current.as_ref(), term_key.get(coord).copied())
+                        else {
+                            return 0.0;
+                        };
+                        beta.as_ref()
+                            .slice(s![a0..a1])
+                            .iter()
+                            .map(|v| v * v)
+                            .sum::<f64>()
+                            .sqrt()
+                    };
+                    let column_corr = |a: usize, b: usize| -> f64 {
+                        let Some(x_concurvity) = x_concurvity.as_ref() else {
+                            return 0.0;
+                        };
+                        let ca = x_concurvity.column(a);
+                        let cb = x_concurvity.column(b);
+                        let ma = ca.iter().copied().sum::<f64>() / ca.len().max(1) as f64;
+                        let mb = cb.iter().copied().sum::<f64>() / cb.len().max(1) as f64;
+                        let mut va = 0.0_f64;
+                        let mut vb = 0.0_f64;
+                        let mut cov = 0.0_f64;
+                        for (&xa, &xb) in ca.iter().zip(cb.iter()) {
+                            let da = xa - ma;
+                            let db = xb - mb;
+                            va += da * da;
+                            vb += db * db;
+                            cov += da * db;
+                        }
+                        if va > 0.0 && vb > 0.0 {
+                            (cov / (va.sqrt() * vb.sqrt())).abs()
+                        } else {
+                            0.0
+                        }
+                    };
+                    let is_concurved_term = |coord: usize| -> bool {
+                        let Some((a0, a1)) = term_key.get(coord).copied() else {
+                            return false;
+                        };
+                        for j in 0..strategy_result.rho.len() {
+                            if j == coord
+                                || !per_coord
+                                    .get(j)
+                                    .is_some_and(gam_terms::smooth::is_nullspace_degeneracy_prior)
+                            {
+                                continue;
+                            }
+                            let Some((b0, b1)) = term_key.get(j).copied() else {
+                                continue;
+                            };
+                            if (a0, a1) == (b0, b1) {
+                                continue;
+                            }
+                            for a in a0..a1 {
+                                for b in b0..b1 {
+                                    if column_corr(a, b) >= CONCURVITY_COLUMN_CORR {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                        false
+                    };
+                    let mut capped = strategy_result.rho.clone();
+                    let mut changed = false;
+                    for i in 0..capped.len() {
+                        if capped[i] > NULLSPACE_DEGENERACY_RHO_CEILING
+                            && per_coord
+                                .get(i)
+                                .is_some_and(gam_terms::smooth::is_nullspace_degeneracy_prior)
+                            && is_concurved_term(i)
+                            && term_beta_norm(i) > 1e-3
+                        {
+                            capped[i] = NULLSPACE_DEGENERACY_RHO_CEILING;
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        reml_state.reset_outer_seed_state();
+                        let capped_cost = reml_state.compute_cost(&capped)?;
+                        log::info!(
+                            "[OUTER] #1860/#1476 null-space degeneracy rail guard: capped \
+                             well-determined double-penalty null-space ρ at \
+                             {NULLSPACE_DEGENERACY_RHO_CEILING:.1} before whole-term shrink-out; \
+                             re-scored cost {capped_cost:.6e}"
+                        );
+                        strategy_result.rho = capped;
+                        strategy_result.final_value = capped_cost;
+                    }
+                }
+            }
             // #1266 NULL-SPACE SHRINK-OUT ESCAPE (pure-REML; the OUTWARD-direction
             // dual of the #1074 inward escape above).
             //
