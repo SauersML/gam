@@ -1,5 +1,17 @@
 use super::*;
 
+/// Relative native-penalty ridge kept on Duchon's affine trend directions.
+///
+/// The affine block is also exposed as a `DoublePenaltyNullspace` component so
+/// REML can shrink unused slopes.  Letting that component be driven all the way
+/// to zero, however, can make the realized unpenalized design rank-deficient
+/// after `OrthogonalToParametric` has projected constants/trends against the
+/// constrained kernel block: the slopes then count as unpenalized columns even
+/// when they are aliased by the realized design.  A machine-scale ridge in the
+/// always-present native penalty keeps those slope directions structurally
+/// penalized without changing the Duchon Hilbert scale at statistical scale.
+const DUCHON_AFFINE_NATIVE_RIDGE_FLOOR: f64 = 1.490_116_119_384_765_6e-8;
+
 /// N-D periodic-cyclic-B-spline first-derivative jet `∂Φ̃/∂t` per row.
 ///
 /// One-dimensional periodic B-spline basis (one latent axis). `t` is the
@@ -1417,6 +1429,11 @@ pub(crate) fn duchon_native_penalty_candidates(
     primary_pre
         .slice_mut(s![..n_kernel, ..n_kernel])
         .assign(&omega);
+    if poly_cols > 1 {
+        for col in (n_kernel + 1)..n_pre {
+            primary_pre[[col, col]] = DUCHON_AFFINE_NATIVE_RIDGE_FLOOR;
+        }
+    }
     let primary = symmetrize(&project_penalty_matrix(&primary_pre, outer_identifiability));
 
     let shrink = if poly_cols > 1 {
@@ -1673,6 +1690,49 @@ mod mixed_periodicity_psd_tests {
             .position(|info| matches!(info.source, PenaltySource::Primary))
             .expect("cylinder build must emit a Primary penalty");
         (built.penalties[idx].clone(), centers.nrows())
+    }
+
+    #[test]
+    fn native_primary_keeps_affine_trend_structurally_penalized_gam1816() {
+        // gam#1816: REML may deselect the explicit DoublePenaltyNullspace slope
+        // ridge.  The Primary Duchon component must therefore retain a tiny
+        // native ridge on affine trend columns so those columns never become
+        // realized-unpenalized aliases of the constrained kernel block.
+        let centers = array![
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+            [0.5, 0.2],
+            [0.2, 0.7],
+        ];
+        let order = DuchonNullspaceOrder::Linear;
+        let poly_cols = polynomial_block_from_order(centers.view(), order).ncols();
+        let mut workspace = BasisWorkspace::default();
+        let z = kernel_constraint_nullspace(centers.view(), order, &mut workspace.cache)
+            .expect("kernel constraint nullspace must build");
+        let n_kernel = z.ncols();
+        let candidates = duchon_native_penalty_candidates(
+            centers.view(),
+            None,
+            0.0,
+            order,
+            None,
+            &z,
+            None,
+            poly_cols,
+        )
+        .expect("native Duchon penalties must build");
+        let primary = candidates
+            .iter()
+            .find(|candidate| matches!(candidate.source, PenaltySource::Primary))
+            .expect("Primary candidate must be present");
+        for col in (n_kernel + 1)..(n_kernel + poly_cols) {
+            assert!(
+                primary.matrix[[col, col]] > 0.0,
+                "affine trend column {col} must carry the native ridge floor"
+            );
+        }
     }
 
     #[test]
