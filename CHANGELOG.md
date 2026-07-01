@@ -1,3 +1,95 @@
+## v0.3.139 — gam 0.3.139 / gamfit 0.1.241 (2026-07-01)
+
+crates.io + PyPI release of the post-0.3.138 wave. The headline is the SAE /
+manifold stack moving its fit and encode paths onto Rust and the `gamfit`
+package thinning to a SPEC-compliant wrapper (numeric math lives in Rust), on
+top of a batch of root-cause correctness fixes, two new pieces of public surface
+(periodic radial builders and the expectile/LAWS family reachable from both the
+Python API and the CLI), and GPU/perf work proven bit-identical to the scalar
+path. Several release-integrity defects that would have shipped a half-broken
+tree — a fix reverted three times by stale-tree merges, and a secondary-smooth
+penalty default that aborted an otherwise-valid fit — are repaired with
+regression guards.
+
+### Fitting / inference correctness
+- **Multinomial per-class λ / EDF are rebuilt from the joint penalty (#561).** The
+  outer REML/LAML loop now converges on genuine per-term smoothing rather than
+  parking at its seed, so a multinomial fit recovers per-class structure instead
+  of a fused, over-/under-smoothed surface.
+- **`smooth_significance()` reference d.f. is floored at the joint null-space
+  dimension (#1766)** so the likelihood-ratio p-value no longer collapses toward
+  0 on a shrunk smooth, keeping the null false-positive rate calibrated.
+- **The Marra & Wood null-space "double" penalty now defaults OFF for a secondary
+  (scale / distributional) smooth (#1561)** — defaulting it on biased the
+  location-scale fit toward homoscedasticity and collapsed the recovered
+  log-sigma surface. `duchon` is excluded from the change (it carries no such
+  penalty and its builder rejects the key), so a scale-block Duchon fit no longer
+  aborts; an explicit user `double_penalty=` still wins.
+- **`gam fit --family expectile` no longer aborts on the frailty guard (#1780).**
+  The inner Gaussian-identity design carries no frailty; the CLI's default
+  `frailty = Some(None)` is now cleared before the inner fit.
+- **No spurious "Inferred gaussian-identity family" note when an explicit
+  non-default `--family` is passed (#1781).**
+- **A 1-D cyclic basis wraps on the data range instead of hard-erroring.**
+- **High-EDF Gaussian observation intervals cover** — the residual-df scale keeps
+  observation bands calibrated at high effective degrees of freedom (#1765).
+
+### New public surface
+- **`periodic=` on the radial builders `duchon()` / `tps()` / `thinplate()` /
+  `matern()` (#580, #1778)** — a scalar or per-axis boolean, wired through Rust
+  and the CLI, with validation that rejects bad axes, per-axis lengths, and
+  non-positive or over-wide periods.
+- **The expectile (LAWS) regression family is reachable from both the Python API
+  and the CLI (#1777)** via `--family expectile` (inline-τ supported), routed
+  through a shared dispatch seam so both interfaces agree.
+
+### SAE / manifold
+- **The SAE fit is routed through Rust FFI** with per-fit config overrides
+  (separation-barrier strength / IBP-α), a `threshold_gate` rename (was
+  `jumprelu`), out-of-sample v-projection, `atom_reconstruct`, and
+  `coord_sparsity` (#1777); the SAE-manifold audit fixes real defects across the
+  hybrid / routing / log-det / sparse paths (#1026).
+- **Fisher steering state now round-trips through `save` / `load`,** so a reloaded
+  model reproduces `steer()`'s dose instead of silently degrading to
+  geometry-only.
+- **A GPU device-resident exact encode kernel, sublinear massive-K routing, and
+  jet / REML / arrow-Schur perf** — including a matrix-free reduced-Schur SLQ
+  evidence log-det — all bit-identical to the CPU / scalar path.
+
+### `gamfit` package (breaking)
+- **Python-side numeric math that violated the thin-wrapper SPEC has been removed;
+  the capabilities that exist in Rust are reached through the FFI.** Ported to
+  Rust (behavior preserved): `partial_dependence`, `variance_share`, the sparse-
+  and linear-dictionary out-of-sample `transform`, and the cyclic difference
+  penalty. Removed with no replacement (breaking):
+  `gamfit.align` (Procrustes alignment), the `sae_benchmark` /
+  `sweep_sae_benchmark` / `format_sae_benchmark_markdown` harness,
+  `activation_statistics`, `recommend_sae_hyperparams`, the EV-vs-K frontier
+  research helpers (`sae_ev_vs_k_frontier` / `ev_knee_k`), and
+  `Model.posterior_predictive_check`.
+- **`coordinate_range` / `typical_shape` are consolidated into
+  `shape_uncertainty`** (which returns the analytic per-atom band as
+  `coords` / `mean` / `sd` / `lower` / `upper`).
+- **ALR simplex fits are no longer auto-whitened to Aitchison geometry** — no Rust
+  FFI exists for the whitener, so an ALR fit again depends on the (arbitrary)
+  reference component. Use the default CLR (or ILR) representation, which is
+  already Aitchison-isometric, for a reference-free simplex fit (#1549
+  auto-whitening removed, per SPEC).
+
+### Build / release integrity
+- Restored the #1780 expectile-frailty fix after stale-tree merges reverted it,
+  and pinned it with a CLI regression test so a future clobber fails loudly.
+- Added a regression guard that a scale-block `duchon()` smooth fits under the
+  #1561 default-off, and that an explicit `double_penalty=` on Duchon is still
+  rejected.
+- Cleared build-gate violations that would have failed the wheel build mid-flight
+  (a banned `debug_assert!` guarding an `unsafe` load promoted to an always-on
+  `assert!`; stray diagnostic scaffolding; a test-only dispersion oracle moved
+  into `#[cfg(test)]` scope; a `sae_manifold_fit` arity mismatch at an internal
+  IBP call site), plus build.sh usability and OOM-recovery hardening.
+
+Everything reachable through the existing API stays backward-compatible except
+the explicitly-listed `gamfit` removals.
 ## v0.3.138 — gam 0.3.138 / gamfit 0.1.240 (2026-06-30)
 
 crates.io + PyPI release of the post-0.3.137 correctness wave. A cluster of
