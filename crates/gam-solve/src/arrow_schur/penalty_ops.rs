@@ -216,10 +216,19 @@ pub trait BetaPenaltyOp: Send + Sync {
     /// write into. Must be BIT-IDENTICAL to the corresponding indices of
     /// `matvec` (same per-index accumulation order) so the composite's parallel
     /// prefix reproduces the serial result exactly.
-    fn matvec_local(&self, _x: &[f64], _y_local: &mut [f64]) {
-        unreachable!(
-            "matvec_local requires output_range() == Some; \
-             a None-range BetaPenaltyOp must be applied through matvec"
+    fn matvec_local(&self, x: &[f64], y_local: &mut [f64]) {
+        // SAFETY: hard contract guard, not a silent sentinel. A `None`-range
+        // `BetaPenaltyOp` exposes no single contiguous output slice, so the
+        // local matvec is undefined and MUST be routed through `matvec`. This
+        // default exists only to turn that misuse into a loud, immediate
+        // failure at the call site; the input/local extents are surfaced for
+        // triage.
+        panic!(
+            "matvec_local requires output_range() == Some; a None-range \
+             BetaPenaltyOp (input len {}, local output len {}) must be applied \
+             through matvec",
+            x.len(),
+            y_local.len()
         );
     }
 }
