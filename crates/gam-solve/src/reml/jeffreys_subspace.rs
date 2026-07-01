@@ -30,9 +30,9 @@
 //! [`joint_jeffreys_term`] (self-limiting, returns the exact zero contribution on
 //! a well-conditioned fit) is the only "apply where needed" mechanism.
 
+use faer::Side;
 use gam_linalg::faer_ndarray::FaerEigh;
 use gam_linalg::lanczos::{SymmetricLanczosOptions, symmetric_lanczos_eigenpairs};
-use faer::Side;
 use ndarray::{Array1, Array2, ArrayView2};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -177,6 +177,31 @@ pub(crate) fn jeffreys_antiderivative_floor_sensitivity(lam: f64, floor: f64) ->
     } else {
         let denom = floor - lam;
         1.0 / floor - lam / (denom * denom)
+    }
+}
+
+/// `∂²g/∂floor²` with `λ` held fixed, paired with
+/// [`jeffreys_antiderivative_floor_sensitivity`]. This is needed when the
+/// reduced-info floor is in its relative regime (`floor = c·λ_max`) and a
+/// second hyperparameter derivative differentiates the first-order floor
+/// response of the Jeffreys value.
+#[inline]
+pub(crate) fn jeffreys_antiderivative_floor_second_sensitivity(lam: f64, floor: f64) -> f64 {
+    let cap = jeffreys_cap(floor);
+    if lam >= cap {
+        if cap > CONDITIONING_GATE_ABSOLUTE_CLEAR {
+            // Floor-bound cap: ∂/∂floor (1/floor − 1/λ).
+            -1.0 / (floor * floor)
+        } else {
+            0.0
+        }
+    } else if lam >= floor {
+        0.0
+    } else if lam >= 0.0 {
+        -1.0 / (floor * floor) + 2.0 * lam / (floor * floor * floor)
+    } else {
+        let denom = floor - lam;
+        -1.0 / (floor * floor) + 2.0 * lam / (denom * denom * denom)
     }
 }
 
@@ -541,7 +566,8 @@ pub(crate) fn conditioning_gate_weight_hess(lambda_min: f64, lambda_max: f64) ->
         let ln10 = std::f64::consts::LN_10;
         let r_min = 1.0 / (lambda_min * ln10);
         let r_max = -1.0 / (lambda_max * ln10);
-        let g_mm = d2w_rel_dr2 * r_min * r_min + dw_rel_dr * (-1.0 / (lambda_min * lambda_min * ln10));
+        let g_mm =
+            d2w_rel_dr2 * r_min * r_min + dw_rel_dr * (-1.0 / (lambda_min * lambda_min * ln10));
         let g_mm_max = d2w_rel_dr2 * r_min * r_max; // ∂²r/∂λ_min∂λ_max = 0
         let g_max_max =
             d2w_rel_dr2 * r_max * r_max + dw_rel_dr * (1.0 / (lambda_max * lambda_max * ln10));
@@ -1549,8 +1575,8 @@ pub fn joint_jeffreys_phi_explicit_param_derivative(
 /// consistent with the gate-aware first derivative
 /// [`joint_jeffreys_phi_explicit_param_derivative`]; it is non-zero only inside the
 /// gate's smooth transition band and vanishes on every saturated/well-conditioned
-/// fit. Floor motion is held fixed (the floor-response is itself second order in the
-/// relative regime, and outside the band the gate already zeroes the whole term).
+/// fit. The reduced-info floor motion is included in the relative-floor regime,
+/// matching the first-derivative helper's value/floor contract.
 pub fn joint_jeffreys_phi_explicit_param_second_derivative(
     h_joint: ArrayView2<'_, f64>,
     z_j: ArrayView2<'_, f64>,
@@ -1560,11 +1586,7 @@ pub fn joint_jeffreys_phi_explicit_param_second_derivative(
 ) -> Result<f64, String> {
     use faer::Side;
     let p = h_joint.nrows();
-    for (name, mat) in [
-        ("pert_i", pert_i),
-        ("pert_j", pert_j),
-        ("pert_ij", pert_ij),
-    ] {
+    for (name, mat) in [("pert_i", pert_i), ("pert_j", pert_j), ("pert_ij", pert_ij)] {
         if mat.nrows() != p || mat.ncols() != p {
             return Err(format!(
                 "joint_jeffreys_phi_explicit_param_second_derivative: {name} shape {}x{} != {p}x{p}",
@@ -1592,7 +1614,9 @@ pub fn joint_jeffreys_phi_explicit_param_second_derivative(
         }
     }
     let (evals, evecs) = h_id_sym.eigh(Side::Lower).map_err(|e| {
-        format!("joint_jeffreys_phi_explicit_param_second_derivative: eigendecomposition failed: {e}")
+        format!(
+            "joint_jeffreys_phi_explicit_param_second_derivative: eigendecomposition failed: {e}"
+        )
     })?;
     let lambda_max = evals.iter().cloned().fold(0.0_f64, f64::max);
     let lambda_min = evals.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -1602,6 +1626,8 @@ pub fn joint_jeffreys_phi_explicit_param_second_derivative(
         return Ok(0.0);
     }
     let floor = (REDUCED_INFO_RELATIVE_FLOOR * lambda_max).max(REDUCED_INFO_ABSOLUTE_FLOOR);
+    let floor_in_relative_regime =
+        lambda_max > 0.0 && REDUCED_INFO_RELATIVE_FLOOR * lambda_max >= REDUCED_INFO_ABSOLUTE_FLOOR;
     let mut idx_max = 0usize;
     let mut idx_min = 0usize;
     for i in 1..m {
@@ -1693,7 +1719,32 @@ pub fn joint_jeffreys_phi_explicit_param_second_derivative(
             .iter()
             .map(|&lam| jeffreys_antiderivative(lam, floor))
             .sum::<f64>();
+    let floor_response = if floor_in_relative_regime {
+        let floor_dot_i = REDUCED_INFO_RELATIVE_FLOOR * dlmax_i;
+        let floor_dot_j = REDUCED_INFO_RELATIVE_FLOOR * dlmax_j;
+        let floor_second_ij = REDUCED_INFO_RELATIVE_FLOOR * d2_lmax;
+        let mut d_floor_i = 0.0;
+        let mut d_floor_j = 0.0;
+        let mut value_floor_sensitivity = 0.0;
+        let mut value_floor_second_sensitivity = 0.0;
+        for k in 0..m {
+            let lam = evals[k];
+            let inv_floor = floored_inverse_floor_sensitivity(lam, floor);
+            d_floor_i += inv_floor * a_i[[k, k]];
+            d_floor_j += inv_floor * a_j[[k, k]];
+            value_floor_sensitivity += jeffreys_antiderivative_floor_sensitivity(lam, floor);
+            value_floor_second_sensitivity +=
+                jeffreys_antiderivative_floor_second_sensitivity(lam, floor);
+        }
+        0.5 * (floor_dot_j * d_floor_i
+            + floor_dot_i * d_floor_j
+            + floor_dot_i * floor_dot_j * value_floor_second_sensitivity
+            + floor_second_ij * value_floor_sensitivity)
+    } else {
+        0.0
+    };
     Ok(gate_weight * u_ij
+        + gate_weight * floor_response
         + gate_dot_i * u_j
         + gate_dot_j * u_i
         + gate_hess_ij * phi_ungated)
