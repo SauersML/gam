@@ -154,6 +154,9 @@ mod term;
 mod tests;
 
 #[cfg(test)]
+mod tests_bessel_normaliser_1113;
+
+#[cfg(test)]
 mod tests_parallelism_invariance_1557;
 
 #[cfg(test)]
