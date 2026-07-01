@@ -7106,7 +7106,13 @@ impl SaeManifoldTerm {
         Ok(out)
     }
 
-    pub fn reml_criterion_streaming_exact(
+    /// Streaming criterion that RETURNS the converged arrow-factor cache — the
+    /// per-row factored Hessian (matrix-free, feasible at massive K; the dense
+    /// `border_dim²` Schur is NEVER formed here), so the EFS hyperparameter lane
+    /// can take its matrix-free ARD / smoothness traces off this cache in the
+    /// streaming regime instead of hard-erroring on the dense evidence path. The
+    /// log-determinant is the chunked matrix-free `streaming_exact_arrow_log_det`.
+    pub fn reml_criterion_streaming_exact_with_cache(
         &mut self,
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
@@ -7115,7 +7121,7 @@ impl SaeManifoldTerm {
         learning_rate: f64,
         ridge_ext_coord: f64,
         ridge_beta: f64,
-    ) -> Result<(f64, SaeManifoldLoss), String> {
+    ) -> Result<(f64, SaeManifoldLoss, ArrowFactorCache), String> {
         let mut rho_fixed = rho.clone();
         let mut loss = self.run_joint_fit_arrow_schur(
             target,
@@ -7136,9 +7142,12 @@ impl SaeManifoldTerm {
         // `PerRowFactorFailed` at base ridge 0. Sharing the driver also keeps the
         // streaming and dense log-determinants bit-identical (#847).
         let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
-        // The dense factor cache from convergence is surplus here — the streaming
-        // path recomputes the (bit-identical) log-determinant chunk-by-chunk in
-        // `streaming_exact_arrow_log_det` to bound peak memory — so it is dropped.
+        // The converged arrow-factor cache is the per-row factored Hessian
+        // (matrix-free, feasible at massive K — the dense border_dim² Schur is
+        // never materialised here); it is RETURNED so the EFS lane can take its
+        // matrix-free ARD/smoothness traces off it. The log-determinant itself is
+        // recomputed chunk-by-chunk in `streaming_exact_arrow_log_det` to bound
+        // peak memory (bit-identical to the dense path, #847).
         let converged_cache = self.converge_inner_for_undamped_logdet(
             target,
             rho,
@@ -7152,7 +7161,6 @@ impl SaeManifoldTerm {
             &options,
             true,
         )?;
-        drop(converged_cache);
         let log_det = self.streaming_exact_arrow_log_det(target, rho, registry)?;
         let occam = self.reml_occam_term(rho)?;
         // Extra analytic-penalty energy (#671/#737), matching the full-batch
@@ -7167,7 +7175,32 @@ impl SaeManifoldTerm {
         Ok((
             loss.total() + extra_penalty_energy + 0.5 * log_det - occam,
             loss,
+            converged_cache,
         ))
+    }
+
+    /// Value-only streaming criterion — the cache-returning
+    /// [`Self::reml_criterion_streaming_exact_with_cache`] with the cache dropped.
+    pub fn reml_criterion_streaming_exact(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        registry: Option<&AnalyticPenaltyRegistry>,
+        inner_max_iter: usize,
+        learning_rate: f64,
+        ridge_ext_coord: f64,
+        ridge_beta: f64,
+    ) -> Result<(f64, SaeManifoldLoss), String> {
+        let (cost, loss, _cache) = self.reml_criterion_streaming_exact_with_cache(
+            target,
+            rho,
+            registry,
+            inner_max_iter,
+            learning_rate,
+            ridge_ext_coord,
+            ridge_beta,
+        )?;
+        Ok((cost, loss))
     }
 
     pub fn streaming_exact_arrow_log_det(

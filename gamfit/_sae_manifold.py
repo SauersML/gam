@@ -2152,9 +2152,18 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
             f"sae_manifold_fit requires n >= 2 observations; got n={n_obs}"
         )
     if n_obs <= k_atoms:
-        raise ValueError(
-            f"sae_manifold_fit requires n > K (more observations than atoms); "
-            f"got n={n_obs}, K={k_atoms}"
+        # Overcomplete regime (K >= n) — the normal sparse-autoencoder setting. The
+        # joint decoder LSQ is underdetermined by raw counts, but the ARD coord
+        # prior + smoothness penalty regularize it to identifiability, so this is
+        # admissible: it relies on the priors rather than on n > K. Warn instead of
+        # refusing so massive-K dictionaries (e.g. K=32,000) can be fit on a
+        # RAM-tight box with modest n — the dense n×K assignment logits scale with
+        # n, so a small n keeps peak memory bounded.
+        import warnings as _warnings
+        _warnings.warn(
+            f"sae_manifold_fit: overcomplete K={k_atoms} >= n={n_obs}; decoder "
+            f"identified by ARD/smoothness priors, not n > K.",
+            stacklevel=2,
         )
     # WP-D output-Fisher shard (#980). Magic-by-default: a non-None
     # `fisher_factors` (HarvestShard / load_harvest_shard dict / raw (n, p, r)

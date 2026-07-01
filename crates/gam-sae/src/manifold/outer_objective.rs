@@ -1569,15 +1569,35 @@ impl SaeManifoldOuterObjective {
         {
             self.term.set_flat_beta(beta.view())?;
         }
-        let (cost, loss, cache) = self.term.reml_criterion_with_cache(
-            self.target.view(),
-            &rho,
-            self.registry.as_ref(),
-            self.inner_max_iter,
-            self.learning_rate,
-            self.ridge_ext_coord,
-            self.ridge_beta,
-        )?;
+        // #1026 massive-K: in the streaming regime the dense evidence cache is
+        // infeasible (O((K·M·p)²)), so `reml_criterion_with_cache` hard-errors
+        // ("cost-only streaming route is required"). But the EFS lane IS the
+        // intended streaming-regime descent, and its ARD/smoothness traces below
+        // are already matrix-free-gated — they only need the per-row factored
+        // arrow cache, which the streaming criterion produces (and now returns).
+        // Route through it so the Fellner–Schall step runs matrix-free at large K;
+        // dense-admitted fits keep the byte-for-byte dense path.
+        let (cost, loss, cache) = if self.term.streaming_plan().direct_logdet_admitted() {
+            self.term.reml_criterion_with_cache(
+                self.target.view(),
+                &rho,
+                self.registry.as_ref(),
+                self.inner_max_iter,
+                self.learning_rate,
+                self.ridge_ext_coord,
+                self.ridge_beta,
+            )?
+        } else {
+            self.term.reml_criterion_streaming_exact_with_cache(
+                self.target.view(),
+                &rho,
+                self.registry.as_ref(),
+                self.inner_max_iter,
+                self.learning_rate,
+                self.ridge_ext_coord,
+                self.ridge_beta,
+            )?
+        };
         self.current_rho = rho.clone();
         let dispersion = self
             .term

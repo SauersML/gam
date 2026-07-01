@@ -81,6 +81,9 @@ def main() -> int:
                     help="homogeneous atom_topology: circle | periodic | duchon | linear")
     ap.add_argument("--d-atom", type=int, default=1)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--allow-overcomplete", action="store_true",
+                    help="permit N < K (overcomplete dictionary) — keeps the dense "
+                         "n×K assignment logits small enough to fit a RAM-tight box")
     args = ap.parse_args()
 
     import gamfit
@@ -93,9 +96,12 @@ def main() -> int:
 
     max_k = max(args.k)
     n_train = args.n_train
-    if n_train <= max_k:
+    if n_train <= max_k and not args.allow_overcomplete:
         n_train = max_k + max(1000, max_k // 4)
         print(f"# bumped n_train to {n_train} to satisfy N > K at K={max_k}")
+    elif n_train <= max_k:
+        print(f"# OVERCOMPLETE: N={n_train} < K={max_k} (overcomplete dictionary; the "
+              f"dense n×K logits stay {n_train*max_k*8/1e9:.2f} GB — fits a RAM-tight box)")
 
     t0 = time.perf_counter()
     train = make_curved_data(
