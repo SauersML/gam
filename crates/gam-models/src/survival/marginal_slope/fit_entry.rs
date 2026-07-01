@@ -8,16 +8,14 @@ pub fn fit_survival_marginal_slope_terms(
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<SurvivalMarginalSlopeFitResult, String> {
-    // gam#979: bound the whole fit so the survival marginal-slope outer search —
-    // whose constrained joint-Newton cannot certify convergence on the
-    // monotonicity-pinned baseline, so seed screening escalates to an uncapped
-    // cycle budget while every seed rejects — returns its best-so-far iterate
-    // (or a catchable error) in bounded time instead of hanging. Configurable
-    // via kappa_options; generous default. Cleared on EVERY exit path so a stale
-    // deadline never leaks to a later fit.
-    let budget_secs = kappa_options.outer_wall_clock_budget_secs.unwrap_or(300.0);
-    gam_solve::rho_optimizer::arm_outer_wall_clock_deadline(
-        std::time::Instant::now() + std::time::Duration::from_secs_f64(budget_secs.max(1.0)),
+    // gam#979/#1794: bound the whole fit so marginal-slope outer searches whose
+    // joint-Newton inner solves cannot certify convergence return a catchable
+    // error in bounded time instead of spinning until an external harness kills
+    // the process. The default is intentionally below common per-test timeouts;
+    // explicit kappa_options still override it. Cleared on EVERY exit path so a
+    // stale deadline never leaks to a later fit.
+    crate::marginal_slope_shared::arm_marginal_slope_outer_wall_clock_deadline(
+        kappa_options.outer_wall_clock_budget_secs,
     );
     let result = fit_survival_marginal_slope_terms_impl(data, spec, options, kappa_options);
     gam_solve::rho_optimizer::clear_outer_wall_clock_deadline();

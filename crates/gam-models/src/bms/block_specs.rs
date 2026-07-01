@@ -1743,6 +1743,31 @@ pub fn fit_bernoulli_marginal_slope_terms(
     kappa_options: &SpatialLengthScaleOptimizationOptions,
     policy: &gam_runtime::resource::ResourcePolicy,
 ) -> Result<BernoulliMarginalSlopeFitResult, String> {
+    // gam#1794: Bernoulli/flex marginal-slope runs through the same coupled
+    // exact-joint inner solves as survival marginal-slope, so it needs the same
+    // fit-level fuse. Without it, non-certification in startup validation or
+    // flex PIRLS scaling probes can spin until the harness hard-timeouts.
+    crate::marginal_slope_shared::arm_marginal_slope_outer_wall_clock_deadline(
+        kappa_options.outer_wall_clock_budget_secs,
+    );
+    let result = fit_bernoulli_marginal_slope_terms_impl(
+        data,
+        spec,
+        options,
+        kappa_options,
+        policy,
+    );
+    gam_solve::rho_optimizer::clear_outer_wall_clock_deadline();
+    result
+}
+
+fn fit_bernoulli_marginal_slope_terms_impl(
+    data: ArrayView2<'_, f64>,
+    spec: BernoulliMarginalSlopeTermSpec,
+    options: &BlockwiseFitOptions,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
+    policy: &gam_runtime::resource::ResourcePolicy,
+) -> Result<BernoulliMarginalSlopeFitResult, String> {
     let mut spec = spec;
     let data_view = data;
     validate_spec(data_view, &spec)?;

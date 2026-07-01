@@ -37,6 +37,25 @@ use ndarray::{Array1, Array2, Axis};
 use std::ops::Range;
 use std::sync::Arc;
 
+/// Default whole-fit wall-clock budget for marginal-slope families.
+///
+/// This is a defensive fuse, not a convergence criterion: it bounds known
+/// joint-Newton non-certification paths so callers get a catchable error before
+/// common test/CI harnesses kill the process. Explicit caller budgets still win.
+pub(crate) const DEFAULT_MARGINAL_SLOPE_OUTER_WALL_CLOCK_BUDGET_SECS: f64 = 30.0;
+
+/// Arms the shared fit-level deadline used by marginal-slope fits and returns
+/// the budget that was installed. Callers must clear the deadline on every exit.
+pub(crate) fn arm_marginal_slope_outer_wall_clock_deadline(budget_secs: Option<f64>) -> f64 {
+    let budget_secs = budget_secs
+        .unwrap_or(DEFAULT_MARGINAL_SLOPE_OUTER_WALL_CLOCK_BUDGET_SECS)
+        .max(1.0);
+    gam_solve::rho_optimizer::arm_outer_wall_clock_deadline(
+        std::time::Instant::now() + std::time::Duration::from_secs_f64(budget_secs),
+    );
+    budget_secs
+}
+
 /// Canonical inner-cache `beta_seed` validator passed to the generic
 /// outer-engine (`optimize_spatial_length_scale_exact_joint`).
 ///
@@ -2146,5 +2165,30 @@ mod tests {
             "weight_scale {} not near 5.0",
             scale
         );
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    #[test]
+    fn marginal_slope_deadline_helper_uses_bounded_default_and_honors_override() {
+        gam_solve::rho_optimizer::clear_outer_wall_clock_deadline();
+
+        let default_budget = arm_marginal_slope_outer_wall_clock_deadline(None);
+        assert_eq!(
+            default_budget, DEFAULT_MARGINAL_SLOPE_OUTER_WALL_CLOCK_BUDGET_SECS,
+            "None should install the shared bounded marginal-slope default, not the old 300s survival-only budget"
+        );
+        assert!(
+            !gam_solve::rho_optimizer::outer_wall_clock_deadline_exceeded(),
+            "freshly armed default budget should not already be expired"
+        );
+        gam_solve::rho_optimizer::clear_outer_wall_clock_deadline();
+
+        let explicit_budget = arm_marginal_slope_outer_wall_clock_deadline(Some(0.25));
+        assert_eq!(explicit_budget, 1.0, "explicit tiny budgets are floored");
+        gam_solve::rho_optimizer::clear_outer_wall_clock_deadline();
     }
 }

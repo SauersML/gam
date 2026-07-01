@@ -437,11 +437,11 @@ pub struct FitConfig {
     /// standard formula fits. `None` uses the production default.
     pub outer_max_iter: Option<usize>,
     /// Optional wall-clock budget (seconds) for the outer smoothing search
-    /// (gam#979). Threaded to the survival marginal-slope fit, whose constrained
+    /// (gam#979/#1794). Threaded to marginal-slope fits whose constrained
     /// joint-Newton can fail to certify convergence and otherwise grind without
     /// bound; with this set the fit returns its best-so-far iterate (or a
-    /// catchable error) within the budget instead of hanging. `None` keeps the
-    /// generous built-in default for that path and is unbounded elsewhere.
+    /// catchable error) within the budget instead of hanging. `None` uses the
+    /// bounded built-in marginal-slope default.
     pub outer_wall_clock_budget_secs: Option<f64>,
 
     /// GPU backend selection policy. `Auto` uses supported device kernels for

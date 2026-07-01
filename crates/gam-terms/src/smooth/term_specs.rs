@@ -3926,11 +3926,9 @@ pub struct SpatialLengthScaleOptimizationOptions {
     pub pilot_subsample_threshold: usize,
     /// Optional wall-clock budget (seconds) for the whole outer smoothing search
     /// (gam#979). When a family arms the global deadline from this, an outer
-    /// search that cannot certify convergence (survival marginal-slope's
-    /// monotonicity-pinned constrained joint-Newton) returns its best-so-far
-    /// iterate (or a catchable error) within the budget instead of hanging.
-    /// `None` keeps the legacy unbounded behavior; the survival marginal-slope
-    /// path applies a generous default when this is `None`.
+    /// search that cannot certify convergence returns its best-so-far iterate
+    /// (or a catchable error) within the budget instead of hanging. `None` lets
+    /// marginal-slope fit entries apply their bounded built-in default.
     pub outer_wall_clock_budget_secs: Option<f64>,
 }
 
