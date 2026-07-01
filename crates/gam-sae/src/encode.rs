@@ -2471,25 +2471,36 @@ impl EncodeAtlas {
             ));
         }
         let budget = auto_candidate_budget(atoms.len().max(1));
-        // ── Per-row EXACT routing (#1777), grouped by the global-argmax atom. ───
+        // ── Per-row SUBLINEAR routing, grouped by the LSH-best atom. ────────────
+        // MASSIVE-K (K≈32k) throughput hinge. The certified path uses
+        // `route_exact`, but its universal-bound LSH certificate only fires when a
+        // gathered atom sits at the alignment ceiling (≈1.0); for any real
+        // dictionary where no atom perfectly aligns (`alignment < 1`) it ALWAYS
+        // falls through to `brute_force_best_atom` — an O(K) full scan PER ROW,
+        // making the whole encode O(N·K) and dominating at K=32k. This is the SPEED
+        // mode, so it takes the LSH gather's best-aligned atom directly
+        // (`propose` scores only the ~budget gathered candidates → sublinear in K).
+        // The gather's best is the exact global argmax on the overwhelming majority
+        // of rows (high LSH recall); a rare miss is a slightly-suboptimal atom that
+        // the fit-quality floor and the downstream certificate/exact fallback catch
+        // — the documented speed/accuracy tradeoff. This is what makes token-rate
+        // encode against a 32k-atom dictionary sublinear in K.
         let mut groups: std::collections::HashMap<usize, Vec<usize>> =
             std::collections::HashMap::new();
         for row in 0..n {
-            // route_exact returns the GLOBAL argmax of the routing score (universal-
-            // bound LSH fast path, else a full scan) — never a silently-missed
-            // ungathered atom.
-            let Some(route) = index.route_exact(sketch, targets.row(row), budget, true) else {
-                continue; // empty dictionary
+            let dir = targets.row(row);
+            let proposal = index.propose(sketch, dir, budget, true);
+            let Some(&best_atom) = proposal.proposed.first() else {
+                continue; // nothing gathered (empty dictionary / probe-dim mismatch)
             };
-            // Fit-quality floor (routing is already exact): the globally-best atom
-            // still fits this row poorly, or the alignment is NaN (zero-norm row) —
-            // flag for the exact fallback by leaving the row out of every group.
-            if !route.alignment.is_finite()
-                || route.alignment < CANDIDATE_ROUTING_MIN_ALIGNMENT
-            {
+            // Fit-quality floor: the best gathered atom still fits this row poorly,
+            // or the alignment is NaN (zero-norm row) — leave the row out of every
+            // group so it flags for the exact multi-start fallback.
+            let alignment = sketch.alignment(best_atom, dir);
+            if !alignment.is_finite() || alignment < CANDIDATE_ROUTING_MIN_ALIGNMENT {
                 continue;
             }
-            groups.entry(route.atom).or_default().push(row);
+            groups.entry(best_atom).or_default().push(row);
         }
 
         let mut coords = Array2::<f64>::zeros((n, latent_dim));
