@@ -3215,14 +3215,18 @@ fn exp_neg_half_square(x: f64) -> f64 {
 /// ```text
 /// both ≥ 0 (upper tail):  erf(b/√2) − erf(a/√2) = erfc(a/√2) − erfc(b/√2)
 /// both ≤ 0 (lower tail):  erf(b/√2) − erf(a/√2) = erfc(−b/√2) − erfc(−a/√2)
-/// straddling zero:        erf(b/√2) − erf(a/√2) = 2 − erfc(b/√2) − erfc(−a/√2)
+/// straddling zero:        erf(b/√2) − erf(a/√2)
+///                        = erf(b/√2) + erf(−a/√2)       near the anchor
+///                        = 2 − erfc(b/√2) − erfc(−a/√2) otherwise
 /// ```
 ///
 /// In each branch every `erfc` argument is `≥ 0`, so the terms are small
-/// positive tail values (or an O(1) constant minus two values `≤ 1`); no
-/// large quantities cancel and full f64 precision survives down to the
-/// underflow boundary in either tail. Infinite endpoints fall out via the
-/// `erfc` limits (`erfc(+∞)=0`, `erfc(−∞)=2`) with no special casing.
+/// positive tail values, while narrow straddling intervals add two
+/// non-negative `erf` masses measured outward from the anchor. That avoids
+/// the `2 − erfc(b/√2) − erfc(−a/√2)` cancellation when both erfc terms round
+/// to `1.0`, but keeps the erfc-tail form for ordinary/full-line straddling
+/// intervals. No large quantities cancel and full f64 precision survives down
+/// to the underflow boundary in either tail and around the affine anchor.
 ///
 /// Uses `libm::erfc` (msun double-precision implementation, ≤ 1 ulp) rather
 /// than `statrs::function::erf::erfc` (a 6-term rational approximation that
@@ -3244,6 +3248,12 @@ fn truncated_gaussian_zeroth_moment(a: f64, b: f64) -> f64 {
         libm::erfc(za) - libm::erfc(zb)
     } else if zb <= 0.0 {
         libm::erfc(-zb) - libm::erfc(-za)
+    } else if zb <= 0.5 && -za <= 0.5 {
+        // Near the affine anchor, erfc(zb) and erfc(-za) are both close to
+        // one; subtracting them from 2.0 can round a tiny but representable
+        // cell mass to zero. The equivalent erf sum adds small positive
+        // quantities directly.
+        libm::erf(zb) + libm::erf(-za)
     } else {
         2.0 - libm::erfc(zb) - libm::erfc(-za)
     };
