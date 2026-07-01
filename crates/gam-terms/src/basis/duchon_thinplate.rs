@@ -398,6 +398,16 @@ fn build_duchon_basis_uncached(
             spec.operator_penalties.stiffness,
             OperatorPenaltySpec::Active { .. }
         );
+        // When the fresh data-metric reparam is computed, its `raw` (un-rotated)
+        // design is built here from a full `n×k` kernel evaluation. That SAME
+        // realized design is the base of the final basis — rotating it by the
+        // adopted `V` gives the fit-time design without a second kernel pass —
+        // so carry it forward instead of rebuilding it below (#1718). This
+        // halves the cold-build kernel work for the default `duchon(x, z)`,
+        // which is the only configuration that hits this branch (native Gram,
+        // no operators, no frozen reparam), closing the wall-time gap to
+        // `thinplate(x, z)`.
+        let mut prebuilt_raw_basis: Option<Array2<f64>> = None;
         if frozen_radial_reparam.is_none() && !operators_active {
             let kernel_cols = kernel_transform.ncols();
             if kernel_cols > 0 {
@@ -429,22 +439,50 @@ fn build_duchon_basis_uncached(
                 // A degenerate reparam (no retained modes) would gut the basis;
                 // only adopt `V` when it preserves at least one radial column.
                 if v.ncols() > 0 {
+                    // The fit-time design is `[K·Z·V | P] = [(K·Z)·V | P]`,
+                    // where `K·Z` and `P` are exactly the kernel/poly blocks of
+                    // `raw` (the reparam only right-multiplies the constrained
+                    // kernel columns; the poly block is reparam-independent). So
+                    // rotate `raw`'s kernel block by `V` in place rather than
+                    // re-evaluating the kernel: `(K·Z)·V = K·(Z·V)`, the same
+                    // model space the un-fused rebuild would produce.
+                    let rotated_kernel = fast_ab(&raw.basis.slice(s![.., 0..kernel_cols]), &v);
+                    let poly_block = raw.basis.slice(s![.., kernel_cols..]);
+                    let mut fused =
+                        Array2::<f64>::zeros((raw.basis.nrows(), rotated_kernel.ncols() + poly_block.ncols()));
+                    fused
+                        .slice_mut(s![.., 0..rotated_kernel.ncols()])
+                        .assign(&rotated_kernel);
+                    if poly_block.ncols() > 0 {
+                        fused
+                            .slice_mut(s![.., rotated_kernel.ncols()..])
+                            .assign(&poly_block);
+                    }
+                    prebuilt_raw_basis = Some(fused);
                     kernel_transform = fast_ab(&kernel_transform, &v);
                     frozen_radial_reparam = Some(v);
+                } else {
+                    // No reparam adopted: `raw` already IS the fit-time design
+                    // (no rotation), so reuse it directly.
+                    prebuilt_raw_basis = Some(raw.basis);
                 }
             }
         }
-        let d = build_duchon_basis_designwithworkspace(
-            data,
-            centers.view(),
-            spec.length_scale,
-            spec.power,
-            effective_nullspace_order,
-            aniso.as_deref(),
-            frozen_radial_reparam.as_ref(),
-            workspace,
-        )?;
-        let basis = d.basis;
+        let basis = if let Some(basis) = prebuilt_raw_basis {
+            basis
+        } else {
+            build_duchon_basis_designwithworkspace(
+                data,
+                centers.view(),
+                spec.length_scale,
+                spec.power,
+                effective_nullspace_order,
+                aniso.as_deref(),
+                frozen_radial_reparam.as_ref(),
+                workspace,
+            )?
+            .basis
+        };
         let identifiability_transform = spatial_identifiability_transform_from_design(
             data,
             basis.view(),

@@ -1,5 +1,20 @@
 use super::*;
 
+/// Process-wide counter of full `n×k` Duchon kernel-design materializations
+/// performed by [`build_duchon_basis_designwithworkspace`]. Each increment is a
+/// full kernel evaluation over every (data-row, center) pair — the dominant
+/// cold-build cost. It exists so regression tests can pin STRUCTURALLY that the
+/// default `duchon(x, z)` cold build materializes the design ONCE, not twice
+/// (the #1718 redundant second kernel pass); it never affects the numeric
+/// result.
+pub(crate) static DUCHON_DESIGN_BUILD_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Current value of the Duchon design-build counter (test-support).
+pub fn duchon_design_build_count() -> usize {
+    DUCHON_DESIGN_BUILD_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub(crate) fn duchon_coeff_exponents(p_order: usize, s_order: usize, m_or_n: usize) -> f64 {
     // In the partial fractions
     //   1 / (z^p (z + kappa^2)^s)
@@ -1468,6 +1483,7 @@ pub(crate) fn build_duchon_basis_designwithworkspace(
     radial_reparam: Option<&Array2<f64>>,
     workspace: &mut BasisWorkspace,
 ) -> Result<DuchonBasisDesign, BasisError> {
+    DUCHON_DESIGN_BUILD_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let n = data.nrows();
     let d = data.ncols();
     let k = centers.nrows();
