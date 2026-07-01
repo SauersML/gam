@@ -6633,7 +6633,12 @@ fn sae_manifold_predict_oos<'py>(
                     t_bar,
                     b0: b0.as_array().to_owned(),
                     b1: b1.as_array().to_owned(),
+                    // Ordinary straight-image path (not a collapse-rescue): the
+                    // line decodes at the atom's own coordinate, so there is no
+                    // per-row code set and no projection direction (#1777). Both
+                    // rescue-only fields stay `None`, in lockstep.
                     row_codes: None,
+                    v: None,
                 },
             )
             .collect();
