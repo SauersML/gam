@@ -163,8 +163,9 @@ def _point_payload_spec(
     transformed to the response scale, and which columns make up the tabular
     form when the caller opts into a table:
 
-    * **transformation-normal** — the per-row z-score (``transformation_normal_z``);
-      table form is the single ``z`` column.
+    * **transformation-normal** — the per-row response-scale conditional mean
+      ``E[Y|x]`` (issue #1612), read from the ``linear_predictor`` column by
+      ``transformation_normal_z``; table form is the single ``z`` column.
     * **Bernoulli marginal-slope** — ``mean`` clipped back to ``(0, 1)`` as a
       probability; table form is the ``mean`` (probability) column, plus
       ``linear_predictor`` (the η-scale point) and the probability-scale
