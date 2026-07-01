@@ -2967,14 +2967,13 @@ pub fn build_smooth_basis(
                             // Rather than emit the fractional cubic and let it truncate
                             // into an inadmissible kernel, resolve the SMALLEST
                             // admissible integer `(nullspace, s)` at the requested
-                            // nullspace order, honoring the collocation order of the
-                            // default operator penalties (mass + tension ⇒ D1). This
-                            // recovers the canonical thin-plate smoothness order
-                            // `m = p + s = ⌊d/2⌋ + 1` for the hybrid kernel and agrees
-                            // with the fractional cubic default for odd `d` (where the
-                            // collocation floor already forces `s = (d-1)/2`).
+                            // nullspace order. The formula default is the same
+                            // native-Gram Duchon smoother as the scale-free path, so
+                            // there is no collocation-operator floor to honor here.
+                            // Users that opt into operator penalties get the stricter
+                            // gate at basis-build time from the requested operators.
                             let max_op = crate::basis::duchon_max_active_operator_derivative_order(
-                                &DuchonOperatorPenaltySpec::default(),
+                                &DuchonOperatorPenaltySpec::all_disabled(),
                             );
                             let (ns, s) = crate::basis::resolve_duchon_orders(
                                 cols.len(),
@@ -3035,9 +3034,15 @@ pub fn build_smooth_basis(
             } else {
                 None
             };
-            // The default is the full Hilbert scale (curvature `Primary` + trend
-            // ridge + mass + tension); REML deselects what the data don't support.
-            let operator_penalties = DuchonOperatorPenaltySpec::default();
+            // Formula-level `duchon(...)` is the native Duchon reproducing-norm
+            // smoother: the always-on Primary Gram plus the polynomial trend
+            // ridge. Do not silently add collocated mass/tension penalties here.
+            // They add extra REML hyperparameters and an O(k)-support quadrature
+            // build to the default 2-D path, making `duchon(x, z)` materially
+            // slower than the equivalent thin-plate fit without a principled
+            // accuracy gain (gam#1718). Lower-order Hilbert-scale penalties remain
+            // available to callers that construct an explicit DuchonBasisSpec.
+            let operator_penalties = DuchonOperatorPenaltySpec::all_disabled();
             // For a 1-D periodic Duchon with no EXPLICIT period, anchor the wrap
             // to the covariate DATA range rather than letting the basis builder
             // derive it from the (k-subsampled) center span. The center span is a
@@ -4648,6 +4653,7 @@ fn parse_spatial_identifiability(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::basis::OperatorPenaltySpec;
     use crate::inference::formula_dsl::parse_formula;
     use gam_data::{DataSchema, SchemaColumn};
     use ndarray::Array2;
@@ -5524,6 +5530,46 @@ mod tests {
             panic!("expected Duchon term");
         };
         assert_eq!(spec.length_scale, None);
+    }
+
+    #[test]
+    fn formula_duchon_default_does_not_enable_collocation_operators() {
+        let ds = continuous_dataset(
+            &["y", "x", "z"],
+            (0..40)
+                .map(|i| {
+                    let x = (i as f64 / 39.0).fract();
+                    let z = ((7 * i) as f64 / 39.0).fract();
+                    vec![x + z, x, z]
+                })
+                .collect(),
+        );
+        let parsed = parse_formula("y ~ duchon(x, z)").expect("parse");
+        let col_map = ds.column_map();
+        let mut notes = Vec::new();
+        let terms = build_termspec(
+            &parsed.terms,
+            &ds,
+            &col_map,
+            &mut notes,
+            &gam_runtime::resource::ResourcePolicy::default_library(),
+        )
+        .expect("build default 2D duchon termspec");
+        let SmoothBasisSpec::Duchon { spec, .. } = &terms.smooth_terms[0].basis else {
+            panic!("expected Duchon term");
+        };
+        assert!(matches!(
+            spec.operator_penalties.mass,
+            OperatorPenaltySpec::Disabled
+        ));
+        assert!(matches!(
+            spec.operator_penalties.tension,
+            OperatorPenaltySpec::Disabled
+        ));
+        assert!(matches!(
+            spec.operator_penalties.stiffness,
+            OperatorPenaltySpec::Disabled
+        ));
     }
 
     #[test]
