@@ -415,6 +415,11 @@ pub(crate) fn dispersion_nb_disp_order1(
 /// `value`/`g[1]`/`h[1][1]` of `dispersion_nb_nll_order2` bit-for-bit. Retained
 /// as the `Order2` oracle pin (`prune_towers_match_dense_all_channels`); the
 /// production NB2 row kernel uses the cheaper [`dispersion_nb_disp_order1`].
+///
+/// Consumed only by the `#[cfg(test)]` oracle pins (`prune_towers_*`); the
+/// non-test lib carries it purely as documentation of the K=2 tower it prunes
+/// from, so `dead_code` is expected off the test profile.
+#[cfg_attr(not(test), allow(dead_code))]
 #[inline]
 pub(crate) fn dispersion_nb_disp_order2(
     yi: f64,
