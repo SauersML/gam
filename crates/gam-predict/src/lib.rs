@@ -814,11 +814,12 @@ impl FittedModelPredictExt for FittedModel {
                 let beta_noise = location_scale_noise_beta(fit)
                     .or_else(|| self.payload().beta_noise.clone().map(Array1::from_vec))?;
                 let response_scale = self.payload().gaussian_response_scale.unwrap_or(1.0);
-                let sigma_floor = gam::families::sigma_link::LOGB_SIGMA_FLOOR * response_scale;
+                let sigma_floor = gam::families::sigma_link::LOGB_SIGMA_FLOOR;
                 Some(Box::new(GaussianLocationScalePredictor {
                     beta_mu,
                     beta_noise,
                     sigma_floor,
+                    response_scale,
                     covariance: fit.beta_covariance().cloned(),
                     link_wiggle: runtime.link_wiggle,
                 }) as Box<dyn PredictableModel>)
@@ -3027,8 +3028,9 @@ mod tests {
         // estimation uncertainty.  logit(0) → mu = 0.5; response_var = mu*(1-mu)/(1+phi).
         let mu = 0.5_f64;
         let response_var = mu * (1.0 - mu) / (1.0 + beta_phi);
-        let (exp_lo, exp_hi) = beta_moment_matched_interval(mu, response_var, normal_cdf(-z), normal_cdf(z))
-            .expect("beta quantiles from phi=31");
+        let (exp_lo, exp_hi) =
+            beta_moment_matched_interval(mu, response_var, normal_cdf(-z), normal_cdf(z))
+                .expect("beta quantiles from phi=31");
         let expected_beta_half_width = 0.5 * (exp_hi - exp_lo);
         assert!(
             (beta_half_width - expected_beta_half_width).abs() < 1e-12,
@@ -3665,6 +3667,7 @@ mod tests {
             beta_mu: array![0.0],
             beta_noise: array![0.0],
             sigma_floor: gam::families::sigma_link::LOGB_SIGMA_FLOOR,
+            response_scale: 1.0,
             covariance: None,
             link_wiggle: None,
         };
@@ -3697,6 +3700,7 @@ mod tests {
             beta_mu: array![0.5],
             beta_noise: array![0.1],
             sigma_floor: gam::families::sigma_link::LOGB_SIGMA_FLOOR,
+            response_scale: 1.0,
             covariance: Some(array![[4.0, 0.0], [0.0, 9.0]]),
             link_wiggle: None,
         };
@@ -3726,6 +3730,7 @@ mod tests {
             beta_mu: array![0.0],
             beta_noise: array![0.0],
             sigma_floor: gam::families::sigma_link::LOGB_SIGMA_FLOOR,
+            response_scale: 1.0,
             covariance: Some(array![[1.0, 0.0], [0.0, 0.0]]),
             link_wiggle: None,
         };
