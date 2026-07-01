@@ -1,3 +1,75 @@
+## v0.3.140 — gam 0.3.140 / gamfit 0.1.242 (2026-07-01)
+
+Release-integrity and correctness patch on top of 0.3.139. The headline is that
+the tree **builds and packages again from a clean checkout**: the 0.3.139
+release shipped a workspace that aborted its own build (build.rs hygiene-ban
+violations), so `cargo build`/`test`, a fresh `--release`, and the `maturin`
+wheel all failed on a cold `target/`. Every violation is cleared and pinned with
+regression guards, on top of a batch of root-cause fixes: a mixed-boundary
+tensor smooth that hard-errored, the SAE IBP-MAP high-noise stall, and a GPU
+BMS-FLEX row-kernel parity bug.
+
+### Fitting / inference correctness
+- **Mixed periodic + clamped tensor smooths fit instead of hard-erroring.** A
+  tensor margin's non-periodic spelling `clamped`/`open` (the B-spline-clamped,
+  free-ended margin) is now accepted in the `boundary=`/`bc=` list, so
+  `te(theta, z, boundary=['periodic','clamped'], period=[2*pi, None])` — gam's
+  analog of mgcv `te(bs=c("cc","ps"))` for a cylinder — builds a cyclic θ margin
+  tensor-producted with an ordinary open z margin. Previously the guard rejected
+  `clamped` as an unsupported endpoint reparameterization, taking out the
+  cylinder / solar-zenith / cyclic-tensor recoveries with an IntegrationFailed.
+  A genuine `anchored` zero-value endpoint constraint (no ordinary-margin
+  meaning on a tensor) is still surfaced as a clean unsupported-feature error.
+- **SAE IBP-MAP reaches a flexible fit at high noise instead of stalling (#1744).**
+  Two root causes are repaired: (1) the IBP-MAP ρ seed is no longer
+  response-dispersion-scaled — that Gaussian-normal-equation identity is invalid
+  for IBP's free Bernoulli gates and let the inner solve overfit at the seed,
+  collapsing the Fellner–Schall fixed point to zero penalty; and (2) the
+  parsimonious keep-best no longer lets a *less-stationary, more-smoothed*
+  non-converged seed displace the flexible incumbent on a marginally-lower
+  non-converged REML alone. Together the planted-circle IBP fit reaches EV ≈ 0.95
+  at σ=0.18 instead of stalling at 0.86.
+
+### GPU / numerical correctness locks
+- **BMS-FLEX GPU row kernel uses the observed predictor VALUE for the probit
+  Mills margin (#415).** The device kernel and its host oracle were reading
+  `bar_e_u[0]` — the u=0 first-derivative jet — as `e_obs` instead of the
+  degree-0 value `η(a(θ),θ;z_obs)`, diverging from the CPU family's
+  `signed_margin = s_y·eta_val`. The observed value is now packed and consumed
+  directly, locked by a non-vacuous CPU-oracle == CPU-family parity test over
+  every row's value, full gradient, and full r×r Hessian.
+- **Survival I-spline time-penalty PSD invariant is locked at construction
+  (#979).** The value-space curvature penalty is assembled as the full
+  congruence `Lᵀ S L` and *then* reduced to the kept columns (PSD by
+  construction); a regression test with a non-trivial `keep_cols` asserts the
+  assembled penalty is PSD, so a future reassembly that reintroduces an
+  indefinite reduction is caught at construction rather than as a silent
+  outer-loop hang.
+
+### Build / release integrity
+- **The workspace builds from a clean checkout again.** Cleared the build.rs ban
+  violations that shipped onto the 0.3.139 release: a temporary exploratory
+  coverage probe committed into `src/` (stdout prints + a `#[cfg(test)]` module
+  dodge), `construction.rs` over the 10k-line tracked-file limit, a `#[ignore]`
+  test, and a stale `uv.lock` gamfit version.
+- **The #415 CPU-oracle test module stays private.** Its cross-file consumer was
+  relocated into a private sibling test module so the oracle is reached in-module
+  — no `pub(crate)` on a `#[cfg(test)] mod`, which the ban gate (correctly)
+  rejects and which had re-broken the build.
+- **Removed the always-`panic!` #1765 observation-coverage probe.** It was
+  inconclusive exploratory scaffolding — its own fixed-seed numbers show the
+  residual-df scale is well-calibrated on that ridge sweep and `edf2` is not the
+  lever — so it neither reproduced the bug nor validated a fix; the finding is
+  recorded on the issue and the Gaussian scale stays guarded by
+  `gaussian_high_edf_scale_tests`.
+- **The `sigma_link` source-pattern guard no longer self-trips** — it skipped a
+  stale `families/sigma_link.rs` path and so scanned its own literal, failing the
+  CI test shard on every commit.
+- Added fast unit locks for the tensor boundary-token guard and made the 0139
+  bug-hunt regression test robust to future version bumps.
+
+Everything reachable through the existing API stays backward-compatible.
+
 ## v0.3.139 — gam 0.3.139 / gamfit 0.1.241 (2026-07-01)
 
 crates.io + PyPI release of the post-0.3.138 wave. The headline is the SAE /
