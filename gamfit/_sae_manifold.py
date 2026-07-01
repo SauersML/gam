@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -272,6 +273,34 @@ def _canonical_public_assignment(value: str) -> str:
 # Sentinel so ``assignment_prior`` can tell "not supplied" apart from any
 # explicit value (including the default ``assignment="ibp_map"``).
 _ASSIGNMENT_PRIOR_UNSET = object()
+
+# Sentinel so ``alpha`` can tell "not supplied" apart from an explicit
+# ``alpha=1.0``. When the caller does not set ``alpha`` and the assignment is
+# ``ibp_map``, the concentration defaults to the K-aware value below rather than
+# the historical fixed ``1.0`` (see #1784).
+_ALPHA_UNSET: Any = object()
+
+
+def _default_ibp_concentration_for_k_atoms(k_atoms: int) -> float:
+    """K-aware default IBP concentration ``α`` (#1784).
+
+    Mirror of the Rust source of truth
+    ``gam_sae::manifold::assignment::default_ibp_concentration_for_k_atoms``.
+    The ordered stick-breaking prior mean ``π_k = (α/(α+1))^{k+1}`` decays
+    GEOMETRICALLY in the atom index, so the historical fixed default ``α = 1``
+    (the ``(0.5)^{k+1}`` schedule) collapses to a near-hard mask past atom ~3: a
+    K-atom dictionary can then only place mass on its first handful of atoms,
+    which is why the manifold SAE underfit a linear dictionary of equal K on real
+    activations and why its late atoms carried zero mass — leaving the per-row
+    joint Hessian rank-deficient (the K = 128 ``RemlConvergenceError``). Choosing
+    ``α`` so the LAST atom retains prior mass ``π_{K-1} = (α/(α+1))^K ≈ e^{-1}``
+    makes the prior SPAN the whole dictionary while staying a monotone, honest
+    ordered stick-breaking prior (no atom structurally masked). Solving
+    ``(α/(α+1))^K = e^{-1}`` gives ``α = 1/(exp(1/K) − 1) ≈ K − 1/2``; floored at
+    ``1.0`` so ``K = 1`` keeps the historical ``α = 1``.
+    """
+    k = float(max(int(k_atoms), 1))
+    return max(1.0, 1.0 / (math.expm1(1.0 / k)))
 
 
 def _resolve_public_assignment(assignment: Any, assignment_prior: Any) -> str:
@@ -1823,7 +1852,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
                      coord_sparsity: Any = _COORD_SPARSITY_UNSET,
                      gate_sparsity: Any = _COORD_SPARSITY_UNSET, scad_mcp_gamma: float | None = None,
                      smoothness_weight: float = 1.0,
-                     alpha: float | str = 1.0, learning_rate: float | None = None, random_state: int = 0,
+                     alpha: float | str | Any = _ALPHA_UNSET, learning_rate: float | None = None, random_state: int = 0,
                      block_orthogonality_weight: float = 0.0,
                      nuclear_norm_weight: float = 1.0, nuclear_norm_max_rank: int | None = None,
                      decoder_incoherence_weight: float = 1.0,
@@ -1942,7 +1971,13 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     alpha
         Assignment-prior concentration/scale. Pass a float for a fixed value or
         ``"auto"`` to mark alpha learnable in the Rust solve; returned metadata
-        records ``alpha=1.0`` and ``learnable_alpha=True`` in that case.
+        records ``alpha=1.0`` and ``learnable_alpha=True`` in that case. If left
+        unset with the (default) ``ibp_map`` gate, the concentration defaults to
+        the K-aware ``default_ibp_concentration_for_k_atoms(K) ≈ K − 1/2`` (#1784)
+        so the ordered stick-breaking prior spans the whole dictionary instead of
+        masking every atom past the first few (which underfit an equal-K linear
+        dictionary and left the K=128 fit rank-deficient). A per-fit ``ibp_alpha``
+        or the global ``sae_set_ibp_alpha`` setter still overrides it.
     learning_rate
         Damped Newton/Gauss-Newton step size. If omitted, the Python facade uses
         ``1.0`` for IBP/softmax and ``0.05`` for JumpReLU.
@@ -2247,7 +2282,25 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
             f"supplied; they must describe the same topology."
         )
     kind = _resolve_public_assignment(assignment, assignment_prior)
-    alpha_value = 1.0 if alpha == "auto" else float(alpha)
+    # #1784 — K-aware default IBP concentration. When the caller does not set
+    # `alpha` and the assignment is the (default) ordered stick-breaking `ibp_map`
+    # gate, default the concentration to `default_ibp_concentration_for_k_atoms(K)`
+    # so the prior SPANS the whole dictionary instead of collapsing to a near-hard
+    # mask past the first ~3 atoms (the fixed `alpha=1.0` failure that made the
+    # manifold underfit an equal-K linear dictionary and left late atoms massless,
+    # rank-deficient at K=128). A per-fit `ibp_alpha` / the process-global
+    # `sae_set_ibp_alpha` override still wins in Rust (`resolved_ibp_alpha`), so
+    # this only moves the *base* default. `alpha="auto"` (learnable) and every
+    # non-`ibp_map` gate keep the historical `1.0` seed.
+    alpha_is_auto = alpha == "auto"
+    if alpha is _ALPHA_UNSET:
+        if kind == "ibp_map" and ibp_alpha is None:
+            alpha_value = _default_ibp_concentration_for_k_atoms(k_atoms)
+        else:
+            alpha_value = 1.0
+        alpha_is_auto = False
+    else:
+        alpha_value = 1.0 if alpha_is_auto else float(alpha)
     # Magic-by-default learning rate: the SAE Newton kernel is a damped
     # Gauss-Newton step against a quadratic local model with Armijo
     # backtracking. For softmax / IBP-MAP assignments the natural full step
@@ -2347,7 +2400,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         [int(d) for d in dims],
         float(alpha_value),
         float(tau),
-        bool(alpha == "auto"),
+        bool(alpha_is_auto),
         str(kind),
         sparsity_strength=float(sparsity),
         smoothness=float(smoothness),
@@ -2388,7 +2441,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     model = ManifoldSAE.from_payload(
         x, payload_dict, resolved_topology, kind, penalties,
         assignment_label=str(assignment),
-        alpha=float(alpha_value), learnable_alpha=bool(alpha == "auto"),
+        alpha=float(alpha_value), learnable_alpha=bool(alpha_is_auto),
         tau=float(tau), sparsity_strength=float(sparsity), smoothness=float(smoothness),
         learning_rate=float(effective_lr), max_iter=int(max_iter_total),
         random_state=int(random_state), top_k=top_k_arg,
