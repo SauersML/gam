@@ -653,8 +653,16 @@ fn certify_with_basin_warmup(
         }
     }
     // refine_certified_start: `newton_steps` further, must stay certified.
+    // Mirror production's convergence early-exit: once the pending Newton step is
+    // below the coordinate ULP scale the certified root is reached and further steps
+    // only re-accumulate round-off (keeps device parity with the encode.rs fold).
     let landing = cert;
     for _ in 0..dev.newton_steps {
+        let dnorm = delta.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let tnorm = t.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if dnorm <= crate::encode::NEWTON_REFINE_CONVERGED_EPS * (1.0 + tnorm) {
+            break;
+        }
         for i in 0..dev.d {
             t[i] += delta[i];
         }
@@ -770,6 +778,16 @@ pub fn emulate_certified_encode_row(dev: &EncodeAtomDevice, x: &[f64], amplitude
             let err = recon_error(dev, &coord, x, amplitude, &mut scratch);
             if best.as_ref().map(|(_, _, e)| err < *e).unwrap_or(true) {
                 best = Some((coord, cert, err));
+            }
+            // Mirror production certified_encode_row's global-minimum short-circuit
+            // (encode.rs): reconstruction error ≥ 0, so a certified candidate already
+            // at the ambient noise floor is provably the global optimum — stop
+            // refining the remaining top-K charts (keeps device parity with the fold).
+            if let Some((_, _, e)) = best.as_ref() {
+                let xnorm = x.iter().map(|v| v * v).sum::<f64>().sqrt();
+                if *e <= crate::encode::CERTIFIED_GLOBAL_MIN_RECON_FLOOR * (1.0 + xnorm) {
+                    break;
+                }
             }
         }
     }
@@ -966,6 +984,10 @@ __device__ int certify_basin(const int* exps, const double* dec,
   }
   double landing = h;
   for(int s=0;s<NEWTON;++s){
+    // convergence early-exit (mirror production refine_certified_start).
+    double dnorm=0.0, tnorm=0.0;
+    for(int i=0;i<DD;++i){ dnorm+=delta[i]*delta[i]; tnorm+=t[i]*t[i]; }
+    if(sqrt(dnorm) <= REFINE_EPS*(1.0+sqrt(tnorm))) break;
     for(int i=0;i<DD;++i) t[i]+=delta[i];
     row_certificate(exps, dec, t, x, amp, L, &h, &beta, &eta, delta);
     if(!(isfinite(h) && h<=KANTOROVICH)) return 0;
@@ -1054,6 +1076,9 @@ extern "C" __global__ void sae_certified_encode(
       double e2=0.0; for(int c=0;c<PP;++c){ double r=x[c]-amp*recon[c]; e2+=r*r; }
       double err = isfinite(e2)? sqrt(e2) : 1.0/0.0;
       if(!have_best || err<best_err){ have_best=1; best_err=err; best_h=landing_h; for(int i=0;i<DD;++i) best_coord[i]=coord[i]; }
+      // global-min short-circuit (mirror production certified_encode_row).
+      double xnorm2=0.0; for(int c=0;c<PP;++c) xnorm2+=x[c]*x[c];
+      if(best_err <= GMIN_FLOOR*(1.0+sqrt(xnorm2))) break;
     }
     (void)produced;
   }
@@ -1075,8 +1100,16 @@ extern "C" __global__ void sae_certified_encode(
 pub fn encode_kernel_source(dev: &EncodeAtomDevice) -> String {
     format!(
         "#define DD {}\n#define MM {}\n#define PP {}\n#define TOPK {}\n#define NEWTON {}\n\
-         #define RIDGE ({:e})\n{ENCODE_KERNEL_SOURCE}",
-        dev.d, dev.m, dev.p, dev.topk, dev.newton_steps, dev.ridge
+         #define RIDGE ({:e})\n#define GMIN_FLOOR ({:e})\n#define REFINE_EPS ({:e})\n\
+         {ENCODE_KERNEL_SOURCE}",
+        dev.d,
+        dev.m,
+        dev.p,
+        dev.topk,
+        dev.newton_steps,
+        dev.ridge,
+        crate::encode::CERTIFIED_GLOBAL_MIN_RECON_FLOOR,
+        crate::encode::NEWTON_REFINE_CONVERGED_EPS
     )
 }
 
