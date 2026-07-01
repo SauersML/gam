@@ -1166,6 +1166,31 @@ pub struct GaussianLocationScaleFitResult {
     pub response_scale: f64,
 }
 
+impl GaussianLocationScaleFitResult {
+    /// Additive σ floor in raw response units for reconstructing the returned
+    /// log-σ coefficients.
+    ///
+    /// Gaussian location-scale fits are solved after standardizing `y` by
+    /// [`Self::response_scale`]. Mapping coefficients back to raw units shifts
+    /// the log-σ intercept by `ln(response_scale)`, which scales only the
+    /// `exp(η)` part of `σ = b + exp(η)`. The additive floor must therefore be
+    /// carried separately as `response_scale * b`; otherwise response rescaling
+    /// `y -> c*y` leaves a raw `b` behind and breaks equivariance.
+    #[inline]
+    pub fn sigma_floor_response_units(&self) -> f64 {
+        self.response_scale * crate::sigma_link::LOGB_SIGMA_FLOOR
+    }
+
+    /// Reconstruct raw-response σ from a returned raw-unit log-σ predictor.
+    #[inline]
+    pub fn sigma_from_raw_eta(&self, eta: f64) -> f64 {
+        crate::sigma_link::logb_sigma_from_eta_with_floor_scalar(
+            self.sigma_floor_response_units(),
+            eta,
+        )
+    }
+}
+
 /// Fit the binomial mean link-wiggle model. Returns the γ-space fit and, when
 /// the frozen-basis de-aliasing engaged (#1596), the standard-basis warp
 /// coefficients `β_w = Z·γ` for the saved-model predict runtime.
