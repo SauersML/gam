@@ -61,6 +61,26 @@ class BasisDescriptor(ABC):
     def __call__(self, t: Any) -> Any:
         return self.evaluate(t)
 
+    def jacobian(self, t: Any) -> Any:
+        """Jacobian ``d Phi / d t`` at ``t``. Default routes through
+        ``torch.autograd``; subclasses may override with an analytic form."""
+        torch = _require_torch()
+        t_t = t if isinstance(t, torch.Tensor) else torch.as_tensor(t, dtype=torch.float64)
+        if not t_t.requires_grad:
+            t_t = t_t.detach().clone().requires_grad_(True)
+        phi = self.evaluate(t_t)
+        return torch.autograd.functional.jacobian(lambda x: self.evaluate(x), t_t)
+
+    def hessian(self, t: Any) -> Any:
+        """Hessian ``d^2 Phi / d t^2`` at ``t``. Default uses autograd."""
+        torch = _require_torch()
+        t_t = t if isinstance(t, torch.Tensor) else torch.as_tensor(t, dtype=torch.float64)
+        if not t_t.requires_grad:
+            t_t = t_t.detach().clone().requires_grad_(True)
+        return torch.autograd.functional.hessian(
+            lambda x: self.evaluate(x).sum(), t_t
+        )
+
     @property
     def output_dim(self) -> int | None:
         """Number of basis columns ``K``. ``None`` if not statically known."""
