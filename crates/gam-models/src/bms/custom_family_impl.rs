@@ -1248,9 +1248,17 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                     beta.len()
                 ));
             }
-            validate_monotone_structural_feasible(runtime, current, "score_warp_dev current")?;
-            validate_monotone_structural_feasible(runtime, &beta, "score_warp_dev proposed")?;
-            return Ok(beta);
+            // The constrained Newton/QP step enforces the structural monotone
+            // rows, but the active-set solve and the subsequent line-search
+            // arithmetic can land a few ulps outside the cone.  Keep the
+            // accepted update on the feasible segment from the last certified
+            // state instead of surfacing a spurious custom-family domain error.
+            return project_monotone_feasible_beta(
+                runtime,
+                current,
+                &beta,
+                "score_warp_dev post-update",
+            );
         }
         if self.link_block_index().is_some_and(|idx| block_idx == idx)
             && let (Some(runtime), Some(link)) =
@@ -1264,9 +1272,15 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                     beta.len()
                 ));
             }
-            validate_monotone_structural_feasible(runtime, current, "link_dev current")?;
-            validate_monotone_structural_feasible(runtime, &beta, "link_dev proposed")?;
-            return Ok(beta);
+            // Same feasibility-preserving segment clamp as the score-warp
+            // block: this is a globalization guard for the analytic linear
+            // constraints, not an unconstrained post-hoc fit alteration.
+            return project_monotone_feasible_beta(
+                runtime,
+                current,
+                &beta,
+                "link_dev post-update",
+            );
         }
         Ok(beta)
     }
