@@ -2040,6 +2040,22 @@ pub(crate) fn validate_fit_args_preflight(
     args: &FitArgs,
     parsed: &ParsedFormula,
 ) -> Result<(), String> {
+    if let (Some(logslope_formula), Some(z_column)) =
+        (args.logslope_formula.as_deref(), args.z_column.as_deref())
+    {
+        let (_, parsed_logslope) = parse_matching_auxiliary_formula(
+            logslope_formula,
+            &parsed.response,
+            "--logslope-formula",
+        )?;
+        validate_marginal_slope_z_column_exclusion(
+            parsed,
+            &parsed_logslope,
+            z_column,
+            "bernoulli marginal-slope",
+            "--logslope-formula",
+        )?;
+    }
     if args.out.is_none() {
         return Err(
             "fit requires --out; refusing to run a training job that writes no model".to_string(),
