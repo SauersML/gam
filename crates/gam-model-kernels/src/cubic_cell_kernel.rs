@@ -7699,35 +7699,63 @@ mod tests {
         let fd = (integral_at(h) - integral_at(-h)) / (2.0 * h);
 
         // Fixed-domain part: differentiate ONLY the integrands (domain frozen at
-        // edge0). We approximate it with the same moment reduction but treating
-        // the edge as fixed — i.e. its directional derivative is captured by the
-        // analytic Leibniz flux alone, since the integrand coefficients here are
-        // edge-independent. So the analytic prediction is pure flux:
-        //   flux = velocity · ( F_rst^L(edge0) − F_rst^R(edge0) ),
-        // using the UN-negated cells/coeffs (the boundary integrand convention).
+        // edge0). Its directional derivative is the analytic Leibniz flux alone,
+        // since the integrand coefficients here are edge-independent:
+        //   flux = velocity · ( F_rst^L(edge0) − F_rst^R(edge0) ).
+        //
+        // CONVENTION: the finite-difference `integral_at` above integrates the
+        // SURVIVAL/probit sign convention — negated cell (η→−η) AND negated
+        // coefficient slices — exactly as the production
+        // `row_primary_third_contracted_recompute` path does. The Leibniz
+        // boundary integrand must therefore be evaluated in that SAME negated
+        // convention: the third-derivative integrand is ODD under the joint
+        // (η→−η, coeff→−coeff) negation (its `rst`, `η·rs·t`, and `(η²−1)·r·s·t`
+        // terms each flip sign an odd number of times), so evaluating the flux
+        // with un-negated cells/coeffs yields exactly the opposite sign and the
+        // Leibniz identity `fd = flux` fails as `fd = −flux`. (The
+        // second-derivative sibling test `moving_shared_edge_second_integral_
+        // derivative_has_leibniz_jump_sign` keeps BOTH sides un-negated and so
+        // stays self-consistent; this test keeps BOTH sides negated.)
+        let neg_eta = |eta: &[f64; 4]| [-eta[0], -eta[1], -eta[2], -eta[3]];
+        let left_eta_neg = neg_eta(&left_eta);
+        let right_eta_neg = neg_eta(&right_eta);
         let left0 = DenestedCubicCell {
             left: -0.7,
             right: edge0,
-            c0: left_eta[0],
-            c1: left_eta[1],
-            c2: left_eta[2],
-            c3: left_eta[3],
+            c0: left_eta_neg[0],
+            c1: left_eta_neg[1],
+            c2: left_eta_neg[2],
+            c3: left_eta_neg[3],
         };
         let right0 = DenestedCubicCell {
             left: edge0,
             right: 1.0,
-            c0: right_eta[0],
-            c1: right_eta[1],
-            c2: right_eta[2],
-            c3: right_eta[3],
+            c0: right_eta_neg[0],
+            c1: right_eta_neg[1],
+            c2: right_eta_neg[2],
+            c3: right_eta_neg[3],
         };
         let f_left = cell_third_derivative_boundary_integrand(
-            left0, &common_r, &common_s, &common_t, &common_rs, &common_rt, &common_st, &left_rst,
+            left0,
+            &neg(&common_r),
+            &neg(&common_s),
+            &neg(&common_t),
+            &neg(&common_rs),
+            &neg(&common_rt),
+            &neg(&common_st),
+            &neg(&left_rst),
             edge0,
         );
         let f_right = cell_third_derivative_boundary_integrand(
-            right0, &common_r, &common_s, &common_t, &common_rs, &common_rt, &common_st,
-            &right_rst, edge0,
+            right0,
+            &neg(&common_r),
+            &neg(&common_s),
+            &neg(&common_t),
+            &neg(&common_rs),
+            &neg(&common_rt),
+            &neg(&common_st),
+            &neg(&right_rst),
+            edge0,
         );
 
         // The integrand DOES jump across this C² knot (the α₃ third-coefficient
