@@ -541,7 +541,14 @@ impl SaeManifoldTerm {
     /// derived strength is `0` (barrier off), and the disabled override `0.0` keeps
     /// the barrier a strict no-op through the same short-circuit.
     pub(crate) fn separation_barrier_strength(&self) -> f64 {
-        if let Some(over) = sae_separation_barrier_override() {
+        // #1777 — the PER-FIT override is the source of truth when set; the
+        // deprecated process-global override is only the fallback (used iff the
+        // per-fit field is unset), then the data-derived strength below. This
+        // isolates concurrent in-process fits: each term carries its own μ_C.
+        if let Some(over) = self
+            .separation_barrier_strength_override
+            .or_else(sae_separation_barrier_override)
+        {
             return over;
         }
         let demand = self.nominal_rank_demand();

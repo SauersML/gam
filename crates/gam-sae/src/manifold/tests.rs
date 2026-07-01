@@ -3171,6 +3171,227 @@ pub(crate) fn oos_linear_images_drive_collapsed_reconstruction() {
     );
 }
 
+/// #1777 helper: a single `d = 1` periodic atom whose latent coordinate has
+/// COLLAPSED to one point (all rows share the same `t`), so the hybrid split
+/// cannot fit a slope against its own codes and must take the collapse-rescue
+/// path (project the leave-this-atom-out residual onto its top output direction
+/// `v`). The `target` is an exact affine ramp along a fixed output direction so
+/// the rescued straight image reconstructs it at near-perfect EV.
+fn collapse_rescue_term_and_target() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
+    let n = 6usize;
+    // Collapsed coordinate: every row at the SAME t → zero coordinate spread.
+    let coords = Array2::<f64>::from_elem((n, 1), 0.3);
+    let (phi, jet) = periodic_basis(&coords);
+    let atom = SaeManifoldAtom::new(
+        "collapsed_circle",
+        SaeAtomBasisKind::Periodic,
+        1,
+        phi,
+        jet,
+        array![[0.1, -0.2], [0.05, 0.15], [-0.1, 0.08]],
+        Array2::<f64>::eye(3),
+    )
+    .unwrap()
+    .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+    // Softmax K=1 → gate ≡ 1 on every row (no IBP α to resolve).
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        Array2::<f64>::zeros((n, 1)),
+        vec![coords],
+        vec![LatentManifold::Circle { period: 1.0 }],
+        AssignmentMode::softmax(1.0),
+    )
+    .unwrap();
+    let term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+    // target_i = mu + s_i · d, an exact affine ramp along d = (0.6, 0.8).
+    let s = [-0.5, -0.3, -0.1, 0.1, 0.3, 0.5];
+    let mu = [0.2, -0.1];
+    let d = [0.6, 0.8];
+    let mut target = Array2::<f64>::zeros((n, 2));
+    for row in 0..n {
+        target[[row, 0]] = mu[0] + s[row] * d[0];
+        target[[row, 1]] = mu[1] + s[row] * d[1];
+    }
+    let rho = SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![array![0.0]]);
+    (term, target, rho)
+}
+
+/// #1777 GOAL 1 — a collapse-rescued atom must reconstruct the SAME rows
+/// identically whether treated as "train" (cached per-row codes) or re-encoded
+/// as "held-out" (the `v`-projection of the row's own leave-this-atom-out
+/// residual), and the `v`-projection OOS reconstruction must BEAT the collapsed
+/// (own-coordinate) fallback in explained variance.
+#[test]
+pub(crate) fn collapse_rescue_oos_v_projection_matches_train_and_beats_fallback() {
+    let (mut term, target, rho) = collapse_rescue_term_and_target();
+
+    // The joint fit drove this atom into the degenerate fixed point; the hybrid
+    // split must take the collapse-rescue branch and produce a linear image that
+    // carries the projection direction `v` (the #1777 serializable quantity).
+    let report = term
+        .compute_hybrid_split_report(&rho, Some(target.view()))
+        .expect("hybrid split computes")
+        .expect("the collapsed d=1 atom presents a rescue verdict");
+    let rescue_image = report
+        .verdicts
+        .iter()
+        .find_map(|v| v.linear_image.clone())
+        .expect("the rescued slot carries a linear image");
+    assert!(
+        rescue_image.is_collapse_rescued() && rescue_image.v.is_some(),
+        "a collapse-rescued image must carry a projection direction v"
+    );
+    assert!(
+        rescue_image.row_codes.is_some(),
+        "a collapse-rescued image must carry its train per-row codes"
+    );
+
+    // TRAIN reconstruction: the term with the report installed decodes the slot at
+    // its cached per-row codes (`row_codes`).
+    term.hybrid_split_report = Some(report);
+    let train_recon = term.fitted();
+
+    // HELD-OUT reconstruction: a fresh OOS term that knows only the decoder and
+    // the trained linear images (no in-fit report) recomputes each row's
+    // coordinate from ITS OWN residual projected onto `v`, via the target-aware
+    // path. Same target ⇒ same residual ⇒ same coordinate ⇒ same reconstruction.
+    let mut oos = term.clone();
+    oos.hybrid_split_report = None;
+    oos.set_hybrid_linear_images(vec![rescue_image.clone()])
+        .expect("trained rescue image attaches to the OOS term");
+    let oos_recon = oos
+        .try_fitted_target_aware(target.view(), Some(&rho))
+        .expect("target-aware OOS reconstruction assembles");
+
+    let max_gap = (&train_recon - &oos_recon)
+        .iter()
+        .fold(0.0_f64, |m, d| m.max(d.abs()));
+    assert!(
+        max_gap < 1e-10,
+        "train (cached codes) and OOS (v-projection) reconstructions must be the \
+         SAME model within tol; max gap {max_gap:e}"
+    );
+
+    // The v-projection OOS reconstruction must beat the collapsed-coordinate
+    // fallback (row_codes/v cleared ⇒ every row decodes at the atom's own, single,
+    // collapsed coordinate → a constant image that cannot track the residual ramp).
+    let fallback_image = crate::hybrid_split::AtomLinearImage {
+        atom_idx: rescue_image.atom_idx,
+        t_bar: rescue_image.t_bar,
+        b0: rescue_image.b0.clone(),
+        b1: rescue_image.b1.clone(),
+        row_codes: None,
+        v: None,
+    };
+    let mut fallback = term.clone();
+    fallback.hybrid_split_report = None;
+    fallback
+        .set_hybrid_linear_images(vec![fallback_image])
+        .expect("fallback image attaches");
+    let fallback_recon = fallback.fitted();
+
+    let ev_vproj = global_ev(target.view(), oos_recon.view());
+    let ev_fallback = global_ev(target.view(), fallback_recon.view());
+    assert!(
+        ev_vproj > ev_fallback + 0.1 && ev_vproj > 0.95,
+        "the v-projection OOS EV ({ev_vproj:.4}) must beat the collapsed-coordinate \
+         fallback ({ev_fallback:.4}) and recover the residual ramp"
+    );
+}
+
+/// #1777 GOAL 2 — the PER-FIT [`SaeFitConfig`] is the source of truth for the
+/// IBP-α and separation-barrier overrides: two terms carrying DIFFERENT configs
+/// produce correspondingly-different α / barrier strength, with NO process-global
+/// atomic touched (isolation), and the two terms do not leak into each other.
+#[test]
+pub(crate) fn per_fit_config_isolates_barrier_and_ibp_alpha() {
+    // Sanity: neither term sets a global override, so the global fallbacks stay
+    // unset and cannot be the source of the distinct effects observed below.
+    assert!(
+        crate::assignment::ibp_alpha_override().is_none(),
+        "test must not depend on a preset global IBP-α override"
+    );
+
+    let (mut term_a, _t_a, rho_a) = small_two_atom_ibp_term();
+    let (mut term_b, _t_b, rho_b) = small_two_atom_ibp_term();
+
+    // Distinct per-fit configs, applied via config ONLY (no global setters).
+    term_a.set_fit_config(SaeFitConfig {
+        separation_barrier_strength_override: Some(0.1),
+        ibp_alpha_override: Some(0.2),
+    });
+    term_b.set_fit_config(SaeFitConfig {
+        separation_barrier_strength_override: Some(3.0),
+        ibp_alpha_override: Some(5.0),
+    });
+
+    // Round-trips through the config accessor.
+    assert_eq!(term_a.fit_config().ibp_alpha_override, Some(0.2));
+    assert_eq!(
+        term_b.fit_config().separation_barrier_strength_override,
+        Some(3.0)
+    );
+
+    // IBP-α: the per-fit override is the resolved α (bypassing the mode schedule),
+    // and the two terms resolve DIFFERENT α without touching any global.
+    assert_eq!(term_a.assignment.resolved_ibp_alpha(&rho_a), Some(0.2));
+    assert_eq!(term_b.assignment.resolved_ibp_alpha(&rho_b), Some(5.0));
+
+    // Distinct α ⇒ distinct gates (the ordered geometric prior π_k differs).
+    let gates_a = term_a.assignment.assignments_for_rho(&rho_a).unwrap();
+    let gates_b = term_b.assignment.assignments_for_rho(&rho_b).unwrap();
+    let gate_gap = (&gates_a - &gates_b)
+        .iter()
+        .fold(0.0_f64, |m, d| m.max(d.abs()));
+    assert!(
+        gate_gap > 1e-6,
+        "distinct per-fit IBP-α overrides must produce distinct gates; gap {gate_gap:e}"
+    );
+
+    // Barrier strength (K=2, so the barrier is live): the per-fit override is the
+    // source of truth, distinct per term, with the global still unset.
+    assert_eq!(term_a.separation_barrier_strength(), 0.1);
+    assert_eq!(term_b.separation_barrier_strength(), 3.0);
+    assert!(
+        super::term::sae_separation_barrier_override().is_none(),
+        "the per-fit override must NOT write the process-global barrier atomic"
+    );
+
+    // Isolation: clearing term_a's config leaves term_b untouched, and term_a
+    // falls back to the mode's own α (the historical path).
+    term_a.set_fit_config(SaeFitConfig::default());
+    assert_eq!(term_a.assignment.resolved_ibp_alpha(&rho_a), Some(1.0)); // the mode's compiled α
+    assert_eq!(term_b.assignment.resolved_ibp_alpha(&rho_b), Some(5.0));
+}
+
+/// #1777 GOAL 3 — the assignment mode is the accurately-named `ThresholdGate`
+/// (a hard-sigmoid gate, NOT the literature JumpReLU magnitude activation); the
+/// legacy `jumprelu` constructor remains a back-compat alias producing the SAME
+/// variant and the SAME gates.
+#[test]
+pub(crate) fn threshold_gate_is_primary_jumprelu_is_backcompat_alias() {
+    let primary = AssignmentMode::threshold_gate(0.9, 0.15);
+    let legacy = AssignmentMode::jumprelu(0.9, 0.15);
+    assert!(matches!(primary, AssignmentMode::ThresholdGate { .. }));
+    assert!(
+        matches!(legacy, AssignmentMode::ThresholdGate { .. }),
+        "the legacy jumprelu constructor must yield the renamed ThresholdGate variant"
+    );
+
+    // Identical gates from either spelling.
+    let logits = array![[0.5, -0.2, 0.4], [0.05, 0.6, -0.3]];
+    let coords = vec![
+        array![[0.1], [0.2]],
+        array![[0.3], [0.4]],
+        array![[0.5], [0.6]],
+    ];
+    let build = |mode: AssignmentMode| {
+        SaeAssignment::from_blocks_with_mode(logits.clone(), coords.clone(), mode).unwrap()
+    };
+    let a_primary = build(primary).assignments();
+    let a_legacy = build(legacy).assignments();
+    assert_eq!(a_primary, a_legacy);
+}
+
 /// #976 Layer-1 guard 2: a single Newton application cannot move a gate
 /// logit by more than the gate-scale cap, however large the solver's raw
 /// delta. Softmax canonicalization shifts whole rows, so the invariant is
