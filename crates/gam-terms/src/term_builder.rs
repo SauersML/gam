@@ -2094,10 +2094,36 @@ pub fn build_smooth_basis(
             let periodic_axes = [true];
             let periods = parse_periods(options, &periodic_axes)?;
             let origins = parse_period_origins(options, &periodic_axes)?;
+            // Distinguish a *cyclic basis selector* (`bs='cc'`/`cp'`/`cyclic`,
+            // this whole arm) from a generic B-spline forced periodic by a
+            // `periodic=`/`boundary=` flag (the `ps`/`bspline` arm). Only the
+            // latter carries the sample-dependent off-by-ε seam that #1771's
+            // guard in `parse_periodic_domain_1d` requires an explicit period
+            // to avoid. A bare `s(x, bs='cc')` opts INTO mgcv's `bs="cc"`
+            // semantics — the wrap IS the observed data range — exactly like
+            // the tensor cc-margin fallback (`te(x, z, bs=c('cc','cc'))`). The
+            // cyclic arm was left routing through the now-strict helper when
+            // #1771 tightened it, so a bare cyclic smooth hard-errored with
+            // "periodic B-spline smooth requires an explicit period" even
+            // though its period is well-defined. Honor `period=`/`periods=`
+            // first, then the half-open `period_start`/`period_end` endpoint
+            // form, and only otherwise wrap at the observed `[min, max]` span.
+            let has_endpoint_decl = ["period_start", "start", "period_end", "end"]
+                .iter()
+                .any(|key| options.contains_key(*key));
             let (domain_start, period) = if let Some(p) = periods[0] {
                 (origins[0].unwrap_or(minv), p)
-            } else {
+            } else if has_endpoint_decl {
                 parse_periodic_domain_1d(options, minv, maxv)?
+            } else {
+                let span = maxv - minv;
+                if !(span.is_finite() && span > 0.0) {
+                    return Err(format!(
+                        "cyclic smooth requires a positive observed data range to derive \
+                         its period, got [{minv}, {maxv}]"
+                    ));
+                }
+                (origins[0].unwrap_or(minv), span)
             };
             Ok(SmoothBasisSpec::BSpline1D {
                 feature_col: c,
