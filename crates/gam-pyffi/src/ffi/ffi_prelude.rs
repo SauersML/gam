@@ -165,7 +165,9 @@ pub(crate) use gam::terms::dictionary::{
     linear_dictionary_transform,
 };
 
-pub(crate) use gam::terms::sae::sparse_dict::{SparseDictConfig, fit_sparse_dictionary};
+pub(crate) use gam::terms::sae::sparse_dict::{
+    SparseDictConfig, fit_sparse_dictionary, sparse_dictionary_transform,
+};
 
 pub(crate) use gam::terms::sae::manifold::{
     AssignmentMode, CylinderHarmonicEvaluator, DuchonCoordinateEvaluator, EuclideanPatchEvaluator,

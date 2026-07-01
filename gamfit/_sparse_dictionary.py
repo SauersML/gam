@@ -78,6 +78,29 @@ class SparseDictionaryFit:
             out += cod[:, [j]] * self.decoder[idx[:, j]]
         return np.ascontiguousarray(out)
 
+    def transform(self, X: Any, active: int | None = None) -> tuple[np.ndarray, np.ndarray]:
+        """Route held-out rows ``X`` (``M x P``) through the fitted decoder.
+
+        Returns ``(indices, codes)`` of shape ``M x active`` (sparse routing),
+        computed by the Rust core (``sparse_dictionary_transform``): the same
+        tiled top-``active`` routing + active-set ridge solve the trainer uses,
+        against the frozen decoder.
+        """
+        x = _as_2d_f32(X, "X")
+        if x.shape[1] != self.decoder.shape[1]:
+            raise ValueError(
+                f"X must have P={self.decoder.shape[1]} columns; got {x.shape[1]}"
+            )
+        s = self.active if active is None else int(active)
+        s = max(1, min(s, self.decoder.shape[0]))
+        indices, codes = rust_module().sparse_dictionary_transform_ffi(
+            np.ascontiguousarray(x, dtype=np.float32),
+            np.ascontiguousarray(self.decoder, dtype=np.float32),
+            int(s),
+        )
+        return np.ascontiguousarray(indices), np.ascontiguousarray(codes)
+
+
 def sparse_dictionary_fit(
     X: Any,
     K: int,

@@ -153,6 +153,45 @@ impl SparseDictFit {
     }
 }
 
+/// Out-of-sample encode: route held-out rows `x` (`M×P`, f32) against a frozen
+/// sparse dictionary `decoder` (`K×P`) and solve the per-row active-set ridge
+/// codes, returning fixed-width `(indices, codes)` each `M×active`. This is the
+/// OOS `transform` step for a fitted sparse dictionary — the tiled routing and
+/// the active-set least squares both live in the Rust core.
+pub fn sparse_dictionary_transform(
+    x: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
+    active: usize,
+    score_tile: usize,
+    code_ridge: f32,
+) -> Result<(Array2<u32>, Array2<f32>), String> {
+    let k = decoder.nrows();
+    if k == 0 {
+        return Err("sparse_dictionary_transform: dictionary has no atoms".to_string());
+    }
+    if x.ncols() != decoder.ncols() {
+        return Err(format!(
+            "sparse_dictionary_transform: X has P={} columns but the decoder has P={}",
+            x.ncols(),
+            decoder.ncols()
+        ));
+    }
+    let s = active.min(k).max(1);
+    let scorer = TileScorer::new(s, score_tile.max(1));
+    let routed = scorer.route_minibatch(x, decoder);
+    let m = x.nrows();
+    let mut indices = Array2::<u32>::zeros((m, s));
+    let mut codes = Array2::<f32>::zeros((m, s));
+    for (row_idx, active_pairs) in routed.iter().enumerate() {
+        let code = codes::solve_row_codes(x.row(row_idx), decoder, active_pairs, s, code_ridge);
+        for j in 0..s {
+            indices[[row_idx, j]] = code.indices[j];
+            codes[[row_idx, j]] = code.codes[j];
+        }
+    }
+    Ok((indices, codes))
+}
+
 /// Fit a fixed-`K` sparse minibatched linear dictionary to `x` (`N×P`).
 ///
 /// This is the public entry of the collapsed linear lane. It never forms a

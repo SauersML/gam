@@ -4344,6 +4344,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(linear_dictionary_fit, module)?)?;
     module.add_function(wrap_pyfunction!(linear_dictionary_transform_ffi, module)?)?;
     module.add_function(wrap_pyfunction!(sparse_dictionary_fit, module)?)?;
+    module.add_function(wrap_pyfunction!(sparse_dictionary_transform_ffi, module)?)?;
     module.add_function(wrap_pyfunction!(
         identifiable_factor_select_weights_array,
         module
@@ -4810,6 +4811,35 @@ fn sparse_dictionary_fit<'py>(
     out.set_item("converged", fit.converged)?;
     out.set_item("active", fit.active)?;
     Ok(out.unbind())
+}
+
+/// Out-of-sample encode: route held-out rows `x` (`M x P`, f32) through a fitted
+/// sparse dictionary `decoder` (`K x P`) via the Rust tiled router + active-set
+/// ridge solve, returning `(indices, codes)` each `M x active`.
+#[pyfunction(signature = (x, decoder, active, score_tile = 4096, code_ridge = 1.0e-6))]
+fn sparse_dictionary_transform_ffi<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray2<'py, f32>,
+    decoder: PyReadonlyArray2<'py, f32>,
+    active: usize,
+    score_tile: usize,
+    code_ridge: f32,
+) -> PyResult<(Py<PyArray2<u32>>, Py<PyArray2<f32>>)> {
+    let x_values = x.as_array().to_owned();
+    let decoder_values = decoder.as_array().to_owned();
+    let (indices, codes) = detach_py_result(py, "sparse_dictionary_transform", move || {
+        sparse_dictionary_transform(
+            x_values.view(),
+            decoder_values.view(),
+            active,
+            score_tile,
+            code_ridge,
+        )
+    })?;
+    Ok((
+        indices.into_pyarray(py).unbind(),
+        codes.into_pyarray(py).unbind(),
+    ))
 }
 
 fn inject_scalar_fisher_rao_weight(
