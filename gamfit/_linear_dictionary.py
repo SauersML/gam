@@ -56,30 +56,6 @@ class LinearDictionaryFit:
             recon = recon + self.mean
         return np.ascontiguousarray(recon)
 
-    def transform(self, X: Any, top_k: int | None = None) -> np.ndarray:
-        x = _as_2d_float(X, "X")
-        if x.shape[1] != self.atoms.shape[1]:
-            raise ValueError(
-                f"X must have p={self.atoms.shape[1]} columns; got {x.shape[1]}"
-            )
-        k_active = self.top_k if top_k is None else int(top_k)
-        if k_active < 1 or k_active > self.atoms.shape[0]:
-            raise ValueError(
-                f"top_k must be in [1, K={self.atoms.shape[0]}]; got {k_active}"
-            )
-        # Affine centered lane: encode the mean-removed input so the codes match
-        # the centered principal direction; `reconstruct` adds the mean back.
-        x_eff = x - self.mean if (self.centered and self.mean is not None) else x
-        scores = x_eff @ self.atoms.T
-        gram = self.atoms @ self.atoms.T
-        codes = np.zeros((x.shape[0], self.atoms.shape[0]), dtype=np.float64)
-        for row in range(x.shape[0]):
-            active = np.argpartition(np.abs(scores[row]), -k_active)[-k_active:]
-            system = gram[np.ix_(active, active)] + self.code_ridge * np.eye(k_active)
-            codes[row, active] = np.linalg.solve(system, scores[row, active])
-        return np.ascontiguousarray(codes)
-
-
 def linear_dictionary_fit(
     X: Any,
     K: int,
