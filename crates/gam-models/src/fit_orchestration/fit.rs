@@ -385,10 +385,16 @@ fn fit_inference_per_term_edf(
         .unwrap_or(0.0)
 }
 
-pub(crate) fn fit_standard_model(
-    request: StandardFitRequest<'_>,
-) -> Result<StandardFitResult, String> {
-    let mut fitted = if let Some(latent_coord) = request.latent_coord.as_ref() {
+/// Run the base standard fit (the three-way latent / coefficient-group /
+/// spatial dispatch) at an explicit [`FitOptions`], leaving the caller's
+/// `request.options` untouched. Split out of [`fit_standard_model`] so the
+/// #1762 near-separation Firth fallback can re-run the identical fit with the
+/// Jeffreys penalty enabled without duplicating the dispatch.
+fn fit_standard_base(
+    request: &StandardFitRequest<'_>,
+    options: &FitOptions,
+) -> Result<crate::fit_orchestration::drivers::FittedTermCollectionWithSpec, String> {
+    if let Some(latent_coord) = request.latent_coord.as_ref() {
         if !request.coefficient_groups.is_empty() || !request.penalty_block_gamma_priors.is_empty()
         {
             return Err("latent-coordinate standard fits do not support coefficient_groups or penalty_block_gamma_priors in the same request".to_string());
@@ -401,9 +407,9 @@ pub(crate) fn fit_standard_model(
             &request.spec,
             latent_coord,
             request.family.clone(),
-            &request.options,
+            options,
         )
-        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
     } else if !request.coefficient_groups.is_empty()
         || !request.penalty_block_gamma_priors.is_empty()
     {
@@ -416,19 +422,19 @@ pub(crate) fn fit_standard_model(
             &request.coefficient_groups,
             &request.penalty_block_gamma_priors,
             request.family.clone(),
-            &request.options,
+            options,
         )
         .map_err(|e| e.to_string())?;
         let resolvedspec =
             crate::fit_orchestration::drivers::freeze_term_collection_from_design(&request.spec, &fitted.design)
                 .map_err(|e| e.to_string())?;
-        crate::fit_orchestration::drivers::FittedTermCollectionWithSpec {
+        Ok(crate::fit_orchestration::drivers::FittedTermCollectionWithSpec {
             fit: fitted.fit,
             design: fitted.design,
             resolvedspec,
             adaptive_diagnostics: fitted.adaptive_diagnostics,
             kappa_timing: None,
-        }
+        })
     } else {
         fit_term_collectionwith_spatial_length_scale_optimization(
             request.data.view(),
@@ -437,10 +443,67 @@ pub(crate) fn fit_standard_model(
             request.offset.clone(),
             &request.spec,
             request.family.clone(),
-            &request.options,
+            options,
             &request.kappa_options,
         )
-        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+    }
+}
+
+pub(crate) fn fit_standard_model(
+    request: StandardFitRequest<'_>,
+) -> Result<StandardFitResult, String> {
+    let base = fit_standard_base(&request, &request.options);
+
+    // #1762: near-perfect linear separation drives the binomial-logit REML/ARC
+    // outer optimizer into a FLAT-VALLEY STALL. As the fit approaches
+    // separation the coefficients want to run to infinity, the PIRLS working
+    // weights w = μ̂(1−μ̂) collapse to ~0 over the saturated majority of rows,
+    // and the inner solve can no longer certify a minimum at the small-λ REML
+    // optimum — so the outer optimizer wanders the flat valley, burns its
+    // cost-stall escapes, and reports NON-CONVERGED (the ~117s / |g|≫tol
+    // pathology; separation can also surface as a hard PerfectSeparation /
+    // PirlsDidNotConverge error). Firth's Jeffreys-prior penalty is the textbook
+    // remedy: it bounds the coefficients and keeps the working weights from
+    // collapsing, so the inner solve is well conditioned at every λ and the
+    // outer optimizer certifies quickly. Retry ONCE with Firth when a plain
+    // binomial-logit fit fails to converge (non-converged OR errored), and adopt
+    // it only if it actually converges — otherwise the honest non-converged base
+    // fit (or its original error) is preserved. This is a no-op on the
+    // overwhelming majority of fits, which converge on the first pass.
+    let is_binomial_logit = matches!(request.family.response, ResponseFamily::Binomial)
+        && matches!(request.family.link, InverseLink::Standard(StandardLink::Logit));
+    let base_needs_rescue = match &base {
+        Ok(f) => !f.fit.outer_converged,
+        Err(_) => true,
+    };
+    let mut fitted = if is_binomial_logit
+        && !request.options.firth_bias_reduction
+        && base_needs_rescue
+    {
+        let mut firth_options = request.options.clone();
+        firth_options.firth_bias_reduction = true;
+        match fit_standard_base(&request, &firth_options) {
+            Ok(firth_fitted) if firth_fitted.fit.outer_converged => {
+                log::info!(
+                    "[#1762] binomial-logit fit did not converge (near-separation flat-valley \
+                     stall); Firth bias-reduction retry converged — adopting the Firth fit \
+                     (base edf {:.2}, Firth edf {:.2}).",
+                    base.as_ref().ok().map_or(f64::NAN, |f| f.fit.edf_total().unwrap_or(f64::NAN)),
+                    firth_fitted.fit.edf_total().unwrap_or(f64::NAN),
+                );
+                firth_fitted
+            }
+            _ => {
+                log::warn!(
+                    "[#1762] binomial-logit fit did not converge and the Firth retry did not \
+                     certify convergence; keeping the base result."
+                );
+                base?
+            }
+        }
+    } else {
+        base?
     };
 
     // #1788: if the outer REML stalled with railed λ, the assembled penalized
