@@ -423,9 +423,22 @@ pub(crate) fn penalty_subspace_trace_drifts_batched(
     kernel: &PenaltySubspaceTrace,
     drifts: &[DriftDerivResult],
 ) -> Vec<f64> {
-    let factor = penalty_subspace_trace_factor(kernel);
-    let cache = ProjectedFactorCache::default();
-    trace_logdet_drifts_projected_factor_batched(drifts, &factor, &cache)
+    drifts
+        .iter()
+        .map(|drift| {
+            match drift {
+                // Use the canonical reduced-kernel contraction for dense drifts
+                // so the projected logdet value and its trace derivative share
+                // exactly the same eigenbasis/inverse. This is essential for
+                // composite drifts `B_i + D_βH[β_i]`: evaluating the dense
+                // component through a separately factorized square root can
+                // make the projected logdet value and gradient describe
+                // slightly different kernels.
+                DriftDerivResult::Dense(matrix) => kernel.trace_projected_logdet(matrix),
+                DriftDerivResult::Operator(op) => kernel.trace_operator(op.as_ref()),
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn penalty_subspace_reduce_drifts_batched(
