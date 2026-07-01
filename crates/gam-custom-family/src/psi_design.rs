@@ -1171,9 +1171,21 @@ impl CustomFamilyPsiSecondDesignAction {
             }
             .into());
         }
-        let same_group = deriv_i.implicit_group_id.is_some()
-            && deriv_i.implicit_group_id == deriv_j.implicit_group_id;
-        if !same_group {
+        // The implicit second-design derivative `∂²X/∂ψ_i∂ψ_j` is nonzero when
+        // the two ψ axes act on the SAME implicit operator. That is either (a) an
+        // anisotropic group sharing one operator (`implicit_group_id` Some and
+        // equal — the Diag/Cross axis pair below), or (b) a plain ISOTROPIC
+        // single-length-scale block whose lone axis carries no group id
+        // (`implicit_group_id == None`): its self-second-derivative (the ψψ
+        // DIAGONAL, `implicit_axis == implicit_axis`) is still genuinely nonzero.
+        // The old `is_some()` guard silently returned `None` (⇒ a ZERO second
+        // design derivative) for that isotropic diagonal, dropping the entire
+        // `∂²X/∂ψ² = J̈` contribution from every ψψ joint-Hessian second
+        // derivative (gam#1607: the matern-length-scale outer-Hessian ψψ term).
+        let same_operator = deriv_i.implicit_group_id == deriv_j.implicit_group_id
+            && (deriv_i.implicit_group_id.is_some()
+                || deriv_i.implicit_axis == deriv_j.implicit_axis);
+        if !same_operator {
             return Ok(None);
         }
         let level = if deriv_i.implicit_axis == deriv_j.implicit_axis {
@@ -1907,9 +1919,14 @@ pub fn resolve_custom_family_x_psi_psi_map(
         && op.n_data() == n
         && op.p_out() == p
     {
-        let same_group = deriv_i.implicit_group_id.is_some()
-            && deriv_i.implicit_group_id == deriv_j.implicit_group_id;
-        if !same_group {
+        // Same-operator predicate — see `from_second_derivative` for the full
+        // rationale. Crucially, an ISOTROPIC single-axis block (`group_id ==
+        // None`) still has a nonzero ψψ DIAGONAL self-second-derivative, so the
+        // old `is_some()` guard must not short-circuit it to zero (gam#1607).
+        let same_operator = deriv_i.implicit_group_id == deriv_j.implicit_group_id
+            && (deriv_i.implicit_group_id.is_some()
+                || deriv_i.implicit_axis == deriv_j.implicit_axis);
+        if !same_operator {
             return Ok(PsiDesignMap::Zero {
                 nrows: row_range.end - row_range.start,
                 ncols: p,
