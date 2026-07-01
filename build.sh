@@ -369,9 +369,20 @@ is_test_run() {
 # perturbs target/ during the execute phase. GAM_NO_SPLIT=1 forces the old
 # everything-under-one-lock behavior.
 run_under_global_lock() {
+  # Single-flight compile gate. NOTE: extra "slots" would NOT buy parallelism —
+  # cargo self-serializes every build on the shared CARGO_TARGET_DIR (its own
+  # target-dir + package-cache locks), so two concurrent cargos on one target
+  # just block each other opaquely (and race the incremental cache). Real
+  # parallelism needs per-build target dirs = redundant recompiles = more CPU +
+  # disk, which we deliberately avoid. So the frugal design is: serialize heavy
+  # compiles here, and make redundant work FREE via the result cache (unchanged
+  # source → ~0s HIT, no lock) + request coalescing (identical concurrent calls
+  # share one turn). The abnormal multi-minute waits were never normal
+  # serialization — they were a dead/orphaned build still HOLDING this lock; that
+  # root cause is fixed by running cargo with the lock fd CLOSED (`9>&-` below),
+  # so only this shell holds fd 9 and flock frees it the instant the shell dies,
+  # plus `timeout -k` so a hung compile is SIGKILLed instead of holding forever.
   exec 9>"$LOCK"
-  # Tell the caller WHY it's blocked instead of hanging silently: try the lock
-  # non-blocking first, and only if another build/test holds it, say so and wait.
   if ! flock -n -x 9; then
     echo "[build.sh] waiting for the global build lock — another build/test is compiling (one cargo at a time on this box)…" >&2
     flock -x 9
@@ -385,9 +396,9 @@ run_under_global_lock() {
     # Split test run: compile-only under the global lock (`--no-run`). Otherwise
     # run the whole command under the global lock as before.
     if [[ -n "$split" ]]; then
-      t0=$(ep); timeout "$TIMEOUT" "${CMD[@]}" --no-run >"$LOG" 2>&1; code=$?; DUR=$(( $(ep)-t0 ))
+      t0=$(ep); timeout -k 30 "$TIMEOUT" "${CMD[@]}" --no-run >"$LOG" 2>&1 9>&-; code=$?; DUR=$(( $(ep)-t0 ))
     else
-      t0=$(ep); timeout "$TIMEOUT" "${CMD[@]}" >"$LOG" 2>&1; code=$?; DUR=$(( $(ep)-t0 ))
+      t0=$(ep); timeout -k 30 "$TIMEOUT" "${CMD[@]}" >"$LOG" 2>&1 9>&-; code=$?; DUR=$(( $(ep)-t0 ))
     fi
     if is_transient; then
       if (( attempt < max )); then
@@ -417,7 +428,7 @@ run_under_global_lock() {
     while :; do
       rattempt=$((rattempt+1))
       wait_for_memory
-      t0=$(ep); timeout "$TIMEOUT" "${CMD[@]}" >>"$LOG" 2>&1; code=$?; DUR=$(( DUR + $(ep)-t0 ))
+      t0=$(ep); timeout -k 30 "$TIMEOUT" "${CMD[@]}" >>"$LOG" 2>&1 8>&- 9>&-; code=$?; DUR=$(( DUR + $(ep)-t0 ))
       if is_transient && (( rattempt < max )); then
         is_incremental_corruption && rm -rf "$REPO/target/debug/incremental" 2>/dev/null || true
         sleep $(( rattempt * 12 )); continue
