@@ -2373,6 +2373,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         )?;
         if let Some(subsample) = options.outer_score_subsample.as_ref() {
             workspace.apply_outer_subsample(subsample.rows.as_ref());
+        } else {
+            workspace.clear_outer_subsample();
         }
         Ok(Some(Arc::new(workspace)))
     }
@@ -3182,6 +3184,10 @@ impl SurvivalLocationScaleExactNewtonJointHessianWorkspace {
             }
         }
         self.row_mask = Some(Arc::new(mask));
+    }
+
+    pub(crate) fn clear_outer_subsample(&mut self) {
+        self.row_mask = None;
     }
 }
 
