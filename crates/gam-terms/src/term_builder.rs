@@ -1307,20 +1307,28 @@ fn parse_tensor_periodic_axes(
     Ok(axes)
 }
 
-/// Reject endpoint boundary conditions (`clamped`/`anchored`) requested on a
-/// tensor-product margin.
+/// Validate the per-margin `boundary=`/`bc=` tokens on a tensor-product smooth.
 ///
-/// Tensor smooths support `bc=`/`boundary=` only for *periodic* margin
-/// selection (`periodic`/`cyclic`/`cc`), which [`parse_tensor_periodic_axes`]
-/// consumes. Endpoint boundary conditions are a 1-D B-spline structural
-/// reparameterization and are NOT implemented for tensor margins, but the
-/// periodic-axes parser silently ignores every non-periodic token — so
-/// `te(x, y, bc=['clamped', 'natural'])` used to be accepted as a no-op and
-/// fit an ordinary unconstrained tensor, dropping the user's clamp without a
-/// word. Surface it as a clean, explicit error instead of a silent drop. The
-/// inert margin tokens (`natural`/`free`/`none`/empty) and the periodic
-/// selectors are accepted; anything else is an unsupported endpoint BC.
-fn reject_tensor_endpoint_boundary_conditions(
+/// The tensor `boundary`/`bc` list selects, per margin, whether the margin
+/// *wraps* (a `periodic`/`cyclic`/`cc` token, consumed by
+/// [`parse_tensor_periodic_axes`]) or is an ordinary non-periodic margin. In the
+/// tensor DSL a *non-periodic* margin is spelled `clamped` — in the B-spline
+/// sense of a **clamped knot vector**, i.e. the standard open spline that is
+/// free at its two ends and does not wrap (exactly how the callers document it:
+/// "non-periodic / clamped … free at the two ends, no wrap"). It is therefore an
+/// inert marker here, not a zero-derivative endpoint reparameterization: a
+/// cylinder `te(theta, z, boundary=['periodic','clamped'], …)` is a cyclic θ
+/// margin tensor-producted with an ordinary open z margin, the direct analog of
+/// mgcv `te(bs=c("cc","ps"))` / `te(bs=c("cc","cr"))`.
+///
+/// The periodic selectors and the inert non-periodic markers
+/// (`clamped`/`open`/`natural`/`free`/`none`/empty) are accepted; anything else
+/// (e.g. a genuine `anchored` zero-value endpoint constraint, which has no
+/// ordinary-margin meaning in a tensor) is surfaced as a clean
+/// unsupported-feature error rather than silently dropped. Previously `clamped`
+/// itself was rejected, so the cylinder/torus mixed-boundary tensors — the exact
+/// construction the manifold quality suite builds — could not be fit at all.
+fn validate_tensor_boundary_tokens(
     options: &BTreeMap<String, String>,
     dim: usize,
 ) -> Result<(), String> {
@@ -1330,15 +1338,15 @@ fn reject_tensor_endpoint_boundary_conditions(
     let entries = parse_option_list(raw);
     for (axis, value) in entries.iter().enumerate() {
         let inert = matches!(
-            value.as_str(),
-            "natural" | "free" | "none" | "" | "periodic" | "cyclic" | "cc"
+            value.trim().to_ascii_lowercase().as_str(),
+            "clamped" | "open" | "natural" | "free" | "none" | "" | "periodic" | "cyclic" | "cc"
         );
         if !inert {
             return Err(TermBuilderError::unsupported_feature(format!(
-                "tensor smooth margin {axis} endpoint boundary condition '{value}' is not supported \
-                 (got bc/boundary={raw:?} on a {dim}-D tensor); tensor margins accept only periodic \
-                 selection (periodic/cyclic/cc) or the inert natural/free token. Apply clamped/anchored \
-                 endpoint boundary conditions with a 1-D s(x, bc=...) term instead."
+                "tensor smooth margin {axis} boundary token '{value}' is not supported \
+                 (got bc/boundary={raw:?} on a {dim}-D tensor); tensor margins accept the periodic \
+                 selectors (periodic/cyclic/cc) or the non-periodic markers (clamped/open/natural/free). \
+                 Apply anchored/zero-value endpoint constraints with a 1-D s(x, bc=...) term instead."
             ))
             .to_string());
         }
@@ -3153,7 +3161,7 @@ pub fn build_smooth_basis(
                 }
             }
             let periodic_axes = parse_tensor_periodic_axes(options, dim)?;
-            reject_tensor_endpoint_boundary_conditions(options, dim)?;
+            validate_tensor_boundary_tokens(options, dim)?;
             let periods_opt = parse_periods(options, &periodic_axes)?;
             let origins_opt = parse_period_origins(options, &periodic_axes)?;
             let degree = option_usize(options, "degree").unwrap_or(DEFAULT_BSPLINE_DEGREE);
