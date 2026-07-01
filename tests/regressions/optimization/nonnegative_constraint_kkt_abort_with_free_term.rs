@@ -108,8 +108,8 @@ fn read_means(path: &Path) -> Vec<f64> {
     let mean_idx = headers
         .iter()
         .position(|h| h == "mean")
-        .or_else(|| headers.iter().position(|h| h == "linear_predictor"))
-        .expect("predict csv has a mean / linear_predictor column");
+        .or_else(|| headers.iter().position(|h| h == "eta"))
+        .expect("predict csv has a mean / eta column");
     reader
         .records()
         .map(|rec| {

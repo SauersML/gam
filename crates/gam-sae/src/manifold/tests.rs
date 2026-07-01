@@ -4019,6 +4019,7 @@ pub(crate) fn sae_value_probe_refusal_classification_is_inner_only() {
     );
 }
 
+
 #[test]
 pub(crate) fn streaming_exact_reml_matches_full_batch_reml_small_sae() {
     let (term0, target, rho) = small_two_atom_periodic_term();

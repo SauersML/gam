@@ -169,6 +169,12 @@ mod tests_ibp_capacity_1784;
 mod tests_startup_validation_1782;
 
 #[cfg(test)]
+mod tests_schur_seed_refusal_1782;
+
+#[cfg(test)]
+mod tests_streaming_efs_cache_1026;
+
+#[cfg(test)]
 mod tests_row_jet_and_outer_objective_780;
 
 #[cfg(test)]

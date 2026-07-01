@@ -196,7 +196,12 @@ impl PenaltyBlocks {
 /// origin; this small positive floor lets a row that genuinely enters at time
 /// zero skip the entry contribution instead of evaluating `log H` at a
 /// degenerate point. Shared so every entry-detection site stays in lockstep.
-const ENTRY_AT_ORIGIN_THRESHOLD: f64 = 1e-8;
+///
+/// Public so the fit-orchestration layer can classify a dataset as genuinely
+/// left-truncated (`entry > threshold`) with the SAME origin convention the
+/// likelihood engines use, and pick the left-truncation-robust time anchor
+/// accordingly (issue #1790).
+pub const ENTRY_AT_ORIGIN_THRESHOLD: f64 = 1e-8;
 
 /// Fraction-to-the-boundary factor for the cause-specific feasible-step search.
 /// When a Newton direction would drive a row's derivative down to the

@@ -1,3 +1,71 @@
+## v0.3.141 — gam 0.3.141 / gamfit 0.1.243 (2026-07-01)
+
+Correctness patch on top of 0.3.140, focused on non-converged / near-degenerate
+fits that previously returned an unusable model or contradicted their own reported
+effective degrees of freedom, plus a matrix-free path that lets massive-K SAE
+dictionaries descend their hyperparameters instead of hard-erroring.
+
+### Fitting / inference correctness
+- **Non-converged estimated-scale fits return a USABLE model (#1789).** When the
+  #1788 EDF-collapse guard re-derives the dispersion `σ̂² = RSS/(n − edf)` after
+  correcting a collapsed effective d.f., it now rescales BOTH redundant covariance
+  representations — the top-level `covariance_conditional`/`covariance_corrected`
+  AND the paired inference-block `beta_covariance*`/SEs — atomically through the
+  new `UnifiedFitResult::rescale_estimated_dispersion`. Previously it scaled only
+  the inference block, so a non-converged multi-smooth gamma / `[INDEF-HESS]` fit
+  returned a `Model` that `fit` accepted but `predict`/`summary`/`save`→`load` all
+  rejected with "inference conditional covariance must match top-level
+  covariance_conditional". The rescale can no longer touch one copy and not the
+  other, and its `#[must_use]` σ̂ ratio is now reported in the non-convergence
+  warning instead of being discarded.
+- **Self-contradictory penalized EDF on stalled REML fits is guarded (#1788).** A
+  non-converged fit whose influence EDF collapsed to the intercept-only floor while
+  its fitted coefficients stayed wiggly now substitutes the per-term dimension
+  floor (so the reported EDF is not self-contradictory) and surfaces the
+  non-convergence rather than shipping a silent collapse.
+- **Firth fallback rescues binomial-logit REML near-separation stalls (#1762).** A
+  binomial-logit fit that stalls in the flat REML valley near quasi-separation is
+  retried once with Firth/Jeffreys bias reduction and adopts that result only if it
+  actually converges, otherwise preserving the honest base result/error.
+- **Log-link PIRLS enforces shape-constraint feasibility (#1786).** Monotone/convex
+  smooths on low-count Poisson (log-link) no longer silently ship coefficients that
+  violate the requested shape cone: an LM-damping retry precedes a
+  feasibility-restoring projection (curvature re-evaluated at the projected β), and
+  an infeasible fit errors rather than returning an invalid model.
+- **Massive-K SAE descends its hyperparameters matrix-free (#1026).** The EFS
+  (Fellner–Schall) lane now takes its ARD/smoothness traces off the streaming
+  arrow-factor cache returned by `reml_criterion_streaming_exact_with_cache`
+  instead of forcing the dense `O((K·M·p)²)` evidence cache that hard-errors at
+  large K (25.9 GB even at K=256). The `gamfit` facade admits an overcomplete
+  dictionary (`K ≥ n`) under ARD/smoothness-prior identifiability — a warning, not
+  a refusal.
+
+### CLI
+- **`gam predict --uncertainty` keeps the posterior-mean point for curved links
+  (#1787).** The point-estimate column is the response-scale posterior mean for
+  curved-link families, matching the Python FFI, instead of being swapped to the
+  linear-predictor mean when `--uncertainty` was requested.
+- **Prediction-CSV linear-predictor column header restored to `eta`.** The base,
+  Gaussian location-scale, survival, and survival-binary CSV writers had drifted
+  to emitting `linear_predictor`; the schema-lock contract (and every downstream
+  reader) expects `eta`. All four writers now emit `eta` again. The Python FFI
+  dict-key contract (`linear_predictor`) is a separate path and is unchanged.
+
+### Python / docs
+- **transformation-normal `predict` output documented as E[Y|x] (#1612)**, not a
+  z-score.
+- **Constrained-REML active-set recompute (gam-pyffi)** partitions rows by KKT
+  activity (`a·β ≤ b + tol`), not by feasibility, so interior rows are no longer
+  spuriously reported active.
+
+### Test / build hygiene
+- Restored the `gam-sae` test binary: an #1784 IBP-capacity refactor left an
+  `Option`/`Result` mismatch (compile break) and stale large-scale assertion
+  margins; margins are recalibrated to the RAM-safe scale and a regression test now
+  pins the #1026 streaming cache as a drop-in for the dense cache in the EFS lane.
+  A closed-form-criterion bench also no longer discards a `#[must_use]` solve
+  `Result`.
+
 ## v0.3.140 — gam 0.3.140 / gamfit 0.1.242 (2026-07-01)
 
 Release-integrity and correctness patch on top of 0.3.139. The headline is that
