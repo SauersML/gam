@@ -111,6 +111,25 @@ pub(crate) const CANDIDATE_ROUTING_MIN_ALIGNMENT: f64 = 0.5;
 /// unimodal atom all candidates converge to the same root, so K>1 is a no-op.
 pub(crate) const CERTIFIED_ROUTING_TOPK: usize = 4;
 
+/// Newton refinement convergence floor. Once a refinement step's length `‖δ‖`
+/// falls below this (relative to the coordinate scale `1 + ‖t‖`), the iterate has
+/// reached the certified root to f64 resolution: applying the step cannot move `t`
+/// meaningfully, and the remaining fixed-budget steps only re-accumulate round-off.
+/// Stopping there is STRICTLY more accurate than draining a fixed step budget on a
+/// well-conditioned quadratic Newton tail, and it removes that tail's per-step
+/// `evaluate` + `second_jet` cost (the dominant per-row encode work). The batched
+/// and per-row encodes share this rule, so they stay bit-identical.
+pub(crate) const NEWTON_REFINE_CONVERGED_EPS: f64 = 1.0e-12;
+
+/// Global-minimum short-circuit floor for top-K certified routing. The
+/// reconstruction error `‖x − z·m(t)‖` is bounded below by 0, so a certified
+/// candidate whose residual already sits at the ambient noise floor
+/// (`≤ this · (1 + ‖x‖)`) is provably the global optimum over the charts — no
+/// competing chart can reach a strictly lower residual. The remaining candidates'
+/// refinement is then skipped. Conservative (a genuine second basin of the same
+/// target reconstructs the SAME point, so returning the first is a valid encode).
+pub(crate) const CERTIFIED_GLOBAL_MIN_RECON_FLOOR: f64 = 1.0e-11;
+
 /// A chart region on an atom's latent coordinate: a center `t_c` plus a
 /// certified in-chart radius. Over the ball `‖t − t_c‖ ≤ radius` the jet sup
 /// bounds returned by [`BasisHessianLipschitz`] hold, so the Kantorovich
@@ -1137,6 +1156,16 @@ fn refine_certified_start(
     assert!(initial_cert.certified());
     let mut final_cert = initial_cert;
     for _ in 0..newton_steps {
+        // Convergence early-exit: the pending Newton step is below the coordinate
+        // ULP scale, so `t + δ == t` to f64 resolution — the certified root is
+        // reached and the remaining fixed-budget steps would only re-accumulate
+        // round-off. This is where the well-conditioned quadratic Newton tail's
+        // redundant `evaluate` + `second_jet` work is eliminated.
+        if delta.dot(&delta).sqrt()
+            <= NEWTON_REFINE_CONVERGED_EPS * (1.0 + t.dot(&t).sqrt())
+        {
+            break;
+        }
         t = &t + &delta;
         let (cert, next_delta) =
             row_certificate(atom, evaluator, t.view(), x, amplitude, lipschitz, ridge)?;
@@ -1629,7 +1658,7 @@ impl EncodeAtlas {
         // atom every candidate chart converges to the same root, so this is a no-op
         // (first-wins tie → the nearest chart), preserving the existing behavior.
         let candidates =
-            nearest_charts_topk(atom_atlas, x, atom, evaluator.as_ref(), CERTIFIED_ROUTING_TOPK);
+            nearest_charts_topk(atom_atlas, x, CERTIFIED_ROUTING_TOPK);
         if candidates.is_empty() {
             return Ok((
                 Array1::<f64>::zeros(d),
@@ -1671,6 +1700,14 @@ impl EncodeAtlas {
                     encode_reconstruction_error(atom, evaluator.as_ref(), coord.view(), x, amplitude);
                 if best.as_ref().map(|(_, _, e)| err < *e).unwrap_or(true) {
                     best = Some((coord, cert, err));
+                }
+                // Global-minimum short-circuit: reconstruction error ≥ 0, so a
+                // certified candidate already at the ambient noise floor is provably
+                // the global optimum over the remaining charts — stop refining them.
+                if let Some((_, _, e)) = best.as_ref() {
+                    if *e <= CERTIFIED_GLOBAL_MIN_RECON_FLOOR * (1.0 + x.dot(&x).sqrt()) {
+                        break;
+                    }
                 }
             }
         }
@@ -1741,7 +1778,7 @@ impl EncodeAtlas {
         let Some(evaluator) = atom.basis_evaluator.as_ref().cloned() else {
             return Ok(uncertified());
         };
-        let Some((chart_idx, _)) = nearest_chart(atom_atlas, x, atom, evaluator.as_ref()) else {
+        let Some((chart_idx, _)) = nearest_chart(atom_atlas, x) else {
             return Ok(uncertified());
         };
         let chart = &atom_atlas.charts[chart_idx];
@@ -2735,8 +2772,6 @@ pub(crate) fn center_amortized_jacobian(
 pub(crate) fn nearest_chart(
     atom_atlas: &AtomEncodeAtlas,
     x: ArrayView1<'_, f64>,
-    _atom: &SaeManifoldAtom,
-    _evaluator: &dyn SaeBasisEvaluator,
 ) -> Option<(usize, f64)> {
     if atom_atlas.charts.is_empty() {
         return None;
@@ -2771,8 +2806,6 @@ pub(crate) fn nearest_chart(
 pub(crate) fn nearest_charts_topk(
     atom_atlas: &AtomEncodeAtlas,
     x: ArrayView1<'_, f64>,
-    _atom: &SaeManifoldAtom,
-    _evaluator: &dyn SaeBasisEvaluator,
     k: usize,
 ) -> Vec<usize> {
     if atom_atlas.charts.is_empty() || k == 0 {
