@@ -3690,6 +3690,160 @@ pub(crate) fn planted_circle_seed_term(
     )
 }
 
+/// #1782 wide planted-circle activations: `X = cos(t)·B₀ + sin(t)·B₁ + noise`
+/// projected into a `p`-dim ambient (the issue's `600×32`, here small/thin). This
+/// is the wide/thin regime where a K>1 softmax seed's off-optimum inner state
+/// leaves a per-row `H_tt` block non-PD, exactly the geometry the issue reports.
+pub(crate) fn planted_circle_wide_data(n: usize, p: usize, sigma: f64) -> Array2<f64> {
+    let mut b0 = vec![0.0_f64; p];
+    let mut b1 = vec![0.0_f64; p];
+    for j in 0..p {
+        // Deterministic pseudo-random projection directions (issue uses standard
+        // normal columns; this reproduces the wide-ambient rank-2 circle image
+        // without an RNG dependency).
+        b0[j] = deterministic_circle_noise(j, 3);
+        b1[j] = deterministic_circle_noise(j, 7);
+    }
+    let mut z = Array2::<f64>::zeros((n, p));
+    for row in 0..n {
+        let theta = std::f64::consts::TAU * row as f64 / n as f64;
+        let (c, s) = (theta.cos(), theta.sin());
+        for j in 0..p {
+            z[[row, j]] = c * b0[j] + s * b1[j] + sigma * deterministic_circle_noise(row, j);
+        }
+    }
+    z
+}
+
+/// #1782 — build a DEGENERATE K>1 planted-circle term whose atoms all share
+/// atom-0's chart coords + decoder (maximally collinear atoms). This is the
+/// "two atoms specialize in opposite directions" regime the arrow-Schur code
+/// comments describe: at the seed the reduced joint Hessian's Schur complement
+/// is indefinite, so its Cholesky fails (`ArrowSchurError::SchurFactorFailed`).
+/// It reproduces the FFI cluster-refined K>1 seed geometry the issue hits with
+/// `jumprelu`/`softmax`, without pulling in the pyffi seed pipeline.
+fn planted_circle_collinear_atoms_term(
+    z: ArrayView2<'_, f64>,
+    k_atoms: usize,
+    seed_logit: f64,
+    mode: AssignmentMode,
+) -> SaeManifoldTerm {
+    let n = z.nrows();
+    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
+    let seed_coords =
+        sae_pca_seed_initial_coords(z, &[SaeAtomBasisKind::Periodic], &[1]).unwrap();
+    let coords = seed_coords.slice(s![0, .., 0..1]).to_owned();
+    let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+    let mut xtx = fast_ata(&phi);
+    for i in 0..xtx.nrows() {
+        xtx[[i, i]] += 1.0e-10;
+    }
+    let decoder = xtx
+        .cholesky(Side::Lower)
+        .unwrap()
+        .solve_mat(&fast_atb(&phi, &z.to_owned()));
+    let mut atoms = Vec::with_capacity(k_atoms);
+    let mut blocks = Vec::with_capacity(k_atoms);
+    let mut mans = Vec::with_capacity(k_atoms);
+    for _ in 0..k_atoms {
+        let ev = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
+        atoms.push(
+            SaeManifoldAtom::new(
+                "c",
+                SaeAtomBasisKind::Periodic,
+                1,
+                phi.clone(),
+                jet.clone(),
+                decoder.clone(),
+                Array2::<f64>::eye(3),
+            )
+            .unwrap()
+            .with_basis_evaluator(ev),
+        );
+        blocks.push(coords.clone());
+        mans.push(LatentManifold::Circle { period: 1.0 });
+    }
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        Array2::<f64>::from_elem((n, k_atoms), seed_logit),
+        blocks,
+        mans,
+        mode,
+    )
+    .unwrap();
+    SaeManifoldTerm::new(atoms, assignment).unwrap()
+}
+
+/// #1782 regression — a K>1 `jumprelu` (threshold-gate) fit whose seed leaves the
+/// reduced joint Hessian's Schur complement indefinite must NOT die in outer
+/// startup validation. Before the fix the arrow-Schur "Schur complement Cholesky
+/// failed: … not positive definite" refusal at the seed ρ — a genuine
+/// INFEASIBLE-ρ probe (the Laplace evidence log-det is undefined there) — was NOT
+/// classified as a recoverable value-probe refusal, so it propagated as a hard
+/// `RemlOptimizationFailed` on EVERY candidate seed →
+/// "no candidate seeds passed outer startup validation". The ibp_map seed lands
+/// in the PD region and converges on identical data. The fix classifies this
+/// non-PD Schur refusal as the same infeasible-ρ class as the per-row / cross-row
+/// non-PD refusals and routes it to +∞ / the infeasibility wall in every lane
+/// (`eval_cost`, the dense gradient `eval`, and the EFS `efs_step` seed probe).
+#[test]
+pub(crate) fn planted_circle_multi_atom_jumprelu_clears_startup_validation_1782() {
+    let n = 80usize;
+    let p = 32usize;
+    let k_atoms = 6usize;
+    let z = planted_circle_wide_data(n, p, 0.03);
+
+    // Precondition: the raw criterion at this seed genuinely refuses with the
+    // non-PD Schur complement (the #1782 infeasible-ρ probe), and the fix now
+    // classifies that refusal as recoverable. If this stops refusing, the test no
+    // longer exercises the bug — surface that loudly rather than passing vacuously.
+    let mut probe_term =
+        planted_circle_collinear_atoms_term(z.view(), k_atoms, 1.0, AssignmentMode::jumprelu(1.0, 0.0));
+    let probe_rho =
+        SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![array![0.0]; k_atoms]);
+    match probe_term.reml_criterion_with_cache(z.view(), &probe_rho, None, 8, 0.04, 1.0e-6, 1.0e-6)
+    {
+        Ok(_) => panic!(
+            "#1782 precondition: the collinear-jumprelu seed must trip the non-PD Schur \
+             refusal so this test exercises the bug; it unexpectedly returned a finite cost"
+        ),
+        Err(e) => assert!(
+            SaeManifoldOuterObjective::is_recoverable_value_probe_refusal(&e),
+            "#1782: the seed's non-PD Schur refusal must be classified as a recoverable \
+             infeasible-ρ probe (so the outer optimizer reads it as +∞ instead of \
+             rejecting the seed); got a non-recoverable classification for: {e}"
+        ),
+    }
+
+    // End-to-end: the full outer fit must NOT die in startup validation.
+    let mut objective = SaeManifoldOuterObjective::new(
+        planted_circle_collinear_atoms_term(z.view(), k_atoms, 1.0, AssignmentMode::jumprelu(1.0, 0.0)),
+        z.clone(),
+        None,
+        SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![array![0.0]; k_atoms]),
+        8,
+        0.04,
+        1.0e-6,
+        1.0e-6,
+    );
+    let init_rho_flat =
+        SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![array![0.0]; k_atoms]).to_flat();
+    let n_params = init_rho_flat.len();
+    let run = gam_solve::rho_optimizer::OuterProblem::new(n_params)
+        .with_initial_rho(init_rho_flat)
+        .with_max_iter(2)
+        .run(&mut objective, "SAE planted circle #1782 jumprelu");
+    if let Err(err) = &run {
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("no candidate seeds passed outer startup validation"),
+            "#1782: K>1 jumprelu fit must NOT die in outer startup validation on data \
+             the ibp_map path fits cleanly; got: {msg}"
+        );
+    }
+    run.map(|_| ())
+        .expect("#1782: K>1 jumprelu fit must clear outer startup validation");
+}
+
 #[test]
 pub(crate) fn planted_circle_noise_scale_sweep_reaches_high_ev_with_dimensionless_rho_seed() {
     for assignment_mode in [
