@@ -328,6 +328,7 @@ pub(crate) fn joint_penalty_subspace_trace_matches_projected_logdet_derivative()
         3,
         0.0,
         None,
+        None,
     )
     .expect("projection parts build");
     let kernel = kernel.expect("rank-deficient penalty still has an identified subspace");
@@ -353,6 +354,7 @@ pub(crate) fn joint_penalty_subspace_trace_matches_projected_logdet_derivative()
         3,
         0.0,
         None,
+        None,
     )
     .expect("plus projection parts build");
     let (logdet_minus, _) = joint_penalty_subspace_trace_parts(
@@ -361,6 +363,7 @@ pub(crate) fn joint_penalty_subspace_trace_matches_projected_logdet_derivative()
         &penalties,
         3,
         0.0,
+        None,
         None,
     )
     .expect("minus projection parts build");
@@ -508,6 +511,7 @@ pub(crate) fn joint_outer_gradient_uses_projected_trace_for_rank_deficient_penal
         3,
         0.0,
         None,
+        None,
     )
     .expect("projection kernel builds");
     let projected_trace = kernel
@@ -644,6 +648,7 @@ pub(crate) fn joint_outer_gradient_projected_trace_drops_joint_null() {
         std::slice::from_ref(&s_lambda),
         3,
         0.0,
+        None,
         None,
     )
     .expect("projection kernel builds");

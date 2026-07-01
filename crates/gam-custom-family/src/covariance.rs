@@ -1316,6 +1316,16 @@ pub(crate) fn joint_penalty_subspace_trace_parts(
     // kernel `(H+Sλ+H_Φ)⁺` match the Jeffreys-augmented operator the LAML score
     // runs on. `None` ⇒ byte-identical released projected logdet.
     scaled_jeffreys_hphi: Option<&Array2<f64>>,
+    // gam#1587/#561: the full-width centered joint penalty `Σ_t λ_t (M⊗S_t)`,
+    // already scaled into the same space as `s_lambdas`. For the multinomial
+    // family ALL smoothing rides on this joint penalty (the per-block
+    // `s_lambdas` are empty), so without folding it into both the structural-
+    // null rank gate AND the materialized `M = H + Sλ` the projected logdet
+    // collapses to `(0.0, None)` — the cost then drops `½log|H_pen|` entirely
+    // (correction `= −hop.logdet()`) while the analytic gradient keeps its
+    // `½tr(H⁻¹∂H)` derivative, desyncing value and gradient. `None` ⇒ no joint
+    // penalty (every per-block-only family) keeps this byte-identical.
+    joint_penalty: Option<&Array2<f64>>,
 ) -> Result<(f64, Option<PenaltySubspaceTrace>), String> {
     if total == 0 {
         return Ok((0.0, None));
@@ -1328,6 +1338,9 @@ pub(crate) fn joint_penalty_subspace_trace_parts(
     // the full spectral `M⁺`, built from M's own eigendecomposition below.)
     let mut s_lambda = Array2::<f64>::zeros((total, total));
     add_joint_penalty_to_matrix(&mut s_lambda, ranges, s_lambdas, 0.0, None);
+    if let Some(joint) = joint_penalty {
+        s_lambda += joint;
+    }
     let s_evals = s_lambda
         .eigh(Side::Lower)
         .map_err(|e| format!("joint penalty subspace eigendecomposition failed: {e}"))?
@@ -1394,6 +1407,9 @@ pub(crate) fn joint_penalty_subspace_trace_parts(
         materialize_joint_hessian_source(h_joint_unpen, total, "joint penalty subspace logdet")?;
     let mut m = m_dense;
     add_joint_penalty_to_matrix(&mut m, ranges, s_lambdas, hessian_diagonal_ridge, None);
+    if let Some(joint) = joint_penalty {
+        m += joint;
+    }
     if let Some(hphi) = scaled_jeffreys_hphi {
         m += hphi;
     }
