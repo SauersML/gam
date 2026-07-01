@@ -446,17 +446,13 @@ pub fn system_admits_fused_path(sys: &ArrowSchurSystem) -> bool {
 /// device. Test-only: production routes through the real NVRTC kernel
 /// (`FORWARD_KERNEL_SOURCE` / `plan_fused_launch`), never this emulation.
 #[cfg(test)]
-// On non-linux the consumers of these imports live in `#[cfg(target_os = "linux")]`
-// test bodies (CI runs the device-parity tests on linux), so the imports read as
-// unused under `-D warnings`. Keep the macOS lib-test binary building for everyone.
-#[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
 mod test_support {
-    use super::*;
-    // `ArrowSchurSystem` is only `use`d at module scope under `cfg(target_os =
-    // "linux")` (line ~49), so `use super::*` does NOT bring it into scope on
-    // macOS. The type itself is un-gated (arrow_schur/system.rs) and the CPU
-    // parity emulator below references it on every OS, so import it explicitly
-    // here to keep the macOS `--tests` build linking.
+    // `ArrowSchurSystem` is the only cross-module name this harness needs. Its
+    // module-scope `use` is `#[cfg(target_os = "linux")]`-gated (it feeds the
+    // linux-only fused dispatch), so it is not in scope on macOS. Import it
+    // directly — that keeps the `--tests` build linking on every platform and
+    // avoids a `use super::*` glob, which would import nothing else the harness
+    // uses and so read as an unused import under `-D warnings` on linux.
     use crate::arrow_schur::ArrowSchurSystem;
 
     /// Why the host-side CPU emulation of the fused Layer D + E pipeline declined.
