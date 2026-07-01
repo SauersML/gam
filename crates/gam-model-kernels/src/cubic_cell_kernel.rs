@@ -1979,6 +1979,52 @@ pub fn cell_second_derivative_boundary_integrand(
     (c_rs - eta * c_r * c_s) * (-cell.q(z)).exp() * INV_TWO_PI
 }
 
+/// Pointwise value of the cell third-derivative integrand
+/// `(∂³/∂r∂s∂t) exp(-q(z))/2π` at a single `z`, evaluated from the same
+/// `(r, s, t, rs, rt, st, rst)` coefficient polynomials that
+/// [`cell_third_derivative_from_moments`] integrates:
+///
+/// ```text
+/// F_rst(z) = (
+///     c_rst(z)
+///   - η(z)·(c_rs(z)c_t(z) + c_rt(z)c_s(z) + c_st(z)c_r(z))
+///   + (η(z)² - 1)·c_r(z)c_s(z)c_t(z)
+/// ) · exp(-q(z)) · 1/2π .
+/// ```
+///
+/// This is the boundary value for differentiating an already-third-order
+/// fixed-domain integral with respect to a moving edge. The sign convention is
+/// intentionally identical to [`cell_third_derivative_from_moments`]: callers
+/// must pass the coefficient slices in the convention of the integral they are
+/// differentiating. In particular, survival/probit paths that integrate the
+/// jointly negated cell and coefficient slices must evaluate this boundary
+/// integrand with the same joint negation; evaluating an un-negated boundary for
+/// a negated fixed-domain integral flips the sign of this odd-order integrand.
+#[inline]
+pub fn cell_third_derivative_boundary_integrand(
+    cell: DenestedCubicCell,
+    first_coefficients_r: &[f64],
+    first_coefficients_s: &[f64],
+    first_coefficients_t: &[f64],
+    second_coefficients_rs: &[f64],
+    second_coefficients_rt: &[f64],
+    second_coefficients_st: &[f64],
+    third_coefficients_rst: &[f64],
+    z: f64,
+) -> f64 {
+    let eta = cell.eta(z);
+    let c_r = poly_eval_at(first_coefficients_r, z);
+    let c_s = poly_eval_at(first_coefficients_s, z);
+    let c_t = poly_eval_at(first_coefficients_t, z);
+    let c_rs = poly_eval_at(second_coefficients_rs, z);
+    let c_rt = poly_eval_at(second_coefficients_rt, z);
+    let c_st = poly_eval_at(second_coefficients_st, z);
+    let c_rst = poly_eval_at(third_coefficients_rst, z);
+    let amplitude =
+        c_rst - eta * (c_rs * c_t + c_rt * c_s + c_st * c_r) + (eta * eta - 1.0) * c_r * c_s * c_t;
+    amplitude * (-cell.q(z)).exp() * INV_TWO_PI
+}
+
 /// Pointwise value of the density-weighted integrand `g(z)·exp(-q(z))/2π` at a
 /// single `z`, for an arbitrary integrand polynomial `g`.
 ///
@@ -4104,38 +4150,6 @@ pub fn evaluate_cell_moments_with_scratch<'a>(
 mod tests {
     use super::*;
     use gam_math::probability::normal_pdf;
-
-    /// Pointwise value of the cell THIRD-derivative integrand
-    /// `(d3/dr ds dt) exp(-q(z))/2pi` at a single `z`, evaluated from the SAME
-    /// `(r, s, t, rs, rt, st, rst)` coefficient polynomials the moment reduction
-    /// `cell_third_derivative_from_moments` integrates. Unlike the
-    /// second-derivative integrand this one does NOT cancel across an interior
-    /// C2-link knot crossing (the `c_rst` third coefficient jumps), so it backs
-    /// the C2-telescoping regression below. Test-only; no production consumer.
-    #[inline]
-    fn cell_third_derivative_boundary_integrand(
-        cell: DenestedCubicCell,
-        first_coefficients_r: &[f64],
-        first_coefficients_s: &[f64],
-        first_coefficients_t: &[f64],
-        second_coefficients_rs: &[f64],
-        second_coefficients_rt: &[f64],
-        second_coefficients_st: &[f64],
-        third_coefficients_rst: &[f64],
-        z: f64,
-    ) -> f64 {
-        let eta = cell.eta(z);
-        let c_r = poly_eval_at(first_coefficients_r, z);
-        let c_s = poly_eval_at(first_coefficients_s, z);
-        let c_t = poly_eval_at(first_coefficients_t, z);
-        let c_rs = poly_eval_at(second_coefficients_rs, z);
-        let c_rt = poly_eval_at(second_coefficients_rt, z);
-        let c_st = poly_eval_at(second_coefficients_st, z);
-        let c_rst = poly_eval_at(third_coefficients_rst, z);
-        let amplitude = c_rst - eta * (c_rs * c_t + c_rt * c_s + c_st * c_r)
-            + (eta * eta - 1.0) * c_r * c_s * c_t;
-        amplitude * (-cell.q(z)).exp() * INV_TWO_PI
-    }
 
     #[inline]
     pub(super) fn polynomial_value(coefficients: &[f64], z: f64) -> f64 {
