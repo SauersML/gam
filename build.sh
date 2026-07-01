@@ -23,7 +23,7 @@ S="$REPO/.buildd"; mkdir -p "$S"
 # recent" convenience copy (non-authoritative under concurrency). The reliable
 # channel is this script's STDOUT (the tail printed by finish()), which agents
 # capture directly. A trap removes the private log on exit.
-LOCK="$S/build.lock"; LOG="$S/run.$$.log"; LAST="$S/last.log"; HIST="$S/history.log"
+LOCK="$S/build.lock"; RUNLOCK="$S/run-exec.lock"; LOG="$S/run.$$.log"; LAST="$S/last.log"; HIST="$S/history.log"
 trap 'rm -f "$LOG" 2>/dev/null' EXIT
 # Prune stale private logs left by killed processes (best-effort).
 find "$S" -maxdepth 1 -name 'run.*.log' -mmin +120 -delete 2>/dev/null || true
@@ -271,17 +271,49 @@ is_incremental_corruption() {
   (( code == 0 )) && return 1
   grep -qiE 'failed to (create|move|open|read|write).*(query cache|dependency graph|incremental)|incremental compilation.*(No such file|cannot|failed)|query-cache\.bin|dep-graph\.(part\.)?bin' "$LOG" 2>/dev/null
 }
-# Run CMD under the global single-flight lock with a memory gate + auto-retry on
-# transient (OOM/timeout) failures. Holds the lock across retries so we stay next
-# in line. Sets globals code + DUR + $LOG.
+# Is CMD a test/bench RUN that compiles binaries and then EXECUTES them? (A pure
+# build-only invocation — `--no-run`/`--list` — is NOT: it never executes, so it
+# needs no execute phase.) Only these are split into compile+execute below.
+is_test_run() {
+  local a saw_run="" saw_norun=""
+  for a in "${CMD[@]}"; do
+    case "$a" in
+      test|nextest|bench) saw_run=1 ;;
+      --no-run|--list|list) saw_norun=1 ;;   # build-only / listing: never execute
+    esac
+  done
+  [[ -n "$saw_run" && -z "$saw_norun" ]]
+}
+
+# Run CMD with a memory gate + auto-retry on transient (OOM/timeout) failures.
+# Sets globals code + DUR + $LOG.
+#
+# The global lock ($LOCK) exists to serialize RAM-heavy COMPILATION — one rustc
+# storm at a time — NOT test EXECUTION. Holding it across a long test run (perf/
+# acceptance sweeps run 500-800s) needlessly blocks every other agent's compile.
+# So for a test RUN we split: compile the binaries under the global lock, RELEASE
+# it, then execute the already-built binaries under a SEPARATE single-flight
+# run-lock ($RUNLOCK). A compile and a test-execution can then overlap (bounded to
+# one of each — the small-RAM invariant still holds, since execution is far
+# lighter than codegen). Non-test requests are unchanged: whole run under $LOCK.
+# The incremental-corruption handler is the backstop if a concurrent compile
+# perturbs target/ during the execute phase. GAM_NO_SPLIT=1 forces the old
+# everything-under-one-lock behavior.
 run_under_global_lock() {
   exec 9>"$LOCK"; flock -x 9
   cd "$REPO" || exit 1
-  local attempt=0 max="${GAM_BUILD_RETRIES:-3}" t0
+  local attempt=0 max="${GAM_BUILD_RETRIES:-3}" t0 split=""
+  [[ -z "${GAM_NO_SPLIT:-}" ]] && is_test_run && split=1
   while :; do
     attempt=$((attempt+1))
     wait_for_memory
-    t0=$(ep); timeout "$TIMEOUT" "${CMD[@]}" >"$LOG" 2>&1; code=$?; DUR=$(( $(ep)-t0 ))
+    # Split test run: compile-only under the global lock (`--no-run`). Otherwise
+    # run the whole command under the global lock as before.
+    if [[ -n "$split" ]]; then
+      t0=$(ep); timeout "$TIMEOUT" "${CMD[@]}" --no-run >"$LOG" 2>&1; code=$?; DUR=$(( $(ep)-t0 ))
+    else
+      t0=$(ep); timeout "$TIMEOUT" "${CMD[@]}" >"$LOG" 2>&1; code=$?; DUR=$(( $(ep)-t0 ))
+    fi
     if is_transient; then
       if (( attempt < max )); then
         if is_incremental_corruption; then
@@ -296,6 +328,25 @@ run_under_global_lock() {
     fi
     break
   done
+  # EXECUTE phase (test run whose compile succeeded): release the global compile
+  # lock so other agents can compile, then run the built binaries under $RUNLOCK.
+  if [[ -n "$split" && "$code" == "0" ]]; then
+    flock -u 9
+    exec 8>"$RUNLOCK"; flock -x 8
+    local rattempt=0
+    while :; do
+      rattempt=$((rattempt+1))
+      wait_for_memory
+      t0=$(ep); timeout "$TIMEOUT" "${CMD[@]}" >>"$LOG" 2>&1; code=$?; DUR=$(( DUR + $(ep)-t0 ))
+      if is_transient && (( rattempt < max )); then
+        is_incremental_corruption && rm -rf "$REPO/target/debug/incremental" 2>/dev/null || true
+        sleep $(( rattempt * 12 )); continue
+      fi
+      break
+    done
+    flock -u 8
+    return
+  fi
   flock -u 9
 }
 # Atomically commit code+log to the cache (log first, code file is the commit marker).
