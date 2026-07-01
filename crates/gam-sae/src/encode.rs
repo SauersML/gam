@@ -2561,21 +2561,25 @@ impl EncodeAtlas {
             ));
         }
         let budget = auto_candidate_budget(atoms.len().max(1));
+        // SUBLINEAR routing for the SPEED-mode full forward — mirror
+        // `amortized_encode_with_index_fast`: take the LSH gather's best-aligned
+        // atom (O(budget) candidates) instead of route_exact's O(K) full-scan
+        // certification, keeping the whole fast encode→decode sublinear in K at
+        // K=32k. The gather's best is the exact argmax on the vast majority of rows;
+        // rare misses are caught by the fit-quality floor + downstream fallback.
         let mut groups: std::collections::HashMap<usize, Vec<usize>> =
             std::collections::HashMap::new();
         for row in 0..n {
-            // EXACT routing (#1777): global argmax of the routing score, not just
-            // the best LSH-gathered candidate.
-            let Some(route) = index.route_exact(sketch, targets.row(row), budget, true) else {
-                continue; // empty dictionary
+            let dir = targets.row(row);
+            let proposal = index.propose(sketch, dir, budget, true);
+            let Some(&best_atom) = proposal.proposed.first() else {
+                continue; // nothing gathered (empty dictionary / probe-dim mismatch)
             };
-            // Fit-quality floor (routing is already exact); NaN ⇒ zero-norm row.
-            if !route.alignment.is_finite()
-                || route.alignment < CANDIDATE_ROUTING_MIN_ALIGNMENT
-            {
+            let alignment = sketch.alignment(best_atom, dir);
+            if !alignment.is_finite() || alignment < CANDIDATE_ROUTING_MIN_ALIGNMENT {
                 continue;
             }
-            groups.entry(route.atom).or_default().push(row);
+            groups.entry(best_atom).or_default().push(row);
         }
 
         let mut recon = Array2::<f64>::zeros((n, p));
