@@ -309,10 +309,13 @@ impl<'a> DeflatedArrowSolver<'a> {
         let total_t = self.cache.delta_t_len();
         let mut out = Array1::<f64>::zeros(total_t);
         let rhs_beta = Array1::<f64>::zeros(self.cache.k);
+        // Reuse one unit-vector buffer: set/clear a single entry per index rather
+        // than allocating and zeroing a total_t-sized RHS on every iteration.
+        let mut rhs_t = Array1::<f64>::zeros(total_t);
         for idx in 0..total_t {
-            let mut rhs_t = Array1::<f64>::zeros(total_t);
             rhs_t[idx] = 1.0;
             let solved = self.solve(rhs_t.view(), rhs_beta.view())?;
+            rhs_t[idx] = 0.0;
             out[idx] = solved.t[idx];
         }
         Ok(out)
@@ -551,19 +554,32 @@ pub(crate) fn cholesky_factor_apply(
     vector: ArrayView1<'_, f64>,
 ) -> Array1<f64> {
     let n = factor.nrows();
+    // `factor` is a lower-triangular Cholesky factor `L` stored row-major; the
+    // represented action is `out = L (Lᵀ v)`.
+    //
+    // Phase 1 — `lt_v = Lᵀ v`. The natural inner-product form reads
+    // `factor[[col, row]]` down a COLUMN (stride `n`), which thrashes cache for
+    // the K×K Schur factor (K up to 32 000). Instead iterate over ROWS `j` of
+    // `L` — contiguous in memory — and scatter `L[j, 0..=j]·v[j]` into `lt_v`,
+    // touching each `L` row exactly once in row-major order.
     let mut lt_v = Array1::<f64>::zeros(n);
-    for row in 0..n {
-        let mut acc = 0.0_f64;
-        for col in row..n {
-            acc += factor[[col, row]] * vector[col];
+    for j in 0..n {
+        let vj = vector[j];
+        if vj == 0.0 {
+            continue;
         }
-        lt_v[row] = acc;
+        // Row `j` of `L` is traversed in its own memory order (contiguous for the
+        // row-major factors we build); the compiler can vectorize the axpy.
+        for (i, &lji) in factor.row(j).iter().enumerate().take(j + 1) {
+            lt_v[i] += lji * vj;
+        }
     }
+    // Phase 2 — `out = L lt_v`. Already contiguous row-major (`L[row, 0..=row]`).
     let mut out = Array1::<f64>::zeros(n);
     for row in 0..n {
         let mut acc = 0.0_f64;
-        for col in 0..=row {
-            acc += factor[[row, col]] * lt_v[col];
+        for (col, &lrc) in factor.row(row).iter().enumerate().take(row + 1) {
+            acc += lrc * lt_v[col];
         }
         out[row] = acc;
     }
@@ -644,8 +660,10 @@ where
     let mut z = solver
         .solve(r.t.view(), r.beta.view())
         .map_err(|err| format!("solve_b_preconditioned_cg: B preconditioner: {err}"))?;
-    let mut p = z.clone();
+    // p_0 = z_0. Compute rz from z FIRST, then MOVE z into p (no clone) — z is
+    // re-bound at the top of every loop iteration before it is read again.
     let mut rz = sae_inner(&r, &z);
+    let mut p = z;
 
     let rhs_norm = sae_norm(rhs).max(1.0);
     let max_iters = (x.t.len() + x.beta.len()).clamp(8, 256);

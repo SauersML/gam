@@ -7652,6 +7652,12 @@ impl SaeManifoldTerm {
                 }
             })
             .collect();
+        // Hoisted RHS scratch reused across every (row, col) solve. Setting and
+        // clearing a SINGLE entry per column is O(1); a fresh
+        // `Array1::zeros(total_t)` memsets total_t≈n·q slots per inner iteration
+        // (O(n) per col ⇒ O(n²) redundant zeroing across the block build).
+        let mut rhs_t_scratch = Array1::<f64>::zeros(total_t);
+        let rhs_beta_zero = Array1::<f64>::zeros(cache.k);
         for row in 0..n {
             let row_base = cache.row_offsets[row];
             let q = cache.row_dims[row];
@@ -7670,12 +7676,11 @@ impl SaeManifoldTerm {
             } else {
                 let mut m = Array2::<f64>::zeros((q, q));
                 for col in 0..q {
-                    let mut rhs_t = Array1::<f64>::zeros(total_t);
-                    let rhs_beta = Array1::<f64>::zeros(cache.k);
-                    rhs_t[row_base + col] = 1.0;
-                    let solved = solver.solve(rhs_t.view(), rhs_beta.view()).map_err(|err| {
-                        ArrowSchurError::SchurFactorFailed { reason: err }
-                    })?;
+                    rhs_t_scratch[row_base + col] = 1.0;
+                    let solved = solver
+                        .solve(rhs_t_scratch.view(), rhs_beta_zero.view())
+                        .map_err(|err| ArrowSchurError::SchurFactorFailed { reason: err })?;
+                    rhs_t_scratch[row_base + col] = 0.0;
                     for r in 0..q {
                         m[[r, col]] = solved.t[row_base + r];
                     }
@@ -7843,6 +7848,9 @@ impl SaeManifoldTerm {
         let k = cache.k;
         let mut per_atom = vec![0.0_f64; self.atoms.len()];
         let mut m_col = Array1::<f64>::zeros(k);
+        // The t-RHS is identically zero for every β-only smoothness solve; build
+        // it once instead of re-zeroing a delta_t_len()-sized buffer per column.
+        let zero_t = Array1::<f64>::zeros(cache.delta_t_len());
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
             let s = &atom.smooth_penalty;
             let m = atom.basis_size();
@@ -7859,7 +7867,6 @@ impl SaeManifoldTerm {
                         let s_nu_mu = 0.5 * (s[[nu, mu]] + s[[mu, nu]]);
                         m_col[off + nu * r + oc] = lambda * s_nu_mu;
                     }
-                    let zero_t = Array1::<f64>::zeros(cache.delta_t_len());
                     let z = solver.solve(zero_t.view(), m_col.view())?.beta;
                     trace += z[col];
                 }
@@ -8027,6 +8034,10 @@ impl SaeManifoldTerm {
             d_k * j * j
         };
         let mut trace = 0.0_f64;
+        // Hoisted RHS scratch for the gauge/Woodbury per-row solve fallback:
+        // single-entry set/clear instead of a per-column total_t-sized zeroing.
+        let mut rhs_t_scratch = Array1::<f64>::zeros(total_t);
+        let rhs_beta_zero = Array1::<f64>::zeros(cache.k);
         for row in 0..self.n_obs() {
             let row_base = cache.row_offsets[row];
             let assignment_base = row * k_atoms;
@@ -8072,14 +8083,15 @@ impl SaeManifoldTerm {
                 } else {
                     let mut inv_vv = Array2::<f64>::zeros((q, q));
                     for col in 0..q {
-                        let mut rhs_t = Array1::<f64>::zeros(total_t);
-                        let rhs_beta = Array1::<f64>::zeros(cache.k);
-                        rhs_t[row_base + col] = 1.0;
-                        let solved = solver.solve(rhs_t.view(), rhs_beta.view()).map_err(|err| {
-                            format!(
-                                "assignment_log_strength_hessian_trace: selected inverse: {err}"
-                            )
-                        })?;
+                        rhs_t_scratch[row_base + col] = 1.0;
+                        let solved = solver
+                            .solve(rhs_t_scratch.view(), rhs_beta_zero.view())
+                            .map_err(|err| {
+                                format!(
+                                    "assignment_log_strength_hessian_trace: selected inverse: {err}"
+                                )
+                            })?;
+                        rhs_t_scratch[row_base + col] = 0.0;
                         for r in 0..q {
                             inv_vv[[r, col]] = solved.t[row_base + r];
                         }
@@ -8153,6 +8165,11 @@ impl SaeManifoldTerm {
                 }
             }
             let mut cross = 0.0_f64;
+            // Hoisted RHS scratch: each active site sets exactly one t-slot, so
+            // set-then-clear that single entry rather than allocating and zeroing
+            // a total_t-sized vector per (column, site).
+            let mut rhs_t_scratch = Array1::<f64>::zeros(total_t);
+            let rhs_beta_zero = Array1::<f64>::zeros(cache.k);
             for k in 0..k_atoms {
                 let d_k = if learnable_alpha {
                     channels.cross_row_d_logalpha[k]
@@ -8168,12 +8185,13 @@ impl SaeManifoldTerm {
                         continue;
                     }
                     // (H⁻¹) column at row `i`'s active logit-`k` slot.
-                    let mut rhs_t = Array1::<f64>::zeros(total_t);
-                    let rhs_beta = Array1::<f64>::zeros(cache.k);
-                    rhs_t[t_i] = 1.0;
-                    let solved = solver.solve(rhs_t.view(), rhs_beta.view()).map_err(|err| {
-                        format!("assignment_log_strength_hessian_trace: {err}")
-                    })?;
+                    rhs_t_scratch[t_i] = 1.0;
+                    let solved = solver
+                        .solve(rhs_t_scratch.view(), rhs_beta_zero.view())
+                        .map_err(|err| {
+                            format!("assignment_log_strength_hessian_trace: {err}")
+                        })?;
+                    rhs_t_scratch[t_i] = 0.0;
                     for &(j, t_j) in &col_sites[k] {
                         if j == i {
                             continue;
@@ -8407,12 +8425,13 @@ impl SaeManifoldTerm {
         } else {
             let mut beta_inv = Array2::<f64>::zeros((cache.k, cache.k));
             let rhs_t = Array1::<f64>::zeros(total_t);
+            let mut rhs_beta = Array1::<f64>::zeros(cache.k);
             for col in 0..cache.k {
-                let mut rhs_beta = Array1::<f64>::zeros(cache.k);
                 rhs_beta[col] = 1.0;
                 let solved = solver.solve(rhs_t.view(), rhs_beta.view()).map_err(|err| {
                     format!("learnable_ibp_data_logdet_alpha_trace: beta inverse: {err}")
                 })?;
+                rhs_beta[col] = 0.0;
                 for r in 0..cache.k {
                     beta_inv[[r, col]] = solved.beta[r];
                 }
@@ -8431,6 +8450,9 @@ impl SaeManifoldTerm {
         let mut jet_window: std::collections::VecDeque<SaeRowJets> =
             std::collections::VecDeque::new();
         let mut jet_window_next = 0usize;
+        // Hoisted RHS scratch for the gauge/Woodbury per-row solve fallback.
+        let mut rhs_t_scratch = Array1::<f64>::zeros(total_t);
+        let rhs_beta_zero = Array1::<f64>::zeros(cache.k);
         for row in 0..n {
             let q = cache.row_dims[row];
             let base = cache.row_offsets[row];
@@ -8472,12 +8494,13 @@ impl SaeManifoldTerm {
                 let mut inv_vv = Array2::<f64>::zeros((q, q));
                 let mut inv_vbeta = Array2::<f64>::zeros((q, cache.k));
                 for col in 0..q {
-                    let mut rhs_t = Array1::<f64>::zeros(total_t);
-                    let rhs_beta = Array1::<f64>::zeros(cache.k);
-                    rhs_t[base + col] = 1.0;
-                    let solved = solver.solve(rhs_t.view(), rhs_beta.view()).map_err(|err| {
-                        format!("learnable_ibp_data_logdet_alpha_trace: selected inverse: {err}")
-                    })?;
+                    rhs_t_scratch[base + col] = 1.0;
+                    let solved = solver
+                        .solve(rhs_t_scratch.view(), rhs_beta_zero.view())
+                        .map_err(|err| {
+                            format!("learnable_ibp_data_logdet_alpha_trace: selected inverse: {err}")
+                        })?;
+                    rhs_t_scratch[base + col] = 0.0;
                     for r in 0..q {
                         inv_vv[[r, col]] = solved.t[base + r];
                     }
@@ -9072,12 +9095,13 @@ impl SaeManifoldTerm {
         } else {
             let mut beta_inv = Array2::<f64>::zeros((cache.k, cache.k));
             let rhs_t = Array1::<f64>::zeros(total_t);
+            let mut rhs_beta = Array1::<f64>::zeros(cache.k);
             for col in 0..cache.k {
-                let mut rhs_beta = Array1::<f64>::zeros(cache.k);
                 rhs_beta[col] = 1.0;
                 let solved = solver.solve(rhs_t.view(), rhs_beta.view()).map_err(|err| {
                     format!("logdet_theta_adjoint: beta selected inverse solve: {err}")
                 })?;
+                rhs_beta[col] = 0.0;
                 for row in 0..cache.k {
                     beta_inv[[row, col]] = solved.beta[row];
                 }
@@ -9137,6 +9161,9 @@ impl SaeManifoldTerm {
         let mut jet_window: std::collections::VecDeque<SaeRowJets> =
             std::collections::VecDeque::new();
         let mut jet_window_next = 0usize;
+        // Hoisted RHS scratch for the gauge/Woodbury per-row solve fallback.
+        let mut rhs_t_scratch = Array1::<f64>::zeros(total_t);
+        let rhs_beta_zero = Array1::<f64>::zeros(cache.k);
         for row in 0..n {
             let q = cache.row_dims[row];
             let base = cache.row_offsets[row];
@@ -9167,12 +9194,13 @@ impl SaeManifoldTerm {
                 let mut inv_vv = Array2::<f64>::zeros((q, q));
                 let mut inv_vbeta = Array2::<f64>::zeros((q, cache.k));
                 for col in 0..q {
-                    let mut rhs_t = Array1::<f64>::zeros(total_t);
-                    let rhs_beta = Array1::<f64>::zeros(cache.k);
-                    rhs_t[base + col] = 1.0;
-                    let solved = solver.solve(rhs_t.view(), rhs_beta.view()).map_err(|err| {
-                        format!("logdet_theta_adjoint: selected inverse solve: {err}")
-                    })?;
+                    rhs_t_scratch[base + col] = 1.0;
+                    let solved = solver
+                        .solve(rhs_t_scratch.view(), rhs_beta_zero.view())
+                        .map_err(|err| {
+                            format!("logdet_theta_adjoint: selected inverse solve: {err}")
+                        })?;
+                    rhs_t_scratch[base + col] = 0.0;
                     for r in 0..q {
                         inv_vv[[r, col]] = solved.t[base + r];
                     }
@@ -9422,6 +9450,10 @@ impl SaeManifoldTerm {
             for &(row, atom, t_index, inv_diag) in &ibp_logit_sites {
                 col_sites[atom].push((row, t_index, inv_diag));
             }
+            // Hoisted RHS scratch: fill only this column's active slots, solve,
+            // then clear exactly those slots — no per-column total_t zeroing.
+            let mut rhs_t_scratch = Array1::<f64>::zeros(total_t);
+            let rhs_beta_zero = Array1::<f64>::zeros(cache.k);
             for atom in 0..k_atoms {
                 let d_k = channels.cross_row_d[atom];
                 let dd_k = channels.cross_row_dd[atom];
@@ -9429,14 +9461,18 @@ impl SaeManifoldTerm {
                     continue;
                 }
                 // u_k as a full t-RHS: J at each active logit-k slot.
-                let mut rhs_t = Array1::<f64>::zeros(total_t);
-                let rhs_beta = Array1::<f64>::zeros(cache.k);
                 for &(row, t_index, _g) in &col_sites[atom] {
-                    rhs_t[t_index] = channels.z_jac[row * k_atoms + atom];
+                    rhs_t_scratch[t_index] = channels.z_jac[row * k_atoms + atom];
                 }
-                let x_k = solver.solve(rhs_t.view(), rhs_beta.view()).map_err(|err| {
-                    format!("logdet_theta_adjoint: IBP cross-row Woodbury solve: {err}")
-                })?;
+                let x_k = solver
+                    .solve(rhs_t_scratch.view(), rhs_beta_zero.view())
+                    .map_err(|err| {
+                        format!("logdet_theta_adjoint: IBP cross-row Woodbury solve: {err}")
+                    })?;
+                // Clear this column's active slots for the next atom's RHS.
+                for &(_row, t_index, _g) in &col_sites[atom] {
+                    rhs_t_scratch[t_index] = 0.0;
+                }
                 // (JᵀH⁻¹J)_k = u_kᵀ x_k, and the diagonal `Σ_i G_ii·J_ik²` that the
                 // `m_channel` pass already counted (subtract it from term A so this
                 // pass holds only the off-diagonal `i ≠ j` remainder).
