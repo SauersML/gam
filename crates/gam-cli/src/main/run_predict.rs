@@ -160,7 +160,44 @@ pub(crate) fn run_predict_unified(
     };
 
     // --- Compute prediction ---
-    let (eta, mean, se_opt, mean_lo, mean_hi) = if args.uncertainty {
+    let (eta, mean, se_opt, mean_lo, mean_hi) = if args.uncertainty && nonlinear {
+        // Curved inverse link + interval: the point prediction is a property of
+        // the model + inputs, never of whether an interval was requested (#398,
+        // #1787). The default (no-interval) path reports the posterior mean
+        // `E[link⁻¹(X·β)]`, so `--uncertainty` must add SE/bounds *on top of the
+        // same posterior-mean point*, not switch to the plug-in `link⁻¹(η̂)`.
+        // Mirror the Python FFI `(interval, uses_posterior_mean = true)` arm and
+        // the sibling `PosteriorMean` arm below: route through
+        // `predict_posterior_mean` with the requested confidence level, threading
+        // `covariance_mode` so the credible band keeps smoothing-parameter
+        // uncertainty (#812).
+        let pm_options = PosteriorMeanOptions {
+            confidence_level: Some(args.level),
+            covariance_mode: infer_covariance_mode(args.covariance_mode),
+            include_observation_interval: false,
+        };
+        let pm = predictor
+            .predict_posterior_mean(pred_input, &fit_for_predict, &pm_options)
+            .map_err(|e| format!("predict_posterior_mean failed: {e}"))?;
+        (
+            pm.eta,
+            pm.mean,
+            // Response-scale `std_error` (#1536): the posterior-mean path
+            // populates `mean_standard_error` once a confidence level is
+            // requested (it is here); fall back to the link-scale SE only for
+            // the unreachable point-only case.
+            Some(
+                pm.mean_standard_error
+                    .clone()
+                    .unwrap_or(pm.eta_standard_error),
+            ),
+            pm.mean_lower,
+            pm.mean_upper,
+        )
+    } else if args.uncertainty {
+        // Linear/identity link: plug-in `link⁻¹(η̂)` equals the posterior mean,
+        // so the full-uncertainty (`TransformEta`) path reports the same point as
+        // the default arm while adding the SE/band columns.
         let options = PredictUncertaintyOptions {
             confidence_level: args.level,
             covariance_mode: infer_covariance_mode(args.covariance_mode),

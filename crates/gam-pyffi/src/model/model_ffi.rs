@@ -4996,7 +4996,16 @@ fn gaussian_reml_fit_with_constraints_forward<'py>(
         .map(|inf| inf.edf_total)
         .unwrap_or(0.0);
 
-    // Recompute active set from final β: row i is active iff a_i·β >= b_i - tol.
+    // Recompute the active set from the final β. Constraints are `A·β ≥ b`
+    // (the convention in `active_set.rs`), so a row is *active* (binding)
+    // exactly when its slack `a_i·β − b_i` sits at or below the boundary
+    // tolerance — `a_i·β ≤ b_i + tol`. A row with a large positive slack is
+    // strictly interior and must NOT be reported active. The earlier test
+    // `a_i·β ≥ b_i − tol` was the *feasibility* predicate, not the activity
+    // one: it holds for every feasible row (slack ≥ 0 ≥ −tol), so it flagged
+    // even a never-binding row such as the degenerate `0·β ≥ −1` (slack 1) as
+    // active, which then corrupted the envelope-theorem backward that consumes
+    // this set (it restricts the KKT face to these rows).
     let active_indices: Vec<u64> = match constraints_opt.as_ref() {
         Some(c) if c.a.nrows() > 0 => {
             let beta_scale = beta.iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1.0);
@@ -5009,7 +5018,7 @@ fn gaussian_reml_fit_with_constraints_forward<'py>(
                         .fold(0.0_f64, |m, &v| m.max(v.abs()))
                         .max(1.0);
                 let tol = 1e-8 * row_scale * beta_scale.max(c.b[i].abs().max(1.0));
-                if ab[i] >= c.b[i] - tol {
+                if ab[i] <= c.b[i] + tol {
                     out.push(i as u64);
                 }
             }

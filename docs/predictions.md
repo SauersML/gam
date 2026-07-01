@@ -43,7 +43,7 @@ it also exposes prediction columns as attributes such as `pred.mean`,
 | --- | --- | --- |
 | Gaussian, binomial, Poisson, negative-binomial, Gamma, Beta, Tweedie | 1-D `numpy.ndarray` | Response-scale point predictions. Table form has `linear_predictor`, `mean`; adds `std_error`, `mean_lower`, `mean_upper` when `interval` is set. |
 | Gaussian / binomial / dispersion location-scale | 1-D `numpy.ndarray` | Response-scale point predictions. Table form has `linear_predictor`, `mean`, `noise_scale`; adds `std_error`, `mean_lower`, `mean_upper` when `interval` is set. |
-| Transformation-normal | 1-D `numpy.ndarray` | Per-row conditional z-scores. |
+| Transformation-normal | 1-D `numpy.ndarray` | Per-row response-scale conditional mean `E[Y|x]` (issue #1612). |
 | Bernoulli marginal-slope | 1-D `numpy.ndarray` | Per-row probabilities clipped to `[0, 1]`. Table form has `mean`; with `interval=` it also includes `linear_predictor`, `std_error`, `mean_lower`, and `mean_upper`. |
 | Survival (any likelihood mode) | `SurvivalPrediction` | Per-row hazard / survival evaluators. |
 | Competing-risks survival | `CompetingRisksPrediction` | Endpoint-stacked hazard, survival, CIF, and overall survival arrays. |

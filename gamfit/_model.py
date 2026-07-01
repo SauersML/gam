@@ -158,7 +158,9 @@ class Model:
               (``pred["mean"]``) and column attributes (``pred.mean``,
               ``pred.std_error``, ``pred.mean_lower``, ``pred.mean_upper``).
             * Bernoulli marginal-slope: a 1-D ``ndarray`` of probabilities.
-            * Transformation-normal: a 1-D ``ndarray`` of z-scores.
+            * Transformation-normal: a 1-D ``ndarray`` of the response-scale
+              conditional mean ``E[Y|x]`` (issue #1612), a covariate-only
+              quantity that does not require the outcome column.
             * Survival models: :class:`SurvivalPrediction`.
             * Competing-risks models: :class:`CompetingRisksPrediction`.
 

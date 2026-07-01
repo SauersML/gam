@@ -367,10 +367,19 @@ def test_sklearn_regressor_accepts_rhs_only_formula_with_separate_target() -> No
 
 
 def test_sklearn_classifier_roundtrip() -> None:
+    # `y ~ x` is an unpenalized parametric term, so its logistic MLE diverges
+    # under perfect separation and the engine's pre-fit separation guard
+    # (PrefitPerfectSeparationDetected) rejects such a design by design. The two
+    # observations at x=2.0 with opposite labels break separation (the MLE is
+    # finite) while preserving the monotone-increasing P(y=1 | x) trend this
+    # roundtrip asserts; the test targets the sklearn wrapper mechanics
+    # (predict_proba shape, class ordering, argmax hard labels, weighted score),
+    # not the degenerate infinite-slope fit.
     train = pd.DataFrame(
         [
             {"y": 0.0, "x": 0.0},
             {"y": 0.0, "x": 1.0},
+            {"y": 0.0, "x": 2.0},
             {"y": 1.0, "x": 2.0},
             {"y": 1.0, "x": 3.0},
             {"y": 1.0, "x": 4.0},
@@ -445,10 +454,19 @@ def test_sklearn_classifier_string_labels_roundtrip() -> None:
     # In-sample accuracy on this logistic problem should clear chance by a
     # wide margin once the labels are encoded correctly; pre-fix the
     # comparison is between '0/1' ints and 'pos/neg' strings, so accuracy is 0.
+    #
+    # The bar is 0.6, not 0.7: with P(y=1|x)=sigmoid(x) on x~U(-2, 2) the
+    # Bayes-optimal (unbeatable) in-sample accuracy is only
+    # (1/2)∫₀² sigmoid(x) dx ≈ 0.717, and the sampling SE at n=200 is ≈0.03, so
+    # a 0.7 bar sits inside sampling noise of the theoretical ceiling and its
+    # pass/fail is decided by the seed rather than by whether the labels were
+    # encoded. 0.6 is ~3.5σ below the ceiling (robust to the seed) while still
+    # cleanly rejecting the pre-fix label-mismatch failure (0.0) and chance
+    # (0.5) — which is the only thing this test is asserting.
     accuracy = float((predicted == y_str).mean())
-    assert accuracy > 0.7, (
+    assert accuracy > 0.6, (
         f"GAMClassifier in-sample accuracy on string labels = {accuracy:.3f}; "
-        "must clear 0.7 once labels are encoded (pre-fix was 0.0)."
+        "must clear 0.6 once labels are encoded (pre-fix was 0.0)."
     )
 
 
@@ -470,10 +488,15 @@ def test_sklearn_classifier_pm1_labels_roundtrip() -> None:
     assert set(np.unique(predicted)).issubset({-1, 1}), (
         f"predict must return labels from classes_; got {np.unique(predicted)!r}"
     )
+    # Bar is 0.6, not 0.7: the Bayes-optimal accuracy for P(y=1|x)=sigmoid(x)
+    # on x~U(-2, 2) is only ≈0.717 (see test_sklearn_classifier_string_labels_
+    # roundtrip), so a 0.7 bar is within sampling noise of the theoretical
+    # ceiling and this seed lands at 0.690. 0.6 still cleanly rejects the
+    # pre-fix label-mismatch failure (0.0) — the actual regression under test.
     accuracy = float((predicted == y_pm).mean())
-    assert accuracy > 0.7, (
+    assert accuracy > 0.6, (
         f"GAMClassifier in-sample accuracy on {{-1, +1}} labels = "
-        f"{accuracy:.3f}; must clear 0.7 once labels are encoded."
+        f"{accuracy:.3f}; must clear 0.6 once labels are encoded."
     )
 
 
@@ -670,13 +693,27 @@ def _pc_duchon(centers: int = 6) -> str:
     )
 
 
-def test_transformation_normal_pgs_calibration_roundtrip(synthetic_large_scale_factory: typing.Any) -> None:
-    """Stage 1: fit h(PGS | PCs) ~ N(0, 1) and verify PIT properties.
+def test_transformation_normal_pgs_conditional_mean_tracks_response(
+    synthetic_large_scale_factory: typing.Any,
+) -> None:
+    """Issue #1612: transformation-normal ``predict`` returns ``E[Y|x]``.
 
-    After conditional Gaussianization on the PC manifold the predicted
-    z-scores should be approximately standard normal AND decorrelated
-    from each PC — that's the defining property of the anchored
-    deviation invariant used throughout the methods section.
+    A conditional transformation model has latent structure ``h(Y|x) ~ N(0, 1)``
+    with ``h(·|x)`` strictly increasing, so the response-scale conditional mean
+    ``E[Y|x] = E_{Z~N(0,1)}[h⁻¹(Z|x)]`` is a function of the covariates alone.
+    ``predict`` reports exactly that quantity (not the standardized latent
+    z-score of a supplied outcome), so its defining properties are those of a
+    regression function on the response scale:
+
+    * it averages to the marginal response mean (``E[E[Y|x]] = E[Y]``);
+    * it is no more dispersed than the response (law of total variance,
+      ``Var(E[Y|x]) ≤ Var(Y)``); and
+    * it is non-negatively correlated with the response, because
+      ``Cov(E[Y|x], Y) = Var(E[Y|x]) ≥ 0``.
+
+    These are the invariants the pre-#1612 z-score contract (unit variance,
+    decorrelated from the covariates) inverted, so asserting them here locks the
+    covariate-only conditional-mean semantics in place.
     """
     _require_extension()
     df = synthetic_large_scale_factory(seed=0, n=128)
@@ -687,20 +724,33 @@ def test_transformation_normal_pgs_calibration_roundtrip(synthetic_large_scale_f
         transformation_normal=True,
         scale_dimensions=True,
     )
-    # Transformation-normal models return the per-row z-score directly as
-    # a numpy array (see _model.predict docstring); no return_type indirection.
-    z = np.asarray(model.predict(df), dtype=float)
+    # Transformation-normal models return the per-row response-scale conditional
+    # mean directly as a numpy array (see _model.predict docstring); no
+    # return_type indirection.
+    cond_mean = np.asarray(model.predict(df), dtype=float)
+    pgs = df["PGS"].to_numpy()
 
-    assert z.shape == (len(df),)
-    assert np.all(np.isfinite(z))
-    assert -0.3 < float(z.mean()) < 0.3
-    assert 0.7 < float(z.std(ddof=0)) < 1.3
-    for pc in ("pc1", "pc2", "pc3", "pc4"):
-        corr = float(np.corrcoef(z, df[pc].to_numpy())[0, 1])
-        assert abs(corr) < 0.3, f"|corr(z, {pc})| = {abs(corr):.3f} too large"
+    assert cond_mean.shape == (len(df),)
+    assert np.all(np.isfinite(cond_mean))
+    # E[E[Y|x]] = E[Y]: the conditional mean averages to the marginal mean.
+    assert abs(float(cond_mean.mean()) - float(pgs.mean())) < 0.3
+    # Var(E[Y|x]) ≤ Var(Y): a conditional mean cannot out-vary its response.
+    assert float(cond_mean.std(ddof=0)) <= float(pgs.std(ddof=0)) * 1.05
+    # Cov(E[Y|x], Y) = Var(E[Y|x]) ≥ 0: the fitted mean tracks the response.
+    assert float(np.corrcoef(cond_mean, pgs)[0, 1]) > 0.05
 
 
-def test_transformation_normal_check_requires_raw_pgs(synthetic_large_scale_factory: typing.Any) -> None:
+def test_transformation_normal_predicts_without_raw_pgs(
+    synthetic_large_scale_factory: typing.Any,
+) -> None:
+    """Issue #1612: transformation-normal ``predict`` is covariate-only.
+
+    Because ``E[Y|x]`` does not depend on any supplied outcome, the raw response
+    column is NOT part of the model's prediction input contract. A covariate-only
+    frame therefore both passes ``check`` (nothing is reported missing) and
+    predicts to finite response-scale values — the opposite of the retired
+    contract that made the outcome mandatory at predict time.
+    """
     _require_extension()
     df = synthetic_large_scale_factory(seed=11, n=128)
 
@@ -711,13 +761,15 @@ def test_transformation_normal_check_requires_raw_pgs(synthetic_large_scale_fact
         scale_dimensions=True,
     )
 
-    missing_pgs = df[["pc1", "pc2", "pc3", "pc4"]].copy()
-    check = model.check(missing_pgs)
+    covariate_only = df[["pc1", "pc2", "pc3", "pc4"]].copy()
+    check = model.check(covariate_only)
 
-    assert not check.ok
-    assert any(issue.column == "PGS" for issue in check.issues)
-    with pytest.raises(gamfit.SchemaMismatchError):
-        model.predict(missing_pgs)
+    assert check.ok, [issue.column for issue in check.issues]
+    assert all(issue.column != "PGS" for issue in check.issues)
+
+    cond_mean = np.asarray(model.predict(covariate_only), dtype=float)
+    assert cond_mean.shape == (len(df),)
+    assert np.all(np.isfinite(cond_mean))
 
 
 def test_bernoulli_marginal_slope_roundtrip_tracks_calibrated_score(
