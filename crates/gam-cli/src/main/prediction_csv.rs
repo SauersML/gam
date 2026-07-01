@@ -244,7 +244,7 @@ pub(crate) fn write_prediction_csv(
     let eta_v: Vec<f64> = eta.to_vec();
     let mean_v: Vec<f64> = mean.to_vec();
 
-    let mut cols: Vec<(&str, &[f64])> = vec![("linear_predictor", &eta_v), ("mean", &mean_v)];
+    let mut cols: Vec<(&str, &[f64])> = vec![("eta", &eta_v), ("mean", &mean_v)];
 
     let se_v: Vec<f64>;
     let lo_v: Vec<f64>;
@@ -297,7 +297,7 @@ pub(crate) fn write_gaussian_location_scale_prediction_csv(
     let sigma_v: Vec<f64> = sigma.to_vec();
 
     let mut cols: Vec<(&str, &[f64])> = vec![
-        ("linear_predictor", &eta_v),
+        ("eta", &eta_v),
         ("mean", &mean_v),
         ("sigma", &sigma_v),
     ];
@@ -340,7 +340,7 @@ pub(crate) fn write_survival_prediction_csv(
     let fail_v: Vec<f64> = surv_v.iter().map(|&s| (1.0 - s).clamp(0.0, 1.0)).collect();
 
     let mut cols: Vec<(&str, &[f64])> = vec![
-        ("linear_predictor", &eta_v),
+        ("eta", &eta_v),
         ("survival_prob", &surv_v),
         ("failure_prob", &fail_v),
         ("risk_score", &risk_v),
@@ -401,7 +401,7 @@ pub(crate) fn write_survival_binary_prediction_csv(
     let survival_v: Vec<f64> = event_v.iter().map(|&p| (1.0 - p).clamp(0.0, 1.0)).collect();
 
     let mut cols: Vec<(&str, &[f64])> = vec![
-        ("linear_predictor", &eta_v),
+        ("eta", &eta_v),
         ("mean", &event_v),
         ("event_prob", &event_v),
         ("failure_prob", &event_v),

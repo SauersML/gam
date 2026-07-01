@@ -114,10 +114,10 @@ pub fn read_prediction_means(path: &Path) -> Vec<f64> {
     let mean_idx = headers
         .iter()
         .position(|h| h == "mean")
-        .or_else(|| headers.iter().position(|h| h == "linear_predictor"))
+        .or_else(|| headers.iter().position(|h| h == "eta"))
         .unwrap_or_else(|| {
             // SAFETY: test-support helper intentionally panics with header context
-            panic!("predict csv has neither `mean` nor `linear_predictor` column: {headers:?}")
+            panic!("predict csv has neither `mean` nor `eta` column: {headers:?}")
         });
     reader
         .records()

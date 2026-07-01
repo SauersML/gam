@@ -5586,9 +5586,9 @@ fn run_predict_survival_supports_saved_baseline_timewiggle_model() {
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "parse prediction csv", e));
     assert_eq!(rows.len(), 2);
     for i in 0..rows.len() {
-        let eta = rows[i]["linear_predictor"]
+        let eta = rows[i]["eta"]
             .parse::<f64>()
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "linear_predictor should parse", e));
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "eta should parse", e));
         let survival_prob = rows[i]["survival_prob"]
             .parse::<f64>()
             .unwrap_or_else(|e| panic!("{} failed: {:?}", "survival_prob should parse", e));
