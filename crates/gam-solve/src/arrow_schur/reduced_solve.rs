@@ -3192,8 +3192,15 @@ pub(crate) fn steihaug_pcg_auto<B: BatchedBlockSolver + Sync>(
                 // `(H_tβ)²/H_tt` over-subtraction) is reached in a handful of
                 // attempts. The ceiling + attempt cap still bound it; on
                 // exhaustion the recoverable failure reaches the outer LM loop.
+                // Jump straight to a meaningful scale on the FIRST refusal rather
+                // than crawling ×10 from a tiny `ridge_beta`: each rebuild is a full
+                // block-Jacobi factorization (the massive-K preconditioner hotspot),
+                // and a large collapsed deficit (`Σ H_tβᵀ(H_tt)⁻¹H_tβ` over-subtraction,
+                // O(1)-scale) otherwise costs ~log10(deficit / ridge_beta) rebuilds.
+                // Seeding the first bump at `rhs_scale` covers it in one or two, then
+                // escalates multiplicatively; the ceiling + attempt cap still bound it.
                 let next = if effective_ridge > 0.0 {
-                    effective_ridge * SCHUR_CURVATURE_FLOOR_DIAG_GROWTH
+                    (effective_ridge * SCHUR_CURVATURE_FLOOR_DIAG_GROWTH).max(rhs_scale)
                 } else {
                     rhs_scale
                 };
