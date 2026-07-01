@@ -181,6 +181,16 @@ pub struct PenalizedVectorGlmOutputs {
     pub log_likelihood: f64,
     /// Penalty term `½ Σ_a λ_a · β̂_aᵀ S β̂_a` at the returned `β̂`.
     pub penalty_term: f64,
+    /// Joint Laplace posterior coefficient covariance `H⁻¹` at the converged
+    /// `β̂`, shape `(P·M)×(P·M)` (#1101). `H = block(XᵀWX) + diag_a(λ_a)⊗S` is
+    /// the penalized Hessian the Newton loop already assembles and factors at
+    /// every step, discarding the factor; here it is re-assembled once at the
+    /// mode and inverted (solve against the identity through the same symmetric
+    /// factorization used for the Newton step). Block-ordered to match the
+    /// stacked coefficient vector `θ[a·P + i] = β̂[i, a]`, i.e.
+    /// `β = [β_0; …; β_{M-1}]`. This is the covariance the predict / inference
+    /// surface uses for delta-method standard errors and prediction intervals.
+    pub coefficient_covariance: Array2<f64>,
 }
 
 /// Quadratic form `½ β_aᵀ S β_a` accumulated across outputs with per-output
@@ -257,6 +267,76 @@ fn weighted_penalty_sum(
             0.5 * lam * (sum_quad - g_quad / k)
         }
     }
+}
+
+/// Invert the symmetric penalized Hessian `H` to the joint Laplace covariance
+/// `Σ = H⁻¹` by solving `H·Σ = I` through the shared symmetric factorization
+/// (#1101). `dim` is the flat block dimension `P·M`; `context` prefixes any
+/// diagnostic. A curvature-scaled Tikhonov ridge `τ·I` — floored at
+/// [`BASE_RIDGE_FRACTION_OF_MAX_DIAG`]·max_diag and escalated geometrically up
+/// to [`MAX_RIDGE_ESCALATIONS`] times — is added ONLY when the raw factor/solve
+/// is non-finite (a rank-deficient null direction), exactly mirroring the
+/// Newton step's ridge so the covariance is always finite; at full rank the
+/// ridge is never engaged and `Σ` is the exact `H⁻¹`. The returned matrix is
+/// symmetrized `(Σ + Σᵀ)/2` to null round-off asymmetry from the back-solve.
+fn invert_symmetric_penalized_hessian(
+    hessian: &Array2<f64>,
+    dim: usize,
+    context: &str,
+) -> Result<Array2<f64>, EstimationError> {
+    let max_diag = (0..dim).fold(0.0_f64, |acc, idx| acc.max(hessian[[idx, idx]].abs()));
+    let base_ridge = if max_diag.is_finite() && max_diag > 0.0 {
+        max_diag * BASE_RIDGE_FRACTION_OF_MAX_DIAG
+    } else {
+        BASE_RIDGE_FRACTION_OF_MAX_DIAG
+    };
+    let mut ridge = 0.0_f64;
+    for attempt in 0..=MAX_RIDGE_ESCALATIONS {
+        let mut ridged = hessian.clone();
+        if ridge > 0.0 {
+            for idx in 0..dim {
+                ridged[[idx, idx]] += ridge;
+            }
+        }
+        let factor = match factorize_symmetricwith_fallback(
+            FaerArrayView::new(&ridged).as_ref(),
+            Side::Lower,
+        ) {
+            Ok(factor) => factor,
+            Err(err) => {
+                if attempt == MAX_RIDGE_ESCALATIONS {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "{context}: covariance factorization failed even with ridge \
+                         {ridge:.3e}: {err}"
+                    )));
+                }
+                ridge = if ridge > 0.0 { ridge * 2.0 } else { base_ridge };
+                continue;
+            }
+        };
+        // Solve H·Σ = I: identity RHS, back-solved in place to yield Σ = H⁻¹.
+        let mut rhs = Array2::<f64>::eye(dim);
+        {
+            let rhs_view = array2_to_matmut(&mut rhs);
+            factor.solve_in_place(rhs_view);
+        }
+        if rhs.iter().all(|v| v.is_finite()) {
+            // Symmetrize to remove round-off asymmetry from the back-solve.
+            let mut cov = Array2::<f64>::zeros((dim, dim));
+            for i in 0..dim {
+                for j in 0..dim {
+                    cov[[i, j]] = 0.5 * (rhs[[i, j]] + rhs[[j, i]]);
+                }
+            }
+            return Ok(cov);
+        }
+        ridge = if ridge > 0.0 { ridge * 2.0 } else { base_ridge };
+    }
+    Err(EstimationError::InvalidInput(format!(
+        "{context}: covariance solve remained non-finite after {} ridge escalations \
+         (max_diag={max_diag:.3e})",
+        MAX_RIDGE_ESCALATIONS,
+    )))
 }
 
 /// Fit a penalized vector-response GLM at fixed `λ` via damped Newton.
@@ -669,6 +749,61 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
     let log_likelihood = likelihood.log_lik(eta.view(), y);
     let penalty_term = weighted_penalty_sum(&beta, penalty, lambdas, class_penalty_metric);
 
+    // Joint Laplace covariance `H⁻¹` at the converged mode (#1101). Re-assemble
+    // the penalized Hessian `H = block(XᵀWX) + penalty` at β̂ — the SAME algebra
+    // the Newton loop runs each iteration — and invert it by solving `H·Σ = I`
+    // through the shared symmetric factorization. The Newton loop discarded its
+    // per-step factor; this recomputes the factor once at the mode where the
+    // curvature is the correct posterior precision. A tiny curvature-scaled
+    // ridge is added only when the raw factorization / solve is non-finite
+    // (rank-deficient null direction), mirroring the Newton step's ridge logic,
+    // so the covariance is always finite; at full rank the ridge is never used.
+    let analytic_fisher_final = fisher_w_override
+        .as_ref()
+        .map_or_else(|| Some(likelihood.hess_block(eta.view(), y)), |_| None);
+    let fisher_blocks_final = match fisher_w_override.as_ref() {
+        Some(fw) => *fw,
+        None => analytic_fisher_final
+            .as_ref()
+            .expect("analytic Fisher computed when no override")
+            .view(),
+    };
+    let mut hessian_final = dense_block_xtwx(design, fisher_blocks_final, None)?;
+    match class_penalty_metric {
+        ClassPenaltyMetric::Diagonal => {
+            for a in 0..m {
+                let la = lambdas[a];
+                if la == 0.0 {
+                    continue;
+                }
+                let base = a * p;
+                for i in 0..p {
+                    for j in 0..p {
+                        hessian_final[[base + i, base + j]] += la * penalty[[i, j]];
+                    }
+                }
+            }
+        }
+        ClassPenaltyMetric::Centered if m > 0 && lambdas[0] != 0.0 => {
+            let lam = lambdas[0];
+            let inv_k = 1.0 / ((m + 1) as f64);
+            for a in 0..m {
+                for b in 0..m {
+                    let coef = lam * (if a == b { 1.0 } else { 0.0 } - inv_k);
+                    let (ba, bb) = (a * p, b * p);
+                    for i in 0..p {
+                        for j in 0..p {
+                            hessian_final[[ba + i, bb + j]] += coef * penalty[[i, j]];
+                        }
+                    }
+                }
+            }
+        }
+        ClassPenaltyMetric::Centered => {}
+    }
+    let coefficient_covariance =
+        invert_symmetric_penalized_hessian(&hessian_final, beta_flat_dim, context)?;
+
     Ok(PenalizedVectorGlmOutputs {
         coefficients: beta,
         eta,
@@ -676,6 +811,7 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
         converged,
         log_likelihood,
         penalty_term,
+        coefficient_covariance,
     })
 }
 

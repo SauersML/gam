@@ -500,6 +500,113 @@ pub struct MultinomialFitOutputs {
     pub penalized_neg_log_likelihood: f64,
     /// Unpenalized deviance `−2 log L(β̂)` for diagnostic reporting.
     pub deviance: f64,
+    /// Joint Laplace posterior coefficient covariance `H⁻¹` at the converged
+    /// `β̂`, shape `(P·(K−1))×(P·(K−1))` (#1101). Block-ordered to match the
+    /// stacked active-class coefficient vector `β = [β_0; …; β_{K-2}]`: active
+    /// class `a`'s `P` coefficients occupy rows/cols `a·P .. (a+1)·P`, indexed
+    /// `θ[a·P + i] = β̂[i, a]`. This is the Laplace covariance from the factored
+    /// penalized Hessian `XᵀWX + diag_a(λ_a)⊗S`; it drives the delta-method
+    /// per-class probability standard errors ([`Self::predict_probabilities_with_se`])
+    /// on the fixed-λ inner-solve path.
+    pub coefficient_covariance: Array2<f64>,
+}
+
+impl MultinomialFitOutputs {
+    /// Number of active classes `M = K − 1` (columns of
+    /// [`Self::coefficients_active`]).
+    pub fn n_active_classes(&self) -> usize {
+        self.coefficients_active.ncols()
+    }
+
+    /// Per-class coefficient dimension `P` (rows of
+    /// [`Self::coefficients_active`]).
+    pub fn p_per_class(&self) -> usize {
+        self.coefficients_active.nrows()
+    }
+
+    /// Evaluate `softmax(X·β̂)` AND its delta-method per-class probability
+    /// standard error at fresh design rows `X_new` (#1101), using the joint
+    /// Laplace covariance [`Self::coefficient_covariance`].
+    ///
+    /// The softmax Jacobian is `∂p_c/∂η_b = p_c (δ_{cb} − p_b)` for active class
+    /// `b ∈ 0..M`, and `∂η_b/∂β[i,a] = X[i]·δ_{ab}`, so the gradient of the
+    /// class-`c` probability w.r.t. the block-ordered coefficient vector is
+    /// `g_c[a·P + i] = X[i]·p_c (δ_{ca} − p_a)` (the reference class `M`
+    /// contributes only through `−p_a` in every active block). The delta-method
+    /// variance is `Var(p_c) = g_cᵀ Σ g_c` with `Σ = H⁻¹`, and
+    /// `SE(p_c) = √Var(p_c)`. Returns `(probs (N,K), prob_se (N,K))`. `X_new`
+    /// must have `P` columns (the same design basis used at fit time); its row
+    /// count sets `N`. The SE is unclamped (the interval consumer applies the
+    /// simplex `[0,1]` clamp).
+    pub fn predict_probabilities_with_se(
+        &self,
+        x_new: ArrayView2<'_, f64>,
+    ) -> Result<(Array2<f64>, Array2<f64>), EstimationError> {
+        let p = self.p_per_class();
+        let m = self.n_active_classes();
+        let k = m + 1;
+        if x_new.ncols() != p {
+            crate::bail_invalid_estim!(
+                "predict_probabilities_with_se: X has {} cols, expected P={p}",
+                x_new.ncols()
+            );
+        }
+        let d = p * m;
+        let cov = &self.coefficient_covariance;
+        if cov.dim() != (d, d) {
+            crate::bail_invalid_estim!(
+                "predict_probabilities_with_se: covariance shape {:?} ≠ (P·M, P·M) = ({d}, {d})",
+                cov.dim()
+            );
+        }
+        let n_new = x_new.nrows();
+        let beta = &self.coefficients_active;
+        let mut probs = Array2::<f64>::zeros((n_new, k));
+        let mut prob_se = Array2::<f64>::zeros((n_new, k));
+        let mut eta_active = vec![0.0_f64; m];
+        let mut row_probs = vec![0.0_f64; k];
+        let mut grad = vec![0.0_f64; d];
+        for row in 0..n_new {
+            for a in 0..m {
+                let mut v = 0.0_f64;
+                for i in 0..p {
+                    v += x_new[[row, i]] * beta[[i, a]];
+                }
+                eta_active[a] = v;
+            }
+            MultinomialLogitLikelihood::softmax_with_baseline(&eta_active, &mut row_probs);
+            for c in 0..k {
+                probs[[row, c]] = row_probs[c];
+            }
+            for c in 0..k {
+                let pc = row_probs[c];
+                // g_c[a·P + i] = X[i] · p_c · (δ_{ca} − p_a), a active.
+                for a in 0..m {
+                    let pa = row_probs[a];
+                    let factor = pc * (if c == a { 1.0 - pa } else { -pa });
+                    let base = a * p;
+                    for i in 0..p {
+                        grad[base + i] = x_new[[row, i]] * factor;
+                    }
+                }
+                // Var = gᵀ Σ g.
+                let mut var = 0.0_f64;
+                for r in 0..d {
+                    let gr = grad[r];
+                    if gr == 0.0 {
+                        continue;
+                    }
+                    let mut acc = 0.0_f64;
+                    for s in 0..d {
+                        acc += cov[[r, s]] * grad[s];
+                    }
+                    var += gr * acc;
+                }
+                prob_se[[row, c]] = var.max(0.0).sqrt();
+            }
+        }
+        Ok((probs, prob_se))
+    }
 }
 
 /// Fit a penalized multinomial-logit GAM at fixed `λ`.
@@ -621,6 +728,7 @@ pub fn fit_penalized_multinomial(
         converged: fit.converged,
         penalized_neg_log_likelihood: -fit.log_likelihood + fit.penalty_term,
         deviance: -2.0 * fit.log_likelihood,
+        coefficient_covariance: fit.coefficient_covariance,
     })
 }
 
@@ -2313,6 +2421,117 @@ mod fisher_override_tests {
         })
         .expect_err("wrong active-block shape must error");
         assert!(format!("{err}").contains("fisher_w_override shape"));
+    }
+
+    /// #1101 regression: the fixed-λ inner solve now surfaces the joint Laplace
+    /// coefficient covariance `H⁻¹`, and the multinomial predictor derives
+    /// finite delta-method per-class probability standard errors from it. Before
+    /// this change `MultinomialFitOutputs` carried NO covariance at all, so the
+    /// covariance-dimension / predictor assertions below could not even compile
+    /// (fail-before). Asserts, with un-weakened bounds:
+    ///   1. covariance is `(P·(K−1))²`, all-finite, symmetric, and PSD (every
+    ///      diagonal ≥ 0 and `vᵀΣv ≥ 0` on probe vectors);
+    ///   2. the delta-method per-class probability SEs are finite and within
+    ///      `[0, 1]` (a probability SE can never exceed the unit interval);
+    ///   3. predicted probabilities are finite, in `[0, 1]`, and each row sums
+    ///      to 1 (simplex).
+    #[test]
+    fn covariance_and_delta_method_se_are_finite_and_wellformed_1101() {
+        let (design, y, penalty, lambdas) = toy();
+        let p = design.ncols();
+        let k = y.ncols();
+        let m = k - 1;
+        let d = p * m;
+
+        let fit = fit_penalized_multinomial(MultinomialFitInputs {
+            design: design.view(),
+            y_one_hot: y.view(),
+            penalty: penalty.view(),
+            lambdas: lambdas.view(),
+            row_weights: None,
+            fisher_w_override: None,
+            max_iter: 50,
+            tol: 1.0e-9,
+        })
+        .expect("fit must succeed");
+        assert!(fit.converged, "toy multinomial fit must converge");
+
+        // (1) Covariance shape, finiteness, symmetry.
+        let cov = &fit.coefficient_covariance;
+        assert_eq!(
+            cov.dim(),
+            (d, d),
+            "covariance must be (P·(K−1))² = ({d},{d})"
+        );
+        for &v in cov.iter() {
+            assert!(v.is_finite(), "covariance entry must be finite (got {v})");
+        }
+        for i in 0..d {
+            for j in 0..d {
+                let asym = (cov[[i, j]] - cov[[j, i]]).abs();
+                assert!(
+                    asym <= 1e-9 * (1.0 + cov[[i, j]].abs()),
+                    "covariance must be symmetric at ({i},{j}): |Σ_ij − Σ_ji| = {asym:.3e}"
+                );
+            }
+        }
+        // PSD: diagonal ≥ 0 and quadratic forms on deterministic probe vectors
+        // (unit axes and the all-ones vector) are non-negative. `H = XᵀWX + λS`
+        // with W PSD (softmax Fisher) and S PSD (identity here) is positive
+        // definite, so its inverse is PD; these probes must all be positive.
+        for i in 0..d {
+            assert!(
+                cov[[i, i]] >= 0.0,
+                "covariance diagonal[{i}] must be ≥ 0 (got {})",
+                cov[[i, i]]
+            );
+        }
+        let mut probes: Vec<Vec<f64>> = Vec::new();
+        for i in 0..d {
+            let mut e = vec![0.0_f64; d];
+            e[i] = 1.0;
+            probes.push(e);
+        }
+        probes.push(vec![1.0_f64; d]);
+        for v in &probes {
+            let mut q = 0.0_f64;
+            for i in 0..d {
+                for j in 0..d {
+                    q += v[i] * cov[[i, j]] * v[j];
+                }
+            }
+            assert!(
+                q >= -1e-9,
+                "covariance must be PSD: vᵀΣv = {q:.3e} < 0"
+            );
+        }
+
+        // (2) & (3) Delta-method SEs and simplex probabilities on the training
+        // design (any P-column matrix in the fitted basis works).
+        let (probs, prob_se) = fit
+            .predict_probabilities_with_se(design.view())
+            .expect("delta-method SE must succeed");
+        let n = design.nrows();
+        assert_eq!(probs.dim(), (n, k));
+        assert_eq!(prob_se.dim(), (n, k));
+        for row in 0..n {
+            let mut rowsum = 0.0_f64;
+            for c in 0..k {
+                let pc = probs[[row, c]];
+                assert!(pc.is_finite() && (0.0..=1.0).contains(&pc), "prob[{row},{c}]={pc}");
+                rowsum += pc;
+                let se = prob_se[[row, c]];
+                assert!(se.is_finite(), "prob_se[{row},{c}] must be finite (got {se})");
+                assert!(
+                    (0.0..=1.0).contains(&se),
+                    "prob_se[{row},{c}] must be in [0,1] (got {se})"
+                );
+            }
+            assert!(
+                (rowsum - 1.0).abs() < 1e-9,
+                "row {row} probabilities must sum to 1 (got {rowsum})"
+            );
+        }
     }
 
     #[test]
