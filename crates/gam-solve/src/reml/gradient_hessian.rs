@@ -3550,23 +3550,6 @@ impl<'a> RemlState<'a> {
         resolve_effective_rho_prior(&self.rho_prior)
     }
 
-    /// Per-coordinate mask marking the smoothing coordinates the caller left
-    /// `Flat` (the firth-general DEFAULT). For the #1266 relaxed `Independent`
-    /// prior, these are exactly the BENDING (range-space wiggliness) coordinates
-    /// of a well-determined relaxable smooth: `relax_smoothing_rho_prior` frees
-    /// them to `Flat` so pure REML — not the prior — picks λ_bend (mgcv parity).
-    ///
-    /// NOTE this reads the CONFIGURED prior (`self.rho_prior`), where a relaxed
-    /// bending coordinate is still `Flat`. The post-resolution `effective_rho_prior`
-    /// has already rewritten that `Flat` into the firth-default `PenalizedComplexity`
-    /// (a serialization-friendly value that nonetheless evaluates through the
-    /// byte-flat self-gated barrier), so it can NOT be used to recover which
-    /// coordinates are flat-relaxed — they are indistinguishable there from an
-    /// explicitly-configured PC prior.
-    pub(crate) fn firth_default_coord_mask(&self, len: usize) -> Vec<bool> {
-        firth_default_coord_mask(&self.rho_prior, len)
-    }
-
     /// ½·Σᵢ log(wᵢ) over the positive-weight rows — the per-observation
     /// Gaussian normalization constant that the log-likelihood drops.
     ///
