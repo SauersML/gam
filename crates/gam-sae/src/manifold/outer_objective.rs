@@ -1579,6 +1579,36 @@ impl OuterObjective for SaeManifoldOuterObjective {
 
     fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
         let rho_state = self.baseline_rho.from_flat(rho.view());
+        // #1026 — matrix-free (streaming) regime: the dense joint-Hessian evidence
+        // cache does not exist, so the analytic gradient lane below
+        // (`reml_criterion_with_cache` → `outer_gradient_arrow_solver`) cannot run
+        // and hard-errors ("cost-only streaming route is required"). The outer plan
+        // descends ρ via the value + Fellner–Schall (EFS) route
+        // (`fixed_point_available`), which never consumes this gradient — but the
+        // generic seed startup-VALIDATION still probes this gradient lane, and its
+        // hard error rejects EVERY seed ("no candidate seeds passed outer startup
+        // validation") for any large-K / wide-border (duchon) fit whose dense
+        // evidence factor exceeds the in-core budget. Route it to the SAME streaming
+        // value path the `Value` order uses: validation then gets a finite streaming
+        // REML cost (paired with a zero gradient it never consumes) and the fit
+        // proceeds on the EFS lane. Dense-admitted fits never enter this branch and
+        // are byte-for-byte unchanged.
+        if !self.term.streaming_plan().direct_logdet_admitted() {
+            let (cost, _beta_hat) =
+                match self.evaluate_with_refine_policy(rho.view(), false, false) {
+                    Ok(evaluated) => evaluated,
+                    Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
+                        return Ok(OuterEval::infeasible(rho.len()));
+                    }
+                    Err(err) => return Err(EstimationError::RemlOptimizationFailed(err)),
+                };
+            return Ok(OuterEval {
+                cost,
+                gradient: Array1::zeros(rho.len()),
+                hessian: HessianResult::Unavailable,
+                inner_beta_hint: None,
+            });
+        }
         if let Some(beta) = self.seeded_beta.take()
             && beta.len() == self.term.beta_dim()
         {
