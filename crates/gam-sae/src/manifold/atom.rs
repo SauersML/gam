@@ -1196,8 +1196,12 @@ impl SaeManifoldAtom {
             for &d in deriv.iter() {
                 speed_sq += d * d;
             }
+            // Row `row` of the (N×M) basis design is contiguous; read it once as
+            // a 1-D view so the per-coefficient accumulation below has no 2-D
+            // index recompute (n-hot: one pass per sample × per atom).
+            let phi_row = self.basis_values.row(row);
             if let Some(col) = linear_col {
-                let t = self.basis_values[[row, col]];
+                let t = phi_row[col];
                 // p = exp₀(t) at unit curvature c = −1: ‖p‖ = tanh(|t|), and
                 // λ(p) = 2 / (1 − ‖p‖²) = 2 / (1 − tanh²|t|) = 2·cosh²(t).
                 // speed_sq ← speed_sq / λ².  (cosh is even, so the sign of t
@@ -1207,8 +1211,7 @@ impl SaeManifoldAtom {
                     speed_sq /= lambda * lambda;
                 }
             }
-            for col in 0..m {
-                let phi = self.basis_values[[row, col]];
+            for (col, &phi) in phi_row.iter().enumerate() {
                 let w = phi * phi;
                 if w == 0.0 {
                     continue;
