@@ -81,6 +81,17 @@ def main() -> int:
                     help="homogeneous atom_topology: circle | periodic | duchon | linear")
     ap.add_argument("--d-atom", type=int, default=1)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--top-k", type=int, default=None,
+                    help="cap per-row active atoms so the reconstruction Tower4 primaries stay <=16")
+    # Convergence hyperparameters. The harness previously fell back to the facade
+    # defaults (isometry=1.0, ard=on, sparsity=1.0, smoothness=1.0), which are ~100x
+    # the values the KNOWN-GOOD tests converge under and drive dictionary co-collapse.
+    # Default here to the known-good regime so a fit actually converges.
+    ap.add_argument("--sparsity-weight", type=float, default=0.01)
+    ap.add_argument("--smoothness-weight", type=float, default=0.01)
+    ap.add_argument("--isometry-weight", type=float, default=0.0)
+    ap.add_argument("--learning-rate", type=float, default=1.0)
+    ap.add_argument("--ard", action="store_true", help="enable per-atom ARD (off by default: known-good regime)")
     ap.add_argument("--allow-overcomplete", action="store_true",
                     help="permit N < K (overcomplete dictionary) — keeps the dense "
                          "n×K assignment logits small enough to fit a RAM-tight box")
@@ -128,6 +139,12 @@ def main() -> int:
                 assignment=args.assignment,
                 n_iter=args.n_iter,
                 random_state=args.seed,
+                top_k=args.top_k,
+                sparsity_weight=args.sparsity_weight,
+                smoothness_weight=args.smoothness_weight,
+                isometry_weight=args.isometry_weight,
+                learning_rate=args.learning_rate,
+                ard_per_atom=args.ard,
             )
             wall = time.perf_counter() - tk
             r2 = float(getattr(model, "reconstruction_r2", float("nan")))
