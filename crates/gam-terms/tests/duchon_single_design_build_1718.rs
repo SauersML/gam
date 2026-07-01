@@ -95,12 +95,13 @@ fn duchon_fresh_reparam_cold_build_materializes_design_exactly_once() {
     // Hold the guard across the measured build so no concurrent test build lands
     // between the two counter reads. `.unwrap_or_else(|e| e.into_inner())`
     // tolerates a poisoned lock from an unrelated test panic.
-    let _guard = DESIGN_BUILD_COUNT_GUARD
+    let count_guard = DESIGN_BUILD_COUNT_GUARD
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let before = duchon_design_build_count();
     let result = build_duchon_basis(data.view(), &spec).expect("duchon(x, z) cold build");
     let builds = duchon_design_build_count() - before;
+    drop(count_guard);
 
     // Precondition: the fresh-reparam branch must actually be the one exercised
     // (a real radial reparam frozen into the basis metadata), otherwise this
@@ -139,7 +140,7 @@ fn duchon_fused_reparam_design_equals_unfused_rebuild() {
 
     // Share the counter guard so this test's builds never overlap the counted
     // region of the sibling count test.
-    let _guard = DESIGN_BUILD_COUNT_GUARD
+    let count_guard = DESIGN_BUILD_COUNT_GUARD
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let fused = build_duchon_basis(data.view(), &spec).expect("cold fused duchon build");
@@ -183,4 +184,5 @@ fn duchon_fused_reparam_design_equals_unfused_rebuild() {
          exceeds tolerance {tol:.3e} (design max-abs {max_abs:.3e}). The fused `(K·Z)·V` \
          path must reproduce the un-fused `K·(Z·V)` design."
     );
+    drop(count_guard);
 }

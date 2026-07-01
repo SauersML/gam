@@ -415,10 +415,16 @@ impl crate::jet_tower::RowNllProgramGeneric<2> for AffineComposeRow {
     fn n_rows(&self) -> usize {
         1
     }
-    fn primaries(&self, _row: usize) -> Result<[f64; 2], String> {
+    fn primaries(&self, row: usize) -> Result<[f64; 2], String> {
+        if row >= self.n_rows() {
+            return Err(format!("AffineComposeRow: row {row} out of range"));
+        }
         Ok([self.p0, self.p1])
     }
-    fn row_nll_generic<S: JetScalar<2>>(&self, _row: usize, p: &[S; 2]) -> Result<S, String> {
+    fn row_nll_generic<S: JetScalar<2>>(&self, row: usize, p: &[S; 2]) -> Result<S, String> {
+        if row >= self.n_rows() {
+            return Err(format!("AffineComposeRow: row {row} out of range"));
+        }
         let x = p[0]
             .scale(self.c0)
             .add(&p[1].scale(self.c1))

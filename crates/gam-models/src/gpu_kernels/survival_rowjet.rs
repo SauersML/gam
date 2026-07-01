@@ -646,7 +646,6 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "diagnostic: per-channel parity breakdown, run explicitly"]
     fn diag_device_channel_breakdown() {
         let rows = fixture(DEVICE_ROW_THRESHOLD + 1024);
         let cpu = survival_rigid_row_jets_cpu(&rows, 0.7, &DIR, &DIRU, &DIRV);

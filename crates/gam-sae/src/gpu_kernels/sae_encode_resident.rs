@@ -1223,7 +1223,7 @@ pub fn measure_device_encode_throughput(
     let n = targets.len();
     // Warm run (device module load / PTX cache / first-touch allocations) is not
     // timed, mirroring the resident-solve and full-path benchmarks.
-    let _ = sae_certified_encode_batch(dev, targets, amplitudes);
+    drop(sae_certified_encode_batch(dev, targets, amplitudes));
     let start = Instant::now();
     let (_out, path) = sae_certified_encode_batch(dev, targets, amplitudes);
     let elapsed = start.elapsed();
