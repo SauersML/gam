@@ -3223,6 +3223,7 @@ pub fn build_smooth_basis(
                     None | Some("cr") | Some("cs") | Some("tp") | Some("tps")
                 )
             };
+            let requested_knot_placement = parse_knot_placement(options)?;
             let mut margins: Vec<BSplineBasisSpec> = Vec::with_capacity(dim);
             let mut emitted_periods: Vec<Option<f64>> = Vec::with_capacity(dim);
             for axis in 0..dim {
@@ -3341,7 +3342,10 @@ pub fn build_smooth_basis(
                         },
                         Some(period_value),
                     )
-                } else if margin_wants_cr(&per_axis_bs[axis]) && k_axis >= 3 {
+                } else if margin_wants_cr(&per_axis_bs[axis])
+                    && requested_knot_placement != crate::basis::BSplineKnotPlacement::Quantile
+                    && k_axis >= 3
+                {
                     // mgcv `te()`/`ti()` default cr margin: place exactly
                     // `k_axis` Lancaster–Salkauskas value-knots at data
                     // quantiles. The cr basis dimension equals the knot count,
@@ -3350,7 +3354,11 @@ pub fn build_smooth_basis(
                     // (one interior); a `k_axis < 3` margin (e.g. a binary
                     // tensor axis requesting a linear margin) falls through to
                     // the B-spline branch below, exactly as before #1074 — mgcv
-                    // likewise does not build a `cr` margin below k=3.
+                    // likewise does not build a `cr` margin below k=3. An
+                    // explicit `knot_placement=quantile` also falls through:
+                    // that option selects the generated B-spline knot strategy
+                    // represented by `Automatic { Quantile }`, whereas the cr
+                    // margin has already materialized its quantile value-knots.
                     let cr_knots =
                         crate::basis::select_cr_knots(ds.values.column(c), k_axis)
                             .map_err(|e| e.to_string())?;
@@ -3371,7 +3379,7 @@ pub fn build_smooth_basis(
                     } else {
                         k_axis.saturating_sub(degree + 1).max(1)
                     };
-                    let knotspec = match parse_knot_placement(options)? {
+                    let knotspec = match requested_knot_placement {
                         crate::basis::BSplineKnotPlacement::Uniform => BSplineKnotSpec::Generate {
                             data_range: (data_min, data_max),
                             num_internal_knots,
