@@ -73,16 +73,35 @@ impl DeviceMatrix {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DeviceCsrError {
+    InvalidRowptrLength { rows: usize, rowptr_len: usize },
+}
+
+impl std::fmt::Display for DeviceCsrError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidRowptrLength { rows, rowptr_len } => write!(
+                f,
+                "CSR rowptr length must equal rows + 1 (rows={rows}, rowptr_len={rowptr_len})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DeviceCsrError {}
+
 #[derive(Clone, Debug)]
 pub struct DeviceCsrMatrix {
-    pub rows: usize,
-    pub cols: usize,
-    pub rowptr: DeviceBuffer<i32>,
-    pub colidx: DeviceBuffer<i32>,
-    pub values: DeviceBuffer<f64>,
+    rows: usize,
+    cols: usize,
+    rowptr: DeviceBuffer<i32>,
+    colidx: DeviceBuffer<i32>,
+    values: DeviceBuffer<f64>,
 }
 
 impl DeviceCsrMatrix {
+<<<<<<< ours
     /// Construct a CSR matrix, enforcing the structural invariant that `rowptr`
     /// holds exactly `rows + 1` entries.
     ///
@@ -94,12 +113,15 @@ impl DeviceCsrMatrix {
     /// row-slice and deallocation paths from indexing `rowptr[row + 1]` out of
     /// bounds, which would be an invalid-free / out-of-bounds deallocation
     /// hazard.
+=======
+>>>>>>> theirs
     pub fn new(
         rows: usize,
         cols: usize,
         rowptr: DeviceBuffer<i32>,
         colidx: DeviceBuffer<i32>,
         values: DeviceBuffer<f64>,
+<<<<<<< ours
     ) -> Self {
         let expected = rows + 1;
         let mut ptr = rowptr.host_shadow().to_vec();
@@ -114,6 +136,44 @@ impl DeviceCsrMatrix {
             colidx,
             values,
         }
+=======
+    ) -> Result<Self, DeviceCsrError> {
+        let rowptr_len = rowptr.len();
+        let Some(expected_rowptr_len) = rows.checked_add(1) else {
+            return Err(DeviceCsrError::InvalidRowptrLength { rows, rowptr_len });
+        };
+        if rowptr_len != expected_rowptr_len {
+            return Err(DeviceCsrError::InvalidRowptrLength { rows, rowptr_len });
+        }
+
+        Ok(Self {
+            rows,
+            cols,
+            rowptr,
+            colidx,
+            values,
+        })
+    }
+
+    pub const fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub const fn cols(&self) -> usize {
+        self.cols
+    }
+
+    pub const fn rowptr(&self) -> &DeviceBuffer<i32> {
+        &self.rowptr
+    }
+
+    pub const fn colidx(&self) -> &DeviceBuffer<i32> {
+        &self.colidx
+    }
+
+    pub const fn values(&self) -> &DeviceBuffer<f64> {
+        &self.values
+>>>>>>> theirs
     }
 
     pub const fn nnz(&self) -> usize {

@@ -66,13 +66,28 @@ fn gpu_device_info_device_count_matches_underlying_driver_count() {
 fn device_memory_representations_guard_against_invalid_csr_and_double_free_style_states() {
     let dense = DeviceMatrix::from_array(&Array2::zeros((3, 2)));
     let vec = DeviceVector::from_array(&array![1.0, 2.0, 3.0]);
+<<<<<<< ours
     let csr = DeviceCsrMatrix::new(
+=======
+    let invalid_csr = DeviceCsrMatrix::new(
+>>>>>>> theirs
         3,
         2,
         gpu::DeviceBuffer::from_host_shadow(vec![0, 1]),
         gpu::DeviceBuffer::from_host_shadow(vec![0]),
         gpu::DeviceBuffer::from_host_shadow(vec![1.0]),
     );
+<<<<<<< ours
+=======
+    let csr = DeviceCsrMatrix::new(
+        3,
+        2,
+        gpu::DeviceBuffer::from_host_shadow(vec![0, 1, 1, 1]),
+        gpu::DeviceBuffer::from_host_shadow(vec![0]),
+        gpu::DeviceBuffer::from_host_shadow(vec![1.0]),
+    )
+    .expect("valid CSR rowptr has rows+1 entries");
+>>>>>>> theirs
 
     assert_eq!(
         dense.data.len(),
@@ -84,9 +99,13 @@ fn device_memory_representations_guard_against_invalid_csr_and_double_free_style
         3,
         "vector allocation size should match input length"
     );
+    assert!(
+        invalid_csr.is_err(),
+        "CSR construction must reject rowptr lengths other than rows+1 to prevent invalid frees / out-of-bounds deallocation paths"
+    );
     assert_eq!(
-        csr.rowptr.len(),
-        csr.rows + 1,
+        csr.rowptr().len(),
+        csr.rows() + 1,
         "CSR rowptr must have rows+1 entries to prevent invalid frees / out-of-bounds deallocation paths"
     );
 }
