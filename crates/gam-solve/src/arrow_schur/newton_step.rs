@@ -1318,7 +1318,8 @@ pub(crate) fn try_mixed_precision_arrow_solve(
         }));
     }
 
-    let (schur_factor, floored_schur) = factor_dense_reduced_schur(schur, options.schur_pd_floor)?;
+    let (schur_factor, floored_schur) =
+        factor_dense_reduced_schur(schur, options.schur_pd_floor, false)?;
     if floored_schur.is_some() {
         return Ok(Some(MixedPrecisionAttempt::Fallback {
             reason: "reduced Schur required the spectral PD-floor; using the f64 dense solve"
@@ -2050,7 +2051,7 @@ impl<'a, B: BatchedBlockSolver> ArrowBlockDiagInverse<'a, B> {
         let htt_factors =
             backend.factor_blocks(&sys.rows, ridge_t, sys.d, tolerate_ill_conditioning)?;
         let schur = build_dense_schur_direct(sys, &htt_factors, ridge_beta, backend)?;
-        let (schur_factor, _) = factor_dense_reduced_schur(&schur, schur_pd_floor)?;
+        let (schur_factor, _) = factor_dense_reduced_schur(&schur, schur_pd_floor, false)?;
         Ok(Self {
             sys,
             backend,

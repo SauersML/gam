@@ -519,9 +519,70 @@ pub(crate) fn spectral_pd_floored_schur(
     Some(conditioned)
 }
 
+/// Unit-stiffness quotient conditioning for the *reduced* evidence Schur block.
+///
+/// `spectral_pd_floored_schur` is the right object for Newton steps: it is a
+/// Levenberg-Marquardt floor that damps collapsed decoder directions just enough
+/// to compute a stable `Δβ`.  The Laplace evidence path is different.  Once the
+/// reduced Schur is being used only for a log determinant, a non-positive (or
+/// numerically null) reduced direction is a quotient/null direction, just like
+/// the per-row `H_tt` spectral-deflation case.  It must contribute the
+/// ρ-independent constant `log 1 = 0`, not `log(floor·max λ)`: the latter is a
+/// ρ-dependent Occam reward for collapsed/redundant decoders and can make the
+/// outer REML sweep prefer a worse planted-manifold optimum.
+pub(crate) fn spectral_unit_deflated_schur(
+    schur: &Array2<f64>,
+    relative_floor: f64,
+) -> Option<Array2<f64>> {
+    let n = schur.nrows();
+    if n == 0 || schur.ncols() != n || !(relative_floor.is_finite() && relative_floor > 0.0) {
+        return None;
+    }
+    let mut sym = Array2::<f64>::zeros((n, n));
+    for i in 0..n {
+        for j in 0..n {
+            let v = 0.5 * (schur[[i, j]] + schur[[j, i]]);
+            if !v.is_finite() {
+                return None;
+            }
+            sym[[i, j]] = v;
+        }
+    }
+    let (evals, evecs) = sym.eigh(Side::Lower).ok()?;
+    let max_abs = evals.iter().fold(
+        0.0_f64,
+        |acc, &v| if v.is_finite() { acc.max(v.abs()) } else { acc },
+    );
+    if !(max_abs.is_finite() && max_abs > 0.0) {
+        return None;
+    }
+    let floor = relative_floor * max_abs;
+    let deflate_floor = floor * (1.0 - SPECTRAL_DEFLATION_HYSTERESIS_FRACTION);
+    let mut conditioned = Array2::<f64>::zeros((n, n));
+    for eig_idx in 0..evals.len() {
+        let lambda = evals[eig_idx];
+        let lambda_conditioned = if !lambda.is_finite() || lambda <= 0.0 || lambda < deflate_floor {
+            1.0
+        } else {
+            lambda.max(floor)
+        };
+        for i in 0..n {
+            let vi = evecs[[i, eig_idx]];
+            if vi == 0.0 {
+                continue;
+            }
+            for j in 0..n {
+                conditioned[[i, j]] += lambda_conditioned * vi * evecs[[j, eig_idx]];
+            }
+        }
+    }
+    Some(conditioned)
+}
+
 pub(crate) fn factor_dense_reduced_schur(
     schur: &Array2<f64>,
     schur_pd_floor: Option<f64>,
+    unit_deflate_null_directions: bool,
 ) -> Result<(Array2<f64>, Option<Array2<f64>>), ArrowSchurError> {
     let (factor, floored_schur) = match cholesky_lower(schur) {
         Ok(factor) => (factor, None),
@@ -531,8 +592,19 @@ pub(crate) fn factor_dense_reduced_schur(
             // auxiliary entry points (mixed precision and cross-row IBP
             // preconditioning) can reject the collapsed dead-atom subspace even
             // though the main direct solve would floor it and continue.
+            //
+            // #1803 — Newton-step callers use the Levenberg-Marquardt PD floor
+            // (`spectral_pd_floored_schur`) so `Δβ` is stable. Evidence/log-det
+            // callers (`unit_deflate_null_directions`) instead deflate
+            // quotient/null directions to unit stiffness so they contribute the
+            // ρ-independent `log 1 = 0` to the Laplace normaliser rather than a
+            // ρ-dependent Occam reward for collapsed decoders.
             match schur_pd_floor {
-                Some(relative_floor) => match spectral_pd_floored_schur(schur, relative_floor) {
+                Some(relative_floor) => match if unit_deflate_null_directions {
+                    spectral_unit_deflated_schur(schur, relative_floor)
+                } else {
+                    spectral_pd_floored_schur(schur, relative_floor)
+                } {
                     Some(floored) => (
                         cholesky_lower(&floored).map_err(|floored_err| {
                             ArrowSchurError::SchurFactorFailed {
@@ -566,7 +638,8 @@ pub(crate) fn solve_dense_reduced_system(
     options: &ArrowSolveOptions,
     metric_weights: Option<&MetricWeights>,
 ) -> Result<(Array1<f64>, Option<Array2<f64>>, PcgDiagnostics), ArrowSchurError> {
-    let (factor, floored_schur) = factor_dense_reduced_schur(schur, options.schur_pd_floor)?;
+    let (factor, floored_schur) =
+        factor_dense_reduced_schur(schur, options.schur_pd_floor, options.tolerate_ill_conditioning)?;
     if let Some(floored) = floored_schur {
         let direct = mixed_precision_reduced_beta(&floored, &factor, rhs_beta, options)
             .unwrap_or_else(|| cholesky_solve_vector(&factor, rhs_beta));
