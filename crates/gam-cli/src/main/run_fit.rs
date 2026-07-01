@@ -394,7 +394,15 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
     if let Err(violation) = family.response.validate_response_support(y.view()) {
         return Err(violation.message_for(&parsed.response));
     }
-    if link_choice.is_none() {
+    // Only emit the family-inference note when the family was actually
+    // auto-discovered from the data. The note text is the data heuristic
+    // (`resolve_family` with `FamilyArg::Auto` picks binomial-logit for binary
+    // responses and gaussian-identity otherwise); gating solely on
+    // `link_choice.is_none()` misfired for every explicit `--family` that left
+    // the link at its default, asserting an inference that never happened and
+    // naming the wrong family (e.g. an explicit `--family gamma-log` fit
+    // reporting "Inferred gaussian-identity family").
+    if link_choice.is_none() && matches!(args.family, FamilyArg::Auto) {
         if is_binary_response(y.view()) {
             inference_notes.push(format!(
                 "Inferred binomial-logit family for response '{}' because all values are binary {{0,1}}. Override with link(type=...).",
