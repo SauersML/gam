@@ -1530,9 +1530,15 @@ impl CellMomentScratch {
             CELL_MOMENT_REALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.moments.reserve(len - self.moments.capacity());
         }
-        self.moments.resize(len, 0.0);
-        self.moments.fill(0.0);
-        &mut self.moments
+        // Grow monotonically: shorter requests should not truncate the backing
+        // storage and then zero the old tail when a later request grows again.
+        // Only the active prefix is scratch for this evaluation.
+        if self.moments.len() < len {
+            self.moments.resize(len, 0.0);
+        }
+        let out = &mut self.moments[..len];
+        out.fill(0.0);
+        out
     }
 }
 
