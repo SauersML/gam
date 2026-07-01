@@ -8,10 +8,19 @@ pub struct PowerLawFit {
 }
 
 pub fn fit_power_law(points: &[(f64, f64)]) -> Option<PowerLawFit> {
-    if points.len() < 3 {
+    let logs: Vec<(f64, f64)> = points
+        .iter()
+        .filter_map(|(x, y)| {
+            if *x > 0.0 && x.is_finite() && *y > 0.0 && y.is_finite() {
+                Some((x.ln(), y.ln()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if logs.len() < 3 {
         return None;
     }
-    let logs: Vec<(f64, f64)> = points.iter().map(|(x, y)| (x.ln(), y.ln())).collect();
     let n = logs.len() as f64;
     let sx: f64 = logs.iter().map(|(x, _)| x).sum();
     let sy: f64 = logs.iter().map(|(_, y)| y).sum();
@@ -65,8 +74,12 @@ pub fn report_power_law_full(
     budget_y: f64,
 ) -> Option<PowerLawFit> {
     let Some(fit) = fit_power_law(points) else {
+        let usable = points
+            .iter()
+            .filter(|(x, y)| *x > 0.0 && x.is_finite() && *y > 0.0 && y.is_finite())
+            .count();
         eprintln!(
-            "{tag} INSUFFICIENT DATA: {} points (need >=3 for an honest fit)",
+            "{tag} INSUFFICIENT DATA: {usable}/{} positive finite points (need >=3 for an honest fit)",
             points.len()
         );
         return None;
@@ -82,13 +95,23 @@ pub fn report_power_law_full(
     );
     if fit.r2 < 0.85 || fit.max_abs_log_resid > 0.5 {
         eprintln!(
-            "{tag} REFUSING EXTRAPOLATION: fit quality insufficient (R^2 < 0.85 or max-resid > 0.5 in log-space)."
+            "{tag} SKIPPING EXTRAPOLATION: fit quality insufficient (R^2 < 0.85 or max-resid > 0.5 in log-space)."
         );
-        return None;
+        return Some(fit);
     }
     eprintln!("{tag} budget: {:.1}", budget_y);
-    let max_x: f64 = points.iter().map(|(x, _)| *x).fold(0.0_f64, f64::max);
-    let min_x: f64 = points.iter().map(|(x, _)| *x).fold(f64::INFINITY, f64::min);
+    let valid_xs = points
+        .iter()
+        .filter_map(|(x, y)| {
+            if *x > 0.0 && x.is_finite() && *y > 0.0 && y.is_finite() {
+                Some(*x)
+            } else {
+                None
+            }
+        });
+    let (min_x, max_x) = valid_xs.fold((f64::INFINITY, 0.0_f64), |(min_x, max_x), x| {
+        (min_x.min(x), max_x.max(x))
+    });
     for (label, x_target) in extrapolate {
         let pred = fit.a * x_target.powf(fit.alpha);
         let stretch = x_target / max_x;
