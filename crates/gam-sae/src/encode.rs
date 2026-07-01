@@ -950,13 +950,26 @@ pub(crate) fn encode_grad_hess(
         Some(result) => result?,
         None => return Ok(None),
     };
+    // Residual · decoder-row `r·B_{basis,:}` is INDEPENDENT of the (a,b) axes, yet
+    // the old code recomputed it `d²` times inside the Hessian double loop. Hoist it
+    // to one O(m·p) pass so the per-axis curvature term is a cheap O(m) dot.
+    let mut rd = vec![0.0_f64; m];
+    for (basis_col, rd_col) in rd.iter_mut().enumerate() {
+        let mut dot = 0.0;
+        for out in 0..p {
+            dot += residual[out] * decoder[[basis_col, out]];
+        }
+        *rd_col = dot;
+    }
     // g_t[axis] = J_m[axis] · r ;  H_tt[a,b] = J_m[a]·J_m[b] + r·∂²m/∂t_a∂t_b.
+    // The full Hessian is symmetric (Gauss-Newton block + symmetric second jet), so
+    // compute the upper triangle and mirror — half the curvature work.
     let mut g = Array1::<f64>::zeros(d);
     let mut h = Array2::<f64>::zeros((d, d));
     for a in 0..d {
         let ja = jm.row(a);
         g[a] = ja.dot(&residual);
-        for b in 0..d {
+        for b in a..d {
             // Gauss-Newton block.
             let mut hab = ja.dot(&jm.row(b));
             // Residual · second-jet curvature: r · ∂²m_{ab},
@@ -967,14 +980,11 @@ pub(crate) fn encode_grad_hess(
                 if d2phi == 0.0 {
                     continue;
                 }
-                let mut dot = 0.0;
-                for out in 0..p {
-                    dot += residual[out] * decoder[[basis_col, out]];
-                }
-                curv += amplitude * d2phi * dot;
+                curv += amplitude * d2phi * rd[basis_col];
             }
             hab += curv;
             h[[a, b]] = hab;
+            h[[b, a]] = hab;
         }
     }
     for a in 0..d {
@@ -991,6 +1001,50 @@ pub(crate) fn beta_eta_newton(
     h: ArrayView2<'_, f64>,
     g: ArrayView1<'_, f64>,
 ) -> Result<Option<(f64, f64, Array1<f64>)>, String> {
+    // Closed-form fast paths for the tiny latent dims that dominate SAE atoms
+    // (`d = 1, 2`), avoiding a faer eigendecomposition + its heap allocations on
+    // the hottest per-row Newton inner loop. `β = 1/λ_min(H)`, `δ = −H⁻¹g`, and the
+    // `λ_min ≤ 0` gate are computed directly; the symmetric-`H` reads mirror
+    // `eigh(Side::Lower)` (which uses the lower triangle) exactly.
+    let d = h.nrows();
+    if d == 1 {
+        let h00 = h[[0, 0]];
+        if !(h00.is_finite() && h00 > 0.0) {
+            return Ok(None);
+        }
+        let delta0 = -g[0] / h00;
+        let mut delta = Array1::<f64>::zeros(1);
+        delta[0] = delta0;
+        return Ok(Some((1.0 / h00, delta0.abs(), delta)));
+    }
+    if d == 2 {
+        // Symmetric H = [[a, b], [b, c]] read from the lower triangle.
+        let a = h[[0, 0]];
+        let b = h[[1, 0]];
+        let c = h[[1, 1]];
+        let tr = a + c;
+        let det = a * c - b * b;
+        // λ_min = ½(tr − √((a−c)² + 4b²)); ≥ 0 ⇒ H PSD, > 0 ⇒ PD.
+        let disc = ((a - c) * (a - c) + 4.0 * b * b).max(0.0).sqrt();
+        let lambda_min = 0.5 * (tr - disc);
+        if !(lambda_min.is_finite() && lambda_min > 0.0) {
+            return Ok(None);
+        }
+        // δ = −H⁻¹g with H⁻¹ = [[c, −b], [−b, a]] / det (det = λ_min·λ_max > 0).
+        let inv_det = 1.0 / det;
+        let g0 = g[0];
+        let g1 = g[1];
+        let d0 = -(c * g0 - b * g1) * inv_det;
+        let d1 = -(a * g1 - b * g0) * inv_det;
+        if !(d0.is_finite() && d1.is_finite()) {
+            return Ok(None);
+        }
+        let mut delta = Array1::<f64>::zeros(2);
+        delta[0] = d0;
+        delta[1] = d1;
+        let eta = (d0 * d0 + d1 * d1).sqrt();
+        return Ok(Some((1.0 / lambda_min, eta, delta)));
+    }
     let (vals, vecs) = h
         .eigh(Side::Lower)
         .map_err(|e| format!("beta_eta_newton: eigh failed: {e:?}"))?;
@@ -1000,7 +1054,6 @@ pub(crate) fn beta_eta_newton(
     }
     let beta = 1.0 / lambda_min;
     // Newton step δ = −H⁻¹ g via the eigendecomposition: δ = −Σ_i (vᵢᵀg/λᵢ) vᵢ.
-    let d = h.nrows();
     let mut delta = Array1::<f64>::zeros(d);
     for (col, &lam) in vals.iter().enumerate() {
         if lam <= 0.0 {
@@ -2000,45 +2053,50 @@ impl EncodeAtlas {
         // For rows routed to chart `c` with finite jacobian `A₁` (d × p) and
         // center reconstruction `m₁` (= `chart.recon_center`), the predictor is
         //   t̂ = t_c − A₁·m₁ + (1/z)·(A₁·x).
-        // The `A₁·x` term is one `(n_c × p)·(p × d)` GEMM; the `1/z` is a per-row
-        // scalar; `t_c − A₁·m₁` is a per-chart constant. This reproduces
-        // `amortized_warm_start` up to FP reassociation of the per-output sum.
-        for (ci, &c) in valid_charts.iter().enumerate() {
-            let chart = &atom_atlas.charts[c];
-            let Some(a1) = chart.amortized_jacobian.as_ref() else {
-                // Singular Gauss–Newton block: predictor cannot fire — the rows
-                // routed here stay zeroed/uncertified (same as warm_start `None`).
+        // `t_c − A₁·m₁` is a per-chart constant `base`; `A₁·x` is a d-vector of
+        // per-row dot products. Instead of gathering routed rows into a fresh
+        // `X_c` (n_c × p) buffer and running a GEMM into a second `U` (n_c × d)
+        // buffer — two allocations plus a full copy of the routed rows, per chart —
+        // fuse the gather straight into the multiply: stream each source row of `x`
+        // once (it is contiguous) and dot it against `A₁`'s rows, writing the
+        // predicted coord directly. Zero per-chart heap traffic; the inverse
+        // amplitude is hoisted to one reciprocal per row.
+        //
+        // Precompute each valid chart's `(A₁, base)` once (charts with a singular
+        // Gauss–Newton block carry no `A₁`, so their routed rows stay
+        // zeroed/uncertified — same as `amortized_warm_start` returning `None`).
+        struct ChartPredictor<'a> {
+            a1: &'a Array2<f64>,
+            base: Array1<f64>,
+        }
+        let predictors: Vec<Option<ChartPredictor<'_>>> = valid_charts
+            .iter()
+            .map(|&c| {
+                let chart = &atom_atlas.charts[c];
+                chart.amortized_jacobian.as_ref().map(|a1| {
+                    let a1_m1 = a1.dot(&chart.recon_center); // (d)
+                    let base = &chart.region.center - &a1_m1; // (d)
+                    ChartPredictor { a1, base }
+                })
+            })
+            .collect();
+
+        for row in 0..n {
+            let Some(pred) = predictors[route_idx[row]].as_ref() else {
                 continue;
             };
-            // Gather rows routed to this chart with a usable amplitude.
-            let rows_here: Vec<usize> = (0..n)
-                .filter(|&row| {
-                    route_idx[row] == ci
-                        && amplitudes[row].is_finite()
-                        && amplitudes[row].abs() > 0.0
-                })
-                .collect();
-            if rows_here.is_empty() {
+            let amp = amplitudes[row];
+            if !(amp.is_finite() && amp.abs() > 0.0) {
                 continue;
             }
-            // X_c (n_c × p).
-            let mut x_c = Array2::<f64>::zeros((rows_here.len(), p));
-            for (i, &row) in rows_here.iter().enumerate() {
-                x_c.row_mut(i).assign(&x.row(row));
+            let inv_z = 1.0 / amp;
+            let x_row = x.row(row);
+            let mut coord_row = coords.row_mut(row);
+            for axis in 0..d {
+                // (A₁·x)[axis] = A₁ row `axis` (contiguous, length p) · x_row.
+                coord_row[axis] = pred.base[axis] + pred.a1.row(axis).dot(&x_row) * inv_z;
             }
-            // U = X_c · A₁ᵀ  (n_c × d) — the GEMM.
-            let u = x_c.dot(&a1.t());
-            // Per-chart constant base = t_c − A₁·m₁ (length d).
-            let m1 = &chart.recon_center;
-            let a1_m1 = a1.dot(m1); // (d)
-            let base = &chart.region.center - &a1_m1; // (d)
-            for (i, &row) in rows_here.iter().enumerate() {
-                let inv_z = 1.0 / amplitudes[row];
-                for axis in 0..d {
-                    coords[[row, axis]] = base[axis] + u[[i, axis]] * inv_z;
-                }
-                valid[row] = true;
-            }
+            valid[row] = true;
         }
         Ok((coords, valid))
     }
@@ -2677,40 +2735,25 @@ pub(crate) fn center_amortized_jacobian(
 pub(crate) fn nearest_chart(
     atom_atlas: &AtomEncodeAtlas,
     x: ArrayView1<'_, f64>,
-    atom: &SaeManifoldAtom,
-    evaluator: &dyn SaeBasisEvaluator,
+    _atom: &SaeManifoldAtom,
+    _evaluator: &dyn SaeBasisEvaluator,
 ) -> Option<(usize, f64)> {
     if atom_atlas.charts.is_empty() {
         return None;
     }
-    let d = atom.latent_dim;
-    let p = atom.output_dim();
-    let m = atom.basis_size();
     let mut best: Option<(usize, f64)> = None;
     for (idx, chart) in atom_atlas.charts.iter().enumerate() {
         if chart.certified_radius <= 0.0 {
             continue;
         }
-        let coords = match chart.region.center.view().to_shape((1, d)) {
-            Ok(c) => c.to_owned(),
-            Err(_) => continue,
-        };
-        let Ok((phi, _jet)) = evaluator.evaluate(coords.view()) else {
-            continue;
-        };
-        // m(t_c) = Bᵀ Φ(t_c) (amplitude-1; routing is scale-tolerant).
-        let mut recon = Array1::<f64>::zeros(p);
-        for basis_col in 0..m {
-            let phi_v = phi[[0, basis_col]];
-            if phi_v == 0.0 {
-                continue;
-            }
-            for out in 0..p {
-                recon[out] += phi_v * atom.decoder_coefficients[[basis_col, out]];
-            }
+        // Reuse the offline-distilled `m(t_c) = B^T Phi(t_c)` (`chart.recon_center`)
+        // instead of re-evaluating the basis at a fixed center per row — see
+        // `nearest_charts_topk`. Distance accumulated in place, no temporary array.
+        let mut dist = 0.0;
+        for (r, xv) in chart.recon_center.iter().zip(x.iter()) {
+            let diff = r - xv;
+            dist += diff * diff;
         }
-        let diff = &recon - &x;
-        let dist = diff.dot(&diff);
         if best.map(|(_, b)| dist < b).unwrap_or(true) {
             best = Some((idx, dist));
         }
@@ -2728,40 +2771,30 @@ pub(crate) fn nearest_chart(
 pub(crate) fn nearest_charts_topk(
     atom_atlas: &AtomEncodeAtlas,
     x: ArrayView1<'_, f64>,
-    atom: &SaeManifoldAtom,
-    evaluator: &dyn SaeBasisEvaluator,
+    _atom: &SaeManifoldAtom,
+    _evaluator: &dyn SaeBasisEvaluator,
     k: usize,
 ) -> Vec<usize> {
     if atom_atlas.charts.is_empty() || k == 0 {
         return Vec::new();
     }
-    let d = atom.latent_dim;
-    let p = atom.output_dim();
-    let m = atom.basis_size();
     let mut scored: Vec<(usize, f64)> = Vec::new();
     for (idx, chart) in atom_atlas.charts.iter().enumerate() {
         if chart.certified_radius <= 0.0 {
             continue;
         }
-        let coords = match chart.region.center.view().to_shape((1, d)) {
-            Ok(c) => c.to_owned(),
-            Err(_) => continue,
-        };
-        let Ok((phi, _jet)) = evaluator.evaluate(coords.view()) else {
-            continue;
-        };
-        let mut recon = Array1::<f64>::zeros(p);
-        for basis_col in 0..m {
-            let phi_v = phi[[0, basis_col]];
-            if phi_v == 0.0 {
-                continue;
-            }
-            for out in 0..p {
-                recon[out] += phi_v * atom.decoder_coefficients[[basis_col, out]];
-            }
+        // `m(t_c) = BᵀΦ(t_c)` is an OFFLINE per-chart constant already distilled
+        // into `chart.recon_center` at build time (bit-for-bit the same φ·decoder
+        // accumulation this used to recompute). Reuse it instead of re-evaluating
+        // the basis at a fixed center for every row — that re-eval was the encode's
+        // dominant per-row cost (charts × rows basis evals, each allocating the φ/jet
+        // arrays). `‖m(t_c) − x‖²` computed in place (no temporary diff array).
+        let mut dist = 0.0;
+        for (r, xv) in chart.recon_center.iter().zip(x.iter()) {
+            let diff = r - xv;
+            dist += diff * diff;
         }
-        let diff = &recon - &x;
-        scored.push((idx, diff.dot(&diff)));
+        scored.push((idx, dist));
     }
     // Sort by distance, then chart index for a deterministic, first-wins order
     // consistent with `nearest_chart`'s strict-`<` tie rule.

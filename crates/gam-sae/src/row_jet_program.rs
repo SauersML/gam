@@ -128,19 +128,23 @@ impl AtomRowBasisJet {
             }
         }
         // ½ Σ_ab d²Φ · δ_a δ_b, the quadratic term of the local Taylor model.
+        // Hoist the axis_a fixed-slot skip and `va` build out of the inner loop.
         for axis_a in 0..self.latent_dim {
+            let slot_a = coord_slots[axis_a];
+            if slot_a == SAE_FIXED_COORD_SLOT {
+                continue;
+            }
+            let va = S::variable(0.0, slot_a);
             for axis_b in 0..self.latent_dim {
                 let d2 = self.d2_phi[basis_col][axis_a][axis_b];
                 if d2 == 0.0 {
                     continue;
                 }
-                if coord_slots[axis_a] == SAE_FIXED_COORD_SLOT
-                    || coord_slots[axis_b] == SAE_FIXED_COORD_SLOT
-                {
+                let slot_b = coord_slots[axis_b];
+                if slot_b == SAE_FIXED_COORD_SLOT {
                     continue;
                 }
-                let va = S::variable(0.0, coord_slots[axis_a]);
-                let vb = S::variable(0.0, coord_slots[axis_b]);
+                let vb = S::variable(0.0, slot_b);
                 acc = acc.add(&va.mul(&vb).scale(0.5 * d2));
             }
         }
@@ -978,10 +982,17 @@ impl SaeReconstructionRowProgram {
             }
         }
         for axis_a in 0..latent {
+            // Hoist the fixed-slot skip and the `va` variable build out of the
+            // inner axis_b loop: both depend only on axis_a, so the old code
+            // rebuilt `va` and re-tested the slot `latent` times per axis_a.
+            let slot_a = coord_slots[axis_a];
+            if slot_a == SAE_FIXED_COORD_SLOT {
+                continue;
+            }
+            let va = O2x4::<K>::variable(l_splat(0.0), slot_a);
             for axis_b in 0..latent {
-                if coord_slots[axis_a] == SAE_FIXED_COORD_SLOT
-                    || coord_slots[axis_b] == SAE_FIXED_COORD_SLOT
-                {
+                let slot_b = coord_slots[axis_b];
+                if slot_b == SAE_FIXED_COORD_SLOT {
                     continue;
                 }
                 let mut d2 = [0.0; LANES];
@@ -998,8 +1009,7 @@ impl SaeReconstructionRowProgram {
                 for lane in 0..LANES {
                     half_d2[lane] = 0.5 * d2[lane];
                 }
-                let va = O2x4::<K>::variable(l_splat(0.0), coord_slots[axis_a]);
-                let vb = O2x4::<K>::variable(l_splat(0.0), coord_slots[axis_b]);
+                let vb = O2x4::<K>::variable(l_splat(0.0), slot_b);
                 acc = acc.add(&va.mul(&vb).scale(half_d2));
             }
         }
@@ -1090,13 +1100,25 @@ impl SaeReconstructionRowProgram {
         }
         let p = head.out_dim();
         let gates: Vec<O2x4<K>> = head.all_gates_o2x4::<K>(&rows, inv_tau);
-        let bases: Vec<Vec<O2x4<K>>> = head
+        // Build a jet tower ONLY for the basis columns that actually decode to
+        // something: a column whose decoder row is identically zero across every
+        // output channel AND every lane contributes exactly zero to all `p` output
+        // sums, so both its (expensive) O2x4 tower build and its per-output gather
+        // are pure waste. Skipping it is bit-identical — the old inner `any` guard
+        // already dropped the scaled add, this just also drops the dead tower build
+        // and the dead re-gather across all `p` columns. Each atom keeps a compact
+        // `(basis_col, tower)` list of its live columns.
+        let bases: Vec<Vec<(usize, O2x4<K>)>> = head
             .atoms
             .iter()
             .enumerate()
             .map(|(atom, atom_jet)| {
                 (0..atom_jet.n_basis())
-                    .map(|b| Self::basis_tower_o2x4::<K>(&rows, atom, b, &head.coord_slot[atom]))
+                    .filter(|&b| {
+                        rows.iter()
+                            .any(|r| (0..p).any(|c| r.atoms[atom].decoder[b][c] != 0.0))
+                    })
+                    .map(|b| (b, Self::basis_tower_o2x4::<K>(&rows, atom, b, &head.coord_slot[atom])))
                     .collect()
             })
             .collect();
@@ -1104,18 +1126,18 @@ impl SaeReconstructionRowProgram {
             [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
         for c in 0..p {
             let mut acc = O2x4::<K>::constant(l_splat(0.0));
-            for (atom, atom_jet) in head.atoms.iter().enumerate() {
+            for atom in 0..head.atoms.len() {
                 let mut decoded = O2x4::<K>::constant(l_splat(0.0));
-                for basis_col in 0..atom_jet.n_basis() {
+                for (basis_col, tower) in &bases[atom] {
                     let mut coeff = [0.0; LANES];
                     let mut any = false;
                     for (lane, r) in rows.iter().enumerate() {
-                        let v = r.atoms[atom].decoder[basis_col][c];
+                        let v = r.atoms[atom].decoder[*basis_col][c];
                         coeff[lane] = v;
                         any |= v != 0.0;
                     }
                     if any {
-                        decoded = decoded.add(&bases[atom][basis_col].scale(coeff));
+                        decoded = decoded.add(&tower.scale(coeff));
                     }
                 }
                 acc = acc.add(&gates[atom].mul(&decoded));

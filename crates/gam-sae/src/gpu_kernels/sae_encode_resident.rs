@@ -1298,7 +1298,7 @@ mod device {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::basis::EuclideanPatchEvaluator;
+    use crate::basis::{EuclideanPatchEvaluator, SaeBasisEvaluator};
     use crate::encode::{AtlasConfig, EncodeAtlas};
     use crate::manifold::{SaeAtomBasisKind, SaeManifoldAtom};
     use ndarray::{Array1, Array2};
