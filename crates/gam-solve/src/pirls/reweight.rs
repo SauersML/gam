@@ -953,16 +953,55 @@ where
             } {
                 Ok(()) => &newton_direction,
                 Err(e) => {
-                    if has_constraints {
-                        return Err(EstimationError::ParameterConstraintViolation(format!(
-                            "constrained PIRLS step solve failed at iteration {iter} with damping λ={loop_lambda:.3e}: {e}"
-                        )));
-                    }
-                    // Singular even with ridge (unlikely unless huge). Increase lambda.
+                    // The constrained active-set Newton inner solve can fail to
+                    // reach a feasible constrained stationary point when the
+                    // working-weight Hessian is near-singular — the #1786 low-count
+                    // log-link regime, where `W ≈ μ → 0` leaves the KKT system
+                    // ill-conditioned (KKT primal feasible but stationarity/dual
+                    // blown up). The FIRST recourse is exactly the recourse an
+                    // unconstrained singular solve takes: escalate the LM damping
+                    // `λ` and retry. `H + λD²` grows better-conditioned as `λ`
+                    // increases, so the same active-set solve on the damped system
+                    // converges — this is resolution #1 (regularize the
+                    // near-singular Hessian) applied through the existing trust
+                    // machinery, and it keeps the constrained and unconstrained
+                    // singular-solve paths in lockstep.
                     if lm_can_retry(loop_lambda) {
                         lm_solve_total += attempt_solve_start.elapsed();
                         madsen_escalator.escalate(&mut loop_lambda);
                         continue;
+                    }
+                    if has_constraints {
+                        // Damping is exhausted and the constrained solve still can
+                        // not produce a step. Rather than hard-error here (which
+                        // bubbles to a NON-CONVERGED outer REML whose keep-best then
+                        // silently ships the last, possibly INFEASIBLE β — the exact
+                        // #1786 defect), fall back to a FEASIBILITY-RESTORING step:
+                        // project the current β strictly into the feasible cone and
+                        // move toward the projection. This never leaves the feasible
+                        // region and lets the PIRLS loop reach the post-loop
+                        // feasibility guard, which certifies (and, if needed,
+                        // re-projects) the returned coefficients so the shipped model
+                        // honors `A·β ≥ 0`. If even the projection is unavailable we
+                        // surface the failure honestly instead of shipping garbage.
+                        let restored = options.linear_constraints.as_ref().and_then(|lin| {
+                            crate::active_set::project_point_strictly_into_feasible_cone(
+                                beta.as_ref(),
+                                lin,
+                            )
+                        });
+                        match restored {
+                            Some(feasible_beta) => {
+                                newton_direction.assign(&feasible_beta);
+                                newton_direction -= beta.as_ref();
+                                &newton_direction
+                            }
+                            None => {
+                                return Err(EstimationError::ParameterConstraintViolation(format!(
+                                    "constrained PIRLS step solve failed at iteration {iter} with damping λ={loop_lambda:.3e} and no feasible projection onto the constraint cone was available: {e}"
+                                )));
+                            }
+                        }
                     } else {
                         // Fallback to gradient descent
                         newton_direction.assign(&state.gradient);
@@ -2173,6 +2212,72 @@ where
                  Δdev={last_deviance_change:.3e})"
             );
             status = PirlsStatus::StalledAtValidMinimum;
+        }
+    }
+
+    // Post-loop constraint-feasibility guard (#1786).
+    //
+    // A shape-constrained smooth (`monotone_increasing`, `convex`, `concave`)
+    // under a NON-canonical log-link family (Poisson / Gamma) in the low-count
+    // regime has IRLS working weights `W ≈ μ` that collapse toward zero, so the
+    // constrained active-set Newton inner solve can be too ill-conditioned to
+    // reach a feasible constrained stationary point. When that happens the inner
+    // solve either failed (bubbling up as `ParameterConstraintViolation`) or the
+    // outer keep-best/best-iterate substitution shipped the LAST iterate — whose
+    // β may VIOLATE the constraints `A·β ≥ 0`, producing point predictions that
+    // are NOT monotone. The contract is family/link independent: a returned
+    // `monotone_increasing` model MUST have non-decreasing point predictions.
+    //
+    // So before finalizing, if this fit carries explicit linear-inequality
+    // constraints and the converged β is primal-INFEASIBLE beyond the published
+    // active-set tolerance, PROJECT β onto the feasible cone (the minimal-L2 move
+    // into `A·β ≥ 0`). The projection is exact and always monotone-feasible when
+    // it succeeds, so the shipped β honors the constraint. If no feasible repair
+    // can be reached we surface the violation to the caller as an error rather
+    // than silently shipping an infeasible model. Because the projected β differs
+    // from the pre-projection β, the working `state` (gradient / Hessian) is
+    // re-evaluated at the projected β below so the exported curvature and the
+    // shipped coefficients stay consistent; feasible fits (the common case) never
+    // enter this branch and pay only one cheap feasibility check.
+    if let Some(lin) = options.linear_constraints.as_ref() {
+        let primal_feasibility =
+            compute_constraint_kkt_diagnostics(beta.as_ref(), &state.gradient, lin)
+                .primal_feasibility;
+        if primal_feasibility > crate::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
+            let projected = crate::active_set::project_point_strictly_into_feasible_cone(
+                beta.as_ref(),
+                lin,
+            )
+            .filter(|candidate| {
+                compute_constraint_kkt_diagnostics(candidate, &state.gradient, lin)
+                    .primal_feasibility
+                    <= crate::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
+            });
+            match projected {
+                Some(feasible_beta) => {
+                    log::warn!(
+                        "[PIRLS] constrained fit converged to an INFEASIBLE β \
+                         (primal={primal_feasibility:.3e} > \
+                         {tol:.3e}); projecting onto the feasible cone so the \
+                         returned model honors A·β ≥ 0 (#1786)",
+                        tol = crate::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL,
+                    );
+                    beta = Coefficients::new(feasible_beta);
+                    // Re-evaluate the working state at the projected β so the
+                    // exported gradient / Hessian match the shipped coefficients.
+                    state = model.update_with_curvature(&beta, state.hessian_curvature)?;
+                }
+                None => {
+                    return Err(EstimationError::ParameterConstraintViolation(format!(
+                        "constrained PIRLS converged to an infeasible coefficient vector \
+                         (primal feasibility {primal_feasibility:.3e} exceeds tolerance \
+                         {tol:.3e}) and no feasible projection onto the constraint cone \
+                         could be found; refusing to return a model whose point predictions \
+                         violate the requested shape constraint (#1786)",
+                        tol = crate::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL,
+                    )));
+                }
+            }
         }
     }
 

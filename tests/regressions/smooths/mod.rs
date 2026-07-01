@@ -20,6 +20,7 @@ mod matern_2d_kappa_nonconvergence;
 mod matern_aniso_input_loc;
 mod matern_zero_aniso_overridden_by_geometry;
 mod monotone_shape_smooth_aborts_fit;
+mod monotone_shape_smooth_log_link_low_count_1786;
 mod new_smooths_misc_regressions;
 mod numeric_by_smooth_column_not_loaded_from_cli;
 mod overlapping_smooth_predict_design_mismatch;
