@@ -78,194 +78,12 @@ jobs:
           cache-all-crates: true
           shared-key: reference-quality
 
-      - name: Install system libraries for reference tools
-        shell: bash
-        run: |
-          set -uo pipefail
-          # Several reference packages link system libs that are NOT on the bare
-          # runner, so they fail to load at test time and the test reports a
-          # spurious "reference unavailable" divergence instead of a real metric:
-          #   libudunits2  -> units/sf (spatial, manifold refs)
-          #   libGLU/mesa  -> rgl (loaded transitively by some geometry refs)
-          #   gsl          -> INLA and gsl-based refs
-          #   gdal/geos/proj -> sf spatial stack
-          # INLA additionally ships PRECOMPILED native binaries (the `inla` and
-          # `fmesher` programs that its R layer dyn.load()s). On a runner those
-          # programs fail to start — the "unable to load shared object"/dyn.load
-          # error in the issue — unless their full runtime link set is present:
-          #   libgfortran5 / libquadmath0 -> the Fortran-built numerics
-          #   libgomp1                    -> OpenMP runtime the binaries thread on
-          #   libmetis / libsuitesparse   -> the sparse-Cholesky path INLA calls
-          #   libjpeg / libpng / libtiff  -> imaging libs linked by the bundled bin
-          sudo apt-get update -y || true
-          sudo apt-get install -y --no-install-recommends \
-            libudunits2-dev libglu1-mesa-dev libgsl-dev \
-            libgdal-dev libgeos-dev libproj-dev \
-            libgfortran5 libquadmath0 libgomp1 \
-            libmetis5 libsuitesparse-dev \
-            libjpeg-turbo8 libpng16-16 libtiff6 || true
-
-      - name: Set up R
-        uses: ./.github/actions/setup-bench-r
-
-      - name: Install R reference packages
-        shell: bash
-        run: |
-          set -uo pipefail
-          # Posit Public Package Manager serves per-distro Linux BINARIES -> fast
-          # installs, but ONLY when the codename in the URL matches the runner's
-          # actual OS *and* its R minor. `ubuntu-latest` migrated jammy (22.04)
-          # -> noble (24.04): a hardcoded `/jammy/` path serves binaries built
-          # against jammy's R while the runner now ships noble's newer R, so every
-          # binary mismatches and install silently falls back to a source build
-          # that the old `try(silent=TRUE)` swallowed -> the "no package called
-          # 'tram'/'scoringrules'" + "dependency 'gsl' is not available" REF_ERRORs
-          # (#1071). Derive the codename from the live runner so the binary
-          # snapshot always matches the R that loads the packages.
-          . /etc/os-release
-          CODENAME="${VERSION_CODENAME:-noble}"
-          POSIT="https://packagemanager.posit.co/cran/__linux__/${CODENAME}/latest"
-          echo "Posit binary repo: $POSIT"
-          export POSIT CODENAME
-          Rscript -e '
-            posit <- Sys.getenv("POSIT")
-            # Canonical source-capable CRAN as a SECOND repo so any package the
-            # distro binary snapshot lacks resolves from source instead of failing
-            # as "not available for this version of R".
-            options(repos = c(POSIT = posit, CRAN = "https://cloud.r-project.org"))
-            pkgs <- c("mgcv","survival","gamlss","gamlss.data","gamlss.dist","gamlss.cens",
-                      "flexsurv","rstpm2","VGAM","nnet","MASS","ordinal","betareg",
-                      "scam","splines2","cmprsk","lme4","nlme","fields","gss","GpGp",
-                      "gsl","quantreg","mlt","tram","basefun","loo","jsonlite",
-                      "spheresmooth","Directional","nprotreg","compositions",
-                      "robCompositions","scoringrules","gamboostLSS","mboost","bamlss",
-                      "gamlss.add")
-            for (p in pkgs) if (!requireNamespace(p, quietly=TRUE))
-              try(install.packages(p), silent=TRUE)
-            # SECOND pass: anything still missing (a binary that mismatched the
-            # runner R, or a snapshot gap such as scoringrules / tram / gsl) is
-            # force-built from SOURCE off canonical CRAN, where every CRAN package
-            # is always available for the current R. This is the durable cure for
-            # the REF_ERRORs rather than papering over a distro/R-version skew.
-            missing <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly=TRUE)]
-            if (length(missing)) {
-              cat("retrying from SOURCE:", paste(missing, collapse=", "), "\n")
-              for (p in missing)
-                try(install.packages(p, type = "source",
-                                     repos = "https://cloud.r-project.org"), silent=TRUE)
-            }
-            # These are required by the always-on stack verification below. Do
-            # not let a swallowed install error defer the failure until the
-            # load-check step, where the real CRAN/source-build error is gone.
-            core <- c("mgcv","survival","gamlss","gamlss.data","gamlss.dist")
-            core_missing <- core[!vapply(core, requireNamespace, logical(1), quietly=TRUE)]
-            if (length(core_missing)) {
-              cat("installing required R refs explicitly:",
-                  paste(core_missing, collapse=", "), "\n")
-              install.packages(core_missing, dependencies = TRUE,
-                               repos = "https://cloud.r-project.org")
-            }
-            core_missing <- core[!vapply(core, requireNamespace, logical(1), quietly=TRUE)]
-            if (length(core_missing))
-              stop("required R reference packages still missing: ",
-                   paste(core_missing, collapse=", "))
-            cat("installed R packages:\n")
-            for (p in pkgs) cat(sprintf("  %-14s %s\n", p, requireNamespace(p, quietly=TRUE)))
-          '
-          # R-INLA is not on CRAN; it ships from its own repository. Best-effort
-          # (large download); tests that need it fail loudly if it is unavailable.
-          # INLA's loader pulls in the Bioconductor packages `graph`/`Rgraphviz`
-          # (the run annotated "dependencies 'Rgraphviz','gsl','graph' are not
-          # available" + a dyn.load failure) and `fmesher`, so install those
-          # first (gsl/graphviz system libs come from the apt step above).
-          Rscript -e '
-            options(repos = c(POSIT = Sys.getenv("POSIT"),
-                              CRAN = "https://cloud.r-project.org"))
-            if (!requireNamespace("BiocManager", quietly=TRUE)) try(install.packages("BiocManager"), silent=TRUE)
-            for (p in c("graph","Rgraphviz"))
-              if (!requireNamespace(p, quietly=TRUE)) try(BiocManager::install(p, update=FALSE, ask=FALSE), silent=TRUE)
-            for (p in c("fmesher","sp","foreach"))
-              if (!requireNamespace(p, quietly=TRUE)) try(install.packages(p), silent=TRUE)
-          '
-          # INLA's bundled native binary must match the runner OS. Map the live
-          # Ubuntu codename to the INLA "os" tag rather than hardcoding 22.04,
-          # which is wrong now that ubuntu-latest is noble (24.04).
-          case "$CODENAME" in
-            noble)  INLA_OS="Ubuntu-24.04" ;;
-            jammy)  INLA_OS="Ubuntu-22.04" ;;
-            focal)  INLA_OS="Ubuntu-20.04" ;;
-            *)      INLA_OS="Ubuntu-22.04" ;;
-          esac
-          export INLA_OS
-          Rscript -e '
-            options(repos = c(POSIT = Sys.getenv("POSIT"),
-                              INLA = "https://inla.r-inla-download.org/R/stable",
-                              CRAN = "https://cloud.r-project.org"))
-            if (!requireNamespace("INLA", quietly=TRUE))
-              try(install.packages("INLA", dependencies=TRUE), silent=TRUE)
-            # The R package installs fine; the failure mode in the issue is that
-            # its BUNDLED native binaries (the `inla`/`fmesher` programs the R
-            # layer shells/dyn.loads) do not match this runner, so the namespace
-            # load aborts. INLA ships per-OS native builds; fetch the one matching
-            # this host non-interactively so the binary actually runs.
-            if (requireNamespace("INLA", quietly=TRUE)) {
-              try({
-                suppressMessages(library(INLA))
-                INLA::inla.binary.install(os = Sys.getenv("INLA_OS"))
-              }, silent = TRUE)
-            }
-            cat(sprintf("  %-14s %s\n", "INLA", requireNamespace("INLA", quietly=TRUE)))
-          '
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-
-      - name: Install Python reference libraries
-        shell: bash
-        run: |
-          set -uo pipefail
-          python -m pip install --upgrade pip
-          # Core (must succeed); heavy/optional ones best-effort so one failure
-          # does not block the rest.
-          #
-          # statsmodels: pin <0.14.2. Newer releases broke GLMGam.select_penweight
-          # — its GCV path reads `self.scale`, which the GLMGam results no longer
-          # expose, raising "'GLMGam' object has no attribute 'scale'" INSIDE
-          # statsmodels (generalized_additive_model.py:814), failing the GLMGam
-          # reference tests through no fault of the comparator script (#1070).
-          # 0.14.1 is the last release whose select_penweight GCV runs clean.
-          pip install "numpy<2" pandas scipy scikit-learn "statsmodels<0.14.2"
-          pip install pygam lifelines scikit-survival properscoring scoringrules || true
-          pip install geomstats GPy gpytorch || true
-          # arviz: pin <1.0. arviz 1.x rewrote `from_dict`, dropping the
-          # `posterior=`/`log_likelihood=` keyword constructors the NUTS and
-          # loo/PSIS reference scripts use ("from_dict() got an unexpected keyword
-          # argument 'posterior'/'log_likelihood'", #1070). The 0.x line keeps the
-          # documented kwarg constructor the scripts are written against.
-          pip install numpyro "arviz<1.0" pymc || true
-          pip install interpret ngboost || true
-          pip install xgboostlss lightgbmlss || true
-          python -c "import numpy,scipy,sklearn,statsmodels,pandas; print('core python refs ok')"
-
-      - name: Verify R stack loads
-        shell: bash
-        run: |
-          set -uo pipefail
-          Rscript -e 'for (p in c("mgcv","gamlss","survival")) library(p, character.only=TRUE); cat("R core refs ok\n")'
-          # Surface the EXACT load error for the two tools this job provisions but
-          # cannot hard-require (large/native): INLA's bundled-binary dyn.load and
-          # the source-built scoringrules. Non-fatal — the quality suite classifies
-          # a still-missing tool as REF_ERROR — but the captured message tells us
-          # precisely which system lib / binary arch is still missing if it recurs.
-          Rscript -e '
-            for (p in c("INLA","scoringrules")) {
-              ok <- tryCatch({ suppressMessages(library(p, character.only=TRUE)); TRUE },
-                             error = function(e) { cat(sprintf("%s load error: %s\n", p, conditionMessage(e))); FALSE })
-              cat(sprintf("  %-12s loadable=%s\n", p, ok))
-            }
-          ' || true
+      # Provision the full mature-tool reference stack (system libs + R + CRAN/
+      # Bioconductor/INLA packages + Python + the scientific reference libs).
+      # Shared with the Rust CI test shards (test.yml) via one composite action
+      # so the two provisioning paths can never drift.
+      - name: Install reference tool stack (R + Python mature comparators)
+        uses: ./.github/actions/install-reference-tools
 
       - name: Build quality tests
         shell: bash
@@ -311,8 +129,8 @@ jobs:
           set +e -u -o pipefail
           pass=0; metricoff=0; gamerr=0; referr=0; testerr=0; tmo=0; bf=0
           # REF_ERROR among comparators the job GUARANTEES are installed (the
-          # `Verify R stack loads` step hard-fails if mgcv/gamlss/survival do not
-          # load). For those tests a lost reference is a genuine breakage, not the
+          # install-reference-tools action hard-fails if mgcv/gamlss/survival do
+          # not load). For those tests a lost reference is a genuine breakage, not the
           # tolerated "optional native tool missing" case (INLA/scoringrules/PyMC),
           # so it must gate the run rather than be absorbed by the 25% global floor.
           guaranteed_referr=0
@@ -529,7 +347,7 @@ jobs:
           # passing without reference coverage"). The 25% global floor below tolerates
           # missing OPTIONAL native references (INLA/scoringrules/PyMC). But the job
           # HARD-VERIFIES that mgcv/gamlss/survival load before running (the
-          # `Verify R stack loads` step fails otherwise), so a REF_ERROR on any test
+          # install-reference-tools action fails otherwise), so a REF_ERROR on any test
           # backed by one of those is NOT a missing-infra waiver — it is a genuine
           # breakage that silently dropped a gam-vs-mature-tool comparison. Require
           # 100% reference coverage for the guaranteed comparators: a single such

@@ -320,6 +320,32 @@ jobs:
         with:
           tool: nextest
 
+      # The whole-workspace test surface now includes the reference-quality
+      # tests under tests/quality/** (the completeness fix, #1624). Those tests
+      # shell out to Rscript / python3 and the reference harness
+      # (crates/gam-test-support/src/reference.rs) treats a missing interpreter
+      # or package as a HARD failure — never a silent skip — so without this
+      # stack every quality_vs_* / manifold / survival reference test in the
+      # shard panics with "spawn Rscript ... NotFound" or "No module named
+      # 'numpy'" (hundreds of spurious FAILs, not real gam bugs). Provision the
+      # same mature-tool stack the reference-quality dashboard uses (shared
+      # composite action, so the two cannot drift).
+      - name: Free disk space for the reference stack
+        shell: bash
+        run: |
+          set -uo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo rm -rf "${AGENT_TOOLSDIRECTORY:-}" || true
+          df -h /
+
+      - name: Install reference tool stack (R + Python mature comparators)
+        uses: ./.github/actions/install-reference-tools
+
       - name: Download workspace test archive
         uses: actions/download-artifact@v4
         continue-on-error: true # archive may be absent if the workspace failed to compile
