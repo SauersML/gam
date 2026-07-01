@@ -39,10 +39,19 @@ ALPHA = 0.05
 
 def _record(x: np.ndarray, y: np.ndarray) -> dict[str, float]:
     model = gamfit.fit({"x": list(x), "y": list(y)}, "y ~ s(x)")
-    edf = float(model.summary().edf_total)
+    summary = model.summary()
+    # The whole-term LR reference d.f. is a property of the SMOOTH TERM alone, so
+    # the quantity it must dominate is the term's own effective d.f. — not the
+    # model total, which also carries the unpenalized intercept (exactly 1 d.f.
+    # under the identity link for a single-smooth model). Subtracting it gives the
+    # term edf; without this correction a fully-collapsed smooth (term_edf ~ 0,
+    # model total ~ 1.0000+eps) trips the ref_df >= edf invariant by ~1e-5 even
+    # though ref_df (floored at 1) sits vastly ABOVE the true term edf.
+    term_edf = max(float(summary.edf_total) - 1.0, 0.0)
     rec = model.smooth_significance({"x": list(x), "y": list(y)})[0]
     return {
-        "edf": edf,
+        "edf": term_edf,
+        "edf_total": float(summary.edf_total),
         "W": float(rec["statistic_lr"]),
         "ref_df": float(rec["ref_df"]),
         "p_corrected": float(rec["p_value_corrected"]),
@@ -51,23 +60,24 @@ def _record(x: np.ndarray, y: np.ndarray) -> dict[str, float]:
 
 
 def test_ref_df_never_below_term_edf_invariant() -> None:
-    # The whole-term LR reference d.f. must satisfy ref_df >= edf for every fit,
-    # including the near-flat fits whose smooth collapses to edf == 1.0 (where
-    # the degenerate tr(F)^2/tr(F^2) used to crash ref_df to ~1e-12).
+    # The whole-term LR reference d.f. must satisfy ref_df >= term_edf for every
+    # fit, including the near-flat fits whose smooth collapses to term_edf -> 0
+    # (where the degenerate tr(F)^2/tr(F^2) used to crash ref_df to ~1e-12).
     violations: list[dict[str, float]] = []
     for seed in range(16):
         rng = np.random.default_rng(seed)
         x = np.linspace(0.0, 1.0, N)
-        y = 0.01 * rng.standard_normal(N)  # essentially constant -> edf -> 1.0
+        y = 0.01 * rng.standard_normal(N)  # essentially constant -> term_edf -> 0
         rec = _record(x, y)
-        # A small numerical slack: ref_df should not sit materially below edf.
+        # A small numerical slack: ref_df should not sit materially below the
+        # term's effective d.f.
         if rec["ref_df"] < rec["edf"] - 1e-6:
             violations.append({"seed": float(seed), **rec})
     assert not violations, (
         "ref_df fell below the term EDF (edf1 >= edf invariant broken) — the "
         "degenerate Wood tr(F)^2/tr(F^2) collapse is back. Offenders: "
         + "; ".join(
-            f"(seed={int(v['seed'])}, edf={v['edf']:.4f}, ref_df={v['ref_df']:.3g})"
+            f"(seed={int(v['seed'])}, term_edf={v['edf']:.4f}, ref_df={v['ref_df']:.3g})"
             for v in violations
         )
     )

@@ -3305,6 +3305,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                                 options.ridge_policy,
                                 &block_constraints,
                                 Some(cached_active_sets.as_slice()),
+                                joint_penalty_stationarity_score(options, specs, &states).as_ref(),
                             ) {
                                 Ok(stall_projected_residual_vec) => {
                                     projected_residual_range_space_inf(
@@ -3708,6 +3709,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     options.ridge_policy,
                     &block_constraints,
                     Some(cached_active_sets.as_slice()),
+                    joint_penalty_stationarity_score(options, specs, &states).as_ref(),
                 )?;
             let block_stationarity_norms = {
                 let mut offset = 0usize;
@@ -5442,6 +5444,8 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             let ift_gradient = augmented_joint_gradient
                 .as_ref()
                 .or(cached_joint_gradient.as_ref());
+            let joint_penalty_score =
+                joint_penalty_stationarity_score(options, specs, &states);
             let kkt_residual = exact_newton_joint_kkt_residual_for_ift_from_cached_gradient(
                 family,
                 specs,
@@ -5451,6 +5455,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 options.ridge_policy,
                 Some(cached_active_sets.as_slice()),
                 ift_gradient,
+                joint_penalty_score.as_ref(),
             )?;
             let kkt_residual =
                 require_projected_kkt_residual(kkt_residual, "joint-Newton converged exit")?;
@@ -6644,6 +6649,7 @@ pub(crate) fn assemble_inner_blockwise_result<F: CustomFamily + Clone + Send + S
                     options.ridge_policy,
                     &block_constraints,
                     Some(cached_active_sets.as_slice()),
+                    joint_penalty_stationarity_score(options, specs, &states).as_ref(),
                 )?
                 .map(|r| r.with_metadata(last_residual_tol, free_rank_at_cert))
             }

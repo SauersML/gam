@@ -9149,24 +9149,53 @@ pub fn smooth_term_lr_inference_forspec(
         // the dimension the term spans when present — its joint null-space
         // dimension (`null_dim`), the effective d.f. it uses in the fit (`edf`),
         // and never below 1 (you cannot test "is this function present" with
-        // fewer than one degree of freedom). The Wood truncation `tr(F)²/tr(F²)`
-        // is the Wood (2013) "edf1"-style reference and dominates in calibrated
-        // and high-power fits, BUT the coefficient influence `F = H⁻¹X'WX` is
-        // NON-symmetric, and as REML shrinks a term onto its null space the
-        // off-diagonal coupling in the term block blows up: `tr(F²) = Σ_ij F_ij
-        // F_ji` runs away while `tr(F) = edf` stays small, so `tr(F)²/tr(F²)`
-        // collapses toward 0. Referencing a positive `W` against `χ²_{~0}` then
-        // reports a flat, shrunk-to-null term as MAXIMALLY significant (`p ~
-        // 1e-12`) — a Type-I error decided by a degenerate reference d.f., not the
-        // data (#1766). Flooring at `max(edf, null_dim, 1)` binds ONLY on that
-        // degenerate collapse and leaves calibrated/high-power fits at the Wood
-        // d.f. (`edf` and `null_dim` never exceed it there). This mirrors the
-        // summary Wald path, which floors the same Wood trace at its statistic
-        // rank for the same reason.
+        // fewer than one degree of freedom). The primary reference is Wood's
+        // smoothing-selection-corrected `edf1 = 2·tr(F) − tr(F²)`
+        // (`wood_reference_df`), which dominates in calibrated and high-power
+        // fits and removes the post-selection left-tail anti-conservatism the raw
+        // `edf` reference leaves behind. The floor guards the DEGENERATE collapse:
+        // as REML shrinks a term fully onto its null space `edf1 → edf → ~0` and
+        // the non-symmetric `F = H⁻¹X'WX` can make the block `tr(F²)` numerically
+        // unreliable, so `wood_reference_df` returns `None` and the floor supplies
+        // `max(edf, null_dim, 1)`. Without a floor, a positive `W` referenced
+        // against `χ²_{~0}` would report a flat, shrunk-to-null term as MAXIMALLY
+        // significant (`p ~ 1e-12`) — a Type-I error decided by a degenerate
+        // reference d.f., not the data (#1766). The floor binds ONLY on that
+        // collapse; `edf` and `null_dim` never exceed `edf1` in a healthy fit.
+        // This mirrors the summary Wald path, which floors its reference at the
+        // statistic's own rank for the same reason.
+        //
+        // Trust that tight `edf1` reference ONLY when the outer fit CONVERGED. A
+        // non-converged fit — the flat-valley REML stall on an unidentified term
+        // (#1762): outer iterations rail out and the null-space shrinkage λ
+        // saturates ~1e13 — leaves the influence-based `edf` INCONSISTENT with
+        // the fitted coefficients: the term still carries a large, wiggly `β`
+        // (so the refit-based LR statistic `W` is large) yet `tr(F) = edf` reads
+        // ~0. Referencing that large `W` against `edf1 ≈ edf ≈ 0` manufactures
+        // significance — measured null false-positive rate ~0.62 on the
+        // non-converged noise fits, versus a well-calibrated ~0.06 on the
+        // converged ones (the entire residual miscalibration lives here). The
+        // summary Wald path already sidesteps this: its statistic is truncated to
+        // the ~0-`edf` rank, so it collapses to ~0 and the term is skipped. The
+        // whole-term LR statistic cannot self-truncate (it is a refit deviance
+        // difference), so we instead widen its REFERENCE: when the fit did not
+        // converge, floor `ref_df` at the term's full basis dimension — the
+        // maximally-honest reference (an untrusted term may occupy up to all its
+        // columns). A genuine effect still rejects (`W` ≫ its column count);
+        // a tiny-`W` collapse still gives `p ≈ 1`; only the spurious
+        // large-`W`/zero-`edf` non-convergence artifact is neutralised. The
+        // underlying stall itself is #1762; this keeps the inference honest on
+        // top of whatever fit it is handed.
+        let unconverged_dim_floor = if full.fit.outer_converged {
+            0.0
+        } else {
+            coeff_range.len() as f64
+        };
         let ref_df = wood_reference_df(influence, &coeff_range)
             .unwrap_or(0.0)
             .max(edf)
             .max(null_dim as f64)
+            .max(unconverged_dim_floor)
             .max(1.0);
         if !(ref_df.is_finite() && ref_df > 0.0) {
             continue;
@@ -9339,11 +9368,29 @@ fn lawley_dispersion_for_family(family: &LikelihoodSpec, fit: &UnifiedFitResult)
     }
 }
 
-/// Wood's rank-corrected reference d.f. `tr(F_jj)² / tr(F_jj²)` on the
-/// coefficient-influence block `F = H⁻¹ X'WX` restricted to `coeff_range`. This
-/// is the same reference the summary Wald row uses, so the corrected LR and the
-/// Wald test reference the *same* `χ²_d`. Returns `None` when the influence
-/// block is unavailable or degenerate.
+/// Wood's smoothing-selection-corrected reference d.f. `edf1 = 2·tr(F_jj) −
+/// tr(F_jj²)` on the coefficient-influence block `F = H⁻¹ X'WX` restricted to
+/// `coeff_range` (mgcv's `edf1`). This is the reference degrees of freedom
+/// Wood (2013) recommends for a smooth-component significance test when the
+/// smoothing parameter is *estimated* (as it always is here): it inflates the
+/// raw effective d.f. `edf = tr(F)` by the selection-bias term
+/// `tr(F) − tr(F²) = Σ_i λ_i(1 − λ_i) ≥ 0` (the F-block eigenvalues `λ_i` lie in
+/// `[0, 1]`), which is exactly the excess variance the fit spends locating a
+/// term on noise. Referencing the whole-term LR statistic against this larger
+/// `edf1` instead of the raw `edf` removes the post-selection left-tail
+/// anti-conservatism (a REML fit that turns a smooth *on* against pure noise no
+/// longer over-rejects): with the raw `edf` reference the mean null p-value is a
+/// calibrated ~0.5 but the 5%-level false-positive rate runs ~0.15; the `edf1`
+/// correction pulls it toward the nominal α while leaving the collapsed-term
+/// verdict (`W ≈ 0 ⇒ p ≈ 1`) untouched.
+///
+/// `edf1 ∈ [edf, 2·edf]` analytically, so it never collapses toward 0 the way
+/// the earlier Satterthwaite ratio `tr(F)²/tr(F²)` did when the non-symmetric
+/// block's `tr(F²)` ran away (the #1766 degeneracy). The `.max(tr)` guard keeps
+/// it ≥ `edf` even if a corrupted block drives `tr(F²)` above `2·tr(F)`. Returns
+/// `None` when the influence block is unavailable or its trace is non-finite /
+/// non-positive (a fully shrunk term), in which case the caller falls back to
+/// the `max(edf, null_dim, 1)` floor.
 fn wood_reference_df(influence: Option<&Array2<f64>>, coeff_range: &Range<usize>) -> Option<f64> {
     let f = influence?;
     let (start, end) = (coeff_range.start, coeff_range.end);
@@ -9353,5 +9400,6 @@ fn wood_reference_df(influence: Option<&Array2<f64>>, coeff_range: &Range<usize>
     let block = f.slice(s![start..end, start..end]);
     let tr = (0..block.nrows()).map(|i| block[[i, i]]).sum::<f64>();
     let tr2 = block.dot(&block).diag().sum();
-    (tr.is_finite() && tr2.is_finite() && tr > 0.0 && tr2 > 0.0).then(|| (tr * tr / tr2).max(1e-12))
+    (tr.is_finite() && tr2.is_finite() && tr > 0.0)
+        .then(|| (2.0 * tr - tr2).max(tr).max(1e-12))
 }

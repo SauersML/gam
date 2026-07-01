@@ -1,7 +1,17 @@
-//! `periodic=true` / periodic tensor margins must require an explicit period.
-//! Inferring periods from the observed data span is sample-dependent: uniform
-//! draws on [0, 2π] usually have range [ε, 2π-ε], so using data max-min as the
-//! period creates off-by-ε seam discontinuities.
+//! Period-resolution contract, split by WHICH mechanism declares periodicity.
+//!
+//! A `periodic=true` FLAG (or a `bc=['periodic', ...]` selector) on an
+//! otherwise-open B-spline / radial margin must require an explicit period.
+//! There the true period is a modeling assumption distinct from the sample:
+//! uniform draws on [0, 2π] usually have range [ε, 2π-ε], so inferring the
+//! period from data max-min would create off-by-ε seam discontinuities.
+//!
+//! A cyclic *basis selector* (`cc`/`cyclic`, i.e. mgcv `bs="cc"`) is the
+//! opposite case: the basis is DEFINED to wrap over its knot range, whose
+//! default is the observed data range, with the two endpoint knots identified
+//! by construction. There is no separate "true period" to approximate, so —
+//! exactly like mgcv's `s(x, bs="cc")` and the tensor `cc` margin — a bare
+//! cyclic smooth must be accepted and wrap on `[min, max]`, not rejected.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
@@ -72,13 +82,54 @@ fn assert_rejects_missing_period(formula: &str, data: &gam::data::EncodedDataset
     );
 }
 
+/// A cyclic *basis selector* (`cc`/`cyclic`, mgcv `bs="cc"`) needs no explicit
+/// period: it wraps over the observed data range. Assert the fit is ACCEPTED
+/// and that the converged curve is genuinely periodic — fitted(min) ==
+/// fitted(max) — the defining structural property of a cyclic basis, which
+/// holds independent of fit quality.
+fn assert_accepts_and_wraps(formula: &str, data: &gam::data::EncodedDataset, feature: &str) {
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula(formula, data, &cfg).unwrap_or_else(|e| {
+        panic!("`{formula}` (cyclic basis) must fit by wrapping on the data range; got error: {e}")
+    });
+    let FitResult::Standard(fit) = result else {
+        panic!("`{formula}` expected a standard GAM fit");
+    };
+    let fidx = data.column_map()[feature];
+    let column = data.values.column(fidx);
+    let (lo, hi) = column.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
+        (lo.min(v), hi.max(v))
+    });
+    let probe = [lo, hi];
+    let mut design_pts = Array2::<f64>::zeros((probe.len(), data.headers.len()));
+    for (i, &x) in probe.iter().enumerate() {
+        design_pts[[i, fidx]] = x;
+    }
+    let design = build_term_collection_design(design_pts.view(), &fit.resolvedspec)
+        .expect("rebuild design at wrap endpoints");
+    let fitted = design.design.apply(&fit.fit.beta).to_vec();
+    let wrap_gap = (fitted[0] - fitted[1]).abs();
+    assert!(
+        wrap_gap < 1e-6,
+        "`{formula}` must wrap: |fitted(min) - fitted(max)| = {wrap_gap:.3e} (>= 1e-6)"
+    );
+}
+
 #[test]
 fn periodic_without_explicit_period_behavior_consistent() {
     init_parallelism();
     let data = make_data_on((0.0, TAU), TAU, 200, 11);
+    // A `periodic=true` FLAG on an open B-spline still requires an explicit
+    // period (the off-by-ε seam concern is real for a forced-periodic basis).
     assert_rejects_missing_period("y ~ s(t, periodic=true)", &data);
-    assert_rejects_missing_period("y ~ cyclic(t)", &data);
-    assert_rejects_missing_period("y ~ cc(t)", &data);
+    // A cyclic BASIS selector (mgcv `bs="cc"`) wraps on the observed data
+    // range and must be accepted — matching mgcv, the tensor `cc` margin, and
+    // the #874 / cc-margin regressions.
+    assert_accepts_and_wraps("y ~ cyclic(t)", &data, "t");
+    assert_accepts_and_wraps("y ~ cc(t)", &data, "t");
 }
 
 #[test]
