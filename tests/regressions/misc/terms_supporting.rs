@@ -19,8 +19,9 @@ fn bug_term_builder_duchon_defaults_and_rejection() {
     );
     assert_eq!(
         parse_duchon_order(&empty).expect("default duchon order should parse"),
-        DuchonNullspaceOrder::Zero,
-        "Duchon order with no explicit option should default to zero-order nullspace."
+        DuchonNullspaceOrder::Linear,
+        "Duchon order with no explicit option should default to the affine nullspace \
+         {1, x₁, …, x_d} used by the structural cubic Duchon default."
     );
 
     let mut bad = BTreeMap::<String, String>::new();
