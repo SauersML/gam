@@ -1318,8 +1318,13 @@ pub(crate) fn try_mixed_precision_arrow_solve(
         }));
     }
 
-    let schur_factor =
-        cholesky_lower(schur).map_err(|e| ArrowSchurError::SchurFactorFailed { reason: e })?;
+    let (schur_factor, floored_schur) = factor_dense_reduced_schur(schur, options.schur_pd_floor)?;
+    if floored_schur.is_some() {
+        return Ok(Some(MixedPrecisionAttempt::Fallback {
+            reason: "reduced Schur required the spectral PD-floor; using the f64 dense solve"
+                .to_string(),
+        }));
+    }
     if !options.tolerate_ill_conditioning {
         let schur_kappa = cholesky_factor_kappa_estimate(&schur_factor);
         if !schur_kappa.is_finite() || schur_kappa > safe_spd_kappa_max(schur.nrows()) {
@@ -2035,6 +2040,7 @@ impl<'a, B: BatchedBlockSolver> ArrowBlockDiagInverse<'a, B> {
         sys: &'a ArrowSchurSystem,
         ridge_t: f64,
         ridge_beta: f64,
+        schur_pd_floor: Option<f64>,
         tolerate_ill_conditioning: bool,
         backend: &'a B,
     ) -> Result<Self, ArrowSchurError>
@@ -2044,8 +2050,7 @@ impl<'a, B: BatchedBlockSolver> ArrowBlockDiagInverse<'a, B> {
         let htt_factors =
             backend.factor_blocks(&sys.rows, ridge_t, sys.d, tolerate_ill_conditioning)?;
         let schur = build_dense_schur_direct(sys, &htt_factors, ridge_beta, backend)?;
-        let schur_factor =
-            cholesky_lower(&schur).map_err(|e| ArrowSchurError::SchurFactorFailed { reason: e })?;
+        let (schur_factor, _) = factor_dense_reduced_schur(&schur, schur_pd_floor)?;
         Ok(Self {
             sys,
             backend,
@@ -2345,6 +2350,7 @@ pub(crate) fn solve_arrow_newton_step_cross_row(
         sys,
         ridge_t,
         ridge_beta,
+        options.schur_pd_floor,
         options.tolerate_ill_conditioning,
         &backend,
     )?;
