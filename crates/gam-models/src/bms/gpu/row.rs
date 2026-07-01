@@ -2918,7 +2918,7 @@ pub fn launch_bms_flex_row_dense_block(
 // box + CPU CI (the sibling `mod tests` is linux-gated because it also builds
 // CUDA-only fixture types). `cpu_oracle_outputs` itself is platform-independent.
 #[cfg(test)]
-pub(crate) mod oracle_parity_tests {
+mod oracle_parity_tests {
     use super::*;
 
     // ── CPU oracle that mirrors ROW_KERNEL_BODY bit-for-bit ──────────────────
