@@ -39,68 +39,6 @@ fn near_separated_binomial(n: usize, slope: f64, seed: u64) -> gam_data::Encoded
     encode_recordswith_inferred_schema(headers, rows).expect("encode")
 }
 
-/// Minimal stderr logger so `RUST_LOG`-gated `log::` traces from the outer
-/// ARC optimizer and inner PIRLS surface during diagnostic runs. Installed
-/// once; ignores the double-install error on repeated test entry.
-struct StderrLogger;
-impl log::Log for StderrLogger {
-    fn enabled(&self, _m: &log::Metadata<'_>) -> bool {
-        true
-    }
-    fn log(&self, record: &log::Record<'_>) {
-        eprintln!("[{}] {}", record.level(), record.args());
-    }
-    fn flush(&self) {}
-}
-static DIAG_LOGGER: StderrLogger = StderrLogger;
-fn install_diag_logger() {
-    if std::env::var("DIAG_1762_LOG").is_ok() {
-        if log::set_logger(&DIAG_LOGGER).is_ok() {
-            log::set_max_level(log::LevelFilter::Debug);
-        }
-    }
-}
-
-/// Diagnostic: fit the #1762 repro at a moderate n and print convergence,
-/// timing, and edf so the failure mode can be read off directly. Run with
-/// `--nocapture`. No hard assertion — this is the measurement harness.
-#[test]
-fn binomial_near_separation_diagnostic_1762() {
-    install_diag_logger();
-    for &(n, slope) in &[(800usize, 12.0), (1600, 12.0), (3200, 12.0), (3200, 20.0)] {
-        let ds = near_separated_binomial(n, slope, 7);
-
-        let cfg = FitConfig {
-            family: Some("binomial".to_string()),
-            ..FitConfig::default()
-        };
-
-        let t0 = std::time::Instant::now();
-        let result = fit_from_formula("y ~ smooth(x)", &ds, &cfg);
-        let elapsed = t0.elapsed();
-
-        match result {
-            Ok(FitResult::Standard(StandardFitResult { fit, .. })) => {
-                let edf = fit.edf_total().unwrap_or(f64::NAN);
-                eprintln!(
-                    "#1762 diag n={n} slope={slope}: OK elapsed={:.2}s edf={edf:.2} converged={}",
-                    elapsed.as_secs_f64(),
-                    fit.outer_converged
-                );
-            }
-            Ok(_) => {
-                eprintln!("#1762 diag n={n} slope={slope}: unexpected non-Standard result variant");
-            }
-            Err(e) => {
-                eprintln!(
-                    "#1762 diag n={n} slope={slope}: ERROR after {:.2}s: {e}",
-                    elapsed.as_secs_f64()
-                );
-            }
-        }
-    }
-}
-
 /// The convergence contract #1762 pins: a near-separated binomial-logit GAM
 /// must converge (not FLAT-VALLEY STALL) and in a sane wall-clock budget.
 #[test]

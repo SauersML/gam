@@ -145,10 +145,17 @@ fn massive_k_encode_is_sublinear_in_k() {
         let (atoms, atlas, index, sketch) = build_dictionary(k, p);
         let (targets, amps) = planted_targets(&atoms, n, p);
 
-        // Warm run (allocations / first-touch), then a timed run.
-        let _warm = atlas
+        // Warm run (allocations / first-touch), then a timed run. Assert the
+        // warm pass already routes a coordinate per target so the timed run
+        // below measures steady-state throughput, not first-touch faults.
+        let (warm_coords, _) = atlas
             .amortized_encode_with_index_fast(&atoms, &index, &sketch, targets.view(), amps.view(), 1)
             .expect("warm fast index-routed encode");
+        assert_eq!(
+            warm_coords.nrows(),
+            n,
+            "warm encode must return one coordinate row per target (K={k})"
+        );
         let start = Instant::now();
         let (coords, valid) = atlas
             .amortized_encode_with_index_fast(&atoms, &index, &sketch, targets.view(), amps.view(), 1)
