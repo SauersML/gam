@@ -1159,6 +1159,107 @@ pub(crate) fn schur_matvec<B: BatchedBlockSolver + Sync>(
     }
 }
 
+/// Matrix-free reduced-Schur log-determinant `log|S|` via Stochastic Lanczos
+/// Quadrature on the exact `schur_matvec` apply `v ↦ S·v`, where
+/// `S = (H_ββ + ρ_β I) − Σ_i H_βt^(i)(H_tt^(i)+ρ_t I)⁻¹H_tβ^(i)` is the SPD
+/// reduced Schur. **The dense `k×k` `S` is NEVER formed.**
+///
+/// This is the memory-matrix-free evidence path for the massive-K manifold SAE.
+/// The dense evidence routes assemble `S` explicitly (`O(k²)` ≈ 8 GB at the
+/// K=32k border) and Cholesky-factor it (`O(k³/3)`) purely to read `Σ 2·log Lᵢᵢ`;
+/// that dense assembly + factor is the massive-K wall (both dense evidence
+/// routes REFUSE above the in-core budget). Here peak memory is `O(k)` — the SLQ
+/// Rademacher probe and Lanczos basis vectors — and the cost is
+/// `O(num_probes·lanczos_steps · matvec)`, each matvec the same `O(n·d·k)`
+/// reduced-Schur apply the PCG hot loop already runs. Deterministic for a fixed
+/// `(sys, htt_factors, ρ_β, resident, num_probes, lanczos_steps, seed)` so the
+/// REML evidence outer loop stays reproducible.
+///
+/// `htt_factors` are the per-row `(H_tt^(i)+ρ_t I)` Cholesky factors; `resident`
+/// is the optional pre-staged SAE residency operator (`None` for the framed /
+/// closure `H_tβ` path). SLQ is an ESTIMATE — the same accuracy contract the
+/// device seam already accepts for `k ≥ SCHUR_SLQ_LOGDET_MIN_DIM`; callers that
+/// need the exact dense log-det at small `k` must stay on the dense route.
+///
+/// Crate-internal because the `resident` parameter carries the `pub(crate)`
+/// [`SaeResidentReducedSchur`] operator; cross-crate callers use the
+/// [`matrix_free_arrow_evidence_log_det`] convenience, which stages residency
+/// internally and exposes no crate-private type.
+pub(crate) fn slq_reduced_schur_log_det<B: BatchedBlockSolver + Sync>(
+    sys: &ArrowSchurSystem,
+    htt_factors: &ArrowFactorSlab,
+    ridge_beta: f64,
+    backend: &B,
+    resident: Option<&SaeResidentReducedSchur>,
+    num_probes: usize,
+    lanczos_steps: usize,
+    seed: u64,
+) -> SlqLogDet {
+    let k = sys.k;
+    slq_logdet(
+        k,
+        |v| {
+            // `schur_matvec` clears and fully assigns `out`, so a fresh zeroed
+            // buffer per apply is correct; the probes fan across rayon workers
+            // (in `slq_logdet`), and `schur_matvec`'s own row parallelism is
+            // guarded off inside a worker, so there is no nested oversubscription.
+            let x = v.to_owned();
+            let mut out = Array1::<f64>::zeros(k);
+            schur_matvec(sys, htt_factors, ridge_beta, &x, &mut out, backend, resident);
+            out
+        },
+        num_probes,
+        lanczos_steps,
+        seed,
+    )
+}
+
+/// One-call matrix-free arrow evidence log-determinant for an assembled system.
+///
+/// Factors the per-row `H_tt^(i)+ρ_t I` blocks (accumulating
+/// `log_det_tt = Σ_i Σ_axis 2·log Lᵢᵢ` from the Cholesky diagonals — the cheap
+/// `O(n·d³)` t-tier term), stages the SAE residency operator when the system
+/// carries `device_sae_pcg` full-`B` data, and estimates `log|S|` via
+/// [`slq_reduced_schur_log_det`] with NO dense `k×k` Schur formed at any point.
+///
+/// Returns `(log_det_tt, log|S| SLQ estimate)`; the undamped joint evidence
+/// log-det the Laplace normaliser needs is their sum. Uses the identical
+/// [`factor_blocks_for_system`] the dense Direct evidence path uses (same gauge
+/// deflation), so `log_det_tt` matches the dense convention exactly and only the
+/// `k×k` Schur term is replaced by its matrix-free SLQ estimate.
+pub fn matrix_free_arrow_evidence_log_det(
+    sys: &ArrowSchurSystem,
+    ridge_t: f64,
+    ridge_beta: f64,
+    options: &ArrowSolveOptions,
+    num_probes: usize,
+    lanczos_steps: usize,
+    seed: u64,
+) -> Result<(f64, SlqLogDet), ArrowSchurError> {
+    let backend = CpuBatchedBlockSolver;
+    let factorization = factor_blocks_for_system(sys, ridge_t, options, &backend)?;
+    let htt_factors = factorization.factors;
+    let mut log_det_tt = 0.0_f64;
+    for row in 0..htt_factors.len() {
+        let factor = htt_factors.factor(row);
+        for axis in 0..factor.nrows() {
+            log_det_tt += 2.0 * factor[[axis, axis]].ln();
+        }
+    }
+    let resident = SaeResidentReducedSchur::build(sys, &htt_factors, &backend);
+    let slq = slq_reduced_schur_log_det(
+        sys,
+        &htt_factors,
+        ridge_beta,
+        &backend,
+        resident.as_ref(),
+        num_probes,
+        lanczos_steps,
+        seed,
+    );
+    Ok((log_det_tt, slq))
+}
+
 /// Accumulate one row's reduced-Schur point-elimination contribution
 /// `H_βt^(i) (H_tt^(i))⁻¹ H_tβ^(i) x` (length `K`) into `acc`.
 ///

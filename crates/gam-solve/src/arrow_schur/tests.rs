@@ -4740,3 +4740,83 @@ fn composite_penalty_parallel_prefix_matches_serial_bit_exact() {
         "second accumulating matvec must remain bit-identical to serial"
     );
 }
+
+/// The matrix-free reduced-Schur log-determinant `slq_reduced_schur_log_det`
+/// (Stochastic Lanczos Quadrature on the `schur_matvec` apply, NO dense `k×k`
+/// Schur formed) must agree with the exact dense evidence log|S| it replaces —
+/// the route both dense evidence paths REFUSE above the in-core budget at the
+/// K=32k manifold border. Also asserts SLQ reproducibility and that the one-call
+/// `matrix_free_arrow_evidence_log_det` returns the exact `log_det_tt` (same
+/// factorization) plus the matrix-free `log|S|`.
+#[test]
+fn slq_reduced_schur_log_det_matches_dense_evidence() {
+    let (n, d, k) = (40usize, 3usize, 80usize);
+    let sys = dense_direct_system(n, d, k);
+    let backend = CpuBatchedBlockSolver;
+    let ridge_beta = 1e-6;
+    let seed = 0x5142_1701_0E_u64;
+
+    let htt_factors = backend
+        .factor_blocks(&sys.rows, 0.0, d, false)
+        .expect("SPD per-row blocks must factor");
+
+    // Exact dense reduced-Schur log|S| — the O(k²) assembly + O(k³) Cholesky the
+    // matrix-free primitive avoids.
+    let schur = build_dense_schur_direct(&sys, &htt_factors, ridge_beta, &backend)
+        .expect("dense reduced Schur must build for the well-conditioned fixture");
+    let l = cholesky_lower(&schur).expect("reduced Schur must be SPD");
+    let exact_logdet: f64 = (0..k).map(|i| 2.0 * l[[i, i]].ln()).sum();
+
+    // Matrix-free SLQ estimate — never forms S.
+    let slq = slq_reduced_schur_log_det(&sys, &htt_factors, ridge_beta, &backend, None, 48, 60, seed);
+    let rel = (slq.estimate - exact_logdet).abs() / exact_logdet.abs();
+    eprintln!(
+        "matrix-free reduced-Schur log|S|: slq={:.6} exact={:.6} rel={:.3e} std_err={:.3e}",
+        slq.estimate, exact_logdet, rel, slq.std_err
+    );
+    assert!(
+        rel < 0.05,
+        "matrix-free SLQ reduced-Schur log|S| rel err {rel:.3e} exceeds 5% \
+         (slq={}, exact={exact_logdet})",
+        slq.estimate
+    );
+
+    // Deterministic for a fixed seed (the REML evidence outer loop requires it).
+    let slq_again =
+        slq_reduced_schur_log_det(&sys, &htt_factors, ridge_beta, &backend, None, 48, 60, seed);
+    assert_eq!(
+        slq.estimate, slq_again.estimate,
+        "matrix-free reduced-Schur SLQ log-det must be bit-reproducible for a fixed seed"
+    );
+
+    // One-call convenience: log_det_tt is EXACT (same undamped factorization as
+    // the manual sum), and log|S| approximates the dense reduced-Schur log-det.
+    let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+    let (log_det_tt, slq_conv) =
+        matrix_free_arrow_evidence_log_det(&sys, 0.0, ridge_beta, &options, 48, 60, seed)
+            .expect("matrix-free evidence log-det must succeed for the SPD fixture");
+    // Reference factorization must use the SAME options-derived
+    // `tolerate_ill_conditioning` the convenience factors with (via
+    // `factor_blocks_for_system`), so the diagonal sum is bit-comparable.
+    let htt_factors_conv = backend
+        .factor_blocks(&sys.rows, 0.0, d, options.tolerate_ill_conditioning)
+        .expect("SPD per-row blocks must factor");
+    // Flat (row, axis) accumulation in the SAME order the convenience uses, so
+    // the f64 associativity matches bit-for-bit.
+    let mut manual_log_det_tt = 0.0_f64;
+    for row in 0..htt_factors_conv.len() {
+        let f = htt_factors_conv.factor(row);
+        for a in 0..f.nrows() {
+            manual_log_det_tt += 2.0 * f[[a, a]].ln();
+        }
+    }
+    assert_eq!(
+        log_det_tt, manual_log_det_tt,
+        "matrix-free evidence log_det_tt must be bit-identical to the undamped factor diagonal sum"
+    );
+    let conv_rel = (slq_conv.estimate - exact_logdet).abs() / exact_logdet.abs();
+    assert!(
+        conv_rel < 0.05,
+        "matrix-free evidence log|S| rel err {conv_rel:.3e} exceeds 5%"
+    );
+}
