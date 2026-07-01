@@ -740,6 +740,93 @@ fn sae_isometry_joint_fit_converges_across_decoder_scales() {
     }
 }
 
+/// #795 (regression guard mirroring the reported Python repro) — the single
+/// planted circle embedded in D≫2 dimensions must converge through the isometry-
+/// gauged arrow-Schur joint fit, not saturate the proximal ridge at 1e15.
+///
+/// The reported failure was the simplest possible manifold-SAE fit: one circle
+/// (`K=1`, `d_atom=1`, `atom_topology="circle"`) planted in `D=12` via a random
+/// 2×D frame. The wide embedding makes the fitted decoder large, and under the
+/// un-normalized `‖B‖⁴` isometry Gauss-Newton curvature the arrow-Schur row
+/// blocks lost positive-definiteness — the proximal ridge escalated to 1e15
+/// while `|step|→1e-13` and every trial step was Armijo-rejected. This test runs
+/// the ACTUAL `run_joint_fit_arrow_schur` with the isometry gauge ON on a
+/// realistically PCA-seeded embedded circle and asserts it returns `Ok`, a finite
+/// converged loss, finite atom coefficients, and recovers the circle
+/// (low reconstruction error) — i.e. no `RemlConvergenceError`.
+#[test]
+fn sae_single_planted_circle_embedded_isometry_fit_converges_795() {
+    use super::tests::{planted_circle_embedded, planted_circle_seed_term, PlantedCircleAssignmentMode};
+    use gam_terms::analytic_penalties::{
+        AnalyticPenaltyKind, AnalyticPenaltyRegistry, IsometryPenalty, PsiSlice,
+    };
+
+    let n = 200usize;
+    let d_embed = 12usize;
+    let sigma = 0.02_f64;
+    let z = planted_circle_embedded(n, d_embed, sigma);
+
+    let (mut term, _seed_dispersion) =
+        planted_circle_seed_term(z.view(), PlantedCircleAssignmentMode::Softmax);
+
+    // Isometry gauge ON — the `t`↔`B` coupling whose un-normalized `‖B‖⁴`
+    // curvature is what regressed #795 (a regression of the #681 sphere fix).
+    let mut registry = AnalyticPenaltyRegistry::new();
+    registry.push(AnalyticPenaltyKind::Isometry(Arc::new(
+        IsometryPenalty::new_euclidean(PsiSlice::full(n, Some(1)), 1),
+    )));
+
+    let mut rho = SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![array![0.0_f64]]);
+
+    let loss = term
+        .run_joint_fit_arrow_schur(
+            z.view(),
+            &mut rho,
+            Some(&registry),
+            25,
+            0.04,
+            1.0e-6,
+            1.0e-6,
+        )
+        .expect(
+            "single planted circle embedded in D=12 with the isometry gauge ON must converge \
+             through the arrow-Schur joint fit (issue #795: the proximal ridge must not \
+             saturate at 1e15 / reject every step)",
+        );
+    assert!(
+        loss.total().is_finite(),
+        "#795: converged loss on the embedded planted circle must be finite, got {}",
+        loss.total()
+    );
+
+    // Atoms must remain finite (no NaN/Inf blow-up from a runaway ridge).
+    let fitted = term.fitted();
+    assert!(
+        fitted.iter().all(|v| v.is_finite()),
+        "#795: fitted reconstruction must be finite"
+    );
+
+    // The fit must actually recover the planted circle, not merely return Ok at a
+    // stalled iterate: relative reconstruction error over the clean signal.
+    let mut num = 0.0_f64;
+    let mut den = 0.0_f64;
+    for (r, t) in fitted.iter().zip(z.iter()) {
+        num += (r - t) * (r - t);
+        den += t * t;
+    }
+    let rel_recon = (num / den.max(1.0e-300)).sqrt();
+    // A healthy single fixed-ρ joint fit from the PCA seed reaches EV≈0.95
+    // (rel recon ≈ 0.22 on this fixture). The #795 stall (ridge saturating at 1e15
+    // with every step Armijo-rejected) leaves the fit at its seed, i.e. rel recon
+    // O(1) (≳0.7, near ‖z‖). This bound cleanly separates the healthy fit from the
+    // stall without over-fitting the exact converged value.
+    assert!(
+        rel_recon < 0.4,
+        "#795: the isometry-gauged joint fit must recover the embedded planted circle \
+         (rel recon {rel_recon:.3e}); a residual near ‖z‖ is the ridge-saturation stall symptom"
+    );
+}
+
 /// #1206 — the gradient lane's `(cost, gradient)` pair must be SELF-CONSISTENT
 /// for the outer BFGS Armijo line search. The amortized-encoder consistency
 /// fold `c(ρ)` (#1154) has no analytic gradient (under Design A the exact

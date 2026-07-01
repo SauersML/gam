@@ -3728,6 +3728,37 @@ pub(crate) fn planted_circle_data(n: usize, sigma: f64) -> Array2<f64> {
     z
 }
 
+/// A single planted circle embedded in `d_embed` dimensions via a random unit
+/// 2×`d_embed` frame, matching the #795 Python repro (`Z = [cos t, sin t] @ B`).
+/// The embedding makes the fitted decoder wide (D≫2), which is the regime that
+/// used to make the isometry Gauss-Newton `‖B‖⁴` curvature dominate the data-fit
+/// block and saturate the arrow-Schur proximal ridge.
+pub(crate) fn planted_circle_embedded(n: usize, d_embed: usize, sigma: f64) -> Array2<f64> {
+    // Two deterministic near-orthonormal frame rows (row-normalized), so the test
+    // needs no RNG dependency but still spans a generic 2-plane in R^{d_embed}.
+    let mut frame = Array2::<f64>::zeros((2, d_embed));
+    for j in 0..d_embed {
+        frame[[0, j]] = deterministic_circle_noise(j, 0);
+        frame[[1, j]] = deterministic_circle_noise(j, 1);
+    }
+    for r in 0..2 {
+        let norm = (0..d_embed).map(|j| frame[[r, j]] * frame[[r, j]]).sum::<f64>().sqrt();
+        for j in 0..d_embed {
+            frame[[r, j]] /= norm.max(1.0e-300);
+        }
+    }
+    let mut z = Array2::<f64>::zeros((n, d_embed));
+    for row in 0..n {
+        let theta = std::f64::consts::TAU * row as f64 / n as f64;
+        let (c, s) = (theta.cos(), theta.sin());
+        for j in 0..d_embed {
+            z[[row, j]] =
+                c * frame[[0, j]] + s * frame[[1, j]] + sigma * deterministic_circle_noise(row, j);
+        }
+    }
+    z
+}
+
 pub(crate) fn global_ev(target: ArrayView2<'_, f64>, fitted: ArrayView2<'_, f64>) -> f64 {
     let (n, p) = target.dim();
     let mut means = vec![0.0_f64; p];
