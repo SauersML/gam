@@ -2037,7 +2037,7 @@ impl SaeManifoldTerm {
                     self.assignment.logits[[row, atom]] = 0.0;
                 }
             }
-            AssignmentMode::JumpReLU {
+            AssignmentMode::ThresholdGate {
                 temperature,
                 threshold,
             } => {

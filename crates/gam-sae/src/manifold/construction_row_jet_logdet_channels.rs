@@ -131,7 +131,7 @@ impl SaeManifoldTerm {
                     ordered_geometric_shrinkage_prior(k_atoms, effective_alpha).to_vec(),
                 )
             }
-            AssignmentMode::JumpReLU {
+            AssignmentMode::ThresholdGate {
                 temperature,
                 threshold,
             } => (
@@ -590,7 +590,7 @@ impl SaeManifoldTerm {
                     &mut beta_l_deriv,
                 );
             }
-            AssignmentMode::IBPMap { .. } | AssignmentMode::JumpReLU { .. } => {
+            AssignmentMode::IBPMap { .. } | AssignmentMode::ThresholdGate { .. } => {
                 // PER-ATOM-LOGISTIC modes keep the jet path: value-preserving
                 // (their hand gate prior diverged from the live ordered-geometric
                 // prior, and the batched SIMD speedup that motivated the revert is

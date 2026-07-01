@@ -2194,6 +2194,18 @@ impl SaeManifoldTerm {
                     img.b1.len()
                 ));
             }
+            // #1777 — a collapse-rescued image's projection direction `v` must
+            // have one entry per output channel so `coordinate_from_residual` can
+            // project a held-out row's `p`-vector residual onto it.
+            if let Some(v) = img.v.as_ref() {
+                if v.len() != p {
+                    return Err(format!(
+                        "set_hybrid_linear_images: atom {} projection direction v has len {} != output_dim {p}",
+                        img.atom_idx,
+                        v.len()
+                    ));
+                }
+            }
             if self.atoms[img.atom_idx].latent_dim != 1 {
                 return Err(format!(
                     "set_hybrid_linear_images: atom {} is not d=1; only d=1 slots collapse to a straight image",
@@ -2249,6 +2261,92 @@ impl SaeManifoldTerm {
                 if let Some(image) = linear_images.get(&atom_idx) {
                     let own_t = self.assignment.coords[atom_idx].as_matrix()[[row, 0]];
                     image.fill_row(image.coordinate_for_row(row, own_t), &mut g_buf);
+                } else {
+                    self.atoms[atom_idx].fill_decoded_row(row, &mut g_buf);
+                }
+                let mut out_row = out.row_mut(row);
+                for out_col in 0..p {
+                    out_row[out_col] += a_k * g_buf[out_col];
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// #1777 — TARGET-AWARE hybrid-collapsed reconstruction: identical to
+    /// [`Self::try_fitted`] except that a #1026 COLLAPSE-RESCUED `d = 1` slot
+    /// (whose linear image carries a projection direction `v`) recomputes each
+    /// row's coordinate from THIS `target` as
+    /// `uᵢ = ⟨y_i − Σ_{j≠k} f_j(x_i), v⟩` — its own leave-this-atom-out residual
+    /// projected onto `v` — instead of reading the train-only cached
+    /// `row_codes[i]` (or, worse, the atom's collapsed own coordinate `own_t`).
+    ///
+    /// This is the SAME math the train split used to build `row_codes`
+    /// (`row_codes[i] = ⟨target_resid[i], v⟩`), so on the TRAIN rows/target it
+    /// reproduces the train reconstruction bit-for-bit, and on a HELD-OUT
+    /// rows/target it produces the correct out-of-sample coordinate — train and
+    /// OOS are ONE model. Ordinary (non-rescued) straight images and curved slots
+    /// are decoded exactly as in [`Self::try_fitted`]; they ignore `target`.
+    ///
+    /// `rho` selects the assignment-mass resolution (`Some` uses the ρ-keyed
+    /// gates, `None` the persisted gates), mirroring [`Self::try_fitted_with_rho`].
+    /// This is the reconstruction path an OOS predict should call once the trained
+    /// hybrid-linear images are attached via [`Self::set_hybrid_linear_images`].
+    pub fn try_fitted_target_aware(
+        &self,
+        target: ArrayView2<'_, f64>,
+        rho: Option<&SaeManifoldRho>,
+    ) -> Result<Array2<f64>, String> {
+        let n = self.n_obs();
+        let p = self.output_dim();
+        let k_atoms = self.k_atoms();
+        if target.dim() != (n, p) {
+            return Err(format!(
+                "SaeManifoldTerm::try_fitted_target_aware: target {:?} != ({n}, {p})",
+                target.dim()
+            ));
+        }
+        let linear_images = self.hybrid_linear_image_map();
+        // The all-curved reconstruction `full = Σ_j a_j·γ_j`, the same quantity the
+        // train split's `target_resid_for` subtracts. A rescued slot `k`'s
+        // leave-this-atom-out residual is then `target − full + a_k·γ_k`.
+        let full_curved = self.try_fitted_with_rho(rho, false)?;
+        let mut out = Array2::<f64>::zeros((n, p));
+        let mut g_buf = vec![0.0_f64; p];
+        let mut decoded_buf = vec![0.0_f64; p];
+        let mut resid_buf = vec![0.0_f64; p];
+        for row in 0..n {
+            let a = match rho {
+                Some(rho) => self.assignment.try_assignments_row_for_rho(row, rho)?,
+                None => self.assignment.try_assignments_row(row)?,
+            };
+            for atom_idx in 0..k_atoms {
+                let a_k = a[atom_idx];
+                if let Some(image) = linear_images.get(&atom_idx) {
+                    if image.is_collapse_rescued() {
+                        // Recompute this row's coordinate from its own
+                        // leave-this-atom-out residual projected onto `v`.
+                        self.atoms[atom_idx].fill_decoded_row(row, &mut decoded_buf);
+                        for col in 0..p {
+                            resid_buf[col] =
+                                target[[row, col]] - full_curved[[row, col]] + a_k * decoded_buf[col];
+                        }
+                        // `coordinate_from_residual` returns `None` only on a
+                        // length mismatch (impossible here — validated at attach)
+                        // or a non-rescued image (excluded by the branch); fall
+                        // back to the train code/own-coord path if it ever does.
+                        let coord = image
+                            .coordinate_from_residual(&resid_buf)
+                            .unwrap_or_else(|| {
+                                let own_t = self.assignment.coords[atom_idx].as_matrix()[[row, 0]];
+                                image.coordinate_for_row(row, own_t)
+                            });
+                        image.fill_row(coord, &mut g_buf);
+                    } else {
+                        // Ordinary straight image: decode at the atom's own coord.
+                        let own_t = self.assignment.coords[atom_idx].as_matrix()[[row, 0]];
+                        image.fill_row(image.coordinate_for_row(row, own_t), &mut g_buf);
+                    }
                 } else {
                     self.atoms[atom_idx].fill_decoded_row(row, &mut g_buf);
                 }
@@ -3869,7 +3967,7 @@ impl SaeManifoldTerm {
         let row_layout: Option<SaeRowLayout> = match forced_layout {
             Some(layout) => layout,
             None => match self.assignment.mode {
-                AssignmentMode::JumpReLU {
+                AssignmentMode::ThresholdGate {
                     threshold,
                     temperature,
                 } => Some(SaeRowLayout::from_jumprelu(
@@ -8734,7 +8832,7 @@ impl SaeManifoldTerm {
                 // source for value, logdet, and adjoint.
                 0.0
             }
-            AssignmentMode::JumpReLU {
+            AssignmentMode::ThresholdGate {
                 temperature,
                 threshold,
             } => {

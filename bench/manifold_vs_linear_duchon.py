@@ -73,11 +73,18 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument(
         "--basis",
-        default="periodic",
+        default="duchon",
         help="homogeneous atom basis: duchon | periodic | circle | linear. "
         "duchon has a large per-atom border (huge dense evidence cache -> needs "
         "the streaming route even at small K); periodic/circle are small-basis "
         "curved atoms whose dense cache fits at moderate K.",
+    )
+    ap.add_argument(
+        "--assignment",
+        default="jumprelu",
+        help="atom assignment mode. jumprelu is per-row independent and streams "
+        "cleanly at large K; ibp_map/softmax couple rows via a cross-row Woodbury "
+        "mass and refuse multi-chunk streaming (route back to the dense cache).",
     )
     args = ap.parse_args()
 
@@ -102,7 +109,11 @@ def main() -> int:
         k_values=list(args.k),
         hybrid_atom_basis=lambda k: [args.basis] * k,
         d_atom=1,
-        sae_fit_kwargs={"n_iter": args.n_iter, "random_state": args.seed},
+        sae_fit_kwargs={
+            "n_iter": args.n_iter,
+            "random_state": args.seed,
+            "assignment": args.assignment,
+        },
         linear_fit_kwargs={},
     )
     elapsed = time.perf_counter() - t0

@@ -298,27 +298,6 @@ struct DecoderNormalEq {
     off: HashMap<(u32, u32), f64>,
 }
 
-impl DecoderNormalEq {
-    /// Symmetric sparse mat-vec `y = (A + ρI) x` for one decoder column `x`
-    /// (length `K`). Touches only the non-zero couplings, so it is `O(K + nnz)`
-    /// and never forms a dense `K×K` matrix. The block solver uses a
-    /// component-restricted variant inline; this whole-system form exists for the
-    /// exactness tests to measure the normal-equation residual.
-    #[cfg(test)]
-    fn matvec_col(&self, ridge: f64, x: &[f64]) -> Vec<f64> {
-        let k = self.diag.len();
-        let mut y = vec![0.0f64; k];
-        for i in 0..k {
-            y[i] = (self.diag[i] + ridge) * x[i];
-        }
-        for (&(a, b), &val) in self.off.iter() {
-            y[a as usize] += val * x[b as usize];
-            y[b as usize] += val * x[a as usize];
-        }
-        y
-    }
-}
-
 /// Assemble the sparse decoder normal equations `(A + ρI) D = B` from the fixed
 /// codes/supports (`ρ` is applied at solve time, so this returns the bare
 /// `A`/`B`). Streams the rows once, accumulating only the entries the codes
@@ -701,6 +680,26 @@ mod exact_solve_tests {
     use crate::sparse_dict::scoring::TileScorer;
     use crate::sparse_dict::{SparseDictConfig, fit_sparse_dictionary};
     use ndarray::Array2;
+
+    impl DecoderNormalEq {
+        /// Symmetric sparse mat-vec `y = (A + ρI) x` for one decoder column `x`
+        /// (length `K`). Whole-system form used by the exactness tests to measure
+        /// the normal-equation residual (the block solver uses a
+        /// component-restricted variant inline). Touches only the non-zero
+        /// couplings, so it is `O(K + nnz)` and never forms a dense `K×K` matrix.
+        fn matvec_col(&self, ridge: f64, x: &[f64]) -> Vec<f64> {
+            let k = self.diag.len();
+            let mut y = vec![0.0f64; k];
+            for i in 0..k {
+                y[i] = (self.diag[i] + ridge) * x[i];
+            }
+            for (&(a, b), &val) in self.off.iter() {
+                y[a as usize] += val * x[b as usize];
+                y[b as usize] += val * x[a as usize];
+            }
+            y
+        }
+    }
 
     /// A small synthetic decoder-update problem with OVERLAPPING supports (`s = 3`):
     /// five codes whose atom sets slide around the 5-atom dictionary so every atom

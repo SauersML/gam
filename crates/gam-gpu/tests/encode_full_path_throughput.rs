@@ -76,7 +76,6 @@ fn orthonormal_pair(p: usize) -> (Array1<f64>, Array1<f64>) {
 /// [`EncodeAtlas`] over the frozen dictionary.
 ///
 /// Returns `(atom, atlas, targets, amplitudes, planted_t)`.
-#[allow(clippy::type_complexity)]
 fn build_fixture(
     n: usize,
     p: usize,
@@ -194,7 +193,7 @@ fn full_exact_encode_throughput_and_correctness() {
 
     // --- The FULL exact per-row encode under test, timed end-to-end. One warm
     // run (allocations / first-touch) then one timed run. ---
-    let _warm = atlas
+    atlas
         .certified_encode_batch(&atom, 0, targets.view(), amplitudes.view())
         .expect("warm batch encode runs");
     let start = Instant::now();

@@ -107,17 +107,19 @@ pub enum AssignmentMode {
     /// is at or below `threshold`, and on with a threshold-centered shifted
     /// sigmoid `σ((logit − threshold) / temperature) ∈ [0.5, 1)` above it.
     ///
-    /// NAME CAVEAT: despite the `JumpReLU` token (kept for API/Python/test
-    /// stability), this is NOT the literature JumpReLU activation `z·1[z>θ]`,
-    /// which carries the thresholded MAGNITUDE `z`. This mode is a
-    /// thresholded-logistic GATE (a hard-sigmoid gate): it carries no magnitude at
-    /// all — its output is a bounded `[0, 1)` indicator. A name like
-    /// `threshold_gate` or `hard_sigmoid_gate` would describe it more accurately.
-    /// It is a member of the gate family (softmax simplex / IBP sigmoid / this
-    /// hard gate); reconstruction magnitude lives entirely in the decoder curve
-    /// `g_k(t) = φ(t)ᵀ B_k`. The discontinuity at `threshold` (0 → 0.5) is the
-    /// intended "jump".
-    JumpReLU { temperature: f64, threshold: f64 },
+    /// #1777 RENAMED from `JumpReLU` (an inaccurate name): this is NOT the
+    /// literature JumpReLU activation `z·1[z>θ]`, which carries the thresholded
+    /// MAGNITUDE `z`. This mode is a thresholded-logistic GATE (a hard-sigmoid
+    /// gate): it carries no magnitude at all — its output is a bounded `[0, 1)`
+    /// indicator. `ThresholdGate` names it for what it is. It is a member of the
+    /// gate family (softmax simplex / IBP sigmoid / this hard gate); reconstruction
+    /// magnitude lives entirely in the decoder curve `g_k(t) = φ(t)ᵀ B_k`. The
+    /// discontinuity at `threshold` (0 → 0.5) is the intended "jump".
+    ///
+    /// BACK-COMPAT: the constructor [`Self::threshold_gate`] is the primary
+    /// spelling; [`Self::jumprelu`] is retained as a deprecated alias, and the FFI
+    /// string parser accepts both `"threshold_gate"` and the legacy `"jumprelu"`.
+    ThresholdGate { temperature: f64, threshold: f64 },
 }
 
 /// #1033 — the fixed-form predictor that produces the ρ-invariant FROZEN routing
@@ -161,19 +163,32 @@ impl AssignmentMode {
         }
     }
 
+    /// #1777 — construct the hard-sigmoid [`Self::ThresholdGate`] (the accurate
+    /// name for what was `jumprelu`). Primary spelling; [`Self::jumprelu`] is a
+    /// deprecated alias kept for back-compat.
     #[must_use]
-    pub fn jumprelu(temperature: f64, threshold: f64) -> Self {
-        Self::JumpReLU {
+    pub fn threshold_gate(temperature: f64, threshold: f64) -> Self {
+        Self::ThresholdGate {
             temperature,
             threshold,
         }
+    }
+
+    /// Back-compat alias for [`Self::threshold_gate`] (#1777): the mode is a
+    /// hard-sigmoid gate, not the literature JumpReLU magnitude activation. Retained
+    /// (NOT `#[deprecated]`, since the workspace denies warnings and many callers
+    /// and the legacy `"jumprelu"` FFI token still use it) so existing code keeps
+    /// compiling; new code should prefer `threshold_gate`.
+    #[must_use]
+    pub fn jumprelu(temperature: f64, threshold: f64) -> Self {
+        Self::threshold_gate(temperature, threshold)
     }
 
     pub fn temperature(&self) -> f64 {
         match *self {
             AssignmentMode::Softmax { temperature, .. }
             | AssignmentMode::IBPMap { temperature, .. }
-            | AssignmentMode::JumpReLU { temperature, .. } => temperature,
+            | AssignmentMode::ThresholdGate { temperature, .. } => temperature,
         }
     }
 
@@ -186,7 +201,7 @@ impl AssignmentMode {
         match self {
             AssignmentMode::Softmax { temperature, .. }
             | AssignmentMode::IBPMap { temperature, .. }
-            | AssignmentMode::JumpReLU { temperature, .. } => {
+            | AssignmentMode::ThresholdGate { temperature, .. } => {
                 *temperature = new_temperature;
             }
         }
@@ -215,10 +230,10 @@ impl AssignmentMode {
                     ));
                 }
             }
-            AssignmentMode::JumpReLU { threshold, .. } => {
+            AssignmentMode::ThresholdGate { threshold, .. } => {
                 if !threshold.is_finite() {
                     return Err(format!(
-                        "AssignmentMode::JumpReLU: threshold must be finite; got {threshold}"
+                        "AssignmentMode::ThresholdGate: threshold must be finite; got {threshold}"
                     ));
                 }
             }
@@ -575,7 +590,7 @@ impl SaeAssignment {
     pub fn assignment_coord_dim(&self) -> usize {
         match self.mode {
             AssignmentMode::Softmax { .. } => self.k_atoms().saturating_sub(1),
-            AssignmentMode::IBPMap { .. } | AssignmentMode::JumpReLU { .. } => self.k_atoms(),
+            AssignmentMode::IBPMap { .. } | AssignmentMode::ThresholdGate { .. } => self.k_atoms(),
         }
     }
 
@@ -648,7 +663,7 @@ impl SaeAssignment {
             AssignmentMode::IBPMap {
                 temperature, alpha, ..
             } => ibp_map_row(routing, temperature, resolved_ibp_alpha.unwrap_or(alpha)),
-            AssignmentMode::JumpReLU {
+            AssignmentMode::ThresholdGate {
                 temperature,
                 threshold,
             } => jumprelu_row(routing, temperature, threshold),
@@ -719,7 +734,7 @@ impl SaeAssignment {
                 resolved_ibp_alpha.unwrap_or(alpha),
                 out,
             ),
-            AssignmentMode::JumpReLU {
+            AssignmentMode::ThresholdGate {
                 temperature,
                 threshold,
             } => jumprelu_row_into(routing, temperature, threshold, out),
@@ -839,7 +854,7 @@ pub(crate) fn neutral_gate_weights(mode: AssignmentMode, k_atoms: usize) -> Arra
         AssignmentMode::IBPMap {
             temperature, alpha, ..
         } => ibp_map_row(Array1::<f64>::zeros(k_atoms).view(), temperature, alpha),
-        AssignmentMode::JumpReLU { .. } => Array1::from_elem(k_atoms, 0.5),
+        AssignmentMode::ThresholdGate { .. } => Array1::from_elem(k_atoms, 0.5),
     }
 }
 
@@ -1107,7 +1122,7 @@ pub(crate) fn fill_active_atom_logit_jvp(
                 jac_compact[[compact_index, out_col]] = dz * decoded_k[out_col];
             }
         }
-        AssignmentMode::JumpReLU {
+        AssignmentMode::ThresholdGate {
             temperature,
             threshold,
         } => {
@@ -1184,7 +1199,7 @@ pub(crate) fn fill_assignment_logit_jvp_rows(
                 }
             }
         }
-        AssignmentMode::JumpReLU {
+        AssignmentMode::ThresholdGate {
             temperature,
             threshold,
         } => {
@@ -1260,7 +1275,7 @@ pub(crate) fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifo
             };
             penalty.value(target.view(), rho_view.view())
         }
-        AssignmentMode::JumpReLU {
+        AssignmentMode::ThresholdGate {
             temperature,
             threshold,
         } => {
@@ -1292,7 +1307,7 @@ pub(crate) fn assignment_prior_log_strength_derivative(
         return 0.0;
     }
     match assignment.mode {
-        AssignmentMode::Softmax { .. } | AssignmentMode::JumpReLU { .. } => {
+        AssignmentMode::Softmax { .. } | AssignmentMode::ThresholdGate { .. } => {
             assignment_prior_value(assignment, rho)
         }
         AssignmentMode::IBPMap {
@@ -1341,7 +1356,7 @@ pub(crate) fn assignment_prior_log_strength_hdiag(
                     "softmax assignment log-strength hessian diag unavailable".to_string()
                 })
         }
-        AssignmentMode::JumpReLU {
+        AssignmentMode::ThresholdGate {
             temperature,
             threshold,
         } => {
@@ -1479,7 +1494,7 @@ pub(crate) fn assignment_prior_grad_hdiag(
                 .ok_or_else(|| "IBP assignment hessian diag unavailable".to_string())?;
             (g, d)
         }
-        AssignmentMode::JumpReLU {
+        AssignmentMode::ThresholdGate {
             temperature,
             threshold,
         } => {
