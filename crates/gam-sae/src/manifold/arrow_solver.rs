@@ -264,37 +264,17 @@ impl<'a> DeflatedArrowSolver<'a> {
             }
         }
 
-        // GS = G_i S⁻¹ (q×K).
-        let mut gs = Array2::<f64>::zeros((q, k));
-        for r in 0..q {
-            for m in 0..k {
-                let mut acc = 0.0_f64;
-                for n in 0..k {
-                    acc += g[[r, n]] * beta_inv[[n, m]];
-                }
-                gs[[r, m]] = acc;
-            }
-        }
+        // GS = G_i S⁻¹ (q×K), via the cache-blocked ndarray/matrixmultiply gemm
+        // instead of an O(q·K²) scalar triple loop (K up to 32k).
+        let gs = g.dot(beta_inv);
 
         // (H⁻¹)_tβ[i] = −G_i S⁻¹ = −GS, layout [col, b].
-        let mut inv_vbeta = Array2::<f64>::zeros((q, k));
-        for col in 0..q {
-            for b in 0..k {
-                inv_vbeta[[col, b]] = -gs[[col, b]];
-            }
-        }
+        let inv_vbeta = -&gs;
 
         // (H⁻¹)_tt[i,i] = A_i⁻¹ + G_i S⁻¹ G_iᵀ = A_i⁻¹ + GS·Gᵀ, layout [r, col].
+        // `GS·Gᵀ` is another gemm (q×K · K×q); accumulate onto A_i⁻¹ in place.
         let mut inv_vv = a_inv;
-        for r in 0..q {
-            for col in 0..q {
-                let mut acc = 0.0_f64;
-                for m in 0..k {
-                    acc += gs[[r, m]] * g[[col, m]];
-                }
-                inv_vv[[r, col]] += acc;
-            }
-        }
+        inv_vv += &gs.dot(&g.t());
 
         Ok((inv_vv, inv_vbeta))
     }

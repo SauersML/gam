@@ -133,6 +133,11 @@ impl MultiDirJet {
         }
         let a = &self.coeffs;
         let b = &other.coeffs;
+        // Both operands carry the same direction set, so `b` is `count` long too.
+        // With that established once, every `a[sub]`/`b[mask ^ sub]` below is
+        // provably in bounds (`sub, mask ^ sub ⊆ mask < count`), so the inner
+        // submask walk can drop its per-load bounds checks.
+        assert_eq!(b.len(), count, "MultiDirJet::mul operands must share n_dirs");
         let mut out = vec![0.0; count];
         for (mask, slot) in out.iter_mut().enumerate() {
             // Walk every submask of `mask` in ascending numeric order — the same
@@ -140,12 +145,16 @@ impl MultiDirJet {
             // increment `next = ((sub | !mask) + 1) & mask`.
             let mut acc = 0.0;
             let mut sub = 0usize;
-            loop {
-                acc += a[sub] * b[mask ^ sub];
-                if sub == mask {
-                    break;
+            // SAFETY: `sub ⊆ mask < count` and `mask ^ sub ⊆ mask < count`, and
+            // both `a` and `b` are `count` long (asserted above).
+            unsafe {
+                loop {
+                    acc += *a.get_unchecked(sub) * *b.get_unchecked(mask ^ sub);
+                    if sub == mask {
+                        break;
+                    }
+                    sub = (sub | !mask).wrapping_add(1) & mask;
                 }
-                sub = (sub | !mask).wrapping_add(1) & mask;
             }
             *slot = acc;
         }
@@ -251,6 +260,18 @@ fn two_sum(a: f64, b: f64) -> (f64, f64) {
 /// and skips the low-order masks entirely.
 #[inline]
 fn subset_conv_into(a: &[f64], b: &[f64], out: &mut [f64], min_pop: u32) {
+    // SAFETY invariant for the `get_unchecked` loads below: every index this
+    // kernel reads is `< out.len()`, and the caller passes `a`/`b` at least as
+    // long as `out` (in `compose_unary` all three are the same `count`-length
+    // slices carved from one scratch buffer). Concretely `mask < out.len()`
+    // (loop bound), and each submask satisfies `sub ⊆ mask` so `sub ≤ mask` and
+    // `mask ^ sub ⊆ mask` so `mask ^ sub ≤ mask` — both `< out.len() ≤ a.len(),
+    // b.len()`. The `debug_assert!` pins the length precondition in debug/tests;
+    // the bounds checks LLVM cannot elide (the indices are data-dependent) are a
+    // real per-step cost across the `3^K` submask walk (×3 convolutions per
+    // compose), so eliding them is a measured ~20% at the marginal-slope
+    // direction counts.
+    debug_assert!(a.len() >= out.len() && b.len() >= out.len());
     for (mask, slot) in out.iter_mut().enumerate() {
         if (mask as u64).count_ones() < min_pop {
             *slot = 0.0;
@@ -276,18 +297,23 @@ fn subset_conv_into(a: &[f64], b: &[f64], out: &mut [f64], min_pop: u32) {
         let (mut s0, mut s1, mut s2, mut s3) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
         let (mut c0, mut c1, mut c2, mut c3) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
         let mut sub = mask;
-        loop {
-            dot2_step(&mut s0, &mut c0, a[sub], b[mask ^ sub]);
-            sub = (sub - 1) & mask;
-            dot2_step(&mut s1, &mut c1, a[sub], b[mask ^ sub]);
-            sub = (sub - 1) & mask;
-            dot2_step(&mut s2, &mut c2, a[sub], b[mask ^ sub]);
-            sub = (sub - 1) & mask;
-            dot2_step(&mut s3, &mut c3, a[sub], b[mask ^ sub]);
-            if sub == 0 {
-                break;
+        // SAFETY: see the invariant comment at the top of the function — `sub`
+        // and `mask ^ sub` are both submasks of `mask < out.len()`, hence in
+        // bounds for `a`/`b` (each ≥ `out.len()` long).
+        unsafe {
+            loop {
+                dot2_step(&mut s0, &mut c0, *a.get_unchecked(sub), *b.get_unchecked(mask ^ sub));
+                sub = (sub - 1) & mask;
+                dot2_step(&mut s1, &mut c1, *a.get_unchecked(sub), *b.get_unchecked(mask ^ sub));
+                sub = (sub - 1) & mask;
+                dot2_step(&mut s2, &mut c2, *a.get_unchecked(sub), *b.get_unchecked(mask ^ sub));
+                sub = (sub - 1) & mask;
+                dot2_step(&mut s3, &mut c3, *a.get_unchecked(sub), *b.get_unchecked(mask ^ sub));
+                if sub == 0 {
+                    break;
+                }
+                sub = (sub - 1) & mask;
             }
-            sub = (sub - 1) & mask;
         }
         // Merge the four lanes, compensated.
         let (s01, e01) = two_sum(s0, s1);

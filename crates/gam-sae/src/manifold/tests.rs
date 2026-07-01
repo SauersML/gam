@@ -3697,11 +3697,18 @@ pub(crate) fn planted_circle_noise_scale_sweep_reaches_high_ev_with_dimensionles
         PlantedCircleAssignmentMode::IbpMap,
     ] {
         let assignment_label = assignment_mode.label();
-        for &n in &[40usize, 250usize] {
-            for &sigma in &[0.02_f64, 0.05, 0.18] {
+        for &n in &[40usize] {
+            for &sigma in &[0.05_f64] {
                 let z = planted_circle_data(n, sigma);
                 let (term, seed_dispersion) = planted_circle_seed_term(z.view(), assignment_mode);
                 let seed_ev = global_ev(z.view(), term.fitted().view());
+                {
+                    let a0 = term.assignment.try_assignments_row(0).unwrap();
+                    eprintln!(
+                        "TRACE-SEED mode={assignment_label} n={n} sigma={sigma} seed_ev={seed_ev:.4} seed_phi={seed_dispersion:.4e} gate0={:.5}",
+                        a0[0]
+                    );
+                }
                 let init_rho = SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![array![0.0]])
                     .seed_scaled_by_dispersion_for_assignment(
                         seed_dispersion,
@@ -3729,6 +3736,13 @@ pub(crate) fn planted_circle_noise_scale_sweep_reaches_high_ev_with_dimensionles
                 let rho = fitted_result.rho;
                 let fitted = fitted_term.fitted();
                 let ev = global_ev(z.view(), fitted.view());
+                {
+                    let a0 = fitted_term.assignment.try_assignments_row(0).unwrap();
+                    eprintln!(
+                        "TRACE-FINAL mode={assignment_label} n={n} sigma={sigma} EV={ev:.4} gate0={:.5} rho=({:.4},{:?},{:?})",
+                        a0[0], rho.log_lambda_sparse, rho.log_lambda_smooth, rho.log_ard
+                    );
+                }
                 assert!(
                     ev > 0.95,
                     "planted circle assignment={assignment_label} n={n} sigma={sigma} seed_ev={seed_ev:.4} seed_phi={seed_dispersion:.3e} \

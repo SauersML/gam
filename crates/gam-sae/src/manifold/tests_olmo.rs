@@ -632,14 +632,13 @@ pub(crate) fn fast_encode_matches_per_row_warm_start() {
     .expect("atlas builds");
     let atom = &term.atoms[0];
     let amps = ndarray::Array1::<f64>::ones(n);
-    let evaluator = atom.basis_evaluator.as_ref().unwrap().clone();
 
     // Reference: per-row nearest_chart routing + the distilled affine predictor.
     let mut ref_coords = ndarray::Array2::<f64>::zeros((n, atom.latent_dim));
     let mut ref_valid = vec![false; n];
     for row in 0..n {
         if let Some((cidx, _)) =
-            crate::encode::nearest_chart(&atlas.atoms[0], z.row(row), atom, evaluator.as_ref())
+            crate::encode::nearest_chart(&atlas.atoms[0], z.row(row))
         {
             if let Some(t) = crate::encode::amortized_warm_start(
                 &atlas.atoms[0].charts[cidx],

@@ -1755,6 +1755,19 @@ impl OuterObjective for SaeManifoldOuterObjective {
             .map_err(EstimationError::RemlOptimizationFailed)?;
         self.current_rho = rho_state;
         self.last_loss = Some(loss);
+        {
+            let ev = self
+                .term
+                .try_fitted_for_rho(&self.current_rho)
+                .ok()
+                .and_then(|f| reconstruction_explained_variance(self.target.view(), f.view()))
+                .unwrap_or(f64::NAN);
+            eprintln!(
+                "TRACE-EVAL rho={:?} cost={cost:.6e} grad={:?} ev={ev:.4}",
+                rho.to_vec(),
+                gradient.to_vec()
+            );
+        }
         Ok(OuterEval {
             cost,
             gradient,
