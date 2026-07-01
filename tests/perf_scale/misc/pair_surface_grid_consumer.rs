@@ -202,6 +202,25 @@ fn noise(i: usize, amp: f64) -> f64 {
     ((i as f64 * 0.618_033_988_749_894_9).fract() - 0.5) * 2.0 * amp
 }
 
+/// Deterministic keyed noise stream in (−amp, amp).
+///
+/// A shifted Kronecker sequence is not an independent stream: for the fixed
+/// offset used by the large pair-surface oracle it has a sample covariance of
+/// about 0.024, which is exactly the residual off-diagonal the oracle is meant
+/// to rule out.  Use a keyed SplitMix64 permutation here so different response
+/// dimensions receive reproducible but decorrelated noise streams without
+/// depending on a runtime RNG.
+fn noise_stream(i: usize, stream: u64, amp: f64) -> f64 {
+    let mut z = (i as u64)
+        .wrapping_add(stream.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        .wrapping_add(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    let u = ((z >> 11) as f64) * (1.0 / ((1_u64 << 53) as f64));
+    (u - 0.5) * 2.0 * amp
+}
+
 /// `nx × ny` lattice over the box — GRIDDED data, corners included.
 fn lattice(nx: usize, ny: usize, lo: [f64; 2], hi: [f64; 2]) -> (Vec<f64>, Vec<f64>) {
     let mut x1 = Vec::with_capacity(nx * ny);
@@ -542,8 +561,8 @@ fn pair_surface_large_gridded_n_recovers_truth_end_to_end() {
     let n = x1.len();
     let mut responses = Array2::<f64>::zeros((n, 2));
     for r in 0..n {
-        responses[[r, 0]] = truth0(x1[r], x2[r]) + noise(r, NOISE_AMP);
-        responses[[r, 1]] = truth1(x1[r], x2[r]) + noise(r + 13, NOISE_AMP);
+        responses[[r, 0]] = truth0(x1[r], x2[r]) + noise_stream(r, 0, NOISE_AMP);
+        responses[[r, 1]] = truth1(x1[r], x2[r]) + noise_stream(r, 1, NOISE_AMP);
     }
 
     let start = Instant::now();
