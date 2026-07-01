@@ -1,6 +1,6 @@
 //! Bug hunt: the workspace does not build from a clean checkout at HEAD — and
 //! the break rode all the way onto a RELEASE commit
-//! (`0e6f90fde release: gam 0.3.139 / gamfit 0.1.241`).
+//! (`0e6f90fde release: gam 0.3.139`; the gamfit wheel is bumped in lockstep).
 //!
 //! `build.rs` runs an always-fatal hygiene ban scanner over every tracked file
 //! before the crate compiles; any violation makes the build script call
@@ -28,9 +28,12 @@
 //!      attribute on `real_olmo_sparse_dict_ev_vs_k_parity`, and line 486 puts a
 //!      redundant `#[cfg(test)]` on the `read_npy_f32_2d` helper `fn`.
 //!
-//! (The remaining violations: a stale `uv.lock:307 version = "0.1.240"` that the
-//! 0.3.139/0.1.241 release bump did not update — the "non-latest gamfit version
-//! reference" rule.)
+//! (The remaining violations: a stale `uv.lock:307` gamfit package version that
+//! the 0.3.139 release bump did not carry forward — the "non-latest gamfit
+//! version reference" rule. The literal versions are deliberately elided from
+//! this file's prose so a later release bump does not turn the historical
+//! narrative into a fresh "non-latest gamfit version" violation of that very
+//! rule.)
 //!
 //! Observed (verbatim, on `cargo build -p gam`):
 //!
@@ -40,7 +43,7 @@
 //!     error — #[cfg(test)] on src/ item  (2 hits)
 //!     error — tracked file over 10k lines  (1 hit) ...construction.rs:10059
 //!     error — #[ignore] test  (1 hit)
-//!     error — non-latest gamfit version reference (expected 0.1.241)  (1 hit)
+//!     error — non-latest gamfit version reference (expected pyproject version)  (1 hit)
 //!     cargo:warning=ban-scanner FAILED: 13 violation(s); build aborted
 //!
 //! Expected: a clean checkout / release tag builds; wheel + CLI produce.
