@@ -1907,6 +1907,81 @@ impl UnifiedFitResult {
 }
 
 impl UnifiedFitResult {
+    /// Rescale every dispersion-linked covariance quantity in place by
+    /// `var_ratio` (equivalently, rescale the estimated dispersion `σ̂²` by
+    /// `var_ratio` and `σ̂` by `√var_ratio`), keeping the fit's two redundant
+    /// covariance representations bit-for-bit consistent.
+    ///
+    /// A GAM fit stores the conditional/corrected coefficient covariance in TWO
+    /// places that [`Self::validate`] requires to be *identical*: the top-level
+    /// `covariance_conditional` / `covariance_corrected` and the paired
+    /// `inference.beta_covariance` / `beta_covariance_corrected`. Because
+    /// `Vb = σ̂²·H⁻¹` (and `Vp` likewise) is linear in the dispersion, any
+    /// post-fit change to `σ̂²` — e.g. the #1788 EDF-collapse guard re-deriving
+    /// `σ̂² = RSS/(n − edf_total)` from a corrected effective d.f. — must scale
+    /// BOTH representations by the same factor, or the model silently fails its
+    /// own consistency check on the next `validate()` and every downstream
+    /// consumer (`predict`/`summary`/`save`→`load`) rejects it (#1789). Routing
+    /// each such rescale through this single method makes that impossible to get
+    /// wrong: the top-level and inference blocks can never drift apart.
+    ///
+    /// This is a no-op (returning `1.0`) unless the fit carries an **estimated**
+    /// scale and `var_ratio` is a finite, positive value that actually differs
+    /// from `1.0`. Fixed-scale families (Binomial/Poisson/…, `φ ≡ 1`) carry
+    /// [`Dispersion::Known`]: their covariance does not embed `σ̂²`, so it must
+    /// not move when the reported effective d.f. changes. Returns the `σ̂` ratio
+    /// (`√var_ratio`) that was applied, so a caller holding an external scalar
+    /// (a plotting scale, a cached SE) can mirror the same change; `1.0` signals
+    /// nothing was rescaled.
+    #[must_use]
+    pub fn rescale_estimated_dispersion(&mut self, var_ratio: f64) -> f64 {
+        if !(var_ratio.is_finite() && var_ratio > 0.0 && (var_ratio - 1.0).abs() > f64::EPSILON) {
+            return 1.0;
+        }
+        // Gate strictly on an ESTIMATED scale — a `Known` (fixed) dispersion
+        // does not enter the covariance, so a d.f. change leaves `Vb`/`Vp`
+        // untouched. When there is no inference block there is nothing whose
+        // dispersion could be estimated, so treat it as fixed and bail.
+        if !matches!(
+            self.inference.as_ref().map(|inf| &inf.dispersion),
+            Some(Dispersion::Estimated(_))
+        ) {
+            return 1.0;
+        }
+        let sigma_ratio = var_ratio.sqrt();
+        // Top-level (canonical) covariance representation.
+        if let Some(cov) = self.covariance_conditional.as_mut() {
+            cov.mapv_inplace(|v| v * var_ratio);
+        }
+        if let Some(cov) = self.covariance_corrected.as_mut() {
+            cov.mapv_inplace(|v| v * var_ratio);
+        }
+        self.standard_deviation *= sigma_ratio;
+        // Paired inference-block representation — kept bit-for-bit identical to
+        // the top-level blocks above (same factor, same fields).
+        if let Some(inference) = self.inference.as_mut() {
+            if let Dispersion::Estimated(sigma2) = &mut inference.dispersion {
+                *sigma2 *= var_ratio;
+            }
+            if let Some(cov) = inference.beta_covariance.as_mut() {
+                cov.0.mapv_inplace(|v| v * var_ratio);
+            }
+            if let Some(cov) = inference.beta_covariance_corrected.as_mut() {
+                cov.mapv_inplace(|v| v * var_ratio);
+            }
+            if let Some(cov) = inference.beta_covariance_frequentist.as_mut() {
+                cov.mapv_inplace(|v| v * var_ratio);
+            }
+            if let Some(se) = inference.beta_standard_errors.as_mut() {
+                se.mapv_inplace(|v| v * sigma_ratio);
+            }
+            if let Some(se) = inference.beta_standard_errors_corrected.as_mut() {
+                se.mapv_inplace(|v| v * sigma_ratio);
+            }
+        }
+        sigma_ratio
+    }
+
     /// Get the conditional Bayesian covariance matrix (`Vb`) if available.
     ///
     /// Contract: `Vb = H^{-1} * phi`, scaled by the fitted dispersion. This is
