@@ -380,6 +380,13 @@ mod tests {
         let mut files = Vec::new();
         collect_rs_files(&root, &mut files);
 
+        // This module (`sigma_link.rs`) is the canonical home of the σ-link
+        // implementation and the guard itself: the forbidden strings appear
+        // here verbatim in `bad_patterns`, so scanning our own source would
+        // always self-trip. Skip exactly this file — every *other* file under
+        // `src/` is still checked.
+        let self_file = root.join("sigma_link.rs");
+
         let bad_patterns = [
             "bounded_sigma",
             "model.sigma_min",
@@ -394,7 +401,7 @@ mod tests {
         ];
 
         for file in files {
-            if file.ends_with("families/sigma_link.rs") {
+            if file == self_file {
                 continue;
             }
             let Ok(content) = fs::read_to_string(&file) else {
