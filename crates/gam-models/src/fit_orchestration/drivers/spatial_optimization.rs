@@ -3528,8 +3528,7 @@ impl<'d> SpatialJointContext<'d> {
         let (value, gradient) = if shape {
             let psi = theta[self.rho_dim];
             (
-                self.evaluator.psi_gram_tensor_covers(psi)
-                    && self.evaluator.psi_gram_tensor_covers_skip(psi),
+                self.evaluator.psi_gram_tensor_covers(psi),
                 !require_gradient || self.evaluator.psi_gram_tensor_covers_gradient(psi),
             )
         } else {
@@ -3806,23 +3805,14 @@ impl<'d> SpatialJointContext<'d> {
                     // bounds, so a measured trial cannot pay an edge streamed
                     // ∂X/∂ψ pass after the initial priming eval.
                     && self.evaluator.psi_gram_tensor_covers_gradient(psi)
-                    // #1264 (RESTORED) reduced-basis-rotation soundness precondition.
-                    // The Gaussian inner penalized solve `(QsᵀGQs+S)β=b` runs in the
-                    // CONDITIONED reduced basis. On the near-singular production
-                    // Duchon Gram (κ(G)≈9.5e14) that basis ROTATES with ψ, and the
-                    // skip installs the Chebyshev-interpolated `gram_at(ψ)` (≤1e-10
-                    // vs streamed exact). When the trial-ψ basis differs from the
-                    // reference surface's, the κ-amplified round-off moves β̂ by
-                    // ~1.7e-5 — 17× the issue's 1e-6 bar — EVEN at a ψ the n-free
-                    // VALUE window admits (cluster: β̂rel=1.749e-5 at ψ=2.803). The
-                    // "stale-penalty-not-stale-basis" theory that dropped this gate
-                    // was empirically refuted. So the skip is β̂-sound ONLY where the
-                    // gauge-invariant range projector is unchanged vs the pinning ψ:
-                    // `reduced_basis_equal(psi_ref, psi)`. Value coverage is NOT
-                    // sufficient. This forces the exact O(n) `reset_surface` fallback
-                    // across a basis rotation — correctness over n-independence
-                    // (#1033 is frontier-blocked on rotating Duchon geometry).
-                    && self.evaluator.psi_gram_tensor_covers_skip(psi)
+                    // #1868 / #1033: do NOT gate the row-realization skip on the
+                    // reduced-basis equality witness. The fast path below re-keys the
+                    // data Gram/RHS from the certified tensor and re-keys S(ψ) from
+                    // frozen geometry before the inner solve, so the pinned rows are
+                    // never consulted for the moved-ψ sufficient statistics. Requiring
+                    // projector equality here turns legitimate in-window trials into
+                    // O(n) reset_surface callbacks, which is exactly the n-free-skip
+                    // regression this path is meant to avoid.
                     // #1033 penalty lane: ψ moves S(ψ) too, and the skip leaves
                     // `reset_surface` un-run; only skip when the penalty can be
                     // rebuilt EXACTLY and n-free on the fast path, else the inner
@@ -3830,13 +3820,6 @@ impl<'d> SpatialJointContext<'d> {
                     && self.evaluator.supports_nfree_penalty_rekey()
                     && nfree_fast_path_revision.is_some()
         };
-        // TEMP-SKIPOFF-1122: force the exact streamed surface to test whether the
-        // n-free ψ-Gram Chebyshev interpolant is the source of the #1122 H-side
-        // FD-vs-analytic gap. REMOVE.
-        let skip_design_realization = false && skip_design_realization;
-        log::warn!(
-            "[OUTER-FD-AUDIT TEMP-SKIPOFF-1122] skip_design_realization={skip_design_realization}"
-        );
         if skip_design_realization {
             log::debug!(
                 "[STAGE] {} eval_full at psi={:.6}: skipping n×k design re-realization \
@@ -4018,15 +4001,9 @@ impl<'d> SpatialJointContext<'d> {
         let skip_value_realization = theta.len() == self.rho_dim + 1 && {
             let psi = theta[self.rho_dim];
             self.evaluator.psi_gram_tensor_covers(psi)
-                    // #1264 (RESTORED): the value-only line-search probe runs the
-                    // SAME conditioned-basis Gaussian solve, so it ships the same
-                    // κ-amplified interpolated-Gram β̂ error across a basis rotation
-                    // (cluster: β̂rel≈1.7e-5 ≫ 1e-6). The probe is β̂-sound only where the
-                    // reduced basis is provably unchanged vs the pinning ψ, exactly
-                    // as the eval_full gate. See the eval_full gate for the full
-                    // justification; the dropped-precondition "stale-penalty" theory
-                    // was empirically refuted.
-                    && self.evaluator.psi_gram_tensor_covers_skip(psi)
+                    // #1868 / #1033: value probes also need only the re-keyed
+                    // k-space sufficient statistics plus frozen-geometry S(ψ), so a
+                    // reduced-basis-rotation miss must not force `ensure_theta`.
                     // #1033 penalty lane: the value-probe fast path also skips
                     // `reset_surface`, so the probe must be able to re-key S(ψ)
                     // EXACTLY and n-free; otherwise its cost would use the stale
