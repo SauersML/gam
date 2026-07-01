@@ -251,7 +251,8 @@ def _grid_for(atom: Any, topology: str) -> np.ndarray:
 def _coordinate_bounds(coords: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     if coords.shape[0] == 0:
         return np.zeros(coords.shape[1]), np.ones(coords.shape[1])
-    lo, hi = np.percentile(coords, [5.0, 95.0], axis=0)
+    lo = coords.min(axis=0)
+    hi = coords.max(axis=0)
     width = np.maximum(hi - lo, 1.0e-6)
     return lo - 0.08 * width, hi + 0.08 * width
 
