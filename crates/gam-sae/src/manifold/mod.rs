@@ -132,6 +132,7 @@ mod arrow_solver;
 mod atom;
 mod certificate;
 mod construction;
+mod construction_ard;
 mod construction_aux_types;
 mod construction_cache_refresh;
 mod construction_padded_blocks;
