@@ -4251,6 +4251,8 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(summary_html, module)?)?;
     module.add_function(wrap_pyfunction!(coefficient_state_json, module)?)?;
     module.add_function(wrap_pyfunction!(term_blocks_for_model, module)?)?;
+    module.add_function(wrap_pyfunction!(model_partial_dependence, module)?)?;
+    module.add_function(wrap_pyfunction!(model_variance_share, module)?)?;
     module.add_function(wrap_pyfunction!(difference_smooth_json, module)?)?;
     module.add_function(wrap_pyfunction!(difference_smooth_rows, module)?)?;
     module.add_function(wrap_pyfunction!(
@@ -6929,6 +6931,156 @@ fn design_matrix_array_impl(
     let model = load_model_impl(model_bytes)?;
     let dataset = dataset_from_x_array_with_model_schema(&model, x)?;
     design_matrix_dense(&model, dataset)
+}
+
+/// Population variance (divide by `n`, matching numpy `np.var`'s default).
+fn population_variance(values: &[f64]) -> f64 {
+    let n = values.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let mean = values.iter().sum::<f64>() / n as f64;
+    values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / n as f64
+}
+
+/// Per-term partial dependence on a grid table.
+///
+/// For the requested `term` this evaluates `f_t(x) = X_t(x) β_t` and the
+/// matching delta-method standard error `sqrt(diag(X_t V_t X_tᵀ))`, where
+/// `V_t` is the term-block of the fitted coefficient covariance. The design
+/// build, `β`, `V`, and the term column ranges are all owned by the Rust
+/// core; the caller only supplies the evaluation grid.
+fn model_partial_dependence_impl(
+    model_bytes: &[u8],
+    term: &str,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+) -> Result<(Vec<f64>, Vec<f64>), String> {
+    let raw = design_matrix_table_impl(model_bytes, headers, rows)?;
+    let x = design_matrix_payload_to_dense(&raw)?;
+    let model = load_model_impl(model_bytes)?;
+    let fit = fit_result_from_saved_model_for_prediction(&model)?;
+    let beta = &fit.beta;
+    let cov = fit.beta_covariance().ok_or_else(|| {
+        "model does not contain coefficient covariance; refit with \
+         covariance-saving inference enabled"
+            .to_string()
+    })?;
+    let blocks = term_blocks_for_model_impl(model_bytes)?;
+    let (start, end) = blocks
+        .iter()
+        .find(|(name, _, _, _)| name.as_str() == term)
+        .map(|(_, _, s, e)| (*s, *e))
+        .ok_or_else(|| {
+            let available: Vec<&str> = blocks.iter().map(|(n, _, _, _)| n.as_str()).collect();
+            format!("partial_dependence: term {term:?} not found; available: {available:?}")
+        })?;
+    let n = x.nrows();
+    let mut predicted = vec![0.0_f64; n];
+    let mut se = vec![0.0_f64; n];
+    for i in 0..n {
+        let xi = x.row(i);
+        let mut f = 0.0_f64;
+        for c in start..end {
+            f += xi[c] * beta[c];
+        }
+        predicted[i] = f;
+        let mut var = 0.0_f64;
+        for a in start..end {
+            let xa = xi[a];
+            for b in start..end {
+                var += xa * cov[[a, b]] * xi[b];
+            }
+        }
+        se[i] = var.max(0.0).sqrt();
+    }
+    Ok((predicted, se))
+}
+
+/// Per-term variance share: `var(X_t β_t) / var(X β)` for each non-intercept
+/// term block (or a single `term` when supplied). Evaluated on the caller's
+/// grid table; `β` and the term column ranges come from the Rust core.
+fn model_variance_share_impl(
+    model_bytes: &[u8],
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    term: Option<String>,
+) -> Result<Vec<(String, f64)>, String> {
+    let raw = design_matrix_table_impl(model_bytes, headers, rows)?;
+    let x = design_matrix_payload_to_dense(&raw)?;
+    let model = load_model_impl(model_bytes)?;
+    let fit = fit_result_from_saved_model_for_prediction(&model)?;
+    let beta = &fit.beta;
+    let blocks = term_blocks_for_model_impl(model_bytes)?;
+    let n = x.nrows();
+    let p = beta.len();
+    let mut eta = vec![0.0_f64; n];
+    for i in 0..n {
+        let xi = x.row(i);
+        let mut s = 0.0_f64;
+        for c in 0..p {
+            s += xi[c] * beta[c];
+        }
+        eta[i] = s;
+    }
+    let total_var = population_variance(&eta);
+    let mut out: Vec<(String, f64)> = Vec::new();
+    for (name, kind, start, end) in &blocks {
+        if kind.as_str() == "intercept" {
+            continue;
+        }
+        if let Some(t) = term.as_ref() {
+            if name.as_str() != t.as_str() {
+                continue;
+            }
+        }
+        let mut contrib = vec![0.0_f64; n];
+        for i in 0..n {
+            let xi = x.row(i);
+            let mut s = 0.0_f64;
+            for c in *start..*end {
+                s += xi[c] * beta[c];
+            }
+            contrib[i] = s;
+        }
+        let share = if total_var > 0.0 {
+            population_variance(&contrib) / total_var
+        } else {
+            0.0
+        };
+        out.push((name.clone(), share));
+    }
+    Ok(out)
+}
+
+#[pyfunction]
+fn model_partial_dependence(
+    py: Python<'_>,
+    model_bytes: Vec<u8>,
+    term: String,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+) -> PyResult<(Py<PyArray1<f64>>, Py<PyArray1<f64>>)> {
+    let (predicted, se) = detach_py_result(py, "model_partial_dependence", move || {
+        model_partial_dependence_impl(&model_bytes, &term, headers, rows)
+    })?;
+    Ok((
+        predicted.into_pyarray(py).unbind(),
+        se.into_pyarray(py).unbind(),
+    ))
+}
+
+#[pyfunction(signature = (model_bytes, headers, rows, term = None))]
+fn model_variance_share(
+    py: Python<'_>,
+    model_bytes: Vec<u8>,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    term: Option<String>,
+) -> PyResult<Vec<(String, f64)>> {
+    detach_py_result(py, "model_variance_share", move || {
+        model_variance_share_impl(&model_bytes, headers, rows, term)
+    })
 }
 
 fn design_matrix_dataset_impl(

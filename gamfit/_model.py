@@ -851,6 +851,161 @@ class Model:
         except Exception as exc:
             raise map_exception(exc) from exc
 
+    def partial_dependence(
+        self,
+        term: str,
+        data: Any,
+        grid: Any | None = None,
+        n_points: int = 100,
+    ) -> dict[str, Any]:
+        """Per-term partial dependence with delta-method SE.
+
+        Analogue of mgcv's ``plot.gam()`` per-term plot: for ``term`` this
+        returns ``f_t(x) = X_t(x) β_t`` and the delta-method standard error
+        ``sqrt(diag(X_t V_t X_tᵀ))``. The evaluation ``f_t`` and its SE are
+        computed by the Rust core (``model_partial_dependence``); Python only
+        constructs the evaluation grid table.
+
+        Parameters
+        ----------
+        term:
+            Term name as it appears in :attr:`term_blocks` (e.g. ``"s(x1)"``).
+        data:
+            Reference table; non-``term`` columns supply template values for
+            the constructed grid rows.
+        grid:
+            Optional explicit grid (1-D for a single-axis smooth, or 2-D
+            ``(n_points, d)`` for a multi-axis smooth). When ``None`` a
+            1-D linspace over the term's training range is used.
+        n_points:
+            Grid resolution when ``grid`` is ``None``.
+
+        Returns
+        -------
+        dict
+            ``{"grid": array, "predicted": array, "standard_error": array}``.
+        """
+        import numpy as np
+
+        block = next((b for b in self.term_blocks if b.name == term), None)
+        if block is None:
+            available = [b.name for b in self.term_blocks]
+            raise ValueError(
+                f"partial_dependence: term {term!r} not found; available: {available}"
+            )
+        state = self._coefficient_state()
+        schema_cols = list((state.get("schema") or {}).get("columns") or [])
+        ranges = state.get("training_feature_ranges") or []
+        names = [str(c.get("name")) for c in schema_cols]
+
+        template: dict[str, Any] = {}
+        data_headers, data_rows, _ = normalize_table(data)
+        if data_rows:
+            first = data_rows[0]
+            template.update({h: first[i] for i, h in enumerate(data_headers)})
+        for idx, col in enumerate(schema_cols):
+            name = str(col.get("name"))
+            if name in template:
+                continue
+            if col.get("kind") == "categorical":
+                levels = col.get("levels") or ["0"]
+                template[name] = str(levels[0])
+            elif idx < len(ranges):
+                lo, hi = map(float, ranges[idx])
+                template[name] = str(0.5 * (lo + hi))
+            else:
+                template[name] = "0"
+
+        term_args: tuple[str, ...] = ()
+        if "(" in term and ")" in term:
+            inside = term[term.index("(") + 1 : term.rindex(")")]
+            term_args = tuple(
+                a.strip() for a in inside.split(",") if a.strip() and a.strip() in names
+            )
+
+        if grid is None:
+            if len(term_args) != 1:
+                raise ValueError(
+                    "partial_dependence: cannot infer a 1D sweep axis from term "
+                    f"{term!r} (axes inferred: {term_args!r}); pass an explicit "
+                    "`grid=` array. Multi-dimensional smooths always require an "
+                    "explicit grid."
+                )
+            term_argument = term_args[0]
+            col_idx = names.index(term_argument)
+            lo, hi = (map(float, ranges[col_idx]) if col_idx < len(ranges) else (0.0, 1.0))
+            lo, hi = float(lo), float(hi)
+            if not (np.isfinite(lo) and np.isfinite(hi)) or lo == hi:
+                lo, hi = 0.0, 1.0
+            grid_arr = np.linspace(lo, hi, int(n_points))
+            sweep_columns: tuple[str, ...] = (term_argument,)
+            grid_matrix = grid_arr.reshape(-1, 1)
+            grid_out: Any = grid_arr
+        else:
+            grid_matrix = np.asarray(grid, dtype=float)
+            if grid_matrix.ndim == 1:
+                if len(term_args) != 1:
+                    raise ValueError(
+                        "partial_dependence: a 1-D grid requires a single-axis "
+                        f"term; {term!r} has axes {term_args!r}. Pass a 2-D grid."
+                    )
+                sweep_columns = (term_args[0],)
+                grid_matrix = grid_matrix.reshape(-1, 1)
+                grid_out = grid_matrix.reshape(-1)
+            elif grid_matrix.ndim == 2:
+                if len(term_args) != grid_matrix.shape[1]:
+                    raise ValueError(
+                        "partial_dependence: explicit grid shape "
+                        f"{grid_matrix.shape} does not match term axes {term_args!r}"
+                    )
+                sweep_columns = term_args
+                grid_out = grid_matrix
+            else:
+                raise ValueError("partial_dependence: grid must be 1-D or 2-D")
+
+        headers = list(template.keys())
+        rows: list[list[str]] = []
+        for row_vals in grid_matrix:
+            row = dict(template)
+            for col_name, value in zip(sweep_columns, row_vals, strict=False):
+                row[col_name] = str(float(value))
+            rows.append([str(row[h]) for h in headers])
+
+        predicted, se = rust_module().model_partial_dependence(
+            self._model_bytes, term, headers, rows
+        )
+        return {
+            "grid": grid_out,
+            "predicted": np.asarray(predicted, dtype=float),
+            "standard_error": np.asarray(se, dtype=float),
+        }
+
+    def variance_share(
+        self,
+        data: Any,
+        term: str | None = None,
+    ) -> dict[str, float] | float:
+        """Term-wise variance decomposition ``var(X_t β_t) / var(X β)``.
+
+        Computed by the Rust core (``model_variance_share``) on the rows of
+        ``data``; the intercept is excluded. Returns ``{term: fraction}`` for
+        every non-intercept term, or the scalar fraction when ``term`` is given.
+        """
+        headers, data_rows, _ = normalize_table(data)
+        rows = [[str(v) for v in row] for row in data_rows]
+        pairs = rust_module().model_variance_share(
+            self._model_bytes, list(headers), rows, term
+        )
+        shares = {str(name): float(frac) for name, frac in pairs}
+        if term is not None:
+            if term not in shares:
+                available = [b.name for b in self.term_blocks]
+                raise ValueError(
+                    f"variance_share: term {term!r} not found; available: {available}"
+                )
+            return shares[term]
+        return shares
+
     @property
     def evidence(self) -> float:
         """Minimised REML / LAML cost for this fit (penalised negative log
