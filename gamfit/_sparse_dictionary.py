@@ -78,37 +78,6 @@ class SparseDictionaryFit:
             out += cod[:, [j]] * self.decoder[idx[:, j]]
         return np.ascontiguousarray(out)
 
-    def transform(self, X: Any, active: int | None = None) -> tuple[np.ndarray, np.ndarray]:
-        """Route held-out rows ``X`` (``M x P``) through the fitted decoder.
-
-        Returns ``(indices, codes)`` of shape ``M x active`` (sparse routing),
-        computed by the same tiled top-``active`` + active-set LS the trainer
-        uses, but against the frozen decoder.
-        """
-        x = _as_2d_f32(X, "X")
-        if x.shape[1] != self.decoder.shape[1]:
-            raise ValueError(
-                f"X must have P={self.decoder.shape[1]} columns; got {x.shape[1]}"
-            )
-        s = self.active if active is None else int(active)
-        s = max(1, min(s, self.decoder.shape[0]))
-        scores = x @ self.decoder.T  # M x K (held-out, allowed; not the trainer hot path)
-        m = x.shape[0]
-        indices = np.zeros((m, s), dtype=np.uint32)
-        codes = np.zeros((m, s), dtype=np.float32)
-        gram_full = self.decoder @ self.decoder.T
-        for row in range(m):
-            top = np.argpartition(np.abs(scores[row]), -s)[-s:]
-            order = top[np.argsort(-np.abs(scores[row][top]))]
-            system = gram_full[np.ix_(order, order)].astype(np.float64)
-            system += 1.0e-6 * np.eye(s)
-            rhs = (self.decoder[order] @ x[row]).astype(np.float64)
-            sol = np.linalg.solve(system, rhs)
-            indices[row] = order.astype(np.uint32)
-            codes[row] = sol.astype(np.float32)
-        return np.ascontiguousarray(indices), np.ascontiguousarray(codes)
-
-
 def sparse_dictionary_fit(
     X: Any,
     K: int,
