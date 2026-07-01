@@ -69,7 +69,10 @@ def test_assignment_unset_prior_passes_through():
 def test_assignment_equal_values_pass_through():
     # softmax via both kwargs (one aliased) resolves cleanly.
     assert _resolve_public_assignment("softmax", "softmax") == "softmax"
-    assert _resolve_public_assignment("gated", "jump_relu") == "jumprelu"
+    # #1777 — "gated"/"jump_relu"/"jumprelu" are deprecated aliases that all
+    # canonicalize to the primary "threshold_gate" token.
+    assert _resolve_public_assignment("gated", "jump_relu") == "threshold_gate"
+    assert _resolve_public_assignment("threshold_gate", "jumprelu") == "threshold_gate"
 
 
 def test_assignment_conflict_raises_naming_both():

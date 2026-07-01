@@ -393,7 +393,7 @@ def test_sae_curvature_report_is_user_reachable_and_round_trips(monkeypatch):
 @pytest.mark.parametrize(
     "kwargs,match",
     [
-        ({"gate_sparsity": "elastic"}, "gate_sparsity must be one of"),
+        ({"gate_sparsity": "elastic"}, "must be one of 'l1'"),
         (
             {"gate_sparsity": "scad", "scad_mcp_gamma": 2.0},
             "scad_mcp_gamma must be finite and > 2",

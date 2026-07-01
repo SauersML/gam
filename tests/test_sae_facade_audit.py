@@ -128,7 +128,11 @@ def test_ibp_alias_is_rejected():
 
 
 def test_jumprelu_assignment_is_canonical():
-    assert sae._canonical_assignment("jumprelu", "assignment") == "jumprelu"
+    # #1777 — the hard-sigmoid gate's canonical token is now "threshold_gate";
+    # the legacy "jumprelu" spelling is retained as a deprecated alias that
+    # canonicalizes to it. Both spellings resolve to the same canonical token.
+    assert sae._canonical_assignment("threshold_gate", "assignment") == "threshold_gate"
+    assert sae._canonical_assignment("jumprelu", "assignment") == "threshold_gate"
 
 
 class _StubModule:
@@ -370,7 +374,11 @@ def test_new_sae_helpers_are_importable_and_defaults_are_research_objective():
     assert callable(gamfit.atom_trust_scores)
 
     signature = inspect.signature(sae.sae_manifold_fit)
-    assert signature.parameters["gate_sparsity"].default == "scad"
+    # #1777 — `coord_sparsity` is the primary coordinate-block penalty param and
+    # `gate_sparsity` is its deprecated alias; both default to the same unset
+    # sentinel (the effective default, "scad", is resolved inside the function).
+    assert signature.parameters["coord_sparsity"].default is sae._COORD_SPARSITY_UNSET
+    assert signature.parameters["gate_sparsity"].default is sae._COORD_SPARSITY_UNSET
     assert signature.parameters["nuclear_norm_weight"].default == 1.0
     assert signature.parameters["decoder_incoherence_weight"].default == 1.0
 
