@@ -13,8 +13,9 @@
 //!      `gate / scaling` floor.
 //!   2. The deployment / surrogate decision is a tri-state
 //!      `EncodeDeploymentDecision` that can only reach `Met`/`Unmet` from a real
-//!      DEVICE measurement; on a CPU-only host it is `Undetermined` (BLOCKED),
-//!      and the gate asserts it never green-washes to "surrogate unneeded".
+//!      FULL-ENCODE DEVICE measurement; on a CPU-only host it is `Undetermined`
+//!      (BLOCKED), and the gate asserts it never green-washes to "surrogate
+//!      unneeded".
 //!   3. Correctness still requires actual SUPPORT RECOVERY (not merely finite
 //!      values), so a fast-but-wrong encode fails.
 //!   4. The CPU throughput assertion is an explicit REGRESSION SENTINEL, not a
@@ -74,6 +75,26 @@ fn throughput_gate_uses_device_only_tristate_decision() {
         BENCH_SRC.contains("!decision.surrogate_unneeded()"),
         "#1412: the gate must assert it never green-washes to 'surrogate unneeded' without a real \
          device measurement clearing the target"
+    );
+    assert!(
+        BENCH_SRC.contains("measure_device_encode_throughput"),
+        "#1412/#988: when a CUDA device is present the gate must run the full exact-encode \
+         throughput measurement, not an orphaned/component proxy"
+    );
+    assert!(
+        BENCH_SRC.contains("matches!(tput.path, EncodePath::Device)"),
+        "#1412/#988: the gate must fail loudly if CUDA is present but the full exact encode does \
+         not actually dispatch to the device"
+    );
+    assert!(
+        BENCH_SRC.contains("decision.surrogate_unneeded()"),
+        "#1412/#988: an engaged device measurement must be asserted against the 100k rows/sec/GPU \
+         target rather than merely printed"
+    );
+    assert!(
+        !BENCH_SRC.contains("measure_resident_solve_throughput"),
+        "#1412/#988: the deployment gate regressed to a resident-solve component measurement; it \
+         must use the full exact encode measurement"
     );
 }
 

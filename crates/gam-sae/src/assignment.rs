@@ -1071,11 +1071,10 @@ pub fn jumprelu_row(logits: ArrayView1<'_, f64>, temperature: f64, threshold: f6
 /// `σ'((l_k − θ_k)/τ)/τ` evaluated on BOTH sides of the jump (a straight-through
 /// estimator: the hard forward has zero derivative below threshold, which would
 /// permanently kill gradient flow to gated-off atoms). `∂a_k/∂θ_k` is the
-/// negation of the returned logit derivative; callers negate rather than a
-/// second buffer being allocated. `thresholds` is per-atom (the torch lane
-/// learns one threshold per atom); the scalar closed-form threshold is the
-/// constant-vector special case and the value arithmetic matches `jumprelu_row`
-/// exactly there.
+/// negation of the returned logit derivative; callers negate. `thresholds` is
+/// per-atom (the torch lane learns one threshold per atom); the scalar
+/// closed-form threshold is the constant-vector special case and the value
+/// arithmetic matches `jumprelu_row` exactly there.
 #[must_use]
 pub fn jumprelu_row_value_grad(
     logits: ArrayView1<'_, f64>,

@@ -6048,14 +6048,25 @@ impl SaeManifoldTerm {
             self.k_atoms(),
         )?;
         if !admission_plan.direct_logdet_admitted() {
-            return Err(format!(
-                "SaeManifoldTerm::reml_criterion_with_cache: predicted working set {} bytes exceeds budget {} bytes for dense evidence cache; shape n={},p={},K={}; cost-only streaming route is required",
-                admission_plan.estimated_direct_peak_bytes,
-                admission_plan.in_core_budget_bytes,
-                self.n_obs(),
-                self.output_dim(),
-                self.k_atoms()
-            ));
+            // The cache-returning REML entry is used by the EFS/outer lanes that
+            // need selected-inverse traces in addition to the scalar evidence.
+            // Large SAE fits cannot form the dense `N · q · border_dim`
+            // evidence slab (`q = K(1+d)`, `border_dim = Σ_k M_k · p`), so the
+            // correct implementation is not to reject here and force callers
+            // onto a value-only path.  Route through the streaming evidence
+            // implementation instead: it reuses the converged per-row factor
+            // cache for traces and recomputes the reduced-Schur logdet by
+            // chunks / matrix-free matvecs, keeping peak memory at the admitted
+            // streaming working set rather than the dense n·k·p floor.
+            return self.reml_criterion_streaming_exact_with_cache(
+                target,
+                rho,
+                registry,
+                inner_max_iter,
+                learning_rate,
+                ridge_ext_coord,
+                ridge_beta,
+            );
         }
         // 1. Run the inner (t, β) Newton solve to convergence at FIXED ρ.
         //    `run_joint_fit_arrow_schur` no longer touches ρ.
