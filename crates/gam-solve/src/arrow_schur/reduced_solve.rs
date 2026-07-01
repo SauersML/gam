@@ -504,6 +504,66 @@ pub(crate) fn spectral_pd_floored_schur(
     Some(conditioned)
 }
 
+/// Unit-stiffness quotient conditioning for the *reduced* evidence Schur block.
+///
+/// `spectral_pd_floored_schur` is the right object for Newton steps: it is a
+/// Levenberg-Marquardt floor that damps collapsed decoder directions just enough
+/// to compute a stable `Δβ`.  The Laplace evidence path is different.  Once the
+/// reduced Schur is being used only for a log determinant, a non-positive (or
+/// numerically null) reduced direction is a quotient/null direction, just like
+/// the per-row `H_tt` spectral-deflation case.  It must contribute the
+/// ρ-independent constant `log 1 = 0`, not `log(floor·max λ)`: the latter is a
+/// ρ-dependent Occam reward for collapsed/redundant decoders and can make the
+/// outer REML sweep prefer a worse planted-manifold optimum.
+pub(crate) fn spectral_unit_deflated_schur(
+    schur: &Array2<f64>,
+    relative_floor: f64,
+) -> Option<Array2<f64>> {
+    let n = schur.nrows();
+    if n == 0 || schur.ncols() != n || !(relative_floor.is_finite() && relative_floor > 0.0) {
+        return None;
+    }
+    let mut sym = Array2::<f64>::zeros((n, n));
+    for i in 0..n {
+        for j in 0..n {
+            let v = 0.5 * (schur[[i, j]] + schur[[j, i]]);
+            if !v.is_finite() {
+                return None;
+            }
+            sym[[i, j]] = v;
+        }
+    }
+    let (evals, evecs) = sym.eigh(Side::Lower).ok()?;
+    let max_abs = evals.iter().fold(
+        0.0_f64,
+        |acc, &v| if v.is_finite() { acc.max(v.abs()) } else { acc },
+    );
+    if !(max_abs.is_finite() && max_abs > 0.0) {
+        return None;
+    }
+    let floor = relative_floor * max_abs;
+    let deflate_floor = floor * (1.0 - SPECTRAL_DEFLATION_HYSTERESIS_FRACTION);
+    let mut conditioned = Array2::<f64>::zeros((n, n));
+    for eig_idx in 0..evals.len() {
+        let lambda = evals[eig_idx];
+        let lambda_conditioned = if !lambda.is_finite() || lambda <= 0.0 || lambda < deflate_floor {
+            1.0
+        } else {
+            lambda.max(floor)
+        };
+        for i in 0..n {
+            let vi = evecs[[i, eig_idx]];
+            if vi == 0.0 {
+                continue;
+            }
+            for j in 0..n {
+                conditioned[[i, j]] += lambda_conditioned * vi * evecs[[j, eig_idx]];
+            }
+        }
+    }
+    Some(conditioned)
+}
+
 pub(crate) fn solve_dense_reduced_system(
     schur: &Array2<f64>,
     rhs_beta: &Array1<f64>,
@@ -520,7 +580,11 @@ pub(crate) fn solve_dense_reduced_system(
             // co-collapse "crawl"). Disabled (default `None`) keeps the strict
             // refusal so BA / non-SAE callers are bit-for-bit unchanged.
             match options.schur_pd_floor {
-                Some(relative_floor) => match spectral_pd_floored_schur(schur, relative_floor) {
+                Some(relative_floor) => match if options.tolerate_ill_conditioning {
+                    spectral_unit_deflated_schur(schur, relative_floor)
+                } else {
+                    spectral_pd_floored_schur(schur, relative_floor)
+                } {
                     Some(floored) => match cholesky_lower(&floored) {
                         Ok(factor) => {
                             // Solve against the floored (PD) Schur. The healthy β
@@ -1011,7 +1075,9 @@ impl SaeResidentReducedSchur {
             }
         }
         // acc += P_iᵀ prod = scatter φ_s · prod into base_s blocks.
-        let acc_slice = acc.as_slice_mut().expect("resident matvec acc must be contiguous");
+        let acc_slice = acc
+            .as_slice_mut()
+            .expect("resident matvec acc must be contiguous");
         for &(base, phi) in support {
             if phi == 0.0 {
                 continue;
@@ -1205,7 +1271,15 @@ pub(crate) fn slq_reduced_schur_log_det<B: BatchedBlockSolver + Sync>(
             // guarded off inside a worker, so there is no nested oversubscription.
             let x = v.to_owned();
             let mut out = Array1::<f64>::zeros(k);
-            schur_matvec(sys, htt_factors, ridge_beta, &x, &mut out, backend, resident);
+            schur_matvec(
+                sys,
+                htt_factors,
+                ridge_beta,
+                &x,
+                &mut out,
+                backend,
+                resident,
+            );
             out
         },
         num_probes,
