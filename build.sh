@@ -389,7 +389,12 @@ run_under_global_lock() {
   fi
   cd "$REPO" || exit 1
   local attempt=0 max="${GAM_BUILD_RETRIES:-3}" t0 split=""
-  [[ -z "${GAM_NO_SPLIT:-}" ]] && is_test_run && split=1
+  # Compile/execute split is OPT-IN (default OFF) for RAM safety: with it on, one
+  # agent's compile can overlap another's test EXECUTION, ~doubling peak heavy
+  # processes — which OOM's a RAM-tight laptop. Default keeps the frugal
+  # one-cargo/test-at-a-time invariant ("serialize heavy compiles here"). Enable
+  # the overlap only on a big-RAM box with GAM_SPLIT=1.
+  [[ -n "${GAM_SPLIT:-}" ]] && is_test_run && split=1
   while :; do
     attempt=$((attempt+1))
     wait_for_memory
