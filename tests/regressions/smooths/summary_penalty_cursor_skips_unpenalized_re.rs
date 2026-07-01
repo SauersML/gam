@@ -107,9 +107,39 @@ fn summary_penalty_cursor_matches_actual_penalty_layout() {
         })
         .count();
 
-    // What the summary cursor SKIPS before the first smooth: one slot per
-    // random-effect range, unconditionally (the buggy reconstruction).
-    let summary_cursor_skips = design.random_effect_ranges.len();
+    // Reconstruct the penalty cursor EXACTLY as the FIXED model summary does
+    // (`model_summary.rs` / `manifold_and_posterior_ffi.rs`): seed PAST any
+    // leading shared `LinearTermRidge` block, then advance by ONE only for a
+    // random-effect range that actually OWNS a penalty block — penalized AND
+    // non-empty (`k_pen = penalized && !range.is_empty()`). The unpenalized
+    // treatment-coded `by`-factor main effect owns no penalty block, so the
+    // cursor must NOT advance for it (#1883). The earlier reconstruction used
+    // `random_effect_ranges.len()`, advancing once per range unconditionally,
+    // which over-counted here and slid every following smooth's penalty window.
+    let linear_ridge_blocks = design
+        .penaltyinfo
+        .iter()
+        .take_while(|info| {
+            matches!(
+                &info.penalty.source,
+                gam::basis::PenaltySource::Other(s) if s == "LinearTermRidge"
+            )
+        })
+        .count();
+    let re_penalty_skips = design
+        .random_effect_ranges
+        .iter()
+        .enumerate()
+        .filter(|(re_idx, (_name, range))| {
+            let penalized = std_fit
+                .resolvedspec
+                .random_effect_terms
+                .get(*re_idx)
+                .map(|t| t.penalized)
+                .unwrap_or(true);
+            penalized && !range.is_empty()
+        })
+        .count();
 
     // Sanity: the `by=g` factor really did introduce a random-effect range.
     assert!(
@@ -118,17 +148,50 @@ fn summary_penalty_cursor_matches_actual_penalty_layout() {
          random_effect_ranges was empty — formula plumbing changed"
     );
 
-    // The invariant the summary RELIES ON: the number of random-effect ranges it
-    // skips must equal the number of leading penalty blocks those ranges own.
-    // An unpenalized `by` factor breaks it (range present, no penalty block).
+    // The invariant the FIXED summary establishes: the number of random-effect
+    // ranges whose penalty block it actually skips must equal the number of
+    // leading random-effect penalty blocks the design emitted. The unpenalized
+    // `by`-factor range is present (sanity above) yet contributes ZERO to the
+    // skip — which is the whole point of #1883. `random_effect_ranges.len()`
+    // (the old reconstruction) would over-count here.
     assert_eq!(
-        summary_cursor_skips, leading_re_penalty_blocks,
-        "summary penalty-cursor desync: the summary advances the penalty cursor \
-         by {summary_cursor_skips} (one per random-effect range) before the first \
-         smooth, but only {leading_re_penalty_blocks} leading penalty blocks \
-         actually belong to random effects. The first smooth's per_term_edf will \
-         read penalty_block_trace[{summary_cursor_skips}..] instead of \
-         [{leading_re_penalty_blocks}..], corrupting EDF / ref_df / p-value in the \
-         influence-matrix-absent fallback path."
+        re_penalty_skips, leading_re_penalty_blocks,
+        "penalty-cursor desync: the fixed reconstruction skips {re_penalty_skips} \
+         random-effect penalty block(s), but the design's global penalty metadata \
+         opens with {leading_re_penalty_blocks} leading random-effect block(s). \
+         (random_effect_ranges.len() = {} includes the unpenalized by-factor main \
+         effect, which owns no penalty block.)",
+        design.random_effect_ranges.len()
+    );
+
+    // End-to-end: walking every smooth term's penalty window from that cursor
+    // must consume the per-block penalty trace EXACTLY, never running past its
+    // end. The old `random_effect_ranges.len()` seed overshoots here, so the
+    // trailing smooth's `[cursor..cursor+k]` window would run off the end of the
+    // per-block traces and `per_term_edf` would return 0 (#1883).
+    let mut penalty_cursor = linear_ridge_blocks + re_penalty_skips;
+    assert_eq!(
+        penalty_cursor,
+        linear_ridge_blocks + leading_re_penalty_blocks,
+        "reconstructed cursor must land on the first smooth penalty block"
+    );
+    for term in &design.smooth.terms {
+        let k = term.penalties_local.len();
+        assert!(
+            penalty_cursor + k <= design.penaltyinfo.len(),
+            "smooth term '{}' penalty window [{penalty_cursor}..{}] runs past the \
+             {} global penalty blocks — penalty-cursor desync (#1883)",
+            term.name,
+            penalty_cursor + k,
+            design.penaltyinfo.len()
+        );
+        penalty_cursor += k;
+    }
+    assert_eq!(
+        penalty_cursor,
+        design.penaltyinfo.len(),
+        "the reconstructed penalty cursor must consume every global penalty block \
+         exactly once; a leftover/overshoot means the per-term windows are \
+         mis-aligned (#1883)"
     );
 }
