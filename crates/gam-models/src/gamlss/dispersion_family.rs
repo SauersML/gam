@@ -312,6 +312,35 @@ mod test_support {
             .sub(&nu.mul(&mu.recip().scale(yi)));
         loglik.scale(-wi)
     }
+
+    /// Pruned single-axis NB2 dispersion tower oracle: `θ` is the sole jet
+    /// variable (axis 0), `μ` a constant. `value`/`g[0]`/`h[0][0]` reproduce the
+    /// consumed `value`/`g[1]`/`h[1][1]` of `dispersion_nb_nll_order2`
+    /// bit-for-bit. Test-only `Order2` oracle pin for
+    /// `prune_towers_match_dense_all_channels`; the production NB2 row kernel uses
+    /// the cheaper `dispersion_nb_disp_order1`.
+    #[inline]
+    pub(super) fn dispersion_nb_disp_order2(
+        yi: f64,
+        mu_value: f64,
+        theta_value: f64,
+        wi: f64,
+    ) -> gam_math::jet_scalar::Order2<1> {
+        type O1 = gam_math::jet_scalar::Order2<1>;
+
+        let mu = O1::constant(mu_value);
+        let theta = O1::variable(theta_value, 0);
+        let tpm = theta.add(&mu);
+        let theta_plus_y = theta.add(&O1::constant(yi));
+        let loglik = order2_ln_gamma(&theta_plus_y)
+            .sub(&order2_ln_gamma(&theta))
+            .sub(&O1::constant(ln_gamma(yi + 1.0)))
+            .add(&theta.mul(&theta.ln()))
+            .sub(&theta.mul(&tpm.ln()))
+            .add(&mu.ln().scale(yi))
+            .sub(&tpm.ln().scale(yi));
+        loglik.scale(-wi)
+    }
 }
 
 /// Production `Order2<2>` Beta row NLL (value/grad/Hessian hot path; the cross
@@ -381,7 +410,7 @@ fn order1_ln_gamma<const K: usize>(
 
 /// Value+gradient-only NB2 dispersion tower: `θ` is the sole jet variable
 /// (axis 0), `μ` a constant. `value`/`g[0]` reproduce the consumed
-/// `value`/`g[0]` of [`dispersion_nb_disp_order2`] bit-for-bit, but as an
+/// `value`/`g[0]` of `dispersion_nb_disp_order2` bit-for-bit, but as an
 /// [`Order1`] jet it never evaluates the trigamma (`ψ′`) that the discarded
 /// observed-Hessian channel would need. The NB2 row kernel uses the EXPECTED
 /// (Fisher) information in θ, not the observed Hessian, so `h[0][0]` was pure
@@ -402,39 +431,6 @@ pub(crate) fn dispersion_nb_disp_order1(
     let theta_plus_y = theta.add(&O1::constant(yi));
     let loglik = order1_ln_gamma(&theta_plus_y)
         .sub(&order1_ln_gamma(&theta))
-        .sub(&O1::constant(ln_gamma(yi + 1.0)))
-        .add(&theta.mul(&theta.ln()))
-        .sub(&theta.mul(&tpm.ln()))
-        .add(&mu.ln().scale(yi))
-        .sub(&tpm.ln().scale(yi));
-    loglik.scale(-wi)
-}
-
-/// Pruned single-axis NB2 dispersion tower: `θ` is the sole jet variable
-/// (axis 0), `μ` a constant. `value`/`g[0]`/`h[0][0]` reproduce the consumed
-/// `value`/`g[1]`/`h[1][1]` of `dispersion_nb_nll_order2` bit-for-bit. Retained
-/// as the `Order2` oracle pin (`prune_towers_match_dense_all_channels`); the
-/// production NB2 row kernel uses the cheaper [`dispersion_nb_disp_order1`].
-///
-/// Consumed only by the `#[cfg(test)]` oracle pins (`prune_towers_*`); the
-/// non-test lib carries it purely as documentation of the K=2 tower it prunes
-/// from, so `dead_code` is expected off the test profile.
-#[cfg_attr(not(test), allow(dead_code))]
-#[inline]
-pub(crate) fn dispersion_nb_disp_order2(
-    yi: f64,
-    mu_value: f64,
-    theta_value: f64,
-    wi: f64,
-) -> gam_math::jet_scalar::Order2<1> {
-    type O1 = gam_math::jet_scalar::Order2<1>;
-
-    let mu = O1::constant(mu_value);
-    let theta = O1::variable(theta_value, 0);
-    let tpm = theta.add(&mu);
-    let theta_plus_y = theta.add(&O1::constant(yi));
-    let loglik = order2_ln_gamma(&theta_plus_y)
-        .sub(&order2_ln_gamma(&theta))
         .sub(&O1::constant(ln_gamma(yi + 1.0)))
         .add(&theta.mul(&theta.ln()))
         .sub(&theta.mul(&tpm.ln()))
@@ -1511,7 +1507,9 @@ pub fn fit_dispersion_glm_location_scale_terms(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::test_support::{dispersion_gamma_nll_order2, dispersion_nb_nll_order2};
+    use super::test_support::{
+        dispersion_gamma_nll_order2, dispersion_nb_disp_order2, dispersion_nb_nll_order2,
+    };
     use crate::gamlss::test_support::dispersion_tweedie_nll_generic;
 
     pub(crate) fn beta_fisher_cross_info_mu_phi(mu: f64, phi: f64) -> f64 {
