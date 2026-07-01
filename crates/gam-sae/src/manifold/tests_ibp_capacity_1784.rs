@@ -71,7 +71,7 @@ fn circle_dictionary_term(z: ArrayView2<'_, f64>, k: usize, num_basis: usize, al
         let coords = seed_coords.slice(s![atom_idx, .., 0..1]).to_owned();
         let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
         let m = phi.ncols();
-        let mut xtx = fast_ata(&phi);
+        let mut xtx = fast_atb(&phi, &phi);
         for i in 0..m {
             xtx[[i, i]] += 1.0e-8;
         }

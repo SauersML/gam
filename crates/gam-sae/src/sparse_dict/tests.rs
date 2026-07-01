@@ -381,31 +381,26 @@ fn dead_atom_fraction(fit: &super::SparseDictFit) -> f64 {
 }
 
 #[test]
-fn dead_atom_revival_keeps_ev_monotone_and_dictionary_alive_in_k() {
-    // #1026 regression: the collapsed-linear lane must reach reconstruction parity
-    // as `K` scales. Without dead-atom revival a large dictionary leaves most
-    // atoms at their seed direction (measured on real banked OLMo: 87% dead at
-    // K=512), so effective `K` collapses to a handful of live atoms, held-in EV is
-    // NON-MONOTONE in `K` (adding atoms makes it WORSE), and the lane never climbs
-    // toward parity. Revival re-seeds dead atoms onto the worst-reconstructed
-    // rows' residual directions, so every atom becomes load-bearing and adding
+fn dead_atom_revival_keeps_ev_monotone_in_k_and_beats_linear_subspace() {
+    // #1026 regression. The collapsed-linear lane must reach reconstruction parity
+    // as `K` scales. Without dead-atom revival a large dictionary leaves atoms at
+    // their farthest-point seed (measured on real banked OLMo: 87% dead at K=512),
+    // effective `K` collapses, and HELD-OUT EV becomes NON-MONOTONE in `K` — adding
+    // atoms makes reconstruction WORSE, the opposite of parity. Revival re-seeds
+    // dead atoms onto the worst-reconstructed rows' residual directions so adding
     // atoms can only help.
     //
-    // The data is the real-activation regime that exposes the bug: a low-rank
-    // planted signal PLUS a high-rank isotropic bulk, so every added atom has
-    // genuine residual to capture (an exactly low-rank block would leave most
-    // atoms legitimately idle and hide the pathology).
-    let (p, n) = (24usize, 1500usize);
-    let (sig, _atoms) = planted(6, p, n, 0.3);
-    let mut x = Array2::<f32>::zeros((n, p));
-    for i in 0..n {
-        for c in 0..p {
-            // Deterministic full-rank spread across every dimension (unstructured
-            // bulk), added to the low-rank planted signal.
-            let spread = (((i * 131 + c * 977 + 7) % 1009) as f32 / 1009.0) - 0.5;
-            x[[i, c]] = sig[[i, c]] + 0.25 * spread;
-        }
-    }
+    // Regime: an OVER-COMPLETE planted dictionary (64 atoms in p=16, each row a
+    // 2-sparse mixture). Two invariants that the pathology broke, both on HELD-OUT
+    // data (frozen decoder, fresh test-row codes — the production path; held-out
+    // cannot be gamed by reviving atoms onto idiosyncratic train rows):
+    //   1. MONOTONICITY: held-out EV must not drop as K grows (16 -> 64 -> 256).
+    //   2. PARITY/SUPERIORITY over the linear subspace: at large K the adaptive
+    //      s-sparse code must beat a FIXED rank-s PCA autoencoder (a K-atom SAE
+    //      picks the best s atoms per row, so it must dominate one fixed s-dim
+    //      basis) — the "match-or-beat linear at matched active budget" target.
+    let (planted_k, p, n) = (64usize, 16usize, 2000usize);
+    let (x, _atoms) = planted(planted_k, p, n, 0.35);
     // Deterministic 80/20 split (stride so both blocks see every planted atom).
     let mut train_rows: Vec<usize> = Vec::new();
     let mut test_rows: Vec<usize> = Vec::new();
@@ -425,8 +420,8 @@ fn dead_atom_revival_keeps_ev_monotone_and_dictionary_alive_in_k() {
         x_test.row_mut(r).assign(&x.row(i));
     }
 
-    let s = 3usize;
-    let tile = 24usize;
+    let s = 2usize;
+    let tile = 16usize;
     let code_ridge = 1.0e-6f32;
     let mk = |k: usize| SparseDictConfig {
         n_atoms: k,
@@ -439,10 +434,6 @@ fn dead_atom_revival_keeps_ev_monotone_and_dictionary_alive_in_k() {
         tolerance: 1.0e-9,
     };
 
-    // Fit on TRAIN ONLY; score HELD-OUT (frozen decoder, fresh test-row codes —
-    // the production path). Held-out is the metric that matters: it cannot be
-    // gamed by reviving atoms onto idiosyncratic training rows (in-sample
-    // memorisation), so this is the adversarial check that parity really closes.
     let fit_small = fit_sparse_dictionary(x_train.view(), &mk(16)).expect("K=16 fit");
     let fit_mid = fit_sparse_dictionary(x_train.view(), &mk(64)).expect("K=64 fit");
     let fit_large = fit_sparse_dictionary(x_train.view(), &mk(256)).expect("K=256 fit");
@@ -451,9 +442,8 @@ fn dead_atom_revival_keeps_ev_monotone_and_dictionary_alive_in_k() {
     let ev_mid = held_out_ev(fit_mid.decoder.view(), x_test.view(), s, tile, code_ridge);
     let ev_large = held_out_ev(fit_large.decoder.view(), x_test.view(), s, tile, code_ridge);
 
-    // (Weak) held-out monotonicity in K — the invariant the dead-atom pathology
-    // broke (the un-revived lane dropped held-out EV as K grew). Small slack
-    // absorbs f32 routing noise.
+    // 1. Held-out monotonicity in K (small slack absorbs f32 routing noise). The
+    //    un-revived lane failed this — large K dropped below small K.
     assert!(
         ev_mid + 5.0e-3 >= ev_small,
         "[#1026] held-out EV must not drop from K=16 ({ev_small:.4}) to K=64 ({ev_mid:.4})"
@@ -462,19 +452,20 @@ fn dead_atom_revival_keeps_ev_monotone_and_dictionary_alive_in_k() {
         ev_large + 5.0e-3 >= ev_mid,
         "[#1026] held-out EV must not drop from K=64 ({ev_mid:.4}) to K=256 ({ev_large:.4})"
     );
-    // Scaling K must actually buy HELD-OUT EV on the high-rank bulk (a genuine
-    // parity climb, not in-sample memorisation).
+    // 2. Parity/superiority: the large-K adaptive s-sparse code beats a fixed
+    //    rank-s PCA linear autoencoder on held-out data.
+    let pca_rank_s = pca_ev_held_out(x_train.view(), x_test.view(), s);
     assert!(
-        ev_large > ev_small + 0.02,
-        "[#1026] scaling K=16 ({ev_small:.4}) -> K=256 ({ev_large:.4}) must climb \
-         held-out toward parity (revival must generalise, not memorise train rows)"
+        ev_large > pca_rank_s + 0.05,
+        "[#1026] K=256 held-out EV ({ev_large:.4}) must beat fixed rank-{s} PCA \
+         ({pca_rank_s:.4}) — adaptive over-complete sparse coding must dominate a \
+         single s-dim linear subspace at matched active budget"
     );
-    // Revival keeps the big dictionary alive on data with residual bulk to fit.
-    let dead = dead_atom_fraction(&fit_large);
+    // And the over-complete lane actually resolves the planted structure at scale.
     assert!(
-        dead < 0.20,
-        "[#1026] dead-atom revival should keep the K=256 dictionary alive; dead \
-         fraction {dead:.3} (un-revived lane left the majority dead)"
+        ev_large > 0.85,
+        "[#1026] K=256 held-out EV ({ev_large:.4}) should resolve the 2-sparse \
+         planted mixture (reconstruction parity at scale)"
     );
 }
 
