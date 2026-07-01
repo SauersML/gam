@@ -2866,7 +2866,7 @@ pub fn build_smooth_basis(
                 input_scales: None,
             })
         }
-        "duchon" => {
+        "duchon" | "ds" => {
             validate_known_options(
                 "duchon",
                 options,
