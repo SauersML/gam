@@ -295,7 +295,6 @@ from ._sae_manifold import (
     ManifoldSAE,
     SaeManifoldAtomFit,
     SaeManifoldFitResult,
-    align,
     featurize,
     fit as sae_fit,
     gumbel_geometric_schedule,

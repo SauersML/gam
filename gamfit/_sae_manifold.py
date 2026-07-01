@@ -395,91 +395,6 @@ def _functional_basis_params(plan: Mapping[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def activation_statistics(X: Any) -> dict[str, float]:
-    """Cheap, scale-free statistics of an activation matrix `X` (n, p) that key
-    the adaptive hyperparameter default (#977 measure→improve). All three are
-    properties of the centred spectrum, so they transfer across datasets rather
-    than overfitting one corpus:
-
-      * ``effective_rank`` — the spectral entropy rank
-        ``exp(-Σ pᵢ log pᵢ)`` with ``pᵢ = sᵢ² / Σ sⱼ²`` (participation ratio of
-        the singular spectrum). Low ⇒ the signal lives in few directions ⇒ a
-        low-dimensional / low intrinsic-rank atom suffices; high ⇒ richer.
-      * ``spectral_decay`` — ``s₀ / s_{k}`` at ``k = min(8, p-1)`` (how fast the
-        spectrum falls). Sharp decay ⇒ a clean low-harmonic ring; slow decay ⇒
-        the curve carries higher harmonics.
-      * ``snr`` — ``(Σ top-d² ) / (Σ tail²)`` with ``d = 2`` (signal vs residual
-        energy), a proxy for assignment sharpness ⇒ the gate temperature.
-    """
-    x = np.asarray(X, dtype=float)
-    if x.ndim == 1:
-        x = x.reshape(-1, 1)
-    x = x - x.mean(axis=0, keepdims=True)
-    n, p = x.shape
-    if n < 2 or p < 1:
-        return {"effective_rank": 1.0, "spectral_decay": 1.0, "snr": 1.0}
-    s = np.linalg.svd(x, compute_uv=False)
-    s2 = s ** 2
-    total = float(s2.sum())
-    if total <= 0.0:
-        return {"effective_rank": 1.0, "spectral_decay": 1.0, "snr": 1.0}
-    probs = s2 / total
-    nz = probs[probs > 0]
-    eff_rank = float(np.exp(-np.sum(nz * np.log(nz))))
-    k = min(8, len(s) - 1)
-    decay = float(s[0] / max(s[k], 1e-12)) if k >= 1 else 1.0
-    d = min(2, len(s2))
-    tail = float(s2[d:].sum())
-    snr = float(s2[:d].sum() / tail) if tail > 1e-12 else float("inf")
-    return {"effective_rank": eff_rank, "spectral_decay": decay, "snr": snr}
-
-
-def recommend_sae_hyperparams(X: Any) -> dict[str, Any]:
-    """Activation-statistics-keyed adaptive default for the manifold-SAE
-    hyperparameters `(tau, n_harmonics, intrinsic_rank)` (#977 measure→improve).
-
-    Calibrated against the held-out-EV optimum the on-corpus hillclimb
-    (`tests/sae/olmo_research_battery.py`) finds on REAL OLMo L25 activations:
-    the OLMo-fixture statistics must map to the measured optimum (asserted in
-    `tests/test_sae_adaptive_defaults.py`). The mapping is monotone in the
-    spectrum statistics so it generalises off that single corpus instead of
-    hard-coding one dataset's argmax.
-
-    The map (intentionally simple, each axis keyed by one statistic):
-      * ``intrinsic_rank`` from ``effective_rank``: a higher participation ratio
-        of the spectrum buys an extra intrinsic dimension (1 ⇒ low, 2 ⇒ high).
-      * ``n_harmonics`` from ``spectral_decay``: sharp decay ⇒ a clean ring at
-        1 harmonic; slow decay ⇒ admit a 2nd/3rd harmonic.
-      * ``tau`` from ``snr``: high SNR ⇒ sharper gate (lower temperature).
-    """
-    stats = activation_statistics(X)
-    eff = stats["effective_rank"]
-    decay = stats["spectral_decay"]
-    snr = stats["snr"]
-
-    intrinsic_rank = 2 if eff >= 6.0 else 1
-    if decay >= 12.0:
-        n_harmonics = 1
-    elif decay >= 4.0:
-        n_harmonics = 2
-    else:
-        n_harmonics = 3
-    # Sharper assignment when the signal stands well clear of the residual.
-    if snr >= 8.0:
-        tau = 0.25
-    elif snr >= 2.0:
-        tau = 0.5
-    else:
-        tau = 0.7
-
-    return {
-        "tau": tau,
-        "n_harmonics": n_harmonics,
-        "intrinsic_rank": intrinsic_rank,
-        "statistics": stats,
-    }
-
-
 def ev_knee_k(
     ev_by_k: Mapping[int, float] | list[tuple[int, float]],
     *,
@@ -3768,13 +3683,6 @@ def featurize(new_activations: Any) -> list[np.ndarray]:
     if _LAST_RESEARCH_LOOP_MODEL is None:
         raise RuntimeError("gamfit.featurize requires a prior gamfit.fit(activations, config=...) call")
     return _LAST_RESEARCH_LOOP_MODEL.featurize(new_activations)
-
-
-def align(fit_a: Any, fit_b: Any) -> Any:
-    """Align two SAE research-loop fits by delegating to ``gamfit._alignment``."""
-    from . import _alignment
-
-    return _alignment.align(fit_a, fit_b)
 
 
 def plot(atom: Any, **kwargs: Any) -> Any:
