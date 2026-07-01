@@ -2043,8 +2043,7 @@ pub(crate) fn positive_spectral_whitener_from_gram(
     let (eigenvalues, eigenvectors) = gram.eigh(Side::Lower).map_err(BasisError::LinalgError)?;
     let n = gram.nrows();
     let max_eval = eigenvalues.iter().copied().fold(0.0_f64, f64::max);
-    let tol = (default_rrqr_rank_alpha() * f64::EPSILON * (n.max(1) as f64) * max_eval.max(1.0))
-        .max(f64::EPSILON);
+    let tol = default_rrqr_rank_alpha() * f64::EPSILON * (n.max(1) as f64) * max_eval;
     let keep = eigenvalues.iter().filter(|&&ev| ev > tol).count();
     if keep == 0 {
         let min_ev = eigenvalues.iter().copied().fold(f64::INFINITY, f64::min);
@@ -2135,4 +2134,33 @@ pub fn orthogonality_transform_for_design(
     }
     let (constraint_cross, gram) = design_cross_and_gram(design, constraint_matrix, weights)?;
     orthogonality_transform_from_cross_and_gram(&constraint_cross, &gram)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn positive_spectral_whitener_uses_relative_scale_for_tiny_positive_gram() {
+        let scale = 1.0e-300;
+        let mut gram = Array2::<f64>::zeros((2, 2));
+        gram[[0, 0]] = scale;
+        gram[[1, 1]] = 0.25 * scale;
+
+        let whitening = positive_spectral_whitener_from_gram(&gram)
+            .expect("tiny-but-positive Gram directions should be retained by relative tolerance");
+
+        assert_eq!(whitening.dim(), (2, 2));
+        let whitened = fast_atb(&whitening, &fast_ab(&gram, &whitening));
+        for i in 0..2 {
+            for j in 0..2 {
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (whitened[[i, j]] - expected).abs() <= 1.0e-12,
+                    "whitened Gram entry ({i}, {j}) = {}, expected {expected}",
+                    whitened[[i, j]]
+                );
+            }
+        }
+    }
 }
