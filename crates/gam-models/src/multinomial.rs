@@ -711,12 +711,52 @@ pub fn fit_penalized_multinomial(
 
     let (max_abs_eta, row_index, active_class_index) = max_abs_eta_location(fit.eta.view());
     if !fit.converged && max_abs_eta >= MULTINOMIAL_SEPARATION_ETA_THRESHOLD {
-        return Err(EstimationError::MultinomialSeparationDetected {
-            iteration: fit.iterations,
-            max_abs_eta,
-            active_class_index,
-            row_index,
-        });
+        // Perfect / quasi-perfect separation (#1854): the UNBIASED softmax MLE is
+        // not finite along `active_class_index`'s saturated logit direction, so
+        // the fixed-λ Newton above ran away (`|η| ≥ 25`, no convergence). A
+        // penalty-null direction `v` (`S v = 0`, e.g. an unpenalized intercept /
+        // linear-covariate column) under softmax saturation has
+        // `(XᵀWX + λS) v → 0` for EVERY λ, so no smoothing parameter can bound it
+        // — only a proper prior on that quotient-null subspace can. Rather than
+        // hard-erroring, engage the Firth/Jeffreys proper prior automatically
+        // (magic-by-default): the full-span `½ log|I(β)|` correction supplies the
+        // `O(1)` curvature that keeps the estimate finite on exactly those
+        // separated directions while leaving well-identified fits untouched. This
+        // reuses the same coupled joint-Newton Jeffreys machinery the formula
+        // REML path arms on separation evidence (see
+        // `fit_penalized_multinomial_formula`), only here at the caller's fixed λ.
+        // Engage the fallback, but never let an internal consistency panic in
+        // the coupled joint-Newton assembly (e.g. the #1395 logdet-collapse
+        // guard) escape as a process abort: convert any panic into the
+        // documented hard separation diagnostic, exactly as if the refit had
+        // returned Err. This mirrors the catch_unwind panic-to-typed-error
+        // boundary already used around the faer / cudarc entry points, and keeps
+        // the separation path no worse than the pre-#1854 clean error while the
+        // Firth refit is still being hardened.
+        let firth = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fit_penalized_multinomial_firth_fallback(
+                design,
+                y_one_hot,
+                penalty,
+                lambdas,
+                row_weights,
+                max_iter,
+                tol,
+            )
+        }));
+        match firth {
+            Ok(Ok(out)) => return Ok(out),
+            // Firth refit errored, or an internal consistency guard panicked:
+            // fall back to the explicit hard separation diagnostic.
+            Ok(Err(_)) | Err(_) => {
+                return Err(EstimationError::MultinomialSeparationDetected {
+                    iteration: fit.iterations,
+                    max_abs_eta,
+                    active_class_index,
+                    row_index,
+                });
+            }
+        }
     }
 
     let fitted_probabilities = likelihood.probabilities(fit.eta.view());
@@ -729,6 +769,201 @@ pub fn fit_penalized_multinomial(
         penalized_neg_log_likelihood: -fit.log_likelihood + fit.penalty_term,
         deviance: -2.0 * fit.log_likelihood,
         coefficient_covariance: fit.coefficient_covariance,
+    })
+}
+
+/// Firth/Jeffreys-penalized multinomial refit engaged automatically when the
+/// unbiased softmax MLE separates (#1854).
+///
+/// The unbiased fixed-λ solve ([`fit_penalized_multinomial`]) runs away on
+/// (quasi-)separated data because the softmax likelihood has no finite mode along
+/// the saturated logit direction and the smoothing penalty `S` cannot bound a
+/// penalty-null direction (`S v = 0` ⇒ `(XᵀWX + λS) v → 0` for every λ). This
+/// refit arms the full-span Jeffreys/Firth proper prior `½ log|I(β)|` on the
+/// coupled joint softmax information, which supplies the `O(1)` curvature that
+/// bounds exactly those directions and keeps the estimate finite.
+///
+/// It reuses the SAME coupled joint-Newton REML machinery the formula multinomial
+/// entry arms on separation evidence (`run_firth_refit` in
+/// [`fit_penalized_multinomial_formula`]): a [`MultinomialFamily`] carrying the
+/// single shared penalty `S` as one smooth term, with the joint Jeffreys/Firth
+/// term armed and the reference-symmetric ("centered") joint penalty as the
+/// smoothing carrier. The caller's per-active-class `lambdas` (the centered metric
+/// ties one shared `λ` across classes; every wine / penguin-style separation
+/// arrives with a single shared smooth λ, for which this is exact) seed the outer
+/// ρ; the outer REML loop then selects the smoothing parameter around that seed.
+/// The Firth curvature — not the smoothing λ — is what keeps the separated
+/// unpenalized directions finite, so the exact λ selection is immaterial to
+/// finiteness here.
+fn fit_penalized_multinomial_firth_fallback(
+    design: ArrayView2<'_, f64>,
+    y_one_hot: ArrayView2<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    lambdas: ArrayView1<'_, f64>,
+    row_weights: Option<ArrayView1<'_, f64>>,
+    max_iter: usize,
+    tol: f64,
+) -> Result<MultinomialFitOutputs, EstimationError> {
+    let n_obs = design.nrows();
+    let p = design.ncols();
+    let k = y_one_hot.ncols();
+    let m = k - 1;
+
+    // Local softmax likelihood mirroring the caller's row weights, used only to
+    // map the fitted η back to probabilities for the returned outputs.
+    let mut likelihood = MultinomialLogitLikelihood::with_classes(k)?;
+    if let Some(w) = row_weights.as_ref() {
+        likelihood = likelihood.with_row_weights(w.to_owned())?;
+    }
+
+    // Representative shared smooth λ seeding the centered joint metric. Floor away
+    // from zero so a fully-unpenalized smooth still seeds a finite `log λ`; the
+    // Firth prior — not this λ — is what bounds the separated directions.
+    let lambda_repr = {
+        let sum: f64 = lambdas.iter().copied().sum();
+        let mean = if m > 0 { sum / m as f64 } else { 0.0 };
+        mean.max(multinomial_formula_min_lambda(y_one_hot))
+    };
+
+    let weights = match row_weights.as_ref() {
+        Some(w) => w.to_owned(),
+        None => Array1::<f64>::ones(n_obs),
+    };
+    let design_arc = Arc::new(design.to_owned());
+    let penalties_arc = Arc::new(vec![PenaltyMatrix::Dense(penalty.to_owned())]);
+    let nullspace_arc = Arc::new(vec![0usize]);
+
+    let family = MultinomialFamily::new(
+        y_one_hot.to_owned(),
+        weights,
+        k,
+        design_arc,
+        penalties_arc,
+        nullspace_arc,
+    )
+    .map_err(EstimationError::InvalidInput)?
+    // Arm the full-span Firth/Jeffreys correction: this is the whole point of the
+    // fallback — supply the `O(1)` curvature that bounds the separated logits.
+    .with_joint_jeffreys_term(true)
+    .with_initial_log_lambda(lambda_repr.ln());
+    let blocks = family.build_block_specs();
+
+    // Mirror the formula path's Firth refit options: full inner budget so the
+    // ill-conditioned LM-damped joint-Newton can certify its KKT point, calibrated
+    // outer REML tolerance, solver-only stabilization (the ridge never enters the
+    // fitted objective), and no seed screening (the pinned seed flows straight to
+    // the outer optimizer).
+    // One smooth term (the shared penalty `S`) per active class.
+    let total_rho_dim = m;
+    let options = BlockwiseFitOptions {
+        inner_max_cycles: crate::custom_family::DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES,
+        inner_tol: MULTINOMIAL_FORMULA_INNER_TOL.max(tol.max(0.0)),
+        outer_max_iter: max_iter.max(1),
+        outer_tol: if tol.is_finite() && tol > 0.0 {
+            tol.max(MULTINOMIAL_OUTER_REML_TOL)
+        } else {
+            MULTINOMIAL_OUTER_REML_TOL
+        },
+        outer_rel_cost_tol: Some(BlockwiseFitOptions::default().outer_tol),
+        rho_lower_bound: multinomial_formula_min_lambda(y_one_hot).ln(),
+        ridge_floor: MULTINOMIAL_FORMULA_RIDGE_FLOOR,
+        ridge_policy: gam_problem::RidgePolicy::solver_only(),
+        use_outer_hessian: multinomial_formula_use_outer_hessian(total_rho_dim),
+        screen_initial_rho: false,
+        compute_covariance: true,
+        ..BlockwiseFitOptions::default()
+    };
+
+    let fit = fit_custom_family_with_rho_prior(
+        &family,
+        &blocks,
+        &options,
+        gam_problem::RhoPrior::Flat,
+    )
+    .map_err(|err| {
+        EstimationError::InvalidInput(format!(
+            "multinomial Firth/Jeffreys separation fallback (#1854) failed: {err}"
+        ))
+    })?;
+
+    if fit.blocks.len() != m {
+        crate::bail_invalid_estim!(
+            "multinomial Firth fallback: expected {m} fitted blocks (K-1), got {}",
+            fit.blocks.len()
+        );
+    }
+    let mut coefficients_active = Array2::<f64>::zeros((p, m));
+    for (a, block) in fit.blocks.iter().enumerate() {
+        if block.beta.len() != p {
+            crate::bail_invalid_estim!(
+                "multinomial Firth fallback: block {a} has {} coefs, expected {p}",
+                block.beta.len()
+            );
+        }
+        for i in 0..p {
+            let v = block.beta[i];
+            if !v.is_finite() {
+                crate::bail_invalid_estim!(
+                    "multinomial Firth fallback: non-finite coefficient β[{i}, {a}] = {v}"
+                );
+            }
+            coefficients_active[[i, a]] = v;
+        }
+    }
+
+    // η = X · β̂, fitted probabilities, and the penalized objective on the direct
+    // path's own (diagonal-metric) reporting convention.
+    let mut eta = Array2::<f64>::zeros((n_obs, m));
+    for a in 0..m {
+        for row in 0..n_obs {
+            let mut acc = 0.0_f64;
+            for i in 0..p {
+                acc += design[[row, i]] * coefficients_active[[i, a]];
+            }
+            eta[[row, a]] = acc;
+        }
+    }
+    let fitted_probabilities = likelihood.probabilities(eta.view());
+
+    let mut log_likelihood = 0.0_f64;
+    for n in 0..n_obs {
+        let w = row_weights.as_ref().map_or(1.0, |rw| rw[n]);
+        for c in 0..k {
+            let ycn = y_one_hot[[n, c]];
+            if ycn != 0.0 {
+                log_likelihood += w * ycn * fitted_probabilities[[n, c]].max(f64::MIN_POSITIVE).ln();
+            }
+        }
+    }
+
+    let mut penalty_term = 0.0_f64;
+    for a in 0..m {
+        let beta_col = coefficients_active.column(a);
+        let mut quad = 0.0_f64;
+        for i in 0..p {
+            let mut s_beta_i = 0.0_f64;
+            for j in 0..p {
+                s_beta_i += penalty[[i, j]] * beta_col[j];
+            }
+            quad += beta_col[i] * s_beta_i;
+        }
+        penalty_term += 0.5 * lambda_repr * quad;
+    }
+
+    let d = p * m;
+    let coefficient_covariance = fit
+        .covariance_conditional
+        .filter(|c| c.dim() == (d, d))
+        .unwrap_or_else(|| Array2::<f64>::zeros((d, d)));
+
+    Ok(MultinomialFitOutputs {
+        coefficients_active,
+        fitted_probabilities,
+        iterations: fit.inner_cycles.max(1),
+        converged: true,
+        penalized_neg_log_likelihood: -log_likelihood + penalty_term,
+        deviance: -2.0 * log_likelihood,
+        coefficient_covariance,
     })
 }
 
@@ -2654,7 +2889,14 @@ mod fisher_override_tests {
     }
 
     #[test]
-    fn fixed_lambda_multinomial_reports_complete_separation() {
+    fn fixed_lambda_multinomial_firth_keeps_complete_separation_finite() {
+        // #1854: complete softmax separation used to be a HARD diagnostic
+        // (`MultinomialSeparationDetected`). It now automatically engages the
+        // Firth/Jeffreys proper prior (`½ log|I(β)|`, magic-by-default) so the fit
+        // stays finite instead of running away — the same guarantee the formula
+        // REML path already provided. The class regions are cleanly separated by
+        // `x`, so the unbiased MLE is at infinity; the Firth-penalized fit must
+        // still converge to a finite mode and recover the region structure.
         let n = 90;
         let design = Array2::<f64>::from_shape_fn((n, 2), |(row, col)| match col {
             0 => 1.0,
@@ -2674,7 +2916,7 @@ mod fisher_override_tests {
         }
         let penalty = Array2::<f64>::zeros((2, 2));
         let lambdas = Array1::<f64>::zeros(2);
-        let err = fit_penalized_multinomial(MultinomialFitInputs {
+        let out = fit_penalized_multinomial(MultinomialFitInputs {
             design: design.view(),
             y_one_hot: y.view(),
             penalty: penalty.view(),
@@ -2684,23 +2926,53 @@ mod fisher_override_tests {
             max_iter: 80,
             tol: 1.0e-12,
         })
-        .expect_err("complete softmax separation must be a hard diagnostic");
+        .expect("Firth/Jeffreys prior keeps the separated multinomial fit finite (#1854)");
         assert!(
-            matches!(err, EstimationError::MultinomialSeparationDetected { .. }),
-            "expected MultinomialSeparationDetected, got {err:?}"
+            out.converged,
+            "the Firth-penalized separation refit must report convergence"
         );
-        assert!(
-            err.to_string().contains("separation"),
-            "diagnostic should mention separation, got {err}"
-        );
-        assert!(
-            err.to_string().contains("active class-"),
-            "diagnostic should name the separated active class logit, got {err}"
-        );
-        assert!(
-            !err.to_string().contains("binary outcomes"),
-            "multinomial diagnostic must not reuse the binary separation text, got {err}"
-        );
+        // Every coefficient is finite — the whole point of the Firth prior on the
+        // separated (unpenalized) logit directions.
+        for &b in out.coefficients_active.iter() {
+            assert!(
+                b.is_finite(),
+                "Firth-penalized coefficients must be finite, got {b}"
+            );
+        }
+        // Fitted probabilities remain a valid simplex per row.
+        for row in 0..n {
+            let mut mass = 0.0_f64;
+            for c in 0..3 {
+                let p = out.fitted_probabilities[[row, c]];
+                assert!(
+                    p.is_finite() && (0.0..=1.0 + 1e-9).contains(&p),
+                    "row {row} class {c} probability {p} out of [0,1]"
+                );
+                mass += p;
+            }
+            assert!(
+                (mass - 1.0).abs() < 1e-6,
+                "row {row} probabilities must sum to 1, got {mass}"
+            );
+        }
+        // The finite fit still recovers the separated structure: on a clearly
+        // interior representative of each region the predicted class is correct.
+        let predict = |x: f64| -> usize {
+            let mut eta = [0.0_f64; 3];
+            for a in 0..2 {
+                eta[a] = out.coefficients_active[[0, a]] + out.coefficients_active[[1, a]] * x;
+            }
+            let mut best = 0usize;
+            for c in 1..3 {
+                if eta[c] > eta[best] {
+                    best = c;
+                }
+            }
+            best
+        };
+        assert_eq!(predict(-2.5), 0, "deep-left region should predict class 0");
+        assert_eq!(predict(2.5), 1, "deep-right region should predict class 1");
+        assert_eq!(predict(0.0), 2, "central region should predict class 2");
     }
 
     #[test]

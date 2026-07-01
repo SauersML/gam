@@ -1080,14 +1080,21 @@ impl TakahashiInverse {
         let s_col_ptr = symbolic.col_ptr();
         let s_row_idx = symbolic.row_idx();
         // tr(Z S) = Σ_diag Z[i,i] S[i,i] + 2 Σ_{i<j} Z[i,j] S[i,j]. Each column's
-        // contribution is independent of every other column's, so the outer loop
-        // is a pure associative reduction — fan it across rayon. `self.get` takes
-        // `&self`, and its on-demand exact-inverse-column cache is `Mutex`-guarded
-        // (`exact_columns`), so concurrent lookups — including cache-miss column
-        // solves — are sound. (This parallelization was first landed for #759 in
-        // b7879667b, then lost in the gam-linalg crate-extraction refactor
-        // a80fe6943; restored here with a regression test pinning the agreement.)
-        (0..s.ncols())
+        // contribution is independent of every other column's, so the expensive
+        // per-column work (`self.get` — on-demand exact-inverse-column solves,
+        // `Mutex`-guarded via `exact_columns`, so concurrent lookups including
+        // cache misses are sound) fans across rayon. But the FINAL reduction must
+        // NOT be a rayon `.sum()`: that folds partials in a work-stealing tree
+        // order, so the low-order bits of `tr(ZS)` would vary with thread count /
+        // scheduling — and this value feeds the REML gradient / EDF, so that drift
+        // makes fits non-reproducible across machines with different core counts.
+        // Collect the per-column partials in column order (`collect()` on an
+        // indexed parallel iterator preserves order) and sum them SERIALLY, so
+        // the result is bit-identical regardless of the thread pool — matching the
+        // index-ordered-serial-reduction idiom the Firth outer-Hessian paths use.
+        // (Parallelization first landed for #759 in b7879667b, lost in the
+        // gam-linalg crate-extraction refactor a80fe6943, restored here.)
+        let per_column: Vec<f64> = (0..s.ncols())
             .into_par_iter()
             .map(|col| {
                 let col_start = s_col_ptr[col];
@@ -1108,7 +1115,8 @@ impl TakahashiInverse {
                 }
                 partial
             })
-            .sum()
+            .collect();
+        per_column.iter().sum()
     }
 }
 
@@ -1648,6 +1656,31 @@ mod tests {
         assert_eq!(
             got, got_again,
             "parallel trace_product_sparse must be deterministic across calls"
+        );
+
+        // Bit-identical across thread-pool sizes. The per-column partials are
+        // summed in fixed column order, so the reduction cannot depend on how
+        // many rayon workers fold them. A plain parallel `.sum()` would fold in
+        // a scheduling-dependent tree order and drift in the low bits, perturbing
+        // the REML gradient / EDF that consumes tr(H⁻¹S) across machines with
+        // different core counts. Pin 1-worker == 8-worker exactly.
+        let pool1 = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let pool8 = rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build()
+            .unwrap();
+        let got_1t = pool1.install(|| taka.trace_product_sparse(&s_sparse));
+        let got_8t = pool8.install(|| taka.trace_product_sparse(&s_sparse));
+        assert_eq!(
+            got_1t, got_8t,
+            "trace_product_sparse must be bit-identical across 1 vs 8 rayon workers"
+        );
+        assert_eq!(
+            got, got_1t,
+            "default-pool result must match the single-worker reduction"
         );
     }
 }

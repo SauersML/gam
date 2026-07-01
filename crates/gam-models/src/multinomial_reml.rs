@@ -817,43 +817,38 @@ impl MultinomialFamily {
     /// the reduction order and break the bit-identical contract whenever
     /// rayon splits the dense path's row range into more than one chunk.
     fn hessian_diagonal_with_probs(&self, probs_full: ArrayView2<'_, f64>) -> Array1<f64> {
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let p = self.design.ncols();
         let m = self.active_classes();
         let n = self.weights.len();
         let dim = m * p;
         let design = self.design.view();
-        (0..n)
-            .into_par_iter()
-            .fold(
-                || Array1::<f64>::zeros(dim),
-                |mut acc, row| {
-                    let w = self.weights[row];
-                    if w == 0.0 {
-                        return acc;
+        gam_problem::outer_subsample::RowSet::All.par_reduce_fold(
+            n,
+            || Array1::<f64>::zeros(dim),
+            |mut acc, row, _row_weight| {
+                let w = self.weights[row];
+                if w == 0.0 {
+                    return acc;
+                }
+                for a in 0..m {
+                    let pa = probs_full[[row, a]];
+                    let waa = w * pa * (1.0 - pa);
+                    if waa == 0.0 {
+                        continue;
                     }
-                    for a in 0..m {
-                        let pa = probs_full[[row, a]];
-                        let waa = w * pa * (1.0 - pa);
-                        if waa == 0.0 {
-                            continue;
-                        }
-                        let base = a * p;
-                        for i in 0..p {
-                            let xi = design[[row, i]];
-                            acc[base + i] += waa * xi * xi;
-                        }
+                    let base = a * p;
+                    for i in 0..p {
+                        let xi = design[[row, i]];
+                        acc[base + i] += waa * xi * xi;
                     }
-                    acc
-                },
-            )
-            .reduce(
-                || Array1::<f64>::zeros(dim),
-                |mut a, b| {
-                    a += &b;
-                    a
-                },
-            )
+                }
+                acc
+            },
+            |mut a, b| {
+                a += &b;
+                a
+            },
+        )
     }
 
     /// Directional derivative of the per-row Fisher block along a

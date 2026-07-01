@@ -749,6 +749,19 @@ pub fn spline_scan_fast_path(request: &StandardFitRequest<'_>) -> Option<SplineS
             bspec.knotspec,
             gam_terms::basis::BSplineKnotSpec::PeriodicUniform { .. }
         )
+        // mgcv `bs="cr"`/`"cs"` materialise a `NaturalCubicRegression` value-knot
+        // spec: a Lancaster–Salkauskas cubic-regression basis whose columns
+        // index `f(x*_i)` at `k` quantile knots — a genuinely DIFFERENT finite
+        // basis (and hence a different penalized posterior) from the free
+        // integrated-Wiener natural spline the exact scan solves on the raw data
+        // points. The scan builds its own knots from `x` and ignores this spec,
+        // so routing a cr fit through it would silently solve the wrong model and
+        // (per #1844) return a non-`Standard` `SplineScan` result the predict-time
+        // design replay cannot reconstruct. Keep cr/cs on the dense path.
+        || matches!(
+            bspec.knotspec,
+            gam_terms::basis::BSplineKnotSpec::NaturalCubicRegression { .. }
+        )
     {
         return None;
     }

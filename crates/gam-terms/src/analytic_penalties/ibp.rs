@@ -86,14 +86,20 @@ impl IBPAssignmentPenalty {
     fn pi_map(&self, z: ArrayView1<'_, f64>, alpha: f64) -> Array1<f64> {
         let n = z.len() / self.k_max;
         let a = alpha / self.k_max as f64;
+        // Use the Beta-Bernoulli posterior mean, `(M_k + a)/(N + a + 1)`, as
+        // the smooth empirical-π plug-in.  The old MAP plug-in
+        // `(M_k + a - 1)/(N + a - 1)` is pinned to the zero boundary whenever
+        // `a < 1` and the fitted mass is sparse, which incorrectly makes
+        // `∂π_k/∂M_k = 0` and drops the IBP cross-row Woodbury curvature for
+        // precisely the active-sparsity regimes this prior is meant to model.
         let mut pi = Array1::<f64>::zeros(self.k_max);
         for k in 0..self.k_max {
             let mut active_mass = 0.0;
             for row in 0..n {
                 active_mass += z[row * self.k_max + k];
             }
-            let denom = (n as f64 + a - 1.0).max(IBP_COUNT_DENOM_FLOOR);
-            let raw = (active_mass + a - 1.0) / denom;
+            let denom = (n as f64 + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
+            let raw = (active_mass + a) / denom;
             pi[k] = raw.clamp(IBP_INTERIOR_TOL, 1.0 - IBP_INTERIOR_TOL);
         }
         pi
@@ -145,7 +151,7 @@ impl IBPAssignmentPenalty {
         let z = self.concrete_logits(target);
         let pi = self.pi_map(z.view(), alpha);
         let n = z.len() / self.k_max;
-        let denom = (n as f64 + a - 1.0).max(IBP_COUNT_DENOM_FLOOR);
+        let denom = (n as f64 + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
 
         let mut active_mass = Array1::<f64>::zeros(self.k_max);
         for row in 0..n {
@@ -161,7 +167,7 @@ impl IBPAssignmentPenalty {
         for k in 0..self.k_max {
             let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
             let mass = active_mass[k];
-            let raw = (mass + a - 1.0) / denom;
+            let raw = (mass + a) / denom;
             let pi_jac = if raw > IBP_INTERIOR_TOL && raw < 1.0 - IBP_INTERIOR_TOL {
                 1.0 / denom
             } else {
@@ -241,12 +247,12 @@ impl IBPAssignmentPenalty {
             if self.learnable_alpha {
                 let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
                 let mass = active_mass[k];
-                let raw = (mass + a - 1.0) / denom;
+                let raw = (mass + a) / denom;
                 // Same interior gate / zero-π-Jacobian convention as
                 // `hessian_diag_log_alpha_derivative`; at the clamp the derivative is 0.
                 if raw > IBP_INTERIOR_TOL && raw < 1.0 - IBP_INTERIOR_TOL {
                     let one_minus = 1.0 - pk;
-                    let dpi_da = (n as f64 - mass) / (denom * denom);
+                    let dpi_da = (n as f64 + 1.0 - mass) / (denom * denom);
                     let inv_p = 1.0 / pk;
                     let inv_q = 1.0 / one_minus;
                     let a_channel = inv_p + inv_q;
@@ -292,7 +298,7 @@ impl IBPAssignmentPenalty {
         let z = self.concrete_logits(target);
         let pi = self.pi_map(z.view(), alpha);
         let n = z.len() / self.k_max;
-        let denom = (n as f64 + a - 1.0).max(IBP_COUNT_DENOM_FLOOR);
+        let denom = (n as f64 + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
         let mut active_mass = Array1::<f64>::zeros(self.k_max);
         for row in 0..n {
             let start = row * self.k_max;
@@ -302,7 +308,7 @@ impl IBPAssignmentPenalty {
         }
         let mut pi_jac = Array1::<f64>::zeros(self.k_max);
         for k in 0..self.k_max {
-            let raw = (active_mass[k] + a - 1.0) / denom;
+            let raw = (active_mass[k] + a) / denom;
             if raw > IBP_INTERIOR_TOL && raw < 1.0 - IBP_INTERIOR_TOL {
                 pi_jac[k] = 1.0 / denom;
             }
@@ -343,7 +349,7 @@ impl IBPAssignmentPenalty {
         let z = self.concrete_logits(target);
         let pi = self.pi_map(z.view(), alpha);
         let n = z.len() / self.k_max;
-        let denom = (n as f64 + a - 1.0).max(IBP_COUNT_DENOM_FLOOR);
+        let denom = (n as f64 + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
         let mut active_mass = Array1::<f64>::zeros(self.k_max);
         for row in 0..n {
             let start = row * self.k_max;
@@ -356,12 +362,12 @@ impl IBPAssignmentPenalty {
         for k in 0..self.k_max {
             let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
             let mass = active_mass[k];
-            let raw = (mass + a - 1.0) / denom;
+            let raw = (mass + a) / denom;
             if raw <= IBP_INTERIOR_TOL || raw >= 1.0 - IBP_INTERIOR_TOL {
                 continue;
             }
             let one_minus = 1.0 - pk;
-            let dpi_da = (n as f64 - mass) / (denom * denom);
+            let dpi_da = (n as f64 + 1.0 - mass) / (denom * denom);
             let dpi_drho = a * dpi_da;
             let d_score_dpi = -1.0 / pk - 1.0 / one_minus;
             d_score[k] = d_score_dpi * dpi_drho;
@@ -469,7 +475,7 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         let z = self.concrete_logits(target);
         let pi = self.pi_map(z.view(), alpha);
         let n = z.len() / self.k_max;
-        let denom = (n as f64 + a - 1.0).max(IBP_COUNT_DENOM_FLOOR);
+        let denom = (n as f64 + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
         let mut out = Array1::<f64>::zeros(target.len());
         let mut active_mass = Array1::<f64>::zeros(self.k_max);
         for row in 0..n {
@@ -483,7 +489,7 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         for k in 0..self.k_max {
             let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
             let mass = active_mass[k];
-            let raw = (mass + a - 1.0) / denom;
+            let raw = (mass + a) / denom;
             if raw > IBP_INTERIOR_TOL && raw < 1.0 - IBP_INTERIOR_TOL {
                 pi_jac[k] = 1.0 / denom;
             }
@@ -518,7 +524,7 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         let n = z.len() / self.k_max;
         let mut out = Array1::<f64>::zeros(target.len());
         let inv_tau2 = 1.0 / (tau * tau);
-        let denom = (n as f64 + a - 1.0).max(IBP_COUNT_DENOM_FLOOR);
+        let denom = (n as f64 + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
         let mut active_mass = Array1::<f64>::zeros(self.k_max);
         for row in 0..n {
             let start = row * self.k_max;
@@ -532,7 +538,7 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         for k in 0..self.k_max {
             let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
             let mass = active_mass[k];
-            let raw = (mass + a - 1.0) / denom;
+            let raw = (mass + a) / denom;
             if raw > IBP_INTERIOR_TOL && raw < 1.0 - IBP_INTERIOR_TOL {
                 pi_jac[k] = 1.0 / denom;
             }
@@ -582,7 +588,7 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         let n = z.len() / self.k_max;
         let inv_tau = 1.0 / tau;
         let inv_tau2 = inv_tau * inv_tau;
-        let denom = (n as f64 + a - 1.0).max(IBP_COUNT_DENOM_FLOOR);
+        let denom = (n as f64 + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
 
         // Column aggregates (active_mass, pi_jac, pi_score, pi_score_derivative,
         // score, score_derivative). These are identical to hessian_diag and
@@ -600,7 +606,7 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         for k in 0..self.k_max {
             let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
             let mass = active_mass[k];
-            let raw = (mass + a - 1.0) / denom;
+            let raw = (mass + a) / denom;
             let pi_jac = if raw > IBP_INTERIOR_TOL && raw < 1.0 - IBP_INTERIOR_TOL {
                 1.0 / denom
             } else {
