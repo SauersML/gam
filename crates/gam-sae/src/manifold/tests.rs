@@ -3642,27 +3642,32 @@ pub(crate) fn sae_rho_seed_dispersion_scaling_shifts_every_scale_coupled_axis() 
         epsilon = 1.0e-14
     );
 
-    let learnable_ibp = rho
-        .seed_scaled_by_dispersion_for_assignment(
-            dispersion,
-            AssignmentMode::ibp_map(1.0, 1.0, true),
-        )
-        .unwrap();
-    assert_abs_diff_eq!(
-        learnable_ibp.log_lambda_sparse,
-        rho.log_lambda_sparse,
-        epsilon = 1.0e-14
-    );
-    assert_abs_diff_eq!(
-        learnable_ibp.log_lambda_smooth[0],
-        rho.log_lambda_smooth[0] + shift,
-        epsilon = 1.0e-14
-    );
-    assert_abs_diff_eq!(
-        learnable_ibp.log_ard[0][0],
-        rho.log_ard[0][0] + shift,
-        epsilon = 1.0e-14
-    );
+    // #1744 — IBP-MAP admits NO response-dispersion scaling on ANY ρ coordinate
+    // (learnable-α or fixed-α). Its free per-row Bernoulli gates overfit under a
+    // dispersion-weakened smoothness/ARD seed, collapsing the Fellner–Schall
+    // fixed point; the sparse coordinate is a dimensionless log-α concentration
+    // offset that was never a squared-output-unit penalty weight. So every IBP
+    // coordinate stays at its absolute (already dimensionless) construction value.
+    for ibp_mode in [
+        AssignmentMode::ibp_map(1.0, 1.0, true),
+        AssignmentMode::ibp_map(1.0, 1.0, false),
+    ] {
+        let ibp = rho
+            .seed_scaled_by_dispersion_for_assignment(dispersion, ibp_mode)
+            .unwrap();
+        assert_abs_diff_eq!(
+            ibp.log_lambda_sparse,
+            rho.log_lambda_sparse,
+            epsilon = 1.0e-14
+        );
+        assert_abs_diff_eq!(
+            ibp.log_lambda_smooth[0],
+            rho.log_lambda_smooth[0],
+            epsilon = 1.0e-14
+        );
+        assert_abs_diff_eq!(ibp.log_ard[0][0], rho.log_ard[0][0], epsilon = 1.0e-14);
+        assert_abs_diff_eq!(ibp.log_ard[0][1], rho.log_ard[0][1], epsilon = 1.0e-14);
+    }
 }
 
 #[test]
@@ -3923,6 +3928,66 @@ pub(crate) fn planted_circle_noise_scale_sweep_reaches_high_ev_with_dimensionles
             }
         }
     }
+}
+
+/// #1744 fast regression — the noisiest IBP-MAP planted circle (n=40, σ=0.18) is
+/// the single sweep point where the outer ρ-optimizer used to stall at the seed
+/// (EV 0.86 < 0.95). Root cause: the dimensionless-ρ seed dispersion-scaled the
+/// smoothness/ARD penalties by `φ_seed ≪ 1`, which handed IBP's free per-row gates
+/// enough slack to overfit at the seed; the reconstruction dispersion `φ̂` then
+/// collapsed toward 0 and the Fellner–Schall multiplicative fixed point
+/// (`λ_new ∝ φ̂`) spiralled the penalties to zero — a degenerate basin the EFS
+/// solver stalled in. The fix makes `seed_scaled_by_dispersion_for_assignment` a
+/// no-op for IBP-MAP (no IBP coordinate is Gaussian-response-dispersion-scalable),
+/// so the seed keeps strong penalties and the EFS lands on the interior optimum.
+///
+/// This is the same single point as the full sweep test but WITHOUT the softmax
+/// lane and the other n/σ points, so it is the cheap iterate for this failure.
+#[test]
+pub(crate) fn planted_circle_ibp_high_noise_reaches_high_ev_1744() {
+    let n = 40usize;
+    let sigma = 0.18_f64;
+    let assignment_mode = PlantedCircleAssignmentMode::IbpMap;
+    let z = planted_circle_data(n, sigma);
+    let (term, seed_dispersion) = planted_circle_seed_term(z.view(), assignment_mode);
+
+    // The fix: IBP-MAP seeding must NOT dispersion-scale the ρ coordinates — the
+    // seed stays at its absolute construction values so the penalties are strong
+    // enough that the inner IBP solve cannot overfit at the seed.
+    let init_rho = SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![array![0.0]])
+        .seed_scaled_by_dispersion_for_assignment(seed_dispersion, assignment_mode.mode())
+        .unwrap();
+    // Precondition: the assignment-aware scaling left the IBP seed unscaled.
+    assert_abs_diff_eq!(init_rho.log_lambda_sparse, 0.02_f64.ln(), epsilon = 1.0e-12);
+    assert_abs_diff_eq!(init_rho.log_lambda_smooth[0], 0.0, epsilon = 1.0e-12);
+    assert_abs_diff_eq!(init_rho.log_ard[0][0], 0.0, epsilon = 1.0e-12);
+
+    let init_rho_flat = init_rho.to_flat();
+    let n_params = init_rho_flat.len();
+    let mut objective =
+        SaeManifoldOuterObjective::new(term, z.clone(), None, init_rho, 50, 0.04, 1.0e-6, 1.0e-6);
+    gam_solve::rho_optimizer::OuterProblem::new(n_params)
+        .with_initial_rho(init_rho_flat)
+        .run(&mut objective, "SAE planted circle #1744 ibp high noise")
+        .unwrap();
+    let fitted_result = objective.into_fitted();
+    let fitted_term = fitted_result.term;
+    let rho = fitted_result.rho;
+    let ev = global_ev(z.view(), fitted_term.fitted().view());
+    assert!(
+        ev > 0.95,
+        "#1744 ibp_map n={n} sigma={sigma} seed_phi={seed_dispersion:.3e} \
+         final_rho=({:.3}, {:?}, {:?}) EV={ev:.4} should exceed 0.95 (outer ρ-optimizer \
+         must not stall at the collapsed seed)",
+        rho.log_lambda_sparse,
+        rho.log_lambda_smooth,
+        rho.log_ard
+    );
+    assert!(
+        fitted_term.collapse_events().is_empty(),
+        "#1744 healthy ibp_map fit should record no collapse events: {:?}",
+        fitted_term.collapse_events()
+    );
 }
 
 #[test]

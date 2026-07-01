@@ -131,23 +131,52 @@ impl SaeManifoldRho {
         self.seed_scaled_by_dispersion_with_sparse_policy(dispersion, true)
     }
 
-    /// Assignment-aware seed scaling. In learnable-alpha IBP mode the sparse
-    /// coordinate is a dimensionless log-alpha offset, not a penalty strength, so
-    /// response-dispersion scaling must skip it while still scaling smoothness and
-    /// ARD precision seeds.
+    /// Assignment-aware seed scaling.
+    ///
+    /// The response-dispersion shift `λ → λ·φ_seed` makes the seeded effective
+    /// stiffness `λ/φ_data` dimensionless — but that identity is derived from the
+    /// Gaussian penalized-likelihood normal equations on a FIXED linear design.
+    /// It is well-founded for the separable-gate modes (softmax entropy /
+    /// JumpReLU gated-L1), whose per-row gates are held at their seed weighting
+    /// while the decoder/coordinates are refit, so `λ/φ` is exactly the effective
+    /// stiffness.
+    ///
+    /// IBP-MAP is different in kind. Its per-row Bernoulli gates are FREE latent
+    /// variables the inner joint solve co-optimizes with the coordinates and
+    /// decoder. A response-dispersion-WEAKENED smoothness/ARD seed
+    /// (`φ_seed ≪ 1` at any non-trivial noise scale) hands that extra gate +
+    /// coordinate freedom enough slack to interpolate the noise: the inner solve
+    /// overfits, the reconstruction dispersion `φ̂` collapses toward 0, and the
+    /// Fellner–Schall multiplicative fixed point (`λ_new ∝ φ̂`) then spirals the
+    /// smoothing/ARD penalties to zero — a degenerate outer basin the ρ-optimizer
+    /// stalls in (#1744: ibp_map n=40 σ=0.18 stalled at EV 0.86). The IBP sparse
+    /// coordinate is additionally a dimensionless log-alpha concentration offset,
+    /// not a squared-output-unit penalty weight, so it was never dispersion-
+    /// scalable either. NONE of the IBP-MAP ρ coordinates therefore admit the
+    /// Gaussian response-dispersion scaling; the seed stays at its absolute
+    /// (already dimensionless) construction values, which keeps the smoothing/ARD
+    /// penalties strong enough that the inner IBP solve cannot overfit at the seed
+    /// and the EFS fixed point lands on the interior optimum instead of the
+    /// zero-penalty collapse. The separable-gate modes are byte-for-byte
+    /// unchanged.
     pub fn seed_scaled_by_dispersion_for_assignment(
         &self,
         dispersion: f64,
         assignment_mode: AssignmentMode,
     ) -> Result<Self, String> {
-        let scale_sparse = !matches!(
-            assignment_mode,
-            AssignmentMode::IBPMap {
-                learnable_alpha: true,
-                ..
+        if matches!(assignment_mode, AssignmentMode::IBPMap { .. }) {
+            // Validate the dispersion for parity with the scaled path (a
+            // non-finite/​non-positive φ is still a caller error), then return the
+            // unscaled seed: no IBP-MAP ρ coordinate is response-dispersion-scalable.
+            if !(dispersion.is_finite() && dispersion > 0.0) {
+                return Err(format!(
+                    "SaeManifoldRho::seed_scaled_by_dispersion_for_assignment: dispersion must \
+                     be finite and positive; got {dispersion}"
+                ));
             }
-        );
-        self.seed_scaled_by_dispersion_with_sparse_policy(dispersion, scale_sparse)
+            return Ok(self.clone());
+        }
+        self.seed_scaled_by_dispersion_with_sparse_policy(dispersion, true)
     }
 
     pub(crate) fn seed_scaled_by_dispersion_with_sparse_policy(
