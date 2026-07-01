@@ -98,6 +98,7 @@ where
     X: Into<DesignMatrix>,
 {
     let x = x.into();
+<<<<<<< ours
     // Reject empty designs (no observations or no coefficients) up front. An
     // empty design has no well-defined fit and downstream indexing / linear
     // solves would otherwise panic on the zero-sized dimensions, so bail with a
@@ -108,6 +109,13 @@ where
             x.nrows(),
             x.ncols(),
         );
+=======
+    if x.nrows() == 0 {
+        crate::bail_invalid_estim!("fit_gam requires at least one observation row");
+    }
+    if x.ncols() == 0 {
+        crate::bail_invalid_estim!("fit_gam requires at least one design column");
+>>>>>>> theirs
     }
     if family.is_binomial_mixture() && opts.mixture_link.is_none() {
         crate::bail_invalid_estim!("BinomialMixture requires mixture_link specification");
