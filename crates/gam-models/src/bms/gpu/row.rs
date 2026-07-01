@@ -763,10 +763,11 @@ impl RowKernelBackend {
                     // the real device arch, and this keeps every BMS-flex compile
                     // site consistent with the SAE arrow/Schur kernels that do
                     // require the sm_60 pin for native `atomicAdd(double*,double)`.
-                    let ptx = gam_gpu::device_cache::compile_ptx_arch(&row_kernel_source)
-                        .map_err(|err| GpuError::DriverCallFailed {
+                    let ptx = gam_gpu::device_cache::compile_ptx_arch(&row_kernel_source).map_err(
+                        |err| GpuError::DriverCallFailed {
                             reason: format!("bms_flex_row NVRTC compile failed: {err}"),
-                        })?;
+                        },
+                    )?;
                     let module =
                         parts
                             .ctx
@@ -1852,10 +1853,11 @@ impl HvpKernelBackend {
                     // #1551: arch-aware compile (see launch_bms_flex_row_kernel) —
                     // pin `--gpu-architecture` to the device capability and supply
                     // the standard include paths via the shared NVRTC entry point.
-                    let ptx = gam_gpu::device_cache::compile_ptx_arch(HVP_KERNEL_SOURCE)
-                        .map_err(|err| GpuError::DriverCallFailed {
+                    let ptx = gam_gpu::device_cache::compile_ptx_arch(HVP_KERNEL_SOURCE).map_err(
+                        |err| GpuError::DriverCallFailed {
                             reason: format!("bms_flex_row hvp NVRTC compile failed: {err}"),
-                        })?;
+                        },
+                    )?;
                     let module =
                         parts
                             .ctx
@@ -3255,7 +3257,7 @@ mod oracle_parity_tests {
         use super::cpu_oracle_outputs;
         use crate::bms::family::*;
         use crate::bms::hessian_paths::*;
-        use crate::bms::{exact_kernel, DeviationBlockConfig, LatentMeasureKind};
+        use crate::bms::{DeviationBlockConfig, LatentMeasureKind, exact_kernel};
         use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix};
         use gam_problem::{InverseLink, ParameterBlockState, StandardLink};
         use ndarray::{Array1, Array2};
@@ -3375,7 +3377,10 @@ mod oracle_parity_tests {
             let r = primary.total;
             let p_h = primary.h.as_ref().map(|range| range.len()).unwrap_or(0);
             let p_w = primary.w.as_ref().map(|range| range.len()).unwrap_or(0);
-            assert!(p_h > 0 && p_w > 0, "#415 fixture must be full-flex: p_h={p_h} p_w={p_w}");
+            assert!(
+                p_h > 0 && p_w > 0,
+                "#415 fixture must be full-flex: p_h={p_h} p_w={p_w}"
+            );
             assert_eq!(r, 2 + p_h + p_w, "#415 fixture primary layout");
 
             // Pack the SAME fitted state the CPU family will consume, then run the
@@ -3389,6 +3394,37 @@ mod oracle_parity_tests {
             assert_eq!(oracle.neglog.len(), n);
             assert_eq!(oracle.grad.len(), n * r);
             assert_eq!(oracle.hess.len(), n * r * r);
+
+            // Non-vacuity guard for the original #415/BMS-FLEX failure mode:
+            // the Mills margin must be the packed observed predictor VALUE
+            // `e_obs`, not the q-axis first derivative `bar_e_u[0]`. The oracle
+            // does not expose `bar_e_u`, but its gradient obeys
+            // `grad[0] = A(e_obs) · bar_e_u[0]`; recover that derivative from
+            // the written output and prove this fixture separates it from
+            // `e_obs` on at least one row. Otherwise a kernel/oracle that
+            // accidentally substituted `bar_e_u[0]` for `e_obs` could pass a
+            // vacuous fixture where both scalars coincide.
+            let mut separates_observed_value_from_q_derivative = false;
+            for row in 0..n {
+                let y = inputs.y[row];
+                let w = inputs.w[row];
+                let s = 2.0 * y - 1.0;
+                let e_obs = inputs.e_obs[row];
+                let (_, lambda) = super::oracle_log_ndtr_and_mills(s * e_obs);
+                let a_i = -w * s * lambda;
+                if a_i.abs() > 1e-12 {
+                    let recovered_bar_e_q = oracle.grad[row * r] / a_i;
+                    if (recovered_bar_e_q - e_obs).abs() > 1e-8 {
+                        separates_observed_value_from_q_derivative = true;
+                        break;
+                    }
+                }
+            }
+            assert!(
+                separates_observed_value_from_q_derivative,
+                "#415 fixture must distinguish e_obs from bar_e_u[0]; otherwise \
+                 the observed-value Mills-margin regression is not exercised"
+            );
 
             // Both sides are exact f64 CPU math over the SAME cached moments, so
             // the only slack is FP summation ordering. Anything looser than this
@@ -3492,8 +3528,8 @@ mod oracle_parity_tests {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::*;
     use super::oracle_parity_tests::*;
+    use super::*;
 
     pub(crate) fn minimal_inputs<'a>(buffers: &'a TestBuffers) -> BmsFlexRowKernelInputs<'a> {
         BmsFlexRowKernelInputs {
@@ -3721,7 +3757,6 @@ mod tests {
         }
     }
 
-
     /// Build a non-trivial fixture: `n = 4` rows, `r = 5` (p_h = 2, p_w = 1),
     /// 2–4 cells per row, distinct values so a structural bug in either path
     /// can't be masked by accidental cancellation.
@@ -3915,8 +3950,9 @@ mod tests {
     ///     H_uv    = B · bar_e_u · bar_e_v + A · bar_e_uv
     /// ```
     ///
-    /// Holding the observed jets `bar_e` fixed, the row neglog is a function
-    /// of the single scalar `e := bar_e_u[0] = e_obs`, and by the assembled
+    /// Holding the observed derivative jets `bar_e_u`/`bar_e_uv` fixed, the
+    /// row neglog is a function of the observed predictor VALUE `e := e_obs`,
+    /// not of the q-axis first derivative `bar_e_u[0]`; by the assembled
     /// formula `∂neglog/∂e = A` and `∂²neglog/∂e² = B`. This test reconstructs
     /// `A`, `B`, and `neglog` exactly as the oracle does (same
     /// `oracle_log_ndtr_and_mills`, same sign convention), then verifies the
