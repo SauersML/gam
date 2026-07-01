@@ -1692,6 +1692,37 @@ fn moment_boundary_term_with_powers(
     right_term - left_term
 }
 
+#[inline]
+fn base_moments_match_direct(base: &[f64], direct: &[f64]) -> bool {
+    base.iter()
+        .zip(direct.iter())
+        .all(|(&lhs, &rhs)| (lhs - rhs).abs() <= 1e-10 * (1.0 + lhs.abs().max(rhs.abs())))
+}
+
+#[inline]
+fn direct_non_affine_moments_if_base_matches(
+    cell: DenestedCubicCell,
+    base: &[f64],
+    max_degree: usize,
+) -> Option<Vec<f64>> {
+    if !cell.left.is_finite() || !cell.right.is_finite() {
+        return None;
+    }
+    // When the supplied base moments are the actual moments of this fixed
+    // finite cell, prefer the same quadrature-backed evaluator used by the
+    // public non-affine moment path.  The algebraic raising recurrence is kept
+    // below for callers that intentionally pass symbolic or otherwise
+    // non-cell-consistent bases, but repeatedly dividing by the quartic/sextic
+    // leading coefficient can amplify harmless base-roundoff into high-order
+    // moment error.
+    let (moments, _) = evaluate_non_affine_cell_simd::<false>(cell, max_degree);
+    if base_moments_match_direct(base, &moments) {
+        Some(moments.into_vec())
+    } else {
+        None
+    }
+}
+
 pub fn reduce_quartic_moments(
     cell: DenestedCubicCell,
     base_m0_m2: [f64; 3],
@@ -1699,6 +1730,10 @@ pub fn reduce_quartic_moments(
 ) -> Result<Vec<f64>, String> {
     if max_degree <= 2 {
         return Ok(base_m0_m2[..=max_degree].to_vec());
+    }
+    if let Some(moments) = direct_non_affine_moments_if_base_matches(cell, &base_m0_m2, max_degree)
+    {
+        return Ok(moments);
     }
     let d = quartic_qprime_coefficients(cell.c0, cell.c1, cell.c2);
     let lead = d[3];
@@ -1749,6 +1784,10 @@ pub fn reduce_sextic_moments(
 ) -> Result<Vec<f64>, String> {
     if max_degree <= 4 {
         return Ok(base_m0_m4[..=max_degree].to_vec());
+    }
+    if let Some(moments) = direct_non_affine_moments_if_base_matches(cell, &base_m0_m4, max_degree)
+    {
+        return Ok(moments);
     }
     let d = sextic_qprime_coefficients(cell.c0, cell.c1, cell.c2, cell.c3);
     let lead = d[5];
