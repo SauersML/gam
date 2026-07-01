@@ -9124,34 +9124,50 @@ pub fn smooth_term_lr_inference_forspec(
         // is not materialised. (Same per-block over-count class as the multinomial
         // `edf_per_class` fix.)
         let edf = full.fit.per_term_edf(coeff_range.clone(), block_start, k);
-        // The term's unpenalized null-space dimension — the polynomial
-        // directions (constant/linear/…) a penalized smooth always carries when
-        // present, which no roughness penalty can shrink. This is the minimum
-        // effective dimension a "term present vs entirely absent" LR test can
-        // possibly have; flooring the reference d.f. below it is meaningless.
-        let null_dim: usize = design_term.nullspace_dims.iter().sum();
+        // The term's **joint** unpenalized null-space dimension: the coefficient
+        // directions penalized by *no* active penalty — the polynomial part a
+        // penalized smooth always carries when present, which no penalty can
+        // shrink. This is `dim(∩_k null(S_k)) = p_local − rank(Σ_k S_k)`, the
+        // INTERSECTION of the per-penalty null spaces, computed by
+        // `wald_unpenalized_dim()` — the very same scalar the summary Wald test
+        // (`wood_smooth_test`) floors its reference d.f. at, so the LR and Wald
+        // tests reference a consistent d.f.
+        //
+        // It must NOT be `nullspace_dims.iter().sum()`: that *unions* the null
+        // spaces (the #1360 defect — see `joint_unpenalized_dim`'s docs). A
+        // double-penalty smooth carries a bending penalty (null space = its
+        // polynomial part) plus a complementary null-space ridge (which penalizes
+        // exactly that polynomial part), so the two null spaces are disjoint and
+        // the joint null space is EMPTY (dim 0) — yet the per-penalty dims sum to
+        // ~`p_local`. Flooring `ref_df` at that sum pins it to the full basis
+        // dimension for every fit (e.g. 11 for a k=12 s(x)), making the LR test
+        // badly conservative for genuine moderate signals while only accidentally
+        // masking the collapse.
+        let null_dim = design_term.wald_unpenalized_dim();
         // χ² reference d.f. for the whole-term LR test. The statistic W tests the
         // term present vs entirely absent, so the reference d.f. must be at least
-        // the dimension the term spans when present — i.e. at least its null-space
-        // dimension, and never below 1 (you cannot test "is this function present"
-        // with fewer than one degree of freedom). The Wood truncation
-        // `tr(F)²/tr(F²)` is the Wood (2013) "edf1" reference and satisfies
-        // `edf1 ≥ edf` analytically, BUT the coefficient influence
-        // `F = H⁻¹X'WX` is NON-symmetric, and as REML shrinks a term onto its
-        // null space the off-diagonal coupling in the term block blows up:
-        // `tr(F²) = Σ_ij F_ij F_ji` runs away (~1e12) while `tr(F) = edf` stays
-        // small, so `tr(F)²/tr(F²)` collapses toward 0. Referencing a positive
-        // `W` against `χ²_{~0}` then reports a flat, shrunk-to-null term as
-        // MAXIMALLY significant (`p ~ 1e-12`) — a Type-I error decided by a
-        // degenerate reference d.f., not the data (#1766). Floor at
-        // `max(edf, null_dim, 1)`: in calibrated and high-power fits the Wood
-        // d.f. already dominates, so the floor binds ONLY on the degenerate
-        // collapse and leaves those fits byte-identical.
+        // the dimension the term spans when present — its joint null-space
+        // dimension (`null_dim`), the effective d.f. it uses in the fit (`edf`),
+        // and never below 1 (you cannot test "is this function present" with
+        // fewer than one degree of freedom). The Wood truncation `tr(F)²/tr(F²)`
+        // is the Wood (2013) "edf1"-style reference and dominates in calibrated
+        // and high-power fits, BUT the coefficient influence `F = H⁻¹X'WX` is
+        // NON-symmetric, and as REML shrinks a term onto its null space the
+        // off-diagonal coupling in the term block blows up: `tr(F²) = Σ_ij F_ij
+        // F_ji` runs away while `tr(F) = edf` stays small, so `tr(F)²/tr(F²)`
+        // collapses toward 0. Referencing a positive `W` against `χ²_{~0}` then
+        // reports a flat, shrunk-to-null term as MAXIMALLY significant (`p ~
+        // 1e-12`) — a Type-I error decided by a degenerate reference d.f., not the
+        // data (#1766). Flooring at `max(edf, null_dim, 1)` binds ONLY on that
+        // degenerate collapse and leaves calibrated/high-power fits at the Wood
+        // d.f. (`edf` and `null_dim` never exceed it there). This mirrors the
+        // summary Wald path, which floors the same Wood trace at its statistic
+        // rank for the same reason.
         let ref_df = wood_reference_df(influence, &coeff_range)
             .unwrap_or(0.0)
             .max(edf)
-            .max(null_dim.max(1) as f64)
-            .max(1e-12);
+            .max(null_dim as f64)
+            .max(1.0);
         if !(ref_df.is_finite() && ref_df > 0.0) {
             continue;
         }
