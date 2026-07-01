@@ -43,6 +43,7 @@ use faer::Side;
 use gam::basis::{
     CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
     OneDimensionalBoundary, SpatialIdentifiability, build_duchon_basis, duchon_nullspace_dimension,
+    select_centers_by_strategy,
 };
 use gam::faer_ndarray::FaerCholesky;
 use ndarray::{Array2, s};
@@ -245,8 +246,10 @@ fn duchon_order1_d3_with_orthogonal_identifiability_gives_k_minus_1() {
 /// The kernel-constraint reparameterisation enforces the side condition
 /// `P(centers)ᵀ Z = 0` on the kernel COEFFICIENTS, projecting the polynomial
 /// directions out of the kernel part. The observable, guaranteed consequence is
-/// that the polynomial block `[1, x₁, x₂, x₃]` is NOT representable by the kernel
-/// columns — the joint design `[kernel | poly]` has full column rank `k`.
+/// that the centered polynomial block `[1, x₁ - μ₁, x₂ - μ₂, x₃ - μ₃]` is NOT
+/// representable by the kernel columns — the joint design `[kernel | poly]` has
+/// full column rank `k`, where `μ` is the center-cloud mean used by the basis
+/// builder to keep the polynomial frame translation invariant.
 ///
 /// (This is deliberately NOT a data-row orthogonality `(ΦZ)ᵀP ≈ 0`: with reduced
 /// knots `k ≪ n` and data ≠ centers, the kernel functions evaluated at the data
@@ -287,8 +290,17 @@ fn duchon_order1_polynomial_block_is_independent_of_the_kernel_block() {
         "expected {k} total cols before identifiability"
     );
 
-    // Polynomial block: last `poly_dim` columns = [constant col | x1 | x2 | x3].
+    // Polynomial block: last `poly_dim` columns = [constant col |
+    // x1 - center_mean1 | x2 - center_mean2 | x3 - center_mean3].
+    // Since #1375 the basis builder assembles these columns in coordinates
+    // centered by the selected center cloud mean, preserving the same polynomial
+    // span while making the realized frame translation invariant.
     let poly_block = full.slice(s![.., kernel_cols..]).to_owned();
+    let centers = select_centers_by_strategy(data.view(), &spec.center_strategy)
+        .expect("centers can be selected");
+    let center_mean: Vec<f64> = (0..d)
+        .map(|col| centers.column(col).sum() / centers.nrows().max(1) as f64)
+        .collect();
 
     // Confirm polynomial block column 0 is all ones.
     let col0_max_dev = poly_block
@@ -301,17 +313,18 @@ fn duchon_order1_polynomial_block_is_independent_of_the_kernel_block() {
         "polynomial block column 0 should be all ones; max deviation = {col0_max_dev:e}"
     );
 
-    // Confirm polynomial block columns 1..4 match the data columns.
+    // Confirm polynomial block columns 1..4 match the centered data columns.
     for col in 0..d {
+        let mu = center_mean[col];
         let max_dev = poly_block
             .column(col + 1)
             .iter()
             .zip(data.column(col).iter())
-            .map(|(&a, &b)| (a - b).abs())
+            .map(|(&a, &x)| (a - (x - mu)).abs())
             .fold(0.0_f64, f64::max);
         assert!(
             max_dev < 1e-12,
-            "polynomial block col {}: max deviation from data = {max_dev:e}",
+            "polynomial block col {}: max deviation from centered data = {max_dev:e}",
             col + 1
         );
     }
