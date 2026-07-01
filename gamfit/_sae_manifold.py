@@ -3631,83 +3631,10 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
                 f"sae_manifold_fit: t_init D_max={coords_init.shape[2]} is too small for "
                 f"max atom dim {d_max}"
             )
-    # The closed-form disjoint-periodic fast path solves each atom in the
-    # Euclidean response geometry and never reaches the FFI that installs
-    # `RowMetric::OutputFisher`. When a WP-D shard is supplied the metric must
-    # be honoured, so skip the shortcut and route through the joint FFI fit.
-    #
-    # E: the closed-form shortcuts also solve a PLAIN reconstruction LSQ and do
-    # NOT honour the advanced objective knobs. Firing them under any non-identity
-    # knob would silently ignore that regularization (two differently-regularized
-    # calls returning identical models). Only take a shortcut when EVERY such
-    # component is at its no-op identity; otherwise fall through to the full Rust
-    # joint fit (conservative — when in doubt, use Rust). Guarded components:
-    #   - schedule (no Gumbel anneal)
-    #   - weights / row-loss weights (no sample reweighting)
-    #   - isometry_weight == 0 (no IsometryPenalty)
-    #   - block_orthogonality_weight == 0
-    #   - nuclear_norm_weight == 0 (no embedding-rank shrinkage)
-    #   - decoder_incoherence_weight == 0 (no cross-atom incoherence)
-    #   - decoder_feature_sparsity_groups is None (no decoder group-lasso)
-    #   - no SCAD/MCP coordinate penalty (gate_sparsity l1 OR sparsity == 0)
-    #   - ard_per_atom is False (no ARD intrinsic-dim pruning)
-    fast_path_eligible = (
-        schedule is None
-        and row_loss_weights_arr is None
-        and float(isometry_weight) == 0.0
-        and float(block_orthogonality_weight) == 0.0
-        and float(nuclear_norm_weight) == 0.0
-        and float(decoder_incoherence_weight) == 0.0
-        and decoder_feature_sparsity_groups is None
-        and not (gate_sparsity_kind in {"scad", "mcp"} and sparsity > 0.0)
-        and not ard_per_atom
-    )
-    if (
-        logits_init is None
-        and coords_init is None
-        and fisher_shard is None
-        and fast_path_eligible
-    ):
-        separable_fit = _fit_disjoint_periodic_top1(
-            x,
-            bases=[str(b) for b in bases],
-            dims=[int(d) for d in dims],
-            assignment=str(kind),
-            top_k=top_k_arg,
-            penalties=penalties,
-            alpha=float(alpha_value),
-            learnable_alpha=bool(alpha == "auto"),
-            tau=float(tau),
-            sparsity_strength=float(sparsity),
-            smoothness=float(smoothness),
-            learning_rate=float(effective_lr),
-            max_iter=int(max_iter_total),
-            random_state=int(random_state),
-            assignment_label=str(assignment),
-            jumprelu_threshold=float(jumprelu_threshold),
-        )
-        if separable_fit is not None:
-            return separable_fit
-        dense_periodic_fit = _fit_dense_periodic_ibp_lsq(
-            x,
-            bases=[str(b) for b in bases],
-            dims=[int(d) for d in dims],
-            assignment=str(kind),
-            top_k=top_k_arg,
-            penalties=penalties,
-            alpha=float(alpha_value),
-            learnable_alpha=bool(alpha == "auto"),
-            tau=float(tau),
-            sparsity_strength=float(sparsity),
-            smoothness=float(smoothness),
-            learning_rate=float(effective_lr),
-            max_iter=int(max_iter_total),
-            random_state=int(random_state),
-            assignment_label=str(assignment),
-            jumprelu_threshold=float(jumprelu_threshold),
-        )
-        if dense_periodic_fit is not None:
-            return dense_periodic_fit
+    # SPEC: the SAE fit is a Rust solver. All fits route through the
+    # `sae_manifold_fit_minimal` FFI; the former numpy closed-form "fast path"
+    # (disjoint-periodic top-1 / dense-periodic IBP-LSQ) was a Python
+    # reimplementation of the Rust joint fit and has been removed.
     payload = rust_module().sae_manifold_fit_minimal(
         np.ascontiguousarray(x),
         [str(b) for b in bases],
