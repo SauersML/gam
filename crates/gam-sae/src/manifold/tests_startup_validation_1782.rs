@@ -289,15 +289,12 @@ fn assignment_kinds_fit_on_circle_1782() {
 /// non-PD dispersion floor (`rho.rs`) are exactly the fixes this probes. Prints
 /// the pass/fail frontier so the effect is visible in `--nocapture`. Asserts
 /// only the known-safe `K = 4` so it can never red the shared tree; the printed
-/// frontier drives the co-collapse-saddle work. Marked `#[ignore]` — it is a
-/// diagnostic sweep whose dense per-seed arrow-Schur criterion is `O((K·b·p)³)`,
-/// too slow for the default CI lane; run explicitly with
-/// `--ignored cocollapse_startup_frontier_1026 --no-capture`.
+/// frontier drives the co-collapse-saddle work. K is capped small (the dense
+/// per-seed arrow-Schur criterion is `O((K·b·p)³)`) so the sweep stays fast.
 #[test]
-#[ignore = "diagnostic frontier sweep; dense O((K·b·p)^3) seed criterion is CI-slow"]
 fn cocollapse_startup_frontier_1026() {
-    let z = planted_circle_embedded(120, 12, 0.03);
-    let ks = [4usize, 8, 12];
+    let z = planted_circle_embedded(96, 10, 0.03);
+    let ks = [4usize, 8];
     // Compare the assignment modes: IBP-MAP couples all rows through a cross-row
     // Woodbury evidence with NO matrix-free log-det route (so large-K refuses on
     // the dense reduced Schur), whereas the hard-sigmoid gate (threshold_gate /
