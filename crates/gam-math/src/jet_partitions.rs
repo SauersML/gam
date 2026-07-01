@@ -266,12 +266,13 @@ fn subset_conv_into(a: &[f64], b: &[f64], out: &mut [f64], min_pop: u32) {
     // slices carved from one scratch buffer). Concretely `mask < out.len()`
     // (loop bound), and each submask satisfies `sub ⊆ mask` so `sub ≤ mask` and
     // `mask ^ sub ⊆ mask` so `mask ^ sub ≤ mask` — both `< out.len() ≤ a.len(),
-    // b.len()`. The `debug_assert!` pins the length precondition in debug/tests;
+    // b.len()`. The `assert!` below pins the length precondition (one check per
+    // call, negligible next to the walk) so the `get_unchecked` below is sound;
     // the bounds checks LLVM cannot elide (the indices are data-dependent) are a
     // real per-step cost across the `3^K` submask walk (×3 convolutions per
-    // compose), so eliding them is a measured ~20% at the marginal-slope
-    // direction counts.
-    debug_assert!(a.len() >= out.len() && b.len() >= out.len());
+    // compose), so eliding them via get_unchecked is a measured ~20% at the
+    // marginal-slope direction counts.
+    assert!(a.len() >= out.len() && b.len() >= out.len());
     for (mask, slot) in out.iter_mut().enumerate() {
         if (mask as u64).count_ones() < min_pop {
             *slot = 0.0;

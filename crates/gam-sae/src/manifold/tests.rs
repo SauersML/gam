@@ -4292,6 +4292,106 @@ pub(crate) fn reconstruction_dispersion_uses_ard_shrunk_coordinate_edf() {
 }
 
 #[test]
+pub(crate) fn latent_block_inverse_diagonal_hutchinson_matches_exact_trace() {
+    // The matrix-free Hutchinson estimator of `diag((H⁻¹)_tt)` (the #1777 fold
+    // that replaces the exact `O(total_t·K²)` selected-inverse diagonal at
+    // massive K) must, over enough Rademacher probes, reproduce BOTH the full
+    // latent-block trace `tr((H⁻¹)_tt)` and the per-axis ARD grouped trace the
+    // exact path feeds the Fellner–Schall/dispersion denominator. Deterministic
+    // seed ⇒ this is a fixed, non-flaky comparison.
+    let n = 24usize;
+    let p = 2usize;
+    let coords = Array2::from_shape_fn((n, 1), |(row, _)| (row as f64 + 0.25) / n as f64);
+    let (phi, jet) = periodic_basis(&coords);
+    let atom = SaeManifoldAtom::new(
+        "periodic",
+        SaeAtomBasisKind::Periodic,
+        1,
+        phi,
+        jet,
+        array![[0.30, -0.10], [0.20, 0.40], [-0.35, 0.15]],
+        Array2::<f64>::eye(3),
+    )
+    .unwrap()
+    .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        Array2::<f64>::zeros((n, 1)),
+        vec![coords],
+        vec![LatentManifold::Circle { period: 1.0 }],
+        AssignmentMode::softmax(1.0),
+    )
+    .unwrap();
+    let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+    let target = Array2::from_shape_fn((n, p), |(row, col)| {
+        let x = (row as f64 + 0.5) / n as f64;
+        if col == 0 {
+            0.45 * (std::f64::consts::TAU * x).sin() + 0.07
+        } else {
+            -0.20 * (std::f64::consts::TAU * x).cos() + 0.03 * row as f64
+        }
+    });
+    let rho = SaeManifoldRho::new(0.0, 0.8_f64.ln(), vec![array![250.0_f64.ln()]]);
+    let sys = term
+        .assemble_arrow_schur(target.view(), &rho, None)
+        .unwrap();
+    let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+    let (_delta_t, _delta_beta, cache) =
+        solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options).unwrap();
+
+    let exact = cache.latent_block_inverse_diagonal().unwrap();
+    // Enough probes to average out the per-entry Hutchinson variance on this
+    // tiny t-space; seed is fixed so the outcome is deterministic.
+    let hutch =
+        SaeManifoldTerm::latent_block_inverse_diagonal_hutchinson(&cache, 20_000, 0xABCD_1234)
+            .unwrap();
+    assert_eq!(exact.len(), hutch.len());
+
+    // Full latent-block trace tr((H⁻¹)_tt): the aggregate the ARD/dispersion
+    // consumers ultimately sum, estimated unbiasedly.
+    let exact_trace: f64 = exact.iter().sum();
+    let hutch_trace: f64 = hutch.iter().sum();
+    assert!(
+        (hutch_trace - exact_trace).abs() <= 0.02 * exact_trace.abs().max(1.0e-6),
+        "Hutchinson latent trace {hutch_trace} vs exact {exact_trace} exceeds 2% tol"
+    );
+
+    // Per-axis ARD grouped trace: the exact grouping of the estimated diagonal
+    // must match the exact grouping of the exact diagonal (both are the same
+    // linear functional of the diagonal, so the error inherits the trace bound).
+    let coord_offsets = term.assignment.coord_offsets();
+    let block_start = coord_offsets[0];
+    let mut exact_axis0 = 0.0_f64;
+    let mut hutch_axis0 = 0.0_f64;
+    match term.last_row_layout {
+        Some(ref layout) => {
+            for row in 0..n {
+                let row_base = cache.row_offsets[row];
+                if let Some(pos) = layout.active_atoms[row].iter().position(|&k| k == 0) {
+                    let s = row_base + layout.coord_starts[row][pos];
+                    exact_axis0 += exact[s];
+                    hutch_axis0 += hutch[s];
+                }
+            }
+        }
+        None => {
+            for row in 0..n {
+                let s = cache.row_offsets[row] + block_start;
+                exact_axis0 += exact[s];
+                hutch_axis0 += hutch[s];
+            }
+        }
+    }
+    assert!(
+        (hutch_axis0 - exact_axis0).abs() <= 0.05 * exact_axis0.abs().max(1.0e-6),
+        "Hutchinson ARD axis trace {hutch_axis0} vs exact {exact_axis0} exceeds 5% tol"
+    );
+    assert!(
+        exact_axis0 > 0.0,
+        "posterior-variance trace must be positive (sanity on the fixture)"
+    );
+}
+
+#[test]
 pub(crate) fn streaming_plan_routes_by_memory_budget_with_identical_logdet() {
     let (term0, target, rho) = small_two_atom_periodic_term();
     let total_basis: usize = term0.atoms.iter().map(|atom| atom.basis_size()).sum();
