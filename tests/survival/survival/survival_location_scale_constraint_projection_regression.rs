@@ -3,7 +3,7 @@ use gam::solver::pirls::LinearInequalityConstraints;
 use ndarray::{Array1, array};
 
 #[test]
-fn project_onto_linear_constraints_should_project_onto_equalities_not_only_inequalities() {
+fn project_onto_linear_constraints_keeps_already_feasible_one_sided_seed() {
     let constraints = LinearInequalityConstraints {
         a: array![[1.0, 0.0], [0.0, 1.0]],
         b: array![0.0, 0.0],
@@ -13,12 +13,35 @@ fn project_onto_linear_constraints_should_project_onto_equalities_not_only_inequ
     let projected: Array1<f64> = project_onto_linear_constraints(2, &constraints, Some(&v))
         .expect("dimensionally consistent projection must succeed");
 
-    let r0: f64 = projected.dot(&constraints.a.row(0));
-    let r1: f64 = projected.dot(&constraints.a.row(1));
-    assert!(
-        r0.abs() <= 1e-12 && r1.abs() <= 1e-12,
-        "Expected projector to enforce C v* = 0 for all supplied linear constraints, but got projected={projected:?}"
-    );
+    for (i, &value) in projected.iter().enumerate() {
+        assert!(
+            (value - v[i]).abs() <= 1e-12,
+            "projection onto the one-sided cone β >= 0 should leave an already-feasible seed \
+             unchanged; coordinate {i} moved from {} to {value}",
+            v[i],
+        );
+    }
+}
+
+#[test]
+fn project_onto_linear_constraints_enforces_equalities_encoded_as_opposing_inequalities() {
+    let constraints = LinearInequalityConstraints {
+        a: array![[1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]],
+        b: array![0.0, 0.0, 0.0, 0.0],
+    };
+    let v = Array1::from_vec(vec![2.5, 3.5]);
+
+    let projected: Array1<f64> = project_onto_linear_constraints(2, &constraints, Some(&v))
+        .expect("dimensionally consistent equality-pair projection must succeed");
+
+    for row in 0..constraints.a.nrows() {
+        let residual = projected.dot(&constraints.a.row(row)) - constraints.b[row];
+        assert!(
+            residual.abs() <= 1e-10,
+            "opposing inequality pair should encode an equality; row {row} residual was {residual} \
+             for projected={projected:?}"
+        );
+    }
 }
 
 /// Regression for issue #374: a survival marginal-slope fit with

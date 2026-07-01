@@ -416,7 +416,13 @@ pub(crate) fn structural_time_coefficient_lower_bounds_with_monotone_time_wiggle
 }
 
 /// Project `beta0` (or the origin when `beta0` is `None`) onto the feasible
-/// polytope `{x : A x >= b}` via cyclic Dykstra projections.
+/// polytope `{x : A x >= b}`.
+///
+/// Rows are one-sided half-spaces. An equality `cᵀx = d` must therefore be
+/// supplied as the opposing pair `cᵀx >= d` and `-cᵀx >= -d`; a single
+/// zero-right-hand-side row such as `cᵀx >= 0` remains a genuine inequality, so
+/// projecting an already-feasible seed against that row is intentionally a
+/// no-op.
 ///
 /// The geometry only makes sense when every operand lives in the same
 /// `dim`-dimensional space, so the function validates its three independent
