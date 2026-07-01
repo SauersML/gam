@@ -47,19 +47,23 @@
 //! ([`gam_problem::MetricProvenance`]) and cannot misreport —
 //! there is only one metric object.
 
+use crate::chart_canonicalization::CanonicalChartTopology;
 use crate::inference::layer_transport::{ChartTopology, TransportLadderReport, transport_ladder};
 use crate::inference::probe_runner::{ProbeRunner, RealizedProbe};
 use crate::inference::riesz::{RieszInput, SmoothFunctional, debias_with_dense_hessian};
-use gam_problem::{MetricProvenance, RowMetric};
-use gam_terms::inference::structure_evidence::{StructureCertificate, StructureLedger};
+use crate::manifold::SaeManifoldTerm;
+use faer::Side;
 use gam_linalg::faer_ndarray::{
     FaerCholesky, FaerEigh, FaerQr, FaerSvd, default_rrqr_rank_alpha, rrqr_with_permutation,
 };
-use crate::chart_canonicalization::CanonicalChartTopology;
-use crate::manifold::SaeManifoldTerm;
-use faer::Side;
+use gam_problem::{MetricProvenance, RowMetric};
+use gam_terms::inference::structure_evidence::{StructureCertificate, StructureLedger};
 use ndarray::{Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, s};
 use std::f64::consts::TAU;
+
+// At two or more independent ladders, each fit is pure and order-independent; fan
+// them out unless this call is already running inside a rayon worker.
+const ATOM_TRANSPORT_LADDER_PARALLEL_MIN: usize = 2;
 
 /// Smoothed column-2-norm of the decoder Jacobian.
 ///
@@ -3040,61 +3044,79 @@ pub fn atom_transport_ladder_reports(
     model: &FittedSaeManifold,
     ladders: &[AtomTransportLadderInput],
 ) -> Result<Vec<AtomTransportLadderReport>, String> {
-    let mut out = Vec::with_capacity(ladders.len());
-    for input in ladders {
-        let atom = model.atoms.get(input.atom_index).ok_or_else(|| {
-            format!(
-                "atom transport ladder index {} out of range for {} fitted atoms",
-                input.atom_index,
-                model.atoms.len()
-            )
-        })?;
-        let depth = input.layers.len();
-        if depth < 2 {
-            return Err(format!(
-                "atom transport ladder for atom {} ('{}') needs at least two layers, got {depth}",
-                input.atom_index, atom.name
-            ));
-        }
-        if input.coords.len() != depth || input.topologies.len() != depth {
-            return Err(format!(
-                "atom transport ladder for atom {} ('{}') has {} layers, {} coordinate blocks, {} topologies",
-                input.atom_index,
-                atom.name,
-                depth,
-                input.coords.len(),
-                input.topologies.len()
-            ));
-        }
+    if ladders.len() >= ATOM_TRANSPORT_LADDER_PARALLEL_MIN
+        && rayon::current_thread_index().is_none()
+    {
+        use rayon::prelude::*;
 
-        let mut coords = Vec::with_capacity(depth);
-        let mut topologies = Vec::with_capacity(depth);
-        for (layer_pos, (coord, topology)) in
-            input.coords.iter().zip(input.topologies.iter()).enumerate()
-        {
-            coords.push(canonical_coords_for_transport(
-                coord,
-                topology,
-                input.atom_index,
-                &atom.name,
-                input.layers[layer_pos],
-            )?);
-            topologies.push(ChartTopology::from(topology));
-        }
-
-        let report = transport_ladder(&input.layers, &coords, &topologies).map_err(|e| {
-            format!(
-                "atom transport ladder for atom {} ('{}') failed: {e}",
-                input.atom_index, atom.name
-            )
-        })?;
-        out.push(AtomTransportLadderReport {
-            atom_index: input.atom_index,
-            atom_name: atom.name.clone(),
-            report,
-        });
+        let fitted: Vec<Result<AtomTransportLadderReport, String>> = ladders
+            .par_iter()
+            .map(|input| fit_atom_transport_ladder_report(model, input))
+            .collect();
+        fitted.into_iter().collect()
+    } else {
+        ladders
+            .iter()
+            .map(|input| fit_atom_transport_ladder_report(model, input))
+            .collect()
     }
-    Ok(out)
+}
+
+fn fit_atom_transport_ladder_report(
+    model: &FittedSaeManifold,
+    input: &AtomTransportLadderInput,
+) -> Result<AtomTransportLadderReport, String> {
+    let atom = model.atoms.get(input.atom_index).ok_or_else(|| {
+        format!(
+            "atom transport ladder index {} out of range for {} fitted atoms",
+            input.atom_index,
+            model.atoms.len()
+        )
+    })?;
+    let depth = input.layers.len();
+    if depth < 2 {
+        return Err(format!(
+            "atom transport ladder for atom {} ('{}') needs at least two layers, got {depth}",
+            input.atom_index, atom.name
+        ));
+    }
+    if input.coords.len() != depth || input.topologies.len() != depth {
+        return Err(format!(
+            "atom transport ladder for atom {} ('{}') has {} layers, {} coordinate blocks, {} topologies",
+            input.atom_index,
+            atom.name,
+            depth,
+            input.coords.len(),
+            input.topologies.len()
+        ));
+    }
+
+    let mut coords = Vec::with_capacity(depth);
+    let mut topologies = Vec::with_capacity(depth);
+    for (layer_pos, (coord, topology)) in
+        input.coords.iter().zip(input.topologies.iter()).enumerate()
+    {
+        coords.push(canonical_coords_for_transport(
+            coord,
+            topology,
+            input.atom_index,
+            &atom.name,
+            input.layers[layer_pos],
+        )?);
+        topologies.push(ChartTopology::from(topology));
+    }
+
+    let report = transport_ladder(&input.layers, &coords, &topologies).map_err(|e| {
+        format!(
+            "atom transport ladder for atom {} ('{}') failed: {e}",
+            input.atom_index, atom.name
+        )
+    })?;
+    Ok(AtomTransportLadderReport {
+        atom_index: input.atom_index,
+        atom_name: atom.name.clone(),
+        report,
+    })
 }
 
 fn canonical_coords_for_transport(
