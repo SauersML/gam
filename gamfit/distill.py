@@ -101,7 +101,9 @@ def _activation_from_logits(
         prior = np.maximum(prior, np.finfo(np.float64).tiny)
         sig = 1.0 / (1.0 + np.exp(-np.clip(z / tau, -709.0, 709.0)))
         return sig * prior.reshape(1, -1)
-    if name == "jumprelu":
+    # #1777 — the hard-sigmoid gate's primary token is "threshold_gate"; the
+    # legacy "jumprelu" spelling is still accepted as a deprecated alias.
+    if name in ("threshold_gate", "jumprelu"):
         shifted = (z - float(jumprelu_threshold)) / tau
         sig = 1.0 / (1.0 + np.exp(-np.clip(shifted, -709.0, 709.0)))
         return np.where(z > float(jumprelu_threshold), sig, 0.0)
