@@ -23,7 +23,7 @@
 use faer::Side;
 use gam_linalg::faer_ndarray::{fast_atb, FaerCholesky};
 use gam_sae::assignment::{default_ibp_concentration_for_k_atoms, AssignmentMode, SaeAssignment};
-use gam_sae::basis::PeriodicHarmonicEvaluator;
+use gam_sae::basis::{PeriodicHarmonicEvaluator, SaeBasisEvaluator};
 use gam_sae::manifold::{
     sae_pca_seed_initial_coords, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
 };
