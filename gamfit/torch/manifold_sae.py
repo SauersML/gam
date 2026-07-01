@@ -56,6 +56,7 @@ from .penalties import (
     JumpReLUPenalty,
     MonotonicityPenalty,
     ibp_map,
+    jumprelu_bounded_gate,
 )
 
 
@@ -736,8 +737,14 @@ class _SparsityLayer(nn.Module):
             return assignments, logits
         if self.kind == "softmax_topk":
             return self._topk_gate(logits), logits
-        # JumpReLU activation: hard threshold forward, Rust-STE backward.
-        assignments = self._jumprelu.gate(logits)
+        # JumpReLU: the bounded [0, 1) threshold gate the closed-form fit
+        # evaluates (Rust `jumprelu_row`; magnitude lives in the decoder), with
+        # the Rust straight-through surrogate derivative as backward. The
+        # magnitude-carrying `z · 1[z > τ]` activation would train a per-token
+        # amplitude the closed-form family does not have.
+        tau = max(float(self.tau.item()), 1e-6)
+        thresholds = self._jumprelu.effective_thresholds(logits.dtype).to(logits.device)
+        assignments = jumprelu_bounded_gate(logits, thresholds, tau)
         return assignments, logits
 
     def _topk_activation(self, logits: torch.Tensor) -> torch.Tensor:
