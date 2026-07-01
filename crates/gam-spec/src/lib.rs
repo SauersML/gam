@@ -556,13 +556,13 @@ impl ResponseFamily {
     /// validation layer (Gaussian) or has its support enforced by a downstream
     /// pathway (RoystonParmar via the survival pipeline).
     ///
-    /// `Binomial` is the scalar Bernoulli-logit family: with no per-row trial
-    /// count `mᵢ`, the log-likelihood is `ℓ(η) = y·η − log(1 + eη)`, which is
-    /// unbounded above for `y ∉ {0, 1}` (as `η → ∞`, `ℓ ~ (y − 1)·η`), and the
-    /// binomial deviance term `(1 − y)·log((1 − y)/(1 − μ))` leaves its domain
-    /// for `y > 1`. The family is therefore only well-posed for `y ∈ {0, 1}`,
-    /// which the support check enforces up front rather than deferring to the
-    /// downstream binarity heuristic.
+    /// `Binomial` accepts Bernoulli observations and grouped-binomial
+    /// proportions. With prior/trial weights folded into the row weight, the
+    /// per-unit log-likelihood is `ℓ(η) = y·η − log(1 + exp(η))`, which is
+    /// bounded exactly for `0 ≤ y ≤ 1`; outside that interval one tail is
+    /// unbounded and the binomial deviance leaves its domain. Strict `{0, 1}`
+    /// binarity remains an auto-inference policy, not the support of an
+    /// explicitly requested binomial model.
     #[inline]
     pub fn response_support_requirement(&self) -> Option<&'static str> {
         match self {
@@ -570,11 +570,16 @@ impl ResponseFamily {
             Self::Poisson | Self::NegativeBinomial { .. } | Self::Tweedie { .. } => {
                 Some("non-negative response values (y ≥ 0)")
             }
+<<<<<<< ours
             Self::Beta { .. } => Some(
                 "response values strictly in the open interval (0, 1) \
                  (a binary {0, 1} response is a Binomial GLM, not Beta; route it through the Binomial family instead)",
             ),
             Self::Binomial => Some("binary response values (y ∈ {0, 1})"),
+=======
+            Self::Beta { .. } => Some("response values strictly in the open interval (0, 1)"),
+            Self::Binomial => Some("response values in the closed interval [0, 1]"),
+>>>>>>> theirs
             Self::Gaussian | Self::RoystonParmar => None,
         }
     }
@@ -586,11 +591,11 @@ impl ResponseFamily {
     /// "unconstrained" families (Gaussian / RoystonParmar) never hit this code
     /// path.
     ///
-    /// `Binomial` accepts only an (exactly) binary value: `y` must equal `0` or
-    /// `1` to within `BINOMIAL_BINARY_TOL` — the same `{0, 1}` test used by the
-    /// auto-inference and degeneracy paths — because the scalar Bernoulli-logit
-    /// likelihood is unbounded for any other value (see
-    /// `response_support_requirement`).
+    /// `Binomial` accepts Bernoulli outcomes and grouped-binomial proportions:
+    /// `y` must be finite and lie in the closed unit interval. The stricter
+    /// `{0, 1}` predicate is used only where the code is specifically asking
+    /// whether a numeric response is binary (auto-inference and all-boundary
+    /// degeneracy checks).
     #[inline]
     fn response_support_contains(&self, yi: f64) -> bool {
         match self {
@@ -599,11 +604,7 @@ impl ResponseFamily {
                 yi.is_finite() && yi >= 0.0
             }
             Self::Beta { .. } => yi.is_finite() && yi > 0.0 && yi < 1.0,
-            Self::Binomial => {
-                yi.is_finite()
-                    && ((yi - 0.0).abs() < BINOMIAL_BINARY_TOL
-                        || (yi - 1.0).abs() < BINOMIAL_BINARY_TOL)
-            }
+            Self::Binomial => yi.is_finite() && (0.0..=1.0).contains(&yi),
             Self::Gaussian | Self::RoystonParmar => true,
         }
     }
@@ -634,8 +635,8 @@ impl ResponseFamily {
     /// Returns `Ok(())` for families whose support is the entire real line at
     /// this layer (Gaussian) or whose support is enforced by a downstream
     /// pathway (RoystonParmar via the survival pipeline). `Binomial` is
-    /// enforced here: only `y ∈ {0, 1}` keeps the scalar Bernoulli-logit
-    /// likelihood bounded.
+    /// enforced here: `0 ≤ y ≤ 1` keeps the Bernoulli / grouped-binomial
+    /// log-likelihood bounded.
     ///
     /// Up to `ResponseSupportViolation::MAX_REPORTED` offending row indices
     /// are returned in the violation so the message stays bounded on large
@@ -692,29 +693,16 @@ impl ResponseFamily {
     ) -> Result<(), ResponseDegeneracy> {
         match self {
             Self::Binomial => {
-                let mut saw_zero = false;
-                let mut saw_one = false;
-                for &yi in y.iter() {
-                    if (yi - 0.0).abs() < BINOMIAL_BINARY_TOL {
-                        saw_zero = true;
-                    } else if (yi - 1.0).abs() < BINOMIAL_BINARY_TOL {
-                        saw_one = true;
-                    }
-                    if saw_zero && saw_one {
-                        return Ok(());
-                    }
+                if y.is_empty() {
+                    return Ok(());
                 }
-                let kind = if saw_one {
-                    ResponseDegeneracyKind::BinomialAllOnes
-                } else if saw_zero {
+                let all_zeros = y.iter().all(|&yi| (yi - 0.0).abs() < BINOMIAL_BINARY_TOL);
+                let all_ones = y.iter().all(|&yi| (yi - 1.0).abs() < BINOMIAL_BINARY_TOL);
+                let kind = if all_zeros {
                     ResponseDegeneracyKind::BinomialAllZeros
+                } else if all_ones {
+                    ResponseDegeneracyKind::BinomialAllOnes
                 } else {
-                    // Reachable only for an empty response: the support check
-                    // (`validate_response_support`) has already rejected any
-                    // non-binary value, so every present `yᵢ` is exactly 0 or 1
-                    // and at least one of `saw_zero`/`saw_one` is set whenever
-                    // `y` is non-empty. An empty response carries no
-                    // saturated-boundary degeneracy, so accept it here.
                     return Ok(());
                 };
                 Err(ResponseDegeneracy {
@@ -2624,8 +2612,14 @@ mod tests {
     }
 
     #[test]
-    fn binomial_support_rejects_fractional() {
+    fn binomial_support_accepts_fractional_proportions() {
         let y = arr1(&[0.0_f64, 0.5, 1.0]);
+        assert!(ResponseFamily::Binomial.validate_response_support(y.view()).is_ok());
+    }
+
+    #[test]
+    fn binomial_support_rejects_values_outside_unit_interval() {
+        let y = arr1(&[0.0_f64, -0.1, 1.1]);
         assert!(ResponseFamily::Binomial.validate_response_support(y.view()).is_err());
     }
 
@@ -2688,6 +2682,7 @@ mod tests {
     }
 
     #[test]
+<<<<<<< ours
     fn gaussian_degeneracy_exactly_constant_ok() {
         // A *genuinely* zero-variance response — every value bit-for-bit
         // identical — is the well-posed constant limit, not the #332
@@ -2696,6 +2691,17 @@ mod tests {
         // fitter return the constant surface (#1856); only a response that
         // varies below the sd floor without being exactly constant keeps the
         // rejection (see `gaussian_degeneracy_near_constant_reproducer_errors`).
+=======
+    fn binomial_degeneracy_fractional_proportions_ok() {
+        let y = arr1(&[0.0_f64, 0.5, 0.75]);
+        assert!(ResponseFamily::Binomial.validate_response_degeneracy(y.view()).is_ok());
+    }
+
+    #[test]
+    fn gaussian_degeneracy_exactly_constant_errors() {
+        // An exactly-constant response has sample sd 0 ⇒ the marginal
+        // `−n/2·log σ²` diverges; the guard must reject it pre-fit (#332).
+>>>>>>> theirs
         let y = arr1(&[1.0_f64, 1.0, 1.0]);
         assert!(ResponseFamily::Gaussian
             .validate_response_degeneracy(y.view())
