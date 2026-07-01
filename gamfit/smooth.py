@@ -19,7 +19,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, ClassVar, Literal, Sequence
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Sequence
+
+if TYPE_CHECKING:
+    import torch
 
 
 ShapeConstraintLiteral = Literal[
@@ -29,6 +32,9 @@ ShapeConstraintLiteral = Literal[
     "convex",
     "concave",
 ]
+
+
+from ._basis_protocol import BasisDescriptor as _BasisDescriptor
 
 
 def _smooth_kind_name(cls: type) -> str:
@@ -79,7 +85,7 @@ def _array_to_list(value: Any) -> Any:
 
 
 @dataclass(slots=True)
-class Smooth:
+class Smooth(_BasisDescriptor):
     """Base class for all smooth-term specs. Don't instantiate directly.
 
     Common fields shared by all smooth kinds:
@@ -135,6 +141,13 @@ class Smooth:
         repr=False,
     )
 
+    # ------------------------------------------------------------------
+    # Callable-basis protocol is inherited from
+    # :class:`gamfit._basis_protocol.BasisDescriptor`. Concrete subclasses
+    # override at least :meth:`_evaluate_torch` plus :attr:`intrinsic_dim` /
+    # :attr:`basis_size`.
+    # ------------------------------------------------------------------
+
     def to_rust_descriptor(self) -> dict[str, Any]:
         """Serialize this smooth descriptor for the Rust ``smooths=`` bridge.
 
@@ -175,6 +188,21 @@ class Smooth:
             # are rejected with a pointer in `_normalize_smooths`.)
             out["by"] = str(self.by)
         return out
+
+
+def _as_torch_tensor(x: Any, *, name: str) -> "torch.Tensor":
+    """Coerce ``x`` to a torch tensor without copying when possible.
+
+    Used by ``Smooth.evaluate`` overrides. We intentionally do not strip a
+    requires_grad flag: routing through the existing
+    :mod:`gamfit.torch._basis` autograd Functions preserves the analytic
+    VJP back to ``x`` for kernels that expose one.
+    """
+    import torch as _torch
+
+    if isinstance(x, _torch.Tensor):
+        return x
+    return _torch.as_tensor(x, dtype=_torch.float64)
 
 
 @dataclass(slots=True)
@@ -262,6 +290,14 @@ class Duchon(Smooth):
 
         return int(np.asarray(self.centers).shape[0])
 
+    def _evaluate_torch(self, coords: Any) -> Any:
+        from ._basis_eval import duchon_evaluate
+        return duchon_evaluate(self, coords)
+
+    def _evaluate_numpy(self, coords: Any) -> Any:
+        from ._basis_eval import duchon_evaluate_numpy
+        return duchon_evaluate_numpy(self, coords)
+
     def to_rust_descriptor(self) -> dict[str, Any]:
         out = super(Duchon, self).to_rust_descriptor()
         if self.centers is not None:
@@ -300,6 +336,19 @@ class BSpline(Smooth):
     def intrinsic_dim(self) -> int:
         return 1
 
+    @property
+    def basis_size(self) -> int:
+        from ._basis_eval import bspline_basis_size
+        return bspline_basis_size(self)
+
+    def _evaluate_torch(self, coords: Any) -> Any:
+        from ._basis_eval import bspline_evaluate
+        return bspline_evaluate(self, coords)
+
+    def _evaluate_numpy(self, coords: Any) -> Any:
+        from ._basis_eval import bspline_evaluate_numpy
+        return bspline_evaluate_numpy(self, coords)
+
     def to_rust_descriptor(self) -> dict[str, Any]:
         out = super(BSpline, self).to_rust_descriptor()
         if self.knots is not None:
@@ -331,6 +380,22 @@ class TensorBSpline(Smooth):
     @property
     def intrinsic_dim(self) -> int:
         return len(self.marginals)
+
+    @property
+    def basis_size(self) -> int:
+        from ._basis_eval import bspline_basis_size
+        total = 1
+        for marg in self.marginals:
+            total *= bspline_basis_size(marg)
+        return int(total)
+
+    def _evaluate_torch(self, coords: Any) -> Any:
+        from ._basis_eval import tensor_bspline_evaluate
+        return tensor_bspline_evaluate(self, coords)
+
+    def _evaluate_numpy(self, coords: Any) -> Any:
+        from ._basis_eval import tensor_bspline_evaluate_numpy
+        return tensor_bspline_evaluate_numpy(self, coords)
 
     def to_rust_descriptor(self) -> dict[str, Any]:
         out = super(TensorBSpline, self).to_rust_descriptor()
@@ -388,6 +453,14 @@ class Matern(Smooth):
         import numpy as np
 
         return int(np.asarray(self.centers).shape[0])
+
+    def _evaluate_torch(self, coords: Any) -> Any:
+        from ._basis_eval import matern_evaluate
+        return matern_evaluate(self, coords)
+
+    def _evaluate_numpy(self, coords: Any) -> Any:
+        from ._basis_eval import matern_evaluate_numpy
+        return matern_evaluate_numpy(self, coords)
 
     def to_rust_descriptor(self) -> dict[str, Any]:
         out = super(Matern, self).to_rust_descriptor()
@@ -562,6 +635,14 @@ class Pca(Smooth):
             raise ValueError("Pca.basis_size: K or basis must be provided")
         return int(self.K)
 
+    def _evaluate_torch(self, coords: Any) -> Any:
+        from ._basis_eval import pca_evaluate
+        return pca_evaluate(self, coords)
+
+    def _evaluate_numpy(self, coords: Any) -> Any:
+        from ._basis_eval import pca_evaluate_numpy
+        return pca_evaluate_numpy(self, coords)
+
     def to_rust_descriptor(self) -> dict[str, Any]:
         out = super(Pca, self).to_rust_descriptor()
         if self.K is not None:
@@ -642,6 +723,60 @@ class Sphere(Smooth):
             return k * (k + 2)
         return k - 1
 
+    def _resolve_centers(self, coords: Any) -> Any:
+        """Resolve and cache the basis center matrix.
+
+        For ``kernel='harmonic'`` no centers are needed and this returns
+        ``None``. For Wahba kernels the resolution order is:
+
+        1. User-supplied ``centers``.
+        2. Farthest-point sampling from ``coords`` when it has at least
+           ``n_centers`` rows.
+        3. Deterministic Fibonacci-lattice fallback otherwise.
+        """
+        if str(self.kernel).lower() == "harmonic":
+            return None
+
+        cached = getattr(self, "_cached_centers", None)
+        if cached is not None:
+            return cached
+
+        import numpy as np
+
+        if self.centers is not None:
+            ctrs = np.ascontiguousarray(
+                np.asarray(self.centers, dtype=np.float64)
+            )
+            if ctrs.ndim != 2 or ctrs.shape[1] != 2:
+                raise ValueError(
+                    f"Sphere.centers must have shape (K, 2); got {ctrs.shape}"
+                )
+        else:
+            n_centers_i = int(self.n_centers)
+            pts = np.ascontiguousarray(np.asarray(coords, dtype=np.float64))
+            if pts.shape[0] >= n_centers_i:
+                from . import _api
+
+                ctrs = np.asarray(
+                    _api.rust_module().sphere_select_farthest_point_centers(
+                        pts, n_centers_i, bool(self.radians),
+                    ),
+                    dtype=np.float64,
+                )
+            else:
+                ctrs = _fibonacci_sphere_lat_lon(n_centers_i, bool(self.radians))
+
+        object.__setattr__(self, "_cached_centers", ctrs)
+        return ctrs
+
+    def _evaluate_numpy(self, coords: Any) -> Any:
+        from ._basis_eval import sphere_evaluate_numpy
+        return sphere_evaluate_numpy(self, coords)
+
+    def _evaluate_torch(self, coords: Any) -> Any:
+        from ._basis_eval import sphere_evaluate
+        return sphere_evaluate(self, coords)
+
     def to_rust_descriptor(self) -> dict[str, Any]:
         out = super(Sphere, self).to_rust_descriptor()
         out["n_centers"] = int(self.n_centers)
@@ -653,6 +788,31 @@ class Sphere(Smooth):
         return out
 
     SUPPORTED_BACKENDS: ClassVar[frozenset[str]] = frozenset({"torch", "numpy", "jax"})
+
+
+def _fibonacci_sphere_lat_lon(n: int, radians: bool) -> Any:
+    """Deterministic quasi-uniform sphere lattice — (n, 2) [lat, lon].
+
+    Golden-angle Fibonacci spiral on S². Used as the default center set
+    when ``Sphere.evaluate`` is called without pre-fit context (eval rows
+    < ``n_centers`` and no user-supplied ``centers``).
+    """
+    import numpy as np
+
+    if n < 2:
+        raise ValueError(f"Sphere needs at least 2 centers; got n_centers={n}")
+    k = np.arange(n, dtype=np.float64)
+    z = 1.0 - (2.0 * k + 1.0) / float(n)
+    z = np.clip(z, -1.0, 1.0)
+    lat_rad = np.arcsin(z)
+    golden_angle = np.pi * (3.0 - np.sqrt(5.0))
+    lon_rad = (k * golden_angle) % (2.0 * np.pi)
+    lon_rad = np.where(lon_rad > np.pi, lon_rad - 2.0 * np.pi, lon_rad)
+    if radians:
+        return np.column_stack([lat_rad, lon_rad]).astype(np.float64)
+    return np.column_stack([np.degrees(lat_rad), np.degrees(lon_rad)]).astype(
+        np.float64
+    )
 
 
 @dataclass(slots=True)
@@ -682,6 +842,26 @@ class PeriodicSplineCurve(Smooth):
     @property
     def basis_size(self) -> int:
         return int(self.n_knots)
+
+    def _evaluate_torch(self, coords: Any) -> Any:
+        from ._basis_eval import _periodic_curve_basis
+        t = coords[:, 0]
+        # Reduce modulo 1 so the cyclic forward sees t ∈ [0, 1).
+        from ._basis_protocol import _torch
+        torch = _torch()
+        t_mod = t - torch.floor(t)
+        return _periodic_curve_basis(t_mod, int(self.n_knots), int(self.degree))
+
+    def _evaluate_numpy(self, coords: Any) -> Any:
+        import numpy as np
+
+        from ._basis_eval import periodic_curve_evaluate_numpy
+
+        coords_np = np.asarray(coords, dtype=np.float64)
+        # Match the torch path: reduce t modulo 1 before evaluating.
+        coords_np = coords_np.copy()
+        coords_np[:, 0] = coords_np[:, 0] - np.floor(coords_np[:, 0])
+        return periodic_curve_evaluate_numpy(self, coords_np)
 
     def to_rust_descriptor(self) -> dict[str, Any]:
         out = super(PeriodicSplineCurve, self).to_rust_descriptor()

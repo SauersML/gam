@@ -1085,11 +1085,9 @@ def fit(
                 "gamfit.fit requires formula='...' when formula-model kwargs are supplied: "
                 + ", ".join(active_formula_kwargs)
             )
-        raise TypeError(
-            "gamfit.fit requires formula='...'; the config-only SAE-manifold "
-            "research-fit path has been removed (its logic belonged in the Rust "
-            "core, per SPEC)."
-        )
+        from ._sae_manifold import fit as _sae_research_fit
+
+        return _sae_research_fit(data, config=config)
 
     if constraints:
         # Alias normalization, smooth-term scanning, and the `shape=` rewrite all
@@ -1406,7 +1404,7 @@ def load(path: str | Path) -> Any:
 
     Returns
     -------
-    Model
+    Model or ManifoldSAE
         Fitted model ready for prediction.
 
     Examples
@@ -1415,6 +1413,12 @@ def load(path: str | Path) -> Any:
     >>> model.predict(test_df)
     """
     raw = Path(path).read_bytes()
+    # Cheap sniff: only ManifoldSAE payloads are JSON with the schema tag.
+    head = raw[:256].lstrip()
+    if head.startswith(b"{") and b"gamfit.ManifoldSAE" in raw[:512]:
+        from ._sae_manifold import ManifoldSAE  # local import avoids cycle
+
+        return ManifoldSAE.from_dict(json.loads(raw.decode("utf-8")))
     return loads(raw)
 
 
