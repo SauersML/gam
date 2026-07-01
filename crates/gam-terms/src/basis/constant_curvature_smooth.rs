@@ -627,7 +627,7 @@ pub fn build_constant_curvature_basis(
         crate::bail_invalid_basis!("constant-curvature smooth needs a finite kappa");
     }
     validate_chart_points(data, spec.kappa, "data")?;
-    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    let centers = select_constant_curvature_centers(data, &spec.center_strategy)?;
     if centers.nrows() < 2 {
         return Err(BasisError::InsufficientColumnsForConstraint {
             found: centers.nrows(),
@@ -769,6 +769,47 @@ pub fn build_constant_curvature_basis(
         null_eigenvectors,
         joint_null_rotation: None,
     })
+}
+
+/// Select constant-curvature centers.
+///
+/// The stereographic constant-curvature chart has a distinguished pole: the
+/// chart origin.  Curvature sign is visible first in the radial geodesic map
+/// from that pole (`2 atan(√κ r)/√κ` versus `2 atanh(√|κ| r)/√|κ|`).  A pure
+/// farthest-point subset can miss the pole on disk-like clouds, leaving the
+/// radial mode to be reconstructed indirectly from boundary centers; then the
+/// positive chart's distance compression becomes a generic interpolation
+/// advantage and the κ profile is sign-blind.  Keep the user's requested center
+/// count, but make data-driven center sets pole-aware by replacing the center
+/// closest to the origin with the exact origin.  User-provided centers are left
+/// verbatim.
+fn select_constant_curvature_centers(
+    data: ArrayView2<'_, f64>,
+    strategy: &CenterStrategy,
+) -> Result<Array2<f64>, BasisError> {
+    let mut centers = select_centers_by_strategy(data, strategy)?;
+    match strategy {
+        CenterStrategy::UserProvided(_) => return Ok(centers),
+        CenterStrategy::Auto(inner) => {
+            if matches!(inner.as_ref(), CenterStrategy::UserProvided(_)) {
+                return Ok(centers);
+            }
+        }
+        _ => {}
+    }
+    if centers.nrows() == 0 || centers.ncols() == 0 {
+        return Ok(centers);
+    }
+    let (closest, _) = centers
+        .outer_iter()
+        .enumerate()
+        .map(|(i, row)| (i, row.dot(&row)))
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap();
+    for j in 0..centers.ncols() {
+        centers[(closest, j)] = 0.0;
+    }
+    Ok(centers)
 }
 
 /// Closed-form profiled Gaussian-REML negative-log-evidence of a dense design
