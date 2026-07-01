@@ -958,13 +958,45 @@ pub struct DenestedCubicCell {
 impl DenestedCubicCell {
     #[inline]
     pub fn eta(self, z: f64) -> f64 {
-        self.c0 + self.c1 * z + self.c2 * z * z + self.c3 * z * z * z
+        if self.left.is_finite() {
+            let scale = self.left.abs().max(self.right.abs()).max(z.abs()).max(1.0);
+            let endpoint_tol = 16.0 * f64::EPSILON * scale.max(1.0e3);
+            let t = z - self.left;
+            if t.abs() <= endpoint_tol {
+                return self.c0;
+            }
+            if self.right.is_finite() && (z - self.right).abs() <= endpoint_tol {
+                let width = self.right - self.left;
+                return self.c0
+                    + self.c1 * width
+                    + self.c2 * width * width
+                    + self.c3 * width * width * width;
+            }
+            self.c0 + self.c1 * t + self.c2 * t * t + self.c3 * t * t * t
+        } else {
+            self.c0 + self.c1 * z + self.c2 * z * z + self.c3 * z * z * z
+        }
     }
 
     #[inline]
     pub fn q(self, z: f64) -> f64 {
         let eta = self.eta(z);
         0.5 * (z * z + eta * eta)
+    }
+
+    #[inline]
+    fn global_eta_coefficients(self) -> [f64; 4] {
+        if self.left.is_finite() {
+            let left = self.left;
+            [
+                self.c0 - self.c1 * left + self.c2 * left * left - self.c3 * left * left * left,
+                self.c1 - 2.0 * self.c2 * left + 3.0 * self.c3 * left * left,
+                self.c2 - 3.0 * self.c3 * left,
+                self.c3,
+            ]
+        } else {
+            [self.c0, self.c1, self.c2, self.c3]
+        }
     }
 }
 
@@ -1731,11 +1763,16 @@ pub fn reduce_quartic_moments(
     if max_degree <= 2 {
         return Ok(base_m0_m2[..=max_degree].to_vec());
     }
+<<<<<<< ours
     if let Some(moments) = direct_non_affine_moments_if_base_matches(cell, &base_m0_m2, max_degree)
     {
         return Ok(moments);
     }
     let d = quartic_qprime_coefficients(cell.c0, cell.c1, cell.c2);
+=======
+    let [c0, c1, c2, _] = cell.global_eta_coefficients();
+    let d = quartic_qprime_coefficients(c0, c1, c2);
+>>>>>>> theirs
     let lead = d[3];
     if !lead.is_finite() || lead.abs() <= 1e-18 {
         return Err(CubicCellKernelError::invalid_cell_shape(format!(
@@ -1785,11 +1822,16 @@ pub fn reduce_sextic_moments(
     if max_degree <= 4 {
         return Ok(base_m0_m4[..=max_degree].to_vec());
     }
+<<<<<<< ours
     if let Some(moments) = direct_non_affine_moments_if_base_matches(cell, &base_m0_m4, max_degree)
     {
         return Ok(moments);
     }
     let d = sextic_qprime_coefficients(cell.c0, cell.c1, cell.c2, cell.c3);
+=======
+    let [c0, c1, c2, c3] = cell.global_eta_coefficients();
+    let d = sextic_qprime_coefficients(c0, c1, c2, c3);
+>>>>>>> theirs
     let lead = d[5];
     if !lead.is_finite() {
         return Err(CubicCellKernelError::invalid_cell_shape(format!(
@@ -1929,7 +1971,7 @@ pub fn cell_second_derivative_from_moments(
     // per call) into `len(eta)·len(r) + (len(eta)+len(r)-1)·len(s) +
     // len(out)` ≈ 16 + 28 + 10 = 54 mul-adds, with the inner loops now in
     // straight-line FMA-friendly form.
-    let cubic = [cell.c0, cell.c1, cell.c2, cell.c3];
+    let cubic = cell.global_eta_coefficients();
     // Capacity bound: cubic (4) + first_r (≤MAX) + first_s (≤MAX) - 2.
     // First-coefficient slices are passed in as `[f64; 4]` from every
     // production caller; sizing to 32 covers any realistic test input.
@@ -2123,7 +2165,7 @@ pub fn cell_third_derivative_from_moments(
     third_coefficients_rst: &[f64],
     moments: &[f64],
 ) -> Result<f64, String> {
-    let eta = [cell.c0, cell.c1, cell.c2, cell.c3];
+    let eta = cell.global_eta_coefficients();
     let r_degree = first_coefficients_degree("r", first_coefficients_r)?;
     let s_degree = first_coefficients_degree("s", first_coefficients_s)?;
     let t_degree = first_coefficients_degree("t", first_coefficients_t)?;
@@ -2637,6 +2679,20 @@ pub fn denested_cell_coefficients(
 }
 
 #[inline]
+pub fn localize_global_coefficients(left: f64, global: [f64; 4]) -> [f64; 4] {
+    if left.is_finite() {
+        [
+            global[0] + global[1] * left + global[2] * left * left + global[3] * left * left * left,
+            global[1] + 2.0 * global[2] * left + 3.0 * global[3] * left * left,
+            global[2] + 3.0 * global[3] * left,
+            global[3],
+        ]
+    } else {
+        global
+    }
+}
+
+#[inline]
 pub fn denested_cell_coefficient_partials(
     score_span: LocalSpanCubic,
     link_span: LocalSpanCubic,
@@ -2906,6 +2962,7 @@ where
         let score_span = score_span_at(mid)?;
         let link_span = link_span_at(a + b * mid)?;
         let coeffs = denested_cell_coefficients(score_span, link_span, a, b);
+        let coeffs = localize_global_coefficients(left, coeffs);
         out.push(DenestedPartitionCell {
             cell: DenestedCubicCell {
                 left,
@@ -2938,6 +2995,7 @@ where
         ))
         .into());
     }
+    let right_coeffs = localize_global_coefficients(rightmost, right_coeffs);
     out.push(DenestedPartitionCell {
         cell: DenestedCubicCell {
             left: rightmost,
@@ -3419,8 +3477,7 @@ pub fn evaluate_affine_cell_state(
     cell: DenestedCubicCell,
     max_degree: usize,
 ) -> Result<CellMomentState, String> {
-    let alpha = cell.c0;
-    let beta = cell.c1;
+    let [alpha, beta, _, _] = cell.global_eta_coefficients();
     let value = affine_value_from_moment_primitive(alpha, beta, cell.left, cell.right);
     let moments = affine_anchor_moment_vector(alpha, beta, cell.left, cell.right, max_degree);
     Ok(CellMomentState {
@@ -3434,8 +3491,7 @@ fn evaluate_affine_cell_derivative_state(
     cell: DenestedCubicCell,
     max_degree: usize,
 ) -> Result<CellDerivativeMomentState, String> {
-    let alpha = cell.c0;
-    let beta = cell.c1;
+    let [alpha, beta, _, _] = cell.global_eta_coefficients();
     let moments = affine_anchor_moment_vector(alpha, beta, cell.left, cell.right, max_degree);
     Ok(CellDerivativeMomentState {
         branch: ExactCellBranch::Affine,
@@ -3524,6 +3580,7 @@ fn evaluate_non_affine_cell_with_rule<const COMPUTE_VALUE: bool>(
     let c1_v = f64x4::splat(c1);
     let c2_v = f64x4::splat(c2);
     let c3_v = f64x4::splat(c3);
+    let left_v = f64x4::splat(cell.left);
     let neg_half_v = f64x4::splat(-0.5);
     let n_total = gl_nodes.len();
     let n_simd = n_total - (n_total % 4);
@@ -3542,11 +3599,12 @@ fn evaluate_non_affine_cell_with_rule<const COMPUTE_VALUE: bool>(
             gl_weights[i + 3],
         ]);
         let z_v = half_width_v.mul_add(node_v, center_v);
-        // Horner: ((c3*z + c2)*z + c1)*z + c0
+        let t_v = z_v - left_v;
+        // Horner in the cell-local coordinate: ((c3*t + c2)*t + c1)*t + c0
         let eta_v = c3_v
-            .mul_add(z_v, c2_v)
-            .mul_add(z_v, c1_v)
-            .mul_add(z_v, c0_v);
+            .mul_add(t_v, c2_v)
+            .mul_add(t_v, c1_v)
+            .mul_add(t_v, c0_v);
         let z2_v = z_v * z_v;
         let neg_q_v = neg_half_v * (z2_v + eta_v * eta_v);
         let exp_negq_v = neg_q_v.exp();
@@ -3573,7 +3631,8 @@ fn evaluate_non_affine_cell_with_rule<const COMPUTE_VALUE: bool>(
                 let node = gl_nodes[i + lane];
                 let weight = gl_weights[i + lane];
                 let z_ref = center + half_width * node;
-                let eta_ref = c0 + c1 * z_ref + c2 * z_ref * z_ref + c3 * z_ref * z_ref * z_ref;
+                let t_ref = z_ref - cell.left;
+                let eta_ref = c0 + c1 * t_ref + c2 * t_ref * t_ref + c3 * t_ref * t_ref * t_ref;
                 value_integral += weight * (-0.5 * z_ref * z_ref).exp() * normal_cdf(eta_ref);
             }
         } else {
@@ -3589,7 +3648,8 @@ fn evaluate_non_affine_cell_with_rule<const COMPUTE_VALUE: bool>(
         let node = gl_nodes[i];
         let weight = gl_weights[i];
         let z = center + half_width * node;
-        let eta = c3.mul_add(z, c2).mul_add(z, c1).mul_add(z, c0);
+        let t = z - cell.left;
+        let eta = c3.mul_add(t, c2).mul_add(t, c1).mul_add(t, c0);
         let q = 0.5 * (z * z + eta * eta);
         let moment_weight = weight * (-q).exp();
         accumulate_moments_unrolled4(moments_slice, moment_weight, z);
@@ -3598,7 +3658,7 @@ fn evaluate_non_affine_cell_with_rule<const COMPUTE_VALUE: bool>(
             // node map `z = center + half_width·node` here already matches the
             // reference (non-fused), but η must use the expanded reference form
             // rather than the moment path's Horner-FMA.
-            let eta_ref = c0 + c1 * z + c2 * z * z + c3 * z * z * z;
+            let eta_ref = c0 + c1 * t + c2 * t * t + c3 * t * t * t;
             value_integral += weight * (-0.5 * z * z).exp() * normal_cdf(eta_ref);
         }
         i += 1;
@@ -3811,7 +3871,8 @@ fn evaluate_non_affine_cell_value_terminal(cell: DenestedCubicCell) -> f64 {
     let mut value_integral = 0.0_f64;
     for (&node, &weight) in GL_NODES.iter().zip(GL_WEIGHTS.iter()) {
         let z = center + half_width * node;
-        let eta = c0 + c1 * z + c2 * z * z + c3 * z * z * z;
+        let t = z - cell.left;
+        let eta = c0 + c1 * t + c2 * t * t + c3 * t * t * t;
         value_integral += weight * (-0.5 * z * z).exp() * normal_cdf(eta);
     }
     value_integral * half_width
@@ -3935,7 +3996,8 @@ fn evaluate_cell_state_dispatched<S>(
         return affine(cell, max_degree);
     }
     if branch == ExactCellBranch::Sextic {
-        let lead = sextic_qprime_coefficients(cell.c0, cell.c1, cell.c2, cell.c3)[5];
+        let [c0, c1, c2, c3] = cell.global_eta_coefficients();
+        let lead = sextic_qprime_coefficients(c0, c1, c2, c3)[5];
         if !lead.is_finite() {
             return Err(CubicCellKernelError::invalid_cell_shape(format!(
                 "sextic cell evaluation encountered non-finite leading coefficient: {lead:.3e}"

@@ -45,7 +45,7 @@ use ndarray::Array2;
 
 use crate::cubic_cell_kernel::{
     DenestedCubicCell, LocalSpanCubic, PartitionEdge, denested_cell_coefficients,
-    evaluate_cell_derivative_moments_uncached,
+    evaluate_cell_derivative_moments_uncached, localize_global_coefficients,
 };
 
 /// Process-wide count of per-row cell lookups served by a certified family
@@ -107,6 +107,7 @@ impl CellMomentFamilySpec {
             ));
         }
         let coeffs = denested_cell_coefficients(self.score_span, self.link_span, a, b);
+        let coeffs = localize_global_coefficients(left, coeffs);
         Ok(DenestedCubicCell {
             left,
             right,
