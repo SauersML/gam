@@ -2607,9 +2607,8 @@ where
             )
             && finalgrad_norm.is_finite()
         {
-            let score_relative_bound = (crate::rho_optimizer::FLAT_VALLEY_CONVERGED_REL_GRAD
-                * (1.0 + outer_result.final_value.abs()))
-            .min(crate::rho_optimizer::FLAT_VALLEY_CONVERGED_ABS_GRAD_CAP);
+            let score_relative_bound =
+                crate::rho_optimizer::flat_valley_converged_grad_bound(outer_result.final_value);
             if finalgrad_norm <= score_relative_bound {
                 log::info!(
                     "[OUTER] flat-valley cost-stall RE-CERTIFIED converged: the authoritative \
