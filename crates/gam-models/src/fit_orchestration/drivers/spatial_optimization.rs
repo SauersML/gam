@@ -9165,31 +9165,42 @@ pub fn smooth_term_lr_inference_forspec(
         // This mirrors the summary Wald path, which floors its reference at the
         // statistic's own rank for the same reason.
         //
-        // Trust that tight `edf1` reference ONLY when the outer fit CONVERGED. A
-        // non-converged fit — the flat-valley REML stall on an unidentified term
-        // (#1762): outer iterations rail out and the null-space shrinkage λ
-        // saturates ~1e13 — leaves the influence-based `edf` INCONSISTENT with
-        // the fitted coefficients: the term still carries a large, wiggly `β`
-        // (so the refit-based LR statistic `W` is large) yet `tr(F) = edf` reads
-        // ~0. Referencing that large `W` against `edf1 ≈ edf ≈ 0` manufactures
-        // significance — measured null false-positive rate ~0.62 on the
-        // non-converged noise fits, versus a well-calibrated ~0.06 on the
-        // converged ones (the entire residual miscalibration lives here). The
-        // summary Wald path already sidesteps this: its statistic is truncated to
-        // the ~0-`edf` rank, so it collapses to ~0 and the term is skipped. The
-        // whole-term LR statistic cannot self-truncate (it is a refit deviance
-        // difference), so we instead widen its REFERENCE: when the fit did not
-        // converge, floor `ref_df` at the term's full basis dimension — the
-        // maximally-honest reference (an untrusted term may occupy up to all its
-        // columns). A genuine effect still rejects (`W` ≫ its column count);
-        // a tiny-`W` collapse still gives `p ≈ 1`; only the spurious
-        // large-`W`/zero-`edf` non-convergence artifact is neutralised. The
-        // underlying stall itself is #1762; this keeps the inference honest on
-        // top of whatever fit it is handed.
-        let unconverged_dim_floor = if full.fit.outer_converged {
-            0.0
-        } else {
+        // Guard the ONE state where `edf1` cannot be trusted: a non-converged fit
+        // whose influence-based `edf` has collapsed BELOW the term's guaranteed
+        // floor. The flat-valley REML stall on an unidentified term (#1762) rails
+        // the outer iterations out and returns an INCONSISTENT state — the term
+        // still carries a large, wiggly `β` (so the refit LR statistic `W` is
+        // large) yet `tr(F) = edf` reads ~0, a combination a genuine penalized
+        // least-squares solution cannot produce (large `β` ⇒ `edf ≫ 0`).
+        // Referencing that large `W` against `edf1 ≈ edf ≈ 0` manufactures
+        // significance: measured null FPR ~0.62 on those stalled noise fits vs a
+        // well-calibrated ~0.06 on the converged ones — the entire residual
+        // miscalibration lives here. The summary Wald path already sidesteps it
+        // (its statistic truncates to the ~0-`edf` rank and the term is skipped);
+        // the whole-term LR statistic cannot self-truncate (it is a refit deviance
+        // difference), so we widen its REFERENCE instead: floor `ref_df` at the
+        // term's full basis dimension — the maximally-honest reference for an
+        // untrusted term (it may occupy up to all its columns). A genuine effect
+        // still rejects (`W` ≫ its column count); a tiny-`W` collapse still gives
+        // `p ≈ 1`; only the spurious large-`W`/zero-`edf` artifact is neutralised.
+        //
+        // The trigger is NARROW on purpose. `outer_converged` alone is far too
+        // broad: the null-space double-penalty's shrinkage λ routinely rails to
+        // its ~1e13 ceiling on perfectly good fits (a `te` interaction, a
+        // multi-term model), flipping `outer_converged` to false while `edf`
+        // stays healthy (~3, ~9). Flooring THOSE at the full basis dimension
+        // would bury real effects (a `te` with `W ≈ 49` on a 48-column basis).
+        // Requiring BOTH non-convergence AND `edf < max(null_dim, 1)` — the term
+        // shrunk below even its unpenalized floor, the inconsistency fingerprint —
+        // fires on the zero-`edf` stall alone and leaves every healthy-`edf` fit
+        // on the tight `edf1` reference. The underlying stall itself is #1762;
+        // this keeps the inference honest on top of whatever fit it is handed.
+        let edf_floor = (null_dim.max(1)) as f64;
+        let untrusted_edf_collapse = !full.fit.outer_converged && edf < edf_floor;
+        let unconverged_dim_floor = if untrusted_edf_collapse {
             coeff_range.len() as f64
+        } else {
+            0.0
         };
         let ref_df = wood_reference_df(influence, &coeff_range)
             .unwrap_or(0.0)
