@@ -5139,6 +5139,57 @@ mod tests {
         assert!((unicode_periods[1].unwrap() - std::f64::consts::TAU).abs() < 1e-12);
     }
 
+    /// The tensor boundary-token guard must ACCEPT `clamped`/`open` (the
+    /// B-spline-clamped, non-periodic margin spelling) alongside the periodic
+    /// selectors and the other inert non-periodic markers, and still REJECT a
+    /// genuine endpoint constraint like `anchored`. This locks the #415 /
+    /// cylinder fix (`te(theta, z, boundary=['periodic','clamped'])`, mgcv
+    /// `te(bs=c("cc","ps"))`) in the fast unit lane — the end-to-end cylinder
+    /// recovery test is R-gated (`run_r` + mgcv), so without this the guard
+    /// regressing back to rejecting `clamped` would slip through CPU CI.
+    #[test]
+    fn tensor_boundary_tokens_accept_clamped_open_reject_anchored() {
+        fn boundary(raw: &str, dim: usize) -> Result<(), String> {
+            let mut opts = BTreeMap::new();
+            opts.insert("boundary".to_string(), raw.to_string());
+            validate_tensor_boundary_tokens(&opts, dim)
+        }
+
+        // Mixed periodic + clamped (the cylinder) and its bare/case/quote
+        // variants are all accepted.
+        for raw in [
+            "['periodic', 'clamped']",
+            "['periodic', 'open']",
+            "['cc', 'clamped']",
+            "['clamped', 'natural']",
+            "[Periodic, CLAMPED]",
+            "c('cc', 'clamped')",  // mgcv-style c(...) vector form round-trips
+        ] {
+            assert!(
+                boundary(raw, 2).is_ok(),
+                "boundary={raw:?} must be accepted (clamped/open/inert non-periodic markers)"
+            );
+        }
+
+        // `bc=` is an accepted alias for `boundary=`.
+        let mut bc_opts = BTreeMap::new();
+        bc_opts.insert("bc".to_string(), "['periodic', 'clamped']".to_string());
+        assert!(validate_tensor_boundary_tokens(&bc_opts, 2).is_ok());
+
+        // A genuine endpoint constraint has no ordinary-margin meaning on a
+        // tensor and must still be surfaced as a clean unsupported-feature error
+        // rather than silently dropped.
+        let err = boundary("['periodic', 'anchored']", 2)
+            .expect_err("anchored endpoint constraint must be rejected on a tensor margin");
+        assert!(
+            err.contains("anchored") && err.contains("not supported"),
+            "rejection must name the offending token and be an unsupported-feature error: {err}"
+        );
+
+        // Absent boundary/bc is a no-op success.
+        assert!(validate_tensor_boundary_tokens(&BTreeMap::new(), 2).is_ok());
+    }
+
     #[test]
     fn parse_single_axis_periodic_zero_as_axis_not_false() {
         let mut opts = BTreeMap::new();
