@@ -30,8 +30,8 @@ use crate::smooth::{
     TensorBSplineIdentifiability, TensorBSplinePenaltyDecomposition, TensorBSplineSpec,
     TermCollectionSpec,
 };
-use gam_problem::types::ColIdx;
 use gam_data::{ColumnKindTag, DataError, EncodedDataset as Dataset};
+use gam_problem::types::ColIdx;
 use gam_runtime::resource::ResourcePolicy;
 
 /// Default B-spline degree when a smooth's `degree=` option is absent. Cubic
@@ -1247,8 +1247,8 @@ fn parse_tensor_periodic_axes(
                 // is what makes the leading tensor margin honor its periodic flag
                 // (#1751: `periodic=c(1,1)` previously parsed `1,1` as axis
                 // indices, marking only axis 1 and dropping axis 0).
-                let all_zero_one = !entries.is_empty()
-                    && entries.iter().all(|v| v == "0" || v == "1");
+                let all_zero_one =
+                    !entries.is_empty() && entries.iter().all(|v| v == "0" || v == "1");
                 let has_repeat = {
                     let mut seen = std::collections::BTreeSet::new();
                     !entries.iter().all(|v| seen.insert(v.clone()))
@@ -1304,10 +1304,7 @@ fn parse_tensor_periodic_axes(
         let per_margin = parse_option_list(raw);
         if per_margin.len() == dim {
             for (axis, margin_bs) in per_margin.iter().enumerate() {
-                if matches!(
-                    canonicalize_smooth_type(margin_bs),
-                    "cc" | "cp" | "cyclic"
-                ) {
+                if matches!(canonicalize_smooth_type(margin_bs), "cc" | "cp" | "cyclic") {
                     axes[axis] = true;
                 }
             }
@@ -3284,18 +3281,14 @@ pub fn build_smooth_basis(
                 // THAT axis only to the largest feasible spline, and track the
                 // penalty order so the marginal difference penalty stays
                 // well-defined (`order < num_basis_functions` is required by
-                // `create_difference_penalty_matrix`). Periodic axes still
-                // need enough basis functions to wrap; reject k there.
+                // `create_difference_penalty_matrix`). Apply the same
+                // per-margin degree shrinkage to periodic tensor margins too:
+                // a cyclic marginal basis with k=3 cannot be cubic, but it is
+                // still a valid lower-degree cyclic margin with dimension k,
+                // matching mgcv's small-k tensor-margin behavior.
                 if k_axis < 2 {
                     return Err(TermBuilderError::invalid_option(format!(
                         "tensor smooth: k[{axis}]={k_axis} too small; tensor margins require k >= 2"
-                    ))
-                    .to_string());
-                }
-                if periodic_axes[axis] && k_axis < degree + 1 {
-                    return Err(TermBuilderError::invalid_option(format!(
-                        "tensor smooth: periodic axis {axis} requires k >= {} for degree {degree}, got k={k_axis}",
-                        degree + 1
                     ))
                     .to_string());
                 }
@@ -3379,9 +3372,8 @@ pub fn build_smooth_basis(
                     // that option selects the generated B-spline knot strategy
                     // represented by `Automatic { Quantile }`, whereas the cr
                     // margin has already materialized its quantile value-knots.
-                    let cr_knots =
-                        crate::basis::select_cr_knots(ds.values.column(c), k_axis)
-                            .map_err(|e| e.to_string())?;
+                    let cr_knots = crate::basis::select_cr_knots(ds.values.column(c), k_axis)
+                        .map_err(|e| e.to_string())?;
                     (
                         BSplineKnotSpec::NaturalCubicRegression { knots: cr_knots },
                         OneDimensionalBoundary::Open,
@@ -4889,8 +4881,7 @@ mod tests {
             SmoothBasisSpec::Matern { spec, .. } => spec.length_scale,
             other => panic!("expected Matern basis after auto-init, got {other:?}"),
         };
-        let expected =
-            crate::smooth::auto_initial_length_scale(ds.values.view(), &feature_cols);
+        let expected = crate::smooth::auto_initial_length_scale(ds.values.view(), &feature_cols);
         assert!(
             (realized - expected).abs() <= 1e-12,
             "auto-init must seed the wiggly-side length scale max_range/sqrt(n) \
@@ -5277,7 +5268,7 @@ mod tests {
             "['cc', 'clamped']",
             "['clamped', 'natural']",
             "[Periodic, CLAMPED]",
-            "c('cc', 'clamped')",  // mgcv-style c(...) vector form round-trips
+            "c('cc', 'clamped')", // mgcv-style c(...) vector form round-trips
         ] {
             assert!(
                 boundary(raw, 2).is_ok(),
@@ -6527,9 +6518,7 @@ mod tests {
                     ..
                 } => num_internal_knots + m.degree + 1,
                 BSplineKnotSpec::PeriodicUniform { num_basis, .. } => num_basis,
-                BSplineKnotSpec::Provided(ref knots) => {
-                    knots.len().saturating_sub(m.degree + 1)
-                }
+                BSplineKnotSpec::Provided(ref knots) => knots.len().saturating_sub(m.degree + 1),
                 BSplineKnotSpec::NaturalCubicRegression { ref knots } => knots.len(),
                 BSplineKnotSpec::Automatic {
                     num_internal_knots: None,
