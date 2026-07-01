@@ -7722,6 +7722,11 @@ impl SaeManifoldTerm {
     /// `λ_k·S_k[:,μ] ⊗ e_oc` (sparse), so we apply `S_β⁻¹` to that K-vector and
     /// read back `result[col]`. The total edf is the sum of the returned vector
     /// (a uniform/broadcast λ reproduces the historical global trace).
+    ///
+    /// At `K ≥ SMOOTHNESS_DOF_HUTCHINSON_MIN_ATOMS` this delegates to the
+    /// matrix-free Hutchinson estimator (the exact `K·M·p`-solve trace is
+    /// infeasible at that scale); below it the exact column solve is used
+    /// unchanged.
     pub(crate) fn decoder_smoothness_effective_dof_per_atom(
         &self,
         cache: &ArrowFactorCache,
@@ -7739,6 +7744,25 @@ impl SaeManifoldTerm {
             (self.beta_offsets(), Box::new(move |_k: usize| p))
         };
         let k = cache.k;
+        if self.atoms.len() >= Self::SMOOTHNESS_DOF_HUTCHINSON_MIN_ATOMS {
+            // Massive-K: `Σ_k M_k·r_k` exact solves is infeasible — estimate every
+            // atom's trace matrix-free with one `S_β⁻¹` solve per Hutchinson probe.
+            return self
+                .decoder_smoothness_effective_dof_per_atom_hutchinson(
+                    k,
+                    &offsets,
+                    out_dim.as_ref(),
+                    lambda_smooth,
+                    Self::SMOOTHNESS_DOF_HUTCHINSON_PROBES,
+                    Self::SMOOTHNESS_DOF_HUTCHINSON_SEED,
+                    |rhs| {
+                        cache
+                            .schur_inverse_apply(rhs)
+                            .map_err(|e| format!("schur_inverse_apply: {e:?}"))
+                    },
+                )
+                .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason });
+        }
         let mut per_atom = vec![0.0_f64; self.atoms.len()];
         let mut m_col = Array1::<f64>::zeros(k);
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
@@ -7794,11 +7818,25 @@ impl SaeManifoldTerm {
             (self.beta_offsets(), Box::new(move |_k: usize| p))
         };
         let k = cache.k;
-        let mut per_atom = vec![0.0_f64; self.atoms.len()];
-        let mut m_col = Array1::<f64>::zeros(k);
         // The t-RHS is identically zero for every β-only smoothness solve; build
         // it once instead of re-zeroing a delta_t_len()-sized buffer per column.
         let zero_t = Array1::<f64>::zeros(cache.delta_t_len());
+        if self.atoms.len() >= Self::SMOOTHNESS_DOF_HUTCHINSON_MIN_ATOMS {
+            // Massive-K matrix-free path: one deflated `(H⁻¹)_ββ` solve per
+            // Hutchinson probe estimates ALL per-atom traces, replacing the
+            // `Σ_k M_k·r_k` deflated solves that form the `O(K³·M·p)` wall.
+            return self.decoder_smoothness_effective_dof_per_atom_hutchinson(
+                k,
+                &offsets,
+                out_dim.as_ref(),
+                lambda_smooth,
+                Self::SMOOTHNESS_DOF_HUTCHINSON_PROBES,
+                Self::SMOOTHNESS_DOF_HUTCHINSON_SEED,
+                |rhs| Ok(solver.solve(zero_t.view(), rhs)?.beta),
+            );
+        }
+        let mut per_atom = vec![0.0_f64; self.atoms.len()];
+        let mut m_col = Array1::<f64>::zeros(k);
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
             let s = &atom.smooth_penalty;
             let m = atom.basis_size();
@@ -9932,6 +9970,13 @@ impl SaeManifoldTerm {
 // `impl SaeManifoldTerm` block, inlined here so it keeps the SAME module scope
 // and private-field access. Keeps this tracked file under the 10k limit.
 include!("construction_row_jet_logdet_channels.rs");
+
+// [#780 line-count gate] Massive-K decoder-smoothness effective-dof Hutchinson
+// estimator (associated constants + the matrix-free per-atom trace) lives in a
+// sibling file as another `impl SaeManifoldTerm` block, inlined here so it keeps
+// the SAME module scope and private-field access. The two gated exact/estimator
+// entry points above dispatch into it at `K >= MIN_ATOMS`.
+include!("construction_smoothness_dof.rs");
 
 // [#780 line-count gate] `term_from_padded_blocks_with_mode` (the padded-FFI
 // term builder) was split into the sibling `construction_padded_blocks.rs`

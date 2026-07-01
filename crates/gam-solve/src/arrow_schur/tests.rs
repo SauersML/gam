@@ -4666,3 +4666,77 @@ pub(crate) fn build_dense_schur_direct_refuses_oversize_border_1017() {
         other => panic!("expected SchurFactorFailed for oversize border, got {other:?}"),
     }
 }
+
+/// The parallel disjoint-range prefix fan-out in `CompositePenaltyOp::matvec`
+/// (per-atom Kronecker smooth blocks over the K=32k manifold border) must be
+/// BIT-IDENTICAL to the plain serial per-op sum. This builds a composite wide
+/// enough to trip the parallel prefix (covered width ≥ `SCHUR_PROLOGUE_PARALLEL_K_MIN`,
+/// ≥ 2 blocks) with a trailing dense op that overlaps every prefix index (the
+/// serial tail), and asserts exact f64 agreement with an independent serial
+/// reference built from `op.matvec`.
+#[test]
+fn composite_penalty_parallel_prefix_matches_serial_bit_exact() {
+    let n_atoms = 8usize;
+    let p_a = 4usize; // left Kronecker factor dim
+    let p = 32usize; // identity-right width
+    let block = p_a * p; // 128
+    let k = n_atoms * block; // 1024 ≥ SCHUR_PROLOGUE_PARALLEL_K_MIN (512)
+    assert!(k >= SCHUR_PROLOGUE_PARALLEL_K_MIN, "must trip the parallel prefix");
+
+    // Deterministic pseudo-random SPD-ish left factors and input.
+    let mut state = 0x1234_5678u64;
+    let mut next = || {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((state >> 11) as f64) / ((1u64 << 53) as f64) * 2.0 - 1.0
+    };
+
+    let mut ops: Vec<Arc<dyn BetaPenaltyOp>> = Vec::with_capacity(n_atoms + 1);
+    for atom in 0..n_atoms {
+        let mut a = Array2::<f64>::zeros((p_a, p_a));
+        for v in a.iter_mut() {
+            *v = next();
+        }
+        ops.push(Arc::new(IdentityRightKroneckerPenaltyOp {
+            factor_a: a,
+            p,
+            global_offset: atom * block,
+            k,
+        }));
+    }
+    // Trailing dense op: a None-range tail that writes EVERY index, exercising
+    // the "prefix-parallel then serial-tail" accumulation order.
+    let mut dense = Array2::<f64>::zeros((k, k));
+    for v in dense.iter_mut() {
+        *v = next() * 0.01;
+    }
+    ops.push(Arc::new(DensePenaltyOp(dense)));
+
+    let x: Array1<f64> = Array1::from_iter((0..k).map(|_| next()));
+    let x_slice = x.as_slice().unwrap();
+
+    // Independent serial reference: sum each op through `op.matvec` in order.
+    let mut reference = vec![0.0_f64; k];
+    for op in &ops {
+        op.matvec(x_slice, &mut reference);
+    }
+
+    let composite = CompositePenaltyOp { k, ops };
+    let mut got = vec![0.0_f64; k];
+    composite.matvec(x_slice, &mut got);
+
+    assert_eq!(
+        got, reference,
+        "parallel-prefix composite matvec must be bit-identical to the serial sum"
+    );
+
+    // Running it again (accumulate contract) must also match a doubled serial ref.
+    let mut reference2 = reference.clone();
+    for op in &composite.ops {
+        op.matvec(x_slice, &mut reference2);
+    }
+    composite.matvec(x_slice, &mut got);
+    assert_eq!(
+        got, reference2,
+        "second accumulating matvec must remain bit-identical to serial"
+    );
+}

@@ -690,3 +690,99 @@ mod exact_stationarity_solve_1418_tests {
         );
     }
 }
+
+/// Validates the matrix-free Hutchinson stochastic-trace estimator that replaces
+/// the exact `Σ_k M_k·r_k`-solve per-atom decoder-smoothness effective-dof at
+/// massive `K` (the `O(K³·M·p)` wall). The estimator is exercised here on a
+/// small (`K = 2`) fixture — where the exact column-solve is the ground truth —
+/// so the block-restricted one-solve-per-probe identity
+/// `E[z_kᵀ (S_β⁻¹ M z)_k] = tr((S_β⁻¹)_{kk} M_k)` (including cross-atom
+/// cancellation, which only a `K ≥ 2` fixture can exhibit) is checked against the
+/// exact trace, plus determinism for a fixed seed.
+#[cfg(test)]
+mod smoothness_dof_hutchinson_tests {
+    use super::*;
+    use crate::manifold::tests::small_two_atom_periodic_term;
+
+    /// Rebuild the exact function's `(offsets, out_dim)` β-layout so the estimator
+    /// is fed the identical geometry.
+    fn beta_layout(term: &SaeManifoldTerm) -> (Vec<usize>, Box<dyn Fn(usize) -> usize>) {
+        let p = term.output_dim();
+        if term.frames_active() {
+            let ranks: Vec<usize> = term.atoms.iter().map(|a| a.border_frame_rank()).collect();
+            (term.factored_beta_offsets(), Box::new(move |k: usize| ranks[k]))
+        } else {
+            (term.beta_offsets(), Box::new(move |_k: usize| p))
+        }
+    }
+
+    #[test]
+    fn hutchinson_smoothness_dof_matches_exact_and_is_deterministic() {
+        let (mut term, target, rho) = small_two_atom_periodic_term();
+        let (_value, _loss, cache) = term
+            .reml_criterion_with_cache(target.view(), &rho, None, 40, 0.4, 1.0e-6, 1.0e-6)
+            .expect("converged cache for the two-atom fixture");
+        let lambda = rho.lambda_smooth_vec();
+
+        // Ground truth: the exact column-by-column trace (the `K < threshold`
+        // path this fixture actually takes).
+        let exact = term
+            .decoder_smoothness_effective_dof_per_atom(&cache, &lambda)
+            .expect("exact per-atom smoothness edof");
+        assert_eq!(exact.len(), 2, "two-atom fixture must return two edofs");
+
+        let (offsets, out_dim) = beta_layout(&term);
+        let solve = |rhs: ndarray::ArrayView1<'_, f64>| {
+            cache
+                .schur_inverse_apply(rhs)
+                .map_err(|e| format!("schur_inverse_apply: {e:?}"))
+        };
+
+        // Many probes so the Monte-Carlo band is tight enough to pin the math.
+        let probes = 6000;
+        let seed = 0xC0FFEE_1234;
+        let est = term
+            .decoder_smoothness_effective_dof_per_atom_hutchinson(
+                cache.k, &offsets, out_dim.as_ref(), &lambda, probes, seed, solve,
+            )
+            .expect("hutchinson per-atom smoothness edof");
+
+        // Total trace tr(S_β⁻¹ M) — the sum averages the per-atom variance, so it
+        // pins tightly to the exact total.
+        let exact_sum: f64 = exact.iter().sum();
+        let est_sum: f64 = est.iter().sum();
+        assert!(
+            (est_sum - exact_sum).abs() <= 0.03 * exact_sum.abs().max(1.0e-3),
+            "hutchinson total edof {est_sum:.6} vs exact {exact_sum:.6}"
+        );
+
+        // Per-atom: looser Monte-Carlo band (per-atom carries the cross-atom
+        // coupling variance), but tight enough that a block-indexing bug — which
+        // would scramble the per-atom split by O(1) — cannot pass.
+        for k in 0..2 {
+            assert!(
+                (est[k] - exact[k]).abs() <= 0.10 * exact[k].abs().max(1.0e-2) + 0.05,
+                "atom {k}: hutchinson edof {:.6} vs exact {:.6}",
+                est[k],
+                exact[k]
+            );
+        }
+
+        // Determinism: a second run with the SAME seed is bit-identical (the REML
+        // outer-loop reproducibility contract).
+        let solve2 = |rhs: ndarray::ArrayView1<'_, f64>| {
+            cache
+                .schur_inverse_apply(rhs)
+                .map_err(|e| format!("schur_inverse_apply: {e:?}"))
+        };
+        let est2 = term
+            .decoder_smoothness_effective_dof_per_atom_hutchinson(
+                cache.k, &offsets, out_dim.as_ref(), &lambda, probes, seed, solve2,
+            )
+            .expect("hutchinson rerun");
+        assert_eq!(
+            est, est2,
+            "hutchinson smoothness edof must be bit-reproducible for a fixed seed"
+        );
+    }
+}

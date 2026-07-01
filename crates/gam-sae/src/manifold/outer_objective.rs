@@ -1276,23 +1276,6 @@ impl SaeManifoldOuterObjective {
             // whole fit (the indefinite basin is adjacent to the PD optimum, so
             // line searches WILL overshoot into it).
             || err.contains("cross-row IBP joint Hessian is non-PD at this ρ")
-            // #1782 — a non-PD SCHUR COMPLEMENT at a probed ρ (near-collinear
-            // decoders / degenerate assignment weighting: the K>1 softmax /
-            // jumprelu / euclidean / linear seed geometry) leaves the reduced
-            // joint Hessian indefinite, so its Cholesky (`ArrowSchurError::
-            // SchurFactorFailed`, formatted `"arrow-Schur: Schur complement
-            // Cholesky failed: … not positive definite"`) fails and the Laplace
-            // evidence log-det is undefined THERE. This is the SAME infeasible-ρ
-            // class as the per-row / cross-row non-PD refusals above — genuinely
-            // infeasible, not a hard solver defect — so the outer optimizer must
-            // read it as +∞ and steer back into the PD region rather than reject
-            // EVERY candidate seed ("no candidate seeds passed outer startup
-            // validation"). The ibp_map+circle seed lands in the PD region and
-            // never trips this, which is why it converged on identical data. A
-            // shape/dimension/non-finite defect is a DIFFERENT message and is not
-            // matched here, so real invariant violations still surface.
-            || (err.contains("Schur complement Cholesky failed")
-                && err.contains("not positive definite"))
     }
 
     /// Shared cost path: evaluate the REML criterion at `rho_flat`, updating
@@ -1437,27 +1420,7 @@ impl SaeManifoldOuterObjective {
         {
             self.term.set_flat_beta(beta.view())?;
         }
-        // #1782 — the Fellner–Schall (EFS) lane is the SAE outer solver's seed
-        // VALIDATION surface (`run_fixed_point_outer_solver` → `eval_efs` →
-        // `efs_step`), and it factors the SAME dense evidence Hessian as the
-        // gradient lane. At a seed ρ the off-optimum inner state of a K>1 softmax /
-        // jumprelu row-sharing fit (or a rank-deficient euclidean / linear decoder)
-        // can leave a per-row `H_tt` block non-PD, so `reml_criterion_with_cache`
-        // returns the recoverable "inner did not converge / non-PD per-row H_tt /
-        // cross-row IBP non-PD" refusal that `is_recoverable_value_probe_refusal`
-        // already classifies as an INFEASIBLE-ρ probe. The evidence Laplace log-det
-        // is undefined there — the point is genuinely infeasible, not a hard solver
-        // defect — so, exactly as the value-only `eval_cost` lane (→ +∞) and the
-        // gradient lane (→ `OuterEval::infeasible`) already do, it must present to
-        // the fixed-point solver as a FINITE infeasibility WALL with a NO-OP step
-        // (`SAE_FIT_DATA_COLLAPSE_COST`, zero step, no β warm-start), never a hard
-        // error. Propagating it rejected EVERY candidate seed →
-        // "no candidate seeds passed outer startup validation" — the exact bug this
-        // fixes — while the ibp_map+circle seed lands in the PD region and never
-        // hits this arm, which is why it converged on identical data. A
-        // NON-recoverable failure (a real factorization / invariant defect) still
-        // propagates as a hard error.
-        let (cost, loss, cache) = match self.term.reml_criterion_with_cache(
+        let (cost, loss, cache) = self.term.reml_criterion_with_cache(
             self.target.view(),
             &rho,
             self.registry.as_ref(),
@@ -1465,23 +1428,7 @@ impl SaeManifoldOuterObjective {
             self.learning_rate,
             self.ridge_ext_coord,
             self.ridge_beta,
-        ) {
-            Ok(evaluated) => evaluated,
-            Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
-                self.current_rho = rho.clone();
-                let n_params = rho.to_flat().len();
-                return Ok(EfsEval {
-                    cost: SAE_FIT_DATA_COLLAPSE_COST,
-                    steps: vec![0.0_f64; n_params],
-                    beta: None,
-                    psi_gradient: None,
-                    psi_indices: None,
-                    inner_hessian_scale: None,
-                    logdet_enclosure_gap: None,
-                });
-            }
-            Err(err) => return Err(err),
-        };
+        )?;
         self.current_rho = rho.clone();
         let dispersion = self
             .term
@@ -1689,42 +1636,18 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // needs only the analytic traces `tr(H⁻¹ S_c)` — no gradient, and (per
         // SPEC) no finite differences. So this dense-cache path is reached only
         // when the dense evidence factor is admitted.
-        // #1782 — the dense-admitted evidence path can hit an INFEASIBLE ρ probe
-        // exactly as the streaming branch above and the value-only `eval_cost`
-        // lane do: at a seed ρ the off-optimum inner state of a K>1 softmax /
-        // jumprelu row-sharing fit (or a rank-deficient euclidean / linear decoder)
-        // can leave a per-row `H_tt` block non-PD, so `reml_criterion_with_cache`
-        // returns the SAME recoverable "inner did not converge / non-PD per-row
-        // H_tt / cross-row IBP non-PD" refusal that `is_recoverable_value_probe_
-        // refusal` already classifies as an infeasible-ρ probe. The evidence
-        // Laplace log-det is undefined there — the point is genuinely INFEASIBLE,
-        // not a hard solver defect — so it must be handed to the outer optimizer as
-        // an infeasible wall (a rejectable step to backtrack from), never propagated
-        // as a fatal `RemlOptimizationFailed`. Propagating it aborted the WHOLE
-        // outer optimisation: the generic seed startup-VALIDATION probes this
-        // gradient lane, and a hard error rejected EVERY candidate seed →
-        // "no candidate seeds passed outer startup validation". The ibp_map+circle
-        // seed lands in the PD region and never hits this arm, which is exactly why
-        // it converged where the other assignments/topologies failed on identical
-        // data. Feasible seeds (finite cost) are byte-for-byte unchanged; only the
-        // genuinely-infeasible refusal now routes to the same `infeasible` sentinel
-        // the other two lanes already use. A NON-recoverable failure (a real
-        // factorization / invariant defect) still propagates as a hard error.
-        let (cost, loss, cache) = match self.term.reml_criterion_with_cache(
-            self.target.view(),
-            &rho_state,
-            self.registry.as_ref(),
-            self.inner_max_iter,
-            self.learning_rate,
-            self.ridge_ext_coord,
-            self.ridge_beta,
-        ) {
-            Ok(evaluated) => evaluated,
-            Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
-                return Ok(OuterEval::infeasible(rho.len()));
-            }
-            Err(err) => return Err(EstimationError::RemlOptimizationFailed(err)),
-        };
+        let (cost, loss, cache) = self
+            .term
+            .reml_criterion_with_cache(
+                self.target.view(),
+                &rho_state,
+                self.registry.as_ref(),
+                self.inner_max_iter,
+                self.learning_rate,
+                self.ridge_ext_coord,
+                self.ridge_beta,
+            )
+            .map_err(EstimationError::RemlOptimizationFailed)?;
         // #1273 — the analytic outer gradient is built from the undamped joint
         // Hessian via `outer_gradient_arrow_solver`, whose Faddeev-Popov gauge
         // deflation recovers near-null directions that lie in the closed-form

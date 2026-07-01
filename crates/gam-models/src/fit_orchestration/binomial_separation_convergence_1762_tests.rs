@@ -55,8 +55,9 @@ impl log::Log for StderrLogger {
 static DIAG_LOGGER: StderrLogger = StderrLogger;
 fn install_diag_logger() {
     if std::env::var("DIAG_1762_LOG").is_ok() {
-        let _ = log::set_logger(&DIAG_LOGGER);
-        log::set_max_level(log::LevelFilter::Debug);
+        if log::set_logger(&DIAG_LOGGER).is_ok() {
+            log::set_max_level(log::LevelFilter::Debug);
+        }
     }
 }
 
@@ -96,62 +97,6 @@ fn binomial_near_separation_diagnostic_1762() {
                     elapsed.as_secs_f64()
                 );
             }
-        }
-    }
-}
-
-/// Load a 2-column (x,y) CSV produced by the exact numpy repro so we can fit
-/// the *identical* dataset the issue reports (isolating data-vs-config).
-fn load_xy_csv(path: &str) -> Option<gam_data::EncodedDataset> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let mut lines = text.lines();
-    let header = lines.next()?;
-    let headers: Vec<String> = header.split(',').map(|s| s.trim().to_string()).collect();
-    let mut rows = Vec::new();
-    for line in lines {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let fields: Vec<String> = line.split(',').map(|s| s.trim().to_string()).collect();
-        rows.push(StringRecord::from(fields));
-    }
-    encode_recordswith_inferred_schema(headers, rows).ok()
-}
-
-/// Data-vs-config isolation: fit the EXACT numpy repro data (dumped to
-/// `/tmp/sep_n{800,3200}.csv`) through `fit_from_formula`. If the stall is
-/// data-driven this reproduces it; if config-driven it converges (proving the
-/// difference is the Python-layer FitConfig, not the sample). Skips silently
-/// when the CSV is absent so CI without the fixture stays green.
-#[test]
-fn binomial_exact_numpy_data_diagnostic_1762() {
-    install_diag_logger();
-    for path in ["/tmp/sep_n800.csv", "/tmp/sep_n3200.csv"] {
-        let Some(ds) = load_xy_csv(path) else {
-            eprintln!("#1762 exact-data: {path} absent, skipping");
-            continue;
-        };
-        let cfg = FitConfig {
-            family: Some("binomial".to_string()),
-            ..FitConfig::default()
-        };
-        let t0 = std::time::Instant::now();
-        let result = fit_from_formula("y ~ smooth(x)", &ds, &cfg);
-        let elapsed = t0.elapsed();
-        match result {
-            Ok(FitResult::Standard(StandardFitResult { fit, .. })) => {
-                let edf = fit.edf_total().unwrap_or(f64::NAN);
-                eprintln!(
-                    "#1762 exact-data {path}: OK elapsed={:.2}s edf={edf:.2} converged={}",
-                    elapsed.as_secs_f64(),
-                    fit.outer_converged
-                );
-            }
-            Ok(_) => eprintln!("#1762 exact-data {path}: unexpected non-Standard result"),
-            Err(e) => eprintln!(
-                "#1762 exact-data {path}: ERROR after {:.2}s: {e}",
-                elapsed.as_secs_f64()
-            ),
         }
     }
 }

@@ -963,7 +963,16 @@ impl SaeResidentReducedSchur {
         if support.is_empty() {
             return;
         }
+        // Slice `x`/`acc` ONCE so the per-support gather/scatter (the dominant
+        // `support·p` terms for wide active support) run over contiguous `f64`
+        // slices — the compiler can prove unit stride and emit vectorized FMA,
+        // where the former `x[base+j]`/`acc[base+j]` ndarray element indexing
+        // forced a per-element strided lookup + bounds check that blocked
+        // autovectorization. Every accumulation order is unchanged, so the
+        // result is bit-identical to the ndarray-indexed form.
+        let x_slice = x.as_slice().expect("resident matvec x must be contiguous");
         // P_i x = Σ_s φ_s · x[base_s .. base_s+p]   (length p).
+        let gather = &mut gather[..p];
         for v in gather.iter_mut() {
             *v = 0.0;
         }
@@ -971,16 +980,17 @@ impl SaeResidentReducedSchur {
             if phi == 0.0 {
                 continue;
             }
-            for j in 0..p {
-                gather[j] += phi * x[base + j];
+            let xrow = &x_slice[base..base + p];
+            for (g, &xv) in gather.iter_mut().zip(xrow) {
+                *g += phi * xv;
             }
         }
         // w = Y_i · (P_i x)   (di × p GEMV → length di).  Y_i row-major di×p.
         for r in 0..di {
             let yrow = &rf.y[r * p..r * p + p];
             let mut s = 0.0_f64;
-            for c in 0..p {
-                s += yrow[c] * gather[c];
+            for (&yv, &gv) in yrow.iter().zip(gather.iter()) {
+                s += yv * gv;
             }
             w[r] = s;
         }
@@ -989,23 +999,26 @@ impl SaeResidentReducedSchur {
         // `L_i` is the shared `local_jac[row]` slab (#1033) — byte-for-byte the
         // former per-row `rf.l` copy.
         let l_i = &self.local_jac[row];
-        for v in prod.iter_mut().take(p) {
+        let prod = &mut prod[..p];
+        for v in prod.iter_mut() {
             *v = 0.0;
         }
         for r in 0..di {
             let lrow = &l_i[r * p..r * p + p];
             let wr = w[r];
-            for j in 0..p {
-                prod[j] += lrow[j] * wr;
+            for (pj, &lj) in prod.iter_mut().zip(lrow) {
+                *pj += lj * wr;
             }
         }
         // acc += P_iᵀ prod = scatter φ_s · prod into base_s blocks.
+        let acc_slice = acc.as_slice_mut().expect("resident matvec acc must be contiguous");
         for &(base, phi) in support {
             if phi == 0.0 {
                 continue;
             }
-            for j in 0..p {
-                acc[base + j] += phi * prod[j];
+            let arow = &mut acc_slice[base..base + p];
+            for (a, &pv) in arow.iter_mut().zip(prod.iter()) {
+                *a += phi * pv;
             }
         }
     }

@@ -195,6 +195,33 @@ pub trait BetaPenaltyOp: Send + Sync {
     /// rather than the full `K×K` dense form, which would defeat the structured
     /// operator's storage savings.
     fn fingerprint(&self, hasher: &mut Fingerprinter);
+
+    /// If this operator writes its `matvec` contribution into EXACTLY one
+    /// contiguous output range `[start, end)` and touches no other index,
+    /// return that range; otherwise `None` (the default — opaque / scattered
+    /// output). This lets [`CompositePenaltyOp::matvec`] fan a leading run of
+    /// mutually-disjoint operators across rayon workers, each writing its own
+    /// output sub-slice with no cross-thread aliasing. The per-atom Kronecker
+    /// smooth penalties (the SAE prologue's serial Amdahl ceiling at the K=32k
+    /// manifold border) each cover one atom's β block, so they qualify.
+    fn output_range(&self) -> Option<Range<usize>> {
+        None
+    }
+
+    /// Accumulate `matvec`'s contribution into `y_local`, where `y_local[i]`
+    /// aliases global output index `output_range().start + i` (so
+    /// `y_local.len() == output_range().len()`), reading the FULL-length input
+    /// `x`. ONLY valid when [`Self::output_range`] returns `Some`; the default
+    /// panics because a `None`-range operator has no single contiguous slice to
+    /// write into. Must be BIT-IDENTICAL to the corresponding indices of
+    /// `matvec` (same per-index accumulation order) so the composite's parallel
+    /// prefix reproduces the serial result exactly.
+    fn matvec_local(&self, _x: &[f64], _y_local: &mut [f64]) {
+        unreachable!(
+            "matvec_local requires output_range() == Some; \
+             a None-range BetaPenaltyOp must be applied through matvec"
+        );
+    }
 }
 
 /// Dense fallback: wraps the existing `K×K` `H_ββ` accumulator.
@@ -401,6 +428,37 @@ impl BetaPenaltyOp for KroneckerPenaltyOp {
         }
     }
 
+    fn output_range(&self) -> Option<Range<usize>> {
+        let off = self.global_offset;
+        Some(off..off + self.factor_a.nrows() * self.factor_b.nrows())
+    }
+
+    fn matvec_local(&self, x: &[f64], y_local: &mut [f64]) {
+        // Byte-for-byte the `matvec` arithmetic with the output written at the
+        // LOCAL index `i_a·p_b + i_b` (== global `gi - off`), so the composite
+        // can apply this block into its own `y[off..off+p_a·p_b]` sub-slice in
+        // parallel. Per-index accumulation order is unchanged ⇒ bit-identical.
+        let p_a = self.factor_a.nrows();
+        let p_b = self.factor_b.nrows();
+        let off = self.global_offset;
+        for i_a in 0..p_a {
+            for i_b in 0..p_b {
+                let li = i_a * p_b + i_b;
+                let mut acc = 0.0_f64;
+                for j_a in 0..p_a {
+                    let a_ij = self.factor_a[[i_a, j_a]];
+                    if a_ij == 0.0 {
+                        continue;
+                    }
+                    for j_b in 0..p_b {
+                        acc += a_ij * self.factor_b[[i_b, j_b]] * x[off + j_a * p_b + j_b];
+                    }
+                }
+                y_local[li] += acc;
+            }
+        }
+    }
+
     fn gradient(&self, beta: &[f64], out: &mut [f64]) {
         let p_a = self.factor_a.nrows();
         let p_b = self.factor_b.nrows();
@@ -537,6 +595,36 @@ impl BetaPenaltyOp for IdentityRightKroneckerPenaltyOp {
                     acc += a_ij * x[off + j_a * p + i_b];
                 }
                 y[gi] += acc;
+            }
+        }
+    }
+
+    fn output_range(&self) -> Option<Range<usize>> {
+        let off = self.global_offset;
+        Some(off..off + self.factor_a.nrows() * self.p)
+    }
+
+    fn matvec_local(&self, x: &[f64], y_local: &mut [f64]) {
+        // Byte-for-byte the `matvec` inner arithmetic, but the output writes to
+        // the LOCAL index `i_a·p + i_b` (== global `gi - off`) so the composite
+        // can hand this operator its own `y[off..off+p_a·p]` sub-slice. The
+        // per-index accumulation order over `j_a` is unchanged, so the result is
+        // bit-identical to `matvec`.
+        let p_a = self.factor_a.nrows();
+        let p = self.p;
+        let off = self.global_offset;
+        for i_a in 0..p_a {
+            for i_b in 0..p {
+                let li = i_a * p + i_b;
+                let mut acc = 0.0_f64;
+                for j_a in 0..p_a {
+                    let a_ij = self.factor_a[[i_a, j_a]];
+                    if a_ij == 0.0 {
+                        continue;
+                    }
+                    acc += a_ij * x[off + j_a * p + i_b];
+                }
+                y_local[li] += acc;
             }
         }
     }
@@ -1272,8 +1360,70 @@ impl BetaPenaltyOp for CompositePenaltyOp {
     }
 
     fn matvec(&self, x: &[f64], y: &mut [f64]) {
-        for op in &self.ops {
-            op.matvec(x, y);
+        // The reduced-Schur PCG matvec applies this composite ONCE PER CG
+        // ITERATION as the penalty prologue `y += (H_ββ) x`. At the K=32k
+        // manifold-SAE border the composite is a leading run of per-atom
+        // Kronecker smooth penalties (`λ S_k ⊗ I_{r_k}`, one per atom, over
+        // DISJOINT β blocks) followed by the cross-atom data-fit op and any
+        // dense analytic tail — and this whole sum ran SERIALLY while the
+        // point-elimination row term already fanned across all cores, so it was
+        // the prologue's Amdahl ceiling on the wide border.
+        //
+        // Fan the leading run of mutually-disjoint, sorted, contiguous-or-gapped
+        // output-range operators across rayon workers: each writes ONLY its own
+        // `y[start..end]` sub-slice (no cross-thread aliasing), then the
+        // remaining (`None`-range / overlapping) operators run SERIALLY in
+        // original order. Because every prefix index is touched by exactly one
+        // prefix operator and all prefix work happens-before the serial tail,
+        // each output index accumulates in the SAME order as the fully-serial
+        // loop — the result is BIT-IDENTICAL, not merely deterministic. Stay
+        // serial when already inside a rayon worker (the topology race / nested
+        // matvec) to avoid oversubscription — the same guard the row loop uses.
+        let mut prefix_len = 0usize;
+        let mut prev_end = 0usize;
+        if rayon::current_thread_index().is_none() {
+            for op in &self.ops {
+                match op.output_range() {
+                    Some(r) if r.start >= prev_end && r.end > r.start && r.end <= y.len() => {
+                        prev_end = r.end;
+                        prefix_len += 1;
+                    }
+                    _ => break,
+                }
+            }
+        }
+        // Only worth the fan-out when there is real disjoint work: at least two
+        // blocks and a covered width past the same border threshold the dense
+        // prologue uses. Otherwise fall through to the plain serial sum.
+        if prefix_len >= 2 && prev_end >= SCHUR_PROLOGUE_PARALLEL_K_MIN {
+            use rayon::prelude::*;
+            // Carve `y` into one mutable sub-slice per prefix operator, skipping
+            // any gaps between ranges. Sorted, non-overlapping ranges make this
+            // a single left-to-right walk of `split_at_mut`.
+            let mut subslices: Vec<&mut [f64]> = Vec::with_capacity(prefix_len);
+            {
+                let mut consumed = 0usize;
+                let mut rest: &mut [f64] = y;
+                for op in &self.ops[..prefix_len] {
+                    let r = op.output_range().expect("prefix op has an output range");
+                    let (_, after_gap) = rest.split_at_mut(r.start - consumed);
+                    let (block, tail) = after_gap.split_at_mut(r.end - r.start);
+                    subslices.push(block);
+                    rest = tail;
+                    consumed = r.end;
+                }
+            }
+            self.ops[..prefix_len]
+                .par_iter()
+                .zip(subslices.par_iter_mut())
+                .for_each(|(op, y_local)| op.matvec_local(x, y_local));
+            for op in &self.ops[prefix_len..] {
+                op.matvec(x, y);
+            }
+        } else {
+            for op in &self.ops {
+                op.matvec(x, y);
+            }
         }
     }
 

@@ -229,7 +229,11 @@ current_free_gb() {
     inact=$(awk '/Pages inactive/{gsub(/\./,"",$3);print $3}' <<<"$stats")
     spec=$(awk '/Pages speculative/{gsub(/\./,"",$3);print $3}' <<<"$stats")
     [[ -z "$free" ]] && return 1
-    echo $(( ( ( ${free:-0} + ${inact:-0} + ${spec:-0} ) * pg ) / 1073741824 )); return 0
+    # Round to the NEAREST GiB (add 0.5 GiB before the integer divide) instead of
+    # truncating: a box with 2.9 GiB available truncated to "2" and, with the
+    # default need=3, waited the full GAM_MEM_WAIT_MAX every build for RAM it
+    # already had. Rounding reports 3 and proceeds.
+    echo $(( ( ( ${free:-0} + ${inact:-0} + ${spec:-0} ) * pg + 536870912 ) / 1073741824 )); return 0
   elif [[ -r /proc/meminfo ]]; then
     awk '/MemAvailable/{print int($2/1048576); f=1} END{exit !f}' /proc/meminfo; return $?
   fi
@@ -471,7 +475,11 @@ run_request() {
 if [[ "${1:-}" == "maturin" ]]; then
   shift
   if command -v sccache >/dev/null 2>&1 && [[ -z "${GAM_NO_SCCACHE:-}" ]]; then
-    export RUSTC_WRAPPER="$(command -v sccache)"   # CARGO_INCREMENTAL already 0 above
+    # sccache FORBIDS incremental; the top-of-file default is CARGO_INCREMENTAL=1
+    # and the =0 override only runs in the cargo-lane sccache block, NOT here — so
+    # the maturin lane must zero it itself or `maturin develop` dies with
+    # "sccache: incremental compilation is prohibited".
+    export RUSTC_WRAPPER="$(command -v sccache)" CARGO_INCREMENTAL=0
   fi
   REQ="maturin develop --release $*"
   CMD=(maturin develop --release "$@")
