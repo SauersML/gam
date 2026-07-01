@@ -225,17 +225,22 @@ fn guard_untrusted_edf_collapse(
     // `UnifiedFitResult::rescale_estimated_dispersion` afterwards, so the two
     // redundant covariance representations can never drift apart (#1789).
     let mut pending_var_ratio = 1.0_f64;
+    // Reporting state hoisted out of the `inference` borrow so the single
+    // non-convergence warning can be emitted AFTER the dispersion rescale below
+    // and thus quote the σ̂ ratio that rescale actually applied.
+    let mut corrected_any = false;
+    let mut correction_note = String::new();
+    let edf_total_before;
+    let mut corrected_total = 0.0_f64;
     {
     let Some(inference) = fit.inference.as_mut() else {
         return;
     };
-    let edf_total_before = inference.edf_total;
+    edf_total_before = inference.edf_total;
     // Penalty-block cursor walks the summary block order: random-effect ranges
     // first, then smooth terms (mirrors `smooth_term_lr_inference_forspec` and the
     // `build_model_summary` per-term EDF walk).
     let mut penalty_cursor = design.random_effect_ranges.len();
-    let mut corrected_any = false;
-    let mut correction_note = String::new();
     // Running change to `Σ edf_by_block`. `edf_total` carries an additional
     // `mp = p − Σ rank_k` offset for the UNPENALIZED columns (e.g. the intercept),
     // so it is NOT `Σ edf_by_block`; applying the same delta preserves that offset.
@@ -297,7 +302,7 @@ fn guard_untrusted_edf_collapse(
         // so `per_term_edf` reports the SAME corrected additive value (its
         // resolution prefers `F` when present).
         inference.edf_total += edf_delta;
-        let corrected_total = inference.edf_total;
+        corrected_total = inference.edf_total;
         inference.coefficient_influence = None;
 
         // Keep the estimated dispersion consistent with the corrected effective
@@ -316,15 +321,10 @@ fn guard_untrusted_edf_collapse(
         let denom_old = (n_obs as f64 - edf_total_before).max(1.0);
         let denom_new = (n_obs as f64 - corrected_total).max(1.0);
         pending_var_ratio = denom_old / denom_new;
-        log::warn!(
-            "[edf#1788] outer REML did not converge (railed smoothing parameters); the \
-             influence EDF collapsed to the intercept-only floor while the fitted \
-             coefficients remain wiggly. Substituted the per-term dimension floor so the \
-             reported EDF is not self-contradictory (edf_total {edf_total_before:.3}->\
-             {corrected_total:.3}).{correction_note} The fit is NON-CONVERGED (see #1762); \
-             treat its inference accordingly."
-        );
     }
+    }
+    if !corrected_any {
+        return;
     }
     // Apply the dispersion rescale outside the `inference` borrow, through the
     // single invariant-preserving method: it scales `σ̂`, both top-level
@@ -334,7 +334,25 @@ fn guard_untrusted_edf_collapse(
     // so the returned model still passes `validate()` on predict/summary/load
     // (#1789); the previous inline rescale updated only the inference block and
     // produced an unusable model.
-    let _ = fit.rescale_estimated_dispersion(pending_var_ratio);
+    //
+    // The method returns the σ̂ ratio it applied: `√pending_var_ratio` for an
+    // estimated-scale fit whose SEs/covariance genuinely moved, or exactly `1.0`
+    // for a fixed-scale family (`φ ≡ 1`) whose covariance does not embed σ̂² and
+    // so must not move under an EDF change. Reporting that factor makes the
+    // downstream consequence of the correction — that the returned standard
+    // errors were rescaled, and by how much — explicit in the non-convergence
+    // warning instead of leaving it silent.
+    let sigma_ratio = fit.rescale_estimated_dispersion(pending_var_ratio);
+    log::warn!(
+        "[edf#1788] outer REML did not converge (railed smoothing parameters); the \
+         influence EDF collapsed to the intercept-only floor while the fitted \
+         coefficients remain wiggly. Substituted the per-term dimension floor so the \
+         reported EDF is not self-contradictory (edf_total {edf_total_before:.3}->\
+         {corrected_total:.3}).{correction_note} Standard errors and covariance rescaled \
+         by ×{sigma_ratio:.4} to keep σ̂² = RSS/(n − edf_total) consistent with the \
+         corrected effective d.f. The fit is NON-CONVERGED (see #1762); treat its \
+         inference accordingly."
+    );
 }
 
 /// Read-only per-term EDF over `coeff_range` from a [`FitInference`], mirroring
