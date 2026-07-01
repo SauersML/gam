@@ -258,6 +258,13 @@ impl gam_problem::HyperOperator for RowCoeffOperator {
             // r[a] += coeff ⊙ u[b]; if a != b also r[b] += coeff ⊙ u[a].
             // Split the borrow so r[a] and r[b] (or u[a] and u[b]) can be
             // accessed simultaneously when a != b.
+            // These per-row `r += c ⊙ u` updates are memory-bandwidth-bound
+            // O(n) saxpys. Fanning each one out over Rayon is a net loss: the
+            // real arithmetic is the design matvecs (`fast_av`/`fast_atv`,
+            // already faer-parallel), and `to_dense` calls `mul_vec` `dim`
+            // times, so a per-call Rayon fan-out here spends almost all its
+            // wall time in join/latch thread-sync rather than the saxpy (#1720).
+            // Run them serially.
             if a == b {
                 let u_a = u[a]
                     .as_slice()
@@ -265,11 +272,9 @@ impl gam_problem::HyperOperator for RowCoeffOperator {
                 let r_a = r[a]
                     .as_slice_mut()
                     .expect("RowCoeffOperator r must be contiguous");
-                use rayon::prelude::*;
-                r_a.par_iter_mut()
-                    .zip(coeff.par_iter())
-                    .zip(u_a.par_iter())
-                    .for_each(|((r, c), u)| *r += c * u);
+                for ((r, c), u) in r_a.iter_mut().zip(coeff.iter()).zip(u_a.iter()) {
+                    *r += c * u;
+                }
             } else {
                 let (r_a_slice, r_b_slice) = if a < b {
                     let (left, right) = r.split_at_mut(b);
@@ -286,17 +291,16 @@ impl gam_problem::HyperOperator for RowCoeffOperator {
                 };
                 let u_a = u[a].as_slice().expect("contiguous");
                 let u_b = u[b].as_slice().expect("contiguous");
-                use rayon::prelude::*;
-                r_a_slice
-                    .par_iter_mut()
-                    .zip(r_b_slice.par_iter_mut())
-                    .zip(coeff.par_iter())
-                    .zip(u_a.par_iter())
-                    .zip(u_b.par_iter())
-                    .for_each(|((((ra, rb), c), ua), ub)| {
-                        *ra += c * ub;
-                        *rb += c * ua;
-                    });
+                for ((((ra, rb), c), ua), ub) in r_a_slice
+                    .iter_mut()
+                    .zip(r_b_slice.iter_mut())
+                    .zip(coeff.iter())
+                    .zip(u_a.iter())
+                    .zip(u_b.iter())
+                {
+                    *ra += c * ub;
+                    *rb += c * ua;
+                }
             }
         }
 
@@ -330,9 +334,35 @@ impl gam_problem::HyperOperator for RowCoeffOperator {
     }
 
     fn to_dense(&self) -> Array2<f64> {
-        // Build by basis-vector probing — small-K materialization path.
+        // Assemble the dense operator directly from its `Σ X_aᵀ diag(c_ab) X_b`
+        // structure instead of probing `dim` basis columns through `mul_vec`
+        // (#1720). Basis probing runs `dim` matvecs on every channel design —
+        // `O(dim · n · Σ p_b)` — and re-forms the same block Grams `dim` times;
+        // the direct form computes each `p_a × p_b` block once as a single
+        // weighted `Xᵀ(diag(c) X)` gemm, cutting both the matmul FLOPs and the
+        // per-`mul_vec` scratch/latch traffic. The result is identical column
+        // for column: `mul_vec(e_j)` is exactly column `j` of this matrix.
         let mut out = Array2::<f64>::zeros((self.dim, self.dim));
-        self.mul_basis_columns_into(0, out.view_mut());
+        for pair in &self.pair_coeffs {
+            let ch_a = &self.channels[pair.a];
+            let ch_b = &self.channels[pair.b];
+            let oa = self.block_offsets[ch_a.block];
+            let wa = self.block_widths[ch_a.block];
+            let ob = self.block_offsets[ch_b.block];
+            let wb = self.block_widths[ch_b.block];
+            // block = X_aᵀ diag(coeff) X_b, formed by scaling each row i of X_b
+            // by coeff[i] then a single AᵀB gemm.
+            let coeff_col = pair.coeff.view().insert_axis(Axis(1));
+            let weighted_b = &(*ch_b.design.as_ref()) * &coeff_col;
+            let block = gam_linalg::faer_ndarray::fast_atb(ch_a.design.as_ref(), &weighted_b);
+            let mut dst_ab = out.slice_mut(s![oa..oa + wa, ob..ob + wb]);
+            dst_ab += &block;
+            if pair.a != pair.b {
+                // X_bᵀ diag(coeff) X_a is the transpose of the block above.
+                let mut dst_ba = out.slice_mut(s![ob..ob + wb, oa..oa + wa]);
+                dst_ba += &block.t();
+            }
+        }
         out
     }
 
@@ -920,4 +950,119 @@ pub(crate) fn make_two_block_design_row_coeff_operator(
         nrows,
         pa,
     })
+}
+
+#[cfg(test)]
+mod to_dense_direct_1720_tests {
+    use super::*;
+    use gam_problem::HyperOperator;
+    use std::time::Instant;
+
+    /// Deterministic, allocation-free pseudo-random value in `[-1, 1)` keyed by
+    /// `(i, j, salt)` — a splitmix64 finaliser over a mixed index. Gives every
+    /// test run identical designs/coefficients without an RNG dependency.
+    fn pseudo(i: usize, j: usize, salt: u64) -> f64 {
+        let mut z = (i as u64)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (j as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+            ^ salt.wrapping_mul(0x1656_67B1_9E37_79F9);
+        z ^= z >> 30;
+        z = z.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z ^= z >> 27;
+        z = z.wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        (z as f64 / u64::MAX as f64) * 2.0 - 1.0
+    }
+
+    /// A two-block Gaussian-location-scale-shaped row-coefficient operator:
+    /// designs `X_mu (n×pa)`, `X_ls (n×pb)`, and the three symmetric per-row
+    /// pair coefficients `(0,0)`, `(0,1)`, `(1,1)` — the exact channel/pair
+    /// layout `GaussianLocationScaleHessianWorkspace` builds for the outer
+    /// Hessian correction.
+    fn build_op(n: usize, pa: usize, pb: usize) -> RowCoeffOperator {
+        let x_a = Arc::new(Array2::from_shape_fn((n, pa), |(i, j)| pseudo(i, j, 1)));
+        let x_b = Arc::new(Array2::from_shape_fn((n, pb), |(i, j)| pseudo(i, j, 2)));
+        let c_aa = Array1::from_shape_fn(n, |i| 0.5 + 0.25 * pseudo(i, 0, 3).abs());
+        let c_ab = Array1::from_shape_fn(n, |i| pseudo(i, 0, 4));
+        let c_bb = Array1::from_shape_fn(n, |i| 0.5 + 0.25 * pseudo(i, 0, 5).abs());
+        RowCoeffOperator::from_directions(
+            vec![pa, pb],
+            vec![(0, x_a), (1, x_b)],
+            vec![(0, 0, c_aa), (0, 1, c_ab), (1, 1, c_bb)],
+            n,
+        )
+    }
+
+    /// The direct block-Gram `to_dense` (#1720) must be identical, column for
+    /// column, to the basis-vector-probing reference it replaced: column `j` of
+    /// the dense operator is exactly `mul_vec(e_j)`. This is an independent code
+    /// path (per-column matvec) from the direct `X_aᵀ diag(c) X_b` assembly, so
+    /// agreement pins the fast path's correctness, not a value against itself.
+    #[test]
+    fn to_dense_matches_basis_probe_reference_1720() {
+        let op = build_op(257, 5, 4);
+        let direct = op.to_dense();
+        let dim = op.dim();
+        let mut reference = Array2::<f64>::zeros((dim, dim));
+        for j in 0..dim {
+            let mut e = Array1::<f64>::zeros(dim);
+            e[j] = 1.0;
+            reference.column_mut(j).assign(&op.mul_vec(&e));
+        }
+        let max_abs = direct
+            .iter()
+            .zip(reference.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        let scale = reference
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0_f64, f64::max)
+            .max(1.0);
+        assert!(
+            max_abs <= 1e-9 * scale,
+            "direct to_dense diverged from the basis-probe reference: max_abs={max_abs} scale={scale}"
+        );
+    }
+
+    /// Best-of-`blocks` mean per-call `to_dense` wall time at `n` rows.
+    fn per_call_secs(n: usize, pa: usize, pb: usize) -> f64 {
+        let op = build_op(n, pa, pb);
+        for _ in 0..3 {
+            std::hint::black_box(op.to_dense());
+        }
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let reps = 20;
+            let t0 = Instant::now();
+            for _ in 0..reps {
+                std::hint::black_box(op.to_dense());
+            }
+            best = best.min(t0.elapsed().as_secs_f64() / reps as f64);
+        }
+        best
+    }
+
+    /// Root cause of #1720: the outer-Hessian correction densified the joint
+    /// row-coefficient operator by probing `dim` basis vectors through
+    /// `mul_vec`, so each `to_dense` cost `O(dim · n · Σ p_b)` and — because a
+    /// plain Gaussian REML is ~flat in n — the location-scale fit's *relative*
+    /// overhead grew super-linearly (3× at n=100 → 9× at n=2000). The direct
+    /// block-Gram assembly is `O(Σ_pairs n · p_a p_b)`, i.e. linear in n at
+    /// fixed width. Pin that scaling: quadrupling the rows must cost no worse
+    /// than ~6× the wall time (linear 4× plus fixed-overhead / measurement
+    /// slack), never the super-linear blow-up the probing regression showed.
+    #[test]
+    fn to_dense_scales_linearly_in_n_1720() {
+        let (pa, pb) = (12, 12);
+        let t_small = per_call_secs(1_000, pa, pb);
+        let t_large = per_call_secs(4_000, pa, pb);
+        let ratio = t_large / t_small.max(1e-9);
+        assert!(
+            ratio <= 6.0,
+            "#1720 to_dense scales super-linearly in n: \
+             t(1000)={t_small:.6}s t(4000)={t_large:.6}s ratio={ratio:.2} \
+             (want <= 6.0 for a 4x row increase)"
+        );
+    }
 }

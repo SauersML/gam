@@ -166,6 +166,9 @@ mod tests_olmo;
 mod tests_ibp_capacity_1784;
 
 #[cfg(test)]
+mod tests_startup_validation_1782;
+
+#[cfg(test)]
 mod tests_row_jet_and_outer_objective_780;
 
 #[cfg(test)]

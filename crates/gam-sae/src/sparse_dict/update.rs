@@ -166,7 +166,8 @@ pub(super) fn run(
         // is the standard dead-feature resampling that makes every atom load-
         // bearing, so adding atoms can only help. It runs only while dead atoms
         // remain, so a fully-alive small-`K` dictionary is untouched.
-        if revive_dead_atoms(x, &codes, &mut decoder) > 0 {
+        let revived = revive_dead_atoms(x, &codes, &mut decoder);
+        if revived > 0 {
             unit_norm_rows(&mut decoder);
         }
 
@@ -189,7 +190,18 @@ pub(super) fn run(
         // Convergence-decision EV, computed from the FRESH post-normalisation codes.
         let ev = explained_variance(x, &codes, decoder.view());
         let improve = ev - prev_ev;
-        if improve.abs() <= config.tolerance && epoch > 0 {
+        // #1026 — do NOT declare convergence while dead atoms are still being
+        // revived. Revival runs at most one atom per row per epoch, so a large
+        // dictionary populates its tail over SEVERAL epochs; a one-epoch EV
+        // plateau can occur mid-population (a revived atom needs the next route to
+        // start firing). Stopping on that plateau froze the dictionary with a
+        // still-dead tail — effective `K` below the requested `K`, the exact
+        // under-population this issue tracks. Requiring `revived == 0` forces every
+        // atom to become load-bearing before the plateau test can fire, so the
+        // returned dictionary uses its full budget and its EV climbs with `K`
+        // toward reconstruction parity. Once no atom is dead, revival returns 0 and
+        // the ordinary EV-plateau test governs stopping exactly as before.
+        if revived == 0 && improve.abs() <= config.tolerance && epoch > 0 {
             converged = true;
             break;
         }

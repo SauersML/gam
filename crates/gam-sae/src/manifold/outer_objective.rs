@@ -1805,18 +1805,34 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // needs only the analytic traces `tr(H⁻¹ S_c)` — no gradient, and (per
         // SPEC) no finite differences. So this dense-cache path is reached only
         // when the dense evidence factor is admitted.
-        let (cost, loss, cache) = self
-            .term
-            .reml_criterion_with_cache(
-                self.target.view(),
-                &rho_state,
-                self.registry.as_ref(),
-                self.inner_max_iter,
-                self.learning_rate,
-                self.ridge_ext_coord,
-                self.ridge_beta,
-            )
-            .map_err(EstimationError::RemlOptimizationFailed)?;
+        // #1782 — a RECOVERABLE inner-solve refusal (a probed ρ whose undamped
+        // joint Hessian is non-PD / whose inner solve cannot converge at that ρ)
+        // is an INFEASIBLE-ρ signal, NOT a fatal defect: the value-only lanes
+        // (`Value` order above, streaming branch) already map it to a `+∞`
+        // infeasible eval so the outer optimizer steers back into the PD region.
+        // This gradient lane previously `?`-propagated the SAME refusal as a fatal
+        // `RemlOptimizationFailed`, which — because the SAE fit runs a single
+        // seed (`max_seeds = 1`, no fallback) — aborted the WHOLE fit at "no
+        // candidate seeds passed outer startup validation" for the assignment /
+        // topology combinations whose seed or a walk probe lands on such a ρ,
+        // while ibp_map (whose seed happens to stay PD) survived. Treat it the
+        // same infeasible way here so the three lanes agree; a genuinely
+        // non-recoverable error still propagates.
+        let (cost, loss, cache) = match self.term.reml_criterion_with_cache(
+            self.target.view(),
+            &rho_state,
+            self.registry.as_ref(),
+            self.inner_max_iter,
+            self.learning_rate,
+            self.ridge_ext_coord,
+            self.ridge_beta,
+        ) {
+            Ok(evaluated) => evaluated,
+            Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
+                return Ok(OuterEval::infeasible(rho.len()));
+            }
+            Err(err) => return Err(EstimationError::RemlOptimizationFailed(err)),
+        };
         // #1273 — the analytic outer gradient is built from the undamped joint
         // Hessian via `outer_gradient_arrow_solver`, whose Faddeev-Popov gauge
         // deflation recovers near-null directions that lie in the closed-form

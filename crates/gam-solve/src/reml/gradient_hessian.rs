@@ -3569,6 +3569,17 @@ impl<'a> RemlState<'a> {
     /// counted in `n_observations` (zero-weight rows are dropped; `log(0)` is
     /// undefined).
     pub(crate) fn gaussian_weight_log_sum_half(&self) -> f64 {
+        // #1033: `½·Σ log wᵢ` is a pure function of the fit-invariant `weights`
+        // view (never reassigned by `reset_surface`), so memoize the O(n)
+        // reduction once per fit. Every subsequent in-window κ-trial eval reads
+        // the cached scalar instead of re-scanning n rows — the per-trial eval
+        // then touches only k-dim objects.
+        *self
+            .gaussian_weight_log_sum_half_cache
+            .get_or_init(|| self.gaussian_weight_log_sum_half_uncached())
+    }
+
+    fn gaussian_weight_log_sum_half_uncached(&self) -> f64 {
         0.5 * self
             .weights
             .iter()
@@ -3598,6 +3609,17 @@ impl<'a> RemlState<'a> {
     /// response, where `D_p` is genuinely ~0 and equivariance is vacuous
     /// (`a·const` is still constant).
     pub(crate) fn gaussian_dp_floor_scale(&self) -> f64 {
+        // #1033: the weighted null deviance `D₀` depends only on the
+        // fit-invariant `(y, weights)` views (never reassigned by
+        // `reset_surface`), so memoize the two O(n) passes once per fit. Every
+        // in-window κ-trial eval then reads the cached scalar rather than
+        // re-scanning n rows.
+        *self
+            .gaussian_dp_floor_scale_cache
+            .get_or_init(|| self.gaussian_dp_floor_scale_uncached())
+    }
+
+    fn gaussian_dp_floor_scale_uncached(&self) -> f64 {
         let mut sw = 0.0_f64;
         let mut swy = 0.0_f64;
         for (&yi, &wi) in self.y.iter().zip(self.weights.iter()) {
@@ -3854,6 +3876,8 @@ impl<'a> RemlState<'a> {
             persistent_warm_start_store_suppression: AtomicUsize::new(0),
             alo_stabilization_suppression: AtomicUsize::new(0),
             persistent_warm_start_disk_enabled: AtomicBool::new(false),
+            gaussian_weight_log_sum_half_cache: std::sync::OnceLock::new(),
+            gaussian_dp_floor_scale_cache: std::sync::OnceLock::new(),
         })
     }
 

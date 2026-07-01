@@ -293,9 +293,27 @@ pub fn sae_pca_seed_initial_coords_with_pc_offset(
                 } else {
                     0
                 };
+                // Per-atom diversification (mirrors the #671 Periodic / Torus fix).
+                // Without it EVERY Euclidean/Linear atom read the SAME leading
+                // principal-score columns, so a K-atom dictionary seeded K
+                // IDENTICAL atoms — a rank-deficient joint decoder whose undamped
+                // Laplace factor is non-PD, which the seed-startup validation then
+                // rejects with "no candidate seeds passed outer startup validation"
+                // (the #1782 euclidean/linear failure; the #1094 multi-atom
+                // euclidean numerical-fixed-point refusal is the same duplicate-atom
+                // rank deficiency). Give atom `k` a DISJOINT window of principal
+                // components `[k·d, k·d + d)` (wrapping when atoms outnumber the
+                // available PCs), so distinct atoms read decorrelated scores and the
+                // cross-atom Gram starts well-conditioned. `atom_idx == 0` keeps the
+                // K=1 path byte-for-byte identical (offset 0).
+                let atom_pc_offset = atom_idx.saturating_mul(d);
                 let mut tmp = Array2::<f64>::zeros((n_obs, d));
                 for col in 0..k_cols {
-                    let src = if avail > 0 { (base + col) % avail } else { col };
+                    let src = if avail > 0 {
+                        (base + atom_pc_offset + col) % avail
+                    } else {
+                        col
+                    };
                     let s_col = s_vals[src];
                     for row in 0..n_obs {
                         tmp[[row, col]] = u[[row, src]] * s_col;

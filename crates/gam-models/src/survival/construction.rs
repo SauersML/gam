@@ -227,6 +227,13 @@ pub struct SurvivalTimeBuildOutput {
 
 pub const SURVIVAL_TIME_FLOOR: f64 = 1e-9;
 
+/// Entry ages above this value mark genuine left truncation (delayed entry): the
+/// row's cumulative-hazard interval starts at a positive left-tail time rather
+/// than the time origin. Kept in lockstep with the working-model's
+/// `ENTRY_AT_ORIGIN_THRESHOLD` so the "this row has an entry interval" and "the
+/// data is left-truncated" decisions agree.
+pub const SURVIVAL_DELAYED_ENTRY_THRESHOLD: f64 = 1e-8;
+
 /// Seed smoothing penalty `λ` used when a survival time basis is reconstructed
 /// from a build (or saved model) that did not carry an explicit `smooth_lambda`.
 /// This is only an initial value for the REML smoothing search, not a fixed
@@ -1861,18 +1868,73 @@ pub fn resolve_survival_marginal_slope_time_anchor_value(
             }
             t_anchor
         }
-        None => {
-            let mut sorted: Vec<f64> = age_exit.iter().copied().collect();
-            sorted.sort_by(f64::total_cmp);
-            let m = sorted.len();
-            if m % 2 == 1 {
-                sorted[m / 2]
-            } else {
-                0.5 * (sorted[m / 2 - 1] + sorted[m / 2])
-            }
-        }
+        None => robust_interior_exit_anchor(age_exit),
     };
     Ok(anchor.max(SURVIVAL_TIME_FLOOR))
+}
+
+/// Median exit age — a robust interior time on the exit scale, where the
+/// at-risk mass concentrates. Used as the survival time-basis centering anchor
+/// whenever the earliest entry is a positive left-tail point (delayed entry):
+/// centering there keeps the reparameterized linear-trend column small and
+/// two-signed instead of large and one-signed. The median is chosen over the
+/// mean for robustness to the heavy right tail of survival times.
+fn robust_interior_exit_anchor(age_exit: &Array1<f64>) -> f64 {
+    let mut sorted: Vec<f64> = age_exit.iter().copied().collect();
+    sorted.sort_by(f64::total_cmp);
+    let m = sorted.len();
+    if m == 0 {
+        return SURVIVAL_TIME_FLOOR;
+    }
+    if m % 2 == 1 {
+        sorted[m / 2]
+    } else {
+        0.5 * (sorted[m / 2 - 1] + sorted[m / 2])
+    }
+}
+
+/// Centering anchor for the default transformation (Royston-Parmar) survival
+/// baseline.
+///
+/// For right-censored-only data the earliest entry age is ≈ the time origin, so
+/// [`resolve_survival_time_anchor_value`] (min entry) is nearly a no-op and is
+/// used unchanged. Under **left truncation** (every row enters at a positive
+/// delayed-entry time) that minimum is a genuine left-tail point far below the
+/// exit mass, and centering the I-spline time basis there leaves the
+/// unpenalized linear-trend column `X(exit) − X(anchor)` large and one-signed
+/// across all rows. That column is the null space of the 2nd-difference time
+/// penalty, so the inflated one-signed column blows up the transformation
+/// smoothing-parameter selection: it rails a penalty direction and collapses the
+/// baseline to a covariate-independent, cumulative-hazard-inflated degenerate
+/// fit (issue #1790 — the transformation-model analogue of the marginal-slope
+/// #751 defect). Anchoring instead at the robust interior **median exit age**
+/// keeps the centered column small and two-signed so the exit-event likelihood
+/// pins the linear trend. Re-centering is an exact affine reparameterization of
+/// the baseline offset — the fitted `q(t)` and REML objective are unchanged,
+/// only the seed conditioning improves. An explicit `time_anchor` is honored
+/// verbatim.
+pub fn resolve_survival_transformation_time_anchor_value(
+    age_entry: &Array1<f64>,
+    age_exit: &Array1<f64>,
+    time_anchor: Option<f64>,
+) -> Result<f64, String> {
+    if time_anchor.is_some() {
+        return resolve_survival_time_anchor_value(age_entry, time_anchor);
+    }
+    if age_exit.is_empty() {
+        return Err(
+            "survival transformation time anchor requires non-empty exit times".to_string(),
+        );
+    }
+    let min_entry = age_entry
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min);
+    if min_entry > SURVIVAL_DELAYED_ENTRY_THRESHOLD {
+        Ok(robust_interior_exit_anchor(age_exit).max(SURVIVAL_TIME_FLOOR))
+    } else {
+        resolve_survival_time_anchor_value(age_entry, None)
+    }
 }
 
 pub fn evaluate_survival_time_basis_row(

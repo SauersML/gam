@@ -52,10 +52,13 @@
 //! emulator, the parity against production, and (on a CUDA host) the NVRTC→PTX
 //! compile + PTX audit — is verified without one.
 
+use std::time::Instant;
+
 use crate::encode::{
     AtlasConfig, AtomEncodeAtlas, KANTOROVICH_THRESHOLD, euclidean_patch_degree,
 };
 use crate::manifold::SaeManifoldAtom;
+use gam_gpu::policy::{EncodeDecisionBlocked, EncodeDeploymentDecision};
 
 /// One `EuclideanPatch` atom's frozen encode data, flattened for a device
 /// launch. This is exactly what the online encode reads: the monomial exponent
@@ -1153,6 +1156,101 @@ pub fn sae_certified_encode_batch(
     )
 }
 
+/// Measured throughput of the device-resident **exact per-row certified encode**
+/// ([`sae_certified_encode_batch`]) — the literal "batched exact per-row GPU
+/// encode" of #988, timed end to end (routing + amortized warm start + basin
+/// Newton + Kantorovich certificate + lowest-error assignment/fallback), NOT a
+/// component solve like [`gam_gpu::encode_throughput::measure_resident_solve_throughput`]
+/// (which times only the resident normal-equations inner cell).
+///
+/// The point of this struct is [`Self::decision`]: the #988 surrogate question
+/// ("is the exact encode fast enough at 10⁹ rows, or must we distill a certified
+/// amortized surrogate?") is answered by *this* measurement and only this one.
+/// The decision is keyed on [`EncodeDeploymentDecision::from_device_measurement`]
+/// with `engaged = (path == EncodePath::Device)`, so it inherits that type's
+/// anti-green-wash contract: a CPU-emulator run (`path == Cpu`) can NEVER declare
+/// the surrogate unneeded — it is honestly [`EncodeDeploymentDecision::Undetermined`]
+/// (blocked on hardware), no matter how fast the CPU rate is. Only a real device
+/// launch of the exact-encode kernel can move the decision to `Met`/`Unmet`.
+#[derive(Debug, Clone, Copy)]
+pub struct DeviceEncodeThroughput {
+    /// Rows encoded in the timed batch.
+    pub n_rows: usize,
+    /// Wall-clock seconds for the full exact encode of the batch.
+    pub encode_secs: f64,
+    /// `n_rows / encode_secs` (`0.0` for a degenerate / non-positive time).
+    pub rows_per_sec: f64,
+    /// Which path actually ran the encode — the #1026/#1551 honesty flag.
+    pub path: EncodePath,
+    /// The #988 surrogate decision keyed on THIS exact-encode measurement.
+    /// `Met`/`Unmet` only when `path == EncodePath::Device`; a CPU-emulator run
+    /// is `Undetermined { NoDeviceEncodeKernel-adjacent }` — a fast CPU number is
+    /// never a device pass.
+    pub decision: EncodeDeploymentDecision,
+}
+
+impl DeviceEncodeThroughput {
+    /// `true` iff the exact-encode kernel actually ran on a CUDA device — the
+    /// only state in which [`Self::decision`] is a real `Met`/`Unmet`.
+    #[must_use]
+    pub fn device_engaged(&self) -> bool {
+        matches!(self.path, EncodePath::Device)
+    }
+}
+
+/// Benchmark the device-resident exact per-row encode over a batch and gate the
+/// #988 certified-surrogate decision on the measured throughput.
+///
+/// Runs [`sae_certified_encode_batch`] once to warm allocations/compile/module
+/// caches, then once more under a wall-clock timer, and reports the measured
+/// rows/sec together with the honest [`EncodePath`] and the derived
+/// [`EncodeDeploymentDecision`]:
+///
+/// * On a CUDA host with `targets.len() >= DEVICE_ROW_THRESHOLD` the batch runs
+///   on the device (`path == Device`), the measurement is a genuine device rate,
+///   and the decision is `Met` (≥ 100k rows/sec/GPU ⇒ ship the exact encode, no
+///   surrogate) or `Unmet` (surrogate justified) by the number.
+/// * On a CPU-only host (or below the launch threshold) the emulator runs
+///   (`path == Cpu`); the rate is real but it is NOT a device measurement, so the
+///   decision is `Undetermined` — the surrogate stays neither justified nor
+///   refuted. This is the honest "needs GPU hardware" outcome.
+#[must_use]
+pub fn measure_device_encode_throughput(
+    dev: &EncodeAtomDevice,
+    targets: &[Vec<f64>],
+    amplitudes: &[f64],
+) -> DeviceEncodeThroughput {
+    let n = targets.len();
+    // Warm run (device module load / PTX cache / first-touch allocations) is not
+    // timed, mirroring the resident-solve and full-path benchmarks.
+    let _ = sae_certified_encode_batch(dev, targets, amplitudes);
+    let start = Instant::now();
+    let (_out, path) = sae_certified_encode_batch(dev, targets, amplitudes);
+    let elapsed = start.elapsed();
+    let encode_secs = elapsed.as_secs_f64();
+    let rows_per_sec = if n > 0 && encode_secs > 0.0 {
+        n as f64 / encode_secs
+    } else {
+        0.0
+    };
+    let engaged = matches!(path, EncodePath::Device);
+    // Key the surrogate decision on the measurement. When the device did not run
+    // the exact encode, report the honest blocked reason rather than a
+    // `DeviceNotEngaged` false-routing (the kernel exists, but no device ran it).
+    let decision = if engaged {
+        EncodeDeploymentDecision::from_device_measurement(true, rows_per_sec)
+    } else {
+        EncodeDeploymentDecision::blocked(EncodeDecisionBlocked::NoDevice)
+    };
+    DeviceEncodeThroughput {
+        n_rows: n,
+        encode_secs,
+        rows_per_sec,
+        path,
+        decision,
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod device {
     use super::{
@@ -1531,6 +1629,115 @@ mod tests {
                 r.cert.certified(),
                 "batch row {k} certificate flag disagrees with production"
             );
+        }
+    }
+
+    /// #988 core: benchmark the batched EXACT per-row encode and gate the
+    /// certified-surrogate decision on the MEASURED throughput of the actual
+    /// device-resident encode kernel — not the host component solve, and not a
+    /// hardcoded target. This is the "benchmark first; surrogate only on
+    /// benchmark evidence" order-of-work wired end to end onto
+    /// [`sae_certified_encode_batch`] (the literal batched exact per-row GPU
+    /// encode) via [`measure_device_encode_throughput`].
+    #[test]
+    fn device_encode_throughput_gates_surrogate_on_measurement() {
+        let (d, deg, p) = (1usize, 2usize, 4usize);
+        let config = AtlasConfig::default();
+        let (atom, atlas) = build_atom_and_atlas(d, deg, p, config);
+        let dev = EncodeAtomDevice::from_atom_atlas(&atom, &atlas.atoms[0], &config).unwrap();
+
+        // A batch large enough that a CUDA host would take the device path
+        // (>= DEVICE_ROW_THRESHOLD), mixing planted on-manifold rows (which must
+        // certify — a non-vacuous benchmark) with off-manifold rows (fallback).
+        let n = DEVICE_ROW_THRESHOLD + 64;
+        let evaluator = EuclideanPatchEvaluator::new(d, deg).unwrap();
+        let mut rows: Vec<Vec<f64>> = Vec::with_capacity(n);
+        let mut amps: Vec<f64> = Vec::with_capacity(n);
+        for k in 0..n {
+            if k % 2 == 0 {
+                // Planted: exact amplitude-1 reconstruction at a known coordinate.
+                let tc = -0.4 + 0.8 * ((k % 24) as f64) / 23.0;
+                let (phi, _) = evaluator
+                    .evaluate(Array2::from_shape_fn((1, d), |_| tc).view())
+                    .unwrap();
+                let x = (0..p)
+                    .map(|c| {
+                        (0..dev.m)
+                            .map(|b| phi[[0, b]] * dev.decoder[b * p + c])
+                            .sum::<f64>()
+                    })
+                    .collect();
+                rows.push(x);
+                amps.push(1.0);
+            } else {
+                let x = (0..p)
+                    .map(|c| 0.5 * (((k * 7 + c * 3) as f64) * 0.021).sin())
+                    .collect();
+                rows.push(x);
+                amps.push(1.0);
+            }
+        }
+
+        // The benchmark: time the exact encode and derive the surrogate decision.
+        let tput = measure_device_encode_throughput(&dev, &rows, &amps);
+        eprintln!(
+            "[device-encode #988] n={} rows/sec={:.1} path={:?} decision={:?}",
+            tput.n_rows, tput.rows_per_sec, tput.path, tput.decision
+        );
+
+        // It must be a REAL measurement (positive rate), and the engagement flag
+        // must be consistent with the path that ran.
+        assert!(
+            tput.rows_per_sec > 0.0,
+            "the exact encode benchmark must produce a positive rows/sec, got {}",
+            tput.rows_per_sec
+        );
+        assert_eq!(tput.device_engaged(), matches!(tput.path, EncodePath::Device));
+
+        // The benchmark must be non-vacuous: on a well-conditioned dictionary the
+        // planted on-manifold rows certify through the exact encode (proving the
+        // routing + basin Newton + certificate really ran, not a trivial pass).
+        let (batch, _) = sae_certified_encode_batch(&dev, &rows, &amps);
+        let certified = batch.iter().filter(|r| r.cert.certified()).count();
+        assert!(
+            certified > 0,
+            "the exact encode must certify a majority of the planted rows; certified={certified}/{n}"
+        );
+
+        if tput.device_engaged() {
+            // Only reachable on a CUDA host: the decision is a REAL Met/Unmet
+            // keyed on the measured device throughput vs the 100k rows/sec target.
+            assert!(
+                !tput.decision.is_undetermined(),
+                "an engaged device measurement must decide Met/Unmet, got {:?}",
+                tput.decision
+            );
+            let target = gam_gpu::policy::GPU_THROUGHPUT_TARGET_ROWS_PER_SEC;
+            if tput.rows_per_sec >= target {
+                assert!(
+                    tput.decision.surrogate_unneeded(),
+                    "device rate {:.1} >= target {target} must mark the surrogate unneeded",
+                    tput.rows_per_sec
+                );
+            } else {
+                assert!(
+                    tput.decision.surrogate_justified(),
+                    "device rate {:.1} < target {target} must justify the surrogate",
+                    tput.rows_per_sec
+                );
+            }
+        } else {
+            // CPU-only host (this dev box): the rate is honest but it is NOT a
+            // device measurement. The surrogate decision is BLOCKED on hardware —
+            // a fast CPU number can never declare the surrogate unneeded (the
+            // #1412 anti-green-wash property carried to the exact device encode).
+            assert!(
+                tput.decision.is_undetermined(),
+                "a CPU-emulator exact encode must leave the surrogate decision Undetermined, got {:?}",
+                tput.decision
+            );
+            assert!(!tput.decision.surrogate_unneeded());
+            assert!(!tput.decision.surrogate_justified());
         }
     }
 

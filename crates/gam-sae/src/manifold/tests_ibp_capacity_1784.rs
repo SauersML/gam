@@ -126,6 +126,7 @@ fn fit_ev(
     term.run_joint_fit_arrow_schur(z, &mut rho, None, max_iter, 1.0, 1.0e-6, 1.0e-6)?;
     let fitted = term.try_fitted_for_rho(&rho)?;
     reconstruction_explained_variance(z, fitted.view())
+        .ok_or_else(|| "reconstruction_explained_variance: degenerate target/fitted".to_string())
 }
 
 fn linear_ev(z: ArrayView2<'_, f64>, k: usize) -> f64 {

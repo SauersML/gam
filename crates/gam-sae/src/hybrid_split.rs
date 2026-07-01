@@ -355,6 +355,35 @@ const MIN_ROWS_FOR_LINEAR_FIT: usize = 3;
 /// material EV loss, so it separates the lossless and load-bearing regimes
 /// without tuning.
 ///
+/// WHY A FIXED DIMENSIONLESS TOLERANCE AND NOT A NOISE/DISPERSION-DERIVED ONE
+/// (#1610). This gate is a SAFETY BACKSTOP layered over the evidence/REML
+/// selection ([`select_hybrid_split`]), which is itself the nested-model
+/// statistical test: it already trades the curved arm's data-fit against its
+/// Laplace parameter price in NLE units and picks the line when the curve is not
+/// evidence-justified. The backstop exists only to catch the residual case where
+/// that argmin prefers the cheaper line yet doing so DROPS reconstruction EV (the
+/// observed 1.0 → 0.748). The correct instrument for a backstop over a
+/// statistical test is a conservative negligibility tolerance on the quantity it
+/// protects (full-reconstruction EV), NOT a second re-derived statistical
+/// threshold. A noise/dispersion-derived per-atom tolerance — e.g.
+/// `df_extra · σ̂² / SST_full`, the curve's expected spurious extra RSS under the
+/// null that the image is straight, with `σ̂²` the curved fit's residual
+/// dispersion — has, moreover, no SAFE calibration here: on an exact-line
+/// collapse the fit's dispersion `σ̂² → 0`, so a pure noise threshold falls BELOW
+/// the least-squares solver round-off of `linear_rss − curved_rss`
+/// (`≈ κ·εmach·SST_full`) and would spuriously VETO the lossless collapses the
+/// deterministic tests require; raising it to clear round-off, conversely, only
+/// relaxes the backstop TOWARD the over-collapse boundary it was added to hold
+/// (larger tolerance ⇒ fewer vetoes ⇒ more collapse). There is thus no safe
+/// direction to make it noise-adaptive. The safe window is the wide, well-
+/// separated band between solver round-off (`~1e-12` relative) and any material
+/// EV loss (`~1e-2`); `1e-3` is the standard "0.1% of variance is negligible"
+/// point inside it — dimensionless on an EV `∈ [0,1]` (hence scale-invariant, per
+/// this issue's scale-invariance contract) with a single explicit meaning, not a
+/// corpus-tuned magnitude. (A noise-adaptive backstop would also change
+/// reconstruction on real activations in a way only the real-OLMo behavioral
+/// battery can validate.)
+///
 /// PER-ATOM SCOPE: applied per slot, this tolerance bounds only ONE atom's
 /// individual EV loss. It does NOT by itself bound the dictionary-level EV loss
 /// when several atoms collapse at once: the true global RSS change is

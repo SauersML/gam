@@ -284,6 +284,206 @@ impl GpuDispatchPolicy {
     }
 }
 
+/// Factorization strategy for the arrow-Schur border (shared `β`) solve, chosen
+/// from the *shape* of the joint system rather than a single fixed border-width
+/// cut (`ArrowSolverMode::automatic`'s `DIRECT_SOLVE_MAX_K = 2000`).
+///
+/// The border width alone is a blunt selector: it cannot see that the data-fit
+/// contribution to the `k × k` border is only rank `Σ_i d_i ≈ n·d`. For the
+/// #1017 color arm (`n = 180`, per-row depth `d = 2`, border `k = 15360`) the
+/// data information is rank `360` yet a dense Direct solve pays a full `k³/3 ≈
+/// 1.2e12`-flop Cholesky — the measured 26-min-class fit. This maps cleanly onto
+/// the two `ArrowSolverMode` variants the solver already implements.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ArrowBorderStrategy {
+    /// Eliminate the per-row blocks, form the dense `k × k` reduced Schur, and
+    /// Cholesky-factor it (`ArrowSolverMode::Direct`). Appropriate for modest,
+    /// near-square borders where the `k³/3` factorization is cheap and the
+    /// data-fit rank is comparable to `k`.
+    DenseDirect,
+    /// Solve the reduced Schur iteratively by matrix-free PCG
+    /// (`ArrowSolverMode::InexactPCG`), never materialising the `k × k` factor.
+    /// Appropriate when the dense `k³` factorization dominates and/or the
+    /// data-fit contribution to the border is rank-deficient (`n·d < k`).
+    ReducedIterative,
+}
+
+/// Cost model + recommendation for the arrow-Schur border solve, a pure function
+/// of the joint-system shape (unit-testable, no device required).
+///
+/// This operationalises the measured #1017 finding that the full arrow-Schur
+/// Newton solve is dominated by the dense `k × k` border Cholesky (the on-device
+/// dense Direct solve was measured at ~0.94× — a slowdown — because the `k³/3`
+/// factorization, not the GPU-favourable batched per-row work, is the bottleneck
+/// at LLM/SAE border widths). The lever the issue calls for is to *shrink or
+/// factor the dense border* so the batched `n`-row work dominates; the plan
+/// makes that decision inspectable and honest.
+///
+/// ## Flop model (deliberate, documented approximations)
+///
+/// * **Dense Direct** ≈ `2·n·d·k²` (assemble the reduced Schur: per row a
+///   rank-`d` symmetric update `H_βt (H_tt)⁻¹ H_tβ` to the `k × k` border,
+///   `≈ 2·d·k²` flops) `+ k³/3` (Cholesky of the dense `k × k` Schur).
+/// * **Reduced iterative** ≈ `cg_iters · n·(4·d·k + d²)` (matrix-free PCG:
+///   per matvec a forward + transpose cross-block GEMV `4·d·k` plus the per-row
+///   `d × d` solve `d²`, summed over `n` row blocks, over `cg_iters` applies).
+///
+/// Both are dispatch-grade estimates, not exact operation counts; they omit
+/// preconditioner setup and lower-order terms symmetrically, so their ratio (the
+/// only thing the recommendation consumes) is meaningful while neither figure
+/// should be reused for speedup accounting.
+///
+/// ## Status
+///
+/// Advisory / diagnostic. It is **not** wired into the live
+/// `ArrowSolverMode::automatic` selector: replacing the fixed `DIRECT_SOLVE_MAX_K`
+/// cut with this shape-driven crossover changes which production fits take the
+/// Direct vs PCG path and must be validated on GPU hardware (#1017 Phase 2–4)
+/// before it can change numerics. Today it is consumed by the honest
+/// `examples/full_color_fit_1017.rs` measurement harness (modeled-vs-measured)
+/// and by the unit tests below.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArrowBorderSolvePlan {
+    /// Number of per-row blocks (SAE observations / latent rows).
+    pub n: usize,
+    /// Border `β` width (the SAE decoder atom count `K` × basis width).
+    pub k: usize,
+    /// Per-row latent / active-frame depth (the `M` dimension).
+    pub d: usize,
+    /// CG iteration budget assumed for the iterative estimate.
+    pub cg_iters: usize,
+    /// Effective rank of the data-fit contribution to the `k × k` border,
+    /// bounded by `Σ_i d_i ≈ n·d` and never more than `k`.
+    pub data_fit_rank: usize,
+    /// True when `n·d < k`: the dense `k × k` Cholesky spends `O(k³)` factorising
+    /// a border whose data information is only rank `n·d` — the pathological
+    /// wide-sparse-border regime (color arm: `n·d = 360 ≪ k = 15360`).
+    pub dense_border_rank_deficient: bool,
+    /// `≈ 2·n·d·k² + k³/3` — reduced-Schur assembly plus dense border Cholesky.
+    pub dense_direct_flops: u128,
+    /// `≈ cg_iters · n·(4·d·k + d²)` — matrix-free PCG matvecs.
+    pub reduced_iterative_flops: u128,
+    /// The recommended strategy: `ReducedIterative` iff the dense factorization
+    /// path costs strictly more arithmetic than the iterative path at
+    /// `cg_iters`.
+    pub recommended: ArrowBorderStrategy,
+    /// Whether running the *recommended* strategy on the device is expected to
+    /// pay off. For `ReducedIterative` this is `reduced_schur_matvec_should_offload`;
+    /// for `DenseDirect` the device wins only when the batched per-row assembly
+    /// work (`2·n·d·k²`, GPU-favourable batched GEMM/POTRF) at least matches the
+    /// border Cholesky (`k³/3`) *and* clears the dense flop floor — the honest
+    /// encoding of the measured 0.94× dense-Direct-on-device slowdown.
+    pub device_favorable: bool,
+}
+
+impl GpuDispatchPolicy {
+    /// Assembly flops for the dense reduced Schur: per row a rank-`d` update to
+    /// the `k × k` border (`≈ 2·d·k²`), summed over `n` rows.
+    const fn dense_schur_assembly_flops(n: usize, k: usize, d: usize) -> u128 {
+        2u128
+            .saturating_mul(n as u128)
+            .saturating_mul(d as u128)
+            .saturating_mul((k as u128).saturating_mul(k as u128))
+    }
+
+    /// Cholesky flops for the dense `k × k` reduced Schur: `≈ k³/3`.
+    const fn dense_border_cholesky_flops(k: usize) -> u128 {
+        let k = k as u128;
+        k.saturating_mul(k).saturating_mul(k) / 3
+    }
+
+    /// Total matrix-free PCG flops: `cg_iters · n·(4·d·k + d²)`.
+    const fn reduced_iterative_flops(n: usize, k: usize, d: usize, cg_iters: usize) -> u128 {
+        let n = n as u128;
+        let k = k as u128;
+        let d = d as u128;
+        let per_apply = n.saturating_mul(
+            4u128
+                .saturating_mul(d)
+                .saturating_mul(k)
+                .saturating_add(d.saturating_mul(d)),
+        );
+        per_apply.saturating_mul(cg_iters as u128)
+    }
+
+    /// Build the shape-driven [`ArrowBorderSolvePlan`] for a joint arrow-Schur
+    /// system with `n` row blocks, border width `k`, per-row depth `d`, and an
+    /// assumed CG budget `cg_iters` (pass
+    /// [`Self::MATVEC_OFFLOAD_MIN_CG_ITERS`] when none is measured; a smaller
+    /// value only biases the recommendation toward `DenseDirect`, never the
+    /// reverse).
+    ///
+    /// Degenerate shapes (`n`, `k`, or `d` zero) return an all-zero plan
+    /// recommending `DenseDirect` (the trivial/empty solve stays on the simple
+    /// path) with `device_favorable = false`.
+    pub fn arrow_border_solve_plan(
+        &self,
+        n: usize,
+        k: usize,
+        d: usize,
+        cg_iters: usize,
+    ) -> ArrowBorderSolvePlan {
+        if n == 0 || k == 0 || d == 0 {
+            return ArrowBorderSolvePlan {
+                n,
+                k,
+                d,
+                cg_iters,
+                data_fit_rank: 0,
+                dense_border_rank_deficient: false,
+                dense_direct_flops: 0,
+                reduced_iterative_flops: 0,
+                recommended: ArrowBorderStrategy::DenseDirect,
+                device_favorable: false,
+            };
+        }
+
+        let assembly = Self::dense_schur_assembly_flops(n, k, d);
+        let border_chol = Self::dense_border_cholesky_flops(k);
+        let dense_direct_flops = assembly.saturating_add(border_chol);
+        let iters = if cg_iters == 0 { 1 } else { cg_iters };
+        let reduced_iterative_flops = Self::reduced_iterative_flops(n, k, d, iters);
+
+        let data_fit_rank = (n.saturating_mul(d)).min(k);
+        let dense_border_rank_deficient = n.saturating_mul(d) < k;
+
+        let recommended = if dense_direct_flops > reduced_iterative_flops {
+            ArrowBorderStrategy::ReducedIterative
+        } else {
+            ArrowBorderStrategy::DenseDirect
+        };
+
+        let device_favorable = match recommended {
+            ArrowBorderStrategy::ReducedIterative => {
+                self.reduced_schur_matvec_should_offload(n, k, d, iters)
+            }
+            ArrowBorderStrategy::DenseDirect => {
+                // Dense Direct wins on device only when the batched per-row
+                // assembly work dominates the (poorly GPU-scaling, and here
+                // rank-deficient) border Cholesky, and the total clears the
+                // dense reduction floor. This is the honest encoding of the
+                // measured 0.94× on-device dense-Direct slowdown: when the k³
+                // Cholesky dominates, stay on the CPU.
+                assembly >= border_chol
+                    && dense_direct_flops >= self.dense_reduction_flops_min()
+            }
+        };
+
+        ArrowBorderSolvePlan {
+            n,
+            k,
+            d,
+            cg_iters: iters,
+            data_fit_rank,
+            dense_border_rank_deficient,
+            dense_direct_flops,
+            reduced_iterative_flops,
+            recommended,
+            device_favorable,
+        }
+    }
+}
+
 /// The aspirational single-GPU design-row throughput the #1412 decision gate is
 /// supposed to establish for the LLM-shape batched-Cholesky + tile-GEMM fit
 /// pipeline: 100 000 design rows processed per wall-clock second per device.
@@ -762,6 +962,115 @@ mod reduced_schur_matvec_offload_tests {
                 "admission lower bound {lower} must undercount actual work {actual} for ({n},{k},{d})"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod arrow_border_solve_plan_tests {
+    use super::*;
+
+    /// The #1017 color arm — few rows, shallow per-row depth, a very wide border
+    /// (`k = 15360 = 3 × 5120`). The dense `k³/3` Cholesky (`≈ 1.2e12` flops)
+    /// dwarfs a matrix-free PCG solve at any realistic CG budget, and the border
+    /// is grossly rank-deficient (`n·d = 360 ≪ k`). The plan must recommend
+    /// `ReducedIterative` and flag the rank deficiency.
+    #[test]
+    fn color_arm_recommends_reduced_iterative_and_flags_rank_deficiency() {
+        let pol = GpuDispatchPolicy::default();
+        let plan = pol.arrow_border_solve_plan(180, 15_360, 2, 30);
+        assert_eq!(plan.recommended, ArrowBorderStrategy::ReducedIterative);
+        assert!(plan.dense_border_rank_deficient);
+        assert_eq!(plan.data_fit_rank, 360);
+        // The dense path is orders of magnitude more expensive here.
+        assert!(plan.dense_direct_flops > plan.reduced_iterative_flops * 100);
+        // The recommended (iterative) path is device-favorable at this shape:
+        // the wide border × summed CG work clears the matvec offload floor.
+        assert!(plan.device_favorable);
+    }
+
+    /// A modest, near-square border where the data-fit rank is comparable to `k`
+    /// and the `k³/3` Cholesky is cheap: dense Direct is the right call.
+    #[test]
+    fn small_square_border_recommends_dense_direct() {
+        let pol = GpuDispatchPolicy::default();
+        // n·d = 400 > k = 64: not rank-deficient; a 64³/3 Cholesky is trivial.
+        let plan = pol.arrow_border_solve_plan(200, 64, 2, 8);
+        assert_eq!(plan.recommended, ArrowBorderStrategy::DenseDirect);
+        assert!(!plan.dense_border_rank_deficient);
+        assert_eq!(plan.data_fit_rank, 64);
+    }
+
+    /// The rank-deficiency flag is exactly `n·d < k`, and `data_fit_rank` is
+    /// clamped at `k` (the border can carry no more than `k` data directions).
+    #[test]
+    fn rank_flag_and_clamp_track_n_d_versus_k() {
+        let pol = GpuDispatchPolicy::default();
+        // n·d == k exactly: full-rank border, not deficient.
+        let exact = pol.arrow_border_solve_plan(50, 100, 2, 8);
+        assert!(!exact.dense_border_rank_deficient);
+        assert_eq!(exact.data_fit_rank, 100);
+        // n·d one below k: deficient.
+        let deficient = pol.arrow_border_solve_plan(49, 100, 2, 8);
+        assert!(deficient.dense_border_rank_deficient);
+        assert_eq!(deficient.data_fit_rank, 98);
+    }
+
+    /// The recommendation is monotone toward `ReducedIterative` as the border
+    /// widens at fixed row work: once the dense `k³` term overtakes the linear-
+    /// in-`k` iterative cost, growing `k` keeps it recommending iterative.
+    #[test]
+    fn wider_border_only_moves_toward_iterative() {
+        let pol = GpuDispatchPolicy::default();
+        let narrow = pol.arrow_border_solve_plan(200, 128, 4, 16);
+        let wide = pol.arrow_border_solve_plan(200, 8_192, 4, 16);
+        // The wide border must recommend iterative.
+        assert_eq!(wide.recommended, ArrowBorderStrategy::ReducedIterative);
+        // If the narrow one already recommends iterative, the wide one still
+        // does (monotone); if not, the wide one is a strict switch. Either way
+        // the wide border's dense/iterative flop ratio exceeds the narrow one's.
+        let narrow_ratio = narrow.dense_direct_flops as f64 / narrow.reduced_iterative_flops as f64;
+        let wide_ratio = wide.dense_direct_flops as f64 / wide.reduced_iterative_flops as f64;
+        assert!(wide_ratio > narrow_ratio);
+    }
+
+    /// A larger CG budget makes the iterative path more expensive, so the
+    /// crossover can only move toward `DenseDirect`, never away from it. If a
+    /// shape is `DenseDirect` at a small budget it stays `DenseDirect` at a
+    /// larger one.
+    #[test]
+    fn larger_cg_budget_never_switches_away_from_dense() {
+        let pol = GpuDispatchPolicy::default();
+        let shape = (200usize, 96usize, 3usize);
+        let small = pol.arrow_border_solve_plan(shape.0, shape.1, shape.2, 4);
+        let large = pol.arrow_border_solve_plan(shape.0, shape.1, shape.2, 400);
+        if small.recommended == ArrowBorderStrategy::DenseDirect {
+            assert_eq!(large.recommended, ArrowBorderStrategy::DenseDirect);
+        }
+        assert!(large.reduced_iterative_flops >= small.reduced_iterative_flops);
+    }
+
+    /// Degenerate shapes yield an all-zero plan on the trivial `DenseDirect`
+    /// path and are never device-favorable.
+    #[test]
+    fn degenerate_shapes_are_trivial_dense_and_not_device_favorable() {
+        let pol = GpuDispatchPolicy::default();
+        for shape in [(0usize, 100usize, 2usize), (100, 0, 2), (100, 100, 0)] {
+            let plan = pol.arrow_border_solve_plan(shape.0, shape.1, shape.2, 8);
+            assert_eq!(plan.recommended, ArrowBorderStrategy::DenseDirect);
+            assert!(!plan.device_favorable);
+            assert_eq!(plan.dense_direct_flops, 0);
+            assert_eq!(plan.reduced_iterative_flops, 0);
+        }
+    }
+
+    /// A zero CG budget is treated as one apply (a plan must still be
+    /// comparable), never a divide-by-zero or an all-free iterative path.
+    #[test]
+    fn zero_cg_budget_is_treated_as_one_apply() {
+        let pol = GpuDispatchPolicy::default();
+        let plan = pol.arrow_border_solve_plan(180, 15_360, 2, 0);
+        assert_eq!(plan.cg_iters, 1);
+        assert!(plan.reduced_iterative_flops > 0);
     }
 }
 

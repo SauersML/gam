@@ -271,10 +271,18 @@ pub(crate) fn materialize_survival<'a>(
     // exit-scale time (median exit) rather than the earliest entry age: under
     // left truncation the earliest entry is a positive left-tail point and
     // centering there inflates the unpenalized linear-trend column, blowing up
-    // the time-block seed score so REML rejects every seed (issue #751).
+    // the time-block seed score so REML rejects every seed (issue #751). The
+    // default transformation (Royston-Parmar) baseline suffers the identical
+    // pathology under left truncation — the inflated one-signed column rails the
+    // transformation smoothing selection and collapses the fit to a
+    // covariate-independent degenerate surface (issue #1790) — so it too switches
+    // to the robust interior anchor when the data is left-truncated (a near no-op
+    // for right-censored data whose earliest entry is ≈ the time origin).
     // Location-scale keeps the earliest-entry anchor.
     let time_anchor = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
         resolve_survival_marginal_slope_time_anchor_value(&age_entry, &age_exit, None)?
+    } else if survival_mode == SurvivalLikelihoodMode::Transformation {
+        resolve_survival_transformation_time_anchor_value(&age_entry, &age_exit, None)?
     } else {
         resolve_survival_time_anchor_value(&age_entry, None)?
     };

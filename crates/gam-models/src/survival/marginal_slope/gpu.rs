@@ -1417,7 +1417,15 @@ impl Step6DeviceBatch {
 /// The intermediate `M = H_p · J` (r × p) is computed in registers/global per
 /// thread-tile exactly as the host does, so each row's output is bit-identical
 /// to the host per-row partial.
-#[cfg(target_os = "linux")]
+///
+/// #415 parity-lock: this source is available on EVERY target (not just Linux)
+/// so the CPU-side device-arithmetic emulator's structural lockstep guard
+/// (`step6_tests::step6_device_emulator_source_lockstep_fingerprint_415`) can
+/// assert the `.cu` still spells the arithmetic the CPU emulator mirrors — on
+/// CPU CI, no CUDA required. Only the NVRTC compile/launch consumers below stay
+/// Linux-gated. `allow(dead_code)` because on a non-Linux, non-test lib build
+/// nothing references the string.
+#[cfg_attr(all(not(target_os = "linux"), not(test)), allow(dead_code))]
 const SURVIVAL_FLEX_STEP6_SOURCE: &str = r#"
 extern "C" __global__ void survival_flex_step6_rows(
     const double * __restrict__ g_p_flat,
@@ -2767,6 +2775,360 @@ mod step6_tests {
             jacs.push(jac);
         }
         (outs, jacs)
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // #415 CPU-verifiable device-arithmetic emulator for the Step-6 row kernel.
+    //
+    // `emulate_step6_row_pullback_device` is a device-free CPU transcription of
+    // the per-row body of `SURVIVAL_FLEX_STEP6_SOURCE`
+    // (`survival_flex_step6_rows`). It writes this row's dense `grad_row[p]` and
+    // `hess_row[p*p]` using the SAME per-output accumulation order and zero-skip
+    // guards the `.cu` uses:
+    //
+    //   grad_row[k]   = Σ_a J[a,k]·g_p[a]     (inner a; skip g_p[a]==0)
+    //   M[a,k]        = Σ_b H_p[a,b]·J[b,k]    (inner b; skip H_p[a,b]==0)
+    //   hess_row[c,k] = Σ_a J[a,c]·M[a,k]      (inner a; skip J[a,c]==0)
+    //
+    // `emulate_step6_joint_beta_device` wraps it with the SAME shape validation
+    // (`Step6DeviceBatch::build`), row-order NLL/partials reduction, and
+    // off-diagonal symmetrization the device launch path
+    // (`launch_step6_joint_beta_linux`) performs on the host. Because both
+    // functions mirror the device program op-for-op, a `.cu` edit that changes
+    // the arithmetic without a lockstep edit here makes
+    // `step6_device_emulator_matches_host_pullback_415` fail on EVERY box — no
+    // CUDA required — so device-algebra drift is caught in CPU CI, long before
+    // it reaches the GPU runner (where `step6_device_contraction_matches_cpu_reference`
+    // pins the compiled kernel and the `.cu`↔emulator fingerprint below reminds).
+    //
+    // Honest reach (identical to the survival_rowjet host-oracle lock): this
+    // emulator is a hand transcription, so an in-place `.cu` arithmetic edit is
+    // caught on CPU CI only when the emulator is updated in lockstep. The
+    // fingerprint guard makes a STRUCTURAL `.cu` change (a dropped skip-zero
+    // branch, a renamed/re-indexed contraction) fail the build directly; the
+    // un-mirrored `.cu` bytes themselves are pinned numerically on a GPU box by
+    // `step6_device_contraction_matches_cpu_reference`.
+    // ────────────────────────────────────────────────────────────────────
+
+    /// Per-row transcription of `survival_flex_step6_rows`. `m_scratch` (len
+    /// `r*p`), `grad_row` (len `p`) and `hess_row` (len `p*p`) are written in
+    /// place. Loop nesting / skip-zero guards mirror the `.cu` exactly.
+    fn emulate_step6_row_pullback_device(
+        g_p: &[f64],
+        h_p: &[f64],
+        jac: &[f64],
+        r: usize,
+        p: usize,
+        m_scratch: &mut [f64],
+        grad_row: &mut [f64],
+        hess_row: &mut [f64],
+    ) {
+        // 1) grad_row[k] = Σ_a J[a*p+k]·g_p[a]  (per-output k, inner a; skip 0).
+        for k in 0..p {
+            let mut acc = 0.0_f64;
+            for a in 0..r {
+                let ga = g_p[a];
+                if ga != 0.0 {
+                    acc += jac[a * p + k] * ga;
+                }
+            }
+            grad_row[k] = acc;
+        }
+        // 2) M[a*p+k] = Σ_b H_p[a*r+b]·J[b*p+k]  (per (a,k), inner b; skip 0).
+        for a in 0..r {
+            for k in 0..p {
+                let mut acc = 0.0_f64;
+                for b in 0..r {
+                    let hab = h_p[a * r + b];
+                    if hab != 0.0 {
+                        acc += hab * jac[b * p + k];
+                    }
+                }
+                m_scratch[a * p + k] = acc;
+            }
+        }
+        // 3) hess_row[col*p+k] = Σ_a J[a*p+col]·M[a*p+k]  (per (col,k), inner a; skip 0).
+        for col in 0..p {
+            for k in 0..p {
+                let mut acc = 0.0_f64;
+                for a in 0..r {
+                    let jac_ac = jac[a * p + col];
+                    if jac_ac != 0.0 {
+                        acc += jac_ac * m_scratch[a * p + k];
+                    }
+                }
+                hess_row[col * p + k] = acc;
+            }
+        }
+    }
+
+    /// Batch driver mirroring `try_device_step6_joint_beta`'s device path:
+    /// validate shapes as `Step6DeviceBatch::build` does, emulate each row's
+    /// dense partial, reduce over rows in row order, then symmetrize the
+    /// off-diagonal exactly as `launch_step6_joint_beta_linux` does.
+    fn emulate_step6_joint_beta_device(
+        rows: &[SurvivalFlexStep6RowPullback<'_>],
+        p: usize,
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), GpuError> {
+        let mut nll = 0.0_f64;
+        for (i, row) in rows.iter().enumerate() {
+            let r = row.primary.grad.len();
+            if row.primary.hess.len() != r * r {
+                return Err(GpuError::DriverCallFailed {
+                    reason: format!(
+                        "step6 emulator row {i}: primary.hess.len()={} expected r*r={}",
+                        row.primary.hess.len(),
+                        r * r
+                    ),
+                });
+            }
+            if row.jacobian.len() != r * p {
+                return Err(GpuError::DriverCallFailed {
+                    reason: format!(
+                        "step6 emulator row {i}: jacobian.len()={} expected r*p={}",
+                        row.jacobian.len(),
+                        r * p
+                    ),
+                });
+            }
+            nll += row.primary.row_nll;
+        }
+
+        let mut grad = Array1::<f64>::zeros(p);
+        let mut hess = Array2::<f64>::zeros((p, p));
+        let mut grad_row = vec![0.0_f64; p];
+        let mut hess_row = vec![0.0_f64; p * p];
+        for row in rows {
+            let r = row.primary.grad.len();
+            let mut m = vec![0.0_f64; r * p];
+            emulate_step6_row_pullback_device(
+                &row.primary.grad,
+                &row.primary.hess,
+                row.jacobian,
+                r,
+                p,
+                &mut m,
+                &mut grad_row,
+                &mut hess_row,
+            );
+            for k in 0..p {
+                grad[k] += grad_row[k];
+            }
+            for col in 0..p {
+                for k in 0..p {
+                    hess[[col, k]] += hess_row[col * p + k];
+                }
+            }
+        }
+        // Same off-diagonal symmetrization pass the device host-reduction uses.
+        for col in 0..p {
+            for k in (col + 1)..p {
+                let avg = 0.5 * (hess[[col, k]] + hess[[k, col]]);
+                hess[[col, k]] = avg;
+                hess[[k, col]] = avg;
+            }
+        }
+        Ok((nll, grad, hess))
+    }
+
+    /// #415 CPU-verifiable parity lock: the device-arithmetic emulator
+    /// reproduces the production host contraction `pullback_step6_joint_beta`
+    /// (and, on the fixed-`r` fixture, the fully independent textbook
+    /// `reference_pullback`) on every box. The two paths differ only by the
+    /// floating-point ASSOCIATION order of each output's inner reduction (the
+    /// emulator sums grad per-output-k / inner-a like the `.cu`; the host sums
+    /// per-a / inner-k), so a mixed abs+rel band absorbs that reassociation
+    /// while any real algebra drift (dropped term, sign flip, index swap) moves
+    /// an output by O(value), not O(ε). The worst normalized drift is asserted
+    /// to keep ~100× headroom so the band pins the transcription, not slack.
+    #[test]
+    fn step6_device_emulator_matches_host_pullback_415() {
+        const ABS_TOL: f64 = 1e-12;
+        const REL_TOL: f64 = 1e-11;
+        let mut worst_ratio = 0.0_f64;
+        let mut close = |a: f64, b: f64| -> bool {
+            if a == b {
+                return true;
+            }
+            let diff = (a - b).abs();
+            let band = ABS_TOL + REL_TOL * a.abs().max(b.abs());
+            worst_ratio = worst_ratio.max(diff / band);
+            diff <= band
+        };
+
+        let mut checked = 0usize;
+
+        // Arm A — varied mixed-r batches (exercise every zero-skip branch).
+        for &(n_rows, p) in &[(1usize, 3usize), (5, 4), (37, 6), (64, 8)] {
+            let (outs, jacs) = varied_step6_rows(n_rows, p);
+            let rows: Vec<SurvivalFlexStep6RowPullback<'_>> = outs
+                .iter()
+                .zip(jacs.iter())
+                .map(|(o, j)| SurvivalFlexStep6RowPullback {
+                    primary: o,
+                    jacobian: j.as_slice(),
+                })
+                .collect();
+
+            let (host_nll, host_grad, host_hess) =
+                pullback_step6_joint_beta(&rows, p).expect("host reference");
+            let (emu_nll, emu_grad, emu_hess) =
+                emulate_step6_joint_beta_device(&rows, p).expect("device emulator");
+
+            assert!(
+                close(emu_nll, host_nll),
+                "nll drift (n={n_rows}, p={p}): emu {emu_nll} vs host {host_nll}"
+            );
+            for j in 0..p {
+                assert!(
+                    close(emu_grad[j], host_grad[j]),
+                    "grad[{j}] drift (n={n_rows}, p={p}): emu {} vs host {}",
+                    emu_grad[j],
+                    host_grad[j]
+                );
+            }
+            for a in 0..p {
+                for b in 0..p {
+                    assert!(
+                        close(emu_hess[[a, b]], host_hess[[a, b]]),
+                        "hess[{a},{b}] drift (n={n_rows}, p={p}): emu {} vs host {}",
+                        emu_hess[[a, b]],
+                        host_hess[[a, b]]
+                    );
+                    // Emulator must produce an exactly symmetric H (same
+                    // symmetrization pass as the device host-reduction).
+                    assert_eq!(
+                        emu_hess[[a, b]],
+                        emu_hess[[b, a]],
+                        "emulator H not symmetric at ({a},{b}) (n={n_rows}, p={p})"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+
+        // Arm B — fixed-r hand fixture cross-checked against the INDEPENDENT
+        // textbook `reference_pullback` (Σ_rows Jᵀ H_p J), not just the
+        // production host path, so the emulator is anchored to a second
+        // implementation of the contraction.
+        let r = 3usize;
+        let p = 4usize;
+        let row_specs: Vec<(f64, Vec<f64>, Vec<f64>, Vec<f64>)> = vec![
+            (
+                1.5,
+                vec![0.3, -0.7, 1.1],
+                vec![
+                    2.0, -0.5, 0.4, //
+                    -0.5, 1.3, 0.2, //
+                    0.4, 0.2, 0.9, //
+                ],
+                vec![
+                    1.0, 0.0, 0.5, -0.2, //
+                    0.0, 1.0, 0.0, 0.3, //
+                    0.7, -0.1, 1.0, 0.0, //
+                ],
+            ),
+            (
+                -0.25,
+                vec![-1.2, 0.4, 0.6],
+                vec![
+                    1.1, 0.3, -0.2, //
+                    0.3, 0.8, 0.5, //
+                    -0.2, 0.5, 1.4, //
+                ],
+                vec![
+                    0.2, 1.0, 0.0, 0.0, //
+                    -0.4, 0.0, 1.0, 0.6, //
+                    0.0, 0.3, 0.0, 1.0, //
+                ],
+            ),
+        ];
+        let primary_outputs: Vec<SurvivalFlexStep5RowOutputs> = row_specs
+            .iter()
+            .map(|(nll, g, h, _)| SurvivalFlexStep5RowOutputs {
+                row_nll: *nll,
+                grad: g.clone(),
+                hess: h.clone(),
+            })
+            .collect();
+        let pullbacks: Vec<SurvivalFlexStep6RowPullback<'_>> = primary_outputs
+            .iter()
+            .zip(row_specs.iter())
+            .map(|(po, (_, _, _, jac))| SurvivalFlexStep6RowPullback {
+                primary: po,
+                jacobian: jac,
+            })
+            .collect();
+        let (emu_nll, emu_grad, emu_hess) =
+            emulate_step6_joint_beta_device(&pullbacks, p).expect("device emulator (hand fixture)");
+        let (ref_nll, ref_grad, ref_hess) = reference_pullback(&row_specs, r, p);
+        assert!(
+            close(emu_nll, ref_nll),
+            "hand fixture nll: emu {emu_nll} vs textbook {ref_nll}"
+        );
+        for j in 0..p {
+            assert!(
+                close(emu_grad[j], ref_grad[j]),
+                "hand fixture grad[{j}]: emu {} vs textbook {}",
+                emu_grad[j],
+                ref_grad[j]
+            );
+            for k in 0..p {
+                assert!(
+                    close(emu_hess[[j, k]], ref_hess[j * p + k]),
+                    "hand fixture hess[{j},{k}]: emu {} vs textbook {}",
+                    emu_hess[[j, k]],
+                    ref_hess[j * p + k]
+                );
+                checked += 1;
+            }
+        }
+
+        assert!(
+            checked > 0,
+            "step6 emulator parity-lock swept zero elements — coverage regressed"
+        );
+        assert!(
+            worst_ratio <= 1e-2,
+            "step6 parity-lock headroom collapsed: worst drift/tolerance = {worst_ratio:.3e} \
+             (want ≤ 1e-2); the band is absorbing conditioning noise rather than pinning the \
+             device transcription"
+        );
+    }
+
+    /// #415 structural lockstep guard: the `.cu` must still spell the exact
+    /// arithmetic `emulate_step6_row_pullback_device` mirrors. A dropped
+    /// skip-zero branch, a renamed output, or a re-indexed contraction removes
+    /// one of these load-bearing substrings and fails the build ON EVERY BOX,
+    /// flagging that the CPU emulator is now stale relative to the device
+    /// program. (The source const is available on all targets specifically so
+    /// this runs in CPU CI, not only on the GPU runner.)
+    #[test]
+    fn step6_device_emulator_source_lockstep_fingerprint_415() {
+        let src = SURVIVAL_FLEX_STEP6_SOURCE;
+        let required = [
+            "survival_flex_step6_rows",
+            // grad_row[k] = Σ_a J[a,k]·g_p[a], skip zero g.
+            "if (ga != 0.0) acc += j[a * p + k] * ga;",
+            "grad_row[k] = acc;",
+            // M[a,k] = Σ_b H_p[a,b]·J[b,k], skip zero H.
+            "double hab = h_p[a * r + b];",
+            "if (hab != 0.0) acc += hab * j[b * p + k];",
+            "m_row[a * p + k] = acc;",
+            // hess_row[col,k] = Σ_a J[a,col]·M[a,k], skip zero J.
+            "double jac = j[a * p + col];",
+            "if (jac != 0.0) acc += jac * m_row[a * p + k];",
+            "hess_row[col * p + k] = acc;",
+        ];
+        for tok in required {
+            assert!(
+                src.contains(tok),
+                "SURVIVAL_FLEX_STEP6_SOURCE no longer contains `{tok}` — the CPU \
+                 device-arithmetic emulator `emulate_step6_row_pullback_device` is now stale; \
+                 re-derive it in lockstep with the .cu edit so the #415 CPU↔device parity-lock \
+                 keeps testing the LIVE device program."
+            );
+        }
     }
 
     /// GPU-vs-CPU parity for the on-device Step-6 joint-β contraction.

@@ -116,7 +116,8 @@ use crate::survival::construction::{
     optimize_survival_baseline_config_with_gradient_only, parse_survival_distribution,
     parse_survival_likelihood_mode, parse_survival_time_basis_config, positive_survival_time_seed,
     require_structural_survival_time_basis, resolve_survival_marginal_slope_time_anchor_value,
-    resolve_survival_time_anchor_value, resolved_survival_time_basis_config_from_build,
+    resolve_survival_time_anchor_value, resolve_survival_transformation_time_anchor_value,
+    resolved_survival_time_basis_config_from_build,
     survival_derivative_guard_for_likelihood,
 };
 

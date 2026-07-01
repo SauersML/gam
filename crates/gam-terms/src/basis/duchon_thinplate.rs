@@ -398,53 +398,84 @@ fn build_duchon_basis_uncached(
             spec.operator_penalties.stiffness,
             OperatorPenaltySpec::Active { .. }
         );
-        if frozen_radial_reparam.is_none() && !operators_active {
-            let kernel_cols = kernel_transform.ncols();
-            if kernel_cols > 0 {
-                // Build the un-rotated constrained kernel design once, take its
-                // realized Gram `G_c = (K·Z)ᵀ(K·Z)`, and solve the generalized
-                // eigenproblem `Ω_c v = μ G_c v` with `Ω_c = α²·ZᵀK_CC Z`.
-                let raw = build_duchon_basis_designwithworkspace(
-                    data,
-                    centers.view(),
-                    spec.length_scale,
-                    spec.power,
-                    effective_nullspace_order,
-                    aniso.as_deref(),
-                    None,
-                    workspace,
-                )?;
-                let kernel_block = raw.basis.slice(s![.., 0..kernel_cols]);
-                let design_gram = symmetrize_penalty(&fast_atb(&kernel_block, &kernel_block));
-                let omega_constrained = duchon_constrained_bending_penalty(
-                    centers.view(),
-                    spec.length_scale,
-                    spec.power,
-                    effective_nullspace_order,
-                    aniso.as_deref(),
-                    &kernel_transform,
-                )?;
-                let (v, _mu) =
-                    thin_plate_radial_reparam_data_metric(&omega_constrained, &design_gram)?;
-                // A degenerate reparam (no retained modes) would gut the basis;
-                // only adopt `V` when it preserves at least one radial column.
-                if v.ncols() > 0 {
-                    kernel_transform = fast_ab(&kernel_transform, &v);
-                    frozen_radial_reparam = Some(v);
-                }
-            }
-        }
-        let d = build_duchon_basis_designwithworkspace(
+        // #1718: build the UN-rotated constrained design `[K·Z | poly]` exactly
+        // ONCE. The data-metric radial reparam `V` (#1355) rotates only the
+        // radial columns, so the final rotated design is `[(K·Z)·V | poly]` — a
+        // cheap `k`-wide post-multiply, NOT a second full `n·k` kernel
+        // re-evaluation. This mirrors the thin-plate builder
+        // (`create_thin_plate_spline_basis_scaled…`, which builds `K·Z` once then
+        // `fast_ab(K·Z, V)`). Previously the Duchon dense path evaluated the
+        // whole `n·k` kernel twice — once to get `G_c` for `V`, then again with
+        // `V` folded into `Z` — which is the 1.5–2.5× cost gap vs thin-plate.
+        let raw = build_duchon_basis_designwithworkspace(
             data,
             centers.view(),
             spec.length_scale,
             spec.power,
             effective_nullspace_order,
             aniso.as_deref(),
-            frozen_radial_reparam.as_ref(),
+            None,
             workspace,
         )?;
-        let basis = d.basis;
+        // Un-rotated radial column count of the single `[K·Z | poly]` build. Read
+        // it off the design (kernel columns come first) rather than from
+        // `kernel_transform`, whose `ncols` on the replay path is already the
+        // rotated width `V.ncols()`.
+        let raw_kernel_cols = raw.basis.ncols().saturating_sub(poly_cols);
+        // Resolve `V`: replay the frozen reparam on predict / κ-trial paths, or
+        // compute a fresh data-metric reparam on the dense cold path (gated to the
+        // native-Gram-only config; operator-penalty configs keep the un-rotated
+        // basis so their collocation Grams stay in the same frame, #1355).
+        let radial_reparam_v: Option<Array2<f64>> = if let Some(v) =
+            frozen_radial_reparam.as_ref()
+        {
+            Some(v.clone())
+        } else if !operators_active && raw_kernel_cols > 0 {
+            // Realized Gram `G_c = (K·Z)ᵀ(K·Z)` from the single build, then solve
+            // the generalized eigenproblem `Ω_c v = μ G_c v` with
+            // `Ω_c = α²·ZᵀK_CC Z`.
+            let kernel_block = raw.basis.slice(s![.., 0..raw_kernel_cols]);
+            let design_gram = symmetrize_penalty(&fast_atb(&kernel_block, &kernel_block));
+            let omega_constrained = duchon_constrained_bending_penalty(
+                centers.view(),
+                spec.length_scale,
+                spec.power,
+                effective_nullspace_order,
+                aniso.as_deref(),
+                &kernel_transform,
+            )?;
+            let (v, _mu) =
+                thin_plate_radial_reparam_data_metric(&omega_constrained, &design_gram)?;
+            // A degenerate reparam (no retained modes) would gut the basis; only
+            // adopt `V` when it preserves at least one radial column.
+            if v.ncols() > 0 {
+                kernel_transform = fast_ab(&kernel_transform, &v);
+                frozen_radial_reparam = Some(v.clone());
+                Some(v)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        // Assemble `[(K·Z)·V | poly]` from the single un-rotated build.
+        let basis = if let Some(v) = radial_reparam_v.as_ref() {
+            let kernel_view = raw.basis.slice(s![.., 0..raw_kernel_cols]);
+            let kernel_rotated = fast_ab(&kernel_view, v);
+            let rotated_cols = kernel_rotated.ncols();
+            let mut basis = Array2::<f64>::zeros((raw.basis.nrows(), rotated_cols + poly_cols));
+            basis
+                .slice_mut(s![.., 0..rotated_cols])
+                .assign(&kernel_rotated);
+            if poly_cols > 0 {
+                basis
+                    .slice_mut(s![.., rotated_cols..])
+                    .assign(&raw.basis.slice(s![.., raw_kernel_cols..]));
+            }
+            basis
+        } else {
+            raw.basis
+        };
         let identifiability_transform = spatial_identifiability_transform_from_design(
             data,
             basis.view(),

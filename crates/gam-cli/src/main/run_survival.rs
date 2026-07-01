@@ -491,10 +491,21 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     // left truncation the earliest entry is a positive left-tail point and
     // centering there inflates the unpenalized linear-trend column, blowing up
     // the time-block seed score so REML rejects every seed (issue #751). The
-    // location-scale path keeps the earliest-entry anchor. An explicit
-    // `--survival-time-anchor` is honored by both.
+    // location-scale path keeps the earliest-entry anchor. The default
+    // transformation (Royston-Parmar) baseline suffers the identical pathology
+    // under left truncation — the inflated one-signed column rails the
+    // transformation smoothing selection and collapses the fit to a
+    // covariate-independent degenerate surface (issue #1790) — so it too switches
+    // to the robust interior anchor when the data is left-truncated. An explicit
+    // `--survival-time-anchor` is honored by all paths.
     let time_anchor = if likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
         resolve_survival_marginal_slope_time_anchor_value(
+            &age_entry,
+            &age_exit,
+            args.survival_time_anchor,
+        )?
+    } else if likelihood_mode == SurvivalLikelihoodMode::Transformation {
+        resolve_survival_transformation_time_anchor_value(
             &age_entry,
             &age_exit,
             args.survival_time_anchor,

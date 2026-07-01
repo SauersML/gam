@@ -5424,4 +5424,17 @@ pub(crate) struct RemlState<'a> {
     /// `FitConfig::persist_warm_start_disk` flips this to `true` only when the
     /// caller explicitly asks for cross-process / repeat-fit persistence.
     pub(crate) persistent_warm_start_disk_enabled: AtomicBool,
+    /// #1033: memoized fit-invariant O(n) response/weight scalars.
+    ///
+    /// `gaussian_weight_log_sum_half` (`½·Σ log wᵢ`) and `gaussian_dp_floor_scale`
+    /// (the weighted null deviance `D₀`) are pure functions of the borrowed
+    /// `(y, weights)` — fields `reset_surface` NEVER reassigns — so they are
+    /// constant for the whole life of the `RemlState`. They were the last O(n)
+    /// passes the n-free κ outer loop ran on EVERY `assemble_and_evaluate`
+    /// (each an n-length scalar reduction, no k factor). Memoizing them once per
+    /// fit makes the per-trial eval touch only k-dim objects, completing the
+    /// issue's sufficient-statistic invariant literally. Plain scalar closures,
+    /// no rayon inside the `get_or_init` (no deadlock trap).
+    pub(crate) gaussian_weight_log_sum_half_cache: std::sync::OnceLock<f64>,
+    pub(crate) gaussian_dp_floor_scale_cache: std::sync::OnceLock<f64>,
 }
