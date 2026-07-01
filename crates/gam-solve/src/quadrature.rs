@@ -4654,7 +4654,10 @@ fn cloglog_g_derivatives(t: f64) -> (f64, f64, f64, f64, f64) {
 /// Compute `L(μ,σ) = E[g(μ + σZ)]` via Gauss-Hermite quadrature.
 ///
 /// The number of GHQ nodes is determined by the `QuadratureContext` cache;
-/// `n_nodes` selects from the available rule sizes (7, 15, 21, 31).
+/// `n_nodes` selects from the available rule sizes (7, 15, 21, 31), but
+/// nondegenerate cloglog convolutions are never evaluated below 31 nodes: the
+/// asymmetric double-exponential transition is too sharp for 15-point GHQ in
+/// the moderate-variance band used by ALO/cubic-cell diagnostics.
 ///
 /// When `sigma` is negligibly small the function evaluates `g(mu)` directly,
 /// bypassing quadrature.
@@ -4665,7 +4668,8 @@ pub fn cloglog_ghq_value(ctx: &QuadratureContext, mu: f64, sigma: f64, n_nodes: 
     }
     let inv_sqrt_pi = 1.0 / std::f64::consts::PI.sqrt();
     let scale = SQRT_2 * sigma;
-    with_gh_nodesweights(ctx, n_nodes, |nodes, weights| {
+    let effective_nodes = n_nodes.max(31);
+    with_gh_nodesweights(ctx, effective_nodes, |nodes, weights| {
         let mut sum = 0.0_f64;
         for i in 0..nodes.len() {
             let t = mu + scale * nodes[i];
