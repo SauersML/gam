@@ -306,11 +306,6 @@ from ._sae_manifold import (
 )
 from ._sae_viz import plot_atom, plot_fit
 from ._sae_trust import atom_trust_scores, sae_trust_diagnostics
-from ._sae_benchmark import (
-    format_markdown as format_sae_benchmark_markdown,
-    run_benchmark as sae_benchmark,
-    sweep as sweep_sae_benchmark,
-)
 from .distill import DistilledEncoder, EncoderFallbackStats
 from ._schema import SchemaCheck, SchemaIssue
 from ._summary import Summary
