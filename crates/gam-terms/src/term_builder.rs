@@ -1796,7 +1796,7 @@ pub fn build_smooth_basis(
         });
     }
 
-    let smooth_double_penalty = option_bool(options, "double_penalty").unwrap_or(true);
+    let smooth_double_penalty = option_bool(options, "double_penalty").unwrap_or(false);
     let type_opt = resolve_smooth_type_name(kind, cols.len(), options);
 
     if matches!(type_opt.as_str(), "fs" | "sz" | "re") {
@@ -3453,14 +3453,12 @@ pub fn build_smooth_basis(
             // mgcv only adds a null-space shrinkage penalty there under the
             // opt-in `select = TRUE` (which gam exposes as `double_penalty`).
             //
-            // The general smooth default (`smooth_double_penalty`, true) is
-            // calibrated for 1-D `s()` terms; carrying it into tensors silently
-            // shrinks the genuinely-present bilinear interaction signal, so
-            // REML places positive weight on the extra ridge and systematically
-            // OVER-SMOOTHS the recovered surface relative to mgcv's plain
-            // `te`/`ti` (gam#700/#701/#702/#703). Default tensors to no extra
-            // null-space penalty; an explicit user `double_penalty=`/`select=`
-            // still wins.
+            // The general smooth default (`smooth_double_penalty`, false) now
+            // matches mgcv's DEFAULT `select = FALSE`: plain smooths expose one
+            // roughness coordinate per smooth, while Marra-Wood null-space
+            // shrinkage is opt-in via `double_penalty=true`/`select=true`.
+            // Tensors keep the same no-extra-ridge default; an explicit user
+            // `double_penalty=`/`select=` still wins.
             let tensor_double_penalty = option_bool(options, "double_penalty").unwrap_or(false);
             Ok(SmoothBasisSpec::TensorBSpline {
                 feature_cols: canon_cols,
@@ -5025,6 +5023,45 @@ mod tests {
             err.contains("Valid options: ["),
             "error should list valid option names, got: {err}"
         );
+    }
+
+    #[test]
+    fn plain_univariate_smooth_defaults_to_single_penalty_block() {
+        let ds = continuous_dataset(
+            &["y", "x"],
+            (0..40)
+                .map(|i| {
+                    let x = i as f64 / 39.0;
+                    vec![x.sin(), x]
+                })
+                .collect(),
+        );
+        let col_map = ds.column_map();
+
+        for (formula, expected) in [
+            ("y ~ s(x)", false),
+            ("y ~ s(x, double_penalty=false)", false),
+            ("y ~ s(x, double_penalty=true)", true),
+        ] {
+            let parsed = parse_formula(formula).expect("parse smooth formula");
+            let mut notes = Vec::new();
+            let terms = build_termspec(
+                &parsed.terms,
+                &ds,
+                &col_map,
+                &mut notes,
+                &gam_runtime::resource::ResourcePolicy::default_library(),
+            )
+            .unwrap_or_else(|err| panic!("{formula} must build, got: {err:?}"));
+            let SmoothBasisSpec::BSpline1D { spec, .. } = &terms.smooth_terms[0].basis else {
+                panic!("{formula} must lower to a BSpline1D smooth");
+            };
+            assert_eq!(
+                spec.double_penalty, expected,
+                "{formula} resolved double_penalty={}; expected {expected}",
+                spec.double_penalty
+            );
+        }
     }
 
     #[test]

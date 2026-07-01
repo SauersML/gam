@@ -135,7 +135,7 @@ second-order difference penalty.
 | `degree` | 3 | Polynomial degree of the B-spline. |
 | `penalty_order` | 2 | Derivative order penalised (1 = slope, 2 = curvature). |
 | `type` | `ps` (1-D), `tps` (2+D) | `ps`, `tps`, `matern`, `duchon`, `sphere`. |
-| `double_penalty` | `true` | Add a ridge penalty alongside the difference penalty. |
+| `double_penalty` | `false` | Opt in to a Marra-Wood null-space ridge alongside the difference penalty. |
 | `bc` | `none` | Boundary condition for both endpoints: `none`, `clamped` (zero first derivative), or `anchored` (fixed value). Combine with `side=left`/`right` for half-open smooths. |
 | `bc_left`, `bc_right` | inherit from `bc` | Per-endpoint overrides, with aliases `start_bc`/`end_bc`. |
 | `anchor`, `anchor_left`, `anchor_right` | `0` for anchored endpoints | Fixed endpoint value(s) when an endpoint uses `anchored`. |
