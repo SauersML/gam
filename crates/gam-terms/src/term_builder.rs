@@ -2988,11 +2988,6 @@ pub fn build_smooth_basis(
             )
             .map_err(|e| e.to_string())?;
             let centers_explicit = has_explicit_countwith_basis_alias(options, "centers");
-            let requested_centers = parse_countwith_basis_alias(
-                options,
-                "centers",
-                cap_default_spatial_centers(options, plan.centers),
-            )?;
             let polynomial_cols = match nullspace_order {
                 DuchonNullspaceOrder::Zero => 1,
                 DuchonNullspaceOrder::Linear => cols.len() + 1,
@@ -3000,6 +2995,17 @@ pub fn build_smooth_basis(
                     crate::basis::duchon_nullspace_dimension(cols.len(), degree)
                 }
             };
+            let default_centers = default_duchon_center_count(
+                ds.values.nrows(),
+                cols.len(),
+                plan.centers,
+                polynomial_cols,
+            );
+            let requested_centers = parse_countwith_basis_alias(
+                options,
+                "centers",
+                cap_default_spatial_centers(options, default_centers),
+            )?;
             if requested_centers <= polynomial_cols {
                 return Err(TermBuilderError::incompatible_config(format!(
                     "Duchon smooth '{}' requested basis dimension {} but order={:?} in {}D needs {} polynomial null-space columns; choose centers/k > {}",
@@ -4353,6 +4359,27 @@ fn default_matern_center_count(n: usize, d: usize, planned_count: usize) -> usiz
     planned_count.max(low_n_floor).max(1)
 }
 
+fn default_duchon_center_count(
+    n: usize,
+    d: usize,
+    planned_count: usize,
+    polynomial_cols: usize,
+) -> usize {
+    // Duchon fits pay a larger setup cost than Matérn/TPS because the
+    // constrained radial block is rotated through its center Gram and several
+    // operator-collocation penalties.  The old generic spatial default handed a
+    // 2-D Gaussian Duchon at n≈500 more than one hundred centers, so cold fits
+    // spent most of their time in dense O(k³) eigensolves even though the REML
+    // smoother uses a low-rank basis.  mgcv's Duchon spline default is the
+    // thin-plate-style `k = 10 * 3^(d - 1)` (30 in 2-D); use that as the
+    // implicit low-rank cap while preserving the user's explicit `centers=`/`k=`
+    // request above.  The polynomial null space must still fit, so tiny
+    // high-order bases are raised to the smallest admissible count.
+    let mgcv_default = 10usize.saturating_mul(3usize.saturating_pow(d.saturating_sub(1) as u32));
+    let low_n_floor = (polynomial_cols + 1).min(n).max(1);
+    planned_count.min(mgcv_default).max(low_n_floor)
+}
+
 pub fn parse_countwith_basis_alias(
     options: &BTreeMap<String, String>,
     primarykey: &str,
@@ -5479,6 +5506,41 @@ mod tests {
             panic!("expected Duchon term");
         };
         assert_eq!(spec.length_scale, Some(0.25));
+    }
+
+    #[test]
+    fn multidimensional_duchon_default_uses_low_rank_mgcv_sized_basis() {
+        let ds = continuous_dataset(
+            &["y", "x1", "x2"],
+            (0..500)
+                .map(|i| {
+                    let x1 = 2.0 * (i as f64 / 499.0) - 1.0;
+                    let x2 = (((37 * i) % 500) as f64 / 499.0) * 2.0 - 1.0;
+                    vec![(2.0 * x1).sin() + (1.5 * x2).cos(), x1, x2]
+                })
+                .collect(),
+        );
+        let parsed = parse_formula("y ~ duchon(x1, x2)").expect("parse");
+        let col_map = ds.column_map();
+        let mut notes = Vec::new();
+        let terms = build_termspec(
+            &parsed.terms,
+            &ds,
+            &col_map,
+            &mut notes,
+            &gam_runtime::resource::ResourcePolicy::default_library(),
+        )
+        .expect("build default 2D duchon termspec");
+        let SmoothBasisSpec::Duchon { spec, .. } = &terms.smooth_terms[0].basis else {
+            panic!("expected Duchon term");
+        };
+        let CenterStrategy::Auto(inner) = &spec.center_strategy else {
+            panic!("expected auto center strategy");
+        };
+        assert!(matches!(
+            inner.as_ref(),
+            CenterStrategy::FarthestPoint { num_centers: 30 }
+        ));
     }
 
     #[test]
