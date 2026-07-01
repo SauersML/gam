@@ -240,6 +240,49 @@ fn all_assignment_topology_combinations_pass_startup_validation_1782() {
     }
 }
 
+/// Run the real outer `OuterProblem::run` ("SAE manifold") cascade — the exact
+/// FFI entry — for one topology/assignment pair on the tiny planted-circle
+/// fixture, with the single-PCA-seed budget the production `sae_manifold_fit`
+/// FFI uses, and return the reconstruction EV. A non-converged best-so-far
+/// iterate is still returned as `Ok`, so a returned EV means the fit RAN to a
+/// real reconstruction rather than aborting at startup / in the outer solver.
+fn run_full_fit(
+    z: ArrayView2<'_, f64>,
+    k: usize,
+    topo: Topo,
+    mode: AssignmentMode,
+    label: &str,
+) -> f64 {
+    let (mut objective, seed) = objective_and_seed(z, k, topo, mode);
+    let n_params = seed.len();
+    gam_solve::rho_optimizer::OuterProblem::new(n_params)
+        .with_initial_rho(seed)
+        .with_max_iter(4)
+        .with_seed_config(gam_problem::SeedConfig {
+            max_seeds: 1,
+            seed_budget: 1,
+            ..Default::default()
+        })
+        .run(&mut objective, "SAE manifold")
+        .unwrap_or_else(|e| {
+            // The two #1782 failure surfaces both land here: the jumprelu / euclidean
+            // "no candidate seeds passed outer startup validation" abort, and the
+            // softmax "BFGS aborted: globally infeasible neighbourhood at seed
+            // (probe-refusal guard)" abort — both are the emptied / globally-refused
+            // seed cascade the fix removes by presenting a recoverable infeasible-ρ
+            // refusal as a finite collapse wall instead of `+∞`.
+            panic!("#1782 {label} fit must not abort at startup / in the outer solver, got: {e}")
+        });
+    let fitted = objective.into_fitted();
+    let ev = global_ev(z, fitted.term.fitted().view());
+    eprintln!("REPRO1782 {label} fit: ev={ev:.4}");
+    assert!(
+        ev.is_finite(),
+        "#1782 {label} produced a non-finite reconstruction EV ({ev})"
+    );
+    ev
+}
+
 /// The assignment axis (the issue's headline: jumprelu/softmax) must not just
 /// pass validation but actually FIT: run the real outer `OuterProblem::run`
 /// ("SAE manifold") cascade — the exact FFI entry — on circle atoms for each
@@ -247,35 +290,52 @@ fn all_assignment_topology_combinations_pass_startup_validation_1782() {
 /// well-conditioned, so a low outer-iteration cap keeps this fast; a
 /// non-converged best-so-far iterate is still returned as `Ok`, so this asserts
 /// the fit RUNS to a real reconstruction rather than aborting at startup.
+///
+/// `softmax` is the SECOND #1782 failure surface: its seed and its whole
+/// neighbourhood land in the recoverable infeasible-ρ refusal class, so the
+/// outer BFGS lane previously returned `+∞` for every probe, never accepted a
+/// step, and the bridge's non-termination guard escalated the globally-refused
+/// neighbourhood to a FATAL seed rejection ("BFGS aborted: globally infeasible
+/// neighbourhood at seed (probe-refusal guard)"). `ibp_map`+`circle` lands in
+/// the PD region and never trips it — RED before the fix on `softmax`, GREEN
+/// after (the refusal now presents the finite collapse wall the EFS lane uses).
 #[test]
 fn assignment_kinds_fit_on_circle_1782() {
     let z = planted_circle_embedded(48, 6, 0.03);
     let k = 4usize;
     for (label, mode) in [
-        ("ibp_map", AssignmentMode::ibp_map(1.0, 1.0, false)),
-        ("softmax", AssignmentMode::softmax(1.0)),
-        ("threshold_gate", AssignmentMode::threshold_gate(1.0, 0.0)),
+        ("circle/ibp_map", AssignmentMode::ibp_map(1.0, 1.0, false)),
+        ("circle/softmax", AssignmentMode::softmax(1.0)),
+        (
+            "circle/threshold_gate",
+            AssignmentMode::threshold_gate(1.0, 0.0),
+        ),
     ] {
-        let (mut objective, seed) = objective_and_seed(z.view(), k, Topo::Circle, mode);
-        let n_params = seed.len();
-        gam_solve::rho_optimizer::OuterProblem::new(n_params)
-            .with_initial_rho(seed)
-            .with_max_iter(4)
-            .with_seed_config(gam_problem::SeedConfig {
-                max_seeds: 1,
-                seed_budget: 1,
-                ..Default::default()
-            })
-            .run(&mut objective, "SAE manifold")
-            .unwrap_or_else(|e| {
-                panic!("#1782 circle/{label} fit must not abort at startup, got: {e}")
-            });
-        let fitted = objective.into_fitted();
-        let ev = global_ev(z.view(), fitted.term.fitted().view());
-        eprintln!("REPRO1782 circle/{label} fit: ev={ev:.4}");
-        assert!(
-            ev.is_finite(),
-            "#1782 circle/{label} produced a non-finite reconstruction EV ({ev})"
+        run_full_fit(z.view(), k, Topo::Circle, mode, label);
+    }
+}
+
+/// The topology axis of #1782: on identical clean planted-circle data the
+/// `euclidean` and `linear` atom topologies (whose rank-deficient PCA seed lands
+/// in the recoverable infeasible-ρ refusal class) must also FIT through the real
+/// outer cascade, not abort with an emptied / globally-refused seed cascade. Same
+/// single-PCA-seed budget and low outer-iteration cap as the assignment-axis
+/// test, so it stays fast. RED before the fix (`euclidean`/`linear` aborted at
+/// "no candidate seeds passed outer startup validation"); GREEN after.
+#[test]
+fn topologies_fit_on_circle_data_1782() {
+    let z = planted_circle_embedded(48, 6, 0.03);
+    let k = 4usize;
+    for (label, topo) in [
+        ("euclidean/ibp_map", Topo::Euclidean),
+        ("linear/ibp_map", Topo::Linear),
+    ] {
+        run_full_fit(
+            z.view(),
+            k,
+            topo,
+            AssignmentMode::ibp_map(1.0, 1.0, false),
+            label,
         );
     }
 }
