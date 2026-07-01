@@ -322,6 +322,15 @@ fn run() -> CliResult<()> {
         Some(raw) => gam::progress_log::init_logging_at(
             gam::progress_log::parse_level_directive(raw).unwrap_or(log::LevelFilter::Info),
         ),
+        None if cli.quiet => gam::progress_log::init_logging_at(log::LevelFilter::Off),
+        None if cli.verbose > 0 => {
+            let level = match cli.verbose {
+                1 => log::LevelFilter::Info,
+                2 => log::LevelFilter::Debug,
+                _ => log::LevelFilter::Trace,
+            };
+            gam::progress_log::init_logging_at(level);
+        }
         None => gam::progress_log::init_logging(),
     }
     log::info!(
