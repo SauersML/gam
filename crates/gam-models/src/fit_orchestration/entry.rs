@@ -499,6 +499,11 @@ fn fit_expectile_laws(
         family: Some("gaussian".to_string()),
         link: Some("identity".to_string()),
         expectile_tau: None,
+        // The inner Gaussian-identity design carries no frailty; the CLI always
+        // populates `frailty = Some(FrailtySpec::None)`, and the standard
+        // materializer's guard rejects ANY `Some(..)`. Clear it explicitly so the
+        // inner fit routes through the standard family (#1780).
+        frailty: None,
         ..config.clone()
     };
 
