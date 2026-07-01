@@ -143,14 +143,6 @@ from ._select_topology import (
 )
 from ._diagnostics import Diagnostics
 from . import diagnostics
-from . import identifiability
-from .identifiability import (
-    IdentifiabilityReport,
-    IdentifiabilityTheoremResult,
-    IdentifiableFactorFitResult,
-    check as identifiability_check,
-    identifiable_factor_fit,
-)
 from ._equivariant import (
     EquivariantPenalty,
     GaugeCompanion,
@@ -196,14 +188,7 @@ from ._penalty_descriptors import (
 # `gamfit._penalties.ARDPenalty`, `gamfit._penalties.BlockOrthogonalityPenalty`,
 # etc., and continue to drive the REML core.
 ARDPenalty = _ARDPenaltyDescriptor
-from . import examples, topology
-from .examples import (
-    PartialSupervisionExample,
-    PartialSupervisionFit,
-    SaeSupervisedFit,
-    partial_supervision,
-    sae_supervised,
-)
+from . import topology
 from ._exceptions import (
     AloError,
     ArrowSchurError,
@@ -290,29 +275,8 @@ from ._sampling import (
     SamplingConfig,
 )
 from ._tables import PredictionResult
-from ._sae_manifold import (
-    GumbelTemperatureSchedule,
-    ManifoldSAE,
-    SaeManifoldAtomFit,
-    SaeManifoldFitResult,
-    align,
-    featurize,
-    fit as sae_fit,
-    gumbel_geometric_schedule,
-    gumbel_linear_schedule,
-    gumbel_reciprocal_iter_schedule,
-    plot,
-    sae_ev_vs_k_frontier,
-    sae_manifold_fit,
-)
 from ._sae_viz import plot_atom, plot_fit
 from ._sae_trust import atom_trust_scores, sae_trust_diagnostics
-from ._sae_benchmark import (
-    format_markdown as format_sae_benchmark_markdown,
-    run_benchmark as sae_benchmark,
-    sweep as sweep_sae_benchmark,
-)
-from .distill import DistilledEncoder, EncoderFallbackStats
 from ._schema import SchemaCheck, SchemaIssue
 from ._summary import Summary
 from ._validation import FormulaValidation
@@ -349,12 +313,7 @@ except _metadata.PackageNotFoundError:
 # advertised at the top level so users can write ``gamfit.AdaptiveTopK(...)``
 # without an explicit ``gamfit.torch`` import, while keeping the cold-start
 # import path torch-free.
-_LAZY_TORCH_ATTRS: dict[str, tuple[str, str]] = {
-    "AdaptiveTopK":          ("gamfit.torch.modules",     "AdaptiveTopK"),
-    "Crosscoder":            ("gamfit.crosscoder",        "Crosscoder"),
-    "PoincareAtoms":         ("gamfit.torch.hyperbolic",  "PoincareAtoms"),
-    "InterchangeSwapDecoder":("gamfit.torch.interchange", "InterchangeSwapDecoder"),
-}
+_LAZY_TORCH_ATTRS: dict[str, tuple[str, str]] = {}
 
 
 _EXCLUDE_FROM_ALL = {"Path"}
@@ -436,9 +395,7 @@ def _build_public_api() -> list[str]:
 
     public_submodules = {
         "diagnostics",
-        "examples",
         "topology",
-        "identifiability",
         "manifolds",
         "kernels",
     }
