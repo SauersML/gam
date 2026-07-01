@@ -264,37 +264,17 @@ impl<'a> DeflatedArrowSolver<'a> {
             }
         }
 
-        // GS = G_i S⁻¹ (q×K).
-        let mut gs = Array2::<f64>::zeros((q, k));
-        for r in 0..q {
-            for m in 0..k {
-                let mut acc = 0.0_f64;
-                for n in 0..k {
-                    acc += g[[r, n]] * beta_inv[[n, m]];
-                }
-                gs[[r, m]] = acc;
-            }
-        }
+        // GS = G_i S⁻¹ (q×K), via the cache-blocked ndarray/matrixmultiply gemm
+        // instead of an O(q·K²) scalar triple loop (K up to 32k).
+        let gs = g.dot(beta_inv);
 
         // (H⁻¹)_tβ[i] = −G_i S⁻¹ = −GS, layout [col, b].
-        let mut inv_vbeta = Array2::<f64>::zeros((q, k));
-        for col in 0..q {
-            for b in 0..k {
-                inv_vbeta[[col, b]] = -gs[[col, b]];
-            }
-        }
+        let inv_vbeta = -&gs;
 
         // (H⁻¹)_tt[i,i] = A_i⁻¹ + G_i S⁻¹ G_iᵀ = A_i⁻¹ + GS·Gᵀ, layout [r, col].
+        // `GS·Gᵀ` is another gemm (q×K · K×q); accumulate onto A_i⁻¹ in place.
         let mut inv_vv = a_inv;
-        for r in 0..q {
-            for col in 0..q {
-                let mut acc = 0.0_f64;
-                for m in 0..k {
-                    acc += gs[[r, m]] * g[[col, m]];
-                }
-                inv_vv[[r, col]] += acc;
-            }
-        }
+        inv_vv += &gs.dot(&g.t());
 
         Ok((inv_vv, inv_vbeta))
     }
@@ -309,10 +289,13 @@ impl<'a> DeflatedArrowSolver<'a> {
         let total_t = self.cache.delta_t_len();
         let mut out = Array1::<f64>::zeros(total_t);
         let rhs_beta = Array1::<f64>::zeros(self.cache.k);
+        // Reuse one unit-vector buffer: set/clear a single entry per index rather
+        // than allocating and zeroing a total_t-sized RHS on every iteration.
+        let mut rhs_t = Array1::<f64>::zeros(total_t);
         for idx in 0..total_t {
-            let mut rhs_t = Array1::<f64>::zeros(total_t);
             rhs_t[idx] = 1.0;
             let solved = self.solve(rhs_t.view(), rhs_beta.view())?;
+            rhs_t[idx] = 0.0;
             out[idx] = solved.t[idx];
         }
         Ok(out)
@@ -551,19 +534,31 @@ pub(crate) fn cholesky_factor_apply(
     vector: ArrayView1<'_, f64>,
 ) -> Array1<f64> {
     let n = factor.nrows();
+    // `factor` is a lower-triangular Cholesky factor `L` stored row-major; the
+    // represented action is `out = L (Lᵀ v)`.
+    //
+    // Phase 1 — `lt_v = Lᵀ v`. The natural inner-product form reads
+    // `factor[[col, row]]` down a COLUMN (stride `n`), which thrashes cache for
+    // the K×K Schur factor (K up to 32 000). Instead iterate over ROWS `j` of
+    // `L` — contiguous in memory — and scatter `L[j, 0..=j]·v[j]` into `lt_v`,
+    // touching each `L` row once in row-major order (summation order preserved
+    // ⇒ bit-identical).
     let mut lt_v = Array1::<f64>::zeros(n);
-    for row in 0..n {
-        let mut acc = 0.0_f64;
-        for col in row..n {
-            acc += factor[[col, row]] * vector[col];
+    for j in 0..n {
+        let vj = vector[j];
+        if vj == 0.0 {
+            continue;
         }
-        lt_v[row] = acc;
+        for (i, &lji) in factor.row(j).iter().enumerate().take(j + 1) {
+            lt_v[i] += lji * vj;
+        }
     }
+    // Phase 2 — `out = L lt_v`. Already contiguous row-major (`L[row, 0..=row]`).
     let mut out = Array1::<f64>::zeros(n);
     for row in 0..n {
         let mut acc = 0.0_f64;
-        for col in 0..=row {
-            acc += factor[[row, col]] * lt_v[col];
+        for (col, &lrc) in factor.row(row).iter().enumerate().take(row + 1) {
+            acc += lrc * lt_v[col];
         }
         out[row] = acc;
     }
@@ -644,8 +639,10 @@ where
     let mut z = solver
         .solve(r.t.view(), r.beta.view())
         .map_err(|err| format!("solve_b_preconditioned_cg: B preconditioner: {err}"))?;
-    let mut p = z.clone();
+    // p_0 = z_0. Compute rz from z FIRST, then MOVE z into p (no clone) — z is
+    // re-bound at the top of every loop iteration before it is read again.
     let mut rz = sae_inner(&r, &z);
+    let mut p = z;
 
     let rhs_norm = sae_norm(rhs).max(1.0);
     let max_iters = (x.t.len() + x.beta.len()).clamp(8, 256);
