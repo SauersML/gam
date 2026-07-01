@@ -362,22 +362,21 @@ def _pad_or_trim(phi: np.ndarray, n_cols: int) -> np.ndarray:
 
 
 def _decoder_projector(decoder: np.ndarray) -> tuple[np.ndarray, int, int]:
-    if decoder.shape[1] == 0:
+    # Plot-axis selection only — no spectral decomposition. The former
+    # np.linalg.svd principal-subspace projector was numeric linear algebra
+    # computed in Python; a visualization does not need it. Project onto the
+    # leading decoder output coordinates instead and report the ambient output
+    # width as the (upper-bound) rank used purely for the plot label.
+    p = int(decoder.shape[1])
+    if p == 0:
         return np.zeros((0, 2)), 2, 0
-    try:
-        _, s, vh = np.linalg.svd(decoder, full_matrices=False)
-    except np.linalg.LinAlgError:
-        vh = np.eye(decoder.shape[1], min(decoder.shape[1], 2)).T
-        s = np.ones(vh.shape[0])
-    tol = max(decoder.shape) * np.finfo(float).eps * (s[0] if s.size else 1.0)
-    rank = int(np.sum(s > tol))
-    plot_dim = 3 if rank >= 3 else 2
-    keep = min(plot_dim, vh.shape[0])
-    projector = vh[:keep].T
+    plot_dim = 3 if p >= 3 else 2
+    keep = min(plot_dim, p)
+    projector = np.eye(p, keep, dtype=float)
     if keep < plot_dim:
-        pad = np.zeros((decoder.shape[1], plot_dim - keep), dtype=float)
+        pad = np.zeros((p, plot_dim - keep), dtype=float)
         projector = np.column_stack([projector, pad])
-    return projector, plot_dim, rank
+    return projector, plot_dim, p
 
 
 def _project(points: np.ndarray, projector: np.ndarray) -> np.ndarray:
@@ -450,10 +449,10 @@ def _decorate_axis(
     if trust is not None:
         title += f" trust={trust:.3g}"
     ax.set_title(title)
-    ax.set_xlabel("decoder SVD 1")
-    ax.set_ylabel("decoder SVD 2")
+    ax.set_xlabel("decoder output 1")
+    ax.set_ylabel("decoder output 2")
     if plot_dim == 3:
-        ax.set_zlabel("decoder SVD 3")
+        ax.set_zlabel("decoder output 3")
     text = f"basis={basis}\nrank={rank}"
     ax.text2D(0.02, 0.98, text, transform=ax.transAxes, ha="left", va="top") if plot_dim == 3 else ax.text(
         0.02,

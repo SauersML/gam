@@ -370,177 +370,21 @@ def _json_ready(value: Any) -> Any:
     return value
 
 
-def _functional_basis_params(plan: Mapping[str, Any]) -> dict[str, Any] | None:
-    kind = str(plan["kind"]).lower().replace("-", "_")
-    if kind in {"periodic", "periodic_spline", "circle"}:
-        n_harmonics = int(plan.get("n_harmonics", 0))
-        if n_harmonics <= 0:
-            basis_size = int(plan.get("basis_size", 0))
-            n_harmonics = (basis_size - 1) // 2
-        return {"n_harmonics": max(1, n_harmonics)}
-    if kind in {
-        "linear",
-        "linear_rank1",
-        "affine",
-        "duchon",
-        "euclidean",
-        "euclidean_patch",
-    }:
-        centers = plan.get("duchon_centers")
-        if centers is None:
-            return None
-        return {"centers": np.asarray(centers, dtype=float), "m": int(plan["basis_size"])}
-    if kind == "sphere":
-        return {}
-    return None
-
-
-def _weighted_row_mean(rows: np.ndarray, weights: np.ndarray | None) -> np.ndarray | None:
-    rows = np.asarray(rows, dtype=float)
-    if rows.ndim != 2 or rows.shape[0] == 0 or not np.all(np.isfinite(rows)):
-        return None
-    if weights is None:
-        return np.mean(rows, axis=0)
-    weights = np.asarray(weights, dtype=float).reshape(-1)
-    if weights.shape[0] != rows.shape[0] or not np.all(np.isfinite(weights)):
-        return None
-    weights = np.maximum(weights, 0.0)
-    weight_sum = float(np.sum(weights))
-    if not np.isfinite(weight_sum) or weight_sum <= 0.0:
-        return None
-    return np.einsum("n,nm->m", weights / weight_sum, rows, optimize=True)
-
-
-def _channel_se_from_decoder_covariance(
-    gradient: np.ndarray,
-    covariance: np.ndarray | None,
-    output_dim: int,
-) -> np.ndarray | None:
-    if covariance is None:
-        return None
-    gradient = np.asarray(gradient, dtype=float).reshape(-1)
-    covariance = np.asarray(covariance, dtype=float)
-    basis_size = gradient.shape[0]
-    if covariance.shape != (basis_size * output_dim, basis_size * output_dim):
-        return None
-    se = np.zeros(output_dim, dtype=float)
-    for channel in range(output_dim):
-        idx = np.arange(channel, basis_size * output_dim, output_dim)
-        sub = covariance[np.ix_(idx, idx)]
-        var = float(gradient @ sub @ gradient)
-        if not np.isfinite(var):
-            return None
-        se[channel] = np.sqrt(max(var, 0.0))
-    return se
-
-
-def _vector_evidence_payload(
-    estimate: np.ndarray,
-    se: np.ndarray | None = None,
-    **extra: Any,
-) -> dict[str, Any] | None:
-    estimate = np.asarray(estimate, dtype=float)
-    if estimate.size == 0 or not np.all(np.isfinite(estimate)):
-        return None
-    payload: dict[str, Any] = {
-        "estimate": estimate.tolist(),
-        "norm": float(np.linalg.norm(estimate)),
-    }
-    if se is not None:
-        se = np.asarray(se, dtype=float)
-        if se.shape == estimate.shape and np.all(np.isfinite(se)):
-            payload["se"] = se.tolist()
-    payload.update(extra)
-    return payload
-
-
 def _atom_functional_evidence(
     atom: Mapping[str, Any],
     plan: Mapping[str, Any],
 ) -> dict[str, Any] | None:
+    """Pass through the Rust/Riesz per-atom functional-evidence payload.
+
+    A native payload is returned as a shallow copy so the accessor never
+    aliases the raw FFI object; absent, ``None``. There is no Python-side
+    plugin any more: the decoder functional evidence (average value /
+    derivative / peak contrast and their delta-method standard errors) is a
+    numeric result computed in the Rust core, not reconstructed in Python.
+    """
+    del plan  # plan-driven Python basis re-evaluation removed; Rust owns it.
     native = atom.get("functional_evidence")
-    if native is not None:
-        return dict(native)
-
-    params = _functional_basis_params(plan)
-    if params is None:
-        return None
-    coords = np.asarray(atom["on_atom_coords_t"], dtype=float)
-    decoder = np.asarray(atom["decoder_B"], dtype=float)
-    assignments = np.asarray(atom.get("assignments_z"), dtype=float)
-    cov = None if atom.get("decoder_covariance") is None else np.asarray(atom["decoder_covariance"], dtype=float)
-    if coords.ndim != 2 or decoder.ndim != 2 or not np.all(np.isfinite(coords)):
-        return None
-    try:
-        phi, jet, _penalty = rust_module().basis_with_jet(
-            str(plan["kind"]),
-            np.ascontiguousarray(coords),
-            params,
-        )
-    except Exception as exc:
-        raise RuntimeError(f"Basis evaluation failed for kind {plan.get('kind')!r}: {exc}") from exc
-    phi = np.asarray(phi, dtype=float)
-    jet = np.asarray(jet, dtype=float)
-    if (
-        phi.ndim != 2
-        or jet.ndim != 3
-        or phi.shape[0] != coords.shape[0]
-        or phi.shape[1] != decoder.shape[0]
-        or jet.shape[:2] != phi.shape
-        or not np.all(np.isfinite(phi))
-        or not np.all(np.isfinite(jet))
-    ):
-        return None
-
-    output_dim = int(decoder.shape[1])
-    value_gradient = _weighted_row_mean(phi, assignments)
-    if value_gradient is None:
-        return None
-    average_value = _vector_evidence_payload(
-        value_gradient @ decoder,
-        _channel_se_from_decoder_covariance(value_gradient, cov, output_dim),
-    )
-
-    derivative_estimates = []
-    derivative_ses = []
-    for axis in range(jet.shape[2]):
-        grad = _weighted_row_mean(jet[:, :, axis], assignments)
-        if grad is None:
-            return None
-        derivative_estimates.append(grad @ decoder)
-        axis_se = _channel_se_from_decoder_covariance(grad, cov, output_dim)
-        if axis_se is not None:
-            derivative_ses.append(axis_se)
-    derivative_est = np.vstack(derivative_estimates)
-    derivative_se = np.vstack(derivative_ses) if len(derivative_ses) == derivative_est.shape[0] else None
-    average_derivative = _vector_evidence_payload(derivative_est, derivative_se)
-
-    mean = phi @ decoder
-    norm = np.linalg.norm(mean, axis=1)
-    peak_idx = int(np.argmax(norm))
-    baseline_idx = int(np.argmin(norm))
-    contrast_gradient = phi[peak_idx] - phi[baseline_idx]
-    peak_contrast = _vector_evidence_payload(
-        contrast_gradient @ decoder,
-        _channel_se_from_decoder_covariance(contrast_gradient, cov, output_dim),
-        from_coord=coords[baseline_idx].tolist(),
-        to_coord=coords[peak_idx].tolist(),
-    )
-
-    out: dict[str, Any] = {"source": "decoder_covariance_plugin"}
-    if average_value is not None:
-        out["average_value"] = average_value
-    if average_derivative is not None:
-        # The conditional-on-fit average derivative E_data[∂g/∂t] of the fitted
-        # decoder curve. Deliberately NOT aliased as "marginal_slope": the latent
-        # coordinate is a fitted, generated regressor, so this is a descriptive
-        # variation of the fitted curve, not a population marginal slope (the
-        # same #1097/#1115 honesty correction the native Rust report makes by
-        # naming the field `decoder_variation_norm`, never `marginal_slope`).
-        out["average_derivative"] = average_derivative
-    if peak_contrast is not None:
-        out["peak_contrast"] = peak_contrast
-    return out if len(out) > 1 else None
+    return None if native is None else dict(native)
 
 
 @dataclass(slots=True)
@@ -908,23 +752,12 @@ class ManifoldSAE:
                 # that must NOT abort the whole fit. Skip the band gracefully.
                 return None, None, None
             mean = phi @ decoder
+            # Posterior sd is surfaced only when the Rust payload already carries
+            # it. The delta-method covariance push-forward that once recomputed
+            # the band sd in Python (var = phiᵀ Σ phi per channel) was numeric
+            # SE/variance math and has been removed; SE is a Rust-owned quantity.
             sd = _opt_arr(atom, "shape_band_sd")
-            cov = _opt_arr(atom, "decoder_covariance")
-            p = int(decoder.shape[1])
-            m = int(decoder.shape[0])
-            if cov is not None and cov.shape != (m * p, m * p):
-                # A collapsed/degenerate periodic atom can carry a covariance
-                # sized for its pre-collapse (linear) decoder. The posterior sd
-                # band is optional; drop it rather than abort the whole fit.
-                cov = None
-            if cov is not None:
-                sd = np.zeros((coords.shape[0], p), dtype=float)
-                for channel in range(p):
-                    idx = np.arange(channel, m * p, p)
-                    sub = cov[np.ix_(idx, idx)]
-                    var = np.einsum("gm,mn,gn->g", phi, sub, phi, optimize=True)
-                    sd[:, channel] = np.sqrt(np.maximum(var, 0.0))
-            elif sd is not None:
+            if sd is not None:
                 sd = np.asarray(sd, dtype=float)[order]
             return coords, mean, sd
 
