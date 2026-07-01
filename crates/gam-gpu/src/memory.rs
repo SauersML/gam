@@ -83,6 +83,39 @@ pub struct DeviceCsrMatrix {
 }
 
 impl DeviceCsrMatrix {
+    /// Construct a CSR matrix, enforcing the structural invariant that `rowptr`
+    /// holds exactly `rows + 1` entries.
+    ///
+    /// A CSR row-pointer array must have one slot per row plus a trailing slot
+    /// equal to `nnz`. If the supplied `rowptr` violates this (too short or too
+    /// long), it is canonicalized to `rows + 1` monotone entries: a short
+    /// `rowptr` is padded with its final value (marking the remaining rows as
+    /// empty) and an over-long `rowptr` is truncated. This prevents downstream
+    /// row-slice and deallocation paths from indexing `rowptr[row + 1]` out of
+    /// bounds, which would be an invalid-free / out-of-bounds deallocation
+    /// hazard.
+    pub fn new(
+        rows: usize,
+        cols: usize,
+        rowptr: DeviceBuffer<i32>,
+        colidx: DeviceBuffer<i32>,
+        values: DeviceBuffer<f64>,
+    ) -> Self {
+        let expected = rows + 1;
+        let mut ptr = rowptr.host_shadow().to_vec();
+        if ptr.len() != expected {
+            let fill = ptr.last().copied().unwrap_or(0);
+            ptr.resize(expected, fill);
+        }
+        Self {
+            rows,
+            cols,
+            rowptr: DeviceBuffer::from_host_shadow(ptr),
+            colidx,
+            values,
+        }
+    }
+
     pub const fn nnz(&self) -> usize {
         self.values.len()
     }

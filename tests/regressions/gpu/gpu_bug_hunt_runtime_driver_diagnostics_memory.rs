@@ -66,13 +66,13 @@ fn gpu_device_info_device_count_matches_underlying_driver_count() {
 fn device_memory_representations_guard_against_invalid_csr_and_double_free_style_states() {
     let dense = DeviceMatrix::from_array(&Array2::zeros((3, 2)));
     let vec = DeviceVector::from_array(&array![1.0, 2.0, 3.0]);
-    let csr = DeviceCsrMatrix {
-        rows: 3,
-        cols: 2,
-        rowptr: gpu::DeviceBuffer::from_host_shadow(vec![0, 1]),
-        colidx: gpu::DeviceBuffer::from_host_shadow(vec![0]),
-        values: gpu::DeviceBuffer::from_host_shadow(vec![1.0]),
-    };
+    let csr = DeviceCsrMatrix::new(
+        3,
+        2,
+        gpu::DeviceBuffer::from_host_shadow(vec![0, 1]),
+        gpu::DeviceBuffer::from_host_shadow(vec![0]),
+        gpu::DeviceBuffer::from_host_shadow(vec![1.0]),
+    );
 
     assert_eq!(
         dense.data.len(),

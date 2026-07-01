@@ -1062,6 +1062,43 @@ pub fn jumprelu_row(logits: ArrayView1<'_, f64>, temperature: f64, threshold: f6
     out
 }
 
+/// Bounded threshold-gate activations together with the straight-through
+/// derivative `∂a_k/∂l_k` of the smooth surrogate, shared with the torch
+/// autograd `Function` so the torch `jumprelu` lane applies the SAME bounded
+/// gate as the closed-form fit (`jumprelu_row`): `a_k = σ((l_k − θ_k)/τ)` for
+/// `l_k > θ_k` and exactly `0` otherwise — magnitude lives in the decoder, the
+/// gate stays in `[0, 1)`. The returned derivative is the smooth surrogate's
+/// `σ'((l_k − θ_k)/τ)/τ` evaluated on BOTH sides of the jump (a straight-through
+/// estimator: the hard forward has zero derivative below threshold, which would
+/// permanently kill gradient flow to gated-off atoms). `∂a_k/∂θ_k` is the
+/// negation of the returned logit derivative; callers negate. `thresholds` is
+/// per-atom (the torch lane learns one threshold per atom); the scalar
+/// closed-form threshold is the constant-vector special case and the value
+/// arithmetic matches `jumprelu_row` exactly there.
+#[must_use]
+pub fn jumprelu_row_value_grad(
+    logits: ArrayView1<'_, f64>,
+    temperature: f64,
+    thresholds: ArrayView1<'_, f64>,
+) -> (Array1<f64>, Array1<f64>) {
+    assert_eq!(
+        logits.len(),
+        thresholds.len(),
+        "jumprelu_row_value_grad: logits/thresholds length mismatch"
+    );
+    let inv_tau = 1.0 / temperature;
+    let mut value = Array1::<f64>::zeros(logits.len());
+    let mut grad = Array1::<f64>::zeros(logits.len());
+    for i in 0..logits.len() {
+        let sig = gam_linalg::utils::stable_logistic((logits[i] - thresholds[i]) * inv_tau);
+        if logits[i] > thresholds[i] {
+            value[i] = sig;
+        }
+        grad[i] = sig * (1.0 - sig) * inv_tau;
+    }
+    (value, grad)
+}
+
 // #1557 — fill-into-caller-buffer variants of the three per-mode row functions.
 // These compute the EXACT SAME values as `softmax_row` / `ibp_map_row` /
 // `jumprelu_row` (same arithmetic, same order of operations) but write into a
