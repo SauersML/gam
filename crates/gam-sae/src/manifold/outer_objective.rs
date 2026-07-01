@@ -1425,6 +1425,28 @@ impl SaeManifoldOuterObjective {
             // whole fit (the indefinite basin is adjacent to the PD optimum, so
             // line searches WILL overshoot into it).
             || err.contains("cross-row IBP joint Hessian is non-PD at this ρ")
+            // #1782 — at a seed ρ, a K>1 jumprelu/softmax (or a rank-deficient
+            // euclidean/linear) fit's OFF-OPTIMUM inner state can leave the
+            // reduced joint-Hessian Schur complement indefinite, so the undamped
+            // Schur-complement Cholesky in `run_joint_fit_arrow_schur` /
+            // `converge_inner_for_undamped_logdet` refuses with
+            // `ArrowSchurError::SchurFactorFailed` (rendered
+            // "arrow-Schur: Schur complement Cholesky failed: … not positive
+            // definite"). That is the SAME infeasible-ρ-probe class as the
+            // per-row / cross-row non-PD refusals above: the indefinite basin is
+            // adjacent to the PD optimum, so the outer optimizer must read it as
+            // +∞ and steer back into the PD region rather than reject the seed and
+            // abort the whole fit ("no candidate seeds passed outer startup
+            // validation"). `ibp_map`+`circle`'s seed lands in the PD region and
+            // never trips this, which is exactly why it converged on identical
+            // data while the other assignments/topologies did not.
+            //
+            // Requires BOTH markers so a genuine shape / dimension / non-finite
+            // Schur defect (a `SchurFactorFailed` whose reason is NOT a non-PD
+            // pivot, e.g. "non-finite entry" or "non-square") still hard-errors
+            // and is not silently masked as a recoverable probe.
+            || (err.contains("Schur complement Cholesky failed")
+                && err.contains("not positive definite"))
     }
 
     /// Shared cost path: evaluate the REML criterion at `rho_flat`, updating
@@ -1577,7 +1599,7 @@ impl SaeManifoldOuterObjective {
         // arrow cache, which the streaming criterion produces (and now returns).
         // Route through it so the Fellner–Schall step runs matrix-free at large K;
         // dense-admitted fits keep the byte-for-byte dense path.
-        let (cost, loss, cache) = if self.term.streaming_plan().direct_logdet_admitted() {
+        let criterion = if self.term.streaming_plan().direct_logdet_admitted() {
             self.term.reml_criterion_with_cache(
                 self.target.view(),
                 &rho,
@@ -1586,7 +1608,7 @@ impl SaeManifoldOuterObjective {
                 self.learning_rate,
                 self.ridge_ext_coord,
                 self.ridge_beta,
-            )?
+            )
         } else {
             self.term.reml_criterion_streaming_exact_with_cache(
                 self.target.view(),
@@ -1596,7 +1618,46 @@ impl SaeManifoldOuterObjective {
                 self.learning_rate,
                 self.ridge_ext_coord,
                 self.ridge_beta,
-            )?
+            )
+        };
+        let (cost, loss, cache) = match criterion {
+            Ok(evaluated) => evaluated,
+            // #1782 — the EFS lane IS the SAE seed-startup-VALIDATION lane
+            // (`run_fixed_point_outer_solver` → `eval_step(seed)` → `eval_efs` →
+            // `efs_step`). At a seed ρ a K>1 jumprelu/softmax (or rank-deficient
+            // euclidean/linear) fit's off-optimum inner state can leave the
+            // reduced joint-Hessian Schur complement indefinite, so the undamped
+            // Laplace factorization refuses ("Schur complement Cholesky failed:
+            // … not positive definite"), and any other infeasible-ρ-probe class
+            // (non-PD per-row / cross-row joint Hessian, inner non-convergence).
+            // Propagating that `Err` here made the FIXED-POINT bridge REJECT the
+            // seed, and with the single PCA seed that emptied the candidate set →
+            // "no candidate seeds passed outer startup validation" for exactly the
+            // assignments/topologies whose seed does not land in the PD region
+            // (ibp_map+circle does, which is why it converged on identical data).
+            //
+            // A recoverable refusal is a REJECTABLE infeasibility WALL, not a hard
+            // failure: return a finite collapse-wall cost with all-zero EFS steps
+            // (the same finite barrier `add_fit_data_collapse_penalty` uses). The
+            // seed then STARTS the fixed-point solver, whose Wood–Fasiolo λ-update
+            // steers ρ off the wall toward the PD region on the next iterate rather
+            // than aborting the whole fit. A non-finite cost would be rejected by
+            // the bridge as a seed refusal, so the wall must stay finite. Genuine
+            // (non-recoverable) defects still propagate as a hard error.
+            Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
+                let n_params = rho.to_flat().len();
+                self.current_rho = rho;
+                return Ok(EfsEval {
+                    cost: SAE_FIT_DATA_COLLAPSE_COST,
+                    steps: vec![0.0_f64; n_params],
+                    beta: None,
+                    psi_gradient: None,
+                    psi_indices: None,
+                    inner_hessian_scale: None,
+                    logdet_enclosure_gap: None,
+                });
+            }
+            Err(err) => return Err(err),
         };
         self.current_rho = rho.clone();
         let dispersion = self
@@ -1805,18 +1866,28 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // needs only the analytic traces `tr(H⁻¹ S_c)` — no gradient, and (per
         // SPEC) no finite differences. So this dense-cache path is reached only
         // when the dense evidence factor is admitted.
-        let (cost, loss, cache) = self
-            .term
-            .reml_criterion_with_cache(
-                self.target.view(),
-                &rho_state,
-                self.registry.as_ref(),
-                self.inner_max_iter,
-                self.learning_rate,
-                self.ridge_ext_coord,
-                self.ridge_beta,
-            )
-            .map_err(EstimationError::RemlOptimizationFailed)?;
+        let (cost, loss, cache) = match self.term.reml_criterion_with_cache(
+            self.target.view(),
+            &rho_state,
+            self.registry.as_ref(),
+            self.inner_max_iter,
+            self.learning_rate,
+            self.ridge_ext_coord,
+            self.ridge_beta,
+        ) {
+            Ok(evaluated) => evaluated,
+            // #1782 — an infeasible-ρ probe (non-PD per-row / cross-row / Schur-
+            // complement joint Hessian) has no defined Laplace evidence at this ρ.
+            // Present it to the BFGS/ARC line search as the SAME infeasible wall
+            // the `Value` order returns (`OuterEval::infeasible` → +∞ cost, zero
+            // gradient) so the search steers back into the PD region instead of
+            // aborting the whole outer solve. Genuine (non-recoverable) defects
+            // still hard-error below.
+            Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
+                return Ok(OuterEval::infeasible(rho.len()));
+            }
+            Err(err) => return Err(EstimationError::RemlOptimizationFailed(err)),
+        };
         // #1273 — the analytic outer gradient is built from the undamped joint
         // Hessian via `outer_gradient_arrow_solver`, whose Faddeev-Popov gauge
         // deflation recovers near-null directions that lie in the closed-form
