@@ -2513,9 +2513,17 @@ fn sae_manifold_fit_inner<'py>(
         .iter()
         .map(|kind| sae_atom_basis_kind_from_str(kind))
         .collect();
+    // #1784/#1777 — use the per-fit IBP concentration override everywhere the
+    // assignment map is materialized, including the *seed* assignment mode below.
+    // `set_fit_config` remains the runtime source of truth for cloned/refit
+    // terms, but constructing the initial `AssignmentMode` with the overridden
+    // α keeps seed decoder solves, metadata, and the first Arrow-Schur pass on
+    // the same K-aware/stated gate instead of briefly using the historical
+    // `alpha=1` geometric mask.
+    let assignment_alpha = ibp_alpha_override.unwrap_or(alpha);
     let mode = match assignment_kind.as_str() {
         "softmax" => AssignmentMode::softmax(tau),
-        "ibp_map" => AssignmentMode::ibp_map(tau, alpha, learnable_alpha),
+        "ibp_map" => AssignmentMode::ibp_map(tau, assignment_alpha, learnable_alpha),
         // The ThresholdGate (#1777, formerly "jumprelu") is a hard-thresholded
         // bounded sigmoid: an atom is active when its raw logit clears
         // `jumprelu_threshold`, and the gate value is the sigmoid (in [0, 1]) —
@@ -6219,7 +6227,7 @@ fn sae_manifold_fit_minimal<'py>(
         z_view,
         initial_logits.view(),
         assignment_kind.as_str(),
-        alpha,
+        ibp_alpha_override.unwrap_or(alpha),
         tau,
         jumprelu_threshold,
     )
