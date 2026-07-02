@@ -231,7 +231,10 @@ struct GaussianRemlPrepared {
     ywy: Array1<f64>,
     projected_rhs_squared: Array2<f64>,
     projected_rhs: Array2<f64>,
-    n_observations: usize,
+    /// Number of rows with a strictly positive prior weight — the effective
+    /// sample size that enters the REML residual degrees of freedom `ν`. Rows
+    /// with weight `0` are excluded (see [`effective_observation_count`]).
+    n_effective: usize,
     n_outputs: usize,
 }
 
@@ -498,9 +501,13 @@ pub fn gaussian_reml_multi_closed_form_with_cache_no_alloc(
     if y.iter().any(|value| !value.is_finite()) {
         crate::bail_invalid_estim!("Gaussian REML inputs must be finite");
     }
-    if n <= eigen_cache.nullity {
+    let n_effective = match weights {
+        Some(w) => effective_observation_count(w),
+        None => n,
+    };
+    if n_effective <= eigen_cache.nullity {
         crate::bail_invalid_estim!(
-            "Gaussian REML requires n > nullspace dimension; got n={n}, nullity={}",
+            "Gaussian REML requires more positive-weight rows than the nullspace dimension; got n_effective={n_effective}, nullity={}",
             eigen_cache.nullity
         );
     }
@@ -526,7 +533,7 @@ pub fn gaussian_reml_multi_closed_form_with_cache_no_alloc(
         eigen_cache,
         workspace.ywy.view(),
         workspace.projected_rhs_squared.view(),
-        n,
+        n_effective,
         d,
         init_rho,
     )?;
@@ -534,7 +541,7 @@ pub fn gaussian_reml_multi_closed_form_with_cache_no_alloc(
         eigen_cache,
         workspace.ywy.view(),
         workspace.projected_rhs_squared.view(),
-        n,
+        n_effective,
         d,
         rho,
     );
@@ -545,7 +552,7 @@ pub fn gaussian_reml_multi_closed_form_with_cache_no_alloc(
         eigen_cache,
         workspace.ywy.view(),
         workspace.projected_rhs_squared.view(),
-        n,
+        n_effective,
         d,
         lambda,
         sigma2.view_mut(),
@@ -882,12 +889,13 @@ pub fn gaussian_reml_blocks_orthogonal_shared_scale(
         ranks.push(rank);
         penalty_logdets.push(logdet);
     }
-    if n <= nullity_total {
+    let n_effective = effective_observation_count(weight.view());
+    if n_effective <= nullity_total {
         crate::bail_invalid_estim!(
-            "block-orthogonal Gaussian REML requires n > total penalty nullity; got n={n}, nullity={nullity_total}"
+            "block-orthogonal Gaussian REML requires more positive-weight rows than the total penalty nullity; got n_effective={n_effective}, nullity={nullity_total}"
         );
     }
-    let nu = (n - nullity_total) as f64;
+    let nu = (n_effective - nullity_total) as f64;
     let mut rhos = match init_rhos {
         Some(values) => Array1::from_vec(values.to_vec()),
         None => Array1::zeros(designs.len()),
@@ -1060,15 +1068,16 @@ pub fn gaussian_reml_free_b_score(
     }
 
     let weight = gaussian_reml_weights(n, weights)?;
+    let n_effective = effective_observation_count(weight.view());
     let cache =
         build_gaussian_reml_eigen_cache_with_nullspace_dim(x, penalty, None, Some(weight.view()))?;
-    if n <= cache.nullity {
+    if n_effective <= cache.nullity {
         crate::bail_invalid_estim!(
-            "Gaussian REML requires n > nullspace dimension; got n={n}, nullity={}",
+            "Gaussian REML requires more positive-weight rows than the nullspace dimension; got n_effective={n_effective}, nullity={}",
             cache.nullity
         );
     }
-    let nu = n as f64 - cache.nullity as f64;
+    let nu = n_effective as f64 - cache.nullity as f64;
     let fitted = dense_ab(x, coefficients);
     let residual = y.to_owned() - &fitted;
     let xtw_residual = dense_xt_diag_y(x, weight.view(), residual.view());
@@ -1263,7 +1272,10 @@ fn gaussian_reml_multi_closed_form_backward_from_fit_with_inverse_hessian_impl(
     let lambda = fit.lambda;
     let beta = &fit.coefficients;
     let residual = y.to_owned() - &fit.fitted;
-    let nu = n as f64 - fit.cache.nullity as f64;
+    // Match the forward's REML residual DoF: zero prior-weight rows are excluded
+    // from the effective sample size (see `effective_observation_count`), so the
+    // adjoint of `ν` uses the same count the forward used.
+    let nu = effective_observation_count(weight.view()) as f64 - fit.cache.nullity as f64;
 
     let mut grad_x = Array2::<f64>::zeros((n, p));
     let mut grad_y = Array2::<f64>::zeros((n, d));
@@ -2229,6 +2241,23 @@ fn validate_gaussian_reml_design(
     Ok(())
 }
 
+/// Effective observation count for the REML residual degrees of freedom.
+///
+/// A prior weight of exactly `0` is the universal "excluded / infinite-variance"
+/// convention (mgcv, statsmodels): such a row must be equivalent to omitting it
+/// entirely. The weighted response energy already handles this (`weight[row] *
+/// y² = 0` for a zero-weight row), and a zero-weight row likewise contributes
+/// nothing to `XᵀWX` / `XᵀWy`, so it cannot move the coefficients at a fixed
+/// smoothing parameter. The one place a zero-weight row used to leak in was the
+/// residual degrees of freedom `ν = n − nullity`, which counted the raw row
+/// count `n`. That deflated `σ²`, under-smoothed `λ`, and (through `λ`) biased
+/// the coefficients — growing with the number of zero-weight rows. The residual
+/// DoF must instead be built from the number of rows that actually enter the
+/// likelihood, i.e. those with a strictly positive weight.
+fn effective_observation_count(weight: ArrayView1<'_, f64>) -> usize {
+    weight.iter().filter(|&&w| w > 0.0).count()
+}
+
 fn gaussian_reml_weights(
     n: usize,
     weights: Option<ArrayView1<'_, f64>>,
@@ -2510,6 +2539,7 @@ fn prepare_gaussian_reml(
         crate::bail_invalid_estim!("Gaussian REML inputs must be finite");
     }
     let weight = gaussian_reml_weights(n, weights)?;
+    let n_effective = effective_observation_count(weight.view());
 
     let xtwy = dense_xt_diag_y(x, weight.view(), y);
     let ywy = Array1::from_iter((0..d).map(|j| {
@@ -2539,9 +2569,9 @@ fn prepare_gaussian_reml(
                 cache.nullity
             );
         }
-        if n <= cache.nullity {
+        if n_effective <= cache.nullity {
             crate::bail_invalid_estim!(
-                "Gaussian REML requires n > nullspace dimension; got n={n}, nullity={}",
+                "Gaussian REML requires more positive-weight rows than the nullspace dimension; got n_effective={n_effective}, nullity={}",
                 cache.nullity
             );
         }
@@ -2552,15 +2582,15 @@ fn prepare_gaussian_reml(
             ywy,
             projected_rhs_squared,
             projected_rhs,
-            n_observations: n,
+            n_effective,
             n_outputs: d,
         });
     }
 
     let cache = gaussian_reml_eigen_cache_from_xtwx(xtwx, penalty, nullspace_dim)?;
-    if n <= cache.nullity {
+    if n_effective <= cache.nullity {
         crate::bail_invalid_estim!(
-            "Gaussian REML requires n > nullspace dimension; got n={n}, nullity={}",
+            "Gaussian REML requires more positive-weight rows than the nullspace dimension; got n_effective={n_effective}, nullity={}",
             cache.nullity
         );
     }
@@ -2572,14 +2602,14 @@ fn prepare_gaussian_reml(
         ywy,
         projected_rhs_squared,
         projected_rhs,
-        n_observations: n,
+        n_effective,
         n_outputs: d,
     })
 }
 
 impl GaussianRemlPrepared {
     fn nu(&self) -> f64 {
-        self.n_observations as f64 - self.cache.nullity as f64
+        self.n_effective as f64 - self.cache.nullity as f64
     }
 
     fn evaluate(&self, rho: f64) -> ObjectiveEval {
@@ -2587,7 +2617,7 @@ impl GaussianRemlPrepared {
             &self.cache,
             self.ywy.view(),
             self.projected_rhs_squared.view(),
-            self.n_observations,
+            self.n_effective,
             self.n_outputs,
             rho,
         )
@@ -2758,12 +2788,12 @@ fn evaluate_reml_parts(
     cache: &GaussianRemlEigenCache,
     ywy: ArrayView1<'_, f64>,
     projected_rhs_squared: ArrayView2<'_, f64>,
-    n_observations: usize,
+    n_effective: usize,
     n_outputs: usize,
     rho: f64,
 ) -> ObjectiveEval {
     let lambda = rho.exp();
-    let nu = n_observations as f64 - cache.nullity as f64;
+    let nu = n_effective as f64 - cache.nullity as f64;
     let d = n_outputs as f64;
 
     // Each term's value and its ρ-derivatives come back from ONE function so
@@ -2787,7 +2817,7 @@ fn optimize_rho_no_alloc(
     cache: &GaussianRemlEigenCache,
     ywy: ArrayView1<'_, f64>,
     projected_rhs_squared: ArrayView2<'_, f64>,
-    n_observations: usize,
+    n_effective: usize,
     n_outputs: usize,
     init_rho: Option<f64>,
 ) -> Result<f64, EstimationError> {
@@ -2799,7 +2829,7 @@ fn optimize_rho_no_alloc(
         cache,
         ywy,
         projected_rhs_squared,
-        n_observations,
+        n_effective,
         n_outputs,
         RHO_LOWER,
     );
@@ -2818,7 +2848,7 @@ fn optimize_rho_no_alloc(
             cache,
             ywy,
             projected_rhs_squared,
-            n_observations,
+            n_effective,
             n_outputs,
             rho,
         );
@@ -2828,7 +2858,7 @@ fn optimize_rho_no_alloc(
                 cache,
                 ywy,
                 projected_rhs_squared,
-                n_observations,
+                n_effective,
                 n_outputs,
                 prev_rho,
                 rho,
@@ -2838,7 +2868,7 @@ fn optimize_rho_no_alloc(
                 cache,
                 ywy,
                 projected_rhs_squared,
-                n_observations,
+                n_effective,
                 n_outputs,
                 stationary_rho,
                 &mut best_rho,
@@ -2871,7 +2901,7 @@ fn optimize_rho_no_alloc(
                 cache,
                 ywy,
                 projected_rhs_squared,
-                n_observations,
+                n_effective,
                 n_outputs,
                 grid[best_idx - 1].0,
                 grid[best_idx + 1].0,
@@ -2882,7 +2912,7 @@ fn optimize_rho_no_alloc(
             cache,
             ywy,
             projected_rhs_squared,
-            n_observations,
+            n_effective,
             n_outputs,
             refined,
             &mut best_rho,
@@ -2894,7 +2924,7 @@ fn optimize_rho_no_alloc(
         cache,
         ywy,
         projected_rhs_squared,
-        n_observations,
+        n_effective,
         n_outputs,
         RHO_UPPER,
         &mut best_rho,
@@ -2905,7 +2935,7 @@ fn optimize_rho_no_alloc(
             cache,
             ywy,
             projected_rhs_squared,
-            n_observations,
+            n_effective,
             n_outputs,
             rho0,
             &mut best_rho,
@@ -2926,7 +2956,7 @@ fn consider_rho_no_alloc(
     cache: &GaussianRemlEigenCache,
     ywy: ArrayView1<'_, f64>,
     projected_rhs_squared: ArrayView2<'_, f64>,
-    n_observations: usize,
+    n_effective: usize,
     n_outputs: usize,
     rho: f64,
     best_rho: &mut f64,
@@ -2940,7 +2970,7 @@ fn consider_rho_no_alloc(
         cache,
         ywy,
         projected_rhs_squared,
-        n_observations,
+        n_effective,
         n_outputs,
         candidate,
     );
@@ -2954,7 +2984,7 @@ fn refine_stationary_rho_no_alloc(
     cache: &GaussianRemlEigenCache,
     ywy: ArrayView1<'_, f64>,
     projected_rhs_squared: ArrayView2<'_, f64>,
-    n_observations: usize,
+    n_effective: usize,
     n_outputs: usize,
     mut lo: f64,
     mut hi: f64,
@@ -2965,7 +2995,7 @@ fn refine_stationary_rho_no_alloc(
             cache,
             ywy,
             projected_rhs_squared,
-            n_observations,
+            n_effective,
             n_outputs,
             rho,
         );
@@ -3042,12 +3072,12 @@ fn fill_sigma2_no_alloc(
     cache: &GaussianRemlEigenCache,
     ywy: ArrayView1<'_, f64>,
     projected_rhs_squared: ArrayView2<'_, f64>,
-    n_observations: usize,
+    n_effective: usize,
     n_outputs: usize,
     lambda: f64,
     mut sigma2: ArrayViewMut1<'_, f64>,
 ) {
-    let nu = n_observations as f64 - cache.nullity as f64;
+    let nu = n_effective as f64 - cache.nullity as f64;
     for output in 0..n_outputs {
         let mut fitted_quadratic = 0.0;
         for eig in 0..cache.penalty_eigenvalues.len() {
@@ -3947,7 +3977,7 @@ mod tests {
                 [0.361060218768292_f64.sqrt()],
                 [0.01014486085547482_f64.sqrt()]
             ],
-            n_observations: 100,
+            n_effective: 100,
             n_outputs: 1,
         };
 
@@ -3956,7 +3986,7 @@ mod tests {
             &cache,
             prepared.ywy.view(),
             prepared.projected_rhs_squared.view(),
-            prepared.n_observations,
+            prepared.n_effective,
             prepared.n_outputs,
             None,
         )
@@ -4367,7 +4397,9 @@ pub fn gaussian_reml_fit_blocks_backward_analytic(
         .zip(ranks.iter())
         .map(|(penalty, rank)| penalty.nrows().saturating_sub(*rank))
         .sum::<usize>();
-    let nu = n as f64 - nullity as f64;
+    // Match the block-orthogonal forward's effective sample size: zero
+    // prior-weight rows are excluded from the residual degrees of freedom.
+    let nu = effective_observation_count(weights) as f64 - nullity as f64;
     if !(nu.is_finite() && nu > 0.0) {
         return Err(EstimationError::InvalidInput(format!(
             "Gaussian REML residual degrees of freedom must be positive; got {nu}"
