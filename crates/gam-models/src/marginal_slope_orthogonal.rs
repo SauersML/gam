@@ -32,30 +32,43 @@
 //! `k = 0` is the unconstrained location block `b(x)`; rows `k ≥ 1` are the
 //! squared SCOP shape blocks for `γ_k(x)`.
 
-use gam_linalg::faer_ndarray::{
-    FaerArrayView, factorize_symmetricwith_fallback, fast_ab, fast_abt, fast_xt_diag_x,
-    fast_xt_diag_y,
+use crate::inference::model::TRANSFORMATION_SCORE_PIT_CLIP_EPS;
+use crate::probability::{
+    log1mexp_positive, normal_cdf, normal_logcdf, normal_pdf, standard_normal_quantile,
 };
 use crate::transformation_normal::{
     TRANSFORMATION_MONOTONICITY_EPS, TransformationNormalFitResult, transformation_normal_pit_score,
 };
-use crate::inference::model::TRANSFORMATION_SCORE_PIT_CLIP_EPS;
-use gam_linalg::matrix::FactorizedSystem;
-use crate::probability::{
-    log1mexp_positive, normal_cdf, normal_logcdf, normal_pdf, standard_normal_quantile,
-};
-use gam_terms::smooth::build_term_collection_design;
 use faer::Side;
+use gam_linalg::faer_ndarray::{
+    FaerArrayView, factorize_symmetricwith_fallback, fast_ab, fast_abt, fast_xt_diag_x,
+    fast_xt_diag_y,
+};
+use gam_linalg::matrix::FactorizedSystem;
+use gam_terms::smooth::build_term_collection_design;
 use ndarray::{Array1, Array2, ArrayView2};
 
-/// Fixed (NOT REML-learned) log-λ for the influence-absorber block's ridge.
+/// Baseline fixed (NOT REML-learned) log-λ for the influence-absorber block's
+/// ridge.
 ///
-/// The §3 absorbed block `+Z_infl·γ` carries a small fixed ridge `½·ρ·‖γ‖²`
-/// (`ρ = exp(log_λ)`) so the joint solve soaks the `span(Z_infl)` component of
-/// the η-residual into `γ` without that block being treated as a smooth/REML
-/// surface. `log_λ = 0` ⇒ `ρ = 1`: enough to keep `γ` finite and bounded while
-/// the much larger marginal/logslope likelihood curvature dominates the fit.
+/// The §3 absorbed block `+Z_infl·γ` is an estimating-equation correction, not a
+/// new outcome surface. Its ridge therefore has to live on the same O(n) scale as
+/// the likelihood curvature; otherwise, as n grows, an O(1) ridge makes the
+/// absorber effectively unpenalized and it can fit genuine β(x) signal.  Keep the
+/// historical constant as the lower bound and use [`influence_absorber_log_lambda`]
+/// at call sites that know the training-row count.
 pub(crate) const INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA: f64 = 0.0;
+
+/// Fixed absorber ridge for `n_rows` observations.
+///
+/// Penalizing γ by roughly one unit per observation keeps the absorber a nuisance
+/// leakage correction rather than a competing flexible target surface, while the
+/// residualized columns still contribute when their score improvement is O(n).
+pub(crate) fn influence_absorber_log_lambda(n_rows: usize) -> f64 {
+    (n_rows.max(1) as f64)
+        .ln()
+        .max(INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA)
+}
 
 /// Per-row, per-θ₁ score-influence Jacobian `∂z/∂θ₁` for a fitted CTN, plus the
 /// latent score `z` itself on the same rows.
