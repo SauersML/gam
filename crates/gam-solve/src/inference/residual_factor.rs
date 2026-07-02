@@ -413,10 +413,45 @@ impl StructuredResidualModel {
             ));
         }
         let p = self.p;
+        let r = self.factor_rank;
+        // Hoist every row-INDEPENDENT Woodbury part out of the per-row loop: the
+        // inverse diagonal D^{-1}, B = D^{-1}Λ, its transpose Bᵀ, and the Gram
+        // M0 = ΛᵀD^{-1}Λ. Only the c_n^{-1} I_r shift on the capacitance is
+        // per-row, so the per-row capacitance is M_n = M0 + c_n^{-1} I_r — a
+        // scalar-diagonal reweight of the SAME M0 (mirroring the Fix-B hoist in
+        // `penalized_log_evidence`). Building the n-row U_n stack now costs
+        // O(p·r² + n·(p·r + r³ + p³)) instead of rebuilding B and the Gram every
+        // row. The summation order per row is unchanged, so the assembled U_n is
+        // bit-for-bit identical to the per-row-rebuild it replaces.
+        let d_inv: Vec<f64> = (0..p).map(|i| 1.0 / self.diagonal[i]).collect();
+        let mut b = Array2::<f64>::zeros((p, r));
+        let mut bt = Array2::<f64>::zeros((r, p));
+        let mut m0 = Array2::<f64>::zeros((r, r));
+        if r > 0 {
+            for i in 0..p {
+                for k in 0..r {
+                    b[[i, k]] = d_inv[i] * self.lambda[[i, k]];
+                }
+            }
+            for a in 0..r {
+                for bk in 0..r {
+                    let mut acc = 0.0_f64;
+                    for i in 0..p {
+                        acc += self.lambda[[i, a]] * b[[i, bk]];
+                    }
+                    m0[[a, bk]] = acc;
+                }
+            }
+            for k in 0..r {
+                for i in 0..p {
+                    bt[[k, i]] = b[[i, k]];
+                }
+            }
+        }
         // Row-major flat factor matrix: u[n, i*p + k] = U_n[i, k].
         let mut u = Array2::<f64>::zeros((n_rows, p * p));
         for row in 0..n_rows {
-            let precision = self.row_precision(row)?;
+            let precision = self.row_precision(&d_inv, &b, &bt, &m0, row)?;
             let factor = lower_cholesky_psd(&precision)?;
             for i in 0..p {
                 for k in 0..p {
@@ -427,13 +462,154 @@ impl StructuredResidualModel {
         RowMetric::whitened_structured(Arc::new(u), p, p)
     }
 
-    /// Per-row precision `Σ_n^{-1}` via the Woodbury identity (an `r × r` solve).
-    fn row_precision(&self, row: usize) -> Result<Array2<f64>, String> {
+    /// Convenience for the #2021 fit-path install seam: fit the structured
+    /// residual model on `input` and immediately materialize its per-row
+    /// `WhitenedStructured` [`RowMetric`] over all `input.residuals.nrows()`
+    /// rows. Equivalent to `Self::fit(input)?.row_metric(n)` — the single call
+    /// the outer alternation loop consumes when it installs the whitening metric
+    /// but does not also need the fitted factor (`factor()` / birth mining).
+    pub fn fit_row_metric(input: ResidualFactorInput<'_>) -> Result<RowMetric, String> {
+        let n = input.residuals.nrows();
+        Self::fit(input)?.row_metric(n)
+    }
+
+    /// Damped per-row metric for the #2021 driver: blend covariances in the
+    /// **covariance domain** (before the Woodbury→Cholesky) between this model's
+    /// estimate and a previous one,
+    /// ```text
+    ///   Σ_t(row) = (1 − γ) · Σ_prev(row) + γ · Σ̂_t(row),
+    /// ```
+    /// where `Σ̂_t(row) = c_t(z)·ΛΛᵀ + D` is this model's per-row covariance
+    /// (built from the hoisted-M0 / occupancy-weighted `c(z)` path), and
+    /// `Σ_prev(row)` is `prev`'s per-row covariance when `Some`, else `I_p`. The
+    /// returned factor `U_n` satisfies `U_n U_nᵀ = Σ_t(row)^{-1}`, packaged as a
+    /// [`RowMetric`](gam_problem::RowMetric).
+    ///
+    /// Endpoints (exact, byte-identical to the undamped producers):
+    /// * `γ = 1.0` ⇒ this model's [`Self::row_metric`] exactly (Woodbury path);
+    /// * `γ = 0.0` ⇒ `prev`'s [`Self::row_metric`] when `Some`, else the
+    ///   Euclidean identity metric.
+    ///
+    /// `γ` must be finite and in `[0, 1]`; when `prev` is `Some` it must share
+    /// this model's `p` and row count.
+    pub fn row_metric_damped(
+        &self,
+        n_rows: usize,
+        gamma: f64,
+        prev: Option<&StructuredResidualModel>,
+    ) -> Result<RowMetric, String> {
+        if n_rows != self.row_scale.len() {
+            return Err(format!(
+                "StructuredResidualModel::row_metric_damped: requested {n_rows} rows but model has {}",
+                self.row_scale.len()
+            ));
+        }
+        if !gamma.is_finite() || !(0.0..=1.0).contains(&gamma) {
+            return Err(format!(
+                "StructuredResidualModel::row_metric_damped: gamma must be finite in [0,1]; got {gamma}"
+            ));
+        }
+        if let Some(pv) = prev {
+            if pv.p != self.p {
+                return Err(format!(
+                    "StructuredResidualModel::row_metric_damped: prev output dim {} != {}",
+                    pv.p, self.p
+                ));
+            }
+            if pv.row_scale.len() != n_rows {
+                return Err(format!(
+                    "StructuredResidualModel::row_metric_damped: prev has {} rows but requested {n_rows}",
+                    pv.row_scale.len()
+                ));
+            }
+        }
+        // Exact endpoints — reuse the undamped producers so the result is
+        // byte-identical (γ=1 ⇒ this model; γ=0 ⇒ prev, or Euclidean identity).
+        if gamma == 1.0 {
+            return self.row_metric(n_rows);
+        }
+        if gamma == 0.0 {
+            return match prev {
+                Some(pv) => pv.row_metric(n_rows),
+                None => RowMetric::euclidean(n_rows, self.p),
+            };
+        }
+
+        let p = self.p;
+        // Row-INDEPENDENT outer products ΛΛᵀ (this model and, if present, prev):
+        // only the per-row activity scale c(z) multiplies them, so hoist the Gram
+        // out of the per-row loop (mirroring the row_metric / penalized_log_evidence
+        // hoist).
+        let self_gram = outer_product(&self.lambda);
+        let prev_gram = prev.map(|pv| outer_product(&pv.lambda));
+
+        let mut u = Array2::<f64>::zeros((n_rows, p * p));
+        for row in 0..n_rows {
+            let c = self.row_scale[row].max(f64::MIN_POSITIVE);
+            // γ · Σ̂_t = γ·(c·ΛΛᵀ + D).
+            let mut sigma = Array2::<f64>::zeros((p, p));
+            for a in 0..p {
+                for b in 0..p {
+                    sigma[[a, b]] = gamma * c * self_gram[[a, b]];
+                }
+                sigma[[a, a]] += gamma * self.diagonal[a];
+            }
+            // (1−γ) · Σ_prev  (prev's per-row Σ, or I_p when prev is None).
+            match prev {
+                Some(pv) => {
+                    let cp = pv.row_scale[row].max(f64::MIN_POSITIVE);
+                    let pg = prev_gram.as_ref().unwrap();
+                    for a in 0..p {
+                        for b in 0..p {
+                            sigma[[a, b]] += (1.0 - gamma) * cp * pg[[a, b]];
+                        }
+                        sigma[[a, a]] += (1.0 - gamma) * pv.diagonal[a];
+                    }
+                }
+                None => {
+                    for a in 0..p {
+                        sigma[[a, a]] += 1.0 - gamma;
+                    }
+                }
+            }
+            // Symmetrize against round-off before inversion.
+            for a in 0..p {
+                for b in (a + 1)..p {
+                    let avg = 0.5 * (sigma[[a, b]] + sigma[[b, a]]);
+                    sigma[[a, b]] = avg;
+                    sigma[[b, a]] = avg;
+                }
+            }
+            // Σ_t is a convex combination of SPD matrices (D ≻ 0 / I ≻ 0) ⇒ SPD.
+            // Precision = Σ_t^{-1} via a Cholesky solve against I_p, then the U_n
+            // factor is the lower-Cholesky of the precision (row_metric's U
+            // convention).
+            let precision = invert_spd(&sigma)?;
+            let factor = lower_cholesky_psd(&precision)?;
+            for i in 0..p {
+                for k in 0..p {
+                    u[[row, i * p + k]] = factor[[i, k]];
+                }
+            }
+        }
+        RowMetric::whitened_structured(Arc::new(u), p, p)
+    }
+
+    /// Per-row precision `Σ_n^{-1}` via the Woodbury identity (an `r × r` solve),
+    /// given the row-independent parts precomputed by [`Self::row_metric`]:
+    /// `d_inv = D^{-1}`, `b = D^{-1}Λ`, `bt = Bᵀ`, and the Gram `m0 = ΛᵀD^{-1}Λ`.
+    /// Only the per-row capacitance `M_n = m0 + c_n^{-1} I_r` and the back-solve
+    /// depend on the row.
+    fn row_precision(
+        &self,
+        d_inv: &[f64],
+        b: &Array2<f64>,
+        bt: &Array2<f64>,
+        m0: &Array2<f64>,
+        row: usize,
+    ) -> Result<Array2<f64>, String> {
         let p = self.p;
         let r = self.factor_rank;
-        let c = self.row_scale[row].max(f64::MIN_POSITIVE);
-        // D^{-1}.
-        let d_inv: Vec<f64> = (0..p).map(|i| 1.0 / self.diagonal[i]).collect();
         // Start from D^{-1}.
         let mut precision = Array2::<f64>::zeros((p, p));
         for i in 0..p {
@@ -442,37 +618,19 @@ impl StructuredResidualModel {
         if r == 0 {
             return Ok(precision);
         }
-        // B = D^{-1} Λ  ∈ ℝ^{p×r}.
-        let mut b = Array2::<f64>::zeros((p, r));
-        for i in 0..p {
-            for k in 0..r {
-                b[[i, k]] = d_inv[i] * self.lambda[[i, k]];
-            }
-        }
-        // Capacitance M = c^{-1} I_r + Λᵀ D^{-1} Λ  ∈ ℝ^{r×r}.
-        let mut cap = Array2::<f64>::zeros((r, r));
+        let c = self.row_scale[row].max(f64::MIN_POSITIVE);
+        // Per-row capacitance M_n = M0 + c^{-1} I_r (copy the hoisted Gram, then
+        // add c^{-1} to the diagonal). M_n ≻ 0 since c^{-1} > 0 and M0 ⪰ 0.
+        let mut cap = m0.clone();
         for a in 0..r {
-            for bk in 0..r {
-                let mut acc = 0.0_f64;
-                for i in 0..p {
-                    acc += self.lambda[[i, a]] * b[[i, bk]];
-                }
-                cap[[a, bk]] = acc;
-            }
             cap[[a, a]] += 1.0 / c;
         }
-        // Σ_n^{-1} = D^{-1} − B M^{-1} Bᵀ. Solve M X = Bᵀ for X = M^{-1} Bᵀ
-        // (r × p) via Cholesky (M ≻ 0 since c^{-1} > 0 and ΛᵀD^{-1}Λ ⪰ 0).
+        // Σ_n^{-1} = D^{-1} − B M_n^{-1} Bᵀ. Solve M_n X = Bᵀ for X = M_n^{-1} Bᵀ
+        // (r × p) via Cholesky.
         let chol = cap
             .cholesky(Side::Lower)
             .map_err(|e| format!("StructuredResidualModel::row_precision capacitance: {e:?}"))?;
-        let mut bt = Array2::<f64>::zeros((r, p));
-        for k in 0..r {
-            for i in 0..p {
-                bt[[k, i]] = b[[i, k]];
-            }
-        }
-        let x = chol.solve_mat(&bt); // r × p
+        let x = chol.solve_mat(bt); // r × p
         for i in 0..p {
             for j in 0..p {
                 let mut acc = 0.0_f64;
@@ -493,6 +651,47 @@ impl StructuredResidualModel {
         }
         Ok(precision)
     }
+}
+
+/// Outer product `Λ Λᵀ ∈ ℝ^{p×p}` of a factor matrix `Λ ∈ ℝ^{p×r}` — the
+/// row-independent factor covariance the per-row activity scale multiplies.
+/// Used by [`StructuredResidualModel::row_metric_damped`] to hoist the Gram out
+/// of its per-row covariance-blend loop.
+fn outer_product(lambda: &Array2<f64>) -> Array2<f64> {
+    let p = lambda.nrows();
+    let r = lambda.ncols();
+    let mut g = Array2::<f64>::zeros((p, p));
+    for a in 0..p {
+        for b in 0..p {
+            let mut acc = 0.0_f64;
+            for k in 0..r {
+                acc += lambda[[a, k]] * lambda[[b, k]];
+            }
+            g[[a, b]] = acc;
+        }
+    }
+    g
+}
+
+/// Inverse of a symmetric positive-definite matrix via a Cholesky solve against
+/// the identity, symmetrized against round-off. Used to form `Σ_t^{-1}` from a
+/// densely-blended covariance in [`StructuredResidualModel::row_metric_damped`]
+/// (the blended covariance is no longer low-rank-plus-diagonal, so Woodbury does
+/// not apply).
+fn invert_spd(a: &Array2<f64>) -> Result<Array2<f64>, String> {
+    let p = a.nrows();
+    let chol = a
+        .cholesky(Side::Lower)
+        .map_err(|e| format!("invert_spd: blended covariance not SPD: {e:?}"))?;
+    let mut inv = chol.solve_mat(&Array2::<f64>::eye(p));
+    for i in 0..p {
+        for j in (i + 1)..p {
+            let avg = 0.5 * (inv[[i, j]] + inv[[j, i]]);
+            inv[[i, j]] = avg;
+            inv[[j, i]] = avg;
+        }
+    }
+    Ok(inv)
 }
 
 /// Per-channel (column) sample second moment of the residual matrix.
@@ -1341,5 +1540,163 @@ mod tests {
             "occupancy-weighted reconstruction must beat bin-uniform: \
              ‖·‖_F occ = {dist_occ:.6} vs uni = {dist_uni:.6}"
         );
+    }
+
+    /// Fit a small structured model on a planted single-factor DGP — shared
+    /// fixture builder for the producer / damped-metric integration tests.
+    fn fit_small_model(seed0: u64, lambda0: &Array1<f64>) -> (usize, StructuredResidualModel) {
+        let n = 300usize;
+        let p = lambda0.len();
+        let sigma_eps = 0.25_f64;
+        let slope = 1.4_f64;
+        let mut seed = seed0;
+        let mut residuals = Array2::<f64>::zeros((n, p));
+        let mut activity = Array1::<f64>::zeros(n);
+        for row in 0..n {
+            let u = (row as f64) / (n as f64 - 1.0);
+            let z = u * u;
+            activity[row] = z;
+            let amp = (slope * z).exp().sqrt();
+            let f = lcg_normal(&mut seed);
+            for i in 0..p {
+                residuals[[row, i]] = amp * lambda0[i] * f + sigma_eps * lcg_normal(&mut seed);
+            }
+        }
+        let model = StructuredResidualModel::fit(ResidualFactorInput {
+            residuals: residuals.view(),
+            activity: activity.view(),
+            max_factor_rank: 2,
+        })
+        .expect("fit");
+        (n, model)
+    }
+
+    /// WAVE-2 producer integration (#2021): the WhitenedStructured RowMetric from
+    /// `row_metric` must deliver the exact Mahalanobis `vᵀ Σ_n^{-1} v` for
+    /// `Σ_n = c_n·ΛΛᵀ + D` over the fitted occupancy-normalized scale. A
+    /// deterministic refit reproduces the same metric (the seam `fit_row_metric`
+    /// relies on).
+    #[test]
+    fn row_metric_precision_matches_woodbury_over_fitted_scale() {
+        let lambda0 = ndarray::array![1.5, 1.2, -0.4, 0.3];
+        let (n, model) = fit_small_model(0x14057B7EF767814F_u64, &lambda0);
+        let p = 4usize;
+        assert!(model.factor_rank() >= 1, "need a factor for a non-trivial Σ_n");
+
+        let metric = model.row_metric(n).expect("row_metric");
+        assert!(
+            metric.whitens_likelihood(),
+            "WhitenedStructured metric must whiten the likelihood"
+        );
+
+        let rank = model.factor_rank();
+        let lam = model.factor();
+        let diag = model.diagonal();
+        let v: Array1<f64> = ndarray::array![0.7, -1.3, 0.4, 0.9];
+
+        for &row in &[0usize, n / 3, n / 2, n - 1] {
+            let c = model.row_scale()[row];
+            let mut sigma = Array2::<f64>::zeros((p, p));
+            for a in 0..p {
+                for b in 0..p {
+                    let mut fac = 0.0_f64;
+                    for k in 0..rank {
+                        fac += lam[[a, k]] * lam[[b, k]];
+                    }
+                    sigma[[a, b]] = c * fac;
+                }
+                sigma[[a, a]] += diag[a];
+            }
+            let chol = sigma.cholesky(Side::Lower).expect("Σ_n PD");
+            let x = chol.solvevec(&v);
+            let mahal_dense: f64 = v.iter().zip(x.iter()).map(|(a, b)| a * b).sum();
+            let mahal_metric = metric.quad_form(row, v.view());
+            assert!(
+                (mahal_dense - mahal_metric).abs() <= 1e-8 * (1.0 + mahal_dense.abs()),
+                "row {row}: metric quad_form {mahal_metric} must equal dense vᵀΣ⁻¹v {mahal_dense}"
+            );
+        }
+
+        // Deterministic refit reproduces the identical metric (fit_row_metric seam).
+        let (n2, model2) = fit_small_model(0x14057B7EF767814F_u64, &lambda0);
+        assert_eq!(n2, n);
+        let metric_again = model2.row_metric(n2).expect("row_metric again");
+        for &row in &[0usize, n / 2, n - 1] {
+            let q1 = metric.quad_form(row, v.view());
+            let q2 = metric_again.quad_form(row, v.view());
+            assert!(
+                (q1 - q2).abs() <= 1e-12 * (1.0 + q1.abs()),
+                "deterministic refit must match at row {row}: {q2} vs {q1}"
+            );
+        }
+    }
+
+    /// WAVE-2 #2021 damped metric endpoint contracts: γ=1 ≡ row_metric (ignores
+    /// prev), γ=0 ≡ prev.row_metric (or Euclidean identity), 0<γ<1 is SPD, and
+    /// out-of-range / non-finite γ is rejected.
+    #[test]
+    fn row_metric_damped_endpoints() {
+        let lambda_a = ndarray::array![1.5, 1.2, -0.4, 0.3];
+        let lambda_b = ndarray::array![-0.6, 1.1, 0.9, -1.3];
+        let (n, model) = fit_small_model(0x51ED270B_u64 ^ 0xF3A5C7D1_u64, &lambda_a);
+        let (n_prev, prev) = fit_small_model(0x2545F491_u64 ^ 0x4F6CDD1D_u64, &lambda_b);
+        assert_eq!(n, n_prev);
+        let p = 4usize;
+        let v: Array1<f64> = ndarray::array![0.7, -1.3, 0.4, 0.9];
+
+        // γ = 1 ⇒ byte-identical to this model's row_metric, regardless of prev.
+        let base = model.row_metric(n).expect("row_metric");
+        for prev_opt in [None, Some(&prev)] {
+            let damped = model.row_metric_damped(n, 1.0, prev_opt).expect("damped γ=1");
+            for row in [0usize, n / 2, n - 1] {
+                for i in 0..p {
+                    for k in 0..p {
+                        assert_eq!(
+                            damped.factor_entry(row, i, k),
+                            base.factor_entry(row, i, k),
+                            "γ=1 must be byte-identical to row_metric at ({row},{i},{k})"
+                        );
+                    }
+                }
+            }
+        }
+
+        // γ = 0, prev = None ⇒ Euclidean identity: quad_form = ‖v‖².
+        let ident = model.row_metric_damped(n, 0.0, None).expect("damped γ=0 None");
+        let sumsq: f64 = v.iter().map(|x| x * x).sum();
+        for row in [0usize, n / 2, n - 1] {
+            let q = ident.quad_form(row, v.view());
+            assert!(
+                (q - sumsq).abs() <= 1e-12 * (1.0 + sumsq),
+                "γ=0/None must be the identity metric: quad_form {q} vs ‖v‖² {sumsq}"
+            );
+        }
+
+        // γ = 0, prev = Some ⇒ byte-identical to prev.row_metric.
+        let prev_metric = prev.row_metric(n).expect("prev row_metric");
+        let damped0 = model.row_metric_damped(n, 0.0, Some(&prev)).expect("damped γ=0 Some");
+        for row in [0usize, n / 2, n - 1] {
+            for i in 0..p {
+                for k in 0..p {
+                    assert_eq!(
+                        damped0.factor_entry(row, i, k),
+                        prev_metric.factor_entry(row, i, k),
+                        "γ=0/Some must be byte-identical to prev.row_metric at ({row},{i},{k})"
+                    );
+                }
+            }
+        }
+
+        // 0 < γ < 1 ⇒ valid SPD metric.
+        let mid = model.row_metric_damped(n, 0.5, Some(&prev)).expect("damped γ=0.5");
+        for row in [0usize, n / 2, n - 1] {
+            let q = mid.quad_form(row, v.view());
+            assert!(q.is_finite() && q > 0.0, "γ=0.5 metric must be SPD; got {q}");
+        }
+
+        // Invalid γ rejected.
+        assert!(model.row_metric_damped(n, 1.5, None).is_err());
+        assert!(model.row_metric_damped(n, -0.1, None).is_err());
+        assert!(model.row_metric_damped(n, f64::NAN, None).is_err());
     }
 }
