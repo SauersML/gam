@@ -5629,6 +5629,11 @@ fn build_standard_payload(
     payload.adaptive_regularization_diagnostics = adaptive_regularization_diagnostics;
     payload.offset_column = fit_config.offset_column.clone();
     payload.noise_offset_column = fit_config.noise_offset_column.clone();
+    // Persist the analytic prior-weights column so `Model.sample_replicates`
+    // can re-resolve the per-row weights and draw heteroskedastic Gaussian
+    // observation noise `sigma_i = sigma_hat / sqrt(w_i)` (#2025). Without this
+    // the replicate path only saw the pooled scalar sigma_hat.
+    payload.weight_column = fit_config.weight_column.clone();
     payload.gaussian_jackknife_plus = jackknife_plus_stats;
     payload.full_conformal = full_conformal_substrate;
     Ok(payload)

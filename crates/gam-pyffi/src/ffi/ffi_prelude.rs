@@ -202,6 +202,7 @@ pub(crate) use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, RhoPrio
 
 pub(crate) use gam::families::fit_orchestration::{
     FitConfig, FitRequest, FitResult, WorkflowError, fit_model, materialize, resolve_offset_column,
+    resolve_weight_column,
 };
 
 pub(crate) use ndarray::{

@@ -301,6 +301,11 @@ pub(crate) fn run_generate_unified(
                         fit_saved.standard_deviation,
                         &family,
                     ),
+                    // This scalar-dispersion fallback arm handles non-Gaussian
+                    // families (Gamma/NB/Beta/Tweedie), whose observation draw
+                    // does not take analytic prior weights; the Gaussian
+                    // weighted case is #2025 in the replicate path.
+                    None,
                 )
                 .map_err(|e| format!("failed to build generative spec: {e}"))
             }
@@ -345,6 +350,10 @@ pub(crate) fn run_generate_unified(
                 fit_saved.standard_deviation,
                 &family,
             ),
+            // Prior-weight scaling for the weighted-Gaussian replicate draw is
+            // resolved in the FFI `Model.sample_replicates` path (#2025); this
+            // CLI generate arm preserves its existing scalar-sigma behavior.
+            None,
         )
         .map_err(|e| format!("failed to build generative spec: {e}"))
     }

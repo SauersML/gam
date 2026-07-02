@@ -160,12 +160,52 @@ pub fn generativespec_from_predict(
     prediction: PredictResult,
     likelihood: LikelihoodSpec,
     gaussian_scale: Option<f64>,
+    prior_weights: Option<&Array1<f64>>,
 ) -> Result<GenerativeSpec, EstimationError> {
-    let noise = NoiseModel::from_likelihood(&likelihood, prediction.mean.len(), gaussian_scale)?;
+    let mut noise =
+        NoiseModel::from_likelihood(&likelihood, prediction.mean.len(), gaussian_scale)?;
+    // Analytic prior weights define `Var(y_i) = sigma^2 / w_i` for a weighted
+    // Gaussian fit, so replicate observation noise is heteroskedastic:
+    // `sigma_i = sigma_hat / sqrt(w_i)`. `from_likelihood` broadcasts the pooled
+    // scalar `sigma_hat` to every row (the correct value for an unweighted fit),
+    // so rescale it per row here whenever the fit carried prior weights (#2025).
+    // Only the Gaussian arm exposes a location-scale `sigma`; the other families
+    // encode dispersion through their own precision parameter and analytic prior
+    // weights do not enter their observation draw, so they are left untouched.
+    if let (NoiseModel::Gaussian { sigma }, Some(weights)) = (&mut noise, prior_weights) {
+        scale_gaussian_sigma_by_prior_weights(sigma, weights)?;
+    }
     Ok(GenerativeSpec {
         mean: prediction.mean,
         noise,
     })
+}
+
+/// Rescale a broadcast Gaussian `sigma_hat` vector into the per-row analytic-weight
+/// observation scale `sigma_i = sigma_hat / sqrt(w_i)` (#2025). The prior weights
+/// `w_i` are the same non-negative weights the fit consumed; a zero or non-finite
+/// weight has no finite observation variance under the analytic-weight model, so it
+/// is rejected rather than silently producing an infinite draw scale.
+fn scale_gaussian_sigma_by_prior_weights(
+    sigma: &mut Array1<f64>,
+    weights: &Array1<f64>,
+) -> Result<(), EstimationError> {
+    if weights.len() != sigma.len() {
+        crate::bail_invalid_estim!(
+            "prior weights length {} does not match observation count {}",
+            weights.len(),
+            sigma.len()
+        );
+    }
+    for (s, &w) in sigma.iter_mut().zip(weights.iter()) {
+        if !(w.is_finite() && w > 0.0) {
+            crate::bail_invalid_estim!(
+                "Gaussian replicate prior weights must be finite and > 0; got {w}"
+            );
+        }
+        *s /= w.sqrt();
+    }
+    Ok(())
 }
 
 impl NoiseModel {
@@ -797,6 +837,66 @@ mod tests {
         assert!(
             theta.len() == nobs && theta.iter().all(|&t| (t - 2.751).abs() < 1e-12),
             "NB generate composes the seed theta=1 instead of theta_hat (#1124): {theta:?}"
+        );
+    }
+
+    /// A weighted Gaussian fit has `Var(y_i) = sigma^2 / w_i`, so the generative
+    /// observation noise must be heteroskedastic in the analytic prior weights:
+    /// `sigma_i = sigma_hat / sqrt(w_i)`. Before #2025 the replicate path dropped
+    /// the weights and broadcast the pooled scalar `sigma_hat` to every row (flat
+    /// sigma). This asserts the per-row scaling and that unit weights leave the
+    /// scalar untouched (so unweighted fits are unchanged).
+    #[test]
+    fn gaussian_generativespec_scales_sigma_by_prior_weights() {
+        let sigma_hat = 2.0_f64;
+        let weights = Array1::from(vec![1.0, 4.0, 0.25]);
+        let mean = Array1::from(vec![0.0, 1.0, -1.0]);
+        let prediction = PredictResult {
+            eta: mean.clone(),
+            mean: mean.clone(),
+        };
+        let spec = generativespec_from_predict(
+            prediction,
+            LikelihoodSpec::gaussian_identity(),
+            Some(sigma_hat),
+            Some(&weights),
+        )
+        .expect("weighted Gaussian generative spec builds");
+        let NoiseModel::Gaussian { sigma } = spec.noise else {
+            panic!("expected Gaussian observation noise");
+        };
+        // sigma_hat / sqrt(w_i) for w = [1, 4, 0.25] -> [2, 1, 4].
+        let expected = [2.0_f64, 1.0, 4.0];
+        for (i, (&got, &want)) in sigma.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-12,
+                "row {i}: sigma must be sigma_hat/sqrt(w_i)={want}, got {got} \
+                 (flat sigma_hat={sigma_hat} drops the prior weights, #2025)"
+            );
+        }
+        assert!(
+            sigma.iter().any(|&s| (s - sigma_hat).abs() > 1e-9),
+            "sigma is flat at the pooled scalar; prior weights were dropped (#2025)"
+        );
+
+        // Unit prior weights must reproduce the unweighted pooled scalar exactly.
+        let unit = Array1::from_elem(3, 1.0_f64);
+        let unweighted = generativespec_from_predict(
+            PredictResult {
+                eta: mean.clone(),
+                mean,
+            },
+            LikelihoodSpec::gaussian_identity(),
+            Some(sigma_hat),
+            Some(&unit),
+        )
+        .expect("unit-weight Gaussian generative spec builds");
+        let NoiseModel::Gaussian { sigma: flat } = unweighted.noise else {
+            panic!("expected Gaussian observation noise");
+        };
+        assert!(
+            flat.iter().all(|&s| (s - sigma_hat).abs() < 1e-12),
+            "unit prior weights must leave sigma at the pooled scalar sigma_hat"
         );
     }
 

@@ -6820,6 +6820,14 @@ fn generative_replicates_impl(
     let offset = resolve_offset_column(&dataset, &col_map, model.offset_column.as_deref())?;
     let offset_noise =
         resolve_offset_column(&dataset, &col_map, model.noise_offset_column.as_deref())?;
+    // Resolve the analytic prior-weights column exactly as the mean/noise offsets
+    // are resolved above. A weighted Gaussian fit has `Var(y_i) = sigma^2 / w_i`,
+    // so replicate observation noise must be heteroskedastic in `w_i`; dropping
+    // the weights here drew every row from the pooled scalar `N(mu_i, sigma_hat^2)`
+    // (#2025). `resolve_weight_column` returns unit weights when the model carried
+    // no weight column, leaving unweighted fits unchanged.
+    let prior_weights =
+        resolve_weight_column(&dataset, &col_map, model.weight_column.as_deref())?;
     let predict_input = build_predict_input_for_model(
         &model,
         dataset.values.view(),
@@ -6853,7 +6861,7 @@ fn generative_replicates_impl(
         &family,
     );
     // Build the generative specification (mean + noise model).
-    let spec = generativespec_from_predict(prediction, family, gaussian_scale)
+    let spec = generativespec_from_predict(prediction, family, gaussian_scale, Some(&prior_weights))
         .map_err(|e| format!("generative_replicates: spec error: {e}"))?;
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     let draws = sampleobservation_replicates(&spec, n_draws, &mut rng)

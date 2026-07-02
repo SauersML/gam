@@ -285,6 +285,12 @@ pub struct FittedModelPayload {
     pub offset_column: Option<String>,
     #[serde(default)]
     pub noise_offset_column: Option<String>,
+    /// Name of the analytic prior-weights column used at fit time (`weights=`),
+    /// persisted so replicate/generative sampling can re-resolve the per-row
+    /// weights and draw heteroskedastic Gaussian observation noise
+    /// `sigma_i = sigma_hat / sqrt(w_i)` (#2025). `None` for an unweighted fit.
+    #[serde(default)]
+    pub weight_column: Option<String>,
     #[serde(default)]
     pub beta_noise: Option<Vec<f64>>,
     #[serde(default)]
@@ -679,6 +685,7 @@ impl FittedModelPayload {
             formula_logslopes: None,
             offset_column: None,
             noise_offset_column: None,
+            weight_column: None,
             beta_noise: None,
             noise_projection: None,
             noise_center: None,
