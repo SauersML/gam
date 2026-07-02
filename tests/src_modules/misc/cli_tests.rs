@@ -6433,7 +6433,10 @@ fn parse_survival_inverse_link_reports_survival_specific_supported_links() {
     args.link = Some("bogus".to_string());
     let err = parse_survival_inverse_link(&args).expect_err("expected unsupported survival link");
     assert!(err.contains("unsupported survival --link 'bogus'"));
-    assert!(err.contains("use identity|logit|probit|cloglog|loglog|cauchit|sas|beta-logistic|blended(...)/mixture(...) or flexible(...)"));
+    // `loglog` and `cauchit` are deliberately absent: they have no LinkFunction
+    // representative and are rejected as survival links, so the usage line must
+    // not advertise them as supported.
+    assert!(err.contains("use identity|logit|probit|cloglog|sas|beta-logistic|blended(...)/mixture(...) or flexible(...)"));
 }
 
 #[test]
