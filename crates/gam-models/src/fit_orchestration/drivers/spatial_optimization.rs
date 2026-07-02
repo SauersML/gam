@@ -9180,8 +9180,9 @@ pub fn smooth_term_lr_inference_forspec(
     let family_disp = lawley_dispersion_for_family(&family, &full.fit);
 
     // The penalty-block cursor walks the same block order the summary table
-    // uses: random-effect ranges first (skipped here), then smooth terms.
-    let mut penalty_cursor = full.design.random_effect_ranges.len();
+    // uses: any leading linear/random-effect penalty blocks first (skipped
+    // here), then smooth terms.
+    let mut penalty_cursor = full.design.leading_penalty_blocks_before_smooth();
     let mut out = Vec::<SmoothTermLrInference>::new();
     for (term_idx, design_term) in full.design.smooth.terms.iter().enumerate() {
         let k = design_term.penalties_local.len();

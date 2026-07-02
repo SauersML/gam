@@ -136,6 +136,8 @@ impl SurvivalLocationScaleFamily {
         }
 
         // Newton iterations on −ℓ(θ).
+        let mut converged = false;
+        let mut last_grad_norm = f64::INFINITY;
         for _ in 0..max_iter {
             let (ll_now, block_gradients) =
                 self.evaluate_log_likelihood_and_block_gradients(&states)?;
@@ -203,7 +205,9 @@ impl SurvivalLocationScaleFamily {
                 g = kernel_g;
             }
             let grad_norm = g.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+            last_grad_norm = grad_norm;
             if grad_norm <= grad_tol {
+                converged = true;
                 break;
             }
 
@@ -300,10 +304,34 @@ impl SurvivalLocationScaleFamily {
                     states = new_states;
                     ll = new_ll;
                 }
-                // No further increase achievable along this direction: the
-                // current iterate is (numerically) stationary. Stop here.
-                None => break,
+                // No further increase was achievable along this direction even
+                // though the stationarity test above has not passed. This is a
+                // real optimizer failure (usually ill-conditioning or a bad
+                // local curvature model), not an MLE. Returning it as a
+                // structured error keeps the reduced-AFT route consistent with
+                // the coupled location-scale solvers instead of handing an
+                // unconverged/possibly indefinite Hessian to downstream linear
+                // algebra, where panic=abort builds can terminate the CLI.
+                None => {
+                    return Err(SurvivalLocationScaleError::NumericalFailure {
+                        reason: format!(
+                            "direct parametric-AFT MLE: line search failed before convergence \
+                             (gradient sup-norm {grad_norm:.6e} > tolerance {grad_tol:.6e})"
+                        ),
+                    }
+                    .into());
+                }
             }
+        }
+
+        if !converged {
+            return Err(SurvivalLocationScaleError::NumericalFailure {
+                reason: format!(
+                    "direct parametric-AFT MLE: failed to converge after {max_iter} Newton iterations \
+                     (last gradient sup-norm {last_grad_norm:.6e} > tolerance {grad_tol:.6e})"
+                ),
+            }
+            .into());
         }
 
         // Observed information at the MLE: the joint negative-log-likelihood
@@ -2373,6 +2401,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         )?;
         if let Some(subsample) = options.outer_score_subsample.as_ref() {
             workspace.apply_outer_subsample(subsample.rows.as_ref());
+        } else {
+            workspace.clear_outer_subsample();
         }
         Ok(Some(Arc::new(workspace)))
     }
@@ -3182,6 +3212,10 @@ impl SurvivalLocationScaleExactNewtonJointHessianWorkspace {
             }
         }
         self.row_mask = Some(Arc::new(mask));
+    }
+
+    pub(crate) fn clear_outer_subsample(&mut self) {
+        self.row_mask = None;
     }
 }
 

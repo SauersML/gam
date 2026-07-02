@@ -1145,6 +1145,12 @@ impl TailCellMomentCacheStats {
 #[derive(Debug)]
 pub struct TailCellMomentCache {
     moments: ByteLruCache<TailCellMomentCacheKey, CellMomentState>,
+    in_flight: std::sync::Mutex<
+        std::collections::HashMap<
+            TailCellMomentCacheKey,
+            Arc<std::sync::OnceLock<Result<CellMomentState, String>>>,
+        >,
+    >,
     hits: std::sync::atomic::AtomicUsize,
     misses: std::sync::atomic::AtomicUsize,
 }
@@ -1164,6 +1170,7 @@ impl Default for TailCellMomentCache {
                 TAIL_CELL_MOMENT_CACHE_MAX_ENTRIES,
                 shard_count,
             ),
+            in_flight: std::sync::Mutex::new(std::collections::HashMap::new()),
             hits: std::sync::atomic::AtomicUsize::new(0),
             misses: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -1182,6 +1189,10 @@ impl TailCellMomentCache {
     #[inline]
     pub fn clear(&self) {
         self.moments.clear();
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
         self.hits.store(0, std::sync::atomic::Ordering::Relaxed);
         self.misses.store(0, std::sync::atomic::Ordering::Relaxed);
     }
@@ -1200,11 +1211,12 @@ impl TailCellMomentCache {
     /// miss. Cells outside the affine-tail keyset bypass the cache and run
     /// the uncached evaluator directly without touching the counters.
     ///
-    /// Stat semantics: every cache hit increments `hits`; a **miss** is
-    /// counted when this call computed the value itself. Under concurrent
-    /// access two workers racing on the same cold key may both count a miss
-    /// (each computes the identical pure-function value); single-threaded
-    /// bookkeeping is exact.
+    /// Stat semantics: every request served from an existing resident entry,
+    /// or from a concurrently published entry for the same key, increments
+    /// `hits`; a **miss** is counted only for the caller that actually
+    /// computes a cold key. The compute happens outside the LRU shard lock,
+    /// but an in-flight table coalesces same-key cold races so followers reuse
+    /// the leader's published value instead of duplicating work.
     pub fn evaluate(
         &self,
         cell: DenestedCubicCell,
@@ -1217,11 +1229,41 @@ impl TailCellMomentCache {
             self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(state);
         }
-        let state = evaluate_cell_moments_uncached(cell, max_degree)?;
+
+        let (slot, leader) = {
+            let mut in_flight = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(slot) = in_flight.get(&key) {
+                (Arc::clone(slot), false)
+            } else {
+                let slot = Arc::new(std::sync::OnceLock::new());
+                in_flight.insert(key, Arc::clone(&slot));
+                (slot, true)
+            }
+        };
+
+        if !leader {
+            let state = slot.wait().clone()?;
+            self.hits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(state);
+        }
+
+        let state = evaluate_cell_moments_uncached(cell, max_degree);
+        if let Ok(state) = &state {
+            self.moments.insert(key, state.clone());
+            self.hits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.misses
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.moments.insert(key, state.clone());
-        Ok(state)
+        if let Err(existing_state) = slot.set(state.clone()) {
+            std::mem::drop(existing_state);
+        }
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&key);
+        state
     }
 }
 
@@ -1530,9 +1572,15 @@ impl CellMomentScratch {
             CELL_MOMENT_REALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.moments.reserve(len - self.moments.capacity());
         }
-        self.moments.resize(len, 0.0);
-        self.moments.fill(0.0);
-        &mut self.moments
+        // Grow monotonically: shorter requests should not truncate the backing
+        // storage and then zero the old tail when a later request grows again.
+        // Only the active prefix is scratch for this evaluation.
+        if self.moments.len() < len {
+            self.moments.resize(len, 0.0);
+        }
+        let out = &mut self.moments[..len];
+        out.fill(0.0);
+        out
     }
 }
 
@@ -1692,6 +1740,37 @@ fn moment_boundary_term_with_powers(
     right_term - left_term
 }
 
+#[inline]
+fn base_moments_match_direct(base: &[f64], direct: &[f64]) -> bool {
+    base.iter()
+        .zip(direct.iter())
+        .all(|(&lhs, &rhs)| (lhs - rhs).abs() <= 1e-10 * (1.0 + lhs.abs().max(rhs.abs())))
+}
+
+#[inline]
+fn direct_non_affine_moments_if_base_matches(
+    cell: DenestedCubicCell,
+    base: &[f64],
+    max_degree: usize,
+) -> Option<Vec<f64>> {
+    if !cell.left.is_finite() || !cell.right.is_finite() {
+        return None;
+    }
+    // When the supplied base moments are the actual moments of this fixed
+    // finite cell, prefer the same quadrature-backed evaluator used by the
+    // public non-affine moment path.  The algebraic raising recurrence is kept
+    // below for callers that intentionally pass symbolic or otherwise
+    // non-cell-consistent bases, but repeatedly dividing by the quartic/sextic
+    // leading coefficient can amplify harmless base-roundoff into high-order
+    // moment error.
+    let (moments, _) = evaluate_non_affine_cell_simd::<false>(cell, max_degree);
+    if base_moments_match_direct(base, &moments) {
+        Some(moments.into_vec())
+    } else {
+        None
+    }
+}
+
 pub fn reduce_quartic_moments(
     cell: DenestedCubicCell,
     base_m0_m2: [f64; 3],
@@ -1699,6 +1778,10 @@ pub fn reduce_quartic_moments(
 ) -> Result<Vec<f64>, String> {
     if max_degree <= 2 {
         return Ok(base_m0_m2[..=max_degree].to_vec());
+    }
+    if let Some(moments) = direct_non_affine_moments_if_base_matches(cell, &base_m0_m2, max_degree)
+    {
+        return Ok(moments);
     }
     let d = quartic_qprime_coefficients(cell.c0, cell.c1, cell.c2);
     let lead = d[3];
@@ -1749,6 +1832,10 @@ pub fn reduce_sextic_moments(
 ) -> Result<Vec<f64>, String> {
     if max_degree <= 4 {
         return Ok(base_m0_m4[..=max_degree].to_vec());
+    }
+    if let Some(moments) = direct_non_affine_moments_if_base_matches(cell, &base_m0_m4, max_degree)
+    {
+        return Ok(moments);
     }
     let d = sextic_qprime_coefficients(cell.c0, cell.c1, cell.c2, cell.c3);
     let lead = d[5];
@@ -1938,6 +2025,52 @@ pub fn cell_second_derivative_boundary_integrand(
     let c_s = poly_eval_at(first_coefficients_s, z);
     let c_rs = poly_eval_at(second_coefficients_rs, z);
     (c_rs - eta * c_r * c_s) * (-cell.q(z)).exp() * INV_TWO_PI
+}
+
+/// Pointwise value of the cell third-derivative integrand
+/// `(∂³/∂r∂s∂t) exp(-q(z))/2π` at a single `z`, evaluated from the same
+/// `(r, s, t, rs, rt, st, rst)` coefficient polynomials that
+/// [`cell_third_derivative_from_moments`] integrates:
+///
+/// ```text
+/// F_rst(z) = (
+///     c_rst(z)
+///   - η(z)·(c_rs(z)c_t(z) + c_rt(z)c_s(z) + c_st(z)c_r(z))
+///   + (η(z)² - 1)·c_r(z)c_s(z)c_t(z)
+/// ) · exp(-q(z)) · 1/2π .
+/// ```
+///
+/// This is the boundary value for differentiating an already-third-order
+/// fixed-domain integral with respect to a moving edge. The sign convention is
+/// intentionally identical to [`cell_third_derivative_from_moments`]: callers
+/// must pass the coefficient slices in the convention of the integral they are
+/// differentiating. In particular, survival/probit paths that integrate the
+/// jointly negated cell and coefficient slices must evaluate this boundary
+/// integrand with the same joint negation; evaluating an un-negated boundary for
+/// a negated fixed-domain integral flips the sign of this odd-order integrand.
+#[inline]
+pub fn cell_third_derivative_boundary_integrand(
+    cell: DenestedCubicCell,
+    first_coefficients_r: &[f64],
+    first_coefficients_s: &[f64],
+    first_coefficients_t: &[f64],
+    second_coefficients_rs: &[f64],
+    second_coefficients_rt: &[f64],
+    second_coefficients_st: &[f64],
+    third_coefficients_rst: &[f64],
+    z: f64,
+) -> f64 {
+    let eta = cell.eta(z);
+    let c_r = poly_eval_at(first_coefficients_r, z);
+    let c_s = poly_eval_at(first_coefficients_s, z);
+    let c_t = poly_eval_at(first_coefficients_t, z);
+    let c_rs = poly_eval_at(second_coefficients_rs, z);
+    let c_rt = poly_eval_at(second_coefficients_rt, z);
+    let c_st = poly_eval_at(second_coefficients_st, z);
+    let c_rst = poly_eval_at(third_coefficients_rst, z);
+    let amplitude =
+        c_rst - eta * (c_rs * c_t + c_rt * c_s + c_st * c_r) + (eta * eta - 1.0) * c_r * c_s * c_t;
+    amplitude * (-cell.q(z)).exp() * INV_TWO_PI
 }
 
 /// Pointwise value of the density-weighted integrand `g(z)·exp(-q(z))/2π` at a
@@ -3176,14 +3309,18 @@ fn exp_neg_half_square(x: f64) -> f64 {
 /// ```text
 /// both ≥ 0 (upper tail):  erf(b/√2) − erf(a/√2) = erfc(a/√2) − erfc(b/√2)
 /// both ≤ 0 (lower tail):  erf(b/√2) − erf(a/√2) = erfc(−b/√2) − erfc(−a/√2)
-/// straddling zero:        erf(b/√2) − erf(a/√2) = 2 − erfc(b/√2) − erfc(−a/√2)
+/// straddling zero:        erf(b/√2) − erf(a/√2)
+///                        = erf(b/√2) + erf(−a/√2)       near the anchor
+///                        = 2 − erfc(b/√2) − erfc(−a/√2) otherwise
 /// ```
 ///
 /// In each branch every `erfc` argument is `≥ 0`, so the terms are small
-/// positive tail values (or an O(1) constant minus two values `≤ 1`); no
-/// large quantities cancel and full f64 precision survives down to the
-/// underflow boundary in either tail. Infinite endpoints fall out via the
-/// `erfc` limits (`erfc(+∞)=0`, `erfc(−∞)=2`) with no special casing.
+/// positive tail values, while narrow straddling intervals add two
+/// non-negative `erf` masses measured outward from the anchor. That avoids
+/// the `2 − erfc(b/√2) − erfc(−a/√2)` cancellation when both erfc terms round
+/// to `1.0`, but keeps the erfc-tail form for ordinary/full-line straddling
+/// intervals. No large quantities cancel and full f64 precision survives down
+/// to the underflow boundary in either tail and around the affine anchor.
 ///
 /// Uses `libm::erfc` (msun double-precision implementation, ≤ 1 ulp) rather
 /// than `statrs::function::erf::erfc` (a 6-term rational approximation that
@@ -3205,6 +3342,12 @@ fn truncated_gaussian_zeroth_moment(a: f64, b: f64) -> f64 {
         libm::erfc(za) - libm::erfc(zb)
     } else if zb <= 0.0 {
         libm::erfc(-zb) - libm::erfc(-za)
+    } else if zb <= 0.5 && -za <= 0.5 {
+        // Near the affine anchor, erfc(zb) and erfc(-za) are both close to
+        // one; subtracting them from 2.0 can round a tiny but representable
+        // cell mass to zero. The equivalent erf sum adds small positive
+        // quantities directly.
+        libm::erf(zb) + libm::erf(-za)
     } else {
         2.0 - libm::erfc(zb) - libm::erfc(-za)
     };
@@ -4065,38 +4208,6 @@ pub fn evaluate_cell_moments_with_scratch<'a>(
 mod tests {
     use super::*;
     use gam_math::probability::normal_pdf;
-
-    /// Pointwise value of the cell THIRD-derivative integrand
-    /// `(d3/dr ds dt) exp(-q(z))/2pi` at a single `z`, evaluated from the SAME
-    /// `(r, s, t, rs, rt, st, rst)` coefficient polynomials the moment reduction
-    /// `cell_third_derivative_from_moments` integrates. Unlike the
-    /// second-derivative integrand this one does NOT cancel across an interior
-    /// C2-link knot crossing (the `c_rst` third coefficient jumps), so it backs
-    /// the C2-telescoping regression below. Test-only; no production consumer.
-    #[inline]
-    fn cell_third_derivative_boundary_integrand(
-        cell: DenestedCubicCell,
-        first_coefficients_r: &[f64],
-        first_coefficients_s: &[f64],
-        first_coefficients_t: &[f64],
-        second_coefficients_rs: &[f64],
-        second_coefficients_rt: &[f64],
-        second_coefficients_st: &[f64],
-        third_coefficients_rst: &[f64],
-        z: f64,
-    ) -> f64 {
-        let eta = cell.eta(z);
-        let c_r = poly_eval_at(first_coefficients_r, z);
-        let c_s = poly_eval_at(first_coefficients_s, z);
-        let c_t = poly_eval_at(first_coefficients_t, z);
-        let c_rs = poly_eval_at(second_coefficients_rs, z);
-        let c_rt = poly_eval_at(second_coefficients_rt, z);
-        let c_st = poly_eval_at(second_coefficients_st, z);
-        let c_rst = poly_eval_at(third_coefficients_rst, z);
-        let amplitude = c_rst - eta * (c_rs * c_t + c_rt * c_s + c_st * c_r)
-            + (eta * eta - 1.0) * c_r * c_s * c_t;
-        amplitude * (-cell.q(z)).exp() * INV_TWO_PI
-    }
 
     #[inline]
     pub(super) fn polynomial_value(coefficients: &[f64], z: f64) -> f64 {

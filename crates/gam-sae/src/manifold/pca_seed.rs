@@ -6,6 +6,90 @@ use super::SaeAtomBasisKind;
 use gam_linalg::faer_ndarray::FaerSvd;
 use ndarray::{Array1, Array2, Array3, ArrayView2};
 
+/// Residual-norm floor below which the surplus atom's second phase axis is
+/// treated as collinear with the first (a degenerate 2-plane). Since both
+/// candidate directions enter [`surplus_phase_plane`] unit-normalized, the
+/// post-orthogonalization residual norm equals the sine of the angle between
+/// them, so this is an absolute "how far from collinear" threshold in `[0, 1]`.
+const SURPLUS_DIR_FLOOR: f64 = 1.0e-6;
+
+/// Golden-ratio conjugate `φ⁻¹`. Additive step of a low-discrepancy (mod 1)
+/// rotation that folds the #976 multi-start retry index into the periodic
+/// `phase_offset`, so successive reseeds place the SAME surplus atom at a
+/// well-spread DISTINCT circle phase. `pc_pair_offset == 0` contributes exactly
+/// `0.0`, leaving the original `atom_idx / k_atoms` offset bit-for-bit.
+const GOLDEN_RATIO_CONJUGATE: f64 = 0.618_033_988_749_894_9;
+
+/// Deterministic generic 2-plane for an OVERCOMPLETE (#1893) SURPLUS periodic
+/// atom, i.e. one whose index outruns the available disjoint PC pairs. Builds
+/// two pseudo-random combinations of ALL principal directions (a random 2-plane
+/// in the PC span) and Gram-Schmidt orthogonalizes the second against the first.
+///
+/// `pc_pair_offset` (the #976 multi-start retry index) is folded into the
+/// splitmix64 weight key via a base-`k_atoms` mix of `(atom_idx, pc_pair_offset)`,
+/// so the SAME surplus atom lands on a DIFFERENT random plane on each reseed
+/// retry (distinct basins by construction) while every `(atom, retry)` key stays
+/// distinct and `pc_pair_offset == 0` reproduces the original key bit-for-bit.
+///
+/// Returns `(dir1, dir2, two_dimensional)`. When the orthogonalized residual
+/// falls below [`SURPLUS_DIR_FLOOR`] the random combination was essentially
+/// collinear (or the effective PC span is 1-D), so `two_dimensional` is `false`
+/// and the caller must fall back to the 1-D span phase path rather than feed an
+/// `atan2` a degenerate plane that collapses to two phase points.
+fn surplus_phase_plane(
+    vt: ArrayView2<'_, f64>,
+    atom_idx: usize,
+    pc_pair_offset: usize,
+    k_atoms: usize,
+) -> (Array1<f64>, Array1<f64>, bool) {
+    let vt_rows = vt.nrows();
+    let ncols = vt.ncols();
+    // splitmix64-seeded weights keyed by (atom_idx, pc_pair_offset, pc):
+    // reproducible, no RNG crate, distinct per atom and per multi-start retry.
+    let mix = |mut z: u64| -> f64 {
+        z = z.wrapping_add(0x9E3779B97F4A7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^= z >> 31;
+        (z as f64 / u64::MAX as f64) * 2.0 - 1.0
+    };
+    let mut a = Array1::<f64>::zeros(ncols);
+    let mut b = Array1::<f64>::zeros(ncols);
+    for pc in 0..vt_rows {
+        let row_pc = vt.row(pc);
+        // Base-`k_atoms` mix of (atom_idx, pc_pair_offset) before the `<< 20`
+        // spread. At `pc_pair_offset == 0` this is exactly `(atom_idx << 20) ^ pc`
+        // — the original key, bit-for-bit — so the first attempt is unchanged.
+        let key = (((atom_idx as u64) + (pc_pair_offset as u64) * (k_atoms as u64)) << 20)
+            ^ (pc as u64);
+        let wa = mix(key);
+        let wb = mix(key ^ 0xD1B54A32D192ED03);
+        for c in 0..ncols {
+            a[c] += wa * row_pc[c];
+            b[c] += wb * row_pc[c];
+        }
+    }
+    let na = a.dot(&a).sqrt().max(1.0e-12);
+    a.mapv_inplace(|v| v / na);
+    let nb = b.dot(&b).sqrt().max(1.0e-12);
+    b.mapv_inplace(|v| v / nb);
+    // Gram-Schmidt: strip dir1's component out of dir2 so the two phase axes are
+    // not near-collinear. Two independently normalized random combinations can be
+    // near-parallel (likely when the effective spectrum is small), which would
+    // make `atan2(z·dir2, z·dir1)` take only two values and kill the diversity
+    // this branch exists to create. With unit `dir1` the residual norm equals the
+    // sine of the angle between the raw directions.
+    let proj = b.dot(&a);
+    b.scaled_add(-proj, &a);
+    let nb_res = b.dot(&b).sqrt();
+    if nb_res > SURPLUS_DIR_FLOOR {
+        b.mapv_inplace(|v| v / nb_res);
+        (a, b, true)
+    } else {
+        (a, b, false)
+    }
+}
+
 /// PCA-based seed for SAE atom latent coordinates. Centers `z`, takes its SVD,
 /// and projects onto leading principal components to initialize each atom's
 /// chart according to its [`SaeAtomBasisKind`]: periodic atoms read a `[0, 1)`
@@ -130,9 +214,27 @@ pub fn sae_pca_seed_initial_coords_with_pc_offset(
                     } else {
                         (0, 0)
                     };
-                    let pc1 = vt.row(pc1_row.min(vt_rows - 1));
+                    // #1893 — OVERCOMPLETE (K ≫ p) generic seeding. Linear
+                    // projection has only `pc_pairs ≈ p/2` distinct PC planes, so
+                    // once atoms outnumber them the old scheme reused a plane with
+                    // only a constant phase shift — a decoder-equivalent DUPLICATE
+                    // that leaves the joint block rank-deficient and drives the
+                    // co-collapse. For every SURPLUS atom (index ≥ pc_pairs) build a
+                    // DISTINCT generic phase plane from a deterministic pseudo-random
+                    // combination of ALL principal directions (a random 2-plane in
+                    // the PC span), so K ≫ p atoms are pairwise distinct for any K.
+                    // Atoms 0..pc_pairs keep their exact PC-pair seed (small-K path
+                    // byte-for-byte unchanged); only wrap-victims are rerouted.
+                    let surplus = pc_pairs >= 1 && k_atoms > pc_pairs && atom_idx >= pc_pairs;
                     let phase_offset = if pc_pairs > 0 && pc_pairs < k_atoms {
+                        // Fold the #976 retry index into the circle offset with a
+                        // golden-ratio additive rotation (low-discrepancy mod 1) so
+                        // successive reseeds place the SAME atom at a distinct
+                        // phase. The `phase - phase.floor()` wrap below reduces this
+                        // mod 1; `pc_pair_offset == 0` adds exactly `0.0`, leaving
+                        // the original `atom_idx / k_atoms` offset bit-for-bit.
                         atom_idx as f64 / k_atoms as f64
+                            + pc_pair_offset as f64 * GOLDEN_RATIO_CONJUGATE
                     } else {
                         0.0
                     };
@@ -140,8 +242,29 @@ pub fn sae_pca_seed_initial_coords_with_pc_offset(
                     let s1 = s_vals.get(pc2_row).copied().unwrap_or(0.0).abs();
                     let has_two_dimensional_phase =
                         vt_rows >= 2 && pc2_row != pc1_row && s1 > 1.0e-10 * s0.max(1.0);
-                    if has_two_dimensional_phase {
-                        let pc2 = vt.row(pc2_row.min(vt_rows - 1));
+                    // `two_dimensional_phase` gates the atan2 (2-plane) read vs the
+                    // min-max (1-span) read. Non-surplus atoms keep the rank check
+                    // above unchanged; surplus atoms use the Gram-Schmidt residual
+                    // flag so a near-collinear random 2-plane falls back to the 1-D
+                    // path instead of collapsing atan2 to two phase points.
+                    let mut two_dimensional_phase = has_two_dimensional_phase;
+                    let dir1: Array1<f64>;
+                    let dir2: Array1<f64>;
+                    if surplus {
+                        // #1893/#976 — distinct generic 2-plane per (atom, retry),
+                        // Gram-Schmidt orthogonalized with a collinearity floor.
+                        let (a, b, two_d) =
+                            surplus_phase_plane(vt.view(), atom_idx, pc_pair_offset, k_atoms);
+                        dir1 = a;
+                        dir2 = b;
+                        two_dimensional_phase = two_d;
+                    } else {
+                        dir1 = vt.row(pc1_row.min(vt_rows - 1)).to_owned();
+                        dir2 = vt.row(pc2_row.min(vt_rows - 1)).to_owned();
+                    }
+                    let pc1 = dir1.view();
+                    if two_dimensional_phase {
+                        let pc2 = dir2.view();
                         for row in 0..n_obs {
                             let mut a = 0.0_f64;
                             let mut b = 0.0_f64;
@@ -342,4 +465,141 @@ pub fn sae_pca_seed_initial_coords_with_pc_offset(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Small deterministic `vt`-like matrix (rows = principal directions). The
+    /// helper does not require orthonormal rows, only a non-degenerate span.
+    fn make_vt(rows: usize, cols: usize) -> Array2<f64> {
+        let mut m = Array2::<f64>::zeros((rows, cols));
+        for r in 0..rows {
+            for c in 0..cols {
+                m[[r, c]] = ((r * 7 + c * 3 + 1) as f64).sin() + 0.1 * (r as f64 - c as f64);
+            }
+        }
+        m
+    }
+
+    /// FIX #1: distinct `pc_pair_offset` ⇒ distinct random plane for a surplus
+    /// atom, so successive #976 reseeds explore different basins. Also checks the
+    /// FIX #2 Gram-Schmidt output is genuinely orthogonal.
+    #[test]
+    fn surplus_plane_differs_across_retries() {
+        let vt = make_vt(6, 5);
+        let k_atoms = 8;
+        let atom_idx = 5;
+        let (d1_0, d2_0, ok0) = surplus_phase_plane(vt.view(), atom_idx, 0, k_atoms);
+        let (d1_1, _d2_1, ok1) = surplus_phase_plane(vt.view(), atom_idx, 1, k_atoms);
+        assert!(ok0 && ok1, "well-conditioned vt should give a 2-D plane");
+        let diff = d1_0
+            .iter()
+            .zip(d1_1.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            diff > 1e-6,
+            "distinct retry offsets must yield distinct dir1 (max diff {diff:.3e})"
+        );
+        let dot: f64 = d1_0.iter().zip(d2_0.iter()).map(|(a, b)| a * b).sum();
+        assert!(dot.abs() < 1e-9, "dir2 must be orthogonal to dir1 (dot {dot:.3e})");
+        let n2: f64 = d2_0.dot(&d2_0).sqrt();
+        assert!((n2 - 1.0).abs() < 1e-9, "dir2 must be unit-normalized (norm {n2})");
+    }
+
+    /// FIX #1: `pc_pair_offset == 0` reproduces the ORIGINAL splitmix64 key
+    /// `((atom_idx) << 20) ^ pc` bit-for-bit, so the first attempt's primary
+    /// phase axis is unchanged by the fix.
+    #[test]
+    fn surplus_plane_offset_zero_matches_original_key() {
+        let vt = make_vt(5, 4);
+        let k_atoms = 7;
+        let atom_idx = 6;
+        // Reference: replicate the pre-fix inline `dir1` computation exactly
+        // (original key, same accumulation and normalization order).
+        let mix = |mut z: u64| -> f64 {
+            z = z.wrapping_add(0x9E3779B97F4A7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^= z >> 31;
+            (z as f64 / u64::MAX as f64) * 2.0 - 1.0
+        };
+        let ncols = vt.ncols();
+        let mut a = Array1::<f64>::zeros(ncols);
+        for pc in 0..vt.nrows() {
+            let row_pc = vt.row(pc);
+            let key = ((atom_idx as u64) << 20) ^ (pc as u64);
+            let wa = mix(key);
+            for c in 0..ncols {
+                a[c] += wa * row_pc[c];
+            }
+        }
+        let na = a.dot(&a).sqrt().max(1.0e-12);
+        a.mapv_inplace(|v| v / na);
+        let (d1, _d2, _ok) = surplus_phase_plane(vt.view(), atom_idx, 0, k_atoms);
+        for (r, o) in d1.iter().zip(a.iter()) {
+            assert!(
+                (r - o).abs() < 1e-15,
+                "offset-0 dir1 must match the original key bit-for-bit ({r} vs {o})"
+            );
+        }
+    }
+
+    /// FIX #2: a rank-1 PC span forces both random combinations collinear, so the
+    /// orthogonalized residual is ~0 and the helper must report the 1-D fallback
+    /// rather than a degenerate 2-plane that collapses atan2 to two phase points.
+    #[test]
+    fn surplus_plane_collinear_falls_back_to_1d() {
+        let vt = make_vt(1, 4);
+        let (d1, _d2, ok) = surplus_phase_plane(vt.view(), 3, 0, 5);
+        assert!(!ok, "rank-1 span must report a 1-D (non-2-plane) result");
+        let n1: f64 = d1.dot(&d1).sqrt();
+        assert!(
+            (n1 - 1.0).abs() < 1e-9 && n1.is_finite(),
+            "dir1 must stay a finite unit vector (norm {n1})"
+        );
+    }
+
+    /// End-to-end wiring: with more periodic atoms than PC pairs, offset 0 vs 1
+    /// must move a SURPLUS atom's phase coords (distinct basins), every coord
+    /// stays finite in `[0, 1)`, and offset 0 equals the no-offset entry point.
+    #[test]
+    fn surplus_periodic_seed_reproduces_and_diversifies() {
+        // p = 4 ⇒ pc_pairs = 2; 5 periodic atoms ⇒ atoms 2..5 are surplus.
+        let n_obs = 8;
+        let p = 4;
+        let mut zvals = Vec::with_capacity(n_obs * p);
+        for r in 0..n_obs {
+            for c in 0..p {
+                zvals.push(
+                    ((r as f64) * 0.9 + 1.0).sin() * ((c + 1) as f64)
+                        + 0.3 * ((r * c) as f64).cos(),
+                );
+            }
+        }
+        let z = Array2::from_shape_vec((n_obs, p), zvals).unwrap();
+        let kinds = vec![SaeAtomBasisKind::Periodic; 5];
+        let dims = vec![1usize; 5];
+        let s0 = sae_pca_seed_initial_coords_with_pc_offset(z.view(), &kinds, &dims, 0).unwrap();
+        let s1 = sae_pca_seed_initial_coords_with_pc_offset(z.view(), &kinds, &dims, 1).unwrap();
+        let plain = sae_pca_seed_initial_coords(z.view(), &kinds, &dims).unwrap();
+        assert_eq!(s0, plain, "offset-0 must equal the no-offset seed bit-for-bit");
+        for v in s0.iter().chain(s1.iter()) {
+            assert!(
+                v.is_finite() && *v >= 0.0 && *v < 1.0,
+                "periodic phase must be finite in [0, 1): {v}"
+            );
+        }
+        let surplus_atom = 3;
+        let mut moved = 0.0_f64;
+        for row in 0..n_obs {
+            moved = moved.max((s0[[surplus_atom, row, 0]] - s1[[surplus_atom, row, 0]]).abs());
+        }
+        assert!(
+            moved > 1e-6,
+            "surplus atom must land on a distinct basin across retries (max move {moved:.3e})"
+        );
+    }
 }

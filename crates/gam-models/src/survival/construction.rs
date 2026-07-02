@@ -27,6 +27,7 @@ use crate::wiggle::{
 use gam_terms::inference::formula_dsl::LinkWiggleFormulaSpec;
 use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix, SparseDesignMatrix, symmetrize_in_place};
 use crate::probability::{normal_pdf, standard_normal_quantile};
+use gam_problem::outer_subsample::RowSet;
 use gam_problem::{InverseLink, StandardLink};
 use ndarray::{Array1, Array2, array, s};
 use rayon::prelude::*;
@@ -2875,61 +2876,61 @@ pub fn marginal_slope_baseline_chain_rule_hessian(
     // Per-row Hessian contractions are independent. Each row contributes a
     // dim×dim increment combining second partials (exit/entry channels) with
     // the curvature-weighted outer product of the (entry, exit, derivative)
-    // first-partial Jacobians. Parallel try_fold/try_reduce accumulates them.
-    let hessian = (0..n)
-        .into_par_iter()
-        .try_fold(
-            || Array2::<f64>::zeros((dim, dim)),
-            |mut acc, i| -> Result<Array2<f64>, String> {
-                let exit_parts =
-                    marginal_slope_baseline_offset_theta_second_partials(age_exit[i], cfg)?
+    // first-partial Jacobians. Fixed row chunks are combined in chunk-index
+    // order so floating-point addition stays deterministic across Rayon
+    // scheduling decisions.
+    let hessian = RowSet::All.par_try_reduce_fold(
+        n,
+        || Array2::<f64>::zeros((dim, dim)),
+        |mut acc, i, _row_weight| -> Result<Array2<f64>, String> {
+            let exit_parts =
+                marginal_slope_baseline_offset_theta_second_partials(age_exit[i], cfg)?
+                    .ok_or_else(|| {
+                        "unexpected None from marginal-slope second partials at exit".to_string()
+                    })?;
+            if exit_parts.first.len() != dim {
+                return Err(
+                    "marginal_slope_baseline_chain_rule_hessian: theta_dim drifted".to_string(),
+                );
+            }
+            let mut entry_parts = None;
+            if residuals.entry[i] != 0.0 {
+                entry_parts = Some(
+                    marginal_slope_baseline_offset_theta_second_partials(age_entry[i], cfg)?
                         .ok_or_else(|| {
-                            "unexpected None from marginal-slope second partials at exit"
+                            "unexpected None from marginal-slope second partials at entry"
                                 .to_string()
-                        })?;
-                if exit_parts.first.len() != dim {
-                    return Err(
-                        "marginal_slope_baseline_chain_rule_hessian: theta_dim drifted".to_string(),
-                    );
-                }
-                let mut entry_parts = None;
-                if residuals.entry[i] != 0.0 {
-                    entry_parts = Some(
-                        marginal_slope_baseline_offset_theta_second_partials(age_entry[i], cfg)?
-                            .ok_or_else(|| {
-                                "unexpected None from marginal-slope second partials at entry"
-                                    .to_string()
-                            })?,
-                    );
-                }
-                for a in 0..dim {
-                    for b in 0..dim {
-                        let j_exit_a = exit_parts.first[a].0;
-                        let j_exit_b = exit_parts.first[b].0;
-                        let j_deriv_a = exit_parts.first[a].1;
-                        let j_deriv_b = exit_parts.first[b].1;
-                        let mut value = residuals.exit[i] * exit_parts.second[a][b].0
-                            + residuals.derivative[i] * exit_parts.second[a][b].1;
-                        if let Some(parts) = entry_parts.as_ref() {
-                            value += residuals.entry[i] * parts.second[a][b].0;
-                        }
-                        let curv = curvatures.rows[i];
-                        let j_entry_a = entry_parts.as_ref().map_or(0.0, |parts| parts.first[a].0);
-                        let j_entry_b = entry_parts.as_ref().map_or(0.0, |parts| parts.first[b].0);
-                        let ja = [j_entry_a, j_exit_a, j_deriv_a];
-                        let jb = [j_entry_b, j_exit_b, j_deriv_b];
-                        for u in 0..3 {
-                            for v in 0..3 {
-                                value += ja[u] * curv[u][v] * jb[v];
-                            }
-                        }
-                        acc[[a, b]] += value;
+                        })?,
+                );
+            }
+            for a in 0..dim {
+                for b in 0..dim {
+                    let j_exit_a = exit_parts.first[a].0;
+                    let j_exit_b = exit_parts.first[b].0;
+                    let j_deriv_a = exit_parts.first[a].1;
+                    let j_deriv_b = exit_parts.first[b].1;
+                    let mut value = residuals.exit[i] * exit_parts.second[a][b].0
+                        + residuals.derivative[i] * exit_parts.second[a][b].1;
+                    if let Some(parts) = entry_parts.as_ref() {
+                        value += residuals.entry[i] * parts.second[a][b].0;
                     }
+                    let curv = curvatures.rows[i];
+                    let j_entry_a = entry_parts.as_ref().map_or(0.0, |parts| parts.first[a].0);
+                    let j_entry_b = entry_parts.as_ref().map_or(0.0, |parts| parts.first[b].0);
+                    let ja = [j_entry_a, j_exit_a, j_deriv_a];
+                    let jb = [j_entry_b, j_exit_b, j_deriv_b];
+                    for u in 0..3 {
+                        for v in 0..3 {
+                            value += ja[u] * curv[u][v] * jb[v];
+                        }
+                    }
+                    acc[[a, b]] += value;
                 }
-                Ok(acc)
-            },
-        )
-        .try_reduce(|| Array2::<f64>::zeros((dim, dim)), |a, b| Ok(a + b))?;
+            }
+            Ok(acc)
+        },
+        |a, b| Ok(a + b),
+    )?;
     Ok(Some(hessian))
 }
 

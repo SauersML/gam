@@ -126,9 +126,12 @@ fn delta_method_variance_matches_posterior_simulation_for_small_logit_problem() 
     let l21 = cov[[1, 0]] / l11;
     let l22 = (cov[[1, 1]] - l21 * l21).sqrt();
     let mut vals = Vec::new();
-    for k in 0..20000 {
-        let u1 = ((k * 48271 % 2147483647) as f64) / 2147483647.0;
-        let u2 = ((k * 69621 % 2147483647) as f64) / 2147483647.0;
+    let mut state = 1_u64;
+    for _ in 0..20000 {
+        state = (state * 48271) % 2147483647;
+        let u1 = (state as f64) / 2147483647.0;
+        state = (state * 48271) % 2147483647;
+        let u2 = (state as f64) / 2147483647.0;
         let r = (-2.0 * u1.max(1e-12).ln()).sqrt();
         let z1 = r * (2.0 * std::f64::consts::PI * u2).cos();
         let z2 = r * (2.0 * std::f64::consts::PI * u2).sin();

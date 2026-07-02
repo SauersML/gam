@@ -687,6 +687,56 @@ def ibp_map(logits: torch.Tensor, temperature: float, alpha: float) -> torch.Ten
     return apply(logits, float(temperature), float(alpha))
 
 
+class _JumpReLUBoundedGateFn(torch.autograd.Function):
+    """Bounded threshold gate — a thin marshaller over the Rust batch kernel.
+
+    Forward returns ``a_k = σ((l_k − θ_k)/τ) · 1[l_k > θ_k]``; the diagonal
+    straight-through derivative ``da/dl_k = σ'((l_k − θ_k)/τ)/τ`` (alive on both
+    sides of the jump so gated-off atoms keep a training signal) comes from ONE
+    call to the Rust source of truth
+    ``gam::terms::sae::assignment::jumprelu_batch_value_grad`` — the batched
+    sibling of ``jumprelu_row_value_grad``, bit-identical to it row-by-row. No
+    torch gate math and no per-row FFI loop: the whole ``(N, K)`` matrix crosses
+    the Python↔Rust boundary exactly once per forward pass. The threshold
+    gradient is the negated row-sum of the diagonal derivative
+    (``∂a_k/∂θ_k = −da/dl_k``); callers negate and accumulate.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: Any, logits: torch.Tensor, thresholds: torch.Tensor, temperature: float
+    ) -> torch.Tensor:
+        # Rust owns the gate math; Python only marshals the (N, K) matrix across
+        # the FFI boundary ONCE (batched — no per-row loop, no torch recompute).
+        logits_np = to_numpy_f64(logits).reshape(logits.shape[0], -1)
+        thr_np = np.ascontiguousarray(to_numpy_f64(thresholds).reshape(-1))
+        value, grad = rust_module().sae_jumprelu_batch_value_grad(
+            logits_np, float(temperature), thr_np
+        )
+        ctx.save_for_backward(from_numpy_like(grad, logits).reshape_as(logits))
+        return from_numpy_like(value, logits).reshape_as(logits)
+
+    @staticmethod
+    def backward(
+        ctx: Any, grad_output: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, None]:
+        (jac_diag,) = ctx.saved_tensors
+        upstream = grad_output * jac_diag
+        return upstream, -upstream.sum(dim=0), None
+
+
+def jumprelu_bounded_gate(
+    logits: torch.Tensor, thresholds: torch.Tensor, temperature: float
+) -> torch.Tensor:
+    """Differentiable bounded threshold gate via the Rust value+grad kernel."""
+    if not isinstance(logits, torch.Tensor):
+        raise TypeError("jumprelu_bounded_gate logits must be a torch.Tensor")
+    if not isinstance(thresholds, torch.Tensor):
+        raise TypeError("jumprelu_bounded_gate thresholds must be a torch.Tensor")
+    apply = cast(Callable[..., torch.Tensor], _JumpReLUBoundedGateFn.apply)
+    return apply(logits, thresholds, float(temperature))
+
+
 class RiemannianRetraction(Optimizer):
     """Optimizer that retracts Euclidean gradient steps onto a manifold."""
 

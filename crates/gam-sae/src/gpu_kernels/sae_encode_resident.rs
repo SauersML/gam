@@ -1234,11 +1234,24 @@ pub fn measure_device_encode_throughput(
         0.0
     };
     let engaged = matches!(path, EncodePath::Device);
-    // Key the surrogate decision on the measurement. When the device did not run
-    // the exact encode, report the honest blocked reason rather than a
-    // `DeviceNotEngaged` false-routing (the kernel exists, but no device ran it).
+    // Key the surrogate decision on the measurement. A CPU-emulator run is an
+    // honest non-measurement for the #988 device gate, but the reason matters:
+    //
+    //   * no CUDA runtime/device on the host => blocked on hardware;
+    //   * CUDA present and the batch was large enough to require the device path,
+    //     yet the kernel fell back to the emulator => false routing / device
+    //     non-engagement, which must be surfaced as such rather than laundered
+    //     into the same state as a CPU-only laptop.
+    //
+    // In either case the anti-green-wash contract is the same: an emulator rate
+    // can never declare the surrogate unneeded or justified.
+    let device_available = gam_gpu::device_runtime::GpuRuntime::global()
+        .map(|rt| rt.device_count() > 0)
+        .unwrap_or(false);
     let decision = if engaged {
         EncodeDeploymentDecision::from_device_measurement(true, rows_per_sec)
+    } else if device_available && n >= DEVICE_ROW_THRESHOLD {
+        EncodeDeploymentDecision::blocked(EncodeDecisionBlocked::DeviceNotEngaged)
     } else {
         EncodeDeploymentDecision::blocked(EncodeDecisionBlocked::NoDevice)
     };
@@ -1728,14 +1741,33 @@ mod tests {
             }
         } else {
             // CPU-only host (this dev box): the rate is honest but it is NOT a
-            // device measurement. The surrogate decision is BLOCKED on hardware —
-            // a fast CPU number can never declare the surrogate unneeded (the
-            // #1412 anti-green-wash property carried to the exact device encode).
+            // device measurement. The surrogate decision is BLOCKED — on a
+            // CPU-only host because there is no hardware, and on a CUDA host
+            // because falling back to the emulator despite a device-sized batch
+            // is false routing. A fast CPU number can never declare the
+            // surrogate unneeded (the #1412 anti-green-wash property carried to
+            // the exact device encode).
             assert!(
                 tput.decision.is_undetermined(),
                 "a CPU-emulator exact encode must leave the surrogate decision Undetermined, got {:?}",
                 tput.decision
             );
+            if gam_gpu::device_runtime::GpuRuntime::global()
+                .map(|rt| rt.device_count() > 0)
+                .unwrap_or(false)
+            {
+                assert_eq!(
+                    tput.decision,
+                    EncodeDeploymentDecision::blocked(EncodeDecisionBlocked::DeviceNotEngaged),
+                    "CUDA was present for a device-sized exact-encode batch, so an emulator path \
+                     must be reported as DeviceNotEngaged (false routing), not NoDevice"
+                );
+            } else {
+                assert_eq!(
+                    tput.decision,
+                    EncodeDeploymentDecision::blocked(EncodeDecisionBlocked::NoDevice)
+                );
+            }
             assert!(!tput.decision.surrogate_unneeded());
             assert!(!tput.decision.surrogate_justified());
         }
@@ -1815,4 +1847,3 @@ mod tests {
         }
     }
 }
-

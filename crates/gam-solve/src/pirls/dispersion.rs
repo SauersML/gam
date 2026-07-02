@@ -32,23 +32,21 @@ pub(crate) fn estimate_gamma_shape_from_eta(
 ) -> f64 {
     const EPS: f64 = 1e-12;
 
-    use rayon::iter::{IntoParallelIterator, ParallelIterator};
-    let (weighted_target, total_weight) = (0..eta.len())
-        .into_par_iter()
-        .map(|i| {
+    let (weighted_target, total_weight) = RowSet::All.par_reduce_fold(
+        eta.len(),
+        || (0.0_f64, 0.0_f64),
+        |(target_acc, weight_acc), i, _row_weight| {
             let wi = priorweights[i].max(0.0);
             if wi == 0.0 {
-                return (0.0_f64, 0.0_f64);
+                return (target_acc, weight_acc);
             }
             let yi = y[i].max(EPS);
             let mui = eta[i].clamp(-ETA_CLAMP, ETA_CLAMP).exp().max(EPS);
             let ratio = yi / mui;
-            (wi * (ratio - ratio.ln() - 1.0), wi)
-        })
-        .reduce(
-            || (0.0_f64, 0.0_f64),
-            |(t1, w1), (t2, w2)| (t1 + t2, w1 + w2),
-        );
+            (target_acc + wi * (ratio - ratio.ln() - 1.0), weight_acc + wi)
+        },
+        |(t1, w1), (t2, w2)| (t1 + t2, w1 + w2),
+    );
 
     if total_weight <= 0.0 {
         return 1.0;

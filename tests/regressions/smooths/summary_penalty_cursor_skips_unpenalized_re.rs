@@ -107,28 +107,64 @@ fn summary_penalty_cursor_matches_actual_penalty_layout() {
         })
         .count();
 
-    // What the summary cursor SKIPS before the first smooth: one slot per
-    // random-effect range, unconditionally (the buggy reconstruction).
-    let summary_cursor_skips = design.random_effect_ranges.len();
+    // What the summary cursor must skip before the first smooth: the actual
+    // leading non-smooth penalty blocks in the flat global penalty layout, read
+    // via the same helper the fixed production summary / EDF / LR sites use.
+    // This intentionally differs from the old buggy reconstruction, which
+    // advanced by one slot per random-effect range unconditionally.
+    let summary_cursor_skips = design.leading_penalty_blocks_before_smooth();
+    let buggy_cursor_skips = design.random_effect_ranges.len();
 
     // Sanity: the `by=g` factor really did introduce a random-effect range.
     assert!(
         !design.random_effect_ranges.is_empty(),
         "expected an unpenalized random-effect main effect for the by= factor; \
-         random_effect_ranges was empty — formula plumbing changed"
+         random_effect_ranges was empty \u{2014} formula plumbing changed"
+    );
+    assert_ne!(
+        buggy_cursor_skips, leading_re_penalty_blocks,
+        "regression fixture no longer contains an unpenalized random-effect \
+         range; the old one-slot-per-range cursor would not desync"
     );
 
-    // The invariant the summary RELIES ON: the number of random-effect ranges it
-    // skips must equal the number of leading penalty blocks those ranges own.
-    // An unpenalized `by` factor breaks it (range present, no penalty block).
+    // The invariant the summary RELIES ON: the number of leading penalty blocks
+    // the cursor skips must equal the number of leading penalty blocks the
+    // random effects own, not the number of random-effect coefficient ranges.
     assert_eq!(
         summary_cursor_skips, leading_re_penalty_blocks,
-        "summary penalty-cursor desync: the summary advances the penalty cursor \
-         by {summary_cursor_skips} (one per random-effect range) before the first \
-         smooth, but only {leading_re_penalty_blocks} leading penalty blocks \
-         actually belong to random effects. The first smooth's per_term_edf will \
-         read penalty_block_trace[{summary_cursor_skips}..] instead of \
+        "summary penalty-cursor desync: the summary advances the penalty cursor by \
+         {summary_cursor_skips} before the first smooth, but \
+         {leading_re_penalty_blocks} leading penalty blocks actually belong to \
+         random effects. The first smooth's per_term_edf will read \
+         penalty_block_trace[{summary_cursor_skips}..] instead of \
          [{leading_re_penalty_blocks}..], corrupting EDF / ref_df / p-value in the \
          influence-matrix-absent fallback path."
+    );
+
+    // End-to-end: walking every smooth term's penalty window from that cursor
+    // must consume the per-block penalty trace EXACTLY, never running past its
+    // end. The old `random_effect_ranges.len()` seed overshoots here, so the
+    // trailing smooth's `[cursor..cursor+k]` window would run off the end of the
+    // per-block traces and `per_term_edf` would return 0 (#1883).
+    let mut penalty_cursor = summary_cursor_skips;
+    for term in &design.smooth.terms {
+        let k = term.penalties_local.len();
+        assert!(
+            penalty_cursor + k <= design.penaltyinfo.len(),
+            "smooth term '{}' penalty window [{penalty_cursor}..{}] runs past the \
+             {} global penalty blocks \u{2014} penalty-cursor desync (#1883)",
+            term.name,
+            penalty_cursor + k,
+            design.penaltyinfo.len()
+        );
+        penalty_cursor += k;
+    }
+    assert_eq!(
+        penalty_cursor,
+        design.penaltyinfo.len(),
+        "the reconstructed penalty cursor must consume every global penalty block \
+         exactly once; a leftover/overshoot means the per-term windows are \
+         mis-aligned (#1883)"
+    );
     );
 }

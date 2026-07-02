@@ -1,5 +1,20 @@
 use super::*;
 
+pub(crate) const STANDARD_PREDICTION_BASE_COLUMNS: [&str; 2] = ["eta", "mean"];
+pub(crate) const GAUSSIAN_LOCATION_SCALE_BASE_COLUMNS: [&str; 3] = ["eta", "mean", "sigma"];
+pub(crate) const SURVIVAL_PREDICTION_BASE_COLUMNS: [&str; 4] =
+    ["eta", "survival_prob", "failure_prob", "risk_score"];
+pub(crate) const SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS: [&str; 6] = [
+    "eta",
+    "mean",
+    "event_prob",
+    "failure_prob",
+    "survival_prob",
+    "risk_score",
+];
+pub(crate) const PREDICTION_INTERVAL_COLUMNS: [&str; 2] = ["mean_lower", "mean_upper"];
+pub(crate) const PREDICTION_STD_ERROR_COLUMN: &str = "std_error";
+
 pub(crate) fn write_matrix_csv(
     path: &Path,
     mat: &Array2<f64>,
@@ -244,7 +259,10 @@ pub(crate) fn write_prediction_csv(
     let eta_v: Vec<f64> = eta.to_vec();
     let mean_v: Vec<f64> = mean.to_vec();
 
-    let mut cols: Vec<(&str, &[f64])> = vec![("eta", &eta_v), ("mean", &mean_v)];
+    let mut cols: Vec<(&str, &[f64])> = vec![
+        (STANDARD_PREDICTION_BASE_COLUMNS[0], &eta_v),
+        (STANDARD_PREDICTION_BASE_COLUMNS[1], &mean_v),
+    ];
 
     let se_v: Vec<f64>;
     let lo_v: Vec<f64>;
@@ -261,14 +279,14 @@ pub(crate) fn write_prediction_csv(
                 "internal error: mean_upper missing while std_error is present".to_string()
             })?
             .to_vec();
-        cols.push(("std_error", &se_v));
-        cols.push(("mean_lower", &lo_v));
-        cols.push(("mean_upper", &hi_v));
+        cols.push((PREDICTION_STD_ERROR_COLUMN, &se_v));
+        cols.push((PREDICTION_INTERVAL_COLUMNS[0], &lo_v));
+        cols.push((PREDICTION_INTERVAL_COLUMNS[1], &hi_v));
     } else if let (Some(lo), Some(hi)) = (mean_lower, mean_upper) {
         lo_v = lo.to_vec();
         hi_v = hi.to_vec();
-        cols.push(("mean_lower", &lo_v));
-        cols.push(("mean_upper", &hi_v));
+        cols.push((PREDICTION_INTERVAL_COLUMNS[0], &lo_v));
+        cols.push((PREDICTION_INTERVAL_COLUMNS[1], &hi_v));
     } else if mean_lower.is_some() {
         return Err(CliError::Internal {
             reason: "internal error: mean_upper missing while mean_lower is present".to_string(),
@@ -297,9 +315,9 @@ pub(crate) fn write_gaussian_location_scale_prediction_csv(
     let sigma_v: Vec<f64> = sigma.to_vec();
 
     let mut cols: Vec<(&str, &[f64])> = vec![
-        ("eta", &eta_v),
-        ("mean", &mean_v),
-        ("sigma", &sigma_v),
+        (GAUSSIAN_LOCATION_SCALE_BASE_COLUMNS[0], &eta_v),
+        (GAUSSIAN_LOCATION_SCALE_BASE_COLUMNS[1], &mean_v),
+        (GAUSSIAN_LOCATION_SCALE_BASE_COLUMNS[2], &sigma_v),
     ];
 
     let lo_v: Vec<f64>;
@@ -312,8 +330,8 @@ pub(crate) fn write_gaussian_location_scale_prediction_csv(
                     .to_string(),
             })?
             .to_vec();
-        cols.push(("mean_lower", &lo_v));
-        cols.push(("mean_upper", &hi_v));
+        cols.push((PREDICTION_INTERVAL_COLUMNS[0], &lo_v));
+        cols.push((PREDICTION_INTERVAL_COLUMNS[1], &hi_v));
     } else if mean_upper.is_some() {
         return Err(CliError::Internal {
             reason: "internal error: gaussian location-scale output requires both mean_lower and mean_upper"
@@ -340,10 +358,10 @@ pub(crate) fn write_survival_prediction_csv(
     let fail_v: Vec<f64> = surv_v.iter().map(|&s| (1.0 - s).clamp(0.0, 1.0)).collect();
 
     let mut cols: Vec<(&str, &[f64])> = vec![
-        ("eta", &eta_v),
-        ("survival_prob", &surv_v),
-        ("failure_prob", &fail_v),
-        ("risk_score", &risk_v),
+        (SURVIVAL_PREDICTION_BASE_COLUMNS[0], &eta_v),
+        (SURVIVAL_PREDICTION_BASE_COLUMNS[1], &surv_v),
+        (SURVIVAL_PREDICTION_BASE_COLUMNS[2], &fail_v),
+        (SURVIVAL_PREDICTION_BASE_COLUMNS[3], &risk_v),
     ];
 
     let se_v: Vec<f64>;
@@ -361,14 +379,14 @@ pub(crate) fn write_survival_prediction_csv(
                 "internal error: survival_upper missing while std_error is present".to_string()
             })?
             .to_vec();
-        cols.push(("std_error", &se_v));
-        cols.push(("mean_lower", &lo_v));
-        cols.push(("mean_upper", &hi_v));
+        cols.push((PREDICTION_STD_ERROR_COLUMN, &se_v));
+        cols.push((PREDICTION_INTERVAL_COLUMNS[0], &lo_v));
+        cols.push((PREDICTION_INTERVAL_COLUMNS[1], &hi_v));
     } else if let (Some(lo), Some(hi)) = (survival_lower, survival_upper) {
         lo_v = lo.to_vec();
         hi_v = hi.to_vec();
-        cols.push(("mean_lower", &lo_v));
-        cols.push(("mean_upper", &hi_v));
+        cols.push((PREDICTION_INTERVAL_COLUMNS[0], &lo_v));
+        cols.push((PREDICTION_INTERVAL_COLUMNS[1], &hi_v));
     } else if survival_lower.is_some() {
         return Err(CliError::Internal {
             reason: "internal error: survival_upper missing while survival_lower is present"
@@ -401,12 +419,12 @@ pub(crate) fn write_survival_binary_prediction_csv(
     let survival_v: Vec<f64> = event_v.iter().map(|&p| (1.0 - p).clamp(0.0, 1.0)).collect();
 
     let mut cols: Vec<(&str, &[f64])> = vec![
-        ("eta", &eta_v),
-        ("mean", &event_v),
-        ("event_prob", &event_v),
-        ("failure_prob", &event_v),
-        ("survival_prob", &survival_v),
-        ("risk_score", &risk_v),
+        (SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS[0], &eta_v),
+        (SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS[1], &event_v),
+        (SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS[2], &event_v),
+        (SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS[3], &event_v),
+        (SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS[4], &survival_v),
+        (SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS[5], &risk_v),
     ];
 
     let se_v: Vec<f64>;
@@ -426,14 +444,14 @@ pub(crate) fn write_survival_binary_prediction_csv(
                     .to_string(),
             })?
             .to_vec();
-        cols.push(("std_error", &se_v));
-        cols.push(("mean_lower", &lo_v));
-        cols.push(("mean_upper", &hi_v));
+        cols.push((PREDICTION_STD_ERROR_COLUMN, &se_v));
+        cols.push((PREDICTION_INTERVAL_COLUMNS[0], &lo_v));
+        cols.push((PREDICTION_INTERVAL_COLUMNS[1], &hi_v));
     } else if let (Some(lo), Some(hi)) = (event_lower, event_upper) {
         lo_v = lo.to_vec();
         hi_v = hi.to_vec();
-        cols.push(("mean_lower", &lo_v));
-        cols.push(("mean_upper", &hi_v));
+        cols.push((PREDICTION_INTERVAL_COLUMNS[0], &lo_v));
+        cols.push((PREDICTION_INTERVAL_COLUMNS[1], &hi_v));
     } else if event_lower.is_some() {
         return Err(CliError::Internal {
             reason: "internal error: event_upper missing while event_lower is present".to_string(),

@@ -1210,6 +1210,58 @@ fn refine_certified_start(
 /// start was past the basin — empirically the rows that miss *plateau*, so more
 /// steps cannot help; the lever there is denser charts, not more iterations). On
 /// success the start is refined `newton_steps` further by [`refine_certified_start`].
+/// Minimum per-step *multiplicative* decrease of the Kantorovich `h` the basin
+/// warm-up requires to keep stepping (FIX #4). A tiny geometric floor: a
+/// continued step must contract `h` by at least this fraction. Chosen small so
+/// it never bites a genuinely converging row (Newton in the Kantorovich regime
+/// is at least geometric and quadratic once `h < 1`, contracting `h` far faster
+/// than `1/64` per step) while still forcing termination on a plateau.
+const WARMUP_MIN_MULTIPLICATIVE_DECREASE: f64 = 1.0 / 64.0;
+
+/// Kantorovich-quadratic acceptance coefficient for the basin warm-up (FIX #4).
+/// Once `h < 1` a converging Newton step contracts quadratically (`h_new ≲ κ·h²`);
+/// accepting that path in addition to the geometric floor makes the
+/// "genuinely-converging rows are untouched" guarantee explicit. Kept `< 1` so
+/// the quadratic path is itself a strict contraction (for `h < 1`,
+/// `κ·h² < κ·h < h`), which preserves the termination bound below.
+const WARMUP_QUADRATIC_KAPPA: f64 = 0.5;
+
+/// Sufficient-decrease test for the basin-warmup loop (FIX #4).
+///
+/// Returns `true` while the warm-up should keep stepping. The previous exit rule
+/// (`h_new >= h_prev` — strict decrease or quit) never fires for an `h`-sequence
+/// that decreases *monotonically toward a limit above ½*: the increments fall
+/// below one ulp long before `h` crosses the certifiable ½ bound, so a single
+/// pathological row could spin ~1e15 full `row_certificate` solves (Hessian
+/// build + solve) on the encode hot path. We instead require genuine
+/// *multiplicative* progress each step, which matches Newton's actual behavior:
+/// a healthy contraction clears the geometric floor by a wide margin (and the
+/// quadratic path once `h < 1`), while a plateau (`h_new/h_prev → 1`) satisfies
+/// neither branch and flags to the exact fallback.
+///
+/// Termination bound: the warm-up loop runs only while the row is uncertified
+/// (`h_prev > ½`), and every continued step contracts `h` by at least the factor
+/// `(1 − WARMUP_MIN_MULTIPLICATIVE_DECREASE)` (the quadratic branch, for `h < 1`,
+/// contracts by `κ·h_prev < κ < 1`, i.e. even harder). Hence after `N` continued
+/// steps `h ≤ (1 − c)^N · h₀`, and since the loop stops once `h ≤ ½` we get
+/// `N < ln(2·h₀) / −ln(1 − c)` — a few hundred iterations at most, versus
+/// unbounded before. No arbitrary fixed step cap is imposed; the bound is a
+/// consequence of the contraction requirement, in keeping with the function's
+/// no-magic-budget design.
+fn warmup_progress_sufficient(h_new: f64, h_prev: f64) -> bool {
+    if !(h_new.is_finite() && h_prev.is_finite()) {
+        return false;
+    }
+    // Geometric floor: a real Newton contraction easily clears this.
+    if h_new <= (1.0 - WARMUP_MIN_MULTIPLICATIVE_DECREASE) * h_prev {
+        return true;
+    }
+    // Kantorovich-quadratic path (only once `h < 1`, where it is a strict
+    // contraction): makes the no-regression guarantee for converging rows
+    // explicit without ever admitting a non-contracting (plateau) step.
+    h_prev < 1.0 && h_new <= WARMUP_QUADRATIC_KAPPA * h_prev * h_prev
+}
+
 fn certify_with_basin_warmup(
     atom: &SaeManifoldAtom,
     evaluator: &dyn SaeBasisEvaluator,
@@ -1236,12 +1288,22 @@ fn certify_with_basin_warmup(
     // route their points to charts whose centers are near the root, so the guard
     // rarely trips for them, and where it does the row was out-of-chart anyway.
     let in_chart = |t: &Array1<f64>| -> bool {
-        let r2: f64 = t
-            .iter()
-            .zip(chart_center.iter())
-            .map(|(a, b)| (a - b) * (a - b))
-            .sum();
-        r2 <= chart_radius * chart_radius
+        // Wrap-aware chart containment. A raw Euclidean latent distance
+        // `Σ(tᵢ − centerᵢ)²` mis-measures separation across the wrap seam of a
+        // periodic axis: an iterate at `t = 0.99` against a chart centered at
+        // `0.01` reads distance `0.98` instead of the true circle distance
+        // `0.02`, so it is wrongly rejected at the start check and at every step
+        // check — silently disabling the amortized encoder for a phase-localized
+        // band of rows on every periodic / torus / cylinder-angle /
+        // sphere-longitude chart and pushing that band to the multi-start
+        // fallback. `latent_coordinate_distance` folds each axis onto its
+        // `latent_axis_period`, so the containment ball is measured in the true
+        // manifold geometry — exactly the geometry the chart's Lipschitz bound
+        // `L` is valid over. This only ever moves points that are genuinely
+        // near the center (small wrapped distance) back INTO the chart where
+        // `L` holds, so it widens acceptance without weakening the soundness
+        // guard (an iterate truly far from the center on the circle still fails).
+        latent_coordinate_distance(atom, t.view(), chart_center) <= chart_radius
     };
     let mut t = t_start;
     // The distilled / chart-center start must itself be in-chart for its certificate
@@ -1267,10 +1329,16 @@ fn certify_with_basin_warmup(
             row_certificate(atom, evaluator, t.view(), x, amplitude, lipschitz, ridge)?;
         cert = next_cert;
         delta = next_delta;
-        // The warm-up only helps while h keeps contracting toward ½. Once a step
-        // fails to reduce it, the iterate is not converging to a certifiable in-chart
-        // root — flag for the exact fallback (no arbitrary step budget).
-        if !cert.h.is_finite() || cert.h >= prev_h {
+        // The warm-up only helps while h keeps *multiplicatively* contracting
+        // toward ½. A plain strict-decrease test (`h >= prev_h`) never fires for
+        // a sequence that decreases monotonically toward a limit above ½, so it
+        // could spin ~1e15 `row_certificate` solves for one row; require genuine
+        // multiplicative progress instead (bounded to a few hundred steps, see
+        // `warmup_progress_sufficient`). Once a step fails that bar the iterate is
+        // not converging to a certifiable in-chart root — flag for the exact
+        // fallback (no arbitrary step budget; the bound falls out of the
+        // contraction requirement).
+        if !warmup_progress_sufficient(cert.h, prev_h) {
             return Ok(None);
         }
     }
@@ -3224,5 +3292,149 @@ pub(crate) fn chart_region(
         // tensor, not a Duchon radial basis), so it needs no radial r_min/r_max.
         Periodic | Sphere | Torus | Cylinder | Linear | EuclideanPatch | Poincare
         | Precomputed(_) => region,
+    }
+}
+
+#[cfg(test)]
+mod encode_fix_tests {
+    //! Unit tests for the two `certify_with_basin_warmup` fixes:
+    //!   FIX #3 — wrap-aware chart containment (`in_chart` now measures latent
+    //!            distance on the atom's periodic geometry via
+    //!            [`latent_coordinate_distance`]).
+    //!   FIX #4 — multiplicative sufficient-decrease bound on the warm-up loop
+    //!            ([`warmup_progress_sufficient`]).
+    use super::*;
+    use crate::manifold::SaeAtomBasisKind;
+    use ndarray::{Array1, Array2, Array3};
+
+    /// Minimal atom carrying only a `basis_kind`; the wrap-aware metric reads no
+    /// other field, so a tiny well-formed basis/decoder/penalty suffices.
+    fn tiny_atom(kind: SaeAtomBasisKind, latent_dim: usize) -> SaeManifoldAtom {
+        let m = 2usize;
+        let phi = Array2::<f64>::eye(m);
+        let jet = Array3::<f64>::zeros((m, m, latent_dim));
+        let dec = Array2::<f64>::from_elem((m, 1), 0.5);
+        let smooth = Array2::<f64>::eye(m);
+        SaeManifoldAtom::new("tiny", kind, latent_dim, phi, jet, dec, smooth)
+            .expect("tiny atom builds")
+    }
+
+    /// FIX #3: a point on the far side of the wrap seam of a periodic axis is now
+    /// IN-CHART under the wrap-aware metric, where the old raw-Euclidean sum used
+    /// by `in_chart` rejected it. This is the exact predicate `in_chart` evaluates
+    /// (`latent_coordinate_distance(atom, t, center) <= radius`).
+    #[test]
+    fn wrap_aware_containment_accepts_seam_point() {
+        let atom = tiny_atom(SaeAtomBasisKind::Periodic, 1);
+        let t = Array1::from(vec![0.99f64]);
+        let center = Array1::from(vec![0.01f64]);
+        let radius = 0.05;
+
+        // Precondition: the OLD raw-Euclidean latent distance is 0.98 — far
+        // outside the 0.05 ball, so the old `in_chart` REJECTED this iterate.
+        let raw = (t[0] - center[0]).abs();
+        assert!(
+            raw > radius,
+            "precondition: raw Euclidean distance {raw} must exceed the chart radius {radius}"
+        );
+
+        // The wrap-aware metric sees the true circle distance 0.02 (period 1.0),
+        // so the seam point is now correctly IN-CHART.
+        let d = latent_coordinate_distance(&atom, t.view(), center.view());
+        assert!(
+            (d - 0.02).abs() < 1e-12,
+            "wrap-aware distance across the seam must be 0.02, got {d}"
+        );
+        assert!(
+            d <= radius,
+            "wrap-aware seam point must now be in-chart (d={d} <= r={radius})"
+        );
+    }
+
+    /// Soundness guard for FIX #3: on a NON-periodic axis the metric must NOT
+    /// wrap — the same coordinates stay at their full Euclidean separation and
+    /// (correctly) remain OUT of the small ball. This preserves the
+    /// never-issue-a-false-certificate invariant for flat-patch families.
+    #[test]
+    fn wrap_aware_containment_does_not_wrap_flat_axis() {
+        let atom = tiny_atom(SaeAtomBasisKind::EuclideanPatch, 1);
+        let t = Array1::from(vec![0.99f64]);
+        let center = Array1::from(vec![0.01f64]);
+        let d = latent_coordinate_distance(&atom, t.view(), center.view());
+        assert!(
+            (d - 0.98).abs() < 1e-12,
+            "a flat (non-periodic) axis must keep the full 0.98 distance, got {d}"
+        );
+        assert!(d > 0.05, "flat-axis point correctly stays out of a 0.05 ball");
+    }
+
+    /// FIX #4: a genuinely converging (Kantorovich-quadratic) `h`-sequence is
+    /// untouched — every step clears the sufficient-decrease bar, so no
+    /// converging row is regressed to the fallback.
+    #[test]
+    fn converging_h_sequence_is_never_flagged() {
+        // Quadratic Newton contraction h_{k+1} = h_k^2 from an uncertified start.
+        let mut h = 0.9f64;
+        while h > KANTOROVICH_THRESHOLD {
+            let h_next = h * h;
+            assert!(
+                warmup_progress_sufficient(h_next, h),
+                "converging step {h} -> {h_next} must be accepted (no regression)"
+            );
+            h = h_next;
+        }
+    }
+
+    /// FIX #4: a monotone `h`-sequence decreasing toward a limit ABOVE ½ (the
+    /// pathological plateau that the old strict-decrease rule spun on until the
+    /// increments fell below one ulp) now terminates in a BOUNDED, small number
+    /// of `warmup_progress_sufficient` steps — flag-to-fallback rather than loop.
+    #[test]
+    fn plateau_h_sequence_terminates_bounded() {
+        let limit = 0.65f64; // plateau limit strictly above ½: never certifies
+        let ratio = 0.8f64; // geometric approach; ratio -> 1 as h -> limit
+        let mut h = 2.0f64; // uncertified start
+        let start = h;
+        let mut accepted = 0usize;
+        let mut iters = 0usize;
+        loop {
+            iters += 1;
+            // Hard ceiling: proves boundedness. The OLD strict-decrease rule
+            // would run ~1e15 steps here (h strictly decreases every step toward
+            // 0.65 and only stalls below one ulp), so tripping this assert would
+            // signal a regression to the unbounded behavior.
+            assert!(
+                iters < 10_000,
+                "warm-up must terminate in a bounded number of steps, not loop"
+            );
+            let h_next = limit + (h - limit) * ratio; // monotone decreasing > limit
+            if !warmup_progress_sufficient(h_next, h) {
+                break; // flag to the exact fallback
+            }
+            accepted += 1;
+            h = h_next;
+        }
+        // It made real progress before flagging (a warm-up, not an instant bail)…
+        assert!(
+            accepted >= 1,
+            "expected the warm-up to accept at least one contracting step first"
+        );
+        // …and it flagged while still strictly above the plateau limit — exactly
+        // where the OLD rule would have kept spinning (h is still shrinking).
+        assert!(
+            h > limit && h < start,
+            "flagged mid-descent (limit < h={h} < start={start}); old rule would not stop here"
+        );
+        // Termination bound was tiny, not astronomical.
+        assert!(iters < 200, "plateau flagged in {iters} steps (bounded)");
+    }
+
+    /// FIX #4: non-finite `h` (indefinite / blown-up Hessian) is treated as
+    /// insufficient progress — the row flags rather than being accepted.
+    #[test]
+    fn non_finite_h_flags() {
+        assert!(!warmup_progress_sufficient(f64::NAN, 0.9));
+        assert!(!warmup_progress_sufficient(f64::INFINITY, 0.9));
+        assert!(!warmup_progress_sufficient(0.5, f64::NAN));
     }
 }

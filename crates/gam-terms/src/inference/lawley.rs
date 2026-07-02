@@ -86,9 +86,9 @@
 
 use ndarray::{Array1, Array2, ArrayView2};
 
+use faer::Side;
 use gam_linalg::faer_ndarray::{FaerArrayView, factorize_symmetricwith_fallback};
 use gam_linalg::matrix::FactorizedSystem;
-use faer::Side;
 
 /// Order-2 jet (value, first, second η-derivative) product.
 #[inline]
@@ -502,7 +502,14 @@ const RHO_VARIATION_STEP: f64 = 0.05;
 ///   solver already maintains), passed as `rho_cov` (`m × m` for `m`
 ///   smoothing parameters). This is the sampling covariance of ρ̂.
 ///
-/// Returns the **total** mean shift `Δε(ρ̂) = Δε_conditional + ½·tr(HᵨᵨCov)`. The
+/// For a single smoothing parameter, returns the normal-reference expectation
+/// `E[Δε(ρ̂)]` directly by Gauss-Hermite quadrature. This avoids treating the
+/// second-order delta term as the target when the REML/LAML log-λ uncertainty is
+/// large enough for higher even derivatives of `Δε(ρ)` to be visible in the LR
+/// first moment. For multi-parameter smooths the function retains the
+/// curvature/covariance delta assembly below.
+///
+/// Returns the **total** mean shift `Δε(ρ̂)`. The
 /// caller forms the Bartlett factor `c = 1 + Δε(ρ̂)/d` exactly as for the
 /// conditional shift; the difference from the conditional factor is the size
 /// correction attributable specifically to ρ̂-variation.
@@ -584,6 +591,69 @@ pub fn lawley_lr_mean_shift_with_rho_variation(
         }
         lawley_lr_mean_shift(x, kappas, Some(s.view()), tested.clone())
     };
+
+    if m == 1 {
+        let var = rho_cov[[0, 0]];
+        if var < -1e-14 {
+            return Err(format!(
+                "lawley_lr_mean_shift_with_rho_variation: rho_cov[0,0] must be non-negative; got {var}"
+            ));
+        }
+        if var <= 1e-14 {
+            return Ok(conditional);
+        }
+        // 15-point Gauss-Hermite rule for
+        // E[f(ρ + Z)] = π^{-1/2} Σ w_i f(ρ + √(2 Var) x_i), Z ~ N(0, Var).
+        // The conditional anchor is at ρ, so the quadrature abscissa is the
+        // perturbation t = √(2 Var) x_i passed to `shift_at`.
+        const GH15_X: [f64; 15] = [
+            -4.499990707309391,
+            -3.669950373404453,
+            -2.967166927905603,
+            -2.325732486173858,
+            -1.719992575186489,
+            -1.136115585210921,
+            -0.565069583255576,
+            0.0,
+            0.565069583255576,
+            1.136115585210921,
+            1.719992575186489,
+            2.325732486173858,
+            2.967166927905603,
+            3.669950373404453,
+            4.499990707309391,
+        ];
+        const GH15_W: [f64; 15] = [
+            1.522475804253517e-9,
+            1.059115547711067e-6,
+            0.0001000044412324999,
+            0.002778068842912776,
+            0.03078003387254608,
+            0.1584889157959357,
+            0.4120286874988986,
+            0.5641003087264175,
+            0.4120286874988986,
+            0.1584889157959357,
+            0.03078003387254608,
+            0.002778068842912776,
+            0.0001000044412324999,
+            1.059115547711067e-6,
+            1.522475804253517e-9,
+        ];
+        let scale = (2.0 * var).sqrt();
+        let mut total = 0.0;
+        for (&x_i, &w_i) in GH15_X.iter().zip(GH15_W.iter()) {
+            total += w_i * shift_at(&[(0, scale * x_i)])?;
+        }
+        let total = total / std::f64::consts::PI.sqrt();
+        if !total.is_finite() {
+            return Err(
+                "lawley_lr_mean_shift_with_rho_variation: non-finite quadrature total shift"
+                    .to_string(),
+            );
+        }
+        return Ok(total);
+    }
 
     let h = RHO_VARIATION_STEP;
     // Hessian of Δε in ρ by symmetric finite differences of the deterministic

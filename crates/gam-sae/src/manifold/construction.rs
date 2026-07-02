@@ -3855,15 +3855,71 @@ impl SaeManifoldTerm {
                 AssignmentMode::ThresholdGate {
                     threshold,
                     temperature,
-                } => Some(SaeRowLayout::from_jumprelu(
-                    n,
-                    k_atoms,
-                    threshold,
-                    temperature,
-                    &self.assignment.logits,
-                    coord_dims.clone(),
-                    self.assignment.coord_offsets(),
-                )),
+                } => {
+                    // Size the JumpReLU joint block by the HARD forward gate plus
+                    // the gated-off atoms still carrying a NON-NEGLIGIBLE
+                    // column-separable (diagonal-only) prior gradient, mirroring
+                    // the softmax / IBP `from_dense_weights` truncation instead of
+                    // dragging the whole −36 optimization band (≈ every atom) into
+                    // the joint solve. `contribution[row, k]` is the exact
+                    // magnitude of atom k's separable diagonal gradient sub-vector
+                    // — the sparsity-prior logit gradient (`assignment_grad`, the
+                    // same values the row block writes at the active-atom slots
+                    // below) plus the ARD coordinate gradient — i.e. precisely the
+                    // slice of `gt` that leaves the block when k is dropped. Deep
+                    // gated-off atoms (`(logit−θ)/τ` very negative) have
+                    // `slope = σ(1−σ) → 0` and drop out, collapsing the block from
+                    // `K·(1+d)` to `k_active·(1+d)`; near-threshold and gated-on
+                    // atoms keep their exact diagonal, so the assembled gradient is
+                    // preserved to the relative cutoff. The OBJECTIVE VALUE is
+                    // layout-independent (the loss's `assignment_prior_value` /
+                    // `ard_value` sum the full band), hence bit-identical.
+                    const JUMPRELU_RELATIVE_CUTOFF: f64 = 1.0e-3;
+                    let mut contribution = Array2::<f64>::zeros((n, k_atoms));
+                    for k in 0..k_atoms {
+                        let coord = &self.assignment.coords[k];
+                        let d = coord.latent_dim();
+                        let has_ard =
+                            d > 0 && k < rho.log_ard.len() && rho.log_ard[k].len() == d;
+                        let periods = if has_ard {
+                            coord.effective_axis_periods()
+                        } else {
+                            Vec::new()
+                        };
+                        for row in 0..n {
+                            // Sparsity-prior separable diagonal gradient on the logit.
+                            let mut c = assignment_grad[row * k_atoms + k].abs();
+                            // ARD separable diagonal gradient on each coord axis.
+                            if has_ard {
+                                let row_t = coord.row(row);
+                                for axis in 0..d {
+                                    let alpha = SaeManifoldRho::stable_exp_strength(
+                                        rho.log_ard[k][axis],
+                                    );
+                                    c += ArdAxisPrior::eval(alpha, row_t[axis], periods[axis])
+                                        .grad
+                                        .abs();
+                                }
+                            }
+                            contribution[[row, k]] = c;
+                        }
+                    }
+                    Some(SaeRowLayout::from_jumprelu(
+                        n,
+                        k_atoms,
+                        threshold,
+                        temperature,
+                        &self.assignment.logits,
+                        &contribution,
+                        // Cap: rely on the relative cutoff to bound the active set;
+                        // a memory-budget cap can be layered in like
+                        // `sparse_active_plan` without changing the contract.
+                        k_atoms,
+                        JUMPRELU_RELATIVE_CUTOFF,
+                        coord_dims.clone(),
+                        self.assignment.coord_offsets(),
+                    ))
+                }
                 // #1408/#1409 — Softmax engages the COMPACT top-`k` row layout
                 // inside the optimization (no longer a post-fit projection).
                 // The active set is each row's top-`k_active_cap` softmax atoms

@@ -10,12 +10,27 @@ pub(crate) struct Cli {
     pub(crate) command: Command,
 
     /// Solver log verbosity: `off|error|warn|info|debug|trace`. Defaults to the
-    /// quiet `warn` level (#1688) — pass `--log-level info` to opt back into the
-    /// full per-iteration solver trace (`[OUTER …]`, `[KAPPA-PHASE …]`, etc.).
-    /// An unrecognized value falls back to the verbose `info` stream the user
-    /// clearly intended rather than being silently swallowed.
+    /// quiet `warn` level (#1688) — pass `--log-level info` or `-v` to opt back
+    /// into the full per-iteration solver trace (`[OUTER …]`, `[KAPPA-PHASE …]`,
+    /// etc.). An unrecognized `--log-level` value falls back to verbose `info`.
+    /// `--log-level` wins over `-v`/`-q` when both are present.
     #[arg(long, global = true, value_name = "LEVEL")]
     pub(crate) log_level: Option<String>,
+
+    /// Increase solver log verbosity. Repeat for more detail: `-v` = info,
+    /// `-vv` = debug, `-vvv` = trace.
+    #[arg(short = 'v', long = "verbose", global = true, action = ArgAction::Count)]
+    pub(crate) verbose: u8,
+
+    /// Quiet solver logs completely (`off`) unless `--log-level` is provided.
+    #[arg(
+        short = 'q',
+        long = "quiet",
+        global = true,
+        action = ArgAction::SetTrue,
+        conflicts_with = "verbose"
+    )]
+    pub(crate) quiet: bool,
 }
 
 #[derive(Subcommand, Debug)]
