@@ -98,24 +98,42 @@ fn bug_tail_cell_cache_second_thread_waits_for_first_computation() {
 
 #[test]
 fn bug_affine_anchor_identity_moments_are_not_preserved() {
+    // `affine_anchor_moment_vector` returns the RAW substrate moments
+    // `T_n = ∫ z^n exp(-½z²) dz`, NOT a normalized density: this is the
+    // `∫ z^n exp(-q) dz` convention the cubic-cell substrate, every production
+    // consumer (`evaluate_affine_cell_state` / `_derivative_state`,
+    // transformation-normal, BMS), and the CPU/GPU parity reference all share
+    // (the `1/√(2π)` is folded in downstream via `INV_TWO_PI`). The identity
+    // invariant this guards is that at `alpha=beta=0` over the whole line the
+    // anchor reduces to the *standard normal* — whose raw moments are the
+    // normalized `{1, 0, 1, 0}` scaled by the whole-line mass `√(2π)`, i.e.
+    // M0 = M2 = √(2π) and M1 = M3 = 0. Asserting a normalized `M0 = 1` here is
+    // mis-specified: it contradicts the whole-line mass `∫ exp(-½z²) dz = √(2π)`
+    // that the #352 both-tails / deep-tail precision guards pin, and no
+    // consumer wants the wrapper normalized.
     let alpha = 0.0;
     let beta = 0.0;
     let out = affine_anchor_moment_vector(alpha, beta, f64::NEG_INFINITY, f64::INFINITY, 6);
+    let sqrt_2pi = (2.0 * std::f64::consts::PI).sqrt();
     assert!(
-        (out[0] - 1.0).abs() < 1e-15,
-        "Expected anchor moment M0 to be exactly 1.0 for alpha=0 beta=0 over (-inf,inf)"
+        (out[0] - sqrt_2pi).abs() < 1e-13,
+        "Expected raw anchor moment M0 = √(2π) ≈ {sqrt_2pi:.6} for alpha=0 beta=0 over (-inf,inf); got {}",
+        out[0]
     );
     assert!(
-        out[1].abs() < 1e-15,
-        "Expected anchor moment M1 to be exactly 0.0 for alpha=0 beta=0 over (-inf,inf)"
+        out[1].abs() < 1e-13,
+        "Expected anchor moment M1 to be 0.0 for alpha=0 beta=0 over (-inf,inf); got {}",
+        out[1]
     );
     assert!(
-        (out[2] - 1.0).abs() < 1e-15,
-        "Expected anchor moment M2 to be exactly 1.0 for alpha=0 beta=0 over (-inf,inf)"
+        (out[2] - sqrt_2pi).abs() < 1e-13,
+        "Expected raw anchor moment M2 = √(2π) ≈ {sqrt_2pi:.6} for alpha=0 beta=0 over (-inf,inf); got {}",
+        out[2]
     );
     assert!(
-        out[3].abs() < 1e-15,
-        "Expected anchor moment M3 to be exactly 0.0 for alpha=0 beta=0 over (-inf,inf)"
+        out[3].abs() < 1e-13,
+        "Expected anchor moment M3 to be 0.0 for alpha=0 beta=0 over (-inf,inf); got {}",
+        out[3]
     );
 }
 

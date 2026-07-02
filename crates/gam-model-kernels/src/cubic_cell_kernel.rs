@@ -134,18 +134,6 @@ pub const NORMALIZED_CELL_BRANCH_TOL: f64 = 1e-10;
 
 const INV_TWO_PI: f64 = 1.0 / std::f64::consts::TAU;
 
-/// `√(2π)`, the normalization constant of the standard-normal density. The
-/// affine-anchor moment measure is `z^n · exp(-½η(z)²) · φ(z) dz` with the
-/// *normalized* Gaussian `φ(z) = exp(-½z²)/√(2π)`, so at the affine identity
-/// (`α=β=0`, whole line) the anchor reduces to a proper density whose zeroth
-/// moment (total mass) is exactly 1. The raw `T_n`/binomial construction in
-/// `affine_anchor_moment_vector_into` accumulates against the *unnormalized*
-/// `exp(-½z²)` (matching the cubic-cell substrate's `∫ z^n exp(-q) dz`
-/// convention, which folds the `1/√(2π)` into consumers via `INV_TWO_PI`);
-/// the public `affine_anchor_moment_vector` divides that raw vector by
-/// `SQRT_TWO_PI` to expose the normalized anchor density directly.
-const SQRT_TWO_PI: f64 = 2.506_628_274_631_000_502_41;
-
 /// 384-point Gauss–Legendre nodes, re-exported for the GPU cubic-cell kernel
 /// (`src/gpu/cubic_cell/kernel_src.rs`) to embed as `__constant__` device
 /// memory. Linux-only because the kernel emitter is Linux-only.
@@ -3436,16 +3424,6 @@ pub fn affine_anchor_moment_vector(
 ) -> Vec<f64> {
     let mut out = vec![0.0; max_degree + 1];
     affine_anchor_moment_vector_into(alpha, beta, left, right, max_degree, &mut out);
-    // The `_into` core accumulates the anchor moments against the unnormalized
-    // Gaussian `exp(-½z²)` (whole-line `T_0 = √(2π)`). Divide by `√(2π)` so the
-    // public anchor is a *normalized* density: at the affine identity
-    // (`α=β=0`, whole line) `M0` and `M2` are exactly `1` and `M1`, `M3` are
-    // `0`, matching the standard-normal moments. Cell-state consumers that need
-    // the substrate's unnormalized `∫ z^n exp(-q) dz` convention call
-    // `affine_anchor_moment_vector_into` directly and are unaffected.
-    for m in out.iter_mut() {
-        *m /= SQRT_TWO_PI;
-    }
     out
 }
 
@@ -3548,11 +3526,7 @@ pub fn evaluate_affine_cell_state(
     let alpha = cell.c0;
     let beta = cell.c1;
     let value = affine_value_from_moment_primitive(alpha, beta, cell.left, cell.right);
-    // Substrate moments use the unnormalized `∫ z^n exp(-q) dz` convention
-    // (the `1/√(2π)` is folded into consumers via `INV_TWO_PI`), so call the
-    // `_into` core directly rather than the normalized public wrapper.
-    let mut moments = vec![0.0; max_degree + 1];
-    affine_anchor_moment_vector_into(alpha, beta, cell.left, cell.right, max_degree, &mut moments);
+    let moments = affine_anchor_moment_vector(alpha, beta, cell.left, cell.right, max_degree);
     Ok(CellMomentState {
         branch: ExactCellBranch::Affine,
         value,
@@ -3566,9 +3540,7 @@ fn evaluate_affine_cell_derivative_state(
 ) -> Result<CellDerivativeMomentState, String> {
     let alpha = cell.c0;
     let beta = cell.c1;
-    // Unnormalized substrate convention (see `evaluate_affine_cell_state`).
-    let mut moments = vec![0.0; max_degree + 1];
-    affine_anchor_moment_vector_into(alpha, beta, cell.left, cell.right, max_degree, &mut moments);
+    let moments = affine_anchor_moment_vector(alpha, beta, cell.left, cell.right, max_degree);
     Ok(CellDerivativeMomentState {
         branch: ExactCellBranch::Affine,
         moments: moments.into(),
@@ -5054,12 +5026,17 @@ mod tests {
     #[test]
     fn affine_anchor_moments_match_whole_line_closed_forms() {
         let out = affine_anchor_moment_vector(0.0, 0.0, f64::NEG_INFINITY, f64::INFINITY, 4);
-        // The public anchor is a normalized density: at the affine identity it
-        // reduces to the standard normal, whose whole-line moments are
-        // M0 = 1, M1 = 0, M2 = 1.
-        assert!((out[0] - 1.0).abs() < 1e-12);
+        // `affine_anchor_moment_vector` returns the RAW substrate moments
+        // `T_n = ∫ z^n exp(-½z²) dz` (the cubic-cell `∫ z^n exp(-q) dz`
+        // convention that every production consumer and the GPU parity path
+        // share; the `1/√(2π)` is folded in downstream via `INV_TWO_PI`). At
+        // the affine identity the anchor is the *unnormalized* standard normal,
+        // so M0 = M2 = √(2π) and M1 = 0 — the normalized {1, 0, 1} moments
+        // scaled by the whole-line mass √(2π).
+        let sqrt_2pi = (2.0 * std::f64::consts::PI).sqrt();
+        assert!((out[0] - sqrt_2pi).abs() < 1e-12);
         assert!(out[1].abs() < 1e-12);
-        assert!((out[2] - 1.0).abs() < 1e-12);
+        assert!((out[2] - sqrt_2pi).abs() < 1e-12);
     }
 
     #[test]
@@ -5069,13 +5046,17 @@ mod tests {
         let out = affine_anchor_moment_vector(alpha, beta, f64::NEG_INFINITY, f64::INFINITY, 4);
         let s = (1.0 + beta * beta).sqrt();
         let mu = -alpha * beta / (1.0 + beta * beta);
-        // Normalized anchor density N(mu, 1/s^2): whole-line raw moments are
-        // M0 = scale, M1 = scale*mu, M2 = scale*(mu^2 + 1/s^2), where the
-        // `scale = exp(-alpha^2 / 2s^2) / s` factor is the anchor amplitude.
+        // RAW (unnormalized) whole-line moments of the affine anchor
+        // `exp(-½(alpha + beta·z)²)·exp(-½z²)`, an unnormalized Gaussian with
+        // mean `mu` and variance `1/s²`. Its raw moments carry the `√(2π)` mass
+        // factor: M0 = √(2π)·scale, M1 = √(2π)·scale·mu,
+        // M2 = √(2π)·scale·(mu² + 1/s²), where the anchor amplitude
+        // `scale = exp(-alpha² / 2s²) / s`.
         let scale = (-alpha * alpha / (2.0 * s * s)).exp() / s;
-        assert!((out[0] - scale).abs() < 1e-12);
-        assert!((out[1] - scale * mu).abs() < 1e-12);
-        assert!((out[2] - scale * (mu * mu + 1.0 / (s * s))).abs() < 1e-10);
+        let sqrt_2pi = (2.0 * std::f64::consts::PI).sqrt();
+        assert!((out[0] - scale * sqrt_2pi).abs() < 1e-12);
+        assert!((out[1] - scale * sqrt_2pi * mu).abs() < 1e-12);
+        assert!((out[2] - scale * sqrt_2pi * (mu * mu + 1.0 / (s * s))).abs() < 1e-10);
     }
 
     #[test]
