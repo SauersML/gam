@@ -4,6 +4,54 @@ use super::*;
 use approx::assert_abs_diff_eq;
 use ndarray::array;
 
+/// #1995: compact SAE rows hand `block_gemm_subtract` dense scratch matrices
+/// whose nonzeros occupy only the active top-k beta columns. The CPU fallback
+/// must produce the same Schur update as a dense GEMM while doing work only on
+/// the discovered column support.
+#[test]
+pub(crate) fn block_gemm_subtract_matches_dense_on_sparse_column_support() {
+    let backend = CpuBatchedBlockSolver;
+    let d = 3usize;
+    let k = 12usize;
+    let mut left = Array2::<f64>::zeros((d, k));
+    let mut right = Array2::<f64>::zeros((d, k));
+    for (row, col, value) in [
+        (0, 1, 0.7),
+        (1, 1, -0.2),
+        (2, 7, 1.3),
+        (0, 10, -0.4),
+        (2, 10, 0.9),
+    ] {
+        left[[row, col]] = value;
+    }
+    for (row, col, value) in [
+        (0, 2, -1.1),
+        (2, 2, 0.5),
+        (1, 7, 0.8),
+        (0, 11, 0.25),
+        (2, 11, -0.6),
+    ] {
+        right[[row, col]] = value;
+    }
+
+    let mut actual = Array2::<f64>::zeros((k, k));
+    backend.block_gemm_subtract(&mut actual, &left, &right);
+
+    let mut expected = Array2::<f64>::zeros((k, k));
+    for c in 0..d {
+        for a in 0..k {
+            for b in 0..k {
+                expected[[a, b]] -= left[[c, a]] * right[[c, b]];
+            }
+        }
+    }
+    for a in 0..k {
+        for b in 0..k {
+            assert_eq!(actual[[a, b]], expected[[a, b]], "entry ({a}, {b})");
+        }
+    }
+}
+
 /// `SparseBlockKroneckerPenaltyOp` must reproduce the dense
 /// `KroneckerPenaltyOp { factor_a: G, factor_b: I_p }` on every interface
 /// (matvec, gradient, diagonal, to_dense) when the sparse block set covers
