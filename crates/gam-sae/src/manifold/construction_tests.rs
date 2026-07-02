@@ -989,3 +989,217 @@ mod step2_quotient_scale_tests {
         );
     }
 }
+
+// ============================================================================
+// #2072 default-off LEVER-WIRING coverage. Both `quotient_scale` and
+// `data_row_reseed` are typed `pub(crate) bool` per-fit opt-ins that default
+// false (bit-inert). Their leaf producers are unit-tested, but the
+// behavior-changing DRIVER path each flag gates was never exercised. These
+// tests run the SAME driver op twice — flag OFF (default) then ON — and assert
+// the output differs in the exact way the flag is meant to change it, so a
+// driver that ignored the flag would fail. Parallel-safe (typed setters, no env).
+// ============================================================================
+#[cfg(test)]
+mod lever_wiring_2072 {
+    use crate::manifold::tests::small_two_atom_periodic_term;
+    use crate::manifold::{
+        sae_data_row_anchored_euclidean_coords, sae_pca_seed_initial_coords_with_pc_offset,
+        AssignmentMode, LatentManifold, SaeAssignment, SaeAtomBasisKind, SaeManifoldAtom,
+        SaeManifoldRho, SaeManifoldTerm,
+    };
+    use ndarray::{array, Array2, Array3};
+
+    fn frob(b: &Array2<f64>) -> f64 {
+        b.iter().map(|v| v * v).sum::<f64>().sqrt()
+    }
+
+    /// #2072 — `quotient_scale` DRIVER (the `if self.quotient_scale` arm of
+    /// `refit_decoder_least_squares_at_current_state`, construction.rs). The LSQ
+    /// refit always writes the ABSOLUTE decoder `B_abs`. With the lever OFF the
+    /// write stays that way (`log_amplitude == 0`, decoder magnitude untouched).
+    /// With the lever ON the driver resets `s = 0` then peels ‖B_k‖ into
+    /// `log_amplitude`, so every decoder is renormalized to unit Frobenius and
+    /// `s_k = ln‖B_abs,k‖` — a PURE GAUGE move: the reconstruction
+    /// `a·exp(s)·Φ·B_unit == a·Φ·B_abs` is preserved to machine precision.
+    #[test]
+    fn quotient_scale_driver_peels_decoder_norm_and_preserves_reconstruction() {
+        // OFF (default).
+        let (mut off, target, rho) = small_two_atom_periodic_term();
+        off.refit_decoder_least_squares_at_current_state(target.view(), Some(&rho))
+            .expect("LSQ refit (lever off)");
+        let fitted_off = off
+            .try_fitted_for_rho(&rho)
+            .expect("reconstruction after off-refit");
+
+        // ON: identical fixture + refit, lever engaged.
+        let (mut on, _t, _r) = small_two_atom_periodic_term();
+        on.set_quotient_scale(true);
+        on.refit_decoder_least_squares_at_current_state(target.view(), Some(&rho))
+            .expect("LSQ refit (lever on)");
+        let fitted_on = on
+            .try_fitted_for_rho(&rho)
+            .expect("reconstruction after on-refit");
+
+        // (1) OFF keeps log_amplitude at 0 and leaves at least one non-unit decoder
+        //     (else the peel would be vacuous — this guards that the ON change is
+        //     the peel, not the solve).
+        let mut off_has_nonunit = false;
+        for atom in &off.atoms {
+            assert_eq!(atom.log_amplitude, 0.0, "off: log_amplitude must stay 0");
+            if (frob(&atom.decoder_coefficients) - 1.0).abs() > 1e-3 {
+                off_has_nonunit = true;
+            }
+        }
+        assert!(
+            off_has_nonunit,
+            "off: the LSQ solve must leave a non-unit decoder (else the peel is vacuous)"
+        );
+
+        // (2) ON renormalizes EVERY decoder to unit Frobenius with a finite
+        //     log_amplitude, and at least one amplitude actually moved off 0.
+        let mut on_amp_moved = false;
+        for atom in &on.atoms {
+            let nrm = frob(&atom.decoder_coefficients);
+            assert!(
+                (nrm - 1.0).abs() <= 1e-9,
+                "on: ‖B_k‖ must be 1 after the quotient peel; got {nrm}"
+            );
+            assert!(
+                atom.log_amplitude.is_finite(),
+                "on: log_amplitude must be finite after the peel"
+            );
+            if atom.log_amplitude.abs() > 1e-6 {
+                on_amp_moved = true;
+            }
+        }
+        assert!(
+            on_amp_moved,
+            "on: the peel must move a decoder magnitude into log_amplitude"
+        );
+
+        // (3) The peel is gauge-invariant: reconstruction preserved to machine tol.
+        assert_eq!(fitted_on.dim(), fitted_off.dim(), "recon shape preserved");
+        let max_gap = (&fitted_on - &fitted_off)
+            .iter()
+            .fold(0.0_f64, |m, d| m.max(d.abs()));
+        assert!(
+            max_gap <= 1e-9,
+            "quotient peel must preserve the reconstruction within tol; max gap {max_gap:e}"
+        );
+    }
+
+    /// A K=1 caller-managed FLAT (EuclideanPatch) term with n ≫ p. Zero decoder
+    /// ⇒ fitted = 0 ⇒ the reconstruction residual is `-target` (a real,
+    /// structured residual the reseed producers read). `p = 4`, `n = 8` ⇒
+    /// `pc_pairs = min(n, p)/2 = 2`, so any `pc_pair_offset ≥ 2` is an
+    /// exhausted-pool retry — the only regime the `data_row_reseed` lever gates.
+    fn small_flat_euclidean_term() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
+        let n = 8usize;
+        let p = 4usize;
+        let m = 2usize;
+        let phi = Array2::<f64>::ones((n, m));
+        let jet = Array3::<f64>::zeros((n, m, 1));
+        let decoder = Array2::<f64>::zeros((m, p));
+        let smooth = Array2::<f64>::eye(m);
+        let atom = SaeManifoldAtom::new(
+            "flat0",
+            SaeAtomBasisKind::EuclideanPatch,
+            1,
+            phi,
+            jet,
+            decoder,
+            smooth,
+        )
+        .unwrap();
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((n, 1)),
+            vec![Array2::<f64>::zeros((n, 1))],
+            vec![LatentManifold::Euclidean],
+            AssignmentMode::softmax(1.0),
+        )
+        .unwrap();
+        let term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+        let mut target = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            for j in 0..p {
+                target[[i, j]] = ((i * 7 + j) as f64).sin() + 0.25 * ((i + 3 * j) as f64).cos();
+            }
+        }
+        let rho = SaeManifoldRho::new(0.0, 0.0, vec![array![0.0]]);
+        (term, target, rho)
+    }
+
+    /// #2072 — `data_row_reseed` DRIVER (the `if data_row_reseed && all_flat && …`
+    /// arm of `reseed_atoms_onto_distinct_residual_pcs`, fit_drivers.rs). On an
+    /// exhausted-pool retry (`offset ≥ pc_pairs`) over all-FLAT atoms the lever
+    /// routes the reseed from the ~p/2-capped PCA pool to the DATA-ROW-anchored
+    /// producer (unbounded n-row diversity). OFF stays on the PCA path. The test
+    /// runs the driver both ways and pins WHICH producer each path took.
+    #[test]
+    fn data_row_reseed_driver_routes_exhausted_pool_retry_to_data_row_anchor() {
+        let atoms = [0usize];
+        let offset = 7usize; // ≥ pc_pairs = 2 ⇒ exhausted-pool retry.
+
+        // OFF (default): PCA pool even on the exhausted-pool retry.
+        let (mut off, target, rho) = small_flat_euclidean_term();
+        off.reseed_atoms_onto_distinct_residual_pcs(&atoms, target.view(), &rho, offset)
+            .expect("reseed (lever off)");
+        let coords_off = off.assignment.coords[0].as_matrix();
+
+        // ON: same retry routed to the data-row-anchored producer.
+        let (mut on, _t, _r) = small_flat_euclidean_term();
+        on.set_data_row_reseed(true);
+        on.reseed_atoms_onto_distinct_residual_pcs(&atoms, target.view(), &rho, offset)
+            .expect("reseed (lever on)");
+        let coords_on = on.assignment.coords[0].as_matrix();
+
+        // The two producers write genuinely different seeds.
+        let max_diff = (&coords_on - &coords_off)
+            .iter()
+            .fold(0.0_f64, |m, d| m.max(d.abs()));
+        assert!(
+            max_diff > 1e-6,
+            "the lever must route to a different seed on the exhausted-pool retry; \
+             max |on - off| = {max_diff:e}"
+        );
+
+        // Pin WHICH producer each path took (non-vacuous): recompute both
+        // reference seeds from a fresh term at the driver's exact anchor/offset.
+        let (reference, _rt, _rr) = small_flat_euclidean_term();
+        let residual = reference
+            .reconstruction_residual(target.view(), &rho)
+            .expect("residual for reference seeds");
+        let n = reference.n_obs();
+        let dims = [1usize];
+        let kinds = [SaeAtomBasisKind::EuclideanPatch];
+        let pca =
+            sae_pca_seed_initial_coords_with_pc_offset(residual.view(), &kinds, &dims, offset)
+                .expect("pca reference seed");
+        // Driver anchor for slot 0: (0 + offset·atoms.len()) % n.
+        let anchor_rows = [(0usize + offset.wrapping_mul(atoms.len().max(1))) % n];
+        let data_row =
+            sae_data_row_anchored_euclidean_coords(residual.view(), &dims, &anchor_rows)
+                .expect("data-row reference seed");
+
+        for row in 0..n {
+            assert!(
+                (coords_off[[row, 0]] - pca[[0, row, 0]]).abs() <= 1e-12,
+                "off path must equal the PCA producer at row {row}"
+            );
+            assert!(
+                (coords_on[[row, 0]] - data_row[[0, row, 0]]).abs() <= 1e-12,
+                "on path must equal the data-row producer at row {row}"
+            );
+        }
+
+        // Guard the >1e-6 gap above: the two reference producers are distinct.
+        let mut ref_gap = 0.0_f64;
+        for row in 0..n {
+            ref_gap = ref_gap.max((pca[[0, row, 0]] - data_row[[0, row, 0]]).abs());
+        }
+        assert!(
+            ref_gap > 1e-6,
+            "the PCA and data-row producers must differ at this offset; gap {ref_gap:e}"
+        );
+    }
+}
