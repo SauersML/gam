@@ -58,6 +58,29 @@ use super::*;
 /// `log|H|`, and Γ differentiate one operator on the compact support. That
 /// coordinated change is landed and FD-certified; the FFI's after-the-fit
 /// top-`k` projection is then a no-op at the optimum.
+/// Scalar knobs for the JumpReLU compact active-set construction
+/// ([`SaeRowLayout::from_jumprelu`]).
+///
+/// Grouping the gate parameters (`threshold`, `temperature`) and the
+/// active-set selection budget (`k_active_cap`, `relative_cutoff`) keeps the
+/// constructor's signature within the argument-count budget; the row/atom
+/// counts are derived from the `logits` array shape rather than passed
+/// separately, so the sizes cannot silently disagree with the data.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct JumpReluActiveSetSpec {
+    /// JumpReLU hard-gate threshold `θ`: `a_k ≠ 0` iff `logit_k > θ`.
+    pub threshold: f64,
+    /// Smoothing temperature `τ` of the sparsity-prior optimization band.
+    pub temperature: f64,
+    /// Upper bound on the per-row active-set size (hard-gated atoms are never
+    /// dropped; the remaining budget is filled by top-contribution gated-off
+    /// atoms).
+    pub k_active_cap: usize,
+    /// Relative cutoff on the separable diagonal gradient magnitude, scaled by
+    /// the per-row peak, below which a gated-off in-band atom is dropped.
+    pub relative_cutoff: f64,
+}
+
 #[derive(Debug, Clone)]
 pub struct SaeRowLayout {
     /// `active_atoms[row]` — sorted indices of active atoms for that row.
@@ -109,20 +132,29 @@ impl SaeRowLayout {
     /// independently of this layout). This mirrors the softmax / IBP-MAP
     /// [`Self::from_dense_weights`] truncation, which likewise keeps a row's
     /// top-`k` atoms above a relative cutoff and drops the negligible tail.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_jumprelu(
-        n: usize,
-        k_atoms: usize,
-        threshold: f64,
-        temperature: f64,
+        spec: JumpReluActiveSetSpec,
         logits: &Array2<f64>,
         contribution: &Array2<f64>,
-        k_active_cap: usize,
-        relative_cutoff: f64,
         coord_dims: Vec<usize>,
         coord_offsets_full: Vec<usize>,
     ) -> Self {
         use std::cmp::Ordering::Equal;
+        let JumpReluActiveSetSpec {
+            threshold,
+            temperature,
+            k_active_cap,
+            relative_cutoff,
+        } = spec;
+        // Row/atom counts are the array shape — carrying them as separate
+        // arguments only invited a mismatch with the data they index.
+        let n = logits.nrows();
+        let k_atoms = logits.ncols();
+        debug_assert_eq!(
+            (n, k_atoms),
+            contribution.dim(),
+            "contribution shape must match logits (n, k_atoms)"
+        );
         let cap = k_active_cap.max(1);
         let mut per_row = Vec::with_capacity(n);
         for row in 0..n {
@@ -316,7 +348,7 @@ mod jumprelu_hard_gate_tests {
     // #5 — JumpReLU joint block sized by the hard forward gate plus the gated-off
     // atoms with a non-negligible column-separable prior gradient; the negligible
     // deep-band tail is dropped (see [`SaeRowLayout::from_jumprelu`]).
-    use super::SaeRowLayout;
+    use super::{JumpReluActiveSetSpec, SaeRowLayout};
     use crate::assignment::{assignment_prior_grad_hdiag, AssignmentMode, SaeAssignment};
     use crate::manifold::{
         SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
@@ -363,14 +395,14 @@ mod jumprelu_hard_gate_tests {
 
         // No cap (cap = K): the relative cutoff is the sole lever.
         let layout = SaeRowLayout::from_jumprelu(
-            n,
-            k,
-            threshold,
-            temperature,
+            JumpReluActiveSetSpec {
+                threshold,
+                temperature,
+                k_active_cap: k,
+                relative_cutoff: 1.0e-3,
+            },
             &logits,
             &contribution,
-            k,
-            1.0e-3,
             coord_dims.clone(),
             coord_offsets_full.clone(),
         );
@@ -386,14 +418,14 @@ mod jumprelu_hard_gate_tests {
         // Cap = 2: hard-gated atoms are never dropped, so the budget for gated-off
         // atoms is 0 and only the two hard-gated atoms remain.
         let capped = SaeRowLayout::from_jumprelu(
-            n,
-            k,
-            threshold,
-            temperature,
+            JumpReluActiveSetSpec {
+                threshold,
+                temperature,
+                k_active_cap: 2,
+                relative_cutoff: 1.0e-3,
+            },
             &logits,
             &contribution,
-            2,
-            1.0e-3,
             coord_dims,
             coord_offsets_full,
         );
@@ -475,14 +507,14 @@ mod jumprelu_hard_gate_tests {
         let coord_dims = vec![1usize; k];
         let coord_offsets = term.assignment.coord_offsets();
         let layout = SaeRowLayout::from_jumprelu(
-            n,
-            k,
-            threshold,
-            temperature,
+            JumpReluActiveSetSpec {
+                threshold,
+                temperature,
+                k_active_cap: k,
+                relative_cutoff: 1.0e-3,
+            },
             &logits,
             &contribution,
-            k,
-            1.0e-3,
             coord_dims,
             coord_offsets,
         );

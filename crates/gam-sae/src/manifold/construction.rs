@@ -3905,17 +3905,17 @@ impl SaeManifoldTerm {
                         }
                     }
                     Some(SaeRowLayout::from_jumprelu(
-                        n,
-                        k_atoms,
-                        threshold,
-                        temperature,
+                        JumpReluActiveSetSpec {
+                            threshold,
+                            temperature,
+                            // Cap: rely on the relative cutoff to bound the active
+                            // set; a memory-budget cap can be layered in like
+                            // `sparse_active_plan` without changing the contract.
+                            k_active_cap: k_atoms,
+                            relative_cutoff: JUMPRELU_RELATIVE_CUTOFF,
+                        },
                         &self.assignment.logits,
                         &contribution,
-                        // Cap: rely on the relative cutoff to bound the active set;
-                        // a memory-budget cap can be layered in like
-                        // `sparse_active_plan` without changing the contract.
-                        k_atoms,
-                        JUMPRELU_RELATIVE_CUTOFF,
                         coord_dims.clone(),
                         self.assignment.coord_offsets(),
                     ))
