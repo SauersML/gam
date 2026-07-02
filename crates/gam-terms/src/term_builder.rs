@@ -2745,6 +2745,7 @@ pub fn build_smooth_basis(
                     "measurejet smooth tau must be finite and nonnegative; got {tau0}"
                 ));
             }
+            let explicit_num_scales = options.contains_key("scales");
             let num_scales = option_usize(options, "scales").unwrap_or(0);
             let length_scale = option_f64(options, "length_scale").unwrap_or(0.0);
             if !length_scale.is_finite() || length_scale < 0.0 {
@@ -2779,6 +2780,7 @@ pub fn build_smooth_basis(
                     alpha,
                     tau0,
                     num_scales,
+                    explicit_num_scales,
                     // 0.0 sentinel = auto initialization in the basis builder
                     // (median nearest-center spacing).
                     length_scale,

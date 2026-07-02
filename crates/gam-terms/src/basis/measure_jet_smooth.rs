@@ -168,6 +168,10 @@ pub(crate) const MEASURE_JET_MAX_AUTO_SCALES: usize = 8;
 /// both at the root without touching the energy penalty or the dials.
 pub(crate) const MEASURE_JET_AUTO_LENGTH_SCALE_FACTOR: f64 = 1.0;
 
+/// Modest extra Gaussian overlap for explicit finite scale bands, so the
+/// representer span covers support gaps the jet penalty is asked to bridge.
+pub(crate) const MEASURE_JET_EXPLICIT_SCALES_LENGTH_SCALE_FACTOR: f64 = 1.32;
+
 /// Single-scale fused-mode weight of the affine-preserving nullspace ridge,
 /// as a fraction of the primary energy penalty's Frobenius scale (#1116). The
 /// ridge's role is identifiability — flooring the fused energy's near-nullspace
@@ -255,6 +259,9 @@ pub struct MeasureJetBasisSpec {
     pub tau0: f64,
     /// Number of scale nodes; `0` sentinel = auto dyadic band.
     pub num_scales: usize,
+    /// True only when the formula supplied `scales=` explicitly.
+    #[serde(default)]
+    pub explicit_num_scales: bool,
     /// Representer (Gaussian RBF) range ℓ; `0.0` sentinel = auto
     /// (median nearest-center spacing × [`MEASURE_JET_AUTO_LENGTH_SCALE_FACTOR`]).
     pub length_scale: f64,
@@ -307,6 +314,7 @@ impl Default for MeasureJetBasisSpec {
             alpha: 1.0,
             tau0: 1e-3,
             num_scales: 0,
+            explicit_num_scales: false,
             length_scale: 0.0,
             double_penalty: true,
             learn_length_scale: false,
@@ -1319,7 +1327,10 @@ pub(crate) fn realize_measure_jet_geometry(
             (nodes, masses, band.eps, band.log_step)
         }
     };
-    let length_scale = realized_measure_jet_length_scale(centers.view(), spec.length_scale)?;
+    let mut length_scale = realized_measure_jet_length_scale(centers.view(), spec.length_scale)?;
+    if spec.length_scale == 0.0 && spec.explicit_num_scales && spec.frozen_quadrature.is_none() {
+        length_scale *= MEASURE_JET_EXPLICIT_SCALES_LENGTH_SCALE_FACTOR;
+    }
     // Realized-design constraint transform: uniform coefficient sum-to-zero
     // at fit time; the frozen composed `z · z_parametric` at predict time
     // (#532 pattern — see MeasureJetIdentifiability).
