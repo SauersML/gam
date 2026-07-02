@@ -638,14 +638,15 @@ pub fn state_from_beta_logisticspec(spec: SasLinkSpec) -> Result<SasLinkState, S
         return Err("Beta-Logistic link parameters must be finite".to_string());
     }
     // For Beta-Logistic, `log_delta` is the unconstrained log geometric-mean beta
-    // shape (the kernels' `log_shape_center`); the derived `delta = exp(log_delta)`
-    // is the positive geometric-mean shape `sqrt(a*b)`. Evaluation consumes
-    // `log_delta`, never `delta`.
+    // shape (the kernels' `log_shape_center`). Evaluation consumes `log_delta`,
+    // never `delta`, but keep the shared `SasLinkState::delta` field on the same
+    // bounded SAS parameterization used by `state_from_sasspec` so constructing a
+    // state from a large finite raw log-delta cannot overflow this derived field.
     let log_shape_center = spec.initial_log_delta;
     Ok(SasLinkState {
         epsilon: spec.initial_epsilon,
         log_delta: log_shape_center,
-        delta: log_shape_center.exp(),
+        delta: sas_delta_from_raw_log_delta(log_shape_center),
     })
 }
 
