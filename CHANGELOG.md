@@ -1,3 +1,115 @@
+## v0.3.143 — gam 0.3.143 / gamfit 0.1.245 (2026-07-02)
+
+Broad correctness, inference-accuracy, and performance release on top of
+0.3.142. The headline changes: grouped-**binomial proportion responses** are
+accepted again (not just strict `{0, 1}`); a batch of REML / posterior-variance
+/ credible-band fixes tighten uncertainty quantification; the Duchon and Matérn
+spline families get several geometry and null-space corrections; the manifold
+SAE stack lands device-resident execution, principled (no-magic-constant)
+penalties, and a batched JumpReLU gate kernel exposed to `gamfit.torch`; and a
+wave of PERF work brings 1-D/2-D smooth and location-scale fits from
+2–160× slower-than-reference down toward parity. This cut also repaired three
+release-blocking compile regressions introduced by concurrent landings (a
+clobbered `ReportInput.smoothing_forensics` field in the PyO3 wheel, a stale
+`ArrowBlockDiagInverse::build` call site, and an unbalanced-delimiter test) and
+removed a banned `#[allow(too_many_arguments)]` by bundling the JumpReLU layout
+inputs into a params struct.
+
+### Families & responses
+- **Binomial proportion responses accepted (#1806, #1987).** The binomial
+  support was tightened to strict `{0, 1}` in an earlier cut, which rejected
+  grouped-binomial and continuous-probability responses (with trial weights
+  folded into the row weight). Support is now the closed interval `[0, 1]`,
+  which keeps the Bernoulli / grouped-binomial log-likelihood bounded; the
+  strict `{0, 1}` predicate is retained only where the code is specifically
+  asking whether a numeric response is binary (auto-inference and all-boundary
+  degeneracy checks). External GLM response-support errors are also clarified
+  (#1982).
+- **Survival lognormal formula routing fixed (#2009);** reduced-AFT MLE
+  non-convergence is handled gracefully (#1921); KKT projection includes
+  near-active monotone rows to clear a flat baseline-hazard stall (#1793,
+  #1992); left-truncated transformation LAML uses a hard-pseudo logdet (#1915);
+  all-interval latent survival warm start restored (#1916); survival constraint
+  projection semantics clarified (#1919).
+- **Beta-Logistic** derived delta now uses the SAS bounded transform (#1993);
+  negative-binomial dispersion location-scale ρ optimization fixed (#1956);
+  Gaussian location-scale fits retain their joint covariance (#1974) and restore
+  σ to response units on generate (#1928).
+
+### Inference, uncertainty & REML
+- **Logit posterior-variance regression fixed (#1976);** smooth credible bands
+  get a corrected ρ-variance cubature gate (#1971) and a bias-correction
+  linearization on the smoothing-corrected β covariance (#1970); the ALO
+  sandwich SE is computed from the frozen-curvature meat `XᵀWX` (#1969).
+- **Hutchinson REML trace standard-error scaling corrected (#1977);** REML folds
+  and B-spline double-penalty EDF inflation get deterministic row reductions and
+  a curvature-only cleanup (#1929, #1964); single-ρ̂ Lawley mean-shift uses
+  Gauss–Hermite quadrature (#1972); `Gamma(1, 0)` precision priors are treated as
+  `Flat` for the REML ρ-prior policy (#2006).
+- **Random-effect BLUP recovery fixed (#2008);** the summary penalty cursor now
+  skips only the penalty blocks the random effects actually own (unpenalized
+  `by`-factor ranges no longer slide every following smooth's window off by one)
+  (#1883, #1979); concurvity-driven double-penalty null-space rail collapse is
+  guarded (#2017); the marginal-slope absorber is protected from
+  over-orthogonalization with an `n`-scaled ridge (#2013, #1947).
+- **Multinomial per-class smoothing recovery fixed (#1855, #2027);**
+  identifiability audit gauge attribution and rank-deficiency handling fixed
+  (#2005); Royston–Parmar uncertainty prediction link canonicalization fixed
+  (#1955); prediction CSV schema stabilized (#1928).
+
+### Smooths & bases
+- **Duchon family:** rotation-equivariant knot tie-breaks (#1935), affine-trend
+  ridge deselection to prevent pre-fit rank deficiency (#1934), polynomial
+  null-space evaluation in the collocation operators (#1933), and nullspace-test
+  centering (#1931); periodic Duchon auto-power pinned to `s = 0`.
+- **Matérn:** sufficient basis centers for exact adaptive regularization (#2003);
+  anisotropic derivative geometry — normalization, center RRQR, η seeding (#1937).
+- **Cubic-regression (`cr`/`cs`)** bases routed to the standard dense fit off the
+  exact spline-scan fast path, with a `ds` Duchon alias added (#1844, #1957);
+  cyclic B-spline seam evaluation fixed (#1922) and small-k cyclic tensor margins
+  allowed (#1944); tensor margins honor quantile knot placement (#1943);
+  `by`-factor / `bs="sz"` `SmoothBasisSpec` construction fixed (#1981);
+  constant-curvature `curv()` recovers hyperbolic data instead of railing to
+  spherical (#1464).
+
+### Manifold SAE
+- **Batched JumpReLU gate FFI kernel (#6).** `gamfit.torch`'s bounded threshold
+  gate is now a thin marshaller over a single batched Rust value+grad call
+  (`sae_jumprelu_batch_value_grad`), bit-identical to the row kernel — the whole
+  `(N, K)` matrix crosses the Python↔Rust boundary once per forward pass instead
+  of once per row, and Rust is the single source of truth for the gate math.
+- **Device-resident SAE solver engages on production fits (#1017, #1551);** the
+  GPU offload gate is tuned for thin `d_atom = 1` curve atoms (#1913) and the
+  throughput decision gate is made honest against its target (#1412).
+- **Principled penalties (#1610):** hand-picked magic-constant penalty strengths
+  and collapse thresholds replaced with derived quantities; per-fit IBP α
+  override on manifold init avoids atom masking (#1784); IBP cross-row Woodbury
+  coupling restored (#1920); SAE evidence Schur deflation uses unit-stiffness
+  quotient conditioning for the log-det (#1925); recoverable refusal probes kept
+  finite (#1912). The JumpReLU compact layout is sized by the hard forward gate
+  (O(k_active)), and the residual-factor path hoists row-independent work into a
+  reusable `fit_row_metric` (#2021 Wave-2). A `WhitenedStructured` row-metric
+  driver is wired onto the fit path behind a default-off flag (#2021).
+
+### Performance
+- 1-D P-spline / thin-plate and Poisson/Gamma `s(x)` fits (#1689, #1690),
+  binomial-logit `s(x)` / `te(x, z)` and REML fits (#1575, #1727),
+  Gaussian-location-scale (`noise_formula`) overhead (#1720), and Duchon 2-D
+  fits (#1718, #1757) are all brought substantially closer to reference-software
+  speed at equal accuracy. GAM significance vs reference software improved
+  (#1561).
+
+### Reports, CLI & reliability
+- **Smoothing-forensics report section added** (λ/σ² paths, EDF criterion vs
+  assembly) (#1986). `--family expectile` and other standard-family CLI fits no
+  longer abort on the frailty guard in the expectile inner fit (#1948).
+- Concurrent tail-cell cache computations are coalesced to avoid duplicate work
+  (#2002); warm-start LRU touch and deterministic eviction fixed (#1998);
+  power-law scaling reports hardened against noisy timings (#1997); the spatial-κ
+  optimizer recovers from a NaN frequentist covariance by treating the trial
+  point as infeasible (#2001); startup no longer bails on repeated non-finite
+  trial objectives (#1802, #1924).
+
 ## v0.3.142 — gam 0.3.142 / gamfit 0.1.244 (2026-07-01)
 
 Broad correctness, robustness, and performance release on top of 0.3.141. The
