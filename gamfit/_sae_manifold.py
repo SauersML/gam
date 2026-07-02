@@ -2831,6 +2831,12 @@ _TOPOLOGY_TO_BASIS = {
     "circle": "periodic", "periodic": "periodic", "periodic_spline": "periodic",
     "sphere": "sphere", "torus": "torus",
     "linear": "linear", "linear_rank1": "linear", "affine": "linear",
+    # BSF block AS a manifold-SAE atom (γ_g(t)=t·D_g, orthonormal frame + block
+    # gating): kept as its OWN basis-kind string so the "linear_block" label
+    # survives round-trip; the Rust `sae_atom_basis_kind_from_str` maps it to the
+    # `Linear` kind for construction/evidence (see the FFI doc-comment). This is
+    # the honest encoding of "BSF ⊂ ManifoldSAE" as config, not a new atom type.
+    "linear_block": "linear_block", "flat_block": "linear_block",
     "euclidean": "euclidean", "euclidean_patch": "euclidean",
     "euclidean_quadratic_patch": "euclidean",
     "duchon": "duchon",
@@ -2842,6 +2848,9 @@ _BASIS_TO_TOPOLOGY = {
     "periodic": "circle", "periodic_spline": "circle", "circle": "circle",
     "sphere": "sphere", "torus": "torus",
     "linear": "linear", "linear_rank1": "linear", "affine": "linear",
+    # linear_block reports its own topology label (it is a flat block, not a plain
+    # linear atom); the distinction is the orthonormal decoder frame + block gating.
+    "linear_block": "linear_block", "flat_block": "linear_block",
     "duchon": "euclidean", "euclidean": "euclidean", "euclidean_patch": "euclidean",
     "euclidean_quadratic_patch": "euclidean",
     "poincare": "poincare", "hyperbolic": "poincare", "poincare_patch": "poincare",
@@ -2864,6 +2873,42 @@ def _canonical_topology(name: str) -> str:
     canon = _canon_name(name)
     basis = _TOPOLOGY_TO_BASIS.get(canon, canon)
     return _basis_to_topology(basis)
+
+
+#: The two block-gating modes for ``atom_topology="linear_block"`` (BSF-as-atom).
+#: ``norm_selection`` mirrors the BSF paper exactly — a block fires by its group ℓ2
+#: coordinate norm (amplitude-driven selection), mapped to the ``ibp_map``
+#: assignment. ``separate_gate`` is our reading — presence is a SEPARATE gate from
+#: amplitude — mapped to the ``threshold_gate`` (hard-sigmoid) assignment. Both are
+#: existing manifold-SAE assignment modes, so a linear_block atom races vs a curved
+#: atom under one framework with no new solver path. No coordinate shrinkage is
+#: applied beyond ARD (the flat block keeps its signed coordinates).
+_FLAT_BLOCK_GATING_TO_ASSIGNMENT = {
+    "norm_selection": "ibp_map",
+    "norm": "ibp_map",
+    "separate_gate": "threshold_gate",
+    "separate": "threshold_gate",
+}
+
+
+def flat_block_assignment(gating: str) -> str:
+    """Resolve a ``linear_block`` block-gating mode to a manifold-SAE assignment.
+
+    Exposes the two gating modes of a BSF-block-as-manifold-atom
+    (``atom_topology="linear_block"``): ``"norm_selection"`` (the paper's group-ℓ2
+    block-TopK, → ``"ibp_map"``) and ``"separate_gate"`` (presence gate separate
+    from amplitude, → ``"threshold_gate"``). Use it as
+    ``sae_manifold_fit(..., atom_topology="linear_block",
+    assignment=flat_block_assignment("norm_selection"))`` so the flat block and a
+    curved atom race under ONE fit. Raises on an unknown mode.
+    """
+    key = _canon_name(gating)
+    if key not in _FLAT_BLOCK_GATING_TO_ASSIGNMENT:
+        raise ValueError(
+            f"flat_block gating must be one of {sorted(set(_FLAT_BLOCK_GATING_TO_ASSIGNMENT))}; "
+            f"got {gating!r}"
+        )
+    return _FLAT_BLOCK_GATING_TO_ASSIGNMENT[key]
 
 
 def _bases(k_atoms: int, atom_basis: Any, atom_topology: str) -> list[str]:

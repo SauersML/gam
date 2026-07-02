@@ -308,6 +308,7 @@ from ._sae_manifold import (
     SaeManifoldFitResult,
     featurize,
     fit as sae_fit,
+    flat_block_assignment,
     gumbel_geometric_schedule,
     gumbel_linear_schedule,
     gumbel_reciprocal_iter_schedule,

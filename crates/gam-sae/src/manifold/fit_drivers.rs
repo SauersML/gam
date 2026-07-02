@@ -2308,7 +2308,17 @@ impl SaeManifoldTerm {
                 target,
                 dictionary_rank,
             );
-            if !(ev.is_finite() && ev <= ev_floor && out_energy_ratio <= ev_floor) {
+            // #2082 — the reseed fires on EITHER degeneracy mode: the decoders have
+            // VANISHED together (EV at the null floor AND output co-vanished), OR the
+            // atoms have STRUCTURALLY collapsed onto a shared output subspace (high EV,
+            // no structure — `structural_coherence_collapse_detected` above its derived
+            // random-subspace null). A well-separated dictionary passes both and
+            // returns here, so healthy fits are untouched; the guard tests (distinct
+            // atoms) never trip the structural arm.
+            let ev_degenerate =
+                ev.is_finite() && ev <= ev_floor && out_energy_ratio <= ev_floor;
+            let structural_collapse = self.structural_coherence_collapse_detected()?.is_some();
+            if !(ev_degenerate || structural_collapse) {
                 return Ok(());
             }
             // #1026 keep-best multi-start: the current (pre-reseed) state is a
@@ -2436,10 +2446,15 @@ impl SaeManifoldTerm {
             // freshly-fit decoders are consistent with the reseeded gates (the LSQ was
             // solved AT those gates), so the reconstruction EV strictly improves over
             // the degenerate incumbent — the keep-best multi-start below then banks or
-            // restores it as usual. (A soft row-ownership logit anchor was tried here
-            // but rewrites the gates AFTER the decoders were fit to them, desyncing the
-            // two and DEGRADING EV; it is deferred to the #2082 hardening, which refits
-            // the decoders after anchoring.)
+            // restores it as usual.
+            self.refit_decoder_sequential_deflation(target, rho)?;
+            // #2082 anchor-then-refit: with disjoint decoders now placed, pin each row
+            // (softly) to the atom that best explains it, THEN re-fit the decoders AT
+            // the anchored gates so decoders and gates stay consistent (anchoring after
+            // a single refit desyncs them and degrades EV — the ordering is what makes
+            // the anchor safe). Gives each atom a stable territory the outer Newton
+            // descent starts from, without breaking the reseed-improves-EV contract.
+            self.anchor_logits_to_residual_ownership(target, rho)?;
             self.refit_decoder_sequential_deflation(target, rho)?;
             return Ok(());
         }
@@ -2772,6 +2787,124 @@ impl SaeManifoldTerm {
             remaining.retain(|&a| a != best_atom);
         }
         Ok(())
+    }
+
+    /// #2082 — soft ROW-OWNERSHIP ANCHOR (used ONLY in the co-collapse reseed arm,
+    /// between two deflation refits: deflate → anchor → refit). For each row, find the
+    /// atom whose current decoder best matches that row's target direction (the
+    /// alignment `⟨target_row, Φ_k(t)·B_k⟩`) and NUDGE that atom's gate logit up by one
+    /// temperature unit, the others down by one — a relative bias in the gate's own
+    /// logit scale, NOT a hard partition. On its own this DESYNCS the gates from the
+    /// decoders the prior deflation fit to the OLD gates (EV degrades — the reason it
+    /// was pulled from the #2027 arm); the caller therefore RE-FITS the decoders at the
+    /// anchored gates immediately after, restoring the reseed-improves-EV contract while
+    /// giving each atom a stable territory the subsequent Newton descent starts from.
+    /// K=1 has no ownership to contest, so this is a no-op there.
+    pub(crate) fn anchor_logits_to_residual_ownership(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        _rho: &SaeManifoldRho,
+    ) -> Result<(), String> {
+        let n = self.n_obs();
+        let p = self.output_dim();
+        let k = self.k_atoms();
+        if n == 0 || k < 2 {
+            return Ok(());
+        }
+        let mut owner = vec![0usize; n];
+        for row in 0..n {
+            let mut best = 0usize;
+            let mut best_align = f64::NEG_INFINITY;
+            for atom in 0..k {
+                let m = self.atoms[atom].basis_size();
+                let phi = &self.atoms[atom].basis_values;
+                let b = &self.atoms[atom].decoder_coefficients;
+                let mut align = 0.0_f64;
+                for out in 0..p {
+                    let mut recon = 0.0_f64;
+                    for col in 0..m {
+                        recon += phi[[row, col]] * b[[col, out]];
+                    }
+                    align += recon * target[[row, out]];
+                }
+                if align > best_align {
+                    best_align = align;
+                    best = atom;
+                }
+            }
+            owner[row] = best;
+        }
+        let bias = self.assignment.mode.temperature().max(f64::MIN_POSITIVE);
+        for row in 0..n {
+            for atom in 0..k {
+                let delta = if atom == owner[row] { bias } else { -bias };
+                self.assignment.logits[[row, atom]] += delta;
+            }
+        }
+        if matches!(self.assignment.mode, AssignmentMode::Softmax { .. }) {
+            canonicalize_softmax_logits(&mut self.assignment.logits);
+        }
+        Ok(())
+    }
+
+    /// #2082 — STRUCTURAL coherence collapse detector. The median/EV co-collapse
+    /// arms catch a dictionary whose decoders have VANISHED (`‖B_k‖ → 0`). They are
+    /// blind to the "HIGH EV, NO STRUCTURE" mode the #2027 two-width test exposes:
+    /// two atoms carry full decoder norm yet decode ~the SAME output subspace, so the
+    /// reconstruction EV looks healthy while the dictionary really has one atom's worth
+    /// of structure. Detect it from the max inter-atom output-frame coherence
+    /// `μ̂_{jk} = σ_max(Q_jᵀ Q_k)` — the largest principal-angle COSINE between the
+    /// atoms' orthonormal decoder output frames `Q_k` (`certificate_output_frame`) —
+    /// fired against a DERIVED random-subspace null (no magic constant).
+    ///
+    /// Null bar: two INDEPENDENT Haar-random subspaces of dims `r_j, r_k` in `Rᵖ` have
+    /// their largest canonical correlation concentrate at the Wachter / MANOVA bulk
+    /// edge `μ_null = √(a(1−b)) + √(b(1−a))` with `a = r_j/p, b = r_k/p` (→ 0 as `p`
+    /// grows: random atoms are incoherent). A pair is STRUCTURALLY collapsed when its
+    /// coherence has moved from that null floor to (near) the degenerate ceiling
+    /// `μ = 1` (identical subspaces): fire when `μ̂_{jk}` exceeds the MIDPOINT
+    /// `½(μ_null + 1)` — halfway between "as incoherent as random" and "identical". The
+    /// only inputs are the derived `μ_null` and the hard degeneracy ceiling 1, so there
+    /// is no free threshold. Returns the worst offending pair `(j, k, μ̂)`, or `None`
+    /// when every pair sits below its derived bar (`K < 2`, a rank-0 atom, or a genuine
+    /// well-separated dictionary all return `None`).
+    pub(crate) fn structural_coherence_collapse_detected(
+        &self,
+    ) -> Result<Option<(usize, usize, f64)>, String> {
+        let k = self.k_atoms();
+        let p = self.output_dim();
+        if k < 2 || p == 0 {
+            return Ok(None);
+        }
+        let frames = (0..k)
+            .map(|atom| crate::manifold::certificate::certificate_output_frame(self, atom))
+            .collect::<Result<Vec<_>, String>>()?;
+        let mut worst: Option<(usize, usize, f64)> = None;
+        for j in 0..k {
+            for kk in (j + 1)..k {
+                let rj = frames[j].ncols();
+                let rk = frames[kk].ncols();
+                if rj == 0 || rk == 0 {
+                    continue;
+                }
+                let overlap = fast_atb(&frames[j], &frames[kk]);
+                let (_u, s, _vt) = overlap.svd(false, false).map_err(|e| {
+                    format!("structural_coherence_collapse_detected: SVD failed ({j},{kk}): {e}")
+                })?;
+                let coherence = s.iter().copied().fold(0.0_f64, f64::max);
+                let a = rj as f64 / p as f64;
+                let b = rk as f64 / p as f64;
+                let mu_null =
+                    (a * (1.0 - b)).max(0.0).sqrt() + (b * (1.0 - a)).max(0.0).sqrt();
+                let bar = 0.5 * (mu_null.min(1.0) + 1.0);
+                if coherence > bar
+                    && worst.as_ref().is_none_or(|&(_, _, c)| coherence > c)
+                {
+                    worst = Some((j, kk, coherence));
+                }
+            }
+        }
+        Ok(worst)
     }
 
     /// #2027 cold-start SEQUENTIAL CHART deflation — seed each atom's CHART *and*

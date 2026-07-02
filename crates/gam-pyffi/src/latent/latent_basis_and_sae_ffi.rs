@@ -1639,6 +1639,20 @@ fn sae_atom_basis_kind_from_str(value: &str) -> SaeAtomBasisKind {
         // QUADRATIC patch `{1, t, t²}`. `"euclidean_quadratic_patch"` is accepted
         // as an explicit synonym so callers can name the quadratic patch honestly.
         "linear" | "linear_rank1" | "affine" => SaeAtomBasisKind::Linear,
+        // #BSF — `"linear_block"` is a BSF block expressed AS a manifold-SAE atom:
+        // γ_g(t) = t·D_g with an orthonormal decoder frame D_g and block-level
+        // (norm-selection or separate-gate) gating. Mathematically it IS the
+        // `Linear` degree-1 patch (the honest encoding of "BSF ⊂ ManifoldSAE" is a
+        // frame + gating CONFIG on the linear atom, not a new basis type), so it
+        // maps to `SaeAtomBasisKind::Linear` for construction/evidence; the
+        // `"linear_block"` label is preserved by the gamfit facade so an artifact
+        // fitted as linear_block round-trips as linear_block (not linear). A
+        // first-class `LinearBlock` enum variant was DEFERRED deliberately: it
+        // would force exhaustive-match edits across ~10 manifold/ files (a large,
+        // then-unverifiable, collision-prone change) for a type-level distinction
+        // the frame+gating config already carries. Do NOT "simplify" this alias
+        // away — it is load-bearing for the executable BSF-subset claim.
+        "linear_block" | "flat_block" => SaeAtomBasisKind::Linear,
         "euclidean" | "euclidean_patch" | "euclidean_quadratic_patch" => {
             SaeAtomBasisKind::EuclideanPatch
         }

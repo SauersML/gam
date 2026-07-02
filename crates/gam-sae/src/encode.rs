@@ -2265,6 +2265,39 @@ impl EncodeAtlas {
             .collect();
 
         for row in 0..n {
+            if std::env::var("DBG_ROUTE").is_ok() && row == 3 {
+                let nc = nearest_chart(atom_atlas, x.row(row), amplitudes[row]);
+                let fast_chart = valid_charts[route_idx[row]];
+                let nci = nc.unwrap().0;
+                // map full-chart index -> valid index
+                let vpos = |full: usize| valid_charts.iter().position(|&c| c == full);
+                let vi_nc = vpos(nci).unwrap();
+                let vi_fast = route_idx[row];
+                let dfast_route =
+                    |c: usize| amplitudes[row] * amplitudes[row] * recon_centers.row(c).dot(&recon_centers.row(c))
+                        - 2.0 * amplitudes[row] * x.row(row).dot(&recon_centers.row(c));
+                eprintln!(
+                    "DBGF row3: nc_full={nci} nc_valid={vi_nc} routeDist(nc)={:.6} | fast_full={fast_chart} fast_valid={vi_fast} routeDist(fast)={:.6}",
+                    dfast_route(vi_nc),
+                    dfast_route(vi_fast),
+                );
+                // Now recompute nearest_chart-style seq dist for both
+                let seq = |c_full: usize| {
+                    let ch = &atom_atlas.charts[c_full];
+                    let mut d = 0.0;
+                    for (r, xv) in ch.recon_center.iter().zip(x.row(row).iter()) {
+                        let diff = amplitudes[row] * r - xv;
+                        d += diff * diff;
+                    }
+                    d
+                };
+                eprintln!(
+                    "DBGF row3 seqDist: nc_full={nci} -> {:.6} | fast_full={fast_chart} -> {:.6} | certR nc={} fast={}",
+                    seq(nci), seq(fast_chart),
+                    atom_atlas.charts[nci].certified_radius,
+                    atom_atlas.charts[fast_chart].certified_radius,
+                );
+            }
             let Some(pred) = predictors[route_idx[row]].as_ref() else {
                 continue;
             };
