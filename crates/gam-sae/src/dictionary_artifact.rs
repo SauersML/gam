@@ -47,6 +47,13 @@ pub struct DictionaryDiff {
     pub substantive_differences: usize,
     pub hash_equal_after_alignment: bool,
     pub subspace_agreement: f64,
+    /// Left-side atom indices with no counterpart in `right` (no atom of the
+    /// same topology/shape was left to pair with). Each such atom is an
+    /// atom-level removal and counts toward [`Self::substantive_differences`].
+    pub unmatched_left_atoms: Vec<usize>,
+    /// Right-side atom indices with no counterpart in `left` — atom-level
+    /// additions, also counted in [`Self::substantive_differences`].
+    pub unmatched_right_atoms: Vec<usize>,
 }
 
 pub fn canonical_dictionary_artifact(
@@ -85,6 +92,17 @@ pub fn diff_dictionaries(
     let mut max_decoder_residual = 0.0_f64;
     let mut substantive_differences = 0_usize;
     let mut agreement_sum = 0.0_f64;
+    // Track which atoms found a partner so unmatched atoms on either side are
+    // reported as atom-level additions/removals rather than silently dropped.
+    // Without this, `{circle, circle}` vs `{circle, sphere}` — equal counts, one
+    // aligned pair — would report zero substantive differences and a spurious
+    // `hash_equal_after_alignment = true`.
+    let mut left_matched = vec![false; left.atoms.len()];
+    let mut right_matched = vec![false; right.atoms.len()];
+    for &(li, ri) in &pairs {
+        left_matched[li] = true;
+        right_matched[ri] = true;
+    }
     for (li, ri) in pairs {
         let l = &left.atoms[li];
         let r = &right.atoms[ri];
@@ -112,13 +130,32 @@ pub fn diff_dictionaries(
     } else {
         agreement_sum / atom_diffs.len() as f64
     };
+    // Unmatched atoms are genuine structural differences (an atom present on one
+    // side with no counterpart on the other). Count each toward the substantive
+    // total so `hash_equal_after_alignment` can never claim equivalence when the
+    // dictionaries carry different atom sets, even at equal total count.
+    let unmatched_left_atoms: Vec<usize> = left_matched
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &m)| (!m).then_some(i))
+        .collect();
+    let unmatched_right_atoms: Vec<usize> = right_matched
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &m)| (!m).then_some(i))
+        .collect();
+    substantive_differences += unmatched_left_atoms.len() + unmatched_right_atoms.len();
     DictionaryDiff {
         atom_diffs,
         max_decoder_residual,
+        // `substantive_differences == 0` now already implies every atom on both
+        // sides was matched and certified-equivalent (any unmatched atom bumped
+        // the count above), so equal counts follow and need no separate guard.
+        hash_equal_after_alignment: substantive_differences == 0,
         substantive_differences,
-        hash_equal_after_alignment: substantive_differences == 0
-            && left.atoms.len() == right.atoms.len(),
         subspace_agreement,
+        unmatched_left_atoms,
+        unmatched_right_atoms,
     }
 }
 
@@ -333,6 +370,41 @@ mod tests {
         let d = diff_dictionaries(&ca, &cb, 1e-12);
         assert_eq!(d.substantive_differences, 0);
         assert!(d.hash_equal_after_alignment);
+    }
+
+    #[test]
+    fn diff_flags_unmatched_atoms_at_equal_count() {
+        // Both dictionaries carry two atoms, and one atom pair is byte-identical,
+        // but the second atoms cannot align (different decoder-block shape). The
+        // aligned-equality claim must be FALSE and the leftover atoms must be
+        // reported as an atom-level removal + addition — not silently dropped
+        // into a spurious "no differences" verdict at equal total count.
+        let left = canonical_dictionary_artifact(&model(vec![
+            array![[1.0], [0.0]],
+            array![[0.0], [1.0]],
+        ]))
+        .unwrap();
+        let right = canonical_dictionary_artifact(&model(vec![
+            array![[1.0], [0.0]],
+            array![[1.0], [0.0], [0.0]],
+        ]))
+        .unwrap();
+        let d = diff_dictionaries(&left, &right, 1e-12);
+        assert!(
+            !d.hash_equal_after_alignment,
+            "dictionaries with different atom sets must not claim aligned equality"
+        );
+        assert_eq!(d.unmatched_left_atoms.len(), 1, "left[1] has no counterpart");
+        assert_eq!(
+            d.unmatched_right_atoms.len(),
+            1,
+            "the 3-row right atom has no counterpart"
+        );
+        assert!(
+            d.substantive_differences >= 2,
+            "each unmatched atom is a substantive difference, got {}",
+            d.substantive_differences
+        );
     }
 
     #[test]
