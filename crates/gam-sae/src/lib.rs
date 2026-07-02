@@ -5,6 +5,7 @@ pub mod candidate_index;
 pub mod certificate_impls;
 pub mod certificates;
 pub mod chart_canonicalization;
+pub mod chart_transfer;
 pub mod corpus;
 pub mod criterion_atoms;
 pub mod dictionary_artifact;
