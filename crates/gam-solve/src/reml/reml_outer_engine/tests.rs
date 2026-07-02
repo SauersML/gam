@@ -6591,3 +6591,145 @@ pub(crate) fn dense_cholesky_value_only_matches_spectral() {
         epsilon = 1e-10
     );
 }
+
+/// FD gate for the BARRIER first-order curvature drift (previously untested —
+/// `BarrierDerivativeProvider` is live whenever a `barrier_config` is present but
+/// no test instantiated it, so a sign/coefficient slip in `barrier_correction`
+/// would have gone uncaught). The log-barrier `B(β) = −τ Σ_j log(slack_j)` with
+/// `slack_j = s_j·β_{idx_j} − b_j` has the diagonal Hessian
+/// `H_B[idx,idx] = τ / slack_j²`, so the ρ-mode drift `D_β H_B[−v_k]` returned by
+/// `hessian_derivative_correction(v_k)` must equal a central difference of that
+/// closed-form `H_B` along the mode direction `−v_k`. The FD reference is built
+/// directly from `slack_j` (independent of the provider's third-derivative path).
+#[test]
+pub(crate) fn barrier_hessian_derivative_correction_matches_fd() {
+    let tau = 0.5;
+    let config = BarrierConfig {
+        tau,
+        constrained_indices: vec![0, 2],
+        lower_bounds: vec![-1.0, -1.0],
+        bound_signs: vec![1.0, -1.0],
+    };
+    // Feasible interior point: slack_0 = 0.3 − (−1) = 1.3 > 0, slack_2 = −0.2 − (−1) = 0.8 > 0.
+    let beta = array![0.3, 0.5, 0.2];
+    let inner = GaussianDerivatives;
+    let provider = BarrierDerivativeProvider::new(&inner, &config, &beta)
+        .expect("feasible interior point yields a barrier provider");
+
+    let v_k = array![0.4, -0.1, 0.25];
+    let analytic = provider
+        .hessian_derivative_correction(&v_k)
+        .expect("barrier correction evaluates")
+        .expect("barrier provider always returns a correction");
+
+    // Independent FD of the closed-form barrier Hessian along β̂_{ρk} = −v_k.
+    let barrier_hess_diag = |b: &Array1<f64>| -> Array2<f64> {
+        let mut h = Array2::<f64>::zeros((3, 3));
+        for (ci, &idx) in config.constrained_indices.iter().enumerate() {
+            let slack = config.bound_signs[ci] * b[idx] - config.lower_bounds[ci];
+            h[[idx, idx]] = tau / (slack * slack);
+        }
+        h
+    };
+    let dir = v_k.mapv(|x| -x);
+    let eps = 1e-6;
+    let step = dir.mapv(|x| x * eps);
+    let plus = barrier_hess_diag(&(&beta + &step));
+    let minus = barrier_hess_diag(&(&beta - &step));
+    let fd = (&plus - &minus).mapv(|v| v / (2.0 * eps));
+
+    // Non-vacuity: a correct correction is materially nonzero on the constrained diagonal.
+    let max_abs = analytic.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    assert!(
+        max_abs > 1e-3,
+        "barrier correction must be materially nonzero; got {max_abs:.3e}"
+    );
+    for i in 0..3 {
+        for j in 0..3 {
+            assert!(
+                (analytic[[i, j]] - fd[[i, j]]).abs() <= 1e-5 * (1.0 + fd[[i, j]].abs()),
+                "barrier D_βH[−v_k] mismatch at ({i},{j}): analytic={:.8e} fd={:.8e}",
+                analytic[[i, j]],
+                fd[[i, j]]
+            );
+        }
+    }
+}
+
+/// FD gate for the base single-predictor GLM first-order curvature drift. The
+/// existing coverage only checks dense-vs-operator self-consistency (a shared
+/// mis-sign would pass); this pins the actual value against a finite difference
+/// of the true GLM Hessian `H(β) = Xᵀ diag(W(η)) X` (logistic: `W = μ(1−μ)`,
+/// `μ = σ(η)`, `η = Xβ`). The provider returns `D_β H[−v_k] = −Xᵀ diag(c ⊙ Xv_k) X`
+/// with `c = dW/dη = W·(1−2μ)`; the FD reference is built from `W` directly, so a
+/// dropped leading minus or a wrong `c` sign fails. This is also the term the
+/// live `FirthAwareGlmDerivatives` wraps (Firth = base − Jeffreys drift), so it
+/// covers the bulk of the Firth curvature path.
+#[test]
+pub(crate) fn single_predictor_glm_hessian_derivative_correction_matches_fd() {
+    let x = array![[1.0, 0.2], [-0.4, 1.1], [0.7, -0.8]];
+    let beta0 = array![0.35, -0.2];
+    let sigmoid = |z: f64| 1.0 / (1.0 + (-z).exp());
+
+    let eta = x.dot(&beta0);
+    let w: Array1<f64> = eta.mapv(|e| {
+        let m = sigmoid(e);
+        m * (1.0 - m)
+    });
+    let c: Array1<f64> = eta.mapv(|e| {
+        let m = sigmoid(e);
+        m * (1.0 - m) * (1.0 - 2.0 * m)
+    });
+
+    let provider = SinglePredictorGlmDerivatives {
+        c_array: c,
+        d_array: None,
+        hessian_weights: w,
+        x_transformed: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x.clone())),
+    };
+
+    let v_k = array![0.5, -0.3];
+    let analytic = provider
+        .hessian_derivative_correction(&v_k)
+        .expect("glm correction evaluates")
+        .expect("glm provider returns a correction");
+
+    // Independent FD of H(β) = Xᵀ diag(W(Xβ)) X along β̂_{ρk} = −v_k, assembled
+    // directly from W (no reuse of the provider's c-array path).
+    let h_at = |b: &Array1<f64>| -> Array2<f64> {
+        let eta_b = x.dot(b);
+        let mut h = Array2::<f64>::zeros((2, 2));
+        for r in 0..x.nrows() {
+            let m = sigmoid(eta_b[r]);
+            let wr = m * (1.0 - m);
+            for a in 0..2 {
+                for c2 in 0..2 {
+                    h[[a, c2]] += wr * x[[r, a]] * x[[r, c2]];
+                }
+            }
+        }
+        h
+    };
+    let dir = v_k.mapv(|z| -z);
+    let eps = 1e-6;
+    let step = dir.mapv(|z| z * eps);
+    let plus = h_at(&(&beta0 + &step));
+    let minus = h_at(&(&beta0 - &step));
+    let fd = (&plus - &minus).mapv(|z| z / (2.0 * eps));
+
+    let max_abs = analytic.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    assert!(
+        max_abs > 1e-4,
+        "glm correction must be materially nonzero; got {max_abs:.3e}"
+    );
+    for i in 0..2 {
+        for j in 0..2 {
+            assert!(
+                (analytic[[i, j]] - fd[[i, j]]).abs() <= 1e-5 * (1.0 + fd[[i, j]].abs()),
+                "glm D_βH[−v_k] mismatch at ({i},{j}): analytic={:.8e} fd={:.8e}",
+                analytic[[i, j]],
+                fd[[i, j]]
+            );
+        }
+    }
+}
