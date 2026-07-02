@@ -220,6 +220,14 @@ impl SaeManifoldTerm {
         atom.basis_second_jet = Some(new_evaluator);
         atom.smooth_penalty =
             transport_smooth_penalty_for_decoder(transport.view(), old_smooth_penalty.view())?;
+        // #2022 transport-peel (ADD form, no-refresh). The transported penalty
+        // above is decoder-magnitude-independent (T⁻ᵀ S_old T⁻¹), so under the
+        // quotient normalize the decoder into log_amplitude WITHOUT recomputing
+        // it. `atom`'s borrow ended at its last use above; re-index fresh.
+        if self.quotient_scale {
+            self.atoms[atom_idx]
+                .absorb_decoder_norm_into_log_amplitude_without_refresh(f64::MIN_POSITIVE);
+        }
         Ok(())
     }
 
@@ -612,6 +620,14 @@ impl SaeManifoldTerm {
             old_smooth_penalty.view(),
         )?;
         atom.chart_canonicalized = true;
+        // #2022 transport-peel (ADD form, no-refresh). Transported penalty is
+        // decoder-magnitude-independent; under the quotient normalize the decoder
+        // into log_amplitude WITHOUT recomputing it. `atom`'s borrow ended above;
+        // re-index self.atoms fresh.
+        if self.quotient_scale {
+            self.atoms[atom_idx]
+                .absorb_decoder_norm_into_log_amplitude_without_refresh(f64::MIN_POSITIVE);
+        }
         Ok(true)
     }
 
@@ -753,6 +769,14 @@ impl SaeManifoldTerm {
             old_smooth_penalty.view(),
         )?;
         atom.chart_canonicalized = true;
+        // #2022 transport-peel (ADD form, no-refresh). Transported penalty is
+        // decoder-magnitude-independent; under the quotient normalize the decoder
+        // into log_amplitude WITHOUT recomputing it. `atom`'s borrow ended above;
+        // re-index self.atoms fresh.
+        if self.quotient_scale {
+            self.atoms[atom_idx]
+                .absorb_decoder_norm_into_log_amplitude_without_refresh(f64::MIN_POSITIVE);
+        }
         Ok(true)
     }
 
@@ -839,6 +863,14 @@ impl SaeManifoldTerm {
             old_smooth_penalty.view(),
         )?;
         atom.chart_canonicalized = true;
+        // #2022 transport-peel (ADD form, no-refresh). Transported penalty is
+        // decoder-magnitude-independent; under the quotient normalize the decoder
+        // into log_amplitude WITHOUT recomputing it. `atom`'s borrow ended above;
+        // re-index self.atoms fresh.
+        if self.quotient_scale {
+            self.atoms[atom_idx]
+                .absorb_decoder_norm_into_log_amplitude_without_refresh(f64::MIN_POSITIVE);
+        }
         Ok(true)
     }
 
@@ -925,6 +957,14 @@ impl SaeManifoldTerm {
             old_smooth_penalty.view(),
         )?;
         atom.chart_canonicalized = true;
+        // #2022 transport-peel (ADD form, no-refresh). Transported penalty is
+        // decoder-magnitude-independent; under the quotient normalize the decoder
+        // into log_amplitude WITHOUT recomputing it. `atom`'s borrow ended above;
+        // re-index self.atoms fresh.
+        if self.quotient_scale {
+            self.atoms[atom_idx]
+                .absorb_decoder_norm_into_log_amplitude_without_refresh(f64::MIN_POSITIVE);
+        }
         Ok(true)
     }
 

@@ -1191,6 +1191,31 @@ impl SaeManifoldAtom {
         self.refresh_intrinsic_smooth_penalty();
     }
 
+    /// #2022 — like [`Self::absorb_decoder_norm_into_log_amplitude`] but SKIPS the
+    /// [`Self::refresh_intrinsic_smooth_penalty`] recompute, so a caller that has
+    /// already installed a specific `smooth_penalty` keeps it. Used at the
+    /// basis-change TRANSPORT / rank-reparam sites, whose penalty is set by
+    /// [`transport_smooth_penalty_for_decoder`](crate::manifold::outer_objective::transport_smooth_penalty_for_decoder)
+    /// = `T⁻ᵀ S_old T⁻¹` — a function of the basis transport and the OLD penalty
+    /// ONLY, independent of the decoder's magnitude/values — so normalizing the
+    /// decoder here cannot invalidate it, and refreshing would clobber it. A
+    /// decoder at/under `floor` (or non-finite norm) is left untouched.
+    pub fn absorb_decoder_norm_into_log_amplitude_without_refresh(&mut self, floor: f64) {
+        let norm = self
+            .decoder_coefficients
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        if !(norm.is_finite() && norm > floor) {
+            return;
+        }
+        self.log_amplitude += norm.ln();
+        self.decoder_coefficients.mapv_inplace(|v| v / norm);
+        // Deliberately NOT refreshing smooth_penalty — the caller's transported
+        // penalty is decoder-magnitude-independent and must survive the peel.
+    }
+
     /// Recompute the intrinsic (arc-length) roughness Gram
     /// [`Self::smooth_penalty`] from [`Self::smooth_penalty_raw`], the current
     /// basis Jacobian, and the current decoder coefficients (issue #673).

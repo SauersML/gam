@@ -944,4 +944,47 @@ mod step2_quotient_scale_tests {
         }
         assert!(checked >= 2, "must check at least two β entries; checked {checked}");
     }
+
+    /// #2022 transport-peel — the no-refresh peel normalizes the decoder into
+    /// log_amplitude while leaving `smooth_penalty` BYTE-IDENTICAL. This is what
+    /// makes it safe at the transport/reparam sites, whose transported penalty
+    /// (`T⁻ᵀ S_old T⁻¹`, decoder-magnitude-independent) must survive the peel.
+    #[test]
+    fn step2_without_refresh_peel_keeps_smooth_penalty() {
+        let (mut term, _target, _rho) = small_two_atom_periodic_term();
+        // Non-unit decoder so the peel does real work.
+        for v in term.atoms[0].decoder_coefficients.iter_mut() {
+            *v *= 3.0;
+        }
+        let penalty_before = term.atoms[0].smooth_penalty.clone();
+        let s_before = term.atoms[0].log_amplitude;
+        let norm_before = term.atoms[0]
+            .decoder_coefficients
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        term.atoms[0]
+            .absorb_decoder_norm_into_log_amplitude_without_refresh(f64::MIN_POSITIVE);
+        // smooth_penalty untouched (the refresh was skipped).
+        assert_eq!(
+            term.atoms[0].smooth_penalty, penalty_before,
+            "without_refresh peel must NOT change smooth_penalty"
+        );
+        // Decoder normalized; magnitude moved into log_amplitude.
+        let norm_after = term.atoms[0]
+            .decoder_coefficients
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        assert!(
+            (norm_after - 1.0).abs() <= 1e-9,
+            "‖B‖ must be 1 after peel; got {norm_after}"
+        );
+        assert!(
+            (term.atoms[0].log_amplitude - (s_before + norm_before.ln())).abs() <= 1e-9,
+            "log_amplitude must gain ln‖B‖"
+        );
+    }
 }
