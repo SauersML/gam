@@ -2135,24 +2135,11 @@ fn metric_provenance_label(
     }
 }
 
-/// #2021 (EXPERIMENT) — number of EXTRA whitened-residual refit passes to run
-/// after the iid pass-0 fit, read from the `GAM_SAE_STRUCTURED_PASSES` env
-/// lever. `0` (unset / default / unparsable) keeps the historical iid-only path
-/// bit-for-bit; the value is clamped to a small ceiling. Deliberately an
-/// unadvertised env gate so it carries zero FFI/Python-signature risk while the
-/// structured-residual outer alternation (#2021) is validated.
-///
-/// TODO(#2021): once the alternation proves out, promote this to a typed
-/// `structured_residual_passes: int = 0` pyfunction kwarg and delete the env
-/// lever — the project does not want permanent hidden env levers.
-fn sae_structured_residual_passes() -> usize {
-    const MAX_STRUCTURED_PASSES: usize = 4;
-    std::env::var("GAM_SAE_STRUCTURED_PASSES")
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .unwrap_or(0)
-        .min(MAX_STRUCTURED_PASSES)
-}
+/// #2021 — ceiling on the number of EXTRA whitened-residual refit passes the
+/// structured-residual outer alternation runs after the iid pass-0 fit. The
+/// caller-supplied `structured_residual_passes` kwarg is capped to this value so
+/// the alternation cost stays bounded regardless of the requested count.
+const MAX_STRUCTURED_PASSES: usize = 4;
 
 /// #2021 — fit the structured residual-covariance model on `term`'s
 /// post-dictionary residuals and return it (the driver then materializes the
@@ -2247,6 +2234,7 @@ fn sae_structured_residual_model(
     row_loss_weights = None,
     separation_barrier_strength_override = None,
     ibp_alpha_override = None,
+    structured_residual_passes = 0,
 ))]
 fn sae_manifold_fit<'py>(
     py: Python<'py>,
@@ -2293,6 +2281,9 @@ fn sae_manifold_fit<'py>(
     // atomic setter (or the compiled default). See `SaeManifoldTerm::set_fit_config`.
     separation_barrier_strength_override: Option<f64>,
     ibp_alpha_override: Option<f64>,
+    // #2021 — EXTRA whitened-residual refit passes for the structured-residual
+    // outer alternation. `0` (default) keeps the iid-only path bit-for-bit.
+    structured_residual_passes: usize,
 ) -> PyResult<Py<PyDict>> {
     // The precomputed-basis entry point carries no Duchon centers / kernel
     // metadata, so any basis kind whose refresh needs them cannot re-evaluate
@@ -2346,6 +2337,7 @@ fn sae_manifold_fit<'py>(
         row_w,
         separation_barrier_strength_override,
         ibp_alpha_override,
+        structured_residual_passes,
     )
 }
 
@@ -2404,6 +2396,12 @@ fn sae_manifold_fit_inner<'py>(
     // term so concurrent fits with different overrides never race a global atomic.
     separation_barrier_strength_override: Option<f64>,
     ibp_alpha_override: Option<f64>,
+    // #2021 — number of EXTRA whitened-residual refit passes to run after the iid
+    // pass-0 fit (the structured-residual outer alternation). `0` keeps the
+    // historical iid-only path bit-for-bit; larger values are clamped to
+    // `MAX_STRUCTURED_PASSES`. Only takes effect when no explicit metric (e.g. a
+    // WP-D `OutputFisher` gauge) was installed at pass 0.
+    structured_residual_passes: usize,
 ) -> PyResult<Py<PyDict>> {
     let analytic_penalties: Option<serde_json::Value> = match analytic_penalties {
         Some(s) => Some(serde_json::from_str(&s).map_err(serde_json_error_to_pyerr)?),
@@ -2915,9 +2913,9 @@ fn sae_manifold_fit_inner<'py>(
     let mut rho = fitted_result.rho;
     let mut loss = fitted_result.loss;
 
-    // #2021 (EXPERIMENT, env-gated) — structured-residual OUTER ALTERNATION.
-    // Pass 0 above is the iid fit (unchanged, bit-for-bit). When
-    // `GAM_SAE_STRUCTURED_PASSES > 0` AND no explicit metric was installed at
+    // #2021 — structured-residual OUTER ALTERNATION.
+    // Pass 0 above is the iid fit (unchanged, bit-for-bit). When the caller's
+    // `structured_residual_passes > 0` AND no explicit metric was installed at
     // pass 0 (a WP-D `OutputFisher` gauge lives in the SAME single metric slot
     // and must not be clobbered), run N extra passes: fit the whitened
     // residual-covariance model on the current fitted residuals, materialize the
@@ -2935,7 +2933,7 @@ fn sae_manifold_fit_inner<'py>(
     // γ_p = (p+1)/(N+1) ∈ (0,1) trusts the new estimate more each pass while
     // damping the early jump off the iid fit (γ is never 0 or 1, so every pass
     // builds a genuine WhitenedStructured blend).
-    let structured_passes = sae_structured_residual_passes();
+    let structured_passes = structured_residual_passes.min(MAX_STRUCTURED_PASSES);
     if structured_passes > 0 && metric_provenance == "Euclidean" {
         let mut prev_model: Option<gam::inference::residual_factor::StructuredResidualModel> =
             None;
@@ -4258,6 +4256,9 @@ fn sae_manifold_fit_ibp<'py>(
         // default), matching how every other override above is left `None` here.
         None,
         None,
+        // This convenience IBP entry point keeps the iid (Euclidean) fit — no
+        // structured-residual outer alternation.
+        0,
     )
 }
 
@@ -6147,6 +6148,7 @@ fn sae_build_atom_plans(
     row_loss_weights = None,
     separation_barrier_strength_override = None,
     ibp_alpha_override = None,
+    structured_residual_passes = 0,
 ))]
 fn sae_manifold_fit_minimal<'py>(
     py: Python<'py>,
@@ -6190,6 +6192,9 @@ fn sae_manifold_fit_minimal<'py>(
     // the high-level Python `sae_manifold_fit` facade routes through.
     separation_barrier_strength_override: Option<f64>,
     ibp_alpha_override: Option<f64>,
+    // #2021 — EXTRA whitened-residual refit passes for the structured-residual
+    // outer alternation. `0` (default) keeps the iid-only path bit-for-bit.
+    structured_residual_passes: usize,
 ) -> PyResult<Py<PyDict>> {
     // #1777 — accept both "threshold_gate" (primary) and legacy "jumprelu".
     let assignment_kind = canonicalize_assignment_kind(&assignment_kind).map_err(py_value_error)?;
@@ -6465,6 +6470,7 @@ fn sae_manifold_fit_minimal<'py>(
         row_w,
         separation_barrier_strength_override,
         ibp_alpha_override,
+        structured_residual_passes,
     )?;
     // #977 — the per-atom `atom_plans` are now emitted by `sae_manifold_fit_inner`
     // FROM THE POST-SEARCH dictionary (variable K), so OOS predict can rebuild the
