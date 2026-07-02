@@ -6353,11 +6353,59 @@ fn fit_score(fit: &UnifiedFitResult) -> f64 {
 /// trust-region solver retreats, rather than aborting the entire REML fit.
 ///
 /// A `BasisError` is exactly this class: it means "the basis/design cannot be
-/// built at this hyperparameter". Everything else (PIRLS divergence wired to a
-/// distinct variant, layout/topology invariants, over-parameterization) stays
-/// fatal so genuine bugs are never masked.
+/// built at this hyperparameter". The same retreat semantics also apply when a
+/// trial reaches the inner solve but produces a singular/unstable curvature:
+/// those cases are reported by the shared inner-solve retreat classifier, or
+/// by the final fit validator when an inference-only matrix derived from
+/// `H⁻¹` (not the fitted mean coefficients themselves) becomes non-finite.
+/// Everything else (layout/topology invariants, over-parameterization, and
+/// arbitrary invalid inputs) stays fatal so genuine bugs are never masked.
 fn is_recoverable_trial_point_error(err: &EstimationError) -> bool {
     matches!(err, EstimationError::BasisError(_))
+        || err.is_inner_solve_retreat()
+        || is_recoverable_fit_inference_finiteness_error(err)
+}
+
+fn is_recoverable_fit_inference_finiteness_error(err: &EstimationError) -> bool {
+    let EstimationError::InvalidInput(message) = err else {
+        return false;
+    };
+
+    message.contains("must be finite")
+        && [
+            "fit_result.beta_covariance_frequentist",
+            "fit_result.coefficient_influence",
+            "fit_result.weighted_gram",
+        ]
+        .iter()
+        .any(|field| message.contains(field))
+}
+
+#[cfg(test)]
+mod spatial_trial_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn nonfinite_frequentist_covariance_is_recoverable_trial_point() {
+        let err = EstimationError::InvalidInput(
+            "fit_result.beta_covariance_frequentist[0] must be finite, got NaN".to_string(),
+        );
+
+        assert!(
+            is_recoverable_trial_point_error(&err),
+            "singular trial-point curvature should make spatial κ retreat, not abort"
+        );
+    }
+
+    #[test]
+    fn arbitrary_invalid_input_remains_fatal_trial_point_error() {
+        let err = EstimationError::InvalidInput("outer rho bounds are invalid".to_string());
+
+        assert!(
+            !is_recoverable_trial_point_error(&err),
+            "the spatial κ recovery gate must not mask unrelated invalid inputs"
+        );
+    }
 }
 
 fn require_successful_spatial_optimization_result<T>(
