@@ -56,10 +56,14 @@ pub fn canonical_standard_fit_options(
         // works for every family (the `COV_MAX_P` diagonal fallback caps cost).
         compute_inference: true,
         // Formula/CLI fits are the interactive/default path: keep coefficient
-        // covariance and the smoothing correction, but do not run the optional
-        // live-rho posterior certificate/escalation, which can launch NUTS over
-        // rho and turn ordinary fits into sampler benchmarks. Lower-level
-        // callers that explicitly need the rho posterior opt in elsewhere.
+        // covariance and the smoothing correction, and emit the CHEAP Tier-0
+        // live-rho posterior certificate (a handful of outer-criterion
+        // evaluations), which the optimizer surfaces regardless of this flag
+        // whenever it is cheaply available (#1810). This flag only suppresses the
+        // EXPENSIVE escalation tiers (Tier-1 quadrature / Tier-2 NUTS over rho),
+        // which could otherwise launch NUTS and turn ordinary fits into sampler
+        // benchmarks. Lower-level callers that explicitly need the escalation opt
+        // in elsewhere (`skip_rho_posterior_inference: false`).
         skip_rho_posterior_inference: true,
         max_iter: config.outer_max_iter.unwrap_or(200),
         // Outer REML/LAML smoothing-selection tolerance. `1e-10` (effective

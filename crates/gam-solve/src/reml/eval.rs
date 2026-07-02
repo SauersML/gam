@@ -561,17 +561,24 @@ impl<'a> RemlState<'a> {
     /// criterion is infeasible at `ρ̂` — the diagnostic is simply absent, never
     /// an error.
     ///
-    /// When the certificate reads [`Escalate`], the escalation tiers (#938) run
-    /// HERE, against the same live objective — Tier 1 quadrature for `K ≤ 4`,
-    /// Tier 2 NUTS with the exact LAML `ρ`-gradient ([`Self::compute_gradient`])
-    /// for `K ≤ 16`, honest `Unavailable` beyond. Post-hoc escalation after the
-    /// `RemlState` is gone would need an owned rebuild recipe; running at the
-    /// live seam avoids that entirely.
+    /// The Tier-0 certificate itself is CHEAP — a handful (`M`) of outer-criterion
+    /// evaluations near `ρ̂` — so it is always produced when available. The
+    /// ESCALATION tiers are the expensive part and are gated by `allow_escalation`:
+    /// when the certificate reads [`Escalate`] AND `allow_escalation` is set, the
+    /// tiers (#938) run HERE, against the same live objective — Tier 1 quadrature
+    /// for `K ≤ 4`, Tier 2 NUTS with the exact LAML `ρ`-gradient
+    /// ([`Self::compute_gradient`]) for `K ≤ 16`, honest `Unavailable` beyond.
+    /// Post-hoc escalation after the `RemlState` is gone would need an owned
+    /// rebuild recipe; running at the live seam avoids that entirely. When
+    /// `allow_escalation` is `false` the returned escalation is always `None`, so
+    /// ordinary interactive formula/CLI fits emit the cheap certificate WITHOUT
+    /// ever turning into a NUTS-over-ρ sampler benchmark.
     ///
     /// [`Escalate`]: gam_problem::rho_posterior::RhoCertificate::Escalate
     pub(crate) fn rho_posterior_inference(
         &self,
         final_rho: &Array1<f64>,
+        allow_escalation: bool,
         n_samples: Option<usize>,
     ) -> (
         Option<gam_problem::rho_posterior::RhoPosteriorCertificate>,
@@ -619,7 +626,12 @@ impl<'a> RemlState<'a> {
             )
         });
         let escalation = match certificate.as_ref().map(|c| c.certificate) {
-            Some(RhoCertificate::Escalate) => self.without_alo_stabilization(|| {
+            // The certificate refuses to certify the plug-in, but escalation
+            // (Tier-1 quadrature / Tier-2 NUTS over ρ) is the expensive tier;
+            // only run it when the caller opts in. Interactive formula/CLI fits
+            // pass `allow_escalation = false`, so they surface the cheap Tier-0
+            // certificate while never launching the sampler.
+            Some(RhoCertificate::Escalate) if allow_escalation => self.without_alo_stabilization(|| {
                 Some(escalator.escalate_rho_posterior(
                     final_rho,
                     &outer_hessian,
