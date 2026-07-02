@@ -3212,7 +3212,12 @@ pub(crate) fn regular_product_grid(
 /// the [`crate::manifold::SphereChartEvaluator`] convention.
 pub(crate) fn sphere_latlon_grid(resolution: usize) -> Array2<f64> {
     use std::f64::consts::PI;
-    let r = resolution.max(2).min(22); // 22² = 484 ≤ SHAPE_BAND_MAX_POINTS.
+    // Per-axis cap derived from the shared point budget rather than a hardcoded
+    // literal (#2071): the largest r with r² ≤ SHAPE_BAND_MAX_POINTS. Equals 22
+    // at the current budget (22²=484≤512), but now tracks the budget if it
+    // changes instead of silently desyncing from the sibling grid arms.
+    let r_cap = SHAPE_BAND_MAX_POINTS.isqrt();
+    let r = resolution.max(2).min(r_cap);
     let mut grid = Array2::<f64>::zeros((r * r, 2));
     for i in 0..r {
         let lat = -PI / 2.0 + PI * (i as f64 + 0.5) / r as f64;
