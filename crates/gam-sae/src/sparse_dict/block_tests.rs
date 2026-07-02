@@ -148,6 +148,65 @@ fn gauge_invariant_selection_and_loss_under_block_rotation() {
         (loss0 - loss1).abs() <= 1.0e-4 * (1.0 + loss0.abs()),
         "loss changed under gauge rotation: {loss0} vs {loss1}"
     );
+
+    // The tied within-block code CO-ROTATES with the basis: w'_g = w_g Rᵀ
+    // (equivalently the column code z_g → R z_g), while its ℓ₂ norm — the gate —
+    // is unchanged. This pins the exact gauge action, not just norm invariance.
+    let w0g = w0.row(g_rot).to_owned();
+    let w1g = w1.row(g_rot).to_owned();
+    for i in 0..b {
+        let mut expect = 0.0f32;
+        for j in 0..b {
+            expect += r_mat[[i, j]] * w0g[j];
+        }
+        assert!(
+            (w1g[i] - expect).abs() <= 1.0e-4 * (1.0 + expect.abs()),
+            "within-block code must co-rotate as z_g -> R z_g under a basis rotation"
+        );
+    }
+    let n0: f32 = w0g.iter().map(|v| v * v).sum::<f32>().sqrt();
+    let n1: f32 = w1g.iter().map(|v| v * v).sum::<f32>().sqrt();
+    assert!(
+        (n0 - n1).abs() <= 1.0e-4 * (1.0 + n0),
+        "within-block code norm (the gate) must be rotation-invariant"
+    );
+}
+
+#[test]
+fn norm_changing_block_map_changes_selection_or_loss() {
+    // NEGATIVE CONTROL: the invariance is specifically to O(b), NOT to an arbitrary
+    // block map. A norm-changing (non-orthogonal) map of a SELECTED block's basis
+    // must change the selection or the loss — otherwise the gauge test above would
+    // pass vacuously (invariant to everything).
+    let (n_blocks, b, p) = (5usize, 2usize, 7usize);
+    let mut decoder = make_decoder(n_blocks, b, p, 2024);
+    let mut s = 13u64;
+    let row: Array1<f32> = (0..p).map(|_| lcg(&mut s)).collect();
+    let gamma = 1.3f32;
+    let k = 2usize;
+
+    let gates0 = block_gates(block_projections_row(row.view(), decoder.view(), n_blocks, b).view());
+    let sel0: Vec<u32> = route_row_blocks(&gates0, k).iter().map(|x| x.0).collect();
+    let loss0 = row_loss(row.view(), decoder.view(), &sel0, gamma, b);
+
+    // Scale a genuinely-selected block's basis by 2 (breaks D_g D_gᵀ = I_b).
+    let g = sel0[0] as usize;
+    for r in 0..b {
+        for c in 0..p {
+            decoder[[g * b + r, c]] *= 2.0;
+        }
+    }
+
+    let gates1 = block_gates(block_projections_row(row.view(), decoder.view(), n_blocks, b).view());
+    let sel1: Vec<u32> = route_row_blocks(&gates1, k).iter().map(|x| x.0).collect();
+    let loss1 = row_loss(row.view(), decoder.view(), &sel1, gamma, b);
+
+    let changed = sel0 != sel1 || (loss0 - loss1).abs() > 1.0e-3 * (1.0 + loss0.abs());
+    assert!(
+        changed,
+        "a norm-changing block map must change selection or loss — the O(b) gauge \
+         test must not be invariant to arbitrary maps (loss {loss0} vs {loss1})"
+    );
 }
 
 #[test]
