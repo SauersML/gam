@@ -2869,6 +2869,92 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
+    /// #2027 cold-start SEQUENTIAL CHART deflation — seed each atom's CHART *and*
+    /// decoder onto DISJOINT structure so a K≥2 fit recovers every planted factor,
+    /// not just the dominant one.
+    ///
+    /// [`Self::refit_decoder_sequential_deflation`] places disjoint DECODERS but
+    /// leaves every atom's COORDINATES at the shared PCA seed. When two atoms' seed
+    /// charts read the SAME dominant structure (empirically the whitened two-circle
+    /// case: both atoms' PCA-pair seeds land on the higher-variance circle) they
+    /// both fit that one factor and the weaker planted factor is never recovered —
+    /// a HIGH EV with NO structure separation (both decoders on the same output
+    /// channels). The decoder is only as expressive as the chart it rides.
+    ///
+    /// This re-seeds each atom's coordinates from the CURRENT residual's LEADING
+    /// structure before fitting its decoder and deflating: atom 0 takes the dominant
+    /// planted factor, atom 1 the dominant factor of what atom 0 left behind, and so
+    /// on — the block-nursery sequential-composition principle applied to the charts
+    /// themselves at cold-start entry. Each atom's chart is therefore aligned with a
+    /// DISTINCT factor, so its deflation decoder lands on that factor's channels and
+    /// the atoms separate. Uses only the production seeding primitive
+    /// (`sae_pca_seed_initial_coords`, one atom at a time on the residual) and the
+    /// same gated design / `quotient_scale` peel as the joint refit.
+    pub(crate) fn seed_cold_start_disjoint_charts(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+    ) -> Result<(), String> {
+        let n = self.n_obs();
+        let p = self.output_dim();
+        let k = self.k_atoms();
+        if n == 0 || k == 0 {
+            return Ok(());
+        }
+        let mut residual = target.to_owned();
+        for atom in 0..k {
+            // 1. Re-seed THIS atom's chart from the current residual's leading
+            //    structure (one-atom PCA seed on the residual left by prior atoms).
+            let kind = self.atoms[atom].basis_kind.clone();
+            let dim = self.atoms[atom].latent_dim;
+            let seeded = sae_pca_seed_initial_coords(
+                residual.view(),
+                std::slice::from_ref(&kind),
+                std::slice::from_ref(&dim),
+            )?;
+            let mut flat = Array1::<f64>::zeros(n * dim);
+            for row in 0..n {
+                for axis in 0..dim {
+                    flat[row * dim + axis] = seeded[[0, row, axis]];
+                }
+            }
+            self.assignment.coords[atom].set_flat(flat.view());
+            let coords = self.assignment.coords[atom].as_matrix();
+            self.atoms[atom].refresh_basis(coords.view())?;
+            // 2. Fit this atom's decoder to the residual on its fresh chart (gated
+            //    design `diag(a_·k)·Φ_k`), then deflate the residual by its fit.
+            let m = self.atoms[atom].basis_size();
+            let mut d = Array2::<f64>::zeros((n, m));
+            for row in 0..n {
+                let assignments = self.assignment.try_assignments_row_for_rho(row, rho)?;
+                let w = assignments[atom];
+                for col in 0..m {
+                    d[[row, col]] = w * self.atoms[atom].basis_values[[row, col]];
+                }
+            }
+            let beta = solve_design_least_squares(d.view(), residual.view())?;
+            if beta.dim() != (m, p) {
+                return Err(format!(
+                    "SaeManifoldTerm::seed_cold_start_disjoint_charts: atom {atom} beta shape {:?} != ({m}, {p})",
+                    beta.dim()
+                ));
+            }
+            let fit = d.dot(&beta);
+            residual = &residual - &fit;
+            for col in 0..m {
+                for out in 0..p {
+                    self.atoms[atom].decoder_coefficients[[col, out]] = beta[[col, out]];
+                }
+            }
+            self.atoms[atom].refresh_intrinsic_smooth_penalty();
+            if self.quotient_scale {
+                self.atoms[atom].log_amplitude = 0.0;
+                self.atoms[atom].absorb_decoder_norm_into_log_amplitude(f64::MIN_POSITIVE);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn apply_newton_step_impl(
         &mut self,
         delta_ext_coord: ArrayView1<'_, f64>,
@@ -3671,7 +3757,11 @@ impl SaeManifoldTerm {
             .fold(0.0_f64, f64::max)
             .sqrt();
         if !(max_decoder_norm > 0.0) {
-            self.refit_decoder_sequential_deflation(target, rho)?;
+            // Sequential CHART deflation (not just decoder deflation): re-seed each
+            // atom's coordinates from the residual left by prior atoms so the atoms
+            // align with DISTINCT planted factors and separate, rather than both
+            // fitting the dominant factor (high EV, no structure recovery).
+            self.seed_cold_start_disjoint_charts(target, rho)?;
         }
         // #1026 — keep the best real reconstruction basin found inside this
         // bounded inner solve. The co-collapse guard can reseed onto a high-EV
