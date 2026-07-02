@@ -2662,7 +2662,6 @@ fn scan_report_html(model: &FittedModel, scan: &ScanIntrospection) -> Result<Str
         converged: true,
         outer_gradient_norm: None,
         criterion_certificate: None,
-        smoothing_forensics: Vec::new(),
         edf_total: scan.edf,
         r_squared: None,
         coefficients: Vec::new(),
@@ -2734,7 +2733,6 @@ fn report_html_impl(model_bytes: &[u8]) -> Result<String, String> {
         converged: fit.pirls_status.is_converged(),
         outer_gradient_norm: fit.outer_gradient_norm,
         criterion_certificate: None,
-        smoothing_forensics: Vec::new(),
         edf_total: fit.edf_total().unwrap_or(0.0),
         r_squared: None,
         coefficients,
@@ -2994,6 +2992,57 @@ fn sae_jumprelu_row_value_grad<'py>(
         value.into_pyarray(py).unbind(),
         grad.into_pyarray(py).unbind(),
     ))
+}
+
+/// Batched sibling of [`sae_jumprelu_row_value_grad`]: the whole `(N, K)` gate
+/// value+grad in ONE FFI call, so `gamfit.torch`'s bounded jumprelu gate crosses
+/// the Python↔Rust boundary once per forward pass instead of once per row.
+///
+/// Returns `(a, da_dl)`, each `(N, K)`, where `a[i,k] = σ((l−θ)/τ)·1[l>θ]` and
+/// `da_dl[i,k] = σ'((l−θ)/τ)/τ` (straight-through, both sides of the jump);
+/// `∂a/∂θ = −da_dl` (torch negates and row-sums). Bit-identical to invoking
+/// `sae_jumprelu_row_value_grad` row-by-row — the shared Rust source of truth.
+#[pyfunction(signature = (logits, temperature, thresholds))]
+fn sae_jumprelu_batch_value_grad<'py>(
+    py: Python<'py>,
+    logits: PyReadonlyArray2<'py, f64>,
+    temperature: f64,
+    thresholds: PyReadonlyArray1<'py, f64>,
+) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
+    if !(temperature.is_finite() && temperature > 0.0) {
+        return Err(py_value_error(format!(
+            "sae_jumprelu_batch_value_grad: temperature must be finite and positive; got {temperature}"
+        )));
+    }
+    let logits_view = logits.as_array();
+    let thresholds_view = thresholds.as_array();
+    let (_n, k) = logits_view.dim();
+    if k != thresholds_view.len() {
+        return Err(py_value_error(format!(
+            "sae_jumprelu_batch_value_grad: thresholds length {} does not match logits columns {k}",
+            thresholds_view.len()
+        )));
+    }
+    for ((row, col), &v) in logits_view.indexed_iter() {
+        if !v.is_finite() {
+            return Err(py_value_error(format!(
+                "sae_jumprelu_batch_value_grad: non-finite logit at row {row} atom {col}: {v}"
+            )));
+        }
+    }
+    for (col, &v) in thresholds_view.iter().enumerate() {
+        if !v.is_finite() {
+            return Err(py_value_error(format!(
+                "sae_jumprelu_batch_value_grad: non-finite threshold at atom {col}: {v}"
+            )));
+        }
+    }
+    let (value, grad) = gam::terms::sae::assignment::jumprelu_batch_value_grad(
+        logits_view.view(),
+        temperature,
+        thresholds_view.view(),
+    );
+    Ok((value.into_pyarray(py).unbind(), grad.into_pyarray(py).unbind()))
 }
 
 #[pyfunction(signature = (
