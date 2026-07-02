@@ -14,8 +14,10 @@
 //! DECLINES (`GpuRequiresDenseSystem`) so the host routes to the CPU lane that
 //! consumes the matrix-free operators.
 
-use crate::arrow_schur::ArrowSchurSystem;
+use crate::arrow_schur::{ArrowSchurSystem, DensePenaltyOp};
 use crate::gpu_kernels::arrow_schur::{ArrowSchurGpuFailure, solve_arrow_newton_step};
+use ndarray::Array2;
+use std::sync::Arc;
 
 /// An absent dense `H_ββ` (shape `≠ (k, k)`) with NO matrix-free operators must
 /// DECLINE with `GpuRequiresDenseSystem`, never `SchurFactorFailed`. Both matvec
@@ -76,5 +78,57 @@ fn present_dense_beta_block_is_not_declined_as_absent() {
             "a system WITH a dense (k,k) H_ββ must not be declined as \
              dense-block-absent"
         );
+    }
+}
+
+/// The subtle correctness case the shape gate alone does NOT catch: a system
+/// that carries an authoritative matrix-free `penalty_op` but whose dense
+/// `(k, k)` `hbb` was NOT reclaimed to a `0×0` workspace (a stale-but-present
+/// block). Such a system passes the `hbb.dim() == (k, k)` shape gate, so without
+/// a dedicated `penalty_op` guard the device path would proceed and compute the
+/// WRONG Newton step from the stale dense curvature instead of the operator's.
+/// The entry must DECLINE (`GpuRequiresDenseSystem`) so the host routes to the
+/// CPU matrix-free lane. No matvec operators are installed (both flags false),
+/// mirroring the frames-engaged SAE assembly that installs `penalty_op` alone.
+#[test]
+fn present_but_stale_hbb_with_penalty_op_declines_not_wrong_step() {
+    let (n, d, k) = (4usize, 2usize, 8usize);
+    // Start from a well-formed dense system (present `(k, k)` `hbb`, no matvecs,
+    // no `penalty_op`) then install an authoritative `penalty_op`, leaving the
+    // now-stale dense block in place. This is the shape the shape gate misses.
+    let mut sys = ArrowSchurSystem::new(n, d, k);
+    sys.penalty_op = Some(Arc::new(DensePenaltyOp(Array2::<f64>::eye(k))));
+    assert_eq!(
+        sys.hbb.dim(),
+        (k, k),
+        "fixture must keep the STALE dense (k,k) block so the shape gate is bypassed"
+    );
+    assert!(
+        sys.hbb_matvec.is_none() && sys.htbeta_matvec.is_none(),
+        "fixture must install penalty_op ALONE (no matvec shadow) to isolate the guard"
+    );
+
+    match solve_arrow_newton_step(&sys, 1e-6, 1e-6) {
+        Err(ArrowSchurGpuFailure::GpuRequiresDenseSystem {
+            had_hbb_matvec,
+            had_htbeta_matvec,
+        }) => {
+            assert!(
+                !had_hbb_matvec && !had_htbeta_matvec,
+                "penalty_op is installed alone, so neither matvec flag should be \
+                 set; got hbb={had_hbb_matvec} htbeta={had_htbeta_matvec}"
+            );
+        }
+        Err(ArrowSchurGpuFailure::SchurFactorFailed { reason }) => panic!(
+            "a penalty_op system must DECLINE, not report a numerical Schur \
+             failure; got reason={reason:?}"
+        ),
+        Err(other) => panic!(
+            "a penalty_op system must decline with GpuRequiresDenseSystem; got {other:?}"
+        ),
+        Ok(_) => panic!(
+            "a penalty_op system carries stale dense curvature — the device must \
+             NOT proceed to compute a step from it"
+        ),
     }
 }

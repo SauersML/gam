@@ -203,6 +203,29 @@ pub fn solve_arrow_newton_step(
         });
     }
 
+    // A `penalty_op` is the AUTHORITATIVE β-curvature source whenever it is
+    // installed: assembly bypasses the dense `hbb` accumulator (and, for
+    // frames-engaged SAE systems, reclaims it to a 0×0 workspace), so whatever
+    // `hbb` survives is STALE relative to the operator. The dense device Schur
+    // path reads ONLY `hbb`, so it must decline here — BEFORE the shape gate
+    // below — even when a stale `(k, k)` `hbb` would pass that gate: proceeding
+    // would silently compute the WRONG Newton step from stale curvature instead
+    // of routing to the CPU matrix-free lane (which reads `penalty_op`) that
+    // returns the correct one. The production caller `try_device_arrow_direct`
+    // already short-circuits this shape, but enforcing it at the entry keeps
+    // EVERY caller covered — the resident / reupload harnesses and any future
+    // direct caller — so no path can reach the device solve with a stale dense
+    // block. Both matvec flags are false here: control only reaches this point
+    // when neither matrix-free operator is installed (returned above), and the
+    // frames-engaged path installs `penalty_op` with no `hbb_matvec` /
+    // `htbeta_matvec`.
+    if sys.penalty_op.is_some() {
+        return Err(ArrowSchurGpuFailure::GpuRequiresDenseSystem {
+            had_hbb_matvec: false,
+            had_htbeta_matvec: false,
+        });
+    }
+
     if sys.hbb.dim() != (k, k) {
         // The dense (K×K) H_ββ block is absent (e.g. an SAE-manifold system
         // whose β-curvature is carried by a matrix-free `penalty_op` /
