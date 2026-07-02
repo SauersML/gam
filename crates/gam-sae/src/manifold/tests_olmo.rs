@@ -665,32 +665,17 @@ pub(crate) fn fast_encode_matches_per_row_warm_start() {
         .expect("batched fast encode runs");
 
     let mut max_diff = 0.0_f64;
-    let mut ndiff = 0usize;
     for row in 0..n {
         assert_eq!(
             fast_valid[row], ref_valid[row],
             "valid-mask mismatch at row {row} (routing/predictor disagreement)"
         );
         if ref_valid[row] {
-            let mut rowmax = 0.0_f64;
             for c in 0..atom.latent_dim {
-                rowmax = rowmax.max((fast_coords[[row, c]] - ref_coords[[row, c]]).abs());
+                max_diff = max_diff.max((fast_coords[[row, c]] - ref_coords[[row, c]]).abs());
             }
-            if rowmax > 1e-9 {
-                ndiff += 1;
-                if ndiff <= 8 {
-                    let (ci, cd) =
-                        crate::encode::nearest_chart(&atlas.atoms[0], z.row(row), amps[row])
-                            .unwrap();
-                    eprintln!(
-                        "DBG row {row}: rowmax={rowmax:.4e} nearest_chart cidx={ci} dist={cd:.6e}"
-                    );
-                }
-            }
-            max_diff = max_diff.max(rowmax);
         }
     }
-    eprintln!("DBG ndiff(>1e-9)={ndiff} of {n} valid rows");
     assert!(
         max_diff < 1.0e-12,
         "batched fast-encode must match the per-row warm-start to 1e-12 (same affine \

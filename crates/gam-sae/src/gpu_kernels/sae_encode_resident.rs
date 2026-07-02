@@ -8,8 +8,9 @@
 //!   2. **warm-starts** each candidate from that chart's distilled IFT affine
 //!      predictor `t̂ = t_c + (1/z)·A₁·(x − z·m₁)`,
 //!   3. runs the **per-row latent-coordinate Newton** solve inside the
-//!      Kantorovich basin: at each iterate it forms the FULL Hessian
-//!      `H = JₘᵀJₘ + r·∂²m + ridge·I`, takes the Newton step `δ = −H⁻¹g`, and
+//!      Kantorovich basin: at each iterate it forms the FULL, TRUE Hessian
+//!      `H = JₘᵀJₘ + r·∂²m` (NO Levenberg ridge — the certificate must see the
+//!      genuine field, F2), takes the Newton step `δ = −H⁻¹g`, and
 //!      evaluates the certificate `h = β·η·L` (`β = 1/λ_min(H)`, `η = ‖δ‖`),
 //!      first navigating into the basin (`h ≤ ½`) then refining `newton_steps`,
 //!   4. **assigns** the row to the lowest-reconstruction-error CERTIFIED
@@ -77,8 +78,6 @@ pub struct EncodeAtomDevice {
     pub topk: usize,
     /// Online Newton refinement steps after a certified landing.
     pub newton_steps: usize,
-    /// Levenberg ridge added to the per-row Hessian diagonal.
-    pub ridge: f64,
     /// Monomial exponents, row-major `exponents[col*d + axis]`, length `m*d`.
     pub exponents: Vec<i32>,
     /// Decoder `B`, row-major `decoder[basis*p + out]`, length `m*p`.
@@ -191,7 +190,6 @@ impl EncodeAtomDevice {
             p,
             topk: crate::encode::CERTIFIED_ROUTING_TOPK,
             newton_steps: config.newton_steps,
-            ridge: config.ridge,
             exponents,
             decoder,
             charts,
@@ -353,10 +351,13 @@ struct EvaluatedBasis<'a> {
     hess: &'a [f64],
 }
 
-/// Gradient `g` and FULL Hessian `H` (+ ridge) of the encode objective at `t`.
+/// Gradient `g` and FULL, TRUE Hessian `H` of the encode objective at `t`.
 /// Mirror of [`crate::encode::encode_grad_hess`]:
-///   `g[a] = Jₘ[a]·r`,  `H[a,b] = Jₘ[a]·Jₘ[b] + z·Σ ∂²Φ·(r·B) + ridge·δ_ab`,
-/// with `m = z·BᵀΦ`, `r = m − x`, `Jₘ = z·BᵀJ_Φ`. For the monomial family the
+///   `g[a] = Jₘ[a]·r`,  `H[a,b] = Jₘ[a]·Jₘ[b] + z·Σ ∂²Φ·(r·B)`,
+/// with `m = z·BᵀΦ`, `r = m − x`, `Jₘ = z·BᵀJ_Φ`. NO Levenberg ridge is added:
+/// the certificate must see the genuine field (F2), exactly as production's
+/// `encode_grad_hess` (a ridged `H + λI` would falsely certify a singular,
+/// non-isolated root). For the monomial family the
 /// second jet always exists, so this never returns "no certificate".
 fn encode_grad_hess(
     dev: &EncodeAtomDevice,
@@ -424,9 +425,7 @@ fn encode_grad_hess(
             h[a * d + b] = hab;
         }
     }
-    for a in 0..d {
-        h[a * d + a] += dev.ridge;
-    }
+    // NO ridge: the certificate uses the TRUE Hessian (F2). See the doc above.
 }
 
 /// Cyclic Jacobi symmetric eigensolver for a `d×d` matrix (row-major, `d ≤ 8`).
@@ -621,7 +620,8 @@ fn in_chart(t: &[f64], center: &[f64], radius: f64) -> bool {
 /// [`crate::encode::certify_with_basin_warmup`] composed with
 /// `refine_certified_start`: navigate into the `h ≤ ½` basin (staying in-chart,
 /// requiring `h` to contract), then take `newton_steps` refine steps that must
-/// all stay certified. Returns `(coord, landing_cert)` or `None`.
+/// all stay certified. Returns `(coord, final_cert)` — the certificate at the
+/// REFINED landing coordinate (F5) — or `None`.
 fn certify_with_basin_warmup(
     dev: &EncodeAtomDevice,
     mut t: Vec<f64>,
@@ -659,7 +659,15 @@ fn certify_with_basin_warmup(
     // Mirror production's convergence early-exit: once the pending Newton step is
     // below the coordinate ULP scale the certified root is reached and further steps
     // only re-accumulate round-off (keeps device parity with the encode.rs fold).
-    let landing = cert;
+    //
+    // F5: return the certificate evaluated AT the refined landing coordinate
+    // (`final_cert`), not the pre-refinement basin-exit cert. `final_cert` starts as
+    // the basin-exit cert and is updated to each certified refine iterate's cert —
+    // exactly production's `refine_certified_start` (the returned β/η/h describe the
+    // coordinate actually returned). The old code returned the basin-exit `landing`,
+    // whose Kantorovich root-radius overstates the refined point's distance to the
+    // root — the source of the emulator↔production `h`-parity gap.
+    let mut final_cert = cert;
     for _ in 0..dev.newton_steps {
         let dnorm = delta.iter().map(|v| v * v).sum::<f64>().sqrt();
         let tnorm = t.iter().map(|v| v * v).sum::<f64>().sqrt();
@@ -673,9 +681,10 @@ fn certify_with_basin_warmup(
         if !nc.certified() {
             return None;
         }
+        final_cert = nc;
         delta = nd;
     }
-    Some((t, landing))
+    Some((t, final_cert))
 }
 
 /// Distilled affine warm start `t̂ = t_c + (1/z)·A₁·(x − z·m₁)`. Mirror of
@@ -876,7 +885,7 @@ __device__ void recon_amp1(const double* dec, const double* phi, double* out){
     for(int c=0;c<PP;++c) out[c]+=pv*dec[b*PP+c]; }
 }
 
-// grad g[D] and full Hessian h[D*D] (+ridge). Mirror of encode_grad_hess.
+// grad g[D] and full, TRUE Hessian h[D*D] (NO ridge, F2). Mirror of encode_grad_hess.
 __device__ void grad_hess(const double* dec, const double* t, const double* x, double amp,
                           const double* phi, const double* jet, const double* hess,
                           double* g, double* h){
@@ -899,7 +908,7 @@ __device__ void grad_hess(const double* dec, const double* t, const double* x, d
       h[a*DD+b]=hab+curv;
     }
   }
-  for(int a=0;a<DD;++a) h[a*DD+a]+=RIDGE;
+  // NO ridge: the certificate uses the TRUE Hessian (F2).
 }
 
 // Cyclic Jacobi eigensolver (mirror of jacobi_eigh); vecs columns: vecs[col*D+row].
@@ -985,7 +994,12 @@ __device__ int certify_basin(const int* exps, const double* dec,
     row_certificate(exps, dec, t, x, amp, L, &h, &beta, &eta, delta);
     if(!(isfinite(h)) || h>=prev_h) return 0;
   }
-  double landing = h;
+  // F5: refine, then report the certificate `h` at the REFINED landing coordinate
+  // (mirror production `refine_certified_start`'s `final_cert`), NOT the pre-refine
+  // basin-exit `h`. `row_certificate` mutates `h` in place at each certified refine
+  // iterate, so after the loop `h` already holds the final refined certificate
+  // (or the basin-exit `h` if convergence broke before any refine step) — exactly
+  // production's `final_cert`.
   for(int s=0;s<NEWTON;++s){
     // convergence early-exit (mirror production refine_certified_start).
     double dnorm=0.0, tnorm=0.0;
@@ -996,7 +1010,7 @@ __device__ int certify_basin(const int* exps, const double* dec,
     if(!(isfinite(h) && h<=KANTOROVICH)) return 0;
   }
   for(int i=0;i<DD;++i) coord_out[i]=t[i];
-  *landing_h=landing;
+  *landing_h=h;
   return 1;
 }
 
@@ -1095,7 +1109,7 @@ extern "C" __global__ void sae_certified_encode(
 }
 "#;
 
-/// Build the full NVRTC source for one `(d, m, p, topk, newton, ridge)`
+/// Build the full NVRTC source for one `(d, m, p, topk, newton)`
 /// instantiation, prepending the `#define`s so the compile is a pure
 /// `compile_ptx_arch` matching `sae_rowjet` / `arrow_schur_nvrtc`.
 #[cfg(target_os = "linux")]
@@ -1103,14 +1117,13 @@ extern "C" __global__ void sae_certified_encode(
 pub fn encode_kernel_source(dev: &EncodeAtomDevice) -> String {
     format!(
         "#define DD {}\n#define MM {}\n#define PP {}\n#define TOPK {}\n#define NEWTON {}\n\
-         #define RIDGE ({:e})\n#define GMIN_FLOOR ({:e})\n#define REFINE_EPS ({:e})\n\
+         #define GMIN_FLOOR ({:e})\n#define REFINE_EPS ({:e})\n\
          {ENCODE_KERNEL_SOURCE}",
         dev.d,
         dev.m,
         dev.p,
         dev.topk,
         dev.newton_steps,
-        dev.ridge,
         crate::encode::CERTIFIED_GLOBAL_MIN_RECON_FLOOR,
         crate::encode::NEWTON_REFINE_CONVERGED_EPS
     )
@@ -1298,8 +1311,8 @@ mod device {
 
     fn module_for(b: &Backend, dev: &EncodeAtomDevice) -> Result<Arc<CudaModule>, GpuError> {
         let key = format!(
-            "{}-{}-{}-{}-{}-{:e}",
-            dev.d, dev.m, dev.p, dev.topk, dev.newton_steps, dev.ridge
+            "{}-{}-{}-{}-{}",
+            dev.d, dev.m, dev.p, dev.topk, dev.newton_steps
         );
         if let Ok(guard) = b.modules.lock() {
             if let Some(m) = guard.get(&key) {

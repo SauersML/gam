@@ -2308,17 +2308,37 @@ impl SaeManifoldTerm {
                 target,
                 dictionary_rank,
             );
-            // #2082 — the reseed fires on EITHER degeneracy mode: the decoders have
-            // VANISHED together (EV at the null floor AND output co-vanished), OR the
-            // atoms have STRUCTURALLY collapsed onto a shared output subspace (high EV,
-            // no structure — `structural_coherence_collapse_detected` above its derived
-            // random-subspace null). A well-separated dictionary passes both and
-            // returns here, so healthy fits are untouched; the guard tests (distinct
-            // atoms) never trip the structural arm.
-            let ev_degenerate =
-                ev.is_finite() && ev <= ev_floor && out_energy_ratio <= ev_floor;
-            let structural_collapse = self.structural_coherence_collapse_detected()?.is_some();
-            if !(ev_degenerate || structural_collapse) {
+            // The reseed fires when the decoders have VANISHED together (EV at the
+            // signal-free null floor AND the output co-vanished). #2082 note: an
+            // additional STRUCTURAL trigger (`structural_coherence_collapse_detected`,
+            // for the "high EV, no structure" mode) was trialed here but its derived
+            // Wachter null bar false-positives on HEALTHY correlated K≥2 fits — atoms
+            // that legitimately share some output span but each carry real structure —
+            // and reseeding them mid-fit regressed `manifold_beats_linear_joint_
+            // streaming_1026` and `planted_circle_multi_atom_jumprelu_clears_startup_
+            // validation_1782`. Distinguishing "merged" from "merely correlated" needs
+            // more than coherence (it depends on what the DATA needs), so the detector
+            // is left as a callable diagnostic for the evidence-gated structure search
+            // to consume, NOT an inline reseed trigger. The #2027 fix (entry-placement
+            // seeding) already resolves the high-EV-no-structure mode at its source.
+            //
+            // #2082 telemetry: surface the "high EV, no structure" mode when it appears
+            // — atoms structurally collapsed onto a shared output subspace while the
+            // reconstruction is NOT decoder-degenerate (EV above the null floor). This
+            // is diagnostic ONLY (no state change), so healthy fits are byte-unchanged;
+            // it lets the structure search / operator see the mode the two-width test
+            // catches without the false-positive reseed that regressed live fits.
+            let ev_degenerate = ev.is_finite() && ev <= ev_floor && out_energy_ratio <= ev_floor;
+            if !ev_degenerate
+                && let Some((j, kk, coherence)) = self.structural_coherence_collapse_detected()?
+            {
+                log::warn!(
+                    "SaeManifoldTerm: structural coherence collapse — atoms ({j}, {kk}) decode a \
+                     shared output subspace (μ̂={coherence:.4} above the derived random-subspace \
+                     null) at healthy EV={ev:.4}; diagnostic only, deferred to the structure search"
+                );
+            }
+            if !ev_degenerate {
                 return Ok(());
             }
             // #1026 keep-best multi-start: the current (pre-reseed) state is a

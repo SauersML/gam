@@ -2198,29 +2198,43 @@ impl EncodeAtlas {
         }
         // Per-chart routing key: route_idx[row] = argmin_c ‖x_row − z_row·r_c‖²
         // (F1: the TRUE objective at the row's amplitude `z_row`, where `r_c` is
-        // the amplitude-1 center reconstruction). Expanding,
-        // ‖x − z·r‖² = ‖x‖² − 2z·(x·r) + z²‖r‖²; the ‖x‖² term is chart-constant
-        // so the argmin uses S = X·recon_centersᵀ and the per-chart ‖r‖²:
-        // dist_c = z²·‖r_c‖² − 2z·(x·r_c). First chart wins on a tie (strict `<`),
-        // matching `nearest_chart`. A non-finite amplitude routes to chart 0 (moot
-        // — the predictor below skips the row anyway).
+        // the amplitude-1 center reconstruction). First chart wins on a tie (strict
+        // `<`), matching `nearest_chart`. A non-finite amplitude routes to chart 0
+        // (moot — the predictor below skips the row anyway).
+        //
+        // Score the DIRECT squared distance `Σ_j (z·r_cj − x_j)²`, accumulated in
+        // the same element order as the per-row `nearest_chart`, NOT the algebraic
+        // expansion `z²‖r_c‖² − 2z·(x·r_c)`. The two are equal in exact arithmetic,
+        // but the expansion subtracts two O(‖x‖²) quantities and loses ~‖x‖²·ε of
+        // precision to cancellation — enough to FLIP the argmin between two charts
+        // whose reconstructions coincide to rounding (e.g. period-wrapped torus-seam
+        // charts, whose latent centers differ by a full period yet reconstruct to
+        // within 1e-14). On such a near-tie the expansion and `nearest_chart`
+        // disagree, and the two seam charts predict coords a full period apart — so
+        // the batched fast-encode would diverge from the per-row warm-start it must
+        // reproduce bit-for-bit (the `fast_encode_matches_per_row_warm_start`
+        // contract). Computing the same direct distance in the same order keeps this
+        // path byte-identical to `nearest_chart`, so routing (and the tie-break)
+        // agrees on every row. `recon_centers` is still the cached offline
+        // `m₁(t_c)` — no basis re-evaluation, which was the fast path's real cost.
         let route_idx: Vec<usize> = if valid_charts.len() == 1 {
             vec![0usize; n]
         } else {
-            let s = x.dot(&recon_centers.t()); // (n × C)
-            let r_sq: Vec<f64> = (0..valid_charts.len())
-                .map(|c| recon_centers.row(c).dot(&recon_centers.row(c)))
-                .collect();
             (0..n)
                 .map(|row| {
                     let z = amplitudes[row];
                     if !z.is_finite() {
                         return 0usize;
                     }
+                    let x_row = x.row(row);
                     let mut best_c = 0usize;
                     let mut best_d = f64::INFINITY;
                     for c in 0..valid_charts.len() {
-                        let dist = z * z * r_sq[c] - 2.0 * z * s[[row, c]];
+                        let mut dist = 0.0;
+                        for (r, xv) in recon_centers.row(c).iter().zip(x_row.iter()) {
+                            let diff = z * r - xv;
+                            dist += diff * diff;
+                        }
                         if dist < best_d {
                             best_d = dist;
                             best_c = c;
@@ -2265,39 +2279,6 @@ impl EncodeAtlas {
             .collect();
 
         for row in 0..n {
-            if std::env::var("DBG_ROUTE").is_ok() && row == 3 {
-                let nc = nearest_chart(atom_atlas, x.row(row), amplitudes[row]);
-                let fast_chart = valid_charts[route_idx[row]];
-                let nci = nc.unwrap().0;
-                // map full-chart index -> valid index
-                let vpos = |full: usize| valid_charts.iter().position(|&c| c == full);
-                let vi_nc = vpos(nci).unwrap();
-                let vi_fast = route_idx[row];
-                let dfast_route =
-                    |c: usize| amplitudes[row] * amplitudes[row] * recon_centers.row(c).dot(&recon_centers.row(c))
-                        - 2.0 * amplitudes[row] * x.row(row).dot(&recon_centers.row(c));
-                eprintln!(
-                    "DBGF row3: nc_full={nci} nc_valid={vi_nc} routeDist(nc)={:.6} | fast_full={fast_chart} fast_valid={vi_fast} routeDist(fast)={:.6}",
-                    dfast_route(vi_nc),
-                    dfast_route(vi_fast),
-                );
-                // Now recompute nearest_chart-style seq dist for both
-                let seq = |c_full: usize| {
-                    let ch = &atom_atlas.charts[c_full];
-                    let mut d = 0.0;
-                    for (r, xv) in ch.recon_center.iter().zip(x.row(row).iter()) {
-                        let diff = amplitudes[row] * r - xv;
-                        d += diff * diff;
-                    }
-                    d
-                };
-                eprintln!(
-                    "DBGF row3 seqDist: nc_full={nci} -> {:.6} | fast_full={fast_chart} -> {:.6} | certR nc={} fast={}",
-                    seq(nci), seq(fast_chart),
-                    atom_atlas.charts[nci].certified_radius,
-                    atom_atlas.charts[fast_chart].certified_radius,
-                );
-            }
             let Some(pred) = predictors[route_idx[row]].as_ref() else {
                 continue;
             };
