@@ -1,3 +1,131 @@
+## v0.3.145 — gam 0.3.145 / gamfit 0.1.247 (2026-07-02)
+
+Correctness release on top of 0.3.144. The headline is a prior-weights
+effective-sample-size cluster that makes zero-weight and zero-`by` rows exactly
+inert in Gaussian REML, plus mgcv-style automatic Tweedie variance-power
+estimation for a bare `family="tweedie"`. Alongside are a multinomial-Firth
+log-determinant consistency fix, a binomial location-scale predict-noise repair,
+a Duchon well-posedness auto-raise, and constrained-REML backward/forward
+corrections. This cut also removes leftover FD-audit debug scaffolding from the
+κ-optimization path and hardens the (experimental, default-off) SAE dictionary
+diff so it can no longer report "no differences" when atoms were added or
+removed.
+
+### Families & responses
+- **Automatic Tweedie variance power for bare `family="tweedie"` (#2026).**
+  Mirroring mgcv's `tw()`, a bare `family="tweedie"`/`"tw"` (CLI `--family
+  tweedie`, or a formula family that names no explicit power) now estimates the
+  variance power `p ∈ (1, 2)` by profile likelihood before the reported fit — a
+  coarse grid over the open interval refined by golden-section search, profiling
+  the dispersion out per node with the solver's own prior-weighted Pearson
+  estimator and scoring the fully-normalized saddlepoint log-likelihood
+  (comparable across `p`). Previously a bare Tweedie silently used a fixed
+  `p = 1.5`, miscalibrating observation intervals on data whose true power was
+  not 1.5. An explicit `tweedie(1.6)` / `tweedie(p=1.6)` still pins `p` exactly.
+- **Weighted replicate frames keep their weight column (#2033).** Regression of
+  #2025: `Model.sample_replicates` narrowed the frame to the required prediction
+  columns + response before resolving per-row weights, so every weighted model
+  raised `weights column '…' not found in data`. The weight column is now part of
+  the consumable-column set (so it survives projection), and the replicate path
+  degrades to unit weights when the caller frame genuinely omits it instead of
+  erroring. Ordinary predict is unaffected.
+
+### REML / prior weights
+- **Zero-`by` rows are inert in Gaussian REML (#2031).** `by` was applied only
+  as a design-column gate, so a `by=0` row's response still entered the response
+  energy `Σ w·y²` and the residual degrees of freedom `ν`, leaking into `σ²`,
+  `λ`, and — through `λ` — the coefficients. The `by` gate is now folded into the
+  REML row weights (`w_eff = w·[by≠0]`) across every forward/backward FFI path, so
+  a `by=0` row is a complete no-op. A fit whose `by` is entirely nonzero stays
+  byte-identical to manually gating the design.
+- **Residual DoF uses the effective sample size (#2032).** Zero prior-weight
+  rows (the universal "excluded / infinite-variance" convention) no longer count
+  toward `ν = n − nullity`. `ν` is now built from the number of strictly
+  positive-weight rows everywhere the REML score, `σ²`, `λ`, `edf`, and the
+  adjoint are computed, so a `weights=0` row is exactly equivalent to omitting it.
+  When every weight is positive this is a strict no-op.
+- **Constrained REML forward/backward (Rust CI / Python API).** The constrained
+  forward now returns the closed-form Gaussian REML solve whenever the optimum is
+  interior — both when no inequality system is supplied *and* when a system is
+  present but the unconstrained optimum is already strictly feasible (every
+  `aᵢ·β̂ > bᵢ`, the exact negation of the active-set binding test). By the KKT
+  conditions an interior certificate is the unconstrained problem, so this makes
+  a non-binding constraint agree bit-for-bit with the unconstrained
+  `gaussian_reml_fit` and with the interior-cert backward (which already
+  differentiates that closed form) instead of settling on a slightly different
+  PIRLS smoothing parameter. Binding (shape-constrained) fits are unchanged. The
+  backward's zero-bound guard is additionally scoped to the *active* face, so an
+  interior certificate carrying a non-zero bound on a never-binding slack
+  constraint (e.g. `0·β ≥ −1`) flows through the correct full-space envelope VJP
+  instead of being rejected up front.
+
+### Inference & prediction
+- **Multinomial-Firth log-determinant consistency (#1854/#1395).** The
+  small-system `BlockCoupledOperator` route eigendecomposes via
+  `eigh(Side::Lower)`, which assumes a symmetric input; on the near-separating
+  Firth path the divided-difference curvature carries an `O(1e10)` scale, so
+  reduction-order floating-point asymmetry produced a materially different
+  spectrum and log-determinant than the #1395 ground-truth guard (which
+  symmetrizes first). The joint Hessian is now symmetrized before the operator is
+  built, so every route realizes the penalized joint Hessian log-det
+  consistently.
+- **Binomial location-scale predict-noise (#1828).** The default-link arm no
+  longer demands an explicit blend spec (it falls back to the binomial-logit base
+  link), and a parametric-linear `log_sigma` is accepted for predict-noise while
+  a nonparametric free scale is still correctly rejected.
+- **BMS marginal / log-slope blocks lock to raw width (Rust CI / Python API).**
+  The Bernoulli marginal-slope and log-slope Jacobian callbacks now declare
+  `locks_raw_width_reduction()`, mirroring the survival marginal-slope precedent,
+  so the canonicaliser keeps their raw block width.
+
+### Smooths & kernels
+- **Duchon null-space order auto-raises to clear the collocation margin
+  (#1817).** A low order/power pair with a derivative-collocation operator active
+  (e.g. `d=2`, `Linear` null space, `power=0` with the stiffness operator) could
+  trip the pointwise/collocation well-posedness guard `2(p+s) > d + max_op`
+  mid-fit. The null-space order `p` is now auto-raised by the smallest amount that
+  restores the strict margin before the guard can fire (warned once per config);
+  the spectral power and the CPD condition `2s < d` are untouched.
+- **κ design-realization skip restored on the n-free lane (#1868/#1033).** The
+  `TEMP-SKIPOFF-1122` debug override that hard-forced the `O(n)` lane in
+  `eval_full` is removed, restoring the n-free gradient/value path. The remaining
+  leftover FD-audit debug scaffolding on that path (four unconditional
+  `TEMP-*-1122` blocks that logged at warn level and rebuilt the Matérn basis /
+  penalty triplet several times per call) is deleted.
+- **Cubic-cell C0-continuity regression made meaningful (#1837).** The
+  `bug_hunt` continuity check was mis-specified — it built the neighbouring cell
+  from a cell-local Taylor parameterization but stored those coefficients as a
+  global polynomial, and compared the two cells at `boundary ± eps` against a
+  tolerance tighter than the injected `O(eps·slope)` gap. The test now constructs
+  the right cell through the kernel's own `global_cubic_from_local` path and
+  evaluates both cells at the shared boundary point, so it is a genuine (passing)
+  C0 invariant check. The production kernel is unchanged.
+
+### SAE manifold (experimental, all default-off)
+- **Chart-transfer operators (#2016).** Pulled-back chart-to-chart transfer
+  operators `A_kj(x) = (JₖᵀJₖ)⁻¹Jₖᵀ J_F(x) Jⱼ(x)` for 1-D/2-D atoms, with
+  density-weighted mean/variance aggregation (Kish effective-n) and
+  isometry/equivariance transport certificates. (The coordinate-valued
+  attribution-graph deliverable is scaffolded but not yet wired.)
+- **Canonical dictionary artifact tooling (#2018).** Deterministic SHA-256
+  hashing of the Frobenius-normalized, reflection-fixed dictionary orbit
+  representative, with order/scale/reflection-invariant equality and a
+  decoder-row-localizing diff. The alignment diff now counts atoms with no
+  counterpart on either side as substantive differences, so
+  `hash_equal_after_alignment` can no longer claim equivalence when the two
+  dictionaries carry different atom sets at equal total count. (Residual
+  continuous-chart gauge pinning and Procrustes/optimal-transport alignment
+  remain future work.)
+- **Sparse SAE Schur block GEMM (#1995).** The reduced-Schur block subtract skips
+  zero columns on the sparse atom support.
+
+### Testing
+- Rust and Python regression coverage for the zero-weight / zero-`by` REML
+  inertness (#2031/#2032), the estimated-Tweedie-power recovery (#2026), the
+  Duchon auto-raise (#1817), the interior-cert non-zero-slack-bound constrained
+  backward, the generic row-kernel jet oracle projections (#932), and the SAE
+  dictionary diff's unmatched-atom accounting.
+
 ## v0.3.144 — gam 0.3.144 / gamfit 0.1.246 (2026-07-02)
 
 Correctness release on top of 0.3.143. Two new user-facing capabilities land on
