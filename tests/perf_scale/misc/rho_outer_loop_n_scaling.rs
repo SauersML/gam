@@ -130,7 +130,6 @@ fn run_fit(n: usize, outer_iters: usize) -> Result<f64, String> {
         min_length_scale: 0.05,
         max_length_scale: 20.0,
         pilot_subsample_threshold: 0,
-        outer_wall_clock_budget_secs: None,
     };
 
     let t0 = Instant::now();

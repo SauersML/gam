@@ -88,7 +88,6 @@ fn aniso_matern_recovers_signal_axis() {
         min_length_scale: 1e-2,
         max_length_scale: 1e2,
         pilot_subsample_threshold: 0,
-        outer_wall_clock_budget_secs: None,
     };
 
     let result = gam::fit_model(FitRequest::Standard(StandardFitRequest {
