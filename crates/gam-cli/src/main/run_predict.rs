@@ -81,6 +81,8 @@ pub(crate) fn geometry_alo_phi(unified: &UnifiedFitResult, link: LinkFunction) -
         | LinkFunction::Logit
         | LinkFunction::Probit
         | LinkFunction::CLogLog
+        | LinkFunction::LogLog
+        | LinkFunction::Cauchit
         | LinkFunction::Sas
         | LinkFunction::BetaLogistic => 1.0,
     }

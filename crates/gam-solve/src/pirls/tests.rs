@@ -250,6 +250,8 @@ mod tests {
             LinkFunction::Logit
             | LinkFunction::Probit
             | LinkFunction::CLogLog
+            | LinkFunction::LogLog
+            | LinkFunction::Cauchit
             | LinkFunction::Sas
             | LinkFunction::BetaLogistic
             | LinkFunction::Log => 1.0,
