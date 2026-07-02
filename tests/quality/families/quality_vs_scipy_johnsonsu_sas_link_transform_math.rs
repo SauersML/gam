@@ -8,7 +8,7 @@
 //! peer fitting tool whose noisy output we chase):
 //!
 //!   1. VALUE (mu): gam's mu(eta) equals the closed-form sinh-arcsinh CDF
-//!      `Phi(sinh(B*tanh((delta*asinh(eta)-eps)/B)))` to ~machine precision.
+//!      `Phi(sinh(B*tanh((delta*asinh(eta)+eps)/B)))` to ~machine precision.
 //!      scipy composes this from the elementary functions `norm.cdf`, `sinh`,
 //!      `tanh`, `arcsinh` — it does NOT reuse gam's internal jet, so agreement
 //!      is a genuine independent check that gam evaluates the right function.
@@ -32,7 +32,7 @@
 //!
 //! gam's SAS inverse link is, verbatim from `sas_inverse_link_jet`:
 //!
-//!   mu(eta) = Phi( sinh( B*tanh( (delta*asinh(eta) - epsilon) / B ) ) ),
+//!   mu(eta) = Phi( sinh( B*tanh( (delta*asinh(eta) + epsilon) / B ) ) ),
 //!   delta   = exp( B_d * tanh(log_delta / B_d) ),
 //!
 //! with `B = SAS_U_CLAMP = 50` and `B_d = SAS_LOG_DELTA_BOUND = 12`. This is the
@@ -142,7 +142,7 @@ def delta_of(ld):
 
 def cdf(e, ep, ld):
     # EXACT sinh-arcsinh CDF, built only from elementary functions:
-    #   mu = Phi(sinh(B*tanh((delta*asinh(eta)-eps)/B)))
+    #   mu = Phi(sinh(B*tanh((delta*asinh(eta)+eps)/B)))
     # gam takes a probit shortcut (latent z == eta) whenever eps==0 and
     # delta==1; replicate that shortcut elementwise so the differentiated
     # reference is the identical mathematical function gam evaluates there
@@ -151,7 +151,7 @@ def cdf(e, ep, ld):
     # derivative of a *different* function and fail for a bogus reason).
     d = delta_of(ld)
     a = np.arcsinh(e)
-    ur = d * a - ep
+    ur = d * a + ep
     z = np.sinh(B * np.tanh(ur / B))
     shortcut = (np.abs(ep) < 1e-12) & (np.abs(d - 1.0) < 1e-12)
     return Phi(np.where(shortcut, e, z))
