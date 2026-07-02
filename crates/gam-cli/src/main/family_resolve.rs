@@ -98,6 +98,8 @@ pub(crate) fn resolve_binomial_inverse_link_for_fit(
         InverseLink::Standard(StandardLink::Probit)
         | InverseLink::Standard(StandardLink::Identity)
         | InverseLink::Standard(StandardLink::Log)
+        | InverseLink::Standard(StandardLink::LogLog)
+        | InverseLink::Standard(StandardLink::Cauchit)
         | InverseLink::LatentCLogLog(_)
         | InverseLink::Mixture(_) => Ok(InverseLink::Standard(
             crate::config_resolve::effective_link_to_standard(effective_link, context)?,
