@@ -570,16 +570,11 @@ impl ResponseFamily {
             Self::Poisson | Self::NegativeBinomial { .. } | Self::Tweedie { .. } => {
                 Some("non-negative response values (y ≥ 0)")
             }
-<<<<<<< ours
             Self::Beta { .. } => Some(
                 "response values strictly in the open interval (0, 1) \
                  (a binary {0, 1} response is a Binomial GLM, not Beta; route it through the Binomial family instead)",
             ),
-            Self::Binomial => Some("binary response values (y ∈ {0, 1})"),
-=======
-            Self::Beta { .. } => Some("response values strictly in the open interval (0, 1)"),
             Self::Binomial => Some("response values in the closed interval [0, 1]"),
->>>>>>> theirs
             Self::Gaussian | Self::RoystonParmar => None,
         }
     }
@@ -2682,26 +2677,20 @@ mod tests {
     }
 
     #[test]
-<<<<<<< ours
-    fn gaussian_degeneracy_exactly_constant_ok() {
-        // A *genuinely* zero-variance response — every value bit-for-bit
-        // identical — is the well-posed constant limit, not the #332
-        // divergence: the fit collapses to the constant (intercept = the shared
-        // value, smooths shrunk to zero). The guard must accept it and let the
-        // fitter return the constant surface (#1856); only a response that
-        // varies below the sd floor without being exactly constant keeps the
-        // rejection (see `gaussian_degeneracy_near_constant_reproducer_errors`).
-=======
     fn binomial_degeneracy_fractional_proportions_ok() {
         let y = arr1(&[0.0_f64, 0.5, 0.75]);
         assert!(ResponseFamily::Binomial.validate_response_degeneracy(y.view()).is_ok());
     }
 
     #[test]
-    fn gaussian_degeneracy_exactly_constant_errors() {
-        // An exactly-constant response has sample sd 0 ⇒ the marginal
-        // `−n/2·log σ²` diverges; the guard must reject it pre-fit (#332).
->>>>>>> theirs
+    fn gaussian_degeneracy_exactly_constant_ok() {
+        // A *genuinely* zero-variance response \u{2014} every value bit-for-bit
+        // identical \u{2014} is the well-posed constant limit, not the #332
+        // divergence: the fit collapses to the constant (intercept = the shared
+        // value, smooths shrunk to zero). The guard must accept it and let the
+        // fitter return the constant surface (#1856); only a response that
+        // varies below the sd floor without being exactly constant keeps the
+        // rejection (see `gaussian_degeneracy_near_constant_reproducer_errors`).
         let y = arr1(&[1.0_f64, 1.0, 1.0]);
         assert!(ResponseFamily::Gaussian
             .validate_response_degeneracy(y.view())
