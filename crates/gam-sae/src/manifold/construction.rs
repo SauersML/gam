@@ -61,6 +61,9 @@ impl SaeManifoldTerm {
             temperature_schedule: None,
             last_row_layout: None,
             row_metric: None,
+            // #2022/#2023 — per-fit opt-ins, default false (bit-for-bit historical).
+            quotient_scale: false,
+            data_row_reseed: false,
             collapse_events: Vec::new(),
             row_loss_weights: None,
             last_frames_active: false,
@@ -545,6 +548,23 @@ impl SaeManifoldTerm {
         }
         self.row_metric = Some(metric);
         Ok(())
+    }
+
+    /// #2022 — set the per-fit SCALE-gauge quotient opt-in (typed kwarg, no env
+    /// lever). Default false ⇒ historical path bit-for-bit.
+    pub fn set_quotient_scale(&mut self, enabled: bool) {
+        self.quotient_scale = enabled;
+    }
+
+    /// #2022 — read the per-fit SCALE-gauge quotient opt-in.
+    pub fn quotient_scale(&self) -> bool {
+        self.quotient_scale
+    }
+
+    /// #2023 — set the per-fit dead-atom data-row reseed opt-in (typed kwarg, no
+    /// env lever). Default false.
+    pub fn set_data_row_reseed(&mut self, enabled: bool) {
+        self.data_row_reseed = enabled;
     }
 
     /// The installed per-row metric, if any. `None` ⇒ Euclidean / isotropic.
@@ -2006,6 +2026,15 @@ impl SaeManifoldTerm {
                 }
             }
             self.atoms[atom_idx].refresh_intrinsic_smooth_penalty();
+            // #2022 refit-peel (RESET form). This LSQ solved the ABSOLUTE decoder
+            // (design = a·φ, exp(s)-unaware), so under the quotient reset s to 0
+            // then peel ⇒ s = ln‖B_abs‖, B unit, reconstruction = a·Φ·B_abs (the
+            // LSQ intent). Gated: default-off keeps the write bit-for-bit.
+            if self.quotient_scale {
+                self.atoms[atom_idx].log_amplitude = 0.0;
+                self.atoms[atom_idx]
+                    .absorb_decoder_norm_into_log_amplitude(f64::MIN_POSITIVE);
+            }
         }
         Ok(())
     }

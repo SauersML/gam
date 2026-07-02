@@ -645,6 +645,17 @@ pub struct SaeManifoldTerm {
     /// the FFI through [`SaeManifoldTerm::set_fit_config`]. Carried across clones
     /// (persisted configuration, like the assignment mode).
     pub(crate) separation_barrier_strength_override: Option<f64>,
+    /// #2022 — persisted per-fit opt-in for the SCALE-gauge quotient (default
+    /// false ⇒ bit-for-bit historical path). When true, the decoder is confined
+    /// to the unit-Frobenius sphere with its magnitude in the explicit per-atom
+    /// log-amplitude (seed/step/refit peel + sphere retract). Set from the FFI
+    /// via the typed `quotient_scale` kwarg — no env lever. Carried across clones
+    /// like the other per-fit config.
+    pub(crate) quotient_scale: bool,
+    /// #2023 — persisted per-fit opt-in for the dead-atom DATA-ROW reseed
+    /// (default false). Set from the FFI via the typed `data_row_reseed` kwarg —
+    /// no env lever. Carried across clones.
+    pub(crate) data_row_reseed: bool,
 }
 
 /// #1777 — PER-FIT configuration overrides the FFI sets on a term to isolate a
@@ -708,6 +719,8 @@ impl Clone for SaeManifoldTerm {
             // #1777 — persisted per-fit config, carried across clones like the
             // assignment mode so a cloned term keeps the same barrier override.
             separation_barrier_strength_override: self.separation_barrier_strength_override,
+            quotient_scale: self.quotient_scale,
+            data_row_reseed: self.data_row_reseed,
         }
     }
 }

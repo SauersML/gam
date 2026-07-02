@@ -4,31 +4,6 @@ use super::*;
 /// Hessian unfactorable.
 const SAE_MANIFOLD_ROW_RIDGE_MAX_ATTEMPTS: usize = 12;
 
-/// #2022 (EXPERIMENT) — SCALE-gauge quotient opt-in. Reads the
-/// `GAM_SAE_QUOTIENT_SCALE` env lever: when truthy, the decoder is confined to
-/// the unit Frobenius sphere per Newton step (retract) with its magnitude peeled
-/// into the explicit per-atom log-amplitude `s`, removing the SCALE gauge
-/// flat-direction. DEFAULT OFF: push CI runs only the release build (no tests),
-/// so the default path must stay verified-inert — off ⇒ no retract ⇒ `s ≡ 0` ⇒
-/// bit-for-bit (the always-on assembly `exp(s)` scaling is inert at `s = 0`).
-/// Flip the default on only after the dispatched Rust CI shows the FD gate green.
-/// Truthy = anything but unset / empty / "0" / "false" / "no" (case-insensitive).
-///
-/// TODO(#2022): promote to a typed fit-config field once the FD gate + a quality
-/// run confirm it — no permanent hidden env levers.
-pub(crate) fn sae_quotient_scale_enabled() -> bool {
-    std::env::var("GAM_SAE_QUOTIENT_SCALE")
-        .ok()
-        .map(|s| {
-            let t = s.trim();
-            !(t.is_empty()
-                || t == "0"
-                || t.eq_ignore_ascii_case("false")
-                || t.eq_ignore_ascii_case("no"))
-        })
-        .unwrap_or(false)
-}
-
 impl SaeManifoldTerm {
     pub fn solve_newton_step(
         &mut self,
@@ -2507,11 +2482,8 @@ impl SaeManifoldTerm {
         // (Periodic/Sphere/Torus/Cylinder/…) always fall through to the PCA seed
         // — their data-row anchoring is the curved-tier follow-up.
         let pc_pairs = (residual.ncols().min(n)) / 2;
-        let data_row_reseed = std::env::var("GAM_SAE_DATA_ROW_RESEED")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .unwrap_or(0)
-            > 0;
+        // #2023 — typed per-fit opt-in (was the GAM_SAE_DATA_ROW_RESEED env lever).
+        let data_row_reseed = self.data_row_reseed;
         let all_flat = basis_kinds
             .iter()
             .all(|k| matches!(k, SaeAtomBasisKind::EuclideanPatch | SaeAtomBasisKind::Linear));
@@ -2716,7 +2688,7 @@ impl SaeManifoldTerm {
         // ⇒ no retract ⇒ s stays 0 ⇒ bit-for-bit (the always-on assembly exp(s)
         // is inert at s=0). Flip the default to on after the dispatched Rust CI
         // confirms the FD gate green.
-        if sae_quotient_scale_enabled() {
+        if self.quotient_scale {
             for atom in self.atoms.iter_mut() {
                 atom.absorb_decoder_norm_into_log_amplitude(f64::MIN_POSITIVE);
             }

@@ -81,27 +81,9 @@ pub fn term_from_padded_blocks_with_mode(
             Some(evaluator) => atom.with_basis_second_jet(evaluator),
             None => atom,
         };
-        // #2022 (gated) SEED peel — SCALE-gauge quotient. With
-        // `GAM_SAE_QUOTIENT_SCALE` set, gauge-fix the seed decoder onto the unit
-        // Frobenius sphere with the magnitude in the explicit log-amplitude, so
-        // the fit starts already on the quotient manifold. Reconstruction is
-        // preserved exactly (exp(s)·B_unit == B_seed). DEFAULT OFF ⇒ `s` stays 0
-        // ⇒ the historical seed is bit-for-bit. (Env read inlined to mirror
-        // `fit_drivers::sae_quotient_scale_enabled` without a cross-module path.)
-        let mut atom = atom;
-        let quotient_scale = std::env::var("GAM_SAE_QUOTIENT_SCALE")
-            .ok()
-            .map(|v| {
-                let t = v.trim();
-                !(t.is_empty()
-                    || t == "0"
-                    || t.eq_ignore_ascii_case("false")
-                    || t.eq_ignore_ascii_case("no"))
-            })
-            .unwrap_or(false);
-        if quotient_scale {
-            atom.absorb_decoder_norm_into_log_amplitude(f64::MIN_POSITIVE);
-        }
+        // #2022 — the SCALE-gauge quotient SEED peel is applied in the FFI
+        // (gated by the typed `quotient_scale` kwarg) after the term is built,
+        // not here (this builder has no per-fit flag + must stay env-free).
         atoms.push(atom);
     }
     let manifolds = basis_kinds

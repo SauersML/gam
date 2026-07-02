@@ -2141,30 +2141,6 @@ fn metric_provenance_label(
 /// pathological value cannot spin the alternation unboundedly.
 const STRUCTURED_RESIDUAL_PASSES_MAX: usize = 4;
 
-/// #2021 (EXPERIMENT) — Λ residual-factor PROMOTION opt-in, read from the
-/// `GAM_SAE_PROMOTE_FROM_RESIDUAL` env lever. When truthy AND
-/// `structured_residual_passes > 0`, a residual factor that PERSISTS across
-/// passes (dwell ≥ 2) and earns energy above the idiosyncratic-noise floor is
-/// promoted to a born atom, GROWING K. DEFAULT OFF: growing K is added capacity,
-/// so the null (no growth) must be the default (SPEC: users opt in to overfitting
-/// potential). This keeps whitening (passes > 0) testable WITHOUT growth — the
-/// (passes-on, promotion-off) pairing is the clean in-sample target. Truthy =
-/// anything other than unset / empty / "0" / "false" / "no" (case-insensitive).
-///
-/// TODO(#2021): promote to a typed `promote_from_residual: bool = false`
-/// pyfunction kwarg once it proves out — no permanent hidden env levers.
-fn sae_promote_from_residual() -> bool {
-    std::env::var("GAM_SAE_PROMOTE_FROM_RESIDUAL")
-        .ok()
-        .map(|s| {
-            let t = s.trim();
-            !(t.is_empty()
-                || t == "0"
-                || t.eq_ignore_ascii_case("false")
-                || t.eq_ignore_ascii_case("no"))
-        })
-        .unwrap_or(false)
-}
 
 /// #2021 — fit the structured residual-covariance model on `term`'s
 /// post-dictionary residuals and return it (the driver then materializes the
@@ -2260,6 +2236,9 @@ fn sae_structured_residual_model(
     separation_barrier_strength_override = None,
     ibp_alpha_override = None,
     structured_residual_passes = 0,
+    promote_from_residual = false,
+    quotient_scale = false,
+    data_row_reseed = false,
 ))]
 fn sae_manifold_fit<'py>(
     py: Python<'py>,
@@ -2309,6 +2288,9 @@ fn sae_manifold_fit<'py>(
     // #2021 — opt-in count of extra whitened-residual structured-alternation
     // passes (default 0 = historical iid-only path, bit-for-bit).
     structured_residual_passes: usize,
+    promote_from_residual: bool,
+    quotient_scale: bool,
+    data_row_reseed: bool,
 ) -> PyResult<Py<PyDict>> {
     // The precomputed-basis entry point carries no Duchon centers / kernel
     // metadata, so any basis kind whose refresh needs them cannot re-evaluate
@@ -2363,6 +2345,9 @@ fn sae_manifold_fit<'py>(
         separation_barrier_strength_override,
         ibp_alpha_override,
         structured_residual_passes,
+        promote_from_residual,
+        quotient_scale,
+        data_row_reseed,
     )
 }
 
@@ -2427,6 +2412,9 @@ fn sae_manifold_fit_inner<'py>(
     // `STRUCTURED_RESIDUAL_PASSES_MAX`. An explicit, typed opt-in — no hidden
     // env lever.
     structured_residual_passes: usize,
+    promote_from_residual: bool,
+    quotient_scale: bool,
+    data_row_reseed: bool,
 ) -> PyResult<Py<PyDict>> {
     let analytic_penalties: Option<serde_json::Value> = match analytic_penalties {
         Some(s) => Some(serde_json::from_str(&s).map_err(serde_json_error_to_pyerr)?),
@@ -2668,6 +2656,19 @@ fn sae_manifold_fit_inner<'py>(
         &evaluators,
     )
     .map_err(py_value_error)?;
+    // #2022/#2023 — install the typed per-fit opt-ins before the fit consumes the
+    // term. Default false ⇒ bit-for-bit historical path.
+    base_term.set_quotient_scale(quotient_scale);
+    base_term.set_data_row_reseed(data_row_reseed);
+    // #2022 SEED peel — moved here from the (env-free) padded-blocks builder.
+    // Quotient on ⇒ gauge-fix each seed decoder onto the unit Frobenius sphere
+    // with its magnitude in the explicit log-amplitude (reconstruction preserved:
+    // exp(s)·B_unit == B_seed). Default off ⇒ s stays 0, seed bit-for-bit.
+    if quotient_scale {
+        for atom in base_term.atoms.iter_mut() {
+            atom.absorb_decoder_norm_into_log_amplitude(f64::MIN_POSITIVE);
+        }
+    }
     // #1777 — install the PER-FIT config overrides as this term's source of truth
     // BEFORE the joint fit / ρ selection consumes it. `set_fit_config` distributes
     // the separation-barrier strength onto the term and the IBP-α onto the
@@ -2974,8 +2975,8 @@ fn sae_manifold_fit_inner<'py>(
         const PROMOTION_ALIGN_MIN: f64 = 0.9;
         const PROMOTION_ENERGY_FLOOR_MULT: f64 = 1.0;
         const PROMOTION_NURSERY_MIN_PASSES: usize = 2;
-        // Opt-in, default-off: whitening runs without growth unless this is set.
-        let promote_from_residual = sae_promote_from_residual();
+        // `promote_from_residual` is the typed pyfunction kwarg (default false);
+        // opt-in, default-off ⇒ whitening runs without growth unless set.
         let mut nursery: Vec<(Array1<f64>, usize)> = Vec::new();
         for pass in 0..structured_passes {
             let Some(model) = sae_structured_residual_model(&term, z_view.view())? else {
@@ -6265,6 +6266,9 @@ fn sae_build_atom_plans(
     separation_barrier_strength_override = None,
     ibp_alpha_override = None,
     structured_residual_passes = 0,
+    promote_from_residual = false,
+    quotient_scale = false,
+    data_row_reseed = false,
 ))]
 fn sae_manifold_fit_minimal<'py>(
     py: Python<'py>,
@@ -6311,6 +6315,9 @@ fn sae_manifold_fit_minimal<'py>(
     // #2021 — opt-in count of extra whitened-residual structured-alternation
     // passes (default 0 = historical iid-only path, bit-for-bit).
     structured_residual_passes: usize,
+    promote_from_residual: bool,
+    quotient_scale: bool,
+    data_row_reseed: bool,
 ) -> PyResult<Py<PyDict>> {
     // #1777 — accept both "threshold_gate" (primary) and legacy "jumprelu".
     let assignment_kind = canonicalize_assignment_kind(&assignment_kind).map_err(py_value_error)?;
@@ -6587,6 +6594,9 @@ fn sae_manifold_fit_minimal<'py>(
         separation_barrier_strength_override,
         ibp_alpha_override,
         structured_residual_passes,
+        promote_from_residual,
+        quotient_scale,
+        data_row_reseed,
     )?;
     // #977 — the per-atom `atom_plans` are now emitted by `sae_manifold_fit_inner`
     // FROM THE POST-SEARCH dictionary (variable K), so OOS predict can rebuild the
