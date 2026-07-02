@@ -713,6 +713,11 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
             offset: offset.clone(),
             spec: spec.clone(),
             family: family.clone(),
+            // #2026: `--family tweedie` names the bare Tweedie family with no way
+            // to spell an explicit power on the CLI, so it mirrors mgcv `tw()`
+            // and estimates `p` by profile likelihood before the reported fit.
+            estimate_tweedie_p: matches!(family.response, ResponseFamily::Tweedie { .. })
+                && matches!(args.family, FamilyArg::Tweedie),
             options: base_fit_options,
             kappa_options: kappa_options.clone(),
             wiggle: standard_wiggle,

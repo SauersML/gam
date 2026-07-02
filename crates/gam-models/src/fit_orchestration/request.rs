@@ -29,6 +29,14 @@ pub struct StandardFitRequest<'a> {
     pub offset: Array1<f64>,
     pub spec: TermCollectionSpec,
     pub family: LikelihoodSpec,
+    /// #2026: estimate the Tweedie variance power `p` by profile likelihood
+    /// (mgcv `tw()` semantics) before the final fit, rather than trusting the
+    /// `p` baked into `family`. Set only for a bare `family="tweedie"`/`"tw"`
+    /// request that named no explicit power; an explicit `tweedie(1.6)` pins `p`
+    /// and leaves this `false`. When `true`, `family` must carry
+    /// `ResponseFamily::Tweedie` on a log link (the placeholder power is
+    /// overwritten with the estimate).
+    pub estimate_tweedie_p: bool,
     pub options: FitOptions,
     pub kappa_options: SpatialLengthScaleOptimizationOptions,
     pub wiggle: Option<StandardBinomialWiggleConfig>,

@@ -399,6 +399,7 @@ fn fit_inference_per_term_edf(
 /// Jeffreys penalty enabled without duplicating the dispatch.
 fn fit_standard_base(
     request: &StandardFitRequest<'_>,
+    family: &LikelihoodSpec,
     options: &FitOptions,
 ) -> Result<crate::fit_orchestration::drivers::FittedTermCollectionWithSpec, String> {
     if let Some(latent_coord) = request.latent_coord.as_ref() {
@@ -413,7 +414,7 @@ fn fit_standard_base(
             request.offset.clone(),
             &request.spec,
             latent_coord,
-            request.family.clone(),
+            family.clone(),
             options,
         )
         .map_err(|e| e.to_string())
@@ -428,7 +429,7 @@ fn fit_standard_base(
             &request.spec,
             &request.coefficient_groups,
             &request.penalty_block_gamma_priors,
-            request.family.clone(),
+            family.clone(),
             options,
         )
         .map_err(|e| e.to_string())?;
@@ -449,7 +450,7 @@ fn fit_standard_base(
             request.weights.clone(),
             request.offset.clone(),
             &request.spec,
-            request.family.clone(),
+            family.clone(),
             options,
             &request.kappa_options,
         )
@@ -457,10 +458,188 @@ fn fit_standard_base(
     }
 }
 
+/// #2026: profile-likelihood grid for the magic-by-default Tweedie power `p`.
+/// mgcv's `tw()` profiles `p` over the open interval `(1, 2)`; these nine
+/// interior nodes bracket the maximizer coarsely and are then refined by a
+/// golden-section search. The endpoints `1` and `2` are excluded — the Tweedie
+/// unit-deviance / saddlepoint density is singular there.
+const TWEEDIE_PROFILE_GRID: [f64; 9] = [1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9];
+
+/// Fully-normalized (saddlepoint) Tweedie log-likelihood of a fit at a fixed
+/// variance power `p` — the profile objective maximized to estimate `p` (#2026).
+///
+/// Refits the mean/dispersion GLM at `Tweedie { p }` reusing the existing fit
+/// machinery (no reimplementation), reconstructs the fitted mean
+/// `μ = exp(Xβ̂ + offset)` on the log link, and evaluates the SAME
+/// fully-normalized saddlepoint log-density the fit reports to the user
+/// (`gam_solve::pirls::calculate_loglikelihood`) at the estimated dispersion
+/// `φ̂(p)`. Unlike the fit's REML building-block log-likelihood (which drops the
+/// `p`-dependent `−½·p·ln y` prefactor and so is not comparable across `p`),
+/// this carries every normalizer and IS comparable across the profile grid.
+///
+/// Returns `None` when the refit fails or yields a non-finite objective so the
+/// profile search can skip that node rather than abort.
+fn tweedie_profile_loglik(request: &StandardFitRequest<'_>, p: f64) -> Option<f64> {
+    if !gam_spec::is_valid_tweedie_power(p) {
+        return None;
+    }
+    let family = LikelihoodSpec::new(
+        ResponseFamily::Tweedie { p },
+        request.family.link.clone(),
+    );
+    // `apply` is the `LinearOperator` trait method used to rebuild the fitted
+    // linear predictor from the design and coefficients.
+    use gam_linalg::matrix::LinearOperator;
+    let fitted = fit_standard_base(request, &family, &request.options).ok()?;
+    // μ = g⁻¹(Xβ̂ + offset); the Tweedie family is fixed to the log link by
+    // `resolve_family`, so g⁻¹ = exp. `design.apply` reproduces the fitted
+    // linear predictor exactly (same contract the expectile/predict paths use).
+    let mut mu = fitted.design.design.apply(&fitted.fit.beta);
+    if mu.len() != request.y.len() {
+        return None;
+    }
+    mu += &request.offset;
+    mu.mapv_inplace(f64::exp);
+    // Profile the dispersion out at this `p` with the SAME prior-weighted Pearson
+    // moment estimator the inner solver uses to report the Tweedie `φ̂`
+    // (`estimate_tweedie_phi_from_eta`): `φ̂ = Σ wᵢ (yᵢ − μᵢ)² / μᵢ^p / Σ wᵢ`.
+    // Computing it here from the reconstructed mean makes the profile objective
+    // independent of whether the fit retained an inference/covariance block (the
+    // seed `φ = 1` carried on `likelihood_scale` would otherwise bias every node
+    // identically-but-wrongly) and gives each `p` its own maximized dispersion —
+    // the whole point of a profile likelihood.
+    const PHI_MIN: f64 = 1e-6;
+    const PHI_MAX: f64 = 1e12;
+    let mut weighted_pearson = 0.0_f64;
+    let mut total_weight = 0.0_f64;
+    for ((&yi, &mui), &wi) in request
+        .y
+        .iter()
+        .zip(mu.iter())
+        .zip(request.weights.iter())
+    {
+        let wi = wi.max(0.0);
+        if wi == 0.0 {
+            continue;
+        }
+        let resid = yi - mui;
+        let var_unit = mui.powf(p).max(f64::MIN_POSITIVE);
+        weighted_pearson += wi * resid * resid / var_unit;
+        total_weight += wi;
+    }
+    if total_weight <= 0.0 || !weighted_pearson.is_finite() || weighted_pearson <= 0.0 {
+        return None;
+    }
+    let phi = (weighted_pearson / total_weight).clamp(PHI_MIN, PHI_MAX);
+    // Evaluate the reporting-grade fully-normalized saddlepoint density at φ̂(p).
+    let glm = gam_spec::GlmLikelihoodSpec {
+        spec: family,
+        scale: gam_spec::LikelihoodScaleMetadata::EstimatedTweediePhi { phi },
+    };
+    let ll = gam_solve::pirls::calculate_loglikelihood(
+        request.y.view(),
+        &mu,
+        &glm,
+        request.weights.view(),
+    );
+    ll.is_finite().then_some(ll)
+}
+
+/// Estimate the Tweedie variance power `p ∈ (1, 2)` by profile likelihood, mgcv
+/// `tw()`-style (#2026): a coarse grid scan over [`TWEEDIE_PROFILE_GRID`] to
+/// bracket the maximizer, then a golden-section refinement inside the winning
+/// interval. Reuses [`tweedie_profile_loglik`] (a full refit per node) as the
+/// objective; the mean fit is robust to a misspecified `p`, but the
+/// observation-interval calibration is not, so this is what makes bare
+/// `family="tweedie"` track data whose true power ≠ 1.5.
+fn estimate_tweedie_power(request: &StandardFitRequest<'_>) -> Result<f64, String> {
+    // Coarse grid: pick the node with the highest profile log-likelihood.
+    let mut best_p = f64::NAN;
+    let mut best_ll = f64::NEG_INFINITY;
+    for &p in TWEEDIE_PROFILE_GRID.iter() {
+        if let Some(ll) = tweedie_profile_loglik(request, p)
+            && ll > best_ll
+        {
+            best_ll = ll;
+            best_p = p;
+        }
+    }
+    if !best_p.is_finite() {
+        return Err(
+            "tweedie power profiling failed: no grid node produced a finite likelihood; \
+             set an explicit power via family=\"tweedie(p)\""
+                .to_string(),
+        );
+    }
+    // Golden-section refinement inside the bracket [best-0.1, best+0.1] ∩ (1,2).
+    // Roughly six iterations narrows the interval by ~0.618⁶ ≈ 0.056 of 0.2,
+    // i.e. to ~0.01 — finer than the physically meaningful precision of `p`.
+    const STEP: f64 = 0.1;
+    const EPS: f64 = 1e-3;
+    let mut a = (best_p - STEP).max(1.0 + EPS);
+    let mut b = (best_p + STEP).min(2.0 - EPS);
+    let inv_phi_gr = (5.0_f64.sqrt() - 1.0) / 2.0; // 1/φ ≈ 0.618
+    let eval = |p: f64| tweedie_profile_loglik(request, p).unwrap_or(f64::NEG_INFINITY);
+    let mut c = b - inv_phi_gr * (b - a);
+    let mut d = a + inv_phi_gr * (b - a);
+    let mut fc = eval(c);
+    let mut fd = eval(d);
+    for _ in 0..6 {
+        if fc >= fd {
+            b = d;
+            d = c;
+            fd = fc;
+            c = b - inv_phi_gr * (b - a);
+            fc = eval(c);
+        } else {
+            a = c;
+            c = d;
+            fc = fd;
+            d = a + inv_phi_gr * (b - a);
+            fd = eval(d);
+        }
+    }
+    // Best of the refinement endpoints and the coarse-grid winner (the grid
+    // winner guards the rare case where the local search wandered off a flat
+    // ridge to a slightly worse interior point).
+    let mid = 0.5 * (a + b);
+    let f_mid = eval(mid);
+    let (p_hat, _) = [(best_p, best_ll), (c, fc), (d, fd), (mid, f_mid)]
+        .into_iter()
+        .fold((best_p, f64::NEG_INFINITY), |acc, (p, ll)| {
+            if ll > acc.1 { (p, ll) } else { acc }
+        });
+    let p_hat = p_hat.clamp(1.0 + EPS, 2.0 - EPS);
+    log::info!(
+        "[tweedie#2026] estimated variance power p={p_hat:.4} by profile likelihood \
+         (bare family=\"tweedie\"); set family=\"tweedie(p)\" to pin it."
+    );
+    Ok(p_hat)
+}
+
 pub(crate) fn fit_standard_model(
-    request: StandardFitRequest<'_>,
+    mut request: StandardFitRequest<'_>,
 ) -> Result<StandardFitResult, String> {
-    let base = fit_standard_base(&request, &request.options);
+    // #2026: magic-by-default Tweedie power. A bare `family="tweedie"`/`"tw"`
+    // arrives with a placeholder power and `estimate_tweedie_p = true`; profile
+    // `p` over (1, 2) by likelihood and bake the estimate into `family` so the
+    // reported fit — and every observation interval derived from it — uses the
+    // data-driven power rather than the interior fallback. An explicit
+    // `tweedie(1.6)` leaves the flag `false` and skips this entirely.
+    if request.estimate_tweedie_p
+        && matches!(request.family.response, ResponseFamily::Tweedie { .. })
+    {
+        let p_hat = estimate_tweedie_power(&request)?;
+        request.family = LikelihoodSpec::new(
+            ResponseFamily::Tweedie { p: p_hat },
+            request.family.link.clone(),
+        );
+        // The power is now pinned; the final fit below is an ordinary fixed-p
+        // Tweedie fit.
+        request.estimate_tweedie_p = false;
+    }
+
+    let base = fit_standard_base(&request, &request.family, &request.options);
 
     // #1762: near-perfect linear separation drives the binomial-logit REML/ARC
     // outer optimizer into a FLAT-VALLEY STALL. As the fit approaches
@@ -490,7 +669,7 @@ pub(crate) fn fit_standard_model(
     {
         let mut firth_options = request.options.clone();
         firth_options.firth_bias_reduction = true;
-        match fit_standard_base(&request, &firth_options) {
+        match fit_standard_base(&request, &request.family, &firth_options) {
             Ok(firth_fitted) if firth_fitted.fit.outer_converged => {
                 log::info!(
                     "[#1762] binomial-logit fit did not converge (near-separation flat-valley \

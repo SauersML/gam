@@ -534,6 +534,7 @@ fn fit_expectile_laws(
         offset,
         spec,
         family: materialized_family,
+        estimate_tweedie_p: _,
         options,
         kappa_options,
         wiggle,
@@ -587,6 +588,9 @@ fn fit_expectile_laws(
             offset: offset.clone(),
             spec: spec.clone(),
             family: gaussian_family.clone(),
+            // Expectile LAWS fits a Gaussian-identity inner family; no Tweedie
+            // power to estimate (#2026).
+            estimate_tweedie_p: false,
             options: options.clone(),
             kappa_options: kappa_options.clone(),
             wiggle: None,

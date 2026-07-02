@@ -165,6 +165,49 @@ fn apply_paren_link(
     Ok((LikelihoodSpec::new(base_spec.response, inverse_link), true))
 }
 
+/// #2026: whether a resolved Tweedie family should have its variance power `p`
+/// estimated by profile likelihood (mgcv `tw()` semantics) instead of held at
+/// the interior fallback baked in by [`resolve_family`].
+///
+/// mgcv's `tw()` family has no canonical `p` — it profiles `p` over the open
+/// interval `(1, 2)`. This returns `true` exactly when the user named the bare
+/// Tweedie family (`tweedie` / `tw` / `tweedie-log`, case- and separator-
+/// insensitive) WITHOUT an explicit numeric power argument. An explicit power
+/// (`tweedie(1.6)` / `tweedie(p=1.6)`) pins `p` and returns `false`; a
+/// non-numeric parenthesized argument (`tweedie(log)`) is a link, not a power,
+/// so it still estimates. The head/argument split mirrors the parser inside
+/// [`resolve_family`] so the two decisions cannot drift.
+pub fn tweedie_power_is_estimated(family: Option<&str>) -> bool {
+    let Some(name) = family else {
+        return false;
+    };
+    let lowered = name.to_ascii_lowercase().replace('_', "-");
+    let (head, arg): (&str, Option<&str>) =
+        if let Some(open) = lowered.find('(') && lowered.ends_with(')') {
+            let head = lowered[..open].trim_end_matches('-').trim();
+            let inner = lowered[open + 1..lowered.len() - 1].trim();
+            if head.is_empty() || inner.is_empty() {
+                (lowered.as_str(), None)
+            } else {
+                (head, Some(inner))
+            }
+        } else {
+            (lowered.as_str(), None)
+        };
+    if !matches!(head, "tweedie" | "tw" | "tweedie-log") {
+        return false;
+    }
+    // An explicit numeric power (`1.6` or `p=1.6`) pins `p`; a missing argument
+    // or a non-numeric link argument leaves `p` to be estimated from the data.
+    match arg {
+        Some(a) => {
+            let numeric = a.strip_prefix("p=").unwrap_or(a).trim();
+            numeric.parse::<f64>().is_err()
+        }
+        None => true,
+    }
+}
+
 /// Resolve a family from an optional name, optional link choice, and response data.
 ///
 /// `y_kind` describes the *source* representation of the response column
