@@ -180,6 +180,19 @@ impl BlockEffectiveJacobian for BmsMarginalJacobian {
     fn n_outputs(&self) -> usize {
         1
     }
+
+    fn locks_raw_width_reduction(&self) -> bool {
+        // The BMS family reads its raw-width internal `marginal_design` and
+        // `validate_exact_block_state_shapes` asserts `beta.len() ==
+        // marginal_design.ncols()`. The block's spec carries the real (non
+        // zero-placeholder) marginal design, so the `#933` gauge-composed
+        // reduction cannot silently absorb a dropped column into the callback —
+        // a reduced β would desynchronise the raw-width layout the family reads.
+        // Keep it at raw width and let the robust Jeffreys curvature regularise
+        // any weak cross-block direction (mirrors the survival marginal-slope
+        // time-wiggle block).
+        true
+    }
 }
 
 /// β-dependent Jacobian for the BMS logslope block.
@@ -288,6 +301,20 @@ impl BlockEffectiveJacobian for BmsLogslopeJacobian {
 
     fn n_outputs(&self) -> usize {
         1
+    }
+
+    fn locks_raw_width_reduction(&self) -> bool {
+        // The BMS family reads its raw-width internal `logslope_design` and
+        // `validate_exact_block_state_shapes` asserts `beta.len() ==
+        // logslope_design.ncols()`. An intercept-only logslope (`logslope_formula
+        // = "1"`) is a constant column perfectly aliased with the marginal
+        // intercept; the effective reduced-reparam leaves a width-1 block at raw
+        // width (a zero-width reduction would delete the score-effect surface), so
+        // the canonicaliser would otherwise column-reduce this block to width 0
+        // and hand the family a length-0 β against a width-1 design. Lock it to
+        // raw width — the robust Jeffreys curvature regularises the weak aliased
+        // direction (mirrors the survival marginal-slope time-wiggle block).
+        true
     }
 }
 
