@@ -35,13 +35,13 @@
 //! exist only during the race; it is not retained for the saved-model
 //! prediction path. That OOS-retention package is out of scope here.
 
-use crate::row_sampling_measure::CoresetCertificate;
 use crate::evidence::{
     GaussianMixtureConfig, StackingConfig, StackingWeights, TopologyScoreScale,
     UNION_STRUCTURE_LADDER, UnionStructure, UnionStructureFit, fit_gaussian_mixture,
     fit_union_ladder, fit_union_structure, solve_stacking_weights, union_per_point_log_density,
 };
 use crate::priority_selection::{PriorityCandidate, rank_priority_candidates};
+use crate::row_sampling_measure::CoresetCertificate;
 use ndarray::{Array2, ArrayView2};
 use serde_json::Value as JsonValue;
 use std::sync::Mutex;
@@ -1487,9 +1487,39 @@ pub fn adjudicate_cross_class_race(
     }
 
     // Cross-class: build the selection-time held-out density table and stack.
+    //
+    // The CV column is a plug-in predictive density: each fold refits the
+    // candidate and evaluates held-out rows at the fitted point estimate.  For
+    // flexible finite mixtures that plug-in score is optimistically sharp on
+    // smooth one-dimensional clouds (a handful of elongated Gaussian blobs can
+    // tile a ring), while the smooth S¹ candidate pays its parameter price in
+    // the evidence scalar only.  The race therefore has to put the two pieces
+    // on the same predictive scale before stacking: use the rank-aware Laplace
+    // negative log evidence as a per-observation model-prior offset.  This is
+    // the selection-time analogue of posterior predictive model comparison:
+    // holdout density supplies local predictive fit, and the marginal evidence
+    // supplies the Occam factor for candidate-class complexity.
+    let evidence_offsets: Vec<f64> = evidence
+        .iter()
+        .map(|&nle| {
+            if nle.is_finite() {
+                -nle / n.max(1) as f64
+            } else {
+                f64::NEG_INFINITY
+            }
+        })
+        .collect();
     let providers: Vec<HeldOutDensityProvider<'_>> =
         candidates.into_iter().map(|c| c.density_provider).collect();
-    let table = build_cv_log_density_table(n, folds, seed, &providers)?;
+    let mut table = build_cv_log_density_table(n, folds, seed, &providers)?;
+    for col in 0..table.ncols() {
+        let offset = evidence_offsets[col];
+        for row in 0..table.nrows() {
+            if table[[row, col]].is_finite() {
+                table[[row, col]] += offset;
+            }
+        }
+    }
     let stacking = solve_stacking_weights(table.view(), stacking_config)?;
     // Headline winner = max stacking weight (most predictive mass).
     let mut winner_index = 0usize;
