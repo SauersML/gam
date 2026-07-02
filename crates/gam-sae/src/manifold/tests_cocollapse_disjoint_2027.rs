@@ -194,3 +194,94 @@ pub(crate) fn sequential_deflation_gives_both_atoms_material_norm_2027() {
         "both atoms must carry material decoder norm after deflation: norms={norms:?}"
     );
 }
+
+/// #2027 WIDTH-SCALING + STRUCTURE-RECOVERY guard — the discriminating test.
+///
+/// Two facts from the sibling nursery evidence make raw EV an INSUFFICIENT guard:
+///   1. The pathology is WIDTH-dependent — the REML control converges at `p = 16`
+///      but hangs / co-collapses at `p ≈ 96`. A fix must be checked at BOTH widths:
+///      the narrow arm must stay healthy, the wide arm is the regime being rescued.
+///   2. Its fingerprint is a co-collapse that posts a DECENT reconstruction EV while
+///      recovering NEITHER planted circle — both atoms pile into one shared subspace
+///      and ride one circle plus noise (torch proxy: EV 0.63, adjacency 0.43/0.25).
+///      Asserting EV alone therefore passes a co-collapsed fit.
+///
+/// The two circles are planted on DISJOINT ambient column PARITIES (circle A on the
+/// even output channels, circle B on the odd), so an honest K=2 dictionary MUST
+/// separate: one atom's decoder concentrates its Frobenius energy on the even
+/// channels, the other on the odd. Co-collapse piles both atoms onto the same
+/// channels — detected here as both atoms landing on the SAME side of the 0.5
+/// even-energy split. We require, at both widths: finite loss (no thrash), a
+/// materially positive EV, and the two atoms SEPARATED onto opposite-parity
+/// subspaces (the structure the disjoint-deflation + ownership-anchor fix restores).
+///
+/// NOTE: this exercises the INNER joint solve (`run_joint_fit_arrow_schur` at a
+/// fixed ρ) — the co-collapse / structure-recovery layer the seeding + anchoring fix
+/// lives in — not the outer REML ρ-search whose non-PD-Hessian retries are the
+/// separate Python-side "hang" at wide `p`.
+#[test]
+pub(crate) fn two_circle_separates_at_narrow_and_wide_widths_2027() {
+    let m = 5usize;
+    // (n, p): a NARROW arm that must stay healthy and the WIDE arm being rescued.
+    for &(n, p) in &[(96usize, 16usize), (120usize, 96usize)] {
+        let (mut term, target) = two_circle_k2_term(n, p, m);
+        let mut rho = SaeManifoldRho::new(
+            0.0,
+            -6.0,
+            vec![Array1::<f64>::zeros(1), Array1::<f64>::zeros(1)],
+        );
+        let loss = term
+            .run_joint_fit_arrow_schur(target.view(), &mut rho, None, 60, 0.05, 1.0e-3, 1.0e-3)
+            .unwrap();
+        assert!(
+            loss.total().is_finite(),
+            "p={p}: joint fit must return a finite loss (no thrash / NaN)"
+        );
+        let ev = term
+            .dictionary_reconstruction_ev(target.view(), &rho)
+            .unwrap();
+
+        // Per-atom decoder energy split across even vs odd output channels: circle A
+        // lives on even channels, circle B on odd.
+        let mut even_frac = [0.0_f64; 2];
+        for (atom_idx, atom) in term.atoms.iter().enumerate() {
+            let b = &atom.decoder_coefficients; // (m × p)
+            let mut e_even = 0.0_f64;
+            let mut e_odd = 0.0_f64;
+            for col in 0..b.nrows() {
+                for out in 0..p {
+                    let v = b[[col, out]] * b[[col, out]];
+                    if out % 2 == 0 {
+                        e_even += v;
+                    } else {
+                        e_odd += v;
+                    }
+                }
+            }
+            even_frac[atom_idx] = e_even / (e_even + e_odd).max(1.0e-300);
+        }
+        eprintln!(
+            "[#2027 repro] p={p}: EV={ev:.4}, per-atom even-energy fraction={even_frac:?}, \
+             cocollapse_reseeds={}",
+            term.dictionary_cocollapse_reseeds
+        );
+        assert!(
+            ev > 0.20,
+            "p={p}: dictionary co-collapsed to the null floor (EV={ev:.4} <= 0.20)"
+        );
+        // STRUCTURE RECOVERY: the atoms must land on OPPOSITE planted subspaces — one
+        // even-dominant, one odd-dominant. Both on the same side of 0.5 is the
+        // co-collapse signature (acceptable EV, neither circle recovered).
+        let (lo, hi) = if even_frac[0] <= even_frac[1] {
+            (even_frac[0], even_frac[1])
+        } else {
+            (even_frac[1], even_frac[0])
+        };
+        assert!(
+            lo < 0.5 && hi > 0.5,
+            "p={p}: atoms did NOT separate onto the two planted circles \
+             (even-energy fractions {even_frac:?} both on one side of 0.5 = co-collapse: \
+             EV looks fine but neither circle is recovered)"
+        );
+    }
+}
