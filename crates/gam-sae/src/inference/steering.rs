@@ -66,8 +66,10 @@
 
 use ndarray::{Array1, Array2, ArrayView1};
 
-use gam_problem::{MetricProvenance, RowMetric};
+use crate::encode::EncodeAtlas;
 use crate::manifold::SaeManifoldTerm;
+use gam_problem::{MetricProvenance, RowMetric};
+use gam_terms::inference::structure_evidence::log_e_from_p_calibrator;
 
 /// Number of sub-steps the latent path `[t_from, t_to]` is integrated over for
 /// the dosimetry path integral. The decoder curve is smooth, so a modest
@@ -128,6 +130,190 @@ pub struct SteerPlan {
     pub metric_provenance: MetricProvenance,
 }
 
+/// Result of writing one certified chart coordinate into an activation row.
+///
+/// The edited row is always `x + δ`, where `δ` is the delta returned by
+/// [`steer_delta`] for the atom's current encoded coordinate and the requested
+/// target coordinate. Because only the on-manifold atom chord is added, every
+/// component of `x` outside this atom's chart residual is preserved exactly; this
+/// is the locality guarantee missing from whole-residual linear-steering
+/// baselines.
+#[derive(Clone, Debug)]
+pub struct CoordinateSetResult {
+    /// The edited activation/reconstruction row.
+    pub edited: Array1<f64>,
+    /// Certified coordinate read from the input row before the write.
+    pub t_from_certified: Array1<f64>,
+    /// Certificate attached to `t_from_certified`.
+    pub encode_certificate: crate::encode::RowCertificate,
+    /// Steering plan whose `delta` was added to the row.
+    pub steer: SteerPlan,
+}
+
+/// Write atom `atom_k`'s chart coordinate in row `x` to `t_to` by delta
+/// steering, preserving the row's off-atom/off-subspace residual exactly.
+///
+/// `amplitude` is the assignment/intensity with which the row expresses this
+/// atom; callers that have already separated existence/intensity/position should
+/// pass the intensity and only swap the position coordinate. The certified read
+/// uses [`EncodeAtlas::certified_encode_row`]; the write uses [`steer_delta`].
+pub fn set_coordinate(
+    model: &SaeManifoldTerm,
+    metric: &RowMetric,
+    atlas: &EncodeAtlas,
+    x: ArrayView1<'_, f64>,
+    atom_k: usize,
+    amplitude: f64,
+    t_to: &[f64],
+) -> Result<CoordinateSetResult, String> {
+    let atom = model.atoms.get(atom_k).ok_or_else(|| {
+        format!(
+            "set_coordinate: atom index {atom_k} out of range (term has {} atoms)",
+            model.k_atoms()
+        )
+    })?;
+    if x.len() != atom.output_dim() {
+        return Err(format!(
+            "set_coordinate: input row has length {} but atom {atom_k} output_dim is {}",
+            x.len(),
+            atom.output_dim()
+        ));
+    }
+    let (t_from, cert) = atlas.certified_encode_row(atom, atom_k, x, amplitude)?;
+    let steer = steer_delta_with_amplitude(
+        model,
+        metric,
+        atom_k,
+        t_from.as_slice().unwrap_or(&[]),
+        t_to,
+        amplitude,
+    )?;
+    let mut edited = x.to_owned();
+    if edited.len() != steer.delta.len() {
+        return Err(format!(
+            "set_coordinate: steering delta length {} does not match row length {}",
+            steer.delta.len(),
+            edited.len()
+        ));
+    }
+    for i in 0..edited.len() {
+        edited[i] += steer.delta[i];
+    }
+    Ok(CoordinateSetResult {
+        edited,
+        t_from_certified: t_from,
+        encode_certificate: cert,
+        steer,
+    })
+}
+
+/// Result of a coordinate interchange: donor position read from `x_source`, then
+/// written into `x_target` while preserving the target residual and intensity.
+#[derive(Clone, Debug)]
+pub struct InterchangeResult {
+    /// Target row after the donor coordinate has been delta-written into it.
+    pub edited_target: Array1<f64>,
+    /// Donor/source coordinate that was transplanted.
+    pub donor_t: Array1<f64>,
+    /// Target coordinate before the transplant.
+    pub target_t_before: Array1<f64>,
+    /// Target behavior coordinate after the transplant, re-read from the edit.
+    pub target_t_after: Array1<f64>,
+    /// Steering dose in nats, when a behavioral metric is available.
+    pub predicted_nats: Option<f64>,
+    /// Norm of the steering delta outside the local atom tangent frame.
+    pub off_manifold_norm: f64,
+    /// Reported steering validity radius.
+    pub validity_radius: Option<f64>,
+    /// Calibrated log e-value for counterfactual consistency: larger means the
+    /// post-edit target coordinate landed closer to the donor coordinate.
+    pub counterfactual_consistency_log_e: f64,
+    /// Underlying coordinate-write plan.
+    pub set_result: CoordinateSetResult,
+}
+
+/// Interchange atom `atom_k`'s chart coordinate from `x_source` into `x_target`.
+///
+/// The source coordinate is certified with `source_amplitude`; the target write
+/// is performed with `target_amplitude`, so swapping a position coordinate cannot
+/// silently smuggle donor intensity into the target. The returned consistency
+/// e-value is computed by re-encoding the edited target and calibrating the
+/// coordinate landing error into the existing structure-evidence e-currency.
+pub fn interchange(
+    model: &SaeManifoldTerm,
+    metric: &RowMetric,
+    atlas: &EncodeAtlas,
+    x_target: ArrayView1<'_, f64>,
+    target_amplitude: f64,
+    x_source: ArrayView1<'_, f64>,
+    source_amplitude: f64,
+    atom_k: usize,
+) -> Result<InterchangeResult, String> {
+    let atom = model.atoms.get(atom_k).ok_or_else(|| {
+        format!(
+            "interchange: atom index {atom_k} out of range (term has {} atoms)",
+            model.k_atoms()
+        )
+    })?;
+    let (donor_t, _donor_cert) =
+        atlas.certified_encode_row(atom, atom_k, x_source, source_amplitude)?;
+    let set = set_coordinate(
+        model,
+        metric,
+        atlas,
+        x_target,
+        atom_k,
+        target_amplitude,
+        donor_t.as_slice().unwrap_or(&[]),
+    )?;
+    let (target_t_after, _after_cert) =
+        atlas.certified_encode_row(atom, atom_k, set.edited.view(), target_amplitude)?;
+    let landing_error = l2_distance(donor_t.view(), target_t_after.view())?;
+    let scale = set
+        .steer
+        .validity_radius
+        .unwrap_or_else(|| {
+            l2_distance(set.t_from_certified.view(), donor_t.view())
+                .unwrap_or(1.0)
+                .max(1e-12)
+        })
+        .max(1e-12);
+    // Convert closeness into a superuniform-shaped p-value and then into the
+    // repository's standard e-value currency. Exact hits approach machine-small
+    // p-values; errors at/above the validity radius produce e-values near or
+    // below one, so shuffled-chart negative controls do not accumulate evidence.
+    let z = (scale / landing_error.max(1e-12)).min(1.0e6);
+    let p_value = (-0.5 * z * z).exp().clamp(f64::MIN_POSITIVE, 1.0);
+    let log_e = log_e_from_p_calibrator(p_value)?;
+    Ok(InterchangeResult {
+        edited_target: set.edited.clone(),
+        donor_t,
+        target_t_before: set.t_from_certified.clone(),
+        target_t_after,
+        predicted_nats: set.steer.predicted_nats,
+        off_manifold_norm: set.steer.off_manifold_norm,
+        validity_radius: set.steer.validity_radius,
+        counterfactual_consistency_log_e: log_e,
+        set_result: set,
+    })
+}
+
+fn l2_distance(a: ArrayView1<'_, f64>, b: ArrayView1<'_, f64>) -> Result<f64, String> {
+    if a.len() != b.len() {
+        return Err(format!(
+            "coordinate distance length mismatch: {} vs {}",
+            a.len(),
+            b.len()
+        ));
+    }
+    let mut ss = 0.0;
+    for i in 0..a.len() {
+        let r = a[i] - b[i];
+        ss += r * r;
+    }
+    Ok(ss.sqrt())
+}
+
 /// Build a [`SteerPlan`] for driving atom `atom_k` from `t_from` to `t_to`.
 ///
 /// `model` is the fitted term (read only); `metric` is the per-row output-Fisher
@@ -147,6 +333,33 @@ pub fn steer_delta(
     atom_k: usize,
     t_from: &[f64],
     t_to: &[f64],
+) -> Result<SteerPlan, String> {
+    steer_delta_impl(model, metric, atom_k, t_from, t_to, None)
+}
+
+fn steer_delta_with_amplitude(
+    model: &SaeManifoldTerm,
+    metric: &RowMetric,
+    atom_k: usize,
+    t_from: &[f64],
+    t_to: &[f64],
+    amplitude: f64,
+) -> Result<SteerPlan, String> {
+    if !(amplitude.is_finite() && amplitude > 0.0) {
+        return Err(format!(
+            "steer_delta_with_amplitude: amplitude must be finite and positive, got {amplitude}"
+        ));
+    }
+    steer_delta_impl(model, metric, atom_k, t_from, t_to, Some(amplitude))
+}
+
+fn steer_delta_impl(
+    model: &SaeManifoldTerm,
+    metric: &RowMetric,
+    atom_k: usize,
+    t_from: &[f64],
+    t_to: &[f64],
+    amplitude_override: Option<f64>,
 ) -> Result<SteerPlan, String> {
     let k = model.k_atoms();
     if atom_k >= k {
@@ -195,11 +408,13 @@ pub fn steer_delta(
             active_count += 1.0;
         }
     }
-    let amplitude = if active_count > 0.0 {
-        mass_sum / active_count
-    } else {
-        1.0
-    };
+    let amplitude = amplitude_override.unwrap_or_else(|| {
+        if active_count > 0.0 {
+            mass_sum / active_count
+        } else {
+            1.0
+        }
+    });
 
     // --- the on-manifold activation-space delta -----------------------------
     let g_from = decode_at(evaluator.as_ref(), &atom.decoder_coefficients, t_from, p)?;
