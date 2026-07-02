@@ -193,7 +193,11 @@ def _fit_ev(
     n_iter: int,
     max_fit_seconds: float,
     max_reconstruct_seconds: float,
-) -> tuple[float, float, float, dict | None, list[str], bool]:
+    *,
+    include_timeout: bool = False,
+) -> tuple[float, float, float, dict | None, list[str]] | tuple[
+    float, float, float, dict | None, list[str], bool
+]:
     """Fit one dictionary through the production engine; return HELD-OUT EV.
 
     The real guard is a HARD subprocess timeout: the fit + reconstruct run in a
@@ -223,7 +227,8 @@ def _fit_ev(
             f"reporting NaN EV and flagging timeout.",
             flush=True,
         )
-        return (float("nan"), float("nan"), float("nan"), None, [], True)
+        timed_out_result = (float("nan"), float("nan"), float("nan"), None, [])
+        return (*timed_out_result, True) if include_timeout else timed_out_result
     else:
         executor.shutdown(wait=False)
 
@@ -251,14 +256,14 @@ def _fit_ev(
         f"held_out_EV={result['test_ev']:.4f}",
         flush=True,
     )
-    return (
+    ok_result = (
         result["test_ev"],
         fit_seconds,
         reconstruct_seconds,
         result["hybrid_split"],
         result["atom_topologies"],
-        False,
     )
+    return (*ok_result, False) if include_timeout else ok_result
 
 
 def _parse_ladder(value: str) -> list[int]:
@@ -464,6 +469,7 @@ def main() -> None:
             args.n_iter,
             k_max_fit_seconds,
             args.max_reconstruct_seconds,
+            include_timeout=True,
         )
         # The pure-linear comparison arm rides a separate basis lane whose OOS /
         # basis_with_jet plumbing can error independently of the curved arm (e.g.
@@ -480,6 +486,7 @@ def main() -> None:
                 args.n_iter,
                 k_max_fit_seconds,
                 args.max_reconstruct_seconds,
+                include_timeout=True,
             )
         except Exception as exc:  # noqa: BLE001 — arm-isolated, reported honestly
             print(f"[linear K={k}] arm failed, reporting NaN: {exc}", flush=True)
