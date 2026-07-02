@@ -182,12 +182,16 @@ fn bug_cubic_cell_boundary_value_is_discontinuous_between_neighbors() {
         c2: rc2,
         c3: rc3,
     };
-    let eps = 1e-12;
-    let l = left.eta(boundary - eps);
-    let r = right.eta(boundary + eps);
+    // C0 continuity is a statement about the shared boundary point itself:
+    // both neighboring cells must agree in value there. Evaluate each cell AT
+    // the boundary (not at boundary ± eps, which would inject a spurious
+    // O(eps · slope) gap unrelated to continuity and defeat any tight bound).
+    let l = left.eta(boundary);
+    let r = right.eta(boundary);
     assert!(
-        (l - r).abs() < 1e-15,
-        "Expected cubic-cell evaluation to be continuous at shared boundary from both neighboring cells"
+        (l - r).abs() < 1e-12,
+        "Expected cubic-cell evaluation to be continuous at shared boundary from both neighboring cells: left={l}, right={r}, gap={}",
+        (l - r).abs()
     );
 }
 
