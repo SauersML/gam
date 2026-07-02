@@ -3830,13 +3830,17 @@ impl<'d> SpatialJointContext<'d> {
                     && self.evaluator.supports_nfree_penalty_rekey()
                     && nfree_fast_path_revision.is_some()
         };
-        // TEMP-SKIPOFF-1122: force the exact streamed surface to test whether the
-        // n-free ψ-Gram Chebyshev interpolant is the source of the #1122 H-side
-        // FD-vs-analytic gap. REMOVE.
-        let skip_design_realization = false && skip_design_realization;
-        log::warn!(
-            "[OUTER-FD-AUDIT TEMP-SKIPOFF-1122] skip_design_realization={skip_design_realization}"
-        );
+        // #1868: the #1033 n-free design-realization skip is armed above. A prior
+        // debug override (`TEMP-SKIPOFF-1122`) hard-forced `skip_design_realization`
+        // to `false` here to test whether the n-free ψ-Gram Chebyshev interpolant
+        // was the source of the #1122 H-side FD-vs-analytic gap. That override was
+        // never removed, so every in-window κ `eval_full` trial fell through to the
+        // O(n) `ensure_theta` → `apply_log_kappa` + `reset_surface` lane — the O(n)
+        // per-callback regression #1868 reports. The skip is already gated on
+        // `!allow_second_order`, so it never fires on the H (Hessian) trials the
+        // #1122 diagnostic was probing; the override only ever suppressed the
+        // n-free gradient/value lane. Removing it routes the gradient eval through
+        // the k-space `GaussianFixedCache` + ψ-derivative tensor as intended.
         if skip_design_realization {
             log::debug!(
                 "[STAGE] {} eval_full at psi={:.6}: skipping n×k design re-realization \
