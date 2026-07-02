@@ -8,6 +8,7 @@ pub mod chart_canonicalization;
 pub mod chart_transfer;
 pub mod corpus;
 pub mod criterion_atoms;
+pub mod description_length;
 pub mod dictionary_artifact;
 pub mod encode;
 pub mod gpu_kernels;
