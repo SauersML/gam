@@ -1,7 +1,7 @@
 use crate::estimate::EstimationError;
+use crate::quadrature::latent_cloglog_jet5;
 use gam_math::probability::{normal_cdf, normal_pdf};
 use gam_math::special::stable_polynomial_times_exp_neg as stable_nonnegative_poly_times_exp_neg;
-use crate::quadrature::latent_cloglog_jet5;
 use gam_problem::{
     InverseLink, LatentCLogLogState, LikelihoodSpec, LinkComponent, LinkFunction, MixtureLinkSpec,
     MixtureLinkState, ResponseFamily, SasLinkSpec, SasLinkState, StandardLink,
@@ -1224,7 +1224,7 @@ fn sas_inverse_link_mu_d1(eta: f64, epsilon: f64, log_delta: f64) -> (f64, f64) 
     let e = if eta.is_finite() { eta } else { 0.0 };
     let a = e.asinh();
     let delta = delta_id;
-    let u_raw = delta * a - epsilon;
+    let u_raw = delta * a + epsilon;
     let u = tanh_bound(u_raw, SAS_U_CLAMP);
     let g1 = tanh_bound_d1(u_raw, SAS_U_CLAMP);
     let s = u.sinh();
@@ -1373,7 +1373,6 @@ pub fn inverse_link_pdffourth_derivative_for_inverse_link(
 ) -> Result<f64, EstimationError> {
     inverse_link_pdf_derivative_for_inverse_link(link, eta, PdfDerivativeOrder::Fourth)
 }
-
 
 #[inline]
 fn royston_parmar_inverse_link_jet(eta: f64) -> InverseLinkJet {
@@ -1946,7 +1945,7 @@ pub fn beta_logistic_inverse_link_jetwith_param_partials(
 }
 
 /// SAS inverse-link jet for:
-///   mu(eta) = Phi(sinh(delta * asinh(eta) - epsilon)),
+///   mu(eta) = Phi(sinh(delta * asinh(eta) + epsilon)),
 ///   delta = exp(B * tanh(log_delta / B)), B = SAS_LOG_DELTA_BOUND.
 pub fn sas_inverse_link_jet(eta: f64, epsilon: f64, log_delta: f64) -> InverseLinkJet {
     let delta_id = sas_delta_from_raw_log_delta(log_delta);
@@ -1956,7 +1955,7 @@ pub fn sas_inverse_link_jet(eta: f64, epsilon: f64, log_delta: f64) -> InverseLi
     let e = if eta.is_finite() { eta } else { 0.0 };
     let a = e.asinh();
     let delta = delta_id;
-    let u_raw = delta * a - epsilon;
+    let u_raw = delta * a + epsilon;
     let u = tanh_bound(u_raw, SAS_U_CLAMP);
     let g1 = tanh_bound_d1(u_raw, SAS_U_CLAMP);
     let g2 = tanh_bound_d2(u_raw, SAS_U_CLAMP);
@@ -1986,7 +1985,7 @@ pub fn sas_inverse_link_pdfthird_derivative(eta: f64, epsilon: f64, log_delta: f
     // SAS link with bounded latent transform:
     //
     //   a  = asinh(eta),
-    //   u  = tanh_bound(delta * a - epsilon),
+    //   u  = tanh_bound(delta * a + epsilon),
     //   z  = sinh(u),
     //   mu = Phi(z).
     //
@@ -2021,7 +2020,7 @@ pub fn sas_inverse_link_pdfthird_derivative(eta: f64, epsilon: f64, log_delta: f
     let e = if eta.is_finite() { eta } else { 0.0 };
     let a = e.asinh();
     let delta = sas_delta_from_raw_log_delta(log_delta);
-    let u_raw = delta * a - epsilon;
+    let u_raw = delta * a + epsilon;
     let u = tanh_bound(u_raw, SAS_U_CLAMP);
     let g1 = tanh_bound_d1(u_raw, SAS_U_CLAMP);
     let g2 = tanh_bound_d2(u_raw, SAS_U_CLAMP);
@@ -2083,7 +2082,7 @@ pub fn sas_inverse_link_pdffourth_derivative(eta: f64, epsilon: f64, log_delta: 
     let e = if eta.is_finite() { eta } else { 0.0 };
     let a = e.asinh();
     let delta = sas_delta_from_raw_log_delta(log_delta);
-    let u_raw = delta * a - epsilon;
+    let u_raw = delta * a + epsilon;
     let u = tanh_bound(u_raw, SAS_U_CLAMP);
     let g1 = tanh_bound_d1(u_raw, SAS_U_CLAMP);
     let g2 = tanh_bound_d2(u_raw, SAS_U_CLAMP);
@@ -2167,7 +2166,7 @@ pub fn sas_inverse_link_jetwith_param_partials(
     let (ld_eff, dld_eff_draw) = sas_effective_log_delta(log_delta);
     let delta = ld_eff.exp();
     let ddelta_draw = delta * dld_eff_draw;
-    let u_raw = delta * a - epsilon;
+    let u_raw = delta * a + epsilon;
     let u = tanh_bound(u_raw, SAS_U_CLAMP);
     let g1 = tanh_bound_d1(u_raw, SAS_U_CLAMP);
     let g2 = tanh_bound_d2(u_raw, SAS_U_CLAMP);
@@ -2226,8 +2225,8 @@ pub fn sas_inverse_link_jetwith_param_partials(
         }
     };
 
-    // epsilon partials (raw_u_t = -1).
-    let rt_eps = -1.0;
+    // epsilon partials (raw_u_t = +1).
+    let rt_eps = 1.0;
     let r1t_eps = 0.0;
     let r2t_eps = 0.0;
     let r3t_eps = 0.0;
