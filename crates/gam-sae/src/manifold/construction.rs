@@ -3904,21 +3904,21 @@ impl SaeManifoldTerm {
                             contribution[[row, k]] = c;
                         }
                     }
-                    Some(SaeRowLayout::from_jumprelu(
+                    Some(SaeRowLayout::from_jumprelu(JumpReluLayoutParams {
                         n,
                         k_atoms,
                         threshold,
                         temperature,
-                        &self.assignment.logits,
-                        &contribution,
+                        logits: &self.assignment.logits,
+                        contribution: &contribution,
                         // Cap: rely on the relative cutoff to bound the active set;
                         // a memory-budget cap can be layered in like
                         // `sparse_active_plan` without changing the contract.
-                        k_atoms,
-                        JUMPRELU_RELATIVE_CUTOFF,
-                        coord_dims.clone(),
-                        self.assignment.coord_offsets(),
-                    ))
+                        k_active_cap: k_atoms,
+                        relative_cutoff: JUMPRELU_RELATIVE_CUTOFF,
+                        coord_dims: coord_dims.clone(),
+                        coord_offsets_full: self.assignment.coord_offsets(),
+                    }))
                 }
                 // #1408/#1409 — Softmax engages the COMPACT top-`k` row layout
                 // inside the optimization (no longer a post-fit projection).
