@@ -810,6 +810,22 @@ pub enum SurvivalTimewiggleBeta {
     ByCause(Vec<Vec<f64>>),
 }
 
+/// Route the fitted baseline-timewiggle coefficients into the matching payload
+/// slot. Both survival payload assemblers funnel through this ONE exhaustive
+/// `match` so a new [`SurvivalTimewiggleBeta`] variant is a compile error rather
+/// than a silent drop (the location-scale assembler previously `if let`-matched
+/// only `Single` and silently discarded `ByCause`).
+fn apply_timewiggle_beta(payload: &mut FittedModelPayload, beta: SurvivalTimewiggleBeta) {
+    match beta {
+        SurvivalTimewiggleBeta::Single(beta) => {
+            payload.beta_baseline_timewiggle = Some(beta);
+        }
+        SurvivalTimewiggleBeta::ByCause(by_cause) => {
+            payload.beta_baseline_timewiggle_by_cause = Some(by_cause);
+        }
+    }
+}
+
 /// Snapshot of the baseline-timewiggle block persisted with a survival model.
 pub struct SurvivalTimewiggle {
     pub degree: usize,
@@ -880,14 +896,7 @@ pub fn assemble_survival_transformation_payload(
         payload.baseline_timewiggle_knots = Some(timewiggle.knots);
         payload.baseline_timewiggle_penalty_orders = timewiggle.penalty_orders;
         payload.baseline_timewiggle_double_penalty = timewiggle.double_penalty;
-        match timewiggle.beta {
-            SurvivalTimewiggleBeta::Single(beta) => {
-                payload.beta_baseline_timewiggle = Some(beta);
-            }
-            SurvivalTimewiggleBeta::ByCause(by_cause) => {
-                payload.beta_baseline_timewiggle_by_cause = Some(by_cause);
-            }
-        }
+        apply_timewiggle_beta(&mut payload, timewiggle.beta);
     }
     payload.survivalridge_lambda = Some(inputs.ridge_lambda);
     payload.survival_likelihood = Some(inputs.survival_likelihood_label);
@@ -956,9 +965,7 @@ pub fn assemble_survival_location_scale_payload(
         payload.baseline_timewiggle_knots = Some(timewiggle.knots);
         payload.baseline_timewiggle_penalty_orders = timewiggle.penalty_orders;
         payload.baseline_timewiggle_double_penalty = timewiggle.double_penalty;
-        if let SurvivalTimewiggleBeta::Single(beta) = timewiggle.beta {
-            payload.beta_baseline_timewiggle = Some(beta);
-        }
+        apply_timewiggle_beta(&mut payload, timewiggle.beta);
     }
     payload.survival_entry = inputs.survival_entry;
     payload.survival_exit = Some(inputs.survival_exit);
@@ -1050,4 +1057,50 @@ pub fn assemble_latent_window_payload(
     payload.resolved_termspec = Some(inputs.resolved_termspec);
     source.apply_to(&mut payload);
     payload
+}
+
+#[cfg(test)]
+mod apply_timewiggle_beta_tests {
+    use super::*;
+
+    /// Minimal payload with both baseline-timewiggle slots unset. Uses the
+    /// fixture-free `LatentBinary` family so the test needs no `LikelihoodSpec`.
+    fn empty_payload() -> FittedModelPayload {
+        FittedModelPayload::new(
+            MODEL_PAYLOAD_VERSION,
+            "y ~ 1".to_string(),
+            ModelKind::Survival,
+            FittedFamily::LatentBinary {
+                frailty: crate::survival::lognormal_kernel::FrailtySpec::None,
+            },
+            "test".to_string(),
+        )
+    }
+
+    #[test]
+    fn by_cause_beta_populates_only_the_by_cause_slot() {
+        let mut payload = empty_payload();
+        apply_timewiggle_beta(
+            &mut payload,
+            SurvivalTimewiggleBeta::ByCause(vec![vec![1.0, 2.0], vec![3.0]]),
+        );
+        assert_eq!(
+            payload.beta_baseline_timewiggle_by_cause,
+            Some(vec![vec![1.0, 2.0], vec![3.0]]),
+            "ByCause coefficients must land in the by-cause slot (regression: the \
+             location-scale assembler used to silently drop them)"
+        );
+        assert!(
+            payload.beta_baseline_timewiggle.is_none(),
+            "ByCause must not populate the single-block slot"
+        );
+    }
+
+    #[test]
+    fn single_beta_populates_only_the_flat_slot() {
+        let mut payload = empty_payload();
+        apply_timewiggle_beta(&mut payload, SurvivalTimewiggleBeta::Single(vec![4.0, 5.0]));
+        assert_eq!(payload.beta_baseline_timewiggle, Some(vec![4.0, 5.0]));
+        assert!(payload.beta_baseline_timewiggle_by_cause.is_none());
+    }
 }
