@@ -419,17 +419,6 @@ pub struct PirlsResult {
     /// the scale-invariant residual r_g = ‖g‖ / (1 + this) without rebuilding
     /// the score and penalty norms.
     pub gradient_natural_scale: f64,
-    /// Penalized inner KKT residual `r = ∇_β L_pen(β̂) = Sβ̂ − ∇ℓ(β̂) (+ridge·β̂)`
-    /// at the accepted P-IRLS iterate, in the STABLE/TRANSFORMED coefficient
-    /// basis (the same frame as `beta_transformed` and
-    /// `penalized_hessian_transformed`). This is the exact vector whose L2 norm
-    /// `lastgradient_norm` records; storing the vector itself lets the outer
-    /// REML/LAML evaluator engage the KKT-residual envelope correction
-    /// `Ṽ = V − ½·rᵀH⁻¹r` when the inner β̂ was accepted at a first-order cap
-    /// short of exact stationarity (the `outer_inner_cap` schedule), rather than
-    /// silently assuming exact KKT. It is `Sβ̂ − ∇ℓ` up to sign conventions and
-    /// vanishes as the inner solve converges. See `ProjectedKktResidual`.
-    pub penalized_gradient_transformed: Array1<f64>,
     pub last_deviance_change: f64,
     pub last_step_halving: usize,
     pub hessian_curvature: HessianCurvatureKind,
@@ -562,10 +551,6 @@ impl PirlsResult {
             max_abs_eta: self.max_abs_eta,
             lastgradient_norm: self.lastgradient_norm,
             gradient_natural_scale: self.gradient_natural_scale,
-            // Small (length-p) vector; keep it across compaction so the KKT
-            // envelope correction survives an LRU round-trip without needing to
-            // rebuild the score from the (dropped) transformed design.
-            penalized_gradient_transformed: self.penalized_gradient_transformed.clone(),
             last_deviance_change: self.last_deviance_change,
             last_step_halving: self.last_step_halving,
             hessian_curvature: self.hessian_curvature,
@@ -653,7 +638,6 @@ impl PirlsResult {
             max_abs_eta: self.max_abs_eta,
             lastgradient_norm: self.lastgradient_norm,
             gradient_natural_scale: self.gradient_natural_scale,
-            penalized_gradient_transformed: self.penalized_gradient_transformed.clone(),
             last_deviance_change: self.last_deviance_change,
             last_step_halving: self.last_step_halving,
             hessian_curvature: self.hessian_curvature,

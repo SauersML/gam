@@ -661,7 +661,6 @@ mod linux_impl {
             max_abs_eta: max_abs_eta_used,
             lastgradient_norm,
             gradient_natural_scale,
-            penalized_gradient_transformed: working_summary.state.gradient.clone(),
             last_deviance_change,
             last_step_halving,
             hessian_curvature: match curvature {
@@ -963,7 +962,6 @@ mod linux_impl {
             max_abs_eta,
             lastgradient_norm: gradient_norm,
             gradient_natural_scale: score_norm + s_beta_norm + ridge_grad_norm,
-            penalized_gradient_transformed: working_summary.state.gradient.clone(),
             last_deviance_change: 0.0,
             last_step_halving: 0,
             hessian_curvature: HessianCurvatureKind::Fisher,
