@@ -285,3 +285,53 @@ pub(crate) fn two_circle_separates_at_narrow_and_wide_widths_2027() {
         );
     }
 }
+
+/// #2082 — the STRUCTURAL coherence detector must fire on atoms that decode the
+/// SAME output subspace (the "high EV, no structure" collapse the two-width test
+/// catches) and stay SILENT on atoms whose decoders span ORTHOGONAL subspaces
+/// (a healthy well-separated dictionary), keying on the derived random-subspace
+/// null — so a live fit's guard reseeds a merged pair without touching separated
+/// atoms.
+#[test]
+pub(crate) fn structural_coherence_detector_fires_on_duplicate_not_orthogonal_2082() {
+    let n = 48usize;
+    let p = 8usize;
+    let m = 5usize;
+    let (mut term, _target) = two_circle_k2_term(n, p, m);
+
+    // ORTHOGONAL output subspaces: atom 0 decodes only EVEN output channels, atom 1
+    // only ODD → their output frames are orthogonal → coherence 0 → NOT flagged.
+    for atom in 0..2 {
+        let mut b = Array2::<f64>::zeros((m, p));
+        for col in 0..m {
+            let out = (if atom == 0 { 0 } else { 1 }) + 2 * (col % (p / 2));
+            if out < p {
+                b[[col, out]] = 1.0;
+            }
+        }
+        term.atoms[atom].decoder_coefficients = b;
+    }
+    assert!(
+        term.structural_coherence_collapse_detected().unwrap().is_none(),
+        "orthogonal-subspace atoms must NOT be flagged as structurally collapsed"
+    );
+
+    // DUPLICATE output subspaces: both atoms decode the SAME two output directions
+    // → identical output frames → coherence ~1 → flagged (well above the ½(μ_null+1)
+    // bar; for p=8, rank-2, μ_null ≈ 0.9 so the bar ≈ 0.95, and 1.0 clears it).
+    let mut dup = Array2::<f64>::zeros((m, p));
+    dup[[0, 0]] = 1.0;
+    dup[[1, 1]] = 1.0;
+    term.atoms[0].decoder_coefficients = dup.clone();
+    term.atoms[1].decoder_coefficients = dup;
+    let hit = term
+        .structural_coherence_collapse_detected()
+        .unwrap()
+        .expect("duplicate-subspace atoms must be flagged as structurally collapsed");
+    assert_eq!((hit.0, hit.1), (0, 1), "the offending pair is (0, 1)");
+    assert!(
+        hit.2 > 0.99,
+        "duplicate output frames must report coherence ~1, got {}",
+        hit.2
+    );
+}
