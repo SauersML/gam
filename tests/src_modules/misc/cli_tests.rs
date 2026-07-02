@@ -1397,6 +1397,59 @@ fn saved_prediction_runtime_rejects_location_scale_survival_payload_drift() {
 }
 
 #[test]
+fn cli_predict_noise_default_logit_base_link_fits_without_blend_spec() {
+    // #1828 defect (1), CLI angle: the DEFAULT binomial-logit location-scale
+    // predict-noise model (no explicit `link(...)`) must fit directly. Before
+    // the fix the default-logit arm wrongly `.ok_or_else`-errored demanding a
+    // `link(type=blended(...))` mixture spec, so the ordinary logit base link
+    // could not run at all. The existing sibling test covers explicit probit;
+    // this one pins the default-logit path that was actually broken, and — with
+    // a parametric-linear scale formula `x2` — also exercises defect (2)'s
+    // now-accepted heteroscedastic (het-logit) log_sigma from the CLI.
+    let td = tempdir().unwrap_or_else(|e| panic!("{} failed: {:?}", "tempdir", e));
+    let train_path = td.path().join("train.csv");
+    let model_path = td.path().join("model.json");
+    write_binomial_location_scale_train_csv(&train_path);
+
+    run_fit(location_scale_fit_args(
+        train_path,
+        model_path.clone(),
+        // No `link(...)`: family=Auto infers binomial for 0/1 data and the base
+        // link defaults to logit. `x2` is a parametric-linear scale (het-logit).
+        "y ~ x1",
+        "x2",
+    ))
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "default-logit location-scale predict-noise fit should succeed without a blend spec",
+            e
+        )
+    });
+
+    let saved = SavedModel::load_from_path(&model_path)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "load fitted model", e));
+    assert_eq!(
+        saved.link.as_ref(),
+        Some(&InverseLink::Standard(StandardLink::Logit)),
+        "default (no link()) binomial location-scale must keep the logit base link"
+    );
+    match &saved.family_state {
+        FittedFamily::LocationScale {
+            likelihood,
+            base_link,
+        } => {
+            assert_eq!(*likelihood, LikelihoodSpec::binomial_logit());
+            assert!(
+                matches!(base_link.as_ref(), Some(InverseLink::Standard(StandardLink::Logit))),
+                "expected logit base link, got {base_link:?}"
+            );
+        }
+        other => panic!("expected location-scale family state, got {other:?}"),
+    }
+}
+
+#[test]
 fn cli_predict_noise_with_explicit_probit_keeps_binomial_probit_base_link() {
     let td = tempdir().unwrap_or_else(|e| panic!("{} failed: {:?}", "tempdir", e));
     let train_path = td.path().join("train.csv");
