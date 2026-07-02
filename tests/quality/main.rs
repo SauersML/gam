@@ -2,6 +2,7 @@
 //!
 //! Former top-level crates included as modules so they link as ONE binary.
 
+mod calibration;
 mod factors;
 mod families;
 mod manifolds;
