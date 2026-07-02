@@ -704,19 +704,22 @@ class _JumpReLUBoundedGateFn(torch.autograd.Function):
     def forward(
         ctx: Any, logits: torch.Tensor, thresholds: torch.Tensor, temperature: float
     ) -> torch.Tensor:
-        rust = rust_module()
-        rows = to_numpy_f64(logits).reshape(logits.shape[0], -1)
-        thr = np.ascontiguousarray(to_numpy_f64(thresholds).reshape(-1))
-        value = np.empty_like(rows)
-        grad = np.empty_like(rows)
-        for r in range(rows.shape[0]):
-            v_r, g_r = rust.sae_jumprelu_row_value_grad(
-                np.ascontiguousarray(rows[r]), float(temperature), thr
-            )
-            value[r] = np.asarray(v_r, dtype=np.float64)
-            grad[r] = np.asarray(g_r, dtype=np.float64)
-        ctx.save_for_backward(from_numpy_like(grad, logits).reshape_as(logits))
-        return from_numpy_like(value, logits).reshape_as(logits)
+        # Pure-torch, on-device transcription of the Rust source of truth
+        # `gam_sae::assignment::jumprelu_row_value_grad` (crates/gam-sae/src/
+        # assignment.rs:1079). Per atom, with ``inv_tau = 1/τ`` (matching the
+        # Rust multiply order for bit-parity):
+        #   ``sig = σ((l − θ)·inv_tau)`` (stable_logistic ≡ torch.sigmoid)
+        #   ``value = sig`` where ``l > θ`` else ``0`` (hard jump)
+        #   ``grad  = sig·(1 − sig)·inv_tau`` (straight-through, both sides)
+        # No CPU/float64 round-trip: dtype and device are preserved.
+        rows = logits.reshape(logits.shape[0], -1)
+        thr = thresholds.reshape(1, -1)
+        inv_tau = 1.0 / temperature
+        sig = torch.sigmoid((rows - thr) * inv_tau)
+        value = torch.where(rows > thr, sig, torch.zeros_like(sig))
+        grad = sig * (1.0 - sig) * inv_tau
+        ctx.save_for_backward(grad.reshape_as(logits))
+        return value.reshape_as(logits)
 
     @staticmethod
     def backward(

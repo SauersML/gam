@@ -6,6 +6,80 @@ use super::SaeAtomBasisKind;
 use gam_linalg::faer_ndarray::FaerSvd;
 use ndarray::{Array1, Array2, Array3, ArrayView2};
 
+/// Residual-norm floor below which the surplus atom's second phase axis is
+/// treated as collinear with the first (a degenerate 2-plane). Since both
+/// candidate directions enter `surplus_phase_plane` unit-normalized, the
+/// post-orthogonalization residual norm is the sine of the angle between them,
+/// so this is an absolute "how far from collinear" threshold in `[0, 1]`.
+const SURPLUS_DIR_FLOOR: f64 = 1.0e-6;
+
+/// Deterministic generic 2-plane for an OVERCOMPLETE (#1893) SURPLUS periodic
+/// atom, i.e. one whose index outruns the available disjoint PC pairs. Builds
+/// two pseudo-random combinations of ALL principal directions (a random 2-plane
+/// in the PC span) and Gram-Schmidt orthogonalizes the second against the first.
+///
+/// `pc_pair_offset` (the #976 multi-start retry index) is folded into the
+/// splitmix64 weight key via a base-`k_atoms` mix of `(atom_idx, pc_pair_offset)`,
+/// so the SAME surplus atom lands on a DIFFERENT random plane on each reseed
+/// retry (distinct basins by construction) while every `(atom, retry)` key stays
+/// distinct and `pc_pair_offset == 0` reproduces the original key bit-for-bit.
+///
+/// Returns `(dir1, dir2, two_dimensional)`. When the orthogonalized residual
+/// falls below [`SURPLUS_DIR_FLOOR`] the random combination was essentially
+/// collinear (or the effective PC span is 1-D), so `two_dimensional` is `false`
+/// and the caller must fall back to the 1-D span phase path rather than feed an
+/// `atan2` a degenerate plane that collapses to two phase points.
+fn surplus_phase_plane(
+    vt: ArrayView2<'_, f64>,
+    atom_idx: usize,
+    pc_pair_offset: usize,
+    k_atoms: usize,
+) -> (Array1<f64>, Array1<f64>, bool) {
+    let vt_rows = vt.nrows();
+    let ncols = vt.ncols();
+    // splitmix64-seeded weights keyed by (atom_idx, pc_pair_offset, pc):
+    // reproducible, no RNG crate, distinct per atom and per multi-start retry.
+    let mix = |mut z: u64| -> f64 {
+        z = z.wrapping_add(0x9E3779B97F4A7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^= z >> 31;
+        (z as f64 / u64::MAX as f64) * 2.0 - 1.0
+    };
+    let mut a = Array1::<f64>::zeros(ncols);
+    let mut b = Array1::<f64>::zeros(ncols);
+    for pc in 0..vt_rows {
+        let row_pc = vt.row(pc);
+        let key = (((atom_idx as u64) + (pc_pair_offset as u64) * (k_atoms as u64)) << 20)
+            ^ (pc as u64);
+        let wa = mix(key);
+        let wb = mix(key ^ 0xD1B54A32D192ED03);
+        for c in 0..ncols {
+            a[c] += wa * row_pc[c];
+            b[c] += wb * row_pc[c];
+        }
+    }
+    let na = a.dot(&a).sqrt().max(1.0e-12);
+    a.mapv_inplace(|v| v / na);
+    let nb = b.dot(&b).sqrt().max(1.0e-12);
+    b.mapv_inplace(|v| v / nb);
+    // Gram-Schmidt: strip dir1's component out of dir2 so the two phase axes are
+    // not near-collinear. Two independently normalized random combinations can be
+    // near-parallel (likely when the effective spectrum is small), which would
+    // make `atan2(z·dir2, z·dir1)` take only two values and kill the diversity
+    // this branch exists to create. With unit dir1 the residual norm equals the
+    // sine of the angle between the raw directions.
+    let proj = b.dot(&a);
+    b.scaled_add(-proj, &a);
+    let nb_res = b.dot(&b).sqrt();
+    if nb_res > SURPLUS_DIR_FLOOR {
+        b.mapv_inplace(|v| v / nb_res);
+        (a, b, true)
+    } else {
+        (a, b, false)
+    }
+}
+
 /// PCA-based seed for SAE atom latent coordinates. Centers `z`, takes its SVD,
 /// and projects onto leading principal components to initialize each atom's
 /// chart according to its [`SaeAtomBasisKind`]: periodic atoms read a `[0, 1)`
