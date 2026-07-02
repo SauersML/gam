@@ -54,21 +54,33 @@ Producer: **WS-D data plane** (`ShardWriter` manifest `stats`) and/or **WS-C**
 "d_model": P, "total_tokens": N
 ```
 
-WS-J additionally records, when available, the **rogue dims** (the few
-high-variance residual-stream directions removed before geometry) and the global
-**scale** — the T0 fields SAC_PLAN Part-3 WS-D calls for ("mean + rogue dims +
-scale"). Contract:
+A **finalized** WS-D manifest (`finalize_harvest.py`, `compute_t0`) carries a full
+`t0` block WS-J passes through verbatim — this is the frozen contract, matched
+exactly by `load_t0_from_manifest`. As harvested on node2 (Qwen3-32B, layers
+24/32/40, `d_model=5120`), the massive-activation ("rogue") dims are a nested
+block, not a flat list:
 
 ```json
 "t0": {
-  "mean":      [P floats],       // required (from manifest stats.mean)
-  "norm":      [P floats],       // required (from manifest stats.norm / rms)
-  "rogue_dims":[int, ...],       // optional: indices of removed high-var dirs
-  "scale":     float,            // optional: global RMS scale
-  "d_model":   P,
-  "total_tokens": N
+  "d_model": 5120,
+  "mean": [P floats], "std": [P floats], "rms": [P floats],   // per-dim
+  "scale_median_std": float,      // robust central per-dim std (whitening ref)
+  "scale_median_rms": float,
+  "rogue_dims": {                 // massive-activation dims (~376 for Qwen3-32B L24)
+    "index":          [int, ...], // the coordinates removed before geometry
+    "rms":            [float,...],
+    "rms_over_median":[float,...],
+    "mad_z":          [float,...],
+    "rule": "rms>5*median_rms OR MAD-z>8"
+  }
 }
 ```
+
+A **provisional** manifest carries only `stats: {mean, norm}`; T0 is then built
+from those with `rogue_dims`/`scale` absent (recorded, never fabricated). The
+content hash folds `mean/std/rms/scale_median_*` and the `rogue_dims.index` set
+(the identity of the massive-activation dims), so two harvests that agree on the
+massive-activation set and per-dim stats hash their T0 identically.
 
 ## Tier T1 — linear sparse dictionary
 

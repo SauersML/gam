@@ -170,14 +170,22 @@ class TieredArtifact:
         """Canonical content hash folding every present tier (see ARTIFACT_SCHEMA.md)."""
         h = hashlib.sha256()
         h.update(_HASH_VERSION)
-        # T0
+        # T0 — folds both the provisional (``mean``/``norm``) and the finalized
+        # WS-D shape (per-dim ``mean``/``std``/``rms``, ``scale_median_std``, and
+        # the nested ``rogue_dims`` massive-activation block).
         if self.t0 is not None:
             h.update(b"T0")
-            for key in ("mean", "norm", "scale"):
+            for key in ("mean", "norm", "std", "rms", "scale",
+                        "scale_median_std", "scale_median_rms"):
                 v = self.t0.get(key)
                 if v is not None:
                     _hash_array_f64(h, np.atleast_1d(np.asarray(v, dtype=np.float64)))
             rogue = self.t0.get("rogue_dims")
+            # rogue_dims is either a flat index list (provisional convenience) or
+            # the finalized dict ``{"index": [...], ...}``; fold only the indices,
+            # which are the identity of the massive-activation set.
+            if isinstance(rogue, dict):
+                rogue = rogue.get("index")
             if rogue is not None:
                 h.update(np.ascontiguousarray(np.asarray(rogue, dtype="<i8")).tobytes())
         # T1 — canonicalize each decoder row (unit norm, orient) then fold
@@ -295,22 +303,33 @@ class TieredArtifact:
 # Loaders — consume exactly what each producing workstream emits.              #
 # --------------------------------------------------------------------------- #
 def load_t0_from_manifest(manifest_path: str) -> dict[str, Any]:
-    """T0 from a WS-D ``ShardWriter`` manifest (``examples/residual_shard_io.py``)."""
+    """T0 from a WS-D harvest manifest (``residual_shard_io.py`` / ``finalize_harvest``).
+
+    A *finalized* WS-D manifest carries a full ``t0`` block (the ``compute_t0``
+    output: per-dim ``mean``/``std``/``rms``, ``scale_median_std`` /
+    ``scale_median_rms``, and the nested ``rogue_dims`` = massive-activation dims
+    ``{"index":[...], "rms":[...], "rms_over_median":[...], "mad_z":[...]}``). It is
+    already the canonical T0 dict, so it is passed through verbatim (with
+    ``d_model`` / ``total_tokens`` attached). A *provisional* manifest carries only
+    ``stats: {mean, norm}``; T0 is then built from those, with ``rogue_dims`` /
+    ``scale`` absent (recorded, not fabricated).
+    """
     with open(manifest_path) as f:
         m = json.load(f)
+    if isinstance(m.get("t0"), dict) and m["t0"]:
+        t0 = dict(m["t0"])
+        t0.setdefault("d_model", m.get("d_model"))
+        t0["total_tokens"] = m.get("total_tokens")
+        t0["provisional"] = bool(m.get("provisional", False))
+        return t0
     stats = m.get("stats", {})
-    t0: dict[str, Any] = {
+    return {
         "mean": stats.get("mean"),
         "norm": stats.get("norm"),
         "d_model": m.get("d_model"),
         "total_tokens": m.get("total_tokens"),
+        "provisional": bool(m.get("provisional", True)),
     }
-    # Optional rogue dims / scale if the harvester recorded them.
-    if "rogue_dims" in m:
-        t0["rogue_dims"] = m["rogue_dims"]
-    if "scale" in m:
-        t0["scale"] = m["scale"]
-    return t0
 
 
 def load_tier1_artifact(source: Any) -> tuple[np.ndarray, dict[str, Any] | None]:
