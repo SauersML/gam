@@ -265,6 +265,7 @@ fn aniso_matern_full_outer_loop_recovers_planted_signal_r2() {
         coefficient_groups: Vec::new(),
         penalty_block_gamma_priors: Vec::new(),
         latent_coord: None,
+        estimate_tweedie_p: false,
         _marker: std::marker::PhantomData,
     }))
     .expect("anisotropic Matérn full-outer-loop fit should converge");
@@ -404,6 +405,7 @@ fn fit_aniso_recovery(double_penalty: bool, num_centers: usize) -> AnisoRecovery
         coefficient_groups: Vec::new(),
         penalty_block_gamma_priors: Vec::new(),
         latent_coord: None,
+        estimate_tweedie_p: false,
         _marker: std::marker::PhantomData,
     }))
     .expect("anisotropic Matérn ablation fit should converge");
