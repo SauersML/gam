@@ -4995,6 +4995,71 @@ fn gaussian_reml_fit_with_constraints_forward<'py>(
         return Ok(out.unbind());
     }
 
+    // Interior-cert fast path. Even with an inequality system present, if the
+    // *unconstrained* closed-form optimum is already strictly interior — every
+    // row `a_i·β̂ > b_i` beyond the boundary tolerance — then no constraint
+    // binds, so by the KKT conditions (all multipliers zero) that unconstrained
+    // optimum IS the constrained solution. Returning the closed form here makes
+    // a present-but-non-binding constraint (e.g. the degenerate `0·β ≥ −1`)
+    // agree bit-for-bit with the unconstrained `gaussian_reml_fit` and with the
+    // interior-cert branch of the analytic backward, which already
+    // differentiates this same closed form; the PIRLS outer loop otherwise
+    // settles on a slightly different smoothing parameter and desynchronises the
+    // forward from both. The strict-interior predicate is the exact negation of
+    // the active-set report's binding test below (same tolerance), so taking
+    // this path ⟺ the reported active set is empty. Only when the unconstrained
+    // optimum actually reaches or violates a row do we pay for the constrained
+    // PIRLS solve.
+    if let Some(constraints) = constraints_opt.as_ref() {
+        let init_lambda = init_log_lambda.map(f64::exp);
+        let x_cf = x_view.to_owned();
+        let y_cf = y_view.to_owned();
+        let penalty_cf = penalty_view.to_owned();
+        let weights_cf: Option<Array1<f64>> = weights.as_ref().map(|w| w.as_array().to_owned());
+        let cf = detach_estimation_result(
+            py,
+            "gaussian_reml_fit_with_constraints_forward",
+            move || {
+                gaussian_reml_multi_closed_form_with_cache(
+                    x_cf.view(),
+                    y_cf.view(),
+                    penalty_cf.view(),
+                    weights_cf.as_ref().map(|w| w.view()),
+                    init_lambda,
+                    None,
+                )
+            },
+        )?;
+        let beta_cf = cf.coefficients.column(0).to_owned();
+        let beta_scale = beta_cf.iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1.0);
+        let ab: Array1<f64> = constraints.a.dot(&beta_cf);
+        let strictly_interior = (0..constraints.a.nrows()).all(|i| {
+            let row_scale =
+                constraints
+                    .a
+                    .row(i)
+                    .iter()
+                    .fold(0.0_f64, |m, &v| m.max(v.abs()))
+                    .max(1.0);
+            let tol = 1e-8 * row_scale * beta_scale.max(constraints.b[i].abs().max(1.0));
+            ab[i] > constraints.b[i] + tol
+        });
+        if strictly_interior {
+            let lambda_scalar = cf.lambda;
+            let log_lambda_scalar = lambda_scalar.max(1e-300).ln();
+            let active_indices_arr: Array1<u64> = Array1::from_vec(Vec::new());
+            let out = PyDict::new(py);
+            out.set_item("coefficients", cf.coefficients.into_pyarray(py))?;
+            out.set_item("fitted", cf.fitted.into_pyarray(py))?;
+            out.set_item("lambda", lambda_scalar)?;
+            out.set_item("log_lambda", log_lambda_scalar)?;
+            out.set_item("reml_score", cf.reml_score)?;
+            out.set_item("edf", cf.edf)?;
+            out.set_item("active_indices", active_indices_arr.into_pyarray(py))?;
+            return Ok(out.unbind());
+        }
+    }
+
     let s_list: Vec<gam::terms::smooth::BlockwisePenalty> =
         vec![gam::terms::smooth::BlockwisePenalty::new(
             0..p_cols,
