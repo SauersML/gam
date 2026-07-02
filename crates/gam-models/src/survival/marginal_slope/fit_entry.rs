@@ -33,8 +33,13 @@ pub fn fit_survival_marginal_slope_terms(
     // via kappa_options; generous default. Cleared on EVERY exit path so a stale
     // deadline never leaks to a later fit.
     let budget_secs = kappa_options.outer_wall_clock_budget_secs.unwrap_or(300.0);
-    let _deadline_guard = OuterWallClockDeadlineGuard::arm(budget_secs);
-    fit_survival_marginal_slope_terms_impl(data, spec, options, kappa_options)
+    let deadline_guard = OuterWallClockDeadlineGuard::arm(budget_secs);
+    let result = fit_survival_marginal_slope_terms_impl(data, spec, options, kappa_options);
+    // Explicit drop (not an underscore binding, which the build.rs ban-scanner
+    // rejects) clears the deadline on this return path; the guard's `Drop` also
+    // covers any panic-unwind exit, so the deadline never leaks to a later fit.
+    drop(deadline_guard);
+    result
 }
 
 pub(crate) fn fit_survival_marginal_slope_terms_impl(
