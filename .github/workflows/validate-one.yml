@@ -120,7 +120,7 @@ jobs:
 
       - name: Run Python tests (filtered, fail-fast)
         if: ${{ github.event.inputs.py_filter != '' }}
-        run: python -m pytest tests/ -k "${{ github.event.inputs.py_filter }}" -x -q --tb=short
+        run: python -m pytest tests/ -k "${{ github.event.inputs.py_filter }}" --continue-on-collection-errors -p no:cacheprovider -x -q --tb=short
 
       - name: Guard against an empty request
         if: ${{ github.event.inputs.rust_filter == '' && github.event.inputs.py_filter == '' }}
