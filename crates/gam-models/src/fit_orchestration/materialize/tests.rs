@@ -165,13 +165,11 @@ fn survival_transformation_left_truncated_uses_median_exit_anchor() {
     )
     .expect("load left-truncated dataset");
 
-    // Default config -> `transformation` (Royston-Parmar) likelihood, the path
-    // the Python `family="survival"` default takes.
-    let config = FitConfig::default();
-    assert_eq!(
-        config.survival_likelihood, "transformation",
-        "test presumes the default survival likelihood is transformation"
-    );
+    // The config-layer/Python default explicitly selects the `transformation`
+    // (Royston-Parmar) likelihood; the direct Rust `FitConfig::default()` stays
+    // lognormal location-scale for backwards-compatible formula fits.
+    let mut config = FitConfig::default();
+    config.survival_likelihood = "transformation".to_string();
 
     let materialized = materialize("Surv(entry, exit, event) ~ x", &data, &config)
         .expect("left-truncated transformation survival should materialize");
@@ -2384,11 +2382,12 @@ fn survival_likelihood_rejected_on_nonsurvival_response() {
 
 #[test]
 fn default_survival_likelihood_allowed_on_nonsurvival_response() {
-    // Positive control: the default ("transformation") mode is indistinguishable
-    // from "unset" and must NOT be rejected, so the guard isn't over-broad.
+    // Positive control: the Rust default (lognormal location-scale) mode is
+    // indistinguishable from "unset" and must NOT be rejected, so the guard
+    // isn't over-broad.
     let data = nonsurvival_gaussian_dataset();
     let config = FitConfig::default();
-    assert_eq!(config.survival_likelihood, "transformation");
+    assert_eq!(config.survival_likelihood, "location-scale");
 
     materialize("time ~ s(x)", &data, &config)
         .expect("default survival_likelihood must still materialize an ordinary GAM (#1767)");
