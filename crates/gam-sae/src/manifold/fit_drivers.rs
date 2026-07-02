@@ -2220,11 +2220,23 @@ impl SaeManifoldTerm {
         } else {
             0.5 * (sorted[k / 2 - 1] + sorted[k / 2])
         };
-        // No usable scale (every decoder is ≈0, e.g. the cold-start zero seed):
-        // the joint solve has not yet placed any signal, so there is nothing to
-        // be "behind"; defer to the mass guard / inner solve rather than reseed
-        // against an all-zero reference.
-        if !(median > 0.0) {
+        // No usable scale (every decoder is ≈0). At ENTRY (iteration 0) this is the
+        // cold-start zero seed — the joint solve has not placed any signal yet, so
+        // there is nothing to be "behind"; defer to the mass guard / inner solve
+        // rather than reseed against an all-zero reference.
+        //
+        // #2027: at iteration > 0 a zero median is NOT cold — the joint solve has
+        // run and STILL left EVERY decoder vanished. That is the stuck-at-null
+        // co-collapse the whitened K≥2 fit falls into (both atoms carry ≈nothing, so
+        // the median collapses WITH them and the relative-norm arm sees no atom
+        // "behind"). Returning here would make the ABSOLUTE co-collapse arm below —
+        // which keys on EV ≤ the null floor AND co-vanished output, i.e. EXACTLY this
+        // state — permanently UNREACHABLE, so the reseed/deflation/anchor never fire
+        // (the #2027 repro's `cocollapse_reseeds == 0` at EV = −0.0). Fall through
+        // instead: with median = 0 the relative floor is 0, no atom is flagged
+        // "behind" (`breached` stays empty), and the iteration>0 absolute arm
+        // correctly recognizes the co-vanished dictionary and reseeds it.
+        if !(median > 0.0) && iteration == 0 {
             return Ok(());
         }
         let floor = SAE_ATOM_DECODER_NORM_COLLAPSE_RATIO * median;
@@ -3634,6 +3646,32 @@ impl SaeManifoldTerm {
             let mut grams = self.empty_decoder_gram_accumulator();
             self.accumulate_decoder_gram(&mut grams);
             self.finalize_decoder_identifiability_audit(&grams, self.n_obs())?;
+        }
+        // #2027 — COLD-START disjoint decoder placement. The joint Newton solve
+        // below relies on its first step to place decoder mass from the seed, but an
+        // all-≈0 cold decoder is a DEGENERATE stationary start: with every `B_k = 0`
+        // the reconstruction is the zero map, the inner gradient can already sit under
+        // the relative convergence tolerance, and the loop "converges" and BREAKS at
+        // iteration 0 without ever placing a decoder — the fit returns the null
+        // reconstruction (EV ≈ 0) and the in-loop co-collapse guard (which the loop
+        // body reaches only AFTER an accepted step) never runs. This is the whitened
+        // K≥2 co-collapse fingerprint: EV = −0.0, `cocollapse_reseeds = 0`. Give the
+        // solve a NON-DEGENERATE start whenever the dictionary decoder has co-vanished
+        // at entry: place an initial DISJOINT-subspace decoder by greedy deflation —
+        // each atom claims a distinct chunk of the target (the same refit the
+        // co-collapse reseed arm uses), so the atoms start on separate structure and
+        // the Newton walk has a real coordinate gradient to descend. Gated strictly on
+        // a co-vanished decoder (`max_k ‖B_k‖ == 0`, the cold seed): any warm-started
+        // or already-placed decoder is left byte-for-byte untouched, so every existing
+        // non-cold fit — and the `max_iter == 0` freeze handled above — is unchanged.
+        let max_decoder_norm = self
+            .atoms
+            .iter()
+            .map(|atom| atom.decoder_coefficients.iter().map(|v| v * v).sum::<f64>())
+            .fold(0.0_f64, f64::max)
+            .sqrt();
+        if !(max_decoder_norm > 0.0) {
+            self.refit_decoder_sequential_deflation(target, rho)?;
         }
         // #1026 — keep the best real reconstruction basin found inside this
         // bounded inner solve. The co-collapse guard can reseed onto a high-EV
