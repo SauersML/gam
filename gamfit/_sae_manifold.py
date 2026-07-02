@@ -2526,6 +2526,10 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     if fisher_shard is not None:
         model.fisher_factors = np.ascontiguousarray(fisher_shard[0])
         model.fisher_provenance = fisher_shard[2]
+    # #BSF — keep the "linear_block" label on a flat-block fit (from_payload reports
+    # the generic fitted "linear"); so an artifact fitted as linear_block reloads as
+    # linear_block. No-op unless the caller requested linear_block atoms.
+    model = _preserve_linear_block_labels(model, bases)
     return model
 
 
@@ -2909,6 +2913,36 @@ def flat_block_assignment(gating: str) -> str:
             f"got {gating!r}"
         )
     return _FLAT_BLOCK_GATING_TO_ASSIGNMENT[key]
+
+
+def _preserve_linear_block_labels(model: "ManifoldSAE", bases: list[str]) -> "ManifoldSAE":
+    """Round-trip fidelity for ``atom_topology="linear_block"``.
+
+    ``from_payload`` derives each atom's topology from the FITTED Rust kind, which
+    is the generic ``"linear"`` for a flat block (``linear_block`` maps to
+    ``SaeAtomBasisKind::Linear``). When the fit did NOT restructure the dictionary
+    (atom count unchanged), restore the ``"linear_block"`` label for the atoms the
+    caller declared as such AND that the fit left as plain ``"linear"`` — so an
+    artifact fitted as linear_block reloads as linear_block, not linear. Positions
+    the fit RETYPED (evidence-gated structure search) keep their discovered
+    topology. A first-class ``LinearBlock`` enum variant would make this automatic;
+    it was deferred (see the ``sae_atom_basis_kind_from_str`` doc-comment).
+    """
+    if not bases or len(bases) != len(model.atom_topologies):
+        return model
+    want = [_canon_name(b) in ("linear_block", "flat_block") for b in bases]
+    if not any(want):
+        return model
+    topos = list(model.atom_topologies)
+    kinds = list(model._basis_kinds)
+    for i, is_block in enumerate(want):
+        if is_block and _canon_name(topos[i]) == "linear":
+            topos[i] = "linear_block"
+            kinds[i] = "linear_block"
+    model.atom_topologies = topos
+    model._basis_kinds = kinds
+    model.atom_topology = _topology_for_bases(kinds) if kinds else model.atom_topology
+    return model
 
 
 def _bases(k_atoms: int, atom_basis: Any, atom_topology: str) -> list[str]:
