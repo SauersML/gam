@@ -866,10 +866,12 @@ pub struct FittedAtom {
     /// claim a pin it cannot resolve, the same honesty contract as the
     /// `diffeomorphism-unpinned` escalation.
     pub lowering_error: f64,
-    /// #1019 stage 1: `true` when the atom's `d = 1` latent chart was pinned
-    /// post-fit to its arc-length (unit-speed) canonical representative. #1019
-    /// stage 2: `true` as well when a `d = 2` torus atom's chart was pinned
-    /// post-fit to the minimum-isometry-defect flow representative, in which
+    /// #1019/#2022 stage 1: `true` when the atom's `d = 1` latent chart is pinned
+    /// to its arc-length (unit-speed) canonical representative — as of #2022
+    /// enforced IN-LOOP (t is arc-length at every assembled iterate), so this flag
+    /// means unit-speed was maintained throughout the fit, not applied once
+    /// post-fit. #1019 stage 2: `true` as well when a `d = 2` torus atom's chart
+    /// was pinned post-fit to the minimum-isometry-defect flow representative, in which
     /// case the residual chart freedom is `Isom(T², flat) = U(1)² ⋊ D₄`. The
     /// certificate then records that this atom's continuous chart
     /// (reparameterization) freedom is **pinned by canonicalization** — a
@@ -2476,16 +2478,21 @@ fn residual_gauge_inner(
     // the union.
     verdicts.extend(exact_verdicts);
 
-    // #1019 — post-fit arc-length chart canonicalization records: for every
-    // canonicalized d = 1 atom the continuous chart (reparameterization)
-    // freedom is pinned BY CONSTRUCTION (the unit-speed representative of the
-    // Diff(M) orbit was selected post-fit, image-frozen), so the certificate
-    // records it pinned with the PinnedByCanonicalization provenance —
-    // distinct from curvature/penalty pinning, since no objective resistance
-    // was measured — and names the surviving FINITE isometry group of the
-    // reference manifold. The group's continuous part (the circle's U(1)
-    // shift) is still enumerated and curvature-tested above; this record is
-    // the chart-freedom downgrade itself.
+    // #1019 / #2022 — arc-length chart canonicalization records: for every
+    // canonicalized d = 1 atom the continuous chart (reparameterization) freedom
+    // is pinned BY CONSTRUCTION. As of #2022 the unit-speed representative of the
+    // Diff(M) orbit is enforced IN-LOOP as an exact, image-frozen retraction at
+    // every chart-refresh boundary (not merely selected once post-fit), so the
+    // Diff(M) chart-speed generator is removed from the optimization THROUGHOUT
+    // the fit. The certificate records it pinned with the PinnedByCanonicalization
+    // provenance — distinct from curvature/penalty pinning, since no objective
+    // resistance is measured (the direction is re-gauged away, not resisted) —
+    // and names the surviving FINITE isometry group of the reference manifold.
+    // Because the speed direction is removed every refresh it never enters
+    // ker(H), so the d = 1 chart-speed generator no longer needs a curvature-test
+    // / deflation verdict. The group's continuous part (the circle's U(1) shift)
+    // is still enumerated and curvature-tested above; this record is the
+    // chart-freedom downgrade itself.
     let mut canonicalized_charts = 0usize;
     let mut canonicalized_torus_charts = 0usize;
     let mut canonicalized_patch_charts = 0usize;

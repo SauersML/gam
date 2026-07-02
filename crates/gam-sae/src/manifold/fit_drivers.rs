@@ -531,7 +531,7 @@ impl SaeManifoldTerm {
         topology: &crate::chart_canonicalization::CanonicalChartTopology,
     ) -> Result<bool, String> {
         use crate::chart_canonicalization::{
-            CHART_RECOMPOSITION_REL_TOL, unit_speed_reparameterization,
+            CHART_RECOMPOSITION_REL_TOL, unit_speed_retraction,
         };
         let n = self.n_obs();
         if n == 0 {
@@ -542,7 +542,7 @@ impl SaeManifoldTerm {
         };
         let coords = self.assignment.coords[atom_idx].as_matrix();
         let row_coords = coords.column(0).to_owned();
-        let Some(repar) = unit_speed_reparameterization(
+        let Some(repar) = unit_speed_retraction(
             evaluator.as_ref(),
             self.atoms[atom_idx].decoder_coefficients.view(),
             row_coords.view(),
@@ -613,6 +613,60 @@ impl SaeManifoldTerm {
         )?;
         atom.chart_canonicalized = true;
         Ok(true)
+    }
+
+    /// #2022 — the `d = 1` arc-length canonical-chart topology for one atom, or
+    /// `None` when the atom has no unit-speed chart (no evaluator, an active
+    /// curvature homotopy, a coord/atom latent-dim mismatch, or `d ≠ 1`). Same
+    /// selection as `canonicalize_charts_post_fit`'s `ChartPlan::UnitSpeed` arm.
+    pub(crate) fn d1_unit_speed_topology(
+        &self,
+        atom_idx: usize,
+    ) -> Option<crate::chart_canonicalization::CanonicalChartTopology> {
+        use crate::chart_canonicalization::CanonicalChartTopology;
+        let atom = &self.atoms[atom_idx];
+        if atom.basis_evaluator.is_none()
+            || atom.homotopy_eta != 1.0
+            || self.assignment.coords[atom_idx].latent_dim() != atom.latent_dim
+        {
+            return None;
+        }
+        match (&atom.basis_kind, atom.latent_dim) {
+            (SaeAtomBasisKind::Periodic | SaeAtomBasisKind::Torus, 1) => {
+                Some(CanonicalChartTopology::Circle { period: 1.0 })
+            }
+            (
+                SaeAtomBasisKind::Linear
+                | SaeAtomBasisKind::Duchon
+                | SaeAtomBasisKind::EuclideanPatch,
+                1,
+            ) => Some(CanonicalChartTopology::Interval),
+            _ => None,
+        }
+    }
+
+    /// #2022 — enforce unit-speed charts IN-LOOP: at a chart-refresh boundary,
+    /// re-gauge every `d = 1` atom to its arc-length representative via the exact,
+    /// image-frozen retraction
+    /// ([`crate::chart_canonicalization::unit_speed_retraction`], applied through
+    /// [`Self::canonicalize_atom_unit_speed_chart`]). Image-frozen ⇒ the data-fit
+    /// and intrinsic-smoothness objective are untouched; the ARD coordinate prior
+    /// re-evaluates at the canonical chart (the term that pins the residual gauge to
+    /// `t → ±t + c`). MUST NOT be called inside a line search — it changes the ARD
+    /// objective term, which would break Armijo bookkeeping. Runs post-acceptance at
+    /// the same cadence as [`Self::enforce_active_mass_guard`] /
+    /// [`Self::enforce_decoder_norm_guard`]. Returns the number of atoms re-gauged.
+    pub(crate) fn retract_unit_speed_charts_in_loop(&mut self) -> Result<usize, String> {
+        let mut retracted = 0usize;
+        for atom_idx in 0..self.atoms.len() {
+            let Some(topology) = self.d1_unit_speed_topology(atom_idx) else {
+                continue;
+            };
+            if self.canonicalize_atom_unit_speed_chart(atom_idx, &topology)? {
+                retracted += 1;
+            }
+        }
+        Ok(retracted)
     }
 
     /// Apply the minimum-isometry-defect flow reparameterization (#1019
@@ -3500,6 +3554,14 @@ impl SaeManifoldTerm {
             // that has fallen far behind its peers and reseed it onto the
             // residual; a strict no-op for K=1.
             self.enforce_decoder_norm_guard(target, outer_iteration, rho)?;
+            // #2022 — enforce unit-speed (arc-length) charts IN-LOOP at this
+            // accepted-outer-iteration boundary (post-acceptance, OUTSIDE the line
+            // search, same cadence as the guards above). Image-frozen ⇒ data-fit +
+            // intrinsic smoothness untouched; re-gauges t so the ARD coordinate
+            // prior (which pins t→±t+c) is enforced throughout the fit, not merely
+            // post-fit. SEAM: this boundary overlaps seed-audit STEP2's reseed/refit
+            // hooks — reconcile ordering there (retraction after guards/reseed).
+            self.retract_unit_speed_charts_in_loop()?;
             // #972 / #977 T1 — U-block of the alternating block-coordinate ascent.
             // After the decoder `B` has been updated by the accepted (t, ΔC) step
             // (lifted through the OLD frames in `apply_newton_step`), re-polar each
