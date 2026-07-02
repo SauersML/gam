@@ -9,11 +9,16 @@ reference) so the seam is correct and buildable on every host today.
 
 The pre-SAC GPU ambition was to run the **giant joint K-atom arrow-Schur system**
 on device: one bordered Hessian with a `K × K` shared β-block, `K` = the whole T2
-dictionary (thousands to tens of thousands of atoms). That system is dead — not
-because of the GPU, but because the *training path* that produced it is dead. The
-joint cold-start fit of K atoms co-collapses on real activations (SAC_PLAN Part 1);
-SAC retires it from training and demotes the joint solver to a single
-evaluate-don't-optimize terminal pass (Phase 3). See §7 for the explicit obituary.
+dictionary (thousands to tens of thousands of atoms). That system leaves the hot
+training loop — not because of the GPU, but because production fitting builds K
+per-atom (evidence-raced births + warm-started backfitting; STAGE1_DIAGNOSIS.md
+Stage 2). Whether the joint cold-start fit itself is architecturally broken or just
+mis-supervised is now attributed to the guard stack (STAGE1_DIAGNOSIS.md supersedes
+SAC_PLAN Part 1), so the joint solver may revive — but growth stays the production
+mode either way (cold PC-pair seeds are basin roulette, and per-atom births make EV
+monotone in K by construction). The joint solve survives as a single terminal
+evaluate-don't-optimize pass (Phase 3), which remains a legitimate one-shot dense
+GPU customer; see §7.
 
 What SAC's backfitting phase (Phase 2) actually needs is the opposite shape. After
 the forward births produce K single-atom charts, backfitting re-solves each atom
@@ -168,17 +173,29 @@ identical (the device path is validated to bit-parity against the reference in t
 `#1017`/`#1551` sense). WS-G does not edit `stagewise.rs`; this doc *is* the seam
 contract.
 
-## 7. What GPU is explicitly NOT for anymore
+## 7. What GPU is NOT for in the training loop
 
 The giant joint multi-atom arrow-Schur system — one bordered Hessian with a dense
-`K × K` β-block spanning the entire T2 dictionary — is no longer a GPU target,
-because it is no longer a target at all. It died with the joint training path: SAC
-never assembles it during fitting (atoms are born and refit one at a time), and the
-only surviving joint solve is Phase 3's single terminal evidence pass, run in
-`#850` evaluate-don't-optimize mode at an already-converged point. That pass forms
-`½log|H|`, the cross-atom covariance, and the identifiability report **once**; it is
-latency-insensitive, memory-bound on a `K × K` (or SLQ-reduced) object, and runs on
-the CPU (or the existing streaming/SLQ evidence lane for large K). Chasing it onto
-the GPU would resurrect the exact `K³` border factor whose cost and co-collapse
-motivated SAC. The GPU's arrow-Schur job is now *only* the batch of small,
-independent, per-atom border solves described above; the monolith is retired.
+`K × K` β-block spanning the entire T2 dictionary — is not a **training-loop** GPU
+target. The production fit builds K per-atom (evidence-raced births + warm-started
+backfitting refits; STAGE1_DIAGNOSIS.md Stage 2), so the training path never
+assembles the monolith on the hot loop no matter how the joint optimizer's own
+health shakes out. Even if Stage 1's guard surgery fully revives the joint solver,
+cold PC-pair seeds are basin roulette and growth is what makes EV monotone in K by
+construction, so per-atom solves remain the training workload and the parallelism —
+hence the batch of small independent border solves above is the training-loop GPU
+job.
+
+The joint system does **not** disappear, though: it runs **once** as Phase 3's
+terminal evaluate-don't-optimize pass (`#850` inner-freeze) at an already-converged
+point, forming `½log|H|`, the cross-atom covariance, the identifiability report, and
+the `dictionary_artifact` hash. That single pass is a legitimate one-shot **dense**
+GPU customer *when `H_ββ` is materialized* — it is exactly the shape the existing
+dense device Schur path (`try_device_arrow_direct` → `solve_arrow_newton_step`) was
+built for, and being a one-shot at convergence it neither co-collapses nor pays the
+`K³` factor repeatedly. So the dense device seam is retained, not retired: it serves
+the terminal pass (subject to the same materialized-`H_ββ` admission and the W12
+decline-to-CPU contract for the large-K matrix-free case, where the streaming/SLQ
+evidence lane takes over). What changed is only that the dense joint solve is no
+longer on the per-iteration training path; the amortized, embarrassingly-parallel
+per-atom batch is.
