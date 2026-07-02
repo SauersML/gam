@@ -79,8 +79,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "cargo test --workspace ${{ github.event.inputs.rust_filter }}"
-          cargo test --workspace ${{ github.event.inputs.rust_filter }} -- --nocapture
+          # `--exclude gam-pyffi`: gam-pyffi's default-on `extension-module`
+          # feature tells pyo3 NOT to link libpython (symbols are resolved by the
+          # host interpreter at import time), so building its TEST binary here
+          # fails at link with `undefined symbol: Py*`. test.yml handles this by
+          # archiving the main workspace with `--exclude gam-pyffi` and gam-pyffi
+          # separately under `--no-default-features`; mirror the exclusion so the
+          # filtered Rust path links for every non-pyffi crate (the Python path
+          # below already exercises the built extension for pyffi coverage).
+          echo "cargo test --workspace --exclude gam-pyffi ${{ github.event.inputs.rust_filter }}"
+          cargo test --workspace --exclude gam-pyffi ${{ github.event.inputs.rust_filter }} -- --nocapture
 
       # ---- Python path (only when a py_filter was given) -------------------
       - name: Set up Python 3.11
