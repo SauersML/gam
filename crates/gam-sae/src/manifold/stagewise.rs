@@ -629,19 +629,29 @@ pub fn fit_stagewise(
         ev_trace.push(ev_after);
     };
 
-    // ── Phase 2 — backfitting sweeps (monotone at fixed ρ) ─────────────────────
+    // ── Phase 2 — backfitting sweeps (keep-best, monotone by construction) ─────
+    // Each sweep minimizes the PENALIZED objective (the routing step and the warm
+    // joint polish are both line-searched descent on it), whose optimum can trade
+    // a hair of raw reconstruction EV for smoothness. So raw EV is not monotone
+    // under the penalized descent alone. A keep-best acceptance makes the reported
+    // EV trace non-decreasing BY CONSTRUCTION: a sweep is adopted only if it
+    // strictly improves EV; the first non-improving sweep is reverted and the loop
+    // stops (converged). Pure convergence test — no magic tolerance.
     let mut backfit_ev_trace: Vec<f64> = Vec::new();
     let mut prev_ev = *ev_trace.last().unwrap_or(&f64::NEG_INFINITY);
     for _ in 0..config.max_backfit_sweeps {
+        let term_snapshot = term.clone();
+        let rho_snapshot = rho.clone();
         backfit_sweep(&mut term, &mut rho, target, registry, config)?;
         let ev = ev_of(&term, target);
-        backfit_ev_trace.push(ev);
-        // Stop when a sweep no longer strictly improves EV (converged). Pure
-        // convergence test — no magic tolerance.
-        if !(ev > prev_ev) {
+        if ev > prev_ev {
+            backfit_ev_trace.push(ev);
+            prev_ev = ev;
+        } else {
+            term = term_snapshot;
+            rho = rho_snapshot;
             break;
         }
-        prev_ev = ev;
     }
 
     // ── Phase 3 — terminal frozen joint evidence of the composed tier ──────────
