@@ -602,8 +602,10 @@ mod tests {
         let ca = Array1::linspace(0.0, 1.0, 11);
         let pts_a = sample_decoded_curve(&ev, d.view(), 0.0, ca.view()).unwrap();
         // B samples the same physical points but parameterized as t_b with
-        // t_a = -t_b + 1  ⇒  physical point = (1 - t_b)·d.
-        let cb = Array1::linspace(0.0, 1.0, 9);
+        // t_a = -t_b + 1  ⇒  physical point = (1 - t_b)·d. Matched grid so every
+        // B point coincides with an A grid point (nearest-match is exact and the
+        // reflected transition is recovered to machine precision).
+        let cb = Array1::linspace(0.0, 1.0, 11);
         let db = array![[0.6_f64, 0.8], [-0.6, -0.8]]; // γ_b(t_b) = (0.6,0.8) + t_b·(-0.6,-0.8)
         let pts_b = sample_decoded_curve(&ev, db.view(), 0.0, cb.view()).unwrap();
         let tr = affine_chart_transition(pts_a.view(), ca.view(), pts_b.view(), cb.view(), None)
