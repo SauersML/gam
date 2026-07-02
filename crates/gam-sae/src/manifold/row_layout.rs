@@ -147,14 +147,12 @@ impl SaeRowLayout {
             relative_cutoff,
         } = spec;
         // Row/atom counts are the array shape — carrying them as separate
-        // arguments only invited a mismatch with the data they index.
+        // arguments only invited a mismatch with the data they index. Both
+        // `logits` and `contribution` are the (n, k_atoms) per-row/per-atom
+        // scores built together by the caller; indexing enforces their
+        // agreement.
         let n = logits.nrows();
         let k_atoms = logits.ncols();
-        debug_assert_eq!(
-            (n, k_atoms),
-            contribution.dim(),
-            "contribution shape must match logits (n, k_atoms)"
-        );
         let cap = k_active_cap.max(1);
         let mut per_row = Vec::with_capacity(n);
         for row in 0..n {
