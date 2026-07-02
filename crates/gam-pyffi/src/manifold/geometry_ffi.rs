@@ -6826,8 +6826,17 @@ fn generative_replicates_impl(
     // the weights here drew every row from the pooled scalar `N(mu_i, sigma_hat^2)`
     // (#2025). `resolve_weight_column` returns unit weights when the model carried
     // no weight column, leaving unweighted fits unchanged.
-    let prior_weights =
-        resolve_weight_column(&dataset, &col_map, model.weight_column.as_deref())?;
+    //
+    // If the model was fitted with weights but the caller's replicate frame does
+    // not carry that column, fall back to unit weights rather than erroring: the
+    // #2025 heteroskedastic contract (Var(y_i)=sigma_hat^2/w_i) degrades to the
+    // pooled scalar `N(mu_i, sigma_hat^2)` when per-row weights are unavailable,
+    // which is the correct default in the absence of the column.
+    let weight_column = model
+        .weight_column
+        .as_deref()
+        .filter(|name| col_map.contains_key(*name));
+    let prior_weights = resolve_weight_column(&dataset, &col_map, weight_column)?;
     let predict_input = build_predict_input_for_model(
         &model,
         dataset.values.view(),

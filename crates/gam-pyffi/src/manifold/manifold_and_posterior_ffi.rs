@@ -4248,7 +4248,10 @@ fn required_prediction_columns(model: &FittedModel) -> Result<BTreeSet<String>, 
 /// `by=` column), plus the offset / noise-offset / latent-`z` / survival
 /// entry-exit columns surfaced by [`required_prediction_columns`], plus the
 /// response column (needed for the conformal-calibration fold and for survival
-/// / transformation-normal label-bearing frames).
+/// / transformation-normal label-bearing frames), plus the prior-weights column
+/// when the model was fitted with one (needed by the generative-replicate path
+/// to reconstruct heteroskedastic observation noise `Var(y_i)=sigma^2/w_i`,
+/// #2025/#2033).
 ///
 /// Any column *not* in this set is irrelevant to the model — a row ID, a
 /// grouping/label column carried for bookkeeping, an auxiliary measurement —
@@ -4258,6 +4261,13 @@ fn prediction_consumable_columns(model: &FittedModel) -> Result<BTreeSet<String>
     let mut consumable = required_prediction_columns(model)?;
     if let Some(response) = response_column_name(model.payload().formula.as_str()) {
         consumable.insert(response);
+    }
+    // Retain the prior-weights column when the model carried one, so it survives
+    // projection and the replicate path can resolve per-row weights rather than
+    // erroring on a frame that *does* include them (#2033 regression of #2025).
+    // Harmless for ordinary predict, which never resolves the weight column.
+    if let Some(weight) = model.weight_column.as_deref() {
+        consumable.insert(weight.to_string());
     }
     Ok(consumable)
 }
