@@ -15,3 +15,4 @@
 - XFAIL pattern on tests is never allowed. A failing test should always indicate problematic behavior.
 - The goal of this project is never to copy existing reference implementations.
 - Grid search is never allowed.
+- Wall-clock time budgets and deadlines are never allowed. Fits and solves must be bounded by deterministic, machine-independent means (iteration/step counts, convergence criteria, or algorithmic complexity), never by elapsed clock time. A wall-clock deadline is non-deterministic (it varies with machine speed and load), makes results irreproducible, and silently ships under-converged "best-so-far" output instead of fixing the underlying convergence or performance problem. A fit that would otherwise run unboundedly must be fixed to converge or be provably bounded by work, not clipped by a timer.
