@@ -69,23 +69,6 @@ pub(crate) const SAE_ATOM_DECODER_NORM_COLLAPSE_RATIO: f64 = 1.0e-3;
 /// been retired.
 pub(crate) const SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET: usize = 3;
 
-/// #2027 co-collapse RESEED HYSTERESIS: minimum accepted-outer-iteration gap
-/// between two consecutive dictionary co-collapse multi-starts. The co-collapse
-/// arm fires whenever the reconstruction EV sits at or below the signal-free null
-/// floor AND the output has co-vanished — but a freshly reseeded dictionary is
-/// briefly BELOW that floor by construction (its brand-new decoders have not yet
-/// been descended), so firing again on the very next iteration would burn the
-/// whole multi-start budget across two or three adjacent iterations without ever
-/// letting a reseeded basin be optimized — the reseed-thrash the #1026 keep-best
-/// incumbent exists to paper over. This cooldown debounces the trigger: after a
-/// reseed the arm holds off for this many iterations so the joint Newton solve
-/// gets a genuine chance to descend the new basin before the guard judges it
-/// degenerate again. The keep-best incumbent is still updated every iteration
-/// (so a good transient basin is never lost); only the destructive re-diversify
-/// is deferred. A wide cooldown cannot mask a persistent co-collapse — once the
-/// gap is spent an unrecovered dictionary is reseeded exactly as before.
-pub(crate) const SAE_COCOLLAPSE_RESEED_COOLDOWN_ITERS: usize = 3;
-
 /// Machine-precision support cutoff for the smooth JumpReLU assignment prior,
 /// in units of the gate temperature below the hard threshold. The forward gate
 /// remains hard-zero at and below `threshold`, but the prior value/gradient and
