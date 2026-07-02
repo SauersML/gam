@@ -198,60 +198,40 @@ pub fn build_term_collection_design_inner(
         }
     }
 
-    // Linear terms with `double_penalty=true` are aggregated into a single
-    // shared ridge block named "linear" that spans the union of their
-    // coefficient columns. Two reasons this is the only correct shape:
-    //
-    //   (i) Per-term redundancy: a penalized linear term is a single scalar
-    //   coefficient β_j; the only shrinkage direction is β_j² itself. The
-    //   earlier per-term form emitted two identical 1×1 ridges per term
-    //   (`LinearTermRidge` + `LinearTermDoubleRidge`); for the two λ's that
-    //   the outer REML/LAML places on those blocks, the total penalty is
-    //   `(λ₁ + λ₂) β_j²` and the outer score is flat along
-    //   `λ₁ + λ₂ = const`. Unidentifiable hyperparameters by construction.
-    //
-    //   (ii) Cross-term aliasing: each penalized linear term in its own 1×1
-    //   block gives the outer optimizer a separate λ per term, when the
-    //   mgcv-equivalent "ridge over the parametric linear columns" is one
-    //   shared λ that shrinks every penalized linear coefficient with the
-    //   same scale. The shared block emits exactly one outer hyperparameter
-    //   and pins each penalized column's diagonal entry to 1.0; unpenalized
-    //   linear columns sit at diagonal 0, so they are mathematically
-    //   unaffected (S β = 0 on those rows) while keeping the block range
-    //   contiguous over the linear coefficient run.
-    //
-    // The block's `termname` is the literal "linear" so keyed hyperpriors
-    // / coefficient groups address the shared lever directly. The
-    // per-term identity is preserved through `linear_ranges`, which still
-    // names each individual column.
-    let any_double_penalty_linear = spec.linear_terms.iter().any(|t| t.double_penalty);
-    if any_double_penalty_linear && p_lin > 0 {
-        let block_range = p_intercept..(p_intercept + p_lin);
-        let mut s = Array2::<f64>::zeros((p_lin, p_lin));
-        let mut effective_rank = 0usize;
-        for (j, linear) in spec.linear_terms.iter().enumerate() {
-            if linear.double_penalty {
-                s[[j, j]] = 1.0;
-                effective_rank += 1;
-            }
+    // An explicit linear `double_penalty` is a user request to expose the
+    // parametric coefficient's ordinary ridge precision and its supplemental
+    // shrinkage precision as separate hyperparameter coordinates.  Keep those
+    // coordinates per term: keyed Gamma priors and coefficient-group priors are
+    // specified at the penalty-coordinate level, so coalescing several linear
+    // columns into a shared "linear" ridge (or replacing the two linear
+    // coordinates by one) silently changes the prior graph.
+    for (j, linear) in spec.linear_terms.iter().enumerate() {
+        if !linear.double_penalty {
+            continue;
         }
-        let global_index = penalties.len();
-        penalties.push(BlockwisePenalty::new(block_range, s));
-        nullspace_dims.push(0);
-        penaltyinfo.push(PenaltyBlockInfo {
-            global_index,
-            termname: Some("linear".to_string()),
-            penalty: PenaltyInfo {
-                source: PenaltySource::Other("LinearTermRidge".to_string()),
-                original_index: 0,
-                active: true,
-                effective_rank,
-                dropped_reason: None,
-                nullspace_dim_hint: 0,
-                normalization_scale: 1.0,
-                kronecker_factors: None,
-            },
-        });
+        let col = p_intercept + j;
+        for (original_index, source) in [
+            (0usize, "LinearTermRidge"),
+            (1usize, "LinearTermDoubleRidge"),
+        ] {
+            let global_index = penalties.len();
+            penalties.push(BlockwisePenalty::ridge(col..(col + 1), 1.0));
+            nullspace_dims.push(0);
+            penaltyinfo.push(PenaltyBlockInfo {
+                global_index,
+                termname: Some(linear.name.clone()),
+                penalty: PenaltyInfo {
+                    source: PenaltySource::Other(source.to_string()),
+                    original_index,
+                    active: true,
+                    effective_rank: 1,
+                    dropped_reason: None,
+                    nullspace_dim_hint: 0,
+                    normalization_scale: 1.0,
+                    kronecker_factors: None,
+                },
+            });
+        }
     }
 
     for (re_idx, (name, range)) in random_effect_ranges.iter().enumerate() {
@@ -2024,4 +2004,3 @@ pub fn orthogonality_relative_residual_for_design(
     let denom = (b_norm * c_norm).max(1e-300);
     Ok(num / denom)
 }
-
