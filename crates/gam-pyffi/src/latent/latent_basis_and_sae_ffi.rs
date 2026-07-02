@@ -2146,9 +2146,10 @@ const STRUCTURED_RESIDUAL_PASSES_MAX: usize = 4;
 /// post-dictionary residuals and return it (the driver then materializes the
 /// damped per-row metric via [`StructuredResidualModel::row_metric_damped`],
 /// holding the returned model as the next pass's damping anchor). `Ok(None)`
-/// when there is no factor subspace to mine (single-channel residuals) or the
-/// evidence fit degenerates — the caller then stops the alternation and keeps
-/// the current (iid or prior-pass) metric.
+/// ONLY when there is no factor subspace to mine (fewer than two output
+/// channels) — the caller then stops the alternation and keeps the current (iid
+/// or prior-pass) metric. A genuine evidence-fit failure is returned as `Err`,
+/// not silently degraded to `Ok(None)`.
 ///
 /// Residuals `R = target − term.fitted()`; the activity coordinate the scale law
 /// `c(z)` is smooth in is the per-row total assignment mass — the same
@@ -2188,9 +2189,16 @@ fn sae_structured_residual_model(
         max_factor_rank,
     }) {
         Ok(m) => Ok(Some(m)),
-        // Total numeric path: a degenerate residual yields no usable model; keep
-        // the prior-pass geometry.
-        Err(_) => Ok(None),
+        // Propagate a genuine fit failure instead of swallowing it (#2070/#2021).
+        // The only benign "nothing to mine" case — fewer than two output channels
+        // — is already handled by the early `Ok(None)` above, and the evidence
+        // ladder always scores at least rank 0, so every error reaching here is a
+        // real breakdown (non-finite residuals/activity, a dimension mismatch, or
+        // an inner-alternation numerical failure). Accepting-on-any-error would
+        // silently degrade to prior-pass geometry and hide the failure; surface it.
+        Err(e) => Err(py_value_error(format!(
+            "sae_structured_residual_model: structured residual-covariance fit failed: {e}"
+        ))),
     }
 }
 
