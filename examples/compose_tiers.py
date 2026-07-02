@@ -408,6 +408,87 @@ def compose_block_charts(
     )
 
 
+def load_seed_manifest(prefix: str) -> tuple[dict, dict, dict]:
+    """Load a seeds manifest written by :func:`emit_block_seed_manifest`.
+
+    Returns ``(manifest, bases, coords)`` where ``bases[g]`` is the ``(p, b)``
+    column-orthonormal basis ``Q`` and ``coords[g]`` the ``(n, b)`` in-block
+    coordinates for block ``g`` — everything a Tier-2 stage needs, read from files
+    ALONE (no Tier-1 fit object). This is the decoupled T1/T2 seam made literal.
+    """
+    p = Path(prefix)
+    manifest = json.loads(p.with_suffix(".seeds.json").read_text())
+    npz = np.load(str(p.with_suffix(".seeds.npz")))
+    bases, coords = {}, {}
+    for g in range(int(manifest["n_blocks"])):
+        bases[g] = np.ascontiguousarray(npz[f"block{g}_basis"], dtype=np.float32)
+        coords[g] = np.ascontiguousarray(npz[f"block{g}_coords"], dtype=np.float32)
+    return manifest, bases, coords
+
+
+def compose_charts_from_manifest(
+    prefix: str,
+    *,
+    X: np.ndarray | None = None,
+    chart_n_iter: int = 50,
+    chart_topology: str = "circle",
+    chart_d_atom: int = 2,
+    random_state: int = 0,
+) -> tuple[dict, np.ndarray]:
+    """Tier-2 stage that consumes a seeds manifest FROM FILES (no Tier-1 object):
+    fit one K=1 curved chart per block on the stored in-block coordinates, lift
+    with the stored basis ``Q``, and additively compose.
+
+    Returns ``(report, combined_recon)``; when the original ``X`` is supplied the
+    report includes the composed ambient EV (else only per-block chart EV in the
+    block's own coordinates, which needs no ambient reference). Proves the block ->
+    chart hand-off is a genuine decoupled file boundary a separate T2 driver
+    (e.g. block_nursery) can consume.
+    """
+    manifest, bases, coords = load_seed_manifest(prefix)
+    n_blocks = int(manifest["n_blocks"])
+    p = int(manifest["ambient_p"])
+    n_rows = next(iter(coords.values())).shape[0]
+    composed = np.zeros((n_rows, p), dtype=np.float64)
+    per_block: list[dict] = []
+    for g in range(n_blocks):
+        q = bases[g]  # (p, b)
+        z = coords[g]  # (n, b)
+        b = int(q.shape[1])
+        rec: dict[str, Any] = {"block": g, "block_dim": b}
+        try:
+            chart = gamfit.sae_manifold_fit(
+                np.ascontiguousarray(z, dtype=np.float32),
+                K=1,
+                d_atom=min(chart_d_atom, b),
+                atom_topology=chart_topology,
+                n_iter=chart_n_iter,
+                random_state=random_state,
+            )
+            z_hat = np.asarray(chart.reconstruct(z), dtype=np.float64)
+            rec["chart_status"] = "CONVERGED"
+            rec["chart_ev_block_coords"] = explained_variance(z, z_hat)
+            composed += z_hat @ q.T  # lift with the stored (p, b) basis
+        except Exception as exc:  # curved fit unavailable / hangs in this env
+            rec["chart_status"] = f"{type(exc).__name__}"
+            rec["chart_error"] = str(exc)[:160]
+            composed += z.astype(np.float64) @ q.T  # linear-lift fallback
+            rec["chart_ev_block_coords"] = None
+        per_block.append(rec)
+    combined = composed.astype(np.float32)
+    report: dict[str, Any] = {
+        "manifest_prefix": str(prefix),
+        "n_blocks": n_blocks,
+        "per_block": per_block,
+        "combined_recon_shape": list(combined.shape),
+    }
+    if X is not None:
+        x = np.ascontiguousarray(np.asarray(X, dtype=np.float32))
+        if x.shape == combined.shape:
+            report["composed_ambient_ev"] = explained_variance(x, combined)
+    return report, combined
+
+
 def _load_activations(args: argparse.Namespace) -> np.ndarray:
     """Load real sharded activations (W4) or synthesize planted structure."""
     if args.shard_manifest is not None:
@@ -504,6 +585,9 @@ def build_parser() -> argparse.ArgumentParser:
     block.add_argument("--emit-seeds", default=None,
                        help="path prefix to write the seeds manifest "
                             "(<prefix>.seeds.json + <prefix>.seeds.npz)")
+    block.add_argument("--from-seeds", default=None,
+                       help="Tier-2 ONLY: consume an existing seeds manifest prefix "
+                            "(fit K=1 chart per block from files, no Tier-1 refit)")
     block.add_argument("--no-mdl", dest="score_mdl", action="store_false", default=True,
                        help="skip the block-vs-chart f* MDL scoring")
 
@@ -525,6 +609,27 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> Any:
     args = build_parser().parse_args(argv)
+
+    if args.from_seeds is not None:
+        # Tier-2 ONLY: run per-block charts straight off a seeds manifest, proving
+        # the T1/T2 seam is a decoupled file boundary. X is loaded only to score
+        # the composed ambient EV (skipped if shapes disagree).
+        X = _load_activations(args)
+        report, _ = compose_charts_from_manifest(
+            args.from_seeds,
+            X=X,
+            chart_n_iter=args.chart_n_iter,
+            chart_topology=args.atom_topology,
+            chart_d_atom=args.d_atom,
+            random_state=args.random_state,
+        )
+        n_charts = sum(1 for r in report["per_block"] if r.get("chart_status") == "CONVERGED")
+        print(f"[compose_tiers] Tier-2 from seeds {args.from_seeds}: "
+              f"{n_charts}/{report['n_blocks']} charts fit")
+        if "composed_ambient_ev" in report:
+            print(f"[compose_tiers] composed ambient EV = {report['composed_ambient_ev']:.4f}")
+        return report
+
     X = _load_activations(args)
 
     if args.t1_mode == "block":
