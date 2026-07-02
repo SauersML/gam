@@ -139,6 +139,14 @@ pub fn signed_log_sum_exp(log_mags: &[f64], signs: &[f64]) -> (f64, f64) {
         f64::NEG_INFINITY
     };
 
+    if log_pos == f64::NEG_INFINITY && log_neg == f64::NEG_INFINITY {
+        // Both partial sums are empty: no terms at all, all signs zero, or every
+        // magnitude `−∞` (each `exp(−∞) = 0`). The signed sum is exactly `0`, so
+        // the contract requires `(−∞, 0.0)` — NOT the positive-sum convention,
+        // which would mislabel a zero as `+1` and corrupt any downstream cascade
+        // that reads back the sign.
+        return (f64::NEG_INFINITY, 0.0);
+    }
     if log_neg == f64::NEG_INFINITY {
         return (log_pos, 1.0);
     }
@@ -469,13 +477,32 @@ mod tests {
     }
 
     #[test]
-    fn slse_empty_returns_neg_inf() {
-        // With no terms the positive partial is vacuously −∞, so the function
-        // short-circuits the `log_neg == NEG_INFINITY` branch and returns sign +1
-        // (the positive-sum convention when both partials are empty).
+    fn slse_empty_returns_neg_inf_with_zero_sign() {
+        // With no terms the sum is exactly 0, so the docstring contract is
+        // `(−∞, 0.0)`. (This test previously encoded the buggy `+1.0` positive-sum
+        // convention, which contradicted both the docstring and the cancellation
+        // test below; rewritten to the correct zero sign.)
         let (lm, sg) = signed_log_sum_exp(&[], &[]);
         assert_eq!(lm, f64::NEG_INFINITY);
-        assert_eq!(sg, 1.0);
+        assert_eq!(sg, 0.0);
+    }
+
+    #[test]
+    fn slse_all_zero_signs_return_zero_sign() {
+        // A single term whose sign is 0 contributes nothing; S = 0 ⇒ (−∞, 0.0).
+        let (lm, sg) = signed_log_sum_exp(&[0.0], &[0.0]);
+        assert_eq!(lm, f64::NEG_INFINITY);
+        assert_eq!(sg, 0.0);
+    }
+
+    #[test]
+    fn slse_all_neg_inf_magnitudes_return_zero_sign() {
+        // Every magnitude is exp(−∞) = 0 regardless of sign, so the sum is 0 and
+        // the reported sign must be 0.0, not +1.0.
+        let (lm, sg) =
+            signed_log_sum_exp(&[f64::NEG_INFINITY, f64::NEG_INFINITY], &[1.0, -1.0]);
+        assert_eq!(lm, f64::NEG_INFINITY);
+        assert_eq!(sg, 0.0);
     }
 
     #[test]

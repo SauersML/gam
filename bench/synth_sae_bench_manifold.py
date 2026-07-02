@@ -191,18 +191,48 @@ def _r2(x: np.ndarray, fitted: np.ndarray) -> float:
     return 1.0 - ss_res / max(ss_tot, 1e-12)
 
 
-def _basis_values(kind: str, coords: np.ndarray, n_harmonics: int) -> np.ndarray:
-    if kind == "periodic":
+def _basis_values(
+    kind: str,
+    coords: np.ndarray,
+    n_harmonics: int,
+    centers: np.ndarray | None = None,
+) -> np.ndarray:
+    """Evaluate an atom's *real* fitted basis matrix at ``coords`` (#1201, E4).
+
+    Scoring must run through the same basis the decoder rows were fit against,
+    not a stand-in. ``periodic``/``torus`` route through the Rust
+    ``basis_with_jet`` evaluator; ``duchon`` evaluates the genuine polyharmonic
+    radial+polynomial basis against the fit's stored centers (``_duchon_centers``);
+    a genuinely ``linear``/``affine`` atom is the affine block ``[1, x]``.
+
+    Any topology whose real evaluator is not reachable here (e.g. ``euclidean``,
+    a degree-2 quadratic patch, or ``duchon`` with no stored centers) raises,
+    rather than silently scoring a fake ``[1, x]`` and inflating the metrics.
+    """
+    if kind in ("periodic", "torus"):
         phi, _jet, _penalty = rust_module().basis_with_jet(
-            "periodic",
+            kind,
             np.ascontiguousarray(np.asarray(coords[:, :1], dtype=float)),
             {"n_harmonics": int(n_harmonics)},
         )
         return np.asarray(phi, dtype=float)
     if kind == "duchon":
-        x = np.asarray(coords, dtype=float)
-        return np.column_stack([np.ones(x.shape[0]), x[:, 0]])
-    return np.column_stack([np.ones(coords.shape[0]), np.asarray(coords[:, 0], dtype=float)])
+        if centers is None:
+            raise ValueError(
+                "duchon atom has no stored centers; cannot evaluate the real "
+                "fitted basis for scoring (refusing to fake [1, x])."
+            )
+        return np.asarray(
+            gamfit.duchon_basis(np.asarray(coords, dtype=float), np.asarray(centers, dtype=float)),
+            dtype=float,
+        )
+    if kind in ("linear", "affine"):
+        x = np.asarray(coords[:, 0], dtype=float)
+        return np.column_stack([np.ones_like(x), x])
+    raise ValueError(
+        f"no faithful Python basis evaluator for atom topology {kind!r}; "
+        "scoring would require the real fitted basis (refusing to fake [1, x])."
+    )
 
 
 def _learned_components(fit: gamfit.ManifoldSAE) -> tuple[np.ndarray, np.ndarray]:
@@ -213,7 +243,8 @@ def _learned_components(fit: gamfit.ManifoldSAE) -> tuple[np.ndarray, np.ndarray
         basis = fit.basis_specs[k]
         coords = np.asarray(fit.coords[k], dtype=float)
         n_harmonics = fit._n_harmonics[k] if k < len(fit._n_harmonics) else 1
-        phi = _basis_values(basis, coords, n_harmonics)
+        centers = fit._duchon_centers[k] if k < len(fit._duchon_centers) else None
+        phi = _basis_values(basis, coords, n_harmonics, centers)
         rows = min(phi.shape[1], block.shape[0])
         for row in range(rows):
             direction = np.asarray(block[row], dtype=float)
@@ -309,17 +340,17 @@ def run_one(args: argparse.Namespace, seed: int) -> BenchmarkMetrics:
 
     t0 = time.perf_counter()
     fit = gamfit.sae_manifold_fit(
-        Z=train_x,
+        X=train_x,
         n_atoms=args.atoms,
         atom_basis=args.atom_basis,
-        atom_dim=args.atom_dim,
+        d_atom=args.atom_dim,
         assignment=args.assignment,
         top_k=args.top_k,
         isometry_weight=args.isometry_weight,
         ard_per_atom=args.ard_per_atom,
         sparsity_weight=args.sparsity_weight,
         smoothness_weight=args.smoothness_weight,
-        max_iter=args.max_iter,
+        n_iter=args.max_iter,
         learning_rate=args.learning_rate,
         random_state=seed,
     )

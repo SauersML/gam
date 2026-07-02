@@ -1194,6 +1194,8 @@ pub enum FamilySpecKind {
     BinomialLogit,
     BinomialProbit,
     BinomialCLogLog,
+    BinomialLogLog,
+    BinomialCauchit,
     BinomialLatentCLogLog(LatentCLogLogState),
     BinomialSas(SasLinkState),
     BinomialBetaLogistic(SasLinkState),
@@ -1215,6 +1217,8 @@ impl FamilySpecKind {
             Self::BinomialLogit => "binomial-logit",
             Self::BinomialProbit => "binomial-probit",
             Self::BinomialCLogLog => "binomial-cloglog",
+            Self::BinomialLogLog => "binomial-loglog",
+            Self::BinomialCauchit => "binomial-cauchit",
             Self::BinomialLatentCLogLog(_) => "latent-cloglog-binomial",
             Self::BinomialSas(_) => "binomial-sas",
             Self::BinomialBetaLogistic(_) => "binomial-beta-logistic",
@@ -1236,6 +1240,8 @@ impl FamilySpecKind {
             Self::BinomialLogit => "Binomial Logit",
             Self::BinomialProbit => "Binomial Probit",
             Self::BinomialCLogLog => "Binomial CLogLog",
+            Self::BinomialLogLog => "Binomial LogLog",
+            Self::BinomialCauchit => "Binomial Cauchit",
             Self::BinomialLatentCLogLog(_) => "Latent CLogLog Binomial",
             Self::BinomialSas(_) => "Binomial SAS",
             Self::BinomialBetaLogistic(_) => "Binomial Beta-Logistic",
@@ -1250,6 +1256,8 @@ impl FamilySpecKind {
             Self::BinomialLogit
                 | Self::BinomialProbit
                 | Self::BinomialCLogLog
+                | Self::BinomialLogLog
+                | Self::BinomialCauchit
                 | Self::BinomialLatentCLogLog(_)
                 | Self::BinomialSas(_)
                 | Self::BinomialBetaLogistic(_)
@@ -1562,6 +1570,12 @@ impl LikelihoodSpec {
             }
             (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::CLogLog)) => {
                 FamilySpecKind::BinomialCLogLog
+            }
+            (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::LogLog)) => {
+                FamilySpecKind::BinomialLogLog
+            }
+            (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Cauchit)) => {
+                FamilySpecKind::BinomialCauchit
             }
             (ResponseFamily::Binomial, InverseLink::LatentCLogLog(state)) => {
                 FamilySpecKind::BinomialLatentCLogLog(*state)
@@ -2932,5 +2946,50 @@ mod tests {
         assert!(!FamilySpecKind::PoissonLog.supports_firth());
         assert!(!FamilySpecKind::GammaLog.supports_firth());
         assert!(!FamilySpecKind::RoystonParmar.supports_firth());
+        // The full binomial probability-link set — including LogLog and Cauchit —
+        // supports Firth; `is_legal_cell` admits them, so `supports_firth` must too.
+        assert!(FamilySpecKind::BinomialLogLog.supports_firth());
+        assert!(FamilySpecKind::BinomialCauchit.supports_firth());
+    }
+
+    /// Every cell `is_legal_cell` admits must classify through `kind()` without
+    /// panicking — the "legal cells always classify" invariant. Binomial LogLog
+    /// and Cauchit are legal (admitted at `is_legal_cell`) but previously had no
+    /// `legal_cell_kind` arm, so `kind()` panicked on a valid, constructible spec.
+    #[test]
+    fn binomial_loglog_and_cauchit_are_legal_and_classify() {
+        for link in [StandardLink::LogLog, StandardLink::Cauchit] {
+            let inv = InverseLink::Standard(link);
+            assert!(
+                LikelihoodSpec::is_legal_cell(&ResponseFamily::Binomial, &inv),
+                "Binomial + {link:?} must be a legal cell"
+            );
+            let spec = LikelihoodSpec::try_new(ResponseFamily::Binomial, inv)
+                .expect("legal binomial spec must construct");
+            // Must not panic; must land on the matching binomial kind.
+            let kind = spec.kind();
+            assert!(kind.is_binomial(), "kind {kind:?} must be binomial");
+            assert!(kind.supports_firth(), "binomial probability link supports Firth");
+        }
+        assert_eq!(
+            LikelihoodSpec::try_new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(StandardLink::LogLog),
+            )
+            .unwrap()
+            .kind()
+            .name(),
+            "binomial-loglog"
+        );
+        assert_eq!(
+            LikelihoodSpec::try_new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(StandardLink::Cauchit),
+            )
+            .unwrap()
+            .kind()
+            .name(),
+            "binomial-cauchit"
+        );
     }
 }

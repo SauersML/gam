@@ -58,6 +58,26 @@ pub fn apply_inverse_link_vec(eta: &[f64], family_kind: &str) -> Result<Vec<f64>
                 out.push(-(-e.exp()).exp_m1());
             }
         }
+        "loglog" => {
+            for &e in eta {
+                // μ = exp(−exp(−η)): the complement of cloglog (the reflected
+                // extreme-value link). Matches the canonical solver kernel
+                // `component_inverse_link_jet(LogLog, ·)` exactly. As η → −∞,
+                // exp(−η) overflows and μ → 0; as η → +∞, exp(−η) → 0 and μ → 1.
+                // Guard the intermediate overflow so the deep-negative tail returns
+                // the exact 0.0 limit instead of exp(−∞) → NaN cascades.
+                let r = (-e).exp();
+                out.push(if r.is_finite() { (-r).exp() } else { 0.0 });
+            }
+        }
+        "cauchit" => {
+            for &e in eta {
+                // μ = ½ + atan(η)/π: the inverse standard-Cauchy CDF. Matches the
+                // canonical solver kernel `component_inverse_link_jet(Cauchit, ·)`.
+                // atan saturates at ±π/2 for η = ±∞, giving μ = 1 / 0 at the limits.
+                out.push(0.5 + e.atan() / std::f64::consts::PI);
+            }
+        }
         "log" => {
             for &e in eta {
                 // Canonical EXACT public log inverse link: bare `exp(η)` with the
@@ -335,6 +355,8 @@ mod tests {
             (InverseLink::Standard(StandardLink::Logit), "logit"),
             (InverseLink::Standard(StandardLink::Probit), "probit"),
             (InverseLink::Standard(StandardLink::CLogLog), "cloglog"),
+            (InverseLink::Standard(StandardLink::LogLog), "loglog"),
+            (InverseLink::Standard(StandardLink::Cauchit), "cauchit"),
             (InverseLink::Standard(StandardLink::Log), "log"),
         ] {
             let via_spec = apply_inverse_link_spec_vec(&eta, &link).expect("spec");
@@ -419,6 +441,48 @@ mod tests {
         // even deeper inputs).
         assert!(out[0] > 0.0, "cloglog(-50) must be positive, got {}", out[0]);
         assert!(approx < 1e-20, "sanity: approx={approx}");
+    }
+
+    #[test]
+    fn loglog_matches_solver_jet_and_limits() {
+        // μ = exp(−exp(−η)): the string path must be bit-identical to the canonical
+        // solver kernel it mirrors, across ordinary and deep-tail η.
+        let eta = [-40.0_f64, -3.0, -1.0, 0.0, 1.0, 3.0, 40.0];
+        let out = apply_inverse_link_vec(&eta, "loglog").expect("loglog");
+        for (i, &e) in eta.iter().enumerate() {
+            let jet =
+                inverse_link_mu_d1_for_inverse_link(&InverseLink::Standard(StandardLink::LogLog), e)
+                    .expect("solver jet");
+            assert_eq!(out[i], jet.0, "loglog row {i} must equal the solver mean");
+            assert!(out[i] >= 0.0 && out[i] <= 1.0, "loglog mu out of [0,1]: {}", out[i]);
+        }
+        // η = 0 ⇒ μ = exp(−1) ≈ 0.3679; strictly increasing; correct tail limits.
+        let at_zero = apply_inverse_link_vec(&[0.0], "loglog").expect("loglog")[0];
+        assert!((at_zero - (-1.0_f64).exp()).abs() < 1e-15, "loglog(0) = {at_zero}");
+        for w in out.windows(2) {
+            assert!(w[1] > w[0], "loglog not monotone: {} >= {}", w[0], w[1]);
+        }
+        assert_eq!(out[0], 0.0, "deep-negative η ⇒ μ underflows to exactly 0.0");
+    }
+
+    #[test]
+    fn cauchit_matches_solver_jet_and_is_symmetric() {
+        // μ = ½ + atan(η)/π: bit-identical to the solver kernel, symmetric about ½.
+        let eta = [-5.0_f64, -1.0, 0.0, 1.0, 5.0];
+        let out = apply_inverse_link_vec(&eta, "cauchit").expect("cauchit");
+        for (i, &e) in eta.iter().enumerate() {
+            let jet =
+                inverse_link_mu_d1_for_inverse_link(&InverseLink::Standard(StandardLink::Cauchit), e)
+                    .expect("solver jet");
+            assert_eq!(out[i], jet.0, "cauchit row {i} must equal the solver mean");
+            assert!(out[i] > 0.0 && out[i] < 1.0, "cauchit mu out of (0,1): {}", out[i]);
+        }
+        assert!((out[2] - 0.5).abs() < 1e-15, "cauchit(0) = {}", out[2]);
+        for &e in &[0.5_f64, 1.0, 3.0] {
+            let pos = apply_inverse_link_vec(&[e], "cauchit").expect("cauchit")[0];
+            let neg = apply_inverse_link_vec(&[-e], "cauchit").expect("cauchit")[0];
+            assert!((pos + neg - 1.0).abs() < 1e-14, "cauchit symmetry at {e}: {}", pos + neg);
+        }
     }
 
     #[test]

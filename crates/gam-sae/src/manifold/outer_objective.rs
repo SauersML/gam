@@ -101,31 +101,69 @@ pub(crate) fn absolute_degeneracy_ev_floor(
 /// dictionary's union of chart images can actually reach on this sample, which
 /// is the principled rank for the linear PCA ceiling that the bar uses.
 ///
-/// `rank(Φ_k)` is read from the CHART design alone (not the decoder magnitude),
+/// The charts are read from the CHART design alone (not the decoder magnitude),
 /// so a co-collapsed atom (`‖B_k‖ → 0`) still reports its full geometric reach
 /// — the collapse guard must NOT silently lower its own bar at the very
-/// degenerate state it exists to catch. Because each per-atom term is
-/// `≤ basis_size_k`, the reachable rank is `≤ Σ_k basis_size_k`, so the bar can
-/// only move DOWN from the old (biased-high) value, never up. When any atom's
-/// chart rank is un-computable (SVD failure) the function falls back to that
-/// atom's nominal `basis_size_k` for that atom only, so a numerical failure
-/// degrades to the historical behavior rather than corrupting the rank. The
-/// total is capped at the data rank `min(n, p)`.
+/// degenerate state it exists to catch.
+///
+/// #C5: `q` is the rank of the HORIZONTALLY CONCATENATED realized chart design
+/// `[Φ_1 … Φ_K]` (`n × Σ_k M_k`), NOT `Σ_k rank(Φ_k)`. `rank([Φ_1 … Φ_K]) ≤
+/// Σ_k rank(Φ_k)`, with equality only when the atoms' column spaces are linearly
+/// INDEPENDENT; summing double-counts shared directions (two identical atoms:
+/// true reachable rank 1, the sum claims 2), biasing the null floor `q/n` upward
+/// and manufacturing false collapse verdicts. The number of FREE reconstruction
+/// directions a signal-free dictionary fits is exactly this concatenated rank.
+/// Capped at the data rank `min(n, p)`. If any atom's design is non-finite or the
+/// concatenated SVD fails, the whole function degrades to the historical summed
+/// per-atom ranks rather than corrupting `q`.
 pub(crate) fn reachable_dictionary_rank(
     atoms: &[SaeManifoldAtom],
     n: usize,
     p: usize,
 ) -> usize {
-    let reachable: usize = atoms
-        .iter()
-        .map(|atom| match atom.realized_chart_image_rank() {
-            Ok(r) => r,
-            // SVD failure on this atom's chart: fall back to the nominal count
-            // (capped at p) for this atom only, never poisoning the sum.
-            Err(_) => atom.basis_size().min(p),
-        })
-        .sum();
-    reachable.min(n).min(p)
+    if atoms.is_empty() || n == 0 || p == 0 {
+        return 0;
+    }
+    // Historical Σ_k rank(Φ_k) (each capped at p) — the graceful-degradation
+    // fallback when the concatenated design cannot be formed or decomposed.
+    let summed_fallback = || -> usize {
+        atoms
+            .iter()
+            .map(|atom| match atom.realized_chart_image_rank() {
+                Ok(r) => r,
+                Err(_) => atom.basis_size().min(p),
+            })
+            .sum::<usize>()
+            .min(n)
+            .min(p)
+    };
+    let total_cols: usize = atoms.iter().map(|atom| atom.basis_values.ncols()).sum();
+    if total_cols == 0 {
+        return 0;
+    }
+    let mut concat = Array2::<f64>::zeros((n, total_cols));
+    let mut col = 0usize;
+    for atom in atoms {
+        let phi = &atom.basis_values;
+        // A shape mismatch or a non-finite entry would poison the joint SVD;
+        // degrade to the per-atom summed ranks instead.
+        if phi.nrows() != n || !phi.iter().all(|v| v.is_finite()) {
+            return summed_fallback();
+        }
+        let m = phi.ncols();
+        concat.slice_mut(s![.., col..col + m]).assign(phi);
+        col += m;
+    }
+    let sv = match concat.svd(false, false) {
+        Ok((_, sv, _)) => sv,
+        Err(_) => return summed_fallback(),
+    };
+    let max_sv = sv.iter().copied().fold(0.0_f64, f64::max);
+    if !(max_sv > 0.0) {
+        return 0;
+    }
+    let tol = SAE_MANIFOLD_SPECTRAL_RANK_CUTOFF * max_sv;
+    sv.iter().filter(|&&v| v > tol).count().min(n).min(p)
 }
 
 /// #1207 — observable telemetry for the amortized warm-start (Design A). The

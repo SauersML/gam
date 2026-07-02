@@ -190,8 +190,8 @@ def test_oos_uses_fit_time_hyperparameters():
         n_iter=37,
         learning_rate=0.07,
         tau=0.3,
-        sparsity_strength=0.5,
-        smoothness=2.0,
+        sparsity_weight=0.5,
+        smoothness_weight=2.0,
         random_state=5,
     )
 

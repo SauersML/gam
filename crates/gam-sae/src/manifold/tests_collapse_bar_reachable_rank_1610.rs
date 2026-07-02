@@ -24,9 +24,15 @@ use ndarray::{Array2, Array3, array};
 ///     every row of `Φ_B` is identical: `rank(Φ_B) = 1 ≪ basis_size = 3` — a
 ///     geometrically degenerate atom that linearly spans only ONE direction.
 ///
-/// Properties asserted (each fails if someone reverts to the nominal count):
-///   1. `reachable_dictionary_rank = rank(Φ_A) + rank(Φ_B) = 3 + 1 = 4`, capped
-///      at `min(n,p)`, strictly BELOW the nominal `Σ basis_size = 6`.
+/// Properties asserted:
+///   1. `reachable_dictionary_rank = rank([Φ_A | Φ_B]) = 3` — the CONCATENATED
+///      chart-design rank, NOT the sum `rank(Φ_A)+rank(Φ_B)=4`. Atom B's single
+///      reachable direction is the constant vector `[1,1,1,1]`, which already lies
+///      inside atom A's `[1,sin,cos]` column span, so the union spans only 3
+///      directions. Strictly BELOW the nominal `Σ basis_size = 6`.
+///   1b. #C5 discriminator: two IDENTICAL atoms reach `rank = rank(Φ) = 3`, while
+///      the summed count would double to 6 — the concatenated rank refuses to
+///      double-count shared column spaces.
 ///   2. the reachable rank is read from the chart design ALONE, so a co-collapsed
 ///      decoder (`B → 0`) reports the SAME reachable rank (the guard does not
 ///      lower its own bar at the very collapse it must catch).

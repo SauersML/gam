@@ -219,6 +219,9 @@ mod sae_contract_probe_tests;
 mod tests_device_engage_1783;
 
 #[cfg(test)]
+mod tests_frame_refresh_alpha_grad;
+
+#[cfg(test)]
 mod lambda_smooth_1556_tests;
 
 pub use arrow_solver::*;
