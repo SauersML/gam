@@ -30,6 +30,120 @@ fn sae_set_ibp_alpha(alpha: f64) {
     gam::terms::sae::assignment::set_ibp_alpha_override(alpha);
 }
 
+#[pyfunction(signature = (centers_1d, d))]
+fn sae_duchon_centers_nd<'py>(
+    py: Python<'py>,
+    centers_1d: PyReadonlyArray1<'py, f64>,
+    d: usize,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let base = centers_1d.as_array();
+    let k = base.len();
+    let mut out = Array2::<f64>::zeros((k, d.max(1)));
+    if k == 0 {
+        return Ok(out.into_pyarray(py).unbind());
+    }
+    for i in 0..k {
+        out[(i, 0)] = base[i];
+    }
+    if d <= 1 {
+        return Ok(out.into_pyarray(py).unbind());
+    }
+    let mut phi = 2.0_f64;
+    for _ in 0..32 {
+        phi = (1.0 + phi).powf(1.0 / d as f64);
+    }
+    for j in 0..(d - 1) {
+        let alpha = (1.0 / phi).powi((j + 1) as i32).rem_euclid(1.0);
+        for i in 0..k {
+            out[(i, j + 1)] = (((i + 1) as f64) * alpha + 0.5).rem_euclid(1.0);
+        }
+    }
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction(signature = (log_scores, iters = 12))]
+fn sae_sinkhorn_balance<'py>(
+    py: Python<'py>,
+    log_scores: PyReadonlyArray2<'py, f64>,
+    iters: usize,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let scores = log_scores.as_array();
+    let (n, f) = scores.dim();
+    if f < 2 || n == 0 {
+        return Ok(scores.to_owned().into_pyarray(py).unbind());
+    }
+    let mut bias = vec![0.0_f64; f];
+    let target = (1.0 / f as f64).ln();
+    for _ in 0..iters {
+        let mut usage = vec![0.0_f64; f];
+        for i in 0..n {
+            let mut max_v = f64::NEG_INFINITY;
+            for k in 0..f {
+                max_v = max_v.max(scores[(i, k)] + bias[k]);
+            }
+            let mut sum = 0.0;
+            for k in 0..f {
+                sum += (scores[(i, k)] + bias[k] - max_v).exp();
+            }
+            for k in 0..f {
+                usage[k] += (scores[(i, k)] + bias[k] - max_v).exp() / sum;
+            }
+        }
+        for u in &mut usage {
+            *u = (*u / n as f64).max(1.0e-12);
+        }
+        for k in 0..f {
+            bias[k] += target - usage[k].ln();
+        }
+        let mean = bias.iter().sum::<f64>() / f as f64;
+        for b in &mut bias {
+            *b -= mean;
+        }
+    }
+    let mut out = scores.to_owned();
+    for i in 0..n {
+        for k in 0..f {
+            out[(i, k)] += bias[k];
+        }
+    }
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction(signature = (logits, temperature))]
+fn sae_topk_activation_value_grad<'py>(
+    py: Python<'py>,
+    logits: PyReadonlyArray2<'py, f64>,
+    temperature: f64,
+) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
+    if !(temperature.is_finite() && temperature > 0.0) {
+        return Err(py_value_error(format!(
+            "sae_topk_activation_value_grad requires temperature > 0, got {temperature}"
+        )));
+    }
+    let x = logits.as_array();
+    let mut value = Array2::<f64>::zeros(x.dim());
+    let mut grad = Array2::<f64>::zeros(x.dim());
+    for ((i, k), &l) in x.indexed_iter() {
+        let z = l / temperature;
+        let sp = if z > 0.0 {
+            z + (-z).exp().ln_1p()
+        } else {
+            z.exp().ln_1p()
+        };
+        value[(i, k)] = temperature * sp;
+        grad[(i, k)] = if z >= 0.0 {
+            1.0 / (1.0 + (-z).exp())
+        } else {
+            let ez = z.exp();
+            ez / (1.0 + ez)
+        };
+    }
+    Ok((
+        value.into_pyarray(py).unbind(),
+        grad.into_pyarray(py).unbind(),
+    ))
+}
+
 #[pyfunction(signature = (points, mode = "kneedle", knee_slope_fraction = 0.10, complexity_penalty = 0.05, flat_span_tol = 1.0e-6))]
 fn sae_select_k(
     py: Python<'_>,
@@ -4136,6 +4250,9 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(analytic_penalty_value_grad, module)?)?;
     module.add_function(wrap_pyfunction!(analytic_penalty_hvp, module)?)?;
     module.add_function(wrap_pyfunction!(gumbel_schedule_tau, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_duchon_centers_nd, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_sinkhorn_balance, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_topk_activation_value_grad, module)?)?;
     module.add_function(wrap_pyfunction!(sae_ibp_map_value_grad, module)?)?;
     module.add_function(wrap_pyfunction!(sae_jumprelu_row_value_grad, module)?)?;
     module.add_function(wrap_pyfunction!(sae_jumprelu_batch_value_grad, module)?)?;

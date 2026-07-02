@@ -48,7 +48,6 @@ from typing import Any, Callable, Literal, Mapping, cast
 
 import numpy as np
 import torch
-import torch.nn.functional as F_torch
 from torch import nn
 
 from .._binding import rust_module
@@ -556,35 +555,29 @@ def _basis_rust(
 
 
 def _duchon_centers_nd(centers_1d: torch.Tensor, d: int) -> torch.Tensor:
-    """Lift the ``(K,)`` 1-D Duchon centers to a ``(K, d)`` cloud in ``[0, 1]^d``.
+    """Lift 1-D Duchon centers through the Rust generalized-golden-ratio kernel."""
+    out = rust_module().sae_duchon_centers_nd(
+        np.ascontiguousarray(to_numpy_f64(centers_1d).reshape(-1)), int(d)
+    )
+    return from_numpy_like(np.asarray(out, dtype=np.float64), centers_1d)
 
-    Axis 0 keeps the caller's 1-D centers (so the periodic/leading coordinate of
-    a cylinder or product patch is seeded exactly as in the 1-D case). The
-    remaining ``d - 1`` axes are filled by an additive-recurrence (Kronecker /
-    generalized-golden-ratio) low-discrepancy sequence keyed only to ``(K, d)``:
-    deterministic, buffer-free, and non-degenerate (the centers do not collapse
-    onto a diagonal, so the multi-axis Duchon kernel is well-conditioned). The
-    centers are a *fixed* design the decoder learns against, so any deterministic
-    well-spread placement is admissible; this one is reproducible and stable
-    across forward calls without enlarging the serialized state.
-    """
-    base = centers_1d.reshape(-1, 1)
-    k = int(base.shape[0])
-    dtype = base.dtype
-    device = base.device
-    if d <= 1 or k == 0:
-        return base
-    # Generalized golden ratio phi_d: the real root of x^{d} = x + 1; its
-    # reciprocal powers give the canonical R_d low-discrepancy generators.
-    phi = 2.0
-    for _ in range(32):
-        phi = (1.0 + phi) ** (1.0 / float(d))
-    alphas = [((1.0 / phi) ** (j + 1)) % 1.0 for j in range(d - 1)]
-    idx = torch.arange(1, k + 1, dtype=dtype, device=device).reshape(-1, 1)
-    extra = torch.empty((k, d - 1), dtype=dtype, device=device)
-    for j, a in enumerate(alphas):
-        extra[:, j] = torch.remainder(idx[:, 0] * float(a) + 0.5, 1.0)
-    return torch.cat([base, extra], dim=-1)
+
+class _TopKActivationFn(torch.autograd.Function):
+    """``tau * softplus(logits / tau)`` with Rust value and diagonal VJP."""
+
+    @staticmethod
+    def forward(ctx: Any, logits: torch.Tensor, temperature: float) -> torch.Tensor:
+        rows = to_numpy_f64(logits).reshape(logits.shape[0], -1)
+        value, grad = rust_module().sae_topk_activation_value_grad(
+            np.ascontiguousarray(rows), float(temperature)
+        )
+        ctx.save_for_backward(from_numpy_like(grad, logits).reshape_as(logits))
+        return from_numpy_like(value, logits).reshape_as(logits)
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        (jac_diag,) = ctx.saved_tensors
+        return grad_output * jac_diag, None
 
 
 def _eval_basis_on_manifold(
@@ -774,7 +767,8 @@ class _SparsityLayer(nn.Module):
 
     def _topk_activation(self, logits: torch.Tensor) -> torch.Tensor:
         tau = max(float(self.tau.item()), 1e-6)
-        return tau * F_torch.softplus(logits / tau)
+        apply = cast(Callable[..., torch.Tensor], _TopKActivationFn.apply)
+        return apply(logits, tau)
 
     def _topk_mask(self, scores: torch.Tensor) -> torch.Tensor:
         k = min(self.target_k, scores.shape[-1])
@@ -1398,42 +1392,15 @@ class _SparsityLayer(nn.Module):
     def _sinkhorn_balance(
         log_scores: torch.Tensor, *, iters: int = 12
     ) -> torch.Tensor:
-        """Add per-atom log-bias potentials so atom usage is balanced.
-
-        ``log_scores[n, k]`` are the unnormalized log-responsibilities of row
-        ``n`` for atom ``k`` (already temperature-scaled). We add a per-column
-        (per-atom) potential ``b_k`` and renormalize each row so the resulting
-        responsibilities ``softmax_k(log_scores + b)`` have equal column sums
-        (each atom claims ``N/F`` of the total assignment mass). This is the
-        Sinkhorn projection of the row-stochastic responsibility matrix onto the
-        doubly-balanced transport polytope with a uniform atom marginal; a few
-        fixed-point sweeps converge it. The potentials are computed under
-        ``no_grad`` and treated as constants in the M-step — they only steer the
-        *assignment*, the reconstruction gradient still flows through the
-        residual-driven ``log_scores``.
-        """
-        n_atoms = log_scores.shape[-1]
-        if n_atoms < 2:
+        """Add Rust-computed per-atom log-bias potentials for balanced usage."""
+        if log_scores.shape[-1] < 2:
             return log_scores
         with torch.no_grad():
-            bias = torch.zeros(
-                n_atoms, dtype=log_scores.dtype, device=log_scores.device
+            out = rust_module().sae_sinkhorn_balance(
+                np.ascontiguousarray(to_numpy_f64(log_scores).reshape(log_scores.shape[0], -1)),
+                int(iters),
             )
-            target = torch.log(
-                torch.tensor(
-                    1.0 / float(n_atoms),
-                    dtype=log_scores.dtype,
-                    device=log_scores.device,
-                )
-            )
-            for _ in range(iters):
-                resp = torch.softmax(log_scores + bias, dim=-1)
-                # Mean assignment mass per atom (row-marginal already 1).
-                usage = resp.mean(dim=0).clamp_min(1e-12)
-                # Multiplicative Sinkhorn update toward the uniform marginal.
-                bias = bias + (target - torch.log(usage))
-                bias = bias - bias.mean()
-        return log_scores + bias
+        return from_numpy_like(np.asarray(out, dtype=np.float64), log_scores).reshape_as(log_scores)
 
     def penalty(self, logits: torch.Tensor) -> torch.Tensor:
         """Rust-backed scalar penalty value at ``logits``."""
