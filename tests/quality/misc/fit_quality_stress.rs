@@ -651,7 +651,13 @@ fn near_flat_signal() -> Result<(), String> {
     let mut rng = Lcg::new(202);
     let x: Vec<f64> = (0..n).map(|_| rng.uniform_01()).collect();
     let truth_const = 3.5_f64;
-    let signal_amp = 0.02_f64;
+    // #1967/#2069: the probe formerly planted signal_amp == sigma (SNR ≈ 1), so a
+    // fit that chased noise was indistinguishable from one that recovered the true
+    // near-flat sinusoid — the over-fit/collapse verdict was muddy. Plant a signal
+    // clearly above the noise floor (SNR ≈ 3) while staying near-flat (~1.7 %
+    // modulation on the 3.5 baseline), so span_fit/span_truth cleanly separates a
+    // genuine recovery from a collapsed-to-flat or noise-chasing fit.
+    let signal_amp = 0.06_f64;
     let y_truth: Vec<f64> = x
         .iter()
         .map(|&t| truth_const + signal_amp * (2.0 * PI * t).sin())
