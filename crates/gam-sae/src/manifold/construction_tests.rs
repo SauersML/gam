@@ -1000,7 +1000,7 @@ mod step2_quotient_scale_tests {
 // driver that ignored the flag would fail. Parallel-safe (typed setters, no env).
 // ============================================================================
 #[cfg(test)]
-mod lever_wiring_2072 {
+mod lever_wiring_2072_tests {
     use crate::manifold::tests::small_two_atom_periodic_term;
     use crate::manifold::{
         sae_data_row_anchored_euclidean_coords, sae_pca_seed_initial_coords_with_pc_offset,
