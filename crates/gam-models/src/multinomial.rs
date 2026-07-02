@@ -904,6 +904,17 @@ fn fit_penalized_multinomial_firth_fallback(
 
     // Factor a symmetric matrix (with escalating ridge only if it is not SPD) and
     // return its inverse and log-determinant.
+    //
+    // The ridge ladder is a standard relative-jitter Cholesky recovery, not a
+    // tuned knob: (a) the base jitter is scaled to the matrix by `max_diag`
+    // (`max_diag · ε` with ε at the double-precision Cholesky floor ~1e-10) so it
+    // is invariant to the overall scale of the Fisher information, falling back
+    // to an absolute floor only when the diagonal is degenerate; (b) it is tried
+    // first at ridge 0 so an already-SPD matrix is factored unperturbed; (c) it
+    // grows geometrically (×4) to span the ~120 dB from the base jitter to O(1)
+    // in a bounded number of steps; (d) the attempt count is capped so a
+    // genuinely singular information (e.g. an exactly rank-deficient Fisher block)
+    // surfaces as an explicit error rather than an unbounded loop.
     let invert_spd = |mat: &Array2<f64>, context: &str| -> Result<(Array2<f64>, f64), EstimationError> {
         let max_diag = (0..d).fold(0.0_f64, |acc, i| acc.max(mat[[i, i]].abs()));
         let base = if max_diag.is_finite() && max_diag > 0.0 {
@@ -1082,7 +1093,11 @@ fn fit_penalized_multinomial_firth_fallback(
     };
 
     // Solve H Δ = U* for the SPD penalized Hessian, ridge-escalating only on
-    // factorization failure.
+    // factorization failure. Same relative-jitter Cholesky-recovery ladder as
+    // `invert_spd` above (see its comment for the rationale); the base jitter is
+    // one decade tighter (`max_diag · 1e-12`) because the penalized Hessian
+    // solved here is better conditioned than the Fisher information inverted
+    // there, so a smaller perturbation suffices before escalating.
     let solve_spd = |mat: &Array2<f64>, rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
         let max_diag = (0..d).fold(0.0_f64, |acc, i| acc.max(mat[[i, i]].abs()));
         let base = if max_diag.is_finite() && max_diag > 0.0 {
@@ -1166,8 +1181,23 @@ fn fit_penalized_multinomial_firth_fallback(
             step *= 0.5;
         }
         if !accepted {
-            // No admissible ascent step: at (or numerically at) the interior mode.
-            converged = true;
+            // Backtracking exhausted 60 halvings without an admissible ascent
+            // step. This is convergence ONLY if the iterate is already first-order
+            // stationary; a line-search stall at a non-stationary point is a
+            // solver failure and must be reported as such, never papered over as
+            // `converged = true` (#2066 — SPEC: do not report a non-converged
+            // iterate as success).
+            //
+            // The verdict is the loop's OWN stationarity test — the Newton
+            // decrement `½·Uᵀ H⁻¹ U` against `tol_eff`, the same criterion the top
+            // of the loop uses to break as converged. A true interior mode never
+            // reaches this branch: an infinitesimal step (`step → 0`) leaves the
+            // iterate SPD with `o1 ≈ o0`, so it is accepted; a numerically flat
+            // mode is caught by the `max_step` test below after that accepted
+            // tiny step. Reaching here therefore means Newton still sees a
+            // meaningful ascent direction it cannot realize (boundary / near-
+            // singular Fisher information), i.e. a genuine stall → not converged.
+            converged = 0.5 * decrement.abs() < tol_eff;
             break;
         }
 
@@ -3565,6 +3595,60 @@ mod separation_firth_tests {
                 out.coefficient_covariance[[i, i]]
             );
         }
+    }
+
+    #[test]
+    fn firth_solver_does_not_over_report_convergence_when_truncated() {
+        // #2066 (convergence honesty): the Firth Newton loop must report
+        // `converged` according to a genuine stationarity criterion — never as a
+        // side effect of simply stopping. Before the fix, a line-search stall set
+        // `converged = true` unconditionally; more broadly, the flag must be
+        // false whenever the solve is stopped short of stationarity.
+        //
+        // Angle: run the SAME separated problem that converges under a full
+        // budget (`separation_engages_firth_finite_converged_fit`) but starve the
+        // iteration budget so it provably cannot reach the interior Firth mode.
+        // The honest report is `converged = false`; the coefficients must still be
+        // finite (no NaN leak from the truncated iterate).
+        let (design, y, penalty, lambdas) = separated_three_class();
+
+        let truncated = fit_penalized_multinomial_firth_fallback(
+            design.view(),
+            y.view(),
+            penalty.view(),
+            lambdas.view(),
+            None,
+            1, // one Newton iteration — far from the separated mode
+            1e-12,
+        )
+        .expect("Firth fallback must return a (non-converged) fit, not error");
+        assert!(
+            !truncated.converged,
+            "a Firth solve stopped after one iteration on a separated problem \
+             must report converged=false, not paper over non-convergence"
+        );
+        assert!(
+            truncated.coefficients_active.iter().all(|v| v.is_finite()),
+            "truncated Firth iterate must remain finite"
+        );
+
+        // Contrast: with a full budget the same problem does reach stationarity
+        // and is honestly reported as converged — so the flag tracks the solve,
+        // not the exit.
+        let full = fit_penalized_multinomial_firth_fallback(
+            design.view(),
+            y.view(),
+            penalty.view(),
+            lambdas.view(),
+            None,
+            300,
+            1e-10,
+        )
+        .expect("Firth fallback must converge under a full budget");
+        assert!(
+            full.converged,
+            "full-budget Firth solve on the separated problem must converge"
+        );
     }
 }
 
