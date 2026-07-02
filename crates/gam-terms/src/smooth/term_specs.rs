@@ -4567,6 +4567,31 @@ pub fn auto_initial_length_scale_for_centers(
     spacing.max(AUTO_LENGTH_SCALE_FLOOR).min(max_range)
 }
 
+/// Low-rank radial-basis length-scale seed tied to the requested center spacing.
+///
+/// Thin-plate regression splines with `k << n` represent the surface through a
+/// compact set of centers; seeding the kernel at the observation fill distance
+/// (`max_range / sqrt(n)`) makes the center Gram nearly diagonal and turns the
+/// bending penalty into an ill-scaled ridge on the radial coefficients. REML then
+/// sees a weakly identified smoothing surface and can settle on under-recovered
+/// spatial fits. Seed at the center fill distance instead, so neighbouring
+/// centers interact at O(1) scale before REML tunes the smoothing parameter.
+pub fn auto_initial_length_scale_for_low_rank_centers(
+    data: ArrayView2<'_, f64>,
+    feature_cols: &[usize],
+    num_centers: usize,
+) -> f64 {
+    if data.nrows() == 0 || feature_cols.is_empty() {
+        return 1.0;
+    }
+    let Some(max_range) = feature_columns_max_range(data, feature_cols) else {
+        return 1.0;
+    };
+    let resolution_points = num_centers.max(1) as f64;
+    let spacing = max_range / resolution_points.sqrt();
+    spacing.max(AUTO_LENGTH_SCALE_FLOOR).min(max_range)
+}
+
 /// Requested center count encoded by a [`CenterStrategy`], if it carries an
 /// explicit count (used to make the Matérn auto length scale density-adaptive).
 fn center_strategy_requested_count(strategy: &CenterStrategy) -> Option<usize> {
@@ -4624,7 +4649,12 @@ pub fn auto_init_length_scale_in_basis(data: ArrayView2<'_, f64>, basis: &mut Sm
             feature_cols, spec, ..
         } => {
             if spec.length_scale == 0.0 {
-                spec.length_scale = auto_initial_length_scale(data, feature_cols);
+                spec.length_scale = match center_strategy_requested_count(&spec.center_strategy) {
+                    Some(k) => {
+                        auto_initial_length_scale_for_low_rank_centers(data, feature_cols, k)
+                    }
+                    None => auto_initial_length_scale(data, feature_cols),
+                };
             }
         }
         SmoothBasisSpec::ByVariable { inner, .. }
