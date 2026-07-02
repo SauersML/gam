@@ -10,7 +10,18 @@ use super::*;
 /// when they are aliased by the realized design.  A machine-scale ridge in the
 /// always-present native penalty keeps those slope directions structurally
 /// penalized without changing the Duchon Hilbert scale at statistical scale.
-const DUCHON_AFFINE_NATIVE_RIDGE_FLOOR: f64 = 1.490_116_119_384_765_6e-8;
+///
+/// This is a RELATIVE coefficient (`√ε ≈ 2⁻²⁶`): the ridge placed on each affine
+/// slope column is this fraction of the curvature block's mean diagonal, NOT an
+/// absolute constant. An absolute floor over-penalizes a low-magnitude curvature
+/// Gram (few centers / small support): once the whole penalty is Frobenius-
+/// normalized the absolute ridge no longer sits below the curvature scale, so the
+/// affine slopes leave the penalty's null space and the smooth loses the affine
+/// trend it is supposed to leave free at statistical scale (gam#880). Scaling by
+/// the curvature magnitude keeps the ridge machine-scale relative to the penalty
+/// in every configuration, so the affine trend stays in the effective null space
+/// while the slopes remain structurally (non-zero) penalized.
+const DUCHON_AFFINE_NATIVE_RIDGE_REL: f64 = 1.490_116_119_384_765_6e-8;
 
 /// N-D periodic-cyclic-B-spline first-derivative jet `∂Φ̃/∂t` per row.
 ///
@@ -1430,8 +1441,32 @@ pub(crate) fn duchon_native_penalty_candidates(
         .slice_mut(s![..n_kernel, ..n_kernel])
         .assign(&omega);
     if poly_cols > 1 {
+        // Machine-scale ridge on the affine SLOPE columns (the constant column
+        // `n_kernel` stays free — it is the model intercept). Scale by the
+        // curvature block's mean diagonal so the ridge is `√ε`-relative to the
+        // penalty, not an absolute floor that would survive Frobenius
+        // normalization and push the affine slopes out of the null space on a
+        // low-curvature Gram (gam#880). `omega` is PSD, so its diagonal is
+        // non-negative; the mean diagonal is a scale-faithful proxy for the
+        // curvature magnitude and is bounded above by `‖omega‖_F`, so the
+        // normalized ridge stays ≤ `√ε/√n_kernel < 1e-8` — below the statistical
+        // scale while remaining strictly positive (structurally penalized).
+        let curvature_scale = if n_kernel > 0 {
+            let trace: f64 = (0..n_kernel).map(|i| omega[[i, i]].abs()).sum();
+            trace / n_kernel as f64
+        } else {
+            0.0
+        };
+        // Fall back to the bare relative constant only for a degenerate all-zero
+        // curvature block (no kernel columns / no curvature), so the slope
+        // columns still carry a strictly positive ridge.
+        let affine_ridge = if curvature_scale > 0.0 {
+            DUCHON_AFFINE_NATIVE_RIDGE_REL * curvature_scale
+        } else {
+            DUCHON_AFFINE_NATIVE_RIDGE_REL
+        };
         for col in (n_kernel + 1)..n_pre {
-            primary_pre[[col, col]] = DUCHON_AFFINE_NATIVE_RIDGE_FLOOR;
+            primary_pre[[col, col]] = affine_ridge;
         }
     }
     let primary = symmetrize(&project_penalty_matrix(&primary_pre, outer_identifiability));
