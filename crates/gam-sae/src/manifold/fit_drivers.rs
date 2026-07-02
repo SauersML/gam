@@ -3731,6 +3731,11 @@ impl SaeManifoldTerm {
         // hint would always equal the cold LSQ decoder, never the seed). A freeze
         // is by definition not a convergence request, so there is no
         // under-converged decoder to rescue here.
+        let pre_polish_reconstruction_incumbent = self
+            .dictionary_reconstruction_ev(target, rho)
+            .ok()
+            .filter(|ev| ev.is_finite())
+            .map(|ev| (ev, self.snapshot_mutable_state()));
         if max_iter > 0 && !self.frames_active() {
             let mut best_objective =
                 self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
@@ -3769,6 +3774,29 @@ impl SaeManifoldTerm {
                             break;
                         }
                     }
+                }
+            }
+        }
+        // The final decoder-LSQ / coordinate-reprojection polish is accepted by
+        // the penalized objective because that is the scalar consumed by the REML
+        // outer loop. Reconstruction EV is the user-facing fitted quantity,
+        // however, and the polish is allowed to trade data fit for smoothness.
+        // Keep the same #1026 invariant as the Newton loop: a bounded in-fit
+        // refinement may not return a materially worse reconstruction than the
+        // incumbent it started from. This preserves the evidence objective's
+        // monotone path during fitting while ensuring the delivered fitted state is
+        // the best reconstruction basin the inner solve already found, rather than
+        // a smoother-but-collapsed post-polish state.
+        if let Some((pre_polish_ev, pre_polish_state)) = pre_polish_reconstruction_incumbent {
+            if let Ok(final_ev) = self.dictionary_reconstruction_ev(target, rho) {
+                if final_ev.is_finite()
+                    && final_ev + SAE_FINAL_EV_DEGRADATION_TOL < pre_polish_ev
+                {
+                    log::warn!(
+                        "[#1026] restoring pre-polish reconstruction incumbent after final \
+                         polish degraded EV from {pre_polish_ev:.4} to {final_ev:.4}"
+                    );
+                    self.restore_mutable_state(&pre_polish_state);
                 }
             }
         }
