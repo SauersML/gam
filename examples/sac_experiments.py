@@ -110,6 +110,9 @@ def main() -> None:
                     help="structured_residual_passes (Sigma whitening); 0 matches "
                          "the joint baseline for a fair comparison")
     ap.add_argument("--backfit", type=int, default=1)
+    ap.add_argument("--isometry", type=float, default=1.0,
+                    help="isometry_weight; 0 drops the whitening gauge (faster "
+                         "outer convergence on clean planted data)")
     args = ap.parse_args()
 
     X, assign, theta, scales = planted_two_circles(args.n, args.p, args.noise, args.seed)
@@ -126,7 +129,7 @@ def main() -> None:
     print("\n[exp1] === JOINT sae_manifold_fit(K=2) ===")
     joint = gamfit.sae_manifold_fit(
         X, K=2, d_atom=args.d_atom, atom_topology="circle", assignment="ibp_map",
-        isometry_weight=1.0, n_iter=args.n_iter, random_state=args.seed,
+        isometry_weight=args.isometry, n_iter=args.n_iter, random_state=args.seed,
     )
     joint_recon = np.asarray(joint.reconstruct(X), dtype=np.float64)
     joint_ev = _ev(X, joint_recon)
@@ -148,7 +151,7 @@ def main() -> None:
     sac = sac_fit(
         X, max_atoms=6, d_atom=args.d_atom, atom_topology="circle",
         assignment="ibp_map", ev_floor=5e-3, structured_residual_passes=args.srp,
-        n_iter=args.n_iter, backfit_sweeps=args.backfit, isometry_weight=1.0,
+        n_iter=args.n_iter, backfit_sweeps=args.backfit, isometry_weight=args.isometry,
         random_state=args.seed, verbose=True,
     )
     print(f"[exp1] SAC accepted K={sac.k} atoms; combined EV = {sac.combined_ev:.4f}")

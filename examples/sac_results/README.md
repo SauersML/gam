@@ -93,12 +93,20 @@ signature of the revised diagnosis:
 | joint K=8 | real OLMo 500×128 (`cache_K8.npy`) | **3×1500 s TIMEOUT** (W6 `results_K8.json`) |
 | joint K=6 (compose T2) | planted N=20k p=64 | co-collapse (reseed-all ×3) → **#1026 oscillation >1 h @ EV≈0.51** (`e2e_smoke.log`) |
 | single **K=1** (SAC birth) | real OLMo 500×128 | **>7 min, no termination** (this run) — sequential fitting does **not** rescue real data pre-fix |
-| joint K=2 | planted two-circles n=1500 p=32 | holds a healthy incumbent EV≈0.969 but outer loop **oscillates >5.5 min without returning** |
+| joint K=2 (isometry on) | planted two-circles n=1500 p=32 | holds a healthy incumbent EV≈0.969 but outer loop **oscillates >6.5 min without returning** |
+| joint K=2 (isometry off) | planted two-circles n=1200 p=24 | **hard error at 24 s**: `reml_criterion: cross-row IBP joint Hessian is non-PD at this ρ ... infeasible ρ probe` |
 
-**Key pre-fix finding:** a single K=1 fit on the real W6 activations is *also*
-crippled (the guard WALL flattens the outer objective at K=1 too), so SAC does
-not work around the guard on the unpatched build. This corroborates the revised
-(guard-stack) diagnosis over the original (joint-architecture) one.
+**Key pre-fix findings:** (a) a single K=1 fit on the real W6 activations is
+*also* crippled (the outer objective flattens/oscillates at K=1 too), so SAC does
+not work around the guard on the unpatched build; (b) the outer ρ optimizer hits
+**non-PD (infeasible) Hessian probes even on clean planted data** — with the
+isometry gauge ON the WALL clamps those to a finite wall (→ endless oscillation),
+with it OFF the raw non-PD error surfaces and aborts the fit. Both are the same
+root cause: the outer objective is not a descendable landscape on the current
+build. This corroborates the revised (guard-stack / outer-objective) diagnosis
+over the original (joint-architecture) one, and pins Stage-1 fix item (iii)
+(restrict the WALL to genuinely non-finite probes so ρ optimization can see
+again) as load-bearing.
 
 Separately found and worked around a real gamfit **bug** (independent of the
 guard issue): the **parallel K=1 fit deadlocks** (0 % CPU, hangs) under
