@@ -1,0 +1,129 @@
+name: Validate One
+
+# Minimal, single-job, on-demand validation for the issue-fixer agents.
+#
+# WHY THIS EXISTS
+# ---------------
+# The full `Rust CI` (test.yml) is an 11+-job fan-out (build archive + N test
+# shards + pyffi + aggregate + python-tests). When the runner pool is saturated
+# by matrix jobs (Publish wheels, Build and Release All, the 6h Claude Fixer),
+# that whole graph sits QUEUED for a long time, so a fixer waiting to confirm a
+# one-line fix gets no feedback. This workflow is ONE ubuntu-latest job with a
+# tiny footprint that schedules into any small runner gap and fails fast, giving
+# a fixer quick per-issue signal. Reserve the full test.yml for a final
+# confirmation.
+#
+# It deliberately mirrors test.yml's `python-tests` job for the Python path
+# (Rust 1.93.0, rust-cache, maturin build+wheel-install, the gamfit/_rust .so
+# copy that defeats the cwd source-package shadowing) so a pass/fail here means
+# the same thing it would in the full suite. sccache is intentionally NOT used
+# (test.yml enables it only after a backend reachability probe; here a plain
+# Swatinem/rust-cache@v2 keeps builds warm after the first run without the
+# reachability hard-fail surface).
+
+on:
+  workflow_dispatch:
+    inputs:
+      rust_filter:
+        description: "cargo test name filter (substring). Empty = skip Rust."
+        default: ""
+        required: false
+      py_filter:
+        description: "pytest -k expression. Empty = skip Python."
+        default: ""
+        required: false
+      issue:
+        description: "Issue number, for labeling / concurrency keying only."
+        default: ""
+        required: false
+
+# Key concurrency on the issue so two DIFFERENT issues validating at once do not
+# cancel each other; a newer dispatch for the SAME issue supersedes the older.
+concurrency:
+  group: validate-one-${{ github.event.inputs.issue }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  validate:
+    name: Validate one (issue ${{ github.event.inputs.issue }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          # The build.rs human-author gate reads the real last editor of
+          # build.rs; a depth-1 clone makes `git log` return HEAD and
+          # false-fails every Claude-authored HEAD (#1458). Any cargo build/test
+          # below trips that gate, so fetch full history.
+          fetch-depth: 0
+
+      - name: Install Rust 1.93.0
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # ---- Rust path (only when a rust_filter was given) -------------------
+      - name: Run Rust tests (filtered)
+        if: ${{ github.event.inputs.rust_filter != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "cargo test --workspace ${{ github.event.inputs.rust_filter }}"
+          cargo test --workspace ${{ github.event.inputs.rust_filter }} -- --nocapture
+
+      # ---- Python path (only when a py_filter was given) -------------------
+      - name: Set up Python 3.11
+        if: ${{ github.event.inputs.py_filter != '' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install maturin
+        if: ${{ github.event.inputs.py_filter != '' }}
+        run: python -m pip install --upgrade pip "maturin>=1.7,<2"
+
+      - name: Build and install gam extension (maturin build + wheel install)
+        if: ${{ github.event.inputs.py_filter != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          maturin build --release -i python3 -o dist
+          python -m pip install --force-reinstall dist/*.whl
+          # pytest runs from the repo root, where the source ./gamfit/ package
+          # shadows the installed wheel on sys.path (cwd searched first). The
+          # source tree has no compiled extension, so `import gamfit._rust`
+          # fails. Copy the just-built extension from the installed wheel into
+          # the source tree so the cwd-shadowed import resolves the real module.
+          SITE="$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+          cp "$SITE"/gamfit/_rust*.so gamfit/ 2>/dev/null || true
+          ls -la gamfit/_rust*.so || { echo "::error::compiled gamfit._rust extension not found in $SITE/gamfit after wheel install"; exit 1; }
+
+      - name: Install Python test extras
+        if: ${{ github.event.inputs.py_filter != '' }}
+        run: |
+          python -m pip install \
+            'pytest>=8' 'numpy>=1.26' 'pandas>=2.0' 'scipy>=1.11' \
+            'pyarrow>=14' 'matplotlib>=3.8' 'scikit-learn>=1.4' requests
+
+      - name: Run Python tests (filtered, fail-fast)
+        if: ${{ github.event.inputs.py_filter != '' }}
+        run: python -m pytest tests/ -k "${{ github.event.inputs.py_filter }}" -x -q --tb=short
+
+      - name: Guard against an empty request
+        if: ${{ github.event.inputs.rust_filter == '' && github.event.inputs.py_filter == '' }}
+        run: |
+          echo "::error::Neither rust_filter nor py_filter was provided; nothing to validate."
+          exit 1
