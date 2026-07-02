@@ -3,11 +3,13 @@ use super::*;
 /// Gaussian location-scale predictor: two blocks (mean + log-sigma).
 ///
 /// Predicts `mean = X_mu @ beta_mu` (identity link on mean) and
-/// `sigma = sigma_floor + exp(X_noise @ beta_noise + offset_noise)`.
+/// `sigma = response_scale · sigma_floor + exp(X_noise @ beta_noise + offset_noise)`.
 ///
-/// `sigma_floor` is the scaled-response σ floor (`LOGB_SIGMA_FLOOR`) and
-/// `response_scale` maps the fitted scaled-response σ back to the original
-/// response units.
+/// `sigma_floor` is the standardized-response σ floor (`LOGB_SIGMA_FLOOR`) and
+/// `response_scale` maps it back to raw response units. The `exp(η)` term is
+/// already in raw units (the persisted log-σ intercept is shifted by
+/// `+ln(response_scale)` at fit time), so only the floor is scaled here — see
+/// [`GaussianLocationScalePredictor::compute_sigma`].
 pub struct GaussianLocationScalePredictor {
     pub beta_mu: Array1<f64>,
     pub beta_noise: Array1<f64>,
@@ -18,9 +20,26 @@ pub struct GaussianLocationScalePredictor {
 }
 
 impl GaussianLocationScalePredictor {
-    /// Compute σ on the scaled-response likelihood scale and then restore it to
-    /// raw response units. Both the positive floor and the exp(η) component are
-    /// scale parameters, so both must be multiplied by the saved response scale.
+    /// Reconstruct σ in raw response units from the persisted Scale-block
+    /// coefficients.
+    ///
+    /// The persisted `beta_noise` is already in RAW response units:
+    /// `rescale_gaussian_location_scale_to_raw` shifts the log-σ block intercept
+    /// by `+ln(response_scale)`, so `η_noise = η_internal + ln(response_scale)`
+    /// and `exp(η_noise) = response_scale · exp(η_internal)` already carries one
+    /// factor of the response scale. The soft floor is the only piece still in
+    /// standardized units — it sits *outside* the exp and cannot ride the
+    /// intercept shift — so it alone is multiplied by `response_scale` here:
+    ///
+    ///   σ_raw = response_scale · sigma_floor + exp(η_noise)
+    ///         = response_scale · (sigma_floor + exp(η_internal))
+    ///         = response_scale · σ_internal.
+    ///
+    /// This applies **exactly one** factor of `response_scale` to the σ surface,
+    /// matching the fit-side reconstruction (the #1874 equivariance test and the
+    /// FFI). Multiplying the whole `(sigma_floor + exp(η_noise))` by
+    /// `response_scale` would double-count it on the exp term (`response_scale²`),
+    /// breaking response-scale equivariance of the reported σ (#1874/#1928).
     fn compute_sigma(
         &self,
         design_noise: &DesignMatrix,
@@ -37,11 +56,9 @@ impl GaussianLocationScalePredictor {
             }
             eta_noise += offset_noise;
         }
-        let floor = self.sigma_floor;
-        let response_scale = self.response_scale;
+        let scaled_floor = self.response_scale * self.sigma_floor;
         Ok(eta_noise.mapv(|eta| {
-            response_scale
-                * gam::families::sigma_link::logb_sigma_from_eta_with_floor_scalar(floor, eta)
+            gam::families::sigma_link::logb_sigma_from_eta_with_floor_scalar(scaled_floor, eta)
         }))
     }
 
