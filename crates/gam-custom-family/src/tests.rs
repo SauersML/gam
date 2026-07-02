@@ -6976,6 +6976,32 @@ pub(crate) fn projected_stationarity_inf_norm_respects_kkt_multipliers() {
     let inf_interior =
         projected_stationarity_inf_norm(&residual_interior, &beta_interior, Some(&single1), None);
     assert_relative_eq!(inf_interior, 0.4_f64, epsilon = 1e-12);
+
+    // #1793/#1040: monotone derivative rows have `b = 0`, so a numerically
+    // pinned baseline-hazard row can sit a few 1e-3 inside the feasible cone
+    // after repeated basis projections even though the residual is entirely a
+    // valid KKT multiplier.  The projection must treat that row as an active
+    // candidate and let the nonnegative cone solve remove the multiplier.
+    let beta_nearly_pinned = array![0.004];
+    let residual_multiplier = array![2.0];
+    let near_pinned = projected_stationarity_inf_norm(
+        &residual_multiplier,
+        &beta_nearly_pinned,
+        Some(&single1),
+        None,
+    );
+    assert_relative_eq!(near_pinned, 0.0_f64, epsilon = 1e-10);
+
+    // But a row clearly in the interior remains visible, so the wider
+    // near-active band cannot erase ordinary interior non-stationarity.
+    let beta_clearly_interior = array![0.02];
+    let interior_residual = projected_stationarity_inf_norm(
+        &residual_multiplier,
+        &beta_clearly_interior,
+        Some(&single1),
+        None,
+    );
+    assert_relative_eq!(interior_residual, 2.0_f64, epsilon = 1e-12);
 }
 
 /// Pins the constrained-stationary certificate semantics.
