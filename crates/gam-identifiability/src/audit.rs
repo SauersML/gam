@@ -1316,6 +1316,15 @@ fn audit_identifiability_impl(
     // verdicts are fully decoupled.
     let mut aliased_pairs: Vec<AliasedPair> = Vec::new();
     let mut halt_pairs: Vec<AliasedPair> = Vec::new();
+    // #2070: joint-column indices that participate in a STRUCTURAL (halt-band)
+    // cross-block alias. Accumulated here — where the joint indices `ja`/`jb`
+    // are in scope — so the rank-restore guard below can decide per demoted
+    // column whether its RRQR demotion is a genuine structural collision (keep
+    // dropped) or a priority-ordering artifact on a merely ill-conditioned
+    // column (restore). Uses the halt band specifically because, unlike the
+    // report band, it has no near-exact floor and so catches structural aliases
+    // that sit below the 0.999 diagnostic floor.
+    let mut halt_alias_cols: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
     let n_block_pairs = specs.len().saturating_mul(specs.len().saturating_sub(1)) / 2;
     for a_block_idx in 0..specs.len() {
         let a_start = col_offsets[a_block_idx];
@@ -1381,6 +1390,11 @@ fn audit_identifiability_impl(
                     let halt_half_width = pair_halt_threshold(s2_ja, s2_jb, n);
                     if cosine_outside_null_band(cosine, shift, halt_half_width) {
                         halt_pairs.push(make_pair());
+                        // #2070: record the actual joint columns of this
+                        // structural alias so the rank-restore guard can protect
+                        // them from being blanket-restored.
+                        halt_alias_cols.insert(ja);
+                        halt_alias_cols.insert(jb);
                     }
                 }
             }
@@ -1403,12 +1417,30 @@ fn audit_identifiability_impl(
         .any(|s| s.gauge_priority != specs[0].gauge_priority);
     // A priority-ordered factorization can expose very small approximation
     // residuals when high-priority, ill-conditioned bases are committed before
-    // lower-priority bases.  Without a near-exact reported alias, that is not a
-    // structural gauge collision to drop: keep the full column set and let the
-    // solver/penalty handle ordinary numerical correlation.
-    if joint_rank < p_total && priority_ordering_exists && aliased_pairs.is_empty() {
-        joint_rank = p_total;
-        demoted_joint_cols.clear();
+    // lower-priority bases: the tier constraint pivots an ill-conditioned
+    // higher-priority column into the kept basis first, deflating a
+    // lower-priority column's Schur residual below `rank_tol` even though it
+    // carries a genuinely new direction. Demoting that column is an artifact of
+    // the ordering, not a structural gauge collision.
+    //
+    // #2070: the previous guard restored the FULL column set whenever no alias
+    // was REPORTED (`aliased_pairs.is_empty()`, floored at 0.999), which not
+    // only undid those numerical artifacts but also silenced RRQR on genuine
+    // STRUCTURAL aliases sitting below the diagnostic report floor. Distinguish
+    // the two PER COLUMN using the independent halt band (leverage-scaled K·σ,
+    // no near-exact floor — the auditor's structural-fittability signal, decoupled
+    // from the report floor by gam#1397): a demoted column corroborated by a
+    // halt-band alias is a real collision and stays dropped; the rest are the
+    // numerical/priority-ordering artifacts the restore exists for, and only
+    // those are returned to the kept set.
+    if joint_rank < p_total && priority_ordering_exists {
+        let has_numerical_only_demotion = demoted_joint_cols
+            .iter()
+            .any(|c| !halt_alias_cols.contains(c));
+        if has_numerical_only_demotion {
+            demoted_joint_cols.retain(|c| halt_alias_cols.contains(c));
+            joint_rank = p_total - demoted_joint_cols.len();
+        }
     }
 
     // Attribute each demoted joint column back to its canonical gauge owner.
