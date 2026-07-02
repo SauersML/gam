@@ -222,6 +222,9 @@ mod tests_device_engage_1783;
 mod tests_frame_refresh_alpha_grad;
 
 #[cfg(test)]
+mod tests_cocollapse_disjoint_2027;
+
+#[cfg(test)]
 mod lambda_smooth_1556_tests;
 
 pub use arrow_solver::*;
