@@ -75,10 +75,10 @@
 //! ([`sphere_chart_isometry_defect`]).
 
 use faer::Side as FaerSide;
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
-use crate::manifold::{SaeBasisEvaluator, SaeManifoldTerm, solve_design_least_squares};
 use gam_linalg::faer_ndarray::{FaerCholesky, fast_ab, fast_ata, fast_atb};
+use crate::manifold::{SaeBasisEvaluator, solve_design_least_squares};
 
 /// Number of integration cells for the fitted-turning quadrature (#1026).
 const TURNING_QUADRATURE_CELLS: usize = 256;
@@ -97,132 +97,6 @@ pub const ARC_LENGTH_GRID_CELLS: usize = 2048;
 /// fitted rows. Matched to the image-invariance contract the certificate and
 /// the tests assert (reconstruction unchanged within 1e-8).
 pub const CHART_RECOMPOSITION_REL_TOL: f64 = 1.0e-9;
-
-const CHART_GLUE_MIN_SUPPORT: usize = 4;
-const CHART_GLUE_MAX_FRAME_ANGLE_RAD: f64 = 0.35;
-const CHART_GLUE_MAX_REL_GAP: f64 = 0.15;
-
-/// Cheap atlas-gluing pre-screen for the structure-harvest fusion lane.
-///
-/// Co-activation detects overlapping duplicates; this catches the complementary
-/// atlas redundancy where two one-dimensional atoms tile disjoint adjacent
-/// charts of one manifold.  It requires adjacent active coordinate supports and
-/// matching seam tangent frames (unoriented principal angle for `d = 1`).  A
-/// returned score is only a proposal trigger; held-out evidence still decides
-/// whether the fused atom is accepted.
-pub(crate) fn chart_gluing_prescreen(term: &SaeManifoldTerm, a: usize, b: usize) -> Option<f64> {
-    let atom_a = term.atoms.get(a)?;
-    let atom_b = term.atoms.get(b)?;
-    if atom_a.latent_dim != 1 || atom_b.latent_dim != 1 || atom_a.basis_kind != atom_b.basis_kind {
-        return None;
-    }
-    if atom_a.decoder_coefficients.ncols() != atom_b.decoder_coefficients.ncols() {
-        return None;
-    }
-    let assignments = term.assignment.assignments();
-    let floor = 0.5 / assignments.ncols().max(1) as f64;
-    let coords_a = term.assignment.coords.get(a)?.as_matrix();
-    let coords_b = term.assignment.coords.get(b)?.as_matrix();
-    let (lo_a, hi_a, seam_a, rows_a) =
-        active_interval(assignments.column(a), coords_a.column(0), floor)?;
-    let (lo_b, hi_b, seam_b, rows_b) =
-        active_interval(assignments.column(b), coords_b.column(0), floor)?;
-    if rows_a < CHART_GLUE_MIN_SUPPORT || rows_b < CHART_GLUE_MIN_SUPPORT {
-        return None;
-    }
-
-    let span = (hi_a.max(hi_b) - lo_a.min(lo_b)).abs().max(1.0e-12);
-    let gap = if hi_a <= lo_b {
-        lo_b - hi_a
-    } else if hi_b <= lo_a {
-        lo_a - hi_b
-    } else {
-        return None;
-    };
-    if gap / span > CHART_GLUE_MAX_REL_GAP {
-        return None;
-    }
-
-    let tan_a = seam_tangent(
-        atom_a.basis_jacobian.view(),
-        atom_a.decoder_coefficients.view(),
-        seam_a,
-    )?;
-    let tan_b = seam_tangent(
-        atom_b.basis_jacobian.view(),
-        atom_b.decoder_coefficients.view(),
-        seam_b,
-    )?;
-    let angle = normalized_abs_dot(&tan_a, &tan_b)?.clamp(0.0, 1.0).acos();
-    (angle <= CHART_GLUE_MAX_FRAME_ANGLE_RAD)
-        .then_some(1.0 - angle / CHART_GLUE_MAX_FRAME_ANGLE_RAD)
-}
-
-fn active_interval(
-    masses: ndarray::ArrayView1<'_, f64>,
-    coords: ndarray::ArrayView1<'_, f64>,
-    floor: f64,
-) -> Option<(f64, f64, usize, usize)> {
-    let mut lo = f64::INFINITY;
-    let mut hi = f64::NEG_INFINITY;
-    let mut lo_row = 0usize;
-    let mut hi_row = 0usize;
-    let mut count = 0usize;
-    for (row, (&mass, &coord)) in masses.iter().zip(coords.iter()).enumerate() {
-        if mass > floor && coord.is_finite() {
-            count += 1;
-            if coord < lo {
-                lo = coord;
-                lo_row = row;
-            }
-            if coord > hi {
-                hi = coord;
-                hi_row = row;
-            }
-        }
-    }
-    (count > 0).then_some((
-        lo,
-        hi,
-        if hi_row >= lo_row { hi_row } else { lo_row },
-        count,
-    ))
-}
-
-fn seam_tangent(
-    jac: ArrayView3<'_, f64>,
-    decoder: ArrayView2<'_, f64>,
-    row: usize,
-) -> Option<Array1<f64>> {
-    if jac.shape().get(2).copied()? != 1
-        || row >= jac.shape()[0]
-        || jac.shape()[1] != decoder.nrows()
-    {
-        return None;
-    }
-    let mut out = Array1::<f64>::zeros(decoder.ncols());
-    for basis in 0..decoder.nrows() {
-        let dphi = jac[[row, basis, 0]];
-        for col in 0..decoder.ncols() {
-            out[col] += dphi * decoder[[basis, col]];
-        }
-    }
-    Some(out)
-}
-
-fn normalized_abs_dot(a: &Array1<f64>, b: &Array1<f64>) -> Option<f64> {
-    if a.len() != b.len() {
-        return None;
-    }
-    let (mut dot, mut na, mut nb) = (0.0, 0.0, 0.0);
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        dot += x * y;
-        na += x * x;
-        nb += y * y;
-    }
-    let denom = (na * nb).sqrt();
-    (denom > 1.0e-12).then_some((dot / denom).abs())
-}
 
 /// The `d = 1` reference topology the canonical chart lives on.
 #[derive(Debug, Clone, PartialEq)]
