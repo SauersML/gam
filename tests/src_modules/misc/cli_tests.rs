@@ -6259,24 +6259,31 @@ fn parse_survival_inverse_link_supports_loglog_and_cauchit() {
         frailty_sd: None,
         hazard_loading: None,
     };
-    // `loglog` and `cauchit` are no longer accepted as survival --link values:
-    // they lack a `LinkFunction` representative, so the previous routing through
-    // a degenerate single-component MixtureLinkSpec violated the mixture-link
-    // anchor invariant enforced by `validate_mixturespec`.
-    let err = parse_survival_inverse_link(&args)
-        .expect_err("loglog survival link must be rejected without a LinkFunction representative");
-    assert!(
-        err.contains("loglog") || err.to_ascii_lowercase().contains("unsupported"),
-        "expected loglog rejection error, got: {err}"
-    );
+    // `loglog` and `cauchit` are supported survival --link values (issue #1829). Each
+    // routes through a single-component MixtureLinkSpec (weight 1.0) — a pure link, not
+    // an under-identified blend — so `validate_mixturespec` accepts it (the anchor
+    // requirement only applies to genuine multi-component blends). Numeric mu checks
+    // live in `parse_survival_inverse_link_accepts_loglog_and_cauchit`.
+    let loglog = parse_survival_inverse_link(&args)
+        .expect("loglog survival link parses to a single-component mixture");
+    match &loglog {
+        InverseLink::Mixture(state) => {
+            assert_eq!(state.components, vec![LinkComponent::LogLog]);
+            assert!((state.pi[0] - 1.0).abs() < 1e-12);
+        }
+        other => panic!("expected loglog to route through a mixture, got {other:?}"),
+    }
 
     args.link = Some("cauchit".to_string());
-    let err = parse_survival_inverse_link(&args)
-        .expect_err("cauchit survival link must be rejected without a LinkFunction representative");
-    assert!(
-        err.contains("cauchit") || err.to_ascii_lowercase().contains("unsupported"),
-        "expected cauchit rejection error, got: {err}"
-    );
+    let cauchit = parse_survival_inverse_link(&args)
+        .expect("cauchit survival link parses to a single-component mixture");
+    match &cauchit {
+        InverseLink::Mixture(state) => {
+            assert_eq!(state.components, vec![LinkComponent::Cauchit]);
+            assert!((state.pi[0] - 1.0).abs() < 1e-12);
+        }
+        other => panic!("expected cauchit to route through a mixture, got {other:?}"),
+    }
 }
 
 #[test]
