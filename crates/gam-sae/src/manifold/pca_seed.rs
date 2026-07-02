@@ -21,16 +21,37 @@ const SURPLUS_DIR_FLOOR: f64 = 1.0e-6;
 /// `0.0`, leaving the original `atom_idx / k_atoms` offset bit-for-bit.
 const GOLDEN_RATIO_CONJUGATE: f64 = 0.618_033_988_749_894_9;
 
-/// Maximum rows used by the topology-aware curved-atom seed.  The seed is only
-/// a starting chart, so a deterministic stride subsample keeps the graph solve
-/// bounded while preserving reproducibility and memory use on large inputs.
-const TOPOLOGY_SEED_MAX_POINTS: usize = 4096;
+/// Explicit memory budget for the topology-aware seed's dense graph-Laplacian
+/// eigensolve. The subsample size is *derived* from this budget rather than
+/// fixed to a tuned point count (#2065): the seed builds two dense `m×m` f64
+/// matrices — the symmetric normalized Laplacian and its eigenvectors — so the
+/// largest `m` that fits `B` bytes is `sqrt(B / 16)`. At the default 256 MiB
+/// this yields `m = 4096` (the historical value), but now as a stated resource
+/// choice whose O(m³) eigensolve cost is bounded by the budget, not by a fudge.
+const TOPOLOGY_SEED_LAPLACIAN_BUDGET_BYTES: usize = 256 << 20;
 
-/// k used for the local neighborhood graph in the topology-aware seed.  This is
-/// large enough to connect ordinary manifold samples but small enough that the
-/// dense Laplacian eigensolve is still dominated by one joint SAE iteration on
-/// the subsample.
-const TOPOLOGY_SEED_KNN: usize = 12;
+/// Largest subsample size whose two dense f64 `m×m` matrices fit
+/// [`TOPOLOGY_SEED_LAPLACIAN_BUDGET_BYTES`] (`16·m²` bytes total).
+fn topology_seed_max_points() -> usize {
+    let m = ((TOPOLOGY_SEED_LAPLACIAN_BUDGET_BYTES / 16) as f64).sqrt() as usize;
+    m.max(4)
+}
+
+/// Neighborhood degree `k` for the topology seed's kNN graph, *derived* from the
+/// atom's intrinsic dimension and the sample size rather than a tuned scalar
+/// (#2065). Two independent requirements set the floor:
+///   * geometric faithfulness — the graph Laplacian approximates the
+///     Laplace–Beltrami operator only if each node links its full local tangent
+///     star, i.e. `≥ 2d+1` neighbours span a `d`-simplex neighborhood; and
+///   * connectivity — a kNN graph on `n` points is connected with high
+///     probability only for `k ≳ log₂ n` (Penrose, random geometric graphs).
+/// Take the larger so the harmonic coordinates are both faithful and connected.
+/// (For the default full subsample `m = 4096`, `d ≤ 2` ⇒ `k = 12`, unchanged.)
+fn topology_seed_knn(n_points: usize, d_atom: usize) -> usize {
+    let tangent_floor = 2 * d_atom + 1;
+    let connectivity_floor = (n_points.max(2) as f64).log2().ceil() as usize;
+    tangent_floor.max(connectivity_floor).max(2)
+}
 
 fn is_curved_kind(kind: &SaeAtomBasisKind) -> bool {
     matches!(
@@ -40,12 +61,13 @@ fn is_curved_kind(kind: &SaeAtomBasisKind) -> bool {
 }
 
 fn topology_seed_subsample(n_obs: usize) -> Vec<usize> {
-    if n_obs <= TOPOLOGY_SEED_MAX_POINTS {
+    let cap = topology_seed_max_points();
+    if n_obs <= cap {
         return (0..n_obs).collect();
     }
-    let mut rows = Vec::with_capacity(TOPOLOGY_SEED_MAX_POINTS);
-    for i in 0..TOPOLOGY_SEED_MAX_POINTS {
-        rows.push(i * n_obs / TOPOLOGY_SEED_MAX_POINTS);
+    let mut rows = Vec::with_capacity(cap);
+    for i in 0..cap {
+        rows.push(i * n_obs / cap);
     }
     rows
 }
@@ -90,7 +112,10 @@ fn topology_curved_seed_initial_coords(
     if m < 4 {
         return Ok(None);
     }
-    let k = TOPOLOGY_SEED_KNN.min(m - 1);
+    let d_max = atom_dim.iter().copied().max().unwrap_or(1).max(1);
+    // Neighborhood degree derived from intrinsic dimension + connectivity
+    // (#2065), capped at the subsample size.
+    let k = topology_seed_knn(m, d_max).min(m - 1);
     let mut w = Array2::<f64>::zeros((m, m));
     for (ia, &ra) in rows.iter().enumerate() {
         let mut dists = Vec::with_capacity(m - 1);
@@ -132,17 +157,21 @@ fn topology_curved_seed_initial_coords(
     if evals.len() < 3 {
         return Ok(None);
     }
-    let d_max = atom_dim.iter().copied().max().unwrap_or(1).max(1);
     let mut out = Array3::<f64>::zeros((basis_kinds.len(), z.nrows(), d_max));
+    // Inverse-distance interpolation onto out-of-subsample rows uses the `d+1`
+    // nearest subsample points — the vertices of a barycentric simplex for a
+    // `d`-dimensional atom chart — derived from the atom dimension rather than a
+    // hardcoded 3-NN (#2065). Bounded by the subsample size `m`.
+    let interp_k = (d_max + 1).max(2).min(m);
     let interp = |sample_values: &Array1<f64>, row: usize| -> f64 {
         if let Some(pos) = rows.iter().position(|&r| r == row) {
             return sample_values[pos];
         }
-        let mut best = [(f64::INFINITY, 0usize); 3];
+        let mut best: Vec<(f64, usize)> = vec![(f64::INFINITY, 0usize); interp_k];
         for (i, &r) in rows.iter().enumerate() {
             let d = squared_distance_rows(z, row, r);
-            if d < best[2].0 {
-                best[2] = (d, i);
+            if d < best[interp_k - 1].0 {
+                best[interp_k - 1] = (d, i);
                 best.sort_by(|a, b| a.0.total_cmp(&b.0));
             }
         }
