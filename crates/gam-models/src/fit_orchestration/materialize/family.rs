@@ -234,6 +234,42 @@ pub fn resolve_family(
             } else {
                 (lowered.as_str(), None)
             };
+            // mgcv's `tw()` carries the Tweedie variance power as its
+            // parenthesized argument (`tweedie(1.6)` / `tweedie(p=1.6)`), NOT a
+            // link name. When the head is Tweedie and the argument parses as a
+            // number, interpret it as the power `p` and consume the argument so
+            // it is not misrouted to the link resolver — which previously
+            // rejected `tweedie(1.5)` as `unknown link '1.5'` (#2026), leaving
+            // no user-facing way to set `p`. A non-numeric argument
+            // (e.g. `tweedie(log)`) still flows through to the link resolver.
+            let (paren_link, tweedie_p_override): (Option<&str>, Option<f64>) =
+                if matches!(head_name, "tweedie" | "tw" | "tweedie-log")
+                    && let Some(arg) = paren_link
+                {
+                    let numeric = arg.strip_prefix("p=").unwrap_or(arg).trim();
+                    match numeric.parse::<f64>() {
+                        Ok(p) => {
+                            // Reuse the single Tweedie-power validity gate
+                            // (`p` finite and strictly in (1, 2)) that the
+                            // latent FFI and PIRLS deviance paths enforce, so a
+                            // bad power fails here with an actionable message
+                            // instead of an opaque downstream NaN deviance.
+                            if !gam_spec::is_valid_tweedie_power(p) {
+                                return Err(WorkflowError::InvalidConfig {
+                                    reason: format!(
+                                        "tweedie power p must be finite and strictly \
+                                         between 1 and 2; got {p}"
+                                    ),
+                                }
+                                .into());
+                            }
+                            (None, Some(p))
+                        }
+                        Err(_) => (Some(arg), None),
+                    }
+                } else {
+                    (paren_link, None)
+                };
             let resolved = match head_name {
                 "gaussian" => (
                     LikelihoodSpec::new(
@@ -351,21 +387,32 @@ pub fn resolve_family(
                     ),
                     true,
                 ),
-                // Tweedie compound-Poisson-Gamma family. The variance power
-                // p must lie strictly in (1, 2); we default to mgcv's
-                // canonical p = 1.5. The link is fixed to log (the only link
-                // wired through the Tweedie working-response and dispersion
-                // machinery). "tw" matches mgcv's family alias.
+                // Tweedie compound-Poisson-Gamma family. The variance power p
+                // must lie strictly in (1, 2). mgcv's `tw()` has NO canonical
+                // p — it *estimates* p by profile likelihood; here p can be set
+                // explicitly via the mgcv-style `tweedie(1.6)` / `tweedie(p=1.6)`
+                // parenthesized argument (parsed above into `tweedie_p_override`,
+                // #2026). Absent an explicit power we fall back to p = 1.5, a
+                // neutral interior default; the fitted mean (log-link
+                // quasi-likelihood) is robust to a misspecified p, but the
+                // observation-interval calibration depends on it, so callers on
+                // data whose true p != 1.5 should set it. The link is fixed to
+                // log (the only link wired through the Tweedie working-response
+                // and dispersion machinery). "tw" matches mgcv's family alias.
                 "tweedie" | "tw" => (
                     LikelihoodSpec::new(
-                        ResponseFamily::Tweedie { p: 1.5 },
+                        ResponseFamily::Tweedie {
+                            p: tweedie_p_override.unwrap_or(1.5),
+                        },
                         InverseLink::Standard(StandardLink::Log),
                     ),
                     false,
                 ),
                 "tweedie-log" => (
                     LikelihoodSpec::new(
-                        ResponseFamily::Tweedie { p: 1.5 },
+                        ResponseFamily::Tweedie {
+                            p: tweedie_p_override.unwrap_or(1.5),
+                        },
                         InverseLink::Standard(StandardLink::Log),
                     ),
                     true,
@@ -585,4 +632,70 @@ pub fn resolve_family(
         _ => InverseLink::Standard(StandardLink::Identity),
     };
     Ok(LikelihoodSpec::new(response, link))
+}
+
+#[cfg(test)]
+mod tweedie_power_tests {
+    //! #2026: the mgcv-style parenthesized Tweedie power `tweedie(p)` must be
+    //! parsed as the variance power (not misrouted to the link resolver), so
+    //! callers whose true `p != 1.5` can set it and get calibrated observation
+    //! intervals (`Var(Y|x) = phi * mu^p`).
+    use super::*;
+    use ndarray::array;
+
+    /// Resolve `family` and return the Tweedie variance power it carries.
+    fn tweedie_p(family: &str) -> f64 {
+        let y = array![0.0, 1.2, 3.4, 0.0, 5.6];
+        let spec = resolve_family(
+            Some(family),
+            None,
+            None,
+            y.view(),
+            ResponseColumnKind::Numeric,
+            "y",
+        )
+        .expect("family should resolve");
+        match spec.response {
+            ResponseFamily::Tweedie { p } => p,
+            _ => panic!("expected a Tweedie response family from `{family}`"),
+        }
+    }
+
+    #[test]
+    fn tweedie_paren_power_parses() {
+        // Each of these was rejected before #2026 as `unknown link '<num>'`.
+        assert_eq!(tweedie_p("tweedie(1.7)"), 1.7);
+        assert_eq!(tweedie_p("tw(1.3)"), 1.3);
+        assert_eq!(tweedie_p("tweedie(p=1.6)"), 1.6);
+        assert_eq!(tweedie_p("Tweedie(1.25)"), 1.25);
+        assert_eq!(tweedie_p("tweedie-log(1.9)"), 1.9);
+    }
+
+    #[test]
+    fn tweedie_bare_defaults_to_interior_power() {
+        // No explicit power → the neutral interior default (documented as a
+        // fallback, not a canonical value).
+        assert_eq!(tweedie_p("tweedie"), 1.5);
+        assert_eq!(tweedie_p("tw"), 1.5);
+    }
+
+    #[test]
+    fn tweedie_paren_power_rejects_out_of_range() {
+        let y = array![0.0, 1.2, 3.4];
+        for bad in ["tweedie(1.0)", "tweedie(2.0)", "tweedie(2.5)", "tweedie(0.5)"] {
+            let err = resolve_family(
+                Some(bad),
+                None,
+                None,
+                y.view(),
+                ResponseColumnKind::Numeric,
+                "y",
+            )
+            .expect_err("power outside (1, 2) must be rejected");
+            assert!(
+                err.contains("tweedie power"),
+                "unexpected error for `{bad}`: {err}"
+            );
+        }
+    }
 }
