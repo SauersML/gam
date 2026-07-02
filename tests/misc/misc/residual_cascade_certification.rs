@@ -676,7 +676,12 @@ fn coarse_space_preconditioner_conditions_uniformly_in_depth() {
                 u[j] = s[j] / inv_norm;
             }
         }
-        lam_max * inv_norm
+        // The spectral condition number of an SPD matrix is mathematically
+        // bounded below by one.  For identity-like matrices the two iterative
+        // estimates can straddle one by a few ulps after whitening/Cholesky
+        // roundoff, so enforce the invariant at the numerical boundary rather
+        // than reporting an impossible sub-unit condition number.
+        (lam_max * inv_norm).max(1.0)
     }
 
     let mut conds = Vec::new();

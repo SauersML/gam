@@ -7,6 +7,43 @@ pub(crate) struct TensorKroneckerPsiOperator {
     pub(crate) covariate_first_cache: Arc<Vec<Mutex<Option<Arc<Array2<f64>>>>>>,
 }
 
+/// Whether two covariate ψ-derivatives act on the SAME implicit second-design
+/// operator, so their `∂²X/∂ψ_d∂ψ_e` block is genuinely nonzero and must route
+/// through `op.*_second_{diag,cross}` rather than falling back to the dense
+/// `x_psi_psi` rows (which are absent on the matrix-free implicit-operator path,
+/// so the fallback returns zeros).
+///
+/// True in exactly two cases:
+///   (a) both axes share one ANISOTROPIC group (`implicit_group_id` Some and
+///       equal — the Diag/Cross axis pair of a shared multi-length-scale
+///       operator), or
+///   (b) the ISOTROPIC self-second-derivative: a single-length-scale block
+///       carries no aniso group id (`implicit_group_id == None`), and its lone
+///       ψψ DIAGONAL — the SAME global covariate-deriv index, `axis_d == axis_e`
+///       — is still genuinely nonzero.
+///
+/// The historical guard tested `implicit_group_id.is_some() && ==`, which failed
+/// case (b): an isotropic-matern block's diagonal `∂²X/∂ψ² = J̈` was silently
+/// dropped to zero, halving the ψψ outer-Hessian / LAML `½log|H|` curvature and
+/// the explicit Firth/Jeffreys `∂²_ψΦ` term. That is the gam#1607 bug — fixed in
+/// the custom-family resolver (`resolve_custom_family_x_psi_psi_map` /
+/// `from_second_derivative`) by the identical same-operator predicate; this is
+/// its transformation-normal `TensorKroneckerPsiOperator` sibling. Two DISTINCT
+/// ungrouped blocks have different global indices (`axis_d != axis_e`), so they
+/// stay zero and no spurious cross term is synthesised (the fix the #1607 commit
+/// explicitly reasoned about, using the global index here as the unambiguous
+/// same-block key).
+#[inline]
+fn same_implicit_operator(
+    deriv_d: &CustomFamilyBlockPsiDerivative,
+    deriv_e: &CustomFamilyBlockPsiDerivative,
+    axis_d: usize,
+    axis_e: usize,
+) -> bool {
+    deriv_d.implicit_group_id == deriv_e.implicit_group_id
+        && (deriv_d.implicit_group_id.is_some() || axis_d == axis_e)
+}
+
 impl TensorKroneckerPsiOperator {
     pub(crate) fn n_data(&self) -> usize {
         self.response_val_basis.nrows()
@@ -78,8 +115,7 @@ impl TensorKroneckerPsiOperator {
     ) -> Result<Array1<f64>, gam_terms::basis::BasisError> {
         let deriv_d = self.cov_deriv(axis_d)?;
         if let Some(op) = deriv_d.implicit_operator.as_ref()
-            && deriv_d.implicit_group_id.is_some()
-            && deriv_d.implicit_group_id == self.cov_deriv(axis_e)?.implicit_group_id
+            && same_implicit_operator(deriv_d, self.cov_deriv(axis_e)?, axis_d, axis_e)
         {
             if deriv_d.implicit_axis == self.cov_deriv(axis_e)?.implicit_axis {
                 return op.forward_mul_second_diag(deriv_d.implicit_axis, u);
@@ -108,8 +144,7 @@ impl TensorKroneckerPsiOperator {
     ) -> Result<Array1<f64>, gam_terms::basis::BasisError> {
         let deriv_d = self.cov_deriv(axis_d)?;
         if let Some(op) = deriv_d.implicit_operator.as_ref()
-            && deriv_d.implicit_group_id.is_some()
-            && deriv_d.implicit_group_id == self.cov_deriv(axis_e)?.implicit_group_id
+            && same_implicit_operator(deriv_d, self.cov_deriv(axis_e)?, axis_d, axis_e)
         {
             if deriv_d.implicit_axis == self.cov_deriv(axis_e)?.implicit_axis {
                 return op.transpose_mul_second_diag(deriv_d.implicit_axis, v);
@@ -177,8 +212,7 @@ impl TensorKroneckerPsiOperator {
         let deriv_d = self.cov_deriv(axis_d)?;
         let deriv_e = self.cov_deriv(axis_e)?;
         if let Some(op) = deriv_d.implicit_operator.as_ref()
-            && deriv_d.implicit_group_id.is_some()
-            && deriv_d.implicit_group_id == deriv_e.implicit_group_id
+            && same_implicit_operator(deriv_d, deriv_e, axis_d, axis_e)
         {
             if deriv_d.implicit_axis == deriv_e.implicit_axis {
                 return op.row_chunk_second_diag(deriv_d.implicit_axis, rows);
@@ -1670,4 +1704,71 @@ pub(crate) fn push_lifted_covariate_penalty_component(
             right: ds_cov,
         },
     ));
+}
+
+#[cfg(test)]
+mod same_implicit_operator_gate_tests {
+    //! gam#1607 (transformation-normal sibling): the ψψ second-design-derivative
+    //! gate on the matrix-free implicit-operator path. The historical predicate
+    //! `implicit_group_id.is_some() && ==` silently dropped an ISOTROPIC single-
+    //! length-scale block's ψψ DIAGONAL (`group_id == None`) to zero — halving
+    //! the ψψ outer-Hessian / LAML curvature and the Firth/Jeffreys `∂²_ψΦ` term.
+    //! The isotropic operator's own second-diagonal *math* is FD-verified by the
+    //! custom-family gate (`families_bms_joint_hessian_hvp_correction_tests`,
+    //! gam#1607); these cases pin the routing decision that feeds it.
+    use super::*;
+
+    fn deriv(group: Option<usize>, implicit_axis: usize) -> CustomFamilyBlockPsiDerivative {
+        let mut d = CustomFamilyBlockPsiDerivative::new(
+            None,
+            Array2::<f64>::zeros((0, 0)),
+            Array2::<f64>::zeros((0, 0)),
+            None,
+            None,
+            None,
+            None,
+        );
+        d.implicit_group_id = group;
+        d.implicit_axis = implicit_axis;
+        d
+    }
+
+    #[test]
+    fn isotropic_diagonal_is_the_same_operator() {
+        // Group None + same global covariate-deriv index ⇒ the isotropic ψψ
+        // self-second-derivative, which is genuinely nonzero and must route
+        // through the operator (not fall through to the absent dense fallback).
+        let iso = deriv(None, 0);
+        assert!(
+            same_implicit_operator(&iso, &iso, 0, 0),
+            "isotropic ψψ diagonal must be treated as the same operator (gam#1607)"
+        );
+    }
+
+    #[test]
+    fn distinct_ungrouped_blocks_are_not_the_same_operator() {
+        // Two SEPARATE isotropic blocks: both ungrouped, and even if their
+        // within-operator implicit_axis collides, their GLOBAL indices differ,
+        // so no spurious cross term may be synthesised.
+        let a = deriv(None, 0);
+        let b = deriv(None, 0);
+        assert!(!same_implicit_operator(&a, &b, 0, 1));
+    }
+
+    #[test]
+    fn anisotropic_group_diag_and_cross_share_the_operator() {
+        // Unchanged from before the fix: aniso axes in one group share a
+        // multi-length-scale operator (both Diag and Cross legs nonzero).
+        let g0 = deriv(Some(0), 0);
+        let g1 = deriv(Some(0), 1);
+        assert!(same_implicit_operator(&g0, &g0, 0, 0), "aniso diagonal");
+        assert!(same_implicit_operator(&g0, &g1, 0, 1), "aniso cross");
+    }
+
+    #[test]
+    fn different_groups_are_distinct_operators() {
+        let g0 = deriv(Some(0), 0);
+        let g1 = deriv(Some(1), 0);
+        assert!(!same_implicit_operator(&g0, &g1, 0, 2));
+    }
 }

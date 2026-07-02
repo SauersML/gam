@@ -446,10 +446,10 @@ pub fn default_num_centers(n: usize, d: usize) -> usize {
 /// the fitted scale is driven small the *observed* information collapses and
 /// the determinant penalty stops holding the wiggle down (#501). This mirrors
 /// standard GAMLSS/mgcv practice of giving distribution parameters a modest
-/// default (mgcv's `k = 10` for a 1-D `s()`), grown gently with dimensionality
-/// and never exceeding the generous primary-predictor default.
+/// default (mgcv's modest default basis for a 1-D `s()`), grown gently with
+/// dimensionality and never exceeding the generous primary-predictor default.
 pub fn conservative_secondary_centers(n: usize, d: usize) -> usize {
-    const BASE_1D_CENTERS: usize = 10;
+    const BASE_1D_CENTERS: usize = 15;
     let modest = BASE_1D_CENTERS.saturating_mul(d.max(1));
     default_num_centers(n, d).min(modest).max(1)
 }
@@ -2043,8 +2043,19 @@ pub(crate) fn positive_spectral_whitener_from_gram(
     let (eigenvalues, eigenvectors) = gram.eigh(Side::Lower).map_err(BasisError::LinalgError)?;
     let n = gram.nrows();
     let max_eval = eigenvalues.iter().copied().fold(0.0_f64, f64::max);
-    let tol = (default_rrqr_rank_alpha() * f64::EPSILON * (n.max(1) as f64) * max_eval.max(1.0))
-        .max(f64::EPSILON);
+    // Scale-invariant rank tolerance: the cutoff must track the Gram's own
+    // spectrum (`α·ε·n·max_eval`), not an absolute floor. An earlier `max_eval
+    // .max(1.0)` clamped the reference scale to 1.0, which is only harmless when
+    // `max_eval ≥ 1`; for a genuinely well-conditioned but small-magnitude Gram
+    // (e.g. a Duchon hybrid whose evaluated kernel sits far below unit scale in
+    // moderate-to-high d) it inflated the tolerance to an absolute `α·ε·n` floor
+    // that swallows the entire — perfectly valid — spectrum, spuriously reporting
+    // `keep == 0`. Using the true `max_eval` makes `keep` invariant to a uniform
+    // rescaling of the Gram (which scales every eigenvalue and the cutoff
+    // identically). The residual `.max(f64::EPSILON)` only guards the degenerate
+    // all-zero Gram so that numerical-zero roundoff directions are still dropped.
+    let tol =
+        (default_rrqr_rank_alpha() * f64::EPSILON * (n.max(1) as f64) * max_eval).max(f64::EPSILON);
     let keep = eigenvalues.iter().filter(|&&ev| ev > tol).count();
     if keep == 0 {
         let min_ev = eigenvalues.iter().copied().fold(f64::INFINITY, f64::min);

@@ -248,6 +248,51 @@ fn kahan_scaled_add_array1(
     }
 }
 
+fn weighted_gram_and_rhs(
+    design: &Array2<f64>,
+    weights: ArrayView1<'_, f64>,
+    wz: &Array1<f64>,
+) -> (Array2<f64>, Array1<f64>) {
+    let (_n, k) = design.dim();
+    let mut gram = Array2::<f64>::zeros((k, k));
+    let mut gram_comp = Array2::<f64>::zeros((k, k));
+    let mut rhs = Array1::<f64>::zeros(k);
+    let mut rhs_comp = Array1::<f64>::zeros(k);
+
+    // Stream row contributions with one compensation term per retained k-space
+    // entry.  The Chebyshev value/derivative accessors are n-free only after
+    // these node sufficient statistics are frozen, so this is the unique O(n)
+    // reduction whose summation error is subsequently amplified by high-order
+    // derivative coefficients.  Keeping the reduction compensated preserves the
+    // algebraic additivity under replicated rows without relying on BLAS dot's
+    // implementation-dependent reduction tree.
+    for ((row, &w), &wz_i) in design.outer_iter().zip(weights.iter()).zip(wz.iter()) {
+        for a in 0..k {
+            let xa = row[a];
+
+            let y_rhs = xa * wz_i - rhs_comp[a];
+            let t_rhs = rhs[a] + y_rhs;
+            rhs_comp[a] = (t_rhs - rhs[a]) - y_rhs;
+            rhs[a] = t_rhs;
+
+            for b in a..k {
+                let y = xa * w * row[b] - gram_comp[[a, b]];
+                let t = gram[[a, b]] + y;
+                gram_comp[[a, b]] = (t - gram[[a, b]]) - y;
+                gram[[a, b]] = t;
+            }
+        }
+    }
+
+    for a in 0..k {
+        for b in 0..a {
+            gram[[a, b]] = gram[[b, a]];
+        }
+    }
+
+    (gram, rhs)
+}
+
 /// Spectral norm of a SYMMETRIC matrix `m` (here the difference of two
 /// orthogonal range projectors), i.e. `max|eigenvalue|`. For two equal-rank
 /// orthogonal projectors `P_ref`, `P_new` this equals `sin θ_max`, the sine of
@@ -424,12 +469,9 @@ impl PsiGramTensor {
             // Weighted Gram / RHS at this node, then the n×k design is dropped.
             // RHS uses the prebuilt `wz = W z` (same factoring as the exact
             // streamed path) so the retained series is bit-faithful to it.
-            let mut wd = design.clone();
-            for (mut row, &w) in wd.outer_iter_mut().zip(weights.iter()) {
-                row.mapv_inplace(|v| v * w);
-            }
-            node_grams.push(design.t().dot(&wd));
-            node_rhs.push(design.t().dot(&wz));
+            let (node_gram, node_rh) = weighted_gram_and_rhs(&design, weights, &wz);
+            node_grams.push(node_gram);
+            node_rhs.push(node_rh);
         }
         let (_n, k) = dims.expect("node ladder rung m≥1 yields at least one design");
         // First-kind discrete orthogonality of the Chebyshev nodes.
@@ -515,11 +557,8 @@ impl PsiGramTensor {
             let Ok(design) = eval_design(psi) else {
                 return false;
             };
-            let mut wd = design.clone();
-            for (mut row, &w) in wd.outer_iter_mut().zip(weights.iter()) {
-                row.mapv_inplace(|v| v * w);
-            }
-            let exact = design.t().dot(&wd);
+            let zero_rhs = Array1::<f64>::zeros(design.nrows());
+            let (exact, _) = weighted_gram_and_rhs(&design, weights, &zero_rhs);
             let assembled = self.gram_at(psi);
             let scale = exact
                 .iter()

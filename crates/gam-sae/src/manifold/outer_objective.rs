@@ -1270,9 +1270,11 @@ impl SaeManifoldOuterObjective {
     /// Laplace normaliser is non-finite). Used ONLY by
     /// [`Self::value_consistent_outer_gradient`] to central-difference the outer
     /// criterion; the clone means the production converged state is untouched and
-    /// the probe re-solves warm from it. Returns `+∞` for a recoverable
-    /// infeasible ρ probe (non-PD joint Hessian), which the caller treats as an
-    /// adjacent wall and declines to difference across.
+    /// the probe re-solves warm from it. Returns the same finite collapse wall
+    /// used by the production value / gradient / EFS lanes for a recoverable
+    /// infeasible ρ probe (non-PD joint Hessian), so the consistency safeguard
+    /// differentiates the objective shape the line search actually sees instead
+    /// of reintroducing an `+∞` lane for the #1782 refusal class.
     fn probe_outer_criterion_value(&self, rho: &SaeManifoldRho) -> Result<f64, String> {
         let mut probe = self.term.clone();
         let reml = match probe.reml_criterion_with_cache(
@@ -1285,7 +1287,9 @@ impl SaeManifoldOuterObjective {
             self.ridge_beta,
         ) {
             Ok(evaluated) => evaluated.0,
-            Err(err) if Self::is_recoverable_value_probe_refusal(&err) => return Ok(f64::INFINITY),
+            Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
+                return Ok(Self::recoverable_refusal_wall_cost());
+            }
             Err(err) => return Err(err),
         };
         Ok(if reml.is_finite() {

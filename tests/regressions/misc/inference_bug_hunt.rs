@@ -20,7 +20,7 @@ fn probability_normal_cdf_boundary_and_accuracy_contract() {
         "normal_cdf(-inf) must be 0"
     );
     let z = 0.37;
-    let expected = 0.644308823593; // high-precision reference
+    let expected = 0.6443087548005467; // high-precision reference
     assert!(
         (normal_cdf(z) - expected).abs() < 1e-12,
         "normal_cdf must match standard normal CDF within 1e-12"

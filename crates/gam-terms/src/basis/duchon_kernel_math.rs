@@ -240,24 +240,45 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
     }
     let d0_kernel = fast_ab(&d0_raw, &z);
     let poly = polynomial_block_from_order(centers, nullspace_order);
+    let poly_collocation = polynomial_block_from_order(collocation_points, nullspace_order);
+    let poly_d1 = if build_d1 {
+        polynomial_derivative_block(collocation_points, nullspace_order, 1)
+    } else {
+        Array2::<f64>::zeros((0, poly.ncols()))
+    };
+    let poly_d2 = if build_d2 {
+        polynomial_derivative_block(collocation_points, nullspace_order, 2)
+    } else {
+        Array2::<f64>::zeros((0, poly.ncols()))
+    };
     let kernel_cols = d0_kernel.ncols();
     let poly_cols = poly.ncols();
     let total_cols = kernel_cols + poly_cols;
-    // The polynomial block is the unpenalized Duchon null space, left zero before
-    // the outer identifiability transform (these operators feed only penalty
-    // construction). Orders the caller skipped stay empty (0 rows).
+    // The operator matrices act on the SAME coefficient basis as the emitted
+    // design: constrained radial columns followed by explicit polynomial
+    // null-space columns.  The lower-order Hilbert-scale penalties are function
+    // penalties, not just radial-kernel penalties, so the polynomial block must
+    // be evaluated/differentiated at the collocation sites too: D0 sees the
+    // polynomial value, D1 its gradient, and D2 its Hessian. Orders the caller
+    // skipped stay empty (0 rows).
     let mut d0 = Array2::<f64>::zeros((p_colloc, total_cols));
     d0.slice_mut(s![.., 0..kernel_cols]).assign(&d0_kernel);
+    d0.slice_mut(s![.., kernel_cols..total_cols])
+        .assign(&poly_collocation);
     let mut d1 = Array2::<f64>::zeros((if build_d1 { p_colloc * dim } else { 0 }, total_cols));
     if build_d1 {
         d1.slice_mut(s![.., 0..kernel_cols])
             .assign(&fast_ab(&d1_raw, &z));
+        d1.slice_mut(s![.., kernel_cols..total_cols])
+            .assign(&poly_d1);
     }
     let mut d2 =
         Array2::<f64>::zeros((if build_d2 { p_colloc * dim * dim } else { 0 }, total_cols));
     if build_d2 {
         d2.slice_mut(s![.., 0..kernel_cols])
             .assign(&fast_ab(&d2_raw, &z));
+        d2.slice_mut(s![.., kernel_cols..total_cols])
+            .assign(&poly_d2);
     }
     if let Some(z) = identifiability_transform {
         let z = z.to_owned();
@@ -273,6 +294,103 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
         kernel_nullspace_transform: Some(z),
         polynomial_block_cols: poly_cols,
     })
+}
+
+fn polynomial_derivative_block(
+    points: ArrayView2<'_, f64>,
+    order: DuchonNullspaceOrder,
+    derivative_order: usize,
+) -> Array2<f64> {
+    let n = points.nrows();
+    let d = points.ncols();
+    let degree = match order {
+        DuchonNullspaceOrder::Zero => 0,
+        DuchonNullspaceOrder::Linear => 1,
+        DuchonNullspaceOrder::Degree(degree) => degree,
+    };
+    let exponents = monomial_exponents(d, degree);
+    match derivative_order {
+        1 => {
+            let mut block = Array2::<f64>::zeros((n * d, exponents.len()));
+            for row in 0..n {
+                for axis in 0..d {
+                    let out_row = row * d + axis;
+                    for (col, exps) in exponents.iter().enumerate() {
+                        block[[out_row, col]] = monomial_derivative_value(points, row, exps, axis);
+                    }
+                }
+            }
+            block
+        }
+        2 => {
+            let mut block = Array2::<f64>::zeros((n * d * d, exponents.len()));
+            for row in 0..n {
+                for axis_a in 0..d {
+                    for axis_b in 0..d {
+                        let out_row = (row * d + axis_a) * d + axis_b;
+                        for (col, exps) in exponents.iter().enumerate() {
+                            block[[out_row, col]] =
+                                monomial_second_derivative_value(points, row, exps, axis_a, axis_b);
+                        }
+                    }
+                }
+            }
+            block
+        }
+        _ => Array2::<f64>::zeros((0, exponents.len())),
+    }
+}
+
+fn monomial_derivative_value(
+    points: ArrayView2<'_, f64>,
+    row: usize,
+    exponents: &[usize],
+    axis: usize,
+) -> f64 {
+    let exponent = exponents[axis];
+    if exponent == 0 {
+        return 0.0;
+    }
+    let mut value = exponent as f64;
+    for a in 0..points.ncols() {
+        let power = exponents[a] - usize::from(a == axis);
+        if power != 0 {
+            value *= points[[row, a]].powi(power as i32);
+        }
+    }
+    value
+}
+
+fn monomial_second_derivative_value(
+    points: ArrayView2<'_, f64>,
+    row: usize,
+    exponents: &[usize],
+    axis_a: usize,
+    axis_b: usize,
+) -> f64 {
+    let coeff = if axis_a == axis_b {
+        let exponent = exponents[axis_a];
+        if exponent < 2 {
+            return 0.0;
+        }
+        (exponent * (exponent - 1)) as f64
+    } else {
+        let exponent_a = exponents[axis_a];
+        let exponent_b = exponents[axis_b];
+        if exponent_a == 0 || exponent_b == 0 {
+            return 0.0;
+        }
+        (exponent_a * exponent_b) as f64
+    };
+    let mut value = coeff;
+    for axis in 0..points.ncols() {
+        let consumed = usize::from(axis == axis_a) + usize::from(axis == axis_b);
+        let power = exponents[axis] - consumed;
+        if power != 0 {
+            value *= points[[row, axis]].powi(power as i32);
+        }
+    }
+    value
 }
 
 #[inline(always)]
@@ -2214,7 +2332,10 @@ mod duchon_hybrid_psd_tests {
             }
             last_rmax = Some(r_max);
             // r_min is positive and finite (the floor used for the high-κ ceiling).
-            assert!(r_min.is_finite() && r_min > 0.0, "r_min must be positive at n={n}");
+            assert!(
+                r_min.is_finite() && r_min > 0.0,
+                "r_min must be positive at n={n}"
+            );
         }
     }
 
@@ -2383,14 +2504,9 @@ mod duchon_hybrid_psd_tests {
                     }
                     for &kappa in &[0.5f64, 1.0, 2.5] {
                         let coeffs = duchon_partial_fraction_coeffs(p, s, kappa);
-                        let got = duchon_hybrid_kernel_collision_value(
-                            1.0 / kappa,
-                            p,
-                            s,
-                            d,
-                            &coeffs,
-                        )
-                        .expect("collision diagonal");
+                        let got =
+                            duchon_hybrid_kernel_collision_value(1.0 / kappa, p, s, d, &coeffs)
+                                .expect("collision diagonal");
                         let want = phi0_closed_form(p, s, d, kappa);
                         let rel = (got - want).abs() / want.abs().max(1e-300);
                         assert!(
@@ -2443,8 +2559,8 @@ mod duchon_hybrid_psd_tests {
                         }
                         for (n, &b_n) in coeffs.b.iter().enumerate().skip(1) {
                             if b_n != 0.0 {
-                                direct +=
-                                    b_n * duchon_matern_block(r, kappa, n, d).expect("matern block");
+                                direct += b_n
+                                    * duchon_matern_block(r, kappa, n, d).expect("matern block");
                             }
                         }
                         let rel = (taylor - direct).abs() / direct.abs().max(1e-300);

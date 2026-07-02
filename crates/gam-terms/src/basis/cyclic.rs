@@ -12,7 +12,7 @@
 //! design assembly. Callers in `basis` handle term specs, streaming chunking,
 //! and downstream matrix wiring.
 
-use super::{BasisError, BasisOptions, Dense, KnotSource, create_basis};
+use super::{BasisError, PeriodicBSplineBasisSpec, build_periodic_bspline_basis_1d};
 use gam_linalg::faer_ndarray::fast_ata;
 use ndarray::{Array1, Array2, ArrayView1};
 
@@ -193,28 +193,29 @@ pub(crate) fn create_cyclic_bspline_basis_dense(
         );
     }
     let period = end - start;
-    // Wrap data into the ANCHORED window `[anchor, anchor + period)`, not the raw
-    // `[start, …)`: the knot grid is canonically anchored at `anchor` (#1593,
-    // `cyclic_knot_anchor`) so the data must be folded against the same grid for
-    // the `j % num_basis` cyclic wrap to align. `anchor` differs from `start` by
-    // less than one knot spacing, so this is the same physical representative
-    // window, just snapped to the seam-invariant knot lattice.
-    let (anchor, _) = cyclic_knot_anchor(start, period, num_basis);
-    let wrapped = data.mapv(|x| wrap_to_period(x, anchor, period));
     let knots = cyclic_uniform_knot_vector(start, end, degree, num_basis);
-    let (extended, _) = create_basis::<Dense>(
-        wrapped.view(),
-        KnotSource::Provided(knots.view()),
-        degree,
-        BasisOptions::value(),
+
+    // Evaluate the cyclic cardinal basis directly on the circle rather than
+    // folding an open B-spline design and summing columns modulo `num_basis`.
+    // The open-knot construction is sensitive to its half-open endpoint
+    // convention: at `x == start + period` the wrapped value lands exactly on
+    // the left boundary of an open spline and the endpoint row can differ from
+    // the row at `start` (the tensor-margin seam bug in #1800). The cardinal
+    // evaluator owns the periodic phase arithmetic and normalizes the wrapped
+    // translates of each cardinal B-spline, so `start` and `end` are identical
+    // by construction and prediction uses the same runtime basis as fitting.
+    let cyclic = build_periodic_bspline_basis_1d(
+        data,
+        &PeriodicBSplineBasisSpec {
+            degree,
+            num_basis,
+            period,
+            origin: start,
+            // The value evaluator does not use the penalty order; pass the
+            // standard cyclic smooth order so spec validation remains shared.
+            penalty_order: 2.min(num_basis - 1),
+        },
     )?;
-    let mut cyclic = Array2::<f64>::zeros((data.len(), num_basis));
-    for i in 0..extended.nrows() {
-        for j in 0..extended.ncols() {
-            let target = j % num_basis;
-            cyclic[[i, target]] += extended[[i, j]];
-        }
-    }
     Ok((cyclic, knots))
 }
 

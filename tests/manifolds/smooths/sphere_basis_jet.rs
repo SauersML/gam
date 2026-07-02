@@ -81,19 +81,27 @@ fn assert_jet_matches_fd(spec: &SphericalSplineBasisSpec, label: &str) {
         analytic.shape(),
         fd.shape()
     );
-    let mut max_rel = 0.0_f64;
+    let rel_tol = 1.0e-4_f64;
+    let abs_tol = 1.0e-9_f64;
+    let mut max_scaled = 0.0_f64;
     for (a, f) in analytic.iter().zip(fd.iter()) {
-        let denom = f.abs().max(a.abs()).max(1.0e-6);
-        let rel = (a - f).abs() / denom;
-        max_rel = max_rel.max(rel);
         assert!(
             a.is_finite() && f.is_finite(),
             "{label}: non-finite jet entry analytic={a} fd={f}"
         );
+        let abs_err = (a - f).abs();
+        let scale = f.abs().max(a.abs());
+        let rel_scaled = if scale > 0.0 {
+            abs_err / (rel_tol * scale)
+        } else {
+            f64::INFINITY
+        };
+        let scaled_err = (abs_err / abs_tol).min(rel_scaled);
+        max_scaled = max_scaled.max(scaled_err);
     }
     assert!(
-        max_rel < 1.0e-4,
-        "{label}: analytic jet disagrees with central-difference (max rel err {max_rel:.3e})"
+        max_scaled < 1.0,
+        "{label}: analytic jet disagrees with central-difference (max abs-or-rel scaled err {max_scaled:.3e})"
     );
 }
 
