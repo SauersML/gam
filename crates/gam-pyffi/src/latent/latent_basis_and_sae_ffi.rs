@@ -2135,6 +2135,77 @@ fn metric_provenance_label(
     }
 }
 
+/// #2021 (EXPERIMENT) — number of EXTRA whitened-residual refit passes to run
+/// after the iid pass-0 fit, read from the `GAM_SAE_STRUCTURED_PASSES` env
+/// lever. `0` (unset / default / unparsable) keeps the historical iid-only path
+/// bit-for-bit; the value is clamped to a small ceiling. Deliberately an
+/// unadvertised env gate so it carries zero FFI/Python-signature risk while the
+/// structured-residual outer alternation (#2021) is validated.
+///
+/// TODO(#2021): once the alternation proves out, promote this to a typed
+/// `structured_residual_passes: int = 0` pyfunction kwarg and delete the env
+/// lever — the project does not want permanent hidden env levers.
+fn sae_structured_residual_passes() -> usize {
+    const MAX_STRUCTURED_PASSES: usize = 4;
+    std::env::var("GAM_SAE_STRUCTURED_PASSES")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(MAX_STRUCTURED_PASSES)
+}
+
+/// #2021 — fit the structured residual-covariance model on `term`'s
+/// post-dictionary residuals and return it (the driver then materializes the
+/// damped per-row metric via [`StructuredResidualModel::row_metric_damped`],
+/// holding the returned model as the next pass's damping anchor). `Ok(None)`
+/// when there is no factor subspace to mine (single-channel residuals) or the
+/// evidence fit degenerates — the caller then stops the alternation and keeps
+/// the current (iid or prior-pass) metric.
+///
+/// Residuals `R = target − term.fitted()`; the activity coordinate the scale law
+/// `c(z)` is smooth in is the per-row total assignment mass — the same
+/// activation-strength summary the structure-search birth harvest mines the
+/// factor subspace in (`gam-sae/src/structure_harvest.rs`).
+fn sae_structured_residual_model(
+    term: &gam::terms::sae::manifold::SaeManifoldTerm,
+    target: ndarray::ArrayView2<'_, f64>,
+) -> PyResult<Option<gam::inference::residual_factor::StructuredResidualModel>> {
+    use gam::inference::residual_factor::{ResidualFactorInput, StructuredResidualModel};
+    let fitted = term.fitted();
+    let (n, p) = fitted.dim();
+    // Need >= 2 output channels for an off-diagonal factor subspace.
+    if n == 0 || p <= 1 {
+        return Ok(None);
+    }
+    if target.dim() != (n, p) {
+        return Err(py_value_error(format!(
+            "sae_structured_residual_model: target must be ({n}, {p}); got {:?}",
+            target.dim()
+        )));
+    }
+    // R = target − fitted (post-dictionary residual). Bind `fitted` first so the
+    // owned temporary outlives the in-place subtraction.
+    let mut residuals = target.to_owned();
+    residuals -= &fitted;
+    // Activity = per-row total assignment mass (mirrors structure_harvest.rs and
+    // the fit tail's own assignment read).
+    let assignments = term.assignment.assignments();
+    let activity: ndarray::Array1<f64> = (0..n).map(|r| assignments.row(r).sum()).collect();
+    // Let the evidence ladder pick the rank up to p-1 (`fit` re-caps to p-1 and
+    // scores r = 0..=cap, keeping the penalized-evidence maximizer).
+    let max_factor_rank = p.saturating_sub(1);
+    match StructuredResidualModel::fit(ResidualFactorInput {
+        residuals: residuals.view(),
+        activity: activity.view(),
+        max_factor_rank,
+    }) {
+        Ok(m) => Ok(Some(m)),
+        // Total numeric path: a degenerate residual yields no usable model; keep
+        // the prior-pass geometry.
+        Err(_) => Ok(None),
+    }
+}
+
 /// Fit a SAE-manifold term end-to-end in Rust: up to `max_iter` Newton steps
 /// per λ_smooth candidate, refreshing `Phi` and `dPhi/dt` between steps via
 /// the per-atom [`SaeBasisSecondJet`] (analytic harmonic for `Periodic`
@@ -2628,7 +2699,7 @@ fn sae_manifold_fit_inner<'py>(
     // flag. The factor stack is `(n_obs, p_out, rank)` row-major, reshaped to the
     // `(n_obs, p_out * rank)` layout `RowMetric::output_fisher` expects
     // (`u[n, i * rank + k] = U[n, i, k]`). Shapes are validated at the boundary.
-    let metric_provenance: &'static str = if let Some(u3) = fisher_u {
+    let mut metric_provenance: &'static str = if let Some(u3) = fisher_u {
         let u_shape = u3.shape();
         if u_shape[0] != n_obs || u_shape[1] != p_out {
             return Err(py_value_error(format!(
@@ -2838,11 +2909,115 @@ fn sae_manifold_fit_inner<'py>(
         .decoder_shape_uncertainty()
         .map_err(py_value_error)?;
     let fitted_result = objective.into_fitted();
-    let finalization_invalidated_shape_uncertainty =
+    let mut finalization_invalidated_shape_uncertainty =
         fitted_result.invalidates_pre_final_shape_uncertainty();
     let mut term = fitted_result.term;
     let mut rho = fitted_result.rho;
-    let loss = fitted_result.loss;
+    let mut loss = fitted_result.loss;
+
+    // #2021 (EXPERIMENT, env-gated) — structured-residual OUTER ALTERNATION.
+    // Pass 0 above is the iid fit (unchanged, bit-for-bit). When
+    // `GAM_SAE_STRUCTURED_PASSES > 0` AND no explicit metric was installed at
+    // pass 0 (a WP-D `OutputFisher` gauge lives in the SAME single metric slot
+    // and must not be clobbered), run N extra passes: fit the whitened
+    // residual-covariance model on the current fitted residuals, materialize the
+    // Σ-DAMPED per-row metric, install it — `loss_scaled` and
+    // `assemble_arrow_schur` auto-route on `metric.whitens_likelihood()` (the
+    // #974 seam, so no construction.rs change is needed) — and refit
+    // warm-started from the settled ρ. The returned provenance / shape bands /
+    // loss are refreshed from the final pass. A `None` model (no factor
+    // subspace, or a degenerate residual fit) stops the alternation early,
+    // degrading to the pass-0 iid fit.
+    //
+    // Covariance-domain damping (residual-fix's `row_metric_damped`):
+    // Σ_t = (1−γ)·Σ_prev + γ·Σ̂_t, with Σ_prev = the previous pass's fitted model
+    // (or I on the first structured pass). A small, increasing γ schedule
+    // γ_p = (p+1)/(N+1) ∈ (0,1) trusts the new estimate more each pass while
+    // damping the early jump off the iid fit (γ is never 0 or 1, so every pass
+    // builds a genuine WhitenedStructured blend).
+    let structured_passes = sae_structured_residual_passes();
+    if structured_passes > 0 && metric_provenance == "Euclidean" {
+        let mut prev_model: Option<gam::inference::residual_factor::StructuredResidualModel> =
+            None;
+        for pass in 0..structured_passes {
+            let Some(model) = sae_structured_residual_model(&term, z_view.view())? else {
+                break;
+            };
+            let gamma = (pass as f64 + 1.0) / (structured_passes as f64 + 1.0);
+            let metric = model
+                .row_metric_damped(n_obs, gamma, prev_model.as_ref())
+                .map_err(py_value_error)?;
+            let installed_label = metric_provenance_label(metric.provenance());
+            term.set_row_metric(metric).map_err(py_value_error)?;
+            // Rebuild the analytic-penalty registry (cheap; `latent_payload` is
+            // still owned) and warm-start ρ from the settled fit.
+            let registry = build_analytic_penalty_registry_from_json(
+                Some(&latent_payload),
+                analytic_penalties.as_ref(),
+            )
+            .map_err(py_value_error)?;
+            let warm_flat = rho.to_flat();
+            let mut objective = gam::terms::sae::manifold::SaeManifoldOuterObjective::new(
+                term,
+                z_view.to_owned(),
+                Some(registry),
+                rho,
+                max_iter,
+                learning_rate,
+                ridge_ext_coord,
+                ridge_beta,
+            );
+            let problem = gam::solver::rho_optimizer::OuterProblem::new(n_params)
+                .with_initial_rho(warm_flat)
+                .with_seed_config(gam::solver::seeding::SeedConfig {
+                    max_seeds: 1,
+                    seed_budget: 1,
+                    ..Default::default()
+                });
+            gam::solver::rho_optimizer::arm_outer_wall_clock_deadline(
+                std::time::Instant::now()
+                    + std::time::Duration::from_secs_f64(SAE_FIT_MAX_SECONDS),
+            );
+            let pass_result = std::thread::scope(|scope| -> PyResult<()> {
+                let worker = std::thread::Builder::new()
+                    .name("gam-sae-fit-structured".to_string())
+                    .stack_size(SAE_FIT_WORKER_STACK_SIZE)
+                    .spawn_scoped(scope, || {
+                        problem.run(&mut objective, "SAE manifold (structured)")
+                    })
+                    .map_err(|err| {
+                        py_value_error(format!(
+                            "sae_manifold_fit: spawn structured-pass worker thread: {err}"
+                        ))
+                    })?;
+                match worker.join() {
+                    Ok(run_result) => run_result.map(|_| ()).map_err(estimation_error_to_pyerr),
+                    Err(_) => Err(py_value_error(
+                        "sae_manifold_fit: structured-pass worker thread panicked (see prior \
+                         error output)"
+                            .to_string(),
+                    )),
+                }
+            });
+            gam::solver::rho_optimizer::clear_outer_wall_clock_deadline();
+            pass_result?;
+            // Refresh shape bands + fitted state from the FINAL pass objective
+            // (decoder_shape_uncertainty must be read before `into_fitted`).
+            shape_uncertainty = objective
+                .decoder_shape_uncertainty()
+                .map_err(py_value_error)?;
+            let fitted_result = objective.into_fitted();
+            finalization_invalidated_shape_uncertainty =
+                fitted_result.invalidates_pre_final_shape_uncertainty();
+            term = fitted_result.term;
+            rho = fitted_result.rho;
+            loss = fitted_result.loss;
+            // Report the geometry actually used by the returned fit.
+            metric_provenance = installed_label;
+            // Carry this pass's model forward as the next pass's damping anchor.
+            prev_model = Some(model);
+        }
+    }
     {
         let assignments = term.assignment.assignments();
         let fitted = term.fitted();
