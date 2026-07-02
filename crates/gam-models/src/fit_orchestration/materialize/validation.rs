@@ -68,17 +68,20 @@ pub(crate) fn reject_survival_only_terms_for_nonsurvival(
 /// the same silent-no-op contract violation as the survival-only *terms* guarded
 /// by [`reject_survival_only_terms_for_nonsurvival`].
 ///
-/// The default value is `"transformation"`, which is indistinguishable from
-/// "unset", so it (and only it) is allowed through here; every other,
+/// The direct Rust API default is `"location-scale"` (lognormal AFT), while
+/// CLI/config-layer callers may still pass their documented `"transformation"`
+/// default explicitly. Both defaults are indistinguishable from "unset" at this
+/// validation seam, so they are allowed through here; every other,
 /// explicitly-requested mode is a configuration error and is rejected with the
 /// same phrasing the survival-only-term path uses.
 pub(crate) fn reject_survival_likelihood_for_nonsurvival(
     config: &FitConfig,
 ) -> Result<(), WorkflowError> {
     let mode = config.survival_likelihood.trim();
-    // `"transformation"` is the default and is indistinguishable from "unset",
-    // so it is the only mode permitted on a non-survival response.
-    if mode.eq_ignore_ascii_case("transformation") {
+    // The library and CLI/config layers have different survival defaults; both are
+    // indistinguishable from "unset" by the time a non-survival formula reaches
+    // this seam, so neither should poison ordinary GAM materialization.
+    if mode.eq_ignore_ascii_case("transformation") || mode.eq_ignore_ascii_case("location-scale") {
         return Ok(());
     }
     Err(WorkflowError::InvalidConfig {

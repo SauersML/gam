@@ -216,17 +216,61 @@ fn fit_term_collection_forspecwith_heuristic_lambdas(
     family: LikelihoodSpec,
     options: &FitOptions,
 ) -> Result<FittedTermCollection, EstimationError> {
-    let base_design = build_term_collection_design(data, spec)?;
+    let adaptive_opts = options.adaptive_regularization.clone().unwrap_or_default();
+    let resolved_spec;
+    let design_spec = if adaptive_opts.enabled {
+        resolved_spec = ensure_matern_adaptive_center_resolution(spec, data.nrows());
+        &resolved_spec
+    } else {
+        spec
+    };
+    let base_design = build_term_collection_design(data, design_spec)?;
     fit_term_collection_on_realized_design(
         y,
         weights,
         offset,
-        spec,
+        design_spec,
         &base_design,
         heuristic_lambdas,
         family,
         options,
     )
+}
+
+fn ensure_matern_adaptive_center_resolution(
+    spec: &TermCollectionSpec,
+    n_rows: usize,
+) -> TermCollectionSpec {
+    let mut out = spec.clone();
+    for term in &mut out.smooth_terms {
+        let gam_terms::smooth::SmoothBasisSpec::Matern {
+            feature_cols,
+            spec: matern,
+            ..
+        } = &mut term.basis
+        else {
+            continue;
+        };
+        if let gam_terms::basis::CenterStrategy::FarthestPoint { num_centers } =
+            &mut matern.center_strategy
+        {
+            // Exact spatial-adaptive regularization estimates three operator
+            // weights from the fitted Matérn field and its first/second
+            // collocation derivatives.  That is a richer hyperproblem than the
+            // ordinary quadratic Matérn fit: with fewer centers than the
+            // coordinate dimension's linear scale, the radial span cannot carry
+            // even low-order directional structure, so REML can only explain the
+            // signal by pushing the adaptive operator weights into the
+            // over-smoothed mean basin.  Treat user-supplied FarthestPoint counts
+            // as a lower bound for this exact-adaptive path and ensure a modest
+            // O(d) collocation resolution.  Existing larger bases are left
+            // untouched, and the cap at n_rows preserves the reduced-rank
+            // contract.
+            let min_centers = (4 * feature_cols.len()).min(n_rows).max(*num_centers);
+            *num_centers = min_centers;
+        }
+    }
+    out
 }
 
 fn has_bounded_linear_terms(spec: &TermCollectionSpec) -> bool {
@@ -6353,11 +6397,59 @@ fn fit_score(fit: &UnifiedFitResult) -> f64 {
 /// trust-region solver retreats, rather than aborting the entire REML fit.
 ///
 /// A `BasisError` is exactly this class: it means "the basis/design cannot be
-/// built at this hyperparameter". Everything else (PIRLS divergence wired to a
-/// distinct variant, layout/topology invariants, over-parameterization) stays
-/// fatal so genuine bugs are never masked.
+/// built at this hyperparameter". The same retreat semantics also apply when a
+/// trial reaches the inner solve but produces a singular/unstable curvature:
+/// those cases are reported by the shared inner-solve retreat classifier, or
+/// by the final fit validator when an inference-only matrix derived from
+/// `H⁻¹` (not the fitted mean coefficients themselves) becomes non-finite.
+/// Everything else (layout/topology invariants, over-parameterization, and
+/// arbitrary invalid inputs) stays fatal so genuine bugs are never masked.
 fn is_recoverable_trial_point_error(err: &EstimationError) -> bool {
     matches!(err, EstimationError::BasisError(_))
+        || err.is_inner_solve_retreat()
+        || is_recoverable_fit_inference_finiteness_error(err)
+}
+
+fn is_recoverable_fit_inference_finiteness_error(err: &EstimationError) -> bool {
+    let EstimationError::InvalidInput(message) = err else {
+        return false;
+    };
+
+    message.contains("must be finite")
+        && [
+            "fit_result.beta_covariance_frequentist",
+            "fit_result.coefficient_influence",
+            "fit_result.weighted_gram",
+        ]
+        .iter()
+        .any(|field| message.contains(field))
+}
+
+#[cfg(test)]
+mod spatial_trial_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn nonfinite_frequentist_covariance_is_recoverable_trial_point() {
+        let err = EstimationError::InvalidInput(
+            "fit_result.beta_covariance_frequentist[0] must be finite, got NaN".to_string(),
+        );
+
+        assert!(
+            is_recoverable_trial_point_error(&err),
+            "singular trial-point curvature should make spatial κ retreat, not abort"
+        );
+    }
+
+    #[test]
+    fn arbitrary_invalid_input_remains_fatal_trial_point_error() {
+        let err = EstimationError::InvalidInput("outer rho bounds are invalid".to_string());
+
+        assert!(
+            !is_recoverable_trial_point_error(&err),
+            "the spatial κ recovery gate must not mask unrelated invalid inputs"
+        );
+    }
 }
 
 fn require_successful_spatial_optimization_result<T>(

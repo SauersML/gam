@@ -3697,15 +3697,25 @@ mod tk_math_tests {
     pub(crate) fn firth_default_pc_prior_fills_flat_holes() {
         let pc = firth_default_pc_prior();
         let configured = RhoPrior::Normal { mean: 0.1, sd: 2.0 };
+        let flat_gamma = RhoPrior::GammaPrecision {
+            shape: 1.0,
+            rate: 0.0,
+        };
         // A whole `Flat` prior becomes the weak PC default.
         assert_eq!(*resolve_effective_rho_prior(&RhoPrior::Flat), pc);
+        // Gamma(1, 0) is the same flat MAP-in-λ prior and follows the same path.
+        assert_eq!(*resolve_effective_rho_prior(&flat_gamma), pc);
         // An explicitly-configured prior is honored unchanged (no override).
         assert_eq!(*resolve_effective_rho_prior(&configured), configured);
-        // Only the `Flat` coordinates of an Independent prior inherit the PC.
-        let indep = RhoPrior::Independent(vec![RhoPrior::Flat, configured.clone()]);
+        // Only flat coordinates of an Independent prior inherit the PC.
+        let indep = RhoPrior::Independent(vec![
+            RhoPrior::Flat,
+            configured.clone(),
+            flat_gamma.clone(),
+        ]);
         assert_eq!(
             *resolve_effective_rho_prior(&indep),
-            RhoPrior::Independent(vec![pc.clone(), configured.clone()])
+            RhoPrior::Independent(vec![pc.clone(), configured.clone(), pc.clone()])
         );
         // An Independent prior with no Flat holes is left untouched.
         let no_holes = RhoPrior::Independent(vec![configured.clone(), configured.clone()]);
@@ -3716,11 +3726,14 @@ mod tk_math_tests {
     pub(crate) fn firth_default_coord_mask_marks_only_flat_coordinates() {
         // Whole-Flat → every coordinate is a firth default.
         assert_eq!(firth_default_coord_mask(&RhoPrior::Flat, 3), vec![true; 3]);
-        // Independent → only the Flat holes are defaults.
+        // Independent → only mathematically flat holes are defaults.
         let indep = RhoPrior::Independent(vec![
             RhoPrior::Flat,
             RhoPrior::Normal { mean: 0.0, sd: 1.0 },
-            RhoPrior::Flat,
+            RhoPrior::GammaPrecision {
+                shape: 1.0,
+                rate: 0.0,
+            },
         ]);
         assert_eq!(firth_default_coord_mask(&indep, 3), vec![true, false, true]);
         // An explicitly-configured scalar prior defaults nothing.

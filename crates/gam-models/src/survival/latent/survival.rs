@@ -571,7 +571,7 @@ pub fn fit_latent_survival_terms(
         .iter()
         .any(|&code| code == LATENT_SURVIVAL_EVENT_INTERVAL);
     if has_interval_rows {
-        let warm_event_target = spec.event_target.mapv(|code| {
+        let censored_warm_event_target = spec.event_target.mapv(|code| {
             if code == LATENT_SURVIVAL_EVENT_INTERVAL {
                 0u8
             } else {
@@ -579,11 +579,11 @@ pub fn fit_latent_survival_terms(
             }
         });
         let mut warm_family = family.clone();
-        warm_family.event_target = warm_event_target;
+        warm_family.event_target = censored_warm_event_target;
         // Right-censored-at-L ignores the interval upper bound `R`, so the
         // (unused) `q_right` channel cannot drift the fit; leaving the right
         // design/mass in place is harmless (no interval row remains to read it).
-        let warm_fit = fit_custom_family_fixed_log_lambdas(
+        let warm_fit_result = fit_custom_family_fixed_log_lambdas(
             &warm_family,
             &blocks,
             options,
@@ -591,15 +591,56 @@ pub fn fit_latent_survival_terms(
             0,
             None,
             false,
-        )
-        .map_err(|e| {
-            format!(
-                "latent interval warm start: right-censored-at-L surrogate fit failed \
-                 (so the interval fit cannot be safely warm-started; this surrogate is \
-                 log-concave and should converge — investigate the surrogate, not the \
-                 interval kernel): {e}"
-            )
-        })?;
+        );
+        let warm_fit = match warm_fit_result {
+            Ok(fit) => fit,
+            Err(censored_error) => {
+                let has_finite_event_in_censored_surrogate =
+                    warm_family.event_target.iter().any(|&code| code != 0);
+                if has_finite_event_in_censored_surrogate {
+                    return Err(format!(
+                        "latent interval warm start: right-censored-at-L surrogate fit failed \
+                         (so the interval fit cannot be safely warm-started; this surrogate is \
+                         log-concave and should converge — investigate the surrogate, not the \
+                         interval kernel): {censored_error}"
+                    ));
+                }
+
+                // When every observed row is interval-censored, the
+                // right-censored-at-L surrogate contains no failures at all.
+                // Its likelihood is maximized only on the zero-hazard boundary
+                // (β_time -> -∞), so the fixed-λ Newton solve is correctly
+                // allowed to refuse it even though the objective is concave.
+                // Use the finite lower-endpoint event surrogate solely to obtain
+                // an interior β/σ seed for the exact interval likelihood below;
+                // no fitted surrogate likelihood or derivative is reused.
+                let lower_event_warm_target = spec.event_target.mapv(|code| {
+                    if code == LATENT_SURVIVAL_EVENT_INTERVAL {
+                        1u8
+                    } else {
+                        code
+                    }
+                });
+                let mut event_warm_family = family.clone();
+                event_warm_family.event_target = lower_event_warm_target;
+                fit_custom_family_fixed_log_lambdas(
+                    &event_warm_family,
+                    &blocks,
+                    options,
+                    None,
+                    0,
+                    None,
+                    false,
+                )
+                .map_err(|event_error| {
+                    format!(
+                        "latent interval warm start failed: the right-censored-at-L surrogate \
+                         has no finite failures and refused its boundary optimum ({censored_error}); \
+                         the finite lower-endpoint event surrogate also failed ({event_error})"
+                    )
+                })?
+            }
+        };
         let warm_beta_usable = warm_fit
             .block_states
             .iter()

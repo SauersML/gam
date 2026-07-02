@@ -2345,6 +2345,27 @@ pub struct TermCollectionDesign {
 }
 
 impl TermCollectionDesign {
+    /// Number of global penalty blocks that precede the smooth-term penalty
+    /// blocks in the flat smoothing-parameter / EDF-trace layout.
+    ///
+    /// The prefix is not the same as `random_effect_ranges.len()`: unpenalized
+    /// (or empty) random-effect ranges contribute coefficient columns but no
+    /// penalty block. The authoritative layout is the recorded `penaltyinfo`
+    /// sequence assembled alongside `penalties`.
+    pub fn leading_penalty_blocks_before_smooth(&self) -> usize {
+        self.penaltyinfo
+            .iter()
+            .take_while(|info| {
+                matches!(
+                    &info.penalty.source,
+                    crate::basis::PenaltySource::Other(source)
+                        if source == "LinearTermRidge"
+                            || source.starts_with("RandomEffectRidge(")
+                )
+            })
+            .count()
+    }
+
     /// Convert blockwise penalties to `PenaltyMatrix::Blockwise` without
     /// expanding to `p_total × p_total`. This is the preferred path for
     /// family modules that accept `Vec<PenaltyMatrix>`.
@@ -5731,14 +5752,17 @@ pub fn build_random_effect_block(
         }
         levels.clone()
     } else {
-        let mut levels_set = BTreeSet::<u64>::new();
+        let mut seen = BTreeSet::<u64>::new();
+        let mut levels = Vec::<u64>::new();
         for &v in col {
-            levels_set.insert(v.to_bits());
+            let bits = v.to_bits();
+            if seen.insert(bits) {
+                levels.push(bits);
+            }
         }
-        if levels_set.is_empty() {
+        if levels.is_empty() {
             crate::bail_invalid_basis!("random-effect term '{}' has no observed levels", spec.name);
         }
-        let levels: Vec<u64> = levels_set.into_iter().collect();
         let start_idx = if spec.drop_first_level && levels.len() > 1 {
             1usize
         } else {
@@ -6715,10 +6739,32 @@ pub fn build_factor_smooth(
         joint_null_rotation: None,
     };
     let inner = build_single_local_smooth_term(data, &inner_term, workspace)?;
-    let base = inner
+    let mut base = inner
         .design
         .try_to_dense_by_chunks("factor smooth marginal")
         .map_err(BasisError::InvalidInput)?;
+    if matches!(spec.flavour, FactorSmoothFlavour::Re) {
+        // `bs="re"` is a parametric random intercept+slope, not a B-spline
+        // smooth evaluated through clamped knot support.  A degree-1 B-spline
+        // with no internal knots spans the training rows, but outside the
+        // boundary knots its basis is not the model matrix for `(1 + x | g)`;
+        // held-out extrapolation then loses the random slope contribution.
+        // Build the random-effect marginal directly as `[1, x - c]`, centered
+        // at the frozen marginal domain, so fit-time and replay-time rows use
+        // the same well-conditioned parametric columns on and off the training
+        // interval.
+        let center = match &inner.metadata {
+            BasisMetadata::BSpline1D { knots, .. } if !knots.is_empty() => {
+                0.5 * (knots[0] + knots[knots.len() - 1])
+            }
+            _ => 0.0,
+        };
+        let mut linear = Array2::<f64>::ones((data.nrows(), 2));
+        linear
+            .column_mut(1)
+            .assign(&data.column(feature_col).mapv(|x| x - center));
+        base = linear;
+    }
     let n = base.nrows();
     let p = base.ncols();
     let q = p * n_levels;
@@ -6743,25 +6789,33 @@ pub fn build_factor_smooth(
     // Penalties: replicate each marginal penalty into a block-diagonal
     // `I_L ⊗ S_j` so every level shares the same smoothing parameter λ_j (one
     // λ per marginal penalty), the defining feature of a factor smooth. For
-    // `Re` the marginal penalty is replaced by an identity ridge so each
-    // per-level coefficient is an iid Gaussian random effect.
+    // `Re` the marginal penalty is replaced by one ridge per parametric
+    // coordinate so intercept and slope variances can be learned separately.
     let marginal_penalties: Vec<Array2<f64>> = if matches!(spec.flavour, FactorSmoothFlavour::Re) {
-        vec![Array2::<f64>::eye(p)]
+        (0..p)
+            .map(|j| {
+                let mut s = Array2::<f64>::zeros((p, p));
+                s[[j, j]] = 1.0;
+                s
+            })
+            .collect()
     } else {
         inner.penalties.clone()
     };
     let marginal_penaltyinfo: Vec<PenaltyInfo> = if matches!(spec.flavour, FactorSmoothFlavour::Re)
     {
-        vec![PenaltyInfo {
-            source: PenaltySource::Primary,
-            original_index: 0,
-            active: true,
-            effective_rank: p,
-            dropped_reason: None,
-            nullspace_dim_hint: 0,
-            normalization_scale: 1.0,
-            kronecker_factors: None,
-        }]
+        (0..p)
+            .map(|j| PenaltyInfo {
+                source: PenaltySource::Primary,
+                original_index: j,
+                active: true,
+                effective_rank: 1,
+                dropped_reason: None,
+                nullspace_dim_hint: p.saturating_sub(1),
+                normalization_scale: 1.0,
+                kronecker_factors: None,
+            })
+            .collect()
     } else {
         inner.penaltyinfo.clone()
     };
@@ -6795,7 +6849,7 @@ pub fn build_factor_smooth(
     }
 
     let mut nullspaces: Vec<usize> = if matches!(spec.flavour, FactorSmoothFlavour::Re) {
-        vec![0]
+        vec![q.saturating_sub(n_levels); p]
     } else {
         inner
             .nullspaces

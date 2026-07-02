@@ -8,13 +8,16 @@ pub(crate) fn blockwise_options_from_fit_args()
 
 pub(crate) fn compact_fit_result_for_batch(fit: &mut UnifiedFitResult) {
     if let Some(inf) = fit.inference.as_mut() {
-        // Keep working_weights/response on inference too — `diagnose --alo`
-        // and other post-fit diagnostics consume them; clearing here zeroed
-        // out the ALO geometry path entirely (failing with
-        // "ALO diagnostics require hessian_weights length N; got 0").
-        // reparam_qs is genuinely large (p × p) and not needed at predict
-        // time, so still drop it.
+        // Batch-saved models are prediction artifacts. Drop row-sized working
+        // vectors from both persisted geometry carriers together so the
+        // UnifiedFitResult invariants remain synchronized after compaction.
+        inf.working_weights = Array1::zeros(0);
+        inf.working_response = Array1::zeros(0);
         inf.reparam_qs = None;
+    }
+    if let Some(geom) = fit.geometry.as_mut() {
+        geom.working_weights = Array1::zeros(0);
+        geom.working_response = Array1::zeros(0);
     }
     fit.artifacts = gam::estimate::FitArtifacts {
         pirls: None,
@@ -2040,6 +2043,22 @@ pub(crate) fn validate_fit_args_preflight(
     args: &FitArgs,
     parsed: &ParsedFormula,
 ) -> Result<(), String> {
+    if let (Some(logslope_formula), Some(z_column)) =
+        (args.logslope_formula.as_deref(), args.z_column.as_deref())
+    {
+        let (_, parsed_logslope) = parse_matching_auxiliary_formula(
+            logslope_formula,
+            &parsed.response,
+            "--logslope-formula",
+        )?;
+        validate_marginal_slope_z_column_exclusion(
+            parsed,
+            &parsed_logslope,
+            z_column,
+            "bernoulli marginal-slope",
+            "--logslope-formula",
+        )?;
+    }
     if args.out.is_none() {
         return Err(
             "fit requires --out; refusing to run a training job that writes no model".to_string(),

@@ -237,10 +237,11 @@ fn guard_untrusted_edf_collapse(
         return;
     };
     edf_total_before = inference.edf_total;
-    // Penalty-block cursor walks the summary block order: random-effect ranges
-    // first, then smooth terms (mirrors `smooth_term_lr_inference_forspec` and the
+    // Penalty-block cursor walks the recorded global block order: any leading
+    // linear ridge and penalized random-effect ridge blocks first, then smooth
+    // terms (mirrors `smooth_term_lr_inference_forspec` and the
     // `build_model_summary` per-term EDF walk).
-    let mut penalty_cursor = design.random_effect_ranges.len();
+    let mut penalty_cursor = design.leading_penalty_blocks_before_smooth();
     // Running change to `Σ edf_by_block`. `edf_total` carries an additional
     // `mp = p − Σ rank_k` offset for the UNPENALIZED columns (e.g. the intercept),
     // so it is NOT `Σ edf_by_block`; applying the same delta preserves that offset.
@@ -1177,6 +1178,13 @@ pub(crate) fn fit_gaussian_location_scale_model(
             .mean_offset
             .mapv_inplace(|v| v / response_scale);
     }
+
+    // Gaussian location-scale prediction has two coupled linear predictors, so
+    // uncertainty on either response channel must be assembled from the joint
+    // `(β_μ, β_logσ)` Laplace posterior covariance. Request it
+    // unconditionally; otherwise predict-time delta-method SEs for the second
+    // predictor can only fall back to scalar/block-local approximations.
+    request.options.compute_covariance = true;
 
     let mut result =
         fit_location_scale_with_optional_wiggle::<GaussianLocationScaleWorkflow>(request)?;

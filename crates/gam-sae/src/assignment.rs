@@ -1062,6 +1062,119 @@ pub fn jumprelu_row(logits: ArrayView1<'_, f64>, temperature: f64, threshold: f6
     out
 }
 
+/// Bounded threshold-gate activations together with the straight-through
+/// derivative `∂a_k/∂l_k` of the smooth surrogate, shared with the torch
+/// autograd `Function` so the torch `jumprelu` lane applies the SAME bounded
+/// gate as the closed-form fit (`jumprelu_row`): `a_k = σ((l_k − θ_k)/τ)` for
+/// `l_k > θ_k` and exactly `0` otherwise — magnitude lives in the decoder, the
+/// gate stays in `[0, 1)`. The returned derivative is the smooth surrogate's
+/// `σ'((l_k − θ_k)/τ)/τ` evaluated on BOTH sides of the jump (a straight-through
+/// estimator: the hard forward has zero derivative below threshold, which would
+/// permanently kill gradient flow to gated-off atoms). `∂a_k/∂θ_k` is the
+/// negation of the returned logit derivative; callers negate. `thresholds` is
+/// per-atom (the torch lane learns one threshold per atom); the scalar
+/// closed-form threshold is the constant-vector special case and the value
+/// arithmetic matches `jumprelu_row` exactly there.
+#[must_use]
+pub fn jumprelu_row_value_grad(
+    logits: ArrayView1<'_, f64>,
+    temperature: f64,
+    thresholds: ArrayView1<'_, f64>,
+) -> (Array1<f64>, Array1<f64>) {
+    assert_eq!(
+        logits.len(),
+        thresholds.len(),
+        "jumprelu_row_value_grad: logits/thresholds length mismatch"
+    );
+    let inv_tau = 1.0 / temperature;
+    let mut value = Array1::<f64>::zeros(logits.len());
+    let mut grad = Array1::<f64>::zeros(logits.len());
+    for i in 0..logits.len() {
+        let sig = gam_linalg::utils::stable_logistic((logits[i] - thresholds[i]) * inv_tau);
+        if logits[i] > thresholds[i] {
+            value[i] = sig;
+        }
+        grad[i] = sig * (1.0 - sig) * inv_tau;
+    }
+    (value, grad)
+}
+
+/// Batched bounded threshold-gate value+grad over an `(N, K)` logit matrix,
+/// sharing the EXACT per-atom arithmetic of [`jumprelu_row_value_grad`] (same
+/// `stable_logistic`, same `(l − θ) * inv_tau` order, same hard-jump gate) so a
+/// single batched call is bit-identical to invoking the row kernel row-by-row.
+///
+/// `thresholds` is per-atom (length `K`, broadcast across the `N` rows). Returns
+/// `(value, grad)`, each `(N, K)`:
+///   * `value[i, k] = σ((l − θ)/τ) · 1[l > θ]` — the bounded `[0, 1)` gate,
+///   * `grad[i, k]  = σ·(1 − σ)/τ` — the straight-through diagonal derivative
+///     `∂a/∂l`, alive on BOTH sides of the jump (`∂a/∂θ = −∂a/∂l`).
+///
+/// This is the single source of truth for `gamfit.torch`'s bounded jumprelu
+/// gate: the torch autograd `Function` crosses the FFI boundary ONCE with the
+/// whole matrix instead of once per row.
+#[must_use]
+pub fn jumprelu_batch_value_grad(
+    logits: ArrayView2<'_, f64>,
+    temperature: f64,
+    thresholds: ArrayView1<'_, f64>,
+) -> (Array2<f64>, Array2<f64>) {
+    let (n, k) = logits.dim();
+    assert_eq!(
+        k,
+        thresholds.len(),
+        "jumprelu_batch_value_grad: logits columns {k} != thresholds length {}",
+        thresholds.len()
+    );
+    let inv_tau = 1.0 / temperature;
+    let mut value = Array2::<f64>::zeros((n, k));
+    let mut grad = Array2::<f64>::zeros((n, k));
+    for i in 0..n {
+        for j in 0..k {
+            let sig =
+                gam_linalg::utils::stable_logistic((logits[[i, j]] - thresholds[j]) * inv_tau);
+            if logits[[i, j]] > thresholds[j] {
+                value[[i, j]] = sig;
+            }
+            grad[[i, j]] = sig * (1.0 - sig) * inv_tau;
+        }
+    }
+    (value, grad)
+}
+
+#[cfg(test)]
+mod jumprelu_batch_tests {
+    use super::*;
+
+    #[test]
+    fn jumprelu_batch_matches_row_kernel_bit_for_bit() {
+        // Deterministic (N, K) logit matrix with per-atom thresholds spanning
+        // both sides of the jump.
+        let n = 5usize;
+        let k = 7usize;
+        let temperature = 0.41_f64;
+        let logits = Array2::from_shape_fn((n, k), |(i, j)| {
+            ((i as f64) * 0.37 - (j as f64) * 0.19 + 0.11).sin()
+        });
+        let thresholds = Array1::from_shape_fn(k, |j| 0.2 - 0.05 * j as f64);
+
+        let (value, grad) =
+            jumprelu_batch_value_grad(logits.view(), temperature, thresholds.view());
+        assert_eq!(value.dim(), (n, k));
+        assert_eq!(grad.dim(), (n, k));
+
+        // The batch kernel must reproduce the row kernel EXACTLY (same ops, same
+        // order) — bit-for-bit, not merely within a tolerance.
+        for i in 0..n {
+            let (rv, rg) = jumprelu_row_value_grad(logits.row(i), temperature, thresholds.view());
+            for j in 0..k {
+                assert_eq!(value[[i, j]], rv[j], "value mismatch at row {i} atom {j}");
+                assert_eq!(grad[[i, j]], rg[j], "grad mismatch at row {i} atom {j}");
+            }
+        }
+    }
+}
+
 // #1557 — fill-into-caller-buffer variants of the three per-mode row functions.
 // These compute the EXACT SAME values as `softmax_row` / `ibp_map_row` /
 // `jumprelu_row` (same arithmetic, same order of operations) but write into a

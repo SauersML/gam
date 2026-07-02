@@ -2613,7 +2613,7 @@ impl FittedModel {
             .or(payload.unified.as_ref())
             .is_some_and(|fit| fit.used_device);
         payload.synchronize_empty_feature_contract();
-        let Some(fit) = payload.fit_result.as_ref() else {
+        let Some(fit) = payload.fit_result.as_ref().or(payload.unified.as_ref()) else {
             return;
         };
         match (&mut payload.family_state, &fit.fitted_link) {

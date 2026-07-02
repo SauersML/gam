@@ -74,6 +74,15 @@ fn spec_from_family_link(
     family: LikelihoodSpec,
     link_kind: Option<&InverseLink>,
 ) -> LikelihoodSpec {
+    // Royston-Parmar's linear predictor is the log cumulative hazard itself;
+    // the scalar inverse-link slot is therefore fixed to the identity. Some
+    // fitted-model surfaces can carry a stale/default standard link alongside
+    // the survival response, but prediction must canonicalize that decorative
+    // link away instead of constructing an illegal likelihood cell.
+    if matches!(family.response, ResponseFamily::RoystonParmar) {
+        return LikelihoodSpec::royston_parmar();
+    }
+
     match link_kind {
         Some(link) => LikelihoodSpec::new(family.response, link.clone()),
         None => family,
@@ -814,11 +823,12 @@ impl FittedModelPredictExt for FittedModel {
                 let beta_noise = location_scale_noise_beta(fit)
                     .or_else(|| self.payload().beta_noise.clone().map(Array1::from_vec))?;
                 let response_scale = self.payload().gaussian_response_scale.unwrap_or(1.0);
-                let sigma_floor = gam::families::sigma_link::LOGB_SIGMA_FLOOR * response_scale;
+                let sigma_floor = gam::families::sigma_link::LOGB_SIGMA_FLOOR;
                 Some(Box::new(GaussianLocationScalePredictor {
                     beta_mu,
                     beta_noise,
                     sigma_floor,
+                    response_scale,
                     covariance: fit.beta_covariance().cloned(),
                     link_wiggle: runtime.link_wiggle,
                 }) as Box<dyn PredictableModel>)
@@ -2372,11 +2382,7 @@ where
         Some(FittedLinkState::Mixture { state, .. }) => Some(InverseLink::Mixture(state.clone())),
         Some(FittedLinkState::Standard(None)) | None => None,
     };
-    let likelihood = if let Some(link) = link_kind.clone() {
-        LikelihoodSpec::new(family.response.clone(), link)
-    } else {
-        family.clone()
-    };
+    let likelihood = spec_from_family_link(family.clone(), link_kind.as_ref());
     let strategy = strategy_for_spec(&likelihood);
     let mean = apply_family_inverse_link(&eta, &likelihood)?;
 
@@ -2523,7 +2529,7 @@ where
             .map(|i| -> Result<f64, EstimationError> {
                 let se_i = etavar[i].max(0.0).sqrt();
                 let (_, mut meanvar) = strategy.posterior_meanvariance(&quadctx, eta[i], se_i)?;
-                if family.is_binomial_sas()
+                if likelihood.is_binomial_sas()
                     && let Some(cov_theta) = fitted_link_state.as_ref().and_then(|s| match s {
                         FittedLinkState::Sas { covariance, .. } => covariance.as_ref(),
                         _ => None,
@@ -2540,7 +2546,7 @@ where
                     let g = [jets.djet_depsilon.mu, jets.djet_dlog_delta.mu];
                     meanvar += quadratic_form(cov_theta, &g)?;
                 }
-                if family.is_binomial_beta_logistic()
+                if likelihood.is_binomial_beta_logistic()
                     && let Some(cov_theta) = fitted_link_state.as_ref().and_then(|s| match s {
                         FittedLinkState::BetaLogistic { covariance, .. } => covariance.as_ref(),
                         _ => None,
@@ -2560,7 +2566,7 @@ where
                     let g = [jets.djet_depsilon.mu, jets.djet_dlog_delta.mu];
                     meanvar += quadratic_form(cov_theta, &g)?;
                 }
-                if family.is_binomial_mixture()
+                if likelihood.is_binomial_mixture()
                     && let Some(cov_theta) = fitted_link_state.as_ref().and_then(|s| match s {
                         FittedLinkState::Mixture { covariance, .. } => covariance.as_ref(),
                         _ => None,
@@ -3027,8 +3033,9 @@ mod tests {
         // estimation uncertainty.  logit(0) → mu = 0.5; response_var = mu*(1-mu)/(1+phi).
         let mu = 0.5_f64;
         let response_var = mu * (1.0 - mu) / (1.0 + beta_phi);
-        let (exp_lo, exp_hi) = beta_moment_matched_interval(mu, response_var, normal_cdf(-z), normal_cdf(z))
-            .expect("beta quantiles from phi=31");
+        let (exp_lo, exp_hi) =
+            beta_moment_matched_interval(mu, response_var, normal_cdf(-z), normal_cdf(z))
+                .expect("beta quantiles from phi=31");
         let expected_beta_half_width = 0.5 * (exp_hi - exp_lo);
         assert!(
             (beta_half_width - expected_beta_half_width).abs() < 1e-12,
@@ -3665,6 +3672,7 @@ mod tests {
             beta_mu: array![0.0],
             beta_noise: array![0.0],
             sigma_floor: gam::families::sigma_link::LOGB_SIGMA_FLOOR,
+            response_scale: 1.0,
             covariance: None,
             link_wiggle: None,
         };
@@ -3697,6 +3705,7 @@ mod tests {
             beta_mu: array![0.5],
             beta_noise: array![0.1],
             sigma_floor: gam::families::sigma_link::LOGB_SIGMA_FLOOR,
+            response_scale: 1.0,
             covariance: Some(array![[4.0, 0.0], [0.0, 9.0]]),
             link_wiggle: None,
         };
@@ -3726,6 +3735,7 @@ mod tests {
             beta_mu: array![0.0],
             beta_noise: array![0.0],
             sigma_floor: gam::families::sigma_link::LOGB_SIGMA_FLOOR,
+            response_scale: 1.0,
             covariance: Some(array![[1.0, 0.0], [0.0, 0.0]]),
             link_wiggle: None,
         };

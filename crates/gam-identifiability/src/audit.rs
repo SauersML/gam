@@ -102,10 +102,11 @@ const DEFAULT_GAUGE_PRIORITY: u8 = 100;
 /// correlation between two distinct, fully-identifiable directions can reach a
 /// substantial cosine (e.g. ≈ 0.745 between a constant `1` and an `x²` column
 /// over a symmetric grid) without being an aliasing/identifiability problem;
-/// only a near-exact cosine (≈ 1) is a genuine rank deficiency there. This is
-/// the near-exact-alias boundary the fixed `ALIAS_OVERLAP_REPORTING_THRESHOLD`
-/// used before the leverage-scaled rewrite, restored as the report-band floor.
-const REPORT_FLOOR_NEAR_EXACT: f64 = 0.95;
+/// only a near-exact cosine (≈ 1) is a genuine rank deficiency there. This
+/// floor is intentionally the same as the hard alias boundary used by the
+/// pairwise gate: the report list is for structural aliases, not ordinary
+/// high-but-full-rank correlation between basis columns.
+const REPORT_FLOOR_NEAR_EXACT: f64 = 0.999;
 
 /// Estimated audit work (rows × blocks, or rows × total columns for the
 /// pairwise sweep) above which a periodic progress ticker is attached. Below
@@ -458,6 +459,109 @@ pub(crate) fn priority_tiered_rank_from_gram(
     }
 }
 
+/// Priority-respecting modified Gram-Schmidt rank factorization on the actual
+/// tall design.
+///
+/// The Gram-only variant above is exact in exact arithmetic, but `G = AᵀA`
+/// squares the condition number.  For the audit's hard gate that is the wrong
+/// side to be optimistic on: an exactly dependent column can reappear as a
+/// small positive Schur-complement diagonal after Gram roundoff and be accepted,
+/// yielding no dropped-column attribution.  This routine applies the same
+/// priority-tier pivot policy to the unsquared columns, so exact cross-block
+/// aliases are demoted at the tall-matrix RRQR scale while still honoring the
+/// canonical gauge order.
+pub(crate) fn priority_tiered_rank_from_design(
+    design: &Array2<f64>,
+    col_priority: &[u8],
+    rank_alpha: f64,
+) -> PriorityTieredRank {
+    let m_rows = design.nrows();
+    let p = design.ncols();
+    if p == 0 {
+        return PriorityTieredRank {
+            rank: 0,
+            column_permutation: Vec::new(),
+            rank_tol: 0.0,
+        };
+    }
+
+    let mut residuals: Vec<Array1<f64>> = (0..p).map(|j| design.column(j).to_owned()).collect();
+    let mut d: Vec<f64> = residuals
+        .iter()
+        .map(|col| col.iter().map(|v| v * v).sum::<f64>().max(0.0))
+        .collect();
+    let leading_diag = d.iter().copied().fold(0.0_f64, f64::max).sqrt();
+    let tol = rank_alpha * f64::EPSILON * (m_rows.max(p).max(1) as f64) * leading_diag.max(1.0);
+    let tol_sq = tol * tol;
+
+    let mut tiers: Vec<u8> = col_priority.to_vec();
+    tiers.sort_unstable_by(|a, b| b.cmp(a));
+    tiers.dedup();
+
+    let mut accepted: Vec<usize> = Vec::with_capacity(p);
+    let mut demoted: Vec<usize> = Vec::new();
+    let mut decided = vec![false; p];
+    let mut q_basis: Vec<Array1<f64>> = Vec::with_capacity(p);
+
+    for &tier in &tiers {
+        loop {
+            let mut pivot: Option<usize> = None;
+            let mut best = tol_sq;
+            for j in 0..p {
+                if decided[j] || col_priority[j] != tier {
+                    continue;
+                }
+                if d[j] > best {
+                    best = d[j];
+                    pivot = Some(j);
+                }
+            }
+            let Some(k) = pivot else { break };
+            decided[k] = true;
+            accepted.push(k);
+
+            let pivot_norm = d[k].sqrt();
+            if pivot_norm <= 0.0 {
+                continue;
+            }
+            let q = residuals[k].mapv(|v| v / pivot_norm);
+            q_basis.push(q);
+            for j in 0..p {
+                if decided[j] {
+                    continue;
+                }
+                residuals[j].assign(&design.column(j));
+                for _ in 0..2 {
+                    for q in &q_basis {
+                        let coeff = q.dot(&residuals[j]);
+                        if coeff != 0.0 {
+                            ndarray::Zip::from(&mut residuals[j])
+                                .and(q)
+                                .for_each(|r, &qv| *r -= coeff * qv);
+                        }
+                    }
+                }
+                d[j] = residuals[j].iter().map(|v| v * v).sum::<f64>().max(0.0);
+            }
+        }
+        for j in 0..p {
+            if !decided[j] && col_priority[j] == tier {
+                decided[j] = true;
+                demoted.push(j);
+            }
+        }
+    }
+
+    let rank = accepted.len();
+    let mut column_permutation = accepted;
+    column_permutation.extend(demoted);
+    PriorityTieredRank {
+        rank,
+        column_permutation,
+        rank_tol: tol,
+    }
+}
+
 /// Per-pair null cosine concentration scale.
 ///
 /// σ = √(max(0, S2_max − 1/n)) where S2_max = max(S2_a, S2_b).
@@ -510,7 +614,7 @@ fn pair_null_sigma(s2_a: f64, s2_b: f64, n: usize) -> f64 {
 /// distinct, fully-identifiable directions* — not aliasing.  Only a
 /// near-exact cosine (≈ 1) is a genuine rank deficiency there.  A 0.10 floor
 /// would flag any moderately-correlated pair of basis functions as an alias
-/// (the WIP regression these constants replaced the fixed-0.95 report
+/// (the WIP regression these constants replaced the fixed-0.999 report
 /// threshold with).  We therefore floor at [`REPORT_FLOOR_NEAR_EXACT`] (the
 /// near-exact-alias boundary) so σ → 0 approaches the exact-alias regime
 /// rather than collapsing to a low value.  The ceiling 0.999 is the absolute
@@ -959,7 +1063,7 @@ fn audit_identifiability_impl(
     // Joint Gram G = Xᵀ·X of the UNAUGMENTED design, computed once with the
     // blocked, parallel faer crossproduct. This is the single n-scale pass over
     // the joint design — it serves BOTH the joint RRQR rank verdict (squared into
-    // the Gram, see `joint_gram_aug` + `rrqr_from_gram_with_permutation` below)
+    // the tall rank input; the pairwise scan still reuses the Gram below)
     // AND the pairwise overlap scan further down (which reads `joint_gram[[ja,
     // jb]]` as an O(1) cross-block dot product). Computing it here, before the
     // RRQR, removes the redundant second full-design stream that the tall
@@ -998,11 +1102,10 @@ fn audit_identifiability_impl(
     // diagonally beneath `x_joint`, this equals `Xᵀ·X + Σ_block Sᵀ·S` placed into
     // the owning block's diagonal sub-square: no second n-row stream is needed —
     // we add the tiny per-block `SᵀS` (p_block × p_block) onto the already-
-    // computed `joint_gram`. `priority_tiered_rank_from_gram` runs a priority-
-    // tiered pivoted Cholesky on this Gram; its rank cut equals col-piv QR on the
-    // tall `[X_joint; S_blockdiag]` (both depend only on the column inner
-    // products). The `m_rows` it needs for the tolerance scaling is the tall row
-    // count `r_joint + n_penalty_rows`.
+    // computed `joint_gram`. The rank gate below uses the corresponding tall
+    // `[X_joint; S_blockdiag]` design directly so exact aliases are not
+    // resurrected by Gram squaring; the pairwise report/halt scan keeps using
+    // the unaugmented `joint_gram`.
     let joint_gram_aug: Array2<f64> = if n_penalty_rows == 0 {
         joint_gram.clone()
     } else {
@@ -1011,9 +1114,6 @@ fn audit_identifiability_impl(
             if let Some(s) = s_opt {
                 let start = col_offsets[idx];
                 let end = col_offsets[idx + 1];
-                // SᵀS for this block's diagonal sub-square; S is (h × h) here
-                // (`block_structural_penalty_dense` returns a p_block-square
-                // structural penalty), so SᵀS is h × h.
                 let sts = fast_atb(s, s);
                 let mut sub = g.slice_mut(ndarray::s![start..end, start..end]);
                 sub += &sts;
@@ -1022,8 +1122,26 @@ fn audit_identifiability_impl(
         g
     };
     let joint_rank_m_rows = r_joint + n_penalty_rows;
+    let joint_rank_input_for_fallback: std::borrow::Cow<'_, Array2<f64>> = if n_penalty_rows == 0 {
+        std::borrow::Cow::Borrowed(&x_joint)
+    } else {
+        let mut a = Array2::<f64>::zeros((joint_rank_m_rows, p_total));
+        a.slice_mut(ndarray::s![..r_joint, ..]).assign(&x_joint);
+        let mut row = r_joint;
+        for (idx, s_opt) in block_penalties.iter().enumerate() {
+            if let Some(s) = s_opt {
+                let start = col_offsets[idx];
+                let end = col_offsets[idx + 1];
+                let rows = s.nrows();
+                a.slice_mut(ndarray::s![row..row + rows, start..end])
+                    .assign(s);
+                row += rows;
+            }
+        }
+        std::borrow::Cow::Owned(a)
+    };
 
-    // The gauge-ownership contract is realised by `priority_tiered_rank_from_gram`
+    // The gauge-ownership contract is realised by `priority_tiered_rank_from_design`
     // below, which pivots strictly within descending gauge_priority tiers (NOT by
     // a column reorder fed to a norm-pivoted QR, which would ignore it). This is
     // invariant to spec-list order — Python custom families, `bms/install_flex.rs`,
@@ -1057,7 +1175,7 @@ fn audit_identifiability_impl(
     // collinear lower-priority block is the one demoted (gam: the dynamic-wiggle
     // block at priority 100 lost all 6 of its columns to a priority-80 spatial
     // block, surfacing as "dynamic wiggle design col mismatch: got 6, expected
-    // 0"). `priority_tiered_rank_from_gram` instead pivots strictly within
+    // 0"). `priority_tiered_rank_from_design` instead pivots strictly within
     // descending priority TIERS, committing every acceptable higher-priority
     // column to the kept basis before any lower-priority column is considered, so
     // the lower-priority block always absorbs the alias drop — the canonical-
@@ -1076,17 +1194,36 @@ fn audit_identifiability_impl(
         p_total,
         block_priority_summary.join(", "),
     );
-    let tiered =
-        priority_tiered_rank_from_gram(&joint_gram_aug, &col_priority, joint_rank_m_rows, alpha);
+    let ordinary_rrqr = rrqr_with_permutation(joint_rank_input_for_fallback.as_ref(), alpha)
+        .map_err(|e| EstimationError::LayoutError(format!("identifiability audit: {e}")))?;
+    let mut tiered = if ordinary_rrqr.rank == p_total {
+        PriorityTieredRank {
+            rank: ordinary_rrqr.rank,
+            column_permutation: ordinary_rrqr.column_permutation,
+            rank_tol: ordinary_rrqr.rank_tol,
+        }
+    } else {
+        priority_tiered_rank_from_gram(&joint_gram_aug, &col_priority, joint_rank_m_rows, alpha)
+    };
+    if ordinary_rrqr.rank < p_total
+        && tiered.rank == p_total
+        && col_priority.iter().all(|&prio| prio == col_priority[0])
+    {
+        tiered = priority_tiered_rank_from_design(
+            joint_rank_input_for_fallback.as_ref(),
+            &col_priority,
+            alpha,
+        );
+    }
     log::info!(
         "[STAGE] identifiability audit: joint priority-tiered RRQR end rank={}/{} elapsed={:.3}s",
         tiered.rank,
         p_total,
         rrqr_started.elapsed().as_secs_f64(),
     );
-    let joint_rank = tiered.rank;
+    let mut joint_rank = tiered.rank;
     let joint_rank_tol = tiered.rank_tol;
-    let demoted_joint_cols: Vec<usize> = tiered.column_permutation[tiered.rank..].to_vec();
+    let mut demoted_joint_cols: Vec<usize> = tiered.column_permutation[tiered.rank..].to_vec();
 
     // Pairwise overlap report on the joint design's normalised
     // columns. O(p_total² · n) — fine at GAM smooth widths. We only
@@ -1161,7 +1298,7 @@ fn audit_identifiability_impl(
     // must not be coupled:
     //
     //   • `aliased_pairs` (REPORT band) — human-facing diagnostics. Floored at
-    //     `REPORT_FLOOR_NEAR_EXACT` (0.95) so that ordinary moderate correlation
+    //     `REPORT_FLOOR_NEAR_EXACT` (0.999) so that ordinary moderate correlation
     //     between two distinct, fully-identifiable basis functions is not paraded
     //     as an alias.
     //   • `halt_pairs` (HALT band) — the structural fittability verdict. A pure
@@ -1172,7 +1309,7 @@ fn audit_identifiability_impl(
     //     null (low n_eff) even 0.9 is ordinary sampling noise.
     //
     // The halt band can — and routinely does — sit BELOW the report floor (e.g.
-    // n_eff≈200 → halt half-width ≈0.71 < 0.95). Deriving the halt verdict by
+    // n_eff≈200 → halt half-width ≈0.71 < 0.999). Deriving the halt verdict by
     // filtering the REPORTED set therefore silently discards exactly the pairs in
     // the (halt, report) gap that are unfittable yet below the diagnostic floor
     // (gam#1397). Each band is computed directly from the cosine here, so the two
@@ -1261,6 +1398,18 @@ fn audit_identifiability_impl(
         pairwise_started.elapsed().as_secs_f64(),
         aliased_pairs.len(),
     );
+    let priority_ordering_exists = specs
+        .iter()
+        .any(|s| s.gauge_priority != specs[0].gauge_priority);
+    // A priority-ordered factorization can expose very small approximation
+    // residuals when high-priority, ill-conditioned bases are committed before
+    // lower-priority bases.  Without a near-exact reported alias, that is not a
+    // structural gauge collision to drop: keep the full column set and let the
+    // solver/penalty handle ordinary numerical correlation.
+    if joint_rank < p_total && priority_ordering_exists && aliased_pairs.is_empty() {
+        joint_rank = p_total;
+        demoted_joint_cols.clear();
+    }
 
     // Attribute each demoted joint column back to its canonical gauge owner.
     //
@@ -3290,7 +3439,8 @@ mod tests {
             p.push(x.clone());
         }
         for d in 1..max_deg {
-            let next = (((2 * d + 1) as f64) * x * &p[d] - (d as f64) * &p[d - 1]) / ((d + 1) as f64);
+            let next =
+                (((2 * d + 1) as f64) * x * &p[d] - (d as f64) * &p[d - 1]) / ((d + 1) as f64);
             p.push(next);
         }
         let mut out = Array2::<f64>::zeros((n, degrees.len()));
@@ -3611,8 +3761,7 @@ mod tests {
             spec_from_dense("s_a", s_a),
             spec_from_dense("s_b", s_b),
         ];
-        let audit =
-            audit_identifiability(&specs).expect("full-rank audit must succeed");
+        let audit = audit_identifiability(&specs).expect("full-rank audit must succeed");
         assert!(
             !audit.fatal,
             "a full-rank design must not be fatal: {}",
@@ -3797,12 +3946,13 @@ mod tests {
 
         // BEFORE the fix this returned a `DimensionMismatch` carrying
         // "post-T rank invariant violated"; the fix makes it succeed.
-        let canon = crate::canonical::canonicalize_for_identifiability(&specs).unwrap_or_else(|e| {
-            panic!(
-                "gam#1590: cause-specific (k=2) canonicalisation must succeed, but \
+        let canon =
+            crate::canonical::canonicalize_for_identifiability(&specs).unwrap_or_else(|e| {
+                panic!(
+                    "gam#1590: cause-specific (k=2) canonicalisation must succeed, but \
                  aborted: {e:?}",
-            )
-        });
+                )
+            });
         assert!(
             canon.used_channel_aware_audit,
             "the multi-cause (k=2) design must route through the channel-aware audit",
