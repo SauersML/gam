@@ -47,8 +47,11 @@ fn absent_dense_beta_block_declines_not_fatal() {
             "absent dense β-block must DECLINE, not report a numerical Schur \
              failure (this is the fatal-RemlConvergenceError bug); got reason={reason:?}"
         ),
-        other => panic!(
+        Err(other) => panic!(
             "absent dense β-block must decline with GpuRequiresDenseSystem; got {other:?}"
+        ),
+        Ok(_) => panic!(
+            "absent dense β-block must decline, but the device solve returned Ok"
         ),
     }
 }
@@ -64,10 +67,14 @@ fn present_dense_beta_block_is_not_declined_as_absent() {
     let sys = ArrowSchurSystem::new(n, d, k);
     assert_eq!(sys.hbb.dim(), (k, k), "fixture must supply a dense (k,k) β-block");
 
-    let result = solve_arrow_newton_step(&sys, 1e-6, 1e-6);
-    assert!(
-        !matches!(result, Err(ArrowSchurGpuFailure::GpuRequiresDenseSystem { .. })),
-        "a system WITH a dense (k,k) H_ββ must not be declined as dense-block-absent; \
-         got {result:?}"
-    );
+    // Only the `Err` variants are `Debug`; match rather than format the whole
+    // `Result` (the `Ok` solution type is intentionally not `Debug`).
+    if let Err(ArrowSchurGpuFailure::GpuRequiresDenseSystem { .. }) =
+        solve_arrow_newton_step(&sys, 1e-6, 1e-6)
+    {
+        panic!(
+            "a system WITH a dense (k,k) H_ββ must not be declined as \
+             dense-block-absent"
+        );
+    }
 }
