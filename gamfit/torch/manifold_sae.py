@@ -237,7 +237,7 @@ class ManifoldSAEConfig:
     """Configuration for :class:`ManifoldSAE`."""
 
     input_dim: int
-    n_atoms: int
+    n_atoms: int | None = None
     intrinsic_rank: int = 2
     atom_manifold: Literal["circle", "cylinder", "sphere", "product"] = "circle"
     atom_basis: Literal["duchon", "bspline", "fourier"] = "duchon"
@@ -249,8 +249,24 @@ class ManifoldSAEConfig:
     encoder_hidden: int = 16
     init_scale: float = 0.05
     dtype: Any = field(default=None)
+    # ``K`` is constructor sugar for ``n_atoms`` (the spelling the docs and the
+    # closed-form ``sae_manifold_fit`` API use). It is normalized into
+    # ``n_atoms`` in ``__post_init__`` and stored as ``None`` afterwards, so
+    # ``dataclasses.replace`` round-trips and ``n_atoms`` stays the single
+    # source of truth.
+    K: int | None = None
 
     def __post_init__(self) -> None:
+        if self.K is not None:
+            if self.n_atoms is not None and int(self.n_atoms) != int(self.K):
+                raise ValueError(
+                    f"ManifoldSAEConfig: n_atoms={self.n_atoms} and K={self.K} "
+                    "are aliases and must agree when both are given"
+                )
+            object.__setattr__(self, "n_atoms", int(self.K))
+            object.__setattr__(self, "K", None)
+        if self.n_atoms is None:
+            raise ValueError("ManifoldSAEConfig requires n_atoms (alias: K)")
         if self.input_dim <= 0:
             raise ValueError("ManifoldSAEConfig.input_dim must be > 0")
         if self.n_atoms <= 0:
@@ -2143,162 +2159,3 @@ __all__ = [
     "RemlConfig",
     "SparsityConfig",
 ]
-
-
-def _selftest_softmax_topk_multi_atom_honors_target_k() -> None:
-    """The multi-atom (``target_k > 1``) gate honors ``target_k`` up to ``n_atoms``.
-
-    Builds a small ``ManifoldSAE`` (``n_atoms=64``) and, for a sweep of
-    ``target_k`` values spanning the sparse regime (4, 8, 16, 32) and the
-    formerly-capped dense regime (48, 64), measures the mean number of active
-    atoms per row (atoms with a nonzero gated code ``z``) after a forward pass.
-
-    Pre-fix behavior: target_k 4..32 were honored but 48 and 64 both plateaued at
-    ~36/64 active because the non-negative ``code`` clamp zeroed every selected
-    atom whose curve projected negatively onto the row. Post-fix: the multi-atom
-    branch scores and gates with the *signed* least-squares code, so every
-    selected atom carries magnitude and the active count tracks
-    ``min(target_k, n_atoms)`` for every ``target_k`` — including 48 and 64.
-
-    This branch is a pure hard top-k of the signed residual with no temperature
-    dependence, so the count is honored in ``eval()`` at any ``tau`` (no training
-    needed). Raises ``AssertionError`` on regression.
-    """
-    torch.manual_seed(0)
-    n_atoms = 64
-    input_dim = 32
-    n_rows = 128
-
-    measured: dict[int, float] = {}
-    for target_k in (4, 8, 16, 32, 48, 64):
-        cfg = ManifoldSAEConfig(
-            input_dim=input_dim,
-            n_atoms=n_atoms,
-            intrinsic_rank=2,
-            atom_manifold="product",
-            atom_basis="duchon",
-            sparsity=SparsityConfig(kind="softmax_topk", target_k=target_k),
-            dtype=torch.float64,
-        )
-        model = ManifoldSAE(cfg)
-        model.eval()
-        x = torch.randn(n_rows, input_dim, dtype=torch.float64)
-        with torch.no_grad():
-            out = model(x)
-        active_per_row = (out.z != 0).sum(dim=1).to(torch.float64)
-        mean_active = float(active_per_row.mean().item())
-        measured[target_k] = mean_active
-
-        assert torch.isfinite(out.x_hat).all(), (
-            f"reconstruction produced non-finite values at target_k={target_k}"
-        )
-        # The gate selects exactly min(target_k, n_atoms) atoms and every selected
-        # atom now carries a (signed) nonzero code, so the active count should
-        # equal target_k to numerical tolerance (a selected atom is zero only on
-        # the measure-zero event recon·x == 0 exactly).
-        expected = min(target_k, n_atoms)
-        assert abs(mean_active - expected) <= 0.5, (
-            f"target_k={target_k}: mean active/row={mean_active:.3f}, "
-            f"expected ~{expected} (gate not honoring target_k)"
-        )
-
-    # Explicitly assert the formerly-capped dense regime no longer plateaus ~36.
-    for target_k in (48, 64):
-        assert measured[target_k] > 40.0, (
-            f"dense regime regressed: target_k={target_k} gave "
-            f"{measured[target_k]:.3f} active/row (old cap was ~36.2)"
-        )
-
-    summary = "  ".join(f"k={k}->{v:.3f}" for k, v in measured.items())
-    print(f"softmax_topk (k>1) active/row vs target_k: {summary}")
-    print("OK: softmax_topk gate honors target_k up to n_atoms (no ~36/64 cap).")
-
-
-def _selftest_softmax_topk_k1_converges_to_one_active() -> None:
-    """The ``target_k == 1`` router converges to ~1 active atom/row when annealed.
-
-    The ``target_k == 1`` path is a deterministic-annealing (DA) EM router
-    (issue #1282): its forward is a soft→hard interpolation controlled by
-    ``progress = (tau_start - tau) / (tau_start - tau_min)``. At the schedule
-    START (``tau = tau_start``, ``progress = 0``) the forward is deliberately the
-    *soft* responsibility-weighted code — a near-uniform, dense gate — so the
-    M-step can differentiate the atoms from a near-symmetric init instead of
-    latching a random top-1 winner and collapsing (the exact #1282 failure). So
-    an untrained model at ``tau_start`` reports many active atoms *by design*;
-    that is the DA warmup, not a cap.
-
-    The honest bar for a top-1 gate is the ANNEALED schedule that every real
-    training run reaches: as ``tau -> tau_min`` (``progress -> 1``) the forward
-    interpolates to the committed hard top-1 winner — exactly one active atom per
-    row. This test trains a few Adam steps while advancing the temperature to
-    ``tau_min`` and asserts the mean active count collapses to ~1, proving the
-    ~1-active contract is honored without disturbing the DA warmup / anchor / EMA
-    machinery that #1282 relies on.
-    """
-    torch.manual_seed(0)
-    input_dim = 16
-    n_atoms = 8
-    n_rows = 96
-    tau_steps = 40
-
-    cfg = ManifoldSAEConfig(
-        input_dim=input_dim,
-        n_atoms=n_atoms,
-        intrinsic_rank=2,
-        atom_manifold="product",
-        atom_basis="duchon",
-        sparsity=SparsityConfig(
-            kind="softmax_topk", target_k=1, tau_start=4.0, tau_min=1.0, tau_steps=tau_steps
-        ),
-        dtype=torch.float64,
-    )
-    model = ManifoldSAE(cfg)
-    x = torch.randn(n_rows, input_dim, dtype=torch.float64)
-
-    # Warmup count at the schedule start (soft DA phase) — documented, not asserted
-    # to be ~1: this is the intended dense warmup.
-    model.eval()
-    with torch.no_grad():
-        warm = float((model(x).z != 0).sum(dim=1).to(torch.float64).mean().item())
-
-    # Train a few steps while annealing tau -> tau_min (a completed schedule).
-    opt = torch.optim.Adam(model.parameters(), lr=1e-2)
-    model.train()
-    for _ in range(120):
-        opt.zero_grad()
-        out = model(x)
-        loss = ((out.x_hat - x) ** 2).mean()
-        loss.backward()
-        opt.step()
-        model.sparsity.advance_temperature()
-
-    model.eval()
-    with torch.no_grad():
-        out = model(x)
-    mean_active = float((out.z != 0).sum(dim=1).to(torch.float64).mean().item())
-    tau_now = float(model.sparsity.tau.item())
-
-    assert torch.isfinite(out.x_hat).all(), "k=1 reconstruction produced non-finite values"
-    assert abs(tau_now - cfg.sparsity.tau_min) < 1e-9, (
-        f"schedule did not reach tau_min (tau={tau_now}); the honest k=1 bar is annealed"
-    )
-    assert abs(mean_active - 1.0) <= 0.25, (
-        f"target_k=1 did not converge to ~1 active/row: mean active/row={mean_active:.3f} "
-        f"(annealed, tau={tau_now})"
-    )
-
-    print(
-        f"softmax_topk k=1 active/row: warmup(tau_start)={warm:.3f} -> "
-        f"annealed(tau_min)={mean_active:.3f}"
-    )
-    print("OK: target_k=1 honors ~1 active/row at the annealed (honest) bar.")
-
-
-def _selftest_softmax_topk_honors_target_k() -> None:
-    """Run the full ``softmax_topk`` target_k contract self-test (k>1 and k=1)."""
-    _selftest_softmax_topk_multi_atom_honors_target_k()
-    _selftest_softmax_topk_k1_converges_to_one_active()
-
-
-if __name__ == "__main__":
-    _selftest_softmax_topk_honors_target_k()

@@ -969,9 +969,26 @@ fn canonicalize_for_identifiability_inner(
             }
         })
     };
+    // A `jacobian_callback` block may explicitly lock itself to raw width when
+    // its family reads raw-width internal designs and asserts `beta.len() ==
+    // p_raw` (the survival marginal-slope monotone time-wiggle time block,
+    // whose Jacobian is a fixed nonlinear functional basis recomputed at raw
+    // width every evaluation). The `#933` gauge-composed reduction is unsound
+    // for such a block — a reduced β desynchronises its raw-width layout — so it
+    // is kept at raw width just like a `stacked_design`/zero-Jacobian block.
+    let locks_raw_width = |name: &str| -> bool {
+        specs.iter().any(|spec| {
+            spec.name == name
+                && spec
+                    .jacobian_callback
+                    .as_ref()
+                    .is_some_and(|cb| cb.locks_raw_width_reduction())
+        })
+    };
     let dropped_on_owned_block = audit.dropped_columns.iter().any(|drop| {
         owns_stacked_geometry(&drop.block)
             || owns_dynamic_zero_jacobian_geometry(&drop.block)
+            || locks_raw_width(&drop.block)
             || dropped_column_is_dead(drop)
     });
     if dropped_on_owned_block {

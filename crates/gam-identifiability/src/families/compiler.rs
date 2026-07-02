@@ -306,6 +306,25 @@ pub fn compile(
     row_hess: &dyn RowHessian,
     ordering: &[BlockOrder],
 ) -> Result<CompiledBlocks, CompilerError> {
+    compile_protected(operators, row_hess, ordering, &[])
+}
+
+/// Variant of [`compile`] that keeps designated blocks at full raw width.
+///
+/// `protected[b] == true` forces block `b` to retain every raw column,
+/// suppressing both the structural and curvature eigenspace drops for that
+/// block while still using it as a full-width anchor for later blocks. See
+/// [`compile_from_raw_grams_protected`] for the motivation: a block whose
+/// effective Jacobian is a fixed nonlinear functional basis (e.g. the survival
+/// marginal-slope time-wiggle block) cannot be expressed on a linearly reduced
+/// design, so it must not be reparameterised/dropped. `protected` may be
+/// shorter than `ordering`; an empty slice reproduces [`compile`] exactly.
+pub fn compile_protected(
+    operators: &[Arc<dyn RowJacobianOperator>],
+    row_hess: &dyn RowHessian,
+    ordering: &[BlockOrder],
+    protected: &[bool],
+) -> Result<CompiledBlocks, CompilerError> {
     // Default structural metric is the per-row identity `K^S_i = I_K`.
     // A pilot-curvature `H` can collapse a direction (zero eigenvalue) at
     // a bad β even though the optimum keeps that direction; routing the
@@ -314,7 +333,7 @@ pub fn compile(
     let n = row_hess.nrows();
     let k = row_hess.k();
     let id_struct = IdentityRowHessian::new(n, k);
-    compile_with_dual_metric(operators, row_hess, &id_struct, ordering)
+    compile_with_dual_metric_protected(operators, row_hess, &id_struct, ordering, protected)
 }
 
 /// Compile a sequence of row-Jacobian operators using *separate* metrics
@@ -352,6 +371,22 @@ pub fn compile_with_dual_metric(
     row_hess: &dyn RowHessian,
     row_structural: &dyn RowHessian,
     ordering: &[BlockOrder],
+) -> Result<CompiledBlocks, CompilerError> {
+    compile_with_dual_metric_protected(operators, row_hess, row_structural, ordering, &[])
+}
+
+/// Variant of [`compile_with_dual_metric`] that keeps designated blocks at full
+/// raw width (see [`compile_protected`] / [`compile_from_raw_grams_protected`]
+/// for the motivation). `protected[b] == true` replaces block `b`'s structural
+/// and curvature eigenspace drops with identity, so the block emerges at full
+/// raw width while still anchoring later blocks. `protected` may be shorter
+/// than `ordering`; an empty slice reproduces [`compile_with_dual_metric`].
+pub fn compile_with_dual_metric_protected(
+    operators: &[Arc<dyn RowJacobianOperator>],
+    row_hess: &dyn RowHessian,
+    row_structural: &dyn RowHessian,
+    ordering: &[BlockOrder],
+    protected: &[bool],
 ) -> Result<CompiledBlocks, CompilerError> {
     if operators.len() != ordering.len() {
         return Err(CompilerError::DimensionMismatch(format!(
@@ -446,6 +481,7 @@ pub fn compile_with_dual_metric(
         let w_h = &scaled_h[idx];
         let w_s = &scaled_s[idx];
         let p_b = w_h.ncols();
+        let block_protected = protected.get(idx).copied().unwrap_or(false);
 
         // A zero-width block owns no raw columns, so it cannot alias against any
         // anchor and is trivially identifiable. Emit an empty compiled block and
@@ -482,7 +518,14 @@ pub fn compile_with_dual_metric(
         // absorption, so a near-zero residual is rejected as fully absorbed.
         let g_s_bb = fast_atb(w_s, w_s);
         let g_s_trace: f64 = (0..p_b).map(|i| g_s_bb[[i, i]].max(0.0)).sum();
-        let d = keep_positive_eigenspace(&g_s, n, k, g_s_trace)?;
+        // A protected block keeps every raw column: the structural residual
+        // eigenfilter is replaced by identity so no within-block direction is
+        // dropped. It still anchors later blocks at full raw width.
+        let d = if block_protected {
+            Array2::<f64>::eye(p_b)
+        } else {
+            keep_positive_eigenspace(&g_s, n, k, g_s_trace)?
+        };
         if d.ncols() == 0 {
             if anchor_h.ncols() == 0 {
                 return Err(CompilerError::FullyAliased {
@@ -524,7 +567,14 @@ pub fn compile_with_dual_metric(
         // its noise directions.
         let g_h_dd = fast_atb(&w_h_d, &w_h_d);
         let g_h_trace: f64 = (0..p_d).map(|i| g_h_dd[[i, i]].max(0.0)).sum();
-        let t_inner = keep_positive_eigenspace(&g_h, n, k, g_h_trace)?;
+        // Protected block: retain every structurally-kept direction (identity
+        // curvature span) instead of dropping curvature-degenerate ones; its own
+        // penalty nullspace regularises the conditioning downstream.
+        let t_inner = if block_protected {
+            Array2::<f64>::eye(p_d)
+        } else {
+            keep_positive_eigenspace(&g_h, n, k, g_h_trace)?
+        };
         if t_inner.ncols() == 0 {
             if anchor_h.ncols() == 0 {
                 return Err(CompilerError::FullyAliased {
@@ -1231,6 +1281,41 @@ pub fn compile_from_raw_grams(
     raw_block_ranges: &[std::ops::Range<usize>],
     ordering: &[BlockOrder],
 ) -> Result<CompiledMap, CompilerError> {
+    compile_from_raw_grams_protected(gram_h, gram_struct, raw_block_ranges, ordering, &[])
+}
+
+/// Variant of [`compile_from_raw_grams`] that keeps designated blocks at full
+/// raw width instead of dropping their near-null structural/curvature
+/// directions.
+///
+/// `protected[b] == true` forces block `b` to retain **all** of its raw
+/// columns: the structural and curvature eigenspace filters that would drop
+/// weak directions are replaced by identity, so `T_b` embeds the full raw
+/// block (orthogonalised against earlier anchors) rather than a reduced
+/// section. The block still serves as a full-width anchor for every later
+/// (unprotected) block, so cross-block aliasing against it is removed exactly
+/// as before — only the protected block's own within-block reparameterisation
+/// is suppressed.
+///
+/// This exists for blocks whose effective Jacobian is a **fixed nonlinear
+/// functional basis** rather than a plain linear design (e.g. the survival
+/// marginal-slope monotone time-wiggle block). Such a block's chain-rule
+/// Jacobian recomputes its basis at the raw coefficient width on every
+/// evaluation and therefore cannot be expressed on a linearly recombined /
+/// reduced design; reparameterising it silently corrupts — and can index out
+/// of bounds in — that basis evaluation. Keeping it at raw width lets its own
+/// penalty nullspace regularise its conditioning, which is the correct
+/// treatment for a within-block (as opposed to cross-block) rank deficiency.
+///
+/// `protected` may be shorter than `ordering` (missing entries default to
+/// `false`); an empty slice reproduces [`compile_from_raw_grams`] exactly.
+pub fn compile_from_raw_grams_protected(
+    gram_h: &Array2<f64>,
+    gram_struct: &Array2<f64>,
+    raw_block_ranges: &[std::ops::Range<usize>],
+    ordering: &[BlockOrder],
+    protected: &[bool],
+) -> Result<CompiledMap, CompilerError> {
     if raw_block_ranges.len() != ordering.len() {
         return Err(CompilerError::DimensionMismatch(format!(
             "raw_block_ranges ({}) and ordering ({}) length mismatch",
@@ -1277,6 +1362,7 @@ pub fn compile_from_raw_grams(
 
     for (idx, range_b) in raw_block_ranges.iter().enumerate() {
         let p_b = range_b.end - range_b.start;
+        let block_protected = protected.get(idx).copied().unwrap_or(false);
         // A zero-width block owns no raw columns. It contributes no compiled
         // degrees of freedom and — having no columns — cannot alias against any
         // anchor, so it is trivially identifiable. Emit an empty compiled range
@@ -1315,7 +1401,14 @@ pub fn compile_from_raw_grams(
         // Trace of the unresidualised diagonal block (scale ref).
         let g_s_bb_trace: f64 = (0..p_b).map(|i| g_s_bb[[i, i]].max(0.0)).sum();
         // p_raw stands in as the "n*K" scale for the closed-form tolerance.
-        let q_plus = keep_positive_eigenspace(&g_s_res, p_raw, 1, g_s_bb_trace)?;
+        // A protected block keeps every raw column (identity structural span);
+        // the residual-Gram eigenfilter that would drop weak directions is
+        // suppressed so the block emerges at full raw width.
+        let q_plus = if block_protected {
+            Array2::<f64>::eye(p_b)
+        } else {
+            keep_positive_eigenspace(&g_s_res, p_raw, 1, g_s_bb_trace)?
+        };
         if q_plus.ncols() == 0 {
             if t_cum.ncols() == 0 {
                 return Err(CompilerError::FullyAliased {
@@ -1361,7 +1454,14 @@ pub fn compile_from_raw_grams(
         let g_h_res = symmetrise(&g_h_res_raw);
         let k_kept = q_plus.ncols();
         let g_h_dd_trace: f64 = (0..k_kept).map(|i| d_t_kh_d[[i, i]].max(0.0)).sum();
-        let u_mat = keep_positive_eigenspace(&g_h_res, p_raw, 1, g_h_dd_trace)?;
+        // A protected block also retains every structurally-kept curvature
+        // direction (identity curvature span), so no within-block conditioning
+        // drop occurs; its own penalty nullspace regularises the fit instead.
+        let u_mat = if block_protected {
+            Array2::<f64>::eye(k_kept)
+        } else {
+            keep_positive_eigenspace(&g_h_res, p_raw, 1, g_h_dd_trace)?
+        };
         if u_mat.ncols() == 0 {
             if t_cum.ncols() == 0 {
                 return Err(CompilerError::FullyAliased {
@@ -1904,6 +2004,56 @@ mod tests {
             compiled.joint_rank, total,
             "audit must report full rank on synthetic full-rank design"
         );
+    }
+
+    /// `compile_protected` keeps a rank-deficient protected first block at full
+    /// raw width (identity V) while the unprotected path drops its null
+    /// direction, and later blocks still orthogonalise against the full anchor.
+    /// Mirrors the `compile_from_raw_grams_protected` guard for the operator
+    /// (per-term) reduction path used by the survival time-wiggle time block.
+    #[test]
+    fn compile_protected_keeps_rank_deficient_first_block_full_width() {
+        let n = 40;
+        // Block A: two identical columns → structural rank 1 (one within-block
+        // null the unprotected filter drops).
+        let a = Array2::from_shape_fn((n, 2), |(i, _)| ((i + 1) as f64 * 0.31).sin());
+        let b = Array2::from_shape_fn((n, 2), |(i, j)| ((i as f64) * 0.17 + j as f64).cos());
+        let hess = IdentityRowHessian::new(n, 1);
+        let ordering = [BlockOrder::Time, BlockOrder::Marginal];
+
+        let unprotected = compile(&[op(a.clone()), op(b.clone())], &hess, &ordering)
+            .expect("unprotected compile");
+        assert_eq!(
+            unprotected.blocks[0].t_lw.ncols(),
+            1,
+            "unprotected first block drops its duplicate column"
+        );
+
+        let protected = compile_protected(
+            &[op(a.clone()), op(b.clone())],
+            &hess,
+            &ordering,
+            &[true, false],
+        )
+        .expect("protected compile");
+        let v_a = &protected.blocks[0].t_lw;
+        assert_eq!(
+            v_a.ncols(),
+            2,
+            "protected first block retains its full raw width"
+        );
+        // V_a is the 2×2 identity: raw coords == compiled coords for the
+        // protected first block.
+        for i in 0..2 {
+            for j in 0..2 {
+                let expect = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (v_a[[i, j]] - expect).abs() <= 1e-12,
+                    "protected first block V must be identity, got [{i},{j}]={}",
+                    v_a[[i, j]]
+                );
+            }
+        }
     }
 
     /// §10 test #3: non-identity row Hessian. With K=1 and weights `w`,
@@ -2847,6 +2997,65 @@ mod tests {
             "the second block keeps its full structural rank"
         );
         assert_eq!(map.raw_from_compiled.dim(), (2, 2));
+    }
+
+    /// A `protected` first block keeps every raw column even when it is
+    /// internally rank-deficient (a duplicate-column structural null that the
+    /// unprotected path drops), and later blocks still reduce against the full
+    /// raw anchor. Regression for the survival marginal-slope monotone
+    /// time-wiggle time block: its chain-rule Jacobian recomputes a fixed
+    /// `p_tw`-column wiggle basis on every evaluation, so a reduced (`p_time <
+    /// p_tw`) time design made that Jacobian write past its buffer — an
+    /// out-of-bounds panic in the phase-4b compiled-map path.
+    #[test]
+    fn compile_from_raw_grams_protected_keeps_full_rank_deficient_first_block() {
+        let n = 14;
+        // Block A (first, highest priority): two IDENTICAL columns → structural
+        // rank 1, i.e. one within-block null direction the unprotected filter
+        // drops. Stands in for the wiggle time block whose raw width must be
+        // preserved.
+        // Column value depends only on the row → both columns are identical.
+        let a = Array2::from_shape_fn((n, 2), |(i, _)| ((i + 1) as f64 * 0.37).sin());
+        // Block B: genuinely independent, so it survives at full width.
+        let b = Array2::from_shape_fn((n, 2), |(i, j)| ((i + 1) as f64 * (0.29 + j as f64 * 0.11)).cos());
+        let w = Array1::ones(n);
+        let (gram_h, gram_struct, raw_ranges) = scalar_grams_two_block(&a, &b, &w);
+        let ordering = [BlockOrder::Time, BlockOrder::Marginal];
+
+        // Unprotected: the duplicate column is dropped → block 0 reduces to 1.
+        let unprotected =
+            compile_from_raw_grams(&gram_h, &gram_struct, &raw_ranges, &ordering)
+                .expect("unprotected compile");
+        assert_eq!(
+            unprotected.compiled_block_ranges[0].len(),
+            1,
+            "unprotected first block drops its structural-null direction"
+        );
+
+        // Protected: block 0 keeps both raw columns; T's block-0 diagonal is the
+        // 2×2 identity (raw coords == compiled coords for the protected block).
+        let protected =
+            compile_from_raw_grams_protected(&gram_h, &gram_struct, &raw_ranges, &ordering, &[true, false])
+                .expect("protected compile");
+        assert_eq!(
+            protected.compiled_block_ranges[0].len(),
+            2,
+            "protected first block retains its full raw width"
+        );
+        let t_block0 = protected
+            .raw_from_compiled
+            .slice(s![0..2, protected.compiled_block_ranges[0].clone()])
+            .to_owned();
+        for i in 0..2 {
+            for j in 0..2 {
+                let expect = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (t_block0[[i, j]] - expect).abs() <= 1e-12,
+                    "protected first block map must be identity, got [{i},{j}]={}",
+                    t_block0[[i, j]]
+                );
+            }
+        }
     }
 
     #[test]

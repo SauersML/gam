@@ -34,7 +34,10 @@
 //! the GPU target is met.
 //!
 //! The benchmark PRINTS the measured rows/sec per K verbatim; the assertion is
-//! the gate, the print is the datum.
+//! the gate, the print is the datum. When CUDA is available the gate also runs
+//! the production device-resident certified encode and compares THAT measured
+//! device rows/sec against the 100k rows/sec/GPU target; a CPU rate can only be
+//! a regression sentinel and can never certify the deployment target.
 
 use gam::terms::latent::LatentManifold;
 use gam::terms::{
@@ -375,11 +378,79 @@ fn measure_encode_rows_per_sec(k_atoms: usize) -> f64 {
     rows_per_sec
 }
 
+/// Build the smallest production certified-encode fixture that can honestly run
+/// on the CUDA SAE encode kernel: a EuclideanPatch atom, its certified atlas,
+/// and a batch of planted on-manifold rows large enough to clear the kernel's
+/// launch threshold. This is deliberately separate from the CPU circle
+/// dictionary above because the resident device encode kernel consumes the
+/// Euclidean monomial basis/exponent table used by the production certified
+/// atlas.
+fn build_device_encode_fixture() -> (
+    gam_sae::manifold::SaeManifoldAtom,
+    gam_sae::encode::EncodeAtlas,
+    Vec<Vec<f64>>,
+    Vec<f64>,
+) {
+    use gam_sae::basis::{EuclideanPatchEvaluator, SaeBasisEvaluator};
+    use gam_sae::encode::AtlasConfig;
+    use gam_sae::gpu_kernels::sae_encode_resident::DEVICE_ROW_THRESHOLD;
+    use gam_sae::manifold::{SaeAtomBasisKind, SaeManifoldAtom};
+
+    let (d, degree, p) = (1usize, 2usize, 4usize);
+    let config = AtlasConfig::default();
+    let evaluator = Arc::new(EuclideanPatchEvaluator::new(d, degree).expect("euclidean evaluator"));
+    let seed = Array2::from_shape_fn((12, d), |(r, c)| {
+        0.15 * ((r as f64 + 1.0) * (c as f64 + 2.0) * 0.37).sin()
+    });
+    let (phi, jet) = evaluator.evaluate(seed.view()).expect("seed basis eval");
+    let m = phi.ncols();
+    let decoder = Array2::from_shape_fn((m, p), |(b, c)| {
+        (1.0 / (1.0 + b as f64)) * (((b as f64 + 1.0) * (c as f64 + 1.0)) * 0.3).cos()
+    });
+    let atom = SaeManifoldAtom::new(
+        "euclid_device_encode_gate",
+        SaeAtomBasisKind::EuclideanPatch,
+        d,
+        phi,
+        jet,
+        decoder,
+        Array2::<f64>::eye(m),
+    )
+    .expect("device encode atom")
+    .with_basis_second_jet(evaluator.clone());
+    let atlas = gam_sae::encode::EncodeAtlas::build(&[atom.clone()], &[2.0], 8.0, config)
+        .expect("device encode atlas");
+
+    let n = DEVICE_ROW_THRESHOLD + 64;
+    let mut rows = Vec::with_capacity(n);
+    let mut amplitudes = Vec::with_capacity(n);
+    for row in 0..n {
+        let tc = -0.4 + 0.8 * ((row % 97) as f64) / 96.0;
+        let coords = Array2::from_shape_fn((1, d), |_| tc);
+        let (phi_row, _) = evaluator.evaluate(coords.view()).expect("row basis eval");
+        let amp = 0.9 + 0.2 * (((row as f64) * 0.013).sin() * 0.5 + 0.5);
+        let mut x = vec![0.0; p];
+        for c in 0..p {
+            x[c] = amp
+                * (0..m)
+                    .map(|b| phi_row[[0, b]] * atom.decoder_coefficients[[b, c]])
+                    .sum::<f64>();
+        }
+        rows.push(x);
+        amplitudes.push(amp);
+    }
+
+    (atom, atlas, rows, amplitudes)
+}
+
 #[test]
 fn sae_encode_throughput_decision_gate() {
     use gam::gpu::device_runtime::GpuRuntime;
-    use gam::gpu::encode_throughput::{measure_resident_solve_throughput, CANONICAL_ENCODE_SHAPES};
     use gam::gpu::policy::{EncodeDecisionBlocked, EncodeDeploymentDecision};
+    use gam_sae::encode::AtlasConfig;
+    use gam_sae::gpu_kernels::sae_encode_resident::{
+        EncodeAtomDevice, EncodePath, measure_device_encode_throughput, sae_certified_encode_batch,
+    };
 
     println!("=== Stage-3 SAE encode throughput benchmark (#988 / #1412) ===");
     // #1412 HONESTY (post-reopen fix): this CPU benchmark does NOT measure the
@@ -427,82 +498,75 @@ fn sae_encode_throughput_decision_gate() {
 
     // ── DEPLOYMENT / SURROGATE DECISION (#988, #1412) ──────────────────────
     //
-    // The decision is empirical and DEVICE-ONLY. Two facts make it `Undetermined`
-    // on essentially every host today:
-    //   1. On a CPU-only host there is no device measurement at all.
-    //   2. Even ON a CUDA device, there is NO device-resident *exact-encode*
-    //      kernel — the production `certified_encode_*` path is host ndarray work,
-    //      and the resident normal-equations solve measured below is only ONE
-    //      COMPONENT of the encode (see `encode_throughput.rs` SCOPE), not the
-    //      full per-row encode. A component measurement cannot decide the encode
-    //      surrogate question (#988).
-    // So the encode deployment decision is `Undetermined`. It is emphatically NOT
-    // "surrogate unneeded": that would require a full-encode device measurement
-    // clearing the target, which does not exist yet.
+    // The decision is empirical and DEVICE-ONLY. On a CPU-only host there is no
+    // device measurement, so the result is `Undetermined`. On a CUDA host the
+    // production device-resident certified encode is measured end-to-end below
+    // and the decision MUST be the exact comparison between that measured device
+    // rate and the 100k rows/sec/GPU target — no resident-solve component proxy
+    // and no CPU×constant projection.
     let device_present = GpuRuntime::global().map(|r| r.device_count()).unwrap_or(0) > 0;
-    let decision = if device_present {
-        EncodeDeploymentDecision::blocked(EncodeDecisionBlocked::NoDeviceEncodeKernel)
+    let mut decision = if device_present {
+        EncodeDeploymentDecision::blocked(EncodeDecisionBlocked::DeviceNotEngaged)
     } else {
         EncodeDeploymentDecision::blocked(EncodeDecisionBlocked::NoDevice)
     };
-    println!("DEPLOYMENT DECISION (full exact encode): {decision:?}");
-    println!(
-        "Stage-3 amortized surrogate: {} — the exact encode is neither proven to clear the target \
-         (no full-encode device measurement) nor proven to miss it; BLOCKED on a device \
-         exact-encode kernel + measurement",
-        if decision.surrogate_unneeded() {
-            "NOT NEEDED"
-        } else if decision.surrogate_justified() {
-            "JUSTIFIED"
-        } else {
-            "UNDETERMINED (BLOCKED)"
-        }
-    );
-    assert!(
-        decision.is_undetermined(),
-        "#1412/#988: with no device exact-encode measurement the deployment decision must be \
-         Undetermined (BLOCKED on hardware), got {decision:?}"
-    );
-    assert!(
-        !decision.surrogate_unneeded(),
-        "#1412: the gate must NOT claim the amortized surrogate is unneeded without a real \
-         full-encode device measurement clearing the target (the reopened green-wash)"
-    );
-
-    // ── COMPONENT MEASUREMENT (device only) ────────────────────────────────
-    //
-    // When a CUDA device is present we STILL measure the resident penalized-solve
-    // COMPONENT and print it — it is real evidence about that inner step — but it
-    // is explicitly NOT the encode decision above. Its `engaged`/`meets_target`
-    // invariants guard against false routing; it never sets `surrogate_unneeded`
-    // for the full encode.
     if device_present {
-        for &shape in CANONICAL_ENCODE_SHAPES {
-            let res = measure_resident_solve_throughput(shape, 20);
-            println!(
-                "COMPONENT-RESIDENT-SOLVE shape={} n={} p={} engaged={} measured_rows_per_sec={:.0} \
-                 frac_of_target={:.3} meets_target={} (COMPONENT ONLY — not the full encode decision)",
-                res.shape.label,
-                res.shape.n,
-                res.shape.p,
-                res.engaged,
-                res.measured_rows_per_sec,
-                res.verdict.fraction_of_target,
-                res.verdict.meets_target,
-            );
-            if !res.engaged {
-                // A non-engaged shape can never be reported as meeting the
-                // target — the #1412 anti-fudge invariant on the component too.
-                assert!(
-                    !res.verdict.meets_target,
-                    "COMPONENT: a non-engaged shape claimed to meet the target (false routing)"
-                );
-            }
-        }
+        let (atom, atlas, rows, amplitudes) = build_device_encode_fixture();
+        let device_config = AtlasConfig::default();
+        let dev = EncodeAtomDevice::from_atom_atlas(&atom, &atlas.atoms[0], &device_config)
+            .expect("device encode fixture must lower to device form");
+        let tput = measure_device_encode_throughput(&dev, &rows, &amplitudes);
+        decision = tput.decision;
+        println!(
+            "DEVICE-FULL-ENCODE n={} path={:?} measured_rows_per_sec={:.0} \
+             target={GPU_DEPLOYMENT_TARGET_ROWS_PER_SEC_PER_GPU:.0} decision={decision:?}",
+            tput.n_rows, tput.path, tput.rows_per_sec
+        );
+
+        let (batch, path) = sae_certified_encode_batch(&dev, &rows, &amplitudes);
+        assert_eq!(
+            path, tput.path,
+            "timed encode path and validation encode path must agree; otherwise the device \
+             engagement flag is not stable enough to certify a deployment decision"
+        );
+        let certified = batch.iter().filter(|row| row.cert.certified()).count();
+        assert!(
+            certified > rows.len() / 2,
+            "device encode fixture must be non-vacuous: certified {certified}/{} rows",
+            rows.len()
+        );
+
+        assert!(
+            matches!(tput.path, EncodePath::Device),
+            "#1412: CUDA was present but the exact encode did not dispatch to the device; 0% GPU \
+             utilization is a hard failure, not a CPU pass (path={:?}, decision={decision:?})",
+            tput.path
+        );
+        assert!(
+            decision.surrogate_unneeded(),
+            "#1412/#988: the deployment gate must be established by the measured FULL exact-encode \
+             device throughput. Measured {:.1} rows/sec/GPU did not clear the {:.1} target \
+             (decision={decision:?})",
+            tput.rows_per_sec,
+            GPU_DEPLOYMENT_TARGET_ROWS_PER_SEC_PER_GPU
+        );
     } else {
         println!(
-            "COMPONENT-RESIDENT-SOLVE: no CUDA device — no component measurement; deployment \
-             decision remains Undetermined (BLOCKED), never a CPU projection"
+            "DEVICE-FULL-ENCODE: no CUDA device — no device measurement; deployment decision \
+             remains Undetermined (BLOCKED), never a CPU projection"
+        );
+    }
+
+    println!("DEPLOYMENT DECISION (full exact encode): {decision:?}");
+    if !device_present {
+        assert!(
+            decision.is_undetermined(),
+            "#1412/#988: with no device exact-encode measurement the deployment decision must be \
+             Undetermined (BLOCKED on hardware), got {decision:?}"
+        );
+        assert!(
+            !decision.surrogate_unneeded(),
+            "#1412: a CPU-only run must NOT claim the amortized surrogate is unneeded"
         );
     }
 }

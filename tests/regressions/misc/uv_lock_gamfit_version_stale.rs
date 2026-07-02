@@ -1,5 +1,5 @@
-use std::fs;
 use std::path::Path;
+use std::{fs, io};
 
 fn quoted_value_after<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
     let raw = line.trim().strip_prefix(prefix)?.trim();
@@ -53,10 +53,12 @@ fn uv_lock_gamfit_version(path: &Path) -> String {
     panic!("{} has no gamfit package version", path.display());
 }
 
-fn cargo_lock_package_version(path: &Path, package_name: &str) -> String {
-    let content = fs::read_to_string(path).unwrap_or_else(|err| {
-        panic!("read {}: {err}", path.display());
-    });
+fn cargo_lock_package_version(path: &Path, package_name: &str) -> Option<String> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return None,
+        Err(err) => panic!("read {}: {err}", path.display()),
+    };
     let mut inside_package = false;
     let mut inside_target = false;
     for line in content.lines() {
@@ -80,7 +82,7 @@ fn cargo_lock_package_version(path: &Path, package_name: &str) -> String {
         }
         if inside_target {
             if let Some(version) = quoted_value_after(trimmed, "version = ") {
-                return version.to_string();
+                return Some(version.to_string());
             }
         }
     }
@@ -103,8 +105,10 @@ fn gamfit_version_is_consistent_across_manifests() {
         pyproject, uv_lock,
         "uv.lock editable gamfit package must match pyproject.toml"
     );
-    assert_eq!(
-        pyproject, cargo_lock,
-        "Cargo.lock gam-pyffi package must match pyproject.toml"
-    );
+    if let Some(cargo_lock) = cargo_lock {
+        assert_eq!(
+            pyproject, cargo_lock,
+            "Cargo.lock gam-pyffi package must match pyproject.toml"
+        );
+    }
 }

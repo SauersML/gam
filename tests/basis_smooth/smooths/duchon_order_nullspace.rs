@@ -41,8 +41,9 @@
 
 use faer::Side;
 use gam::basis::{
-    CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
-    OneDimensionalBoundary, SpatialIdentifiability, build_duchon_basis, duchon_nullspace_dimension,
+    BasisMetadata, CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder,
+    DuchonOperatorPenaltySpec, OneDimensionalBoundary, SpatialIdentifiability, build_duchon_basis,
+    duchon_nullspace_dimension,
 };
 use gam::faer_ndarray::FaerCholesky;
 use ndarray::{Array2, s};
@@ -287,7 +288,14 @@ fn duchon_order1_polynomial_block_is_independent_of_the_kernel_block() {
         "expected {k} total cols before identifiability"
     );
 
-    // Polynomial block: last `poly_dim` columns = [constant col | x1 | x2 | x3].
+    // Polynomial block: last `poly_dim` columns = [constant col | x1-c̄1 | x2-c̄2 | x3-c̄3].
+    //
+    // The production Duchon builder deliberately uses a translation-invariant
+    // polynomial frame, centered by the selected center-cloud mean, so the
+    // explicit trend block and the center-side condition `P(centers)^T alpha=0`
+    // are assembled in the same coordinate frame.  Do not compare these columns
+    // to raw data coordinates: that would reject the #1375 translation-invariant
+    // basis while testing no valid Duchon side-condition property.
     let poly_block = full.slice(s![.., kernel_cols..]).to_owned();
 
     // Confirm polynomial block column 0 is all ones.
@@ -301,17 +309,26 @@ fn duchon_order1_polynomial_block_is_independent_of_the_kernel_block() {
         "polynomial block column 0 should be all ones; max deviation = {col0_max_dev:e}"
     );
 
-    // Confirm polynomial block columns 1..4 match the data columns.
+    let centers = match &result.metadata {
+        BasisMetadata::Duchon { centers, .. } => centers,
+        other => panic!("expected Duchon metadata, got {other:?}"),
+    };
+    let center_mean: Vec<f64> = (0..d)
+        .map(|col| centers.column(col).sum() / centers.nrows().max(1) as f64)
+        .collect();
+
+    // Confirm polynomial block columns 1..4 match the center-cloud centered
+    // data columns used by the builder's translation-invariant polynomial frame.
     for col in 0..d {
         let max_dev = poly_block
             .column(col + 1)
             .iter()
             .zip(data.column(col).iter())
-            .map(|(&a, &b)| (a - b).abs())
+            .map(|(&a, &b)| (a - (b - center_mean[col])).abs())
             .fold(0.0_f64, f64::max);
         assert!(
             max_dev < 1e-12,
-            "polynomial block col {}: max deviation from data = {max_dev:e}",
+            "polynomial block col {}: max deviation from center-cloud centered data = {max_dev:e}",
             col + 1
         );
     }

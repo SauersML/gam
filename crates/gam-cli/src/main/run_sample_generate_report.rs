@@ -350,6 +350,44 @@ pub(crate) fn run_generate_unified(
     }
 }
 
+fn smoothing_forensics_rows(
+    fit: &UnifiedFitResult,
+    edf_blocks: &[report::EdfBlockRow],
+) -> Vec<report::SmoothingForensicsRow> {
+    let sigma2 = (fit.standard_deviation * fit.standard_deviation).max(0.0);
+    let assembly_edfs = fit.edf_by_block();
+    fit.blocks
+        .iter()
+        .enumerate()
+        .map(|(block_idx, block)| {
+            let lambda_path = block.lambdas.iter().copied().collect::<Vec<_>>();
+            let edf_criterion = edf_blocks
+                .iter()
+                .find(|row| row.index == block_idx)
+                .map(|row| row.edf)
+                .or(Some(block.edf));
+            let edf_assembly = assembly_edfs.get(block_idx).copied().or(Some(block.edf));
+            let role = block_role_label(&block.role);
+            report::SmoothingForensicsRow {
+                term: format!("block {block_idx} ({role})"),
+                lambda_path,
+                sigma2_path: vec![sigma2],
+                edf_criterion,
+                edf_assembly,
+                double_penalty_range: None,
+                double_penalty_null_space: fit.artifacts.null_space_dim.and_then(|dim| {
+                    if dim > 0 && block_idx == 0 {
+                        Some(dim as f64)
+                    } else {
+                        None
+                    }
+                }),
+                seed_screening: Vec::new(),
+            }
+        })
+        .collect()
+}
+
 /// Render the report for a spline-scan model (#1046) from its reconstructed
 /// scalar quantities and the single smooth's EDF block, reusing the standard
 /// `report::write_report` renderer. A scan model retains no dense design/Gram,
@@ -391,6 +429,7 @@ pub(crate) fn run_report_spline_scan(
         converged: true,
         outer_gradient_norm: None,
         criterion_certificate: None,
+        smoothing_forensics: Vec::new(),
         edf_total: scan.edf(),
         r_squared: None,
         coefficients: Vec::new(),
@@ -464,6 +503,7 @@ pub(crate) fn run_report_residual_cascade(
         converged: true,
         outer_gradient_norm: None,
         criterion_certificate: None,
+        smoothing_forensics: Vec::new(),
         edf_total: 0.0,
         r_squared: None,
         coefficients: Vec::new(),
@@ -729,7 +769,38 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
                 // λ_raw = λ̃ / ||S_raw,ℓ||_F, before the arbitrary Mellin
                 // ε_ℓ^(-2s0)·log_step gauge is folded into the fit-time forms.
                 {
-                    let mut penalty_cursor = design.random_effect_ranges.len();
+                    // Seed the penalty cursor the SAME way `build_model_summary`
+                    // does: PAST any leading shared `LinearTermRidge` block, then
+                    // advance by ONE per random-effect range ONLY when it owns a
+                    // penalty block (penalized AND non-empty). An unpenalized
+                    // `by`-factor main effect adds a random-effect range with NO
+                    // penalty block (`design_construction`/`term_design` skip it),
+                    // so counting it — as the old `random_effect_ranges.len()`
+                    // seed did — slid every following smooth's `[start..start+k]`
+                    // measure-jet penalty window off by one and read the wrong
+                    // per-scale λ (#1883). Likewise the leading `LinearTermRidge`
+                    // block must be stepped over so the first smooth's window is
+                    // not off by one when a penalized linear term is present.
+                    let mut penalty_cursor = design
+                        .penaltyinfo
+                        .iter()
+                        .take_while(|info| {
+                            matches!(
+                                &info.penalty.source,
+                                gam::basis::PenaltySource::Other(s) if s == "LinearTermRidge"
+                            )
+                        })
+                        .count();
+                    for (re_idx, (_re_name, re_range)) in
+                        design.random_effect_ranges.iter().enumerate()
+                    {
+                        let penalized = spec
+                            .random_effect_terms
+                            .get(re_idx)
+                            .map(|t| t.penalized)
+                            .unwrap_or(true);
+                        penalty_cursor += usize::from(penalized && !re_range.is_empty());
+                    }
                     for term in &design.smooth.terms {
                         let k = term.penalties_local.len();
                         let term_penalty_start = penalty_cursor;
@@ -956,6 +1027,7 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
                 clean: cert.is_clean(),
             }
         }),
+        smoothing_forensics: smoothing_forensics_rows(&fit, &edf_blocks),
         edf_total: model
             .unified()
             .and_then(|u| u.edf_total())
