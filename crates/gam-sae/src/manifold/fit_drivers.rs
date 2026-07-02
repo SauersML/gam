@@ -1660,46 +1660,50 @@ impl SaeManifoldTerm {
         }
         let mut ssr = 0.0_f64;
         let mut sst = 0.0_f64;
+        // Reconstruction OUTPUT energy about the target column means: `Σ (fitted −
+        // mean)²`. A dictionary whose decoders have co-vanished produces ≈ the
+        // column mean and hence near-zero output energy; a fit that merely explains
+        // little but whose decoders carry real signal has output energy of ordinary
+        // magnitude. This is the "decoder output co-vanished" half of the
+        // absolute-degeneracy verdict below.
+        let mut sfit = 0.0_f64;
         for row in 0..n {
             for col in 0..p {
                 let r = target[[row, col]] - fitted[[row, col]];
                 ssr += r * r;
                 let centered = target[[row, col]] - means[col];
                 sst += centered * centered;
+                let out = fitted[[row, col]] - means[col];
+                sfit += out * out;
             }
         }
-        if !(ssr.is_finite() && sst.is_finite()) || sst <= f64::MIN_POSITIVE {
+        if !(ssr.is_finite() && sst.is_finite() && sfit.is_finite()) || sst <= f64::MIN_POSITIVE {
             return Ok(false);
         }
         let ev = 1.0 - ssr / sst;
-        // #1522 — DERIVE the co-collapse acceptance bar from the data rather than
-        // keying on a corpus-tuned absolute constant. The bar is half the BEST EV
-        // any rank-`K` linear dictionary could reach on THIS centered target (its
-        // rank-`K` PCA / Eckart-Young ceiling), so it tracks the data's achievable
-        // reconstruction instead of an OLMo-calibrated number: a fit that explains
-        // less than half the variance a rank-`K` optimum could is a structural
-        // collapse on this data, whatever its absolute EV. The dictionary rank is
-        // the sum of the per-atom basis sizes (each atom contributes its own
-        // `basis_size()` directions), capped at the data rank `min(n, p)`. When the
-        // ceiling is degenerate or un-computable (constant target, SVD failure) the
-        // `pca_ev_ceiling` returns non-finite and we fall back to the absolute
-        // [`SAE_FIT_DATA_COLLAPSE_EV_FLOOR`] so the guard never keys on a
-        // meaningless bar.
-        //
-        // #1610 — the rank `q` at which the linear PCA ceiling is taken is the
-        // dictionary's GEOMETRICALLY REACHABLE rank (`Σ_k rank(Φ_k)` capped at
-        // `min(n,p)`), not the nominal coefficient count `Σ_k basis_size_k`. A
-        // curved atom's decoded image spans only `rank(Φ_k) ≤ basis_size_k`
-        // linear directions, so the old nominal count over-stated what the
-        // NONLINEAR dictionary can reach and biased the linear PCA ceiling high
-        // (and hence the bar). The reachable rank is read from the chart designs
-        // alone, so a co-collapsed dictionary still reports full geometric reach
-        // and the guard does not lower its own bar at the collapse it must catch.
+        let out_energy_ratio = sfit / sst;
+        // S1 (guard surgery) — the collapse verdict that feeds the outer BFGS WALL
+        // must fire ONLY on ABSOLUTE degeneracy, never on a fit that is merely
+        // below a competitiveness ceiling. The former `0.5 × dense rank-K PCA
+        // ceiling` bar sat above the honest `k_active`-sparse optimum on real
+        // activations, so ordinary K≥2 fits were walled as "collapsed", flattening
+        // the outer objective (every probe returned the wall → no line-search
+        // gradient → ρ oscillation / timeout). Detection now keys on the SIGNAL-FREE
+        // null floor (`absolute_degeneracy_ev_floor` = `q / n`, the classical
+        // null-`R²`), and requires BOTH:
+        //   (a) EV at or below that null floor (explains no more than chance), AND
+        //   (b) the reconstruction output co-vanished (output energy at or below the
+        //       same null level — the decoders produce ≈ the column mean, nothing).
+        // Condition (b) is the discriminator that distinguishes a genuinely
+        // co-vanished dictionary (reseed/wall appropriate) from a present-decoder
+        // fit that simply reconstructs poorly (the optimizer's job). The reachable
+        // rank `q = Σ_k rank(Φ_k)` (chart geometry alone, so a co-collapsed decoder
+        // still reports full reach) sets the null floor.
         let dictionary_rank =
             crate::manifold::outer_objective::reachable_dictionary_rank(&self.atoms, n, p);
         let ev_floor =
-            crate::manifold::outer_objective::collapse_ev_bar(target, dictionary_rank);
-        if !(ev.is_finite() && ev <= ev_floor) {
+            crate::manifold::outer_objective::absolute_degeneracy_ev_floor(target, dictionary_rank);
+        if !(ev.is_finite() && ev <= ev_floor && out_energy_ratio <= ev_floor) {
             return Ok(false);
         }
 
@@ -2239,40 +2243,58 @@ impl SaeManifoldTerm {
             // real-data K=2 failure (both atoms fall into one basin and the fit
             // explains ~0 variance; empirically a different seed or stronger
             // decoder-incoherence repulsion avoids the basin, but the guard must
-            // catch it for ANY seed). Detect it ABSOLUTELY from the
-            // reconstruction: a dictionary that explains essentially none of the
-            // centered target variance has collapsed regardless of relative
-            // norms.
+            // catch it once the fit has genuinely stalled there — see the S1 note
+            // below for why this is gated to iteration > 0 and ABSOLUTE degeneracy).
+            // Detect it ABSOLUTELY from the reconstruction: a dictionary that
+            // explains essentially none of the centered target variance AND whose
+            // output has co-vanished has collapsed regardless of relative norms.
+            // S1 (guard surgery) — the co-collapse reseed arm must fire ONLY on
+            // genuine ABSOLUTE degeneracy after the optimizer has had a chance, NOT
+            // on a cold seed or a merely-uncompetitive fit. Two changes close the
+            // #1522 false-positive that was destroying state before optimization:
+            //
+            //  (1) NEVER at iteration 0. The entry (iteration-0) guard call evaluated
+            //      the SEED against a bar — but a cold seed is below ANY bar by
+            //      definition, so K≥2 real-data fits opened by burning the whole
+            //      reseed budget on the seed's PCs and recording Terminal collapse
+            //      events before the first Newton step. Checking the seed against a
+            //      bar checks COLDNESS, not health. The entry call still runs the
+            //      relative-norm arm above (a warm-started already-collapsed decoder
+            //      is legitimately reseeded there), but the EV arm is armed only once
+            //      an accepted step exists to have progressed — an `iteration > 0`
+            //      state still at the null floor is genuinely STALLED at a degenerate
+            //      basin, not merely cold.
+            //
+            //  (2) ABSOLUTE degeneracy, not "below a competitiveness ceiling". The
+            //      former `0.5 × dense rank-K PCA ceiling` bar sat above the honest
+            //      `k_active`-sparse optimum on real activations, so ordinary K≥2
+            //      fits tripped it. Trip now requires BOTH the reconstruction EV at
+            //      or below the SIGNAL-FREE null floor (`absolute_degeneracy_ev_floor`
+            //      = `q / n`, the classical null-`R²`) AND the reconstruction OUTPUT
+            //      co-vanished (output energy at or below the same null level — the
+            //      decoders produce ≈ the column mean). Both hold exactly when every
+            //      decoder has vanished TOGETHER (the #853/#976 co-collapse); a
+            //      present-decoder fit that merely reconstructs poorly keeps output
+            //      energy and is left to the optimizer. A non-finite EV is deferred
+            //      to the median/mass guards; iteration 0 defers entirely.
+            if iteration == 0 {
+                return Ok(());
+            }
             let ev = self.dictionary_reconstruction_ev(target, rho)?;
-            // CO-collapse is an EV-MAGNITUDE failure, not an EV-finiteness one: a
-            // co-collapsed dictionary explains essentially none of the centered
-            // target variance, but that EV is a perfectly finite number near zero
-            // (often slightly negative). Gating on `ev.is_finite()` therefore short-
-            // circuits this arm for every real fit — the #1522 regression that
-            // re-opened the #853/#976 blind spot (gates spread, decoders co-collapse,
-            // EV≈0, rank-deficient Hessian → REML abort). Trip the arm exactly when
-            // EV sits at or below the SAME data-derived collapse bar the fitted-data
-            // acceptance check keys on (half the rank-`K` PCA / Eckart-Young ceiling
-            // achievable on THIS centered target, falling back to the absolute
-            // [`SAE_FIT_DATA_COLLAPSE_EV_FLOOR`] when that ceiling is un-computable),
-            // so the co-collapse reseed and the data-collapse verdict measure
-            // degeneracy against one and the same threshold. A non-finite EV is
-            // un-certifiable here and is deferred (the median/mass guards and inner
-            // solve own that case), as is any EV above the bar (a healthy fit).
+            let out_energy_ratio =
+                self.dictionary_reconstruction_output_energy_ratio(target, rho)?;
             let n = self.n_obs();
             let p = target.ncols();
-            // #1610 — calibrate the linear PCA ceiling against the dictionary's
-            // GEOMETRICALLY REACHABLE rank (`Σ_k rank(Φ_k)`), not the nominal
-            // coefficient count `Σ_k basis_size_k` (biased high for a nonlinear
-            // dictionary). Shared with the fitted-data collapse acceptance check
-            // so both verdicts key on the same reachable-rank bar.
+            // Reachable rank `q = Σ_k rank(Φ_k)` (chart geometry alone, so a
+            // co-collapsed decoder still reports full reach) sets the null floor,
+            // shared with the fitted-data collapse verdict so both key on one bar.
             let dictionary_rank =
                 crate::manifold::outer_objective::reachable_dictionary_rank(&self.atoms, n, p);
-            let ev_floor = crate::manifold::outer_objective::collapse_ev_bar(
+            let ev_floor = crate::manifold::outer_objective::absolute_degeneracy_ev_floor(
                 target,
                 dictionary_rank,
             );
-            if !(ev.is_finite() && ev <= ev_floor) {
+            if !(ev.is_finite() && ev <= ev_floor && out_energy_ratio <= ev_floor) {
                 return Ok(());
             }
             // #1026 keep-best multi-start: the current (pre-reseed) state is a
@@ -2315,12 +2337,13 @@ impl SaeManifoldTerm {
             // fighting the optimizer over one atom. It gets its OWN budget
             // (`SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET`), distinct from the
             // per-atom `SAE_ATOM_COLLAPSE_RESEED_BUDGET` (which stays 1 for the
-            // reasons in its doc). Because this branch only runs when EV is at or
-            // below the data-derived collapse bar (`collapse_ev_bar` =
-            // `SAE_COLLAPSE_PCA_EV_FRACTION` × the rank-K PCA ceiling) — a fit
-            // explaining less than half the linearly-achievable variance — it is a
-            // no-op for every healthy fit and can only ADD basin-escape attempts
-            // to an already-failed dictionary.
+            // reasons in its doc). Because this branch only runs at iteration > 0
+            // when EV is at or below the SIGNAL-FREE null floor
+            // (`absolute_degeneracy_ev_floor` = `q / n`) AND the reconstruction
+            // output has co-vanished — a dictionary explaining no more than chance
+            // whose decoders produce ≈ the column mean — it is a no-op for every
+            // healthy (or merely-uncompetitive) fit and can only ADD basin-escape
+            // attempts to an already-degenerate dictionary.
             if self.dictionary_cocollapse_reseeds >= SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET {
                 // Multi-start budget spent. #1026: restore the BEST basin seen
                 // across all reseeds (including the original seed) before giving up
@@ -2361,7 +2384,7 @@ impl SaeManifoldTerm {
             self.dictionary_cocollapse_reseeds += 1;
             log::warn!(
                 "SaeManifoldTerm: dictionary co-collapse (reconstruction EV={ev:.4} at or \
-                 below the data-derived collapse bar) with no relative-norm breach; \
+                 below the signal-free null floor, output co-vanished) with no relative-norm breach; \
                  reseeding all {k} atoms onto distinct residual PCs (dictionary multi-start \
                  {}/{SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET}: total co-collapse, no atom \
                  carries material signal to anchor)",
@@ -2488,6 +2511,54 @@ impl SaeManifoldTerm {
             return Ok(if ss_res > 0.0 { 0.0 } else { 1.0 });
         }
         Ok(1.0 - ss_res / ss_tot)
+    }
+
+    /// S1 (guard surgery) — fraction of the centered target variance carried by the
+    /// dictionary's OWN reconstruction OUTPUT: `Σ (fitted − mean)² / Σ (target −
+    /// mean)²`. A dictionary whose decoders have co-vanished reconstructs ≈ the
+    /// column mean, so this ratio falls to the null fitting-noise level; a fit that
+    /// merely reconstructs poorly but whose decoders carry real signal keeps output
+    /// energy of ordinary magnitude. Paired with [`Self::dictionary_reconstruction_ev`],
+    /// this is the "decoder output co-vanished" half of the absolute-degeneracy
+    /// co-collapse verdict in [`Self::enforce_decoder_norm_guard`]: a genuine
+    /// co-collapse has BOTH ~zero EV AND ~zero output energy, distinguishing it from
+    /// a present-decoder fit that simply reconstructs poorly (the optimizer's job).
+    /// Returns `0.0` for a constant (zero-variance) target, where the notion is
+    /// vacuous. Column means use the same running update as `dictionary_reconstruction_ev`.
+    pub(crate) fn dictionary_reconstruction_output_energy_ratio(
+        &self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+    ) -> Result<f64, String> {
+        let fitted = self.try_fitted_for_rho(rho)?;
+        if fitted.dim() != target.dim() {
+            return Err(format!(
+                "SaeManifoldTerm::dictionary_reconstruction_output_energy_ratio: fitted {:?} \
+                 != target {:?}",
+                fitted.dim(),
+                target.dim()
+            ));
+        }
+        let n = target.nrows();
+        let mut ss_out = 0.0_f64;
+        let mut ss_tot = 0.0_f64;
+        for col in 0..target.ncols() {
+            let mut mean = 0.0_f64;
+            for (count, row) in (0..n).enumerate() {
+                let x = target[[row, col]];
+                mean += (x - mean) / (count as f64 + 1.0);
+            }
+            for row in 0..n {
+                let dev = target[[row, col]] - mean;
+                ss_tot += dev * dev;
+                let out = fitted[[row, col]] - mean;
+                ss_out += out * out;
+            }
+        }
+        if !(ss_tot > 0.0) {
+            return Ok(0.0);
+        }
+        Ok(ss_out / ss_tot)
     }
 
     /// Reseed a set of collapsed atoms onto DISTINCT principal directions of the

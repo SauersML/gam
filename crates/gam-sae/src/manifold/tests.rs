@@ -1727,7 +1727,8 @@ pub(crate) fn decoder_norm_guard_reseeds_all_atoms_on_total_co_collapse_k3() {
         "test precondition: dictionary must start co-collapsed; EV={ev_before:.4}"
     );
 
-    term.enforce_decoder_norm_guard(target.view(), 0, &rho)
+    // S1: the EV co-collapse arm is armed only at iteration > 0 (iteration 0 = cold seed).
+    term.enforce_decoder_norm_guard(target.view(), 1, &rho)
         .expect("co-collapse guard must recover, not error");
 
     // EVERY atom — including the one the old code preserved as anchor — must be
@@ -1862,8 +1863,9 @@ pub(crate) fn co_collapse_multistart_restores_best_basin_not_last_reseed() {
     // guard observes at the start of each call (the candidate basin it may bank).
     // The guard reseeds in place, so each call's pre-reseed EV is a distinct
     // multi-start attempt; the best of these is what the final state must match.
+    // S1: the EV arm is armed only at iteration > 0; drive 1..=BUDGET+1 (BUDGET reseeds + restore).
     let mut best_seen = f64::NEG_INFINITY;
-    for iteration in 0..=SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET {
+    for iteration in 1..=(SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET + 1) {
         let ev_at_entry = term
             .dictionary_reconstruction_ev(target.view(), &rho)
             .expect("EV evaluates");

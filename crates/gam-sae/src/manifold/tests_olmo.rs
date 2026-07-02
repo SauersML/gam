@@ -471,31 +471,28 @@ pub(crate) fn read_npy_f32_2d(path: &std::path::Path) -> Array2<f64> {
     out
 }
 
-/// #1522 — the fitted-data collapse acceptance bar is DERIVED FROM THE DATA
-/// (`0.5 × rank-K PCA EV ceiling`), not the absolute
-/// [`SAE_FIT_DATA_COLLAPSE_EV_FLOOR`] magic constant. This pins the data
-/// derivation: build a fit whose reconstruction EV lands STRICTLY BETWEEN the old
-/// absolute floor and the data-derived bar, and assert the guard fires.
-///
-/// The target is the unit circle in `R^2` (`[[1,0],[0,1],[-1,0],[0,-1]]`), whose
-/// rank-2 PCA captures ALL of its centered variance, so `pca_ev_ceiling(target,
-/// K>=2) == 1.0` and the derived bar is `0.5`. The fit explains EV ~= 0.30 — ABOVE
-/// the old `SAE_FIT_DATA_COLLAPSE_EV_FLOOR` (0.10) but BELOW the data-derived 0.5.
-///
-/// Fail-before / pass-after: against the pre-#1522 hardcoded floor the test
-/// `0.30 <= 0.10` is FALSE, so the guard returns `false` (no collapse) and the
-/// `assert!(recorded)` FAILS. With the data-derived bar `0.30 <= 0.5` is TRUE, so
-/// the guard records the structural collapse and the test PASSES. A fit explaining
-/// less than half what a rank-K dictionary could is a collapse ON THIS DATA,
-/// whatever its absolute EV.
+/// S1 (guard surgery) — the fitted-data collapse verdict fires on ABSOLUTE
+/// degeneracy, NOT on a fit that is merely below a dense-PCA competitiveness
+/// ceiling. This is the CONVERSE of the retired #1522 behavior: the former
+/// `0.5 × rank-K PCA EV ceiling` bar flagged a present-decoder fit that explains
+/// only 30% of the variance as a "structural collapse", which is the exact
+/// false-positive that walled every real K≥2 fit. The corrected detector requires
+/// BOTH the reconstruction EV at or below the signal-free null floor
+/// (`absolute_degeneracy_ev_floor` = `q / n`) AND the reconstruction OUTPUT
+/// co-vanished, so:
+///   * a PRESENT-decoder fit (`fitted = 0.837 · target`, EV ≈ 0.30, output energy
+///     ≈ 0.70 of the variance) is NOT a collapse — its decoders carry real signal;
+///     the optimizer, not the guard, owns a merely-uncompetitive fit;
+///   * a genuinely VANISHED dictionary (`fitted ≈ column mean`) at the SAME K/data
+///     IS a collapse — EV ≈ 0 AND output energy ≈ 0.
 ///
 /// The collapse guard reads only `target`, `fitted`, `assignments`, the per-atom
-/// `basis_size()` and `k_atoms()` — it never EVALUATES the basis — so the atom is
+/// chart geometry and `k_atoms()` — it never EVALUATES the basis — so the atom is
 /// built with a raw periodic basis (`basis_size = 3`) and no evaluator.
 #[test]
-pub(crate) fn fit_data_collapse_bar_is_data_derived_not_absolute_floor_1522() {
+pub(crate) fn fit_data_collapse_verdict_is_absolute_degeneracy_not_competitiveness_s1() {
     // Raw periodic basis Φ = [1, sin(2πt), cos(2πt)] on 4 sample coords;
-    // `basis_size = 3`, so the single-atom dictionary rank is min(3, n, p).
+    // `basis_size = 3`, so the single-atom dictionary rank is min(rank(Φ), n, p).
     let coords = array![[0.0_f64], [0.25], [0.5], [0.75]];
     let n = coords.nrows();
     let mut phi = Array2::<f64>::zeros((n, 3));
@@ -528,79 +525,91 @@ pub(crate) fn fit_data_collapse_bar_is_data_derived_not_absolute_floor_1522() {
     let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
 
     let target = array![[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]];
+    let assignments = Array2::<f64>::ones((n, 1));
 
-    // The rank-K PCA ceiling of this rank-2 target is 1.0 (the PROMOTED production
-    // function must be reachable and reach the full ceiling), so the data-derived
-    // bar is 0.5 — well above the absolute 0.10 floor.
-    let dictionary_rank = term
-        .atoms
-        .iter()
-        .map(|atom| atom.basis_size())
-        .sum::<usize>()
-        .min(target.nrows())
-        .min(target.ncols());
-    let ceiling = crate::manifold::outer_objective::pca_ev_ceiling(
+    // The reachable rank and hence the null floor `q / n` the production verdict
+    // keys on. On this rank-2 target (n=4, p=2) q is capped at min(n,p)=2, so the
+    // floor is 2/4 = 0.5.
+    let dictionary_rank = crate::manifold::outer_objective::reachable_dictionary_rank(
+        &term.atoms,
+        target.nrows(),
+        target.ncols(),
+    );
+    let floor = crate::manifold::outer_objective::absolute_degeneracy_ev_floor(
         target.view(),
         dictionary_rank,
     );
-    assert!(
-        (ceiling - 1.0).abs() < 1e-9,
-        "rank-{dictionary_rank} PCA ceiling of the unit-circle target must be 1.0; got {ceiling}"
-    );
-    // Key on production's own bar (collapse_ev_bar = SAE_COLLAPSE_PCA_EV_FRACTION
-    // · ceiling here, since the ceiling is finite) so this test can never drift
-    // from the live collapse decision.
-    let derived_bar = crate::manifold::outer_objective::collapse_ev_bar(
-        target.view(),
-        dictionary_rank,
-    );
-    assert!(
-        derived_bar > SAE_FIT_DATA_COLLAPSE_EV_FLOOR,
-        "data-derived bar {derived_bar} must exceed the old absolute floor \
-         {SAE_FIT_DATA_COLLAPSE_EV_FLOOR}, or the test cannot distinguish them"
-    );
 
-    // fitted = alpha * target ⇒ EV = 1 - (1 - alpha)^2 (column means are 0). Pick
-    // alpha so EV ~= 0.30, strictly inside (0.10, 0.5).
-    let alpha = 1.0 - (0.70_f64).sqrt();
-    let fitted = &target * alpha;
+    // ── CONVERSE: a present-decoder, MISALIGNED fit is NOT a collapse ──
+    // A fit whose decoders carry FULL output energy but point partly the wrong way
+    // reconstructs poorly (low / negative EV) yet is trivially recoverable by the
+    // optimizer (rotate the decoders) — it is NOT a structural collapse. Build it
+    // by negating two of the four rows of the unit-circle `target`: the output
+    // energy is preserved exactly (`out_ratio = 1`, well above the null floor),
+    // while the misalignment pushes EV below the floor (here EV = −1). Column means
+    // are 0, so all energies are taken about 0.
+    let fitted_present = array![[1.0, 0.0], [0.0, 1.0], [1.0, 0.0], [0.0, 1.0]];
+    let sst: f64 = target.iter().map(|t| t * t).sum();
     let ssr: f64 = target
         .iter()
-        .zip(fitted.iter())
+        .zip(fitted_present.iter())
         .map(|(t, f)| (t - f) * (t - f))
         .sum();
-    let sst: f64 = target.iter().map(|t| t * t).sum();
-    let ev = 1.0 - ssr / sst;
+    let ev_present = 1.0 - ssr / sst;
+    let out_energy_present = fitted_present.iter().map(|f| f * f).sum::<f64>() / sst;
     assert!(
-        ev > SAE_FIT_DATA_COLLAPSE_EV_FLOOR && ev < derived_bar,
-        "fit EV {ev} must sit STRICTLY between the old floor \
-         {SAE_FIT_DATA_COLLAPSE_EV_FLOOR} and the derived bar {derived_bar}"
+        ev_present <= floor && out_energy_present > floor,
+        "fixture invariants: EV {ev_present} must be ≤ the null floor {floor} while output \
+         energy {out_energy_present} must exceed it, so only the output-co-vanished half fails"
     );
-
-    let assignments = Array2::<f64>::ones((n, 1));
-    let recorded = term
-        .record_fit_data_collapse_if_needed(target.view(), fitted.view(), assignments.view(), 3)
+    let recorded_present = term
+        .record_fit_data_collapse_if_needed(
+            target.view(),
+            fitted_present.view(),
+            assignments.view(),
+            3,
+        )
         .unwrap();
-
-    // Pre-#1522 (absolute 0.10 floor): EV 0.30 > 0.10 ⇒ NOT recorded ⇒ this fails.
-    // Post-#1522 (derived 0.5 bar): EV 0.30 < 0.5 ⇒ recorded as a structural collapse.
     assert!(
-        recorded,
-        "fit EV {ev} is below the data-derived bar {derived_bar} (half the rank-K \
-         PCA ceiling) and must be recorded as a collapse; the guard is still keying \
-         on the absolute floor {SAE_FIT_DATA_COLLAPSE_EV_FLOOR} instead of the data"
+        !recorded_present,
+        "a present-decoder fit (EV {ev_present}, output energy {out_energy_present} of the \
+         variance) is merely uncompetitive, NOT a structural collapse — the retired \
+         `0.5 × PCA ceiling` bar's false-positive must be gone"
     );
-    // The recorded ledger event must report the DATA-DERIVED bar, not the constant.
+    assert!(
+        !term
+            .collapse_events()
+            .iter()
+            .any(|e| e.action == CollapseAction::Terminal),
+        "no terminal collapse event may be recorded for a present-decoder fit"
+    );
+
+    // ── DIRECT: a genuinely vanished dictionary at the same K IS a collapse ──
+    let fitted_vanished = Array2::<f64>::zeros(target.dim()); // ≈ column mean (means are 0)
+    let recorded_vanished = term
+        .record_fit_data_collapse_if_needed(
+            target.view(),
+            fitted_vanished.view(),
+            assignments.view(),
+            7,
+        )
+        .unwrap();
+    assert!(
+        recorded_vanished,
+        "a vanished dictionary (fitted ≈ column mean, EV ≈ 0 AND output energy ≈ 0) is a \
+         genuine #853/#976 co-collapse and must be recorded"
+    );
     let terminal = term
         .collapse_events()
         .iter()
         .find(|e| e.action == CollapseAction::Terminal)
-        .expect("a terminal collapse event must be recorded");
+        .expect("a terminal collapse event must be recorded for the vanished dictionary");
+    // The recorded ledger event reports the reconstruction EV (≈ 0) in its
+    // `max_active_mass` slot; it is at or below the null floor by construction.
     assert!(
-        (terminal.floor - derived_bar).abs() < 1e-9,
-        "ledger floor {} must be the data-derived bar {derived_bar}, not the absolute \
-         {SAE_FIT_DATA_COLLAPSE_EV_FLOOR}",
-        terminal.floor
+        terminal.max_active_mass <= floor,
+        "ledger EV {} for the vanished dictionary must be at or below the null floor {floor}",
+        terminal.max_active_mass
     );
 }
 

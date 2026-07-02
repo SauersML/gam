@@ -58,14 +58,15 @@ pub(crate) const SAE_ATOM_DECODER_NORM_COLLAPSE_RATIO: f64 = 1.0e-3;
 /// recomputed residual, so successive attempts explore genuinely different
 /// basins. A single such reseed empirically cannot always break a K≥3 three-way
 /// basin (identical (K, seed) flips EV≈0.40 ↔ 0.00), so this arm gets a small
-/// bounded budget of independent multi-starts. It is consumed ONLY when the
-/// whole dictionary's reconstruction EV is at or below the data-derived collapse
-/// bar (`collapse_ev_bar` = `SAE_COLLAPSE_PCA_EV_FRACTION` × the rank-K PCA
-/// ceiling, i.e. less than half the variance any rank-K linear dictionary could
-/// reach) — the old absolute magic EV floor was REPLACED by that data-derived
-/// bar, not deleted. A no-op for any healthy fit (real OLMo K=1 ~0.22, K=2
-/// ~0.40, both well above the bar); on the rough patches of a hard K≥3 fit a
-/// transient sub-bar EV can still consume the budget before the fit recovers.
+/// bounded budget of independent multi-starts. S1 (guard surgery): it is consumed
+/// ONLY at iteration > 0 when the whole dictionary's reconstruction EV is at or
+/// below the SIGNAL-FREE null floor (`absolute_degeneracy_ev_floor` = `q / n`, the
+/// classical null-`R²`) AND the reconstruction OUTPUT has co-vanished (output
+/// energy at or below the same null level). Both hold only in a genuine #853/#976
+/// co-collapse; a healthy fit (real OLMo K=1 ~0.22, K=2 ~0.40) and a
+/// merely-uncompetitive present-decoder fit keep output energy and never consume
+/// the budget — the former `0.5 × dense PCA ceiling` bar that tripped on those has
+/// been retired.
 pub(crate) const SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET: usize = 3;
 
 /// Machine-precision support cutoff for the smooth JumpReLU assignment prior,

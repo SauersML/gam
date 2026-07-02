@@ -48,9 +48,15 @@ pub(crate) fn reconstruction_explained_variance(
 /// fraction of centered total variance captured by its top-`q` principal
 /// directions (the Eckart-Young optimum at rank `q`). This is the BEST
 /// reconstruction EV any rank-`q` linear dictionary can achieve on this data, so
-/// it is the natural data-derived scale for a collapse acceptance bar (#1522):
-/// `0.5 × pca_ev_ceiling(target, K)` tracks the data's achievable EV instead of a
-/// corpus-tuned magic constant.
+/// it is the natural data-derived scale for the arrival / curved-quality health
+/// checks that adjudicate a CONVERGED fit against the linear optimum.
+///
+/// S1 (guard surgery) — this ceiling is NO LONGER the collapse-DETECTION bar: a
+/// `k_active`-sparse fit cannot in general reach the DENSE rank-`q` ceiling on
+/// real (non-sparse) activations, so keying collapse detection on a fraction of it
+/// flagged healthy-but-uncompetitive fits as collapses. Detection now keys on the
+/// signal-free null floor ([`absolute_degeneracy_ev_floor`]); this dense ceiling
+/// remains the achievable reference for post-convergence quality adjudication.
 ///
 /// Returns a value in `[0, 1]` on a finite target; `f64::NAN` when the SVD fails
 /// or the centered target has no variance (an all-constant target), so callers
@@ -80,32 +86,54 @@ pub(crate) fn pca_ev_ceiling(target: ArrayView2<'_, f64>, q: usize) -> f64 {
     captured / sst
 }
 
-/// #1522 — the data-derived co-collapse acceptance bar: a fit whose
-/// reconstruction EV sits at or below this value on `target` is a structural
-/// collapse. It is [`SAE_COLLAPSE_PCA_EV_FRACTION`] times the rank-`q` PCA /
-/// Eckart-Young EV ceiling (`pca_ev_ceiling`), i.e. a fixed fraction of the BEST
-/// EV any rank-`q` linear dictionary could reach on THIS centered target, so the
-/// bar tracks what the data actually admits rather than a corpus-tuned constant.
-/// When the ceiling is un-computable (constant target / SVD failure →
-/// non-finite) it falls back to the absolute [`SAE_FIT_DATA_COLLAPSE_EV_FLOOR`]
-/// so the guard always keys on a finite number. This is the SINGLE source every
-/// collapse-guard site shares, so the fitted-data acceptance check and the
-/// co-collapse reseed measure degeneracy against one and the same threshold.
-pub(crate) fn collapse_ev_bar(target: ArrayView2<'_, f64>, dictionary_rank: usize) -> f64 {
-    let derived = SAE_COLLAPSE_PCA_EV_FRACTION * pca_ev_ceiling(target, dictionary_rank);
-    if derived.is_finite() {
-        derived
-    } else {
-        SAE_FIT_DATA_COLLAPSE_EV_FLOOR
+/// S1 (guard surgery) — the ABSOLUTE-DEGENERACY explained-variance floor: a fit
+/// whose reconstruction EV sits at or below this value explains no more of the
+/// centered target than a SIGNAL-FREE dictionary of the same reachable rank would
+/// by finite-sample chance, so it is a structural collapse rather than a
+/// merely-uncompetitive fit. It is the SINGLE source both collapse-detection sites
+/// share (the fitted-data verdict feeding the outer wall, and the co-collapse
+/// reseed arm), so both measure degeneracy against one and the same threshold.
+///
+/// The floor is the classical null coefficient of determination `q / n`
+/// (`#free-reconstruction-directions / #observations`): fitting `q =
+/// dictionary_rank` arbitrary linear directions to `n` centered rows of a
+/// signal-free target captures, IN EXPECTATION, a fraction `q / n` of the variance
+/// (the textbook null-`R²` of a `q`-regressor / `n`-observation least squares). It
+/// is therefore a SAMPLING NOISE-FLOOR bound — the EV a collapsed dictionary
+/// reaches purely from finite-sample fitting noise — carrying no magnitude fit to
+/// any corpus and shrinking toward 0 as `n` grows, exactly as the null fitting
+/// noise does. `dictionary_rank` is the dictionary's GEOMETRICALLY REACHABLE rank
+/// (`reachable_dictionary_rank` = `Σ_k rank(Φ_k)`, read from the chart designs
+/// alone so a co-collapsed decoder still reports full reach), capped at
+/// `min(n, p) ≤ n`, so the floor stays in `[0, 1]`.
+///
+/// This REPLACES the former `0.5 × rank-q PCA/Eckart-Young EV ceiling` bar, which
+/// compared a `k_active`-SPARSE fit against a DENSE rank-`q` linear ceiling and so
+/// sat ABOVE the honest sparse optimum on real (non-sparse) activations, flagging
+/// healthy-but-below-ceiling fits as collapses (the K≥2-real-data false positive
+/// that opened every fit with a spurious "co-collapse"). A degeneracy detector may
+/// catch only states from which descent cannot recover — EV at the null floor AND
+/// the decoder output co-vanished (the original #853/#976 meaning) — never a
+/// merely-uncompetitive state, which is the optimizer's job mid-fit and the
+/// evidence framework's job after convergence. `f64::NAN` when there are no rows
+/// (`n == 0`), which the callers' `ev <= floor` comparison treats as "no verdict".
+pub(crate) fn absolute_degeneracy_ev_floor(
+    target: ArrayView2<'_, f64>,
+    dictionary_rank: usize,
+) -> f64 {
+    let n = target.nrows();
+    if n == 0 {
+        return f64::NAN;
     }
+    dictionary_rank as f64 / n as f64
 }
 
 /// #1610 — the GEOMETRICALLY REACHABLE linear rank of a dictionary, used as the
-/// rank `q` at which the co-collapse bar evaluates its PCA / Eckart-Young EV
-/// ceiling (`collapse_ev_bar(target, reachable_dictionary_rank(...))`).
+/// rank `q` in the signal-free null degeneracy floor
+/// (`absolute_degeneracy_ev_floor(target, reachable_dictionary_rank(...))` = `q / n`).
 ///
-/// The collapse bar compares a fit against the best EV a rank-`q` LINEAR
-/// dictionary could reach. The previous `q = Σ_k basis_size_k` (nominal
+/// The null floor scales with the number of directions the dictionary can reach.
+/// The previous `q = Σ_k basis_size_k` (nominal
 /// coefficient count) is biased HIGH for a NONLINEAR dictionary: a curved
 /// `latent_dim = d` atom decoded through a smooth chart does not linearly span
 /// all `basis_size_k` of its coefficient directions in the output — its decoded
@@ -465,9 +493,18 @@ impl SaeManifoldOuterObjective {
                     reconstruction_explained_variance(target.view(), settled_fit.view()),
                 )
             {
+                // S1 (guard surgery) — keep the BEST-of-candidates by finiteness
+                // and strict EV improvement alone; do NOT additionally gate the
+                // seed on clearing an absolute `SAE_FIT_DATA_COLLAPSE_EV_FLOOR`.
+                // The old floor made a genuinely-better seed unrecoverable whenever
+                // both candidates sat below it — unreachable for cold PC-pair seeds
+                // on real activations, the proximate cause of #1782's "no candidate
+                // seeds passed outer startup validation". A multi-start must return
+                // the best finite basin it visited, whatever its absolute EV; a
+                // truly degenerate seed is caught downstream by the null-floor
+                // detector, not by refusing to keep the better of two candidates.
                 seed_won = seed_ev.is_finite()
                     && settled_ev.is_finite()
-                    && seed_ev >= SAE_FIT_DATA_COLLAPSE_EV_FLOOR
                     && settled_ev + SAE_FINAL_EV_DEGRADATION_TOL < seed_ev;
             }
         }
@@ -484,7 +521,7 @@ impl SaeManifoldOuterObjective {
         ) && let (Some(seed_ev), Some(returned_ev)) = (
             reconstruction_explained_variance(target.view(), seed_fit.view()),
             reconstruction_explained_variance(target.view(), returned_fit.view()),
-        ) && seed_ev >= SAE_FIT_DATA_COLLAPSE_EV_FLOOR
+        ) && seed_ev.is_finite()
             && returned_ev + SAE_FINAL_EV_DEGRADATION_TOL < seed_ev
             && let Ok(seed_loss) = pristine_seed_term.loss(target.view(), &pristine_seed_rho)
         {

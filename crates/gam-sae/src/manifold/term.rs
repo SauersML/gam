@@ -134,47 +134,19 @@ impl SaeBetaPenaltyAssembly {
     }
 }
 
-/// ABSOLUTE FALLBACK explained-variance floor for the reconstruction-collapse
-/// guard (#1023), used ONLY when the data-derived bar is un-computable.
+/// ABSOLUTE "worse than a constant predictor" explained-variance floor (#1023),
+/// used by the curved-ARRIVAL quality gate and the inner-fit incumbent-restore
+/// gate as the point below which a CONVERGED fit is degenerate whatever the data's
+/// achievable ceiling. `0.10` is a deliberately conservative "must explain at least
+/// a tenth of the variance or it is structurally degenerate" floor for those
+/// post-convergence quality checks; it is NOT a tuned operating point.
 ///
-/// #1522 retired this as the primary collapse threshold: the live bar is
-/// [`SAE_COLLAPSE_PCA_EV_FRACTION`]`·pca_ev_ceiling(target, K)` (see
-/// `collapse_ev_bar`), which tracks the data's own achievable EV instead of a
-/// corpus-tuned constant. This number is reached only on a degenerate target
-/// (constant columns / SVD failure → non-finite ceiling), where any positive
-/// floor is arbitrary; `0.10` is a deliberately conservative "the fitted matrix
-/// must explain at least a tenth of the variance or it is a structural collapse"
-/// fallback so the guard still keys on *something* finite in that corner. It is
-/// NOT a tuned operating point — a fit on real data is judged against the PCA
-/// ceiling, never this constant.
+/// S1 (guard surgery) — this is NO LONGER used by the collapse DETECTOR: the
+/// co-collapse verdict and reseed arm now key on the signal-free null floor
+/// ([`super::outer_objective::absolute_degeneracy_ev_floor`] = `q / n`), not on any
+/// fraction of a dense PCA ceiling. This constant survives only where a fixed
+/// "worse than the mean" reference is genuinely wanted (arrival / incumbent gates).
 pub(crate) const SAE_FIT_DATA_COLLAPSE_EV_FLOOR: f64 = 0.10;
-
-/// #1522/#1610 — fraction of the REACHABLE-rank PCA / Eckart-Young EV ceiling
-/// below which a fit counts as a structural co-collapse. The collapse bar is
-/// `SAE_COLLAPSE_PCA_EV_FRACTION · pca_ev_ceiling(target, dictionary_rank)`,
-/// where `dictionary_rank` is the dictionary's GEOMETRICALLY REACHABLE rank
-/// ([`super::outer_objective::reachable_dictionary_rank`] = `Σ_k rank(Φ_k)`),
-/// not the nominal coefficient count `Σ_k basis_size_k`. The ceiling is the BEST
-/// EV any rank-`dictionary_rank` LINEAR dictionary could reach on THIS centered
-/// target, so the bar is data-derived (scales with what the data actually
-/// admits) rather than an absolute corpus-tuned number.
-///
-/// #1610 — the previous rank `Σ_k basis_size_k` was biased HIGH for a NONLINEAR
-/// dictionary (the owner's audit table: "nonlinear dict vs linear PCA ceiling
-/// (biased high)"): a curved `latent_dim = d` atom decoded through a smooth
-/// chart spans only `rank(Φ_k) ≤ basis_size_k` linear output directions, so
-/// summing the nominal coefficient counts over-stated the linearly-achievable
-/// ceiling the fraction is taken against. Keying the rank on each chart's
-/// REALIZED image rank `rank(Φ_k)` (read from the chart design alone, so a
-/// co-collapsed decoder still reports full geometric reach) calibrates the bar
-/// against what the dictionary geometry can actually reach.
-///
-/// `0.5` encodes the decision "a fit that explains less than HALF of the variance
-/// a reachable-rank dictionary could has structurally collapsed, whatever its
-/// absolute EV" — a dimensionless ratio with that single, explicit meaning, not
-/// a magnitude tuned to any one corpus. It is the sole source for the ratio used
-/// at every collapse-guard site.
-pub(crate) const SAE_COLLAPSE_PCA_EV_FRACTION: f64 = 0.5;
 
 /// #1189/#1217/#1610 — the finite BFGS INFEASIBILITY WALL substituted for a
 /// non-finite / collapsed REML criterion so the outer line search REJECTS the

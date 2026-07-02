@@ -207,6 +207,9 @@ mod tests_isometry_exact_hvp_majorizer_457;
 mod tests_collapse_bar_reachable_rank_1610;
 
 #[cfg(test)]
+mod tests_s1_iteration_zero_guard;
+
+#[cfg(test)]
 mod sae_contract_probe_tests;
 
 #[cfg(test)]
