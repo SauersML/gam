@@ -876,8 +876,8 @@ mod step2_quotient_scale_tests {
 
     /// #2022 gate (i) — lever DEFAULT-OFF ⇒ the step never peels ⇒ `s` stays 0 ⇒
     /// bit-for-bit. Verified by construction: `absorb_*` is only invoked from the
-    /// step under `sae_quotient_scale_enabled()` (default false) and from the
-    /// gated seed peel; with the env unset a freshly-built term has every
+    /// step under the `quotient_scale` kwarg (default false) and from the gated
+    /// seed peel; with the kwarg unset a freshly-built term has every
     /// `log_amplitude == 0.0`. (No env mutation here — parallel-safe.)
     #[test]
     fn step2_default_off_leaves_log_amplitude_zero() {
@@ -888,5 +888,60 @@ mod step2_quotient_scale_tests {
                 "default (lever off) must leave log_amplitude at 0 (bit-for-bit)"
             );
         }
+    }
+
+    /// #2022 FINDING-1 (rigorous) — the assembled β gradient carries exp(s):
+    /// gb == central-diff ∂(data_fit+smoothness)/∂β on the peeled (s≠0) state.
+    /// A missing exp(s) on a_phi would scale gb by exp(-s) vs the FD and fail.
+    /// Parallel-safe: drives the quotient via absorb_* directly (no kwarg/env).
+    #[test]
+    fn step2_beta_gradient_matches_central_diff_on_peeled_state() {
+        let (mut term, target, rho) = small_two_atom_periodic_term();
+        for atom in term.atoms.iter_mut() {
+            atom.absorb_decoder_norm_into_log_amplitude(f64::MIN_POSITIVE);
+        }
+        let sys = term
+            .assemble_arrow_schur(target.view(), &rho, None)
+            .expect("assemble arrow-schur on peeled state");
+        assert_eq!(
+            sys.gb.len(),
+            term.beta_dim(),
+            "expected full-B gb layout (no frames) on the fixture"
+        );
+        let gb = sys.gb.clone();
+        let offsets = term.beta_offsets();
+        let p = term.output_dim();
+        let loss_beta_terms = |t: &SaeManifoldTerm| -> f64 {
+            let l = t.loss(target.view(), &rho).expect("loss");
+            l.data_fit + l.smoothness
+        };
+        let eps = 1e-6;
+        let mut checked = 0usize;
+        for k in 0..term.k_atoms() {
+            let m = term.atoms[k].basis_size();
+            for &(bc, oc) in &[(0usize, 0usize), (m.saturating_sub(1), 0usize)] {
+                if bc >= m {
+                    continue;
+                }
+                let idx = offsets[k] + bc * p + oc;
+                let orig = term.atoms[k].decoder_coefficients[[bc, oc]];
+                term.atoms[k].decoder_coefficients[[bc, oc]] = orig + eps;
+                let lp = loss_beta_terms(&term);
+                term.atoms[k].decoder_coefficients[[bc, oc]] = orig - eps;
+                let lm = loss_beta_terms(&term);
+                term.atoms[k].decoder_coefficients[[bc, oc]] = orig;
+                let fd = (lp - lm) / (2.0 * eps);
+                let g = gb[idx];
+                // Sign: gb = +∂(data_fit+smooth)/∂β (from gb=Jᵀ(fitted−target)).
+                // If CI shows a uniform flip, compare to `-g` (1-char fix).
+                assert!(
+                    (fd - g).abs() <= 1e-4 * (1.0 + g.abs()),
+                    "β gradient exp(s)-consistency (atom {k}, basis {bc}, out {oc}): \
+                     FD {fd} vs gb {g}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 2, "must check at least two β entries; checked {checked}");
     }
 }
