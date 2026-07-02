@@ -1,7 +1,8 @@
 use gam::families::cubic_cell_kernel::{
-    CellMomentScratch, DenestedCubicCell, affine_anchor_moment_vector, evaluate_cell_moments,
-    evaluate_cell_moments_with_scratch, reduce_quartic_moments, reduce_sextic_moments,
-    reset_tail_cell_moment_cache, set_tail_cell_moment_cache_enabled, tail_cell_moment_cache_stats,
+    CellMomentScratch, DenestedCubicCell, LocalSpanCubic, affine_anchor_moment_vector,
+    evaluate_cell_moments, evaluate_cell_moments_with_scratch, global_cubic_from_local,
+    reduce_quartic_moments, reduce_sextic_moments, reset_tail_cell_moment_cache,
+    set_tail_cell_moment_cache_enabled, tail_cell_moment_cache_stats,
 };
 use std::sync::{Arc, Barrier};
 
@@ -150,13 +151,36 @@ fn bug_cubic_cell_boundary_value_is_discontinuous_between_neighbors() {
     let boundary = left.right;
     let eta_boundary = left.eta(boundary);
     let slope_boundary = left.c1 + 2.0 * left.c2 * boundary + 3.0 * left.c3 * boundary * boundary;
-    let right = DenestedCubicCell {
+    // The right cell is specified with a cell-LOCAL Taylor parameterization
+    // anchored at the shared boundary: its local `c0`/`c1` are the left cell's
+    // value and slope there, plus a chosen local curvature. But
+    // `DenestedCubicCell::eta` evaluates its coefficients as a polynomial in
+    // GLOBAL `z` — exactly the convention the production kernel uses when it
+    // builds a cell's coefficients via `global_cubic_from_local` /
+    // `denested_cell_coefficients`. So the local coefficients must be converted
+    // into the global cubic basis before they are stored in the cell; assigning
+    // the local Taylor coefficients directly (the original mis-specification)
+    // would make the cell represent a DIFFERENT polynomial than the intended
+    // local expansion, manufacturing a spurious boundary discontinuity that the
+    // production kernel — which shares one global η(z) across neighbors — never
+    // exhibits. Converting through the kernel's own path makes this a genuine
+    // C0-continuity check.
+    let right_local = LocalSpanCubic {
         left: boundary,
         right: 1.4,
         c0: eta_boundary,
         c1: slope_boundary,
         c2: 0.2,
         c3: -0.05,
+    };
+    let (rc0, rc1, rc2, rc3) = global_cubic_from_local(right_local);
+    let right = DenestedCubicCell {
+        left: boundary,
+        right: 1.4,
+        c0: rc0,
+        c1: rc1,
+        c2: rc2,
+        c3: rc3,
     };
     let eps = 1e-12;
     let l = left.eta(boundary - eps);
