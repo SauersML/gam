@@ -38,7 +38,7 @@ fn main() {
         return;
     }
 
-    // HARD ban (always fatal): Claude may not edit build.rs alone. If the most
+    // Hard ban (always fatal): Claude may not edit build.rs alone. If the most
     // recent git author of build.rs is Claude, the change must be a co-authored
     // human collaboration. The checks in this file are not to be weakened or
     // removed under any circumstances; a human maintainer must approve and commit
