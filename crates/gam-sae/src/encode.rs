@@ -3035,22 +3035,23 @@ pub(crate) const SHAPE_BAND_MAX_POINTS: usize = 512;
 /// (circle) axes — period 1 to match `chart_center_grid`'s `[0,1)` torus tiling
 /// — and plain difference on line axes. Used to place + size data-driven charts.
 pub(crate) fn coord_dist_sq(atom: &SaeManifoldAtom, a: ArrayView1<'_, f64>, b: ArrayView1<'_, f64>) -> f64 {
-    use crate::manifold::SaeAtomBasisKind::*;
-    let periodic_axis = |axis: usize| -> bool {
-        match &atom.basis_kind {
-            Periodic | Torus | Sphere => true,
-            // Cylinder S¹×ℝ: only axis 0 is the circle.
-            Cylinder => axis == 0,
-            Linear | Duchon | EuclideanPatch | Poincare | Precomputed(_) => false,
-        }
-    };
+    // Per-axis period comes from the ONE canonical source `latent_axis_period` —
+    // the SAME convention the certified-encode `in_chart` guard uses (via
+    // `latent_coordinate_distance`): period-1 fraction axes for periodic/torus and
+    // the cylinder angle, period-2π on the sphere LONGITUDE (axis 1), and
+    // NON-periodic otherwise — including the sphere LATITUDE (axis 0), which ranges
+    // over [−π/2, π/2] and must NOT wrap. A former local `periodic_axis` closure
+    // wrapped BOTH sphere axes at period 1, so two genuinely-far radian longitudes
+    // (e.g. 0 and 3 rad) collapsed to distance 0 — corrupting the farthest-point
+    // placement AND the nearest-neighbour radii in `data_driven_chart_centers` for
+    // sphere atoms, and disagreeing with the metric the encode's `in_chart`
+    // soundness guard enforces. Delegating keeps the two metrics identical.
     let mut acc = 0.0;
-    for axis in 0..a.len() {
+    for axis in 0..a.len().min(b.len()) {
         let mut d = (a[axis] - b[axis]).abs();
-        if periodic_axis(axis) {
-            // Wrap onto the circle of unit period.
-            d -= d.floor(); // fractional part in [0,1)
-            d = d.min(1.0 - d);
+        if let Some(period) = latent_axis_period(atom, axis) {
+            let wrapped = d.rem_euclid(period);
+            d = wrapped.min(period - wrapped);
         }
         acc += d * d;
     }
@@ -3256,7 +3257,14 @@ pub(crate) fn chart_nominal_radius(atom: &SaeManifoldAtom, resolution: usize) ->
     use crate::manifold::SaeAtomBasisKind::*;
     match &atom.basis_kind {
         Periodic | Torus => 0.5 / (capped_per_axis(atom.latent_dim, resolution) as f64),
-        Sphere => std::f64::consts::PI / (resolution.max(2) as f64),
+        // Must use the SAME capped per-axis count `min(resolution, 22)` that
+        // `sphere_latlon_grid` lays the centers on: the coarsest tiling step is
+        // the longitude half-spacing `π/r` with `r = min(resolution, 22)`. Deriving
+        // the radius from the RAW resolution makes it smaller than the grid spacing
+        // once `resolution > 22`, leaving gaps between charts so rows in the gaps
+        // spuriously route to the exact fallback (the exact hazard `capped_per_axis`
+        // documents for the regular grid).
+        Sphere => std::f64::consts::PI / (resolution.max(2).min(22) as f64),
         // Cylinder charts tile two heterogeneous axes (a `[0,1)` periodic step
         // and a unit-box line step); the chart radius is a single scalar, so we
         // take the tighter (periodic) step `0.5/res` to keep every chart valid
@@ -3445,5 +3453,67 @@ mod encode_fix_tests {
         assert!(!warmup_progress_sufficient(f64::NAN, 0.9));
         assert!(!warmup_progress_sufficient(f64::INFINITY, 0.9));
         assert!(!warmup_progress_sufficient(0.5, f64::NAN));
+    }
+
+    /// BUG (sphere data-driven placement): `coord_dist_sq` must measure sphere
+    /// coordinates in RADIANS via the canonical `latent_axis_period` — longitude
+    /// (axis 1) wraps at 2π, latitude (axis 0) does NOT wrap — not at unit period
+    /// on both axes. The old period-1 wrap collapsed genuinely-far longitudes to
+    /// distance 0, corrupting `data_driven_chart_centers` for sphere atoms.
+    #[test]
+    fn coord_dist_sq_sphere_uses_radian_metric_not_unit_period() {
+        let atom = tiny_atom(SaeAtomBasisKind::Sphere, 2);
+        // Longitude differs by 3.0 rad: circle distance min(3, 2π−3)=3
+        // (2π−3 ≈ 3.283) ⇒ dist² = 9. The old period-1 wrap read 3 mod 1 = 0.
+        let a = Array1::from(vec![0.0f64, 0.0]);
+        let b = Array1::from(vec![0.0f64, 3.0]);
+        let dsq = coord_dist_sq(&atom, a.view(), b.view());
+        assert!(
+            (dsq - 9.0).abs() < 1e-9,
+            "sphere longitude dist² must be 3²=9 (2π radian period), got {dsq}"
+        );
+        // Latitude (axis 0) must NOT wrap: 1.2 rad apart ⇒ dist² = 1.44.
+        let c = Array1::from(vec![0.0f64, 0.0]);
+        let e = Array1::from(vec![1.2f64, 0.0]);
+        let dsq_lat = coord_dist_sq(&atom, c.view(), e.view());
+        assert!(
+            (dsq_lat - 1.44).abs() < 1e-9,
+            "sphere latitude must not wrap; 1.2²=1.44, got {dsq_lat}"
+        );
+        // Must agree with the certified-encode metric (single source of truth).
+        let dc = latent_coordinate_distance(&atom, a.view(), b.view());
+        assert!(
+            (dc * dc - dsq).abs() < 1e-9,
+            "coord_dist_sq must equal latent_coordinate_distance² ({} vs {dsq})",
+            dc * dc
+        );
+    }
+
+    /// No-regression: periodic / torus axes still wrap at unit period.
+    #[test]
+    fn coord_dist_sq_torus_still_wraps_unit_period() {
+        let atom = tiny_atom(SaeAtomBasisKind::Torus, 1);
+        let a = Array1::from(vec![0.02f64]);
+        let b = Array1::from(vec![0.98f64]);
+        // Wrapped circle distance min(0.96, 0.04) = 0.04 ⇒ dist² = 0.0016.
+        let dsq = coord_dist_sq(&atom, a.view(), b.view());
+        assert!((dsq - 0.0016).abs() < 1e-12, "torus unit-period wrap; got {dsq}");
+    }
+
+    /// BUG (sphere chart tiling): `chart_nominal_radius` for the sphere must use
+    /// the SAME capped per-axis count `min(resolution, 22)` as `sphere_latlon_grid`,
+    /// so the radius covers the (capped) longitude half-spacing π/22 and the charts
+    /// tile without gaps for resolution > 22 (raw π/40 would leave gaps).
+    #[test]
+    fn chart_nominal_radius_sphere_covers_capped_grid_spacing() {
+        let atom = tiny_atom(SaeAtomBasisKind::Sphere, 2);
+        let lon_half_spacing = std::f64::consts::PI / 22.0; // r capped at 22
+        let r = chart_nominal_radius(&atom, 40);
+        assert!(
+            r >= lon_half_spacing - 1e-12,
+            "sphere radius {r} must cover the capped lon half-spacing {lon_half_spacing} \
+             (no gaps for resolution>22); raw π/40={} would gap",
+            std::f64::consts::PI / 40.0
+        );
     }
 }
