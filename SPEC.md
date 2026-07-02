@@ -1,7 +1,7 @@
 - Autodiff is never used outside of tests as hand-derived derivatives enable performance optimizations. Exception: not-our-code not-our-problem, e.g., obviously autodiff will be used internally by PyTorch. Exception: exact forward-mode AD that is verified to match or surpass hand-derived speed.
 - Finite differences is never used outside of tests. Only exception: differentiating observed data, where it is provably impossible to use a function.
 - Posterior mean must always be the default (never MAP).
-- Analytic, closed-forms should be supported in general for all model types.
+- Analytic closed-forms should be supported in general for all model types.
 - Penalties must always be on the final function itself, never on the model coefficients. Exception: when it can be proven that penalizing model coefficients is precisely equivalent to the function value approach.
 - Fitting and inference must be fast on all scales of data, but especially large-scale data where it matters the most (with seamless transitions between strategies).
 - Never vendor external software.
