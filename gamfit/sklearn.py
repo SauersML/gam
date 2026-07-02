@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
@@ -10,7 +11,7 @@ from sklearn.utils.validation import check_is_fitted
 from ._binding import rust_module
 from ._api import fit as fit_model
 from ._model import Model
-from ._tables import attach_target, table_columns
+from ._tables import attach_target, detect_table_kind, table_columns
 
 __all__ = ["GAMClassifier", "GAMRegressor"]
 
@@ -297,6 +298,9 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
         the encoded column directly from the formula.
         """
         if not isinstance(y, str) and y is not None:
+            # Array-style `y`: the target is external to the serving frame, so
+            # inference never needs to strip a response column from `X`.
+            self._encoded_target_name_ = None
             return X, encoded
         columns, _ = table_columns(X)
         if isinstance(y, str):
@@ -309,6 +313,14 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
             _, _, target_name = rust.sklearn_fit_metadata(
                 list(columns), self.formula, None, False,
             )
+        # Cache the resolved response-column name so inference can drop it from
+        # the caller's serving frame. Fitting label-encodes this column to
+        # {0,1} and records that {0,1} schema in the Rust model; a serving frame
+        # that still carries the ORIGINAL (string / {1,2} / {-1,+1}) labels
+        # would be validated against that {0,1} schema and rejected. The column
+        # is never needed to predict, so we strip it (see
+        # `_strip_response_column`).
+        self._encoded_target_name_ = target_name
         new_columns: dict[str, list[Any]] = {
             name: list(values) for name, values in columns.items()
         }
@@ -335,10 +347,50 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
         (100, 2)
         """
         check_is_fitted(self, "model_")
-        predicted = self.model_.predict(X, return_type="dict")
+        serving = self._strip_response_column(X)
+        predicted = self.model_.predict(serving, return_type="dict")
         positive = np.clip(np.asarray(predicted["mean"], dtype=float), 0.0, 1.0)
         negative = 1.0 - positive
         return np.column_stack([negative, positive])
+
+    def _strip_response_column(self, X: Any) -> Any:
+        """Return ``X`` with the fit-time response column removed if present.
+
+        The column-name (``y="col"``) and ``y=None`` fit paths label-encode the
+        response to ``{0, 1}`` inside the fitted table, so the Rust model's
+        schema records that column as binary ``{0, 1}``. The response is never
+        needed to predict, yet callers naturally re-serve the SAME frame (which
+        still holds the ORIGINAL string / ``{1, 2}`` / ``{-1, +1}`` labels);
+        validated against the ``{0, 1}`` schema those labels are rejected with a
+        ``GamError``. Dropping the column keeps inference consistent with
+        fitting. The carrier kind is preserved so downstream dtype-based
+        categorical inference is unchanged; only the response column goes.
+
+        A no-op when no response column was cached (array-``y`` fits) or when
+        the column is absent from the serving frame (an ``X`` that never carried
+        the response), so the already-working ``{0, 1}`` and array-``y`` paths
+        are untouched.
+        """
+        name = getattr(self, "_encoded_target_name_", None)
+        if name is None:
+            return X
+        kind = detect_table_kind(X)
+        if kind == "pandas":
+            matches = [c for c in X.columns if str(c) == name]
+            return X.drop(columns=matches) if matches else X
+        if kind == "polars":
+            matches = [c for c in X.columns if str(c) == name]
+            return X.drop(matches) if matches else X
+        if kind == "pyarrow":
+            matches = [c for c in X.column_names if str(c) == name]
+            return X.drop_columns(matches) if matches else X
+        if isinstance(X, Mapping):
+            if any(str(key) == name for key in X):
+                return {
+                    key: value for key, value in X.items() if str(key) != name
+                }
+            return X
+        return X
 
     def predict(self, X: Any) -> np.ndarray:
         """Predict the highest-probability class label drawn from ``classes_``.
