@@ -1806,9 +1806,10 @@ fn encode_grad_hess_and_beta_eta_match_finite_differences() {
         0.5 * r.dot(&r)
     };
 
-    // Analytic g, H (ridge = 0 so H is exactly ∂²f/∂t²).
+    // Analytic g, H — `encode_grad_hess` returns the TRUE Hessian ∂²f/∂t² (no
+    // Levenberg ridge is added to the certified field; F2).
     let t_view = ndarray::Array1::from_vec(vec![t0]);
-    let (g, h) = encode_grad_hess(&atom, &eval, t_view.view(), x.view(), amplitude, 0.0)
+    let (g, h) = encode_grad_hess(&atom, &eval, t_view.view(), x.view(), amplitude)
         .expect("encode_grad_hess runs")
         .expect("second jet present ⇒ Some");
 

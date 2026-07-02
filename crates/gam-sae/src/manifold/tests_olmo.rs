@@ -647,7 +647,7 @@ pub(crate) fn fast_encode_matches_per_row_warm_start() {
     let mut ref_valid = vec![false; n];
     for row in 0..n {
         if let Some((cidx, _)) =
-            crate::encode::nearest_chart(&atlas.atoms[0], z.row(row))
+            crate::encode::nearest_chart(&atlas.atoms[0], z.row(row), amps[row])
         {
             if let Some(t) = crate::encode::amortized_warm_start(
                 &atlas.atoms[0].charts[cidx],
