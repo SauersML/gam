@@ -283,6 +283,8 @@ pub(crate) fn fisher_weight_jet5(link: StandardLink, eta: f64) -> (f64, f64, f64
         }
         StandardLink::Probit => probit_fisher_weight_jet5(eta),
         StandardLink::CLogLog => component_fisher_weight_jet5(LinkComponent::CLogLog, eta),
+        StandardLink::LogLog => component_fisher_weight_jet5(LinkComponent::LogLog, eta),
+        StandardLink::Cauchit => component_fisher_weight_jet5(LinkComponent::Cauchit, eta),
         StandardLink::Identity | StandardLink::Log => (0.0, 0.0, 0.0, 0.0, 0.0),
     }
 }
@@ -968,6 +970,8 @@ impl InverseLinkKernel for LinkFunction {
             LinkFunction::Logit => LogitLinkKernel.jet(eta),
             LinkFunction::Probit => ProbitLinkKernel.jet(eta),
             LinkFunction::CLogLog => CLogLogLinkKernel.jet(eta),
+            LinkFunction::LogLog => LogLogLinkKernel.jet(eta),
+            LinkFunction::Cauchit => CauchitLinkKernel.jet(eta),
             LinkFunction::Identity => Ok(InverseLinkJet {
                 mu: eta,
                 d1: 1.0,
@@ -1060,7 +1064,13 @@ impl InverseLinkKernel for MixtureLinkState {
 impl InverseLinkKernel for InverseLink {
     fn jet(&self, eta: f64) -> Result<InverseLinkJet, EstimationError> {
         match self {
-            InverseLink::Standard(link_fn) => link_fn.as_link_function().jet(eta),
+            InverseLink::Standard(StandardLink::Logit) => LogitLinkKernel.jet(eta),
+            InverseLink::Standard(StandardLink::Probit) => ProbitLinkKernel.jet(eta),
+            InverseLink::Standard(StandardLink::CLogLog) => CLogLogLinkKernel.jet(eta),
+            InverseLink::Standard(StandardLink::LogLog) => LogLogLinkKernel.jet(eta),
+            InverseLink::Standard(StandardLink::Cauchit) => CauchitLinkKernel.jet(eta),
+            InverseLink::Standard(StandardLink::Identity) => LinkFunction::Identity.jet(eta),
+            InverseLink::Standard(StandardLink::Log) => LinkFunction::Log.jet(eta),
             InverseLink::LatentCLogLog(state) => latent_cloglog_point_jet(state, eta),
             InverseLink::Sas(state) => state.jet(eta),
             InverseLink::BetaLogistic(state) => BetaLogisticKernel {
@@ -1140,6 +1150,8 @@ fn link_function_mu_d1(link: LinkFunction, eta: f64) -> Result<(f64, f64), Estim
         LinkFunction::Logit => Ok(component_inverse_link_mu_d1(LinkComponent::Logit, eta)),
         LinkFunction::Probit => Ok(component_inverse_link_mu_d1(LinkComponent::Probit, eta)),
         LinkFunction::CLogLog => Ok(component_inverse_link_mu_d1(LinkComponent::CLogLog, eta)),
+        LinkFunction::LogLog => Ok(component_inverse_link_mu_d1(LinkComponent::LogLog, eta)),
+        LinkFunction::Cauchit => Ok(component_inverse_link_mu_d1(LinkComponent::Cauchit, eta)),
         LinkFunction::Sas => Err(EstimationError::InvalidInput(
             "LinkFunction::Sas inverse-link requires explicit SAS link state".to_string(),
         )),
@@ -1325,6 +1337,12 @@ fn inverse_link_pdf_derivative_for_inverse_link(
         }
         InverseLink::Standard(StandardLink::CLogLog) => {
             Ok(order.component(LinkComponent::CLogLog, eta))
+        }
+        InverseLink::Standard(StandardLink::LogLog) => {
+            Ok(order.component(LinkComponent::LogLog, eta))
+        }
+        InverseLink::Standard(StandardLink::Cauchit) => {
+            Ok(order.component(LinkComponent::Cauchit, eta))
         }
         InverseLink::LatentCLogLog(state) => order.latent_cloglog(eta, state.latent_sd),
         InverseLink::Sas(state) => Ok(order.sas(eta, state.epsilon, state.log_delta)),

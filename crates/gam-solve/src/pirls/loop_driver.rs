@@ -85,6 +85,8 @@ pub(super) fn default_beta_guess_external(
         LinkFunction::Logit
         | LinkFunction::Probit
         | LinkFunction::CLogLog
+        | LinkFunction::LogLog
+        | LinkFunction::Cauchit
         | LinkFunction::Sas
         | LinkFunction::BetaLogistic => {
             let mut weighted_sum = 0.0;
@@ -106,6 +108,8 @@ pub(super) fn default_beta_guess_external(
                         })
                     }
                     LinkFunction::CLogLog => (-(1.0 - prevalence).ln()).ln(),
+                    LinkFunction::LogLog => -(-prevalence.ln()).ln(),
+                    LinkFunction::Cauchit => (std::f64::consts::PI * (prevalence - 0.5)).tan(),
                     LinkFunction::Sas => solve_intercept_for_prevalence(
                         link_function,
                         prevalence,

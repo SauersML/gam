@@ -134,6 +134,8 @@ pub fn apply_inverse_link_spec_vec(
             StandardLink::Logit => "logit",
             StandardLink::Probit => "probit",
             StandardLink::CLogLog => "cloglog",
+            StandardLink::LogLog => "loglog",
+            StandardLink::Cauchit => "cauchit",
         };
         return apply_inverse_link_vec(eta, tag);
     }

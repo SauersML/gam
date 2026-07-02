@@ -564,6 +564,14 @@ pub fn resolve_family(
                     ResponseFamily::Binomial,
                     InverseLink::Standard(StandardLink::CLogLog),
                 ),
+                LinkFunction::LogLog => LikelihoodSpec::new(
+                    ResponseFamily::Binomial,
+                    InverseLink::Standard(StandardLink::LogLog),
+                ),
+                LinkFunction::Cauchit => LikelihoodSpec::new(
+                    ResponseFamily::Binomial,
+                    InverseLink::Standard(StandardLink::Cauchit),
+                ),
                 LinkFunction::Sas => {
                     // The SAS initial state (epsilon, log_delta) is carried into
                     // the fit through `FitOptions.sas_link`, not the family spec:

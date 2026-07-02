@@ -217,6 +217,8 @@ pub(crate) fn weight_link_for_inverse_link(inverse_link: &InverseLink) -> Weight
         InverseLink::Standard(StandardLink::Logit) => WeightLink::Logit,
         InverseLink::Standard(StandardLink::Probit)
         | InverseLink::Standard(StandardLink::CLogLog)
+        | InverseLink::Standard(StandardLink::LogLog)
+        | InverseLink::Standard(StandardLink::Cauchit)
         | InverseLink::LatentCLogLog(_)
         | InverseLink::Sas(_)
         | InverseLink::BetaLogistic(_)
@@ -243,6 +245,8 @@ pub(crate) fn supports_observed_hessian_curvature_for_likelihood(
         spec.link,
         InverseLink::Standard(StandardLink::Probit)
             | InverseLink::Standard(StandardLink::CLogLog)
+            | InverseLink::Standard(StandardLink::LogLog)
+            | InverseLink::Standard(StandardLink::Cauchit)
             | InverseLink::Sas(_)
             | InverseLink::BetaLogistic(_)
             | InverseLink::Mixture(_)
@@ -263,6 +267,8 @@ pub(crate) fn eta_for_observed_hessian_jet(inverse_link: &InverseLink, eta: f64)
         InverseLink::Standard(StandardLink::CLogLog) | InverseLink::LatentCLogLog(_) => {
             eta.clamp(-23.0, 3.0)
         }
+        InverseLink::Standard(StandardLink::LogLog) => eta.clamp(-3.0, 23.0),
+        InverseLink::Standard(StandardLink::Cauchit) => eta.clamp(-1.0e6, 1.0e6),
         // Why: SAS / beta-logistic / mixture compose logistic-like sigmoids that saturate by |eta|~20 (logistic(20)~1-2e-9).
         InverseLink::Sas(_) | InverseLink::BetaLogistic(_) | InverseLink::Mixture(_) => {
             eta.clamp(-20.0, 20.0)
