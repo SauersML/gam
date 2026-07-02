@@ -1,5 +1,38 @@
 use super::*;
 
+fn thin_plate_augmented_center_strategy(
+    strategy: &CenterStrategy,
+    poly_cols: usize,
+) -> CenterStrategy {
+    match strategy {
+        CenterStrategy::Auto(inner) => CenterStrategy::Auto(Box::new(
+            thin_plate_augmented_center_strategy(inner.as_ref(), poly_cols),
+        )),
+        CenterStrategy::EqualMass { num_centers } => CenterStrategy::EqualMass {
+            num_centers: num_centers.saturating_add(poly_cols),
+        },
+        CenterStrategy::EqualMassCovarRepresentative { num_centers } => {
+            CenterStrategy::EqualMassCovarRepresentative {
+                num_centers: num_centers.saturating_add(poly_cols),
+            }
+        }
+        CenterStrategy::FarthestPoint { num_centers } => CenterStrategy::FarthestPoint {
+            num_centers: num_centers.saturating_add(poly_cols),
+        },
+        CenterStrategy::KMeans {
+            num_centers,
+            max_iter,
+        } => CenterStrategy::KMeans {
+            num_centers: num_centers.saturating_add(poly_cols),
+            max_iter: *max_iter,
+        },
+        CenterStrategy::UniformGrid { points_per_dim } => CenterStrategy::UniformGrid {
+            points_per_dim: *points_per_dim,
+        },
+        CenterStrategy::UserProvided(centers) => CenterStrategy::UserProvided(centers.clone()),
+    }
+}
+
 /// Generic thin-plate builder returning design + penalty list.
 pub fn build_thin_plate_basis(
     data: ArrayView2<'_, f64>,
@@ -14,7 +47,9 @@ pub fn build_thin_plate_basiswithworkspace(
     spec: &ThinPlateBasisSpec,
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
-    let original_centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    let poly_cols = thin_plate_polynomial_basis_dimension(data.ncols());
+    let center_strategy = thin_plate_augmented_center_strategy(&spec.center_strategy, poly_cols);
+    let original_centers = select_centers_by_strategy(data, &center_strategy)?;
     let centers = expand_periodic_centers(&original_centers, spec.periodic.as_deref())?;
     // Canonical TPS in dimension d uses penalty order m = ⌊d/2⌋+1 and a
     // polynomial nullspace of size M(d) = C(d+m-1, d). For d=16 this is
@@ -79,7 +114,6 @@ pub fn build_thin_plate_basiswithworkspace(
     }
     let internal_kernel_transform =
         thin_plate_kernel_constraint_nullspace(centers.view(), &mut workspace.cache)?;
-    let poly_cols = thin_plate_polynomial_basis_dimension(centers.ncols());
     let radial_reparam = if let Some(v) = spec.radial_reparam.as_ref() {
         if v.nrows() != internal_kernel_transform.ncols() {
             crate::bail_dim_basis!(
