@@ -2,6 +2,23 @@
 
 use super::*;
 
+struct OuterWallClockDeadlineGuard;
+
+impl OuterWallClockDeadlineGuard {
+    fn arm(budget_secs: f64) -> Self {
+        gam_solve::rho_optimizer::arm_outer_wall_clock_deadline(
+            std::time::Instant::now() + std::time::Duration::from_secs_f64(budget_secs.max(1.0)),
+        );
+        Self
+    }
+}
+
+impl Drop for OuterWallClockDeadlineGuard {
+    fn drop(&mut self) {
+        gam_solve::rho_optimizer::clear_outer_wall_clock_deadline();
+    }
+}
+
 pub fn fit_survival_marginal_slope_terms(
     data: ArrayView2<'_, f64>,
     spec: SurvivalMarginalSlopeTermSpec,
@@ -16,12 +33,8 @@ pub fn fit_survival_marginal_slope_terms(
     // via kappa_options; generous default. Cleared on EVERY exit path so a stale
     // deadline never leaks to a later fit.
     let budget_secs = kappa_options.outer_wall_clock_budget_secs.unwrap_or(300.0);
-    gam_solve::rho_optimizer::arm_outer_wall_clock_deadline(
-        std::time::Instant::now() + std::time::Duration::from_secs_f64(budget_secs.max(1.0)),
-    );
-    let result = fit_survival_marginal_slope_terms_impl(data, spec, options, kappa_options);
-    gam_solve::rho_optimizer::clear_outer_wall_clock_deadline();
-    result
+    let _deadline_guard = OuterWallClockDeadlineGuard::arm(budget_secs);
+    fit_survival_marginal_slope_terms_impl(data, spec, options, kappa_options)
 }
 
 pub(crate) fn fit_survival_marginal_slope_terms_impl(
