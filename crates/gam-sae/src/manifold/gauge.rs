@@ -40,7 +40,7 @@
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
-use super::{SaeBasisEvaluator, SaeManifoldAtom};
+use super::{SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldTerm};
 
 /// Frobenius norm `‖B‖_F = (Σ_{μ,j} B_{μj}²)^{1/2}` of a decoder block.
 pub fn decoder_frobenius_norm(decoder: ArrayView2<'_, f64>) -> f64 {
@@ -424,6 +424,38 @@ pub fn affine_chart_transition(
         coord_residual,
         geometric_residual,
     })
+}
+
+impl SaeManifoldTerm {
+    /// #2022 STEP 2 — in-loop decoder-frame gauge retraction: pin `‖B_k‖_F = 1`
+    /// on every atom, folding each removed magnitude into that atom's explicit
+    /// log-amplitude. The companion of
+    /// [`Self::retract_unit_speed_charts_in_loop`] for the SCALE gauge: both are
+    /// IMAGE-FROZEN (the decoded contribution `exp(s)·Φ·B` is numerically
+    /// unchanged), so the data-fit, smoothness, and terminal Laplace evidence
+    /// are invariant — only the `(B_k, s_k)` representation moves onto the
+    /// quotient (unit-Frobenius frame + explicit amplitude).
+    ///
+    /// Cadence (identical to the unit-speed chart retraction): call at a
+    /// post-acceptance chart-refresh boundary, NEVER inside a line search. Within
+    /// one inner solve the border `B_k` is free to carry scale; peeling it into
+    /// `s_k` here between solves is what makes the *converged* dictionary sit on
+    /// the SCALE quotient — so terminal evidence normalizers are comparable
+    /// across `K` and the decoder-norm collapse guards (which key on `‖B_k‖`)
+    /// become inert, their dead-atom signal migrating to the amplitude `s_k`.
+    ///
+    /// Returns the number of atoms whose frame was rescaled (a strict no-op —
+    /// `0` returned — once every atom is already unit-Frobenius, so it is
+    /// idempotent at a boundary).
+    pub fn retract_decoder_gauge_in_loop(&mut self) -> usize {
+        let mut retracted = 0usize;
+        for atom in self.atoms.iter_mut() {
+            if retract_decoder_unit_frobenius(atom) {
+                retracted += 1;
+            }
+        }
+        retracted
+    }
 }
 
 #[cfg(test)]
