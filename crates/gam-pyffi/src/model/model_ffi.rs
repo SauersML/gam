@@ -3087,13 +3087,19 @@ fn gaussian_reml_score<'py>(
         )
         .map_err(EstimationError::InvalidInput)?;
         let fit_x = gated_x.as_ref().map_or(x_values.view(), |g| g.view());
+        let gated_weights = gate_weights_for_forward(
+            weight_values.as_ref().map(|w| w.view()),
+            by_values.as_ref().map(|b| b.view()),
+            x_values.nrows(),
+        )
+        .map_err(EstimationError::InvalidInput)?;
         gaussian_reml_free_b_score(
             fit_x,
             y_values.view(),
             coefficient_values.view(),
             log_lambda,
             penalty_values.view(),
-            weight_values.as_ref().map(|w| w.view()),
+            gated_weights.as_ref().map(|w| w.view()),
         )
     })?;
     let out = PyDict::new(py);
@@ -4152,11 +4158,16 @@ fn gaussian_reml_fit<'py>(
             by_start_col,
         )?;
         let fit_x = gated_x.as_ref().map_or(x_values.view(), |g| g.view());
+        let gated_weights = gate_weights_for_forward(
+            weight_values.as_ref().map(|w| w.view()),
+            by_values.as_ref().map(|b| b.view()),
+            x_values.nrows(),
+        )?;
         match gaussian_reml_multi_closed_form_with_cache(
             fit_x,
             y_values.view(),
             penalty_values.view(),
-            weight_values.as_ref().map(|w| w.view()),
+            gated_weights.as_ref().map(|w| w.view()),
             init_lambda,
             None,
         ) {
@@ -4228,12 +4239,18 @@ fn gaussian_reml_fit_backward<'py>(
             )
             .map_err(EstimationError::InvalidInput)?;
             let fit_x = gated_x.as_ref().map_or(x_values.view(), |g| g.view());
+            let gated_weights = gate_weights_for_forward(
+                weight_values.as_ref().map(|w| w.view()),
+                by_values.as_ref().map(|b| b.view()),
+                x_values.nrows(),
+            )
+            .map_err(EstimationError::InvalidInput)?;
             let backward = if let Some(fit) = forward_fit.as_ref() {
                 gaussian_reml_multi_closed_form_backward_from_fit(
                     fit_x,
                     y_values.view(),
                     penalty_values.view(),
-                    weight_values.as_ref().map(|w| w.view()),
+                    gated_weights.as_ref().map(|w| w.view()),
                     fit,
                     grad_lambda,
                     grad_coefficients_values.as_ref().map(|g| g.view()),
@@ -4246,7 +4263,7 @@ fn gaussian_reml_fit_backward<'py>(
                     fit_x,
                     y_values.view(),
                     penalty_values.view(),
-                    weight_values.as_ref().map(|w| w.view()),
+                    gated_weights.as_ref().map(|w| w.view()),
                     init_lambda,
                     grad_lambda,
                     grad_coefficients_values.as_ref().map(|g| g.view()),
@@ -4262,12 +4279,14 @@ fn gaussian_reml_fit_backward<'py>(
                 backward.grad_x,
             )
             .map_err(EstimationError::InvalidInput)?;
+            let grad_weights =
+                ungate_weight_gradient(by_values.as_ref().map(|b| b.view()), backward.grad_weights);
             Ok((
                 grad_x,
                 grad_by,
                 backward.grad_y,
                 backward.grad_penalty,
-                backward.grad_weights,
+                grad_weights,
             ))
         })?;
 
@@ -5493,12 +5512,17 @@ fn gaussian_reml_fit_batched<'py>(
             by_start_col,
         )?;
         let fit_x = gated_x.as_ref().map_or(x_values.view(), |g| g.view());
+        let gated_weights = gate_weights_for_forward(
+            weight_values.as_ref().map(|w| w.view()),
+            by_values.as_ref().map(|b| b.view()),
+            x_values.nrows(),
+        )?;
         gaussian_reml_fit_batched_impl(
             fit_x,
             y_values.view(),
             row_offset_values.view(),
             penalty_values.view(),
-            weight_values.as_ref().map(|w| w.view()),
+            gated_weights.as_ref().map(|w| w.view()),
             init_lambda,
         )
     })?;
@@ -5622,12 +5646,17 @@ fn gaussian_reml_fit_batched_backward<'py>(
                 by_start_col,
             )?;
             let fit_x = gated_x.as_ref().map_or(x_values.view(), |g| g.view());
+            let gated_weights = gate_weights_for_forward(
+                weight_values.as_ref().map(|w| w.view()),
+                by_values.as_ref().map(|b| b.view()),
+                x_values.nrows(),
+            )?;
             let backward = gaussian_reml_fit_batched_backward_impl(
                 fit_x,
                 y_values.view(),
                 row_offset_values.view(),
                 penalty_values.view(),
-                weight_values.as_ref().map(|w| w.view()),
+                gated_weights.as_ref().map(|w| w.view()),
                 init_lambda,
                 grad_lambda_values.as_ref().map(|g| g.view()),
                 grad_coefficients_values.as_ref().map(|g| g.view()),
@@ -5642,13 +5671,15 @@ fn gaussian_reml_fit_batched_backward<'py>(
                 by_start_col,
                 backward.grad_x,
             )?;
+            let grad_weights =
+                ungate_weight_gradient(by_values.as_ref().map(|b| b.view()), backward.grad_weights);
             Ok((
                 backward.statuses,
                 grad_x,
                 grad_by,
                 backward.grad_y,
                 backward.grad_penalty,
-                backward.grad_weights,
+                grad_weights,
             ))
         })?;
 
@@ -5716,11 +5747,16 @@ fn gaussian_reml_fit_positions<'py>(
         let gated_x =
             gate_design_for_forward(x.view(), by_values.as_ref().map(|b| b.view()), by_start_col)?;
         let fit_x = gated_x.as_ref().map_or(x.view(), |g| g.view());
+        let gated_weights = gate_weights_for_forward(
+            weight_values.as_ref().map(|w| w.view()),
+            by_values.as_ref().map(|b| b.view()),
+            x.nrows(),
+        )?;
         match gaussian_reml_multi_closed_form_with_cache(
             fit_x,
             y_values.view(),
             penalty_values.view(),
-            weight_values.as_ref().map(|w| w.view()),
+            gated_weights.as_ref().map(|w| w.view()),
             init_lambda,
             None,
         ) {

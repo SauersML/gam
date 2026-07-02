@@ -2388,12 +2388,13 @@ fn gaussian_reml_fit_positions_backward_impl(
     )?;
     let gated_x = gate_design_for_forward(x.view(), by, by_start_col)?;
     let fit_x = gated_x.as_ref().map_or(x.view(), |g| g.view());
+    let gated_weights = gate_weights_for_forward(weights, by, x.nrows())?;
     let backward = if let Some(fit) = forward_fit {
         gaussian_reml_multi_closed_form_backward_from_fit(
             fit_x,
             y,
             penalty,
-            weights,
+            gated_weights.as_ref().map(|w| w.view()),
             fit,
             grad_lambda,
             grad_coefficients,
@@ -2406,7 +2407,7 @@ fn gaussian_reml_fit_positions_backward_impl(
             fit_x,
             y,
             penalty,
-            weights,
+            gated_weights.as_ref().map(|w| w.view()),
             init_lambda,
             grad_lambda,
             grad_coefficients,
@@ -2422,7 +2423,7 @@ fn gaussian_reml_fit_positions_backward_impl(
         grad_t,
         grad_y: backward.grad_y,
         grad_penalty: backward.grad_penalty,
-        grad_weights: backward.grad_weights,
+        grad_weights: ungate_weight_gradient(by, backward.grad_weights),
         grad_by,
     })
 }
@@ -2617,6 +2618,14 @@ fn gaussian_reml_fit_positions_batched_streaming_impl(
         by,
         by_start_col,
     )?;
+
+    // Fold the `by` gate into the prior weights ONCE for the whole batch, then
+    // slice the gated array per segment. Zero-`by` rows get weight 0, so they
+    // drop out of both the segment `XᵀWX` (cache build) and the segment fit
+    // consistently — the cache fingerprint check requires the same weights in
+    // both — and out of `ywy` / the effective-DoF `ν` in the solver (#2031).
+    let gated_weights = gate_weights_for_forward(weights, by, t.len())?;
+    let weights = gated_weights.as_ref().map(|w| w.view());
 
     // Build each ragged segment's basis independently. This makes it
     // impossible for the position-batched API to materialize the concatenated
@@ -2914,6 +2923,9 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
             let by_slice = by.as_ref().map(|values| values.slice(s![start..end]));
             let gated_x = gate_design_for_forward(x_base.view(), by_slice, by_start_col)?;
             let x_slice = gated_x.as_ref().map_or(x_base.view(), |g| g.view());
+            // Fold the `by` gate into this segment's weights so the backward's
+            // effective sample size matches the forward's (#2031).
+            let gated_weight_slice = gate_weights_for_forward(weight_slice, by_slice, end - start)?;
             let y_slice = y.slice(s![start..end, ..]);
             let backward_result = if let Some(fits) = forward_fits {
                 match fits[b].as_ref() {
@@ -2921,7 +2933,7 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
                         x_slice,
                         y_slice,
                         penalty,
-                        weight_slice,
+                        gated_weight_slice.as_ref().map(|w| w.view()),
                         fit,
                         upstream_lambda,
                         upstream_coefficients,
@@ -2936,7 +2948,7 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
                     x_slice,
                     y_slice,
                     penalty,
-                    weight_slice,
+                    gated_weight_slice.as_ref().map(|w| w.view()),
                     init_lambda,
                     upstream_lambda,
                     upstream_coefficients,
@@ -2956,7 +2968,7 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
                             grad_t,
                             backward.grad_y,
                             backward.grad_penalty,
-                            backward.grad_weights,
+                            ungate_weight_gradient(by_slice, backward.grad_weights),
                             grad_by,
                         )),
                     ))
@@ -3281,6 +3293,92 @@ fn gate_design_for_forward(
         Some(by_arr) => Ok(Some(apply_by_gate(x, by_arr, by_start_col)?)),
         None => Ok(None),
     }
+}
+
+/// Fold the `by` gate into the REML row weights for a forward solve.
+///
+/// The `by` gate scales the modulated design columns by `by[row]`, so a row
+/// with `by[row] == 0` has an all-zero modulated design and cannot move the
+/// coefficients at a fixed λ. But the response energy `Σ w·y²` and the residual
+/// degrees of freedom `ν` counted such rows, letting a gated-off row's response
+/// leak into `σ²`, `λ`, and — through λ — the coefficients, contradicting the
+/// documented contract that zero-`by` rows are inert (#2031). Honoring "the
+/// REML fit is also weighted by `by`", we zero the prior weight of every
+/// `by == 0` row: the response energy and the effective-sample-size DoF
+/// (`effective_observation_count` in `gam-solve`) then both exclude it, so a
+/// zero-`by` row is a complete no-op.
+///
+/// Rows with a nonzero `by` keep their prior weight unchanged, so a fit whose
+/// `by` is entirely nonzero is byte-identical to manually gating the design and
+/// passing the raw weights (the pre-existing, tested contract). When there is
+/// no gate, or the gate has no zeros, the caller's original weights are
+/// returned verbatim (preserving `None`) so those paths are untouched.
+///
+/// The owned array is held by the caller so the solver's weight view borrows a
+/// binding that outlives the solve, mirroring [`gate_design_for_forward`]. The
+/// error type is `String`; typed call sites wrap it with
+/// `EstimationError::InvalidInput`.
+fn gate_weights_for_forward(
+    weights: Option<ArrayView1<'_, f64>>,
+    by: Option<ArrayView1<'_, f64>>,
+    n_rows: usize,
+) -> Result<Option<Array1<f64>>, String> {
+    let Some(by_arr) = by else {
+        return Ok(weights.map(|w| w.to_owned()));
+    };
+    if by_arr.len() != n_rows {
+        return Err(format!(
+            "by gate length mismatch: expected {n_rows}, got {}",
+            by_arr.len()
+        ));
+    }
+    if !by_arr.iter().any(|&gate| gate == 0.0) {
+        // No gated-off rows: the effective weights equal the prior weights, so
+        // preserve the caller's exact argument (including `None`) for
+        // byte-identical behavior with the pre-#2031 path.
+        return Ok(weights.map(|w| w.to_owned()));
+    }
+    let mut gated = match weights {
+        Some(w) => {
+            if w.len() != n_rows {
+                return Err(format!(
+                    "weights length mismatch: expected {n_rows}, got {}",
+                    w.len()
+                ));
+            }
+            w.to_owned()
+        }
+        None => Array1::ones(n_rows),
+    };
+    for (row, &gate) in by_arr.iter().enumerate() {
+        if gate == 0.0 {
+            gated[row] = 0.0;
+        }
+    }
+    Ok(Some(gated))
+}
+
+/// Route the effective-weight gradient back to the raw prior weights.
+///
+/// The forward folds the `by` gate into the weights as `w_eff = w · [by ≠ 0]`
+/// (see [`gate_weights_for_forward`]), so `∂L/∂w = (∂L/∂w_eff) · [by ≠ 0]`: a
+/// zero-`by` row's prior weight has no effect on the fit and therefore zero
+/// gradient. The mask is an indicator with zero derivative almost everywhere,
+/// so it contributes nothing to `grad_by` (which the design gate produces in
+/// full). With no gate the gradient passes through unchanged.
+fn ungate_weight_gradient(
+    by: Option<ArrayView1<'_, f64>>,
+    mut grad_weights: Array1<f64>,
+) -> Array1<f64> {
+    if let Some(by_arr) = by {
+        let limit = by_arr.len().min(grad_weights.len());
+        for row in 0..limit {
+            if by_arr[row] == 0.0 {
+                grad_weights[row] = 0.0;
+            }
+        }
+    }
+    grad_weights
 }
 
 /// Route a raw design-gradient back through the `by` gate, if one was applied.
