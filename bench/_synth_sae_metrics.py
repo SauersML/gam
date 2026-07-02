@@ -41,6 +41,7 @@ quality metric must not depend on it.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 
@@ -253,3 +254,145 @@ def recovery_scores(
     return RecoveryScores(
         mcc, precision, recall, f1, jaccard, ceiling, rows, cols, method
     )
+
+
+def _rankdata_average(x: np.ndarray) -> np.ndarray:
+    """Average ranks with deterministic tie handling (SciPy-free)."""
+    x = np.asarray(x, dtype=float).reshape(-1)
+    order = np.argsort(x, kind="mergesort")
+    ranks = np.empty(x.shape[0], dtype=float)
+    i = 0
+    while i < order.size:
+        j = i + 1
+        while j < order.size and x[order[j]] == x[order[i]]:
+            j += 1
+        ranks[order[i:j]] = 0.5 * (i + j - 1) + 1.0
+        i = j
+    return ranks
+
+
+def _pearson(x: np.ndarray, y: np.ndarray) -> float:
+    x = np.asarray(x, dtype=float).reshape(-1)
+    y = np.asarray(y, dtype=float).reshape(-1)
+    mask = np.isfinite(x) & np.isfinite(y)
+    if mask.sum() < 2:
+        return 0.0
+    xc = x[mask] - float(np.mean(x[mask]))
+    yc = y[mask] - float(np.mean(y[mask]))
+    denom = float(np.linalg.norm(xc) * np.linalg.norm(yc))
+    return 0.0 if denom <= 0.0 else float(np.dot(xc, yc) / denom)
+
+
+def spearman_rank_correlation(recovered: np.ndarray, labels: np.ndarray) -> float:
+    """Spearman correlation for non-cyclic chart coordinates."""
+    return _pearson(
+        _rankdata_average(np.asarray(recovered)),
+        _rankdata_average(np.asarray(labels)),
+    )
+
+
+def circular_rank_correlation(
+    recovered: np.ndarray, cyclic_labels: np.ndarray, period: float = 1.0
+) -> float:
+    """Rotation-invariant circular/rank association for 1-D chart coordinates.
+
+    The recovered coordinate is rank-normalized onto a circle, then compared to
+    ground-truth cyclic labels by the magnitude of the first circular moment
+    ``E[exp(i(theta_hat - theta_true))]``. This scores coordinate identity
+    without requiring an arbitrary chart origin or orientation.
+    """
+    rec = np.asarray(recovered, dtype=float).reshape(-1)
+    lab = np.asarray(cyclic_labels, dtype=float).reshape(-1)
+    if rec.size != lab.size:
+        raise ValueError("recovered and cyclic_labels must have the same length")
+    mask = np.isfinite(rec) & np.isfinite(lab)
+    if mask.sum() < 2:
+        return 0.0
+    ranks = (_rankdata_average(rec[mask]) - 0.5) / float(mask.sum())
+    theta_hat = 2.0 * np.pi * ranks
+    theta_true = 2.0 * np.pi * (np.mod(lab[mask], period) / period)
+    return float(abs(np.mean(np.exp(1j * (theta_hat - theta_true)))))
+
+
+def chart_interp_score(
+    recovered_t: np.ndarray,
+    ground_truth_labels: np.ndarray,
+    *,
+    cyclic: bool = True,
+    period: float = 1.0,
+    weights: np.ndarray | None = None,
+) -> dict[str, Any]:
+    """Manifold-native chart-interpretability score for coordinate identity.
+
+    ``recovered_t`` is the scalar coordinate inferred for rows/tokens and
+    ``ground_truth_labels`` is the known concept order/phase. For cyclic charts
+    the headline is the rotation-invariant circular rank correlation; otherwise
+    it is Spearman rank correlation. Optional posterior weights (for example
+    inverse coordinate variance from the row-Hessian solve) select reliable rows
+    but do not change the estimand.
+    """
+    t = np.asarray(recovered_t, dtype=float).reshape(-1)
+    y = np.asarray(ground_truth_labels, dtype=float).reshape(-1)
+    if t.size != y.size:
+        raise ValueError("recovered_t and ground_truth_labels must have the same length")
+    mask = np.isfinite(t) & np.isfinite(y)
+    if weights is not None:
+        w = np.asarray(weights, dtype=float).reshape(-1)
+        if w.size != t.size:
+            raise ValueError("weights must have the same length as recovered_t")
+        mask &= np.isfinite(w) & (w > 0.0)
+    if mask.sum() < 2:
+        score = 0.0
+    elif cyclic:
+        score = circular_rank_correlation(t[mask], y[mask], period=period)
+    else:
+        score = abs(spearman_rank_correlation(t[mask], y[mask]))
+    return {"score": float(score), "n": int(mask.sum()), "cyclic": bool(cyclic)}
+
+
+def dose_response_calibration(
+    predicted_nats: np.ndarray, measured_kl: np.ndarray
+) -> dict[str, float]:
+    """Calibrate predicted steering dose (nats) against measured KL.
+
+    Returns slope-through-origin, intercept/slope linear fit, Pearson
+    correlation, RMSE, MAE, and sample count. The slope-through-origin is the
+    key calibration number: 1.0 means the output-Fisher dose predicts measured
+    KL in natural units.
+    """
+    pred = np.asarray(predicted_nats, dtype=float).reshape(-1)
+    meas = np.asarray(measured_kl, dtype=float).reshape(-1)
+    if pred.size != meas.size:
+        raise ValueError("predicted_nats and measured_kl must have the same length")
+    mask = np.isfinite(pred) & np.isfinite(meas) & (pred >= 0.0) & (meas >= 0.0)
+    if mask.sum() == 0:
+        return {
+            "n": 0,
+            "slope": 0.0,
+            "intercept": 0.0,
+            "linear_slope": 0.0,
+            "pearson": 0.0,
+            "rmse": 0.0,
+            "mae": 0.0,
+        }
+    x = pred[mask]
+    y = meas[mask]
+    denom = float(np.dot(x, x))
+    slope = 0.0 if denom <= 0.0 else float(np.dot(x, y) / denom)
+    if x.size >= 2 and float(np.var(x)) > 0.0:
+        linear_slope, intercept = np.polyfit(x, y, 1)
+        linear_slope = float(linear_slope)
+        intercept = float(intercept)
+    else:
+        linear_slope = slope
+        intercept = 0.0
+    err = y - slope * x
+    return {
+        "n": int(x.size),
+        "slope": float(slope),
+        "intercept": float(intercept),
+        "linear_slope": float(linear_slope),
+        "pearson": _pearson(x, y),
+        "rmse": float(np.sqrt(np.mean(err * err))),
+        "mae": float(np.mean(np.abs(err))),
+    }

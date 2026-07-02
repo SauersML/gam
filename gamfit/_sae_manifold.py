@@ -516,6 +516,11 @@ class ManifoldSAE:
     # rank-r subspace. ``None`` when no shard (or no mass_residual) was supplied.
     # Surfaced so a too-small rank ``r`` is visible, not silent.
     fisher_mass_residual: np.ndarray | None = None
+    # Optional per-row, per-atom posterior covariance of the solved intrinsic
+    # coordinates, in the same units as ``coords``. Shape is a list of ``(N,d,d)``
+    # blocks. Fresh Rust payloads may expose this from the row-Hessian factors
+    # already built by the Arrow solve; legacy payloads leave it ``None``.
+    coordinate_posterior_covariance: list[np.ndarray] | None = None
     # Additive two-score per-atom lens (#980): for each atom, ``presence``
     # (representational, activation-side, Fisher-free), ``coupling`` (behavioral
     # output-Fisher mass; ``NaN`` under a Euclidean / no-harvest provenance), and
@@ -835,6 +840,14 @@ class ManifoldSAE:
                 None
                 if payload.get("fisher_mass_residual") is None
                 else np.asarray(payload["fisher_mass_residual"], dtype=float)
+            ),
+            coordinate_posterior_covariance=(
+                None
+                if payload.get("coordinate_posterior_covariance") is None
+                else [
+                    np.asarray(c, dtype=float)
+                    for c in payload["coordinate_posterior_covariance"]
+                ]
             ),
             # Additive post-fit diagnostics: the two-score per-atom lens,
             # residual-gauge certificate, and empirical incoherence inputs.
@@ -1282,6 +1295,45 @@ class ManifoldSAE:
             "fitted": np.asarray(payload["fitted"], dtype=float),
         }
 
+    def coordinate_posteriors(self, X: Any | None = None) -> dict[str, Any]:
+        """Per-token coordinate posterior means and covariance blocks.
+
+        The posterior mean is always the converged coordinate ``t*``. When the
+        fitted payload includes row-Hessian coordinate covariance blocks, they
+        are returned as ``covariance`` and their inverse diagonal precision
+        weights are exposed for downstream manifold-native metrics (chart
+        interpretation and steering calibration). For out-of-sample ``X`` the
+        exact frozen-decoder coordinate solve supplies the means; covariance is
+        currently returned only for the training rows whose Hessian blocks were
+        factored during fitting.
+        """
+        x = None if X is None else _as_2d_float(X, "X")
+        means = self.per_atom_latent_for(self.training_data if x is None else x)
+        cov = (
+            self.coordinate_posterior_covariance
+            if (x is None or self._is_training_data(x))
+            else None
+        )
+        weights: list[np.ndarray] | None = None
+        if cov is not None:
+            weights = []
+            for block in cov:
+                arr = np.asarray(block, dtype=float)
+                if arr.ndim != 3 or arr.shape[1] != arr.shape[2]:
+                    raise ValueError(
+                        "coordinate posterior covariance blocks must have shape (N,d,d); "
+                        f"got {arr.shape}"
+                    )
+                diag = np.diagonal(arr, axis1=1, axis2=2)
+                weights.append(np.where(diag > 0.0, 1.0 / diag, 0.0))
+        return {
+            "mean": [m.copy() for m in means],
+            "covariance": (
+                None if cov is None else [np.asarray(c, dtype=float).copy() for c in cov]
+            ),
+            "precision_weight": weights,
+        }
+
     def project(self, X: Any, atom_k: int) -> np.ndarray:
         """Standalone per-atom projection ``project(x, atom_k) -> t`` (#357).
 
@@ -1617,6 +1669,14 @@ class ManifoldSAE:
             ),
             "metric_provenance": str(self.metric_provenance),
             "fisher_mass_residual": _optional_list(self.fisher_mass_residual),
+            "coordinate_posterior_covariance": (
+                None
+                if self.coordinate_posterior_covariance is None
+                else [
+                    np.asarray(c, dtype=float).tolist()
+                    for c in self.coordinate_posterior_covariance
+                ]
+            ),
         }
 
     def save(self, path: str | Path) -> None:
@@ -1793,6 +1853,14 @@ class ManifoldSAE:
                 None
                 if payload.get("fisher_mass_residual") is None
                 else np.asarray(payload["fisher_mass_residual"], dtype=float)
+            ),
+            coordinate_posterior_covariance=(
+                None
+                if payload.get("coordinate_posterior_covariance") is None
+                else [
+                    np.asarray(c, dtype=float)
+                    for c in payload["coordinate_posterior_covariance"]
+                ]
             ),
         )
 
