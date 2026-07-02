@@ -4726,19 +4726,18 @@ pub fn cloglog_ghq_value(ctx: &QuadratureContext, mu: f64, sigma: f64, n_nodes: 
     //     which improves conditioning and reduces to the plain rule as σ→0
     //     (η̂→μ, τ→σ). This buys ~10× accuracy.
     //
-    //  2. Choose the node count from σ, not blindly from the caller's request.
-    //     A single Gaussian proposal still cannot resolve a CDF ramp to 1e-8
-    //     with only 15 nodes when σ≈1 (mode- or centroid-centring both plateau
-    //     near ~1e-7 there). The requested `n_nodes` is therefore treated as a
-    //     *minimum*: the effective order is raised to the σ-appropriate size via
-    //     the same schedule used elsewhere for tail-sensitive transforms. The
-    //     rule is then genuinely converged, so evaluating it at a requested 15
-    //     vs 31 nodes returns the same converged value (they share the adapted
-    //     order in the wide-σ regime) rather than two differing under-resolved
-    //     estimates. The value remains correct — it matches the high-accuracy
-    //     lognormal-Laplace reference — it is merely no longer under-resolved.
-    let n_eff = n_nodes.max(adaptive_point_count_from_sd(sigma));
-
+    //  2. Certify convergence by an actual order-doubling error estimate, not by
+    //     clamping the request to one σ-derived order. `n_nodes` is the starting
+    //     order; we then escalate up the GHQ ladder (7→15→21→31→51) and stop as
+    //     soon as two successive orders agree to `CLOGLOG_GHQ_CONV_TOL`, returning
+    //     the higher-order (more resolved) estimate. Earlier code instead set
+    //     `n_eff = n_nodes.max(adaptive_point_count_from_sd(σ))`, forcing a
+    //     requested 15 and 31 to the *same* internal order so the caller's
+    //     order-doubling check `|I_31 − I_15|` was trivially ≈0 — it papered over
+    //     under-resolution rather than proving it (#2063; the σ step-function it
+    //     relied on was itself tuned to pass tests). With the mode-centred rule
+    //     of (1) the escalation converges in 1–2 steps, so this is both honest
+    //     and cheap.
     let inv_sig2 = 1.0 / (sigma * sigma);
     let mut eta_hat = mu;
     let mut converged = false;
@@ -4782,34 +4781,58 @@ pub fn cloglog_ghq_value(ctx: &QuadratureContext, mu: f64, sigma: f64, n_nodes: 
         None
     };
 
-    match tau {
-        Some(tau) => {
-            let pref = tau * inv_sqrt_pi / sigma;
-            with_gh_nodesweights(ctx, n_eff, |nodes, weights| {
-                let mut sum = 0.0_f64;
-                for i in 0..nodes.len() {
-                    let t = nodes[i];
-                    let eta_i = eta_hat + SQRT_2 * tau * t;
-                    let (g, _, _, _, _, _) = cloglog_point_jet5(eta_i);
-                    let dev = eta_i - mu;
-                    sum += weights[i] * (t * t - 0.5 * dev * dev * inv_sig2).exp() * g;
-                }
-                (pref * sum).clamp(0.0, 1.0)
-            })
+    // Evaluate the (mode-centred, or μ-centred fallback) rule at a single order.
+    let eval_at = |n: usize| -> f64 {
+        match tau {
+            Some(tau) => {
+                let pref = tau * inv_sqrt_pi / sigma;
+                with_gh_nodesweights(ctx, n, |nodes, weights| {
+                    let mut sum = 0.0_f64;
+                    for i in 0..nodes.len() {
+                        let t = nodes[i];
+                        let eta_i = eta_hat + SQRT_2 * tau * t;
+                        let (g, _, _, _, _, _) = cloglog_point_jet5(eta_i);
+                        let dev = eta_i - mu;
+                        sum += weights[i] * (t * t - 0.5 * dev * dev * inv_sig2).exp() * g;
+                    }
+                    (pref * sum).clamp(0.0, 1.0)
+                })
+            }
+            None => {
+                let scale = SQRT_2 * sigma;
+                with_gh_nodesweights(ctx, n, |nodes, weights| {
+                    let mut sum = 0.0_f64;
+                    for i in 0..nodes.len() {
+                        let t = mu + scale * nodes[i];
+                        let (g, _, _, _, _) = cloglog_g_derivatives(t);
+                        sum += weights[i] * g;
+                    }
+                    (sum * inv_sqrt_pi).clamp(0.0, 1.0)
+                })
+            }
         }
-        None => {
-            let scale = SQRT_2 * sigma;
-            with_gh_nodesweights(ctx, n_eff, |nodes, weights| {
-                let mut sum = 0.0_f64;
-                for i in 0..nodes.len() {
-                    let t = mu + scale * nodes[i];
-                    let (g, _, _, _, _) = cloglog_g_derivatives(t);
-                    sum += weights[i] * g;
-                }
-                (sum * inv_sqrt_pi).clamp(0.0, 1.0)
-            })
+    };
+
+    // Error-driven order-doubling: start at `n_nodes` (its floor), escalate up
+    // the ladder and return the higher-order estimate as soon as two successive
+    // orders agree to `CLOGLOG_GHQ_CONV_TOL`; if none do, return the max-order
+    // (most-resolved) estimate rather than assert convergence (#2063).
+    const CLOGLOG_GHQ_ORDER_LADDER: [usize; 5] = [7, 15, 21, 31, 51];
+    const CLOGLOG_GHQ_CONV_TOL: f64 = 1e-10;
+    let floor = n_nodes.min(*CLOGLOG_GHQ_ORDER_LADDER.last().unwrap());
+    let mut prev: Option<f64> = None;
+    let mut result = 0.0_f64;
+    for &n in CLOGLOG_GHQ_ORDER_LADDER.iter().filter(|&&n| n >= floor) {
+        let cur = eval_at(n);
+        result = cur;
+        if let Some(p) = prev
+            && (cur - p).abs() < CLOGLOG_GHQ_CONV_TOL
+        {
+            break;
         }
+        prev = Some(cur);
     }
+    result
 }
 
 /// Compute all partial derivatives of `L(μ,σ)` up to fourth order via

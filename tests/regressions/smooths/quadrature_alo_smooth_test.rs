@@ -42,6 +42,34 @@ fn integrated_family_moments_jet_matches_lognormal_mean_for_poisson_log_link() {
     }
 }
 
+/// Independent brute-force reference for `L(η,σ) = ∫ (1 − exp(−exp(η+σz))) φ(z) dz`
+/// via composite Simpson on a fine grid over [−12, 12] (φ tails below 1e-30
+/// beyond). This does NOT share GHQ nodes/weights with the routine under test,
+/// so matching it certifies genuine resolution — unlike an order-doubling check
+/// the routine can trivially satisfy by clamping both requests to one order
+/// (the #2063 anti-pattern).
+fn cloglog_convolution_reference(eta: f64, sigma: f64) -> f64 {
+    let n = 200_000usize;
+    let (lo, hi) = (-12.0_f64, 12.0_f64);
+    let h = (hi - lo) / n as f64;
+    let inv_sqrt_2pi = 1.0 / (2.0 * std::f64::consts::PI).sqrt();
+    let mut sum = 0.0_f64;
+    for i in 0..=n {
+        let z = lo + i as f64 * h;
+        let g = 1.0 - (-(eta + sigma * z).exp()).exp();
+        let phi = (-0.5 * z * z).exp() * inv_sqrt_2pi;
+        let w = if i == 0 || i == n {
+            1.0
+        } else if i % 2 == 1 {
+            4.0
+        } else {
+            2.0
+        };
+        sum += w * g * phi;
+    }
+    (sum * h / 3.0).clamp(0.0, 1.0)
+}
+
 #[test]
 fn quadrature_order_doubling_stabilizes_cloglog_integral() {
     let mut rng = StdRng::seed_from_u64(7);
@@ -52,10 +80,24 @@ fn quadrature_order_doubling_stabilizes_cloglog_integral() {
         let sigma = rng.random_range(0.1..1.0);
         let q = cloglog_ghq_value(&ctx, eta, sigma, 15);
         let q2 = cloglog_ghq_value(&ctx, eta, sigma, 31);
+
+        // (a) Order-doubling stability: two different requested orders must land
+        // on the same value (each is internally escalated to convergence).
         let diff = (q2 - q).abs();
         assert!(
             diff < 1e-8,
             "Doubling GHQ order should stabilize cloglog integral; |I_31-I_15|={diff:.3e}, eta={eta:.4}, sigma={sigma:.4}"
+        );
+
+        // (b) Non-vacuous certification (#2063): the converged value must match
+        // an INDEPENDENT high-resolution reference, proving genuine resolution
+        // rather than two requests being clamped to one internal order.
+        let reference = cloglog_convolution_reference(eta, sigma);
+        let ref_err = (q - reference).abs();
+        assert!(
+            ref_err < 1e-7,
+            "cloglog GHQ value must match the brute-force convolution reference; \
+             |I_15-ref|={ref_err:.3e}, I_15={q:.12}, ref={reference:.12}, eta={eta:.4}, sigma={sigma:.4}"
         );
     }
 }
