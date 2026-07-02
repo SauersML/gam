@@ -1024,7 +1024,6 @@ impl<'a> RemlState<'a> {
     /// `InnerAssembly`. All three assembly builders (`build_dense_assembly`,
     /// `build_sparse_assembly`, `build_dense_original_assembly`) delegate
     /// here to avoid repeating the 18-field struct literal.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn finish_assembly(
         &self,
         pirls_result: &PirlsResult,
