@@ -26,8 +26,13 @@ from sac_prototype import _ev, sac_fit  # noqa: E402
 
 CACHE = os.environ.get("SAC_W6_CACHE", "/dev/shm/w6/cache_K8.npy")
 OUT_DIR = Path(os.environ.get("SAC_W6_OUT", "/dev/shm/sauers_gpu/sac_w6"))
-N_ITER = int(os.environ.get("SAC_W6_ITER", "20"))
+N_ITER = int(os.environ.get("SAC_W6_ITER", "8"))
 K_TARGET = int(os.environ.get("SAC_W6_K", "8"))
+# Kill-test matches the joint baseline's settings: isometry gauge on, no
+# structured-residual (Sigma) whitening, no backfit -- it isolates the narrow
+# Part-5 question "do 8 sequential K=1 fits work where the joint timed out".
+SRP = int(os.environ.get("SAC_W6_SRP", "0"))
+BACKFIT = int(os.environ.get("SAC_W6_BACKFIT", "0"))
 
 
 def main() -> None:
@@ -37,7 +42,8 @@ def main() -> None:
     print(f"[sac_w6] loaded {CACHE}: X={X.shape} dtype={X.dtype}", flush=True)
     print(f"[sac_w6] running SAC: {K_TARGET} forced sequential K=1 fits "
           f"(d_atom=1, circle, ibp_map, isometry_weight=1.0, "
-          f"structured_residual_passes=2, n_iter={N_ITER})", flush=True)
+          f"structured_residual_passes={SRP}, n_iter={N_ITER}, backfit={BACKFIT})",
+          flush=True)
 
     t0 = time.time()
     sac = sac_fit(
@@ -47,9 +53,9 @@ def main() -> None:
         atom_topology="circle",
         assignment="ibp_map",
         ev_floor=1e-3,
-        structured_residual_passes=2,
+        structured_residual_passes=SRP,
         n_iter=N_ITER,
-        backfit_sweeps=1,
+        backfit_sweeps=BACKFIT,
         isometry_weight=1.0,
         stop_on_rejections=False,   # force all 8 births to test the criterion
         random_state=0,

@@ -103,7 +103,13 @@ def main() -> None:
     ap.add_argument("--p", type=int, default=32)
     ap.add_argument("--noise", type=float, default=0.03)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--n-iter", type=int, default=60)
+    ap.add_argument("--n-iter", type=int, default=20)
+    ap.add_argument("--d-atom", type=int, default=1,
+                    help="circle is a 1-manifold -> d_atom=1 (matches W6 baseline)")
+    ap.add_argument("--srp", type=int, default=0,
+                    help="structured_residual_passes (Sigma whitening); 0 matches "
+                         "the joint baseline for a fair comparison")
+    ap.add_argument("--backfit", type=int, default=1)
     args = ap.parse_args()
 
     X, assign, theta, scales = planted_two_circles(args.n, args.p, args.noise, args.seed)
@@ -119,8 +125,8 @@ def main() -> None:
     # ---- Joint K=2 baseline (the call SAC replaces) --------------------- #
     print("\n[exp1] === JOINT sae_manifold_fit(K=2) ===")
     joint = gamfit.sae_manifold_fit(
-        X, K=2, d_atom=2, atom_topology="circle", assignment="ibp_map",
-        n_iter=args.n_iter, random_state=args.seed,
+        X, K=2, d_atom=args.d_atom, atom_topology="circle", assignment="ibp_map",
+        isometry_weight=1.0, n_iter=args.n_iter, random_state=args.seed,
     )
     joint_recon = np.asarray(joint.reconstruct(X), dtype=np.float64)
     joint_ev = _ev(X, joint_recon)
@@ -140,9 +146,10 @@ def main() -> None:
     # ---- SAC prototype -------------------------------------------------- #
     print("\n[exp1] === SAC prototype ===")
     sac = sac_fit(
-        X, max_atoms=6, d_atom=2, atom_topology="circle", assignment="ibp_map",
-        ev_floor=5e-3, structured_residual_passes=2, n_iter=args.n_iter,
-        backfit_sweeps=2, random_state=args.seed, verbose=True,
+        X, max_atoms=6, d_atom=args.d_atom, atom_topology="circle",
+        assignment="ibp_map", ev_floor=5e-3, structured_residual_passes=args.srp,
+        n_iter=args.n_iter, backfit_sweeps=args.backfit, isometry_weight=1.0,
+        random_state=args.seed, verbose=True,
     )
     print(f"[exp1] SAC accepted K={sac.k} atoms; combined EV = {sac.combined_ev:.4f}")
     print(f"[exp1] SAC EV trace = {[round(e, 4) for e in sac.ev_trace]}")
