@@ -2775,6 +2775,19 @@ impl FittedModel {
     pub fn diagnostic_extra_columns(&self) -> Result<Vec<String>, String> {
         let payload = self.payload();
         let parsed = parse_formula(payload.formula.as_str()).map_err(|e| e.to_string())?;
+        // Prior (case) weights never enter the linear predictor, so
+        // `prediction_required_columns` deliberately omits the weight column and
+        // a prediction frame may drop it. Diagnostics are weight-aware, though:
+        // `diagnose` reconstructs the ALO working weights `w_i = prior_i ·
+        // Fisher_i` (and the refit fallback re-weights the same way), so the
+        // weight column must be loaded. Fold it in here — the single seam that
+        // makes it structurally impossible for a diagnostic command to silently
+        // drop a needed column — regardless of the response-shape early-outs
+        // below, since it is orthogonal to the response.
+        let mut extras: Vec<String> = Vec::new();
+        if let Some(weight_column) = payload.weight_column.as_ref() {
+            extras.push(weight_column.clone());
+        }
         // Survival responses are `Surv(...)` expressions, not bare columns; the
         // underlying entry/exit columns are already prediction-required.
         if parse_surv_response(parsed.response.as_str())
@@ -2784,20 +2797,21 @@ impl FittedModel {
                 .map_err(|e| e.to_string())?
                 .is_some()
         {
-            return Ok(Vec::new());
+            return Ok(extras);
         }
         let response = parsed.response.trim();
         // A response that is empty, or a function-call expression rather than a
         // plain data column, has no bare column to re-add.
         if response.is_empty() || response.contains('(') {
-            return Ok(Vec::new());
+            return Ok(extras);
         }
         // Already prediction-required (e.g. transformation-normal re-adds it):
         // nothing extra to fold in.
         if self.prediction_required_columns()?.contains(response) {
-            return Ok(Vec::new());
+            return Ok(extras);
         }
-        Ok(vec![response.to_string()])
+        extras.push(response.to_string());
+        Ok(extras)
     }
 
     /// Add the columns referenced by an auxiliary (noise / logslope) formula,
