@@ -2260,11 +2260,25 @@ impl BinomialLocationScaleFamily {
 }
 
 impl CustomFamily for BinomialLocationScaleFamily {
-    // Binomial fits have a genuine separation regime; keep the self-limiting
-    // Jeffreys/Firth curvature active. The trait default flipped to OFF in
-    // gam#1395 (flat-prior exact-Newton objective); opt back in here.
+    // NO full-span Firth/Jeffreys for this family (#1607, Cluster 2 — gamlss
+    // batched gradient), mirroring `BinomialLocationScaleWiggleFamily`. The
+    // threshold/log-σ map `q = −η_t/σ` carries an EXACT gauge null (`δη_t = η_t,
+    // δη_ls = 1` gives `q̇ = 0`), so the reduced Fisher information is singular
+    // along it. The always-on full-span Firth term floor-inverts that gauge
+    // direction into a `1/floor` curvature wall whose bounded divided-difference
+    // `H_Φ` is only an APPROXIMATION of the exact Firth curvature the inner
+    // Newton converges on; on the gauge-degenerate reduced span the outer
+    // gradient's `H_Φ`-drift contraction then desynchronises from the finite
+    // difference of the folded cost by ~4-5%, tripping the batched-gradient FD
+    // check. The smoothing penalty already regularises the identifiable
+    // coefficients, so the self-limiting Firth curvature is unnecessary here;
+    // dropping it lets value, gradient, and mode-response stay on the exact
+    // observed penalized Hessian. (The `expected_joint_information_*` /
+    // `joint_jeffreys_information_*` methods are retained: they still back the
+    // directly-tested Fisher-information derivative surface and any future
+    // opt-in.)
     fn joint_jeffreys_term_required(&self) -> bool {
-        true
+        false
     }
 
     /// The Binomial location-scale joint Hessian depends on β because the
@@ -2274,68 +2288,43 @@ impl CustomFamily for BinomialLocationScaleFamily {
         true
     }
 
-    // OUTER-REML CURVATURE: use the EXPECTED (Fisher) joint information, not the
-    // OBSERVED joint Hessian (#1607). The probit (and any non-canonical) link
-    // makes the observed joint Hessian
-    //   coeff_tt = m2 r², coeff_tl = r(m1 + q m2), coeff_ll = q(m1 + q m2)
-    // INDEFINITE away from an exact mode: its per-row 2×2 block has determinant
-    // `−m1(m1 + q m2)·(…)²`, which is negative whenever the row's score factor
-    // `m1` and curvature factor `(m1 + q m2)` share a sign — the generic case at
-    // the loose β̂ an `outer_max_iter:1` evaluation (and every early outer iterate)
-    // hands the REML criterion. The outer LAML logdet `½ log|H + S_λ|` and its
-    // ρ-derivative trace then run on an indefinite `H`: the smooth pseudo-logdet
-    // floors the negative eigenvalue, the projected generalized-determinant kernel
-    // drops it from `range(H + S_λ)` (leaving the inner KKT residual with
-    // unresolved mass), and the envelope trace `tr((H+S_λ)⁺ ∂_ρ(H+S_λ))` blows up
-    // to O(1/floor) ≈ 1e13 while the FD of the floored cost stays O(1) — the
-    // envelope-consistency tripwire then suppresses the analytic gradient to zero
-    // (the cluster-2 symptom) and the NaN/cond spectra of clusters 3/4.
-    //
-    // The EXPECTED information `I = Σ_i f_i (q_a)(q_b)` (f_i = E[F''] ≥ 0, no `m1`
-    // term) is PSD by construction, so `H_E + S_λ` is SPD, its logdet and trace
-    // kernel are well-conditioned, and value/gradient/mode-response all live on
-    // one identifiable subspace. This is Fisher-scoring REML (mgcv's treatment for
-    // non-canonical links) and matches the #1606 NB/Gamma location-scale fix: the
-    // inner P-IRLS score (= 0 at β̂) is untouched, so the stationary point β̂(ρ),
-    // the reported coefficients, and the optimum are unchanged — only the outer
-    // curvature conditioning improves. The directional derivatives below switch in
-    // lock-step so `∂_ρ H_E` and `∂²_ρ H_E` differentiate the SAME expected
-    // information the value path uses.
-    fn exact_newton_outer_curvature(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> Result<Option<crate::custom_family::ExactNewtonOuterCurvature>, String> {
-        Ok(self.expected_joint_information_for_specs(block_states, None)?.map(
-            |hessian| crate::custom_family::ExactNewtonOuterCurvature {
-                hessian,
-                rho_curvature_scale: 1.0,
-                hessian_logdet_correction: 0.0,
-            },
-        ))
-    }
+    // OUTER-REML CURVATURE: use the OBSERVED joint Hessian (the trait default),
+    // NOT the EXPECTED (Fisher) information (#1607, Cluster 2 — gamlss batched
+    // gradient). The outer LAML criterion the value path evaluates is
+    // `½ log|H + S_λ (+ H_Φ)|`, and its analytic ρ-gradient contracts that same
+    // operator's inverse `K` against the mode-response drift `dH/dβ[v_k]`, where
+    // `v_k = ∂β̂/∂ρ_k`. But `β̂(ρ)` is the stationary point of the inner
+    // penalized (Firth-augmented) objective, so implicit differentiation of the
+    // inner score `∇_β L(β̂,ρ)=0` gives `v_k = −(∇²_β L)⁻¹ A_k β̂` with `∇²_β L`
+    // the OBSERVED penalized Hessian — the SAME object the inner exact-Newton
+    // solve and the value's logdet use. Overriding this with the EXPECTED
+    // information makes the mode-response solve (and the Jeffreys `H_Φ` drift it
+    // feeds) differentiate a DIFFERENT operator than the value, so the finite
+    // difference of the cost — which sees the true observed-Hessian `β̂` motion —
+    // disagreed with the analytic gradient by ~1% (logdet trace) and ~5.5% (with
+    // the Jeffreys curvature), exactly the batched-gradient FD mismatch. Falling
+    // back to the observed joint Hessian keeps value, gradient, and mode-response
+    // on one operator (matching the survival/NB/Gamma location-scale families),
+    // so the analytic outer gradient is the exact derivative of the cost it
+    // reports. The `expected_joint_information_*` methods remain in use for the
+    // Jeffreys/Firth prior, which is defined on the Fisher information by
+    // construction (#1020).
 
-    fn exact_newton_outer_curvature_directional_derivative_with_specs(
-        &self,
-        block_states: &[ParameterBlockState],
-        specs: &[ParameterBlockSpec],
-        d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, String> {
-        self.expected_joint_information_directional_for_specs(block_states, Some(specs), d_beta_flat)
-    }
-
-    fn exact_newton_outer_curvature_second_directional_derivative_with_specs(
-        &self,
-        block_states: &[ParameterBlockState],
-        specs: &[ParameterBlockSpec],
-        d_beta_u_flat: &Array1<f64>,
-        d_beta_v_flat: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, String> {
-        self.expected_joint_information_second_directional_for_specs(
-            block_states,
-            Some(specs),
-            d_beta_u_flat,
-            d_beta_v_flat,
-        )
+    /// The threshold/log-σ map `q = −η_t/σ` carries an EXACT gauge null: the
+    /// direction `(δη_t = η_t, δη_ls = 1)` gives `q̇ = q_t·η_t + q_ls = 0`, so the
+    /// likelihood joint Hessian is singular along it. Under the default `Smooth`
+    /// pseudo-logdet the near-zero eigenvalue contributes a first-order
+    /// `φ'(σ_min)·dσ_min/dρ` term to `d log|H|/dρ` that the analytic
+    /// `u⊤(dH/dρ)u` formula cannot match (the eigenvector `u` is numerically
+    /// arbitrary inside the null space), so the outer trace blows up to
+    /// `O(1/floor)` and the envelope-consistency tripwire suppresses the analytic
+    /// gradient to zero — the Cluster 2 symptom (#1607). `HardPseudo` excludes
+    /// `σ ≤ ε` from BOTH `log|H|` and its ρ-gradient consistently, so the gauge
+    /// direction drops out of the analytic geometry and the outer gradient
+    /// matches the finite difference of the same pseudo-logdet cost. This mirrors
+    /// the `BinomialLocationScaleWiggleFamily` treatment of its structural gauge.
+    fn pseudo_logdet_mode(&self) -> crate::custom_family::PseudoLogdetMode {
+        crate::custom_family::PseudoLogdetMode::HardPseudo
     }
 
     fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
