@@ -3,7 +3,8 @@
 //! path can call it in release builds.
 
 use super::SaeAtomBasisKind;
-use gam_linalg::faer_ndarray::FaerSvd;
+use faer::Side;
+use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd};
 use ndarray::{Array1, Array2, Array3, ArrayView2};
 
 /// Residual-norm floor below which the surplus atom's second phase axis is
@@ -19,6 +20,235 @@ const SURPLUS_DIR_FLOOR: f64 = 1.0e-6;
 /// well-spread DISTINCT circle phase. `pc_pair_offset == 0` contributes exactly
 /// `0.0`, leaving the original `atom_idx / k_atoms` offset bit-for-bit.
 const GOLDEN_RATIO_CONJUGATE: f64 = 0.618_033_988_749_894_9;
+
+/// Maximum rows used by the topology-aware curved-atom seed.  The seed is only
+/// a starting chart, so a deterministic stride subsample keeps the graph solve
+/// bounded while preserving reproducibility and memory use on large inputs.
+const TOPOLOGY_SEED_MAX_POINTS: usize = 4096;
+
+/// k used for the local neighborhood graph in the topology-aware seed.  This is
+/// large enough to connect ordinary manifold samples but small enough that the
+/// dense Laplacian eigensolve is still dominated by one joint SAE iteration on
+/// the subsample.
+const TOPOLOGY_SEED_KNN: usize = 12;
+
+fn is_curved_kind(kind: &SaeAtomBasisKind) -> bool {
+    matches!(
+        kind,
+        SaeAtomBasisKind::Periodic | SaeAtomBasisKind::Torus | SaeAtomBasisKind::Sphere
+    )
+}
+
+fn topology_seed_subsample(n_obs: usize) -> Vec<usize> {
+    if n_obs <= TOPOLOGY_SEED_MAX_POINTS {
+        return (0..n_obs).collect();
+    }
+    let mut rows = Vec::with_capacity(TOPOLOGY_SEED_MAX_POINTS);
+    for i in 0..TOPOLOGY_SEED_MAX_POINTS {
+        rows.push(i * n_obs / TOPOLOGY_SEED_MAX_POINTS);
+    }
+    rows
+}
+
+fn squared_distance_rows(z: ArrayView2<'_, f64>, a: usize, b: usize) -> f64 {
+    let mut acc = 0.0;
+    for c in 0..z.ncols() {
+        let d = z[[a, c]] - z[[b, c]];
+        acc += d * d;
+    }
+    acc
+}
+
+/// Topology-aware deterministic initialization for curved atom charts.
+///
+/// The issue asks for persistent-cohomology harmonic coordinates.  In the core
+/// build we avoid a heavyweight dependency and compute the same object needed by
+/// the optimizer seed: low-energy harmonic coordinates on a symmetric kNN graph
+/// built from a bounded deterministic subsample.  The first non-constant graph
+/// Laplacian eigenfunctions are the discrete harmonic representatives; reading
+/// their phases gives circle/torus coordinates, while normalizing the first
+/// three gives a sphere chart.  If the graph is too small/degenerate this returns
+/// `Ok(None)` and the caller falls back to the older PCA seed.
+fn topology_curved_seed_initial_coords(
+    z: ArrayView2<'_, f64>,
+    basis_kinds: &[SaeAtomBasisKind],
+    atom_dim: &[usize],
+    pc_pair_offset: usize,
+) -> Result<Option<Array3<f64>>, String> {
+    if !basis_kinds.iter().any(is_curved_kind) || z.nrows() < 4 || z.ncols() == 0 {
+        return Ok(None);
+    }
+    for ((row, col), &value) in z.indexed_iter() {
+        if !value.is_finite() {
+            return Err(format!(
+                "sae_pca_seed: Z must be finite; Z[{row}, {col}] = {value}"
+            ));
+        }
+    }
+    let rows = topology_seed_subsample(z.nrows());
+    let m = rows.len();
+    if m < 4 {
+        return Ok(None);
+    }
+    let k = TOPOLOGY_SEED_KNN.min(m - 1);
+    let mut w = Array2::<f64>::zeros((m, m));
+    for (ia, &ra) in rows.iter().enumerate() {
+        let mut dists = Vec::with_capacity(m - 1);
+        for (ib, &rb) in rows.iter().enumerate() {
+            if ia != ib {
+                dists.push((squared_distance_rows(z, ra, rb), ib));
+            }
+        }
+        dists.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let scale = dists[k.saturating_sub(1)].0.max(1.0e-24);
+        for &(dist2, ib) in dists.iter().take(k) {
+            let wij = (-dist2 / scale).exp().max(1.0e-12);
+            if wij > w[[ia, ib]] {
+                w[[ia, ib]] = wij;
+            }
+            if wij > w[[ib, ia]] {
+                w[[ib, ia]] = wij;
+            }
+        }
+    }
+    let mut lap = Array2::<f64>::zeros((m, m));
+    for i in 0..m {
+        let deg: f64 = w.row(i).sum();
+        if deg <= 0.0 || !deg.is_finite() {
+            return Ok(None);
+        }
+        lap[[i, i]] = 1.0;
+        let inv_sqrt = 1.0 / deg.sqrt();
+        for j in 0..m {
+            if i != j && w[[i, j]] != 0.0 {
+                let deg_j: f64 = w.row(j).sum();
+                lap[[i, j]] = -w[[i, j]] * inv_sqrt / deg_j.sqrt();
+            }
+        }
+    }
+    let (evals, evecs) = lap
+        .eigh(Side::Lower)
+        .map_err(|err| format!("topology_seed: graph Laplacian eigensolve failed: {err:?}"))?;
+    if evals.len() < 3 {
+        return Ok(None);
+    }
+    let d_max = atom_dim.iter().copied().max().unwrap_or(1).max(1);
+    let mut out = Array3::<f64>::zeros((basis_kinds.len(), z.nrows(), d_max));
+    let interp = |sample_values: &Array1<f64>, row: usize| -> f64 {
+        if let Some(pos) = rows.iter().position(|&r| r == row) {
+            return sample_values[pos];
+        }
+        let mut best = [(f64::INFINITY, 0usize); 3];
+        for (i, &r) in rows.iter().enumerate() {
+            let d = squared_distance_rows(z, row, r);
+            if d < best[2].0 {
+                best[2] = (d, i);
+                best.sort_by(|a, b| a.0.total_cmp(&b.0));
+            }
+        }
+        let mut num = 0.0;
+        let mut den = 0.0;
+        for (d, i) in best {
+            let ww = 1.0 / d.max(1.0e-24);
+            num += ww * sample_values[i];
+            den += ww;
+        }
+        num / den
+    };
+    let component = |idx: usize| -> Option<Array1<f64>> {
+        if idx >= evecs.ncols() {
+            None
+        } else {
+            Some(evecs.column(idx).to_owned())
+        }
+    };
+    for atom_idx in 0..basis_kinds.len() {
+        let d = atom_dim[atom_idx];
+        match basis_kinds[atom_idx] {
+            SaeAtomBasisKind::Periodic => {
+                let pair_count = (evecs.ncols().saturating_sub(1)) / 2;
+                let base = if pair_count > 0 {
+                    1 + 2 * ((atom_idx + pc_pair_offset) % pair_count)
+                } else {
+                    1
+                };
+                let Some(a) = component(base) else {
+                    continue;
+                };
+                let Some(b) = component(base + 1) else {
+                    continue;
+                };
+                for row in 0..z.nrows() {
+                    let phase = interp(&b, row).atan2(interp(&a, row)) / std::f64::consts::TAU;
+                    out[[atom_idx, row, 0]] = phase - phase.floor();
+                }
+            }
+            SaeAtomBasisKind::Torus => {
+                for axis in 0..d {
+                    let pair_count = (evecs.ncols().saturating_sub(1)) / 2;
+                    let pair = if pair_count > 0 {
+                        (axis + pc_pair_offset) % pair_count
+                    } else {
+                        axis
+                    };
+                    let Some(a) = component(1 + 2 * pair) else {
+                        break;
+                    };
+                    let Some(b) = component(2 + 2 * pair) else {
+                        break;
+                    };
+                    for row in 0..z.nrows() {
+                        let phase = interp(&b, row).atan2(interp(&a, row)) / std::f64::consts::TAU;
+                        out[[atom_idx, row, axis]] = phase - phase.floor();
+                    }
+                }
+            }
+            SaeAtomBasisKind::Sphere => {
+                let base = if evecs.ncols() > 3 {
+                    1 + (2 * pc_pair_offset) % (evecs.ncols() - 3)
+                } else {
+                    1
+                };
+                let (Some(xv), Some(yv), Some(zv)) =
+                    (component(base), component(base + 1), component(base + 2))
+                else {
+                    continue;
+                };
+                for row in 0..z.nrows() {
+                    let x = interp(&xv, row);
+                    let y = interp(&yv, row);
+                    let zz = interp(&zv, row);
+                    let norm = (x * x + y * y + zz * zz).sqrt().max(1.0e-24);
+                    if d >= 1 {
+                        out[[atom_idx, row, 0]] = (zz / norm).clamp(-1.0, 1.0).asin();
+                    }
+                    if d >= 2 {
+                        out[[atom_idx, row, 1]] = y.atan2(x);
+                    }
+                }
+            }
+            _ => {
+                for axis in 0..d {
+                    let Some(values) = component(1 + axis) else {
+                        break;
+                    };
+                    let (lo, hi) = values
+                        .iter()
+                        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
+                            (lo.min(v), hi.max(v))
+                        });
+                    let span = hi - lo;
+                    if span > 0.0 && span.is_finite() {
+                        for row in 0..z.nrows() {
+                            out[[atom_idx, row, axis]] = (interp(&values, row) - lo) / span - 0.5;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(Some(out))
+}
 
 /// Deterministic generic 2-plane for an OVERCOMPLETE (#1893) SURPLUS periodic
 /// atom, i.e. one whose index outruns the available disjoint PC pairs. Builds
@@ -60,8 +290,8 @@ fn surplus_phase_plane(
         // Base-`k_atoms` mix of (atom_idx, pc_pair_offset) before the `<< 20`
         // spread. At `pc_pair_offset == 0` this is exactly `(atom_idx << 20) ^ pc`
         // — the original key, bit-for-bit — so the first attempt is unchanged.
-        let key = (((atom_idx as u64) + (pc_pair_offset as u64) * (k_atoms as u64)) << 20)
-            ^ (pc as u64);
+        let key =
+            (((atom_idx as u64) + (pc_pair_offset as u64) * (k_atoms as u64)) << 20) ^ (pc as u64);
         let wa = mix(key);
         let wb = mix(key ^ 0xD1B54A32D192ED03);
         for c in 0..ncols {
@@ -128,6 +358,11 @@ pub fn sae_pca_seed_initial_coords_with_pc_offset(
     atom_dim: &[usize],
     pc_pair_offset: usize,
 ) -> Result<Array3<f64>, String> {
+    if let Some(seed) =
+        topology_curved_seed_initial_coords(z, basis_kinds, atom_dim, pc_pair_offset)?
+    {
+        return Ok(seed);
+    }
     let k_atoms = basis_kinds.len();
     let (n_obs, _p_out) = z.dim();
     let d_max = atom_dim.iter().copied().max().unwrap_or(1).max(1);
@@ -588,9 +823,15 @@ mod tests {
             "distinct retry offsets must yield distinct dir1 (max diff {diff:.3e})"
         );
         let dot: f64 = d1_0.iter().zip(d2_0.iter()).map(|(a, b)| a * b).sum();
-        assert!(dot.abs() < 1e-9, "dir2 must be orthogonal to dir1 (dot {dot:.3e})");
+        assert!(
+            dot.abs() < 1e-9,
+            "dir2 must be orthogonal to dir1 (dot {dot:.3e})"
+        );
         let n2: f64 = d2_0.dot(&d2_0).sqrt();
-        assert!((n2 - 1.0).abs() < 1e-9, "dir2 must be unit-normalized (norm {n2})");
+        assert!(
+            (n2 - 1.0).abs() < 1e-9,
+            "dir2 must be unit-normalized (norm {n2})"
+        );
     }
 
     /// FIX #1: `pc_pair_offset == 0` reproduces the ORIGINAL splitmix64 key
@@ -669,7 +910,10 @@ mod tests {
         let s0 = sae_pca_seed_initial_coords_with_pc_offset(z.view(), &kinds, &dims, 0).unwrap();
         let s1 = sae_pca_seed_initial_coords_with_pc_offset(z.view(), &kinds, &dims, 1).unwrap();
         let plain = sae_pca_seed_initial_coords(z.view(), &kinds, &dims).unwrap();
-        assert_eq!(s0, plain, "offset-0 must equal the no-offset seed bit-for-bit");
+        assert_eq!(
+            s0, plain,
+            "offset-0 must equal the no-offset seed bit-for-bit"
+        );
         for v in s0.iter().chain(s1.iter()) {
             assert!(
                 v.is_finite() && *v >= 0.0 && *v < 1.0,
