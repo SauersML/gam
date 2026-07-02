@@ -2091,6 +2091,81 @@ mod tests {
     }
 
     #[test]
+    fn sandwich_meat_uses_score_weights_not_hessian_weights_noncanonical() {
+        // Regression for the sandwich-SE "meat" weight bug: the meat must be the
+        // SCORE covariance Xᵀ diag(W_S) X (Fisher, PSD), NOT the observed-info
+        // Hessian weight W_H (signed). This fixture mimics a non-canonical link
+        // (W_H ≠ W_S) with mixed-sign observed curvature.
+        //
+        // Single column (p = 1) makes H a scalar, so the sandwich variance is
+        // closed form: with H = Σ W_H·x² + s0 (> 0 after the penalty), the meat
+        // for obs is x_obs²·H⁻²·Σ_row W_S·x_row², and se = sqrt(φ·meat).
+        let x = Array2::from_shape_vec((5, 1), vec![1.0, 2.0, 1.0, 2.0, 1.0]).unwrap();
+        // Mixed-sign observed-information weights; the negative rows carry the
+        // larger design values so Σ W_H·x² is NEGATIVE (see assert below).
+        let w_h_vec = Array1::from_vec(vec![1.0, -1.0, 1.0, -1.0, 0.5]);
+        // Score/Fisher weights are strictly positive (PSD by construction).
+        let w_s_vec = Array1::from_vec(vec![1.0, 0.8, 1.2, 0.6, 0.9]);
+        let phi = 1.3;
+
+        let n = x.nrows();
+        let sum_wh_x2: f64 = (0..n).map(|i| w_h_vec[i] * x[[i, 0]] * x[[i, 0]]).sum();
+        let sum_ws_x2: f64 = (0..n).map(|i| w_s_vec[i] * x[[i, 0]] * x[[i, 0]]).sum();
+        // The whole point: Σ W_H·x² < 0 < Σ W_S·x². With W_H the meat is negative
+        // and the "materially negative sandwich variance" guard would trip
+        // (spurious LooComputationFailed); with W_S it is a valid PSD meat.
+        assert!(sum_wh_x2 < 0.0, "fixture must exercise a negative W_H meat");
+        assert!(sum_ws_x2 > 0.0);
+
+        // Penalize enough that the penalized Hessian is PD despite Σ W_H·x² < 0.
+        let s0 = 8.0_f64;
+        let h = s0 + sum_wh_x2; // = 2.5
+        assert!(h > 0.0, "penalized Hessian must stay PD");
+        let penalized_hessian = Array2::from_elem((1, 1), h);
+
+        // Pre-fix arithmetic check: the OLD W_H meat would be materially negative
+        // for the larger-x rows, so the old code returned LooComputationFailed.
+        let old_meat_obs1 = x[[1, 0]] * x[[1, 0]] / (h * h) * sum_wh_x2;
+        assert!(
+            phi * old_meat_obs1 < -super::variance_negative_tolerance(phi * old_meat_obs1.abs()),
+            "the pre-fix W_H meat must be materially negative (guard would trip)"
+        );
+
+        let working_response = Array1::from_vec(vec![0.3, -0.2, 0.5, 0.1, -0.4]);
+        let eta = Array1::from_vec(vec![0.2, 0.1, 0.4, -0.1, 0.05]);
+        let offset = Array1::zeros(n);
+        let input = AloInput {
+            design: &x,
+            penalized_hessian: &penalized_hessian,
+            hessian_weights: SignedWeightsView::from_array(&w_h_vec),
+            score_weights: PsdWeightsView::try_from_array(&w_s_vec).expect("psd weights"),
+            working_response: &working_response,
+            eta: &eta,
+            offset: &offset,
+            link: LinkFunction::Probit,
+            phi,
+            penalty_root: None,
+            ridge: 0.0,
+            score_curvature: None,
+        };
+
+        // The fix must let this succeed (no spurious negative-meat failure)...
+        let diag = compute_alo_from_input_inner(&input)
+            .expect("fixed sandwich meat (W_S) must not trip the negative-variance guard");
+
+        // ...and match the closed-form W_S reference for every row.
+        for obs in 0..n {
+            let expected =
+                (phi * x[[obs, 0]] * x[[obs, 0]] / (h * h) * sum_ws_x2).sqrt();
+            assert!(
+                (diag.se_sandwich[obs] - expected).abs() <= 1e-10 * expected.max(1.0),
+                "row {obs}: se_sandwich={} expected={expected}",
+                diag.se_sandwich[obs]
+            );
+        }
+    }
+
+    #[test]
     fn percentile_index_matches_expected_rounding() {
         assert_eq!(percentile_index(0, 0.95), 0);
         assert_eq!(percentile_index(1, 0.95), 0);
