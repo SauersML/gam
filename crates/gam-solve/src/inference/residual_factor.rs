@@ -121,6 +121,33 @@ pub struct ResidualFactorInput<'a> {
     pub max_factor_rank: usize,
 }
 
+/// A persistent, evidence-earning residual factor direction — a promotion
+/// candidate for the #2021 Λ nursery→promotion birth channel. Emitted by
+/// [`StructuredResidualModel::promotion_candidates`] when a column of this
+/// pass's `Λ` both (a) aligns with a column of the previous pass's `Λ` (it
+/// *persisted* across the outer alternation) and (b) explains residual energy
+/// above the idiosyncratic-noise floor (it *earns its complexity*). The driver
+/// accumulates persistence across passes (the nursery) and, once a direction
+/// survives long enough, promotes it to a new curved/linear atom seeded by
+/// [`Self::direction`].
+#[derive(Clone, Debug)]
+pub struct FactorPromotion {
+    /// Unit-norm factor direction in output space (`p`-vector): the L2-normalized
+    /// column of `Λ`. This is the decoder direction a promoted atom is born with.
+    pub direction: Array1<f64>,
+    /// Explained residual energy `‖Λ_:,j‖²` (pre-normalization squared column
+    /// norm) — the factor's contribution to `Σ = c·ΛΛᵀ + D`. Candidates are
+    /// returned in descending energy so the driver promotes the strongest first.
+    pub energy: f64,
+    /// `|cos|` alignment (∈ `[0, 1]`) between this direction and the best-matching
+    /// column of the previous pass's `Λ` — the persistence score gating promotion.
+    pub persistence_alignment: f64,
+    /// Index of the best-matching previous-pass `Λ` column (the nursery lineage
+    /// this candidate continues), so the driver can track a stable identity for a
+    /// direction across passes.
+    pub prev_column: usize,
+}
+
 impl StructuredResidualModel {
     /// Fit the structured residual-covariance model by the deterministic
     /// fixed-iteration alternation, selecting the factor rank by the evidence
@@ -389,6 +416,105 @@ impl StructuredResidualModel {
     /// The penalized Gaussian log-evidence the rank-selection ladder maximized.
     pub fn log_evidence(&self) -> f64 {
         self.log_evidence
+    }
+
+    /// #2021 Λ nursery→promotion: detect *persistent, evidence-earning* factor
+    /// directions relative to the previous outer-alternation pass's model.
+    ///
+    /// A column `j` of this model's `Λ` is a [`FactorPromotion`] candidate iff
+    /// both gates hold:
+    /// 1. **Earns its complexity** (evidence gate): its explained energy
+    ///    `‖Λ_:,j‖² ≥ energy_floor_mult · mean(diag(D))`. Every column is already
+    ///    inside the evidence-ladder-selected rank (so it cleared the BIC
+    ///    penalty globally); this per-direction floor additionally requires the
+    ///    factor to explain more than an average channel's idiosyncratic noise,
+    ///    so we never promote a direction that only barely survived rank
+    ///    selection.
+    /// 2. **Persists** (nursery gate): its `|cos|` alignment with the best-
+    ///    matching column of `prev`'s `Λ` is `≥ align_min` — the direction is the
+    ///    same subspace the previous pass already found, not a new
+    ///    pass-to-pass artifact.
+    ///
+    /// Returns candidates sorted by energy (descending). `prev = None` (the first
+    /// structured pass, damping toward `I`) yields no candidates — a direction
+    /// must survive at least one pass to enter the nursery. The driver holds the
+    /// cross-pass persistence count (promote after it clears the direction's
+    /// nursery dwell) and does the actual atom birth; this method is the pure,
+    /// per-pass detector.
+    ///
+    /// Errors on non-finite / out-of-range gates (`align_min ∈ [0,1]`,
+    /// `energy_floor_mult ≥ 0`) or a `prev` with a different output dim `p`.
+    pub fn promotion_candidates(
+        &self,
+        prev: Option<&StructuredResidualModel>,
+        align_min: f64,
+        energy_floor_mult: f64,
+    ) -> Result<Vec<FactorPromotion>, String> {
+        if !align_min.is_finite() || !(0.0..=1.0).contains(&align_min) {
+            return Err(format!(
+                "StructuredResidualModel::promotion_candidates: align_min must be finite in [0,1]; got {align_min}"
+            ));
+        }
+        if !energy_floor_mult.is_finite() || energy_floor_mult < 0.0 {
+            return Err(format!(
+                "StructuredResidualModel::promotion_candidates: energy_floor_mult must be finite and ≥ 0; got {energy_floor_mult}"
+            ));
+        }
+        let prev = match prev {
+            Some(pv) => pv,
+            None => return Ok(Vec::new()),
+        };
+        if prev.p != self.p {
+            return Err(format!(
+                "StructuredResidualModel::promotion_candidates: prev output dim {} != {}",
+                prev.p, self.p
+            ));
+        }
+        let r = self.factor_rank;
+        let prev_r = prev.factor_rank;
+        if r == 0 || prev_r == 0 {
+            return Ok(Vec::new());
+        }
+        // Idiosyncratic-noise floor: a promoted direction must explain more than
+        // an average channel's independent variance.
+        let mean_d = self.diagonal.iter().copied().sum::<f64>() / self.p as f64;
+        let energy_floor = energy_floor_mult * mean_d;
+
+        let mut out: Vec<FactorPromotion> = Vec::new();
+        for j in 0..r {
+            let col = self.lambda.column(j);
+            let energy: f64 = col.iter().map(|v| v * v).sum();
+            if energy <= 0.0 || energy < energy_floor {
+                continue;
+            }
+            let norm = energy.sqrt();
+            // Best |cos| against the previous pass's columns.
+            let mut best_align = 0.0_f64;
+            let mut best_k = 0usize;
+            for k in 0..prev_r {
+                let pcol = prev.lambda.column(k);
+                let pnorm: f64 = pcol.iter().map(|v| v * v).sum::<f64>().sqrt();
+                if pnorm <= 0.0 {
+                    continue;
+                }
+                let dot: f64 = col.iter().zip(pcol.iter()).map(|(a, b)| a * b).sum();
+                let cos_abs = (dot / (norm * pnorm)).abs();
+                if cos_abs > best_align {
+                    best_align = cos_abs;
+                    best_k = k;
+                }
+            }
+            if best_align >= align_min {
+                out.push(FactorPromotion {
+                    direction: col.mapv(|v| v / norm),
+                    energy,
+                    persistence_alignment: best_align,
+                    prev_column: best_k,
+                });
+            }
+        }
+        out.sort_by(|a, b| b.energy.total_cmp(&a.energy));
+        Ok(out)
     }
 
     /// Build the per-row precision factor stack `U_n ∈ ℝ^{p×p}` with
@@ -1698,5 +1824,80 @@ mod tests {
         assert!(model.row_metric_damped(n, 1.5, None).is_err());
         assert!(model.row_metric_damped(n, -0.1, None).is_err());
         assert!(model.row_metric_damped(n, f64::NAN, None).is_err());
+    }
+
+    /// WAVE-2 #2021 Λ nursery→promotion: `promotion_candidates` must fire only
+    /// for a factor that BOTH persists across passes (aligns with the previous
+    /// model's Λ) AND clears the idiosyncratic-noise energy floor; a fresh
+    /// orthogonal direction, an over-high energy floor, and `prev = None` all
+    /// yield no candidates, and out-of-range gates are rejected.
+    #[test]
+    fn promotion_candidates_gates_on_persistence_and_energy() {
+        let lambda_a = ndarray::array![1.5, 1.2, -0.4, 0.3];
+        let lambda_b = ndarray::array![-0.6, 1.1, 0.9, -1.3];
+        // Same planted direction across two passes ⇒ persistent.
+        let (_, prev) = fit_small_model(0xA1B2C3D4_u64 ^ 0x0F0F0F0F_u64, &lambda_a);
+        let (_, cur) = fit_small_model(0x5566778899AABBCC_u64, &lambda_a);
+        // A different (well-separated) planted direction ⇒ NOT aligned with cur.
+        let (_, other) = fit_small_model(0x1122334455667788_u64, &lambda_b);
+
+        assert!(prev.factor_rank() >= 1 && cur.factor_rank() >= 1 && other.factor_rank() >= 1);
+
+        // Persistent + energetic ⇒ at least one candidate, aligned with the
+        // planted direction and above the noise floor.
+        let cands = cur
+            .promotion_candidates(Some(&prev), 0.9, 1.0)
+            .expect("promotion_candidates");
+        assert!(
+            !cands.is_empty(),
+            "a persistent, energetic factor must yield a promotion candidate"
+        );
+        let top = &cands[0];
+        assert!(
+            top.persistence_alignment >= 0.9,
+            "top candidate must clear the alignment gate; got {}",
+            top.persistence_alignment
+        );
+        // The promoted unit direction must align with the planted (unit) lambda_a.
+        let la_norm = lambda_a.dot(&lambda_a).sqrt();
+        let la_unit = lambda_a.mapv(|v| v / la_norm);
+        let dir_cos = top.direction.dot(&la_unit).abs();
+        assert!(
+            dir_cos > 0.9,
+            "promoted direction must recover the planted factor; |cos| = {dir_cos:.4}"
+        );
+        assert!(
+            (top.direction.dot(&top.direction) - 1.0).abs() < 1e-10,
+            "promoted direction must be unit-norm"
+        );
+        assert!(top.energy > 0.0);
+
+        // A fresh, well-separated direction does NOT persist ⇒ no candidate at 0.9.
+        let cross = cur
+            .promotion_candidates(Some(&other), 0.9, 1.0)
+            .expect("promotion_candidates cross");
+        assert!(
+            cross.is_empty(),
+            "a non-persistent (unaligned) factor must not be promoted; got {} candidate(s)",
+            cross.len()
+        );
+
+        // An over-high energy floor rejects even the persistent factor.
+        let floored = cur
+            .promotion_candidates(Some(&prev), 0.9, 1.0e6)
+            .expect("promotion_candidates floored");
+        assert!(
+            floored.is_empty(),
+            "energy floor must gate out factors below the noise-scaled threshold"
+        );
+
+        // prev = None (first structured pass, damping toward I) ⇒ no candidates.
+        assert!(cur.promotion_candidates(None, 0.9, 1.0).unwrap().is_empty());
+
+        // Invalid gates rejected.
+        assert!(cur.promotion_candidates(Some(&prev), 1.5, 1.0).is_err());
+        assert!(cur.promotion_candidates(Some(&prev), -0.1, 1.0).is_err());
+        assert!(cur.promotion_candidates(Some(&prev), 0.9, -1.0).is_err());
+        assert!(cur.promotion_candidates(Some(&prev), f64::NAN, 1.0).is_err());
     }
 }
