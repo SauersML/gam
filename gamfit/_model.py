@@ -918,6 +918,26 @@ class Model:
             else:
                 template[name] = "0"
 
+        # For a ``by=``-factor smooth block, the block name carries the factor
+        # level as a ``:by=<var>[<level>]`` suffix (e.g. ``s(x, by=g):by=g[a]``).
+        # Pin the grouping factor at the block's OWN level so that partial
+        # dependence reflects a fixed model property rather than the arbitrary
+        # value found in the first row of the passed frame (issue #2076).
+        by_marker = ":by="
+        by_pos = term.rfind(by_marker)
+        if by_pos != -1 and term.endswith("]"):
+            by_suffix = term[by_pos + len(by_marker) :]
+            bracket = by_suffix.find("[")
+            if bracket != -1:
+                by_var = by_suffix[:bracket]
+                by_level = by_suffix[bracket + 1 : -1]
+                if by_var in names:
+                    by_col = schema_cols[names.index(by_var)]
+                    by_levels = [str(lvl) for lvl in (by_col.get("levels") or [])]
+                    template[by_var] = next(
+                        (lvl for lvl in by_levels if lvl == by_level), by_level
+                    )
+
         term_args: tuple[str, ...] = ()
         if "(" in term and ")" in term:
             inside = term[term.index("(") + 1 : term.rindex(")")]
@@ -1221,6 +1241,19 @@ class MultinomialModel:
     @property
     def n_iter_(self) -> int:
         return int(self._metadata["iterations"])
+
+    # ------------------------------------------------------------------ persistence
+    def save(self, path: str | Path) -> None:
+        """Serialise the fitted multinomial model to ``path``.
+
+        Mirrors :meth:`Model.save`; the resulting file round-trips through
+        :func:`gamfit.load`, which reconstructs a :class:`MultinomialModel`.
+        """
+        Path(path).write_bytes(self._model_bytes)
+
+    def dumps(self) -> bytes:
+        """Return the serialised multinomial model as raw bytes."""
+        return self._model_bytes
 
     # ------------------------------------------------------------------ predict
     def predict(self, data: Any, *, interval: str | None = None, level: float = 0.95) -> Any:
