@@ -198,7 +198,11 @@ banscan_fast_fail() {
 #       KEY = sha1( request-args + tree content hash ).
 # The tree hash makes the key source-sensitive: the SAME command on the SAME
 # source serves the cached exit code + log in ~0s (HIT) and recompiles nothing;
-# any *.rs / *.toml / Cargo.lock edit changes the hash → a fresh run (MISS).
+# editing any file the ban-scanner reads — every *.rs / *.py / *.toml / *.yml /
+# *.yaml / *.sh / *.bash / *.json / Makefile in the tree, plus Cargo.lock —
+# changes the hash → a fresh run (MISS). The key surface is a superset of the
+# scan surface (see scan_surface_files0) so the gate can never serve a cached
+# pass for a tree the authoritative build.rs scanner would fail (#2092).
 #
 # Coalescing: two agents issuing the SAME live request concurrently share ONE
 # run, even if unrelated source edits happen while they are queued. The first
@@ -227,21 +231,40 @@ find "$CACHEDIR" "$REQDIR" -mindepth 1 -maxdepth 1 -mtime +7 -exec rm -rf {} + 2
 
 # `stat` flags differ by OS: macOS uses -f, GNU/Linux uses -c. Detect once.
 if stat -f '%m' "$REPO" >/dev/null 2>&1; then STAT_ARGS=(-f '%m %z %N'); else STAT_ARGS=(-c '%Y %s %n'); fi
+# Null-delimited list of every file the authoritative ban-scanner (root build.rs)
+# reads. The dedup KEY must be a superset of the SCAN inputs — otherwise build.sh
+# can serve a cached "pass" for a tree the scanner would REJECT: a violation in a
+# scanned file OUTSIDE the key leaves the hash unchanged, so the warm fleet path
+# skips cargo (and thus the scan) while cold clones / CI still fail. That gap is
+# #2092 — its 15 offenders included examples/sac_prototype.py deferred-work
+# markers and a gamfit/.github .py/.yml surface the old {src,tests,crates}/*.{rs,toml} key never
+# covered, so every warm local build passed a tree the MSI cold build failed. The
+# extension set (rs|py|toml|yml|yaml|sh|bash|json + Makefile) and the directory
+# skip-list below mirror build.rs's collect_scannable_files exactly, so the key
+# now tracks the scan surface file-for-file. Cargo.lock (no scannable extension)
+# is appended by the caller so dep bumps still invalidate.
+scan_surface_files0() {
+  find "$REPO" \
+      \( -type d \( \( -name '.?*' ! -name '.github' \) -o -name target -o -name 'target-*' \
+          -o -name node_modules -o -name __pycache__ -o -name pydeps -o -name site-packages \
+          -o -name venv -o -name dist -o -name build -o -name site \) -prune \) -o \
+      \( -type f \( -name '*.rs' -o -name '*.py' -o -name '*.toml' -o -name '*.yml' \
+          -o -name '*.yaml' -o -name '*.sh' -o -name '*.bash' -o -name '*.json' \
+          -o -name Makefile \) -print0 2>/dev/null \)
+}
 tree_hash() {
   # Source signature from file METADATA (mtime+size+path), NOT content. A full
-  # content shasum reads every one of ~1.8k files (~0.4s) on EACH call; with a
+  # content shasum reads every one of ~2.5k scanned files on EACH call; with a
   # swarm of agents that's N concurrent whole-repo reads before the lock — a
   # self-inflicted IO/CPU storm. stat-only is ~10x cheaper, and since any normal
   # edit bumps mtime (and Cargo.lock is included so dep bumps invalidate) an agent
   # always sees its own change. Set GAM_CONTENT_HASH=1 to force exact content hash.
   if [[ -n "${GAM_CONTENT_HASH:-}" ]]; then
-    { find "$REPO/src" "$REPO/tests" "$REPO/crates" -type f \( -name '*.rs' -o -name '*.toml' \) -print0 2>/dev/null \
-        | sort -z | xargs -0 shasum 2>/dev/null
-      shasum "$REPO/Cargo.toml" "$REPO/Cargo.lock" 2>/dev/null; } | shasum | cut -d' ' -f1
+    { scan_surface_files0 | sort -z | xargs -0 shasum 2>/dev/null
+      shasum "$REPO/Cargo.lock" 2>/dev/null; } | shasum | cut -d' ' -f1
   else
-    { find "$REPO/src" "$REPO/tests" "$REPO/crates" -type f \( -name '*.rs' -o -name '*.toml' \) -print0 2>/dev/null \
-        | sort -z | xargs -0 stat "${STAT_ARGS[@]}" 2>/dev/null
-      stat "${STAT_ARGS[@]}" "$REPO/Cargo.toml" "$REPO/Cargo.lock" 2>/dev/null; } | shasum | cut -d' ' -f1
+    { scan_surface_files0 | sort -z | xargs -0 stat "${STAT_ARGS[@]}" 2>/dev/null
+      stat "${STAT_ARGS[@]}" "$REPO/Cargo.lock" 2>/dev/null; } | shasum | cut -d' ' -f1
   fi
 }
 sha_str() { printf '%s' "$1" | shasum | cut -d' ' -f1; }
