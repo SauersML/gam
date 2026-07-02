@@ -2063,12 +2063,20 @@ class ManifoldSAE(nn.Module):
         if self.cfg.atom_manifold == "circle":
             theta = torch.linspace(0.0, 1.0, grid_size, dtype=anchor.dtype, device=anchor.device)
             probe = theta.reshape(grid_size, 1)
+            # The probe grid, config, and centers do not depend on the atom index,
+            # so on the circle the basis evaluation is loop-invariant: evaluate the
+            # Rust `basis_with_jet` kernel once and reuse it for every atom (only the
+            # per-atom decoder block `decoder_blocks[i]` differs). The sphere/product
+            # branches keep the call inside the loop because their probe genuinely
+            # varies per atom (it carries that atom's anchor coordinates); on the
+            # circle the per-atom call was F-1 redundant FFI evaluations, and F
+            # reaches tens of thousands at deployment dictionary widths.
+            curves = _eval_basis_on_manifold(
+                probe,
+                self.cfg,
+                self._forward_centers,
+            )
             for i in range(F):
-                curves = _eval_basis_on_manifold(
-                    probe,
-                    self.cfg,
-                    self._forward_centers,
-                )
                 out[i] = curves @ self.decoder_blocks[i]
         elif self.cfg.atom_manifold == "sphere":
             lat = torch.linspace(
