@@ -1719,12 +1719,18 @@ impl SaeManifoldOuterObjective {
         // λ_smooth (indices 1..1+K): per-atom Wood-Fasiolo EFS multiplicative
         // update (#1556). The EFS fixed point is already per-coordinate, so each
         // atom `k` gets `λ_k_new = φ̂·(rank_k − edof_k)/energy_k` written into its
-        // own step slot. `rank_k = p·rank(S_k)`, `edof_k = tr_k(H⁻¹ M_k)`, and
+        // own step slot. `rank_k = r_k·rank(S_k)`, `edof_k = tr_k(H⁻¹ M_k)`, and
         // `energy_k = <B_k, S_k B_k>` are the per-atom splits of the historical
-        // global totals.
+        // global totals. The penalized-dimension `rank_k` uses the atom's
+        // `border_frame_rank()` r_k — the number of decoder channels the `S_k`
+        // roughness penalty actually acts on (`r_k == p` on the full-`B` path, the
+        // smaller frame rank when a Grassmann frame is active), NOT the full output
+        // dim `p`. This matches the criterion's EDF trace / penalty energy / Occam
+        // derivative (all `border_frame_rank`-based); using `p` when `r_k < p`
+        // overcounted the FS numerator by `(p−r_k)·rank(S_k)` and drove
+        // `λ_smooth` too high on frame-active fits.
         let k_smooth = rho.log_lambda_smooth.len();
         let lambda_smooth_vec = rho.lambda_smooth_vec();
-        let p_out = self.term.output_dim() as f64;
         let quad_per_atom = self.term.decoder_smoothness_quadratic_form_per_atom();
         let eff_dof_per_atom = self
             .term
@@ -1732,7 +1738,7 @@ impl SaeManifoldOuterObjective {
             .map_err(|e| format!("SaeManifoldOuterObjective::efs_step: smooth dof: {e}"))?;
         for atom_idx in 0..k_smooth {
             let lambda_k = lambda_smooth_vec[atom_idx];
-            let rank_k = p_out
+            let rank_k = (self.term.atoms[atom_idx].border_frame_rank() as f64)
                 * (SaeManifoldTerm::symmetric_rank(&self.term.atoms[atom_idx].smooth_penalty)?
                     as f64);
             let quad_k = quad_per_atom[atom_idx];
@@ -1749,19 +1755,49 @@ impl SaeManifoldOuterObjective {
         }
 
         // ARD axes (indices 1+K..): Mackay fixed point with posterior variance.
-        let mut cursor = 1 + k_smooth;
-        for (k, axis_logard) in rho.log_ard.iter().enumerate() {
-            let d = axis_logard.len();
-            for j in 0..d {
-                let denom = sumsq[k][j] + traces[k][j];
-                if denom > 0.0 {
-                    let alpha_new = dispersion * n_obs / denom;
-                    if alpha_new.is_finite() && alpha_new > 0.0 {
-                        steps[cursor + j] = alpha_new.ln() - axis_logard[j];
+        // #1026 shared-ARD: in `Shared` mode several atoms alias ONE outer
+        // coordinate `1+K+axis`, so the fixed point pools the evidence across the
+        // atoms owning the axis — `α_axis_new = φ̂·(count·n) / Σ_k(‖t_kj‖²+tr_kj)` —
+        // and writes a single step. Walking a raw per-atom cursor there indexes
+        // past the flat length `1+K+max_d` (OOB) and splits one shared strength
+        // across phantom slots. In `PerAtom` mode each `(k, axis)` is its own
+        // coordinate and this reduces to the historical per-atom Mackay update.
+        match rho.ard_sharing() {
+            ArdSharing::PerAtom => {
+                for (k, axis_logard) in rho.log_ard.iter().enumerate() {
+                    for (j, &logard_kj) in axis_logard.iter().enumerate() {
+                        let denom = sumsq[k][j] + traces[k][j];
+                        if denom > 0.0 {
+                            let alpha_new = dispersion * n_obs / denom;
+                            if alpha_new.is_finite() && alpha_new > 0.0 {
+                                steps[rho.ard_flat_index(k, j)] = alpha_new.ln() - logard_kj;
+                            }
+                        }
                     }
                 }
             }
-            cursor += d;
+            ArdSharing::Shared => {
+                let max_d = rho.max_ard_axes();
+                for axis in 0..max_d {
+                    let mut denom = 0.0_f64;
+                    let mut count = 0usize;
+                    let mut shared_logard = 0.0_f64;
+                    for (k, axis_logard) in rho.log_ard.iter().enumerate() {
+                        if axis < axis_logard.len() {
+                            denom += sumsq[k][axis] + traces[k][axis];
+                            // Broadcast table: every owner carries the same value.
+                            shared_logard = axis_logard[axis];
+                            count += 1;
+                        }
+                    }
+                    if count > 0 && denom > 0.0 {
+                        let alpha_new = dispersion * n_obs * (count as f64) / denom;
+                        if alpha_new.is_finite() && alpha_new > 0.0 {
+                            steps[rho.ard_flat_index(0, axis)] = alpha_new.ln() - shared_logard;
+                        }
+                    }
+                }
+            }
         }
 
         let beta_hat = self.term.flatten_beta();
