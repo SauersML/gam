@@ -253,34 +253,47 @@ def run_arm_b(reader, test: np.ndarray, sample: np.ndarray, cfg: dict) -> dict:
     l0 = cfg["block_topk"] * cfg["block_size"]     # matched active-code count
     dev = "cuda" if torch.cuda.is_available() else "cpu"
 
-    model = _TopKSAE(d, k_atoms, l0).to(dev).double()
+    # float32, NOT float64: the forward materialises a dense (n, K)=(n, 32768)
+    # pre-activation and an equal-size scatter buffer, so f64 both doubles GPU
+    # memory and OOMs a 32768-atom SAE at batch-sized n. The reported EV is still
+    # computed in float64 (numpy) from the float32 reconstruction.
+    mb = max(1, int(cfg["minibatch"]))
+    model = _TopKSAE(d, k_atoms, l0).to(dev).float()
     opt = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
-    b_dec_init = torch.tensor(sample.mean(0), dtype=torch.float64, device=dev)
     with torch.no_grad():
-        model.b_dec.copy_(b_dec_init)
+        model.b_dec.copy_(torch.tensor(sample.mean(0), dtype=torch.float32, device=dev))
 
     t0 = time.time()
     cutoff = cfg["train_cutoff"]
     for epoch in range(cfg["epochs"]):
         rows, loss_acc = 0, 0.0
         for b in train_batches(reader, cfg["batch"], cutoff):
-            xb = torch.tensor(np.ascontiguousarray(b, dtype=np.float64), device=dev)
-            xhat, _ = model(xb)
-            loss = ((xhat - xb) ** 2).mean()
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            model.normalize_decoder()
-            rows += b.shape[0]
-            loss_acc = float(loss.detach())
+            # Sub-chunk each streamed batch: the (n, K) forward is the memory wall,
+            # so step on minibatch-sized n rather than the full 65536-row batch.
+            for s in range(0, b.shape[0], mb):
+                chunk = np.ascontiguousarray(b[s : s + mb], dtype=np.float32)
+                xb = torch.from_numpy(chunk).to(dev)
+                xhat, _ = model(xb)
+                loss = ((xhat - xb) ** 2).mean()
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+                model.normalize_decoder()
+                rows += chunk.shape[0]
+                loss_acc = float(loss.detach())
         print(f"[B] epoch {epoch} rows={rows} recon={loss_acc:.5f}", flush=True)
 
     model.eval()
+    counts = np.zeros(k_atoms, dtype=np.int64)
+    xhat_full = np.empty_like(test, dtype=np.float32)
     with torch.no_grad():
-        xt = torch.tensor(np.ascontiguousarray(test, dtype=np.float64), device=dev)
-        xhat, topi = model(xt)
-        ev_test = explained_variance(test, xhat.cpu().numpy())
-        counts = np.bincount(topi.cpu().numpy().reshape(-1), minlength=k_atoms).astype(np.int64)
+        for s in range(0, test.shape[0], mb):
+            chunk = np.ascontiguousarray(test[s : s + mb], dtype=np.float32)
+            xt = torch.from_numpy(chunk).to(dev)
+            xh, topi = model(xt)
+            xhat_full[s : s + chunk.shape[0]] = xh.cpu().numpy()
+            counts += np.bincount(topi.cpu().numpy().reshape(-1), minlength=k_atoms).astype(np.int64)
+    ev_test = explained_variance(test, xhat_full) if test.shape[0] else 0.0
     mdl = _topk_mdl(cfg, test, k_atoms, l0, d, counts)
     return {
         "arm": "B_topk_sae",
@@ -380,11 +393,15 @@ def transfer_eval(arm_a: dict, arm_b: dict, eval_dir: str, cfg: dict) -> dict:
     if model is not None:
         import torch
 
+        mb = max(1, int(cfg["minibatch"]))
+        dev = next(model.parameters()).device
+        xhat_full = np.empty_like(x, dtype=np.float32)
         with torch.no_grad():
-            xt = torch.tensor(np.ascontiguousarray(x, dtype=np.float64),
-                              device=next(model.parameters()).device)
-            xhat, _ = model(xt)
-        out["arm_B_transfer_ev"] = round(explained_variance(x, xhat.cpu().numpy()), 4)
+            for s in range(0, x.shape[0], mb):
+                chunk = np.ascontiguousarray(x[s : s + mb], dtype=np.float32)
+                xh, _ = model(torch.from_numpy(chunk).to(dev))
+                xhat_full[s : s + chunk.shape[0]] = xh.cpu().numpy()
+        out["arm_B_transfer_ev"] = round(explained_variance(x, xhat_full), 4)
     return out
 
 
