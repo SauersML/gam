@@ -2315,6 +2315,31 @@ impl SaeManifoldTerm {
             {
                 self.best_cocollapse_incumbent = Some((ev, self.snapshot_mutable_state()));
             }
+            // #2027 RESEED HYSTERESIS (cooldown). A dictionary reseeded on a recent
+            // iteration is BELOW the null floor by construction — its brand-new
+            // decoders have not been descended yet — so firing again immediately
+            // would burn the multi-start budget across adjacent iterations without
+            // ever optimizing a reseeded basin (the reseed-thrash). Defer the
+            // destructive re-diversify until the joint Newton solve has had
+            // `SAE_COCOLLAPSE_RESEED_COOLDOWN_ITERS` accepted iterations to descend
+            // the freshest basin. The keep-best incumbent was already updated above,
+            // so a good transient basin is never lost during the cooldown; only the
+            // reseed is held off. Once the gap is spent a still-degenerate dictionary
+            // is reseeded exactly as before, so a persistent co-collapse is not
+            // masked. Derived from `collapse_events` (per-fit, cleared at fit entry)
+            // — no persistent state, so a K=1 or healthy fit is byte-for-byte
+            // unchanged (it never enters this arm).
+            let last_reseed_iteration = self
+                .collapse_events
+                .iter()
+                .filter(|e| e.action == CollapseAction::Reseeded)
+                .map(|e| e.iteration)
+                .max();
+            if let Some(last) = last_reseed_iteration
+                && iteration.saturating_sub(last) < SAE_COCOLLAPSE_RESEED_COOLDOWN_ITERS
+            {
+                return Ok(());
+            }
             // Co-collapsed: every decoder is ≈0 TOGETHER. Reseed ALL atoms onto
             // DISTINCT residual PCs — keeping no "anchor", because in a true
             // co-collapse the "strongest" atom is itself degenerate, so there is no
@@ -2414,11 +2439,19 @@ impl SaeManifoldTerm {
                     action: CollapseAction::Reseeded,
                 });
             }
-            // One joint least-squares decoder refit at the re-diversified state
-            // (same rationale as the per-atom arm below): every atom, the reseeded
-            // ones especially, gets a fresh non-degenerate decoder that distributes
-            // the available signal across the dictionary.
-            self.refit_decoder_least_squares_at_current_state(target, Some(rho))?;
+            // #2027 Part A — a GREEDY DISJOINT-SUBSPACE (matching-pursuit) decoder
+            // refit REPLACES the joint least-squares refit here. The joint refit's
+            // minimum-norm solution re-spreads the leading residual direction across
+            // atoms at the near-degenerate co-collapsed Gram, undoing the disjoint
+            // coordinate reseed above; the deflation refit instead makes each atom
+            // claim residual variance no other atom already took, so the dictionary
+            // cannot re-collapse onto one shared direction in a single refit.
+            self.refit_decoder_sequential_deflation(target, rho)?;
+            // #2027 Part B — pin each row (softly) to the atom whose fresh decoder
+            // best explains it, so the joint solve keeps the disjoint assignment the
+            // deflation established instead of letting atoms trade rows and
+            // re-symmetrise across the next outer passes.
+            self.anchor_logits_to_residual_ownership(target, rho)?;
             return Ok(());
         }
         // Decide which breached atoms still have reseed budget (recording a
@@ -2638,6 +2671,188 @@ impl SaeManifoldTerm {
             self.assignment.coords[atom].set_flat(flat.view());
             let coords = self.assignment.coords[atom].as_matrix();
             self.atoms[atom].refresh_basis(coords.view())?;
+        }
+        Ok(())
+    }
+
+    /// #2027 co-collapse fix, Part A — GREEDY DISJOINT-SUBSPACE decoder refit.
+    ///
+    /// The joint decoder least-squares
+    /// ([`Self::refit_decoder_least_squares_at_current_state`]) fits ALL atoms
+    /// against the SAME target in ONE normal-equations solve. At a co-collapsed
+    /// state the freshly reseeded atoms sit on distinct residual PC pairs, but the
+    /// joint Gram is near-degenerate (the atoms' gated designs overlap heavily on
+    /// the leading residual direction), and the minimum-norm joint solution spreads
+    /// that SAME direction across several atoms — re-symmetrising the very basin the
+    /// reseed just broke. This is the mechanism behind the K≥2 co-collapse: disjoint
+    /// COORDINATE seeds are not enough while the DECODER refit is free to re-share
+    /// one direction.
+    ///
+    /// This greedy matching-pursuit refit instead lets every atom claim a DISJOINT
+    /// chunk of the residual. Repeatedly: single-atom-fit each not-yet-committed atom
+    /// against the CURRENT residual, commit the one whose gated fit explains the most
+    /// residual energy, subtract its contribution, and continue. Each atom therefore
+    /// lands on residual variance no already-committed atom took, so the dictionary
+    /// cannot collapse back onto one shared direction in a single refit — the
+    /// block-nursery sequential-composition principle, applied in-loop. The per-atom
+    /// design is the identical gated `diag(a_·k)·Φ_k` the joint audit and joint refit
+    /// use, so on a healthy, well-separated dictionary the deflation reproduces the
+    /// joint least-squares fit up to block-coordinate ordering. Deterministic: ties
+    /// resolve to the lower atom index. The `quotient_scale` peel is mirrored from
+    /// the joint refit so the amortized-amplitude bookkeeping stays consistent.
+    pub(crate) fn refit_decoder_sequential_deflation(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+    ) -> Result<(), String> {
+        let n = self.n_obs();
+        let p = self.output_dim();
+        if target.dim() != (n, p) {
+            return Err(format!(
+                "SaeManifoldTerm::refit_decoder_sequential_deflation: target shape {:?} != ({n}, {p})",
+                target.dim()
+            ));
+        }
+        let k = self.k_atoms();
+        if k == 0 || n == 0 {
+            return Ok(());
+        }
+        // Per-row gate weights, rho-keyed exactly as the joint refit reads them, so
+        // the deflation design matches the joint audit's `diag(a_·k)·Φ_k` blocks.
+        let mut gates = Array2::<f64>::zeros((n, k));
+        for row in 0..n {
+            let assignments = self.assignment.try_assignments_row_for_rho(row, rho)?;
+            for atom in 0..k {
+                gates[[row, atom]] = assignments[atom];
+            }
+        }
+        // Gated single-atom design `D_k = diag(a_·k)·Φ_k` (n × M_k).
+        let gated_design = |slf: &Self, atom: usize| -> Array2<f64> {
+            let m = slf.atoms[atom].basis_size();
+            let mut d = Array2::<f64>::zeros((n, m));
+            for row in 0..n {
+                let w = gates[[row, atom]];
+                for col in 0..m {
+                    d[[row, col]] = w * slf.atoms[atom].basis_values[[row, col]];
+                }
+            }
+            d
+        };
+        let mut residual = target.to_owned();
+        let mut remaining: Vec<usize> = (0..k).collect();
+        while !remaining.is_empty() {
+            let mut best_atom = remaining[0];
+            let mut best_energy = f64::NEG_INFINITY;
+            let mut best_beta: Option<Array2<f64>> = None;
+            for &atom in &remaining {
+                let d = gated_design(self, atom);
+                let beta = solve_design_least_squares(d.view(), residual.view())?;
+                let fit = d.dot(&beta);
+                let energy: f64 = fit.iter().map(|v| v * v).sum();
+                // Strict `>` keeps the tie-break at the lower index (deterministic).
+                if energy > best_energy {
+                    best_energy = energy;
+                    best_atom = atom;
+                    best_beta = Some(beta);
+                }
+            }
+            let beta = best_beta.expect("remaining is non-empty so a best atom was chosen");
+            let m = self.atoms[best_atom].basis_size();
+            if beta.dim() != (m, p) {
+                return Err(format!(
+                    "SaeManifoldTerm::refit_decoder_sequential_deflation: atom {best_atom} beta shape {:?} != ({m}, {p})",
+                    beta.dim()
+                ));
+            }
+            // Deflate the residual by this atom's committed gated contribution.
+            let d = gated_design(self, best_atom);
+            let fit = d.dot(&beta);
+            residual = &residual - &fit;
+            for col in 0..m {
+                for out in 0..p {
+                    self.atoms[best_atom].decoder_coefficients[[col, out]] = beta[[col, out]];
+                }
+            }
+            self.atoms[best_atom].refresh_intrinsic_smooth_penalty();
+            // #2022 refit-peel, mirrored from the joint refit (default-off; a no-op
+            // unless the scale-gauge quotient is armed on this term).
+            if self.quotient_scale {
+                self.atoms[best_atom].log_amplitude = 0.0;
+                self.atoms[best_atom].absorb_decoder_norm_into_log_amplitude(f64::MIN_POSITIVE);
+            }
+            remaining.retain(|&a| a != best_atom);
+        }
+        Ok(())
+    }
+
+    /// #2027 co-collapse fix, Part B — soft ROW-OWNERSHIP ANCHOR.
+    ///
+    /// Disjoint coordinate seeding (Part of `reseed_atoms_onto_distinct_residual_pcs`)
+    /// plus the greedy deflation refit ([`Self::refit_decoder_sequential_deflation`])
+    /// give each reseeded atom its OWN residual subspace and decoder. Nothing,
+    /// however, PINS a data row to the atom that best explains it: the IBP / softmax
+    /// gate lets any atom claim any row, so the joint (t, β, gate) solve can let two
+    /// atoms trade rows across successive outer passes and re-symmetrise into a shared
+    /// basin — the "atoms trade rows each outer pass" half of the co-collapse.
+    ///
+    /// This installs a SOFT ownership prior: for each row, find the atom whose current
+    /// decoder best matches that row's target direction (the alignment
+    /// `⟨target_row, Φ_k(t)·B_k⟩`, which credits the atom that both reconstructs the
+    /// row AND points the right way), then NUDGE that atom's gate logit up by one
+    /// temperature unit and every other atom's down by one — a relative bias in the
+    /// gate's own logit scale, not a hard partition, so the IBP prior `π_k` and the
+    /// subsequent Newton descent still move gates freely. The nudge simply gives each
+    /// atom a stable territory to descend FROM, so the joint solve keeps the disjoint
+    /// assignment the deflation established instead of collapsing it. Softmax logits
+    /// are re-canonicalized after the nudge. A K=1 dictionary has no ownership to
+    /// contest, so this is a no-op there.
+    pub(crate) fn anchor_logits_to_residual_ownership(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        _rho: &SaeManifoldRho,
+    ) -> Result<(), String> {
+        let n = self.n_obs();
+        let p = self.output_dim();
+        let k = self.k_atoms();
+        if n == 0 || k < 2 {
+            return Ok(());
+        }
+        // Per-row owner = argmax_k ⟨target_row, Φ_k(t_row)·B_k⟩. The alignment is
+        // read from the atom's OWN decoder (ungated), so a momentarily-collapsed
+        // gate cannot hide the atom that genuinely explains the row.
+        let mut owner = vec![0usize; n];
+        for row in 0..n {
+            let mut best = 0usize;
+            let mut best_align = f64::NEG_INFINITY;
+            for atom in 0..k {
+                let m = self.atoms[atom].basis_size();
+                let phi = &self.atoms[atom].basis_values;
+                let b = &self.atoms[atom].decoder_coefficients;
+                let mut align = 0.0_f64;
+                for out in 0..p {
+                    let mut recon = 0.0_f64;
+                    for col in 0..m {
+                        recon += phi[[row, col]] * b[[col, out]];
+                    }
+                    align += recon * target[[row, out]];
+                }
+                if align > best_align {
+                    best_align = align;
+                    best = atom;
+                }
+            }
+            owner[row] = best;
+        }
+        // One-temperature-unit relative nudge in the gate's own logit scale.
+        let bias = self.assignment.mode.temperature().max(f64::MIN_POSITIVE);
+        for row in 0..n {
+            for atom in 0..k {
+                let delta = if atom == owner[row] { bias } else { -bias };
+                self.assignment.logits[[row, atom]] += delta;
+            }
+        }
+        if matches!(self.assignment.mode, AssignmentMode::Softmax { .. }) {
+            canonicalize_softmax_logits(&mut self.assignment.logits);
         }
         Ok(())
     }
