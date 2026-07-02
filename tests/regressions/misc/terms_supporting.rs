@@ -21,7 +21,7 @@ fn bug_term_builder_duchon_defaults_and_rejection() {
         parse_duchon_order(&empty).expect("default duchon order should parse"),
         DuchonNullspaceOrder::Linear,
         "Duchon order with no explicit option should default to the affine nullspace \
-         {1, x₁, …, x_d} used by the structural cubic Duchon default."
+         {{1, x₁, …, x_d}} used by the structural cubic Duchon default."
     );
 
     let mut bad = BTreeMap::<String, String>::new();
