@@ -502,6 +502,20 @@ pub(crate) fn effective_df_floor_rho_upper_bounds(
             if unit_weight_term_edf(&gammas, ceiling) >= EFFECTIVE_DF_FLOOR {
                 continue;
             }
+            // If the existing lower side of the box has already smoothed this
+            // term below the structural floor, the floor is not enforceable
+            // inside the optimizer's admissible domain. Do not manufacture an
+            // upper bound numerically indistinguishable from (or below, after
+            // the optimizer's strict bound-validation tolerance is applied)
+            // the lower bound: that turns a legitimate model into an invalid
+            // rho-box before the data likelihood is even evaluated. This case
+            // occurs for very weakly scaled range-space directions, including
+            // dispersion location-scale smooths whose unit-weight generalized
+            // eigenvalues can put the edf=1 crossing just outside the default
+            // [-10, 10] rho box.
+            if unit_weight_term_edf(&gammas, -ceiling) <= EFFECTIVE_DF_FLOOR {
+                continue;
+            }
             let mut lo = -ceiling;
             let mut hi = ceiling;
             for _ in 0..64 {
@@ -516,7 +530,7 @@ pub(crate) fn effective_df_floor_rho_upper_bounds(
             // Tied coordinates: take the tightest (smallest) bound across terms,
             // so every term sharing this λ retains at least the floor.
             let slot = &mut upper[outer];
-            if rho_star > -ceiling && rho_star < *slot {
+            if rho_star > -ceiling + 1e-6 && rho_star < *slot {
                 *slot = rho_star;
             }
         }

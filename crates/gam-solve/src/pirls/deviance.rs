@@ -122,10 +122,10 @@ pub fn calculate_deviance(
     const MU_FLOOR: f64 = 1e-10;
     match &likelihood.spec.response {
         ResponseFamily::Binomial => {
-            use rayon::iter::{IntoParallelIterator, ParallelIterator};
-            let total_residual: f64 = (0..y.len())
-                .into_par_iter()
-                .map(|i| {
+            let total_residual: f64 = RowSet::All.par_reduce_fold(
+                y.len(),
+                || 0.0_f64,
+                |acc, i, _row_weight| {
                     let yi = y[i];
                     // Inverse links (probit, cloglog, logit) can saturate to
                     // exactly 0 or 1 in finite precision; clamp before ln so
@@ -144,9 +144,10 @@ pub fn calculate_deviance(
                     } else {
                         0.0
                     };
-                    wi * (term1 + term2)
-                })
-                .sum();
+                    acc + wi * (term1 + term2)
+                },
+                |a, b| a + b,
+            );
             2.0 * total_residual
         }
         ResponseFamily::Gaussian => {

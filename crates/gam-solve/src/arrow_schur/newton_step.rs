@@ -317,8 +317,7 @@ pub(crate) fn maybe_inject_gpu_schur_matvec(
         return None;
     }
     let matvec =
-        crate::gpu_kernels::arrow_schur::gpu_schur_matvec_backend(sys, ridge_t, ridge_beta)
-            .ok()?;
+        crate::gpu_kernels::arrow_schur::gpu_schur_matvec_backend(sys, ridge_t, ridge_beta).ok()?;
     let mut device_options = options.clone();
     device_options.gpu_matvec = Some(matvec);
     Some(device_options)
@@ -570,15 +569,31 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
             // On any failure forming/factoring the Schur (non-PD pivot the LM
             // escalation must respond to), surface the error rather than returning a
             // cache that would silently starve the evidence of its log-det.
-            let schur = match build_dense_schur_direct(sys, htt_factors, ridge_beta, backend) {
-                Ok(schur) => schur,
-                Err(err) => return Some(Err(err)),
-            };
             let (schur_factor, schur_log_det_override) = if sys.k >= SCHUR_SLQ_LOGDET_MIN_DIM {
-                // Matrix-free (flop) log|S| via SLQ on the SPD reduced Schur.
-                let slq = crate::arrow_schur::slq_logdet(
-                    sys.k,
-                    |v| schur.dot(&v),
+                // Matrix-free log|S| via SLQ on the exact reduced-Schur apply.
+                //
+                // IMPORTANT (#1017): do not build the dense `k×k` Schur here.
+                // The old implementation still called `build_dense_schur_direct`
+                // before this branch and then ran SLQ over `schur.dot(v)`, which
+                // removed the Cholesky but left the production color/Qwen path
+                // paying (or refusing/OOMing) the dense assembly.  The whole
+                // point of the SAE Direct device-PCG seam is that the step is
+                // solved matrix-free; the evidence log-det must consume the same
+                // matrix-free reduced operator.  `slq_reduced_schur_log_det`
+                // stages the CPU resident row factors when available and then
+                // applies
+                //
+                //     S v = (H_ββ + ρ_β I)v
+                //           - Σ_i H_βt_i (H_tt_i + ρ_t I)⁻¹ H_tβ_i v
+                //
+                // without materialising `S`.
+                let resident = SaeResidentReducedSchur::build(sys, htt_factors, backend);
+                let slq = crate::arrow_schur::slq_reduced_schur_log_det(
+                    sys,
+                    htt_factors,
+                    ridge_beta,
+                    backend,
+                    resident.as_ref(),
                     SCHUR_SLQ_LOGDET_PROBES,
                     SCHUR_SLQ_LOGDET_LANCZOS_STEPS,
                     SCHUR_SLQ_LOGDET_SEED,
@@ -606,6 +621,10 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
                 // `solve_dense_reduced_system` (the exact CPU Direct reduce) so the
                 // emitted factor — and therefore the log-det — is bit-identical to
                 // the non-device path.
+                let schur = match build_dense_schur_direct(sys, htt_factors, ridge_beta, backend) {
+                    Ok(schur) => schur,
+                    Err(err) => return Some(Err(err)),
+                };
                 let factor = match solve_dense_reduced_system(&schur, rhs_beta, options, None) {
                     Ok((_cpu_delta_beta, Some(factor), _diag)) => factor,
                     Ok((_, None, _)) => {
@@ -649,7 +668,10 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
         // Unavailable / transient / framed-mismatch all mean "device declined" —
         // fall through to the CPU dense Direct path transparently.
         Err(other) => {
-            trace_decline!("device kernel returned {:?} — falling back to CPU dense", other);
+            trace_decline!(
+                "device kernel returned {:?} — falling back to CPU dense",
+                other
+            );
             None
         }
     }
@@ -1144,8 +1166,7 @@ pub(crate) fn factor_blocks_for_system<B: BatchedBlockSolver>(
     };
     let mut blocks = Vec::with_capacity(sys.rows.len());
     let mut count = 0usize;
-    let mut deflated_row_directions: Vec<Vec<Array1<f64>>> =
-        Vec::with_capacity(sys.rows.len());
+    let mut deflated_row_directions: Vec<Vec<Array1<f64>>> = Vec::with_capacity(sys.rows.len());
     let mut deflation_row_spectra: Vec<Option<RowDeflationSpectrum>> =
         Vec::with_capacity(sys.rows.len());
     for (row_idx, row) in sys.rows.iter().enumerate() {
@@ -1297,8 +1318,14 @@ pub(crate) fn try_mixed_precision_arrow_solve(
         }));
     }
 
-    let schur_factor =
-        cholesky_lower(schur).map_err(|e| ArrowSchurError::SchurFactorFailed { reason: e })?;
+    let (schur_factor, floored_schur) =
+        factor_dense_reduced_schur(schur, options.schur_pd_floor, false)?;
+    if floored_schur.is_some() {
+        return Ok(Some(MixedPrecisionAttempt::Fallback {
+            reason: "reduced Schur required the spectral PD-floor; using the f64 dense solve"
+                .to_string(),
+        }));
+    }
     if !options.tolerate_ill_conditioning {
         let schur_kappa = cholesky_factor_kappa_estimate(&schur_factor);
         if !schur_kappa.is_finite() || schur_kappa > safe_spd_kappa_max(schur.nrows()) {
@@ -2014,6 +2041,7 @@ impl<'a, B: BatchedBlockSolver> ArrowBlockDiagInverse<'a, B> {
         sys: &'a ArrowSchurSystem,
         ridge_t: f64,
         ridge_beta: f64,
+        schur_pd_floor: Option<f64>,
         tolerate_ill_conditioning: bool,
         backend: &'a B,
     ) -> Result<Self, ArrowSchurError>
@@ -2023,8 +2051,7 @@ impl<'a, B: BatchedBlockSolver> ArrowBlockDiagInverse<'a, B> {
         let htt_factors =
             backend.factor_blocks(&sys.rows, ridge_t, sys.d, tolerate_ill_conditioning)?;
         let schur = build_dense_schur_direct(sys, &htt_factors, ridge_beta, backend)?;
-        let schur_factor =
-            cholesky_lower(&schur).map_err(|e| ArrowSchurError::SchurFactorFailed { reason: e })?;
+        let (schur_factor, _) = factor_dense_reduced_schur(&schur, schur_pd_floor, false)?;
         Ok(Self {
             sys,
             backend,
@@ -2324,6 +2351,7 @@ pub(crate) fn solve_arrow_newton_step_cross_row(
         sys,
         ridge_t,
         ridge_beta,
+        options.schur_pd_floor,
         options.tolerate_ill_conditioning,
         &backend,
     )?;
