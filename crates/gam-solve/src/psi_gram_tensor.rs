@@ -109,6 +109,16 @@ pub const PSI_GRAM_SKIP_RANK_RTOL: f64 = 1.0e-10;
 /// of magnitude, so it refuses the skip well before the ~1e-6 β̂ bar is at risk.
 pub const PSI_GRAM_SKIP_PROJ_ATOL: f64 = 1.0e-7;
 
+/// Bisection budget for the rank-stable ψ-band edge search
+/// ([`PsiGramTensor::rank_stable_psi_floor`] / `_ceiling`). The band edge is a
+/// monotone crossing of the projector witness, so bisection converges to the
+/// true edge in `ceil(log2(span/atol))` steps — 64 caps any window to well
+/// below machine precision, and the relative `ATOL` break stops earlier in
+/// practice. Replaces the former fixed 96-node grid scan (SPEC: grid search is
+/// never allowed, #2054); each witness eval is O(k³), independent of n.
+const PSI_BAND_BISECTION_ITERS: usize = 64;
+const PSI_BAND_BISECTION_ATOL: f64 = 1.0e-10;
+
 /// Certified Chebyshev-in-ψ expansion of a design-moving Gram (#1033b).
 ///
 /// Holds the one-time Chebyshev sufficient-statistic series; every per-trial
@@ -744,54 +754,49 @@ impl PsiGramTensor {
     /// geometry — at small ψ the longest-scale mode collapses into the polynomial
     /// nullspace, and at very large ψ every radial column goes collinear with it.
     /// The skip-acceptable region is therefore a middle BAND, and the κ-optimum
-    /// lives inside it. We walk DOWN from the anchor on a fixed k-space grid and
-    /// return the lowest ψ still sharing the anchor's reduced projector (stopping
-    /// at the first node the actual skip witness refuses). Purely O(nodes·k³) —
-    /// no row access.
+    /// lives inside it. We bisect DOWN from the anchor on the projector witness
+    /// and return the lowest ψ still sharing the anchor's reduced projector — the
+    /// true lower band edge, resolved continuously rather than snapped to a fixed
+    /// grid (#2054). Purely O(iters·k³) — no row access.
     ///
     /// Returns `None` when the band already reaches `psi_lo` (no lift needed), when
     /// the anchor is off-window / projector-indeterminate, or when the window is empty.
     pub fn rank_stable_psi_floor(&self, psi_anchor: f64) -> Option<f64> {
-        // Fixed k-space grid over the window. 96 nodes resolves the rank cliff
-        // (~1 ψ-decade wide on production Duchon geometry) far finer than the
-        // optimizer's ~ln2 step; the whole scan is O(nodes·k³), independent of n.
-        const NODES: usize = 96;
         if !(self.psi_hi > self.psi_lo) {
             return None;
         }
-        let span = self.psi_hi - self.psi_lo;
-        let psi_at = |i: usize| self.psi_lo + span * (i as f64) / ((NODES - 1) as f64);
         if !self.contains(psi_anchor) {
             return None;
         }
-        let accepts_anchor = |psi: f64| self.reduced_basis_equal(psi_anchor, psi);
-        // Map the anchor to the nearest grid node, then snap UP to the nearest node
-        // whose reduced projector matches the anchor (so the band edge is measured
-        // from inside the exact same skip-acceptable component even if the seed
-        // sits just outside a grid node). If no accepting node exists at/above the
-        // anchor, there is nothing reliable to protect below it.
-        let anchor = psi_anchor.clamp(self.psi_lo, self.psi_hi);
-        let anchor_idx = (((anchor - self.psi_lo) / span) * ((NODES - 1) as f64))
-            .round()
-            .clamp(0.0, (NODES - 1) as f64) as usize;
-        let band_idx = (anchor_idx..NODES).find(|&i| accepts_anchor(psi_at(i)))?;
-        // Walk DOWN from the band node; the floor is the lowest node from which
-        // every node up to it shares the anchor's reduced projector. Stop at the
-        // first node below that the actual skip witness would refuse.
-        let mut floor_idx = band_idx;
-        for i in (0..band_idx).rev() {
-            if accepts_anchor(psi_at(i)) {
-                floor_idx = i;
-            } else {
+        // The anchor always accepts (`reduced_basis_equal(x, x) == true`) and, per
+        // the window geometry, sits inside the contiguous skip-acceptable middle
+        // band, so `accepts` is a monotone step on `[psi_lo, psi_anchor]`: true
+        // from the anchor down to the band's lower edge, false below it. Find that
+        // edge by BISECTION on the projector witness — it converges continuously
+        // to the true crossing instead of snapping to one of a fixed grid of nodes
+        // (#2054; SPEC forbids grid search). Purely k-space (O(iters·k³)),
+        // independent of n; the witness is a property of the k×k tensor.
+        let accepts = |psi: f64| self.reduced_basis_equal(psi_anchor, psi);
+        let mut lo = self.psi_lo; // refusing endpoint (to be established)
+        if accepts(lo) {
+            // The skip-acceptable band already reaches `psi_lo` — no lift needed.
+            return None;
+        }
+        let mut hi = psi_anchor; // known accepting endpoint (accepts(anchor) == true)
+        // Invariant: `accepts(hi)` true, `accepts(lo)` false; the lower band edge
+        // is the unique crossing in `(lo, hi]`. Return the lowest accepting ψ.
+        for _ in 0..PSI_BAND_BISECTION_ITERS {
+            if hi - lo <= PSI_BAND_BISECTION_ATOL * (1.0 + hi.abs()) {
                 break;
             }
+            let mid = 0.5 * (lo + hi);
+            if accepts(mid) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
         }
-        if floor_idx == 0 {
-            // The skip-acceptable band already reaches `psi_lo` — no lift needed.
-            None
-        } else {
-            Some(psi_at(floor_idx))
-        }
+        Some(hi)
     }
 
     /// Upper edge of the contiguous skip-acceptable ψ-band, the symmetric twin of
@@ -808,56 +813,48 @@ impl PsiGramTensor {
     /// resets vanish once the optimizer's UPPER bound is clamped down to this
     /// n-free k-space ceiling, keeping every trial inside the skip-acceptable band.
     ///
-    /// Walks UP from the anchor on the same fixed k-space grid as the floor and
-    /// returns the highest ψ still accepted by `reduced_basis_equal` against the
-    /// anchor (stopping at the first node above that the actual skip witness would
-    /// refuse). Purely O(nodes·k³) — no row access, inherently n-INDEPENDENT (the
-    /// projector is a property of the k×k tensor).
+    /// Bisects UP from the anchor on the projector witness (the mirror of the
+    /// floor) and returns the highest ψ still accepted by `reduced_basis_equal`
+    /// against the anchor — the true upper band edge, resolved continuously rather
+    /// than snapped to a fixed grid (#2054). Purely O(iters·k³) — no row access,
+    /// inherently n-INDEPENDENT (the projector is a property of the k×k tensor).
     ///
     /// Returns `None` when the band already reaches `psi_hi` (no clamp needed),
     /// when the anchor is off-window / projector-indeterminate, or when the window is
     /// empty.
     pub fn rank_stable_psi_ceiling(&self, psi_anchor: f64) -> Option<f64> {
-        // Same grid + projector witness + anchor→band snap as
-        // `rank_stable_psi_floor` so the floor and ceiling bracket the SAME
-        // contiguous skip-acceptable reduced-basis component.
-        const NODES: usize = 96;
+        // Bisection mirror of `rank_stable_psi_floor` (#2054): the anchor always
+        // accepts and sits inside the contiguous band, so `accepts` is a monotone
+        // step on `[psi_anchor, psi_hi]` (true up to the upper edge, false above).
+        // Locate the edge by bisection on the projector witness rather than a
+        // fixed grid scan. Purely k-space (O(iters·k³)), independent of n.
         if !(self.psi_hi > self.psi_lo) {
             return None;
         }
-        let span = self.psi_hi - self.psi_lo;
-        let psi_at = |i: usize| self.psi_lo + span * (i as f64) / ((NODES - 1) as f64);
         if !self.contains(psi_anchor) {
             return None;
         }
-        let accepts_anchor = |psi: f64| self.reduced_basis_equal(psi_anchor, psi);
-        let anchor = psi_anchor.clamp(self.psi_lo, self.psi_hi);
-        let anchor_idx = (((anchor - self.psi_lo) / span) * ((NODES - 1) as f64))
-            .round()
-            .clamp(0.0, (NODES - 1) as f64) as usize;
-        // Snap to the nearest node at/below the anchor whose reduced projector
-        // matches the anchor (the mirror of the floor's snap-UP), so the edge is
-        // measured from inside the exact same skip-acceptable component.
-        let band_idx = (0..=anchor_idx)
-            .rev()
-            .find(|&i| accepts_anchor(psi_at(i)))?;
-        // Walk UP from the band node; the ceiling is the highest node from which
-        // every node down to it shares the anchor's reduced projector. Stop at the
-        // first node above that the actual skip witness would refuse.
-        let mut ceil_idx = band_idx;
-        for i in (band_idx + 1)..NODES {
-            if accepts_anchor(psi_at(i)) {
-                ceil_idx = i;
-            } else {
+        let accepts = |psi: f64| self.reduced_basis_equal(psi_anchor, psi);
+        let mut hi = self.psi_hi; // refusing endpoint (to be established)
+        if accepts(hi) {
+            // The skip-acceptable band already reaches `psi_hi` — no clamp needed.
+            return None;
+        }
+        let mut lo = psi_anchor; // known accepting endpoint (accepts(anchor) == true)
+        // Invariant: `accepts(lo)` true, `accepts(hi)` false; the upper band edge
+        // is the unique crossing in `[lo, hi)`. Return the highest accepting ψ.
+        for _ in 0..PSI_BAND_BISECTION_ITERS {
+            if hi - lo <= PSI_BAND_BISECTION_ATOL * (1.0 + hi.abs()) {
                 break;
             }
+            let mid = 0.5 * (lo + hi);
+            if accepts(mid) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
         }
-        if ceil_idx == NODES - 1 {
-            // The skip-acceptable band already reaches `psi_hi` — no clamp needed.
-            None
-        } else {
-            Some(psi_at(ceil_idx))
-        }
+        Some(lo)
     }
 
     /// True when `psi` lies inside the certified window.
