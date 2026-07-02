@@ -4352,6 +4352,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sparse_dictionary_transform_ffi, module)?)?;
     module.add_function(wrap_pyfunction!(block_sparse_dictionary_fit, module)?)?;
     module.add_class::<SparseDictStream>()?;
+    module.add_class::<BlockSparseDictStream>()?;
     module.add_function(wrap_pyfunction!(
         identifiable_factor_select_weights_array,
         module
@@ -5027,6 +5028,147 @@ impl SparseDictStream {
     #[getter]
     fn active(&self) -> usize {
         self.inner.active()
+    }
+
+    /// Epochs closed so far.
+    #[getter]
+    fn epochs_run(&self) -> usize {
+        self.inner.epochs_run()
+    }
+}
+
+/// Streaming (partial-fit) handle for the block-sparse lane: a native-side
+/// [`BlockSparseStreamState`] so a Python loop can stream epochs over shards of a
+/// sharded corpus without round-tripping the `K×P` frames or any `N×k` object.
+/// Mirrors [`SparseDictStream`]: `fit_begin` (seed + config), `partial_fit(shard)`
+/// routes + accumulates one shard, `end_epoch()` refreshes γ + frames and revives
+/// dead blocks, `finalize()` returns the frames + γ + per-block report. The frames,
+/// γ, and revival state warm-start across every call.
+#[pyclass(module = "gam_pyffi._rust", name = "BlockSparseDictStream")]
+struct BlockSparseDictStream {
+    inner: BlockSparseStreamState,
+}
+
+#[pymethods]
+impl BlockSparseDictStream {
+    #[new]
+    #[pyo3(signature = (
+        seed,
+        n_blocks,
+        block_size = 2,
+        block_topk = 1,
+        max_epochs = 30,
+        minibatch = 512,
+        block_tile = 1024,
+        frame_ridge = 1.0e-9,
+        aux_k = 0,
+        tolerance = 1.0e-6
+    ))]
+    fn new(
+        py: Python<'_>,
+        seed: PyReadonlyArray2<'_, f32>,
+        n_blocks: usize,
+        block_size: usize,
+        block_topk: usize,
+        max_epochs: usize,
+        minibatch: usize,
+        block_tile: usize,
+        frame_ridge: f64,
+        aux_k: usize,
+        tolerance: f64,
+    ) -> PyResult<Self> {
+        let seed_values = seed.as_array().to_owned();
+        let config = BlockSparseConfig {
+            n_blocks,
+            block_size,
+            block_topk,
+            max_epochs,
+            minibatch,
+            block_tile,
+            frame_ridge,
+            aux_k,
+            tolerance,
+        };
+        let inner = py
+            .detach(|| BlockSparseStreamState::new(seed_values.view(), &config))
+            .map_err(py_value_error)?;
+        Ok(Self { inner })
+    }
+
+    /// Route + tied-code one shard against the current frames and fold its
+    /// contributions into the running epoch. Returns `{rows, rss, alive_blocks}`.
+    fn partial_fit<'py>(
+        &mut self,
+        py: Python<'py>,
+        shard: PyReadonlyArray2<'py, f32>,
+    ) -> PyResult<Py<PyDict>> {
+        let shard_values = shard.as_array().to_owned();
+        let stats = py
+            .detach(|| self.inner.partial_fit(shard_values.view()))
+            .map_err(py_value_error)?;
+        let out = PyDict::new(py);
+        out.set_item("rows", stats.rows)?;
+        out.set_item("rss", stats.rss)?;
+        out.set_item("alive_blocks", stats.alive_blocks)?;
+        Ok(out.unbind())
+    }
+
+    /// Refresh γ + block frames from the epoch's accumulators, revive dead blocks
+    /// onto worst-reconstructed residual rows, and reset the epoch. Returns
+    /// `{explained_variance, revived, dead, gamma, converged, epoch}`.
+    fn end_epoch(&mut self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let stats = py
+            .detach(|| self.inner.end_epoch())
+            .map_err(py_value_error)?;
+        let out = PyDict::new(py);
+        out.set_item("explained_variance", stats.explained_variance)?;
+        out.set_item("revived", stats.revived)?;
+        out.set_item("dead", stats.dead)?;
+        out.set_item("gamma", stats.gamma)?;
+        out.set_item("converged", stats.converged)?;
+        out.set_item("epoch", stats.epoch)?;
+        Ok(out.unbind())
+    }
+
+    /// Hand back the trained block frames (`K×P`) + γ + per-block report + metadata:
+    /// `{decoder, gamma, block_topk, block_size, block_utilization,
+    /// block_stable_rank, epochs, explained_variance, converged}`.
+    fn finalize(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let artifact = self.inner.finalize();
+        let out = PyDict::new(py);
+        out.set_item("decoder", artifact.decoder.into_pyarray(py))?;
+        out.set_item("gamma", artifact.gamma)?;
+        out.set_item("block_topk", artifact.block_topk)?;
+        out.set_item("block_size", artifact.block_size)?;
+        out.set_item("block_utilization", artifact.block_utilization)?;
+        out.set_item("block_stable_rank", artifact.block_stable_rank)?;
+        out.set_item("epochs", artifact.epochs)?;
+        out.set_item("explained_variance", artifact.explained_variance)?;
+        out.set_item("converged", artifact.converged)?;
+        Ok(out.unbind())
+    }
+
+    /// A live copy of the current warm-started frames (`K×P`, block-orthonormal).
+    fn decoder(&self, py: Python<'_>) -> Py<PyArray2<f32>> {
+        self.inner.decoder().to_owned().into_pyarray(py).unbind()
+    }
+
+    /// Current shared tied scalar γ.
+    #[getter]
+    fn gamma(&self) -> f32 {
+        self.inner.gamma()
+    }
+
+    /// Block routing budget `k` in use (`min(block_topk, G)`).
+    #[getter]
+    fn block_topk(&self) -> usize {
+        self.inner.block_topk()
+    }
+
+    /// Block size `b`.
+    #[getter]
+    fn block_size(&self) -> usize {
+        self.inner.block_size()
     }
 
     /// Epochs closed so far.

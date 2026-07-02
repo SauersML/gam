@@ -27,6 +27,7 @@
 //! [`fit_sparse_dictionary`] (and the `gamfit` Python facade that wraps it).
 
 mod block;
+mod block_stream;
 mod codes;
 mod scoring;
 #[cfg(target_os = "linux")]
@@ -40,6 +41,9 @@ mod tests;
 pub use block::{
     BlockSparseConfig, BlockSparseFit, block_gates, block_projections_row,
     fit_block_sparse_dictionary, reconstruct_row, route_row_blocks, row_loss,
+};
+pub use block_stream::{
+    BlockEpochStats, BlockShardStats, BlockSparseStreamArtifact, BlockSparseStreamState,
 };
 pub use codes::SparseCode;
 pub use scoring::{TileScorer, top_s_online};

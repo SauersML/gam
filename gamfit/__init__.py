@@ -97,11 +97,14 @@ from ._rust import adjudicate_atom_shape  # cross-class atom-shape adjudicator (
 from ._compare import compare_models
 from ._linear_dictionary import LinearDictionaryFit, linear_dictionary_fit
 from ._sparse_dictionary import (
+    BlockSparseDictStream,
     BlockSparseDictionaryFit,
+    BlockSparseStreamArtifact,
     SparseDictStream,
     SparseDictStreamArtifact,
     SparseDictionaryFit,
     block_sparse_dictionary_fit,
+    block_sparse_dictionary_fit_begin,
     sparse_dictionary_fit,
     sparse_dictionary_fit_begin,
 )

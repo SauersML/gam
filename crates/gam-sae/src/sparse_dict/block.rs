@@ -327,7 +327,7 @@ pub(super) fn orthonormalize_block(block: &mut Array2<f32>) {
 /// Modified Gram–Schmidt orthonormalisation of the rows in place, substituting a
 /// canonical axis `e_j` for any row that collapses (so a rank-deficient seed
 /// still yields `b` orthonormal rows). f64 accumulation, f32 storage.
-fn gram_schmidt_rows(block: &mut Array2<f32>) {
+pub(super) fn gram_schmidt_rows(block: &mut Array2<f32>) {
     let (b, p) = block.dim();
     let mut basis: Vec<Vec<f64>> = Vec::with_capacity(b);
     for r in 0..b {
@@ -385,14 +385,16 @@ fn gram_schmidt_rows(block: &mut Array2<f32>) {
 // ---------------------------------------------------------------------------
 
 /// One row's block routing: the selected block indices and their signed codes.
-struct RowBlockCode {
+/// `pub(super)` so the streaming lane ([`super::block_stream`]) can consume the
+/// same per-row codes the one-shot trainer produces.
+pub(super) struct RowBlockCode {
     /// Selected block indices, length `k` (padded with block 0 + zero gate/code
     /// when the row had fewer than `k` blocks with positive gate).
-    blocks: Vec<u32>,
+    pub(super) blocks: Vec<u32>,
     /// Gate `‖z_g‖₂` per selected block, length `k`.
-    gates: Vec<f32>,
+    pub(super) gates: Vec<f32>,
     /// Signed within-block code `z_g = γ w_g`, `k×b` flattened row-major.
-    codes: Vec<f32>,
+    pub(super) codes: Vec<f32>,
 }
 
 /// Route one minibatch `block_rows` (`B×P`) against the frames, scoring blocks a
@@ -438,7 +440,7 @@ fn route_block_minibatch(
 /// Encode + route the whole corpus in minibatches. For each row: block-TopK route
 /// (`gate = ‖x D_gᵀ‖₂`), then the tied signed code `z_g = γ x D_gᵀ` for the
 /// selected blocks. Returns one [`RowBlockCode`] per row in global order.
-fn route_and_code_all(
+pub(super) fn route_and_code_all(
     x: ArrayView2<'_, f32>,
     decoder: ArrayView2<'_, f32>,
     gamma: f32,
@@ -885,7 +887,7 @@ fn block_reports(
 
 /// Stable rank `trace(C)/λ_max(C)` of a small symmetric PSD matrix (`b×b`), via a
 /// dense symmetric eigensolve. Returns 0 for an all-zero (unused) block.
-fn stable_rank_symmetric(c: ArrayView2<'_, f64>) -> f32 {
+pub(super) fn stable_rank_symmetric(c: ArrayView2<'_, f64>) -> f32 {
     use gam_linalg::faer_ndarray::FaerEigh;
     let trace: f64 = (0..c.nrows()).map(|i| c[[i, i]]).sum();
     if trace <= 1.0e-24 {
@@ -910,7 +912,7 @@ fn stable_rank_symmetric(c: ArrayView2<'_, f64>) -> f32 {
 /// rows (reusing the atom lane's [`super::update::seed_decoder`] to pick `K`
 /// distinct direction rows), then orthonormalise each block's `b` rows so every
 /// frame starts as a genuine `St(b, P)` point.
-fn seed_frames(x: ArrayView2<'_, f32>, n_blocks: usize, b: usize) -> Array2<f32> {
+pub(super) fn seed_frames(x: ArrayView2<'_, f32>, n_blocks: usize, b: usize) -> Array2<f32> {
     let k = n_blocks * b;
     let mut decoder = super::update::seed_decoder(x, k);
     for g in 0..n_blocks {

@@ -669,6 +669,259 @@ def block_sparse_dictionary_fit(
     )
 
 
+@dataclass(frozen=True)
+class BlockSparseStreamArtifact:
+    """Result of a streaming (partial-fit) block-sparse fit.
+
+    The streaming path never materialises an ``N x k`` routing (a streamed corpus
+    is re-encoded shard-by-shard through the frozen frames), so — unlike
+    :class:`BlockSparseDictionaryFit` — this artifact carries only the trained
+    block frames, the shared scalar ``γ``, the per-block report, and run metadata.
+    Call :meth:`to_fit` to route a representative sample back through the frames and
+    obtain a full :class:`BlockSparseDictionaryFit` (with the whole block->chart
+    seeding surface), or :meth:`transform` for the sparse block routing alone.
+
+    Attributes
+    ----------
+    decoder:
+        ``K x P`` block frames (``K = G*b``); each block's ``b`` rows orthonormal.
+    gamma:
+        Shared tied-encoder scalar ``γ``.
+    block_utilization, block_stable_rank:
+        Length-``G`` per-block report from the final epoch.
+    block_topk, block_size, epochs, explained_variance, converged:
+        Run metadata.
+    """
+
+    decoder: np.ndarray
+    gamma: float
+    block_topk: int
+    block_size: int
+    block_utilization: np.ndarray
+    block_stable_rank: np.ndarray
+    epochs: int
+    explained_variance: float
+    converged: bool
+
+    @property
+    def n_blocks(self) -> int:
+        """Number of blocks ``G = K / b``."""
+        return self.decoder.shape[0] // self.block_size
+
+    def transform(
+        self, X: Any, block_topk: int | None = None
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Route held-out rows ``X`` (``M x P``) through the fitted block frames,
+        returning ``(blocks, gates, codes)`` — the same block-TopK routing + tied
+        signed codes the trainer uses, against the frozen frames."""
+        x = _as_2d_f32(X, "X")
+        if x.shape[1] != self.decoder.shape[1]:
+            raise ValueError(
+                f"X must have P={self.decoder.shape[1]} columns; got {x.shape[1]}"
+            )
+        b = self.block_size
+        g_blocks = self.n_blocks
+        k = self.block_topk if block_topk is None else int(block_topk)
+        k = max(1, min(k, g_blocks))
+        w = (x @ self.decoder.T).reshape(x.shape[0], g_blocks, b)
+        gate = np.linalg.norm(w, axis=2)
+        order = np.argsort(-gate, axis=1, kind="stable")[:, :k]
+        rows = np.arange(x.shape[0])[:, None]
+        blocks = order.astype(np.uint32)
+        gates = float(abs(self.gamma)) * gate[rows, order]
+        codes = float(self.gamma) * w[rows, order, :]
+        return (
+            np.ascontiguousarray(blocks),
+            np.ascontiguousarray(gates.astype(np.float32)),
+            np.ascontiguousarray(codes.astype(np.float32)),
+        )
+
+    def to_fit(self, X: Any) -> BlockSparseDictionaryFit:
+        """Route a representative sample ``X`` through the frozen frames and return
+        a full :class:`BlockSparseDictionaryFit` — the streamed frames + γ + report
+        plus the sample's routing/reconstruction — so the ENTIRE block->chart
+        seeding surface (``block_frame`` / ``block_coords`` / ``project_residual`` /
+        ``block_seeds`` / ``seed_manifest`` …) is available on a streamed fit.
+        """
+        x = _as_2d_f32(X, "X")
+        blocks, gates, codes = self.transform(x)
+        b = self.block_size
+        p = self.decoder.shape[1]
+        fitted = np.zeros((x.shape[0], p), dtype=np.float32)
+        for j in range(self.block_topk):
+            gg = blocks[:, j].astype(np.int64)
+            for r in range(b):
+                fitted += codes[:, j, r][:, None] * self.decoder[gg * b + r]
+        return BlockSparseDictionaryFit(
+            decoder=np.ascontiguousarray(self.decoder, dtype=np.float32),
+            blocks=blocks,
+            gates=gates,
+            codes=codes,
+            gamma=float(self.gamma),
+            block_utilization=np.ascontiguousarray(self.block_utilization, dtype=np.float32),
+            block_stable_rank=np.ascontiguousarray(self.block_stable_rank, dtype=np.float32),
+            fitted=np.ascontiguousarray(fitted),
+            explained_variance=float(self.explained_variance),
+            epochs=int(self.epochs),
+            converged=bool(self.converged),
+            block_topk=int(self.block_topk),
+            block_size=int(b),
+        )
+
+
+class BlockSparseDictStream:
+    """Partial-fit streaming surface for the block-sparse lane (#1026 block ext).
+
+    Wraps the native ``BlockSparseDictStream`` handle so a Python loop can stream
+    epochs over shards of a corpus that never fits in memory at once (a sharded
+    residual-stream harvest of tens of millions of tokens). All heavy state — the
+    warm-started block frames, γ, the epoch's per-block cross-moments, the dead-
+    block revival reservoir — lives native-side; a shard round-trips only its own
+    ``shard x P`` rows through Python, so per-shard overhead is independent of ``K``
+    and of the corpus length.
+
+    Usage mirrors :class:`SparseDictStream`::
+
+        stream = BlockSparseDictStream(seed_sample, G, block_size=2, block_topk=1)
+        for _epoch in range(max_epochs):
+            for shard in reader.batches(65536):    # ShardReader batches ARE arrays
+                stream.partial_fit(shard)
+            stats = stream.end_epoch()
+            if stats["converged"]:
+                break
+        art = stream.finalize()
+
+    Parameters
+    ----------
+    seed:
+        A representative ``N_seed x P`` sample fixing ``P`` and seeding the initial
+        block frames (deterministic farthest-point + orthonormalisation).
+    n_blocks, block_size, block_topk, max_epochs, minibatch, block_tile, frame_ridge, aux_k, tolerance:
+        Identical hyper-parameters to :func:`block_sparse_dictionary_fit`.
+    """
+
+    def __init__(
+        self,
+        seed: Any,
+        n_blocks: int,
+        *,
+        block_size: int = 2,
+        block_topk: int = 1,
+        max_epochs: int = 30,
+        minibatch: int = 512,
+        block_tile: int = 1024,
+        frame_ridge: float = 1.0e-9,
+        aux_k: int = 0,
+        tolerance: float = 1.0e-6,
+    ) -> None:
+        seed_arr = _as_2d_f32(seed, "seed")
+        if block_size > seed_arr.shape[1]:
+            raise ValueError(
+                f"block_size={block_size} cannot exceed P={seed_arr.shape[1]}"
+            )
+        self._handle = rust_module().BlockSparseDictStream(
+            seed_arr,
+            int(n_blocks),
+            block_size=int(block_size),
+            block_topk=int(block_topk),
+            max_epochs=int(max_epochs),
+            minibatch=int(minibatch),
+            block_tile=int(block_tile),
+            frame_ridge=float(frame_ridge),
+            aux_k=int(aux_k),
+            tolerance=float(tolerance),
+        )
+
+    def partial_fit(self, shard: Any) -> dict[str, Any]:
+        """Route + tied-code one ``shard`` (``M x P``) against the current frames
+        and fold it into the running epoch. Accepts any 2-D float array-like,
+        including :class:`ShardReader` ``batches(n)`` blocks. Returns
+        ``{rows, rss, alive_blocks}`` (``alive_blocks`` cumulative since the last
+        :meth:`end_epoch`)."""
+        shard_arr = _as_2d_f32(shard, "shard")
+        return dict(self._handle.partial_fit(shard_arr))
+
+    def end_epoch(self) -> dict[str, Any]:
+        """Close the epoch: refresh γ + block frames from the accumulators, revive
+        dead blocks onto worst-reconstructed residual rows, reset the accumulators.
+        Returns ``{explained_variance, revived, dead, gamma, converged, epoch}``."""
+        return dict(self._handle.end_epoch())
+
+    def finalize(self) -> BlockSparseStreamArtifact:
+        """Hand back the trained block frames + γ + per-block report as a
+        :class:`BlockSparseStreamArtifact`."""
+        data = dict(self._handle.finalize())
+        return BlockSparseStreamArtifact(
+            decoder=np.ascontiguousarray(data["decoder"], dtype=np.float32),
+            gamma=float(data["gamma"]),
+            block_topk=int(data["block_topk"]),
+            block_size=int(data["block_size"]),
+            block_utilization=np.ascontiguousarray(data["block_utilization"], dtype=np.float32),
+            block_stable_rank=np.ascontiguousarray(data["block_stable_rank"], dtype=np.float32),
+            epochs=int(data["epochs"]),
+            explained_variance=float(data["explained_variance"]),
+            converged=bool(data["converged"]),
+        )
+
+    @property
+    def decoder(self) -> np.ndarray:
+        """A live copy of the current warm-started block frames (``K x P``)."""
+        return np.ascontiguousarray(self._handle.decoder(), dtype=np.float32)
+
+    @property
+    def gamma(self) -> float:
+        """Current shared tied scalar ``γ``."""
+        return float(self._handle.gamma)
+
+    @property
+    def block_topk(self) -> int:
+        """Block routing budget ``k`` in use (``min(block_topk, G)``)."""
+        return int(self._handle.block_topk)
+
+    @property
+    def block_size(self) -> int:
+        """Block size ``b``."""
+        return int(self._handle.block_size)
+
+    @property
+    def epochs_run(self) -> int:
+        """Epochs closed so far."""
+        return int(self._handle.epochs_run)
+
+
+def block_sparse_dictionary_fit_begin(
+    seed: Any,
+    n_blocks: int,
+    *,
+    block_size: int = 2,
+    block_topk: int = 1,
+    max_epochs: int = 30,
+    minibatch: int = 512,
+    block_tile: int = 1024,
+    frame_ridge: float = 1.0e-9,
+    aux_k: int = 0,
+    tolerance: float = 1.0e-6,
+) -> BlockSparseDictStream:
+    """Begin a STREAMING block-sparse fit and return a :class:`BlockSparseDictStream`.
+
+    Thin functional alias for ``BlockSparseDictStream(seed, n_blocks, ...)``
+    mirroring the ``fit_begin`` / ``partial_fit`` / ``finalize`` surface of the
+    atom lane's :func:`sparse_dictionary_fit_begin`.
+    """
+    return BlockSparseDictStream(
+        seed,
+        n_blocks,
+        block_size=block_size,
+        block_topk=block_topk,
+        max_epochs=max_epochs,
+        minibatch=minibatch,
+        block_tile=block_tile,
+        frame_ridge=frame_ridge,
+        aux_k=aux_k,
+        tolerance=tolerance,
+    )
+
+
 def sparse_dictionary_fit_begin(
     seed: Any,
     K: int,
@@ -751,11 +1004,14 @@ def sparse_dictionary_fit(
 
 
 __all__ = [
+    "BlockSparseDictStream",
     "BlockSparseDictionaryFit",
+    "BlockSparseStreamArtifact",
     "SparseDictStream",
     "SparseDictStreamArtifact",
     "SparseDictionaryFit",
     "block_sparse_dictionary_fit",
+    "block_sparse_dictionary_fit_begin",
     "sparse_dictionary_fit",
     "sparse_dictionary_fit_begin",
 ]
