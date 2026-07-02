@@ -216,17 +216,61 @@ fn fit_term_collection_forspecwith_heuristic_lambdas(
     family: LikelihoodSpec,
     options: &FitOptions,
 ) -> Result<FittedTermCollection, EstimationError> {
-    let base_design = build_term_collection_design(data, spec)?;
+    let adaptive_opts = options.adaptive_regularization.clone().unwrap_or_default();
+    let resolved_spec;
+    let design_spec = if adaptive_opts.enabled {
+        resolved_spec = ensure_matern_adaptive_center_resolution(spec, data.nrows());
+        &resolved_spec
+    } else {
+        spec
+    };
+    let base_design = build_term_collection_design(data, design_spec)?;
     fit_term_collection_on_realized_design(
         y,
         weights,
         offset,
-        spec,
+        design_spec,
         &base_design,
         heuristic_lambdas,
         family,
         options,
     )
+}
+
+fn ensure_matern_adaptive_center_resolution(
+    spec: &TermCollectionSpec,
+    n_rows: usize,
+) -> TermCollectionSpec {
+    let mut out = spec.clone();
+    for term in &mut out.smooth_terms {
+        let gam_terms::smooth::SmoothBasisSpec::Matern {
+            feature_cols,
+            spec: matern,
+            ..
+        } = &mut term.basis
+        else {
+            continue;
+        };
+        if let gam_terms::basis::CenterStrategy::FarthestPoint { num_centers } =
+            &mut matern.center_strategy
+        {
+            // Exact spatial-adaptive regularization estimates three operator
+            // weights from the fitted Matérn field and its first/second
+            // collocation derivatives.  That is a richer hyperproblem than the
+            // ordinary quadratic Matérn fit: with fewer centers than the
+            // coordinate dimension's linear scale, the radial span cannot carry
+            // even low-order directional structure, so REML can only explain the
+            // signal by pushing the adaptive operator weights into the
+            // over-smoothed mean basin.  Treat user-supplied FarthestPoint counts
+            // as a lower bound for this exact-adaptive path and ensure a modest
+            // O(d) collocation resolution.  Existing larger bases are left
+            // untouched, and the cap at n_rows preserves the reduced-rank
+            // contract.
+            let min_centers = (4 * feature_cols.len()).min(n_rows).max(*num_centers);
+            *num_centers = min_centers;
+        }
+    }
+    out
 }
 
 fn has_bounded_linear_terms(spec: &TermCollectionSpec) -> bool {
