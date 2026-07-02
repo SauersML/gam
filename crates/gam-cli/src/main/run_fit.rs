@@ -1846,17 +1846,18 @@ pub(crate) fn run_fitwith_predict_noise(
     // family is already gated as binomial by is_binomial() above, so we
     // only need to discriminate on the link.
     let location_scale_link_kind = match &family.link {
-        InverseLink::Standard(StandardLink::Logit) => {
-            let spec = mixture_linkspec
-                .ok_or_else(|| {
-                    "binomial blended-inverse-link location-scale fitting requires link(type=blended(...))"
-                        .to_string()
-                })?
-                .clone();
-            let state = state_fromspec(&spec)
-                .map_err(|e| format!("invalid blended link configuration: {e}"))?;
-            InverseLink::Mixture(state)
-        }
+        InverseLink::Standard(StandardLink::Logit) => match mixture_linkspec {
+            // An explicit `link(type=blended(...))` upgrades the default logit
+            // base link to a blended inverse-link mixture. Absent a blend spec,
+            // the default logit base link fits directly — no blend is required
+            // for the ordinary binomial-logit location-scale model.
+            Some(spec) => {
+                let state = state_fromspec(spec)
+                    .map_err(|e| format!("invalid blended link configuration: {e}"))?;
+                InverseLink::Mixture(state)
+            }
+            None => InverseLink::Standard(StandardLink::Logit),
+        },
         // `resolve_family` already upgrades `LinkFunction::Sas` /
         // `LinkFunction::BetaLogistic` to their state-bearing variants,
         // so the family arrives here fully typed.

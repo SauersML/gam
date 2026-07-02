@@ -210,16 +210,20 @@ pub(super) fn validate_binomial_log_sigma_identifiable(
     log_sigmaspec: &TermCollectionSpec,
     context: &str,
 ) -> Result<(), String> {
-    if log_sigmaspec.linear_terms.is_empty()
-        && log_sigmaspec.random_effect_terms.is_empty()
-        && log_sigmaspec.smooth_terms.is_empty()
-    {
+    // A parametric-linear log_sigma (heteroscedastic binary regression, i.e.
+    // het-probit / het-logit) is a low-dimensional scale model whose slopes are
+    // identifiable from the per-observation composite q; the ridge-regularized
+    // fit pins the confounded scale intercept, so linear log_sigma terms are
+    // accepted. A *nonparametric* free log_sigma — a random-effect or smooth
+    // formula — is an unidentified scale gauge for 0/1 Bernoulli data and is
+    // still rejected before the exact spatial joint optimizer is entered.
+    if log_sigmaspec.random_effect_terms.is_empty() && log_sigmaspec.smooth_terms.is_empty() {
         return Ok(());
     }
 
     Err(GamlssError::UnsupportedConfiguration {
         reason: format!(
-            "{context}: Bernoulli binomial location-scale data identify only the composite q = -threshold / sigma; log_sigma must be intercept-only/fixed, not a free linear, random-effect, or smooth formula"
+            "{context}: Bernoulli binomial location-scale data identify only the composite q = -threshold / sigma; log_sigma must be intercept-only/fixed or a parametric-linear scale, not a random-effect or smooth formula"
         ),
     }
     .into())
