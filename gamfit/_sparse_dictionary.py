@@ -32,6 +32,64 @@ def _as_2d_f32(values: Any, label: str) -> np.ndarray:
     return np.ascontiguousarray(arr)
 
 
+def _block_transform(
+    decoder: np.ndarray,
+    gamma: float,
+    block_size: int,
+    block_topk: int,
+    X: Any,
+    *,
+    block_tile: int = 1024,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Block out-of-sample routing ``(blocks, gates, codes)`` for held-out rows.
+
+    Delegates to the Rust core (``block_sparse_dictionary_transform_ffi``) — the same
+    group-ℓ₂ gate + block-TopK + tied signed codes the trainer uses, so held-out
+    encoding is bit-consistent with training (SPEC rule 8, python-thin). Falls back
+    to an equivalent numpy path ONLY when the compiled extension predates the symbol
+    or is unavailable (stale-build tolerance); the two agree up to f32 rounding.
+    """
+    x = _as_2d_f32(X, "X")
+    p = decoder.shape[1]
+    if x.shape[1] != p:
+        raise ValueError(f"X must have P={p} columns; got {x.shape[1]}")
+    b = int(block_size)
+    g_blocks = decoder.shape[0] // b
+    k = max(1, min(int(block_topk), g_blocks))
+    fn = None
+    try:
+        fn = getattr(rust_module(), "block_sparse_dictionary_transform_ffi", None)
+    except Exception:
+        fn = None  # extension unavailable -> pure-numpy fallback below
+    if fn is not None:
+        blocks, gates, codes = fn(
+            np.ascontiguousarray(x, dtype=np.float32),
+            np.ascontiguousarray(decoder, dtype=np.float32),
+            float(gamma),
+            int(b),
+            int(k),
+            int(block_tile),
+        )
+        return (
+            np.ascontiguousarray(blocks),
+            np.ascontiguousarray(gates),
+            np.ascontiguousarray(codes),
+        )
+    # ---- numpy fallback (documented equivalent; used only on a stale/absent ext) --
+    w = (x @ decoder.T).reshape(x.shape[0], g_blocks, b)  # M x G x b tied projections
+    gate = np.linalg.norm(w, axis=2)  # M x G  (γ-free routing gate)
+    order = np.argsort(-gate, axis=1, kind="stable")[:, :k]  # M x k block-TopK
+    rows = np.arange(x.shape[0])[:, None]
+    blocks = order.astype(np.uint32)
+    gates = float(abs(gamma)) * gate[rows, order]  # M x k presence ‖z_g‖
+    codes = float(gamma) * w[rows, order, :]  # M x k x b signed amplitude
+    return (
+        np.ascontiguousarray(blocks),
+        np.ascontiguousarray(gates.astype(np.float32)),
+        np.ascontiguousarray(codes.astype(np.float32)),
+    )
+
+
 @dataclass(frozen=True)
 class SparseDictionaryFit:
     """Result of a collapsed-linear-lane fit.
@@ -341,31 +399,10 @@ class BlockSparseDictionaryFit:
         signed codes ``z_g = γ x D_gᵀ`` the trainer uses, against the frozen
         frames. Pure block routing (no least-squares), so it is exactly the
         encoder the fit learned. ``k`` defaults to the fitted ``block_topk``.
+        Delegates to the Rust core (numpy fallback on a stale/absent extension).
         """
-        x = _as_2d_f32(X, "X")
-        if x.shape[1] != self.decoder.shape[1]:
-            raise ValueError(
-                f"X must have P={self.decoder.shape[1]} columns; got {x.shape[1]}"
-            )
-        b = self.block_size
-        g_blocks = self.n_blocks
         k = self.block_topk if block_topk is None else int(block_topk)
-        k = max(1, min(k, g_blocks))
-        # Raw tied projections w[m, g, r] = x_m · D_{g,r}.
-        w = (x @ self.decoder.T).reshape(x.shape[0], g_blocks, b)  # M x G x b
-        gate = np.linalg.norm(w, axis=2)  # M x G  (γ-free routing gate)
-        # Block-TopK by gate (ties broken toward smaller block index for
-        # determinism, matching the Rust online selector).
-        order = np.argsort(-gate, axis=1, kind="stable")[:, :k]  # M x k
-        blocks = order.astype(np.uint32)
-        rows = np.arange(x.shape[0])[:, None]
-        gates = float(abs(self.gamma)) * gate[rows, order]  # M x k presence ‖z_g‖
-        codes = float(self.gamma) * w[rows, order, :]  # M x k x b signed amplitude
-        return (
-            np.ascontiguousarray(blocks),
-            np.ascontiguousarray(gates.astype(np.float32)),
-            np.ascontiguousarray(codes.astype(np.float32)),
-        )
+        return _block_transform(self.decoder, self.gamma, self.block_size, k, X)
 
     # ---- block -> chart SEEDING SURFACE (Tier-1 block -> Tier-2 nursery) -------
     #
@@ -713,28 +750,10 @@ class BlockSparseStreamArtifact:
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Route held-out rows ``X`` (``M x P``) through the fitted block frames,
         returning ``(blocks, gates, codes)`` — the same block-TopK routing + tied
-        signed codes the trainer uses, against the frozen frames."""
-        x = _as_2d_f32(X, "X")
-        if x.shape[1] != self.decoder.shape[1]:
-            raise ValueError(
-                f"X must have P={self.decoder.shape[1]} columns; got {x.shape[1]}"
-            )
-        b = self.block_size
-        g_blocks = self.n_blocks
+        signed codes the trainer uses, against the frozen frames. Delegates to the
+        Rust core (numpy fallback on a stale/absent extension)."""
         k = self.block_topk if block_topk is None else int(block_topk)
-        k = max(1, min(k, g_blocks))
-        w = (x @ self.decoder.T).reshape(x.shape[0], g_blocks, b)
-        gate = np.linalg.norm(w, axis=2)
-        order = np.argsort(-gate, axis=1, kind="stable")[:, :k]
-        rows = np.arange(x.shape[0])[:, None]
-        blocks = order.astype(np.uint32)
-        gates = float(abs(self.gamma)) * gate[rows, order]
-        codes = float(self.gamma) * w[rows, order, :]
-        return (
-            np.ascontiguousarray(blocks),
-            np.ascontiguousarray(gates.astype(np.float32)),
-            np.ascontiguousarray(codes.astype(np.float32)),
-        )
+        return _block_transform(self.decoder, self.gamma, self.block_size, k, X)
 
     def to_fit(self, X: Any) -> BlockSparseDictionaryFit:
         """Route a representative sample ``X`` through the frozen frames and return

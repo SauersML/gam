@@ -1104,6 +1104,66 @@ fn recompute_gates(
     }
 }
 
+/// Out-of-sample block encode: route held-out rows `x` (`M×P`) against frozen
+/// block frames `decoder` (`K×P`, `K = G·b`) with tied scalar `gamma`, returning
+/// the fixed-width sparse block routing `(blocks[M,k], gates[M,k], codes[M,k,b])`.
+///
+/// This is the Rust core of the block lane's `transform`: the same group-ℓ₂ gate
+/// (`‖z_g‖₂ = γ‖x D_gᵀ‖₂`), block-TopK selection, and tied signed within-block
+/// codes (`z_g = γ x D_gᵀ`, no ReLU) the trainer uses — so held-out encoding is
+/// bit-consistent with training, and the Python facade need not reimplement it in
+/// numpy. `gates` carry the FINAL-γ presence `γ·‖x D_gᵀ‖₂`; `codes` are the signed
+/// `z_g`.
+pub fn block_sparse_dictionary_transform(
+    x: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
+    gamma: f32,
+    block_size: usize,
+    block_topk: usize,
+    block_tile: usize,
+) -> Result<(Array2<u32>, Array2<f32>, Array3<f32>), String> {
+    let b = block_size;
+    if b == 0 {
+        return Err("block_sparse_dictionary_transform: block_size must be >= 1".to_string());
+    }
+    let krows = decoder.nrows();
+    if krows == 0 || krows % b != 0 {
+        return Err(format!(
+            "block_sparse_dictionary_transform: decoder has K={krows} rows, not a multiple of \
+             block_size b={b}"
+        ));
+    }
+    if x.ncols() != decoder.ncols() {
+        return Err(format!(
+            "block_sparse_dictionary_transform: X has P={} columns but the frames have P={}",
+            x.ncols(),
+            decoder.ncols()
+        ));
+    }
+    let g = krows / b;
+    let k = block_topk.min(g).max(1);
+    // Route + tied-code every row (block-tiled internally, never N×K). A generous
+    // minibatch keeps the peak working set bounded without materialising M×G.
+    let minibatch = 4096usize;
+    let codes = route_and_code_all(x, decoder, gamma, g, b, k, minibatch, block_tile.max(1));
+
+    let m = x.nrows();
+    let mut blocks = Array2::<u32>::zeros((m, k));
+    let mut gates = Array2::<f32>::zeros((m, k));
+    let mut code_arr = Array3::<f32>::zeros((m, k, b));
+    for (i, code) in codes.iter().enumerate() {
+        for j in 0..k {
+            blocks[[i, j]] = code.blocks[j];
+            // Presence gate under the tied scalar: γ·‖w_g‖₂ = ‖z_g‖₂.
+            gates[[i, j]] = gamma.abs() * code.gates[j];
+            for r in 0..b {
+                code_arr[[i, j, r]] = code.codes[j * b + r];
+            }
+        }
+    }
+    Ok((blocks, gates, code_arr))
+}
+
 #[cfg(test)]
 #[path = "block_tests.rs"]
 mod block_tests;

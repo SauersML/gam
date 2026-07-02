@@ -167,7 +167,8 @@ pub(crate) use gam::terms::dictionary::{
 
 pub(crate) use gam::terms::sae::sparse_dict::{
     BlockSparseConfig, BlockSparseStreamState, SparseDictConfig, SparseDictStreamState,
-    fit_block_sparse_dictionary, fit_sparse_dictionary, sparse_dictionary_transform,
+    block_sparse_dictionary_transform, fit_block_sparse_dictionary, fit_sparse_dictionary,
+    sparse_dictionary_transform,
 };
 
 pub(crate) use gam::terms::sae::manifold::{

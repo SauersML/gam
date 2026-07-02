@@ -4351,6 +4351,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sparse_dictionary_fit, module)?)?;
     module.add_function(wrap_pyfunction!(sparse_dictionary_transform_ffi, module)?)?;
     module.add_function(wrap_pyfunction!(block_sparse_dictionary_fit, module)?)?;
+    module.add_function(wrap_pyfunction!(block_sparse_dictionary_transform_ffi, module)?)?;
     module.add_class::<SparseDictStream>()?;
     module.add_class::<BlockSparseDictStream>()?;
     module.add_function(wrap_pyfunction!(
@@ -4914,6 +4915,41 @@ fn block_sparse_dictionary_fit<'py>(
     out.set_item("block_topk", fit.block_topk)?;
     out.set_item("block_size", fit.block_size)?;
     Ok(out.unbind())
+}
+
+/// Out-of-sample BLOCK encode: route held-out rows `x` (`M×P`, f32) through frozen
+/// block frames `decoder` (`K×P`, `K = G·b`) with tied scalar `gamma`, returning the
+/// fixed-width sparse block routing `(blocks[M,k], gates[M,k], codes[M,k,b])` via the
+/// Rust core — the same group-ℓ₂ gate + block-TopK + tied signed codes the trainer
+/// uses. Lets the Python `transform` delegate instead of reimplementing the routing.
+#[pyfunction(signature = (x, decoder, gamma, block_size, block_topk, block_tile = 1024))]
+fn block_sparse_dictionary_transform_ffi<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray2<'py, f32>,
+    decoder: PyReadonlyArray2<'py, f32>,
+    gamma: f32,
+    block_size: usize,
+    block_topk: usize,
+    block_tile: usize,
+) -> PyResult<(Py<PyArray2<u32>>, Py<PyArray2<f32>>, Py<PyArray3<f32>>)> {
+    let x_values = x.as_array().to_owned();
+    let decoder_values = decoder.as_array().to_owned();
+    let (blocks, gates, codes) =
+        detach_py_result(py, "block_sparse_dictionary_transform", move || {
+            block_sparse_dictionary_transform(
+                x_values.view(),
+                decoder_values.view(),
+                gamma,
+                block_size,
+                block_topk,
+                block_tile,
+            )
+        })?;
+    Ok((
+        blocks.into_pyarray(py).unbind(),
+        gates.into_pyarray(py).unbind(),
+        codes.into_pyarray(py).unbind(),
+    ))
 }
 
 /// Streaming (partial-fit) handle for the collapsed linear lane: a native-side

@@ -40,7 +40,8 @@ mod tests;
 
 pub use block::{
     BlockSparseConfig, BlockSparseFit, block_gates, block_projections_row,
-    fit_block_sparse_dictionary, reconstruct_row, route_row_blocks, row_loss,
+    block_sparse_dictionary_transform, fit_block_sparse_dictionary, reconstruct_row,
+    route_row_blocks, row_loss,
 };
 pub use block_stream::{
     BlockEpochStats, BlockShardStats, BlockSparseStreamArtifact, BlockSparseStreamState,
