@@ -458,13 +458,6 @@ fn fit_standard_base(
     }
 }
 
-/// #2026: profile-likelihood grid for the magic-by-default Tweedie power `p`.
-/// mgcv's `tw()` profiles `p` over the open interval `(1, 2)`; these nine
-/// interior nodes bracket the maximizer coarsely and are then refined by a
-/// golden-section search. The endpoints `1` and `2` are excluded — the Tweedie
-/// unit-deviance / saddlepoint density is singular there.
-const TWEEDIE_PROFILE_GRID: [f64; 9] = [1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9];
-
 /// Fully-normalized (saddlepoint) Tweedie log-likelihood of a fit at a fixed
 /// variance power `p` — the profile objective maximized to estimate `p` (#2026).
 ///
@@ -546,45 +539,35 @@ fn tweedie_profile_loglik(request: &StandardFitRequest<'_>, p: f64) -> Option<f6
 }
 
 /// Estimate the Tweedie variance power `p ∈ (1, 2)` by profile likelihood, mgcv
-/// `tw()`-style (#2026): a coarse grid scan over [`TWEEDIE_PROFILE_GRID`] to
-/// bracket the maximizer, then a golden-section refinement inside the winning
-/// interval. Reuses [`tweedie_profile_loglik`] (a full refit per node) as the
-/// objective; the mean fit is robust to a misspecified `p`, but the
-/// observation-interval calibration is not, so this is what makes bare
-/// `family="tweedie"` track data whose true power ≠ 1.5.
+/// `tw()`-style (#2026), via a **golden-section search** over the whole open
+/// interval `(1, 2)` — NO fixed node grid (SPEC: grid search is never allowed;
+/// #2064). The profile objective [`tweedie_profile_loglik`] (a full mean/
+/// dispersion refit at each `p`) is smooth and unimodal in `p` for the
+/// compound-Poisson-gamma law, so golden section brackets the maximizer directly
+/// and contracts the bracket by the golden ratio each step. The mean fit is
+/// robust to a misspecified `p`, but the observation-interval calibration is
+/// not, so this is what makes bare `family="tweedie"` track data whose true
+/// power ≠ 1.5.
 fn estimate_tweedie_power(request: &StandardFitRequest<'_>) -> Result<f64, String> {
-    // Coarse grid: pick the node with the highest profile log-likelihood.
-    let mut best_p = f64::NAN;
-    let mut best_ll = f64::NEG_INFINITY;
-    for &p in TWEEDIE_PROFILE_GRID.iter() {
-        if let Some(ll) = tweedie_profile_loglik(request, p)
-            && ll > best_ll
-        {
-            best_ll = ll;
-            best_p = p;
-        }
-    }
-    if !best_p.is_finite() {
-        return Err(
-            "tweedie power profiling failed: no grid node produced a finite likelihood; \
-             set an explicit power via family=\"tweedie(p)\""
-                .to_string(),
-        );
-    }
-    // Golden-section refinement inside the bracket [best-0.1, best+0.1] ∩ (1,2).
-    // Roughly six iterations narrows the interval by ~0.618⁶ ≈ 0.056 of 0.2,
-    // i.e. to ~0.01 — finer than the physically meaningful precision of `p`.
-    const STEP: f64 = 0.1;
+    // Endpoints excluded: the Tweedie unit-deviance / saddlepoint density is
+    // singular at p = 1 (Poisson) and p = 2 (gamma).
     const EPS: f64 = 1e-3;
-    let mut a = (best_p - STEP).max(1.0 + EPS);
-    let mut b = (best_p + STEP).min(2.0 - EPS);
+    // Converge the bracket to this width in `p`; finer than the physically
+    // meaningful precision of the variance power.
+    const TOL: f64 = 1e-3;
+    let mut a = 1.0 + EPS;
+    let mut b = 2.0 - EPS;
     let inv_phi_gr = (5.0_f64.sqrt() - 1.0) / 2.0; // 1/φ ≈ 0.618
     let eval = |p: f64| tweedie_profile_loglik(request, p).unwrap_or(f64::NEG_INFINITY);
+    // Iteration count DERIVED from the tolerance (not a magic cap): each step
+    // multiplies the bracket width by `inv_phi_gr`, so `n` steps with
+    // `(b−a)·inv_phi_gr^n ≤ TOL` guarantees convergence to `TOL`.
+    let n_iter = (((TOL / (b - a)).ln() / inv_phi_gr.ln()).ceil() as i64).max(1) as usize;
     let mut c = b - inv_phi_gr * (b - a);
     let mut d = a + inv_phi_gr * (b - a);
     let mut fc = eval(c);
     let mut fd = eval(d);
-    for _ in 0..6 {
+    for _ in 0..n_iter {
         if fc >= fd {
             b = d;
             d = c;
@@ -599,20 +582,20 @@ fn estimate_tweedie_power(request: &StandardFitRequest<'_>) -> Result<f64, Strin
             fd = eval(d);
         }
     }
-    // Best of the refinement endpoints and the coarse-grid winner (the grid
-    // winner guards the rare case where the local search wandered off a flat
-    // ridge to a slightly worse interior point).
-    let mid = 0.5 * (a + b);
-    let f_mid = eval(mid);
-    let (p_hat, _) = [(best_p, best_ll), (c, fc), (d, fd), (mid, f_mid)]
-        .into_iter()
-        .fold((best_p, f64::NEG_INFINITY), |acc, (p, ll)| {
-            if ll > acc.1 { (p, ll) } else { acc }
-        });
-    let p_hat = p_hat.clamp(1.0 + EPS, 2.0 - EPS);
+    let p_hat = (0.5 * (a + b)).clamp(1.0 + EPS, 2.0 - EPS);
+    // A finite profile likelihood at the maximizer certifies the search found a
+    // usable optimum (degenerate data — every `p` non-finite — fails here rather
+    // than silently returning the interval midpoint).
+    if !tweedie_profile_loglik(request, p_hat).is_some_and(f64::is_finite) {
+        return Err(
+            "tweedie power profiling failed: the profile likelihood is non-finite across \
+             (1, 2); set an explicit power via family=\"tweedie(p)\""
+                .to_string(),
+        );
+    }
     log::info!(
-        "[tweedie#2026] estimated variance power p={p_hat:.4} by profile likelihood \
-         (bare family=\"tweedie\"); set family=\"tweedie(p)\" to pin it."
+        "[tweedie#2026] estimated variance power p={p_hat:.4} by golden-section profile \
+         likelihood (bare family=\"tweedie\"); set family=\"tweedie(p)\" to pin it."
     );
     Ok(p_hat)
 }

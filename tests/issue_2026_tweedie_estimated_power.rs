@@ -115,6 +115,41 @@ fn recovered_power(fit: &gam::StandardFitResult) -> f64 {
     }
 }
 
+/// Simulate a compound-Poisson-gamma (Jørgensen) Tweedie sample at `p_true`
+/// (mean `true_mu(x)`, dispersion `PHI`) and return the power a bare
+/// `family="tweedie"` fit estimates from it.
+fn estimated_bare_tweedie_power(p_true: f64, n: usize, seed: u64) -> f64 {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let unif01 = Uniform::new(0.0_f64, 1.0).expect("uniform x");
+    let mut x = Vec::with_capacity(n);
+    let mut y = Vec::with_capacity(n);
+    for _ in 0..n {
+        let xi: f64 = unif01.sample(&mut rng);
+        let mu = true_mu(xi);
+        let lambda = mu.powf(2.0 - p_true) / (PHI * (2.0 - p_true));
+        let shape = (2.0 - p_true) / (p_true - 1.0);
+        let scale = PHI * (p_true - 1.0) * mu.powf(p_true - 1.0);
+        let n_jumps = poisson_sample(lambda, &mut rng, &unif01);
+        let mut yi = 0.0;
+        for _ in 0..n_jumps {
+            yi += gamma_sample(shape, scale, &mut rng);
+        }
+        x.push(xi);
+        y.push(yi);
+    }
+    let ds = encode(&[("x", &x), ("y", &y)]);
+    let cfg = FitConfig {
+        family: Some("tweedie".to_string()),
+        ..FitConfig::default()
+    };
+    let FitResult::Standard(fit) =
+        fit_from_formula("y ~ x", &ds, &cfg).expect("bare tweedie fit")
+    else {
+        panic!("Tweedie(log) is a scalar GLM => expected FitResult::Standard");
+    };
+    recovered_power(&fit)
+}
+
 #[test]
 fn bare_tweedie_estimates_variance_power_from_data() {
     init_parallelism();
@@ -186,5 +221,32 @@ fn bare_tweedie_estimates_variance_power_from_data() {
          fallback p=1.5 gives error {:.4}; a working profile estimator must beat it.",
         (p_hat - P_TRUE).abs(),
         (1.5 - P_TRUE).abs(),
+    );
+}
+
+/// #2064 — the grid scan is gone; the estimator is a golden-section search over
+/// the whole open interval (1, 2). This guards the estimator on a truth that
+/// sits OFF the removed fixed grid nodes {1.1, …, 1.9}: `p_true = 1.65`, halfway
+/// between the two nearest old nodes (1.6 and 1.7). The continuous optimizer must
+/// still recover it from data — the tolerance (0.15 at n = 3000) mirrors the
+/// n = 800 / 0.2 calibration of the sibling test, scaled for the larger sample,
+/// so it is robust to the (real) sampling variance of the weakly-identified
+/// Tweedie power rather than a flaky point bound.
+#[test]
+fn tweedie_power_recovers_an_off_grid_truth() {
+    init_parallelism();
+
+    const P_OFF_GRID: f64 = 1.65;
+    let p_hat = estimated_bare_tweedie_power(P_OFF_GRID, 3000, 2_064_017);
+    eprintln!(
+        "tweedie #2064: p_true={P_OFF_GRID} n=3000 bare_p_hat={p_hat:.4} \
+         (err {:.4}); the removed grid had no node here (nearest 1.6 / 1.7)",
+        (p_hat - P_OFF_GRID).abs()
+    );
+    assert!(
+        (p_hat - P_OFF_GRID).abs() < 0.15,
+        "golden-section power estimator did not recover the off-grid truth: \
+         p̂={p_hat:.4} is {:.4} from p_true={P_OFF_GRID} (tolerance 0.15)",
+        (p_hat - P_OFF_GRID).abs()
     );
 }
