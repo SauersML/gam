@@ -617,28 +617,38 @@ class JumpReLUPenalty(_RustPenaltyModule):
 
 
 class _JumpReLUSTEFn(torch.autograd.Function):
-    """Hard-threshold forward; smooth-sigmoid Hessian-consistent STE backward.
+    """Hard-threshold JumpReLU gate — a pure-torch, on-device transcription of Rust.
 
-    Backward is derived from the same smoothed indicator the Rust
-    `JumpReLUPenalty` uses so the analytic and STE gradients agree by
-    construction (see gam/tests/jumprelu_ste.rs).
+    Forward returns the hard gate ``φ(z) = z · 1[z > τ]``; backward uses the
+    smooth surrogate ``φ̃(z) = z · σ((z − τ)/ε)`` so the activation keeps a usable
+    subgradient inside the smoothing band ``|z − τ| ≲ ε`` (a straight-through
+    estimator). The math is transcribed element-for-element from the Rust source
+    of truth ``gam::terms::analytic_penalties::jumprelu_gate_value_grad``
+    (crates/gam-terms/src/analytic_penalties/sparsity.rs), computed directly in
+    torch so no ``(N, F)`` matrix ever crosses the Python↔Rust boundary and
+    dtype/device are preserved (works on GPU without a CPU/float64 round-trip).
+    Parity is pinned by ``tests/torch/test_jumprelu_ste_parity.py``.
     """
 
     @staticmethod
     def forward(ctx: Any, z: torch.Tensor, tau: torch.Tensor, smoothing_eps: float) -> torch.Tensor:
-        # All gate / STE math lives in Rust
-        # (gam::terms::analytic_penalties::jumprelu_gate_value_grad); Python only
-        # marshals tensors so torch's backward matches the analytic smoothed gate.
-        z_np = to_numpy_f64(z).reshape(z.shape[0], -1)
-        tau_np = to_numpy_f64(tau).reshape(-1)
-        value, dphi_dz, dphi_dtau = rust_module().jumprelu_gate_value_grad(
-            z_np, tau_np, float(smoothing_eps)
-        )
-        ctx.save_for_backward(
-            from_numpy_like(dphi_dz, z).reshape_as(z),
-            from_numpy_like(dphi_dtau, z).reshape_as(z),
-        )
-        return from_numpy_like(value, z).reshape_as(z)
+        # Pure-torch, on-device transcription of the Rust source of truth
+        # `gam::terms::analytic_penalties::jumprelu_gate_value_grad`. Per element,
+        # with per-column threshold ``τ`` broadcast over rows (matching the Rust
+        # divide order for parity):
+        #   ``g         = σ((z − τ)/ε)`` (stable_logistic ≡ torch.sigmoid)
+        #   ``value     = z`` where ``z > τ`` else ``0`` (hard gate)
+        #   ``slope     = z·g·(1 − g)/ε``
+        #   ``dphi_dz   = g + slope``   ``dphi_dtau = −slope`` (smooth surrogate STE)
+        rows = z.reshape(z.shape[0], -1)
+        tau_row = tau.reshape(1, -1).to(device=rows.device, dtype=rows.dtype)
+        g = torch.sigmoid((rows - tau_row) / smoothing_eps)
+        value = torch.where(rows > tau_row, rows, torch.zeros_like(rows))
+        slope = rows * g * (1.0 - g) / smoothing_eps
+        dphi_dz = g + slope
+        dphi_dtau = -slope
+        ctx.save_for_backward(dphi_dz.reshape_as(z), dphi_dtau.reshape_as(z))
+        return value.reshape_as(z)
 
     @staticmethod
     def backward(ctx: Any, grad_output: torch.Tensor):
