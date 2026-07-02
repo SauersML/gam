@@ -1545,7 +1545,12 @@ pub(crate) fn create_thin_plate_spline_basis_scaledwithworkspace(
     } else if constrained_kernel_cols == 0 {
         (Array2::<f64>::zeros((0, 0)), Array1::<f64>::zeros(0))
     } else {
-        thin_plate_radial_reparam_from_constrained_penalty(&omega_constrained)?
+        // #1347: reparameterize in the realized data metric so the bending
+        // spectrum acquires mgcv's cliff (curvature per unit data-variance),
+        // rather than the cliff-less raw knot-Gram spectrum that lets REML buy
+        // near-free wiggle on near-linear data. G_c = (K Z)ᵀ (K Z).
+        let design_gram = symmetrize_penalty(&fast_atb(&kernel_constrained, &kernel_constrained));
+        thin_plate_radial_reparam_data_metric(&omega_constrained, &design_gram)?
     };
     let kernel_cols = radial_eigvals.len();
     let total_cols = kernel_cols + poly_cols;
