@@ -486,6 +486,12 @@ impl PredictableModel for StandardPredictor {
                         &z_row,
                         &z_row,
                         fit,
+                        // Posterior-mean band: the analytic prior-weights path
+                        // (#2077) is threaded through `predict_gamwith_uncertainty`
+                        // for the effectively-linear Gaussian identity fits it
+                        // targets; the curved posterior-mean families reaching here
+                        // are unweighted-scalar for now (None ⇒ unchanged).
+                        None,
                     );
                     result.observation_lower = obs_lower;
                     result.observation_upper = obs_upper;

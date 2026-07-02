@@ -1466,6 +1466,18 @@ pub struct PredictUncertaintyOptions {
     /// reads this field; `None` (the default) leaves the model-based interval
     /// untouched. There is no CLI flag — conformal is a library-API opt-in.
     pub conformal_level: Option<f64>,
+    /// Per-row analytic prior weights `w_i` for the WEIGHTED-Gaussian
+    /// observation (prediction) interval (#2077). A weighted Gaussian fit has
+    /// `Var(y_i) = σ²/w_i`, so the observation band's conditional response
+    /// variance is per-row `σ̂²/w_i` rather than the pooled scalar `σ̂²`
+    /// broadcast to every row — the analytic sibling of the generative
+    /// `sigma_i = σ̂/√(w_i)` scaling (#2025). These are resolved from the
+    /// PREDICTION frame's weight column (the same column / unit-weight default
+    /// `sample_replicates` uses) and threaded into [`family_observation_band`].
+    /// `None` (the default) or unit weights leave unweighted fits byte-identical.
+    /// Only the Gaussian observation band consumes this; every other family
+    /// encodes dispersion through its own precision parameter.
+    pub observation_prior_weights: Option<Array1<f64>>,
 }
 
 impl Default for PredictUncertaintyOptions {
@@ -1489,6 +1501,7 @@ impl Default for PredictUncertaintyOptions {
             boundary_band_fraction: 0.05,
             ood_gamma: 1.0,
             conformal_level: None,
+            observation_prior_weights: None,
         }
     }
 }
@@ -1945,10 +1958,44 @@ where
 /// mean SE alone — normalizing by the (much smaller, x-varying) epistemic mean
 /// SE injects spurious heteroscedasticity and under-covers `Y` in the
 /// data-dense interior (#1054).
+/// Per-row Gaussian conditional response (observation-noise) variance
+/// `Var(Y_i | μ_i) = σ̂² / w_i` (#2077).
+///
+/// A WEIGHTED Gaussian fit models `Var(y_i) = σ² / w_i`, so the observation
+/// noise a *prediction* interval must carry is heteroscedastic in the per-row
+/// prior weight — a weight-`w_i` row is `1/√(w_i)` as wide as a weight-1 row.
+/// This is the analytic-band sibling of the generative `sigma_i = σ̂/√(w_i)`
+/// scaling (#2025, `scale_gaussian_sigma_by_prior_weights`); before #2077 the
+/// analytic path broadcast the pooled scalar `σ̂²` to every row, contradicting
+/// the weight-aware `sample_replicates` path on the same model/rows.
+///
+/// `prior_weights` are the per-row weights resolved from the PREDICTION frame
+/// (the same weight column / unit-weight default `sample_replicates` resolves,
+/// via `resolve_weight_column`). `None`, a length mismatch, or a
+/// non-finite / non-positive weight falls back to `w_i = 1` for that row, so an
+/// unweighted fit is byte-identical to the pre-#2077 scalar broadcast.
+fn gaussian_observation_variance_per_row(
+    obsvar: f64,
+    n: usize,
+    prior_weights: Option<&Array1<f64>>,
+) -> Array1<f64> {
+    match prior_weights {
+        Some(weights) if weights.len() == n => Array1::from_iter(weights.iter().map(|&w| {
+            if w.is_finite() && w > 0.0 {
+                obsvar / w
+            } else {
+                obsvar
+            }
+        })),
+        _ => Array1::from_elem(n, obsvar),
+    }
+}
+
 pub(crate) fn family_response_variance<S>(
     response: &ResponseFamily,
     mean: &Array1<f64>,
     source: &S,
+    prior_weights: Option<&Array1<f64>>,
 ) -> Option<Array1<f64>>
 where
     S: UncertaintyCovarianceSource + ?Sized,
@@ -1956,7 +2003,11 @@ where
     match response {
         ResponseFamily::Gaussian => {
             let obsvar = source.observation_standard_deviation().max(0.0).powi(2);
-            Some(Array1::from_elem(mean.len(), obsvar))
+            Some(gaussian_observation_variance_per_row(
+                obsvar,
+                mean.len(),
+                prior_weights,
+            ))
         }
         ResponseFamily::Poisson => Some(mean.mapv(|mu| mu.max(0.0))),
         ResponseFamily::NegativeBinomial { theta, theta_fixed } => {
@@ -1996,6 +2047,7 @@ pub(crate) fn family_observation_band<S>(
     z_lower_per_row: &Array1<f64>,
     z_upper_per_row: &Array1<f64>,
     source: &S,
+    prior_weights: Option<&Array1<f64>>,
 ) -> (Option<Array1<f64>>, Option<Array1<f64>>)
 where
     S: UncertaintyCovarianceSource + ?Sized,
@@ -2081,7 +2133,17 @@ where
     match response {
         ResponseFamily::Gaussian => {
             let obsvar = source.observation_standard_deviation().max(0.0).powi(2);
-            let obs_se = etavar.mapv(|v| (v + obsvar).max(0.0).sqrt());
+            // Weighted Gaussian: `Var(Y_i|μ_i) = σ̂²/w_i`, so the observation
+            // noise is per-row, not the broadcast pooled scalar (#2077). Identity
+            // link ⇒ η == μ, so this widens the band symmetrically per row.
+            let obsvar_per_row =
+                gaussian_observation_variance_per_row(obsvar, eta.len(), prior_weights);
+            let obs_se = Array1::from_iter(
+                etavar
+                    .iter()
+                    .zip(obsvar_per_row.iter())
+                    .map(|(&v, &ov)| (v + ov).max(0.0).sqrt()),
+            );
             let lower = Array1::from_iter(
                 eta.iter()
                     .zip(obs_se.iter())
@@ -2671,6 +2733,7 @@ where
             &z_lower_per_row,
             &z_upper_per_row,
             source,
+            options.observation_prior_weights.as_ref(),
         )
     } else {
         (None, None)
@@ -2825,7 +2888,7 @@ fn predictive_standard_error<S>(
 where
     S: UncertaintyCovarianceSource + ?Sized,
 {
-    match family_response_variance(&family.response, mean, source) {
+    match family_response_variance(&family.response, mean, source, None) {
         Some(response_var) => Array1::from_iter(
             mean_standard_error
                 .iter()

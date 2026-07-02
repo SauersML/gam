@@ -854,6 +854,11 @@ pub fn predict_posterior_mean_generic<T: PredictionTransform>(
                     &z_row,
                     &z_row,
                     fit,
+                    // Generic transform posterior-mean band: analytic prior
+                    // weights (#2077) are threaded through the dedicated
+                    // full-uncertainty Gaussian path, not this driver (None ⇒
+                    // unchanged for the families reaching here).
+                    None,
                 );
                 result.observation_lower = obs_lower;
                 result.observation_upper = obs_upper;

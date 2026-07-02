@@ -6426,6 +6426,23 @@ fn predict_columns(
     let offset = resolve_offset_column(&dataset, &col_map, model.offset_column.as_deref())?;
     let offset_noise =
         resolve_offset_column(&dataset, &col_map, model.noise_offset_column.as_deref())?;
+    // Resolve the analytic prior-weights column from the PREDICTION frame exactly
+    // as `generative_replicates_impl`/`sample_replicates` does (#2077). A weighted
+    // Gaussian fit has `Var(y_i) = σ²/w_i`, so the analytic observation
+    // (prediction) interval's conditional response variance is per-row `σ̂²/w_i`,
+    // not the pooled scalar `σ̂²` broadcast to every row. `resolve_weight_column`
+    // returns unit weights when the model carried no weight column, and we only
+    // forward weights when the model was actually fitted with a weight column that
+    // is present in the prediction frame — so unweighted fits stay byte-identical
+    // and a missing column degrades to unit weights (the correct default).
+    let weight_column = model
+        .weight_column
+        .as_deref()
+        .filter(|name| col_map.contains_key(*name));
+    let observation_prior_weights = match weight_column {
+        Some(_) => Some(resolve_weight_column(&dataset, &col_map, weight_column)?),
+        None => None,
+    };
     let predict_input = build_predict_input_for_model(
         &model,
         dataset.values.view(),
@@ -6557,6 +6574,10 @@ fn predict_columns(
                 mean_interval_method: gam_predict::MeanIntervalMethod::TransformEta,
                 includeobservation_interval,
                 apply_bias_correction: false,
+                // Weighted-Gaussian observation band is heteroscedastic in the
+                // per-row prior weight `Var(y_i)=σ̂²/w_i` (#2077); unweighted fits
+                // pass `None` and stay byte-identical.
+                observation_prior_weights: observation_prior_weights.clone(),
                 ..gam_predict::PredictUncertaintyOptions::default()
             };
             let prediction = predictor
