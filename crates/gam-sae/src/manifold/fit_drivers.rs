@@ -4,6 +4,31 @@ use super::*;
 /// Hessian unfactorable.
 const SAE_MANIFOLD_ROW_RIDGE_MAX_ATTEMPTS: usize = 12;
 
+/// #2022 (EXPERIMENT) — SCALE-gauge quotient opt-in. Reads the
+/// `GAM_SAE_QUOTIENT_SCALE` env lever: when truthy, the decoder is confined to
+/// the unit Frobenius sphere per Newton step (retract) with its magnitude peeled
+/// into the explicit per-atom log-amplitude `s`, removing the SCALE gauge
+/// flat-direction. DEFAULT OFF: push CI runs only the release build (no tests),
+/// so the default path must stay verified-inert — off ⇒ no retract ⇒ `s ≡ 0` ⇒
+/// bit-for-bit (the always-on assembly `exp(s)` scaling is inert at `s = 0`).
+/// Flip the default on only after the dispatched Rust CI shows the FD gate green.
+/// Truthy = anything but unset / empty / "0" / "false" / "no" (case-insensitive).
+///
+/// TODO(#2022): promote to a typed fit-config field once the FD gate + a quality
+/// run confirm it — no permanent hidden env levers.
+pub(crate) fn sae_quotient_scale_enabled() -> bool {
+    std::env::var("GAM_SAE_QUOTIENT_SCALE")
+        .ok()
+        .map(|s| {
+            let t = s.trim();
+            !(t.is_empty()
+                || t == "0"
+                || t.eq_ignore_ascii_case("false")
+                || t.eq_ignore_ascii_case("no"))
+        })
+        .unwrap_or(false)
+}
+
 impl SaeManifoldTerm {
     pub fn solve_newton_step(
         &mut self,
@@ -2673,7 +2698,30 @@ impl SaeManifoldTerm {
                 beta[idx] += step_size * delta_beta[idx];
             }
         }
-        self.set_flat_beta(beta.view())
+        self.set_flat_beta(beta.view())?;
+        // #2022 STEP2 — sphere retract + peel. After the Euclidean β step writes
+        // B'_k, project each decoder onto the unit Frobenius sphere and move its
+        // magnitude into the explicit log-amplitude: B''_k = B'_k/‖B'_k‖,
+        // s_k += ln‖B'_k‖. This holds ‖B_k‖≡1 per iterate and puts scale solely
+        // in s, removing the SCALE gauge flat-direction, while preserving the
+        // reconstruction just written (exp(s')·B'' == exp(s)·B'). The joint β
+        // Newton step already optimized the decoder magnitude, so the peeled s is
+        // the concentrated scale optimum — no target/residual needed here.
+        // absorb_* no-ops an already-unit / collapsed decoder. exp(0)=1 keeps the
+        // pre-#2022 path bit-for-bit until an amplitude first appears.
+        //
+        // #2022 gate: the SCALE-gauge quotient (retract+peel) is behind the
+        // default-OFF `GAM_SAE_QUOTIENT_SCALE` env lever. Push CI runs only the
+        // release BUILD (no tests), so the default path stays verified-inert: off
+        // ⇒ no retract ⇒ s stays 0 ⇒ bit-for-bit (the always-on assembly exp(s)
+        // is inert at s=0). Flip the default to on after the dispatched Rust CI
+        // confirms the FD gate green.
+        if sae_quotient_scale_enabled() {
+            for atom in self.atoms.iter_mut() {
+                atom.absorb_decoder_norm_into_log_amplitude(f64::MIN_POSITIVE);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn solve_fixed_decoder_row_step(

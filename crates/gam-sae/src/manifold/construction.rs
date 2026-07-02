@@ -4817,7 +4817,12 @@ impl SaeManifoldTerm {
                                     // with the `√w_row` on the residual (β gradient =
                                     // `a·φ · M r` ⇒ w_row) and with itself (β Gram `G` and the
                                     // htbeta Kronecker capture ⇒ w_row). `1.0` when unweighted.
-                                    let w = a_k * phi * sqrt_row_w;
+                                    // #2022 — β data-fit Jacobian of exp(s)·a·Φ·B is
+                                    // exp(s)·a·Φ (∂/∂B). The coord Jacobian + residual
+                                    // already carry exp(s) via fill_decoded_*; this is the
+                                    // one inline site that needs it. exp(0)=1 ⇒ bit-for-bit
+                                    // when no amplitude is set.
+                                    let w = a_k * phi * sqrt_row_w * atom.log_amplitude.exp();
                                     a_phi.push((atom_beta_off + basis_col * p, w));
                                     wphi.push(w);
                                 }
@@ -4849,7 +4854,12 @@ impl SaeManifoldTerm {
                                     let a_k = assignments[atom_idx];
                                     for basis_col in 0..m {
                                         let phi = atom.basis_values[[row, basis_col]];
-                                        let w = a_k * phi * sqrt_row_w;
+                                        // #2022 — β data-fit Jacobian of exp(s)·a·Φ·B is
+                                    // exp(s)·a·Φ (∂/∂B). The coord Jacobian + residual
+                                    // already carry exp(s) via fill_decoded_*; this is the
+                                    // one inline site that needs it. exp(0)=1 ⇒ bit-for-bit
+                                    // when no amplitude is set.
+                                    let w = a_k * phi * sqrt_row_w * atom.log_amplitude.exp();
                                         if w == 0.0 {
                                             continue;
                                         }
