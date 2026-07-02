@@ -1057,9 +1057,7 @@ class Model:
         return math.exp(log_diff)
 
     def _model_class_from_payload(self) -> str:
-        return rust_module().required_saved_model_payload_string(
-            self._model_bytes, "model_kind"
-        )
+        return rust_module().saved_model_predict_class_name(self._model_bytes)
 
     def _family_from_payload(self) -> str:
         return rust_module().required_saved_model_payload_string(

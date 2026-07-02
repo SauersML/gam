@@ -1311,6 +1311,27 @@ fn required_saved_model_payload_string(model_bytes: Vec<u8>, key: &str) -> PyRes
     required_saved_model_payload_string_value(&model_bytes, key)
 }
 
+/// The canonical fine-grained prediction class label for a saved model — e.g.
+/// `"bernoulli marginal-slope"`, `"survival marginal-slope"`, `"competing
+/// risks survival"`, `"latent survival"`, `"gaussian location-scale"`,
+/// `"transformation-normal"`, or `"standard"`.
+///
+/// The persisted `model_kind` field is the *coarse* [`ModelKind`] enum, which
+/// collapses distinct model classes onto a single tag: both bernoulli- and
+/// survival-marginal-slope serialize as `"marginal-slope"`, and every
+/// location-scale variant as `"location-scale"`. `gamfit`'s model-introspection
+/// sets (`is_marginal_slope`, `is_survival`, `is_transformation_normal`) are
+/// written against the fine-grained label, so reading the coarse `model_kind`
+/// for them silently misclassifies — e.g. a marginal-slope model reports
+/// `is_marginal_slope == False`. This accessor derives the label from the
+/// fitted family state, the same authority the predict payloads and CLI use.
+#[pyfunction]
+fn saved_model_predict_class_name(model_bytes: Vec<u8>) -> PyResult<String> {
+    let model: FittedModel = serde_json::from_slice(&model_bytes)
+        .map_err(|err| py_value_error(format!("saved model payload must be JSON: {err}")))?;
+    Ok(prediction_model_class_label(&model))
+}
+
 #[pyfunction]
 fn build_extend_group_payload_json(
     spec_json: &str,
