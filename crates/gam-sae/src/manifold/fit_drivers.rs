@@ -2413,13 +2413,44 @@ impl SaeManifoldTerm {
         // multi-start RETRY (offset = retry index) reads a disjoint principal
         // subspace from the previous attempt; the per-atom breach arm passes 0
         // (its single reseed needs no rotation).
-        let seeded = sae_pca_seed_initial_coords_with_pc_offset(
-            residual.view(),
-            &basis_kinds,
-            &dims,
-            pc_pair_offset,
-        )?;
         let n = self.n_obs();
+        // #2023 dead-atom DATA-ROW reseed (default-off via GAM_SAE_DATA_ROW_RESEED).
+        // The PCA reseed's diversity is capped at pc_pairs ≈ min(n, p)/2 principal
+        // pairs; a co-collapsed dictionary leaves residual ≈ target, so once a
+        // multi-start RETRY exhausts that pool (pc_pair_offset ≥ pc_pairs) it
+        // re-reads the SAME leading PCs → the same degenerate basin → the
+        // reseed-duplication spiral. When the lever is on AND every reseeded atom
+        // is a FLAT kind (EuclideanPatch | Linear — the only kinds whose PCA seed
+        // is the euclidean score-projection this data-row path mirrors), draw the
+        // exhausted-pool retries from DISTINCT DATA ROWS (n ≫ p, unbounded
+        // diversity) instead. Unset (default) ⇒ this branch never runs and the
+        // seed is bit-identical to the historical PCA path. Chart kinds
+        // (Periodic/Sphere/Torus/Cylinder/…) always fall through to the PCA seed
+        // — their data-row anchoring is the curved-tier follow-up.
+        let pc_pairs = (residual.ncols().min(n)) / 2;
+        let data_row_reseed = std::env::var("GAM_SAE_DATA_ROW_RESEED")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(0)
+            > 0;
+        let all_flat = basis_kinds
+            .iter()
+            .all(|k| matches!(k, SaeAtomBasisKind::EuclideanPatch | SaeAtomBasisKind::Linear));
+        let seeded = if data_row_reseed && all_flat && n > 0 && pc_pair_offset >= pc_pairs.max(1) {
+            // Distinct anchor row per (atom, retry), spanning the full n-row range
+            // so successive exhausted-pool retries never re-anchor identically.
+            let anchor_rows: Vec<usize> = (0..atoms.len())
+                .map(|slot| (slot + pc_pair_offset.wrapping_mul(atoms.len().max(1))) % n)
+                .collect();
+            sae_data_row_anchored_euclidean_coords(residual.view(), &dims, &anchor_rows)?
+        } else {
+            sae_pca_seed_initial_coords_with_pc_offset(
+                residual.view(),
+                &basis_kinds,
+                &dims,
+                pc_pair_offset,
+            )?
+        };
         for (slot, &atom) in atoms.iter().enumerate() {
             let d = dims[slot];
             let mut flat = Array1::<f64>::zeros(n * d);

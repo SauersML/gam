@@ -467,6 +467,90 @@ pub fn sae_pca_seed_initial_coords_with_pc_offset(
     Ok(out)
 }
 
+/// #2023 — DATA-ROW-anchored seed for flat (Euclidean/Linear) dead atoms.
+///
+/// The PCA reseed ([`sae_pca_seed_initial_coords_with_pc_offset`]) draws its
+/// per-atom / per-retry diversity from principal-component pairs, of which there
+/// are only `≈ min(n, p) / 2`. A co-collapsed dictionary leaves residual ≈
+/// target, so every multi-start retry re-SVDs the same matrix and, once the
+/// retry offset wraps the PC pool, re-reads the SAME leading components → the
+/// joint LSQ relaxes into the SAME degenerate basin. That p/2 ceiling is the
+/// co-collapse reseed-duplication spiral.
+///
+/// This anchors flat atom `slot` at a DISTINCT DATA ROW `anchor_rows[slot]`
+/// (there are `n ≫ p` of them, so the diversity domain is unbounded) and seeds
+/// each row `i`'s latent coordinate from that row's residual SIMILARITY to the
+/// anchor row, `<residual_i, residual_anchor>`, min-max normalized to
+/// `[-0.5, 0.5]` — the exact convention of the Euclidean/Linear branch of the
+/// PCA seed, so a downstream refit sees a same-shaped (just more diverse) seed.
+/// A `d`-dimensional atom spans `d` consecutive anchor rows (one per axis), so
+/// its axes stay decorrelated. Returns the padded `(K, n, d_max)` coordinate
+/// array; non-flat kinds are the caller's responsibility (it keeps them on the
+/// PCA path). Rejects non-finite residuals up front.
+pub fn sae_data_row_anchored_euclidean_coords(
+    residual: ArrayView2<'_, f64>,
+    atom_dim: &[usize],
+    anchor_rows: &[usize],
+) -> Result<Array3<f64>, String> {
+    let k_atoms = atom_dim.len();
+    let (n_obs, p_out) = residual.dim();
+    let d_max = atom_dim.iter().copied().max().unwrap_or(1).max(1);
+    let mut out = Array3::<f64>::zeros((k_atoms, n_obs, d_max));
+    if n_obs == 0 || p_out == 0 {
+        return Ok(out);
+    }
+    if anchor_rows.len() != k_atoms {
+        return Err(format!(
+            "sae_data_row_anchored_euclidean_coords: anchor_rows len {} != atoms {k_atoms}",
+            anchor_rows.len()
+        ));
+    }
+    for ((row, col), &value) in residual.indexed_iter() {
+        if !value.is_finite() {
+            return Err(format!(
+                "sae_data_row_anchored_euclidean_coords: residual must be finite; \
+                 residual[{row}, {col}] = {value}"
+            ));
+        }
+    }
+    let mut sim = vec![0.0_f64; n_obs];
+    for slot in 0..k_atoms {
+        let d = atom_dim[slot];
+        if d == 0 {
+            continue;
+        }
+        let base = anchor_rows[slot] % n_obs;
+        for axis in 0..d {
+            // A distinct anchor row per axis so a d>1 atom spans d data rows and
+            // its axes stay decorrelated (mirrors the PCA branch's disjoint-PC
+            // window per axis).
+            let anchor = (base + axis) % n_obs;
+            let mut min_v = f64::INFINITY;
+            let mut max_v = f64::NEG_INFINITY;
+            for i in 0..n_obs {
+                let mut dot = 0.0_f64;
+                for col in 0..p_out {
+                    dot += residual[[i, col]] * residual[[anchor, col]];
+                }
+                sim[i] = dot;
+                if dot < min_v {
+                    min_v = dot;
+                }
+                if dot > max_v {
+                    max_v = dot;
+                }
+            }
+            let span = max_v - min_v;
+            if span > 0.0 {
+                for i in 0..n_obs {
+                    out[[slot, i, axis]] = (sim[i] - min_v) / span - 0.5;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,6 +684,45 @@ mod tests {
         assert!(
             moved > 1e-6,
             "surplus atom must land on a distinct basin across retries (max move {moved:.3e})"
+        );
+    }
+
+    /// #2023 — the data-row-anchored reseed must diversify BEYOND the ~p/2 PC
+    /// pool: with `p` small (few PCs) but many distinct data-row anchors, the
+    /// number of distinct seeds must exceed the PC-pair ceiling that caps the PCA
+    /// reseed (the co-collapse cause). Coords stay in the `[-0.5, 0.5]` band.
+    #[test]
+    fn data_row_anchored_seed_diversifies_beyond_pc_pool() {
+        let n = 64usize;
+        let p = 4usize; // pc_pairs = min(n,p)/2 = 2 — the PCA reseed ceiling.
+        // A low-rank-ish structured residual (the co-collapse regime).
+        let mut residual = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            for j in 0..p {
+                residual[[i, j]] = ((i * 7 + j) as f64).sin() + 0.25 * ((i + 3 * j) as f64).cos();
+            }
+        }
+        let dims = vec![1usize];
+        // p distinct anchors (> pc_pairs = 2) must yield > pc_pairs distinct seeds.
+        let mut seeds = std::collections::HashSet::new();
+        for anchor in 0..p {
+            let s = sae_data_row_anchored_euclidean_coords(residual.view(), &dims, &[anchor])
+                .expect("data-row seed");
+            for v in s.iter() {
+                assert!(
+                    v.is_finite() && *v >= -0.5 - 1e-12 && *v <= 0.5 + 1e-12,
+                    "seed coord must stay in [-0.5, 0.5]: {v}"
+                );
+            }
+            let key: Vec<i64> = (0..n).map(|i| (s[[0, i, 0]] * 1e6).round() as i64).collect();
+            seeds.insert(key);
+        }
+        assert!(
+            seeds.len() >= p,
+            "data-row anchors must give ≥ p distinct seeds; the PCA reseed caps at \
+             pc_pairs = {} — got {} distinct",
+            (n.min(p)) / 2,
+            seeds.len()
         );
     }
 }
