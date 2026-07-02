@@ -16,3 +16,4 @@
 - The goal of this project is never to copy existing reference implementations.
 - Grid search is never allowed.
 - Wall-clock time budgets and deadlines are never allowed. In general, do not paper over solver issues.
+- Hard-coded knobs and magic constants, especially if arbitrary, should be avoided when possible.
