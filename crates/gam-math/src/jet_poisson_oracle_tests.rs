@@ -51,7 +51,10 @@
 //! ```
 
 use crate::jet_scalar::{JetScalar, OneSeed, Order2, TwoSeed};
-use crate::jet_tower::Tower4;
+use crate::jet_tower::{
+    RowNllProgramGeneric, Tower4, generic_fourth_contracted, generic_full_tower,
+    generic_row_kernel, generic_third_contracted,
+};
 
 /// One Poisson-log row fixture: the response `y` (a count, as `f64`) and the
 /// three bilinear-predictor coefficients `(a, b, d)` defining
@@ -99,6 +102,32 @@ pub fn poisson_row_nll<S: JetScalar<2>>(row: &PoissonRow, p: &[S; 2]) -> S {
 pub fn poisson_jet_tower(row: &PoissonRow, p0: [f64; 2]) -> Tower4<2> {
     let vars: [Tower4<2>; 2] = std::array::from_fn(|axis| Tower4::variable(p0[axis], axis));
     poisson_row_nll(row, &vars)
+}
+
+/// A minimal [`RowNllProgramGeneric`] wrapper around [`poisson_row_nll`].
+///
+/// This mirrors the production family seam: primaries are seeded by the generic
+/// row-kernel helpers, while the row likelihood itself stays a single expression
+/// over `S: JetScalar<2>`.
+struct PoissonProgram {
+    row: PoissonRow,
+    p0: [f64; 2],
+}
+
+impl RowNllProgramGeneric<2> for PoissonProgram {
+    fn n_rows(&self) -> usize {
+        1
+    }
+
+    fn primaries(&self, row: usize) -> Result<[f64; 2], String> {
+        assert_eq!(row, 0, "single-row PoissonProgram only contains row zero");
+        Ok(self.p0)
+    }
+
+    fn row_nll_generic<S: JetScalar<2>>(&self, row: usize, p: &[S; 2]) -> Result<S, String> {
+        assert_eq!(row, 0, "single-row PoissonProgram only contains row zero");
+        Ok(poisson_row_nll(&self.row, p))
+    }
 }
 
 /// INDEPENDENT hand-derived closed-form Poisson-log derivative tower at the base
@@ -327,6 +356,82 @@ fn poisson_packed_scalars_match_hand_derived_contractions() {
                         fourth[i][j],
                         truth[i][j],
                         &format!("trial {trial} pair {ui} TwoSeed fourth[{i}][{j}]"),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The RowKernel-shaped generic helper surface (`generic_row_kernel`,
+/// `generic_third_contracted`, `generic_fourth_contracted`) must be a pure
+/// projection of the same full tower. This is the exact, FD-free oracle pattern
+/// production families use to guard hand-tuned kernels: every channel a
+/// `RowKernel` consumer can request is derived from ONE `row_nll_generic`
+/// expression, so the cross-channel desynchronisation class from #736/#932 has
+/// no second derivative source in which to hide.
+#[test]
+fn poisson_generic_row_kernel_helpers_are_full_tower_projections() {
+    let mut rng = Lcg(0x9320_0000_cafe_f00d);
+    let dirs: [[f64; 2]; 3] = [[0.7, -0.4], [-0.9, 1.3], [1.1, 0.6]];
+
+    for trial in 0..12 {
+        let program = PoissonProgram {
+            row: PoissonRow {
+                y: (rng.uniform(0.0, 8.0)).floor(),
+                a: rng.uniform(-1.2, 1.2),
+                b: rng.uniform(-1.2, 1.2),
+                d: rng.uniform(-0.9, 0.9),
+            },
+            p0: [rng.uniform(-0.8, 0.8), rng.uniform(-0.8, 0.8)],
+        };
+
+        let tower = generic_full_tower(&program, 0).expect("full generic Poisson tower");
+        let (value, gradient, hessian) =
+            generic_row_kernel(&program, 0).expect("generic row kernel");
+
+        close(value, tower.v, &format!("trial {trial} generic value"));
+        for i in 0..2 {
+            close(
+                gradient[i],
+                tower.g[i],
+                &format!("trial {trial} generic grad[{i}]"),
+            );
+            for j in 0..2 {
+                close(
+                    hessian[i][j],
+                    tower.h[i][j],
+                    &format!("trial {trial} generic hess[{i}][{j}]"),
+                );
+            }
+        }
+
+        for (di, dir) in dirs.iter().enumerate() {
+            let third =
+                generic_third_contracted(&program, 0, dir).expect("generic third contraction");
+            let truth = tower.third_contracted(dir);
+            for i in 0..2 {
+                for j in 0..2 {
+                    close(
+                        third[i][j],
+                        truth[i][j],
+                        &format!("trial {trial} dir {di} generic third[{i}][{j}]"),
+                    );
+                }
+            }
+        }
+
+        for (ui, u) in dirs.iter().enumerate() {
+            let v = dirs[(ui + 1) % dirs.len()];
+            let fourth =
+                generic_fourth_contracted(&program, 0, u, &v).expect("generic fourth contraction");
+            let truth = tower.fourth_contracted(u, &v);
+            for i in 0..2 {
+                for j in 0..2 {
+                    close(
+                        fourth[i][j],
+                        truth[i][j],
+                        &format!("trial {trial} pair {ui} generic fourth[{i}][{j}]"),
                     );
                 }
             }
