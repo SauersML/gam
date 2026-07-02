@@ -1678,7 +1678,6 @@ pub fn matern_input_location_jet_nd(
     aniso_log_scales: Option<&[f64]>,
 ) -> Result<Array3<f64>, BasisError> {
     let n_rows = t.nrows();
-    let n_centers = centers.nrows();
     let dim = centers.ncols();
     if dim == 0 {
         crate::bail_invalid_basis!(
@@ -1701,6 +1700,15 @@ pub fn matern_input_location_jet_nd(
             dim
         );
     }
+    // Match the forward Matérn basis builder's realized column geometry: an
+    // over-specified center set is RRQR-reduced before the design matrix is
+    // formed. Input-location jets must differentiate those same realized basis
+    // columns; evaluating all pre-reduction centers desynchronizes derivative
+    // column indices from finite differences of the forward design.
+    let reduced_centers =
+        matern_rank_reduce_centers(t, &centers.to_owned(), length_scale, nu, aniso_log_scales)?;
+    let centers = reduced_centers.view();
+    let n_centers = centers.nrows();
     let weights = matern_metric_weights(dim, aniso_log_scales);
     let mut out = Array3::<f64>::zeros((n_rows, n_centers, dim));
     for n in 0..n_rows {

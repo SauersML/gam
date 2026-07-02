@@ -229,13 +229,16 @@ where
     // Per-family response-support validation, owned by the family type.
     // Gamma `y > 0`, Poisson / NegativeBinomial / Tweedie `y ≥ 0`, Beta
     // `y ∈ (0, 1)`. Centralising the rule on `ResponseFamily` means the
-    // external-design GLM path and the formula path produce identical
-    // user-facing messages for the same domain violation, and adding a new
-    // constrained family is a single edit on the type. The response column
-    // name is unknown on the external-design path (the caller passes a bare
+    // external-design GLM path and the formula path share the same
+    // family-owned domain rule, while this external path appends the routing
+    // context the formula path does not have. The response column name is
+    // unknown on the external-design path (the caller passes a bare
     // `y: ArrayView1<f64>`) so we surface it as the generic "y".
     if let Err(violation) = resolved_family.response.validate_response_support(y.view()) {
-        crate::bail_invalid_estim!("{}", violation);
+        crate::bail_invalid_estim!(
+            "{}; external-design GLM routing accepted the family/link, but the response values are outside that GLM family's support",
+            violation
+        );
     }
     validate_penalty_specs(&specs, x.ncols(), "fit_gam")?;
     let ext_opts = ExternalOptimOptions {

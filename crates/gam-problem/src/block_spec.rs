@@ -261,6 +261,27 @@ pub trait BlockEffectiveJacobian: Send + Sync {
     fn eta_row_scaling_for_skewness(&self) -> Option<Arc<[f64]>> {
         None
     }
+
+    /// Whether the identifiability canonicaliser must keep this block at its
+    /// full raw column width instead of column-reducing it.
+    ///
+    /// The `#933` reduction path wraps a `jacobian_callback` block in a
+    /// gauge-composed Jacobian so the family fits in a reduced section — sound
+    /// only when the family's effective geometry is DERIVED from the callback
+    /// (multinomial softmax, marginal-slope logslope). It is NOT sound for a
+    /// callback whose effective Jacobian is a **fixed nonlinear functional
+    /// basis** recomputed at the raw coefficient width on every evaluation
+    /// (the survival marginal-slope monotone time-wiggle time block): its
+    /// downstream likelihood reads raw-width internal designs and asserts
+    /// `beta.len() == p_raw`, so a reduced β desynchronises that layout — the
+    /// same failure mode the competing-risks dead-column veto already guards.
+    /// Such a block returns `true` so the canonicaliser keeps it at raw width
+    /// (its own penalty nullspace regularises the weak directions instead).
+    ///
+    /// Defaults to `false`: every existing callback reduces safely.
+    fn locks_raw_width_reduction(&self) -> bool {
+        false
+    }
 }
 
 /// A [`BlockEffectiveJacobian`] for any block that contributes linearly to

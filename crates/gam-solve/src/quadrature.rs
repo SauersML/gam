@@ -4093,12 +4093,12 @@ pub fn probit_posterior_mean(eta: f64, se_eta: f64) -> f64 {
 
 #[inline]
 pub fn logit_posterior_meanvariance(ctx: &QuadratureContext, eta: f64, se_eta: f64) -> (f64, f64) {
-    let m1 = integrate_normal_ghq_adaptive(ctx, eta, se_eta, sigmoid);
-    let m2 = integrate_normal_ghq_adaptive(ctx, eta, se_eta, |x| {
+    let (m1, m2) = integrate_normal_ghq_adaptive(ctx, eta, se_eta, |x| {
         let p = sigmoid(x);
-        p * p
-    })
-    .clamp(0.0, 1.0);
+        (p, p * p)
+    });
+    let m1 = m1.clamp(0.0, 1.0);
+    let m2 = m2.clamp(0.0, 1.0);
     (m1, (m2 - m1 * m1).max(0.0))
 }
 
@@ -5528,7 +5528,11 @@ mod tests {
         let s = (1.0 + sigma * sigma).sqrt();
         let z = mu / s;
         let pdf = gam_math::probability::normal_pdf(z);
-        assert_relative_eq!(out.mean, gam_math::probability::normal_cdf(z), epsilon = 1e-12);
+        assert_relative_eq!(
+            out.mean,
+            gam_math::probability::normal_cdf(z),
+            epsilon = 1e-12
+        );
         assert_relative_eq!(out.d1, pdf / s, epsilon = 1e-12);
         assert_relative_eq!(out.d2, -z * pdf / (s * s), epsilon = 1e-12);
         assert_relative_eq!(out.d3, (z * z - 1.0) * pdf / (s * s * s), epsilon = 1e-12);

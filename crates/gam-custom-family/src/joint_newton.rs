@@ -3426,6 +3426,7 @@ pub(crate) fn compute_kkt_refusal_report(
     let mut hpen_null_gradient_inf = f64::NAN;
     let mut hpen_null_vector_block_inf = Vec::new();
     let mut hpen_null_vector_carrying_block = None;
+    let mut hpen_spectrum_unavailable = false;
     if total_p > 0
         && let Some(source) = joint_hessian_source
         && let Ok(mut h_joint) =
@@ -3438,60 +3439,65 @@ pub(crate) fn compute_kkt_refusal_report(
         };
         add_joint_penalty_to_matrix(&mut h_joint, ranges, s_lambdas, model_diagonal_ridge, None);
         symmetrize_dense_in_place(&mut h_joint);
-        if let Ok((evals, evecs)) = FaerEigh::eigh(&h_joint, Side::Lower) {
-            let mut sorted: Vec<f64> = evals.iter().copied().collect();
-            sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-            let max_abs = sorted.iter().map(|x: &f64| x.abs()).fold(0.0_f64, f64::max);
-            let min_abs = sorted
-                .iter()
-                .map(|x: &f64| x.abs())
-                .fold(f64::INFINITY, f64::min);
-            let cutoff = KKT_REFUSAL_RANK_TOL * max_abs;
-            hpen_nullity_at_rank_tol = sorted.iter().filter(|x| x.abs() < cutoff).count();
-            hpen_max_abs_eigenvalue = max_abs;
-            hpen_min_abs_eigenvalue = if min_abs.is_finite() {
-                min_abs
-            } else {
-                f64::NAN
-            };
-            hpen_condition_number = if min_abs > 0.0 && min_abs.is_finite() {
-                max_abs / min_abs
-            } else {
-                f64::INFINITY
-            };
-            if let Some(residual) = residual_vec_opt.as_ref()
-                && residual.len() == total_p
-                && hpen_nullity_at_rank_tol > 0
-            {
-                let mut best_component = 0.0_f64;
-                let mut best_block_inf = vec![0.0_f64; ranges.len()];
-                for k in 0..evals.len() {
-                    if evals[k].abs() >= cutoff {
-                        continue;
-                    }
-                    let component = evecs.column(k).dot(residual).abs();
-                    if component > best_component {
-                        best_component = component;
-                        best_block_inf.clear();
-                        best_block_inf.extend(ranges.iter().map(|(start, end)| {
-                            evecs
-                                .slice(ndarray::s![*start..*end, k])
-                                .iter()
-                                .map(|x: &f64| x.abs())
-                                .fold(0.0_f64, f64::max)
-                        }));
-                    }
-                }
-                hpen_null_gradient_inf = best_component;
-                hpen_null_vector_block_inf = best_block_inf;
-                hpen_null_vector_carrying_block = hpen_null_vector_block_inf
+        match FaerEigh::eigh(&h_joint, Side::Lower) {
+            Ok((evals, evecs)) if evals.iter().all(|x| x.is_finite()) => {
+                let mut sorted: Vec<f64> = evals.iter().copied().collect();
+                sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                let max_abs = sorted.iter().map(|x: &f64| x.abs()).fold(0.0_f64, f64::max);
+                let min_abs = sorted
                     .iter()
-                    .enumerate()
-                    .filter(|(_, v)| v.is_finite())
-                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|(i, _)| i);
+                    .map(|x: &f64| x.abs())
+                    .fold(f64::INFINITY, f64::min);
+                let cutoff = KKT_REFUSAL_RANK_TOL * max_abs;
+                hpen_nullity_at_rank_tol = sorted.iter().filter(|x| x.abs() < cutoff).count();
+                hpen_max_abs_eigenvalue = max_abs;
+                hpen_min_abs_eigenvalue = if min_abs.is_finite() {
+                    min_abs
+                } else {
+                    f64::NAN
+                };
+                hpen_condition_number = if min_abs > 0.0 && min_abs.is_finite() {
+                    max_abs / min_abs
+                } else {
+                    f64::INFINITY
+                };
+                if let Some(residual) = residual_vec_opt.as_ref()
+                    && residual.len() == total_p
+                    && hpen_nullity_at_rank_tol > 0
+                {
+                    let mut best_component = 0.0_f64;
+                    let mut best_block_inf = vec![0.0_f64; ranges.len()];
+                    for k in 0..evals.len() {
+                        if evals[k].abs() >= cutoff {
+                            continue;
+                        }
+                        let component = evecs.column(k).dot(residual).abs();
+                        if component > best_component {
+                            best_component = component;
+                            best_block_inf.clear();
+                            best_block_inf.extend(ranges.iter().map(|(start, end)| {
+                                evecs
+                                    .slice(ndarray::s![*start..*end, k])
+                                    .iter()
+                                    .map(|x: &f64| x.abs())
+                                    .fold(0.0_f64, f64::max)
+                            }));
+                        }
+                    }
+                    hpen_null_gradient_inf = best_component;
+                    hpen_null_vector_block_inf = best_block_inf;
+                    hpen_null_vector_carrying_block = hpen_null_vector_block_inf
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, v)| v.is_finite())
+                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                        .map(|(i, _)| i);
+                }
+                hpen_eigenvalues_sorted_desc = sorted;
             }
-            hpen_eigenvalues_sorted_desc = sorted;
+            Ok(_) | Err(_) => {
+                hpen_spectrum_unavailable = true;
+            }
         }
     }
 
@@ -3501,7 +3507,7 @@ pub(crate) fn compute_kkt_refusal_report(
         .sum();
     let any_block_has_constraints = block_constraints.iter().any(|c| c.is_some());
 
-    let diagnosis = if hpen_nullity_at_rank_tol > 0 {
+    let diagnosis = if hpen_spectrum_unavailable || hpen_nullity_at_rank_tol > 0 {
         KktRefusalDiagnosis::RankDeficientHPen
     } else if any_block_has_constraints
         && cached_active_sets.iter().any(|s| s.is_some())

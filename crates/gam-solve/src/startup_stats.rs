@@ -195,6 +195,30 @@ fn variant_tag(failure: &InnerFailure) -> FailureVariantTag {
     }
 }
 
+/// True only for repeated generic failures that are safe to treat as a
+/// cross-seed structural fingerprint.  Non-finite objective/domain failures are
+/// deliberately excluded even when they carry a repeated numeric marker: those
+/// are often rho-local trial-point pathologies on spatial/Duchon/sphere bases,
+/// and bailing early turns "the first few seeds were numerically bad" into the
+/// fatal and misleading "no candidate seeds passed" outcome before the stable
+/// heavy-smoothing candidates are ever tried (#1802).
+fn eligible_for_generic_structural_bail(failure: &InnerFailure) -> bool {
+    match failure {
+        InnerFailure::CertRefused { .. }
+        | InnerFailure::BudgetExhausted { .. }
+        | InnerFailure::TrustRegionFloor { .. }
+        | InnerFailure::IdentifiabilityFailure { .. } => true,
+        InnerFailure::LikelihoodFailure(_) => false,
+        InnerFailure::Other(message) => {
+            let lower = message.to_ascii_lowercase();
+            !(lower.contains("non-finite")
+                || lower.contains("not finite")
+                || lower.contains("nan")
+                || lower.contains("infinite"))
+        }
+    }
+}
+
 /// Signed order-of-magnitude bucket of the dominant diagnostic numeric:
 /// `sign` is the value's sign (`-1`/`0`/`+1`) and `order` is
 /// `floor(log10(|value|))`. Kept as two independent fields rather than a
@@ -345,6 +369,12 @@ pub(crate) fn consecutive_generic_signature(
         return None;
     }
     let tail = &rejections[rejections.len() - min_run..];
+    if tail
+        .iter()
+        .any(|rej| !eligible_for_generic_structural_bail(&rej.failure))
+    {
+        return None;
+    }
     let sig = generic_signature(&tail[0].failure);
     // An unquantified (None-magnitude) signature is excluded by contract.
     sig.1?;
@@ -907,6 +937,29 @@ mod tests {
                     order: -11
                 })
             )
+        );
+    }
+
+    /// #1802: a repeated non-finite objective at the first few trial rhos is a
+    /// numeric startup miss, not proof that the remaining spatial/Duchon/sphere
+    /// seed lattice is infeasible.  The live per-seed breakdown must keep
+    /// running so an over-smoothed or manifold-consistent seed can pass.
+    #[test]
+    fn generic_detector_does_not_bail_on_repeated_nonfinite_objectives() {
+        let nonfinite = |seed: usize| {
+            SeedRejection::from_message(
+                seed,
+                "validation",
+                "outer eval failed: non-finite objective at trial rho; \
+                 non-PD pivot -6.0e-11 at index 2"
+                    .into(),
+            )
+        };
+        let rejections = vec![nonfinite(0), nonfinite(1), nonfinite(2)];
+        assert!(
+            consecutive_generic_signature(&rejections, 3).is_none(),
+            "non-finite objective rejections are rho-local startup failures; \
+             the seed cascade must keep evaluating later candidates"
         );
     }
 

@@ -743,13 +743,12 @@ impl<'a> RemlState<'a> {
         const HIGHGRAD_REL_TOL: f64 = 1e-3;
         let cost_scale = 1.0 + final_fit.deviance.abs();
         let highgrad = grad_norm > HIGHGRAD_REL_TOL * cost_scale;
-        if !near_boundary && !highgrad {
-            // Keep the hot path cheap when the local linearization is likely sufficient.
-            return self.finalize_smoothing_outcome(first_order_routine(
-                first_order_correction,
-                "linearization sufficient: not near boundary and outer gradient is small",
-            ));
-        }
+        // Do not decide the cubature gate from boundary/gradient alone.  A fit can
+        // be perfectly interior and converged while the REML surface is still broad
+        // in rho; then the missing `E_rho[H(rho)^-1] - H(rho_hat)^-1` curvature
+        // component materially narrows posterior smooth bands.  Continue to the
+        // rho-Hessian inversion below so `max_rhovar` can trigger cubature for
+        // those broad-but-well-converged posteriors.
 
         // If the first-order path used a rank-deficient pseudo-inverse, the
         // ρ-Hessian was indefinite or near-singular and the matrix-free ridged
@@ -2483,7 +2482,6 @@ mod smoothing_correction_outcome_tests {
             "n_rho == 0: unified corrected covariance equals H^{-1}",
             "n_rho exceeds AUTO_CUBATURE_MAX_RHO_DIM: cubature cost prohibitive",
             "beta dimension exceeds AUTO_CUBATURE_MAX_BETA_DIM: cubature cost prohibitive",
-            "linearization sufficient: not near boundary and outer gradient is small",
             "first-order V_rho rank-deficient: cubature would impute spurious variance",
             "post-inversion rho posterior variance below trigger threshold",
             "no base covariance supplied: nothing for cubature to upgrade",

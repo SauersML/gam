@@ -410,11 +410,32 @@ fn clean_fit_invariance_survival_lognormal() {
     let z_idx = col["z"];
 
     let run = || -> CleanFit {
-        let cfg = FitConfig::default();
+        // The lognormal AFT survival model is the location-scale likelihood. The
+        // default `survival_likelihood` is "transformation" (Royston-Parmar,
+        // enforced by `materialize::tests`), so request location-scale explicitly
+        // to exercise the lognormal fit this test is named for (#1847) rather than
+        // relying on a wrong assumption that the default is location-scale.
+        let mut cfg = FitConfig::default();
+        cfg.survival_likelihood = "location-scale".to_string();
         let result = fit_from_formula(r#"Surv(t, event) ~ x + s(z, bs="tp", k=6)"#, &data, &cfg)
             .unwrap_or_else(|e| panic!("clean survival fit returned Err: {e}"));
+        let variant_dbg = match &result {
+            FitResult::Standard(_) => "Standard",
+            FitResult::GaussianLocationScale(_) => "GaussianLocationScale",
+            FitResult::BinomialLocationScale(_) => "BinomialLocationScale",
+            FitResult::DispersionLocationScale(_) => "DispersionLocationScale",
+            FitResult::SurvivalLocationScale(_) => "SurvivalLocationScale",
+            FitResult::SurvivalTransformation(_) => "SurvivalTransformation",
+            FitResult::SurvivalMarginalSlope(_) => "SurvivalMarginalSlope",
+            FitResult::BernoulliMarginalSlope(_) => "BernoulliMarginalSlope",
+            FitResult::LatentSurvival(_) => "LatentSurvival",
+            FitResult::LatentBinary(_) => "LatentBinary",
+            FitResult::TransformationNormal(_) => "TransformationNormal",
+            FitResult::SplineScan(_) => "SplineScan",
+            FitResult::ResidualCascade(_) => "ResidualCascade",
+        };
         let FitResult::SurvivalLocationScale(fit) = result else {
-            panic!("expected SurvivalLocationScale");
+            panic!("expected SurvivalLocationScale, got {variant_dbg}");
         };
         let unified = &fit.fit.fit;
         let mut tg = Array2::<f64>::zeros((n, data.headers.len()));
