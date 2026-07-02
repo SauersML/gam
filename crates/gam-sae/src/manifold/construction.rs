@@ -1011,7 +1011,13 @@ impl SaeManifoldTerm {
             } else {
                 0.0
             };
-            let trust_score = tangent_condition_score;
+            // Curvature-certification power scales with the fourth power of
+            // observed chart coverage: λ₂ ≈ r²·a⁴/45, hence N* ∝ a⁻⁴. A
+            // well-conditioned tangent basis on a thinly covered atom is still
+            // not globally trustworthy, so trust must decay quartically rather
+            // than linearly (or not at all) with observed extent/coverage.
+            let chart_coverage_weight = coverage.powi(4);
+            let trust_score = tangent_condition_score * chart_coverage_weight;
             atom_trust.push(trust_score);
             atoms.push(SaeAtomTrustDiagnostics {
                 trust_score,
