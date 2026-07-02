@@ -4350,6 +4350,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(linear_dictionary_transform_ffi, module)?)?;
     module.add_function(wrap_pyfunction!(sparse_dictionary_fit, module)?)?;
     module.add_function(wrap_pyfunction!(sparse_dictionary_transform_ffi, module)?)?;
+    module.add_function(wrap_pyfunction!(block_sparse_dictionary_fit, module)?)?;
     module.add_class::<SparseDictStream>()?;
     module.add_function(wrap_pyfunction!(
         identifiable_factor_select_weights_array,
@@ -4846,6 +4847,72 @@ fn sparse_dictionary_transform_ffi<'py>(
         indices.into_pyarray(py).unbind(),
         codes.into_pyarray(py).unbind(),
     ))
+}
+
+/// #1026 block-sparse lane — fit a **block-sparse** dictionary: the `K = G·b`
+/// atoms are grouped into `G` blocks of `b` orthonormal atoms, routing selects
+/// whole blocks by their group ℓ₂ gate `‖z_g‖₂` (block-TopK, signed codes, no
+/// ReLU), and each block is a Stiefel-constrained frame refreshed by polar steps.
+/// Presence (`gates`) and amplitude (`codes`) are returned as separate arrays;
+/// every selection is invariant to each block's internal `O(b)` gauge. Returns
+/// per-block utilisation + stable rank for the MDL lane. Additive path; the atom
+/// lane and the exact manifold engine are untouched.
+#[pyfunction(signature = (
+    x,
+    n_blocks,
+    block_size = 2,
+    block_topk = 1,
+    max_epochs = 30,
+    minibatch = 512,
+    block_tile = 1024,
+    frame_ridge = 1.0e-9,
+    aux_k = 0,
+    tolerance = 1.0e-6
+))]
+fn block_sparse_dictionary_fit<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray2<'py, f32>,
+    n_blocks: usize,
+    block_size: usize,
+    block_topk: usize,
+    max_epochs: usize,
+    minibatch: usize,
+    block_tile: usize,
+    frame_ridge: f64,
+    aux_k: usize,
+    tolerance: f64,
+) -> PyResult<Py<PyDict>> {
+    let x_values = x.as_array().to_owned();
+    let config = BlockSparseConfig {
+        n_blocks,
+        block_size,
+        block_topk,
+        max_epochs,
+        minibatch,
+        block_tile,
+        frame_ridge,
+        aux_k,
+        tolerance,
+    };
+    let fit = detach_py_result(py, "block_sparse_dictionary_fit", move || {
+        fit_block_sparse_dictionary(x_values.view(), &config)
+    })?;
+    let fitted = fit.reconstruct();
+    let out = PyDict::new(py);
+    out.set_item("decoder", fit.decoder.into_pyarray(py))?;
+    out.set_item("blocks", fit.blocks.into_pyarray(py))?;
+    out.set_item("gates", fit.gates.into_pyarray(py))?;
+    out.set_item("codes", fit.codes.into_pyarray(py))?;
+    out.set_item("fitted", fitted.into_pyarray(py))?;
+    out.set_item("gamma", fit.gamma)?;
+    out.set_item("block_utilization", fit.block_utilization)?;
+    out.set_item("block_stable_rank", fit.block_stable_rank)?;
+    out.set_item("explained_variance", fit.explained_variance)?;
+    out.set_item("epochs", fit.epochs)?;
+    out.set_item("converged", fit.converged)?;
+    out.set_item("block_topk", fit.block_topk)?;
+    out.set_item("block_size", fit.block_size)?;
+    Ok(out.unbind())
 }
 
 /// Streaming (partial-fit) handle for the collapsed linear lane: a native-side

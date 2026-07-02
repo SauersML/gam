@@ -261,6 +261,195 @@ class SparseDictStream:
         return int(self._handle.epochs_run)
 
 
+@dataclass(frozen=True)
+class BlockSparseDictionaryFit:
+    """Result of a block-sparse fit (#1026 block extension).
+
+    The ``K = G*b`` atoms are grouped into ``G`` blocks of ``b`` orthonormal
+    atoms. Routing selects whole blocks by their group ℓ₂ gate ``‖z_g‖₂``
+    (block-TopK, signed codes, no ReLU); each block is a Stiefel-constrained
+    frame. **Presence** (:attr:`gates`) and **amplitude** (:attr:`codes`) are
+    deliberately separate arrays — the decoupling this lane is built around — and
+    every routing decision is invariant to each block's internal ``O(b)`` gauge.
+
+    Attributes
+    ----------
+    decoder:
+        ``K x P`` decoder (``K = G*b``); block ``g`` occupies rows
+        ``[g*b, g*b+b)`` and its ``b`` rows are orthonormal (``D_g D_gᵀ = I_b``).
+    blocks:
+        ``N x block_topk`` selected block indices per row (``uint32``).
+    gates:
+        ``N x block_topk`` per-selected-block **gate** ``‖z_g‖₂`` (presence, FP32).
+    codes:
+        ``N x block_topk x b`` signed **within-block code** ``z_g`` (amplitude /
+        direction, FP32), aligned with :attr:`blocks`.
+    gamma:
+        Shared tied-encoder scalar ``γ`` (one scalar for the whole dictionary).
+    block_utilization:
+        Length-``G`` fraction of rows that selected each block.
+    block_stable_rank:
+        Length-``G`` stable rank ``trace(C_g)/λ_max(C_g)`` of each block's
+        within-block code second moment — the effective dimensionality each block
+        uses (for the MDL lane).
+    fitted:
+        ``N x P`` dense reconstruction of the training rows (FP32).
+    explained_variance, epochs, converged, block_topk, block_size:
+        Run metadata.
+    """
+
+    decoder: np.ndarray
+    blocks: np.ndarray
+    gates: np.ndarray
+    codes: np.ndarray
+    gamma: float
+    block_utilization: np.ndarray
+    block_stable_rank: np.ndarray
+    fitted: np.ndarray
+    explained_variance: float
+    epochs: int
+    converged: bool
+    block_topk: int
+    block_size: int
+
+    @property
+    def n_blocks(self) -> int:
+        """Number of blocks ``G = K / b``."""
+        return self.decoder.shape[0] // self.block_size
+
+    def reconstruct(self) -> np.ndarray:
+        """Dense ``N x P`` reconstruction from the stored block routing
+        (``x̂_i = Σ_g z_{ig} D_g``)."""
+        n = self.blocks.shape[0]
+        p = self.decoder.shape[1]
+        b = self.block_size
+        out = np.zeros((n, p), dtype=np.float32)
+        for j in range(self.block_topk):
+            g = self.blocks[:, j].astype(np.int64)  # N
+            for r in range(b):
+                atoms = self.decoder[g * b + r]  # N x P
+                out += self.codes[:, j, r][:, None] * atoms
+        return np.ascontiguousarray(out)
+
+    def transform(
+        self, X: Any, block_topk: int | None = None
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Route held-out rows ``X`` (``M x P``) through the fitted block frames.
+
+        Returns ``(blocks, gates, codes)`` of shapes ``M x k`` / ``M x k`` /
+        ``M x k x b`` — the same block-TopK routing (by group ℓ₂ gate) and tied
+        signed codes ``z_g = γ x D_gᵀ`` the trainer uses, against the frozen
+        frames. Pure block routing (no least-squares), so it is exactly the
+        encoder the fit learned. ``k`` defaults to the fitted ``block_topk``.
+        """
+        x = _as_2d_f32(X, "X")
+        if x.shape[1] != self.decoder.shape[1]:
+            raise ValueError(
+                f"X must have P={self.decoder.shape[1]} columns; got {x.shape[1]}"
+            )
+        b = self.block_size
+        g_blocks = self.n_blocks
+        k = self.block_topk if block_topk is None else int(block_topk)
+        k = max(1, min(k, g_blocks))
+        # Raw tied projections w[m, g, r] = x_m · D_{g,r}.
+        w = (x @ self.decoder.T).reshape(x.shape[0], g_blocks, b)  # M x G x b
+        gate = np.linalg.norm(w, axis=2)  # M x G  (γ-free routing gate)
+        # Block-TopK by gate (ties broken toward smaller block index for
+        # determinism, matching the Rust online selector).
+        order = np.argsort(-gate, axis=1, kind="stable")[:, :k]  # M x k
+        blocks = order.astype(np.uint32)
+        rows = np.arange(x.shape[0])[:, None]
+        gates = float(abs(self.gamma)) * gate[rows, order]  # M x k presence ‖z_g‖
+        codes = float(self.gamma) * w[rows, order, :]  # M x k x b signed amplitude
+        return (
+            np.ascontiguousarray(blocks),
+            np.ascontiguousarray(gates.astype(np.float32)),
+            np.ascontiguousarray(codes.astype(np.float32)),
+        )
+
+
+def block_sparse_dictionary_fit(
+    X: Any,
+    n_blocks: int,
+    *,
+    block_size: int = 2,
+    block_topk: int = 1,
+    grassmann: bool = True,
+    max_epochs: int = 30,
+    minibatch: int = 512,
+    block_tile: int = 1024,
+    frame_ridge: float = 1.0e-9,
+    aux_k: int = 0,
+    tolerance: float = 1.0e-6,
+) -> BlockSparseDictionaryFit:
+    """Fit a **block-sparse** dictionary to ``X`` (``N x P``): ``G = n_blocks``
+    blocks of ``b = block_size`` orthonormal atoms (``K = G*b``), block-TopK
+    routing by group ℓ₂ gate, tied signed codes with one shared scalar ``γ``,
+    Stiefel-constrained frames refreshed by polar steps, and AuxK dead-block
+    revival seeded from worst-reconstructed residual rows.
+
+    Parameters
+    ----------
+    n_blocks:
+        Number of blocks ``G``. The dictionary has ``K = G * block_size`` atoms.
+    block_size:
+        Atoms per block ``b`` (the subspace dimension). Typically 2–4; must not
+        exceed ``P``.
+    block_topk:
+        Block routing budget ``k`` (blocks allowed to fire per row).
+    grassmann:
+        Block frames are Grassmann/Stiefel-constrained (column-orthonormal).
+        This lane is always frame-constrained; ``grassmann=False`` is rejected
+        (use :func:`sparse_dictionary_fit` for an unconstrained atom dictionary).
+    max_epochs, minibatch, block_tile:
+        Streaming / tiling controls (peak routing working set is
+        ``minibatch x (block_tile*b)``, never ``N x K``).
+    frame_ridge, aux_k, tolerance:
+        Frame-refresh ridge, AuxK dead-block revival budget, and the EV stopping
+        tolerance.
+    """
+    if not grassmann:
+        raise ValueError(
+            "block_sparse_dictionary_fit is always Grassmann/Stiefel-constrained; "
+            "pass grassmann=True (or use sparse_dictionary_fit for an unconstrained "
+            "atom dictionary)"
+        )
+    x = _as_2d_f32(X, "X")
+    if block_size > x.shape[1]:
+        raise ValueError(
+            f"block_size={block_size} cannot exceed P={x.shape[1]} "
+            "(a block's b orthonormal rows must fit in R^P)"
+        )
+    payload = rust_module().block_sparse_dictionary_fit(
+        x,
+        int(n_blocks),
+        block_size=int(block_size),
+        block_topk=int(block_topk),
+        max_epochs=int(max_epochs),
+        minibatch=int(minibatch),
+        block_tile=int(block_tile),
+        frame_ridge=float(frame_ridge),
+        aux_k=int(aux_k),
+        tolerance=float(tolerance),
+    )
+    data = dict(payload)
+    return BlockSparseDictionaryFit(
+        decoder=np.ascontiguousarray(data["decoder"], dtype=np.float32),
+        blocks=np.ascontiguousarray(data["blocks"], dtype=np.uint32),
+        gates=np.ascontiguousarray(data["gates"], dtype=np.float32),
+        codes=np.ascontiguousarray(data["codes"], dtype=np.float32),
+        gamma=float(data["gamma"]),
+        block_utilization=np.ascontiguousarray(data["block_utilization"], dtype=np.float32),
+        block_stable_rank=np.ascontiguousarray(data["block_stable_rank"], dtype=np.float32),
+        fitted=np.ascontiguousarray(data["fitted"], dtype=np.float32),
+        explained_variance=float(data["explained_variance"]),
+        epochs=int(data["epochs"]),
+        converged=bool(data["converged"]),
+        block_topk=int(data["block_topk"]),
+        block_size=int(data["block_size"]),
+    )
+
+
 def sparse_dictionary_fit_begin(
     seed: Any,
     K: int,
@@ -343,9 +532,11 @@ def sparse_dictionary_fit(
 
 
 __all__ = [
+    "BlockSparseDictionaryFit",
     "SparseDictStream",
     "SparseDictStreamArtifact",
     "SparseDictionaryFit",
+    "block_sparse_dictionary_fit",
     "sparse_dictionary_fit",
     "sparse_dictionary_fit_begin",
 ]

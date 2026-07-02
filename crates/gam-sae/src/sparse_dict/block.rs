@@ -589,8 +589,7 @@ fn refresh_gamma(
 /// cross-moment `M_g = Σ_i r_{ig}ᵀ z_{ig}` (`P×b`). We accumulate `M_g` for every
 /// block, add a tiny ridge on its Gram for a thinly-used block, and polar it via
 /// [`GrassmannFrame::polar_update`]. Blocks that no row selected accumulate a zero
-/// `M_g` and keep their current frame (they are revived separately). Returns the
-/// number of blocks whose frame was refreshed (nonzero cross-moment).
+/// `M_g` and keep their current frame in place (they are revived separately).
 fn refresh_frames(
     x: ArrayView2<'_, f32>,
     codes: &[RowBlockCode],
@@ -620,7 +619,7 @@ fn refresh_frames(
         if selected.is_empty() {
             continue;
         }
-        let recon = reconstruct_row(xi, decoder, &selected, gamma, b);
+        let recon = reconstruct_row(xi, decoder.view(), &selected, gamma, b);
         for (j, &g) in code.blocks.iter().enumerate() {
             if code.gates[j] == 0.0 {
                 continue;
@@ -740,7 +739,7 @@ fn revive_dead_blocks(
             .filter(|(_, &gate)| gate != 0.0)
             .map(|(&g, _)| g)
             .collect();
-        let recon = reconstruct_row(xi, decoder, &selected, gamma, b);
+        let recon = reconstruct_row(xi, decoder.view(), &selected, gamma, b);
         let mut acc = 0.0f64;
         for c in 0..p {
             let rc = xi[c] - recon[c];
