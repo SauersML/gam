@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol, Sequence, cast, runtime_checkable
@@ -661,18 +662,32 @@ class _IBPMapFn(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx: Any, logits: torch.Tensor, temperature: float, alpha: float) -> torch.Tensor:
-        rust = rust_module()
-        rows = to_numpy_f64(logits).reshape(logits.shape[0], -1)
-        value = np.empty_like(rows)
-        grad = np.empty_like(rows)
-        for r in range(rows.shape[0]):
-            v_r, g_r = rust.sae_ibp_map_value_grad(
-                np.ascontiguousarray(rows[r]), float(temperature), float(alpha)
-            )
-            value[r] = np.asarray(v_r, dtype=np.float64)
-            grad[r] = np.asarray(g_r, dtype=np.float64)
-        ctx.save_for_backward(from_numpy_like(grad, logits).reshape_as(logits))
-        return from_numpy_like(value, logits).reshape_as(logits)
+        # Pure-torch, on-device transcription of the Rust source of truth
+        # `gam::terms::sae::assignment::ibp_map_row_value_grad`
+        # (crates/gam-sae/src/assignment.rs:1033). Per atom `k` (0-indexed),
+        # with ``inv_tau = 1/τ`` (matching the Rust multiply order for parity):
+        #   ``π_k = max((α/(α+1))^{k+1}, tiny)`` — the truncated stick-breaking
+        #     prior mean, accumulated in LOG space then floored at the smallest
+        #     positive normal so large-K atoms keep a live (never hard-masked)
+        #     gradient path, exactly as `ordered_geometric_shrinkage_prior`
+        #     (assignment.rs:966) does with `f64::MIN_POSITIVE`.
+        #   ``sig   = σ(l_k·inv_tau)`` (stable_logistic ≡ torch.sigmoid)
+        #   ``value = sig · π_k``
+        #   ``grad  = sig·(1 − sig)·inv_tau·π_k`` (diagonal logit Jacobian)
+        # No (N, K) matrix crosses the FFI boundary; dtype and device are
+        # preserved (runs on GPU without a CPU/float64 round-trip).
+        rows = logits.reshape(logits.shape[0], -1)
+        k_atoms = rows.shape[1]
+        inv_tau = 1.0 / temperature
+        log_ratio = math.log(alpha / (alpha + 1.0))
+        atom_index = torch.arange(1, k_atoms + 1, device=rows.device, dtype=rows.dtype)
+        tiny = torch.finfo(rows.dtype).tiny
+        pi = torch.exp(atom_index * log_ratio).clamp_min(tiny).reshape(1, -1)
+        sig = torch.sigmoid(rows * inv_tau)
+        value = sig * pi
+        grad = sig * (1.0 - sig) * inv_tau * pi
+        ctx.save_for_backward(grad.reshape_as(logits))
+        return value.reshape_as(logits)
 
     @staticmethod
     def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, None, None]:

@@ -4347,6 +4347,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(linear_dictionary_transform_ffi, module)?)?;
     module.add_function(wrap_pyfunction!(sparse_dictionary_fit, module)?)?;
     module.add_function(wrap_pyfunction!(sparse_dictionary_transform_ffi, module)?)?;
+    module.add_class::<SparseDictStream>()?;
     module.add_function(wrap_pyfunction!(
         identifiable_factor_select_weights_array,
         module
@@ -4842,6 +4843,127 @@ fn sparse_dictionary_transform_ffi<'py>(
         indices.into_pyarray(py).unbind(),
         codes.into_pyarray(py).unbind(),
     ))
+}
+
+/// Streaming (partial-fit) handle for the collapsed linear lane: a native-side
+/// [`SparseDictStreamState`] so a Python loop can stream epochs over shards
+/// without round-tripping the `K×P` decoder or any `N×K` object through Python.
+///
+/// `fit_begin` is the constructor (seed sample + config); `partial_fit(shard)`
+/// routes and accumulates one shard; `end_epoch()` refreshes the decoder and
+/// revives dead atoms; `finalize()` returns the decoder + metadata. The decoder
+/// and dead-atom revival state warm-start across every call.
+#[pyclass(module = "gam_pyffi._rust", name = "SparseDictStream")]
+struct SparseDictStream {
+    inner: SparseDictStreamState,
+}
+
+#[pymethods]
+impl SparseDictStream {
+    #[new]
+    #[pyo3(signature = (
+        seed,
+        k,
+        active = 1,
+        minibatch = 512,
+        max_epochs = 30,
+        score_tile = 4096,
+        code_ridge = 1.0e-6,
+        decoder_ridge = 1.0e-6,
+        tolerance = 1.0e-6
+    ))]
+    fn new(
+        py: Python<'_>,
+        seed: PyReadonlyArray2<'_, f32>,
+        k: usize,
+        active: usize,
+        minibatch: usize,
+        max_epochs: usize,
+        score_tile: usize,
+        code_ridge: f32,
+        decoder_ridge: f32,
+        tolerance: f64,
+    ) -> PyResult<Self> {
+        let seed_values = seed.as_array().to_owned();
+        let config = SparseDictConfig {
+            n_atoms: k,
+            active,
+            minibatch,
+            max_epochs,
+            score_tile,
+            code_ridge,
+            decoder_ridge,
+            tolerance,
+        };
+        let inner = py
+            .detach(|| SparseDictStreamState::new(seed_values.view(), &config))
+            .map_err(py_value_error)?;
+        Ok(Self { inner })
+    }
+
+    /// Route + sparse-code one shard against the current decoder and fold its
+    /// contributions into the running epoch. Returns `{rows, rss, alive_atoms}`.
+    fn partial_fit<'py>(
+        &mut self,
+        py: Python<'py>,
+        shard: PyReadonlyArray2<'py, f32>,
+    ) -> PyResult<Py<PyDict>> {
+        let shard_values = shard.as_array().to_owned();
+        let stats = py
+            .detach(|| self.inner.partial_fit(shard_values.view()))
+            .map_err(py_value_error)?;
+        let out = PyDict::new(py);
+        out.set_item("rows", stats.rows)?;
+        out.set_item("rss", stats.rss)?;
+        out.set_item("alive_atoms", stats.alive_atoms)?;
+        Ok(out.unbind())
+    }
+
+    /// Refresh the decoder from the epoch's accumulated normal equations, revive
+    /// dead atoms onto worst-reconstructed residual rows, and reset the epoch.
+    /// Returns `{explained_variance, revived, dead, converged, epoch}`.
+    fn end_epoch(&mut self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let stats = py
+            .detach(|| self.inner.end_epoch())
+            .map_err(py_value_error)?;
+        let out = PyDict::new(py);
+        out.set_item("explained_variance", stats.explained_variance)?;
+        out.set_item("revived", stats.revived)?;
+        out.set_item("dead", stats.dead)?;
+        out.set_item("converged", stats.converged)?;
+        out.set_item("epoch", stats.epoch)?;
+        Ok(out.unbind())
+    }
+
+    /// Hand back the trained decoder (`K×P`, unit-norm) plus run metadata:
+    /// `{decoder, active, epochs, explained_variance, converged}`.
+    fn finalize(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let artifact = self.inner.finalize();
+        let out = PyDict::new(py);
+        out.set_item("decoder", artifact.decoder.into_pyarray(py))?;
+        out.set_item("active", artifact.active)?;
+        out.set_item("epochs", artifact.epochs)?;
+        out.set_item("explained_variance", artifact.explained_variance)?;
+        out.set_item("converged", artifact.converged)?;
+        Ok(out.unbind())
+    }
+
+    /// A live copy of the current warm-started decoder (`K×P`, unit-norm rows).
+    fn decoder(&self, py: Python<'_>) -> Py<PyArray2<f32>> {
+        self.inner.decoder().to_owned().into_pyarray(py).unbind()
+    }
+
+    /// Active budget `s` in use (`min(active, K)`).
+    #[getter]
+    fn active(&self) -> usize {
+        self.inner.active()
+    }
+
+    /// Epochs closed so far.
+    #[getter]
+    fn epochs_run(&self) -> usize {
+        self.inner.epochs_run()
+    }
 }
 
 fn inject_scalar_fisher_rao_weight(

@@ -6,19 +6,27 @@ matrix). Streams documents from a Hugging Face dataset, tokenizes into
 fixed-length sequences, hooks one decoder layer's output, and saves all
 token positions (BOS dropped) until the requested token budget is reached.
 
-Output format is a generic Manifold-SAE activation cache: a dict with
-``X`` of shape ``(n_tokens, d_model)`` float32 and a ``sig`` metadata dict.
+Output is a sharded bf16 harvest directory (see ``residual_shard_io``): raw
+bf16 memmap shards plus a ``manifest.json`` carrying model/layer/tokenizer
+provenance and per-dimension mean/norm stats. This streams straight into the
+downstream ``ShardReader(dir).batches(n)`` epoch loop without ever holding the
+full activation matrix in memory.
 
 Example:
   python harvest_residual_activations.py --model Qwen/Qwen2.5-0.5B \
       --dataset wikitext --config wikitext-103-raw-v1 --layer 12 \
-      --n-tokens 120000 --out qwen05_wikitext_l12.pt
+      --n-tokens 120000 --out qwen05_wikitext_l12/
 """
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 
 import torch
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from residual_shard_io import ShardWriter, tokenizer_hash  # noqa: E402
 
 
 def main() -> None:
@@ -32,7 +40,11 @@ def main() -> None:
     ap.add_argument("--n-tokens", type=int, default=120_000)
     ap.add_argument("--seq-len", type=int, default=256)
     ap.add_argument("--batch-seqs", type=int, default=16)
-    ap.add_argument("--out", required=True)
+    ap.add_argument(
+        "--rows-per-shard", type=int, default=1_000_000,
+        help="token-activation rows per shard file",
+    )
+    ap.add_argument("--out", required=True, help="output harvest directory")
     args = ap.parse_args()
 
     from datasets import load_dataset
@@ -47,6 +59,8 @@ def main() -> None:
     if not (0 <= args.layer < len(layers)):
         raise SystemExit(f"--layer {args.layer} out of range (model has {len(layers)})")
 
+    d_model = int(model.config.hidden_size)
+
     grabbed: list[torch.Tensor] = []
 
     def hook(_mod, _inp, out):
@@ -55,9 +69,23 @@ def main() -> None:
 
     handle = layers[args.layer].register_forward_hook(hook)
 
+    writer = ShardWriter(
+        args.out,
+        d_model=d_model,
+        rows_per_shard=args.rows_per_shard,
+        meta={
+            "model_name": args.model,
+            "layer": args.layer,
+            "tokenizer_hash": tokenizer_hash(tok),
+            "text_dataset": f"{args.dataset}/{args.config}",
+            "text_subset": args.split,
+            "seq_len": args.seq_len,
+            "harvest_args": vars(args),
+        },
+    )
+
     ds = load_dataset(args.dataset, args.config, split=args.split, streaming=True)
     buf: list[int] = []
-    chunks: list[torch.Tensor] = []
     collected = 0
     batch: list[list[int]] = []
 
@@ -70,8 +98,9 @@ def main() -> None:
             model(ids)
         h = grabbed.pop()  # (B, seq_len, D)
         h = h[:, 1:, :].reshape(-1, h.shape[-1])  # drop position 0 per sequence
-        chunks.append(h)
-        collected += h.shape[0]
+        take = min(h.shape[0], args.n_tokens - collected)
+        writer.append(h[:take].numpy())
+        collected += take
         batch.clear()
         print(f"[harvest] {collected}/{args.n_tokens} tokens", flush=True)
 
@@ -90,17 +119,13 @@ def main() -> None:
     flush_batch()
     handle.remove()
 
-    X = torch.cat(chunks, dim=0)[: args.n_tokens]
-    sig = {
-        "model_name": args.model,
-        "layer": str(args.layer),
-        "text_dataset": f"{args.dataset}/{args.config}",
-        "text_subset": args.split,
-        "seq_len": str(args.seq_len),
-        "n_tokens": int(X.shape[0]),
-    }
-    torch.save({"X": X, "sig": sig}, args.out)
-    print(f"[harvest] saved {args.out} X={tuple(X.shape)}", flush=True)
+    manifest = writer.close()
+    print(
+        f"[harvest] saved {args.out} "
+        f"tokens={manifest['total_tokens']} shards={len(manifest['shards'])} "
+        f"d_model={d_model}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

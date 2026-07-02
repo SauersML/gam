@@ -30,6 +30,7 @@ mod codes;
 mod scoring;
 #[cfg(target_os = "linux")]
 mod scoring_gpu;
+mod stream;
 mod update;
 
 #[cfg(test)]
@@ -37,6 +38,7 @@ mod tests;
 
 pub use codes::SparseCode;
 pub use scoring::{TileScorer, top_s_online};
+pub use stream::{EpochStats, ShardStats, SparseDictArtifact, SparseDictStreamState};
 #[cfg(target_os = "linux")]
 pub use scoring_gpu::{
     DEVICE_SCORE_BLOCK_MIN_ELEMS, ScoreBlockPath, score_block_cpu, score_block_required,

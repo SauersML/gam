@@ -1843,7 +1843,9 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
                      atom_basis: Any = None, fisher_factors: Any = None,
                      weights: Any = None,
                      separation_barrier_strength: float | None = None,
-                     ibp_alpha: float | None = None) -> ManifoldSAE:
+                     ibp_alpha: float | None = None,
+                     structured_residual_passes: int = 0,
+                     promote_from_residual: bool = False) -> ManifoldSAE:
     """Fit an SAE-manifold model.
 
     Parameters
@@ -1960,6 +1962,19 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         masking every atom past the first few (which underfit an equal-K linear
         dictionary and left the K=128 fit rank-deficient). A per-fit ``ibp_alpha``
         or the global ``sae_set_ibp_alpha`` setter still overrides it.
+    structured_residual_passes
+        Number of structured-residual sculpting passes run after the primary
+        joint fit. Defaults to ``0`` (off). Each pass fits the current
+        reconstruction residual and folds the recovered structure back into the
+        atom dictionary. Must be a non-negative int; the native core clamps the
+        effective count to ``STRUCTURED_RESIDUAL_PASSES_MAX`` (currently ``4``),
+        so larger values behave like ``4``. An explicit, typed opt-in — with the
+        default ``0`` the fit is bit-identical to the pre-existing behavior.
+    promote_from_residual
+        When ``True`` (default ``False``), atoms discovered in the structured
+        residual passes are promoted into the primary atom tier rather than kept
+        as a secondary residual dictionary. Only meaningful when
+        ``structured_residual_passes > 0``. Coerced to ``bool``.
     learning_rate
         Damped Newton/Gauss-Newton step size. If omitted, the Python facade uses
         ``1.0`` for IBP/softmax and ``0.05`` for JumpReLU.
@@ -2111,6 +2126,18 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
             "ibp_alpha must be finite and > 0 (or None to defer to the global "
             f"setter); got {ibp_alpha}"
         )
+    # Structured-residual sculpting is an explicit, typed opt-in. The count must
+    # be a non-negative int (it is clamped natively to
+    # `STRUCTURED_RESIDUAL_PASSES_MAX`); `promote_from_residual` is coerced to a
+    # plain bool for the pyfunction kwarg.
+    structured_residual_passes = int(structured_residual_passes)
+    if structured_residual_passes < 0:
+        raise ValueError(
+            "structured_residual_passes must be a non-negative int (it is "
+            "clamped natively to STRUCTURED_RESIDUAL_PASSES_MAX); "
+            f"got {structured_residual_passes}"
+        )
+    promote_from_residual = bool(promote_from_residual)
     if scad_mcp_gamma is None:
         scad_mcp_gamma_value = 3.7 if gate_sparsity_kind == "scad" else 2.5
     else:
@@ -2427,6 +2454,8 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
             None if separation_barrier_strength is None else float(separation_barrier_strength)
         ),
         ibp_alpha_override=None if ibp_alpha is None else float(ibp_alpha),
+        structured_residual_passes=int(structured_residual_passes),
+        promote_from_residual=bool(promote_from_residual),
     )
     payload_dict = dict(payload)
     model = ManifoldSAE.from_payload(
