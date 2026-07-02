@@ -4021,6 +4021,43 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
+    /// Synthesize the monomial-patch basis evaluator for a streaming chunk when
+    /// the atom was built from a precomputed design matrix and therefore carries
+    /// no `basis_evaluator` (issue #1801).
+    ///
+    /// The flat monomial-patch families — [`SaeAtomBasisKind::EuclideanPatch`],
+    /// [`SaeAtomBasisKind::Linear`], and [`SaeAtomBasisKind::Poincare`] — all
+    /// share the deterministic [`crate::basis::EuclideanPatchEvaluator`] design:
+    /// `Φ(t)` is the set of monomials of total degree ≤ `max_degree` in the
+    /// atom's `latent_dim` coordinates (the Poincaré patch differs only in its
+    /// intrinsic penalty, not in `Φ`). We recover `max_degree` by searching
+    /// upward for the degree whose monomial count equals the atom's
+    /// `basis_size()`; the count is strictly increasing in the degree, so the
+    /// match is unique. Returns `None` when the basis kind has no well-defined
+    /// monomial evaluator (e.g. `Duchon`, which needs its kernel centers) or when
+    /// no degree reproduces the atom's width, so the caller keeps the original
+    /// "no basis evaluator" error rather than guessing.
+    fn synthesize_monomial_patch_evaluator(
+        atom: &SaeManifoldAtom,
+    ) -> Option<Arc<dyn SaeBasisEvaluator>> {
+        match atom.basis_kind {
+            SaeAtomBasisKind::EuclideanPatch
+            | SaeAtomBasisKind::Linear
+            | SaeAtomBasisKind::Poincare => {}
+            _ => return None,
+        }
+        let latent_dim = atom.latent_dim;
+        let target = atom.basis_size();
+        for degree in 0..=target {
+            if gam_terms::basis::monomial_exponents(latent_dim, degree).len() == target {
+                return crate::basis::EuclideanPatchEvaluator::new(latent_dim, degree)
+                    .ok()
+                    .map(|ev| Arc::new(ev) as Arc<dyn SaeBasisEvaluator>);
+            }
+        }
+        None
+    }
+
     /// Materialize a row-chunk `[start, end)` of this term as a standalone
     /// `SaeManifoldTerm`, recomputing `(basis_values, basis_jacobian)` on demand
     /// from the persisted decoder + atom geometry and the caller-supplied
@@ -4068,13 +4105,25 @@ impl SaeManifoldTerm {
                     atom.latent_dim
                 ));
             }
-            let evaluator = atom.basis_evaluator.as_ref().ok_or_else(|| {
-                format!(
-                    "SaeManifoldTerm::materialize_chunk: atom '{}' has no basis evaluator; a \
-                     streaming fit must re-evaluate Φ(t) at each chunk's coordinates",
-                    atom.name
-                )
-            })?;
+            // A streaming fit must re-evaluate Φ(t) at each chunk's coordinates.
+            // Atoms carried from precomputed design matrices via
+            // `SaeManifoldAtom::new` hold `basis_evaluator = None`; for the flat
+            // monomial-patch families we synthesize the deterministic evaluator
+            // from the atom geometry (issue #1801) instead of aborting the fit.
+            let synthesized_evaluator = match atom.basis_evaluator.as_ref() {
+                Some(_) => None,
+                None => Self::synthesize_monomial_patch_evaluator(atom),
+            };
+            let evaluator = match atom.basis_evaluator.as_ref().or(synthesized_evaluator.as_ref()) {
+                Some(evaluator) => evaluator,
+                None => {
+                    return Err(format!(
+                        "SaeManifoldTerm::materialize_chunk: atom '{}' has no basis evaluator; a \
+                         streaming fit must re-evaluate Φ(t) at each chunk's coordinates",
+                        atom.name
+                    ));
+                }
+            };
             let (phi, jet) = evaluator.evaluate(coords.view())?;
             let m = atom.basis_size();
             if phi.dim() != (n_chunk, m) {
@@ -4107,7 +4156,14 @@ impl SaeManifoldTerm {
                 atom.decoder_coefficients.clone(),
                 atom.smooth_penalty_raw.clone(),
             )?;
-            chunk_atom.basis_evaluator = atom.basis_evaluator.clone();
+            // Carry the atom's own evaluator when it has one; otherwise seed the
+            // chunk with the synthesized monomial-patch evaluator (#1801) so the
+            // downstream streaming assembly re-evaluates Φ(t) exactly as the
+            // non-precomputed path does.
+            chunk_atom.basis_evaluator = atom
+                .basis_evaluator
+                .clone()
+                .or_else(|| synthesized_evaluator.clone());
             chunk_atom.basis_second_jet = atom.basis_second_jet.clone();
             // #972 / #977 T1: carry the active Grassmann frame onto the chunk
             // atom so the streaming per-chunk assembly uses the SAME factored
