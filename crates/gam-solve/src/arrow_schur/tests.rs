@@ -3067,7 +3067,7 @@ pub(crate) fn parallel_block_diag_inverse_apply_deterministic_and_solves() {
     let backend = CpuBatchedBlockSolver;
     let ridge_t = 1e-4;
     let ridge_beta = 1e-5;
-    let precond = ArrowBlockDiagInverse::build(&sys, ridge_t, ridge_beta, false, &backend)
+    let precond = ArrowBlockDiagInverse::build(&sys, ridge_t, ridge_beta, None, false, &backend)
         .expect("block-diagonal inverse must build");
     let total_dt = sys.row_offsets[n];
     let r_t = Array1::from_iter((0..total_dt).map(|i| 0.15 * (i as f64).sin() + 0.02));

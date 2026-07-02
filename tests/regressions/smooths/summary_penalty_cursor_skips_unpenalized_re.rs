@@ -166,5 +166,4 @@ fn summary_penalty_cursor_matches_actual_penalty_layout() {
          exactly once; a leftover/overshoot means the per-term windows are \
          mis-aligned (#1883)"
     );
-    );
 }
