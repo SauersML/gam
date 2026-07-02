@@ -522,6 +522,46 @@ mod coordinate_fidelity_tests {
         );
     }
 
+    /// CONTRACT: the declining higher-jet impls are a *capability declaration*
+    /// (`None` = "no analytic jet"), not a silent stub. A d = 1 evaluator must
+    /// still validate its coordinate shape and surface a wrong-dimension call as
+    /// an error rather than ignore the argument. This guards against the higher
+    /// jets regressing back to an unused-`_coords` body (which the whole-workspace
+    /// ban-scanner rejects, and which cold release builds fail on — #2092): if the
+    /// argument were ignored, the malformed-shape probe below would silently
+    /// return `None` instead of `Some(Err(..))`.
+    #[test]
+    fn declining_higher_jets_enforce_d1_coords_contract() {
+        let ev = CircleHarmonicEvaluator { harmonics: 3 };
+        // Well-formed d = 1 coords: both higher jets decline (no analytic form).
+        let good = Array2::<f64>::zeros((5, 1));
+        assert!(
+            ev.second_jet_dyn(good.view()).is_none(),
+            "d = 1 coords must decline the second jet with None"
+        );
+        assert!(
+            ev.third_jet_dyn(good.view()).is_none(),
+            "d = 1 coords must decline the third jet with None"
+        );
+        // Malformed coords (d = 2): the evaluator must consume the argument and
+        // reject the contract violation, not silently decline.
+        let bad = Array2::<f64>::zeros((5, 2));
+        let second = ev
+            .second_jet_dyn(bad.view())
+            .expect("wrong-dimension coords must not silently decline the second jet");
+        assert!(
+            second.is_err(),
+            "second_jet_dyn must reject d != 1 coords, got {second:?}"
+        );
+        let third = ev
+            .third_jet_dyn(bad.view())
+            .expect("wrong-dimension coords must not silently decline the third jet");
+        assert!(
+            third.is_err(),
+            "third_jet_dyn must reject d != 1 coords, got {third:?}"
+        );
+    }
+
     /// TIE-BREAK: the raw EV comparison is preserved, and at (near-)equal EV the
     /// more-uniform-coordinate candidate is preferred.
     #[test]
