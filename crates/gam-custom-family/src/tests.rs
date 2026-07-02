@@ -8755,3 +8755,88 @@ pub(crate) fn structural_edf_matches_trace_identity_noncommuting_pair() {
         "edf at λ=1 must be ≈0.6111 (true), not 0.7000 (Rayleigh-quotient bug): got {edf_at_one}",
     );
 }
+
+/// gam#1854 / gam#1395: the multinomial Firth/Jeffreys separation fallback assembles
+/// the outer joint Hessian `H_unpen + S_λ + scale·H_Φ` and, for small systems
+/// (`total <= JOINT_LOGDET_GUARD_MAX_DIM`), realizes its `0.5·log|H|` Laplace term
+/// through `BlockCoupledOperator::from_joint_hessian_with_mode` →
+/// `DenseSpectralOperator::from_symmetric_with_mode` → `eigh(Side::Lower)`. That
+/// eigensolver reads ONLY the lower triangle and ASSUMES the input is symmetric.
+///
+/// On the near-separation Firth path the divided-difference `H_Φ` (plus its
+/// second-order completion) carries an `O(1e10)` curvature scale, so reduction-order
+/// floating-point noise desyncs the assembled matrix's mirror entries by an amount
+/// that is *large in absolute terms*. Reading the raw lower triangle then yields a
+/// materially different spectrum — and logdet — than the symmetrized matrix. The
+/// gam#1395 ground-truth guard in `joint_outer_evaluate` reconstructs the SAME matrix
+/// but symmetrizes it first, so an unsymmetrized assembly makes the assembled-vs-
+/// reference logdet diverge and the guard `assert!` fires (caught by the fallback's
+/// `catch_unwind` and degraded to the clean separation error — the #1854 symptom).
+///
+/// The fix symmetrizes the assembled joint Hessian in place before constructing the
+/// `BlockCoupledOperator`, mirroring the guard's ground truth and the matrix-free
+/// dense-assemble path. This test pins that invariant at the operator boundary that
+/// the guard compares across: on a symmetric input the `BlockCoupledOperator` and the
+/// guard's `DenseSpectralOperator` realize the identical logdet (the guard's apples-to-
+/// apples assumption), while the RAW asymmetric matrix — the pre-symmetrization state —
+/// diverges by FAR more than the guard tolerance. That divergence is exactly why the
+/// symmetrization is load-bearing; removing it re-opens the #1854 guard trip.
+#[test]
+fn multinomial_firth_joint_hessian_logdet_needs_symmetrization_1854() {
+    let mode = PseudoLogdetMode::Smooth;
+
+    // A 3×3 SPD joint-Hessian stand-in with an `O(1e10)` curvature scale (the
+    // near-separation Firth regime) and a large lower-/upper-triangle desync on one
+    // off-diagonal pair, standing in for reduction-order f.p. noise on a huge entry.
+    let mut raw = Array2::<f64>::zeros((3, 3));
+    raw[[0, 0]] = 1.0e10;
+    raw[[1, 1]] = 5.0;
+    raw[[2, 2]] = 2.0;
+    raw[[0, 1]] = 0.0; // upper mirror entry
+    raw[[1, 0]] = 2.0e5; // lower mirror entry — desynced from the upper one
+
+    // Guard ground truth: symmetrize first, then the dense spectral operator.
+    let mut symmetric = raw.clone();
+    symmetrize_dense_in_place(&mut symmetric);
+    let reference = DenseSpectralOperator::from_symmetric_with_mode(&symmetric, mode)
+        .expect("reference eigendecomposition of the symmetrized joint Hessian");
+    let reference_logdet = reference.logdet();
+    assert!(
+        reference_logdet.is_finite(),
+        "reference logdet must be finite: {reference_logdet}"
+    );
+
+    // Post-fix assembly route: `BlockCoupledOperator` on the SAME symmetrized matrix.
+    let assembled = BlockCoupledOperator::from_joint_hessian_with_mode(&symmetric, mode)
+        .expect("assembled BlockCoupledOperator on the symmetrized joint Hessian");
+    let assembled_logdet = assembled.logdet();
+
+    // Guard tolerance, verbatim from `joint_outer_evaluate`'s gam#1395 check.
+    let total = 3usize;
+    let tol = 1e-7 * (total as f64) * (1.0 + reference_logdet.abs());
+
+    // Apples-to-apples: on a symmetric input the two operator routes realize the
+    // identical logdet, so the guard passes. This is the property the symmetrization
+    // restores.
+    assert!(
+        (assembled_logdet - reference_logdet).abs() <= tol,
+        "symmetrized assembly must match the gam#1395 reference logdet within guard \
+         tolerance: assembled={assembled_logdet:.9e} reference={reference_logdet:.9e} \
+         tol={tol:.3e}"
+    );
+
+    // Load-bearing check: feeding the RAW asymmetric matrix (the pre-symmetrization
+    // state) to the same operator route makes `eigh(Side::Lower)` read the desynced
+    // lower triangle, diverging from the guard's reference by FAR more than the guard
+    // tolerance — i.e. skipping the symmetrization trips the gam#1395 guard exactly as
+    // reported in #1854.
+    let unsymmetrized = BlockCoupledOperator::from_joint_hessian_with_mode(&raw, mode)
+        .expect("BlockCoupledOperator on the raw asymmetric joint Hessian");
+    let unsymmetrized_logdet = unsymmetrized.logdet();
+    assert!(
+        (unsymmetrized_logdet - reference_logdet).abs() > 1.0e3 * tol,
+        "raw asymmetric assembly must diverge from the reference (symmetrization is \
+         load-bearing): raw={unsymmetrized_logdet:.9e} reference={reference_logdet:.9e} \
+         tol={tol:.3e}"
+    );
+}
