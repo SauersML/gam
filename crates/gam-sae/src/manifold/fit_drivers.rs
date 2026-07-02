@@ -2023,6 +2023,13 @@ impl SaeManifoldTerm {
         iteration: usize,
         rho: Option<&SaeManifoldRho>,
     ) -> Result<(), String> {
+        // SAC — the K=1 stagewise lane disarms the guard stack: a single atom has
+        // no dictionary peer to collapse against, so the reseed machinery is a
+        // no-op there, and disarming keeps the per-atom / backfitting refits
+        // provably reseed-free (block-coordinate monotonicity).
+        if !self.guards_enabled {
+            return Ok(());
+        }
         let n = self.n_obs();
         let k = self.k_atoms();
         if n == 0 || k == 0 {
@@ -2179,6 +2186,11 @@ impl SaeManifoldTerm {
         iteration: usize,
         rho: &SaeManifoldRho,
     ) -> Result<(), String> {
+        // SAC — the stagewise lane disarms the guard stack (see
+        // `enforce_active_mass_guard`); a disarmed term never reseeds.
+        if !self.guards_enabled {
+            return Ok(());
+        }
         let n = self.n_obs();
         let k = self.k_atoms();
         // A single atom has no dictionary peer to be distinct from, so the

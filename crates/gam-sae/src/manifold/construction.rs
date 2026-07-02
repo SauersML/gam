@@ -64,6 +64,9 @@ impl SaeManifoldTerm {
             // #2022/#2023 — per-fit opt-ins, default false (bit-for-bit historical).
             quotient_scale: false,
             data_row_reseed: false,
+            // SAC — the collapse-guard stack is armed by default; the stagewise
+            // K=1 lane disarms it explicitly (see the field docs on term.rs).
+            guards_enabled: true,
             collapse_events: Vec::new(),
             row_loss_weights: None,
             last_frames_active: false,
@@ -801,6 +804,21 @@ impl SaeManifoldTerm {
     /// env lever). Default false.
     pub fn set_data_row_reseed(&mut self, enabled: bool) {
         self.data_row_reseed = enabled;
+    }
+
+    /// SAC — arm (`true`, the default) or disarm (`false`) the #976 Layer-1
+    /// collapse-guard stack for this term's inner joint fits. The Sequential Atom
+    /// Composition K=1 lane disarms it: a single atom never trips the guards, so
+    /// disarming is a no-op on reconstruction while guaranteeing the per-atom and
+    /// backfitting refits stay reseed-free (a mid-refit reseed would break the
+    /// block-coordinate monotonicity). See [`super::stagewise`].
+    pub fn set_guards_enabled(&mut self, enabled: bool) {
+        self.guards_enabled = enabled;
+    }
+
+    /// SAC — whether the Layer-1 collapse-guard stack is armed on this term.
+    pub fn guards_enabled(&self) -> bool {
+        self.guards_enabled
     }
 
     /// The installed per-row metric, if any. `None` ⇒ Euclidean / isotropic.

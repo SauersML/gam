@@ -656,6 +656,17 @@ pub struct SaeManifoldTerm {
     /// (default false). Set from the FFI via the typed `data_row_reseed` kwarg —
     /// no env lever. Carried across clones.
     pub(crate) data_row_reseed: bool,
+    /// SAC — whether the #976 Layer-1 collapse-guard stack (active-mass /
+    /// decoder-norm re-seed, co-collapse reseed-all) is armed on this term's
+    /// inner joint fits. Default `true` (bit-for-bit historical path). The
+    /// Sequential Atom Composition driver ([`super::stagewise`]) fits one atom at
+    /// a time and drives this to `false` on the K=1 path: a single atom never
+    /// trips the guards (there is no dictionary peer to collapse against), so the
+    /// guards are pure no-ops there, and disarming them makes the per-atom /
+    /// backfitting refits provably reseed-free — a reseed mid-refit would break
+    /// the block-coordinate monotonicity the composition rests on. Carried across
+    /// clones like the other per-fit config so a cloned candidate keeps the lane.
+    pub(crate) guards_enabled: bool,
 }
 
 /// #1777 — PER-FIT configuration overrides the FFI sets on a term to isolate a
@@ -721,6 +732,7 @@ impl Clone for SaeManifoldTerm {
             separation_barrier_strength_override: self.separation_barrier_strength_override,
             quotient_scale: self.quotient_scale,
             data_row_reseed: self.data_row_reseed,
+            guards_enabled: self.guards_enabled,
         }
     }
 }
