@@ -40,7 +40,6 @@ impl SaeManifoldTerm {
         self.apply_newton_step_impl(delta_ext_coord, delta_beta, step_size, true)
     }
 
-
     /// Capture the mutable state perturbed by an `apply_newton_step` +
     /// `loss` line-search trial, plus the row-layout state read by
     /// `apply_newton_step` when unpacking compact Newton steps. See
@@ -293,9 +292,7 @@ impl SaeManifoldTerm {
         rho: &SaeManifoldRho,
         analytic_penalties: Option<&AnalyticPenaltyRegistry>,
     ) -> Result<(), String> {
-        use crate::chart_canonicalization::{
-            CHART_RECOMPOSITION_REL_TOL, CanonicalChartTopology,
-        };
+        use crate::chart_canonicalization::{CHART_RECOMPOSITION_REL_TOL, CanonicalChartTopology};
         /// Which canonical-representative construction applies to an atom:
         /// arc length for `d = 1` (#1019 stage 1), the minimum-isometry-defect
         /// flow for `d = 2` torus atoms (#1019 stage 2), and the same flow
@@ -1697,8 +1694,7 @@ impl SaeManifoldTerm {
         // and the guard does not lower its own bar at the collapse it must catch.
         let dictionary_rank =
             crate::manifold::outer_objective::reachable_dictionary_rank(&self.atoms, n, p);
-        let ev_floor =
-            crate::manifold::outer_objective::collapse_ev_bar(target, dictionary_rank);
+        let ev_floor = crate::manifold::outer_objective::collapse_ev_bar(target, dictionary_rank);
         if !(ev.is_finite() && ev <= ev_floor) {
             return Ok(false);
         }
@@ -2256,10 +2252,8 @@ impl SaeManifoldTerm {
             // so both verdicts key on the same reachable-rank bar.
             let dictionary_rank =
                 crate::manifold::outer_objective::reachable_dictionary_rank(&self.atoms, n, p);
-            let ev_floor = crate::manifold::outer_objective::collapse_ev_bar(
-                target,
-                dictionary_rank,
-            );
+            let ev_floor =
+                crate::manifold::outer_objective::collapse_ev_bar(target, dictionary_rank);
             if !(ev.is_finite() && ev <= ev_floor) {
                 return Ok(());
             }
@@ -2632,6 +2626,11 @@ impl SaeManifoldTerm {
                         * full_delta[row_base + atom_idx])
                         .clamp(-logit_step_cap, logit_step_cap);
                 }
+                let amp_off = self.assignment.amplitude_offset();
+                for atom_idx in 0..k_atoms {
+                    self.assignment.log_amplitudes[[row, atom_idx]] +=
+                        step_size * full_delta[row_base + amp_off + atom_idx];
+                }
             }
             // Apply coords from expanded buffer.
             let coord_offsets = self.assignment.coord_offsets();
@@ -2669,6 +2668,11 @@ impl SaeManifoldTerm {
                     self.assignment.logits[[row, atom_idx]] += (step_size
                         * delta_ext_coord[row_base + atom_idx])
                         .clamp(-logit_step_cap, logit_step_cap);
+                }
+                let amp_off = self.assignment.amplitude_offset();
+                for atom_idx in 0..k_atoms {
+                    self.assignment.log_amplitudes[[row, atom_idx]] +=
+                        step_size * delta_ext_coord[row_base + amp_off + atom_idx];
                 }
             }
             for atom_idx in 0..k_atoms {
