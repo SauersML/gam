@@ -5301,12 +5301,23 @@ struct DuchonHybridConfig {
 ///   null space, spectral power ``s = (d−1)/2``) and ships the native
 ///   reproducing-norm Gram plus a null-space shrinkage ridge, not the operator
 ///   triplet.
+///
+/// When ``any_periodic`` is set, the spec is destined for the mixed-periodicity
+/// (cylinder/torus) builder, whose additive per-axis reproducing kernel is
+/// derived only for the pure-polyharmonic spectrum (Sobolev tail ``s = 0``):
+/// the periodic Bernoulli Green's function and the non-periodic Sobolev kernel
+/// have no validated fractional-power generalization. The auto-power branch
+/// therefore pins ``power = 0`` on periodic requests, keeping the SAME cubic
+/// ``Linear`` null space (so the ``{1, y}`` polynomial block still matches
+/// ``duchon_p_from_nullspace_order``) rather than emitting the Euclidean
+/// ``s = (d−1)/2`` default the periodic builder cannot represent.
 fn resolve_duchon_hybrid_config(
     dim: usize,
     length_scale: Option<f64>,
     nullspace_order: Option<&str>,
     explicit_power: Option<f64>,
     max_op: usize,
+    any_periodic: bool,
 ) -> PyResult<DuchonHybridConfig> {
     let requested_nullspace = parse_nullspace_order(nullspace_order)?;
     // Pure, auto-power requests (no `length_scale`, no explicit `power`) resolve
@@ -5324,7 +5335,12 @@ fn resolve_duchon_hybrid_config(
     // an explicit `power` or the hybrid Matérn-blended kernel (`length_scale`),
     // whose partial-fraction spectrum is only defined for integer `s`.
     if length_scale.is_none() && explicit_power.is_none() {
-        let (nullspace_order, power) = duchon_cubic_default(dim);
+        let (nullspace_order, cubic_power) = duchon_cubic_default(dim);
+        // The mixed-periodicity reproducing kernel supports only s = 0 (pure
+        // polyharmonic); pin the auto power to 0 there while keeping the cubic
+        // `Linear` null space so the periodic builder accepts the auto-resolved
+        // spec instead of rejecting the Euclidean s = (d−1)/2 default.
+        let power = if any_periodic { 0.0 } else { cubic_power };
         return Ok(DuchonHybridConfig {
             length_scale,
             nullspace_order,

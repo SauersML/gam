@@ -2018,12 +2018,14 @@ fn duchon_basis_with_jets<'py>(
     // Resolve the (nullspace_order, power) pair exactly as the basis-only
     // `duchon_basis` forward does (`max_op = 0`): the returned jets must
     // differentiate the *same* matrix the forward builds.
+    let any_periodic = periodic_flags.iter().any(|&b| b);
     let cfg = resolve_duchon_hybrid_config(
         d,
         length_scale,
         nullspace_order,
         power,
         /* max_op = */ 0,
+        any_periodic,
     )?;
 
     // Periods for periodic axes: auto-derived as (max − min) over centers,
@@ -2416,6 +2418,7 @@ fn duchon_basis<'py>(
         nullspace_order,
         power,
         /* max_op = */ 0,
+        any_periodic,
     )?;
     let (spec_length_scale, spec_nullspace, spec_power) =
         (cfg.length_scale, cfg.nullspace_order, cfg.power);
@@ -2596,11 +2599,13 @@ fn duchon_function_norm_penalty<'py>(
                 nullspace_order,
                 Some(explicit_power),
                 /* max_op = */ 0,
+                any_periodic,
             )?;
             (cfg.length_scale, cfg.nullspace_order, cfg.power)
         }
         None => {
-            let cfg = resolve_duchon_hybrid_config(d, length_scale, nullspace_order, None, 0)?;
+            let cfg =
+                resolve_duchon_hybrid_config(d, length_scale, nullspace_order, None, 0, any_periodic)?;
             (cfg.length_scale, cfg.nullspace_order, cfg.power)
         }
     };
