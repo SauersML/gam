@@ -199,21 +199,46 @@ def _save_manifest(manifest: dict, fit, sample: np.ndarray, out_prefix: str) -> 
         print(f"[A] manifest emit skipped: {type(exc).__name__}: {exc}", flush=True)
 
 
-def _score_mdl(manifest: dict) -> float | None:
-    for cand in ("/Users/user/Manifold-SAE/experiments/mdl_ladder",
-                 str(Path(__file__).resolve().parent.parent.parent / "Manifold-SAE"
-                     / "experiments" / "mdl_ladder")):
-        if os.path.exists(os.path.join(cand, "mdl.py")):
-            sys.path.insert(0, cand)
+def _mdl_module():
+    """Import the mdl_ladder scorer, searching (in order) ``$MDL_LADDER_DIR``, a
+    sibling Manifold-SAE checkout at several plausible roots, then a dev-laptop
+    path. Returns the module or None (bits/token then reports null — never crashes).
+    On MSI, set MDL_LADDER_DIR (the sbatch does) or clone Manifold-SAE beside gam."""
+    here = Path(__file__).resolve()
+    cands = []
+    env = os.environ.get("MDL_LADDER_DIR")
+    if env:
+        cands.append(env)
+    # gam clone at $ROOT/<clone>; Manifold-SAE clone at $ROOT/Manifold-SAE.
+    for root in (here.parent.parent.parent, here.parent.parent.parent.parent):
+        cands.append(str(root / "Manifold-SAE" / "experiments" / "mdl_ladder"))
+    cands.append("/Users/user/Manifold-SAE/experiments/mdl_ladder")
+    for cand in cands:
+        if cand and os.path.exists(os.path.join(cand, "mdl.py")):
+            if cand not in sys.path:
+                sys.path.insert(0, cand)
             try:
                 import mdl
 
-                resp = mdl.score_json({"delta2": None, "l_param_bits": None,
-                                       "featurizers": manifest["mdl_featurizers"]})
-                return round(float(sum(r.get("bits_per_token", 0.0) for r in resp.get("rows", []))), 4)
+                return mdl
             except Exception:
                 return None
     return None
+
+
+def _bits_per_token(featurizers: list[dict]) -> float | None:
+    mdl = _mdl_module()
+    if mdl is None:
+        return None
+    try:
+        resp = mdl.score_json({"delta2": None, "l_param_bits": None, "featurizers": featurizers})
+        return round(float(sum(r.get("bits_per_token", 0.0) for r in resp.get("rows", []))), 4)
+    except Exception:
+        return None
+
+
+def _score_mdl(manifest: dict) -> float | None:
+    return _bits_per_token(manifest["mdl_featurizers"])
 
 
 # --------------------------------------------------------------------------- #
@@ -303,25 +328,15 @@ class _TopKSAE:  # thin torch module built lazily so import works without torch
 def _topk_mdl(cfg, test, k_atoms, l0, d, counts) -> float | None:
     """Bits/token for the TopK-SAE via the MDL scorer: one direction featurizer per
     firing budget (uniform), at the same task floor the block arm uses."""
-    for cand in ("/Users/user/Manifold-SAE/experiments/mdl_ladder",):
-        if os.path.exists(os.path.join(cand, "mdl.py")):
-            sys.path.insert(0, cand)
-            try:
-                import mdl
-
-                total_var = float(((test - test.mean(0)) ** 2).sum() / max(test.shape[0], 1))
-                feats = [{
-                    "name": "topk-sae", "kind": "direction",
-                    "total_var": max(total_var, 1e-9), "n_tokens": int(test.shape[0]),
-                    "n_firings": int(counts.sum()), "n_params": int(k_atoms * d),
-                    "g_dict": int(k_atoms), "k_active": int(l0),
-                    "coded_dim": int(l0), "ev": 0.5,
-                }]
-                resp = mdl.score_json({"delta2": None, "l_param_bits": None, "featurizers": feats})
-                return round(float(sum(r.get("bits_per_token", 0.0) for r in resp.get("rows", []))), 4)
-            except Exception:
-                return None
-    return None
+    total_var = float(((test - test.mean(0)) ** 2).sum() / max(test.shape[0], 1))
+    feats = [{
+        "name": "topk-sae", "kind": "direction",
+        "total_var": max(total_var, 1e-9), "n_tokens": int(test.shape[0]),
+        "n_firings": int(counts.sum()), "n_params": int(k_atoms * d),
+        "g_dict": int(k_atoms), "k_active": int(l0),
+        "coded_dim": int(l0), "ev": 0.5,
+    }]
+    return _bits_per_token(feats)
 
 
 # --------------------------------------------------------------------------- #
