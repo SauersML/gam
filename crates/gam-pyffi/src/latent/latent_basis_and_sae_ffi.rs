@@ -2141,6 +2141,31 @@ fn metric_provenance_label(
 /// pathological value cannot spin the alternation unboundedly.
 const STRUCTURED_RESIDUAL_PASSES_MAX: usize = 4;
 
+/// #2021 (EXPERIMENT) — Λ residual-factor PROMOTION opt-in, read from the
+/// `GAM_SAE_PROMOTE_FROM_RESIDUAL` env lever. When truthy AND
+/// `structured_residual_passes > 0`, a residual factor that PERSISTS across
+/// passes (dwell ≥ 2) and earns energy above the idiosyncratic-noise floor is
+/// promoted to a born atom, GROWING K. DEFAULT OFF: growing K is added capacity,
+/// so the null (no growth) must be the default (SPEC: users opt in to overfitting
+/// potential). This keeps whitening (passes > 0) testable WITHOUT growth — the
+/// (passes-on, promotion-off) pairing is the clean in-sample target. Truthy =
+/// anything other than unset / empty / "0" / "false" / "no" (case-insensitive).
+///
+/// TODO(#2021): promote to a typed `promote_from_residual: bool = false`
+/// pyfunction kwarg once it proves out — no permanent hidden env levers.
+fn sae_promote_from_residual() -> bool {
+    std::env::var("GAM_SAE_PROMOTE_FROM_RESIDUAL")
+        .ok()
+        .map(|s| {
+            let t = s.trim();
+            !(t.is_empty()
+                || t == "0"
+                || t.eq_ignore_ascii_case("false")
+                || t.eq_ignore_ascii_case("no"))
+        })
+        .unwrap_or(false)
+}
+
 /// #2021 — fit the structured residual-covariance model on `term`'s
 /// post-dictionary residuals and return it (the driver then materializes the
 /// damped per-row metric via [`StructuredResidualModel::row_metric_damped`],
@@ -2937,6 +2962,21 @@ fn sae_manifold_fit_inner<'py>(
     if structured_passes > 0 && metric_provenance == "Euclidean" {
         let mut prev_model: Option<gam::inference::residual_factor::StructuredResidualModel> =
             None;
+        // #2021 Λ nursery→promotion (evidence-gated). Accumulate residual-factor
+        // directions that PERSIST across passes (producer
+        // `StructuredResidualModel::promotion_candidates`: energy above the
+        // idiosyncratic-noise floor AND |cos|-alignment with the previous pass's
+        // Λ) and, once a lineage matures, promote it to a born atom so the NEXT
+        // pass refits with the discovered structure. A lineage that skips a pass
+        // loses its dwell; at most one birth per pass, and only when a later pass
+        // remains to refit the born atom, so K grows ≤ structured_passes and no
+        // born atom is left unrefit inside the alternation.
+        const PROMOTION_ALIGN_MIN: f64 = 0.9;
+        const PROMOTION_ENERGY_FLOOR_MULT: f64 = 1.0;
+        const PROMOTION_NURSERY_MIN_PASSES: usize = 2;
+        // Opt-in, default-off: whitening runs without growth unless this is set.
+        let promote_from_residual = sae_promote_from_residual();
+        let mut nursery: Vec<(Array1<f64>, usize)> = Vec::new();
         for pass in 0..structured_passes {
             let Some(model) = sae_structured_residual_model(&term, z_view.view())? else {
                 break;
@@ -2965,7 +3005,10 @@ fn sae_manifold_fit_inner<'py>(
                 ridge_ext_coord,
                 ridge_beta,
             );
-            let problem = gam::solver::rho_optimizer::OuterProblem::new(n_params)
+            // #2021 — a promotion (below) grows K, enlarging ρ; size the outer
+            // problem from the CURRENT warm vector, not the pass-0 `n_params`
+            // (identical to `n_params` when no birth has occurred).
+            let problem = gam::solver::rho_optimizer::OuterProblem::new(warm_flat.len())
                 .with_initial_rho(warm_flat)
                 .with_seed_config(gam::solver::seeding::SeedConfig {
                     max_seeds: 1,
@@ -3012,6 +3055,79 @@ fn sae_manifold_fit_inner<'py>(
             loss = fitted_result.loss;
             // Report the geometry actually used by the returned fit.
             metric_provenance = installed_label;
+            // #2021 promotion: fold this pass's persisted factor directions into
+            // the nursery, then promote (birth) at most one matured lineage so the
+            // NEXT pass refits with it. Runs only when the opt-in lever is set
+            // (default off) AND from pass 1 on (needs a `prev`). Gating via a
+            // `None` prev keeps the block un-indented and inert when off.
+            let prev_for_promotion = if promote_from_residual {
+                prev_model.as_ref()
+            } else {
+                None
+            };
+            if let Some(prev) = prev_for_promotion {
+                let cands = model
+                    .promotion_candidates(
+                        Some(prev),
+                        PROMOTION_ALIGN_MIN,
+                        PROMOTION_ENERGY_FLOOR_MULT,
+                    )
+                    .map_err(py_value_error)?;
+                let mut seen = vec![false; nursery.len()];
+                for cand in &cands {
+                    let hit = nursery
+                        .iter()
+                        .position(|(d, _)| cand.direction.dot(d).abs() >= PROMOTION_ALIGN_MIN);
+                    match hit {
+                        Some(i) => {
+                            nursery[i].0 = cand.direction.clone();
+                            nursery[i].1 += 1;
+                            seen[i] = true;
+                        }
+                        None => {
+                            nursery.push((cand.direction.clone(), 1));
+                            seen.push(true);
+                        }
+                    }
+                }
+                // A lineage that did not recur this pass loses its dwell.
+                let mut keep = seen.into_iter();
+                nursery.retain(|_| keep.next().unwrap_or(false));
+                // Promote at most one matured lineage, and only if a later pass
+                // remains to refit the born atom. Collect the direction BEFORE
+                // mutating `term` to avoid overlapping borrows.
+                let matured = if pass + 1 < structured_passes {
+                    nursery
+                        .iter()
+                        .find(|(_, count)| *count >= PROMOTION_NURSERY_MIN_PASSES)
+                        .map(|(dir, _)| dir.clone())
+                } else {
+                    None
+                };
+                if let Some(dir) = matured {
+                    // Born-atom decoder: the unit direction on atom-0's constant
+                    // (row-0) basis row, shape (m, p) per `born_atom`'s contract.
+                    let m = term.atoms[0].basis_size();
+                    let mut decoder = Array2::<f64>::zeros((m, p_out));
+                    for out in 0..p_out {
+                        decoder[[0, out]] = dir[out];
+                    }
+                    let (grown_term, grown_rho) =
+                        gam::terms::sae::structure_harvest::apply_structure_move(
+                            &term,
+                            &rho,
+                            &gam::solver::structure_search::StructureMove::Birth { candidate: 0 },
+                            std::slice::from_ref(&decoder),
+                        )
+                        .map_err(py_value_error)?;
+                    term = grown_term;
+                    rho = grown_rho;
+                    // Drop the promoted lineage so it is not re-promoted; the next
+                    // pass rebuilds the objective from the grown `term`/`rho` and
+                    // `warm_flat.len()` picks up the enlarged ρ automatically.
+                    nursery.retain(|(d, _)| d.dot(&dir).abs() < PROMOTION_ALIGN_MIN);
+                }
+            }
             // Carry this pass's model forward as the next pass's damping anchor.
             prev_model = Some(model);
         }
