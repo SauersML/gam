@@ -82,6 +82,7 @@ def test_forward_output_shapes_and_finite():
         atom_manifold="circle",
         atom_basis="fourier",
         n_basis_per_atom=5,
+        dtype=torch.float32,
     )
     sae = gt.ManifoldSAE(cfg)
     x = torch.randn(7, 8, dtype=torch.float32)
@@ -153,20 +154,19 @@ def test_decoder_monotonicity_routes_through_rust():
     assert sae0.decoder_monotonicity_penalty().item() == 0.0
 
 
-def test_bspline_basis_routes_through_rust():
-    # Cylinder + bspline now reaches the Rust bspline arm of basis_with_jet
-    # (open uniform). Forward and backward must both succeed without falling
-    # back to the Duchon path.
+def test_bspline_basis_refuses_dead_multid_coordinates():
+    # The Rust B-spline basis_with_jet kernel is one-dimensional.  A rank-2
+    # cylinder + bspline config would silently ignore the second intrinsic
+    # coordinate, so the module must refuse it instead of routing through a
+    # mathematically wrong basis.
     cfg = gt.ManifoldSAEConfig(
         input_dim=5, K=2, intrinsic_rank=2, atom_manifold="cylinder",
         atom_basis="bspline", basis_order=2, n_basis_per_atom=6,
     )
     sae = gt.ManifoldSAE(cfg)
     x = torch.randn(3, 5, dtype=torch.float64, requires_grad=True)
-    out = sae(x)
-    assert torch.isfinite(out.x_hat).all()
-    out.x_hat.sum().backward()
-    assert x.grad is not None and torch.isfinite(x.grad).all()
+    with pytest.raises(NotImplementedError, match="bspline.*intrinsically 1-D"):
+        sae(x)
 
 
 def test_basis_eval_matches_rust_basis_with_jet():
