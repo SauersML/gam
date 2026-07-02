@@ -4934,6 +4934,48 @@ fn gaussian_reml_fit_with_constraints_forward<'py>(
             }
         };
 
+    // With no active inequality system the constrained forward is, by
+    // definition, the unconstrained Gaussian REML fit. Route it through the
+    // exact same closed-form solver that `gaussian_reml_fit` uses so the two
+    // agree to the last bit rather than merely "close" — the general PIRLS
+    // outer loop converges to a slightly different smoothing parameter and
+    // would otherwise violate the documented no-constraint invariant.
+    if constraints_opt.is_none() {
+        let init_lambda = init_log_lambda.map(f64::exp);
+        let x_cf = x_view.to_owned();
+        let y_cf = y_view.to_owned();
+        let penalty_cf = penalty_view.to_owned();
+        let weights_cf: Option<Array1<f64>> = weights.as_ref().map(|w| w.as_array().to_owned());
+        let fit = detach_estimation_result(
+            py,
+            "gaussian_reml_fit_with_constraints_forward",
+            move || {
+                gaussian_reml_multi_closed_form_with_cache(
+                    x_cf.view(),
+                    y_cf.view(),
+                    penalty_cf.view(),
+                    weights_cf.as_ref().map(|w| w.view()),
+                    init_lambda,
+                    None,
+                )
+            },
+        )?;
+
+        let lambda_scalar = fit.lambda;
+        let log_lambda_scalar = lambda_scalar.max(1e-300).ln();
+        let active_indices_arr: Array1<u64> = Array1::from_vec(Vec::new());
+
+        let out = PyDict::new(py);
+        out.set_item("coefficients", fit.coefficients.into_pyarray(py))?;
+        out.set_item("fitted", fit.fitted.into_pyarray(py))?;
+        out.set_item("lambda", lambda_scalar)?;
+        out.set_item("log_lambda", log_lambda_scalar)?;
+        out.set_item("reml_score", fit.reml_score)?;
+        out.set_item("edf", fit.edf)?;
+        out.set_item("active_indices", active_indices_arr.into_pyarray(py))?;
+        return Ok(out.unbind());
+    }
+
     let s_list: Vec<gam::terms::smooth::BlockwisePenalty> =
         vec![gam::terms::smooth::BlockwisePenalty::new(
             0..p_cols,
