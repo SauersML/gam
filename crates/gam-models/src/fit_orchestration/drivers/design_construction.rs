@@ -157,6 +157,102 @@ pub fn fit_term_collection_with_penalty_block_gamma_priors(
     Ok(fitted)
 }
 
+/// Expand the single shared "linear" ridge block that the base design emits for
+/// `double_penalty` linear terms into one DISTINCT penalty coordinate per source:
+/// a per-term base ridge (addressed by the term's own name so a keyed block-gamma
+/// prior lands on it) plus a per-term null-space (double) ridge.
+///
+/// The base design deliberately aggregates all `double_penalty` linear terms into
+/// one shared ridge named `"linear"` — a single identifiable λ for the plain fit
+/// path (and the shape the no-group `..._penalty_block_gamma_priors` path relies
+/// on). But when the caller ALSO supplies per-term keyed block-gamma priors and
+/// coefficient groups, that aggregation collapses the per-term base/double
+/// coordinates the caller addresses by name, so this combined path materializes
+/// them locally without perturbing the plain design consumers (#1881).
+fn expand_double_penalty_linear_penalty_blocks(
+    design: &TermCollectionDesign,
+    spec: &TermCollectionSpec,
+) -> TermCollectionDesign {
+    let Some(shared_idx) = design.penaltyinfo.iter().position(|info| {
+        info.termname.as_deref() == Some("linear")
+            && matches!(&info.penalty.source, PenaltySource::Other(s) if s == "LinearTermRidge")
+    }) else {
+        return design.clone();
+    };
+
+    let mut new_penalties = Vec::<BlockwisePenalty>::new();
+    let mut new_nullspace = Vec::<usize>::new();
+    let mut new_info = Vec::<PenaltyBlockInfo>::new();
+    for (j, linear) in spec.linear_terms.iter().enumerate() {
+        if !linear.double_penalty {
+            continue;
+        }
+        let Some((_, range)) = design
+            .linear_ranges
+            .iter()
+            .find(|(name, _)| name == &linear.name)
+        else {
+            continue;
+        };
+        // Base linear ridge — carries the caller's per-term keyed block-gamma
+        // prior through its term name.
+        new_penalties.push(BlockwisePenalty::ridge(range.clone(), 1.0));
+        new_nullspace.push(0);
+        new_info.push(PenaltyBlockInfo {
+            global_index: 0,
+            termname: Some(linear.name.clone()),
+            penalty: PenaltyInfo {
+                source: PenaltySource::Other("LinearTermRidge".to_string()),
+                original_index: j,
+                active: true,
+                effective_rank: 1,
+                dropped_reason: None,
+                nullspace_dim_hint: 0,
+                normalization_scale: 1.0,
+                kronecker_factors: None,
+            },
+        });
+        // Double-penalty (null-space) coordinate — a DISTINCT λ, kept anonymous
+        // so a term-keyed block-gamma prior lands on the base ridge only.
+        new_penalties.push(BlockwisePenalty::ridge(range.clone(), 1.0));
+        new_nullspace.push(0);
+        new_info.push(PenaltyBlockInfo {
+            global_index: 0,
+            termname: None,
+            penalty: PenaltyInfo {
+                source: PenaltySource::DoublePenaltyNullspace,
+                original_index: j,
+                active: true,
+                effective_rank: 1,
+                dropped_reason: None,
+                nullspace_dim_hint: 0,
+                normalization_scale: 1.0,
+                kronecker_factors: None,
+            },
+        });
+    }
+
+    if new_penalties.is_empty() {
+        return design.clone();
+    }
+
+    let mut expanded = design.clone();
+    expanded
+        .penalties
+        .splice(shared_idx..=shared_idx, new_penalties);
+    expanded
+        .nullspace_dims
+        .splice(shared_idx..=shared_idx, new_nullspace);
+    expanded
+        .penaltyinfo
+        .splice(shared_idx..=shared_idx, new_info);
+    // Re-key the global indices so keyed-prior matching stays 1:1 with position.
+    for (idx, info) in expanded.penaltyinfo.iter_mut().enumerate() {
+        info.global_index = idx;
+    }
+    expanded
+}
+
 pub fn fit_term_collection_with_coefficient_groups_and_penalty_block_gamma_priors(
     data: ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
@@ -180,6 +276,12 @@ pub fn fit_term_collection_with_coefficient_groups_and_penalty_block_gamma_prior
     }
 
     let design = build_term_collection_design(data, spec)?;
+    // Keep every distinct penalty source — each double-penalty linear term's base
+    // ridge and its null-space (double) coordinate, each keyed block-gamma prior,
+    // and each coefficient group — as its OWN λ. The base design folds all
+    // `double_penalty` linear terms into one shared "linear" ridge; expand it so
+    // the per-term coordinates the caller keys / groups on stay distinct (#1881).
+    let design = expand_double_penalty_linear_penalty_blocks(&design, spec);
     let base_fit_opts = adaptive_fit_options_base(options, &design);
     let base_rho_prior = realize_keyed_penalty_block_gamma_priors(&design, priors)
         .map_err(EstimationError::BasisError)?;
