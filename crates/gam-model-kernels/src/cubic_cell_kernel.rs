@@ -1145,6 +1145,12 @@ impl TailCellMomentCacheStats {
 #[derive(Debug)]
 pub struct TailCellMomentCache {
     moments: ByteLruCache<TailCellMomentCacheKey, CellMomentState>,
+    in_flight: std::sync::Mutex<
+        std::collections::HashMap<
+            TailCellMomentCacheKey,
+            Arc<std::sync::OnceLock<Result<CellMomentState, String>>>,
+        >,
+    >,
     hits: std::sync::atomic::AtomicUsize,
     misses: std::sync::atomic::AtomicUsize,
 }
@@ -1164,6 +1170,7 @@ impl Default for TailCellMomentCache {
                 TAIL_CELL_MOMENT_CACHE_MAX_ENTRIES,
                 shard_count,
             ),
+            in_flight: std::sync::Mutex::new(std::collections::HashMap::new()),
             hits: std::sync::atomic::AtomicUsize::new(0),
             misses: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -1182,6 +1189,10 @@ impl TailCellMomentCache {
     #[inline]
     pub fn clear(&self) {
         self.moments.clear();
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
         self.hits.store(0, std::sync::atomic::Ordering::Relaxed);
         self.misses.store(0, std::sync::atomic::Ordering::Relaxed);
     }
@@ -1200,11 +1211,12 @@ impl TailCellMomentCache {
     /// miss. Cells outside the affine-tail keyset bypass the cache and run
     /// the uncached evaluator directly without touching the counters.
     ///
-    /// Stat semantics: every cache hit increments `hits`; a **miss** is
-    /// counted when this call computed the value itself. Under concurrent
-    /// access two workers racing on the same cold key may both count a miss
-    /// (each computes the identical pure-function value); single-threaded
-    /// bookkeeping is exact.
+    /// Stat semantics: every request served from an existing resident entry,
+    /// or from a concurrently published entry for the same key, increments
+    /// `hits`; a **miss** is counted only for the caller that actually
+    /// computes a cold key. The compute happens outside the LRU shard lock,
+    /// but an in-flight table coalesces same-key cold races so followers reuse
+    /// the leader's published value instead of duplicating work.
     pub fn evaluate(
         &self,
         cell: DenestedCubicCell,
@@ -1217,11 +1229,41 @@ impl TailCellMomentCache {
             self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(state);
         }
-        let state = evaluate_cell_moments_uncached(cell, max_degree)?;
+
+        let (slot, leader) = {
+            let mut in_flight = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(slot) = in_flight.get(&key) {
+                (Arc::clone(slot), false)
+            } else {
+                let slot = Arc::new(std::sync::OnceLock::new());
+                in_flight.insert(key, Arc::clone(&slot));
+                (slot, true)
+            }
+        };
+
+        if !leader {
+            let state = slot.wait().clone()?;
+            self.hits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(state);
+        }
+
+        let state = evaluate_cell_moments_uncached(cell, max_degree);
+        if let Ok(state) = &state {
+            self.moments.insert(key, state.clone());
+            self.hits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.misses
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.moments.insert(key, state.clone());
-        Ok(state)
+        if let Err(existing_state) = slot.set(state.clone()) {
+            std::mem::drop(existing_state);
+        }
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&key);
+        state
     }
 }
 
