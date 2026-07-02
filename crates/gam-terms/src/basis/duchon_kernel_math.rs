@@ -85,6 +85,18 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
     // old `collocation_points == centers` special case — under-samples a
     // `k`-bump basis and is what made these penalties explode).
     let nullspace_order = duchon_effective_nullspace_order(centers, nullspace_order);
+    // Auto-raise the null-space order (p) so the pointwise kernel and every
+    // active derivative-collocation operator clear their well-posedness margin
+    // `2(p + s) > d + max_op` BEFORE the guard in
+    // `validate_duchon_collocation_orders` can fire. Mirrors the auto-degrade
+    // above; only `p` is lifted, so the spectral power and CPD condition are
+    // untouched. See `duchon_order_for_operator_margin`.
+    let nullspace_order = duchon_order_for_operator_margin(
+        centers.ncols(),
+        power,
+        nullspace_order,
+        max_operator_derivative_order,
+    );
     let p_order = duchon_p_from_nullspace_order(nullspace_order);
     let s_order: f64 = power;
     let p_colloc = collocation_points.nrows();
@@ -530,6 +542,68 @@ pub(crate) fn duchon_effective_nullspace_order(
                 requested_cols,
                 effective,
                 effective_cols
+            );
+        }
+    }
+    effective
+}
+
+/// Auto-*raise* the Duchon null-space order so the polyharmonic kernel — and
+/// any active derivative-collocation operators — clear their pointwise
+/// well-posedness margin `2(p + s) > dimension + max_operator_derivative_order`
+/// *before* the hard guard in [`validate_duchon_collocation_orders`] can fire.
+///
+/// This is the escalating twin of [`duchon_effective_nullspace_order`], which
+/// auto-*degrades* the order when too few centers remain to leave any radial
+/// kernel columns. Here the failure mode is the opposite end: a low
+/// order/power pair in dimension `dim` (e.g. `d=2`, `Linear` ⇒ `p=2`, `s=0`
+/// with stiffness/D2 active) leaves the kernel value — or its `k`-th
+/// derivative collocation — divergent at the origin, so `2(p + s) ≤ d + k`
+/// trips the guard mid-fit. Lifting `p` (the null-space order) by the smallest
+/// amount that restores the strict margin makes the guard unreachable for
+/// otherwise valid-intent configs.
+///
+/// Only `p` is lifted; the spectral power `s` and the CPD condition `2s < d`
+/// (which involves `s` and `d` alone) are untouched, so raising `p` can never
+/// invalidate a config that the requested power already satisfied.
+///
+/// `max_operator_derivative_order` is the max derivative order among the
+/// *active* operators (0 = mass/pointwise, 1 = tension/D1, 2 = stiffness/D2),
+/// exactly the value threaded into [`validate_duchon_collocation_orders`].
+pub(crate) fn duchon_order_for_operator_margin(
+    dim: usize,
+    power: f64,
+    order: DuchonNullspaceOrder,
+    max_operator_derivative_order: usize,
+) -> DuchonNullspaceOrder {
+    let margin = dim as f64 + max_operator_derivative_order as f64;
+    let mut effective = order;
+    // 2(p + s) > margin  ⇔  p > margin/2 − s. Each escalation lifts `p` by 1, so
+    // `2(p + s)` grows by 2 per step and the loop is bounded by ⌈margin/2⌉.
+    while 2.0 * (duchon_p_from_nullspace_order(effective) as f64 + power) <= margin {
+        effective = duchon_next_nullspace_order(effective);
+    }
+    if effective != order {
+        // Dedup: warn only once per (dim, power, requested_order, max_op) per
+        // process — the escalation is hit from many rebuild callsites.
+        static SEEN: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashSet<(usize, u64, DuchonNullspaceOrder, usize)>>,
+        > = std::sync::OnceLock::new();
+        let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+        let key = (dim, power.to_bits(), order, max_operator_derivative_order);
+        let fresh = seen.lock().map(|mut s| s.insert(key)).unwrap_or(true);
+        if fresh {
+            log::warn!(
+                "Duchon nullspace order={:?} with power={} in dim={} leaves 2*(p+s)={} \
+                 below the pointwise/collocation margin dimension+{}={} required by the \
+                 active operators; auto-raising to {:?} so the kernel stays well-posed",
+                order,
+                power,
+                dim,
+                2.0 * (duchon_p_from_nullspace_order(order) as f64 + power),
+                max_operator_derivative_order,
+                margin,
+                effective,
             );
         }
     }
@@ -2657,6 +2731,72 @@ mod duchon_hybrid_psd_tests {
             assert!(
                 (got - reference).abs() <= 1e-10,
                 "low-d hybrid kernel value regressed at r={r}: got {got:.15e}, reference {reference:.15e}"
+            );
+        }
+    }
+
+    /// #1817: a low-order/low-power Duchon config with the stiffness (D2)
+    /// operator active — d=2, `Linear` null space (p=2), power s=0 — has
+    /// `2(p+s)=4`, which clears the pointwise margin (>d=2) and D1 (>d+1=3) but
+    /// NOT D2 (>d+2=4), so the collocation guard used to fire mid-fit. The order
+    /// must now auto-raise so the mass+tension+stiffness penalty matrices build
+    /// cleanly, and the effective order must satisfy the strict D2 margin.
+    #[test]
+    fn operator_penalties_auto_raise_order_issue_1817() {
+        // 4×3 grid on [0,1]² — 12 centers, comfortably above the 6 polynomial
+        // columns of the auto-raised Degree(2) null space, so the auto-DEGRADE
+        // path does not interfere with the auto-RAISE under test.
+        let mut centers = Array2::<f64>::zeros((12, 2));
+        let mut row = 0;
+        for i in 0..4 {
+            for j in 0..3 {
+                centers[[row, 0]] = i as f64 / 3.0;
+                centers[[row, 1]] = j as f64 / 2.0;
+                row += 1;
+            }
+        }
+
+        let dim = 2usize;
+        let power = 0.0_f64;
+        let requested = DuchonNullspaceOrder::Linear;
+
+        // The unraised config is exactly the one that trips the D2 guard.
+        let requested_p = duchon_p_from_nullspace_order(requested);
+        assert!(
+            2.0 * (requested_p as f64 + power) <= dim as f64 + 2.0,
+            "precondition: requested (p,s) must be on the failing side of the D2 margin"
+        );
+
+        // Auto-raise (max_op = 2 ⇒ stiffness/D2 active) must clear the strict D2
+        // margin 2(p+s) > d+2.
+        let effective = duchon_order_for_operator_margin(dim, power, requested, 2);
+        let effective_p = duchon_p_from_nullspace_order(effective);
+        assert!(
+            2.0 * (effective_p as f64 + power) > dim as f64 + 2.0,
+            "auto-raised order must satisfy 2(p+s) > d+2: got 2*({}+{})={} vs d+2={}",
+            effective_p,
+            power,
+            2.0 * (effective_p as f64 + power),
+            dim as f64 + 2.0
+        );
+
+        // End-to-end: the mass+tension+stiffness penalty matrices (max_op=2)
+        // must now build without an InvalidInput from the pointwise/collocation
+        // guard, because the order was raised before the guard could fire.
+        let penalties = build_duchon_operator_penalty_matrices(
+            centers.view(),
+            None,
+            None, // pure (scale-free) Duchon — the guarded branch
+            power,
+            requested,
+            None,
+            None,
+        )
+        .expect("Duchon mass+tension+stiffness penalties must build after auto-raise (#1817)");
+        for m in [&penalties.mass, &penalties.tension, &penalties.stiffness] {
+            assert!(
+                m.iter().all(|v| v.is_finite()),
+                "auto-raised operator penalty matrices must be finite"
             );
         }
     }
