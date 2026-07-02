@@ -297,7 +297,7 @@ pub fn row_loss(
 /// is always a genuine `St(b, P)` point.
 pub(super) fn orthonormalize_block(block: &mut Array2<f32>) {
     let (b, p) = block.dim();
-    debug_assert!(b <= p, "block size b must not exceed output dim p");
+    assert!(b <= p, "block size b must not exceed output dim p");
     // Build the P×b transpose as an f64 cross-moment and polar it.
     let mut cm = Array2::<f64>::zeros((p, b));
     for r in 0..b {

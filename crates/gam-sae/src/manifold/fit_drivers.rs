@@ -2231,7 +2231,7 @@ impl SaeManifoldTerm {
         // the median collapses WITH them and the relative-norm arm sees no atom
         // "behind"). Returning here would make the ABSOLUTE co-collapse arm below —
         // which keys on EV ≤ the null floor AND co-vanished output, i.e. EXACTLY this
-        // state — permanently UNREACHABLE, so the reseed/deflation/anchor never fire
+        // state — a permanently dead arm, so the reseed/deflation/anchor would not fire
         // (the #2027 repro's `cocollapse_reseeds == 0` at EV = −0.0). Fall through
         // instead: with median = 0 the relative floor is 0, no atom is flagged
         // "behind" (`breached` stays empty), and the iteration>0 absolute arm
@@ -2349,13 +2349,24 @@ impl SaeManifoldTerm {
             // On budget exhaustion we restore the incumbent rather than leaving the
             // last (often catastrophic) reseed — a multi-start must never return a
             // basin worse than one it already visited.
-            if ev.is_finite()
-                && self
-                    .best_cocollapse_incumbent
-                    .as_ref()
-                    .is_none_or(|(best_ev, _)| ev > *best_ev)
-            {
-                self.best_cocollapse_incumbent = Some((ev, self.snapshot_mutable_state()));
+            // #2081 — the incumbent comparison prices reconstruction EV FIRST and,
+            // at (near-)equal EV, breaks the tie on coordinate uniformity: EV
+            // provably does not certify the coordinate, so a reseed that ties on EV
+            // but reads a more uniform angle is the better basin.
+            let candidate_uniformity = self.coordinate_uniformity_aggregate();
+            let prefer = match self.best_cocollapse_incumbent.as_ref() {
+                None => ev.is_finite(),
+                Some((best_ev, best_uniformity, _)) => prefer_candidate_basin(
+                    ev,
+                    candidate_uniformity,
+                    *best_ev,
+                    *best_uniformity,
+                    SAE_FINAL_EV_DEGRADATION_TOL,
+                ),
+            };
+            if prefer {
+                self.best_cocollapse_incumbent =
+                    Some((ev, candidate_uniformity, self.snapshot_mutable_state()));
             }
             // Co-collapsed: every decoder is ≈0 TOGETHER. Reseed ALL atoms onto
             // DISTINCT residual PCs — keeping no "anchor", because in a true
@@ -2396,8 +2407,20 @@ impl SaeManifoldTerm {
                 // converts the catastrophic-last-reseed outcome (EV −1.01) back to
                 // the best basin found (EV 0.127), so the evidence-gated structure
                 // search ranks the dictionary's real best, not its worst attempt.
-                if let Some((best_ev, best_state)) = self.best_cocollapse_incumbent.take() {
-                    if best_ev > ev {
+                if let Some((best_ev, best_uniformity, best_state)) =
+                    self.best_cocollapse_incumbent.take()
+                {
+                    // #2081 — restore the incumbent when it is the better basin under
+                    // the same EV-then-uniformity ordering used to bank it: strictly
+                    // higher EV, or (near-)equal EV with a more uniform coordinate.
+                    let current_uniformity = self.coordinate_uniformity_aggregate();
+                    if prefer_candidate_basin(
+                        best_ev,
+                        best_uniformity,
+                        ev,
+                        current_uniformity,
+                        SAE_FINAL_EV_DEGRADATION_TOL,
+                    ) {
                         self.restore_mutable_state(&best_state);
                         log::warn!(
                             "SaeManifoldTerm: dictionary co-collapse multi-start budget spent; \
@@ -2474,7 +2497,7 @@ impl SaeManifoldTerm {
             // a single refit desyncs them and degrades EV — the ordering is what makes
             // the anchor safe). Gives each atom a stable territory the outer Newton
             // descent starts from, without breaking the reseed-improves-EV contract.
-            self.anchor_logits_to_residual_ownership(target, rho)?;
+            self.anchor_logits_to_residual_ownership(target)?;
             self.refit_decoder_sequential_deflation(target, rho)?;
             return Ok(());
         }
@@ -2823,7 +2846,6 @@ impl SaeManifoldTerm {
     pub(crate) fn anchor_logits_to_residual_ownership(
         &mut self,
         target: ArrayView2<'_, f64>,
-        _rho: &SaeManifoldRho,
     ) -> Result<(), String> {
         let n = self.n_obs();
         let p = self.output_dim();
@@ -3833,6 +3855,13 @@ impl SaeManifoldTerm {
         let mut best_reconstruction_ev = self
             .dictionary_reconstruction_ev(target, rho)
             .unwrap_or(f64::NEG_INFINITY);
+        // #2081 — the incumbent carries its coordinate-uniformity score alongside
+        // EV so the keep-best can break (near-)equal-EV ties on coordinate fidelity.
+        let mut best_reconstruction_uniformity = if best_reconstruction_ev.is_finite() {
+            self.coordinate_uniformity_aggregate()
+        } else {
+            None
+        };
         let mut best_reconstruction_state = if best_reconstruction_ev.is_finite() {
             Some(self.snapshot_mutable_state())
         } else {
@@ -4124,8 +4153,18 @@ impl SaeManifoldTerm {
                     .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
             }
             if let Ok(ev) = self.dictionary_reconstruction_ev(target, rho) {
-                if ev.is_finite() && ev > best_reconstruction_ev + SAE_FINAL_EV_DEGRADATION_TOL {
+                // #2081 — keep the best basin on EV FIRST and, at (near-)equal EV,
+                // on the coordinate-uniformity certificate ([`prefer_candidate_basin`]).
+                let candidate_uniformity = self.coordinate_uniformity_aggregate();
+                if prefer_candidate_basin(
+                    ev,
+                    candidate_uniformity,
+                    best_reconstruction_ev,
+                    best_reconstruction_uniformity,
+                    SAE_FINAL_EV_DEGRADATION_TOL,
+                ) {
                     best_reconstruction_ev = ev;
+                    best_reconstruction_uniformity = candidate_uniformity;
                     best_reconstruction_state = Some(self.snapshot_mutable_state());
                 }
             }

@@ -959,6 +959,14 @@ impl SaeManifoldTerm {
         let atom_inference =
             crate::identifiability::atom_inference_reports(&certificate_model);
 
+        // #2081 — per-atom coordinate-fidelity certificate (uniformity + arc-length
+        // defect). Always populated (one entry per atom, `None` for non-`d = 1`
+        // charts), never dispersion-gated: coordinate quality does not depend on the
+        // reconstruction dispersion the incoherence report needs.
+        let coordinate_fidelity = (0..self.k_atoms())
+            .map(|atom_idx| atom_coordinate_fidelity(self, atom_idx))
+            .collect::<Result<Vec<_>, _>>()?;
+
         Ok(SaeManifoldFitDiagnostics {
             atom_two_lens,
             residual_gauge,
@@ -969,6 +977,7 @@ impl SaeManifoldTerm {
                 None => None,
             },
             atom_inference,
+            coordinate_fidelity,
         })
     }
 

@@ -541,6 +541,14 @@ class ManifoldSAE:
     # geometry summary. A curvature bound is not an estimand with a profiled
     # criterion, so no SE/CI/flatness fields are carried.
     curvature_report: dict[str, Any] | None = None
+    # Per-atom chart coordinate-fidelity certificate (#2081). ``atoms[k]`` carries
+    # the circular coordinate-uniformity statistic (Watson U² + closed-form
+    # p-value) of the fitted d=1 coordinate against the atom's uniform invariant
+    # measure, plus the arc-length (unit-speed) defect of the chart
+    # parameterization. Reconstruction EV does not certify coordinate quality;
+    # this reports it. Atoms without a d=1 circle/interval chart carry a null
+    # ``topology``.
+    coordinate_fidelity: dict[str, Any] | None = None
     # Per-atom smooth-functional inference (#1097 / #1103): one entry per fitted
     # atom, ``{"atom_index": int, "atom_name": str, "functionals": {...} | None,
     # "smooth_significance": {"log_e_nonconstant": float | None} | None}``. The
@@ -860,6 +868,11 @@ class ManifoldSAE:
                 if payload.get("curvature_report") is None
                 else dict(payload["curvature_report"])
             ),
+            coordinate_fidelity=(
+                None
+                if payload.get("coordinate_fidelity") is None
+                else dict(payload["coordinate_fidelity"])
+            ),
             atom_inference_reports=atom_inference_reports,
             certificates=(
                 None
@@ -1050,6 +1063,42 @@ class ManifoldSAE:
         if k >= len(rows):
             raise ValueError(
                 f"curvature report has {len(rows)} atom rows but model has {len(self.atoms)} atoms"
+            )
+        return dict(rows[k])
+
+    def coordinate_fidelity_report(self) -> list[dict[str, Any]]:
+        """Per-atom chart coordinate-fidelity certificate (#2081).
+
+        Returns one record per atom. An atom with a ``d = 1`` circle/interval
+        chart carries ``{"atom": int, "topology": "circle" | "interval",
+        "uniformity_statistic": float, "uniformity_p_value": float,
+        "arclength_defect": float, "n_coords": int}``:
+
+        * ``uniformity_statistic`` is Watson's ``U²`` of the fitted coordinate
+          against the atom's uniform invariant measure (rotation/reflection
+          invariant), and ``uniformity_p_value`` its closed-form asymptotic null
+          p-value — small values flag a materially non-uniform coordinate.
+        * ``arclength_defect`` is the speed coefficient-of-variation of the
+          decoded curve on a uniform latent grid: ``0`` is an arc-length
+          (unit-speed) chart, and a positive value means the parameterization
+          squishes arc length — the failure reconstruction EV cannot see.
+
+        Atoms without a ``d = 1`` chart carry a null ``topology``.
+        """
+        if self.coordinate_fidelity is None:
+            raise ValueError(
+                "this fitted model carries no SAE coordinate-fidelity report; refit to obtain one"
+            )
+        return [dict(atom) for atom in self.coordinate_fidelity.get("atoms", [])]
+
+    def atom_coordinate_fidelity(self, atom: int) -> dict[str, Any]:
+        """Coordinate-fidelity certificate record for one atom (#2081)."""
+        k = self._atom_index(atom)
+        rows = self.coordinate_fidelity_report()
+        if k >= len(rows):
+            raise ValueError(
+                f"coordinate-fidelity report has {len(rows)} atom rows but model has "
+                f"{len(self.atoms)} atoms"
             )
         return dict(rows[k])
 
@@ -1369,6 +1418,48 @@ class ManifoldSAE:
         payload = self._oos_payload(x)
         return np.asarray(payload["atoms"][k]["atom_reconstruction"], dtype=float)
 
+    def attach_fisher(
+        self, fisher_factors: Any, *, provenance: str | None = None
+    ) -> "ManifoldSAE":
+        """Install (or replace) the output-Fisher metric on a fitted model.
+
+        Post-hoc companion to ``sae_manifold_fit(..., fisher_factors=...)``:
+        lets a harvest→attach→steer flow add a WP-D output-Fisher shard to an
+        already fitted model without refitting, so :meth:`steer` reports the
+        path-integrated ``predicted_nats`` dose. Accepts the same inputs as the
+        fit-time hook: a :class:`gamfit.torch.harvest.HarvestShard`, a mapping
+        with ``"U"`` ``(n, p, r)`` (plus optional ``"mass_residual"`` /
+        ``"provenance"``), or a raw ``(n, p, r)`` array. ``provenance``
+        overrides the shard's own tag when given (must be ``"output_fisher"``
+        or ``"output_fisher_downstream"``). Pass ``fisher_factors=None`` to
+        detach and revert to the Euclidean metric. Returns ``self``.
+        """
+        if fisher_factors is None:
+            self.fisher_factors = None
+            self.fisher_mass_residual = None
+            self.fisher_provenance = "output_fisher"
+            self.metric_provenance = "Euclidean"
+            return self
+        if provenance is not None:
+            # Route the override through the one normalizer so provenance
+            # validation lives in exactly one place.
+            shard_in = _normalize_fisher_factors(
+                fisher_factors, int(self.fitted.shape[0]), int(self.fitted.shape[1])
+            )
+            fisher_factors = {
+                "U": shard_in[0],
+                "mass_residual": shard_in[1],
+                "provenance": provenance,
+            }
+        u, mass_residual, shard_provenance = _normalize_fisher_factors(
+            fisher_factors, int(self.fitted.shape[0]), int(self.fitted.shape[1])
+        )
+        self.fisher_factors = u
+        self.fisher_mass_residual = mass_residual
+        self.fisher_provenance = shard_provenance
+        self.metric_provenance = "OutputFisher"
+        return self
+
     def steer(self, atom_k: int, t_from: Any, t_to: Any) -> dict[str, Any]:
         """Steering plan with output dosimetry for one atom (#980).
 
@@ -1650,6 +1741,11 @@ class ManifoldSAE:
             "curvature_report": (
                 None if self.curvature_report is None else _jsonable(self.curvature_report)
             ),
+            "coordinate_fidelity": (
+                None
+                if self.coordinate_fidelity is None
+                else _jsonable(self.coordinate_fidelity)
+            ),
             "atom_inference": (
                 None
                 if self.atom_inference_reports is None
@@ -1808,6 +1904,11 @@ class ManifoldSAE:
                 None
                 if payload.get("curvature_report") is None
                 else dict(payload["curvature_report"])
+            ),
+            coordinate_fidelity=(
+                None
+                if payload.get("coordinate_fidelity") is None
+                else dict(payload["coordinate_fidelity"])
             ),
             atom_inference_reports=_coerce_atom_inference(payload.get("atom_inference")),
             # F: round-trip the unified certificate ledger. to_dict() writes it,

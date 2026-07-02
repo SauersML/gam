@@ -692,6 +692,17 @@ class _SparsityLayer(nn.Module):
         # GumbelTemperatureSchedule. We hold the descriptor and query τ through
         # the FFI accessor rather than re-deriving the decay in Python.
         self._schedule = cfg.sparsity.gumbel_schedule()
+        # The schedule is a live Rust object held only in Python, so it is NOT
+        # captured by ``state_dict``. Mirror its step index in a persistent
+        # buffer and re-sync the schedule to it on reload, so the temperature
+        # anneal continues correctly across a checkpoint/resume instead of
+        # restarting from ``tau_start`` (the decay arithmetic stays in Rust — the
+        # single source of truth — and only the integer step index round-trips).
+        # ``_sparsity_cfg`` is retained to rebuild the schedule when re-syncing.
+        self._sparsity_cfg = cfg.sparsity
+        self.register_buffer(
+            "_anneal_steps", torch.zeros((), dtype=torch.long), persistent=True
+        )
         self._init_alpha = float(cfg.sparsity.init_alpha)
         # #1282 balanced-commitment window. For the first ~15% of the anneal
         # (>=40 steps) commit each atom to a fixed balanced row partition to
@@ -746,13 +757,23 @@ class _SparsityLayer(nn.Module):
 
     @torch.no_grad()
     def advance_temperature(self) -> None:
-        """Anneal ``tau`` by advancing the Rust ``GumbelTemperatureSchedule``.
+        """Anneal ``tau`` one step via the Rust ``GumbelTemperatureSchedule``.
 
-        The schedule owns the iteration counter and evaluates the decay through
-        the Rust ``gumbel_schedule_tau`` FFI, so the annealing arithmetic lives
-        in exactly one place (no Python-side step bookkeeping).
+        The schedule owns the decay arithmetic (single source of truth), and its
+        step index is mirrored in the persistent ``_anneal_steps`` buffer so the
+        annealing position survives serialization. After a ``load_state_dict``
+        the freshly built schedule sits at step 0 while ``_anneal_steps`` carries
+        the true position, so the schedule is fast-forwarded to match before
+        stepping. Without this the anneal would restart from ``tau_start`` on
+        every checkpoint/resume, re-softening a gate that was already sharpened.
         """
+        target = int(self._anneal_steps.item())
+        if int(self._schedule.iter_count) != target:
+            self._schedule = self._sparsity_cfg.gumbel_schedule()
+            for _ in range(target):
+                self._schedule.step()
         self.tau.fill_(float(self._schedule.step()))
+        self._anneal_steps += 1
 
     def forward(self, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply the sparsity gate. Returns ``(assignments, gate_pre)``."""

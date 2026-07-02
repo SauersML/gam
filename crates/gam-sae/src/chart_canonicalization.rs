@@ -711,6 +711,95 @@ pub fn unit_speed_retraction(
     unit_speed_reparameterization(evaluator, decoder, row_coords, topology)
 }
 
+/// #2081 — the unit-speed (arc-length) DEFECT of a fitted `d = 1` chart: the
+/// coefficient of variation `stddev(‖γ'(t)‖) / mean(‖γ'(t)‖)` of the decoder
+/// curve speed over a uniform grid of the chart's canonical domain. `0` ⟺ the
+/// parameterization is exactly arc-length (unit-speed); a positive value is the
+/// same gauge the in-loop retraction's early-out reads
+/// ([`speed_uniformity_defect`]), promoted here from a control signal to a
+/// REPORTED per-atom certificate quantity.
+///
+/// It is a pure property of `(decoder, basis)` — measured on a UNIFORM latent
+/// grid, not on the data rows — so it certifies the CHART parameterization
+/// independent of where the data falls (the complement of the coordinate
+/// UNIFORMITY statistic, which certifies the coordinate distribution). This is
+/// exactly the #2081 lever: an `n_basis = 4` Fourier chart can reconstruct its
+/// ring at high EV while its parameterization is far from arc-length, and EV
+/// cannot see that — this defect can.
+///
+/// The domain is the circle's full period `[0, period)` or, for an interval
+/// chart, the fitted coordinate range `[min t_i, max t_i]` — the SAME `(lo, hi)`
+/// [`unit_speed_reparameterization`] integrates over. Returns `Ok(None)` (honest
+/// skip, never a fabricated number) on a degenerate chart: empty basis/decoder,
+/// a non-finite / collapsed domain, or a non-finite / zero-mean speed field.
+pub fn chart_unit_speed_defect(
+    evaluator: &dyn SaeBasisEvaluator,
+    decoder: ArrayView2<'_, f64>,
+    row_coords: ArrayView1<'_, f64>,
+    topology: &CanonicalChartTopology,
+) -> Result<Option<f64>, String> {
+    let m = decoder.nrows();
+    let p = decoder.ncols();
+    if m == 0 || p == 0 {
+        return Ok(None);
+    }
+    // Canonical domain `[lo, hi]` — identical to the reparameterization's.
+    let (lo, hi) = match topology {
+        CanonicalChartTopology::Circle { period } => {
+            if !(period.is_finite() && *period > 0.0) {
+                return Ok(None);
+            }
+            (0.0, *period)
+        }
+        CanonicalChartTopology::Interval => {
+            let mut t_min = f64::INFINITY;
+            let mut t_max = f64::NEG_INFINITY;
+            for &t in row_coords.iter() {
+                if !t.is_finite() {
+                    return Ok(None);
+                }
+                t_min = t_min.min(t);
+                t_max = t_max.max(t);
+            }
+            let scale = t_min.abs().max(t_max.abs()).max(1.0);
+            if !(t_max - t_min > 1.0e-12 * scale) {
+                return Ok(None);
+            }
+            (t_min, t_max)
+        }
+    };
+    // Uniform latent grid over the domain. The speed field is band-limited by
+    // the basis, so reusing the arc-length quadrature cell count oversamples it
+    // — no new resolution constant. A circle omits the wrap-duplicate endpoint;
+    // an interval samples both ends.
+    let cells = ARC_LENGTH_GRID_CELLS;
+    let step = (hi - lo) / cells as f64;
+    let nodes = match topology {
+        CanonicalChartTopology::Circle { .. } => cells,
+        CanonicalChartTopology::Interval => cells + 1,
+    };
+    let mut grid = Array2::<f64>::zeros((nodes, 1));
+    for j in 0..nodes {
+        grid[[j, 0]] = lo + j as f64 * step;
+    }
+    let (grid_phi, jet) = evaluator.evaluate(grid.view())?;
+    if grid_phi.ncols() != m {
+        return Err(format!(
+            "chart_unit_speed_defect: evaluator basis width {} != decoder rows {m}",
+            grid_phi.ncols()
+        ));
+    }
+    let speeds = curve_speeds(&jet, decoder)?;
+    if speeds.iter().any(|s| !s.is_finite()) {
+        return Ok(None);
+    }
+    let defect = speed_uniformity_defect(&speeds);
+    if !defect.is_finite() {
+        return Ok(None);
+    }
+    Ok(Some(defect))
+}
+
 /// State of the flow objective at one `θ`: the defect, the profiled scale,
 /// and the per-row flow Jacobians `A_i = Dφ_θ(t_i)` (row-major
 /// `[a00, a01, a10, a11]`) the Gauss–Newton rows are built from.

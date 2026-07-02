@@ -48,7 +48,7 @@ pub fn solve_batched_k1_border(
     ridge_t: f64,
     ridge_beta: f64,
 ) -> Vec<Result<ArrowSchurGpuSolution, ArrowSchurGpuFailure>> {
-    if let Some(batched) = try_device_batched_k1(systems, ridge_t, ridge_beta) {
+    if let Some(batched) = try_device_batched_k1(systems) {
         return batched;
     }
     systems
@@ -71,34 +71,20 @@ fn cpu_reference_k1(
         .map_err(|reason| ArrowSchurGpuFailure::SchurFactorFailed { reason })
 }
 
-/// Device admission + batched dispatch for a color class. Returns `None` to
-/// decline the whole class to the CPU reference; `Some(results)` once the batched
-/// device kernel is wired.
-///
-/// On non-Linux builds there is no CUDA path, so the class always declines.
-#[cfg(not(target_os = "linux"))]
-fn try_device_batched_k1(
-    _systems: &[ArrowSchurSystem],
-    _ridge_t: f64,
-    _ridge_beta: f64,
-) -> Option<Vec<Result<ArrowSchurGpuSolution, ArrowSchurGpuFailure>>> {
-    None
-}
-
-/// Linux/CUDA admission for the batched color class. Applies the same work-based
+/// Device admission for the batched color class. Applies the same work-based
 /// offload floor the single-system reduced-Schur paths use, keyed on the class's
 /// AGGREGATE active-row mass and mean border width (CG budget 1: a K=1 Direct
 /// solve is a single factor, not a CG loop — see `BATCHED_K1_DESIGN.md` §5).
+/// Returns `None` to decline the whole class to the CPU reference. Off Linux
+/// there is no CUDA path: `GpuRuntime::global()` is `None` and the class
+/// declines through the same admission flow.
 ///
 /// The batched per-atom device kernel is not yet attached, so an admitted class
 /// still declines to the CPU reference rather than fabricate a step: this function
-/// is the seam where `cuda::solve_batched_k1` will produce the per-atom results.
-/// Ridges are unused until then.
-#[cfg(target_os = "linux")]
+/// is the seam where `cuda::solve_batched_k1` will produce the per-atom results
+/// (and where the caller's ridge pair re-enters the signature once consumed).
 fn try_device_batched_k1(
     systems: &[ArrowSchurSystem],
-    _ridge_t: f64,
-    _ridge_beta: f64,
 ) -> Option<Vec<Result<ArrowSchurGpuSolution, ArrowSchurGpuFailure>>> {
     if systems.is_empty() {
         return None;

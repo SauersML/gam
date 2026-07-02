@@ -200,6 +200,14 @@ pub struct SaeManifoldFitDiagnostics {
     /// [`SaeManifoldTerm::set_atom_inner_fits`] and the inner penalized Hessian
     /// was SPD on a non-empty active set); otherwise they degrade to `None`.
     pub atom_inference: Vec<crate::identifiability::AtomInferenceReport>,
+    /// #2081 — per-atom chart coordinate-fidelity certificate: the circular
+    /// coordinate-uniformity statistic (Watson `U²` + closed-form p-value)
+    /// against the atom's invariant measure, and the arc-length (unit-speed)
+    /// defect of the chart parameterization. One entry per fitted atom in atom
+    /// order; `None` for atoms without a `d = 1` circle/interval chart. Reports
+    /// coordinate quality — which reconstruction EV provably does not certify
+    /// (see [`AtomCoordinateFidelity`]).
+    pub coordinate_fidelity: Vec<Option<AtomCoordinateFidelity>>,
 }
 
 /// Honest trust-diagnostics payload for the Python `diagnostics` block (#1005).

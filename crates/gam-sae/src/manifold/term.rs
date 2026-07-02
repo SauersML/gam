@@ -525,7 +525,12 @@ pub struct SaeManifoldTerm {
     /// (often catastrophic) attempt. `None` until the first co-collapse reseed;
     /// reset to `None` alongside [`Self::dictionary_cocollapse_reseeds`] at the
     /// start of each outer optimization.
-    pub(crate) best_cocollapse_incumbent: Option<(f64, SaeManifoldMutableState)>,
+    ///
+    /// #2081 — the middle `Option<f64>` is the incumbent basin's aggregate
+    /// coordinate-uniformity score ([`SaeManifoldTerm::coordinate_uniformity_aggregate`]),
+    /// carried alongside the EV so the multi-start can break (near-)equal-EV ties
+    /// on coordinate fidelity ([`prefer_candidate_basin`]).
+    pub(crate) best_cocollapse_incumbent: Option<(f64, Option<f64>, SaeManifoldMutableState)>,
     /// #1026 decoder-repulsion gate, frozen per assembly (lagged-diffusivity
     /// discipline, exactly like [`SaeManifoldAtom::smooth_penalty`]): the
     /// symmetric `(K, K)` matrix of collinearity gate weights

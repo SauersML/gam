@@ -489,15 +489,27 @@ mod tests {
 
         fn second_jet_dyn(
             &self,
-            _coords: ArrayView2<'_, f64>,
+            coords: ArrayView2<'_, f64>,
         ) -> Option<Result<ndarray::Array4<f64>, String>> {
+            if coords.ncols() != 1 {
+                return Some(Err(format!(
+                    "AffineLineEvaluator::second_jet_dyn: d = 1 evaluator got {} coords",
+                    coords.ncols()
+                )));
+            }
             None
         }
 
         fn third_jet_dyn(
             &self,
-            _coords: ArrayView2<'_, f64>,
+            coords: ArrayView2<'_, f64>,
         ) -> Option<Result<ndarray::Array5<f64>, String>> {
+            if coords.ncols() != 1 {
+                return Some(Err(format!(
+                    "AffineLineEvaluator::third_jet_dyn: d = 1 evaluator got {} coords",
+                    coords.ncols()
+                )));
+            }
             None
         }
     }

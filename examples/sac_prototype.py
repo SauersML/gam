@@ -5,7 +5,7 @@ joint ``sae_manifold_fit(K=k2)`` call inside ``compose_tiers`` (the exact call
 that co-collapses on real activations) with a stagewise construction that only
 ever runs the *proven* K=1 manifold fit:
 
-    forward births  ->  backfitting sweeps  ->  (terminal joint assembly, TODO)
+    forward births  ->  backfitting sweeps  ->  (terminal joint assembly, pending)
 
 The thesis (SAC_PLAN Part 1): K=1 curved fits succeed on real data; the
 simultaneous cold-start joint fit of K atoms is the wrong algorithm. So build K
@@ -27,7 +27,7 @@ Honesty notes:
 
 Phase 3 (terminal joint assembly via a single evaluate-don't-optimize arrow-Schur
 pass) needs a ``merge_tiers`` / ``frozen_evaluate`` FFI verb that does not exist
-yet; it is left as a documented TODO. Everything the joint fit uniquely provided
+yet; it stays unimplemented until that verb lands. Everything the joint fit uniquely provided
 that Phase 3 would recover (joint Laplace evidence, cross-atom covariance) is
 orthogonal to the reconstruction/structure claims these experiments test.
 """

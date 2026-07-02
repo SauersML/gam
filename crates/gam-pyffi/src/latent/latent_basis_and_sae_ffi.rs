@@ -2529,13 +2529,19 @@ fn sae_manifold_fit_stagewise<'py>(
         &evaluators,
     )
     .map_err(py_value_error)?;
-    // `0.0` sparsity is the canonical "no sparsity" baseline; floor to a tiny
-    // positive sentinel before the log so log-ρ stays finite (mirrors sae_manifold_fit).
+    // `0.0` sparsity/smoothness is the canonical "term disabled" baseline; floor
+    // to a tiny positive sentinel before the log so log-ρ stays finite (mirrors
+    // sae_manifold_fit; #184 sparsity, #2090 smoothness).
     const SPARSITY_DISABLED_FLOOR: f64 = 1.0e-300;
     let sparsity_strength = if sparsity_strength <= 0.0 {
         SPARSITY_DISABLED_FLOOR
     } else {
         sparsity_strength
+    };
+    let smoothness = if smoothness <= 0.0 {
+        SPARSITY_DISABLED_FLOOR
+    } else {
+        smoothness
     };
     let seed_dispersion = base_term
         .seed_reconstruction_dispersion(z_view)
@@ -2794,7 +2800,6 @@ fn sae_manifold_fit_inner<'py>(
     for (name, value) in [
         ("alpha", alpha),
         ("tau", tau),
-        ("smoothness", smoothness),
         ("learning_rate", learning_rate),
         ("ridge_ext_coord", ridge_ext_coord),
         ("ridge_beta", ridge_beta),
@@ -2811,10 +2816,19 @@ fn sae_manifold_fit_inner<'py>(
     // resulting `lambda_sparse = exp(log(SPARSITY_DISABLED_FLOOR))` is
     // numerically equivalent to zero relative to the data-fit Hessian for
     // any realistic problem scale. Negatives, infinities, and NaN remain
-    // rejected.
+    // rejected. `smoothness == 0.0` gets the identical treatment (#2090):
+    // every other penalty weight in the public facade uses zero to disable
+    // its term, and the docstring already declares smoothness_weight
+    // "non-negative"; both weights only seed the outer REML cascade's
+    // log-rho, so the floor keeps that parametrisation finite.
     if !sparsity_strength.is_finite() || sparsity_strength < 0.0 {
         return Err(py_value_error(format!(
             "sparsity_strength must be finite and non-negative; got {sparsity_strength}"
+        )));
+    }
+    if !smoothness.is_finite() || smoothness < 0.0 {
+        return Err(py_value_error(format!(
+            "smoothness must be finite and non-negative; got {smoothness}"
         )));
     }
     const SPARSITY_DISABLED_FLOOR: f64 = 1.0e-300;
@@ -2822,6 +2836,11 @@ fn sae_manifold_fit_inner<'py>(
         SPARSITY_DISABLED_FLOOR
     } else {
         sparsity_strength
+    };
+    let smoothness = if smoothness == 0.0 {
+        SPARSITY_DISABLED_FLOOR
+    } else {
+        smoothness
     };
 
     let basis_values_shape = basis_values.shape().to_vec();
@@ -3986,6 +4005,15 @@ fn sae_manifold_fit_inner<'py>(
         "atom_inference",
         sae_atom_inference_list(py, &fit_diagnostics.atom_inference)?,
     )?;
+    // #2081 — per-atom chart coordinate-fidelity certificate: the circular
+    // coordinate-uniformity statistic (Watson U² + closed-form p-value) against
+    // the atom's invariant measure, and the arc-length (unit-speed) defect of the
+    // chart parameterization. Always present (one entry per atom); reconstruction
+    // EV does not certify coordinate quality.
+    out.set_item(
+        "coordinate_fidelity",
+        sae_coordinate_fidelity_dict(py, &fit_diagnostics.coordinate_fidelity)?,
+    )?;
     // #16 — ONE coherent certificate ledger. Every certificate this fit produced
     // implements the shared claim+evidence+conservative-verdict contract
     // ([`gam::inference::certificates::Certificate`]); the ledger folds them into
@@ -4520,6 +4548,50 @@ fn sae_curvature_report_dict<'py>(
         let a = PyDict::new(py);
         a.set_item("atom", atom_idx)?;
         a.set_item("kappa_hat", kappa_hat)?;
+        atoms.append(a)?;
+    }
+    d.set_item("atoms", atoms)?;
+    Ok(d)
+}
+
+/// #2081 — build the result-dict entry for the per-atom coordinate-fidelity
+/// certificate: the circular coordinate-uniformity statistic (Watson U² +
+/// closed-form asymptotic p-value) against the atom's invariant measure, and the
+/// arc-length (unit-speed) defect of the chart parameterization. One per-atom
+/// entry in atom order; atoms without a `d = 1` circle/interval chart carry a
+/// null `topology`.
+fn sae_coordinate_fidelity_dict<'py>(
+    py: Python<'py>,
+    fidelity: &[Option<gam::terms::sae::manifold::AtomCoordinateFidelity>],
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item(
+        "note",
+        "SAE per-atom coordinate-fidelity certificate (#2081). `uniformity_statistic` \
+         is Watson's U² of the fitted d=1 coordinate against the atom's uniform \
+         invariant measure (rotation/reflection invariant); `uniformity_p_value` is its \
+         closed-form asymptotic null p-value (small => coordinates flagged non-uniform). \
+         `arclength_defect` is the speed coefficient-of-variation of the decoded curve on \
+         a uniform latent grid (0 => arc-length / unit-speed chart; positive => the \
+         parameterization squishes arc length, which reconstruction EV cannot see). \
+         Entries with null `topology` carry no d=1 chart.",
+    )?;
+    let atoms = PyList::empty(py);
+    for (atom_idx, entry) in fidelity.iter().enumerate() {
+        let a = PyDict::new(py);
+        a.set_item("atom", atom_idx)?;
+        match entry {
+            Some(fid) => {
+                a.set_item("topology", fid.topology)?;
+                a.set_item("uniformity_statistic", fid.uniformity_statistic)?;
+                a.set_item("uniformity_p_value", fid.uniformity_p_value)?;
+                a.set_item("arclength_defect", fid.arclength_defect)?;
+                a.set_item("n_coords", fid.n_coords)?;
+            }
+            None => {
+                a.set_item("topology", py.None())?;
+            }
+        }
         atoms.append(a)?;
     }
     d.set_item("atoms", atoms)?;
@@ -7227,7 +7299,6 @@ fn sae_manifold_predict_oos<'py>(
     for (name, value) in [
         ("alpha", alpha),
         ("tau", tau),
-        ("smoothness", smoothness),
         ("learning_rate", learning_rate),
         ("ridge_ext_coord", ridge_ext_coord),
         ("ridge_beta", ridge_beta),
@@ -7243,11 +7314,23 @@ fn sae_manifold_predict_oos<'py>(
             "sae_manifold_predict_oos: sparsity_strength must be finite and non-negative; got {sparsity_strength}"
         )));
     }
+    // Zero disables the term (#184 sparsity / #2090 smoothness): floor to a
+    // tiny positive sentinel so the log-rho parametrisation stays finite.
+    if !smoothness.is_finite() || smoothness < 0.0 {
+        return Err(py_value_error(format!(
+            "sae_manifold_predict_oos: smoothness must be finite and non-negative; got {smoothness}"
+        )));
+    }
     const SPARSITY_DISABLED_FLOOR: f64 = 1.0e-300;
     let sparsity_strength = if sparsity_strength == 0.0 {
         SPARSITY_DISABLED_FLOOR
     } else {
         sparsity_strength
+    };
+    let smoothness = if smoothness == 0.0 {
+        SPARSITY_DISABLED_FLOOR
+    } else {
+        smoothness
     };
 
     let mode = match assignment_kind.as_str() {

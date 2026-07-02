@@ -221,5 +221,12 @@ fn revival_reseeds_dead_block_from_worst_residual_row() {
     assert!(ev > 0.9, "revival should let the fit reach all planted subspaces, EV={ev}");
     // Revival machinery actually engaged at some point (dictionary started under-
     // populated and AuxK filled it).
-    let _ = (saw_dead, saw_revive);
+    assert!(
+        saw_dead,
+        "dictionary must pass through a dead-block state before revival"
+    );
+    assert!(
+        saw_revive,
+        "AuxK revival must engage on the under-populated dictionary"
+    );
 }

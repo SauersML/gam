@@ -3689,8 +3689,15 @@ mod encode_fix_tests {
         }
         fn third_jet_dyn(
             &self,
-            _coords: ndarray::ArrayView2<'_, f64>,
+            coords: ndarray::ArrayView2<'_, f64>,
         ) -> Option<Result<ndarray::Array5<f64>, String>> {
+            if coords.ncols() != self.d {
+                return Some(Err(format!(
+                    "ConstantPhi::third_jet_dyn: expected d = {}, got {} coords",
+                    self.d,
+                    coords.ncols()
+                )));
+            }
             None
         }
     }
