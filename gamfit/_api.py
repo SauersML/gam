@@ -1461,6 +1461,36 @@ def loads(model_bytes: bytes) -> Model:
     >>> with open("model.gam", "rb") as fh:
     ...     model = gamfit.loads(fh.read())
     """
+    # Multinomial-logit payloads carry a different on-disk schema than the
+    # scalar `Model` archive (`load_model` rejects them with a missing
+    # `model_type` field). Detect them positively: only a genuine multinomial
+    # payload deserialises through the multinomial-metadata FFI into a dict
+    # carrying `class_levels`. If that succeeds, reconstruct a
+    # `MultinomialModel`; otherwise fall through to the scalar `Model` path so a
+    # genuinely malformed payload still raises the mapped GamError there.
+    multinomial_metadata = None
+    try:
+        candidate = rust_module().multinomial_model_metadata_pyfunc(model_bytes)
+        if isinstance(candidate, dict) and "class_levels" in candidate:
+            multinomial_metadata = candidate
+    except Exception:
+        multinomial_metadata = None
+    if multinomial_metadata is not None:
+        from ._model import MultinomialModel  # local import avoids cycle
+
+        # The multinomial payload predates the `training_table_kind` sniff used
+        # by the scalar path; probe for it but tolerate the FFI rejecting the
+        # multinomial schema, in which case the container falls back to None.
+        try:
+            training_table_kind = rust_module().saved_model_payload_string(
+                model_bytes, "training_table_kind"
+            )
+        except Exception:
+            training_table_kind = None
+        return MultinomialModel(
+            _model_bytes=model_bytes,
+            _training_table_kind=training_table_kind,
+        )
     try:
         rust_module().load_model(model_bytes)
         # Restore the training-table container type persisted in the payload so
