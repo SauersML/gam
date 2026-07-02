@@ -2720,10 +2720,11 @@ pub fn integrated_inverse_link_mean_and_derivative(
         LinkFunction::Logit => logit_posterior_meanwith_deriv_controlled(mu, sigma),
         LinkFunction::CLogLog => Ok(cloglog_posterior_meanwith_deriv_controlled(quadctx, mu, sigma)),
         LinkFunction::LogLog | LinkFunction::Cauchit => {
-            let component = match link {
-                LinkFunction::LogLog => LinkComponent::LogLog,
-                LinkFunction::Cauchit => LinkComponent::Cauchit,
-                _ => unreachable!("guarded by outer match"),
+            // The outer arm restricts `link` to exactly these two variants.
+            let component = if matches!(link, LinkFunction::LogLog) {
+                LinkComponent::LogLog
+            } else {
+                LinkComponent::Cauchit
             };
             let (mean, dmean_dmu, _, _) = integrate_normal_ghq_adaptive(quadctx, mu, sigma, |x| {
                 component_point_jet(component, x)
@@ -2815,10 +2816,11 @@ pub fn integrated_inverse_link_jet(
             ))
         }
         LinkFunction::LogLog | LinkFunction::Cauchit => {
-            let component = match link {
-                LinkFunction::LogLog => LinkComponent::LogLog,
-                LinkFunction::Cauchit => LinkComponent::Cauchit,
-                _ => unreachable!("guarded by outer match"),
+            // The outer arm restricts `link` to exactly these two variants.
+            let component = if matches!(link, LinkFunction::LogLog) {
+                LinkComponent::LogLog
+            } else {
+                LinkComponent::Cauchit
             };
             let (mean, d1, d2, d3) = integrate_normal_ghq_adaptive(quadctx, mu, sigma, |x| {
                 component_point_jet(component, x)
