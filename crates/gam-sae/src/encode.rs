@@ -738,7 +738,6 @@ impl RowCertificate {
 #[derive(Debug, Clone)]
 struct CertifiedEncodeProbe {
     coord: Array1<f64>,
-    initial_cert: RowCertificate,
     final_cert: RowCertificate,
 }
 
@@ -1192,7 +1191,6 @@ fn refine_certified_start(
     }
     Ok(Some(CertifiedEncodeProbe {
         coord: t,
-        initial_cert,
         final_cert,
     }))
 }

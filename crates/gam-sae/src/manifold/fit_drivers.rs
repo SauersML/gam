@@ -2285,9 +2285,11 @@ impl SaeManifoldTerm {
                 self.dictionary_reconstruction_output_energy_ratio(target, rho)?;
             let n = self.n_obs();
             let p = target.ncols();
-            // Reachable rank `q = Σ_k rank(Φ_k)` (chart geometry alone, so a
-            // co-collapsed decoder still reports full reach) sets the null floor,
-            // shared with the fitted-data collapse verdict so both key on one bar.
+            // Reachable rank `q = rank([Φ_1 … Φ_K])`, the CONCATENATED chart-design
+            // rank (#C5), NOT the sum `Σ_k rank(Φ_k)` — shared atom column spaces
+            // are counted once (chart geometry alone, so a co-collapsed decoder
+            // still reports full reach). Sets the null floor, shared with the
+            // fitted-data collapse verdict so both key on one bar.
             let dictionary_rank =
                 crate::manifold::outer_objective::reachable_dictionary_rank(&self.atoms, n, p);
             let ev_floor = crate::manifold::outer_objective::absolute_degeneracy_ev_floor(
