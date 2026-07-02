@@ -2,9 +2,53 @@ use csv::{ReaderBuilder, StringRecord};
 use ndarray::{Array2, Axis};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
+
+fn natural_level_cmp(a: &str, b: &str) -> Ordering {
+    let mut ia = 0;
+    let mut ib = 0;
+    let ba = a.as_bytes();
+    let bb = b.as_bytes();
+    while ia < ba.len() && ib < bb.len() {
+        if ba[ia].is_ascii_digit() && bb[ib].is_ascii_digit() {
+            let sa = ia;
+            let sb = ib;
+            while ia < ba.len() && ba[ia].is_ascii_digit() {
+                ia += 1;
+            }
+            while ib < bb.len() && bb[ib].is_ascii_digit() {
+                ib += 1;
+            }
+            let da = &a[sa..ia];
+            let db = &b[sb..ib];
+            let ta = da.trim_start_matches('0');
+            let tb = db.trim_start_matches('0');
+            let ta = if ta.is_empty() { "0" } else { ta };
+            let tb = if tb.is_empty() { "0" } else { tb };
+            match ta.len().cmp(&tb.len()).then_with(|| ta.cmp(tb)) {
+                Ordering::Equal if da.len() != db.len() => return da.len().cmp(&db.len()),
+                Ordering::Equal => {}
+                ord => return ord,
+            }
+        } else {
+            match ba[ia].cmp(&bb[ib]) {
+                Ordering::Equal => {
+                    ia += 1;
+                    ib += 1;
+                }
+                ord => return ord,
+            }
+        }
+    }
+    ba.len().cmp(&bb.len())
+}
+
+fn sort_levels_canonical(levels: &mut [String]) {
+    levels.sort_by(|a, b| natural_level_cmp(a, b));
+}
 
 // ---------------------------------------------------------------------------
 // Typed error
@@ -781,7 +825,7 @@ fn infer_delimited_column(
                 new_idx
             });
         }
-        levels.sort();
+        sort_levels_canonical(&mut levels);
         level_index.clear();
         for (idx, level) in levels.iter().enumerate() {
             level_index.insert(level.clone(), idx);
@@ -2036,11 +2080,12 @@ fn infer_schema_column(
     } else {
         ColumnKindTag::Categorical
     };
-    // Canonical (sorted) level order — see `infer_and_encode_column_major`. The
+    // Canonical natural-sorted level order — see `infer_and_encode_column_major`. The
     // record-driven and column-major inference paths must produce byte-identical
-    // schemas, so both sort the level set lexicographically (#1319).
+    // schemas, so both sort the level set with the same natural comparator
+    // (#1319).
     if matches!(kind, ColumnKindTag::Categorical) {
-        levels.sort();
+        sort_levels_canonical(&mut levels);
     }
     Ok(SchemaColumn {
         name: name.to_string(),
@@ -2152,9 +2197,10 @@ pub fn infer_and_encode_column_major(
     // row-shuffle would permute the output) instead of on the class labels
     // (#1319). Sorting makes the encoding a deterministic function of the label
     // *set*, independent of row order, and matches the factor convention so
-    // column `k` of a multinomial prediction is class `levels[k]`.
+    // column `k` of a multinomial prediction is class `levels[k]`. Use natural
+    // ordering so generated labels like g2 stay before g10.
     if matches!(kind, ColumnKindTag::Categorical) {
-        levels.sort();
+        sort_levels_canonical(&mut levels);
     }
     let schema = SchemaColumn {
         name: name.to_string(),
