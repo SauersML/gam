@@ -3160,6 +3160,18 @@ pub(crate) fn chart_center_grid(atom: &SaeManifoldAtom, resolution: usize) -> Ar
 /// [`SHAPE_BAND_MAX_POINTS`] total points (the per-axis resolution is reduced
 /// until the product fits). When `include_endpoint` the last grid point sits at
 /// `hi`; otherwise the axis is treated as periodic and stops one step short.
+/// Per-axis resolution actually used by [`regular_product_grid`] after the
+/// [`SHAPE_BAND_MAX_POINTS`] product cap. Chart radii must be derived from THIS
+/// (not the raw `resolution`), otherwise for `resolution^d > SHAPE_BAND_MAX_POINTS`
+/// the grid spacing is coarser than the radius and the charts leave gaps.
+pub(crate) fn capped_per_axis(d: usize, resolution: usize) -> usize {
+    let mut per_axis = resolution.max(2);
+    while per_axis.saturating_pow(d as u32) > SHAPE_BAND_MAX_POINTS && per_axis > 2 {
+        per_axis -= 1;
+    }
+    per_axis
+}
+
 pub(crate) fn regular_product_grid(
     d: usize,
     resolution: usize,
@@ -3170,10 +3182,7 @@ pub(crate) fn regular_product_grid(
     if d == 0 {
         return Array2::<f64>::zeros((1, 0));
     }
-    let mut per_axis = resolution.max(2);
-    while per_axis.saturating_pow(d as u32) > SHAPE_BAND_MAX_POINTS && per_axis > 2 {
-        per_axis -= 1;
-    }
+    let per_axis = capped_per_axis(d, resolution);
     let total = per_axis.saturating_pow(d as u32).max(1);
     let denom = if include_endpoint {
         (per_axis.max(2) - 1) as f64
@@ -3246,13 +3255,13 @@ pub(crate) fn cylinder_chart_center_grid(resolution: usize) -> Array2<f64> {
 pub(crate) fn chart_nominal_radius(atom: &SaeManifoldAtom, resolution: usize) -> f64 {
     use crate::manifold::SaeAtomBasisKind::*;
     match &atom.basis_kind {
-        Periodic | Torus => 0.5 / (resolution.max(2) as f64),
+        Periodic | Torus => 0.5 / (capped_per_axis(atom.latent_dim, resolution) as f64),
         Sphere => std::f64::consts::PI / (resolution.max(2) as f64),
         // Cylinder charts tile two heterogeneous axes (a `[0,1)` periodic step
         // and a unit-box line step); the chart radius is a single scalar, so we
         // take the tighter (periodic) step `0.5/res` to keep every chart valid
         // on both axes. The certified Kantorovich radius refines it per chart.
-        Cylinder => 0.5 / (resolution.max(2) as f64),
+        Cylinder => 0.5 / (capped_per_axis(atom.latent_dim, resolution) as f64),
         Linear | Duchon | EuclideanPatch | Poincare | Precomputed(_) => {
             1.0 / (resolution.max(2) as f64)
         }
