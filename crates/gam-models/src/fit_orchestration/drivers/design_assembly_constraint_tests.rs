@@ -3188,7 +3188,6 @@ fn assert_matern_spatial_length_scale_optimization_monotone(
             max_outer_iter: 16,
             rel_tol: 1e-5,
             pilot_subsample_threshold: 0,
-            outer_wall_clock_budget_secs: None,
             ..SpatialLengthScaleOptimizationOptions::default()
         },
     )
@@ -3293,7 +3292,6 @@ pub(super) fn run_two_block_exact_joint_optimize(
         max_outer_iter: 1,
         rel_tol: 1e-6,
         pilot_subsample_threshold: 0,
-        outer_wall_clock_budget_secs: None,
         ..SpatialLengthScaleOptimizationOptions::default()
     };
     let joint_setup = two_block_exact_joint_hyper_setup(meanspec, noisespec, &kappa_options);
@@ -6431,7 +6429,6 @@ fn exact_joint_two_block_no_spatial_fast_path_returns_fully_frozen_specs() {
         max_outer_iter: 1,
         rel_tol: 1e-6,
         pilot_subsample_threshold: 0,
-        outer_wall_clock_budget_secs: None,
         ..SpatialLengthScaleOptimizationOptions::default()
     };
     let joint_setup = two_block_exact_joint_hyper_setup(&meanspec, &noisespec, &kappa_options);
@@ -6730,7 +6727,6 @@ fn two_block_exact_joint_design_cache_clears_memo_on_theta_change() {
         max_outer_iter: 1,
         rel_tol: 1e-6,
         pilot_subsample_threshold: 0,
-        outer_wall_clock_budget_secs: None,
         ..SpatialLengthScaleOptimizationOptions::default()
     };
     let joint_setup = two_block_exact_joint_hyper_setup(&meanspec, &noisespec, &kappa_options);
@@ -7647,7 +7643,6 @@ fn spatial_length_scale_optimization_runs_binomial_logit_matern_with_exact_laml_
                 max_outer_iter: 2,
                 rel_tol: 1e-5,
                 pilot_subsample_threshold: 0,
-                outer_wall_clock_budget_secs: None,
                 ..SpatialLengthScaleOptimizationOptions::default()
             },
         )
@@ -8065,7 +8060,6 @@ fn aniso_bounds_clamp_preserves_in_range_global_length_scale_and_eta() {
         min_length_scale: (-2.0_f64).exp(),
         max_length_scale: 1.0_f64.exp(),
         pilot_subsample_threshold: 0,
-        outer_wall_clock_budget_secs: None,
         ..SpatialLengthScaleOptimizationOptions::default()
     };
     let spatial_terms = vec![0];

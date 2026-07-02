@@ -77,11 +77,4 @@ pub use run::OuterProblem;
 // name `gam_solve::rho_optimizer::OuterResult` (#1521).
 pub use run::OuterResult;
 pub(crate) use run_plan::*;
-// Re-export the outer wall-clock deadline arming at `pub` (the blanket
-// `run_plan` re-export above is `pub(crate)`) so the gam-pyffi SAE fit entry can
-// bound its outer search the same way the in-crate survival entry does.
-pub use run_plan::{
-    arm_outer_wall_clock_deadline, clear_outer_wall_clock_deadline,
-    outer_wall_clock_deadline_exceeded,
-};
 pub(crate) use seed_screening::*;

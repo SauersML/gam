@@ -2898,14 +2898,6 @@ fn sae_manifold_fit_inner<'py>(
     // config — no borrowed Python views), so a *scoped* thread can borrow them
     // without a `'static` bound and is guaranteed to join before they drop.
     const SAE_FIT_WORKER_STACK_SIZE: usize = 512 << 20;
-    // gam#1026: bound the whole SAE manifold fit so the K>=2 outer search returns
-    // its best-so-far iterate instead of livelocking in a collapsed, near-singular
-    // basin. Cleared on every exit path so a stale deadline never leaks to a
-    // later fit on the same process.
-    const SAE_FIT_MAX_SECONDS: f64 = 1800.0;
-    gam::solver::rho_optimizer::arm_outer_wall_clock_deadline(
-        std::time::Instant::now() + std::time::Duration::from_secs_f64(SAE_FIT_MAX_SECONDS),
-    );
     let fit_scope_result = std::thread::scope(|scope| -> PyResult<()> {
         let worker = std::thread::Builder::new()
             .name("gam-sae-fit".to_string())
@@ -2922,7 +2914,6 @@ fn sae_manifold_fit_inner<'py>(
             )),
         }
     });
-    gam::solver::rho_optimizer::clear_outer_wall_clock_deadline();
     fit_scope_result?;
     // Posterior shape uncertainty: per-atom φ-scaled decoder covariance and
     // ambient bands, read off the converged joint-Hessian Schur factor at the
@@ -3016,10 +3007,6 @@ fn sae_manifold_fit_inner<'py>(
                     seed_budget: 1,
                     ..Default::default()
                 });
-            gam::solver::rho_optimizer::arm_outer_wall_clock_deadline(
-                std::time::Instant::now()
-                    + std::time::Duration::from_secs_f64(SAE_FIT_MAX_SECONDS),
-            );
             let pass_result = std::thread::scope(|scope| -> PyResult<()> {
                 let worker = std::thread::Builder::new()
                     .name("gam-sae-fit-structured".to_string())
@@ -3041,7 +3028,6 @@ fn sae_manifold_fit_inner<'py>(
                     )),
                 }
             });
-            gam::solver::rho_optimizer::clear_outer_wall_clock_deadline();
             pass_result?;
             // Refresh shape bands + fitted state from the FINAL pass objective
             // (decoder_shape_uncertainty must be read before `into_fitted`).

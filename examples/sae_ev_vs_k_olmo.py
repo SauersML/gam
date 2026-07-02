@@ -191,64 +191,27 @@ def _fit_ev(
     topology: str,
     seed: int,
     n_iter: int,
-    max_fit_seconds: float,
-    max_reconstruct_seconds: float,
-    *,
-    include_timeout: bool = False,
-) -> tuple[float, float, float, dict | None, list[str]] | tuple[
-    float, float, float, dict | None, list[str], bool
-]:
+) -> tuple[float, float, float, dict | None, list[str]]:
     """Fit one dictionary through the production engine; return HELD-OUT EV.
 
-    The real guard is a HARD subprocess timeout: the fit + reconstruct run in a
-    "spawn" child process, and `.result(timeout=...)` interrupts a hung fit (the
-    old post-hoc elapsed checks could only fire AFTER a fit returned, so a wedged
-    solver was never actually interrupted). On timeout the child is terminated and
-    the arm is reported as NaN EV with timed_out=True so the acceptance gate treats
-    it as a blocker. The elapsed checks survive as a secondary (soft) signal only.
+    The fit + reconstruct run in a "spawn" child process for a clean, isolated
+    interpreter, and we block on its result. The fit is bounded by deterministic
+    work (`--n-iter` and the solver's own iteration/convergence criteria), not by
+    a wall-clock timeout: clipping by elapsed time is non-deterministic and
+    machine-dependent (#2055), so a slow fit is fixed or bounded by work rather
+    than cut short by a timer.
     """
-    hard_timeout = max_fit_seconds + max_reconstruct_seconds
     ctx = multiprocessing.get_context("spawn")
     executor = concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=ctx)
-    future = executor.submit(_sae_fit_worker, z_tr, z_te, k, topology, seed, n_iter)
     try:
-        result = future.result(timeout=hard_timeout)
-    except concurrent.futures.TimeoutError:
-        # Forcibly kill the wedged child; do not wait on it (that would re-hang).
-        for proc in list(getattr(executor, "_processes", {}).values()):
-            try:
-                proc.terminate()
-            except Exception:  # noqa: BLE001 - best-effort kill
-                pass
-        executor.shutdown(wait=False, cancel_futures=True)
-        print(
-            f"[{topology} K={k}] TIMED OUT after {hard_timeout:.1f}s "
-            f"(fit budget {max_fit_seconds:.1f}s + recon {max_reconstruct_seconds:.1f}s); "
-            f"reporting NaN EV and flagging timeout.",
-            flush=True,
-        )
-        timed_out_result = (float("nan"), float("nan"), float("nan"), None, [])
-        return (*timed_out_result, True) if include_timeout else timed_out_result
-    else:
+        result = executor.submit(
+            _sae_fit_worker, z_tr, z_te, k, topology, seed, n_iter
+        ).result()
+    finally:
         executor.shutdown(wait=False)
 
     fit_seconds = result["fit_seconds"]
     reconstruct_seconds = result["reconstruct_seconds"]
-    # Secondary (soft) signal: the subprocess hard-timeout above is the real guard,
-    # but a fit/reconstruct that overran its per-arm budget yet still returned is
-    # worth flagging so a near-miss does not pass unnoticed.
-    if fit_seconds > max_fit_seconds:
-        print(
-            f"[warn] {topology} K={k} fit took {fit_seconds:.1f}s > soft guard "
-            f"{max_fit_seconds:.1f}s (subprocess hard-timeout is the real guard).",
-            flush=True,
-        )
-    if reconstruct_seconds > max_reconstruct_seconds:
-        print(
-            f"[warn] {topology} K={k} reconstruct took {reconstruct_seconds:.1f}s > soft "
-            f"guard {max_reconstruct_seconds:.1f}s (subprocess hard-timeout is the real guard).",
-            flush=True,
-        )
     if result["train_probe_error"] is not None:
         print(f"[{topology} K={k}] train-EV probe failed: {result['train_probe_error']}", flush=True)
     print(
@@ -256,14 +219,13 @@ def _fit_ev(
         f"held_out_EV={result['test_ev']:.4f}",
         flush=True,
     )
-    ok_result = (
+    return (
         result["test_ev"],
         fit_seconds,
         reconstruct_seconds,
         result["hybrid_split"],
         result["atom_topologies"],
     )
-    return (*ok_result, False) if include_timeout else ok_result
 
 
 def _parse_ladder(value: str) -> list[int]:
@@ -383,18 +345,6 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--n-iter", type=int, default=40)
     ap.add_argument(
-        "--max-fit-seconds",
-        type=float,
-        default=900.0,
-        help=(
-            "PER-ATOM wall-clock guard, scaled by K (the K>=2 joint inner solve + "
-            "the inter-atom routing-collapse-protected outer homotopy walk both grow "
-            "with K, so a fixed budget that fits K=1 (~67s) wrongly trips K=2 (~1245s). "
-            "The effective guard for a rung is max-fit-seconds * K."
-        ),
-    )
-    ap.add_argument("--max-reconstruct-seconds", type=float, default=60.0)
-    ap.add_argument(
         "--official-qwen-w32k-ev",
         type=float,
         default=OFFICIAL_QWEN_W32K_EV,
@@ -456,20 +406,13 @@ def main() -> None:
     )
     rows = []
     for k in ladder:
-        # Per-K wall-clock guard: the K>=2 fit's joint inner solve and the
-        # routing-collapse-protected outer homotopy walk both grow with K, so the
-        # budget must scale with K rather than gate every rung on the K=1 time.
-        k_max_fit_seconds = args.max_fit_seconds * k
-        ev_h_pca, fit_h, recon_h, hybrid_split, hybrid_topologies, hybrid_timed_out = _fit_ev(
+        ev_h_pca, fit_h, recon_h, hybrid_split, hybrid_topologies = _fit_ev(
             z_tr,
             z_te,
             k,
             "circle",
             args.seed,
             args.n_iter,
-            k_max_fit_seconds,
-            args.max_reconstruct_seconds,
-            include_timeout=True,
         )
         # The pure-linear comparison arm rides a separate basis lane whose OOS /
         # basis_with_jet plumbing can error independently of the curved arm (e.g.
@@ -477,21 +420,18 @@ def main() -> None:
         # the curved EV-vs-K climb — the #1026 headline measurement — so the
         # linear arm is reported as NaN and the row still prints.
         try:
-            ev_l_pca, fit_l, recon_l, linear_split, linear_topologies, linear_timed_out = _fit_ev(
+            ev_l_pca, fit_l, recon_l, linear_split, linear_topologies = _fit_ev(
                 z_tr,
                 z_te,
                 k,
                 "linear",
                 args.seed,
                 args.n_iter,
-                k_max_fit_seconds,
-                args.max_reconstruct_seconds,
-                include_timeout=True,
             )
         except Exception as exc:  # noqa: BLE001 — arm-isolated, reported honestly
             print(f"[linear K={k}] arm failed, reporting NaN: {exc}", flush=True)
             ev_l_pca, fit_l, recon_l = float("nan"), float("nan"), float("nan")
-            linear_split, linear_topologies, linear_timed_out = None, None, False
+            linear_split, linear_topologies = None, None
         # FULL-space EV = r * EV_Z (see _pca_project): the PCA-space EV is inflated
         # by ~1/r relative to a full-space reconstruction, so the acceptance gate and
         # the official-reference parity must use the full-space numbers.
@@ -518,8 +458,6 @@ def main() -> None:
                 "hybrid_fit_seconds": fit_h,
                 "linear_fit_seconds": fit_l,
                 "max_reconstruct_seconds": max(recon_h, recon_l),
-                "hybrid_timed_out": bool(hybrid_timed_out),
-                "linear_timed_out": bool(linear_timed_out),
                 "hybrid_seed_topology": "circle",
                 "hybrid_atom_topologies": hybrid_topologies,
                 "hybrid_split": hybrid_split,

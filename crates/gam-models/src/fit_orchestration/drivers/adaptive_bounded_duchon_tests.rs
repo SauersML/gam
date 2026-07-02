@@ -406,7 +406,6 @@ mod adaptive_bounded_duchon_tests {
             max_outer_iter: 1,
             rel_tol: 1e-6,
             pilot_subsample_threshold: 0,
-            outer_wall_clock_budget_secs: None,
             ..SpatialLengthScaleOptimizationOptions::default()
         };
         let joint_setup =

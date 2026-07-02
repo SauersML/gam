@@ -792,41 +792,12 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         // at cycle 0 via the divergence/stall guard, so `cycle > 0` is never
         // reached and the per-cycle guard never fires. The outer startup then
         // drives a whole cascade of fresh solves — one per multistart seed,
-        // plus the post-failure identifiability audit and the final
-        // posterior-escalation refit — and each pays a full cycle-0 joint
-        // Hessian assembly + constrained QP before exiting. With each cycle 0
-        // costing ~one outer budget-window at scale, the total fit wall-clock
-        // grew without bound (#seeds + audit + refit) even though the budget
-        // was long spent. Refuse to begin a fresh solve once the deadline has
-        // passed: the first solve still runs (the deadline is checked at its
-        // entry, before it has taken time), so a best-effort iterate is always
-        // produced for the outer search, and every solve entered AFTER the
-        // budget is spent returns a catchable error in O(1) instead of paying
-        // another cycle 0. A solve started past the deadline cannot improve a
-        // within-budget result. No-op when no deadline is armed.
-        if gam_solve::rho_optimizer::outer_wall_clock_deadline_exceeded() {
-            return Err(
-                "coupled exact-joint inner solve abandoned at entry: the fit-level wall-clock \
-                 budget was exhausted before this solve began — returning a bounded catchable \
-                 error rather than paying another full inner cycle past the deadline"
-                    .to_string(),
-            );
-        }
         // The exact joint-Hessian route solves the penalized Newton system
         // directly. Extra damping must be wired through an accepted/rejected
         // step policy before it belongs here; keep the matvec faithful to the
         // objective until then.
         for cycle in 0..inner_loop_hard_ceiling {
             if cycle >= inner_max_cycles {
-                break;
-            }
-            if cycle > 0 && gam_solve::rho_optimizer::outer_wall_clock_deadline_exceeded() {
-                // gam#979: the fit-level wall-clock budget is spent. Stop at the
-                // current best-effort iterate so the outer search (which would
-                // otherwise grind every remaining screening stage / seed / plan
-                // to its cycle budget on a constrained solve that never
-                // certifies) terminates in bounded time. >=1 cycle has run, so a
-                // finite iterate is always returned.
                 break;
             }
             let verbose_cycle = cycle == 0

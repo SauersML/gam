@@ -993,14 +993,13 @@ pub fn compiled_map_from_per_term(
 /// UNREDUCED design + Jeffreys conditioning. That fallback leaves a
 /// quadratically-flat near-null direction in the joint penalised Hessian
 /// `M = JᵀHJ + S`, so the inner joint-Newton cannot certify stationarity and
-/// the outer wall-clock deadline becomes load-bearing rather than a backstop.
+/// runs to its bounded iteration cap without converging.
 ///
 /// The BMS path never hits this because it does a *partial* reduction: it
 /// removes from the logslope block ONLY the directions whose effective image is
 /// W-explained by the marginal span (the confounded null space of the effective
 /// Schur Gram), keeping every surviving logslope direction. The result is
-/// full-rank `M` BY CONSTRUCTION — no runtime projection, deadline demoted to a
-/// pure backstop.
+/// full-rank `M` BY CONSTRUCTION — no runtime projection needed.
 ///
 /// # The metric collapse to scalar weights
 ///

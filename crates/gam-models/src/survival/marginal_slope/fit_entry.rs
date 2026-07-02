@@ -2,44 +2,17 @@
 
 use super::*;
 
-struct OuterWallClockDeadlineGuard;
-
-impl OuterWallClockDeadlineGuard {
-    fn arm(budget_secs: f64) -> Self {
-        gam_solve::rho_optimizer::arm_outer_wall_clock_deadline(
-            std::time::Instant::now() + std::time::Duration::from_secs_f64(budget_secs.max(1.0)),
-        );
-        Self
-    }
-}
-
-impl Drop for OuterWallClockDeadlineGuard {
-    fn drop(&mut self) {
-        gam_solve::rho_optimizer::clear_outer_wall_clock_deadline();
-    }
-}
-
 pub fn fit_survival_marginal_slope_terms(
     data: ArrayView2<'_, f64>,
     spec: SurvivalMarginalSlopeTermSpec,
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<SurvivalMarginalSlopeFitResult, String> {
-    // gam#979: bound the whole fit so the survival marginal-slope outer search —
-    // whose constrained joint-Newton cannot certify convergence on the
-    // monotonicity-pinned baseline, so seed screening escalates to an uncapped
-    // cycle budget while every seed rejects — returns its best-so-far iterate
-    // (or a catchable error) in bounded time instead of hanging. Configurable
-    // via kappa_options; generous default. Cleared on EVERY exit path so a stale
-    // deadline never leaks to a later fit.
-    let budget_secs = kappa_options.outer_wall_clock_budget_secs.unwrap_or(300.0);
-    let deadline_guard = OuterWallClockDeadlineGuard::arm(budget_secs);
-    let result = fit_survival_marginal_slope_terms_impl(data, spec, options, kappa_options);
-    // Explicit drop (not an underscore binding, which the build.rs ban-scanner
-    // rejects) clears the deadline on this return path; the guard's `Drop` also
-    // covers any panic-unwind exit, so the deadline never leaks to a later fit.
-    drop(deadline_guard);
-    result
+    // The outer search is bounded by deterministic work (iteration/cycle caps
+    // and the seed-screening cascade budget), not by wall-clock time (#2055):
+    // clipping a fit by elapsed time is non-deterministic and machine-dependent,
+    // so a slow-to-converge fit is fixed or bounded by work, never by a timer.
+    fit_survival_marginal_slope_terms_impl(data, spec, options, kappa_options)
 }
 
 pub(crate) fn fit_survival_marginal_slope_terms_impl(

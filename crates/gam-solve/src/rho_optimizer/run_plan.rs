@@ -26,20 +26,6 @@ pub(crate) const PREWARM_COST_CLIFF_COEFF_DIM: usize = 12;
 pub(crate) const PREWARM_COST_BUDGET_COEFF_PRODUCT: usize =
     PREWARM_COST_CLIFF_COEFF_DIM * SINGLE_EXPENSIVE_PREWARM_BUDGET;
 
-/// Process-global wall-clock deadline for the current outer fit (gam#979). A
-/// family whose outer search can grind on an ill-posed constrained inner solve
-/// (survival marginal-slope: the monotonicity-pinned baseline drives an active-
-/// set QP that never certifies, so seed screening escalates to an uncapped cycle
-/// budget while every seed rejects) arms this around its whole fit. The joint-
-/// Newton cycle loop (the chokepoint EVERY phase flows through) checks it and
-/// stops at the current best-effort iterate once the budget is spent, so the
-/// public API returns (or raises) catchably in bounded time instead of hanging.
-/// GLOBAL, not thread-local, because seed screening can evaluate candidates on
-/// rayon worker threads. The arming family MUST clear it on every exit path so a
-/// stale past deadline never bounds a later, unrelated fit.
-static OUTER_WALL_CLOCK_DEADLINE: std::sync::Mutex<Option<std::time::Instant>> =
-    std::sync::Mutex::new(None);
-
 /// RAII guard that lifts the outer-aware inner-PIRLS iteration cap
 /// (`RemlState::outer_inner_cap`, shared into the outer optimizer via
 /// `InnerProgressFeedback::cap`) to 0 ("no cap") for the duration of the
@@ -73,34 +59,6 @@ impl Drop for FinalizeInnerCapGuard<'_> {
     fn drop(&mut self) {
         self.cap.store(self.prev_cap, std::sync::atomic::Ordering::Relaxed);
     }
-}
-
-/// Arm the global outer wall-clock deadline for the current fit. `pub` so FFI
-/// fit entries (the SAE manifold fit is orchestrated from the `gam-pyffi` crate)
-/// can bound their outer search the same way the in-crate survival entry does
-/// (see `survival/marginal_slope/fit_entry.rs`).
-pub fn arm_outer_wall_clock_deadline(deadline: std::time::Instant) {
-    if let Ok(mut slot) = OUTER_WALL_CLOCK_DEADLINE.lock() {
-        *slot = Some(deadline);
-    }
-}
-
-/// Clear the armed deadline. Call on EVERY exit path of the arming fit. `pub` for
-/// the same FFI-entry reason as [`arm_outer_wall_clock_deadline`].
-pub fn clear_outer_wall_clock_deadline() {
-    if let Ok(mut slot) = OUTER_WALL_CLOCK_DEADLINE.lock() {
-        *slot = None;
-    }
-}
-
-/// True once an armed deadline has passed; `false` when none is armed, so every
-/// path that does not opt in is byte-for-byte unchanged.
-pub fn outer_wall_clock_deadline_exceeded() -> bool {
-    OUTER_WALL_CLOCK_DEADLINE
-        .lock()
-        .ok()
-        .and_then(|slot| *slot)
-        .is_some_and(|deadline| std::time::Instant::now() >= deadline)
 }
 
 /// Floor on the scaled budget: even on the largest problems the pre-warm must

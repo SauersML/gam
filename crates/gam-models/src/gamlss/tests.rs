@@ -4042,7 +4042,6 @@ pub(crate) fn spatial_kappa_options() -> SpatialLengthScaleOptimizationOptions {
         min_length_scale: 0.1,
         max_length_scale: 2.0,
         pilot_subsample_threshold: 10_000,
-        outer_wall_clock_budget_secs: None,
     }
 }
 

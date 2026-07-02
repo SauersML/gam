@@ -249,20 +249,6 @@ pub(crate) fn rank_seeds_with_screening(
         seeds.len(),
         &cascade_caps,
         |stage, cap, idx| {
-            // gam#979: the seed-screening cascade is an OUTER-search activity and
-            // must honor the same fit-level wall-clock budget the inner cycle loop
-            // already respects (`inner_blockwise_fit`'s deadline break). Without
-            // this the guard is asymmetric: once the budget is spent the cascade
-            // keeps starting fresh seed proxies — each paying a full cycle-0
-            // constrained-Newton setup before the inner break — and at the
-            // uncapped final stage (every seed rejecting on a baseline whose
-            // active-set QP never certifies) that grinds far past the deadline.
-            // Reject the remaining seeds instantly so the cascade collapses to the
-            // heuristic order in bounded time. The budget is already exceeded here,
-            // so the foregone proxy ranking cannot affect a within-budget fit.
-            if crate::rho_optimizer::outer_wall_clock_deadline_exceeded() {
-                return Err(());
-            }
             screening_cap.store(cap, Ordering::Relaxed);
             obj.reset();
             screening_cap.store(cap, Ordering::Relaxed);

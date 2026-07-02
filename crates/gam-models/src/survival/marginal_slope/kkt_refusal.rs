@@ -7,8 +7,8 @@
 //! (tiny `λ_min`, huge condition number, `nullity@tol = 0`). When that
 //! direction is left unreduced and handed to the constrained joint Newton,
 //! the inner solve cannot certify stationarity, seed screening escalates,
-//! and the outer wall-clock deadline becomes load-bearing rather than a
-//! pure backstop.
+//! and the fit exhausts its bounded (deterministic) iteration budget without
+//! ever certifying convergence.
 //!
 //! The temptation is to simply shrink or delete every near-null direction.
 //! That is reward-hacking: a near-null direction can also be a *genuine*
@@ -47,7 +47,8 @@ const K_SURVIVAL: usize = 4;
 /// the inner solver: a direction already stationary to within this radius is
 /// "converged", so projecting it is identity on the optimum. Deliberately
 /// small so the gate is conservative — projecting fewer directions risks no
-/// reward-hacking, only a missed cleanup that the deadline still backstops.
+/// reward-hacking, only a missed cleanup (the inner solver still terminates at
+/// its bounded iteration cap).
 pub(crate) const KKT_PHANTOM_TRUST_RADIUS: f64 = 1.0e-3;
 
 /// Relative tolerance applied to `λ_max` when counting eigenvalues as
