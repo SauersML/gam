@@ -732,20 +732,26 @@ pub fn validate_mixturespec(spec: &MixtureLinkSpec) -> Result<(), String> {
         }
     }
     // `LinkComponent` admits two variants (Cauchit, LogLog) that have no matching
-    // `LinkFunction` entry. The mixture-link pipeline projects every mixture back onto
-    // a single `LinkFunction` value for downstream solver/IO bookkeeping (see
-    // `InverseLink::link_function`), so a mixture composed solely of components without
-    // a LinkFunction representative would silently lie about its projected link. We
-    // require every spec to contain at least one Logit/Probit/CLogLog "anchor" so the
-    // projection is meaningful. A mixture of only {Cauchit, LogLog} (or any single
-    // component restricted to that pair) has no anchor and is rejected here.
+    // `LinkFunction` entry. When two or more components are *blended*, the mixture-link
+    // pipeline projects the blend back onto a single `LinkFunction` value for downstream
+    // solver/IO bookkeeping (see `InverseLink::link_function`), so a multi-component blend
+    // composed solely of components without a LinkFunction representative would silently
+    // lie about its projected link. We therefore require any genuine *blend* (two or more
+    // components) to contain at least one Logit/Probit/CLogLog "anchor" so the projection
+    // is meaningful, and reject e.g. a blend of only {Cauchit, LogLog}.
+    //
+    // A *single-component* spec is not a blend at all: it is that one link, with weight
+    // 1.0 and no free mixing logits. `LinkComponent::LogLog` / `LinkComponent::Cauchit`
+    // implement their inverse link and derivative jets exactly, so a single-component
+    // `{LogLog}` / `{Cauchit}` spec is a fully-defined standalone link and is accepted
+    // here (this is how survival `--link loglog` / `--link cauchit` are represented).
     let has_anchor = spec.components.iter().any(|component| {
         matches!(
             component,
             LinkComponent::Logit | LinkComponent::Probit | LinkComponent::CLogLog
         )
     });
-    if !has_anchor {
+    if !has_anchor && spec.components.len() > 1 {
         let unsupported: Vec<&str> = spec
             .components
             .iter()

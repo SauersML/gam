@@ -68,9 +68,10 @@ use gam::smooth::{
 use gam::term_builder::{
     heuristic_knots_for_column, parse_duchon_order, parse_duchon_power, unique_count_column,
 };
+use gam::mixture_link::mixture_inverse_link_jet;
 use gam::types::{
-    InverseLink, LikelihoodScaleMetadata, LinkFunction, LogLikelihoodNormalization, StandardLink,
-    WigglePenaltyConfig,
+    InverseLink, LikelihoodScaleMetadata, LinkComponent, LinkFunction, LogLikelihoodNormalization,
+    StandardLink, WigglePenaltyConfig,
 };
 use gam_predict::{FittedModelPredictExt, PredictableModel};
 use ndarray::{Array1, Array2, ArrayViewMut2, array, s};
@@ -6433,10 +6434,93 @@ fn parse_survival_inverse_link_reports_survival_specific_supported_links() {
     args.link = Some("bogus".to_string());
     let err = parse_survival_inverse_link(&args).expect_err("expected unsupported survival link");
     assert!(err.contains("unsupported survival --link 'bogus'"));
-    // `loglog` and `cauchit` are deliberately absent: they have no LinkFunction
-    // representative and are rejected as survival links, so the usage line must
-    // not advertise them as supported.
-    assert!(err.contains("use identity|logit|probit|cloglog|sas|beta-logistic|blended(...)/mixture(...) or flexible(...)"));
+    // `loglog` and `cauchit` are now genuinely implemented survival links (routed
+    // through the single-component mixture kernels), so the usage line must advertise
+    // them alongside the other supported survival links.
+    assert!(err.contains("use identity|logit|probit|cloglog|loglog|cauchit|sas|beta-logistic|blended(...)/mixture(...) or flexible(...)"));
+}
+
+#[test]
+fn parse_survival_inverse_link_accepts_loglog_and_cauchit() {
+    let mut args = SurvivalArgs {
+        data: std::path::PathBuf::from("dummy.csv"),
+        entry: Some("entry".to_string()),
+        exit: "exit".to_string(),
+        event: "event".to_string(),
+        formula: "1".to_string(),
+        predict_noise: None,
+        survival_likelihood: "location-scale".to_string(),
+        survival_distribution: "gaussian".to_string(),
+        link: Some("loglog".to_string()),
+        mixture_rho: None,
+        sas_init: None,
+        beta_logistic_init: None,
+        survival_time_anchor: None,
+        baseline_target: "linear".to_string(),
+        baseline_scale: None,
+        baseline_shape: None,
+        baseline_rate: None,
+        baseline_makeham: None,
+        time_basis: "linear".to_string(),
+        time_degree: 3,
+        time_num_internal_knots: 8,
+        time_smooth_lambda: 1e-2,
+        ridge_lambda: 1e-6,
+        threshold_time_k: None,
+        threshold_time_degree: 3,
+        sigma_time_k: None,
+        sigma_time_degree: 3,
+        scale_dimensions: false,
+        pilot_subsample_threshold: 0,
+        out: None,
+        logslope_formula: None,
+        z_column: None,
+        weights_column: None,
+        offset_column: None,
+        noise_offset_column: None,
+        frailty_kind: None,
+        frailty_sd: None,
+        hazard_loading: None,
+    };
+
+    // `--link loglog` parses to a single-component LogLog mixture (weight 1.0), which
+    // evaluates as the exact loglog inverse link mu = exp(-exp(-eta)).
+    args.link = Some("loglog".to_string());
+    let loglog = parse_survival_inverse_link(&args).expect("loglog survival link parses");
+    let loglog_state = match &loglog {
+        InverseLink::Mixture(state) => state,
+        other => panic!("expected loglog to route through a mixture, got {other:?}"),
+    };
+    assert_eq!(loglog_state.components, vec![LinkComponent::LogLog]);
+    assert!((loglog_state.pi[0] - 1.0).abs() < 1e-12);
+    let eta = 0.3_f64;
+    let jet = mixture_inverse_link_jet(loglog_state, eta);
+    let expected_loglog_mu = (-((-eta).exp())).exp();
+    assert!(
+        (jet.mu - expected_loglog_mu).abs() < 1e-10,
+        "loglog mu mismatch: {} vs {}",
+        jet.mu,
+        expected_loglog_mu
+    );
+
+    // `--link cauchit` parses to a single-component Cauchit mixture, evaluating as the
+    // exact cauchit inverse link mu = 0.5 + atan(eta)/pi.
+    args.link = Some("cauchit".to_string());
+    let cauchit = parse_survival_inverse_link(&args).expect("cauchit survival link parses");
+    let cauchit_state = match &cauchit {
+        InverseLink::Mixture(state) => state,
+        other => panic!("expected cauchit to route through a mixture, got {other:?}"),
+    };
+    assert_eq!(cauchit_state.components, vec![LinkComponent::Cauchit]);
+    assert!((cauchit_state.pi[0] - 1.0).abs() < 1e-12);
+    let cjet = mixture_inverse_link_jet(cauchit_state, eta);
+    let expected_cauchit_mu = 0.5 + eta.atan() / std::f64::consts::PI;
+    assert!(
+        (cjet.mu - expected_cauchit_mu).abs() < 1e-10,
+        "cauchit mu mismatch: {} vs {}",
+        cjet.mu,
+        expected_cauchit_mu
+    );
 }
 
 #[test]
