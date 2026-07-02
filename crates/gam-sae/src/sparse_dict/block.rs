@@ -613,7 +613,7 @@ fn refresh_frames(
             .blocks
             .iter()
             .zip(code.gates.iter())
-            .filter(|(_, &gate)| gate != 0.0)
+            .filter(|&(_, &gate)| gate != 0.0)
             .map(|(&g, _)| g)
             .collect();
         if selected.is_empty() {
@@ -736,7 +736,7 @@ fn revive_dead_blocks(
             .blocks
             .iter()
             .zip(code.gates.iter())
-            .filter(|(_, &gate)| gate != 0.0)
+            .filter(|&(_, &gate)| gate != 0.0)
             .map(|(&g, _)| g)
             .collect();
         let recon = reconstruct_row(xi, decoder.view(), &selected, gamma, b);
@@ -817,7 +817,7 @@ fn explained_variance(
             .blocks
             .iter()
             .zip(code.gates.iter())
-            .filter(|(_, &gate)| gate != 0.0)
+            .filter(|&(_, &gate)| gate != 0.0)
             .map(|(&g, _)| g)
             .collect();
         let recon = reconstruct_row(xi, decoder, &selected, gamma, b);
