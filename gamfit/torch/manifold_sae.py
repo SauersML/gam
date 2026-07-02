@@ -1765,6 +1765,7 @@ class ManifoldSAE(nn.Module):
         x: torch.Tensor,
         *,
         max_iter: int | None = None,
+        n_iter: int | None = None,
         random_state: int = 0,
         learning_rate: float | None = None,
     ) -> _ClosedFormManifoldSAE:
@@ -1804,6 +1805,12 @@ class ManifoldSAE(nn.Module):
         the closed-form decoder. Build a fresh, unfitted module for gradient
         training.
         """
+        if max_iter is not None and n_iter is not None and int(max_iter) != int(n_iter):
+            raise ValueError(
+                f"ManifoldSAE.fit: max_iter={max_iter} and n_iter={n_iter} "
+                "are aliases and must agree when both are given"
+            )
+        resolved_iter = max_iter if max_iter is not None else n_iter
         if not isinstance(x, torch.Tensor):
             raise TypeError("ManifoldSAE.fit expects a torch.Tensor")
         if x.dim() != 2 or x.shape[1] != self.cfg.input_dim:
@@ -1857,13 +1864,44 @@ class ManifoldSAE(nn.Module):
             atom_basis=cfg.closed_form_basis_kind(),
             assignment=cfg.closed_form_assignment(),
             schedule=cfg.sparsity.gumbel_schedule(),
-            n_iter=int(max_iter or cfg.reml.max_iter),
+            n_iter=int(resolved_iter or cfg.reml.max_iter),
             random_state=int(random_state),
             **kwargs,
         )
+        self._pad_fit_decoder_blocks_for_config(fit)
         self._last_fit = fit
         self._copy_fit_into_params(fit)
         return fit
+
+    def _pad_fit_decoder_blocks_for_config(self, fit: _ClosedFormManifoldSAE) -> None:
+        """Expose closed-form decoder blocks at the module config width.
+
+        Rust atoms can legitimately solve with narrower basis blocks than the
+        torch wrapper's fixed ``n_basis_per_atom`` (for example periodic bases
+        have width ``2H+1``).  The torch module has a rectangular
+        ``(F, K, D)`` decoder parameter and the public torch ``fit()`` contract
+        mirrors that rectangular config surface, so pad missing rows/columns
+        with zeros before returning the fit object.  This is representation-only:
+        it never alters fitted values, because padded coefficients multiply
+        basis columns that are absent/zero-padded on the torch side.
+        """
+        F = int(self.cfg.n_atoms)
+        K = int(self.cfg.n_basis_per_atom)
+        D = int(self.cfg.input_dim)
+        padded: list[np.ndarray] = []
+        for block in fit.decoder_blocks[:F]:
+            arr = np.asarray(block, dtype=np.float64)
+            out = np.zeros((K, D), dtype=np.float64)
+            if arr.ndim == 2:
+                m_i = min(int(arr.shape[0]), K)
+                d_i = min(int(arr.shape[1]), D)
+                out[:m_i, :d_i] = arr[:m_i, :d_i]
+            padded.append(out)
+        if len(padded) < F:
+            padded.extend(
+                np.zeros((K, D), dtype=np.float64) for _ in range(F - len(padded))
+            )
+        fit.decoder_blocks = padded
 
     @torch.no_grad()
     def _copy_fit_into_params(self, fit: _ClosedFormManifoldSAE) -> None:
