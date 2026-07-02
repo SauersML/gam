@@ -21,6 +21,7 @@ fn main() {
 
     let manifest_dir =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set"));
+    emit_workspace_scanner_rerun_roots(&manifest_dir);
 
     // Everything below — the Python penalty-manifest generation and the
     // first-party hygiene scanners — is development/CI tooling that operates on
@@ -4469,6 +4470,27 @@ struct ScannedFile {
 }
 
 static SCANNABLE_FILES: OnceLock<Vec<ScannedFile>> = OnceLock::new();
+
+fn emit_workspace_scanner_rerun_roots(root: &Path) {
+    emit_rerun_if_dir_exists(&root.join("src"));
+    emit_rerun_if_dir_exists(&root.join("examples"));
+    emit_rerun_if_dir_exists(&root.join("gamfit"));
+
+    let crates_dir = root.join("crates");
+    let Ok(entries) = fs::read_dir(&crates_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let crate_src = entry.path().join("src");
+        emit_rerun_if_dir_exists(&crate_src);
+    }
+}
+
+fn emit_rerun_if_dir_exists(path: &Path) {
+    if path.is_dir() {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+}
 
 fn visit_files(root: &Path, dir: &Path, visitor: &mut dyn FnMut(&Path, &str)) {
     let dir_rel = dir
