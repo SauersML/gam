@@ -1030,12 +1030,17 @@ class Model:
 
     @property
     def evidence(self) -> float:
-        """Minimised REML / LAML cost for this fit (penalised negative log
-        marginal likelihood plus Laplace correction), on the same
-        rank-normalized comparison scale used by ``gamfit.compare_models``.
+        """Model-selection cost for this fit, on the same rank scale used by
+        ``gamfit.compare_models`` to pick its winner: the Occam-penalised
+        conditional AIC (``-2*loglik + 2*edf``) when the log-likelihood and
+        effective degrees of freedom are available, falling back to the raw
+        (TK-normalized) REML / LAML marginal-likelihood cost otherwise (#2079).
         It is a *cost*, so **lower is better** -- the model with the smaller
-        ``evidence`` is the better-supported one. Use :meth:`bayes_factor_vs`
-        or ``gamfit.compare_models`` for a direct comparison.
+        ``evidence`` is the better-supported one, agreeing with the winner
+        reported by ``gamfit.compare_models``. Use :meth:`bayes_factor_vs` or
+        ``gamfit.compare_models`` for a direct comparison. (The raw,
+        un-penalised REML/LAML evidence headline remains available as
+        ``Summary.reml_score`` / the ``score_table`` column.)
         """
         return float(rust_module().model_evidence(self._model_bytes))
 
