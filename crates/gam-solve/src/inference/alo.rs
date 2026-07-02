@@ -770,6 +770,52 @@ impl<'a> AloInput<'a> {
             score_curvature: None,
         }
     }
+
+    /// Build an `AloInput` from a `FitGeometry`'s penalized Hessian plus
+    /// externally supplied working weights / working response.
+    ///
+    /// The row-sized IRLS working vectors are *derived* quantities: at
+    /// convergence they are deterministic functions of the linear predictor
+    /// `η̂ = Xβ̂`, the response `y`, and the family (`w_i = h'(η̂_i)²/(φ V(μ̂_i))·
+    /// prior_i`, `z_i = η̂_i + (y_i−μ̂_i)/h'(η̂_i)`). A size-compacted saved model
+    /// keeps the p×p `penalized_hessian` (n-independent) but drops those n-sized
+    /// vectors; a post-fit consumer such as `gam diagnose` reconstructs them from
+    /// the saved `β` by replaying the same PIRLS working-state update the fit
+    /// used, then feeds them here. This preserves the size win of dropping the
+    /// working vectors from persistence while still serving the exact geometry
+    /// ALO path (no refit, exact saved Hessian).
+    ///
+    /// Same canonical (Fisher == Observed) contract as [`from_geometry`]: the
+    /// supplied `working_weights` are the score-side Fisher weights and are
+    /// re-viewed for the Hessian-side slot via `as_signed()`.
+    ///
+    /// [`from_geometry`]: AloInput::from_geometry
+    pub fn from_geometry_with_working_state(
+        geom: &'a FitGeometry,
+        design: &'a Array2<f64>,
+        eta: &'a Array1<f64>,
+        offset: &'a Array1<f64>,
+        link: LinkFunction,
+        phi: f64,
+        working_weights: &'a Array1<f64>,
+        working_response: &'a Array1<f64>,
+    ) -> Self {
+        let psd_w = PsdWeightsView::from_view_unchecked(working_weights.view());
+        Self {
+            design,
+            penalized_hessian: &geom.penalized_hessian,
+            hessian_weights: psd_w.as_signed(),
+            score_weights: psd_w,
+            working_response,
+            eta,
+            offset,
+            link,
+            phi,
+            penalty_root: None,
+            ridge: 0.0,
+            score_curvature: None,
+        }
+    }
 }
 
 /// Compute ALO diagnostics from model-agnostic inputs.

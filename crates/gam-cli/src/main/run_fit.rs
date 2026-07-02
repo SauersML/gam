@@ -1031,6 +1031,7 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
             fit_config.offset_column.clone(),
             fit_config.noise_offset_column.clone(),
         );
+        set_saved_weight_column(&mut payload, fit_config.weight_column.clone());
         write_payload_json(&out, payload)?;
     }
 
