@@ -276,6 +276,7 @@ from ._model import (
 )
 from ._response_geometry import (
     ResponseGeometryModel,
+    fit_behavior_anchored_joint_atoms,
     alr,
     closure,
     clr,

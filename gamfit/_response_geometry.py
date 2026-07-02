@@ -524,6 +524,140 @@ def fit_response_geometry(
     )
 
 
+def fit_behavior_anchored_joint_atoms(
+    data: Any,
+    formula: str,
+    activation: Any,
+    behavior: Any,
+    *,
+    weights: Any | None = None,
+    behavior_weight: float | str = "reml",
+) -> dict[str, Any]:
+    """Fit activation and Hellinger behavior blocks on shared formula coordinates.
+
+    ``behavior`` is a row-stochastic next-token/readout distribution.  Rust owns
+    the manifold operations used by the behavior block: rows are mapped to
+    ``q=sqrt(p)`` on the positive unit sphere, centered at the spherical
+    Fréchet mean, and converted to tangent coordinates with the sphere log map.
+    The returned fit uses the existing shared-tangent Gaussian REML solver on
+    the concatenated activation and behavior tangent block, so all smoothness
+    parameters are REML-selected by the production Rust REML path.
+
+    ``behavior_weight="reml"`` profiles the single cross-block relative
+    precision with a deterministic golden-section REML profile (not a grid).
+    """
+    import json
+
+    np = _np()
+    h = np.asarray(activation, dtype=float)
+    if h.ndim == 1:
+        h = h.reshape(-1, 1)
+    if h.ndim != 2 or h.shape[1] == 0:
+        raise ValueError("activation must be a non-empty 1D or 2D array")
+    p = np.asarray(behavior, dtype=float)
+    if p.ndim == 1:
+        p = p.reshape(1, -1)
+    if p.ndim != 2 or p.shape[1] < 2:
+        raise ValueError("behavior must be a 2D probability array with at least two bins")
+    if h.shape[0] != p.shape[0]:
+        raise ValueError(
+            f"activation and behavior row counts differ: {h.shape[0]} vs {p.shape[0]}"
+        )
+    if not np.all(np.isfinite(h)) or not np.all(np.isfinite(p)):
+        raise ValueError("activation and behavior must be finite")
+    if np.any(p < 0.0):
+        raise ValueError("behavior probabilities must be non-negative")
+    row_sum = p.sum(axis=1)
+    if np.any(row_sum <= 0.0):
+        raise ValueError("each behavior row must have positive mass")
+    p = p / row_sum[:, None]
+    q = np.sqrt(p)
+    base = sphere_frechet_mean(q, weights=weights)
+    y_tangent = sphere_log_map(q, base)
+    headers, rows, _kind = normalize_table(data)
+    config = {"family": "gaussian", "link": "identity", "weights": weights}
+
+    def fit_at(log_w: float) -> dict[str, Any]:
+        scale = float(np.exp(0.5 * log_w))
+        y = np.ascontiguousarray(np.column_stack([h, scale * y_tangent]), dtype=float)
+        payload = _ffi(
+            "gaussian_reml_fit_formula_table",
+            headers,
+            rows,
+            formula,
+            y,
+            json.dumps(config),
+            None,
+        )
+        out = dict(payload)
+        if str(out.get("status", "ok")) != "ok":
+            raise ValueError(f"joint Hellinger REML failed with status={out.get('status')!r}")
+        for key in ("coefficients", "fitted", "sigma2", "lambdas", "edf"):
+            if key in out:
+                out[key] = np.asarray(out[key], dtype=float)
+        # Relative-precision Gaussian likelihood normalization for the behavior rows.
+        out["profile_score"] = (
+            float(out["reml_score"])
+            - 0.5 * h.shape[0] * y_tangent.shape[1] * log_w
+        )
+        out["behavior_weight"] = float(np.exp(log_w))
+        return out
+
+    if isinstance(behavior_weight, str):
+        if behavior_weight.lower() != "reml":
+            raise ValueError("behavior_weight must be a positive float or 'reml'")
+        a, b = -16.0, 16.0
+        gr = (5.0 ** 0.5 - 1.0) / 2.0
+        c = b - gr * (b - a)
+        d = a + gr * (b - a)
+        fc = fit_at(c)
+        fd = fit_at(d)
+        for _ in range(48):
+            if fc["profile_score"] <= fd["profile_score"]:
+                b, d, fd = d, c, fc
+                c = b - gr * (b - a)
+                fc = fit_at(c)
+            else:
+                a, c, fc = c, d, fd
+                d = a + gr * (b - a)
+                fd = fit_at(d)
+        fit = fc if fc["profile_score"] <= fd["profile_score"] else fd
+    else:
+        bw = float(behavior_weight)
+        if not np.isfinite(bw) or bw <= 0.0:
+            raise ValueError("behavior_weight must be finite and positive")
+        fit = fit_at(float(np.log(bw)))
+
+    fitted = fit["fitted"]
+    dh = h.shape[1]
+    scale = fit["behavior_weight"] ** 0.5
+    behavior_tangent_fitted = fitted[:, dh:] / scale
+    behavior_q_fitted = sphere_exp_map(behavior_tangent_fitted, base)
+    behavior_p_fitted = np.square(np.maximum(behavior_q_fitted, 0.0))
+    behavior_p_fitted /= behavior_p_fitted.sum(axis=1, keepdims=True)
+    resid_h = h - fitted[:, :dh]
+    resid_y = y_tangent - behavior_tangent_fitted
+    fit.update(
+        {
+            "activation_fitted": fitted[:, :dh],
+            "behavior_tangent": y_tangent,
+            "behavior_tangent_fitted": behavior_tangent_fitted,
+            "behavior_fitted": behavior_p_fitted,
+            "behavior_base_sqrt": np.asarray(base, dtype=float),
+            "activation_residual_rms": float(np.sqrt(np.mean(resid_h * resid_h))),
+            "behavior_hellinger_residual_rms": float(
+                np.sqrt(np.mean(resid_y * resid_y))
+            ),
+            "isometry_defect": float(
+                np.sqrt(np.mean(resid_y * resid_y))
+                / max(np.sqrt(np.mean(resid_h * resid_h)), 1e-300)
+            ),
+            "nats_per_unit_t": 2.0,
+        }
+    )
+    return fit
+
+
 def _formula_rhs(formula: str) -> str:
     parts = formula.split("~", 1)
     if len(parts) != 2 or not parts[1].strip():

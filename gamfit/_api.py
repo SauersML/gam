@@ -20,7 +20,11 @@ from ._cuda import format_cuda_diagnostics as _format_cuda_diagnostics
 from ._exceptions import map_exception
 from ._model import Model
 from ._reml_common import check_forward_state, coerce_grad_payload
-from ._response_geometry import ResponseGeometryModel, fit_response_geometry
+from ._response_geometry import (
+    ResponseGeometryModel,
+    fit_behavior_anchored_joint_atoms,
+    fit_response_geometry,
+)
 from ._tables import normalize_table
 from ._validation import FormulaValidation
 from ._warnings import emit_inference_warnings
