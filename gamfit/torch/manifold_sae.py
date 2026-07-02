@@ -631,9 +631,12 @@ def _project_to_manifold(raw: torch.Tensor, manifold: str, intrinsic_rank: int) 
         lon = torch.tanh(raw[..., 1:2]) * math.pi
         return torch.cat([lat, lon], dim=-1)
     if manifold == "product":
-        ang = torch.sigmoid(raw[..., :1])
-        rest = raw[..., 1:intrinsic_rank]
-        return torch.cat([ang, rest], dim=-1)
+        # A product atom is a flat Euclidean Duchon patch (genuinely R^d, see
+        # ``basis_kind`` and ``_TOPOLOGY_MAP``); it has no periodic/bounded axis.
+        # Passing the raw coordinates straight through keeps the Jacobian
+        # identity, avoiding the artificial (0,1) boundary and saturating
+        # gradients a sigmoid on coord 0 would impose.
+        return raw[..., :intrinsic_rank]
     raise ValueError(f"unknown manifold {manifold!r}")
 
 

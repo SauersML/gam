@@ -154,6 +154,40 @@ def test_multid_product_second_axis_is_live() -> None:
     )
 
 
+def test_product_projection_is_identity_not_sigmoid() -> None:
+    """F4: the product patch projection must pass raw coordinates through.
+
+    A product atom is a flat Euclidean Duchon patch (genuinely ``R^d``) — it has
+    no periodic or bounded axis. The old code ran ``sigmoid`` on coordinate 0,
+    squashing it into ``(0, 1)`` and giving a Jacobian that saturates to zero for
+    large ``|raw_0|`` (dead / saturated product atoms). The correct projection is
+    the identity, so both the value equals the input and the coordinate-0
+    Jacobian is exactly 1 everywhere (never <= 0.25, the sigmoid's max slope).
+    """
+    from gamfit.torch.manifold_sae import _project_to_manifold
+
+    raw = torch.tensor(
+        [[-4.0, 0.3, 1.5], [0.0, -2.0, 0.7], [5.0, 1.0, -0.9]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    out = _project_to_manifold(raw, "product", intrinsic_rank=3)
+    assert out.shape == raw.shape
+    # Value is the raw coordinates unchanged (no sigmoid on coord 0).
+    assert torch.allclose(out, raw.detach()), (
+        "product projection altered the raw coordinates — a sigmoid or other "
+        "domain map is being applied to a flat Euclidean patch"
+    )
+    # Coordinate-0 Jacobian is exactly 1 (a sigmoid would give <= 0.25, and ~0
+    # at raw_0 = +-4/+-5 where the old code saturated).
+    out[:, 0].sum().backward()
+    coord0_jac = raw.grad[:, 0]
+    assert torch.allclose(coord0_jac, torch.ones_like(coord0_jac)), (
+        f"product coord-0 Jacobian is not identity: {coord0_jac.tolist()} — "
+        "the saturating sigmoid regression is back"
+    )
+
+
 def test_cylinder_forward_refused_with_accurate_message() -> None:
     """Cylinder forward stays refused (no topology-faithful periodic torch kernel)."""
     cfg = gt.ManifoldSAEConfig(
