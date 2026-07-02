@@ -4376,6 +4376,13 @@ fn sae_manifold_fit_ibp<'py>(
         // No structured-residual alternation on this convenience IBP entry point
         // (#2021): the iid-only path, matching the default of the other entry points.
         0,
+        // No #2021 promotion / #2022 scale-quotient / #2023 data-row reseed on this
+        // convenience IBP entry point: all default-off, matching how every other
+        // opt-in above is left inert here (the primary `sae_manifold_fit` /
+        // `sae_manifold_fit_minimal` entry points carry the typed kwargs).
+        false,
+        false,
+        false,
     )
 }
 
