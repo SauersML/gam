@@ -874,7 +874,13 @@ fn compute_alo_from_input_inner(input: &AloInput) -> Result<AloDiagnostics, AloE
             let mut meat_quad = 0.0f64;
             for row in 0..n {
                 let xs = xs_slice[row];
-                meat_quad += w_h[row] * xs * xs;
+                // Sandwich meat is the SCORE covariance Xᵀ diag(W_S) X (Fisher,
+                // PSD by construction), not the observed-information Hessian
+                // weight W_H: the estimator is Var = H⁻¹·Cov(score)·H⁻¹ with the
+                // bread H = Xᵀ W_H X + S. For non-canonical links W_H ≠ W_S (and
+                // W_H can be negative), so using W_H here gives a wrong — even
+                // negative — sandwich SE. See `AloInput::score_weights`.
+                meat_quad += w_s[row] * xs * xs;
             }
             let var_sandwich = sandwichvar_eta_from_meat(phi, meat_quad);
 
