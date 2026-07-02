@@ -722,10 +722,19 @@ fn recon_error(dev: &EncodeAtomDevice, t: &[f64], x: &[f64], amplitude: f64, scr
     if err2.is_finite() { err2.sqrt() } else { f64::INFINITY }
 }
 
-/// Top-`k` charts by center reconstruction distance, sorted by (distance, index)
-/// — mirror of [`crate::encode::nearest_charts_topk`]. Only certifiable charts
-/// (`certified_radius > 0`) are considered.
-fn nearest_charts_topk(dev: &EncodeAtomDevice, x: &[f64], scratch: &mut Scratch) -> Vec<usize> {
+/// Top-`k` charts by the amplitude-scaled center reconstruction distance
+/// `‖x − z·m₁(t_c)‖²` (F1), sorted by (distance, index) — mirror of
+/// [`crate::encode::nearest_charts_topk`]. `m₁` is the amplitude-1 center
+/// reconstruction; the reconstruction actually compared against `x` is `z·m₁`, so
+/// routing must scale by the row's amplitude `z` (an amplitude-blind score picks
+/// the wrong chart whenever `z ≠ 1`). Only certifiable charts (`certified_radius >
+/// 0`) are considered.
+fn nearest_charts_topk(
+    dev: &EncodeAtomDevice,
+    x: &[f64],
+    amplitude: f64,
+    scratch: &mut Scratch,
+) -> Vec<usize> {
     if dev.charts.is_empty() || dev.topk == 0 {
         return Vec::new();
     }
@@ -740,7 +749,7 @@ fn nearest_charts_topk(dev: &EncodeAtomDevice, x: &[f64], scratch: &mut Scratch)
         recon_amp1(dev, &scratch.phi, &mut recon);
         let mut dist = 0.0;
         for c in 0..p {
-            let diff = recon[c] - x[c];
+            let diff = amplitude * recon[c] - x[c];
             dist += diff * diff;
         }
         scored.push((idx, dist));
@@ -762,7 +771,7 @@ pub fn emulate_certified_encode_row(dev: &EncodeAtomDevice, x: &[f64], amplitude
     let d = dev.d;
     let p = dev.p;
     let mut scratch = Scratch::new(dev);
-    let candidates = nearest_charts_topk(dev, x, &mut scratch);
+    let candidates = nearest_charts_topk(dev, x, amplitude, &mut scratch);
     if candidates.is_empty() {
         return DeviceEncodeRow {
             coord: vec![0.0; d],
@@ -1040,7 +1049,9 @@ extern "C" __global__ void sae_certified_encode(
   const double* x = targets + (size_t)row*PP;
   double amp = amps[row];
 
-  // ---- routing: top-TOPK certifiable charts by center recon distance. ----
+  // ---- routing: top-TOPK certifiable charts by the amplitude-scaled center
+  //      recon distance ‖x − z·m₁(t_c)‖² (F1; z·m₁ is the reconstruction actually
+  //      compared against x — an amplitude-blind score mis-routes when z != 1). ----
   int cand[TOPK]; double cand_d[TOPK]; int ncand=0;
   {
     double phi[MM]; double jet[MM*DD]; double hess[MM*DD*DD]; double recon[PP];
@@ -1048,7 +1059,7 @@ extern "C" __global__ void sae_certified_encode(
       if (cert_radii[idx] <= 0.0) continue;
       eval_basis(exps, centers + (size_t)idx*DD, phi, jet, hess);
       recon_amp1(dec, phi, recon);
-      double dist=0.0; for(int c=0;c<PP;++c){ double df=recon[c]-x[c]; dist+=df*df; }
+      double dist=0.0; for(int c=0;c<PP;++c){ double df=amp*recon[c]-x[c]; dist+=df*df; }
       // insert into the sorted top-TOPK by (dist, idx).
       int pos=ncand;
       while(pos>0 && (cand_d[pos-1]>dist)){ if(pos<TOPK){cand_d[pos]=cand_d[pos-1]; cand[pos]=cand[pos-1];} pos--; }
