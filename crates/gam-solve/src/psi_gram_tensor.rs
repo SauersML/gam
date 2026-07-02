@@ -731,25 +731,26 @@ impl PsiGramTensor {
     }
 
     /// Lower edge of the contiguous ψ-band, ANCHORED at `psi_anchor`, over which
-    /// the conditioned Gram `XᵀWX(ψ)` holds the SAME numerical rank it has at the
+    /// the conditioned Gram `XᵀWX(ψ)` has the SAME reduced range projector as the
     /// anchor — i.e. the ψ-floor below which the design-revision skip's
     /// `reduced_basis_equal` witness must (soundly) refuse, because the range
-    /// subspace collapses as the longest-length-scale radial mode drops under the
-    /// rank cutoff. Lifting the κ-optimizer's lower bound to this floor keeps every
-    /// in-window trial on the n-free fast path and is inherently n-INDEPENDENT: the
-    /// rank is a property of the k×k tensor, not of the sample size (#1033).
+    /// subspace either collapses or rotates away from the pinned slow-path basis.
+    /// Lifting the κ-optimizer's lower bound to this floor keeps every in-window
+    /// trial on the n-free fast path and is inherently n-INDEPENDENT: the witness
+    /// is computed from the k×k tensor, not from sample rows (#1033).
     ///
     /// Anchoring at `psi_anchor` (the optimizer's ψ seed) is essential: the
     /// conditioned Gram is rank-deficient at BOTH window ends on production radial
     /// geometry — at small ψ the longest-scale mode collapses into the polynomial
     /// nullspace, and at very large ψ every radial column goes collinear with it.
-    /// The maximal-rank region is therefore a middle BAND, and the κ-optimum lives
-    /// inside it. We walk DOWN from the anchor on a fixed k-space grid and return
-    /// the lowest ψ still at the anchor's rank (stopping at the first node that
-    /// differs). Purely O(nodes·k³) — no row access.
+    /// The skip-acceptable region is therefore a middle BAND, and the κ-optimum
+    /// lives inside it. We walk DOWN from the anchor on a fixed k-space grid and
+    /// return the lowest ψ still sharing the anchor's reduced projector (stopping
+    /// at the first node the actual skip witness refuses). Purely O(nodes·k³) —
+    /// no row access.
     ///
     /// Returns `None` when the band already reaches `psi_lo` (no lift needed), when
-    /// the anchor is off-window / rank-indeterminate, or when the window is empty.
+    /// the anchor is off-window / projector-indeterminate, or when the window is empty.
     pub fn rank_stable_psi_floor(&self, psi_anchor: f64) -> Option<f64> {
         // Fixed k-space grid over the window. 96 nodes resolves the rank cliff
         // (~1 ψ-decade wide on production Duchon geometry) far finer than the
@@ -760,93 +761,99 @@ impl PsiGramTensor {
         }
         let span = self.psi_hi - self.psi_lo;
         let psi_at = |i: usize| self.psi_lo + span * (i as f64) / ((NODES - 1) as f64);
-        let ranks: Vec<Option<usize>> =
-            (0..NODES).map(|i| self.gram_numerical_rank(psi_at(i))).collect();
-        // Target the MAXIMAL numerical rank attained anywhere in the window — the
-        // full-rank "good" geometry the skip certifies. Anchoring on the seed's own
-        // rank would be fragile if the seed happened to land in a deficient spot;
-        // the window-max is the rank the κ-optimum's neighbourhood must hold.
-        let max_rank = ranks.iter().filter_map(|r| *r).max()?;
+        if !self.contains(psi_anchor) {
+            return None;
+        }
+        let accepts_anchor = |psi: f64| self.reduced_basis_equal(psi_anchor, psi);
         // Map the anchor to the nearest grid node, then snap UP to the nearest node
-        // at maximal rank (so the band edge is measured from inside the good band
-        // even if the seed sits just below the cliff). If no max-rank node exists
-        // at/above the anchor, there is nothing to protect below it.
+        // whose reduced projector matches the anchor (so the band edge is measured
+        // from inside the exact same skip-acceptable component even if the seed
+        // sits just outside a grid node). If no accepting node exists at/above the
+        // anchor, there is nothing reliable to protect below it.
         let anchor = psi_anchor.clamp(self.psi_lo, self.psi_hi);
         let anchor_idx = (((anchor - self.psi_lo) / span) * ((NODES - 1) as f64))
             .round()
             .clamp(0.0, (NODES - 1) as f64) as usize;
-        let band_idx = (anchor_idx..NODES).find(|&i| ranks[i] == Some(max_rank))?;
+        let band_idx = (anchor_idx..NODES).find(|&i| accepts_anchor(psi_at(i)))?;
         // Walk DOWN from the band node; the floor is the lowest node from which
-        // every node up to it holds `max_rank`. Stop at the first node below.
+        // every node up to it shares the anchor's reduced projector. Stop at the
+        // first node below that the actual skip witness would refuse.
         let mut floor_idx = band_idx;
         for i in (0..band_idx).rev() {
-            if ranks[i] == Some(max_rank) {
+            if accepts_anchor(psi_at(i)) {
                 floor_idx = i;
             } else {
                 break;
             }
         }
         if floor_idx == 0 {
-            // The maximal-rank band already reaches `psi_lo` — no lift needed.
+            // The skip-acceptable band already reaches `psi_lo` — no lift needed.
             None
         } else {
             Some(psi_at(floor_idx))
         }
     }
 
-    /// Upper edge of the contiguous maximal-rank ψ-band, the symmetric twin of
+    /// Upper edge of the contiguous skip-acceptable ψ-band, the symmetric twin of
     /// [`Self::rank_stable_psi_floor`] (#1033). The conditioned Gram `XᵀWX(ψ)` is
     /// rank-deficient at BOTH window ends — at small ψ the longest-length-scale
     /// radial mode collapses into the polynomial nullspace, and at very large ψ
     /// every radial column goes collinear with the low-frequency mode, so the
-    /// maximal-rank region is a middle BAND. The optimizer's line search can
+    /// skip-acceptable region is a middle BAND. The optimizer's line search can
     /// OVERSHOOT above that band (e.g. ψ≈1.0 on production Duchon geometry), where
     /// the design-realization skip's `reduced_basis_equal` witness must soundly
     /// refuse (the range subspace dropped a dimension) → an O(n) `reset_surface`,
     /// AND the pinning ψ recorded at that reset is itself rank-deficient, so the
     /// NEXT in-band trial mismatches its reference and resets a SECOND time. Both
     /// resets vanish once the optimizer's UPPER bound is clamped down to this
-    /// n-free k-space ceiling, keeping every trial inside the maximal-rank band.
+    /// n-free k-space ceiling, keeping every trial inside the skip-acceptable band.
     ///
     /// Walks UP from the anchor on the same fixed k-space grid as the floor and
-    /// returns the highest ψ still at the window's maximal numerical rank
-    /// (stopping at the first node above that differs). Purely O(nodes·k³) — no
-    /// row access, inherently n-INDEPENDENT (rank is a property of the k×k tensor).
+    /// returns the highest ψ still accepted by `reduced_basis_equal` against the
+    /// anchor (stopping at the first node above that the actual skip witness would
+    /// refuse). Purely O(nodes·k³) — no row access, inherently n-INDEPENDENT (the
+    /// projector is a property of the k×k tensor).
     ///
     /// Returns `None` when the band already reaches `psi_hi` (no clamp needed),
-    /// when the anchor is off-window / rank-indeterminate, or when the window is
+    /// when the anchor is off-window / projector-indeterminate, or when the window is
     /// empty.
     pub fn rank_stable_psi_ceiling(&self, psi_anchor: f64) -> Option<f64> {
-        // Same grid + max-rank target + anchor→band snap as `rank_stable_psi_floor`
-        // so the floor and ceiling bracket the SAME contiguous maximal-rank band.
+        // Same grid + projector witness + anchor→band snap as
+        // `rank_stable_psi_floor` so the floor and ceiling bracket the SAME
+        // contiguous skip-acceptable reduced-basis component.
         const NODES: usize = 96;
         if !(self.psi_hi > self.psi_lo) {
             return None;
         }
         let span = self.psi_hi - self.psi_lo;
         let psi_at = |i: usize| self.psi_lo + span * (i as f64) / ((NODES - 1) as f64);
-        let ranks: Vec<Option<usize>> =
-            (0..NODES).map(|i| self.gram_numerical_rank(psi_at(i))).collect();
-        let max_rank = ranks.iter().filter_map(|r| *r).max()?;
+        if !self.contains(psi_anchor) {
+            return None;
+        }
+        let accepts_anchor = |psi: f64| self.reduced_basis_equal(psi_anchor, psi);
         let anchor = psi_anchor.clamp(self.psi_lo, self.psi_hi);
         let anchor_idx = (((anchor - self.psi_lo) / span) * ((NODES - 1) as f64))
             .round()
             .clamp(0.0, (NODES - 1) as f64) as usize;
-        // Snap to the nearest max-rank node at/below the anchor (the mirror of the
-        // floor's snap-UP), so the band edge is measured from inside the good band.
-        let band_idx = (0..=anchor_idx).rev().find(|&i| ranks[i] == Some(max_rank))?;
+        // Snap to the nearest node at/below the anchor whose reduced projector
+        // matches the anchor (the mirror of the floor's snap-UP), so the edge is
+        // measured from inside the exact same skip-acceptable component.
+        let band_idx = (0..=anchor_idx)
+            .rev()
+            .find(|&i| accepts_anchor(psi_at(i)))?;
         // Walk UP from the band node; the ceiling is the highest node from which
-        // every node down to it holds `max_rank`. Stop at the first node above.
+        // every node down to it shares the anchor's reduced projector. Stop at the
+        // first node above that the actual skip witness would refuse.
         let mut ceil_idx = band_idx;
         for i in (band_idx + 1)..NODES {
-            if ranks[i] == Some(max_rank) {
+            if accepts_anchor(psi_at(i)) {
                 ceil_idx = i;
             } else {
                 break;
             }
         }
         if ceil_idx == NODES - 1 {
-            // The maximal-rank band already reaches `psi_hi` — no clamp needed.
+            // The skip-acceptable band already reaches `psi_hi` — no clamp needed.
             None
         } else {
             Some(psi_at(ceil_idx))
@@ -1232,8 +1239,14 @@ mod tests {
         let build_at = |n: usize| {
             let w = Array1::from_iter((0..n).map(|i| 1.0 + 0.5 * ((i % 3) as f64)));
             let z = Array1::from_iter((0..n).map(|i| ((i as f64) * 0.37).sin()));
-            PsiGramTensor::build(|psi| synth_design(psi, n, k), w.view(), z.view(), psi_lo, psi_hi)
-                .expect("analytic synthetic design must certify")
+            PsiGramTensor::build(
+                |psi| synth_design(psi, n, k),
+                w.view(),
+                z.view(),
+                psi_lo,
+                psi_hi,
+            )
+            .expect("analytic synthetic design must certify")
         };
 
         let t_small = build_at(120);
@@ -1332,8 +1345,14 @@ mod tests {
         let build_at = |n: usize| {
             let w = Array1::from_iter((0..n).map(|i| 1.0 + 0.5 * ((i % 3) as f64)));
             let z = Array1::from_iter((0..n).map(|i| ((i as f64) * 0.41).cos()));
-            PsiGramTensor::build(|psi| synth_design(-psi, n, k), w.view(), z.view(), psi_lo, psi_hi)
-                .expect("analytic synthetic design must certify")
+            PsiGramTensor::build(
+                |psi| synth_design(-psi, n, k),
+                w.view(),
+                z.view(),
+                psi_lo,
+                psi_hi,
+            )
+            .expect("analytic synthetic design must certify")
         };
 
         let t_small = build_at(120);
@@ -1924,8 +1943,8 @@ mod tests {
         };
         let v_lo = leading_evec(grid[0]);
         let v_hi = leading_evec(*grid.last().unwrap());
-        let cos_angle = v_lo.dot(&v_hi).abs()
-            / (v_lo.dot(&v_lo).sqrt() * v_hi.dot(&v_hi).sqrt()).max(1e-300);
+        let cos_angle =
+            v_lo.dot(&v_hi).abs() / (v_lo.dot(&v_lo).sqrt() * v_hi.dot(&v_hi).sqrt()).max(1e-300);
         assert!(
             cos_angle <= 0.999,
             "the design's eigenvectors must rotate with ψ for the gauge-invariance \
