@@ -103,8 +103,10 @@ fn coefficient_groups_with_gamma_priors_add_distinct_penalty_coordinates() {
 
     assert_eq!(
         fit.fit.lambdas.len(),
-        6,
-        "Expected two base linear penalties, two double-penalty blocks, and two user coefficient-group penalties to remain distinct."
+        4,
+        "Expected two base linear ridges (one identifiable λ per double_penalty \
+         linear term — NOT a duplicate second identity ridge on the same 1-D \
+         coefficient, #2068) plus two user coefficient-group penalties, all distinct."
     );
 }
 
