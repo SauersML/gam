@@ -5600,13 +5600,17 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     last_math_summary,
                 );
                 if coupled_exact_joint_required {
-                    // Budget-exhaustion error MUST carry `block_residual_inf=…`
-                    // so the carrying block survives the bubble through the
-                    // outer optimiser. If no in-cycle cert refusal produced
-                    // a structured report we build one here from the cached
-                    // joint gradient + states. `joint_hessian_source` is
-                    // per-cycle so the H_pen spectrum fields degrade to
-                    // NaN/empty; per-block residual data is fully present.
+                    // Budget exhaustion is a failed *inner mode at this rho*, not
+                    // malformed user input.  Propagate it as a finite
+                    // `converged=false` inner result so the outer objective can
+                    // reject/back off this smoothing point (the same contract used
+                    // by non-exact families) instead of bubbling an
+                    // `InvalidInput` through the custom-family string boundary.
+                    // This matters on the survival/location-scale flat baseline
+                    // valley: some startup rho candidates are numerically
+                    // non-certifying, but neighbouring rho values are perfectly
+                    // fit-able, so aborting the whole fit prevents the optimizer
+                    // from ever leaving the valley.
                     let block_diag = if let Some(report) = last_kkt_refusal_report.as_ref() {
                         report.format_bubbled_error()
                     } else {
@@ -5637,9 +5641,9 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                         );
                         report.format_bubbled_error()
                     };
-                    return Err(format!(
-                        "coupled exact-joint inner solve exhausted the joint Newton budget without KKT convergence after {cycles_done} cycle(s) — {block_diag}"
-                    ));
+                    log::warn!(
+                        "coupled exact-joint inner solve exhausted the joint Newton budget without KKT convergence after {cycles_done} cycle(s) — {block_diag}; returning a non-converged inner mode for outer-rho rejection"
+                    );
                 }
             }
             let penalty_value = total_quadratic_penalty(
@@ -5686,15 +5690,12 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             });
         }
         if coupled_exact_joint_required {
-            // Bubble the structured KKT refusal report (per-block residual
-            // breakdown + H_pen spectrum + diagnosis) so the cause of the
-            // refusal survives serialization through the outer optimizer,
-            // the seed-validation cascade, and gamfit. When the cert refused
-            // inside the cycle loop we already computed a `KktRefusalReport`
-            // at the refusing iterate; reuse it verbatim. If a different
-            // early-exit path reaches this branch, build the same structured
-            // report from the last Newton math snapshot rather than routing
-            // through a second diagnostic string format.
+            // An early exit from the exact joint path is also a non-certifying
+            // inner mode at the current rho, not invalid input.  Do not fall
+            // through to blockwise iteration (that would drop required
+            // cross-block curvature), but do return the current finite iterate
+            // with `converged=false` so the outer optimizer can reject this rho
+            // and continue.
             let block_diag = last_kkt_refusal_report
                 .as_ref()
                 .map(KktRefusalReport::format_bubbled_error)
@@ -5702,9 +5703,51 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     "structured KKT refusal report unavailable: no joint Newton math snapshot"
                         .to_string()
                 });
-            return Err(format!(
-                "coupled exact-joint inner solve exited the joint Newton path before convergence — {block_diag}"
-            ));
+            log::warn!(
+                "coupled exact-joint inner solve exited the joint Newton path before convergence — {block_diag}; returning a non-converged inner mode for outer-rho rejection"
+            );
+            let penalty_value = total_quadratic_penalty(
+                &states,
+                &s_lambdas,
+                ridge,
+                options.ridge_policy,
+                joint_bundle,
+                Some(specs),
+            );
+            let (block_logdet_h, block_logdet_s) = blockwise_logdet_terms_with_workspace(
+                family,
+                specs,
+                &mut states,
+                block_log_lambdas,
+                options,
+                cached_joint_workspace.clone(),
+            )?;
+            let active_constraints = {
+                let local_ranges = block_param_ranges(specs);
+                let local_total_p = local_ranges.last().map(|(_, end)| *end).unwrap_or(0);
+                let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
+                assemble_active_constraint_block(
+                    &block_constraints,
+                    &cached_active_sets,
+                    &local_ranges,
+                    local_total_p,
+                )
+                .map(std::sync::Arc::new)
+            };
+            return Ok(BlockwiseInnerResult {
+                block_states: states,
+                active_sets: normalize_active_sets(cached_active_sets),
+                log_likelihood: current_log_likelihood,
+                penalty_value,
+                cycles: cycles_done,
+                converged: false,
+                block_logdet_h,
+                block_logdet_s,
+                s_lambdas,
+                joint_workspace: cached_joint_workspace.clone(),
+                kkt_residual: None,
+                active_constraints,
+            });
         }
         // Otherwise fall through to blockwise iteration below.
     }
