@@ -1,6 +1,6 @@
 [package]
 name = "gam-model-api"
-version = "0.3.141"
+version = "0.3.142"
 edition = "2024"
 description = "Model and custom-family trait API and contracts for the gam penalized-likelihood engine"
 license = "AGPL-3.0-or-later"
@@ -10,8 +10,8 @@ repository = "https://github.com/SauersML/gam"
 warnings = "deny"
 
 [dependencies]
-gam-linalg = { path = "../gam-linalg", version = "=0.3.141" }
-gam-problem = { path = "../gam-problem", version = "=0.3.141" }
-gam-runtime = { path = "../gam-runtime", version = "=0.3.141" }
+gam-linalg = { path = "../gam-linalg", version = "=0.3.142" }
+gam-problem = { path = "../gam-problem", version = "=0.3.142" }
+gam-runtime = { path = "../gam-runtime", version = "=0.3.142" }
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 rayon = "1.12.0"

@@ -253,6 +253,18 @@ pub(crate) const FLAT_VALLEY_STALL_ESCAPE_MARGIN: f64 = 1.5;
 /// large-score fit is never certified.
 pub(crate) const FLAT_VALLEY_CONVERGED_ABS_GRAD_CAP: f64 = 1.0;
 
+/// Score-relative flat-valley stationarity bound used by both the in-loop ARC
+/// cost-stall guard and the post-fit authoritative-gradient reconciliation.
+///
+/// Keeping the formula centralized prevents the shipped-fit certificate from
+/// drifting away from the guard that originally decides whether a stalled ARC
+/// trajectory is a genuine weakly-identified valley.
+#[inline]
+pub(crate) fn flat_valley_converged_grad_bound(score: f64) -> f64 {
+    (FLAT_VALLEY_CONVERGED_REL_GRAD * (1.0 + score.abs()))
+        .min(FLAT_VALLEY_CONVERGED_ABS_GRAD_CAP)
+}
+
 /// Maximum number of consecutive [`CostStallVerdict::StuckKeepDescending`]
 /// escapes the guard grants before it falls back to a [`CostStallVerdict::
 /// FlatValleyStall`] halt (#1426). Each escape resets the no-improvement window
@@ -602,8 +614,7 @@ impl CostStallGuard {
         // overfit (|g| ≈ 11 on a score `O(1e3)`, i.e. above BOTH this bound and the
         // separate `FLAT_VALLEY_STALL_GRAD_CEILING`) — is still rejected and routed
         // to `StuckKeepDescending`, so no near-full-basis overfit is ever certified.
-        let score_relative_grad_bound = (FLAT_VALLEY_CONVERGED_REL_GRAD * (1.0 + best_value.abs()))
-            .min(FLAT_VALLEY_CONVERGED_ABS_GRAD_CAP);
+        let score_relative_grad_bound = flat_valley_converged_grad_bound(best_value);
         let converged = best_grad_norm.is_finite()
             && (best_grad_norm <= self.grad_threshold
                 || best_grad_norm <= score_relative_grad_bound);

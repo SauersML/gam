@@ -663,8 +663,9 @@ pub fn compile_survival_parametric_designs_per_term(
     logslope_dg: Array2<f64>,
     logslope_partition: &[std::ops::Range<usize>],
     row_hess: &dyn RowHessian,
+    protect_time: bool,
 ) -> Result<SurvivalParametricCompiledPerTerm, String> {
-    use gam_identifiability::families::compiler::compile;
+    use gam_identifiability::families::compiler::compile_protected;
 
     let p_time = time_dq0.ncols();
     let p_marg = marginal_dq.ncols();
@@ -699,11 +700,25 @@ pub fn compile_survival_parametric_designs_per_term(
         ordering.push(BlockOrder::Logslope);
     }
 
-    let compiled = compile(&operators, row_hess, &ordering).map_err(|e| {
-        format!("identifiability::families::compiler::compile (per-term) failed: {e}")
-    })?;
-    let blocks = compiled.blocks;
+    // The time block carries the monotone time-wiggle basis, whose effective
+    // Jacobian is a fixed nonlinear functional basis rather than a linear
+    // design. When `protect_time` is set it must be kept at full raw width: a
+    // linear reparameterisation of it would desynchronise the raw-width
+    // wiggle-basis chain rule (`SmsTimewiggleTimeJacobian`), which recomputes
+    // the basis on every evaluation. Marginal/logslope still reduce against the
+    // full time anchor. The time block spans operators `0..n_time` (pushed
+    // first above); mark exactly those protected.
     let n_time = time_partition.len();
+    let protected: Vec<bool> = if protect_time {
+        (0..operators.len()).map(|i| i < n_time).collect()
+    } else {
+        Vec::new()
+    };
+    let compiled =
+        compile_protected(&operators, row_hess, &ordering, &protected).map_err(|e| {
+            format!("identifiability::families::compiler::compile (per-term) failed: {e}")
+        })?;
+    let blocks = compiled.blocks;
     let n_marg = marginal_partition.len();
     let n_log = logslope_partition.len();
     if blocks.len() != n_time + n_marg + n_log {
@@ -2345,6 +2360,7 @@ mod tests {
             log_dg.clone(),
             &log_partition,
             &row_hess_ident,
+            false,
         )
         .expect("identity-H compile must succeed");
 
@@ -2367,6 +2383,7 @@ mod tests {
             log_dg,
             &log_partition,
             &row_hess_q0,
+            false,
         )
         .expect("q0-only-H compile must succeed");
 

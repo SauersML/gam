@@ -1179,6 +1179,13 @@ pub(crate) fn fit_gaussian_location_scale_model(
             .mapv_inplace(|v| v / response_scale);
     }
 
+    // Gaussian location-scale prediction has two coupled linear predictors, so
+    // uncertainty on either response channel must be assembled from the joint
+    // `(β_μ, β_logσ)` Laplace posterior covariance. Request it
+    // unconditionally; otherwise predict-time delta-method SEs for the second
+    // predictor can only fall back to scalar/block-local approximations.
+    request.options.compute_covariance = true;
+
     let mut result =
         fit_location_scale_with_optional_wiggle::<GaussianLocationScaleWorkflow>(request)?;
 

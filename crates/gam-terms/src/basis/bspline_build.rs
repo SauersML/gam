@@ -159,9 +159,9 @@ pub fn build_bspline_basis_1d(
     };
 
     if let Some((start, end, num_basis)) = periodic_build {
-        if spec.degree != 3 {
+        if spec.degree < 1 {
             crate::bail_invalid_basis!(
-                "cyclic P-splines currently require cubic degree=3, got degree={}",
+                "cyclic P-splines require degree >= 1, got degree={}",
                 spec.degree
             );
         }
@@ -1860,9 +1860,8 @@ pub fn filter_active_penalty_candidates_with_ops(
     let mut penaltyinfo = Vec::with_capacity(candidates.len());
     let mut active_null_eigenvectors: Vec<Option<Array2<f64>>> =
         Vec::with_capacity(candidates.len());
-    let mut active_ops: Vec<
-        Option<std::sync::Arc<dyn crate::analytic_penalties::PenaltyOp>>,
-    > = Vec::with_capacity(candidates.len());
+    let mut active_ops: Vec<Option<std::sync::Arc<dyn crate::analytic_penalties::PenaltyOp>>> =
+        Vec::with_capacity(candidates.len());
 
     for (original_index, candidate) in candidates.into_iter().enumerate() {
         let analysis = analyze_penalty_block_with_op(&candidate.matrix, candidate.op.clone())?;

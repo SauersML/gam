@@ -171,10 +171,10 @@ pub struct RemlTraceHutchinsonEvidence {
     pub logdet_hessian: f64,
     /// REML logdet gradient `g_j = (1/2) · mean_k(q_{j,k})`, length `D`.
     pub gradient_rho_logdet: Array1<f64>,
-    /// Per-probe sample standard deviation of the half-scaled gradient term
-    /// `(1/2)·q_{j,·}` across the `K` probes (i.e. `0.5·sd`, NOT divided by
-    /// `sqrt(K)`), length `D`. To obtain the standard error of the running
-    /// mean `g_j`, divide by `sqrt(K)` (= `sqrt(probe_count)`).
+    /// Standard error of the half-scaled gradient estimator
+    /// `(1/2)·mean_k(q_{j,k})`, length `D`. This is the Bessel-corrected
+    /// sample standard deviation across probes divided by `sqrt(K)`, with the
+    /// same `(1/2)` REML logdet scaling as [`Self::gradient_rho_logdet`].
     pub gradient_rho_stderr: Array1<f64>,
     /// `K` probes actually used (matches `input.probe_count`).
     pub probe_count: usize,
@@ -436,12 +436,11 @@ pub const HUTCHINSON_ADAPTIVE_TAU_REL: f64 = 1e-8;
 /// the per-coordinate relative-SE criterion
 ///
 /// ```text
-/// max_j  s_j / (sqrt(K) · max(|t_j|, τ))  ≤  ε
+/// max_j  SE(t_j) / max(|t_j|, τ)  ≤  ε
 /// ```
 ///
-/// where `s_j` is the sample standard deviation across the `K` probes (the
-/// raw quadratic-form sample, *without* the `(1/2)` REML logdet scaling)
-/// and `t_j` is the running mean. Because the SplitMix probe RNG is
+/// where `SE(t_j)` is the standard error of the raw quadratic-form running
+/// mean (without the `(1/2)` REML logdet scaling) and `t_j` is the running mean. Because the SplitMix probe RNG is
 /// stateless (`(seed, k_index, i) → ±1`), the first `K_prev` probes of a
 /// `K = 2·K_prev` re-run are bit-identical to the previous batch, so each
 /// step extends the prior estimate rather than starting fresh in
@@ -456,9 +455,8 @@ pub const HUTCHINSON_ADAPTIVE_TAU_REL: f64 = 1e-8;
 pub struct AdaptiveTraceEvidence {
     pub logdet_hessian: f64,
     pub traces: Array1<f64>,
-    /// Per-probe sample standard deviation of the raw trace estimator
-    /// `q_{j,·}` (NOT divided by `sqrt(K)`); divide by `sqrt(probe_count)`
-    /// to obtain the standard error of the running mean `traces[j]`.
+    /// Standard error of the raw trace estimator `mean_k(q_{j,k})`, i.e. the
+    /// Bessel-corrected sample standard deviation divided by `sqrt(K)`.
     pub stderrs: Array1<f64>,
     pub probe_count: usize,
     pub converged: bool,
@@ -509,26 +507,20 @@ pub fn evidence_traces_adaptive<'a>(
         last_k = k;
 
         // The dispatch entry returns the **(1/2)·mean** REML logdet
-        // gradient and **(1/2)·per-probe sample SD**. Undo the half to
-        // recover the raw `t_j = mean_k q_{j,k}` and the per-probe sample
-        // standard deviation `s_j` the stopping rule wants.
+        // gradient and **(1/2)·SE**. Undo the half to recover the raw
+        // `t_j = mean_k q_{j,k}` and the standard error of the raw mean.
         for j in 0..d {
             last_traces[j] = 2.0 * evidence.gradient_rho_logdet[j];
             last_stderrs[j] = 2.0 * evidence.gradient_rho_stderr[j];
         }
 
         // Stopping rule (math block 2 §16):
-        //   max_j  s_j / (sqrt(K) · max(|t_j|, τ))  ≤  ε
-        // `s_j` here is the per-probe sample standard deviation across the K
-        // probes (`reduce_mean_stderr` returns the raw SD, NOT the SE-of-mean);
-        // dividing by sqrt(K) once converts it to the standard error of the
-        // running mean. (The earlier double-sqrt(K) division — once here and
-        // once already inside `reduce_mean_stderr` — made this test sqrt(K)×
-        // too lax, stopping the schedule at too-small K; see #829.)
-        let sqrt_k = (k as f64).sqrt();
+        //   max_j  SE(t_j) / max(|t_j|, τ)  ≤  ε
+        // where `last_stderrs[j]` is already the standard error of the
+        // running mean.
         let mut worst = 0.0_f64;
         for j in 0..d {
-            let denom = sqrt_k * last_traces[j].abs().max(tau_rel);
+            let denom = last_traces[j].abs().max(tau_rel);
             let r = last_stderrs[j] / denom;
             if r > worst {
                 worst = r;
@@ -728,11 +720,11 @@ where
             // two-pass `reduce_mean_stderr` exactly (no one-pass cancellation).
             // For K = 1 there is no spread to estimate, so the variance is 0.
             let var = if n > 1.0 { q_m2[j] / (n - 1.0) } else { 0.0 };
-            let s = var.sqrt();
+            let se = var.sqrt() / n.sqrt();
             last_traces[j] = mean;
-            last_stderrs[j] = s;
-            let denom = n.sqrt() * mean.abs().max(tau_rel);
-            let r = s / denom;
+            last_stderrs[j] = se;
+            let denom = mean.abs().max(tau_rel);
+            let r = se / denom;
             if r > worst_ratio {
                 worst_ratio = r;
             }
@@ -847,16 +839,16 @@ mod linux_cuda {
         DerivativeHessian, ProbeSeed, RemlTraceHutchinsonEvidence, RemlTraceHutchinsonInput,
         reduce_mean_stderr,
     };
+    use cudarc::cublas::sys::cublasOperation_t;
+    use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
+    use cudarc::cusolver::DnHandle;
+    use cudarc::driver::{CudaContext, CudaModule, CudaStream, LaunchConfig, PushKernelArg};
     use gam_gpu::driver::to_col_major;
     use gam_gpu::gpu_error::{GpuError, GpuResultExt};
     use gam_gpu::solver::{
         cholesky_logdet_from_col_major, context_and_stream, pinned_htod, potrf_in_place,
         potrs_in_place,
     };
-    use cudarc::cublas::sys::cublasOperation_t;
-    use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
-    use cudarc::cusolver::DnHandle;
-    use cudarc::driver::{CudaContext, CudaModule, CudaStream, LaunchConfig, PushKernelArg};
     use std::sync::Arc;
 
     /// NVRTC source for the three custom kernels used by this path. All
@@ -1452,15 +1444,10 @@ fn validate_inputs(input: &RemlTraceHutchinsonInput<'_>) -> Result<(), String> {
     Ok(())
 }
 
-/// Compute the per-derivative sample mean and **per-probe sample standard
-/// deviation** from the flat row-major (D, K) Q matrix. The SD uses Bessel's
-/// correction (K-1) for the variance; it is NOT divided by `sqrt(K)`. Callers
-/// that want the standard error of the running mean must divide by `sqrt(K)`
-/// themselves (the stopping rule and the tests do). Returning the raw sample
-/// SD here keeps a single convention shared with the HVP adaptive path
-/// (which folds `var.sqrt()` directly into its `stderrs`), and avoids the
-/// historical double `1/sqrt(K)` division that under-counted the variance
-/// band by a factor of `K`.
+/// Compute the per-derivative sample mean and **standard error of that mean**
+/// from the flat row-major (D, K) Q matrix. The variance uses Bessel's
+/// correction (K-1), then divides by `K` to report the uncertainty of
+/// `mean_k(q_{j,k})` rather than the per-probe spread.
 fn reduce_mean_stderr(q: &[f64], d: usize, k: usize) -> (Vec<f64>, Vec<f64>) {
     assert_eq!(
         q.len(),
@@ -1479,7 +1466,7 @@ fn reduce_mean_stderr(q: &[f64], d: usize, k: usize) -> (Vec<f64>, Vec<f64>) {
         means[j] = mean;
         if k >= 2 {
             let var = row.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / ((k - 1) as f64);
-            stderrs[j] = var.sqrt();
+            stderrs[j] = (var / (k as f64)).sqrt();
         }
     }
     (means, stderrs)
@@ -1660,11 +1647,10 @@ mod tests {
         // gradient = 0.5 * trace, so multiply estimate by 2 for the trace.
         let est1 = 2.0 * evidence.gradient_rho_logdet[0];
         let est2 = 2.0 * evidence.gradient_rho_logdet[1];
-        // `gradient_rho_stderr` is the per-probe sample SD of the half-scaled
-        // gradient; the trace SE of the K-probe mean is `2·sd/sqrt(K)`.
-        let sqrt_k = (evidence.probe_count as f64).sqrt();
-        let se1 = 2.0 * evidence.gradient_rho_stderr[0] / sqrt_k;
-        let se2 = 2.0 * evidence.gradient_rho_stderr[1] / sqrt_k;
+        // `gradient_rho_stderr` is already the SE of the half-scaled
+        // gradient; multiply by 2 for the raw trace SE.
+        let se1 = 2.0 * evidence.gradient_rho_stderr[0];
+        let se2 = 2.0 * evidence.gradient_rho_stderr[1];
         let tol1 = 6.0 * se1.max(1e-8);
         let tol2 = 6.0 * se2.max(1e-8);
         assert!(
@@ -1772,8 +1758,8 @@ mod tests {
             seed: ProbeSeed(0xAA55),
         };
         let evidence = evidence_derivatives_hutchinson_cpu(&input).expect("ok");
-        // SE of the half-scaled gradient mean = (per-probe sample SD) / sqrt(K).
-        let se = evidence.gradient_rho_stderr[0] / (evidence.probe_count as f64).sqrt();
+        // SE of the half-scaled gradient mean.
+        let se = evidence.gradient_rho_stderr[0];
         let tol = 8.0 * se.max(1e-8);
         assert!(
             (evidence.gradient_rho_logdet[0] - 0.5 * exact).abs() < tol,
@@ -1832,7 +1818,7 @@ mod tests {
         )
         .expect("adaptive run ok");
         let est = evidence.traces[0];
-        let se = evidence.stderrs[0] / (evidence.probe_count as f64).sqrt();
+        let se = evidence.stderrs[0];
         let tol = (8.0 * se).max(0.05 * exact.abs());
         assert!(
             (est - exact).abs() <= tol,
@@ -1901,7 +1887,7 @@ mod tests {
         )
         .expect("adaptive ok");
         let est = evidence.traces[0];
-        let se = evidence.stderrs[0] / (evidence.probe_count as f64).sqrt();
+        let se = evidence.stderrs[0];
         let tol = (8.0 * se).max(0.05 * fd.abs());
         assert!(
             (est - fd).abs() <= tol,
@@ -1928,7 +1914,7 @@ mod tests {
         };
         let evidence = evidence_derivatives_hutchinson_gpu(input).expect("ok");
         let est = 2.0 * evidence.gradient_rho_logdet[0];
-        let se = 2.0 * evidence.gradient_rho_stderr[0] / (4096_f64).sqrt();
+        let se = 2.0 * evidence.gradient_rho_stderr[0];
         let tol = (6.0 * se).max(1e-3 * exact.abs());
         assert!(
             (est - exact).abs() <= tol,
@@ -2012,8 +1998,8 @@ mod tests {
         // at a different step due to CG round-off; compare both
         // estimates against exact rather than to each other.
         let exact = exact_trace_hinv_a(h.view(), a.view());
-        let se_dense = dense.stderrs[0] / (dense.probe_count as f64).sqrt();
-        let se_hvp = hvp_evidence.stderrs[0] / (hvp_evidence.probe_count as f64).sqrt();
+        let se_dense = dense.stderrs[0];
+        let se_hvp = hvp_evidence.stderrs[0];
         let tol_dense = (8.0 * se_dense).max(0.05 * exact.abs());
         let tol_hvp = (8.0 * se_hvp).max(0.05 * exact.abs());
         assert!(
@@ -2038,11 +2024,11 @@ mod tests {
     fn block_2_7_hvp_stderr_matches_dense_reduce_mean_stderr() {
         // The HVP path's `stderrs` must use the SAME estimator convention as
         // the dense path's `reduce_mean_stderr`: the Bessel-corrected (K−1)
-        // sample standard deviation of the per-probe q values. We force both
+        // standard error of the per-probe q running mean. We force both
         // paths to run the full K=128 schedule (rel_tol below any achievable
         // ratio) so the comparison is at identical probe counts on identical
         // CRN probes. The only residual difference is the inner solve (exact
-        // Cholesky vs CG@1e-6), which keeps the q values — and hence the SDs —
+        // Cholesky vs CG@1e-6), which keeps the q values — and hence the SEs —
         // agreeing to a tight relative tolerance.
         let p = 36;
         let h = make_spd(p, 0.6);
@@ -2088,12 +2074,12 @@ mod tests {
         let sd_hvp = hvp.stderrs[0];
         assert!(
             sd_dense > 0.0,
-            "dense SD should be positive, got {sd_dense}"
+            "dense SE should be positive, got {sd_dense}"
         );
         let rel = (sd_hvp - sd_dense).abs() / sd_dense;
         assert!(
             rel <= 1e-3,
-            "HVP SD {sd_hvp} disagrees with dense reduce_mean_stderr SD {sd_dense} \
+            "HVP SE {sd_hvp} disagrees with dense reduce_mean_stderr SE {sd_dense} \
              (rel {rel}); the two paths must share the Bessel-corrected (K−1) convention"
         );
     }
@@ -2203,7 +2189,7 @@ mod tests {
         // Sanity: every adaptive trace must agree with exact within its
         // reported SE. This guards against a fast-but-wrong perf path.
         for j in 0..d {
-            let se = evidence.stderrs[j] / (evidence.probe_count as f64).sqrt();
+            let se = evidence.stderrs[j];
             let tol = (10.0 * se).max(0.05 * exact_traces[j].abs());
             let diff = (evidence.traces[j] - exact_traces[j]).abs();
             assert!(

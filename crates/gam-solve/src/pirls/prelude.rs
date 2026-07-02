@@ -34,6 +34,7 @@ pub(crate) use gam_problem::{
     GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, MixtureLinkState, ResponseFamily,
     SasLinkState, is_valid_tweedie_power,
 };
+pub(crate) use gam_problem::outer_subsample::RowSet;
 
 pub(crate) use dyn_stack::{MemBuffer, MemStack};
 

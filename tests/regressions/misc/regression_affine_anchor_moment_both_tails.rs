@@ -15,19 +15,21 @@
 use gam::families::cubic_cell_kernel::affine_anchor_moment_vector;
 
 /// Stable reference for `T_0(a, b) = ∫_a^b e^(−z²/2) dz = √(2π)(Φ(b) − Φ(a))`,
-/// computed in whichever tail keeps full precision. Independent of the crate
-/// implementation: here Φ is taken from `statrs`'s `Normal` distribution.
+/// computed in whichever tail keeps full precision.
 fn t0_reference(a: f64, b: f64) -> f64 {
-    use statrs::distribution::{ContinuousCDF, Normal};
-    let n = Normal::new(0.0, 1.0).unwrap();
-    // For both-positive intervals, work with the upper-tail complement so the
-    // reference itself does not lose precision: Φ(b) − Φ(a) = sf(a) − sf(b).
-    let diff = if a >= 0.0 {
-        n.sf(a) - n.sf(b)
+    let inv_sqrt2 = 1.0 / std::f64::consts::SQRT_2;
+    let za = a * inv_sqrt2;
+    let zb = b * inv_sqrt2;
+    let erf_diff = if za >= 0.0 {
+        libm::erfc(za) - libm::erfc(zb)
+    } else if zb <= 0.0 {
+        libm::erfc(-zb) - libm::erfc(-za)
+    } else if zb <= 0.5 && -za <= 0.5 {
+        libm::erf(zb) + libm::erf(-za)
     } else {
-        n.cdf(b) - n.cdf(a)
+        2.0 - libm::erfc(zb) - libm::erfc(-za)
     };
-    (2.0 * std::f64::consts::PI).sqrt() * diff
+    (std::f64::consts::PI / 2.0).sqrt() * erf_diff
 }
 
 #[test]
@@ -135,5 +137,22 @@ fn t0_handles_straddling_and_infinite_endpoints() {
     assert!(
         (lower - upper).abs() / upper < 1e-12,
         "T_0([-inf,-10]) = {lower:.10e} must equal T_0([10,inf]) = {upper:.10e} by symmetry"
+    );
+}
+
+#[test]
+fn t0_handles_tiny_interval_straddling_affine_anchor() {
+    // A straddling interval may be much narrower than machine epsilon around
+    // the O(1) erfc terms. Computing it as `2 - erfc(b) - erfc(-a)` rounds both
+    // erfc terms to 1 and loses the cell mass entirely; the anchor-centered
+    // `erf(b) + erf(-a)` form keeps the small positive integral.
+    let eps = 1.0e-300;
+    let got = affine_anchor_moment_vector(0.0, 0.0, -eps, eps, 2)[0];
+    let reference = 2.0 * eps;
+    let rel = (got - reference).abs() / reference;
+    assert!(
+        got > 0.0 && rel < 1e-12,
+        "T_0([-{eps:e},{eps:e}]) = {got:.10e} vs local reference {reference:.10e}; \
+         tiny anchor-straddling cells must not cancel to zero"
     );
 }

@@ -3481,11 +3481,10 @@ pub(crate) fn sae_direct_inner_solve_engages_device_and_matches_cpu_1551() {
     // Parity (holds on every host): the produced Newton step must match the dense
     // joint-system reference. On a GPU host this is the device==CPU parity gate;
     // on a CPU host it pins the matrix-free reduced solve to the dense oracle.
-    let reference =
-        crate::gpu_kernels::arrow_schur::solve_arrow_newton_step_dense_reference(
-            &sys, ridge_t, ridge_beta,
-        )
-        .expect("dense reference solve");
+    let reference = crate::gpu_kernels::arrow_schur::solve_arrow_newton_step_dense_reference(
+        &sys, ridge_t, ridge_beta,
+    )
+    .expect("dense reference solve");
     let db_scale = reference
         .delta_beta
         .iter()
@@ -3493,7 +3492,8 @@ pub(crate) fn sae_direct_inner_solve_engages_device_and_matches_cpu_1551() {
         .max(1.0);
     let mut max_db_rel = 0.0_f64;
     for a in 0..sys.k {
-        max_db_rel = max_db_rel.max((artifacts.delta_beta[a] - reference.delta_beta[a]).abs() / db_scale);
+        max_db_rel =
+            max_db_rel.max((artifacts.delta_beta[a] - reference.delta_beta[a]).abs() / db_scale);
     }
     assert!(
         max_db_rel <= 1e-7,
@@ -3639,8 +3639,8 @@ pub(crate) fn device_arrow_and_host_procedural_matvec_flags_are_mutually_exclusi
         ArrowSolveOptions::direct(),
     ] {
         let mode = options.mode;
-        let (_dt, _db, diag) = solve_arrow_newton_step_core(&sys, ridge_t, ridge_beta, &options)
-            .expect("core solve");
+        let (_dt, _db, diag) =
+            solve_arrow_newton_step_core(&sys, ridge_t, ridge_beta, &options).expect("core solve");
         assert!(
             !(diag.used_device_arrow && diag.injected_host_procedural_matvec),
             "#1209: used_device_arrow and injected_host_procedural_matvec are mutually \
@@ -4665,6 +4665,18 @@ pub(crate) fn build_dense_schur_direct_refuses_oversize_border_1017() {
         }
         other => panic!("expected SchurFactorFailed for oversize border, got {other:?}"),
     }
+
+    let err = build_dense_schur_sqrt_ba(&sys, &htt_factors, 1e-6, &backend)
+        .expect_err("oversize square-root BA border must be refused, not allocated");
+    match err {
+        ArrowSchurError::SchurFactorFailed { reason } => {
+            assert!(
+                reason.contains("host budget") && reason.contains("matrix-free"),
+                "sqrt-BA refusal must be actionable (border-too-large, matrix-free-only): {reason}"
+            );
+        }
+        other => panic!("expected SchurFactorFailed for oversize sqrt-BA border, got {other:?}"),
+    }
 }
 
 /// The parallel disjoint-range prefix fan-out in `CompositePenaltyOp::matvec`
@@ -4681,12 +4693,17 @@ fn composite_penalty_parallel_prefix_matches_serial_bit_exact() {
     let p = 32usize; // identity-right width
     let block = p_a * p; // 128
     let k = n_atoms * block; // 1024 ≥ SCHUR_PROLOGUE_PARALLEL_K_MIN (512)
-    assert!(k >= SCHUR_PROLOGUE_PARALLEL_K_MIN, "must trip the parallel prefix");
+    assert!(
+        k >= SCHUR_PROLOGUE_PARALLEL_K_MIN,
+        "must trip the parallel prefix"
+    );
 
     // Deterministic pseudo-random SPD-ish left factors and input.
     let mut state = 0x1234_5678u64;
     let mut next = || {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((state >> 11) as f64) / ((1u64 << 53) as f64) * 2.0 - 1.0
     };
 
@@ -4768,7 +4785,8 @@ fn slq_reduced_schur_log_det_matches_dense_evidence() {
     let exact_logdet: f64 = (0..k).map(|i| 2.0 * l[[i, i]].ln()).sum();
 
     // Matrix-free SLQ estimate — never forms S.
-    let slq = slq_reduced_schur_log_det(&sys, &htt_factors, ridge_beta, &backend, None, 48, 60, seed);
+    let slq =
+        slq_reduced_schur_log_det(&sys, &htt_factors, ridge_beta, &backend, None, 48, 60, seed);
     let rel = (slq.estimate - exact_logdet).abs() / exact_logdet.abs();
     eprintln!(
         "matrix-free reduced-Schur log|S|: slq={:.6} exact={:.6} rel={:.3e} std_err={:.3e}",

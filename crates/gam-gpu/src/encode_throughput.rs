@@ -288,18 +288,17 @@ pub const DEPLOYMENT_TARGET_ROWS_PER_SEC: f64 = GPU_THROUGHPUT_TARGET_ROWS_PER_S
 // `crates/gam-gpu/tests/encode_full_path_throughput.rs` (a dev-dependency cycle
 // onto `gam-sae`, allowed by cargo for test-only edges).
 //
-// HONEST DEVICE STATUS. There is currently NO device-resident exact-encode
-// kernel: the production `certified_encode_*` path is per-row host ndarray work
-// (the only SAE GPU kernel, `gam_sae::gpu_kernels::sae_rowjet`, accelerates the
-// *fitting* reconstruction-jet tower, not the encode). So the
-// [`FullEncodeThroughput::device_encode_engaged`] flag is `false` even on a GPU
-// host until such a kernel exists. This benchmark therefore does NOT yet
-// substantiate a device "batched exact per-row GPU encode" number — by design,
-// it refuses to fabricate one (the same fail-loud, never-false-route discipline
-// as the component benchmark). What it DOES establish is the real end-to-end
-// encode throughput (CPU today) and a correctness contract — support agreement,
-// coordinate error, reconstruction explained-variance, and fallback rate
-// against the production CPU encode — that any future device encode must match.
+// HONEST DEVICE STATUS. This helper is still backend-agnostic instrumentation:
+// callers must set `device_encode_engaged` to `true` only when their encode was
+// produced by a real device-resident exact-encode kernel. The current SAE device
+// driver that can make that assertion lives in
+// `gam_sae::gpu_kernels::sae_encode_resident::measure_device_encode_throughput`;
+// older host-only full-path harnesses pass `false`. This benchmark therefore
+// never fabricates a device "batched exact per-row GPU encode" number from a
+// host encode — it reports the full-path timing and a correctness contract
+// (support agreement, coordinate error, reconstruction explained-variance, and
+// fallback rate), while the caller-owned engagement flag decides whether the
+// #988 deployment/surrogate gate may consume the rate as a device measurement.
 // ===========================================================================
 
 /// End-to-end throughput of the FULL exact per-row encode for one batch.

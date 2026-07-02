@@ -601,6 +601,17 @@ pub(crate) fn update_custom_outer_inner_cap_from_warm_start(
         }
     }
 
+    // Keep the adaptive cap as a performance budget, not a mathematical
+    // admissibility constraint.  Some valid smooth/nonlinear custom-family
+    // profiles (notably negative-binomial dispersion location-scale) need a
+    // few dozen polishing cycles at nearby trial rho values even after a
+    // warm-started evaluation converged quickly.  Capping the next derivative
+    // evaluation at `last_cycles + 5` can then reject an otherwise valid rho
+    // point before the KKT certificate has a chance to fire, causing the outer
+    // optimizer to exhaust fallbacks on a spurious "inner solve did not
+    // converge".  Preserve the adaptive shrink for easy regions, but never
+    // drive the ordinary outer-evaluation budget below a small polishing floor.
+    let cap_floor = full_budget.min(64);
     let next_cap = if cached_inner.converged {
         cached_inner
             .cycles
@@ -612,6 +623,6 @@ pub(crate) fn update_custom_outer_inner_cap_from_warm_start(
                 .saturating_add(CUSTOM_OUTER_INNER_CAP_MARGIN),
         )
     }
-    .clamp(1, full_budget);
+    .clamp(cap_floor, full_budget);
     outer_cap.store(next_cap, Ordering::Relaxed);
 }

@@ -2176,8 +2176,21 @@ pub fn fit_residual_cascade(
     sobolev_s: f64,
 ) -> Result<ResidualCascadeFit, String> {
     let mut levels = INITIAL_LEVELS;
+    let mut capped_fit: Option<ResidualCascadeFit> = None;
     loop {
-        let design = ResidualCascadeDesign::build(xs, y, w, metric, sobolev_s, levels)?;
+        let design = match ResidualCascadeDesign::build(xs, y, w, metric, sobolev_s, levels) {
+            Ok(design) => design,
+            Err(err)
+                if levels > INITIAL_LEVELS
+                    && err.contains(&format!("center cap {MAX_CENTERS} exceeded")) =>
+            {
+                if let Some(fit) = capped_fit {
+                    return Ok(fit);
+                }
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+        };
         // Quasi-uniformity guard (issue #1032, caveat 2): if the metric has
         // collapsed the cloud onto a near-degenerate sheet in scaled
         // coordinates, the BPX iteration bound no longer holds. Refuse the
@@ -2225,7 +2238,15 @@ pub fn fit_residual_cascade(
                 });
                 return Ok(fit);
             }
-            Some(_) => {
+            Some(bound) => {
+                capped_fit = Some({
+                    fit.refinement = Some(RefinementCertificate {
+                        next_level_gain_bound: bound,
+                        tolerance,
+                        exhausted: true,
+                    });
+                    fit
+                });
                 levels += 1;
             }
         }
