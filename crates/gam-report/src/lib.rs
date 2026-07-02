@@ -29,6 +29,10 @@ pub struct ReportInput {
     /// Plain data so report.rs stays free of gam library types; main.rs maps
     /// the fit's `CriterionCertificate` into this row.
     pub criterion_certificate: Option<CriterionCertificateRow>,
+    /// Optional smoothing-forensics rows (#1892). These are diagnostic-only
+    /// snapshots aligned to fitted terms/blocks and expose the quantities that
+    /// distinguish over-smoothing mechanisms without changing any fit math.
+    pub smoothing_forensics: Vec<SmoothingForensicsRow>,
     pub edf_total: f64,
     pub r_squared: Option<f64>,
     pub coefficients: Vec<CoefficientRow>,
@@ -46,6 +50,24 @@ pub struct EdfBlockRow {
     pub index: usize,
     pub edf: f64,
     pub role: Option<String>,
+}
+
+/// One row of the on-demand smoothing-forensics report (#1892).
+///
+/// All fields are plain renderer data. Paths are recorded as the sequence the
+/// fitting layer can prove it used; saved models often only retain the final
+/// value, in which case the path is a one-element vector rather than an
+/// invented history. EDF is split into the value consumed by the model/report
+/// criterion and the assembly/influence side when both channels are available.
+pub struct SmoothingForensicsRow {
+    pub term: String,
+    pub lambda_path: Vec<f64>,
+    pub sigma2_path: Vec<f64>,
+    pub edf_criterion: Option<f64>,
+    pub edf_assembly: Option<f64>,
+    pub double_penalty_range: Option<f64>,
+    pub double_penalty_null_space: Option<f64>,
+    pub seed_screening: Vec<String>,
 }
 
 /// First-order optimality certificate row (#934): the fit's self-audit of its
@@ -642,6 +664,61 @@ pub fn render_html(input: &ReportInput) -> Result<String, String> {
         )
     };
 
+    // Smoothing forensics (#1892): compact, numeric rows used to distinguish
+    // dispersion→λ feedback, criterion/assembly EDF drift, double-penalty
+    // null-space shrinkage, and seed-screening failures. Empty means the saved
+    // fit did not retain enough diagnostic state; non-empty rows are rendered
+    // verbatim without re-deriving fit quantities in the renderer.
+    let smoothing_forensics_section = if input.smoothing_forensics.is_empty() {
+        String::new()
+    } else {
+        let fmt_path = |values: &[f64]| {
+            if values.is_empty() {
+                "—".to_string()
+            } else {
+                values
+                    .iter()
+                    .map(|value| fmt_num(*value))
+                    .collect::<Vec<_>>()
+                    .join(" → ")
+            }
+        };
+        let fmt_opt = |value: Option<f64>| value.map(fmt_num).unwrap_or_else(|| "—".to_string());
+        let rows = input
+            .smoothing_forensics
+            .iter()
+            .map(|row| {
+                let seeds = if row.seed_screening.is_empty() {
+                    "—".to_string()
+                } else {
+                    esc(&row.seed_screening.join("; "))
+                };
+                format!(
+                    "<tr><td>{}</td><td class=\"mono\">{}</td><td class=\"mono\">{}</td>\
+                     <td class=\"num\">{}</td><td class=\"num\">{}</td>\
+                     <td class=\"num\">{}</td><td class=\"num\">{}</td><td>{}</td></tr>",
+                    esc(&row.term),
+                    esc(&fmt_path(&row.lambda_path)),
+                    esc(&fmt_path(&row.sigma2_path)),
+                    fmt_opt(row.edf_criterion),
+                    fmt_opt(row.edf_assembly),
+                    fmt_opt(row.double_penalty_range),
+                    fmt_opt(row.double_penalty_null_space),
+                    seeds,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "<section class=\"card\" id=\"sec-smoothing-forensics\">\n\
+             <h2>Smoothing Forensics</h2>\n\
+             <p class=\"muted\">Diagnostic-only state for over-smoothing investigations: λ and σ² paths, criterion-vs-assembly EDF, double-penalty split, and seed-screening verdicts.</p>\n\
+             <div class=\"table-wrap\"><table>\n\
+             <thead><tr><th>Term</th><th>λ path</th><th>σ² path</th><th>EDF criterion</th><th>EDF assembly</th><th>Range penalty</th><th>Null-space penalty</th><th>Seed screening</th></tr></thead>\n\
+             <tbody>{rows}</tbody>\n</table></div>\n</section>"
+        )
+    };
+
     // Diagnostics plots grid
     let diagnostics_section = if input.diagnostics.is_some() {
         let has_cal = input
@@ -741,6 +818,9 @@ pub fn render_html(input: &ReportInput) -> Result<String, String> {
     }
     if !input.measure_jet_spectra.is_empty() {
         nav_items.push(("sec-mjet-spectrum", "Measure-Jet"));
+    }
+    if !input.smoothing_forensics.is_empty() {
+        nav_items.push(("sec-smoothing-forensics", "Forensics"));
     }
     if input.diagnostics.is_some() {
         nav_items.push(("sec-diagnostics", "Diagnostics"));
@@ -911,6 +991,7 @@ details[open] .toggle::before {{ content:'\25BC\FE0E  '; }}
 {continuous_section}
 {aniso_section}
 {measure_jet_section}
+{smoothing_forensics_section}
 {diagnostics_section}
 {smooth_section}
 {alo_section}
@@ -933,6 +1014,7 @@ details[open] .toggle::before {{ content:'\25BC\FE0E  '; }}
         continuous_section = continuous_section,
         aniso_section = aniso_section,
         measure_jet_section = measure_jet_section,
+        smoothing_forensics_section = smoothing_forensics_section,
         diagnostics_section = diagnostics_section,
         smooth_section = smooth_section,
         alo_section = alo_section,
@@ -1013,10 +1095,7 @@ mod tests {
 
     #[test]
     fn esc_all_entities() {
-        assert_eq!(
-            esc("a&b<c>d\"e'f"),
-            "a&amp;b&lt;c&gt;d&quot;e&#39;f"
-        );
+        assert_eq!(esc("a&b<c>d\"e'f"), "a&amp;b&lt;c&gt;d&quot;e&#39;f");
     }
 
     // ── js_escape ─────────────────────────────────────────────────────────────
@@ -1129,6 +1208,7 @@ mod tests {
             converged: true,
             outer_gradient_norm: None,
             criterion_certificate: None,
+            smoothing_forensics: vec![],
             edf_total: 3.2,
             r_squared: Some(0.85),
             coefficients: vec![CoefficientRow {
@@ -1176,7 +1256,10 @@ mod tests {
             html.contains("&lt;bad&gt;"),
             "HTML special chars in formula must be escaped"
         );
-        assert!(!html.contains("<bad>"), "raw unescaped <bad> must not appear");
+        assert!(
+            !html.contains("<bad>"),
+            "raw unescaped <bad> must not appear"
+        );
     }
 
     #[test]
@@ -1192,6 +1275,25 @@ mod tests {
             html.contains("&lt;script&gt;"),
             "script tag must be HTML-escaped"
         );
+    }
+
+    #[test]
+    fn render_html_includes_smoothing_forensics_when_present() {
+        let mut input = minimal_input("y ~ s(x)");
+        input.smoothing_forensics = vec![SmoothingForensicsRow {
+            term: "s(x)".to_string(),
+            lambda_path: vec![0.1, 0.2],
+            sigma2_path: vec![1.5],
+            edf_criterion: Some(3.0),
+            edf_assembly: Some(3.1),
+            double_penalty_range: Some(2.0),
+            double_penalty_null_space: Some(1.0),
+            seed_screening: vec!["accepted".to_string()],
+        }];
+        let html = render_html(&input).unwrap();
+        assert!(html.contains("Smoothing Forensics"));
+        assert!(html.contains("0.1000 → 0.2000"));
+        assert!(html.contains("accepted"));
     }
 
     #[test]
