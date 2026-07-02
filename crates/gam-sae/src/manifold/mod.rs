@@ -174,6 +174,9 @@ mod tests_startup_validation_1782;
 mod tests_schur_seed_refusal_1782;
 
 #[cfg(test)]
+mod tests_streaming_materialize_chunk_1801;
+
+#[cfg(test)]
 mod tests_unit_speed_inloop_2022;
 
 #[cfg(test)]
