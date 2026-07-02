@@ -1,4 +1,84 @@
-## v0.3.143 — gam 0.3.143 / gamfit 0.1.245 (2026-07-02)
+## v0.3.144 — gam 0.3.144 / gamfit 0.1.246 (2026-07-02)
+
+Correctness release on top of 0.3.143. Two new user-facing capabilities land on
+the formula/CLI surface — the Tweedie variance power is now settable and the
+`loglog`/`cauchit` survival links are wired end-to-end — alongside a batch of
+prediction/diagnostics fixes (Gaussian location-scale σ scale double-count, a
+`gam diagnose` failure on every standard fit, and generative replicate noise
+that ignored prior weights). This cut also repairs a release-blocking cubic-cell
+regression that landed after 0.3.143: a well-meaning affine-anchor "normalization"
+turned five previously-green deep-tail/both-tails precision guards red, and is
+reverted here to the raw substrate convention the whole kernel (and the CPU/GPU
+parity reference) actually uses.
+
+### Families & responses
+- **Tweedie variance power on the formula path (#2026).** `family="tweedie(1.6)"`
+  / `tweedie(p=1.6)` now parse the mgcv-style parenthesized argument as the
+  variance power `p` (`Var = φ·μ^p`) and validate it through the shared
+  strict-`(1, 2)` gate, instead of misrouting `1.6` to the link resolver and
+  failing with `unknown link '1.6'`. A non-numeric argument (`tweedie(log)`)
+  still flows to the link resolver; bare `tweedie`/`tw` keep the neutral interior
+  default `p = 1.5`.
+- **Survival `--link loglog` / `--link cauchit` (#1829).** Both links are now
+  accepted and evaluate exactly, routed through a single-component mixture
+  (weight 1.0, no free mixing logits) so they flow end-to-end through the wired
+  `InverseLink::Mixture` survival path; the survival `--link` usage string
+  advertises them. Genuine multi-component blends still require a
+  logit/probit/cloglog anchor.
+- **Weighted Gaussian replicate noise (#2025).** `Model.sample_replicates` now
+  scales each row's Gaussian observation noise by its analytic prior weight
+  (`σ_i = σ̂/√w_i`, `Var(y_i) = σ²/w_i`) instead of a single pooled scalar.
+  Unit/absent weights leave unweighted fits unchanged.
+
+### Inference, prediction & diagnostics
+- **Gaussian location-scale predict σ no longer double-counts `response_scale`
+  (#1874, #1928).** The persisted log-σ intercept is already shifted by
+  `+ln(response_scale)` at fit time, so only the soft floor (which sits outside
+  the `exp`) is scaled at predict time — exactly one factor of `response_scale`
+  on the σ surface, restoring response-scale equivariance whenever
+  `sample_std(y) ≠ 1`.
+- **`gam diagnose` fixed on every standard fit (#2030).** Batch compaction no
+  longer zeroes the row-sized `working_weights`/`working_response` on the
+  persisted geometry carrier, so the geometry-ALO path stops handing empty
+  vectors to `AloInput::from_geometry` and failing length-N validation; a
+  present-but-emptied carrier now falls through to the refit branch, and the
+  saved weight column is loaded into the diagnose frame.
+- **Distinct penalty coordinates for grouped + double-penalty + block-gamma
+  priors (#1881).** Combining coefficient groups, per-term double penalties, and
+  keyed block-gamma priors now keeps each as its own λ instead of collapsing the
+  per-term base/double coordinates into one shared linear ridge.
+
+### Smooths & kernels
+- **Cubic-cell affine-anchor moments kept in the raw substrate convention
+  (#1833).** Reverts the post-0.3.143 normalization of the public
+  `affine_anchor_moment_vector` (dividing by `√(2π)`), which broke the #352
+  both-tails and deep-tail precision guards (relative error `1 − 1/√(2π)`) and
+  diverged the public API from every production consumer and the byte-for-byte
+  CPU/GPU parity reference. The mis-specified identity test is corrected to the
+  raw standard-normal moments (`M0 = M2 = √(2π)`, `M1 = M3 = 0`).
+- **Duchon affine-trend native ridge is curvature-relative (#880).** The
+  machine-scale ridge on the affine slope columns is now scaled by the curvature
+  block's mean diagonal (genuinely `√ε`-relative, as documented) rather than an
+  absolute floor that survived Frobenius normalization and pushed the affine
+  trend out of the null space on low-magnitude curvature grids.
+
+### SAE manifold (experimental, all default-off)
+- Two-tier fit primitives (tier merge / atom reorder), the scale-gauge quotient
+  with no-refresh amplitude-absorb transport-peel, data-row dead-atom reseed, and
+  the Λ nursery→promotion birth channel are promoted from hidden `GAM_SAE_*` env
+  levers to typed, default-`false` kwargs (`promote_from_residual`,
+  `quotient_scale`, `data_row_reseed`), threaded through the pyffi entry points
+  including the IBP convenience delegator (#2021, #2022, #2023). The historical
+  default path stays bit-for-bit unchanged.
+
+### REML / ALO internals
+- FD gates added for the Firth and Barrier first-order `D_βH` curvature
+  operators; the ALO sandwich-SE meat weight is taken from the score/Fisher
+  weight `w_s` rather than the observed-information weight `w_h`, with a
+  defense-in-depth reject of non-positive `snr_proxy` in the SAE global-optimality
+  verdict.
+
+
 
 Broad correctness, inference-accuracy, and performance release on top of
 0.3.142. The headline changes: grouped-**binomial proportion responses** are
