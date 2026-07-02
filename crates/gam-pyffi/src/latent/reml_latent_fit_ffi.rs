@@ -4099,7 +4099,11 @@ fn model_deployment_extensions(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult
 #[pyfunction]
 fn model_evidence(model_bytes: Vec<u8>) -> PyResult<f64> {
     let payload = summary_payload_from_model_bytes(&model_bytes)?;
-    comparable_reml_score_from_summary_payload(&payload)
+    // Report the SAME Occam-penalised conditional-AIC ranking score that
+    // `gamfit.compare_models` ranks on (`-2·loglik + 2·edf`), not the raw
+    // REML/LAML evidence headline, so `Model.evidence` ordering agrees with the
+    // winner `compare_models` declares. Lower is still better (issue #2079).
+    ranking_score_from_summary_payload(&payload)
 }
 
 fn summary_payload_value_from_model_bytes(model_bytes: &[u8]) -> Result<serde_json::Value, String> {

@@ -1250,13 +1250,19 @@ fn load_model(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<()> {
 fn bayes_factor_log_diff(model_a_bytes: Vec<u8>, model_b_bytes: Vec<u8>) -> PyResult<f64> {
     let payload_a = summary_payload_from_model_bytes(&model_a_bytes)?;
     let payload_b = summary_payload_from_model_bytes(&model_b_bytes)?;
-    let score_a = comparable_reml_score_from_summary_payload(&payload_a)?;
-    let score_b = comparable_reml_score_from_summary_payload(&payload_b)?;
-    // `reml_score` is a minimised cost (lower = better marginal likelihood),
-    // so the log Bayes factor of A over B is `score_b - score_a`, not
-    // `score_a - score_b`. Route through the shared convention so this agrees
-    // with `compare_reml_fits` (issue #575: the raw subtraction was inverted,
-    // reporting overwhelming evidence for the worse-fitting model).
+    // Rank on the SAME Occam-penalised conditional AIC that `compare_models`
+    // uses (`-2·loglik + 2·edf`, `ranking_score_from_summary_payload`), not the
+    // raw REML/LAML evidence headline. The raw headline fails to penalise a
+    // pure-noise smooth, so `bayes_factor_vs` used to declare the augmented
+    // model better supported even though `compare_models` correctly picked the
+    // smaller one — the two contradicted each other (issue #2079).
+    let score_a = ranking_score_from_summary_payload(&payload_a)?;
+    let score_b = ranking_score_from_summary_payload(&payload_b)?;
+    // The ranking score is a minimised cost (lower = better), so the log Bayes
+    // factor of A over B is `score_b - score_a`, not `score_a - score_b`. Route
+    // through the shared convention so this agrees with `compare_reml_fits`
+    // (issue #575: the raw subtraction was inverted, reporting overwhelming
+    // evidence for the worse-fitting model).
     Ok(log_bayes_factor(score_a, score_b))
 }
 
@@ -3827,6 +3833,32 @@ fn comparable_reml_score(
         1,
         gam::solver::evidence::TopologyScoreScale::PerObservation,
     )
+}
+
+/// Occam-penalised conditional-AIC ranking score for a saved-model summary
+/// payload, matching `gam::solver::evidence::RemlCandidate::ranking_score`
+/// exactly (`-2·loglik + 2·edf`) so `Model.evidence` and `Model.bayes_factor_vs`
+/// pick the SAME winner as `gamfit.compare_models` (issue #2079).
+///
+/// `compare_models` ranks on this conditional AIC (which prices the effective
+/// degrees of freedom a pure-noise smooth spends, penalising it correctly),
+/// while `evidence` / `bayes_factor_vs` previously used the raw REML/LAML
+/// evidence headline (`comparable_reml_score_from_summary_payload`) — the two
+/// picked OPPOSITE winners when a model was augmented with a near-null smooth.
+/// Routing both through this helper removes that cross-method contradiction.
+///
+/// Falls back to the raw comparable REML/LAML score when the payload predates
+/// the log-likelihood / edf fields (both must be present and finite), matching
+/// the `ranking_score` fallback in `evidence.rs`.
+fn ranking_score_from_summary_payload(payload: &serde_json::Value) -> PyResult<f64> {
+    let log_lik = json_lookup_f64(payload, LOG_LIK_KEYS);
+    let edf = json_lookup_edf(payload, EDF_KEYS);
+    if let (Some(log_lik), Some(edf)) = (log_lik, edf) {
+        if log_lik.is_finite() && edf.is_finite() {
+            return Ok(-2.0 * log_lik + 2.0 * edf);
+        }
+    }
+    comparable_reml_score_from_summary_payload(payload)
 }
 
 fn comparable_reml_score_from_summary_payload(payload: &serde_json::Value) -> PyResult<f64> {

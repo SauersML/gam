@@ -32,6 +32,18 @@ This is a sibling of #575 (which fixed only the *direction* of
 not stress the normalizer). The fix is direction-agnostic: route all three
 entry points through the same score. These assertions only require *consistency*
 between the paths, so they pass whichever score the maintainer settles on.
+
+Update (#2079): the maintainer settled ``Model.evidence`` and
+``Model.bayes_factor_vs`` on the Occam-penalised conditional-AIC *ranking* score
+(``-2*loglik + 2*edf``) that ``compare_models`` ranks its ``winner`` on — so
+that the two per-model APIs can no longer contradict the declared winner when a
+model is augmented with a pure-noise smooth. That ranking score is exposed by
+``compare_models`` through the ``ranking`` list (its ``delta`` / Bayes-factor
+columns), NOT through the raw ``score_table['reml_score']`` headline (which,
+along with ``Summary.reml_score``, still reports the un-penalised REML/LAML
+evidence). The consistency assertions below therefore compare ``evidence`` /
+``bayes_factor_vs`` against the ``ranking`` columns; the raw ``score_table`` /
+``Summary.reml_score`` path is checked separately for its own self-consistency.
 """
 from __future__ import annotations
 
@@ -72,8 +84,10 @@ def test_compare_models_precondition_null_dims_differ() -> None:
 
 
 def test_compare_models_score_matches_model_own_score() -> None:
-    # The reml_score that compare_models reports for a model must equal the
-    # model's own reported score (Summary.reml_score == Model.evidence).
+    # The raw ``reml_score`` that compare_models reports for a model must equal
+    # the model's own reported raw score (score_table['reml_score'] ==
+    # Summary.reml_score) -- the un-penalised REML/LAML evidence headline path
+    # must stay self-consistent regardless of the normalizer.
     m_smooth, m_poly = _fit_pair()
     comparison = gamfit.compare_models([m_smooth, m_poly], names=["smooth", "poly"])
     compare_score = {row["name"]: row["reml_score"] for row in comparison["score_table"]}
@@ -81,11 +95,10 @@ def test_compare_models_score_matches_model_own_score() -> None:
     # The null_dim == 0 model is the control: its normalizer is zero, so the two
     # paths already agree here. This anchors that we are comparing like with like.
     assert compare_score["poly"] == pytest.approx(m_poly.summary().reml_score, rel=1e-9)
-    assert compare_score["poly"] == pytest.approx(m_poly.evidence, rel=1e-9)
 
     # The real assertion: the penalized smooth (null_dim >= 1) must also report
-    # the same score in both places. Pre-fix, compare_models adds the
-    # Tierney-Kadane normalizer (~1.9 nats) that evidence/summary omit.
+    # the same raw score in both places. Pre-fix, compare_models added the
+    # Tierney-Kadane normalizer (~1.9 nats) that Summary omitted.
     assert compare_score["smooth"] == pytest.approx(
         m_smooth.summary().reml_score, rel=1e-9
     ), (
@@ -94,20 +107,37 @@ def test_compare_models_score_matches_model_own_score() -> None:
         f"reml_score {m_smooth.summary().reml_score!r} (TK normalizer applied "
         "in only one path)"
     )
-    assert compare_score["smooth"] == pytest.approx(m_smooth.evidence, rel=1e-9)
+
+    # #2079: Model.evidence reports the conditional-AIC RANKING score, which
+    # compare_models exposes as the ``ranking`` ``delta`` (each model's ranking
+    # score minus the winner's). So evidence differences must reproduce the
+    # ranking deltas exactly -- the two are on one score.
+    ranking = {row[0]: row for row in comparison["ranking"]}
+    winner = comparison["winner"]
+    winner_evidence = {"smooth": m_smooth.evidence, "poly": m_poly.evidence}[winner]
+    for name, model in (("smooth", m_smooth), ("poly", m_poly)):
+        ranking_delta = ranking[name][2]
+        assert ranking_delta == pytest.approx(
+            model.evidence - winner_evidence, rel=1e-9, abs=1e-9
+        ), (
+            f"compare_models ranking delta {ranking_delta!r} for {name!r} "
+            f"disagrees with Model.evidence gap {model.evidence - winner_evidence!r}"
+        )
 
 
 def test_bayes_factor_vs_agrees_with_compare_models_magnitude() -> None:
     # User-facing consequence: the log Bayes factor between two fits must be the
     # same whether read from bayes_factor_vs or implied by the compare_models
-    # score deltas. Both purport to be log p(D|model_a) - log p(D|model_b).
+    # ranking deltas. Both are on the conditional-AIC ranking score (#2079).
     m_smooth, m_poly = _fit_pair()
     comparison = gamfit.compare_models([m_smooth, m_poly], names=["smooth", "poly"])
-    compare_score = {row["name"]: row["reml_score"] for row in comparison["score_table"]}
+    ranking = {row[0]: row for row in comparison["ranking"]}
 
-    # reml_score is a minimized cost (lower = better), so the log Bayes factor
-    # of poly over smooth implied by compare_models is (smooth_score - poly_score).
-    log_bf_poly_over_smooth_compare = compare_score["smooth"] - compare_score["poly"]
+    # The ranking ``delta`` is each model's ranking score minus the winner's, so
+    # the log Bayes factor of poly over smooth implied by compare_models is
+    # (delta_smooth - delta_poly) -- the winner term cancels. bayes_factor_vs is
+    # a minimized cost (lower = better), matching that direction.
+    log_bf_poly_over_smooth_compare = ranking["smooth"][2] - ranking["poly"][2]
     log_bf_poly_over_smooth_pairwise = math.log(m_poly.bayes_factor_vs(m_smooth))
 
     assert log_bf_poly_over_smooth_pairwise == pytest.approx(
