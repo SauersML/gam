@@ -223,8 +223,9 @@ fn bug_cell_moment_scratch_resize_corrupts_existing_entries() {
             "Expected scratch resize reuse to preserve earlier written values exactly after changing output length; mismatch at index {i}"
         );
     }
-    assert!(
-        (snap[0] - fresh.moments[0]).abs() < 0.0,
+    assert_eq!(
+        snap[0].to_bits(),
+        fresh.moments[0].to_bits(),
         "Expected scratch-backed moment storage to remain untouched after a second call with a different requested length"
     );
 }
