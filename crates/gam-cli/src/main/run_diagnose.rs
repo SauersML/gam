@@ -96,6 +96,14 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     let alo = if let Some((unified, geom)) = model
         .unified()
         .and_then(|u| u.geometry.as_ref().map(|g| (u, g)))
+        // Treat a present-but-emptied geometry carrier as "geometry
+        // unavailable" and fall through to the refit branch. Batch-compacted
+        // models (see `compact_fit_result_for_batch`) used to zero these
+        // row-sized working vectors; `AloInput::from_geometry` then failed its
+        // length-N validation instead of ever reaching the refit fallback
+        // (#2030). This guard keeps diagnose working even for such saved
+        // models produced before the compaction fix.
+        .filter(|(_, geom)| !geom.working_weights.is_empty() && !geom.working_response.is_empty())
     {
         let fit_saved = fit_result_from_saved_model_for_prediction(&model)?;
         // ALO's geometry constructor expects the *full* linear predictor (offset
