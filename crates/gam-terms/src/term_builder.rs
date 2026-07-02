@@ -25,10 +25,10 @@ use crate::inference::formula_dsl::{
     option_usize_any, option_usize_any_strict, option_usize_strict, strip_quotes,
 };
 use crate::smooth::{
-    ByVarKind, FactorSmoothFlavour, FactorSmoothSpec, LinearCoefficientGeometry, LinearTermSpec,
-    RandomEffectTermSpec, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec,
-    TensorBSplineIdentifiability, TensorBSplinePenaltyDecomposition, TensorBSplineSpec,
-    TermCollectionSpec,
+    BySmoothKind, ByVarKind, ByVariableSpec, FactorSmoothFlavour, FactorSmoothSpec,
+    LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec, ShapeConstraint,
+    SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability,
+    TensorBSplinePenaltyDecomposition, TensorBSplineSpec, TermCollectionSpec,
 };
 use gam_data::{ColumnKindTag, DataError, EncodedDataset as Dataset};
 use gam_problem::types::ColIdx;
@@ -474,6 +474,39 @@ pub fn build_termspec(
                     policy,
                     smooth_coordinate_count,
                 )?;
+                let inner_basis = match inner_basis {
+                    SmoothBasisSpec::FactorSmooth {
+                        spec:
+                            FactorSmoothSpec {
+                                continuous_cols,
+                                group_col,
+                                marginal,
+                                flavour: FactorSmoothFlavour::Sz,
+                                frozen_global_orthogonality,
+                                ..
+                            },
+                    } => {
+                        if continuous_cols.len() != 1 {
+                            return Err(TermBuilderError::incompatible_config(format!(
+                                "sz factor-smooth currently expects exactly one continuous covariate, found {}",
+                                continuous_cols.len()
+                            )));
+                        }
+                        SmoothBasisSpec::FactorSumToZero {
+                            inner: Box::new(SmoothBasisSpec::BSpline1D {
+                                feature_col: continuous_cols[0],
+                                spec: marginal,
+                            }),
+                            by_col: group_col,
+                            levels: encoded_levels_for_column(ds, ColIdx::new(group_col))
+                                .into_iter()
+                                .map(|(bits, _)| bits)
+                                .collect(),
+                            frozen_global_orthogonality,
+                        }
+                    }
+                    other => other,
+                };
                 if let Some(by_name) = by_name {
                     let by_col = resolve_col(col_map, &by_name)?;
                     match ds.column_kinds.get(by_col).copied().ok_or_else(|| {
@@ -528,34 +561,37 @@ pub fn build_termspec(
                                     frozen_levels: None,
                                 });
                             }
-                            // Route to a single BySmooth::Factor term with
-                            // frozen levels pre-populated from the training data.
-                            // Design building later gates each level into its own
-                            // column block (see build_by_smooth_local in term_specs).
-                            let frozen_levels: Vec<u64> =
-                                levels.iter().map(|(bits, _)| *bits).collect();
-                            smooth_terms.push(SmoothTermSpec {
-                                name: label.clone(),
-                                basis: SmoothBasisSpec::BySmooth {
-                                    smooth: Box::new(inner_basis),
-                                    by_kind: ByVarKind::Factor {
-                                        feature_col: by_col,
-                                        ordered: option_bool(options, "ordered").unwrap_or(false),
-                                        frozen_levels: Some(frozen_levels),
+                            // Unordered factor-by smooths are independent
+                            // level-specific smooths. Preserve that
+                            // term-spec structure explicitly so later
+                            // hierarchy/identifiability passes can see the
+                            // per-level ownership rather than a generic
+                            // BySmooth envelope.
+                            for (level_bits, level_label) in levels {
+                                smooth_terms.push(SmoothTermSpec {
+                                    name: format!("{label}:by={by_name}[{level_label}]"),
+                                    basis: SmoothBasisSpec::ByVariable {
+                                        inner: Box::new(inner_basis.clone()),
+                                        by_col,
+                                        kind: BySmoothKind::Level { level_bits },
+                                        by: ByVariableSpec::Level {
+                                            value_bits: level_bits,
+                                            label: level_label,
+                                        },
                                     },
-                                },
-                                shape,
-                                joint_null_rotation: None,
-                            });
+                                    shape: shape.clone(),
+                                    joint_null_rotation: None,
+                                });
+                            }
                         }
                         ColumnKindTag::Binary | ColumnKindTag::Continuous => {
                             smooth_terms.push(SmoothTermSpec {
                                 name: label.clone(),
-                                basis: SmoothBasisSpec::BySmooth {
-                                    smooth: Box::new(inner_basis),
-                                    by_kind: ByVarKind::Numeric {
-                                        feature_col: by_col,
-                                    },
+                                basis: SmoothBasisSpec::ByVariable {
+                                    inner: Box::new(inner_basis),
+                                    by_col,
+                                    kind: BySmoothKind::Numeric,
+                                    by: ByVariableSpec::Numeric,
                                 },
                                 shape,
                                 joint_null_rotation: None,
