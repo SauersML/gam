@@ -4,7 +4,7 @@ use super::hessian_paths::{new_cell_moment_cache_stats, new_cell_moment_lru_cach
 use super::install_flex::validate_spec;
 use super::*;
 use gam_linalg::faer_ndarray::{FaerEigh, fast_ab, fast_atb, fast_xt_diag_x};
-use crate::marginal_slope_orthogonal::INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA;
+use crate::marginal_slope_orthogonal::influence_absorber_log_lambda;
 use faer::Side;
 
 /// Sup-norm of the FITTED marginal linear predictor `η = X·β` at which the
@@ -180,6 +180,19 @@ impl BlockEffectiveJacobian for BmsMarginalJacobian {
     fn n_outputs(&self) -> usize {
         1
     }
+
+    fn locks_raw_width_reduction(&self) -> bool {
+        // The BMS family reads its raw-width internal `marginal_design` and
+        // `validate_exact_block_state_shapes` asserts `beta.len() ==
+        // marginal_design.ncols()`. The block's spec carries the real (non
+        // zero-placeholder) marginal design, so the `#933` gauge-composed
+        // reduction cannot silently absorb a dropped column into the callback —
+        // a reduced β would desynchronise the raw-width layout the family reads.
+        // Keep it at raw width and let the robust Jeffreys curvature regularise
+        // any weak cross-block direction (mirrors the survival marginal-slope
+        // time-wiggle block).
+        true
+    }
 }
 
 /// β-dependent Jacobian for the BMS logslope block.
@@ -288,6 +301,20 @@ impl BlockEffectiveJacobian for BmsLogslopeJacobian {
 
     fn n_outputs(&self) -> usize {
         1
+    }
+
+    fn locks_raw_width_reduction(&self) -> bool {
+        // The BMS family reads its raw-width internal `logslope_design` and
+        // `validate_exact_block_state_shapes` asserts `beta.len() ==
+        // logslope_design.ncols()`. An intercept-only logslope (`logslope_formula
+        // = "1"`) is a constant column perfectly aliased with the marginal
+        // intercept; the effective reduced-reparam leaves a width-1 block at raw
+        // width (a zero-width reduction would delete the score-effect surface), so
+        // the canonicaliser would otherwise column-reduce this block to width 0
+        // and hand the family a length-0 β against a width-1 design. Lock it to
+        // raw width — the robust Jeffreys curvature regularises the weak aliased
+        // direction (mirrors the survival marginal-slope time-wiggle block).
+        true
     }
 }
 
@@ -1986,45 +2013,57 @@ pub fn fit_bernoulli_marginal_slope_terms(
     // Absorbed Stage-1 influence columns (#461, design §3). When the workflow
     // chained a CTN Stage-1 into this marginal-slope fit, `spec.score_influence_
     // jacobian` carries the out-of-fold `J = ∂z/∂θ₁`; the realized leakage
-    // directions `Z_infl = diag(s_f·β̂₀)·J` are residualised against the
-    // marginal span (logslope-aligned component retained) and appended to the
-    // additive marginal-index block as a fixed-ridge absorber, so the joint
-    // penalised solve makes the (α,β) score orthogonal to span(Z_infl) — the
-    // x-dependent realisation of `ψ − Π_η[ψ]`. `None` ⇒ raw z, and the free
-    // score_warp spline below is the x-free-column fallback. β̂₀(x_i) is the
-    // rigid-pilot logslope `baseline.1 + logslope_offset[i]`; s_f = probit_scale.
+    // directions `Z_infl = diag(s_f·β̂₀)·J` are residualised against the fitted
+    // marginal+logslope target span and appended to the additive marginal-index
+    // block as a fixed-ridge absorber, so the joint penalised solve makes the
+    // (α,β) score orthogonal to the remaining nuisance span without letting the
+    // absorber compete for identifiable β(x) signal. `None` ⇒ raw z, and the
+    // free score_warp spline below is the x-free-column fallback. β̂₀(x_i) is
+    // the rigid-pilot logslope `baseline.1 + logslope_offset[i]`; s_f =
+    // probit_scale.
     let influence_columns = if let Some(jac) = spec
         .score_influence_jacobian
         .as_ref()
         .filter(|j| j.ncols() > 0)
     {
-        let marginal_dense_for_proj = marginal_design
-            .design
-            .try_to_dense_arc("bernoulli marginal-slope influence-block marginal projection")?;
-        let marginal_dense = marginal_dense_for_proj.as_ref();
-        if jac.nrows() != marginal_dense.nrows() {
+        let protected_design = DesignMatrix::hstack(vec![
+            marginal_design.design.clone(),
+            logslope_design.design.clone(),
+        ])
+        .map_err(|e| {
+            format!(
+                "bernoulli marginal-slope influence-block protected projection stack failed to concatenate marginal + logslope design: {e}"
+            )
+        })?;
+        let protected_dense_for_proj = protected_design
+            .try_to_dense_arc("bernoulli marginal-slope influence-block protected projection")?;
+        let protected_dense = protected_dense_for_proj.as_ref();
+        if jac.nrows() != protected_dense.nrows() {
             return Err(format!(
-                "influence block: Jacobian has {} rows, marginal design has {}",
+                "influence block: Jacobian has {} rows, protected design has {}",
                 jac.nrows(),
-                marginal_dense.nrows()
+                protected_dense.nrows()
             ));
         }
-        // Z̃ = residualize(diag(s_f·β̂₀)·J) against the marginal span in the
-        // rigid-pilot W-metric, via the SHARED core entry point (single source
-        // of truth across bms + survival; the two families differ ONLY in how
-        // they install the returned Z̃ — bms widens [M | Z̃], survival adds a
-        // dedicated η₁ channel). β̂₀(x_i) = baseline.1 + logslope_offset[i];
-        // s_f = probit_scale; W = the rigid-pilot PIRLS row metric.
+        // Z̃ = residualize(diag(s_f·β̂₀)·J) against the fitted target span in
+        // the rigid-pilot W-metric.  For BMS the absorbed columns are installed
+        // in the same additive predictor as the marginal surface; if we protect
+        // only M, any component of Z_infl aligned with the logslope design G can
+        // be assigned to the fixed-ridge absorber by the joint solve, erasing
+        // genuine β(x) heterogeneity.  Projecting out [M | G] keeps the nuisance
+        // absorber orthogonal to both parametric target surfaces while still
+        // absorbing Stage-1 leakage directions outside that identifiable target
+        // span. β̂₀(x_i) = baseline.1 + logslope_offset[i]; s_f = probit_scale;
+        // W = the rigid-pilot PIRLS row metric.
         let rigid_logslope_at_rows = &spec.logslope_offset + baseline.1;
-        let residualized =
-            crate::marginal_slope_orthogonal::residualized_influence_block(
-                jac,
-                z_train,
-                &rigid_logslope_at_rows,
-                probit_scale,
-                marginal_dense.view(),
-                &cross_block_pilot_w_score_warp,
-            )?;
+        let residualized = crate::marginal_slope_orthogonal::residualized_influence_block(
+            jac,
+            z_train,
+            &rigid_logslope_at_rows,
+            probit_scale,
+            protected_dense.view(),
+            &cross_block_pilot_w_score_warp,
+        )?;
         Some(residualized)
     } else {
         None
@@ -2310,7 +2349,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 baseline.1,
                 p_m,
                 influence_columns.as_ref(),
-                INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA,
+                influence_absorber_log_lambda(spec.z.len()),
             )?,
             build_logslope_blockspec_bms(
                 logslope_design,

@@ -114,7 +114,7 @@ fn human_elapsed(elapsed: Duration) -> String {
     }
 }
 
-/// Default verbosity when the user has set no environment override.
+/// Default verbosity when the user has not requested an explicit level.
 ///
 /// A single ordinary fit (e.g. a 400-row `s(x)` P-spline) emits thousands of
 /// per-iteration `[OUTER ...]` / `[GAM ALO]` `info!`/`warn!` records. Writing
@@ -125,28 +125,8 @@ fn human_elapsed(elapsed: Duration) -> String {
 /// surface, but the routine progress chatter is silent unless explicitly
 /// requested. Power users opt back in by calling [`set_log_level`] (e.g.
 /// `set_log_level("info")`) or [`log::set_max_level`] directly — verbosity is
-/// set through an explicit API, not a process-global env var (`std::env::var`
-/// is banned crate-wide; see [`resolve_log_level`]).
+/// set through an explicit API, not a process-global env var.
 const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::Warn;
-
-/// Resolve the active log level.
-///
-/// Reading verbosity from the environment (`GAM_LOG` / `RUST_LOG`) is NOT
-/// permitted: `std::env::var` is banned crate-wide (build.rs substring scanner,
-/// `feedback_no_env_vars` policy), because process-global env reads are a hidden
-/// input that makes a library call's behavior depend on ambient state the caller
-/// never passed. An override path landed transiently in #1696 and broke the
-/// build; the supported way to change verbosity is the explicit
-/// [`set_log_level`] entry point (or [`log::set_max_level`] directly), not an
-/// env var. The out-of-the-box level stays [`DEFAULT_LOG_LEVEL`] (`Warn`): a
-/// plain library call from Python gets quiet logs and pays no per-record stderr
-/// cost (#1689), while genuine problems still surface.
-fn resolve_log_level() -> LevelFilter {
-    // Reading env vars in non-test src is banned by build.rs (no env-var gates),
-    // so the active level is the compile-time default. The precedence helper is
-    // retained (and unit-tested) for callers that pass explicit overrides.
-    log_level_from_overrides(None, None)
-}
 
 /// Parse one verbosity spelling into a [`LevelFilter`]. Case-insensitive,
 /// surrounding whitespace ignored. Returns `None` for anything unrecognized so
@@ -161,18 +141,6 @@ fn parse_log_level(value: &str) -> Option<LevelFilter> {
         "trace" | "all" => Some(LevelFilter::Trace),
         _ => None,
     }
-}
-
-/// Pure resolution of the active level from up to two explicitly-supplied
-/// override spellings, with the primary source winning over the fallback and an
-/// unset/unrecognized value falling through to [`DEFAULT_LOG_LEVEL`]. Kept pure
-/// (no env, no globals) so the precedence rules are unit-testable and so the
-/// public [`set_log_level`] entry point can hand it caller-provided strings.
-fn log_level_from_overrides(primary: Option<&str>, fallback: Option<&str>) -> LevelFilter {
-    primary
-        .and_then(parse_log_level)
-        .or_else(|| fallback.and_then(parse_log_level))
-        .unwrap_or(DEFAULT_LOG_LEVEL)
 }
 
 /// Map a caller-supplied verbosity spelling onto a [`LevelFilter`]. Wraps the
@@ -193,18 +161,17 @@ pub const fn default_log_level() -> LevelFilter {
 /// Explicitly set the active log verbosity from a level spelling
 /// (`off|error|warn|info|debug|trace`, case-insensitive). This is the supported
 /// way to raise verbosity above the default — callers pass the level they want
-/// rather than relying on a process-global env var (`std::env::var` is banned
-/// crate-wide; see [`resolve_log_level`]). Returns the [`LevelFilter`] actually
-/// installed (the default when `spelling` is unrecognized, so a typo never
+/// rather than relying on a process-global env var. Returns the [`LevelFilter`]
+/// actually installed (the default when `spelling` is unrecognized, so a typo never
 /// silently disables logging). A no-op-safe wrapper over [`log::set_max_level`].
 pub fn set_log_level(spelling: &str) -> LevelFilter {
-    let level = log_level_from_overrides(Some(spelling), None);
+    let level = parse_log_level(spelling).unwrap_or(DEFAULT_LOG_LEVEL);
     log::set_max_level(level);
     level
 }
 
 pub fn init_logging() {
-    init_logging_at(resolve_log_level());
+    init_logging_at(DEFAULT_LOG_LEVEL);
 }
 
 /// Install the stderr logger at an explicit verbosity. Idempotent in the sense
@@ -234,34 +201,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_level_is_warn_when_no_overrides() {
-        assert_eq!(log_level_from_overrides(None, None), LevelFilter::Warn);
+    fn default_level_is_warn_when_no_explicit_level() {
         assert_eq!(DEFAULT_LOG_LEVEL, LevelFilter::Warn);
-    }
-
-    #[test]
-    fn primary_override_takes_precedence_over_fallback() {
-        assert_eq!(
-            log_level_from_overrides(Some("info"), Some("trace")),
-            LevelFilter::Info
-        );
-        assert_eq!(
-            log_level_from_overrides(Some("off"), Some("debug")),
-            LevelFilter::Off
-        );
-    }
-
-    #[test]
-    fn fallback_used_when_primary_absent_or_unrecognized() {
-        assert_eq!(
-            log_level_from_overrides(None, Some("debug")),
-            LevelFilter::Debug
-        );
-        // Primary present but garbage → fall through to the fallback.
-        assert_eq!(
-            log_level_from_overrides(Some("loud"), Some("trace")),
-            LevelFilter::Trace
-        );
+        init_logging();
+        assert_eq!(log::max_level(), DEFAULT_LOG_LEVEL);
     }
 
     #[test]
@@ -280,21 +223,18 @@ mod tests {
     #[test]
     fn unrecognized_values_fall_back_to_default_not_off() {
         // A typo must never silently disable logging or crank it to trace.
-        assert_eq!(
-            log_level_from_overrides(Some("verbose"), None),
-            DEFAULT_LOG_LEVEL
-        );
-        assert_eq!(
-            log_level_from_overrides(Some("yes"), Some("loud")),
-            DEFAULT_LOG_LEVEL
-        );
+        assert_eq!(set_log_level("verbose"), DEFAULT_LOG_LEVEL);
+        assert_eq!(set_log_level("yes"), DEFAULT_LOG_LEVEL);
+        log::set_max_level(DEFAULT_LOG_LEVEL);
     }
 
     #[test]
     fn parse_level_directive_matches_internal_parser() {
         // The public out-of-crate entry point must behave exactly like the
         // internal parser the env-precedence helper uses.
-        for spelling in ["off", "error", "warn", "info", "debug", "trace", "", "garbage"] {
+        for spelling in [
+            "off", "error", "warn", "info", "debug", "trace", "", "garbage",
+        ] {
             assert_eq!(parse_level_directive(spelling), parse_log_level(spelling));
         }
     }

@@ -172,6 +172,15 @@ mod tests_startup_validation_1782;
 mod tests_schur_seed_refusal_1782;
 
 #[cfg(test)]
+mod tests_unit_speed_inloop_2022;
+
+#[cfg(test)]
+mod tests_structured_residual_2021;
+
+#[cfg(test)]
+mod tests_two_tier_2023;
+
+#[cfg(test)]
 mod tests_streaming_efs_cache_1026;
 
 #[cfg(test)]

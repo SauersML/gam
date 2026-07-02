@@ -147,6 +147,62 @@ def test_constrained_reml_vjp_interior_cert() -> None:
     )
 
 
+def test_constrained_reml_vjp_interior_cert_nonzero_slack_bound() -> None:
+    """Interior cert with a NON-ZERO bound on a never-binding constraint.
+
+    Regression for the backward's zero-bound guard being scoped to the active
+    face: the curvature constraint ``[0,0,1]·β ≥ -1`` carries a non-zero bound
+    but is strictly slack for the convex truth (curvature ≈ +1.5 ≥ -1), so the
+    cert is interior and the backward is the full-space envelope VJP that never
+    reads ``b``. Before the fix the top-level guard rejected *any* non-zero
+    ``b_inequality`` with "supports only zero-bound inequality certificates",
+    so this forward+backward raised instead of running; it must now gradcheck
+    exactly like the zero-bound interior case.
+    """
+    _require_ffi()
+    n = 24
+    x_np, t = _curvature_design(n)
+    rng = np.random.default_rng(20240602)
+    # Convex truth (positive curvature) → `curvature ≥ -1` is satisfied
+    # strictly, so the cert stays interior even with the non-zero bound.
+    y_np = 0.3 + 0.5 * t + 1.5 * t * t + 0.02 * rng.standard_normal(n)
+
+    def forward_slack(
+        x_: "torch.Tensor",
+        y_: "torch.Tensor",
+        p_: "torch.Tensor",
+        w_: "torch.Tensor",
+    ) -> object:
+        a = torch.tensor(_A_INEQ, dtype=torch.float64)
+        b = torch.tensor([-1.0], dtype=torch.float64)  # non-zero, never binds
+        return gaussian_reml_fit_with_constraints(
+            x_, y_, p_, weights=w_, a_inequality=a, b_inequality=b
+        )
+
+    x, y, penalty, weights = _make_inputs(y_np, x_np)
+    out = forward_slack(x, y, penalty, weights)
+    assert (
+        cast("torch.Tensor", out.active_indices).numel() == 0  # type: ignore[attr-defined]
+    ), "expected an interior cert (constraint slack) despite the non-zero bound"
+
+    def f(
+        x_: "torch.Tensor",
+        y_: "torch.Tensor",
+        p_: "torch.Tensor",
+        w_: "torch.Tensor",
+    ) -> "torch.Tensor":
+        return _scalar_objective(forward_slack(x_, y_, p_, w_))
+
+    assert torch.autograd.gradcheck(
+        f,
+        (x, y, penalty, weights),
+        eps=_EPS,
+        atol=_ATOL,
+        rtol=_RTOL,
+        nondet_tol=_NONDET_TOL,
+    )
+
+
 def test_constrained_reml_vjp_active_cert() -> None:
     """Constraint binds at the optimum: gradcheck the tangent-projected VJP."""
     _require_ffi()

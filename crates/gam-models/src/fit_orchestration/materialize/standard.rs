@@ -27,6 +27,14 @@ pub(crate) fn materialize_standard<'a>(
         y_kind,
         &parsed.response,
     )?;
+    // #2026: a bare `family="tweedie"`/`"tw"` (no explicit power) mirrors mgcv's
+    // `tw()`: the variance power `p` is estimated by profile likelihood before
+    // the reported fit, so the observation-interval calibration tracks the data
+    // rather than the interior fallback `resolve_family` baked in. An explicit
+    // `tweedie(1.6)` pins `p` and leaves this `false`.
+    let estimate_tweedie_p = matches!(family.response, ResponseFamily::Tweedie { .. })
+        && matches!(family.link, InverseLink::Standard(StandardLink::Log))
+        && tweedie_power_is_estimated(config.family.as_deref());
 
     // Per-family response-support validation (#335 Gamma requires y > 0;
     // #337 Poisson/NegativeBinomial require y ≥ 0; mirrors the Beta
@@ -277,6 +285,7 @@ pub(crate) fn materialize_standard<'a>(
             offset,
             spec,
             family,
+            estimate_tweedie_p,
             options,
             kappa_options,
             wiggle,

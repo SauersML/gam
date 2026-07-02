@@ -1,14 +1,8 @@
 name: Build and Release All
 
 on:
-  push:
-    branches:
-      - main
-      - master
-    paths:
-      - 'Cargo.toml'
-      - '**/*.rs'
-      - '.github/workflows/build-release-all.yml'
+  schedule:
+    - cron: "0 */2 * * *"
   workflow_dispatch:
 
 concurrency:

@@ -185,6 +185,8 @@ fn main() {
             ResponseFamily::Binomial,
             InverseLink::Standard(StandardLink::Logit),
         ),
+        // Binomial fit — no Tweedie power to profile (#2026).
+        estimate_tweedie_p: false,
         options: fit_options(),
         kappa_options,
         wiggle: None,

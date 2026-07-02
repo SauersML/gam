@@ -651,7 +651,11 @@ fn near_flat_signal() -> Result<(), String> {
     let mut rng = Lcg::new(202);
     let x: Vec<f64> = (0..n).map(|_| rng.uniform_01()).collect();
     let truth_const = 3.5_f64;
-    let y_truth: Vec<f64> = vec![truth_const; n];
+    let signal_amp = 0.02_f64;
+    let y_truth: Vec<f64> = x
+        .iter()
+        .map(|&t| truth_const + signal_amp * (2.0 * PI * t).sin())
+        .collect();
     let y_noisy: Vec<f64> = y_truth.iter().map(|&v| v + sigma * rng.normal()).collect();
     let data = make_dataset_1d(&x, &y_noisy);
     let formula = "y ~ s(x, bc=anchored, k=15)";
@@ -660,7 +664,10 @@ fn near_flat_signal() -> Result<(), String> {
     let x_grid: Vec<f64> = (0..mgrid)
         .map(|i| 0.002 + 0.996 * i as f64 / (mgrid as f64 - 1.0))
         .collect();
-    let truth: Vec<f64> = vec![truth_const; mgrid];
+    let truth: Vec<f64> = x_grid
+        .iter()
+        .map(|&t| truth_const + signal_amp * (2.0 * PI * t).sin())
+        .collect();
     let (yhat, beta) = match fit_predict_1d(formula, &data, &x_grid) {
         Ok(v) => v,
         Err(e) => {
@@ -671,9 +678,7 @@ fn near_flat_signal() -> Result<(), String> {
     check_finite("near_flat_signal", formula, &yhat, &beta);
     let r = rmse(&yhat, &truth);
     let sf = span(&yhat);
-    // For a constant truth, span_truth = 0; substitute the noise sigma as
-    // the "trivial baseline span" so the ratio reflects over-fitting noise.
-    let st = sigma; // a smoother should NOT exceed a few σ in fitted span
+    let st = span(&truth);
     let extra = format!("max_abs_dev_from_truth={:.4}", {
         yhat.iter()
             .map(|v| (v - truth_const).abs())

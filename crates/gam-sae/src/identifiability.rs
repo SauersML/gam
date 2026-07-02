@@ -47,19 +47,23 @@
 //! ([`gam_problem::MetricProvenance`]) and cannot misreport —
 //! there is only one metric object.
 
+use crate::chart_canonicalization::CanonicalChartTopology;
 use crate::inference::layer_transport::{ChartTopology, TransportLadderReport, transport_ladder};
 use crate::inference::probe_runner::{ProbeRunner, RealizedProbe};
 use crate::inference::riesz::{RieszInput, SmoothFunctional, debias_with_dense_hessian};
-use gam_problem::{MetricProvenance, RowMetric};
-use gam_terms::inference::structure_evidence::{StructureCertificate, StructureLedger};
+use crate::manifold::SaeManifoldTerm;
+use faer::Side;
 use gam_linalg::faer_ndarray::{
     FaerCholesky, FaerEigh, FaerQr, FaerSvd, default_rrqr_rank_alpha, rrqr_with_permutation,
 };
-use crate::chart_canonicalization::CanonicalChartTopology;
-use crate::manifold::SaeManifoldTerm;
-use faer::Side;
+use gam_problem::{MetricProvenance, RowMetric};
+use gam_terms::inference::structure_evidence::{StructureCertificate, StructureLedger};
 use ndarray::{Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, s};
 use std::f64::consts::TAU;
+
+// At two or more independent ladders, each fit is pure and order-independent; fan
+// them out unless this call is already running inside a rayon worker.
+const ATOM_TRANSPORT_LADDER_PARALLEL_MIN: usize = 2;
 
 /// Smoothed column-2-norm of the decoder Jacobian.
 ///
@@ -862,10 +866,12 @@ pub struct FittedAtom {
     /// claim a pin it cannot resolve, the same honesty contract as the
     /// `diffeomorphism-unpinned` escalation.
     pub lowering_error: f64,
-    /// #1019 stage 1: `true` when the atom's `d = 1` latent chart was pinned
-    /// post-fit to its arc-length (unit-speed) canonical representative. #1019
-    /// stage 2: `true` as well when a `d = 2` torus atom's chart was pinned
-    /// post-fit to the minimum-isometry-defect flow representative, in which
+    /// #1019/#2022 stage 1: `true` when the atom's `d = 1` latent chart is pinned
+    /// to its arc-length (unit-speed) canonical representative — as of #2022
+    /// enforced IN-LOOP (t is arc-length at every assembled iterate), so this flag
+    /// means unit-speed was maintained throughout the fit, not applied once
+    /// post-fit. #1019 stage 2: `true` as well when a `d = 2` torus atom's chart
+    /// was pinned post-fit to the minimum-isometry-defect flow representative, in which
     /// case the residual chart freedom is `Isom(T², flat) = U(1)² ⋊ D₄`. The
     /// certificate then records that this atom's continuous chart
     /// (reparameterization) freedom is **pinned by canonicalization** — a
@@ -1734,7 +1740,9 @@ pub fn isometry_orbit_penalty_operator(
             }
         }
         for e in 0..d {
-            let mut frob = 0.0_f64;
+            // Build the symmetric d×d gram-derivative slab G_e (g[a,b] = g[b,a]
+            // by construction).
+            let mut g_e = Array2::<f64>::zeros((d, d));
             for a in 0..d {
                 for b in 0..d {
                     let mut g = 0.0;
@@ -1742,10 +1750,17 @@ pub fn isometry_orbit_penalty_operator(
                         g += hn[(i * d + a) * d + e] * j_base[[row, i, b]];
                         g += j_base[[row, i, a]] * hn[(i * d + b) * d + e];
                     }
-                    frob += g * g;
+                    g_e[[a, b]] = g;
                 }
             }
-            max_curv_sq = max_curv_sq.max(frob);
+            // Stiffness is the SPECTRAL norm σ_max(G_e), NOT the Frobenius norm:
+            // since ‖G_e‖_F² = Σ_i σ_i² ≥ σ_max², using Frobenius OVER-states the
+            // stiffness → UNDER-states the pinned-energy fraction → could drop a
+            // genuinely-pinned generator below GENERATOR_FLAT_ENERGY_TOL and
+            // falsely certify it UNPINNED (spurious non-identifiability — the
+            // opposite of the "never under-state the pin" guarantee). G_e is
+            // symmetric, so σ_max = max|eigenvalue| (see `symmetric_spectral_norm_sq`).
+            max_curv_sq = max_curv_sq.max(symmetric_spectral_norm_sq(g_e.view()));
         }
     }
     let stiffness_sq = (weight * max_curv_sq).max(f64::MIN_POSITIVE);
@@ -1799,6 +1814,38 @@ pub fn isometry_orbit_penalty_operator(
         apply: Box::new(apply),
         stiffness_sq,
     })
+}
+
+/// Squared spectral norm `σ_max(G)²` of a SYMMETRIC `d×d` matrix — the correct
+/// stiffness scale for the isometry-orbit pin (a Frobenius `Σσ_i²` over-states it
+/// and can spuriously free a pinned generator; see `isometry_orbit_penalty_operator`).
+/// `σ_max = max|eigenvalue|` for a symmetric matrix. Falls back to the largest
+/// column 2-norm — a valid LOWER bound on `σ_max` (`‖G e_j‖ ≤ σ_max`), so still
+/// conservative in the "never under-state the pin" direction — if the symmetric
+/// eig fails (e.g. a non-finite slab). For `d = 1` this is exactly `g²`
+/// (Frobenius and σ_max coincide), so the `d = 1` path is unchanged.
+fn symmetric_spectral_norm_sq(g: ArrayView2<'_, f64>) -> f64 {
+    let d = g.nrows();
+    if d == 0 {
+        return 0.0;
+    }
+    match g.to_owned().eigh(Side::Lower) {
+        Ok((evals, _)) => {
+            let s = evals.iter().fold(0.0_f64, |mx, &v| mx.max(v.abs()));
+            s * s
+        }
+        Err(_) => {
+            let mut max_col_sq = 0.0_f64;
+            for b in 0..g.ncols() {
+                let mut col_sq = 0.0_f64;
+                for a in 0..d {
+                    col_sq += g[[a, b]] * g[[a, b]];
+                }
+                max_col_sq = max_col_sq.max(col_sq);
+            }
+            max_col_sq
+        }
+    }
 }
 
 /// Enumerate one atom's exact orbit coordinate-motion fields `δt ∈ ℝ^{n×d}`.
@@ -2472,16 +2519,21 @@ fn residual_gauge_inner(
     // the union.
     verdicts.extend(exact_verdicts);
 
-    // #1019 — post-fit arc-length chart canonicalization records: for every
-    // canonicalized d = 1 atom the continuous chart (reparameterization)
-    // freedom is pinned BY CONSTRUCTION (the unit-speed representative of the
-    // Diff(M) orbit was selected post-fit, image-frozen), so the certificate
-    // records it pinned with the PinnedByCanonicalization provenance —
-    // distinct from curvature/penalty pinning, since no objective resistance
-    // was measured — and names the surviving FINITE isometry group of the
-    // reference manifold. The group's continuous part (the circle's U(1)
-    // shift) is still enumerated and curvature-tested above; this record is
-    // the chart-freedom downgrade itself.
+    // #1019 / #2022 — arc-length chart canonicalization records: for every
+    // canonicalized d = 1 atom the continuous chart (reparameterization) freedom
+    // is pinned BY CONSTRUCTION. As of #2022 the unit-speed representative of the
+    // Diff(M) orbit is enforced IN-LOOP as an exact, image-frozen retraction at
+    // every chart-refresh boundary (not merely selected once post-fit), so the
+    // Diff(M) chart-speed generator is removed from the optimization THROUGHOUT
+    // the fit. The certificate records it pinned with the PinnedByCanonicalization
+    // provenance — distinct from curvature/penalty pinning, since no objective
+    // resistance is measured (the direction is re-gauged away, not resisted) —
+    // and names the surviving FINITE isometry group of the reference manifold.
+    // Because the speed direction is removed every refresh it never enters
+    // ker(H), so the d = 1 chart-speed generator no longer needs a curvature-test
+    // / deflation verdict. The group's continuous part (the circle's U(1) shift)
+    // is still enumerated and curvature-tested above; this record is the
+    // chart-freedom downgrade itself.
     let mut canonicalized_charts = 0usize;
     let mut canonicalized_torus_charts = 0usize;
     let mut canonicalized_patch_charts = 0usize;
@@ -3040,61 +3092,79 @@ pub fn atom_transport_ladder_reports(
     model: &FittedSaeManifold,
     ladders: &[AtomTransportLadderInput],
 ) -> Result<Vec<AtomTransportLadderReport>, String> {
-    let mut out = Vec::with_capacity(ladders.len());
-    for input in ladders {
-        let atom = model.atoms.get(input.atom_index).ok_or_else(|| {
-            format!(
-                "atom transport ladder index {} out of range for {} fitted atoms",
-                input.atom_index,
-                model.atoms.len()
-            )
-        })?;
-        let depth = input.layers.len();
-        if depth < 2 {
-            return Err(format!(
-                "atom transport ladder for atom {} ('{}') needs at least two layers, got {depth}",
-                input.atom_index, atom.name
-            ));
-        }
-        if input.coords.len() != depth || input.topologies.len() != depth {
-            return Err(format!(
-                "atom transport ladder for atom {} ('{}') has {} layers, {} coordinate blocks, {} topologies",
-                input.atom_index,
-                atom.name,
-                depth,
-                input.coords.len(),
-                input.topologies.len()
-            ));
-        }
+    if ladders.len() >= ATOM_TRANSPORT_LADDER_PARALLEL_MIN
+        && rayon::current_thread_index().is_none()
+    {
+        use rayon::prelude::*;
 
-        let mut coords = Vec::with_capacity(depth);
-        let mut topologies = Vec::with_capacity(depth);
-        for (layer_pos, (coord, topology)) in
-            input.coords.iter().zip(input.topologies.iter()).enumerate()
-        {
-            coords.push(canonical_coords_for_transport(
-                coord,
-                topology,
-                input.atom_index,
-                &atom.name,
-                input.layers[layer_pos],
-            )?);
-            topologies.push(ChartTopology::from(topology));
-        }
-
-        let report = transport_ladder(&input.layers, &coords, &topologies).map_err(|e| {
-            format!(
-                "atom transport ladder for atom {} ('{}') failed: {e}",
-                input.atom_index, atom.name
-            )
-        })?;
-        out.push(AtomTransportLadderReport {
-            atom_index: input.atom_index,
-            atom_name: atom.name.clone(),
-            report,
-        });
+        let fitted: Vec<Result<AtomTransportLadderReport, String>> = ladders
+            .par_iter()
+            .map(|input| fit_atom_transport_ladder_report(model, input))
+            .collect();
+        fitted.into_iter().collect()
+    } else {
+        ladders
+            .iter()
+            .map(|input| fit_atom_transport_ladder_report(model, input))
+            .collect()
     }
-    Ok(out)
+}
+
+fn fit_atom_transport_ladder_report(
+    model: &FittedSaeManifold,
+    input: &AtomTransportLadderInput,
+) -> Result<AtomTransportLadderReport, String> {
+    let atom = model.atoms.get(input.atom_index).ok_or_else(|| {
+        format!(
+            "atom transport ladder index {} out of range for {} fitted atoms",
+            input.atom_index,
+            model.atoms.len()
+        )
+    })?;
+    let depth = input.layers.len();
+    if depth < 2 {
+        return Err(format!(
+            "atom transport ladder for atom {} ('{}') needs at least two layers, got {depth}",
+            input.atom_index, atom.name
+        ));
+    }
+    if input.coords.len() != depth || input.topologies.len() != depth {
+        return Err(format!(
+            "atom transport ladder for atom {} ('{}') has {} layers, {} coordinate blocks, {} topologies",
+            input.atom_index,
+            atom.name,
+            depth,
+            input.coords.len(),
+            input.topologies.len()
+        ));
+    }
+
+    let mut coords = Vec::with_capacity(depth);
+    let mut topologies = Vec::with_capacity(depth);
+    for (layer_pos, (coord, topology)) in
+        input.coords.iter().zip(input.topologies.iter()).enumerate()
+    {
+        coords.push(canonical_coords_for_transport(
+            coord,
+            topology,
+            input.atom_index,
+            &atom.name,
+            input.layers[layer_pos],
+        )?);
+        topologies.push(ChartTopology::from(topology));
+    }
+
+    let report = transport_ladder(&input.layers, &coords, &topologies).map_err(|e| {
+        format!(
+            "atom transport ladder for atom {} ('{}') failed: {e}",
+            input.atom_index, atom.name
+        )
+    })?;
+    Ok(AtomTransportLadderReport {
+        atom_index: input.atom_index,
+        atom_name: atom.name.clone(),
+        report,
+    })
 }
 
 fn canonical_coords_for_transport(
@@ -3704,5 +3774,33 @@ mod tests {
         let lam = result.selected_weight.unwrap();
         assert!(lam.is_finite() && lam > 0.0, "lam={lam}");
         assert!(result.map_a.is_some());
+    }
+
+    /// FINDING B (#2022 review): the isometry-orbit stiffness must be σ_max(G_e),
+    /// not ‖G_e‖_F. A d=2 fixture where the two differ pins the fix; d=1 (where
+    /// they coincide) must be unchanged.
+    #[test]
+    fn symmetric_spectral_norm_sq_uses_sigma_max_not_frobenius() {
+        use ndarray::Array2;
+        // Off-diagonal G = [[0,1],[1,0]]: eigenvalues ±1 ⇒ σ_max² = 1, while
+        // ‖G‖_F² = 2. The Frobenius bug returns 2, doubling the stiffness →
+        // halving the pinned-energy fraction → risks a false "unpinned" verdict.
+        let g = Array2::<f64>::from_shape_vec((2, 2), vec![0.0, 1.0, 1.0, 0.0]).unwrap();
+        let sigma_sq = super::symmetric_spectral_norm_sq(g.view());
+        let frob_sq: f64 = g.iter().map(|&v| v * v).sum();
+        assert!((sigma_sq - 1.0).abs() < 1e-9, "σ_max² must be 1, got {sigma_sq}");
+        assert!((frob_sq - 2.0).abs() < 1e-9, "fixture ‖G‖_F² is 2 (the flip)");
+        assert!(sigma_sq < frob_sq, "σ_max² must be strictly below ‖G‖_F² here");
+
+        // Balanced rank-2 G = [[1,0.1],[0.1,1]] ⇒ eigenvalues 1.1, 0.9 ⇒
+        // σ_max² = 1.21 vs ‖G‖_F² = 2.02.
+        let g2 = Array2::<f64>::from_shape_vec((2, 2), vec![1.0, 0.1, 0.1, 1.0]).unwrap();
+        let s2 = super::symmetric_spectral_norm_sq(g2.view());
+        assert!((s2 - 1.21).abs() < 1e-9, "σ_max² must be 1.21, got {s2}");
+
+        // d = 1: σ_max² == Frobenius² == g² — no regression on the scalar path.
+        let g1 = Array2::<f64>::from_shape_vec((1, 1), vec![-1.3]).unwrap();
+        let s1 = super::symmetric_spectral_norm_sq(g1.view());
+        assert!((s1 - 1.69).abs() < 1e-9, "d=1 must be g² = 1.69, got {s1}");
     }
 }

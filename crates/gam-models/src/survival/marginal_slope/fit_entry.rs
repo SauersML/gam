@@ -2,6 +2,23 @@
 
 use super::*;
 
+struct OuterWallClockDeadlineGuard;
+
+impl OuterWallClockDeadlineGuard {
+    fn arm(budget_secs: f64) -> Self {
+        gam_solve::rho_optimizer::arm_outer_wall_clock_deadline(
+            std::time::Instant::now() + std::time::Duration::from_secs_f64(budget_secs.max(1.0)),
+        );
+        Self
+    }
+}
+
+impl Drop for OuterWallClockDeadlineGuard {
+    fn drop(&mut self) {
+        gam_solve::rho_optimizer::clear_outer_wall_clock_deadline();
+    }
+}
+
 pub fn fit_survival_marginal_slope_terms(
     data: ArrayView2<'_, f64>,
     spec: SurvivalMarginalSlopeTermSpec,
@@ -16,11 +33,12 @@ pub fn fit_survival_marginal_slope_terms(
     // via kappa_options; generous default. Cleared on EVERY exit path so a stale
     // deadline never leaks to a later fit.
     let budget_secs = kappa_options.outer_wall_clock_budget_secs.unwrap_or(300.0);
-    gam_solve::rho_optimizer::arm_outer_wall_clock_deadline(
-        std::time::Instant::now() + std::time::Duration::from_secs_f64(budget_secs.max(1.0)),
-    );
+    let deadline_guard = OuterWallClockDeadlineGuard::arm(budget_secs);
     let result = fit_survival_marginal_slope_terms_impl(data, spec, options, kappa_options);
-    gam_solve::rho_optimizer::clear_outer_wall_clock_deadline();
+    // Explicit drop (not an underscore binding, which the build.rs ban-scanner
+    // rejects) clears the deadline on this return path; the guard's `Drop` also
+    // covers any panic-unwind exit, so the deadline never leaks to a later fit.
+    drop(deadline_guard);
     result
 }
 
@@ -803,6 +821,10 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         // from the partial structural drops and must NOT be flagged as a
         // pilot-curvature trap (that comparison is apples-to-oranges).
         used_partial_logslope_reduction: bool,
+        /// Protect the time block from reduction on recompile — set when the
+        /// time block carries a monotone time-wiggle basis (a fixed nonlinear
+        /// functional basis that cannot be linearly reparameterised).
+        protect_time: bool,
     }
     type SmgsCutoverTuple = (
         gam_linalg::matrix::DesignMatrix,
@@ -986,7 +1008,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             // W rather than at β=0.
             {
                 use gam_identifiability::families::compiler::{
-                    BlockOrder as IdBlockOrder, compile_from_raw_grams,
+                    BlockOrder as IdBlockOrder, compile_from_raw_grams_protected,
                 };
                 let closed_form = (|| -> Result<
                     Option<(
@@ -1070,7 +1092,19 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                             );
                         }
                     }
-                    let map = compile_from_raw_grams(
+                    // The monotone time-wiggle time block is a fixed nonlinear
+                    // functional basis, not a plain linear design: its
+                    // `SmsTimewiggleTimeJacobian` recomputes the full-width
+                    // wiggle basis on every evaluation and cannot be expressed
+                    // on a linearly reduced time design. Protect it from the
+                    // compiled-map reduction so it stays at raw width (its own
+                    // wiggle penalty nullspace regularises its conditioning);
+                    // marginal/logslope still reduce against the full time
+                    // anchor. Without this, a time reduction (11→9 here) leaves
+                    // the Jacobian writing `p_tw` wiggle columns into a narrower
+                    // `p_time`-wide buffer — an out-of-bounds panic.
+                    let time_is_timewiggle = spec.timewiggle_block.is_some();
+                    let map = compile_from_raw_grams_protected(
                         &gram_h,
                         &gram_struct,
                         &raw_ranges,
@@ -1079,6 +1113,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                             IdBlockOrder::Marginal,
                             IdBlockOrder::Logslope,
                         ],
+                        &[time_is_timewiggle, false, false],
                     )
                     .map_err(|e| format!("compile_from_raw_grams: {e}"))?;
                     if map.raw_from_compiled.shape()[0] != p_total_raw {
@@ -1158,6 +1193,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                                 g_dg.clone(),
                                 &logslope_partition,
                                 &row_hess,
+                                spec.timewiggle_block.is_some(),
                             )?;
                             let map = compiled_map_from_per_term(&per_term);
                             let fw_time = map.compiled_block_ranges[0].len();
@@ -1409,6 +1445,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                             probit_scale,
                             drops_by_block_initial: drops,
                             used_partial_logslope_reduction,
+                            protect_time: spec.timewiggle_block.is_some(),
                         });
                         if drops.0 + drops.1 + drops.2 == 0 {
                             log::info!(
@@ -2628,6 +2665,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 ctx.g_dg.clone(),
                 &ctx.logslope_partition,
                 &row_hess,
+                ctx.protect_time,
             )?;
             Ok(compiled.drops_by_block)
         })();

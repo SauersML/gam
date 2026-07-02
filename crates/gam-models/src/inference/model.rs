@@ -285,6 +285,12 @@ pub struct FittedModelPayload {
     pub offset_column: Option<String>,
     #[serde(default)]
     pub noise_offset_column: Option<String>,
+    /// Name of the analytic prior-weights column used at fit time (`weights=`),
+    /// persisted so replicate/generative sampling can re-resolve the per-row
+    /// weights and draw heteroskedastic Gaussian observation noise
+    /// `sigma_i = sigma_hat / sqrt(w_i)` (#2025). `None` for an unweighted fit.
+    #[serde(default)]
+    pub weight_column: Option<String>,
     #[serde(default)]
     pub beta_noise: Option<Vec<f64>>,
     #[serde(default)]
@@ -679,6 +685,7 @@ impl FittedModelPayload {
             formula_logslopes: None,
             offset_column: None,
             noise_offset_column: None,
+            weight_column: None,
             beta_noise: None,
             noise_projection: None,
             noise_center: None,
@@ -2613,7 +2620,7 @@ impl FittedModel {
             .or(payload.unified.as_ref())
             .is_some_and(|fit| fit.used_device);
         payload.synchronize_empty_feature_contract();
-        let Some(fit) = payload.fit_result.as_ref() else {
+        let Some(fit) = payload.fit_result.as_ref().or(payload.unified.as_ref()) else {
             return;
         };
         match (&mut payload.family_state, &fit.fitted_link) {
@@ -2768,6 +2775,19 @@ impl FittedModel {
     pub fn diagnostic_extra_columns(&self) -> Result<Vec<String>, String> {
         let payload = self.payload();
         let parsed = parse_formula(payload.formula.as_str()).map_err(|e| e.to_string())?;
+        // Prior (case) weights never enter the linear predictor, so
+        // `prediction_required_columns` deliberately omits the weight column and
+        // a prediction frame may drop it. Diagnostics are weight-aware, though:
+        // `diagnose` reconstructs the ALO working weights `w_i = prior_i ·
+        // Fisher_i` (and the refit fallback re-weights the same way), so the
+        // weight column must be loaded. Fold it in here — the single seam that
+        // makes it structurally impossible for a diagnostic command to silently
+        // drop a needed column — regardless of the response-shape early-outs
+        // below, since it is orthogonal to the response.
+        let mut extras: Vec<String> = Vec::new();
+        if let Some(weight_column) = payload.weight_column.as_ref() {
+            extras.push(weight_column.clone());
+        }
         // Survival responses are `Surv(...)` expressions, not bare columns; the
         // underlying entry/exit columns are already prediction-required.
         if parse_surv_response(parsed.response.as_str())
@@ -2777,20 +2797,21 @@ impl FittedModel {
                 .map_err(|e| e.to_string())?
                 .is_some()
         {
-            return Ok(Vec::new());
+            return Ok(extras);
         }
         let response = parsed.response.trim();
         // A response that is empty, or a function-call expression rather than a
         // plain data column, has no bare column to re-add.
         if response.is_empty() || response.contains('(') {
-            return Ok(Vec::new());
+            return Ok(extras);
         }
         // Already prediction-required (e.g. transformation-normal re-adds it):
         // nothing extra to fold in.
         if self.prediction_required_columns()?.contains(response) {
-            return Ok(Vec::new());
+            return Ok(extras);
         }
-        Ok(vec![response.to_string()])
+        extras.push(response.to_string());
+        Ok(extras)
     }
 
     /// Add the columns referenced by an auxiliary (noise / logslope) formula,

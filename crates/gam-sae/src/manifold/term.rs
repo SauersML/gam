@@ -636,15 +636,26 @@ pub struct SaeManifoldTerm {
     /// #1777 PER-FIT separation-barrier strength override `μ_C` — the source of
     /// truth for the barrier strength when set, replacing the process-global
     /// [`set_sae_barrier_overrides`] atomic. `Some(μ_C)` forces the absolute
-    /// strength (bypassing the data-derived overcompleteness ratio), scoped to
-    /// THIS term/fit so concurrent in-process fits are isolated; `0.0` disables the
-    /// barrier. `None` ⇒ fall back to the deprecated process-global override, then
-    /// the data-derived strength (bit-identical to the historical path when
-    /// neither override is set). Read via
+    /// strength (bypassing the #1610 evidence-derived per-pair reciprocal-margin
+    /// strengths), scoped to THIS term/fit so concurrent in-process fits are
+    /// isolated; `0.0` disables the barrier. `None` ⇒ fall back to the deprecated
+    /// process-global override, then the evidence-derived strength (bit-identical
+    /// to the historical path when neither override is set). Read via
     /// [`super::penalties::SaeManifoldTerm::separation_barrier_strength`]; set from
     /// the FFI through [`SaeManifoldTerm::set_fit_config`]. Carried across clones
     /// (persisted configuration, like the assignment mode).
     pub(crate) separation_barrier_strength_override: Option<f64>,
+    /// #2022 — persisted per-fit opt-in for the SCALE-gauge quotient (default
+    /// false ⇒ bit-for-bit historical path). When true, the decoder is confined
+    /// to the unit-Frobenius sphere with its magnitude in the explicit per-atom
+    /// log-amplitude (seed/step/refit peel + sphere retract). Set from the FFI
+    /// via the typed `quotient_scale` kwarg — no env lever. Carried across clones
+    /// like the other per-fit config.
+    pub(crate) quotient_scale: bool,
+    /// #2023 — persisted per-fit opt-in for the dead-atom DATA-ROW reseed
+    /// (default false). Set from the FFI via the typed `data_row_reseed` kwarg —
+    /// no env lever. Carried across clones.
+    pub(crate) data_row_reseed: bool,
 }
 
 /// #1777 — PER-FIT configuration overrides the FFI sets on a term to isolate a
@@ -662,7 +673,7 @@ pub struct SaeManifoldTerm {
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct SaeFitConfig {
     /// Per-fit separation-barrier strength `μ_C`. `Some` bypasses both the global
-    /// override and the data-derived overcompleteness ratio (`0.0` = barrier off).
+    /// override and the #1610 evidence-derived per-pair strengths (`0.0` = barrier off).
     pub separation_barrier_strength_override: Option<f64>,
     /// Per-fit truncated-IBP concentration `α`. `Some` bypasses both the global
     /// override and the mode's own `α` / learnable schedule.
@@ -708,6 +719,8 @@ impl Clone for SaeManifoldTerm {
             // #1777 — persisted per-fit config, carried across clones like the
             // assignment mode so a cloned term keeps the same barrier override.
             separation_barrier_strength_override: self.separation_barrier_strength_override,
+            quotient_scale: self.quotient_scale,
+            data_row_reseed: self.data_row_reseed,
         }
     }
 }

@@ -29,12 +29,12 @@
 
 use ndarray::array;
 
-use gam_problem::RowMetric;
 use crate::inference::steering::{SteerPlan, steer_delta};
+use crate::manifold::SaeManifoldTerm;
+use gam_problem::RowMetric;
 use gam_terms::inference::structure_evidence::{
     CandidateProbe, ClaimKind, ProbePlan, StructureLedger, plan_probe_for_contested_claim,
 };
-use crate::manifold::SaeManifoldTerm;
 
 /// The level the contested-claim selection and budget are computed at. Fixed so
 /// a probe can never be shopped across α after seeing the evidence (mirrors
@@ -88,6 +88,7 @@ impl<'a> ProbeRunner<'a> {
     /// already-computed [`SteerPlan`] rides back in the result.
     pub fn design_next(&self, ledger: &StructureLedger) -> Result<RealizedProbe, String> {
         let (claim_idx, atom_k) = self.most_contested_atom_claim(ledger)?;
+        let claim_kind = &ledger.claims()[claim_idx].kind;
         let current_log_e = ledger.claims()[claim_idx].evidence.current_e_value_log();
 
         let candidates = self.candidate_steers(atom_k)?;
@@ -104,11 +105,11 @@ impl<'a> ProbeRunner<'a> {
         let probes: Vec<CandidateProbe> = candidates
             .iter()
             .map(|steer| {
-                let dose = steer.predicted_nats.unwrap_or(0.0).max(0.0);
+                let objective = self.probe_objective(claim_kind, steer);
                 CandidateProbe {
                     delta: steer.delta.clone(),
                     predicted_mean_null: array![0.0],
-                    predicted_mean_alt: array![(2.0 * dose).sqrt()],
+                    predicted_mean_alt: array![(2.0 * objective).sqrt()],
                 }
             })
             .collect();
@@ -119,8 +120,8 @@ impl<'a> ProbeRunner<'a> {
                 .ok_or_else(|| {
                     format!(
                         "ProbeRunner::design_next: no candidate probe discriminates the hypotheses \
-                     for atom {atom_k} (every reachable steering move delivers zero output-Fisher \
-                     dose — the claim is undecidable by steering, a finding not a failure)"
+                     for atom {atom_k} (every reachable steering move delivers zero design \
+                     objective — the claim is undecidable by steering, a finding not a failure)"
                     )
                 })?;
 
@@ -213,6 +214,61 @@ impl<'a> ProbeRunner<'a> {
         }
         best.map(|(idx, _)| (idx, steer.atom))
             .ok_or_else(|| format!("ProbeRunner: no claim names steered atom {}", steer.atom))
+    }
+
+    /// Design objective for a realized steering candidate. Existence claims use
+    /// the behavioral KL dose directly. Geometry adjudication is different: the
+    /// curvature signal scales as observed chart coverage to the fourth power,
+    /// so a token spent at an already-covered coordinate buys essentially no new
+    /// curvature-certification power. For geometry claims the candidate score is
+    /// therefore the expected increase in `extent^4` of the observed chart, per
+    /// probe token (all candidates here cost one token), rather than raw dose.
+    fn probe_objective(&self, claim_kind: &ClaimKind, steer: &SteerPlan) -> f64 {
+        match claim_kind {
+            ClaimKind::GeometryKind { .. } => self.chart_extent_fourth_gain(steer),
+            ClaimKind::AtomExists { .. }
+            | ClaimKind::BindingEdge { .. }
+            | ClaimKind::Custom { .. } => steer.predicted_nats.unwrap_or(0.0).max(0.0),
+        }
+    }
+
+    /// Increase in the atom's observed latent chart extent to the fourth power
+    /// after adding this probe endpoint. The extent is the root-mean-square axis
+    /// range, which is zero only for a collapsed chart and grows when any latent
+    /// direction obtains genuinely wider coverage.
+    fn chart_extent_fourth_gain(&self, steer: &SteerPlan) -> f64 {
+        let coords = self.term.assignment.coords[steer.atom].as_matrix();
+        let d = steer.t_to.len();
+        if d == 0 {
+            return 0.0;
+        }
+        let mut extent_sq = 0.0_f64;
+        let mut extended_extent_sq = 0.0_f64;
+        for axis in 0..d {
+            let mut lo = f64::INFINITY;
+            let mut hi = f64::NEG_INFINITY;
+            for row in 0..coords.nrows() {
+                let t = coords[[row, axis]];
+                if t.is_finite() {
+                    lo = lo.min(t);
+                    hi = hi.max(t);
+                }
+            }
+            if !lo.is_finite() || !hi.is_finite() {
+                lo = steer.t_from[axis];
+                hi = steer.t_from[axis];
+            }
+            let range = (hi - lo).max(0.0);
+            extent_sq += range * range;
+
+            let to = steer.t_to[axis];
+            let extended_range = (hi.max(to) - lo.min(to)).max(0.0);
+            extended_extent_sq += extended_range * extended_range;
+        }
+        let inv_d = 1.0 / d as f64;
+        let extent_fourth = (extent_sq * inv_d).powi(2);
+        let extended_extent_fourth = (extended_extent_sq * inv_d).powi(2);
+        (extended_extent_fourth - extent_fourth).max(0.0)
     }
 
     /// Build the realized steering candidates for atom `atom_k`: a positive and

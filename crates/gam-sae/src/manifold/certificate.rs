@@ -103,8 +103,18 @@ pub fn curved_dictionary_global_optimality_verdict(
         || !kappa_max.is_finite()
         || !activity_floor.is_finite()
         || !snr_proxy.is_finite()
+        || snr_proxy <= 0.0
         || k_atoms == 0
     {
+        // `snr_proxy <= 0.0` is an explicit precondition: the sufficient
+        // condition needs SNR > 1, enforced below via `snr_factor > 0`. But that
+        // check alone is `1 − 1/snr_proxy > 0`, which a NEGATIVE `snr_proxy` also
+        // satisfies (`1 − (negative) > 1`) and would then INFLATE the budget
+        // (`snr_factor > 1`) and falsely certify. A negative signal-to-noise
+        // proxy is physically degenerate, so refuse up front — keeping the
+        // "an Uncertified verdict never claims a wrong certification" contract
+        // robust even for direct callers (the in-tree report path already floors
+        // dispersion > 0, so this only hardens the public entry point).
         return GlobalOptimalityVerdict::Uncertified {
             margin: f64::NEG_INFINITY,
         };
@@ -522,4 +532,41 @@ pub(crate) fn projected_perp_norm(vector: &[f64], tangent_frame: ArrayView2<'_, 
         }
     }
     residual.iter().map(|v| v * v).sum::<f64>().sqrt()
+}
+
+#[cfg(test)]
+mod certificate_verdict_tests {
+    use super::*;
+
+    /// A negative `snr_proxy` must NEVER certify. The bare `snr_factor =
+    /// 1 − 1/snr_proxy > 0` check passes a negative proxy (`1 − (−) > 1`) and
+    /// inflates the budget; the explicit precondition refuses it.
+    #[test]
+    fn negative_snr_proxy_never_certifies() {
+        // Inputs that WOULD certify at a healthy SNR (tiny μ̂, zero curvature,
+        // strong activity), so only the SNR guard can decide the verdict.
+        let v = curved_dictionary_global_optimality_verdict(1e-6, 0.0, 0.9, -5.0, 4);
+        assert!(!v.is_certified(), "negative snr_proxy must not certify");
+        assert_eq!(v.margin(), f64::NEG_INFINITY, "precondition failure yields −inf margin");
+    }
+
+    /// SNR at/below 1 (reachable (0, 1]) is uncertifiable — the sufficient
+    /// condition needs strictly SNR > 1; unchanged by the negative-guard hardening.
+    #[test]
+    fn snr_at_or_below_one_does_not_certify() {
+        for snr in [0.25_f64, 1.0] {
+            let v = curved_dictionary_global_optimality_verdict(1e-9, 0.0, 0.9, snr, 4);
+            assert!(!v.is_certified(), "snr_proxy={snr} (<= 1) must not certify");
+        }
+    }
+
+    /// A healthy regime (SNR >> 1, tiny incoherence, zero curvature, strong
+    /// activity floor) certifies with a positive margin — the guard does not
+    /// over-reject the reachable, genuinely-certifiable case.
+    #[test]
+    fn healthy_regime_certifies_with_positive_margin() {
+        let v = curved_dictionary_global_optimality_verdict(1e-9, 0.0, 0.9, 100.0, 4);
+        assert!(v.is_certified(), "healthy regime must certify");
+        assert!(v.margin() > 0.0, "certified margin must be positive");
+    }
 }

@@ -2662,6 +2662,7 @@ fn scan_report_html(model: &FittedModel, scan: &ScanIntrospection) -> Result<Str
         converged: true,
         outer_gradient_norm: None,
         criterion_certificate: None,
+        smoothing_forensics: Vec::new(),
         edf_total: scan.edf,
         r_squared: None,
         coefficients: Vec::new(),
@@ -2733,6 +2734,7 @@ fn report_html_impl(model_bytes: &[u8]) -> Result<String, String> {
         converged: fit.pirls_status.is_converged(),
         outer_gradient_norm: fit.outer_gradient_norm,
         criterion_certificate: None,
+        smoothing_forensics: Vec::new(),
         edf_total: fit.edf_total().unwrap_or(0.0),
         r_squared: None,
         coefficients,
@@ -2992,6 +2994,57 @@ fn sae_jumprelu_row_value_grad<'py>(
         value.into_pyarray(py).unbind(),
         grad.into_pyarray(py).unbind(),
     ))
+}
+
+/// Batched sibling of [`sae_jumprelu_row_value_grad`]: the whole `(N, K)` gate
+/// value+grad in ONE FFI call, so `gamfit.torch`'s bounded jumprelu gate crosses
+/// the Python↔Rust boundary once per forward pass instead of once per row.
+///
+/// Returns `(a, da_dl)`, each `(N, K)`, where `a[i,k] = σ((l−θ)/τ)·1[l>θ]` and
+/// `da_dl[i,k] = σ'((l−θ)/τ)/τ` (straight-through, both sides of the jump);
+/// `∂a/∂θ = −da_dl` (torch negates and row-sums). Bit-identical to invoking
+/// `sae_jumprelu_row_value_grad` row-by-row — the shared Rust source of truth.
+#[pyfunction(signature = (logits, temperature, thresholds))]
+fn sae_jumprelu_batch_value_grad<'py>(
+    py: Python<'py>,
+    logits: PyReadonlyArray2<'py, f64>,
+    temperature: f64,
+    thresholds: PyReadonlyArray1<'py, f64>,
+) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
+    if !(temperature.is_finite() && temperature > 0.0) {
+        return Err(py_value_error(format!(
+            "sae_jumprelu_batch_value_grad: temperature must be finite and positive; got {temperature}"
+        )));
+    }
+    let logits_view = logits.as_array();
+    let thresholds_view = thresholds.as_array();
+    let (_n, k) = logits_view.dim();
+    if k != thresholds_view.len() {
+        return Err(py_value_error(format!(
+            "sae_jumprelu_batch_value_grad: thresholds length {} does not match logits columns {k}",
+            thresholds_view.len()
+        )));
+    }
+    for ((row, col), &v) in logits_view.indexed_iter() {
+        if !v.is_finite() {
+            return Err(py_value_error(format!(
+                "sae_jumprelu_batch_value_grad: non-finite logit at row {row} atom {col}: {v}"
+            )));
+        }
+    }
+    for (col, &v) in thresholds_view.iter().enumerate() {
+        if !v.is_finite() {
+            return Err(py_value_error(format!(
+                "sae_jumprelu_batch_value_grad: non-finite threshold at atom {col}: {v}"
+            )));
+        }
+    }
+    let (value, grad) = gam::terms::sae::assignment::jumprelu_batch_value_grad(
+        logits_view.view(),
+        temperature,
+        thresholds_view.view(),
+    );
+    Ok((value.into_pyarray(py).unbind(), grad.into_pyarray(py).unbind()))
 }
 
 #[pyfunction(signature = (
@@ -4195,7 +4248,10 @@ fn required_prediction_columns(model: &FittedModel) -> Result<BTreeSet<String>, 
 /// `by=` column), plus the offset / noise-offset / latent-`z` / survival
 /// entry-exit columns surfaced by [`required_prediction_columns`], plus the
 /// response column (needed for the conformal-calibration fold and for survival
-/// / transformation-normal label-bearing frames).
+/// / transformation-normal label-bearing frames), plus the prior-weights column
+/// when the model was fitted with one (needed by the generative-replicate path
+/// to reconstruct heteroskedastic observation noise `Var(y_i)=sigma^2/w_i`,
+/// #2025/#2033).
 ///
 /// Any column *not* in this set is irrelevant to the model — a row ID, a
 /// grouping/label column carried for bookkeeping, an auxiliary measurement —
@@ -4205,6 +4261,13 @@ fn prediction_consumable_columns(model: &FittedModel) -> Result<BTreeSet<String>
     let mut consumable = required_prediction_columns(model)?;
     if let Some(response) = response_column_name(model.payload().formula.as_str()) {
         consumable.insert(response);
+    }
+    // Retain the prior-weights column when the model carried one, so it survives
+    // projection and the replicate path can resolve per-row weights rather than
+    // erroring on a frame that *does* include them (#2033 regression of #2025).
+    // Harmless for ordinary predict, which never resolves the weight column.
+    if let Some(weight) = model.weight_column.as_deref() {
+        consumable.insert(weight.to_string());
     }
     Ok(consumable)
 }
@@ -5250,12 +5313,23 @@ struct DuchonHybridConfig {
 ///   null space, spectral power ``s = (d−1)/2``) and ships the native
 ///   reproducing-norm Gram plus a null-space shrinkage ridge, not the operator
 ///   triplet.
+///
+/// When ``any_periodic`` is set, the spec is destined for the mixed-periodicity
+/// (cylinder/torus) builder, whose additive per-axis reproducing kernel is
+/// derived only for the pure-polyharmonic spectrum (Sobolev tail ``s = 0``):
+/// the periodic Bernoulli Green's function and the non-periodic Sobolev kernel
+/// have no validated fractional-power generalization. The auto-power branch
+/// therefore pins ``power = 0`` on periodic requests, keeping the SAME cubic
+/// ``Linear`` null space (so the ``{1, y}`` polynomial block still matches
+/// ``duchon_p_from_nullspace_order``) rather than emitting the Euclidean
+/// ``s = (d−1)/2`` default the periodic builder cannot represent.
 fn resolve_duchon_hybrid_config(
     dim: usize,
     length_scale: Option<f64>,
     nullspace_order: Option<&str>,
     explicit_power: Option<f64>,
     max_op: usize,
+    any_periodic: bool,
 ) -> PyResult<DuchonHybridConfig> {
     let requested_nullspace = parse_nullspace_order(nullspace_order)?;
     // Pure, auto-power requests (no `length_scale`, no explicit `power`) resolve
@@ -5273,7 +5347,12 @@ fn resolve_duchon_hybrid_config(
     // an explicit `power` or the hybrid Matérn-blended kernel (`length_scale`),
     // whose partial-fraction spectrum is only defined for integer `s`.
     if length_scale.is_none() && explicit_power.is_none() {
-        let (nullspace_order, power) = duchon_cubic_default(dim);
+        let (nullspace_order, cubic_power) = duchon_cubic_default(dim);
+        // The mixed-periodicity reproducing kernel supports only s = 0 (pure
+        // polyharmonic); pin the auto power to 0 there while keeping the cubic
+        // `Linear` null space so the periodic builder accepts the auto-resolved
+        // spec instead of rejecting the Euclidean s = (d−1)/2 default.
+        let power = if any_periodic { 0.0 } else { cubic_power };
         return Ok(DuchonHybridConfig {
             length_scale,
             nullspace_order,
@@ -5560,6 +5639,11 @@ fn build_standard_payload(
     payload.adaptive_regularization_diagnostics = adaptive_regularization_diagnostics;
     payload.offset_column = fit_config.offset_column.clone();
     payload.noise_offset_column = fit_config.noise_offset_column.clone();
+    // Persist the analytic prior-weights column so `Model.sample_replicates`
+    // can re-resolve the per-row weights and draw heteroskedastic Gaussian
+    // observation noise `sigma_i = sigma_hat / sqrt(w_i)` (#2025). Without this
+    // the replicate path only saw the pooled scalar sigma_hat.
+    payload.weight_column = fit_config.weight_column.clone();
     payload.gaussian_jackknife_plus = jackknife_plus_stats;
     payload.full_conformal = full_conformal_substrate;
     Ok(payload)

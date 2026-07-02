@@ -753,6 +753,12 @@ jobs:
       - name: Run curv() constant-curvature sign-recovery contract (#1464)
         run: python -m pytest tests/test_bug_hunt_curv_smooth_hyperbolic_recovered_as_spherical.py -v --tb=short
 
+      - name: Run weighted sample_replicates weight-column contract (#2033)
+        run: python -m pytest tests/test_bug_hunt_2033_sample_replicates_weighted_model_drops_weight_column.py -v --tb=short
+
+      - name: Run Tweedie estimated-power conditional coverage contract (#2026)
+        run: python -m pytest tests/test_bug_hunt_2026_tweedie_estimated_power_conditional_coverage.py -v --tb=short
+
       - name: Run survival API regression + save/load roundtrip tests
         run: |
           python -m pytest \

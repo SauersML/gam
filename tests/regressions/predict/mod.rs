@@ -1,5 +1,6 @@
 mod beta_phi_frozen_at_null_predictor;
 mod dispersion_location_scale_generate_predict_variance_agreement;
+mod gaussian_location_scale_predict_sigma_response_scale_equivariant;
 mod predict_2_2;
 mod predict_ignores_unrelated_cli_column;
 mod predict_linear_term_clamped_to_training_range;

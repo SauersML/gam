@@ -614,3 +614,19 @@ pub(crate) fn set_saved_offset_columns(
     payload.offset_column = offset_column;
     payload.noise_offset_column = noise_offset_column;
 }
+
+/// Persist the fit's case-weight column name on the saved model.
+///
+/// The saved offset column is already threaded through
+/// [`set_saved_offset_columns`]; the weight column was silently dropped, so
+/// `gam diagnose` (which reloads the prior weights by name to reconstruct the
+/// IRLS working weights for the ALO geometry path) could not recover the case
+/// weights of a `--weights-column` fit and fell back to unit weights. Persist it
+/// alongside the offset so every post-fit diagnostic sees the weights the model
+/// was actually fit with.
+pub(crate) fn set_saved_weight_column(
+    payload: &mut FittedModelPayload,
+    weight_column: Option<String>,
+) {
+    payload.weight_column = weight_column;
+}

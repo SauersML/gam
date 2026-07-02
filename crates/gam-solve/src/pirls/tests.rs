@@ -2019,6 +2019,35 @@ mod tests {
                 max_relative = 1e-12
             );
         }
+
+        // The stored penalized KKT residual (#1876) must (a) be the vector whose
+        // L2 norm the fit already reports as `lastgradient_norm` — a direct
+        // plumbing guard that every PirlsResult construction site populates the
+        // right vector — and (b) survive the compaction / rehydration LRU
+        // round-trip unchanged, so the outer envelope correction still sees it
+        // after a cache eviction.
+        let stored_norm = fit
+            .penalized_gradient_transformed
+            .dot(&fit.penalized_gradient_transformed)
+            .sqrt();
+        assert_relative_eq!(
+            stored_norm,
+            fit.lastgradient_norm,
+            epsilon = 1e-10,
+            max_relative = 1e-10
+        );
+        assert_eq!(
+            fit.penalized_gradient_transformed.len(),
+            rehydrated.penalized_gradient_transformed.len()
+        );
+        for i in 0..fit.penalized_gradient_transformed.len() {
+            assert_relative_eq!(
+                fit.penalized_gradient_transformed[i],
+                rehydrated.penalized_gradient_transformed[i],
+                epsilon = 1e-12,
+                max_relative = 1e-12
+            );
+        }
     }
 
     #[test]

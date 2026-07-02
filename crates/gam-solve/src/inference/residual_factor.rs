@@ -121,6 +121,33 @@ pub struct ResidualFactorInput<'a> {
     pub max_factor_rank: usize,
 }
 
+/// A persistent, evidence-earning residual factor direction — a promotion
+/// candidate for the #2021 Λ nursery→promotion birth channel. Emitted by
+/// [`StructuredResidualModel::promotion_candidates`] when a column of this
+/// pass's `Λ` both (a) aligns with a column of the previous pass's `Λ` (it
+/// *persisted* across the outer alternation) and (b) explains residual energy
+/// above the idiosyncratic-noise floor (it *earns its complexity*). The driver
+/// accumulates persistence across passes (the nursery) and, once a direction
+/// survives long enough, promotes it to a new curved/linear atom seeded by
+/// [`Self::direction`].
+#[derive(Clone, Debug)]
+pub struct FactorPromotion {
+    /// Unit-norm factor direction in output space (`p`-vector): the L2-normalized
+    /// column of `Λ`. This is the decoder direction a promoted atom is born with.
+    pub direction: Array1<f64>,
+    /// Explained residual energy `‖Λ_:,j‖²` (pre-normalization squared column
+    /// norm) — the factor's contribution to `Σ = c·ΛΛᵀ + D`. Candidates are
+    /// returned in descending energy so the driver promotes the strongest first.
+    pub energy: f64,
+    /// `|cos|` alignment (∈ `[0, 1]`) between this direction and the best-matching
+    /// column of the previous pass's `Λ` — the persistence score gating promotion.
+    pub persistence_alignment: f64,
+    /// Index of the best-matching previous-pass `Λ` column (the nursery lineage
+    /// this candidate continues), so the driver can track a stable identity for a
+    /// direction across passes.
+    pub prev_column: usize,
+}
+
 impl StructuredResidualModel {
     /// Fit the structured residual-covariance model by the deterministic
     /// fixed-iteration alternation, selecting the factor rank by the evidence
@@ -303,12 +330,37 @@ impl StructuredResidualModel {
                 // Re-normalize so the mean scale is 1 (the factor amplitude lives
                 // in Λ; c(z) carries only the relative activity law). This keeps
                 // the (Λ, D) ↔ (scale) split identified.
-                let mean_scale = bin_scale.iter().copied().sum::<f64>() / bins as f64;
+                //
+                // The mean MUST be taken over ROWS, not over bins. The identity
+                // that makes `raw_diag` an unbiased ΛΛᵀ + D estimator is
+                //   E[(1/n) Σ_n r_n r_nᵀ] = (1/n) Σ_i c(z_i) · ΛΛᵀ + D,
+                // which reduces to ΛΛᵀ + D iff the ROW mean of c is 1:
+                //   (1/n) Σ_i c(z_i) = Σ_b (n_b / n) · bin_scale[b] = 1,
+                // where n_b is the occupancy (row count) of bin b. Under uneven
+                // occupancy (the common case — z is data-driven) the bin-UNIFORM
+                // mean (1/bins) Σ_b bin_scale[b] ≠ this occupancy-weighted mean, so
+                // normalizing by it would leave raw_diag = ΛΛᵀ + D biased by
+                // exactly (occupancy mean / bin mean). Divide by the occupancy-
+                // weighted mean instead, so (1/n) Σ_i row_scale[i] is exactly 1.
+                // ORDERING: the positivity floor was applied above FIRST, so the
+                // floored per-bin values are the ones this normalization sees; the
+                // per-row assignment below therefore needs no second clamp (a
+                // re-clamp would use pre-normalization floor units and break the
+                // exact row-mean-1 invariant just established).
+                let mut bin_count = vec![0.0_f64; bins];
+                for &b in row_bin.iter() {
+                    bin_count[b] += 1.0;
+                }
+                let mean_scale = (0..bins)
+                    .map(|b| bin_count[b] * bin_scale[b])
+                    .sum::<f64>()
+                    / n as f64;
                 if mean_scale > 0.0 {
                     bin_scale.mapv_inplace(|v| v / mean_scale);
                 }
+                // Each bin_scale[b] is already ≥ scale_floor / mean_scale > 0.
                 for i in 0..n {
-                    row_scale[i] = bin_scale[row_bin[i]].max(scale_floor);
+                    row_scale[i] = bin_scale[row_bin[i]];
                 }
             }
         }
@@ -366,6 +418,105 @@ impl StructuredResidualModel {
         self.log_evidence
     }
 
+    /// #2021 Λ nursery→promotion: detect *persistent, evidence-earning* factor
+    /// directions relative to the previous outer-alternation pass's model.
+    ///
+    /// A column `j` of this model's `Λ` is a [`FactorPromotion`] candidate iff
+    /// both gates hold:
+    /// 1. **Earns its complexity** (evidence gate): its explained energy
+    ///    `‖Λ_:,j‖² ≥ energy_floor_mult · mean(diag(D))`. Every column is already
+    ///    inside the evidence-ladder-selected rank (so it cleared the BIC
+    ///    penalty globally); this per-direction floor additionally requires the
+    ///    factor to explain more than an average channel's idiosyncratic noise,
+    ///    so we never promote a direction that only barely survived rank
+    ///    selection.
+    /// 2. **Persists** (nursery gate): its `|cos|` alignment with the best-
+    ///    matching column of `prev`'s `Λ` is `≥ align_min` — the direction is the
+    ///    same subspace the previous pass already found, not a new
+    ///    pass-to-pass artifact.
+    ///
+    /// Returns candidates sorted by energy (descending). `prev = None` (the first
+    /// structured pass, damping toward `I`) yields no candidates — a direction
+    /// must survive at least one pass to enter the nursery. The driver holds the
+    /// cross-pass persistence count (promote after it clears the direction's
+    /// nursery dwell) and does the actual atom birth; this method is the pure,
+    /// per-pass detector.
+    ///
+    /// Errors on non-finite / out-of-range gates (`align_min ∈ [0,1]`,
+    /// `energy_floor_mult ≥ 0`) or a `prev` with a different output dim `p`.
+    pub fn promotion_candidates(
+        &self,
+        prev: Option<&StructuredResidualModel>,
+        align_min: f64,
+        energy_floor_mult: f64,
+    ) -> Result<Vec<FactorPromotion>, String> {
+        if !align_min.is_finite() || !(0.0..=1.0).contains(&align_min) {
+            return Err(format!(
+                "StructuredResidualModel::promotion_candidates: align_min must be finite in [0,1]; got {align_min}"
+            ));
+        }
+        if !energy_floor_mult.is_finite() || energy_floor_mult < 0.0 {
+            return Err(format!(
+                "StructuredResidualModel::promotion_candidates: energy_floor_mult must be finite and ≥ 0; got {energy_floor_mult}"
+            ));
+        }
+        let prev = match prev {
+            Some(pv) => pv,
+            None => return Ok(Vec::new()),
+        };
+        if prev.p != self.p {
+            return Err(format!(
+                "StructuredResidualModel::promotion_candidates: prev output dim {} != {}",
+                prev.p, self.p
+            ));
+        }
+        let r = self.factor_rank;
+        let prev_r = prev.factor_rank;
+        if r == 0 || prev_r == 0 {
+            return Ok(Vec::new());
+        }
+        // Idiosyncratic-noise floor: a promoted direction must explain more than
+        // an average channel's independent variance.
+        let mean_d = self.diagonal.iter().copied().sum::<f64>() / self.p as f64;
+        let energy_floor = energy_floor_mult * mean_d;
+
+        let mut out: Vec<FactorPromotion> = Vec::new();
+        for j in 0..r {
+            let col = self.lambda.column(j);
+            let energy: f64 = col.iter().map(|v| v * v).sum();
+            if energy <= 0.0 || energy < energy_floor {
+                continue;
+            }
+            let norm = energy.sqrt();
+            // Best |cos| against the previous pass's columns.
+            let mut best_align = 0.0_f64;
+            let mut best_k = 0usize;
+            for k in 0..prev_r {
+                let pcol = prev.lambda.column(k);
+                let pnorm: f64 = pcol.iter().map(|v| v * v).sum::<f64>().sqrt();
+                if pnorm <= 0.0 {
+                    continue;
+                }
+                let dot: f64 = col.iter().zip(pcol.iter()).map(|(a, b)| a * b).sum();
+                let cos_abs = (dot / (norm * pnorm)).abs();
+                if cos_abs > best_align {
+                    best_align = cos_abs;
+                    best_k = k;
+                }
+            }
+            if best_align >= align_min {
+                out.push(FactorPromotion {
+                    direction: col.mapv(|v| v / norm),
+                    energy,
+                    persistence_alignment: best_align,
+                    prev_column: best_k,
+                });
+            }
+        }
+        out.sort_by(|a, b| b.energy.total_cmp(&a.energy));
+        Ok(out)
+    }
+
     /// Build the per-row precision factor stack `U_n ∈ ℝ^{p×p}` with
     /// `U_n U_nᵀ = Σ_n^{-1}` and package it as a
     /// [`MetricProvenance::WhitenedStructured`](gam_problem::MetricProvenance::WhitenedStructured)
@@ -388,10 +539,45 @@ impl StructuredResidualModel {
             ));
         }
         let p = self.p;
+        let r = self.factor_rank;
+        // Hoist every row-INDEPENDENT Woodbury part out of the per-row loop: the
+        // inverse diagonal D^{-1}, B = D^{-1}Λ, its transpose Bᵀ, and the Gram
+        // M0 = ΛᵀD^{-1}Λ. Only the c_n^{-1} I_r shift on the capacitance is
+        // per-row, so the per-row capacitance is M_n = M0 + c_n^{-1} I_r — a
+        // scalar-diagonal reweight of the SAME M0 (mirroring the Fix-B hoist in
+        // `penalized_log_evidence`). Building the n-row U_n stack now costs
+        // O(p·r² + n·(p·r + r³ + p³)) instead of rebuilding B and the Gram every
+        // row. The summation order per row is unchanged, so the assembled U_n is
+        // bit-for-bit identical to the per-row-rebuild it replaces.
+        let d_inv: Vec<f64> = (0..p).map(|i| 1.0 / self.diagonal[i]).collect();
+        let mut b = Array2::<f64>::zeros((p, r));
+        let mut bt = Array2::<f64>::zeros((r, p));
+        let mut m0 = Array2::<f64>::zeros((r, r));
+        if r > 0 {
+            for i in 0..p {
+                for k in 0..r {
+                    b[[i, k]] = d_inv[i] * self.lambda[[i, k]];
+                }
+            }
+            for a in 0..r {
+                for bk in 0..r {
+                    let mut acc = 0.0_f64;
+                    for i in 0..p {
+                        acc += self.lambda[[i, a]] * b[[i, bk]];
+                    }
+                    m0[[a, bk]] = acc;
+                }
+            }
+            for k in 0..r {
+                for i in 0..p {
+                    bt[[k, i]] = b[[i, k]];
+                }
+            }
+        }
         // Row-major flat factor matrix: u[n, i*p + k] = U_n[i, k].
         let mut u = Array2::<f64>::zeros((n_rows, p * p));
         for row in 0..n_rows {
-            let precision = self.row_precision(row)?;
+            let precision = self.row_precision(&d_inv, &b, &bt, &m0, row)?;
             let factor = lower_cholesky_psd(&precision)?;
             for i in 0..p {
                 for k in 0..p {
@@ -402,13 +588,154 @@ impl StructuredResidualModel {
         RowMetric::whitened_structured(Arc::new(u), p, p)
     }
 
-    /// Per-row precision `Σ_n^{-1}` via the Woodbury identity (an `r × r` solve).
-    fn row_precision(&self, row: usize) -> Result<Array2<f64>, String> {
+    /// Convenience for the #2021 fit-path install seam: fit the structured
+    /// residual model on `input` and immediately materialize its per-row
+    /// `WhitenedStructured` [`RowMetric`] over all `input.residuals.nrows()`
+    /// rows. Equivalent to `Self::fit(input)?.row_metric(n)` — the single call
+    /// the outer alternation loop consumes when it installs the whitening metric
+    /// but does not also need the fitted factor (`factor()` / birth mining).
+    pub fn fit_row_metric(input: ResidualFactorInput<'_>) -> Result<RowMetric, String> {
+        let n = input.residuals.nrows();
+        Self::fit(input)?.row_metric(n)
+    }
+
+    /// Damped per-row metric for the #2021 driver: blend covariances in the
+    /// **covariance domain** (before the Woodbury→Cholesky) between this model's
+    /// estimate and a previous one,
+    /// ```text
+    ///   Σ_t(row) = (1 − γ) · Σ_prev(row) + γ · Σ̂_t(row),
+    /// ```
+    /// where `Σ̂_t(row) = c_t(z)·ΛΛᵀ + D` is this model's per-row covariance
+    /// (built from the hoisted-M0 / occupancy-weighted `c(z)` path), and
+    /// `Σ_prev(row)` is `prev`'s per-row covariance when `Some`, else `I_p`. The
+    /// returned factor `U_n` satisfies `U_n U_nᵀ = Σ_t(row)^{-1}`, packaged as a
+    /// [`RowMetric`](gam_problem::RowMetric).
+    ///
+    /// Endpoints (exact, byte-identical to the undamped producers):
+    /// * `γ = 1.0` ⇒ this model's [`Self::row_metric`] exactly (Woodbury path);
+    /// * `γ = 0.0` ⇒ `prev`'s [`Self::row_metric`] when `Some`, else the
+    ///   Euclidean identity metric.
+    ///
+    /// `γ` must be finite and in `[0, 1]`; when `prev` is `Some` it must share
+    /// this model's `p` and row count.
+    pub fn row_metric_damped(
+        &self,
+        n_rows: usize,
+        gamma: f64,
+        prev: Option<&StructuredResidualModel>,
+    ) -> Result<RowMetric, String> {
+        if n_rows != self.row_scale.len() {
+            return Err(format!(
+                "StructuredResidualModel::row_metric_damped: requested {n_rows} rows but model has {}",
+                self.row_scale.len()
+            ));
+        }
+        if !gamma.is_finite() || !(0.0..=1.0).contains(&gamma) {
+            return Err(format!(
+                "StructuredResidualModel::row_metric_damped: gamma must be finite in [0,1]; got {gamma}"
+            ));
+        }
+        if let Some(pv) = prev {
+            if pv.p != self.p {
+                return Err(format!(
+                    "StructuredResidualModel::row_metric_damped: prev output dim {} != {}",
+                    pv.p, self.p
+                ));
+            }
+            if pv.row_scale.len() != n_rows {
+                return Err(format!(
+                    "StructuredResidualModel::row_metric_damped: prev has {} rows but requested {n_rows}",
+                    pv.row_scale.len()
+                ));
+            }
+        }
+        // Exact endpoints — reuse the undamped producers so the result is
+        // byte-identical (γ=1 ⇒ this model; γ=0 ⇒ prev, or Euclidean identity).
+        if gamma == 1.0 {
+            return self.row_metric(n_rows);
+        }
+        if gamma == 0.0 {
+            return match prev {
+                Some(pv) => pv.row_metric(n_rows),
+                None => RowMetric::euclidean(n_rows, self.p),
+            };
+        }
+
+        let p = self.p;
+        // Row-INDEPENDENT outer products ΛΛᵀ (this model and, if present, prev):
+        // only the per-row activity scale c(z) multiplies them, so hoist the Gram
+        // out of the per-row loop (mirroring the row_metric / penalized_log_evidence
+        // hoist).
+        let self_gram = outer_product(&self.lambda);
+        let prev_gram = prev.map(|pv| outer_product(&pv.lambda));
+
+        let mut u = Array2::<f64>::zeros((n_rows, p * p));
+        for row in 0..n_rows {
+            let c = self.row_scale[row].max(f64::MIN_POSITIVE);
+            // γ · Σ̂_t = γ·(c·ΛΛᵀ + D).
+            let mut sigma = Array2::<f64>::zeros((p, p));
+            for a in 0..p {
+                for b in 0..p {
+                    sigma[[a, b]] = gamma * c * self_gram[[a, b]];
+                }
+                sigma[[a, a]] += gamma * self.diagonal[a];
+            }
+            // (1−γ) · Σ_prev  (prev's per-row Σ, or I_p when prev is None).
+            match prev {
+                Some(pv) => {
+                    let cp = pv.row_scale[row].max(f64::MIN_POSITIVE);
+                    let pg = prev_gram.as_ref().unwrap();
+                    for a in 0..p {
+                        for b in 0..p {
+                            sigma[[a, b]] += (1.0 - gamma) * cp * pg[[a, b]];
+                        }
+                        sigma[[a, a]] += (1.0 - gamma) * pv.diagonal[a];
+                    }
+                }
+                None => {
+                    for a in 0..p {
+                        sigma[[a, a]] += 1.0 - gamma;
+                    }
+                }
+            }
+            // Symmetrize against round-off before inversion.
+            for a in 0..p {
+                for b in (a + 1)..p {
+                    let avg = 0.5 * (sigma[[a, b]] + sigma[[b, a]]);
+                    sigma[[a, b]] = avg;
+                    sigma[[b, a]] = avg;
+                }
+            }
+            // Σ_t is a convex combination of SPD matrices (D ≻ 0 / I ≻ 0) ⇒ SPD.
+            // Precision = Σ_t^{-1} via a Cholesky solve against I_p, then the U_n
+            // factor is the lower-Cholesky of the precision (row_metric's U
+            // convention).
+            let precision = invert_spd(&sigma)?;
+            let factor = lower_cholesky_psd(&precision)?;
+            for i in 0..p {
+                for k in 0..p {
+                    u[[row, i * p + k]] = factor[[i, k]];
+                }
+            }
+        }
+        RowMetric::whitened_structured(Arc::new(u), p, p)
+    }
+
+    /// Per-row precision `Σ_n^{-1}` via the Woodbury identity (an `r × r` solve),
+    /// given the row-independent parts precomputed by [`Self::row_metric`]:
+    /// `d_inv = D^{-1}`, `b = D^{-1}Λ`, `bt = Bᵀ`, and the Gram `m0 = ΛᵀD^{-1}Λ`.
+    /// Only the per-row capacitance `M_n = m0 + c_n^{-1} I_r` and the back-solve
+    /// depend on the row.
+    fn row_precision(
+        &self,
+        d_inv: &[f64],
+        b: &Array2<f64>,
+        bt: &Array2<f64>,
+        m0: &Array2<f64>,
+        row: usize,
+    ) -> Result<Array2<f64>, String> {
         let p = self.p;
         let r = self.factor_rank;
-        let c = self.row_scale[row].max(f64::MIN_POSITIVE);
-        // D^{-1}.
-        let d_inv: Vec<f64> = (0..p).map(|i| 1.0 / self.diagonal[i]).collect();
         // Start from D^{-1}.
         let mut precision = Array2::<f64>::zeros((p, p));
         for i in 0..p {
@@ -417,37 +744,19 @@ impl StructuredResidualModel {
         if r == 0 {
             return Ok(precision);
         }
-        // B = D^{-1} Λ  ∈ ℝ^{p×r}.
-        let mut b = Array2::<f64>::zeros((p, r));
-        for i in 0..p {
-            for k in 0..r {
-                b[[i, k]] = d_inv[i] * self.lambda[[i, k]];
-            }
-        }
-        // Capacitance M = c^{-1} I_r + Λᵀ D^{-1} Λ  ∈ ℝ^{r×r}.
-        let mut cap = Array2::<f64>::zeros((r, r));
+        let c = self.row_scale[row].max(f64::MIN_POSITIVE);
+        // Per-row capacitance M_n = M0 + c^{-1} I_r (copy the hoisted Gram, then
+        // add c^{-1} to the diagonal). M_n ≻ 0 since c^{-1} > 0 and M0 ⪰ 0.
+        let mut cap = m0.clone();
         for a in 0..r {
-            for bk in 0..r {
-                let mut acc = 0.0_f64;
-                for i in 0..p {
-                    acc += self.lambda[[i, a]] * b[[i, bk]];
-                }
-                cap[[a, bk]] = acc;
-            }
             cap[[a, a]] += 1.0 / c;
         }
-        // Σ_n^{-1} = D^{-1} − B M^{-1} Bᵀ. Solve M X = Bᵀ for X = M^{-1} Bᵀ
-        // (r × p) via Cholesky (M ≻ 0 since c^{-1} > 0 and ΛᵀD^{-1}Λ ⪰ 0).
+        // Σ_n^{-1} = D^{-1} − B M_n^{-1} Bᵀ. Solve M_n X = Bᵀ for X = M_n^{-1} Bᵀ
+        // (r × p) via Cholesky.
         let chol = cap
             .cholesky(Side::Lower)
             .map_err(|e| format!("StructuredResidualModel::row_precision capacitance: {e:?}"))?;
-        let mut bt = Array2::<f64>::zeros((r, p));
-        for k in 0..r {
-            for i in 0..p {
-                bt[[k, i]] = b[[i, k]];
-            }
-        }
-        let x = chol.solve_mat(&bt); // r × p
+        let x = chol.solve_mat(bt); // r × p
         for i in 0..p {
             for j in 0..p {
                 let mut acc = 0.0_f64;
@@ -468,6 +777,47 @@ impl StructuredResidualModel {
         }
         Ok(precision)
     }
+}
+
+/// Outer product `Λ Λᵀ ∈ ℝ^{p×p}` of a factor matrix `Λ ∈ ℝ^{p×r}` — the
+/// row-independent factor covariance the per-row activity scale multiplies.
+/// Used by [`StructuredResidualModel::row_metric_damped`] to hoist the Gram out
+/// of its per-row covariance-blend loop.
+fn outer_product(lambda: &Array2<f64>) -> Array2<f64> {
+    let p = lambda.nrows();
+    let r = lambda.ncols();
+    let mut g = Array2::<f64>::zeros((p, p));
+    for a in 0..p {
+        for b in 0..p {
+            let mut acc = 0.0_f64;
+            for k in 0..r {
+                acc += lambda[[a, k]] * lambda[[b, k]];
+            }
+            g[[a, b]] = acc;
+        }
+    }
+    g
+}
+
+/// Inverse of a symmetric positive-definite matrix via a Cholesky solve against
+/// the identity, symmetrized against round-off. Used to form `Σ_t^{-1}` from a
+/// densely-blended covariance in [`StructuredResidualModel::row_metric_damped`]
+/// (the blended covariance is no longer low-rank-plus-diagonal, so Woodbury does
+/// not apply).
+fn invert_spd(a: &Array2<f64>) -> Result<Array2<f64>, String> {
+    let p = a.nrows();
+    let chol = a
+        .cholesky(Side::Lower)
+        .map_err(|e| format!("invert_spd: blended covariance not SPD: {e:?}"))?;
+    let mut inv = chol.solve_mat(&Array2::<f64>::eye(p));
+    for i in 0..p {
+        for j in (i + 1)..p {
+            let avg = 0.5 * (inv[[i, j]] + inv[[j, i]]);
+            inv[[i, j]] = avg;
+            inv[[j, i]] = avg;
+        }
+    }
+    Ok(inv)
 }
 
 /// Per-channel (column) sample second moment of the residual matrix.
@@ -639,6 +989,27 @@ fn penalized_log_evidence(
     let log_det_d: f64 = diagonal.iter().map(|&d| d.ln()).sum();
     let two_pi_ln = (2.0 * std::f64::consts::PI).ln();
 
+    // Row-INDEPENDENT Gram M0 = ΛᵀD^{-1}Λ (r × r). This does not depend on the
+    // row, so build it ONCE here rather than rebuilding it inside the per-row loop
+    // (which was O(n·p·r²)). The per-row capacitance is only a scalar-diagonal
+    // reweight of this SAME M0 — M_n = M0 + (1/c_n) I_r — so each row copies M0 and
+    // adds 1/c_n to its diagonal (cheap, O(r)) before its own Cholesky. The
+    // summation order over j (0..p) is preserved exactly and the diagonal add is
+    // the identical `+= 1.0 / c` op, so the hoist is bit-for-bit identical to the
+    // pre-hoist per-row rebuild (same log|Σ_n|, same quadratic, same evidence).
+    let mut m0 = Array2::<f64>::zeros((rank, rank));
+    if rank > 0 {
+        for a in 0..rank {
+            for b in 0..rank {
+                let mut acc = 0.0_f64;
+                for j in 0..p {
+                    acc += lambda[[j, a]] * d_inv[j] * lambda[[j, b]];
+                }
+                m0[[a, b]] = acc;
+            }
+        }
+    }
+
     let mut log_lik = 0.0_f64;
     for i in 0..n {
         let c = row_scale[i].max(f64::MIN_POSITIVE);
@@ -651,8 +1022,12 @@ fn penalized_log_evidence(
         }
         let mut log_det = log_det_d;
         if rank > 0 {
-            // M (r × r) and w = Bᵀ r_n = ΛᵀD^{-1} r_n.
-            let mut m = Array2::<f64>::zeros((rank, rank));
+            // Per-row capacitance M_n = M0 + (1/c) I_r (copy the hoisted M0, then
+            // add 1/c to the diagonal), and w = Bᵀ r_n = ΛᵀD^{-1} r_n.
+            let mut m = m0.clone();
+            for a in 0..rank {
+                m[[a, a]] += 1.0 / c;
+            }
             let mut w = Array1::<f64>::zeros(rank);
             for a in 0..rank {
                 let mut wa = 0.0_f64;
@@ -660,14 +1035,6 @@ fn penalized_log_evidence(
                     wa += lambda[[j, a]] * d_inv[j] * r[[i, j]];
                 }
                 w[a] = wa;
-                for b in 0..rank {
-                    let mut acc = 0.0_f64;
-                    for j in 0..p {
-                        acc += lambda[[j, a]] * d_inv[j] * lambda[[j, b]];
-                    }
-                    m[[a, b]] = acc;
-                }
-                m[[a, a]] += 1.0 / c;
             }
             // Cholesky M = R Rᵀ → log|M|, and solve M y = w.
             match m.cholesky(Side::Lower) {
@@ -924,5 +1291,613 @@ mod tests {
             ratio > 1.8 && ratio < 5.5,
             "fitted dynamic range {ratio:.3} must bracket the planted ≈3.1"
         );
+    }
+
+    /// Reproduce `fit`'s equal-width bin assignment for a test activity vector.
+    fn assign_bins(activity: &Array1<f64>, bins: usize) -> Vec<usize> {
+        let n = activity.len();
+        let z_min = activity.iter().copied().fold(f64::INFINITY, f64::min);
+        let z_max = activity.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let span = z_max - z_min;
+        (0..n)
+            .map(|i| {
+                if span <= 0.0 {
+                    0
+                } else {
+                    let frac = (activity[i] - z_min) / span;
+                    (frac * bins as f64).floor().clamp(0.0, bins as f64 - 1.0) as usize
+                }
+            })
+            .collect()
+    }
+
+    /// FIX A invariant: with deliberately UNEVEN bin occupancy the fitted
+    /// per-row scale must have `(1/n) Σ_i row_scale[i] = 1` (occupancy-weighted
+    /// mean-1), NOT the bin-uniform mean-1 the old code enforced. We assert the
+    /// row-mean is 1 to tight tolerance, and that the bin-UNIFORM mean of the
+    /// distinct per-bin scales is materially ≠ 1 — which is exactly the quantity
+    /// the old normalization forced to 1, so this proves the two means differ
+    /// under uneven occupancy and the test bites.
+    #[test]
+    fn occupancy_weighted_scale_has_row_mean_one() {
+        let n = 4000usize;
+        let p = 4usize;
+        let lambda0 = ndarray::array![1.5, 1.2, -0.4, 0.3];
+        let sigma_eps = 0.2_f64;
+        let slope = 2.0_f64;
+        let mut seed = 0xB5297A4D_u64 ^ 0x68E31DA4_u64;
+        let mut residuals = Array2::<f64>::zeros((n, p));
+        let mut activity = Array1::<f64>::zeros(n);
+        for row in 0..n {
+            // Cubic warp concentrates rows in the low-z bins ⇒ uneven occupancy.
+            let u = (row as f64) / (n as f64 - 1.0);
+            let z = u * u * u;
+            activity[row] = z;
+            let amp = (slope * z).exp().sqrt();
+            let f = lcg_normal(&mut seed);
+            for i in 0..p {
+                residuals[[row, i]] = amp * lambda0[i] * f + sigma_eps * lcg_normal(&mut seed);
+            }
+        }
+
+        let model = StructuredResidualModel::fit(ResidualFactorInput {
+            residuals: residuals.view(),
+            activity: activity.view(),
+            max_factor_rank: 2,
+        })
+        .expect("fit");
+        assert!(
+            model.factor_rank() >= 1,
+            "need a non-trivial scale law (rank ≥ 1) for this invariant to bite; got rank 0"
+        );
+
+        // Occupancy-weighted (row) mean must be exactly 1.
+        let row_mean = model.row_scale().iter().sum::<f64>() / n as f64;
+        assert!(
+            (row_mean - 1.0).abs() < 1e-9,
+            "occupancy-weighted row mean of c(z) must be 1; got {row_mean:.12}"
+        );
+
+        // Bins are genuinely unevenly occupied, and every occupied bin's rows
+        // share one scale value (collect the distinct value per bin).
+        let bins = ACTIVITY_SCALE_BINS.max(1);
+        let row_bin = assign_bins(&activity, bins);
+        let mut counts = vec![0usize; bins];
+        let mut bin_val = vec![f64::NAN; bins];
+        for i in 0..n {
+            let b = row_bin[i];
+            counts[b] += 1;
+            bin_val[b] = model.row_scale()[i];
+        }
+        let occupied: Vec<usize> = (0..bins).filter(|&b| counts[b] > 0).collect();
+        let max_c = *counts.iter().max().unwrap();
+        let min_c = *counts.iter().filter(|&&c| c > 0).min().unwrap();
+        assert!(
+            max_c as f64 > 2.0 * min_c as f64,
+            "fixture must have uneven occupancy; counts = {counts:?}"
+        );
+
+        // The bin-UNIFORM mean of the per-bin scales is what the OLD code forced
+        // to 1. Under uneven occupancy + a non-constant law it is materially ≠ 1,
+        // so the old normalization would NOT satisfy the row-mean-1 identity.
+        let uniform_mean =
+            occupied.iter().map(|&b| bin_val[b]).sum::<f64>() / occupied.len() as f64;
+        assert!(
+            (uniform_mean - 1.0).abs() > 0.1,
+            "bin-uniform mean must differ from 1 (proving occupancy weighting matters); \
+             got uniform_mean = {uniform_mean:.6}, row_mean = {row_mean:.6}"
+        );
+    }
+
+    /// Naive, pre-hoist reference for `penalized_log_evidence`: rebuilds the
+    /// row-independent Gram M0 = ΛᵀD⁻¹Λ INSIDE the per-row loop (the original
+    /// formula). The production function hoists M0 out; the two must agree.
+    fn naive_penalized_log_evidence(
+        r: ArrayView2<'_, f64>,
+        lambda: &Array2<f64>,
+        diagonal: &Array1<f64>,
+        row_scale: &Array1<f64>,
+        rank: usize,
+    ) -> f64 {
+        let n = r.nrows();
+        let p = r.ncols();
+        let d_inv: Vec<f64> = (0..p).map(|i| 1.0 / diagonal[i]).collect();
+        let log_det_d: f64 = diagonal.iter().map(|&d| d.ln()).sum();
+        let two_pi_ln = (2.0 * std::f64::consts::PI).ln();
+        let mut log_lik = 0.0_f64;
+        for i in 0..n {
+            let c = row_scale[i].max(f64::MIN_POSITIVE);
+            let mut quad = 0.0_f64;
+            for j in 0..p {
+                quad += r[[i, j]] * d_inv[j] * r[[i, j]];
+            }
+            let mut log_det = log_det_d;
+            if rank > 0 {
+                let mut m = Array2::<f64>::zeros((rank, rank));
+                let mut w = Array1::<f64>::zeros(rank);
+                for a in 0..rank {
+                    let mut wa = 0.0_f64;
+                    for j in 0..p {
+                        wa += lambda[[j, a]] * d_inv[j] * r[[i, j]];
+                    }
+                    w[a] = wa;
+                    for b in 0..rank {
+                        let mut acc = 0.0_f64;
+                        for j in 0..p {
+                            acc += lambda[[j, a]] * d_inv[j] * lambda[[j, b]];
+                        }
+                        m[[a, b]] = acc;
+                    }
+                    m[[a, a]] += 1.0 / c;
+                }
+                match m.cholesky(Side::Lower) {
+                    Ok(chol) => {
+                        let y = chol.solvevec(&w);
+                        let mut wy = 0.0_f64;
+                        for a in 0..rank {
+                            wy += w[a] * y[a];
+                        }
+                        quad -= wy;
+                        let diag = chol.diag();
+                        let log_det_m: f64 = diag.iter().map(|&l| (l * l).ln()).sum();
+                        log_det = log_det_d + log_det_m + rank as f64 * c.ln();
+                    }
+                    Err(_) => {
+                        log_det = log_det_d;
+                    }
+                }
+            }
+            log_lik += -0.5 * (log_det + quad + p as f64 * two_pi_ln);
+        }
+        let k_params = (p * rank + p + ACTIVITY_SCALE_BINS) as f64;
+        log_lik - 0.5 * k_params * (n.max(2) as f64).ln()
+    }
+
+    /// Naive, per-row-rebuild reference for `factor_coordinates`: rebuilds and
+    /// re-factors the (row-independent) normal matrix ΛᵀD⁻¹Λ for EVERY row.
+    /// Mathematically identical to the shared-factorization production path.
+    fn naive_factor_coordinates(
+        lambda: &Array2<f64>,
+        diagonal: &Array1<f64>,
+        r: ArrayView2<'_, f64>,
+    ) -> Array2<f64> {
+        let p = lambda.nrows();
+        let rank = lambda.ncols();
+        let n = r.nrows();
+        let d_inv: Vec<f64> = (0..p).map(|i| 1.0 / diagonal[i]).collect();
+        let mut coords = Array2::<f64>::zeros((n, rank));
+        for i in 0..n {
+            let mut normal = Array2::<f64>::zeros((rank, rank));
+            for a in 0..rank {
+                for b in 0..rank {
+                    let mut acc = 0.0_f64;
+                    for j in 0..p {
+                        acc += lambda[[j, a]] * d_inv[j] * lambda[[j, b]];
+                    }
+                    normal[[a, b]] = acc;
+                }
+            }
+            let trace = (0..rank).map(|k| normal[[k, k]]).sum::<f64>().max(1.0);
+            let ridge = 1e-10 * trace / rank.max(1) as f64;
+            for k in 0..rank {
+                normal[[k, k]] += ridge;
+            }
+            let chol = normal.cholesky(Side::Lower).expect("naive normal solve");
+            let mut rhs = Array1::<f64>::zeros(rank);
+            for a in 0..rank {
+                let mut acc = 0.0_f64;
+                for j in 0..p {
+                    acc += lambda[[j, a]] * d_inv[j] * r[[i, j]];
+                }
+                rhs[a] = acc;
+            }
+            let gamma = chol.solvevec(&rhs);
+            for a in 0..rank {
+                coords[[i, a]] = gamma[a];
+            }
+        }
+        coords
+    }
+
+    /// FIX B equivalence: the hoisted `penalized_log_evidence` and the shared-
+    /// factorization `factor_coordinates` must equal their naive per-row-rebuild
+    /// references to ~1e-10 (in fact bit-for-bit — the hoist preserves op order).
+    #[test]
+    fn hoisted_gram_matches_naive_per_row_rebuild() {
+        let n = 200usize;
+        let p = 5usize;
+        let rank = 2usize;
+        let mut seed = 0x243F6A8885A308D3_u64;
+        let mut lambda = Array2::<f64>::zeros((p, rank));
+        for i in 0..p {
+            for k in 0..rank {
+                lambda[[i, k]] = lcg_normal(&mut seed);
+            }
+        }
+        let mut diagonal = Array1::<f64>::zeros(p);
+        for j in 0..p {
+            diagonal[j] = 0.3 + lcg_uniform(&mut seed); // strictly positive
+        }
+        let mut row_scale = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            row_scale[i] = 0.5 + 1.5 * lcg_uniform(&mut seed); // strictly positive
+        }
+        let mut residuals = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            for j in 0..p {
+                residuals[[i, j]] = lcg_normal(&mut seed);
+            }
+        }
+
+        let ev_hoisted =
+            penalized_log_evidence(residuals.view(), &lambda, &diagonal, &row_scale, rank);
+        let ev_naive =
+            naive_penalized_log_evidence(residuals.view(), &lambda, &diagonal, &row_scale, rank);
+        assert!(
+            (ev_hoisted - ev_naive).abs() <= 1e-10 * (1.0 + ev_naive.abs()),
+            "hoisted log-evidence must equal naive rebuild: {ev_hoisted} vs {ev_naive}"
+        );
+
+        let coords_hoisted =
+            factor_coordinates(&lambda, &diagonal, residuals.view()).expect("coords");
+        let coords_naive = naive_factor_coordinates(&lambda, &diagonal, residuals.view());
+        let mut max_abs = 0.0_f64;
+        for i in 0..n {
+            for a in 0..rank {
+                max_abs = max_abs.max((coords_hoisted[[i, a]] - coords_naive[[i, a]]).abs());
+            }
+        }
+        assert!(
+            max_abs <= 1e-10,
+            "hoisted factor coordinates must equal naive rebuild; max |Δ| = {max_abs:e}"
+        );
+    }
+
+    /// FIX A regression: on an uneven-bin synthetic with a KNOWN planted single
+    /// factor, the low-rank reconstruction ΛΛᵀ + D built from the OCCUPANCY-
+    /// weighted scale law reconstructs the empirical second moment
+    /// (1/n) Σ_n r_n r_nᵀ strictly better (Frobenius) than the one built from
+    /// the bin-UNIFORM scale law. Uses the module's own `scaled_second_moment` /
+    /// eigen path so it exercises the real (Λ, D | scale) step.
+    #[test]
+    fn occupancy_scale_improves_second_moment_reconstruction() {
+        let n = 4000usize;
+        let p = 4usize;
+        let lambda0 = ndarray::array![1.5, 1.2, -0.4, 0.3];
+        let sigma_eps = 0.2_f64;
+        let slope = 2.0_f64;
+        let bins = ACTIVITY_SCALE_BINS.max(1);
+        let mut seed = 0xCA62C1D6_u64 ^ 0x9B05688C_u64;
+        let mut residuals = Array2::<f64>::zeros((n, p));
+        let mut activity = Array1::<f64>::zeros(n);
+        let mut c_true = Array1::<f64>::zeros(n);
+        for row in 0..n {
+            let u = (row as f64) / (n as f64 - 1.0);
+            let z = u * u * u; // cubic warp ⇒ uneven bin occupancy
+            activity[row] = z;
+            let c = (slope * z).exp();
+            c_true[row] = c;
+            let amp = c.sqrt();
+            let f = lcg_normal(&mut seed);
+            for i in 0..p {
+                residuals[[row, i]] = amp * lambda0[i] * f + sigma_eps * lcg_normal(&mut seed);
+            }
+        }
+
+        // Empirical (undeflated) second moment T = (1/n) Σ_n r_n r_nᵀ — the
+        // object the model's ΛΛᵀ + D must reconstruct.
+        let mut t = Array2::<f64>::zeros((p, p));
+        for i in 0..n {
+            for a in 0..p {
+                for b in 0..p {
+                    t[[a, b]] += residuals[[i, a]] * residuals[[i, b]];
+                }
+            }
+        }
+        t.mapv_inplace(|v| v / n as f64);
+
+        let raw_diag = column_variances(residuals.view());
+        let mean_var = raw_diag.iter().sum::<f64>() / p as f64;
+        let diag_floor = DIAGONAL_REL_FLOOR * mean_var.max(f64::MIN_POSITIVE);
+
+        // Per-bin raw scale law: mean of the true c(z) within each bin.
+        let row_bin = assign_bins(&activity, bins);
+        let mut bin_sum = vec![0.0_f64; bins];
+        let mut bin_cnt = vec![0.0_f64; bins];
+        for i in 0..n {
+            bin_sum[row_bin[i]] += c_true[i];
+            bin_cnt[row_bin[i]] += 1.0;
+        }
+        let bin_raw: Vec<f64> = (0..bins)
+            .map(|b| if bin_cnt[b] > 0.0 { bin_sum[b] / bin_cnt[b] } else { 1.0 })
+            .collect();
+
+        // Occupancy-weighted mean-1 (Fix A) vs bin-uniform mean-1 (old).
+        let mean_occ = (0..bins).map(|b| bin_cnt[b] * bin_raw[b]).sum::<f64>() / n as f64;
+        let occupied: Vec<usize> = (0..bins).filter(|&b| bin_cnt[b] > 0.0).collect();
+        let mean_uni =
+            occupied.iter().map(|&b| bin_raw[b]).sum::<f64>() / occupied.len() as f64;
+        let row_scale_occ: Array1<f64> =
+            (0..n).map(|i| bin_raw[row_bin[i]] / mean_occ).collect();
+        let row_scale_uni: Array1<f64> =
+            (0..n).map(|i| bin_raw[row_bin[i]] / mean_uni).collect();
+
+        // One (Λ, D | scale) extraction from the deflated moment, mirroring the
+        // production first sweep, returning the reconstruction ΛΛᵀ + D.
+        let extract_recon = |row_scale: &Array1<f64>| -> Array2<f64> {
+            let s = scaled_second_moment(residuals.view(), row_scale);
+            let (evals, evecs) = symmetric_eig_ascending(&s).expect("eig");
+            let mean_diag =
+                raw_diag.iter().map(|&v| v.max(diag_floor)).sum::<f64>() / p as f64;
+            let col = p - 1;
+            let amp = (evals[col] - mean_diag).max(0.0).sqrt();
+            let mut lam = Array1::<f64>::zeros(p);
+            for j in 0..p {
+                lam[j] = amp * evecs[[j, col]];
+            }
+            let mut recon = Array2::<f64>::zeros((p, p));
+            for a in 0..p {
+                for b in 0..p {
+                    recon[[a, b]] = lam[a] * lam[b];
+                }
+            }
+            for j in 0..p {
+                let d = (raw_diag[j] - lam[j] * lam[j]).max(diag_floor);
+                recon[[j, j]] += d;
+            }
+            recon
+        };
+
+        let frob = |m: &Array2<f64>| -> f64 {
+            let mut acc = 0.0_f64;
+            for a in 0..p {
+                for b in 0..p {
+                    let d = m[[a, b]] - t[[a, b]];
+                    acc += d * d;
+                }
+            }
+            acc.sqrt()
+        };
+
+        let dist_occ = frob(&extract_recon(&row_scale_occ));
+        let dist_uni = frob(&extract_recon(&row_scale_uni));
+        assert!(
+            dist_occ < dist_uni,
+            "occupancy-weighted reconstruction must beat bin-uniform: \
+             ‖·‖_F occ = {dist_occ:.6} vs uni = {dist_uni:.6}"
+        );
+    }
+
+    /// Fit a small structured model on a planted single-factor DGP — shared
+    /// fixture builder for the producer / damped-metric integration tests.
+    fn fit_small_model(seed0: u64, lambda0: &Array1<f64>) -> (usize, StructuredResidualModel) {
+        let n = 300usize;
+        let p = lambda0.len();
+        let sigma_eps = 0.25_f64;
+        let slope = 1.4_f64;
+        let mut seed = seed0;
+        let mut residuals = Array2::<f64>::zeros((n, p));
+        let mut activity = Array1::<f64>::zeros(n);
+        for row in 0..n {
+            let u = (row as f64) / (n as f64 - 1.0);
+            let z = u * u;
+            activity[row] = z;
+            let amp = (slope * z).exp().sqrt();
+            let f = lcg_normal(&mut seed);
+            for i in 0..p {
+                residuals[[row, i]] = amp * lambda0[i] * f + sigma_eps * lcg_normal(&mut seed);
+            }
+        }
+        let model = StructuredResidualModel::fit(ResidualFactorInput {
+            residuals: residuals.view(),
+            activity: activity.view(),
+            max_factor_rank: 2,
+        })
+        .expect("fit");
+        (n, model)
+    }
+
+    /// WAVE-2 producer integration (#2021): the WhitenedStructured RowMetric from
+    /// `row_metric` must deliver the exact Mahalanobis `vᵀ Σ_n^{-1} v` for
+    /// `Σ_n = c_n·ΛΛᵀ + D` over the fitted occupancy-normalized scale. A
+    /// deterministic refit reproduces the same metric (the seam `fit_row_metric`
+    /// relies on).
+    #[test]
+    fn row_metric_precision_matches_woodbury_over_fitted_scale() {
+        let lambda0 = ndarray::array![1.5, 1.2, -0.4, 0.3];
+        let (n, model) = fit_small_model(0x14057B7EF767814F_u64, &lambda0);
+        let p = 4usize;
+        assert!(model.factor_rank() >= 1, "need a factor for a non-trivial Σ_n");
+
+        let metric = model.row_metric(n).expect("row_metric");
+        assert!(
+            metric.whitens_likelihood(),
+            "WhitenedStructured metric must whiten the likelihood"
+        );
+
+        let rank = model.factor_rank();
+        let lam = model.factor();
+        let diag = model.diagonal();
+        let v: Array1<f64> = ndarray::array![0.7, -1.3, 0.4, 0.9];
+
+        for &row in &[0usize, n / 3, n / 2, n - 1] {
+            let c = model.row_scale()[row];
+            let mut sigma = Array2::<f64>::zeros((p, p));
+            for a in 0..p {
+                for b in 0..p {
+                    let mut fac = 0.0_f64;
+                    for k in 0..rank {
+                        fac += lam[[a, k]] * lam[[b, k]];
+                    }
+                    sigma[[a, b]] = c * fac;
+                }
+                sigma[[a, a]] += diag[a];
+            }
+            let chol = sigma.cholesky(Side::Lower).expect("Σ_n PD");
+            let x = chol.solvevec(&v);
+            let mahal_dense: f64 = v.iter().zip(x.iter()).map(|(a, b)| a * b).sum();
+            let mahal_metric = metric.quad_form(row, v.view());
+            assert!(
+                (mahal_dense - mahal_metric).abs() <= 1e-8 * (1.0 + mahal_dense.abs()),
+                "row {row}: metric quad_form {mahal_metric} must equal dense vᵀΣ⁻¹v {mahal_dense}"
+            );
+        }
+
+        // Deterministic refit reproduces the identical metric (fit_row_metric seam).
+        let (n2, model2) = fit_small_model(0x14057B7EF767814F_u64, &lambda0);
+        assert_eq!(n2, n);
+        let metric_again = model2.row_metric(n2).expect("row_metric again");
+        for &row in &[0usize, n / 2, n - 1] {
+            let q1 = metric.quad_form(row, v.view());
+            let q2 = metric_again.quad_form(row, v.view());
+            assert!(
+                (q1 - q2).abs() <= 1e-12 * (1.0 + q1.abs()),
+                "deterministic refit must match at row {row}: {q2} vs {q1}"
+            );
+        }
+    }
+
+    /// WAVE-2 #2021 damped metric endpoint contracts: γ=1 ≡ row_metric (ignores
+    /// prev), γ=0 ≡ prev.row_metric (or Euclidean identity), 0<γ<1 is SPD, and
+    /// out-of-range / non-finite γ is rejected.
+    #[test]
+    fn row_metric_damped_endpoints() {
+        let lambda_a = ndarray::array![1.5, 1.2, -0.4, 0.3];
+        let lambda_b = ndarray::array![-0.6, 1.1, 0.9, -1.3];
+        let (n, model) = fit_small_model(0x51ED270B_u64 ^ 0xF3A5C7D1_u64, &lambda_a);
+        let (n_prev, prev) = fit_small_model(0x2545F491_u64 ^ 0x4F6CDD1D_u64, &lambda_b);
+        assert_eq!(n, n_prev);
+        let p = 4usize;
+        let v: Array1<f64> = ndarray::array![0.7, -1.3, 0.4, 0.9];
+
+        // γ = 1 ⇒ byte-identical to this model's row_metric, regardless of prev.
+        let base = model.row_metric(n).expect("row_metric");
+        for prev_opt in [None, Some(&prev)] {
+            let damped = model.row_metric_damped(n, 1.0, prev_opt).expect("damped γ=1");
+            for row in [0usize, n / 2, n - 1] {
+                for i in 0..p {
+                    for k in 0..p {
+                        assert_eq!(
+                            damped.factor_entry(row, i, k),
+                            base.factor_entry(row, i, k),
+                            "γ=1 must be byte-identical to row_metric at ({row},{i},{k})"
+                        );
+                    }
+                }
+            }
+        }
+
+        // γ = 0, prev = None ⇒ Euclidean identity: quad_form = ‖v‖².
+        let ident = model.row_metric_damped(n, 0.0, None).expect("damped γ=0 None");
+        let sumsq: f64 = v.iter().map(|x| x * x).sum();
+        for row in [0usize, n / 2, n - 1] {
+            let q = ident.quad_form(row, v.view());
+            assert!(
+                (q - sumsq).abs() <= 1e-12 * (1.0 + sumsq),
+                "γ=0/None must be the identity metric: quad_form {q} vs ‖v‖² {sumsq}"
+            );
+        }
+
+        // γ = 0, prev = Some ⇒ byte-identical to prev.row_metric.
+        let prev_metric = prev.row_metric(n).expect("prev row_metric");
+        let damped0 = model.row_metric_damped(n, 0.0, Some(&prev)).expect("damped γ=0 Some");
+        for row in [0usize, n / 2, n - 1] {
+            for i in 0..p {
+                for k in 0..p {
+                    assert_eq!(
+                        damped0.factor_entry(row, i, k),
+                        prev_metric.factor_entry(row, i, k),
+                        "γ=0/Some must be byte-identical to prev.row_metric at ({row},{i},{k})"
+                    );
+                }
+            }
+        }
+
+        // 0 < γ < 1 ⇒ valid SPD metric.
+        let mid = model.row_metric_damped(n, 0.5, Some(&prev)).expect("damped γ=0.5");
+        for row in [0usize, n / 2, n - 1] {
+            let q = mid.quad_form(row, v.view());
+            assert!(q.is_finite() && q > 0.0, "γ=0.5 metric must be SPD; got {q}");
+        }
+
+        // Invalid γ rejected.
+        assert!(model.row_metric_damped(n, 1.5, None).is_err());
+        assert!(model.row_metric_damped(n, -0.1, None).is_err());
+        assert!(model.row_metric_damped(n, f64::NAN, None).is_err());
+    }
+
+    /// WAVE-2 #2021 Λ nursery→promotion: `promotion_candidates` must fire only
+    /// for a factor that BOTH persists across passes (aligns with the previous
+    /// model's Λ) AND clears the idiosyncratic-noise energy floor; a fresh
+    /// orthogonal direction, an over-high energy floor, and `prev = None` all
+    /// yield no candidates, and out-of-range gates are rejected.
+    #[test]
+    fn promotion_candidates_gates_on_persistence_and_energy() {
+        let lambda_a = ndarray::array![1.5, 1.2, -0.4, 0.3];
+        let lambda_b = ndarray::array![-0.6, 1.1, 0.9, -1.3];
+        // Same planted direction across two passes ⇒ persistent.
+        let (_, prev) = fit_small_model(0xA1B2C3D4_u64 ^ 0x0F0F0F0F_u64, &lambda_a);
+        let (_, cur) = fit_small_model(0x5566778899AABBCC_u64, &lambda_a);
+        // A different (well-separated) planted direction ⇒ NOT aligned with cur.
+        let (_, other) = fit_small_model(0x1122334455667788_u64, &lambda_b);
+
+        assert!(prev.factor_rank() >= 1 && cur.factor_rank() >= 1 && other.factor_rank() >= 1);
+
+        // Persistent + energetic ⇒ at least one candidate, aligned with the
+        // planted direction and above the noise floor.
+        let cands = cur
+            .promotion_candidates(Some(&prev), 0.9, 1.0)
+            .expect("promotion_candidates");
+        assert!(
+            !cands.is_empty(),
+            "a persistent, energetic factor must yield a promotion candidate"
+        );
+        let top = &cands[0];
+        assert!(
+            top.persistence_alignment >= 0.9,
+            "top candidate must clear the alignment gate; got {}",
+            top.persistence_alignment
+        );
+        // The promoted unit direction must align with the planted (unit) lambda_a.
+        let la_norm = lambda_a.dot(&lambda_a).sqrt();
+        let la_unit = lambda_a.mapv(|v| v / la_norm);
+        let dir_cos = top.direction.dot(&la_unit).abs();
+        assert!(
+            dir_cos > 0.9,
+            "promoted direction must recover the planted factor; |cos| = {dir_cos:.4}"
+        );
+        assert!(
+            (top.direction.dot(&top.direction) - 1.0).abs() < 1e-10,
+            "promoted direction must be unit-norm"
+        );
+        assert!(top.energy > 0.0);
+
+        // A fresh, well-separated direction does NOT persist ⇒ no candidate at 0.9.
+        let cross = cur
+            .promotion_candidates(Some(&other), 0.9, 1.0)
+            .expect("promotion_candidates cross");
+        assert!(
+            cross.is_empty(),
+            "a non-persistent (unaligned) factor must not be promoted; got {} candidate(s)",
+            cross.len()
+        );
+
+        // An over-high energy floor rejects even the persistent factor.
+        let floored = cur
+            .promotion_candidates(Some(&prev), 0.9, 1.0e6)
+            .expect("promotion_candidates floored");
+        assert!(
+            floored.is_empty(),
+            "energy floor must gate out factors below the noise-scaled threshold"
+        );
+
+        // prev = None (first structured pass, damping toward I) ⇒ no candidates.
+        assert!(cur.promotion_candidates(None, 0.9, 1.0).unwrap().is_empty());
+
+        // Invalid gates rejected.
+        assert!(cur.promotion_candidates(Some(&prev), 1.5, 1.0).is_err());
+        assert!(cur.promotion_candidates(Some(&prev), -0.1, 1.0).is_err());
+        assert!(cur.promotion_candidates(Some(&prev), 0.9, -1.0).is_err());
+        assert!(cur.promotion_candidates(Some(&prev), f64::NAN, 1.0).is_err());
     }
 }

@@ -711,12 +711,52 @@ pub fn fit_penalized_multinomial(
 
     let (max_abs_eta, row_index, active_class_index) = max_abs_eta_location(fit.eta.view());
     if !fit.converged && max_abs_eta >= MULTINOMIAL_SEPARATION_ETA_THRESHOLD {
-        return Err(EstimationError::MultinomialSeparationDetected {
-            iteration: fit.iterations,
-            max_abs_eta,
-            active_class_index,
-            row_index,
-        });
+        // Perfect / quasi-perfect separation (#1854): the UNBIASED softmax MLE is
+        // not finite along `active_class_index`'s saturated logit direction, so
+        // the fixed-λ Newton above ran away (`|η| ≥ 25`, no convergence). A
+        // penalty-null direction `v` (`S v = 0`, e.g. an unpenalized intercept /
+        // linear-covariate column) under softmax saturation has
+        // `(XᵀWX + λS) v → 0` for EVERY λ, so no smoothing parameter can bound it
+        // — only a proper prior on that quotient-null subspace can. Rather than
+        // hard-erroring, engage the Firth/Jeffreys proper prior automatically
+        // (magic-by-default): the full-span `½ log|I(β)|` correction supplies the
+        // `O(1)` curvature that keeps the estimate finite on exactly those
+        // separated directions while leaving well-identified fits untouched. This
+        // reuses the same coupled joint-Newton Jeffreys machinery the formula
+        // REML path arms on separation evidence (see
+        // `fit_penalized_multinomial_formula`), only here at the caller's fixed λ.
+        // Engage the fallback, but never let an internal consistency panic in
+        // the coupled joint-Newton assembly (e.g. the #1395 logdet-collapse
+        // guard) escape as a process abort: convert any panic into the
+        // documented hard separation diagnostic, exactly as if the refit had
+        // returned Err. This mirrors the catch_unwind panic-to-typed-error
+        // boundary already used around the faer / cudarc entry points, and keeps
+        // the separation path no worse than the pre-#1854 clean error while the
+        // Firth refit is still being hardened.
+        let firth = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fit_penalized_multinomial_firth_fallback(
+                design,
+                y_one_hot,
+                penalty,
+                lambdas,
+                row_weights,
+                max_iter,
+                tol,
+            )
+        }));
+        match firth {
+            Ok(Ok(out)) => return Ok(out),
+            // Firth refit errored, or an internal consistency guard panicked:
+            // fall back to the explicit hard separation diagnostic.
+            Ok(Err(_)) | Err(_) => {
+                return Err(EstimationError::MultinomialSeparationDetected {
+                    iteration: fit.iterations,
+                    max_abs_eta,
+                    active_class_index,
+                    row_index,
+                });
+            }
+        }
     }
 
     let fitted_probabilities = likelihood.probabilities(fit.eta.view());
@@ -729,6 +769,463 @@ pub fn fit_penalized_multinomial(
         penalized_neg_log_likelihood: -fit.log_likelihood + fit.penalty_term,
         deviance: -2.0 * fit.log_likelihood,
         coefficient_covariance: fit.coefficient_covariance,
+    })
+}
+
+/// Firth/Jeffreys-penalized multinomial refit engaged automatically when the
+/// unbiased softmax MLE separates (#1854).
+///
+/// The unbiased fixed-λ solve ([`fit_penalized_multinomial`]) runs away on
+/// (quasi-)separated data because the softmax likelihood has no finite mode along
+/// the saturated logit direction and the smoothing penalty `S` cannot bound a
+/// penalty-null direction (`S v = 0` ⇒ `(XᵀWX + λS) v → 0` for every λ). This
+/// refit arms the full-span Jeffreys/Firth proper prior `½ log|I(β)|` on the
+/// coupled joint softmax information, which supplies the `O(1)` curvature that
+/// bounds exactly those directions and keeps the estimate finite.
+///
+/// # The estimator
+///
+/// It maximizes the penalized Firth objective at the caller's *fixed* `λ`
+///
+/// ```text
+///   ℓ*(β) = Σ_n w_n Σ_c y_{nc} log p_{nc}
+///           − ½ Σ_a λ_a βₐᵀ S βₐ
+///           + ½ log det I(β)
+/// ```
+///
+/// where `I(β)` is the coupled `(P·M)×(P·M)` softmax Fisher information (block
+/// `(a,b)` is `Σ_n w_n (δ_{ab} p_{na} − p_{na} p_{nb}) x_n x_nᵀ`, block-ordered so
+/// `θ[a·P+i] = β[i,a]`) and `M = K−1` active classes carry the reference-coded
+/// logits (`η_{ref} ≡ 0`). The Jeffreys term `½ log det I(β)` is the standard
+/// Firth penalty: it diverges to `−∞` as any fitted probability approaches the
+/// simplex boundary (`I → 0`), so its maximizer is interior and finite on exactly
+/// the separated directions that defeat every smoothing `λ`.
+///
+/// # Why this fixed-λ solver rather than the outer-REML formula path
+///
+/// The direct entry ([`fit_penalized_multinomial`]) is a fixed-λ inner solve — it
+/// carries no outer smoothing selection — so the natural Firth engagement is a
+/// fixed-λ Firth Newton, not the formula path's outer-REML joint-Newton machinery
+/// (which is armed instead by [`fit_penalized_multinomial_formula`] on separation
+/// evidence). Solving the Firth objective directly here keeps the separation
+/// contract self-contained and independent of the shared trust-region/KKT
+/// certificate machinery.
+///
+/// # The iteration
+///
+/// A Fisher-scoring Newton on `ℓ*`: the ascent direction is
+/// `Δ = (I + Λ⊗S)⁻¹ U*`, where `U*` is the Firth-adjusted penalized score
+///
+/// ```text
+///   U*[(c,s)] = Σ_n w_n x_{ns} (y_{nc} − p_{nc})       (data score)
+///             − λ_c (S β_c)_s                           (smoothing penalty)
+///             + ½ Σ_n w_n x_{ns} h^c_n                  (Firth adjustment)
+/// ```
+///
+/// and the Firth adjustment uses `h^c_n = Σ_{a,b} G^c_{n,ab} Q_{n,ab}` with the
+/// per-row information "hat" `Q_{n,ab} = x_nᵀ [I⁻¹]_{(a,b)} x_n` and the softmax
+/// third-derivative tensor
+/// `G^c_{ab} = δ_{ab} p_a (δ_{ac} − p_c) − p_a p_b (δ_{ac} + δ_{bc} − 2 p_c)`.
+/// This `½ Σ tr(I⁻¹ ∂I/∂β)` is exactly `∇[½ log det I]` (finite-difference
+/// verified). Each step is globalized by backtracking on `ℓ*`, so a step that
+/// would push a probability to the boundary (making `I` non-PD) is rejected and
+/// the fit stays interior. Convergence is the Newton decrement `½ U*ᵀΔ`.
+fn fit_penalized_multinomial_firth_fallback(
+    design: ArrayView2<'_, f64>,
+    y_one_hot: ArrayView2<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    lambdas: ArrayView1<'_, f64>,
+    row_weights: Option<ArrayView1<'_, f64>>,
+    max_iter: usize,
+    tol: f64,
+) -> Result<MultinomialFitOutputs, EstimationError> {
+    use faer::Side;
+    use gam_linalg::faer_ndarray::{
+        FaerArrayView, array1_to_col_matmut, array2_to_matmut, factorize_symmetricwith_fallback,
+    };
+    use gam_linalg::matrix::FactorizedSystem;
+
+    let n_obs = design.nrows();
+    let p = design.ncols();
+    let k = y_one_hot.ncols();
+    let m = k - 1;
+    let d = p * m;
+
+    // Local softmax likelihood mirroring the caller's row weights, used to map the
+    // fitted η back to probabilities.
+    let mut likelihood = MultinomialLogitLikelihood::with_classes(k)?;
+    if let Some(w) = row_weights.as_ref() {
+        likelihood = likelihood.with_row_weights(w.to_owned())?;
+    }
+    let weight = |row: usize| -> f64 { row_weights.as_ref().map_or(1.0, |w| w[row]) };
+
+    let max_iter = max_iter.max(1);
+    let tol_eff = if tol.is_finite() && tol > 0.0 { tol } else { 1e-8 };
+
+    // Probabilities (N, K), active classes 0..M then the pinned reference at M.
+    let probs_at = |beta: &Array2<f64>| -> Array2<f64> {
+        let eta = design.dot(beta);
+        likelihood.probabilities(eta.view())
+    };
+
+    // Coupled softmax Fisher information I (d×d), block-ordered θ[a·P+i] = β[i,a].
+    let assemble_info = |probs: &Array2<f64>| -> Array2<f64> {
+        let mut info = Array2::<f64>::zeros((d, d));
+        for row in 0..n_obs {
+            let w = weight(row);
+            if w == 0.0 {
+                continue;
+            }
+            for a in 0..m {
+                let pa = probs[[row, a]];
+                let ao = a * p;
+                for b in 0..m {
+                    let pb = probs[[row, b]];
+                    let wab = w * (if a == b { pa - pa * pb } else { -pa * pb });
+                    if wab == 0.0 {
+                        continue;
+                    }
+                    let bo = b * p;
+                    for i in 0..p {
+                        let xi = design[[row, i]];
+                        if xi == 0.0 {
+                            continue;
+                        }
+                        let cc = wab * xi;
+                        for j in 0..p {
+                            info[[ao + i, bo + j]] += cc * design[[row, j]];
+                        }
+                    }
+                }
+            }
+        }
+        info
+    };
+
+    // Factor a symmetric matrix (with escalating ridge only if it is not SPD) and
+    // return its inverse and log-determinant.
+    let invert_spd = |mat: &Array2<f64>, context: &str| -> Result<(Array2<f64>, f64), EstimationError> {
+        let max_diag = (0..d).fold(0.0_f64, |acc, i| acc.max(mat[[i, i]].abs()));
+        let base = if max_diag.is_finite() && max_diag > 0.0 {
+            max_diag * 1e-10
+        } else {
+            1e-10
+        };
+        let mut ridge = 0.0_f64;
+        for _ in 0..=60 {
+            let mut ridged = mat.clone();
+            if ridge > 0.0 {
+                for i in 0..d {
+                    ridged[[i, i]] += ridge;
+                }
+            }
+            if let Ok(factor) =
+                factorize_symmetricwith_fallback(FaerArrayView::new(&ridged).as_ref(), Side::Lower)
+            {
+                let logdet = factor.logdet();
+                if logdet.is_finite() {
+                    let mut rhs = Array2::<f64>::eye(d);
+                    {
+                        let v = array2_to_matmut(&mut rhs);
+                        factor.solve_in_place(v);
+                    }
+                    if rhs.iter().all(|x| x.is_finite()) {
+                        let mut inv = Array2::<f64>::zeros((d, d));
+                        for i in 0..d {
+                            for j in 0..d {
+                                inv[[i, j]] = 0.5 * (rhs[[i, j]] + rhs[[j, i]]);
+                            }
+                        }
+                        return Ok((inv, logdet));
+                    }
+                }
+            }
+            ridge = if ridge > 0.0 { ridge * 4.0 } else { base };
+        }
+        Err(EstimationError::InvalidInput(format!(
+            "multinomial Firth fallback: {context} not invertible (max_diag={max_diag:.3e})"
+        )))
+    };
+
+    // SPD log-determinant only (no ridge): used by the backtracking line search to
+    // reject any candidate that pushes a fitted probability to the simplex
+    // boundary (where I loses positive-definiteness and the Firth term → −∞).
+    let spd_logdet = |mat: &Array2<f64>| -> Option<f64> {
+        factorize_symmetricwith_fallback(FaerArrayView::new(mat).as_ref(), Side::Lower)
+            .ok()
+            .map(|factor| factor.logdet())
+            .filter(|ld| ld.is_finite())
+    };
+
+    // Penalized Firth objective ℓ* (MAXIMIZED), given probabilities, β, and the
+    // precomputed log det I(β).
+    let objective = |probs: &Array2<f64>, beta: &Array2<f64>, logdet_info: f64| -> f64 {
+        let mut ll = 0.0_f64;
+        for row in 0..n_obs {
+            let w = weight(row);
+            if w == 0.0 {
+                continue;
+            }
+            for c in 0..k {
+                let ycn = y_one_hot[[row, c]];
+                if ycn != 0.0 {
+                    ll += w * ycn * probs[[row, c]].max(f64::MIN_POSITIVE).ln();
+                }
+            }
+        }
+        let mut pen = 0.0_f64;
+        for a in 0..m {
+            let la = lambdas[a];
+            if la != 0.0 {
+                let bcol = beta.column(a);
+                let sbeta = penalty.dot(&bcol);
+                pen += 0.5 * la * bcol.dot(&sbeta);
+            }
+        }
+        ll - pen + 0.5 * logdet_info
+    };
+
+    // Firth-adjusted penalized score U* (length d, block-ordered).
+    let firth_score = |probs: &Array2<f64>, beta: &Array2<f64>, iinv: &Array2<f64>| -> Array1<f64> {
+        let mut u = Array1::<f64>::zeros(d);
+        let mut xn = vec![0.0_f64; p];
+        let mut pa = vec![0.0_f64; m];
+        let mut q = vec![0.0_f64; m * m];
+        for row in 0..n_obs {
+            let w = weight(row);
+            if w == 0.0 {
+                continue;
+            }
+            for i in 0..p {
+                xn[i] = design[[row, i]];
+            }
+            for a in 0..m {
+                pa[a] = probs[[row, a]];
+            }
+            // Data score: U[(a,i)] += w x_{ni} (y_{na} − p_{na}).
+            for a in 0..m {
+                let resid = y_one_hot[[row, a]] - pa[a];
+                let ao = a * p;
+                for i in 0..p {
+                    u[ao + i] += w * xn[i] * resid;
+                }
+            }
+            // Per-row information hat Q_{ab} = x_nᵀ [I⁻¹]_{(a,b)} x_n.
+            for a in 0..m {
+                let ao = a * p;
+                for b in 0..m {
+                    let bo = b * p;
+                    let mut s = 0.0_f64;
+                    for i in 0..p {
+                        let xi = xn[i];
+                        if xi == 0.0 {
+                            continue;
+                        }
+                        let mut inner = 0.0_f64;
+                        for j in 0..p {
+                            inner += iinv[[ao + i, bo + j]] * xn[j];
+                        }
+                        s += xi * inner;
+                    }
+                    q[a * m + b] = s;
+                }
+            }
+            // Firth adjustment: U[(c,s)] += ½ w x_{ns} h^c_n.
+            for c in 0..m {
+                let pc = pa[c];
+                let mut h = 0.0_f64;
+                for a in 0..m {
+                    for b in 0..m {
+                        let dab = if a == b { 1.0 } else { 0.0 };
+                        let dac = if a == c { 1.0 } else { 0.0 };
+                        let dbc = if b == c { 1.0 } else { 0.0 };
+                        let g = dab * pa[a] * (dac - pc)
+                            - pa[a] * pa[b] * (dac + dbc - 2.0 * pc);
+                        h += g * q[a * m + b];
+                    }
+                }
+                let co = c * p;
+                for s in 0..p {
+                    u[co + s] += 0.5 * w * h * xn[s];
+                }
+            }
+        }
+        // Smoothing penalty gradient: U[(a,i)] −= λ_a (S β_a)_i.
+        for a in 0..m {
+            let la = lambdas[a];
+            if la != 0.0 {
+                let sbeta = penalty.dot(&beta.column(a));
+                let ao = a * p;
+                for i in 0..p {
+                    u[ao + i] -= la * sbeta[i];
+                }
+            }
+        }
+        u
+    };
+
+    // Penalized Hessian H = I + blockdiag_a(λ_a S) (positive definite).
+    let penalized_hessian = |info: &Array2<f64>| -> Array2<f64> {
+        let mut h = info.clone();
+        for a in 0..m {
+            let la = lambdas[a];
+            if la != 0.0 {
+                let ao = a * p;
+                for i in 0..p {
+                    for j in 0..p {
+                        h[[ao + i, ao + j]] += la * penalty[[i, j]];
+                    }
+                }
+            }
+        }
+        h
+    };
+
+    // Solve H Δ = U* for the SPD penalized Hessian, ridge-escalating only on
+    // factorization failure.
+    let solve_spd = |mat: &Array2<f64>, rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
+        let max_diag = (0..d).fold(0.0_f64, |acc, i| acc.max(mat[[i, i]].abs()));
+        let base = if max_diag.is_finite() && max_diag > 0.0 {
+            max_diag * 1e-12
+        } else {
+            1e-12
+        };
+        let mut ridge = 0.0_f64;
+        for _ in 0..=60 {
+            let mut ridged = mat.clone();
+            if ridge > 0.0 {
+                for i in 0..d {
+                    ridged[[i, i]] += ridge;
+                }
+            }
+            if let Ok(factor) =
+                factorize_symmetricwith_fallback(FaerArrayView::new(&ridged).as_ref(), Side::Lower)
+            {
+                let mut sol = rhs.clone();
+                {
+                    let v = array1_to_col_matmut(&mut sol);
+                    factor.solve_in_place(v);
+                }
+                if sol.iter().all(|x| x.is_finite()) {
+                    return Ok(sol);
+                }
+            }
+            ridge = if ridge > 0.0 { ridge * 4.0 } else { base };
+        }
+        Err(EstimationError::InvalidInput(
+            "multinomial Firth fallback: penalized Hessian solve failed".to_string(),
+        ))
+    };
+
+    // ─────────────────────────── Firth Newton loop ────────────────────────────
+    let mut beta = Array2::<f64>::zeros((p, m));
+    let mut converged = false;
+    let mut iterations = 0_usize;
+    for it in 0..max_iter {
+        iterations = it + 1;
+        let probs = probs_at(&beta);
+        let info = assemble_info(&probs);
+        let (iinv, logdet_info) = invert_spd(&info, "Fisher information")?;
+        let u = firth_score(&probs, &beta, &iinv);
+        let hmat = penalized_hessian(&info);
+        let step_vec = solve_spd(&hmat, &u)?;
+
+        // Newton decrement ½ U*ᵀ H⁻¹ U* = ½ U*ᵀ Δ (≥ 0, scale-aware stop).
+        let decrement = u.dot(&step_vec);
+        if 0.5 * decrement.abs() < tol_eff {
+            converged = true;
+            break;
+        }
+
+        // Δ as (P, M): delta[i, a] = step_vec[a·P + i].
+        let mut delta = Array2::<f64>::zeros((p, m));
+        for a in 0..m {
+            let ao = a * p;
+            for i in 0..p {
+                delta[[i, a]] = step_vec[ao + i];
+            }
+        }
+
+        // Backtracking line search on ℓ* (ascent). Reject any candidate whose I is
+        // not SPD (boundary), so the iterate stays interior.
+        let o0 = objective(&probs, &beta, logdet_info);
+        let mut step = 1.0_f64;
+        let mut accepted = false;
+        for _ in 0..60 {
+            let cand = &beta + &(&delta * step);
+            let cand_probs = probs_at(&cand);
+            let cand_info = assemble_info(&cand_probs);
+            if let Some(cand_logdet) = spd_logdet(&cand_info) {
+                let o1 = objective(&cand_probs, &cand, cand_logdet);
+                if o1 >= o0 - 1e-12 {
+                    beta = cand;
+                    accepted = true;
+                    break;
+                }
+            }
+            step *= 0.5;
+        }
+        if !accepted {
+            // No admissible ascent step: at (or numerically at) the interior mode.
+            converged = true;
+            break;
+        }
+
+        let max_step = step * delta.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        let scale = 1.0 + beta.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        if max_step < tol_eff * scale {
+            converged = true;
+            break;
+        }
+    }
+
+    // ─────────────────────────── final quantities ─────────────────────────────
+    for (idx, &v) in beta.iter().enumerate() {
+        if !v.is_finite() {
+            crate::bail_invalid_estim!(
+                "multinomial Firth fallback: non-finite coefficient at flat index {idx} = {v}"
+            );
+        }
+    }
+    let coefficients_active = beta;
+
+    let probs = probs_at(&coefficients_active);
+    let info = assemble_info(&probs);
+    // Laplace covariance H⁻¹ at the converged mode (block-ordered θ[a·P+i]).
+    let hmat = penalized_hessian(&info);
+    let coefficient_covariance = match invert_spd(&hmat, "penalized Hessian covariance") {
+        Ok((cov, _)) => cov,
+        Err(_) => Array2::<f64>::zeros((d, d)),
+    };
+
+    let fitted_probabilities = probs;
+    let mut log_likelihood = 0.0_f64;
+    for row in 0..n_obs {
+        let w = weight(row);
+        for c in 0..k {
+            let ycn = y_one_hot[[row, c]];
+            if ycn != 0.0 {
+                log_likelihood +=
+                    w * ycn * fitted_probabilities[[row, c]].max(f64::MIN_POSITIVE).ln();
+            }
+        }
+    }
+
+    let mut penalty_term = 0.0_f64;
+    for a in 0..m {
+        let beta_col = coefficients_active.column(a);
+        let sbeta = penalty.dot(&beta_col);
+        penalty_term += 0.5 * lambdas[a] * beta_col.dot(&sbeta);
+    }
+
+    Ok(MultinomialFitOutputs {
+        coefficients_active,
+        fitted_probabilities,
+        iterations,
+        converged,
+        penalized_neg_log_likelihood: -log_likelihood + penalty_term,
+        deviance: -2.0 * log_likelihood,
+        coefficient_covariance,
     })
 }
 
@@ -2654,7 +3151,14 @@ mod fisher_override_tests {
     }
 
     #[test]
-    fn fixed_lambda_multinomial_reports_complete_separation() {
+    fn fixed_lambda_multinomial_firth_keeps_complete_separation_finite() {
+        // #1854: complete softmax separation used to be a HARD diagnostic
+        // (`MultinomialSeparationDetected`). It now automatically engages the
+        // Firth/Jeffreys proper prior (`½ log|I(β)|`, magic-by-default) so the fit
+        // stays finite instead of running away — the same guarantee the formula
+        // REML path already provided. The class regions are cleanly separated by
+        // `x`, so the unbiased MLE is at infinity; the Firth-penalized fit must
+        // still converge to a finite mode and recover the region structure.
         let n = 90;
         let design = Array2::<f64>::from_shape_fn((n, 2), |(row, col)| match col {
             0 => 1.0,
@@ -2674,7 +3178,7 @@ mod fisher_override_tests {
         }
         let penalty = Array2::<f64>::zeros((2, 2));
         let lambdas = Array1::<f64>::zeros(2);
-        let err = fit_penalized_multinomial(MultinomialFitInputs {
+        let out = fit_penalized_multinomial(MultinomialFitInputs {
             design: design.view(),
             y_one_hot: y.view(),
             penalty: penalty.view(),
@@ -2684,23 +3188,53 @@ mod fisher_override_tests {
             max_iter: 80,
             tol: 1.0e-12,
         })
-        .expect_err("complete softmax separation must be a hard diagnostic");
+        .expect("Firth/Jeffreys prior keeps the separated multinomial fit finite (#1854)");
         assert!(
-            matches!(err, EstimationError::MultinomialSeparationDetected { .. }),
-            "expected MultinomialSeparationDetected, got {err:?}"
+            out.converged,
+            "the Firth-penalized separation refit must report convergence"
         );
-        assert!(
-            err.to_string().contains("separation"),
-            "diagnostic should mention separation, got {err}"
-        );
-        assert!(
-            err.to_string().contains("active class-"),
-            "diagnostic should name the separated active class logit, got {err}"
-        );
-        assert!(
-            !err.to_string().contains("binary outcomes"),
-            "multinomial diagnostic must not reuse the binary separation text, got {err}"
-        );
+        // Every coefficient is finite — the whole point of the Firth prior on the
+        // separated (unpenalized) logit directions.
+        for &b in out.coefficients_active.iter() {
+            assert!(
+                b.is_finite(),
+                "Firth-penalized coefficients must be finite, got {b}"
+            );
+        }
+        // Fitted probabilities remain a valid simplex per row.
+        for row in 0..n {
+            let mut mass = 0.0_f64;
+            for c in 0..3 {
+                let p = out.fitted_probabilities[[row, c]];
+                assert!(
+                    p.is_finite() && (0.0..=1.0 + 1e-9).contains(&p),
+                    "row {row} class {c} probability {p} out of [0,1]"
+                );
+                mass += p;
+            }
+            assert!(
+                (mass - 1.0).abs() < 1e-6,
+                "row {row} probabilities must sum to 1, got {mass}"
+            );
+        }
+        // The finite fit still recovers the separated structure: on a clearly
+        // interior representative of each region the predicted class is correct.
+        let predict = |x: f64| -> usize {
+            let mut eta = [0.0_f64; 3];
+            for a in 0..2 {
+                eta[a] = out.coefficients_active[[0, a]] + out.coefficients_active[[1, a]] * x;
+            }
+            let mut best = 0usize;
+            for c in 1..3 {
+                if eta[c] > eta[best] {
+                    best = c;
+                }
+            }
+            best
+        };
+        assert_eq!(predict(-2.5), 0, "deep-left region should predict class 0");
+        assert_eq!(predict(2.5), 1, "deep-right region should predict class 1");
+        assert_eq!(predict(0.0), 2, "central region should predict class 2");
     }
 
     #[test]
@@ -2904,6 +3438,133 @@ mod fisher_override_tests {
             .zip(analytic.coefficients_active.iter())
             .any(|(a, b)| (a - b).abs() > 1.0e-6);
         assert!(differs, "scaled curvature must change the first step");
+    }
+}
+
+#[cfg(test)]
+mod separation_firth_tests {
+    //! Regression for #1854: on (quasi-)perfect separation the fixed-λ direct
+    //! multinomial solve must engage the Firth/Jeffreys penalty and return a
+    //! finite, converged, well-behaved fit instead of hard-erroring with
+    //! `MultinomialSeparationDetected`.
+    use super::*;
+
+    /// A perfectly linearly separable 3-class problem with an UNPENALIZED design
+    /// (`S = 0`), so no smoothing `λ` can bound the saturated logits — only the
+    /// Firth prior `½ log det I(β)` keeps the estimate finite. The unbiased MLE
+    /// here runs `|η| → ∞` (separation), which is exactly the #1854 trigger.
+    fn separated_three_class() -> (Array2<f64>, Array2<f64>, Array2<f64>, Array1<f64>) {
+        let n = 21;
+        let p = 2; // intercept + ordering covariate x
+        let k = 3;
+        let mut design = Array2::<f64>::zeros((n, p));
+        let mut y = Array2::<f64>::zeros((n, k));
+        for i in 0..n {
+            let x = -3.0 + 6.0 * (i as f64) / ((n - 1) as f64);
+            design[[i, 0]] = 1.0;
+            design[[i, 1]] = x;
+            let cls = if x < -1.0 {
+                0
+            } else if x < 1.0 {
+                1
+            } else {
+                2
+            };
+            y[[i, cls]] = 1.0;
+        }
+        // S = 0: no smoothing direction can bound the separated logits.
+        let penalty = Array2::<f64>::zeros((p, p));
+        let lambdas = Array1::<f64>::from_elem(k - 1, 1.0);
+        (design, y, penalty, lambdas)
+    }
+
+    #[test]
+    fn separation_engages_firth_finite_converged_fit() {
+        let (design, y, penalty, lambdas) = separated_three_class();
+        let out = fit_penalized_multinomial(MultinomialFitInputs {
+            design: design.view(),
+            y_one_hot: y.view(),
+            penalty: penalty.view(),
+            lambdas: lambdas.view(),
+            row_weights: None,
+            fisher_w_override: None,
+            max_iter: 300,
+            tol: 1e-10,
+        })
+        .expect("separated multinomial must engage Firth and return a fit, not error");
+
+        assert!(out.converged, "Firth-engaged separation fit must converge");
+        assert!(
+            out.coefficients_active.iter().all(|v| v.is_finite()),
+            "all coefficients must be finite under the Firth prior"
+        );
+        assert!(out.deviance.is_finite(), "deviance must be finite");
+
+        // The runaway MLE would drive fitted probabilities to the {0,1} boundary;
+        // the Firth prior keeps them strictly interior.
+        for v in out.fitted_probabilities.iter() {
+            assert!(
+                *v > 0.0 && *v < 1.0,
+                "Firth fit must stay interior, got p={v}"
+            );
+        }
+
+        // Perfect separation ⇒ every training row classified to its true class.
+        let n = design.nrows();
+        let k = y.ncols();
+        for i in 0..n {
+            let mut best = 0usize;
+            for c in 1..k {
+                if out.fitted_probabilities[[i, c]] > out.fitted_probabilities[[i, best]] {
+                    best = c;
+                }
+            }
+            let truth = (0..k)
+                .find(|&c| y[[i, c]] == 1.0)
+                .expect("one-hot truth class");
+            assert_eq!(best, truth, "row {i} misclassified under separation");
+        }
+    }
+
+    #[test]
+    fn separation_firth_returns_finite_wellshaped_covariance() {
+        // Distinct angle: the Firth separation path must also expose a finite,
+        // correctly-shaped (P·M × P·M) Laplace coefficient covariance — the
+        // downstream SE machinery consumes it. A runaway MLE would have a
+        // singular (non-invertible) information here.
+        let (design, y, penalty, lambdas) = separated_three_class();
+        let p = design.ncols();
+        let k = y.ncols();
+        let m = k - 1;
+        let out = fit_penalized_multinomial(MultinomialFitInputs {
+            design: design.view(),
+            y_one_hot: y.view(),
+            penalty: penalty.view(),
+            lambdas: lambdas.view(),
+            row_weights: None,
+            fisher_w_override: None,
+            max_iter: 300,
+            tol: 1e-10,
+        })
+        .expect("separated multinomial must return a Firth fit");
+
+        assert_eq!(
+            out.coefficient_covariance.dim(),
+            (p * m, p * m),
+            "covariance must be P·M square"
+        );
+        assert!(
+            out.coefficient_covariance.iter().all(|v| v.is_finite()),
+            "Firth covariance entries must be finite"
+        );
+        // A genuine Laplace covariance is PSD ⇒ non-negative diagonal.
+        for i in 0..(p * m) {
+            assert!(
+                out.coefficient_covariance[[i, i]] >= -1e-9,
+                "covariance diagonal must be non-negative, got {}",
+                out.coefficient_covariance[[i, i]]
+            );
+        }
     }
 }
 

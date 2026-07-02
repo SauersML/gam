@@ -1784,3 +1784,83 @@ fn issue_876_periodic_latent_duchon_decoder_is_seam_consistent_and_recovers_circ
         seam_err(&fitted_open),
     );
 }
+
+/// Regression for #2033: a model fitted with prior weights must retain its
+/// weight column through the prediction/replicate projection. The #2025 fix
+/// made `generative_replicates_impl` resolve per-row weights, but the column was
+/// projected away by `project_frame_to_model_columns` (its consumable set kept
+/// only offset + response, not the weight), so `Model.sample_replicates` raised
+/// "weights column 'w' not found in data" for EVERY weighted model — even when
+/// the caller's frame carried the column. The consumable set must include the
+/// model's weight column, and projection must keep it while still dropping
+/// unrelated bookkeeping columns.
+#[test]
+fn weighted_model_projection_retains_weight_column_2033() {
+    let mut payload = FittedModelPayload::new(
+        MODEL_PAYLOAD_VERSION,
+        "y ~ x".to_string(),
+        ModelKind::Standard,
+        FittedFamily::Standard {
+            likelihood: LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(StandardLink::Identity),
+            ),
+            link: Some(StandardLink::Identity),
+            latent_cloglog_state: None,
+            mixture_state: None,
+            sas_state: None,
+        },
+        "gaussian".to_string(),
+    );
+    payload.weight_column = Some("w".to_string());
+    let model = FittedModel::from_payload(payload);
+
+    // The consumable-column contract must include the weight column so it
+    // survives projection when the model was fitted with weights.
+    let consumable = prediction_consumable_columns(&model)
+        .expect("consumable columns should resolve for a well-formed model");
+    assert!(
+        consumable.contains("w"),
+        "weight column 'w' must be in the consumable set, got {consumable:?}"
+    );
+
+    // Projecting a frame that carries the weight column (plus an unrelated `id`
+    // column) must keep `w` and drop only `id`.
+    let headers = vec![
+        "y".to_string(),
+        "x".to_string(),
+        "w".to_string(),
+        "id".to_string(),
+    ];
+    let rows = vec![
+        vec![
+            "1.0".to_string(),
+            "0.5".to_string(),
+            "2.0".to_string(),
+            "a".to_string(),
+        ],
+        vec![
+            "2.0".to_string(),
+            "1.5".to_string(),
+            "3.0".to_string(),
+            "b".to_string(),
+        ],
+    ];
+    let (kept_headers, kept_rows) =
+        project_frame_to_model_columns(&model, &headers, &rows).expect("projection should succeed");
+    assert!(
+        kept_headers.contains(&"w".to_string()),
+        "projection must retain the weight column, kept {kept_headers:?}"
+    );
+    assert!(
+        !kept_headers.contains(&"id".to_string()),
+        "projection must drop the unrelated id column, kept {kept_headers:?}"
+    );
+    for row in &kept_rows {
+        assert_eq!(
+            row.len(),
+            kept_headers.len(),
+            "each projected row width must match the retained header count"
+        );
+    }
+}

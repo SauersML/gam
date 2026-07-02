@@ -14,3 +14,5 @@
 - Large, massive changes must be made if that would improve the code--it's not something to be avoided.
 - XFAIL pattern on tests is never allowed. A failing test should always indicate problematic behavior.
 - The goal of this project is never to copy existing reference implementations.
+- Grid search is never allowed.
+- Wall-clock time budgets and deadlines are never allowed. In general, do not paper over solver issues.

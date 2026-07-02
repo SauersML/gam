@@ -7,13 +7,22 @@ pub(crate) fn blockwise_options_from_fit_args()
 }
 
 pub(crate) fn compact_fit_result_for_batch(fit: &mut UnifiedFitResult) {
+    // GUARD (#2030): the persisted geometry carrier's row-sized working
+    // vectors (`working_weights` / `working_response`) MUST survive
+    // compaction. `gam diagnose` (and post-fit `--alo` diagnostics) takes the
+    // geometry ALO path in `run_diagnose.rs` whenever `unified.geometry` is
+    // `Some`, handing `geom.working_weights` / `geom.working_response` to
+    // `AloInput::from_geometry`. Zeroing them to length 0 makes ALO fail its
+    // length-N validation ("ALO diagnostics require hessian_weights length N;
+    // got 0") on EVERY standard fit, because the field is present-but-empty so
+    // diagnose never falls through to its refit fallback. A prior fix carried
+    // this warning; commit 57bdc8011 deleted it and reintroduced the defect.
+    // The two carriers must also stay length-synchronized: `validate` bails
+    // with "UnifiedFitResult geometry working_weights must match
+    // inference.working_weights" if one is emptied while the other is not, so
+    // we cannot drop just one copy. We therefore keep BOTH working vectors and
+    // reclaim memory only from `reparam_qs` and the heavier `artifacts`.
     if let Some(inf) = fit.inference.as_mut() {
-        // Keep working_weights/response on inference too — `diagnose --alo`
-        // and other post-fit diagnostics consume them; clearing here zeroed
-        // out the ALO geometry path entirely (failing with
-        // "ALO diagnostics require hessian_weights length N; got 0").
-        // reparam_qs is genuinely large (p × p) and not needed at predict
-        // time, so still drop it.
         inf.reparam_qs = None;
     }
     fit.artifacts = gam::estimate::FitArtifacts {
@@ -704,6 +713,11 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
             offset: offset.clone(),
             spec: spec.clone(),
             family: family.clone(),
+            // #2026: `--family tweedie` names the bare Tweedie family with no way
+            // to spell an explicit power on the CLI, so it mirrors mgcv `tw()`
+            // and estimates `p` by profile likelihood before the reported fit.
+            estimate_tweedie_p: matches!(family.response, ResponseFamily::Tweedie { .. })
+                && matches!(args.family, FamilyArg::Tweedie),
             options: base_fit_options,
             kappa_options: kappa_options.clone(),
             wiggle: standard_wiggle,
@@ -1028,6 +1042,7 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
             fit_config.offset_column.clone(),
             fit_config.noise_offset_column.clone(),
         );
+        set_saved_weight_column(&mut payload, fit_config.weight_column.clone());
         write_payload_json(&out, payload)?;
     }
 
@@ -1836,17 +1851,18 @@ pub(crate) fn run_fitwith_predict_noise(
     // family is already gated as binomial by is_binomial() above, so we
     // only need to discriminate on the link.
     let location_scale_link_kind = match &family.link {
-        InverseLink::Standard(StandardLink::Logit) => {
-            let spec = mixture_linkspec
-                .ok_or_else(|| {
-                    "binomial blended-inverse-link location-scale fitting requires link(type=blended(...))"
-                        .to_string()
-                })?
-                .clone();
-            let state = state_fromspec(&spec)
-                .map_err(|e| format!("invalid blended link configuration: {e}"))?;
-            InverseLink::Mixture(state)
-        }
+        InverseLink::Standard(StandardLink::Logit) => match mixture_linkspec {
+            // An explicit `link(type=blended(...))` upgrades the default logit
+            // base link to a blended inverse-link mixture. Absent a blend spec,
+            // the default logit base link fits directly — no blend is required
+            // for the ordinary binomial-logit location-scale model.
+            Some(spec) => {
+                let state = state_fromspec(spec)
+                    .map_err(|e| format!("invalid blended link configuration: {e}"))?;
+                InverseLink::Mixture(state)
+            }
+            None => InverseLink::Standard(StandardLink::Logit),
+        },
         // `resolve_family` already upgrades `LinkFunction::Sas` /
         // `LinkFunction::BetaLogistic` to their state-bearing variants,
         // so the family arrives here fully typed.
@@ -2040,6 +2056,22 @@ pub(crate) fn validate_fit_args_preflight(
     args: &FitArgs,
     parsed: &ParsedFormula,
 ) -> Result<(), String> {
+    if let (Some(logslope_formula), Some(z_column)) =
+        (args.logslope_formula.as_deref(), args.z_column.as_deref())
+    {
+        let (_, parsed_logslope) = parse_matching_auxiliary_formula(
+            logslope_formula,
+            &parsed.response,
+            "--logslope-formula",
+        )?;
+        validate_marginal_slope_z_column_exclusion(
+            parsed,
+            &parsed_logslope,
+            z_column,
+            "bernoulli marginal-slope",
+            "--logslope-formula",
+        )?;
+    }
     if args.out.is_none() {
         return Err(
             "fit requires --out; refusing to run a training job that writes no model".to_string(),

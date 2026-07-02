@@ -2135,6 +2135,65 @@ fn metric_provenance_label(
     }
 }
 
+/// #2021 — ceiling on the number of EXTRA whitened-residual refit passes the
+/// structured-residual outer alternation will run after the iid pass-0 fit. The
+/// caller-supplied `structured_residual_passes` kwarg is clamped to this so a
+/// pathological value cannot spin the alternation unboundedly.
+const STRUCTURED_RESIDUAL_PASSES_MAX: usize = 4;
+
+
+/// #2021 — fit the structured residual-covariance model on `term`'s
+/// post-dictionary residuals and return it (the driver then materializes the
+/// damped per-row metric via [`StructuredResidualModel::row_metric_damped`],
+/// holding the returned model as the next pass's damping anchor). `Ok(None)`
+/// when there is no factor subspace to mine (single-channel residuals) or the
+/// evidence fit degenerates — the caller then stops the alternation and keeps
+/// the current (iid or prior-pass) metric.
+///
+/// Residuals `R = target − term.fitted()`; the activity coordinate the scale law
+/// `c(z)` is smooth in is the per-row total assignment mass — the same
+/// activation-strength summary the structure-search birth harvest mines the
+/// factor subspace in (`gam-sae/src/structure_harvest.rs`).
+fn sae_structured_residual_model(
+    term: &gam::terms::sae::manifold::SaeManifoldTerm,
+    target: ndarray::ArrayView2<'_, f64>,
+) -> PyResult<Option<gam::inference::residual_factor::StructuredResidualModel>> {
+    use gam::inference::residual_factor::{ResidualFactorInput, StructuredResidualModel};
+    let fitted = term.fitted();
+    let (n, p) = fitted.dim();
+    // Need >= 2 output channels for an off-diagonal factor subspace.
+    if n == 0 || p <= 1 {
+        return Ok(None);
+    }
+    if target.dim() != (n, p) {
+        return Err(py_value_error(format!(
+            "sae_structured_residual_model: target must be ({n}, {p}); got {:?}",
+            target.dim()
+        )));
+    }
+    // R = target − fitted (post-dictionary residual). Bind `fitted` first so the
+    // owned temporary outlives the in-place subtraction.
+    let mut residuals = target.to_owned();
+    residuals -= &fitted;
+    // Activity = per-row total assignment mass (mirrors structure_harvest.rs and
+    // the fit tail's own assignment read).
+    let assignments = term.assignment.assignments();
+    let activity: ndarray::Array1<f64> = (0..n).map(|r| assignments.row(r).sum()).collect();
+    // Let the evidence ladder pick the rank up to p-1 (`fit` re-caps to p-1 and
+    // scores r = 0..=cap, keeping the penalized-evidence maximizer).
+    let max_factor_rank = p.saturating_sub(1);
+    match StructuredResidualModel::fit(ResidualFactorInput {
+        residuals: residuals.view(),
+        activity: activity.view(),
+        max_factor_rank,
+    }) {
+        Ok(m) => Ok(Some(m)),
+        // Total numeric path: a degenerate residual yields no usable model; keep
+        // the prior-pass geometry.
+        Err(_) => Ok(None),
+    }
+}
+
 /// Fit a SAE-manifold term end-to-end in Rust: up to `max_iter` Newton steps
 /// per λ_smooth candidate, refreshing `Phi` and `dPhi/dt` between steps via
 /// the per-atom [`SaeBasisSecondJet`] (analytic harmonic for `Periodic`
@@ -2176,6 +2235,10 @@ fn metric_provenance_label(
     row_loss_weights = None,
     separation_barrier_strength_override = None,
     ibp_alpha_override = None,
+    structured_residual_passes = 0,
+    promote_from_residual = false,
+    quotient_scale = false,
+    data_row_reseed = false,
 ))]
 fn sae_manifold_fit<'py>(
     py: Python<'py>,
@@ -2222,6 +2285,12 @@ fn sae_manifold_fit<'py>(
     // atomic setter (or the compiled default). See `SaeManifoldTerm::set_fit_config`.
     separation_barrier_strength_override: Option<f64>,
     ibp_alpha_override: Option<f64>,
+    // #2021 — opt-in count of extra whitened-residual structured-alternation
+    // passes (default 0 = historical iid-only path, bit-for-bit).
+    structured_residual_passes: usize,
+    promote_from_residual: bool,
+    quotient_scale: bool,
+    data_row_reseed: bool,
 ) -> PyResult<Py<PyDict>> {
     // The precomputed-basis entry point carries no Duchon centers / kernel
     // metadata, so any basis kind whose refresh needs them cannot re-evaluate
@@ -2275,6 +2344,10 @@ fn sae_manifold_fit<'py>(
         row_w,
         separation_barrier_strength_override,
         ibp_alpha_override,
+        structured_residual_passes,
+        promote_from_residual,
+        quotient_scale,
+        data_row_reseed,
     )
 }
 
@@ -2333,6 +2406,15 @@ fn sae_manifold_fit_inner<'py>(
     // term so concurrent fits with different overrides never race a global atomic.
     separation_barrier_strength_override: Option<f64>,
     ibp_alpha_override: Option<f64>,
+    // #2021 — number of EXTRA whitened-residual refit passes after the iid
+    // pass-0 fit (the structured-residual outer alternation). `0` (the default)
+    // keeps the historical iid-only path bit-for-bit; the value is clamped to
+    // `STRUCTURED_RESIDUAL_PASSES_MAX`. An explicit, typed opt-in — no hidden
+    // env lever.
+    structured_residual_passes: usize,
+    promote_from_residual: bool,
+    quotient_scale: bool,
+    data_row_reseed: bool,
 ) -> PyResult<Py<PyDict>> {
     let analytic_penalties: Option<serde_json::Value> = match analytic_penalties {
         Some(s) => Some(serde_json::from_str(&s).map_err(serde_json_error_to_pyerr)?),
@@ -2513,9 +2595,17 @@ fn sae_manifold_fit_inner<'py>(
         .iter()
         .map(|kind| sae_atom_basis_kind_from_str(kind))
         .collect();
+    // #1784/#1777 — use the per-fit IBP concentration override everywhere the
+    // assignment map is materialized, including the *seed* assignment mode below.
+    // `set_fit_config` remains the runtime source of truth for cloned/refit
+    // terms, but constructing the initial `AssignmentMode` with the overridden
+    // α keeps seed decoder solves, metadata, and the first Arrow-Schur pass on
+    // the same K-aware/stated gate instead of briefly using the historical
+    // `alpha=1` geometric mask.
+    let assignment_alpha = ibp_alpha_override.unwrap_or(alpha);
     let mode = match assignment_kind.as_str() {
         "softmax" => AssignmentMode::softmax(tau),
-        "ibp_map" => AssignmentMode::ibp_map(tau, alpha, learnable_alpha),
+        "ibp_map" => AssignmentMode::ibp_map(tau, assignment_alpha, learnable_alpha),
         // The ThresholdGate (#1777, formerly "jumprelu") is a hard-thresholded
         // bounded sigmoid: an atom is active when its raw logit clears
         // `jumprelu_threshold`, and the gate value is the sigmoid (in [0, 1]) —
@@ -2566,6 +2656,19 @@ fn sae_manifold_fit_inner<'py>(
         &evaluators,
     )
     .map_err(py_value_error)?;
+    // #2022/#2023 — install the typed per-fit opt-ins before the fit consumes the
+    // term. Default false ⇒ bit-for-bit historical path.
+    base_term.set_quotient_scale(quotient_scale);
+    base_term.set_data_row_reseed(data_row_reseed);
+    // #2022 SEED peel — moved here from the (env-free) padded-blocks builder.
+    // Quotient on ⇒ gauge-fix each seed decoder onto the unit Frobenius sphere
+    // with its magnitude in the explicit log-amplitude (reconstruction preserved:
+    // exp(s)·B_unit == B_seed). Default off ⇒ s stays 0, seed bit-for-bit.
+    if quotient_scale {
+        for atom in base_term.atoms.iter_mut() {
+            atom.absorb_decoder_norm_into_log_amplitude(f64::MIN_POSITIVE);
+        }
+    }
     // #1777 — install the PER-FIT config overrides as this term's source of truth
     // BEFORE the joint fit / ρ selection consumes it. `set_fit_config` distributes
     // the separation-barrier strength onto the term and the IBP-α onto the
@@ -2620,7 +2723,7 @@ fn sae_manifold_fit_inner<'py>(
     // flag. The factor stack is `(n_obs, p_out, rank)` row-major, reshaped to the
     // `(n_obs, p_out * rank)` layout `RowMetric::output_fisher` expects
     // (`u[n, i * rank + k] = U[n, i, k]`). Shapes are validated at the boundary.
-    let metric_provenance: &'static str = if let Some(u3) = fisher_u {
+    let mut metric_provenance: &'static str = if let Some(u3) = fisher_u {
         let u_shape = u3.shape();
         if u_shape[0] != n_obs || u_shape[1] != p_out {
             return Err(py_value_error(format!(
@@ -2830,11 +2933,206 @@ fn sae_manifold_fit_inner<'py>(
         .decoder_shape_uncertainty()
         .map_err(py_value_error)?;
     let fitted_result = objective.into_fitted();
-    let finalization_invalidated_shape_uncertainty =
+    let mut finalization_invalidated_shape_uncertainty =
         fitted_result.invalidates_pre_final_shape_uncertainty();
     let mut term = fitted_result.term;
     let mut rho = fitted_result.rho;
-    let loss = fitted_result.loss;
+    let mut loss = fitted_result.loss;
+
+    // #2021 (EXPERIMENT) — structured-residual OUTER ALTERNATION.
+    // Pass 0 above is the iid fit (unchanged, bit-for-bit). When the caller's
+    // `structured_residual_passes > 0` AND no explicit metric was installed at
+    // pass 0 (a WP-D `OutputFisher` gauge lives in the SAME single metric slot
+    // and must not be clobbered), run N extra passes: fit the whitened
+    // residual-covariance model on the current fitted residuals, materialize the
+    // Σ-DAMPED per-row metric, install it — `loss_scaled` and
+    // `assemble_arrow_schur` auto-route on `metric.whitens_likelihood()` (the
+    // #974 seam, so no construction.rs change is needed) — and refit
+    // warm-started from the settled ρ. The returned provenance / shape bands /
+    // loss are refreshed from the final pass. A `None` model (no factor
+    // subspace, or a degenerate residual fit) stops the alternation early,
+    // degrading to the pass-0 iid fit.
+    //
+    // Covariance-domain damping (residual-fix's `row_metric_damped`):
+    // Σ_t = (1−γ)·Σ_prev + γ·Σ̂_t, with Σ_prev = the previous pass's fitted model
+    // (or I on the first structured pass). A small, increasing γ schedule
+    // γ_p = (p+1)/(N+1) ∈ (0,1) trusts the new estimate more each pass while
+    // damping the early jump off the iid fit (γ is never 0 or 1, so every pass
+    // builds a genuine WhitenedStructured blend).
+    let structured_passes = structured_residual_passes.min(STRUCTURED_RESIDUAL_PASSES_MAX);
+    if structured_passes > 0 && metric_provenance == "Euclidean" {
+        let mut prev_model: Option<gam::inference::residual_factor::StructuredResidualModel> =
+            None;
+        // #2021 Λ nursery→promotion (evidence-gated). Accumulate residual-factor
+        // directions that PERSIST across passes (producer
+        // `StructuredResidualModel::promotion_candidates`: energy above the
+        // idiosyncratic-noise floor AND |cos|-alignment with the previous pass's
+        // Λ) and, once a lineage matures, promote it to a born atom so the NEXT
+        // pass refits with the discovered structure. A lineage that skips a pass
+        // loses its dwell; at most one birth per pass, and only when a later pass
+        // remains to refit the born atom, so K grows ≤ structured_passes and no
+        // born atom is left unrefit inside the alternation.
+        const PROMOTION_ALIGN_MIN: f64 = 0.9;
+        const PROMOTION_ENERGY_FLOOR_MULT: f64 = 1.0;
+        const PROMOTION_NURSERY_MIN_PASSES: usize = 2;
+        // `promote_from_residual` is the typed pyfunction kwarg (default false);
+        // opt-in, default-off ⇒ whitening runs without growth unless set.
+        let mut nursery: Vec<(Array1<f64>, usize)> = Vec::new();
+        for pass in 0..structured_passes {
+            let Some(model) = sae_structured_residual_model(&term, z_view.view())? else {
+                break;
+            };
+            let gamma = (pass as f64 + 1.0) / (structured_passes as f64 + 1.0);
+            let metric = model
+                .row_metric_damped(n_obs, gamma, prev_model.as_ref())
+                .map_err(py_value_error)?;
+            let installed_label = metric_provenance_label(metric.provenance());
+            term.set_row_metric(metric).map_err(py_value_error)?;
+            // Rebuild the analytic-penalty registry (cheap; `latent_payload` is
+            // still owned) and warm-start ρ from the settled fit.
+            let registry = build_analytic_penalty_registry_from_json(
+                Some(&latent_payload),
+                analytic_penalties.as_ref(),
+            )
+            .map_err(py_value_error)?;
+            let warm_flat = rho.to_flat();
+            let mut objective = gam::terms::sae::manifold::SaeManifoldOuterObjective::new(
+                term,
+                z_view.to_owned(),
+                Some(registry),
+                rho,
+                max_iter,
+                learning_rate,
+                ridge_ext_coord,
+                ridge_beta,
+            );
+            // #2021 — a promotion (below) grows K, enlarging ρ; size the outer
+            // problem from the CURRENT warm vector, not the pass-0 `n_params`
+            // (identical to `n_params` when no birth has occurred).
+            let problem = gam::solver::rho_optimizer::OuterProblem::new(warm_flat.len())
+                .with_initial_rho(warm_flat)
+                .with_seed_config(gam::solver::seeding::SeedConfig {
+                    max_seeds: 1,
+                    seed_budget: 1,
+                    ..Default::default()
+                });
+            gam::solver::rho_optimizer::arm_outer_wall_clock_deadline(
+                std::time::Instant::now()
+                    + std::time::Duration::from_secs_f64(SAE_FIT_MAX_SECONDS),
+            );
+            let pass_result = std::thread::scope(|scope| -> PyResult<()> {
+                let worker = std::thread::Builder::new()
+                    .name("gam-sae-fit-structured".to_string())
+                    .stack_size(SAE_FIT_WORKER_STACK_SIZE)
+                    .spawn_scoped(scope, || {
+                        problem.run(&mut objective, "SAE manifold (structured)")
+                    })
+                    .map_err(|err| {
+                        py_value_error(format!(
+                            "sae_manifold_fit: spawn structured-pass worker thread: {err}"
+                        ))
+                    })?;
+                match worker.join() {
+                    Ok(run_result) => run_result.map(|_| ()).map_err(estimation_error_to_pyerr),
+                    Err(_) => Err(py_value_error(
+                        "sae_manifold_fit: structured-pass worker thread panicked (see prior \
+                         error output)"
+                            .to_string(),
+                    )),
+                }
+            });
+            gam::solver::rho_optimizer::clear_outer_wall_clock_deadline();
+            pass_result?;
+            // Refresh shape bands + fitted state from the FINAL pass objective
+            // (decoder_shape_uncertainty must be read before `into_fitted`).
+            shape_uncertainty = objective
+                .decoder_shape_uncertainty()
+                .map_err(py_value_error)?;
+            let fitted_result = objective.into_fitted();
+            finalization_invalidated_shape_uncertainty =
+                fitted_result.invalidates_pre_final_shape_uncertainty();
+            term = fitted_result.term;
+            rho = fitted_result.rho;
+            loss = fitted_result.loss;
+            // Report the geometry actually used by the returned fit.
+            metric_provenance = installed_label;
+            // #2021 promotion: fold this pass's persisted factor directions into
+            // the nursery, then promote (birth) at most one matured lineage so the
+            // NEXT pass refits with it. Runs only when the opt-in lever is set
+            // (default off) AND from pass 1 on (needs a `prev`). Gating via a
+            // `None` prev keeps the block un-indented and inert when off.
+            let prev_for_promotion = if promote_from_residual {
+                prev_model.as_ref()
+            } else {
+                None
+            };
+            if let Some(prev) = prev_for_promotion {
+                let cands = model
+                    .promotion_candidates(
+                        Some(prev),
+                        PROMOTION_ALIGN_MIN,
+                        PROMOTION_ENERGY_FLOOR_MULT,
+                    )
+                    .map_err(py_value_error)?;
+                let mut seen = vec![false; nursery.len()];
+                for cand in &cands {
+                    let hit = nursery
+                        .iter()
+                        .position(|(d, _)| cand.direction.dot(d).abs() >= PROMOTION_ALIGN_MIN);
+                    match hit {
+                        Some(i) => {
+                            nursery[i].0 = cand.direction.clone();
+                            nursery[i].1 += 1;
+                            seen[i] = true;
+                        }
+                        None => {
+                            nursery.push((cand.direction.clone(), 1));
+                            seen.push(true);
+                        }
+                    }
+                }
+                // A lineage that did not recur this pass loses its dwell.
+                let mut keep = seen.into_iter();
+                nursery.retain(|_| keep.next().unwrap_or(false));
+                // Promote at most one matured lineage, and only if a later pass
+                // remains to refit the born atom. Collect the direction BEFORE
+                // mutating `term` to avoid overlapping borrows.
+                let matured = if pass + 1 < structured_passes {
+                    nursery
+                        .iter()
+                        .find(|(_, count)| *count >= PROMOTION_NURSERY_MIN_PASSES)
+                        .map(|(dir, _)| dir.clone())
+                } else {
+                    None
+                };
+                if let Some(dir) = matured {
+                    // Born-atom decoder: the unit direction on atom-0's constant
+                    // (row-0) basis row, shape (m, p) per `born_atom`'s contract.
+                    let m = term.atoms[0].basis_size();
+                    let mut decoder = Array2::<f64>::zeros((m, p_out));
+                    for out in 0..p_out {
+                        decoder[[0, out]] = dir[out];
+                    }
+                    let (grown_term, grown_rho) =
+                        gam::terms::sae::structure_harvest::apply_structure_move(
+                            &term,
+                            &rho,
+                            &gam::solver::structure_search::StructureMove::Birth { candidate: 0 },
+                            std::slice::from_ref(&decoder),
+                        )
+                        .map_err(py_value_error)?;
+                    term = grown_term;
+                    rho = grown_rho;
+                    // Drop the promoted lineage so it is not re-promoted; the next
+                    // pass rebuilds the objective from the grown `term`/`rho` and
+                    // `warm_flat.len()` picks up the enlarged ρ automatically.
+                    nursery.retain(|(d, _)| d.dot(&dir).abs() < PROMOTION_ALIGN_MIN);
+                }
+            }
+            // Carry this pass's model forward as the next pass's damping anchor.
+            prev_model = Some(model);
+        }
+    }
     {
         let assignments = term.assignment.assignments();
         let fitted = term.fitted();
@@ -4075,6 +4373,16 @@ fn sae_manifold_fit_ibp<'py>(
         // default), matching how every other override above is left `None` here.
         None,
         None,
+        // No structured-residual alternation on this convenience IBP entry point
+        // (#2021): the iid-only path, matching the default of the other entry points.
+        0,
+        // No #2021 promotion / #2022 scale-quotient / #2023 data-row reseed on this
+        // convenience IBP entry point: all default-off, matching how every other
+        // opt-in above is left inert here (the primary `sae_manifold_fit` /
+        // `sae_manifold_fit_minimal` entry points carry the typed kwargs).
+        false,
+        false,
+        false,
     )
 }
 
@@ -5964,6 +6272,10 @@ fn sae_build_atom_plans(
     row_loss_weights = None,
     separation_barrier_strength_override = None,
     ibp_alpha_override = None,
+    structured_residual_passes = 0,
+    promote_from_residual = false,
+    quotient_scale = false,
+    data_row_reseed = false,
 ))]
 fn sae_manifold_fit_minimal<'py>(
     py: Python<'py>,
@@ -6007,6 +6319,12 @@ fn sae_manifold_fit_minimal<'py>(
     // the high-level Python `sae_manifold_fit` facade routes through.
     separation_barrier_strength_override: Option<f64>,
     ibp_alpha_override: Option<f64>,
+    // #2021 — opt-in count of extra whitened-residual structured-alternation
+    // passes (default 0 = historical iid-only path, bit-for-bit).
+    structured_residual_passes: usize,
+    promote_from_residual: bool,
+    quotient_scale: bool,
+    data_row_reseed: bool,
 ) -> PyResult<Py<PyDict>> {
     // #1777 — accept both "threshold_gate" (primary) and legacy "jumprelu".
     let assignment_kind = canonicalize_assignment_kind(&assignment_kind).map_err(py_value_error)?;
@@ -6219,7 +6537,7 @@ fn sae_manifold_fit_minimal<'py>(
         z_view,
         initial_logits.view(),
         assignment_kind.as_str(),
-        alpha,
+        ibp_alpha_override.unwrap_or(alpha),
         tau,
         jumprelu_threshold,
     )
@@ -6282,6 +6600,10 @@ fn sae_manifold_fit_minimal<'py>(
         row_w,
         separation_barrier_strength_override,
         ibp_alpha_override,
+        structured_residual_passes,
+        promote_from_residual,
+        quotient_scale,
+        data_row_reseed,
     )?;
     // #977 — the per-atom `atom_plans` are now emitted by `sae_manifold_fit_inner`
     // FROM THE POST-SEARCH dictionary (variable K), so OOS predict can rebuild the

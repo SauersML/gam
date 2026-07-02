@@ -19,8 +19,10 @@
 //! hand) and the polynomial block is reparam-independent, so `[K·Z·V | P]` is
 //! assembled by rotating the existing design instead of re-evaluating the
 //! kernel. `(K·Z)·V = K·(Z·V)`, so the model space and the numeric design are
-//! unchanged — the second test below pins that equivalence bit-for-bit against
-//! the un-fused rebuild that the predict/replay path still uses.
+//! the same product — equal in exact arithmetic and, in floating point,
+//! agreeing up to benign reassociation. The second test below pins that
+//! equivalence to a tight relative tolerance (≤1e-9·‖design‖) against the
+//! un-fused rebuild that the predict/replay path still uses.
 //!
 //! NOTE ON SCOPE: this branch (`frozen_radial_reparam.is_none() &&
 //! !operators_active`) is taken by an operators-OFF Duchon smooth. The DEFAULT

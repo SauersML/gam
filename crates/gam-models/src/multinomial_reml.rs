@@ -70,8 +70,8 @@ use crate::vector_response::{
     MultinomialLogitLikelihood, VectorLikelihood, validate_multinomial_simplex,
 };
 use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
-use gam_solve::pirls::dense_block_xtwx;
 use gam_problem::HyperOperator;
+use gam_solve::pirls::dense_block_xtwx;
 use ndarray::{Array1, Array2, Array3, ArrayView2};
 use std::sync::{Arc, Mutex};
 
@@ -378,38 +378,26 @@ impl MultinomialFamily {
                 // repeated columns for aliases, and strips every block past
                 // `class_0` to width 0 — the failure in #363.
                 //
-                // Each block carries the FULL per-term physical penalty list.
-                //
-                // #1587 (tied λ): the K−1 cloned per-class copies of term `t`'s
-                // penalty all carry the SAME `precision_label`
-                // (`multinomial_term_{t}`), so the custom-family outer loop
-                // (`penalty_label_layout`) collapses them onto ONE outer ρ per
-                // term — a single shared `λ_t` smoothing every class's copy of
-                // term `t` instead of an independent `λ_{a,t}` per (class, term).
-                // A single shared λ per smooth term is the gauge the
-                // reference-symmetric (CLR) softmax penalty requires: the
-                // centered metric `λ_t·((I−J/K)⊗S_t)` has ONE λ_t, not one per
-                // class. (The cross-block `−(λ_t/K)·S_t` coupling of that metric
-                // is the second half of the #1587 fix; this λ-tying is the
-                // contained prerequisite.) Untied per-(class,term) λ — the prior
-                // behavior — additionally breaks reference-class invariance
-                // because relabeling permutes which class owns which λ.
-                // gam#1587: the smooth-term penalties are carried as
-                // reference-symmetric full-width `M⊗S_t` JOINT penalties (see
-                // `joint_penalty_specs` / `centered_joint_penalty_specs`), NOT
-                // per-block `I⊗S_t`. The per-class blocks therefore attach NO
-                // smooth penalty here — the joint penalty is the sole carrier of
-                // their smoothing, and the outer ρ coordinates `multinomial_term_t`
-                // are created by the joint specs. Attaching the per-block penalty
-                // too would double-count `(I+M)⊗S_t` and re-introduce the
-                // reference-anchored frame.
+                // Each block carries the FULL per-term physical penalty list
+                // with its own log-λ coordinates. Multinomial smooth effects are
+                // genuinely class-specific: tying one λ_t across all active
+                // logits lets an easy/near-linear class force over-smoothing of
+                // a wiggly class (the #1855 truth-recovery failure). Keeping the
+                // penalties on the active-class blocks lets REML select the
+                // heterogeneous per-(class, term) smoothness required by held-out
+                // simplex and decision-boundary recovery while the
+                // channel-aware Jacobian above preserves the coefficient-space
+                // identifiability audit.
                 let mut spec = ParameterBlockSpec {
                     name: format!("class_{a}"),
                     design: DesignMatrix::Dense(DenseDesignMatrix::from(self.design.clone())),
                     offset: Array1::<f64>::zeros(self.design.nrows()),
-                    penalties: Vec::new(),
-                    nullspace_dims: Vec::new(),
-                    initial_log_lambdas: Array1::<f64>::zeros(0),
+                    penalties: self.penalties.iter().cloned().collect(),
+                    nullspace_dims: (*self.penalty_nullspace_dims).clone(),
+                    initial_log_lambdas: Array1::<f64>::from_elem(
+                        self.penalties.len(),
+                        self.initial_log_lambda,
+                    ),
                     initial_beta: None,
                     gauge_priority: priority,
                     jacobian_callback: None,
@@ -493,11 +481,10 @@ impl MultinomialFamily {
                     && spec.offset.len() == n
                     && spec.stacked_design.is_none()
                     && spec.stacked_offset.is_none()
-                    // gam#1587: per-block smooth penalties are emptied (the
-                    // centered `M⊗S_t` joint penalty is the sole smoothing
-                    // carrier), so the per-block penalty/λ count is 0. Accept
-                    // either the legacy full per-term list or the emptied form so
-                    // the workspace HVP/gradient/loglik stay available.
+                    // Production blocks carry the full per-term penalty/λ list.
+                    // Accept the empty legacy/joint form here as well so older
+                    // workspaces and diagnostic callers can still reuse the
+                    // family HVP/gradient/log-likelihood machinery.
                     && (spec.initial_log_lambdas.len() == self.penalties.len()
                         || spec.initial_log_lambdas.is_empty())
                     && (spec.penalties.len() == self.penalties.len()
@@ -817,43 +804,38 @@ impl MultinomialFamily {
     /// the reduction order and break the bit-identical contract whenever
     /// rayon splits the dense path's row range into more than one chunk.
     fn hessian_diagonal_with_probs(&self, probs_full: ArrayView2<'_, f64>) -> Array1<f64> {
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let p = self.design.ncols();
         let m = self.active_classes();
         let n = self.weights.len();
         let dim = m * p;
         let design = self.design.view();
-        (0..n)
-            .into_par_iter()
-            .fold(
-                || Array1::<f64>::zeros(dim),
-                |mut acc, row| {
-                    let w = self.weights[row];
-                    if w == 0.0 {
-                        return acc;
+        gam_problem::outer_subsample::RowSet::All.par_reduce_fold(
+            n,
+            || Array1::<f64>::zeros(dim),
+            |mut acc, row, _row_weight| {
+                let w = self.weights[row];
+                if w == 0.0 {
+                    return acc;
+                }
+                for a in 0..m {
+                    let pa = probs_full[[row, a]];
+                    let waa = w * pa * (1.0 - pa);
+                    if waa == 0.0 {
+                        continue;
                     }
-                    for a in 0..m {
-                        let pa = probs_full[[row, a]];
-                        let waa = w * pa * (1.0 - pa);
-                        if waa == 0.0 {
-                            continue;
-                        }
-                        let base = a * p;
-                        for i in 0..p {
-                            let xi = design[[row, i]];
-                            acc[base + i] += waa * xi * xi;
-                        }
+                    let base = a * p;
+                    for i in 0..p {
+                        let xi = design[[row, i]];
+                        acc[base + i] += waa * xi * xi;
                     }
-                    acc
-                },
-            )
-            .reduce(
-                || Array1::<f64>::zeros(dim),
-                |mut a, b| {
-                    a += &b;
-                    a
-                },
-            )
+                }
+                acc
+            },
+            |mut a, b| {
+                a += &b;
+                a
+            },
+        )
     }
 
     /// Directional derivative of the per-row Fisher block along a
@@ -1507,12 +1489,14 @@ impl CustomFamily for MultinomialFamily {
     }
 
     fn joint_penalty_specs(&self) -> Result<Vec<gam_problem::JointPenaltySpec>, String> {
-        // gam#1587: the smooth-term penalties are carried as reference-symmetric
-        // full-width `M ⊗ S_t` joint penalties (not per-block `I ⊗ S_t`), so the
-        // multinomial fit is invariant to the arbitrary reference class. The
-        // per-class block specs therefore attach NO smooth penalty (see
-        // `build_block_specs`); this is the sole carrier of their smoothing.
-        Ok(self.centered_joint_penalty_specs())
+        // The formula path attaches the physical smooth penalties to each
+        // active-class block so REML can select the heterogeneous per-class
+        // smoothness required by multinomial truth-recovery/classification
+        // problems. A centered joint penalty is still available for diagnostics
+        // through `centered_joint_penalty_specs`, but it is not the production
+        // smoothing carrier because one shared λ_t over-smooths class-specific
+        // decision surfaces.
+        Ok(Vec::new())
     }
 
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
@@ -2447,102 +2431,23 @@ mod tests {
     }
 
     #[test]
-    fn per_term_smoothing_is_carried_by_the_centered_joint_penalty() {
-        // gam#1587: the per-block specs no longer attach ANY smooth penalty —
-        // the reference-symmetric centered `M⊗S_t` JOINT penalty is the sole
-        // carrier of the per-term smoothing (otherwise the per-block `I⊗S_t` and
-        // the joint `M⊗S_t` would double-count, re-introducing the
-        // reference-anchored frame). Each block therefore reports an EMPTY
-        // per-block penalty/λ list, and `joint_penalty_specs()` returns one
-        // full-width penalty per smooth term.
-
-        // Single-term family: one joint penalty, blocks carry none.
+    fn per_term_smoothing_is_carried_by_active_class_blocks() {
         let single = toy_family(6, 4, 3);
         for spec in &single.build_block_specs() {
-            assert!(spec.penalties.is_empty());
-            assert!(spec.initial_log_lambdas.is_empty());
-            assert!(spec.nullspace_dims.is_empty());
+            assert_eq!(spec.penalties.len(), 1);
+            assert_eq!(spec.initial_log_lambdas.len(), 1);
+            assert_eq!(spec.nullspace_dims.len(), 1);
         }
-        assert_eq!(
-            single.joint_penalty_specs().expect("joint specs").len(),
-            1,
-            "single-term family carries exactly one full-width joint penalty"
+        assert!(
+            single
+                .joint_penalty_specs()
+                .expect("joint specs")
+                .is_empty(),
+            "production smoothing is carried by per-class blocks so each class can select its own λ"
         );
 
-        // Multi-term family (#561): the per-term list is preserved — one joint
-        // `M⊗S_t` per term — so the outer REML loop still selects a per-term λ_t
-        // (now shared across classes by the centered metric, see the tied-label
-        // test). The per-block lists stay empty.
         let p = 5;
         let k = 4;
-        let n_terms = 3;
-        let n_obs = 9;
-        let y = {
-            let mut y = Array2::<f64>::zeros((n_obs, k));
-            for i in 0..n_obs {
-                y[[i, i % k]] = 1.0;
-            }
-            y
-        };
-        let weights = Array1::<f64>::ones(n_obs);
-        let design = Arc::new(Array2::<f64>::from_shape_fn((n_obs, p), |(i, j)| {
-            ((i + j + 1) as f64).cos()
-        }));
-        // Distinct per-term penalties (each PSD) so the terms are genuinely
-        // different operators, not aliases of one matrix.
-        let penalties = Arc::new(
-            (0..n_terms)
-                .map(|t| {
-                    crate::custom_family::PenaltyMatrix::Dense(Array2::<f64>::from_shape_fn(
-                        (p, p),
-                        |(i, j)| {
-                            if i == j { (t + 1) as f64 } else { 0.0 }
-                        },
-                    ))
-                })
-                .collect::<Vec<_>>(),
-        );
-        let nullspace_dims = Arc::new(vec![0usize; n_terms]);
-        let multi = MultinomialFamily::new(y, weights, k, design, penalties, nullspace_dims)
-            .expect("multi-term MultinomialFamily must construct");
-        let specs = multi.build_block_specs();
-        assert_eq!(specs.len(), k - 1, "one block per active class");
-        for spec in &specs {
-            assert!(
-                spec.penalties.is_empty(),
-                "per-block smooth penalties are emptied; the joint penalty carries them (#1587)"
-            );
-            assert!(spec.initial_log_lambdas.is_empty());
-            assert!(spec.nullspace_dims.is_empty());
-        }
-        // One full-width joint penalty per smooth term, each acting on the whole
-        // (K−1)·P stacked coefficient vector.
-        let joint = multi.joint_penalty_specs().expect("joint specs");
-        assert_eq!(
-            joint.len(),
-            n_terms,
-            "each smooth term contributes one full-width centered joint penalty (#561/#1587)"
-        );
-        for spec in &joint {
-            assert_eq!(spec.matrix.nrows(), (k - 1) * p);
-            assert_eq!(spec.matrix.ncols(), (k - 1) * p);
-        }
-    }
-
-    /// #1587 (tied λ): the K−1 cloned per-class copies of smooth term `t` must
-    /// all carry the SAME per-term precision label `multinomial_term_{t}`, and
-    /// distinct terms must carry DISTINCT labels. The custom-family outer loop
-    /// (`penalty_label_layout`) collapses penalties sharing a label onto one
-    /// outer ρ, so this labelling ties the smoothing parameter of term `t`
-    /// across every class to a single shared `λ_t` (the gauge the
-    /// reference-symmetric softmax penalty requires) instead of the historical
-    /// independent `λ_{a,t}` per (class, term). Untied per-(class,term) λ is a
-    /// reference-class-dependent gauge: relabelling the response permutes which
-    /// class owns which λ, drifting the fit (the secondary half of #1587).
-    #[test]
-    fn block_specs_tie_lambda_per_term_across_classes_1587() {
-        let p = 5;
-        let k = 4; // 3 active classes
         let n_terms = 3;
         let n_obs = 9;
         let y = {
@@ -2570,49 +2475,50 @@ mod tests {
         let multi = MultinomialFamily::new(y, weights, k, design, penalties, nullspace_dims)
             .expect("multi-term MultinomialFamily must construct");
         let specs = multi.build_block_specs();
-        let m = k - 1;
-        assert_eq!(specs.len(), m);
-
-        // gam#1587: the per-block specs carry NO smooth penalty; the per-term
-        // tied label now lives on the full-width centered JOINT penalties, one
-        // per smooth term. Each `multinomial_term_{t}` appears EXACTLY ONCE among
-        // the joint specs (the centered metric already couples the classes), so
-        // the outer loop yields exactly `n_terms` shared `λ_t` coordinates.
+        assert_eq!(specs.len(), k - 1, "one block per active class");
         for spec in &specs {
-            assert!(
-                spec.penalties.is_empty(),
-                "per-block penalties are emptied; the joint penalty carries the tied label (#1587)"
-            );
+            assert_eq!(spec.penalties.len(), n_terms);
+            assert_eq!(spec.initial_log_lambdas.len(), n_terms);
+            assert_eq!(spec.nullspace_dims.len(), n_terms);
         }
+        assert!(multi.joint_penalty_specs().expect("joint specs").is_empty());
+    }
 
-        let joint = multi.joint_penalty_specs().expect("joint specs");
-        assert_eq!(joint.len(), n_terms, "one joint penalty per smooth term");
-
-        // Each term-t joint penalty carries the shared per-term label.
-        for (t, spec) in joint.iter().enumerate() {
-            let expected = format!("multinomial_term_{t}");
-            assert_eq!(
-                spec.label.as_deref(),
-                Some(expected.as_str()),
-                "joint term {t} must carry the shared per-term precision label \
-                 '{expected}' so the outer loop ties λ across classes (#1587), got {:?}",
-                spec.label,
-            );
-        }
-
-        // Distinct terms carry DISTINCT labels (per-term smoothing preserved),
-        // and the label set is exactly `n_terms` outer smoothing parameters.
-        let mut labels: Vec<String> = joint
-            .iter()
-            .map(|spec| spec.label.clone().unwrap())
-            .collect();
-        labels.sort();
-        labels.dedup();
-        assert_eq!(
-            labels.len(),
-            n_terms,
-            "each smooth term must keep its OWN shared λ; labels must be distinct per term"
+    #[test]
+    fn block_specs_keep_independent_lambda_per_class_and_term() {
+        let p = 5;
+        let k = 4;
+        let n_terms = 3;
+        let n_obs = 9;
+        let y = {
+            let mut y = Array2::<f64>::zeros((n_obs, k));
+            for i in 0..n_obs {
+                y[[i, i % k]] = 1.0;
+            }
+            y
+        };
+        let weights = Array1::<f64>::ones(n_obs);
+        let design = Arc::new(Array2::<f64>::from_shape_fn((n_obs, p), |(i, j)| {
+            ((i + j + 1) as f64).cos()
+        }));
+        let penalties = Arc::new(
+            (0..n_terms)
+                .map(|t| {
+                    crate::custom_family::PenaltyMatrix::Dense(Array2::<f64>::from_shape_fn(
+                        (p, p),
+                        |(i, j)| if i == j { (t + 1) as f64 } else { 0.0 },
+                    ))
+                })
+                .collect::<Vec<_>>(),
         );
+        let nullspace_dims = Arc::new(vec![0usize; n_terms]);
+        let multi = MultinomialFamily::new(y, weights, k, design, penalties, nullspace_dims)
+            .expect("multi-term MultinomialFamily must construct");
+        let specs = multi.build_block_specs();
+        assert_eq!(specs.len(), k - 1);
+        for spec in &specs {
+            assert_eq!(spec.penalties.len(), n_terms);
+        }
     }
 
     #[test]
@@ -3024,7 +2930,13 @@ mod tests {
                 let mf = family
                     .directional_hyper_operator(probs.view(), direction)
                     .expect("matrix-free directional operator must build");
-                assert_oracle_parity(&dense, &mf, &factor, &probe, &format!("dir {idx} n={n} p={p} k={k}"));
+                assert_oracle_parity(
+                    &dense,
+                    &mf,
+                    &factor,
+                    &probe,
+                    &format!("dir {idx} n={n} p={p} k={k}"),
+                );
             }
 
             // Second-directional: dense vs matrix-free.
@@ -3049,7 +2961,13 @@ mod tests {
                 let mf = family
                     .second_directional_hyper_operator(probs.view(), u, v)
                     .expect("matrix-free second-directional operator must build");
-                assert_oracle_parity(&dense, &mf, &factor, &probe, &format!("pair {idx} n={n} p={p} k={k}"));
+                assert_oracle_parity(
+                    &dense,
+                    &mf,
+                    &factor,
+                    &probe,
+                    &format!("pair {idx} n={n} p={p} k={k}"),
+                );
             }
         }
     }
@@ -3730,10 +3648,10 @@ mod tests {
     ///     finite (acceptance option (a)).
     #[test]
     fn separating_multinomial_arms_universal_jeffreys_firth_term() {
+        use gam_linalg::faer_ndarray::FaerEigh;
         use gam_solve::estimate::reml::jeffreys_subspace::{
             jeffreys_subspace_from_penalty, joint_jeffreys_term,
         };
-        use gam_linalg::faer_ndarray::FaerEigh;
 
         // K = 3 classes, single covariate that PERFECTLY separates the classes
         // by threshold, plus an intercept. Unpenalized (λ = 0, zero penalty), so
@@ -3918,7 +3836,8 @@ mod tests {
             let mut beta = Array1::<f64>::zeros(m * p);
             for (a, &cls) in actives.iter().enumerate() {
                 let diff = &gamma[cls] - &gamma[r];
-                beta.slice_mut(ndarray::s![a * p..(a + 1) * p]).assign(&diff);
+                beta.slice_mut(ndarray::s![a * p..(a + 1) * p])
+                    .assign(&diff);
             }
             // βᵀ (M ⊗ S) β with block (a,b) = M[a,b]·S.
             let mut acc = 0.0;
@@ -4008,6 +3927,10 @@ mod tests {
         assert!(sorted[0] > -1e-10, "M⊗S must be PSD; min eig {}", sorted[0]);
         // Nullspace dim = (K-1)·ns(S) = 3·2 = 6.
         let zeros = sorted.iter().take_while(|&&v| v.abs() < 1e-9).count();
-        assert_eq!(zeros, m * 2, "nullspace dim must be (K-1)·ns(S); spectrum {sorted:?}");
+        assert_eq!(
+            zeros,
+            m * 2,
+            "nullspace dim must be (K-1)·ns(S); spectrum {sorted:?}"
+        );
     }
 }

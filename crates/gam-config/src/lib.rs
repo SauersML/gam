@@ -8,7 +8,9 @@ use gam_solve::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, 
 use gam_models::fit_orchestration::descriptors::build_analytic_penalty_registry_from_descriptors;
 use gam_models::fit_orchestration::{CtnStage1Recipe, FitConfig};
 use gam_models::transformation_normal::TransformationNormalConfig;
-use gam_problem::types::{InverseLink, LinkFunction, MixtureLinkSpec, SasLinkSpec, StandardLink};
+use gam_problem::types::{
+    InverseLink, LinkComponent, LinkFunction, MixtureLinkSpec, SasLinkSpec, StandardLink,
+};
 use ndarray::Array1;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -514,12 +516,36 @@ pub fn parse_survival_inverse_link(
     if let Some(raw) = input.link {
         let name = raw.trim().to_ascii_lowercase();
         if name == "loglog" || name == "cauchit" {
-            return Err(format!(
-                "survival --link {name} is not supported: cauchit and loglog have no \
-                 LinkFunction representative and cannot be wrapped in a MixtureLinkSpec; \
-                 {}",
-                survival_link_usage()
-            ));
+            // `loglog` and `cauchit` have no scalar `LinkFunction`/`StandardLink`
+            // representative, but the blended-link kernels implement their inverse
+            // link and derivative jets exactly (`LinkComponent::LogLog` /
+            // `LinkComponent::Cauchit`). Represent a survival `--link loglog` /
+            // `--link cauchit` as a single-component mixture: it carries weight 1.0
+            // with no free mixing logits, so it evaluates as exactly that link and
+            // flows end-to-end through the fully-wired `InverseLink::Mixture` survival
+            // path (prepare/construct/row-kernel/predict).
+            if input.sas_init.is_some() {
+                return Err("--sas-init requires --link sas".to_string());
+            }
+            if input.beta_logistic_init.is_some() {
+                return Err("--beta-logistic-init requires --link beta-logistic".to_string());
+            }
+            if input.mixture_rho.is_some() {
+                return Err(
+                    "--mixture-rho requires survival --link blended(...)/mixture(...)".to_string(),
+                );
+            }
+            let component = if name == "loglog" {
+                LinkComponent::LogLog
+            } else {
+                LinkComponent::Cauchit
+            };
+            return state_fromspec(&MixtureLinkSpec {
+                components: vec![component],
+                initial_rho: Array1::zeros(0),
+            })
+            .map(InverseLink::Mixture)
+            .map_err(|e| format!("invalid survival {name} link state: {e}"));
         }
     }
     let choice = parse_link_choice(input.link, false).map_err(|err| {
@@ -936,7 +962,7 @@ fn validate_resolved_fit_config(config: &FitConfig) -> Result<(), String> {
 }
 
 fn survival_link_usage() -> &'static str {
-    "use identity|logit|probit|cloglog|sas|beta-logistic|blended(...)/mixture(...) or flexible(...)"
+    "use identity|logit|probit|cloglog|loglog|cauchit|sas|beta-logistic|blended(...)/mixture(...) or flexible(...)"
 }
 
 #[cfg(test)]

@@ -191,6 +191,7 @@ fn run_fit(
         coefficient_groups: Vec::new(),
         penalty_block_gamma_priors: Vec::new(),
         latent_coord: None,
+        estimate_tweedie_p: false,
         _marker: std::marker::PhantomData,
     }))
     .map_err(|e| format!("{e:?}"))?;
@@ -776,6 +777,7 @@ fn run_fit_poisson(n: usize, bounds: (f64, f64)) -> Result<FitTiming, String> {
         coefficient_groups: Vec::new(),
         penalty_block_gamma_priors: Vec::new(),
         latent_coord: None,
+        estimate_tweedie_p: false,
         _marker: std::marker::PhantomData,
     }))
     .map_err(|e| format!("{e:?}"))?;

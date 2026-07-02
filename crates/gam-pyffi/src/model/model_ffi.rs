@@ -2018,12 +2018,14 @@ fn duchon_basis_with_jets<'py>(
     // Resolve the (nullspace_order, power) pair exactly as the basis-only
     // `duchon_basis` forward does (`max_op = 0`): the returned jets must
     // differentiate the *same* matrix the forward builds.
+    let any_periodic = periodic_flags.iter().any(|&b| b);
     let cfg = resolve_duchon_hybrid_config(
         d,
         length_scale,
         nullspace_order,
         power,
         /* max_op = */ 0,
+        any_periodic,
     )?;
 
     // Periods for periodic axes: auto-derived as (max − min) over centers,
@@ -2416,6 +2418,7 @@ fn duchon_basis<'py>(
         nullspace_order,
         power,
         /* max_op = */ 0,
+        any_periodic,
     )?;
     let (spec_length_scale, spec_nullspace, spec_power) =
         (cfg.length_scale, cfg.nullspace_order, cfg.power);
@@ -2596,11 +2599,13 @@ fn duchon_function_norm_penalty<'py>(
                 nullspace_order,
                 Some(explicit_power),
                 /* max_op = */ 0,
+                any_periodic,
             )?;
             (cfg.length_scale, cfg.nullspace_order, cfg.power)
         }
         None => {
-            let cfg = resolve_duchon_hybrid_config(d, length_scale, nullspace_order, None, 0)?;
+            let cfg =
+                resolve_duchon_hybrid_config(d, length_scale, nullspace_order, None, 0, any_periodic)?;
             (cfg.length_scale, cfg.nullspace_order, cfg.power)
         }
     };
@@ -3082,13 +3087,19 @@ fn gaussian_reml_score<'py>(
         )
         .map_err(EstimationError::InvalidInput)?;
         let fit_x = gated_x.as_ref().map_or(x_values.view(), |g| g.view());
+        let gated_weights = gate_weights_for_forward(
+            weight_values.as_ref().map(|w| w.view()),
+            by_values.as_ref().map(|b| b.view()),
+            x_values.nrows(),
+        )
+        .map_err(EstimationError::InvalidInput)?;
         gaussian_reml_free_b_score(
             fit_x,
             y_values.view(),
             coefficient_values.view(),
             log_lambda,
             penalty_values.view(),
-            weight_values.as_ref().map(|w| w.view()),
+            gated_weights.as_ref().map(|w| w.view()),
         )
     })?;
     let out = PyDict::new(py);
@@ -4147,11 +4158,16 @@ fn gaussian_reml_fit<'py>(
             by_start_col,
         )?;
         let fit_x = gated_x.as_ref().map_or(x_values.view(), |g| g.view());
+        let gated_weights = gate_weights_for_forward(
+            weight_values.as_ref().map(|w| w.view()),
+            by_values.as_ref().map(|b| b.view()),
+            x_values.nrows(),
+        )?;
         match gaussian_reml_multi_closed_form_with_cache(
             fit_x,
             y_values.view(),
             penalty_values.view(),
-            weight_values.as_ref().map(|w| w.view()),
+            gated_weights.as_ref().map(|w| w.view()),
             init_lambda,
             None,
         ) {
@@ -4223,12 +4239,18 @@ fn gaussian_reml_fit_backward<'py>(
             )
             .map_err(EstimationError::InvalidInput)?;
             let fit_x = gated_x.as_ref().map_or(x_values.view(), |g| g.view());
+            let gated_weights = gate_weights_for_forward(
+                weight_values.as_ref().map(|w| w.view()),
+                by_values.as_ref().map(|b| b.view()),
+                x_values.nrows(),
+            )
+            .map_err(EstimationError::InvalidInput)?;
             let backward = if let Some(fit) = forward_fit.as_ref() {
                 gaussian_reml_multi_closed_form_backward_from_fit(
                     fit_x,
                     y_values.view(),
                     penalty_values.view(),
-                    weight_values.as_ref().map(|w| w.view()),
+                    gated_weights.as_ref().map(|w| w.view()),
                     fit,
                     grad_lambda,
                     grad_coefficients_values.as_ref().map(|g| g.view()),
@@ -4241,7 +4263,7 @@ fn gaussian_reml_fit_backward<'py>(
                     fit_x,
                     y_values.view(),
                     penalty_values.view(),
-                    weight_values.as_ref().map(|w| w.view()),
+                    gated_weights.as_ref().map(|w| w.view()),
                     init_lambda,
                     grad_lambda,
                     grad_coefficients_values.as_ref().map(|g| g.view()),
@@ -4257,12 +4279,14 @@ fn gaussian_reml_fit_backward<'py>(
                 backward.grad_x,
             )
             .map_err(EstimationError::InvalidInput)?;
+            let grad_weights =
+                ungate_weight_gradient(by_values.as_ref().map(|b| b.view()), backward.grad_weights);
             Ok((
                 grad_x,
                 grad_by,
                 backward.grad_y,
                 backward.grad_penalty,
-                backward.grad_weights,
+                grad_weights,
             ))
         })?;
 
@@ -4929,6 +4953,113 @@ fn gaussian_reml_fit_with_constraints_forward<'py>(
             }
         };
 
+    // With no active inequality system the constrained forward is, by
+    // definition, the unconstrained Gaussian REML fit. Route it through the
+    // exact same closed-form solver that `gaussian_reml_fit` uses so the two
+    // agree to the last bit rather than merely "close" — the general PIRLS
+    // outer loop converges to a slightly different smoothing parameter and
+    // would otherwise violate the documented no-constraint invariant.
+    if constraints_opt.is_none() {
+        let init_lambda = init_log_lambda.map(f64::exp);
+        let x_cf = x_view.to_owned();
+        let y_cf = y_view.to_owned();
+        let penalty_cf = penalty_view.to_owned();
+        let weights_cf: Option<Array1<f64>> = weights.as_ref().map(|w| w.as_array().to_owned());
+        let fit = detach_estimation_result(
+            py,
+            "gaussian_reml_fit_with_constraints_forward",
+            move || {
+                gaussian_reml_multi_closed_form_with_cache(
+                    x_cf.view(),
+                    y_cf.view(),
+                    penalty_cf.view(),
+                    weights_cf.as_ref().map(|w| w.view()),
+                    init_lambda,
+                    None,
+                )
+            },
+        )?;
+
+        let lambda_scalar = fit.lambda;
+        let log_lambda_scalar = lambda_scalar.max(1e-300).ln();
+        let active_indices_arr: Array1<u64> = Array1::from_vec(Vec::new());
+
+        let out = PyDict::new(py);
+        out.set_item("coefficients", fit.coefficients.into_pyarray(py))?;
+        out.set_item("fitted", fit.fitted.into_pyarray(py))?;
+        out.set_item("lambda", lambda_scalar)?;
+        out.set_item("log_lambda", log_lambda_scalar)?;
+        out.set_item("reml_score", fit.reml_score)?;
+        out.set_item("edf", fit.edf)?;
+        out.set_item("active_indices", active_indices_arr.into_pyarray(py))?;
+        return Ok(out.unbind());
+    }
+
+    // Interior-cert fast path. Even with an inequality system present, if the
+    // *unconstrained* closed-form optimum is already strictly interior — every
+    // row `a_i·β̂ > b_i` beyond the boundary tolerance — then no constraint
+    // binds, so by the KKT conditions (all multipliers zero) that unconstrained
+    // optimum IS the constrained solution. Returning the closed form here makes
+    // a present-but-non-binding constraint (e.g. the degenerate `0·β ≥ −1`)
+    // agree bit-for-bit with the unconstrained `gaussian_reml_fit` and with the
+    // interior-cert branch of the analytic backward, which already
+    // differentiates this same closed form; the PIRLS outer loop otherwise
+    // settles on a slightly different smoothing parameter and desynchronises the
+    // forward from both. The strict-interior predicate is the exact negation of
+    // the active-set report's binding test below (same tolerance), so taking
+    // this path ⟺ the reported active set is empty. Only when the unconstrained
+    // optimum actually reaches or violates a row do we pay for the constrained
+    // PIRLS solve.
+    if let Some(constraints) = constraints_opt.as_ref() {
+        let init_lambda = init_log_lambda.map(f64::exp);
+        let x_cf = x_view.to_owned();
+        let y_cf = y_view.to_owned();
+        let penalty_cf = penalty_view.to_owned();
+        let weights_cf: Option<Array1<f64>> = weights.as_ref().map(|w| w.as_array().to_owned());
+        let cf = detach_estimation_result(
+            py,
+            "gaussian_reml_fit_with_constraints_forward",
+            move || {
+                gaussian_reml_multi_closed_form_with_cache(
+                    x_cf.view(),
+                    y_cf.view(),
+                    penalty_cf.view(),
+                    weights_cf.as_ref().map(|w| w.view()),
+                    init_lambda,
+                    None,
+                )
+            },
+        )?;
+        let beta_cf = cf.coefficients.column(0).to_owned();
+        let beta_scale = beta_cf.iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1.0);
+        let ab: Array1<f64> = constraints.a.dot(&beta_cf);
+        let strictly_interior = (0..constraints.a.nrows()).all(|i| {
+            let row_scale =
+                constraints
+                    .a
+                    .row(i)
+                    .iter()
+                    .fold(0.0_f64, |m, &v| m.max(v.abs()))
+                    .max(1.0);
+            let tol = 1e-8 * row_scale * beta_scale.max(constraints.b[i].abs().max(1.0));
+            ab[i] > constraints.b[i] + tol
+        });
+        if strictly_interior {
+            let lambda_scalar = cf.lambda;
+            let log_lambda_scalar = lambda_scalar.max(1e-300).ln();
+            let active_indices_arr: Array1<u64> = Array1::from_vec(Vec::new());
+            let out = PyDict::new(py);
+            out.set_item("coefficients", cf.coefficients.into_pyarray(py))?;
+            out.set_item("fitted", cf.fitted.into_pyarray(py))?;
+            out.set_item("lambda", lambda_scalar)?;
+            out.set_item("log_lambda", log_lambda_scalar)?;
+            out.set_item("reml_score", cf.reml_score)?;
+            out.set_item("edf", cf.edf)?;
+            out.set_item("active_indices", active_indices_arr.into_pyarray(py))?;
+            return Ok(out.unbind());
+        }
+    }
+
     let s_list: Vec<gam::terms::smooth::BlockwisePenalty> =
         vec![gam::terms::smooth::BlockwisePenalty::new(
             0..p_cols,
@@ -5103,13 +5234,6 @@ fn gaussian_reml_fit_with_constraints_backward<'py>(
     grad_reml_score: f64,
     grad_edf: f64,
 ) -> PyResult<Py<PyDict>> {
-    if let Some(b) = b_inequality.as_ref() {
-        if b.as_array().iter().any(|value| value.abs() > 0.0) {
-            return Err(py_value_error(
-                "gaussian_reml_fit_with_constraints_backward supports only zero-bound inequality certificates".to_string(),
-            ));
-        }
-    }
     if let Some(coefficients) = coefficients_at_optimum.as_ref() {
         let coeffs = coefficients.as_array();
         if coeffs.nrows() != x.as_array().ncols() || coeffs.ncols() != y.as_array().ncols() {
@@ -5146,6 +5270,27 @@ fn gaussian_reml_fit_with_constraints_backward<'py>(
     let is_interior = active_empty || no_constraints;
 
     if !is_interior {
+        // The tangent reparametrisation `β = Z γ`, `Z = null(A_act)` below
+        // encodes the *homogeneous* active face `A_act β̂ = 0`. A non-zero
+        // active bound `b_act` shifts the face to the affine set
+        // `A_act β̂ = b_act` (β̂ = β_particular + Z γ̂), which this reduced
+        // backward does not model. Guard exactly the rows that enter the
+        // reparametrisation — the active ones — rather than every bound:
+        // an interior cert (handled below) never touches `b`, so a slack
+        // constraint with a non-zero bound is perfectly admissible there.
+        if let (Some(b), Some(active)) = (b_inequality.as_ref(), active_indices.as_ref()) {
+            let b_view = b.as_array();
+            for &idx in active.as_array().iter() {
+                let idx = idx as usize;
+                if b_view.get(idx).is_some_and(|value| value.abs() > 0.0) {
+                    return Err(py_value_error(
+                        "gaussian_reml_fit_with_constraints_backward supports only \
+                         zero-bound inequality certificates on the active face"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
         // Active cert: tangent-projected envelope-theorem VJP.
         //
         // At the active cert the equality constraints `A_act β̂ = 0` confine
@@ -5432,12 +5577,17 @@ fn gaussian_reml_fit_batched<'py>(
             by_start_col,
         )?;
         let fit_x = gated_x.as_ref().map_or(x_values.view(), |g| g.view());
+        let gated_weights = gate_weights_for_forward(
+            weight_values.as_ref().map(|w| w.view()),
+            by_values.as_ref().map(|b| b.view()),
+            x_values.nrows(),
+        )?;
         gaussian_reml_fit_batched_impl(
             fit_x,
             y_values.view(),
             row_offset_values.view(),
             penalty_values.view(),
-            weight_values.as_ref().map(|w| w.view()),
+            gated_weights.as_ref().map(|w| w.view()),
             init_lambda,
         )
     })?;
@@ -5561,12 +5711,17 @@ fn gaussian_reml_fit_batched_backward<'py>(
                 by_start_col,
             )?;
             let fit_x = gated_x.as_ref().map_or(x_values.view(), |g| g.view());
+            let gated_weights = gate_weights_for_forward(
+                weight_values.as_ref().map(|w| w.view()),
+                by_values.as_ref().map(|b| b.view()),
+                x_values.nrows(),
+            )?;
             let backward = gaussian_reml_fit_batched_backward_impl(
                 fit_x,
                 y_values.view(),
                 row_offset_values.view(),
                 penalty_values.view(),
-                weight_values.as_ref().map(|w| w.view()),
+                gated_weights.as_ref().map(|w| w.view()),
                 init_lambda,
                 grad_lambda_values.as_ref().map(|g| g.view()),
                 grad_coefficients_values.as_ref().map(|g| g.view()),
@@ -5581,13 +5736,15 @@ fn gaussian_reml_fit_batched_backward<'py>(
                 by_start_col,
                 backward.grad_x,
             )?;
+            let grad_weights =
+                ungate_weight_gradient(by_values.as_ref().map(|b| b.view()), backward.grad_weights);
             Ok((
                 backward.statuses,
                 grad_x,
                 grad_by,
                 backward.grad_y,
                 backward.grad_penalty,
-                backward.grad_weights,
+                grad_weights,
             ))
         })?;
 
@@ -5655,11 +5812,16 @@ fn gaussian_reml_fit_positions<'py>(
         let gated_x =
             gate_design_for_forward(x.view(), by_values.as_ref().map(|b| b.view()), by_start_col)?;
         let fit_x = gated_x.as_ref().map_or(x.view(), |g| g.view());
+        let gated_weights = gate_weights_for_forward(
+            weight_values.as_ref().map(|w| w.view()),
+            by_values.as_ref().map(|b| b.view()),
+            x.nrows(),
+        )?;
         match gaussian_reml_multi_closed_form_with_cache(
             fit_x,
             y_values.view(),
             penalty_values.view(),
-            weight_values.as_ref().map(|w| w.view()),
+            gated_weights.as_ref().map(|w| w.view()),
             init_lambda,
             None,
         ) {

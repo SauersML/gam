@@ -1185,6 +1185,22 @@ pub(crate) fn joint_outer_evaluate(
             if let Some(hphi) = robust_jeffreys_hphi_for_operator.as_ref() {
                 j_for_traces.scaled_add(rho_curvature_scale, hphi);
             }
+            // gam#1395/#1854: `BlockCoupledOperator::from_joint_hessian_with_mode`
+            // eigendecomposes via `eigh(Side::Lower)`, which reads ONLY the lower
+            // triangle and assumes the input is already symmetric. The assembled
+            // `H_unpen + S_λ + scale·H_Φ` is symmetric in exact arithmetic, but
+            // reduction-order f.p. noise desyncs mirror entries — and on the
+            // multinomial Firth/Jeffreys path the divided-difference `H_Φ` (plus
+            // its second-order completion) carries an `O(1e10)` curvature scale in
+            // the near-separation regime, so that asymmetry is large enough that
+            // reading the raw lower triangle yields a materially different spectrum
+            // (and logdet) than the symmetrized matrix. That is exactly the gam#1395
+            // logdet-collapse the ground-truth guard below detects, because the
+            // guard reconstructs the SAME matrix but symmetrizes it first (as does
+            // the matrix-free dense-assemble path). Symmetrize here too so every
+            // route feeds `from_symmetric_with_mode` the identical symmetric matrix
+            // and the operator realizes the penalized joint Hessian consistently.
+            symmetrize_dense_in_place(&mut j_for_traces);
             Arc::new(
                 BlockCoupledOperator::from_joint_hessian_with_mode(
                     &j_for_traces,

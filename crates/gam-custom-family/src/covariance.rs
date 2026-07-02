@@ -524,7 +524,27 @@ pub fn projected_linear_constraint_stationarity_vector(
         // candidate carrying no multiplier mass, so a non-binding row cannot
         // spuriously shrink the residual.
         let scale = value.abs().max(constraints.b[row].abs()).max(1.0);
-        let active_tol = 1e-3 * scale + 1e-8;
+        let beta_inf = beta
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0_f64, f64::max)
+            .max(1.0);
+        let row_norm1 = a_row.iter().map(|v| v.abs()).sum::<f64>().max(1.0);
+        // A row that is mathematically binding can appear a small positive
+        // distance inside the feasible cone after repeated dense/spectral
+        // Newton projections on a flat baseline-hazard valley: the objective is
+        // insensitive along that direction, so round-off in the derivative-basis
+        // coordinates dominates the true slack.  The active-set QP reports only
+        // rows it explicitly pivoted on, so the KKT residual projection must also
+        // recover these numerically-pinned rows from primal slack.  Use a
+        // coefficient-space slack band, scaled by the row norm and coefficient
+        // magnitude, not just by `Aβ` (which is exactly zero for monotone
+        // derivative constraints with `b=0`).  Over-inclusion is safe because the
+        // downstream nonnegative cone projection assigns λ=0 to rows that do not
+        // carry multiplier mass; under-inclusion leaves a genuine multiplier in
+        // the residual and falsely reports `active_set_incomplete` (#1793/#1040).
+        let coordinate_slack_tol = 5e-3 * row_norm1 * beta_inf + 1e-8;
+        let active_tol = (1e-3 * scale + 1e-8).max(coordinate_slack_tol);
         if slack <= active_tol {
             in_active[row] = true;
         }

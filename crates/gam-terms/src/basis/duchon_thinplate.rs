@@ -1045,37 +1045,52 @@ pub fn select_thin_plate_knots(
         })
         .collect();
 
-    // Value-lexicographic order on a candidate's COORDINATE VALUES (not its row
-    // index): a pure function of the unordered data value set. It is the final,
-    // measure-zero tie-break for points that coincide on every rotation-
-    // invariant key below. Breaking ties by row index instead made the selected
-    // knot SET depend on the row order of the data, so a pure permutation
-    // produced a different basis, different conditioning, and a different REML
-    // λ̂ (gam#1378, ~3% curve drift while value-anchored cr/ps were identical).
-    let value_less = |i: usize, j: usize| -> bool {
-        for c in 0..d {
-            let vi = data[[i, c]];
-            let vj = data[[j, c]];
-            if vi < vj {
-                return true;
+    // Rotation- and permutation-invariant tie-break on a candidate's distance
+    // profile to the whole support.  Lexicographic coordinate order is
+    // permutation-invariant, but it is NOT rotation-invariant: on symmetric
+    // clouds (regular grids, rings, centred designs) the centroid/fill-distance
+    // keys often tie exactly, and a rigid rotation can change which coordinate
+    // tuple is lexicographically smallest.  That reseeds the farthest-point
+    // recursion with a different physical row and breaks the isotropic Duchon /
+    // thin-plate equivariance contract.  The sorted multiset
+    // `{‖x_i - x_l‖² : l=1..n}` is a pure function of the unordered Euclidean
+    // geometry, so it survives both row permutations and rigid rotations.  Only
+    // genuinely duplicate/interchangeable rows fall through to the row index.
+    let distance_profile_less = |i: usize, j: usize| -> bool {
+        let mut profile_i = Vec::with_capacity(n);
+        let mut profile_j = Vec::with_capacity(n);
+        for row in 0..n {
+            let mut d2_i = 0.0;
+            let mut d2_j = 0.0;
+            for c in 0..d {
+                let delta_i = data[[i, c]] - data[[row, c]];
+                let delta_j = data[[j, c]] - data[[row, c]];
+                d2_i += delta_i * delta_i;
+                d2_j += delta_j * delta_j;
             }
-            if vi > vj {
-                return false;
+            profile_i.push(d2_i);
+            profile_j.push(d2_j);
+        }
+        profile_i.sort_by(|a, b| a.total_cmp(b));
+        profile_j.sort_by(|a, b| a.total_cmp(b));
+        for (&di, &dj) in profile_i.iter().zip(profile_j.iter()) {
+            match di.total_cmp(&dj) {
+                std::cmp::Ordering::Less => return true,
+                std::cmp::Ordering::Greater => return false,
+                std::cmp::Ordering::Equal => {}
             }
         }
-        // Exactly equal coordinates: fall back to row index only to keep a
-        // total order (duplicate points are interchangeable in the basis).
         i < j
     };
 
-    // Seed = centroid-nearest row; equidistant ties resolved by the value order
-    // so the seed is a deterministic, rotation- and permutation-invariant
-    // function of the data.
+    // Seed = centroid-nearest row; equidistant ties resolved by the invariant
+    // support-distance profile so the seed is a deterministic, rotation- and
+    // permutation-invariant function of the data.
     let seed_idx = (0..n)
         .into_par_iter()
         .map(|i| (i, dist2_to_centroid[i]))
         .reduce_with(|a, b| {
-            if b.1 < a.1 || (b.1 == a.1 && value_less(b.0, a.0)) {
+            if b.1 < a.1 || (b.1 == a.1 && distance_profile_less(b.0, a.0)) {
                 b
             } else {
                 a
@@ -1113,14 +1128,15 @@ pub fn select_thin_plate_knots(
                 // arithmetic — are resolved by a rotation-invariant key first
                 // (the larger distance to the centroid, which spreads knots
                 // outward and is a pure function of the unordered value set),
-                // and only by the value order for points that also tie there.
+                // and only by the invariant support-distance profile for points
+                // that also tie there.
                 // This keeps the selected knot set invariant under both rigid
                 // rotation and row permutation of the data.
                 let pick_b = b.1 > a.1
                     || (b.1 == a.1
                         && (dist2_to_centroid[b.0] > dist2_to_centroid[a.0]
                             || (dist2_to_centroid[b.0] == dist2_to_centroid[a.0]
-                                && value_less(b.0, a.0))));
+                                && distance_profile_less(b.0, a.0))));
                 if pick_b { b } else { a }
             })
             .map(|(i, _)| i);

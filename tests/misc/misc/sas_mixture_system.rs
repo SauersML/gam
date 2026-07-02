@@ -158,6 +158,85 @@ fn sas_fit_recovery_and_calibration_system() {
     );
 }
 
+/// Root-cause regression for #1876 from a different angle: the original defect
+/// recovered the SAS skewness with the WRONG SIGN and WRONG MAGNITUDE because
+/// the outer link-parameter gradient was evaluated at a first-order-capped inner
+/// β̂ without the KKT-residual envelope correction. The headline repro plants a
+/// positive skew (+0.38); here we plant a NEGATIVE skew with a POSITIVE
+/// log-delta (a genuinely different point in (ε, log δ) space) and require the
+/// fit to recover both — so a sign flip or a scale error in the envelope
+/// correction is caught independently of the exact seed/parameters that first
+/// surfaced the bug.
+#[test]
+fn sas_recovers_negative_skew_and_positive_log_delta() {
+    let n = 3000usize;
+    let x = build_design(n);
+    let beta_true = Array1::from_vec(vec![-0.20, 0.95, -0.55, 0.40]);
+    let eps_true: f64 = -0.55;
+    let log_delta_true: f64 = 0.25;
+    let delta_true = log_delta_true.exp();
+    let eta = x.dot(&beta_true);
+    let p_true = eta.mapv(|e| sas_inverse_link_jet(e, eps_true, log_delta_true).mu);
+
+    let mut rng = StdRng::seed_from_u64(20260702);
+    let y = p_true.mapv(|p| if rng.random::<f64>() < p { 1.0 } else { 0.0 });
+    let w = Array1::<f64>::ones(n);
+    let offset = Array1::<f64>::zeros(n);
+    let s_list = one_penalty_for_non_intercept(x.ncols());
+
+    let mut opts = base_fit_options();
+    opts.sas_link = Some(SasLinkSpec {
+        initial_epsilon: 0.0,
+        initial_log_delta: 0.0,
+    });
+    opts.optimize_sas = true;
+    let family = sas_likelihood(opts.sas_link.expect("SAS fit spec"));
+    let fit = fit_gam(
+        x.view(),
+        y.view(),
+        w.view(),
+        offset.view(),
+        &s_list,
+        family.clone(),
+        &opts,
+    )
+    .expect("SAS fit");
+
+    let (eps_hat, delta_hat) = match &fit.fitted_link {
+        FittedLinkState::Sas { state, .. } => (state.epsilon, state.delta),
+        other => panic!("expected SAS fitted state, got {other:?}"),
+    };
+    // Sign must be correct (the pre-fix defect flipped it) and the magnitude
+    // within the same tolerance band the positive-skew repro uses.
+    assert!(
+        eps_hat < 0.0,
+        "recovered skewness has the wrong sign: hat={eps_hat:.4}, true={eps_true:.4}"
+    );
+    assert!(
+        (eps_hat - eps_true).abs() < 0.20,
+        "epsilon recovery off: hat={eps_hat:.4}, true={eps_true:.4}"
+    );
+    assert!(
+        (delta_hat - delta_true).abs() < 0.20,
+        "delta recovery off: hat={delta_hat:.4}, true={delta_true:.4}"
+    );
+
+    let pred = predict_gamwith_uncertainty(
+        x.view(),
+        fit.beta.view(),
+        offset.view(),
+        family,
+        &fit,
+        &PredictUncertaintyOptions::default(),
+    )
+    .expect("SAS predict");
+    let calib_gap = (pred.mean.mean().unwrap_or(0.0) - y.mean().unwrap_or(0.0)).abs();
+    assert!(
+        calib_gap < 0.04,
+        "SAS prevalence calibration gap too large: {calib_gap:.4}"
+    );
+}
+
 #[test]
 fn mixture_recovery_and_prediction_alignment_system() {
     let n = 2000usize;

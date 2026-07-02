@@ -342,6 +342,7 @@ fn aniso_matern_theta0_eta_contrast_gradient_is_fd_visible() {
         coefficient_groups: Vec::new(),
         penalty_block_gamma_priors: Vec::new(),
         latent_coord: None,
+        estimate_tweedie_p: false,
         _marker: std::marker::PhantomData,
     }));
     match outcome {

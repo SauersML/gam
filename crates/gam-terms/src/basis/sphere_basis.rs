@@ -3237,7 +3237,12 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
     // (`build_matern_basis_log_kappa_derivativeswithworkspace`): pull the realized
     // centers / identifiability transform / resolved anisotropy from the value
     // build's metadata so the two are byte-consistent by construction.
-    let base = build_matern_basiswithworkspace(data, spec, &mut BasisWorkspace::default())?;
+    let base = build_matern_basis_seeded(
+        data,
+        spec,
+        &mut BasisWorkspace::default(),
+        AnisoSeedMode::Literal,
+    )?;
     let (base_centers, z_opt, base_aniso) = match &base.metadata {
         BasisMetadata::Matern {
             centers,
@@ -3286,8 +3291,8 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
         let k = centers.nrows();
         let kernel_cols = z_opt.as_ref().map(|z| z.ncols()).unwrap_or(k);
         let total_cols = kernel_cols + usize::from(spec.include_intercept);
-        let mut primary_first = vec![Array2::<f64>::zeros((total_cols, total_cols)); dim];
-        let mut primary_second_diag = vec![Array2::<f64>::zeros((total_cols, total_cols)); dim];
+        let mut primary_first_raw = vec![Array2::<f64>::zeros((total_cols, total_cols)); dim];
+        let mut primary_second_diag_raw = vec![Array2::<f64>::zeros((total_cols, total_cols)); dim];
         let coefficient_gauge = z_opt
             .as_ref()
             .map(|z| gam_problem::Gauge::from_block_transforms(&[z.clone()]));
@@ -3312,10 +3317,10 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
             } else {
                 std::mem::take(&mut raw_second_diag[a])
             };
-            primary_first[a]
+            primary_first_raw[a]
                 .slice_mut(s![0..kernel_cols, 0..kernel_cols])
                 .assign(&projected_first);
-            primary_second_diag[a]
+            primary_second_diag_raw[a]
                 .slice_mut(s![0..kernel_cols, 0..kernel_cols])
                 .assign(&projected_second);
         }
@@ -3332,44 +3337,55 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
         let has_shrinkage = base.penaltyinfo.iter().any(|info| {
             info.active && matches!(info.source, PenaltySource::DoublePenaltyNullspace)
         });
-        // The un-normalized projected aniso kernel Gram `A = Zᵀ K Z` (embedded
-        // into `total_cols`) is what the value build's shrinkage block eigen-
-        // decomposes; its per-axis η_a derivatives are `primary_first[a]`. The
-        // shrinkage-projector derivative (#1122) is driven by exactly these.
+        // The value path emits the primary double-penalty block as
+        // `A / ||A||_F`. Differentiate that normalized block here too; the raw
+        // `A_a` / `A_aa` derivatives are still retained for the shrinkage
+        // projector, whose eigenspace is defined by the un-normalized `A`.
+        let kernel = build_matern_kernel_penalty(
+            centers.view(),
+            spec.length_scale,
+            spec.nu,
+            spec.include_intercept,
+            Some(eta),
+        )?;
+        let kblock = kernel.slice(s![0..k, 0..k]).to_owned();
+        let projected = if let Some(gauge) = coefficient_gauge.as_ref() {
+            gauge.restrict_penalty(&kblock)
+        } else {
+            kblock
+        };
+        let mut a_raw = Array2::<f64>::zeros((total_cols, total_cols));
+        a_raw
+            .slice_mut(s![0..kernel_cols, 0..kernel_cols])
+            .assign(&projected);
+        let mut primary_first = Vec::with_capacity(dim);
+        let mut primary_second_diag = Vec::with_capacity(dim);
+        for a in 0..dim {
+            let (_, first, second, _) = normalize_penaltywith_psi_derivatives(
+                &a_raw,
+                &primary_first_raw[a],
+                &primary_second_diag_raw[a],
+            );
+            primary_first.push(first);
+            primary_second_diag.push(second);
+        }
         let shrinkage_frame = if has_shrinkage {
-            let kernel = build_matern_kernel_penalty(
-                centers.view(),
-                spec.length_scale,
-                spec.nu,
-                spec.include_intercept,
-                Some(eta),
-            )?;
-            let kblock = kernel.slice(s![0..k, 0..k]).to_owned();
-            let mut a_raw = Array2::<f64>::zeros((total_cols, total_cols));
-            let projected = if let Some(gauge) = coefficient_gauge.as_ref() {
-                gauge.restrict_penalty(&kblock)
-            } else {
-                kblock
-            };
-            a_raw
-                .slice_mut(s![0..kernel_cols, 0..kernel_cols])
-                .assign(&projected);
             ShrinkageProjectorFrame::build(&a_raw)?
         } else {
             None
         };
         let shrinkage_first: Vec<Array2<f64>> = (0..dim)
             .map(|a| match &shrinkage_frame {
-                Some(frame) => frame.first(&primary_first[a]),
+                Some(frame) => frame.first(&primary_first_raw[a]),
                 None => Array2::<f64>::zeros((total_cols, total_cols)),
             })
             .collect();
         let shrinkage_second_diag: Vec<Array2<f64>> = (0..dim)
             .map(|a| match &shrinkage_frame {
                 Some(frame) => frame.second(
-                    &primary_first[a],
-                    &primary_first[a],
-                    &primary_second_diag[a],
+                    &primary_first_raw[a],
+                    &primary_first_raw[a],
+                    &primary_second_diag_raw[a],
                 ),
                 None => Array2::<f64>::zeros((total_cols, total_cols)),
             })
@@ -3402,7 +3418,8 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
         // Per-axis projected first derivatives ∂A/∂η_a (embedded), so the
         // cross-pair shrinkage second derivative `∂²P/∂η_a∂η_b` can be formed
         // exactly inside the provider (#1122).
-        let primary_first_owned = primary_first.clone();
+        let primary_first_raw_owned = primary_first_raw.clone();
+        let a_raw_owned = a_raw.clone();
         let include_intercept = spec.include_intercept;
         result.penalties_cross_provider = Some(AnisoPenaltyCrossProvider::new(
             move |axis_a: usize, axis_b: usize| {
@@ -3431,6 +3448,13 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
                 padded
                     .slice_mut(s![0..kernel_cols, 0..kernel_cols])
                     .assign(&projected);
+                let primary_cross = normalize_penalty_cross_psi_derivative(
+                    &a_raw_owned,
+                    &primary_first_raw_owned[a],
+                    &primary_first_raw_owned[b],
+                    &padded,
+                    trace_of_product(&a_raw_owned, &a_raw_owned).sqrt(),
+                );
                 // Exact cross second derivative of the shrinkage projector, if
                 // an active shrinkage block exists at this hyperparameter.
                 let shrinkage_cross = if penaltyinfo.iter().any(|info| {
@@ -3455,15 +3479,21 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
                         .slice_mut(s![0..kernel_cols, 0..kernel_cols])
                         .assign(&projected_a);
                     match ShrinkageProjectorFrame::build(&a_raw)? {
-                        Some(frame) => {
-                            frame.second(&primary_first_owned[a], &primary_first_owned[b], &padded)
-                        }
+                        Some(frame) => frame.second(
+                            &primary_first_raw_owned[a],
+                            &primary_first_raw_owned[b],
+                            &padded,
+                        ),
                         None => Array2::<f64>::zeros((total_cols, total_cols)),
                     }
                 } else {
                     Array2::<f64>::zeros((total_cols, total_cols))
                 };
-                active_matern_double_penalty_derivatives(&penaltyinfo, &padded, &shrinkage_cross)
+                active_matern_double_penalty_derivatives(
+                    &penaltyinfo,
+                    &primary_cross,
+                    &shrinkage_cross,
+                )
             },
         ));
     } else {

@@ -301,6 +301,11 @@ pub(crate) fn run_generate_unified(
                         fit_saved.standard_deviation,
                         &family,
                     ),
+                    // This scalar-dispersion fallback arm handles non-Gaussian
+                    // families (Gamma/NB/Beta/Tweedie), whose observation draw
+                    // does not take analytic prior weights; the Gaussian
+                    // weighted case is #2025 in the replicate path.
+                    None,
                 )
                 .map_err(|e| format!("failed to build generative spec: {e}"))
             }
@@ -345,9 +350,51 @@ pub(crate) fn run_generate_unified(
                 fit_saved.standard_deviation,
                 &family,
             ),
+            // Prior-weight scaling for the weighted-Gaussian replicate draw is
+            // resolved in the FFI `Model.sample_replicates` path (#2025); this
+            // CLI generate arm preserves its existing scalar-sigma behavior.
+            None,
         )
         .map_err(|e| format!("failed to build generative spec: {e}"))
     }
+}
+
+fn smoothing_forensics_rows(
+    fit: &UnifiedFitResult,
+    edf_blocks: &[report::EdfBlockRow],
+) -> Vec<report::SmoothingForensicsRow> {
+    let sigma2 = (fit.standard_deviation * fit.standard_deviation).max(0.0);
+    let assembly_edfs = fit.edf_by_block();
+    fit.blocks
+        .iter()
+        .enumerate()
+        .map(|(block_idx, block)| {
+            let lambda_path = block.lambdas.iter().copied().collect::<Vec<_>>();
+            let edf_criterion = edf_blocks
+                .iter()
+                .find(|row| row.index == block_idx)
+                .map(|row| row.edf)
+                .or(Some(block.edf));
+            let edf_assembly = assembly_edfs.get(block_idx).copied().or(Some(block.edf));
+            let role = block_role_label(&block.role);
+            report::SmoothingForensicsRow {
+                term: format!("block {block_idx} ({role})"),
+                lambda_path,
+                sigma2_path: vec![sigma2],
+                edf_criterion,
+                edf_assembly,
+                double_penalty_range: None,
+                double_penalty_null_space: fit.artifacts.null_space_dim.and_then(|dim| {
+                    if dim > 0 && block_idx == 0 {
+                        Some(dim as f64)
+                    } else {
+                        None
+                    }
+                }),
+                seed_screening: Vec::new(),
+            }
+        })
+        .collect()
 }
 
 /// Render the report for a spline-scan model (#1046) from its reconstructed
@@ -391,6 +438,7 @@ pub(crate) fn run_report_spline_scan(
         converged: true,
         outer_gradient_norm: None,
         criterion_certificate: None,
+        smoothing_forensics: Vec::new(),
         edf_total: scan.edf(),
         r_squared: None,
         coefficients: Vec::new(),
@@ -464,6 +512,7 @@ pub(crate) fn run_report_residual_cascade(
         converged: true,
         outer_gradient_norm: None,
         criterion_certificate: None,
+        smoothing_forensics: Vec::new(),
         edf_total: 0.0,
         r_squared: None,
         coefficients: Vec::new(),
@@ -729,7 +778,7 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
                 // λ_raw = λ̃ / ||S_raw,ℓ||_F, before the arbitrary Mellin
                 // ε_ℓ^(-2s0)·log_step gauge is folded into the fit-time forms.
                 {
-                    let mut penalty_cursor = design.random_effect_ranges.len();
+                    let mut penalty_cursor = design.leading_penalty_blocks_before_smooth();
                     for term in &design.smooth.terms {
                         let k = term.penalties_local.len();
                         let term_penalty_start = penalty_cursor;
@@ -956,6 +1005,7 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
                 clean: cert.is_clean(),
             }
         }),
+        smoothing_forensics: smoothing_forensics_rows(&fit, &edf_blocks),
         edf_total: model
             .unified()
             .and_then(|u| u.edf_total())

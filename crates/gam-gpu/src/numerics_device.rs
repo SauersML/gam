@@ -15,7 +15,9 @@
 /// `cudarc::nvrtc::compile_ptx` or `PtxModuleCache::get_or_compile`.
 pub const PROBIT_NUMERICS_CU: &str = r#"
 // -------- shared probit numerics -----------------------------------------
-// All math in double precision.  No --use_fast_math.
+// All math in double precision; fast-math is disabled at compile time
+// (see `device_cache`'s `--fmad=false`) and the source is kept free of any
+// fast-math / single-precision intrinsic, guarded by the numerics_host tests.
 //
 // `log_ndtr(x)` = log Φ(x).  For x < 0 uses the erfcx representation
 //   log Φ(x) = -u² + log(½ · erfcx(u)),   u = -x / √2

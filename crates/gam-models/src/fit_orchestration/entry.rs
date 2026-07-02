@@ -493,18 +493,24 @@ fn fit_expectile_laws(
 ) -> Result<StandardFitResult, WorkflowError> {
     use gam_linalg::matrix::LinearOperator;
 
+    if config.frailty.as_ref().is_some_and(FrailtySpec::is_active) {
+        return Err(WorkflowError::InvalidConfig {
+            reason: "expectile regression does not support frailty; use a survival/frailty-aware family instead"
+                .to_string(),
+        });
+    }
+
     // Inner fits are ordinary Gaussian-identity GAMs; the τ asymmetry lives
     // entirely in the per-iteration prior weights this driver injects.
     let gaussian_config = FitConfig {
         family: Some("gaussian".to_string()),
         link: Some("identity".to_string()),
         expectile_tau: None,
-        // The inner Gaussian-identity design carries no frailty; the CLI always
-        // populates `frailty = Some(FrailtySpec::None)`, which the standard
-        // materializer's guard rejects (`config.frailty is not supported for
-        // standard family`). Clear it explicitly so the inner fit routes through
-        // the standard family (#1780). Guarded by the CLI regression test
-        // `bug_hunt_expectile_cli_fit_aborts_on_frailty_guard`.
+        // The inner Gaussian-identity design carries no frailty. Normalize the
+        // CLI/config-layer null value (`Some(FrailtySpec::None)`) to `None` so
+        // the expectile driver does not leak survival-only plumbing into the
+        // standard-family materializer, while the active-frailty guard above
+        // still rejects unsupported frailty requests explicitly.
         frailty: None,
         ..config.clone()
     };
@@ -528,6 +534,7 @@ fn fit_expectile_laws(
         offset,
         spec,
         family: materialized_family,
+        estimate_tweedie_p: _,
         options,
         kappa_options,
         wiggle,
@@ -581,6 +588,9 @@ fn fit_expectile_laws(
             offset: offset.clone(),
             spec: spec.clone(),
             family: gaussian_family.clone(),
+            // Expectile LAWS fits a Gaussian-identity inner family; no Tweedie
+            // power to estimate (#2026).
+            estimate_tweedie_p: false,
             options: options.clone(),
             kappa_options: kappa_options.clone(),
             wiggle: None,
@@ -652,7 +662,9 @@ fn fit_expectile_laws(
 ///   through the scan would silently drop that penalty and select λ from the
 ///   bending penalty alone, which is exactly the EDF inflation #1266 reports.
 ///   Those fits fall through to the dense two-rho path, which owns both penalties
-///   jointly;
+///   jointly. Natural cubic regression (`bs="cr"`/`"cs"`) terms also fall
+///   through: their knot-value parameterization is a finite-rank regression
+///   spline, not the scan's full smoothing-spline state-space posterior;
 /// - the offset is identically zero and every weight is finite and positive;
 /// - at least 3 distinct finite abscissae (the scan's diffuse rank plus one).
 ///
@@ -748,6 +760,20 @@ pub fn spline_scan_fast_path(request: &StandardFitRequest<'_>) -> Option<SplineS
         || matches!(
             bspec.knotspec,
             gam_terms::basis::BSplineKnotSpec::PeriodicUniform { .. }
+                | gam_terms::basis::BSplineKnotSpec::NaturalCubicRegression { .. }
+        )
+        // mgcv `bs="cr"`/`"cs"` materialise a `NaturalCubicRegression` value-knot
+        // spec: a Lancaster–Salkauskas cubic-regression basis whose columns
+        // index `f(x*_i)` at `k` quantile knots — a genuinely DIFFERENT finite
+        // basis (and hence a different penalized posterior) from the free
+        // integrated-Wiener natural spline the exact scan solves on the raw data
+        // points. The scan builds its own knots from `x` and ignores this spec,
+        // so routing a cr fit through it would silently solve the wrong model and
+        // (per #1844) return a non-`Standard` `SplineScan` result the predict-time
+        // design replay cannot reconstruct. Keep cr/cs on the dense path.
+        || matches!(
+            bspec.knotspec,
+            gam_terms::basis::BSplineKnotSpec::NaturalCubicRegression { .. }
         )
     {
         return None;

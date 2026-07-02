@@ -71,7 +71,16 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
         .map_err(|e| format!("failed to build term collection design: {e}"))?;
 
     let link = family.link_function();
-    let weights = Array1::ones(ds.values.nrows());
+    // Prior (case) weights the model was fit with, reloaded by the saved weight
+    // column name — the same column the fit persisted. Hard-coding `weights = 1`
+    // silently dropped the case weights from every diagnostic on a
+    // `--weights-column` fit: the geometry ALO path's working weights
+    // `w_i = prior_i · Fisher_i` and the refit fallback both need the true prior
+    // weights, and the recomputation below reproduces the fit's stored working
+    // weights only when seeded with them. `resolve_weight_column` returns all-ones
+    // when the model carries no weight column (the unweighted default).
+    let weights = resolve_weight_column(&ds, &col_map, model.weight_column.as_deref())
+        .map_err(|e| format!("failed to resolve saved weight column for diagnose: {e}"))?;
     // Re-apply the offset the model was fit with, resolved by the saved offset
     // column name exactly as the predict path does. Diagnose is Standard-only
     // (non-standard classes are rejected above), so the noise-offset slot is
@@ -87,9 +96,17 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     let alo = if let Some((unified, geom)) = model
         .unified()
         .and_then(|u| u.geometry.as_ref().map(|g| (u, g)))
+        // Treat a present-but-emptied geometry carrier as "geometry
+        // unavailable" and fall through to the refit branch. Batch-compacted
+        // models (see `compact_fit_result_for_batch`) used to zero these
+        // row-sized working vectors; `AloInput::from_geometry` then failed its
+        // length-N validation instead of ever reaching the refit fallback
+        // (#2030). This guard keeps diagnose working even for such saved
+        // models produced before the compaction fix.
+        .filter(|(_, geom)| !geom.working_weights.is_empty() && !geom.working_response.is_empty())
     {
         let fit_saved = fit_result_from_saved_model_for_prediction(&model)?;
-        // ALO's `from_geometry` expects the *full* linear predictor (offset
+        // ALO's geometry constructor expects the *full* linear predictor (offset
         // included); it re-centres internally via the separate `offset` arg to
         // match the offset-inclusive saved working response. The refit branch
         // below already adds `offset` here — the geometry path must too (#881).
@@ -104,8 +121,31 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
         // the model's estimated dispersion σ̂², not a hard-coded 1.0 (#881-class
         // SE-scale bug). `geometry_alo_phi` reads the saved σ̂.
         let phi = geometry_alo_phi(unified, link);
-        let input =
-            gam::alo::AloInput::from_geometry(geom, &alo_design_dense, &eta, &offset, link, phi);
+        // Recompute the row-sized IRLS working vectors rather than reading them
+        // off `geom`. Saved models are size-compacted for n-independence
+        // (`compact_fit_result_for_batch` empties `geom.working_weights` /
+        // `geom.working_response`), so reading them off `geom` fed empty vectors
+        // to the ALO solve and every `gam diagnose` failed with
+        // "ALO diagnostics require hessian_weights length N; got 0". These
+        // vectors are *derived* — at convergence they are deterministic
+        // functions of η̂ = Xβ̂, y, and the family — so replaying the same PIRLS
+        // working-state update the fit used reproduces the fit's exact working
+        // weights/response, keeping saved models n-independent while serving the
+        // exact geometry ALO path (saved Hessian, no refit). `likelihood_scale`
+        // is threaded from the fit so any scale-carrying family (fixed-φ
+        // Gaussian, Tweedie, Gamma, Beta) reproduces bit-for-bit.
+        let recomputed = geometry_alo_working_state(&family, unified, &eta, y.view(), weights.view())
+            .map_err(|e| format!("failed to recompute working state for geometry ALO: {e}"))?;
+        let input = gam::alo::AloInput::from_geometry_with_working_state(
+            geom,
+            &alo_design_dense,
+            &eta,
+            &offset,
+            link,
+            phi,
+            &recomputed.working_weights,
+            &recomputed.working_response,
+        );
         gam::alo::compute_alo_from_input(&input)
             .map_err(|e| format!("compute_alo_from_input (geometry path) failed: {e}"))?
     } else {
@@ -260,4 +300,56 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Row-sized IRLS working vectors reconstructed for the geometry ALO path.
+struct GeometryAloWorkingState {
+    /// Score-side Fisher working weights `w_i = prior_i · h'(η̂_i)²/(φ V(μ̂_i))`.
+    working_weights: Array1<f64>,
+    /// IRLS working response `z_i = η̂_i + (y_i − μ̂_i)/h'(η̂_i)` (offset-inclusive).
+    working_response: Array1<f64>,
+}
+
+/// Reconstruct the fit's converged IRLS working weights/response from `η̂`.
+///
+/// Saved models are size-compacted (`compact_fit_result_for_batch` empties the
+/// n-sized `FitGeometry` working vectors so persisted models stay n-independent),
+/// so the geometry ALO path cannot read them off `geom`. They are *derived*
+/// quantities, though: at convergence they are deterministic functions of the
+/// linear predictor `η̂ = Xβ̂`, the response `y`, the prior weights, and the
+/// family. Replaying the exact PIRLS working-state update the fit used
+/// (`update_glmvectors_by_family`) reproduces the fit's stored working vectors
+/// bit-for-bit — including scale-carrying families, since `likelihood_scale` is
+/// threaded from the saved fit — while keeping saved models free of any n-sized
+/// carrier. `eta` must be the full, offset-inclusive linear predictor (PIRLS
+/// works on `Xβ + offset`), matching the offset-inclusive working response.
+fn geometry_alo_working_state(
+    family: &LikelihoodSpec,
+    unified: &UnifiedFitResult,
+    eta: &Array1<f64>,
+    y: ArrayView1<f64>,
+    prior_weights: ArrayView1<f64>,
+) -> Result<GeometryAloWorkingState, String> {
+    let likelihood = gam::types::GlmLikelihoodSpec {
+        spec: family.clone(),
+        scale: unified.likelihood_scale.clone(),
+    };
+    let n = eta.len();
+    let mut mu = Array1::<f64>::zeros(n);
+    let mut working_weights = Array1::<f64>::zeros(n);
+    let mut working_response = Array1::<f64>::zeros(n);
+    gam::pirls::update_glmvectors_by_family(
+        y,
+        eta,
+        &likelihood,
+        prior_weights,
+        &mut mu,
+        &mut working_weights,
+        &mut working_response,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(GeometryAloWorkingState {
+        working_weights,
+        working_response,
+    })
 }

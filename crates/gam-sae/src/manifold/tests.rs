@@ -2512,7 +2512,8 @@ pub(crate) fn decoder_repulsion_strength_is_derived_and_scale_invariant_1610() {
     // (1) Strength is a DERIVED dimensionless fraction of the data-derived
     // separation-barrier strength μ_C, not an independent absolute constant.
     // (Checked on a constructed term below, after the fixture builder — μ_C is
-    // now a per-dictionary quantity, K / reachable_rank, not a global constant.)
+    // now read from the data-fit inseparability of the live design/routing, not a
+    // global constant or a rank-count heuristic.)
 
     // (2) End-to-end scale invariance of the repulsion value.
     let coords0 = array![[0.05], [0.20], [0.55], [0.80], [0.35], [0.65]];

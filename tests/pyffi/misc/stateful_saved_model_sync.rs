@@ -352,6 +352,68 @@ fn save_and_load_syncs_standard_sas_state_from_fit_result() {
 }
 
 #[test]
+fn save_and_load_syncs_standard_sas_state_from_unified_fit_result() {
+    let log_delta = -0.4;
+    let sas_state =
+        gam::mixture_link::sas_link_state_from_raw(0.25, log_delta).expect("valid sas state");
+    let covariance =
+        Array2::from_shape_vec((2, 2), vec![0.1, 0.02, 0.02, 0.2]).expect("2x2 covariance");
+    let mut payload = FittedModelPayload::new(
+        MODEL_PAYLOAD_VERSION,
+        "y ~ x".to_string(),
+        ModelKind::Standard,
+        FittedFamily::Standard {
+            likelihood: LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Sas(sas_state)),
+            link: None,
+            latent_cloglog_state: None,
+            mixture_state: None,
+            sas_state: None,
+        },
+        "binomial-sas".to_string(),
+    );
+    payload.unified = Some(minimal_fit_result(FittedLinkState::Sas {
+        state: sas_state,
+        covariance: Some(covariance.clone()),
+    }));
+    payload.data_schema = Some(gam::inference::model::DataSchema { columns: vec![] });
+    payload.resolved_termspec = Some(gam::terms::smooth::TermCollectionSpec {
+        linear_terms: vec![],
+        smooth_terms: vec![],
+        random_effect_terms: vec![],
+    });
+
+    let model = FittedModel::from_payload(payload);
+    let saved_state = model
+        .saved_sas_state()
+        .expect("saved sas state")
+        .expect("expected synchronized sas state from unified fit");
+    assert_eq!(saved_state, sas_state);
+
+    let dir = tempdir().expect("temp dir");
+    let path = dir.path().join("unified-model.json");
+    model.save_to_path(&path).expect("save model");
+
+    let saved = read_saved_model_json(&path);
+    let family_state = standard_family_state(&saved);
+    assert_eq!(
+        family_state.get("sas_state"),
+        Some(&serde_json::to_value(sas_state).expect("sas state json")),
+        "serialized model should include synchronized family_state.sas_state from unified fit"
+    );
+    assert_eq!(
+        saved_model_payload(&saved).get("sas_param_covariance"),
+        Some(&serde_json::json!([[0.1, 0.02], [0.02, 0.2]]))
+    );
+
+    let loaded = FittedModel::load_from_path(&path).expect("load model");
+    let loaded_state = loaded
+        .saved_sas_state()
+        .expect("loaded sas state")
+        .expect("expected loaded sas state");
+    assert_eq!(loaded_state, sas_state);
+}
+
+#[test]
 fn save_and_load_syncs_standard_latent_cloglog_state_from_fit_result() {
     let latent_state = LatentCLogLogState::new(0.65).expect("valid latent state");
     let mut payload = FittedModelPayload::new(

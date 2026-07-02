@@ -220,6 +220,14 @@ impl SaeManifoldTerm {
         atom.basis_second_jet = Some(new_evaluator);
         atom.smooth_penalty =
             transport_smooth_penalty_for_decoder(transport.view(), old_smooth_penalty.view())?;
+        // #2022 transport-peel (ADD form, no-refresh). The transported penalty
+        // above is decoder-magnitude-independent (T⁻ᵀ S_old T⁻¹), so under the
+        // quotient normalize the decoder into log_amplitude WITHOUT recomputing
+        // it. `atom`'s borrow ended at its last use above; re-index fresh.
+        if self.quotient_scale {
+            self.atoms[atom_idx]
+                .absorb_decoder_norm_into_log_amplitude_without_refresh(f64::MIN_POSITIVE);
+        }
         Ok(())
     }
 
@@ -531,7 +539,7 @@ impl SaeManifoldTerm {
         topology: &crate::chart_canonicalization::CanonicalChartTopology,
     ) -> Result<bool, String> {
         use crate::chart_canonicalization::{
-            CHART_RECOMPOSITION_REL_TOL, unit_speed_reparameterization,
+            CHART_RECOMPOSITION_REL_TOL, unit_speed_retraction,
         };
         let n = self.n_obs();
         if n == 0 {
@@ -542,7 +550,7 @@ impl SaeManifoldTerm {
         };
         let coords = self.assignment.coords[atom_idx].as_matrix();
         let row_coords = coords.column(0).to_owned();
-        let Some(repar) = unit_speed_reparameterization(
+        let Some(repar) = unit_speed_retraction(
             evaluator.as_ref(),
             self.atoms[atom_idx].decoder_coefficients.view(),
             row_coords.view(),
@@ -612,7 +620,69 @@ impl SaeManifoldTerm {
             old_smooth_penalty.view(),
         )?;
         atom.chart_canonicalized = true;
+        // #2022 transport-peel (ADD form, no-refresh). Transported penalty is
+        // decoder-magnitude-independent; under the quotient normalize the decoder
+        // into log_amplitude WITHOUT recomputing it. `atom`'s borrow ended above;
+        // re-index self.atoms fresh.
+        if self.quotient_scale {
+            self.atoms[atom_idx]
+                .absorb_decoder_norm_into_log_amplitude_without_refresh(f64::MIN_POSITIVE);
+        }
         Ok(true)
+    }
+
+    /// #2022 — the `d = 1` arc-length canonical-chart topology for one atom, or
+    /// `None` when the atom has no unit-speed chart (no evaluator, an active
+    /// curvature homotopy, a coord/atom latent-dim mismatch, or `d ≠ 1`). Same
+    /// selection as `canonicalize_charts_post_fit`'s `ChartPlan::UnitSpeed` arm.
+    pub(crate) fn d1_unit_speed_topology(
+        &self,
+        atom_idx: usize,
+    ) -> Option<crate::chart_canonicalization::CanonicalChartTopology> {
+        use crate::chart_canonicalization::CanonicalChartTopology;
+        let atom = &self.atoms[atom_idx];
+        if atom.basis_evaluator.is_none()
+            || atom.homotopy_eta != 1.0
+            || self.assignment.coords[atom_idx].latent_dim() != atom.latent_dim
+        {
+            return None;
+        }
+        match (&atom.basis_kind, atom.latent_dim) {
+            (SaeAtomBasisKind::Periodic | SaeAtomBasisKind::Torus, 1) => {
+                Some(CanonicalChartTopology::Circle { period: 1.0 })
+            }
+            (
+                SaeAtomBasisKind::Linear
+                | SaeAtomBasisKind::Duchon
+                | SaeAtomBasisKind::EuclideanPatch,
+                1,
+            ) => Some(CanonicalChartTopology::Interval),
+            _ => None,
+        }
+    }
+
+    /// #2022 — enforce unit-speed charts IN-LOOP: at a chart-refresh boundary,
+    /// re-gauge every `d = 1` atom to its arc-length representative via the exact,
+    /// image-frozen retraction
+    /// ([`crate::chart_canonicalization::unit_speed_retraction`], applied through
+    /// [`Self::canonicalize_atom_unit_speed_chart`]). Image-frozen ⇒ the data-fit
+    /// and intrinsic-smoothness objective are untouched; the ARD coordinate prior
+    /// re-evaluates at the canonical chart (the term that pins the residual gauge to
+    /// `t → ±t + c`). MUST NOT be called inside a line search — it changes the ARD
+    /// objective term, which would break Armijo bookkeeping. Runs post-acceptance at
+    /// the same cadence as [`Self::enforce_active_mass_guard`] /
+    /// [`Self::enforce_decoder_norm_guard`]. Returns the number of atoms re-gauged.
+    pub(crate) fn retract_unit_speed_charts_in_loop(&mut self) -> Result<usize, String> {
+        let mut retracted = 0usize;
+        for atom_idx in 0..self.atoms.len() {
+            let Some(topology) = self.d1_unit_speed_topology(atom_idx) else {
+                continue;
+            };
+            if self.canonicalize_atom_unit_speed_chart(atom_idx, &topology)? {
+                retracted += 1;
+            }
+        }
+        Ok(retracted)
     }
 
     /// Apply the minimum-isometry-defect flow reparameterization (#1019
@@ -699,6 +769,14 @@ impl SaeManifoldTerm {
             old_smooth_penalty.view(),
         )?;
         atom.chart_canonicalized = true;
+        // #2022 transport-peel (ADD form, no-refresh). Transported penalty is
+        // decoder-magnitude-independent; under the quotient normalize the decoder
+        // into log_amplitude WITHOUT recomputing it. `atom`'s borrow ended above;
+        // re-index self.atoms fresh.
+        if self.quotient_scale {
+            self.atoms[atom_idx]
+                .absorb_decoder_norm_into_log_amplitude_without_refresh(f64::MIN_POSITIVE);
+        }
         Ok(true)
     }
 
@@ -785,6 +863,14 @@ impl SaeManifoldTerm {
             old_smooth_penalty.view(),
         )?;
         atom.chart_canonicalized = true;
+        // #2022 transport-peel (ADD form, no-refresh). Transported penalty is
+        // decoder-magnitude-independent; under the quotient normalize the decoder
+        // into log_amplitude WITHOUT recomputing it. `atom`'s borrow ended above;
+        // re-index self.atoms fresh.
+        if self.quotient_scale {
+            self.atoms[atom_idx]
+                .absorb_decoder_norm_into_log_amplitude_without_refresh(f64::MIN_POSITIVE);
+        }
         Ok(true)
     }
 
@@ -871,6 +957,14 @@ impl SaeManifoldTerm {
             old_smooth_penalty.view(),
         )?;
         atom.chart_canonicalized = true;
+        // #2022 transport-peel (ADD form, no-refresh). Transported penalty is
+        // decoder-magnitude-independent; under the quotient normalize the decoder
+        // into log_amplitude WITHOUT recomputing it. `atom`'s borrow ended above;
+        // re-index self.atoms fresh.
+        if self.quotient_scale {
+            self.atoms[atom_idx]
+                .absorb_decoder_norm_into_log_amplitude_without_refresh(f64::MIN_POSITIVE);
+        }
         Ok(true)
     }
 
@@ -2413,13 +2507,41 @@ impl SaeManifoldTerm {
         // multi-start RETRY (offset = retry index) reads a disjoint principal
         // subspace from the previous attempt; the per-atom breach arm passes 0
         // (its single reseed needs no rotation).
-        let seeded = sae_pca_seed_initial_coords_with_pc_offset(
-            residual.view(),
-            &basis_kinds,
-            &dims,
-            pc_pair_offset,
-        )?;
         let n = self.n_obs();
+        // #2023 dead-atom DATA-ROW reseed (default-off via GAM_SAE_DATA_ROW_RESEED).
+        // The PCA reseed's diversity is capped at pc_pairs ≈ min(n, p)/2 principal
+        // pairs; a co-collapsed dictionary leaves residual ≈ target, so once a
+        // multi-start RETRY exhausts that pool (pc_pair_offset ≥ pc_pairs) it
+        // re-reads the SAME leading PCs → the same degenerate basin → the
+        // reseed-duplication spiral. When the lever is on AND every reseeded atom
+        // is a FLAT kind (EuclideanPatch | Linear — the only kinds whose PCA seed
+        // is the euclidean score-projection this data-row path mirrors), draw the
+        // exhausted-pool retries from DISTINCT DATA ROWS (n ≫ p, unbounded
+        // diversity) instead. Unset (default) ⇒ this branch never runs and the
+        // seed is bit-identical to the historical PCA path. Chart kinds
+        // (Periodic/Sphere/Torus/Cylinder/…) always fall through to the PCA seed
+        // — their data-row anchoring is the curved-tier follow-up.
+        let pc_pairs = (residual.ncols().min(n)) / 2;
+        // #2023 — typed per-fit opt-in (was the GAM_SAE_DATA_ROW_RESEED env lever).
+        let data_row_reseed = self.data_row_reseed;
+        let all_flat = basis_kinds
+            .iter()
+            .all(|k| matches!(k, SaeAtomBasisKind::EuclideanPatch | SaeAtomBasisKind::Linear));
+        let seeded = if data_row_reseed && all_flat && n > 0 && pc_pair_offset >= pc_pairs.max(1) {
+            // Distinct anchor row per (atom, retry), spanning the full n-row range
+            // so successive exhausted-pool retries never re-anchor identically.
+            let anchor_rows: Vec<usize> = (0..atoms.len())
+                .map(|slot| (slot + pc_pair_offset.wrapping_mul(atoms.len().max(1))) % n)
+                .collect();
+            sae_data_row_anchored_euclidean_coords(residual.view(), &dims, &anchor_rows)?
+        } else {
+            sae_pca_seed_initial_coords_with_pc_offset(
+                residual.view(),
+                &basis_kinds,
+                &dims,
+                pc_pair_offset,
+            )?
+        };
         for (slot, &atom) in atoms.iter().enumerate() {
             let d = dims[slot];
             let mut flat = Array1::<f64>::zeros(n * d);
@@ -2588,7 +2710,30 @@ impl SaeManifoldTerm {
                 beta[idx] += step_size * delta_beta[idx];
             }
         }
-        self.set_flat_beta(beta.view())
+        self.set_flat_beta(beta.view())?;
+        // #2022 STEP2 — sphere retract + peel. After the Euclidean β step writes
+        // B'_k, project each decoder onto the unit Frobenius sphere and move its
+        // magnitude into the explicit log-amplitude: B''_k = B'_k/‖B'_k‖,
+        // s_k += ln‖B'_k‖. This holds ‖B_k‖≡1 per iterate and puts scale solely
+        // in s, removing the SCALE gauge flat-direction, while preserving the
+        // reconstruction just written (exp(s')·B'' == exp(s)·B'). The joint β
+        // Newton step already optimized the decoder magnitude, so the peeled s is
+        // the concentrated scale optimum — no target/residual needed here.
+        // absorb_* no-ops an already-unit / collapsed decoder. exp(0)=1 keeps the
+        // pre-#2022 path bit-for-bit until an amplitude first appears.
+        //
+        // #2022 gate: the SCALE-gauge quotient (retract+peel) is behind the
+        // default-OFF `GAM_SAE_QUOTIENT_SCALE` env lever. Push CI runs only the
+        // release BUILD (no tests), so the default path stays verified-inert: off
+        // ⇒ no retract ⇒ s stays 0 ⇒ bit-for-bit (the always-on assembly exp(s)
+        // is inert at s=0). Flip the default to on after the dispatched Rust CI
+        // confirms the FD gate green.
+        if self.quotient_scale {
+            for atom in self.atoms.iter_mut() {
+                atom.absorb_decoder_norm_into_log_amplitude(f64::MIN_POSITIVE);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn solve_fixed_decoder_row_step(
@@ -3469,6 +3614,14 @@ impl SaeManifoldTerm {
             // that has fallen far behind its peers and reseed it onto the
             // residual; a strict no-op for K=1.
             self.enforce_decoder_norm_guard(target, outer_iteration, rho)?;
+            // #2022 — enforce unit-speed (arc-length) charts IN-LOOP at this
+            // accepted-outer-iteration boundary (post-acceptance, OUTSIDE the line
+            // search, same cadence as the guards above). Image-frozen ⇒ data-fit +
+            // intrinsic smoothness untouched; re-gauges t so the ARD coordinate
+            // prior (which pins t→±t+c) is enforced throughout the fit, not merely
+            // post-fit. SEAM: this boundary overlaps seed-audit STEP2's reseed/refit
+            // hooks — reconcile ordering there (retraction after guards/reseed).
+            self.retract_unit_speed_charts_in_loop()?;
             // #972 / #977 T1 — U-block of the alternating block-coordinate ascent.
             // After the decoder `B` has been updated by the accepted (t, ΔC) step
             // (lifted through the OLD frames in `apply_newton_step`), re-polar each
@@ -3578,6 +3731,11 @@ impl SaeManifoldTerm {
         // hint would always equal the cold LSQ decoder, never the seed). A freeze
         // is by definition not a convergence request, so there is no
         // under-converged decoder to rescue here.
+        let pre_polish_reconstruction_incumbent = self
+            .dictionary_reconstruction_ev(target, rho)
+            .ok()
+            .filter(|ev| ev.is_finite())
+            .map(|ev| (ev, self.snapshot_mutable_state()));
         if max_iter > 0 && !self.frames_active() {
             let mut best_objective =
                 self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
@@ -3616,6 +3774,29 @@ impl SaeManifoldTerm {
                             break;
                         }
                     }
+                }
+            }
+        }
+        // The final decoder-LSQ / coordinate-reprojection polish is accepted by
+        // the penalized objective because that is the scalar consumed by the REML
+        // outer loop. Reconstruction EV is the user-facing fitted quantity,
+        // however, and the polish is allowed to trade data fit for smoothness.
+        // Keep the same #1026 invariant as the Newton loop: a bounded in-fit
+        // refinement may not return a materially worse reconstruction than the
+        // incumbent it started from. This preserves the evidence objective's
+        // monotone path during fitting while ensuring the delivered fitted state is
+        // the best reconstruction basin the inner solve already found, rather than
+        // a smoother-but-collapsed post-polish state.
+        if let Some((pre_polish_ev, pre_polish_state)) = pre_polish_reconstruction_incumbent {
+            if let Ok(final_ev) = self.dictionary_reconstruction_ev(target, rho) {
+                if final_ev.is_finite()
+                    && final_ev + SAE_FINAL_EV_DEGRADATION_TOL < pre_polish_ev
+                {
+                    log::warn!(
+                        "[#1026] restoring pre-polish reconstruction incumbent after final \
+                         polish degraded EV from {pre_polish_ev:.4} to {final_ev:.4}"
+                    );
+                    self.restore_mutable_state(&pre_polish_state);
                 }
             }
         }

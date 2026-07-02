@@ -4138,6 +4138,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(gumbel_schedule_tau, module)?)?;
     module.add_function(wrap_pyfunction!(sae_ibp_map_value_grad, module)?)?;
     module.add_function(wrap_pyfunction!(sae_jumprelu_row_value_grad, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_jumprelu_batch_value_grad, module)?)?;
     module.add_function(wrap_pyfunction!(jumprelu_gate_value_grad, module)?)?;
     module.add_function(wrap_pyfunction!(equivariant_penalty_value, module)?)?;
     module.add_function(wrap_pyfunction!(riemannian_retract, module)?)?;
@@ -6819,6 +6820,23 @@ fn generative_replicates_impl(
     let offset = resolve_offset_column(&dataset, &col_map, model.offset_column.as_deref())?;
     let offset_noise =
         resolve_offset_column(&dataset, &col_map, model.noise_offset_column.as_deref())?;
+    // Resolve the analytic prior-weights column exactly as the mean/noise offsets
+    // are resolved above. A weighted Gaussian fit has `Var(y_i) = sigma^2 / w_i`,
+    // so replicate observation noise must be heteroskedastic in `w_i`; dropping
+    // the weights here drew every row from the pooled scalar `N(mu_i, sigma_hat^2)`
+    // (#2025). `resolve_weight_column` returns unit weights when the model carried
+    // no weight column, leaving unweighted fits unchanged.
+    //
+    // If the model was fitted with weights but the caller's replicate frame does
+    // not carry that column, fall back to unit weights rather than erroring: the
+    // #2025 heteroskedastic contract (Var(y_i)=sigma_hat^2/w_i) degrades to the
+    // pooled scalar `N(mu_i, sigma_hat^2)` when per-row weights are unavailable,
+    // which is the correct default in the absence of the column.
+    let weight_column = model
+        .weight_column
+        .as_deref()
+        .filter(|name| col_map.contains_key(*name));
+    let prior_weights = resolve_weight_column(&dataset, &col_map, weight_column)?;
     let predict_input = build_predict_input_for_model(
         &model,
         dataset.values.view(),
@@ -6852,7 +6870,7 @@ fn generative_replicates_impl(
         &family,
     );
     // Build the generative specification (mean + noise model).
-    let spec = generativespec_from_predict(prediction, family, gaussian_scale)
+    let spec = generativespec_from_predict(prediction, family, gaussian_scale, Some(&prior_weights))
         .map_err(|e| format!("generative_replicates: spec error: {e}"))?;
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     let draws = sampleobservation_replicates(&spec, n_draws, &mut rng)

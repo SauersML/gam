@@ -1,3 +1,12 @@
+//! #1019 stage 1 / #2022 — arc-length (unit-speed) chart canonicalization for `d = 1`.
+//! The arc-length reparameterization is exact and IMAGE-FROZEN (reconstruction
+//! unchanged; the transport preserves `BᵀSB`), so it is a gauge RETRACTION along
+//! the `Diff(M)` orbit that leaves the data-fit AND intrinsic-smoothness objective
+//! invariant. #2022 promotes it from a post-fit pass to IN-LOOP enforcement (see
+//! [`unit_speed_retraction`]), applied at chart-refresh boundaries — never inside a
+//! line search, because it re-gauges `t` and thus changes the ARD *coordinate*
+//! prior energy (the term that pins the residual gauge to `t → ±t + c`). Post-fit
+//! canonicalization then reduces to a verification no-op.
 //! #1019 stage 1 — arc-length (unit-speed) chart canonicalization for `d = 1`
 //! manifold atoms (circle and interval topologies).
 //!
@@ -644,6 +653,62 @@ pub struct TorusIsometryFlowReparameterization {
     /// Max-abs recomposition error on the audit grid, relative to the image
     /// scale. Always `≤ CHART_RECOMPOSITION_REL_TOL` when `Some(..)`.
     pub recomposition_residual: f64,
+}
+
+/// Speed-uniformity defect above which the in-loop unit-speed retraction fires.
+/// Below it the chart is already ~arc-length and re-gauging is skipped (keeps the
+/// per-refresh cost negligible and makes the retraction idempotent at a boundary).
+pub const UNIT_SPEED_INLOOP_DEFECT_TOL: f64 = 1.0e-6;
+
+/// Coefficient of variation `stddev(‖γ'‖)/mean(‖γ'‖)` of the decoder-curve speed
+/// field. `0` ⇔ already unit-speed (arc-length). Cheap in-loop early-out signal;
+/// returns `+∞` on a collapsed/non-positive mean so the caller defers to the full
+/// reparameterization (which honest-skips a degenerate chart).
+fn speed_uniformity_defect(speeds: &[f64]) -> f64 {
+    let n = speeds.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let mean = speeds.iter().sum::<f64>() / n as f64;
+    if !(mean > 0.0) {
+        return f64::INFINITY;
+    }
+    let var = speeds.iter().map(|&s| (s - mean) * (s - mean)).sum::<f64>() / n as f64;
+    var.sqrt() / mean
+}
+
+/// #2022 — in-loop unit-speed RETRACTION for one `d = 1` atom, the primitive the
+/// fit loop calls at each chart-refresh boundary. Returns `Ok(None)` (honest skip:
+/// already ~unit-speed, degenerate chart, basis not closed under the reparam, or
+/// image drift above tolerance) or `Ok(Some(repar))` to apply. Objective-invariant
+/// for data-fit + intrinsic smoothness (image-frozen; transport preserves `BᵀSB`);
+/// the ARD coordinate prior re-evaluates at the canonical `t̃`, so this MUST be
+/// applied only at refresh boundaries, never inside a line search.
+pub fn unit_speed_retraction(
+    evaluator: &dyn SaeBasisEvaluator,
+    decoder: ArrayView2<'_, f64>,
+    row_coords: ArrayView1<'_, f64>,
+    topology: &CanonicalChartTopology,
+) -> Result<Option<UnitSpeedReparameterization>, String> {
+    let n = row_coords.len();
+    if n == 0 {
+        return Ok(None);
+    }
+    // Cheap early-out: evaluate the jet at the CURRENT coords and skip the reparam
+    // when the chart is already ~arc-length. `evaluate` returns `(phi, jet)`; only
+    // the jet is needed for the speed field.
+    let mut coords2 = Array2::<f64>::zeros((n, 1));
+    for i in 0..n {
+        coords2[[i, 0]] = row_coords[i];
+    }
+    let (_phi, jet) = evaluator.evaluate(coords2.view())?;
+    let speeds = curve_speeds(&jet, decoder)?;
+    if speeds.iter().all(|s| s.is_finite())
+        && speed_uniformity_defect(&speeds) < UNIT_SPEED_INLOOP_DEFECT_TOL
+    {
+        return Ok(None);
+    }
+    unit_speed_reparameterization(evaluator, decoder, row_coords, topology)
 }
 
 /// State of the flow objective at one `θ`: the defect, the profiled scale,

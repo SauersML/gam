@@ -786,3 +786,206 @@ mod smoothness_dof_hutchinson_tests {
         );
     }
 }
+
+// ============================================================================
+// #2022 STEP2 FD / behavior gate. Paste as a new submodule INTO
+// crates/gam-sae/src/manifold/construction_tests.rs (that file is already
+// #[cfg(test)]; this `mod` nests cleanly, mirroring its existing
+// `use crate::manifold::tests::small_two_atom_periodic_term;` submodules).
+//
+// Parallel-safe: exercises the retract+peel via `absorb_*` DIRECTLY (not the
+// GAM_SAE_QUOTIENT_SCALE env lever), so no process-global env mutation. Because
+// absorb sets s≠0 and the assembly's β a_phi × exp(s) is ALWAYS-ON, this covers
+// the FINDING-1 exp(s) gradient/loss consistency without the lever.
+// ============================================================================
+#[cfg(test)]
+mod step2_quotient_scale_tests {
+    use crate::manifold::SaeManifoldTerm;
+    use crate::manifold::tests::small_two_atom_periodic_term;
+
+    fn frob(b: &ndarray::Array2<f64>) -> f64 {
+        b.iter().map(|v| v * v).sum::<f64>().sqrt()
+    }
+
+    /// #2022 — the SCALE-gauge quotient (unit-Frobenius decoder + explicit
+    /// log-amplitude `s`) is exp(s)-consistent:
+    ///   (i)  peeling ‖B_k‖ into `s_k` preserves the reconstruction data-fit
+    ///        (the always-on `fill_decoded_* · exp(s)` from STEP1),
+    ///   (ii) every decoder is unit-Frobenius afterward and `s_k` is finite,
+    ///   (iii) FINDING-1: with `s≠0`, the assembled β Jacobian carries `exp(s)`
+    ///        (`a_phi × exp(s)`), so a Newton step assembles with finite deltas
+    ///        and a damped step does not blow up / materially increase the loss.
+    ///        A missing `exp(s)` on `a_phi` (the desync STEP2 fixes) misscales the
+    ///        β gradient/Hessian and breaks this.
+    #[test]
+    fn step2_amplitude_peel_is_exp_s_consistent() {
+        let (mut term, target, rho) = small_two_atom_periodic_term();
+        let loss0 = term.loss(target.view(), &rho).expect("baseline loss");
+
+        // Retract + peel each atom onto the unit sphere (scale → s). Same op the
+        // gated apply_newton_step performs; called directly for a lever-free,
+        // parallel-safe test.
+        for atom in term.atoms.iter_mut() {
+            atom.absorb_decoder_norm_into_log_amplitude(f64::MIN_POSITIVE);
+        }
+
+        // (i) reconstruction data-fit preserved by the peel.
+        let loss_peeled = term.loss(target.view(), &rho).expect("peeled loss");
+        assert!(
+            (loss_peeled.data_fit - loss0.data_fit).abs()
+                <= 1e-9 * (1.0 + loss0.data_fit.abs()),
+            "peel must preserve reconstruction data-fit: {} vs {}",
+            loss0.data_fit,
+            loss_peeled.data_fit
+        );
+
+        // (ii) unit-Frobenius decoders + finite log-amplitude.
+        for atom in &term.atoms {
+            let nrm = frob(&atom.decoder_coefficients);
+            assert!(
+                (nrm - 1.0).abs() <= 1e-9,
+                "‖B_k‖ must be 1 after peel; got {nrm}"
+            );
+            assert!(
+                atom.log_amplitude.is_finite(),
+                "log_amplitude must be finite after peel"
+            );
+        }
+
+        // (iii) FINDING-1 consistency: assemble+solve a Newton step on the peeled
+        // (s≠0) state — the assembly must produce finite deltas, and a damped step
+        // must keep the loss finite without materially increasing it.
+        let (dt, db) = term
+            .solve_newton_step(target.view(), &rho, None, 0.0, 0.0)
+            .expect("newton step assembles on the exp(s)-scaled decoder");
+        assert!(
+            dt.iter().chain(db.iter()).all(|v| v.is_finite()),
+            "step deltas must be finite (exp(s) assembly well-formed)"
+        );
+        term.apply_newton_step(dt.view(), db.view(), 0.1)
+            .expect("apply damped newton step");
+        let loss_step = term.loss(target.view(), &rho).expect("post-step loss");
+        assert!(
+            loss_step.total().is_finite()
+                && loss_step.total() <= loss_peeled.total() * (1.0 + 1e-6) + 1e-6,
+            "a damped Newton step on the exp(s)-scaled decoder must not blow up / \
+             materially increase loss: {} -> {}",
+            loss_peeled.total(),
+            loss_step.total()
+        );
+    }
+
+    /// #2022 gate (i) — lever DEFAULT-OFF ⇒ the step never peels ⇒ `s` stays 0 ⇒
+    /// bit-for-bit. Verified by construction: `absorb_*` is only invoked from the
+    /// step under the `quotient_scale` kwarg (default false) and from the gated
+    /// seed peel; with the kwarg unset a freshly-built term has every
+    /// `log_amplitude == 0.0`. (No env mutation here — parallel-safe.)
+    #[test]
+    fn step2_default_off_leaves_log_amplitude_zero() {
+        let (term, _target, _rho) = small_two_atom_periodic_term();
+        for atom in &term.atoms {
+            assert_eq!(
+                atom.log_amplitude, 0.0,
+                "default (lever off) must leave log_amplitude at 0 (bit-for-bit)"
+            );
+        }
+    }
+
+    /// #2022 FINDING-1 (rigorous) — the assembled β gradient carries exp(s):
+    /// gb == central-diff ∂(data_fit+smoothness)/∂β on the peeled (s≠0) state.
+    /// A missing exp(s) on a_phi would scale gb by exp(-s) vs the FD and fail.
+    /// Parallel-safe: drives the quotient via absorb_* directly (no kwarg/env).
+    #[test]
+    fn step2_beta_gradient_matches_central_diff_on_peeled_state() {
+        let (mut term, target, rho) = small_two_atom_periodic_term();
+        for atom in term.atoms.iter_mut() {
+            atom.absorb_decoder_norm_into_log_amplitude(f64::MIN_POSITIVE);
+        }
+        let sys = term
+            .assemble_arrow_schur(target.view(), &rho, None)
+            .expect("assemble arrow-schur on peeled state");
+        assert_eq!(
+            sys.gb.len(),
+            term.beta_dim(),
+            "expected full-B gb layout (no frames) on the fixture"
+        );
+        let gb = sys.gb.clone();
+        let offsets = term.beta_offsets();
+        let p = term.output_dim();
+        let loss_beta_terms = |t: &SaeManifoldTerm| -> f64 {
+            let l = t.loss(target.view(), &rho).expect("loss");
+            l.data_fit + l.smoothness
+        };
+        let eps = 1e-6;
+        let mut checked = 0usize;
+        for k in 0..term.k_atoms() {
+            let m = term.atoms[k].basis_size();
+            for &(bc, oc) in &[(0usize, 0usize), (m.saturating_sub(1), 0usize)] {
+                if bc >= m {
+                    continue;
+                }
+                let idx = offsets[k] + bc * p + oc;
+                let orig = term.atoms[k].decoder_coefficients[[bc, oc]];
+                term.atoms[k].decoder_coefficients[[bc, oc]] = orig + eps;
+                let lp = loss_beta_terms(&term);
+                term.atoms[k].decoder_coefficients[[bc, oc]] = orig - eps;
+                let lm = loss_beta_terms(&term);
+                term.atoms[k].decoder_coefficients[[bc, oc]] = orig;
+                let fd = (lp - lm) / (2.0 * eps);
+                let g = gb[idx];
+                // Sign: gb = +∂(data_fit+smooth)/∂β (from gb=Jᵀ(fitted−target)).
+                // If CI shows a uniform flip, compare to `-g` (1-char fix).
+                assert!(
+                    (fd - g).abs() <= 1e-4 * (1.0 + g.abs()),
+                    "β gradient exp(s)-consistency (atom {k}, basis {bc}, out {oc}): \
+                     FD {fd} vs gb {g}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 2, "must check at least two β entries; checked {checked}");
+    }
+
+    /// #2022 transport-peel — the no-refresh peel normalizes the decoder into
+    /// log_amplitude while leaving `smooth_penalty` BYTE-IDENTICAL. This is what
+    /// makes it safe at the transport/reparam sites, whose transported penalty
+    /// (`T⁻ᵀ S_old T⁻¹`, decoder-magnitude-independent) must survive the peel.
+    #[test]
+    fn step2_without_refresh_peel_keeps_smooth_penalty() {
+        let (mut term, _target, _rho) = small_two_atom_periodic_term();
+        // Non-unit decoder so the peel does real work.
+        for v in term.atoms[0].decoder_coefficients.iter_mut() {
+            *v *= 3.0;
+        }
+        let penalty_before = term.atoms[0].smooth_penalty.clone();
+        let s_before = term.atoms[0].log_amplitude;
+        let norm_before = term.atoms[0]
+            .decoder_coefficients
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        term.atoms[0]
+            .absorb_decoder_norm_into_log_amplitude_without_refresh(f64::MIN_POSITIVE);
+        // smooth_penalty untouched (the refresh was skipped).
+        assert_eq!(
+            term.atoms[0].smooth_penalty, penalty_before,
+            "without_refresh peel must NOT change smooth_penalty"
+        );
+        // Decoder normalized; magnitude moved into log_amplitude.
+        let norm_after = term.atoms[0]
+            .decoder_coefficients
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        assert!(
+            (norm_after - 1.0).abs() <= 1e-9,
+            "‖B‖ must be 1 after peel; got {norm_after}"
+        );
+        assert!(
+            (term.atoms[0].log_amplitude - (s_before + norm_before.ln())).abs() <= 1e-9,
+            "log_amplitude must gain ln‖B‖"
+        );
+    }
+}

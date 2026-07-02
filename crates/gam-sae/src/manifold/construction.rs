@@ -61,6 +61,9 @@ impl SaeManifoldTerm {
             temperature_schedule: None,
             last_row_layout: None,
             row_metric: None,
+            // #2022/#2023 — per-fit opt-ins, default false (bit-for-bit historical).
+            quotient_scale: false,
+            data_row_reseed: false,
             collapse_events: Vec::new(),
             row_loss_weights: None,
             last_frames_active: false,
@@ -111,6 +114,242 @@ impl SaeManifoldTerm {
             separation_barrier_strength_override: self.separation_barrier_strength_override,
             ibp_alpha_override: self.assignment.ibp_alpha_override,
         }
+    }
+
+    /// #2023 — merge two fitted terms (tier-1 linear bulk `primary` + tier-2
+    /// curved `secondary`) into one whose atom set is `primary.atoms ++
+    /// secondary.atoms`, for the final joint polish of the two-tier fit-order.
+    /// Both must share `n_obs`, `output_dim`, and assignment-mode VARIANT.
+    /// Concatenates in (primary, secondary) order: atoms; assignment logits
+    /// (column hstack), coords, ungated; rho `log_lambda_smooth` and `log_ard`.
+    /// The global sparsity ρ and ALL per-fit config (row_metric, row-loss
+    /// weights, fit-config, quotient_scale, data_row_reseed, temperature, softmax
+    /// cap, assignment mode) are carried from `primary`; `secondary`'s config is
+    /// discarded. This asymmetry is deliberate: in the two-tier fit-order
+    /// `primary` is the linear/bulk tier that defines the fit's global regime —
+    /// it owns the sparse-penalty scale (`log_lambda_sparse`), the observation
+    /// `row_metric` / row-loss weighting (the whitening the curved tier is fit
+    /// *against*), and the fit-config (barrier / IBP-α). The curved `secondary`
+    /// tier is fit on the whitened residual under that same regime, so it
+    /// contributes only its per-atom parameters (atoms, coords, ungated,
+    /// per-atom `log_lambda_smooth` / `log_ard`); its globals are byproducts of
+    /// the residual sub-problem and must not overwrite the bulk tier's. K-
+    /// dependent / per-assembly transient state (row layout, frame flag, border
+    /// workspace, frozen routing, repulsion/coactivation gates, co-collapse /
+    /// gauge-deflation bookkeeping) is RESET — it is rebuilt at the next assembly.
+    ///
+    /// This primitive is intentionally MODE-GENERAL: structural concatenation is
+    /// well-defined for any assignment mode, so the only mode check here is
+    /// variant-equality between tiers. The restriction that two-tier fit-order
+    /// applies only to independent-gate modes lives at the orchestration layer,
+    /// not in this merge — see below.
+    ///
+    /// Fitted-additivity `merged.fitted() == primary.fitted() + secondary.fitted()`
+    /// holds EXACTLY for independent-gate modes (JumpReLU / IBP, where each atom's
+    /// gate is computed independently); under Softmax the gate re-normalizes over
+    /// the merged `K`, so the merge is a WARM START into the joint objective (the
+    /// two-tier driver's final joint polish reconciles it).
+    pub fn merge_tiers(
+        mut primary: SaeManifoldTerm,
+        primary_rho: &SaeManifoldRho,
+        secondary: SaeManifoldTerm,
+        secondary_rho: &SaeManifoldRho,
+    ) -> Result<(SaeManifoldTerm, SaeManifoldRho), String> {
+        let n = primary.n_obs();
+        let p = primary.output_dim();
+        let k1 = primary.k_atoms();
+        let k2 = secondary.k_atoms();
+        if secondary.n_obs() != n {
+            return Err(format!(
+                "SaeManifoldTerm::merge_tiers: n_obs mismatch: {n} vs {}",
+                secondary.n_obs()
+            ));
+        }
+        if secondary.output_dim() != p {
+            return Err(format!(
+                "SaeManifoldTerm::merge_tiers: output_dim mismatch: {p} vs {}",
+                secondary.output_dim()
+            ));
+        }
+        if std::mem::discriminant(&primary.assignment.mode)
+            != std::mem::discriminant(&secondary.assignment.mode)
+        {
+            return Err(
+                "SaeManifoldTerm::merge_tiers: assignment-mode variant mismatch between tiers"
+                    .to_string(),
+            );
+        }
+        if primary_rho.log_lambda_smooth.len() != k1
+            || secondary_rho.log_lambda_smooth.len() != k2
+            || primary_rho.log_ard.len() != k1
+            || secondary_rho.log_ard.len() != k2
+        {
+            return Err(format!(
+                "SaeManifoldTerm::merge_tiers: rho per-atom lengths (smooth {}/{}, ard {}/{}) \
+                 must equal K1/K2 = {k1}/{k2}",
+                primary_rho.log_lambda_smooth.len(),
+                secondary_rho.log_lambda_smooth.len(),
+                primary_rho.log_ard.len(),
+                secondary_rho.log_ard.len()
+            ));
+        }
+        // Symmetric per-atom guard on the ASSIGNMENT side: coords / ungated must be
+        // one entry per atom in each tier, or the concatenation below silently
+        // desynchronizes the atom↔coord↔gate correspondence.
+        if primary.assignment.coords.len() != k1
+            || secondary.assignment.coords.len() != k2
+            || primary.assignment.ungated.len() != k1
+            || secondary.assignment.ungated.len() != k2
+        {
+            return Err(format!(
+                "SaeManifoldTerm::merge_tiers: assignment per-atom lengths (coords {}/{}, \
+                 ungated {}/{}) must equal K1/K2 = {k1}/{k2}",
+                primary.assignment.coords.len(),
+                secondary.assignment.coords.len(),
+                primary.assignment.ungated.len(),
+                secondary.assignment.ungated.len()
+            ));
+        }
+        // Assignment: column-hstack logits (n×K1 | n×K2), append per-atom coords
+        // and ungated flags. Carries primary's mode + ibp_alpha_override.
+        let mut logits = Array2::<f64>::zeros((n, k1 + k2));
+        logits
+            .slice_mut(s![.., 0..k1])
+            .assign(&primary.assignment.logits);
+        logits
+            .slice_mut(s![.., k1..k1 + k2])
+            .assign(&secondary.assignment.logits);
+        primary.assignment.logits = logits;
+        primary.assignment.coords.extend(secondary.assignment.coords);
+        primary.assignment.ungated.extend(secondary.assignment.ungated);
+        primary.assignment.frozen_logits = None;
+        // Atoms.
+        primary.atoms.extend(secondary.atoms);
+        // Reset K-dependent / per-assembly transient state (rebuilt next assembly).
+        primary.last_row_layout = None;
+        primary.last_frames_active = false;
+        primary.border_hbb_workspace = Array2::<f64>::zeros((0, 0));
+        primary.decoder_repulsion_gate = None;
+        primary.barrier_coactivation_gate = None;
+        // Evidence-gauge / co-collapse cluster — the canonical reset (mirrors
+        // outer_objective.rs and the ctor) clears all FIVE fields together: the
+        // reanchor count and last-delta sign feed the reml_criterion reversal-
+        // budget loop, so carrying `primary`'s stale tier-1 values would either
+        // spuriously flag a reversal on the merged term's FIRST deflation step or
+        // start the joint polish with a partially-consumed budget (erroring
+        // earlier than a fresh fit on an ill-conditioned tier-1).
+        primary.expected_evidence_gauge_deflated_directions = None;
+        primary.evidence_gauge_deflation_reanchors = 0;
+        primary.evidence_gauge_deflation_last_delta_sign = 0;
+        primary.dictionary_cocollapse_reseeds = 0;
+        primary.best_cocollapse_incumbent = None;
+        // Stale tier-1 diagnostics — rebuilt at the next assembly / post-fit pass.
+        primary.collapse_events = Vec::new();
+        primary.curvature_walk_report = None;
+        // Rho: global sparsity from primary; per-atom smoothness + ARD concatenated.
+        let mut rho = primary_rho.clone();
+        rho.log_lambda_smooth
+            .extend_from_slice(&secondary_rho.log_lambda_smooth);
+        rho.log_ard.extend(secondary_rho.log_ard.iter().cloned());
+        Ok((primary, rho))
+    }
+
+    /// Gather a `Vec` into a new order without cloning: `out[new] = items[order[new]]`.
+    /// `order` MUST be a permutation of `0..items.len()` (each source index visited
+    /// exactly once); the caller [`Self::reorder_atoms`] validates that first.
+    fn gather_by_order<T>(items: Vec<T>, order: &[usize]) -> Vec<T> {
+        let mut slots: Vec<Option<T>> = items.into_iter().map(Some).collect();
+        order
+            .iter()
+            .map(|&src| {
+                slots[src]
+                    .take()
+                    .expect("reorder_atoms: order must visit each source index exactly once")
+            })
+            .collect()
+    }
+
+    /// #2023 — permute this term's atoms (and the paired `rho`) into a new order:
+    /// the atom currently at `order[i]` moves to final position `i`
+    /// (`new[i] = old[order[i]]`, a gather). Used by the two-tier fit-order to
+    /// restore the CALLER's atom order after [`Self::merge_tiers`] concatenates the
+    /// linear (primary) and curved (secondary) tiers — merge yields
+    /// linear++curved order, and this scatters each atom back to its original
+    /// input index so the entire downstream (joint polish, into_fitted,
+    /// shape-uncertainty, structured passes, and every by-original-index
+    /// serialization read) sees the caller's order with zero further changes.
+    ///
+    /// Permutes, in lockstep: atoms; assignment logit COLUMNS; per-atom coords and
+    /// ungated flags; and the paired `rho`'s `log_lambda_smooth` / `log_ard`. The
+    /// global sparsity ρ and the assignment mode are order-independent and left
+    /// untouched. Atom NAMES travel with their atom (the caller renames tiers to
+    /// their input indices before merging, so after this the names read
+    /// `atom_0..atom_{K-1}` in caller order — identical to a single-tier build).
+    /// K-dependent transient state that encodes the OLD column order (row layout,
+    /// frame flag, border workspace, frozen routing) is reset — rebuilt at the
+    /// next assembly (the joint polish).
+    ///
+    /// `order` must be a permutation of `0..K` and `rho` must carry `K` per-atom
+    /// entries, or this errs without mutating anything observable downstream.
+    pub fn reorder_atoms(
+        &mut self,
+        order: &[usize],
+        rho: &mut SaeManifoldRho,
+    ) -> Result<(), String> {
+        let k = self.k_atoms();
+        if order.len() != k {
+            return Err(format!(
+                "SaeManifoldTerm::reorder_atoms: order length {} must equal K={k}",
+                order.len()
+            ));
+        }
+        // Validate `order` is a permutation of 0..K (every index present once).
+        let mut seen = vec![false; k];
+        for &src in order {
+            let slot = seen.get_mut(src).ok_or_else(|| {
+                format!("SaeManifoldTerm::reorder_atoms: order index {src} out of range 0..{k}")
+            })?;
+            if *slot {
+                return Err(format!(
+                    "SaeManifoldTerm::reorder_atoms: order index {src} repeated (not a permutation)"
+                ));
+            }
+            *slot = true;
+        }
+        if rho.log_lambda_smooth.len() != k || rho.log_ard.len() != k {
+            return Err(format!(
+                "SaeManifoldTerm::reorder_atoms: rho per-atom lengths (smooth {}, ard {}) \
+                 must equal K={k}",
+                rho.log_lambda_smooth.len(),
+                rho.log_ard.len()
+            ));
+        }
+        // Assignment logit COLUMNS: new column i is old column order[i].
+        let n = self.n_obs();
+        let mut new_logits = Array2::<f64>::zeros((n, k));
+        for (new_j, &old_j) in order.iter().enumerate() {
+            new_logits
+                .column_mut(new_j)
+                .assign(&self.assignment.logits.column(old_j));
+        }
+        self.assignment.logits = new_logits;
+        // Per-atom Vecs (atoms / coords / ungated) and the paired rho blocks.
+        let atoms = std::mem::take(&mut self.atoms);
+        self.atoms = Self::gather_by_order(atoms, order);
+        let coords = std::mem::take(&mut self.assignment.coords);
+        self.assignment.coords = Self::gather_by_order(coords, order);
+        let ungated = std::mem::take(&mut self.assignment.ungated);
+        self.assignment.ungated = Self::gather_by_order(ungated, order);
+        let smooth = std::mem::take(&mut rho.log_lambda_smooth);
+        rho.log_lambda_smooth = Self::gather_by_order(smooth, order);
+        let ard = std::mem::take(&mut rho.log_ard);
+        rho.log_ard = Self::gather_by_order(ard, order);
+        // Reset K-ordered transient state that encoded the OLD column order.
+        self.assignment.frozen_logits = None;
+        self.last_row_layout = None;
+        self.last_frames_active = false;
+        self.border_hbb_workspace = Array2::<f64>::zeros((0, 0));
+        Ok(())
     }
 
     /// #1408/#1409 — install the optional hard per-row active-atom cap for
@@ -547,6 +786,23 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
+    /// #2022 — set the per-fit SCALE-gauge quotient opt-in (typed kwarg, no env
+    /// lever). Default false ⇒ historical path bit-for-bit.
+    pub fn set_quotient_scale(&mut self, enabled: bool) {
+        self.quotient_scale = enabled;
+    }
+
+    /// #2022 — read the per-fit SCALE-gauge quotient opt-in.
+    pub fn quotient_scale(&self) -> bool {
+        self.quotient_scale
+    }
+
+    /// #2023 — set the per-fit dead-atom data-row reseed opt-in (typed kwarg, no
+    /// env lever). Default false.
+    pub fn set_data_row_reseed(&mut self, enabled: bool) {
+        self.data_row_reseed = enabled;
+    }
+
     /// The installed per-row metric, if any. `None` ⇒ Euclidean / isotropic.
     /// Consumed by the gauge wiring (to build the matching `WeightField`) and by
     /// Object 4 (to read the [`MetricProvenance`](gam_problem::MetricProvenance)).
@@ -755,7 +1011,13 @@ impl SaeManifoldTerm {
             } else {
                 0.0
             };
-            let trust_score = tangent_condition_score;
+            // Curvature-certification power scales with the fourth power of
+            // observed chart coverage: λ₂ ≈ r²·a⁴/45, hence N* ∝ a⁻⁴. A
+            // well-conditioned tangent basis on a thinly covered atom is still
+            // not globally trustworthy, so trust must decay quartically rather
+            // than linearly (or not at all) with observed extent/coverage.
+            let chart_coverage_weight = coverage.powi(4);
+            let trust_score = tangent_condition_score * chart_coverage_weight;
             atom_trust.push(trust_score);
             atoms.push(SaeAtomTrustDiagnostics {
                 trust_score,
@@ -2006,6 +2268,15 @@ impl SaeManifoldTerm {
                 }
             }
             self.atoms[atom_idx].refresh_intrinsic_smooth_penalty();
+            // #2022 refit-peel (RESET form). This LSQ solved the ABSOLUTE decoder
+            // (design = a·φ, exp(s)-unaware), so under the quotient reset s to 0
+            // then peel ⇒ s = ln‖B_abs‖, B unit, reconstruction = a·Φ·B_abs (the
+            // LSQ intent). Gated: default-off keeps the write bit-for-bit.
+            if self.quotient_scale {
+                self.atoms[atom_idx].log_amplitude = 0.0;
+                self.atoms[atom_idx]
+                    .absorb_decoder_norm_into_log_amplitude(f64::MIN_POSITIVE);
+            }
         }
         Ok(())
     }
@@ -3855,15 +4126,71 @@ impl SaeManifoldTerm {
                 AssignmentMode::ThresholdGate {
                     threshold,
                     temperature,
-                } => Some(SaeRowLayout::from_jumprelu(
-                    n,
-                    k_atoms,
-                    threshold,
-                    temperature,
-                    &self.assignment.logits,
-                    coord_dims.clone(),
-                    self.assignment.coord_offsets(),
-                )),
+                } => {
+                    // Size the JumpReLU joint block by the HARD forward gate plus
+                    // the gated-off atoms still carrying a NON-NEGLIGIBLE
+                    // column-separable (diagonal-only) prior gradient, mirroring
+                    // the softmax / IBP `from_dense_weights` truncation instead of
+                    // dragging the whole −36 optimization band (≈ every atom) into
+                    // the joint solve. `contribution[row, k]` is the exact
+                    // magnitude of atom k's separable diagonal gradient sub-vector
+                    // — the sparsity-prior logit gradient (`assignment_grad`, the
+                    // same values the row block writes at the active-atom slots
+                    // below) plus the ARD coordinate gradient — i.e. precisely the
+                    // slice of `gt` that leaves the block when k is dropped. Deep
+                    // gated-off atoms (`(logit−θ)/τ` very negative) have
+                    // `slope = σ(1−σ) → 0` and drop out, collapsing the block from
+                    // `K·(1+d)` to `k_active·(1+d)`; near-threshold and gated-on
+                    // atoms keep their exact diagonal, so the assembled gradient is
+                    // preserved to the relative cutoff. The OBJECTIVE VALUE is
+                    // layout-independent (the loss's `assignment_prior_value` /
+                    // `ard_value` sum the full band), hence bit-identical.
+                    const JUMPRELU_RELATIVE_CUTOFF: f64 = 1.0e-3;
+                    let mut contribution = Array2::<f64>::zeros((n, k_atoms));
+                    for k in 0..k_atoms {
+                        let coord = &self.assignment.coords[k];
+                        let d = coord.latent_dim();
+                        let has_ard =
+                            d > 0 && k < rho.log_ard.len() && rho.log_ard[k].len() == d;
+                        let periods = if has_ard {
+                            coord.effective_axis_periods()
+                        } else {
+                            Vec::new()
+                        };
+                        for row in 0..n {
+                            // Sparsity-prior separable diagonal gradient on the logit.
+                            let mut c = assignment_grad[row * k_atoms + k].abs();
+                            // ARD separable diagonal gradient on each coord axis.
+                            if has_ard {
+                                let row_t = coord.row(row);
+                                for axis in 0..d {
+                                    let alpha = SaeManifoldRho::stable_exp_strength(
+                                        rho.log_ard[k][axis],
+                                    );
+                                    c += ArdAxisPrior::eval(alpha, row_t[axis], periods[axis])
+                                        .grad
+                                        .abs();
+                                }
+                            }
+                            contribution[[row, k]] = c;
+                        }
+                    }
+                    Some(SaeRowLayout::from_jumprelu(JumpReluLayoutParams {
+                        n,
+                        k_atoms,
+                        threshold,
+                        temperature,
+                        logits: &self.assignment.logits,
+                        contribution: &contribution,
+                        // Cap: rely on the relative cutoff to bound the active set;
+                        // a memory-budget cap can be layered in like
+                        // `sparse_active_plan` without changing the contract.
+                        k_active_cap: k_atoms,
+                        relative_cutoff: JUMPRELU_RELATIVE_CUTOFF,
+                        coord_dims: coord_dims.clone(),
+                        coord_offsets_full: self.assignment.coord_offsets(),
+                    }))
+                }
                 // #1408/#1409 — Softmax engages the COMPACT top-`k` row layout
                 // inside the optimization (no longer a post-fit projection).
                 // The active set is each row's top-`k_active_cap` softmax atoms
@@ -4761,7 +5088,12 @@ impl SaeManifoldTerm {
                                     // with the `√w_row` on the residual (β gradient =
                                     // `a·φ · M r` ⇒ w_row) and with itself (β Gram `G` and the
                                     // htbeta Kronecker capture ⇒ w_row). `1.0` when unweighted.
-                                    let w = a_k * phi * sqrt_row_w;
+                                    // #2022 — β data-fit Jacobian of exp(s)·a·Φ·B is
+                                    // exp(s)·a·Φ (∂/∂B). The coord Jacobian + residual
+                                    // already carry exp(s) via fill_decoded_*; this is the
+                                    // one inline site that needs it. exp(0)=1 ⇒ bit-for-bit
+                                    // when no amplitude is set.
+                                    let w = a_k * phi * sqrt_row_w * atom.log_amplitude.exp();
                                     a_phi.push((atom_beta_off + basis_col * p, w));
                                     wphi.push(w);
                                 }
@@ -4793,7 +5125,12 @@ impl SaeManifoldTerm {
                                     let a_k = assignments[atom_idx];
                                     for basis_col in 0..m {
                                         let phi = atom.basis_values[[row, basis_col]];
-                                        let w = a_k * phi * sqrt_row_w;
+                                        // #2022 — β data-fit Jacobian of exp(s)·a·Φ·B is
+                                    // exp(s)·a·Φ (∂/∂B). The coord Jacobian + residual
+                                    // already carry exp(s) via fill_decoded_*; this is the
+                                    // one inline site that needs it. exp(0)=1 ⇒ bit-for-bit
+                                    // when no amplitude is set.
+                                    let w = a_k * phi * sqrt_row_w * atom.log_amplitude.exp();
                                         if w == 0.0 {
                                             continue;
                                         }

@@ -1304,6 +1304,129 @@ where
                     }
                 }
             }
+            // #1860/#1476 CONCURVITY NULL-SPACE RAIL GUARD. The wide symmetric
+            // well-determined null-space prior is a degeneracy breaker, not a
+            // selection criterion that should accept the numerical `ρ=RHO_BOUND`
+            // shoulder as a finite smoothing estimate. On correlated supported
+            // smooths, the REML surface is nearly flat in the direction that
+            // transfers affine signal between terms, so a null-space coordinate
+            // can rail without representing a meaningful optimum. Cap only these
+            // well-determined degeneracy-breaker coordinates whose coefficient
+            // block is genuinely concurved with another selected smooth at the top
+            // of the moderate shrink-out band before the #1266 whole-term search
+            // below. Unsupported, uncorrelated terms are left alone so the
+            // whole-term shrink-out can still select them out at the rail.
+            {
+                const NULLSPACE_DEGENERACY_RHO_CEILING: f64 = 21.0;
+                const CONCURVITY_COLUMN_CORR: f64 = 0.2;
+                if n_design_rows >= 2 * p
+                    && let gam_problem::RhoPrior::Independent(per_coord) =
+                        reml_state.effective_rho_prior().as_ref()
+                {
+                    let term_key: Vec<(usize, usize)> = canonical_shared
+                        .iter()
+                        .map(|cp| (cp.col_range.start, cp.col_range.end))
+                        .collect();
+                    let x_concurvity = x_o
+                        .try_to_dense_by_chunks("#1860/#1476 concurvity rail guard")
+                        .ok();
+                    let beta_at_current = reml_state
+                        .obtain_eval_bundle(&strategy_result.rho)
+                        .ok()
+                        .map(|bundle| bundle.pirls_result.beta_transformed.clone());
+                    let term_beta_norm = |coord: usize| -> f64 {
+                        let (Some(beta), Some((a0, a1))) =
+                            (beta_at_current.as_ref(), term_key.get(coord).copied())
+                        else {
+                            return 0.0;
+                        };
+                        beta.as_ref()
+                            .slice(s![a0..a1])
+                            .iter()
+                            .map(|v| v * v)
+                            .sum::<f64>()
+                            .sqrt()
+                    };
+                    let column_corr = |a: usize, b: usize| -> f64 {
+                        let Some(x_concurvity) = x_concurvity.as_ref() else {
+                            return 0.0;
+                        };
+                        let ca = x_concurvity.column(a);
+                        let cb = x_concurvity.column(b);
+                        let ma = ca.iter().copied().sum::<f64>() / ca.len().max(1) as f64;
+                        let mb = cb.iter().copied().sum::<f64>() / cb.len().max(1) as f64;
+                        let mut va = 0.0_f64;
+                        let mut vb = 0.0_f64;
+                        let mut cov = 0.0_f64;
+                        for (&xa, &xb) in ca.iter().zip(cb.iter()) {
+                            let da = xa - ma;
+                            let db = xb - mb;
+                            va += da * da;
+                            vb += db * db;
+                            cov += da * db;
+                        }
+                        if va > 0.0 && vb > 0.0 {
+                            (cov / (va.sqrt() * vb.sqrt())).abs()
+                        } else {
+                            0.0
+                        }
+                    };
+                    let is_concurved_term = |coord: usize| -> bool {
+                        let Some((a0, a1)) = term_key.get(coord).copied() else {
+                            return false;
+                        };
+                        for j in 0..strategy_result.rho.len() {
+                            if j == coord
+                                || !per_coord
+                                    .get(j)
+                                    .is_some_and(gam_terms::smooth::is_nullspace_degeneracy_prior)
+                            {
+                                continue;
+                            }
+                            let Some((b0, b1)) = term_key.get(j).copied() else {
+                                continue;
+                            };
+                            if (a0, a1) == (b0, b1) {
+                                continue;
+                            }
+                            for a in a0..a1 {
+                                for b in b0..b1 {
+                                    if column_corr(a, b) >= CONCURVITY_COLUMN_CORR {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                        false
+                    };
+                    let mut capped = strategy_result.rho.clone();
+                    let mut changed = false;
+                    for i in 0..capped.len() {
+                        if capped[i] > NULLSPACE_DEGENERACY_RHO_CEILING
+                            && per_coord
+                                .get(i)
+                                .is_some_and(gam_terms::smooth::is_nullspace_degeneracy_prior)
+                            && is_concurved_term(i)
+                            && term_beta_norm(i) > 1e-3
+                        {
+                            capped[i] = NULLSPACE_DEGENERACY_RHO_CEILING;
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        reml_state.reset_outer_seed_state();
+                        let capped_cost = reml_state.compute_cost(&capped)?;
+                        log::info!(
+                            "[OUTER] #1860/#1476 null-space degeneracy rail guard: capped \
+                             well-determined double-penalty null-space ρ at \
+                             {NULLSPACE_DEGENERACY_RHO_CEILING:.1} before whole-term shrink-out; \
+                             re-scored cost {capped_cost:.6e}"
+                        );
+                        strategy_result.rho = capped;
+                        strategy_result.final_value = capped_cost;
+                    }
+                }
+            }
             // #1266 NULL-SPACE SHRINK-OUT ESCAPE (pure-REML; the OUTWARD-direction
             // dual of the #1074 inward escape above).
             //
@@ -1520,6 +1643,79 @@ where
                         // COLD-confirm the group's best candidate on BOTH axes (the
                         // warm probes ran off each other's inner warm starts — the
                         // #1074 lesson): pure REML strictly down AND total EDF not up.
+                        let Some((cand, _)) = group_best else { continue };
+                        reml_state.reset_outer_seed_state();
+                        let cold_pen = reml_state.compute_cost(&cand);
+                        let cold_pure = cold_pen.as_ref().ok().and_then(|&c| {
+                            c.is_finite().then(|| {
+                                c - reml_state.configured_rho_prior_atom(&cand).cost()
+                                    - reml_state.soft_rho_guard_prior_atom(&cand).cost()
+                            })
+                        });
+                        let cand_edf = reml_state
+                            .obtain_eval_bundle(&cand)
+                            .ok()
+                            .map(|b| b.pirls_result.edf);
+                        let parsimonious = match (cand_edf, best_edf) {
+                            (Some(ec), Some(eb)) => ec <= eb + 1e-6,
+                            _ => false,
+                        };
+                        if let Some(cp) = cold_pure
+                            && cp.is_finite()
+                            && cp < best_pure - 1e-6 * (1.0 + best_pure.abs())
+                            && parsimonious
+                        {
+                            best_rho = cand;
+                            best_pure = cp;
+                            best_edf = cand_edf;
+                            improved = true;
+                        }
+                    }
+                    // CURVATURE-ONLY cleanup for supported null-space signals
+                    // (#1859).  The whole-term shrink-out above is deliberately
+                    // rejected when the smooth's penalty null space is supported
+                    // by the data (for example a genuine linear trend): raising
+                    // the null-space ridge would kill real signal.  But the
+                    // Marra-Wood `select=TRUE` decomposition still gives REML an
+                    // independent, legitimate move: raise only the primary
+                    // wiggliness penalty, leaving the supported null-space
+                    // coordinate free.  Without this post-pass the symmetric
+                    // degeneracy prior on the null-space coordinate can leave the
+                    // primary λ at a too-low compromise, so the fitted B-spline
+                    // spends extra curved EDF on data that are already explained
+                    // by the null-space slope.  Accept this move under the same
+                    // objective discipline as the shrink-out escape — cold
+                    // confirmed pure-REML improvement and no total-EDF increase
+                    // — so genuinely nonlinear smooths are untouched.
+                    for group in &groups {
+                        let primary_coords: Vec<usize> = group
+                            .iter()
+                            .copied()
+                            .filter(|i| !select_coords.contains(i))
+                            .collect();
+                        if primary_coords.is_empty() {
+                            continue;
+                        }
+                        let mut group_best: Option<(Array1<f64>, f64)> = None;
+                        for &lvl in &SHRINK_BAND {
+                            let mut probe = best_rho.clone();
+                            let mut raised = false;
+                            for &i in &primary_coords {
+                                if lvl > probe[i] + 1e-9 {
+                                    probe[i] = lvl;
+                                    raised = true;
+                                }
+                            }
+                            if !raised {
+                                continue;
+                            }
+                            if let Some(c) = pure_reml(&probe)
+                                && c < best_pure - 1e-6 * (1.0 + best_pure.abs())
+                                && group_best.as_ref().is_none_or(|(_, gp)| c < *gp)
+                            {
+                                group_best = Some((probe, c));
+                            }
+                        }
                         let Some((cand, _)) = group_best else { continue };
                         reml_state.reset_outer_seed_state();
                         let cold_pen = reml_state.compute_cost(&cand);
@@ -1840,7 +2036,16 @@ where
             |state: &mut &mut crate::estimate::reml::RemlState<'_>,
              theta: &Array1<f64>| {
                 let rho = apply_link_theta(state, theta)?;
-                let cost = state.compute_cost(&rho)? + sas_ridge_cost(theta);
+                // Route the cost through the SAME link-ext evaluator the gradient
+                // closure uses (value-only), so both see the #1876 inner-KKT
+                // envelope correction `Ṽ = V − ½·rᵀH⁻¹r`. Using the plain
+                // `compute_cost` here would report the raw capped-β̂ value `V`
+                // while the gradient closure reports `∇Ṽ`, desyncing the outer
+                // trust-region ratio test on any first-order-capped inner solve.
+                let value_mode =
+                    crate::estimate::reml::reml_outer_engine::EvalMode::ValueOnly;
+                let result = state.evaluate_unified_with_link_ext(&rho, value_mode)?;
+                let cost = result.cost + sas_ridge_cost(theta);
                 Ok(cost)
             },
             |state: &mut &mut crate::estimate::reml::RemlState<'_>,
@@ -2251,6 +2456,7 @@ where
     let mut beta_covariance_frequentist = None;
     let mut coefficient_influence = None;
     let mut weighted_gram = None;
+    let mut bias_correction_jacobian = None;
     // Factorization of stabilized Hessian in transformed basis, reused for
     // SE computation via solve-on-demand after dispersion is determined.
     let mut edf_factor: Option<Box<dyn FactorizedSystem>> = None;
@@ -2607,9 +2813,8 @@ where
             )
             && finalgrad_norm.is_finite()
         {
-            let score_relative_bound = (crate::rho_optimizer::FLAT_VALLEY_CONVERGED_REL_GRAD
-                * (1.0 + outer_result.final_value.abs()))
-            .min(crate::rho_optimizer::FLAT_VALLEY_CONVERGED_ABS_GRAD_CAP);
+            let score_relative_bound =
+                crate::rho_optimizer::flat_valley_converged_grad_bound(outer_result.final_value);
             if finalgrad_norm <= score_relative_bound {
                 log::info!(
                     "[OUTER] flat-valley cost-stall RE-CERTIFIED converged: the authoritative \
@@ -2701,6 +2906,18 @@ where
             }
             let mut s_mat = qs.dot(&s_t).dot(&qs.t());
             gam_linalg::matrix::symmetrize_in_place(&mut s_mat);
+
+            // The frequentist bias-corrected coefficient used by prediction is
+            // β_BC = β̂ + b̂ with b̂ = H⁻¹S(β̂ - μ) at fixed smoothing
+            // parameters. Its fixed-ρ linearization with respect to β̂ is
+            // A = I + H⁻¹S. Credible bands centered at β_BC must use the
+            // covariance of that same estimator, A V Aᵀ; otherwise the center is
+            // debiased but the reported uncertainty remains for the shrunken
+            // penalized mode β̂, producing severely over-narrow bands on heavily
+            // smoothed large-scale Duchon fits (#1870).
+            let mut bc_jac = Array2::<f64>::eye(p_cov);
+            bc_jac += &h_inv.dot(&s_mat);
+            bias_correction_jacobian = Some(bc_jac);
             // Influence matrix F = I − H⁻¹·S(λ) = H⁻¹·X'WX. This is a product
             // of two symmetric matrices and is therefore generally NOT
             // symmetric; it must not be symmetrized — `gam_linalg::matrix::symmetrize_in_place(F)`
@@ -2843,6 +3060,11 @@ where
             (Some(base_cov), Some(corr)) if base_cov.as_array().dim() == corr.dim() => {
                 let mut corrected = base_cov.as_array().clone();
                 corrected += corr;
+                if let Some(a_bc) = bias_correction_jacobian.as_ref()
+                    && a_bc.dim() == corrected.dim()
+                {
+                    corrected = a_bc.dot(&corrected).dot(&a_bc.t());
+                }
                 gam_linalg::matrix::symmetrize_in_place(&mut corrected);
                 Some(corrected)
             }

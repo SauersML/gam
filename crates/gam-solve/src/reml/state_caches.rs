@@ -1723,17 +1723,38 @@ pub(crate) fn firth_default_pc_prior() -> RhoPrior {
     }
 }
 
+/// A Gamma prior on the physical precision `λ` with shape `1` and rate `0` has
+/// density proportional to a constant in `λ`. Under the deterministic
+/// MAP-in-`λ` REML convention used for [`RhoPrior::GammaPrecision`], its
+/// negative-log contribution is exactly zero (cost/gradient/Hessian all vanish),
+/// so it is semantically the same "unset/flat" coordinate as [`RhoPrior::Flat`].
+///
+/// Keep this equivalence explicit at the prior-policy boundary. Otherwise an
+/// `Independent([GammaPrecision { shape: 1, rate: 0 }])` is treated as an
+/// explicitly configured prior while `Flat` is treated as an unset coordinate,
+/// sending mathematically identical fits through different default-prior and
+/// seed-selection branches.
+#[inline]
+pub(crate) fn is_unset_flat_rho_prior(prior: &RhoPrior) -> bool {
+    match prior {
+        RhoPrior::Flat => true,
+        RhoPrior::GammaPrecision { shape, rate } => *shape == 1.0 && *rate == 0.0,
+        _ => false,
+    }
+}
+
 /// Per-coordinate `true` where the firth-general default barrier (rather than an
 /// explicitly-configured prior) governs that smoothing coordinate. A coordinate
-/// is a firth default exactly when the caller left it `Flat`: the whole prior is
-/// `Flat` (every coordinate defaulted) or it is an `Independent` with `Flat`
-/// holes. Returned per-`ρ`-coordinate so the runtime can override just those
-/// coordinates' objective contribution with the self-gated barrier.
+/// is a firth default exactly when the caller left it mathematically flat:
+/// `Flat`, or the equivalent `GammaPrecision { shape: 1, rate: 0 }`, either as a
+/// whole prior or as holes in an `Independent` prior. Returned per-`ρ`-coordinate
+/// so the runtime can override just those coordinates' objective contribution
+/// with the self-gated barrier.
 pub(crate) fn firth_default_coord_mask(configured: &RhoPrior, len: usize) -> Vec<bool> {
     match configured {
         RhoPrior::Flat => vec![true; len],
         RhoPrior::Independent(priors) if priors.len() == len => {
-            priors.iter().map(|p| matches!(p, RhoPrior::Flat)).collect()
+            priors.iter().map(is_unset_flat_rho_prior).collect()
         }
         _ => vec![false; len],
     }
@@ -1742,8 +1763,8 @@ pub(crate) fn firth_default_coord_mask(configured: &RhoPrior, len: usize) -> Vec
 /// Resolve the *effective* outer ρ prior under the (unconditional) firth-general
 /// default policy.
 ///
-/// An *unset* prior (the `Flat` sentinel — whole-prior, or any `Flat` coordinate
-/// of an `Independent`) is filled with the weakly-informative
+/// An *unset* prior (the `Flat` sentinel or equivalent Gamma(1, 0) flat prior —
+/// whole-prior, or any such coordinate of an `Independent`) is filled with the weakly-informative
 /// [`firth_default_pc_prior`]; any explicitly-configured prior is honored
 /// unchanged. Pulled out as a free function so the decision is unit-testable
 /// without constructing a full `RemlState`.
@@ -1751,13 +1772,18 @@ pub(crate) fn resolve_effective_rho_prior(configured: &RhoPrior) -> std::borrow:
     match configured {
         // Whole prior unset → fill every coordinate with the weak PC default.
         RhoPrior::Flat => std::borrow::Cow::Owned(firth_default_pc_prior()),
+        // Gamma(1, 0) is exactly flat in the deterministic MAP-in-λ convention,
+        // so route it through the same unset path as `Flat`.
+        RhoPrior::GammaPrecision { shape, rate } if *shape == 1.0 && *rate == 0.0 => {
+            std::borrow::Cow::Owned(firth_default_pc_prior())
+        }
         // Per-coordinate priors: only the `Flat` (unset) coordinates inherit the
         // PC default; explicitly configured coordinates are preserved.
-        RhoPrior::Independent(priors) if priors.iter().any(|p| matches!(p, RhoPrior::Flat)) => {
+        RhoPrior::Independent(priors) if priors.iter().any(is_unset_flat_rho_prior) => {
             let filled = priors
                 .iter()
                 .map(|p| match p {
-                    RhoPrior::Flat => firth_default_pc_prior(),
+                    p if is_unset_flat_rho_prior(p) => firth_default_pc_prior(),
                     other => other.clone(),
                 })
                 .collect();

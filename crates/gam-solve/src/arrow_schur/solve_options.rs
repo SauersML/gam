@@ -636,19 +636,58 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
         // strided reads of `left[[c, a]]` for every (a, b); reorder to
         // (c, a, b) so the inner `b`-loop is contiguous in `right` and
         // `left[[c, a]]` is hoisted out of the inner loop.
+        //
+        // Sparse SAE rows install a matrix-free `H_tβ` operator but the direct
+        // reduced-Schur path still asks `row_htbeta` for a dense `(d_i × K)`
+        // scratch matrix. Those rows have support on only the active atoms
+        // (`top_k · basis · p` columns), so blindly iterating the full `K × K`
+        // product made the Schur assembly compute-bound even though almost every
+        // entry multiplied by zero (#1995). Discover the non-zero column support
+        // of the two row factors once (`O(d_i·K)`) and multiply only the touched
+        // columns (`O(d_i·nnz_left·nnz_right)`). Dense callers still take the same
+        // arithmetic path with all columns active, while compact top-k rows scale
+        // with the active support rather than the global border width.
         let k = schur.nrows();
         let d = left.nrows();
         assert_eq!(left.ncols(), k);
+        assert_eq!(right.nrows(), d);
         assert_eq!(right.ncols(), k);
         assert_eq!(schur.ncols(), k);
+
+        let mut left_active = Vec::with_capacity(k);
+        let mut right_active = Vec::with_capacity(k);
+        for col in 0..k {
+            let mut left_nz = false;
+            let mut right_nz = false;
+            for row in 0..d {
+                left_nz |= left[[row, col]] != 0.0;
+                right_nz |= right[[row, col]] != 0.0;
+                if left_nz && right_nz {
+                    break;
+                }
+            }
+            if left_nz {
+                left_active.push(col);
+            }
+            if right_nz {
+                right_active.push(col);
+            }
+        }
+        if left_active.is_empty() || right_active.is_empty() {
+            return;
+        }
+
         for c in 0..d {
-            for a in 0..k {
+            for &a in &left_active {
                 let lca = left[[c, a]];
                 if lca == 0.0 {
                     continue;
                 }
-                for b in 0..k {
-                    schur[[a, b]] -= lca * right[[c, b]];
+                for &b in &right_active {
+                    let rcb = right[[c, b]];
+                    if rcb != 0.0 {
+                        schur[[a, b]] -= lca * rcb;
+                    }
                 }
             }
         }

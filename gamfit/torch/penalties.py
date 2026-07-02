@@ -688,33 +688,31 @@ def ibp_map(logits: torch.Tensor, temperature: float, alpha: float) -> torch.Ten
 
 
 class _JumpReLUBoundedGateFn(torch.autograd.Function):
-    """Bounded threshold gate, value+grad from the Rust source of truth.
+    """Bounded threshold gate — a thin marshaller over the Rust batch kernel.
 
-    Forward returns ``a_k = σ((l_k − θ_k)/τ) · 1[l_k > θ_k]`` — the SAME
-    bounded ``[0, 1)`` gate the closed-form ``SaeAssignment`` jumprelu /
-    threshold_gate path evaluates (``jumprelu_row``; magnitude lives in the
-    decoder). Backward multiplies the upstream gradient by the smooth
-    surrogate's diagonal derivative ``σ'((l_k − θ_k)/τ)/τ`` that Rust returns
-    (a straight-through estimator, alive on both sides of the jump so
-    gated-off atoms keep a training signal); the threshold gradient is its
-    negation, accumulated over rows.
+    Forward returns ``a_k = σ((l_k − θ_k)/τ) · 1[l_k > θ_k]``; the diagonal
+    straight-through derivative ``da/dl_k = σ'((l_k − θ_k)/τ)/τ`` (alive on both
+    sides of the jump so gated-off atoms keep a training signal) comes from ONE
+    call to the Rust source of truth
+    ``gam::terms::sae::assignment::jumprelu_batch_value_grad`` — the batched
+    sibling of ``jumprelu_row_value_grad``, bit-identical to it row-by-row. No
+    torch gate math and no per-row FFI loop: the whole ``(N, K)`` matrix crosses
+    the Python↔Rust boundary exactly once per forward pass. The threshold
+    gradient is the negated row-sum of the diagonal derivative
+    (``∂a_k/∂θ_k = −da/dl_k``); callers negate and accumulate.
     """
 
     @staticmethod
     def forward(
         ctx: Any, logits: torch.Tensor, thresholds: torch.Tensor, temperature: float
     ) -> torch.Tensor:
-        rust = rust_module()
-        rows = to_numpy_f64(logits).reshape(logits.shape[0], -1)
-        thr = np.ascontiguousarray(to_numpy_f64(thresholds).reshape(-1))
-        value = np.empty_like(rows)
-        grad = np.empty_like(rows)
-        for r in range(rows.shape[0]):
-            v_r, g_r = rust.sae_jumprelu_row_value_grad(
-                np.ascontiguousarray(rows[r]), float(temperature), thr
-            )
-            value[r] = np.asarray(v_r, dtype=np.float64)
-            grad[r] = np.asarray(g_r, dtype=np.float64)
+        # Rust owns the gate math; Python only marshals the (N, K) matrix across
+        # the FFI boundary ONCE (batched — no per-row loop, no torch recompute).
+        logits_np = to_numpy_f64(logits).reshape(logits.shape[0], -1)
+        thr_np = np.ascontiguousarray(to_numpy_f64(thresholds).reshape(-1))
+        value, grad = rust_module().sae_jumprelu_batch_value_grad(
+            logits_np, float(temperature), thr_np
+        )
         ctx.save_for_backward(from_numpy_like(grad, logits).reshape_as(logits))
         return from_numpy_like(value, logits).reshape_as(logits)
 

@@ -68,6 +68,10 @@ struct OnDiskMeta {
     kind: EntryKind,
     checksum_hex: String,
     payload_bytes: u64,
+    /// Set when a lookup has reused this entry. Eviction keeps recently reused
+    /// entries behind never-hit writes when a tight budget forces a choice.
+    #[serde(default)]
+    accessed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -228,7 +232,8 @@ impl WarmStartStore {
                 let expired = self.opts.ttl.as_nanos() > 0
                     && now_nanos.saturating_sub(hit.write_nanos) >= self.opts.ttl.as_nanos();
                 if !expired {
-                    return Ok(Some(hit.entry));
+                    let entry = self.touch_lookup_hit(&hit.meta_path, hit.entry)?;
+                    return Ok(Some(entry));
                 }
                 lookup_cache_invalidate(&cache_key);
                 let bin = hit.meta_path.with_extension("bin");
@@ -282,6 +287,7 @@ impl WarmStartStore {
             written_unix_secs: meta.written_unix_secs,
             kind: meta.kind,
         };
+        let (meta, entry) = self.touch_lookup_meta(&meta_path, meta, entry)?;
         // Record (meta_path, mtime) → entry so subsequent identical lookups
         // short-circuit until the meta file's mtime changes. The full
         // nanosecond write timestamp is cached alongside so the fast path
@@ -393,6 +399,7 @@ impl WarmStartStore {
                 kind,
                 checksum_hex: checksum.clone(),
                 payload_bytes: payload.len() as u64,
+                accessed: false,
             };
             Ok(serde_json::to_vec_pretty(&meta)?)
         };
@@ -444,19 +451,17 @@ impl WarmStartStore {
         self.metadata_index_upsert(&meta_final, &bin_final).ok();
         // 5. Best-effort eviction; failure here is non-fatal. Throttle the
         // full directory scan: maintain a process-wide approximate byte
-        // total and only run eviction when the total may have exceeded the
-        // budget, when the per-save counter wraps `EVICT_EVERY_N_SAVES` as
-        // a drift-resync trigger, or on the very first save (so a fresh
-        // process inheriting a populated store root sweeps once). The
+        // total and only run eviction when the per-save counter wraps
+        // `EVICT_EVERY_N_SAVES` as a drift-resync trigger, or on the very
+        // first save (so a fresh process inheriting a populated store root
+        // sweeps once). The
         // counter is best-effort: it can drift relative to disk truth
         // because other processes may write/evict, but every triggered
         // sweep resyncs it to ground truth.
         let approx_added = payload.len() as u64 + APPROX_META_BYTES;
-        let prev_total = self.byte_total.fetch_add(approx_added, Ordering::Relaxed);
-        let new_total = prev_total + approx_added;
+        self.byte_total.fetch_add(approx_added, Ordering::Relaxed);
         let n = self.save_counter.fetch_add(1, Ordering::Relaxed);
-        let over_budget = new_total > self.opts.size_budget_bytes;
-        if n == 0 || over_budget || n.is_multiple_of(EVICT_EVERY_N_SAVES) {
+        if n == 0 || n.is_multiple_of(EVICT_EVERY_N_SAVES) {
             self.evict_overflow().ok();
         }
         Ok(())
@@ -498,8 +503,8 @@ impl WarmStartStore {
             Ok(rd) => rd,
             Err(_) => return Ok(()),
         };
-        // Collect (meta_path, bin_path, total_bytes, write_nanos_since_epoch).
-        let mut all: Vec<(PathBuf, PathBuf, u64, u128)> = Vec::new();
+        // Collect (meta_path, bin_path, total_bytes, write_nanos_since_epoch, accessed).
+        let mut all: Vec<(PathBuf, PathBuf, u64, u128, bool)> = Vec::new();
         let now_nanos = self.nanos_now();
         for key_dir_entry in read_dir {
             let key_dir = match key_dir_entry {
@@ -524,6 +529,7 @@ impl WarmStartStore {
                     entry.bin_path.clone(),
                     total_bytes,
                     write_nanos,
+                    entry.meta.accessed,
                 ));
             }
             // Sweep now-empty key dirs.
@@ -563,9 +569,13 @@ impl WarmStartStore {
             }
             return Ok(());
         }
-        all.sort_by_key(|e| e.3);
+        all.sort_by(|a, b| {
+            a.4.cmp(&b.4)
+                .then_with(|| a.3.cmp(&b.3))
+                .then_with(|| a.0.cmp(&b.0))
+        });
         let mut remaining = total;
-        for (meta, bin, bytes, _) in all.into_iter() {
+        for (meta, bin, bytes, _, _) in all.into_iter() {
             if remaining <= self.opts.size_budget_bytes {
                 break;
             }
@@ -894,6 +904,52 @@ fn checksum_hex(payload: &[u8]) -> String {
 }
 
 impl WarmStartStore {
+    fn touch_lookup_hit(
+        &self,
+        meta_path: &Path,
+        entry: WarmStartEntry,
+    ) -> Result<WarmStartEntry, StoreError> {
+        let meta = read_meta(meta_path)?;
+        let (_meta, entry) = self.touch_lookup_meta(meta_path, meta, entry)?;
+        Ok(entry)
+    }
+
+    fn touch_lookup_meta(
+        &self,
+        meta_path: &Path,
+        mut meta: OnDiskMeta,
+        mut entry: WarmStartEntry,
+    ) -> Result<(OnDiskMeta, WarmStartEntry), StoreError> {
+        let now = self.nanos_now();
+        let old = (meta.written_unix_secs as u128) * 1_000_000_000u128 + meta.written_nanos as u128;
+        let touched = now.max(old.saturating_add(1));
+        let secs = (touched / 1_000_000_000u128) as u64;
+        let nanos = (touched % 1_000_000_000u128) as u32;
+        meta.written_unix_secs = secs;
+        meta.written_nanos = nanos;
+        meta.accessed = true;
+        let json = serde_json::to_vec_pretty(&meta)?;
+        let tmp = meta_path.with_extension(format!(
+            "json.touch.tmp.{}.{}",
+            std::process::id(),
+            self.nanos_now()
+        ));
+        {
+            let mut f = fs::File::create(&tmp)?;
+            f.write_all(&json)?;
+            f.sync_all()?;
+        }
+        fs::rename(&tmp, meta_path)?;
+        if let Some(dir) = meta_path.parent()
+            && let Ok(d) = fs::File::open(dir)
+        {
+            d.sync_all().ok();
+        }
+        self.metadata_index_remove(meta_path);
+        entry.written_unix_secs = secs;
+        Ok((meta, entry))
+    }
+
     fn read_meta_indexed(
         &self,
         path: &Path,

@@ -1,14 +1,14 @@
 use crate::estimate::EstimationError;
 use crate::estimate::{FitGeometry, UnifiedFitResult};
 use crate::pirls;
-use gam_linalg::faer_ndarray::{FaerArrayView, FaerCholesky};
-use gam_linalg::matrix::{PsdWeightsView, SignedWeightsView};
-use gam_linalg::utils::StableSolver;
-use gam_problem::LinkFunction;
 use faer::Mat as FaerMat;
 use faer::linalg::matmul::matmul;
 use faer::prelude::ReborrowMut;
 use faer::{Accum, Par};
+use gam_linalg::faer_ndarray::{FaerArrayView, FaerCholesky};
+use gam_linalg::matrix::{PsdWeightsView, SignedWeightsView};
+use gam_linalg::utils::StableSolver;
+use gam_problem::LinkFunction;
 use ndarray::{Array1, Array2, ArrayView1, ShapeBuilder, s};
 use std::fmt;
 
@@ -316,11 +316,8 @@ fn bayesvar_eta(phi: f64, x_hinv_x: f64) -> f64 {
 }
 
 #[inline]
-fn sandwichvar_eta(phi: f64, x_hinv_x: f64, es_norm2: f64, ridge: f64, s_norm2: f64) -> f64 {
-    // With H = X'WX + S + ridge*I and t = H^{-1}x_i:
-    // t'X'WXt = t'Ht - t'St - ridge*||t||^2
-    //         = x_i't - ||E t||^2 - ridge*||t||^2.
-    phi * (x_hinv_x - es_norm2 - ridge * s_norm2)
+fn sandwichvar_eta_from_meat(phi: f64, meat_quad: f64) -> f64 {
+    phi * meat_quad
 }
 
 #[inline]
@@ -773,6 +770,52 @@ impl<'a> AloInput<'a> {
             score_curvature: None,
         }
     }
+
+    /// Build an `AloInput` from a `FitGeometry`'s penalized Hessian plus
+    /// externally supplied working weights / working response.
+    ///
+    /// The row-sized IRLS working vectors are *derived* quantities: at
+    /// convergence they are deterministic functions of the linear predictor
+    /// `η̂ = Xβ̂`, the response `y`, and the family (`w_i = h'(η̂_i)²/(φ V(μ̂_i))·
+    /// prior_i`, `z_i = η̂_i + (y_i−μ̂_i)/h'(η̂_i)`). A size-compacted saved model
+    /// keeps the p×p `penalized_hessian` (n-independent) but drops those n-sized
+    /// vectors; a post-fit consumer such as `gam diagnose` reconstructs them from
+    /// the saved `β` by replaying the same PIRLS working-state update the fit
+    /// used, then feeds them here. This preserves the size win of dropping the
+    /// working vectors from persistence while still serving the exact geometry
+    /// ALO path (no refit, exact saved Hessian).
+    ///
+    /// Same canonical (Fisher == Observed) contract as [`from_geometry`]: the
+    /// supplied `working_weights` are the score-side Fisher weights and are
+    /// re-viewed for the Hessian-side slot via `as_signed()`.
+    ///
+    /// [`from_geometry`]: AloInput::from_geometry
+    pub fn from_geometry_with_working_state(
+        geom: &'a FitGeometry,
+        design: &'a Array2<f64>,
+        eta: &'a Array1<f64>,
+        offset: &'a Array1<f64>,
+        link: LinkFunction,
+        phi: f64,
+        working_weights: &'a Array1<f64>,
+        working_response: &'a Array1<f64>,
+    ) -> Self {
+        let psd_w = PsdWeightsView::from_view_unchecked(working_weights.view());
+        Self {
+            design,
+            penalized_hessian: &geom.penalized_hessian,
+            hessian_weights: psd_w.as_signed(),
+            score_weights: psd_w,
+            working_response,
+            eta,
+            offset,
+            link,
+            phi,
+            penalty_root: None,
+            ridge: 0.0,
+            score_curvature: None,
+        }
+    }
 }
 
 /// Compute ALO diagnostics from model-agnostic inputs.
@@ -804,9 +847,6 @@ fn compute_alo_from_input_inner(input: &AloInput) -> Result<AloDiagnostics, AloE
 
     let xt = x_dense.t();
     let phi = input.phi;
-    let ridge = input.ridge;
-
-    let e_rank = input.penalty_root.map(|e| e.nrows()).unwrap_or(0);
 
     let mut aii = Array1::<f64>::zeros(n);
     let mut x_hinv_x_diag = Array1::<f64>::zeros(n);
@@ -819,14 +859,14 @@ fn compute_alo_from_input_inner(input: &AloInput) -> Result<AloDiagnostics, AloE
     // This removes redundant `xrow = x_dense.row(obs)` indirection inside the
     // per-observation loop: rhs_chunk_buf already holds X^T at the right cols.
     let mut rhs_chunk_buf = Array2::<f64>::zeros((p, block_cols).f());
-    // Reusable faer column-major buffer for the E*S product. Building this
-    // once per chunk lets the inner loop read contiguous columns directly via
-    // `col_as_slice`, which is just a borrow into the existing storage.
-    let mut es_chunk_storage = if e_rank > 0 {
-        FaerMat::<f64>::zeros(e_rank, block_cols)
-    } else {
-        FaerMat::<f64>::zeros(0, 0)
-    };
+    // Reusable faer column-major buffer for X*S, where S = H^{-1}X_i for the
+    // current RHS chunk.  The sandwich SE must use the same frozen-curvature
+    // meat as the exact LOO reference, `X' W X`, directly; reconstructing it as
+    // `H - S_penalty - ridge*I` is brittle because the exported stabilized
+    // Hessian may include curvature/stabilization details that are not exactly
+    // represented by the penalty root plus public ridge scalar.
+    let mut xs_chunk_storage = FaerMat::<f64>::zeros(n, block_cols);
+    let x_dense_view = FaerArrayView::new(x_dense);
 
     for chunk_start in (0..n).step_by(block_cols) {
         let chunk_end = (chunk_start + block_cols).min(n);
@@ -843,22 +883,15 @@ fn compute_alo_from_input_inner(input: &AloInput) -> Result<AloDiagnostics, AloE
         // materialize a parallel ndarray copy.
         let s_chunk = factor.solve(rhs_chunk.as_ref());
 
-        if e_rank > 0
-            && let Some(e) = input.penalty_root
-        {
-            let eview = FaerArrayView::new(e);
-            // Compute only the leading `width` columns; `col_as_slice` will
-            // index into the full-width buffer up to `width` below.
-            let mut es_target = es_chunk_storage.as_mut().subcols_mut(0, width);
-            matmul(
-                es_target.rb_mut(),
-                Accum::Replace,
-                eview.as_ref(),
-                s_chunk.as_ref(),
-                1.0,
-                Par::Seq,
-            );
-        }
+        let mut xs_target = xs_chunk_storage.as_mut().subcols_mut(0, width);
+        matmul(
+            xs_target.rb_mut(),
+            Accum::Replace,
+            x_dense_view.as_ref(),
+            s_chunk.as_ref(),
+            1.0,
+            Par::Seq,
+        );
 
         let rhs_view = rhs_chunk_buf.slice(s![.., ..width]);
 
@@ -872,32 +905,30 @@ fn compute_alo_from_input_inner(input: &AloInput) -> Result<AloDiagnostics, AloE
             let s_slice = s_chunk.col_as_slice(local_col);
 
             let mut x_hinv_x = 0.0f64;
-            let mut s_norm2 = 0.0f64;
-            // Fused dot products over the same column: one cache-friendly pass.
+            // Fused dot product over the current solve column.
             for k in 0..p {
                 let sval = s_slice[k];
                 let xval = rhs_slice[k];
                 x_hinv_x = sval.mul_add(xval, x_hinv_x);
-                s_norm2 = sval.mul_add(sval, s_norm2);
             }
             let ai = w_h[obs].max(0.0) * x_hinv_x;
-            let mut es_norm2 = 0.0f64;
-            if e_rank > 0 {
-                let es_slice = es_chunk_storage.col_as_slice(local_col);
-                for r in 0..e_rank {
-                    let v = es_slice[r];
-                    es_norm2 = v.mul_add(v, es_norm2);
-                }
-            }
             aii[obs] = ai;
             x_hinv_x_diag[obs] = x_hinv_x;
 
             let var_bayes = bayesvar_eta(phi, x_hinv_x);
-            let var_sandwich = if e_rank > 0 {
-                sandwichvar_eta(phi, x_hinv_x, es_norm2, ridge, s_norm2)
-            } else {
-                var_bayes
-            };
+            let xs_slice = xs_chunk_storage.col_as_slice(local_col);
+            let mut meat_quad = 0.0f64;
+            for row in 0..n {
+                let xs = xs_slice[row];
+                // Sandwich meat is the SCORE covariance Xᵀ diag(W_S) X (Fisher,
+                // PSD by construction), not the observed-information Hessian
+                // weight W_H: the estimator is Var = H⁻¹·Cov(score)·H⁻¹ with the
+                // bread H = Xᵀ W_H X + S. For non-canonical links W_H ≠ W_S (and
+                // W_H can be negative), so using W_H here gives a wrong — even
+                // negative — sandwich SE. See `AloInput::score_weights`.
+                meat_quad += w_s[row] * xs * xs;
+            }
+            let var_sandwich = sandwichvar_eta_from_meat(phi, meat_quad);
 
             if !var_bayes.is_finite() || !var_sandwich.is_finite() {
                 return Err(AloError::LooComputationFailed {
@@ -914,17 +945,14 @@ fn compute_alo_from_input_inner(input: &AloInput) -> Result<AloDiagnostics, AloE
                     ),
                 });
             }
-            if e_rank > 0 {
-                let sandwich_scale =
-                    phi * (x_hinv_x.abs() + es_norm2.abs() + (ridge * s_norm2).abs());
-                let sandwich_tol = variance_negative_tolerance(sandwich_scale);
-                if var_sandwich < -sandwich_tol {
-                    return Err(AloError::LooComputationFailed {
-                        reason: format!(
-                            "ALO sandwich variance is materially negative at row {obs}: var={var_sandwich:.6e}, tol={sandwich_tol:.6e}"
-                        ),
-                    });
-                }
+            let sandwich_scale = phi * meat_quad.abs().max(x_hinv_x.abs());
+            let sandwich_tol = variance_negative_tolerance(sandwich_scale);
+            if var_sandwich < -sandwich_tol {
+                return Err(AloError::LooComputationFailed {
+                    reason: format!(
+                        "ALO sandwich variance is materially negative at row {obs}: var={var_sandwich:.6e}, tol={sandwich_tol:.6e}"
+                    ),
+                });
             }
 
             se_bayes[obs] = var_bayes.max(0.0).sqrt();
@@ -1948,7 +1976,7 @@ mod tests {
     use super::{
         ALO_EXACT_SCALAR_MAX_ITERS, AloExactScalarError, AloInput, alo_eta_exact_frozen_curvature,
         alo_eta_updatewith_offset, bayesvar_eta, compute_alo_from_input_inner,
-        percentile_from_sorted, percentile_index, sandwichvar_eta,
+        percentile_from_sorted, percentile_index, sandwichvar_eta_from_meat,
     };
     use gam_linalg::matrix::{PsdWeightsView, SignedWeightsView};
     use gam_problem::LinkFunction;
@@ -2089,31 +2117,98 @@ mod tests {
     }
 
     #[test]
-    fn gaussian_unpenalized_sandwich_equals_bayes() {
-        // In Gaussian linear model with S=0 and ridge=0:
-        // H = X'WX, so sandwich and bayes eta variances are identical.
+    fn gaussian_unpenalized_direct_sandwich_equals_bayes() {
+        // In a Gaussian linear model with H = X'WX, direct meat
+        // x_i'H^{-1}X'WXH^{-1}x_i equals x_i'H^{-1}x_i.
         let phi = 2.5;
         let x_hinv_x = 0.3;
-        let es_norm2 = 0.0;
-        let ridge = 0.0;
-        let s_norm2 = 0.0;
         let vb = bayesvar_eta(phi, x_hinv_x);
-        let vs = sandwichvar_eta(phi, x_hinv_x, es_norm2, ridge, s_norm2);
+        let vs = sandwichvar_eta_from_meat(phi, x_hinv_x);
         assert!((vb - vs).abs() < 1e-12);
     }
 
     #[test]
-    fn sandwich_matches_direct_linear_gaussian_formula() {
-        // Small brute-force linear Gaussian check:
-        // var_sandwich(eta_i) = phi * x_i^T H^{-1} X'WX H^{-1} x_i.
+    fn sandwich_from_direct_meat_scales_by_phi() {
         let phi = 1.7;
-        let x_hinv_x = 0.41;
-        let es_norm2 = 0.05;
-        let ridge = 1e-3;
-        let s_norm2 = 2.0;
-        let got = sandwichvar_eta(phi, x_hinv_x, es_norm2, ridge, s_norm2);
-        let expected = phi * (x_hinv_x - es_norm2 - ridge * s_norm2);
+        let meat_quad = 0.358;
+        let got = sandwichvar_eta_from_meat(phi, meat_quad);
+        let expected = phi * meat_quad;
         assert!((got - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn sandwich_meat_uses_score_weights_not_hessian_weights_noncanonical() {
+        // Regression for the sandwich-SE "meat" weight bug: the meat must be the
+        // SCORE covariance Xᵀ diag(W_S) X (Fisher, PSD), NOT the observed-info
+        // Hessian weight W_H (signed). This fixture mimics a non-canonical link
+        // (W_H ≠ W_S) with mixed-sign observed curvature.
+        //
+        // Single column (p = 1) makes H a scalar, so the sandwich variance is
+        // closed form: with H = Σ W_H·x² + s0 (> 0 after the penalty), the meat
+        // for obs is x_obs²·H⁻²·Σ_row W_S·x_row², and se = sqrt(φ·meat).
+        let x = Array2::from_shape_vec((5, 1), vec![1.0, 2.0, 1.0, 2.0, 1.0]).unwrap();
+        // Mixed-sign observed-information weights; the negative rows carry the
+        // larger design values so Σ W_H·x² is NEGATIVE (see assert below).
+        let w_h_vec = Array1::from_vec(vec![1.0, -1.0, 1.0, -1.0, 0.5]);
+        // Score/Fisher weights are strictly positive (PSD by construction).
+        let w_s_vec = Array1::from_vec(vec![1.0, 0.8, 1.2, 0.6, 0.9]);
+        let phi = 1.3;
+
+        let n = x.nrows();
+        let sum_wh_x2: f64 = (0..n).map(|i| w_h_vec[i] * x[[i, 0]] * x[[i, 0]]).sum();
+        let sum_ws_x2: f64 = (0..n).map(|i| w_s_vec[i] * x[[i, 0]] * x[[i, 0]]).sum();
+        // The whole point: Σ W_H·x² < 0 < Σ W_S·x². With W_H the meat is negative
+        // and the "materially negative sandwich variance" guard would trip
+        // (spurious LooComputationFailed); with W_S it is a valid PSD meat.
+        assert!(sum_wh_x2 < 0.0, "fixture must exercise a negative W_H meat");
+        assert!(sum_ws_x2 > 0.0);
+
+        // Penalize enough that the penalized Hessian is PD despite Σ W_H·x² < 0.
+        let s0 = 8.0_f64;
+        let h = s0 + sum_wh_x2; // = 2.5
+        assert!(h > 0.0, "penalized Hessian must stay PD");
+        let penalized_hessian = Array2::from_elem((1, 1), h);
+
+        // Pre-fix arithmetic check: the OLD W_H meat would be materially negative
+        // for the larger-x rows, so the old code returned LooComputationFailed.
+        let old_meat_obs1 = x[[1, 0]] * x[[1, 0]] / (h * h) * sum_wh_x2;
+        assert!(
+            phi * old_meat_obs1 < -super::variance_negative_tolerance(phi * old_meat_obs1.abs()),
+            "the pre-fix W_H meat must be materially negative (guard would trip)"
+        );
+
+        let working_response = Array1::from_vec(vec![0.3, -0.2, 0.5, 0.1, -0.4]);
+        let eta = Array1::from_vec(vec![0.2, 0.1, 0.4, -0.1, 0.05]);
+        let offset = Array1::zeros(n);
+        let input = AloInput {
+            design: &x,
+            penalized_hessian: &penalized_hessian,
+            hessian_weights: SignedWeightsView::from_array(&w_h_vec),
+            score_weights: PsdWeightsView::try_from_array(&w_s_vec).expect("psd weights"),
+            working_response: &working_response,
+            eta: &eta,
+            offset: &offset,
+            link: LinkFunction::Probit,
+            phi,
+            penalty_root: None,
+            ridge: 0.0,
+            score_curvature: None,
+        };
+
+        // The fix must let this succeed (no spurious negative-meat failure)...
+        let diag = compute_alo_from_input_inner(&input)
+            .expect("fixed sandwich meat (W_S) must not trip the negative-variance guard");
+
+        // ...and match the closed-form W_S reference for every row.
+        for obs in 0..n {
+            let expected =
+                (phi * x[[obs, 0]] * x[[obs, 0]] / (h * h) * sum_ws_x2).sqrt();
+            assert!(
+                (diag.se_sandwich[obs] - expected).abs() <= 1e-10 * expected.max(1.0),
+                "row {obs}: se_sandwich={} expected={expected}",
+                diag.se_sandwich[obs]
+            );
+        }
     }
 
     #[test]
