@@ -36,7 +36,6 @@
 //! the two coincide once the dictionary is fully populated and revival goes
 //! quiescent.
 
-use super::codes::SparseCode;
 use super::scoring::TileScorer;
 use super::update::{
     DEAD_DENOM, DecoderNormalEq, route_and_code_all, seed_decoder, solve_decoder, unit_norm_rows,
@@ -527,9 +526,8 @@ fn validate_config(config: &SparseDictConfig) -> Result<(), String> {
 
 #[cfg(test)]
 mod stream_tests {
-    use super::SparseDictStreamState;
-    use crate::sparse_dict::update::route_and_code_all;
-    use crate::sparse_dict::{SparseDictConfig, TileScorer, fit_sparse_dictionary};
+    use super::{SparseDictConfig, SparseDictStreamState, TileScorer, route_and_code_all};
+    use crate::sparse_dict::fit_sparse_dictionary;
     use ndarray::{Array2, ArrayView2};
 
     /// Deterministic synthetic corpus: `n` rows, each a scaled planted atom plus a
@@ -656,13 +654,29 @@ mod stream_tests {
         assert!(ev_stream > 0.9, "planted corpus should fit well, got EV {ev_stream}");
     }
 
+    /// Deterministic full-rank pseudo-random corpus in `[-1, 1)` (index hash), so
+    /// an undercomplete dictionary reconstructs it only partially and the fit has
+    /// real headroom to improve across epochs.
+    fn pseudo_random(n: usize, p: usize) -> Array2<f32> {
+        let mut x = Array2::<f32>::zeros((n, p));
+        for i in 0..n {
+            for c in 0..p {
+                let h = (i.wrapping_mul(73_856_093) ^ c.wrapping_mul(19_349_663)) as u64;
+                let h = h.wrapping_mul(2_654_435_761) % 2_000;
+                x[[i, c]] = h as f32 / 1_000.0 - 1.0;
+            }
+        }
+        x
+    }
+
     #[test]
     fn warm_start_persists_across_epochs() {
         // The decoder must warm-start across partial_fit/end_epoch calls: a later
         // epoch's pre-refresh EV (which sees the decoder refreshed by earlier
-        // epochs) strictly improves on the first epoch's.
-        let (n, k, p) = (180usize, 5usize, 6usize);
-        let x = planted(n, k, p);
+        // epochs) strictly improves on the first epoch's. Uses full-rank data with
+        // an undercomplete K so the seed is far from a perfect fit.
+        let (n, k, p) = (300usize, 8usize, 12usize);
+        let x = pseudo_random(n, p);
         let config = SparseDictConfig {
             n_atoms: k,
             active: 1,
@@ -685,5 +699,55 @@ mod stream_tests {
             evs[1],
             evs[0]
         );
+    }
+
+    #[test]
+    fn revival_targets_worst_reconstructed_row_not_pcs() {
+        // Seed the decoder from a sample spanning only e0/e1 (so one seeded atom is
+        // a redundant duplicate that fires for no shard row — a dead atom), then
+        // stream a shard whose lone e2 row no atom can reconstruct — the worst
+        // residual row. Revival must point the orphaned atom at that row's residual
+        // direction (e2), which is the shard's least-variance axis, never a PC.
+        let p = 4usize;
+        let mut seed = Array2::<f32>::zeros((20, p));
+        for i in 0..10 {
+            seed[[i, 0]] = 3.0;
+            seed[[10 + i, 1]] = 3.0;
+        }
+        let mut shard = Array2::<f32>::zeros((21, p));
+        for i in 0..10 {
+            shard[[i, 0]] = 3.0;
+            shard[[10 + i, 1]] = 3.0;
+        }
+        shard[[20, 2]] = 2.0; // lone e2 row — unreconstructable by an e0/e1 decoder
+
+        let config = SparseDictConfig {
+            n_atoms: 3,
+            active: 1,
+            minibatch: 64,
+            max_epochs: 5,
+            score_tile: 16,
+            code_ridge: 1.0e-6,
+            decoder_ridge: 1.0e-6,
+            tolerance: 0.0,
+        };
+        let mut state = SparseDictStreamState::new(seed.view(), &config).expect("fit_begin");
+        // Seed spans only e0/e1: nothing points at e2 yet.
+        let pre_cos_e2 = (0..3).map(|a| state.decoder()[[a, 2]].abs()).fold(0.0f32, f32::max);
+        assert!(pre_cos_e2 < 1.0e-4, "seed decoder must not span e2, got |cos|={pre_cos_e2}");
+
+        state.partial_fit(shard.view()).expect("partial_fit");
+        let stats = state.end_epoch().expect("end_epoch");
+        assert!(
+            stats.dead >= 1 && stats.revived >= 1,
+            "expected a dead atom revived; dead={} revived={}",
+            stats.dead,
+            stats.revived
+        );
+
+        // A revived atom now points at e2 — the worst-reconstructed row's residual
+        // direction — where none did before.
+        let post_cos_e2 = (0..3).map(|a| state.decoder()[[a, 2]].abs()).fold(0.0f32, f32::max);
+        assert!(post_cos_e2 > 0.999, "a revived atom must equal e2, got |cos|={post_cos_e2}");
     }
 }

@@ -355,10 +355,21 @@ pub(crate) fn try_device_arrow_direct(
     // all outside the dense device path; the GPU entry itself rejects the
     // matrix-free cases, but short-circuit here so we never pay a device probe
     // for a system that cannot route.
+    //
+    // A `penalty_op` is likewise disqualifying: when set it is the AUTHORITATIVE
+    // β-curvature source (the dense `hbb` accumulator is bypassed and, for SAE
+    // systems, reclaimed to a 0×0 workspace after assembly). The dense device
+    // Schur path reads only `hbb`, so probing it here would either compute the
+    // wrong step (dense `hbb` present but stale relative to `penalty_op`) or —
+    // the observed failure — hit the GPU entry's "dense block absent" decline
+    // after already paying the device probe. Route these straight to the CPU
+    // matrix-free lane. (This is the frames-engaged SAE path, which installs a
+    // `penalty_op` but no `htbeta_matvec`, so the matvec guards above miss it.)
     if !sys.cross_row_penalties.is_empty()
         || options.streaming_chunk_size.is_some()
         || sys.hbb_matvec.is_some()
         || sys.htbeta_matvec.is_some()
+        || sys.penalty_op.is_some()
     {
         return None;
     }

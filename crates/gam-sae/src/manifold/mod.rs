@@ -184,6 +184,9 @@ mod tests_two_tier_2023;
 mod tests_streaming_efs_cache_1026;
 
 #[cfg(test)]
+mod tests_streaming_outer_gradient_2026;
+
+#[cfg(test)]
 mod tests_row_jet_and_outer_objective_780;
 
 #[cfg(test)]

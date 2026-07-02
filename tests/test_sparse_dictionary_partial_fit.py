@@ -106,16 +106,15 @@ def test_one_shot_fit_still_works():
 
 
 def test_warm_start_persists_across_epochs():
-    n, k, p = 180, 5, 6
-    x = _planted(k, p, n)
+    # Full-rank data with a modest, undercomplete dictionary: the seed decoder
+    # reconstructs only partially, so a later epoch — which routes against the
+    # decoder that earlier epochs refreshed — must post a strictly higher EV than
+    # the first. If state did not persist across calls, every epoch would re-see
+    # the seed and EVs would not climb.
+    rng = np.random.default_rng(1)
+    x = rng.standard_normal((300, 12)).astype(np.float32)
     stream = sparse_dictionary_fit_begin(
-        x,
-        k,
-        active=1,
-        minibatch=64,
-        max_epochs=6,
-        score_tile=16,
-        tolerance=1.0e-12,
+        x, 8, active=1, minibatch=64, max_epochs=6, score_tile=16, tolerance=1.0e-12
     )
     evs = []
     for _ in range(6):
@@ -123,74 +122,66 @@ def test_warm_start_persists_across_epochs():
         evs.append(stream.end_epoch()["explained_variance"])
 
     assert stream.epochs_run == 6
-    # A later epoch's pre-refresh EV sees the decoder refreshed by earlier epochs;
-    # if state did not persist across calls every epoch would re-see the seed.
-    assert evs[1] > evs[0] + 1.0e-4, (
+    assert evs[1] > evs[0] + 1.0e-3, (
         f"second-epoch EV {evs[1]} must improve on first-epoch EV {evs[0]} "
         "(warm-start persisted across partial_fit/end_epoch calls)"
     )
+    assert evs[-1] > evs[0], "EV must climb across the streamed epochs"
 
 
-def test_revival_pulls_from_worst_reconstructed_rows_not_pcs():
-    # K far larger than the data's effective rank: farthest-point seeding spreads
-    # atoms across noise rows, the decoder refresh collapses many onto shared
-    # cluster directions, and the orphaned (dead) atoms must be revived onto the
-    # worst-reconstructed *residual rows*. We catch the first epoch that revives an
-    # atom and verify the revived direction equals that worst row's residual — and
-    # is NOT the data's leading principal component.
-    rng = np.random.default_rng(7)
-    p = 10
-    centers = rng.standard_normal((5, p)).astype(np.float32)
-    centers /= np.linalg.norm(centers, axis=1, keepdims=True)
-    rows = []
-    for c in range(5):
-        scale = 4.0 if c == 0 else 2.0  # cluster 0 dominates the variance (top PC)
-        block = scale * centers[c] + 0.15 * rng.standard_normal((40, p)).astype(np.float32)
-        rows.append(block.astype(np.float32))
-    x = np.ascontiguousarray(np.concatenate(rows, axis=0), dtype=np.float32)
+def test_revival_pulls_from_worst_reconstructed_row_not_pcs():
+    # The streaming API lets us seed the decoder from a sample that does NOT span a
+    # direction the corpus then visits, giving a fully controlled revival: the seed
+    # covers only e0/e1 (so one seeded atom is a redundant duplicate that fires for
+    # no row — a dead atom), while the streamed shard adds a lone e2 row that no
+    # atom can reconstruct — the worst-reconstructed residual row. Dead-atom revival
+    # must point the orphaned atom at THAT row's residual direction (e2), never at a
+    # principal component (the shard's variance is entirely along e0/e1; e2 is its
+    # least-variance axis).
+    p = 4
+    eye = np.eye(p, dtype=np.float32)
+    seed = np.concatenate(
+        [np.tile(3.0 * eye[0], (10, 1)), np.tile(3.0 * eye[1], (10, 1))]
+    ).astype(np.float32)
+    shard = np.concatenate(
+        [
+            np.tile(3.0 * eye[0], (10, 1)),
+            np.tile(3.0 * eye[1], (10, 1)),
+            (2.0 * eye[2]).reshape(1, -1),
+        ]
+    ).astype(np.float32)
 
-    k, active = 24, 1
-    # Top principal component of the data (the direction revival must NOT copy).
-    xc = x - x.mean(axis=0, keepdims=True)
-    _, _, vt = np.linalg.svd(xc, full_matrices=False)
-    pc0 = vt[0]
+    stream = SparseDictStream(seed, 3, active=1, minibatch=64, max_epochs=5, score_tile=16)
 
-    stream = SparseDictStream(
-        x, k, active=active, minibatch=64, max_epochs=30, score_tile=64, tolerance=0.0
+    # Seed decoder spans only e0/e1: nothing points at the soon-to-be-worst row.
+    assert np.abs(stream.decoder @ eye[2]).max() < 1.0e-4
+
+    # Residual of the e2 row under the pre-refresh (seed) decoder, via the trainer's
+    # own routing — the exact field revival ranks. It is the worst-reconstructed row.
+    d_pre = stream.decoder
+    idx, cod = rust_module().sparse_dictionary_transform_ffi(
+        shard, np.ascontiguousarray(d_pre, dtype=np.float32), 1
+    )
+    resid = shard - _reconstruct(idx, cod, d_pre)
+    resid_norm = np.linalg.norm(resid, axis=1)
+    worst = int(np.argmax(resid_norm))
+    assert worst == shard.shape[0] - 1, "the lone e2 row must be the worst-reconstructed"
+    worst_dir = resid[worst] / np.linalg.norm(resid[worst])
+
+    stream.partial_fit(shard)
+    stats = stream.end_epoch()
+    assert stats["dead"] >= 1 and stats["revived"] >= 1, (
+        f"expected a dead atom revived; got dead={stats['dead']} revived={stats['revived']}"
     )
 
-    observed = False
-    for _ in range(30):
-        stream.partial_fit(x)
-        # Residual under the decoder in force this epoch (the pre-refresh decoder),
-        # via the trainer's own routing — this is exactly the field revival ranks.
-        d_pre = stream.decoder
-        idx, cod = rust_module().sparse_dictionary_transform_ffi(
-            x, np.ascontiguousarray(d_pre, dtype=np.float32), active
-        )
-        resid = x - _reconstruct(idx, cod, d_pre)
-        resid_norm = np.linalg.norm(resid, axis=1)
-
-        stats = stream.end_epoch()
-        if stats["revived"] > 0:
-            d_post = stream.decoder
-            worst = int(np.argmax(resid_norm))
-            wdir = resid[worst] / np.linalg.norm(resid[worst])
-            # Some atom now equals the worst row's residual direction (sign-free).
-            cos_atoms = np.abs(d_post @ wdir)
-            assert cos_atoms.max() > 0.999, (
-                f"a revived atom must equal the worst residual row's direction; "
-                f"best |cos|={cos_atoms.max():.4f}"
-            )
-            # ...and that direction is a residual row, not the leading PC.
-            assert abs(float(np.dot(wdir, pc0))) < 0.5, (
-                "revival source must be a residual row, not the top principal "
-                f"component (|cos to PC0|={abs(float(np.dot(wdir, pc0))):.3f})"
-            )
-            observed = True
-            break
-
-    assert observed, "revival never fired — construction did not orphan any atom"
+    d_post = stream.decoder
+    # A revived atom now equals the worst row's residual direction (sign-free)...
+    assert np.abs(d_post @ worst_dir).max() > 0.999, "no atom matched the worst residual row"
+    # ...and the shard's leading principal component (along e0/e1) is NOT that
+    # direction — revival used a residual row, not a PC.
+    sc = shard - shard.mean(axis=0, keepdims=True)
+    _, _, vt = np.linalg.svd(sc, full_matrices=False)
+    assert abs(float(worst_dir @ vt[0])) < 1.0e-3, "revival source coincided with the top PC"
 
 
 if __name__ == "__main__":

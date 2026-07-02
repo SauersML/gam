@@ -43,11 +43,16 @@ pub enum ArrowSchurGpuFailure {
     /// Shared Schur factor failed; bordered system is rank-deficient at the
     /// requested ridges and the CPU path should handle escalation.
     SchurFactorFailed { reason: String },
-    /// The system carries matrix-free `H_ββ` or per-row `H_tβ` operators that
-    /// the dense GPU Schur path cannot consume. The caller should route to CPU
-    /// `InexactPCG` (or supply dense buffers) rather than treating this as a
-    /// numerical failure. See `gpu/arrow_schur.rs` Part B for the planned GPU
-    /// PCG path that will lift this restriction at K ≥ 5000.
+    /// The dense GPU Schur path cannot consume this system's β-block. Either
+    /// the system carries matrix-free `H_ββ` / per-row `H_tβ` operators
+    /// (`had_*_matvec` set), OR the dense `(K×K)` `H_ββ` block is simply absent
+    /// (both flags false) — e.g. an SAE-manifold system whose β-curvature lives
+    /// in a `penalty_op` / factored-frame representation with `hbb` reclaimed to
+    /// a `0×0` workspace. In BOTH cases this is a capability mismatch, NOT a
+    /// numerical failure: the caller should route to CPU `InexactPCG` (or supply
+    /// dense buffers) rather than escalating a ridge. See `gpu/arrow_schur.rs`
+    /// Part B for the planned GPU PCG path that will lift this restriction at
+    /// K ≥ 5000.
     GpuRequiresDenseSystem {
         had_hbb_matvec: bool,
         had_htbeta_matvec: bool,
@@ -199,8 +204,22 @@ pub fn solve_arrow_newton_step(
     }
 
     if sys.hbb.dim() != (k, k) {
-        return Err(ArrowSchurGpuFailure::SchurFactorFailed {
-            reason: "CUDA arrow-Schur requires a dense shared beta block".to_string(),
+        // The dense (K×K) H_ββ block is absent (e.g. an SAE-manifold system
+        // whose β-curvature is carried by a matrix-free `penalty_op` /
+        // factored-frame representation, with `hbb` reclaimed to a 0×0
+        // workspace at the end of assembly). This is a CAPABILITY decline, not
+        // a numerical failure: the dense device Schur path simply cannot
+        // consume this system, so the host must route it to the CPU lane
+        // (which reads the matrix-free operators) exactly as it does for the
+        // `hbb_matvec` / `htbeta_matvec` case above. Returning `SchurFactorFailed`
+        // here would masquerade as a non-PD/rank-deficient factorization and be
+        // escalated (and ultimately surfaced as a FATAL RemlConvergenceError)
+        // by the outer LM loop instead of falling back. Decline instead. Both
+        // matvec flags are false because the absence is structural (no dense
+        // block was materialized), not caused by an installed matrix-free op.
+        return Err(ArrowSchurGpuFailure::GpuRequiresDenseSystem {
+            had_hbb_matvec: false,
+            had_htbeta_matvec: false,
         });
     }
     if n == 0 || d == 0 {
