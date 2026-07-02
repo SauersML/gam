@@ -1177,10 +1177,21 @@ impl<'a> RemlState<'a> {
             );
         }
 
+        // `p_total` is the TK correction's gradient with respect to the
+        // *penalized negative-log-posterior* Hessian drift.  Along a mode
+        // displacement `beta_dir = dβ*/dθ`, the Jeffreys contribution to that
+        // Hessian is `-D H_φ[beta_dir]`; however the surrounding TK gradient
+        // assembly already uses the REML/LAML cost convention (the same
+        // convention under which the penalty block contributes
+        // `+tr(S_θ p_total)`).  Therefore the Jeffreys logdet atom enters the
+        // propagated directional derivative with the same sign as its
+        // `H_φ` directional derivative.  Using the inner-objective sign here
+        // double-negates the Firth term and makes the analytic ρ/τ gradient
+        // disagree with finite differences while non-Firth siblings pass.
         let mut trace = 0.0;
         for row in 0..hphi.nrows() {
             for col in 0..hphi.ncols() {
-                trace -= hphi[[row, col]] * p_total[[col, row]];
+                trace += hphi[[row, col]] * p_total[[col, row]];
             }
         }
         Ok(trace)
