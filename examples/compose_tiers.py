@@ -38,7 +38,9 @@ Integration seams (concurrent work):
 from __future__ import annotations
 
 import argparse
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -209,6 +211,203 @@ def compose_tiers(
     )
 
 
+@dataclass
+class BlockNurseryComposition:
+    """A block-sparse Tier-1 factored into per-block K=1 curved Tier-2 charts.
+
+    The block-sparse T1 discovers ``G`` low-dimensional block subspaces; each block
+    becomes a well-seeded nursery for ONE curved chart fit in the block's own b-dim
+    coordinates (never the full ambient joint fit that co-collapses). The composed
+    artifact is the additive sum of every block chart lifted back to ambient. This
+    is the executable direction ⊂ block ⊂ chart ladder.
+    """
+
+    t1: Any  # gamfit.BlockSparseDictionaryFit
+    manifest: dict
+    per_block: list[dict]
+    t1_block_ev: float
+    composed_ev: float
+    combined_recon: np.ndarray
+    mdl: dict | None
+
+    @property
+    def ev_gain(self) -> float:
+        return self.composed_ev - self.t1_block_ev
+
+
+def emit_block_seed_manifest(
+    t1: Any,
+    X: np.ndarray,
+    out_prefix: str | None,
+    *,
+    n_basis_chart: int = 4,
+    residual_target: bool = True,
+) -> dict:
+    """Emit the Tier-1 -> Tier-2 seeds manifest (JSON + npz) a K=1-per-block curved
+    stage consumes, mirroring the block_nursery hand-off (per-block basis ``Q``,
+    in-block coordinates, and per-block stats + MDL featurizer rows).
+
+    The compact JSON (``{prefix}.seeds.json``) carries the ``(p, b)`` bases + scalar
+    stats + a flat ``mdl_featurizers`` list (ready for ``mdl.score_json``); the
+    companion npz (``{prefix}.seeds.npz``) carries the heavy per-block arrays:
+    ``block{g}_basis`` (p x b, column-orthonormal ``Q = D_gᵀ``) and ``block{g}_coords``
+    (n x b, the residual-projected in-block coordinates the chart is fit on).
+    Returns the manifest dict (also written to JSON when ``out_prefix`` is given).
+    """
+    x = np.ascontiguousarray(np.asarray(X, dtype=np.float32))
+    manifest = t1.seed_manifest(
+        x, n_basis_chart=n_basis_chart, residual_target=residual_target
+    )
+    if out_prefix is not None:
+        prefix = Path(out_prefix)
+        prefix.parent.mkdir(parents=True, exist_ok=True)
+        prefix.with_suffix(".seeds.json").write_text(json.dumps(manifest, indent=2))
+        arrays: dict[str, np.ndarray] = {}
+        for g in range(t1.n_blocks):
+            arrays[f"block{g}_basis"] = t1.block_frame(g).T  # (p, b) = Q
+            coords = (
+                t1.project_residual(x, g) if residual_target else t1.block_coords(x, g)
+            )
+            arrays[f"block{g}_coords"] = coords
+        np.savez(str(prefix.with_suffix(".seeds.npz")), **arrays)
+        print(
+            f"[compose_tiers] wrote seeds manifest "
+            f"{prefix.with_suffix('.seeds.json')} (+ .seeds.npz, {t1.n_blocks} blocks)"
+        )
+    return manifest
+
+
+def _score_block_mdl(manifest: dict) -> dict | None:
+    """Score the manifest's block-vs-chart crossover ``f*`` per block via M-mdl's
+    scorer, if it is importable. Pure-numpy JSON path (no model load)."""
+    import importlib
+    import sys as _sys
+
+    candidates = [
+        Path("/Users/user/Manifold-SAE/experiments/mdl_ladder"),
+        Path(__file__).resolve().parent.parent.parent / "Manifold-SAE"
+        / "experiments" / "mdl_ladder",
+    ]
+    for cand in candidates:
+        if (cand / "mdl.py").exists():
+            _sys.path.insert(0, str(cand))
+            try:
+                mdl = importlib.import_module("mdl")
+            except Exception:
+                return None
+            feats = manifest["mdl_featurizers"]
+            payload = {
+                "delta2": None,
+                "l_param_bits": None,
+                "featurizers": feats,
+            }
+            # Crossover f* resolves from PAYLOAD-level block_name/chart_name (per the
+            # mdl_ladder schema). Point them at the first block's own two rungs so the
+            # response carries a block->chart f* for that representative block.
+            if len(feats) >= 2:
+                payload["block_name"] = feats[0]["name"]
+                payload["chart_name"] = feats[1]["name"]
+            try:
+                return mdl.score_json(payload)
+            except Exception as exc:  # pragma: no cover - scorer-side issue
+                return {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+    return None
+
+
+def compose_block_charts(
+    X: np.ndarray,
+    *,
+    n_blocks: int,
+    block_size: int = 2,
+    block_topk: int = 1,
+    t1_max_epochs: int = 30,
+    aux_k: int = 0,
+    chart_n_iter: int = 50,
+    chart_topology: str = "circle",
+    chart_d_atom: int = 2,
+    n_basis_chart: int = 4,
+    residual_target: bool = True,
+    seed_out: str | None = None,
+    score_mdl: bool = True,
+    random_state: int = 0,
+) -> BlockNurseryComposition:
+    """Block-sparse Tier-1 -> per-block K=1 curved Tier-2 nursery -> additive compose.
+
+    (1) Fit a block-sparse T1 (``block_sparse_dictionary_fit``). (2) Emit the seeds
+    manifest. (3) For EACH block fit ONE curved chart (``sae_manifold_fit`` K=1,
+    ``d_atom = block_size``) on that block's in-block coordinates — a tiny, well-
+    seeded ``d≈b`` fit, never the full-ambient joint fit that co-collapses — then
+    lift the chart back with the block frame and sum. Composition EV is measured
+    honestly against ``X``.
+
+    Only the seeds manifest + per-block coords cross the T1/T2 seam, so the two
+    stages stay decoupled (a different T2 fitter can consume the same manifest).
+    """
+    x = np.ascontiguousarray(np.asarray(X, dtype=np.float32))
+    t1 = gamfit.block_sparse_dictionary_fit(
+        x,
+        n_blocks,
+        block_size=block_size,
+        block_topk=block_topk,
+        max_epochs=t1_max_epochs,
+        aux_k=aux_k,
+    )
+    manifest = emit_block_seed_manifest(
+        t1, x, seed_out, n_basis_chart=n_basis_chart, residual_target=residual_target
+    )
+
+    composed = np.zeros_like(x, dtype=np.float64)
+    firings = t1.block_firings(x)
+    per_block: list[dict] = []
+    for g in range(t1.n_blocks):
+        coords = (
+            t1.project_residual(x, g) if residual_target else t1.block_coords(x, g)
+        )
+        rec: dict[str, Any] = {
+            "block": g,
+            "block_dim": int(block_size),
+            "n_firings": int(firings[g]),
+            "utilization": float(t1.block_utilization[g]),
+            "stable_rank": float(t1.block_stable_rank[g]),
+        }
+        # One tiny curved chart in the block's own coordinates.
+        try:
+            chart = gamfit.sae_manifold_fit(
+                np.ascontiguousarray(coords, dtype=np.float32),
+                K=1,
+                # d_atom is the atom manifold's embedding dim (a circle is 2), not
+                # the block width; clamp to the b-dim block coordinate space.
+                d_atom=min(chart_d_atom, block_size),
+                atom_topology=chart_topology,
+                n_iter=chart_n_iter,
+                random_state=random_state,
+            )
+            coords_hat = np.asarray(chart.reconstruct(coords), dtype=np.float64)
+            rec["chart_status"] = "CONVERGED"
+            rec["chart_ev_block_coords"] = explained_variance(coords, coords_hat)
+            composed += t1.lift_block(coords_hat.astype(np.float32), g).astype(np.float64)
+        except Exception as exc:  # curved fit unavailable / hangs in this env
+            rec["chart_status"] = f"{type(exc).__name__}"
+            rec["chart_error"] = str(exc)[:160]
+            # Fall back to the block's LINEAR reconstruction so the composition is
+            # still defined (the direction⊂block rung without the chart rung).
+            composed += t1.lift_block(coords, g).astype(np.float64)
+            rec["chart_ev_block_coords"] = None
+        per_block.append(rec)
+
+    combined = composed.astype(np.float32)
+    mdl = _score_block_mdl(manifest) if score_mdl else None
+    return BlockNurseryComposition(
+        t1=t1,
+        manifest=manifest,
+        per_block=per_block,
+        t1_block_ev=float(t1.explained_variance),
+        composed_ev=explained_variance(x, combined),
+        combined_recon=combined,
+        mdl=mdl,
+    )
+
+
 def _load_activations(args: argparse.Namespace) -> np.ndarray:
     """Load real sharded activations (W4) or synthesize planted structure."""
     if args.shard_manifest is not None:
@@ -276,6 +475,9 @@ def build_parser() -> argparse.ArgumentParser:
     src.add_argument("--curved-scale", type=float, default=1.0)
 
     tiers = ap.add_argument_group("tiers")
+    tiers.add_argument("--t1-mode", choices=("sparse", "block"), default="sparse",
+                       help="Tier-1 engine: 'sparse' (collapsed-linear atoms) or "
+                            "'block' (block-sparse -> per-block curved nursery)")
     tiers.add_argument("--k1", type=int, default=16, help="linear dictionary width")
     tiers.add_argument("--k2", type=int, default=8, help="curved SAE width (K<=64)")
     tiers.add_argument("--t1-active", type=int, default=4)
@@ -284,6 +486,26 @@ def build_parser() -> argparse.ArgumentParser:
     tiers.add_argument("--atom-topology", default="circle")
     tiers.add_argument("--assignment", default="threshold_gate")
     tiers.add_argument("--t2-n-iter", type=int, default=50)
+
+    block = ap.add_argument_group("block tier (--t1-mode block)")
+    block.add_argument("--n-blocks", type=int, default=8,
+                       help="number of block subspaces G (K = G*block_size)")
+    block.add_argument("--block-size", type=int, default=2, help="atoms per block b (2-4)")
+    block.add_argument("--block-topk", type=int, default=1, help="blocks active per row")
+    block.add_argument("--aux-k", type=int, default=2, help="AuxK dead-block revival budget")
+    block.add_argument("--chart-n-iter", type=int, default=50,
+                       help="curved chart n_iter per block")
+    block.add_argument("--n-basis-chart", type=int, default=4,
+                       help="Fourier basis count per circle chart (for MDL n_params)")
+    block.add_argument("--direct-coords", dest="residual_target", action="store_false",
+                       default=True,
+                       help="seed charts on direct block coords X D_gᵀ instead of the "
+                            "leave-one-block-out residual (default: residual)")
+    block.add_argument("--emit-seeds", default=None,
+                       help="path prefix to write the seeds manifest "
+                            "(<prefix>.seeds.json + <prefix>.seeds.npz)")
+    block.add_argument("--no-mdl", dest="score_mdl", action="store_false", default=True,
+                       help="skip the block-vs-chart f* MDL scoring")
 
     resid = ap.add_argument_group("residual / composition")
     resid.add_argument("--residual-passes", type=int, default=3)
@@ -301,9 +523,41 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-def main(argv: list[str] | None = None) -> TieredComposition:
+def main(argv: list[str] | None = None) -> Any:
     args = build_parser().parse_args(argv)
     X = _load_activations(args)
+
+    if args.t1_mode == "block":
+        print(f"[compose_tiers] corpus X: {X.shape} "
+              f"(T1 block-sparse G={args.n_blocks} b={args.block_size} "
+              f"top-k={args.block_topk} -> per-block K=1 {args.atom_topology} charts)")
+        bn = compose_block_charts(
+            X,
+            n_blocks=args.n_blocks,
+            block_size=args.block_size,
+            block_topk=args.block_topk,
+            t1_max_epochs=args.t1_max_epochs,
+            aux_k=args.aux_k,
+            chart_n_iter=args.chart_n_iter,
+            chart_topology=args.atom_topology,
+            chart_d_atom=args.d_atom,
+            n_basis_chart=args.n_basis_chart,
+            residual_target=args.residual_target,
+            seed_out=args.emit_seeds,
+            score_mdl=args.score_mdl,
+            random_state=args.random_state,
+        )
+        n_charts = sum(1 for r in bn.per_block if r.get("chart_status") == "CONVERGED")
+        print(f"[compose_tiers] T1 block-sparse EV = {bn.t1_block_ev:.4f}")
+        print(f"[compose_tiers] composed (block->chart) EV = {bn.composed_ev:.4f} "
+              f"(+{bn.ev_gain:.4f} from curved charts; {n_charts}/{len(bn.per_block)} "
+              f"charts fit)")
+        if bn.mdl and "crossover" in bn.mdl:
+            xo = bn.mdl["crossover"]
+            print(f"[compose_tiers] MDL block->chart f* = {xo.get('f_star')} "
+                  f"(chart wins at actual f: {xo.get('chart_wins_at_actual_f')})")
+        return bn
+
     print(f"[compose_tiers] corpus X: {X.shape} "
           f"(T1 K={args.k1}, T2 K={args.k2}, topology={args.atom_topology})")
 

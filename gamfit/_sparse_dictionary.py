@@ -367,6 +367,225 @@ class BlockSparseDictionaryFit:
             np.ascontiguousarray(codes.astype(np.float32)),
         )
 
+    # ---- block -> chart SEEDING SURFACE (Tier-1 block -> Tier-2 nursery) -------
+    #
+    # These turn each block into a well-seeded low-dimensional nursery for a
+    # curved (K=1-per-block) Tier-2 chart, mirroring the block_nursery recipe:
+    # project the (residual of the) data into a block's own b-dim coordinates,
+    # fit ONE chart there, and lift back with the block frame. The frame D_g is
+    # the b x P orthonormal block; its transpose Q = D_gᵀ (P x b, column-
+    # orthonormal) is the ``(p, b)`` basis the nursery convention uses
+    # (``Z = Xc @ Q``, lift ``Zhat @ Qᵀ``).
+
+    def block_frame(self, g: int) -> np.ndarray:
+        """The ``b x P`` orthonormal frame ``D_g`` of block ``g`` (its ``b`` rows
+        are orthonormal). Use ``block_frame(g).T`` for the ``(p, b)`` column-
+        orthonormal basis ``Q`` in the nursery convention."""
+        b = self.block_size
+        if not 0 <= g < self.n_blocks:
+            raise IndexError(f"block {g} out of range [0, {self.n_blocks})")
+        return np.ascontiguousarray(self.decoder[g * b : g * b + b])
+
+    def block_coords(self, X: Any, g: int) -> np.ndarray:
+        """In-block coordinates ``X D_gᵀ`` (``M x b``): the tied projection of each
+        row onto block ``g``'s subspace — the direct nursery coordinate ``Z``
+        (before any residual bookkeeping). Deterministic, no routing."""
+        x = _as_2d_f32(X, "X")
+        return np.ascontiguousarray(x @ self.block_frame(g).T)
+
+    def lift_block(self, coords: Any, g: int) -> np.ndarray:
+        """Lift ``M x b`` in-block coordinates back to ambient ``M x P`` via the
+        block frame: ``coords @ D_g``. Inverse of :meth:`block_coords` on the
+        block subspace (``D_g D_gᵀ = I_b``)."""
+        c = np.ascontiguousarray(np.asarray(coords, dtype=np.float32))
+        if c.ndim != 2 or c.shape[1] != self.block_size:
+            raise ValueError(
+                f"coords must be M x b (b={self.block_size}); got {c.shape}"
+            )
+        return np.ascontiguousarray(c @ self.block_frame(g))
+
+    def _reconstruct_from(self, blocks: np.ndarray, codes: np.ndarray) -> np.ndarray:
+        """Dense ``M x P`` reconstruction from an arbitrary ``(blocks, codes)``
+        routing (``M x k`` / ``M x k x b``)."""
+        n = blocks.shape[0]
+        p = self.decoder.shape[1]
+        b = self.block_size
+        out = np.zeros((n, p), dtype=np.float32)
+        for j in range(blocks.shape[1]):
+            g = blocks[:, j].astype(np.int64)
+            for r in range(b):
+                out += codes[:, j, r][:, None] * self.decoder[g * b + r]
+        return out
+
+    def project_residual(self, X: Any, g: int) -> np.ndarray:
+        """Residual-excluding-block-``g`` projected into block ``g``'s coordinates
+        (``M x b``).
+
+        Routes ``X`` through the frozen frames, reconstructs, adds block ``g``'s
+        OWN contribution back (so the target is the structure every OTHER block
+        leaves for ``g``), and projects that leave-one-block-out residual into
+        ``g``'s frame. This is the exact per-block target a Tier-2 chart should fit
+        (the same ``r_{ig}`` the Rust frame refresh forms), and — unlike the direct
+        :meth:`block_coords` — it is meaningful even when blocks share span."""
+        x = _as_2d_f32(X, "X")
+        b = self.block_size
+        dg = self.block_frame(g)  # b x P
+        blocks, _gates, codes = self.transform(x)
+        xhat = self._reconstruct_from(blocks, codes)
+        resid = x - xhat
+        # Add block g's own contribution back wherever g was selected.
+        sel = blocks == np.uint32(g)  # M x k
+        for j in range(blocks.shape[1]):
+            mask = sel[:, j]
+            if mask.any():
+                resid[mask] += codes[mask, j, :] @ dg
+        return np.ascontiguousarray(resid @ dg.T)
+
+    def block_firings(self, X: Any) -> np.ndarray:
+        """Per-block firing counts on ``X`` (``G``-vector): how many rows route to
+        each block under the frozen frames. ``n_firings`` for the MDL scorer."""
+        x = _as_2d_f32(X, "X")
+        blocks, _gates, _codes = self.transform(x)
+        counts = np.zeros(self.n_blocks, dtype=np.int64)
+        vals, n = np.unique(blocks, return_counts=True)
+        counts[vals.astype(np.int64)] = n
+        return counts
+
+    def block_seeds(
+        self,
+        X: Any,
+        *,
+        n_basis_chart: int = 4,
+        residual_target: bool = True,
+        name_prefix: str = "block",
+    ) -> list[dict]:
+        """Per-block seed records for ranking which blocks deserve a curved Tier-2
+        chart, each carrying MDL-scorer featurizer rows (block rung + circle-chart
+        rung) matching the mdl_ladder JSON interface.
+
+        For every block: its in-block coordinate statistics (variance spectrum),
+        firing count, utilisation, stable rank, and the linear EV it captures — plus
+        two ready-to-score featurizer dicts (``mdl_block`` / ``mdl_chart``) whose
+        ``block_name`` / ``chart_name`` are set so ``mdl.score_json`` returns the
+        per-block chart-vs-block crossover ``f*``. ``residual_target`` chooses the
+        in-block coordinates (leave-one-block-out residual vs direct projection).
+
+        The featurizer ``total_var``/``coded_var`` live in the block's b-dim
+        coordinate space (the shared lift ``Q`` cancels in the block-vs-chart
+        crossover), matching how block_nursery scores each block.
+        """
+        x = _as_2d_f32(X, "X")
+        n_tokens = x.shape[0]
+        p = self.decoder.shape[1]
+        b = self.block_size
+        firings = self.block_firings(x)
+        # Total ambient variance (denominator for each block's linear EV).
+        xc = x - x.mean(axis=0, keepdims=True)
+        ambient_var = float((xc**2).sum()) or 1.0
+        seeds: list[dict] = []
+        for g in range(self.n_blocks):
+            coords = (
+                self.project_residual(x, g) if residual_target else self.block_coords(x, g)
+            )
+            cc = coords - coords.mean(axis=0, keepdims=True)
+            # Per-intrinsic-coordinate signal variances = eigenvalues of the b x b
+            # coordinate covariance (a gauge invariant of the block code).
+            cov = (cc.T @ cc) / max(cc.shape[0], 1)
+            eig = np.linalg.eigvalsh(cov.astype(np.float64))
+            coded_var = np.sort(np.clip(eig, 0.0, None))[::-1]
+            total_var = float(coded_var.sum())
+            # Linear EV this block captures of the ambient (its projector's energy).
+            block_ev = float((cc**2).sum() / ambient_var)
+            f = int(firings[g])
+            base = f"{name_prefix}{g}"
+            mdl_block = {
+                "name": f"{base}-linear-{b}d",
+                "kind": "block",
+                "total_var": max(total_var, 1e-12),
+                "n_tokens": int(n_tokens),
+                "n_firings": max(f, 1),
+                "n_params": b * p,
+                "coded_var": [float(v) for v in coded_var],
+                "g_dict": int(self.n_blocks),
+                "k_active": int(self.block_topk),
+            }
+            mdl_chart = {
+                "name": f"{base}-circle-chart",
+                "kind": "chart",
+                "total_var": max(total_var, 1e-12),
+                "n_tokens": int(n_tokens),
+                "n_firings": max(f, 1),
+                "n_params": int(n_basis_chart) * p,
+                # A single intrinsic (angular) coordinate carries the block's signal
+                # variance; ev split across the 1 coord = total captured.
+                "coded_var": [max(total_var, 1e-12)],
+                "g_dict": int(self.n_blocks),
+                "k_active": int(self.block_topk),
+                "block_name": f"{base}-linear-{b}d",
+                "chart_name": f"{base}-circle-chart",
+            }
+            seeds.append(
+                {
+                    "block": g,
+                    "block_dim": b,
+                    "n_firings": f,
+                    "utilization": float(self.block_utilization[g]),
+                    "stable_rank": float(self.block_stable_rank[g]),
+                    "coded_var": [float(v) for v in coded_var],
+                    "total_var": total_var,
+                    "block_linear_ev": block_ev,
+                    "mdl_block": mdl_block,
+                    "mdl_chart": mdl_chart,
+                }
+            )
+        return seeds
+
+    def seed_manifest(
+        self,
+        X: Any,
+        *,
+        n_basis_chart: int = 4,
+        residual_target: bool = True,
+        include_bases: bool = True,
+    ) -> dict:
+        """A JSON-serialisable Tier-1 -> Tier-2 hand-off manifest: per-block basis,
+        coordinate statistics, firing counts, and MDL featurizer rows, plus a flat
+        ``mdl_featurizers`` list ready to pass straight to ``mdl.score_json``.
+
+        The heavy per-row in-block COORDINATES are NOT embedded here (call
+        :meth:`block_coords` / :meth:`project_residual` and save them to an ``.npz``
+        alongside); this manifest carries only the (p x b) bases + scalar stats so
+        it stays a compact, human-readable JSON. Mirrors the block->chart hand-off
+        block_nursery consumes (basis ``Q``, in-block coords, per-block stats)."""
+        seeds = self.block_seeds(
+            X, n_basis_chart=n_basis_chart, residual_target=residual_target
+        )
+        b = self.block_size
+        blocks_out = []
+        featurizers = []
+        for s in seeds:
+            g = s["block"]
+            entry = {k: v for k, v in s.items() if k not in ("mdl_block", "mdl_chart")}
+            if include_bases:
+                # (p, b) column-orthonormal basis Q = D_gᵀ (nursery convention).
+                entry["basis"] = self.block_frame(g).T.tolist()
+            blocks_out.append(entry)
+            featurizers.append(s["mdl_block"])
+            featurizers.append(s["mdl_chart"])
+        return {
+            "schema": "block_seed_manifest.v1",
+            "n_blocks": int(self.n_blocks),
+            "block_size": int(b),
+            "block_topk": int(self.block_topk),
+            "ambient_p": int(self.decoder.shape[1]),
+            "gamma": float(self.gamma),
+            "explained_variance": float(self.explained_variance),
+            "residual_target": bool(residual_target),
+            "n_basis_chart": int(n_basis_chart),
+            "blocks": blocks_out,
+            "mdl_featurizers": featurizers,
+        }
+
 
 def block_sparse_dictionary_fit(
     X: Any,
