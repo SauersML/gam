@@ -3742,14 +3742,12 @@ fn cli_and_ffi_bernoulli_marginal_slope_payloads_have_one_contract() {
     let mut ffi_json = serde_json::to_value(&ffi_payload)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "serialize FFI payload", e));
     for json in [&mut cli_json, &mut ffi_json] {
-        // Field names are kebab-case under the payload's
-        // `#[serde(rename_all = "kebab-case")]`.
         let obj = json
             .as_object_mut()
             .unwrap_or_else(|| panic!("{} failed", "payload serializes to an object"));
-        obj.remove("training-feature-ranges");
-        obj.remove("offset-column");
-        obj.remove("noise-offset-column");
+        obj.remove("training_feature_ranges");
+        obj.remove("offset_column");
+        obj.remove("noise_offset_column");
     }
     assert_eq!(
         cli_json, ffi_json,

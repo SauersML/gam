@@ -1361,17 +1361,24 @@ pub fn validate_marginal_slope_z_column_exclusion(
     logslope_label: &str,
 ) -> Result<(), String> {
     let surfaces = marginal_slope_logslope_surfaces(logslope_formula, z_column)?;
-    for z_column in surfaces.iter().map(|surface| surface.z_column.as_str()) {
-        if parsed_terms_reference_column(&main_formula.terms, z_column) {
+    // The CLI/configured z column is reserved even when the log-slope formula
+    // is intercept-only (`~ 1`) and therefore contributes no surface terms.
+    // Explicit logslope(...) declarations may reserve additional z coordinates.
+    let mut reserved_z_columns = std::collections::BTreeSet::<&str>::new();
+    reserved_z_columns.insert(z_column);
+    reserved_z_columns.extend(surfaces.iter().map(|surface| surface.z_column.as_str()));
+
+    for reserved in &reserved_z_columns {
+        if parsed_terms_reference_column(&main_formula.terms, reserved) {
             return Err(FormulaDslError::IncompatibleTerm {
                 reason: format!(
-                    "{context} reserves z column '{z_column}' as the auxiliary latent score; it cannot also appear in the main formula"
+                    "{context} reserves z column '{reserved}' as the auxiliary latent score; it cannot also appear in the main formula"
                 ),
             }
             .into());
         }
     }
-    for reserved in surfaces.iter().map(|surface| surface.z_column.as_str()) {
+    for reserved in &reserved_z_columns {
         if parsed_terms_reference_column(&logslope_formula.terms, reserved) {
             return Err(FormulaDslError::IncompatibleTerm {
                 reason: format!(

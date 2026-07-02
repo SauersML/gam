@@ -238,17 +238,35 @@ fn gam_penalized_binomial_posterior_matches_pymc_and_concentrates_with_lambda() 
         (5..=20).contains(&p),
         "s(x) default basis should give a modest coefficient count, got p={p}"
     );
+    // A bare `s(x)` uses gam's documented default DOUBLE penalty: a cubic
+    // P-spline wiggliness penalty PLUS the Marra & Wood (2011) null-space
+    // shrinkage ridge (see docs/formulas.md `double_penalty=true` default and
+    // CHANGELOG #1544). The frozen design therefore carries one penalty block
+    // per fitted smoothing parameter — the same invariant the NUTS sibling
+    // (`quality_vs_pymc_nuts_binomial_logit`) asserts. The λ scan below scales
+    // the ENTIRE (multi-block) roughness prior by a single scalar, so it stays
+    // agnostic to the exact block count while remaining identical to the PyMC
+    // baseline (which multiplies the same unit penalty by that scalar).
+    let fitted_lambdas = fit.fit.lambdas.as_slice().expect("contiguous lambdas");
     assert_eq!(
+        fitted_lambdas.len(),
         design.penalties.len(),
-        1,
-        "s(x) should yield one penalty block"
+        "fitted smoothing-parameter count must match the design's penalty block count"
+    );
+    let n_penalty_blocks = design.penalties.len();
+    assert!(
+        n_penalty_blocks >= 1,
+        "s(x) must yield at least one roughness penalty block"
     );
 
     // Identify the penalized subspace: columns whose diagonal penalty weight is
     // non-trivial. These are the "high-order" / roughness-bearing coefficients
     // whose posterior must tighten as λ grows; the smooth's null space
     // (unpenalized polynomial part) is excluded from the shrinkage claim.
-    let unit_penalty = weighted_blockwise_penalty_sum(&design.penalties, &[1.0], p);
+    // Weight every block at unit λ so the reference penalty spans the full
+    // double-penalty layout (wiggliness + null-space ridge).
+    let unit_penalty =
+        weighted_blockwise_penalty_sum(&design.penalties, &vec![1.0; n_penalty_blocks], p);
     let penalized_cols: Vec<usize> = (0..p)
         .filter(|&j| unit_penalty[[j, j]].abs() > 1e-8)
         .collect();
@@ -282,7 +300,10 @@ fn gam_penalized_binomial_posterior_matches_pymc_and_concentrates_with_lambda() 
     let mut gam_eta_rmse: Vec<f64> = Vec::new();
 
     for &lam in &lambdas {
-        let s_lambda = weighted_blockwise_penalty_sum(&design.penalties, &[lam], p);
+        // Scale the full double-penalty layout by the scalar scan value, so
+        // `s_lambda == lam * unit_penalty` exactly (matching PyMC's `lam * PEN`).
+        let s_lambda =
+            weighted_blockwise_penalty_sum(&design.penalties, &vec![lam; n_penalty_blocks], p);
         let (mode, hessian) = penalized_logit_mode(&x_dense, &y_arr, &s_lambda);
 
         let res: NutsResult = run_nuts_sampling_flattened_family(

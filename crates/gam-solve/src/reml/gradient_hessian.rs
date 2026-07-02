@@ -436,6 +436,24 @@ impl<'a> RemlState<'a> {
             );
             return false;
         }
+        // Canonical-logit Firth fits have an exact Tierney-Kadane Hessian, but
+        // its skewness correction contains an O(n²) row-pair contraction.  Keep
+        // that exact curvature for small separation-rescue fits, where it is
+        // cheap and useful; for ordinary multi-thousand-row binomial GAMs keep
+        // the same Firth objective and analytic gradient while routing outer
+        // curvature to BFGS instead of spending minutes on one Hessian probe
+        // (#1575).
+        if reml_robust_jeffreys_link(&self.config).is_some()
+            && self.tk_correction_is_canonical_logit()
+            && !Self::firth_tk_exact_hessian_scale_allows(n_obs, p_dim)
+        {
+            log::info!(
+                "[standard-GAM] declining canonical-logit Firth exact outer Hessian for \
+                 n={n_obs} p={p_dim} (row-pair TK Hessian work n²·p exceeds budget); \
+                 routing to analytic-gradient BFGS"
+            );
+            return false;
+        }
         // The analytic outer Hessian for a Firth fit folds in the Tierney-Kadane
         // curvature, whose c/d/e/f derivative arrays are implemented only for the
         // canonical Binomial Logit jet. #758 widened Firth to other Binomial
@@ -449,6 +467,16 @@ impl<'a> RemlState<'a> {
             return false;
         }
         true
+    }
+
+    pub(crate) fn firth_tk_exact_hessian_scale_allows(n_obs: usize, p_coeff: usize) -> bool {
+        // Separate from `firth_problem_scale_allows`, which gates the O(n·p²)
+        // dense Firth operator used by the inner solve and gradient.  The exact
+        // TK Hessian-only path is O(n²·p) after the #1575 matvec hoist and needs
+        // its own budget.
+        const FIRTH_TK_EXACT_HESSIAN_MAX_ROW_PAIR_WORK: usize = 10_000_000;
+        n_obs.saturating_mul(n_obs).saturating_mul(p_coeff)
+            <= FIRTH_TK_EXACT_HESSIAN_MAX_ROW_PAIR_WORK
     }
 
     /// Whether the Tierney-Kadane outer correction (its value, ρ-gradient, and

@@ -769,7 +769,38 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
                 // λ_raw = λ̃ / ||S_raw,ℓ||_F, before the arbitrary Mellin
                 // ε_ℓ^(-2s0)·log_step gauge is folded into the fit-time forms.
                 {
-                    let mut penalty_cursor = design.random_effect_ranges.len();
+                    // Seed the penalty cursor the SAME way `build_model_summary`
+                    // does: PAST any leading shared `LinearTermRidge` block, then
+                    // advance by ONE per random-effect range ONLY when it owns a
+                    // penalty block (penalized AND non-empty). An unpenalized
+                    // `by`-factor main effect adds a random-effect range with NO
+                    // penalty block (`design_construction`/`term_design` skip it),
+                    // so counting it — as the old `random_effect_ranges.len()`
+                    // seed did — slid every following smooth's `[start..start+k]`
+                    // measure-jet penalty window off by one and read the wrong
+                    // per-scale λ (#1883). Likewise the leading `LinearTermRidge`
+                    // block must be stepped over so the first smooth's window is
+                    // not off by one when a penalized linear term is present.
+                    let mut penalty_cursor = design
+                        .penaltyinfo
+                        .iter()
+                        .take_while(|info| {
+                            matches!(
+                                &info.penalty.source,
+                                gam::basis::PenaltySource::Other(s) if s == "LinearTermRidge"
+                            )
+                        })
+                        .count();
+                    for (re_idx, (_re_name, re_range)) in
+                        design.random_effect_ranges.iter().enumerate()
+                    {
+                        let penalized = spec
+                            .random_effect_terms
+                            .get(re_idx)
+                            .map(|t| t.penalized)
+                            .unwrap_or(true);
+                        penalty_cursor += usize::from(penalized && !re_range.is_empty());
+                    }
                     for term in &design.smooth.terms {
                         let k = term.penalties_local.len();
                         let term_penalty_start = penalty_cursor;

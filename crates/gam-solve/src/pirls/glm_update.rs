@@ -5,6 +5,17 @@
 use super::*;
 use gam_problem::MIN_WEIGHT;
 
+#[inline]
+fn stable_logit_mu(eta: f64) -> f64 {
+    if eta >= 0.0 {
+        let z = (-eta).exp();
+        1.0 / (1.0 + z)
+    } else {
+        let z = eta.exp();
+        z / (1.0 + z)
+    }
+}
+
 pub fn update_glmvectors(
     y: ArrayView1<f64>,
     eta: &Array1<f64>,
@@ -79,20 +90,12 @@ pub fn update_glmvectors(
                 .zip(z_s.par_iter_mut())
                 .enumerate()
                 .for_each(|(i, ((mu_o, w_o), z_o))| {
-                    let eta_raw = eta[i];
-                    let eta_c = eta_raw.clamp(-ETA_CLAMP, ETA_CLAMP);
-                    let jet = logit_inverse_link_jet5(eta_c);
-                    let geom = bernoulli_logit_geometry_from_jet(
-                        eta_raw,
-                        eta_c,
-                        y[i],
-                        priorweights[i],
-                        jet,
-                        true,
-                    );
-                    *mu_o = geom.mu;
-                    *w_o = geom.weight;
-                    *z_o = geom.z;
+                    let eta_c = eta[i].clamp(-ETA_CLAMP, ETA_CLAMP);
+                    let mu = stable_logit_mu(eta_c);
+                    let fisher = mu * (1.0 - mu);
+                    *mu_o = mu;
+                    *w_o = priorweights[i] * fisher;
+                    *z_o = bernoulli_exact_working_response(eta_c, y[i], mu, fisher);
                 });
         }
         return Ok(());

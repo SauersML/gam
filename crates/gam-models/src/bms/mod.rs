@@ -2069,5 +2069,4 @@ pub(crate) use gradient_paths::{
 };
 pub(crate) use install_flex::{
     install_compiled_flex_block_into_runtime, project_monotone_feasible_beta,
-    validate_monotone_structural_feasible,
 };
