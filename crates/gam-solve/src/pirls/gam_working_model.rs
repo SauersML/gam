@@ -1123,14 +1123,26 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         beta: &Coefficients,
         curvature: HessianCurvatureKind,
     ) -> Result<WorkingState, EstimationError> {
-        if !self.firth_bias_reduction {
-            return self.update_with_curvature(beta, curvature);
-        }
-        let firth_enabled = self.firth_bias_reduction;
-        self.firth_bias_reduction = false;
-        let result = self.update_with_curvature(beta, curvature);
-        self.firth_bias_reduction = firth_enabled;
-        result
+        // The LM line-search candidate MUST be built with the SAME objective the
+        // accepted state and `current_penalized` use — i.e. with Firth active
+        // when `firth_bias_reduction` is set. Previously this method transiently
+        // disabled Firth while building the candidate, so the candidate's
+        // `WorkingState.firth` came back `Inactive` and
+        // `CandidateEvaluation::penalized_objective` dropped the `−2·½log|XᵀWX|`
+        // Jeffreys term for the candidate while `current_penalized` (built with
+        // Firth) kept it. The line search then compared a Firth objective against
+        // a non-Firth one, and — because the accepted state IS the candidate
+        // state (`final_state = accepted_state`) and convergence is certified on
+        // `accepted_state.gradient` — the inner solve converged on the ordinary
+        // penalized-MLE stationarity `∇(−ℓ+½βᵀSβ)=0` instead of the
+        // Firth-penalized stationarity `∇(−ℓ+½βᵀSβ)−∇Φ=0`. The returned β̂ then
+        // sat at the WRONG mode, breaking the outer LAML envelope identity
+        // (the dense path carries no KKT-residual correction), so the analytic
+        // smoothing-selection gradient disagreed with the finite difference of
+        // the cost for every Firth fit routed through the LM line search
+        // (gam#1821). Keep Firth active for the candidate so the whole line
+        // search optimizes one coherent Firth-penalized objective.
+        self.update_with_curvature(beta, curvature)
     }
 
     fn screen_candidate(

@@ -1022,13 +1022,40 @@ where
     // direction at small `n` that the scale-free relative ratio alone would miss
     // — we fall through to the floored log-det term below, the `O(1)`-bounding
     // curvature this machinery exists to supply.
-    let gate_weight = {
-        let lambda_min = evals.iter().cloned().fold(f64::INFINITY, f64::min);
-        conditioning_gate_weight(lambda_min, lambda_max)
-    };
+    let lambda_min = evals.iter().cloned().fold(f64::INFINITY, f64::min);
+    let gate_weight = conditioning_gate_weight(lambda_min, lambda_max);
     if gate_weight == 0.0 {
         return Ok((0.0, Array1::zeros(p), Array2::zeros((p, p))));
     }
+    // Conditioning-gate mode motion (gam#1821). `Φ = G·U` with `G =
+    // conditioning_gate_weight(λ_min(β), λ_max(β))`. Because `λ_min, λ_max` move
+    // with β through the inner mode, the β-gradient of `Φ` is
+    //   ∂Φ/∂β_k = G·∂U/∂β_k + (∂G/∂β_k)·U,
+    // with `∂G/∂β_k = G'_min·(Ṽ_k)_{min,min} + G'_max·(Ṽ_k)_{max,max}`. The atom's
+    // `frozen_d1` supplies the first (gate-frozen) term; the gate-motion term
+    // `(∂G/∂β_k)·U` is added below. Dropping it left the inner joint-Newton
+    // certifying stationarity of a DIFFERENT objective than the gate-aware value
+    // the outer LAML folds, so β̂ settled off the gated-Φ mode whenever the gate
+    // sat in its smooth transition band — breaking the outer envelope identity
+    // and biasing smoothing selection (the residual over-smoothing on Firth
+    // custom-family fits, e.g. multinomial smooth-by-factor). This mirrors the
+    // gate-aware explicit-parameter derivative `joint_jeffreys_phi_explicit_param_derivative`
+    // and the floor-response fix already applied to the eigenvalue drift.
+    let (gate_grad_min, gate_grad_max) = conditioning_gate_weight_grad(lambda_min, lambda_max);
+    let gate_motion_active = gate_grad_min != 0.0 || gate_grad_max != 0.0;
+    let (idx_min_gate, idx_max_gate) = {
+        let mut lo = 0usize;
+        let mut hi = 0usize;
+        for i in 1..m {
+            if evals[i] < evals[lo] {
+                lo = i;
+            }
+            if evals[i] > evals[hi] {
+                hi = i;
+            }
+        }
+        (lo, hi)
+    };
     // Absolute floor relative to the dominant identified curvature: negligible on
     // identified directions (O(n)), positive on separating ones.
     let floor = (REDUCED_INFO_RELATIVE_FLOOR * lambda_max).max(REDUCED_INFO_ABSOLUTE_FLOOR);
@@ -1152,6 +1179,10 @@ where
     };
     let mut reduced_drift: HashMap<usize, Arc<Array2<f64>>> = HashMap::with_capacity(p);
     let mut floor_drift: HashMap<usize, f64> = HashMap::new();
+    // Per-axis conditioning-gate mode motion `∂G/∂β_k` (see the gate block above).
+    // Empty when the gate is saturated (`∂G = 0`), so a clean/fully-active fit is
+    // byte-unchanged.
+    let mut gate_dot: HashMap<usize, f64> = HashMap::new();
     for (k, hdot) in hdots.into_iter().enumerate() {
         // Reduced derivative D_k = Z_J^T Hdot Z_J (m x m), rotated into the
         // eigenbasis: Ṽ_k = Vᵀ D_k V.
@@ -1164,6 +1195,15 @@ where
         if let Some(idx_max) = lambda_max_idx {
             let dlambda_max = a_k[[idx_max, idx_max]]; // v_maxᵀ D_k v_max
             floor_drift.insert(k, REDUCED_INFO_RELATIVE_FLOOR * dlambda_max);
+        }
+        if gate_motion_active {
+            // ∂G/∂β_k = G'_min·(Ṽ_k)_{min,min} + G'_max·(Ṽ_k)_{max,max}, the
+            // first-order eigenvalue-perturbation motion of the gate arguments.
+            gate_dot.insert(
+                k,
+                gate_grad_min * a_k[[idx_min_gate, idx_min_gate]]
+                    + gate_grad_max * a_k[[idx_max_gate, idx_max_gate]],
+            );
         }
         reduced_drift.insert(k, Arc::new(a_k));
     }
@@ -1178,6 +1218,13 @@ where
             min_relative_eigengap: 0.0,
         },
     };
+    // Ungated Jeffreys log-volume `U = ½ Σ_i g(λ_i; floor)` (the value without the
+    // gate factor), the multiplier on the gate-motion term `(∂G/∂β_k)·U`.
+    let phi_ungated = 0.5
+        * evals
+            .iter()
+            .map(|&lam| jeffreys_antiderivative(lam, floor))
+            .sum::<f64>();
     for k in 0..p {
         let dir = super::atoms::ThetaDirection {
             index: Some(k),
@@ -1185,6 +1232,9 @@ where
             h_dot_total: None,
         };
         grad[k] = super::atoms::CriterionAtom::frozen_d1(&gradient_atom, &dir);
+        if let Some(&gate_dot_k) = gate_dot.get(&k) {
+            grad[k] += gate_dot_k * phi_ungated;
+        }
     }
     // EXACT Jeffreys curvature on the floored spectrum (gam#979), now emitted
     // by the same atom that emitted `phi` and `grad`. The penalized objective is

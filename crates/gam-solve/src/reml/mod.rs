@@ -1749,6 +1749,65 @@ mod tests {
         assert!(efs.cost.is_finite(), "efs cost={}", efs.cost);
     }
 
+    /// Regression for gam#1821: the analytic ρ-gradient of the Firth-corrected
+    /// LAML cost must equal the central finite difference of that SAME cost,
+    /// evaluated END-TO-END through the inner P-IRLS solve (`compute_cost` /
+    /// `compute_gradient`), for a genuinely Firth-active (near-separable) fit.
+    ///
+    /// This exercises the branch the earlier operator-level Firth FD tests never
+    /// touched: the LM line-search that produces β̂. The dense LAML gradient uses
+    /// the envelope identity, which holds ONLY when β̂ satisfies the *Firth*-KKT
+    /// stationarity `∇(−ℓ+½βᵀSβ) = ∇Φ`. When `GamWorkingModel::update_candidate`
+    /// built line-search candidates with Firth disabled, the candidate/accepted
+    /// `WorkingState` dropped the `−2·½log|XᵀWX|` Jeffreys term, the objective
+    /// the line search compared (candidate vs `current_penalized`) was
+    /// inconsistent, and — because the accepted state IS the candidate and
+    /// convergence is certified on `accepted_state.gradient` — the inner solve
+    /// settled at the ordinary penalized MLE (`∇(−ℓ+½βᵀSβ)=0`) instead. At that
+    /// wrong mode the envelope breaks and the analytic ρ-gradient disagrees with
+    /// the FD of the cost by `O((∇Φ)ᵀ∂β̂/∂ρ)` — a large (percent-level) desync
+    /// that appears ONLY under `firth_bias_reduction`. A tight FD-vs-analytic
+    /// bound therefore fails iff the inner solve regresses off the Firth mode.
+    #[test]
+    pub(crate) fn firth_logit_rho_gradient_matches_finite_difference_through_inner_solve() {
+        // Near-separable n=3 logit: Firth is materially active (the ordinary
+        // penalized MLE and the Firth-penalized mode differ enough that any
+        // envelope break shows up far above the 1e-4 tolerance).
+        let x = array![[1.0, -6.0], [1.0, 0.2], [1.0, 5.8]];
+        let y = array![0.0, 0.0, 1.0];
+        let w = Array1::<f64>::ones(y.len());
+        // Full-rank identity penalty on both coefficients (single ρ).
+        let s0 = array![[1.0, 0.0], [0.0, 1.0]];
+        // Tight inner tolerance so β̂(ρ ± δ) and β̂(ρ) are all at the converged
+        // Firth-KKT mode; otherwise the FD would capture β̂'s residual motion.
+        let cfg = RemlConfig::external(binomial_logit_glm_spec(), 1e-12, true);
+        let state = build_logit_state(&y, &w, &x, &s0, &cfg);
+        let delta = 1e-4_f64;
+        for &rho in &[-0.6_f64, -0.3, 0.0, 0.3, 0.6] {
+            let r = array![rho];
+            let analytic = state
+                .compute_gradient(&r)
+                .expect("Firth LAML ρ-gradient should evaluate")[0];
+            let cost_plus = state
+                .compute_cost(&array![rho + delta])
+                .expect("Firth LAML cost(ρ+δ) should evaluate");
+            let cost_minus = state
+                .compute_cost(&array![rho - delta])
+                .expect("Firth LAML cost(ρ−δ) should evaluate");
+            let fd = (cost_plus - cost_minus) / (2.0 * delta);
+            let rel = (fd - analytic).abs() / fd.abs().max(1e-3);
+            assert!(
+                analytic.is_finite() && fd.is_finite(),
+                "non-finite Firth ρ-gradient at rho={rho:+.3}: fd={fd:+.6e}, analytic={analytic:+.6e}"
+            );
+            assert!(
+                rel < 1e-4,
+                "Firth ρ-gradient FD desync at rho={rho:+.3}: fd={fd:+.6e}, analytic={analytic:+.6e}, rel={rel:.3e} (>= 1e-4). \
+                 The inner P-IRLS likely converged off the Firth-KKT mode (gam#1821)."
+            );
+        }
+    }
+
     #[test]
     pub(crate) fn firth_logit_directional_hypergradient_accepts_design_moving_with_full_tk_gradient()
      {

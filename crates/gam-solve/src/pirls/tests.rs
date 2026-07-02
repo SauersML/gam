@@ -2429,11 +2429,13 @@ mod root_cause_tests {
             curvature: HessianCurvatureKind,
         ) -> Result<WorkingState, EstimationError> {
             // Production firth `update_candidate` evaluates the candidate
-            // through `update_with_curvature` (with Firth temporarily disabled)
-            // rather than via a separate cheap screen: since the candidate
-            // screening split landed, the firth accepted-state re-evaluation is
-            // folded into this single call instead of running as a distinct
-            // post-acceptance phase. Mirror that here so the injected
+            // through `update_with_curvature` (with Firth ACTIVE, so the
+            // candidate/accepted objective carries the Jeffreys `−2·½log|XᵀWX|`
+            // term consistently with `current_penalized`; gam#1821) rather than
+            // via a separate cheap screen: since the candidate screening split
+            // landed, the firth accepted-state re-evaluation is folded into this
+            // single call instead of running as a distinct post-acceptance
+            // phase. Mirror that here so the injected
             // candidate-evaluation failure actually surfaces through the LM
             // loop, which must bound the retries instead of looping or silently
             // accepting a non-stationary state.
