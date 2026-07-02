@@ -15,6 +15,7 @@ from torch.optim import Optimizer
 from .._binding import rust_module
 from .._penalty_bridge import (
     GumbelTemperatureSchedule,
+    fixed_weight_schedule as _fixed_weight_schedule,
     ard_descriptor,
     block_orthogonality_descriptor,
     call_rust_value_grad as _call_rust_value_grad,
