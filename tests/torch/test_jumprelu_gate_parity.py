@@ -41,9 +41,15 @@ def test_jumprelu_gate_gradcheck() -> None:
     """
     torch.manual_seed(0)
     rows, cols = 4, 6
-    logits = torch.randn(rows, cols, dtype=torch.float64, requires_grad=True)
-    thresholds = torch.randn(cols, dtype=torch.float64, requires_grad=True)
     temperature = 0.37
+    # Keep every logit clear of its threshold so the finite-difference probe
+    # never straddles the hard ``1[l > θ]`` jump (the STE surrogate is smooth;
+    # the returned value is not). Thresholds are positive; logits sit a full
+    # unit above them.
+    thresholds = torch.rand(cols, dtype=torch.float64, requires_grad=True)
+    logits = (
+        thresholds.detach() + 1.0 + torch.rand(rows, cols, dtype=torch.float64)
+    ).requires_grad_(True)
 
     assert torch.autograd.gradcheck(
         lambda x, t: jumprelu_bounded_gate(x, t, temperature),

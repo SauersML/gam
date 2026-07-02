@@ -171,7 +171,7 @@ def test_rust_value_matches_internal_helper_for_ard() -> None:
     if schedule is not None:
         descriptor["weight_schedule"] = schedule
 
-    value_t, _, _ = _call_rust_value_grad(
+    value_t, _, _, _ = _call_rust_value_grad(
         latent,
         rho,
         _latent_json(latent.shape[0], latent.shape[1], name="t"),
@@ -206,7 +206,7 @@ def test_rust_value_matches_internal_helper_for_isometry() -> None:
     rho = torch.full((1,), float(np.log(module.weight)), dtype=latent.dtype)
     jacobian = basis.unsqueeze(0).expand(latent.shape[0], -1, -1).reshape(latent.shape[0], -1)
 
-    value_t, _, _ = _call_rust_value_grad(
+    value_t, _, _, _ = _call_rust_value_grad(
         latent,
         rho,
         _latent_json(latent.shape[0], latent.shape[1], name="t"),
