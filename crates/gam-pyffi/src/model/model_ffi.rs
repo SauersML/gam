@@ -5108,13 +5108,6 @@ fn gaussian_reml_fit_with_constraints_backward<'py>(
     grad_reml_score: f64,
     grad_edf: f64,
 ) -> PyResult<Py<PyDict>> {
-    if let Some(b) = b_inequality.as_ref() {
-        if b.as_array().iter().any(|value| value.abs() > 0.0) {
-            return Err(py_value_error(
-                "gaussian_reml_fit_with_constraints_backward supports only zero-bound inequality certificates".to_string(),
-            ));
-        }
-    }
     if let Some(coefficients) = coefficients_at_optimum.as_ref() {
         let coeffs = coefficients.as_array();
         if coeffs.nrows() != x.as_array().ncols() || coeffs.ncols() != y.as_array().ncols() {
@@ -5151,6 +5144,27 @@ fn gaussian_reml_fit_with_constraints_backward<'py>(
     let is_interior = active_empty || no_constraints;
 
     if !is_interior {
+        // The tangent reparametrisation `β = Z γ`, `Z = null(A_act)` below
+        // encodes the *homogeneous* active face `A_act β̂ = 0`. A non-zero
+        // active bound `b_act` shifts the face to the affine set
+        // `A_act β̂ = b_act` (β̂ = β_particular + Z γ̂), which this reduced
+        // backward does not model. Guard exactly the rows that enter the
+        // reparametrisation — the active ones — rather than every bound:
+        // an interior cert (handled below) never touches `b`, so a slack
+        // constraint with a non-zero bound is perfectly admissible there.
+        if let (Some(b), Some(active)) = (b_inequality.as_ref(), active_indices.as_ref()) {
+            let b_view = b.as_array();
+            for &idx in active.as_array().iter() {
+                let idx = idx as usize;
+                if b_view.get(idx).is_some_and(|value| value.abs() > 0.0) {
+                    return Err(py_value_error(
+                        "gaussian_reml_fit_with_constraints_backward supports only \
+                         zero-bound inequality certificates on the active face"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
         // Active cert: tangent-projected envelope-theorem VJP.
         //
         // At the active cert the equality constraints `A_act β̂ = 0` confine
