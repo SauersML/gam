@@ -800,6 +800,7 @@ mod smoothness_dof_hutchinson_tests {
 // ============================================================================
 #[cfg(test)]
 mod step2_quotient_scale_tests {
+    use crate::manifold::SaeManifoldTerm;
     use crate::manifold::tests::small_two_atom_periodic_term;
 
     fn frob(b: &ndarray::Array2<f64>) -> f64 {
