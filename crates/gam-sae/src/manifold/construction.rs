@@ -1710,7 +1710,9 @@ impl SaeManifoldTerm {
     /// must enter the Laplace evidence dimension accounting (evidence honesty):
     /// the profiled frame is a MAP point on `∏_k Gr(r_k, p)`, contributing this
     /// many free dimensions to the model. `0` when every atom is on the full-`B`
-    /// path. Threaded into [`Self::reml_occam_term`].
+    /// path. Counted (unscaled by `log λ`) in the effective decoder-parameter dof
+    /// of `reconstruction_dispersion`; it does NOT enter the `log λ`-scaled
+    /// smoothing Occam normalizer (the frame orientation is unpenalized by `λ`).
     pub fn grassmann_evidence_dimension(&self) -> usize {
         self.atoms
             .iter()
@@ -7424,52 +7426,53 @@ impl SaeManifoldTerm {
     }
 
     /// Smoothing-penalty Occam normalizer `−½ Σ_k r_k·rank(S_k)·log λ_smooth`
-    /// PLUS the profiled-frame evidence-dimension term `½ Σ_k r_k·(p−r_k)·log
-    /// λ_smooth` (issue #972).
+    /// (issue #972; #1556 per-atom λ).
     ///
-    /// On the full-`B` path every atom's frame rank `r_k == p`, so the first
-    /// piece reduces to the historical `½ p·(Σ rank S_k)·log λ_smooth` and the
-    /// Grassmann term is zero — bit-for-bit unchanged. When a frame is active the
-    /// decoder coordinates `C_k` carry the `⊗ I_{r_k}` Kronecker structure (the
-    /// smoothing penalty `S_k` now acts on `r_k` channels, not `p`), so the
-    /// penalty-logdet normalizer uses `r_k·rank(S_k)`; and the `r_k·(p−r_k)`
-    /// frame degrees of freedom profiled OUT of the border are counted explicitly
-    /// in the Laplace dimension accounting (evidence honesty) so the criterion
-    /// cannot buy a free evidence boost by hiding decoder freedom in the frame.
+    /// This is the `log λ`-dependent part of the penalty log-determinant
+    /// `−½ log|λ_k S_k|_+` summed over the `r_k` penalized decoder channels: the
+    /// `S_k` roughness penalty acts on `r_k` coordinate channels (`r_k == p` on
+    /// the full-`B` path, the smaller frame rank when a Grassmann frame is
+    /// active), each contributing `rank(S_k)` penalized directions, so the
+    /// `λ_k`-normalizer is `½ r_k·rank(S_k)·log λ_k`.
+    ///
+    /// The profiled frame ORIENTATION `U_k` is NOT penalized by `λ_k` — the
+    /// isotropic `⊗ I_{r_k}` penalty is invariant to rotating the frame, so the
+    /// `r_k(p−r_k)` Grassmann directions are flat directions of the penalty and
+    /// their Laplace curvature comes from the DATA fit, carrying NO `log λ_k`
+    /// dependence. The historical `−½ r_k(p−r_k)·log λ_k` "frame evidence
+    /// dimension" term therefore attached a `log λ_k` factor to a
+    /// λ-INDEPENDENT geometric dimension (e.g. `p=896, r=1, rank S=1`:
+    /// `0.5·(1−895)=−447`, i.e. `+447·log λ` pushed into the smoothing selection
+    /// from an unpenalized orientation) and is dropped. On the full-`B` path
+    /// `r_k == p` so `frame_dim = r_k(p−r_k) = 0` and this is bit-for-bit
+    /// unchanged; only frame-active fits change, toward the correct normalizer.
+    /// A genuine frame-orientation evidence correction, if wanted, is a SEPARATE
+    /// (λ-independent) Laplace term built from the actual frame Hessian.
     pub(crate) fn reml_occam_term(&self, rho: &SaeManifoldRho) -> Result<f64, String> {
-        // #1556: λ_smooth is per-atom, so the Occam penalty normalizer and the
-        // profiled-frame evidence-dimension term are both per-atom sums, each
-        // atom `k` weighted by its own `log λ_smooth[k]`. With a uniform
-        // (broadcast) vector this is bit-for-bit the historical global form.
         let mut acc = 0.0_f64;
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
             let rank_s = Self::symmetric_rank(&atom.smooth_penalty)?;
             // Penalized decoder dimension: `r_k` coordinate channels carry the
             // `S_k` roughness penalty (full-`B` path ⇒ `r_k == p`).
             let penalized_channel_dim = atom.border_frame_rank() * rank_s;
-            // Profiled Grassmann dimensions enter the Laplace evidence dimension
-            // count with the OPPOSITE sign of the penalty Occam term (they are
-            // free, unpenalized-by-`S` profiled directions), so `−occam` adds
-            // `+½ r(p−r) log λ_k` to the criterion `V` — the honesty correction.
-            let frame_dim = atom.frame_manifold_dimension();
             let log_lambda = rho.log_lambda_smooth[atom_idx];
-            acc += 0.5 * ((penalized_channel_dim as f64) - (frame_dim as f64)) * log_lambda;
+            acc += 0.5 * (penalized_channel_dim as f64) * log_lambda;
         }
-        // `V = … − occam`, so the net occam SUBTRACTS the penalty normalizer and
-        // ADDS the frame-dimension count after the caller's `− occam`.
+        // `V = … − occam`, so the net occam SUBTRACTS the penalty normalizer.
         Ok(acc)
     }
 
     /// Per-atom derivative `∂(occam)/∂log λ_smooth[k]` (#1556): atom `k`'s entry
-    /// is `½·(r_k·rank(S_k) − frame_dim_k)`, matching the per-atom Occam term in
-    /// [`Self::reml_occam_term`]. Returns one entry per atom in atom order.
+    /// is `½·r_k·rank(S_k)`, matching the per-atom Occam term in
+    /// [`Self::reml_occam_term`] (the unpenalized-frame `frame_dim` term carries
+    /// no `log λ` dependence and is therefore absent from both). Returns one
+    /// entry per atom in atom order.
     pub(crate) fn reml_occam_log_lambda_smooth_derivative(&self) -> Result<Vec<f64>, String> {
         let mut out = Vec::with_capacity(self.atoms.len());
         for atom in &self.atoms {
             let rank_s = Self::symmetric_rank(&atom.smooth_penalty)?;
             let penalized_channel_dim = atom.border_frame_rank() * rank_s;
-            let frame_dim = atom.frame_manifold_dimension();
-            out.push(0.5 * ((penalized_channel_dim as f64) - (frame_dim as f64)));
+            out.push(0.5 * (penalized_channel_dim as f64));
         }
         Ok(out)
     }
@@ -9118,28 +9121,34 @@ impl SaeManifoldTerm {
                 }
             }
         } else {
-            let mut cursor = 1 + rho.log_lambda_smooth.len();
+            // ARD coordinate `j`. `ard_flat_index` maps `(atom, axis)` onto the
+            // flat coordinate for both parameterizations; a shared axis is owned
+            // by SEVERAL atoms, and the RHS for that one outer coordinate is the
+            // SUM of each owning atom's `∂g/∂log α_{atom,axis}` block (chain rule
+            // through the broadcast). Those blocks land in disjoint per-atom row
+            // slots of `t`, so accumulate every matching atom rather than
+            // returning on the first. In `PerAtom` mode exactly one `(atom, axis)`
+            // matches, reproducing the historical single-atom RHS.
             for atom in 0..rho.log_ard.len() {
                 for axis in 0..rho.log_ard[atom].len() {
-                    if cursor == j {
-                        let alpha = SaeManifoldRho::stable_exp_strength(rho.log_ard[atom][axis]);
-                        let periods = self.assignment.coords[atom].effective_axis_periods();
-                        for row in 0..self.n_obs() {
-                            let row_t = self.assignment.coords[atom].row(row);
-                            let prior = ArdAxisPrior::eval(alpha, row_t[axis], periods[axis]);
-                            let Some(pos) = sae_coord_penalty_offset(
-                                self.last_row_layout.as_ref(),
-                                self.assignment.coord_offsets()[atom] + axis,
-                                row,
-                                atom,
-                            ) else {
-                                continue;
-                            };
-                            t[cache.row_offsets[row] + pos] = prior.grad;
-                        }
-                        return Ok(SaeArrowVector { t, beta });
+                    if rho.ard_flat_index(atom, axis) != j {
+                        continue;
                     }
-                    cursor += 1;
+                    let alpha = SaeManifoldRho::stable_exp_strength(rho.log_ard[atom][axis]);
+                    let periods = self.assignment.coords[atom].effective_axis_periods();
+                    for row in 0..self.n_obs() {
+                        let row_t = self.assignment.coords[atom].row(row);
+                        let prior = ArdAxisPrior::eval(alpha, row_t[axis], periods[axis]);
+                        let Some(pos) = sae_coord_penalty_offset(
+                            self.last_row_layout.as_ref(),
+                            self.assignment.coord_offsets()[atom] + axis,
+                            row,
+                            atom,
+                        ) else {
+                            continue;
+                        };
+                        t[cache.row_offsets[row] + pos] += prior.grad;
+                    }
                 }
             }
         }

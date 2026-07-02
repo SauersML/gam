@@ -1181,6 +1181,59 @@ class ManifoldSAE:
             and np.array_equal(x, td)
         )
 
+    def build_encode_atlas(
+        self,
+        *,
+        amplitude_bounds: Any | None = None,
+        target_norm_bound: float | None = None,
+        grid_resolution: int = 32,
+        ridge: float = 1.0e-10,
+        newton_steps: int = 8,
+    ) -> Any:
+        """Build the frozen-dictionary Kantorovich-certified encode atlas (#1010).
+
+        Returns the Rust ``SaeEncodeAtlas``. Its
+        ``certified_encode(X, amplitudes, atom_index)`` exposes the per-row
+        ``h <= 1/2`` Newton-Kantorovich certificate directly — the honesty signal
+        an amortized encoder reads INSTEAD of a cold exact multi-start probe per
+        row (:meth:`converged_latents`). Rows that fail the certificate are
+        flagged (``certified[i] is False``) and must be routed to that exact
+        fallback; no approximation enters silently.
+
+        This is a thin marshalling wrapper (SPEC: math lives in Rust): it hands
+        the frozen decoder blocks + basis metadata to the FFI, which reconstructs
+        the atoms with live analytic evaluators and lays down the certified charts.
+
+        ``amplitude_bounds[k]`` bounds ``|z_k|`` and ``target_norm_bound`` bounds
+        ``||x||`` over the encode data; both scale the offline Hessian-Lipschitz
+        constant, so a larger bound only shrinks the certified radius (never a
+        false certificate). When omitted they default to the trained assignment
+        magnitudes and the training-row norms, respectively.
+        """
+        if amplitude_bounds is None:
+            amp = np.abs(np.asarray(self.assignments, dtype=float))
+            amplitude_bounds = [
+                float(amp[:, k].max()) if amp.shape[0] else 1.0
+                for k in range(len(self._atom_dims))
+            ]
+        if target_norm_bound is None:
+            td = np.asarray(self.training_data, dtype=float)
+            target_norm_bound = (
+                float(np.max(np.sqrt(np.sum(td * td, axis=1)))) if td.size else 1.0
+            )
+        return rust_module().build_sae_encode_atlas(
+            list(self._basis_kinds),
+            list(self._atom_dims),
+            [np.ascontiguousarray(b) for b in self.decoder_blocks],
+            [None if c is None else np.ascontiguousarray(c) for c in self._duchon_centers],
+            [int(s) for s in self._basis_sizes],
+            [float(a) for a in amplitude_bounds],
+            float(target_norm_bound),
+            grid_resolution=int(grid_resolution),
+            ridge=float(ridge),
+            newton_steps=int(newton_steps),
+        )
+
     def reconstruct(self, X: Any, *, t_init: Any = None, a_init: Any = None) -> np.ndarray:
         x = _as_2d_float(X, "X")
         if t_init is None and a_init is None and self._is_training_data(x):

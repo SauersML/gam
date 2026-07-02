@@ -312,30 +312,55 @@ pub fn conformal_factor(p: ArrayView1<'_, f64>, curvature: f64) -> GeometryResul
 /// the Poincaré ball — the hyperbolic analogue of the flat
 /// `∫ Φ'(t)ᵀ Φ'(t) dt` patch penalty.
 ///
-/// The atom's latent coordinate `t_n ∈ ℝ^d` is read as a *tangent vector at the
-/// ball origin*; its ball point is `p_n = exp₀(t_n)` (the wrapped / tangent
-/// parameterisation of Nagano et al. 2019, Mathieu et al. 2019). For a decoded
-/// field `f(t) = β·Φ(t)` the hyperbolic Dirichlet energy is
+/// The atom's latent coordinate `t_n ∈ ℝ^d` is a *tangent vector at the ball
+/// origin*; its ball point is `p_n = exp₀(t_n)` (the wrapped / tangent
+/// parameterisation of Nagano et al. 2019, Mathieu et al. 2019), and the
+/// penalised field `f(t) = β·Φ(t)` is a function of that tangent coordinate. The
+/// hyperbolic Dirichlet energy is the coordinate-invariant
 ///
 /// ```text
-/// E_g[f] = ∫ gᵃᵇ ∂_a f ∂_b f dμ_g
-///        = ∫ λ(p)^{d−2} ‖∇_t f‖² dt           (g_ab = λ² δ_ab, dμ_g = λ^d dt)
+/// E_g[f] = ∫ gᵃᵇ ∂_a f ∂_b f dμ_g .
 /// ```
 ///
-/// with `λ(p) = 2 / (1 + c‖p‖²)` the conformal factor ([`conformal_factor`],
-/// `c < 0`). Discretising the integral against the empirical row density gives
-/// the coefficient-space Gram
+/// The ball metric is conformal, `g_ab(p) = λ(p)² δ_ab` with
+/// `λ(p) = 2 / (1 + c‖p‖²)` ([`conformal_factor`], `c < 0`), so *in ball
+/// coordinates `p`* the energy is `∫ λ(p)^{d−2} ‖∇_p f‖² dp`. But `Φ` and its
+/// jet are parameterised by the tangent coordinate `t`, **not** by `p`, and
+/// `p = exp₀(t)` is not conformal (it is radial-only: `‖p‖ = tanh(√k‖t‖)/√k`,
+/// so it scales the radial and angular directions by different factors). We must
+/// therefore integrate against the *pullback* metric on tangent space,
+/// `h(t) = J(t)ᵀ λ(p)² J(t)` with `J = ∂p/∂t = D exp₀(t)`:
 ///
 /// ```text
-/// S = Σ_n w_n Φ'(t_n)ᵀ Φ'(t_n),   w_n = λ(p_n)^{d−2},
+/// E_g[f] = ∫ √det h · ∇_t fᵀ h⁻¹ ∇_t f dt ,
 /// ```
-/// which this function assembles from the basis first-derivative jet
+/// giving the coefficient-space Gram
+///
+/// ```text
+/// S = Σ_n Φ'(t_n)ᵀ G(t_n) Φ'(t_n),   G(t) = √det h · h⁻¹  (d×d, SPD),
+/// ```
+/// assembled from the basis first-derivative jet
 /// `basis_jacobian[n, k, a] = ∂Φ_k/∂t_a (t_n)` and the latent coordinates
-/// `coords[n, a] = t_{n,a}`. The flat patch is the `c → 0⁻` / `d = 2` limit
-/// where `w_n ≡ 1` (2-D Dirichlet energy is conformally invariant), so the
-/// hyperbolic penalty differs from the Euclidean one exactly when the data has
-/// the boundary-concentrated (exponential-volume) structure hyperbolic geometry
-/// is for. The returned Gram is symmetric PSD by construction.
+/// `coords[n, a] = t_{n,a}`.
+///
+/// `D exp₀(t)` has the closed spectral form `e_t (I − t̂t̂ᵀ) + e_r t̂t̂ᵀ` with
+/// tangential eigenvalue `e_t = tanh(s)/s` (multiplicity `d−1`) and radial
+/// eigenvalue `e_r = sech²(s)`, `s = √k‖t‖`, `t̂ = t/‖t‖`. With `λ = 2 cosh²(s)`
+/// (`= conformal_factor(exp₀(t))`) the metric weight is diagonal in that same
+/// eigenbasis,
+///
+/// ```text
+/// G(t) = λ^{d−2} [ e_t^{d−3} e_r (I − t̂t̂ᵀ) + e_t^{d−1} e_r⁻¹ t̂t̂ᵀ ],
+/// ```
+/// which is anisotropic for `d ≠` the isotropic point and reduces to the flat
+/// patch only in the `‖t‖ → 0` limit (`G → 2^{d−2} I`). For `d = 2` this is the
+/// closed-form pullback of `4 dr² + sinh²(2r) dθ²` (`r = ‖t‖`, `c = −1`), **not**
+/// the flat tangent-coordinate Dirichlet Gram — that flat form (the old
+/// implementation) conflated ball and tangent charts. For `d = 1` the manifold
+/// is intrinsically flat but the tangent coordinate runs at half arc-length
+/// (`geodesic dist = 2‖t‖`), so `G ≡ 1/2` exactly. The returned Gram is
+/// symmetric PSD by construction (`G` is SPD: eigenvalues `λ^{d−2} e_t^{d−3} e_r`
+/// and `λ^{d−2} e_t^{d−1} e_r⁻¹` are all positive).
 ///
 /// `curvature` must be strictly negative. Returns the `(M, M)` Gram, `M` the
 /// number of basis columns.
@@ -344,7 +369,7 @@ pub fn conformal_dirichlet_penalty(
     basis_jacobian: ndarray::ArrayView3<'_, f64>,
     curvature: f64,
 ) -> GeometryResult<Array2<f64>> {
-    require_negative_curvature(curvature)?;
+    let sqrt_negc = require_negative_curvature(curvature)?;
     let n = coords.nrows();
     let d = coords.ncols();
     let jet_shape = basis_jacobian.shape();
@@ -367,18 +392,46 @@ pub fn conformal_dirichlet_penalty(
     if n == 0 || m == 0 {
         return Ok(gram);
     }
-    let exponent = d as f64 - 2.0;
+    // Dimension-derived exponents for the diagonal metric weight G(t) (see the
+    // doc comment): the isotropic coefficient carries λ^{d−2}·e_t^{d−3}·e_r, the
+    // radial coefficient λ^{d−2}·e_t^{d−1}/e_r.
+    let e_iso = d as i32 - 2; // λ power
+    let e_perp = d as i32 - 3; // e_t power on the perpendicular block
+    let e_rad = d as i32 - 1; // e_t power on the radial block
     let mut grad = vec![0.0_f64; m];
+    let mut proj = vec![0.0_f64; m]; // Φ'(t)·t̂, the radial gradient component
     for row in 0..n {
-        // Ball point p_n = exp₀(t_n) and its conformal weight w_n = λ(p_n)^{d−2}.
-        let p = exp_origin(coords.row(row), curvature)?;
+        let t = coords.row(row);
+        let norm = t.iter().map(|x| x * x).sum::<f64>().sqrt();
+        // Ball point and conformal factor λ = 2 cosh²(s) via the single-source
+        // primitives (their boundary clamp keeps λ finite for atoms driven to
+        // the rim).
+        let p = exp_origin(t, curvature)?;
         let lambda = conformal_factor(p.view(), curvature)?;
-        let w = lambda.powf(exponent);
-        if !(w.is_finite() && w > 0.0) {
+        // Eigenvalues of D exp₀(t). Cap s at EXP_SATURATION_CAP — the same rim
+        // clamp exp_origin applies — so cosh/tanh stay finite and e_r > 0 (the
+        // metric never degenerates); coords from a projected atom already
+        // satisfy s ≤ EXP_SATURATION_CAP.
+        let s = sqrt_negc * norm;
+        let (e_t, e_r) = if s <= ORIGIN_EPS {
+            // D exp₀(0) = I: the eigenvalues coincide, the radial block below is
+            // switched off (its coefficient vanishes), and G → λ^{d−2} I.
+            (1.0, 1.0)
+        } else {
+            let s_c = s.min(EXP_SATURATION_CAP);
+            let cosh_sc = s_c.cosh();
+            (s_c.tanh() / s_c, 1.0 / (cosh_sc * cosh_sc))
+        };
+        let lam_pow = lambda.powi(e_iso);
+        let iso_coeff = lam_pow * e_t.powi(e_perp) * e_r; // G isotropic part
+        let rad_coeff = lam_pow * e_t.powi(e_rad) / e_r; // G radial eigenvalue
+        // G = iso_coeff·(I − t̂t̂ᵀ) + rad_coeff·t̂t̂ᵀ
+        //   = iso_coeff·I + (rad_coeff − iso_coeff)·t̂t̂ᵀ.
+        // Φ'ᵀ G Φ' = iso_coeff·Σ_a Φ'_a Φ'_aᵀ + (rad_coeff−iso_coeff)·(Φ'·t̂)(Φ'·t̂)ᵀ.
+        if !(iso_coeff.is_finite() && rad_coeff.is_finite()) {
             continue;
         }
-        // Accumulate w_n · ∇f outer products one latent axis at a time:
-        // S += Σ_a w_n · (∂Φ/∂t_a)(∂Φ/∂t_a)ᵀ.
+        // Isotropic block: iso_coeff · Σ_axis (∂Φ/∂t_a)(∂Φ/∂t_a)ᵀ.
         for axis in 0..d {
             for k in 0..m {
                 grad[k] = basis_jacobian[[row, k, axis]];
@@ -388,9 +441,33 @@ pub fn conformal_dirichlet_penalty(
                 if gi == 0.0 {
                     continue;
                 }
-                let scaled = w * gi;
+                let scaled = iso_coeff * gi;
                 for j in 0..m {
                     gram[[i, j]] += scaled * grad[j];
+                }
+            }
+        }
+        // Radial block: (rad_coeff − iso_coeff) · proj projᵀ, proj = Φ'·t̂.
+        if norm > ORIGIN_EPS {
+            let radial_weight = rad_coeff - iso_coeff;
+            if radial_weight != 0.0 {
+                let inv_norm = 1.0 / norm;
+                for k in 0..m {
+                    let mut acc = 0.0;
+                    for axis in 0..d {
+                        acc += basis_jacobian[[row, k, axis]] * t[axis];
+                    }
+                    proj[k] = acc * inv_norm;
+                }
+                for i in 0..m {
+                    let pi = proj[i];
+                    if pi == 0.0 {
+                        continue;
+                    }
+                    let scaled = radial_weight * pi;
+                    for j in 0..m {
+                        gram[[i, j]] += scaled * proj[j];
+                    }
                 }
             }
         }

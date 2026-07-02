@@ -3,23 +3,24 @@
 //! Gram that turns a flat tangent patch into a hyperbolic patch).
 //!
 //! The operator is the single source of truth for hyperbolic atom smoothness.
-//! These tests pin the three properties that make it a *correct* and *useful*
+//! These tests pin the properties that make it a *correct* and *useful*
 //! roughness penalty, with truth we construct ourselves (no reference tool):
 //!
 //! 1. **Symmetric PSD** — a roughness Gram must be a valid quadratic form: it
 //!    is symmetric and `βᵀSβ ≥ 0` for every coefficient vector.
-//! 2. **Conformal-invariance limit (`d = 2`)** — 2-D Dirichlet energy is
-//!    conformally invariant, so at `d = 2` the hyperbolic weight `λ^{d−2} = 1`
-//!    and the hyperbolic Gram must equal the *flat* Dirichlet Gram exactly. A
-//!    penalty that claimed a `d = 2` hyperbolic correction would be wrong.
-//! 3. **Boundary up-weighting (`d = 1`)** — for `d = 1` the weight is
-//!    `λ(p)^{−1} = (1 + c‖p‖²)/2`, which *decreases* toward the boundary
-//!    (`c < 0`). The hyperbolic penalty therefore charges *less* per unit
-//!    tangent-coordinate wiggle near the boundary than the flat penalty does —
-//!    i.e. a unit step in the tangent coordinate covers more hyperbolic
-//!    distance away from the boundary and less near it. We assert the exact
-//!    monotone relationship between the per-row weights and the boundary
-//!    radius, so the geometry (not just the shape) is pinned.
+//! 2. **Closed-form pullback (`d = 2`, `c = −1`)** — the penalised field is a
+//!    function of the *tangent* coordinate `t`, and `p = exp₀(t)` is not a
+//!    conformal chart, so the energy must integrate against the pullback metric
+//!    `h(t) = J(t)ᵀ λ² J(t)`, which in polar tangent coordinates is
+//!    `4 dr² + sinh²(2r) dθ²`. The assembled Gram must equal
+//!    `Σ_n Φ'(t_n)ᵀ (√det h · h⁻¹) Φ'(t_n)` built from that closed form — and it
+//!    must **not** equal the flat tangent-coordinate Dirichlet Gram (the old
+//!    implementation, which conflated the ball and tangent charts).
+//! 3. **`d = 1` half-speed tangent coordinate** — a 1-D hyperbolic manifold is
+//!    intrinsically flat, but the tangent coordinate runs at half arc-length
+//!    (`geodesic dist = 2‖t‖`), so the per-row weight the operator applies is the
+//!    exact constant `1/2` at every radius, independent of the boundary
+//!    proximity. We pin that constant.
 
 use gam::geometry::poincare;
 use gam::terms::basis::{
@@ -82,10 +83,10 @@ fn conformal_dirichlet_penalty_is_symmetric_and_psd() {
     }
 }
 
-/// Flat Euclidean Dirichlet Gram `Σ_n Φ'(t_n)ᵀ Φ'(t_n)` (weight ≡ 1) — the
-/// `c → 0⁻` / `d = 2` limit the hyperbolic penalty must reproduce when the
-/// conformal weight is unity.
-fn flat_dirichlet_gram(coords: &Array2<f64>, jet: &Array3<f64>) -> Array2<f64> {
+/// Flat *tangent-coordinate* Dirichlet Gram `Σ_n Φ'(t_n)ᵀ Φ'(t_n)` (weight ≡ 1).
+/// This is the OLD (incorrect) implementation, kept here only as the negative
+/// control: for `d = 2` the correct pullback Gram must *differ* from it.
+fn flat_tangent_dirichlet_gram(coords: &Array2<f64>, jet: &Array3<f64>) -> Array2<f64> {
     let n = coords.nrows();
     let d = coords.ncols();
     let m = jet.shape()[1];
@@ -106,12 +107,61 @@ fn flat_dirichlet_gram(coords: &Array2<f64>, jet: &Array3<f64>) -> Array2<f64> {
     gram
 }
 
+/// Reference Gram for `d = 2`, `c = −1`, assembled from the closed-form pullback
+/// metric `4 dr² + sinh²(2r) dθ²` (`r = ‖t‖`). In Cartesian tangent coordinates
+/// this line element is `h = 4·t̂t̂ᵀ + (sinh(2r)²/r²)·(I − t̂t̂ᵀ)` (the radial
+/// direction gets the `dr²` weight, the perpendicular direction the `dθ²` weight
+/// through `r dθ = t̂⊥·dt`). The metric weight is `G = √det h · h⁻¹`, and since
+/// `h = a·t̂t̂ᵀ + b·(I − t̂t̂ᵀ)` with `a = 4`, `b = sinh(2r)²/r²`,
+/// `G = √(b/a)·t̂t̂ᵀ + √(a/b)·(I − t̂t̂ᵀ)`. This route is independent of the
+/// implementation's eigen-decomposition (it starts from the polar line element).
+fn closed_form_pullback_gram_d2(coords: &Array2<f64>, jet: &Array3<f64>) -> Array2<f64> {
+    let n = coords.nrows();
+    let m = jet.shape()[1];
+    let mut gram = Array2::<f64>::zeros((m, m));
+    for row in 0..n {
+        let tx = coords[[row, 0]];
+        let ty = coords[[row, 1]];
+        let r = (tx * tx + ty * ty).sqrt();
+        // G = g_par·t̂t̂ᵀ + g_perp·(I − t̂t̂ᵀ), with the closed-form eigenvalues.
+        let (g_par, g_perp, that) = if r <= 1e-15 {
+            // r → 0: a = 4, b = sinh(2r)²/r² → 4, so G → I (isotropic).
+            (1.0, 1.0, [0.0, 0.0])
+        } else {
+            let a = 4.0_f64;
+            let b = (2.0 * r).sinh().powi(2) / (r * r);
+            ((b / a).sqrt(), (a / b).sqrt(), [tx / r, ty / r])
+        };
+        // 2×2 metric weight G.
+        let mut gmat = [[0.0_f64; 2]; 2];
+        for i in 0..2 {
+            for j in 0..2 {
+                let pij = that[i] * that[j];
+                let iso = if i == j { 1.0 } else { 0.0 };
+                gmat[i][j] = g_par * pij + g_perp * (iso - pij);
+            }
+        }
+        // S += Φ'ᵀ G Φ' with Φ'[k, axis] = jet[row, k, axis].
+        for k in 0..m {
+            // Gk[axis] = Σ_b G[axis, b] Φ'[k, b].
+            let gk = [
+                gmat[0][0] * jet[[row, k, 0]] + gmat[0][1] * jet[[row, k, 1]],
+                gmat[1][0] * jet[[row, k, 0]] + gmat[1][1] * jet[[row, k, 1]],
+            ];
+            for l in 0..m {
+                gram[[k, l]] += jet[[row, l, 0]] * gk[0] + jet[[row, l, 1]] * gk[1];
+            }
+        }
+    }
+    gram
+}
+
 #[test]
-fn d2_hyperbolic_penalty_equals_flat_dirichlet_conformal_invariance() {
-    // d = 2: λ^{d−2} = λ^0 = 1 everywhere, so the hyperbolic Gram must equal
-    // the flat Dirichlet Gram to round-off. This is the discrete witness of the
-    // conformal invariance of 2-D Dirichlet energy — a hyperbolic penalty that
-    // deviated here would be geometrically wrong.
+fn d2_hyperbolic_penalty_matches_closed_form_pullback() {
+    // d = 2, c = −1: the assembled Gram must equal the Gram built from the
+    // closed-form pullback metric 4 dr² + sinh²(2r) dθ², and must NOT equal the
+    // flat tangent-coordinate Dirichlet Gram (which the old code returned — it
+    // used the ball-coordinate weight λ^{d−2} = 1 in the wrong chart).
     let max_degree = 2;
     let n = 50;
     let coords = Array2::from_shape_fn((n, 2), |(i, a)| {
@@ -121,39 +171,46 @@ fn d2_hyperbolic_penalty_equals_flat_dirichlet_conformal_invariance() {
     let jet = monomial_jet(&coords, max_degree);
     let hyp = poincare::conformal_dirichlet_penalty(coords.view(), jet.view(), CURV)
         .expect("penalty builds");
-    let flat = flat_dirichlet_gram(&coords, &jet);
+    let reference = closed_form_pullback_gram_d2(&coords, &jet);
+    let flat = flat_tangent_dirichlet_gram(&coords, &jet);
     let m = hyp.ncols();
-    let mut max_abs = 0.0_f64;
-    let mut scale = 0.0_f64;
+
+    let mut max_ref_gap = 0.0_f64;
+    let mut ref_scale = 0.0_f64;
+    let mut max_flat_gap = 0.0_f64;
     for i in 0..m {
         for j in 0..m {
-            max_abs = max_abs.max((hyp[[i, j]] - flat[[i, j]]).abs());
-            scale = scale.max(flat[[i, j]].abs());
+            max_ref_gap = max_ref_gap.max((hyp[[i, j]] - reference[[i, j]]).abs());
+            ref_scale = ref_scale.max(reference[[i, j]].abs());
+            max_flat_gap = max_flat_gap.max((hyp[[i, j]] - flat[[i, j]]).abs());
         }
     }
     assert!(
-        max_abs <= 1e-10 * (1.0 + scale),
-        "d=2 hyperbolic penalty must equal the flat Dirichlet Gram (conformal \
-         invariance), but max|hyp−flat| = {max_abs:.3e} (scale {scale:.3e})"
+        max_ref_gap <= 1e-10 * (1.0 + ref_scale),
+        "d=2 penalty must equal the closed-form pullback Gram, but \
+         max|hyp−ref| = {max_ref_gap:.3e} (scale {ref_scale:.3e})"
+    );
+    // Discrimination: the correct pullback Gram is genuinely anisotropic, so it
+    // must differ substantially from the old flat tangent Dirichlet Gram — this
+    // is exactly the bug the fix removes.
+    assert!(
+        max_flat_gap > 1e-3 * (1.0 + ref_scale),
+        "d=2 pullback Gram must NOT equal the flat tangent Dirichlet Gram \
+         (max|hyp−flat| = {max_flat_gap:.3e}); the anisotropic correction is missing"
     );
 }
 
 #[test]
-fn d1_weight_is_exact_inverse_conformal_factor_monotone_in_radius() {
-    // d = 1: the per-row weight the operator applies is λ(p)^{d−2} = λ^{−1}.
-    // We reconstruct the implied weights from the rank-1 single-monomial design
-    // Φ = [t] (degree 1, so Φ' ≡ 1 and S = Σ_n w_n is a scalar accumulation),
-    // and assert each row's weight equals the closed-form (1 + c‖p‖²)/2 and is
-    // monotone *decreasing* in the boundary radius ‖p‖ (c < 0). This pins the
-    // geometry: wiggle near the boundary is charged less per tangent unit
-    // because a tangent step there spans more hyperbolic length.
+fn d1_weight_is_constant_half_from_half_speed_tangent() {
+    // d = 1: the hyperbolic manifold is intrinsically flat, but the tangent
+    // coordinate runs at half arc-length (geodesic distance = 2‖t‖ under the
+    // λ = 2/(1+c‖p‖²) ball metric), so the Dirichlet energy ∫(f')² ds becomes
+    // ∫ (f_t²/2) dt: the per-row weight is the exact constant 1/2 at every
+    // radius, NOT the boundary-dependent λ^{-1} the old code produced.
     let radii_in = [0.05_f64, 0.2, 0.4, 0.6, 0.8, 1.0, 1.4, 1.8];
-    let mut prev_weight = f64::INFINITY;
-    let mut prev_radius = -1.0_f64;
     for &t in &radii_in {
         // Single-row, single linear monomial: Φ'(t) = d/dt (t) = 1.
         let coords = Array2::from_shape_fn((1, 1), |_| t);
-        // Build only the linear monomial column so Φ' is exactly 1.
         let exponents = monomial_exponents(1, 1); // [[0],[1]] -> [1, t]
         assert_eq!(exponents.len(), 2);
         let full_jet = monomial_jet(&coords, 1);
@@ -167,28 +224,11 @@ fn d1_weight_is_exact_inverse_conformal_factor_monotone_in_radius() {
 
         let gram =
             poincare::conformal_dirichlet_penalty(coords.view(), lin_jet.view(), CURV).unwrap();
-        let weight = gram[[0, 0]]; // = w_n · 1² = λ(p)^{-1}
+        let weight = gram[[0, 0]]; // = G(t) · 1² = 1/2
 
-        // Closed-form check: p = exp₀(t), λ = 2/(1 + c‖p‖²), weight = λ^{-1}.
-        let p = poincare::exp_origin(coords.row(0), CURV).unwrap();
-        let p_sq: f64 = p.iter().map(|x| x * x).sum();
-        let lambda = 2.0 / (1.0 + CURV * p_sq);
-        let expected = 1.0 / lambda;
         assert!(
-            (weight - expected).abs() <= 1e-10 * (1.0 + expected.abs()),
-            "d=1 weight at t={t}: got {weight:.6e}, expected λ^-1 = {expected:.6e}"
+            (weight - 0.5).abs() <= 1e-10,
+            "d=1 weight at t={t}: got {weight:.12e}, expected the constant 1/2"
         );
-
-        let radius = p_sq.sqrt();
-        // Monotone decreasing in boundary radius (strictly, for c < 0).
-        if prev_radius >= 0.0 {
-            assert!(
-                weight < prev_weight + 1e-12 && radius > prev_radius,
-                "weight must decrease as the ball radius grows: t={t} radius={radius:.4} \
-                 weight={weight:.6e} (prev radius={prev_radius:.4} weight={prev_weight:.6e})"
-            );
-        }
-        prev_weight = weight;
-        prev_radius = radius;
     }
 }

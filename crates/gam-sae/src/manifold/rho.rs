@@ -122,6 +122,44 @@ impl SaeManifoldRho {
         self.log_ard.iter().map(|a| a.len()).max().unwrap_or(0)
     }
 
+    /// The outer ARD parameterization ([`ArdSharing::PerAtom`] vs
+    /// [`ArdSharing::Shared`]). Every derivative / trace / EFS / IFT-RHS
+    /// consumer of the flat ρ layout must branch on this: the per-atom cursor
+    /// walk `1+K+Σ_{a<k} d_a + j` is only valid in [`ArdSharing::PerAtom`] mode;
+    /// in [`ArdSharing::Shared`] mode atom `k`'s axis `j` maps onto the SINGLE
+    /// shared coordinate `1+K+j` (see [`Self::ard_flat_index`]), so several atoms
+    /// alias one coordinate and their contributions must be ACCUMULATED — walking
+    /// them as if per-atom both indexes OOB (flat len is only `1+K+max_d`) and,
+    /// when it does not panic, splits one shared strength across phantom slots.
+    #[must_use]
+    pub fn ard_sharing(&self) -> ArdSharing {
+        self.ard_sharing
+    }
+
+    /// Flat outer-coordinate index that atom `k`'s ARD axis `j` writes to,
+    /// consistent with [`Self::to_flat`] / [`Self::from_flat`].
+    ///
+    /// * [`ArdSharing::PerAtom`] — a UNIQUE coordinate per `(k, j)`:
+    ///   `1 + K + Σ_{a<k} d_a + j`. Accumulating (`+=`) into it is therefore the
+    ///   same as assigning.
+    /// * [`ArdSharing::Shared`] — the shared per-axis coordinate `1 + K + j`,
+    ///   which EVERY atom owning axis `j` maps onto. Consumers MUST accumulate
+    ///   (gradient / trace / RHS `+=`; EFS numerator/denominator summed over the
+    ///   atoms owning the axis), since the outer optimizer searches one strength
+    ///   per axis, broadcast to all sharing atoms — the chain rule
+    ///   `∂/∂log α_j = Σ_{k owns j} ∂/∂log α_{kj}`.
+    #[must_use]
+    pub fn ard_flat_index(&self, atom: usize, axis: usize) -> usize {
+        let k = self.log_lambda_smooth.len();
+        match self.ard_sharing {
+            ArdSharing::PerAtom => {
+                let base: usize = self.log_ard[..atom].iter().map(|a| a.len()).sum();
+                1 + k + base + axis
+            }
+            ArdSharing::Shared => 1 + k + axis,
+        }
+    }
+
     /// Shift every scale-coupled penalty seed by the profiled reconstruction
     /// dispersion scale. SAE's Gaussian data-fit term is in squared output
     /// units, while `lambda_sparse`, `lambda_smooth`, and ARD precisions are

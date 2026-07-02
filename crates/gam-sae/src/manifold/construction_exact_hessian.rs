@@ -353,12 +353,19 @@ impl SaeManifoldTerm {
             .map_err(|err| OuterGradientError::InternalInvariant {
                 reason: format!("analytic_outer_rho_gradient_components: {err}"),
             })?;
-        let mut cursor = 1 + k_smooth;
+        // #1026 shared-ARD: `ard_flat_index` maps `(k, axis)` onto the flat outer
+        // coordinate for BOTH parameterizations. In `Shared` mode several atoms
+        // alias one axis coordinate `1+K+axis`, and the outer derivative there is
+        // `∂/∂log α_axis = Σ_{k owns axis} ∂/∂log α_{k,axis}` (chain rule through
+        // the broadcast), so we ACCUMULATE. In `PerAtom` mode each `(k, axis)` has
+        // a unique coordinate, so `+=` is identical to the historical `=`. Walking
+        // a raw per-atom cursor in `Shared` mode would index past the flat length
+        // `1+K+max_d` (OOB) and split one shared strength across phantom slots.
         for k in 0..rho.log_ard.len() {
             for axis in 0..rho.log_ard[k].len() {
-                explicit[cursor] = ard_explicit[k][axis];
-                logdet_trace[cursor] = ard_trace[k][axis];
-                cursor += 1;
+                let idx = rho.ard_flat_index(k, axis);
+                explicit[idx] += ard_explicit[k][axis];
+                logdet_trace[idx] += ard_trace[k][axis];
             }
         }
 

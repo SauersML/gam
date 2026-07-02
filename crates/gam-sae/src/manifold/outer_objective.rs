@@ -44,48 +44,6 @@ pub(crate) fn reconstruction_explained_variance(
     }
 }
 
-/// Rank-`q` PCA explained-variance ceiling of a column-centered `target`: the
-/// fraction of centered total variance captured by its top-`q` principal
-/// directions (the Eckart-Young optimum at rank `q`). This is the BEST
-/// reconstruction EV any rank-`q` linear dictionary can achieve on this data, so
-/// it is the natural data-derived scale for the arrival / curved-quality health
-/// checks that adjudicate a CONVERGED fit against the linear optimum.
-///
-/// S1 (guard surgery) — this ceiling is NO LONGER the collapse-DETECTION bar: a
-/// `k_active`-sparse fit cannot in general reach the DENSE rank-`q` ceiling on
-/// real (non-sparse) activations, so keying collapse detection on a fraction of it
-/// flagged healthy-but-uncompetitive fits as collapses. Detection now keys on the
-/// signal-free null floor ([`absolute_degeneracy_ev_floor`]); this dense ceiling
-/// remains the achievable reference for post-convergence quality adjudication.
-///
-/// Returns a value in `[0, 1]` on a finite target; `f64::NAN` when the SVD fails
-/// or the centered target has no variance (an all-constant target), so callers
-/// can detect the degenerate case and fall back to their absolute floor rather
-/// than silently key on a meaningless ceiling.
-pub(crate) fn pca_ev_ceiling(target: ArrayView2<'_, f64>, q: usize) -> f64 {
-    let (n, p) = target.dim();
-    if n == 0 || p == 0 {
-        return f64::NAN;
-    }
-    let mut centered = target.to_owned();
-    for c in 0..p {
-        let mean = (0..n).map(|r| target[[r, c]]).sum::<f64>() / n as f64;
-        for r in 0..n {
-            centered[[r, c]] -= mean;
-        }
-    }
-    let sst: f64 = centered.iter().map(|v| v * v).sum();
-    if !(sst > 0.0) || !sst.is_finite() {
-        return f64::NAN;
-    }
-    let sv = match centered.svd(false, false) {
-        Ok((_, sv, _)) => sv,
-        Err(_) => return f64::NAN,
-    };
-    let captured: f64 = sv.iter().take(q).map(|s| s * s).sum();
-    captured / sst
-}
-
 /// S1 (guard surgery) — the ABSOLUTE-DEGENERACY explained-variance floor: a fit
 /// whose reconstruction EV sits at or below this value explains no more of the
 /// centered target than a SIGNAL-FREE dictionary of the same reachable rank would
@@ -2775,6 +2733,39 @@ mod linear_parity_anchor_1026_tests {
     //! linear component carry full-rank variance while curved atoms stay sparse.
 
     use super::*;
+
+    /// Rank-`q` PCA / Eckart-Young explained-variance ceiling of a column-centered
+    /// `target` — the best reconstruction EV any rank-`q` LINEAR dictionary can
+    /// reach. S1 (guard surgery): this is now a TEST ORACLE only. It was the
+    /// reference for the retired `0.5 × ceiling` collapse bar; the live collapse
+    /// detector keys on the signal-free null floor
+    /// (`super::absolute_degeneracy_ev_floor` = `q / n`), so no production code
+    /// consumes this ceiling. The linear-anchor parity tests below still compare the
+    /// anchor's reconstruction against it, so it lives here as their oracle. Returns
+    /// `[0, 1]` on a finite target; `f64::NAN` on SVD failure / zero-variance target.
+    fn pca_ev_ceiling(target: ArrayView2<'_, f64>, q: usize) -> f64 {
+        let (n, p) = target.dim();
+        if n == 0 || p == 0 {
+            return f64::NAN;
+        }
+        let mut centered = target.to_owned();
+        for c in 0..p {
+            let mean = (0..n).map(|r| target[[r, c]]).sum::<f64>() / n as f64;
+            for r in 0..n {
+                centered[[r, c]] -= mean;
+            }
+        }
+        let sst: f64 = centered.iter().map(|v| v * v).sum();
+        if !(sst > 0.0) || !sst.is_finite() {
+            return f64::NAN;
+        }
+        let sv = match centered.svd(false, false) {
+            Ok((_, sv, _)) => sv,
+            Err(_) => return f64::NAN,
+        };
+        let captured: f64 = sv.iter().take(q).map(|s| s * s).sum();
+        captured / sst
+    }
 
     /// Build a K-atom LINEAR (degree-1, d=1) SAE term over distinct 1-D coords
     /// with a known rank-`r_true` linear target `X = Z @ D`. The decoder seed is

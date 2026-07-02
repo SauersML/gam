@@ -4212,9 +4212,12 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sae_select_k, module)?)?;
     module.add_function(wrap_pyfunction!(sae_auto_k_recommendation, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_manifold_fit_stagewise, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit_ibp, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit_minimal, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_predict_oos, module)?)?;
+    module.add_function(wrap_pyfunction!(build_sae_encode_atlas, module)?)?;
+    module.add_class::<PySaeEncodeAtlas>()?;
     module.add_function(wrap_pyfunction!(sae_steer_delta, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_reconstruction_r2, module)?)?;
     module.add_function(wrap_pyfunction!(sae_streaming_plan, module)?)?;

@@ -993,6 +993,42 @@ pub(crate) fn scad_coord_penalty_active_on_euclidean_axis() {
 /// pivot (BUG 3). The assembled `htt` diagonal on every periodic coord axis
 /// must therefore be non-negative (the `max(V'',0)` PSD majorizer), while the
 /// gradient stays the exact `V'`.
+/// #1026 shared-ARD flat-layout contract. With `K=2` single-axis atoms the
+/// SHARED parameterization collapses both per-atom axis-0 ARD strengths onto ONE
+/// outer coordinate (`1+K+0 = 3`), so the flat outer vector is length
+/// `1+K+max_d = 4`. The former per-atom cursor walk in the gradient / EFS / IFT
+/// consumers wrote atom0→3 and atom1→4 — index 4 is OUT OF BOUNDS on a length-4
+/// vector (panic), and even when it did not panic it split one shared strength
+/// across two phantom slots. `ard_flat_index` maps every atom owning an axis onto
+/// the single shared coordinate (in-bounds), and the consumers accumulate into
+/// it. The PerAtom arm keeps unique coordinates matching the `to_flat` cursor.
+#[test]
+pub(crate) fn shared_ard_flat_index_aliases_in_bounds_1026() {
+    let shared =
+        SaeManifoldRho::new_shared_ard(0.0, 0.0, vec![array![0.1_f64], array![0.2_f64]]);
+    let shared_len = shared.to_flat().len();
+    assert_eq!(shared_len, 4, "shared flat len = 1+K+max_d");
+    assert_eq!(shared.ard_flat_index(0, 0), 3);
+    assert_eq!(
+        shared.ard_flat_index(1, 0),
+        3,
+        "both atoms' axis 0 alias the single shared coordinate"
+    );
+    assert!(
+        shared.ard_flat_index(1, 0) < shared_len,
+        "shared index must stay in bounds (the old per-atom walk went OOB)"
+    );
+
+    let per_atom = SaeManifoldRho::new(0.0, 0.0, vec![array![0.1_f64], array![0.2_f64]]);
+    assert_eq!(per_atom.to_flat().len(), 5, "per-atom flat len = 1+K+Σ d_k");
+    assert_eq!(per_atom.ard_flat_index(0, 0), 3);
+    assert_eq!(
+        per_atom.ard_flat_index(1, 0),
+        4,
+        "per-atom keeps unique coordinates (bit-for-bit the historical cursor)"
+    );
+}
+
 #[test]
 pub(crate) fn periodic_ard_curvature_is_psd_in_assembled_htt() {
     // Two rows past the quarter period (t in (0.25, 0.75)) where cos(2πt) < 0.

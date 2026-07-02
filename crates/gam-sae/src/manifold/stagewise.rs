@@ -37,8 +37,13 @@
 //! residual carries no structured factor above the idiosyncratic-noise floor
 //! (`Σ.factor_rank() == 0`), or at the caller's `max_births` safety cap.
 //! Co-collapse is impossible by construction: atoms never compete inside one
-//! Hessian, and the guard stack is BYPASSED ([`SaeManifoldTerm::set_guards_enabled`]
-//! `false`) — the K=1 path never trips it anyway.
+//! Hessian, and the RESEED guard stack (the #976 active-mass / decoder-norm
+//! reseed + co-collapse reseed-all) is DISARMED
+//! ([`SaeManifoldTerm::set_guards_enabled`] `false`) — the K=1 path never trips it
+//! anyway. Note this disarms only the *reseed* machinery: the separation barrier
+//! (`add_sae_separation_barrier`) is assembled unconditionally and is NOT gated by
+//! this toggle, so it remains as a dormant, load-bearing collinearity safety net
+//! for the K≥2 backfitting polish below.
 //!
 //! **Phase 2 — backfitting sweeps.** Greedy ordering misassigns credit where
 //! atoms overlap. Each sweep first re-solves the per-row routing jointly given all
@@ -182,11 +187,17 @@ pub struct StagewiseReport {
     pub births_rejected: usize,
     /// Per-round birth records (accepted and rejected), in order.
     pub birth_records: Vec<BirthRecord>,
-    /// EV after the seed fit and after each ACCEPTED birth — non-decreasing by
-    /// construction (every adopted candidate cleared `min_effect_ev ≥ 0`).
+    /// EV after the seed fit and after each ACCEPTED birth. Non-decreasing
+    /// because every adopted candidate is gated on measured `ΔEV ≥ min_effect_ev
+    /// ≥ 0` — the recorded trace is monotone as long as the underlying candidate
+    /// fits stay healthy, which for K ≥ 2 relies on the separation barrier
+    /// (dormant, not gated by `guards_enabled`) keeping atoms from collapsing
+    /// collinear (its gate is inactive while pairwise `c² < 0.5`).
     pub ev_trace: Vec<f64>,
-    /// EV after each backfitting sweep — non-decreasing by construction (monotone
-    /// block-coordinate descent at fixed ρ).
+    /// EV after each backfitting sweep. Each sweep is line-searched descent on the
+    /// PENALIZED objective (monotone there); the recorded EV trace is non-decreasing
+    /// under the keep-best acceptance (a sweep that does not strictly improve EV is
+    /// reverted), again while atoms stay separated (barrier gate inactive, `c² < 0.5`).
     pub backfit_ev_trace: Vec<f64>,
     /// Why the forward-birth phase stopped.
     pub stopped_reason: StagewiseStop,
@@ -394,10 +405,14 @@ fn refit_single_atom_in_place(
 }
 
 /// One backfitting sweep at FIXED ρ: (1) re-solve the per-row routing jointly at
-/// frozen decoders (the sparse-coding step), then (2) a warm, guards-off joint
-/// polish. Both are line-searched descent on the penalized objective, so the
-/// sweep is monotone by construction. A step that fails to assemble is a no-op
-/// (never a hard error — the state is left as the last good iterate).
+/// frozen decoders (the sparse-coding step), then (2) a warm joint polish with the
+/// RESEED guards disarmed. Both are line-searched descent on the penalized
+/// objective, so the sweep is monotone in that objective by construction. The
+/// K ≥ 2 joint polish still leans on the separation barrier
+/// (`add_sae_separation_barrier`, assembled unconditionally — NOT gated by
+/// `guards_enabled`) as its collinearity defense: disarming the guards removes
+/// only the reseed machinery, not that barrier. A step that fails to assemble is a
+/// no-op (never a hard error — the state is left as the last good iterate).
 fn backfit_sweep(
     term: &mut SaeManifoldTerm,
     rho: &mut SaeManifoldRho,
@@ -658,6 +673,12 @@ pub fn fit_stagewise(
     let (terminal_joint_reml, terminal_joint_loss) =
         frozen_joint_evidence(&mut term, target, &rho, registry, config)?;
 
+    // Re-arm the collapse-guard stack before the composed dictionary escapes: the
+    // guards-off lane is an INTERNAL economy for the K=1 / backfitting refits, but
+    // the returned artifact must ship armed so any downstream non-frozen refit gets
+    // the normal supervision (mirrors `terminal_joint_assembly`).
+    term.set_guards_enabled(true);
+
     Ok(StagewiseResult {
         term,
         rho,
@@ -696,8 +717,14 @@ pub fn terminal_joint_assembly(
 ) -> Result<(SaeManifoldTerm, SaeManifoldRho, f64, SaeManifoldLoss), String> {
     let (mut merged, merged_rho) =
         SaeManifoldTerm::merge_tiers(primary, primary_rho, secondary, secondary_rho)?;
+    // Disarm the reseed guards ONLY for the frozen (evaluate-don't-optimize) pass,
+    // then RE-ARM before returning: guards-off is the K=1 / backfitting rationale,
+    // but the composed artifact must ship with the collapse-guard stack armed so
+    // any downstream non-frozen refit / FFI consumer of the returned dictionary
+    // gets the normal supervision (a disarmed term would silently skip it).
     merged.set_guards_enabled(false);
     let (reml, loss) = frozen_joint_evidence(&mut merged, target, &merged_rho, registry, config)?;
+    merged.set_guards_enabled(true);
     Ok((merged, merged_rho, reml, loss))
 }
 

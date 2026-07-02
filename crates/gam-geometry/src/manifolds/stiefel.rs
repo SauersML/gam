@@ -86,8 +86,15 @@ impl RiemannianManifold for StiefelManifold {
     ///   W = Δ Yᵀ − Y Δᵀ − Y (YᵀΔ) Yᵀ      (n×n, skew)
     /// ```
     ///
-    /// is the unique skew matrix satisfying `W·Y = Δ` (using `YᵀΔ + ΔᵀY = 0`
-    /// for a canonical-metric tangent). Since `W` is skew, `exp(W)` is
+    /// is a skew matrix satisfying `W·Y = Δ` (using `YᵀΔ + ΔᵀY = 0` for a
+    /// canonical-metric tangent). It is *not* the unique such skew matrix — when
+    /// the normal space has dimension `n − k ≥ 2` any nonzero skew `K` supported
+    /// on that complement satisfies `K·Y = 0`, so `(W + K)` is skew with
+    /// `(W + K)·Y = Δ` as well. `W` is the distinguished *horizontal* generator:
+    /// in the completed basis `[Y Y⊥]` it equals `[[A, −Bᵀ], [B, 0]]`
+    /// (`A = YᵀΔ`, `B = Y⊥ᵀΔ`), the unique skew generator whose
+    /// complement–complement block vanishes — i.e. the canonical-metric geodesic
+    /// generator (Edelman–Arias–Smith). Since `W` is skew, `exp(W)` is
     /// orthogonal and `exp(W)·Y` lies on the Stiefel manifold for any
     /// `n ≥ k`. This avoids the Edelman–Arias–Smith `2k`-block form, whose
     /// thin QR of `(I − YYᵀ)Δ` is structurally rank-deficient when `n < 2k`
