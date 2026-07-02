@@ -306,6 +306,8 @@ from ._sae_manifold import (
     ManifoldSAE,
     SaeManifoldAtomFit,
     SaeManifoldFitResult,
+    StagewiseAtom,
+    StagewiseSAE,
     featurize,
     fit as sae_fit,
     flat_block_assignment,
@@ -314,6 +316,7 @@ from ._sae_manifold import (
     gumbel_reciprocal_iter_schedule,
     plot,
     sae_manifold_fit,
+    sae_manifold_fit_stagewise,
 )
 from ._sae_viz import plot_atom, plot_fit
 from ._sae_trust import atom_trust_scores, sae_trust_diagnostics

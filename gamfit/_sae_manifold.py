@@ -2634,6 +2634,468 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     return model
 
 
+# --------------------------------------------------------------------------- #
+# Sequential Atom Composition (SAC) — the stagewise adapter (#2027 / SAC WS-A). #
+# --------------------------------------------------------------------------- #
+#
+# The Rust ``fit_stagewise`` driver (crates/gam-sae/src/manifold/stagewise.rs)
+# grows a curved dictionary ONE atom at a time from a single K=1 seed: forward
+# births (each seeds from the running residual factor and races a new atom vs a
+# chart extension under an evidence + minimum-effect gate), backfitting sweeps
+# (keep-best, monotone at fixed ρ), then a terminal frozen joint-evidence pass.
+# It exists because the cold-start joint fit of K>1 curved atoms co-collapses on
+# real activations while every K=1 fit succeeds; SAC retires the simultaneous
+# cold start and builds K from the proven K=1 path (guards disarmed — the K=1
+# lane never trips them). The whole driver is Rust; this adapter is a THIN shell
+# (SPEC): it assembles the K=1 SEED via the proven Rust ``sae_manifold_fit`` and
+# rebuilds the atom's basis (Φ / dΦ / roughness Gram) via the Rust
+# ``basis_with_jet`` kernel, then hands those verbatim to the compact stagewise
+# FFI. No model math is computed here — only array packing.
+
+
+@dataclass(slots=True)
+class StagewiseAtom:
+    """One atom of a SAC-composed dictionary.
+
+    Attributes
+    ----------
+    decoder
+        Decoder basis coefficients ``(M_k, p)`` (same contract as
+        :attr:`SaeManifoldAtomFit.decoder_coefficients`).
+    coords
+        Recovered on-atom coordinates ``(N, d_k)``.
+    assignments
+        Per-observation gate for this atom ``(N,)``.
+    topology
+        Atom topology label (``"circle"`` / ``"sphere"`` / ...).
+    latent_dim
+        Intrinsic coordinate dimension ``d_k``.
+    delta_ev
+        The ΔEV this atom earned at its accepting birth (``None`` for the seed
+        atom, which is atom 0). This is the per-atom salience the birth ledger
+        recorded — the discriminator's "each atom earns its ΔEV" datum.
+    theta
+        Fitted turning ``Θ`` of the atom's chart. ``None`` here: the compact
+        stagewise FFI does not emit the hybrid-split turning report, so ``Θ`` is
+        left to the eval lane, which recomputes it from :attr:`decoder`. Kept in
+        the schema so the ``(Θ, ΔEV)`` frontier has a home per atom.
+    """
+
+    decoder: np.ndarray
+    coords: np.ndarray
+    assignments: np.ndarray
+    topology: str
+    latent_dim: int
+    delta_ev: float | None
+    theta: float | None = None
+
+
+@dataclass(slots=True)
+class StagewiseSAE:
+    """A SAC-composed manifold dictionary and its discriminator instrumentation.
+
+    The headline discriminator lives in the traces and the birth ledger, not in
+    a separate run (LANE_PLAN): ``ev_trace`` is non-decreasing in births *by
+    construction* (every adopted candidate cleared ``ΔEV >= min_effect_ev >= 0``),
+    ``backfit_ev_trace`` is non-decreasing under keep-best, ``birth_records`` logs
+    every round (accepted new-atom / chart-extension / rejection) with its ΔEV
+    and the frozen joint-REML before/after, and ``collapse_events`` is the
+    live-decoder collapse log — empty by construction (atoms never compete inside
+    one Hessian), which IS the answer to the old joint-vs-grown collapse question
+    on the real target.
+    """
+
+    atoms: list[StagewiseAtom]
+    logits: np.ndarray
+    ev_trace: np.ndarray
+    backfit_ev_trace: np.ndarray
+    births_accepted: int
+    births_rejected: int
+    stopped_reason: str
+    terminal_joint_reml: float
+    terminal_data_fit: float
+    birth_records: list[dict[str, Any]]
+    collapse_events: list[dict[str, Any]]
+    log_lambda_sparse: float
+    log_lambda_smooth: np.ndarray
+    log_ard: list[np.ndarray]
+    assignment: str
+    seed: ManifoldSAE
+    training_data: np.ndarray
+
+    @property
+    def k(self) -> int:
+        """Number of atoms in the composed dictionary."""
+        return len(self.atoms)
+
+    def _atom_reconstructions(self) -> list[np.ndarray]:
+        """Per-atom gated reconstructions ``a_k · (Φ_k B_k)`` over the target.
+
+        Applies each fitted decoder through the Rust ``basis_with_jet`` kernel at
+        the atom's recovered coordinates and scales by its returned gate. This is
+        decoder application (linear algebra), not model fitting — the Rust core
+        owns every coefficient; here we only evaluate them.
+        """
+        recons: list[np.ndarray] = []
+        for atom in self.atoms:
+            phi, _jet, _pen = _basis_with_jet_for_atom(
+                atom.topology, atom.coords, int(atom.decoder.shape[0]), atom.latent_dim
+            )
+            curve = phi @ atom.decoder
+            recons.append(atom.assignments[:, None] * curve)
+        return recons
+
+    def reconstruct(self, X: Any = None) -> np.ndarray:
+        """Composed reconstruction ``Σ_k a_k · (Φ_k B_k)`` of the training target.
+
+        ``X`` is accepted for API symmetry with :meth:`ManifoldSAE.reconstruct`
+        but ignored: the composed dictionary reconstructs the target it was fit
+        on (the atoms carry their converged coordinates/gates). Returns ``(N, p)``.
+        """
+        del X
+        if not self.atoms:
+            return np.zeros_like(self.training_data, dtype=np.float64)
+        return np.sum(self._atom_reconstructions(), axis=0)
+
+    def reconstruction_ev(self) -> float:
+        """Centered explained variance of :meth:`reconstruct` against the target."""
+        x = np.asarray(self.training_data, dtype=np.float64)
+        recon = self.reconstruct()
+        rss = float(np.sum((x - recon) ** 2))
+        tss = float(np.sum((x - x.mean(axis=0, keepdims=True)) ** 2))
+        return 1.0 - rss / tss if tss > 0.0 else 0.0
+
+
+def _basis_with_jet_for_atom(
+    topology: str,
+    coords: np.ndarray,
+    basis_size: int,
+    latent_dim: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Rebuild ``(Φ, dΦ/dt, roughness Gram)`` for a K=1 atom via the Rust kernel.
+
+    The stagewise FFI is a *precomputed-basis* entry point (like the low-level
+    ``sae_manifold_fit``): it carries no Duchon centers, so only the analytic,
+    centers-free bases can refresh ``Φ(t)`` as the driver moves coordinates. This
+    helper dispatches those kinds to the single Rust ``basis_with_jet`` kernel —
+    the same one the torch bridge and the shape-band reconstruct use — so no
+    basis math is reimplemented in Python.
+
+    Returns ``phi`` ``(N, M)``, ``jet`` ``(N, M, d)``, ``penalty`` ``(M, M)``.
+    Raises ``NotImplementedError`` for a centers-bearing basis (Duchon / linear /
+    euclidean), which this precomputed FFI path cannot re-evaluate.
+    """
+    canon = _canonical_topology(str(topology))
+    t = np.ascontiguousarray(np.asarray(coords, dtype=np.float64))
+    if t.ndim != 2:
+        raise ValueError(f"stagewise atom coords must be 2D (N, d); got shape {t.shape}")
+    if canon == "circle":
+        # A periodic atom's basis width is M = 2H + 1; recover H from the trained
+        # decoder width (mirrors ``_canonical_n_harmonics``) so the rebuilt Φ has
+        # exactly the atom's columns even for a born/degenerate-width atom.
+        n_harmonics = max(1, (int(basis_size) - 1) // 2)
+        phi, jet, penalty = rust_module().basis_with_jet(
+            "periodic", t[:, :1], {"n_harmonics": int(n_harmonics)}
+        )
+    elif canon == "sphere":
+        phi, jet, penalty = rust_module().basis_with_jet("sphere", t[:, : max(1, latent_dim)], {})
+    else:
+        raise NotImplementedError(
+            f"sae_manifold_fit_stagewise supports only centers-free analytic atom "
+            f"bases (circle / sphere) — the precomputed stagewise FFI carries no "
+            f"basis centers; got topology={topology!r} (canonical {canon!r}). Use "
+            f"the joint sae_manifold_fit for a Duchon/linear/euclidean dictionary."
+        )
+    phi = np.ascontiguousarray(np.asarray(phi, dtype=np.float64))
+    jet = np.ascontiguousarray(np.asarray(jet, dtype=np.float64))
+    penalty = np.ascontiguousarray(np.asarray(penalty, dtype=np.float64))
+    return phi, jet, penalty
+
+
+def sae_manifold_fit_stagewise(
+    X: Any = None,
+    *,
+    d_atom: int = 1,
+    atom_topology: str = "circle",
+    assignment: str = "ibp_map",
+    structured_whitening: bool = True,
+    min_effect_ev: float = 0.0,
+    max_births: int = 24,
+    max_backfit_sweeps: int = 4,
+    max_factor_rank: int = 4,
+    sample_weights: Any = None,
+    n_iter: int = 64,
+    seed_n_iter: int | None = None,
+    learning_rate: float | None = None,
+    sparsity_weight: float = 1.0,
+    smoothness_weight: float = 1.0,
+    isometry_weight: float = 1.0,
+    ridge_ext_coord: float = 1.0e-6,
+    ridge_beta: float = 1.0e-6,
+    alpha: float | str | None = None,
+    tau: float | None = None,
+    random_state: int = 0,
+) -> StagewiseSAE:
+    """Grow a curved SAE dictionary by Sequential Atom Composition (SAC).
+
+    Thin wrapper over the Rust ``fit_stagewise`` driver. It builds the single K=1
+    SEED with the proven :func:`sae_manifold_fit` (Rust-seeded + fit — so the seed
+    coordinates/decoder come from the certified K=1 path, not a Python
+    reimplementation), rebuilds that atom's basis via the Rust ``basis_with_jet``
+    kernel, and hands the arrays to the ``sae_manifold_fit_stagewise`` FFI, which
+    runs forward births + backfitting + terminal joint evidence entirely in Rust.
+
+    Parameters
+    ----------
+    X
+        Target matrix the dictionary reconstructs, ``(N, p)`` (1D reshaped to
+        ``(N, 1)``). At the composed-tier call site this is the T1 residual.
+    d_atom
+        Intrinsic coordinate dimension of the seed atom (``1`` for a circle).
+    atom_topology
+        Seed atom topology. Only centers-free analytic bases are supported by the
+        precomputed stagewise FFI: ``"circle"`` (periodic) and ``"sphere"``.
+    assignment
+        Assignment/gate family (``"ibp_map"`` / ``"softmax"`` / ``"threshold_gate"``
+        and their aliases), resolved through the shared public validator.
+    structured_whitening
+        Install the Σ-whitened per-row metric on each birth so the K=1 candidate
+        fits run under the structured residual covariance from atom one (Σ is
+        refit per birth internally). ``True`` by default.
+    min_effect_ev
+        Explicit MINIMUM-EFFECT (salience) floor a birth's ΔEV must clear ON TOP
+        of the evidence gate. ``0.0`` (default) recovers evidence-only, null-
+        recovering acceptance; a positive value suppresses true-but-trivial
+        wiggles at frontier ``n``. A config dial, never a magic constant.
+    max_births
+        Safety cap on forward births atop the seed (a BOUND, not the stop rule —
+        two consecutive rejections / an empty residual factor stop the phase).
+    max_backfit_sweeps
+        Maximum keep-best backfitting sweeps (each monotone at fixed ρ).
+    max_factor_rank
+        Residual-factor ladder cap per birth (how many candidate factor
+        directions the evidence ladder scores when mining the residual).
+    sample_weights
+        Optional length-``N`` per-row stratified importance weights (√w),
+        installed on every inner fit via the reconstruction-weight seam. ``None``
+        is the unweighted path.
+    n_iter
+        Inner Newton iterations per birth / per sweep.
+    seed_n_iter
+        Inner iterations for the K=1 SEED fit. ``None`` reuses ``n_iter``.
+    learning_rate
+        Inner step size. ``None`` uses ``0.05`` for ``threshold_gate`` and ``1.0``
+        otherwise (matching :func:`sae_manifold_fit`).
+    sparsity_weight, smoothness_weight, isometry_weight
+        Forwarded to the seed fit; ``sparsity_weight`` / ``smoothness_weight`` are
+        also handed to the stagewise driver's inner fits. (``isometry_weight`` and
+        the other analytic penalties gauge only the SEED; the compact FFI's inner
+        fits carry no analytic-penalty registry — a known scoping limit.)
+    ridge_ext_coord, ridge_beta
+        Inner coordinate / β ridges for the stagewise fits.
+    alpha, tau
+        Assignment concentration / temperature. ``None`` resolves to the seed
+        fit's values (K-aware IBP α; τ = 0.5).
+    random_state
+        Seed forwarded to the K=1 seed fit's initializer.
+
+    Returns
+    -------
+    StagewiseSAE
+        The composed dictionary (per-atom decoder / coords / gate / topology /
+        latent_dim / ΔEV) plus the by-construction-monotone ``ev_trace`` and
+        ``backfit_ev_trace``, ``births_accepted``, the full ``birth_records``
+        ledger, and the (empty-by-construction) ``collapse_events`` log.
+    """
+    if X is None:
+        raise TypeError("sae_manifold_fit_stagewise requires X input array")
+    x = _as_2d_float(X, "X")
+    n_obs, p_out = int(x.shape[0]), int(x.shape[1])
+    if n_obs < 2:
+        raise ValueError(f"sae_manifold_fit_stagewise requires n >= 2; got n={n_obs}")
+    d0 = int(d_atom)
+    if d0 < 1:
+        raise ValueError(f"d_atom must be >= 1; got {d0}")
+    if int(max_births) < 0 or int(max_backfit_sweeps) < 0 or int(max_factor_rank) < 1:
+        raise ValueError(
+            "max_births / max_backfit_sweeps must be >= 0 and max_factor_rank >= 1"
+        )
+    kind = _canonical_public_assignment(assignment)
+    seed_iter = int(n_iter if seed_n_iter is None else seed_n_iter)
+    effective_lr = (0.05 if kind == "threshold_gate" else 1.0) if learning_rate is None else float(learning_rate)
+
+    weights_arr: np.ndarray | None
+    if sample_weights is None:
+        weights_arr = None
+    else:
+        weights_arr = np.ascontiguousarray(np.asarray(sample_weights, dtype=np.float64).reshape(-1))
+        if weights_arr.shape[0] != n_obs:
+            raise ValueError(
+                "sample_weights must have one entry per observation; "
+                f"got {weights_arr.shape[0]} for n={n_obs}"
+            )
+        if not np.all(np.isfinite(weights_arr)) or np.any(weights_arr <= 0.0):
+            raise ValueError("sample_weights must be finite and strictly positive")
+
+    # ── Seed: the proven Rust K=1 fit (Rust-seeded coords/decoder, no Python
+    # reimplementation of the topology-specific seeding). ─────────────────────
+    seed_fit = sae_manifold_fit(
+        x,
+        K=1,
+        d_atom=d0,
+        atom_topology=atom_topology,
+        assignment=assignment,
+        isometry_weight=isometry_weight,
+        sparsity_weight=sparsity_weight,
+        smoothness_weight=smoothness_weight,
+        n_iter=seed_iter,
+        random_state=int(random_state),
+        alpha=(_ALPHA_UNSET if alpha is None else alpha),
+        tau=tau,
+        weights=weights_arr,
+    )
+    seed_topology = seed_fit.atom_topologies[0]
+    seed_kind = str(seed_fit._basis_kinds[0])
+    # Use the seed atom's ACTUAL intrinsic dimension, not the requested d_atom: a
+    # circle is intrinsically 1-D whatever the caller asked, and the rebuilt jet /
+    # initial_coords must agree with atom_dim the FFI installs on the term.
+    d_seed = int(seed_fit._atom_dims[0])
+    coords0 = np.ascontiguousarray(seed_fit.coords[0].astype(np.float64))
+    if coords0.ndim != 2 or coords0.shape[1] != d_seed:
+        coords0 = coords0.reshape(n_obs, d_seed)
+    decoder0 = np.ascontiguousarray(seed_fit.decoder_blocks[0].astype(np.float64))
+    m0 = int(decoder0.shape[0])
+    phi0, jet0, penalty0 = _basis_with_jet_for_atom(seed_topology, coords0, m0, d_seed)
+    if jet0.shape != (n_obs, m0, d_seed):
+        raise ValueError(
+            f"stagewise seed jet shape {jet0.shape} disagrees with (N, M, d)="
+            f"({n_obs}, {m0}, {d_seed}); the rebuilt Jacobian must match atom_dim"
+        )
+    if phi0.shape != (n_obs, m0):
+        raise ValueError(
+            f"stagewise seed basis width {phi0.shape[1]} disagrees with the seed "
+            f"decoder rows {m0}; the rebuilt Φ must match the fitted decoder basis"
+        )
+    logits0 = np.ascontiguousarray(np.asarray(seed_fit.low_level_logits, dtype=np.float64))
+    if logits0.shape != (n_obs, 1):
+        logits0 = logits0.reshape(n_obs, 1)
+
+    basis_values = phi0[None, :, :]                    # (1, N, M)
+    basis_jacobian = jet0[None, :, :, :]               # (1, N, M, d)
+    decoder_coefficients = decoder0[None, :, :]        # (1, M, p)
+    smooth_penalties = penalty0[None, :, :]            # (1, M, M)
+    initial_coords = coords0[None, :, :]               # (1, N, d)
+
+    payload = rust_module().sae_manifold_fit_stagewise(
+        np.ascontiguousarray(x),
+        [seed_kind],
+        [d_seed],
+        np.ascontiguousarray(basis_values),
+        np.ascontiguousarray(basis_jacobian),
+        [m0],
+        np.ascontiguousarray(decoder_coefficients),
+        np.ascontiguousarray(smooth_penalties),
+        np.ascontiguousarray(logits0),
+        np.ascontiguousarray(initial_coords),
+        float(seed_fit.alpha),
+        float(seed_fit.tau),
+        bool(seed_fit.learnable_alpha),
+        str(kind),
+        sparsity_strength=float(sparsity_weight),
+        smoothness=float(smoothness_weight),
+        max_iter=int(n_iter),
+        learning_rate=float(effective_lr),
+        ridge_ext_coord=float(ridge_ext_coord),
+        ridge_beta=float(ridge_beta),
+        max_births=int(max_births),
+        max_backfit_sweeps=int(max_backfit_sweeps),
+        min_effect_ev=float(min_effect_ev),
+        max_factor_rank=int(max_factor_rank),
+        structured_whitening=bool(structured_whitening),
+        row_loss_weights=weights_arr,
+    )
+    return _stagewise_from_payload(dict(payload), x, seed_fit)
+
+
+def _stagewise_from_payload(
+    payload: Mapping[str, Any],
+    x: np.ndarray,
+    seed_fit: ManifoldSAE,
+) -> StagewiseSAE:
+    """Assemble a :class:`StagewiseSAE` from the compact stagewise FFI payload."""
+    logits = np.asarray(payload["logits"], dtype=np.float64)
+    birth_records = [
+        {
+            "kind": str(rec["kind"]),
+            "delta_ev": float(rec["delta_ev"]),
+            "factor_energy": float(rec["factor_energy"]),
+            "joint_reml_before": float(rec["joint_reml_before"]),
+            "joint_reml_after": float(rec["joint_reml_after"]),
+            "accepted": bool(rec["accepted"]),
+        }
+        for rec in payload["birth_records"]
+    ]
+    # Map the ΔEV each ACCEPTED NEW-ATOM birth earned onto its atom (atom 0 is the
+    # seed; chart extensions refit the previous atom and do not create a new one).
+    new_atom_deltas = [
+        rec["delta_ev"] for rec in birth_records if rec["accepted"] and rec["kind"] == "new_atom"
+    ]
+    atoms: list[StagewiseAtom] = []
+    for atom_idx, atom in enumerate(payload["atoms"]):
+        topology = _basis_to_topology(str(atom["basis_kind"]))
+        coords = np.asarray(atom["on_atom_coords_t"], dtype=np.float64)
+        if coords.ndim == 1:
+            coords = coords.reshape(-1, 1)
+        delta_ev: float | None
+        if atom_idx == 0:
+            delta_ev = None
+        elif atom_idx - 1 < len(new_atom_deltas):
+            delta_ev = float(new_atom_deltas[atom_idx - 1])
+        else:
+            delta_ev = None
+        atoms.append(
+            StagewiseAtom(
+                decoder=np.asarray(atom["decoder_B"], dtype=np.float64),
+                coords=coords,
+                assignments=np.asarray(atom["assignments_z"], dtype=np.float64).reshape(-1),
+                topology=topology,
+                latent_dim=int(atom["latent_dim"]),
+                delta_ev=delta_ev,
+                theta=None,
+            )
+        )
+    ev_trace = np.asarray(payload["ev_trace"], dtype=np.float64)
+    backfit_ev_trace = np.asarray(payload["backfit_ev_trace"], dtype=np.float64)
+    # Live-decoder collapse log: a monotonicity violation among adopted candidates.
+    # Empty BY CONSTRUCTION (atoms never share a Hessian, every adoption cleared
+    # ΔEV >= 0) — an empty log IS the discriminator's zero-collapse verdict.
+    collapse_events = [
+        dict(rec, reason="ev_regression")
+        for rec in birth_records
+        if rec["accepted"] and rec["delta_ev"] < -1.0e-9
+    ]
+    log_ard = [np.asarray(a, dtype=np.float64) for a in payload["log_ard"]]
+    return StagewiseSAE(
+        atoms=atoms,
+        logits=logits,
+        ev_trace=ev_trace,
+        backfit_ev_trace=backfit_ev_trace,
+        births_accepted=int(payload["births_accepted"]),
+        births_rejected=int(payload["births_rejected"]),
+        stopped_reason=str(payload["stopped_reason"]),
+        terminal_joint_reml=float(payload["terminal_joint_reml"]),
+        terminal_data_fit=float(payload["terminal_data_fit"]),
+        birth_records=birth_records,
+        collapse_events=collapse_events,
+        log_lambda_sparse=float(payload["log_lambda_sparse"]),
+        log_lambda_smooth=np.asarray(payload["log_lambda_smooth"], dtype=np.float64),
+        log_ard=log_ard,
+        assignment=str(seed_fit.assignment),
+        seed=seed_fit,
+        training_data=np.asarray(x, dtype=np.float64),
+    )
+
+
 def _require_sae_row_block_penalty(kind: str, kwarg: str) -> None:
     """Refuse a SAE row-block penalty the running extension does not advertise.
 

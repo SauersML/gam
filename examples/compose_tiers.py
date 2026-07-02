@@ -106,7 +106,7 @@ class TieredComposition:
     """The single composed artifact: additive T1 + T2 reconstruction."""
 
     t1: gamfit.SparseDictionaryFit
-    t2: Any  # gamfit ManifoldSAE
+    t2: Any  # gamfit ManifoldSAE (joint) or StagewiseSAE (grown)
     t1_recon: np.ndarray
     t2_recon: np.ndarray
     combined_recon: np.ndarray
@@ -115,6 +115,22 @@ class TieredComposition:
     subsample_rows: int
     importance_weight: float
     alternated: bool
+    # Which curved-tier engine produced ``t2`` / the artifact: ``"joint"`` (the
+    # simultaneous ``sae_manifold_fit(K=k2)``, routed OOS over the full residual)
+    # or ``"stagewise"`` (the SAC grow-from-residual dictionary, evaluated on the
+    # subsample it was composed on — the stagewise payload carries no OOS router).
+    t2_engine: str = "joint"
+    # The support ``combined_ev`` is measured on: ``"full_corpus"`` (joint OOS) or
+    # ``"subsample"`` (stagewise in-sample composed dictionary).
+    eval_support: str = "full_corpus"
+    # The grown-vs-joint discriminator (SAC WS-A): both arms fit on the SAME
+    # subsample, so the EV gap is the architecture datum, not a data-split
+    # artifact. ``None`` when the discriminator was not requested. Keys:
+    # ``joint_ev`` / ``stagewise_ev`` (combined EV on the subsample),
+    # ``joint_chosen_k`` / ``stagewise_k``, ``stagewise_births_accepted``,
+    # ``stagewise_collapse_events`` (0 by construction — the live-decoder collapse
+    # answer on the real target), ``stagewise_ev_trace`` (monotone by construction).
+    discriminator: dict | None = None
 
     @property
     def ev_gain(self) -> float:
@@ -136,19 +152,39 @@ def compose_tiers(
     t2_n_iter: int = 50,
     subsample_tokens: int = 1_000_000,
     alternation: bool = True,
+    t2_engine: str = "joint",
+    discriminator: bool = False,
+    stagewise_max_births: int = 24,
+    stagewise_min_effect_ev: float = 0.0,
     random_state: int = 0,
 ) -> TieredComposition:
     """Fit the two-tier composition and return the combined artifact.
 
     All heavy math is inside the two Rust fitters. This function only: fits T1,
     forms the residual, draws the stratified subsample, fits the (small, curved)
-    T2 on it and routes it over the full residual, optionally runs one deflation
-    alternation, and adds the two reconstructions.
+    T2 on it, optionally runs one deflation alternation, and adds the two
+    reconstructions.
+
+    ``t2_engine`` selects the curved tier:
+
+    * ``"joint"`` — the simultaneous ``sae_manifold_fit(K=k2)`` (the exact call
+      that co-collapses on real activations), routed OOS over the FULL residual.
+    * ``"stagewise"`` — the SAC ``sae_manifold_fit_stagewise`` grow-from-residual
+      dictionary (forward births + backfitting, guards disarmed by construction).
+      The compact stagewise payload carries no OOS router, so its artifact is
+      evaluated ON THE SUBSAMPLE it was composed on (``eval_support="subsample"``).
+
+    ``discriminator=True`` fits BOTH arms on the SAME subsample and records the
+    grown-vs-joint comparison (EV gap, collapse-event count, births) in
+    ``result.discriminator`` — the SAC WS-A log line, a matched in-sample compare.
     """
     x = np.ascontiguousarray(np.asarray(X, dtype=np.float32))
     n = x.shape[0]
     if k2 > 64:
         raise ValueError(f"curved tier K must stay small (K<=64); got {k2}")
+    engine = str(t2_engine).strip().lower()
+    if engine not in ("joint", "stagewise"):
+        raise ValueError(f"t2_engine must be 'joint' or 'stagewise'; got {t2_engine!r}")
 
     # --- Tier 1: collapsed-linear sparse dictionary over the FULL corpus -----
     t1 = gamfit.sparse_dictionary_fit(
@@ -156,12 +192,8 @@ def compose_tiers(
     )
     t1_recon = t1.fitted
 
-    def _fit_curved(residual: np.ndarray) -> Any:
-        # Stratified subsample: curved fitting needs statistical sufficiency,
-        # never the whole corpus. Fit on the draw, then route the full residual.
-        idx, weight = stratified_subsample(n, subsample_tokens, random_state)
-        sub = np.ascontiguousarray(residual[idx])
-        fit = gamfit.sae_manifold_fit(
+    def _fit_joint(sub: np.ndarray) -> Any:
+        return gamfit.sae_manifold_fit(
             sub,
             K=k2,
             d_atom=d_atom,
@@ -175,39 +207,108 @@ def compose_tiers(
             n_iter=t2_n_iter,
             random_state=random_state,
         )
-        return fit, idx, weight
+
+    def _fit_stagewise(sub: np.ndarray) -> Any:
+        # SAC grow-from-residual: one K=1 seed, then evidence-gated births. K is
+        # DISCOVERED (capped at ``k2`` births), not fixed — the grown analogue of
+        # the joint K=k2 arm.
+        return gamfit.sae_manifold_fit_stagewise(
+            sub,
+            d_atom=d_atom,
+            atom_topology=atom_topology,
+            assignment=assignment,
+            max_births=int(min(stagewise_max_births, k2)),
+            max_backfit_sweeps=4,
+            min_effect_ev=float(stagewise_min_effect_ev),
+            n_iter=t2_n_iter,
+            random_state=random_state,
+        )
+
+    def _fit_curved(residual: np.ndarray) -> Any:
+        # Stratified subsample: curved fitting needs statistical sufficiency,
+        # never the whole corpus. Both arms fit on the SAME draw so the grown-vs-
+        # joint comparison is matched.
+        idx, weight = stratified_subsample(n, subsample_tokens, random_state)
+        sub = np.ascontiguousarray(residual[idx])
+        joint = _fit_joint(sub) if (engine == "joint" or discriminator) else None
+        grown = _fit_stagewise(sub) if (engine == "stagewise" or discriminator) else None
+        return joint, grown, sub, idx, weight
+
+    def _stagewise_ev(grown: Any, sub: np.ndarray) -> float:
+        recon = np.asarray(grown.reconstruct(), dtype=np.float64)
+        return explained_variance(sub, recon)
 
     residual = x - t1_recon
-    t2, idx, weight = _fit_curved(residual)
-    t2_recon = np.asarray(t2.reconstruct(residual), dtype=np.float32)
+    joint, grown, sub, idx, weight = _fit_curved(residual)
 
-    # --- Optional one alternation: deflate T2, warm-refit T1, refit T2 -------
-    # There is no decoder-seeding API on sparse_dictionary_fit, so the "warm"
-    # T1 epoch is a short refit on the T2-deflated target (X - T2_recon).
+    # --- Optional one alternation (joint engine only: it routes the full corpus
+    # for the T1 deflation target). ------------------------------------------
     alternated = False
-    if alternation:
-        deflated = np.ascontiguousarray(x - t2_recon)
+    if alternation and engine == "joint" and joint is not None:
+        t2_recon_full = np.asarray(joint.reconstruct(residual), dtype=np.float32)
+        deflated = np.ascontiguousarray(x - t2_recon_full)
         t1 = gamfit.sparse_dictionary_fit(
             deflated, K=k1, active=t1_active, max_epochs=max(1, t1_max_epochs // 3)
         )
         t1_recon = t1.fitted
         residual = x - t1_recon
-        t2, idx, weight = _fit_curved(residual)
-        t2_recon = np.asarray(t2.reconstruct(residual), dtype=np.float32)
+        joint, grown, sub, idx, weight = _fit_curved(residual)
         alternated = True
 
-    combined_recon = t1_recon + t2_recon
+    # --- Assemble the discriminator (both arms on the subsample) -------------
+    disc: dict | None = None
+    if discriminator and joint is not None and grown is not None:
+        joint_sub_recon = np.asarray(joint.reconstruct(sub), dtype=np.float64)
+        joint_sub_ev = explained_variance(sub, joint_sub_recon)
+        grown_sub_ev = _stagewise_ev(grown, sub)
+        disc = {
+            "subsample_rows": int(idx.size),
+            "joint_ev": joint_sub_ev,
+            "stagewise_ev": grown_sub_ev,
+            "ev_gap_grown_minus_joint": grown_sub_ev - joint_sub_ev,
+            "joint_chosen_k": int(getattr(joint, "chosen_k", len(joint.atoms))),
+            "stagewise_k": int(grown.k),
+            "stagewise_births_accepted": int(grown.births_accepted),
+            "stagewise_births_rejected": int(grown.births_rejected),
+            "stagewise_collapse_events": int(len(grown.collapse_events)),
+            "stagewise_stopped_reason": grown.stopped_reason,
+            "stagewise_ev_trace": [float(e) for e in grown.ev_trace],
+        }
+
+    # --- Build the artifact from the selected engine -------------------------
+    if engine == "stagewise":
+        # No OOS router: the composed dictionary reconstructs the subsample it was
+        # grown on, so the artifact is evaluated on the subsample support.
+        t2 = grown
+        x_sub = np.ascontiguousarray(x[idx])
+        t1_sub = np.ascontiguousarray(t1_recon[idx])
+        t2_recon = np.asarray(grown.reconstruct(), dtype=np.float32)
+        combined_recon = t1_sub + t2_recon
+        t1_ev = explained_variance(x_sub, t1_sub)
+        combined_ev = explained_variance(x_sub, combined_recon)
+        eval_support = "subsample"
+    else:
+        t2 = joint
+        t2_recon = np.asarray(joint.reconstruct(residual), dtype=np.float32)
+        combined_recon = t1_recon + t2_recon
+        t1_ev = explained_variance(x, t1_recon)
+        combined_ev = explained_variance(x, combined_recon)
+        eval_support = "full_corpus"
+
     return TieredComposition(
         t1=t1,
         t2=t2,
         t1_recon=t1_recon,
         t2_recon=t2_recon,
         combined_recon=combined_recon,
-        t1_ev=explained_variance(x, t1_recon),
-        combined_ev=explained_variance(x, combined_recon),
+        t1_ev=t1_ev,
+        combined_ev=combined_ev,
         subsample_rows=int(idx.size),
         importance_weight=weight,
         alternated=alternated,
+        t2_engine=engine,
+        eval_support=eval_support,
+        discriminator=disc,
     )
 
 
@@ -567,6 +668,17 @@ def build_parser() -> argparse.ArgumentParser:
     tiers.add_argument("--atom-topology", default="circle")
     tiers.add_argument("--assignment", default="threshold_gate")
     tiers.add_argument("--t2-n-iter", type=int, default=50)
+    tiers.add_argument("--t2-engine", choices=("joint", "stagewise"), default="joint",
+                       help="curved-tier engine: 'joint' sae_manifold_fit(K=k2) or "
+                            "'stagewise' SAC grow-from-residual (sae_manifold_fit_stagewise)")
+    tiers.add_argument("--discriminator", action="store_true", default=False,
+                       help="fit BOTH curved arms on the same subsample and log the "
+                            "grown-vs-joint EV gap + collapse-event count (SAC WS-A)")
+    tiers.add_argument("--stagewise-max-births", type=int, default=24,
+                       help="SAC forward-birth safety cap (capped further by k2)")
+    tiers.add_argument("--stagewise-min-effect-ev", type=float, default=0.0,
+                       help="SAC minimum-effect salience floor a birth's dEV must clear "
+                            "(0.0 = null-recovering, evidence-only)")
 
     block = ap.add_argument_group("block tier (--t1-mode block)")
     block.add_argument("--n-blocks", type=int, default=8,
@@ -680,15 +792,27 @@ def main(argv: list[str] | None = None) -> Any:
         t2_n_iter=args.t2_n_iter,
         subsample_tokens=args.subsample_tokens,
         alternation=args.alternation,
+        t2_engine=args.t2_engine,
+        discriminator=args.discriminator,
+        stagewise_max_births=args.stagewise_max_births,
+        stagewise_min_effect_ev=args.stagewise_min_effect_ev,
         random_state=args.random_state,
     )
 
-    print(f"[compose_tiers] curved fit on {result.subsample_rows} rows "
+    print(f"[compose_tiers] curved fit ({result.t2_engine}) on {result.subsample_rows} rows "
           f"(importance weight {result.importance_weight:.3f}), "
           f"alternation={'on' if result.alternated else 'off'}")
-    print(f"[compose_tiers] T1-only EV   = {result.t1_ev:.4f}")
+    print(f"[compose_tiers] T1-only EV   = {result.t1_ev:.4f}  (support={result.eval_support})")
     print(f"[compose_tiers] combined  EV = {result.combined_ev:.4f} "
           f"(+{result.ev_gain:.4f} from the curved tier)")
+    if result.discriminator is not None:
+        d = result.discriminator
+        # The SAC WS-A grown-vs-joint discriminator, matched on one subsample.
+        print(f"[compose_tiers] DISCRIMINATOR (grown vs joint, subsample={d['subsample_rows']}): "
+              f"stagewise EV={d['stagewise_ev']:.4f} (K={d['stagewise_k']}, "
+              f"births={d['stagewise_births_accepted']}, collapse_events="
+              f"{d['stagewise_collapse_events']}) vs joint EV={d['joint_ev']:.4f} "
+              f"(K={d['joint_chosen_k']}); gap={d['ev_gap_grown_minus_joint']:+.4f}")
     hs = getattr(result.t2, "hybrid_split", None)
     if hs is not None:
         print(f"[compose_tiers] curved-tier hybrid_split keys: {sorted(hs)}")
