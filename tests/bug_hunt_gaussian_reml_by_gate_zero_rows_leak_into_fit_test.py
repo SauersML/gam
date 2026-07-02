@@ -177,3 +177,51 @@ def test_by_mask_composes_with_prior_weights() -> None:
     np.testing.assert_allclose(
         _scalar(aug, "sigma2"), _scalar(base, "sigma2"), rtol=1e-9, atol=0
     )
+
+
+def test_zero_by_rows_inert_under_partial_column_gate() -> None:
+    """A ``by=0`` row is inert even when the gate covers only trailing columns.
+
+    ``by_start_col > 0`` scales only columns ``[by_start_col, n_cols)`` by
+    ``by`` (``apply_by_gate``); a ``by=0`` row therefore keeps its *leading*
+    columns ``[0, by_start_col)`` fully intact in the design. Design-column
+    gating alone thus cannot make such a row inert — its leading columns would
+    still enter ``XᵀWX`` / ``XᵀWy`` and move ``B``. The *only* thing that makes
+    the row a no-op is folding the gate into the row weight (``w_eff = 0``), so
+    this isolates the #2031 fix in a regime the ``by_start_col == 0`` tests
+    above never reach.
+    """
+    design, penalty, y = _base_problem(seed=17)
+    n, n_cols = design.shape
+    by_start_col = max(1, n_cols // 2)  # leave a nonempty ungated leading block
+
+    base = gamfit.gaussian_reml_fit(
+        design, y, penalty, by=np.ones(n), by_start_col=by_start_col
+    )
+
+    g = 45
+    rng = np.random.default_rng(101)
+    # Junk rows with large, dense designs (leading columns are NOT gated away)
+    # and large garbage responses; all gated off via by=0.
+    design_aug = np.vstack([design, rng.normal(0.0, 6.0, (g, n_cols))])
+    y_aug = np.vstack([y, rng.normal(0.0, 1e3, (g, 1))])
+    by_aug = np.concatenate([np.ones(n), np.zeros(g)])
+    aug = gamfit.gaussian_reml_fit(
+        design_aug, y_aug, penalty, by=by_aug, by_start_col=by_start_col
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(aug["coefficients"]).ravel(),
+        np.asarray(base["coefficients"]).ravel(),
+        rtol=0,
+        atol=1e-9,
+    )
+    np.testing.assert_allclose(
+        _scalar(aug, "lambda"), _scalar(base, "lambda"), rtol=1e-9, atol=0
+    )
+    np.testing.assert_allclose(
+        _scalar(aug, "sigma2"), _scalar(base, "sigma2"), rtol=1e-9, atol=0
+    )
+    np.testing.assert_allclose(
+        _scalar(aug, "edf"), _scalar(base, "edf"), rtol=1e-9, atol=0
+    )

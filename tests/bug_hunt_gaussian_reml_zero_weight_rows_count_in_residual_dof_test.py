@@ -160,3 +160,90 @@ def test_all_positive_weights_are_unaffected() -> None:
     )
     # sigma2 must be finite and positive (a sanity anchor for the DoF path).
     assert _scalar(fit1, "sigma2") > 0.0
+
+
+def test_zero_weight_padding_inert_for_multi_output() -> None:
+    """Multi-output (``d>1``): zero-weight rows must be inert per output.
+
+    ``ywy`` and the fitted energy are accumulated per response column, and the
+    per-output ``sigma2`` divides by the same effective ``ν``. A prior weight of
+    ``0`` must drop the row from *every* output's response energy and from the
+    shared DoF count, so the whole multi-output fit matches the positive-weight
+    subset. The other tests use ``d == 1``; this exercises the per-output loop.
+    """
+    x = np.linspace(0.0, 1.0, 140)
+    design = np.asarray(gamfit.bspline_basis(x, knots=8))
+    penalty = _pspline_penalty(design.shape[1])
+    n = design.shape[0]
+    rng = np.random.default_rng(202)
+    y = np.column_stack(
+        [
+            np.sin(2 * np.pi * x) + rng.normal(0.0, 0.2, n),
+            np.cos(2 * np.pi * x) + rng.normal(0.0, 0.3, n),
+        ]
+    )
+
+    sub = gamfit.gaussian_reml_fit(design, y, penalty, weights=np.ones(n))
+
+    g = 175
+    design_full = np.vstack([design, rng.normal(0.0, 2.0, (g, design.shape[1]))])
+    y_full = np.vstack([y, rng.normal(0.0, 50.0, (g, 2))])
+    weights_full = np.concatenate([np.ones(n), np.zeros(g)])
+    full = gamfit.gaussian_reml_fit(design_full, y_full, penalty, weights=weights_full)
+
+    np.testing.assert_allclose(
+        np.asarray(full["coefficients"]),
+        np.asarray(sub["coefficients"]),
+        rtol=0,
+        atol=1e-9,
+    )
+    np.testing.assert_allclose(
+        np.asarray(full["sigma2"]).ravel(),
+        np.asarray(sub["sigma2"]).ravel(),
+        rtol=1e-9,
+        atol=0,
+    )
+    np.testing.assert_allclose(
+        _scalar(full, "lambda"), _scalar(sub, "lambda"), rtol=1e-9, atol=0
+    )
+
+
+def test_zero_weight_rows_inert_when_interleaved() -> None:
+    """Zero-weight rows are inert wherever they sit, not only when appended.
+
+    The effective-count DoF and ``Σ w·y²`` are order-free, so scattering the
+    ``weights=0`` rows *among* the informative rows (rather than as a trailing
+    block) must give the identical fit. Guards against any accidental
+    dependence on zero-weight rows being contiguous or last.
+    """
+    design, penalty, y = _base_problem(seed=23)
+    n = design.shape[0]
+    sub = gamfit.gaussian_reml_fit(design, y, penalty, weights=np.ones(n))
+
+    rng = np.random.default_rng(303)
+    g = 90
+    junk_design = rng.normal(0.0, 3.0, (g, design.shape[1]))
+    junk_y = rng.normal(0.0, 20.0, (g, 1))
+
+    design_mix = np.vstack([design, junk_design])
+    y_mix = np.vstack([y, junk_y])
+    weights_mix = np.concatenate([np.ones(n), np.zeros(g)])
+
+    # Shuffle rows so the zero-weight rows are interleaved with the real ones.
+    perm = rng.permutation(n + g)
+    mixed = gamfit.gaussian_reml_fit(
+        design_mix[perm], y_mix[perm], penalty, weights=weights_mix[perm]
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(mixed["coefficients"]).ravel(),
+        np.asarray(sub["coefficients"]).ravel(),
+        rtol=0,
+        atol=1e-9,
+    )
+    np.testing.assert_allclose(
+        _scalar(mixed, "sigma2"), _scalar(sub, "sigma2"), rtol=1e-9, atol=0
+    )
+    np.testing.assert_allclose(
+        _scalar(mixed, "lambda"), _scalar(sub, "lambda"), rtol=1e-9, atol=0
+    )
