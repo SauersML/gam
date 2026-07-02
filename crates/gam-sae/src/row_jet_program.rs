@@ -674,12 +674,22 @@ impl<const K: usize> O2x4<K> {
         for i in 0..K {
             out.g[i] = l_add(l_mul(a.v, b.g[i]), l_mul(a.g[i], b.v));
         }
+        // Compute only the upper triangle (`j ≥ i`) and mirror to the lower,
+        // exactly as `Tower2::mul` does. Computing the full K×K independently
+        // would sum the two cross terms `a.g[i]·b.g[j]` and `a.g[j]·b.g[i]` in
+        // the OPPOSITE order for a lower-triangle entry `(i>j)` versus the
+        // scalar's canonical `(min,max)` computation; IEEE addition is not
+        // associative, so that reordered the lower-triangle Hessian by a ULP
+        // and broke lane-`i` `to_bits` parity with the scalar `Order2` (and
+        // left the batched Hessian only near-symmetric). Mirroring pins both.
         for i in 0..K {
-            for j in 0..K {
+            for j in i..K {
                 let t0 = l_mul(a.v, b.h[i][j]);
                 let t1 = l_add(t0, l_mul(a.g[i], b.g[j]));
                 let t2 = l_add(t1, l_mul(a.g[j], b.g[i]));
-                out.h[i][j] = l_add(t2, l_mul(a.h[i][j], b.v));
+                let hij = l_add(t2, l_mul(a.h[i][j], b.v));
+                out.h[i][j] = hij;
+                out.h[j][i] = hij;
             }
         }
         out
