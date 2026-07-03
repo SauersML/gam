@@ -169,13 +169,17 @@ class SparseDictionaryFit:
             out += cod[:, [j]] * self.decoder[idx[:, j]]
         return np.ascontiguousarray(out)
 
-    def transform(self, X: Any, active: int | None = None) -> SparseDictionaryTransform:
+    def transform(
+        self, X: Any, active: int | None = None, *, score_mode: str = "required"
+    ) -> SparseDictionaryTransform:
         """Route held-out rows ``X`` (``M x P``) through the fitted decoder.
 
         Returns a :class:`SparseDictionaryTransform` with ``indices`` and
         ``codes`` of shape ``M x active`` plus ``score_route_stats``. The stats
         are part of the API: high-``K`` jobs must prove whether the route ran on
-        the device or on the host.
+        the device or on the host. ``score_mode`` defaults to ``"required"`` so
+        an admitted route that cannot run on CUDA raises instead of returning an
+        all-CPU success.
         """
         x = _as_2d_f32(X, "X")
         if x.shape[1] != self.decoder.shape[1]:
@@ -188,6 +192,7 @@ class SparseDictionaryFit:
             np.ascontiguousarray(x, dtype=np.float32),
             np.ascontiguousarray(self.decoder, dtype=np.float32),
             int(s),
+            score_mode=str(score_mode),
         )
         data = dict(payload)
         return SparseDictionaryTransform(
@@ -216,6 +221,8 @@ class SparseDictStreamArtifact:
         for a converged fit this equals the returned decoder's EV to tolerance.
     epochs, converged, active:
         Run metadata.
+    score_route_stats:
+        Aggregate CPU/GPU route telemetry across streamed shards.
     """
 
     decoder: np.ndarray
@@ -223,12 +230,16 @@ class SparseDictStreamArtifact:
     epochs: int
     converged: bool
     active: int
+    score_route_stats: dict[str, Any]
 
-    def transform(self, X: Any, active: int | None = None) -> SparseDictionaryTransform:
+    def transform(
+        self, X: Any, active: int | None = None, *, score_mode: str = "required"
+    ) -> SparseDictionaryTransform:
         """Route held-out rows ``X`` (``M x P``) through the fitted decoder.
 
         Returns a :class:`SparseDictionaryTransform`, including route telemetry
-        proving CPU/device dispatch for the held-out encode.
+        proving CPU/device dispatch for the held-out encode. ``score_mode``
+        defaults to ``"required"`` for fail-closed GPU routing.
         """
         x = _as_2d_f32(X, "X")
         if x.shape[1] != self.decoder.shape[1]:
@@ -241,6 +252,7 @@ class SparseDictStreamArtifact:
             np.ascontiguousarray(x, dtype=np.float32),
             np.ascontiguousarray(self.decoder, dtype=np.float32),
             int(s),
+            score_mode=str(score_mode),
         )
         data = dict(payload)
         return SparseDictionaryTransform(
@@ -278,11 +290,13 @@ class SparseDictStream:
         A representative ``N_seed x P`` sample used to fix ``P`` and seed the
         initial atom directions (deterministic farthest-point). One shard, or the
         whole corpus for small problems.
-    K, active, minibatch, max_epochs, score_tile, code_ridge, decoder_ridge, tolerance:
+    K, active, minibatch, max_epochs, score_tile, code_ridge, decoder_ridge, tolerance, score_mode:
         Identical hyper-parameters to :func:`sparse_dictionary_fit`. ``max_epochs``
         is advisory here (the driving Python loop decides how many epochs to run);
         it is carried only so :meth:`end_epoch`'s convergence flag matches the
-        one-shot stopping rule.
+        one-shot stopping rule. ``score_mode="required"`` fails closed if an
+        admitted route cannot run on the CUDA scorer; use ``"off"`` for deliberate
+        CPU-only runs.
     """
 
     def __init__(
@@ -297,6 +311,7 @@ class SparseDictStream:
         code_ridge: float = 1.0e-6,
         decoder_ridge: float = 1.0e-6,
         tolerance: float = 1.0e-6,
+        score_mode: str = "required",
     ) -> None:
         seed_arr = _as_2d_f32(seed, "seed")
         self._handle = rust_module().SparseDictStream(
@@ -309,17 +324,21 @@ class SparseDictStream:
             code_ridge=float(code_ridge),
             decoder_ridge=float(decoder_ridge),
             tolerance=float(tolerance),
+            score_mode=str(score_mode),
         )
 
     def partial_fit(self, shard: Any) -> dict[str, Any]:
         """Route + sparse-code one ``shard`` (``M x P``) against the current
         decoder and fold it into the running epoch.
 
-        Returns per-shard stats ``{rows, rss, alive_atoms}`` (``alive_atoms`` is
-        cumulative across the shards seen since the last :meth:`end_epoch`).
+        Returns per-shard stats ``{rows, rss, alive_atoms, score_route_stats}``
+        (``alive_atoms`` is cumulative across the shards seen since the last
+        :meth:`end_epoch`).
         """
         shard_arr = _as_2d_f32(shard, "shard")
-        return dict(self._handle.partial_fit(shard_arr))
+        data = dict(self._handle.partial_fit(shard_arr))
+        data["score_route_stats"] = _route_stats(data["score_route_stats"])
+        return data
 
     def end_epoch(self) -> dict[str, Any]:
         """Close the current epoch: refresh the decoder from the accumulated
@@ -343,6 +362,7 @@ class SparseDictStream:
             epochs=int(data["epochs"]),
             converged=bool(data["converged"]),
             active=int(data["active"]),
+            score_route_stats=_route_stats(data["score_route_stats"]),
         )
 
     @property
@@ -994,6 +1014,7 @@ def sparse_dictionary_fit_begin(
     code_ridge: float = 1.0e-6,
     decoder_ridge: float = 1.0e-6,
     tolerance: float = 1.0e-6,
+    score_mode: str = "required",
 ) -> SparseDictStream:
     """Begin a streaming sparse-dictionary fit and return a :class:`SparseDictStream`.
 
@@ -1010,6 +1031,7 @@ def sparse_dictionary_fit_begin(
         code_ridge=code_ridge,
         decoder_ridge=decoder_ridge,
         tolerance=tolerance,
+        score_mode=score_mode,
     )
 
 
@@ -1024,6 +1046,7 @@ def sparse_dictionary_fit(
     code_ridge: float = 1.0e-6,
     decoder_ridge: float = 1.0e-6,
     tolerance: float = 1.0e-6,
+    score_mode: str = "required",
 ) -> SparseDictionaryFit:
     """Fit a fixed-``K`` sparse, minibatched linear dictionary to ``X`` (``N x P``).
 
@@ -1038,6 +1061,9 @@ def sparse_dictionary_fit(
         Streaming / tiling controls.
     code_ridge, decoder_ridge, tolerance:
         Shared regularisation and stopping controls.
+    score_mode:
+        ``"required"`` (default) fails closed when an admitted high-``K`` route
+        cannot run on CUDA. Use ``"off"`` for deliberate CPU-only runs.
     """
     x = _as_2d_f32(X, "X")
     payload = rust_module().sparse_dictionary_fit(
@@ -1050,6 +1076,7 @@ def sparse_dictionary_fit(
         code_ridge=float(code_ridge),
         decoder_ridge=float(decoder_ridge),
         tolerance=float(tolerance),
+        score_mode=str(score_mode),
     )
     data = dict(payload)
     return SparseDictionaryFit(

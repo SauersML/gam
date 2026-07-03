@@ -644,7 +644,7 @@ pub fn fit_stagewise(
                 backfit_sweep: 0,
                 candidate: None,
                 accepted: None,
-                checkpoint: false,
+                checkpoint: true,
                 k_atoms: term.k_atoms(),
                 births_accepted,
                 births_rejected,
@@ -1431,6 +1431,92 @@ mod tests {
         assert!(
             is_non_decreasing(&result.report.ev_trace),
             "EV trace must remain monotone"
+        );
+    }
+
+    #[test]
+    fn progress_callback_emits_pre_birth_checkpoints() {
+        let n = 32usize;
+        let p = 4usize;
+        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
+        let coords = Array2::<f64>::from_shape_fn((n, 1), |(row, _)| row as f64 / n as f64);
+        let (atom0, cb0) = circle_atom("t0", &evaluator, &coords, 0, 1, p);
+        let (atom1, cb1) = circle_atom("t1", &evaluator, &coords, 2, 3, p);
+        let active_truth: Vec<Vec<bool>> = (0..n).map(|r| vec![r < n / 2, r >= n / 2]).collect();
+        let (truth, _rho) = build_term(
+            vec![atom0.clone(), atom1],
+            vec![cb0.clone(), cb1],
+            &active_truth,
+        );
+        let target = truth.fitted();
+        let config = StagewiseConfig {
+            max_births: 1,
+            max_backfit_sweeps: 0,
+            ..test_config()
+        };
+        let (seed, rho) = build_term(vec![atom0], vec![cb0], &vec![vec![true]; n]);
+        let (seed, rho) = fitted_seed(seed, rho, target.view(), &config);
+        let mut events: Vec<(StagewiseEventKind, bool, usize, Option<BirthKind>)> = Vec::new();
+        let mut progress = |event: StagewiseProgress<'_>| -> Result<(), String> {
+            events.push((
+                event.event,
+                event.checkpoint,
+                event.k_atoms,
+                event.candidate,
+            ));
+            Ok(())
+        };
+
+        fit_stagewise(
+            seed,
+            rho,
+            target.view(),
+            None,
+            None,
+            &config,
+            Some(&mut progress),
+        )
+        .expect("fit_stagewise must complete while emitting progress");
+
+        assert_eq!(
+            events.first().map(|event| event.0),
+            Some(StagewiseEventKind::SeedReady),
+            "the first callback must expose the fitted K=1 seed"
+        );
+        assert_eq!(
+            events.get(1).map(|event| event.0),
+            Some(StagewiseEventKind::BirthRoundStarted),
+            "the second callback must expose a durable birth-round checkpoint"
+        );
+        assert_eq!(events[0].1, true, "seed_ready must be checkpointable");
+        assert_eq!(
+            events[1].1, true,
+            "birth_round_started must be checkpointable before residual work"
+        );
+        assert_eq!(events[0].2, 1, "seed checkpoint must be K=1");
+
+        let pos = |kind: StagewiseEventKind| -> usize {
+            events
+                .iter()
+                .position(|event| event.0 == kind)
+                .expect("expected progress event")
+        };
+        assert!(
+            pos(StagewiseEventKind::ResidualModelStarted)
+                < pos(StagewiseEventKind::CurrentEvidenceStarted),
+            "residual-fit progress must precede current-evidence progress"
+        );
+        assert!(
+            pos(StagewiseEventKind::CurrentEvidenceStarted)
+                < pos(StagewiseEventKind::CandidateStarted),
+            "current-evidence progress must precede candidate fitting"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.0 == StagewiseEventKind::CandidateStarted
+                    && event.3 == Some(BirthKind::NewAtom)),
+            "first birth must report the new-atom candidate"
         );
     }
 

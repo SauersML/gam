@@ -5077,7 +5077,8 @@ impl SparseDictStream {
     }
 
     /// Route + sparse-code one shard against the current decoder and fold its
-    /// contributions into the running epoch. Returns `{rows, rss, alive_atoms}`.
+    /// contributions into the running epoch. Returns `{rows, rss, alive_atoms,
+    /// score_route_stats}`.
     fn partial_fit<'py>(
         &mut self,
         py: Python<'py>,
@@ -5114,8 +5115,8 @@ impl SparseDictStream {
         Ok(out.unbind())
     }
 
-    /// Hand back the trained decoder (`K×P`, unit-norm) plus run metadata:
-    /// `{decoder, active, epochs, explained_variance, converged}`.
+    /// Hand back the trained decoder (`K×P`, unit-norm) plus run metadata and
+    /// aggregate score-route telemetry.
     fn finalize(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let artifact = self.inner.finalize();
         let out = PyDict::new(py);

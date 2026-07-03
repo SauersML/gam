@@ -10,7 +10,7 @@ fn parse_arg(args: &[String], idx: usize, default: usize) -> usize {
 }
 
 fn parse_mode(args: &[String]) -> Result<gam_gpu::GpuMode, String> {
-    match args.get(6).map(String::as_str).unwrap_or("off") {
+    match args.get(6).map(String::as_str).unwrap_or("required") {
         "auto" => Ok(gam_gpu::GpuMode::Auto),
         "required" => Ok(gam_gpu::GpuMode::Required),
         "off" => Ok(gam_gpu::GpuMode::Off),

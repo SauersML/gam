@@ -1643,6 +1643,19 @@ impl SaeManifoldOuterObjective {
             // and is not silently masked as a recoverable probe.
             || (err.contains("Schur complement Cholesky failed")
                 && err.contains("not positive definite"))
+            // #2087 — at a seed ρ a K>1 jumprelu/threshold-gate assignment can gate an
+            // atom OFF at every row, so the sequential-deflation refit's gated design
+            // `diag(a_·k)·Φ_k` is all-zero and the reduced joint problem is
+            // rank-deficient with an undefined Laplace evidence — the SAME infeasible-ρ
+            // class as the non-PD Schur / Hessian refusals above. `run_joint_fit_arrow_schur`
+            // → `enforce_decoder_norm_guard` → `refit_decoder_sequential_deflation`
+            // surfaces the DISTINCT "gated off at every row (all-zero gated design)"
+            // marker (NOT the generic `solve_design_least_squares` "zero numerical rank",
+            // which stays fatal for genuinely defective designs), so the outer solver
+            // reads it as the finite collapse wall and steers ρ back to where the gate
+            // turns atoms on (or ships best-so-far) rather than aborting the whole fit
+            // with "no candidate seeds passed outer startup validation".
+            || err.contains("gated off at every row (all-zero gated design)")
     }
 
     /// Shared cost path: evaluate the REML criterion at `rho_flat`, updating
@@ -1723,6 +1736,14 @@ impl SaeManifoldOuterObjective {
         self.current_rho = rho;
         self.last_loss = Some(loss);
         Ok((cost, beta_hat))
+    }
+
+    /// Fit the SAE inner problem once at a caller-selected rho, committing the
+    /// resulting basin without running the outer-rho search or its derivative
+    /// lanes.
+    pub fn fit_at_fixed_rho(&mut self, rho_flat: ArrayView1<'_, f64>) -> Result<(), String> {
+        self.evaluate_with_refine_policy(rho_flat, true, false)
+            .map(|_| ())
     }
 
     /// Evaluate a value-only rho probe without committing the inner basin it

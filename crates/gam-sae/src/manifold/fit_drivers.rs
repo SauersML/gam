@@ -2791,6 +2791,29 @@ impl SaeManifoldTerm {
             let mut best_beta: Option<Array2<f64>> = None;
             for &atom in &remaining {
                 let d = gated_design(self, atom);
+                // A gated design `D_k = diag(a_·k)·Φ_k` that is all-zero means atom
+                // `k` is gated OFF at every row: its reconstruction is identically
+                // zero for ANY decoder, so the reduced joint problem this seed ρ
+                // presents is rank-deficient and its closed-form Laplace evidence is
+                // undefined — the SAME infeasible-ρ class as the non-PD Schur /
+                // per-row Hessian refusals (#1782). It arises for a legitimate seed
+                // state (a jumprelu / threshold gate that zeroes every row at an
+                // off-optimum seed ρ), NOT a coding defect, and fitting the resulting
+                // all-off (zero) dictionary just makes the outer optimizer grind on a
+                // gradient-free landscape. Surface a DISTINCT, classifiable refusal so
+                // `is_recoverable_value_probe_refusal` reads it as the finite collapse
+                // wall and the outer solver steers ρ back to where atoms turn on (or
+                // ships best-so-far), instead of `solve_design_least_squares`'s
+                // generic "zero numerical rank" error aborting the whole fit ("no
+                // candidate seeds passed outer startup validation"). The generic error
+                // stays fatal for every other (genuinely defective) caller.
+                if d.iter().all(|&v| v == 0.0) {
+                    return Err(format!(
+                        "refit_decoder_sequential_deflation: atom {atom} is gated off at \
+                         every row (all-zero gated design); the seed ρ leaves the reduced \
+                         problem rank-deficient (recoverable infeasible-ρ probe)"
+                    ));
+                }
                 let beta = solve_design_least_squares(d.view(), residual.view())?;
                 let fit = d.dot(&beta);
                 let energy: f64 = fit.iter().map(|v| v * v).sum();

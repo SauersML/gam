@@ -2060,7 +2060,9 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
                      separation_barrier_strength: float | None = None,
                      ibp_alpha: float | None = None,
                      structured_residual_passes: int = 0,
-                     promote_from_residual: bool = False) -> ManifoldSAE:
+                     promote_from_residual: bool = False,
+                     _run_structure_search: bool = True,
+                     _run_outer_rho_search: bool = True) -> ManifoldSAE:
     """Fit an SAE-manifold model.
 
     Parameters
@@ -2427,6 +2429,46 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         raise ValueError(
             f"d_atom must be >= 1 for every atom; got {dims}"
         )
+    # Eager heterogeneous-d_atom validation (issue #2088). The SAE row-block
+    # analytic penalties (isometry, native ARD, SCAD/MCP coord sparsity,
+    # block-orthogonality) target the UNIFIED "t" latent block, whose width is a
+    # single `d_max` shared by every atom. With heterogeneous per-atom coord
+    # dims the arrow-Schur assembler cannot dispatch a shared-width row-block
+    # penalty per atom without silently truncating or padding axes, so
+    # `SaeManifoldTerm::validate_analytic_penalty_registry` refuses — but only
+    # deep inside the REML cascade, surfacing as a confusing
+    # `RemlConvergenceError` "before solver start". Because `isometry_weight`
+    # and `ard_per_atom` default ON, EVERY heterogeneous `d_atom` call hit that
+    # refusal, making the documented heterogeneous path unusable. Detect the
+    # incompatibility up front and raise a direct, actionable error naming the
+    # conflicting knobs. With all row-block penalties disabled the heterogeneous
+    # path runs normally (the per-atom decoder / nuclear-norm / incoherence
+    # penalties already dispatch per atom and are unaffected).
+    if len(set(dims)) > 1:
+        row_block_conflicts = []
+        if float(isometry_weight) > 0.0:
+            row_block_conflicts.append("isometry_weight>0")
+        if bool(ard_per_atom):
+            row_block_conflicts.append("ard_per_atom=True")
+        if gate_sparsity_kind in {"scad", "mcp"} and sparsity > 0.0:
+            row_block_conflicts.append(
+                f"coord_sparsity={gate_sparsity_kind!r} with sparsity_weight>0"
+            )
+        if float(block_orthogonality_weight) > 0.0:
+            row_block_conflicts.append("block_orthogonality_weight>0")
+        if row_block_conflicts:
+            raise ValueError(
+                f"sae_manifold_fit: heterogeneous d_atom ({dims}) is "
+                "incompatible with the SAE row-block analytic penalties "
+                + ", ".join(row_block_conflicts)
+                + ". These penalties target the shared 't' latent block, whose "
+                "width must match every atom, so mixed per-atom coordinate dims "
+                "cannot be dispatched (they would silently truncate or pad "
+                "axes). Either use a uniform d_atom for all atoms, or disable "
+                "the conflicting penalties (isometry_weight=0.0, "
+                "ard_per_atom=False, coord_sparsity='l1', "
+                "block_orthogonality_weight=0.0)."
+            )
     # Eager sparsity_weight validation (issue #184). The signature
     # advertises `sparsity_weight: float = 1.0`; `0.0` is the canonical
     # "no sparsity" baseline and must be accepted. Reject only negative,
@@ -2671,6 +2713,8 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         ibp_alpha_override=None if ibp_alpha is None else float(ibp_alpha),
         structured_residual_passes=int(structured_residual_passes),
         promote_from_residual=bool(promote_from_residual),
+        run_structure_search=bool(_run_structure_search),
+        run_outer_rho_search=bool(_run_outer_rho_search),
     )
     payload_dict = dict(payload)
     model = ManifoldSAE.from_payload(
@@ -3020,6 +3064,8 @@ def sae_manifold_fit_stagewise(
         alpha=(_ALPHA_UNSET if alpha is None else alpha),
         tau=tau,
         weights=weights_arr,
+        _run_structure_search=False,
+        _run_outer_rho_search=False,
     )
     seed_topology = seed_fit.atom_topologies[0]
     seed_kind = str(seed_fit._basis_kinds[0])
@@ -3051,14 +3097,11 @@ def sae_manifold_fit_stagewise(
                 f"got flat length {logits_seed.size} for n={n_obs}"
             )
         logits0 = logits_seed.reshape(n_obs, 1)
-    elif logits_seed.ndim == 2 and logits_seed.shape[0] == n_obs and logits_seed.shape[1] >= 1:
-        # `sae_manifold_fit(K=1)` can return a structure-grown payload. SAC needs
-        # one fitted seed atom, so take atom 0's fitted gate column instead of
-        # reshaping an (N, K_grown) matrix into nonsense.
-        logits0 = logits_seed[:, :1]
+    elif logits_seed.ndim == 2 and logits_seed.shape == (n_obs, 1):
+        logits0 = logits_seed
     else:
         raise ValueError(
-            "stagewise seed logits must be (N,) or (N, K>=1); "
+            "stagewise seed logits must be (N,) or (N, 1); "
             f"got shape {logits_seed.shape} for n={n_obs}"
         )
     logits0 = np.ascontiguousarray(logits0)

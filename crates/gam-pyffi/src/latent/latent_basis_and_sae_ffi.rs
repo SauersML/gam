@@ -2265,6 +2265,8 @@ fn sae_structured_residual_model(
     ibp_alpha_override = None,
     structured_residual_passes = 0,
     promote_from_residual = false,
+    run_structure_search = true,
+    run_outer_rho_search = true,
     quotient_scale = false,
     data_row_reseed = false,
 ))]
@@ -2317,6 +2319,8 @@ fn sae_manifold_fit<'py>(
     // passes (default 0 = historical iid-only path, bit-for-bit).
     structured_residual_passes: usize,
     promote_from_residual: bool,
+    run_structure_search: bool,
+    run_outer_rho_search: bool,
     quotient_scale: bool,
     data_row_reseed: bool,
 ) -> PyResult<Py<PyDict>> {
@@ -2374,6 +2378,8 @@ fn sae_manifold_fit<'py>(
         ibp_alpha_override,
         structured_residual_passes,
         promote_from_residual,
+        run_structure_search,
+        run_outer_rho_search,
         quotient_scale,
         data_row_reseed,
     )
@@ -2845,6 +2851,8 @@ fn sae_manifold_fit_inner<'py>(
     // env lever.
     structured_residual_passes: usize,
     promote_from_residual: bool,
+    run_structure_search: bool,
+    run_outer_rho_search: bool,
     quotient_scale: bool,
     data_row_reseed: bool,
 ) -> PyResult<Py<PyDict>> {
@@ -3321,13 +3329,6 @@ fn sae_manifold_fit_inner<'py>(
     // multistart insurance: the PCA projection lands each row in the decisive
     // basin and EFS refines the per-atom penalties from there. seed_budget=1 +
     // max_seeds=1 collapses the cascade to the single initial ρ.
-    let problem = gam::solver::rho_optimizer::OuterProblem::new(n_params)
-        .with_initial_rho(init_rho_flat)
-        .with_seed_config(gam::solver::seeding::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
     // #1388: the outer ρ cascade drives a SERIAL per-row jet loop
     // (`logdet_theta_adjoint` → `row_jets_for_logdet` → `gate_tower`) that builds
     // `Tower4<16>` derivative towers — each carries a `t4` channel of 16⁴ doubles
@@ -3347,7 +3348,22 @@ fn sae_manifold_fit_inner<'py>(
         let worker = std::thread::Builder::new()
             .name("gam-sae-fit".to_string())
             .stack_size(SAE_FIT_WORKER_STACK_SIZE)
-            .spawn_scoped(scope, || problem.run(&mut objective, "SAE manifold"))
+            .spawn_scoped(scope, || {
+                if run_outer_rho_search {
+                    let problem = gam::solver::rho_optimizer::OuterProblem::new(n_params)
+                        .with_initial_rho(init_rho_flat.clone())
+                        .with_seed_config(gam::solver::seeding::SeedConfig {
+                            max_seeds: 1,
+                            seed_budget: 1,
+                            ..Default::default()
+                        });
+                    problem.run(&mut objective, "SAE manifold").map(|_| ())
+                } else {
+                    objective
+                        .fit_at_fixed_rho(init_rho_flat.view())
+                        .map_err(gam::model_types::EstimationError::RemlOptimizationFailed)
+                }
+            })
             .map_err(|err| {
                 py_value_error(format!("sae_manifold_fit: spawn fit worker thread: {err}"))
             })?;
@@ -3607,6 +3623,9 @@ fn sae_manifold_fit_inner<'py>(
     // from the final post-search per-atom inner fits (below).
     let mut structure_changed = false;
     let structure_search_json = 'structure: {
+        if !run_structure_search {
+            break 'structure None;
+        }
         // #1026 — structure search is a post-fit DISCOVERY pass: each round refits
         // the full dictionary over ALL N rows, so its cost is ~(moves·rounds)
         // full-dictionary refits. At large user-fixed K it is intractable (dozens
@@ -4909,6 +4928,8 @@ fn sae_manifold_fit_ibp<'py>(
         // opt-in above is left inert here (the primary `sae_manifold_fit` /
         // `sae_manifold_fit_minimal` entry points carry the typed kwargs).
         false,
+        true,
+        true,
         false,
         false,
     )
@@ -6802,6 +6823,8 @@ fn sae_build_atom_plans(
     ibp_alpha_override = None,
     structured_residual_passes = 0,
     promote_from_residual = false,
+    run_structure_search = true,
+    run_outer_rho_search = true,
     quotient_scale = false,
     data_row_reseed = false,
 ))]
@@ -6851,6 +6874,8 @@ fn sae_manifold_fit_minimal<'py>(
     // passes (default 0 = historical iid-only path, bit-for-bit).
     structured_residual_passes: usize,
     promote_from_residual: bool,
+    run_structure_search: bool,
+    run_outer_rho_search: bool,
     quotient_scale: bool,
     data_row_reseed: bool,
 ) -> PyResult<Py<PyDict>> {
@@ -7130,6 +7155,8 @@ fn sae_manifold_fit_minimal<'py>(
         ibp_alpha_override,
         structured_residual_passes,
         promote_from_residual,
+        run_structure_search,
+        run_outer_rho_search,
         quotient_scale,
         data_row_reseed,
     )?;
