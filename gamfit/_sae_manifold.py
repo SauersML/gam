@@ -427,6 +427,15 @@ class SaeManifoldAtomFit:
     shape_band_mean: np.ndarray | None = None
     shape_band_sd: np.ndarray | None = None
     functional_evidence: dict[str, Any] | None = None
+    # #2081 — the honest arc-length coordinate ``u_arc = s(t_i)/L in [0, 1)`` for
+    # every training row, the gauge-fixed complement to the raw ``coords`` (which
+    # are chart-arbitrary: reconstruction EV cannot certify them). Present for a
+    # ``d = 1`` circle/interval atom whose chart is non-degenerate; ``None`` for
+    # higher-d atoms or a collapsed chart (see the coordinate-fidelity
+    # ``verdict``). Downstream angle/dose/adjacency claims should read this, not
+    # ``coords``, unless the certificate verdict is ``arclength_honest``. Use
+    # :meth:`ManifoldSAE.atom_angle_coordinate` for the certificate-gated reader.
+    coords_u_arc: np.ndarray | None = None
 
 
 @dataclass(slots=True)
@@ -765,6 +774,7 @@ class ManifoldSAE:
                 shape_band_mean=shape_band_mean,
                 shape_band_sd=shape_band_sd,
                 functional_evidence=functional_evidence,
+                coords_u_arc=_opt_arr(atom, "on_atom_coords_u_arc"),
             ))
         fitted = np.asarray(payload["fitted"], dtype=float)
         assigns = np.asarray(payload["assignments_z"], dtype=float)
@@ -1082,6 +1092,18 @@ class ManifoldSAE:
           decoded curve on a uniform latent grid: ``0`` is an arc-length
           (unit-speed) chart, and a positive value means the parameterization
           squishes arc length — the failure reconstruction EV cannot see.
+        * ``verdict`` is the certified reading rule — ``"arclength_honest"``
+          (read the raw ``coords``), ``"recoverable_via_arclength"`` (read
+          ``coords_u_arc`` instead), or ``"degenerate"`` (refuse; the chart
+          collapses) — and ``certified`` is ``verdict != "degenerate"``. Use
+          :meth:`atom_angle_coordinate` for the gated reader.
+        * ``coords_u_arc`` is the honest arc-length coordinate ``s(t_i)/L`` in
+          ``[0, 1)`` for every fitted row (a pure read, computed regardless of
+          whether the decoder-mutating canonicalization committed), or ``None``
+          for a degenerate chart. ``raw_arclength_defect_rms`` /
+          ``raw_arclength_defect_max`` measure the raw-vs-``u_arc`` distance at
+          the data rows after best gauge alignment, and ``min_speed_over_mean`` /
+          ``max_speed_over_mean`` / ``log_speed_rms`` summarize the speed profile.
 
         Atoms without a ``d = 1`` chart carry a null ``topology``.
         """
@@ -1101,6 +1123,43 @@ class ManifoldSAE:
                 f"{len(self.atoms)} atoms"
             )
         return dict(rows[k])
+
+    def atom_angle_coordinate(self, atom: int) -> np.ndarray:
+        """The certificate-gated honest coordinate for one ``d = 1`` atom (#2081).
+
+        Returns the arc-length coordinate ``u_arc = s(t_i)/L in [0, 1)`` — the
+        gauge-fixed reading of the atom's manifold — for every training row. This
+        is the coordinate every angle / dose-in-nats / adjacency claim should
+        consume, because reconstruction EV provably does NOT certify the raw
+        latent coordinate (a chart can reconstruct its ring at high EV while
+        reading a squished, non-uniform angle).
+
+        The reader is gated on the coordinate-fidelity ``verdict``:
+
+        * ``arclength_honest`` — the raw chart is already arc-length; ``coords``
+          and ``coords_u_arc`` agree up to gauge. Returns ``coords_u_arc``.
+        * ``recoverable_via_arclength`` — the raw chart squishes arc length but
+          the honest coordinate is recoverable. Returns ``coords_u_arc``.
+        * ``degenerate`` — the chart collapses (the decoded speed vanishes
+          somewhere), so no faithful coordinate exists. **Raises** rather than
+          hand back an arbitrary chart.
+
+        Raises ``ValueError`` for an atom without a ``d = 1`` chart or without a
+        coordinate-fidelity certificate (refit to obtain one).
+        """
+        record = self.atom_coordinate_fidelity(atom)
+        if record.get("topology") is None:
+            raise ValueError(
+                f"atom {atom} has no d=1 circle/interval chart; no angle coordinate is defined"
+            )
+        verdict = record.get("verdict")
+        if verdict == "degenerate" or record.get("coords_u_arc") is None:
+            raise ValueError(
+                f"atom {atom} chart is degenerate (verdict={verdict!r}); the decoded curve "
+                "collapses, so no faithful angle coordinate exists — refusing rather than "
+                "returning an arbitrary chart"
+            )
+        return np.asarray(record["coords_u_arc"], dtype=float)
 
     def shape_uncertainty(self, atom: int = 0, *, n_sd: float = 1.96) -> dict[str, np.ndarray]:
         """Posterior ambient shape uncertainty for one atom.

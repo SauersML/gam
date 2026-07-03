@@ -199,4 +199,69 @@ impl TileScorer {
         }
         selectors.into_iter().map(TopSSelector::finish).collect()
     }
+
+    /// Top-`active` atoms for every row, using the sparse-dict CUDA score-block
+    /// router when the process-wide GPU mode admits it and the `rows × K` route
+    /// clears the device break-even. Auto mode never pays the slower GPU wrapper's
+    /// CPU fallback below break-even: it goes straight to the batched CPU GEMM
+    /// router above. Required mode is fail-closed and propagates the CUDA router's
+    /// error instead of silently routing on the CPU.
+    pub fn route_minibatch_dispatch(
+        &self,
+        rows: ArrayView2<'_, f32>,
+        decoder: ArrayView2<'_, f32>,
+    ) -> Result<Vec<Vec<(u32, f32)>>, String> {
+        let mode = gam_gpu::gpu_mode();
+        if mode == gam_gpu::GpuMode::Off {
+            return Ok(self.route_minibatch(rows, decoder));
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let elems = rows.nrows().saturating_mul(decoder.nrows());
+            let clears_device_floor = elems >= super::scoring_gpu::DEVICE_SCORE_BLOCK_MIN_ELEMS
+                && rows.nrows() > 0
+                && decoder.nrows() > 0;
+
+            if mode == gam_gpu::GpuMode::Required || clears_device_floor {
+                match super::scoring_gpu::route_minibatch_required(
+                    rows,
+                    decoder,
+                    self.active,
+                    self.tile,
+                    mode,
+                ) {
+                    Ok((routed, super::scoring_gpu::ScoreBlockPath::Device)) => {
+                        return Ok(routed);
+                    }
+                    Ok((_, super::scoring_gpu::ScoreBlockPath::Cpu)) => {
+                        if mode == gam_gpu::GpuMode::Required {
+                            return Err(
+                                "sparse_dict route_minibatch Required mode returned CPU path"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        if mode == gam_gpu::GpuMode::Required {
+                            return Err(err.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            if mode == gam_gpu::GpuMode::Required {
+                return Err(
+                    "sparse_dict route_minibatch GpuMode::Required: CUDA routing is only compiled \
+                     on Linux"
+                        .to_string(),
+                );
+            }
+        }
+
+        Ok(self.route_minibatch(rows, decoder))
+    }
 }

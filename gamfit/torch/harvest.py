@@ -382,7 +382,11 @@ def _capture_activations_downstream(
         def _splice(_mod: torch.nn.Module, _inp: Any, out: torch.Tensor) -> torch.Tensor:
             flat = out.reshape(-1, out.shape[-1])
             rows = [flat[i] for i in range(flat.shape[0])]
-            rows[replacement["index"]] = single_row
+            # Cast into the hook site's dtype: probes work in f32/f64 while the
+            # model may run bf16, and torch.stack rejects mixed dtypes. Autograd
+            # differentiates through the cast, so the VJP still lands in the
+            # probe's working dtype.
+            rows[replacement["index"]] = single_row.to(dtype=flat.dtype)
             new_flat = torch.stack(rows, dim=0)
             return new_flat.reshape(out.shape)
 

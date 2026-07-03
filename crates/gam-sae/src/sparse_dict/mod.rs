@@ -169,7 +169,8 @@ impl SparseDictFit {
 /// sparse dictionary `decoder` (`K×P`) and solve the per-row active-set ridge
 /// codes, returning fixed-width `(indices, codes)` each `M×active`. This is the
 /// OOS `transform` step for a fitted sparse dictionary — the tiled routing and
-/// the active-set least squares both live in the Rust core.
+/// the active-set least squares both live in the Rust core, and the route step
+/// uses the same GPU-dispatched high-`K` scorer as fitting.
 pub fn sparse_dictionary_transform(
     x: ArrayView2<'_, f32>,
     decoder: ArrayView2<'_, f32>,
@@ -190,7 +191,7 @@ pub fn sparse_dictionary_transform(
     }
     let s = active.min(k).max(1);
     let scorer = TileScorer::new(s, score_tile.max(1));
-    let routed = scorer.route_minibatch(x, decoder);
+    let routed = scorer.route_minibatch_dispatch(x, decoder)?;
     let m = x.nrows();
     let mut indices = Array2::<u32>::zeros((m, s));
     let mut codes = Array2::<f32>::zeros((m, s));

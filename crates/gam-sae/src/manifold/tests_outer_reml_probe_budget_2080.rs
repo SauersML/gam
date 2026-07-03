@@ -24,7 +24,7 @@ use super::tests::{deterministic_circle_noise, global_ev};
 use super::*;
 use crate::basis::{PeriodicHarmonicEvaluator, SaeBasisSecondJet};
 use gam_linalg::faer_ndarray::{fast_atb, FaerCholesky};
-use gam_solve::rho_optimizer::{OuterObjective, OuterProblem};
+use gam_solve::rho_optimizer::OuterProblem;
 use ndarray::{array, s, Array2, ArrayView2};
 use std::sync::Arc;
 

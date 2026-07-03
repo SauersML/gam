@@ -351,6 +351,158 @@ fn tangent_basis_orthogonal_to(axis: ArrayView1<'_, f64>) -> Result<Array2<f64>,
     Ok(basis)
 }
 
+/// The behavioral data block of a Rung-2 two-block manifold-SAE fit: the fitted
+/// sphere-tangent chart, the (unscaled, nats-unit) behavior target `Y`
+/// (`n × p_y`), the activation/behavior output split, and the REML-selected
+/// relative block weight `λ_y` (stored on the log scale).
+///
+/// # How it plugs into the existing term
+///
+/// The two-block fit is realized as an **output-space augmentation** of the
+/// ordinary `SaeManifoldTerm`: each atom's decoder is widened to
+/// `p̃ = p_x + p_y = [B_k | C_k]`, and the fit target is the stack
+/// `Z̃ = [Z | √λ_y · Y]` ([`Self::augmented_target`]). Because both output
+/// blocks are decoded from the SAME per-row basis `Φ_k(t_ik)` and the SAME gate
+/// `a_ik`, the latent coordinate `t` and the routing `a` are shared by
+/// construction — the whole arrow-Schur / REML / smoothness / evidence stack
+/// then operates on the wider output with no bespoke behavior likelihood. The
+/// `√λ_y` scaling makes the single Gaussian reconstruction dispersion `φ̂` play
+/// the role of the activation-block noise while the behavior block carries noise
+/// `φ̂ / λ_y`; `λ_y = φ_x / φ_y` is exactly the variance ratio REML selects
+/// (fixed here in Increment 2; REML-live in Increment 3).
+///
+/// The block keeps `Y` **unscaled** so the weight can be changed without
+/// re-embedding, and so [`Self::split_decoder`] can recover the true behavior
+/// decoder `C_k` (un-doing the `√λ_y`) from a fitted augmented decoder.
+#[derive(Clone, Debug)]
+pub struct BehaviorBlock {
+    /// The fitted sphere-tangent chart the behavior target was embedded through.
+    pub embedding: SphereTangentEmbedding,
+    /// Nats-unit behavior target `Y` (`n × p_y`), **unscaled** by `λ_y`.
+    pub target: Array2<f64>,
+    /// Activation output width `p_x` — the split point in the augmented output:
+    /// columns `[0, p_x)` are activation, `[p_x, p_x + p_y)` are behavior.
+    pub activation_dim: usize,
+    /// `log(λ_y)`; the relative weight of the behavior block. Fixed in Inc2,
+    /// REML-selected in Inc3. `λ_y = 1` (log 0) weights nats-in-behavior equally
+    /// with the activation reconstruction's own units.
+    pub log_lambda_y: f64,
+}
+
+impl BehaviorBlock {
+    /// Build the behavior block from raw behavioral summaries `prob_rows`
+    /// (`n × V`) and the activation output width `p_x`, at a fixed initial
+    /// `log(λ_y)`. Fits the sphere-tangent chart and stores the nats-unit target.
+    pub fn fit(
+        prob_rows: ArrayView2<'_, f64>,
+        activation_dim: usize,
+        log_lambda_y: f64,
+    ) -> Result<Self, String> {
+        if activation_dim == 0 {
+            return Err("BehaviorBlock::fit: activation_dim must be positive".into());
+        }
+        if !log_lambda_y.is_finite() {
+            return Err(format!(
+                "BehaviorBlock::fit: log_lambda_y must be finite; got {log_lambda_y}"
+            ));
+        }
+        let (embedding, target) = SphereTangentEmbedding::fit(prob_rows)?;
+        Ok(Self {
+            embedding,
+            target,
+            activation_dim,
+            log_lambda_y,
+        })
+    }
+
+    /// Behavior tangent width `p_y = V - 1`.
+    pub fn behavior_dim(&self) -> usize {
+        self.embedding.behavior_dim()
+    }
+
+    /// Augmented output width `p̃ = p_x + p_y`.
+    pub fn augmented_dim(&self) -> usize {
+        self.activation_dim + self.behavior_dim()
+    }
+
+    /// The behavior block weight `λ_y = exp(log_lambda_y)`.
+    pub fn lambda_y(&self) -> f64 {
+        self.log_lambda_y.exp()
+    }
+
+    /// `√λ_y`, the per-column scaling applied to the behavior target so a single
+    /// shared dispersion realizes the block variance ratio.
+    pub fn sqrt_lambda_y(&self) -> f64 {
+        (0.5 * self.log_lambda_y).exp()
+    }
+
+    /// Stack the activation target `Z` (`n × p_x`) with the `√λ_y`-scaled
+    /// behavior target to form the augmented fit target `Z̃ = [Z | √λ_y · Y]`
+    /// (`n × p̃`). This is what the two-block term is fit against; a change to
+    /// `λ_y` is realized by re-stacking (Inc3 lifts this to an in-loop
+    /// output-column weight so `λ_y` moves under REML without re-stacking).
+    pub fn augmented_target(&self, activation: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+        let (n, px) = activation.dim();
+        if px != self.activation_dim {
+            return Err(format!(
+                "BehaviorBlock::augmented_target: activation has {px} columns; block activation_dim \
+                 is {}",
+                self.activation_dim
+            ));
+        }
+        if self.target.nrows() != n {
+            return Err(format!(
+                "BehaviorBlock::augmented_target: activation has {n} rows but behavior target has {}",
+                self.target.nrows()
+            ));
+        }
+        let py = self.behavior_dim();
+        let sqrt_lambda = self.sqrt_lambda_y();
+        let mut augmented = Array2::<f64>::zeros((n, px + py));
+        for i in 0..n {
+            for j in 0..px {
+                augmented[[i, j]] = activation[[i, j]];
+            }
+            for j in 0..py {
+                augmented[[i, px + j]] = sqrt_lambda * self.target[[i, j]];
+            }
+        }
+        Ok(augmented)
+    }
+
+    /// Split a fitted augmented decoder `B̃_k` (`M × p̃`) into the activation
+    /// decoder `B_k` (`M × p_x`) and the **true** behavior decoder `C_k`
+    /// (`M × p_y`), un-doing the `√λ_y` scaling so `C_k` decodes directly into
+    /// nats-unit behavior tangent coordinates.
+    pub fn split_decoder(
+        &self,
+        augmented_decoder: ArrayView2<'_, f64>,
+    ) -> Result<(Array2<f64>, Array2<f64>), String> {
+        let px = self.activation_dim;
+        let py = self.behavior_dim();
+        let (m, p_tot) = augmented_decoder.dim();
+        if p_tot != px + py {
+            return Err(format!(
+                "BehaviorBlock::split_decoder: decoder has {p_tot} output columns; expected \
+                 p_x + p_y = {px} + {py} = {}",
+                px + py
+            ));
+        }
+        let inv_sqrt_lambda = 1.0 / self.sqrt_lambda_y();
+        let mut b = Array2::<f64>::zeros((m, px));
+        let mut c = Array2::<f64>::zeros((m, py));
+        for row in 0..m {
+            for j in 0..px {
+                b[[row, j]] = augmented_decoder[[row, j]];
+            }
+            for j in 0..py {
+                c[[row, j]] = inv_sqrt_lambda * augmented_decoder[[row, px + j]];
+            }
+        }
+        Ok((b, c))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

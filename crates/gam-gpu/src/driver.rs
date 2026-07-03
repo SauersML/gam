@@ -246,14 +246,14 @@ fn cuda_system_library_dirs() -> Vec<&'static str> {
 fn complete_system_cuda_stack(dir: &str) -> Option<Vec<PathBuf>> {
     let dir = Path::new(dir);
     let stack = vec![
-        first_existing(dir, &["libcudart.so.12", "libcudart.so"])?,
-        first_existing(dir, &["libnvJitLink.so.12", "libnvJitLink.so"])?,
-        first_existing(dir, &["libcublasLt.so.12", "libcublasLt.so"])?,
-        first_existing(dir, &["libcublas.so.12", "libcublas.so"])?,
-        first_existing(dir, &["libcusparse.so.12", "libcusparse.so"])?,
+        first_existing(dir, &["libcudart.so.13", "libcudart.so.12", "libcudart.so"])?,
+        first_existing(dir, &["libnvJitLink.so.13", "libnvJitLink.so.12", "libnvJitLink.so"])?,
+        first_existing(dir, &["libcublasLt.so.13", "libcublasLt.so.12", "libcublasLt.so"])?,
+        first_existing(dir, &["libcublas.so.13", "libcublas.so.12", "libcublas.so"])?,
+        first_existing(dir, &["libcusparse.so.13", "libcusparse.so.12", "libcusparse.so"])?,
         first_existing(
             dir,
-            &["libcusolver.so.12", "libcusolver.so.11", "libcusolver.so"],
+            &["libcusolver.so.13", "libcusolver.so.12", "libcusolver.so.11", "libcusolver.so"],
         )?,
     ];
     Some(stack)
@@ -264,14 +264,14 @@ fn system_cuda_stack_with_packaged_nvjitlink(dir: &str) -> Option<Vec<PathBuf>> 
     let dir = Path::new(dir);
     let nvjitlink = packaged_nvjitlink_library()?;
     let stack = vec![
-        first_existing(dir, &["libcudart.so.12", "libcudart.so"])?,
+        first_existing(dir, &["libcudart.so.13", "libcudart.so.12", "libcudart.so"])?,
         nvjitlink,
-        first_existing(dir, &["libcublasLt.so.12", "libcublasLt.so"])?,
-        first_existing(dir, &["libcublas.so.12", "libcublas.so"])?,
-        first_existing(dir, &["libcusparse.so.12", "libcusparse.so"])?,
+        first_existing(dir, &["libcublasLt.so.13", "libcublasLt.so.12", "libcublasLt.so"])?,
+        first_existing(dir, &["libcublas.so.13", "libcublas.so.12", "libcublas.so"])?,
+        first_existing(dir, &["libcusparse.so.13", "libcusparse.so.12", "libcusparse.so"])?,
         first_existing(
             dir,
-            &["libcusolver.so.12", "libcusolver.so.11", "libcusolver.so"],
+            &["libcusolver.so.13", "libcusolver.so.12", "libcusolver.so.11", "libcusolver.so"],
         )?,
     ];
     Some(stack)
@@ -282,27 +282,27 @@ fn complete_nvidia_cuda_stack(root: &Path) -> Option<Vec<PathBuf>> {
     let stack = vec![
         first_existing(
             &root.join("cuda_runtime").join("lib"),
-            &["libcudart.so.12", "libcudart.so"],
+            &["libcudart.so.13", "libcudart.so.12", "libcudart.so"],
         )?,
         first_existing(
             &root.join("nvjitlink").join("lib"),
-            &["libnvJitLink.so.12", "libnvJitLink.so"],
+            &["libnvJitLink.so.13", "libnvJitLink.so.12", "libnvJitLink.so"],
         )?,
         first_existing(
             &root.join("cublas").join("lib"),
-            &["libcublasLt.so.12", "libcublasLt.so"],
+            &["libcublasLt.so.13", "libcublasLt.so.12", "libcublasLt.so"],
         )?,
         first_existing(
             &root.join("cublas").join("lib"),
-            &["libcublas.so.12", "libcublas.so"],
+            &["libcublas.so.13", "libcublas.so.12", "libcublas.so"],
         )?,
         first_existing(
             &root.join("cusparse").join("lib"),
-            &["libcusparse.so.12", "libcusparse.so"],
+            &["libcusparse.so.13", "libcusparse.so.12", "libcusparse.so"],
         )?,
         first_existing(
             &root.join("cusolver").join("lib"),
-            &["libcusolver.so.12", "libcusolver.so.11", "libcusolver.so"],
+            &["libcusolver.so.13", "libcusolver.so.12", "libcusolver.so.11", "libcusolver.so"],
         )?,
     ];
     Some(stack)
@@ -312,7 +312,10 @@ fn complete_nvidia_cuda_stack(root: &Path) -> Option<Vec<PathBuf>> {
 fn packaged_nvjitlink_library() -> Option<PathBuf> {
     for root in nvidia_package_roots() {
         let lib_dir = root.join("nvjitlink").join("lib");
-        if let Some(path) = first_existing(&lib_dir, &["libnvJitLink.so.12", "libnvJitLink.so"]) {
+        if let Some(path) = first_existing(
+            &lib_dir,
+            &["libnvJitLink.so.13", "libnvJitLink.so.12", "libnvJitLink.so"],
+        ) {
             return Some(path);
         }
     }

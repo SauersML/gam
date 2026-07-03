@@ -644,6 +644,17 @@ pub struct SaeManifoldTerm {
     /// the block-coordinate monotonicity the composition rests on. Carried across
     /// clones like the other per-fit config so a cloned candidate keeps the lane.
     pub(crate) guards_enabled: bool,
+    /// Rung-2 behavioral data block: when `Some`, this term's output is the
+    /// AUGMENTED stack `[activation | √λ_y · behavior-tangent]` and each atom's
+    /// decoder is the widened `[B_k | C_k]`. The block records the sphere-tangent
+    /// chart, the unscaled nats-unit behavior target, the activation/behavior
+    /// output split, and the REML-selected relative weight `λ_y`. `None` ⇒ the
+    /// ordinary single-block (activation-only) term, bit-for-bit unchanged. It is
+    /// pure descriptor state (which output columns are behavior, and how to decode
+    /// them back to distributions); the joint fit itself needs no special path,
+    /// because the augmented output shares `t` and `a` by construction. Carried
+    /// across clones so a cloned candidate keeps its behavioral identity.
+    pub(crate) behavior: Option<crate::manifold::BehaviorBlock>,
 }
 
 /// #1777 — PER-FIT configuration overrides the FFI sets on a term to isolate a
@@ -710,6 +721,10 @@ impl Clone for SaeManifoldTerm {
             quotient_scale: self.quotient_scale,
             data_row_reseed: self.data_row_reseed,
             guards_enabled: self.guards_enabled,
+            // Rung-2 behavioral identity is persisted configuration (like the
+            // assignment mode / barrier override), carried across clones so a
+            // cloned candidate fits the same augmented two-block problem.
+            behavior: self.behavior.clone(),
         }
     }
 }

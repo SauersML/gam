@@ -235,6 +235,9 @@ mod tests_outer_reml_probe_budget_2080;
 #[cfg(test)]
 mod lambda_smooth_1556_tests;
 
+#[cfg(test)]
+mod tests_behavior_twoblock_rung2;
+
 pub use arrow_solver::*;
 pub use atom::*;
 pub use behavior::*;

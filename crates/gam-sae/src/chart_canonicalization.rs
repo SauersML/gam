@@ -800,6 +800,182 @@ pub fn chart_unit_speed_defect(
     Ok(Some(defect))
 }
 
+/// #2081 — the honest arc-length (unit-speed) coordinate of a fitted `d = 1`
+/// chart, computed as a PURE READ: the per-row canonical coordinate
+/// `u_i = s(t_i)/L` plus the decoder-curve speed profile, WITHOUT the decoder
+/// mutation or the [`CHART_RECOMPOSITION_REL_TOL`] recomposition gate that
+/// [`unit_speed_reparameterization`] applies.
+///
+/// The recomposition gate rightly protects a decoder REWRITE — a finite Fourier
+/// basis generically cannot re-express a warped circle within `1e-9`, so the
+/// mutating canonicalization honestly refuses. But the arc-length COORDINATE is
+/// a property of the fitted curve alone (`s(t) = ∫‖γ'‖`), so it is always
+/// computable and must always be reportable: this is the coordinate every
+/// downstream angle/dose/adjacency claim should read instead of the gauge-
+/// arbitrary raw `t` (#2081). The map is the SAME `t ↦ span·s(t)/L` the mutating
+/// path uses, so `coords_u_arc` equals the reparameterized coordinates whenever
+/// that path DID commit — this is its ungated sibling.
+///
+/// Returns `Ok(None)` (honest skip, never a fabricated coordinate) on a
+/// degenerate chart: empty basis/decoder, a non-finite / collapsed domain, or a
+/// non-finite / zero total arc length.
+#[derive(Debug, Clone)]
+pub struct ChartArcLengthReading {
+    /// Per-row canonical coordinate `u_i = s(t_i)/L ∈ [0, 1)` (circle, wrapped)
+    /// or `∈ [0, 1]` (interval) — the arc-length reparameterization normalized
+    /// to the unit interval. The honest angle/position every coordinate consumer
+    /// should read in place of the raw `t_i`.
+    pub coords_u_arc: Array1<f64>,
+    /// Speed coefficient of variation `stddev(‖γ'‖)/mean(‖γ'‖)` on the uniform
+    /// quadrature grid. `0` ⟺ the raw chart is already exactly arc-length.
+    pub speed_cv: f64,
+    /// RMS of `log(‖γ'‖/mean)` over the grid — the scale-invariant log-speed
+    /// spread (a lognormal-flavoured complement to `speed_cv`, robust to a few
+    /// fast cells dominating the variance).
+    pub log_speed_rms: f64,
+    /// `min ‖γ'‖ / mean ‖γ'‖` over the grid. Approaching `0` means the chart
+    /// nearly collapses somewhere (a flat spot in `u`), so the arc-length
+    /// reparameterization stops being a well-conditioned diffeomorphism.
+    pub min_speed_over_mean: f64,
+    /// `max ‖γ'‖ / mean ‖γ'‖` over the grid.
+    pub max_speed_over_mean: f64,
+    /// Total arc length `L` of the decoder curve over the canonical domain.
+    pub total_arc_length: f64,
+}
+
+pub fn chart_arclength_coordinates(
+    evaluator: &dyn SaeBasisEvaluator,
+    decoder: ArrayView2<'_, f64>,
+    row_coords: ArrayView1<'_, f64>,
+    topology: &CanonicalChartTopology,
+) -> Result<Option<ChartArcLengthReading>, String> {
+    let n = row_coords.len();
+    let m = decoder.nrows();
+    let p = decoder.ncols();
+    if n == 0 || m == 0 || p == 0 {
+        return Ok(None);
+    }
+    for &t in row_coords.iter() {
+        if !t.is_finite() {
+            return Ok(None);
+        }
+    }
+
+    // Canonical quadrature domain `[lo, hi]` and unit target span — IDENTICAL to
+    // `unit_speed_reparameterization`, but normalized to `[0, 1)` (we report the
+    // unit-interval coordinate, not the native-period one).
+    let (lo, hi) = match topology {
+        CanonicalChartTopology::Circle { period } => {
+            if !(period.is_finite() && *period > 0.0) {
+                return Ok(None);
+            }
+            (0.0, *period)
+        }
+        CanonicalChartTopology::Interval => {
+            let mut t_min = f64::INFINITY;
+            let mut t_max = f64::NEG_INFINITY;
+            for &t in row_coords.iter() {
+                t_min = t_min.min(t);
+                t_max = t_max.max(t);
+            }
+            let scale = t_min.abs().max(t_max.abs()).max(1.0);
+            if !(t_max - t_min > 1.0e-12 * scale) {
+                return Ok(None);
+            }
+            (t_min, t_max)
+        }
+    };
+
+    // Speed field on the composite-Simpson grid (nodes + midpoints).
+    let cells = ARC_LENGTH_GRID_CELLS;
+    let h = (hi - lo) / cells as f64;
+    let mut quad_coords = Array2::<f64>::zeros((2 * cells + 1, 1));
+    for j in 0..=cells {
+        quad_coords[[2 * j, 0]] = lo + j as f64 * h;
+        if j < cells {
+            quad_coords[[2 * j + 1, 0]] = lo + (j as f64 + 0.5) * h;
+        }
+    }
+    let (_grid_phi, grid_jet) = evaluator.evaluate(quad_coords.view())?;
+    let speeds = curve_speeds(&grid_jet, decoder)?;
+    if speeds.iter().any(|s| !s.is_finite()) {
+        return Ok(None);
+    }
+
+    // Cumulative arc length at the cell nodes (composite Simpson).
+    let mut cumulative = vec![0.0_f64; cells + 1];
+    for j in 0..cells {
+        let f0 = speeds[2 * j];
+        let fm = speeds[2 * j + 1];
+        let f1 = speeds[2 * j + 2];
+        cumulative[j + 1] = cumulative[j] + h * (f0 + 4.0 * fm + f1) / 6.0;
+    }
+    let total = cumulative[cells];
+    if !(total.is_finite() && total > 0.0) {
+        return Ok(None);
+    }
+    let inv_total = 1.0 / total;
+
+    // The canonical chart map `t ↦ s(t)/L`, normalized to `[0, 1)`.
+    let map_unit = |t: f64| -> f64 {
+        let local = match topology {
+            CanonicalChartTopology::Circle { period } => (t - lo).rem_euclid(*period),
+            CanonicalChartTopology::Interval => (t - lo).clamp(0.0, hi - lo),
+        };
+        let cell = ((local / h).floor() as usize).min(cells - 1);
+        let x = local - cell as f64 * h;
+        let s = cumulative[cell]
+            + partial_cell_arc(
+                speeds[2 * cell],
+                speeds[2 * cell + 1],
+                speeds[2 * cell + 2],
+                h,
+                x,
+            );
+        let u = s * inv_total;
+        match topology {
+            CanonicalChartTopology::Circle { .. } => u.rem_euclid(1.0),
+            CanonicalChartTopology::Interval => u.clamp(0.0, 1.0),
+        }
+    };
+    let coords_u_arc = Array1::from_iter(row_coords.iter().map(|&t| map_unit(t)));
+
+    // Speed profile over the same grid samples (nodes + midpoints).
+    let mean = speeds.iter().sum::<f64>() / speeds.len() as f64;
+    if !(mean > 0.0) {
+        return Ok(None);
+    }
+    let speed_cv = speed_uniformity_defect(&speeds);
+    let mut log_sq = 0.0_f64;
+    let mut min_over_mean = f64::INFINITY;
+    let mut max_over_mean = f64::NEG_INFINITY;
+    for &s in &speeds {
+        let ratio = s / mean;
+        min_over_mean = min_over_mean.min(ratio);
+        max_over_mean = max_over_mean.max(ratio);
+        // `s` is finite and non-negative; a genuine zero-speed cell drives
+        // `min_over_mean → 0` (caught by the diffeomorphism-floor verdict) and is
+        // excluded from the log spread so it does not poison it with `-inf`.
+        if ratio > 0.0 {
+            let l = ratio.ln();
+            log_sq += l * l;
+        }
+    }
+    let log_speed_rms = (log_sq / speeds.len() as f64).sqrt();
+    if !(speed_cv.is_finite() && log_speed_rms.is_finite() && min_over_mean.is_finite()) {
+        return Ok(None);
+    }
+
+    Ok(Some(ChartArcLengthReading {
+        coords_u_arc,
+        speed_cv,
+        log_speed_rms,
+        min_speed_over_mean: min_over_mean,
+        max_speed_over_mean: max_over_mean,
+        total_arc_length: total,
+    }))
+}
+
 /// State of the flow objective at one `θ`: the defect, the profiled scale,
 /// and the per-row flow Jacobians `A_i = Dφ_θ(t_i)` (row-major
 /// `[a00, a01, a10, a11]`) the Gauss–Newton rows are built from.

@@ -3834,6 +3834,25 @@ fn sae_manifold_fit_inner<'py>(
                 .as_matrix()
                 .into_pyarray(py),
         )?;
+        // #2081 — the honest arc-length coordinate `u_arc = s(t_i)/L` alongside
+        // the raw (gauge-arbitrary) `on_atom_coords_t`. Pulled from the
+        // coordinate-fidelity certificate the fit diagnostics just built, so it
+        // reflects the FINAL reported chart regardless of whether the mutating
+        // canonicalization committed. `None` for atoms without a d=1 chart or a
+        // degenerate chart (verdict `degenerate`) — a coordinate consumer must
+        // then read the certificate `verdict` and refuse rather than substitute
+        // the raw `t` as if it were an angle.
+        match fit_diagnostics
+            .coordinate_fidelity
+            .get(atom_idx)
+            .and_then(|entry| entry.as_ref())
+            .and_then(|fid| fid.coords_u_arc.as_ref())
+        {
+            Some(u_arc) => {
+                atom_dict.set_item("on_atom_coords_u_arc", u_arc.clone().into_pyarray(py))?
+            }
+            None => atom_dict.set_item("on_atom_coords_u_arc", py.None())?,
+        }
         atom_dict.set_item(
             "assignments_z",
             assignments.column(atom_idx).to_owned().into_pyarray(py),
@@ -4605,7 +4624,7 @@ fn sae_coordinate_fidelity_dict<'py>(
                 a.set_item("arclength_defect", fid.arclength_defect)?;
                 a.set_item("n_coords", fid.n_coords)?;
                 a.set_item("verdict", fid.verdict.label())?;
-                a.set_item("certified", fid.verdict.certified())?;
+                a.set_item("certified", fid.certified)?;
                 match &fid.coords_u_arc {
                     Some(u) => a.set_item("coords_u_arc", u.clone().into_pyarray(py))?,
                     None => a.set_item("coords_u_arc", py.None())?,

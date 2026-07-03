@@ -34,10 +34,11 @@ use std::collections::HashMap;
 
 /// Route + sparse-code every row of `x`, processing the rows in minibatches of
 /// `config.minibatch` so the peak score working set is `minibatch × score_tile`
-/// (never `N × K`). Within a minibatch the rows are routed by one batched GEMM
-/// per column tile ([`TileScorer::route_minibatch`]) and the per-row active-set
-/// code solves run in parallel. The returned `Vec<SparseCode>` is in global row
-/// order, identical to a serial row-at-a-time pass up to f32 GEMM rounding.
+/// (never `N × K`). Within a minibatch the rows are routed by the shared
+/// [`TileScorer::route_minibatch_dispatch`] policy: GPU score-blocks when
+/// admitted, otherwise the batched CPU GEMM router. The per-row active-set code
+/// solves run in parallel. The returned `Vec<SparseCode>` is in global row order,
+/// identical to a serial row-at-a-time pass up to f32 GEMM rounding.
 pub(super) fn route_and_code_all(
     x: ArrayView2<'_, f32>,
     decoder: ArrayView2<'_, f32>,
@@ -45,7 +46,7 @@ pub(super) fn route_and_code_all(
     s: usize,
     code_ridge: f32,
     minibatch: usize,
-) -> Vec<SparseCode> {
+) -> Result<Vec<SparseCode>, String> {
     let n = x.nrows();
     let batch = minibatch.max(1);
     let mut codes: Vec<SparseCode> = Vec::with_capacity(n);
@@ -53,7 +54,7 @@ pub(super) fn route_and_code_all(
     while start < n {
         let end = (start + batch).min(n);
         let block = x.slice(ndarray::s![start..end, ..]);
-        let active_lists = route_block(block, decoder, scorer);
+        let active_lists = scorer.route_minibatch_dispatch(block, decoder)?;
         // Per-row code solves are independent; fan them out over the minibatch.
         let mut block_codes: Vec<SparseCode> = block
             .axis_iter(Axis(0))
@@ -64,53 +65,7 @@ pub(super) fn route_and_code_all(
         codes.append(&mut block_codes);
         start = end;
     }
-    codes
-}
-
-/// Route one minibatch `block` (`B × P`) against `decoder` (`K × P`), returning
-/// each row's top-`s` `(atom, score)` shortlist.
-///
-/// The routing — the `N×K×P` scale-K hot loop the whole lane is built around —
-/// is GPU-offloaded when the process admits a device (Linux + CUDA runtime + a
-/// `B × K` block above the device break-even), auto-derived at runtime from
-/// [`gam_gpu::gpu_mode`] (the charter forbids gating behind a build feature). The
-/// device walks `K` in atom-column tiles so peak score memory stays `B × tile`,
-/// independent of `K` — the same no-`N×K` discipline as the CPU path. The score
-/// block is bit-identical to the CPU per-row `top_s_online` (the kernel forbids
-/// FMA contraction), so the GPU routing equals the row-at-a-time oracle exactly.
-///
-/// The universal fallback (non-Linux, [`gam_gpu::GpuMode::Off`], below
-/// break-even, or any device fault under [`gam_gpu::GpuMode::Auto`]) is the
-/// parallel CPU GEMM router [`TileScorer::route_minibatch`]. We pass
-/// [`gam_gpu::GpuMode::Auto`] — never `Required` — because a real fit must run on
-/// any box; the fit is robust to which router ran (it is minibatch-invariant, see
-/// [`TileScorer::route_minibatch`]).
-fn route_block(
-    block: ArrayView2<'_, f32>,
-    decoder: ArrayView2<'_, f32>,
-    scorer: &TileScorer,
-) -> Vec<Vec<(u32, f32)>> {
-    #[cfg(target_os = "linux")]
-    {
-        if gam_gpu::gpu_mode() != gam_gpu::GpuMode::Off {
-            // Auto: the router runs on the device when admitted and the block
-            // clears the break-even, else it returns the CPU path internally; we
-            // only adopt its result when the DEVICE actually produced it, and
-            // otherwise use the faster parallel CPU GEMM below.
-            if let Ok((routed, super::scoring_gpu::ScoreBlockPath::Device)) =
-                super::scoring_gpu::route_minibatch_required(
-                    block,
-                    decoder,
-                    scorer.active,
-                    scorer.tile,
-                    gam_gpu::GpuMode::Auto,
-                )
-            {
-                return routed;
-            }
-        }
-    }
-    scorer.route_minibatch(block, decoder)
+    Ok(codes)
 }
 
 pub(super) fn run(
@@ -144,7 +99,7 @@ pub(super) fn run(
         s,
         config.code_ridge,
         config.minibatch,
-    );
+    )?;
 
     for epoch in 0..config.max_epochs {
         epochs_run = epoch + 1;
@@ -185,7 +140,7 @@ pub(super) fn run(
             s,
             config.code_ridge,
             config.minibatch,
-        );
+        )?;
 
         // Convergence-decision EV, computed from the FRESH post-normalisation codes.
         let ev = explained_variance(x, &codes, decoder.view());
@@ -1068,7 +1023,8 @@ mod exact_solve_tests {
             s,
             config.code_ridge,
             config.minibatch,
-        );
+        )
+        .expect("fresh route");
         let fresh_ev = explained_variance(x.view(), &codes, fit.decoder.view());
         assert!(
             (fresh_ev - fit.explained_variance).abs() < 1.0e-6,

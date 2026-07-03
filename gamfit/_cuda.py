@@ -11,22 +11,22 @@ from pathlib import Path
 from typing import Iterable
 
 _CUDA_LIBRARY_GROUPS: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...] = (
-    ("cuda_runtime", (("libcudart.so.12", "libcudart.so"),)),
-    ("nvjitlink", (("libnvJitLink.so.12", "libnvJitLink.so"),)),
+    ("cuda_runtime", (("libcudart.so.13", "libcudart.so.12", "libcudart.so"),)),
+    ("nvjitlink", (("libnvJitLink.so.13", "libnvJitLink.so.12", "libnvJitLink.so"),)),
     (
         "cublas",
         (
-            ("libcublasLt.so.12", "libcublasLt.so"),
-            ("libcublas.so.12", "libcublas.so"),
+            ("libcublasLt.so.13", "libcublasLt.so.12", "libcublasLt.so"),
+            ("libcublas.so.13", "libcublas.so.12", "libcublas.so"),
         ),
     ),
-    ("cusparse", (("libcusparse.so.12", "libcusparse.so"),)),
-    ("cusolver", (("libcusolver.so.12", "libcusolver.so.11", "libcusolver.so"),)),
+    ("cusparse", (("libcusparse.so.13", "libcusparse.so.12", "libcusparse.so"),)),
+    ("cusolver", (("libcusolver.so.13", "libcusolver.so.12", "libcusolver.so.11", "libcusolver.so"),)),
 )
 
 _CUDA_SUBPROCESS_LIBRARY_GROUPS: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...] = (
     *_CUDA_LIBRARY_GROUPS,
-    ("cuda_nvrtc", (("libnvrtc.so.12", "libnvrtc.so"),)),
+    ("cuda_nvrtc", (("libnvrtc.so.13", "libnvrtc.so.12", "libnvrtc.so"),)),
 )
 
 _CUDA_DRIVER_NAMES: tuple[str, ...] = ("libcuda.so.1", "libcuda.so")

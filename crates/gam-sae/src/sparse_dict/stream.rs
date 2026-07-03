@@ -282,7 +282,7 @@ impl SparseDictStreamState {
             self.s,
             self.config.code_ridge,
             self.config.minibatch,
-        );
+        )?;
 
         // Decoder normal equations: CᵀC / CᵀX for this shard, summed into the
         // epoch's running system (exactly the one-shot assembly, one shard's rows
@@ -550,7 +550,15 @@ mod stream_tests {
     /// EV a given entry point caches.
     fn routed_ev(x: ArrayView2<'_, f32>, decoder: &Array2<f32>, s: usize, config: &SparseDictConfig) -> f64 {
         let scorer = TileScorer::new(s, config.score_tile);
-        let codes = route_and_code_all(x, decoder.view(), &scorer, s, config.code_ridge, config.minibatch);
+        let codes = route_and_code_all(
+            x,
+            decoder.view(),
+            &scorer,
+            s,
+            config.code_ridge,
+            config.minibatch,
+        )
+        .expect("fresh route");
         let n = x.nrows();
         let p = x.ncols();
         let mut means = vec![0.0f64; p];

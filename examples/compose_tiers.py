@@ -48,6 +48,11 @@ import numpy as np
 import gamfit
 from gamfit._sae_manifold import _default_ibp_concentration_for_k_atoms
 
+from compose_artifact_schema import (
+    explained_variance_train_mean,
+    require_gamfit_version,
+)
+
 # Mask constant shared with `gam_sae::corpus::rho_cascade` (full u64 hash space).
 _U64 = np.uint64(0xFFFFFFFFFFFFFFFF)
 
@@ -92,13 +97,18 @@ def stratified_subsample(
     return np.nonzero(mask)[0].astype(np.int64), 1.0 / fraction
 
 
-def explained_variance(x: np.ndarray, recon: np.ndarray) -> float:
-    """Held-in EV ``1 - RSS/TSS`` against the column-mean baseline."""
+def explained_variance(
+    x: np.ndarray, recon: np.ndarray, *, train_mean: np.ndarray | None = None
+) -> float:
+    """EV ``1 - RSS/TSS`` against an explicit train-mean baseline.
+
+    For in-sample synthetic smoke runs ``train_mean`` defaults to ``x.mean(0)``.
+    Held-out driver code should pass the train-split Tier-0 mean explicitly.
+    """
     x = np.asarray(x, dtype=np.float64)
     recon = np.asarray(recon, dtype=np.float64)
-    rss = float(np.sum((x - recon) ** 2))
-    tss = float(np.sum((x - x.mean(axis=0, keepdims=True)) ** 2))
-    return 1.0 - rss / tss if tss > 0.0 else 0.0
+    baseline = x.mean(axis=0) if train_mean is None else np.asarray(train_mean, dtype=np.float64)
+    return explained_variance_train_mean(x, recon, baseline)
 
 
 @dataclass
@@ -178,6 +188,7 @@ def compose_tiers(
     grown-vs-joint comparison (EV gap, collapse-event count, births) in
     ``result.discriminator`` — the SAC WS-A log line, a matched in-sample compare.
     """
+    require_gamfit_version()
     x = np.ascontiguousarray(np.asarray(X, dtype=np.float32))
     n = x.shape[0]
     if k2 > 64:

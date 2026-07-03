@@ -37,11 +37,78 @@
 //! more-uniform-coordinate basin wins, because EV alone provably cannot break
 //! that tie.
 
-use ndarray::ArrayView1;
+use ndarray::{Array1, ArrayView1};
 
-use crate::chart_canonicalization::CanonicalChartTopology;
+use crate::chart_canonicalization::{
+    CanonicalChartTopology, ChartArcLengthReading, SAE_FLOW_DIFFEO_MIN_DET,
+    UNIT_SPEED_INLOOP_DEFECT_TOL, chart_arclength_coordinates,
+};
 
 use super::SaeManifoldTerm;
+
+/// #2081 — the certified verdict on whether a fitted `d = 1` atom carries an
+/// honest angle/position coordinate. A downstream angle / dose-in-nats /
+/// adjacency claim keys off this: read the raw `t` only under
+/// [`Self::ArcLengthHonest`], read the canonical `u_arc` under
+/// [`Self::RecoverableViaArcLength`], and REFUSE under [`Self::Degenerate`]
+/// (the chart collapses, so no faithful coordinate exists).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AngleFidelityVerdict {
+    /// The raw fitted coordinate is already arc-length (decoder-speed CV below
+    /// the in-loop retraction tolerance [`UNIT_SPEED_INLOOP_DEFECT_TOL`]): the
+    /// reported raw `t` IS the honest angle and `u_arc ≈ t`.
+    ArcLengthHonest,
+    /// The raw coordinate is NOT arc-length, but the arc-length
+    /// reparameterization is a well-conditioned diffeomorphism (speed stays
+    /// above the [`SAE_FLOW_DIFFEO_MIN_DET`] collapse floor everywhere), so the
+    /// honest coordinate is recoverable: consumers must read `coords_u_arc`.
+    RecoverableViaArcLength,
+    /// The chart collapses — the decoder speed drops to a
+    /// [`SAE_FLOW_DIFFEO_MIN_DET`] fraction of its mean somewhere, so `u_arc`
+    /// has a flat spot and no faithful coordinate exists there. Refuse.
+    Degenerate,
+}
+
+impl AngleFidelityVerdict {
+    /// Lowercase label for the diagnostics payload.
+    pub fn label(self) -> &'static str {
+        match self {
+            AngleFidelityVerdict::ArcLengthHonest => "arclength_honest",
+            AngleFidelityVerdict::RecoverableViaArcLength => "recoverable_via_arclength",
+            AngleFidelityVerdict::Degenerate => "degenerate",
+        }
+    }
+
+    /// `true` when an honest coordinate is available (raw `t` under
+    /// `ArcLengthHonest`, `coords_u_arc` under `RecoverableViaArcLength`).
+    /// `false` only under `Degenerate`, where every coordinate consumer must
+    /// refuse rather than read an arbitrary chart.
+    pub fn certified(self) -> bool {
+        !matches!(self, AngleFidelityVerdict::Degenerate)
+    }
+}
+
+/// The certified angle-fidelity verdict from a chart's arc-length reading. The
+/// two decision thresholds are the fit's OWN dimensionless invariants, not fresh
+/// constants: the chart is a well-conditioned diffeomorphism iff its slowest
+/// speed stays above the [`SAE_FLOW_DIFFEO_MIN_DET`] fraction of the mean (the
+/// same fold floor the `d = 2` flow charts enforce on `det Dφ`), and the raw
+/// coordinate is already the honest angle iff its speed CV is below
+/// [`UNIT_SPEED_INLOOP_DEFECT_TOL`] (the same tolerance below which the in-loop
+/// retraction treats a chart as already arc-length and skips it). A `None`
+/// reading (arc length ill-defined) is `Degenerate`.
+pub fn angle_fidelity_verdict(reading: Option<&ChartArcLengthReading>) -> AngleFidelityVerdict {
+    match reading {
+        Some(r) if r.min_speed_over_mean > SAE_FLOW_DIFFEO_MIN_DET => {
+            if r.speed_cv < UNIT_SPEED_INLOOP_DEFECT_TOL {
+                AngleFidelityVerdict::ArcLengthHonest
+            } else {
+                AngleFidelityVerdict::RecoverableViaArcLength
+            }
+        }
+        _ => AngleFidelityVerdict::Degenerate,
+    }
+}
 
 /// Watson's `U²` uniformity statistic and its asymptotic null p-value for a set
 /// of coordinates already mapped onto the unit interval `[0, 1)` (a circle by
@@ -200,6 +267,38 @@ pub struct AtomCoordinateFidelity {
     pub arclength_defect: f64,
     /// Number of fitted coordinates the uniformity statistic was computed from.
     pub n_coords: usize,
+    /// The certified verdict on whether an honest coordinate is available and
+    /// which one to read ([`AngleFidelityVerdict`]).
+    pub verdict: AngleFidelityVerdict,
+    /// `true` when the certificate provides an honest coordinate. `false` only
+    /// for a collapsed / degenerate chart, where coordinate consumers must
+    /// refuse rather than read the raw chart.
+    pub certified: bool,
+    /// The honest, pure-read arc-length coordinate `u_i = s(t_i)/L ∈ [0, 1)` for
+    /// every fitted row, in atom-coordinate order — the coordinate every
+    /// downstream angle/dose/adjacency claim should read in place of the
+    /// gauge-arbitrary raw `t` (#2081). Computed regardless of whether the
+    /// mutating canonicalization committed (it is a property of the fitted curve
+    /// alone). `None` only when the chart is degenerate (arc length ill-defined).
+    pub coords_u_arc: Option<Array1<f64>>,
+    /// RMS over the fitted rows of the (circular, for a circle) distance between
+    /// the raw normalized coordinate and its arc-length image `u_arc`, after the
+    /// best rotation/reflection alignment of the residual `O(2)` gauge. `0` ⟺ the
+    /// raw coordinate already IS the arc-length coordinate up to gauge; large ⟺
+    /// the raw chart squishes arc length AT THE DATA ROWS (the #2081 pathology,
+    /// measured on data rather than a grid). `NaN` when `u_arc` is unavailable.
+    pub raw_arclength_defect_rms: f64,
+    /// Max over the fitted rows of the same aligned raw-vs-`u_arc` distance.
+    pub raw_arclength_defect_max: f64,
+    /// `min ‖γ'‖ / mean ‖γ'‖` of the decoder curve on a uniform grid. Below the
+    /// [`SAE_FLOW_DIFFEO_MIN_DET`] collapse floor drives the `Degenerate`
+    /// verdict. `NaN` when the chart is degenerate.
+    pub min_speed_over_mean: f64,
+    /// `max ‖γ'‖ / mean ‖γ'‖` on the grid. `NaN` when degenerate.
+    pub max_speed_over_mean: f64,
+    /// RMS of `log(‖γ'‖/mean)` on the grid — scale-invariant log-speed spread.
+    /// `NaN` when degenerate.
+    pub log_speed_rms: f64,
 }
 
 /// Build the coordinate-fidelity certificate for one fitted atom, or `None` when
@@ -222,9 +321,7 @@ pub fn atom_coordinate_fidelity(
         return Ok(None);
     }
     let row_coords = coords.column(0);
-    let Some(uniformity) = coordinate_uniformity(row_coords, &topology) else {
-        return Ok(None);
-    };
+    let uniformity = coordinate_uniformity(row_coords, &topology);
     let atom = &term.atoms[atom_idx];
     let evaluator = atom.basis_evaluator.as_ref().ok_or_else(|| {
         format!("atom_coordinate_fidelity: atom {atom_idx} has no basis evaluator")
@@ -235,17 +332,176 @@ pub fn atom_coordinate_fidelity(
         row_coords,
         &topology,
     )?;
+    // The honest arc-length coordinate + speed profile, computed as a pure read
+    // (ungated by the decoder-recomposition tolerance) — always reportable even
+    // when the mutating canonicalization honestly refused.
+    let reading = chart_arclength_coordinates(
+        evaluator.as_ref(),
+        atom.decoder_coefficients.view(),
+        row_coords,
+        &topology,
+    )?;
     let topology_label = match topology {
         CanonicalChartTopology::Circle { .. } => "circle",
         CanonicalChartTopology::Interval => "interval",
     };
+    let is_circle = matches!(topology, CanonicalChartTopology::Circle { .. });
+
+    let (
+        verdict,
+        coords_u_arc,
+        raw_arclength_defect_rms,
+        raw_arclength_defect_max,
+        min_speed_over_mean,
+        max_speed_over_mean,
+        log_speed_rms,
+    ) = match reading {
+        Some(r) if r.min_speed_over_mean > SAE_FLOW_DIFFEO_MIN_DET => {
+            // A well-conditioned chart: raw t is honest iff already unit-speed,
+            // otherwise the coordinate is recoverable via `u_arc`.
+            let verdict = angle_fidelity_verdict(Some(&r));
+            let (rms, max) =
+                raw_vs_arclength_defect(row_coords, r.coords_u_arc.view(), &topology, is_circle);
+            (
+                verdict,
+                Some(r.coords_u_arc),
+                rms,
+                max,
+                r.min_speed_over_mean,
+                r.max_speed_over_mean,
+                r.log_speed_rms,
+            )
+        }
+        // Collapsed chart (speed vanishes somewhere) or arc length ill-defined:
+        // no faithful coordinate exists — refuse.
+        Some(r) => (
+            AngleFidelityVerdict::Degenerate,
+            None,
+            f64::NAN,
+            f64::NAN,
+            r.min_speed_over_mean,
+            r.max_speed_over_mean,
+            r.log_speed_rms,
+        ),
+        None => (
+            AngleFidelityVerdict::Degenerate,
+            None,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+        ),
+    };
+
     Ok(Some(AtomCoordinateFidelity {
         topology: topology_label,
-        uniformity_statistic: uniformity.statistic,
-        uniformity_p_value: uniformity.p_value,
+        uniformity_statistic: uniformity
+            .as_ref()
+            .map(|u| u.statistic)
+            .unwrap_or(f64::NAN),
+        uniformity_p_value: uniformity
+            .as_ref()
+            .map(|u| u.p_value)
+            .unwrap_or(f64::NAN),
         arclength_defect: defect.unwrap_or(f64::NAN),
-        n_coords: uniformity.n,
+        n_coords: uniformity.as_ref().map(|u| u.n).unwrap_or(row_coords.len()),
+        verdict,
+        certified: verdict.certified(),
+        coords_u_arc,
+        raw_arclength_defect_rms,
+        raw_arclength_defect_max,
+        min_speed_over_mean,
+        max_speed_over_mean,
+        log_speed_rms,
     }))
+}
+
+/// The (circular, for a circle) distance between the raw normalized coordinate
+/// `t_i / span` and its arc-length image `u_i`, minimized over the residual
+/// gauge — a base-point shift `c` and an orientation flip `s ∈ {+1, −1}` — and
+/// summarized as `(rms, max)` over the rows. On a circle the residual gauge is
+/// the full `O(2)` (rotation + reflection), so the best rotation is the circular
+/// mean of `u_i − s·r_i`; on an interval it is reflection + translation, so the
+/// best shift is the ordinary mean. `0` ⟺ the raw coordinate already equals the
+/// arc-length coordinate up to that gauge (an honest, unit-speed chart at the
+/// data rows).
+fn raw_vs_arclength_defect(
+    raw: ArrayView1<'_, f64>,
+    u_arc: ArrayView1<'_, f64>,
+    topology: &CanonicalChartTopology,
+    is_circle: bool,
+) -> (f64, f64) {
+    let n = raw.len();
+    if n == 0 {
+        return (f64::NAN, f64::NAN);
+    }
+    // Raw coordinate normalized to `[0, 1)` (circle) / `[0, 1]` (interval),
+    // matching the `u_arc` normalization.
+    let r: Vec<f64> = match topology {
+        CanonicalChartTopology::Circle { period } => {
+            raw.iter().map(|&t| (t / period).rem_euclid(1.0)).collect()
+        }
+        CanonicalChartTopology::Interval => {
+            let mut lo = f64::INFINITY;
+            let mut hi = f64::NEG_INFINITY;
+            for &t in raw.iter() {
+                lo = lo.min(t);
+                hi = hi.max(t);
+            }
+            let span = hi - lo;
+            if !(span > 0.0) {
+                return (f64::NAN, f64::NAN);
+            }
+            raw.iter().map(|&t| ((t - lo) / span).clamp(0.0, 1.0)).collect()
+        }
+    };
+
+    let circ_dist = |a: f64, b: f64| -> f64 {
+        let d = (a - b).rem_euclid(1.0);
+        d.min(1.0 - d)
+    };
+
+    let mut best_rms = f64::INFINITY;
+    let mut best_max = f64::INFINITY;
+    for &s in &[1.0_f64, -1.0_f64] {
+        // Best gauge offset c: circular mean of (u - s·r) on a circle, ordinary
+        // mean on an interval.
+        let c = if is_circle {
+            let (mut sx, mut sy) = (0.0_f64, 0.0_f64);
+            for (ui, ri) in u_arc.iter().zip(r.iter()) {
+                let diff = ui - s * ri;
+                let ang = std::f64::consts::TAU * diff;
+                sx += ang.cos();
+                sy += ang.sin();
+            }
+            sy.atan2(sx) / std::f64::consts::TAU
+        } else {
+            let mut acc = 0.0_f64;
+            for (ui, ri) in u_arc.iter().zip(r.iter()) {
+                acc += ui - s * ri;
+            }
+            acc / n as f64
+        };
+        let mut sum_sq = 0.0_f64;
+        let mut max = 0.0_f64;
+        for (ui, ri) in u_arc.iter().zip(r.iter()) {
+            let aligned = s * ri + c;
+            let d = if is_circle {
+                circ_dist(*ui, aligned)
+            } else {
+                (ui - aligned).abs()
+            };
+            sum_sq += d * d;
+            max = max.max(d);
+        }
+        let rms = (sum_sq / n as f64).sqrt();
+        if rms < best_rms {
+            best_rms = rms;
+            best_max = max;
+        }
+    }
+    (best_rms, best_max)
 }
 
 /// #2081 — basin preference at (near-)equal reconstruction EV: the seed-selection
@@ -397,8 +653,58 @@ mod coordinate_fidelity_tests {
         }
     }
 
+    #[derive(Debug)]
+    struct IntervalLinearEvaluator;
+
+    impl SaeBasisEvaluator for IntervalLinearEvaluator {
+        fn evaluate(
+            &self,
+            coords: ArrayView2<'_, f64>,
+        ) -> Result<(Array2<f64>, Array3<f64>), String> {
+            let n = coords.nrows();
+            let mut phi = Array2::<f64>::zeros((n, 2));
+            let mut jet = Array3::<f64>::zeros((n, 2, 1));
+            for i in 0..n {
+                phi[[i, 0]] = 1.0;
+                phi[[i, 1]] = coords[[i, 0]];
+                jet[[i, 1, 0]] = 1.0;
+            }
+            Ok((phi, jet))
+        }
+
+        fn second_jet_dyn(
+            &self,
+            coords: ArrayView2<'_, f64>,
+        ) -> Option<Result<Array4<f64>, String>> {
+            if coords.ncols() != 1 {
+                return Some(Err(format!(
+                    "IntervalLinearEvaluator::second_jet_dyn: d = 1 evaluator got {} coords",
+                    coords.ncols()
+                )));
+            }
+            None
+        }
+
+        fn third_jet_dyn(
+            &self,
+            coords: ArrayView2<'_, f64>,
+        ) -> Option<Result<Array5<f64>, String>> {
+            if coords.ncols() != 1 {
+                return Some(Err(format!(
+                    "IntervalLinearEvaluator::third_jet_dyn: d = 1 evaluator got {} coords",
+                    coords.ncols()
+                )));
+            }
+            None
+        }
+    }
+
     fn circle() -> CanonicalChartTopology {
         CanonicalChartTopology::Circle { period: 1.0 }
+    }
+
+    fn interval() -> CanonicalChartTopology {
+        CanonicalChartTopology::Interval
     }
 
     /// The closed-form Watson p-value must reproduce the classical tabulated
@@ -614,5 +920,199 @@ mod coordinate_fidelity_tests {
             !prefer_candidate_basin(ev, Some(ub), ev, Some(ua), tol),
             "the squished seed must NOT displace the honest incumbent at equal EV"
         );
+    }
+
+    /// The honest arc-length coordinate is the pure-read complement to the raw
+    /// chart: on an already-unit-speed circle it equals the raw coordinate, the
+    /// speed profile is flat, the verdict certifies the raw reading is honest,
+    /// and the raw-vs-`u_arc` defect is ~zero.
+    #[test]
+    fn arclength_reading_is_identity_on_a_unit_speed_circle() {
+        use crate::chart_canonicalization::chart_arclength_coordinates;
+        let ev = CircleHarmonicEvaluator { harmonics: 2 };
+        let mut unit = Array2::<f64>::zeros((4, 2));
+        unit[[0, 0]] = 1.3; // cos 2πt → x
+        unit[[1, 1]] = 1.3; // sin 2πt → y
+        let rows = Array1::linspace(0.0, 0.97, 40);
+        let reading = chart_arclength_coordinates(&ev, unit.view(), rows.view(), &circle())
+            .unwrap()
+            .expect("unit-speed circle yields a reading");
+        // Constant speed ⇒ u_arc(t) = t (mod 1) and the speed profile is flat.
+        for (i, &t) in rows.iter().enumerate() {
+            let d = (reading.coords_u_arc[i] - t).rem_euclid(1.0);
+            let circ = d.min(1.0 - d);
+            assert!(circ < 1e-6, "u_arc must equal raw t on a unit-speed circle: {circ}");
+        }
+        assert!(reading.speed_cv < 1e-6, "flat speed ⇒ ~zero CV, got {}", reading.speed_cv);
+        assert!((reading.min_speed_over_mean - 1.0).abs() < 1e-6);
+        assert!((reading.max_speed_over_mean - 1.0).abs() < 1e-6);
+        assert_eq!(
+            angle_fidelity_verdict(Some(&reading)),
+            AngleFidelityVerdict::ArcLengthHonest
+        );
+        let (rms, max) =
+            raw_vs_arclength_defect(rows.view(), reading.coords_u_arc.view(), &circle(), true);
+        assert!(rms < 1e-6 && max < 1e-6, "honest chart has ~zero raw defect: rms={rms} max={max}");
+    }
+
+    /// The pure-read arclength coordinate also handles interval charts: for a
+    /// linear decoded segment the speed is constant, so the reported coordinate
+    /// is exactly the affine normalization of the fitted interval.
+    #[test]
+    fn arclength_reading_is_affine_on_a_linear_interval() {
+        use crate::chart_canonicalization::chart_arclength_coordinates;
+        let ev = IntervalLinearEvaluator;
+        let mut decoder = Array2::<f64>::zeros((2, 2));
+        decoder[[0, 0]] = 0.7;
+        decoder[[0, 1]] = -0.2;
+        decoder[[1, 0]] = 1.5;
+        decoder[[1, 1]] = -0.5;
+        let rows = Array1::linspace(-0.4, 1.3, 37);
+        let reading = chart_arclength_coordinates(&ev, decoder.view(), rows.view(), &interval())
+            .unwrap()
+            .expect("linear interval yields a reading");
+        let lo = rows[0];
+        let span = rows[rows.len() - 1] - lo;
+        for (i, &t) in rows.iter().enumerate() {
+            let expected = (t - lo) / span;
+            assert!(
+                (reading.coords_u_arc[i] - expected).abs() < 1e-9,
+                "linear interval u_arc must be affine: got {}, expected {}",
+                reading.coords_u_arc[i],
+                expected
+            );
+        }
+        assert!(reading.speed_cv < 1e-9, "linear segment has constant speed");
+        assert_eq!(
+            angle_fidelity_verdict(Some(&reading)),
+            AngleFidelityVerdict::ArcLengthHonest
+        );
+    }
+
+    /// EV-INSUFFICIENCY (the #2081 headline): a wobbly (non-unit-speed) circle
+    /// reconstructs its ring at high EV while reading a squished coordinate. The
+    /// pure-read arc-length coordinate is computed regardless (it is a property
+    /// of the fitted curve alone), the verdict flags the raw chart as
+    /// recoverable-via-arclength rather than silently trusting the raw `t`, and
+    /// `u_arc` materially differs from the raw coordinate at the data rows — the
+    /// correction reconstruction EV provably cannot make.
+    #[test]
+    fn arclength_reading_recovers_and_certifies_a_wobbly_circle() {
+        use crate::chart_canonicalization::chart_arclength_coordinates;
+        let ev = CircleHarmonicEvaluator { harmonics: 2 };
+        let mut wobbly = Array2::<f64>::zeros((4, 2));
+        wobbly[[0, 0]] = 1.3;
+        wobbly[[1, 1]] = 1.3;
+        wobbly[[2, 0]] = 0.2; // cos 4πt → x (a mild, well-conditioned wobble)
+        wobbly[[3, 1]] = 0.2; // sin 4πt → y
+        let rows = Array1::linspace(0.0, 0.98, 64);
+        let reading = chart_arclength_coordinates(&ev, wobbly.view(), rows.view(), &circle())
+            .unwrap()
+            .expect("wobbly circle yields a reading");
+        assert!(
+            reading.speed_cv > 1e-2,
+            "wobbly chart must have a positive speed CV, got {}",
+            reading.speed_cv
+        );
+        assert!(reading.min_speed_over_mean < 1.0 && reading.max_speed_over_mean > 1.0);
+        // Stays a well-conditioned diffeomorphism ⇒ RECOVERABLE, not degenerate.
+        assert!(reading.min_speed_over_mean > SAE_FLOW_DIFFEO_MIN_DET);
+        assert_eq!(
+            angle_fidelity_verdict(Some(&reading)),
+            AngleFidelityVerdict::RecoverableViaArcLength
+        );
+        let (rms, _max) =
+            raw_vs_arclength_defect(rows.view(), reading.coords_u_arc.view(), &circle(), true);
+        assert!(
+            rms > 1e-2,
+            "u_arc must materially differ from raw t on a squished chart, got rms={rms}"
+        );
+    }
+
+    /// A chart whose decoded speed COLLAPSES (a cusp where `‖γ'‖ → 0`) has no
+    /// faithful coordinate: the arc-length map has a flat spot, so the verdict is
+    /// `Degenerate` — a coordinate consumer must refuse rather than read it. Built
+    /// from a real decoder: a second harmonic of equal amplitude to the first
+    /// makes the tangent vanish at `t = 1/2`.
+    #[test]
+    fn arclength_reading_flags_a_cusped_chart_degenerate() {
+        use crate::chart_canonicalization::chart_arclength_coordinates;
+        let ev = CircleHarmonicEvaluator { harmonics: 2 };
+        let mut cusped = Array2::<f64>::zeros((4, 2));
+        cusped[[0, 0]] = 1.0; // R = 1
+        cusped[[1, 1]] = 1.0;
+        cusped[[2, 0]] = 0.5; // 4π·0.5 = 2π·1.0 ⇒ effective 2nd amp = R ⇒ cusp
+        cusped[[3, 1]] = 0.5;
+        let rows = Array1::linspace(0.0, 0.98, 64);
+        let reading = chart_arclength_coordinates(&ev, cusped.view(), rows.view(), &circle())
+            .unwrap()
+            .expect("a cusped-but-finite chart still yields a reading");
+        assert!(
+            reading.min_speed_over_mean < SAE_FLOW_DIFFEO_MIN_DET,
+            "a cusped chart must have a collapsing min speed, got {}",
+            reading.min_speed_over_mean
+        );
+        assert_eq!(
+            angle_fidelity_verdict(Some(&reading)),
+            AngleFidelityVerdict::Degenerate
+        );
+    }
+
+    /// The verdict keys off the fit's OWN dimensionless invariants, not fresh
+    /// tuned constants: the diffeomorphism collapse floor `SAE_FLOW_DIFFEO_MIN_DET`
+    /// and the in-loop retraction tolerance `UNIT_SPEED_INLOOP_DEFECT_TOL`.
+    #[test]
+    fn angle_fidelity_verdict_uses_derived_thresholds() {
+        use crate::chart_canonicalization::{
+            ChartArcLengthReading, UNIT_SPEED_INLOOP_DEFECT_TOL,
+        };
+        let mk = |speed_cv: f64, min_over: f64, max_over: f64| ChartArcLengthReading {
+            coords_u_arc: Array1::zeros(1),
+            speed_cv,
+            log_speed_rms: 0.0,
+            min_speed_over_mean: min_over,
+            max_speed_over_mean: max_over,
+            total_arc_length: 1.0,
+        };
+        // Below the retraction tol ⇒ raw t already IS the arc-length coordinate.
+        assert_eq!(
+            angle_fidelity_verdict(Some(&mk(0.1 * UNIT_SPEED_INLOOP_DEFECT_TOL, 1.0, 1.0))),
+            AngleFidelityVerdict::ArcLengthHonest
+        );
+        // Non-uniform speed but well above the collapse floor ⇒ recoverable.
+        assert_eq!(
+            angle_fidelity_verdict(Some(&mk(0.3, 2.0 * SAE_FLOW_DIFFEO_MIN_DET, 1.8))),
+            AngleFidelityVerdict::RecoverableViaArcLength
+        );
+        // Min speed below the collapse floor ⇒ degenerate (refuse).
+        assert_eq!(
+            angle_fidelity_verdict(Some(&mk(0.3, 0.5 * SAE_FLOW_DIFFEO_MIN_DET, 3.0))),
+            AngleFidelityVerdict::Degenerate
+        );
+        // No reading at all ⇒ degenerate.
+        assert_eq!(angle_fidelity_verdict(None), AngleFidelityVerdict::Degenerate);
+        assert!(AngleFidelityVerdict::ArcLengthHonest.certified());
+        assert!(AngleFidelityVerdict::RecoverableViaArcLength.certified());
+        assert!(!AngleFidelityVerdict::Degenerate.certified());
+    }
+
+    /// The raw-vs-`u_arc` defect is invariant to the circle's residual `O(2)`
+    /// gauge (rotation + reflection) — it aligns before measuring — so it reports
+    /// the genuine parameterization discrepancy, not the reading convention.
+    #[test]
+    fn raw_vs_arclength_defect_is_gauge_invariant() {
+        // A deterministic non-uniform u_arc against a uniform raw grid.
+        let n = 80;
+        let raw = Array1::linspace(0.0, 1.0 - 1.0 / n as f64, n);
+        let u_arc = Array1::from_iter(raw.iter().map(|&t| (0.5 * t * t + 0.5 * t).rem_euclid(1.0)));
+        let (rms0, _) = raw_vs_arclength_defect(raw.view(), u_arc.view(), &circle(), true);
+        // Rotate the raw base point and reflect its orientation: both are the
+        // circle's residual gauge, so the aligned defect must not change.
+        let rotated = Array1::from_iter(raw.iter().map(|&t| (t + 0.31).rem_euclid(1.0)));
+        let reflected = Array1::from_iter(raw.iter().map(|&t| (1.0 - t).rem_euclid(1.0)));
+        let (rms_rot, _) = raw_vs_arclength_defect(rotated.view(), u_arc.view(), &circle(), true);
+        let (rms_ref, _) = raw_vs_arclength_defect(reflected.view(), u_arc.view(), &circle(), true);
+        assert!((rms0 - rms_rot).abs() < 1e-9, "rotation must not change the defect: {rms0} vs {rms_rot}");
+        assert!((rms0 - rms_ref).abs() < 1e-9, "reflection must not change the defect: {rms0} vs {rms_ref}");
     }
 }

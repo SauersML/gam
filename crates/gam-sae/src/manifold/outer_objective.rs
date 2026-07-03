@@ -2324,21 +2324,17 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 let (cost, _beta_hat) =
                     match self.evaluate_with_refine_policy(rho.view(), false, false) {
                         Ok(evaluated) => evaluated,
-                        // #1782 — recoverable infeasible-ρ refusal → finite collapse
-                        // wall (zero gradient), matching the gradient/EFS lanes. The
-                        // wall still fails the Armijo/Wolfe sufficient-decrease test
-                        // (it dwarfs any real REML cost) so the line search steers
-                        // back into the PD region, but a BOUNDED cost keeps a
-                        // globally-refused seed neighbourhood from tripping the
-                        // bridge's non-termination guard (see
-                        // `recoverable_refusal_wall_cost`).
+                        // #2080 — the `Value` order is the BFGS / ARC line-search
+                        // probe lane, where the bridge can distinguish an
+                        // infeasible trial and count it in the recoverable-probe
+                        // guard. Do not hide this behind the finite #1782 wall:
+                        // a non-PD Laplace probe is not an ordinary Wolfe value.
+                        // The finite wall remains on `eval_cost` / EFS / startup
+                        // lanes, where it is deliberately used for seed survival.
                         Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
-                            return Ok(OuterEval {
-                                cost: Self::recoverable_refusal_wall_cost(),
-                                gradient: Array1::zeros(rho.len()),
-                                hessian: HessianResult::Unavailable,
-                                inner_beta_hint: None,
-                            });
+                            self.probe_telemetry.record_refusal_kind(&err);
+                            self.probe_telemetry.wall_cost_value_probes += 1;
+                            return Ok(OuterEval::infeasible(rho.len()));
                         }
                         Err(err) => return Err(EstimationError::RemlOptimizationFailed(err)),
                     };

@@ -87,6 +87,9 @@ impl SaeManifoldTerm {
             atom_inner_fits: None,
             oos_linear_images: None,
             separation_barrier_strength_override: None,
+            // Rung-2 behavioral block: default None (ordinary single-block term,
+            // bit-for-bit unchanged). Attached via `set_behavior_block`.
+            behavior: None,
         })
     }
 
@@ -819,6 +822,57 @@ impl SaeManifoldTerm {
     /// SAC — whether the Layer-1 collapse-guard stack is armed on this term.
     pub fn guards_enabled(&self) -> bool {
         self.guards_enabled
+    }
+
+    /// Rung-2 — attach the behavioral data block, declaring this an augmented
+    /// two-block term. Validates that the block's augmented output width
+    /// `p_x + p_y` equals the term's actual `output_dim()` (the caller must have
+    /// built the atoms at the augmented width) and that its row count matches, so
+    /// the descriptor cannot silently disagree with the decoders it describes.
+    pub fn set_behavior_block(
+        &mut self,
+        block: crate::manifold::BehaviorBlock,
+    ) -> Result<(), String> {
+        if block.augmented_dim() != self.output_dim() {
+            return Err(format!(
+                "SaeManifoldTerm::set_behavior_block: block augmented width p_x+p_y = {} but the \
+                 term's output_dim is {} (atoms must be built at the augmented width)",
+                block.augmented_dim(),
+                self.output_dim()
+            ));
+        }
+        if block.target.nrows() != self.n_obs() {
+            return Err(format!(
+                "SaeManifoldTerm::set_behavior_block: behavior target has {} rows but term has {}",
+                block.target.nrows(),
+                self.n_obs()
+            ));
+        }
+        self.behavior = Some(block);
+        Ok(())
+    }
+
+    /// Rung-2 — the behavioral data block, if this is a two-block term.
+    pub fn behavior_block(&self) -> Option<&crate::manifold::BehaviorBlock> {
+        self.behavior.as_ref()
+    }
+
+    /// Rung-2 — the activation output width `p_x` (the split point in the
+    /// augmented output). Equals the full `output_dim()` for an ordinary
+    /// single-block term (no behavior block installed).
+    pub fn activation_output_dim(&self) -> usize {
+        match &self.behavior {
+            Some(block) => block.activation_dim,
+            None => self.output_dim(),
+        }
+    }
+
+    /// Rung-2 — the half-open behavior output column range `[p_x, p_x + p_y)`, or
+    /// `None` for a single-block term.
+    pub fn behavior_output_range(&self) -> Option<std::ops::Range<usize>> {
+        self.behavior
+            .as_ref()
+            .map(|block| block.activation_dim..block.augmented_dim())
     }
 
     /// The installed per-row metric, if any. `None` ⇒ Euclidean / isotropic.
