@@ -375,8 +375,7 @@ class _DuchonJetFn(torch.autograd.Function):
 class _DuchonBasisFn(torch.autograd.Function):
     """Autograd Function evaluating the Rust multi-dim Duchon basis.
 
-    The Rust Duchon *forward* design is **not** the raw centerwise radial
-    kernel ``K(x, C)``; it is the built design
+    The differentiable Duchon *forward* design is the built design
 
     ``X(x) = [ α · K(x, C) · Z ,  P(x) ]``,
 
@@ -389,6 +388,18 @@ class _DuchonBasisFn(torch.autograd.Function):
     the Jacobian — the input-location Hessian — is itself well-defined via the
     Rust second jet. Gradients with respect to ``points`` are exact and
     analytic; ``centers`` and the structural spec carry no gradient.
+
+    Both the forward design **and** the jets are produced by the SAME Rust
+    builder — ``build_duchon_basis_design_and_jets`` via
+    :func:`_duchon_design_jets` — so the jet is, by construction, the exact
+    input-location derivative of the returned forward. The basis-only forward
+    ``_api.duchon_basis`` (``build_duchon_basis``) is *not* used here: on the
+    dense path it applies a data-metric radial reparameterization ``V``
+    (gam#1355) that (a) is recomputed from the whole passed batch — so it is
+    not a per-point-local feature map — and (b) drops near-null kernel modes,
+    changing both the column construction and the design *width*. Contracting
+    the batch-invariant jets against that reparameterized forward gave a wrong
+    (and, when the width differed, un-broadcastable) input gradient (gam#2097).
     """
 
     @staticmethod
@@ -403,7 +414,9 @@ class _DuchonBasisFn(torch.autograd.Function):
         pts_np = to_numpy_f64(points)
         ctrs_np = to_numpy_f64(centers)
         kwargs = _duchon_basis_kwargs(m, length_scale, periodic_per_axis)
-        basis_np = _api.duchon_basis(pts_np, ctrs_np, **kwargs)
+        # Forward design comes from the jet builder so that the analytic
+        # backward differentiates exactly the matrix returned here.
+        basis_np, _jet, _hess = _duchon_design_jets(pts_np, ctrs_np, kwargs)
         ctx.save_for_backward(points, centers)
         ctx.m = int(m)
         ctx.length_scale = length_scale
