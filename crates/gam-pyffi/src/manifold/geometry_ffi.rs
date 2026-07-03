@@ -4806,6 +4806,7 @@ fn sparse_dictionary_fit<'py>(
         code_ridge,
         decoder_ridge,
         tolerance,
+        score_mode: gam::gpu::GpuMode::Auto,
     };
     let fit = detach_py_result(py, "sparse_dictionary_fit", move || {
         fit_sparse_dictionary(x_values.view(), &config)
@@ -5002,6 +5003,7 @@ impl SparseDictStream {
             code_ridge,
             decoder_ridge,
             tolerance,
+            score_mode: gam::gpu::GpuMode::Auto,
         };
         let inner = py
             .detach(|| SparseDictStreamState::new(seed_values.view(), &config))

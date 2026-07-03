@@ -36,7 +36,7 @@
 //! the two coincide once the dictionary is fully populated and revival goes
 //! quiescent.
 
-use super::SparseDictConfig;
+use super::{ScoreRouteStats, SparseDictConfig};
 use super::scoring::TileScorer;
 use super::update::{
     DEAD_DENOM, DecoderNormalEq, route_and_code_all, seed_decoder, solve_decoder, unit_norm_rows,
@@ -57,6 +57,8 @@ pub struct ShardStats {
     /// Distinct atoms that have fired at least once so far this epoch (cumulative
     /// across the shards seen since the last [`SparseDictStreamState::end_epoch`]).
     pub alive_atoms: usize,
+    /// CPU/GPU scoring counters for this shard route.
+    pub score_route_stats: ScoreRouteStats,
 }
 
 /// Per-epoch summary returned by [`SparseDictStreamState::end_epoch`].
@@ -200,6 +202,7 @@ pub struct SparseDictStreamState {
     epochs_run: usize,
     last_revived: usize,
     converged: bool,
+    score_route_stats: ScoreRouteStats,
 }
 
 impl SparseDictStreamState {
@@ -247,6 +250,7 @@ impl SparseDictStreamState {
             epochs_run: 0,
             last_revived: 0,
             converged: false,
+            score_route_stats: ScoreRouteStats::default(),
         })
     }
 
@@ -261,6 +265,7 @@ impl SparseDictStreamState {
                 rows: 0,
                 rss: 0.0,
                 alive_atoms: self.alive_count,
+                score_route_stats: ScoreRouteStats::default(),
             });
         }
         if shard.ncols() != self.p {
@@ -275,6 +280,7 @@ impl SparseDictStreamState {
             return Err("SparseDictStream.partial_fit shard must be finite".to_string());
         }
 
+        let mut shard_route_stats = ScoreRouteStats::default();
         let codes = route_and_code_all(
             shard,
             self.decoder.view(),
@@ -282,7 +288,10 @@ impl SparseDictStreamState {
             self.s,
             self.config.code_ridge,
             self.config.minibatch,
+            self.config.score_mode,
+            Some(&mut shard_route_stats),
         )?;
+        self.score_route_stats.absorb(shard_route_stats);
 
         // Decoder normal equations: CᵀC / CᵀX for this shard, summed into the
         // epoch's running system (exactly the one-shot assembly, one shard's rows
@@ -328,6 +337,7 @@ impl SparseDictStreamState {
             rows: codes.len(),
             rss: shard_rss,
             alive_atoms: self.alive_count,
+            score_route_stats: shard_route_stats,
         })
     }
 
@@ -470,6 +480,7 @@ impl SparseDictStreamState {
             epochs: self.epochs_run,
             explained_variance: self.last_ev,
             converged: self.converged,
+            score_route_stats: self.score_route_stats,
         }
     }
 
@@ -505,6 +516,8 @@ pub struct SparseDictArtifact {
     pub explained_variance: f64,
     /// Whether the streaming loop met the convergence rule.
     pub converged: bool,
+    /// Aggregate CPU/GPU scoring counters across streamed shards.
+    pub score_route_stats: ScoreRouteStats,
 }
 
 fn validate_config(config: &SparseDictConfig) -> Result<(), String> {

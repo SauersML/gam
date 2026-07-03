@@ -9,6 +9,87 @@
 
 use ndarray::{ArrayView1, ArrayView2, Axis};
 
+/// Minibatch score route path selected by [`TileScorer::route_minibatch_with_mode`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScoreRoutePath {
+    /// The CUDA score-block router computed the minibatch scores.
+    Device,
+    /// A host router computed the minibatch scores.
+    Cpu,
+}
+
+/// Routed minibatch plus the dispatch plan/path used to produce it.
+#[derive(Clone, Debug)]
+pub struct ScoreRouteResult {
+    /// One top-`active` shortlist per input row.
+    pub selections: Vec<Vec<(u32, f32)>>,
+    /// CPU/device path that produced the score route.
+    pub path: ScoreRoutePath,
+    /// Shape, admission, and tile geometry for this score route.
+    pub plan: gam_gpu::DictionaryScoreRoutePlan,
+}
+
+/// Aggregate score-route counters for a sparse-dictionary fit or stream.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ScoreRouteStats {
+    /// Minibatches routed.
+    pub minibatches: usize,
+    /// Minibatches whose shape cleared the device admission floor.
+    pub admitted_minibatches: usize,
+    /// Minibatches scored by the CUDA router.
+    pub device_minibatches: usize,
+    /// Minibatches scored on the host.
+    pub cpu_minibatches: usize,
+    /// Total route score elements (`rows * atoms`) considered.
+    pub score_elements: u128,
+    /// Total number of score tiles walked across all minibatches.
+    pub score_tiles: usize,
+    /// Maximum score-block bytes held by any single route tile.
+    pub peak_score_bytes: usize,
+    /// Lower-bound dot-product arithmetic across all routed scores.
+    pub dot_flops_lower_bound: u128,
+}
+
+impl ScoreRouteStats {
+    /// Fold one routed minibatch into the aggregate counters.
+    pub fn record(&mut self, plan: gam_gpu::DictionaryScoreRoutePlan, path: ScoreRoutePath) {
+        self.minibatches += 1;
+        if plan.device_admitted {
+            self.admitted_minibatches += 1;
+        }
+        match path {
+            ScoreRoutePath::Device => self.device_minibatches += 1,
+            ScoreRoutePath::Cpu => self.cpu_minibatches += 1,
+        }
+        self.score_elements = self
+            .score_elements
+            .saturating_add((plan.n_rows as u128).saturating_mul(plan.n_items as u128));
+        self.score_tiles = self.score_tiles.saturating_add(plan.tile_count);
+        self.peak_score_bytes = self.peak_score_bytes.max(plan.peak_score_bytes);
+        self.dot_flops_lower_bound = self
+            .dot_flops_lower_bound
+            .saturating_add(plan.dot_flops_lower_bound);
+    }
+
+    /// Merge another aggregate into this one.
+    pub fn absorb(&mut self, other: Self) {
+        self.minibatches = self.minibatches.saturating_add(other.minibatches);
+        self.admitted_minibatches = self
+            .admitted_minibatches
+            .saturating_add(other.admitted_minibatches);
+        self.device_minibatches = self
+            .device_minibatches
+            .saturating_add(other.device_minibatches);
+        self.cpu_minibatches = self.cpu_minibatches.saturating_add(other.cpu_minibatches);
+        self.score_elements = self.score_elements.saturating_add(other.score_elements);
+        self.score_tiles = self.score_tiles.saturating_add(other.score_tiles);
+        self.peak_score_bytes = self.peak_score_bytes.max(other.peak_score_bytes);
+        self.dot_flops_lower_bound = self
+            .dot_flops_lower_bound
+            .saturating_add(other.dot_flops_lower_bound);
+    }
+}
+
 /// Online "keep the `s` largest-magnitude scores seen so far" selector for a
 /// single row. Selection is by `|score|` (the dictionary atoms are unit-norm,
 /// so `|xᵀd|` is the magnitude of the optimal 1-atom projection); ties break by
@@ -211,21 +292,51 @@ impl TileScorer {
         rows: ArrayView2<'_, f32>,
         decoder: ArrayView2<'_, f32>,
     ) -> Result<Vec<Vec<(u32, f32)>>, String> {
-        let mode = gam_gpu::gpu_mode();
+        Ok(self
+            .route_minibatch_with_mode(rows, decoder, gam_gpu::gpu_mode())?
+            .selections)
+    }
+
+    /// Top-`active` atoms for every row under an explicit GPU residency mode.
+    ///
+    /// This is the reusable Rust control surface for high-`K` T1 scoring:
+    /// callers can choose `Off`, `Auto`, or fail-closed `Required` per fit/route,
+    /// and can inspect the returned [`ScoreRouteResult`] to verify whether a route
+    /// was device-admitted and whether it actually used the CUDA score-block path.
+    pub fn route_minibatch_with_mode(
+        &self,
+        rows: ArrayView2<'_, f32>,
+        decoder: ArrayView2<'_, f32>,
+        mode: gam_gpu::GpuMode,
+    ) -> Result<ScoreRouteResult, String> {
+        let plan = gam_gpu::DictionaryScoreRoutePlan::default_for_shape(
+            rows.nrows(),
+            decoder.nrows(),
+            decoder.ncols(),
+        );
         if mode == gam_gpu::GpuMode::Off {
-            return Ok(self.route_minibatch(rows, decoder));
+            return Ok(ScoreRouteResult {
+                selections: self.route_minibatch(rows, decoder),
+                path: ScoreRoutePath::Cpu,
+                plan,
+            });
+        }
+
+        if mode == gam_gpu::GpuMode::Required && !plan.device_admitted {
+            return Err(format!(
+                "sparse_dict route_minibatch GpuMode::Required: block of {}x{} = {} elems is \
+                 below the device launch break-even (DEVICE_SCORE_BLOCK_MIN_ELEMS={}); refusing \
+                 to silently run on the CPU",
+                plan.n_rows,
+                plan.n_items,
+                plan.n_rows.saturating_mul(plan.n_items),
+                plan.device_min_score_elems
+            ));
         }
 
         #[cfg(target_os = "linux")]
         {
-            let plan = gam_gpu::DictionaryScoreRoutePlan::default_for_shape(
-                rows.nrows(),
-                decoder.nrows(),
-                decoder.ncols(),
-            );
-            let clears_device_floor = plan.device_admitted;
-
-            if mode == gam_gpu::GpuMode::Required || clears_device_floor {
+            if mode == gam_gpu::GpuMode::Required || plan.device_admitted {
                 match super::scoring_gpu::route_minibatch_required(
                     rows,
                     decoder,
@@ -234,15 +345,24 @@ impl TileScorer {
                     mode,
                 ) {
                     Ok((routed, super::scoring_gpu::ScoreBlockPath::Device)) => {
-                        return Ok(routed);
+                        return Ok(ScoreRouteResult {
+                            selections: routed,
+                            path: ScoreRoutePath::Device,
+                            plan,
+                        });
                     }
-                    Ok((_, super::scoring_gpu::ScoreBlockPath::Cpu)) => {
+                    Ok((routed, super::scoring_gpu::ScoreBlockPath::Cpu)) => {
                         if mode == gam_gpu::GpuMode::Required {
                             return Err(
                                 "sparse_dict route_minibatch Required mode returned CPU path"
                                     .to_string(),
                             );
                         }
+                        return Ok(ScoreRouteResult {
+                            selections: routed,
+                            path: ScoreRoutePath::Cpu,
+                            plan,
+                        });
                     }
                     Err(err) => {
                         if mode == gam_gpu::GpuMode::Required {
@@ -264,6 +384,10 @@ impl TileScorer {
             }
         }
 
-        Ok(self.route_minibatch(rows, decoder))
+        Ok(ScoreRouteResult {
+            selections: self.route_minibatch(rows, decoder),
+            path: ScoreRoutePath::Cpu,
+            plan,
+        })
     }
 }

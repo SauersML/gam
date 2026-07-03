@@ -26,7 +26,7 @@
 //! remains a one-shot exact diagonal solve.
 
 use super::codes::{SparseCode, solve_row_codes};
-use super::scoring::TileScorer;
+use super::scoring::{ScoreRouteStats, TileScorer};
 use super::{SparseDictConfig, SparseDictFit};
 use ndarray::{Array2, ArrayView2, Axis};
 use rayon::prelude::*;
@@ -46,6 +46,8 @@ pub(super) fn route_and_code_all(
     s: usize,
     code_ridge: f32,
     minibatch: usize,
+    score_mode: gam_gpu::GpuMode,
+    mut score_route_stats: Option<&mut ScoreRouteStats>,
 ) -> Result<Vec<SparseCode>, String> {
     let n = x.nrows();
     let batch = minibatch.max(1);
@@ -54,7 +56,11 @@ pub(super) fn route_and_code_all(
     while start < n {
         let end = (start + batch).min(n);
         let block = x.slice(ndarray::s![start..end, ..]);
-        let active_lists = scorer.route_minibatch_dispatch(block, decoder)?;
+        let routed = scorer.route_minibatch_with_mode(block, decoder, score_mode)?;
+        if let Some(stats) = score_route_stats.as_deref_mut() {
+            stats.record(routed.plan, routed.path);
+        }
+        let active_lists = routed.selections;
         // Per-row code solves are independent; fan them out over the minibatch.
         let mut block_codes: Vec<SparseCode> = block
             .axis_iter(Axis(0))
@@ -82,6 +88,7 @@ pub(super) fn run(
     unit_norm_rows(&mut decoder);
 
     let scorer = TileScorer::new(s, config.score_tile);
+    let mut score_route_stats = ScoreRouteStats::default();
     let mut prev_ev = f64::NEG_INFINITY;
     let mut converged = false;
     let mut epochs_run = 0usize;
@@ -99,6 +106,8 @@ pub(super) fn run(
         s,
         config.code_ridge,
         config.minibatch,
+        config.score_mode,
+        Some(&mut score_route_stats),
     )?;
 
     for epoch in 0..config.max_epochs {
@@ -140,6 +149,8 @@ pub(super) fn run(
             s,
             config.code_ridge,
             config.minibatch,
+            config.score_mode,
+            Some(&mut score_route_stats),
         )?;
 
         // Convergence-decision EV, computed from the FRESH post-normalisation codes.
@@ -178,6 +189,7 @@ pub(super) fn run(
         epochs: epochs_run,
         converged,
         active: s,
+        score_route_stats,
     })
 }
 
