@@ -6,6 +6,7 @@ use faer::{Side, Unbind};
 use gam_problem::LinearInequalityConstraints;
 use ndarray::{Array1, Array2, s};
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::collections::HashSet;
 
 /// Primal-feasibility tolerance the inequality-constrained active-set Newton
@@ -489,6 +490,67 @@ pub(crate) fn interior_seed_margin() -> f64 {
     ACTIVE_SET_INTERIOR_SEED_MARGIN
 }
 
+/// Maximum nesting depth of the strictly-interior feasibility repair before the
+/// solver stops re-projecting and surfaces an honest constraint-violation error.
+///
+/// [`project_point_strictly_into_feasible_cone`] and
+/// [`solve_quadratic_with_linear_constraints`] are mutually recursive: the
+/// quadratic solve's final feasibility contract (#1108) projects an infeasible
+/// iterate back onto the cone, and that projection itself solves an inner
+/// identity-Hessian QP whose *own* feasibility contract can project again. On a
+/// well-conditioned cone the repair converges at depth 0–1 — each level shifts
+/// every one-sided row strictly further inward. But on near-anti-parallel rows
+/// (the clamped / anchored monotone time-warp constraints an interval-censored
+/// survival fit emits, which are only *near* — not exactly — anti-parallel and so
+/// slip past the zero-width equality lift below), the inward-shifted QP can keep
+/// returning an infeasible candidate, so the `solve ↔ project` recursion never
+/// bottoms out and exhausts the worker stack. A cone that cannot be certified
+/// feasible within this many successive inward shifts is degenerate; the
+/// projection then returns `None`, which the quadratic solve reports as
+/// [`EstimationError::ParameterConstraintViolation`] rather than recursing.
+const MAX_FEASIBILITY_REPAIR_DEPTH: u32 = 16;
+
+thread_local! {
+    /// Current nesting depth of the `solve ↔ project` feasibility-repair cycle on
+    /// this thread. Every recursion path (the quadratic solve's repair step and
+    /// the projected-gradient fallback alike) routes back through
+    /// [`project_point_strictly_into_feasible_cone`], so bounding its re-entrancy
+    /// bounds the whole cycle. Per-thread because each solve runs to completion on
+    /// a single call stack; independent solves on other worker threads carry their
+    /// own counter.
+    static FEASIBILITY_REPAIR_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// RAII depth counter for the feasibility-repair recursion. [`enter`] increments
+/// the per-thread depth and returns a guard whose `Drop` restores it on every
+/// exit path — including the projection's many `return None` branches — so the
+/// counter can never leak. It yields `None` once
+/// [`MAX_FEASIBILITY_REPAIR_DEPTH`] is reached, so the caller bails out of the
+/// recursion instead of descending another level.
+///
+/// [`enter`]: FeasibilityRepairGuard::enter
+struct FeasibilityRepairGuard;
+
+impl FeasibilityRepairGuard {
+    fn enter() -> Option<Self> {
+        FEASIBILITY_REPAIR_DEPTH.with(|depth| {
+            let current = depth.get();
+            if current >= MAX_FEASIBILITY_REPAIR_DEPTH {
+                None
+            } else {
+                depth.set(current + 1);
+                Some(Self)
+            }
+        })
+    }
+}
+
+impl Drop for FeasibilityRepairGuard {
+    fn drop(&mut self) {
+        FEASIBILITY_REPAIR_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
 /// Project `point` to a *strictly interior* feasible point of the polyhedron
 /// `{β : A·β ≥ b}`: the solution of `min_β ½‖β − point‖²` subject to the
 /// margin-shifted system `A·β ≥ b + δ·‖a_i‖`, with `δ =
@@ -521,6 +583,12 @@ pub fn project_point_strictly_into_feasible_cone(
     point: &Array1<f64>,
     constraints: &LinearInequalityConstraints,
 ) -> Option<Array1<f64>> {
+    // Bound the mutually-recursive `solve ↔ project` feasibility repair. Every
+    // recursion path re-enters here, so a too-deep call returns `None` (a
+    // degenerate cone the strictly-interior QP cannot certify) instead of
+    // recursing until the worker stack overflows. The guard restores the
+    // per-thread depth on every early return via its `Drop`.
+    let _repair_guard = FeasibilityRepairGuard::enter()?;
     let p = point.len();
     let m = constraints.a.nrows();
     if constraints.a.ncols() != p || m == 0 || constraints.b.len() != m {
