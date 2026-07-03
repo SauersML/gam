@@ -41,7 +41,7 @@ thiserror = "2.0.18"
 wide = "0.7"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-cudarc = { version = "0.19.6", default-features = false, features = ["std", "driver", "runtime", "nvrtc", "cublas", "cublaslt", "cusparse", "cusolver", "cusolvermg", "curand", "nvtx", "cupti", "fallback-dynamic-loading", "cuda-12080"] }
+cudarc = { version = "0.19.6", default-features = false, features = ["std", "driver", "runtime", "nvrtc", "cublas", "cublaslt", "cusparse", "cusolver", "cusolvermg", "curand", "nvtx", "cupti", "fallback-dynamic-loading", "cuda-13000"] }
 
 [dev-dependencies]
 approx = "0.5.1"

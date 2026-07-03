@@ -32,7 +32,7 @@ serde_json = { version = "1.0.149", features = ["float_roundtrip"] }
 statrs = "0.18.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-cudarc = { version = "0.19.6", default-features = false, features = ["std", "driver", "runtime", "nvrtc", "cublas", "cublaslt", "cusparse", "cusolver", "cusolvermg", "curand", "nvtx", "cupti", "fallback-dynamic-loading", "cuda-12080"] }
+cudarc = { version = "0.19.6", default-features = false, features = ["std", "driver", "runtime", "nvrtc", "cublas", "cublaslt", "cusparse", "cusolver", "cusolvermg", "curand", "nvtx", "cupti", "fallback-dynamic-loading", "cuda-13000"] }
 
 [dev-dependencies]
 approx = "0.5.1"
