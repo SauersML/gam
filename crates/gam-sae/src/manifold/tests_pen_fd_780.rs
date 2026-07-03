@@ -536,6 +536,34 @@ pub(crate) fn sae_pen_fd_check(
         .assemble_arrow_schur(target.view(), rho, Some(registry))
         .unwrap();
 
+    // Coordinate-tier FD objective: data-fit + smoothness + ONLY the Psi-tier
+    // (coordinate) analytic penalties. The β-tier decoder penalties
+    // (DecoderIncoherence / MechanismSparsity / NuclearNorm) and the frozen-gate
+    // decoder repulsion / separation barrier are coordinate-INDEPENDENT, so the
+    // assembled coord gradient `rows[].gt` carries exactly zero of them. The
+    // `decoder_incoherence_k2` fixture drives its incoherence VALUE to ~7e4;
+    // folding that coord-constant into `penalized_objective_total` BEFORE the
+    // central difference is catastrophic cancellation (the ~1e2 loss loses its
+    // low bits when summed into the ~7e4 penalty, injecting ~3e-6 of FD roundoff
+    // that the exact `gt` — correctly carrying no coord-gradient for a β-only
+    // penalty — cannot match). Isolating the coord-tier value (all-penalty value
+    // minus the β-tier decoder value) keeps the huge coord-constant OUT of the
+    // differenced objective, so the coord FD sees only the terms `gt` truly
+    // differentiates. Single-atom blocks (isometry/ard/scadmcp/nuclearnorm) are
+    // unchanged: their β-tier value is coord-independent and cancels in the
+    // central difference either way. (The decoder block below keeps the full
+    // `penalized_objective_total` — the β penalties ARE what its gradient matches.)
+    let coord_objective = |t: &SaeManifoldTerm| -> f64 {
+        let loss = t.loss(target.view(), rho).expect("coord fd loss").total();
+        let all_penalty = t
+            .analytic_penalty_value_total(registry, 1.0)
+            .expect("coord fd all-penalty value");
+        let beta_penalty = t
+            .analytic_decoder_penalty_value_total(registry)
+            .expect("coord fd beta-penalty value");
+        loss + (all_penalty - beta_penalty)
+    };
+
     let mut coord = SaeFdWorst::new();
     let coord_offsets = base.assignment.coord_offsets();
     for atom_idx in 0..base.k_atoms() {
@@ -553,9 +581,7 @@ pub(crate) fn sae_pen_fd_check(
                 plus.assignment.coords[atom_idx].set_flat(flat_p.view());
                 let coords_p = plus.assignment.coords[atom_idx].as_matrix();
                 plus.atoms[atom_idx].refresh_basis(coords_p.view()).unwrap();
-                let obj_p = plus
-                    .penalized_objective_total(target.view(), rho, Some(registry), 1.0)
-                    .unwrap();
+                let obj_p = coord_objective(&plus);
 
                 let mut minus = base.clone();
                 reinstall_frozen_gates(&mut minus);
@@ -566,9 +592,7 @@ pub(crate) fn sae_pen_fd_check(
                 minus.atoms[atom_idx]
                     .refresh_basis(coords_m.view())
                     .unwrap();
-                let obj_m = minus
-                    .penalized_objective_total(target.view(), rho, Some(registry), 1.0)
-                    .unwrap();
+                let obj_m = coord_objective(&minus);
 
                 let finite_difference = (obj_p - obj_m) / (2.0 * epsilon);
                 coord.observe(

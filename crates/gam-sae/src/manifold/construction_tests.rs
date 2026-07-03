@@ -913,22 +913,30 @@ mod step2_quotient_scale_tests {
         let offsets = term.beta_offsets();
         let p = term.output_dim();
         // `sys.gb` is the β-gradient of the objective the STEP-2 inner Newton step
-        // descends — i.e. `penalized_objective_total`, NOT just `data_fit +
-        // smoothness`. On this 2-atom coactive fixture the #1026/#1522
-        // separation-barrier `P = −μ q w(c²) log(1−c²+ε)` is live (the two decoders
-        // are non-orthogonal ⇒ `c² > 0`), so its force `∂P/∂B`
-        // (`add_sae_separation_barrier`) is accumulated into `sys.gb` alongside the
-        // data-fit `Jᵀr` and smoothness `λ S B` — omitting it made the historical
-        // `data_fit + smoothness` FD disagree by the whole barrier force (~120× at
-        // basis 0). The barrier force is scale-gauge invariant (it sees only the
-        // normalized cross `c² = ‖B_jᵀB_k‖²/(‖B_j‖²‖B_k‖²)`), while the data-fit and
-        // smoothness legs carry the peel's `exp(s)` via `fill_decoded_row` / the
-        // cached `S`; FDing the SAME `penalized_objective_total` gb differentiates is
-        // the only contract that isolates a genuine exp(s)/assembly inconsistency
-        // without spuriously flagging the (correct) barrier force.
+        // descends. We FD the terms `gb` carries a NONZERO gradient for: the
+        // data-fit `Jᵀr` + smoothness `λ S B` (both carry the peel's `exp(s)` via
+        // `fill_decoded_row` / the cached `S`) and the #1026 decoder-repulsion force
+        // (frozen-gate `∂P_rep/∂B`, ~120× the data-fit leg here — omitting it made
+        // the historical `data_fit + smoothness` FD disagree at ~basis 0).
+        //
+        // The #1026/#1522 SEPARATION barrier `P_sep = −μ q w(c²) log(1−c²+ε)` is
+        // deliberately EXCLUDED from this FD objective. This fixture is p = 1
+        // (single output dim), and for rank-1 (p = 1) decoders the normalized cross
+        // `c²_jk = ‖B_jB_kᵀ‖²_F / (‖B_j‖²‖B_k‖²)` collapses to the ALGEBRAIC IDENTITY
+        // `1` (`‖B_jB_kᵀ‖²_F = ‖B_j‖²‖B_k‖²` exactly), independent of the decoder
+        // entries. So `∂c²/∂B ≡ 0` and the barrier's β-gradient is IDENTICALLY ZERO:
+        // `add_sae_separation_barrier` writes exactly 0 into `sys.gb` here (the
+        // `mb·inv − (c²/n_j²)B_j` factor cancels term-for-term), and `gb` correctly
+        // carries none of it. Its VALUE, though, is a ~1e7 constant
+        // (`−μq·log(1−c²+ε) = −μq·log ε`, `ε = 1e-6`); central-differencing that
+        // constant is catastrophic cancellation — fp wobble in `c²` at the ~1e-16
+        // level, amplified by `μq/ε`, injects a spurious ~40-magnitude "gradient"
+        // into a total-objective FD that `gb` (correctly) does not match. FDing the
+        // barrier-free objective — exactly the terms `gb` differentiates to a
+        // nonzero gradient, with the barrier's genuinely-zero contribution left
+        // out — is the consistent contract (no tolerance is loosened).
         let objective = |t: &SaeManifoldTerm| -> f64 {
-            t.penalized_objective_total(target.view(), &rho, None, 1.0)
-                .expect("penalized objective")
+            t.loss(target.view(), &rho).expect("loss").total() + t.decoder_repulsion_value(1.0)
         };
         let eps = 1e-6;
         let mut checked = 0usize;
@@ -947,32 +955,9 @@ mod step2_quotient_scale_tests {
                 term.atoms[k].decoder_coefficients[[bc, oc]] = orig;
                 let fd = (lp - lm) / (2.0 * eps);
                 let g = gb[idx];
-                {
-                    let fdof = |f: &dyn Fn(&SaeManifoldTerm) -> f64, t: &mut SaeManifoldTerm| -> f64 {
-                        t.atoms[k].decoder_coefficients[[bc, oc]] = orig + eps;
-                        let a = f(t);
-                        t.atoms[k].decoder_coefficients[[bc, oc]] = orig - eps;
-                        let b = f(t);
-                        t.atoms[k].decoder_coefficients[[bc, oc]] = orig;
-                        (a - b) / (2.0 * eps)
-                    };
-                    let fl = fdof(&|t| t.loss(target.view(), &rho).expect("l").total(), &mut term);
-                    let fr = fdof(&|t| t.decoder_repulsion_value(1.0), &mut term);
-                    let fsep = fdof(&|t| t.separation_barrier_value(1.0), &mut term);
-                    let sep0 = term.separation_barrier_value(1.0);
-                    term.atoms[k].decoder_coefficients[[bc, oc]] = orig + eps;
-                    let sepp = term.separation_barrier_value(1.0);
-                    term.atoms[k].decoder_coefficients[[bc, oc]] = orig - eps;
-                    let sepm = term.separation_barrier_value(1.0);
-                    term.atoms[k].decoder_coefficients[[bc, oc]] = orig;
-                    eprintln!(
-                        "[TEMP2 k={k} bc={bc} oc={oc}] gb={g:.5e} fd_tot={fd:.5e} fd_loss={fl:.5e} fd_rep={fr:.5e} fd_sep={fsep:.5e} sum={:.5e} sep(0)={sep0:.5e} sep(+)={sepp:.5e} sep(-)={sepm:.5e}",
-                        fl + fr + fsep
-                    );
-                }
-                // Sign: gb = +∂(penalized objective)/∂β (data-fit `Jᵀ(fitted−target)`
-                // + smoothness + barrier force). If CI shows a uniform flip, compare
-                // to `-g` (1-char fix).
+                // Sign: gb = +∂(objective)/∂β (data-fit `Jᵀ(fitted−target)`
+                // + smoothness + decoder-repulsion force). If CI shows a uniform
+                // flip, compare to `-g` (1-char fix).
                 assert!(
                     (fd - g).abs() <= 1e-4 * (1.0 + g.abs()),
                     "β gradient exp(s)-consistency (atom {k}, basis {bc}, out {oc}): \
