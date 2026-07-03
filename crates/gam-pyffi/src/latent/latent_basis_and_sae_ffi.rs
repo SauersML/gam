@@ -2405,9 +2405,19 @@ fn stagewise_birth_kind_tag(kind: gam::terms::sae::manifold::BirthKind) -> &'sta
 
 fn stagewise_event_kind_tag(kind: gam::terms::sae::manifold::StagewiseEventKind) -> &'static str {
     match kind {
-        gam::terms::sae::manifold::StagewiseEventKind::SeedFitCompleted => "seed_fit_completed",
+        gam::terms::sae::manifold::StagewiseEventKind::SeedReady => "seed_ready",
+        gam::terms::sae::manifold::StagewiseEventKind::BirthRoundStarted => "birth_round_started",
+        gam::terms::sae::manifold::StagewiseEventKind::ResidualModelStarted => {
+            "residual_model_started"
+        }
         gam::terms::sae::manifold::StagewiseEventKind::ResidualModelFitted => {
             "residual_model_fitted"
+        }
+        gam::terms::sae::manifold::StagewiseEventKind::CurrentEvidenceStarted => {
+            "current_evidence_started"
+        }
+        gam::terms::sae::manifold::StagewiseEventKind::CurrentEvidenceFinished => {
+            "current_evidence_finished"
         }
         gam::terms::sae::manifold::StagewiseEventKind::CandidateStarted => "candidate_started",
         gam::terms::sae::manifold::StagewiseEventKind::CandidateFinished => "candidate_finished",
@@ -2488,10 +2498,7 @@ fn stagewise_progress_py<'py>(
     out.set_item("event", stagewise_event_kind_tag(event.event))?;
     out.set_item("birth_round", event.birth_round)?;
     out.set_item("backfit_sweep", event.backfit_sweep)?;
-    out.set_item(
-        "candidate",
-        event.candidate.map(stagewise_birth_kind_tag),
-    )?;
+    out.set_item("candidate", event.candidate.map(stagewise_birth_kind_tag))?;
     out.set_item("accepted", event.accepted)?;
     out.set_item("checkpoint_available", event.checkpoint)?;
     out.set_item("k", event.k_atoms)?;
@@ -2503,7 +2510,10 @@ fn stagewise_progress_py<'py>(
     out.set_item("joint_reml_after", event.joint_reml_after)?;
     out.set_item("terminal_joint_reml", event.terminal_joint_reml)?;
     if event.checkpoint {
-        out.set_item("checkpoint", stagewise_checkpoint_py(py, event.term, event.rho)?)?;
+        out.set_item(
+            "checkpoint",
+            stagewise_checkpoint_py(py, event.term, event.rho)?,
+        )?;
     } else {
         out.set_item("checkpoint", py.None())?;
     }

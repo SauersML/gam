@@ -3043,9 +3043,25 @@ def sae_manifold_fit_stagewise(
             f"stagewise seed basis width {phi0.shape[1]} disagrees with the seed "
             f"decoder rows {m0}; the rebuilt Φ must match the fitted decoder basis"
         )
-    logits0 = np.ascontiguousarray(np.asarray(seed_fit.low_level_logits, dtype=np.float64))
-    if logits0.shape != (n_obs, 1):
-        logits0 = logits0.reshape(n_obs, 1)
+    logits_seed = np.asarray(seed_fit.low_level_logits, dtype=np.float64)
+    if logits_seed.ndim == 1:
+        if logits_seed.size != n_obs:
+            raise ValueError(
+                "stagewise seed logits must have one row per observation; "
+                f"got flat length {logits_seed.size} for n={n_obs}"
+            )
+        logits0 = logits_seed.reshape(n_obs, 1)
+    elif logits_seed.ndim == 2 and logits_seed.shape[0] == n_obs and logits_seed.shape[1] >= 1:
+        # `sae_manifold_fit(K=1)` can return a structure-grown payload. SAC needs
+        # one fitted seed atom, so take atom 0's fitted gate column instead of
+        # reshaping an (N, K_grown) matrix into nonsense.
+        logits0 = logits_seed[:, :1]
+    else:
+        raise ValueError(
+            "stagewise seed logits must be (N,) or (N, K>=1); "
+            f"got shape {logits_seed.shape} for n={n_obs}"
+        )
+    logits0 = np.ascontiguousarray(logits0)
 
     basis_values = phi0[None, :, :]                    # (1, N, M)
     basis_jacobian = jet0[None, :, :, :]               # (1, N, M, d)

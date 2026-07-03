@@ -219,8 +219,12 @@ pub struct StagewiseResult {
 /// Stagewise progress event emitted at durable SAC phase boundaries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StagewiseEventKind {
-    SeedFitCompleted,
+    SeedReady,
+    BirthRoundStarted,
+    ResidualModelStarted,
     ResidualModelFitted,
+    CurrentEvidenceStarted,
+    CurrentEvidenceFinished,
     CandidateStarted,
     CandidateFinished,
     BirthAccepted,
@@ -266,6 +270,14 @@ fn emit_stagewise_progress(
         callback(event)?;
     }
     Ok(())
+}
+
+fn current_residual(
+    term: &SaeManifoldTerm,
+    target: ArrayView2<'_, f64>,
+) -> Result<Array2<f64>, String> {
+    let fitted = term.try_fitted()?;
+    Ok(&target.to_owned() - &fitted)
 }
 
 /// Frozen (`inner_max_iter == 0`, the #850 freeze) joint REML criterion of a term
@@ -316,9 +328,8 @@ fn fit_residual_covariance(
     term: &SaeManifoldTerm,
     target: ArrayView2<'_, f64>,
     config: &StagewiseConfig,
-) -> Result<Option<StructuredResidualModel>, String> {
-    let fitted = term.try_fitted()?;
-    let residual = &target.to_owned() - &fitted;
+) -> Result<Option<(Array2<f64>, StructuredResidualModel)>, String> {
+    let residual = current_residual(term, target)?;
     let (n, p) = residual.dim();
     if n == 0 || p < 2 {
         return Ok(None);
@@ -330,10 +341,79 @@ fn fit_residual_covariance(
         activity: activity.view(),
         max_factor_rank: max_rank,
     }) {
-        Ok(model) => Ok(Some(model)),
+        Ok(model) => Ok(Some((residual, model))),
         // A degenerate residual fit is a stop signal, not an error.
         Err(_) => Ok(None),
     }
+}
+
+fn fit_single_atom_response_in_place(
+    term: &mut SaeManifoldTerm,
+    rho: &mut SaeManifoldRho,
+    atom_idx: usize,
+    response: ArrayView2<'_, f64>,
+    registry: Option<&AnalyticPenaltyRegistry>,
+    config: &StagewiseConfig,
+) -> Result<(), String> {
+    let n = term.n_obs();
+    let k = term.k_atoms();
+    if atom_idx >= k {
+        return Err(format!(
+            "fit_single_atom_response_in_place: atom {atom_idx} out of range (K={k})"
+        ));
+    }
+    let sub_atom = term.atoms[atom_idx].clone();
+    let coord_block = term.assignment.coords[atom_idx].clone();
+    let mut sub_logits = Array2::<f64>::zeros((n, 1));
+    for row in 0..n {
+        sub_logits[[row, 0]] = term.assignment.logits[[row, atom_idx]];
+    }
+    let sub_assignment =
+        SaeAssignment::with_mode(sub_logits, vec![coord_block], term.assignment.mode)?;
+    let mut sub_term = SaeManifoldTerm::new(vec![sub_atom], sub_assignment)?;
+    sub_term.set_guards_enabled(false);
+    if let Some(w) = term.row_loss_weights().map(|w| w.to_vec()) {
+        sub_term.set_row_loss_weights(w)?;
+    }
+    if let Some(metric) = term.row_metric().cloned() {
+        sub_term.set_row_metric(metric)?;
+    }
+    let mut sub_rho = SaeManifoldRho::with_per_atom_smooth(
+        rho.log_lambda_sparse,
+        vec![*rho.log_lambda_smooth.get(atom_idx).unwrap_or(&0.0)],
+        vec![
+            rho.log_ard
+                .get(atom_idx)
+                .cloned()
+                .unwrap_or_else(|| Array1::zeros(0)),
+        ],
+    );
+    sub_term.run_joint_fit_arrow_schur(
+        response,
+        &mut sub_rho,
+        registry,
+        config.inner_max_iter,
+        config.learning_rate,
+        config.ridge_ext_coord,
+        config.ridge_beta,
+    )?;
+
+    term.atoms[atom_idx] = sub_term.atoms[0].clone();
+    term.assignment.coords[atom_idx] = sub_term.assignment.coords[0].clone();
+    for row in 0..n {
+        term.assignment.logits[[row, atom_idx]] = sub_term.assignment.logits[[row, 0]];
+    }
+    if atom_idx < rho.log_lambda_smooth.len() {
+        rho.log_lambda_smooth[atom_idx] = sub_rho.log_lambda_smooth[0];
+    }
+    if atom_idx < rho.log_ard.len() {
+        rho.log_ard[atom_idx] = sub_rho.log_ard[0].clone();
+    }
+    term.assignment.frozen_logits = None;
+    term.last_row_layout = None;
+    term.last_frames_active = false;
+    term.border_hbb_workspace = Array2::<f64>::zeros((0, 0));
+    Ok(())
 }
 
 /// Lift the top residual-factor direction to an `(m, p)` birth decoder in atom
@@ -410,55 +490,15 @@ fn refit_single_atom_in_place(
         }
     }
 
-    // Build the K=1 sub-term from atom k and its coordinate block + routing column.
-    let sub_atom = term.atoms[atom_idx].clone();
-    let coord_block = term.assignment.coords[atom_idx].clone();
-    let mut sub_logits = Array2::<f64>::zeros((n, 1));
-    for row in 0..n {
-        sub_logits[[row, 0]] = term.assignment.logits[[row, atom_idx]];
-    }
-    let sub_assignment =
-        SaeAssignment::with_mode(sub_logits, vec![coord_block], term.assignment.mode)?;
-    let mut sub_term = SaeManifoldTerm::new(vec![sub_atom], sub_assignment)?;
-    sub_term.set_guards_enabled(false);
-    if let Some(w) = term.row_loss_weights().map(|w| w.to_vec()) {
-        sub_term.set_row_loss_weights(w)?;
-    }
-    let mut sub_rho = SaeManifoldRho::with_per_atom_smooth(
-        rho.log_lambda_sparse,
-        vec![*rho.log_lambda_smooth.get(atom_idx).unwrap_or(&0.0)],
-        vec![
-            rho.log_ard
-                .get(atom_idx)
-                .cloned()
-                .unwrap_or_else(|| Array1::zeros(0)),
-        ],
-    );
-    sub_term.run_joint_fit_arrow_schur(
+    let mut rho_scratch = rho.clone();
+    fit_single_atom_response_in_place(
+        term,
+        &mut rho_scratch,
+        atom_idx,
         e_k.view(),
-        &mut sub_rho,
         registry,
-        config.inner_max_iter,
-        config.learning_rate,
-        config.ridge_ext_coord,
-        config.ridge_beta,
-    )?;
-
-    // Write the refit atom / coordinates / routing back into the parent, then
-    // reset the K-ordered transient caches so the next assembly rebuilds them.
-    term.atoms[atom_idx] = sub_term.atoms[0].clone();
-    term.assignment.coords[atom_idx] = sub_term.assignment.coords[0].clone();
-    for row in 0..n {
-        term.assignment.logits[[row, atom_idx]] = sub_term.assignment.logits[[row, 0]];
-    }
-    // Reset the K-ordered transient assembly caches so the next assembly rebuilds
-    // them for the rewritten atom (mirrors the reset `merge_tiers` / `reorder_atoms`
-    // perform after mutating the atom ↔ column correspondence).
-    term.assignment.frozen_logits = None;
-    term.last_row_layout = None;
-    term.last_frames_active = false;
-    term.border_hbb_workspace = Array2::<f64>::zeros((0, 0));
-    Ok(())
+        config,
+    )
 }
 
 /// One backfitting sweep at FIXED ρ: (1) re-solve the per-row routing jointly at
@@ -505,11 +545,12 @@ fn backfit_sweep(
     Ok(())
 }
 
-/// Fit the seed atom, run the forward-birth phase, run the backfitting sweeps, and
-/// report the terminal frozen joint evidence. `seed` MUST be a single-atom (K=1)
-/// term carrying the initial basis/topology; `rho` its matching ρ. `sample_weights`
-/// (optional, length `n`) are the subsampler's per-row stratified importance
-/// weights, installed on every fit via the reconstruction-weight seam.
+/// Run the forward-birth phase, run the backfitting sweeps, and report the
+/// terminal frozen joint evidence. `seed` MUST be a fitted single-atom (K=1) term
+/// carrying the initial basis/topology and converged decoder/coordinates; `rho`
+/// its matching ρ. `sample_weights` (optional, length `n`) are the subsampler's
+/// per-row stratified importance weights, installed on every fit via the
+/// reconstruction-weight seam.
 ///
 /// The returned `term` is the SAC-composed curved tier (`K ≥ 1` atoms); pass it to
 /// [`terminal_joint_assembly`] to merge it with a Tier-1 bulk term and read the
@@ -550,16 +591,12 @@ pub fn fit_stagewise(
         term.set_row_loss_weights(w.to_vec())?;
     }
 
-    // ── Phase 1a — seed fit (K=1, the proven curved fit) ───────────────────────
-    term.run_joint_fit_arrow_schur(
-        target,
-        &mut rho,
-        registry,
-        config.inner_max_iter,
-        config.learning_rate,
-        config.ridge_ext_coord,
-        config.ridge_beta,
-    )?;
+    // ── Phase 1a — fitted K=1 seed checkpoint ────────────────────────────────
+    // The caller owns the proven K=1 fit. The Python stagewise adapter constructs
+    // this seed via `sae_manifold_fit`; re-solving it here duplicated the most
+    // expensive p-wide work and, on real p=2048 residuals, could consume the whole
+    // smoke timeout before the first progress callback. SAC starts from that
+    // fitted atom and emits a durable checkpoint immediately.
     let mut ev_trace = vec![ev_of(&term, target)];
     let mut birth_records: Vec<BirthRecord> = Vec::new();
     let mut births_accepted = 0usize;
@@ -568,7 +605,7 @@ pub fn fit_stagewise(
     emit_stagewise_progress(
         &mut progress,
         StagewiseProgress {
-            event: StagewiseEventKind::SeedFitCompleted,
+            event: StagewiseEventKind::SeedReady,
             birth_round: 0,
             backfit_sweep: 0,
             candidate: None,
@@ -598,9 +635,52 @@ pub fn fit_stagewise(
         }
         let round = birth_round;
         birth_round += 1;
+        let entry_ev = ev_of(&term, target);
+        emit_stagewise_progress(
+            &mut progress,
+            StagewiseProgress {
+                event: StagewiseEventKind::BirthRoundStarted,
+                birth_round: round,
+                backfit_sweep: 0,
+                candidate: None,
+                accepted: None,
+                checkpoint: false,
+                k_atoms: term.k_atoms(),
+                births_accepted,
+                births_rejected,
+                ev: Some(entry_ev),
+                factor_energy: None,
+                joint_reml_before: None,
+                joint_reml_after: None,
+                terminal_joint_reml: None,
+                term: &term,
+                rho: &rho,
+            },
+        )?;
         // Refit Σ on the current residual and install the whitened metric so the
         // candidate fits run under the structured covariance from atom one.
-        let Some(model) = fit_residual_covariance(&term, target, config)? else {
+        emit_stagewise_progress(
+            &mut progress,
+            StagewiseProgress {
+                event: StagewiseEventKind::ResidualModelStarted,
+                birth_round: round,
+                backfit_sweep: 0,
+                candidate: None,
+                accepted: None,
+                checkpoint: false,
+                k_atoms: term.k_atoms(),
+                births_accepted,
+                births_rejected,
+                ev: Some(entry_ev),
+                factor_energy: None,
+                joint_reml_before: None,
+                joint_reml_after: None,
+                terminal_joint_reml: None,
+                term: &term,
+                rho: &rho,
+            },
+        )?;
+        let Some((residual, model)) = fit_residual_covariance(&term, target, config)? else {
             break StagewiseStop::NoResidualStructure;
         };
         let Some((birth_decoder, factor_energy)) = top_factor_birth_decoder(&term, &model) else {
@@ -610,13 +690,54 @@ pub fn fit_stagewise(
             // Install Σ^{-1} as the per-row whitened metric (carried into clones).
             term.set_row_metric(model.row_metric(n)?)?;
         }
-
+        emit_stagewise_progress(
+            &mut progress,
+            StagewiseProgress {
+                event: StagewiseEventKind::ResidualModelFitted,
+                birth_round: round,
+                backfit_sweep: 0,
+                candidate: None,
+                accepted: None,
+                checkpoint: false,
+                k_atoms: term.k_atoms(),
+                births_accepted,
+                births_rejected,
+                ev: Some(entry_ev),
+                factor_energy: Some(factor_energy),
+                joint_reml_before: None,
+                joint_reml_after: None,
+                terminal_joint_reml: None,
+                term: &term,
+                rho: &rho,
+            },
+        )?;
+        emit_stagewise_progress(
+            &mut progress,
+            StagewiseProgress {
+                event: StagewiseEventKind::CurrentEvidenceStarted,
+                birth_round: round,
+                backfit_sweep: 0,
+                candidate: None,
+                accepted: None,
+                checkpoint: false,
+                k_atoms: term.k_atoms(),
+                births_accepted,
+                births_rejected,
+                ev: Some(entry_ev),
+                factor_energy: Some(factor_energy),
+                joint_reml_before: None,
+                joint_reml_after: None,
+                terminal_joint_reml: None,
+                term: &term,
+                rho: &rho,
+            },
+        )?;
         let (cur_reml, _) = frozen_joint_evidence(&mut term, target, &rho, registry, config)?;
         let cur_ev = ev_of(&term, target);
         emit_stagewise_progress(
             &mut progress,
             StagewiseProgress {
-                event: StagewiseEventKind::ResidualModelFitted,
+                event: StagewiseEventKind::CurrentEvidenceFinished,
                 birth_round: round,
                 backfit_sweep: 0,
                 candidate: None,
@@ -665,14 +786,14 @@ pub fn fit_stagewise(
         )
         .and_then(|(mut cand_term, mut cand_rho)| {
             cand_term.set_guards_enabled(false);
-            cand_term.run_joint_fit_arrow_schur(
-                target,
+            let born = cand_term.k_atoms() - 1;
+            fit_single_atom_response_in_place(
+                &mut cand_term,
                 &mut cand_rho,
+                born,
+                residual.view(),
                 registry,
-                config.inner_max_iter,
-                config.learning_rate,
-                config.ridge_ext_coord,
-                config.ridge_beta,
+                config,
             )?;
             let (reml, _) =
                 frozen_joint_evidence(&mut cand_term, target, &cand_rho, registry, config)?;
@@ -1189,6 +1310,26 @@ mod tests {
         (term, rho)
     }
 
+    fn fitted_seed(
+        mut seed: SaeManifoldTerm,
+        mut rho: SaeManifoldRho,
+        target: ArrayView2<'_, f64>,
+        config: &StagewiseConfig,
+    ) -> (SaeManifoldTerm, SaeManifoldRho) {
+        seed.set_guards_enabled(false);
+        seed.run_joint_fit_arrow_schur(
+            target,
+            &mut rho,
+            None,
+            config.inner_max_iter,
+            config.learning_rate,
+            config.ridge_ext_coord,
+            config.ridge_beta,
+        )
+        .expect("test seed K=1 fit must complete before stagewise entry");
+        (seed, rho)
+    }
+
     fn is_non_decreasing(xs: &[f64]) -> bool {
         // Non-decreasing within a small relative slack that absorbs the
         // line-search's terminal rounding — the guarantee is monotone descent, and
@@ -1222,8 +1363,9 @@ mod tests {
         let target = truth.fitted();
 
         // Seed: a single circle atom, active on every row.
-        let (seed, rho) = build_term(vec![atom0], vec![cb0], &vec![vec![true]; n]);
         let config = test_config();
+        let (seed, rho) = build_term(vec![atom0], vec![cb0], &vec![vec![true]; n]);
+        let (seed, rho) = fitted_seed(seed, rho, target.view(), &config);
         let result = fit_stagewise(seed, rho, target.view(), None, None, &config, None)
             .expect("fit_stagewise must complete on planted two-circles");
 
@@ -1265,7 +1407,6 @@ mod tests {
             build_term(vec![atom0.clone()], vec![cb0.clone()], &vec![vec![true]; n]);
         let target = truth.fitted();
 
-        let (seed, rho) = build_term(vec![atom0], vec![cb0], &vec![vec![true]; n]);
         // Exercise the explicit salience dial: a birth must add ≥ 1% EV. A target
         // already reconstructed by the seed leaves no residual clearing that floor,
         // so every birth is rejected (evidence gate ∪ minimum-effect floor).
@@ -1273,6 +1414,8 @@ mod tests {
             min_effect_ev: 0.01,
             ..test_config()
         };
+        let (seed, rho) = build_term(vec![atom0], vec![cb0], &vec![vec![true]; n]);
+        let (seed, rho) = fitted_seed(seed, rho, target.view(), &config);
         let result = fit_stagewise(seed, rho, target.view(), None, None, &config, None)
             .expect("fit_stagewise must complete on a fully-explained target");
 
@@ -1308,8 +1451,9 @@ mod tests {
             &active_truth,
         );
         let target = truth.fitted();
-        let (seed, rho) = build_term(vec![atom0], vec![cb0], &vec![vec![true]; n]);
         let config = test_config();
+        let (seed, rho) = build_term(vec![atom0], vec![cb0], &vec![vec![true]; n]);
+        let (seed, rho) = fitted_seed(seed, rho, target.view(), &config);
         let result = fit_stagewise(seed, rho, target.view(), None, None, &config, None)
             .expect("fit_stagewise must complete");
         assert!(

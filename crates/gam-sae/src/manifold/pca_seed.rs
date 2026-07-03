@@ -225,6 +225,29 @@ fn topology_curved_seed_initial_coords(
                         interp(&fns[1], row).atan2(interp(&fns[0], row)) / std::f64::consts::TAU;
                     out[[atom_idx, row, 0]] = phase - phase.floor();
                 }
+                // Axes beyond the leading circle are flat coordinates, mirroring the
+                // linear PCA Periodic seed's `1..d` min-max branch: a periodic atom of
+                // intrinsic dim `d > 1` is one phase plane plus `d − 1` Euclidean axes.
+                // The phase consumed `fns[0..2]`, so the flat axes read the NEXT
+                // harmonics (`fns[axis + 1]`). Without this the topology seed left
+                // every axis past 0 at zero, collapsing a `d > 1` seed to rank 1 (so a
+                // higher latent dim was a bit-for-bit no-op).
+                for axis in 1..d {
+                    let Some(values) = fns.get(axis + 1) else {
+                        break;
+                    };
+                    let (lo, hi) = values
+                        .iter()
+                        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
+                            (lo.min(v), hi.max(v))
+                        });
+                    let span = hi - lo;
+                    if span > 0.0 && span.is_finite() {
+                        for row in 0..z.nrows() {
+                            out[[atom_idx, row, axis]] = (interp(values, row) - lo) / span - 0.5;
+                        }
+                    }
+                }
             }
             SaeAtomBasisKind::Torus => {
                 for axis in 0..d {
@@ -281,7 +304,10 @@ fn topology_curved_seed_initial_coords(
 // per circle axis, a 3-frame for the sphere, and one coordinate per flat axis.
 fn topology_seed_chart_need(kind: &SaeAtomBasisKind, d: usize) -> usize {
     match kind {
-        SaeAtomBasisKind::Periodic => 2,
+        // Two harmonics for the leading phase plane, plus one flat harmonic per
+        // extra axis so a `d > 1` periodic atom's Euclidean axes are seeded (not
+        // left at zero). `d == 1` keeps the historical need of 2.
+        SaeAtomBasisKind::Periodic => 2 + d.max(1).saturating_sub(1),
         SaeAtomBasisKind::Torus => 2 * d.max(1),
         SaeAtomBasisKind::Sphere => 3,
         _ => d.max(1),

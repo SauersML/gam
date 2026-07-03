@@ -117,7 +117,10 @@ def test_stagewise_progress_callback_receives_durable_checkpoints() -> None:
 
     assert events, "progress_callback must receive Rust stagewise progress events"
     event_names = [str(event["event"]) for event in events]
-    assert "seed_fit_completed" in event_names
+    assert "seed_ready" in event_names
+    assert "birth_round_started" in event_names
+    assert "residual_model_started" in event_names
+    assert "current_evidence_started" in event_names
     assert "candidate_started" in event_names
     assert "terminal_evidence_completed" in event_names
 
