@@ -1,8 +1,8 @@
 use crate::device::GpuDeviceInfo;
 use crate::gpu_error::GpuError;
 use crate::policy::GpuDispatchPolicy;
-use gam_linalg::faer_ndarray::FaerCholesky;
 use faer::Side;
+use gam_linalg::faer_ndarray::FaerCholesky;
 use gam_runtime::warm_start::{Fingerprint, Fingerprinter};
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
@@ -156,9 +156,8 @@ fn measure_potrf(ordinal: usize) -> Result<Vec<Measurement>, GpuError> {
                 .map(|factor| factor.lower_triangular())
                 .map_err(|err| format!("cpu POTRF failed: {err}"))
         })?;
-        let gpu_seconds = time_gpu_result(|| {
-            crate::solver::cholesky_lower_on_ordinal_gpu(ordinal, a.view())
-        })?;
+        let gpu_seconds =
+            time_gpu_result(|| crate::solver::cholesky_lower_on_ordinal_gpu(ordinal, a.view()))?;
         out.push(Measurement {
             operation: "potrf",
             rows: dim,

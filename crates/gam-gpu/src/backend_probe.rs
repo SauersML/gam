@@ -91,10 +91,7 @@ mod linux {
     /// messages — live in the shared probe; `build` receives the resolved
     /// [`CudaBackendParts`] (so it can clone the `Arc<CudaContext>` /
     /// `Arc<CudaStream>` it needs) and returns the backend's own state `T`.
-    pub fn probe_backend_with_compile<F, T>(
-        label: &'static str,
-        build: F,
-    ) -> Result<T, GpuError>
+    pub fn probe_backend_with_compile<F, T>(label: &'static str, build: F) -> Result<T, GpuError>
     where
         F: FnOnce(&CudaBackendParts) -> Result<T, GpuError>,
     {

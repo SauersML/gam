@@ -479,8 +479,7 @@ impl GpuDispatchPolicy {
                 // dense reduction floor. This is the honest encoding of the
                 // measured 0.94× on-device dense-Direct slowdown: when the k³
                 // Cholesky dominates, stay on the CPU.
-                assembly >= border_chol
-                    && dense_direct_flops >= self.dense_reduction_flops_min()
+                assembly >= border_chol && dense_direct_flops >= self.dense_reduction_flops_min()
             }
         };
 

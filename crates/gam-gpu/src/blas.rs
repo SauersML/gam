@@ -22,9 +22,7 @@ pub fn blas_backend_status() -> super::CudaBackendStatus {
 mod cuda_impl {
     use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis};
 
-    use crate::driver::{
-        array_from_row_major, from_col_major, to_col_major, to_i32, to_row_major,
-    };
+    use crate::driver::{array_from_row_major, from_col_major, to_col_major, to_i32, to_row_major};
 
     use super::super::device_runtime::GpuRuntime;
     use cudarc::cublas::sys::{

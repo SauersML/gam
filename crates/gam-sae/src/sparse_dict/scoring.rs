@@ -218,8 +218,11 @@ impl TileScorer {
 
         #[cfg(target_os = "linux")]
         {
-            let plan =
-                gam_gpu::DictionaryScoreRoutePlan::default_for_shape(rows.nrows(), decoder.nrows(), decoder.ncols());
+            let plan = gam_gpu::DictionaryScoreRoutePlan::default_for_shape(
+                rows.nrows(),
+                decoder.nrows(),
+                decoder.ncols(),
+            );
             let clears_device_floor = plan.device_admitted;
 
             if mode == gam_gpu::GpuMode::Required || clears_device_floor {

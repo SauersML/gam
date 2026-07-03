@@ -27,12 +27,12 @@ pub struct RefinementOutcome {
 #[cfg(target_os = "linux")]
 mod cuda {
     use crate::driver::{from_col_major, to_col_major};
-    use gam_linalg::faer_ndarray::cholesky_factor_logdet;
     use cudarc::cublas::sys as cublas_sys;
     use cudarc::cublas::{CudaBlas, Gemv, GemvConfig};
     use cudarc::cusolver::{DnHandle, sys as cusolver_sys};
     use cudarc::driver::{CudaContext, CudaSlice, DevicePtr, DevicePtrMut};
     use faer::MatRef;
+    use gam_linalg::faer_ndarray::cholesky_factor_logdet;
     use ndarray::{Array2, ArrayView2};
 
     pub(super) fn cholesky_solve(
@@ -686,9 +686,7 @@ mod cuda {
         context_and_stream_for(runtime.selected_device().ordinal)
     }
 
-    pub fn pinned_htod<
-        T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Copy,
-    >(
+    pub fn pinned_htod<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Copy>(
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
         src: &[T],
     ) -> Result<CudaSlice<T>, String> {
@@ -896,13 +894,13 @@ mod cuda {
 // only one with no cross-crate consumer; it stays crate-private and is
 // reached internally through `crate::solver::potrf_in_place_generic`.
 #[cfg(target_os = "linux")]
+pub(crate) use cuda::potrf_in_place_generic;
+#[cfg(target_os = "linux")]
 pub use cuda::{
     check_deferred_potrf_info, check_deferred_potrs_info, cholesky_logdet_from_col_major,
     context_and_stream, pinned_htod, potrf_in_place, potrf_in_place_reuse, potrf_query_lwork,
     potrs_in_place, potrs_in_place_reuse,
 };
-#[cfg(target_os = "linux")]
-pub(crate) use cuda::potrf_in_place_generic;
 
 /// Solve `A x = b` with fp32 Cholesky factorization + fp64-residual iterative
 /// refinement, automatically falling back to fp64 when the policy rejects the

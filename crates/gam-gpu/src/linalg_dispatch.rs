@@ -1051,7 +1051,11 @@ mod tests {
                     let gpu = gemm_cuda(runtime, a.view(), b.view(), trans_a, trans_b).expect(
                         "transpose-free device GEMM must produce a result when a device is present",
                     );
-                    assert_eq!(gpu.dim(), (m, n), "output shape wrong for trans_a={trans_a} trans_b={trans_b} ({m}×{k}×{n})");
+                    assert_eq!(
+                        gpu.dim(),
+                        (m, n),
+                        "output shape wrong for trans_a={trans_a} trans_b={trans_b} ({m}×{k}×{n})"
+                    );
 
                     // CPU oracle on the logically-transposed operands.
                     let mut cpu = Array2::<f64>::zeros((m, n));

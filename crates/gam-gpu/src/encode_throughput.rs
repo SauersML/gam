@@ -54,7 +54,7 @@ use std::time::{Duration, Instant};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use super::linalg_dispatch::ResidentDesignGram;
-use super::policy::{GpuThroughputVerdict, GPU_THROUGHPUT_TARGET_ROWS_PER_SEC};
+use super::policy::{GPU_THROUGHPUT_TARGET_ROWS_PER_SEC, GpuThroughputVerdict};
 
 /// A representative LLM/SAE batched-solve work cell: `n` design rows, `p` wide
 /// decoder border. (`d`, the per-atom reduced-Schur block size, is fixed by the
@@ -133,7 +133,10 @@ fn planted_design(n: usize, p: usize, seed: u64) -> Array2<f64> {
 /// on a CPU-only host (or if the device declines) it is `false` and the rate is
 /// `0.0`.
 #[must_use]
-pub fn measure_resident_solve_throughput(shape: EncodeShape, reps: usize) -> ResidentSolveThroughput {
+pub fn measure_resident_solve_throughput(
+    shape: EncodeShape,
+    reps: usize,
+) -> ResidentSolveThroughput {
     let EncodeShape { n, p, .. } = shape;
     let not_engaged = |shape| ResidentSolveThroughput {
         shape,
@@ -162,7 +165,10 @@ pub fn measure_resident_solve_throughput(shape: EncodeShape, reps: usize) -> Res
 
     // Warm the resident solve (allocations, kernel handles) outside the timer;
     // if even the warm solve declines, the device path is not usable here.
-    if handle.solve_normal_equations(w.view(), rhs.view(), ridge).is_none() {
+    if handle
+        .solve_normal_equations(w.view(), rhs.view(), ridge)
+        .is_none()
+    {
         return not_engaged(shape);
     }
 
@@ -405,7 +411,11 @@ pub fn encode_quality_metrics(
         coords_ref.dim(),
         (n, d)
     );
-    assert_eq!(certified.len(), n, "certified flags must have one entry per row");
+    assert_eq!(
+        certified.len(),
+        n,
+        "certified flags must have one entry per row"
+    );
     assert_eq!(
         certified_ref.len(),
         n,
@@ -492,7 +502,11 @@ mod full_encode_metric_tests {
         assert_eq!(t.n_rows, 8_000);
         assert!(!t.device_encode_engaged);
         // 8000 rows / 0.1 s = 80_000 rows/sec.
-        assert!((t.rows_per_sec - 80_000.0).abs() < 1.0, "got {}", t.rows_per_sec);
+        assert!(
+            (t.rows_per_sec - 80_000.0).abs() < 1.0,
+            "got {}",
+            t.rows_per_sec
+        );
         // Zero elapsed is a non-measurement, not an infinite rate.
         let z = FullEncodeThroughput::from_elapsed(8_000, Duration::ZERO, false);
         assert_eq!(z.rows_per_sec, 0.0);
