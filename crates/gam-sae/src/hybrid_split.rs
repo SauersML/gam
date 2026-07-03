@@ -1469,6 +1469,86 @@ mod tests {
         );
     }
 
+    /// #16 DEMOTE flag-ON: with `rank_charge_evidence = true`, the two arms are
+    /// priced in the joint fit's ½·d_eff·log(n_obs) currency (d_eff read off the
+    /// curved REFIT decoder + Gram via `realised_rank_charge_dof`), NOT the ½log|H|
+    /// Laplace det. A full-circle residual still KEEPS curved (its realised rank-2
+    /// d_eff earns the fit); a straight-line residual stays LINEAR (the periodic
+    /// curve bends away from the line, so its extra realised DOF is not earned).
+    /// A real `Φ = [1, cos, sin]` is passed so d_eff reads the refit decoder rather
+    /// than the parameter-count fallback.
+    #[test]
+    fn rank_charge_demote_prices_realised_rank() {
+        let n = 60;
+        let coords = Array1::from_iter((0..n).map(|i| (i as f64) / ((n - 1) as f64)));
+        let assign = Array1::<f64>::ones(n);
+        let mut phi = Array2::<f64>::zeros((n, 3));
+        for i in 0..n {
+            let th = 2.0 * PI * coords[i];
+            phi[[i, 0]] = 1.0;
+            phi[[i, 1]] = th.cos();
+            phi[[i, 2]] = th.sin();
+        }
+        // (a) full-circle residual → curved fits, linear misfits → CURVED kept.
+        let mut circle = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            let th = 2.0 * PI * coords[i];
+            circle[[i, 0]] = th.cos();
+            circle[[i, 1]] = th.sin();
+        }
+        let (lin, crv, _) = build_atom_candidates(
+            coords.view(),
+            assign.view(),
+            circle.view(),
+            circle.view(),
+            6,
+            Some(phi.view()),
+            Some(2.0 * PI),
+            n,
+            0.0025,
+            true,
+        )
+        .expect("circle candidate pair");
+        let choice =
+            gam_solve::evidence::select_hybrid_atom(&[lin, crv]).expect("non-empty slot");
+        assert_eq!(
+            choice.param,
+            gam_solve::evidence::HybridAtomParam::Curved { latent_dim: 1 },
+            "rank charge must KEEP curved on a full-circle residual"
+        );
+        assert!(
+            choice.curved_evidence_margin > 0.0,
+            "curved must clear a positive rank-charge margin on a circle"
+        );
+
+        // (b) straight-line residual → linear fits, periodic curve misfits → LINEAR.
+        let mut line = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            line[[i, 0]] = coords[i];
+            line[[i, 1]] = 0.5 * coords[i];
+        }
+        let (lin2, crv2, _) = build_atom_candidates(
+            coords.view(),
+            assign.view(),
+            line.view(),
+            line.view(),
+            6,
+            Some(phi.view()),
+            Some(0.0),
+            n,
+            0.0025,
+            true,
+        )
+        .expect("line candidate pair");
+        let choice2 =
+            gam_solve::evidence::select_hybrid_atom(&[lin2, crv2]).expect("non-empty slot");
+        assert_eq!(
+            choice2.param,
+            gam_solve::evidence::HybridAtomParam::Linear,
+            "rank charge must stay LINEAR on a straight-line residual"
+        );
+    }
+
     /// The nested-dominance floor on common data (#1202): when the curved decoded
     /// image is a WORSE fit to the response residual than its own best straight
     /// projection, linear must win — the curved family cannot be charged extra
