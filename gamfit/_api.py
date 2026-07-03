@@ -1461,6 +1461,16 @@ def loads(model_bytes: bytes) -> Model:
     >>> with open("model.gam", "rb") as fh:
     ...     model = gamfit.loads(fh.read())
     """
+    # Response-geometry payloads are a small JSON container (schema-tagged) that
+    # embeds the constituent tangent `Model` archives plus the base point /
+    # coordinate chart / geometry metadata (#2114). They are neither a scalar
+    # `Model` archive nor a multinomial payload, so detect them first by the
+    # schema tag and reconstruct a `ResponseGeometryModel`.
+    head = model_bytes[:256].lstrip()
+    if head.startswith(b"{") and b"gamfit.ResponseGeometryModel" in model_bytes[:512]:
+        payload = json.loads(model_bytes.decode("utf-8"))
+        if str(payload.get("schema", "")).startswith("gamfit.ResponseGeometryModel/"):
+            return _reconstruct_response_geometry(payload)
     # Multinomial-logit payloads carry a different on-disk schema than the
     # scalar `Model` archive (`load_model` rejects them with a missing
     # `model_type` field). Detect them positively: only a genuine multinomial
@@ -1503,6 +1513,57 @@ def loads(model_bytes: bytes) -> Model:
     except Exception as exc:
         raise map_exception(exc) from exc
     return Model(_model_bytes=model_bytes, _training_table_kind=training_table_kind)
+
+
+def _reconstruct_response_geometry(payload: Mapping[str, Any]) -> ResponseGeometryModel:
+    """Rebuild a :class:`ResponseGeometryModel` from its JSON payload (#2114).
+
+    Symmetric with :meth:`ResponseGeometryModel.to_dict`: each embedded tangent
+    ``Model`` archive is reloaded through :func:`loads`, and the base point,
+    coordinate chart, geometry label, and (optional) curvature summary are
+    restored so the rebuilt model reproduces :meth:`ResponseGeometryModel.predict`.
+    """
+    import base64
+
+    import numpy as np
+
+    from ._response_geometry import SharedGaussianRemlTangentFit
+
+    def _model_from_b64(encoded: str) -> Model:
+        return loads(base64.b64decode(encoded.encode("ascii")))
+
+    models = tuple(
+        _model_from_b64(encoded) for encoded in payload.get("coordinate_models_b64", [])
+    )
+
+    shared_payload = payload.get("shared_tangent_fit")
+    shared_fit: SharedGaussianRemlTangentFit | None = None
+    if shared_payload is not None:
+        template = _model_from_b64(shared_payload["template_model_b64"])
+        coefficients = np.asarray(shared_payload["coefficients"], dtype=float)
+        fit = dict(shared_payload.get("fit", {}))
+        for key in ("coefficients", "fitted", "sigma2", "lambdas", "edf"):
+            if fit.get(key) is not None:
+                fit[key] = np.asarray(fit[key], dtype=float)
+        if fit.get("reml_score") is not None:
+            fit["reml_score"] = float(fit["reml_score"])
+        shared_fit = SharedGaussianRemlTangentFit(
+            template_model=template,
+            coefficients=coefficients,
+            fit=fit,
+        )
+
+    return ResponseGeometryModel(
+        models=models,
+        response_geometry=str(payload["response_geometry"]),
+        response_columns=tuple(payload["response_columns"]),
+        base_point=np.asarray(payload["base_point"], dtype=float),
+        coordinates=str(payload["coordinates"]),
+        reference=int(payload.get("reference", -1)),
+        training_table_kind=payload.get("training_table_kind"),
+        shared_tangent_fit=shared_fit,
+        curvature=payload.get("curvature"),
+    )
 
 
 def validate_formula(

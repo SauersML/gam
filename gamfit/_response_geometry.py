@@ -415,6 +415,79 @@ class ResponseGeometryModel:
             out["curvature"] = dict(self.curvature)
         return out
 
+    # ------------------------------------------------------------------ persistence
+    def to_dict(self) -> dict[str, Any]:
+        """Round-trippable JSON-compatible serialization of this fit.
+
+        Mirrors the persistence added for :class:`MultinomialModel` (#2078): the
+        response-geometry model is a Python composite (base point + coordinate
+        chart + geometry label + the tangent-coordinate ``Model`` fits), so it is
+        serialized as a small JSON container that embeds each constituent
+        ``Model`` through its own binary archive (base64-encoded ``Model.dumps``)
+        plus the base point, coordinate chart, and geometry metadata. Passed to
+        :func:`gamfit.loads` (or written by :meth:`save` / :func:`gamfit.save`)
+        it reconstructs a :class:`ResponseGeometryModel` that reproduces
+        :meth:`predict`.
+        """
+        import base64
+
+        np = _np()
+
+        def _model_b64(model: Any) -> str:
+            return base64.b64encode(bytes(model.dumps())).decode("ascii")
+
+        def _jsonable(value: Any) -> Any:
+            if hasattr(value, "tolist") and not isinstance(value, (str, bytes)):
+                return value.tolist()
+            if isinstance(value, dict):
+                return {str(k): _jsonable(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [_jsonable(v) for v in value]
+            return value
+
+        shared: dict[str, Any] | None = None
+        if self.shared_tangent_fit is not None:
+            f = self.shared_tangent_fit
+            shared = {
+                "template_model_b64": _model_b64(f.template_model),
+                "coefficients": np.asarray(f.coefficients, dtype=float).tolist(),
+                "fit": {str(k): _jsonable(v) for k, v in f.fit.items()},
+            }
+        return {
+            "schema": _RESPONSE_GEOMETRY_SCHEMA,
+            "response_geometry": self.response_geometry,
+            "response_columns": list(self.response_columns),
+            "base_point": [
+                float(v) for v in np.asarray(self.base_point, dtype=float).reshape(-1)
+            ],
+            "coordinates": self.coordinates,
+            "reference": int(self.reference),
+            "training_table_kind": self.training_table_kind,
+            "curvature": None if self.curvature is None else dict(self.curvature),
+            "coordinate_models_b64": [_model_b64(m) for m in self.models],
+            "shared_tangent_fit": shared,
+        }
+
+    def dumps(self) -> bytes:
+        """Return the serialized response-geometry model as raw JSON bytes."""
+        import json
+
+        return json.dumps(self.to_dict()).encode("utf-8")
+
+    def save(self, path: Any) -> None:
+        """Serialise the fitted response-geometry model to ``path``.
+
+        Mirrors :meth:`Model.save`; the resulting file round-trips through
+        :func:`gamfit.load`, which reconstructs a
+        :class:`ResponseGeometryModel`.
+        """
+        from pathlib import Path
+
+        Path(path).write_bytes(self.dumps())
+
+
+_RESPONSE_GEOMETRY_SCHEMA = "gamfit.ResponseGeometryModel/v1"
+
 
 def fit_response_geometry(
     fit_func: Any,
