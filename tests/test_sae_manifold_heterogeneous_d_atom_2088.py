@@ -8,9 +8,12 @@ is a single ``d_max`` shared by every atom, so heterogeneous per-atom coord dims
 cannot be dispatched. Because ``isometry_weight`` and ``ard_per_atom`` default
 ON, EVERY heterogeneous call hit that refusal.
 
-The fix validates the incompatibility up front in the facade and raises a direct
-``ValueError`` naming the conflicting knobs (issue #2088 option 2), and — with
-those row-block penalties disabled — lets the heterogeneous path run (option 1).
+The fix validates the incompatibility up front and raises a direct ``ValueError``
+naming the conflict and both resolutions (issue #2088 option 2), and — with those
+row-block penalties disabled — lets the heterogeneous path run (option 1). Under
+#2098 (SPEC-8) this validation lives in the Rust engine
+(``SaeManifoldTerm::validate_heterogeneous_atom_compatibility``); the Python
+facade is a thin wrapper that surfaces the engine error.
 """
 
 from __future__ import annotations
@@ -45,10 +48,11 @@ def test_heterogeneous_d_atom_with_default_row_block_penalties_raises_clear_erro
             alpha="auto",
         )
     msg = str(excinfo.value)
-    # A direct, actionable facade error — not a deep RemlConvergenceError.
-    assert "heterogeneous d_atom" in msg
-    assert "isometry_weight>0" in msg
-    assert "uniform d_atom" in msg
+    # A direct, actionable engine error (moved into gam-sae under #2098/SPEC-8),
+    # surfaced as a ValueError — not a deep RemlConvergenceError.
+    assert "heterogeneous atom coordinate dims" in msg
+    assert "isometry" in msg
+    assert "uniform atom_dim" in msg
     assert "RemlConvergence" not in type(excinfo.value).__name__
 
 
@@ -82,7 +86,7 @@ def test_heterogeneous_d_atom_passes_validation_when_row_block_penalties_disable
             alpha="auto",
         )
     except ValueError as exc:
-        assert "heterogeneous d_atom" not in str(exc), (
+        assert "heterogeneous atom coordinate dims" not in str(exc), (
             "penalties-off heterogeneous path must not hit the row-block "
             f"refusal validation: {exc}"
         )

@@ -16,14 +16,104 @@ use super::{
     calculate_edfwithworkspace_from_factor, ensure_sparse_positive_definitewithridge,
     solve_sparse_spd,
 };
+use super::{calculate_loglikelihood, computeworkingweight_derivatives_from_eta};
 use crate::estimate::EstimationError;
 use gam_linalg::faer_ndarray::{FaerLinalgError, array1_to_col_matmut};
-use gam_linalg::utils::{StableSolver, array_is_finite};
+use gam_linalg::utils::{StableSolver, array_is_finite, inf_norm};
 use gam_linalg::matrix::{DesignMatrix, LinearOperator, SymmetricMatrix};
-use gam_problem::{Coefficients, LinkFunction};
+use gam_problem::{Coefficients, GlmLikelihoodSpec, InverseLink, LinkFunction};
 use faer::sparse::SparseColMat;
-use ndarray::{Array1, Array2, ArrayView1, ShapeBuilder};
+use ndarray::{ArcArray1, Array1, Array2, ArrayView1, ShapeBuilder};
 use std::sync::Arc;
+
+/// #1868 / #1033: the once-built, ψ-invariant length-`n` row bundle for the
+/// Gaussian-identity n-free κ-trial *skip* path.
+///
+/// On that path the inner "solve" is a zero-iteration synthesis whose every
+/// length-`n` array is a trial-INVARIANT placeholder — the row predictions are
+/// not recomputed, so `η ≡ μ ≡ offset`, the working response `z ≡ y`, the
+/// score/Hessian weights `w ≡ priorweights`, and the working-weight
+/// derivatives are `computeworkingweight_derivatives_from_eta(offset)` — all
+/// functions of the frozen `(offset, y, weights)` and the fixed link, never of
+/// the trial ψ. Re-materialising them on every κ callback is the O(n)-per-call
+/// regression #1868 tracks (~16·n element touches per trial).
+///
+/// Building them **once** and sharing them by `ArcArray1` (a reference-counted
+/// ndarray whose `.clone()` is O(1)) lets each trial's `PirlsResult` reuse the
+/// same rows with zero per-callback row work, so the κ outer loop touches only
+/// k×k objects per trial — the #1033 architectural invariant. The two cached
+/// scalars (`log_likelihood` at `μ=offset`, `max_abs_eta = ‖offset‖∞`) are the
+/// only other length-`n` reductions the synthesis performed per trial.
+#[derive(Debug, Clone)]
+pub struct GaussianFrozenRows {
+    /// `η ≡ μ ≡ offset` (identity link, stale rows) — shared by the
+    /// `final_offset`, `final_eta`, `finalmu`, and `solvemu` result fields.
+    pub eta: ArcArray1<f64>,
+    /// Working response `z ≡ y` — shared by `solveworking_response`.
+    pub z: ArcArray1<f64>,
+    /// Score/Hessian weights `w ≡ priorweights` — shared by `finalweights`
+    /// and `solveweights`.
+    pub weights: ArcArray1<f64>,
+    /// `dμ/dη` at `η=offset`.
+    pub solve_dmu_deta: ArcArray1<f64>,
+    /// `d²μ/dη²` at `η=offset`.
+    pub solve_d2mu_deta2: ArcArray1<f64>,
+    /// `d³μ/dη³` at `η=offset`.
+    pub solve_d3mu_deta3: ArcArray1<f64>,
+    /// `dW_H/dη` at `η=offset`.
+    pub solve_c_array: ArcArray1<f64>,
+    /// `d²W_H/dη²` at `η=offset`.
+    pub solve_d_array: ArcArray1<f64>,
+    /// `log L(y; μ=offset)` — the trial-invariant zero-iteration log-likelihood.
+    pub log_likelihood: f64,
+    /// `‖offset‖∞` — the trial-invariant `max_abs_eta`.
+    pub max_abs_eta: f64,
+}
+
+impl GaussianFrozenRows {
+    /// Build the ψ-invariant frozen row bundle ONCE from the fit's frozen
+    /// `(offset, y, weights)` and fixed link. This is the single O(n) reduction
+    /// the n-free κ loop is allowed to pay (it is amortised across every trial),
+    /// so every subsequent skip-path callback shares these rows O(1) and touches
+    /// zero length-`n` objects (#1868).
+    ///
+    /// The values are bit-identical to what the loop_driver stale-row synthesis
+    /// used to re-materialise per trial: `η ≡ μ ≡ offset` (the tensor path is
+    /// Gaussian-identity, so the row predictions are stale placeholders), the
+    /// working-weight derivatives are `computeworkingweight_derivatives_from_eta`
+    /// at `η=offset` (constant `(1,0,0,0,0)` for Gaussian-identity), and the two
+    /// scalars are the zero-iteration `log L(y; μ=offset)` and `‖offset‖∞`.
+    pub(crate) fn build(
+        offset: ArrayView1<'_, f64>,
+        y: ArrayView1<'_, f64>,
+        weights: ArrayView1<'_, f64>,
+        likelihood: &GlmLikelihoodSpec,
+        inverse_link: &InverseLink,
+    ) -> Result<Self, EstimationError> {
+        let eta_owned = offset.to_owned();
+        let (solve_c_array, solve_d_array, solve_dmu_deta, solve_d2mu_deta2, solve_d3mu_deta3) =
+            computeworkingweight_derivatives_from_eta(
+                likelihood,
+                inverse_link,
+                &eta_owned,
+                weights,
+            )?;
+        let log_likelihood = calculate_loglikelihood(y, &eta_owned, likelihood, weights);
+        let max_abs_eta = inf_norm(eta_owned.iter().copied());
+        Ok(Self {
+            eta: eta_owned.into_shared(),
+            z: y.to_owned().into_shared(),
+            weights: weights.to_owned().into_shared(),
+            solve_dmu_deta: solve_dmu_deta.into_shared(),
+            solve_d2mu_deta2: solve_d2mu_deta2.into_shared(),
+            solve_d3mu_deta3: solve_d3mu_deta3.into_shared(),
+            solve_c_array: solve_c_array.into_shared(),
+            solve_d_array: solve_d_array.into_shared(),
+            log_likelihood,
+            max_abs_eta,
+        })
+    }
+}
 
 /// Reusable `XᵀWX` and `XᵀW(y − offset)` for Gaussian + Identity REML fits.
 ///
@@ -64,6 +154,15 @@ pub struct GaussianFixedCache {
     /// scattered from this cached values vector instead of re-doing the
     /// O(nnz²/n) SpGEMM each call.
     pub xtwx_sparse_orig: Option<Arc<SparseXtwxPrecomputed>>,
+    /// #1868 / #1033: the once-built ψ-invariant frozen row bundle for the
+    /// n-free κ-trial skip path. Present exactly when `row_prediction_is_stale`
+    /// is `true` and the producer (`gaussian_fixed_cache_at` via
+    /// `install_psi_gram_statistics`) attached it. When present the Gaussian
+    /// zero-iteration inner synthesis shares these length-`n` placeholders O(1)
+    /// instead of re-materialising `offset`/`y`/`weights` and the working-weight
+    /// derivatives per trial. `None` on the exact (non-stale) path, where the
+    /// rows are freshly realised from the design.
+    pub frozen_rows: Option<Arc<GaussianFrozenRows>>,
 }
 
 /// Precomputed numerical values of `XᵀWX` aligned with the symbolic pattern

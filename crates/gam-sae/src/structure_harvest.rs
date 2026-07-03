@@ -1479,7 +1479,7 @@ pub(crate) fn born_circle_atom(
     rho: &SaeManifoldRho,
     harmonic_decoder: Array2<f64>,
     phase_coords: Array2<f64>,
-    circle_present: Vec<bool>,
+    circle_gate: Vec<f64>,
 ) -> Result<(SaeManifoldTerm, SaeManifoldRho), String> {
     let k = term.k_atoms();
     if term.atoms.is_empty() {
@@ -1532,21 +1532,30 @@ pub(crate) fn born_circle_atom(
         for col in 0..k {
             logits[[row, col]] = term.assignment.logits[[row, col]];
         }
-        // #2101 PRESENCE-PROPORTIONAL gate seed. The flat weak BIRTH_SEED_LOGIT (−4)
-        // is fatal under IBP — the born circle starts nearly OFF (σ(−4)≈0.018) and
+        // #2101/#2109 PRESENCE-PROPORTIONAL gate seed. The flat weak BIRTH_SEED_LOGIT
+        // (−4) is fatal under IBP — the born circle starts nearly OFF (σ(−4)≈0.018) and
         // the sub-fit collapses it (measured: ibp logit −4 collapses ‖B‖ 1.41→1e-4,
-        // logit +3 survives). WHERE the born circle is PRESENT (its 2-plane energy
-        // clears the derived MP floor, `circle_present[row]`), route it CO-ACTIVE
-        // with the incumbent dictionary (per-row max of existing logits) so it has
-        // the gate to establish; elsewhere keep the conservative birth default. The
-        // scale is the dictionary's own logits and the presence is the derived λ₊
-        // floor — no new constant (replaces the unjustified −4 on present rows).
-        let present = circle_present.get(row).copied().unwrap_or(true);
+        // logit +3 survives). On a row where the born circle is PRESENT (`circle_gate`
+        // finite: its 2-plane energy cleared the derived MP floor), route it at the
+        // STRONGER of two derived scales: (a) CO-ACTIVE with the incumbent dictionary
+        // (per-row max of existing logits) and (b) the born circle's OWN presence gate
+        // `ln(ρ_i²/2·λ₊)` carried in `circle_gate`. Taking the max is what fixes #2109:
+        // on incumbent-SPARSE rows `inc_max` is low/negative (the incumbents don't
+        // cover where the new circle lives), so the own-presence gate keeps the born
+        // circle strong enough to ESTABLISH there instead of re-collapsing. Elsewhere
+        // (absent rows, `circle_gate` = −∞) keep the conservative birth default. Both
+        // scales are derived — the dictionary's own logits and the ρ_i/λ₊ ratio — no
+        // new constant.
+        let own_gate = circle_gate.get(row).copied().unwrap_or(f64::NEG_INFINITY);
         let inc_max = (0..k)
             .map(|c| term.assignment.logits[[row, c]])
             .fold(f64::NEG_INFINITY, f64::max);
-        logits[[row, k]] = if present && inc_max.is_finite() {
-            inc_max
+        logits[[row, k]] = if own_gate.is_finite() {
+            if inc_max.is_finite() {
+                inc_max.max(own_gate)
+            } else {
+                own_gate
+            }
         } else {
             BIRTH_SEED_LOGIT
         };

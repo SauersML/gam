@@ -3328,6 +3328,15 @@ fn sae_manifold_fit_inner<'py>(
             gam::terms::analytic_penalties::AnalyticPenaltyKind::Isometry(_)
         )
     });
+    // #2098 (SPEC-8) — the engine self-protects against the heterogeneous-
+    // `d_atom` + row-block-penalty incompatibility up front, so it surfaces as a
+    // direct `ValueError` here (covering BOTH `sae_manifold_fit` and
+    // `sae_manifold_fit_minimal`, which share this inner) rather than as a deep
+    // `RemlConvergenceError` mid-REML. Native ARD rides `native_ard_enabled` (not
+    // a registry descriptor), so both penalty sources are threaded through.
+    base_term
+        .validate_heterogeneous_atom_compatibility(Some(&registry), native_ard_enabled)
+        .map_err(py_value_error)?;
     // Route every problem size through the full-batch objective on the owned
     // `target`: the inner Arrow-Schur fit materializes the `(N × M_total)`
     // basis, `(N × M_total × d)` jacobian, and `(N × K)` logit buffers in full,

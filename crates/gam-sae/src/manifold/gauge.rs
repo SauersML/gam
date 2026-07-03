@@ -549,8 +549,9 @@ impl SaeManifoldTerm {
                 }
             }
         }
-        // #1939 wheel diagnostic (opt-in path only — this runs solely under the
-        // `cone_atom_recovery` flag). Emit the RAW UNROUNDED per-atom norms, the
+        // #1939 wheel diagnostic (opt-in path only — this runs under the
+        // `cone_atom_recovery` or `quotient_scale` (#2100) breach-gated boundary
+        // retraction). Emit the RAW UNROUNDED per-atom norms, the
         // breach/direction thresholds, and the fired / literal-zero counts, so the
         // near-zero-vs-literal-zero question is answered inside the A/B run: a
         // collapse at `1e-3` is retracted (`retracted>0`), a collapse at `1e-16` is

@@ -3207,28 +3207,18 @@ impl SaeManifoldTerm {
             }
         }
         self.set_flat_beta(beta.view())?;
-        // #2022 STEP2 — sphere retract + peel. After the Euclidean β step writes
-        // B'_k, project each decoder onto the unit Frobenius sphere and move its
-        // magnitude into the explicit log-amplitude: B''_k = B'_k/‖B'_k‖,
-        // s_k += ln‖B'_k‖. This holds ‖B_k‖≡1 per iterate and puts scale solely
-        // in s, removing the SCALE gauge flat-direction, while preserving the
-        // reconstruction just written (exp(s')·B'' == exp(s)·B'). The joint β
-        // Newton step already optimized the decoder magnitude, so the peeled s is
-        // the concentrated scale optimum — no target/residual needed here.
-        // absorb_* no-ops an already-unit / collapsed decoder. exp(0)=1 keeps the
-        // pre-#2022 path bit-for-bit until an amplitude first appears.
-        //
-        // #2022 gate: the SCALE-gauge quotient (retract+peel) is behind the
-        // default-OFF `GAM_SAE_QUOTIENT_SCALE` env lever. Push CI runs only the
-        // release BUILD (no tests), so the default path stays verified-inert: off
-        // ⇒ no retract ⇒ s stays 0 ⇒ bit-for-bit (the always-on assembly exp(s)
-        // is inert at s=0). Flip the default to on after the dispatched Rust CI
-        // confirms the FD gate green.
-        if self.quotient_scale {
-            for atom in self.atoms.iter_mut() {
-                atom.absorb_decoder_norm_into_log_amplitude(f64::MIN_POSITIVE);
-            }
-        }
+        // #2100 — the #2022 STEP2 sphere-retract+peel does NOT belong here.
+        // `apply_newton_step_impl` runs on EVERY β-Newton line-search TRIAL, and
+        // folding every atom's ‖B_k‖ into its log-amplitude mid-solve forces
+        // ‖B_k‖≡1 while the β-Newton magnitude step (which assumes scale lives in
+        // B) is still moving: the next step then takes a runaway magnitude
+        // correction that compounds to EV → −1e128 on a HEALTHY dictionary (the
+        // #2100 detonation). The retraction is a settled-iterate representation
+        // move, not a per-trial one, so it now lives at the ACCEPTED-iterate
+        // boundary in `run_joint_fit_arrow_schur` (gated to COLLAPSED atoms via
+        // `retract_collapsed_decoders_in_loop`, where the norms have settled).
+        // Keeping scale in B during the inner solve leaves the β-Newton step on
+        // the manifold it was linearized on. See the #2100 note at that boundary.
         Ok(())
     }
 
@@ -4227,17 +4217,24 @@ impl SaeManifoldTerm {
             // re-home it — recovering a co-vanished born decoder (the K≥2
             // 0.7255→0.0023 collapse) — while leaving HEALTHY atoms' scale in B.
             //
-            // On its OWN flag `cone_atom_recovery`, DISTINCT from `quotient_scale`:
-            // the #2022 scale-quotient forces ‖B_k‖≡1 on EVERY atom (incl. the
-            // per-β-Newton fold at 3227) which DETONATES a healthy fit (EV→−1e128 on
-            // healthy K=2 — a pre-existing #2022 bug, filed separately). This does
-            // ONLY the breach-gated boundary retraction and never the per-Newton
-            // fold, so it is a strict no-op on a healthy dictionary (proven: healthy
-            // K=2 EV preserved, K=1 no-op) and cannot detonate. K<2 / all-zero-median
-            // are no-ops inside the helper. Run the paired amplitude solve solely when
-            // an atom was actually retracted, so a fit with no collapsed atom is a
-            // strict no-op (bit-for-bit the flag-off path).
-            if self.cone_atom_recovery && self.retract_collapsed_decoders_in_loop() > 0 {
+            // Shared by two flags, both breach-gated at this settled boundary:
+            //   * `cone_atom_recovery` (#1939) — recover a co-vanished born decoder.
+            //   * `quotient_scale` (#2022 SCALE-gauge) — after #2100 removed the
+            //     detonating per-β-Newton fold at `apply_newton_step_impl` (which
+            //     forced ‖B_k‖≡1 on EVERY atom every TRIAL and blew a healthy K=2
+            //     fit to EV→−1e128), the #2022 unit-Frobenius retraction lives HERE
+            //     instead: at the ACCEPTED iterate where the norms have settled, and
+            //     gated to the COLLAPSED atoms only. On a healthy dictionary nothing
+            //     breaches ⇒ strict no-op ⇒ EV preserved (healthy K=2 back to ~+0.43);
+            //     K<2 is a no-op inside the helper (the K=1 low-amp fit is untouched).
+            // Either flag does ONLY the breach-gated boundary retraction and never a
+            // per-Newton fold, so neither can detonate. K<2 / all-zero-median are
+            // no-ops inside the helper. Run the paired amplitude solve solely when an
+            // atom was actually retracted, so a fit with no collapsed atom is a strict
+            // no-op (bit-for-bit the flag-off path).
+            if (self.cone_atom_recovery || self.quotient_scale)
+                && self.retract_collapsed_decoders_in_loop() > 0
+            {
                 self.optimize_log_amplitudes_closed_form(target, rho)?;
             }
             // #972 / #977 T1 — U-block of the alternating block-coordinate ascent.
