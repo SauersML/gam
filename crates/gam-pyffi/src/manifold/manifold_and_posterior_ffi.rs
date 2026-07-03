@@ -2497,7 +2497,7 @@ fn curvature_inference_json_impl(
     // the model's own family. We replace the materialized (default-κ) spec with
     // the FITTED spec so the V_p oracle profiles around κ̂ — only κ moves.
     let dataset = dataset_with_inferred_schema(headers, rows)?;
-    let (fit_config, _table_kind) = parse_fit_config(None)?;
+    let fit_config = postfit_standard_materialization_config(&model)?;
     let materialized = materialize(&formula, &dataset, &fit_config)?;
     let standard = match materialized.request {
         FitRequest::Standard(request) => request,
@@ -2586,7 +2586,7 @@ fn smooth_term_lr_inference_json_impl(
     }
 
     let dataset = dataset_with_inferred_schema(headers, rows)?;
-    let (fit_config, _table_kind) = parse_fit_config(None)?;
+    let fit_config = postfit_standard_materialization_config(&model)?;
     let materialized = materialize(&formula, &dataset, &fit_config)?;
     let standard = match materialized.request {
         FitRequest::Standard(request) => request,
@@ -2632,6 +2632,13 @@ fn smooth_term_lr_inference_json_impl(
     let payload = SmoothTermLrPayload { smooth_terms };
     serde_json::to_string(&payload)
         .map_err(|err| format!("failed to serialize smooth-term LR inference: {err}"))
+}
+
+fn postfit_standard_materialization_config(model: &FittedModel) -> Result<FitConfig, String> {
+    let (mut fit_config, _table_kind) = parse_fit_config(None)?;
+    fit_config.weight_column = model.weight_column.clone();
+    fit_config.offset_column = model.offset_column.clone();
+    Ok(fit_config)
 }
 
 fn check_json_impl(
