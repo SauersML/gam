@@ -335,6 +335,16 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
     // downstream logdet check that may be gated off by the outer
     // optimizer's flags.
     let validate_started = std::time::Instant::now();
+    // Gradient-override families (e.g. Gaussian/Binomial location-scale, whose
+    // `exact_newton_joint_gradient_evaluation` serves the exact joint score)
+    // return `cached_eval = None` from `load_joint_gradient_evaluation`, which
+    // would otherwise SKIP this guard entirely (#2108 / #1820). Materialize the
+    // family evaluation once here and keep it in `cached_eval` so the
+    // finite-block-Hessian guard still runs at the inner-solve boundary and the
+    // blockwise fall-through reuses the same eval instead of recomputing it.
+    if cached_eval.is_none() {
+        cached_eval = Some(family.evaluate(&states)?);
+    }
     if let Some(eval) = cached_eval.as_ref() {
         validate_block_hessians_finite(eval)?;
     }

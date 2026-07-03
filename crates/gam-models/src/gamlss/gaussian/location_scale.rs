@@ -247,6 +247,68 @@ impl GaussianLocationScaleFamily {
         self.exact_newton_joint_hessian_from_designs(block_states, &xmu, &x_ls)
     }
 
+    /// Exact joint log-likelihood / score in the flattened coefficient space
+    /// `β = [β_μ; β_logσ]`, sized from the (post-audit) `specs` block designs.
+    /// Returns `None` when either block design is unavailable, matching the
+    /// joint-Hessian path's gating so the two never disagree on shape.
+    pub(crate) fn exact_newton_joint_gradient_for_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: Option<&[ParameterBlockSpec]>,
+    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
+        let Some((xmu, x_ls)) = self.exact_joint_dense_block_designs(specs)? else {
+            return Ok(None);
+        };
+        self.exact_newton_joint_gradient_from_designs(block_states, &xmu, &x_ls)
+            .map(Some)
+    }
+
+    /// Assemble the joint log-likelihood gradient `g = ∇_β log L` from the SAME
+    /// per-row score the inner-solve / ψ path consumes
+    /// (`gaussian_joint_psi_firstweights.{scoremu, score_ls}`), so the analytic
+    /// joint gradient can never disagree with the derivation feeding the joint
+    /// Hessian. Those fields are the negative-log-likelihood (objective) score
+    /// w.r.t. η (`scoremu = -m`, `score_ls = κ(a−n)`); the log-likelihood
+    /// gradient is their negation contracted with the block designs,
+    /// `g = [Xμᵀ·(−scoreμ); X_lsᵀ·(−score_ls)]`. The ψ-direction inputs only
+    /// feed the drift / objective fields, not `scoremu`/`score_ls`, so passing
+    /// zero directions yields exactly the plain per-row score.
+    pub(crate) fn exact_newton_joint_gradient_from_designs(
+        &self,
+        block_states: &[ParameterBlockState],
+        xmu: &Array2<f64>,
+        x_ls: &Array2<f64>,
+    ) -> Result<ExactNewtonJointGradientEvaluation, String> {
+        validate_block_count::<GamlssError>("GaussianLocationScaleFamily", 2, block_states.len())?;
+        let n = self.y.len();
+        let etamu = &block_states[Self::BLOCK_MU].eta;
+        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        if etamu.len() != n
+            || eta_ls.len() != n
+            || self.weights.len() != n
+            || xmu.nrows() != n
+            || x_ls.nrows() != n
+        {
+            return Err(GamlssError::DimensionMismatch {
+                reason: "GaussianLocationScaleFamily joint gradient input size mismatch".to_string(),
+            }
+            .into());
+        }
+        let rows = self.get_or_compute_row_scalars(etamu, eta_ls)?;
+        let zero = Array1::<f64>::zeros(n);
+        let weights = gaussian_joint_psi_firstweights(&rows, &zero, &zero);
+        let grad_eta_mu = -&weights.scoremu;
+        let grad_eta_ls = -&weights.score_ls;
+        let grad_mu = fast_atv(xmu, &grad_eta_mu);
+        let grad_ls = fast_atv(x_ls, &grad_eta_ls);
+        let gradient = gaussian_pack_joint_score(&grad_mu, &grad_ls);
+        let log_likelihood = self.log_likelihood_only(block_states)?;
+        Ok(ExactNewtonJointGradientEvaluation {
+            log_likelihood,
+            gradient,
+        })
+    }
+
     pub(crate) fn exact_newton_joint_hessian_directional_derivative_for_specs(
         &self,
         block_states: &[ParameterBlockState],
@@ -1394,6 +1456,14 @@ impl CustomFamily for GaussianLocationScaleFamily {
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
         self.exact_newton_joint_hessian_for_specs(block_states, None)
+    }
+
+    fn exact_newton_joint_gradient_evaluation(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
+        self.exact_newton_joint_gradient_for_specs(block_states, Some(specs))
     }
 
     fn has_explicit_joint_hessian(&self) -> bool {

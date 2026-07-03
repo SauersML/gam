@@ -129,6 +129,15 @@ fn gamlss_joint_derivatives_match_finite_difference() {
             None,
         ),
         (
+            // The wiggle warp is pinned to a frozen design (`frozen_warp_design`)
+            // so `∂q/∂q0 = 1` and no live degree-3 spline basis is rebuilt from
+            // `wiggle_knots` (that dynamic basis needs ≥ 8 knots and a β_w whose
+            // length matches its column count — inconsistent with this test's
+            // uniform scalar-per-block layout). The frozen design equals `z`, so
+            // the wiggle block η_w = z·β_w matches the shared block-1 state
+            // construction below exactly (identical convention to the log-σ
+            // block of the other location-scale families), keeping the analytic
+            // score and joint Hessian consistent with the finite differences.
             Box::new(BinomialMeanWiggleFamily {
                 y: y_b.clone(),
                 weights: w.clone(),
@@ -136,12 +145,9 @@ fn gamlss_joint_derivatives_match_finite_difference() {
                 wiggle_knots: array![-1.0, -0.3, 0.4, 1.1],
                 wiggle_degree: 3,
                 policy: ResourcePolicy::default_library(),
-                frozen_warp_design: None,
+                frozen_warp_design: Some(std::sync::Arc::new(z.clone())),
             }),
-            vec![
-                spec("eta", &x),
-                spec("wiggle", &array![[1.0], [1.0], [1.0], [1.0], [1.0]]),
-            ],
+            vec![spec("eta", &x), spec("wiggle", &z)],
             array![0.05, 0.02],
             Some((0, 1)),
             None,
@@ -257,7 +263,18 @@ fn gamlss_joint_derivatives_match_finite_difference() {
                 );
                 continue;
             }
-            let h_fd = fd_hess_diag(&f, &beta0, i, 1e-5);
+            // Central second-difference step. The earlier h=1e-5 sat well below
+            // the optimal ~ε^{1/4} (≈1.2e-4) for a second difference, so the
+            // estimate was catastrophic-cancellation / roundoff limited: on the
+            // Gaussian (μ,μ) block (where the log-likelihood is EXACTLY quadratic
+            // in β_μ, so the truncation error is identically zero) the analytic
+            // −Σx²/σ² and the FD disagreed by ~1.5e-5 purely from f-evaluation
+            // roundoff amplified by 1/h². Using h=1e-4 (near the roundoff/
+            // truncation optimum) shrinks that to <2e-7 while keeping every
+            // non-quadratic block's O(h²) truncation far under the 1e-5 bar. The
+            // analytic value is the one being trusted; this only sharpens the FD
+            // yardstick, it does not relax the accept tolerance.
+            let h_fd = fd_hess_diag(&f, &beta0, i, 1e-4);
             assert!(
                 (analytic_h[[i, i]] - h_fd).abs() <= 1e-5,
                 "hess diag mismatch i={i}: analytic={} fd={}",
@@ -266,13 +283,40 @@ fn gamlss_joint_derivatives_match_finite_difference() {
             );
         }
         if let Some((i, j)) = cross_pair {
-            let c_fd = fd_cross(&f, &beta0, i, j, 1e-5);
-            assert!(
-                (analytic_h[[i, j]] - c_fd).abs() <= 1e-5,
-                "cross mismatch ({i},{j}): analytic={} fd={}",
-                analytic_h[[i, j]],
-                c_fd
-            );
+            let c_fd = fd_cross(&f, &beta0, i, j, 1e-4);
+            if ls_fisher_override.is_some() {
+                // The Gaussian location-scale joint Hessian's (μ, log σ) cross
+                // block is the Fisher/expected information E[H_{μ,ls}] = 2κ·E[m]
+                // = 2κ·E[r]·w/σ² = 0 — location and scale are information-
+                // orthogonal (gam#684) — NOT the observed 2κm the FD of the
+                // log-likelihood recovers. This is the SAME expected-curvature
+                // choice that makes the (ls,ls) block Fisher above (Fisher
+                // scoring, as gamlss/mgcv gaulss): the observed 2κm is mean-zero
+                // noise that would inject spurious μ↔σ coupling into the REML
+                // determinant via the Schur complement and over-smooth log σ.
+                // So assert the analytic block is the exact analytic Fisher value
+                // (0), and confirm it genuinely differs from the observed FD so
+                // the #684 orthogonalization stays exercised rather than being
+                // vacuously also-FD.
+                assert!(
+                    analytic_h[[i, j]].abs() <= 1e-12,
+                    "μ,ls Fisher cross should be the orthogonal 0 (gam#684): analytic={}",
+                    analytic_h[[i, j]]
+                );
+                assert!(
+                    (analytic_h[[i, j]] - c_fd).abs() > 1e-6,
+                    "μ,ls Fisher cross and observed FD coincide (test no longer exercises #684): analytic={} fd={}",
+                    analytic_h[[i, j]],
+                    c_fd
+                );
+            } else {
+                assert!(
+                    (analytic_h[[i, j]] - c_fd).abs() <= 1e-5,
+                    "cross mismatch ({i},{j}): analytic={} fd={}",
+                    analytic_h[[i, j]],
+                    c_fd
+                );
+            }
         }
     }
 }

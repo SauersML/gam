@@ -171,6 +171,19 @@ impl CustomFamily for PoissonLogFamily {
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         evaluate_log_link_diagonal_irls(self, block_states)
     }
+
+    fn exact_newton_joint_gradient_evaluation(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
+        // Assemble the exact score from the IRLS working set (X_bᵀ(w⊙(z−η))),
+        // the same source of truth the inner joint-Newton RHS uses. For the
+        // canonical Poisson log link observed = Fisher, so this is the exact
+        // observed gradient (matches FD of the log-likelihood).
+        let eval = self.evaluate(block_states)?;
+        gamlss_joint_gradient_from_working_sets(&eval, specs, block_states).map(Some)
+    }
 }
 
 impl CustomFamilyGenerative for PoissonLogFamily {
@@ -280,6 +293,19 @@ impl CustomFamily for GammaLogFamily {
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         evaluate_log_link_diagonal_irls(self, block_states)
+    }
+
+    fn exact_newton_joint_gradient_evaluation(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
+        // Assemble the exact score from the IRLS working set (X_bᵀ(w⊙(z−η))).
+        // The Gamma log link is non-canonical, but the working step z is defined
+        // relative to the row weight so w(z−η) is the exact observed ∂ℓ/∂η
+        // regardless — the assembled gradient matches FD of the log-likelihood.
+        let eval = self.evaluate(block_states)?;
+        gamlss_joint_gradient_from_working_sets(&eval, specs, block_states).map(Some)
     }
 
     fn diagonalworking_weights_directional_derivative(
