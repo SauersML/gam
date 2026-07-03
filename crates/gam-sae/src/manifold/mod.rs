@@ -130,6 +130,7 @@ pub use crate::frames::*;
 mod amortized_routing;
 mod arrow_solver;
 mod atom;
+mod behavior;
 mod certificate;
 mod construction;
 mod construction_ard;
@@ -184,6 +185,9 @@ mod tests_unit_speed_inloop_2022;
 mod tests_structured_residual_2021;
 
 #[cfg(test)]
+mod tests_behavioral_fisher_rung1;
+
+#[cfg(test)]
 mod tests_two_tier_2023;
 
 #[cfg(test)]
@@ -230,6 +234,7 @@ mod lambda_smooth_1556_tests;
 
 pub use arrow_solver::*;
 pub use atom::*;
+pub use behavior::*;
 pub use certificate::*;
 pub use construction_aux_types::*;
 pub use coordinate_fidelity::*;
