@@ -17,7 +17,7 @@ use std::sync::Arc;
 use crate::manifold::{
     AssignmentMode, BehaviorBlock, LatentManifold, PeriodicHarmonicEvaluator, SaeAssignment,
     SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
-    SphereTangentEmbedding, reconstruction_explained_variance,
+    SphereTangentEmbedding, TwoBlockRemlControls, reconstruction_explained_variance,
 };
 
 const ON: f64 = 6.0;
@@ -299,7 +299,19 @@ fn reml_selects_lambda_y_at_planted_variance_ratio() {
         term.set_behavior_block(block).unwrap();
         term.set_guards_enabled(false);
         let report = term
-            .run_two_block_reml_fit(z.view(), &mut rho, None, 20, 48, 1.0, 1e-6, 1e-6, 1e-3)
+            .run_two_block_reml_fit(
+                z.view(),
+                &mut rho,
+                None,
+                TwoBlockRemlControls {
+                    max_sweeps: 20,
+                    inner_max_iter: 48,
+                    step_size: 1.0,
+                    ridge_ext_coord: 1e-6,
+                    ridge_beta: 1e-6,
+                    log_lambda_tol: 1e-3,
+                },
+            )
             .expect("two-block REML fit must complete");
         assert!(
             report.converged,
@@ -402,7 +414,19 @@ fn behavior_block_pins_reflection_gauge_that_activation_alone_cannot() {
     term_b.set_behavior_block(block).unwrap();
     term_b.set_guards_enabled(false);
     let report = term_b
-        .run_two_block_reml_fit(z.view(), &mut rho_b, None, 20, 48, 1.0, 1e-6, 1e-6, 1e-3)
+        .run_two_block_reml_fit(
+            z.view(),
+            &mut rho_b,
+            None,
+            TwoBlockRemlControls {
+                max_sweeps: 20,
+                inner_max_iter: 48,
+                step_size: 1.0,
+                ridge_ext_coord: 1e-6,
+                ridge_beta: 1e-6,
+                log_lambda_tol: 1e-3,
+            },
+        )
         .expect("two-block fit must complete");
     assert!(report.lambda_identifiable);
     let block = term_b.behavior_block().unwrap().clone();
