@@ -87,7 +87,7 @@ fn two_block_joint_fit_reconstructs_activation_and_behavior() {
     let n = 60usize;
     let p_x = 4usize;
     let vocab = 4usize; // behavior tangent dim p_y = 3
-    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
+    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(5).unwrap());
     let coords = Array2::<f64>::from_shape_fn((n, 1), |(i, _)| i as f64 / n as f64);
 
     // Planted activation: two channels are a clean cos/sin of the circle angle,
@@ -112,7 +112,7 @@ fn two_block_joint_fit_reconstructs_activation_and_behavior() {
         }
     }
 
-    let block = BehaviorBlock::fit(probs.view(), p_x, -4.0).unwrap();
+    let block = BehaviorBlock::fit(probs.view(), p_x, 0.0).unwrap();
     let p_y = block.behavior_dim();
     assert_eq!(p_y, vocab - 1);
     let p_tot = p_x + p_y;
