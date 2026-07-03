@@ -2,7 +2,7 @@
 # MSI gamfit wheel cutover guard. Source this after any Python environment
 # activation; it forces the current commit-pinned wheel venv to the front.
 
-GAMFIT_MSI_ROOT=/projects/standard/hsiehph/sauer354
+GAMFIT_MSI_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 GAMFIT_MSI_MANIFEST=${GAMFIT_MSI_ROOT}/gamfit_current_manifest.sh
 
 _gamfit_msi_die() {

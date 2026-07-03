@@ -4,21 +4,21 @@ The active MSI wheel venv is pinned by the generated MSI manifest, not just by
 package version:
 
 ```bash
-/projects/standard/hsiehph/sauer354/gamfit_current_manifest.sh
+<MSI_PROJECT_ROOT>/gamfit_current_manifest.sh
 ```
 
 That manifest contains the exact `origin/main` commit, wheel path, venv path,
 and wheel SHA installed by the latest CPU build job:
 
 ```bash
-cat /projects/standard/hsiehph/sauer354/gamfit_current_manifest.sh
+cat <MSI_PROJECT_ROOT>/gamfit_current_manifest.sh
 ```
 
 Use this invocation for MSI wheel-backed Python work:
 
 ```bash
-source /projects/standard/hsiehph/sauer354/gam_env.sh
-source /projects/standard/hsiehph/sauer354/gamfit_current_env.sh
+source <MSI_PROJECT_ROOT>/gam_env.sh
+source <MSI_PROJECT_ROOT>/gamfit_current_env.sh
 gamfit_assert_msi_current
 gamfit_python -c 'import gamfit, gamfit._rust; print(gamfit.__version__, gamfit.__file__, gamfit._rust.__file__)'
 ```
@@ -35,6 +35,6 @@ runtime work. They are not commit-pinned to current `origin/main`.
 To rebuild this cutover wheel on CPU resources only:
 
 ```bash
-cd /projects/standard/hsiehph/sauer354
+cd <MSI_PROJECT_ROOT>
 sbatch --parsable msi_build_gamfit_current.sbatch
 ```
