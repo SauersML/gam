@@ -4136,21 +4136,36 @@ pub(crate) fn joint_newton_budget_exhaustion_refuses_coupled_exact_inner() {
     };
     let per_block = vec![Array1::zeros(0), Array1::zeros(0)];
 
-    let err = inner_blockwise_fit(
+    // A coupled exact-joint family whose gradient never reaches KKT (the unit
+    // persistent gradient) exhausts a one-cycle budget. Per the coupled-exact
+    // budget-exhaustion contract (`inner_blockwise_fit`, the `if
+    // coupled_exact_joint_required` budget branch), that is NOT malformed input:
+    // the inner solver returns a finite, NON-converged mode so the OUTER
+    // optimizer can reject this rho and back off to a fit-able neighbour —
+    // escaping the survival/location-scale flat-baseline valley — instead of
+    // bubbling an `InvalidInput` through the custom-family string boundary and
+    // aborting the whole fit on the first non-certifying startup rho. The outer
+    // consumes `!inner.converged` (`assembly.rs`, `fit.rs`); an `Err` here would
+    // defeat that rho-rejection contract.
+    let result = inner_blockwise_fit(
         &TwoBlockPersistentGradientFamily,
         &[spec0, spec1],
         &per_block,
         &options,
         None,
     )
-    .expect_err("coupled exact-joint max-budget exhaustion must fail loudly");
+    .expect("coupled exact-joint budget exhaustion returns a non-converged mode, not an error");
     assert!(
-        err.contains("exhausted the joint Newton budget without KKT convergence"),
-        "budget exhaustion should be named explicitly: {err}"
+        !result.converged,
+        "a budget-exhausted coupled-exact inner mode must be reported non-converged"
+    );
+    assert_eq!(
+        result.cycles, 1,
+        "the one-cycle budget must be fully consumed before the non-converged exit"
     );
     assert!(
-        err.contains("block_residual_inf"),
-        "error should carry per-block residual diagnostics: {err}"
+        result.kkt_residual.is_none(),
+        "a non-converged inner mode carries no KKT certificate for the outer IFT correction"
     );
 }
 
@@ -4211,13 +4226,17 @@ pub(crate) fn non_finite_curvature_exits_joint_newton_far_below_budget() {
         None,
     )
     .expect_err("a non-finite joint Hessian must fail the coupled exact-joint inner solve");
-    // The exit is via the structured "exited the joint Newton path before
-    // convergence" branch (an immediate early break), NOT the budget-
-    // exhaustion branch — proving the loop did not grind to the ceiling.
+    // gam#1088: the NaN curvature is detected and rejected at the smooth-
+    // regularized logdet-Hessian boundary — BEFORE the joint-Newton loop and its
+    // eigendecomposition — so the solve fails loudly essentially immediately and
+    // never grinds toward the ceiling (the same fail-loudly contract pinned by
+    // `exact_newton_nan_hessian_fails_loudly_before_eigendecomposition`). The
+    // full production ceiling set above proves the fast exit does not depend on a
+    // small budget.
     assert!(
-        err.contains("exited the joint Newton path before convergence"),
-        "non-finite curvature must take the early structured exit, not the \
-             budget path: {err}"
+        err.contains("smooth-regularized logdet Hessian contains non-finite entry"),
+        "non-finite curvature must be rejected loudly at the logdet boundary, far \
+             below the Newton budget: {err}"
     );
     assert!(
         !err.contains("exhausted the joint Newton budget"),
