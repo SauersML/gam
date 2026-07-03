@@ -836,14 +836,15 @@ impl SaeManifoldTerm {
 
     /// #5/(B) — per-atom realised-rank effective DOF for the rank-charge criterion:
     /// `d_eff_k = rank_eff_k · basis_edf_k`, where
-    ///   * `rank_eff_k = Σ_i s_i²/(s_i² + R)` over the fitted decoder's singular
-    ///     values `s_i` (its REALISED output rank — 2 for a rank-2 circle),
-    ///     with the FIXED noise floor `R = dispersion_r` (the residual variance).
-    ///     A decoder collapsing to `‖B‖→0` sends every `s_i → 0 ≪ R` → `rank_eff
-    ///     → 0` → charge 0 → neutral (the co-collapse fix). Because `R` is the
-    ///     fixed data-noise scale (NOT a self-relative `ε·max_sv`), a single
-    ///     vanishing atom's singular values fall below it even though its own
-    ///     ratios are preserved under uniform shrink.
+    ///   * `rank_eff_k` = the Marchenko–Pastur HARD count of the atom's realised
+    ///     output rank: the number of per-atom reconstruction-Gram eigenvalues
+    ///     (`(1/N_eff)·BᵀB`, `B = diag(a_k)·Φ_k·D_k`, `N_eff = Σ_row a_k²`) above
+    ///     the DERIVED bulk edge `R·(1+√(p/N_eff))²` (`R = dispersion_r`, the
+    ///     residual variance). Exactly 2 for a rank-2 circle; 0 for a decoder
+    ///     collapsing to `‖B‖→0` (every eigenvalue → 0 ≪ edge) → charge 0 →
+    ///     neutral (the co-collapse fix). The edge is parameter-free (NOT a
+    ///     self-relative `ε·max_sv`): pure output noise cannot exceed it, so an
+    ///     eigenvalue above it is identified signal. [#1893]
     ///   * `basis_edf_k = tr(G_k · (G_k + λ_k S_k)⁻¹)` on the atom's `m×m`
     ///     decoder data Gram (its identified basis dimension, ~m minus the
     ///     smoothness/DC shrinkage).
@@ -856,8 +857,34 @@ impl SaeManifoldTerm {
         rho: &SaeManifoldRho,
         dispersion_r: f64,
     ) -> Result<Vec<f64>, String> {
+        // Dense path: materialise the per-atom Grams G_k = Φ_kᵀdiag(a_k²)Φ_k and the
+        // effective sample sizes N_eff,k = Σ_row a_k² from `self`, then delegate the
+        // rank/EDF pricing to the shared `rank_dof_from_grams`. The #9 streaming path
+        // ACCUMULATES the same `grams`/`n_eff` chunk-by-chunk (basis_values is not
+        // persisted there) and calls the SAME core — so the criterion is identical.
         let mut grams = self.empty_decoder_gram_accumulator();
         self.accumulate_decoder_gram(&mut grams);
+        let assignments = self.assignment.assignments();
+        let n_eff: Vec<f64> = (0..self.k_atoms())
+            .map(|k| assignments.column(k).iter().map(|&a| a * a).sum())
+            .collect();
+        self.rank_dof_from_grams(&grams, &n_eff, rho, dispersion_r)
+    }
+
+    /// Shared rank-charge DOF core (#11): `d_eff_k = rank_eff_k · basis_edf_k` from the
+    /// PRE-ACCUMULATED per-atom Grams `grams[k] = Φ_kᵀdiag(a_k²)Φ_k` and effective sample
+    /// sizes `n_eff[k] = Σ_row a_k²`. Split out of `per_atom_realised_rank_dof` so the
+    /// dense path (grams from `self`) and the #9 streaming path (grams accumulated over
+    /// `materialize_chunk` chunks) price the atom IDENTICALLY — only the Gram source
+    /// differs. Reads only the persisted `decoder_coefficients`/`smooth_penalty`, never
+    /// `basis_values` (absent under streaming).
+    pub(crate) fn rank_dof_from_grams(
+        &self,
+        grams: &[Array2<f64>],
+        n_eff: &[f64],
+        rho: &SaeManifoldRho,
+        dispersion_r: f64,
+    ) -> Result<Vec<f64>, String> {
         let lam = rho.lambda_smooth_vec();
         // Fixed noise floor R = residual variance (dispersion). Guard finite/positive.
         let r_floor = if dispersion_r.is_finite() && dispersion_r > 0.0 {
@@ -865,30 +892,51 @@ impl SaeManifoldTerm {
         } else {
             f64::MIN_POSITIVE
         };
+        let p_out = self.output_dim() as f64;
         let mut out = Vec::with_capacity(self.k_atoms());
         for k in 0..self.k_atoms() {
-            // rank_eff: realised output rank of the fitted decoder vs the noise floor.
-            let rank_eff: f64 = match self.atoms[k].decoder_coefficients.svd(false, false) {
-                Ok((_, sv, _)) => sv
-                    .iter()
-                    .map(|&s| {
-                        let s2 = s * s;
-                        if s2 + r_floor > 0.0 {
-                            s2 / (s2 + r_floor)
-                        } else {
-                            0.0
-                        }
-                    })
-                    .sum(),
-                Err(e) => {
-                    return Err(format!(
-                        "per_atom_realised_rank_dof: decoder svd atom {k}: {e}"
-                    ))
-                }
-            };
-            // basis_edf = tr(G (G + λS)⁻¹) on the m×m decoder data Gram.
             let g = &grams[k];
             let m = g.nrows();
+            // rank_eff (#11): Marchenko–Pastur HARD count of the atom's realised output
+            // rank on the per-atom reconstruction Gram (1/N_eff)·BᵀB, B = diag(a_k)·Φ_k·D_k.
+            // Its nonzero eigenvalues are the squared singular values of diag(√λ)·Uᵀ·D_k
+            // (with (λ,U)=eigh(G_k), G_k = Φ_kᵀdiag(a_k²)Φ_k = grams[k], decoder-independent)
+            // divided by the effective sample size N_eff = Σ_row a_k² (which makes the count
+            // invariant to the assignment scale, reducing to n for a dense atom). Count those
+            // above the MP bulk edge R·(1+√(p/N_eff))²: pure output noise cannot push an
+            // eigenvalue past this DERIVED, parameter-free edge, so a real rank-2 circle → 2
+            // and a vanishing decoder (all eigs → 0) → 0. This replaces the soft Σ s²/(s²+R)
+            // (which leaks ~0.4/dim and floors above 0 on a noisy Gram, re-admitting the
+            // collapse it must reject) and is the count the #9 streaming port reuses verbatim
+            // on its streaming-accumulated ΦᵀWΦ.  [#1893]
+            let n_eff_k = n_eff.get(k).copied().unwrap_or(0.0);
+            let rank_eff: f64 = if m == 0 || !(n_eff_k > 0.0) {
+                0.0
+            } else {
+                let (evals, u) = g.eigh(super::Side::Lower).map_err(|e| {
+                    format!("rank_dof_from_grams: eigh(G) atom {k}: {e}")
+                })?;
+                // diag(√max(λ,0))·Uᵀ·D_k (m×p); its singular values equal those of the
+                // reconstruction square root G_k^½·D_k because left-multiplying by the
+                // orthogonal U preserves singular values.
+                let mut scaled = u.t().dot(&self.atoms[k].decoder_coefficients);
+                let cols = scaled.ncols();
+                for i in 0..m {
+                    let s = evals[i].max(0.0).sqrt();
+                    for j in 0..cols {
+                        scaled[[i, j]] *= s;
+                    }
+                }
+                let sv = match scaled.svd(false, false) {
+                    Ok((_, sv, _)) => sv,
+                    Err(e) => {
+                        return Err(format!("rank_dof_from_grams: recon svd atom {k}: {e}"))
+                    }
+                };
+                let edge = r_floor * (1.0 + (p_out / n_eff_k).sqrt()).powi(2);
+                sv.iter().filter(|&&s| (s * s) / n_eff_k > edge).count() as f64
+            };
+            // basis_edf = tr(G (G + λS)⁻¹) on the m×m decoder data Gram.
             let basis_edf = if m == 0 {
                 0.0
             } else {
