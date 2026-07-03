@@ -15,6 +15,7 @@ torch = pytest.importorskip("torch")
 
 from gamfit.torch._basis import (  # noqa: E402
     bspline_basis_derivative,
+    duchon_basis,
     gaussian_weighted_ridge,
     gaussian_weighted_ridge_batch,
     sphere_basis,
@@ -76,6 +77,88 @@ def test_sphere_basis_gradcheck_points(kernel: str) -> None:
         return design
 
     assert torch.autograd.gradcheck(fn, (points,), atol=1e-6, rtol=1e-4)
+
+
+# --------------------------------------------------------------------------- #
+# Item D: duchon_basis (grad through points)
+#
+# The forward design and the analytic jets must come from ONE Rust builder so
+# the input gradient is the exact derivative of the returned forward (gam#2097);
+# the basis-only forward applies a batch-global data-metric reparam the jets do
+# not, which used to make the VJP wrong / un-broadcastable.
+# --------------------------------------------------------------------------- #
+_DUCHON_POINTS = torch.tensor(
+    [[0.15, 0.25], [0.35, 0.65], [0.55, 0.45], [0.75, 0.85], [0.25, 0.55]],
+    dtype=torch.float64,
+)
+_DUCHON_CENTERS = torch.tensor(
+    [[0.1, 0.1], [0.1, 0.9], [0.9, 0.1], [0.9, 0.9], [0.5, 0.5], [0.3, 0.7]],
+    dtype=torch.float64,
+)
+
+
+@pytest.mark.parametrize("m", [2, 3])
+def test_duchon_basis_gradcheck_points(m: int) -> None:
+    points = _DUCHON_POINTS.clone().requires_grad_(True)
+
+    def fn(pts: torch.Tensor) -> torch.Tensor:
+        return duchon_basis(pts, centers=_DUCHON_CENTERS, m=m)
+
+    assert torch.autograd.gradcheck(fn, (points,), atol=1e-6, rtol=1e-4)
+
+
+def test_duchon_basis_gradgradcheck_points() -> None:
+    # Second-order (input-location Hessian) routes through the Rust second jet.
+    points = _DUCHON_POINTS[:4].clone().requires_grad_(True)
+
+    def fn(pts: torch.Tensor) -> torch.Tensor:
+        return duchon_basis(pts, centers=_DUCHON_CENTERS, m=2)
+
+    assert torch.autograd.gradgradcheck(fn, (points,), atol=1e-5, rtol=1e-3)
+
+
+def test_duchon_basis_gradcheck_width_reducing_config() -> None:
+    # K=10 centers in 2D: the basis-only forward's data-metric reparam drops a
+    # near-null kernel mode (9 columns) while the jet builder keeps all 10, so
+    # the two-builder path raised a shape-mismatch RuntimeError here. Sharing one
+    # builder keeps the width consistent (10) and the gradient exact.
+    g = torch.Generator().manual_seed(0)
+    centers = torch.rand(10, 2, generator=g, dtype=torch.float64)
+    points = torch.rand(4, 2, generator=g, dtype=torch.float64).requires_grad_(True)
+
+    out = duchon_basis(points, centers=centers, m=2)
+    assert out.shape == (4, 10)
+    assert torch.autograd.gradcheck(
+        lambda pts: duchon_basis(pts, centers=centers, m=2),
+        (points,),
+        atol=1e-6,
+        rtol=1e-4,
+    )
+
+
+def test_duchon_basis_gradcheck_1d_and_periodic() -> None:
+    # 1D open smooth.
+    p1 = torch.tensor(
+        [[0.2], [0.4], [0.6], [0.8]], dtype=torch.float64
+    ).requires_grad_(True)
+    c1 = torch.tensor([[0.1], [0.3], [0.5], [0.7], [0.9]], dtype=torch.float64)
+    assert torch.autograd.gradcheck(
+        lambda x: duchon_basis(x, centers=c1, m=2), (p1,), atol=1e-6, rtol=1e-4
+    )
+    # 1D circle (mixed-periodicity builder): the forward and jets share the
+    # additive-kernel design too.
+    pc = torch.tensor(
+        [[0.2], [1.1], [2.4], [3.0]], dtype=torch.float64
+    ).requires_grad_(True)
+    cc = torch.tensor(
+        [[0.0], [1.0], [2.0], [3.0], [4.0], [5.0]], dtype=torch.float64
+    )
+    assert torch.autograd.gradcheck(
+        lambda x: duchon_basis(x, centers=cc, m=2, periodic_per_axis=(True,)),
+        (pc,),
+        atol=1e-5,
+        rtol=1e-3,
+    )
 
 
 # --------------------------------------------------------------------------- #
