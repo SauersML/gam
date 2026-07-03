@@ -161,7 +161,7 @@ pub fn score_block_cpu(rows: ArrayView2<'_, f32>, atoms: ArrayView2<'_, f32>) ->
 /// launch is not worth its fixed cost (probe + H2D + D2H). Below this the CPU
 /// reference is used. Tuned to the same genus as the other SAE device floors
 /// (`sae_rowjet::DEVICE_ROW_THRESHOLD`).
-pub const DEVICE_SCORE_BLOCK_MIN_ELEMS: usize = 1 << 20; // ~1M MACs/tile minimum
+pub const DEVICE_SCORE_BLOCK_MIN_ELEMS: usize = gam_gpu::DEFAULT_DICTIONARY_SCORE_MIN_ELEMS;
 
 /// Which path produced a score block. Returned by the fail-loud entry point so
 /// callers (and the parity test) can ASSERT the device engaged rather than
@@ -236,7 +236,7 @@ pub fn score_block_required(
 /// memory bounded **independent of `K`** — the same discipline the CPU lane
 /// ([`super::scoring::top_s_online`]) keeps with its `rows × tile` column tiles —
 /// so a `K ≈ 32_000` fit does not balloon a `device alloc` linearly in `K`.
-const GPU_ROUTE_TILE_ELEMS: usize = 1 << 21;
+const GPU_ROUTE_TILE_ELEMS: usize = gam_gpu::DEFAULT_DICTIONARY_SCORE_TILE_ELEMS;
 
 /// Route a whole minibatch of rows against the full decoder, returning each
 /// row's top-`s` `(atom, score)` selection — BIT-IDENTICAL to calling
@@ -290,14 +290,20 @@ pub fn route_minibatch_required(
     // Engagement is decided on the TOTAL work `m × K` (that is what justifies the
     // device's fixed launch cost), but the launches themselves are K-tiled so the
     // buffers never grow with K.
-    let elems = m.saturating_mul(k);
-    let below_breakeven = elems < DEVICE_SCORE_BLOCK_MIN_ELEMS;
-    if below_breakeven {
+    let plan = gam_gpu::DictionaryScoreRoutePlan::with_limits(
+        m,
+        k,
+        decoder.ncols(),
+        DEVICE_SCORE_BLOCK_MIN_ELEMS,
+        GPU_ROUTE_TILE_ELEMS,
+    );
+    if !plan.device_admitted {
         if mode == gam_gpu::GpuMode::Required {
             return Err(gam_gpu::gpu_err!(
-                "route_minibatch GpuMode::Required: block of {m}×{k} = {elems} elems is below \
+                "route_minibatch GpuMode::Required: block of {m}×{k} = {} elems is below \
                  the device launch break-even (DEVICE_SCORE_BLOCK_MIN_ELEMS={DEVICE_SCORE_BLOCK_MIN_ELEMS}); \
-                 refusing to silently run on the CPU"
+                 refusing to silently run on the CPU",
+                m.saturating_mul(k)
             ));
         }
         return Ok((cpu_route(), ScoreBlockPath::Cpu));
@@ -308,36 +314,29 @@ pub fn route_minibatch_required(
 
     // Atom-columns per device launch: bound the per-launch block to
     // GPU_ROUTE_TILE_ELEMS, at least one column, never more than K.
-    let tile_cols = (GPU_ROUTE_TILE_ELEMS / m).clamp(1, k);
+    let tile_cols = plan.tile_items;
 
     // Per-row online selectors; each device tile's scores are folded in ascending
     // global atom order (offset + ascending local), and the selector's result is
     // tile-order-invariant, so the support is bit-identical to top_s_online.
     let mut selectors: Vec<TopSSelector> = (0..m).map(|_| TopSSelector::new(s)).collect();
-    let mut start = 0usize;
-    while start < k {
-        let end = (start + tile_cols).min(k);
-        let atoms_tile = decoder.slice(ndarray::s![start..end, ..]);
-        match device::score_block_device(rows, atoms_tile) {
-            Ok(block) => {
-                let cols = end - start;
-                for (r, sel) in selectors.iter_mut().enumerate() {
-                    let base = r * cols;
-                    for (local, score) in block[base..base + cols].iter().enumerate() {
-                        sel.offer((start + local) as u32, *score);
-                    }
-                }
-            }
-            Err(err) => {
-                if mode == gam_gpu::GpuMode::Required {
-                    return Err(err);
-                }
-                // Auto: the device faulted mid-route; discard partial selectors and
-                // run the exact CPU oracle for the whole minibatch.
-                return Ok((cpu_route(), ScoreBlockPath::Cpu));
+    match device::score_decoder_tiled_device(rows, decoder, tile_cols, |start, cols, block| {
+        for (r, sel) in selectors.iter_mut().enumerate() {
+            let base = r * cols;
+            for (local, score) in block[base..base + cols].iter().enumerate() {
+                sel.offer((start + local) as u32, *score);
             }
         }
-        start = end;
+    }) {
+        Ok(()) => {}
+        Err(err) => {
+            if mode == gam_gpu::GpuMode::Required {
+                return Err(err);
+            }
+            // Auto: the device faulted mid-route; discard partial selectors and
+            // run the exact CPU oracle for the whole minibatch.
+            return Ok((cpu_route(), ScoreBlockPath::Cpu));
+        }
     }
 
     let routed = selectors.into_iter().map(TopSSelector::finish).collect();
@@ -484,6 +483,112 @@ mod device {
             .synchronize()
             .gpu_ctx("sparse_dict score-block synchronize")?;
         Ok(scores)
+    }
+
+    /// Route-time score-block stream for a full decoder. The rows are uploaded
+    /// once and kept resident across every atom tile; only the atom tile and
+    /// score block rotate per launch. That preserves the existing bit-exact
+    /// `sparse_dict_score_block` arithmetic while removing the repeated `B × P`
+    /// H2D copy that `score_block_device(rows, atoms_tile)` paid once per K tile.
+    pub(super) fn score_decoder_tiled_device<F>(
+        rows: ArrayView2<'_, f32>,
+        decoder: ArrayView2<'_, f32>,
+        tile_cols: usize,
+        mut fold_tile: F,
+    ) -> Result<(), GpuError>
+    where
+        F: FnMut(usize, usize, &[f32]),
+    {
+        let n_rows = rows.nrows();
+        let k = decoder.nrows();
+        let p = rows.ncols();
+        if p != decoder.ncols() {
+            return Err(gam_gpu::gpu_err!(
+                "sparse_dict tiled score: P mismatch rows={p} decoder={}",
+                decoder.ncols()
+            ));
+        }
+        if n_rows == 0 || k == 0 || p == 0 {
+            return Ok(());
+        }
+
+        let b = backend()?;
+        let module = module_for(b, p)?;
+        let func = module
+            .load_function("sparse_dict_score_block")
+            .gpu_ctx("sparse_dict tiled score load_function")?;
+        let stream = b.stream.clone();
+
+        let rows_host: Vec<f32> = rows.iter().copied().collect();
+        assert_eq!(
+            rows_host.len(),
+            n_rows * p,
+            "tiled score rows flatten length"
+        );
+        let rows_dev = stream
+            .clone_htod(&rows_host)
+            .gpu_ctx("sparse_dict tiled score htod rows")?;
+
+        let n_rows_i32 = i32::try_from(n_rows).map_err(|_| {
+            gam_gpu::gpu_err!("sparse_dict tiled score n_rows={n_rows} overflows i32")
+        })?;
+        let tile_m = super::SCORE_BLOCK_TILE_M;
+        let tile_n = super::SCORE_BLOCK_TILE_N;
+        let tile_cols = tile_cols.max(1);
+
+        let mut start = 0usize;
+        while start < k {
+            let end = (start + tile_cols).min(k);
+            let atoms = decoder.slice(ndarray::s![start..end, ..]);
+            let n_atoms = atoms.nrows();
+            let atoms_host: Vec<f32> = atoms.iter().copied().collect();
+            assert_eq!(
+                atoms_host.len(),
+                n_atoms * p,
+                "tiled score atoms flatten length"
+            );
+            let atoms_dev = stream
+                .clone_htod(&atoms_host)
+                .gpu_ctx("sparse_dict tiled score htod atoms")?;
+            let mut scores_dev = stream
+                .alloc_zeros::<f32>(n_rows * n_atoms)
+                .gpu_ctx("sparse_dict tiled score alloc scores")?;
+
+            let n_atoms_i32 = i32::try_from(n_atoms).map_err(|_| {
+                gam_gpu::gpu_err!("sparse_dict tiled score n_atoms={n_atoms} overflows i32")
+            })?;
+            let grid_x: u32 = u32::try_from(n_atoms.div_ceil(tile_n as usize))
+                .map_err(|_| gam_gpu::gpu_err!("sparse_dict tiled score grid_x overflow"))?;
+            let grid_y: u32 = u32::try_from(n_rows.div_ceil(tile_m as usize))
+                .map_err(|_| gam_gpu::gpu_err!("sparse_dict tiled score grid_y overflow"))?;
+            let cfg = LaunchConfig {
+                grid_dim: (grid_x, grid_y, 1),
+                block_dim: (tile_n, tile_m, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut builder = stream.launch_builder(&func);
+            builder
+                .arg(&rows_dev)
+                .arg(&atoms_dev)
+                .arg(&n_rows_i32)
+                .arg(&n_atoms_i32)
+                .arg(&mut scores_dev);
+            // SAFETY: grid/block validated; device pointers are cudarc-checked
+            // allocations on this stream. The kernel reads the resident rows and
+            // current atom tile and writes exactly `n_rows * n_atoms` scores.
+            unsafe { builder.launch(cfg) }.gpu_ctx("sparse_dict tiled score launch")?;
+
+            let mut scores = vec![0.0f32; n_rows * n_atoms];
+            stream
+                .memcpy_dtoh(&scores_dev, &mut scores)
+                .gpu_ctx("sparse_dict tiled score dtoh scores")?;
+            stream
+                .synchronize()
+                .gpu_ctx("sparse_dict tiled score synchronize")?;
+            fold_tile(start, n_atoms, &scores);
+            start = end;
+        }
+        Ok(())
     }
 }
 

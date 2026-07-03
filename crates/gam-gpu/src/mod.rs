@@ -25,6 +25,7 @@ pub mod device;
 pub mod device_cache;
 pub mod driver;
 pub mod device_runtime;
+pub mod dictionary_score;
 pub mod encode_throughput;
 pub mod linalg_dispatch;
 pub mod memory;
@@ -41,6 +42,10 @@ pub mod kernels;
 pub use cpu_traits::MatrixLocation;
 pub use device::GpuDeviceInfo;
 pub use device_runtime::GpuRuntime;
+pub use dictionary_score::{
+    DEFAULT_DICTIONARY_SCORE_MIN_ELEMS, DEFAULT_DICTIONARY_SCORE_TILE_ELEMS,
+    DictionaryScoreRoutePlan,
+};
 pub use gpu_error::GpuError;
 pub use memory::{DeviceBuffer, DeviceCsrMatrix, DeviceMatrix, DeviceVector};
 pub use policy::{GpuDispatchPolicy, GpuMixedPrecisionPolicy};

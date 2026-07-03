@@ -218,10 +218,9 @@ impl TileScorer {
 
         #[cfg(target_os = "linux")]
         {
-            let elems = rows.nrows().saturating_mul(decoder.nrows());
-            let clears_device_floor = elems >= super::scoring_gpu::DEVICE_SCORE_BLOCK_MIN_ELEMS
-                && rows.nrows() > 0
-                && decoder.nrows() > 0;
+            let plan =
+                gam_gpu::DictionaryScoreRoutePlan::default_for_shape(rows.nrows(), decoder.nrows(), decoder.ncols());
+            let clears_device_floor = plan.device_admitted;
 
             if mode == gam_gpu::GpuMode::Required || clears_device_floor {
                 match super::scoring_gpu::route_minibatch_required(

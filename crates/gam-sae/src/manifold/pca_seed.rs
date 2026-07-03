@@ -188,17 +188,11 @@ fn topology_curved_seed_initial_coords(
     // constant Fiedler-0 column. Each is a function over the `m` subsample rows.
     let harmonic: Vec<ArrayView1<'_, f64>> = (1..evecs.ncols()).map(|c| evecs.column(c)).collect();
     let n_harm = harmonic.len();
+    let starts = topology_seed_harmonic_starts(basis_kinds, atom_dim);
     for atom_idx in 0..basis_kinds.len() {
         let d = atom_dim[atom_idx];
         let kind = &basis_kinds[atom_idx];
-        // Chart functions this atom's kind needs: a phase plane per circle axis (2
-        // each), a 3-frame for the sphere, one coordinate per flat axis.
-        let need = match kind {
-            SaeAtomBasisKind::Periodic => 2,
-            SaeAtomBasisKind::Torus => 2 * d.max(1),
-            SaeAtomBasisKind::Sphere => 3,
-            _ => d.max(1),
-        };
+        let need = topology_seed_chart_need(kind, d);
         if need == 0 || n_harm == 0 {
             continue;
         }
@@ -211,7 +205,7 @@ fn topology_curved_seed_initial_coords(
         // of ALL harmonics, so K ≫ p atoms never share a chart and a co-collapse
         // reseed (retry > 0) lands every atom on a different basin. Atom 0 at
         // retry 0 keeps its original leading-harmonic window bit-for-bit.
-        let start = atom_idx.saturating_mul(need);
+        let start = starts[atom_idx];
         let canonical = pc_pair_offset == 0 && start + need <= n_harm;
         let fns: Vec<Array1<f64>> = if canonical {
             (0..need).map(|i| harmonic[start + i].to_owned()).collect()
@@ -281,6 +275,30 @@ fn topology_curved_seed_initial_coords(
         }
     }
     Ok(Some(out))
+}
+
+// Chart functions needed by one atom in the topology-seed path: one phase plane
+// per circle axis, a 3-frame for the sphere, and one coordinate per flat axis.
+fn topology_seed_chart_need(kind: &SaeAtomBasisKind, d: usize) -> usize {
+    match kind {
+        SaeAtomBasisKind::Periodic => 2,
+        SaeAtomBasisKind::Torus => 2 * d.max(1),
+        SaeAtomBasisKind::Sphere => 3,
+        _ => d.max(1),
+    }
+}
+
+fn topology_seed_harmonic_starts(
+    basis_kinds: &[SaeAtomBasisKind],
+    atom_dim: &[usize],
+) -> Vec<usize> {
+    let mut next = 0usize;
+    let mut starts = Vec::with_capacity(basis_kinds.len());
+    for (kind, &d) in basis_kinds.iter().zip(atom_dim.iter()) {
+        starts.push(next);
+        next = next.saturating_add(topology_seed_chart_need(kind, d));
+    }
+    starts
 }
 
 /// splitmix64 → pseudo-random weight in `[-1, 1]`, keyed deterministically. No
@@ -918,6 +936,23 @@ mod tests {
             }
         }
         m
+    }
+
+    #[test]
+    fn topology_harmonic_windows_are_cumulative_for_mixed_kinds() {
+        let kinds = vec![
+            SaeAtomBasisKind::Torus,
+            SaeAtomBasisKind::Periodic,
+            SaeAtomBasisKind::Sphere,
+            SaeAtomBasisKind::Linear,
+        ];
+        let dims = vec![2usize, 1, 2, 3];
+        assert_eq!(
+            topology_seed_harmonic_starts(&kinds, &dims),
+            vec![0, 4, 6, 9],
+            "mixed atom kinds must allocate canonical harmonic windows cumulatively; \
+             atom_idx * per-atom-need overlaps when need varies"
+        );
     }
 
     /// FIX #1: distinct `pc_pair_offset` ⇒ distinct random plane for a surplus
