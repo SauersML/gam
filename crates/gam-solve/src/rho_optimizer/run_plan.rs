@@ -305,6 +305,17 @@ pub(crate) fn run_outer_with_plan(
     // `expensive_unsuccessful_seed_limit` so the aggregate error can
     // distinguish "all generated seeds tried" from "stopped early".
     let mut stopped_early_due_to_limit = false;
+    // Tracks whether the loop stopped starting NEW seeds because the outer
+    // wall-clock deadline (gam#979) passed. Each seed attempt runs a
+    // continuation pre-warm plus one or more joint-Newton inner solves that
+    // can each take minutes on the non-convergent monotonicity-pinned survival
+    // marginal-slope baseline; the deadline is checked at inner-cycle
+    // boundaries, but nothing stopped the OUTER loop from opening yet another
+    // expensive seed once the budget was already spent, so the fit overran its
+    // budget several-fold (observed: 632s against a 300s budget). Consulting
+    // the deadline here caps the wall clock at "current seed finishes, no new
+    // seed starts" and returns the best-so-far iterate in bounded time.
+    let mut stopped_early_due_to_wall_clock = false;
     // Structured mirror of `rejection_reasons` used for honest seed
     // accounting + structural early-exit. Populated lazily at the top of
     // each iteration from any reasons accumulated during the previous
@@ -352,6 +363,23 @@ pub(crate) fn run_outer_with_plan(
 
     'seed_attempts: for (seed_idx, seed) in seeds.iter().enumerate() {
         if started_seeds == seed_budget {
+            break;
+        }
+        // Stop opening new (expensive) seeds once the outer wall-clock deadline
+        // has passed (gam#979). The inner joint-Newton solves honour the same
+        // deadline at their cycle boundaries, but a fresh seed's continuation
+        // pre-warm can run for minutes before the first cycle check fires, so
+        // without this guard the outer loop kept launching seed after seed well
+        // past budget. Breaking here returns the best-so-far iterate accumulated
+        // in `best` (or the aggregated no-seed error) in bounded time.
+        if crate::rho_optimizer::outer_wall_clock_deadline_exceeded() {
+            log::warn!(
+                "[OUTER] {context}: outer wall-clock deadline reached before seed {seed_idx}; \
+                 stopping the seed cascade with {started_seeds} started seed(s) and \
+                 skipping the remaining {} candidate(s)",
+                seeds.len().saturating_sub(seed_idx),
+            );
+            stopped_early_due_to_wall_clock = true;
             break;
         }
         // Lazy structured classification: convert any new entries in
@@ -2052,6 +2080,12 @@ pub(crate) fn run_outer_with_plan(
             format!(
                 "structural: {label} on seeds {first_seed}..{last_seed}; \
                  remaining {skipped} seeds skipped"
+            )
+        } else if stopped_early_due_to_wall_clock {
+            format!(
+                "stopped early: outer wall-clock deadline reached after {started_seeds} started \
+                 {:?} seed(s) (gam#979 bounded budget); best-so-far iterate returned",
+                the_plan.solver
             )
         } else if stopped_early_due_to_limit {
             format!(
