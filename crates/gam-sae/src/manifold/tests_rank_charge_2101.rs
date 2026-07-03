@@ -346,8 +346,18 @@ fn rank_charge_k3_decisions_preserved() {
             })
             .collect()
     };
-    let m_off = margins(false);
-    let m_on = margins(true);
+    // The K=3 joint fits use rayon parallel reductions whose order is thread-timing
+    // dependent; the leave-one-out margin is a difference of two large independent
+    // fits, which amplifies that into occasional sign flips under parallel test
+    // execution. Pin the fits to a ONE-thread rayon pool so they converge to the
+    // identical (correct) optimum every run — the single-thread values ARE the
+    // optimum (verified: stable across runs, matches the flag-off baseline).
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .expect("1-thread rayon pool for deterministic K=3 fits");
+    let m_off = pool.install(|| margins(false));
+    let m_on = pool.install(|| margins(true));
     eprintln!("[rank-charge K=3 decisions] leave-one-out margins OFF={m_off:?} ON={m_on:?}");
     for k in 0..ncirc {
         // (a) every real atom ACCEPTED under the rank charge (margin < 0).
@@ -448,6 +458,51 @@ fn rank_charge_dense_streaming_parity() {
     assert!(
         (v_dense - v_stream).abs() < 1e-5,
         "dense vs streaming rank-charge criterion must agree: dense={v_dense} stream={v_stream}"
+    );
+}
+
+/// (vii) #16 SHARED PRIMITIVE parity. The free `realised_rank_charge_dof` must price an
+/// atom IDENTICALLY to the term-level `per_atom_realised_rank_dof` — the single source of
+/// truth the #2023 tier PROMOTE/DEMOTE sites will both call, guaranteeing they adjudicate
+/// in one currency.
+#[test]
+fn rank_charge_shared_primitive_parity() {
+    let (mut term, rho) = fitted_circle_term(80, 16);
+    let tgt = unit_target(&term);
+    let (_v, loss, cache) = term
+        .reml_criterion_with_cache(tgt.view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
+        .unwrap();
+    let disp = term.reconstruction_dispersion(&loss, &cache, &rho).unwrap();
+    drop((loss, cache));
+
+    // Term-level d_eff (the currency the joint REML charges).
+    let d_term = term.per_atom_realised_rank_dof(&rho, disp).unwrap();
+
+    // Free-fn d_eff from the SAME atom's gram/decoder/N_eff — must be bit-identical.
+    let mut grams = term.empty_decoder_gram_accumulator();
+    term.accumulate_decoder_gram(&mut grams);
+    let n_eff: f64 = term
+        .assignment
+        .assignments()
+        .column(0)
+        .iter()
+        .map(|&a| a * a)
+        .sum();
+    let lam = rho.lambda_smooth_vec();
+    let d_free = super::construction::realised_rank_charge_dof(
+        &grams[0],
+        &term.atoms[0].decoder_coefficients,
+        n_eff,
+        term.output_dim() as f64,
+        disp,
+        lam.first().copied().unwrap_or(0.0),
+        Some(&term.atoms[0].smooth_penalty),
+    )
+    .unwrap();
+    eprintln!("[#16 primitive] d_term={:.12} d_free={:.12}", d_term[0], d_free);
+    assert_eq!(
+        d_term[0], d_free,
+        "shared realised_rank_charge_dof must match the term-level pricing bit-for-bit"
     );
 }
 

@@ -17,6 +17,75 @@ pub struct StreamingRankInputs {
     pub(crate) n_eff: Vec<f64>,
 }
 
+/// #16/#2023 — the SINGLE per-atom rank-charge DOF core: `d_eff = rank_eff · basis_edf`
+/// for ONE atom from its weighted basis Gram `gram = Φᵀdiag(a²)Φ` (m×m), `decoder`
+/// (m×p), effective sample size `n_eff = Σ_row a²`, output dim `p_out`, noise floor
+/// `r_floor` (dispersion R, assumed already guarded > 0), and smoothness `(lam_smooth,
+/// smooth_penalty)`.
+///   * `rank_eff` = Marchenko–Pastur HARD count on the per-atom reconstruction Gram
+///     `(1/n_eff)·BᵀB`, `B = diag(a)·Φ·D`: eigenvalues = svd(diag(√λ)·Uᵀ·D)²/n_eff with
+///     `(λ,U)=eigh(gram)`; count those above `R·(1+√(p/n_eff))²` (a real rank-2 circle
+///     → 2, a vanishing decoder → 0).  [#1893/#11]
+///   * `basis_edf = tr(gram·(gram+λS)⁻¹)`.
+/// This is the source of truth the term-level `rank_dof_from_grams` (dense + #9
+/// streaming) loops, AND that the #2023 migration gate prices linear/curved candidates
+/// through — so PROMOTE (birth) and DEMOTE (hybrid split) adjudicate in ONE currency.
+pub(crate) fn realised_rank_charge_dof(
+    gram: &Array2<f64>,
+    decoder: &Array2<f64>,
+    n_eff: f64,
+    p_out: f64,
+    r_floor: f64,
+    lam_smooth: f64,
+    smooth_penalty: Option<&Array2<f64>>,
+) -> Result<f64, String> {
+    let m = gram.nrows();
+    if m == 0 || !(n_eff > 0.0) {
+        return Ok(0.0);
+    }
+    // rank_eff: MP hard count on the reconstruction Gram. U orthogonal ⇒ svd of
+    // diag(√λ)·Uᵀ·D equals svd of the reconstruction square root G^½·D.
+    let (evals, u) = gram
+        .eigh(super::Side::Lower)
+        .map_err(|e| format!("realised_rank_charge_dof: eigh(G): {e}"))?;
+    let mut scaled = u.t().dot(decoder);
+    let cols = scaled.ncols();
+    for i in 0..m {
+        let s = evals[i].max(0.0).sqrt();
+        for j in 0..cols {
+            scaled[[i, j]] *= s;
+        }
+    }
+    let sv = match scaled.svd(false, false) {
+        Ok((_, sv, _)) => sv,
+        Err(e) => return Err(format!("realised_rank_charge_dof: recon svd: {e}")),
+    };
+    let edge = r_floor * (1.0 + (p_out / n_eff).sqrt()).powi(2);
+    let rank_eff = sv.iter().filter(|&&s| (s * s) / n_eff > edge).count() as f64;
+    // basis_edf = tr(gram·(gram+λS)⁻¹).
+    let mut mmat = gram.clone();
+    if let Some(pen) = smooth_penalty {
+        if pen.dim() == (m, m) {
+            for i in 0..m {
+                for j in 0..m {
+                    mmat[[i, j]] += lam_smooth * pen[[i, j]];
+                }
+            }
+        }
+    }
+    for i in 0..m {
+        mmat[[i, i]] += 1.0e-12; // SPD guard for the factorization
+    }
+    let basis_edf = match mmat.cholesky(super::Side::Lower) {
+        Ok(factor) => {
+            let x = factor.solve_mat(gram); // X = (G+λS)⁻¹ G
+            (0..m).map(|i| x[[i, i]]).sum::<f64>().clamp(0.0, m as f64)
+        }
+        Err(_) => m as f64, // fallback: full basis count (conservative)
+    };
+    Ok(rank_eff * basis_edf)
+}
+
 // [#780] Softmax-entropy Gershgorin majorizer leaf helpers live in a sibling
 // cohesive module, inlined here so they share this module scope.
 include!("softmax_entropy_majorizer.rs");
@@ -911,73 +980,22 @@ impl SaeManifoldTerm {
         let p_out = self.output_dim() as f64;
         let mut out = Vec::with_capacity(self.k_atoms());
         for k in 0..self.k_atoms() {
-            let g = &grams[k];
-            let m = g.nrows();
-            // rank_eff (#11): Marchenko–Pastur HARD count of the atom's realised output
-            // rank on the per-atom reconstruction Gram (1/N_eff)·BᵀB, B = diag(a_k)·Φ_k·D_k.
-            // Its nonzero eigenvalues are the squared singular values of diag(√λ)·Uᵀ·D_k
-            // (with (λ,U)=eigh(G_k), G_k = Φ_kᵀdiag(a_k²)Φ_k = grams[k], decoder-independent)
-            // divided by the effective sample size N_eff = Σ_row a_k² (which makes the count
-            // invariant to the assignment scale, reducing to n for a dense atom). Count those
-            // above the MP bulk edge R·(1+√(p/N_eff))²: pure output noise cannot push an
-            // eigenvalue past this DERIVED, parameter-free edge, so a real rank-2 circle → 2
-            // and a vanishing decoder (all eigs → 0) → 0. This replaces the soft Σ s²/(s²+R)
-            // (which leaks ~0.4/dim and floors above 0 on a noisy Gram, re-admitting the
-            // collapse it must reject) and is the count the #9 streaming port reuses verbatim
-            // on its streaming-accumulated ΦᵀWΦ.  [#1893]
+            // Each atom is priced through the shared `realised_rank_charge_dof` core
+            // (the SAME fn the #2023 migration gate uses), so dense, #9 streaming, and
+            // the tier PROMOTE/DEMOTE sites all adjudicate in one currency.
             let n_eff_k = n_eff.get(k).copied().unwrap_or(0.0);
-            let rank_eff: f64 = if m == 0 || !(n_eff_k > 0.0) {
-                0.0
-            } else {
-                let (evals, u) = g.eigh(super::Side::Lower).map_err(|e| {
-                    format!("rank_dof_from_grams: eigh(G) atom {k}: {e}")
-                })?;
-                // diag(√max(λ,0))·Uᵀ·D_k (m×p); its singular values equal those of the
-                // reconstruction square root G_k^½·D_k because left-multiplying by the
-                // orthogonal U preserves singular values.
-                let mut scaled = u.t().dot(&self.atoms[k].decoder_coefficients);
-                let cols = scaled.ncols();
-                for i in 0..m {
-                    let s = evals[i].max(0.0).sqrt();
-                    for j in 0..cols {
-                        scaled[[i, j]] *= s;
-                    }
-                }
-                let sv = match scaled.svd(false, false) {
-                    Ok((_, sv, _)) => sv,
-                    Err(e) => {
-                        return Err(format!("rank_dof_from_grams: recon svd atom {k}: {e}"))
-                    }
-                };
-                let edge = r_floor * (1.0 + (p_out / n_eff_k).sqrt()).powi(2);
-                sv.iter().filter(|&&s| (s * s) / n_eff_k > edge).count() as f64
-            };
-            // basis_edf = tr(G (G + λS)⁻¹) on the m×m decoder data Gram.
-            let basis_edf = if m == 0 {
-                0.0
-            } else {
-                let mut mmat = g.clone();
-                let lam_k = lam.get(k).copied().unwrap_or(0.0);
-                let pen = &self.atoms[k].smooth_penalty;
-                if pen.dim() == (m, m) {
-                    for i in 0..m {
-                        for j in 0..m {
-                            mmat[[i, j]] += lam_k * pen[[i, j]];
-                        }
-                    }
-                }
-                for i in 0..m {
-                    mmat[[i, i]] += 1.0e-12; // SPD guard for the factorization
-                }
-                match mmat.cholesky(super::Side::Lower) {
-                    Ok(factor) => {
-                        let x = factor.solve_mat(g); // X = (G+λS)⁻¹ G
-                        (0..m).map(|i| x[[i, i]]).sum::<f64>().clamp(0.0, m as f64)
-                    }
-                    Err(_) => m as f64, // fallback: full basis count (conservative)
-                }
-            };
-            out.push(rank_eff * basis_edf);
+            let lam_k = lam.get(k).copied().unwrap_or(0.0);
+            let d = realised_rank_charge_dof(
+                &grams[k],
+                &self.atoms[k].decoder_coefficients,
+                n_eff_k,
+                p_out,
+                r_floor,
+                lam_k,
+                Some(&self.atoms[k].smooth_penalty),
+            )
+            .map_err(|e| format!("rank_dof_from_grams: atom {k}: {e}"))?;
+            out.push(d);
         }
         Ok(out)
     }
