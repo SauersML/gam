@@ -463,11 +463,18 @@ fn collapse_ssr_increase(
 /// residual is on the SAME footing the linear arm and the joint loss use).
 /// Returns `None` when the solve is degenerate or non-finite; the caller then
 /// falls back to the already-realized curve's RSS rather than fabricate a value.
-fn curved_refit_rss(
+///
+/// #2023 DEMOTE surface: returns the fitted decoder `B` (`M × p`, the
+/// constrained-minimum curved decoder) and its mass-weighted basis Gram
+/// `G = ΦᵀWΦ = designᵀdesign` (`M × M`, `W = diag(a²)`) alongside the RSS — the
+/// two inputs `realised_rank_charge_dof` needs to price the curved arm's realised
+/// rank in the SAME currency the fit's REML criterion uses. `curved_refit_rss`
+/// below is the historical RSS-only wrapper (unchanged `Option<f64>` contract).
+fn curved_refit_decoder(
     phi: ArrayView2<'_, f64>,
     assign: ArrayView1<'_, f64>,
     target_resid: ArrayView2<'_, f64>,
-) -> Option<f64> {
+) -> Option<(f64, Array2<f64>, Array2<f64>)> {
     let n = phi.nrows();
     let m = phi.ncols();
     let p = target_resid.ncols();
@@ -499,7 +506,25 @@ fn curved_refit_rss(
             rss += r * r;
         }
     }
-    rss.is_finite().then_some(rss)
+    if !rss.is_finite() {
+        return None;
+    }
+    // Mass-weighted basis Gram `G = designᵀdesign = ΦᵀWΦ` (W = diag(a²)) — the
+    // rank-charge d_eff's `gram` input (its MP-count + basis_edf are read off G).
+    let gram = design.t().dot(&design);
+    Some((rss, b, gram))
+}
+
+/// Curved-arm refit RSS only — the scalar data-fit the hybrid selector scores.
+/// Thin wrapper over [`curved_refit_decoder`]; identical to the historical
+/// `Option<f64>` contract (the decoder + Gram are dropped here, consumed by the
+/// rank-charge DEMOTE gate through the decoder-returning form).
+fn curved_refit_rss(
+    phi: ArrayView2<'_, f64>,
+    assign: ArrayView1<'_, f64>,
+    target_resid: ArrayView2<'_, f64>,
+) -> Option<f64> {
+    curved_refit_decoder(phi, assign, target_resid).map(|(rss, _, _)| rss)
 }
 
 /// Build the curved + linear candidates for ONE fitted `d = 1` atom and return
