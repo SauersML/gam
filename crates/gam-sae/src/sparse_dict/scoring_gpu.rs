@@ -524,7 +524,13 @@ pub fn route_minibatch_required(
     let tile_cols = plan.tile_items;
 
     match device::route_decoder_tiled_device(rows, decoder, active, tile_cols) {
-        Ok(out) => return Ok((out.selections, ScoreBlockPath::Device, out.device_dtoh_bytes)),
+        Ok(out) => {
+            return Ok((
+                out.selections,
+                ScoreBlockPath::Device,
+                out.device_dtoh_bytes,
+            ));
+        }
         Err(err) => {
             if mode == gam_gpu::GpuMode::Required {
                 return Err(err);
@@ -813,7 +819,8 @@ mod device {
         let mut top_mags_dev = stream
             .alloc_zeros::<f32>(n_rows * active)
             .gpu_ctx("sparse_dict top-s alloc mags")?;
-        let fold_shared = fold_shared_bytes(active, TOP_S_FOLD_THREADS, b.max_shared_mem_per_block)?;
+        let fold_shared =
+            fold_shared_bytes(active, TOP_S_FOLD_THREADS, b.max_shared_mem_per_block)?;
 
         let mut start = 0usize;
         while start < k {

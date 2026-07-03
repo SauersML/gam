@@ -1470,25 +1470,27 @@ fn difference_smooth_json_impl(model_bytes: &[u8], request_json: &str) -> Result
         if template.contains_key(name) {
             continue;
         }
-        if column
-            .get("kind")
-            .and_then(|raw| raw.as_str())
-            .is_some_and(|kind| kind == "categorical")
-        {
-            let value = column
-                .get("levels")
-                .and_then(|raw| raw.as_array())
-                .and_then(|values| values.first())
-                .and_then(json_value_to_row_string)
-                .unwrap_or_else(|| "0".to_string());
-            template.insert(name.clone(), value);
-        } else {
-            let value = ranges
-                .get(idx)
-                .map(|(a, b)| 0.5 * (a + b))
-                .filter(|value| value.is_finite())
-                .unwrap_or(0.0);
-            template.insert(name.clone(), value.to_string());
+        match column.get("kind").and_then(|raw| raw.as_str()) {
+            Some("categorical") => {
+                let value = column
+                    .get("levels")
+                    .and_then(|raw| raw.as_array())
+                    .and_then(|values| values.first())
+                    .and_then(json_value_to_row_string)
+                    .unwrap_or_else(|| "0".to_string());
+                template.insert(name.clone(), value);
+            }
+            Some("binary") => {
+                template.insert(name.clone(), "0".to_string());
+            }
+            _ => {
+                let value = ranges
+                    .get(idx)
+                    .map(|(a, b)| 0.5 * (a + b))
+                    .filter(|value| value.is_finite())
+                    .unwrap_or(0.0);
+                template.insert(name.clone(), value.to_string());
+            }
         }
     }
 
