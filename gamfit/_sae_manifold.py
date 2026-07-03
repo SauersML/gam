@@ -2429,46 +2429,13 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         raise ValueError(
             f"d_atom must be >= 1 for every atom; got {dims}"
         )
-    # Eager heterogeneous-d_atom validation (issue #2088). The SAE row-block
-    # analytic penalties (isometry, native ARD, SCAD/MCP coord sparsity,
-    # block-orthogonality) target the UNIFIED "t" latent block, whose width is a
-    # single `d_max` shared by every atom. With heterogeneous per-atom coord
-    # dims the arrow-Schur assembler cannot dispatch a shared-width row-block
-    # penalty per atom without silently truncating or padding axes, so
-    # `SaeManifoldTerm::validate_analytic_penalty_registry` refuses — but only
-    # deep inside the REML cascade, surfacing as a confusing
-    # `RemlConvergenceError` "before solver start". Because `isometry_weight`
-    # and `ard_per_atom` default ON, EVERY heterogeneous `d_atom` call hit that
-    # refusal, making the documented heterogeneous path unusable. Detect the
-    # incompatibility up front and raise a direct, actionable error naming the
-    # conflicting knobs. With all row-block penalties disabled the heterogeneous
-    # path runs normally (the per-atom decoder / nuclear-norm / incoherence
-    # penalties already dispatch per atom and are unaffected).
-    if len(set(dims)) > 1:
-        row_block_conflicts = []
-        if float(isometry_weight) > 0.0:
-            row_block_conflicts.append("isometry_weight>0")
-        if bool(ard_per_atom):
-            row_block_conflicts.append("ard_per_atom=True")
-        if gate_sparsity_kind in {"scad", "mcp"} and sparsity > 0.0:
-            row_block_conflicts.append(
-                f"coord_sparsity={gate_sparsity_kind!r} with sparsity_weight>0"
-            )
-        if float(block_orthogonality_weight) > 0.0:
-            row_block_conflicts.append("block_orthogonality_weight>0")
-        if row_block_conflicts:
-            raise ValueError(
-                f"sae_manifold_fit: heterogeneous d_atom ({dims}) is "
-                "incompatible with the SAE row-block analytic penalties "
-                + ", ".join(row_block_conflicts)
-                + ". These penalties target the shared 't' latent block, whose "
-                "width must match every atom, so mixed per-atom coordinate dims "
-                "cannot be dispatched (they would silently truncate or pad "
-                "axes). Either use a uniform d_atom for all atoms, or disable "
-                "the conflicting penalties (isometry_weight=0.0, "
-                "ard_per_atom=False, coord_sparsity='l1', "
-                "block_orthogonality_weight=0.0)."
-            )
+    # #2098 (SPEC-8) — the heterogeneous-`d_atom` + row-block-penalty
+    # incompatibility (isometry / native ARD / SCAD-MCP coord sparsity /
+    # block-orthogonality on a mixed per-atom "t" block) is now validated inside
+    # the Rust engine (`SaeManifoldTerm::validate_heterogeneous_atom_compatibility`,
+    # called in `sae_manifold_fit_inner`), which self-protects and raises a direct
+    # `ValueError` up front. The facade stays thin and simply surfaces that engine
+    # error rather than duplicating the check here.
     # Eager sparsity_weight validation (issue #184). The signature
     # advertises `sparsity_weight: float = 1.0`; `0.0` is the canonical
     # "no sparsity" baseline and must be accepted. Reject only negative,

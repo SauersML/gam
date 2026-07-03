@@ -1738,6 +1738,65 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
+    /// Up-front cross-check (issue #2098, SPEC-8): a heterogeneous-`d_atom`
+    /// dictionary is incompatible with any row-block "t"-block analytic penalty
+    /// (isometry / native ARD / SCAD-MCP coord sparsity / block-orthogonality).
+    ///
+    /// The row-block penalties target the UNIFIED "t" latent block, whose width
+    /// is a single shape shared by every atom; with heterogeneous per-atom coord
+    /// dims the arrow-Schur assembler cannot dispatch a shared-width row-block
+    /// penalty per atom without silently truncating or padding axes. The engine
+    /// self-protects here so the incompatibility surfaces as a direct, actionable
+    /// error at the FFI boundary rather than as a deep `RemlConvergenceError`
+    /// mid-REML (the failure mode [`Self::validate_analytic_penalty_registry`]
+    /// otherwise produces during `assemble_arrow_schur`).
+    ///
+    /// Two penalty sources are covered so the check cannot be bypassed:
+    /// * REGISTRY row-block penalties, detected via
+    ///   [`sae_penalty_is_row_block_supported`] on the Psi-tier descriptors; and
+    /// * NATIVE ARD, which rides the separate `native_ard_enabled` FFI flag and
+    ///   is NOT a registry descriptor, so the registry validator alone cannot
+    ///   see the heterogeneous + `ard_per_atom`-only case.
+    ///
+    /// Homogeneous coord dims (including `K == 1`) always pass, as does a
+    /// heterogeneous dictionary that carries no conflicting penalty.
+    pub fn validate_heterogeneous_atom_compatibility(
+        &self,
+        registry: Option<&AnalyticPenaltyRegistry>,
+        native_ard_enabled: bool,
+    ) -> Result<(), String> {
+        // Per-atom coord latent dims via the same accessor the registry
+        // validator uses, so the two cannot disagree on "heterogeneous".
+        let mut dims = self.assignment.coords.iter().map(|c| c.latent_dim());
+        let Some(first) = dims.next() else {
+            return Ok(());
+        };
+        let Some(mismatch) = dims.find(|d| *d != first) else {
+            // Homogeneous coord dims: every row-block penalty dispatches cleanly.
+            return Ok(());
+        };
+        // A registry row-block coord penalty is exactly a Psi-tier descriptor
+        // accepted by `sae_penalty_is_row_block_supported` (the same predicate
+        // `validate_analytic_penalty_registry` uses to gate the "t" row block).
+        let registry_row_block = registry.is_some_and(|reg| {
+            reg.penalties.iter().any(|penalty| {
+                penalty.tier() == PenaltyTier::Psi && sae_penalty_is_row_block_supported(penalty)
+            })
+        });
+        if !(registry_row_block || native_ard_enabled) {
+            return Ok(());
+        }
+        Err(format!(
+            "SAE-manifold fit refuses a row-block analytic penalty on heterogeneous \
+             atom coordinate dims (saw {first} and {mismatch}): the row-block penalties \
+             (isometry, native ARD, SCAD-MCP coord sparsity, block-orthogonality) target \
+             the unified \"t\" latent block whose declared `d` matches a single shape, so \
+             mixed per-atom coordinate dims cannot be dispatched (they would silently \
+             truncate or pad axes). Either configure a uniform atom_dim for all atoms, or \
+             disable the conflicting penalties (isometry / ard / scad-mcp / block-orthogonality)."
+        ))
+    }
+
     pub fn output_dim(&self) -> usize {
         self.atoms[0].output_dim()
     }
