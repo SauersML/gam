@@ -23,9 +23,10 @@ if [ -z "$COMMIT" ]; then
   exit 79
 fi
 SHORT=${COMMIT:0:8}
-BUILD=$ROOT/gam_wheel_$SHORT
+RUN_ID=${SLURM_JOB_ID:-manual}
+BUILD=$ROOT/gam_wheel_${SHORT}_${RUN_ID}
 WHEELDIR=$ROOT/wheels_$SHORT
-BUILD_VENV=$ROOT/gamfit-build-$SHORT-venv
+BUILD_VENV=$ROOT/gamfit-build-${SHORT}_${RUN_ID}-venv
 MANIFEST=$ROOT/gamfit_current_manifest.sh
 PY=/usr/bin/python3.11
 
