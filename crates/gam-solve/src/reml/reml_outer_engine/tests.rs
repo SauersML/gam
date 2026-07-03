@@ -408,7 +408,16 @@ pub(crate) fn active_projected_kkt_residual_is_reduced_before_projected_ift() {
 }
 
 #[test]
-pub(crate) fn active_projected_kkt_residual_rejects_large_drop_before_projected_ift() {
+pub(crate) fn active_projected_kkt_residual_drops_gauge_mass_of_any_magnitude() {
+    // Post-#901 `U_S` is the orthonormal eigenbasis of the LAML Hessian `M`
+    // over its identifiable range, so the dropped component `r_A − r_R` lives
+    // in `ker(M)` and is annihilated by the IFT kernel `K = U_S H_proj⁻¹ U_Sᵀ`:
+    // here `K·[0, 4] = U_S·0.25·(U_Sᵀ·[0, 4]) = U_S·0.25·0 = 0`. Dropping it
+    // leaves the correction `−½ rᵀ K r` bit-identical, so a gauge-direction
+    // residual of ANY magnitude (4.0 ≫ the 1e-6 KKT tolerance) is valid to
+    // reduce — the previous magnitude gate rejected exactly this legitimate
+    // gauge mass, which is precisely what the inner solver leaves unmoved on an
+    // oversmoothed marginal-slope fit.
     let kernel = PenaltySubspaceTrace {
         u_s: array![[1.0], [0.0]],
         h_proj_inverse: array![[0.25]],
@@ -416,12 +425,37 @@ pub(crate) fn active_projected_kkt_residual_rejects_large_drop_before_projected_
     let active =
         ProjectedKktResidual::from_active_projected(array![3.0, 4.0]).with_metadata(1.0e-6, 1);
 
+    let reduced = active
+        .projected_into_reduced_range(&kernel)
+        .expect("gauge-only drop is annihilated by the kernel and must be accepted");
+
+    assert_eq!(reduced.subspace(), KktResidualSubspace::ReducedRange);
+    assert_relative_eq!(reduced.as_array()[0], 3.0, epsilon = 1e-12);
+    assert_relative_eq!(reduced.as_array()[1], 0.0, epsilon = 1e-12);
+    assert_eq!(reduced.residual_tol(), Some(1.0e-6));
+}
+
+#[test]
+pub(crate) fn active_projected_kkt_residual_rejects_retained_range_leak() {
+    // The guard's genuine job: catch a kernel whose `U_S` is NOT orthonormal,
+    // so `project_onto_subspace` is non-idempotent and the "dropped" component
+    // still carries retained-range mass. With `U_S = [2, 0]ᵀ` (column norm 2),
+    // `r_R = U_S(U_Sᵀ r) = [12, 0]`, so `r_A − r_R = [−9, 4]` and
+    // `U_Sᵀ(r_A − r_R) = −18 ≠ 0`: reducing this residual would CHANGE the IFT
+    // correction rather than leave it invariant, so it must be rejected.
+    let kernel = PenaltySubspaceTrace {
+        u_s: array![[2.0], [0.0]],
+        h_proj_inverse: array![[0.25]],
+    };
+    let active =
+        ProjectedKktResidual::from_active_projected(array![3.0, 4.0]).with_metadata(1.0e-6, 1);
+
     let err = active
         .projected_into_reduced_range(&kernel)
-        .expect_err("large null/range-excluded residual must not be silently dropped");
+        .expect_err("a non-orthonormal / desynced kernel leaks retained-range mass");
 
     assert!(
-        err.contains("unresolved mass outside the reduced Hessian/penalty range"),
+        err.contains("leaks retained-range mass"),
         "unexpected error: {err}"
     );
 }
