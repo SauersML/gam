@@ -1221,9 +1221,24 @@ fn audit_identifiability_impl(
         p_total,
         rrqr_started.elapsed().as_secs_f64(),
     );
-    let mut joint_rank = tiered.rank;
+    // #2070: the free-pivot tall-RRQR (`ordinary_rrqr`, run on the UNSQUARED
+    // augmented design `[X_joint; S_blockdiag]`) is the authoritative numerical
+    // rank verdict. Unlike the priority-tiered pivot it neither (a) squares the
+    // condition number — Gram roundoff can resurrect an exactly-dependent column
+    // and silently UNDER-report the deficiency — nor (b) imposes a gauge-priority
+    // pivot order, which can OVER-demote a genuinely-new lower-priority column
+    // whose Schur residual was deflated by an ill-conditioned higher-priority
+    // column committed first. We therefore keep `ordinary_rrqr.rank` as the honest
+    // `joint_rank`: a genuine rank deficiency is reported, never blanket-restored
+    // to full rank. The priority-tiered permutation is used ONLY to attribute
+    // WHICH columns absorb the drop — its tail is ordered lowest-gauge-priority
+    // last, so `[joint_rank..]` selects exactly the `p_total - joint_rank`
+    // canonical gauge-loser columns. When the tiered pivot over-demoted (a
+    // numerical/ordering artifact), `joint_rank == p_total` here and the slice is
+    // empty, so the artifact is dropped WITHOUT a post-hoc rank-restore hack.
+    let joint_rank = ordinary_rrqr.rank;
     let joint_rank_tol = tiered.rank_tol;
-    let mut demoted_joint_cols: Vec<usize> = tiered.column_permutation[tiered.rank..].to_vec();
+    let demoted_joint_cols: Vec<usize> = tiered.column_permutation[joint_rank..].to_vec();
 
     // Pairwise overlap report on the joint design's normalised
     // columns. O(p_total² · n) — fine at GAM smooth widths. We only
@@ -1316,15 +1331,6 @@ fn audit_identifiability_impl(
     // verdicts are fully decoupled.
     let mut aliased_pairs: Vec<AliasedPair> = Vec::new();
     let mut halt_pairs: Vec<AliasedPair> = Vec::new();
-    // #2070: joint-column indices that participate in a STRUCTURAL (halt-band)
-    // cross-block alias. Accumulated here — where the joint indices `ja`/`jb`
-    // are in scope — so the rank-restore guard below can decide per demoted
-    // column whether its RRQR demotion is a genuine structural collision (keep
-    // dropped) or a priority-ordering artifact on a merely ill-conditioned
-    // column (restore). Uses the halt band specifically because, unlike the
-    // report band, it has no near-exact floor and so catches structural aliases
-    // that sit below the 0.999 diagnostic floor.
-    let mut halt_alias_cols: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
     let n_block_pairs = specs.len().saturating_mul(specs.len().saturating_sub(1)) / 2;
     for a_block_idx in 0..specs.len() {
         let a_start = col_offsets[a_block_idx];
@@ -1390,11 +1396,6 @@ fn audit_identifiability_impl(
                     let halt_half_width = pair_halt_threshold(s2_ja, s2_jb, n);
                     if cosine_outside_null_band(cosine, shift, halt_half_width) {
                         halt_pairs.push(make_pair());
-                        // #2070: record the actual joint columns of this
-                        // structural alias so the rank-restore guard can protect
-                        // them from being blanket-restored.
-                        halt_alias_cols.insert(ja);
-                        halt_alias_cols.insert(jb);
                     }
                 }
             }
@@ -1412,36 +1413,6 @@ fn audit_identifiability_impl(
         pairwise_started.elapsed().as_secs_f64(),
         aliased_pairs.len(),
     );
-    let priority_ordering_exists = specs
-        .iter()
-        .any(|s| s.gauge_priority != specs[0].gauge_priority);
-    // A priority-ordered factorization can expose very small approximation
-    // residuals when high-priority, ill-conditioned bases are committed before
-    // lower-priority bases: the tier constraint pivots an ill-conditioned
-    // higher-priority column into the kept basis first, deflating a
-    // lower-priority column's Schur residual below `rank_tol` even though it
-    // carries a genuinely new direction. Demoting that column is an artifact of
-    // the ordering, not a structural gauge collision.
-    //
-    // #2070: the previous guard restored the FULL column set whenever no alias
-    // was REPORTED (`aliased_pairs.is_empty()`, floored at 0.999), which not
-    // only undid those numerical artifacts but also silenced RRQR on genuine
-    // STRUCTURAL aliases sitting below the diagnostic report floor. Distinguish
-    // the two PER COLUMN using the independent halt band (leverage-scaled K·σ,
-    // no near-exact floor — the auditor's structural-fittability signal, decoupled
-    // from the report floor by gam#1397): a demoted column corroborated by a
-    // halt-band alias is a real collision and stays dropped; the rest are the
-    // numerical/priority-ordering artifacts the restore exists for, and only
-    // those are returned to the kept set.
-    if joint_rank < p_total && priority_ordering_exists {
-        let has_numerical_only_demotion = demoted_joint_cols
-            .iter()
-            .any(|c| !halt_alias_cols.contains(c));
-        if has_numerical_only_demotion {
-            demoted_joint_cols.retain(|c| halt_alias_cols.contains(c));
-            joint_rank = p_total - demoted_joint_cols.len();
-        }
-    }
 
     // Attribute each demoted joint column back to its canonical gauge owner.
     //
@@ -3425,7 +3396,7 @@ fn dominant_block_for_direction(
 mod tests {
     use super::*;
 
-    use gam_test_support::spec_from_dense;
+    use gam_test_support::{spec_from_dense, spec_from_dense_with_priority};
     use linspace as linspace_minus_one_to_one;
     use ndarray::Array2;
 
@@ -3689,6 +3660,74 @@ mod tests {
         assert_eq!(
             total_kept, 2,
             "three-way alias collapses to rank 2; got {total_kept}"
+        );
+    }
+
+    /// #2070 regression: a GENUINE rank deficiency that carries NO cross-block
+    /// halt-band alias — an exact intra-block duplicate column — must be reported
+    /// honestly (one demoted column, joint rank `p_total − 1`), NOT silently
+    /// restored to full rank.
+    ///
+    /// This pins the removed rank-restore override. That override fired whenever
+    /// `joint_rank < p_total && priority_ordering_exists`, restoring every demoted
+    /// column that was not corroborated by a cross-block halt-band pair. An
+    /// intra-block duplicate is exactly such a column: the pairwise overlap scan
+    /// only compares columns across DISTINCT blocks, so an in-block duplicate
+    /// never enters `halt_alias_cols`, and the override would have cleared the
+    /// demotion and reported full rank — the auditor silencing the rank deficiency
+    /// it exists to catch. Distinct block priorities (200 vs 80) put us on the
+    /// `priority_ordering_exists` branch the override keyed on.
+    ///
+    /// Built from orthogonal Legendre polynomials so the ONLY dependency is the
+    /// seeded exact duplicate (`spatial` column 0 == column 2 == `P₂`); every
+    /// other direction sits far above the RRQR resolution floor, so the "exactly
+    /// one drop" verdict is backend-independent (see [`legendre_columns`]).
+    #[test]
+    fn audit_intra_block_duplicate_reported_not_restored_2070() {
+        let n = 128;
+        let x = linspace_minus_one_to_one(n);
+        // Block "spatial" (priority 200): [P₂, P₃, P₂] — column 0 and column 2 are
+        // the SAME Legendre polynomial, an exact intra-block rank deficiency.
+        let spatial = legendre_columns(&x, &[2, 3, 2]);
+        // Block "parametric" (priority 80): [P₀, P₁] = [1, x] — orthogonal to the
+        // spatial columns and full rank, so no cross-block alias exists anywhere.
+        let parametric = legendre_columns(&x, &[0, 1]);
+        let specs = [
+            spec_from_dense_with_priority("spatial", spatial, 200),
+            spec_from_dense_with_priority("parametric", parametric, 80),
+        ];
+        let audit = audit_identifiability(&specs).expect("audit must succeed");
+        // The exact duplicate is a genuine deficiency: the tall free-pivot RRQR
+        // detects it and the auditor must REPORT it, not restore full rank.
+        assert_eq!(
+            audit.dropped_columns.len(),
+            1,
+            "the exact intra-block duplicate must be reported as one demoted column, \
+             not silently restored to full rank; got {:?} ({})",
+            audit.dropped_columns,
+            audit.summary,
+        );
+        // Joint rank 4 of 5 columns — the honest deficiency, never restored to 5.
+        let total_kept: usize = audit.blocks.iter().map(|b| b.effective_dim).sum();
+        assert_eq!(
+            total_kept, 4,
+            "joint rank must be the honest 4/5 (one direction lost to the duplicate), \
+             not restored to 5: {}",
+            audit.summary,
+        );
+        // The deficiency lives inside `spatial`; the drop must be attributed there.
+        let dropped = &audit.dropped_columns[0];
+        assert_eq!(
+            dropped.block.as_str(),
+            "spatial",
+            "the intra-block deficiency belongs to 'spatial'; got {dropped:?}",
+        );
+        // An intra-block rank deficiency is NOT resolvable by cross-block gauge
+        // ordering, so an honest audit halts rather than papering over it.
+        assert!(
+            audit.fatal,
+            "an intra-block rank deficiency must be fatal (not gauge-resolvable): {}",
+            audit.summary,
         );
     }
 
