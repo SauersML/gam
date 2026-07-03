@@ -2718,7 +2718,6 @@ fn sae_manifold_fit_stagewise<'py>(
     let rho = result.rho;
     let report = result.report;
     let k_final = term.k_atoms();
-    let assignments = term.assignment.assignments();
 
     let atoms_py = stagewise_atoms_py(py, &term)?;
 
