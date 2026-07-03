@@ -539,12 +539,13 @@ const GPU_ROUTE_TILE_ELEMS: usize = gam_gpu::DEFAULT_DICTIONARY_SCORE_TILE_ELEMS
 /// # Errors
 /// Returns [`gam_gpu::GpuError`] when [`gam_gpu::GpuMode::Required`] is set but
 /// the device path cannot run for this minibatch.
-/// One-shot stderr engagement report for the T1 score router (#1551 class:
-/// "GPU 0%" runs where the decline reason was swallowed by the Auto fallback).
-/// Python builds initialise no `log` backend, so `log::warn!` would vanish;
-/// stderr lands in slurm/job logs. Each category prints once per process — the
-/// route is per-minibatch and a faulting device would otherwise spam thousands
-/// of identical lines.
+/// One-shot engagement report for the T1 score router (#1551 class: "GPU 0%"
+/// runs where the decline reason was swallowed by the Auto fallback). Routed
+/// through `log::warn!` — the repo's sanctioned diagnostics path (same class as
+/// the arrow_schur #1551 cleanup) — so a `log` backend, when initialised, lands
+/// it in the job logs. Each category warns once per process: the route is
+/// per-minibatch and a faulting device would otherwise spam thousands of
+/// identical lines.
 fn note_route_engagement(engaged: bool, detail: &str) {
     use std::sync::Once;
     static ENGAGED_ONCE: Once = Once::new();
@@ -556,7 +557,7 @@ fn note_route_engagement(engaged: bool, detail: &str) {
         } else {
             "device DECLINED - falling back to CPU"
         };
-        eprintln!("[gam-sae sparse_dict score router] {verdict}: {detail}");
+        log::warn!("[gam-sae sparse_dict score router] {verdict}: {detail}");
     });
 }
 
