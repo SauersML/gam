@@ -69,7 +69,7 @@ gamfit_use_0247() {
   export PYTHONNOUSERSITE=1
   export PATH="${GAMFIT_0247_VENV}/bin:${PATH}"
 
-  gamfit_assert_0247 "$GAMFIT_0247_PYTHON"
+  gamfit_assert_0247 "$GAMFIT_0247_PYTHON" >/dev/null
 }
 
 gamfit_python() {
