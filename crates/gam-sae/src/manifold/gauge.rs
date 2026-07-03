@@ -504,15 +504,19 @@ impl SaeManifoldTerm {
                 .sum::<f64>()
                 .sqrt();
         }
-        // Robust "healthy dictionary scale" to measure collapse against. The median
-        // is the guard's statistic, but it DEGENERATES when the MAJORITY of atoms
-        // collapse: at K=3 with two co-vanished atoms (real data: ‖B‖=[2.6, 0, 0])
-        // the median IS 0, so a median-keyed floor would find no reference and skip
-        // the collapse entirely — exactly the failure this exists to fix. Fall back
-        // to the MAX norm (definitionally a surviving/healthy atom) whenever the
-        // median is non-positive, so the collapsed atoms are still measured against
-        // the survivor. Only genuine TOTAL collapse (every decoder literally 0 ⇒ max
-        // 0) has no scale to key on — return 0 there and defer to the reseed arm.
+        // "Healthy dictionary scale" to measure collapse against = the MAX decoder
+        // norm (definitionally a surviving atom). NOT the median: the median is the
+        // guard's statistic but it DEGENERATES whenever the MAJORITY of atoms
+        // collapse, because the collapsed atoms THEMSELVES set the median. At K=3
+        // with two co-vanished atoms (real IBP data: ‖B‖=[2.6, ~0, ~0]) the median
+        // is ~0 — either exactly 0 (a median-keyed floor finds no reference) or
+        // tiny-nonzero (a median-keyed `1e-3·median` floor sits BELOW the collapsed
+        // atoms, so they aren't flagged). Both miss exactly the failure this exists
+        // to fix. Keying on the max survivor is robust to any collapse fraction and
+        // leaves healthy fits unchanged (the largest atom's 1e-3·max floor never
+        // flags a peer of ordinary magnitude). `median` is kept for the diagnostic
+        // trace only. Genuine TOTAL collapse (max 0) has no scale — return 0 and
+        // defer to the reseed arm.
         let mut sorted = norms.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let median = if k % 2 == 1 {
@@ -520,11 +524,7 @@ impl SaeManifoldTerm {
         } else {
             0.5 * (sorted[k / 2 - 1] + sorted[k / 2])
         };
-        let reference = if median > 0.0 {
-            median
-        } else {
-            norms.iter().copied().fold(0.0_f64, f64::max)
-        };
+        let reference = norms.iter().copied().fold(0.0_f64, f64::max);
         if !(reference > 0.0) {
             return 0;
         }

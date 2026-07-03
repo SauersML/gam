@@ -123,6 +123,101 @@ fn two_circle_k2_term(n: usize, p: usize, m: usize) -> (SaeManifoldTerm, Array2<
     (term, target)
 }
 
+/// Generalized K=`k` build of the disjoint two-circle fixture (decoders cold at
+/// zero) — used by the majority-collapse breach regression.
+fn two_circle_kn_term(n: usize, p: usize, m: usize, k: usize) -> SaeManifoldTerm {
+    let d = 1usize;
+    let target = two_circle_whitened_target(n, p, 0.05);
+    let basis_kinds = vec![SaeAtomBasisKind::Periodic; k];
+    let dims = vec![d; k];
+    let seed = sae_pca_seed_initial_coords(target.view(), &basis_kinds, &dims).unwrap();
+    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(m).unwrap());
+    let mut basis_values = Array3::<f64>::zeros((k, n, m));
+    let mut basis_jacobian = Array4::<f64>::zeros((k, n, m, d));
+    let decoder = Array3::<f64>::zeros((k, m, p));
+    let mut penalties = Array3::<f64>::zeros((k, m, m));
+    let mut coords_vec: Vec<Array2<f64>> = Vec::new();
+    for atom in 0..k {
+        let coords = seed.slice(s![atom, .., 0..d]).to_owned();
+        let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+        basis_values.slice_mut(s![atom, .., ..]).assign(&phi);
+        basis_jacobian.slice_mut(s![atom, .., .., ..]).assign(&jet);
+        penalties
+            .slice_mut(s![atom, .., ..])
+            .assign(&Array2::<f64>::eye(m));
+        coords_vec.push(coords);
+    }
+    let logits = Array2::<f64>::zeros((n, k));
+    let mut evaluators: Vec<Option<Arc<dyn SaeBasisSecondJet>>> = Vec::new();
+    for _ in 0..k {
+        evaluators.push(Some(evaluator.clone()));
+    }
+    term_from_padded_blocks_with_mode(
+        n,
+        p,
+        &basis_kinds,
+        basis_values.view(),
+        basis_jacobian.view(),
+        &vec![m; k],
+        &dims,
+        decoder.view(),
+        penalties.view(),
+        logits.view(),
+        &coords_vec,
+        AssignmentMode::ibp_map(1.0, 1.0, false),
+        &evaluators,
+    )
+    .unwrap()
+}
+
+/// #1939 regression — the breach reference must NOT degenerate when the MAJORITY
+/// of atoms collapse. Real IBP data is `‖B‖=[2.6, ~0, ~0]` (K=3, two co-vanished):
+/// the MEDIAN norm is set BY the collapsed atoms (tiny or 0), so a median-keyed
+/// `1e-3·median` floor sits below them and `retract_collapsed_decoders_in_loop`
+/// would skip the collapse — a silent no-op on exactly the failure it targets.
+/// Keying on the max survivor must retract the two collapsed atoms while leaving
+/// the healthy one alone. Uses tiny-NONZERO collapsed norms (5e-4), the case a
+/// median-fallback-only fix would still miss (median 5e-4 > 0).
+#[test]
+fn cone_atom_breach_survives_majority_collapse() {
+    let mut term = two_circle_kn_term(48, 8, 5, 3);
+    // Put all decoder mass on one entry so each atom's norm is exactly the target:
+    // atom 0 healthy (2.6), atoms 1 & 2 collapsed but RETRACTABLE (5e-4, above the
+    // direction floor 1e-12·2.6). Median = 5e-4 (nonzero); only the max reference
+    // (2.6) flags 1 & 2.
+    for (idx, target_norm) in [(0usize, 2.6_f64), (1, 5.0e-4), (2, 5.0e-4)] {
+        let dec = &mut term.atoms[idx].decoder_coefficients;
+        for v in dec.iter_mut() {
+            *v = 0.0;
+        }
+        dec[[0, 0]] = target_norm;
+    }
+    let retracted = term.retract_collapsed_decoders_in_loop();
+    assert_eq!(
+        retracted, 2,
+        "the two majority-collapsed atoms must be retracted against the max survivor, \
+         not skipped because the median is set by the collapse"
+    );
+    let norm = |t: &SaeManifoldTerm, i: usize| -> f64 {
+        t.atoms[i]
+            .decoder_coefficients
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt()
+    };
+    assert!(
+        (norm(&term, 0) - 2.6).abs() < 1.0e-9,
+        "the healthy survivor must be untouched"
+    );
+    for idx in [1usize, 2] {
+        assert!(
+            (norm(&term, idx) - 1.0).abs() < 1.0e-9,
+            "retracted atom {idx} must be unit-Frobenius"
+        );
+    }
+}
+
 /// The K=2 whitened two-circle fit must recover a materially positive
 /// reconstruction EV — NOT co-collapse to the signal-free null floor. Two disjoint
 /// circles together span a rank-4 subspace of the whitened cloud, so an honest K=2
