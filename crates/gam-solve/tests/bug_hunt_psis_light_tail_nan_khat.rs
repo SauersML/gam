@@ -8,7 +8,7 @@
 //! returns `Some` with a finite, non-heavy `k_hat`) and the underlying numerical
 //! defect (`fit_gpd_moments` reports a positive, finite scale on the excesses).
 
-use gam_solve::psis::{fit_gpd_moments, pareto_smooth_weights, MIN_TAIL_COUNT};
+use gam_solve::psis::{MIN_TAIL_COUNT, fit_gpd_moments, pareto_smooth_weights};
 
 const BASELINE: f64 = 1.0;
 const TAIL_K: f64 = -0.2; // a genuinely LIGHT (bounded-support, negative-shape) tail

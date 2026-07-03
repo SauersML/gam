@@ -4352,7 +4352,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sparse_dictionary_fit, module)?)?;
     module.add_function(wrap_pyfunction!(sparse_dictionary_transform_ffi, module)?)?;
     module.add_function(wrap_pyfunction!(block_sparse_dictionary_fit, module)?)?;
-    module.add_function(wrap_pyfunction!(block_sparse_dictionary_transform_ffi, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        block_sparse_dictionary_transform_ffi,
+        module
+    )?)?;
     module.add_class::<SparseDictStream>()?;
     module.add_class::<BlockSparseDictStream>()?;
     module.add_function(wrap_pyfunction!(
@@ -4773,6 +4776,25 @@ fn linear_dictionary_transform_ffi<'py>(
 /// (`indices[N, active]`, `codes[N, active]`) so very large `K` stays tractable.
 /// All heavy state is FP32. The exact manifold engine is untouched; this is an
 /// additive path.
+fn score_route_stats_dict<'py>(
+    py: Python<'py>,
+    stats: gam::terms::sae::sparse_dict::ScoreRouteStats,
+) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py);
+    out.set_item("minibatches", stats.minibatches)?;
+    out.set_item("admitted_minibatches", stats.admitted_minibatches)?;
+    out.set_item("device_minibatches", stats.device_minibatches)?;
+    out.set_item("cpu_minibatches", stats.cpu_minibatches)?;
+    out.set_item("score_elements", stats.score_elements.to_string())?;
+    out.set_item("score_tiles", stats.score_tiles)?;
+    out.set_item("peak_score_bytes", stats.peak_score_bytes)?;
+    out.set_item(
+        "dot_flops_lower_bound",
+        stats.dot_flops_lower_bound.to_string(),
+    )?;
+    Ok(out)
+}
+
 #[pyfunction(signature = (
     x,
     k,
@@ -4821,6 +4843,10 @@ fn sparse_dictionary_fit<'py>(
     out.set_item("epochs", fit.epochs)?;
     out.set_item("converged", fit.converged)?;
     out.set_item("active", fit.active)?;
+    out.set_item(
+        "score_route_stats",
+        score_route_stats_dict(py, fit.score_route_stats)?,
+    )?;
     Ok(out.unbind())
 }
 
@@ -4835,22 +4861,27 @@ fn sparse_dictionary_transform_ffi<'py>(
     active: usize,
     score_tile: usize,
     code_ridge: f32,
-) -> PyResult<(Py<PyArray2<u32>>, Py<PyArray2<f32>>)> {
+) -> PyResult<Py<PyDict>> {
     let x_values = x.as_array().to_owned();
     let decoder_values = decoder.as_array().to_owned();
-    let (indices, codes) = detach_py_result(py, "sparse_dictionary_transform", move || {
-        sparse_dictionary_transform(
+    let transform = detach_py_result(py, "sparse_dictionary_transform", move || {
+        sparse_dictionary_transform_with_mode(
             x_values.view(),
             decoder_values.view(),
             active,
             score_tile,
             code_ridge,
+            gam::gpu::GpuMode::Auto,
         )
     })?;
-    Ok((
-        indices.into_pyarray(py).unbind(),
-        codes.into_pyarray(py).unbind(),
-    ))
+    let out = PyDict::new(py);
+    out.set_item("indices", transform.indices.into_pyarray(py))?;
+    out.set_item("codes", transform.codes.into_pyarray(py))?;
+    out.set_item(
+        "score_route_stats",
+        score_route_stats_dict(py, transform.score_route_stats)?,
+    )?;
+    Ok(out.unbind())
 }
 
 /// #1026 block-sparse lane — fit a **block-sparse** dictionary: the `K = G·b`
@@ -5297,13 +5328,11 @@ fn fit_dataset_impl(
     // `unknown family 'expectile(τ)'`. The driver returns an ordinary
     // `StandardFitResult`, so the persistence payload is built by the same
     // `build_standard_payload` used for every other standard fit.
-    if let Some(expectile_result) =
-        gam::families::fit_orchestration::fit_expectile_if_requested(
-            &formula,
-            &dataset,
-            &fit_config,
-        )?
-    {
+    if let Some(expectile_result) = gam::families::fit_orchestration::fit_expectile_if_requested(
+        &formula,
+        &dataset,
+        &fit_config,
+    )? {
         let family = expectile_result
             .fit
             .likelihood_family
@@ -6156,14 +6185,11 @@ fn validate_formula_json_impl(
         dataset
             .column_kinds
             .push(gam::data::ColumnKindTag::Continuous);
-        dataset
-            .schema
-            .columns
-            .push(gam::data::SchemaColumn {
-                name: VALIDATION_PLACEHOLDER_Z.to_string(),
-                kind: gam::data::ColumnKindTag::Continuous,
-                levels: Vec::new(),
-            });
+        dataset.schema.columns.push(gam::data::SchemaColumn {
+            name: VALIDATION_PLACEHOLDER_Z.to_string(),
+            kind: gam::data::ColumnKindTag::Continuous,
+            levels: Vec::new(),
+        });
         fit_config.z_column = Some(VALIDATION_PLACEHOLDER_Z.to_string());
     }
     let materialized = materialize(&formula, &dataset, &fit_config)?;
@@ -6504,9 +6530,7 @@ fn predict_columns(
             // (#812). The posterior-mean *point* stays conditional regardless of
             // mode (issue #398); only the reported uncertainty responds.
             let covariance_mode = parse_covariance_mode(options.covariance_mode.as_deref())?
-                .unwrap_or(
-                gam_predict::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
-            );
+                .unwrap_or(gam_predict::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred);
             let posterior_options = gam_predict::PosteriorMeanOptions {
                 confidence_level: Some(confidence_level),
                 covariance_mode,
@@ -6566,9 +6590,7 @@ fn predict_columns(
             // user-selectable, mirroring `gam predict --covariance-mode` and the
             // engine's `includeobservation_interval` switch.
             let covariance_mode = parse_covariance_mode(options.covariance_mode.as_deref())?
-                .unwrap_or(
-                gam_predict::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
-            );
+                .unwrap_or(gam_predict::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred);
             let includeobservation_interval = options.observation_interval.unwrap_or(false);
             let uncertainty_options = gam_predict::PredictUncertaintyOptions {
                 confidence_level,
@@ -6742,9 +6764,8 @@ fn predict_columns_conformal(
     let fit = fit_result_from_saved_model_for_prediction(model)?;
     let family = model_likelihood_spec(model);
 
-    let covariance_mode = parse_covariance_mode(options.covariance_mode.as_deref())?.unwrap_or(
-        gam_predict::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
-    );
+    let covariance_mode = parse_covariance_mode(options.covariance_mode.as_deref())?
+        .unwrap_or(gam_predict::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred);
     let uncertainty_options = gam_predict::PredictUncertaintyOptions {
         confidence_level: level,
         covariance_mode,
@@ -7264,8 +7285,9 @@ fn generative_replicates_impl(
         &family,
     );
     // Build the generative specification (mean + noise model).
-    let spec = generativespec_from_predict(prediction, family, gaussian_scale, Some(&prior_weights))
-        .map_err(|e| format!("generative_replicates: spec error: {e}"))?;
+    let spec =
+        generativespec_from_predict(prediction, family, gaussian_scale, Some(&prior_weights))
+            .map_err(|e| format!("generative_replicates: spec error: {e}"))?;
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     let draws = sampleobservation_replicates(&spec, n_draws, &mut rng)
         .map_err(|e| format!("generative_replicates: sampling failed: {e}"))?;

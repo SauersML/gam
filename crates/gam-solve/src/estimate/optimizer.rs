@@ -632,60 +632,64 @@ where
                 );
             }
             let problem = OuterProblem::new(k)
-            .with_gradient(Derivative::Analytic)
-            .with_hessian(if analytic_outer_hessian_available {
-                DeclaredHessianForm::Either
-            } else {
-                DeclaredHessianForm::Unavailable
-            })
-            .with_prefer_gradient_only(prefer_gradient_only)
-            .with_continuation_prewarm(continuation_prewarm)
-            .with_barrier(
-                crate::estimate::reml::reml_outer_engine::BarrierConfig::from_constraints(
-                    fit_linear_constraints.as_ref(),
-                ),
-            )
-            .with_tolerance(reml_tol)
-            .with_max_iter(reml_max_iter)
-            .with_seed_config(reml_seed_config)
-            .with_screening_cap(Arc::clone(&reml_state.screening_max_inner_iterations))
-            .with_outer_inner_cap(reml_inner_progress_feedback(&reml_state))
-            // n-scaled absolute gradient floor for EVERY family (#1082).
-            //
-            // The REML/LAML profiled criterion is a sum over n rows
-            // (deviance / −2·loglik + the penalty/logdet terms), so it and its
-            // ∂/∂logλ gradient inherit an O(n) scale for Poisson, NB, binomial,
-            // Tweedie, beta — exactly as for Gaussian-identity. The previous gate
-            // restricted `with_objective_scale` to the Gaussian-identity arm on
-            // the (incorrect) premise that only that criterion is O(n). For a
-            // non-Gaussian tensor/cyclic/CI/badhealth fit at n≈1.5k–5k the fixed
-            // `abs = tol ≈ 1e-6` gradient floor is then orders of magnitude below
-            // the n-scaled gradient's converged residual: the relative-from-seed
-            // test declares convergence iters earlier, but the binding abs floor
-            // keeps the outer optimizer chasing sub-floor log-λ changes, paying a
-            // full k²·n·p² LAML-Hessian assembly per phantom iteration until it
-            // exhausts the iteration budget — the #1082 outer-loop "cycling"
-            // timeout. Lifting the floor to ~n·1e-9 (the same calibration the
-            // spatial/custom-family outer already uses via `with_problem_size`,
-            // #1053/#1066/#1069) lets the loop terminate as soon as the relative
-            // reduction is met, for every family, while the relative-to-cost
-            // component still owns the actual convergence decision. ARC σ and the
-            // initial trust radius stay Gaussian-gated: those exploit the
-            // Gaussian profile being quadratic-in-log-λ, which is family-specific.
-            .with_objective_scale(Some(n_obs as f64))
-            .with_problem_size(n_obs, x_o.ncols())
-            .with_arc_initial_regularization(if gaussian_identity { Some(0.25) } else { None })
-            .with_operator_initial_trust_radius(if gaussian_identity { Some(4.0) } else { None })
-            .with_rho_bound(crate::estimate::RHO_BOUND)
-            // Make the outer smoothing-parameter search invariant to the order
-            // the smooth terms / tensor margins were written (#1538/#1539). The
-            // structural keys label each ρ-coordinate by its placement-
-            // independent penalty content, so the optimizer canonicalizes the
-            // coordinate layout and resolves the flat double-penalty REML valley
-            // identically for `s(x)+s(z)` vs `s(z)+s(x)` and `te(x,z)` vs
-            // `te(z,x)`. `None` (coordinate count not matching ρ-dim) leaves the
-            // native-order path unchanged.
-            .with_rho_canonical_keys(canon_keys.clone());
+                .with_gradient(Derivative::Analytic)
+                .with_hessian(if analytic_outer_hessian_available {
+                    DeclaredHessianForm::Either
+                } else {
+                    DeclaredHessianForm::Unavailable
+                })
+                .with_prefer_gradient_only(prefer_gradient_only)
+                .with_continuation_prewarm(continuation_prewarm)
+                .with_barrier(
+                    crate::estimate::reml::reml_outer_engine::BarrierConfig::from_constraints(
+                        fit_linear_constraints.as_ref(),
+                    ),
+                )
+                .with_tolerance(reml_tol)
+                .with_max_iter(reml_max_iter)
+                .with_seed_config(reml_seed_config)
+                .with_screening_cap(Arc::clone(&reml_state.screening_max_inner_iterations))
+                .with_outer_inner_cap(reml_inner_progress_feedback(&reml_state))
+                // n-scaled absolute gradient floor for EVERY family (#1082).
+                //
+                // The REML/LAML profiled criterion is a sum over n rows
+                // (deviance / −2·loglik + the penalty/logdet terms), so it and its
+                // ∂/∂logλ gradient inherit an O(n) scale for Poisson, NB, binomial,
+                // Tweedie, beta — exactly as for Gaussian-identity. The previous gate
+                // restricted `with_objective_scale` to the Gaussian-identity arm on
+                // the (incorrect) premise that only that criterion is O(n). For a
+                // non-Gaussian tensor/cyclic/CI/badhealth fit at n≈1.5k–5k the fixed
+                // `abs = tol ≈ 1e-6` gradient floor is then orders of magnitude below
+                // the n-scaled gradient's converged residual: the relative-from-seed
+                // test declares convergence iters earlier, but the binding abs floor
+                // keeps the outer optimizer chasing sub-floor log-λ changes, paying a
+                // full k²·n·p² LAML-Hessian assembly per phantom iteration until it
+                // exhausts the iteration budget — the #1082 outer-loop "cycling"
+                // timeout. Lifting the floor to ~n·1e-9 (the same calibration the
+                // spatial/custom-family outer already uses via `with_problem_size`,
+                // #1053/#1066/#1069) lets the loop terminate as soon as the relative
+                // reduction is met, for every family, while the relative-to-cost
+                // component still owns the actual convergence decision. ARC σ and the
+                // initial trust radius stay Gaussian-gated: those exploit the
+                // Gaussian profile being quadratic-in-log-λ, which is family-specific.
+                .with_objective_scale(Some(n_obs as f64))
+                .with_problem_size(n_obs, x_o.ncols())
+                .with_arc_initial_regularization(if gaussian_identity { Some(0.25) } else { None })
+                .with_operator_initial_trust_radius(if gaussian_identity {
+                    Some(4.0)
+                } else {
+                    None
+                })
+                .with_rho_bound(crate::estimate::RHO_BOUND)
+                // Make the outer smoothing-parameter search invariant to the order
+                // the smooth terms / tensor margins were written (#1538/#1539). The
+                // structural keys label each ρ-coordinate by its placement-
+                // independent penalty content, so the optimizer canonicalizes the
+                // coordinate layout and resolves the flat double-penalty REML valley
+                // identically for `s(x)+s(z)` vs `s(z)+s(x)` and `te(x,z)` vs
+                // `te(z,x)`. `None` (coordinate count not matching ρ-dim) leaves the
+                // native-order path unchanged.
+                .with_rho_canonical_keys(canon_keys.clone());
             let problem = if let Some(h) = heuristic_lambdas {
                 problem.with_heuristic_lambdas(h.to_vec())
             } else {
@@ -924,10 +928,10 @@ where
 
             let obj = problem.build_objective_with_screening_proxy(
                 &mut reml_state,
-                |state: &mut &mut crate::estimate::reml::RemlState<'_>,
-                 rho: &Array1<f64>| { state.compute_cost(rho) },
-                |state: &mut &mut crate::estimate::reml::RemlState<'_>,
-                 rho: &Array1<f64>| {
+                |state: &mut &mut crate::estimate::reml::RemlState<'_>, rho: &Array1<f64>| {
+                    state.compute_cost(rho)
+                },
+                |state: &mut &mut crate::estimate::reml::RemlState<'_>, rho: &Array1<f64>| {
                     outer_eval_idx.fetch_add(1, Ordering::Relaxed);
                     state.compute_outer_eval_with_order(
                         rho,
@@ -944,17 +948,17 @@ where
                     outer_eval_idx.fetch_add(1, Ordering::Relaxed);
                     state.compute_outer_eval_with_order(rho, order)
                 },
+                Some(|state: &mut &mut crate::estimate::reml::RemlState<'_>| {
+                    state.reset_outer_seed_state()
+                }),
                 Some(
-                    |state: &mut &mut crate::estimate::reml::RemlState<'_>| {
-                        state.reset_outer_seed_state()
+                    |state: &mut &mut crate::estimate::reml::RemlState<'_>, rho: &Array1<f64>| {
+                        state.compute_efs_steps(rho)
                     },
                 ),
-                Some(
-                    |state: &mut &mut crate::estimate::reml::RemlState<'_>,
-                     rho: &Array1<f64>| { state.compute_efs_steps(rho) },
-                ),
-                |state: &mut &mut crate::estimate::reml::RemlState<'_>,
-                 rho: &Array1<f64>| { state.compute_screening_proxy(rho) },
+                |state: &mut &mut crate::estimate::reml::RemlState<'_>, rho: &Array1<f64>| {
+                    state.compute_screening_proxy(rho)
+                },
             );
             // Standard REML's eval closure publishes
             // `inner_beta_hint = state.current_original_basis_beta()` on
@@ -1056,8 +1060,7 @@ where
                         sumsq.sqrt()
                     };
                     let seed_cost_trustworthy = seed_grad_norm.is_finite()
-                        && seed_grad_norm
-                            <= crate::rho_optimizer::FLAT_VALLEY_STALL_GRAD_CEILING;
+                        && seed_grad_norm <= crate::rho_optimizer::FLAT_VALLEY_STALL_GRAD_CEILING;
                     if seed_cost_trustworthy {
                         log::info!(
                             "[OUTER] #1371 release-and-rerank: certified ρ cost {cost_converged:.6e} \
@@ -1643,7 +1646,9 @@ where
                         // COLD-confirm the group's best candidate on BOTH axes (the
                         // warm probes ran off each other's inner warm starts — the
                         // #1074 lesson): pure REML strictly down AND total EDF not up.
-                        let Some((cand, _)) = group_best else { continue };
+                        let Some((cand, _)) = group_best else {
+                            continue;
+                        };
                         reml_state.reset_outer_seed_state();
                         let cold_pen = reml_state.compute_cost(&cand);
                         let cold_pure = cold_pen.as_ref().ok().and_then(|&c| {
@@ -1716,7 +1721,9 @@ where
                                 group_best = Some((probe, c));
                             }
                         }
-                        let Some((cand, _)) = group_best else { continue };
+                        let Some((cand, _)) = group_best else {
+                            continue;
+                        };
                         reml_state.reset_outer_seed_state();
                         let cold_pen = reml_state.compute_cost(&cand);
                         let cold_pure = cold_pen.as_ref().ok().and_then(|&c| {
@@ -1921,22 +1928,22 @@ where
                 );
             }
             let problem = OuterProblem::new(theta_dim)
-            .with_gradient(Derivative::Analytic)
-            .with_hessian(DeclaredHessianForm::Either)
-            .with_prefer_gradient_only(prefer_gradient_only)
-            .with_continuation_prewarm(continuation_prewarm)
-            .with_psi_dim(mixture_dim + sas_dim)
-            .with_barrier(
-                crate::estimate::reml::reml_outer_engine::BarrierConfig::from_constraints(
-                    fit_linear_constraints.as_ref(),
-                ),
-            )
-            .with_tolerance(reml_tol)
-            .with_max_iter(reml_max_iter)
-            .with_seed_config(reml_seed_config_mix)
-            .with_screening_cap(Arc::clone(&reml_state.screening_max_inner_iterations))
-            .with_outer_inner_cap(reml_inner_progress_feedback(&reml_state))
-            .with_rho_bound(crate::estimate::RHO_BOUND);
+                .with_gradient(Derivative::Analytic)
+                .with_hessian(DeclaredHessianForm::Either)
+                .with_prefer_gradient_only(prefer_gradient_only)
+                .with_continuation_prewarm(continuation_prewarm)
+                .with_psi_dim(mixture_dim + sas_dim)
+                .with_barrier(
+                    crate::estimate::reml::reml_outer_engine::BarrierConfig::from_constraints(
+                        fit_linear_constraints.as_ref(),
+                    ),
+                )
+                .with_tolerance(reml_tol)
+                .with_max_iter(reml_max_iter)
+                .with_seed_config(reml_seed_config_mix)
+                .with_screening_cap(Arc::clone(&reml_state.screening_max_inner_iterations))
+                .with_outer_inner_cap(reml_inner_progress_feedback(&reml_state))
+                .with_rho_bound(crate::estimate::RHO_BOUND);
             let problem = if let Some(h) = heuristic_theta_ref {
                 problem.with_heuristic_lambdas(h.to_vec())
             } else {
@@ -1952,64 +1959,63 @@ where
                 None => problem,
             };
             // Shared helper: parse theta into rho + link params, update link state.
-            let apply_link_theta =
-                |state: &mut &mut crate::estimate::reml::RemlState<'_>,
-                 theta: &Array1<f64>|
-                 -> Result<Array1<f64>, EstimationError> {
-                    let rho = theta.slice(s![..k]).to_owned();
-                    let mut cfg_eval = cfg.clone();
-                    if use_mixture {
-                        let mix_rho = theta.slice(s![k..(k + mixture_dim)]).to_owned();
-                        cfg_eval.link_kind = InverseLink::Mixture(
-                            state_fromspec(&MixtureLinkSpec {
-                                components: mixspec.components.clone(),
-                                initial_rho: mix_rho,
+            let apply_link_theta = |state: &mut &mut crate::estimate::reml::RemlState<'_>,
+                                    theta: &Array1<f64>|
+             -> Result<Array1<f64>, EstimationError> {
+                let rho = theta.slice(s![..k]).to_owned();
+                let mut cfg_eval = cfg.clone();
+                if use_mixture {
+                    let mix_rho = theta.slice(s![k..(k + mixture_dim)]).to_owned();
+                    cfg_eval.link_kind = InverseLink::Mixture(
+                        state_fromspec(&MixtureLinkSpec {
+                            components: mixspec.components.clone(),
+                            initial_rho: mix_rho,
+                        })
+                        .map_err(|e| {
+                            EstimationError::InvalidInput(format!(
+                                "invalid blended inverse link: {e}"
+                            ))
+                        })?,
+                    );
+                }
+                if use_sas {
+                    let epsilon = if use_beta_logistic {
+                        theta[k]
+                    } else {
+                        let (v, _) = sas_effective_epsilon(theta[k]);
+                        v
+                    };
+                    let delta_like = theta[k + 1];
+                    cfg_eval.link_kind = if use_beta_logistic {
+                        InverseLink::BetaLogistic(
+                            state_from_beta_logisticspec(SasLinkSpec {
+                                initial_epsilon: epsilon,
+                                initial_log_delta: delta_like,
                             })
                             .map_err(|e| {
                                 EstimationError::InvalidInput(format!(
-                                    "invalid blended inverse link: {e}"
+                                    "invalid Beta-Logistic link: {e}"
                                 ))
                             })?,
-                        );
-                    }
-                    if use_sas {
-                        let epsilon = if use_beta_logistic {
-                            theta[k]
-                        } else {
-                            let (v, _) = sas_effective_epsilon(theta[k]);
-                            v
-                        };
-                        let delta_like = theta[k + 1];
-                        cfg_eval.link_kind = if use_beta_logistic {
-                            InverseLink::BetaLogistic(
-                                state_from_beta_logisticspec(SasLinkSpec {
-                                    initial_epsilon: epsilon,
-                                    initial_log_delta: delta_like,
-                                })
-                                .map_err(|e| {
-                                    EstimationError::InvalidInput(format!(
-                                        "invalid Beta-Logistic link: {e}"
-                                    ))
-                                })?,
-                            )
-                        } else {
-                            InverseLink::Sas(
-                                state_from_sasspec(SasLinkSpec {
-                                    initial_epsilon: epsilon,
-                                    initial_log_delta: delta_like,
-                                })
-                                .map_err(|e| {
-                                    EstimationError::InvalidInput(format!("invalid SAS link: {e}"))
-                                })?,
-                            )
-                        };
-                    }
-                    state.set_link_states(
-                        cfg_eval.link_kind.mixture_state().cloned(),
-                        cfg_eval.link_kind.sas_state().copied(),
-                    );
-                    Ok(rho)
-                };
+                        )
+                    } else {
+                        InverseLink::Sas(
+                            state_from_sasspec(SasLinkSpec {
+                                initial_epsilon: epsilon,
+                                initial_log_delta: delta_like,
+                            })
+                            .map_err(|e| {
+                                EstimationError::InvalidInput(format!("invalid SAS link: {e}"))
+                            })?,
+                        )
+                    };
+                }
+                state.set_link_states(
+                    cfg_eval.link_kind.mixture_state().cloned(),
+                    cfg_eval.link_kind.sas_state().copied(),
+                );
+                Ok(rho)
+            };
 
             // SAS ridge/barrier cost correction (shared between cost_fn, eval_fn, efs_fn).
             let sas_ridge_cost = |theta: &Array1<f64>| -> f64 {
@@ -2183,8 +2189,7 @@ where
             // installs the converged mixture/SAS link state onto `reml_state`
             // and returns the smoothing-only ρ block.
             let guard_rho = {
-                let mut state_ref: &mut crate::estimate::reml::RemlState<'_> =
-                    &mut reml_state;
+                let mut state_ref: &mut crate::estimate::reml::RemlState<'_> = &mut reml_state;
                 apply_link_theta(&mut state_ref, &outer_result.rho)?
             };
             run_outer_inner_cap_guard(
@@ -2984,8 +2989,11 @@ where
         // benchmark, while lower-level callers that opt in (`skip = false`) get
         // the auto-selected escalation tier (quadrature for K≤4, NUTS over ρ for
         // K≤16, honest Unavailable beyond) at this same live seam.
-        (rho_posterior_certificate, rho_posterior_escalation) = reml_state
-            .rho_posterior_inference(&final_rho, !opts.skip_rho_posterior_inference, None);
+        (rho_posterior_certificate, rho_posterior_escalation) = reml_state.rho_posterior_inference(
+            &final_rho,
+            !opts.skip_rho_posterior_inference,
+            None,
+        );
 
         // Standard errors: prefer the diagonal of the full inverse when
         // available; otherwise use the factorised Hessian from the EDF pass
@@ -3107,12 +3115,6 @@ where
 
     let pirls_status = pirls_res.status;
     let likelihood_scale_field = pirls_res.likelihood.scale;
-    let log_likelihood = crate::pirls::calculate_loglikelihood_omitting_constants(
-        y_o.view(),
-        &pirls_res.finalmu,
-        &pirls_res.likelihood,
-        w_o.view(),
-    );
 
     // Report the fitted dispersion parameter on the family variant for the two
     // families whose *reporting log-likelihood kernel* reads it from the family
@@ -3153,13 +3155,23 @@ where
         }
         _ => {}
     }
+    let reported_likelihood = GlmLikelihoodSpec {
+        spec: reported_family.clone(),
+        scale: likelihood_scale_field,
+    };
+    let log_likelihood = crate::pirls::calculate_loglikelihood(
+        y_o.view(),
+        &pirls_res.finalmu,
+        &reported_likelihood,
+        w_o.view(),
+    );
 
     let result = ExternalOptimResult {
         beta: beta_orig_internal,
         lambdas: lambdas.to_owned(),
         likelihood_family: reported_family,
         likelihood_scale: likelihood_scale_field,
-        log_likelihood_normalization: LogLikelihoodNormalization::OmittingResponseConstants,
+        log_likelihood_normalization: LogLikelihoodNormalization::Full,
         log_likelihood,
         standard_deviation,
         iterations: iters,

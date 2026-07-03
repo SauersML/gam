@@ -62,8 +62,9 @@ def test_sparse_trainer_held_out_ev_beats_pca_baseline_modest_k():
     assert fit.decoder.shape == (k, p)
 
     # Held-out: route the test rows through the frozen decoder, reconstruct.
-    idx, cod = fit.transform(test, active=2)
-    recon = fit.reconstruct(idx, cod)
+    routed = fit.transform(test, active=2)
+    assert routed.score_route_stats["minibatches"] == 1
+    recon = fit.reconstruct(routed.indices, routed.codes)
     held_out_ev = _ev(test, recon)
 
     baseline = _pca_held_out_ev(train, test, rank=k)

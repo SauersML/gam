@@ -97,24 +97,24 @@ pub fn admission_for(spec: &LikelihoodSpec, n: usize, p: usize) -> Option<PirlsL
 mod linux_impl {
     use ndarray::{Array1, ArrayView1, ArrayView2};
 
-    use gam_terms::construction::ReparamResult;
-    use gam_gpu::cuda_selected;
-    use gam_gpu::device_runtime::GpuRuntime;
-    use crate::gpu_kernels::pirls_row::{CurvatureMode, PirlsRowFamily};
-    use gam_gpu::policy::{PirlsLoopAdmission, PirlsLoopCurvatureKind, PirlsLoopFamilyKind};
-    use gam_linalg::matrix::SymmetricMatrix;
-    use gam_linalg::matrix::DesignMatrix;
     use crate::active_set::compute_constraint_kkt_diagnostics;
     use crate::gpu::pirls_dispatch_wire::admission_for;
     use crate::gpu::pirls_gpu::{self, cuda};
+    use crate::gpu_kernels::pirls_row::{CurvatureMode, PirlsRowFamily};
     use crate::pirls::{
         ExportedLaplaceCurvature, FirthDiagnostics, HessianCurvatureKind, PirlsCoordinateFrame,
         PirlsResult, PirlsStatus, WorkingModelPirlsResult, WorkingState,
         calculate_loglikelihood_omitting_constants, compute_observed_hessian_curvature_arrays,
         computeworkingweight_derivatives_from_eta,
     };
-    use gam_problem::{Coefficients, GlmLikelihoodSpec, InverseLink, LinearPredictor};
+    use gam_gpu::cuda_selected;
+    use gam_gpu::device_runtime::GpuRuntime;
+    use gam_gpu::policy::{PirlsLoopAdmission, PirlsLoopCurvatureKind, PirlsLoopFamilyKind};
+    use gam_linalg::matrix::DesignMatrix;
+    use gam_linalg::matrix::SymmetricMatrix;
     use gam_problem::LinearInequalityConstraints;
+    use gam_problem::{Coefficients, GlmLikelihoodSpec, InverseLink, LinearPredictor};
+    use gam_terms::construction::ReparamResult;
 
     /// All inputs needed for the GPU PIRLS loop end-to-end. Built by the
     /// CPU PIRLS driver right before it would invoke `runworking_model_pirls`,
@@ -387,9 +387,8 @@ mod linux_impl {
         // at the dispatch boundary rather than silently passing a corrupt
         // iterate to the outer REML loop.
         {
-            const FORBIDDEN_ROW: u32 =
-                crate::gpu_kernels::pirls_row::status_flags::INVALID_RESPONSE
-                    | crate::gpu_kernels::pirls_row::status_flags::ZERO_PRIOR_WEIGHT;
+            const FORBIDDEN_ROW: u32 = crate::gpu_kernels::pirls_row::status_flags::INVALID_RESPONSE
+                | crate::gpu_kernels::pirls_row::status_flags::ZERO_PRIOR_WEIGHT;
             if (per_row_status_or & FORBIDDEN_ROW) != 0 && !matches!(status, PirlsStatus::Unstable)
             {
                 return Err(format!(
@@ -764,12 +763,12 @@ mod linux_impl {
     fn run_gpu_gaussian_pls(
         input: GpuGaussianPlsInput<'_>,
     ) -> Result<(PirlsResult, WorkingModelPirlsResult), String> {
-        use gam_linalg::utils::inf_norm;
-        use gam_linalg::matrix::LinearOperator;
         use crate::pirls::{
             array1_l2_norm, calculate_deviance, calculate_loglikelihood_omitting_constants,
             computeworkingweight_derivatives_from_eta,
         };
+        use gam_linalg::matrix::LinearOperator;
+        use gam_linalg::utils::inf_norm;
         use gam_problem::{RidgePassport, RidgePolicy};
         use ndarray::Array1;
 

@@ -47,11 +47,14 @@ def _reconstruct(indices, codes, decoder):
 def _routed_ev(x, decoder, active):
     """EV of `decoder` over `x` under the trainer's own routing (tiled top-s +
     active-set ridge) — the quantity the fit reports, computed independently."""
-    idx, cod = rust_module().sparse_dictionary_transform_ffi(
+    routed = dict(rust_module().sparse_dictionary_transform_ffi(
         np.ascontiguousarray(x, dtype=np.float32),
         np.ascontiguousarray(decoder, dtype=np.float32),
         int(active),
-    )
+    ))
+    idx = np.ascontiguousarray(routed["indices"], dtype=np.uint32)
+    cod = np.ascontiguousarray(routed["codes"], dtype=np.float32)
+    assert int(dict(routed["score_route_stats"])["minibatches"]) == 1
     recon = _reconstruct(idx, cod, decoder)
     rss = float(np.sum((x - recon) ** 2))
     tss = float(np.sum((x - x.mean(axis=0, keepdims=True)) ** 2))
@@ -159,9 +162,11 @@ def test_revival_pulls_from_worst_reconstructed_row_not_pcs():
     # Residual of the e2 row under the pre-refresh (seed) decoder, via the trainer's
     # own routing — the exact field revival ranks. It is the worst-reconstructed row.
     d_pre = stream.decoder
-    idx, cod = rust_module().sparse_dictionary_transform_ffi(
+    routed = dict(rust_module().sparse_dictionary_transform_ffi(
         shard, np.ascontiguousarray(d_pre, dtype=np.float32), 1
-    )
+    ))
+    idx = np.ascontiguousarray(routed["indices"], dtype=np.uint32)
+    cod = np.ascontiguousarray(routed["codes"], dtype=np.float32)
     resid = shard - _reconstruct(idx, cod, d_pre)
     resid_norm = np.linalg.norm(resid, axis=1)
     worst = int(np.argmax(resid_norm))

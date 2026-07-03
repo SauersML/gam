@@ -15,25 +15,25 @@ mod tests {
     use super::{
         LinearInequalityConstraints, PenaltyConfig, PirlsConfig, PirlsLinearSolvePath,
         PirlsProblem, PirlsWorkspace, WorkingDerivativeBuffersMut, bernoulli_geometry_from_jet,
-        calculate_deviance, compute_constraint_kkt_diagnostics,
-        compute_observed_hessian_curvature_arrays, fit_model_for_fixed_rho,
-        select_active_set_release, should_log_pirls_decision_summary,
+        calculate_deviance, calculate_loglikelihood, calculate_loglikelihood_omitting_constants,
+        compute_constraint_kkt_diagnostics, compute_observed_hessian_curvature_arrays,
+        fit_model_for_fixed_rho, select_active_set_release, should_log_pirls_decision_summary,
         should_use_sparse_native_pirls, solve_newton_directionwith_linear_constraints,
         solve_newton_directionwith_lower_bounds, tweedie_log_weight_mu_power, update_glmvectors,
         write_gamma_log_working_state, write_negative_binomial_log_working_state,
         write_poisson_log_working_state, write_tweedie_log_working_state,
     };
-    use gam_linalg::matrix::DesignMatrix;
-    use crate::mixture_link::{InverseLinkJet as MixtureInverseLinkJet, state_fromspec};
-    use gam_math::probability::standard_normal_quantile;
     use crate::active_set;
     use crate::estimate::EstimationError;
+    use crate::mixture_link::{InverseLinkJet as MixtureInverseLinkJet, state_fromspec};
+    use approx::assert_relative_eq;
+    use faer::sparse::{SparseColMat, Triplet};
+    use gam_linalg::matrix::DesignMatrix;
+    use gam_math::probability::standard_normal_quantile;
     use gam_problem::{
         Coefficients, GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkComponent, LinkFunction,
         LogSmoothingParamsView, MIN_WEIGHT, MixtureLinkSpec, ResponseFamily, StandardLink,
     };
-    use approx::assert_relative_eq;
-    use faer::sparse::{SparseColMat, Triplet};
 
     // Full-operator Firth/Jeffreys diagnostics reference (#1575): bit-identical to
     // the production `jeffreys_pirls_diagnostics_from_factor` fast path, used here
@@ -181,13 +181,9 @@ mod tests {
                 let (hat_f, logdet_f, shift_f) =
                     FirthDenseOperator::pirls_diagnostics_from_factor(&factor_w, link, eta)
                         .expect("factored weighted diagnostics");
-                let (hat_o, logdet_o, shift_o) = compute_jeffreys_pirls_diagnostics(
-                    link,
-                    x.view(),
-                    eta.view(),
-                    weights.view(),
-                )
-                .expect("oracle weighted diagnostics");
+                let (hat_o, logdet_o, shift_o) =
+                    compute_jeffreys_pirls_diagnostics(link, x.view(), eta.view(), weights.view())
+                        .expect("oracle weighted diagnostics");
                 assert_relative_eq!(logdet_f, logdet_o, epsilon = 1e-12, max_relative = 1e-12);
                 for i in 0..x.nrows() {
                     assert_relative_eq!(hat_f[i], hat_o[i], epsilon = 1e-12, max_relative = 1e-12);
@@ -894,9 +890,13 @@ mod tests {
             .map(crate::estimate::PenaltySpec::from_blockwise_ref)
             .collect();
         let nulls = vec![0; specs.len()];
-        let (canonical, _) =
-            gam_terms::construction::canonicalize_penalty_specs(&specs, &nulls, p, "prior mean test")
-                .expect("canonical penalties");
+        let (canonical, _) = gam_terms::construction::canonicalize_penalty_specs(
+            &specs,
+            &nulls,
+            p,
+            "prior mean test",
+        )
+        .expect("canonical penalties");
         let config = PirlsConfig {
             likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
@@ -1198,8 +1198,8 @@ mod tests {
     /// this test FAILS rather than being weakened.
     #[test]
     pub(crate) fn sparse_native_and_dense_select_same_lambda_under_shrinkage_floor() {
-        use gam_terms::smooth::BlockwisePenalty;
         use crate::estimate::{ExternalOptimOptions, optimize_external_design};
+        use gam_terms::smooth::BlockwisePenalty;
 
         // --- Fixture: a banded "local-support" (B-spline-like) design so the
         // penalized Hessian is sparse enough for the sparse copy to take the
@@ -1852,6 +1852,84 @@ mod tests {
     }
 
     #[test]
+    pub(crate) fn poisson_external_fit_reports_full_loglikelihood_not_reml_kernel() {
+        use crate::estimate::{ExternalOptimOptions, optimize_external_design};
+        use gam_terms::smooth::BlockwisePenalty;
+
+        let x = array![
+            [1.0, -1.0],
+            [1.0, -0.5],
+            [1.0, 0.0],
+            [1.0, 0.5],
+            [1.0, 1.0],
+            [1.0, 1.5],
+        ];
+        let y = array![0.0, 1.0, 2.0, 4.0, 6.0, 9.0];
+        let w = Array1::ones(y.len());
+        let offset = Array1::zeros(y.len());
+        let root = array![[0.0, 1.0]];
+        let likelihood = GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Poisson,
+            InverseLink::Standard(StandardLink::Log),
+        ));
+        let opts = ExternalOptimOptions {
+            family: likelihood.spec.clone(),
+            latent_cloglog: None,
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
+            compute_inference: false,
+            skip_rho_posterior_inference: true,
+            max_iter: 100,
+            tol: 1e-10,
+            nullspace_dims: vec![1],
+            linear_constraints: None,
+            firth_bias_reduction: None,
+            penalty_shrinkage_floor: None,
+            rho_prior: Default::default(),
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
+            persist_warm_start_disk: false,
+        };
+
+        let result = optimize_external_design(
+            y.view(),
+            w.view(),
+            x.clone(),
+            offset.view(),
+            vec![BlockwisePenalty::new(0..2, root)],
+            &opts,
+        )
+        .expect("external Poisson fit should converge");
+
+        let eta = x.dot(&result.beta) + &offset;
+        let mu = eta.mapv(f64::exp);
+        let full = calculate_loglikelihood(y.view(), &mu, &likelihood, w.view());
+        let omit = calculate_loglikelihood_omitting_constants(
+            y.view(),
+            &mu,
+            &likelihood,
+            w.view(),
+        );
+        assert!(
+            full <= 0.0,
+            "Poisson reporting log-likelihood is a log-mass and must be <= 0, got {full}"
+        );
+        assert!(
+            omit > full,
+            "REML omitting-constants kernel must be larger after dropping count normalizers: \
+             omit={omit} full={full}"
+        );
+        assert_relative_eq!(
+            result.log_likelihood,
+            full,
+            epsilon = 1e-10,
+            max_relative = 1e-10
+        );
+    }
+
+    #[test]
     pub(crate) fn gamma_log_fit_profiles_shape_instead_of_fixing_one() {
         let x = array![[1.0], [1.0], [1.0], [1.0], [1.0], [1.0]];
         let y = array![0.8, 1.1, 1.7, 2.0, 2.6, 3.1];
@@ -2268,8 +2346,8 @@ mod tests {
 #[cfg(test)]
 mod root_cause_tests {
     use super::*;
-    use gam_problem::LogSmoothingParamsView;
     use approx::assert_relative_eq;
+    use gam_problem::LogSmoothingParamsView;
     use ndarray::{Array1, Array2, array};
 
     pub(crate) fn capture_pirls_penalized_deviance<F, R>(run: F) -> (R, Vec<f64>)
@@ -3858,12 +3936,14 @@ mod reporting_loglikelihood_tests {
             .sum();
         let total = calculate_loglikelihood(y.view(), &mu, &glm, w.view());
         assert!((total - analytic).abs() < 1e-10, "{total} vs {analytic}");
-        assert!(total < 0.0, "summed Poisson elpd must be negative, got {total}");
+        assert!(
+            total < 0.0,
+            "summed Poisson elpd must be negative, got {total}"
+        );
 
         // The reporting kernel differs from the REML building block by EXACTLY
         // the dropped −Σ ln Γ(y+1) count normalizer — the #1581 root cause.
-        let omitting =
-            calculate_loglikelihood_omitting_constants(y.view(), &mu, &glm, w.view());
+        let omitting = calculate_loglikelihood_omitting_constants(y.view(), &mu, &glm, w.view());
         let dropped: f64 = y.iter().map(|&yi| ln_gamma(yi + 1.0)).sum();
         assert!(
             (omitting - total - dropped).abs() < 1e-10,
@@ -3884,7 +3964,10 @@ mod reporting_loglikelihood_tests {
         let poisson = canonical(ResponseFamily::Poisson, StandardLink::Log);
         let theta = 1.0e5;
         let negbin = canonical(
-            ResponseFamily::NegativeBinomial { theta, theta_fixed: true },
+            ResponseFamily::NegativeBinomial {
+                theta,
+                theta_fixed: true,
+            },
             StandardLink::Log,
         );
 
@@ -3913,7 +3996,10 @@ mod reporting_loglikelihood_tests {
         let sigma2 = 0.25_f64;
 
         let glm = |s2: f64| GlmLikelihoodSpec {
-            spec: LikelihoodSpec::new(ResponseFamily::Gaussian, InverseLink::Standard(StandardLink::Identity)),
+            spec: LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(StandardLink::Identity),
+            ),
             scale: LikelihoodScaleMetadata::FixedDispersion { phi: s2 },
         };
 
@@ -3953,7 +4039,10 @@ mod reporting_loglikelihood_tests {
         let glm = canonical(ResponseFamily::Gaussian, StandardLink::Identity);
         // canonical Gaussian ⇒ ProfiledGaussian ⇒ fixed_phi() == None.
         let ll = calculate_loglikelihood(y.view(), &mu, &glm, w.view());
-        assert!(ll.is_nan(), "profiled Gaussian without a concrete σ̂² must be NaN, got {ll}");
+        assert!(
+            ll.is_nan(),
+            "profiled Gaussian without a concrete σ̂² must be NaN, got {ll}"
+        );
     }
 
     // Gaussian prior weights act as inverse-variance scaling (Var = φ/wᵢ): the
@@ -3965,16 +4054,22 @@ mod reporting_loglikelihood_tests {
         let w = array![2.0, 0.5];
         let sigma2 = 0.4_f64;
         let glm = GlmLikelihoodSpec {
-            spec: LikelihoodSpec::new(ResponseFamily::Gaussian, InverseLink::Standard(StandardLink::Identity)),
+            spec: LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(StandardLink::Identity),
+            ),
             scale: LikelihoodScaleMetadata::FixedDispersion { phi: sigma2 },
         };
         let pw = pointwise_loglikelihood(y.view(), &mu, &glm, w.view());
         for i in 0..2 {
             let r = y[i] - mu[i];
             let expect = -0.5
-                * ((2.0 * std::f64::consts::PI * sigma2).ln() - w[i].ln()
-                    + w[i] * r * r / sigma2);
-            assert!((pw[i] - expect).abs() < 1e-12, "row {i}: {} vs {expect}", pw[i]);
+                * ((2.0 * std::f64::consts::PI * sigma2).ln() - w[i].ln() + w[i] * r * r / sigma2);
+            assert!(
+                (pw[i] - expect).abs() < 1e-12,
+                "row {i}: {} vs {expect}",
+                pw[i]
+            );
         }
     }
 
@@ -3989,7 +4084,10 @@ mod reporting_loglikelihood_tests {
         let glm = canonical(ResponseFamily::Binomial, StandardLink::Logit);
         let pw = pointwise_loglikelihood(y.view(), &mu, &glm, w.view());
         for (i, &v) in pw.iter().enumerate() {
-            assert!(v <= 1e-12, "row {i}: binomial log-mass must be ≤ 0, got {v}");
+            assert!(
+                v <= 1e-12,
+                "row {i}: binomial log-mass must be ≤ 0, got {v}"
+            );
             let n = w[i];
             let k = n * y[i];
             let coef = ln_gamma(n + 1.0) - ln_gamma(k + 1.0) - ln_gamma(n - k + 1.0);
@@ -4005,7 +4103,12 @@ mod reporting_loglikelihood_tests {
         let full = pointwise_loglikelihood(yb.view(), &mub, &glm, wb.view());
         let omit = pointwise_loglikelihood_omitting_constants(yb.view(), &mub, &glm, wb.view());
         for i in 0..4 {
-            assert!((full[i] - omit[i]).abs() < 1e-12, "row {i}: {} vs {}", full[i], omit[i]);
+            assert!(
+                (full[i] - omit[i]).abs() < 1e-12,
+                "row {i}: {} vs {}",
+                full[i],
+                omit[i]
+            );
         }
     }
 
@@ -4022,9 +4125,13 @@ mod reporting_loglikelihood_tests {
         let pw = pointwise_loglikelihood(y.view(), &mu, &glm, w.view());
         for i in 0..3 {
             let a = w[i] * nu;
-            let expect = a * (a / mu[i]).ln() + (a - 1.0) * y[i].ln() - a * y[i] / mu[i]
-                - ln_gamma(a);
-            assert!((pw[i] - expect).abs() < 1e-10, "row {i}: {} vs {expect}", pw[i]);
+            let expect =
+                a * (a / mu[i]).ln() + (a - 1.0) * y[i].ln() - a * y[i] / mu[i] - ln_gamma(a);
+            assert!(
+                (pw[i] - expect).abs() < 1e-10,
+                "row {i}: {} vs {expect}",
+                pw[i]
+            );
         }
         let total = calculate_loglikelihood(y.view(), &mu, &glm, w.view());
         assert!((total - pw.sum()).abs() < 1e-12);
@@ -4042,11 +4149,17 @@ mod reporting_loglikelihood_tests {
             canonical(ResponseFamily::Gamma, StandardLink::Log),
             canonical(ResponseFamily::Binomial, StandardLink::Logit),
             GlmLikelihoodSpec {
-                spec: LikelihoodSpec::new(ResponseFamily::Gaussian, InverseLink::Standard(StandardLink::Identity)),
+                spec: LikelihoodSpec::new(
+                    ResponseFamily::Gaussian,
+                    InverseLink::Standard(StandardLink::Identity),
+                ),
                 scale: LikelihoodScaleMetadata::FixedDispersion { phi: 0.3 },
             },
             GlmLikelihoodSpec {
-                spec: LikelihoodSpec::new(ResponseFamily::Tweedie { p: 1.5 }, InverseLink::Standard(StandardLink::Log)),
+                spec: LikelihoodSpec::new(
+                    ResponseFamily::Tweedie { p: 1.5 },
+                    InverseLink::Standard(StandardLink::Log),
+                ),
                 scale: LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
             },
         ] {
@@ -4058,7 +4171,11 @@ mod reporting_loglikelihood_tests {
             };
             let pw = pointwise_loglikelihood(yy.view(), &mm, &glm, w.view());
             for &v in pw.iter() {
-                assert_eq!(v, 0.0, "{:?}: zero-weight row must be 0, got {v}", glm.spec.response);
+                assert_eq!(
+                    v, 0.0,
+                    "{:?}: zero-weight row must be 0, got {v}",
+                    glm.spec.response
+                );
             }
         }
     }

@@ -53,20 +53,20 @@ use super::{
     ArrowSchurInnerConfig, GamModelFinalState, effective_kkt_tolerance,
     project_coefficients_to_lower_bounds,
 };
-use gam_terms::construction::{KroneckerReparamResult, ReparamResult};
+use crate::active_set;
 use crate::estimate::EstimationError;
+use crate::gpu::pirls_host_dispatch::{try_gaussian_pls_gpu, try_pirls_loop_gpu};
+use crate::mixture_link::inverse_link_has_fisher_weight_jet;
+use faer::sparse::{SparseColMat, Triplet};
 use gam_linalg::faer_ndarray::fast_ab;
 use gam_linalg::matrix::{DesignMatrix, LinearOperator, ReparamOperator, SymmetricMatrix};
-use crate::mixture_link::inverse_link_has_fisher_weight_jet;
 use gam_math::probability::standard_normal_quantile;
-use crate::active_set;
-use crate::gpu::pirls_host_dispatch::{try_gaussian_pls_gpu, try_pirls_loop_gpu};
 use gam_problem::{
     Coefficients, GlmLikelihoodSpec, InverseLink, LinearPredictor, LinkFunction,
     LogSmoothingParamsView, MixtureLinkState, ResponseFamily, RidgePassport, RidgePolicy,
     SasLinkState, StandardLink,
 };
-use faer::sparse::{SparseColMat, Triplet};
+use gam_terms::construction::{KroneckerReparamResult, ReparamResult};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -856,13 +856,14 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         // λ-grid logdet/derivative sweep is redone here. Bit-identical to the
         // unmemoized engine.
         let invariant = kron.invariant_structure()?;
-        let kron_result = gam_terms::construction::kronecker_reparameterization_engine_with_invariant(
-            invariant.as_ref(),
-            &kron.marginal_dims,
-            lambdas_slice,
-            kron.has_double_penalty,
-            penalty.penalty_shrinkage_floor,
-        )?;
+        let kron_result =
+            gam_terms::construction::kronecker_reparameterization_engine_with_invariant(
+                invariant.as_ref(),
+                &kron.marginal_dims,
+                lambdas_slice,
+                kron.has_double_penalty,
+                penalty.penalty_shrinkage_floor,
+            )?;
         let transform = Arc::new(KroneckerQsTransform::new(&kron_result));
         let penalty_diag = build_diagonal_penalty_from_kronecker(&kron_result, lambdas_slice);
         Some((kron_result, transform, penalty_diag))
@@ -1211,7 +1212,12 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                 } else {
                     f64::NAN
                 };
-                let log_likelihood = -0.5 * deviance;
+                let log_likelihood = calculate_loglikelihood_omitting_constants(
+                    y,
+                    &finalmu,
+                    likelihood,
+                    priorweights,
+                );
                 let max_abs_eta = inf_norm(finalmu.iter().copied());
                 (
                     final_eta,

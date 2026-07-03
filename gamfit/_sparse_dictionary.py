@@ -32,6 +32,24 @@ def _as_2d_f32(values: Any, label: str) -> np.ndarray:
     return np.ascontiguousarray(arr)
 
 
+def _route_stats(payload: Any) -> dict[str, Any]:
+    stats = dict(payload or {})
+    for key in (
+        "minibatches",
+        "admitted_minibatches",
+        "device_minibatches",
+        "cpu_minibatches",
+        "score_tiles",
+        "peak_score_bytes",
+    ):
+        if key in stats:
+            stats[key] = int(stats[key])
+    for key in ("score_elements", "dot_flops_lower_bound"):
+        if key in stats:
+            stats[key] = int(stats[key])
+    return stats
+
+
 def _block_transform(
     decoder: np.ndarray,
     gamma: float,
@@ -91,6 +109,15 @@ def _block_transform(
 
 
 @dataclass(frozen=True)
+class SparseDictionaryTransform:
+    """Out-of-sample sparse routing plus CPU/GPU route telemetry."""
+
+    indices: np.ndarray
+    codes: np.ndarray
+    score_route_stats: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class SparseDictionaryFit:
     """Result of a collapsed-linear-lane fit.
 
@@ -118,6 +145,7 @@ class SparseDictionaryFit:
     epochs: int
     converged: bool
     active: int
+    score_route_stats: dict[str, Any]
 
     def reconstruct(self, indices: Any | None = None, codes: Any | None = None) -> np.ndarray:
         """Dense reconstruct from a sparse ``(indices, codes)`` routing.
@@ -136,13 +164,13 @@ class SparseDictionaryFit:
             out += cod[:, [j]] * self.decoder[idx[:, j]]
         return np.ascontiguousarray(out)
 
-    def transform(self, X: Any, active: int | None = None) -> tuple[np.ndarray, np.ndarray]:
+    def transform(self, X: Any, active: int | None = None) -> SparseDictionaryTransform:
         """Route held-out rows ``X`` (``M x P``) through the fitted decoder.
 
-        Returns ``(indices, codes)`` of shape ``M x active`` (sparse routing),
-        computed by the Rust core (``sparse_dictionary_transform``): the same
-        tiled top-``active`` routing + active-set ridge solve the trainer uses,
-        against the frozen decoder.
+        Returns a :class:`SparseDictionaryTransform` with ``indices`` and
+        ``codes`` of shape ``M x active`` plus ``score_route_stats``. The stats
+        are part of the API: high-``K`` jobs must prove whether the route ran on
+        the device or on the host.
         """
         x = _as_2d_f32(X, "X")
         if x.shape[1] != self.decoder.shape[1]:
@@ -151,12 +179,17 @@ class SparseDictionaryFit:
             )
         s = self.active if active is None else int(active)
         s = max(1, min(s, self.decoder.shape[0]))
-        indices, codes = rust_module().sparse_dictionary_transform_ffi(
+        payload = rust_module().sparse_dictionary_transform_ffi(
             np.ascontiguousarray(x, dtype=np.float32),
             np.ascontiguousarray(self.decoder, dtype=np.float32),
             int(s),
         )
-        return np.ascontiguousarray(indices), np.ascontiguousarray(codes)
+        data = dict(payload)
+        return SparseDictionaryTransform(
+            indices=np.ascontiguousarray(data["indices"], dtype=np.uint32),
+            codes=np.ascontiguousarray(data["codes"], dtype=np.float32),
+            score_route_stats=_route_stats(data["score_route_stats"]),
+        )
 
 
 @dataclass(frozen=True)
@@ -186,12 +219,11 @@ class SparseDictStreamArtifact:
     converged: bool
     active: int
 
-    def transform(self, X: Any, active: int | None = None) -> tuple[np.ndarray, np.ndarray]:
+    def transform(self, X: Any, active: int | None = None) -> SparseDictionaryTransform:
         """Route held-out rows ``X`` (``M x P``) through the fitted decoder.
 
-        Returns ``(indices, codes)`` of shape ``M x active`` (sparse routing),
-        computed by the Rust core against the frozen decoder — the same tiled
-        top-``active`` routing + active-set ridge solve the trainer uses.
+        Returns a :class:`SparseDictionaryTransform`, including route telemetry
+        proving CPU/device dispatch for the held-out encode.
         """
         x = _as_2d_f32(X, "X")
         if x.shape[1] != self.decoder.shape[1]:
@@ -200,12 +232,17 @@ class SparseDictStreamArtifact:
             )
         s = self.active if active is None else int(active)
         s = max(1, min(s, self.decoder.shape[0]))
-        indices, codes = rust_module().sparse_dictionary_transform_ffi(
+        payload = rust_module().sparse_dictionary_transform_ffi(
             np.ascontiguousarray(x, dtype=np.float32),
             np.ascontiguousarray(self.decoder, dtype=np.float32),
             int(s),
         )
-        return np.ascontiguousarray(indices), np.ascontiguousarray(codes)
+        data = dict(payload)
+        return SparseDictionaryTransform(
+            indices=np.ascontiguousarray(data["indices"], dtype=np.uint32),
+            codes=np.ascontiguousarray(data["codes"], dtype=np.float32),
+            score_route_stats=_route_stats(data["score_route_stats"]),
+        )
 
 
 class SparseDictStream:
@@ -1019,6 +1056,7 @@ def sparse_dictionary_fit(
         epochs=int(data["epochs"]),
         converged=bool(data["converged"]),
         active=int(data["active"]),
+        score_route_stats=_route_stats(data["score_route_stats"]),
     )
 
 
@@ -1029,6 +1067,7 @@ __all__ = [
     "SparseDictStream",
     "SparseDictStreamArtifact",
     "SparseDictionaryFit",
+    "SparseDictionaryTransform",
     "block_sparse_dictionary_fit",
     "block_sparse_dictionary_fit_begin",
     "sparse_dictionary_fit",
