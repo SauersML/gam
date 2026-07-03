@@ -216,6 +216,58 @@ pub struct StagewiseResult {
     pub report: StagewiseReport,
 }
 
+/// Stagewise progress event emitted at durable SAC phase boundaries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StagewiseEventKind {
+    SeedFitCompleted,
+    ResidualModelFitted,
+    CandidateStarted,
+    CandidateFinished,
+    BirthAccepted,
+    BirthRejected,
+    BackfitSweepStarted,
+    BackfitSweepAccepted,
+    BackfitSweepRejected,
+    TerminalEvidenceCompleted,
+}
+
+/// A real-time, checkpoint-capable view of the current SAC state. When
+/// `checkpoint` is true, `term`/`rho` name a durable parent state that can be
+/// serialized and resumed by the caller; candidate events are progress-only.
+pub struct StagewiseProgress<'a> {
+    pub event: StagewiseEventKind,
+    pub birth_round: usize,
+    pub backfit_sweep: usize,
+    pub candidate: Option<BirthKind>,
+    pub accepted: Option<bool>,
+    pub checkpoint: bool,
+    pub k_atoms: usize,
+    pub births_accepted: usize,
+    pub births_rejected: usize,
+    pub ev: Option<f64>,
+    pub factor_energy: Option<f64>,
+    pub joint_reml_before: Option<f64>,
+    pub joint_reml_after: Option<f64>,
+    pub terminal_joint_reml: Option<f64>,
+    pub term: &'a SaeManifoldTerm,
+    pub rho: &'a SaeManifoldRho,
+}
+
+/// Callback hook for progress and per-birth checkpointing. The callback may
+/// return an error to abort the fit cleanly.
+pub type StagewiseProgressCallback<'cb> =
+    dyn for<'event> FnMut(StagewiseProgress<'event>) -> Result<(), String> + 'cb;
+
+fn emit_stagewise_progress(
+    progress: &mut Option<&mut StagewiseProgressCallback<'_>>,
+    event: StagewiseProgress<'_>,
+) -> Result<(), String> {
+    if let Some(callback) = progress.as_deref_mut() {
+        callback(event)?;
+    }
+    Ok(())
+}
+
 /// Frozen (`inner_max_iter == 0`, the #850 freeze) joint REML criterion of a term
 /// at its current `(t, β)` — evaluate-don't-optimize. This is the joint-Laplace
 /// evidence at a fixed converged state (`loss.total() + extra penalties + ½
@@ -469,6 +521,7 @@ pub fn fit_stagewise(
     registry: Option<&AnalyticPenaltyRegistry>,
     sample_weights: Option<&[f64]>,
     config: &StagewiseConfig,
+    mut progress: Option<&mut StagewiseProgressCallback<'_>>,
 ) -> Result<StagewiseResult, String> {
     let n = target.nrows();
     if seed.k_atoms() != 1 {
@@ -512,8 +565,30 @@ pub fn fit_stagewise(
     let mut births_accepted = 0usize;
     let mut births_rejected = 0usize;
     let mut consecutive_rejections = 0usize;
+    emit_stagewise_progress(
+        &mut progress,
+        StagewiseProgress {
+            event: StagewiseEventKind::SeedFitCompleted,
+            birth_round: 0,
+            backfit_sweep: 0,
+            candidate: None,
+            accepted: Some(true),
+            checkpoint: true,
+            k_atoms: term.k_atoms(),
+            births_accepted,
+            births_rejected,
+            ev: ev_trace.last().copied(),
+            factor_energy: None,
+            joint_reml_before: None,
+            joint_reml_after: None,
+            terminal_joint_reml: None,
+            term: &term,
+            rho: &rho,
+        },
+    )?;
 
     // ── Phase 1b — forward births ──────────────────────────────────────────────
+    let mut birth_round = 0usize;
     let stopped_reason = loop {
         if births_accepted >= config.max_births {
             break StagewiseStop::MaxBirths;
@@ -521,6 +596,8 @@ pub fn fit_stagewise(
         if consecutive_rejections >= 2 {
             break StagewiseStop::TwoConsecutiveRejections;
         }
+        let round = birth_round;
+        birth_round += 1;
         // Refit Σ on the current residual and install the whitened metric so the
         // candidate fits run under the structured covariance from atom one.
         let Some(model) = fit_residual_covariance(&term, target, config)? else {
@@ -536,8 +613,50 @@ pub fn fit_stagewise(
 
         let (cur_reml, _) = frozen_joint_evidence(&mut term, target, &rho, registry, config)?;
         let cur_ev = ev_of(&term, target);
+        emit_stagewise_progress(
+            &mut progress,
+            StagewiseProgress {
+                event: StagewiseEventKind::ResidualModelFitted,
+                birth_round: round,
+                backfit_sweep: 0,
+                candidate: None,
+                accepted: None,
+                checkpoint: false,
+                k_atoms: term.k_atoms(),
+                births_accepted,
+                births_rejected,
+                ev: Some(cur_ev),
+                factor_energy: Some(factor_energy),
+                joint_reml_before: Some(cur_reml),
+                joint_reml_after: None,
+                terminal_joint_reml: None,
+                term: &term,
+                rho: &rho,
+            },
+        )?;
 
         // Candidate A — a genuinely-new atom (topology raced at birth).
+        emit_stagewise_progress(
+            &mut progress,
+            StagewiseProgress {
+                event: StagewiseEventKind::CandidateStarted,
+                birth_round: round,
+                backfit_sweep: 0,
+                candidate: Some(BirthKind::NewAtom),
+                accepted: None,
+                checkpoint: false,
+                k_atoms: term.k_atoms(),
+                births_accepted,
+                births_rejected,
+                ev: Some(cur_ev),
+                factor_energy: Some(factor_energy),
+                joint_reml_before: Some(cur_reml),
+                joint_reml_after: None,
+                terminal_joint_reml: None,
+                term: &term,
+                rho: &rho,
+            },
+        )?;
         let mut cand_a = apply_structure_move(
             &term,
             &rho,
@@ -561,11 +680,77 @@ pub fn fit_stagewise(
             Ok((cand_term, cand_rho, reml, ev))
         })
         .ok();
+        if let Some((cand_term, cand_rho, reml, ev)) = cand_a.as_ref() {
+            emit_stagewise_progress(
+                &mut progress,
+                StagewiseProgress {
+                    event: StagewiseEventKind::CandidateFinished,
+                    birth_round: round,
+                    backfit_sweep: 0,
+                    candidate: Some(BirthKind::NewAtom),
+                    accepted: None,
+                    checkpoint: false,
+                    k_atoms: cand_term.k_atoms(),
+                    births_accepted,
+                    births_rejected,
+                    ev: Some(*ev),
+                    factor_energy: Some(factor_energy),
+                    joint_reml_before: Some(cur_reml),
+                    joint_reml_after: Some(*reml),
+                    terminal_joint_reml: None,
+                    term: cand_term,
+                    rho: cand_rho,
+                },
+            )?;
+        } else {
+            emit_stagewise_progress(
+                &mut progress,
+                StagewiseProgress {
+                    event: StagewiseEventKind::CandidateFinished,
+                    birth_round: round,
+                    backfit_sweep: 0,
+                    candidate: Some(BirthKind::NewAtom),
+                    accepted: Some(false),
+                    checkpoint: false,
+                    k_atoms: term.k_atoms(),
+                    births_accepted,
+                    births_rejected,
+                    ev: Some(cur_ev),
+                    factor_energy: Some(factor_energy),
+                    joint_reml_before: Some(cur_reml),
+                    joint_reml_after: None,
+                    terminal_joint_reml: None,
+                    term: &term,
+                    rho: &rho,
+                },
+            )?;
+        }
 
         // Candidate B — extend the previous atom's chart (arc-tiling). Refit the
         // last atom on its LOO residual so it can absorb the residual it left
         // behind; K does NOT grow.
-        let mut cand_b = {
+        let mut cand_b = if term.k_atoms() > 1 {
+            emit_stagewise_progress(
+                &mut progress,
+                StagewiseProgress {
+                    event: StagewiseEventKind::CandidateStarted,
+                    birth_round: round,
+                    backfit_sweep: 0,
+                    candidate: Some(BirthKind::ChartExtension),
+                    accepted: None,
+                    checkpoint: false,
+                    k_atoms: term.k_atoms(),
+                    births_accepted,
+                    births_rejected,
+                    ev: Some(cur_ev),
+                    factor_energy: Some(factor_energy),
+                    joint_reml_before: Some(cur_reml),
+                    joint_reml_after: None,
+                    terminal_joint_reml: None,
+                    term: &term,
+                    rho: &rho,
+                },
+            )?;
             let last = term.k_atoms() - 1;
             let mut cand_term = term.clone();
             let mut cand_rho = rho.clone();
@@ -593,7 +778,60 @@ pub fn fit_stagewise(
                 let ev = ev_of(&cand_term, target);
                 Ok((cand_term, cand_rho, reml, ev))
             })();
-            built.ok()
+            let out = built.ok();
+            if let Some((cand_term, cand_rho, reml, ev)) = out.as_ref() {
+                emit_stagewise_progress(
+                    &mut progress,
+                    StagewiseProgress {
+                        event: StagewiseEventKind::CandidateFinished,
+                        birth_round: round,
+                        backfit_sweep: 0,
+                        candidate: Some(BirthKind::ChartExtension),
+                        accepted: None,
+                        checkpoint: false,
+                        k_atoms: cand_term.k_atoms(),
+                        births_accepted,
+                        births_rejected,
+                        ev: Some(*ev),
+                        factor_energy: Some(factor_energy),
+                        joint_reml_before: Some(cur_reml),
+                        joint_reml_after: Some(*reml),
+                        terminal_joint_reml: None,
+                        term: cand_term,
+                        rho: cand_rho,
+                    },
+                )?;
+            } else {
+                emit_stagewise_progress(
+                    &mut progress,
+                    StagewiseProgress {
+                        event: StagewiseEventKind::CandidateFinished,
+                        birth_round: round,
+                        backfit_sweep: 0,
+                        candidate: Some(BirthKind::ChartExtension),
+                        accepted: Some(false),
+                        checkpoint: false,
+                        k_atoms: term.k_atoms(),
+                        births_accepted,
+                        births_rejected,
+                        ev: Some(cur_ev),
+                        factor_energy: Some(factor_energy),
+                        joint_reml_before: Some(cur_reml),
+                        joint_reml_after: None,
+                        terminal_joint_reml: None,
+                        term: &term,
+                        rho: &rho,
+                    },
+                )?;
+            }
+            out
+        } else {
+            // With K=1 the "chart extension" arm is exactly the seed fit repeated
+            // against the same target under the same ρ. Skipping it removes one
+            // full K=1 solve from the first birth without changing the candidate
+            // set in any meaningful way; real arc-tiling only exists once a later
+            // atom has left a leave-one-out residual.
+            None
         };
 
         // Gate: strictly-improved joint evidence AND ΔEV ≥ the minimum-effect
@@ -632,6 +870,27 @@ pub fn fit_stagewise(
                     joint_reml_after: cur_reml,
                     accepted: false,
                 });
+                emit_stagewise_progress(
+                    &mut progress,
+                    StagewiseProgress {
+                        event: StagewiseEventKind::BirthRejected,
+                        birth_round: round,
+                        backfit_sweep: 0,
+                        candidate: None,
+                        accepted: Some(false),
+                        checkpoint: true,
+                        k_atoms: term.k_atoms(),
+                        births_accepted,
+                        births_rejected,
+                        ev: Some(cur_ev),
+                        factor_energy: Some(factor_energy),
+                        joint_reml_before: Some(cur_reml),
+                        joint_reml_after: Some(cur_reml),
+                        terminal_joint_reml: None,
+                        term: &term,
+                        rho: &rho,
+                    },
+                )?;
                 continue;
             }
         };
@@ -654,6 +913,27 @@ pub fn fit_stagewise(
             accepted: true,
         });
         ev_trace.push(ev_after);
+        emit_stagewise_progress(
+            &mut progress,
+            StagewiseProgress {
+                event: StagewiseEventKind::BirthAccepted,
+                birth_round: round,
+                backfit_sweep: 0,
+                candidate: Some(kind),
+                accepted: Some(true),
+                checkpoint: true,
+                k_atoms: term.k_atoms(),
+                births_accepted,
+                births_rejected,
+                ev: Some(ev_after),
+                factor_energy: Some(factor_energy),
+                joint_reml_before: Some(cur_reml),
+                joint_reml_after: Some(reml_after),
+                terminal_joint_reml: None,
+                term: &term,
+                rho: &rho,
+            },
+        )?;
     };
 
     // ── Phase 2 — backfitting sweeps (keep-best, monotone by construction) ─────
@@ -666,7 +946,28 @@ pub fn fit_stagewise(
     // stops (converged). Pure convergence test — no magic tolerance.
     let mut backfit_ev_trace: Vec<f64> = Vec::new();
     let mut prev_ev = *ev_trace.last().unwrap_or(&f64::NEG_INFINITY);
-    for _ in 0..config.max_backfit_sweeps {
+    for sweep in 0..config.max_backfit_sweeps {
+        emit_stagewise_progress(
+            &mut progress,
+            StagewiseProgress {
+                event: StagewiseEventKind::BackfitSweepStarted,
+                birth_round,
+                backfit_sweep: sweep,
+                candidate: None,
+                accepted: None,
+                checkpoint: false,
+                k_atoms: term.k_atoms(),
+                births_accepted,
+                births_rejected,
+                ev: Some(prev_ev),
+                factor_energy: None,
+                joint_reml_before: None,
+                joint_reml_after: None,
+                terminal_joint_reml: None,
+                term: &term,
+                rho: &rho,
+            },
+        )?;
         let term_snapshot = term.clone();
         let rho_snapshot = rho.clone();
         backfit_sweep(&mut term, &mut rho, target, registry, config)?;
@@ -674,9 +975,51 @@ pub fn fit_stagewise(
         if ev > prev_ev {
             backfit_ev_trace.push(ev);
             prev_ev = ev;
+            emit_stagewise_progress(
+                &mut progress,
+                StagewiseProgress {
+                    event: StagewiseEventKind::BackfitSweepAccepted,
+                    birth_round,
+                    backfit_sweep: sweep,
+                    candidate: None,
+                    accepted: Some(true),
+                    checkpoint: true,
+                    k_atoms: term.k_atoms(),
+                    births_accepted,
+                    births_rejected,
+                    ev: Some(ev),
+                    factor_energy: None,
+                    joint_reml_before: None,
+                    joint_reml_after: None,
+                    terminal_joint_reml: None,
+                    term: &term,
+                    rho: &rho,
+                },
+            )?;
         } else {
             term = term_snapshot;
             rho = rho_snapshot;
+            emit_stagewise_progress(
+                &mut progress,
+                StagewiseProgress {
+                    event: StagewiseEventKind::BackfitSweepRejected,
+                    birth_round,
+                    backfit_sweep: sweep,
+                    candidate: None,
+                    accepted: Some(false),
+                    checkpoint: true,
+                    k_atoms: term.k_atoms(),
+                    births_accepted,
+                    births_rejected,
+                    ev: Some(prev_ev),
+                    factor_energy: None,
+                    joint_reml_before: None,
+                    joint_reml_after: None,
+                    terminal_joint_reml: None,
+                    term: &term,
+                    rho: &rho,
+                },
+            )?;
             break;
         }
     }
@@ -690,6 +1033,27 @@ pub fn fit_stagewise(
     // the returned artifact must ship armed so any downstream non-frozen refit gets
     // the normal supervision (mirrors `terminal_joint_assembly`).
     term.set_guards_enabled(true);
+    emit_stagewise_progress(
+        &mut progress,
+        StagewiseProgress {
+            event: StagewiseEventKind::TerminalEvidenceCompleted,
+            birth_round,
+            backfit_sweep: backfit_ev_trace.len(),
+            candidate: None,
+            accepted: Some(true),
+            checkpoint: true,
+            k_atoms: term.k_atoms(),
+            births_accepted,
+            births_rejected,
+            ev: Some(prev_ev),
+            factor_energy: None,
+            joint_reml_before: None,
+            joint_reml_after: Some(terminal_joint_reml),
+            terminal_joint_reml: Some(terminal_joint_reml),
+            term: &term,
+            rho: &rho,
+        },
+    )?;
 
     Ok(StagewiseResult {
         term,
@@ -860,7 +1224,7 @@ mod tests {
         // Seed: a single circle atom, active on every row.
         let (seed, rho) = build_term(vec![atom0], vec![cb0], &vec![vec![true]; n]);
         let config = test_config();
-        let result = fit_stagewise(seed, rho, target.view(), None, None, &config)
+        let result = fit_stagewise(seed, rho, target.view(), None, None, &config, None)
             .expect("fit_stagewise must complete on planted two-circles");
 
         assert!(
@@ -909,7 +1273,7 @@ mod tests {
             min_effect_ev: 0.01,
             ..test_config()
         };
-        let result = fit_stagewise(seed, rho, target.view(), None, None, &config)
+        let result = fit_stagewise(seed, rho, target.view(), None, None, &config, None)
             .expect("fit_stagewise must complete on a fully-explained target");
 
         assert_eq!(
@@ -946,7 +1310,7 @@ mod tests {
         let target = truth.fitted();
         let (seed, rho) = build_term(vec![atom0], vec![cb0], &vec![vec![true]; n]);
         let config = test_config();
-        let result = fit_stagewise(seed, rho, target.view(), None, None, &config)
+        let result = fit_stagewise(seed, rho, target.view(), None, None, &config, None)
             .expect("fit_stagewise must complete");
         assert!(
             is_non_decreasing(&result.report.backfit_ev_trace),
