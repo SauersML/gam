@@ -219,7 +219,7 @@ fn real_test() {
 }
 
 #[test]
-#[should_panic]
+#[should_panic(expected = "boom")]
 fn expected_panic() {
     trigger();
 }
