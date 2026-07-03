@@ -42,34 +42,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import signal
+import multiprocessing as mp
 import sys
 import time
-from contextlib import contextmanager
 from typing import Any
 
 import numpy as np
-
-
-class _FitTimeout(Exception):
-    pass
-
-
-@contextmanager
-def _time_limit(seconds: float):
-    """External wall-clock guard around a fit cell (STATE.md: every fit cell needs
-    a timeout so a co-collapse HANG is RECORDED, not a silent stall). SIGALRM is
-    POSIX-only; the fleet runs on Linux/macOS so this is sufficient."""
-    def _handler(signum: int, frame: Any) -> None:
-        raise _FitTimeout(f"fit exceeded {seconds:.0f}s wall-clock budget")
-
-    old = signal.signal(signal.SIGALRM, _handler)
-    signal.setitimer(signal.ITIMER_REAL, float(seconds))
-    try:
-        yield
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0.0)
-        signal.signal(signal.SIGALRM, old)
 
 
 def _behavioral_mass(U: np.ndarray, e: np.ndarray) -> np.ndarray:
@@ -104,6 +82,44 @@ def euclidean_ev(x: np.ndarray, xhat: np.ndarray) -> float:
     return 1.0 - ss_res / ss_tot
 
 
+def _fit_worker(
+    x: np.ndarray,
+    fisher_factors: Any,
+    topology: str,
+    assignment: str,
+    max_births: int,
+    n_iter: int,
+    random_state: int,
+    out_q: "mp.Queue[Any]",
+) -> None:
+    """Child-process body: one stagewise fit, result pushed to ``out_q``. Runs in
+    its own process so a native Rust HANG (STATE.md BLOCKER-1: K≥2 stagewise can
+    spin) is hard-killable by the parent — a Python SIGALRM cannot interrupt a
+    long FFI call that never yields to the interpreter."""
+    try:
+        import gamfit
+
+        model = gamfit.sae_manifold_fit_stagewise(
+            np.ascontiguousarray(x, dtype=np.float64),
+            d_atom=1,
+            atom_topology=topology,
+            assignment=assignment,
+            fisher_factors=fisher_factors,  # None ⇒ iid; shard ⇒ GLS (nats)
+            max_births=max_births,
+            max_backfit_sweeps=2,
+            n_iter=n_iter,
+            random_state=random_state,
+        )
+        out_q.put({
+            "ok": True,
+            "xhat": np.ascontiguousarray(model.fitted, dtype=np.float64),
+            "k_final": int(model.k),
+            "terminal_joint_reml": float(model.terminal_joint_reml),
+        })
+    except Exception as exc:  # a genuine fit failure is recorded, not hidden
+        out_q.put({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+
+
 def _fit_arm(
     x: np.ndarray,
     *,
@@ -115,36 +131,32 @@ def _fit_arm(
     random_state: int,
     timeout_s: float,
 ) -> dict[str, Any]:
-    """Fit one stagewise arm under an external timeout. Returns the reconstruction
-    ``(N, p)`` plus a compact record; on timeout/hang the record carries the
-    failure honestly (no silenced stall)."""
-    import gamfit
-
+    """Fit one stagewise arm in a HARD-KILLABLE child process. On timeout the
+    child is terminated and the record carries the failure honestly (no silenced
+    stall). 'spawn' start method avoids fork-after-BLAS-threads hazards."""
+    ctx = mp.get_context("spawn")
+    out_q: "mp.Queue[Any]" = ctx.Queue()
+    proc = ctx.Process(
+        target=_fit_worker,
+        args=(x, fisher_factors, topology, assignment, max_births, n_iter, random_state, out_q),
+    )
     t0 = time.time()
+    proc.start()
+    proc.join(timeout_s)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(10.0)
+        if proc.is_alive():
+            proc.kill()
+        return {"ok": False, "error": f"TIMEOUT: fit exceeded {timeout_s:.0f}s (hard-killed)",
+                "seconds": time.time() - t0}
     try:
-        with _time_limit(timeout_s):
-            model = gamfit.sae_manifold_fit_stagewise(
-                np.ascontiguousarray(x, dtype=np.float64),
-                d_atom=1,
-                atom_topology=topology,
-                assignment=assignment,
-                fisher_factors=fisher_factors,  # None ⇒ iid; shard ⇒ GLS (nats)
-                max_births=max_births,
-                max_backfit_sweeps=2,
-                n_iter=n_iter,
-                random_state=random_state,
-            )
-    except _FitTimeout as exc:
-        return {"ok": False, "error": f"TIMEOUT: {exc}", "seconds": time.time() - t0}
-    except Exception as exc:  # a genuine fit failure is recorded, not hidden
-        return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "seconds": time.time() - t0}
-    return {
-        "ok": True,
-        "seconds": time.time() - t0,
-        "xhat": np.ascontiguousarray(model.fitted, dtype=np.float64),
-        "k_final": int(model.k),
-        "terminal_joint_reml": float(model.terminal_joint_reml),
-    }
+        rec = out_q.get_nowait()
+    except Exception:
+        return {"ok": False, "error": f"child exited (code {proc.exitcode}) with no result",
+                "seconds": time.time() - t0}
+    rec["seconds"] = time.time() - t0
+    return rec
 
 
 def run_ab(

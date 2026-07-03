@@ -178,3 +178,59 @@ def test_stagewise_separates_disjoint_circles() -> None:
     most_odd = min(shares)
     assert most_even > 0.75, f"no atom cleanly captured the even-channel circle; shares={shares}"
     assert most_odd < 0.25, f"no atom cleanly captured the odd-channel circle; shares={shares}"
+
+
+def _behavioral_fisher_shard(n: int, p: int, s: int = 4, seed: int = 0) -> dict:
+    """A minimal ``behavioral_fisher`` shard dict (the layout
+    ``_normalize_fisher_factors`` accepts): ``U (n, p, s)`` random probe factors
+    with ``G_n = U_n U_nᵀ`` a rank-s output-Fisher sketch, tagged so the fit
+    installs ``RowMetric::behavioral_fisher`` (the Rung-1 GLS likelihood weight)."""
+    rng = np.random.default_rng(seed)
+    u = rng.standard_normal((n, p, s)).astype(np.float64) / np.sqrt(s)
+    return {"U": np.ascontiguousarray(u), "provenance": "behavioral_fisher"}
+
+
+def test_stagewise_behavioral_fisher_runs_and_auto_disables_structured_whitening() -> None:
+    # The Rung-1 (B4) GLS lane: a behavioral_fisher shard installs the output-Fisher
+    # metric AS the reconstruction likelihood weight (nats) on the seed and every
+    # born atom. structured_whitening defaults to None → resolves to False here
+    # (the fixed harvest metric and the per-birth Σ-refit are rival metric sources),
+    # so the fit runs under the fixed GLS metric alone.
+    x, _assign = _planted_two_circles(n=300, p=8, noise=0.02, seed=5)
+    shard = _behavioral_fisher_shard(x.shape[0], x.shape[1], s=4, seed=5)
+    result = gamfit.sae_manifold_fit_stagewise(
+        x,
+        d_atom=1,
+        atom_topology="circle",
+        assignment="ibp_map",
+        fisher_factors=shard,  # structured_whitening left at default None
+        max_births=3,
+        max_backfit_sweeps=1,
+        n_iter=30,
+        random_state=5,
+    )
+    assert result.k >= 1
+    assert np.isfinite(result.terminal_joint_reml)
+    assert result.fitted.shape == x.shape
+    # A monotone-by-construction EV trace still holds under the GLS metric.
+    assert _is_non_decreasing(result.ev_trace), list(result.ev_trace)
+
+
+def test_stagewise_behavioral_fisher_conflicts_with_structured_whitening() -> None:
+    # The fixed likelihood-whitening metric and the per-birth Σ-refit are two rival
+    # sources for the SAME per-row inner product; the wrapper refuses the ambiguous
+    # combination rather than let the Σ-refit silently clobber the harvest metric.
+    x, _assign = _planted_two_circles(n=200, p=8, noise=0.02, seed=6)
+    shard = _behavioral_fisher_shard(x.shape[0], x.shape[1], s=4, seed=6)
+    with pytest.raises(ValueError, match="structured_whitening"):
+        gamfit.sae_manifold_fit_stagewise(
+            x,
+            d_atom=1,
+            atom_topology="circle",
+            assignment="ibp_map",
+            fisher_factors=shard,
+            structured_whitening=True,  # explicit conflict
+            max_births=1,
+            n_iter=10,
+            random_state=6,
+        )

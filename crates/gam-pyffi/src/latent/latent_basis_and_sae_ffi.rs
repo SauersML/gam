@@ -5482,6 +5482,34 @@ fn chart_transfer_operator<'py>(
     )
     .map_err(PyValueError::new_err)?;
     let out = PyDict::new(py);
+    // For square 2x2 operators, the circle-atom readout: the density-weighted
+    // circular mean of the per-token SO(2) polar angles with its SE (the
+    // rotation band), plus the mean operator's own polar angle. `None` when the
+    // operators are not 2x2 or any token reflects/collapses the chart — the
+    // caller must then report the orientation flip rather than an angle.
+    if report.token_operators.dim().1 == 2 && report.token_operators.dim().2 == 2 {
+        match gam::terms::sae::chart_transfer::rotation_angle_band(
+            report.token_operators.view(),
+            weights_arr.as_ref().map(|w| w.view()),
+        ) {
+            Ok((mean_angle, se)) => {
+                out.set_item("rotation_angle_mean", mean_angle)?;
+                out.set_item("rotation_angle_se", se)?;
+            }
+            Err(_) => {
+                out.set_item("rotation_angle_mean", py.None())?;
+                out.set_item("rotation_angle_se", py.None())?;
+            }
+        }
+        match gam::terms::sae::chart_transfer::so2_polar_angle(report.mean.view()) {
+            Ok(angle) => out.set_item("rotation_angle_of_mean", angle)?,
+            Err(_) => out.set_item("rotation_angle_of_mean", py.None())?,
+        }
+    } else {
+        out.set_item("rotation_angle_mean", py.None())?;
+        out.set_item("rotation_angle_se", py.None())?;
+        out.set_item("rotation_angle_of_mean", py.None())?;
+    }
     out.set_item("mean", report.mean.into_pyarray(py))?;
     out.set_item("variance", report.variance.into_pyarray(py))?;
     out.set_item("effective_n", report.effective_n)?;
@@ -5499,7 +5527,8 @@ fn chart_transfer_operator<'py>(
 /// commutes with the rotation action, so the cyclic structure is preserved).
 /// `input_generator` / `output_generator` are the `[d, d]` generators of the
 /// input and output charts. Returns `{"transport_defect": f,
-/// "equivariance_defect": f}`.
+/// "equivariance_defect": f, "rotation_angle": f | None}` (the SO(2)
+/// polar-factor angle of `A`; `None` unless `A` is 2x2 with det > 0).
 #[pyfunction(signature = (operator, input_generator, output_generator))]
 fn certify_chart_transfer(
     py: Python<'_>,
@@ -5516,6 +5545,13 @@ fn certify_chart_transfer(
     let out = PyDict::new(py);
     out.set_item("transport_defect", cert.transport_defect)?;
     out.set_item("equivariance_defect", cert.equivariance_defect)?;
+    // The certified operator's SO(2) polar angle (2x2, det > 0 only): the
+    // "rotates by Z radians" readout next to the defects. `None` for other
+    // dimensions or an orientation-flipping operator.
+    match gam::terms::sae::chart_transfer::so2_polar_angle(operator.as_array()) {
+        Ok(angle) => out.set_item("rotation_angle", angle)?,
+        Err(_) => out.set_item("rotation_angle", py.None())?,
+    }
     Ok(out.unbind())
 }
 
