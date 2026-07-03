@@ -3155,9 +3155,27 @@ where
         }
         _ => {}
     }
+    // The fully-normalized reporting kernel (#2096) reads a CONCRETE dispersion
+    // `φ = σ̂²` for Gaussian off `likelihood.scale`. A profiled Gaussian carries
+    // only the `ProfiledGaussian` marker (`fixed_phi() == None`), which the
+    // kernel maps to NaN by contract (the #1583 no-silent-`φ=1` rule) — so the
+    // reported `log_likelihood` (and the AIC built from it) came out NaN for
+    // every Gaussian fit. Resolve the profiled residual scale `σ̂²` (the
+    // `standard_deviation` computed above, floored like `cov_scale`) into the
+    // reporting spec here. This is a REPORTING-only substitution: the persisted
+    // `likelihood_scale` field below stays `ProfiledGaussian` so downstream
+    // consumers still see that the scale was profiled, not user-fixed.
+    let reporting_scale = match (&reported_family.response, likelihood_scale_field) {
+        (ResponseFamily::Gaussian, LikelihoodScaleMetadata::ProfiledGaussian) => {
+            LikelihoodScaleMetadata::FixedDispersion {
+                phi: (standard_deviation * standard_deviation).max(f64::MIN_POSITIVE),
+            }
+        }
+        _ => likelihood_scale_field,
+    };
     let reported_likelihood = GlmLikelihoodSpec {
         spec: reported_family.clone(),
-        scale: likelihood_scale_field,
+        scale: reporting_scale,
     };
     let log_likelihood = crate::pirls::calculate_loglikelihood(
         y_o.view(),
@@ -3383,5 +3401,173 @@ mod blended_mixture_link_solve_tests {
             vb += db * db;
         }
         cov / (va.sqrt() * vb.sqrt())
+    }
+}
+
+#[cfg(test)]
+mod reported_loglikelihood_normalization_tests {
+    //! End-to-end regression coverage for issue #2096.
+    //!
+    //! `optimize_external_design` populates the user-facing
+    //! `ExternalOptimResult::log_likelihood` — the number that surfaces as
+    //! `Model.summary()["log_likelihood"]` and feeds the conditional/corrected
+    //! AIC. Before #2096 that field was wired to the REML building-block kernel
+    //! `calculate_loglikelihood_omitting_constants`, which drops the Poisson
+    //! count normalizer `−Σ lnΓ(y+1)`. On count data that makes the reported
+    //! log-likelihood POSITIVE — impossible for a probability mass — and, because
+    //! different families drop different normalizers, non-comparable across
+    //! families (breaking any AIC built from it).
+    //!
+    //! The fix routes the reporting field through the fully-normalized
+    //! `calculate_loglikelihood` kernel and tags it
+    //! `LogLikelihoodNormalization::Full`. This test fits a small Poisson GAM
+    //! surface through the real optimizer and asserts the reported field is a
+    //! proper (negative) log-mass — the direct, field-level symptom of #2096,
+    //! distinct from the kernel-level checks in
+    //! `crate::pirls::tests::reporting_loglikelihood_tests`.
+
+    use super::optimize_external_design;
+    use crate::estimate::external_options::ExternalOptimOptions;
+    use gam_problem::{
+        InverseLink, LikelihoodSpec, LogLikelihoodNormalization, ResponseFamily, StandardLink,
+    };
+    use gam_terms::smooth::BlockwisePenalty;
+    use ndarray::{Array1, Array2};
+
+    fn poisson_opts() -> ExternalOptimOptions {
+        ExternalOptimOptions {
+            family: LikelihoodSpec::new(
+                ResponseFamily::Poisson,
+                InverseLink::Standard(StandardLink::Log),
+            ),
+            latent_cloglog: None,
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
+            compute_inference: false,
+            skip_rho_posterior_inference: true,
+            max_iter: 200,
+            tol: 1e-9,
+            nullspace_dims: vec![2],
+            linear_constraints: None,
+            firth_bias_reduction: None,
+            penalty_shrinkage_floor: None,
+            rho_prior: Default::default(),
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
+            persist_warm_start_disk: false,
+        }
+    }
+
+    #[test]
+    fn poisson_reported_loglikelihood_is_a_negative_log_mass() {
+        // Deterministic log-linear count data: μᵢ = exp(1.5 + 0.4·xᵢ), yᵢ =
+        // round(μᵢ). Means run from ≈3 to ≈30, so the omitting-constants kernel
+        // Σ(y·ln μ − μ) the buggy field used is strongly POSITIVE, while the
+        // fully-normalized kernel (which subtracts Σ lnΓ(y+1)) is negative. A
+        // near-perfect fit keeps the two far apart, making the sign check sharp.
+        let n = 40usize;
+        let mut design = Array2::<f64>::zeros((n, 2));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let xi = -3.0 + 6.0 * (i as f64) / ((n - 1) as f64);
+            let mu = (1.5 + 0.4 * xi).exp();
+            design[[i, 0]] = 1.0;
+            design[[i, 1]] = xi;
+            y[i] = mu.round().max(1.0);
+        }
+        let w = Array1::<f64>::ones(n);
+        let offset = Array1::<f64>::zeros(n);
+        let penalty = BlockwisePenalty::new(0..2, Array2::<f64>::zeros((2, 2)));
+
+        let result = optimize_external_design(
+            y.view(),
+            w.view(),
+            design,
+            offset.view(),
+            vec![penalty],
+            &poisson_opts(),
+        )
+        .expect("Poisson solve on clean log-linear count data must converge");
+
+        assert!(
+            result.log_likelihood.is_finite(),
+            "reported Poisson log-likelihood must be finite, got {}",
+            result.log_likelihood
+        );
+        // #2096: a count model's reported log-likelihood is a log probability
+        // mass and MUST be ≤ 0. The pre-fix omitting-constants field was large
+        // and positive (≈ +1100 on the issue's data) because it dropped
+        // −Σ lnΓ(y+1).
+        assert!(
+            result.log_likelihood <= 0.0,
+            "reported Poisson log-likelihood must be a negative log-mass (#2096), \
+             got {}",
+            result.log_likelihood
+        );
+        // The paired normalization tag must advertise the fully-normalized kernel,
+        // so downstream AIC/elpd consumers know the count normalizer is included.
+        assert_eq!(
+            result.log_likelihood_normalization,
+            LogLikelihoodNormalization::Full,
+            "reporting field must be tagged fully-normalized (#2096)"
+        );
+    }
+
+    fn gaussian_opts() -> ExternalOptimOptions {
+        ExternalOptimOptions {
+            family: LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(StandardLink::Identity),
+            ),
+            ..poisson_opts()
+        }
+    }
+
+    #[test]
+    fn gaussian_reported_loglikelihood_is_finite() {
+        // #2096 follow-through: the reporting field switched to the
+        // fully-normalized Gaussian kernel, which reads a CONCRETE dispersion
+        // `φ = σ̂²` from `likelihood.scale`. If the reporting site ships the
+        // unresolved `ProfiledGaussian` marker (fixed_phi() == None), the kernel
+        // returns NaN — every Gaussian summary().log_likelihood / AIC becomes
+        // NaN. This asserts the profiled σ̂² is resolved into the reported scale.
+        let n = 40usize;
+        let mut design = Array2::<f64>::zeros((n, 2));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let xi = -3.0 + 6.0 * (i as f64) / ((n - 1) as f64);
+            design[[i, 0]] = 1.0;
+            design[[i, 1]] = xi;
+            // Deterministic near-linear signal with a small deterministic wiggle
+            // so RSS > 0 and σ̂² is strictly positive.
+            y[i] = 0.7 + 1.3 * xi + 0.05 * (3.0 * xi).sin();
+        }
+        let w = Array1::<f64>::ones(n);
+        let offset = Array1::<f64>::zeros(n);
+        let penalty = BlockwisePenalty::new(0..2, Array2::<f64>::zeros((2, 2)));
+
+        let result = optimize_external_design(
+            y.view(),
+            w.view(),
+            design,
+            offset.view(),
+            vec![penalty],
+            &gaussian_opts(),
+        )
+        .expect("Gaussian solve on clean near-linear data must converge");
+
+        assert!(
+            result.log_likelihood.is_finite(),
+            "reported Gaussian log-likelihood must be finite (the profiled σ̂² \
+             must be resolved into the reported scale), got {}",
+            result.log_likelihood
+        );
+        assert_eq!(
+            result.log_likelihood_normalization,
+            LogLikelihoodNormalization::Full,
+            "Gaussian reporting field must be tagged fully-normalized"
+        );
     }
 }

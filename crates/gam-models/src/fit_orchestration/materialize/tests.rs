@@ -813,6 +813,43 @@ fn materialize_standard_honors_adaptive_regularization_disable() {
 }
 
 #[test]
+fn issue_2094_sas_and_beta_logistic_links_enable_optimize_sas_on_formula_path() {
+    // #2094: the learnable `sas` (sinh-arcsinh) and `beta-logistic` links carry
+    // a shape pair `(epsilon, log_delta)` that the standard fit only estimates
+    // when `optimize_sas=true` AND a `sas_link` spec is threaded into the fit
+    // options. Before the fix, `materialize_standard` left both at their
+    // defaults (`sas_link=None`, `optimize_sas=false`), so the outer optimizer
+    // set `sas_dim=0`, the shape stayed frozen at its init, and `link(type=sas)`
+    // silently collapsed to plain probit / `link(type=beta-logistic)` to plain
+    // logit on the formula/Python path — while the `gam` CLI fit them correctly.
+    // This mirrors the CLI's `sas_linkspec` / `optimize_sas` wiring in
+    // run_fit.rs and is the SAS analogue of the mixture-link freeze fixed in
+    // #1598. This test fails before the fix (both assertions false) and passes
+    // after.
+    let data = workflow_test_dataset();
+    for (formula, label) in [
+        ("event ~ bmi + link(type=sas)", "sas"),
+        ("event ~ bmi + link(type=beta-logistic)", "beta-logistic"),
+    ] {
+        let materialized = materialize(formula, &data, &FitConfig::default())
+            .unwrap_or_else(|e| panic!("{label}: materialize failed: {e}"));
+        let FitRequest::Standard(request) = materialized.request else {
+            panic!("{label}: expected a standard fit request");
+        };
+        assert!(
+            request.options.sas_link.is_some(),
+            "{label}: sas_link must be populated so the standard path can rebuild \
+             and fit the learnable link state (#2094)"
+        );
+        assert!(
+            request.options.optimize_sas,
+            "{label}: optimize_sas must be true or the SAS shape stays frozen at \
+             its init and the link degrades to its plain base link (#2094)"
+        );
+    }
+}
+
+#[test]
 fn materialize_standard_duchon_defaults_to_pure_scale_free_basis() {
     let data = duchon_workflow_dataset();
     let materialized = materialize(

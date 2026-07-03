@@ -226,12 +226,43 @@ pub(crate) fn materialize_standard<'a>(
     // (run_fit.rs); mirror that so the formula/Python path actually fits the
     // mixture rather than silently degrading to plain logit (#1598).
     let optimize_mixture = mixture_link.is_some();
+    // The learnable `sas` (sinh-arcsinh) and `beta-logistic` links carry a
+    // shape pair `(epsilon, log_delta)` that is only fit when `optimize_sas` is
+    // set: that flag tells the outer optimizer to append the SAS coords. With
+    // `optimize_sas=false` the solver sets `sas_dim=0` and freezes the shape at
+    // its init, where `sas` == probit and `beta-logistic` == logit, so the
+    // learnable link silently degrades to its plain base link. `resolve_family`
+    // embeds only the canonical zero-seed placeholder into the family; the
+    // effective link is rebuilt from `FitOptions.sas_link`, so the
+    // formula/Python path MUST populate that field and enable optimization,
+    // exactly as the `gam` CLI does (run_fit.rs `sas_linkspec` / `optimize_sas`).
+    // Leaving them at their defaults made the fit a no-op (#2094, the SAS
+    // analogue of the mixture-link freeze fixed in #1598).
+    let sas_link = link_choice.as_ref().and_then(|choice| {
+        if choice.mixture_components.is_none()
+            && matches!(choice.link, LinkFunction::Sas | LinkFunction::BetaLogistic)
+        {
+            // The formula DSL carries no `sas_init`/`beta_logistic_init`
+            // override, so the canonical zero seed is used — identical to what
+            // `resolve_family` embeds and to the CLI's default when no explicit
+            // init is supplied.
+            Some(SasLinkSpec {
+                initial_epsilon: 0.0,
+                initial_log_delta: 0.0,
+            })
+        } else {
+            None
+        }
+    });
+    let optimize_sas = sas_link.is_some();
     let options = crate::fit_orchestration::canonical_standard_fit_options(
         config,
         crate::fit_orchestration::StandardFitOptionsInputs {
             latent_cloglog,
             mixture_link,
             optimize_mixture,
+            sas_link,
+            optimize_sas,
             firth_bias_reduction: config.firth,
             adaptive_regularization: standard_adaptive_regularization_options(config),
             persist_warm_start_disk: config.persist_warm_start_disk,
