@@ -130,7 +130,7 @@ fn two_block_joint_fit_reconstructs_activation_and_behavior() {
     term.run_joint_fit_arrow_schur(augmented.view(), &mut rho, None, 48, 1.0, 1e-6, 1e-6)
         .expect("two-block joint fit must complete");
 
-    let fitted = term.try_fitted().unwrap();
+    let fitted = term.try_fitted_for_rho(&rho).unwrap();
     // Compare each block on the SAME (scaled) augmented target the fit saw.
     let ev_act = block_ev(&augmented, &fitted, 0, p_x);
     let ev_beh = block_ev(&augmented, &fitted, p_x, p_tot);
