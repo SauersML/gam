@@ -7492,11 +7492,14 @@ fn model_partial_dependence_impl(
     let model = load_model_impl(model_bytes)?;
     let fit = fit_result_from_saved_model_for_prediction(&model)?;
     let beta = &fit.beta;
-    let cov = fit.beta_covariance().ok_or_else(|| {
-        "model does not contain coefficient covariance; refit with \
-         covariance-saving inference enabled"
-            .to_string()
-    })?;
+    let cov = fit
+        .beta_covariance_corrected()
+        .or_else(|| fit.beta_covariance())
+        .ok_or_else(|| {
+            "model does not contain coefficient covariance; refit with \
+             covariance-saving inference enabled"
+                .to_string()
+        })?;
     let blocks = term_blocks_for_model_impl(model_bytes)?;
     let (start, end) = blocks
         .iter()
