@@ -159,6 +159,31 @@ def _fit_arm(
     return rec
 
 
+def _resolve_fit_space(
+    fit_space: str, p: int, tier0_mean: Any, tier0_scale: Any
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return ``(mean, scale_eff)`` (each length-p) for the requested fit space.
+
+    * ``"raw"``         — mean=0, scale=1: fit the activations as-is.
+    * ``"mean_center"`` — subtract the tier0 mean, scale=1. The residual ``e`` is
+      mean-invariant, so the raw output-Fisher factors ``U`` stay valid unchanged.
+    * ``"zscore"``      — full tier0 z-score. The residual now lives in normalized
+      coords, so the GLS metric must be rescaled ``U'[i,k] = scale[i]·U[i,k]``
+      (since ``∂logits/∂x_norm = ∂logits/∂x_raw · scale``); the caller does that.
+    """
+    mean = np.zeros(p) if tier0_mean is None else np.asarray(tier0_mean, float).reshape(-1)
+    scale = np.ones(p) if tier0_scale is None else np.asarray(tier0_scale, float).reshape(-1)
+    if fit_space == "raw":
+        return np.zeros(p), np.ones(p)
+    if fit_space == "mean_center":
+        return mean, np.ones(p)
+    if fit_space == "zscore":
+        if not np.all(scale > 0):
+            raise ValueError("zscore fit_space needs a strictly-positive tier0_scale")
+        return mean, scale
+    raise ValueError(f"fit_space must be raw/mean_center/zscore; got {fit_space!r}")
+
+
 def run_ab(
     x: np.ndarray,
     shard: Any,
@@ -169,9 +194,20 @@ def run_ab(
     n_iter: int = 40,
     random_state: int = 0,
     timeout_s: float = 900.0,
+    fit_space: str = "raw",
+    tier0_mean: Any = None,
+    tier0_scale: Any = None,
 ) -> dict[str, Any]:
     """Run both arms and score them in BOTH currencies. ``shard`` is a HarvestShard
-    / dict / npz-loaded object carrying ``behavioral_fisher`` ``U``."""
+    / dict / npz-loaded object carrying ``behavioral_fisher`` ``U``.
+
+    ``fit_space`` selects the coordinate the arms are FIT in (``raw`` /
+    ``mean_center`` / ``zscore``); the metric ``U`` is rescaled to that space so
+    the GLS loss stays the true output-Fisher, and reconstructions are inverted
+    back to RAW space for the TORCH patch-in. Scoring (euclidean_ev,
+    loss_recovered_nats) is always done in RAW space with the RAW ``U`` so the
+    two arms are compared in the model's own currency regardless of fit space.
+    """
     from gamfit.torch.harvest import load_harvest_shard
 
     if isinstance(shard, str):
@@ -181,22 +217,33 @@ def run_ab(
     if x.shape != (n, p):
         raise ValueError(f"acts {x.shape} disagree with shard U {(n, p, s)}")
 
+    mean, scale_eff = _resolve_fit_space(fit_space, p, tier0_mean, tier0_scale)
+    x_fit = np.ascontiguousarray((x - mean[None, :]) / scale_eff[None, :])
+    # Rescale U into the fit space so the GLS metric is the true output-Fisher there.
+    u_fit = np.ascontiguousarray(U * scale_eff[None, :, None])
+    gls_shard = {"U": u_fit, "provenance": "behavioral_fisher"}
+
+    def _to_raw(xhat_fit: np.ndarray) -> np.ndarray:
+        return np.ascontiguousarray(xhat_fit * scale_eff[None, :] + mean[None, :])
+
     arms: dict[str, Any] = {}
     arms["iid"] = _fit_arm(
-        x, fisher_factors=None, topology=topology, assignment=assignment,
+        x_fit, fisher_factors=None, topology=topology, assignment=assignment,
         max_births=max_births, n_iter=n_iter, random_state=random_state, timeout_s=timeout_s,
     )
     arms["gls"] = _fit_arm(
-        x, fisher_factors=shard, topology=topology, assignment=assignment,
+        x_fit, fisher_factors=gls_shard, topology=topology, assignment=assignment,
         max_births=max_births, n_iter=n_iter, random_state=random_state, timeout_s=timeout_s,
     )
 
-    table: dict[str, Any] = {"n": n, "p": p, "probes_s": s, "arms": {}}
+    table: dict[str, Any] = {"n": n, "p": p, "probes_s": s, "fit_space": fit_space, "arms": {}}
+    reconstructions: dict[str, np.ndarray] = {}
     for name, rec in arms.items():
         if not rec["ok"]:
             table["arms"][name] = {"status": rec["error"], "seconds": rec["seconds"]}
             continue
-        xhat = rec["xhat"]
+        xhat = _to_raw(rec["xhat"])  # back to RAW space for scoring + patch-in
+        reconstructions[name] = xhat
         table["arms"][name] = {
             "status": "ok",
             "seconds": round(rec["seconds"], 1),
@@ -205,10 +252,13 @@ def run_ab(
             "loss_recovered_nats": loss_recovered_nats(U, x, xhat),
             "terminal_joint_reml": rec["terminal_joint_reml"],
         }
-    # Persist the reconstructions for the TORCH fidelity harness (KL_patched).
-    table["_reconstructions"] = {
-        name: arms[name]["xhat"] for name in arms if arms[name].get("ok")
-    }
+    # RAW-space reconstructions + the raw ablate mean for the TORCH fidelity harness
+    # (CallableReconstructor(lambda a: xhat_raw, ablate_mean=tier0_mean)).
+    table["_reconstructions"] = reconstructions
+    table["_ablate_mean_raw"] = (
+        np.asarray(tier0_mean, float).reshape(-1) if tier0_mean is not None
+        else x.mean(axis=0)
+    )
     return table
 
 
@@ -249,23 +299,35 @@ def main() -> int:
     ap.add_argument("--n-iter", type=int, default=40)
     ap.add_argument("--random-state", type=int, default=0)
     ap.add_argument("--timeout-s", type=float, default=900.0)
+    ap.add_argument("--fit-space", default="raw", choices=("raw", "mean_center", "zscore"),
+                    help="coordinate the arms are fit in; U is rescaled to match")
+    ap.add_argument("--tier0", default=None,
+                    help="tier-0 npz with 'mean' (+ 'scale' for zscore) for the fit space + ablate")
     ap.add_argument("--out", default=None, help="write reconstructions + table json/npz here (prefix)")
     args = ap.parse_args()
+
+    tier0_mean = tier0_scale = None
+    if args.tier0:
+        t0 = np.load(args.tier0)
+        tier0_mean = t0["mean"] if "mean" in t0 else None
+        tier0_scale = t0["scale"] if "scale" in t0 else None
 
     x = np.ascontiguousarray(np.load(args.acts), dtype=np.float64)
     table = run_ab(
         x, args.shard, topology=args.topology, assignment=args.assignment,
         max_births=args.max_births, n_iter=args.n_iter, random_state=args.random_state,
-        timeout_s=args.timeout_s,
+        timeout_s=args.timeout_s, fit_space=args.fit_space,
+        tier0_mean=tier0_mean, tier0_scale=tier0_scale,
     )
     recs = table.pop("_reconstructions")
+    ablate = table.pop("_ablate_mean_raw")
     print(_format_table(table))
     if args.out:
         with open(f"{args.out}.table.json", "w") as fh:
             json.dump(table, fh, indent=2, default=float)
-        np.savez(f"{args.out}.recon.npz", **recs)
+        np.savez(f"{args.out}.recon.npz", ablate_mean_raw=ablate, **recs)
         print(f"\nwrote {args.out}.table.json and {args.out}.recon.npz "
-              f"(reconstructions for the TORCH KL_patched harness)")
+              f"(RAW-space reconstructions + ablate_mean_raw for the TORCH KL_patched harness)")
     return 0
 
 
