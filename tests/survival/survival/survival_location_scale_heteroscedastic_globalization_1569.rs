@@ -132,12 +132,7 @@ fn fit_heteroscedastic(
         v.iter().map(|&z| z - m).collect()
     };
     let rmse = |a: &[f64], b: &[f64]| -> f64 {
-        (a.iter()
-            .zip(b)
-            .map(|(p, q)| (p - q) * (p - q))
-            .sum::<f64>()
-            / a.len() as f64)
-            .sqrt()
+        (a.iter().zip(b).map(|(p, q)| (p - q) * (p - q)).sum::<f64>() / a.len() as f64).sqrt()
     };
 
     let (rmse_loc, rmse_logsig) = if unified.beta_threshold().iter().all(|v| v.is_finite())
@@ -184,8 +179,13 @@ fn survival_location_scale_heteroscedastic_sweep_diagnostic() {
             "[#1569 sweep] n={n} loc_amp={la} scale_amp={sa} k_loc={kl} k_scale={ks} seed={seed} \
              censor={:.2} elapsed={secs:.1}s -> converged={} outer_iters={} inner_cycles={} \
              grad_norm={:?} rmse_loc={:.4} rmse_logsig={:.4}",
-            r.censor_frac, r.converged, r.outer_iterations, r.inner_cycles,
-            r.grad_norm, r.rmse_loc, r.rmse_logsig,
+            r.censor_frac,
+            r.converged,
+            r.outer_iterations,
+            r.inner_cycles,
+            r.grad_norm,
+            r.rmse_loc,
+            r.rmse_logsig,
         );
     }
 }
@@ -204,9 +204,18 @@ fn survival_location_scale_heteroscedastic_globalization_converges_1569() {
     assert!(
         r.rmse_loc.is_finite() && r.rmse_logsig.is_finite(),
         "#1569: non-finite truth-recovery RMSE (loc={}, logsig={})",
-        r.rmse_loc, r.rmse_logsig,
+        r.rmse_loc,
+        r.rmse_logsig,
     );
     // Provisional truth-recovery bars (re-measure + tighten when buildable).
-    assert!(r.rmse_loc <= 0.20, "#1569: AFT location recovery too coarse: rmse_loc={:.4}", r.rmse_loc);
-    assert!(r.rmse_logsig <= 0.40, "#1569: log-σ recovery too coarse: rmse_logsig={:.4}", r.rmse_logsig);
+    assert!(
+        r.rmse_loc <= 0.20,
+        "#1569: AFT location recovery too coarse: rmse_loc={:.4}",
+        r.rmse_loc
+    );
+    assert!(
+        r.rmse_logsig <= 0.40,
+        "#1569: log-σ recovery too coarse: rmse_logsig={:.4}",
+        r.rmse_logsig
+    );
 }

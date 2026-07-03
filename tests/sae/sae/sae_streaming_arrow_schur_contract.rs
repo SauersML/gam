@@ -32,10 +32,10 @@
 
 use ndarray::{Array1, Array2, Array3, s};
 
-use gam::solver::gpu_kernels::arrow_schur::{ArrowSchurGpuFailure, solve_reduced_beta_pcg};
 use gam::solver::arrow_schur::{
     ArrowSchurSystem, ArrowSolveOptions, StreamingArrowSchur, solve_streaming_reduced_beta,
 };
+use gam::solver::gpu_kernels::arrow_schur::{ArrowSchurGpuFailure, solve_reduced_beta_pcg};
 use gam::terms::{
     AssignmentMode, SaeAssignment, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho,
     SaeManifoldTerm,

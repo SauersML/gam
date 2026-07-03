@@ -141,7 +141,8 @@ fn assert_monotone_or_error(outcome: Result<(FitResult, usize, usize), String>) 
                 }
             }
             assert_eq!(
-                n_drops, 0,
+                n_drops,
+                0,
                 "SILENT INFEASIBLE MODEL: poisson monotone_increasing fit returned a Model \
                  whose predictions DECREASE at {n_drops}/{} grid steps (worst drop {worst_drop:.3e}, \
                  range {range:.3e}). The contract requires either non-decreasing predictions or a \

@@ -744,7 +744,12 @@ fn amortized_predictor_is_the_ift_first_order_map() {
 /// output space: `m(t) = cos(2πt)·e_{axis0} + sin(2πt)·e_{axis1}`. Two such atoms
 /// in ORTHOGONAL planes give the candidate index distinct decoder frames, so a
 /// target lying in one plane routes to that atom and not the other.
-fn planted_circle_atom_in_plane(axis0: usize, axis1: usize, ambient: usize, n_obs: usize) -> SaeManifoldAtom {
+fn planted_circle_atom_in_plane(
+    axis0: usize,
+    axis1: usize,
+    ambient: usize,
+    n_obs: usize,
+) -> SaeManifoldAtom {
     let evaluator = PeriodicHarmonicEvaluator::new(M).expect("evaluator");
     let coords = Array2::<f64>::zeros((n_obs.max(1), 1));
     let (phi, jet) = evaluator.evaluate(coords.view()).expect("evaluate");
@@ -815,10 +820,23 @@ fn fast_routed_forward_groups_atoms_correctly() {
     let amplitudes = Array1::<f64>::ones(n);
 
     let (routed_coords, routed_valid) = atlas
-        .amortized_encode_with_index_fast(&atoms, &index, &sketch, targets.view(), amplitudes.view(), 1)
+        .amortized_encode_with_index_fast(
+            &atoms,
+            &index,
+            &sketch,
+            targets.view(),
+            amplitudes.view(),
+            1,
+        )
         .expect("fast routed encode");
     let (routed_recon, recon_valid) = atlas
-        .amortized_reconstruct_with_index_fast(&atoms, &index, &sketch, targets.view(), amplitudes.view())
+        .amortized_reconstruct_with_index_fast(
+            &atoms,
+            &index,
+            &sketch,
+            targets.view(),
+            amplitudes.view(),
+        )
         .expect("fast routed reconstruct");
 
     // Reference: each plane's rows batched directly against the atom they SHOULD
@@ -846,7 +864,10 @@ fn fast_routed_forward_groups_atoms_correctly() {
             routed_valid[i], ref0_valid[i],
             "plane-0 row {i}: routed valid-mask must match the atom-0 batch (routed to atom 0)"
         );
-        assert_eq!(recon_valid[i], routed_valid[i], "encode/recon valid-mask agree, row {i}");
+        assert_eq!(
+            recon_valid[i], routed_valid[i],
+            "encode/recon valid-mask agree, row {i}"
+        );
         if routed_valid[i] {
             valid_count += 1;
             assert!(

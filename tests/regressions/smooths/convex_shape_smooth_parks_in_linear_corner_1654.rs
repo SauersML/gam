@@ -107,8 +107,8 @@ fn convex_shape_smooth_does_not_park_in_linear_corner_at_collapsing_k() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ s(x, k=20, shape=convex)", &ds, &cfg)
-        .expect("gam convex smooth fit");
+    let result =
+        fit_from_formula("y ~ s(x, k=20, shape=convex)", &ds, &cfg).expect("gam convex smooth fit");
     let FitResult::Standard(fit) = result else {
         panic!("Gaussian convex smooth is a scalar family => expected FitResult::Standard");
     };
@@ -156,9 +156,7 @@ fn convex_shape_smooth_does_not_park_in_linear_corner_at_collapsing_k() {
         -convexity_eps
     );
 
-    eprintln!(
-        "[#1654] seed=7 k=20 sigma={sigma} convex fit: rmse={err:.4} curv_rms={curv_rms:.4}"
-    );
+    eprintln!("[#1654] seed=7 k=20 sigma={sigma} convex fit: rmse={err:.4} curv_rms={curv_rms:.4}");
 
     // PRIMARY: not the linear corner. Pre-fix this fit collapses to
     // rmse ≈ 0.31, curv_rms ≈ 0.15 (a straight line). Post-fix it recovers the

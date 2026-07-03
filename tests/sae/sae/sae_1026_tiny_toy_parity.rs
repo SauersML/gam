@@ -212,7 +212,11 @@ fn build_cold_term(arm: Arm, z: &Array2<f64>, frac: &[f64]) -> SaeManifoldTerm {
 /// Fit `arm` through the production outer engine and return the fitted term.
 fn run_production_fit(arm: Arm, z: &Array2<f64>, frac: &[f64], label: &str) -> SaeManifoldTerm {
     let term = build_cold_term(arm, z, frac);
-    let init_rho = SaeManifoldRho::new(SPARSITY.ln(), SMOOTHNESS.ln(), vec![Array1::<f64>::zeros(0)]);
+    let init_rho = SaeManifoldRho::new(
+        SPARSITY.ln(),
+        SMOOTHNESS.ln(),
+        vec![Array1::<f64>::zeros(0)],
+    );
     let init_flat = init_rho.to_flat();
     let n_params = init_flat.len();
     let mut objective = SaeManifoldOuterObjective::new(
@@ -277,7 +281,10 @@ fn sae_1026_tiny_toy_curved_beats_linear_at_k1_on_unit_circle() {
     println!("reconstruction EV (1 − SSR/SST):");
     println!("  CURVED (1 periodic atom, M=3)   EV = {ev_curved:.6}");
     println!("  LINEAR (1 linear  atom, M=2)    EV = {ev_linear:.6}");
-    println!("  curved − linear margin          = {:.6}", ev_curved - ev_linear);
+    println!(
+        "  curved − linear margin          = {:.6}",
+        ev_curved - ev_linear
+    );
 
     // (1) The curved atom reconstructs the known circle to high absolute EV —
     //     the same 0.85 bar the recovery pins hold (2% noise caps EV near 1; one

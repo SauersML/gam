@@ -60,16 +60,32 @@ fn fixture_records() -> (Vec<String>, Vec<Vec<String>>) {
         .collect();
     let rows: Vec<Vec<String>> = reader
         .records()
-        .map(|r| r.expect("fixture row").iter().map(|s| s.to_string()).collect())
+        .map(|r| {
+            r.expect("fixture row")
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        })
         .collect();
     (headers, rows)
 }
 
 /// Build a small predict frame from the first `k` subjects with a large `exit`
 /// placeholder so the surface frame is never the binding constraint on the grid.
-fn predict_dataset(headers: &[String], rows: &[Vec<String>], k: usize, big_exit: f64) -> EncodedDataset {
-    let exit_idx = headers.iter().position(|h| h == "exit").expect("exit column");
-    let event_idx = headers.iter().position(|h| h == "event").expect("event column");
+fn predict_dataset(
+    headers: &[String],
+    rows: &[Vec<String>],
+    k: usize,
+    big_exit: f64,
+) -> EncodedDataset {
+    let exit_idx = headers
+        .iter()
+        .position(|h| h == "exit")
+        .expect("exit column");
+    let event_idx = headers
+        .iter()
+        .position(|h| h == "event")
+        .expect("event column");
     let records: Vec<StringRecord> = rows
         .iter()
         .take(k)
@@ -86,7 +102,10 @@ fn predict_dataset(headers: &[String], rows: &[Vec<String>], k: usize, big_exit:
 #[test]
 fn royston_parmar_saved_predict_at_grid_top_does_not_fail() {
     let (headers, rows) = fixture_records();
-    let exit_idx = headers.iter().position(|h| h == "exit").expect("exit column");
+    let exit_idx = headers
+        .iter()
+        .position(|h| h == "exit")
+        .expect("exit column");
     let max_exit = rows
         .iter()
         .map(|row| row[exit_idx].parse::<f64>().expect("numeric exit"))
@@ -142,8 +161,16 @@ fn royston_parmar_saved_predict_at_grid_top_does_not_fail() {
     let result = predict_survival(request)
         .expect("RP saved predict must succeed at the default grid top (#1564)");
 
-    assert_eq!(result.survival.nrows(), n, "one survival row per predict row");
-    assert_eq!(result.survival.ncols(), grid.len(), "surface covers every grid time");
+    assert_eq!(
+        result.survival.nrows(),
+        n,
+        "one survival row per predict row"
+    );
+    assert_eq!(
+        result.survival.ncols(),
+        grid.len(),
+        "surface covers every grid time"
+    );
 
     let mut zero_hazard_nodes = 0usize;
     for r in 0..n {

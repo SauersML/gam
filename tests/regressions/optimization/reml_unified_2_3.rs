@@ -90,7 +90,10 @@ fn build_gaussian_problem(seed: u64) -> GaussianProblem {
 
     let s_block = second_difference_penalty(block_k);
     let start = 1usize;
-    let s_list = vec![BlockwisePenalty::new(start..(start + block_k), s_block.clone())];
+    let s_list = vec![BlockwisePenalty::new(
+        start..(start + block_k),
+        s_block.clone(),
+    )];
 
     GaussianProblem {
         x,
@@ -294,9 +297,7 @@ fn bug_projected_kkt_residual_identity_not_satisfied() {
     // bounded by the same tolerance.
     let (_s_block, start) = &prob.block;
     let k = root.nrows();
-    let penalized_inf = (0..k)
-        .map(|j| kkt[start + j].abs())
-        .fold(0.0_f64, f64::max);
+    let penalized_inf = (0..k).map(|j| kkt[start + j].abs()).fold(0.0_f64, f64::max);
     assert!(
         penalized_inf / ref_scale <= 1e-6,
         "KKT residual restricted to the penalized (active) block must vanish: {penalized_inf:.3e}"
