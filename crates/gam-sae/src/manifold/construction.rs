@@ -63,6 +63,7 @@ impl SaeManifoldTerm {
             row_metric: None,
             // #2022/#2023 — per-fit opt-ins, default false (bit-for-bit historical).
             quotient_scale: false,
+            cone_atom_recovery: false,
             data_row_reseed: false,
             // SAC — the collapse-guard stack is armed by default; the stagewise
             // K=1 lane disarms it explicitly (see the field docs on term.rs).
@@ -804,6 +805,19 @@ impl SaeManifoldTerm {
     /// #2022 — read the per-fit SCALE-gauge quotient opt-in.
     pub fn quotient_scale(&self) -> bool {
         self.quotient_scale
+    }
+
+    /// #1939 — set the per-fit cone-atom RECOVERY-retraction opt-in (typed kwarg,
+    /// no env lever). Default false ⇒ historical path bit-for-bit. Distinct from
+    /// `quotient_scale`: this engages ONLY the stable breach-gated boundary
+    /// retraction (never the #2022 per-Newton fold), so it cannot detonate.
+    pub fn set_cone_atom_recovery(&mut self, enabled: bool) {
+        self.cone_atom_recovery = enabled;
+    }
+
+    /// #1939 — read the per-fit cone-atom RECOVERY-retraction opt-in.
+    pub fn cone_atom_recovery(&self) -> bool {
+        self.cone_atom_recovery
     }
 
     /// #2023 — set the per-fit dead-atom data-row reseed opt-in (typed kwarg, no

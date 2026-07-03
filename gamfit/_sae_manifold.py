@@ -2924,6 +2924,7 @@ def sae_manifold_fit_stagewise(
     atom_topology: str = "circle",
     assignment: str = "ibp_map",
     structured_whitening: bool = True,
+    cone_atom_recovery: bool = False,
     min_effect_ev: float = 0.0,
     max_births: int = 24,
     max_backfit_sweeps: int = 4,
@@ -3138,6 +3139,7 @@ def sae_manifold_fit_stagewise(
         min_effect_ev=float(min_effect_ev),
         max_factor_rank=int(max_factor_rank),
         structured_whitening=bool(structured_whitening),
+        cone_atom_recovery=bool(cone_atom_recovery),
         row_loss_weights=weights_arr,
         progress_callback=progress_callback,
     )

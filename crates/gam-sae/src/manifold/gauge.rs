@@ -40,7 +40,8 @@
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
-use super::{SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldTerm};
+use super::{SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, Side};
+use gam_linalg::faer_ndarray::FaerCholesky;
 
 /// Frobenius norm `‖B‖_F = (Σ_{μ,j} B_{μj}²)^{1/2}` of a decoder block.
 pub fn decoder_frobenius_norm(decoder: ArrayView2<'_, f64>) -> f64 {
@@ -459,6 +460,280 @@ impl SaeManifoldTerm {
             }
         }
         retracted
+    }
+
+    /// #1939 Design B — SCOPED cone-atom retraction: unit-Frobenius-retract ONLY
+    /// the atoms whose decoder has COLLAPSED relative to its dictionary peers,
+    /// leaving healthy atoms' scale in `B` untouched. Returns the number retracted.
+    ///
+    /// The unconditional [`Self::retract_decoder_gauge_in_loop`] forces `‖B_k‖≡1`
+    /// on EVERY atom every accepted iterate, which fights every subsystem that
+    /// assumes scale lives in `B` (the isometry `‖B‖⁴` pullback #673/#795, the
+    /// `‖B‖`-keyed norm guards, the β-Newton magnitude step). On a HEALTHY fit that
+    /// destabilizes the trajectory — empirically it DETONATES a healthy K=2 disjoint
+    /// fit (EV → −1e128, a runaway β step after the forced unit retraction). So
+    /// retracting healthy atoms is the harm; retracting a genuinely-collapsed atom is
+    /// the cure (it re-homes the vanished decoder onto the unit sphere so the paired
+    /// amplitude solve can restore its magnitude — the born-atom `0.7255→0.0023`
+    /// recovery).
+    ///
+    /// The collapse trigger REUSES the existing decoder-norm guard threshold
+    /// (`SAE_ATOM_DECODER_NORM_COLLAPSE_RATIO · median‖B‖`, assignment.rs — an
+    /// existing DERIVED constant, no new magic number) so an atom is retracted iff
+    /// its decoder is below the same bar `enforce_decoder_norm_guard` calls a breach.
+    /// Two floors keep it safe: (i) `k < 2` returns 0 — a lone atom has no peer to be
+    /// "collapsed" relative to, and a K=1 low-amplitude decoder is HEALTHY (its scale
+    /// legitimately lives in `B`), so it is never retracted (this is what makes the
+    /// K=1 low-amp crash structurally impossible); (ii) an atom whose `‖B‖` is below
+    /// a machine floor is skipped — it carries no direction to normalize (`B/‖B‖` is
+    /// undefined), it needs reseeding not retraction (seed-fix's lane).
+    pub fn retract_collapsed_decoders_in_loop(&mut self) -> usize {
+        let k = self.k_atoms();
+        // A single atom has no dictionary peer to be collapsed *relative to*, and a
+        // K=1 low-amplitude decoder is healthy — never retract it (mirrors the
+        // K<2 early-out in `enforce_decoder_norm_guard`).
+        if k < 2 {
+            return 0;
+        }
+        let mut norms = vec![0.0_f64; k];
+        for (idx, atom) in self.atoms.iter().enumerate() {
+            norms[idx] = atom
+                .decoder_coefficients
+                .iter()
+                .map(|v| v * v)
+                .sum::<f64>()
+                .sqrt();
+        }
+        // Median decoder norm = the robust dictionary scale, identical to the guard.
+        let mut sorted = norms.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median = if k % 2 == 1 {
+            sorted[k / 2]
+        } else {
+            0.5 * (sorted[k / 2 - 1] + sorted[k / 2])
+        };
+        if !(median > 0.0) {
+            // Every decoder ≈ 0 (total co-collapse): no healthy scale to key on and
+            // no direction to retract onto — leave it to the reseed/deflation arm.
+            return 0;
+        }
+        let breach_floor = crate::assignment::SAE_ATOM_DECODER_NORM_COLLAPSE_RATIO * median;
+        // Below this a decoder carries no usable direction to normalize; retracting
+        // `B/‖B‖` would amplify pure round-off. Machine-scaled to the dictionary.
+        let direction_floor = 1.0e-12 * median;
+        let mut retracted = 0usize;
+        // A decoder BELOW the direction floor is collapsed but UN-RETRACTABLE (no
+        // direction to normalize) — it needs a fresh-direction reseed, not this
+        // retraction. Count it so a null wheel A/B is self-diagnosing (fired-but-
+        // didn't-help vs never-fired-because-literal-zero — see the trace below).
+        let mut unretractable_zero = 0usize;
+        for idx in 0..k {
+            if norms[idx] < breach_floor {
+                if norms[idx] > direction_floor {
+                    if retract_decoder_unit_frobenius(&mut self.atoms[idx]) {
+                        retracted += 1;
+                    }
+                } else {
+                    unretractable_zero += 1;
+                }
+            }
+        }
+        // #1939 wheel diagnostic (opt-in path only — this runs solely under the
+        // `cone_atom_recovery` flag). Emit the RAW UNROUNDED per-atom norms, the
+        // breach/direction thresholds, and the fired / literal-zero counts, so the
+        // near-zero-vs-literal-zero question is answered inside the A/B run: a
+        // collapse at `1e-3` is retracted (`retracted>0`), a collapse at `1e-16` is
+        // an `unretractable_zero` (Design B correctly no-ops → needs a backfit
+        // reseed, not this). Under a healthy dictionary nothing breaches and this is
+        // a bit-for-bit no-op with a benign one-line trace.
+        let norms_fmt: Vec<String> = norms.iter().map(|v| format!("{v:.6e}")).collect();
+        log::warn!(
+            "[#1939 cone-atom] k={k} norms=[{}] median={median:.6e} \
+             breach_floor={breach_floor:.6e} direction_floor={direction_floor:.6e} \
+             retracted={retracted} unretractable_zero={unretractable_zero}",
+            norms_fmt.join(", ")
+        );
+        retracted
+    }
+
+    /// #1939 cone-atom amplitude solve — the OTHER half of the scale quotient.
+    /// After [`Self::retract_decoder_gauge_in_loop`] pins every `‖B_k‖_F = 1`, set
+    /// each atom's explicit log-amplitude `s_k` to the RECONSTRUCTION-OPTIMAL
+    /// magnitude by a small non-negative least squares over the amplitudes
+    /// `β = exp(s)`: with the frozen unit-`B` gated designs
+    /// `D_k = diag(a_{·k})·Φ_k·B_k` (the atom's reconstruction at unit amplitude),
+    /// `β` minimises the fit's OWN weighted reconstruction data-fit
+    /// `0.5·Σ_i w_i·‖W_i(target_i − Σ_k β_k D_{k,i})‖²` — the same per-row RowMetric
+    /// whitening `W_i` and #991 design-honesty weights `w_i` that
+    /// [`Self::data_fit_for_reconstruction`] / `loss_scaled` use — as a `K×K` SPD
+    /// weighted normal-equation solve. The weighting is DELEGATED to the fit's own
+    /// `whiten_residual_row`, never re-derived in raw space: a parallel raw-space
+    /// LSQ diverges from the fit's objective under a whitening / row-weighted
+    /// metric and regresses those fits (the −151 / whitened_k2 class). Under a
+    /// Euclidean, unweighted metric it is bit-for-bit the plain `‖target − Σβ_kD_k‖²`.
+    ///
+    /// This is load-bearing: the retraction alone only FOLDS `‖B‖` into `s`
+    /// (magnitude-neutral), so `s` then DRIFTS to collapse under the penalty's
+    /// residual shape gradient — the scale-collapse merely relocates from `B` to
+    /// `s`. Pinning `s` to the data optimum here is what keeps a low-signal atom's
+    /// amplitude at its true (small) value with a HEALTHY unit-norm decoder shape,
+    /// instead of co-vanishing (the K≥2 born-atom `0.7255→0.0023` decoder collapse
+    /// / the #1026 degenerate-amplitude thrash). Idempotent at a fixed point.
+    pub fn optimize_log_amplitudes_closed_form(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+    ) -> Result<(), String> {
+        let k = self.k_atoms();
+        if k == 0 {
+            return Ok(());
+        }
+        // Per-atom UNIT-amplitude contribution C_k, taken from the term's OWN
+        // `try_fitted_for_rho` reconstruction so it matches the fitted output the
+        // data-fit measures exactly (a naive `Φ_k·B_k·gate` mis-matches the gated
+        // `exp(s)·Φ·B` fitted output and sets a wrong amplitude). The fitted output
+        // is LINEAR in `exp(s_k)`
+        // (`fitted = Σ_k a_k·exp(s_k)·Φ_k·B_k`, and the gate `a_k` is amplitude-
+        // independent), so toggling atom `k` on (`s=0`) and the rest off
+        // (`exp(s)→0`) reads off `C_k`.
+        let saved: Vec<f64> = self.atoms.iter().map(|a| a.log_amplitude).collect();
+        // Monotone safeguard: the amplitude LSQ is optimal for the frozen unit-B
+        // designs, but the retraction↔amplitude↔Newton alternation is not
+        // guaranteed contractive, so the update can make the reconstruction WORSE.
+        // Bank the pre-solve data-fit and revert if the update degrades it
+        // (keep-best, exactly like the #1026 incumbent restore), so the cone-atom
+        // can never regress a fit that was recovering. CRITICAL (team-lead
+        // #1939): the banked objective is the fit's OWN weighted reconstruction
+        // data-fit `data_fit_for_reconstruction` (per-row RowMetric whitening +
+        // #991 design-honesty row weights), NOT a raw unweighted EV — a raw EV is
+        // a parallel re-derivation that diverges from what the fit minimises under
+        // a whitening / row-weighted metric and mis-fires the guard (the −151 /
+        // whitened_k2 regression class). The retraction is magnitude-neutral, so
+        // this reconstruction is the pre-retraction one. Lower data-fit is better.
+        let df_before = self
+            .try_fitted_for_rho(rho)
+            .and_then(|recon| self.data_fit_for_reconstruction(target, recon.view()))
+            .unwrap_or(f64::INFINITY);
+        const OFF: f64 = -700.0; // exp(-700) underflows to 0: contribution off.
+        let mut designs: Vec<Array2<f64>> = Vec::with_capacity(k);
+        let mut probe_err: Option<String> = None;
+        for kk in 0..k {
+            for (j, atom) in self.atoms.iter_mut().enumerate() {
+                atom.log_amplitude = if j == kk { 0.0 } else { OFF };
+            }
+            match self.try_fitted_for_rho(rho) {
+                Ok(c) => designs.push(c),
+                Err(e) => {
+                    probe_err = Some(e);
+                    break;
+                }
+            }
+        }
+        for (j, atom) in self.atoms.iter_mut().enumerate() {
+            atom.log_amplitude = saved[j];
+        }
+        if let Some(e) = probe_err {
+            return Err(format!(
+                "optimize_log_amplitudes_closed_form: per-atom probe fit failed: {e}"
+            ));
+        }
+        // Normal equations for min_β 0.5·Σ_i w_i·‖W_i(target_i − Σ_k β_k C_{k,i})‖²,
+        // β = exp(s) ≥ 0 — the WEIGHTED reconstruction VarPro profile, i.e. exactly
+        // the objective `data_fit_for_reconstruction` (hence `loss_scaled`)
+        // minimises. `W_i` is the per-row RowMetric whitening factor `U_iᵀ` and
+        // `w_i` the #991 design-honesty row weight. Rather than re-derive the
+        // weighting (the −151 raw-space mismatch class), whiten each per-atom
+        // design row and the target row through the fit's OWN `whiten_residual_row`
+        // (linear in its argument, `‖W_i r‖² = rᵀ W_i r`; identity/rank-p for a
+        // Euclidean metric, so this reduces to the plain Gram bit-for-bit when no
+        // metric/row-weight is installed) and scale by `√w_i`. The `0.5` and the
+        // constant `√w_i`/`W_i` factors are shared by Gram and RHS, so the profile
+        // minimiser is unchanged; forming them in the whitened rank space makes the
+        // Gram the true weighted `CᵀWC`.
+        let metric = self.row_metric();
+        let whitens = metric.is_some_and(|m| m.whitens_likelihood());
+        let row_loss_w = self.row_loss_weights();
+        let n = target.nrows();
+        let mut gram = Array2::<f64>::zeros((k, k));
+        let mut rhs = Array1::<f64>::zeros(k);
+        // Per-row whitened design/target rows reused across the K(K+1)/2 + K dot
+        // products (K small); rank-length under a factored metric, p under None.
+        let mut wdesign: Vec<Vec<f64>> = vec![Vec::new(); k];
+        for row in 0..n {
+            let sw = row_loss_w.map_or(1.0, |w| w[row]).sqrt();
+            let whiten_row = |r: ArrayView1<'_, f64>| -> Vec<f64> {
+                match metric {
+                    Some(m) if whitens => {
+                        let mut w = m.whiten_residual_row(row, r);
+                        for x in w.iter_mut() {
+                            *x *= sw;
+                        }
+                        w
+                    }
+                    _ => r.iter().map(|&x| x * sw).collect(),
+                }
+            };
+            let wtarget = whiten_row(target.row(row));
+            for kk in 0..k {
+                wdesign[kk] = whiten_row(designs[kk].row(row));
+            }
+            for j in 0..k {
+                rhs[j] += wtarget.iter().zip(wdesign[j].iter()).map(|(t, d)| t * d).sum::<f64>();
+                for kk in j..k {
+                    let g: f64 = wdesign[j]
+                        .iter()
+                        .zip(wdesign[kk].iter())
+                        .map(|(x, y)| x * y)
+                        .sum();
+                    gram[[j, kk]] += g;
+                    if kk != j {
+                        gram[[kk, j]] += g;
+                    }
+                }
+            }
+        }
+        // Numerical PD epsilon (NOT a penalty): keep the Cholesky well-posed when
+        // two atoms' contributions are near-collinear (co-collapse). The
+        // non-negativity clamp below — not this epsilon — is what bounds the
+        // amplitude on a rank-deficient design, so the epsilon can stay at
+        // machine scale and never biases a well-identified amplitude.
+        let scale = (0..k).map(|j| gram[[j, j]]).fold(0.0_f64, f64::max).max(1e-300);
+        for j in 0..k {
+            gram[[j, j]] += 1e-12 * scale;
+        }
+        let raw = gram
+            .cholesky(Side::Lower)
+            .map_err(|e| format!("optimize_log_amplitudes_closed_form: cholesky failed: {e}"))?
+            .solvevec(&rhs);
+        // Project to the non-negative orthant (guardrail: born atom takes only its
+        // residual-appropriate share; a negative optimum means the atom is off).
+        // For an already-non-negative optimum this is exact; where it clamps, the
+        // remaining atoms' share is re-absorbed on the next accepted-iterate solve.
+        const AMP_FLOOR: f64 = 1.0e-12;
+        for atom_idx in 0..k {
+            let b = raw[atom_idx];
+            self.atoms[atom_idx].log_amplitude = if b.is_finite() && b > AMP_FLOOR {
+                b.ln()
+            } else {
+                AMP_FLOOR.ln()
+            };
+        }
+        let df_after = self
+            .try_fitted_for_rho(rho)
+            .and_then(|recon| self.data_fit_for_reconstruction(target, recon.view()))
+            .unwrap_or(f64::INFINITY);
+        // Keep-best on the fit's own weighted data-fit (lower = better). Tolerance
+        // is relative to the incumbent so a benign round-off wobble is accepted but
+        // a genuine degradation reverts. `df_before` finite is guaranteed unless the
+        // entry reconstruction itself failed, in which case any finite `df_after`
+        // is an improvement over the +inf sentinel and is kept.
+        let tol = 1.0e-9 * df_before.abs().max(1.0);
+        if !(df_after <= df_before + tol) {
+            for (j, atom) in self.atoms.iter_mut().enumerate() {
+                atom.log_amplitude = saved[j];
+            }
+        }
+        Ok(())
     }
 }
 

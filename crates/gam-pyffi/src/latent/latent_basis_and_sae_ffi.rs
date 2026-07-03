@@ -2563,6 +2563,7 @@ fn stagewise_progress_py<'py>(
     min_effect_ev = 0.0,
     max_factor_rank = 4,
     structured_whitening = true,
+    cone_atom_recovery = false,
     row_loss_weights = None,
     progress_callback = None,
 ))]
@@ -2593,6 +2594,7 @@ fn sae_manifold_fit_stagewise<'py>(
     min_effect_ev: f64,
     max_factor_rank: usize,
     structured_whitening: bool,
+    cone_atom_recovery: bool,
     row_loss_weights: Option<PyReadonlyArray1<'py, f64>>,
     progress_callback: Option<PyObject>,
 ) -> PyResult<Py<PyDict>> {
@@ -2651,7 +2653,7 @@ fn sae_manifold_fit_stagewise<'py>(
             )));
         }
     };
-    let base_term = term_from_padded_blocks_with_mode(
+    let mut base_term = term_from_padded_blocks_with_mode(
         n_obs,
         p_out,
         &basis_kinds,
@@ -2667,6 +2669,13 @@ fn sae_manifold_fit_stagewise<'py>(
         &evaluators,
     )
     .map_err(py_value_error)?;
+    // #1939 — install the cone-atom RECOVERY opt-in before the fit consumes the
+    // term; it is carried across the stagewise clones (birth candidates / backfit)
+    // like the other per-fit config, so it reaches the K≥2 backfit where a born
+    // decoder can co-vanish. Default false ⇒ bit-for-bit historical path. Distinct
+    // from `quotient_scale` (which the stagewise entry never sets): this only arms
+    // the stable breach-gated boundary retraction, never the #2022 per-Newton fold.
+    base_term.set_cone_atom_recovery(cone_atom_recovery);
     // `0.0` sparsity/smoothness is the canonical "term disabled" baseline; floor
     // to a tiny positive sentinel before the log so log-ρ stays finite (mirrors
     // sae_manifold_fit; #184 sparsity, #2090 smoothness).
@@ -2764,6 +2773,9 @@ fn sae_manifold_fit_stagewise<'py>(
 
     let out = PyDict::new(py);
     out.set_item("k_final", k_final)?;
+    // #1939 — echo the resolved cone-atom RECOVERY opt-in so a harness can VERIFY
+    // the kwarg engaged (no silent no-op): the value the fit actually ran with.
+    out.set_item("cone_atom_recovery_used", cone_atom_recovery)?;
     out.set_item("births_accepted", report.births_accepted)?;
     out.set_item("births_rejected", report.births_rejected)?;
     out.set_item("stopped_reason", stopped_reason)?;

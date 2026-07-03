@@ -4220,6 +4220,26 @@ impl SaeManifoldTerm {
             // post-fit. SEAM: this boundary overlaps seed-audit STEP2's reseed/refit
             // hooks — reconcile ordering there (retraction after guards/reseed).
             self.retract_unit_speed_charts_in_loop()?;
+            // #1939 cone-atom RECOVERY retraction (Design B) — at this accepted
+            // OUTER-iterate boundary, retract ONLY the atoms whose decoder has
+            // COLLAPSED relative to its dictionary peers (breach vs peer median),
+            // folding the vanished ‖B_k‖ into s_k so the paired amplitude solve can
+            // re-home it — recovering a co-vanished born decoder (the K≥2
+            // 0.7255→0.0023 collapse) — while leaving HEALTHY atoms' scale in B.
+            //
+            // On its OWN flag `cone_atom_recovery`, DISTINCT from `quotient_scale`:
+            // the #2022 scale-quotient forces ‖B_k‖≡1 on EVERY atom (incl. the
+            // per-β-Newton fold at 3227) which DETONATES a healthy fit (EV→−1e128 on
+            // healthy K=2 — a pre-existing #2022 bug, filed separately). This does
+            // ONLY the breach-gated boundary retraction and never the per-Newton
+            // fold, so it is a strict no-op on a healthy dictionary (proven: healthy
+            // K=2 EV preserved, K=1 no-op) and cannot detonate. K<2 / all-zero-median
+            // are no-ops inside the helper. Run the paired amplitude solve solely when
+            // an atom was actually retracted, so a fit with no collapsed atom is a
+            // strict no-op (bit-for-bit the flag-off path).
+            if self.cone_atom_recovery && self.retract_collapsed_decoders_in_loop() > 0 {
+                self.optimize_log_amplitudes_closed_form(target, rho)?;
+            }
             // #972 / #977 T1 — U-block of the alternating block-coordinate ascent.
             // After the decoder `B` has been updated by the accepted (t, ΔC) step
             // (lifted through the OLD frames in `apply_newton_step`), re-polar each

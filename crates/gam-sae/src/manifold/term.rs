@@ -628,6 +628,16 @@ pub struct SaeManifoldTerm {
     /// via the typed `quotient_scale` kwarg — no env lever. Carried across clones
     /// like the other per-fit config.
     pub(crate) quotient_scale: bool,
+    /// #1939 — persisted per-fit opt-in for the cone-atom RECOVERY retraction
+    /// (default false ⇒ bit-for-bit historical path). When true, at each accepted
+    /// OUTER-iterate boundary any atom whose decoder has COLLAPSED relative to its
+    /// dictionary peers (`‖B_k‖ < ratio·median`) is retracted onto the unit sphere
+    /// and its amplitude re-solved, re-homing a co-vanished born decoder without
+    /// touching healthy atoms. Distinct from `quotient_scale`: this does ONLY the
+    /// stable breach-gated boundary retraction and NEVER the #2022 per-Newton fold
+    /// (fit_drivers.rs:3227), so it cannot detonate a healthy fit. Carried across
+    /// clones like the other per-fit config.
+    pub(crate) cone_atom_recovery: bool,
     /// #2023 — persisted per-fit opt-in for the dead-atom DATA-ROW reseed
     /// (default false). Set from the FFI via the typed `data_row_reseed` kwarg —
     /// no env lever. Carried across clones.
@@ -718,6 +728,7 @@ impl Clone for SaeManifoldTerm {
             // assignment mode so a cloned term keeps the same barrier override.
             separation_barrier_strength_override: self.separation_barrier_strength_override,
             quotient_scale: self.quotient_scale,
+            cone_atom_recovery: self.cone_atom_recovery,
             data_row_reseed: self.data_row_reseed,
             guards_enabled: self.guards_enabled,
             // Rung-2 behavioral identity is persisted configuration (like the
