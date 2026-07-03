@@ -563,6 +563,13 @@ fn build_atom_candidates(
     curved_num_params: usize,
     curved_phi: Option<ArrayView2<'_, f64>>,
     fitted_turning: Option<f64>,
+    // #16 DEMOTE: when `rank_charge_evidence` is on, price both arms in the joint
+    // fit's currency — ½·d_eff·log(n_obs) on the realised decoder rank — instead of
+    // the ½log|H| Laplace det. `n_obs` = the term's full row count (matches PROMOTE's
+    // charge); `dispersion_r` = the term's reconstruction φ̂ (the MP-edge noise floor).
+    n_obs: usize,
+    dispersion_r: f64,
+    rank_charge_evidence: bool,
 ) -> Option<(
     HybridAtomCandidate,
     HybridAtomCandidate,
@@ -723,8 +730,54 @@ fn build_atom_candidates(
     // smoothing-penalty logdet (the intrinsic smoothness penalty is
     // reparameterization-invariant and identical in expectation across the two
     // parameterizations of the same image).
-    let linear_nle = reduced_laplace_nle(linear_residual_objective, linear_log_det_h);
-    let curved_nle = reduced_laplace_nle(curved_residual_objective, curved_log_det_h);
+    let (linear_nle, curved_nle) = if rank_charge_evidence {
+        // #16 DEMOTE currency swap: charge ½·d_eff·log(n_obs) (realised decoder rank,
+        // the SAME quantity the joint REML PROMOTE gate charges) in place of the
+        // ½log|H| Laplace det (the #5-mispriced term + its column-symmetric ·p
+        // over-count). d_eff = realised_rank_charge_dof(G, B, N_eff, p, R): a real
+        // rank-2 circle → ~2×basis_edf, a vanishing decoder → 0. The migration gate
+        // (curve earns Tier-2 iff Δloss > ½·Δd_eff·log n) then falls out of the SAME
+        // select_hybrid_atom NLE comparison — one currency, no separate margin.
+        let n_obs_ln = (n_obs.max(1) as f64).ln();
+        let n_eff = w_sum; // effective sample size Σa² (MP-edge aspect)
+        // Linear arm: decoder B=[b₀;b₁] (2×p), Gram G=diag(w_sum, s_tt) (2×2).
+        let mut b_lin = Array2::<f64>::zeros((2, p));
+        for j in 0..p {
+            b_lin[[0, j]] = b0[j];
+            b_lin[[1, j]] = b1[j];
+        }
+        let mut g_lin = Array2::<f64>::zeros((2, 2));
+        g_lin[[0, 0]] = w_sum;
+        g_lin[[1, 1]] = s_tt;
+        let d_lin = crate::manifold::realised_rank_charge_dof(
+            &g_lin, &b_lin, n_eff, p as f64, dispersion_r, 0.0, None,
+        )
+        .ok()?;
+        // Curved arm: refit decoder B + Gram G=ΦᵀWΦ on the same residual.
+        let d_curved = match curved_phi {
+            Some(phi) if phi.nrows() == n => {
+                match curved_refit_decoder(phi, assign, target_resid) {
+                    Some((_, b_c, g_c)) => crate::manifold::realised_rank_charge_dof(
+                        &g_c, &b_c, n_eff, p as f64, dispersion_r, 0.0, None,
+                    )
+                    .ok()?,
+                    // Φ refit degenerate: fall back to the raw decoder param count.
+                    None => curved_num_params as f64,
+                }
+            }
+            // Φ absent or row-count mismatch → param-count fallback (same as flag-off).
+            _ => curved_num_params as f64,
+        };
+        (
+            reduced_laplace_nle(linear_residual_objective, d_lin * n_obs_ln),
+            reduced_laplace_nle(curved_residual_objective, d_curved * n_obs_ln),
+        )
+    } else {
+        (
+            reduced_laplace_nle(linear_residual_objective, linear_log_det_h),
+            reduced_laplace_nle(curved_residual_objective, curved_log_det_h),
+        )
+    };
     if !(linear_nle.is_finite() && curved_nle.is_finite()) {
         return None;
     }
@@ -1032,6 +1085,13 @@ pub fn build_hybrid_split_report<'a, C, W, D, R, M, E>(
     // fixed denominator of the EV-preservation gate. `≤ 0` / non-finite disables
     // the gate (a degenerate, varianceless target has no EV to preserve).
     total_centered_variance: f64,
+    // #16 DEMOTE rank-charge currency (default-off ⇒ historical ½log|H|). `n_obs` =
+    // the term's row count (the log-n BIC scale, matching PROMOTE); `dispersion_r` =
+    // the reconstruction noise floor φ̂ for the MP edge; `rank_charge_evidence` = the
+    // per-fit flag.
+    n_obs: usize,
+    dispersion_r: f64,
+    rank_charge_evidence: bool,
 ) -> Result<Option<SaeHybridSplitReport>, String>
 where
     C: FnMut(usize) -> Array1<f64>,
@@ -1113,6 +1173,9 @@ where
             curved_num_params,
             curved_phi.as_ref().map(|phi| phi.view()),
             fitted_turning,
+            n_obs,
+            dispersion_r,
+            rank_charge_evidence,
         ) {
             Some((linear, curved, (t_bar, b0, b1))) => {
                 // #1026 PER-ATOM EV-PRESERVATION gate. Collapsing this slot raises
@@ -1334,6 +1397,9 @@ mod tests {
             10,
             None,
             Some(0.0),
+            coords.len(),
+            0.0,
+            false,
         )
         .expect("straight residual yields a candidate pair");
         let choice =
@@ -1378,6 +1444,9 @@ mod tests {
             5,
             None,
             Some(2.0 * PI),
+            coords.len(),
+            0.0,
+            false,
         )
         .expect("turning residual yields a candidate pair");
         assert!(
@@ -1431,6 +1500,9 @@ mod tests {
             6,
             None,
             Some(1.0),
+            coords.len(),
+            0.0,
+            false,
         )
         .expect("candidate pair");
         let choice =
@@ -1480,6 +1552,9 @@ mod tests {
                 10,
                 None,
                 Some(0.0),
+                coords.len(),
+                0.0,
+                false,
             )
             .expect("straight residual yields a pair");
             2.0 * linear.negative_log_evidence // = logdet (linear_rss == 0)
@@ -1717,7 +1792,10 @@ mod tests {
                 data.view(),
                 6,
                 None,
-                Some(0.0)
+                Some(0.0),
+                coords.len(),
+                0.0,
+                false,
             )
             .is_none(),
             "a degenerate coordinate span must be refused"

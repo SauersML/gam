@@ -266,6 +266,9 @@ pub use certificate::*;
 pub use construction_aux_types::*;
 pub use construction_cache_refresh::*;
 pub use construction_padded_blocks::*;
+// #16/#2023 — the shared rank-charge DOF core, exposed so the hybrid-split DEMOTE
+// gate prices linear/curved candidates in the SAME currency as the joint REML fit.
+pub(crate) use construction::realised_rank_charge_dof;
 pub use coordinate_fidelity::*;
 pub use gauge::*;
 pub use isa_seed::*;

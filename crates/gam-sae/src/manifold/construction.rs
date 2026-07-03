@@ -3154,6 +3154,22 @@ impl SaeManifoldTerm {
             }
             tss
         };
+        // #16 DEMOTE rank-charge noise floor: the full-reconstruction residual
+        // variance φ̂ = ‖target − full‖² / (n·p). This is tier2's sanctioned fallback
+        // for the MP edge when the term's exact reconstruction_dispersion isn't in
+        // scope at the hybrid-split site; the MP rank count is R-robust for real
+        // (signal ≫ noise) circles, so the demote decision is currency-consistent.
+        let dispersion_r = {
+            let mut rss = 0.0_f64;
+            for row in 0..n {
+                for col in 0..p {
+                    let r = target[[row, col]] - full[[row, col]];
+                    rss += r * r;
+                }
+            }
+            let denom = (n * p).max(1) as f64;
+            rss / denom
+        };
         crate::hybrid_split::build_hybrid_split_report(
             &self.atoms,
             eligible.into_iter(),
@@ -3164,6 +3180,9 @@ impl SaeManifoldTerm {
             manifold_for,
             delta_ev_for,
             total_centered_variance,
+            n,
+            dispersion_r,
+            self.rank_charge_evidence(),
         )
     }
 
