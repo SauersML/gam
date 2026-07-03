@@ -1042,6 +1042,26 @@ mod lever_wiring_2072_tests {
     /// write stays that way (`log_amplitude == 0`, decoder magnitude untouched).
     /// With the lever ON the driver resets `s = 0` then peels ‖B_k‖ into
     /// `log_amplitude`, so every decoder is renormalized to unit Frobenius and
+    /// #1939 — the per-fit `cone_atom_recovery` opt-in must be carried across
+    /// clones (the stagewise driver clones the term for every birth candidate /
+    /// backfit, so a dropped field would silently disable recovery mid-fit — a hole
+    /// the flag-ON==flag-OFF no-op proof cannot catch, since both read `false`).
+    #[test]
+    fn clone_preserves_cone_atom_recovery() {
+        let (mut term, _target, _rho) = small_two_atom_periodic_term();
+        assert!(
+            !term.cone_atom_recovery(),
+            "cone_atom_recovery must default to off"
+        );
+        term.set_cone_atom_recovery(true);
+        let cloned = term.clone();
+        assert!(
+            cloned.cone_atom_recovery(),
+            "Clone must carry cone_atom_recovery — a dropped field silently disables \
+             recovery on every stagewise birth/backfit clone"
+        );
+    }
+
     /// `s_k = ln‖B_abs,k‖` — a PURE GAUGE move: the reconstruction
     /// `a·exp(s)·Φ·B_unit == a·Φ·B_abs` is preserved to machine precision.
     #[test]

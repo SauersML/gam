@@ -2563,9 +2563,11 @@ fn stagewise_progress_py<'py>(
     min_effect_ev = 0.0,
     max_factor_rank = 4,
     structured_whitening = true,
-    cone_atom_recovery = false,
     row_loss_weights = None,
     progress_callback = None,
+    // #1939 — appended LAST so the signature stays strictly additive: existing
+    // positional/kwarg callers (which never pass this) are byte-for-byte unaffected.
+    cone_atom_recovery = false,
 ))]
 fn sae_manifold_fit_stagewise<'py>(
     py: Python<'py>,
@@ -2594,9 +2596,9 @@ fn sae_manifold_fit_stagewise<'py>(
     min_effect_ev: f64,
     max_factor_rank: usize,
     structured_whitening: bool,
-    cone_atom_recovery: bool,
     row_loss_weights: Option<PyReadonlyArray1<'py, f64>>,
     progress_callback: Option<PyObject>,
+    cone_atom_recovery: bool,
 ) -> PyResult<Py<PyDict>> {
     let assignment_kind = canonicalize_assignment_kind(&assignment_kind).map_err(py_value_error)?;
     let z_view = z.as_array();
