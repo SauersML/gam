@@ -152,7 +152,11 @@ mod tests {
         let mut term = SaeManifoldTerm::new(atoms, assignment).unwrap();
         if tier0 {
             // Fit + install the Tier-0 shared mean μ = column-mean of the target.
-            let _demeaned = term.fit_tier0_mean(x.view()).unwrap();
+            // (The returned de-meaned target is what a real driver would fit the
+            // atoms against; this fixture keeps the hand-set decoders and only
+            // needs the installed μ, so the de-meaned matrix is intentionally
+            // dropped.)
+            term.fit_tier0_mean(x.view()).unwrap();
         }
         let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1); NCIRC + 1]);
         (term, rho)

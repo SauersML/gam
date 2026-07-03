@@ -30,6 +30,8 @@
 //! scale-out (one K=1 curved chart per orthonormal Tier-1 block) consumes the
 //! block frames on the block-sparse fit directly; see `sparse_dict::block`.
 
+use std::collections::BTreeMap;
+
 use gam_linalg::faer_ndarray::FaerEigh;
 use ndarray::{Array1, Array2, ArrayView2, Axis};
 
@@ -79,6 +81,98 @@ impl Tier0Mean {
             ));
         }
         Ok(&recon + &self.mean.view().insert_axis(Axis(0)))
+    }
+}
+
+/// Tier-0 PER-CONTEXT mean: one mean vector per context/template group, with a
+/// global fallback for groups unseen at fit time. On real residual streams a
+/// per-prompt/per-template DC otherwise leaks into the fit (measured to drive
+/// held-out EV negative), so per-template demean is the production Tier-0 for
+/// grouped data; [`Tier0Mean`] is the single-group (global) special case. Same
+/// structural DC-atom kill as `Tier0Mean` (#10), applied within each context.
+#[derive(Clone, Debug)]
+pub struct PerContextMean {
+    /// Global fallback mean (used for groups unseen at fit time), length `p`.
+    pub global: Array1<f64>,
+    /// Per-group column means, keyed by context/template id.
+    pub group_means: BTreeMap<i64, Array1<f64>>,
+}
+
+impl PerContextMean {
+    /// Fit per-group column means from `z` (`N×P`) and `group_ids` (length `N`,
+    /// one context id per row). Also stores the global mean as the fallback.
+    pub fn fit(z: ArrayView2<'_, f64>, group_ids: &[i64]) -> Result<Self, String> {
+        let n = z.nrows();
+        let p = z.ncols();
+        if n == 0 || p == 0 {
+            return Err("PerContextMean::fit requires a non-empty (N, P) matrix".to_string());
+        }
+        if group_ids.len() != n {
+            return Err(format!(
+                "PerContextMean::fit: group_ids length {} != N {n}",
+                group_ids.len()
+            ));
+        }
+        let global = z
+            .mean_axis(Axis(0))
+            .ok_or_else(|| "PerContextMean::fit: global mean_axis returned None".to_string())?;
+        let mut sums: BTreeMap<i64, (Array1<f64>, usize)> = BTreeMap::new();
+        for (row, &g) in z.rows().into_iter().zip(group_ids.iter()) {
+            let entry = sums.entry(g).or_insert_with(|| (Array1::<f64>::zeros(p), 0usize));
+            entry.0 += &row;
+            entry.1 += 1;
+        }
+        let mut group_means = BTreeMap::new();
+        for (g, (sum, count)) in sums {
+            if count > 0 {
+                group_means.insert(g, sum / count as f64);
+            }
+        }
+        Ok(Self {
+            global,
+            group_means,
+        })
+    }
+
+    /// The mean for a context: its own if seen at fit time, else the global fallback.
+    pub fn row_mean(&self, group: i64) -> &Array1<f64> {
+        self.group_means.get(&group).unwrap_or(&self.global)
+    }
+
+    /// De-mean each row by its context mean: `R0[i] = z[i] − μ_{group[i]}`.
+    pub fn apply(&self, z: ArrayView2<'_, f64>, group_ids: &[i64]) -> Result<Array2<f64>, String> {
+        if group_ids.len() != z.nrows() {
+            return Err(format!(
+                "PerContextMean::apply: group_ids length {} != N {}",
+                group_ids.len(),
+                z.nrows()
+            ));
+        }
+        let mut out = z.to_owned();
+        for (mut row, &g) in out.rows_mut().into_iter().zip(group_ids.iter()) {
+            row -= self.row_mean(g);
+        }
+        Ok(out)
+    }
+
+    /// Add each row's context mean back to a de-meaned reconstruction.
+    pub fn reconstruct(
+        &self,
+        recon: ArrayView2<'_, f64>,
+        group_ids: &[i64],
+    ) -> Result<Array2<f64>, String> {
+        if group_ids.len() != recon.nrows() {
+            return Err(format!(
+                "PerContextMean::reconstruct: group_ids length {} != N {}",
+                group_ids.len(),
+                recon.nrows()
+            ));
+        }
+        let mut out = recon.to_owned();
+        for (mut row, &g) in out.rows_mut().into_iter().zip(group_ids.iter()) {
+            row += self.row_mean(g);
+        }
+        Ok(out)
     }
 }
 
@@ -331,5 +425,26 @@ mod tests {
         assert!(sub.q_perp[[0, 0]].abs() < 1e-6 && sub.q_perp[[1, 0]].abs() < 1e-6);
         // Atom 0 (code 2) carries more energy than atom 1 (code 1) ⇒ larger scale first.
         assert!(sub.scale[0] >= sub.scale[1]);
+    }
+
+    #[test]
+    fn per_context_mean_zeros_each_group_and_falls_back() {
+        // group 0 centered at (10,10), group 1 at (−5,−5).
+        let z = array![[11.0, 9.0], [9.0, 11.0], [-4.0, -6.0], [-6.0, -4.0]];
+        let groups = [0i64, 0, 1, 1];
+        let pcm = PerContextMean::fit(z.view(), &groups).expect("fit");
+        assert!((pcm.row_mean(0)[0] - 10.0).abs() < 1e-12);
+        assert!((pcm.row_mean(1)[0] + 5.0).abs() < 1e-12);
+        // Unseen context falls back to the global mean.
+        assert!((pcm.row_mean(999)[0] - pcm.global[0]).abs() < 1e-12);
+        // Per-context de-mean zeros each group (⇒ column sums ~0 overall).
+        let demeaned = pcm.apply(z.view(), &groups).expect("apply");
+        let col_sum = demeaned.sum_axis(Axis(0));
+        assert!(col_sum[0].abs() < 1e-12 && col_sum[1].abs() < 1e-12);
+        // Roundtrip.
+        let back = pcm.reconstruct(demeaned.view(), &groups).expect("reconstruct");
+        for (a, b) in back.iter().zip(z.iter()) {
+            assert!((a - b).abs() < 1e-12);
+        }
     }
 }
