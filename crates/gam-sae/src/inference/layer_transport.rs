@@ -58,15 +58,15 @@
 //! circular domains, and the open B-spline basis with the standard difference
 //! penalty on interval domains — constructed directly, not via the string DSL.
 
+use crate::chart_canonicalization::CanonicalChartTopology;
+use faer::Side;
 use gam_linalg::faer_ndarray::FaerEigh;
-use gam_terms::inference::smooth_test::{SmoothTestInput, SmoothTestScale, wood_smooth_test};
 use gam_terms::basis::{
     BasisOptions, Dense, KnotSource, PeriodicBSplineBasisSpec, build_periodic_bspline_basis_1d,
     create_basis, create_cyclic_difference_penalty_matrix, create_difference_penalty_matrix,
     periodic_bspline_first_derivative_nd,
 };
-use crate::chart_canonicalization::CanonicalChartTopology;
-use faer::Side;
+use gam_terms::inference::smooth_test::{SmoothTestInput, SmoothTestScale, wood_smooth_test};
 use ndarray::{Array1, Array2, ArrayView1, Axis};
 use statrs::distribution::{ContinuousCDF, Normal};
 use std::f64::consts::{PI, TAU};

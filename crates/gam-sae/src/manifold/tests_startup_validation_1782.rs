@@ -20,11 +20,11 @@
 
 use super::tests::{global_ev, planted_circle_embedded};
 use super::*;
-use crate::sparse_dict::{fit_sparse_dictionary, SparseDictConfig};
 use crate::basis::{EuclideanPatchEvaluator, PeriodicHarmonicEvaluator, SaeBasisSecondJet};
-use gam_linalg::faer_ndarray::{fast_atb, FaerCholesky};
+use crate::sparse_dict::{SparseDictConfig, fit_sparse_dictionary};
+use gam_linalg::faer_ndarray::{FaerCholesky, fast_atb};
 use gam_solve::rho_optimizer::OuterObjective;
-use ndarray::{array, s, Array1, Array2, ArrayView2};
+use ndarray::{Array1, Array2, ArrayView2, array, s};
 use std::sync::Arc;
 
 #[derive(Clone, Copy)]
@@ -147,16 +147,8 @@ fn objective_and_seed(
         .seed_scaled_by_dispersion_for_assignment(seed_dispersion, mode)
         .unwrap();
     let init_rho_flat = init_rho.to_flat();
-    let objective = SaeManifoldOuterObjective::new(
-        term,
-        z.to_owned(),
-        None,
-        init_rho,
-        8,
-        0.04,
-        1.0e-6,
-        1.0e-6,
-    );
+    let objective =
+        SaeManifoldOuterObjective::new(term, z.to_owned(), None, init_rho, 8, 0.04, 1.0e-6, 1.0e-6);
     (objective, init_rho_flat)
 }
 
@@ -183,9 +175,7 @@ fn seed_passes_startup_validation(
         "test must exercise the EFS lane (n_params={} must exceed 8)",
         seed.len()
     );
-    let eval = objective
-        .eval_efs(&seed)
-        .map_err(|e| e.to_string())?;
+    let eval = objective.eval_efs(&seed).map_err(|e| e.to_string())?;
     if !eval.cost.is_finite() {
         return Err(format!("EFS seed cost is non-finite ({})", eval.cost));
     }
@@ -430,7 +420,9 @@ fn manifold_beats_linear_joint_streaming_1026() {
             vec![array![1.0e-3_f64.ln()]; k],
         );
         term.run_joint_fit_arrow_schur(z.view(), &mut rho, None, 24, 1.0, 1.0e-6, 1.0e-6)
-            .unwrap_or_else(|e| panic!("#1026 manifold K={k} joint inner fit must run e2e, got: {e}"));
+            .unwrap_or_else(|e| {
+                panic!("#1026 manifold K={k} joint inner fit must run e2e, got: {e}")
+            });
         let fitted = term.try_fitted().expect("manifold fitted");
         let ev_manifold = global_ev(z.view(), fitted.view());
 

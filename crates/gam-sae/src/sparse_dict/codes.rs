@@ -82,8 +82,8 @@ pub fn solve_row_codes(
 /// SPD solve via Cholesky with a Tikhonov-bumped fallback. The system is `s×s`
 /// with `s` tiny, so an in-place dense factorisation is appropriate.
 fn solve_spd(gram: &Array2<f64>, rhs: &Array1<f64>) -> Array1<f64> {
-    use gam_linalg::faer_ndarray::FaerCholesky;
     use faer::Side;
+    use gam_linalg::faer_ndarray::FaerCholesky;
 
     let m = rhs.len();
     let mut a = gram.clone();

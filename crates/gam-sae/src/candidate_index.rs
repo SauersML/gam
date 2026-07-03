@@ -1516,11 +1516,17 @@ mod tests {
         let j = 777usize;
         let dj = &dirs[j];
         let (truth_atom, _) = brute_force_best_atom(&sketch, dj.view()).unwrap();
-        assert_eq!(truth_atom, j, "the in-frame column is its own unique argmax");
+        assert_eq!(
+            truth_atom, j,
+            "the in-frame column is its own unique argmax"
+        );
         let route = index
             .route_exact(&sketch, dj.view(), budget, cfg.multiprobe)
             .unwrap();
-        assert_eq!(route.atom, j, "fast path must still return the global argmax");
+        assert_eq!(
+            route.atom, j,
+            "fast path must still return the global argmax"
+        );
         assert!(
             route.lsh_certified && !route.did_full_scan,
             "a ceiling-alignment row must be certified by the universal bound, no scan"

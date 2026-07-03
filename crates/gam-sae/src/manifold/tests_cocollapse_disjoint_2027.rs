@@ -12,8 +12,8 @@
 //! refit + soft row-ownership anchor + reseed cooldown the two atoms hold distinct
 //! territories and the fit recovers a materially positive EV.
 
-use super::*;
 use super::tests::deterministic_circle_noise;
+use super::*;
 
 /// Whitened two-circle target: circle A lives on the even ambient columns, circle
 /// B on the odd ones (disjoint deterministic near-orthonormal 2-frames), driven by
@@ -180,7 +180,12 @@ pub(crate) fn sequential_deflation_gives_both_atoms_material_norm_2027() {
         .unwrap();
     let mut norms = [0.0_f64; 2];
     for (atom_idx, atom) in term.atoms.iter().enumerate() {
-        norms[atom_idx] = atom.decoder_coefficients.iter().map(|v| v * v).sum::<f64>().sqrt();
+        norms[atom_idx] = atom
+            .decoder_coefficients
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
     }
     let (lo, hi) = if norms[0] <= norms[1] {
         (norms[0], norms[1])
@@ -312,7 +317,9 @@ pub(crate) fn structural_coherence_detector_fires_on_duplicate_not_orthogonal_20
         term.atoms[atom].decoder_coefficients = b;
     }
     assert!(
-        term.structural_coherence_collapse_detected().unwrap().is_none(),
+        term.structural_coherence_collapse_detected()
+            .unwrap()
+            .is_none(),
         "orthogonal-subspace atoms must NOT be flagged as structurally collapsed"
     );
 

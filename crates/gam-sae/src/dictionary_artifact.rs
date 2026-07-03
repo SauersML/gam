@@ -379,11 +379,9 @@ mod tests {
         // aligned-equality claim must be FALSE and the leftover atoms must be
         // reported as an atom-level removal + addition — not silently dropped
         // into a spurious "no differences" verdict at equal total count.
-        let left = canonical_dictionary_artifact(&model(vec![
-            array![[1.0], [0.0]],
-            array![[0.0], [1.0]],
-        ]))
-        .unwrap();
+        let left =
+            canonical_dictionary_artifact(&model(vec![array![[1.0], [0.0]], array![[0.0], [1.0]]]))
+                .unwrap();
         let right = canonical_dictionary_artifact(&model(vec![
             array![[1.0], [0.0]],
             array![[1.0], [0.0], [0.0]],
@@ -394,7 +392,11 @@ mod tests {
             !d.hash_equal_after_alignment,
             "dictionaries with different atom sets must not claim aligned equality"
         );
-        assert_eq!(d.unmatched_left_atoms.len(), 1, "left[1] has no counterpart");
+        assert_eq!(
+            d.unmatched_left_atoms.len(),
+            1,
+            "left[1] has no counterpart"
+        );
         assert_eq!(
             d.unmatched_right_atoms.len(),
             1,

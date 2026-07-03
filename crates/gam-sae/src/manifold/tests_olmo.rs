@@ -753,7 +753,9 @@ pub(crate) fn fast_reconstruct_matches_per_row_decode() {
         valid_rows += 1;
         // Oracle: decode this row's coord singly. m(t̂) = z·Φ(t̂)·B.
         let single = coords.row(row).insert_axis(ndarray::Axis(0)).to_owned();
-        let (phi_row, _jet) = evaluator.evaluate(single.view()).expect("single basis eval");
+        let (phi_row, _jet) = evaluator
+            .evaluate(single.view())
+            .expect("single basis eval");
         let decoded_row = phi_row.dot(&atom.decoder_coefficients); // (1 × p)
         for col in 0..p {
             let expect = amps[row] * decoded_row[[0, col]];
@@ -938,12 +940,9 @@ pub(crate) fn oos_train_curved(
         nb = nb.max(z_te.row(r).dot(&z_te.row(r)).sqrt());
     }
     let ev_eval = Arc::new(TorusHarmonicEvaluator::new(d, h).unwrap());
-    let seed = sae_pca_seed_initial_coords(
-        z_tr.view(),
-        &vec![SaeAtomBasisKind::Periodic; 1],
-        &vec![d],
-    )
-    .unwrap();
+    let seed =
+        sae_pca_seed_initial_coords(z_tr.view(), &vec![SaeAtomBasisKind::Periodic; 1], &vec![d])
+            .unwrap();
     let mut coords = seed.slice(s![0, .., 0..d]).to_owned();
     let build = |coords: &Array2<f64>| -> SaeManifoldAtom {
         let (phi, jet) = ev_eval.evaluate(coords.view()).unwrap();
@@ -954,9 +953,17 @@ pub(crate) fn oos_train_curved(
         }
         let xtz = fast_atb(&phi, &z_tr.to_owned());
         let dec = xtx.cholesky(Side::Lower).unwrap().solve_mat(&xtz);
-        SaeManifoldAtom::new("t", SaeAtomBasisKind::Periodic, d, phi, jet, dec, Array2::eye(m))
-            .unwrap()
-            .with_basis_evaluator(ev_eval.clone())
+        SaeManifoldAtom::new(
+            "t",
+            SaeAtomBasisKind::Periodic,
+            d,
+            phi,
+            jet,
+            dec,
+            Array2::eye(m),
+        )
+        .unwrap()
+        .with_basis_evaluator(ev_eval.clone())
     };
     let mk_atlas = |atom: &SaeManifoldAtom, coords: &Array2<f64>| {
         if data_driven {
@@ -1148,8 +1155,17 @@ fn certified_encode_is_globally_sound_near_self_crossing() {
     let mut decoder = Array2::<f64>::zeros((m, 2));
     decoder[[2, 0]] = 1.0; // x = cos 2πt
     decoder[[3, 1]] = 1.0; // y = sin 4πt
-    let atom = SaeManifoldAtom::new("fig8", SaeAtomBasisKind::Periodic, 1, phi, jet, decoder,
-        Array2::<f64>::eye(m)).unwrap().with_basis_evaluator(evaluator.clone());
+    let atom = SaeManifoldAtom::new(
+        "fig8",
+        SaeAtomBasisKind::Periodic,
+        1,
+        phi,
+        jet,
+        decoder,
+        Array2::<f64>::eye(m),
+    )
+    .unwrap()
+    .with_basis_evaluator(evaluator.clone());
 
     let recon = |t: f64| -> [f64; 2] {
         let a = 2.0 * std::f64::consts::PI * t;
@@ -1158,8 +1174,10 @@ fn certified_encode_is_globally_sound_near_self_crossing() {
     // ‖∇_t ½‖x − m(t)‖²‖ = | −(dm/dt)·(x − m(t)) |.
     let grad = |t: f64, x: &[f64; 2]| -> f64 {
         let a = 2.0 * std::f64::consts::PI * t;
-        let dm = [-2.0 * std::f64::consts::PI * a.sin(),
-                   4.0 * std::f64::consts::PI * (2.0 * a).cos()];
+        let dm = [
+            -2.0 * std::f64::consts::PI * a.sin(),
+            4.0 * std::f64::consts::PI * (2.0 * a).cos(),
+        ];
         let r = recon(t);
         -(dm[0] * (x[0] - r[0]) + dm[1] * (x[1] - r[1]))
     };
@@ -1169,14 +1187,25 @@ fn certified_encode_is_globally_sound_near_self_crossing() {
         for i in 0..g {
             let t = i as f64 / g as f64;
             let r = recon(t);
-            let e = (r[0]-x[0]).powi(2) + (r[1]-x[1]).powi(2);
-            if e < best { best = e; }
+            let e = (r[0] - x[0]).powi(2) + (r[1] - x[1]).powi(2);
+            if e < best {
+                best = e;
+            }
         }
         best.sqrt()
     };
 
-    let atlas = crate::encode::EncodeAtlas::build(std::slice::from_ref(&atom), &[1.0], 1.6,
-        crate::encode::AtlasConfig { grid_resolution: 64, ridge: 1e-10, newton_steps: 8 }).unwrap();
+    let atlas = crate::encode::EncodeAtlas::build(
+        std::slice::from_ref(&atom),
+        &[1.0],
+        1.6,
+        crate::encode::AtlasConfig {
+            grid_resolution: 64,
+            ridge: 1e-10,
+            newton_steps: 8,
+        },
+    )
+    .unwrap();
 
     let mut certified = 0usize;
     let mut worst_grad = 0.0_f64;
@@ -1187,18 +1216,24 @@ fn certified_encode_is_globally_sound_near_self_crossing() {
             let x0 = -0.30 + 0.60 * ix as f64 / (steps - 1) as f64;
             let x1 = -0.30 + 0.60 * iy as f64 / (steps - 1) as f64;
             let xv = Array1::from(vec![x0, x1]);
-            let (coord, cert) = atlas.certified_encode_row(&atom, 0, xv.view(), 1.0).unwrap();
-            if !cert.certified() { continue; }
+            let (coord, cert) = atlas
+                .certified_encode_row(&atom, 0, xv.view(), 1.0)
+                .unwrap();
+            if !cert.certified() {
+                continue;
+            }
             certified += 1;
             let t = coord[0];
             worst_grad = worst_grad.max(grad(t, &[x0, x1]).abs());
             let r = recon(t);
-            let cert_err = ((r[0]-x0).powi(2) + (r[1]-x1).powi(2)).sqrt();
+            let cert_err = ((r[0] - x0).powi(2) + (r[1] - x1).powi(2)).sqrt();
             worst_global_excess = worst_global_excess.max(cert_err - global_min_err(&[x0, x1]));
         }
     }
-    eprintln!("certified={certified}/{}  worst|grad|={worst_grad:.2e}  worst global excess={worst_global_excess:.4}",
-        steps*steps);
+    eprintln!(
+        "certified={certified}/{}  worst|grad|={worst_grad:.2e}  worst global excess={worst_global_excess:.4}",
+        steps * steps
+    );
 
     // (A) LOCAL soundness: every certified coord is a true stationary point.
     assert!(
@@ -1207,7 +1242,10 @@ fn certified_encode_is_globally_sound_near_self_crossing() {
          points (‖∇‖≈0); worst |∇| = {worst_grad:.2e}"
     );
     // Non-vacuity: the sweep actually certified a substantial set.
-    assert!(certified > steps * steps / 2, "fixture must certify most targets; got {certified}");
+    assert!(
+        certified > steps * steps / 2,
+        "fixture must certify most targets; got {certified}"
+    );
     // (B) GLOBAL soundness now HOLDS: top-K chart routing (CERTIFIED_ROUTING_TOPK)
     //     refines the competing branches and returns the lowest-reconstruction
     //     certified result, so a certified encode lands within the GLOBAL minimum's

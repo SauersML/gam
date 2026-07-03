@@ -138,7 +138,11 @@ pub struct ScoreRow {
 /// rate as a code coefficient) = the mean per-coefficient code rate; pass a value
 /// (e.g. 16 for fp16) to override.
 pub fn score(feat: &Featurizer, delta2: f64, l_param_bits: Option<f64>) -> ScoreRow {
-    let code_coeff: f64 = feat.coded_var.iter().map(|&v| scalar_rate_bits(v, delta2)).sum();
+    let code_coeff: f64 = feat
+        .coded_var
+        .iter()
+        .map(|&v| scalar_rate_bits(v, delta2))
+        .sum();
     let sel = selection_bits(feat.g_dict, feat.k_active);
     let code_per_firing = code_coeff + sel;
     let m = feat.m();
@@ -165,7 +169,11 @@ pub fn score(feat: &Featurizer, delta2: f64, l_param_bits: Option<f64>) -> Score
         dict_bits,
         code_bits_total: code_total,
         total_bits: total,
-        bits_per_token: if feat.n_tokens > 0 { total / feat.n_tokens as f64 } else { f64::INFINITY },
+        bits_per_token: if feat.n_tokens > 0 {
+            total / feat.n_tokens as f64
+        } else {
+            f64::INFINITY
+        },
         residual_achieved: residual,
         distortion_floor: delta2,
         distortion_infeasible: residual > delta2 * 1.02,
@@ -206,8 +214,16 @@ pub fn crossover_firings(
     delta2: f64,
     l_param_bits: Option<f64>,
 ) -> Crossover {
-    let code_b: f64 = block.coded_var.iter().map(|&v| scalar_rate_bits(v, delta2)).sum();
-    let code_c: f64 = chart.coded_var.iter().map(|&v| scalar_rate_bits(v, delta2)).sum();
+    let code_b: f64 = block
+        .coded_var
+        .iter()
+        .map(|&v| scalar_rate_bits(v, delta2))
+        .sum();
+    let code_c: f64 = chart
+        .coded_var
+        .iter()
+        .map(|&v| scalar_rate_bits(v, delta2))
+        .sum();
     let sel_b = selection_bits(block.g_dict, block.k_active);
     let sel_c = selection_bits(chart.g_dict, chart.k_active);
     let dcode_coeff = code_b - code_c;
@@ -277,7 +293,11 @@ impl DescriptionLength {
             selection_bits: selection,
             dict_bits: dict,
             total_bits: total,
-            bits_per_token: if n_tokens > 0 { total / n_tokens as f64 } else { f64::INFINITY },
+            bits_per_token: if n_tokens > 0 {
+                total / n_tokens as f64
+            } else {
+                f64::INFINITY
+            },
         }
     }
 

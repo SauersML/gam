@@ -44,8 +44,8 @@
 //! from the tier — the same #973 honesty discipline, applied to the metric's
 //! estimation roles instead of the likelihood.
 
-use gam_solve::row_sampling_measure::{RowSamplingMeasure, per_row_fisher_mass};
 use gam_problem::{MetricProvenance, RowMetric};
+use gam_solve::row_sampling_measure::{RowSamplingMeasure, per_row_fisher_mass};
 
 /// The Fisher-bearing tier: which corpus rows carry factors, and the metric
 /// over exactly those rows.

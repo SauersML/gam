@@ -101,7 +101,12 @@ fn two_block_joint_fit_reconstructs_activation_and_behavior() {
         z[[i, 0]] = theta.cos();
         z[[i, 1]] = theta.sin();
         z[[i, 2]] = (2.0 * theta).cos();
-        let law = softmax(&[1.5 * theta.cos(), 1.5 * theta.sin(), 0.3 * (2.0 * theta).cos(), 0.0]);
+        let law = softmax(&[
+            1.5 * theta.cos(),
+            1.5 * theta.sin(),
+            0.3 * (2.0 * theta).cos(),
+            0.0,
+        ]);
         for j in 0..vocab {
             probs[[i, j]] = law[j];
         }
@@ -134,11 +139,16 @@ fn two_block_joint_fit_reconstructs_activation_and_behavior() {
 
     // split_decoder recovers a NON-trivial behavior decoder, and decoding the
     // fitted behavior reconstruction returns to the planted distributions.
-    let (b_k, c_k) = block.split_decoder(term.atoms[0].decoder_coefficients.view()).unwrap();
+    let (b_k, c_k) = block
+        .split_decoder(term.atoms[0].decoder_coefficients.view())
+        .unwrap();
     assert_eq!(b_k.dim().1, p_x);
     assert_eq!(c_k.dim().1, p_y);
     let c_norm = c_k.iter().map(|v| v * v).sum::<f64>().sqrt();
-    assert!(c_norm > 0.1, "behavior decoder collapsed to ~0 despite real behavior: {c_norm}");
+    assert!(
+        c_norm > 0.1,
+        "behavior decoder collapsed to ~0 despite real behavior: {c_norm}"
+    );
 
     // Decode the fitted behavior tangent at a few rows and compare KL to planted.
     let mut worst_kl = 0.0_f64;
@@ -147,10 +157,14 @@ fn two_block_joint_fit_reconstructs_activation_and_behavior() {
         let inv = 1.0 / block.sqrt_lambda_y();
         let y_hat = Array1::from_shape_fn(p_y, |j| fitted[[i, p_x + j]] * inv);
         let p_hat = block.embedding.decode(y_hat.view()).unwrap();
-        let kl = crate::manifold::SphereTangentEmbedding::exact_kl(probs.row(i), p_hat.view()).unwrap();
+        let kl =
+            crate::manifold::SphereTangentEmbedding::exact_kl(probs.row(i), p_hat.view()).unwrap();
         worst_kl = worst_kl.max(kl);
     }
-    assert!(worst_kl < 0.02, "decoded behavior diverges from planted (worst KL {worst_kl} nats)");
+    assert!(
+        worst_kl < 0.02,
+        "decoded behavior diverges from planted (worst KL {worst_kl} nats)"
+    );
 }
 
 /// Selection-for-mattering: when the behavior does NOT vary across rows (the
@@ -191,10 +205,15 @@ fn constant_behavior_yields_zero_behavior_decoder() {
     term.run_joint_fit_arrow_schur(augmented.view(), &mut rho, None, 48, 1.0, 1e-6, 1e-6)
         .expect("fit must complete");
 
-    let (b_k, c_k) = block.split_decoder(term.atoms[0].decoder_coefficients.view()).unwrap();
+    let (b_k, c_k) = block
+        .split_decoder(term.atoms[0].decoder_coefficients.view())
+        .unwrap();
     let b_norm = b_k.iter().map(|v| v * v).sum::<f64>().sqrt();
     let c_norm = c_k.iter().map(|v| v * v).sum::<f64>().sqrt();
-    assert!(b_norm > 0.1, "activation decoder should still fit the circle: {b_norm}");
+    assert!(
+        b_norm > 0.1,
+        "activation decoder should still fit the circle: {b_norm}"
+    );
     assert!(
         c_norm < 1e-6,
         "constant behavior must earn a ~0 behavior decoder; got {c_norm}"

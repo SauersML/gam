@@ -21,16 +21,16 @@
 //!     circles / position waves) and the byte-for-byte-stable single-atom path.
 
 use faer::Side;
-use gam_linalg::faer_ndarray::{fast_atb, FaerCholesky};
-use gam_sae::assignment::{default_ibp_concentration_for_k_atoms, AssignmentMode, SaeAssignment};
+use gam_linalg::faer_ndarray::{FaerCholesky, fast_atb};
+use gam_sae::assignment::{AssignmentMode, SaeAssignment, default_ibp_concentration_for_k_atoms};
 use gam_sae::basis::{PeriodicHarmonicEvaluator, SaeBasisEvaluator};
 use gam_sae::manifold::{
-    sae_pca_seed_initial_coords, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
+    SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, sae_pca_seed_initial_coords,
 };
-use gam_sae::sparse_dict::{fit_sparse_dictionary, SparseDictConfig, SparseDictFit};
-use gam_terms::dictionary::{fit_linear_dictionary, LinearDictionaryConfig};
+use gam_sae::sparse_dict::{SparseDictConfig, SparseDictFit, fit_sparse_dictionary};
+use gam_terms::dictionary::{LinearDictionaryConfig, fit_linear_dictionary};
 use gam_terms::latent::LatentManifold;
-use ndarray::{array, s, Array2, ArrayView2};
+use ndarray::{Array2, ArrayView2, array, s};
 use std::sync::Arc;
 
 /// Deterministic standard-normal stream (splitmix64 + Box–Muller); no `rand`
@@ -77,11 +77,7 @@ fn explained_variance(target: ArrayView2<'_, f64>, fitted: ArrayView2<'_, f64>) 
         }
     }
     if tss <= 1.0e-24 {
-        if rss <= 1.0e-24 {
-            1.0
-        } else {
-            0.0
-        }
+        if rss <= 1.0e-24 { 1.0 } else { 0.0 }
     } else {
         1.0 - rss / tss
     }
@@ -243,7 +239,11 @@ fn curved_single_atom_ev(z: ArrayView2<'_, f64>, num_basis: usize) -> f64 {
     )
     .unwrap();
     let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
-    let mut rho = SaeManifoldRho::new(1.0e-3_f64.ln(), 1.0e-3_f64.ln(), vec![array![1.0e-3_f64.ln()]]);
+    let mut rho = SaeManifoldRho::new(
+        1.0e-3_f64.ln(),
+        1.0e-3_f64.ln(),
+        vec![array![1.0e-3_f64.ln()]],
+    );
     term.run_joint_fit_arrow_schur(z, &mut rho, None, 12, 1.0, 1.0e-6, 1.0e-6)
         .expect("curved K=1 inner fit runs");
     let fitted = term.try_fitted().expect("curved fitted");

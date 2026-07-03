@@ -116,11 +116,7 @@ pub(crate) fn absolute_degeneracy_ev_floor(
 /// Capped at the data rank `min(n, p)`. If any atom's design is non-finite or the
 /// concatenated SVD fails, the whole function degrades to the historical summed
 /// per-atom ranks rather than corrupting `q`.
-pub(crate) fn reachable_dictionary_rank(
-    atoms: &[SaeManifoldAtom],
-    n: usize,
-    p: usize,
-) -> usize {
+pub(crate) fn reachable_dictionary_rank(atoms: &[SaeManifoldAtom], n: usize, p: usize) -> usize {
     if atoms.is_empty() || n == 0 || p == 0 {
         return 0;
     }
@@ -1573,11 +1569,7 @@ impl SaeManifoldOuterObjective {
             return Ok(analytic);
         }
         let cosine = analytic.dot(&fd) / (na * nf);
-        if cosine < 0.5 {
-            Ok(fd)
-        } else {
-            Ok(analytic)
-        }
+        if cosine < 0.5 { Ok(fd) } else { Ok(analytic) }
     }
 
     /// #1782 — the finite outer-cost a recoverable infeasible-ρ REFUSAL presents
@@ -2079,27 +2071,27 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // proceeds on the EFS lane. Dense-admitted fits never enter this branch and
         // are byte-for-byte unchanged.
         if !self.term.streaming_plan().direct_logdet_admitted() {
-            let (cost, _beta_hat) =
-                match self.evaluate_with_refine_policy(rho.view(), false, false) {
-                    Ok(evaluated) => evaluated,
-                    // #1782 — recoverable infeasible-ρ refusal → finite collapse
-                    // wall (zero gradient), not `+∞`. The wall still steers the
-                    // outer descent away from the infeasible basin, but keeps the
-                    // seed neighbourhood bounded so a globally-refused seed ships
-                    // the best-so-far dictionary instead of aborting the fit (see
-                    // `recoverable_refusal_wall_cost`).
-                    Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
-                        self.probe_telemetry.record_refusal_kind(&err);
-                        self.probe_telemetry.wall_cost_value_probes += 1;
-                        return Ok(OuterEval {
-                            cost: Self::recoverable_refusal_wall_cost(),
-                            gradient: Array1::zeros(rho.len()),
-                            hessian: HessianResult::Unavailable,
-                            inner_beta_hint: None,
-                        });
-                    }
-                    Err(err) => return Err(EstimationError::RemlOptimizationFailed(err)),
-                };
+            let (cost, _beta_hat) = match self.evaluate_with_refine_policy(rho.view(), false, false)
+            {
+                Ok(evaluated) => evaluated,
+                // #1782 — recoverable infeasible-ρ refusal → finite collapse
+                // wall (zero gradient), not `+∞`. The wall still steers the
+                // outer descent away from the infeasible basin, but keeps the
+                // seed neighbourhood bounded so a globally-refused seed ships
+                // the best-so-far dictionary instead of aborting the fit (see
+                // `recoverable_refusal_wall_cost`).
+                Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
+                    self.probe_telemetry.record_refusal_kind(&err);
+                    self.probe_telemetry.wall_cost_value_probes += 1;
+                    return Ok(OuterEval {
+                        cost: Self::recoverable_refusal_wall_cost(),
+                        gradient: Array1::zeros(rho.len()),
+                        hessian: HessianResult::Unavailable,
+                        inner_beta_hint: None,
+                    });
+                }
+                Err(err) => return Err(EstimationError::RemlOptimizationFailed(err)),
+            };
             return Ok(OuterEval {
                 cost,
                 gradient: Array1::zeros(rho.len()),

@@ -14,8 +14,8 @@
 //!   forward data-derivative gives an ungated background-tier atom zero
 //!   α-sensitivity (FD-checked against the data NLL).
 
-use super::*;
 use super::tests::gamma_fd_tiny_fixture;
+use super::*;
 use approx::assert_abs_diff_eq;
 
 /// Streaming polar refresh from an accumulated cross-moment re-orients the

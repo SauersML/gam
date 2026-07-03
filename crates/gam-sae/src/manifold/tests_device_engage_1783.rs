@@ -156,7 +156,12 @@ fn framed_circle_isometry_fit_builds_device_sae_pcg_data_1783() {
          device-resident SAE PCG seam is reachable (was None: silent CPU, GPU 0%)"
     );
     assert!(
-        sys_deferred.device_sae_pcg.as_ref().unwrap().frame.is_some(),
+        sys_deferred
+            .device_sae_pcg
+            .as_ref()
+            .unwrap()
+            .frame
+            .is_some(),
         "the framed fit must carry the factored (Grassmann-frame) device payload"
     );
 

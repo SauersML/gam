@@ -1,11 +1,11 @@
 use gam_linalg::faer_ndarray::fast_ata;
 
 use super::*;
+use approx::assert_abs_diff_eq;
 use gam_solve::arrow_schur::{
     ArrowFactorSlab, ArrowHtbetaCache, ArrowSolverMode, ArrowUndampedFactors, PcgDiagnostics,
 };
 use gam_terms::analytic_penalties::ARDPenalty;
-use approx::assert_abs_diff_eq;
 use ndarray::{Array5, array};
 
 pub(crate) fn assert_matrix_same_bits(left: &Array2<f64>, right: &Array2<f64>) {
@@ -158,7 +158,9 @@ pub(crate) fn evidence_gauge_deflation_count_bounded_flicker_reanchors_freely() 
     // A sustained 150<->147 flicker reverses direction on EVERY step — far more
     // reversals than the K=1 budget of 6 — yet the amplitude (3) is well inside
     // the relative jitter band (150/4 = 37), so none charge the budget.
-    let flicker = [147usize, 150, 147, 150, 147, 150, 147, 150, 147, 150, 147, 150, 147, 150];
+    let flicker = [
+        147usize, 150, 147, 150, 147, 150, 147, 150, 147, 150, 147, 150, 147, 150,
+    ];
     for &c in &flicker {
         term.record_evidence_gauge_deflation_count(c)
             .expect("a bounded low-amplitude flicker must re-anchor, never abort");
@@ -178,7 +180,9 @@ pub(crate) fn evidence_gauge_deflation_count_bounded_flicker_reanchors_freely() 
     let mut term2 = trivial_k1_euclidean_term();
     term2.record_evidence_gauge_deflation_count(150).unwrap();
     let mut errored = false;
-    for &c in &[40usize, 150, 40, 150, 40, 150, 40, 150, 40, 150, 40, 150, 40, 150] {
+    for &c in &[
+        40usize, 150, 40, 150, 40, 150, 40, 150, 40, 150, 40, 150, 40, 150,
+    ] {
         if term2.record_evidence_gauge_deflation_count(c).is_err() {
             errored = true;
             break;
@@ -1004,8 +1008,7 @@ pub(crate) fn scad_coord_penalty_active_on_euclidean_axis() {
 /// it. The PerAtom arm keeps unique coordinates matching the `to_flat` cursor.
 #[test]
 pub(crate) fn shared_ard_flat_index_aliases_in_bounds_1026() {
-    let shared =
-        SaeManifoldRho::new_shared_ard(0.0, 0.0, vec![array![0.1_f64], array![0.2_f64]]);
+    let shared = SaeManifoldRho::new_shared_ard(0.0, 0.0, vec![array![0.1_f64], array![0.2_f64]]);
     let shared_len = shared.to_flat().len();
     assert_eq!(shared_len, 4, "shared flat len = 1+K+max_d");
     assert_eq!(shared.ard_flat_index(0, 0), 3);
@@ -2614,8 +2617,7 @@ pub(crate) fn decoder_repulsion_strength_is_derived_and_scale_invariant_1610() {
     // hand-picked magnitude and NOT a rank-count heuristic. Checked on a
     // constructed unit-scale term (μ_C is a per-term, per-pair quantity).
     let unit_term = build_at_scale(1.0);
-    let expected =
-        SAE_DECODER_REPULSION_BARRIER_RATIO * unit_term.separation_barrier_strength();
+    let expected = SAE_DECODER_REPULSION_BARRIER_RATIO * unit_term.separation_barrier_strength();
     assert_eq!(
         unit_term.decoder_repulsion_strength(),
         expected,
@@ -3746,7 +3748,10 @@ pub(crate) fn planted_circle_embedded(n: usize, d_embed: usize, sigma: f64) -> A
         frame[[1, j]] = deterministic_circle_noise(j, 1);
     }
     for r in 0..2 {
-        let norm = (0..d_embed).map(|j| frame[[r, j]] * frame[[r, j]]).sum::<f64>().sqrt();
+        let norm = (0..d_embed)
+            .map(|j| frame[[r, j]] * frame[[r, j]])
+            .sum::<f64>()
+            .sqrt();
         for j in 0..d_embed {
             frame[[r, j]] /= norm.max(1.0e-300);
         }
@@ -3886,7 +3891,9 @@ pub(crate) fn planted_circle_focus_1744() {
     ] {
         let label = assignment_mode.label();
         let (term, seed_dispersion) = planted_circle_seed_term(z.view(), assignment_mode);
-        out.push_str(&format!("FOCUS1744 mode={label} seed_disp={seed_dispersion:.3e}\n"));
+        out.push_str(&format!(
+            "FOCUS1744 mode={label} seed_disp={seed_dispersion:.3e}\n"
+        ));
         for &sparse in &[-8.0_f64, 1.0] {
             for &ard in &[-6.0_f64, -3.0, 0.0, 1.0] {
                 for &smooth in &[-8.0_f64, -5.0, -3.0, -1.0, 0.0, 1.0, 3.0] {
@@ -4057,7 +4064,6 @@ pub(crate) fn sae_value_probe_refusal_classification_is_inner_only() {
         )
     );
 }
-
 
 #[test]
 pub(crate) fn streaming_exact_reml_matches_full_batch_reml_small_sae() {
@@ -4384,7 +4390,9 @@ pub(crate) fn reml_retries_refinement_after_non_pd_undamped_evidence_factor() {
     // bare-`Err` precondition — it proves both that the seed is genuinely
     // indefinite AND that the #1117 deflation engaged).
     let (.., cold_cache) = solve_arrow_newton_step_with_options(&cold_sys, 0.0, 0.0, &options)
-        .expect("cold undamped evidence factor must be spectrally conditioned (#1117), not refused");
+        .expect(
+            "cold undamped evidence factor must be spectrally conditioned (#1117), not refused",
+        );
     let cold_deflated_rows = cold_cache
         .deflation_row_spectra
         .iter()
@@ -7920,8 +7928,8 @@ pub(crate) fn jumprelu_assignment_prior_hessian_diag_is_exact_over_logit_sweep()
 /// reproducer in #174.
 #[test]
 pub(crate) fn ibp_map_k2_periodic_torus_recovers_signal_with_lsq_init() {
-    use gam_linalg::faer_ndarray::{FaerCholesky, fast_ata, fast_atb};
     use faer::Side as FaerSide;
+    use gam_linalg::faer_ndarray::{FaerCholesky, fast_ata, fast_atb};
 
     let n = 200usize;
     let p = 8usize;
@@ -9876,7 +9884,6 @@ pub(crate) fn fixed_state_logdet(
     let (tt, beta) = cache.arrow_log_det();
     tt + beta.expect("dense Schur logdet")
 }
-
 
 // [#780 line-count gate] The #1557 arrow-Schur parallelism-invariance
 // regression test (`arrow_schur_assembly_is_faer_parallelism_invariant_1557`)

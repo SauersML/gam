@@ -373,7 +373,11 @@ pub fn affine_chart_transition(
     // atom whose arc-length coordinate wraps modulo the period does not inject a
     // spurious `±P` jump into the regression.
     let mut order: Vec<usize> = (0..nb).collect();
-    order.sort_by(|&i, &j| xs[i].partial_cmp(&xs[j]).unwrap_or(std::cmp::Ordering::Equal));
+    order.sort_by(|&i, &j| {
+        xs[i]
+            .partial_cmp(&xs[j])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let xo: Vec<f64> = order.iter().map(|&i| xs[i]).collect();
     let mut yo: Vec<f64> = order.iter().map(|&i| ys[i]).collect();
     if let Some(pp) = period_a {
@@ -461,7 +465,7 @@ impl SaeManifoldTerm {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{array, Array3};
+    use ndarray::{Array3, array};
 
     /// A trivial `d = 1` evaluator whose basis is the monomial patch
     /// `Φ(t) = [1, t]` — enough to build straight-line and circle-arc decoders
@@ -522,7 +526,10 @@ mod tests {
         let radial = b.mapv(|v| 2.5 * v);
         let proj = unit_frobenius_tangent_projection(b.view(), radial.view());
         let worst = proj.iter().fold(0.0_f64, |a, &v| a.max(v.abs()));
-        assert!(worst < 1e-12, "radial gradient must project to 0, got {worst}");
+        assert!(
+            worst < 1e-12,
+            "radial gradient must project to 0, got {worst}"
+        );
 
         let tangent = array![[0.0_f64, 1.0], [-1.0, 0.0]]; // ⟨tangent, B⟩ = 0
         let proj_t = unit_frobenius_tangent_projection(b.view(), tangent.view());
@@ -531,7 +538,10 @@ mod tests {
             .zip(tangent.iter())
             .map(|(a, c)| (a - c).abs())
             .fold(0.0_f64, f64::max);
-        assert!(drift < 1e-12, "tangent gradient must pass through, drift {drift}");
+        assert!(
+            drift < 1e-12,
+            "tangent gradient must pass through, drift {drift}"
+        );
     }
 
     #[test]
@@ -593,7 +603,10 @@ mod tests {
         let ed = log_amplitude_hoyer_energy(dense.view(), 1.0).value;
         assert!(es < ed, "sparse energy {es} must be below dense {ed}");
         // Dense K-vector realizes the ratio ceiling √K.
-        assert!((ed - (4.0_f64).sqrt()).abs() < 1e-9, "dense ratio must be √K");
+        assert!(
+            (ed - (4.0_f64).sqrt()).abs() < 1e-9,
+            "dense ratio must be √K"
+        );
     }
 
     #[test]
@@ -615,24 +628,43 @@ mod tests {
         .unwrap()
         .with_basis_evaluator(std::sync::Arc::new(AffineLineEvaluator));
         // Image before the retraction.
-        let before = sample_decoded_curve(&ev, atom.decoder_coefficients.view(), atom.log_amplitude, coords.column(0))
-            .unwrap();
+        let before = sample_decoded_curve(
+            &ev,
+            atom.decoder_coefficients.view(),
+            atom.log_amplitude,
+            coords.column(0),
+        )
+        .unwrap();
         let mut atom = atom;
         let applied = retract_decoder_unit_frobenius(&mut atom);
         assert!(applied, "a non-unit decoder must be retracted");
         let norm = decoder_frobenius_norm(atom.decoder_coefficients.view());
-        assert!((norm - 1.0).abs() < 1e-12, "‖B‖_F must be pinned to 1, got {norm}");
+        assert!(
+            (norm - 1.0).abs() < 1e-12,
+            "‖B‖_F must be pinned to 1, got {norm}"
+        );
         // Image after — exp(s)·Φ·B must be byte-close to the original.
-        let after = sample_decoded_curve(&ev, atom.decoder_coefficients.view(), atom.log_amplitude, coords.column(0))
-            .unwrap();
+        let after = sample_decoded_curve(
+            &ev,
+            atom.decoder_coefficients.view(),
+            atom.log_amplitude,
+            coords.column(0),
+        )
+        .unwrap();
         let drift = before
             .iter()
             .zip(after.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f64, f64::max);
-        assert!(drift < 1e-10, "retraction must be image-frozen, drift {drift}");
+        assert!(
+            drift < 1e-10,
+            "retraction must be image-frozen, drift {drift}"
+        );
         // Idempotent: a second retraction is a no-op.
-        assert!(!retract_decoder_unit_frobenius(&mut atom), "retraction must be idempotent");
+        assert!(
+            !retract_decoder_unit_frobenius(&mut atom),
+            "retraction must be idempotent"
+        );
     }
 
     #[test]
@@ -654,10 +686,26 @@ mod tests {
         let pts_b = sample_decoded_curve(&ev, db.view(), 0.0, cb.view()).unwrap();
         let tr = affine_chart_transition(pts_a.view(), ca.view(), pts_b.view(), cb.view(), None)
             .unwrap();
-        assert!((tr.slope + 1.0).abs() < 1e-6, "slope must be -1, got {}", tr.slope);
-        assert!((tr.offset - 1.0).abs() < 1e-6, "offset must be 1, got {}", tr.offset);
-        assert!(tr.coord_residual < 1e-6, "coord residual {}", tr.coord_residual);
-        assert!(tr.geometric_residual < 1e-6, "geometric residual {}", tr.geometric_residual);
+        assert!(
+            (tr.slope + 1.0).abs() < 1e-6,
+            "slope must be -1, got {}",
+            tr.slope
+        );
+        assert!(
+            (tr.offset - 1.0).abs() < 1e-6,
+            "offset must be 1, got {}",
+            tr.offset
+        );
+        assert!(
+            tr.coord_residual < 1e-6,
+            "coord residual {}",
+            tr.coord_residual
+        );
+        assert!(
+            tr.geometric_residual < 1e-6,
+            "geometric residual {}",
+            tr.geometric_residual
+        );
         assert!(tr.same_manifold(1.0, 1e-3), "must be flagged same-manifold");
     }
 
@@ -675,7 +723,13 @@ mod tests {
         let pts_b = sample_decoded_curve(&ev, db.view(), 0.0, cb.view()).unwrap();
         let tr = affine_chart_transition(pts_a.view(), ca.view(), pts_b.view(), cb.view(), None)
             .unwrap();
-        assert!(tr.geometric_residual > 1.0, "disjoint curve must have large geometric residual");
-        assert!(!tr.same_manifold(1.0, 1e-2), "disjoint curve must be rejected");
+        assert!(
+            tr.geometric_residual > 1.0,
+            "disjoint curve must have large geometric residual"
+        );
+        assert!(
+            !tr.same_manifold(1.0, 1e-2),
+            "disjoint curve must be rejected"
+        );
     }
 }

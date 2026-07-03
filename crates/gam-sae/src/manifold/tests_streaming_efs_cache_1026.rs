@@ -55,7 +55,11 @@ fn streaming_cache_is_efs_dropin_for_dense_cache_1026() {
         "streaming cache yields a different ARD-trace atom count than the dense cache"
     );
     for (k, (d, s)) in dense_traces.iter().zip(stream_traces.iter()).enumerate() {
-        assert_eq!(d.len(), s.len(), "ARD-trace latent dim mismatch at atom {k}");
+        assert_eq!(
+            d.len(),
+            s.len(),
+            "ARD-trace latent dim mismatch at atom {k}"
+        );
         for (dv, sv) in d.iter().zip(s.iter()) {
             assert_abs_diff_eq!(dv, sv, epsilon = 1.0e-8);
         }

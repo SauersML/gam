@@ -866,13 +866,7 @@ mod exact_solve_tests {
         let k = 5usize;
         let p = 4usize;
         // Overlapping 3-atom supports (a sliding window) with generic codes.
-        let supports: [[u32; 3]; 5] = [
-            [0, 1, 2],
-            [1, 2, 3],
-            [2, 3, 4],
-            [3, 4, 0],
-            [4, 0, 1],
-        ];
+        let supports: [[u32; 3]; 5] = [[0, 1, 2], [1, 2, 3], [2, 3, 4], [3, 4, 0], [4, 0, 1]];
         let codevals: [[f32; 3]; 5] = [
             [1.0, 0.5, -0.3],
             [0.7, -0.2, 0.4],

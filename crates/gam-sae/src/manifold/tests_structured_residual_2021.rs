@@ -70,12 +70,12 @@ fn build_term(n: usize, p: usize, k: usize) -> SaeManifoldTerm {
             .unwrap()
         })
         .collect();
-    let coords: Vec<Array2<f64>> =
-        (0..k).map(|_| Array2::<f64>::from_shape_fn((n, 1), |(r, _)| 0.05 * (r as f64))).collect();
+    let coords: Vec<Array2<f64>> = (0..k)
+        .map(|_| Array2::<f64>::from_shape_fn((n, 1), |(r, _)| 0.05 * (r as f64)))
+        .collect();
     let manifolds = vec![LatentManifold::Euclidean; k];
-    let logits = Array2::<f64>::from_shape_fn((n, k), |(r, c)| {
-        0.3 * (c as f64) - 0.1 * (r as f64) + 0.2
-    });
+    let logits =
+        Array2::<f64>::from_shape_fn((n, k), |(r, c)| 0.3 * (c as f64) - 0.1 * (r as f64) + 0.2);
     // IBP-MAP (fixed alpha): small K ⇒ dense layout, so the iid and whitened
     // assemblies share the exact same row structure and only the metric differs.
     let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
@@ -105,8 +105,8 @@ fn fit_structured_metric(n: usize, p: usize) -> gam_problem::RowMetric {
         activity[row] = 0.25 + (row as f64) / (n as f64);
         let amp = activity[row].sqrt();
         for i in 0..p {
-            residuals[[row, i]] =
-                amp * lam[i % lam.len()] * common + dscale[i % dscale.len()] * lcg_normal(&mut seed);
+            residuals[[row, i]] = amp * lam[i % lam.len()] * common
+                + dscale[i % dscale.len()] * lcg_normal(&mut seed);
         }
     }
     let model = StructuredResidualModel::fit(ResidualFactorInput {
@@ -139,9 +139,14 @@ fn structured_residual_metric_whitens_loss_and_gradient_2021() {
     let rho = SaeManifoldRho::new(-1.0, -6.0, vec![Array1::<f64>::from_elem(1, 0.0); k]);
 
     // ---- iid (Euclidean) baseline: no metric installed. ----
-    assert!(term.row_metric().is_none(), "precondition: no metric ⇒ isotropic path");
+    assert!(
+        term.row_metric().is_none(),
+        "precondition: no metric ⇒ isotropic path"
+    );
     let loss_iid = term.loss(target.view(), &rho).unwrap();
-    let sys_iid = term.assemble_arrow_schur(target.view(), &rho, None).unwrap();
+    let sys_iid = term
+        .assemble_arrow_schur(target.view(), &rho, None)
+        .unwrap();
     let g_iid = grad_norm_sq(&sys_iid);
 
     // ---- install the WhitenedStructured metric and re-evaluate. ----
@@ -157,7 +162,9 @@ fn structured_residual_metric_whitens_loss_and_gradient_2021() {
     );
 
     let loss_str = term.loss(target.view(), &rho).unwrap();
-    let sys_str = term.assemble_arrow_schur(target.view(), &rho, None).unwrap();
+    let sys_str = term
+        .assemble_arrow_schur(target.view(), &rho, None)
+        .unwrap();
     let g_str = grad_norm_sq(&sys_str);
 
     // (b) data-fit VALUE moved materially (whitening is active, not a no-op).

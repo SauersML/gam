@@ -19,13 +19,13 @@
 //! integration test (the active path is rarely fired for finite bases).
 
 use crate::assignment::{AssignmentMode, SaeAssignment};
-use crate::chart_canonicalization::{unit_speed_retraction, CanonicalChartTopology};
+use crate::chart_canonicalization::{CanonicalChartTopology, unit_speed_retraction};
 use crate::manifold::{SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm};
 use gam_terms::latent::LatentManifold;
-use ndarray::{array, Array2};
+use ndarray::{Array2, array};
 use std::sync::Arc;
 
-use super::tests::{periodic_basis, TestPeriodicEvaluator};
+use super::tests::{TestPeriodicEvaluator, periodic_basis};
 
 fn build_circle_term(coords_col: &Array2<f64>, decoder: &Array2<f64>) -> SaeManifoldTerm {
     let n = coords_col.nrows();
@@ -83,7 +83,9 @@ fn unit_speed_hook_gradient_consistent_and_noop_safe_2022() {
     let rho = SaeManifoldRho::new(0.0, -4.0, vec![array![0.0]]); // λ_sparse=1, α=1 ARD
 
     // ================= GRADIENT CONSISTENCY (incl. ARD coord grad) =================
-    let sys = term.assemble_arrow_schur(target.view(), &rho, None).unwrap();
+    let sys = term
+        .assemble_arrow_schur(target.view(), &rho, None)
+        .unwrap();
     let h = 1.0e-6_f64;
 
     // t-coordinate FD — guards ∂(data_fit + ARD)/∂t. A t-perturbation is invisible
@@ -142,9 +144,18 @@ fn unit_speed_hook_gradient_consistent_and_noop_safe_2022() {
         "a non-uniform harmonic d=1 chart cannot meet the 1e-9 recomposition gate ⇒ must honest-skip"
     );
     let l1 = term.loss(target.view(), &rho).unwrap();
-    assert!((l1.data_fit - l0.data_fit).abs() < 1.0e-12, "honest-skip must not move data_fit");
-    assert!((l1.smoothness - l0.smoothness).abs() < 1.0e-12, "honest-skip must not move smoothness");
-    assert!((l1.ard - l0.ard).abs() < 1.0e-12, "honest-skip must not move ARD");
+    assert!(
+        (l1.data_fit - l0.data_fit).abs() < 1.0e-12,
+        "honest-skip must not move data_fit"
+    );
+    assert!(
+        (l1.smoothness - l0.smoothness).abs() < 1.0e-12,
+        "honest-skip must not move smoothness"
+    );
+    assert!(
+        (l1.ard - l0.ard).abs() < 1.0e-12,
+        "honest-skip must not move ARD"
+    );
     assert!(
         (l1.assignment_sparsity - l0.assignment_sparsity).abs() < 1.0e-12,
         "honest-skip must not move the assignment prior"
@@ -155,16 +166,25 @@ fn unit_speed_hook_gradient_consistent_and_noop_safe_2022() {
         .zip(coords1.iter())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0_f64, f64::max);
-    assert!(cdrift == 0.0, "honest-skip must leave coords byte-unchanged; drift {cdrift}");
+    assert!(
+        cdrift == 0.0,
+        "honest-skip must leave coords byte-unchanged; drift {cdrift}"
+    );
     let ddrift = decoder0
         .iter()
         .zip(term.atoms[0].decoder_coefficients.iter())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0_f64, f64::max);
-    assert!(ddrift == 0.0, "honest-skip must leave the decoder byte-unchanged; drift {ddrift}");
+    assert!(
+        ddrift == 0.0,
+        "honest-skip must leave the decoder byte-unchanged; drift {ddrift}"
+    );
     // The in-loop hook re-gauges 0 atoms on this term and is a strict no-op.
     let n_retracted = term.retract_unit_speed_charts_in_loop().unwrap();
-    assert_eq!(n_retracted, 0, "in-loop hook must re-gauge 0 atoms when nothing can reparam-close");
+    assert_eq!(
+        n_retracted, 0,
+        "in-loop hook must re-gauge 0 atoms when nothing can reparam-close"
+    );
     let l2 = term.loss(target.view(), &rho).unwrap();
     assert!((l2.data_fit - l0.data_fit).abs() < 1.0e-12 && (l2.ard - l0.ard).abs() < 1.0e-12);
 

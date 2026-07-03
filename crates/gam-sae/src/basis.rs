@@ -166,8 +166,12 @@ fn duchon_effective_order_for_eta(
         && centers.nrows() <= duchon_polynomial_column_count(centers.ncols(), effective)
     {
         effective = match effective {
-            gam_terms::basis::DuchonNullspaceOrder::Zero => gam_terms::basis::DuchonNullspaceOrder::Zero,
-            gam_terms::basis::DuchonNullspaceOrder::Linear => gam_terms::basis::DuchonNullspaceOrder::Zero,
+            gam_terms::basis::DuchonNullspaceOrder::Zero => {
+                gam_terms::basis::DuchonNullspaceOrder::Zero
+            }
+            gam_terms::basis::DuchonNullspaceOrder::Linear => {
+                gam_terms::basis::DuchonNullspaceOrder::Zero
+            }
             gam_terms::basis::DuchonNullspaceOrder::Degree(2) => {
                 gam_terms::basis::DuchonNullspaceOrder::Linear
             }

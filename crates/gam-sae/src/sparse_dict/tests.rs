@@ -268,6 +268,25 @@ fn tile_scorer_matches_untiled_brute_force() {
 }
 
 #[test]
+fn tile_scorer_dispatch_matches_cpu_below_device_floor() {
+    let p = 5;
+    let k = 37;
+    let rows = Array2::<f32>::from_shape_fn((3, p), |(r, c)| {
+        (((r * 11 + c * 7 + 3) % 13) as f32 - 6.0) / 6.0
+    });
+    let decoder = Array2::<f32>::from_shape_fn((k, p), |(atom, c)| {
+        (((atom * 3 + c * 5 + 1) % 7) as f32 - 3.0) / 3.0
+    });
+    let scorer = TileScorer::new(4, 7);
+
+    let cpu = scorer.route_minibatch(rows.view(), decoder.view());
+    let dispatched = scorer
+        .route_minibatch_dispatch(rows.view(), decoder.view())
+        .expect("dispatch route");
+    assert_eq!(dispatched, cpu);
+}
+
+#[test]
 fn sparse_trainer_recovers_planted_dictionary_beats_pca_baseline() {
     // Planted K-atom rank-1 mixture; the sparse trainer with top_s=2 should
     // reconstruct it at high EV and match-or-beat a rank-K PCA baseline.
@@ -538,7 +557,10 @@ fn read_npy_f32_2d(path: &str) -> (usize, usize, Vec<f32>) {
 #[test]
 fn real_olmo_sparse_dict_ev_vs_k_parity() {
     let files = [
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/data/olmo_l18_pca64_635.npy"),
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/data/olmo_l18_pca64_635.npy"
+        ),
         concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/data/olmo_mixedlayer_pca64_768.npy"
@@ -565,7 +587,11 @@ fn real_olmo_sparse_dict_ev_vs_k_parity() {
         for (r, &i) in te.iter().enumerate() {
             x_te.row_mut(r).assign(&x.row(i));
         }
-        println!("\n=== {path}  (N={n}, P={p}, train={}, test={}) ===", tr.len(), te.len());
+        println!(
+            "\n=== {path}  (N={n}, P={p}, train={}, test={}) ===",
+            tr.len(),
+            te.len()
+        );
         for s in [8usize, 32usize] {
             let tile = p.max(1);
             let pca = pca_ev_held_out(x_tr.view(), x_te.view(), s);
@@ -588,7 +614,11 @@ fn real_olmo_sparse_dict_ev_vs_k_parity() {
                 let fit = fit_sparse_dictionary(x_tr.view(), &config).expect("fit");
                 let ev_te = held_out_ev(fit.decoder.view(), x_te.view(), s, tile, 1.0e-6);
                 let dead = dead_atom_fraction(&fit);
-                let mono = if ev_te + 5.0e-3 >= prev { "" } else { "  <-- DROP" };
+                let mono = if ev_te + 5.0e-3 >= prev {
+                    ""
+                } else {
+                    "  <-- DROP"
+                };
                 println!(
                     "    K={k:5}  train_EV={:.4}  test_EV={ev_te:.4}  dead={dead:.3}  epochs={}{mono}",
                     fit.explained_variance, fit.epochs

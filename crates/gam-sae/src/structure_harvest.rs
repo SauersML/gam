@@ -43,17 +43,6 @@ use std::sync::Arc;
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
-use gam_solve::gaussian_reml::gaussian_reml_multi_closed_form;
-use gam_solve::inference::residual_factor::{ResidualFactorInput, StructuredResidualModel};
-use gam_terms::inference::structure_evidence::{ClaimKind, StructureLedger};
-use gam_solve::structure_search::{
-    CollapseAction, MoveBudget, MoveProposal, SearchLedger, SearchOutcome, StructureMove, search,
-};
-use gam_solve::{
-    AutoTopologyKind, TopologyAutoFitEvidence, TopologyAutoSelector, TopologyScoreScale,
-    select_topology_with_fit,
-};
-use gam_terms::latent::{LatentIdMode, LatentManifold};
 use crate::atom_codes::SparseAtomCodes;
 use crate::basis::{
     CylinderHarmonicEvaluator, EuclideanPatchEvaluator, PeriodicHarmonicEvaluator,
@@ -62,10 +51,21 @@ use crate::basis::{
 use crate::manifold::{
     AssignmentMode, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
 };
+use gam_runtime::warm_start::Fingerprinter;
+use gam_solve::gaussian_reml::gaussian_reml_multi_closed_form;
+use gam_solve::inference::residual_factor::{ResidualFactorInput, StructuredResidualModel};
+use gam_solve::structure_search::{
+    CollapseAction, MoveBudget, MoveProposal, SearchLedger, SearchOutcome, StructureMove, search,
+};
+use gam_solve::{
+    AutoTopologyKind, TopologyAutoFitEvidence, TopologyAutoSelector, TopologyScoreScale,
+    select_topology_with_fit,
+};
+use gam_terms::inference::structure_evidence::{ClaimKind, StructureLedger};
+use gam_terms::latent::{LatentIdMode, LatentManifold};
 use gam_terms::structure::anova_atom::{
     CarveReport, FissionDecision, carve, carve_input_from_fitted_atom, fission_decision,
 };
-use gam_runtime::warm_start::Fingerprinter;
 
 /// Per-row soft-assignment mass below which an atom is treated as INACTIVE on
 /// that row when deriving the discrete co-activation support. A soft softmax /
@@ -794,11 +794,8 @@ fn duplicate_atom(
     }
     let mut coords = term.assignment.coords.clone();
     coords.push(term.assignment.coords[parent].clone());
-    let assignment = crate::manifold::SaeAssignment::with_mode(
-        logits,
-        coords,
-        term.assignment.mode,
-    )?;
+    let assignment =
+        crate::manifold::SaeAssignment::with_mode(logits, coords, term.assignment.mode)?;
     let child = SaeManifoldTerm::new(atoms, assignment)?;
 
     let mut child_rho = rho.clone();
@@ -1153,14 +1150,9 @@ fn fit_topology_candidate(
     // freedom `tr[(ΦᵀWΦ + λS)⁻¹ ΦᵀWΦ]`. We feed `reml_score` as `raw_reml` and
     // `edf` as `effective_dim`, and report `null_dim = 0` so the TK normalizer does
     // NOT re-subtract a null-space term the REML score already integrated out.
-    let reml_fit = gaussian_reml_multi_closed_form(
-        phi.view(),
-        target,
-        s_raw.view(),
-        Some(weights),
-        None,
-    )
-    .map_err(|e| format!("fit_topology_candidate: REML evidence: {e:?}"))?;
+    let reml_fit =
+        gaussian_reml_multi_closed_form(phi.view(), target, s_raw.view(), Some(weights), None)
+            .map_err(|e| format!("fit_topology_candidate: REML evidence: {e:?}"))?;
     let lambda = reml_fit.lambda;
     if !(lambda.is_finite() && lambda >= 0.0) {
         return Err(format!(
@@ -1448,11 +1440,8 @@ fn born_atom(
     }
     let mut coords = term.assignment.coords.clone();
     coords.push(born_coord_block);
-    let assignment = crate::manifold::SaeAssignment::with_mode(
-        logits,
-        coords,
-        term.assignment.mode,
-    )?;
+    let assignment =
+        crate::manifold::SaeAssignment::with_mode(logits, coords, term.assignment.mode)?;
     let child = SaeManifoldTerm::new(atoms, assignment)?;
 
     let mut child_rho = rho.clone();
@@ -2064,12 +2053,12 @@ pub fn rounds_to_json(rounds: &[SearchLedger]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gam_solve::structure_search::{CollapseAction, CollapseEvent};
-    use gam_terms::latent::LatentManifold;
     use crate::manifold::{
         AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
         SaeBasisEvaluator, SaeManifoldAtom,
     };
+    use gam_solve::structure_search::{CollapseAction, CollapseEvent};
+    use gam_terms::latent::LatentManifold;
     use ndarray::Array2;
     use std::sync::Arc;
 
@@ -3166,7 +3155,11 @@ mod tests {
         // (2) Warm-start preserved EXACTLY: the equal-mass combined decoder is the
         // original (the anti-symmetric ±ε perturbation cancels).
         let combined = (d0 + d1).mapv(|x| 0.5 * x);
-        let warm_err = (&combined - &orig).iter().map(|x| x * x).sum::<f64>().sqrt();
+        let warm_err = (&combined - &orig)
+            .iter()
+            .map(|x| x * x)
+            .sum::<f64>()
+            .sqrt();
         assert!(
             warm_err < 1.0e-12,
             "mass-split combined decoder must equal the original; err = {warm_err}"

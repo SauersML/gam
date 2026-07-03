@@ -47,11 +47,16 @@ mod tests {
         );
 
         // Assignment logits: n×(K1+K2), columns 0..K1 == primary, K1.. == secondary.
-        assert_eq!(merged.assignment.logits.dim(), (n, k1 + k2), "merged logits shape");
+        assert_eq!(
+            merged.assignment.logits.dim(),
+            (n, k1 + k2),
+            "merged logits shape"
+        );
         for j in 0..k1 {
             for i in 0..n {
                 assert_eq!(
-                    merged.assignment.logits[[i, j]], a_logits[[i, j]],
+                    merged.assignment.logits[[i, j]],
+                    a_logits[[i, j]],
                     "primary logits column {j} preserved"
                 );
             }
@@ -59,7 +64,8 @@ mod tests {
         for j in 0..k2 {
             for i in 0..n {
                 assert_eq!(
-                    merged.assignment.logits[[i, k1 + j]], b_logits[[i, j]],
+                    merged.assignment.logits[[i, k1 + j]],
+                    b_logits[[i, j]],
                     "secondary logits column {j} placed at {}",
                     k1 + j
                 );
@@ -189,7 +195,11 @@ mod tests {
         // Stamp unique per-slot sentinels.
         for j in 0..k {
             merged.atoms[j].name = format!("orig{j}");
-            merged.assignment.logits.column_mut(j).fill((j as f64 + 1.0) * 10.0);
+            merged
+                .assignment
+                .logits
+                .column_mut(j)
+                .fill((j as f64 + 1.0) * 10.0);
             merged.assignment.ungated[j] = j % 2 == 0;
             rho.log_lambda_smooth[j] = j as f64;
             rho.log_ard[j][0] = 100.0 + j as f64;
@@ -210,7 +220,10 @@ mod tests {
                 );
             }
             assert_eq!(merged.assignment.ungated[i], o % 2 == 0, "ungated at {i}");
-            assert_eq!(rho.log_lambda_smooth[i], o as f64, "log_lambda_smooth at {i}");
+            assert_eq!(
+                rho.log_lambda_smooth[i], o as f64,
+                "log_lambda_smooth at {i}"
+            );
             assert_eq!(rho.log_ard[i][0], 100.0 + o as f64, "log_ard at {i}");
         }
 
@@ -219,9 +232,15 @@ mod tests {
         for (i, &o) in order.iter().enumerate() {
             inv[o] = i;
         }
-        merged.reorder_atoms(&inv, &mut rho).expect("inverse permutation");
+        merged
+            .reorder_atoms(&inv, &mut rho)
+            .expect("inverse permutation");
         for j in 0..k {
-            assert_eq!(merged.atoms[j].name, format!("orig{j}"), "round-trip name {j}");
+            assert_eq!(
+                merged.atoms[j].name,
+                format!("orig{j}"),
+                "round-trip name {j}"
+            );
             assert_eq!(rho.log_lambda_smooth[j], j as f64, "round-trip smooth {j}");
         }
     }
@@ -257,6 +276,9 @@ mod tests {
         let mut bad_rho = a_rho.clone();
         bad_rho.log_lambda_smooth.push(0.0); // len 3 != K1 2
         let err = crate::manifold::SaeManifoldTerm::merge_tiers(a_term, &bad_rho, b_term, &b_rho);
-        assert!(err.is_err(), "merge_tiers must reject a rho whose length != K");
+        assert!(
+            err.is_err(),
+            "merge_tiers must reject a rho whose length != K"
+        );
     }
 }

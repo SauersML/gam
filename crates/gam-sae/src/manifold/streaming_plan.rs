@@ -500,9 +500,8 @@ mod host_in_core_budget_tests {
 
         // Tiny plan: the #1026 toy shape n=120, p=2, K=1 (one M=3 atom) — a few
         // KiB working set, far below the 16 MiB always-admit size.
-        let tiny = sae_streaming_plan_from_budget(
-            120, 3, 1, 1, 6, budget, SAE_CPU_L2_CACHE_BYTES, avail,
-        );
+        let tiny =
+            sae_streaming_plan_from_budget(120, 3, 1, 1, 6, budget, SAE_CPU_L2_CACHE_BYTES, avail);
         assert!(
             tiny.estimated_direct_peak_bytes <= SAE_DIRECT_ALWAYS_ADMIT_BYTES,
             "toy plan should be far below the always-admit size, got {} bytes",
@@ -522,7 +521,14 @@ mod host_in_core_budget_tests {
         // Large plan at the same collapsed budget must still NOT be direct-admitted
         // (its peak exceeds both the budget and the 16 MiB always-admit size).
         let large = sae_streaming_plan_from_budget(
-            10_000, 4_096, 8, 8, 64, budget, SAE_CPU_L2_CACHE_BYTES, avail,
+            10_000,
+            4_096,
+            8,
+            8,
+            64,
+            budget,
+            SAE_CPU_L2_CACHE_BYTES,
+            avail,
         );
         assert!(
             large.estimated_direct_peak_bytes > SAE_DIRECT_ALWAYS_ADMIT_BYTES,

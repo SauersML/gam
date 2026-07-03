@@ -145,13 +145,9 @@ pub(crate) fn planted_circle_multi_atom_jumprelu_clears_startup_validation_1782(
     .unwrap();
     let term = SaeManifoldTerm::new(atoms, assignment).unwrap();
 
-    let init_rho = SaeManifoldRho::new(
-        0.02_f64.ln(),
-        1.0_f64.ln(),
-        vec![array![0.0]; k_atoms],
-    )
-    .seed_scaled_by_dispersion_for_assignment(1.0, assignment_mode)
-    .unwrap();
+    let init_rho = SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![array![0.0]; k_atoms])
+        .seed_scaled_by_dispersion_for_assignment(1.0, assignment_mode)
+        .unwrap();
     let init_rho_flat = init_rho.to_flat();
     let n_params = init_rho_flat.len();
     let mut objective =

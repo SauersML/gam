@@ -33,7 +33,7 @@ use gam_solve::inference::residual_factor::{ResidualFactorInput, StructuredResid
 use gam_terms::latent::LatentManifold;
 use ndarray::{Array1, Array2};
 
-use super::tests::{periodic_basis, small_two_atom_periodic_term, TestPeriodicEvaluator};
+use super::tests::{TestPeriodicEvaluator, periodic_basis, small_two_atom_periodic_term};
 use std::sync::Arc;
 
 /// The analytic outer ρ-gradient assembled off the STREAMING cache
@@ -181,9 +181,8 @@ fn build_softmax_term(n: usize, p: usize, k: usize) -> SaeManifoldTerm {
         })
         .collect();
     let manifolds = vec![LatentManifold::Circle { period: 1.0 }; k];
-    let logits = Array2::<f64>::from_shape_fn((n, k), |(r, c)| {
-        0.3 * (c as f64) - 0.1 * (r as f64) + 0.2
-    });
+    let logits =
+        Array2::<f64>::from_shape_fn((n, k), |(r, c)| 0.3 * (c as f64) - 0.1 * (r as f64) + 0.2);
     let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
         logits,
         coord_cols,
@@ -207,8 +206,8 @@ fn fit_structured_metric(n: usize, p: usize) -> gam_problem::RowMetric {
         activity[row] = 0.25 + (row as f64) / (n as f64);
         let amp = activity[row].sqrt();
         for i in 0..p {
-            residuals[[row, i]] =
-                amp * lam[i % lam.len()] * common + dscale[i % dscale.len()] * lcg_normal(&mut seed);
+            residuals[[row, i]] = amp * lam[i % lam.len()] * common
+                + dscale[i % dscale.len()] * lcg_normal(&mut seed);
         }
     }
     let model = StructuredResidualModel::fit(ResidualFactorInput {
@@ -256,7 +255,10 @@ fn wide_border_k32_p128_plan_routes_to_streaming() {
         "the matrix-free plan ({} bytes) must be admitted so the fit has a route",
         plan.estimated_matrix_free_peak_bytes
     );
-    assert!(plan.streaming, "a non-direct-admitted plan must select streaming");
+    assert!(
+        plan.streaming,
+        "a non-direct-admitted plan must select streaming"
+    );
     // The admission gate must accept the plan (no 'working set exceeds budget'
     // hard error) precisely because the matrix-free lane is admitted.
     plan.admitted_or_error(n, border_dim, k)
@@ -288,7 +290,8 @@ fn whitened_streaming_criterion_completes() {
     term.set_row_metric(metric).unwrap();
 
     let target = Array2::<f64>::from_shape_fn((n, p), |(r, c)| {
-        0.4 - 0.15 * (r as f64 / n as f64) + 0.25 * (c as f64 / p as f64)
+        0.4 - 0.15 * (r as f64 / n as f64)
+            + 0.25 * (c as f64 / p as f64)
             + 0.05 * (((r + c) % 7) as f64)
     });
     let rho = SaeManifoldRho::new(

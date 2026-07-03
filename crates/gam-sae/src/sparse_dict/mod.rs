@@ -48,11 +48,11 @@ pub use block_stream::{
 };
 pub use codes::SparseCode;
 pub use scoring::{TileScorer, top_s_online};
-pub use stream::{EpochStats, ShardStats, SparseDictArtifact, SparseDictStreamState};
 #[cfg(target_os = "linux")]
 pub use scoring_gpu::{
     DEVICE_SCORE_BLOCK_MIN_ELEMS, ScoreBlockPath, score_block_cpu, score_block_required,
 };
+pub use stream::{EpochStats, ShardStats, SparseDictArtifact, SparseDictStreamState};
 
 use ndarray::{Array2, ArrayView2};
 

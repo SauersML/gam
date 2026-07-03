@@ -23,9 +23,9 @@
 use super::tests::{deterministic_circle_noise, global_ev};
 use super::*;
 use crate::basis::{PeriodicHarmonicEvaluator, SaeBasisSecondJet};
-use gam_linalg::faer_ndarray::{fast_atb, FaerCholesky};
+use gam_linalg::faer_ndarray::{FaerCholesky, fast_atb};
 use gam_solve::rho_optimizer::OuterProblem;
-use ndarray::{array, s, Array2, ArrayView2};
+use ndarray::{Array2, ArrayView2, array, s};
 use std::sync::Arc;
 
 /// Two planted circles on DISJOINT ambient column parities (circle A on the even
@@ -146,12 +146,20 @@ fn two_circle_periodic_term(
     let assignment =
         SaeAssignment::from_blocks_with_mode_and_manifolds(logits, coords_blocks, manifolds, mode)
             .unwrap();
-    (SaeManifoldTerm::new(atoms, assignment).unwrap(), seed_dispersion)
+    (
+        SaeManifoldTerm::new(atoms, assignment).unwrap(),
+        seed_dispersion,
+    )
 }
 
 /// Drive the full outer `OuterProblem::run` path on a wide two-circle fixture and
 /// return `(reconstruction EV, probe telemetry)`.
-fn run_wide_outer_fit(n: usize, p: usize, k: usize, harmonics: usize) -> (f64, OuterProbeTelemetry) {
+fn run_wide_outer_fit(
+    n: usize,
+    p: usize,
+    k: usize,
+    harmonics: usize,
+) -> (f64, OuterProbeTelemetry) {
     let z = two_circle_wide_target(n, p, 0.05);
     let (term, seed_dispersion) = two_circle_periodic_term(z.view(), k, harmonics);
     let mode = AssignmentMode::ibp_map(1.0, 1.0, false);

@@ -71,10 +71,12 @@ fn build_term(n: usize, p: usize, k: usize) -> SaeManifoldTerm {
             .unwrap()
         })
         .collect();
-    let coords: Vec<Array2<f64>> =
-        (0..k).map(|_| Array2::<f64>::from_shape_fn((n, 1), |(r, _)| 0.05 * (r as f64))).collect();
+    let coords: Vec<Array2<f64>> = (0..k)
+        .map(|_| Array2::<f64>::from_shape_fn((n, 1), |(r, _)| 0.05 * (r as f64)))
+        .collect();
     let manifolds = vec![LatentManifold::Euclidean; k];
-    let logits = Array2::<f64>::from_shape_fn((n, k), |(r, c)| 0.3 * (c as f64) - 0.1 * (r as f64) + 0.2);
+    let logits =
+        Array2::<f64>::from_shape_fn((n, k), |(r, c)| 0.3 * (c as f64) - 0.1 * (r as f64) + 0.2);
     let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
         logits,
         coords,
@@ -96,7 +98,8 @@ fn target(n: usize, p: usize) -> Array2<f64> {
 /// the likelihood *in name* yet reproduce the plain-MSE arithmetic exactly.
 fn behavioral_fisher_identity(n: usize, p: usize) -> RowMetric {
     // probes[row, i, k] = δ_ik (same identity on every row).
-    let probes = Array3::<f64>::from_shape_fn((n, p, p), |(_, i, k)| if i == k { 1.0 } else { 0.0 });
+    let probes =
+        Array3::<f64>::from_shape_fn((n, p, p), |(_, i, k)| if i == k { 1.0 } else { 0.0 });
     let u = pack_probe_factors(probes.view()).unwrap();
     RowMetric::behavioral_fisher(Arc::new(u), p, p).unwrap()
 }
@@ -143,9 +146,19 @@ fn behavioral_fisher_identity_reproduces_plain_mse_reml_assembly() {
     // but the metric_rank equals p so the whitened residual-dof accounting is
     // unchanged, and the identity factor makes the whitened residual == residual.
     let metric = behavioral_fisher_identity(n, p);
-    assert!(metric.whitens_likelihood(), "BehavioralFisher must whiten the likelihood");
-    assert_eq!(metric.provenance(), MetricProvenance::BehavioralFisher { probes: p });
-    assert_eq!(metric.metric_rank(), p, "G=I metric rank must equal p (dof preserved)");
+    assert!(
+        metric.whitens_likelihood(),
+        "BehavioralFisher must whiten the likelihood"
+    );
+    assert_eq!(
+        metric.provenance(),
+        MetricProvenance::BehavioralFisher { probes: p }
+    );
+    assert_eq!(
+        metric.metric_rank(),
+        p,
+        "G=I metric rank must equal p (dof preserved)"
+    );
     term.set_row_metric(metric).unwrap();
     assert!(term.row_metric().is_some_and(|m| m.whitens_likelihood()));
 
@@ -166,14 +179,24 @@ fn behavioral_fisher_identity_reproduces_plain_mse_reml_assembly() {
     // differentiates — matches entry-for-entry. β-tier gradient:
     assert_eq!(sys_gls.gb.len(), sys_iid.gb.len());
     for (a, b) in sys_gls.gb.iter().zip(sys_iid.gb.iter()) {
-        assert!((a - b).abs() <= 1e-12 * (1.0 + b.abs()), "gb mismatch: {a} vs {b}");
+        assert!(
+            (a - b).abs() <= 1e-12 * (1.0 + b.abs()),
+            "gb mismatch: {a} vs {b}"
+        );
     }
     // Per-row t-tier gradient:
     assert_eq!(sys_gls.rows.len(), sys_iid.rows.len());
     for (rg, ri) in sys_gls.rows.iter().zip(sys_iid.rows.iter()) {
-        assert_eq!(rg.gt.len(), ri.gt.len(), "per-row t-gradient length mismatch");
+        assert_eq!(
+            rg.gt.len(),
+            ri.gt.len(),
+            "per-row t-gradient length mismatch"
+        );
         for (a, b) in rg.gt.iter().zip(ri.gt.iter()) {
-            assert!((a - b).abs() <= 1e-12 * (1.0 + b.abs()), "gt mismatch: {a} vs {b}");
+            assert!(
+                (a - b).abs() <= 1e-12 * (1.0 + b.abs()),
+                "gt mismatch: {a} vs {b}"
+            );
         }
     }
 }
@@ -195,7 +218,10 @@ fn behavioral_fisher_anisotropic_moves_only_the_reconstruction() {
 
     let metric = behavioral_fisher_anisotropic(n, p);
     assert!(metric.whitens_likelihood());
-    assert!(matches!(metric.provenance(), MetricProvenance::BehavioralFisher { .. }));
+    assert!(matches!(
+        metric.provenance(),
+        MetricProvenance::BehavioralFisher { .. }
+    ));
     term.set_row_metric(metric).unwrap();
 
     let loss_gls = term.loss(z.view(), &rho).unwrap();
@@ -203,7 +229,12 @@ fn behavioral_fisher_anisotropic_moves_only_the_reconstruction() {
 
     // Data-fit moved materially (the GLS weighting is genuinely anisotropic).
     let df_rel = (loss_gls.data_fit - loss_iid.data_fit).abs() / (1.0 + loss_iid.data_fit.abs());
-    assert!(df_rel > 1e-3, "GLS data-fit ({}) must differ from MSE ({})", loss_gls.data_fit, loss_iid.data_fit);
+    assert!(
+        df_rel > 1e-3,
+        "GLS data-fit ({}) must differ from MSE ({})",
+        loss_gls.data_fit,
+        loss_iid.data_fit
+    );
     assert!(loss_gls.data_fit.is_finite());
 
     // Assembled gradient moved: the reconstruction Jacobian is now weighted by

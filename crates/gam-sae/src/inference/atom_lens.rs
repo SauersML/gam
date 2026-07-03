@@ -51,8 +51,8 @@
 
 use ndarray::{ArrayView1, ArrayView2};
 
-use gam_problem::{MetricProvenance, RowMetric};
 use crate::manifold::SaeManifoldTerm;
+use gam_problem::{MetricProvenance, RowMetric};
 
 /// Below this active mass a row is not "truly active" for an atom, so it
 /// contributes to neither the presence average nor the coupling average. The

@@ -768,8 +768,9 @@ mod tests {
         // device-vs-CPU drift on a V100 is ~1.7e-16 — the FMA-free softmax
         // seeded-jet is round-off-floor tight, far inside the 1e-9 gate.
         if gam_gpu::device_runtime::GpuRuntime::global().is_some() {
-            let dev = device::sae_row_jets_softmax_device(&rows, k, p, inv_tau)
-                .expect("admitted GPU runtime must run the sae_rowjet device kernel, not fall back");
+            let dev = device::sae_row_jets_softmax_device(&rows, k, p, inv_tau).expect(
+                "admitted GPU runtime must run the sae_rowjet device kernel, not fall back",
+            );
             let dev_diff = max_diff(&cpu, &dev);
             assert!(
                 dev_diff <= 1e-9,

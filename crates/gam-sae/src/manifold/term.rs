@@ -599,8 +599,7 @@ pub struct SaeManifoldTerm {
     /// also profiled); a per-atom `None` means that atom had no active rows or a
     /// degenerate inner design. Read by [`Self::to_residual_gauge_model`], which
     /// attaches each onto its [`crate::identifiability::FittedAtom`].
-    pub(crate) atom_inner_fits:
-        Option<Vec<Option<crate::identifiability::AtomInnerFit>>>,
+    pub(crate) atom_inner_fits: Option<Vec<Option<crate::identifiability::AtomInnerFit>>>,
     /// #1228 — the trained dictionary's hybrid-collapsed linear images, attached
     /// to an OOS term so held-out reconstruction decodes verdict-linear `d = 1`
     /// slots by the SAME straight sub-model the training reconstruction used.

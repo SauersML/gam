@@ -555,7 +555,11 @@ mod certificate_verdict_tests {
         // strong activity), so only the SNR guard can decide the verdict.
         let v = curved_dictionary_global_optimality_verdict(1e-6, 0.0, 0.9, -5.0, 4);
         assert!(!v.is_certified(), "negative snr_proxy must not certify");
-        assert_eq!(v.margin(), f64::NEG_INFINITY, "precondition failure yields −inf margin");
+        assert_eq!(
+            v.margin(),
+            f64::NEG_INFINITY,
+            "precondition failure yields −inf margin"
+        );
     }
 
     /// SNR at/below 1 (reachable (0, 1]) is uncertifiable — the sufficient

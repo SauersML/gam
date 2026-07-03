@@ -3,13 +3,13 @@
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
+use crate::manifold::SaeManifoldRho;
 use gam_solve::evidence::{HybridAtomCandidate, HybridAtomChoice, select_hybrid_atom};
 use gam_terms::analytic_penalties::{
     AnalyticPenalty, IBPAssignmentPenalty, IbpHessianDiagThirdChannels,
     SoftmaxAssignmentSparsityPenalty, resolve_learnable_weight,
 };
 use gam_terms::latent::{LatentCoordValues, LatentIdMode, LatentManifold};
-use crate::manifold::SaeManifoldRho;
 
 /// #976 Layer-1 guard: cap on one accepted iteration's assignment-logit
 /// update, in units of the gate temperature τ (the gate's natural length
@@ -260,19 +260,21 @@ impl AssignmentMode {
                 alpha,
                 learnable_alpha,
                 ..
-            } => Some(if let Some(over) = per_fit_override.or_else(ibp_alpha_override) {
-                // #1777 — the per-fit override (else the deprecated process-global
-                // one) flattens the ordered geometric prior π_k = (α/(α+1))^{k+1}
-                // so all K atoms can contribute to the reconstruction (the
-                // production α=1 gives a (0.5)^{k+1} schedule that structurally
-                // caps atoms 4..K → effective-K≈3). Forces the fixed value,
-                // bypassing the learnable schedule.
-                over
-            } else if learnable_alpha {
-                resolve_learnable_weight(alpha, rho.log_lambda_sparse)
-            } else {
-                alpha
-            }),
+            } => Some(
+                if let Some(over) = per_fit_override.or_else(ibp_alpha_override) {
+                    // #1777 — the per-fit override (else the deprecated process-global
+                    // one) flattens the ordered geometric prior π_k = (α/(α+1))^{k+1}
+                    // so all K atoms can contribute to the reconstruction (the
+                    // production α=1 gives a (0.5)^{k+1} schedule that structurally
+                    // caps atoms 4..K → effective-K≈3). Forces the fixed value,
+                    // bypassing the learnable schedule.
+                    over
+                } else if learnable_alpha {
+                    resolve_learnable_weight(alpha, rho.log_lambda_sparse)
+                } else {
+                    alpha
+                },
+            ),
             _ => None,
         }
     }
@@ -1390,9 +1392,8 @@ pub(crate) fn fill_assignment_logit_jvp_rows(
                 if is_ungated(logit_col) || logits[logit_col] <= threshold {
                     continue;
                 }
-                let activation = gam_linalg::utils::stable_logistic(
-                    (logits[logit_col] - threshold) * inv_tau,
-                );
+                let activation =
+                    gam_linalg::utils::stable_logistic((logits[logit_col] - threshold) * inv_tau);
                 let da = activation * (1.0 - activation) * inv_tau;
                 for out_col in 0..fitted.len() {
                     local_jac[[logit_col, out_col]] = da * decoded[[logit_col, out_col]];
@@ -1547,8 +1548,7 @@ pub(crate) fn assignment_prior_log_strength_hdiag(
                 if !jumprelu_in_optimization_band(logit, threshold, temperature) {
                     continue;
                 }
-                let activation =
-                    gam_linalg::utils::stable_logistic((logit - threshold) * inv_tau);
+                let activation = gam_linalg::utils::stable_logistic((logit - threshold) * inv_tau);
                 let slope = activation * (1.0 - activation);
                 d[idx] = sparsity_strength * slope * (1.0 - 2.0 * activation) * inv_tau2;
             }
@@ -1690,8 +1690,7 @@ pub(crate) fn assignment_prior_grad_hdiag(
                 if !jumprelu_in_optimization_band(logit, threshold, temperature) {
                     continue;
                 }
-                let activation =
-                    gam_linalg::utils::stable_logistic((logit - threshold) * inv_tau);
+                let activation = gam_linalg::utils::stable_logistic((logit - threshold) * inv_tau);
                 let slope = activation * (1.0 - activation);
                 g[idx] = sparsity_strength * slope * inv_tau;
                 d[idx] = sparsity_strength * slope * (1.0 - 2.0 * activation) * inv_tau2;

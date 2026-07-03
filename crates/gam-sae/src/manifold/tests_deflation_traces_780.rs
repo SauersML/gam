@@ -4,8 +4,8 @@
 //! `gamma_fd_tiny_fixture` / `fixed_state_logdet` are sourced from the sibling
 //! `tests` module.
 
-use super::*;
 use super::tests::{fixed_state_logdet, gamma_fd_tiny_fixture};
+use super::*;
 
 /// Deflation-derivative regression. At `rho.log_lambda_sparse = 0.5` the
 /// converged tiny IBP-MAP fixture has per-row `H_tt` blocks whose

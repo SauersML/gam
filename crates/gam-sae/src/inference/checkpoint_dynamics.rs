@@ -46,7 +46,9 @@ use crate::inference::layer_transport::{ChartTopology, LayerTransportReport, fit
 use crate::inference::riesz::{
     RieszDebiasReport, RieszInput, SmoothFunctional, debias_with_dense_hessian,
 };
-use gam_terms::inference::structure_evidence::{ClaimKind, StructureLedger, log_e_from_p_calibrator};
+use gam_terms::inference::structure_evidence::{
+    ClaimKind, StructureLedger, log_e_from_p_calibrator,
+};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView4};
 use statrs::distribution::{ContinuousCDF, Normal};
 

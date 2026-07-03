@@ -236,7 +236,11 @@ impl SphereTangentEmbedding {
         let c = &y.to_owned() * inv_root_two;
         let tangent = self.tangent_basis.dot(&c);
         let radial_sq = 1.0 - c.dot(&c);
-        let radial = if radial_sq > 0.0 { radial_sq.sqrt() } else { 0.0 };
+        let radial = if radial_sq > 0.0 {
+            radial_sq.sqrt()
+        } else {
+            0.0
+        };
         let mut q = &tangent + &(&self.basepoint * radial);
         // Guard against round-off drift off the sphere so `p = q⊙q` normalizes.
         let norm = q.dot(&q).sqrt();
@@ -308,9 +312,7 @@ impl SphereTangentEmbedding {
 fn tangent_basis_orthogonal_to(axis: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
     let v = axis.len();
     if v < 2 {
-        return Err(format!(
-            "tangent_basis_orthogonal_to: need V ≥ 2; got {v}"
-        ));
+        return Err(format!("tangent_basis_orthogonal_to: need V ≥ 2; got {v}"));
     }
     // Pivot = argmax |axis_j|.
     let mut pivot = 0usize;
@@ -628,7 +630,10 @@ mod tests {
         }
         let (_chart, y) = SphereTangentEmbedding::fit(p.view()).unwrap();
         for value in y.iter() {
-            assert!(value.abs() < 1e-12, "constant behavior gave nonzero target {value}");
+            assert!(
+                value.abs() < 1e-12,
+                "constant behavior gave nonzero target {value}"
+            );
         }
     }
 
@@ -643,7 +648,10 @@ mod tests {
         let qa = a.mapv(|v| v.sqrt());
         let qb = b.mapv(|v| v.sqrt());
         let self_dist = SphereTangentEmbedding::fisher_rao_distance(qa.view(), qa.view());
-        assert!(self_dist < 1e-9, "self F-R distance should be 0, got {self_dist}");
+        assert!(
+            self_dist < 1e-9,
+            "self F-R distance should be 0, got {self_dist}"
+        );
         let d = SphereTangentEmbedding::fisher_rao_distance(qa.view(), qb.view());
         let kl = SphereTangentEmbedding::exact_kl(a.view(), b.view()).unwrap();
         let half_dsq = 0.5 * d * d;

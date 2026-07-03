@@ -4,8 +4,8 @@
 //! Declared as a sibling `#[cfg(test)] mod` in `mod.rs`; the shared
 //! `gamma_fd_tiny_fixture` is sourced from the sibling `tests` module.
 
-use super::*;
 use super::tests::gamma_fd_tiny_fixture;
+use super::*;
 
 /// #932 follow-up (the issue-comment cache-seam ask): the SAE row
 /// jet-program oracle driven directly from a CONVERGED production
@@ -26,9 +26,7 @@ use super::tests::gamma_fd_tiny_fixture;
 /// production channel by `sqrt(w_row)`.
 #[test]
 pub(crate) fn sae_row_jet_program_matches_production_row_jets_on_converged_cache() {
-    use crate::row_jet_program::{
-        AtomRowBasisJet, RowGate, SaeReconstructionRowProgram,
-    };
+    use crate::row_jet_program::{AtomRowBasisJet, RowGate, SaeReconstructionRowProgram};
 
     // Tiny-fixture row arity: softmax gauges the last logit as the fixed
     // reference (assignment_coord_dim = k_atoms − 1 = 1 free logit), plus

@@ -181,9 +181,8 @@ mod tests {
     #[test]
     fn device_and_kron_rows_share_backing_alloc_1033() {
         let p = 6usize;
-        let a_phi: Arc<[Vec<(usize, f64)>]> = Arc::from(
-            vec![vec![(0usize, 2.0f64), (12, 1.0)], vec![(0, 0.5)]].into_boxed_slice(),
-        );
+        let a_phi: Arc<[Vec<(usize, f64)>]> =
+            Arc::from(vec![vec![(0usize, 2.0f64), (12, 1.0)], vec![(0, 0.5)]].into_boxed_slice());
         let jac: Arc<[Vec<f64>]> =
             Arc::from(vec![vec![1.0; 4 * p], vec![2.0; 4 * p]].into_boxed_slice());
         // Both consumers built from refcount bumps of the same allocation.

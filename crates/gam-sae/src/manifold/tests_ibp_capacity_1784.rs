@@ -21,9 +21,9 @@
 use super::*;
 use crate::assignment::{default_ibp_concentration_for_k_atoms, ordered_geometric_shrinkage_prior};
 use crate::basis::PeriodicHarmonicEvaluator;
-use gam_linalg::faer_ndarray::{fast_atb, FaerCholesky};
-use gam_terms::dictionary::{fit_linear_dictionary, LinearDictionaryConfig};
-use ndarray::{s, Array2, ArrayView2};
+use gam_linalg::faer_ndarray::{FaerCholesky, fast_atb};
+use gam_terms::dictionary::{LinearDictionaryConfig, fit_linear_dictionary};
+use ndarray::{Array2, ArrayView2, s};
 use std::sync::Arc;
 
 /// Deterministic "real-like" activation matrix: an anisotropic Gaussian with a

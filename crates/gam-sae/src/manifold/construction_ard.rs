@@ -381,5 +381,4 @@ impl SaeManifoldTerm {
         }
         Ok(traces)
     }
-
 }

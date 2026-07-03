@@ -165,7 +165,9 @@ impl SaeRowLayout {
             };
             // Hard forward gate: nonzero assignment mass ⇒ data-fit coupling in
             // the joint block. Always retained.
-            let hard: Vec<usize> = (0..k_atoms).filter(|&k| row_logits[k] > threshold).collect();
+            let hard: Vec<usize> = (0..k_atoms)
+                .filter(|&k| row_logits[k] > threshold)
+                .collect();
             // Relative-cutoff base: the largest separable contribution over all
             // in-band atoms in this row.
             let peak = (0..k_atoms)
@@ -345,10 +347,10 @@ mod jumprelu_hard_gate_tests {
     // atoms with a non-negligible column-separable prior gradient; the negligible
     // deep-band tail is dropped (see [`SaeRowLayout::from_jumprelu`]).
     use super::{JumpReluLayoutParams, SaeRowLayout};
-    use crate::assignment::{assignment_prior_grad_hdiag, AssignmentMode, SaeAssignment};
+    use crate::assignment::{AssignmentMode, SaeAssignment, assignment_prior_grad_hdiag};
     use crate::manifold::{
-        SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
-        SAE_DENSE_BETA_PENALTY_PROBE_MAX_DIM,
+        SAE_DENSE_BETA_PENALTY_PROBE_MAX_DIM, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho,
+        SaeManifoldTerm,
     };
     use gam_terms::latent::LatentManifold;
     use ndarray::{Array1, Array2, Array3};
@@ -382,7 +384,11 @@ mod jumprelu_hard_gate_tests {
         // Every logit is inside the −36 optimization band, so the OLD full-band
         // layout would put all K=6 atoms in the joint block.
         for &l in logits.iter() {
-            assert!(crate::assignment::jumprelu_in_optimization_band(l, threshold, temperature));
+            assert!(crate::assignment::jumprelu_in_optimization_band(
+                l,
+                threshold,
+                temperature
+            ));
         }
         let contribution = logits.mapv(logit_slope);
         let coord_dims = vec![1usize; k];
@@ -472,8 +478,11 @@ mod jumprelu_hard_gate_tests {
                     1,
                     Array2::<f64>::from_elem((n, 2), 1.0),
                     Array3::<f64>::zeros((n, 2, 1)),
-                    Array2::<f64>::from_shape_vec((2, p), vec![0.1 * f, -0.2 * f, 0.15 * f, 0.3 * f])
-                        .unwrap(),
+                    Array2::<f64>::from_shape_vec(
+                        (2, p),
+                        vec![0.1 * f, -0.2 * f, 0.15 * f, 0.3 * f],
+                    )
+                    .unwrap(),
                     Array2::<f64>::eye(2),
                 )
                 .unwrap()
@@ -496,10 +505,8 @@ mod jumprelu_hard_gate_tests {
 
         // Reproduce the production `contribution` (construction.rs): the sparsity
         // prior separable gradient magnitude (ARD is zero at the origin).
-        let (assignment_grad, _) =
-            assignment_prior_grad_hdiag(&term.assignment, &rho).unwrap();
-        let contribution =
-            Array2::from_shape_fn((n, k), |(r, c)| assignment_grad[r * k + c].abs());
+        let (assignment_grad, _) = assignment_prior_grad_hdiag(&term.assignment, &rho).unwrap();
+        let contribution = Array2::from_shape_fn((n, k), |(r, c)| assignment_grad[r * k + c].abs());
         let coord_dims = vec![1usize; k];
         let coord_offsets = term.assignment.coord_offsets();
         let layout = SaeRowLayout::from_jumprelu(JumpReluLayoutParams {
@@ -586,7 +593,10 @@ mod jumprelu_hard_gate_tests {
                 dgt[2]
             );
         }
-        assert!(saw_drop, "the compact layout must actually drop deep-band atoms");
+        assert!(
+            saw_drop,
+            "the compact layout must actually drop deep-band atoms"
+        );
         // Tolerance is met with margin: dropped atoms' separable contribution
         // (~e^{-28..-35}) is far below the 1e-8 gate.
         assert!(max_diff < 1.0e-8, "max full-q gradient diff {max_diff:e}");

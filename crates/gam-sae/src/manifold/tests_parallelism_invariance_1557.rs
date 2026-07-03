@@ -3,8 +3,8 @@
 //! as a sibling `#[cfg(test)] mod` in `mod.rs`.
 
 use super::*;
-use ndarray::array;
 use ndarray::Array2;
+use ndarray::array;
 use std::sync::Arc;
 
 /// Shared fixture for the #1557 parallelism-invariance tests: the issue's

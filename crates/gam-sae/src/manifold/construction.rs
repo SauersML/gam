@@ -226,8 +226,14 @@ impl SaeManifoldTerm {
             .slice_mut(s![.., k1..k1 + k2])
             .assign(&secondary.assignment.logits);
         primary.assignment.logits = logits;
-        primary.assignment.coords.extend(secondary.assignment.coords);
-        primary.assignment.ungated.extend(secondary.assignment.ungated);
+        primary
+            .assignment
+            .coords
+            .extend(secondary.assignment.coords);
+        primary
+            .assignment
+            .ungated
+            .extend(secondary.assignment.ungated);
         primary.assignment.frozen_logits = None;
         // Atoms.
         primary.atoms.extend(secondary.atoms);
@@ -770,10 +776,7 @@ impl SaeManifoldTerm {
     /// metric (or never calling this) keeps the bit-identical isotropic path.
     ///
     /// The metric's row count and output dimension must match the term.
-    pub fn set_row_metric(
-        &mut self,
-        metric: gam_problem::RowMetric,
-    ) -> Result<(), String> {
+    pub fn set_row_metric(&mut self, metric: gam_problem::RowMetric) -> Result<(), String> {
         if metric.n_rows() != self.n_obs() {
             return Err(format!(
                 "SaeManifoldTerm::set_row_metric: metric has {} rows but term has {}",
@@ -888,14 +891,10 @@ impl SaeManifoldTerm {
     /// Euclidean metric of the term's own `(n_obs, output_dim)` shape. Either way
     /// a metric always exists, so the diagnostics are never gated by a flag — the
     /// Euclidean fallback is the bit-identical isotropic path.
-    pub(crate) fn diagnostic_metric(
-        &self,
-    ) -> Result<gam_problem::RowMetric, String> {
+    pub(crate) fn diagnostic_metric(&self) -> Result<gam_problem::RowMetric, String> {
         match self.row_metric() {
             Some(metric) => Ok(metric.clone()),
-            None => {
-                gam_problem::RowMetric::euclidean(self.n_obs(), self.output_dim())
-            }
+            None => gam_problem::RowMetric::euclidean(self.n_obs(), self.output_dim()),
         }
     }
 
@@ -964,30 +963,24 @@ impl SaeManifoldTerm {
         // error. Magic-by-default either way: the choice is derived from the fit,
         // never a flag.
         let views = self.atom_parameter_views();
-        let ops: Vec<Option<crate::identifiability::OrbitPenaltyOperator>> =
-            if isometry_pin_active {
-                views
-                    .iter()
-                    .map(|view| {
-                        view.as_ref().and_then(|v| {
-                            crate::identifiability::isometry_orbit_penalty_operator(
-                                v, 1.0,
-                            )
-                        })
+        let ops: Vec<Option<crate::identifiability::OrbitPenaltyOperator>> = if isometry_pin_active
+        {
+            views
+                .iter()
+                .map(|view| {
+                    view.as_ref().and_then(|v| {
+                        crate::identifiability::isometry_orbit_penalty_operator(v, 1.0)
                     })
-                    .collect()
-            } else {
-                (0..self.k_atoms()).map(|_| None).collect()
-            };
+                })
+                .collect()
+        } else {
+            (0..self.k_atoms()).map(|_| None).collect()
+        };
         let residual_gauge = if isometry_pin_active {
             // The pin-active path consumes the per-row Jacobian curvature
             // directly (the certificate_model retains it under a pin), so route
             // through the non-streamed exact entry point.
-            crate::identifiability::residual_gauge_exact(
-                &certificate_model,
-                &views,
-                &ops,
-            )?
+            crate::identifiability::residual_gauge_exact(&certificate_model, &views, &ops)?
         } else {
             let (curvature_gram, root_rows) = streamed_curvature.ok_or_else(|| {
                 "fit_diagnostics_report: missing streamed residual-gauge curvature for unpinned exact path"
@@ -1010,8 +1003,7 @@ impl SaeManifoldTerm {
         // harvested inner fit degrade their inference fields to `None` inside
         // `atom_inference_reports`, so this is always populated (one entry per
         // atom) and never gated by a flag.
-        let atom_inference =
-            crate::identifiability::atom_inference_reports(&certificate_model);
+        let atom_inference = crate::identifiability::atom_inference_reports(&certificate_model);
 
         // #2081 — per-atom coordinate-fidelity certificate (uniformity + arc-length
         // defect). Always populated (one entry per atom, `None` for non-`d = 1`
@@ -2357,8 +2349,7 @@ impl SaeManifoldTerm {
             // LSQ intent). Gated: default-off keeps the write bit-for-bit.
             if self.quotient_scale {
                 self.atoms[atom_idx].log_amplitude = 0.0;
-                self.atoms[atom_idx]
-                    .absorb_decoder_norm_into_log_amplitude(f64::MIN_POSITIVE);
+                self.atoms[atom_idx].absorb_decoder_norm_into_log_amplitude(f64::MIN_POSITIVE);
             }
         }
         Ok(())
@@ -2567,19 +2558,21 @@ impl SaeManifoldTerm {
                         // leave-this-atom-out residual projected onto `v`.
                         self.atoms[atom_idx].fill_decoded_row(row, &mut decoded_buf);
                         for col in 0..p {
-                            resid_buf[col] =
-                                target[[row, col]] - full_curved[[row, col]] + a_k * decoded_buf[col];
+                            resid_buf[col] = target[[row, col]] - full_curved[[row, col]]
+                                + a_k * decoded_buf[col];
                         }
                         // `coordinate_from_residual` returns `None` only on a
                         // length mismatch (impossible here — validated at attach)
                         // or a non-rescued image (excluded by the branch); fall
                         // back to the train code/own-coord path if it ever does.
-                        let coord = image
-                            .coordinate_from_residual(&resid_buf)
-                            .unwrap_or_else(|| {
-                                let own_t = self.assignment.coords[atom_idx].as_matrix()[[row, 0]];
-                                image.coordinate_for_row(row, own_t)
-                            });
+                        let coord =
+                            image
+                                .coordinate_from_residual(&resid_buf)
+                                .unwrap_or_else(|| {
+                                    let own_t =
+                                        self.assignment.coords[atom_idx].as_matrix()[[row, 0]];
+                                    image.coordinate_for_row(row, own_t)
+                                });
                         image.fill_row(coord, &mut g_buf);
                     } else {
                         // Ordinary straight image: decode at the atom's own coord.
@@ -2692,9 +2685,7 @@ impl SaeManifoldTerm {
     /// fitted dictionary, or `None` until [`Self::canonicalize_charts_post_fit`]
     /// has run (or when no `d = 1` atom is eligible). Surfaced in the Python model
     /// output so the user sees which atoms genuinely earn their curvature.
-    pub fn hybrid_split_report(
-        &self,
-    ) -> Option<&crate::hybrid_split::SaeHybridSplitReport> {
+    pub fn hybrid_split_report(&self) -> Option<&crate::hybrid_split::SaeHybridSplitReport> {
         self.hybrid_split_report.as_ref()
     }
 
@@ -3041,9 +3032,7 @@ impl SaeManifoldTerm {
                     certified[row] = true;
                 }
             }
-            results.push(crate::encode::EncodeResult::from_rows(
-                coords, certified,
-            ));
+            results.push(crate::encode::EncodeResult::from_rows(coords, certified));
         }
         Ok(results)
     }
@@ -3407,51 +3396,50 @@ impl SaeManifoldTerm {
         // (the topology race owns the outer pool) to avoid nested
         // oversubscription.
         let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
-        let row_data_fit =
-            |row: usize,
-             g_buf: &mut [f64],
-             fitted_row: &mut [f64],
-             assign_buf: &mut [f64]|
-             -> Result<f64, String> {
-                // #1557 — fill the per-atom assignment row into reused per-worker
-                // scratch via the `_into` twin instead of heap-allocating a fresh
-                // `Array1` per row per loss eval. Bit-identical to the allocating
-                // `try_assignments_row_for_rho` (same arithmetic, same order); this
-                // loss reruns every Armijo halving × inner Newton iter × outer ρ
-                // eval, so the per-row K-sized allocation was a hot-path churn.
-                self.assignment
-                    .try_assignments_row_for_rho_into(row, rho, assign_buf)?;
-                let a = &*assign_buf;
-                for slot in fitted_row.iter_mut() {
-                    *slot = 0.0;
-                }
-                for atom_idx in 0..k_atoms {
-                    self.atoms[atom_idx].fill_decoded_row(row, g_buf);
-                    let a_k = a[atom_idx];
-                    for out_col in 0..p {
-                        fitted_row[out_col] += a_k * g_buf[out_col];
-                    }
-                }
+        let row_data_fit = |row: usize,
+                            g_buf: &mut [f64],
+                            fitted_row: &mut [f64],
+                            assign_buf: &mut [f64]|
+         -> Result<f64, String> {
+            // #1557 — fill the per-atom assignment row into reused per-worker
+            // scratch via the `_into` twin instead of heap-allocating a fresh
+            // `Array1` per row per loss eval. Bit-identical to the allocating
+            // `try_assignments_row_for_rho` (same arithmetic, same order); this
+            // loss reruns every Armijo halving × inner Newton iter × outer ρ
+            // eval, so the per-row K-sized allocation was a hot-path churn.
+            self.assignment
+                .try_assignments_row_for_rho_into(row, rho, assign_buf)?;
+            let a = &*assign_buf;
+            for slot in fitted_row.iter_mut() {
+                *slot = 0.0;
+            }
+            for atom_idx in 0..k_atoms {
+                self.atoms[atom_idx].fill_decoded_row(row, g_buf);
+                let a_k = a[atom_idx];
                 for out_col in 0..p {
-                    fitted_row[out_col] = target[[row, out_col]] - fitted_row[out_col];
+                    fitted_row[out_col] += a_k * g_buf[out_col];
                 }
-                let w_row = row_loss_w.map_or(1.0, |w| w[row]);
-                let mut acc = 0.0_f64;
-                match self.row_metric.as_ref() {
-                    Some(metric) if whitens => {
-                        let resid = ArrayView1::from(&fitted_row[..p]);
-                        for w in metric.whiten_residual_row(row, resid) {
-                            acc += 0.5 * w_row * w * w;
-                        }
-                    }
-                    _ => {
-                        for &r in fitted_row[..p].iter() {
-                            acc += 0.5 * w_row * r * r;
-                        }
+            }
+            for out_col in 0..p {
+                fitted_row[out_col] = target[[row, out_col]] - fitted_row[out_col];
+            }
+            let w_row = row_loss_w.map_or(1.0, |w| w[row]);
+            let mut acc = 0.0_f64;
+            match self.row_metric.as_ref() {
+                Some(metric) if whitens => {
+                    let resid = ArrayView1::from(&fitted_row[..p]);
+                    for w in metric.whiten_residual_row(row, resid) {
+                        acc += 0.5 * w_row * w * w;
                     }
                 }
-                Ok(acc)
-            };
+                _ => {
+                    for &r in fitted_row[..p].iter() {
+                        acc += 0.5 * w_row * r * r;
+                    }
+                }
+            }
+            Ok(acc)
+        };
         let data_fit = if parallel {
             use rayon::prelude::*;
             const CHUNK: usize = 32;
@@ -4233,8 +4221,7 @@ impl SaeManifoldTerm {
                     for k in 0..k_atoms {
                         let coord = &self.assignment.coords[k];
                         let d = coord.latent_dim();
-                        let has_ard =
-                            d > 0 && k < rho.log_ard.len() && rho.log_ard[k].len() == d;
+                        let has_ard = d > 0 && k < rho.log_ard.len() && rho.log_ard[k].len() == d;
                         let periods = if has_ard {
                             coord.effective_axis_periods()
                         } else {
@@ -4247,9 +4234,8 @@ impl SaeManifoldTerm {
                             if has_ard {
                                 let row_t = coord.row(row);
                                 for axis in 0..d {
-                                    let alpha = SaeManifoldRho::stable_exp_strength(
-                                        rho.log_ard[k][axis],
-                                    );
+                                    let alpha =
+                                        SaeManifoldRho::stable_exp_strength(rho.log_ard[k][axis]);
                                     c += ArdAxisPrior::eval(alpha, row_t[axis], periods[axis])
                                         .grad
                                         .abs();
@@ -5751,11 +5737,7 @@ impl SaeManifoldTerm {
                 // `psd_majorizer_hvp` + frame-projection probe pattern the registry
                 // DecoderIncoherence uses, so the collapse-prevention curvature
                 // reaches the operator here too. No-op when no repulsion is active.
-                self.add_factored_repulsion_curvature(
-                    &mut hbb_c,
-                    penalty_scale,
-                    &frame_projection,
-                );
+                self.add_factored_repulsion_curvature(&mut hbb_c, penalty_scale, &frame_projection);
                 ops.push(Arc::new(DensePenaltyOp(hbb_c)));
             }
 
@@ -5784,8 +5766,8 @@ impl SaeManifoldTerm {
             let has_dense_beta_penalty =
                 beta_penalty_assembly.dense_written || beta_penalty_assembly.deferred_factored;
             if !has_dense_beta_penalty {
-                let device = crate::frames::build_framed_device_sae_data(
-                    crate::frames::FramedDeviceArgs {
+                let device =
+                    crate::frames::build_framed_device_sae_data(crate::frames::FramedDeviceArgs {
                         p,
                         border_dim,
                         border_offsets: off_c.as_slice(),
@@ -5794,8 +5776,7 @@ impl SaeManifoldTerm {
                         smooth_scaled_s: &smooth_scaled_s,
                         frame_blocks: device_frame_blocks,
                         rows: &sys.rows,
-                    },
-                );
+                    });
                 sys.set_device_sae_pcg_data(device);
             }
         } else {
@@ -6153,8 +6134,11 @@ impl SaeManifoldTerm {
                     projection.lift_axis_into(&mut probe, k, basis_col, frame_col);
                     let col =
                         projection.border_offsets[k] + basis_col * projection.ranks[k] + frame_col;
-                    let hv =
-                        per_fit.psd_majorizer_hvp(target_beta.view(), rho_local.view(), probe.view());
+                    let hv = per_fit.psd_majorizer_hvp(
+                        target_beta.view(),
+                        rho_local.view(),
+                        probe.view(),
+                    );
                     projection
                         .project_border_vec(hv.view())
                         .iter()
@@ -6545,8 +6529,7 @@ impl SaeManifoldTerm {
             // (The old message claimed "no dense Schur factor", which is false
             // here — the Schur factor is present; the Woodbury correction is the
             // non-finite term.)
-            if cache.cross_row_woodbury.is_some()
-                && !cache.cross_row_woodbury_log_det().is_finite()
+            if cache.cross_row_woodbury.is_some() && !cache.cross_row_woodbury_log_det().is_finite()
             {
                 "SaeManifoldTerm::reml_criterion: cross-row IBP joint Hessian is non-PD at \
                  this ρ; evidence Laplace log-det undefined (infeasible ρ probe)"
@@ -7707,8 +7690,8 @@ impl SaeManifoldTerm {
             }
             let n_total = self.n_obs();
             let options = ArrowSolveOptions::direct()
-            .with_ill_conditioning_tolerated()
-            .with_schur_pd_floor(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR);
+                .with_ill_conditioning_tolerated()
+                .with_schur_pd_floor(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR);
             // Assemble the WHOLE system once (a single "chunk" over all rows) so the
             // matrix-free reduced-Schur apply `v ↦ S·v` can iterate every row; the
             // per-row block storage is exactly what the inner solve already holds.
@@ -7727,9 +7710,7 @@ impl SaeManifoldTerm {
             // objective, matching the summed per-chunk `(end-start)/n_total` scale.
             let sys = full_chunk
                 .assemble_arrow_schur_scaled(target, rho, registry, 1.0)
-                .map_err(|err| {
-                    format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}")
-                })?;
+                .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}"))?;
             let (log_det_tt, slq) = matrix_free_arrow_evidence_log_det(
                 &sys,
                 0.0,
@@ -7868,9 +7849,7 @@ impl SaeManifoldTerm {
         // coupling and disagree with the dense path by exactly `log|C|`.
         if let (Some(m0), Some(w), Some(d)) = (wood_m0, wood_w, wood_d) {
             let correction = streaming_cross_row_woodbury_log_det(&schur_acc, &m0, &w, &d)
-                .map_err(|err| {
-                    format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}")
-                })?
+                .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}"))?
                 .ok_or_else(|| {
                     "SaeManifoldTerm::reml_criterion: cross-row IBP joint Hessian is non-PD at \
                      this ρ; evidence Laplace log-det undefined (infeasible ρ probe)"
@@ -8251,7 +8230,9 @@ impl SaeManifoldTerm {
                     let (inv_vv, _inv_vbeta) = solver
                         .selected_inverse_row_blocks(row, &selected_beta_inv)
                         .map_err(|err| {
-                            format!("assignment_log_strength_hessian_trace: selected inverse: {err}")
+                            format!(
+                                "assignment_log_strength_hessian_trace: selected inverse: {err}"
+                            )
                         })?;
                     inv_vv
                 } else {
@@ -8362,9 +8343,7 @@ impl SaeManifoldTerm {
                     rhs_t_scratch[t_i] = 1.0;
                     let solved = solver
                         .solve(rhs_t_scratch.view(), rhs_beta_zero.view())
-                        .map_err(|err| {
-                            format!("assignment_log_strength_hessian_trace: {err}")
-                        })?;
+                        .map_err(|err| format!("assignment_log_strength_hessian_trace: {err}"))?;
                     rhs_t_scratch[t_i] = 0.0;
                     for &(j, t_j) in &col_sites[k] {
                         if j == i {
@@ -8646,7 +8625,9 @@ impl SaeManifoldTerm {
                     &mut jet_window,
                 )?;
             }
-            let jets = jet_window.pop_front().expect("jet window must be non-empty");
+            let jets = jet_window
+                .pop_front()
+                .expect("jet window must be non-empty");
             // Atom index (k-weight) of each local t-var.
             let var_atom: Vec<usize> = jets
                 .vars
@@ -8675,7 +8656,9 @@ impl SaeManifoldTerm {
                     let solved = solver
                         .solve(rhs_t_scratch.view(), rhs_beta_zero.view())
                         .map_err(|err| {
-                            format!("learnable_ibp_data_logdet_alpha_trace: selected inverse: {err}")
+                            format!(
+                                "learnable_ibp_data_logdet_alpha_trace: selected inverse: {err}"
+                            )
                         })?;
                     rhs_t_scratch[base + col] = 0.0;
                     for r in 0..q {
@@ -9066,16 +9049,12 @@ impl SaeManifoldTerm {
                     return 0.0;
                 }
                 let logit = self.assignment.logits[[row, diag_atom]];
-                if !crate::assignment::jumprelu_in_optimization_band(
-                    logit,
-                    threshold,
-                    temperature,
-                ) {
+                if !crate::assignment::jumprelu_in_optimization_band(logit, threshold, temperature)
+                {
                     return 0.0;
                 }
                 let inv_tau = 1.0 / temperature;
-                let activation =
-                    gam_linalg::utils::stable_logistic((logit - threshold) * inv_tau);
+                let activation = gam_linalg::utils::stable_logistic((logit - threshold) * inv_tau);
                 let slope = activation * (1.0 - activation);
                 // #1415: P(ℓ)=λσ((ℓ−θ)/τ); P''(ℓ)=(λ/τ²)s(1−2a) so the third
                 // derivative is P'''(ℓ)=(λ/τ³)·s·(1−6a+6a²), because
@@ -9363,16 +9342,16 @@ impl SaeManifoldTerm {
                     &mut jet_window,
                 )?;
             }
-            let jets = jet_window.pop_front().expect("jet window must be non-empty");
+            let jets = jet_window
+                .pop_front()
+                .expect("jet window must be non-empty");
 
             // #932 FRONT C: row-local Takahashi on the plain arrow; per-row
             // full-system `solve` loop under gauge / cross-row Woodbury.
             let (inv_vv, inv_vbeta) = if fast_selected {
                 solver
                     .selected_inverse_row_blocks(row, &beta_inv)
-                    .map_err(|err| {
-                        format!("logdet_theta_adjoint: selected inverse: {err}")
-                    })?
+                    .map_err(|err| format!("logdet_theta_adjoint: selected inverse: {err}"))?
             } else {
                 let mut inv_vv = Array2::<f64>::zeros((q, q));
                 let mut inv_vbeta = Array2::<f64>::zeros((q, cache.k));
@@ -9505,7 +9484,10 @@ impl SaeManifoldTerm {
                 }
                 if !defl_dirs.is_empty() {
                     gamma -= Self::deflation_block_correction(
-                        &inv_vv, &dh_mat, defl_dirs, defl_spectrum,
+                        &inv_vv,
+                        &dh_mat,
+                        defl_dirs,
+                        defl_spectrum,
                     );
                 }
                 for a in 0..q {
@@ -9538,7 +9520,10 @@ impl SaeManifoldTerm {
                 }
                 if !defl_dirs.is_empty() {
                     gamma -= Self::deflation_block_correction(
-                        &inv_vv, &dh_mat, defl_dirs, defl_spectrum,
+                        &inv_vv,
+                        &dh_mat,
+                        defl_dirs,
+                        defl_spectrum,
                     );
                 }
                 for a in 0..q {
@@ -9683,7 +9668,6 @@ impl SaeManifoldTerm {
             beta: gamma_beta,
         })
     }
-
 
     /// Public analytic outer-ρ gradient at a converged inner state, constructing
     /// the deflated arrow solver from the supplied cache. Use this seam from

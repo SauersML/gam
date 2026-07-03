@@ -3788,9 +3788,18 @@ mod tests {
         let g = Array2::<f64>::from_shape_vec((2, 2), vec![0.0, 1.0, 1.0, 0.0]).unwrap();
         let sigma_sq = super::symmetric_spectral_norm_sq(g.view());
         let frob_sq: f64 = g.iter().map(|&v| v * v).sum();
-        assert!((sigma_sq - 1.0).abs() < 1e-9, "σ_max² must be 1, got {sigma_sq}");
-        assert!((frob_sq - 2.0).abs() < 1e-9, "fixture ‖G‖_F² is 2 (the flip)");
-        assert!(sigma_sq < frob_sq, "σ_max² must be strictly below ‖G‖_F² here");
+        assert!(
+            (sigma_sq - 1.0).abs() < 1e-9,
+            "σ_max² must be 1, got {sigma_sq}"
+        );
+        assert!(
+            (frob_sq - 2.0).abs() < 1e-9,
+            "fixture ‖G‖_F² is 2 (the flip)"
+        );
+        assert!(
+            sigma_sq < frob_sq,
+            "σ_max² must be strictly below ‖G‖_F² here"
+        );
 
         // Balanced rank-2 G = [[1,0.1],[0.1,1]] ⇒ eigenvalues 1.1, 0.9 ⇒
         // σ_max² = 1.21 vs ‖G‖_F² = 2.02.

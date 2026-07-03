@@ -111,10 +111,10 @@ pub(crate) use gam_solve::estimate::EstimationError;
 
 pub(crate) use gam_solve::evidence::arrow_log_det_from_cache;
 
+pub(crate) use gam_problem::{DeclaredHessianForm, Derivative, EfsEval, HessianResult, OuterEval};
 pub(crate) use gam_solve::rho_optimizer::{
     OuterCapability, OuterEvalOrder, OuterObjective, SeedOutcome,
 };
-pub(crate) use gam_problem::{DeclaredHessianForm, Derivative, EfsEval, HessianResult, OuterEval};
 
 pub(crate) use gam_solve::structure_search::{CollapseAction, CollapseEvent};
 
@@ -243,9 +243,9 @@ pub use atom::*;
 pub use behavior::*;
 pub use certificate::*;
 pub use construction_aux_types::*;
-pub use coordinate_fidelity::*;
 pub use construction_cache_refresh::*;
 pub use construction_padded_blocks::*;
+pub use coordinate_fidelity::*;
 pub use gauge::*;
 pub(crate) use kronecker::*;
 pub use loss::*;

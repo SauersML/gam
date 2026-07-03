@@ -3,8 +3,8 @@
 //! `#[cfg(test)] mod` in `mod.rs`; the shared `periodic_basis` fixture helper and
 //! the `TestPeriodicEvaluator` are sourced from the sibling `tests` module.
 
-use super::*;
 use super::tests::{TestPeriodicEvaluator, periodic_basis};
+use super::*;
 use ndarray::{Array2, Array3, array};
 use std::sync::Arc;
 
@@ -91,8 +91,7 @@ pub(crate) fn co_collapse_ev_arm_is_disarmed_at_iteration_zero_s1() {
         term.n_obs(),
         target.ncols(),
     );
-    let floor =
-        crate::manifold::outer_objective::absolute_degeneracy_ev_floor(target.view(), q);
+    let floor = crate::manifold::outer_objective::absolute_degeneracy_ev_floor(target.view(), q);
     assert!(
         ev <= floor && out_ratio <= floor,
         "precondition: co-collapsed state must sit at the null floor \

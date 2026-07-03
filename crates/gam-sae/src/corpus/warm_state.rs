@@ -39,9 +39,9 @@
 //! `HashMap` iteration, no float formatting), so the same warm state always
 //! hashes/round-trips identically.
 
-use gam_terms::smooth::TermCollectionSpec;
 use gam_runtime::warm_start::store::{EntryKind, StoreOptions, WarmStartStore};
 use gam_runtime::warm_start::{Fingerprint, Fingerprinter};
+use gam_terms::smooth::TermCollectionSpec;
 use std::collections::HashMap;
 use std::time::Duration;
 

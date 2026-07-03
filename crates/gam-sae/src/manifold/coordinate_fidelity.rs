@@ -224,7 +224,10 @@ pub fn coordinate_uniformity(
             if !(period.is_finite() && *period > 0.0) {
                 return None;
             }
-            coords.iter().map(|&t| t.rem_euclid(*period) / *period).collect()
+            coords
+                .iter()
+                .map(|&t| t.rem_euclid(*period) / *period)
+                .collect()
         }
         CanonicalChartTopology::Interval => {
             let mut lo = f64::INFINITY;
@@ -396,14 +399,8 @@ pub fn atom_coordinate_fidelity(
 
     Ok(Some(AtomCoordinateFidelity {
         topology: topology_label,
-        uniformity_statistic: uniformity
-            .as_ref()
-            .map(|u| u.statistic)
-            .unwrap_or(f64::NAN),
-        uniformity_p_value: uniformity
-            .as_ref()
-            .map(|u| u.p_value)
-            .unwrap_or(f64::NAN),
+        uniformity_statistic: uniformity.as_ref().map(|u| u.statistic).unwrap_or(f64::NAN),
+        uniformity_p_value: uniformity.as_ref().map(|u| u.p_value).unwrap_or(f64::NAN),
         arclength_defect: defect.unwrap_or(f64::NAN),
         n_coords: uniformity.as_ref().map(|u| u.n).unwrap_or(row_coords.len()),
         verdict,
@@ -453,7 +450,9 @@ fn raw_vs_arclength_defect(
             if !(span > 0.0) {
                 return (f64::NAN, f64::NAN);
             }
-            raw.iter().map(|&t| ((t - lo) / span).clamp(0.0, 1.0)).collect()
+            raw.iter()
+                .map(|&t| ((t - lo) / span).clamp(0.0, 1.0))
+                .collect()
         }
     };
 
@@ -588,7 +587,7 @@ impl SaeManifoldTerm {
 #[cfg(test)]
 mod coordinate_fidelity_tests {
     use super::*;
-    use crate::manifold::{SaeBasisEvaluator, SAE_FINAL_EV_DEGRADATION_TOL};
+    use crate::manifold::{SAE_FINAL_EV_DEGRADATION_TOL, SaeBasisEvaluator};
     use ndarray::{Array1, Array2, Array3, Array4, Array5, ArrayView2};
 
     /// A minimal circle-harmonic evaluator for the arc-length-defect tests:
@@ -783,8 +782,14 @@ mod coordinate_fidelity_tests {
         let reflected: Vec<f64> = base.iter().map(|&x| (1.0 - x).rem_euclid(1.0)).collect();
         let ur = watson_u2_uniform(&rotated).statistic;
         let uf = watson_u2_uniform(&reflected).statistic;
-        assert!((u0 - ur).abs() < 1e-9, "rotation must not change U²: {u0} vs {ur}");
-        assert!((u0 - uf).abs() < 1e-9, "reflection must not change U²: {u0} vs {uf}");
+        assert!(
+            (u0 - ur).abs() < 1e-9,
+            "rotation must not change U²: {u0} vs {ur}"
+        );
+        assert!(
+            (u0 - uf).abs() < 1e-9,
+            "reflection must not change U²: {u0} vs {uf}"
+        );
     }
 
     /// The arc-length defect is ≈0 for a unit-speed circle (pure first harmonic,
@@ -874,19 +879,55 @@ mod coordinate_fidelity_tests {
     fn prefer_candidate_basin_prices_ev_then_uniformity() {
         let tol = SAE_FINAL_EV_DEGRADATION_TOL;
         // Strictly better EV always wins, regardless of uniformity.
-        assert!(prefer_candidate_basin(0.90, Some(0.5), 0.80, Some(0.01), tol));
+        assert!(prefer_candidate_basin(
+            0.90,
+            Some(0.5),
+            0.80,
+            Some(0.01),
+            tol
+        ));
         // Strictly worse EV always loses, regardless of uniformity.
-        assert!(!prefer_candidate_basin(0.80, Some(0.01), 0.90, Some(0.5), tol));
+        assert!(!prefer_candidate_basin(
+            0.80,
+            Some(0.01),
+            0.90,
+            Some(0.5),
+            tol
+        ));
         // Near-equal EV: lower U² (more uniform) wins.
-        assert!(prefer_candidate_basin(0.90, Some(0.02), 0.9005, Some(0.20), tol));
+        assert!(prefer_candidate_basin(
+            0.90,
+            Some(0.02),
+            0.9005,
+            Some(0.20),
+            tol
+        ));
         // Near-equal EV: higher U² loses.
-        assert!(!prefer_candidate_basin(0.90, Some(0.20), 0.9005, Some(0.02), tol));
+        assert!(!prefer_candidate_basin(
+            0.90,
+            Some(0.20),
+            0.9005,
+            Some(0.02),
+            tol
+        ));
         // Near-equal EV, equal uniformity: keep incumbent (no thrash).
-        assert!(!prefer_candidate_basin(0.90, Some(0.05), 0.90, Some(0.05), tol));
+        assert!(!prefer_candidate_basin(
+            0.90,
+            Some(0.05),
+            0.90,
+            Some(0.05),
+            tol
+        ));
         // No certificate on either side: tie-break inert.
         assert!(!prefer_candidate_basin(0.90, None, 0.90, Some(0.05), tol));
         // Non-finite candidate EV never preferred.
-        assert!(!prefer_candidate_basin(f64::NAN, Some(0.0), 0.5, Some(0.5), tol));
+        assert!(!prefer_candidate_basin(
+            f64::NAN,
+            Some(0.0),
+            0.5,
+            Some(0.5),
+            tol
+        ));
     }
 
     /// PLANTED-CIRCLE tie-break: two seeds reach equal EV but read different
@@ -907,7 +948,10 @@ mod coordinate_fidelity_tests {
         let ub = coordinate_uniformity(Array1::from(squished).view(), &circle())
             .unwrap()
             .statistic;
-        assert!(ua < ub, "honest chart must read a more uniform angle: {ua} vs {ub}");
+        assert!(
+            ua < ub,
+            "honest chart must read a more uniform angle: {ua} vs {ub}"
+        );
         // Both seeds reconstruct the ring equally well (EV within the negligibility
         // band): the tie-break must prefer the honest (uniform) seed over the
         // squished incumbent, and never the reverse.
@@ -941,9 +985,16 @@ mod coordinate_fidelity_tests {
         for (i, &t) in rows.iter().enumerate() {
             let d = (reading.coords_u_arc[i] - t).rem_euclid(1.0);
             let circ = d.min(1.0 - d);
-            assert!(circ < 1e-6, "u_arc must equal raw t on a unit-speed circle: {circ}");
+            assert!(
+                circ < 1e-6,
+                "u_arc must equal raw t on a unit-speed circle: {circ}"
+            );
         }
-        assert!(reading.speed_cv < 1e-6, "flat speed ⇒ ~zero CV, got {}", reading.speed_cv);
+        assert!(
+            reading.speed_cv < 1e-6,
+            "flat speed ⇒ ~zero CV, got {}",
+            reading.speed_cv
+        );
         assert!((reading.min_speed_over_mean - 1.0).abs() < 1e-6);
         assert!((reading.max_speed_over_mean - 1.0).abs() < 1e-6);
         assert_eq!(
@@ -952,7 +1003,10 @@ mod coordinate_fidelity_tests {
         );
         let (rms, max) =
             raw_vs_arclength_defect(rows.view(), reading.coords_u_arc.view(), &circle(), true);
-        assert!(rms < 1e-6 && max < 1e-6, "honest chart has ~zero raw defect: rms={rms} max={max}");
+        assert!(
+            rms < 1e-6 && max < 1e-6,
+            "honest chart has ~zero raw defect: rms={rms} max={max}"
+        );
     }
 
     /// The pure-read arclength coordinate also handles interval charts: for a
@@ -1063,9 +1117,7 @@ mod coordinate_fidelity_tests {
     /// and the in-loop retraction tolerance `UNIT_SPEED_INLOOP_DEFECT_TOL`.
     #[test]
     fn angle_fidelity_verdict_uses_derived_thresholds() {
-        use crate::chart_canonicalization::{
-            ChartArcLengthReading, UNIT_SPEED_INLOOP_DEFECT_TOL,
-        };
+        use crate::chart_canonicalization::{ChartArcLengthReading, UNIT_SPEED_INLOOP_DEFECT_TOL};
         let mk = |speed_cv: f64, min_over: f64, max_over: f64| ChartArcLengthReading {
             coords_u_arc: Array1::zeros(1),
             speed_cv,
@@ -1090,7 +1142,10 @@ mod coordinate_fidelity_tests {
             AngleFidelityVerdict::Degenerate
         );
         // No reading at all ⇒ degenerate.
-        assert_eq!(angle_fidelity_verdict(None), AngleFidelityVerdict::Degenerate);
+        assert_eq!(
+            angle_fidelity_verdict(None),
+            AngleFidelityVerdict::Degenerate
+        );
         assert!(AngleFidelityVerdict::ArcLengthHonest.certified());
         assert!(AngleFidelityVerdict::RecoverableViaArcLength.certified());
         assert!(!AngleFidelityVerdict::Degenerate.certified());
@@ -1112,7 +1167,13 @@ mod coordinate_fidelity_tests {
         let reflected = Array1::from_iter(raw.iter().map(|&t| (1.0 - t).rem_euclid(1.0)));
         let (rms_rot, _) = raw_vs_arclength_defect(rotated.view(), u_arc.view(), &circle(), true);
         let (rms_ref, _) = raw_vs_arclength_defect(reflected.view(), u_arc.view(), &circle(), true);
-        assert!((rms0 - rms_rot).abs() < 1e-9, "rotation must not change the defect: {rms0} vs {rms_rot}");
-        assert!((rms0 - rms_ref).abs() < 1e-9, "reflection must not change the defect: {rms0} vs {rms_ref}");
+        assert!(
+            (rms0 - rms_rot).abs() < 1e-9,
+            "rotation must not change the defect: {rms0} vs {rms_rot}"
+        );
+        assert!(
+            (rms0 - rms_ref).abs() < 1e-9,
+            "reflection must not change the defect: {rms0} vs {rms_ref}"
+        );
     }
 }

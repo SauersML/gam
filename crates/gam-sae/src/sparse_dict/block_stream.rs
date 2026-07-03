@@ -38,10 +38,8 @@
 //! the reconstruction throughout the epoch), so its per-epoch step is internally
 //! consistent.
 
-use super::block::{
-    gram_schmidt_rows, route_and_code_all, seed_frames, stable_rank_symmetric,
-};
 use super::BlockSparseConfig;
+use super::block::{gram_schmidt_rows, route_and_code_all, seed_frames, stable_rank_symmetric};
 use crate::frames::GrassmannFrame;
 use ndarray::{Array2, ArrayView2};
 use std::cmp::Ordering;
@@ -182,7 +180,7 @@ pub struct BlockSparseStreamState {
     gamma: f32,
 
     // ---- accumulators reset at each end_epoch (frozen frames/γ used to fill) ----
-    cross: Vec<Array2<f64>>, // per-block MOD cross-moment M_g (P×b)
+    cross: Vec<Array2<f64>>,  // per-block MOD cross-moment M_g (P×b)
     second: Vec<Array2<f64>>, // per-block within-block code 2nd moment (b×b)
     usage: Vec<usize>,
     touched: Vec<bool>,

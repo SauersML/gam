@@ -1,7 +1,7 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
-use gam_linalg::faer_ndarray::{FaerSvd, fast_ab, fast_abt, fast_atb};
 use crate::manifold::SaeManifoldTerm;
+use gam_linalg::faer_ndarray::{FaerSvd, fast_ab, fast_abt, fast_atb};
 
 #[derive(Clone, Debug)]
 pub(crate) struct FrameProjection {

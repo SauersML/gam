@@ -226,7 +226,14 @@ impl SaeManifoldTerm {
         let gates = self.assignment.assignments();
         let frozen: Vec<(usize, usize, f64, f64)> = pairs
             .into_iter()
-            .map(|(j, k, q)| (j, k, q, self.barrier_pair_strength_with_gates(gates.view(), j, k)))
+            .map(|(j, k, q)| {
+                (
+                    j,
+                    k,
+                    q,
+                    self.barrier_pair_strength_with_gates(gates.view(), j, k),
+                )
+            })
             .collect();
         self.barrier_coactivation_gate = Some(frozen);
     }
@@ -251,7 +258,12 @@ impl SaeManifoldTerm {
                 self.barrier_coactive_pairs()
                     .into_iter()
                     .map(|(j, k, q)| {
-                        (j, k, q, self.barrier_pair_strength_with_gates(gates.view(), j, k))
+                        (
+                            j,
+                            k,
+                            q,
+                            self.barrier_pair_strength_with_gates(gates.view(), j, k),
+                        )
                     })
                     .collect()
             }
@@ -713,7 +725,11 @@ impl SaeManifoldTerm {
         let t = ((c2 - s0) / span).min(1.0);
         let w = t * t * (3.0 - 2.0 * t);
         // dw/dc² = (6t − 6t²) · dt/dc² = 6t(1−t)/span; flat (0) once t saturates.
-        let dw = if t >= 1.0 { 0.0 } else { 6.0 * t * (1.0 - t) / span };
+        let dw = if t >= 1.0 {
+            0.0
+        } else {
+            6.0 * t * (1.0 - t) / span
+        };
         (w, dw)
     }
 
@@ -1651,7 +1667,8 @@ impl SaeManifoldTerm {
         // penalty (the single source of truth shared with the gradient); if it
         // is unavailable/degenerate we skip the block rather than write a
         // mis-scaled one.
-        let mu_raw = resolve_learnable_weight(corrected.scalar_weight, rho_local[corrected.rho_index]);
+        let mu_raw =
+            resolve_learnable_weight(corrected.scalar_weight, rho_local[corrected.rho_index]);
         let Some(gbar) = corrected.metric_normalizer(d) else {
             return;
         };
@@ -1911,7 +1928,8 @@ impl SaeManifoldTerm {
         // so the decoder curvature matches its scale-free gradient. PSD-
         // preserving (positive scalar on a PSD Gram block); skip on a degenerate
         // normalizer rather than write a mis-scaled block.
-        let mu_raw = resolve_learnable_weight(corrected.scalar_weight, rho_local[corrected.rho_index]);
+        let mu_raw =
+            resolve_learnable_weight(corrected.scalar_weight, rho_local[corrected.rho_index]);
         let Some(gbar) = corrected.metric_normalizer(d) else {
             return;
         };

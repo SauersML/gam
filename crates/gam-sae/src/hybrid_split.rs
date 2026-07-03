@@ -66,13 +66,13 @@
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
+use crate::chart_canonicalization::d1_atom_fitted_turning;
+use crate::manifold::{SaeManifoldAtom, solve_design_least_squares};
 use gam_linalg::faer_ndarray::FaerEigh;
 use gam_solve::evidence::{
     HybridAtomCandidate, HybridAtomChoice, HybridSplitSelection, select_hybrid_split,
 };
 use gam_terms::latent::LatentManifold;
-use crate::chart_canonicalization::d1_atom_fitted_turning;
-use crate::manifold::{SaeManifoldAtom, solve_design_least_squares};
 
 /// The rank-aware Laplace negative-log-evidence of a reduced per-atom Gaussian
 /// reconstruction sub-model: `residual_objective + ½ log|H|` with no smoothing
@@ -1231,8 +1231,7 @@ where
             let reverted = global_collapse_rollback(r0.view(), &eligible, &forced, global_tol);
             if !reverted.is_empty() {
                 for slot in reverted {
-                    if let Some(curved) =
-                        slots[slot].iter().find(|c| !c.param.is_linear()).copied()
+                    if let Some(curved) = slots[slot].iter().find(|c| !c.param.is_linear()).copied()
                     {
                         slots[slot] = vec![curved];
                     }
@@ -1561,8 +1560,7 @@ mod tests {
     fn refit_curved_rss_matches_or_beats_best_line_nested() {
         let n = 40usize;
         let p = 2usize;
-        let coords =
-            Array1::from_iter((0..n).map(|i| -1.0 + 2.0 * (i as f64) / ((n - 1) as f64)));
+        let coords = Array1::from_iter((0..n).map(|i| -1.0 + 2.0 * (i as f64) / ((n - 1) as f64)));
         let assign = Array1::<f64>::ones(n);
         // Φ = [1, t, t²]: its column span contains the straight lane [1, t], so the
         // decoder-only curved refit is a proper superset of the line fit.

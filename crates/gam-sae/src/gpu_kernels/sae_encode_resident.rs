@@ -55,9 +55,7 @@
 
 use std::time::Instant;
 
-use crate::encode::{
-    AtlasConfig, AtomEncodeAtlas, KANTOROVICH_THRESHOLD, euclidean_patch_degree,
-};
+use crate::encode::{AtlasConfig, AtomEncodeAtlas, KANTOROVICH_THRESHOLD, euclidean_patch_degree};
 use crate::manifold::SaeManifoldAtom;
 use gam_gpu::policy::{EncodeDecisionBlocked, EncodeDeploymentDecision};
 
@@ -262,7 +260,13 @@ fn dpow(base: f64, exp: i32) -> f64 {
 /// [`crate::basis::EuclideanPatchEvaluator::second_jet`] (the same falling-
 /// factorial monomial derivatives), producing:
 ///   `phi[col]`, `jet[col*d + axis]`, `hess[(col*d + a)*d + c]`.
-fn eval_basis(dev: &EncodeAtomDevice, t: &[f64], phi: &mut [f64], jet: &mut [f64], hess: &mut [f64]) {
+fn eval_basis(
+    dev: &EncodeAtomDevice,
+    t: &[f64],
+    phi: &mut [f64],
+    jet: &mut [f64],
+    hess: &mut [f64],
+) {
     let (d, m) = (dev.d, dev.m);
     let exp = &dev.exponents;
     for col in 0..m {
@@ -282,7 +286,11 @@ fn eval_basis(dev: &EncodeAtomDevice, t: &[f64], phi: &mut [f64], jet: &mut [f64
             if a_axis != 0 {
                 jval = a_axis as f64;
                 for a in 0..d {
-                    let ea = if a == axis { a_axis - 1 } else { exp[col * d + a] };
+                    let ea = if a == axis {
+                        a_axis - 1
+                    } else {
+                        exp[col * d + a]
+                    };
                     if ea != 0 {
                         jval *= dpow(t[a], ea);
                     }
@@ -554,7 +562,13 @@ fn row_certificate(
     scratch: &mut Scratch,
 ) -> (DeviceRowCertificate, Vec<f64>) {
     let d = dev.d;
-    eval_basis(dev, t, &mut scratch.phi, &mut scratch.jet, &mut scratch.hess);
+    eval_basis(
+        dev,
+        t,
+        &mut scratch.phi,
+        &mut scratch.jet,
+        &mut scratch.hess,
+    );
     encode_grad_hess(
         dev,
         x,
@@ -633,8 +647,7 @@ fn certify_with_basin_warmup(
     if !in_chart(&t, &chart.center, chart.radius) {
         return None;
     }
-    let (mut cert, mut delta) =
-        row_certificate(dev, &t, x, amplitude, chart.lipschitz, scratch);
+    let (mut cert, mut delta) = row_certificate(dev, &t, x, amplitude, chart.lipschitz, scratch);
     while !cert.certified() {
         if !(cert.h.is_finite() && cert.beta.is_finite() && cert.eta.is_finite()) {
             return None;
@@ -690,7 +703,13 @@ fn certify_with_basin_warmup(
 /// Distilled affine warm start `t̂ = t_c + (1/z)·A₁·(x − z·m₁)`. Mirror of
 /// [`crate::encode::amortized_warm_start`]. `None` when the chart has no
 /// Jacobian or the amplitude is not strictly positive & finite.
-fn amortized_warm_start(chart: &EncodeChartDevice, x: &[f64], amplitude: f64, d: usize, p: usize) -> Option<Vec<f64>> {
+fn amortized_warm_start(
+    chart: &EncodeChartDevice,
+    x: &[f64],
+    amplitude: f64,
+    d: usize,
+    p: usize,
+) -> Option<Vec<f64>> {
     if !chart.has_jacobian {
         return None;
     }
@@ -709,8 +728,20 @@ fn amortized_warm_start(chart: &EncodeChartDevice, x: &[f64], amplitude: f64, d:
 
 /// Reconstruction error `‖x − z·m(t)‖`. Mirror of
 /// [`crate::encode::encode_reconstruction_error`].
-fn recon_error(dev: &EncodeAtomDevice, t: &[f64], x: &[f64], amplitude: f64, scratch: &mut Scratch) -> f64 {
-    eval_basis(dev, t, &mut scratch.phi, &mut scratch.jet, &mut scratch.hess);
+fn recon_error(
+    dev: &EncodeAtomDevice,
+    t: &[f64],
+    x: &[f64],
+    amplitude: f64,
+    scratch: &mut Scratch,
+) -> f64 {
+    eval_basis(
+        dev,
+        t,
+        &mut scratch.phi,
+        &mut scratch.jet,
+        &mut scratch.hess,
+    );
     let mut err2 = 0.0;
     let p = dev.p;
     let mut recon = vec![0.0_f64; p];
@@ -719,7 +750,11 @@ fn recon_error(dev: &EncodeAtomDevice, t: &[f64], x: &[f64], amplitude: f64, scr
         let r = x[c] - amplitude * recon[c];
         err2 += r * r;
     }
-    if err2.is_finite() { err2.sqrt() } else { f64::INFINITY }
+    if err2.is_finite() {
+        err2.sqrt()
+    } else {
+        f64::INFINITY
+    }
 }
 
 /// Top-`k` charts by the amplitude-scaled center reconstruction distance
@@ -745,7 +780,13 @@ fn nearest_charts_topk(
         if chart.certified_radius <= 0.0 {
             continue;
         }
-        eval_basis(dev, &chart.center, &mut scratch.phi, &mut scratch.jet, &mut scratch.hess);
+        eval_basis(
+            dev,
+            &chart.center,
+            &mut scratch.phi,
+            &mut scratch.jet,
+            &mut scratch.hess,
+        );
         recon_amp1(dev, &scratch.phi, &mut recon);
         let mut dist = 0.0;
         for c in 0..p {
@@ -767,7 +808,11 @@ fn nearest_charts_topk(
 /// This is BOTH the CPU fallback and the exactness oracle the CUDA kernel is
 /// pinned to (the kernel does exactly this, one block per row).
 #[must_use]
-pub fn emulate_certified_encode_row(dev: &EncodeAtomDevice, x: &[f64], amplitude: f64) -> DeviceEncodeRow {
+pub fn emulate_certified_encode_row(
+    dev: &EncodeAtomDevice,
+    x: &[f64],
+    amplitude: f64,
+) -> DeviceEncodeRow {
     let d = dev.d;
     let p = dev.p;
     let mut scratch = Scratch::new(dev);
@@ -784,14 +829,21 @@ pub fn emulate_certified_encode_row(dev: &EncodeAtomDevice, x: &[f64], amplitude
         let chart = &dev.charts[chart_idx];
         let Some(t_hat) = amortized_warm_start(chart, x, amplitude, d, p) else {
             if nearest_fallback.is_none() {
-                nearest_fallback = Some((vec![0.0; d], DeviceRowCertificate::uncertified(chart.lipschitz)));
+                nearest_fallback = Some((
+                    vec![0.0; d],
+                    DeviceRowCertificate::uncertified(chart.lipschitz),
+                ));
             }
             continue;
         };
-        let (coord, cert) = match certify_with_basin_warmup(dev, t_hat, x, amplitude, chart, &mut scratch) {
-            Some((c, cert)) => (c, cert),
-            None => (vec![0.0; d], DeviceRowCertificate::uncertified(chart.lipschitz)),
-        };
+        let (coord, cert) =
+            match certify_with_basin_warmup(dev, t_hat, x, amplitude, chart, &mut scratch) {
+                Some((c, cert)) => (c, cert),
+                None => (
+                    vec![0.0; d],
+                    DeviceRowCertificate::uncertified(chart.lipschitz),
+                ),
+            };
         if nearest_fallback.is_none() {
             nearest_fallback = Some((coord.clone(), cert));
         }
@@ -1290,9 +1342,7 @@ pub fn measure_device_encode_throughput(
 
 #[cfg(target_os = "linux")]
 mod device {
-    use super::{
-        DeviceEncodeRow, DeviceRowCertificate, EncodeAtomDevice, encode_kernel_source,
-    };
+    use super::{DeviceEncodeRow, DeviceRowCertificate, EncodeAtomDevice, encode_kernel_source};
     use gam_gpu::gpu_error::{GpuError, GpuResultExt};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
@@ -1384,24 +1434,42 @@ mod device {
             tgt[i * p..(i + 1) * p].copy_from_slice(x);
         }
 
-        let exps_dev = stream.clone_htod(&dev.exponents).gpu_ctx("sae_encode htod exps")?;
-        let dec_dev = stream.clone_htod(&dev.decoder).gpu_ctx("sae_encode htod dec")?;
-        let centers_dev = stream.clone_htod(&centers).gpu_ctx("sae_encode htod centers")?;
+        let exps_dev = stream
+            .clone_htod(&dev.exponents)
+            .gpu_ctx("sae_encode htod exps")?;
+        let dec_dev = stream
+            .clone_htod(&dev.decoder)
+            .gpu_ctx("sae_encode htod dec")?;
+        let centers_dev = stream
+            .clone_htod(&centers)
+            .gpu_ctx("sae_encode htod centers")?;
         let radii_dev = stream.clone_htod(&radii).gpu_ctx("sae_encode htod radii")?;
-        let cert_dev = stream.clone_htod(&cert_radii).gpu_ctx("sae_encode htod cert_radii")?;
+        let cert_dev = stream
+            .clone_htod(&cert_radii)
+            .gpu_ctx("sae_encode htod cert_radii")?;
         let lips_dev = stream.clone_htod(&lips).gpu_ctx("sae_encode htod lips")?;
-        let hasj_dev = stream.clone_htod(&has_jac).gpu_ctx("sae_encode htod has_jac")?;
+        let hasj_dev = stream
+            .clone_htod(&has_jac)
+            .gpu_ctx("sae_encode htod has_jac")?;
         let a1_dev = stream.clone_htod(&a1).gpu_ctx("sae_encode htod a1")?;
-        let reconc_dev = stream.clone_htod(&recon_c).gpu_ctx("sae_encode htod recon_c")?;
+        let reconc_dev = stream
+            .clone_htod(&recon_c)
+            .gpu_ctx("sae_encode htod recon_c")?;
         let tgt_dev = stream.clone_htod(&tgt).gpu_ctx("sae_encode htod targets")?;
-        let amps_dev = stream.clone_htod(&amplitudes.to_vec()).gpu_ctx("sae_encode htod amps")?;
-        let mut coords_dev = stream.alloc_zeros::<f64>(n * d).gpu_ctx("sae_encode alloc coords")?;
+        let amps_dev = stream
+            .clone_htod(&amplitudes.to_vec())
+            .gpu_ctx("sae_encode htod amps")?;
+        let mut coords_dev = stream
+            .alloc_zeros::<f64>(n * d)
+            .gpu_ctx("sae_encode alloc coords")?;
         let mut h_dev = stream.alloc_zeros::<f64>(n).gpu_ctx("sae_encode alloc h")?;
-        let mut cert_out_dev = stream.alloc_zeros::<i32>(n).gpu_ctx("sae_encode alloc certified")?;
+        let mut cert_out_dev = stream
+            .alloc_zeros::<i32>(n)
+            .gpu_ctx("sae_encode alloc certified")?;
 
         let n_i32 = i32::try_from(n).map_err(|_| gam_gpu::gpu_err!("sae_encode n overflow"))?;
-        let ncharts_i32 =
-            i32::try_from(n_charts).map_err(|_| gam_gpu::gpu_err!("sae_encode n_charts overflow"))?;
+        let ncharts_i32 = i32::try_from(n_charts)
+            .map_err(|_| gam_gpu::gpu_err!("sae_encode n_charts overflow"))?;
         let cfg = LaunchConfig {
             grid_dim: (n_i32 as u32, 1, 1),
             block_dim: (32, 1, 1),
@@ -1433,9 +1501,15 @@ mod device {
         let mut coords = vec![0.0_f64; n * d];
         let mut h = vec![0.0_f64; n];
         let mut cert = vec![0_i32; n];
-        stream.memcpy_dtoh(&coords_dev, &mut coords).gpu_ctx("sae_encode dtoh coords")?;
-        stream.memcpy_dtoh(&h_dev, &mut h).gpu_ctx("sae_encode dtoh h")?;
-        stream.memcpy_dtoh(&cert_out_dev, &mut cert).gpu_ctx("sae_encode dtoh certified")?;
+        stream
+            .memcpy_dtoh(&coords_dev, &mut coords)
+            .gpu_ctx("sae_encode dtoh coords")?;
+        stream
+            .memcpy_dtoh(&h_dev, &mut h)
+            .gpu_ctx("sae_encode dtoh h")?;
+        stream
+            .memcpy_dtoh(&cert_out_dev, &mut cert)
+            .gpu_ctx("sae_encode dtoh certified")?;
         stream.synchronize().gpu_ctx("sae_encode synchronize")?;
 
         let mut out = Vec::with_capacity(n);
@@ -1648,7 +1722,11 @@ mod tests {
         let dev = EncodeAtomDevice::from_atom_atlas(&atom, &atlas.atoms[0], &config).unwrap();
         let n = 40usize;
         let rows: Vec<Vec<f64>> = (0..n)
-            .map(|k| (0..p).map(|c| 0.3 * (((k + c) as f64) * 0.19).sin()).collect())
+            .map(|k| {
+                (0..p)
+                    .map(|c| 0.3 * (((k + c) as f64) * 0.19).sin())
+                    .collect()
+            })
             .collect();
         let amps: Vec<f64> = (0..n).map(|_| 1.0).collect();
         let (batch, path) = sae_certified_encode_batch(&dev, &rows, &amps);
@@ -1729,7 +1807,10 @@ mod tests {
             "the exact encode benchmark must produce a positive rows/sec, got {}",
             tput.rows_per_sec
         );
-        assert_eq!(tput.device_engaged(), matches!(tput.path, EncodePath::Device));
+        assert_eq!(
+            tput.device_engaged(),
+            matches!(tput.path, EncodePath::Device)
+        );
 
         // The benchmark must be non-vacuous: on a well-conditioned dictionary the
         // planted on-manifold rows certify through the exact encode (proving the
@@ -1811,7 +1892,10 @@ mod tests {
                 for k in 0..2 {
                     acc += vals[k] * vecs[k * 2 + r] * vecs[k * 2 + c];
                 }
-                assert!((acc - a[r * 2 + c]).abs() < 1e-12, "eig reconstruct {r},{c}");
+                assert!(
+                    (acc - a[r * 2 + c]).abs() < 1e-12,
+                    "eig reconstruct {r},{c}"
+                );
             }
         }
         // Eigenvalues of [[4,1],[1,3]] are (7±√5)/2.
@@ -1837,8 +1921,10 @@ mod tests {
         let ptx = gam_gpu::device_cache::compile_ptx_arch(&src)
             .expect("sae_encode kernel compiles to PTX via NVRTC");
         let text = ptx.to_src();
-        assert!(text.contains(".visible .entry sae_certified_encode"),
-            "PTX must export the encode entry");
+        assert!(
+            text.contains(".visible .entry sae_certified_encode"),
+            "PTX must export the encode entry"
+        );
         assert!(text.contains(".target sm_"), "PTX must carry a target arch");
     }
 
@@ -1851,7 +1937,11 @@ mod tests {
         let dev = EncodeAtomDevice::from_atom_atlas(&atom, &atlas.atoms[0], &config).unwrap();
         let n = DEVICE_ROW_THRESHOLD + 64;
         let rows: Vec<Vec<f64>> = (0..n)
-            .map(|k| (0..p).map(|c| 0.3 * (((k + c) as f64) * 0.019).sin()).collect())
+            .map(|k| {
+                (0..p)
+                    .map(|c| 0.3 * (((k + c) as f64) * 0.019).sin())
+                    .collect()
+            })
             .collect();
         let amps = vec![1.0; n];
         let cpu = emulate_certified_encode_batch(&dev, &rows, &amps);
@@ -1860,14 +1950,21 @@ mod tests {
                 .expect("admitted GPU runtime must run the sae_encode kernel");
             let mut max_coord = 0.0_f64;
             for (a, b) in cpu.iter().zip(devout.iter()) {
-                assert_eq!(a.cert.certified(), b.cert.certified(), "device certified flag");
+                assert_eq!(
+                    a.cert.certified(),
+                    b.cert.certified(),
+                    "device certified flag"
+                );
                 if a.cert.certified() {
                     for axis in 0..dev.d {
                         max_coord = max_coord.max((a.coord[axis] - b.coord[axis]).abs());
                     }
                 }
             }
-            assert!(max_coord <= 1e-9, "device vs emulator coord diff {max_coord:.3e} > 1e-9");
+            assert!(
+                max_coord <= 1e-9,
+                "device vs emulator coord diff {max_coord:.3e} > 1e-9"
+            );
         }
     }
 }

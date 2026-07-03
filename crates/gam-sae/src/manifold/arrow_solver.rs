@@ -337,11 +337,8 @@ mod selected_inverse_row_blocks_oracle_tests {
             ridge_beta: 0.0,
             htbeta: ArrowHtbetaCache::Dense {
                 blocks: Arc::from(
-                    vec![
-                        array![[0.5_f64, -0.2], [0.1, 0.4]],
-                        array![[0.3_f64, 0.7]],
-                    ]
-                    .into_boxed_slice(),
+                    vec![array![[0.5_f64, -0.2], [0.1, 0.4]], array![[0.3_f64, 0.7]]]
+                        .into_boxed_slice(),
                 ),
                 estimated_bytes: 0,
             },

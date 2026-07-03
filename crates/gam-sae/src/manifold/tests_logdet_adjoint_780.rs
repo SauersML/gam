@@ -4,8 +4,8 @@
 //! `gamma_fd_tiny_fixture` / `fixed_state_logdet` are sourced from the sibling
 //! `tests` module.
 
-use super::*;
 use super::tests::{fixed_state_logdet, gamma_fd_tiny_fixture};
+use super::*;
 
 /// #1416 exact NUMERICAL ORACLE for the IBP cross-row log-det derivatives.
 ///
@@ -110,7 +110,8 @@ fn ibp_1416_oracle_cache(term: &SaeManifoldTerm, rho: &SaeManifoldRho) -> ArrowF
     }
     // IBP source: rank R = 1, coefficient d_0 = w·s'_0 = cross_row_d[0]; the two
     // entries place `J_i = z_jac[i]` at row i's logit slot (global index i).
-    let entries: Vec<(usize, usize, f64)> = (0..n).map(|i| (i, 0usize, channels.z_jac[i])).collect();
+    let entries: Vec<(usize, usize, f64)> =
+        (0..n).map(|i| (i, 0usize, channels.z_jac[i])).collect();
     let source = IbpCrossRowSource {
         r: 1,
         d: channels.cross_row_d.clone(),
@@ -161,9 +162,8 @@ fn ibp_1416_oracle_cache_with_coord(
         // htbeta stays zero (decoder is zero ⇒ no t↔β data coupling).
     }
     // IBP source entries place `J_i` at row i's LOGIT slot, global index 2·i.
-    let entries: Vec<(usize, usize, f64)> = (0..n)
-        .map(|i| (2 * i, 0usize, channels.z_jac[i]))
-        .collect();
+    let entries: Vec<(usize, usize, f64)> =
+        (0..n).map(|i| (2 * i, 0usize, channels.z_jac[i])).collect();
     let source = IbpCrossRowSource {
         r: 1,
         d: channels.cross_row_d.clone(),
@@ -484,8 +484,6 @@ pub(crate) fn learnable_ibp_alpha_logdet_trace_matches_dense_fd_1417() {
          {data_trace:.3e}"
     );
 }
-
-
 
 /// #1625 (scope expansion) — the LEARNABLE-α IBP-MAP logit θ-adjoint. This is
 /// the cross-row Woodbury logit channel of `Γ = tr(H⁻¹ ∂H/∂ℓ)` under

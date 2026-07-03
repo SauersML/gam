@@ -36,11 +36,11 @@
 //! the two coincide once the dictionary is fully populated and revival goes
 //! quiescent.
 
+use super::SparseDictConfig;
 use super::scoring::TileScorer;
 use super::update::{
     DEAD_DENOM, DecoderNormalEq, route_and_code_all, seed_decoder, solve_decoder, unit_norm_rows,
 };
-use super::SparseDictConfig;
 use ndarray::{Array2, ArrayView2};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -369,7 +369,11 @@ impl SparseDictStreamState {
 
         // (c) exact decoder refresh from this epoch's normal equations, then (d)
         // unit-norm. Dead atoms keep their current direction inside solve_decoder.
-        solve_decoder(&mut self.decoder, &self.eq, self.config.decoder_ridge as f64);
+        solve_decoder(
+            &mut self.decoder,
+            &self.eq,
+            self.config.decoder_ridge as f64,
+        );
         unit_norm_rows(&mut self.decoder);
 
         // (e) dead-atom revival onto worst-reconstructed residual rows (never PCs).
@@ -383,7 +387,8 @@ impl SparseDictStreamState {
         // still being revived (a large dictionary populates its tail over several
         // epochs); once quiescent, an EV plateau converges.
         let improve = ev - self.prev_ev;
-        let converged = revived == 0 && improve.abs() <= self.config.tolerance && self.epochs_run > 0;
+        let converged =
+            revived == 0 && improve.abs() <= self.config.tolerance && self.epochs_run > 0;
 
         self.prev_ev = ev;
         self.last_ev = ev;
@@ -548,7 +553,12 @@ mod stream_tests {
     /// Explained variance of a decoder + fresh routing over `x` (the same quantity
     /// the trainer reports), computed directly so the test does not depend on which
     /// EV a given entry point caches.
-    fn routed_ev(x: ArrayView2<'_, f32>, decoder: &Array2<f32>, s: usize, config: &SparseDictConfig) -> f64 {
+    fn routed_ev(
+        x: ArrayView2<'_, f32>,
+        decoder: &Array2<f32>,
+        s: usize,
+        config: &SparseDictConfig,
+    ) -> f64 {
         let scorer = TileScorer::new(s, config.score_tile);
         let codes = route_and_code_all(
             x,
@@ -651,7 +661,11 @@ mod stream_tests {
             .collect();
         let (stream_decoder, s) = stream_fit(x.view(), &shards, &config);
 
-        assert_eq!(stream_decoder.shape(), one_shot.decoder.shape(), "decoder shapes must match");
+        assert_eq!(
+            stream_decoder.shape(),
+            one_shot.decoder.shape(),
+            "decoder shapes must match"
+        );
 
         let ev_stream = routed_ev(x.view(), &stream_decoder, s, &config);
         assert!(
@@ -659,7 +673,10 @@ mod stream_tests {
             "streamed EV {ev_stream} must match one-shot EV {} within 1e-3",
             one_shot.explained_variance
         );
-        assert!(ev_stream > 0.9, "planted corpus should fit well, got EV {ev_stream}");
+        assert!(
+            ev_stream > 0.9,
+            "planted corpus should fit well, got EV {ev_stream}"
+        );
     }
 
     /// Deterministic full-rank pseudo-random corpus in `[-1, 1)` (index hash), so
@@ -741,8 +758,13 @@ mod stream_tests {
         };
         let mut state = SparseDictStreamState::new(seed.view(), &config).expect("fit_begin");
         // Seed spans only e0/e1: nothing points at e2 yet.
-        let pre_cos_e2 = (0..3).map(|a| state.decoder()[[a, 2]].abs()).fold(0.0f32, f32::max);
-        assert!(pre_cos_e2 < 1.0e-4, "seed decoder must not span e2, got |cos|={pre_cos_e2}");
+        let pre_cos_e2 = (0..3)
+            .map(|a| state.decoder()[[a, 2]].abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            pre_cos_e2 < 1.0e-4,
+            "seed decoder must not span e2, got |cos|={pre_cos_e2}"
+        );
 
         state.partial_fit(shard.view()).expect("partial_fit");
         let stats = state.end_epoch().expect("end_epoch");
@@ -755,7 +777,12 @@ mod stream_tests {
 
         // A revived atom now points at e2 — the worst-reconstructed row's residual
         // direction — where none did before.
-        let post_cos_e2 = (0..3).map(|a| state.decoder()[[a, 2]].abs()).fold(0.0f32, f32::max);
-        assert!(post_cos_e2 > 0.999, "a revived atom must equal e2, got |cos|={post_cos_e2}");
+        let post_cos_e2 = (0..3)
+            .map(|a| state.decoder()[[a, 2]].abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            post_cos_e2 > 0.999,
+            "a revived atom must equal e2, got |cos|={post_cos_e2}"
+        );
     }
 }

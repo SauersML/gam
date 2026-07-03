@@ -65,7 +65,10 @@ fn planted_frames(p: usize, n_blocks: usize, b: usize) -> Array2<f32> {
     let sym = &a + &a.t();
     let (_ev, evecs) = sym.eigh(faer::Side::Lower).expect("orthonormal seed");
     let k = n_blocks * b;
-    assert!(k <= p, "planted test needs K <= P for distinct orthonormal atoms");
+    assert!(
+        k <= p,
+        "planted test needs K <= P for distinct orthonormal atoms"
+    );
     let mut atoms = Array2::<f32>::zeros((k, p));
     for atom in 0..k {
         let col = evecs.column(atom);
@@ -77,7 +80,13 @@ fn planted_frames(p: usize, n_blocks: usize, b: usize) -> Array2<f32> {
 }
 
 /// Data whose every row lies in exactly ONE planted block's rank-`b` subspace.
-fn planted_data(planted: &Array2<f32>, n_blocks: usize, b: usize, p: usize, n: usize) -> Array2<f32> {
+fn planted_data(
+    planted: &Array2<f32>,
+    n_blocks: usize,
+    b: usize,
+    p: usize,
+    n: usize,
+) -> Array2<f32> {
     let mut s = 31337u64;
     let mut x = Array2::<f32>::zeros((n, p));
     for i in 0..n {
@@ -108,7 +117,10 @@ fn gauge_invariant_selection_and_loss_under_block_rotation() {
 
     let w0 = block_projections_row(row.view(), decoder.view(), n_blocks, b);
     let gates0 = block_gates(w0.view());
-    let sel0: Vec<u32> = route_row_blocks(&gates0, k).iter().map(|&(g, _)| g).collect();
+    let sel0: Vec<u32> = route_row_blocks(&gates0, k)
+        .iter()
+        .map(|&(g, _)| g)
+        .collect();
     let loss0 = row_loss(row.view(), decoder.view(), &sel0, gamma, b);
 
     // Rotate block g_rot's basis by a random O(b): D_g <- R D_g (rows stay orthonormal).
@@ -129,7 +141,10 @@ fn gauge_invariant_selection_and_loss_under_block_rotation() {
 
     let w1 = block_projections_row(row.view(), decoder.view(), n_blocks, b);
     let gates1 = block_gates(w1.view());
-    let sel1: Vec<u32> = route_row_blocks(&gates1, k).iter().map(|&(g, _)| g).collect();
+    let sel1: Vec<u32> = route_row_blocks(&gates1, k)
+        .iter()
+        .map(|&(g, _)| g)
+        .collect();
     let loss1 = row_loss(row.view(), decoder.view(), &sel1, gamma, b);
 
     assert_eq!(
@@ -365,7 +380,10 @@ fn utilization_and_stable_rank_reported() {
         "utilisation fractions must sum to block_topk={k}, got {total}"
     );
     for &u in &fit.block_utilization {
-        assert!((0.0..=1.0 + 1.0e-6).contains(&u), "utilisation out of [0,1]: {u}");
+        assert!(
+            (0.0..=1.0 + 1.0e-6).contains(&u),
+            "utilisation out of [0,1]: {u}"
+        );
     }
     // Stable rank of each used block lies in [0, b]; a block used along its full
     // 2D planted subspace has stable rank meaningfully above 1.
@@ -375,11 +393,7 @@ fn utilization_and_stable_rank_reported() {
             "stable rank out of [0,b]: {sr}"
         );
     }
-    let max_sr = fit
-        .block_stable_rank
-        .iter()
-        .cloned()
-        .fold(0.0f32, f32::max);
+    let max_sr = fit.block_stable_rank.iter().cloned().fold(0.0f32, f32::max);
     assert!(
         max_sr > 1.2,
         "a block spanning a genuine 2D subspace should report stable rank > 1.2, got {max_sr}"

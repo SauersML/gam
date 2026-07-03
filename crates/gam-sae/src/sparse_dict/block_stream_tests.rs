@@ -41,7 +41,13 @@ fn planted_frames(p: usize, n_blocks: usize, b: usize) -> Array2<f32> {
 }
 
 /// Every row lies in exactly ONE planted block's rank-`b` subspace.
-fn planted_data(planted: &Array2<f32>, n_blocks: usize, b: usize, p: usize, n: usize) -> Array2<f32> {
+fn planted_data(
+    planted: &Array2<f32>,
+    n_blocks: usize,
+    b: usize,
+    p: usize,
+    n: usize,
+) -> Array2<f32> {
     let mut s = 31337u64;
     let mut x = Array2::<f32>::zeros((n, p));
     for i in 0..n {
@@ -87,7 +93,10 @@ fn model_ev(
         let row = x.row(i);
         let w = block_projections_row(row, decoder.view(), g, b);
         let gates = block_gates(w.view());
-        let sel: Vec<u32> = route_row_blocks(&gates, k).iter().map(|&(gg, _)| gg).collect();
+        let sel: Vec<u32> = route_row_blocks(&gates, k)
+            .iter()
+            .map(|&(gg, _)| gg)
+            .collect();
         let recon = reconstruct_row(row, decoder.view(), &sel, gamma, b);
         for c in 0..p {
             let r = x[[i, c]] as f64 - recon[c] as f64;
@@ -216,9 +225,15 @@ fn revival_reseeds_dead_block_from_worst_residual_row() {
     let art = state.finalize();
     // Every planted subspace is used: no block ends with zero utilisation.
     let live = art.block_utilization.iter().filter(|&&u| u > 0.0).count();
-    assert_eq!(live, g, "all {g} blocks must be live after revival (util>0)");
+    assert_eq!(
+        live, g,
+        "all {g} blocks must be live after revival (util>0)"
+    );
     let ev = model_ev(x.view(), &art.decoder, art.gamma, g, b, art.block_topk);
-    assert!(ev > 0.9, "revival should let the fit reach all planted subspaces, EV={ev}");
+    assert!(
+        ev > 0.9,
+        "revival should let the fit reach all planted subspaces, EV={ev}"
+    );
     // Revival machinery actually engaged at some point (dictionary started under-
     // populated and AuxK filled it).
     assert!(

@@ -40,7 +40,6 @@ impl SaeManifoldTerm {
         self.apply_newton_step_impl(delta_ext_coord, delta_beta, step_size, true)
     }
 
-
     /// Capture the mutable state perturbed by an `apply_newton_step` +
     /// `loss` line-search trial, plus the row-layout state read by
     /// `apply_newton_step` when unpacking compact Newton steps. See
@@ -293,9 +292,7 @@ impl SaeManifoldTerm {
         rho: &SaeManifoldRho,
         analytic_penalties: Option<&AnalyticPenaltyRegistry>,
     ) -> Result<(), String> {
-        use crate::chart_canonicalization::{
-            CHART_RECOMPOSITION_REL_TOL, CanonicalChartTopology,
-        };
+        use crate::chart_canonicalization::{CHART_RECOMPOSITION_REL_TOL, CanonicalChartTopology};
         /// Which canonical-representative construction applies to an atom:
         /// arc length for `d = 1` (#1019 stage 1), the minimum-isometry-defect
         /// flow for `d = 2` torus atoms (#1019 stage 2), and the same flow
@@ -538,9 +535,7 @@ impl SaeManifoldTerm {
         atom_idx: usize,
         topology: &crate::chart_canonicalization::CanonicalChartTopology,
     ) -> Result<bool, String> {
-        use crate::chart_canonicalization::{
-            CHART_RECOMPOSITION_REL_TOL, unit_speed_retraction,
-        };
+        use crate::chart_canonicalization::{CHART_RECOMPOSITION_REL_TOL, unit_speed_retraction};
         let n = self.n_obs();
         if n == 0 {
             return Ok(false);
@@ -2689,9 +2684,12 @@ impl SaeManifoldTerm {
         let pc_pairs = (residual.ncols().min(n)) / 2;
         // #2023 — typed per-fit opt-in (was the GAM_SAE_DATA_ROW_RESEED env lever).
         let data_row_reseed = self.data_row_reseed;
-        let all_flat = basis_kinds
-            .iter()
-            .all(|k| matches!(k, SaeAtomBasisKind::EuclideanPatch | SaeAtomBasisKind::Linear));
+        let all_flat = basis_kinds.iter().all(|k| {
+            matches!(
+                k,
+                SaeAtomBasisKind::EuclideanPatch | SaeAtomBasisKind::Linear
+            )
+        });
         let seeded = if data_row_reseed && all_flat && n > 0 && pc_pair_offset >= pc_pairs.max(1) {
             // Distinct anchor row per (atom, retry), spanning the full n-row range
             // so successive exhausted-pool retries never re-anchor identically.
@@ -2936,12 +2934,9 @@ impl SaeManifoldTerm {
                 let coherence = s.iter().copied().fold(0.0_f64, f64::max);
                 let a = rj as f64 / p as f64;
                 let b = rk as f64 / p as f64;
-                let mu_null =
-                    (a * (1.0 - b)).max(0.0).sqrt() + (b * (1.0 - a)).max(0.0).sqrt();
+                let mu_null = (a * (1.0 - b)).max(0.0).sqrt() + (b * (1.0 - a)).max(0.0).sqrt();
                 let bar = 0.5 * (mu_null.min(1.0) + 1.0);
-                if coherence > bar
-                    && worst.as_ref().is_none_or(|&(_, _, c)| coherence > c)
-                {
+                if coherence > bar && worst.as_ref().is_none_or(|&(_, _, c)| coherence > c) {
                     worst = Some((j, kk, coherence));
                 }
             }
@@ -4314,9 +4309,7 @@ impl SaeManifoldTerm {
         // a smoother-but-collapsed post-polish state.
         if let Some((pre_polish_ev, pre_polish_state)) = pre_polish_reconstruction_incumbent {
             if let Ok(final_ev) = self.dictionary_reconstruction_ev(target, rho) {
-                if final_ev.is_finite()
-                    && final_ev + SAE_FINAL_EV_DEGRADATION_TOL < pre_polish_ev
-                {
+                if final_ev.is_finite() && final_ev + SAE_FINAL_EV_DEGRADATION_TOL < pre_polish_ev {
                     log::warn!(
                         "[#1026] restoring pre-polish reconstruction incumbent after final \
                          polish degraded EV from {pre_polish_ev:.4} to {final_ev:.4}"
@@ -4627,7 +4620,11 @@ impl SaeManifoldTerm {
                 Some(_) => None,
                 None => Self::synthesize_monomial_patch_evaluator(atom),
             };
-            let evaluator = match atom.basis_evaluator.as_ref().or(synthesized_evaluator.as_ref()) {
+            let evaluator = match atom
+                .basis_evaluator
+                .as_ref()
+                .or(synthesized_evaluator.as_ref())
+            {
                 Some(evaluator) => evaluator,
                 None => {
                     return Err(format!(

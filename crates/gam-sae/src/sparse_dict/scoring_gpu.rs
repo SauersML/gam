@@ -136,7 +136,11 @@ pub fn score_block_cpu(rows: ArrayView2<'_, f32>, atoms: ArrayView2<'_, f32>) ->
     let n_rows = rows.nrows();
     let n_atoms = atoms.nrows();
     let p = rows.ncols();
-    assert_eq!(p, atoms.ncols(), "score_block_cpu: P mismatch rows vs atoms");
+    assert_eq!(
+        p,
+        atoms.ncols(),
+        "score_block_cpu: P mismatch rows vs atoms"
+    );
     let mut scores = vec![0.0f32; n_rows * n_atoms];
     for r in 0..n_rows {
         let xr = rows.row(r);
@@ -418,7 +422,11 @@ mod device {
         // Row-major contiguous host buffers (handles non-contiguous views).
         let rows_host: Vec<f32> = rows.iter().copied().collect();
         let atoms_host: Vec<f32> = atoms.iter().copied().collect();
-        assert_eq!(rows_host.len(), n_rows * p, "score-block rows flatten length");
+        assert_eq!(
+            rows_host.len(),
+            n_rows * p,
+            "score-block rows flatten length"
+        );
         assert_eq!(
             atoms_host.len(),
             n_atoms * p,
@@ -435,8 +443,9 @@ mod device {
             .alloc_zeros::<f32>(n_rows * n_atoms)
             .gpu_ctx("sparse_dict score-block alloc scores")?;
 
-        let n_rows_i32 = i32::try_from(n_rows)
-            .map_err(|_| gam_gpu::gpu_err!("sparse_dict score-block n_rows={n_rows} overflows i32"))?;
+        let n_rows_i32 = i32::try_from(n_rows).map_err(|_| {
+            gam_gpu::gpu_err!("sparse_dict score-block n_rows={n_rows} overflows i32")
+        })?;
         let n_atoms_i32 = i32::try_from(n_atoms).map_err(|_| {
             gam_gpu::gpu_err!("sparse_dict score-block n_atoms={n_atoms} overflows i32")
         })?;
@@ -626,8 +635,13 @@ mod tests {
             .map(|row| top_s_online(row, atoms.view(), s, tile))
             .collect();
 
-        match route_minibatch_required(rows.view(), atoms.view(), s, tile, gam_gpu::GpuMode::Required)
-        {
+        match route_minibatch_required(
+            rows.view(),
+            atoms.view(),
+            s,
+            tile,
+            gam_gpu::GpuMode::Required,
+        ) {
             Ok((routed, path)) => {
                 assert_eq!(
                     path,
@@ -636,9 +650,16 @@ mod tests {
                 );
                 assert_eq!(routed.len(), cpu.len());
                 for (r, (dev_sel, cpu_sel)) in routed.iter().zip(&cpu).enumerate() {
-                    assert_eq!(dev_sel.len(), cpu_sel.len(), "row {r}: selection length differs");
+                    assert_eq!(
+                        dev_sel.len(),
+                        cpu_sel.len(),
+                        "row {r}: selection length differs"
+                    );
                     for (j, ((da, ds), (ca, cs))) in dev_sel.iter().zip(cpu_sel).enumerate() {
-                        assert_eq!(da, ca, "K=32k row {r} slot {j}: atom differs dev={da} cpu={ca}");
+                        assert_eq!(
+                            da, ca,
+                            "K=32k row {r} slot {j}: atom differs dev={da} cpu={ca}"
+                        );
                         assert_eq!(
                             ds.to_bits(),
                             cs.to_bits(),

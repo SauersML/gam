@@ -61,15 +61,13 @@
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
-use gam_linalg::faer_ndarray::FaerEigh;
-use crate::candidate_index::{
-    AtomFrameSketch, SaeCandidateIndex, auto_candidate_budget,
-};
+use crate::candidate_index::{AtomFrameSketch, SaeCandidateIndex, auto_candidate_budget};
 use crate::manifold::{
     AffineCoordinateEvaluator, CylinderHarmonicEvaluator, DuchonCoordinateEvaluator,
     EuclideanPatchEvaluator, PeriodicHarmonicEvaluator, SaeBasisEvaluator, SaeManifoldAtom,
     SphereChartEvaluator, TorusHarmonicEvaluator,
 };
+use gam_linalg::faer_ndarray::FaerEigh;
 
 use faer::Side;
 
@@ -586,10 +584,7 @@ pub(crate) fn reconstruction_jet_sups(
     atom: &SaeManifoldAtom,
     sups: JetSups,
 ) -> ReconstructionJetSups {
-    if matches!(
-        atom.basis_kind,
-        crate::manifold::SaeAtomBasisKind::Periodic
-    ) {
+    if matches!(atom.basis_kind, crate::manifold::SaeAtomBasisKind::Periodic) {
         periodic_reconstruction_jet_sups(atom.decoder_coefficients.view())
     } else {
         let decoder_norm_sum = decoder_row_norm_sum(atom.decoder_coefficients.view());
@@ -1175,9 +1170,7 @@ fn refine_certified_start(
         // reached and the remaining fixed-budget steps would only re-accumulate
         // round-off. This is where the well-conditioned quadratic Newton tail's
         // redundant `evaluate` + `second_jet` work is eliminated.
-        if delta.dot(&delta).sqrt()
-            <= NEWTON_REFINE_CONVERGED_EPS * (1.0 + t.dot(&t).sqrt())
-        {
+        if delta.dot(&delta).sqrt() <= NEWTON_REFINE_CONVERGED_EPS * (1.0 + t.dot(&t).sqrt()) {
             break;
         }
         t = &t + &delta;
@@ -1792,8 +1785,7 @@ impl EncodeAtlas {
         // and keep the lowest-reconstruction-error CERTIFIED result. For a unimodal
         // atom every candidate chart converges to the same root, so this is a no-op
         // (first-wins tie → the nearest chart), preserving the existing behavior.
-        let candidates =
-            nearest_charts_topk(atom_atlas, x, amplitude, CERTIFIED_ROUTING_TOPK);
+        let candidates = nearest_charts_topk(atom_atlas, x, amplitude, CERTIFIED_ROUTING_TOPK);
         if candidates.is_empty() {
             return Ok((
                 Array1::<f64>::zeros(d),
@@ -1814,8 +1806,10 @@ impl EncodeAtlas {
             let chart = &atom_atlas.charts[chart_idx];
             let Some(t) = amortized_warm_start(chart, x, amplitude) else {
                 if nearest_fallback.is_none() {
-                    nearest_fallback =
-                        Some((Array1::<f64>::zeros(d), uncertified_certificate(chart.lipschitz)));
+                    nearest_fallback = Some((
+                        Array1::<f64>::zeros(d),
+                        uncertified_certificate(chart.lipschitz),
+                    ));
                 }
                 continue;
             };
@@ -1831,8 +1825,13 @@ impl EncodeAtlas {
                 nearest_fallback = Some((coord.clone(), cert.clone()));
             }
             if cert.certified() {
-                let err =
-                    encode_reconstruction_error(atom, evaluator.as_ref(), coord.view(), x, amplitude);
+                let err = encode_reconstruction_error(
+                    atom,
+                    evaluator.as_ref(),
+                    coord.view(),
+                    x,
+                    amplitude,
+                );
                 if best.as_ref().map(|(_, _, e)| err < *e).unwrap_or(true) {
                     best = Some((coord, cert, err));
                 }
@@ -2271,7 +2270,10 @@ impl EncodeAtlas {
                 let chart = &atom_atlas.charts[c];
                 // `base = t_c − A₁·m₁` is precomputed offline in the atlas; reuse it
                 // (both are `Some` together — singular G-N block ⇒ both `None`).
-                match (chart.amortized_jacobian.as_ref(), chart.amortized_base.as_ref()) {
+                match (
+                    chart.amortized_jacobian.as_ref(),
+                    chart.amortized_base.as_ref(),
+                ) {
                     (Some(a1), Some(base)) => Some(ChartPredictor { a1, base }),
                     _ => None,
                 }
@@ -2676,8 +2678,13 @@ impl EncodeAtlas {
             let Some(atom_atlas) = self.atoms.get(best_atom) else {
                 continue; // no atlas for this atom → predictor cannot fire (zeroed)
             };
-            if amortized_predict_row(atom_atlas, dir, amplitudes[row], latent_dim, coords.row_mut(row))
-            {
+            if amortized_predict_row(
+                atom_atlas,
+                dir,
+                amplitudes[row],
+                latent_dim,
+                coords.row_mut(row),
+            ) {
                 valid[row] = true;
             }
         }
@@ -3098,7 +3105,11 @@ pub(crate) fn encode_reconstruction_error(
         let r = x[out] - amplitude * recon;
         err2 += r * r;
     }
-    if err2.is_finite() { err2.sqrt() } else { f64::INFINITY }
+    if err2.is_finite() {
+        err2.sqrt()
+    } else {
+        f64::INFINITY
+    }
 }
 
 /// Maximum number of chart centers laid down per atom (the SHAPE_BAND grid
@@ -3118,7 +3129,11 @@ pub(crate) const SHAPE_BAND_MAX_POINTS: usize = 512;
 /// geometry: per-axis WRAPPED distance `min(|a−b|, period−|a−b|)` on periodic
 /// (circle) axes — period 1 to match `chart_center_grid`'s `[0,1)` torus tiling
 /// — and plain difference on line axes. Used to place + size data-driven charts.
-pub(crate) fn coord_dist_sq(atom: &SaeManifoldAtom, a: ArrayView1<'_, f64>, b: ArrayView1<'_, f64>) -> f64 {
+pub(crate) fn coord_dist_sq(
+    atom: &SaeManifoldAtom,
+    a: ArrayView1<'_, f64>,
+    b: ArrayView1<'_, f64>,
+) -> f64 {
     // Per-axis period comes from the ONE canonical source `latent_axis_period` —
     // the SAME convention the certified-encode `in_chart` guard uses (via
     // `latent_coordinate_distance`): period-1 fraction axes for periodic/torus and
@@ -3471,7 +3486,10 @@ mod encode_fix_tests {
             (d - 0.98).abs() < 1e-12,
             "a flat (non-periodic) axis must keep the full 0.98 distance, got {d}"
         );
-        assert!(d > 0.05, "flat-axis point correctly stays out of a 0.05 ball");
+        assert!(
+            d > 0.05,
+            "flat-axis point correctly stays out of a 0.05 ball"
+        );
     }
 
     /// FIX #4: a genuinely converging (Kantorovich-quadratic) `h`-sequence is
@@ -3586,7 +3604,10 @@ mod encode_fix_tests {
         let b = Array1::from(vec![0.98f64]);
         // Wrapped circle distance min(0.96, 0.04) = 0.04 ⇒ dist² = 0.0016.
         let dsq = coord_dist_sq(&atom, a.view(), b.view());
-        assert!((dsq - 0.0016).abs() < 1e-12, "torus unit-period wrap; got {dsq}");
+        assert!(
+            (dsq - 0.0016).abs() < 1e-12,
+            "torus unit-period wrap; got {dsq}"
+        );
     }
 
     /// BUG (sphere chart tiling): `chart_nominal_radius` for the sphere must use
@@ -3644,7 +3665,10 @@ mod encode_fix_tests {
         let x = Array1::from(vec![1.0]);
 
         let (idx, _) = nearest_chart(&atlas, x.view(), 0.1).expect("routes");
-        assert_eq!(idx, 1, "z=0.1: must route to the m=10 chart (z·m=1 exact), not m=1");
+        assert_eq!(
+            idx, 1,
+            "z=0.1: must route to the m=10 chart (z·m=1 exact), not m=1"
+        );
 
         let ranked = nearest_charts_topk(&atlas, x.view(), 0.1, 2);
         assert_eq!(ranked[0], 1, "z=0.1: nearest chart is the m=10 chart");
@@ -3678,7 +3702,10 @@ mod encode_fix_tests {
             coords: ndarray::ArrayView2<'_, f64>,
         ) -> Result<(Array2<f64>, Array3<f64>), String> {
             let n = coords.nrows();
-            Ok((Array2::ones((n, self.m)), Array3::zeros((n, self.m, self.d))))
+            Ok((
+                Array2::ones((n, self.m)),
+                Array3::zeros((n, self.m, self.d)),
+            ))
         }
         fn second_jet_dyn(
             &self,
@@ -3711,7 +3738,10 @@ mod encode_fix_tests {
     #[test]
     fn f2_certificate_uses_true_hessian_refuses_singular_field() {
         let atom = tiny_atom(SaeAtomBasisKind::EuclideanPatch, 1);
-        let eval = ConstantPhi { m: atom.basis_size(), d: 1 };
+        let eval = ConstantPhi {
+            m: atom.basis_size(),
+            d: 1,
+        };
         let t0 = Array1::from(vec![0.0]);
         let x = Array1::from(vec![0.5]);
 
@@ -3723,7 +3753,10 @@ mod encode_fix_tests {
             "the TRUE Hessian of a constant reconstruction is 0 — no ridge is added \
              to the certified field; got {h:?}"
         );
-        assert!(g.iter().all(|&v| v == 0.0), "gradient is 0 at a flat reconstruction");
+        assert!(
+            g.iter().all(|&v| v == 0.0),
+            "gradient is 0 at a flat reconstruction"
+        );
 
         let (cert, _) = row_certificate(&atom, &eval, t0.view(), x.view(), 1.0, 1.0)
             .expect("row_certificate runs");

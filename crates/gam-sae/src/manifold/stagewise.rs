@@ -375,7 +375,12 @@ fn refit_single_atom_in_place(
     let mut sub_rho = SaeManifoldRho::with_per_atom_smooth(
         rho.log_lambda_sparse,
         vec![*rho.log_lambda_smooth.get(atom_idx).unwrap_or(&0.0)],
-        vec![rho.log_ard.get(atom_idx).cloned().unwrap_or_else(|| Array1::zeros(0))],
+        vec![
+            rho.log_ard
+                .get(atom_idx)
+                .cloned()
+                .unwrap_or_else(|| Array1::zeros(0)),
+        ],
     );
     sub_term.run_joint_fit_arrow_schur(
         e_k.view(),
@@ -550,7 +555,8 @@ pub fn fit_stagewise(
                 config.ridge_ext_coord,
                 config.ridge_beta,
             )?;
-            let (reml, _) = frozen_joint_evidence(&mut cand_term, target, &cand_rho, registry, config)?;
+            let (reml, _) =
+                frozen_joint_evidence(&mut cand_term, target, &cand_rho, registry, config)?;
             let ev = ev_of(&cand_term, target);
             Ok((cand_term, cand_rho, reml, ev))
         })
@@ -598,8 +604,14 @@ pub fn fit_stagewise(
                 && ev.is_finite()
                 && (ev - cur_ev) >= config.min_effect_ev
         };
-        let a_ok = cand_a.as_ref().map(|&(_, _, r, e)| passes(r, e)).unwrap_or(false);
-        let b_ok = cand_b.as_ref().map(|&(_, _, r, e)| passes(r, e)).unwrap_or(false);
+        let a_ok = cand_a
+            .as_ref()
+            .map(|&(_, _, r, e)| passes(r, e))
+            .unwrap_or(false);
+        let b_ok = cand_b
+            .as_ref()
+            .map(|&(_, _, r, e)| passes(r, e))
+            .unwrap_or(false);
 
         let choose_a = match (a_ok, b_ok) {
             (true, true) => {
@@ -837,9 +849,7 @@ mod tests {
         let (atom0, cb0) = circle_atom("t0", &evaluator, &coords, 0, 1, p);
         let (atom1, cb1) = circle_atom("t1", &evaluator, &coords, 2, 3, p);
         // Truth: two atoms, first active on the top half, second on the bottom.
-        let active_truth: Vec<Vec<bool>> = (0..n)
-            .map(|r| vec![r < n / 2, r >= n / 2])
-            .collect();
+        let active_truth: Vec<Vec<bool>> = (0..n).map(|r| vec![r < n / 2, r >= n / 2]).collect();
         let (truth, _truth_rho) = build_term(
             vec![atom0.clone(), atom1.clone()],
             vec![cb0.clone(), cb1.clone()],
@@ -887,7 +897,8 @@ mod tests {
         let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
         let coords = Array2::<f64>::from_shape_fn((n, 1), |(row, _)| row as f64 / n as f64);
         let (atom0, cb0) = circle_atom("t0", &evaluator, &coords, 0, 1, p);
-        let (truth, _rho) = build_term(vec![atom0.clone()], vec![cb0.clone()], &vec![vec![true]; n]);
+        let (truth, _rho) =
+            build_term(vec![atom0.clone()], vec![cb0.clone()], &vec![vec![true]; n]);
         let target = truth.fitted();
 
         let (seed, rho) = build_term(vec![atom0], vec![cb0], &vec![vec![true]; n]);
@@ -905,7 +916,11 @@ mod tests {
             result.report.births_accepted, 0,
             "a duplicate/empty residual must yield no accepted births"
         );
-        assert_eq!(result.term.k_atoms(), 1, "K must stay at the single seed atom");
+        assert_eq!(
+            result.term.k_atoms(),
+            1,
+            "K must stay at the single seed atom"
+        );
         assert!(
             is_non_decreasing(&result.report.ev_trace),
             "EV trace must remain monotone"

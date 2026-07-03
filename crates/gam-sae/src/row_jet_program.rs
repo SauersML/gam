@@ -1118,12 +1118,16 @@ impl SaeReconstructionRowProgram {
                         rows.iter()
                             .any(|r| (0..p).any(|c| r.atoms[atom].decoder[b][c] != 0.0))
                     })
-                    .map(|b| (b, Self::basis_tower_o2x4::<K>(&rows, atom, b, &head.coord_slot[atom])))
+                    .map(|b| {
+                        (
+                            b,
+                            Self::basis_tower_o2x4::<K>(&rows, atom, b, &head.coord_slot[atom]),
+                        )
+                    })
                     .collect()
             })
             .collect();
-        let mut cols: [Vec<Order2<K>>; LANES] =
-            [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        let mut cols: [Vec<Order2<K>>; LANES] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
         for c in 0..p {
             let mut acc = O2x4::<K>::constant(l_splat(0.0));
             for atom in 0..head.atoms.len() {
@@ -1173,8 +1177,7 @@ impl SaeReconstructionRowProgram {
             }
         }
         let gates: Vec<O1x4<K>> = head.all_gates_o1x4::<K>(&rows, inv_tau);
-        let mut out: [Vec<Order1<K>>; LANES] =
-            [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        let mut out: [Vec<Order1<K>>; LANES] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
         for &(atom, basis_col) in channels {
             let phi = Self::basis_tower_o1x4::<K>(&rows, atom, basis_col, &head.coord_slot[atom]);
             let s = gates[atom].mul(&phi);
@@ -1476,7 +1479,11 @@ mod tests {
         let atoms: Vec<AtomRowBasisJet> = (0..n_atoms).map(|k| mk_atom(k as f64)).collect();
         let logit_slot: Vec<Option<usize>> = (0..n_atoms).map(Some).collect();
         let coord_slot: Vec<Vec<usize>> = (0..n_atoms)
-            .map(|k| (0..latent_dim).map(|j| n_atoms + k * latent_dim + j).collect())
+            .map(|k| {
+                (0..latent_dim)
+                    .map(|j| n_atoms + k * latent_dim + j)
+                    .collect()
+            })
             .collect();
         SaeReconstructionRowProgram {
             atoms,
@@ -1525,16 +1532,16 @@ mod tests {
             assert!((cols[c].value() - hand.value).abs() <= 1e-9 * hand.value.abs().max(1.0));
             // The per-column path matches the all-columns path (same kernel, no hoist).
             let percol = prog.reconstruction_column_packed::<K>(c);
-            assert!((percol.value() - cols[c].value()).abs() <= 1e-12 * cols[c].value().abs().max(1.0));
+            assert!(
+                (percol.value() - cols[c].value()).abs() <= 1e-12 * cols[c].value().abs().max(1.0)
+            );
             for a in 0..K {
                 for b in 0..K {
                     assert!(
-                        (cols[c].h()[a][b] - hand.second[a][b]).abs()
-                            <= 1e-8 * h_floor.max(1e-12)
+                        (cols[c].h()[a][b] - hand.second[a][b]).abs() <= 1e-8 * h_floor.max(1e-12)
                     );
                     assert!(
-                        (percol.h()[a][b] - cols[c].h()[a][b]).abs()
-                            <= 1e-12 * h_floor.max(1e-12)
+                        (percol.h()[a][b] - cols[c].h()[a][b]).abs() <= 1e-12 * h_floor.max(1e-12)
                     );
                 }
             }
@@ -2046,7 +2053,8 @@ mod tests {
                     .map(|b| {
                         (0..2)
                             .map(|axis| {
-                                0.1 * (b as f64 + 1.0) - 0.05 * axis as f64 + 0.03 * seed
+                                0.1 * (b as f64 + 1.0) - 0.05 * axis as f64
+                                    + 0.03 * seed
                                     + 0.017 * row_seed
                             })
                             .collect()
@@ -2073,7 +2081,9 @@ mod tests {
                     .map(|b| {
                         (0..out_dim)
                             .map(|c| {
-                                0.5 - 0.1 * (b as f64) + 0.07 * (c as f64) + 0.02 * seed
+                                0.5 - 0.1 * (b as f64)
+                                    + 0.07 * (c as f64)
+                                    + 0.02 * seed
                                     + 0.009 * row_seed
                             })
                             .collect()
@@ -2131,7 +2141,11 @@ mod tests {
                     let (bg, pg) = (b.g(), p.g());
                     let (bh, ph) = (b.h(), p.h());
                     for a in 0..6 {
-                        assert_eq!(bg[a].to_bits(), pg[a].to_bits(), "lane {lane} col {c} g[{a}]");
+                        assert_eq!(
+                            bg[a].to_bits(),
+                            pg[a].to_bits(),
+                            "lane {lane} col {c} g[{a}]"
+                        );
                         for d in 0..6 {
                             assert_eq!(
                                 bh[a][d].to_bits(),
@@ -2163,14 +2177,17 @@ mod tests {
                 }
             }
             chans.push(chans[0]); // repeat to exercise gate-cache reuse
-            let batch =
-                SaeReconstructionRowProgram::beta_border_order1_batch4::<6>(refs, &chans)
-                    .expect("softmax-aligned rows must batch");
+            let batch = SaeReconstructionRowProgram::beta_border_order1_batch4::<6>(refs, &chans)
+                .expect("softmax-aligned rows must batch");
             for lane in 0..LANES {
                 let per = rows[lane].beta_border_order1_packed::<6>(&chans);
                 assert_eq!(per.len(), batch[lane].len());
                 for (i, (b, p)) in batch[lane].iter().zip(per.iter()).enumerate() {
-                    assert_eq!(b.value().to_bits(), p.value().to_bits(), "lane {lane} chan {i} v");
+                    assert_eq!(
+                        b.value().to_bits(),
+                        p.value().to_bits(),
+                        "lane {lane} chan {i} v"
+                    );
                     let (bg, pg) = (b.g(), p.g());
                     for a in 0..6 {
                         assert_eq!(

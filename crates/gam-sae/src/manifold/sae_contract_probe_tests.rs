@@ -11,8 +11,8 @@ use super::tests::{
 };
 use super::*;
 use crate::assignment::{AssignmentMode, SaeAssignment};
-use gam_terms::latent::LatentManifold;
 use approx::assert_abs_diff_eq;
+use gam_terms::latent::LatentManifold;
 use ndarray::array;
 use std::sync::Arc;
 
@@ -711,7 +711,9 @@ fn sae_isometry_joint_fit_converges_across_decoder_scales() {
             loss.total()
         );
 
-        let recon = term.try_fitted_for_rho(&rho).expect("fitted reconstruction exists");
+        let recon = term
+            .try_fitted_for_rho(&rho)
+            .expect("fitted reconstruction exists");
         let mut num = 0.0_f64;
         let mut den = 0.0_f64;
         for (r, t) in recon.iter().zip(target.iter()) {
@@ -756,7 +758,9 @@ fn sae_isometry_joint_fit_converges_across_decoder_scales() {
 /// (low reconstruction error) — i.e. no `RemlConvergenceError`.
 #[test]
 fn sae_single_planted_circle_embedded_isometry_fit_converges_795() {
-    use super::tests::{planted_circle_embedded, planted_circle_seed_term, PlantedCircleAssignmentMode};
+    use super::tests::{
+        PlantedCircleAssignmentMode, planted_circle_embedded, planted_circle_seed_term,
+    };
     use gam_terms::analytic_penalties::{
         AnalyticPenaltyKind, AnalyticPenaltyRegistry, IsometryPenalty, PsiSlice,
     };
@@ -1405,45 +1409,76 @@ fn sae_1026_curved_beats_linear_reconstruction_through_solver() {
 /// the fix). Fast (no fit needed — a known circle atom isolates the encode pipeline).
 #[test]
 fn sae_1026_full_encode_decode_heldout_curved_certifies() {
-    let n = 48usize; let p = 4usize;
-    let coords = Array2::from_shape_fn((n,1), |(r,_)| (r as f64 + 0.5)/n as f64);
+    let n = 48usize;
+    let p = 4usize;
+    let coords = Array2::from_shape_fn((n, 1), |(r, _)| (r as f64 + 0.5) / n as f64);
     let (phi, jet) = periodic_basis(&coords);
     let m = phi.ncols();
-    let decoder = Array2::from_shape_fn((m,p), |(b,c)| (1.0/(1.0+b as f64))*((b as f64+1.0)*(c as f64+1.0)).cos());
-    let atom = SaeManifoldAtom::new("circle", SaeAtomBasisKind::Periodic, 1, phi, jet,
-        decoder.clone(), Array2::<f64>::eye(m)).unwrap()
-        .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+    let decoder = Array2::from_shape_fn((m, p), |(b, c)| {
+        (1.0 / (1.0 + b as f64)) * ((b as f64 + 1.0) * (c as f64 + 1.0)).cos()
+    });
+    let atom = SaeManifoldAtom::new(
+        "circle",
+        SaeAtomBasisKind::Periodic,
+        1,
+        phi,
+        jet,
+        decoder.clone(),
+        Array2::<f64>::eye(m),
+    )
+    .unwrap()
+    .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
     let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
-        Array2::<f64>::zeros((n,1)), vec![coords.clone()],
-        vec![LatentManifold::Circle{period:1.0}], AssignmentMode::softmax(1.0)).unwrap();
+        Array2::<f64>::zeros((n, 1)),
+        vec![coords.clone()],
+        vec![LatentManifold::Circle { period: 1.0 }],
+        AssignmentMode::softmax(1.0),
+    )
+    .unwrap();
     let term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
     // Held-out, on-manifold circle points at FRESH angles, encoded from z alone.
     let n_test = 32usize;
-    let theta_test = Array2::from_shape_fn((n_test,1), |(r,_)| (r as f64 + 0.25)/n_test as f64);
+    let theta_test = Array2::from_shape_fn((n_test, 1), |(r, _)| (r as f64 + 0.25) / n_test as f64);
     let (phi_test, _) = periodic_basis(&theta_test);
     let z_test = phi_test.dot(&decoder);
     let amps = Array1::<f64>::ones(n_test);
     let mut norm_bound = 0.0_f64;
-    for r in 0..n_test { norm_bound = norm_bound.max(z_test.row(r).dot(&z_test.row(r)).sqrt()); }
-    let atlas = crate::encode::EncodeAtlas::build(&term.atoms, &[1.0], norm_bound,
-        crate::encode::AtlasConfig::default()).expect("atlas builds");
+    for r in 0..n_test {
+        norm_bound = norm_bound.max(z_test.row(r).dot(&z_test.row(r)).sqrt());
+    }
+    let atlas = crate::encode::EncodeAtlas::build(
+        &term.atoms,
+        &[1.0],
+        norm_bound,
+        crate::encode::AtlasConfig::default(),
+    )
+    .expect("atlas builds");
     let mut recon = Array2::<f64>::zeros((n_test, p));
     let mut certified = 0usize;
     for r in 0..n_test {
-        let (coord, cert) = atlas.certified_encode_row(&term.atoms[0], 0, z_test.row(r), amps[r])
+        let (coord, cert) = atlas
+            .certified_encode_row(&term.atoms[0], 0, z_test.row(r), amps[r])
             .expect("held-out encode runs");
-        if cert.certified() { certified += 1; }
-        let cc = Array2::from_shape_fn((1,1), |_| coord[0]);
+        if cert.certified() {
+            certified += 1;
+        }
+        let cc = Array2::from_shape_fn((1, 1), |_| coord[0]);
         let (phi_enc, _) = periodic_basis(&cc);
         let rr = phi_enc.dot(&decoder);
-        for c in 0..p { recon[[r,c]] = rr[[0,c]]; }
+        for c in 0..p {
+            recon[[r, c]] = rr[[0, c]];
+        }
     }
     let ev = reconstruction_explained_variance(z_test.view(), recon.view()).unwrap();
     eprintln!("FULL_ENCODE_DECODE heldout EV={ev:.4} certified={certified}/{n_test}");
-    assert!(ev > 0.95,
-        "full encode+decode must recover on-manifold held-out curved points (EV={ev})");
-    assert!(certified > 0,
-        "basin-warmup fix must certify held-out curved encodes at unit amplitude (got {certified})");
+    assert!(
+        ev > 0.95,
+        "full encode+decode must recover on-manifold held-out curved points (EV={ev})"
+    );
+    assert!(
+        certified > 0,
+        "basin-warmup fix must certify held-out curved encodes at unit amplitude (got {certified})"
+    );
 }
 
 /// #1026 — K=2 superposition recovery through the REAL solver, and the p ≥ 2K
@@ -1479,29 +1514,51 @@ fn sae_1026_solver_recovers_separable_superposition_but_not_below_2k() {
                 target[[r, 2]] += b.sin();
             }
         }
-        let seed_a = Array2::from_shape_fn((n, 1), |(r, _)| (theta_a[[r, 0]] + 0.03).rem_euclid(1.0));
-        let seed_b = Array2::from_shape_fn((n, 1), |(r, _)| (theta_b[[r, 0]] + 0.03).rem_euclid(1.0));
+        let seed_a =
+            Array2::from_shape_fn((n, 1), |(r, _)| (theta_a[[r, 0]] + 0.03).rem_euclid(1.0));
+        let seed_b =
+            Array2::from_shape_fn((n, 1), |(r, _)| (theta_b[[r, 0]] + 0.03).rem_euclid(1.0));
         let (pa, ja) = periodic_basis(&seed_a);
         let (pb, jb) = periodic_basis(&seed_b);
         let m = pa.ncols();
         let a0 = SaeManifoldAtom::new(
-            "cA", SaeAtomBasisKind::Periodic, 1, pa, ja,
-            Array2::<f64>::zeros((m, p)), Array2::<f64>::eye(m),
-        ).unwrap().with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+            "cA",
+            SaeAtomBasisKind::Periodic,
+            1,
+            pa,
+            ja,
+            Array2::<f64>::zeros((m, p)),
+            Array2::<f64>::eye(m),
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
         let a1 = SaeManifoldAtom::new(
-            "cB", SaeAtomBasisKind::Periodic, 1, pb, jb,
-            Array2::<f64>::zeros((m, p)), Array2::<f64>::eye(m),
-        ).unwrap().with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+            "cB",
+            SaeAtomBasisKind::Periodic,
+            1,
+            pb,
+            jb,
+            Array2::<f64>::zeros((m, p)),
+            Array2::<f64>::eye(m),
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
         let logits = Array2::<f64>::from_elem((n, 2), 6.0 * 0.5);
         let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
             logits,
             vec![seed_a.clone(), seed_b.clone()],
-            vec![LatentManifold::Circle { period: 1.0 }, LatentManifold::Circle { period: 1.0 }],
+            vec![
+                LatentManifold::Circle { period: 1.0 },
+                LatentManifold::Circle { period: 1.0 },
+            ],
             AssignmentMode::ibp_map(0.5, 1.0, false),
-        ).unwrap();
+        )
+        .unwrap();
         let mut term = SaeManifoldTerm::new(vec![a0, a1], assignment).unwrap();
         let mut rho = SaeManifoldRho::new(
-            0.0, 0.01_f64.ln(), vec![array![1.0_f64.ln()], array![1.0_f64.ln()]],
+            0.0,
+            0.01_f64.ln(),
+            vec![array![1.0_f64.ln()], array![1.0_f64.ln()]],
         );
         term.run_joint_fit_arrow_schur(target.view(), &mut rho, None, 24, 0.1, 1.0e-4, 1.0e-4)
             .expect("K=2 inner solve converges");
@@ -1510,7 +1567,9 @@ fn sae_1026_solver_recovers_separable_superposition_but_not_below_2k() {
     };
     let separable = recover(4, false);
     let under_determined = recover(3, true);
-    eprintln!("#1026 K=2 superposition: separable(p=4)={separable:.4}, overlap(p=3)={under_determined:.4}");
+    eprintln!(
+        "#1026 K=2 superposition: separable(p=4)={separable:.4}, overlap(p=3)={under_determined:.4}"
+    );
     assert!(
         separable > 0.95,
         "the joint solver must recover two superposed circles when p >= 2K (EV={separable})"
@@ -1884,7 +1943,11 @@ fn robust_norm_row_weights_rebalances_heavy_tailed_objective() {
     assert_abs_diff_eq!(mean, 1.0, epsilon = 1e-9);
     // High-norm tokens downweighted; a median-ish bulk token keeps ~full weight.
     for &i in &hi {
-        assert!(w[i] < 0.5, "high-norm token {i} should be downweighted, w={}", w[i]);
+        assert!(
+            w[i] < 0.5,
+            "high-norm token {i} should be downweighted, w={}",
+            w[i]
+        );
     }
     // Weighted objective share of the high-norm cluster.
     let total_w: f64 = (0..n).map(|i| w[i] * norms[i] * norms[i]).sum();
@@ -1899,7 +1962,10 @@ fn robust_norm_row_weights_rebalances_heavy_tailed_objective() {
     // (uniform-design guard: a flat slice yields all-1.0 and the unweighted path).
     let flat = Array2::<f64>::from_elem((4, p), 2.0);
     let wf = SaeManifoldTerm::robust_norm_row_weights(flat.view(), 1.0).unwrap();
-    assert!(wf.iter().all(|&x| (x - 1.0).abs() < 1e-12), "flat norms → uniform weights");
+    assert!(
+        wf.iter().all(|&x| (x - 1.0).abs() < 1e-12),
+        "flat norms → uniform weights"
+    );
 }
 
 /// Driver-level freeze invariant (#850). The outer-objective test

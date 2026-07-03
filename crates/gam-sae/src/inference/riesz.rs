@@ -1,7 +1,7 @@
+use faer::Side;
 use gam_linalg::faer_ndarray::FaerCholesky;
 use gam_solve::model_types::EstimationError;
 use gam_solve::sensitivity::FitSensitivity;
-use faer::Side;
 use ndarray::{Array1, ArrayView1, ArrayView2};
 
 /// Closed-form Riesz representer for a linear functional of a fitted smooth.
@@ -228,7 +228,9 @@ fn weighted_row_mean(
             }
             let weight_sum = w.sum();
             if !(weight_sum.is_finite() && weight_sum > 0.0) {
-                gam_problem::bail_invalid_estim!("Riesz {what} weights must have positive finite sum");
+                gam_problem::bail_invalid_estim!(
+                    "Riesz {what} weights must have positive finite sum"
+                );
             }
             for row_idx in 0..n {
                 let scale = w[row_idx] / weight_sum;

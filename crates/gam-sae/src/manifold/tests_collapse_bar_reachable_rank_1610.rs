@@ -3,8 +3,8 @@
 //! gate. Declared as a sibling `#[cfg(test)] mod` in `mod.rs`; the shared
 //! `periodic_basis` fixture helper is sourced from the sibling `tests` module.
 
-use super::*;
 use super::tests::periodic_basis;
+use super::*;
 use ndarray::{Array2, Array3, array};
 
 /// #1610 / S1 — the co-collapse degeneracy floor must be calibrated against the
@@ -82,8 +82,18 @@ pub(crate) fn collapse_bar_uses_reachable_dictionary_rank_not_nominal_count_1610
     };
 
     // Healthy (nonzero) decoders for both atoms.
-    let atom_a = make("full", phi_a.clone(), jet_a.clone(), Array2::<f64>::ones((3, p)));
-    let atom_b = make("degenerate", phi_b.clone(), jet_b.clone(), Array2::<f64>::ones((3, p)));
+    let atom_a = make(
+        "full",
+        phi_a.clone(),
+        jet_a.clone(),
+        Array2::<f64>::ones((3, p)),
+    );
+    let atom_b = make(
+        "degenerate",
+        phi_b.clone(),
+        jet_b.clone(),
+        Array2::<f64>::ones((3, p)),
+    );
 
     // Per-atom realized chart image rank (capped at output dim p=8, so no cap
     // bites here): full chart spans rank 3; the repeated-coordinate chart rank 1.
@@ -110,8 +120,14 @@ pub(crate) fn collapse_bar_uses_reachable_dictionary_rank_not_nominal_count_1610
 
     // (1) reachable rank = rank(Φ_A) + rank(Φ_B) = 3 + 1 = 4, STRICTLY below the
     // nominal Σ basis_size = 6 — the biased-high count is corrected.
-    assert_eq!(reachable, 4, "reachable rank must be rank(Φ_A) + rank(Φ_B) = 3 + 1");
-    assert_eq!(nominal, 6, "nominal Σ basis_size (capped) must be 6 on this fixture");
+    assert_eq!(
+        reachable, 4,
+        "reachable rank must be rank(Φ_A) + rank(Φ_B) = 3 + 1"
+    );
+    assert_eq!(
+        nominal, 6,
+        "nominal Σ basis_size (capped) must be 6 on this fixture"
+    );
     assert!(
         reachable < nominal,
         "reachable rank {reachable} must be strictly below the nominal count \

@@ -186,8 +186,7 @@ fn topology_curved_seed_initial_coords(
     };
     // Harmonic chart functions: graph-Laplacian eigenvectors, excluding the
     // constant Fiedler-0 column. Each is a function over the `m` subsample rows.
-    let harmonic: Vec<ArrayView1<'_, f64>> =
-        (1..evecs.ncols()).map(|c| evecs.column(c)).collect();
+    let harmonic: Vec<ArrayView1<'_, f64>> = (1..evecs.ncols()).map(|c| evecs.column(c)).collect();
     let n_harm = harmonic.len();
     for atom_idx in 0..basis_kinds.len() {
         let d = atom_dim[atom_idx];
@@ -382,7 +381,11 @@ fn surplus_phase_plane(
             let mut it = dirs.into_iter();
             (it.next().unwrap(), it.next().unwrap(), true)
         }
-        1 => (dirs.into_iter().next().unwrap(), Array1::zeros(ncols), false),
+        1 => (
+            dirs.into_iter().next().unwrap(),
+            Array1::zeros(ncols),
+            false,
+        ),
         _ => (Array1::zeros(ncols), Array1::zeros(ncols), false),
     }
 }
@@ -645,7 +648,9 @@ pub fn sae_pca_seed_initial_coords_with_pc_offset(
                 let atom_start = atom_idx.saturating_mul(3);
                 let canonical = pc_pair_offset == 0 && atom_start + 3 <= vt_rows;
                 let frame: Vec<Array1<f64>> = if canonical {
-                    (0..n_pc).map(|i| vt.row(atom_start + i).to_owned()).collect()
+                    (0..n_pc)
+                        .map(|i| vt.row(atom_start + i).to_owned())
+                        .collect()
                 } else {
                     let sources: Vec<ArrayView1<'_, f64>> =
                         (0..vt_rows).map(|r| vt.row(r)).collect();
@@ -1071,7 +1076,9 @@ mod tests {
                     "seed coord must stay in [-0.5, 0.5]: {v}"
                 );
             }
-            let key: Vec<i64> = (0..n).map(|i| (s[[0, i, 0]] * 1e6).round() as i64).collect();
+            let key: Vec<i64> = (0..n)
+                .map(|i| (s[[0, i, 0]] * 1e6).round() as i64)
+                .collect();
             seeds.insert(key);
         }
         assert!(

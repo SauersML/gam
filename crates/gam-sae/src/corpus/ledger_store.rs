@@ -38,10 +38,10 @@
 //! claim's history and restart its e-process from 1, which is exactly the
 //! optional-stopping abuse the ledger exists to prevent.
 
-use gam_terms::inference::structure_evidence::StructureLedger;
-use gam_terms::smooth::TermCollectionSpec;
 use gam_runtime::warm_start::store::{EntryKind, StoreOptions, WarmStartStore};
 use gam_runtime::warm_start::{Fingerprint, Fingerprinter};
+use gam_terms::inference::structure_evidence::StructureLedger;
+use gam_terms::smooth::TermCollectionSpec;
 use std::time::Duration;
 
 /// The default level for the dictionary's e-BH structure certificate.
