@@ -230,6 +230,9 @@ mod tests_frame_refresh_alpha_grad;
 mod tests_cocollapse_disjoint_2027;
 
 #[cfg(test)]
+mod tests_outer_reml_probe_budget_2080;
+
+#[cfg(test)]
 mod lambda_smooth_1556_tests;
 
 pub use arrow_solver::*;

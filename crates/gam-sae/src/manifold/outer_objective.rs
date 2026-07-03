@@ -250,6 +250,70 @@ impl AmortizedWarmStartTelemetry {
 /// (task v2 wires the selected-inverse block-trace ρ-gradient), so this
 /// is a cost-only objective and the engine routes it to a derivative-free /
 /// central-difference outer strategy per the planner.
+/// #2080 — probe telemetry for the outer REML ρ-search. Counts how the outer
+/// objective spends its criterion evaluations so the wide-`p` acceptance test can
+/// assert a BOUNDED probe budget (not a wall-clock limit — SPEC bans time
+/// budgets). Every counter is a plain evaluation tally; the fields are read after
+/// a fit via [`SaeManifoldOuterObjective::probe_telemetry`].
+///
+/// The load-bearing metric is `infeasible_*`: at a wide-`p` planted-circle fit the
+/// outer line search overshoots into the adjacent indefinite (non-PD Laplace)
+/// basin on nearly every probe. Historically each such probe ground the inner
+/// refinement budget (up to `64×inner_max_iter`) before refusing; the #2080 fix
+/// makes an infeasible PROBE return the typed refusal after a single diagnostic
+/// pass, so `infeasible_*` can be large while the fit still terminates in a
+/// bounded number of criterion evals.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OuterProbeTelemetry {
+    /// Full REML criterion evaluations that MUTATED `self.term` (accepted
+    /// gradient/value/EFS lanes, seed validation). Line-search value probes run
+    /// on a throwaway clone and are counted under `fd_probe_calls` instead.
+    pub criterion_calls: usize,
+    /// Finite-difference / directional value probes issued by the
+    /// value-consistent-gradient safeguard. Each runs on a clone of `self.term`
+    /// (pure — never mutates the accepted basin).
+    pub fd_probe_calls: usize,
+    /// Infeasible probes by refusal kind (non-PD Laplace log-det at that ρ).
+    pub infeasible_non_pd_per_row: usize,
+    pub infeasible_cross_row: usize,
+    pub infeasible_schur: usize,
+    /// Probes refused because the inner solve did not converge at fixed ρ.
+    pub infeasible_inner_not_converged: usize,
+    /// Value probes that resolved to the finite collapse/refusal wall
+    /// (`cost ≥ SAE_FIT_DATA_COLLAPSE_COST`) rather than a real REML value.
+    pub wall_cost_value_probes: usize,
+    /// #2080 defect 3 — FD/line-search value probes issued by the
+    /// value-consistent-gradient safeguard that mutated the accepted `self.term`
+    /// basin. The fix routes every such probe through a THROWAWAY clone
+    /// (`probe_outer_criterion_value`), so this stays 0: a rejected line-search /
+    /// FD probe can no longer drag the per-row routing off the decisive seed basin
+    /// (the stateful-objective corruption of #629/#630/#2080). A nonzero count is a
+    /// regression — a probe lane that mutates the committed state.
+    pub mutating_value_probes: usize,
+}
+
+impl OuterProbeTelemetry {
+    fn record_refusal_kind(&mut self, err: &str) {
+        if err.contains("inner solve did not converge at fixed ρ") {
+            self.infeasible_inner_not_converged += 1;
+        } else if err.contains("cross-row IBP joint Hessian is non-PD") {
+            self.infeasible_cross_row += 1;
+        } else if err.contains("Schur complement Cholesky failed") {
+            self.infeasible_schur += 1;
+        } else if err.contains("non-PD per-row H_tt block") {
+            self.infeasible_non_pd_per_row += 1;
+        }
+    }
+
+    /// Total infeasible probes across all refusal kinds.
+    pub fn infeasible_total(&self) -> usize {
+        self.infeasible_non_pd_per_row
+            + self.infeasible_cross_row
+            + self.infeasible_schur
+            + self.infeasible_inner_not_converged
+    }
+}
+
 pub struct SaeManifoldOuterObjective {
     pub(crate) term: SaeManifoldTerm,
     /// Pristine term to restore from on `reset` (multi-start baseline).
@@ -282,6 +346,9 @@ pub struct SaeManifoldOuterObjective {
     /// opt-in lever for the n-independent outer loop; the n-scaling timing is
     /// verified on the cluster.
     pub(crate) routing_frozen: bool,
+    /// #2080 — outer probe telemetry (criterion/FD/infeasible counts). Read via
+    /// [`Self::probe_telemetry`] after the fit for the wide-`p` acceptance test.
+    pub(crate) probe_telemetry: OuterProbeTelemetry,
 }
 
 impl SaeManifoldOuterObjective {
@@ -317,7 +384,15 @@ impl SaeManifoldOuterObjective {
             seeded_beta: None,
             warm_start_telemetry: AmortizedWarmStartTelemetry::default(),
             routing_frozen: false,
+            probe_telemetry: OuterProbeTelemetry::default(),
         }
+    }
+
+    /// #2080 — the accumulated outer probe telemetry (criterion/FD/infeasible
+    /// evaluation counts). The wide-`p` acceptance test asserts these counts stay
+    /// bounded (a PROBE-COUNT budget, per SPEC's ban on wall-clock budgets).
+    pub fn probe_telemetry(&self) -> OuterProbeTelemetry {
+        self.probe_telemetry
     }
 
     /// #1033 — opt into AMORTIZED (frozen) routing for the ρ-search: freeze the
@@ -1308,9 +1383,20 @@ impl SaeManifoldOuterObjective {
     /// infeasible ρ probe (non-PD joint Hessian), so the consistency safeguard
     /// differentiates the objective shape the line search actually sees instead
     /// of reintroducing an `+∞` lane for the #1782 refusal class.
-    fn probe_outer_criterion_value(&self, rho: &SaeManifoldRho) -> Result<f64, String> {
+    fn probe_outer_criterion_value(&mut self, rho: &SaeManifoldRho) -> Result<f64, String> {
+        self.probe_telemetry.fd_probe_calls += 1;
+        // #2080 — a PURE line-search / FD probe: run on a THROWAWAY clone so the
+        // accepted warm-start basin in `self.term` is never mutated (defect 3),
+        // and on the PROBE refine budget (`refine_progress_extension = false`) so
+        // an infeasible ρ (non-PD Laplace log-det) returns the typed refusal after
+        // a single diagnostic pass instead of grinding the accepted 16×/64× inner
+        // refinement budget (defect 2). The value it returns is the same quantity
+        // `eval` reports as `cost` (floored to the finite collapse wall when the
+        // Laplace normaliser is non-finite, and to the recoverable refusal wall for
+        // an infeasible ρ), so the outer central-difference differentiates the
+        // objective shape the line search actually sees.
         let mut probe = self.term.clone();
-        let reml = match probe.reml_criterion_with_cache(
+        let reml = match probe.reml_criterion_with_cache_refine_policy(
             self.target.view(),
             rho,
             self.registry.as_ref(),
@@ -1318,9 +1404,12 @@ impl SaeManifoldOuterObjective {
             self.learning_rate,
             self.ridge_ext_coord,
             self.ridge_beta,
+            false,
         ) {
             Ok(evaluated) => evaluated.0,
             Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
+                self.probe_telemetry.record_refusal_kind(&err);
+                self.probe_telemetry.wall_cost_value_probes += 1;
                 return Ok(Self::recoverable_refusal_wall_cost());
             }
             Err(err) => return Err(err),
@@ -1330,6 +1419,15 @@ impl SaeManifoldOuterObjective {
         } else {
             SAE_FIT_DATA_COLLAPSE_COST
         })
+    }
+
+    /// #2080 — whether a probe value resolved to the finite collapse/refusal wall
+    /// (an infeasible ρ or a data-collapsed fit) rather than a real REML value.
+    /// Differencing the objective across such a wall is meaningless, so the
+    /// value-consistent-gradient safeguard treats it exactly like a non-finite
+    /// probe and keeps the analytic gradient.
+    fn probe_value_is_wall(value: f64) -> bool {
+        !value.is_finite() || value >= SAE_FIT_DATA_COLLAPSE_COST
     }
 
     /// Value-consistent outer-ρ gradient safeguard for the small (BFGS) regime.
@@ -1361,7 +1459,7 @@ impl SaeManifoldOuterObjective {
     /// direction is exactly consistent with what the line search minimises (a
     /// real gradient of the real criterion, used only as a descent direction).
     fn value_consistent_outer_gradient(
-        &self,
+        &mut self,
         rho_state: &SaeManifoldRho,
         cost: f64,
         analytic: Array1<f64>,
@@ -1405,18 +1503,48 @@ impl SaeManifoldOuterObjective {
             dir_plus[i] += step * d;
             dir_minus[i] -= step * d;
         }
-        let vp_dir =
-            self.probe_outer_criterion_value(&self.baseline_rho.from_flat(dir_plus.view()))?;
-        let vm_dir =
-            self.probe_outer_criterion_value(&self.baseline_rho.from_flat(dir_minus.view()))?;
-        if !(vp_dir.is_finite() && vm_dir.is_finite()) {
-            // A probe hit an infeasible wall adjacent to this ρ; differencing
-            // across it is meaningless, so keep the analytic gradient.
+        let rho_plus = self.baseline_rho.from_flat(dir_plus.view());
+        let rho_minus = self.baseline_rho.from_flat(dir_minus.view());
+        let vp_dir = self.probe_outer_criterion_value(&rho_plus)?;
+        let vm_dir = self.probe_outer_criterion_value(&rho_minus)?;
+        if Self::probe_value_is_wall(vp_dir) || Self::probe_value_is_wall(vm_dir) {
+            // #2080 — a probe hit an infeasible (non-PD Laplace) or collapse wall
+            // adjacent to this ρ; the finite wall cost is astronomically larger
+            // than any real REML value, so differencing across it produces a
+            // spurious huge slope. Keep the analytic gradient, exactly as for a
+            // non-finite probe.
             return Ok(analytic);
         }
         let fd_dir = (vp_dir - vm_dir) / (2.0 * step);
         if fd_dir >= 0.5 * na {
             // Analytic gradient is descent-consistent along its own direction.
+            return Ok(analytic);
+        }
+        // #2080 (defect 4) — the desync is only SUSPECTED here (the cheap 2-probe
+        // directional check tripped). Confirming it needs the FULL 2·d_ρ
+        // central-difference gradient, each probe a fresh dense inner solve. Gate
+        // that escalation on the inner-criterion cost, not on d_ρ alone: when the
+        // dense evidence factor is WIDE (the aggregate factor work of the 2·d_ρ
+        // escalation probes exceeds the in-core budget's worth of factor slabs),
+        // the escalation is disproportionately expensive relative to the safeguard
+        // it provides, so keep the analytic gradient rather than pay it. The
+        // gate is derived from the streaming plan's in-core budget machinery, not a
+        // bare magic threshold. Narrow (small-`p`) fits — every current fixture —
+        // fall through and run the full escalation exactly as before.
+        let plan = self.term.streaming_plan();
+        let escalation_probe_factor_work = plan
+            .estimated_dense_schur_bytes
+            .saturating_mul(2usize.saturating_mul(n));
+        if escalation_probe_factor_work > plan.in_core_budget_bytes {
+            log::info!(
+                "[SAE/#2080] value-consistent outer-gradient safeguard: skipping the \
+                 2·d_ρ full-FD escalation at a wide criterion (dense factor slab \
+                 {schur} B × {probes} probes exceeds in-core budget {budget} B); \
+                 descending with the analytic outer gradient",
+                schur = plan.estimated_dense_schur_bytes,
+                probes = 2 * n,
+                budget = plan.in_core_budget_bytes,
+            );
             return Ok(analytic);
         }
         // Stage 2 — desync suspected: assemble the FULL central-difference gradient
@@ -1431,9 +1559,11 @@ impl SaeManifoldOuterObjective {
             let mut minus = flat.clone();
             plus[i] += h;
             minus[i] -= h;
-            let vp = self.probe_outer_criterion_value(&self.baseline_rho.from_flat(plus.view()))?;
-            let vm = self.probe_outer_criterion_value(&self.baseline_rho.from_flat(minus.view()))?;
-            if !(vp.is_finite() && vm.is_finite()) {
+            let rho_plus = self.baseline_rho.from_flat(plus.view());
+            let rho_minus = self.baseline_rho.from_flat(minus.view());
+            let vp = self.probe_outer_criterion_value(&rho_plus)?;
+            let vm = self.probe_outer_criterion_value(&rho_minus)?;
+            if Self::probe_value_is_wall(vp) || Self::probe_value_is_wall(vm) {
                 return Ok(analytic);
             }
             fd[i] = (vp - vm) / (2.0 * h);
@@ -1658,6 +1788,7 @@ impl SaeManifoldOuterObjective {
     ///   point exists; it stays cost-driven (the cascade still moves it via
     ///   the cost path when EFS is not the active lane for that coord).
     pub(crate) fn efs_step(&mut self, rho_flat: ArrayView1<'_, f64>) -> Result<EfsEval, String> {
+        self.probe_telemetry.criterion_calls += 1;
         let rho = self.baseline_rho.from_flat(rho_flat);
         if let Some(beta) = self.seeded_beta.take()
             && beta.len() == self.term.beta_dim()
@@ -1718,6 +1849,8 @@ impl SaeManifoldOuterObjective {
             // the bridge as a seed refusal, so the wall must stay finite. Genuine
             // (non-recoverable) defects still propagate as a hard error.
             Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
+                self.probe_telemetry.record_refusal_kind(&err);
+                self.probe_telemetry.wall_cost_value_probes += 1;
                 let n_params = rho.to_flat().len();
                 self.current_rho = rho;
                 return Ok(EfsEval {
@@ -1909,6 +2042,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // (seed screening, cross-seed final selection, EFS backtracking). No `∇f`
         // is ever paired with this cost, so it is the correct place to carry the
         // derivative-free co-training fold `f+c` (`fold_cotrain = true`).
+        self.probe_telemetry.criterion_calls += 1;
         match self.evaluate_with_refine_policy(rho.view(), false, true) {
             Ok((cost, _beta)) => Ok(cost),
             // #1782 — a recoverable infeasible-ρ refusal presents the SAME finite
@@ -1919,6 +2053,8 @@ impl OuterObjective for SaeManifoldOuterObjective {
             // neighbourhood to a fatal seed rejection (see
             // `recoverable_refusal_wall_cost`).
             Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
+                self.probe_telemetry.record_refusal_kind(&err);
+                self.probe_telemetry.wall_cost_value_probes += 1;
                 Ok(Self::recoverable_refusal_wall_cost())
             }
             Err(err) => Err(EstimationError::RemlOptimizationFailed(err)),
@@ -1926,6 +2062,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
     }
 
     fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
+        self.probe_telemetry.criterion_calls += 1;
         let rho_state = self.baseline_rho.from_flat(rho.view());
         // #1026 — matrix-free (streaming) regime: the dense joint-Hessian evidence
         // cache does not exist, so the analytic gradient lane below
@@ -1952,6 +2089,8 @@ impl OuterObjective for SaeManifoldOuterObjective {
                     // the best-so-far dictionary instead of aborting the fit (see
                     // `recoverable_refusal_wall_cost`).
                     Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
+                        self.probe_telemetry.record_refusal_kind(&err);
+                        self.probe_telemetry.wall_cost_value_probes += 1;
                         return Ok(OuterEval {
                             cost: Self::recoverable_refusal_wall_cost(),
                             gradient: Array1::zeros(rho.len()),
@@ -2032,6 +2171,8 @@ impl OuterObjective for SaeManifoldOuterObjective {
             // dictionary instead (see `recoverable_refusal_wall_cost`). Genuine
             // (non-recoverable) defects still hard-error below.
             Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
+                self.probe_telemetry.record_refusal_kind(&err);
+                self.probe_telemetry.wall_cost_value_probes += 1;
                 return Ok(OuterEval {
                     cost: Self::recoverable_refusal_wall_cost(),
                     gradient: Array1::zeros(rho.len()),

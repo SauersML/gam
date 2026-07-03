@@ -6912,6 +6912,30 @@ impl SaeManifoldTerm {
                                  {err}"
                             ));
                         }
+                        // #2080 — a non-PD per-row H_tt block means the undamped
+                        // Laplace log-det is UNDEFINED at this ρ: the ρ is
+                        // infeasible. For a PROBE (line-search value / FD /
+                        // seed-validation lane, `refine_progress_extension == false`)
+                        // the caller only needs a typed infeasible verdict so the
+                        // outer search steers back into the PD region — refining the
+                        // inner solve to try to CROSS the indefinite basin is the
+                        // accepted-iterate's job, not a probe's. Grinding the probe
+                        // refine budget (up to `4×inner_max_iter`, and historically
+                        // the accepted `16×/64×` via `reml_criterion_with_cache`) on
+                        // every overshooting line-search / FD probe is exactly the
+                        // wide-`p` outer REML hang (#2080). Return the typed refusal
+                        // after this single diagnostic factor pass;
+                        // `is_recoverable_value_probe_refusal` maps it to the finite
+                        // infeasibility wall.
+                        if !refine_progress_extension {
+                            return Err(format!(
+                                "SaeManifoldTerm::reml_criterion: undamped evidence \
+                                 factorization hit a non-PD per-row H_tt block before KKT \
+                                 stationarity at an infeasible-ρ probe (‖g‖={grad_norm:.6e}, \
+                                 tol {grad_tolerance:.6e}); returning the typed infeasible \
+                                 refusal without grinding the probe refinement budget; {err}"
+                            ));
+                        }
                         let refine_limit = Self::refine_iteration_limit(
                             total_inner_iter,
                             base_refine_iter,
