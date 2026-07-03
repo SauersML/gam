@@ -379,6 +379,12 @@ pub fn build_termspec(
                                 drop_first_level: false,
                                 penalized: true,
                                 frozen_levels: None,
+                                // A BARE categorical main effect (`+ g`) is a FIXED
+                                // parametric factor. Although it is auto-promoted to
+                                // a penalized random block above, an *unseen* level
+                                // at predict must raise a schema mismatch rather than
+                                // be mapped to the factor's centering point (#2102).
+                                lenient_unseen: false,
                             });
                         }
                     }
@@ -425,6 +431,10 @@ pub fn build_termspec(
                     drop_first_level: false,
                     penalized: true,
                     frozen_levels: None,
+                    // An EXPLICIT random effect (`group(g)`/`re(g)`/`factor(g)` /
+                    // `s(g, bs="re")`) deliberately tolerates unseen levels: a
+                    // held-out group is shrunk to the population mean (#2102).
+                    lenient_unseen: true,
                 });
             }
             ParsedTerm::Smooth {
@@ -559,6 +569,11 @@ pub fn build_termspec(
                                     drop_first_level: true,
                                     penalized: false,
                                     frozen_levels: None,
+                                    // Unpenalized treatment-coded FIXED factor main
+                                    // effect for a factor-by smooth: an unseen level
+                                    // is out of contract and must raise, not center
+                                    // (#2102).
+                                    lenient_unseen: false,
                                 });
                             }
                             // Unordered factor-by smooths are independent

@@ -189,6 +189,7 @@ mod adaptive_bounded_duchon_tests {
                 drop_first_level: false,
                 penalized: true,
                 frozen_levels: None,
+                lenient_unseen: true,
             }],
             smooth_terms: vec![SmoothTermSpec {
                 name: "ps".to_string(),
