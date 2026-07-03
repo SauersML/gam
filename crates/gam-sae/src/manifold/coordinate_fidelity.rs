@@ -304,6 +304,22 @@ pub struct AtomCoordinateFidelity {
     pub log_speed_rms: f64,
 }
 
+/// Aggregate certificate adapter for the unified certificate ledger.
+///
+/// The full per-atom records remain in the typed `coordinate_fidelity` payload;
+/// this adapter contributes the conservative dictionary-level claim to the
+/// shared ledger: every eligible d=1 coordinate must have an honest reading.
+#[derive(Debug, Clone, Copy)]
+pub struct CoordinateFidelityCertificate<'a> {
+    pub atoms: &'a [Option<AtomCoordinateFidelity>],
+}
+
+impl<'a> CoordinateFidelityCertificate<'a> {
+    pub fn new(atoms: &'a [Option<AtomCoordinateFidelity>]) -> Self {
+        Self { atoms }
+    }
+}
+
 /// Build the coordinate-fidelity certificate for one fitted atom, or `None` when
 /// the atom has no `d = 1` circle/interval chart (higher-`d` / non-metric atoms,
 /// a demoted homotopy, or a lost basis evaluator — the same gate the in-loop

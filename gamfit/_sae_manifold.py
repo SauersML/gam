@@ -1777,6 +1777,7 @@ class ManifoldSAE:
                     "decoder_coefficients": a.decoder_coefficients.tolist(),
                     "assignments": a.assignments.tolist(),
                     "coords": a.coords.tolist(),
+                    "coords_u_arc": _optional_list(a.coords_u_arc),
                     "evidence": None if a.evidence is None else float(a.evidence),
                     "active_dim": int(a.active_dim),
                     "decoder_covariance": _optional_list(a.decoder_covariance),
@@ -1871,6 +1872,7 @@ class ManifoldSAE:
                     if a.get("functional_evidence") is None
                     else dict(a["functional_evidence"])
                 ),
+                coords_u_arc=_optional_array(a, "coords_u_arc"),
             )
             for a in payload["atoms"]
         ]

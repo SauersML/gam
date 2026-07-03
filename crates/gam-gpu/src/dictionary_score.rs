@@ -58,7 +58,7 @@ impl DictionaryScoreRoutePlan {
     ) -> Self {
         let total_score_elems = n_rows.saturating_mul(n_items);
         let nondegenerate = n_rows > 0 && n_items > 0 && feature_dim > 0;
-        let tile_items = if n_rows == 0 || n_items == 0 {
+        let tile_items = if !nondegenerate {
             0
         } else {
             (max_tile_score_elems / n_rows).clamp(1, n_items)

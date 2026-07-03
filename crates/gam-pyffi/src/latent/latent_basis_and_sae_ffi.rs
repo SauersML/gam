@@ -2162,7 +2162,6 @@ fn metric_provenance_label(
 /// pathological value cannot spin the alternation unboundedly.
 const STRUCTURED_RESIDUAL_PASSES_MAX: usize = 4;
 
-
 /// #2021 — fit the structured residual-covariance model on `term`'s
 /// post-dictionary residuals and return it (the driver then materializes the
 /// damped per-row metric via [`StructuredResidualModel::row_metric_damped`],
@@ -2593,12 +2592,17 @@ fn sae_manifold_fit_stagewise<'py>(
     for atom_idx in 0..k_final {
         let atom = &term.atoms[atom_idx];
         let atom_dict = PyDict::new(py);
-        atom_dict.set_item("decoder_B", atom.decoder_coefficients.clone().into_pyarray(py))?;
+        atom_dict.set_item(
+            "decoder_B",
+            atom.decoder_coefficients.clone().into_pyarray(py),
+        )?;
         atom_dict.set_item("basis_kind", stagewise_basis_kind_tag(&atom.basis_kind))?;
         atom_dict.set_item("latent_dim", atom.latent_dim)?;
         atom_dict.set_item(
             "on_atom_coords_t",
-            term.assignment.coords[atom_idx].as_matrix().into_pyarray(py),
+            term.assignment.coords[atom_idx]
+                .as_matrix()
+                .into_pyarray(py),
         )?;
         atom_dict.set_item(
             "assignments_z",
@@ -3277,8 +3281,7 @@ fn sae_manifold_fit_inner<'py>(
     // builds a genuine WhitenedStructured blend).
     let structured_passes = structured_residual_passes.min(STRUCTURED_RESIDUAL_PASSES_MAX);
     if structured_passes > 0 && metric_provenance == "Euclidean" {
-        let mut prev_model: Option<gam::inference::residual_factor::StructuredResidualModel> =
-            None;
+        let mut prev_model: Option<gam::inference::residual_factor::StructuredResidualModel> = None;
         // #2021 Λ nursery→promotion (evidence-gated). Accumulate residual-factor
         // directions that PERSIST across passes (producer
         // `StructuredResidualModel::promotion_candidates`: energy above the
@@ -4054,6 +4057,11 @@ fn sae_manifold_fit_inner<'py>(
         use gam::inference::certificates::CertificateLedger;
         let mut ledger = CertificateLedger::new();
         ledger.record(&fit_diagnostics.residual_gauge);
+        let coordinate_fidelity_certificate =
+            gam::terms::sae::manifold::CoordinateFidelityCertificate::new(
+                &fit_diagnostics.coordinate_fidelity,
+            );
+        ledger.record(&coordinate_fidelity_certificate);
         if let Some(report) = &fit_diagnostics.incoherence_report {
             ledger.record(report);
         }

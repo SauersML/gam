@@ -15,7 +15,7 @@ use gam_problem::topology_certificates::{Certificate, Claim, Evidence, Verdict};
 
 use crate::encode::EncodeResult;
 use crate::identifiability::ResidualGaugeReport;
-use crate::manifold::{CertificateInputs, GlobalOptimalityVerdict};
+use crate::manifold::{CertificateInputs, CoordinateFidelityCertificate, GlobalOptimalityVerdict};
 
 /// Helper: insert a scalar only when finite, else record it as text "n/a" so the
 /// evidence is explicit about a missing quantity (never a silent 0.0).
@@ -176,6 +176,88 @@ impl Certificate for CertificateInputs {
         match self.global_optimality {
             GlobalOptimalityVerdict::CertifiedGlobal { .. } => Verdict::Certified,
             GlobalOptimalityVerdict::Uncertified { .. } => Verdict::Insufficient,
+        }
+    }
+}
+
+// ── 7. Chart coordinate fidelity (#2081) ─────────────────────────────────────
+
+impl<'a> Certificate for CoordinateFidelityCertificate<'a> {
+    fn claim(&self) -> Claim {
+        Claim::new(
+            "coordinate-fidelity",
+            "every eligible d=1 SAE chart reports a faithful coordinate reading: \
+             either the raw chart is already arc-length or the payload supplies \
+             the pure-read arc-length coordinate; degenerate charts are exposed \
+             as refusals rather than silently treated as angles",
+        )
+    }
+
+    fn evidence(&self) -> Evidence {
+        let mut e = Evidence::new();
+        let mut eligible = 0_usize;
+        let mut certified = 0_usize;
+        let mut degenerate = 0_usize;
+        let mut max_arclength = f64::NEG_INFINITY;
+        let mut max_raw_rms = f64::NEG_INFINITY;
+        let mut max_raw_max = f64::NEG_INFINITY;
+        let mut max_uniformity = f64::NEG_INFINITY;
+        let mut min_p = f64::INFINITY;
+        let mut worst = "unavailable";
+
+        for atom in self.atoms.iter().flatten() {
+            eligible += 1;
+            if atom.certified {
+                certified += 1;
+                if worst == "unavailable" {
+                    worst = atom.verdict.label();
+                }
+            } else {
+                degenerate += 1;
+                worst = atom.verdict.label();
+            }
+            if atom.arclength_defect.is_finite() {
+                max_arclength = max_arclength.max(atom.arclength_defect);
+            }
+            if atom.raw_arclength_defect_rms.is_finite() {
+                max_raw_rms = max_raw_rms.max(atom.raw_arclength_defect_rms);
+            }
+            if atom.raw_arclength_defect_max.is_finite() {
+                max_raw_max = max_raw_max.max(atom.raw_arclength_defect_max);
+            }
+            if atom.uniformity_statistic.is_finite() {
+                max_uniformity = max_uniformity.max(atom.uniformity_statistic);
+            }
+            if atom.uniformity_p_value.is_finite() {
+                min_p = min_p.min(atom.uniformity_p_value);
+            }
+        }
+
+        e.insert("atom_count", self.atoms.len().into());
+        e.insert("eligible_d1_atoms", eligible.into());
+        e.insert("certified_d1_atoms", certified.into());
+        e.insert("degenerate_d1_atoms", degenerate.into());
+        e.insert("worst_coordinate_verdict", worst.into());
+        put_finite(&mut e, "max_arclength_defect", max_arclength);
+        put_finite(&mut e, "max_raw_arclength_defect_rms", max_raw_rms);
+        put_finite(&mut e, "max_raw_arclength_defect_max", max_raw_max);
+        put_finite(&mut e, "max_uniformity_statistic", max_uniformity);
+        put_finite(&mut e, "min_uniformity_p_value", min_p);
+        e
+    }
+
+    fn verdict(&self) -> Verdict {
+        let mut saw_eligible = false;
+        for atom in self.atoms.iter().flatten() {
+            saw_eligible = true;
+            if !atom.certified {
+                return Verdict::Insufficient;
+            }
+        }
+        if saw_eligible {
+            Verdict::Certified
+        } else {
+            Verdict::Unavailable
         }
     }
 }
