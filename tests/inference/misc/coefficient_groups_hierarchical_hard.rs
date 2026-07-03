@@ -69,6 +69,7 @@ fn mixed_term_spec() -> TermCollectionSpec {
             drop_first_level: false,
             penalized: true,
             frozen_levels: None,
+            lenient_unseen: true,
         }],
         smooth_terms: Vec::new(),
     }

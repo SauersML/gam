@@ -1223,9 +1223,27 @@ pub struct RandomEffectTermSpec {
     /// When present, prediction uses exactly these columns to avoid design drift.
     #[serde(default)]
     pub frozen_levels: Option<Vec<u64>>,
+    /// Whether an *unseen* level of this grouping column is tolerated at predict
+    /// time (encoded as an out-of-vocabulary code and shrunk toward the
+    /// population mean) instead of raising a schema mismatch.
+    ///
+    /// Only an EXPLICIT random effect — `group(g)`/`re(g)`/`factor(g)` /
+    /// `s(g, bs="re")` — is lenient: the held-out-group policy is a deliberate
+    /// contract. A BARE categorical main effect (`+ g`), although auto-promoted
+    /// to a penalized random block internally, is a FIXED parametric factor, and
+    /// an out-of-vocabulary level of it must raise `SchemaMismatchError` at
+    /// predict rather than being silently mapped to the factor's centering point
+    /// (#2102). The `true` default preserves the pre-#2102 (uniformly lenient)
+    /// behavior for models serialized before this field existed.
+    #[serde(default = "default_random_effect_lenient_unseen")]
+    pub lenient_unseen: bool,
 }
 
 pub fn default_random_effect_penalized() -> bool {
+    true
+}
+
+pub fn default_random_effect_lenient_unseen() -> bool {
     true
 }
 

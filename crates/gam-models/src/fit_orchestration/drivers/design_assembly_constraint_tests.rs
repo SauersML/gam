@@ -171,6 +171,7 @@ fn remap_feature_columns_rewrites_every_index_bearing_field() {
             drop_first_level: false,
             penalized: true,
             frozen_levels: Some(vec![0, 1]),
+            lenient_unseen: true,
         }],
         smooth_terms: vec![
             SmoothTermSpec {
@@ -2333,6 +2334,7 @@ fn term_collection_design_adds_random_effect_dummy_blockwithridge() {
             drop_first_level: false,
             penalized: true,
             frozen_levels: None,
+            lenient_unseen: true,
         }],
         smooth_terms: vec![],
     };
@@ -6412,6 +6414,7 @@ fn exact_joint_two_block_no_spatial_fast_path_returns_fully_frozen_specs() {
         drop_first_level: false,
         penalized: true,
         frozen_levels: None,
+        lenient_unseen: true,
     };
 
     let meanspec = TermCollectionSpec {
@@ -6549,6 +6552,7 @@ fn incremental_frozen_realizer_matches_unified_full_rebuild() {
             drop_first_level: false,
             penalized: true,
             frozen_levels: None,
+            lenient_unseen: true,
         }],
         smooth_terms: vec![
             SmoothTermSpec {

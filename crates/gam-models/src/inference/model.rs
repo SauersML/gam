@@ -3719,6 +3719,20 @@ impl FittedModel {
         Ok(Some((saved.feature_columns.as_slice(), fit)))
     }
 
+    /// Grouping columns eligible for LENIENT unseen-level encoding at predict
+    /// time (the held-out-group policy: an unseen group is encoded as an
+    /// out-of-vocabulary code and shrunk toward the population mean).
+    ///
+    /// This is the whitelist the predict/`check` encode paths pass to
+    /// [`UnseenCategoryPolicy::encode_unknown_for_columns`]. It intentionally
+    /// covers ONLY explicit random effects (`group(g)`/`re(g)`/`factor(g)` /
+    /// `s(g, bs="re")`). A bare categorical main effect (`+ g`) is auto-promoted
+    /// to a penalized random block internally but is a FIXED parametric factor:
+    /// an unseen level of it must reach the strict schema encode and raise a
+    /// `SchemaMismatchError` rather than be silently averaged to the factor's
+    /// centering point (#2102). Such terms carry `lenient_unseen == false` and
+    /// are excluded here so they hit the strict `UnseenCategoryPolicy::Error`
+    /// arm.
     pub fn random_effect_group_columns(&self) -> HashSet<String> {
         let Some(training_headers) = self.training_headers.as_ref() else {
             return HashSet::new();
@@ -3726,6 +3740,9 @@ impl FittedModel {
         let mut out = HashSet::<String>::new();
         for spec in self.saved_term_specs() {
             for term in &spec.random_effect_terms {
+                if !term.lenient_unseen {
+                    continue;
+                }
                 if let Some(name) = training_headers.get(term.feature_col) {
                     out.insert(name.clone());
                 }
@@ -4953,6 +4970,7 @@ mod tests {
                 drop_first_level: false,
                 penalized: true,
                 frozen_levels: Some(vec![0.0_f64.to_bits(), 7.0_f64.to_bits()]),
+                lenient_unseen: true,
             });
         group_payload.resolved_termspec = Some(group_spec);
         let group_model = FittedModel::from_payload(group_payload);
@@ -4967,6 +4985,119 @@ mod tests {
             None,
             "numeric group labels must reach RandomEffectOperator as unseen levels, not be clipped to boundary seen levels"
         );
+    }
+
+    /// #2102: a BARE categorical predictor (`y ~ g`) is a FIXED parametric
+    /// factor. An unseen level in a prediction frame must reach the strict
+    /// schema encode and raise a `SchemaMismatch` — it must NOT be silently
+    /// mapped to the factor's centering point (the across-level average). Only
+    /// an EXPLICIT random effect (`group(g)`/`re(g)`/`factor(g)`) is eligible
+    /// for the lenient held-out-group policy, and it must stay lenient.
+    ///
+    /// This drives the real predict/`check` encode contract: it derives the
+    /// lenient whitelist from `random_effect_group_columns()` exactly as the
+    /// predict and `schema_check` FFI paths do, then encodes a frame carrying an
+    /// out-of-vocabulary level.
+    #[test]
+    fn bare_categorical_fixed_factor_unseen_level_rejected_by_predict_encode() {
+        use csv::StringRecord;
+        use gam_data::{EncodedDataset, UnseenCategoryPolicy, encode_recordswith_schema};
+        use gam_runtime::resource::ResourcePolicy;
+        use gam_terms::inference::formula_dsl::parse_formula;
+        use gam_terms::term_builder::build_termspec;
+
+        // Training frame: response `y` + categorical `g` with levels {a,b,c}.
+        let train_schema = DataSchema {
+            columns: vec![
+                SchemaColumn {
+                    name: "y".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "g".to_string(),
+                    kind: ColumnKindTag::Categorical,
+                    levels: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+                },
+            ],
+        };
+        let train = EncodedDataset {
+            headers: vec!["y".to_string(), "g".to_string()],
+            values: Array2::from_shape_vec(
+                (6, 2),
+                vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 0.0, 0.0, 1.0, 1.0, 2.0, 2.0],
+            )
+            .expect("rectangular training frame"),
+            schema: train_schema.clone(),
+            column_kinds: vec![ColumnKindTag::Continuous, ColumnKindTag::Categorical],
+        };
+        let build_col_map = train.column_map();
+
+        let model_for = |formula: &str| -> FittedModel {
+            let parsed = parse_formula(formula).expect("formula parses");
+            let mut notes = Vec::new();
+            let spec = build_termspec(
+                &parsed.terms,
+                &train,
+                &build_col_map,
+                &mut notes,
+                &ResourcePolicy::default_library(),
+            )
+            .unwrap_or_else(|err| panic!("`{formula}` must build a term spec, got: {err:?}"));
+            let mut payload = standard_gaussian_payload();
+            payload.data_schema = Some(train_schema.clone());
+            payload.set_training_feature_metadata(
+                vec!["y".to_string(), "g".to_string()],
+                vec![(0.0, 2.0), (0.0, 2.0)],
+            );
+            payload.resolved_termspec = Some(spec);
+            FittedModel::from_payload(payload)
+        };
+
+        // Predict frame with an out-of-vocabulary level for `g`.
+        let g_schema = DataSchema {
+            columns: vec![SchemaColumn {
+                name: "g".to_string(),
+                kind: ColumnKindTag::Categorical,
+                levels: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            }],
+        };
+        let encode_level = |model: &FittedModel, level: &str| -> Result<EncodedDataset, String> {
+            let policy = UnseenCategoryPolicy::encode_unknown_for_columns(
+                model.random_effect_group_columns(),
+            );
+            encode_recordswith_schema(
+                vec!["g".to_string()],
+                vec![StringRecord::from(vec![level])],
+                &g_schema,
+                policy,
+            )
+        };
+
+        // Fixed factor: `g` is NOT a lenient group column, so the strict encode
+        // must reject the unseen level while still accepting a seen one.
+        let bare = model_for("y ~ g");
+        assert!(
+            !bare.random_effect_group_columns().contains("g"),
+            "bare `+ g` is a fixed parametric factor; it must NOT be whitelisted for lenient \
+             unseen-level encoding (#2102)"
+        );
+        encode_level(&bare, "a").expect("a seen level must still encode for the fixed factor");
+        let err = encode_level(&bare, "TYPO")
+            .expect_err("an unseen fixed-factor level must raise a schema mismatch (#2102)");
+        assert!(
+            err.contains("unseen level"),
+            "expected an unseen-level schema mismatch naming the level, got: {err}"
+        );
+
+        // Explicit random effect: stays lenient (held-out group → population mean).
+        let grouped = model_for("y ~ group(g)");
+        assert!(
+            grouped.random_effect_group_columns().contains("g"),
+            "explicit group(g) must remain lenient on unseen levels (held-out-group policy)"
+        );
+        encode_level(&grouped, "TYPO")
+            .expect("explicit group(g) tolerates unseen levels by contract");
     }
 
     #[test]

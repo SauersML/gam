@@ -40,8 +40,12 @@ pub(crate) fn response_column_kind(data: &Dataset, y_col: usize) -> ResponseColu
 /// * `Gaussian` + `Identity`
 /// * `{Poisson, Gamma, Tweedie, NegativeBinomial}` + `Log`
 /// * `Beta` + `Logit`
-/// * `Binomial` + `{Logit, Probit, CLogLog, Sas, BetaLogistic}` (and the
-///   Logit-shaped `Mixture`, handled by the caller via `mixture_components`)
+/// * `Binomial` + `{Logit, Probit, CLogLog, LogLog, Cauchit, Sas,
+///   BetaLogistic}` (and the Logit-shaped `Mixture`, handled by the caller via
+///   `mixture_components`). `LogLog` (`μ = exp(−exp(−η))`, the reflected
+///   extreme-value link) and `Cauchit` (`μ = ½ + atan(η)/π`) are fully wired
+///   binomial inverse links — closed-form μ in the kernel plus a full IRLS
+///   d1..d5 / Fisher-weight jet in the solver — so they are legal here (#2104).
 ///
 /// `RoystonParmar` is a flexible-parametric survival family whose link is fixed
 /// at construction and is never reached through the scalar link-choice path, so
@@ -59,6 +63,8 @@ fn link_legal_for_family(response: &ResponseFamily, link: LinkFunction) -> bool 
             LinkFunction::Logit
                 | LinkFunction::Probit
                 | LinkFunction::CLogLog
+                | LinkFunction::LogLog
+                | LinkFunction::Cauchit
                 | LinkFunction::Sas
                 | LinkFunction::BetaLogistic
         ),
@@ -728,6 +734,69 @@ mod tweedie_power_tests {
         // fallback, not a canonical value).
         assert_eq!(tweedie_p("tweedie"), 1.5);
         assert_eq!(tweedie_p("tw"), 1.5);
+    }
+
+    #[test]
+    fn binomial_loglog_and_cauchit_links_are_legal() {
+        // #2104: `loglog` (μ = exp(−exp(−η))) and `cauchit` (μ = ½ + atan(η)/π)
+        // are fully-implemented binomial inverse links — closed-form μ in the
+        // kernel plus a full IRLS d1..d5 / Fisher-weight jet in the solver — and
+        // are advertised by the parser vocabulary, but the legality gate omitted
+        // them, so `binomial(loglog)` / `binomial(cauchit)` were rejected as
+        // "not supported for family 'binomial'". Exercise the real legality
+        // predicate directly (it is private to this module) and the end-to-end
+        // resolver seam through which the user reaches it.
+        assert!(
+            link_legal_for_family(&ResponseFamily::Binomial, LinkFunction::LogLog),
+            "binomial + loglog must be a legal pairing"
+        );
+        assert!(
+            link_legal_for_family(&ResponseFamily::Binomial, LinkFunction::Cauchit),
+            "binomial + cauchit must be a legal pairing"
+        );
+        // The other three canonical binomial links stay legal (no regression),
+        // and a non-binomial family still rejects these two links.
+        assert!(link_legal_for_family(
+            &ResponseFamily::Binomial,
+            LinkFunction::CLogLog
+        ));
+        assert!(!link_legal_for_family(
+            &ResponseFamily::Gaussian,
+            LinkFunction::LogLog
+        ));
+        assert!(!link_legal_for_family(
+            &ResponseFamily::Gaussian,
+            LinkFunction::Cauchit
+        ));
+
+        // End-to-end resolver path (mgcv-style `family(link)`) must now accept
+        // both links and carry the requested inverse link into the spec.
+        let y = array![0.0, 1.0, 0.0, 1.0, 1.0, 0.0];
+        for (raw, want) in [
+            ("binomial(loglog)", LinkFunction::LogLog),
+            ("binomial(cauchit)", LinkFunction::Cauchit),
+            ("Binomial(LogLog)", LinkFunction::LogLog),
+            ("bernoulli(cauchit)", LinkFunction::Cauchit),
+        ] {
+            let spec = resolve_family(
+                Some(raw),
+                None,
+                None,
+                y.view(),
+                ResponseColumnKind::Numeric,
+                "y",
+            )
+            .unwrap_or_else(|err| panic!("resolve_family({raw:?}) must succeed, got: {err}"));
+            assert!(
+                matches!(spec.response, ResponseFamily::Binomial),
+                "{raw}: expected Binomial response"
+            );
+            assert_eq!(
+                spec.link.link_function(),
+                want,
+                "{raw}: expected {want:?} link"
+            );
+        }
     }
 
     #[test]

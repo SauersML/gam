@@ -458,17 +458,24 @@ fn fit_standard_base(
     }
 }
 
-/// Fully-normalized (saddlepoint) Tweedie log-likelihood of a fit at a fixed
-/// variance power `p` — the profile objective maximized to estimate `p` (#2026).
+/// **Exact** Tweedie log-likelihood of a fit at a fixed variance power `p` — the
+/// profile objective maximized to estimate `p` (#2026 / #2105).
 ///
 /// Refits the mean/dispersion GLM at `Tweedie { p }` reusing the existing fit
 /// machinery (no reimplementation), reconstructs the fitted mean
-/// `μ = exp(Xβ̂ + offset)` on the log link, and evaluates the SAME
-/// fully-normalized saddlepoint log-density the fit reports to the user
-/// (`gam_solve::pirls::calculate_loglikelihood`) at the estimated dispersion
-/// `φ̂(p)`. Unlike the fit's REML building-block log-likelihood (which drops the
-/// `p`-dependent `−½·p·ln y` prefactor and so is not comparable across `p`),
-/// this carries every normalizer and IS comparable across the profile grid.
+/// `μ = exp(Xβ̂ + offset)` on the log link, and evaluates the **exact** Jørgensen
+/// compound-Poisson–gamma log-density (`gam_solve::pirls::tweedie_exact_loglik_total`)
+/// at the estimated dispersion `φ̂(p)`.
+///
+/// CRITICAL (#2105): the objective must be the *exact* EDM density, NOT the
+/// saddlepoint approximation the fit reports for AIC. The saddlepoint is exact
+/// only in the many-jumps (large Poisson-rate λ) limit; at the moderate λ of a
+/// typical Tweedie fit its missing `O(1/λ)` normalizer correction, summed across
+/// the sample, biases the profile maximizer **low** (e.g. `p̂ ≈ 1.33` on `p = 1.5`
+/// data). Because the reported dispersion is the Pearson estimate
+/// `φ̂ = Σw(y−μ)²/μ^p / Σw`, an under-estimated `p` inflates `φ̂` and every SE /
+/// interval scaled by `√φ̂`. mgcv's `tw()` profiles `p` on the same exact series
+/// (`ldTweedie`) for exactly this reason.
 ///
 /// Returns `None` when the refit fails or yields a non-finite objective so the
 /// profile search can skip that node rather than abort.
@@ -524,16 +531,15 @@ fn tweedie_profile_loglik(request: &StandardFitRequest<'_>, p: f64) -> Option<f6
         return None;
     }
     let phi = (weighted_pearson / total_weight).clamp(PHI_MIN, PHI_MAX);
-    // Evaluate the reporting-grade fully-normalized saddlepoint density at φ̂(p).
-    let glm = gam_spec::GlmLikelihoodSpec {
-        spec: family,
-        scale: gam_spec::LikelihoodScaleMetadata::EstimatedTweediePhi { phi },
-    };
-    let ll = gam_solve::pirls::calculate_loglikelihood(
+    // Evaluate the EXACT compound-Poisson–gamma density at φ̂(p) — the profile
+    // objective mgcv's `tw()` maximizes. Using the saddlepoint here (as the AIC
+    // path does) is what biased `p̂` low and inflated `φ̂` (#2105).
+    let ll = gam_solve::pirls::tweedie_exact_loglik_total(
         request.y.view(),
         &mu,
-        &glm,
         request.weights.view(),
+        p,
+        phi,
     );
     ll.is_finite().then_some(ll)
 }
