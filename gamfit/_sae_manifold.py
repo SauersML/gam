@@ -2827,6 +2827,10 @@ class StagewiseSAE:
     assignment: str
     seed: ManifoldSAE
     training_data: np.ndarray
+    #: #1939 — the resolved cone-atom RECOVERY opt-in the fit actually ran with
+    #: (echoed from the FFI). Lets a harness verify the kwarg engaged rather than
+    #: assuming; default false keeps older constructors valid.
+    cone_atom_recovery_used: bool = False
 
     @property
     def k(self) -> int:
@@ -3222,6 +3226,10 @@ def _stagewise_from_payload(
         assignment=str(seed_fit.assignment),
         seed=seed_fit,
         training_data=np.asarray(x, dtype=np.float64),
+        # #1939 — surface the FFI's cone_atom_recovery echo on the result object so a
+        # harness can verify the flag engaged; older payloads without the key default
+        # to False.
+        cone_atom_recovery_used=bool(payload.get("cone_atom_recovery_used", False)),
     )
 
 
