@@ -36,11 +36,11 @@
 //! the two coincide once the dictionary is fully populated and revival goes
 //! quiescent.
 
-use super::{ScoreRouteStats, SparseDictConfig};
 use super::scoring::TileScorer;
 use super::update::{
     DEAD_DENOM, DecoderNormalEq, route_and_code_all, seed_decoder, solve_decoder, unit_norm_rows,
 };
+use super::{ScoreRouteStats, SparseDictConfig};
 use ndarray::{Array2, ArrayView2};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
