@@ -165,7 +165,7 @@ fn rank_charge_flag_off_is_inert() {
 /// bit-identical.
 #[test]
 fn rank_charge_healthy_k3_control_well_conditioned() {
-    let _serial = k3_guard();
+    let serial = k3_guard();
     let n = 96usize;
     let p = 18usize;
     let ncirc = 3usize;
@@ -247,6 +247,7 @@ fn rank_charge_healthy_k3_control_well_conditioned() {
         v_on.is_finite() && v_off.is_finite(),
         "K=3 criterion must stay finite (no Schur collapse) both ways: off={v_off} on={v_on}"
     );
+    drop(serial); // hold the K=3 serialisation lock across the whole fit
 }
 
 /// Build + fit a term with circles on the given output-dim indices (each circle
@@ -310,7 +311,7 @@ fn fit_circle_subset(
 /// by design; the accept/reject OUTCOME must not.
 #[test]
 fn rank_charge_k3_decisions_preserved() {
-    let _serial = k3_guard();
+    let serial = k3_guard();
     let n = 96usize;
     let p = 18usize;
     let ncirc = 3usize;
@@ -376,6 +377,7 @@ fn rank_charge_k3_decisions_preserved() {
     }
     // (c) spurious/noise atom rejected is covered structurally by the vanishing
     // test (rank→0 → charge 0 → ΔEV rejects); a real atom here is never spurious.
+    drop(serial); // hold the K=3 serialisation lock across the whole fit
 }
 
 /// (vi) #9 DENSE-vs-STREAMING PARITY (the #9 correctness proof): the streaming
@@ -386,7 +388,7 @@ fn rank_charge_k3_decisions_preserved() {
 /// criterion values agree to ε.
 #[test]
 fn rank_charge_dense_streaming_parity() {
-    let _serial = k3_guard();
+    let serial = k3_guard();
     let (mut term, rho) = fitted_circle_term(80, 16);
     term.set_rank_charge_evidence(true);
     let tgt = unit_target(&term);
@@ -407,8 +409,7 @@ fn rank_charge_dense_streaming_parity() {
 
     // Streaming: pull the chunk-accumulated Grams + N_eff via the log-det pass.
     let mut ri = super::construction::StreamingRankInputs::default();
-    let _ld = term
-        .streaming_exact_arrow_log_det(tgt.view(), &rho, None, Some(&mut ri))
+    term.streaming_exact_arrow_log_det(tgt.view(), &rho, None, Some(&mut ri))
         .expect("streaming log-det with rank inputs");
 
     assert_eq!(ri.grams.len(), dense_grams.len(), "atom count parity");
@@ -459,6 +460,7 @@ fn rank_charge_dense_streaming_parity() {
         (v_dense - v_stream).abs() < 1e-5,
         "dense vs streaming rank-charge criterion must agree: dense={v_dense} stream={v_stream}"
     );
+    drop(serial); // hold the K=3 serialisation lock across the whole fit
 }
 
 /// (vii) #16 SHARED PRIMITIVE parity. The free `realised_rank_charge_dof` must price an
