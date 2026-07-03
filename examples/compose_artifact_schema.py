@@ -122,8 +122,14 @@ def make_null_control_artifact(
     gaussian_matched: dict[str, Any],
     shuffled: dict[str, Any],
     harmonic_null: dict[str, Any] | None = None,
+    theta_accept: float | None = None,
 ) -> dict[str, Any]:
-    """Build a strict `null_control.json` payload and validate it."""
+    """Build a strict `null_control.json` payload and validate it.
+
+    ``theta_accept`` is the pre-registered null-calibrated curved-atom acceptance threshold
+    (Amendment 1(1) of prereg_35b.md): the q99 of the turning Θ the matched-Gaussian null
+    manufactures through the identical composed pipeline. EVAL reads it as the operative A2
+    acceptance threshold; when absent, A2/I1/G_band/G_util stay PENDING (never Θ>1)."""
     payload = {
         "schema": NULL_CONTROL_SCHEMA,
         "schema_version": SCHEMA_VERSION,
@@ -133,6 +139,8 @@ def make_null_control_artifact(
         "shuffled": dict(shuffled),
         "harmonic_null": dict(harmonic_null or {}),
     }
+    if theta_accept is not None:
+        payload["theta_accept"] = float(theta_accept)
     validate_null_control_artifact(payload, compose_min_effect_ev=float(salience_floor))
     return payload
 
@@ -208,6 +216,12 @@ def validate_null_control_artifact(
                 raise ArtifactSchemaError(f"{arm}.scatter_points[{j}] must be an object")
             _require_number(point, "theta")
             _require_number(point, "delta_ev")
+    # Amendment 1(1): optional null-calibrated acceptance threshold; if present must be a
+    # positive turning (radians). Absent → EVAL leaves curved-atom acceptance uncalibrated.
+    if "theta_accept" in payload:
+        ta = payload["theta_accept"]
+        if not isinstance(ta, (int, float)) or isinstance(ta, bool) or float(ta) <= 0.0:
+            raise ArtifactSchemaError("theta_accept must be a positive number (radians)")
 
 
 def _require_schema(payload: dict[str, Any], schema: str) -> None:
