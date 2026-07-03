@@ -19,6 +19,7 @@
 //! plus the same fit run activation-only for a side-by-side.
 
 use ndarray::{Array1, Array2};
+use std::io::Write;
 use std::sync::Arc;
 
 use gam_sae::manifold::{
@@ -137,7 +138,7 @@ fn main() -> Result<(), String> {
             probs.nrows()
         ));
     }
-    println!("n = {n} tokens, p_x = {p_x} activation dims, V = {vocab} restricted tokens");
+    let _ = writeln!(std::io::stdout(),"n = {n} tokens, p_x = {p_x} activation dims, V = {vocab} restricted tokens");
 
     // Seed the circle coordinate by phase of the two leading activation PCs
     // (cheap deterministic seed; the fit refines it jointly).
@@ -171,7 +172,7 @@ fn main() -> Result<(), String> {
         .behavior_block()
         .expect("installed above")
         .clone();
-    println!(
+    let _ = writeln!(std::io::stdout(),
         "REML-selected log λ_y = {:.4} (λ_y = {:.4}); sweeps = {}, converged = {}, identifiable = {}",
         report.log_lambda_y,
         report.log_lambda_y.exp(),
@@ -186,7 +187,7 @@ fn main() -> Result<(), String> {
     let act_f = fitted.slice(ndarray::s![.., ..p_x]).to_owned();
     let beh_t = augmented.slice(ndarray::s![.., p_x..]).to_owned();
     let beh_f = fitted.slice(ndarray::s![.., p_x..]).to_owned();
-    println!(
+    let _ = writeln!(std::io::stdout(),
         "two-block fit: activation EV = {:.4}, behavior EV = {:.4}",
         explained_variance(&act_t, &act_f),
         explained_variance(&beh_t, &beh_f)
@@ -217,10 +218,10 @@ fn main() -> Result<(), String> {
         total_nats += kl;
         speeds.push((tg[[g, 0]], flat, kl));
     }
-    println!("behavioral circumference of the fitted weekday circle: {total_nats:.4} nats");
-    println!("t, predicted_nats(chord), exact_kl (per 1/{grid} step):");
+    let _ = writeln!(std::io::stdout(),"behavioral circumference of the fitted weekday circle: {total_nats:.4} nats");
+    let _ = writeln!(std::io::stdout(),"t, predicted_nats(chord), exact_kl (per 1/{grid} step):");
     for (t, flat, kl) in &speeds {
-        println!("{t:.4}, {flat:.6}, {kl:.6}");
+        let _ = writeln!(std::io::stdout(),"{t:.4}, {flat:.6}, {kl:.6}");
     }
 
     // --- Activation-only baseline for the side-by-side. ---
@@ -228,7 +229,7 @@ fn main() -> Result<(), String> {
     term_a.set_guards_enabled(false);
     term_a.run_joint_fit_arrow_schur(z.view(), &mut rho_a, None, 60, 1.0, 1e-6, 1e-6)?;
     let fitted_a = term_a.try_fitted_for_rho(&rho_a)?;
-    println!(
+    let _ = writeln!(std::io::stdout(),
         "activation-only baseline: activation EV = {:.4} (no behavioral units available)",
         explained_variance(&z, &fitted_a)
     );
