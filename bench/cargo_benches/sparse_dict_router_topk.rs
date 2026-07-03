@@ -18,7 +18,7 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use gam::sae::sparse_dict::top_s_online;
+use gam::terms::sae::sparse_dict::top_s_online;
 use ndarray::Array2;
 
 const K: usize = 32_768; // #1026 headline dictionary width

@@ -31,6 +31,16 @@ _SURVIVAL_MODEL_CLASSES = frozenset(
 )
 _MARGINAL_SLOPE_MODEL_CLASSES = frozenset(
     {
+        # Kebab-case ``ModelKind`` label carried by the *saved* model payload
+        # (``Model.model_class`` reads the payload's ``model_kind`` field, which
+        # serde-serialises ``ModelKind::MarginalSlope`` to ``"marginal-slope"``).
+        # ``is_marginal_slope`` matches on this, exactly as ``is_survival`` /
+        # ``is_transformation_normal`` match the kebab ``"survival"`` /
+        # ``"transformation-normal"`` labels in their own sets.
+        "marginal-slope",
+        # Rich predict-payload labels (``parsed["model_class"]`` from
+        # ``predict_table``) consulted by ``_predict_shape``; kept so the same
+        # set drives both the saved-payload and predict-payload taxonomies.
         "bernoulli marginal-slope",
         "survival marginal-slope",
     }

@@ -715,6 +715,20 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     let mut rho0 = label_layout.initial_rho.clone();
     let (persistent_warm_start_key, mut persistent_warm_start) =
         load_persistent_custom_family_warm_start::<F>(family, specs, options, rho0.len());
+    // The cross-fit `FitArtifact` transfer (consume/capture below) reuses
+    // per-block β/ρ from a structurally-matching prior fit under a descriptor
+    // key that deliberately EXCLUDES the response. Per the
+    // `persistent_warm_start_fingerprint` contract, reusing β across fits is
+    // only admissible for families that opt into persistent warm-starts by
+    // providing a likelihood-data fingerprint (which is exactly what makes
+    // `persistent_warm_start_key` `Some`). Families that opt out (fingerprint
+    // `None` ⇒ key `None`) must cold-start so repeat fits of the same model are
+    // bit-reproducible: without this gate a second structurally-identical fit
+    // warm-starts off the first and settles on a different point within the
+    // inner solve's flat-basin tolerance (gam#1607 cluster 4 — the location-
+    // scale engine-vs-reference exact-replay parity), and successive process
+    // runs drift as each seeds off the previous run's on-disk artifact.
+    let cross_fit_artifact_enabled = persistent_warm_start_key.is_some();
 
     // Cross-fit warm start: when the exact response-keyed inner cache MISSES
     // (a new fold / row population / reduced width), fall back to the
@@ -729,7 +743,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     // KKT/REML certificate — and behavior-neutral on a cold store (no parent ⇒
     // rho0 + cold β unchanged). Any anomaly degrades that block (or the whole
     // transfer) to cold.
-    if persistent_warm_start.is_none() && !rho0.is_empty() {
+    if cross_fit_artifact_enabled && persistent_warm_start.is_none() && !rho0.is_empty() {
         if let Some(warm) = consume_fit_artifact::<F>(
             specs,
             &canonical.gauge,
@@ -803,16 +817,20 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         );
         // Cross-fit FitArtifact capture (Phase 0/1): persist the converged
         // raw-β + ρ under the descriptor-indexed keyspace so a later fold
-        // can warm-start its ρ. Best-effort; never affects this fit.
-        capture_fit_artifact::<F>(
-            specs,
-            &canonical.gauge,
-            &warm_start.block_beta,
-            &warm_start.rho,
-            &label_layout.physical_to_outer,
-            penalized_objective,
-            inner.converged,
-        );
+        // can warm-start its ρ. Best-effort; never affects this fit. Gated on
+        // the same opt-in as the consume side (gam#1607) so opt-out families
+        // publish nothing and stay bit-reproducible across repeat fits/runs.
+        if cross_fit_artifact_enabled {
+            capture_fit_artifact::<F>(
+                specs,
+                &canonical.gauge,
+                &warm_start.block_beta,
+                &warm_start.rho,
+                &label_layout.physical_to_outer,
+                penalized_objective,
+                inner.converged,
+            );
+        }
         let inner_converged = inner.converged;
         return assemble_custom_family_fit_result(
             inner,
@@ -1711,16 +1729,20 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     })?;
     // Cross-fit FitArtifact capture (Phase 0/1) for the converged smoothing
     // fit: persist the descriptor-indexed raw-β + ρ so a later fold transfers
-    // ρ. Best-effort; never affects this fit's result.
-    capture_fit_artifact::<F>(
-        specs,
-        &canonical.gauge,
-        &final_warm_start.block_beta,
-        &final_warm_start.rho,
-        &label_layout.physical_to_outer,
-        penalized_objective,
-        !nonconvergence_escalation,
-    );
+    // ρ. Best-effort; never affects this fit's result. Gated on the same opt-in
+    // as the consume side (gam#1607) so opt-out families publish nothing and
+    // stay bit-reproducible across repeat fits/runs.
+    if cross_fit_artifact_enabled {
+        capture_fit_artifact::<F>(
+            specs,
+            &canonical.gauge,
+            &final_warm_start.block_beta,
+            &final_warm_start.rho,
+            &label_layout.physical_to_outer,
+            penalized_objective,
+            !nonconvergence_escalation,
+        );
+    }
     // Never-fail terminal rung. Under escalation, sample the proper posterior
     // `N(β̂, H⁻¹)` whose precision `H` is the SAME penalized (Jeffreys-augmented)
     // joint Hessian the inner solve produced at the reached mode `β̂`, and report

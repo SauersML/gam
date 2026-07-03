@@ -146,7 +146,6 @@ fn antipodal_start_flags_never_silently_wrong() {
         x.view(),
         1.0,
         lipschitz,
-        1.0e-12,
     )
     .expect("certificate at antipode");
 
@@ -181,7 +180,6 @@ fn certificate_h_is_monotone_in_distance_from_root() {
             x.view(),
             1.0,
             lipschitz,
-            1.0e-12,
         )
         .expect("certificate");
         cert.h
@@ -291,7 +289,6 @@ fn lipschitz_constant_shrinks_certified_radius_monotonically() {
         x.view(),
         1.0,
         10.0,
-        1.0e-12,
     )
     .unwrap()
     .0
@@ -303,7 +300,6 @@ fn lipschitz_constant_shrinks_certified_radius_monotonically() {
         x.view(),
         1.0,
         1000.0,
-        1.0e-12,
     )
     .unwrap()
     .0
