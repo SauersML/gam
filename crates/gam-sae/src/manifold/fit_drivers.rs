@@ -4147,6 +4147,71 @@ impl SaeManifoldTerm {
             // that has fallen far behind its peers and reseed it onto the
             // residual; a strict no-op for K=1.
             self.enforce_decoder_norm_guard(target, outer_iteration, rho)?;
+            // #2089 defense-in-depth: never grind a hopeless fit (and never let a
+            // CPU watchdog SIGKILL the host while it does). When the co-collapse
+            // multi-start budget is fully spent yet the dictionary is STILL at or
+            // below the signal-free null floor (`q/n`), it never escaped total
+            // co-collapse for this input — every atom's decoder co-vanished and no
+            // residual structure could anchor `K` distinct charts. The guard has
+            // already restored the best basin it banked, so continuing the outer
+            // loop (and the outer-REML ρ-search that drives it) only re-derives the
+            // same degenerate basin at cost. Return a typed error so the FFI raises
+            // a diagnosable Python exception PROMPTLY instead of thrashing toward a
+            // useless model. Gated to genuine, budget-exhausted TOTAL co-collapse:
+            // a healthy fit never reseeds (`dictionary_cocollapse_reseeds == 0`),
+            // and a partially-recovered basin (best EV above the floor) still
+            // returns `Ok` exactly as before, so no non-degenerate fit is affected.
+            if self.dictionary_cocollapse_reseeds
+                >= crate::assignment::SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET
+            {
+                let ev_now = self.dictionary_reconstruction_ev(target, rho)?;
+                let dictionary_rank = crate::manifold::outer_objective::reachable_dictionary_rank(
+                    &self.atoms,
+                    self.n_obs(),
+                    target.ncols(),
+                );
+                let ev_floor = crate::manifold::outer_objective::absolute_degeneracy_ev_floor(
+                    target,
+                    dictionary_rank,
+                );
+                if !(ev_now.is_finite() && ev_now > ev_floor) {
+                    // Carry the collapse MEASUREMENTS in the message so a caller that
+                    // deliberately drives co-collapse as a control (red-tree scaling
+                    // experiments) can read the numbers off the exception instead of
+                    // losing them to the raise: the terminal reconstruction EV, the
+                    // null floor, the worst inter-atom output-frame coherence μ̂ (the
+                    // shared-subspace signature), and the per-atom decoder norms ‖B_k‖
+                    // (all ≈0 under a genuine co-vanish).
+                    let mu_hat = match self.structural_coherence_collapse_detected() {
+                        Ok(Some((_, _, coherence))) => format!("{coherence:.4}"),
+                        Ok(None) => "below-null-bar".to_string(),
+                        Err(_) => "unavailable".to_string(),
+                    };
+                    let decoder_norms: Vec<f64> = self
+                        .atoms
+                        .iter()
+                        .map(|atom| {
+                            atom.decoder_coefficients
+                                .iter()
+                                .map(|value| value * value)
+                                .sum::<f64>()
+                                .sqrt()
+                        })
+                        .collect();
+                    return Err(format!(
+                        "SaeManifoldTerm::run_joint_fit_arrow_schur: dictionary did not escape \
+                         total co-collapse after {} reseed multi-starts (reconstruction \
+                         EV={ev_now:.4} at or below the signal-free null floor {ev_floor:.4}); \
+                         every atom's decoder co-vanished and no residual structure could anchor \
+                         K={} distinct charts for this input [mu_hat_max={mu_hat}, \
+                         decoder_norms={decoder_norms:.4?}]. Refusing to continue the degenerate \
+                         fit. Try fewer atoms (a smaller K), a different atom_topology/assignment, \
+                         more observations, or a different random_state.",
+                        crate::assignment::SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET,
+                        self.k_atoms()
+                    ));
+                }
+            }
             // #2022 — enforce unit-speed (arc-length) charts IN-LOOP at this
             // accepted-outer-iteration boundary (post-acceptance, OUTSIDE the line
             // search, same cadence as the guards above). Image-frozen ⇒ data-fit +
