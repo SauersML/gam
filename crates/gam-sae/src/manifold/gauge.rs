@@ -504,7 +504,15 @@ impl SaeManifoldTerm {
                 .sum::<f64>()
                 .sqrt();
         }
-        // Median decoder norm = the robust dictionary scale, identical to the guard.
+        // Robust "healthy dictionary scale" to measure collapse against. The median
+        // is the guard's statistic, but it DEGENERATES when the MAJORITY of atoms
+        // collapse: at K=3 with two co-vanished atoms (real data: ‖B‖=[2.6, 0, 0])
+        // the median IS 0, so a median-keyed floor would find no reference and skip
+        // the collapse entirely — exactly the failure this exists to fix. Fall back
+        // to the MAX norm (definitionally a surviving/healthy atom) whenever the
+        // median is non-positive, so the collapsed atoms are still measured against
+        // the survivor. Only genuine TOTAL collapse (every decoder literally 0 ⇒ max
+        // 0) has no scale to key on — return 0 there and defer to the reseed arm.
         let mut sorted = norms.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let median = if k % 2 == 1 {
@@ -512,15 +520,18 @@ impl SaeManifoldTerm {
         } else {
             0.5 * (sorted[k / 2 - 1] + sorted[k / 2])
         };
-        if !(median > 0.0) {
-            // Every decoder ≈ 0 (total co-collapse): no healthy scale to key on and
-            // no direction to retract onto — leave it to the reseed/deflation arm.
+        let reference = if median > 0.0 {
+            median
+        } else {
+            norms.iter().copied().fold(0.0_f64, f64::max)
+        };
+        if !(reference > 0.0) {
             return 0;
         }
-        let breach_floor = crate::assignment::SAE_ATOM_DECODER_NORM_COLLAPSE_RATIO * median;
+        let breach_floor = crate::assignment::SAE_ATOM_DECODER_NORM_COLLAPSE_RATIO * reference;
         // Below this a decoder carries no usable direction to normalize; retracting
         // `B/‖B‖` would amplify pure round-off. Machine-scaled to the dictionary.
-        let direction_floor = 1.0e-12 * median;
+        let direction_floor = 1.0e-12 * reference;
         let mut retracted = 0usize;
         // A decoder BELOW the direction floor is collapsed but UN-RETRACTABLE (no
         // direction to normalize) — it needs a fresh-direction reseed, not this
@@ -548,7 +559,7 @@ impl SaeManifoldTerm {
         // a bit-for-bit no-op with a benign one-line trace.
         let norms_fmt: Vec<String> = norms.iter().map(|v| format!("{v:.6e}")).collect();
         log::warn!(
-            "[#1939 cone-atom] k={k} norms=[{}] median={median:.6e} \
+            "[#1939 cone-atom] k={k} norms=[{}] median={median:.6e} reference={reference:.6e} \
              breach_floor={breach_floor:.6e} direction_floor={direction_floor:.6e} \
              retracted={retracted} unretractable_zero={unretractable_zero}",
             norms_fmt.join(", ")
