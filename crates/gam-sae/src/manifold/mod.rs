@@ -52,7 +52,9 @@
 //! * [`term`] — the `SaeManifoldTerm` aggregate, its shared numeric constants,
 //!   and the mutable-state snapshot the inner line search restores.
 //! * [`construction`] — term construction, accessors, frame/border bookkeeping,
-//!   loss/penalty/criterion evaluation, and the arrow-Schur assembly.
+//!   and loss/penalty/criterion evaluation.
+//! * [`construction_arrow_schur_assembly`] — the Gauss-Newton bordered-Hessian
+//!   arrow-Schur assembly and its factored β-penalty curvature helpers.
 //! * [`penalties`] — the live analytic-penalty curvature contributions.
 //! * [`fit_drivers`] — gauge canonicalization, the Newton step, and the joint /
 //!   fixed-decoder / streaming fit drivers.
@@ -134,6 +136,7 @@ mod behavior;
 mod certificate;
 mod construction;
 mod construction_ard;
+mod construction_arrow_schur_assembly;
 mod construction_aux_types;
 mod construction_cache_refresh;
 mod construction_padded_blocks;
