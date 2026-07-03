@@ -74,6 +74,8 @@
 
 use ndarray::{Array1, Array2, ArrayView2};
 
+use faer::Side;
+use gam_linalg::faer_ndarray::FaerEigh;
 use gam_solve::inference::residual_factor::{ResidualFactorInput, StructuredResidualModel};
 use gam_solve::structure_search::StructureMove;
 
@@ -523,6 +525,129 @@ fn top_factor_birth_decoder(
     Some((decoder, energy))
 }
 
+/// #2080 DISJOINT-extraction fallback birth candidate. [`StructuredResidualModel`]
+/// detects only SHARED low-rank (off-diagonal, correlated) residual structure. A
+/// dictionary of DISJOINT factors — orthogonal circles each in its own 2-plane with
+/// independent phases — leaves a nearly BLOCK-DIAGONAL residual covariance, which the
+/// evidence ladder correctly attributes to the idiosyncratic diagonal `D`, so
+/// `factor_rank() == 0` and the forward-birth phase would STOP at `k = 1` despite
+/// abundant remaining structure (the observed disjoint 6-circle `1/6` recovery).
+///
+/// When the factor model is rank-0 but the residual still carries ABOVE-NOISE
+/// variance, seed the birth from the residual's dominant PRINCIPAL direction(s)
+/// instead. The stop is now a DERIVED noise floor, not `factor_rank == 0`: the
+/// residual-covariance eigenspectrum is thresholded at the Marchenko–Pastur top edge
+/// `λ₊ = σ̂²·(1 + √(p/n))²` — the analytic largest eigenvalue a sample covariance of
+/// white noise at aspect `p/n` produces — with `σ̂²` the median of the lower-half
+/// eigenvalues (a robust noise scale, unbiased while ≤ p/2 directions are signal).
+/// A direction above `λ₊` is real structure; none above ⇒ the residual is noise and
+/// the phase stops. No magic constant — the edge is the null distribution.
+///
+/// This is a FALLBACK to unblock GROWTH only. The birth EVIDENCE gate + anchor
+/// scoring downstream remain the quality control that decides birth-or-stop, so a
+/// variance-seeded candidate is safe: a weak one is rejected by the gate. It does
+/// NOT replace the factor/anchor seed path — on real activations global principal
+/// components are semantic mush, so the factor+anchor path stays PRIMARY and this
+/// engages ONLY when the factor model finds nothing but the noise-floor test says
+/// structure remains. (Do not "simplify" this to always-PCA.) The chosen direction
+/// is anchor-scored exactly like the factor path (fraction of residual support on
+/// the dictionary's uncontested rows).
+fn residual_principal_birth_candidate(
+    term: &SaeManifoldTerm,
+    residual: ArrayView2<'_, f64>,
+) -> Option<(Array2<f64>, f64)> {
+    let (n, p) = residual.dim();
+    if n < 2 || p == 0 || term.atoms.is_empty() {
+        return None;
+    }
+    // Column-centered residual second moment S = (1/n) R_cᵀ R_c (p×p).
+    let mut mean = Array1::<f64>::zeros(p);
+    for row in 0..n {
+        for j in 0..p {
+            mean[j] += residual[[row, j]];
+        }
+    }
+    mean.mapv_inplace(|v| v / n as f64);
+    let mut s = Array2::<f64>::zeros((p, p));
+    for row in 0..n {
+        for a in 0..p {
+            let ra = residual[[row, a]] - mean[a];
+            for b in 0..p {
+                s[[a, b]] += ra * (residual[[row, b]] - mean[b]);
+            }
+        }
+    }
+    s.mapv_inplace(|v| v / n as f64);
+    let (evals, evecs) = s.eigh(Side::Lower).ok()?; // ascending eigenvalues
+    if evals.is_empty() {
+        return None;
+    }
+    // Derived Marchenko–Pastur noise floor. `σ̂²` is the MEDIAN eigenvalue — a robust
+    // noise-scale estimate that sits in the noise bulk whenever the signal directions
+    // are a minority (the disjoint-recovery regime), unbiased by the strong signal
+    // eigenvalues. `λ₊ = σ̂²·(1+√(p/n))²` is the analytic top edge of the MP law, the
+    // largest eigenvalue white noise at aspect `p/n` produces; a direction above it is
+    // real structure, not a noise fluctuation.
+    let mut ascending: Vec<f64> = evals.iter().copied().collect();
+    ascending.sort_by(|a, b| a.total_cmp(b));
+    let mid = ascending.len() / 2;
+    let sigma2 = if ascending.len() % 2 == 1 {
+        ascending[mid]
+    } else {
+        0.5 * (ascending[mid - 1] + ascending[mid])
+    }
+    .max(f64::MIN_POSITIVE);
+    let gamma = p as f64 / n as f64;
+    let mp_edge = sigma2 * (1.0 + gamma.sqrt()).powi(2);
+    // Above-floor principal directions, strongest first.
+    let mut above: Vec<usize> = (0..evals.len()).filter(|&k| evals[k] > mp_edge).collect();
+    above.sort_by(|&a, &b| evals[b].total_cmp(&evals[a]));
+    if above.is_empty() {
+        return None; // residual is noise ⇒ stop growing (the derived-floor stop)
+    }
+    // Anchor-score the above-floor directions exactly like the factor path.
+    let anchor_w = birth_anchor_weights(term);
+    let mut best = above[0];
+    if anchor_w.iter().sum::<f64>() > 0.0 {
+        let mut best_score = f64::NEG_INFINITY;
+        for &k in &above {
+            let col = evecs.column(k); // unit-norm eigenvector
+            let mut num = 0.0_f64;
+            let mut den = 0.0_f64;
+            for i in 0..n {
+                let mut proj = 0.0_f64;
+                for j in 0..p {
+                    proj += residual[[i, j]] * col[j];
+                }
+                let si = proj * proj;
+                num += anchor_w[i] * si;
+                den += si;
+            }
+            if den > 0.0 {
+                let score = num / den;
+                if score > best_score {
+                    best_score = score;
+                    best = k;
+                }
+            }
+        }
+    }
+    let energy = evals[best].max(0.0);
+    if !(energy > 0.0) {
+        return None;
+    }
+    // Lift to a birth decoder: the principal p-direction scaled by its amplitude
+    // √λ on the constant (row-0) basis row (matches top_factor_birth_decoder's
+    // energy-scaled convention, so the reported dose is the direction's variance).
+    let amp = energy.sqrt();
+    let m = term.atoms[0].basis_size();
+    let mut decoder = Array2::<f64>::zeros((m, p));
+    for j in 0..p {
+        decoder[[0, j]] = amp * evecs[[j, best]];
+    }
+    Some((decoder, energy))
+}
+
 /// Refit a SINGLE atom `k` in place on its leave-one-atom-out partial residual —
 /// the k-SVD-style certified per-atom update. The LOO residual is
 /// `e_k = target − Σ_{j≠k} a_j g_j = target − fitted + a_k g_k` (computed with the
@@ -764,8 +889,17 @@ pub fn fit_stagewise(
         let Some((residual, model)) = fit_residual_covariance(&term, target, config)? else {
             break StagewiseStop::NoResidualStructure;
         };
+        // Primary: anchor-scored SHARED-factor birth seed. Fallback (#2080): when the
+        // factor model is rank-0 (block-diagonal DISJOINT residual — see
+        // `residual_principal_birth_candidate`) but the residual still carries
+        // above-noise variance, seed from its dominant principal direction so growth
+        // is not blocked at k=1 on the easy disjoint case. The derived Marchenko–Pastur
+        // noise floor inside the fallback is now the stop criterion (residual is noise
+        // ⇒ `None` ⇒ stop), not `factor_rank == 0`; the evidence gate below stays the
+        // birth-or-stop quality control, so a variance-seeded candidate is safe.
         let Some((birth_decoder, factor_energy)) =
             top_factor_birth_decoder(&term, &model, residual.view())
+                .or_else(|| residual_principal_birth_candidate(&term, residual.view()))
         else {
             break StagewiseStop::NoResidualStructure;
         };
@@ -1608,6 +1742,71 @@ mod tests {
             u_strong > u_anchor,
             "uniform routing must fall back to the dominant-energy factor (dA, channels 0,1): \
              |dA|={u_strong:.4} |dB|={u_anchor:.4}"
+        );
+    }
+
+    /// #2080 — the disjoint-extraction fallback must FIRE on a block-diagonal
+    /// (disjoint) residual the structured factor model reports as rank-0, and must
+    /// REJECT pure noise (the derived Marchenko–Pastur floor is the stop criterion).
+    #[test]
+    fn residual_principal_fallback_fires_on_disjoint_not_noise_2080() {
+        let n = 400usize;
+        let p = 8usize;
+        // 1-atom term (only basis_size + activity are read by the fallback).
+        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
+        let coords = Array2::<f64>::from_shape_fn((n, 1), |(row, _)| row as f64 / n as f64);
+        let (atom0, cb0) = circle_atom("t0", &evaluator, &coords, 0, 1, p);
+        let (term, _rho) = build_term(vec![atom0], vec![cb0], &vec![vec![true]; n]);
+
+        let mut state = 0xC0FFEE_1234_5678_u64;
+        let mut rng = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f64) / ((1u64 << 31) as f64) - 1.0
+        };
+
+        // BLOCK-DIAGONAL disjoint residual: two independent correlated signals on
+        // channels {0,1} and {2,3} (zero cross-block correlation → the factor model
+        // attributes it to D → rank-0), tiny isotropic noise everywhere.
+        let mut residual = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            let a = rng();
+            let b = rng();
+            residual[[i, 0]] = 2.0 * a;
+            residual[[i, 1]] = 2.0 * a; // signal A: correlated 0,1
+            residual[[i, 2]] = 1.5 * b;
+            residual[[i, 3]] = 1.5 * b; // signal B: correlated 2,3
+            for j in 0..p {
+                residual[[i, j]] += 0.03 * rng();
+            }
+        }
+        let got = residual_principal_birth_candidate(&term, residual.view());
+        let (decoder, energy) = got.expect(
+            "disjoint block-diagonal residual must yield a fallback candidate \
+             (structure above the derived MP noise floor)",
+        );
+        assert!(energy > 0.0 && energy.is_finite());
+        // The chosen direction must be a real signal direction (mass on channels 0-3),
+        // not a noise channel.
+        let sig_mass: f64 = (0..4).map(|j| decoder[[0, j]].powi(2)).sum();
+        let noise_mass: f64 = (4..p).map(|j| decoder[[0, j]].powi(2)).sum();
+        assert!(
+            sig_mass > noise_mass,
+            "fallback birth direction must land on the signal block (0-3), not noise: \
+             sig={sig_mass:.3e} noise={noise_mass:.3e}"
+        );
+
+        // PURE NOISE: no direction above the MP floor ⇒ None ⇒ stop growing.
+        let mut noise = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            for j in 0..p {
+                noise[[i, j]] = rng();
+            }
+        }
+        assert!(
+            residual_principal_birth_candidate(&term, noise.view()).is_none(),
+            "pure-noise residual must be below the derived MP floor ⇒ no candidate (stop)"
         );
     }
 
