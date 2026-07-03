@@ -580,6 +580,8 @@ mod stream_tests {
             s,
             config.code_ridge,
             config.minibatch,
+            config.score_mode,
+            None,
         )
         .expect("fresh route");
         let n = x.nrows();
@@ -659,6 +661,7 @@ mod stream_tests {
             code_ridge: 1.0e-6,
             decoder_ridge: 1.0e-6,
             tolerance: 1.0e-9,
+            score_mode: gam_gpu::GpuMode::Off,
         };
 
         let one_shot = fit_sparse_dictionary(x.view(), &config).expect("one-shot fit");
@@ -724,6 +727,7 @@ mod stream_tests {
             code_ridge: 1.0e-6,
             decoder_ridge: 1.0e-6,
             tolerance: 1.0e-12,
+            score_mode: gam_gpu::GpuMode::Off,
         };
         let mut state = SparseDictStreamState::new(x.view(), &config).expect("fit_begin");
         let mut evs = Vec::new();
@@ -768,6 +772,7 @@ mod stream_tests {
             code_ridge: 1.0e-6,
             decoder_ridge: 1.0e-6,
             tolerance: 0.0,
+            score_mode: gam_gpu::GpuMode::Off,
         };
         let mut state = SparseDictStreamState::new(seed.view(), &config).expect("fit_begin");
         // Seed spans only e0/e1: nothing points at e2 yet.

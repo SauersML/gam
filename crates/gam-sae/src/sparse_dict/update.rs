@@ -1016,6 +1016,7 @@ mod exact_solve_tests {
             code_ridge: 1.0e-6,
             decoder_ridge: 1.0e-6,
             tolerance: 1.0e-9,
+            score_mode: gam_gpu::GpuMode::Off,
         };
         let fit = fit_sparse_dictionary(x.view(), &config).expect("fit");
         let s = fit.active;
@@ -1029,6 +1030,8 @@ mod exact_solve_tests {
             s,
             config.code_ridge,
             config.minibatch,
+            config.score_mode,
+            None,
         )
         .expect("fresh route");
         let fresh_ev = explained_variance(x.view(), &codes, fit.decoder.view());

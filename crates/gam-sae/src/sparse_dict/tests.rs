@@ -301,6 +301,7 @@ fn sparse_trainer_recovers_planted_dictionary_beats_pca_baseline() {
         code_ridge: 1.0e-6,
         decoder_ridge: 1.0e-6,
         tolerance: 1.0e-9,
+        score_mode: gam_gpu::GpuMode::Off,
     };
     let fit = fit_sparse_dictionary(x.view(), &config).expect("sparse dictionary fit");
     let baseline = pca_ev(x.view(), k);
@@ -364,6 +365,7 @@ fn sparse_trainer_beats_rank_k_pca_on_held_out_reconstruction() {
         code_ridge,
         decoder_ridge: 1.0e-6,
         tolerance: 1.0e-9,
+        score_mode: gam_gpu::GpuMode::Off,
     };
     // Fit the dictionary on TRAIN ONLY.
     let fit = fit_sparse_dictionary(x_train.view(), &config).expect("held-out trainer fit");
@@ -451,6 +453,7 @@ fn dead_atom_revival_keeps_ev_monotone_in_k_and_beats_linear_subspace() {
         code_ridge,
         decoder_ridge: 1.0e-6,
         tolerance: 1.0e-9,
+        score_mode: gam_gpu::GpuMode::Off,
     };
 
     let fit_small = fit_sparse_dictionary(x_train.view(), &mk(16)).expect("K=16 fit");
@@ -610,6 +613,7 @@ fn real_olmo_sparse_dict_ev_vs_k_parity() {
                     code_ridge: 1.0e-6,
                     decoder_ridge: 1.0e-6,
                     tolerance: 1.0e-7,
+                    score_mode: gam_gpu::GpuMode::Off,
                 };
                 let fit = fit_sparse_dictionary(x_tr.view(), &config).expect("fit");
                 let ev_te = held_out_ev(fit.decoder.view(), x_te.view(), s, tile, 1.0e-6);
@@ -638,6 +642,7 @@ fn fixed_width_sparse_storage_never_dense_and_reconstructs() {
         active: 1,
         max_epochs: 30,
         score_tile: 4,
+        score_mode: gam_gpu::GpuMode::Off,
         ..SparseDictConfig::new(k)
     };
     let fit = fit_sparse_dictionary(x.view(), &config).expect("fit");
@@ -773,6 +778,7 @@ fn fit_is_minibatch_size_invariant() {
         code_ridge: 1.0e-6,
         decoder_ridge: 1.0e-6,
         tolerance: 1.0e-9,
+        score_mode: gam_gpu::GpuMode::Off,
     };
     let fit_mb1 = fit_sparse_dictionary(x.view(), &base).expect("minibatch=1 fit");
     let fit_mbn = fit_sparse_dictionary(
@@ -819,6 +825,7 @@ fn scales_to_large_k_without_dense_n_by_k() {
         active: 1,
         max_epochs: 6,
         score_tile: 256,
+        score_mode: gam_gpu::GpuMode::Off,
         ..SparseDictConfig::new(k)
     };
     let fit = fit_sparse_dictionary(x.view(), &config).expect("large-K fit");
