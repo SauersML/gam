@@ -2396,6 +2396,120 @@ fn stagewise_basis_kind_tag(kind: &SaeAtomBasisKind) -> &'static str {
     }
 }
 
+fn stagewise_birth_kind_tag(kind: gam::terms::sae::manifold::BirthKind) -> &'static str {
+    match kind {
+        gam::terms::sae::manifold::BirthKind::NewAtom => "new_atom",
+        gam::terms::sae::manifold::BirthKind::ChartExtension => "chart_extension",
+    }
+}
+
+fn stagewise_event_kind_tag(kind: gam::terms::sae::manifold::StagewiseEventKind) -> &'static str {
+    match kind {
+        gam::terms::sae::manifold::StagewiseEventKind::SeedFitCompleted => "seed_fit_completed",
+        gam::terms::sae::manifold::StagewiseEventKind::ResidualModelFitted => {
+            "residual_model_fitted"
+        }
+        gam::terms::sae::manifold::StagewiseEventKind::CandidateStarted => "candidate_started",
+        gam::terms::sae::manifold::StagewiseEventKind::CandidateFinished => "candidate_finished",
+        gam::terms::sae::manifold::StagewiseEventKind::BirthAccepted => "birth_accepted",
+        gam::terms::sae::manifold::StagewiseEventKind::BirthRejected => "birth_rejected",
+        gam::terms::sae::manifold::StagewiseEventKind::BackfitSweepStarted => {
+            "backfit_sweep_started"
+        }
+        gam::terms::sae::manifold::StagewiseEventKind::BackfitSweepAccepted => {
+            "backfit_sweep_accepted"
+        }
+        gam::terms::sae::manifold::StagewiseEventKind::BackfitSweepRejected => {
+            "backfit_sweep_rejected"
+        }
+        gam::terms::sae::manifold::StagewiseEventKind::TerminalEvidenceCompleted => {
+            "terminal_evidence_completed"
+        }
+    }
+}
+
+fn stagewise_atoms_py<'py>(
+    py: Python<'py>,
+    term: &gam::terms::sae::manifold::SaeManifoldTerm,
+) -> PyResult<Bound<'py, PyList>> {
+    let assignments = term.assignment.assignments();
+    let atoms_py = PyList::empty(py);
+    for atom_idx in 0..term.k_atoms() {
+        let atom = &term.atoms[atom_idx];
+        let atom_dict = PyDict::new(py);
+        atom_dict.set_item(
+            "decoder_B",
+            atom.decoder_coefficients.clone().into_pyarray(py),
+        )?;
+        atom_dict.set_item("basis_kind", stagewise_basis_kind_tag(&atom.basis_kind))?;
+        atom_dict.set_item("latent_dim", atom.latent_dim)?;
+        atom_dict.set_item(
+            "on_atom_coords_t",
+            term.assignment.coords[atom_idx]
+                .as_matrix()
+                .into_pyarray(py),
+        )?;
+        atom_dict.set_item(
+            "assignments_z",
+            assignments.column(atom_idx).to_owned().into_pyarray(py),
+        )?;
+        atoms_py.append(atom_dict)?;
+    }
+    Ok(atoms_py)
+}
+
+fn stagewise_checkpoint_py<'py>(
+    py: Python<'py>,
+    term: &gam::terms::sae::manifold::SaeManifoldTerm,
+    rho: &SaeManifoldRho,
+) -> PyResult<Bound<'py, PyDict>> {
+    let checkpoint = PyDict::new(py);
+    checkpoint.set_item("k_final", term.k_atoms())?;
+    checkpoint.set_item("atoms", stagewise_atoms_py(py, term)?)?;
+    checkpoint.set_item("logits", term.assignment.logits.clone().into_pyarray(py))?;
+    checkpoint.set_item("log_lambda_sparse", rho.log_lambda_sparse)?;
+    checkpoint.set_item(
+        "log_lambda_smooth",
+        Array1::from(rho.log_lambda_smooth.clone()).into_pyarray(py),
+    )?;
+    let log_ard_py = PyList::empty(py);
+    for atom_log_ard in &rho.log_ard {
+        log_ard_py.append(atom_log_ard.clone().into_pyarray(py))?;
+    }
+    checkpoint.set_item("log_ard", log_ard_py)?;
+    Ok(checkpoint)
+}
+
+fn stagewise_progress_py<'py>(
+    py: Python<'py>,
+    event: &gam::terms::sae::manifold::StagewiseProgress<'_>,
+) -> PyResult<Py<PyDict>> {
+    let out = PyDict::new(py);
+    out.set_item("event", stagewise_event_kind_tag(event.event))?;
+    out.set_item("birth_round", event.birth_round)?;
+    out.set_item("backfit_sweep", event.backfit_sweep)?;
+    out.set_item(
+        "candidate",
+        event.candidate.map(stagewise_birth_kind_tag),
+    )?;
+    out.set_item("accepted", event.accepted)?;
+    out.set_item("checkpoint_available", event.checkpoint)?;
+    out.set_item("k", event.k_atoms)?;
+    out.set_item("births_accepted", event.births_accepted)?;
+    out.set_item("births_rejected", event.births_rejected)?;
+    out.set_item("ev", event.ev)?;
+    out.set_item("factor_energy", event.factor_energy)?;
+    out.set_item("joint_reml_before", event.joint_reml_before)?;
+    out.set_item("joint_reml_after", event.joint_reml_after)?;
+    out.set_item("terminal_joint_reml", event.terminal_joint_reml)?;
+    if event.checkpoint {
+        out.set_item("checkpoint", stagewise_checkpoint_py(py, event.term, event.rho)?)?;
+    } else {
+        out.set_item("checkpoint", py.None())?;
+    }
+    Ok(out.unbind())
+}
+
 /// SAC — Sequential Atom Composition entry. Grows a curved dictionary from a
 /// single K=1 seed atom by forward-stagewise births + backfitting, then reports
 /// the terminal frozen joint evidence. This is the productionised
@@ -2434,6 +2548,7 @@ fn stagewise_basis_kind_tag(kind: &SaeAtomBasisKind) -> &'static str {
     max_factor_rank = 4,
     structured_whitening = true,
     row_loss_weights = None,
+    birth_callback = None,
 ))]
 fn sae_manifold_fit_stagewise<'py>(
     py: Python<'py>,
@@ -2463,6 +2578,7 @@ fn sae_manifold_fit_stagewise<'py>(
     max_factor_rank: usize,
     structured_whitening: bool,
     row_loss_weights: Option<PyReadonlyArray1<'py, f64>>,
+    birth_callback: Option<PyObject>,
 ) -> PyResult<Py<PyDict>> {
     let assignment_kind = canonicalize_assignment_kind(&assignment_kind).map_err(py_value_error)?;
     let z_view = z.as_array();
@@ -2572,6 +2688,21 @@ fn sae_manifold_fit_stagewise<'py>(
         max_factor_rank,
         structured_whitening,
     };
+    let mut progress_callback = birth_callback.map(|callback| {
+        move |event: gam::terms::sae::manifold::StagewiseProgress<'_>| -> Result<(), String> {
+            Python::with_gil(|py| {
+                let payload = stagewise_progress_py(py, &event).map_err(|err| err.to_string())?;
+                callback
+                    .call1(py, (payload,))
+                    .map_err(|err| err.to_string())?;
+                Ok(())
+            })
+        }
+    });
+    let progress_hook: Option<&mut gam::terms::sae::manifold::StagewiseProgressCallback<'_>> =
+        progress_callback.as_mut().map(|callback| {
+            callback as &mut gam::terms::sae::manifold::StagewiseProgressCallback<'_>
+        });
     let result = gam::terms::sae::manifold::fit_stagewise(
         base_term,
         init_rho,
@@ -2579,6 +2710,7 @@ fn sae_manifold_fit_stagewise<'py>(
         None,
         weights.as_deref(),
         &config,
+        progress_hook,
     )
     .map_err(py_value_error)?;
 
@@ -2588,37 +2720,12 @@ fn sae_manifold_fit_stagewise<'py>(
     let k_final = term.k_atoms();
     let assignments = term.assignment.assignments();
 
-    let atoms_py = PyList::empty(py);
-    for atom_idx in 0..k_final {
-        let atom = &term.atoms[atom_idx];
-        let atom_dict = PyDict::new(py);
-        atom_dict.set_item(
-            "decoder_B",
-            atom.decoder_coefficients.clone().into_pyarray(py),
-        )?;
-        atom_dict.set_item("basis_kind", stagewise_basis_kind_tag(&atom.basis_kind))?;
-        atom_dict.set_item("latent_dim", atom.latent_dim)?;
-        atom_dict.set_item(
-            "on_atom_coords_t",
-            term.assignment.coords[atom_idx]
-                .as_matrix()
-                .into_pyarray(py),
-        )?;
-        atom_dict.set_item(
-            "assignments_z",
-            assignments.column(atom_idx).to_owned().into_pyarray(py),
-        )?;
-        atoms_py.append(atom_dict)?;
-    }
+    let atoms_py = stagewise_atoms_py(py, &term)?;
 
     let births_py = PyList::empty(py);
     for rec in &report.birth_records {
         let d = PyDict::new(py);
-        let kind = match rec.kind {
-            gam::terms::sae::manifold::BirthKind::NewAtom => "new_atom",
-            gam::terms::sae::manifold::BirthKind::ChartExtension => "chart_extension",
-        };
-        d.set_item("kind", kind)?;
+        d.set_item("kind", stagewise_birth_kind_tag(rec.kind))?;
         d.set_item("delta_ev", rec.delta_ev)?;
         d.set_item("factor_energy", rec.factor_energy)?;
         d.set_item("joint_reml_before", rec.joint_reml_before)?;
