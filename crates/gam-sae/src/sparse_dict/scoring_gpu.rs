@@ -541,6 +541,11 @@ mod device {
         let tile_m = super::SCORE_BLOCK_TILE_M;
         let tile_n = super::SCORE_BLOCK_TILE_N;
         let tile_cols = tile_cols.max(1);
+        let max_tile_cols = tile_cols.min(k);
+        let mut scores_dev = stream
+            .alloc_zeros::<f32>(n_rows * max_tile_cols)
+            .gpu_ctx("sparse_dict tiled score alloc scores")?;
+        let mut scores = vec![0.0f32; n_rows * max_tile_cols];
 
         let mut start = 0usize;
         while start < k {
@@ -556,9 +561,6 @@ mod device {
             let atoms_dev = stream
                 .clone_htod(&atoms_host)
                 .gpu_ctx("sparse_dict tiled score htod atoms")?;
-            let mut scores_dev = stream
-                .alloc_zeros::<f32>(n_rows * n_atoms)
-                .gpu_ctx("sparse_dict tiled score alloc scores")?;
 
             let n_atoms_i32 = i32::try_from(n_atoms).map_err(|_| {
                 gam_gpu::gpu_err!("sparse_dict tiled score n_atoms={n_atoms} overflows i32")
@@ -584,14 +586,14 @@ mod device {
             // current atom tile and writes exactly `n_rows * n_atoms` scores.
             unsafe { builder.launch(cfg) }.gpu_ctx("sparse_dict tiled score launch")?;
 
-            let mut scores = vec![0.0f32; n_rows * n_atoms];
+            let score_len = n_rows * n_atoms;
             stream
-                .memcpy_dtoh(&scores_dev, &mut scores)
+                .memcpy_dtoh(&scores_dev, &mut scores[..score_len])
                 .gpu_ctx("sparse_dict tiled score dtoh scores")?;
             stream
                 .synchronize()
                 .gpu_ctx("sparse_dict tiled score synchronize")?;
-            fold_tile(start, n_atoms, &scores);
+            fold_tile(start, n_atoms, &scores[..score_len]);
             start = end;
         }
         Ok(())
