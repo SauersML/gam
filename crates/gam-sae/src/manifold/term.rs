@@ -676,6 +676,21 @@ pub struct SaeManifoldTerm {
     /// because the augmented output shares `t` and `a` by construction. Carried
     /// across clones so a cloned candidate keeps its behavioral identity.
     pub(crate) behavior: Option<crate::manifold::BehaviorBlock>,
+    /// #2023 C4 — the manifold-tier analogue of [`crate::tiered::Tier0Mean`]: the
+    /// single shared mean μ (length `p`) that carries the global DC for THIS term.
+    /// `None` (the default) ⇒ the historical, bit-for-bit path (no Tier-0; every
+    /// atom is free to smear a piece of the mean through its constant basis column).
+    /// `Some(μ)` ⇒ the atoms are fit against the de-meaned target `Z − μ` and the
+    /// reconstruction adds μ back ([`SaeManifoldTerm::try_fitted_with_rho`]).
+    ///
+    /// Moving the global DC out of the K per-atom intercepts into ONE Tier-0 mean
+    /// structurally kills the co-collapse-to-mean zombie class (#10 / #1893): on
+    /// de-meaned data the "every atom decodes the mean" state reconstructs zero, so
+    /// it earns zero explained variance and is pruned by the rank charge (its
+    /// realised rank → 0), instead of being rewarded and PC-reseeded. A pure
+    /// DC-constant decoder is then EV-invisible BY CONSTRUCTION — the mean it would
+    /// chase is already gone. Carried across clones like the other persisted config.
+    pub(crate) tier0_mean: Option<Array1<f64>>,
 }
 
 /// #1777 — PER-FIT configuration overrides the FFI sets on a term to isolate a
@@ -748,6 +763,9 @@ impl Clone for SaeManifoldTerm {
             // assignment mode / barrier override), carried across clones so a
             // cloned candidate fits the same augmented two-block problem.
             behavior: self.behavior.clone(),
+            // #2023 C4 — persisted Tier-0 shared mean, carried across clones like
+            // the assignment mode so a cloned candidate de-means identically.
+            tier0_mean: self.tier0_mean.clone(),
         }
     }
 }

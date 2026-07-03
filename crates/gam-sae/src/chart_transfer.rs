@@ -155,6 +155,91 @@ pub fn certify_square_transfer(
     })
 }
 
+/// The SO(2) polar-factor angle of a 2×2 operator with positive determinant.
+///
+/// The polar decomposition `A = R·S` (rotation × SPD stretch) has the unique
+/// rotation maximising `tr(Rᵀ A)`; for 2×2 that angle is
+/// `atan2(a₁₀ − a₀₁, a₀₀ + a₁₁)`. A non-positive determinant means the
+/// operator reflects (or collapses) the chart rather than rotating it, so no
+/// rotation angle exists and the call errs — a consumer must report the
+/// orientation flip, not silently fold it into an angle.
+pub fn so2_polar_angle(operator: ArrayView2<'_, f64>) -> Result<f64, String> {
+    if operator.dim() != (2, 2) {
+        return Err(format!(
+            "SO(2) polar angle requires a 2x2 operator, got {:?}",
+            operator.dim()
+        ));
+    }
+    ensure_finite(operator, "operator")?;
+    let det = operator[[0, 0]] * operator[[1, 1]] - operator[[0, 1]] * operator[[1, 0]];
+    if !(det > 0.0) {
+        return Err(format!(
+            "SO(2) polar angle requires positive determinant (rotation, not reflection/collapse); got det={det}"
+        ));
+    }
+    Ok((operator[[1, 0]] - operator[[0, 1]]).atan2(operator[[0, 0]] + operator[[1, 1]]))
+}
+
+/// Density-weighted circular mean and standard error of the per-token SO(2)
+/// polar angles of a stack of 2×2 operators.
+///
+/// Returns `(mean_angle, se)`. The mean direction comes from the weighted
+/// resultant `(C, S) = Σ wᵢ (cos θᵢ, sin θᵢ)`; the SE is the circular standard
+/// deviation `√(−2 ln R̄)` (with `R̄` the mean resultant length) divided by
+/// `√n_eff`, where `n_eff` is Kish's effective sample size under the weights.
+/// Any token whose operator is a reflection/collapse propagates the
+/// [`so2_polar_angle`] error — a mixed rotation/reflection population has no
+/// honest mean angle.
+pub fn rotation_angle_band(
+    token_operators: ArrayView3<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+) -> Result<(f64, f64), String> {
+    let n = token_operators.len_of(Axis(0));
+    if n == 0 {
+        return Err("rotation angle band requires at least one token operator".to_string());
+    }
+    if let Some(w) = weights
+        && w.len() != n
+    {
+        return Err(format!(
+            "weights length {} does not match token count {n}",
+            w.len()
+        ));
+    }
+    let mut c = 0.0_f64;
+    let mut s_sum = 0.0_f64;
+    let mut weight_sum = 0.0_f64;
+    let mut weight_sq_sum = 0.0_f64;
+    for i in 0..n {
+        let w = weights.as_ref().map_or(1.0, |ws| ws[i]);
+        if !w.is_finite() || w < 0.0 {
+            return Err(format!(
+                "weights must be finite and non-negative; got {w} at token {i}"
+            ));
+        }
+        let angle = so2_polar_angle(token_operators.slice(s![i, .., ..]))
+            .map_err(|e| format!("token {i}: {e}"))?;
+        c += w * angle.cos();
+        s_sum += w * angle.sin();
+        weight_sum += w;
+        weight_sq_sum += w * w;
+    }
+    if weight_sum <= 0.0 {
+        return Err("at least one token must have positive weight".to_string());
+    }
+    let mean_angle = s_sum.atan2(c);
+    let resultant = (c * c + s_sum * s_sum).sqrt() / weight_sum;
+    let effective_n = weight_sum * weight_sum / weight_sq_sum;
+    // Degenerate resultant (angles spread over the whole circle): the circular
+    // std diverges; report it honestly as infinite rather than clamping.
+    let circular_sd = if resultant > 0.0 {
+        (-2.0 * resultant.ln()).max(0.0).sqrt()
+    } else {
+        f64::INFINITY
+    };
+    Ok((mean_angle, circular_sd / effective_n.sqrt()))
+}
+
 fn solve_spd_1_or_2(
     gram: ArrayView2<'_, f64>,
     rhs: ArrayView2<'_, f64>,
@@ -238,6 +323,49 @@ mod tests {
         assert!((report.mean[[0, 1]] + 0.75).abs() < 1.0e-12);
         assert!(report.variance[[0, 0]] > 0.0);
         assert!((report.effective_n - 1.6).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn so2_polar_angle_recovers_rotation_through_stretch() {
+        let angle = 0.7_f64;
+        let rot = array![[angle.cos(), -angle.sin()], [angle.sin(), angle.cos()]];
+        // A = R·S with an anisotropic SPD stretch: the polar angle must ignore S.
+        let stretch = array![[2.0, 0.3], [0.3, 0.9]];
+        let a = rot.dot(&stretch);
+        let got = so2_polar_angle(a.view()).unwrap();
+        assert!((got - angle).abs() < 1.0e-12, "got {got}, want {angle}");
+    }
+
+    #[test]
+    fn so2_polar_angle_rejects_reflection() {
+        let reflection = array![[1.0, 0.0], [0.0, -1.0]];
+        assert!(so2_polar_angle(reflection.view()).is_err());
+    }
+
+    #[test]
+    fn rotation_angle_band_weights_and_wraps() {
+        // Two rotations straddling the ±π seam: circular mean must wrap, not
+        // average to zero.
+        let mut ops = Array3::<f64>::zeros((2, 2, 2));
+        for (i, angle) in [std::f64::consts::PI - 0.1, -std::f64::consts::PI + 0.1]
+            .into_iter()
+            .enumerate()
+        {
+            ops.slice_mut(s![i, .., ..])
+                .assign(&array![[angle.cos(), -angle.sin()], [angle.sin(), angle.cos()]]);
+        }
+        let (mean, se) = rotation_angle_band(ops.view(), None).unwrap();
+        assert!(
+            (mean.abs() - std::f64::consts::PI).abs() < 1.0e-9,
+            "seam-straddling mean should sit at ±π, got {mean}"
+        );
+        assert!(se.is_finite() && se > 0.0);
+
+        // Fully weighted onto one token, the band collapses to that angle.
+        let (mean_one, se_one) =
+            rotation_angle_band(ops.view(), Some(array![1.0, 0.0].view())).unwrap();
+        assert!((mean_one - (std::f64::consts::PI - 0.1)).abs() < 1.0e-9);
+        assert!(se_one.abs() < 1.0e-9);
     }
 
     #[test]

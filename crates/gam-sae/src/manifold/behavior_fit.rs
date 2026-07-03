@@ -93,7 +93,6 @@ impl SaeManifoldTerm {
     /// `λ_y` (its behavior block updated in place), so
     /// [`BehaviorBlock::split_decoder`] on the fitted decoders yields the
     /// activation decoder `B_k` and the nats-unit behavior decoder `C_k`.
-    #[allow(clippy::too_many_arguments)]
     pub fn run_two_block_reml_fit(
         &mut self,
         activation: ArrayView2<'_, f64>,

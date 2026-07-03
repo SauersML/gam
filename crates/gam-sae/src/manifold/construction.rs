@@ -177,6 +177,10 @@ impl SaeManifoldTerm {
             // Rung-2 behavioral block: default None (ordinary single-block term,
             // bit-for-bit unchanged). Attached via `set_behavior_block`.
             behavior: None,
+            // #2023 C4 — Tier-0 shared mean: default None (no de-meaning; the
+            // historical path is bit-for-bit). Installed via `set_tier0_mean` /
+            // `fit_tier0_mean`.
+            tier0_mean: None,
         })
     }
 
@@ -917,6 +921,85 @@ impl SaeManifoldTerm {
     /// #5/(B) — read the per-fit rank-charge evidence opt-in.
     pub fn rank_charge_evidence(&self) -> bool {
         self.rank_charge_evidence
+    }
+
+    /// #2023 C4 — install a Tier-0 shared mean μ (the manifold analogue of
+    /// [`crate::tiered::Tier0Mean`]). Once set, [`Self::try_fitted_with_rho`] adds
+    /// μ back to the assembled per-atom reconstruction, so the atoms only ever
+    /// need to explain the DE-MEANED target `Z − μ`. Pass a length-`p` vector;
+    /// mismatched length is rejected. Passing the column-mean of the fit target
+    /// (see [`Self::fit_tier0_mean`]) moves the global DC out of the K per-atom
+    /// intercepts into ONE shared mean — structurally removing the
+    /// co-collapse-to-mean incentive (a pure DC-constant decoder then reconstructs
+    /// a constant that the de-meaned target no longer contains, so it earns zero
+    /// EV and is priced at realised rank 0 by the rank charge — unrepresentable as
+    /// a survivor by construction).
+    pub fn set_tier0_mean(&mut self, mean: Array1<f64>) -> Result<(), String> {
+        let p = self.output_dim();
+        if mean.len() != p {
+            return Err(format!(
+                "SaeManifoldTerm::set_tier0_mean: mean length {} must equal output_dim {p}",
+                mean.len()
+            ));
+        }
+        if !mean.iter().all(|v| v.is_finite()) {
+            return Err("SaeManifoldTerm::set_tier0_mean: mean must be finite".to_string());
+        }
+        self.tier0_mean = Some(mean);
+        Ok(())
+    }
+
+    /// #2023 C4 — the installed Tier-0 shared mean, or `None` on the historical
+    /// (no-de-meaning) path. Round-trips with [`Self::set_tier0_mean`].
+    pub fn tier0_mean(&self) -> Option<&Array1<f64>> {
+        self.tier0_mean.as_ref()
+    }
+
+    /// #2023 C4 — add the Tier-0 shared mean μ back (row-broadcast) to an assembled
+    /// `Σ_k a_k g_k` reconstruction, in place. A strict no-op on the historical
+    /// path (`tier0_mean == None`), so every reconstruction entry point can call it
+    /// unconditionally and stay bit-for-bit unchanged when Tier-0 is inactive.
+    pub(crate) fn add_tier0_mean_inplace(&self, out: &mut Array2<f64>) {
+        if let Some(mean) = self.tier0_mean.as_ref() {
+            for mut out_row in out.rows_mut() {
+                for (out_col, m) in out_row.iter_mut().zip(mean.iter()) {
+                    *out_col += *m;
+                }
+            }
+        }
+    }
+
+    /// #2023 C4 — fit the Tier-0 shared mean as the column mean of the fit target
+    /// `Z` (`N×P`), install it on the term, and return the DE-MEANED target
+    /// `Z − μ` the atoms should be fit against. This is the single seam a driver
+    /// calls before the joint fit so the global DC is carried by Tier-0 and the
+    /// atoms chase only structure. The mean is the TRAIN-split mean: hold it fixed
+    /// and reuse it for out-of-sample de-meaning and the EV baseline so held-out
+    /// EV is measured against the same Tier-0 constant (no full-data leak).
+    ///
+    /// DOUBLE-SUBTRACTION HAZARD: exactly ONE stage may own the mean. If an
+    /// upstream data-prep step already centers the target (e.g. the COMPOSE L17
+    /// driver's `tier0.json` mean/scale), the term must NOT also de-mean — leave
+    /// `tier0_mean` at `None` (the default), which is CORRECT for already-centered
+    /// data. Only call this on RAW (un-centered) targets, where the term takes
+    /// ownership of the mean.
+    pub fn fit_tier0_mean(&mut self, z: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+        let p = self.output_dim();
+        if z.ncols() != p {
+            return Err(format!(
+                "SaeManifoldTerm::fit_tier0_mean: target has P={} but output_dim is {p}",
+                z.ncols()
+            ));
+        }
+        if z.nrows() == 0 {
+            return Err("SaeManifoldTerm::fit_tier0_mean: empty target".to_string());
+        }
+        let mean = z
+            .mean_axis(ndarray::Axis(0))
+            .ok_or_else(|| "SaeManifoldTerm::fit_tier0_mean: mean_axis returned None".to_string())?;
+        let demeaned = &z - &mean.view().insert_axis(ndarray::Axis(0));
+        self.set_tier0_mean(mean)?;
+        Ok(demeaned)
     }
 
     /// #5/(B) — per-atom realised-rank effective DOF for the rank-charge criterion:
@@ -2753,6 +2836,8 @@ impl SaeManifoldTerm {
                 }
             }
         }
+        // #2023 C4 — Tier-0 shared mean add-back (no-op when inactive).
+        self.add_tier0_mean_inplace(&mut out);
         Ok(out)
     }
 
@@ -2841,6 +2926,8 @@ impl SaeManifoldTerm {
                 }
             }
         }
+        // #2023 C4 — Tier-0 shared mean add-back (no-op when inactive).
+        self.add_tier0_mean_inplace(&mut out);
         Ok(out)
     }
 
@@ -2914,6 +3001,8 @@ impl SaeManifoldTerm {
                 }
             }
         }
+        // #2023 C4 — Tier-0 shared mean add-back (no-op when inactive).
+        self.add_tier0_mean_inplace(&mut out);
         Ok(out)
     }
 

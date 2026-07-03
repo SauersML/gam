@@ -145,6 +145,7 @@ mod construction_reconstruction;
 mod coordinate_fidelity;
 mod fit_drivers;
 mod gauge;
+mod isa_seed;
 mod kronecker;
 mod loss;
 mod outer_objective;
@@ -207,6 +208,9 @@ mod tests_behavioral_fisher_rung1;
 mod tests_two_tier_2023;
 
 #[cfg(test)]
+mod tests_tier0_shared_mean_2023;
+
+#[cfg(test)]
 mod tests_streaming_efs_cache_1026;
 
 #[cfg(test)]
@@ -264,6 +268,7 @@ pub use construction_cache_refresh::*;
 pub use construction_padded_blocks::*;
 pub use coordinate_fidelity::*;
 pub use gauge::*;
+pub use isa_seed::*;
 pub(crate) use kronecker::*;
 pub use loss::*;
 pub use outer_objective::*;

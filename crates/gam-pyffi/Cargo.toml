@@ -18,6 +18,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 gam = { path = "../.." }
+gam-math = { path = "../gam-math" }
 gam-predict = { path = "../gam-predict" }
 gam-runtime = { path = "../gam-runtime" }
 # `extension-module` tells PyO3 NOT to link libpython (the host interpreter

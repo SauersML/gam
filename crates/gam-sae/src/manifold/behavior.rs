@@ -743,6 +743,78 @@ mod tests {
         }
     }
 
+    /// The closed-form REML λ_y update is the per-channel residual-variance
+    /// ratio, computed from a residual expressed in the SCALED augmented units
+    /// (the behavior columns carry √λ_y), and it is the stationary point of the
+    /// profiled criterion `(n·p̃/2)·log((R_x + λ·R_y)/(n·p̃)) + jacobian(λ)`.
+    #[test]
+    fn reml_lambda_update_is_variance_ratio_and_criterion_stationary_point() {
+        let n = 7usize;
+        let p_x = 3usize;
+        let vocab = 4usize; // p_y = 3
+        // Any valid block; the update only reads dims and the current λ_y.
+        let mut probs = Array2::<f64>::zeros((n, vocab));
+        for i in 0..n {
+            for j in 0..vocab {
+                probs[[i, j]] = 1.0 + ((i * vocab + j) as f64 * 0.618).sin().abs();
+            }
+        }
+        let current_log_lambda = 0.7_f64;
+        let block = BehaviorBlock::fit(probs.view(), p_x, current_log_lambda).unwrap();
+        let p_y = block.behavior_dim();
+
+        // A synthetic residual with known per-block sums of squares, written in
+        // scaled units: behavior columns get an extra √λ_y factor.
+        let sqrt_lambda = block.sqrt_lambda_y();
+        let mut residual = Array2::<f64>::zeros((n, p_x + p_y));
+        let mut rss_x = 0.0_f64;
+        let mut rss_y = 0.0_f64; // unscaled
+        for i in 0..n {
+            for j in 0..p_x {
+                let r = 0.3 + 0.1 * (i as f64) - 0.05 * (j as f64);
+                residual[[i, j]] = r;
+                rss_x += r * r;
+            }
+            for j in 0..p_y {
+                let r = 0.1 - 0.02 * (i as f64) + 0.03 * (j as f64);
+                residual[[i, p_x + j]] = sqrt_lambda * r;
+                rss_y += r * r;
+            }
+        }
+        let updated = block.reml_updated_log_lambda_y(residual.view()).unwrap();
+        let expected = ((rss_x / p_x as f64) / (rss_y / p_y as f64)).ln();
+        assert!(
+            (updated - expected).abs() < 1e-12,
+            "update {updated} != variance ratio {expected}"
+        );
+
+        // Stationarity: the profiled criterion C(logλ) = (n·p̃/2)·log(R_x+λR_y)
+        // − (n·p_y/2)·logλ (constants dropped) has zero derivative at the
+        // update: λR_y·p_x = R_x·p_y ⟺ dC/dlogλ = (np̃/2)·λR_y/(R_x+λR_y) −
+        // n·p_y/2 = 0. Verify the identity at the returned point.
+        let lambda_hat = updated.exp();
+        let p_tot = (p_x + p_y) as f64;
+        let dc = 0.5 * (n as f64) * p_tot * lambda_hat * rss_y / (rss_x + lambda_hat * rss_y)
+            - 0.5 * (n as f64) * (p_y as f64);
+        assert!(
+            dc.abs() < 1e-9,
+            "criterion derivative at the update is {dc}, not 0"
+        );
+        // And the Jacobian term itself matches its formula.
+        let jac = block.reml_log_lambda_jacobian(n);
+        assert!((jac + 0.5 * (n as f64) * (p_y as f64) * current_log_lambda).abs() < 1e-12);
+
+        // A behavior block with an identically-zero behavior residual carries no
+        // information about λ_y: surfaced as an error, not a silent divergence.
+        let mut inert = residual.clone();
+        for i in 0..n {
+            for j in p_x..p_x + p_y {
+                inert[[i, j]] = 0.0;
+            }
+        }
+        assert!(block.reml_updated_log_lambda_y(inert.view()).is_err());
+    }
+
     /// Fisher–Rao distance is zero for identical distributions and grows with
     /// separation, and `KL ≈ ½ d_FR²` holds to leading order.
     #[test]

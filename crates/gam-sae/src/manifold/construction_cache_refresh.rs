@@ -68,20 +68,19 @@ pub fn refresh_isometry_caches_from_atom(
         ));
     }
 
-    // J[n, i*d + a] = Σ_m dPhi[n, m, a] · B[m, i].
+    // J[n, i*d + a] = Σ_m dPhi[n, m, a] · B[m, i]. One (n×m)·(m×p) GEMM per
+    // latent axis `a` (jet slice × decoder), scattered into the row-major
+    // (n, p, d) layout: the m-contraction is a matmul, not a quadruple scalar
+    // loop of bounds-checked element reads (the profiled BLOCKER-1 hot leaf).
     let b = &atom.decoder_coefficients;
-    let mut jac = Array2::<f64>::zeros((n_obs, p * d));
-    for n in 0..n_obs {
-        for i in 0..p {
-            for a in 0..d {
-                let mut acc = 0.0;
-                for mm in 0..m {
-                    acc += jet[[n, mm, a]] * b[[mm, i]];
-                }
-                jac[[n, i * d + a]] = acc;
-            }
-        }
+    let mut jac3d = ndarray::Array3::<f64>::zeros((n_obs, p, d));
+    for a in 0..d {
+        let slab = jet.slice(ndarray::s![.., .., a]).dot(b);
+        jac3d.slice_mut(ndarray::s![.., .., a]).assign(&slab);
     }
+    let jac = jac3d
+        .into_shape_with_order((n_obs, p * d))
+        .map_err(|err| format!("refresh_isometry_caches_from_atom: J reshape failed: {err}"))?;
 
     // The second jet is sourced from the optional `basis_second_jet`
     // slot. The trait split (`SaeBasisEvaluator` vs `SaeBasisSecondJet`)
@@ -99,20 +98,21 @@ pub fn refresh_isometry_caches_from_atom(
                 hess.dim()
             ));
         }
-        let mut jac2 = Array2::<f64>::zeros((n_obs, p * d * d));
-        for n in 0..n_obs {
-            for i in 0..p {
-                for a in 0..d {
-                    for c in 0..d {
-                        let mut acc = 0.0;
-                        for mm in 0..m {
-                            acc += hess[[n, mm, a, c]] * b[[mm, i]];
-                        }
-                        jac2[[n, (i * d + a) * d + c]] = acc;
-                    }
-                }
+        // H[n, (i*d + a)*d + c]: one (n×m)·(m×p) GEMM per (a, c) pair,
+        // scattered into the row-major (n, p, d, d) layout (same GEMM-not-
+        // scalar-loop rewrite as J above).
+        let mut jac2_4d = ndarray::Array4::<f64>::zeros((n_obs, p, d, d));
+        for a in 0..d {
+            for c in 0..d {
+                let slab = hess.slice(ndarray::s![.., .., a, c]).dot(b);
+                jac2_4d
+                    .slice_mut(ndarray::s![.., .., a, c])
+                    .assign(&slab);
             }
         }
+        let jac2 = jac2_4d.into_shape_with_order((n_obs, p * d * d)).map_err(|err| {
+            format!("refresh_isometry_caches_from_atom: H reshape failed: {err}")
+        })?;
         Some(Arc::new(jac2))
     } else {
         None
@@ -140,22 +140,26 @@ pub fn refresh_isometry_caches_from_atom(
                         t3.dim()
                     ));
                 }
-                let mut jac3 = Array3::<f64>::zeros((n_obs, p, d * d * d));
-                for n in 0..n_obs {
-                    for i in 0..p {
-                        for a in 0..d {
-                            for c in 0..d {
-                                for e in 0..d {
-                                    let mut acc = 0.0;
-                                    for mm in 0..m {
-                                        acc += t3[[n, mm, a, c, e]] * b[[mm, i]];
-                                    }
-                                    jac3[[n, i, ((a * d) + c) * d + e]] = acc;
-                                }
-                            }
+                // K[n, i, ((a·d + c)·d + e)]: one (n×m)·(m×p) GEMM per
+                // (a, c, e) triple into the row-major (n, p, d, d, d) layout,
+                // then flattened — the last axis packing ((a·d + c)·d + e) IS
+                // the row-major order of (a, c, e).
+                let mut jac3_5d = ndarray::Array5::<f64>::zeros((n_obs, p, d, d, d));
+                for a in 0..d {
+                    for c in 0..d {
+                        for e in 0..d {
+                            let slab = t3.slice(ndarray::s![.., .., a, c, e]).dot(b);
+                            jac3_5d
+                                .slice_mut(ndarray::s![.., .., a, c, e])
+                                .assign(&slab);
                         }
                     }
                 }
+                let jac3 = jac3_5d
+                    .into_shape_with_order((n_obs, p, d * d * d))
+                    .map_err(|err| {
+                        format!("refresh_isometry_caches_from_atom: K reshape failed: {err}")
+                    })?;
                 Some(Arc::new(jac3))
             }
             None => None,

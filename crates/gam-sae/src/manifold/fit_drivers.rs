@@ -3875,6 +3875,33 @@ impl SaeManifoldTerm {
         } else {
             None
         };
+        // #2100/#1117 — objective-stagnation convergence for the JOINT outer loop,
+        // the exact analogue of the #1051 stall gate already guarding
+        // `converge_inner_for_undamped_logdet`. On a co-collapsed K≥2 basin (two
+        // atoms decode a SHARED output subspace, μ̂≈1 — the inter-atom
+        // coefficient-rotation gauge orbit), the joint Newton wanders that flat
+        // direction: each Armijo-accepted step lowers the penalised objective by a
+        // sub-√εmach amount while ‖g‖ and the quotient step stay above their
+        // relative tolerances (the near-singular Schur amplifies the weakly-identified
+        // decoder direction), so the grad/step gates never clear and the loop grinds
+        // the full (refine-escalated, ≥1024) `max_iter` at ~1 s/iterate — the
+        // BLOCKER-1 hours-long K=2 planted-circle hang. The grad/quotient-step gates
+        // quotient the SINGLE-atom chart gauge and the decoder-β-null but NOT this
+        // inter-atom shared-subspace gauge, so the objective itself is the honest
+        // stationarity witness here: an iterate whose penalised objective has stopped
+        // decreasing to within √εmach of its scale IS the numerical inner optimum on
+        // whatever quotient the flat direction spans, and ranking the Laplace
+        // criterion there is correct. Break after
+        // `SAE_MANIFOLD_INNER_OBJECTIVE_STALL_MIN_ROUNDS` CONSECUTIVE stalled
+        // iterations (a single flat step can be a benign saddle crossing; a run of
+        // them is the fixed point). `previous_full_iterate_objective` is the
+        // loop-top objective, which already reflects the PRIOR iteration's step,
+        // guards, retraction and canonicalization, so the measured decrease is the
+        // TOTAL per-iteration progress. Reuses the existing derived stall constants
+        // (no new magic number). A healthy fit clears the grad gate long before its
+        // relative decrease falls below 1e-8, so this never truncates real descent.
+        let mut previous_full_iterate_objective = f64::INFINITY;
+        let mut consecutive_objective_stalls = 0usize;
         for outer_iteration in 0..max_iter {
             self.advance_temperature_schedule()?;
             // ρ (including the ARD precisions) is owned by the outer engine
@@ -3998,6 +4025,36 @@ impl SaeManifoldTerm {
                 self.restore_mutable_state(&snapshot);
                 break;
             }
+            // #2100/#1117 objective-stagnation gate (see the locals above). The
+            // loop-top `pre_step_total` already carries the full effect of the
+            // previous iteration, so a relative decrease below the derived stall
+            // tolerance means that whole iteration (Newton step + guards +
+            // retraction + canonicalization) failed to move the penalised objective
+            // to within √εmach of its scale. On the gauge-orbit crawl this fires
+            // immediately (constant EV ⇒ vanishing objective decrease); on a healthy
+            // fit the grad gate above breaks first. Counting CONSECUTIVE stalls
+            // tolerates a lone flat step; `MIN_ROUNDS` in a row is the fixed point.
+            if previous_full_iterate_objective.is_finite() {
+                let round_improvement =
+                    (previous_full_iterate_objective - pre_step_total).max(0.0);
+                let objective_scale =
+                    previous_full_iterate_objective.abs().max(pre_step_total.abs()) + 1.0;
+                let relative_decrease = round_improvement / objective_scale;
+                if relative_decrease < SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL {
+                    consecutive_objective_stalls += 1;
+                    if consecutive_objective_stalls
+                        >= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_MIN_ROUNDS
+                    {
+                        // Converged on the quotient — the objective is at its
+                        // numerical fixed point. The pre-step state is unperturbed
+                        // (the snapshot was taken from it), so no restore is needed.
+                        break;
+                    }
+                } else {
+                    consecutive_objective_stalls = 0;
+                }
+            }
+            previous_full_iterate_objective = pre_step_total;
             // A non-descent Newton direction (gᵀΔ ≤ 0 or below the rounding
             // floor) is only a STOPPING criterion when the iterate is actually
             // stationary: the floor exists for benign ill-conditioned
