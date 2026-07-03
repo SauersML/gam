@@ -3,12 +3,7 @@
 # activation; it forces the current commit-pinned wheel venv to the front.
 
 GAMFIT_MSI_ROOT=/projects/standard/hsiehph/sauer354
-GAMFIT_MSI_VERSION=0.1.247
-GAMFIT_MSI_COMMIT=f6ce7eeac90fd182fa62a4dba3ffcf6736f835f9
-GAMFIT_MSI_SHORT=f6ce7eea
-GAMFIT_MSI_VENV=${GAMFIT_MSI_ROOT}/gamfit-${GAMFIT_MSI_VERSION}-${GAMFIT_MSI_SHORT}-venv
-GAMFIT_MSI_WHEEL=${GAMFIT_MSI_ROOT}/wheels_${GAMFIT_MSI_SHORT}/gamfit-${GAMFIT_MSI_VERSION}-cp310-abi3-manylinux_2_28_x86_64.whl
-GAMFIT_MSI_PYTHON=${GAMFIT_MSI_VENV}/bin/python
+GAMFIT_MSI_MANIFEST=${GAMFIT_MSI_ROOT}/gamfit_current_manifest.sh
 
 _gamfit_msi_die() {
   local code="${2:-87}"
@@ -19,7 +14,34 @@ _gamfit_msi_die() {
   esac
 }
 
+gamfit_load_msi_manifest() {
+  if [ ! -r "$GAMFIT_MSI_MANIFEST" ]; then
+    echo "missing MSI gamfit manifest: $GAMFIT_MSI_MANIFEST" >&2
+    return 87
+  fi
+
+  # shellcheck source=/dev/null
+  . "$GAMFIT_MSI_MANIFEST"
+
+  for name in \
+    GAMFIT_MSI_VERSION \
+    GAMFIT_MSI_COMMIT \
+    GAMFIT_MSI_SHORT \
+    GAMFIT_MSI_VENV \
+    GAMFIT_MSI_WHEEL \
+    GAMFIT_MSI_PYTHON \
+    GAMFIT_MSI_WHEEL_SHA256
+  do
+    eval "value=\${$name:-}"
+    if [ -z "$value" ]; then
+      echo "manifest missing $name: $GAMFIT_MSI_MANIFEST" >&2
+      return 87
+    fi
+  done
+}
+
 gamfit_assert_msi_current() {
+  gamfit_load_msi_manifest || return 87
   local py="${1:-${GAMFIT_MSI_PYTHON}}"
   if [ ! -x "$py" ]; then
     echo "missing executable Python: $py" >&2
@@ -31,6 +53,10 @@ gamfit_assert_msi_current() {
   fi
   if [ ! -f "${GAMFIT_MSI_VENV}/GAMFIT_WHEEL_SHA256" ]; then
     echo "missing wheel sha marker: ${GAMFIT_MSI_VENV}/GAMFIT_WHEEL_SHA256" >&2
+    return 87
+  fi
+  if [ "$(cat "${GAMFIT_MSI_VENV}/GAMFIT_WHEEL_SHA256")" != "$GAMFIT_MSI_WHEEL_SHA256" ]; then
+    echo "wheel sha marker does not match manifest" >&2
     return 87
   fi
 
@@ -67,6 +93,7 @@ PY
 }
 
 gamfit_use_msi_current() {
+  gamfit_load_msi_manifest || return 87
   [ -f "$GAMFIT_MSI_WHEEL" ] || {
     echo "missing wheel: $GAMFIT_MSI_WHEEL" >&2
     return 87
@@ -87,7 +114,8 @@ gamfit_use_msi_current() {
 }
 
 gamfit_python() {
+  gamfit_load_msi_manifest || return 87
   (cd /tmp && "$GAMFIT_MSI_PYTHON" "$@")
 }
 
-gamfit_use_msi_current || _gamfit_msi_die "expected gamfit ${GAMFIT_MSI_VERSION} ${GAMFIT_MSI_SHORT} wheel venv is not usable"
+gamfit_use_msi_current || _gamfit_msi_die "expected current manifest-pinned gamfit wheel venv is not usable"

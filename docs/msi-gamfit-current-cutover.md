@@ -1,22 +1,17 @@
 # MSI gamfit current wheel cutover
 
-The active MSI wheel venv is pinned by source commit, not just by package
-version:
+The active MSI wheel venv is pinned by the generated MSI manifest, not just by
+package version:
 
 ```bash
-/projects/standard/hsiehph/sauer354/gamfit-0.1.247-f6ce7eea-venv
+/projects/standard/hsiehph/sauer354/gamfit_current_manifest.sh
 ```
 
-It is installed from:
+That manifest contains the exact `origin/main` commit, wheel path, venv path,
+and wheel SHA installed by the latest CPU build job:
 
 ```bash
-/projects/standard/hsiehph/sauer354/wheels_f6ce7eea/gamfit-0.1.247-cp310-abi3-manylinux_2_28_x86_64.whl
-```
-
-The required source commit is:
-
-```text
-f6ce7eeac90fd182fa62a4dba3ffcf6736f835f9
+cat /projects/standard/hsiehph/sauer354/gamfit_current_manifest.sh
 ```
 
 Use this invocation for MSI wheel-backed Python work:
@@ -31,7 +26,8 @@ gamfit_python -c 'import gamfit, gamfit._rust; print(gamfit.__version__, gamfit.
 If a script activates another environment, source `gamfit_current_env.sh` after
 that activation. The guard fails non-interactive scripts when `gamfit` or
 `gamfit._rust` resolves outside the commit-pinned venv, or when the venv's
-`GAMFIT_SOURCE_COMMIT` marker does not match the required commit.
+`GAMFIT_SOURCE_COMMIT` or `GAMFIT_WHEEL_SHA256` markers do not match the
+manifest.
 
 Do not source `saevenv`, `saevenv_head`, or `gamfit_0247_env.sh` for gamfit
 runtime work. They are not commit-pinned to current `origin/main`.
