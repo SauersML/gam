@@ -199,22 +199,28 @@ pub fn score_block_required(
 
     let n_rows = rows.nrows();
     let n_atoms = atoms.nrows();
-    let elems = n_rows.saturating_mul(n_atoms);
+    let plan = gam_gpu::DictionaryScoreRoutePlan::with_limits(
+        n_rows,
+        n_atoms,
+        rows.ncols(),
+        DEVICE_SCORE_BLOCK_MIN_ELEMS,
+        GPU_ROUTE_TILE_ELEMS,
+    );
 
     if mode == GpuMode::Off {
         return Ok((score_block_cpu(rows, atoms), ScoreBlockPath::Cpu));
     }
 
-    let below_breakeven = elems < DEVICE_SCORE_BLOCK_MIN_ELEMS;
-    if mode == GpuMode::Required && below_breakeven {
+    if mode == GpuMode::Required && !plan.device_admitted {
         return Err(gam_gpu::gpu_err!(
-            "sparse_dict score-block GpuMode::Required: block of {n_rows}×{n_atoms} \
-             = {elems} elems is below the device launch break-even \
+            "sparse_dict score-block GpuMode::Required: block of {n_rows}×{n_atoms} = {} \
+             elems is below the device launch break-even \
              (DEVICE_SCORE_BLOCK_MIN_ELEMS={DEVICE_SCORE_BLOCK_MIN_ELEMS}); refusing \
-             to silently run on the CPU"
+             to silently run on the CPU",
+            n_rows.saturating_mul(n_atoms)
         ));
     }
-    if !below_breakeven {
+    if plan.device_admitted {
         match device::score_block_device(rows, atoms) {
             Ok(out) => return Ok((out, ScoreBlockPath::Device)),
             Err(err) => {
