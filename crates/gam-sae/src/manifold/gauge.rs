@@ -690,7 +690,11 @@ impl SaeManifoldTerm {
                 wdesign[kk] = whiten_row(designs[kk].row(row));
             }
             for j in 0..k {
-                rhs[j] += wtarget.iter().zip(wdesign[j].iter()).map(|(t, d)| t * d).sum::<f64>();
+                rhs[j] += wtarget
+                    .iter()
+                    .zip(wdesign[j].iter())
+                    .map(|(t, d)| t * d)
+                    .sum::<f64>();
                 for kk in j..k {
                     let g: f64 = wdesign[j]
                         .iter()
@@ -709,7 +713,10 @@ impl SaeManifoldTerm {
         // non-negativity clamp below — not this epsilon — is what bounds the
         // amplitude on a rank-deficient design, so the epsilon can stay at
         // machine scale and never biases a well-identified amplitude.
-        let scale = (0..k).map(|j| gram[[j, j]]).fold(0.0_f64, f64::max).max(1e-300);
+        let scale = (0..k)
+            .map(|j| gram[[j, j]])
+            .fold(0.0_f64, f64::max)
+            .max(1e-300);
         for j in 0..k {
             gram[[j, j]] += 1e-12 * scale;
         }

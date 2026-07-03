@@ -323,14 +323,7 @@ fn unit_speed_active_retraction_moves_only_ard_2070() {
     // Fitted coordinates on the interval, bounded away from 0 so `|γ'| = 2t > 0`
     // and the chart is non-degenerate; unevenly spaced so `t̃ = t²`-normalized
     // genuinely re-gauges every row.
-    let coords_col = array![
-        [0.15_f64],
-        [0.30],
-        [0.42],
-        [0.58],
-        [0.71],
-        [0.88]
-    ];
+    let coords_col = array![[0.15_f64], [0.30], [0.42], [0.58], [0.71], [0.88]];
     let n = coords_col.nrows();
     let p = 1usize;
     // Decoder selects the t² monomial ⇒ γ(t) = t² (single output channel).

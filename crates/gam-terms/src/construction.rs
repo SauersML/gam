@@ -654,8 +654,7 @@ fn subspace_split_is_consistent(leakage: &SubspaceLeakageMetrics, p: usize) -> b
     let leakage_rel_tol = (p.max(1) as f64) * REL_PSD_FLOOR;
     let leakage_abs_tol = 1e-12;
     let orth_tol = 1e-10;
-    let root_leaks =
-        leakage.max_rel_sq > leakage_rel_tol && leakage.max_abs_sq > leakage_abs_tol;
+    let root_leaks = leakage.max_rel_sq > leakage_rel_tol && leakage.max_abs_sq > leakage_abs_tol;
     let split_nonorthogonal = leakage.max_cross_gram_abs > orth_tol;
     !(root_leaks || split_nonorthogonal)
 }

@@ -257,8 +257,7 @@ impl IBPAssignmentPenalty {
             // primitive as `hessian_diag_log_alpha_derivative` so the cross-row
             // off-diagonal channel of the log-det α-gradient matches the diagonal
             // exactly (one operator, one derivative).
-            let (_d_score, d_score_derivative) =
-                self.learnable_alpha_score_rho_derivs(target, rho);
+            let (_d_score, d_score_derivative) = self.learnable_alpha_score_rho_derivs(target, rho);
             for k in 0..self.k_max {
                 cross_row_d_logalpha[k] = self.weight * d_score_derivative[k];
             }
@@ -327,8 +326,7 @@ impl IBPAssignmentPenalty {
             let pi_score = -mass / pk + (n_f - mass) / one_minus - (a - 1.0) / pk;
             let psd = -1.0 / pk + (mass + a - 1.0) * pj / (pk * pk) - 1.0 / one_minus
                 + (n_f - mass) * pj / (one_minus * one_minus);
-            d_g_dm[k] =
-                (a / (denom * denom)) * (psd * (n_f + 1.0 - mass) - pi_score) - a * pj / pk;
+            d_g_dm[k] = (a / (denom * denom)) * (psd * (n_f + 1.0 - mass) - pi_score) - a * pj / pk;
         }
         for row in 0..n {
             let start = row * self.k_max;
@@ -405,9 +403,7 @@ impl IBPAssignmentPenalty {
             let d1_p = pi_p / (pk * pk) - pi_p / (one_minus * one_minus);
             let psd = -1.0 / pk + (mass + a - 1.0) * pj / (pk * pk) - 1.0 / one_minus
                 + (n_f - mass) * pj / (one_minus * one_minus);
-            let psd_p = pi_p / (pk * pk)
-                + a * pj / (pk * pk)
-                + (mass + a - 1.0) * pj_p / (pk * pk)
+            let psd_p = pi_p / (pk * pk) + a * pj / (pk * pk) + (mass + a - 1.0) * pj_p / (pk * pk)
                 - 2.0 * (mass + a - 1.0) * pj * pi_p / (pk * pk * pk)
                 - pi_p / (one_minus * one_minus)
                 + (n_f - mass) * pj_p / (one_minus * one_minus)

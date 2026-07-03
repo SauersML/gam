@@ -1027,9 +1027,7 @@ fn forbid_claude_build_rs_edits(manifest_dir: &Path) {
         .arg("--is-shallow-repository")
         .output();
     if let Ok(shallow) = shallow {
-        if shallow.status.success()
-            && String::from_utf8_lossy(&shallow.stdout).trim() == "true"
-        {
+        if shallow.status.success() && String::from_utf8_lossy(&shallow.stdout).trim() == "true" {
             return;
         }
     }

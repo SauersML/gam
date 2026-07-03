@@ -6163,15 +6163,16 @@ fn hetero_compat_term(d0: usize, d1: usize) -> SaeManifoldTerm {
     };
     let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
         Array2::<f64>::zeros((n, 2)),
-        vec![
-            Array2::<f64>::zeros((n, d0)),
-            Array2::<f64>::zeros((n, d1)),
-        ],
+        vec![Array2::<f64>::zeros((n, d0)), Array2::<f64>::zeros((n, d1))],
         vec![manifold(d0), manifold(d1)],
         AssignmentMode::softmax(1.0),
     )
     .unwrap();
-    SaeManifoldTerm::new(vec![make_atom("atom0", d0), make_atom("atom1", d1)], assignment).unwrap()
+    SaeManifoldTerm::new(
+        vec![make_atom("atom0", d0), make_atom("atom1", d1)],
+        assignment,
+    )
+    .unwrap()
 }
 
 /// #2098 (SPEC-8) — the heterogeneous-`d_atom` + row-block-penalty guard, moved

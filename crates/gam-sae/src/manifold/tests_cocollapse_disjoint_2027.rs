@@ -493,9 +493,17 @@ pub(crate) fn quotient_scale_on_does_not_detonate_healthy_k2_two_circle_2100() {
     let norms: Vec<f64> = on
         .atoms
         .iter()
-        .map(|a| a.decoder_coefficients.iter().map(|v| v * v).sum::<f64>().sqrt())
+        .map(|a| {
+            a.decoder_coefficients
+                .iter()
+                .map(|v| v * v)
+                .sum::<f64>()
+                .sqrt()
+        })
         .collect();
-    eprintln!("[#2100 repro] quotient_scale ON: EV={ev_on:.4} (OFF={ev_off:.4}), norms={norms:.4?}");
+    eprintln!(
+        "[#2100 repro] quotient_scale ON: EV={ev_on:.4} (OFF={ev_off:.4}), norms={norms:.4?}"
+    );
     assert!(
         ev_on.is_finite() && ev_on > 0.3,
         "quotient_scale ON DETONATED a healthy K=2 fit: EV={ev_on:.4e} (expected finite > 0.3, \

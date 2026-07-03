@@ -99,8 +99,8 @@ fn contains_assertion_helper(code: &str) -> bool {
     let mut i = 0usize;
     while i < n {
         // Find an ident immediately followed by `!<delim>` (macro) or `(` (call).
-        let is_macro = bytes[i] == b'!'
-            && matches!(bytes.get(i + 1), Some(b'(') | Some(b'[') | Some(b'{'));
+        let is_macro =
+            bytes[i] == b'!' && matches!(bytes.get(i + 1), Some(b'(') | Some(b'[') | Some(b'{'));
         let is_call = bytes[i] == b'(' && !(i > 0 && bytes[i - 1] == b'!');
         if !is_macro && !is_call {
             i += 1;
@@ -322,7 +322,10 @@ fn body_reaches_assertion(
 /// `#[should_panic]`.
 fn assertionless_tests(content: &str) -> Vec<(usize, String)> {
     let raw: Vec<&str> = content.lines().collect();
-    let stripped: Vec<String> = raw.iter().map(|l| strip_line_comment(l).to_string()).collect();
+    let stripped: Vec<String> = raw
+        .iter()
+        .map(|l| strip_line_comment(l).to_string())
+        .collect();
     let n = raw.len();
 
     // Index local fns so a test can delegate its assertions to a helper.
@@ -400,8 +403,8 @@ fn assertionless_tests(content: &str) -> Vec<(usize, String)> {
 #[test]
 fn gam_sae_manifold_tests_are_not_assertionless() {
     let dir = manifold_dir();
-    let entries = fs::read_dir(&dir)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
+    let entries =
+        fs::read_dir(&dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
     let mut all_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
     let mut files_scanned = 0usize;
     for entry in entries {
