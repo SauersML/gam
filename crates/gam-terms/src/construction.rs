@@ -14,6 +14,17 @@ use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
+/// Relative "numerically-PSD" floor of the symmetric eigensolver: an eigenvalue
+/// smaller than this fraction of the spectrum scale is roundoff, not genuine
+/// curvature (~`sqrt(machine ε)`; #1619). This single floor governs BOTH which
+/// eigenvalues are snapped to zero (declared null) in `classify_eigenvalues_strict`
+/// AND how much per-mode relative energy the transformed penalty root may retain
+/// in the resulting null block (`subspace_split_is_consistent`). Keeping the two
+/// tied to one constant makes the null-space definition and the leakage-consistency
+/// guard provably mutually consistent, rather than the guard demanding a precision
+/// the classifier never promised.
+const REL_PSD_FLOOR: f64 = 1.0e-8;
+
 #[derive(Clone)]
 pub enum PenaltyRepresentation {
     Dense(Array2<f64>),
@@ -394,10 +405,10 @@ fn classify_eigenvalues_strict(
     context: &str,
 ) -> Result<(), EstimationError> {
     const C_EPS_P_FACTOR: f64 = 64.0;
-    // Standard "numerically PSD" relative threshold (~sqrt(machine ε)). A negative
-    // eigenvalue smaller than this fraction of the spectrum scale is roundoff, not
-    // genuine negative curvature, and is snapped to zero rather than rejected.
-    const REL_PSD_FLOOR: f64 = 1.0e-8;
+    // `REL_PSD_FLOOR` (module-level): the relative threshold below which a
+    // (possibly slightly negative) eigenvalue is roundoff and is snapped to zero
+    // rather than rejected. Shared with the subspace-leakage guard so the null
+    // definition and the leakage tolerance stay mutually consistent.
     let p = eigenvalues.len();
 
     let mut scale = 0.0_f64;
@@ -611,6 +622,42 @@ fn assess_subspace_leakage(
         worst_penalty,
         max_cross_gram_abs,
     }
+}
+
+/// True when the penalized/null subspace split is numerically self-consistent.
+///
+/// The split has two independent invariants:
+///
+/// 1. **Orthogonality** — `Qs = [Q_p | Q_n]` must be orthonormal, so the range
+///    and null blocks share no direction (`max |Qp'Qn| ≤ orth_tol`). This is the
+///    structural correctness guarantee and is checked at machine precision.
+///
+/// 2. **Bounded root leakage** — the transformed penalty root must have
+///    negligible energy on the null columns. The admissible relative-energy
+///    leakage is DERIVED from `REL_PSD_FLOOR`, the same numerically-PSD floor
+///    that `classify_eigenvalues_strict` uses to decide which modes are null:
+///    a mode the classifier is entitled to call null can, by the symmetric
+///    eigensolver's own eigenvector accuracy on a small-gap spectrum, retain up
+///    to `REL_PSD_FLOOR` of the penalty root's relative energy in that direction.
+///    Summed over the at-most-`p` near-threshold null modes the relative leakage
+///    cannot exceed `p · REL_PSD_FLOOR` without signalling a genuine
+///    (non-numerical) inconsistency, so that is the derived tolerance — matching
+///    the `p`-scaling `classify_eigenvalues_strict` already applies to its
+///    machine floor. Demanding a leakage tighter than the very floor that
+///    defined the null space is self-contradictory: it rejects well-posed smooth
+///    manifold / Duchon / sphere penalties whose Laplace-Beltrami spectrum decays
+///    through the classification threshold with no clean rank gap (#1802), even
+///    though the downstream penalty (`E'E`) is rebuilt with an EXACTLY clean null
+///    block regardless. The absolute floor keeps a vanishing-scale penalty from
+///    tripping the relative test on pure roundoff.
+fn subspace_split_is_consistent(leakage: &SubspaceLeakageMetrics, p: usize) -> bool {
+    let leakage_rel_tol = (p.max(1) as f64) * REL_PSD_FLOOR;
+    let leakage_abs_tol = 1e-12;
+    let orth_tol = 1e-10;
+    let root_leaks =
+        leakage.max_rel_sq > leakage_rel_tol && leakage.max_abs_sq > leakage_abs_tol;
+    let split_nonorthogonal = leakage.max_cross_gram_abs > orth_tol;
+    !(root_leaks || split_nonorthogonal)
 }
 
 fn compose_qs_from_split(q_pen: &Mat<f64>, q_null: &Mat<f64>, p: usize) -> Mat<f64> {
@@ -2184,12 +2231,7 @@ pub fn stable_reparameterizationwith_invariant(
     // Guard against any accidental penalized/null mixing. The transformed penalty
     // roots must have negligible support on null columns by construction.
     let leakage = assess_subspace_leakage(&qs, &rs_transformed, structural_rank, p);
-    let leakage_rel_tol = 1e-10;
-    let leakage_abs_tol = 1e-12;
-    let orth_tol = 1e-10;
-    if leakage.max_rel_sq > leakage_rel_tol && leakage.max_abs_sq > leakage_abs_tol
-        || leakage.max_cross_gram_abs > orth_tol
-    {
+    if !subspace_split_is_consistent(&leakage, p) {
         return Err(EstimationError::LayoutError(format!(
             "Reparameterization subspace split is inconsistent: max null leakage {:.3e} (rel {:.3e}, worst penalty {}), max |Qp'Qn| {:.3e}",
             leakage.max_abs_sq.sqrt(),
@@ -2902,9 +2944,10 @@ pub fn calculate_condition_number(matrix: &Array2<f64>) -> Result<f64, FaerLinal
 #[cfg(test)]
 mod tests {
     use super::{
-        CanonicalPenalty, SubspaceLeakageMetrics, assess_subspace_leakage,
+        CanonicalPenalty, REL_PSD_FLOOR, SubspaceLeakageMetrics, assess_subspace_leakage,
         classify_eigenvalues_strict, precompute_reparam_invariant_from_canonical,
         report_penalty_pair_redundancy, stable_reparameterizationwith_invariant,
+        subspace_split_is_consistent,
     };
     use crate::EstimationError;
     use crate::construction::kronecker_product;
@@ -2980,6 +3023,78 @@ mod tests {
 
         let m = metrics_for(&qs, &[r0], structural_rank, p);
         assert!(m.max_cross_gram_abs > 1e-3);
+    }
+
+    #[test]
+    fn subspace_split_admits_near_threshold_manifold_leakage_1802() {
+        // #1802: on sphere / Duchon / spline-on-sphere bases the REML outer
+        // startup rejected EVERY candidate seed with
+        //   "Reparameterization subspace split is inconsistent:
+        //    max null leakage 1.174e-4 (rel 1.031e-4, worst penalty 0),
+        //    max |Qp'Qn| 4.316e-16"
+        // The split is perfectly ORTHOGONAL (|Qp'Qn| ≈ 4e-16); the only tripped
+        // quantity is the transformed-root null-block leakage, whose RELATIVE
+        // energy (1.031e-4)² ≈ 1.06e-8 sits right at `REL_PSD_FLOOR`. That is the
+        // eigensolver's own numerically-PSD floor — the same floor
+        // `classify_eigenvalues_strict` uses to declare a mode null — so a
+        // manifold penalty whose Laplace-Beltrami spectrum decays through the
+        // rank threshold with no clean gap MUST be admitted. Reproduce that exact
+        // signature and assert the guard accepts it.
+        let p = 40usize;
+        let structural_rank = p - 1;
+        // Unit-amplitude range column + a null column at √(REL_PSD_FLOOR)
+        // amplitude, so the null-block relative energy lands at ~REL_PSD_FLOOR.
+        let null_amp = (1.06e-8_f64).sqrt();
+        let mut rs = Mat::<f64>::zeros(1, p);
+        rs[(0, 0)] = 1.0;
+        rs[(0, p - 1)] = null_amp;
+        let qs = Mat::<f64>::identity(p, p);
+        let leakage = metrics_for(&qs, &[rs], structural_rank, p);
+        // The leakage reproduces the observed band: above the OLD fixed 1e-10
+        // tolerance (which rejected the sphere fit) yet a benign ~REL_PSD_FLOOR.
+        assert!(
+            leakage.max_rel_sq > 1e-10 && leakage.max_rel_sq < 1e-6,
+            "reproduced leakage should sit in the near-REL_PSD_FLOOR band, got {:.3e}",
+            leakage.max_rel_sq
+        );
+        assert!(leakage.max_cross_gram_abs <= 1e-12);
+        assert!(
+            subspace_split_is_consistent(&leakage, p),
+            "near-REL_PSD_FLOOR null leakage on a manifold basis must be admitted \
+             (rel_sq={:.3e}, tol={:.3e})",
+            leakage.max_rel_sq,
+            (p as f64) * REL_PSD_FLOOR,
+        );
+    }
+
+    #[test]
+    fn subspace_split_still_rejects_genuine_inconsistency_1802() {
+        // The #1802 relaxation only widens the leakage tolerance to the
+        // classifier's own `p · REL_PSD_FLOOR` floor; it must NOT admit a
+        // genuinely broken split. A whole penalized mode dumped into the null
+        // block (O(1) relative leakage) is still rejected.
+        let p = 40usize;
+        let structural_rank = p - 1;
+        let mut rs = Mat::<f64>::zeros(1, p);
+        rs[(0, p - 1)] = 1.0; // all penalty-root energy in the null column
+        let qs = Mat::<f64>::identity(p, p);
+        let leakage = metrics_for(&qs, &[rs], structural_rank, p);
+        assert!(leakage.max_rel_sq > 0.99);
+        assert!(
+            !subspace_split_is_consistent(&leakage, p),
+            "an O(1) null-block leakage is a real inconsistency and must be rejected"
+        );
+
+        // A non-orthogonal split is rejected regardless of root leakage.
+        let mut qs_bad = Mat::<f64>::identity(3, 3);
+        qs_bad[(0, 1)] = 0.2;
+        let clean = Mat::<f64>::zeros(1, 3);
+        let leakage2 = metrics_for(&qs_bad, &[clean], 1, 3);
+        assert!(leakage2.max_cross_gram_abs > 1e-3);
+        assert!(
+            !subspace_split_is_consistent(&leakage2, 3),
+            "a non-orthogonal Qp/Qn split must be rejected"
+        );
     }
 
     #[test]
