@@ -3099,8 +3099,8 @@ where
         edf_total,
         smoothing_correction,
         penalized_hessian: penalized_hessian.into(),
-        working_weights: pirls_res.solveweights.clone(),
-        working_response: pirls_res.solveworking_response.clone(),
+        working_weights: pirls_res.solveweights.to_owned(),
+        working_response: pirls_res.solveworking_response.to_owned(),
         reparam_qs: Some(pirls_res.reparam_result.qs.clone()),
         dispersion,
         beta_covariance,
@@ -3179,7 +3179,7 @@ where
     };
     let log_likelihood = crate::pirls::calculate_loglikelihood(
         y_o.view(),
-        &pirls_res.finalmu,
+        &pirls_res.finalmu.to_owned(),
         &reported_likelihood,
         w_o.view(),
     );

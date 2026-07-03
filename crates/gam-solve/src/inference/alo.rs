@@ -556,14 +556,20 @@ fn compute_alo_diagnostics_from_pirls_inner(
         .map(|f| f as &AloScalarScoreCurvature);
 
     // Build model-agnostic AloInput from PIRLS geometry, then delegate.
+    // #1868: the PIRLS row fields are now shared `ArcArray1`; `AloInput` borrows
+    // `&Array1`, so materialise owned copies for this cold post-fit inference
+    // path (ALO runs once after the fit, not per κ trial).
+    let alo_working_response = base.solveworking_response.to_owned();
+    let alo_final_eta = base.final_eta.to_owned();
+    let alo_final_offset = base.final_offset.to_owned();
     let input = AloInput {
         design: x_dense,
         penalized_hessian: &h_dense_for_alo,
         hessian_weights: base.final_weights_signed(),
         score_weights: base.solve_weights_psd(),
-        working_response: &base.solveworking_response,
-        eta: &base.final_eta,
-        offset: &base.final_offset,
+        working_response: &alo_working_response,
+        eta: &alo_final_eta,
+        offset: &alo_final_offset,
         link,
         phi,
         penalty_root: if e.nrows() > 0 { Some(e) } else { None },

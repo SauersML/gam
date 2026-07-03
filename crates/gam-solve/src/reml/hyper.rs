@@ -1323,8 +1323,13 @@ impl<'a> RemlState<'a> {
         // Working residual u = w ⊙ (z − η̂).
         let u = &pirls_result.solveweights
             * &(&pirls_result.solveworking_response - &pirls_result.final_eta);
-        let w_diag = &pirls_result.finalweights;
-        let c_array = &pirls_result.solve_c_array;
+        // #1868: the tau-drift / implicit-derivative Hessian builders below take
+        // `&Array1<f64>`; the row fields are now shared `ArcArray1`, so own a copy
+        // here (temporary-lifetime-extended to this scope). Cold on the n-free
+        // Gaussian κ lane, which suppresses the outer Hessian and never enters
+        // this drift-operator assembly.
+        let w_diag = &pirls_result.finalweights.to_owned();
+        let c_array = &pirls_result.solve_c_array.to_owned();
 
         // Whether third-derivative corrections are needed (non-Gaussian).
         let is_gaussian_identity = matches!(self.config.link_function(), LinkFunction::Identity);
@@ -1408,7 +1413,7 @@ impl<'a> RemlState<'a> {
                     Some(Self::build_firth_dense_operator_for_link(
                         &jeffreys_link,
                         x_dense,
-                        &pirls_result.final_eta,
+                        &pirls_result.final_eta.to_owned(),
                         self.weights,
                     )?)
                 }
@@ -1416,7 +1421,7 @@ impl<'a> RemlState<'a> {
                 Some(Self::build_firth_dense_operator_for_link(
                     &jeffreys_link,
                     x_dense,
-                    &pirls_result.final_eta,
+                    &pirls_result.final_eta.to_owned(),
                     self.weights,
                 )?)
             }
@@ -1424,7 +1429,7 @@ impl<'a> RemlState<'a> {
             None
         };
         let w_diag_shared: Option<std::sync::Arc<Array1<f64>>> = if use_implicit {
-            Some(std::sync::Arc::new(w_diag.clone()))
+            Some(std::sync::Arc::new(w_diag.to_owned()))
         } else {
             None
         };
@@ -2007,7 +2012,7 @@ impl<'a> RemlState<'a> {
                     Self::build_firth_dense_operator_for_link(
                         &jeffreys_link,
                         x_dense,
-                        &pirls_result.final_eta,
+                        &pirls_result.final_eta.to_owned(),
                         self.weights,
                     )?
                 }
@@ -2015,7 +2020,7 @@ impl<'a> RemlState<'a> {
                 Self::build_firth_dense_operator_for_link(
                     &jeffreys_link,
                     x_dense,
-                    &pirls_result.final_eta,
+                    &pirls_result.final_eta.to_owned(),
                     self.weights,
                 )?
             };
@@ -2028,8 +2033,8 @@ impl<'a> RemlState<'a> {
             x_design,
             beta_eval,
             x_tau_dense_list,
-            pirls_result.solve_c_array.clone(),
-            pirls_result.solve_d_array.clone(),
+            pirls_result.solve_c_array.to_owned(),
+            pirls_result.solve_d_array.to_owned(),
             firth_op,
         ))
     }
@@ -2081,7 +2086,7 @@ impl<'a> RemlState<'a> {
 
         let u = &pirls_result.solveweights
             * &(&pirls_result.solveworking_response - &pirls_result.final_eta);
-        let w_diag = gam_linalg::matrix::SignedWeightsArc::from_array(pirls_result.finalweights.clone());
+        let w_diag = gam_linalg::matrix::SignedWeightsArc::from_array(pirls_result.finalweights.to_owned());
         let x_design = self.x().clone();
 
         let is_gaussian_identity = matches!(self.config.link_function(), LinkFunction::Identity);
@@ -2099,7 +2104,7 @@ impl<'a> RemlState<'a> {
                 Some(Self::build_firth_dense_operator_for_link(
                     &jeffreys_link,
                     x_dense_arc.as_ref(),
-                    &pirls_result.final_eta,
+                    &pirls_result.final_eta.to_owned(),
                     self.weights,
                 )?)
             }
@@ -2401,7 +2406,7 @@ impl<'a> RemlState<'a> {
                 None
             } else {
                 Some(directional_curvature_weights(
-                    &pirls_result.solve_c_array,
+                    &pirls_result.solve_c_array.to_owned(),
                     w_diag.as_ref(),
                     &x_tau_beta_j,
                 ))
@@ -2466,7 +2471,7 @@ impl<'a> RemlState<'a> {
                 Self::build_firth_dense_operator_for_link(
                     &jeffreys_link,
                     x_dense_arc.as_ref(),
-                    &pirls_result.final_eta,
+                    &pirls_result.final_eta.to_owned(),
                     self.weights,
                 )?
             };
@@ -2479,8 +2484,8 @@ impl<'a> RemlState<'a> {
             self.x().clone(),
             beta_eval,
             x_tau_dense_list,
-            pirls_result.solve_c_array.clone(),
-            pirls_result.solve_d_array.clone(),
+            pirls_result.solve_c_array.to_owned(),
+            pirls_result.solve_d_array.to_owned(),
             firth_op,
         ))
     }
@@ -2572,9 +2577,9 @@ impl<'a> RemlState<'a> {
 
         let u = &pirls_result.solveweights
             * &(&pirls_result.solveworking_response - &pirls_result.final_eta);
-        let w_diag = pirls_result.finalweights.clone();
-        let c_array = pirls_result.solve_c_array.clone();
-        let d_array = pirls_result.solve_d_array.clone();
+        let w_diag = pirls_result.finalweights.to_owned();
+        let c_array = pirls_result.solve_c_array.to_owned();
+        let d_array = pirls_result.solve_d_array.to_owned();
         let is_gaussian_identity = matches!(self.config.link_function(), LinkFunction::Identity);
 
         let s_tau_tau = std::sync::Arc::new(s_tau_tau);
@@ -2614,7 +2619,7 @@ impl<'a> RemlState<'a> {
                         Self::build_firth_dense_operator_for_link(
                             &jeffreys_link,
                             x_dense_arc.as_ref(),
-                            &pirls_result.final_eta,
+                            &pirls_result.final_eta.to_owned(),
                             self.weights,
                         )?,
                     ))
@@ -2825,9 +2830,9 @@ impl<'a> RemlState<'a> {
         // Working residual u = w ⊙ (z − η̂).
         let u = &pirls_result.solveweights
             * &(&pirls_result.solveworking_response - &pirls_result.final_eta);
-        let w_diag = pirls_result.finalweights.clone();
-        let c_array = pirls_result.solve_c_array.clone();
-        let d_array = pirls_result.solve_d_array.clone();
+        let w_diag = pirls_result.finalweights.to_owned();
+        let c_array = pirls_result.solve_c_array.to_owned();
+        let d_array = pirls_result.solve_d_array.to_owned();
         let is_gaussian_identity = matches!(self.config.link_function(), LinkFunction::Identity);
 
         // Capture into Arc for shared ownership in closures.

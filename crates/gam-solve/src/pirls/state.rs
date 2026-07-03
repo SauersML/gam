@@ -6,7 +6,7 @@ use gam_linalg::matrix::{
 use crate::active_set::ConstraintKktDiagnostics;
 use gam_problem::{Coefficients, GlmLikelihoodSpec, InverseLink, LinearPredictor, RidgePassport};
 use gam_problem::LinearInequalityConstraints;
-use ndarray::{Array1, Array2, ArrayView1};
+use ndarray::{ArcArray1, Array1, Array2, ArrayView1};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -378,31 +378,40 @@ pub struct PirlsResult {
     // due to a fallback. Exact label of what these represent is in
     // `exported_laplace_curvature`; do not infer the kind from `hessian_curvature`
     // (which records what the inner loop's last accepted step happened to use).
-    pub finalweights: Array1<f64>,
+    // #1868: the length-`n` row fields are `ArcArray1` (reference-counted
+    // ndarray, O(1) clone) so the n-free κ-trial skip path can SHARE the
+    // once-built frozen row bundle across every trial instead of
+    // re-materialising these placeholders per callback. On the exact path they
+    // are built owned and moved into the shared representation via
+    // `.into_shared()` (O(1) — no element copy). `ArcArray1` is an `ArrayBase`,
+    // so reads (indexing, iteration, `.dot`, `&a - &b`, `.len`, `.view`) work
+    // unchanged; only sites needing an owned `Array1`/`&Array1` take
+    // `.to_owned()`/`.view()`.
+    pub finalweights: ArcArray1<f64>,
     // Additional PIRLS state captured at the accepted step to support
     // cost/gradient consistency in the outer optimization
-    pub final_offset: Array1<f64>,
-    pub final_eta: Array1<f64>,
-    pub finalmu: Array1<f64>,
+    pub final_offset: ArcArray1<f64>,
+    pub final_eta: ArcArray1<f64>,
+    pub finalmu: ArcArray1<f64>,
     /// Score-side Fisher weights used in `X'W(z-eta) - S beta`.
-    pub solveweights: Array1<f64>,
-    pub solveworking_response: Array1<f64>,
-    pub solvemu: Array1<f64>,
-    pub solve_dmu_deta: Array1<f64>,
-    pub solve_d2mu_deta2: Array1<f64>,
-    pub solve_d3mu_deta3: Array1<f64>,
+    pub solveweights: ArcArray1<f64>,
+    pub solveworking_response: ArcArray1<f64>,
+    pub solvemu: ArcArray1<f64>,
+    pub solve_dmu_deta: ArcArray1<f64>,
+    pub solve_d2mu_deta2: ArcArray1<f64>,
+    pub solve_d3mu_deta3: ArcArray1<f64>,
     /// First eta-derivative of the diagonal Hessian curvature W_H(eta):
     /// c_i := dW_i/deta_i at the accepted PIRLS solution.
     ///
     /// This carries 3rd-order likelihood information used in exact dH/dρ
     /// terms for outer LAML derivatives.
-    pub solve_c_array: Array1<f64>,
+    pub solve_c_array: ArcArray1<f64>,
     /// Second eta-derivative of the diagonal Hessian curvature W_H(eta):
     /// d_i := d²W_i/deta_i² at the accepted PIRLS solution.
     ///
     /// This carries 4th-order likelihood information used in exact d²H/dρ²
     /// terms for the outer LAML Hessian.
-    pub solve_d_array: Array1<f64>,
+    pub solve_d_array: ArcArray1<f64>,
     /// True when `solve_c_array` / `solve_d_array` are placeholders rather
     /// than supported likelihood derivatives.
     pub derivatives_unsupported: bool,
@@ -495,7 +504,7 @@ impl PirlsResult {
     /// `linalg/matrix.rs` is construction-enforced.
     #[inline]
     pub fn final_weights_signed(&self) -> SignedWeightsView<'_> {
-        SignedWeightsView::from_array(&self.finalweights)
+        SignedWeightsView::new(self.finalweights.view())
     }
 
     /// Typed view of the score-side Fisher weights `W_F = h'²/(φ V(μ)) ≥ 0`
@@ -533,16 +542,16 @@ impl PirlsResult {
             edf: self.edf,
             stable_penalty_term: self.stable_penalty_term,
             firth: self.firth.clone(),
-            finalweights: Array1::zeros(0),
-            final_offset: Array1::zeros(0),
+            finalweights: ArcArray1::zeros(0),
+            final_offset: ArcArray1::zeros(0),
             final_eta: self.final_eta.clone(),
-            finalmu: Array1::zeros(0),
+            finalmu: ArcArray1::zeros(0),
             solveweights: self.solveweights.clone(),
             solveworking_response: self.solveworking_response.clone(),
             solvemu: self.solvemu.clone(),
-            solve_dmu_deta: Array1::zeros(0),
-            solve_d2mu_deta2: Array1::zeros(0),
-            solve_d3mu_deta3: Array1::zeros(0),
+            solve_dmu_deta: ArcArray1::zeros(0),
+            solve_d2mu_deta2: ArcArray1::zeros(0),
+            solve_d3mu_deta3: ArcArray1::zeros(0),
             solve_c_array: self.solve_c_array.clone(),
             solve_d_array: self.solve_d_array.clone(),
             derivatives_unsupported: self.derivatives_unsupported,
@@ -582,30 +591,38 @@ impl PirlsResult {
             return Ok(self.clone());
         }
 
+        // #1868: cold LRU rehydration path — materialise the compacted rows from
+        // the frozen link/derivatives and re-wrap into the shared `ArcArray1`
+        // fields (`.into()`, O(1) once owned).
+        let final_eta_owned = self.final_eta.to_owned();
         let (score_c_array, score_d_array, solve_dmu_deta, solve_d2mu_deta2, solve_d3mu_deta3) =
             computeworkingweight_derivatives_from_eta(
                 &self.likelihood,
                 inverse_link,
-                &self.final_eta,
+                &final_eta_owned,
                 priorweights,
             )?;
-        let (finalweights, solve_c_array, solve_d_array) =
-            if self.hessian_curvature == HessianCurvatureKind::Observed {
-                compute_observed_hessian_curvature_arrays(
-                    &self.likelihood,
-                    inverse_link,
-                    &self.final_eta,
-                    y,
-                    &self.solveweights,
-                    priorweights,
-                )?
-            } else {
-                (
-                    self.solveweights.clone(),
-                    score_c_array.clone(),
-                    score_d_array.clone(),
-                )
-            };
+        let (finalweights, solve_c_array, solve_d_array): (
+            ArcArray1<f64>,
+            ArcArray1<f64>,
+            ArcArray1<f64>,
+        ) = if self.hessian_curvature == HessianCurvatureKind::Observed {
+            let (fw, sc, sd) = compute_observed_hessian_curvature_arrays(
+                &self.likelihood,
+                inverse_link,
+                &final_eta_owned,
+                y,
+                &self.solveweights.to_owned(),
+                priorweights,
+            )?;
+            (fw.into(), sc.into(), sd.into())
+        } else {
+            (
+                self.solveweights.clone(),
+                score_c_array.clone().into(),
+                score_d_array.clone().into(),
+            )
+        };
         // Lazy rehydration: wrap in ReparamOperator instead of materializing X·Qs.
         let qs_arc = Arc::new(self.reparam_result.qs.clone());
         Ok(Self {
@@ -621,15 +638,15 @@ impl PirlsResult {
             stable_penalty_term: self.stable_penalty_term,
             firth: self.firth.clone(),
             finalweights,
-            final_offset: offset.to_owned(),
+            final_offset: offset.to_owned().into(),
             final_eta: self.final_eta.clone(),
             finalmu: self.solvemu.clone(),
             solveweights: self.solveweights.clone(),
             solveworking_response: self.solveworking_response.clone(),
             solvemu: self.solvemu.clone(),
-            solve_dmu_deta,
-            solve_d2mu_deta2,
-            solve_d3mu_deta3,
+            solve_dmu_deta: solve_dmu_deta.into(),
+            solve_d2mu_deta2: solve_d2mu_deta2.into(),
+            solve_d3mu_deta3: solve_d3mu_deta3.into(),
             solve_c_array,
             solve_d_array,
             derivatives_unsupported: self.derivatives_unsupported,
