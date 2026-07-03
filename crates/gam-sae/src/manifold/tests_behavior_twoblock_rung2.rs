@@ -112,7 +112,7 @@ fn two_block_joint_fit_reconstructs_activation_and_behavior() {
         }
     }
 
-    let block = BehaviorBlock::fit(probs.view(), p_x, 0.0).unwrap();
+    let block = BehaviorBlock::fit(probs.view(), p_x, -4.0).unwrap();
     let p_y = block.behavior_dim();
     assert_eq!(p_y, vocab - 1);
     let p_tot = p_x + p_y;
