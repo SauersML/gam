@@ -6979,3 +6979,150 @@ fn survival_ls_scale_aware_location_block_trust_metric_floor_caps_starvation_156
         "floor must not loosen the dominant location-coordinate metric"
     );
 }
+
+/// Regression for gam#2112: the reduced constant-scale parametric-AFT MLE must
+/// CONVERGE on benign fully-observed lognormal data and recover the closed-form
+/// lognormal MLE, `μ̂ = mean(log t)` and `σ̂ = sd(log t)` (population/MLE `1/n`
+/// variance).
+///
+/// Before the fix, `fit_parametric_aft_direct_mle` certified stationarity with
+/// an ABSOLUTE tolerance on the sup-norm of the SUMMED log-likelihood gradient
+/// `g = ∇ℓ`, floored at `REDUCED_AFT_*_TOL_FLOOR = 1e-8`. Because `g` is a sum
+/// over the `n` rows, its attainable round-off floor at the true MLE grows like
+/// `n·ε`, so for `n ≳ 1000` that floor exceeds the fixed tolerance and the loop
+/// runs all `max_iter` iterations and hard-errors "failed to converge" on data
+/// whose MLE is closed-form. Empirically, on this `n = 2000` sample the summed
+/// gradient plateaus at a sup-norm of `≈ 2.3e-7` at the numerical optimum (where
+/// the half-Newton-decrement `½·gᵀH⁻¹g ≈ 1e-17`, i.e. machine-zero suboptimality
+/// and `μ̂/σ̂` recovered to `~1e-6`). With `tol = 1e-8` the OLD gate demanded
+/// `|g|_∞ ≤ 1e-8`, which that `2.3e-7` floor can NEVER reach → a spurious
+/// 200-iteration hard error. The fix stops on the affine-invariant, sample-size-
+/// invariant Newton decrement instead, so this converges. A `tol = 1e-8` here is
+/// therefore exactly the pre-fix failing regime and gives the test teeth.
+#[test]
+fn reduced_parametric_aft_converges_and_recovers_lognormal_mle_2112() {
+    // Deterministic lognormal sample: log t ~ N(mu0, sigma0), all fully observed.
+    let n = 2000usize;
+    let mu0 = 1.5_f64;
+    let sigma0 = 0.7_f64;
+    // Seeded LCG + Box-Muller: reproducible standard normals, no RNG dependency.
+    let mut state: u64 = 0x2112_2112_dead_beef;
+    let mut next_u = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((state >> 11) as f64) / ((1u64 << 53) as f64)
+    };
+    let mut z = Vec::with_capacity(n);
+    while z.len() < n {
+        let u1 = next_u().max(1e-300);
+        let u2 = next_u();
+        let r = (-2.0 * u1.ln()).sqrt();
+        z.push(r * (std::f64::consts::TAU * u2).cos());
+        z.push(r * (std::f64::consts::TAU * u2).sin());
+    }
+    z.truncate(n);
+    let logt: Vec<f64> = z.iter().map(|zi| mu0 + sigma0 * zi).collect();
+    let age_exit = Array1::from_iter(logt.iter().map(|l| l.exp()));
+    // Left-truncation entry ~1e-4·t is far below the mass (~9σ), so S(entry) ≈ 1
+    // and the fit is the standard uncensored lognormal MLE.
+    let age_entry = Array1::from_iter(age_exit.iter().map(|t| t * 1e-4));
+    let event_target = Array1::ones(n);
+    let weights = Array1::ones(n);
+
+    // Closed-form lognormal MLE (all events, negligible truncation).
+    let mean_logt = logt.iter().sum::<f64>() / n as f64;
+    let var_logt = logt.iter().map(|l| (l - mean_logt).powi(2)).sum::<f64>() / n as f64;
+    let sd_logt = var_logt.sqrt();
+
+    // Time block: 2 columns with a diag(0, 1) penalty whose 1-D null space is the
+    // leading (log-t) column. Under constant scale the block reduces to the pinned
+    // unit-log-t warp with zero free columns, so the fit routes through the reduced
+    // parametric-AFT direct MLE (the code path fixed for gam#2112).
+    let mut design_entry = Array2::<f64>::zeros((n, 2));
+    let mut design_exit = Array2::<f64>::zeros((n, 2));
+    let mut design_deriv = Array2::<f64>::zeros((n, 2));
+    for i in 0..n {
+        design_entry[[i, 0]] = age_entry[i].ln();
+        design_exit[[i, 0]] = age_exit[i].ln();
+        design_deriv[[i, 0]] = 1.0 / age_exit[i];
+    }
+    let penalty = array![[0.0, 0.0], [0.0, 1.0]];
+
+    let spec = SurvivalLocationScaleSpec {
+        age_entry,
+        age_exit,
+        event_target,
+        weights,
+        inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
+        derivative_guard: DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
+        max_iter: 200,
+        // 1e-8 == REDUCED_AFT_OBJ_TOL_FLOOR: the pre-fix failing regime (see doc).
+        tol: 1e-8,
+        time_block: TimeBlockInput {
+            design_entry: DesignMatrix::from(design_entry),
+            design_exit: DesignMatrix::from(design_exit),
+            design_derivative_exit: DesignMatrix::from(design_deriv),
+            offset_entry: Array1::zeros(n),
+            offset_exit: Array1::zeros(n),
+            derivative_offset_exit: Array1::from_elem(
+                n,
+                DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
+            ),
+            time_monotonicity: TimeBlockMonotonicity::EnforcedByCoordinateCone,
+            penalties: vec![penalty],
+            nullspace_dims: vec![],
+            initial_log_lambdas: None,
+            initial_beta: None,
+        },
+        threshold_block: CovariateBlockKind::Static(ParameterBlockInput {
+            design: DesignMatrix::from(Array2::ones((n, 1))),
+            offset: Array1::zeros(n),
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: None,
+            initial_beta: None,
+        }),
+        log_sigma_block: CovariateBlockKind::Static(ParameterBlockInput {
+            design: DesignMatrix::from(Array2::ones((n, 1))),
+            offset: Array1::zeros(n),
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: None,
+            initial_beta: None,
+        }),
+        timewiggle_block: None,
+        linkwiggle_block: None,
+        cache_session: None,
+        cache_mirror_sessions: Vec::new(),
+    };
+
+    // The fit must take the reduced parametric-AFT route (the fixed code path);
+    // otherwise this would not exercise gam#2112 at all.
+    let prepared = prepare_survival_location_scale_model(&spec).expect("prepare succeeds");
+    assert!(
+        prepared.is_reduced_parametric_aft(),
+        "test must exercise the reduced parametric-AFT direct MLE (the gam#2112 code path)"
+    );
+
+    // The crux of gam#2112: on benign fully-observed lognormal data at n=2000 the
+    // fit must CONVERGE (pre-fix it hard-errored after 200 Newton iterations).
+    let (fit, _geo) = fit_survival_location_scale_with_geometry(spec)
+        .expect("reduced parametric-AFT MLE must converge on benign lognormal data (gam#2112)");
+    assert!(
+        fit.outer_converged,
+        "reduced parametric-AFT fit must report convergence (gam#2112)"
+    );
+
+    // Closed-form MLE recovery: μ̂ = mean(log t), σ̂ = sd(log t).
+    let mu_hat = fit.beta_threshold()[0];
+    let sigma_hat = fit.beta_log_sigma()[0].exp();
+    assert!(
+        (mu_hat - mean_logt).abs() < 1e-4,
+        "location MLE μ̂={mu_hat} must match closed-form mean(log t)={mean_logt}"
+    );
+    assert!(
+        (sigma_hat - sd_logt).abs() < 1e-4,
+        "scale MLE σ̂={sigma_hat} must match closed-form sd(log t)={sd_logt}"
+    );
+}
