@@ -1011,6 +1011,29 @@ fn forbid_build_rs_self_tampering(manifest_dir: &Path) {
 /// author; `Co-Authored-By` alone is intentionally not enough because git log
 /// `%an` returns the primary author of the commit.
 fn forbid_claude_build_rs_edits(manifest_dir: &Path) {
+    // A shallow or partial clone (e.g. a CI / wheel-build fetch made with
+    // `--depth`) does not contain the commit that actually last modified
+    // build.rs, so the `git log -- build.rs` audit below cannot see it and git
+    // instead reports the shallow-boundary tip commit's author — a false
+    // positive that blocks the build whenever that tip happens to be a
+    // Claude-authored commit to some *other* file. Authoring of build.rs never
+    // happens inside a shallow, checkout-only build clone, so the guard is
+    // inapplicable there and is skipped. Full working clones — the only place a
+    // build.rs commit is actually authored — still enforce it below.
+    let shallow = Command::new("git")
+        .arg("-C")
+        .arg(manifest_dir)
+        .arg("rev-parse")
+        .arg("--is-shallow-repository")
+        .output();
+    if let Ok(shallow) = shallow {
+        if shallow.status.success()
+            && String::from_utf8_lossy(&shallow.stdout).trim() == "true"
+        {
+            return;
+        }
+    }
+
     let output = Command::new("git")
         .arg("-C")
         .arg(manifest_dir)
