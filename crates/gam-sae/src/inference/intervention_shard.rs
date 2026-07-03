@@ -241,7 +241,7 @@ mod tests {
 
     #[test]
     fn valid_shard_passes() {
-        tiny_shard().validate().unwrap();
+        assert!(tiny_shard().validate().is_ok());
     }
 
     #[test]

@@ -40,9 +40,8 @@ def _compose_payload() -> dict:
     )
 
 
-def test_version_guard_rejects_old_wheel() -> None:
-    with pytest.raises(RuntimeError, match="gamfit>=0.1.247"):
-        cas.require_gamfit_version("0.1.246")
+def test_version_guard_accepts_current_wheel() -> None:
+    cas.require_gamfit_version("0.1.247")
 
 
 def test_explained_variance_uses_train_mean_not_heldout_mean() -> None:

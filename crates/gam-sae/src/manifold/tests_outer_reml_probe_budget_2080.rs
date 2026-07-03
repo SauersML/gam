@@ -255,10 +255,8 @@ fn n_params_for(k: usize) -> usize {
 }
 
 /// #2080 — heavier K=3 wide-`p` variant (the issue's headline shape). Same
-/// bounded-probe-budget contract; `#[ignore]` because the wider inner solve is
-/// several seconds under the shared RAM-tight build gate.
+/// bounded-probe-budget contract.
 #[test]
-#[ignore = "heavy K=3 wide-p variant; run explicitly to exercise the headline #2080 shape"]
 fn wide_p_outer_reml_terminates_k3_heavy_2080() {
     let (ev, telemetry) = run_wide_outer_fit(96, 96, 3, 2);
     eprintln!(
