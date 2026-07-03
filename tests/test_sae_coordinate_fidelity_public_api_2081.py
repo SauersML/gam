@@ -70,6 +70,19 @@ def _certificates() -> dict:
     }
 
 
+def _trust_atom() -> dict:
+    return {
+        "trust_score": 1.0,
+        "sigma_min_tangent": 1.0,
+        "sigma_max_tangent": 1.0,
+        "tangent_condition_score": 1.0,
+        "coverage": 1.0,
+        "activation_frequency": 1.0,
+        "untyped": False,
+        "active_token_count": 4,
+    }
+
+
 def _model() -> ManifoldSAE:
     n, p = 4, 2
     fitted = np.zeros((n, p))
@@ -127,7 +140,7 @@ def _model() -> ManifoldSAE:
         training_data=np.zeros((n, p)),
         low_level=low,
         low_level_logits=logits,
-        diagnostics={"atom_trust": [1.0, 1.0], "atoms": []},
+        diagnostics={"atom_trust": [1.0, 1.0], "atoms": [_trust_atom(), _trust_atom()]},
         _basis_kinds=["periodic", "periodic"],
         _atom_dims=[1, 1],
         _basis_sizes=[3, 3],
