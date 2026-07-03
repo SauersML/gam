@@ -99,8 +99,9 @@ fn two_circle_periodic_term(
     let n = z.nrows();
     let p = z.ncols();
     let dim = 1usize;
+    let num_basis = 1 + 2 * harmonics;
     let evaluator: Arc<dyn SaeBasisSecondJet> =
-        Arc::new(PeriodicHarmonicEvaluator::new(harmonics).unwrap());
+        Arc::new(PeriodicHarmonicEvaluator::new(num_basis).unwrap());
     let basis_kinds = vec![SaeAtomBasisKind::Periodic; k];
     let atom_dims = vec![dim; k];
     let seed_coords = sae_pca_seed_initial_coords(z, &basis_kinds, &atom_dims).unwrap();
