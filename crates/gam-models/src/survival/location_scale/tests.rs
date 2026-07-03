@@ -7126,3 +7126,220 @@ fn reduced_parametric_aft_converges_and_recovers_lognormal_mle_2112() {
         "scale MLE σ̂={sigma_hat} must match closed-form sd(log t)={sd_logt}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// gam#2112: the reduced parametric-AFT (constant-scale location-scale survival)
+// direct Newton MLE must certify stationarity with a SCALE-INVARIANT criterion
+// (the Newton decrement ½·gᵀH⁻¹g), not an absolute tolerance on the SUMMED
+// log-likelihood gradient — whose attainable floor grows like n·ε, so an
+// absolute tolerance spuriously fails to converge on benign data as n (or the
+// total weight) grows. These tests drive the real reduced-AFT path
+// (`prepare_survival_location_scale_model` → `is_reduced_parametric_aft` →
+// `fit_reduced_parametric_aft` → `fit_parametric_aft_direct_mle`).
+// ---------------------------------------------------------------------------
+
+/// Deterministic lognormal AFT sample: `log t ~ Normal(mu, sigma)`, fully
+/// observed. Returns `(age_exit, event, log_t)`.
+fn reduced_aft_lognormal_sample(n: usize, mu: f64, sigma: f64, seed: u64) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
+    let mut state = seed;
+    let next_u01 = |state: &mut u64| -> f64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((*state >> 11) as f64) / ((1u64 << 53) as f64)
+    };
+    let mut log_t = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let u1 = next_u01(&mut state).max(1e-12);
+        let u2 = next_u01(&mut state);
+        let z = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
+        log_t[i] = mu + sigma * z;
+    }
+    let age_exit = log_t.mapv(f64::exp);
+    let event = Array1::<f64>::ones(n);
+    (age_exit, event, log_t)
+}
+
+/// Build a constant-scale lognormal-AFT `SurvivalLocationScaleSpec` from event
+/// times: a monotone I-spline-like time basis over `log t` (rank-1 penalty null
+/// space → the reduced log-t warp), an intercept location and constant log-σ
+/// (both unpenalized). `weights` scales every row's likelihood contribution.
+fn reduced_aft_lognormal_spec(
+    age_exit: &Array1<f64>,
+    event: &Array1<f64>,
+    weight: f64,
+) -> SurvivalLocationScaleSpec {
+    let n = age_exit.len();
+    let p_time = 6usize;
+    let age_entry = Array1::from_elem(n, 1e-9_f64);
+    let log_t: Vec<f64> = age_exit.iter().map(|&t| t.max(1e-12).ln()).collect();
+    let lo = log_t.iter().cloned().fold(f64::INFINITY, f64::min);
+    let hi = log_t.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let span = (hi - lo).max(1e-6);
+    // Monotone I-spline-like value / derivative rows over log t.
+    let mut design_exit = Array2::<f64>::zeros((n, p_time));
+    let mut design_derivative_exit = Array2::<f64>::zeros((n, p_time));
+    for i in 0..n {
+        let lt = log_t[i];
+        for j in 0..p_time {
+            let center = lo + span * (j as f64 + 0.5) / (p_time as f64);
+            let x = 6.0 / span * (lt - center);
+            let sigmoid = 1.0 / (1.0 + (-x).exp());
+            design_exit[[i, j]] = sigmoid;
+            // d/dt = d/d(log t) * d(log t)/dt = sigmoid'(x)*(6/span) * (1/t).
+            let dsig = sigmoid * (1.0 - sigmoid) * (6.0 / span);
+            design_derivative_exit[[i, j]] = dsig / age_exit[i].max(1e-12);
+        }
+    }
+    // I-spline is 0 below the knot range: entry near t=0 contributes nothing.
+    let design_entry = Array2::<f64>::zeros((n, p_time));
+    // 1st-difference penalty: null space = the constant vector (rank 1), the
+    // affine log-t baseline the reduce collapses onto.
+    let mut penalty = Array2::<f64>::zeros((p_time, p_time));
+    for j in 0..(p_time - 1) {
+        penalty[[j, j]] += 1.0;
+        penalty[[j, j + 1]] -= 1.0;
+        penalty[[j + 1, j]] -= 1.0;
+        penalty[[j + 1, j + 1]] += 1.0;
+    }
+    let derivative_offset_exit =
+        Array1::from_elem(n, DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD);
+    SurvivalLocationScaleSpec {
+        age_entry,
+        age_exit: age_exit.clone(),
+        event_target: event.clone(),
+        weights: Array1::from_elem(n, weight),
+        inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
+        derivative_guard: DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
+        max_iter: 200,
+        tol: 1e-7,
+        time_block: TimeBlockInput {
+            design_entry: DesignMatrix::from(design_entry),
+            design_exit: DesignMatrix::from(design_exit),
+            design_derivative_exit: DesignMatrix::from(design_derivative_exit),
+            offset_entry: Array1::zeros(n),
+            offset_exit: Array1::zeros(n),
+            derivative_offset_exit,
+            time_monotonicity: TimeBlockMonotonicity::EnforcedByCoordinateCone,
+            penalties: vec![penalty],
+            nullspace_dims: vec![],
+            initial_log_lambdas: Some(array![0.0]),
+            initial_beta: None,
+        },
+        threshold_block: CovariateBlockKind::Static(ParameterBlockInput {
+            design: DesignMatrix::from(Array2::ones((n, 1))),
+            offset: Array1::zeros(n),
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: None,
+            initial_beta: None,
+        }),
+        log_sigma_block: CovariateBlockKind::Static(ParameterBlockInput {
+            design: DesignMatrix::from(Array2::ones((n, 1))),
+            offset: Array1::zeros(n),
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: None,
+            initial_beta: None,
+        }),
+        timewiggle_block: None,
+        linkwiggle_block: None,
+        cache_session: None,
+        cache_mirror_sessions: Vec::new(),
+    }
+}
+
+/// Closed-form uncensored lognormal MLE: `mu_hat = mean(log t)`,
+/// `sigma_hat = population sd(log t)`.
+fn lognormal_closed_form_mle(log_t: &Array1<f64>) -> (f64, f64) {
+    let mu = log_t.mean().unwrap();
+    let sigma = (log_t.mapv(|v| (v - mu).powi(2)).sum() / (log_t.len() as f64)).sqrt();
+    (mu, sigma)
+}
+
+/// gam#2112: the reduced parametric-AFT direct MLE must CONVERGE and recover the
+/// closed-form lognormal MLE at sample sizes where the removed absolute
+/// summed-gradient tolerance failed (n ≳ 1000). This drives the real reduced
+/// path and checks the fitted location intercept / constant log-σ against the
+/// closed form `mu = mean(log t)`, `log σ = log sd(log t)`.
+#[test]
+fn reduced_parametric_aft_converges_and_recovers_mle_at_scale() {
+    for &n in &[2000usize, 5000, 10000] {
+        let (age_exit, event, log_t) = reduced_aft_lognormal_sample(n, 1.4, 0.5, 0);
+        let spec = reduced_aft_lognormal_spec(&age_exit, &event, 1.0);
+
+        // Confirm we are exercising the fixed code path (the direct parametric
+        // AFT MLE), not the coupled REML fallback.
+        let prepared = prepare_survival_location_scale_model(&spec).expect("prepare");
+        assert!(
+            prepared.is_reduced_parametric_aft(),
+            "n={n}: expected the reduced parametric-AFT regime (the fit_parametric_aft_direct_mle path)"
+        );
+        assert!(
+            prepared.family.location_log_time.is_some(),
+            "n={n}: the log-t AFT baseline must be encoded for a lognormal AFT"
+        );
+
+        // The core regression: this used to hard-error with
+        // "direct parametric-AFT MLE: failed to converge after 200 Newton
+        // iterations" for n ≳ 1000. It must now converge.
+        let (fit, _) = fit_survival_location_scale_with_geometry(spec)
+            .unwrap_or_else(|e| panic!("n={n}: reduced parametric-AFT MLE must converge: {e}"));
+
+        let (mu_hat, sigma_hat) = lognormal_closed_form_mle(&log_t);
+        let loc = fit.beta_threshold()[0];
+        let log_sigma = fit.beta_log_sigma()[0];
+        // A CONVERGED Newton MLE lands on the closed-form optimum. The recovered
+        // values match to ~1e-6 in practice; 1e-3 leaves ample slack for the
+        // Newton stop while still catching a mis-converged / non-stationary fit.
+        assert!(
+            (loc - mu_hat).abs() < 1e-3,
+            "n={n}: location {loc:.6} != closed-form mu {mu_hat:.6}"
+        );
+        assert!(
+            (log_sigma - sigma_hat.ln()).abs() < 1e-3,
+            "n={n}: log-sigma {log_sigma:.6} != closed-form {:.6}",
+            sigma_hat.ln()
+        );
+    }
+}
+
+/// gam#2112 (the mechanism, from a second angle): the stopping criterion must be
+/// invariant to the TOTAL WEIGHT, exactly as it must be invariant to `n`. The
+/// per-row weights multiply every likelihood contribution, so a uniform weight
+/// `W` scales the summed log-likelihood — and hence the summed gradient `g = ∇ℓ`
+/// and Hessian `H = −∇²ℓ` — by `W`, while leaving the MLE `θ̂ = argmax ℓ`
+/// unchanged. The removed absolute test on `‖g‖∞` therefore fails to converge
+/// for large `W` (the summed gradient's floor scales with `W`), whereas the
+/// Newton-decrement test `gᵀH⁻¹g` cancels the `W` and certifies stationarity at
+/// the SAME `θ̂`. Fitting the identical sample at `W = 1` and a large `W` must
+/// converge to the same coefficients.
+#[test]
+fn reduced_parametric_aft_stopping_criterion_is_weight_scale_invariant() {
+    let (age_exit, event, _log_t) = reduced_aft_lognormal_sample(1500, 1.2, 0.6, 7);
+
+    let fit_at_weight = |w: f64| -> (f64, f64) {
+        let spec = reduced_aft_lognormal_spec(&age_exit, &event, w);
+        let prepared = prepare_survival_location_scale_model(&spec).expect("prepare");
+        assert!(prepared.is_reduced_parametric_aft(), "expected reduced parametric-AFT regime");
+        let (fit, _) = fit_survival_location_scale_with_geometry(spec).unwrap_or_else(|e| {
+            panic!("reduced parametric-AFT MLE must converge at total-weight scale w={w}: {e}")
+        });
+        (fit.beta_threshold()[0], fit.beta_log_sigma()[0])
+    };
+
+    let (loc1, ls1) = fit_at_weight(1.0);
+    // W = 500 makes the summed gradient 500× larger — well past the regime where
+    // the old absolute 1e-7 gradient tolerance could ever be met — yet the MLE
+    // is identical, so a scale-invariant criterion converges to the same point.
+    let (loc500, ls500) = fit_at_weight(500.0);
+
+    assert!(
+        (loc1 - loc500).abs() < 1e-6,
+        "location must be weight-scale invariant: w=1 -> {loc1:.9}, w=500 -> {loc500:.9}"
+    );
+    assert!(
+        (ls1 - ls500).abs() < 1e-6,
+        "log-sigma must be weight-scale invariant: w=1 -> {ls1:.9}, w=500 -> {ls500:.9}"
+    );
+}
