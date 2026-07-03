@@ -3788,15 +3788,35 @@ impl<'d> SpatialJointContext<'d> {
         let skip_value_realization = theta.len() == self.rho_dim + 1 && {
             let psi = theta[self.rho_dim];
             self.evaluator.psi_gram_tensor_covers(psi)
-                    // #1264 (RESTORED): the value-only line-search probe runs the
-                    // SAME conditioned-basis Gaussian solve, so it ships the same
-                    // κ-amplified interpolated-Gram β̂ error across a basis rotation
-                    // (cluster: β̂rel≈1.7e-5 ≫ 1e-6). The probe is β̂-sound only where the
-                    // reduced basis is provably unchanged vs the pinning ψ, exactly
-                    // as the eval_full gate. See the eval_full gate for the full
-                    // justification; the dropped-precondition "stale-penalty" theory
-                    // was empirically refuted.
-                    && self.evaluator.psi_gram_tensor_covers_skip(psi)
+                    // #1868: a VALUE-only line-search probe does NOT need the
+                    // #1264 `reduced_basis_equal` (`covers_skip`) soundness gate the
+                    // ACCEPTED gradient eval (`eval_full`, still gated) requires. That
+                    // gate exists because the design-realization skip freezes the
+                    // conditioned reduced basis at the pinning ψ, and on the near-
+                    // singular Duchon Gram (κ(G)≈9.5e14) a ψ-rotation makes the
+                    // frozen basis interpolate β̂ with a κ-amplified round-off of
+                    // β̂rel≈1.7e-5 — which matters for the RETURNED coefficients/
+                    // gradient. A cost probe returns only the scalar REML criterion
+                    // for the line search, and that criterion is STATIONARY in β̂ at
+                    // the inner minimizer (envelope theorem): a β̂ perturbation δβ
+                    // moves the data-fit+penalty term by O(δβ²) and leaves the
+                    // `log|H|` term (built from the EXACT tensor Gram G(ψ), not β̂)
+                    // untouched, so the RELATIVE cost error is ~δβ² ≈ 3e-10 — orders
+                    // below the line search's 1e-5 Armijo tolerance. So the probe
+                    // cannot be mis-ranked, and the converged κ/β̂ (pinned by the
+                    // covers_skip-gated `eval_full` at accepted iterates) is
+                    // unchanged. Gating the probe on `covers_skip` instead forced the
+                    // O(n) `reset_surface` lane for every line-search step that
+                    // overshoots the (n-drifting) reduced-basis-stable band — the
+                    // #1868 per-callback reset climb: the band's rotation rate dP/dψ
+                    // grows with n (sample-std standardization), so more probes fall
+                    // just past PSI_GRAM_SKIP_PROJ_ATOL as n grows, defeating the
+                    // n-independence the tensor lane was built for. The evaluator's
+                    // own value-probe fast path (`prepare_eval_state_cost_only`) is
+                    // gated on VALUE coverage exactly for this reason; aligning the
+                    // driver here lets the probe cost come from the n-free k-space
+                    // Gram/penalty statistics across the rotation.
+                    //
                     // #1033 penalty lane: the value-probe fast path also skips
                     // `reset_surface`, so the probe must be able to re-key S(ψ)
                     // EXACTLY and n-free; otherwise its cost would use the stale
