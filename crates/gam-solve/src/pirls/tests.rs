@@ -1867,7 +1867,7 @@ mod tests {
         let y = array![0.0, 1.0, 2.0, 4.0, 6.0, 9.0];
         let w = Array1::ones(y.len());
         let offset = Array1::zeros(y.len());
-        let root = array![[0.0, 1.0]];
+        let local_penalty = array![[0.0, 0.0], [0.0, 1.0]];
         let likelihood = GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
             ResponseFamily::Poisson,
             InverseLink::Standard(StandardLink::Log),
@@ -1898,7 +1898,7 @@ mod tests {
             w.view(),
             x.clone(),
             offset.view(),
-            vec![BlockwisePenalty::new(0..2, root)],
+            vec![BlockwisePenalty::new(0..2, local_penalty)],
             &opts,
         )
         .expect("external Poisson fit should converge");
