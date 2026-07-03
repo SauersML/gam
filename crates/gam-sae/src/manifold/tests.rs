@@ -4192,7 +4192,7 @@ pub(crate) fn streaming_exact_reml_matches_full_batch_reml_ibp_woodbury() {
     // cross-row source), so this differed by `log|C|` (≈ {log_c}) or errored.
     let dense_logdet = arrow_log_det_from_cache(&cache).expect("dense log-det finite");
     let stream_logdet = full
-        .streaming_exact_arrow_log_det(target.view(), &rho, None)
+        .streaming_exact_arrow_log_det(target.view(), &rho, None, None)
         .expect("streaming log-det must evaluate (cross-row Woodbury now carried)");
     assert_abs_diff_eq!(stream_logdet, dense_logdet, epsilon = 1.0e-8);
 }
