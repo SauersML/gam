@@ -60,8 +60,8 @@ impl SurvivalLocationScaleFamily {
     /// runs an outer ρ search around an inner per-block trust-region Newton that
     /// oscillates and never certifies stationarity on this tiny unpenalized
     /// likelihood. Instead we run a damped, line-searched joint Newton directly
-    /// on the negative log-likelihood `−ℓ(θ)`, converging to the gradient-norm
-    /// tolerance in a handful of iterations exactly like `survreg`/`lifelines`.
+    /// on the negative log-likelihood `−ℓ(θ)`, converging in a handful of
+    /// iterations exactly like `survreg`/`lifelines`.
     ///
     /// The step is `δ = H⁻¹ g` with `g = ∇ℓ` (the block-concatenated
     /// log-likelihood gradient) and `H = −∇²ℓ` (the exact joint Hessian, all
@@ -73,14 +73,41 @@ impl SurvivalLocationScaleFamily {
     /// on `−ℓ`, so the time derivative stays `≥ guard` at every observed time
     /// and `ℓ` increases monotonically.
     ///
+    /// # Convergence criterion
+    ///
+    /// Stationarity is certified by the **Newton decrement**
+    /// `λ²(θ) = gᵀH⁻¹g = g·δ ≥ 0`, whose half is a second-order estimate of the
+    /// log-likelihood gap `ℓ(θ*) − ℓ(θ) ≈ ½λ²` (equivalently, `λ²` is the squared
+    /// Mahalanobis distance from `θ` to the optimum in the observed-information
+    /// metric). The fit stops when `½λ² ≤ obj_tol`.
+    ///
+    /// A raw gradient-norm test is NOT used here: `g = ∇ℓ` is a SUM over the `n`
+    /// observations, so at the true MLE its attainable sup-norm floor in double
+    /// precision grows like `n·ε`, and an absolute gradient tolerance therefore
+    /// spuriously fails to converge on perfectly benign data with rising
+    /// frequency as `n` grows (gam#2112). The decrement `gᵀH⁻¹g` divides the
+    /// n-scaled gradient by the n-scaled curvature, so it is invariant to the
+    /// sample size and to any affine reparameterization: a single fixed `obj_tol`
+    /// certifies stationarity uniformly across `n`, and its own round-off floor
+    /// (`~ n·ε²·κ(H)`) stays vanishingly far below any usable tolerance.
+    ///
+    /// If, near the optimum, the damped-Newton ascent direction admits no
+    /// Armijo-sufficient step (`ℓ` cannot be increased to numerical precision)
+    /// while `½λ²` is already below [`REDUCED_AFT_NEWTON_STALL_TOL`], the iterate
+    /// is accepted as the numerical MLE; a large decrement at such a stall is a
+    /// genuine curvature-model failure and is surfaced as an error.
+    ///
     /// Returns the converged block states, the log-likelihood at the MLE, and
     /// the joint negative-log-likelihood Hessian `H` (the observed information),
     /// whose inverse is the conditional covariance the caller assembles.
+    ///
+    /// `obj_tol` is the objective-suboptimality tolerance on `½λ²` described
+    /// above (floored by the caller at [`REDUCED_AFT_OBJ_TOL_FLOOR`]).
     pub(crate) fn fit_parametric_aft_direct_mle(
         &self,
         specs: &[ParameterBlockSpec],
         max_iter: usize,
-        grad_tol: f64,
+        obj_tol: f64,
     ) -> Result<(Vec<ParameterBlockState>, f64, Array2<f64>), String> {
         use gam_linalg::faer_ndarray::FaerCholesky;
 
@@ -138,6 +165,7 @@ impl SurvivalLocationScaleFamily {
         // Newton iterations on −ℓ(θ).
         let mut converged = false;
         let mut last_grad_norm = f64::INFINITY;
+        let mut last_newton_decrement = f64::INFINITY;
         for _ in 0..max_iter {
             let (ll_now, block_gradients) =
                 self.evaluate_log_likelihood_and_block_gradients(&states)?;
@@ -204,12 +232,12 @@ impl SurvivalLocationScaleFamily {
                 }
                 g = kernel_g;
             }
+            // Retained for diagnostics only — the stopping test is the Newton
+            // decrement computed below, NOT this raw summed-gradient sup-norm
+            // (whose attainable floor scales with `n`; see the doc comment /
+            // gam#2112).
             let grad_norm = g.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
             last_grad_norm = grad_norm;
-            if grad_norm <= grad_tol {
-                converged = true;
-                break;
-            }
 
             // H = −∇²ℓ (positive (semi)definite near the optimum). The exact
             // joint Hessian assembly returns it directly, symmetrized.
@@ -267,6 +295,25 @@ impl SurvivalLocationScaleFamily {
                 .into());
             }
 
+            // Affine-invariant stationarity test: the Newton decrement
+            //   λ² = gᵀH⁻¹g = g·δ ≥ 0,   ℓ(θ*) − ℓ(θ) ≈ ½λ².
+            // Because δ = H⁻¹g divides the n-scaled gradient by the n-scaled
+            // curvature, ½λ² (the estimated log-likelihood gap, equivalently the
+            // squared Mahalanobis distance to θ* in the observed-information
+            // metric) is invariant to the sample size — so a single `obj_tol`
+            // certifies stationarity uniformly across `n`, unlike the raw
+            // summed-gradient sup-norm whose floor grows like n·ε (gam#2112). If
+            // Levenberg damping was active (τ>0, only ever off the optimum) δ is
+            // the damped solve, so g·δ under-estimates the true decrement — a
+            // conservative (never-early) test there, since a genuinely stationary
+            // iterate has τ=0.
+            let newton_decrement = g.dot(&delta);
+            last_newton_decrement = newton_decrement;
+            if 0.5 * newton_decrement <= obj_tol {
+                converged = true;
+                break;
+            }
+
             // Cap the step to keep the monotone time-warp feasible: the family's
             // per-block feasibility barrier reports the largest α that keeps the
             // derivative guard satisfied (only the time block constrains it).
@@ -280,8 +327,9 @@ impl SurvivalLocationScaleFamily {
 
             // Armijo backtracking on −ℓ along the (feasibility-capped) Newton
             // ascent direction. `g·δ > 0` because δ is an ascent direction, so a
-            // sufficient-increase condition on ℓ is well posed.
-            let directional = g.dot(&delta);
+            // sufficient-increase condition on ℓ is well posed. The directional
+            // derivative is exactly the Newton decrement computed above.
+            let directional = newton_decrement;
             const ARMIJO_C: f64 = 1e-4;
             const BACKTRACK: f64 = 0.5;
             const MIN_ALPHA: f64 = 1e-12;
@@ -304,19 +352,31 @@ impl SurvivalLocationScaleFamily {
                     states = new_states;
                     ll = new_ll;
                 }
-                // No further increase was achievable along this direction even
-                // though the stationarity test above has not passed. This is a
-                // real optimizer failure (usually ill-conditioning or a bad
-                // local curvature model), not an MLE. Returning it as a
-                // structured error keeps the reduced-AFT route consistent with
-                // the coupled location-scale solvers instead of handing an
-                // unconverged/possibly indefinite Hessian to downstream linear
-                // algebra, where panic=abort builds can terminate the CLI.
+                // The damped-Newton ascent direction admits no Armijo-sufficient
+                // step: ℓ can no longer be increased to numerical precision. If
+                // the Newton decrement is also small, this is the numerical MLE —
+                // a near-stationary iterate whose step no longer improves ℓ
+                // (gam#2112) — so accept it. This is the correct terminal state
+                // of a maximizer: an iterate at which the objective cannot be
+                // increased IS the optimum, even if the raw (n-scaled) gradient
+                // has not reached an absolute floor. A LARGE decrement here means
+                // the quadratic model is badly wrong (ill-conditioning / a bad
+                // local curvature model), not an MLE; that stays a structured
+                // error, keeping the reduced-AFT route consistent with the coupled
+                // location-scale solvers rather than handing an unconverged /
+                // possibly indefinite Hessian to downstream linear algebra, where
+                // panic=abort builds can terminate the CLI.
                 None => {
+                    if 0.5 * newton_decrement <= REDUCED_AFT_NEWTON_STALL_TOL {
+                        converged = true;
+                        break;
+                    }
                     return Err(SurvivalLocationScaleError::NumericalFailure {
                         reason: format!(
                             "direct parametric-AFT MLE: line search failed before convergence \
-                             (gradient sup-norm {grad_norm:.6e} > tolerance {grad_tol:.6e})"
+                             (½·Newton-decrement {half_decrement:.6e} > tolerance {obj_tol:.6e}; \
+                             gradient sup-norm {grad_norm:.6e})",
+                            half_decrement = 0.5 * newton_decrement
                         ),
                     }
                     .into());
@@ -328,7 +388,9 @@ impl SurvivalLocationScaleFamily {
             return Err(SurvivalLocationScaleError::NumericalFailure {
                 reason: format!(
                     "direct parametric-AFT MLE: failed to converge after {max_iter} Newton iterations \
-                     (last gradient sup-norm {last_grad_norm:.6e} > tolerance {grad_tol:.6e})"
+                     (last ½·Newton-decrement {half_decrement:.6e} > tolerance {obj_tol:.6e}; \
+                     last gradient sup-norm {last_grad_norm:.6e})",
+                    half_decrement = 0.5 * last_newton_decrement
                 ),
             }
             .into());

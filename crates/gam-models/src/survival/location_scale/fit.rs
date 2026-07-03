@@ -26,7 +26,7 @@ pub(crate) fn fit_reduced_parametric_aft(
     let (states, log_likelihood, h) = prepared.family.fit_parametric_aft_direct_mle(
         specs,
         options.inner_max_cycles.max(1),
-        options.inner_tol.max(REDUCED_AFT_GRAD_TOL_FLOOR),
+        options.inner_tol.max(REDUCED_AFT_OBJ_TOL_FLOOR),
     )?;
 
     let p_total = h.nrows();
