@@ -588,7 +588,7 @@ pub fn project_point_strictly_into_feasible_cone(
     // degenerate cone the strictly-interior QP cannot certify) instead of
     // recursing until the worker stack overflows. The guard restores the
     // per-thread depth on every early return via its `Drop`.
-    let _repair_guard = FeasibilityRepairGuard::enter()?;
+    let repair_guard = FeasibilityRepairGuard::enter()?;
     let p = point.len();
     let m = constraints.a.nrows();
     if constraints.a.ncols() != p || m == 0 || constraints.b.len() != m {
@@ -755,6 +755,11 @@ pub fn project_point_strictly_into_feasible_cone(
             return None;
         }
     }
+    // All mutually-recursive `solve ↔ project` calls are complete; release the
+    // per-thread recursion-depth guard explicitly on the success path (early
+    // returns above release it via `Drop`). Named + dropped (not `let _guard`)
+    // to satisfy the underscore-binding ban without changing its lifetime.
+    drop(repair_guard);
     Some(beta)
 }
 
