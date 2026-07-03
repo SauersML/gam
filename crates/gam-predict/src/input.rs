@@ -12,7 +12,9 @@ use gam::families::survival::predict::SurvivalPredictError;
 use gam::families::survival::predict::{
     fit_result_from_saved_model_for_prediction, resolve_termspec_for_prediction,
 };
-use gam::families::transformation_normal::TRANSFORMATION_MONOTONICITY_EPS;
+use gam::families::transformation_normal::{
+    TRANSFORMATION_MONOTONICITY_EPS, transformation_normal_pit_score,
+};
 use gam::probability::standard_normal_quantile;
 use gam::inference::model::{
     FittedModel, FittedModelError, PredictModelClass, append_deployment_extension_columns,
@@ -364,6 +366,19 @@ fn transformation_normal_quantile_grid(
     let cov_mat_ref = &cov_mat;
     let grid_shape_ref = &grid_shape;
     let grid_y_ref = &grid_y;
+    // The CTM latent that is calibrated to N(0,1) is the finite-support PIT
+    // score, not the raw roughness transform `h` (see
+    // `calibrate_transformation_scores`). The inverse-transform consumers —
+    // `predict`'s `E[Y|x]` quadrature and the `generate` sampler — draw
+    // `Z ~ N(0,1)` and invert this grid, so it must carry the calibrated
+    // score. Returning the raw `h` (whose per-row range is an arbitrary,
+    // covariate-shifted interval that generally does not straddle the standard
+    // normal support) makes every `Z` node fall outside `[h_lo, h_hi]` and
+    // clamp to a response-support endpoint, collapsing `E[Y|x]` onto the two
+    // support bounds. Applying the model's own PIT here reuses the fit-time
+    // score semantics exactly, so prediction, generation, and fitting share a
+    // single latent scale.
+    let clip_eps = calibration.clip_eps;
     let rows: Vec<Result<Vec<f64>, String>> = (0..n)
         .into_par_iter()
         .map(|i| {
@@ -405,7 +420,25 @@ fn transformation_normal_quantile_grid(
                     ));
                 }
             }
-            Ok(h_row)
+            // Map the raw transform onto the calibrated N(0,1) latent scale via
+            // the finite-support PIT, normalized by this row's own support
+            // endpoints `h(y_lo|x_i)`, `h(y_hi|x_i)`. The PIT is computed in
+            // log-CDF space, so it stays well-conditioned even when the raw `h`
+            // window sits deep in a normal tail (where a direct `Φ(h)`
+            // difference would underflow). It is strictly increasing in `h`, so
+            // the calibrated row inherits the monotonicity just verified.
+            let h_lo = h_row[0];
+            let h_hi = h_row[GRID - 1];
+            let mut s_row = vec![0.0_f64; GRID];
+            for k in 0..GRID {
+                s_row[k] = transformation_normal_pit_score(h_row[k], h_lo, h_hi, clip_eps)
+                    .map_err(|err| {
+                        format!(
+                            "transformation-normal PIT calibration failed at row {i}, grid node {k}: {err}"
+                        )
+                    })?;
+            }
+            Ok(s_row)
         })
         .collect();
     let mut h_grid = Array2::<f64>::zeros((n, GRID));
@@ -494,7 +527,11 @@ fn transformation_normal_conditional_mean(
 pub struct TransformationNormalQuantileGrid {
     /// Shared, strictly increasing response grid (length `g ≥ 2`).
     pub grid_y: Array1<f64>,
-    /// `h_grid[[i, k]] = h(grid_y[k] | x_i)`, strictly increasing in `k`.
+    /// The row-wise monotone CTM latent on the *calibrated* N(0,1) scale:
+    /// `h_grid[[i, k]] = s(grid_y[k] | x_i)`, where `s` is the finite-support
+    /// PIT of the raw roughness transform (strictly increasing in `k`). This is
+    /// the scale the inverse-transform sampler and the `E[Y|x]` quadrature draw
+    /// `Z ~ N(0,1)` against.
     pub h_grid: Array2<f64>,
     /// Response-scale conditional mean `E[Y|x_i]` — the same value `predict`
     /// returns (#1612), provided so the generate spec's reference mean and the
