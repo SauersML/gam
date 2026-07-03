@@ -6733,3 +6733,58 @@ pub(crate) fn single_predictor_glm_hessian_derivative_correction_matches_fd() {
         }
     }
 }
+
+#[test]
+pub(crate) fn tangent_projected_trace_logdet_operator_matches_densify_then_project() {
+    // The matrix-free `TangentProjectedHessianOperator::trace_logdet_operator`
+    // override must return exactly what the previous trait-default path
+    // produced: densify the operator-backed drift `B`, then evaluate the
+    // wrapper's `trace_logdet_gradient` (which forms `Zᵀ B Z` and applies the
+    // wrapped spectral logdet kernel). The override instead projects `B` into
+    // tangent space matrix-free via `op.projected_matrix(Z) = Zᵀ (B·Z)`; since
+    // `Zᵀ B Z` has entry `z_iᵀ B z_j` in both computations, the two must agree
+    // to machine precision.
+    let p = 6usize;
+    let m = 4usize;
+
+    // Full-rank tall tangent basis Z (p × m). The projection identity holds for
+    // any Z, so an orthonormal basis is not required — a deterministic
+    // well-conditioned block suffices.
+    let z = Array2::<f64>::from_shape_fn((p, m), |(i, j)| {
+        ((i as f64 + 1.0) * 0.31 - (j as f64 + 1.0) * 0.17).sin() + if i == j { 1.5 } else { 0.0 }
+    });
+
+    // A symmetric positive-definite full-space Hessian H, projected to the
+    // tangent operator H_T = ZᵀHZ and re-eigendecomposed exactly as the
+    // production tangent-projection path does.
+    let h_full = Array2::<f64>::from_shape_fn((p, p), |(i, j)| {
+        let s = ((i as f64 + 0.7) * 0.29 + (j as f64 + 0.4) * 0.13).cos();
+        if i == j { 4.0 + i as f64 } else { 0.2 * s }
+    });
+    let h_full = 0.5 * (&h_full + &h_full.t());
+    let h_t = z.t().dot(&h_full).dot(&z);
+    let h_t_op = DenseSpectralOperator::from_symmetric(&h_t).unwrap();
+    let h_t_op_ref = DenseSpectralOperator::from_symmetric(&h_t).unwrap();
+
+    let wrapper = TangentProjectedHessianOperator { z: z.clone(), h_t_op };
+
+    // Operator-backed symmetric drift B.
+    let b = Array2::<f64>::from_shape_fn((p, p), |(i, j)| {
+        ((i as f64 + 1.3) * 0.23 - (j as f64 + 0.9) * 0.19).sin() + if i == j { 0.8 } else { 0.0 }
+    });
+    let b = 0.5 * (&b + &b.t());
+    let b_op = DenseMatrixHyperOperator { matrix: b.clone() };
+
+    // Reference: the exact pre-override path — densify B, then project.
+    let zbz_ref = z.t().dot(&b).dot(&z);
+    let reference = h_t_op_ref.trace_logdet_gradient(&zbz_ref);
+
+    let got = wrapper.trace_logdet_operator(&b_op);
+
+    // The trace must be materially nonzero so the equality is not vacuous.
+    assert!(
+        reference.abs() > 1e-6,
+        "reference tangent logdet trace must be nonzero; got {reference:.3e}"
+    );
+    assert_relative_eq!(got, reference, max_relative = 1e-10, epsilon = 1e-12);
+}

@@ -702,6 +702,28 @@ impl HessianOperator for TangentProjectedHessianOperator {
         let zaz = self.z.t().dot(a).dot(&self.z);
         self.h_t_op.trace_logdet_gradient(&zaz)
     }
+    fn trace_logdet_operator(&self, op: &dyn HyperOperator) -> f64 {
+        // Matrix-free tangent projection of an operator-backed Hessian drift.
+        //
+        // The `HessianOperator` trait default densifies `op` (`op.to_dense()`,
+        // p forward HVPs + a p×p transient) and then evaluates
+        // `trace_logdet_gradient`, which internally forms `Zᵀ Bdense Z`. For a
+        // spectral tangent operator `logdet_traces_match_hinv_kernel()` is
+        // false, so that default never reaches the Hutch++ fast path and
+        // unconditionally hits the warn-and-materialize branch — the dominant
+        // source of `trace_logdet_operator: materializing implicit
+        // HyperOperator` spam (and O(p²) work per outer eval per penalty) on
+        // every shape-constrained REML fit.
+        //
+        // `Zᵀ B Z` is exactly `op.projected_matrix(Z) = Zᵀ (B·Z)`, where `B·Z`
+        // is `op.mul_mat(Z)` — the operator's own matrix-free action, only
+        // m ≤ p HVPs and no dense p×p B. The two are algebraically identical
+        // (both have entry `z_iᵀ B z_j`), so this override changes only the
+        // arithmetic path, never the value: `tr(G_ε(H_T) · ZᵀBZ)` via the
+        // wrapped spectral logdet kernel.
+        let zbz = op.projected_matrix(&self.z);
+        self.h_t_op.trace_logdet_gradient(&zbz)
+    }
     fn is_dense(&self) -> bool {
         self.h_t_op.is_dense()
     }
