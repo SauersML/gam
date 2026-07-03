@@ -1,5 +1,6 @@
 use gam_sae::sparse_dict::{ScoreRouteStats, TileScorer};
 use ndarray::Array2;
+use std::io::Write;
 use std::time::Instant;
 
 fn parse_arg(args: &[String], idx: usize, default: usize) -> usize {
@@ -8,23 +9,23 @@ fn parse_arg(args: &[String], idx: usize, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-fn parse_mode(args: &[String]) -> gam_gpu::GpuMode {
+fn parse_mode(args: &[String]) -> Result<gam_gpu::GpuMode, String> {
     match args.get(6).map(String::as_str).unwrap_or("off") {
-        "auto" => gam_gpu::GpuMode::Auto,
-        "required" => gam_gpu::GpuMode::Required,
-        "off" => gam_gpu::GpuMode::Off,
-        other => panic!("mode must be off|auto|required, got {other}"),
+        "auto" => Ok(gam_gpu::GpuMode::Auto),
+        "required" => Ok(gam_gpu::GpuMode::Required),
+        "off" => Ok(gam_gpu::GpuMode::Off),
+        other => Err(format!("mode must be off|auto|required, got {other}")),
     }
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let n_rows = parse_arg(&args, 1, 256);
     let n_atoms = parse_arg(&args, 2, 4096);
     let p = parse_arg(&args, 3, 48);
     let active = parse_arg(&args, 4, 4);
     let tile = parse_arg(&args, 5, 1024);
-    let mode = parse_mode(&args);
+    let mode = parse_mode(&args)?;
 
     let rows = Array2::<f32>::from_shape_fn((n_rows, p), |(r, c)| {
         (((r * 31 + c * 17 + 3) as f32) * 0.013).sin() * 0.9
@@ -54,7 +55,8 @@ fn main() {
                 .map(|(atom, score)| (*atom as u64) ^ score.to_bits() as u64)
         })
         .fold(0u64, |acc, v| acc.wrapping_mul(16_777_619) ^ v);
-    println!(
+    writeln!(
+        std::io::stdout(),
         "rows={n_rows} atoms={n_atoms} p={p} active={active} tile={tile} mode={mode} \
          path={:?} elapsed_ms={:.3} admitted={} tiles={} peak_score_mb={:.2} \
          score_elems={} dot_flops_lower_bound={} checksum={checksum}",
@@ -65,5 +67,6 @@ fn main() {
         stats.peak_score_bytes as f64 / (1024.0 * 1024.0),
         stats.score_elements,
         stats.dot_flops_lower_bound,
-    );
+    )?;
+    Ok(())
 }
