@@ -73,21 +73,48 @@ pub struct TwoBlockRemlFitReport {
     pub log_lambda_trajectory: Vec<f64>,
 }
 
+/// Caller-owned resolution knobs for [`SaeManifoldTerm::run_two_block_reml_fit`].
+///
+/// None of these choose *what* the fit converges to — the destination is the
+/// data-determined REML stationary point. They only bound how far the inner
+/// arrow-Schur solve and the outer `(fit, λ_y-update)` alternation walk toward
+/// it, plus the pass-through inner regularization. Bundling them keeps the fit
+/// entry point at a single grouped argument (the four inner knobs are the exact
+/// pass-through set [`SaeManifoldTerm::run_joint_fit_arrow_schur`] already
+/// takes, and the two outer knobs govern the sweep loop).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TwoBlockRemlControls {
+    /// Upper bound on the outer `(fit, λ_y-update)` alternation. Must be ≥ 1.
+    pub max_sweeps: usize,
+    /// Inner arrow-Schur iteration cap, passed through to
+    /// [`SaeManifoldTerm::run_joint_fit_arrow_schur`] unchanged each sweep.
+    pub inner_max_iter: usize,
+    /// Inner damped-Newton step size (finite, positive), passed through.
+    pub step_size: f64,
+    /// Ridge on the external-coordinate block of the inner solve, passed through.
+    pub ridge_ext_coord: f64,
+    /// Ridge on the decoder (`β`) block of the inner solve, passed through.
+    pub ridge_beta: f64,
+    /// Convergence tolerance on `|Δ log λ_y|` between sweeps (finite, positive).
+    pub log_lambda_tol: f64,
+}
+
 impl SaeManifoldTerm {
     /// Run the Rung-2 two-block joint fit with `λ_y` selected by REML.
     ///
     /// Requires a [`BehaviorBlock`] installed via
     /// [`Self::set_behavior_block`]; `activation` is the raw activation target
     /// `Z` (`n × p_x`) — the augmented target is stacked internally at each
-    /// sweep's current `λ_y`. `rho`, `analytic_penalties`, `inner_max_iter`,
-    /// `step_size`, and the two ridges are passed through to
-    /// [`Self::run_joint_fit_arrow_schur`] unchanged.
+    /// sweep's current `λ_y`. `rho`, `analytic_penalties`, and the inner knobs
+    /// carried in `controls` (`inner_max_iter`, `step_size`, and the two ridges)
+    /// are passed through to [`Self::run_joint_fit_arrow_schur`] unchanged.
     ///
-    /// `max_sweeps` bounds the outer (fit, λ-update) alternation;
-    /// `log_lambda_tol` is the convergence tolerance on `|Δ log λ_y|` (both are
-    /// caller-owned resolution choices, like `inner_max_iter` — not fit
-    /// hyperparameters: the *destination* is the data-determined REML
-    /// stationary point, these only bound how long we walk toward it).
+    /// `controls.max_sweeps` bounds the outer (fit, λ-update) alternation;
+    /// `controls.log_lambda_tol` is the convergence tolerance on `|Δ log λ_y|`
+    /// (see [`TwoBlockRemlControls`]: all of these are caller-owned resolution
+    /// choices — not fit hyperparameters. The *destination* is the
+    /// data-determined REML stationary point; these only bound how long we walk
+    /// toward it).
     ///
     /// On return the term holds the fitted two-block state at the selected
     /// `λ_y` (its behavior block updated in place), so
@@ -98,13 +125,16 @@ impl SaeManifoldTerm {
         activation: ArrayView2<'_, f64>,
         rho: &mut SaeManifoldRho,
         analytic_penalties: Option<&AnalyticPenaltyRegistry>,
-        max_sweeps: usize,
-        inner_max_iter: usize,
-        step_size: f64,
-        ridge_ext_coord: f64,
-        ridge_beta: f64,
-        log_lambda_tol: f64,
+        controls: TwoBlockRemlControls,
     ) -> Result<TwoBlockRemlFitReport, String> {
+        let TwoBlockRemlControls {
+            max_sweeps,
+            inner_max_iter,
+            step_size,
+            ridge_ext_coord,
+            ridge_beta,
+            log_lambda_tol,
+        } = controls;
         if max_sweeps == 0 {
             return Err(
                 "SaeManifoldTerm::run_two_block_reml_fit: max_sweeps must be ≥ 1".to_string(),
