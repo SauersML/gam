@@ -194,6 +194,9 @@ mod tests_coatom_sigma_coherence_2021;
 mod tests_2101_birth_locus_probe;
 
 #[cfg(test)]
+mod tests_rank_charge_2101;
+
+#[cfg(test)]
 mod tests_behavioral_fisher_rung1;
 
 #[cfg(test)]

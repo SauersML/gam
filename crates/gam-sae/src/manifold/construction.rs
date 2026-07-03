@@ -64,6 +64,7 @@ impl SaeManifoldTerm {
             // #2022/#2023 — per-fit opt-ins, default false (bit-for-bit historical).
             quotient_scale: false,
             cone_atom_recovery: false,
+            rank_charge_evidence: false,
             data_row_reseed: false,
             // SAC — the collapse-guard stack is armed by default; the stagewise
             // K=1 lane disarms it explicitly (see the field docs on term.rs).
@@ -818,6 +819,103 @@ impl SaeManifoldTerm {
     /// #1939 — read the per-fit cone-atom RECOVERY-retraction opt-in.
     pub fn cone_atom_recovery(&self) -> bool {
         self.cone_atom_recovery
+    }
+
+    /// #5/(B) — set the per-fit rank-charge evidence opt-in (typed kwarg, no env
+    /// lever). Default false ⇒ historical path bit-for-bit. Replaces the
+    /// coordinate-block ½log|H_tt| with the honest BIC ½·d_eff·log n on the
+    /// realised decoder rank (over-charge + co-collapse fix).
+    pub fn set_rank_charge_evidence(&mut self, enabled: bool) {
+        self.rank_charge_evidence = enabled;
+    }
+
+    /// #5/(B) — read the per-fit rank-charge evidence opt-in.
+    pub fn rank_charge_evidence(&self) -> bool {
+        self.rank_charge_evidence
+    }
+
+    /// #5/(B) — per-atom realised-rank effective DOF for the rank-charge criterion:
+    /// `d_eff_k = rank_eff_k · basis_edf_k`, where
+    ///   * `rank_eff_k = Σ_i s_i²/(s_i² + R)` over the fitted decoder's singular
+    ///     values `s_i` (its REALISED output rank — 2 for a rank-2 circle),
+    ///     with the FIXED noise floor `R = dispersion_r` (the residual variance).
+    ///     A decoder collapsing to `‖B‖→0` sends every `s_i → 0 ≪ R` → `rank_eff
+    ///     → 0` → charge 0 → neutral (the co-collapse fix). Because `R` is the
+    ///     fixed data-noise scale (NOT a self-relative `ε·max_sv`), a single
+    ///     vanishing atom's singular values fall below it even though its own
+    ///     ratios are preserved under uniform shrink.
+    ///   * `basis_edf_k = tr(G_k · (G_k + λ_k S_k)⁻¹)` on the atom's `m×m`
+    ///     decoder data Gram (its identified basis dimension, ~m minus the
+    ///     smoothness/DC shrinkage).
+    /// The charge `½·d_eff_k·log n` is the honest BIC on the atom's realised
+    /// decoder parameters. It is ROTATION-INVARIANT (rank + basis EDF are), so it
+    /// does NOT distinguish a clean circle from a blend (both rank-2) — the
+    /// producer owns cleanliness.
+    pub(crate) fn per_atom_realised_rank_dof(
+        &self,
+        rho: &SaeManifoldRho,
+        dispersion_r: f64,
+    ) -> Result<Vec<f64>, String> {
+        let mut grams = self.empty_decoder_gram_accumulator();
+        self.accumulate_decoder_gram(&mut grams);
+        let lam = rho.lambda_smooth_vec();
+        // Fixed noise floor R = residual variance (dispersion). Guard finite/positive.
+        let r_floor = if dispersion_r.is_finite() && dispersion_r > 0.0 {
+            dispersion_r
+        } else {
+            f64::MIN_POSITIVE
+        };
+        let mut out = Vec::with_capacity(self.k_atoms());
+        for k in 0..self.k_atoms() {
+            // rank_eff: realised output rank of the fitted decoder vs the noise floor.
+            let rank_eff: f64 = match self.atoms[k].decoder_coefficients.svd(false, false) {
+                Ok((_, sv, _)) => sv
+                    .iter()
+                    .map(|&s| {
+                        let s2 = s * s;
+                        if s2 + r_floor > 0.0 {
+                            s2 / (s2 + r_floor)
+                        } else {
+                            0.0
+                        }
+                    })
+                    .sum(),
+                Err(e) => {
+                    return Err(format!(
+                        "per_atom_realised_rank_dof: decoder svd atom {k}: {e}"
+                    ))
+                }
+            };
+            // basis_edf = tr(G (G + λS)⁻¹) on the m×m decoder data Gram.
+            let g = &grams[k];
+            let m = g.nrows();
+            let basis_edf = if m == 0 {
+                0.0
+            } else {
+                let mut mmat = g.clone();
+                let lam_k = lam.get(k).copied().unwrap_or(0.0);
+                let pen = &self.atoms[k].smooth_penalty;
+                if pen.dim() == (m, m) {
+                    for i in 0..m {
+                        for j in 0..m {
+                            mmat[[i, j]] += lam_k * pen[[i, j]];
+                        }
+                    }
+                }
+                for i in 0..m {
+                    mmat[[i, i]] += 1.0e-12; // SPD guard for the factorization
+                }
+                match mmat.cholesky(super::Side::Lower) {
+                    Ok(factor) => {
+                        let x = factor.solve_mat(g); // X = (G+λS)⁻¹ G
+                        (0..m).map(|i| x[[i, i]]).sum::<f64>().clamp(0.0, m as f64)
+                    }
+                    Err(_) => m as f64, // fallback: full basis count (conservative)
+                }
+            };
+            out.push(rank_eff * basis_edf);
+        }
+        Ok(out)
     }
 
     /// #2023 — set the per-fit dead-atom data-row reseed opt-in (typed kwarg, no
@@ -6583,7 +6681,51 @@ impl SaeManifoldTerm {
             None => 0.0,
         };
 
-        let v = loss.total() + extra_penalty_energy + 0.5 * log_det - occam;
+        let v = if self.rank_charge_evidence {
+            // #5/(B): replace the COORDINATE-block ½log|H_tt| in the Laplace
+            // complexity with the honest BIC ½·d_eff·log n on each atom's realised
+            // decoder rank. The decoder-scale mispricing (`½log(a²‖B‖²)` scale,
+            // over-charging real atoms + rewarding a²‖B‖²→0) lives ENTIRELY in the
+            // coordinate block (`H_tt ∝ ‖B‖²`); the β/Schur block is
+            // ‖B‖-independent (ρ⁰ coupling) and stays. `d_eff` is rotation-
+            // invariant, so it accepts a real rank-2 circle and neutralises a
+            // vanishing atom — but does NOT distinguish clean-vs-blend (producer's
+            // job).
+            let n_obs = self.n_obs() as f64;
+            // Noise floor R = residual dispersion φ (per-fit, noise-relative — NOT a
+            // hardcoded/self-relative floor). If it cannot be computed the vanishing-
+            // atom detection silently degrades (R→0 keeps rank_eff≈rank), so surface
+            // it loudly rather than hiding a re-admitted co-collapse.
+            let disp = match self.reconstruction_dispersion(&loss, &cache, rho) {
+                Ok(phi) => phi,
+                Err(e) => {
+                    log::warn!(
+                        "[#5 rank-charge] reconstruction_dispersion failed ({e}); noise floor \
+                         R→MIN_POSITIVE — vanishing-atom detection degraded this ρ-eval"
+                    );
+                    f64::MIN_POSITIVE
+                }
+            };
+            let d_eff = self.per_atom_realised_rank_dof(rho, disp)?;
+            let rank_charge: f64 = d_eff.iter().map(|&de| 0.5 * de * n_obs.ln()).sum();
+            // htt_half = the coordinate-block part of ½log|H| = Σ_i Σ_j ln diag(L_i)
+            // (= ½·Σ_i log|H_tt^(i)|; `arrow_log_det_from_cache` doubles this into
+            // `log_det`). Subtracting it removes the per-row coordinate log-det.
+            let mut htt_half = 0.0_f64;
+            for row in 0..cache.undamped_factor_count() {
+                let l = cache.undamped_factor(row);
+                for i in 0..l.nrows() {
+                    let d = l[[i, i]];
+                    if d > 0.0 {
+                        htt_half += d.ln();
+                    }
+                }
+            }
+            loss.total() + extra_penalty_energy + (0.5 * log_det - htt_half + rank_charge)
+                - occam
+        } else {
+            loss.total() + extra_penalty_energy + 0.5 * log_det - occam
+        };
         Ok((v, loss, cache))
     }
 

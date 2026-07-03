@@ -2568,6 +2568,9 @@ fn stagewise_progress_py<'py>(
     // #1939 — appended LAST so the signature stays strictly additive: existing
     // positional/kwarg callers (which never pass this) are byte-for-byte unaffected.
     cone_atom_recovery = false,
+    // #5/(B) — appended LAST (after cone_atom_recovery) so the signature stays
+    // strictly additive: existing positional/kwarg callers are byte-unaffected.
+    rank_charge_evidence = false,
 ))]
 fn sae_manifold_fit_stagewise<'py>(
     py: Python<'py>,
@@ -2599,6 +2602,7 @@ fn sae_manifold_fit_stagewise<'py>(
     row_loss_weights: Option<PyReadonlyArray1<'py, f64>>,
     progress_callback: Option<PyObject>,
     cone_atom_recovery: bool,
+    rank_charge_evidence: bool,
 ) -> PyResult<Py<PyDict>> {
     let assignment_kind = canonicalize_assignment_kind(&assignment_kind).map_err(py_value_error)?;
     let z_view = z.as_array();
@@ -2678,6 +2682,9 @@ fn sae_manifold_fit_stagewise<'py>(
     // from `quotient_scale` (which the stagewise entry never sets): this only arms
     // the stable breach-gated boundary retraction, never the #2022 per-Newton fold.
     base_term.set_cone_atom_recovery(cone_atom_recovery);
+    // #5/(B) — rank-charge evidence criterion (default false ⇒ bit-for-bit
+    // historical). Replaces the coord-block ½log|H_tt| with the realised-rank BIC.
+    base_term.set_rank_charge_evidence(rank_charge_evidence);
     // `0.0` sparsity/smoothness is the canonical "term disabled" baseline; floor
     // to a tiny positive sentinel before the log so log-ρ stays finite (mirrors
     // sae_manifold_fit; #184 sparsity, #2090 smoothness).
@@ -2778,6 +2785,9 @@ fn sae_manifold_fit_stagewise<'py>(
     // #1939 — echo the resolved cone-atom RECOVERY opt-in so a harness can VERIFY
     // the kwarg engaged (no silent no-op): the value the fit actually ran with.
     out.set_item("cone_atom_recovery_used", cone_atom_recovery)?;
+    // #5/(B) — echo the resolved rank-charge opt-in so red-tree's A/B harness can
+    // VERIFY the kwarg engaged (no silent no-op).
+    out.set_item("rank_charge_evidence_used", rank_charge_evidence)?;
     out.set_item("births_accepted", report.births_accepted)?;
     out.set_item("births_rejected", report.births_rejected)?;
     out.set_item("stopped_reason", stopped_reason)?;

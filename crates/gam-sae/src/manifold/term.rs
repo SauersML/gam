@@ -638,6 +638,18 @@ pub struct SaeManifoldTerm {
     /// (fit_drivers.rs:3227), so it cannot detonate a healthy fit. Carried across
     /// clones like the other per-fit config.
     pub(crate) cone_atom_recovery: bool,
+    /// #5/(B) — persisted per-fit opt-in (default false ⇒ bit-for-bit historical
+    /// path) for the RANK-CHARGE evidence criterion. When true, the Laplace
+    /// complexity's per-atom COORDINATE-block term ½log|H_tt| — which mis-prices
+    /// with the `log(a²‖B‖²)` scale (over-charging real atoms, rewarding
+    /// a²‖B‖²→0) — is replaced by the honest BIC ½·d_eff·log n on the atom's
+    /// realised decoder RANK: d_eff_k = rank_eff_k · basis_edf_k, rank_eff_k =
+    /// Σ_i s_i²/(s_i²+R) over the decoder singular values with a FIXED dictionary-
+    /// relative floor R (so a vanishing atom → rank→0 → charge 0 → neutral, the
+    /// co-collapse fix). Rotation-invariant; it does NOT distinguish a clean
+    /// circle from a blend (both rank-2) — that is the producer's job. Carried
+    /// across clones like the other per-fit config.
+    pub(crate) rank_charge_evidence: bool,
     /// #2023 — persisted per-fit opt-in for the dead-atom DATA-ROW reseed
     /// (default false). Set from the FFI via the typed `data_row_reseed` kwarg —
     /// no env lever. Carried across clones.
@@ -729,6 +741,7 @@ impl Clone for SaeManifoldTerm {
             separation_barrier_strength_override: self.separation_barrier_strength_override,
             quotient_scale: self.quotient_scale,
             cone_atom_recovery: self.cone_atom_recovery,
+            rank_charge_evidence: self.rank_charge_evidence,
             data_row_reseed: self.data_row_reseed,
             guards_enabled: self.guards_enabled,
             // Rung-2 behavioral identity is persisted configuration (like the

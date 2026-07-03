@@ -2831,6 +2831,9 @@ class StagewiseSAE:
     #: (echoed from the FFI). Lets a harness verify the kwarg engaged rather than
     #: assuming; default false keeps older constructors valid.
     cone_atom_recovery_used: bool = False
+    #: #5/(B) — echoed rank-charge opt-in (the value the fit ran with), so red-tree's
+    #: A/B harness can verify the flag engaged; default false keeps older payloads valid.
+    rank_charge_evidence_used: bool = False
 
     @property
     def k(self) -> int:
@@ -2929,6 +2932,7 @@ def sae_manifold_fit_stagewise(
     assignment: str = "ibp_map",
     structured_whitening: bool = True,
     cone_atom_recovery: bool = False,
+    rank_charge_evidence: bool = False,
     min_effect_ev: float = 0.0,
     max_births: int = 24,
     max_backfit_sweeps: int = 4,
@@ -3144,6 +3148,7 @@ def sae_manifold_fit_stagewise(
         max_factor_rank=int(max_factor_rank),
         structured_whitening=bool(structured_whitening),
         cone_atom_recovery=bool(cone_atom_recovery),
+        rank_charge_evidence=bool(rank_charge_evidence),
         row_loss_weights=weights_arr,
         progress_callback=progress_callback,
     )
@@ -3230,6 +3235,7 @@ def _stagewise_from_payload(
         # harness can verify the flag engaged; older payloads without the key default
         # to False.
         cone_atom_recovery_used=bool(payload.get("cone_atom_recovery_used", False)),
+        rank_charge_evidence_used=bool(payload.get("rank_charge_evidence_used", False)),
     )
 
 
