@@ -1383,12 +1383,12 @@ mod tests {
         // with W_τ provided by the family directional curvature callback.
         let eta_dot = &x_tau_beta + &gam_linalg::faer_ndarray::fast_av(&x, &b_analytic);
         let w_direction = crate::pirls::directionalworking_curvature_from_c_array(
-            &pr.solve_c_array,
-            &pr.finalweights,
+            &pr.solve_c_array.to_owned(),
+            &pr.finalweights.to_owned(),
             &eta_dot,
         );
-        let wx = RemlState::row_scale(&x, &pr.finalweights);
-        let wx_tau = RemlState::row_scale(&x_tau, &pr.finalweights);
+        let wx = RemlState::row_scale(&x, &pr.finalweights.to_owned());
+        let wx_tau = RemlState::row_scale(&x_tau, &pr.finalweights.to_owned());
         let mut xwtau_x = x.clone();
         match w_direction {
             crate::pirls::DirectionalWorkingCurvature::Diagonal(diag) => {
