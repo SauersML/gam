@@ -416,28 +416,109 @@ fn fit_single_atom_response_in_place(
     Ok(())
 }
 
-/// Lift the top residual-factor direction to an `(m, p)` birth decoder in atom
-/// 0's basis: the `p`-vector direction placed on the constant (row-0) basis row,
-/// exactly the contract [`crate::structure_harvest::apply_structure_move`]'s
-/// `Birth` expects (`born_atom` then races the topology and reshapes the seed).
-/// Returns the decoder and the top factor's explained energy (the reported dose).
+/// Per-row ANCHOR WEIGHT for birth-seed selection: how UNCONTESTED each row is by
+/// the existing dictionary. A birth is "singly-attributable" (#2080) when the new
+/// factor is present on rows where the existing atoms are NOT active — those rows
+/// give the born atom its own territory, so the joint gate cannot re-route it onto
+/// an incumbent atom's rows (the co-collapse magnet). We measure contestedness by
+/// the per-row total assignment mass (`activity_of`) and reward the rows the
+/// dictionary leaves cold: `w_i = max_activity − activity_i` (≥ 0). When the routing
+/// is UNIFORM (every row equally contested — e.g. the very first birth off a single
+/// seed active everywhere) all weights collapse to 0 and the caller falls back to the
+/// historical dominant-energy pick, so small-K behavior is unchanged.
+fn birth_anchor_weights(term: &SaeManifoldTerm) -> Array1<f64> {
+    let activity = activity_of(term);
+    let m_max = activity.iter().copied().fold(0.0_f64, f64::max);
+    if m_max > 0.0 {
+        activity.mapv(|m| (m_max - m).max(0.0))
+    } else {
+        // No existing activity at all (nothing to contest): every row is an anchor.
+        Array1::ones(activity.len())
+    }
+}
+
+/// Lift a residual-factor direction to an `(m, p)` birth decoder in atom 0's basis:
+/// the `p`-vector direction placed on the constant (row-0) basis row, exactly the
+/// contract [`crate::structure_harvest::apply_structure_move`]'s `Birth` expects
+/// (`born_atom` then races the topology and reshapes the seed). Returns the decoder
+/// and the chosen factor's explained energy (the reported dose).
+///
+/// #2080 — ANCHOR-SCORED birth-seed selection. The evidence ladder already selected
+/// `r` factor directions that each earn their complexity; the OLD selection then
+/// always birthed column 0 (the dominant residual VARIANCE). On entangled / decaying-
+/// amplitude data that repeatedly grabs the same dominant residual mixture, so
+/// successive births pile onto one direction and are born as degenerate rank-1 lines
+/// (red-tree's "2/6 factors recovered"). Instead, among the evidence-worthy columns
+/// pick the one whose residual support is most concentrated on ANCHOR rows — rows the
+/// existing dictionary leaves uncontested (`birth_anchor_weights`) — i.e. the most
+/// SINGLY-ATTRIBUTABLE factor, which lands on its own territory and separates rather
+/// than co-collapsing. Ties (and a uniform, contrast-free routing) fall back to the
+/// energy order, so the first birth off a single seed is byte-for-byte the old pick.
 fn top_factor_birth_decoder(
     term: &SaeManifoldTerm,
     model: &StructuredResidualModel,
+    residual: ArrayView2<'_, f64>,
 ) -> Option<(Array2<f64>, f64)> {
-    if model.factor_rank() == 0 {
+    let r = model.factor_rank();
+    if r == 0 {
         return None;
     }
     let factor = model.factor(); // (p, r), columns in descending explained energy
     let p = factor.nrows();
-    let energy: f64 = factor.column(0).iter().map(|v| v * v).sum();
+    let (n, p_res) = residual.dim();
+    if p_res != p || n == 0 {
+        return None;
+    }
+    let anchor_w = birth_anchor_weights(term);
+    let anchor_total: f64 = anchor_w.iter().sum();
+    // No anchor CONTRAST (uniform routing) ⇒ the historical dominant-energy pick.
+    let use_anchor = anchor_total > 0.0;
+
+    // Score each evidence-worthy factor direction by the FRACTION of its residual
+    // support energy `(R·û_j)²` that lands on anchor (uncontested) rows. Columns are
+    // energy-ordered, and a strict `>` keeps the lower (higher-energy) index on an
+    // exact tie — so a uniform anchor field reproduces the column-0 pick exactly.
+    let mut best_j = 0usize;
+    let mut best_score = f64::NEG_INFINITY;
+    if use_anchor {
+        for j in 0..r {
+            let col = factor.column(j);
+            let energy: f64 = col.iter().map(|v| v * v).sum();
+            if !(energy > 0.0) {
+                continue;
+            }
+            let inv_norm = 1.0 / energy.sqrt();
+            let mut num = 0.0_f64; // Σ_i w_i · s_i²
+            let mut den = 0.0_f64; // Σ_i s_i²
+            for i in 0..n {
+                let mut proj = 0.0_f64;
+                for out in 0..p {
+                    proj += residual[[i, out]] * col[out];
+                }
+                let s = (proj * inv_norm) * (proj * inv_norm);
+                num += anchor_w[i] * s;
+                den += s;
+            }
+            if den <= 0.0 {
+                continue;
+            }
+            let score = num / den;
+            if score > best_score {
+                best_score = score;
+                best_j = j;
+            }
+        }
+    }
+
+    let chosen = if use_anchor { best_j } else { 0 };
+    let energy: f64 = factor.column(chosen).iter().map(|v| v * v).sum();
     if !(energy > 0.0) {
         return None;
     }
     let m = term.atoms[0].basis_size();
     let mut decoder = Array2::<f64>::zeros((m, p));
     for out in 0..p {
-        decoder[[0, out]] = factor[[out, 0]];
+        decoder[[0, out]] = factor[[out, chosen]];
     }
     Some((decoder, energy))
 }
@@ -683,7 +764,9 @@ pub fn fit_stagewise(
         let Some((residual, model)) = fit_residual_covariance(&term, target, config)? else {
             break StagewiseStop::NoResidualStructure;
         };
-        let Some((birth_decoder, factor_energy)) = top_factor_birth_decoder(&term, &model) else {
+        let Some((birth_decoder, factor_energy)) =
+            top_factor_birth_decoder(&term, &model, residual.view())
+        else {
             break StagewiseStop::NoResidualStructure;
         };
         if config.structured_whitening {
@@ -1431,6 +1514,100 @@ mod tests {
         assert!(
             is_non_decreasing(&result.report.ev_trace),
             "EV trace must remain monotone"
+        );
+    }
+
+    /// #2080 — anchor-scored birth selection must prefer the SINGLY-ATTRIBUTABLE
+    /// residual factor (supported on rows the existing dictionary leaves UNCONTESTED)
+    /// over the dominant-VARIANCE factor, under an IBP routing whose per-row mass
+    /// varies. Also pins the fallback: a UNIFORM routing (no anchor contrast) keeps
+    /// the historical dominant-energy (column-0) pick.
+    #[test]
+    fn anchor_scored_birth_prefers_uncontested_factor_2080() {
+        use gam_solve::inference::residual_factor::{ResidualFactorInput, StructuredResidualModel};
+        let n = 120usize;
+        let p = 6usize;
+        let h = n / 2; // rows [0,h) contested (existing atom active), [h,n) anchor.
+        // Residual: two rank-1 FACTOR directions (shared, correlated across two
+        // channels each — the structured model captures off-diagonal correlation, so
+        // a single independent channel would read as pure diagonal noise). A STRONG
+        // factor dA (channels 0,1) lives on the CONTESTED rows; a WEAKER factor dB
+        // (channels 2,3) lives on the ANCHOR rows.
+        let inv_sqrt2 = 1.0 / 2.0_f64.sqrt();
+        let d_a = [inv_sqrt2, inv_sqrt2, 0.0, 0.0, 0.0, 0.0];
+        let d_b = [0.0, 0.0, inv_sqrt2, inv_sqrt2, 0.0, 0.0];
+        let mut residual = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            let s = (std::f64::consts::TAU * i as f64 / 11.0).cos(); // zero-mean wiggle
+            let (dir, amp) = if i < h { (&d_a, 3.0) } else { (&d_b, 2.0) };
+            for j in 0..p {
+                residual[[i, j]] = amp * s * dir[j];
+                // Small idiosyncratic noise on every channel for a well-posed D.
+                residual[[i, j]] += 0.04 * ((i * 7 + j * 13) as f64).sin();
+            }
+        }
+        let uniform_act = Array1::<f64>::ones(n);
+        let model = StructuredResidualModel::fit(ResidualFactorInput {
+            residuals: residual.view(),
+            activity: uniform_act.view(),
+            max_factor_rank: 2,
+        })
+        .unwrap();
+        assert!(model.factor_rank() >= 2, "need both planted factors");
+
+        // Seed atom over the row-fraction coordinate.
+        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
+        let coords = Array2::<f64>::from_shape_fn((n, 1), |(row, _)| row as f64 / n as f64);
+        let (atom0, cb0) = circle_atom("t0", &evaluator, &coords, 0, 1, p);
+
+        // Helper: build a 1-atom IBP term from a per-row logit column.
+        let build_ibp = |logit: &dyn Fn(usize) -> f64| -> SaeManifoldTerm {
+            let mut logits = Array2::<f64>::zeros((n, 1));
+            for row in 0..n {
+                logits[[row, 0]] = logit(row);
+            }
+            let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+                logits,
+                vec![cb0.clone()],
+                vec![LatentManifold::Circle { period: 1.0 }],
+                AssignmentMode::ibp_map(1.0, 1.0, false),
+            )
+            .unwrap();
+            SaeManifoldTerm::new(vec![atom0.clone()], assignment).unwrap()
+        };
+
+        // CONTESTED-vs-ANCHOR routing: existing atom ACTIVE on [0,h) (high logit),
+        // INACTIVE on [h,n) (low logit) — so [h,n) are the uncontested anchor rows.
+        let contrast_term = build_ibp(&|row| if row < h { 3.0 } else { -3.0 });
+        let act = activity_of(&contrast_term);
+        assert!(
+            act[0] > act[n - 1] + 1e-6,
+            "IBP activity must be higher on contested rows (got {} vs {})",
+            act[0],
+            act[n - 1]
+        );
+        let (decoder, _energy) =
+            top_factor_birth_decoder(&contrast_term, &model, residual.view()).unwrap();
+        // Chosen p-direction sits on the constant (row-0) basis row.
+        let pick_strong = decoder[[0, 0]].hypot(decoder[[0, 1]]); // contested dA (0,1)
+        let pick_anchor = decoder[[0, 2]].hypot(decoder[[0, 3]]); // uncontested dB (2,3)
+        assert!(
+            pick_anchor > pick_strong,
+            "anchor-scored birth must pick the UNCONTESTED (dB, channels 2,3) factor, not the \
+             dominant-variance (dA, channels 0,1) one: |dB|={pick_anchor:.4} |dA|={pick_strong:.4}"
+        );
+
+        // FALLBACK: uniform routing ⇒ no anchor contrast ⇒ dominant-energy column 0
+        // (channel 0, the higher-variance planted factor).
+        let uniform_term = build_ibp(&|_| 0.5);
+        let (decoder_u, _e) =
+            top_factor_birth_decoder(&uniform_term, &model, residual.view()).unwrap();
+        let u_strong = decoder_u[[0, 0]].hypot(decoder_u[[0, 1]]);
+        let u_anchor = decoder_u[[0, 2]].hypot(decoder_u[[0, 3]]);
+        assert!(
+            u_strong > u_anchor,
+            "uniform routing must fall back to the dominant-energy factor (dA, channels 0,1): \
+             |dA|={u_strong:.4} |dB|={u_anchor:.4}"
         );
     }
 
