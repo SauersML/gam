@@ -12,7 +12,7 @@
 #SBATCH --cpus-per-task=24
 #SBATCH --mem=96g
 #SBATCH --time=02:00:00
-#SBATCH --output=/projects/standard/hsiehph/sauer354/build_gamfit_f6ce7eea_%j.out
+#SBATCH --output=/projects/standard/hsiehph/sauer354/build_gamfit_current_%j.out
 set -euo pipefail
 
 ROOT=/projects/standard/hsiehph/sauer354
@@ -48,11 +48,12 @@ export CARGO_INCREMENTAL=1
 export CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 export RUST_BACKTRACE=1
 
-module load openblas/0.3.27_gcc11.3.0_multiarch 2>/dev/null || true
-OBLAS=$(dirname "$(find /common/software -name "libopenblas*.so" 2>/dev/null | grep -i "0.3.27" | head -1)" 2>/dev/null || true)
-if [ -n "$OBLAS" ]; then
-  export LIBRARY_PATH="$OBLAS:${LIBRARY_PATH:-}"
-  export LD_LIBRARY_PATH="$OBLAS:${LD_LIBRARY_PATH:-}"
+module load openblas/0.3.27_gcc11.3.0_multiarch
+OBLAS=$(printf '%s' "${LIBRARY_PATH:-}" | tr ':' '\n' | grep '/openblas/' | head -1)
+if [ -z "$OBLAS" ] || [ ! -r "$OBLAS/libopenblas.so" ]; then
+  echo "openblas module did not expose a readable libopenblas.so in LIBRARY_PATH" >&2
+  echo "LIBRARY_PATH=${LIBRARY_PATH:-}" >&2
+  exit 78
 fi
 
 echo "=== build metadata ==="
@@ -78,8 +79,8 @@ git log --oneline -1
 PROJECT_VERSION=$(awk -F\" '/^version = / {print $2; exit}' pyproject.toml)
 CRATE_VERSION=$(awk -F\" '/^version = / {print $2; exit}' crates/gam-pyffi/Cargo.toml)
 VERSION=$PROJECT_VERSION
-if [ "$PROJECT_VERSION" != "$VERSION" ] || [ "$CRATE_VERSION" != "$VERSION" ]; then
-  echo "version mismatch: pyproject=$PROJECT_VERSION crate=$CRATE_VERSION expected=$VERSION" >&2
+if [ -z "$PROJECT_VERSION" ] || [ "$CRATE_VERSION" != "$PROJECT_VERSION" ]; then
+  echo "version mismatch: pyproject=$PROJECT_VERSION crate=$CRATE_VERSION" >&2
   exit 82
 fi
 VENV=$ROOT/gamfit-$VERSION-$SHORT-venv
