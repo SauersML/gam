@@ -191,6 +191,9 @@ mod tests_encode_whitened_gls_2021;
 mod tests_coatom_sigma_coherence_2021;
 
 #[cfg(test)]
+mod tests_2101_birth_locus_probe;
+
+#[cfg(test)]
 mod tests_behavioral_fisher_rung1;
 
 #[cfg(test)]

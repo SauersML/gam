@@ -1464,6 +1464,111 @@ fn born_atom(
     Ok((child, child_rho))
 }
 
+/// #2101 — build a born atom seeded DIRECTLY as a rank-2 circle: a Periodic atom
+/// carrying the residual 2-plane on its cos/sin harmonic decoder rows and a
+/// PHASE-ALIGNED coordinate `phase_coords` (`(n, 1)`). This BYPASSES the topology
+/// race in [`born_atom`], which parameterizes the born-circle candidate with the
+/// TEMPLATE atom's coordinate (`topology_candidates_for_dim` reuses the seed
+/// coords) — the wrong phase for a fresh disjoint circle, which leaves the born
+/// image `Φ·B` at the DC stationary point where cos/sin never populate. Seeding the
+/// fresh phase directly gives the coordinate a nonzero gradient at birth (the birth
+/// analogue of the 7a93b1d06 cold-start chart deflation). Mirrors `born_atom`'s
+/// logit / coord / ρ construction so the born atom joins the dictionary identically.
+pub(crate) fn born_circle_atom(
+    term: &SaeManifoldTerm,
+    rho: &SaeManifoldRho,
+    harmonic_decoder: Array2<f64>,
+    phase_coords: Array2<f64>,
+    circle_present: Vec<bool>,
+) -> Result<(SaeManifoldTerm, SaeManifoldRho), String> {
+    let k = term.k_atoms();
+    if term.atoms.is_empty() {
+        return Err("born_circle_atom: cannot birth from an empty dictionary".to_string());
+    }
+    let m = term.atoms[0].basis_size();
+    let p = term.output_dim();
+    if harmonic_decoder.dim() != (m, p) {
+        return Err(format!(
+            "born_circle_atom: harmonic decoder must be ({m}, {p}); got {:?}",
+            harmonic_decoder.dim()
+        ));
+    }
+    let n = term.assignment.logits.nrows();
+    if phase_coords.dim() != (n, 1) {
+        return Err(format!(
+            "born_circle_atom: phase coords must be ({n}, 1); got {:?}",
+            phase_coords.dim()
+        ));
+    }
+    // A Periodic harmonic basis of the template's width, evaluated at the FRESH
+    // phase coordinate the born circle lives on.
+    let evaluator = std::sync::Arc::new(crate::manifold::PeriodicHarmonicEvaluator::new(m)?);
+    let (phi, jet) = {
+        use crate::manifold::SaeBasisEvaluator;
+        evaluator.evaluate(phase_coords.view())?
+    };
+    let mut born = SaeManifoldAtom::new(
+        format!("atom_born_{k}"),
+        SaeAtomBasisKind::Periodic,
+        1,
+        phi,
+        jet,
+        harmonic_decoder,
+        Array2::<f64>::eye(m),
+    )?
+    .with_basis_second_jet(evaluator.clone());
+    born.refresh_intrinsic_smooth_penalty();
+
+    let born_coord_block = gam_terms::latent::LatentCoordValues::from_matrix_with_manifold(
+        phase_coords.view(),
+        LatentIdMode::None,
+        LatentManifold::Circle { period: 1.0 },
+    );
+
+    let mut atoms = term.atoms.clone();
+    atoms.push(born);
+    let mut logits = Array2::<f64>::zeros((n, k + 1));
+    for row in 0..n {
+        for col in 0..k {
+            logits[[row, col]] = term.assignment.logits[[row, col]];
+        }
+        // #2101 PRESENCE-PROPORTIONAL gate seed. The flat weak BIRTH_SEED_LOGIT (−4)
+        // is fatal under IBP — the born circle starts nearly OFF (σ(−4)≈0.018) and
+        // the sub-fit collapses it (measured: ibp logit −4 collapses ‖B‖ 1.41→1e-4,
+        // logit +3 survives). WHERE the born circle is PRESENT (its 2-plane energy
+        // clears the derived MP floor, `circle_present[row]`), route it CO-ACTIVE
+        // with the incumbent dictionary (per-row max of existing logits) so it has
+        // the gate to establish; elsewhere keep the conservative birth default. The
+        // scale is the dictionary's own logits and the presence is the derived λ₊
+        // floor — no new constant (replaces the unjustified −4 on present rows).
+        let present = circle_present.get(row).copied().unwrap_or(true);
+        let inc_max = (0..k)
+            .map(|c| term.assignment.logits[[row, c]])
+            .fold(f64::NEG_INFINITY, f64::max);
+        logits[[row, k]] = if present && inc_max.is_finite() {
+            inc_max
+        } else {
+            BIRTH_SEED_LOGIT
+        };
+    }
+    let mut coords = term.assignment.coords.clone();
+    coords.push(born_coord_block);
+    let assignment =
+        crate::manifold::SaeAssignment::with_mode(logits, coords, term.assignment.mode)?;
+    let child = SaeManifoldTerm::new(atoms, assignment)?;
+
+    let mut child_rho = rho.clone();
+    let inherited = child_rho
+        .log_ard
+        .first()
+        .cloned()
+        .unwrap_or_else(|| Array1::<f64>::zeros(0));
+    child_rho.log_ard.push(inherited);
+    let inherited_smooth = child_rho.log_lambda_smooth.first().copied().unwrap_or(0.0);
+    child_rho.log_lambda_smooth.push(inherited_smooth);
+    Ok((child, child_rho))
+}
+
 /// A held-out row-block shard for the universal-inference estimation/evaluation
 /// split the gates run over: a contiguous block of row indices into the FULL
 /// target the triggers were not tuned on.

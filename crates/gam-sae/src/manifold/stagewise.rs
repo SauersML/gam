@@ -439,6 +439,28 @@ fn birth_anchor_weights(term: &SaeManifoldTerm) -> Array1<f64> {
     }
 }
 
+/// A birth-candidate seed. `decoder` is the born atom's decoder in atom-0's basis;
+/// `energy` is the chosen direction's explained variance (the reported dose). When
+/// the residual carries a genuine rank-2 (circular) structure, `circle_coords` is
+/// `Some(t)` — a PHASE-ALIGNED per-row coordinate `(n, 1)` — so the born atom is
+/// seeded directly ON a circle (harmonic decoder rows + aligned chart) rather than
+/// at the DC-row stationary point that leaves cos/sin dead (#2101). `None` is the
+/// rank-1 / shared-factor fallback: the historical row-0 (DC) seed that
+/// [`crate::structure_harvest::apply_structure_move`]'s `Birth` races the topology on.
+struct BirthSeed {
+    decoder: Array2<f64>,
+    energy: f64,
+    circle_coords: Option<Array2<f64>>,
+    /// Per-row PRESENCE of the born circle: `true` where its 2-plane energy `ρ_i²`
+    /// clears the derived noise floor `2·λ₊` (the circle actually contributes on
+    /// that row). `born_circle_atom` routes the born atom at the incumbent gate
+    /// scale on present rows and the conservative birth default elsewhere — a
+    /// presence-proportional gate seed that lets the circle ESTABLISH under IBP
+    /// (the flat `BIRTH_SEED_LOGIT` starves it), derived from `λ₊` + the
+    /// dictionary's own logits with no new constant. `None` for the DC fallback.
+    circle_present: Option<Vec<bool>>,
+}
+
 /// Lift a residual-factor direction to an `(m, p)` birth decoder in atom 0's basis:
 /// the `p`-vector direction placed on the constant (row-0) basis row, exactly the
 /// contract [`crate::structure_harvest::apply_structure_move`]'s `Birth` expects
@@ -460,7 +482,7 @@ fn top_factor_birth_decoder(
     term: &SaeManifoldTerm,
     model: &StructuredResidualModel,
     residual: ArrayView2<'_, f64>,
-) -> Option<(Array2<f64>, f64)> {
+) -> Option<BirthSeed> {
     let r = model.factor_rank();
     if r == 0 {
         return None;
@@ -522,7 +544,15 @@ fn top_factor_birth_decoder(
     for out in 0..p {
         decoder[[0, out]] = factor[[out, chosen]];
     }
-    Some((decoder, energy))
+    // Shared-factor path keeps the historical row-0 seed for now (the disjoint
+    // recovery rides on `residual_principal_birth_candidate`, which is where the
+    // #2101 circle seed lands). Mirror the 2-plane seed here once disjoint is proven.
+    Some(BirthSeed {
+        decoder,
+        energy,
+        circle_coords: None,
+        circle_present: None,
+    })
 }
 
 /// #2080 DISJOINT-extraction fallback birth candidate. [`StructuredResidualModel`]
@@ -555,7 +585,7 @@ fn top_factor_birth_decoder(
 fn residual_principal_birth_candidate(
     term: &SaeManifoldTerm,
     residual: ArrayView2<'_, f64>,
-) -> Option<(Array2<f64>, f64)> {
+) -> Option<BirthSeed> {
     let (n, p) = residual.dim();
     if n < 2 || p == 0 || term.atoms.is_empty() {
         return None;
@@ -636,16 +666,101 @@ fn residual_principal_birth_candidate(
     if !(energy > 0.0) {
         return None;
     }
-    // Lift to a birth decoder: the principal p-direction scaled by its amplitude
-    // √λ on the constant (row-0) basis row (matches top_factor_birth_decoder's
-    // energy-scaled convention, so the reported dose is the direction's variance).
-    let amp = energy.sqrt();
     let m = term.atoms[0].basis_size();
+
+    // #2101 CIRCLE SEED. A disjoint circle occupies a rank-2 PLANE (its cos/sin
+    // axes carry ~equal variance), so the residual's dominant structure is a
+    // 2-PLANE, not one direction. The historical seed put ONE direction on the
+    // CONSTANT (row-0) basis row, making the birth image `Φ·B` coordinate-
+    // independent — a stationary point at which the coordinate has no gradient and
+    // the cos/sin rows never populate (the born atom stays a constant, `chart
+    // survives / decoder is not a circle`). Instead, when a SECOND direction also
+    // clears the MP edge (a genuine 2-plane, not a sin row hallucinated from
+    // noise), seed the born atom directly ON a circle: the 2-plane on the harmonic
+    // (cos/sin) rows and a PHASE-ALIGNED coordinate. This is the birth analogue of
+    // the 7a93b1d06 cold-start chart deflation and breaks the stationary point
+    // (the coordinate gradient is nonzero at the seed). Everything is DERIVED from
+    // the residual SVD + the existing MP floor — no magic constant (SPEC-19).
+    let template_is_circle =
+        matches!(term.atoms[0].basis_kind, SaeAtomBasisKind::Periodic) && m >= 3;
+    if template_is_circle {
+        // The circle's OTHER axis is the above-floor direction whose eigenvalue is
+        // CLOSEST to `best`'s: a circle's cos/sin axes carry ~EQUAL variance, so its
+        // mate is the near-degenerate eigenvalue — not merely the next-strongest
+        // direction, which on a multi-structure residual could belong to a DIFFERENT
+        // factor (pairing two unrelated rank-1 signals into a fake circle).
+        let best2 = above
+            .iter()
+            .copied()
+            .filter(|&k| k != best)
+            .min_by(|&a, &b| {
+                (evals[a] - evals[best])
+                    .abs()
+                    .total_cmp(&(evals[b] - evals[best]).abs())
+            });
+        // Circle VALIDITY: a genuine circle's cos/sin axes are near-DEGENERATE
+        // (equal population variance), so require the two eigenvalues to agree within
+        // their sampling spread `√(2/n)·λ` — the asymptotic std. of a sample
+        // eigenvalue. Two UNEQUAL signal directions (independent factors that share no
+        // circle) fail this and fall through to the rank-1 row-0 seed, so the fallback
+        // never HALLUCINATES a circle by pairing unrelated structure. Derived from the
+        // eigenvalue sampling law — no magic constant (SPEC-19).
+        let degenerate = best2.is_some_and(|b2| {
+            let (l1, l2) = (evals[best].max(0.0), evals[b2].max(0.0));
+            (l1 - l2).abs() <= (l1 + l2) * (2.0 / n as f64).sqrt()
+        });
+        if let (Some(best2), true) = (best2, degenerate) {
+            let a1 = evals[best].max(0.0).sqrt();
+            let a2 = evals[best2].max(0.0).sqrt();
+            // Harmonic seed: cos row (1) = √λ1·u1, sin row (2) = √λ2·u2, DC row-0 = 0.
+            let mut decoder = Array2::<f64>::zeros((m, p));
+            for j in 0..p {
+                decoder[[1, j]] = a1 * evecs[[j, best]];
+                decoder[[2, j]] = a2 * evecs[[j, best2]];
+            }
+            // Phase-aligned coordinate t_i = atan2(⟨r_i,u2⟩, ⟨r_i,u1⟩)/2π ∈ [0,1)
+            // over the COLUMN-CENTERED residual (the plane the SVD found). The SAME
+            // (u1,u2) feed the decoder rows and the atan2, so the handedness is
+            // internally consistent.
+            // Per-row phase AND presence: a row's 2-plane energy ρ_i²=proj1²+proj2²
+            // clearing the noise floor `2·λ₊` (two noise directions at the derived MP
+            // edge) means the born circle actually contributes there — the gate seed.
+            let noise_2plane = 2.0 * mp_edge;
+            let mut coords = Array2::<f64>::zeros((n, 1));
+            let mut present = vec![false; n];
+            for i in 0..n {
+                let (mut proj1, mut proj2) = (0.0_f64, 0.0_f64);
+                for j in 0..p {
+                    let ri = residual[[i, j]] - mean[j];
+                    proj1 += ri * evecs[[j, best]];
+                    proj2 += ri * evecs[[j, best2]];
+                }
+                coords[[i, 0]] =
+                    proj2.atan2(proj1).rem_euclid(std::f64::consts::TAU) / std::f64::consts::TAU;
+                present[i] = (proj1 * proj1 + proj2 * proj2) > noise_2plane;
+            }
+            return Some(BirthSeed {
+                decoder,
+                energy,
+                circle_coords: Some(coords),
+                circle_present: Some(present),
+            });
+        }
+    }
+
+    // Rank-1 fallback (a genuine line, a partially-extracted circle, or a
+    // non-periodic template): keep the historical row-0 (DC) seed + topology race.
+    let amp = energy.sqrt();
     let mut decoder = Array2::<f64>::zeros((m, p));
     for j in 0..p {
         decoder[[0, j]] = amp * evecs[[j, best]];
     }
-    Some((decoder, energy))
+    Some(BirthSeed {
+        decoder,
+        energy,
+        circle_coords: None,
+        circle_present: None,
+    })
 }
 
 /// Refit a SINGLE atom `k` in place on its leave-one-atom-out partial residual —
@@ -897,12 +1012,13 @@ pub fn fit_stagewise(
         // noise floor inside the fallback is now the stop criterion (residual is noise
         // ⇒ `None` ⇒ stop), not `factor_rank == 0`; the evidence gate below stays the
         // birth-or-stop quality control, so a variance-seeded candidate is safe.
-        let Some((birth_decoder, factor_energy)) =
+        let Some(seed) =
             top_factor_birth_decoder(&term, &model, residual.view())
                 .or_else(|| residual_principal_birth_candidate(&term, residual.view()))
         else {
             break StagewiseStop::NoResidualStructure;
         };
+        let factor_energy = seed.energy;
         if config.structured_whitening {
             // Install Σ^{-1} as the per-row whitened metric (carried into clones).
             term.set_row_metric(model.row_metric(n)?)?;
@@ -995,12 +1111,27 @@ pub fn fit_stagewise(
                 rho: &rho,
             },
         )?;
-        let mut cand_a = apply_structure_move(
-            &term,
-            &rho,
-            &StructureMove::Birth { candidate: 0 },
-            std::slice::from_ref(&birth_decoder),
-        )
+        // #2101: a circle seed (rank-2 2-plane + phase-aligned coordinate) is built
+        // DIRECTLY as a Periodic atom — bypassing the topology race, which
+        // parameterizes the born circle with the TEMPLATE's coordinate (the wrong
+        // phase for a fresh disjoint circle). The rank-1 / shared-factor fallback
+        // keeps the historical DC-row seed + race.
+        let born_move = match &seed.circle_coords {
+            Some(coords) => crate::structure_harvest::born_circle_atom(
+                &term,
+                &rho,
+                seed.decoder.clone(),
+                coords.clone(),
+                seed.circle_present.clone().unwrap_or_else(|| vec![true; n]),
+            ),
+            None => apply_structure_move(
+                &term,
+                &rho,
+                &StructureMove::Birth { candidate: 0 },
+                std::slice::from_ref(&seed.decoder),
+            ),
+        };
+        let mut cand_a = born_move
         .and_then(|(mut cand_term, mut cand_rho)| {
             cand_term.set_guards_enabled(false);
             let born = cand_term.k_atoms() - 1;
@@ -1720,8 +1851,9 @@ mod tests {
             act[0],
             act[n - 1]
         );
-        let (decoder, _energy) =
-            top_factor_birth_decoder(&contrast_term, &model, residual.view()).unwrap();
+        let decoder = top_factor_birth_decoder(&contrast_term, &model, residual.view())
+            .unwrap()
+            .decoder;
         // Chosen p-direction sits on the constant (row-0) basis row.
         let pick_strong = decoder[[0, 0]].hypot(decoder[[0, 1]]); // contested dA (0,1)
         let pick_anchor = decoder[[0, 2]].hypot(decoder[[0, 3]]); // uncontested dB (2,3)
@@ -1734,8 +1866,9 @@ mod tests {
         // FALLBACK: uniform routing ⇒ no anchor contrast ⇒ dominant-energy column 0
         // (channel 0, the higher-variance planted factor).
         let uniform_term = build_ibp(&|_| 0.5);
-        let (decoder_u, _e) =
-            top_factor_birth_decoder(&uniform_term, &model, residual.view()).unwrap();
+        let decoder_u = top_factor_birth_decoder(&uniform_term, &model, residual.view())
+            .unwrap()
+            .decoder;
         let u_strong = decoder_u[[0, 0]].hypot(decoder_u[[0, 1]]);
         let u_anchor = decoder_u[[0, 2]].hypot(decoder_u[[0, 3]]);
         assert!(
@@ -1781,12 +1914,19 @@ mod tests {
                 residual[[i, j]] += 0.03 * rng();
             }
         }
-        let got = residual_principal_birth_candidate(&term, residual.view());
-        let (decoder, energy) = got.expect(
+        let seed = residual_principal_birth_candidate(&term, residual.view()).expect(
             "disjoint block-diagonal residual must yield a fallback candidate \
              (structure above the derived MP noise floor)",
         );
+        let (decoder, energy) = (seed.decoder, seed.energy);
         assert!(energy > 0.0 && energy.is_finite());
+        // Two UNEQUAL independent signals (var 4 vs 2.25) are NOT a circle — the
+        // eigenvalue-degeneracy gate rejects the 2-plane, so this exercises the
+        // rank-1 row-0 fallback (circle_coords None, direction on the constant row).
+        assert!(
+            seed.circle_coords.is_none(),
+            "unequal independent signals must NOT be seeded as a circle"
+        );
         // The chosen direction must be a real signal direction (mass on channels 0-3),
         // not a noise channel.
         let sig_mass: f64 = (0..4).map(|j| decoder[[0, j]].powi(2)).sum();
@@ -1807,6 +1947,107 @@ mod tests {
         assert!(
             residual_principal_birth_candidate(&term, noise.view()).is_none(),
             "pure-noise residual must be below the derived MP floor ⇒ no candidate (stop)"
+        );
+    }
+
+    /// #2101 RECOVERY GUARD — a genuine disjoint CIRCLE residual must be seeded as a
+    /// rank-2 circle: the 2-plane on the cos/sin HARMONIC rows (NOT the DC row-0), a
+    /// phase-aligned coordinate that SPANS and recovers the planted angle up to gauge.
+    /// This is the birth-seed fix that breaks the DC stationary point (#2101); the
+    /// old row-0 seed produced a constant (cos/sin dead) and this asserts against it.
+    #[test]
+    fn residual_principal_seeds_circle_as_rank2_not_dc_2101() {
+        let n = 240usize;
+        let p = 8usize;
+        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
+        let coords = Array2::<f64>::from_shape_fn((n, 1), |(row, _)| row as f64 / n as f64);
+        let (atom0, cb0) = circle_atom("t0", &evaluator, &coords, 0, 1, p);
+        let (term, _rho) = build_term(vec![atom0], vec![cb0], &vec![vec![true]; n]);
+
+        // A real circle on channels (2,3): equal-variance cos/sin axes + tiny noise.
+        let mut state = 0x5EED_2101_u64;
+        let mut rng = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f64) / ((1u64 << 31) as f64)
+        };
+        let mut residual = Array2::<f64>::zeros((n, p));
+        let mut planted = vec![0.0_f64; n];
+        for i in 0..n {
+            let theta = std::f64::consts::TAU * rng();
+            planted[i] = theta;
+            residual[[i, 2]] = theta.cos();
+            residual[[i, 3]] = theta.sin();
+            for j in 0..p {
+                residual[[i, j]] += 0.02 * (rng() - 0.5);
+            }
+        }
+        let seed = residual_principal_birth_candidate(&term, residual.view())
+            .expect("a real circle residual must yield a birth candidate");
+        let born_coords = seed.circle_coords.clone().expect(
+            "a circle residual must be seeded as a rank-2 CIRCLE (circle_coords Some), \
+             not a DC direction",
+        );
+
+        // Harmonic (cos/sin) rows carry the mass; the DC row-0 is ~0.
+        let dc: f64 = (0..p).map(|j| seed.decoder[[0, j]].powi(2)).sum::<f64>().sqrt();
+        let harm: f64 = (0..p)
+            .map(|j| seed.decoder[[1, j]].powi(2) + seed.decoder[[2, j]].powi(2))
+            .sum::<f64>()
+            .sqrt();
+        assert!(
+            harm > 10.0 * dc.max(1e-9),
+            "circle seed must put mass on the cos/sin rows, not the DC row: harm={harm:.3} dc={dc:.3}"
+        );
+        // The 2-plane must land on the planted channels (2,3), not elsewhere.
+        let on_plane: f64 = [2usize, 3]
+            .iter()
+            .map(|&j| seed.decoder[[1, j]].powi(2) + seed.decoder[[2, j]].powi(2))
+            .sum();
+        let off_plane: f64 = (0..p)
+            .filter(|&j| j != 2 && j != 3)
+            .map(|j| seed.decoder[[1, j]].powi(2) + seed.decoder[[2, j]].powi(2))
+            .sum();
+        assert!(
+            on_plane > off_plane,
+            "circle seed 2-plane must land on the planted channels (2,3): on={on_plane:.3} off={off_plane:.3}"
+        );
+
+        // The phase-aligned coordinate SPANS (breaks the DC stationary point).
+        let cmin = born_coords.iter().copied().fold(f64::INFINITY, f64::min);
+        let cmax = born_coords.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            cmax - cmin > 0.5,
+            "seeded coordinate must span the circle (breaks the stationary point); range={:.3}",
+            cmax - cmin
+        );
+        // ...and recovers the planted angle up to gauge (reflection ± + phase). Score
+        // the best-aligned circular RMSE over both reflections.
+        let mut best_rmse = f64::INFINITY;
+        for &sign in &[1.0_f64, -1.0] {
+            let (mut cs, mut sn) = (0.0_f64, 0.0_f64);
+            for i in 0..n {
+                let r = std::f64::consts::TAU * born_coords[[i, 0]] - sign * planted[i];
+                cs += r.cos();
+                sn += r.sin();
+            }
+            let phase = sn.atan2(cs);
+            let mut sse = 0.0_f64;
+            for i in 0..n {
+                let mut e = (std::f64::consts::TAU * born_coords[[i, 0]] - sign * planted[i] - phase)
+                    .rem_euclid(std::f64::consts::TAU);
+                if e > std::f64::consts::PI {
+                    e -= std::f64::consts::TAU;
+                }
+                sse += e * e;
+            }
+            best_rmse = best_rmse.min((sse / n as f64).sqrt());
+        }
+        assert!(
+            best_rmse < 0.15,
+            "seeded coordinate must recover the planted circle phase up to gauge; \
+             gauge-aligned circular RMSE = {best_rmse:.3} rad"
         );
     }
 
