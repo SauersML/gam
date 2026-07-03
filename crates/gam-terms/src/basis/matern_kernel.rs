@@ -48,7 +48,27 @@ pub fn build_thin_plate_basiswithworkspace(
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
     let poly_cols = thin_plate_polynomial_basis_dimension(data.ncols());
-    let center_strategy = thin_plate_augmented_center_strategy(&spec.center_strategy, poly_cols);
+    // Canonical TPS reserves `poly_cols = M(d)` extra centers for the
+    // polynomial nullspace on top of the requested knot count (see
+    // `thin_plate_augmented_center_strategy`). In high dimension M(d) explodes
+    // (M(16) = 735_471) and the augmented request dwarfs the sample size, so
+    // asking `select_centers_by_strategy` for `k + M(d)` centers hard-errors
+    // ("requested N centers but data has n rows") and used to fail the whole
+    // fit before the hybrid-Duchon fallback below could engage. Decide up front
+    // whether the augmented canonical request even fits in the data: if it does,
+    // augment and build canonical TPS; if not, canonical TPS is infeasible here,
+    // so select the UN-augmented knots (the fit stays at the user's requested
+    // resolution rather than ballooning to `n` centers) and let the
+    // infeasibility gate below delegate to the hybrid Duchon generalization.
+    let augmented_strategy = thin_plate_augmented_center_strategy(&spec.center_strategy, poly_cols);
+    let augmented_fits_in_data = center_strategy_num_centers(&augmented_strategy)
+        .map(|augmented_count| augmented_count <= data.nrows())
+        .unwrap_or(true);
+    let center_strategy = if augmented_fits_in_data {
+        augmented_strategy
+    } else {
+        spec.center_strategy.clone()
+    };
     let original_centers = select_centers_by_strategy(data, &center_strategy)?;
     let centers = expand_periodic_centers(&original_centers, spec.periodic.as_deref())?;
     // Canonical TPS in dimension d uses penalty order m = ⌊d/2⌋+1 and a

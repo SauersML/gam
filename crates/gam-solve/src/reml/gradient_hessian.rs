@@ -2065,7 +2065,7 @@ impl<'a> RemlState<'a> {
                         Self::build_firth_dense_operator_for_link(
                             &jeffreys_link,
                             x_dense.as_ref(),
-                            &pirls_result.final_eta,
+                            &pirls_result.final_eta.to_owned(),
                             self.weights,
                         )?,
                     ))
@@ -2219,7 +2219,7 @@ impl<'a> RemlState<'a> {
                 Self::build_firth_dense_operator_for_link(
                     &jeffreys_link,
                     &x_eff_dense,
-                    &pirls_result.final_eta,
+                    &pirls_result.final_eta.to_owned(),
                     self.weights,
                 )?,
             ))
@@ -2441,7 +2441,7 @@ impl<'a> RemlState<'a> {
         // `final_eta`, `finalweights`, `beta_transformed` and `x_transformed`
         // are all mutually consistent.
         let h_total = bundle.h_total.as_ref();
-        let c_weights = &pirls_result.solve_c_array;
+        let c_weights = &pirls_result.solve_c_array.to_owned();
         let x_design = &pirls_result.x_transformed;
         let p = h_total.nrows();
         if p == 0 || c_weights.len() != x_design.nrows() {
@@ -2572,8 +2572,8 @@ impl<'a> RemlState<'a> {
             x_transformed: x_dense.as_ref(),
             block_vecs,
             block_lambdas,
-            eta_hat: pirls_result.final_eta.clone(),
-            weights_obs: pirls_result.finalweights.clone(),
+            eta_hat: pirls_result.final_eta.to_owned(),
+            weights_obs: pirls_result.finalweights.to_owned(),
             y: self.y.to_owned(),
             prior_weights: self.weights.to_owned(),
             likelihood: self.config.likelihood.clone(),
@@ -3206,8 +3206,8 @@ impl<'a> RemlState<'a> {
         pirls_result: &PirlsResult,
     ) -> Result<(Array1<f64>, Array1<f64>), EstimationError> {
         Ok((
-            pirls_result.solve_c_array.clone(),
-            pirls_result.solve_d_array.clone(),
+            pirls_result.solve_c_array.to_owned(),
+            pirls_result.solve_d_array.to_owned(),
         ))
     }
 
@@ -3221,7 +3221,7 @@ impl<'a> RemlState<'a> {
             pirls_result.solve_weights_psd(),
             &c_array,
             &d_array,
-            &pirls_result.final_eta,
+            &pirls_result.final_eta.to_owned(),
             &self.config.link_kind,
         ))
     }
@@ -3258,8 +3258,8 @@ impl<'a> RemlState<'a> {
         &self,
         pirls_result: &PirlsResult,
     ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
-        let c_array = pirls_result.solve_c_array.clone();
-        let d_array = pirls_result.solve_d_array.clone();
+        let c_array = pirls_result.solve_c_array.to_owned();
+        let d_array = pirls_result.solve_d_array.to_owned();
         let n = d_array.len();
         let mut e_array = Array1::<f64>::zeros(n);
 
@@ -5964,6 +5964,9 @@ impl<'a> RemlState<'a> {
             centered_weighted_y_sq,
             row_prediction_is_stale: false,
             xtwx_sparse_orig,
+            // Exact (non-stale) path: rows are freshly realised from the design,
+            // so there is no shared frozen-row bundle to attach (#1868).
+            frozen_rows: None,
         });
         log::info!(
             "[gaussian-fixed-cache] built p={} n={} in {:.3} ms",
@@ -6010,7 +6013,7 @@ impl<'a> RemlState<'a> {
                 let firth_op = Arc::new(Self::build_firth_dense_operator_for_link(
                     &jeffreys_link,
                     x_dense.as_ref(),
-                    &pirls_result.final_eta,
+                    &pirls_result.final_eta.to_owned(),
                     self.weights,
                 )?);
                 log::debug!(
@@ -6181,7 +6184,7 @@ impl<'a> RemlState<'a> {
                 Some(Arc::new(Self::build_firth_dense_operator_for_link(
                     &jeffreys_link,
                     x_dense.as_ref(),
-                    &pirls_result.final_eta,
+                    &pirls_result.final_eta.to_owned(),
                     self.weights,
                 )?))
             }

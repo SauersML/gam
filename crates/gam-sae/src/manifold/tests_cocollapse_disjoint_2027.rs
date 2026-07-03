@@ -437,3 +437,144 @@ pub(crate) fn structural_coherence_detector_fires_on_duplicate_not_orthogonal_20
         hit.2
     );
 }
+
+/// #2100 — turning the `quotient_scale` SCALE-gauge lever ON must NOT detonate a
+/// healthy fit. The pre-fix #2022 decoder peel folded EVERY atom's ‖B_k‖ into its
+/// log-amplitude on EVERY β-Newton line-search TRIAL (inside `apply_newton_step_impl`),
+/// forcing ‖B_k‖≡1 mid-solve and fighting the β-Newton magnitude step; the next step
+/// took a runaway magnitude correction that compounded to a reconstruction EV of
+/// ≈ −5.8e128 on the healthy K=2 two-circle dictionary (norms crushed to
+/// [1.00, 0.187]). The fix removes that per-trial fold and moves the unit-Frobenius
+/// retraction to the ACCEPTED-iterate boundary, gated to COLLAPSED atoms only
+/// (`retract_collapsed_decoders_in_loop`) — so on a HEALTHY dictionary nothing
+/// breaches and the ON path reproduces the OFF baseline (EV ≈ +0.43). Pre-fix this
+/// test FAILS (EV explodes to ≈ −1e128); post-fix it PASSES.
+#[test]
+pub(crate) fn quotient_scale_on_does_not_detonate_healthy_k2_two_circle_2100() {
+    let n = 96usize;
+    let p = 16usize;
+    let m = 5usize;
+
+    // OFF baseline (default lever) — the healthy EV the ON path must match.
+    let (mut off, target) = two_circle_k2_term(n, p, m);
+    let mut rho_off = SaeManifoldRho::new(
+        0.0,
+        -6.0,
+        vec![Array1::<f64>::zeros(1), Array1::<f64>::zeros(1)],
+    );
+    off.run_joint_fit_arrow_schur(target.view(), &mut rho_off, None, 60, 0.05, 1.0e-3, 1.0e-3)
+        .unwrap();
+    let ev_off = off
+        .dictionary_reconstruction_ev(target.view(), &rho_off)
+        .unwrap();
+    assert!(
+        ev_off.is_finite() && ev_off > 0.3,
+        "OFF baseline must be a healthy positive EV (~+0.43); got {ev_off:.4}"
+    );
+
+    // ON — identical fixture, `quotient_scale` engaged.
+    let (mut on, _t) = two_circle_k2_term(n, p, m);
+    on.set_quotient_scale(true);
+    let mut rho_on = SaeManifoldRho::new(
+        0.0,
+        -6.0,
+        vec![Array1::<f64>::zeros(1), Array1::<f64>::zeros(1)],
+    );
+    let loss = on
+        .run_joint_fit_arrow_schur(target.view(), &mut rho_on, None, 60, 0.05, 1.0e-3, 1.0e-3)
+        .unwrap();
+    assert!(
+        loss.total().is_finite(),
+        "quotient_scale ON: joint fit loss must stay finite (no runaway magnitude)"
+    );
+    let ev_on = on
+        .dictionary_reconstruction_ev(target.view(), &rho_on)
+        .unwrap();
+    let norms: Vec<f64> = on
+        .atoms
+        .iter()
+        .map(|a| {
+            a.decoder_coefficients
+                .iter()
+                .map(|v| v * v)
+                .sum::<f64>()
+                .sqrt()
+        })
+        .collect();
+    eprintln!(
+        "[#2100 repro] quotient_scale ON: EV={ev_on:.4} (OFF={ev_off:.4}), norms={norms:.4?}"
+    );
+    assert!(
+        ev_on.is_finite() && ev_on > 0.3,
+        "quotient_scale ON DETONATED a healthy K=2 fit: EV={ev_on:.4e} (expected finite > 0.3, \
+         matching the OFF baseline {ev_off:.4}). The #2022 per-β-Newton decoder peel must NOT \
+         run mid-solve — the unit-Frobenius retraction belongs at the accepted-iterate boundary, \
+         gated to collapsed atoms."
+    );
+    // On a healthy dictionary nothing breaches the collapse ratio, so the ON path is
+    // effectively inert: the recovered EV must track the OFF baseline closely (not a
+    // coincidentally-positive but degraded fit).
+    assert!(
+        (ev_on - ev_off).abs() <= 0.1 * (1.0 + ev_off.abs()),
+        "quotient_scale ON must track the OFF baseline on a healthy fit: ON={ev_on:.4} vs \
+         OFF={ev_off:.4}"
+    );
+}
+
+/// #2100 (K=1 arm) — turning `quotient_scale` ON must NOT crash a single-atom fit.
+/// The issue's second failure mode: a healthy K=1 fit collapsed (EV 0.9975 → 0.0,
+/// s → −43) because the per-β-Newton fold at `apply_newton_step_impl` folded the lone
+/// decoder's ‖B‖ into `s` on every trial, so `s` ran away and `B` was crushed. With
+/// that per-trial fold removed and the boundary retraction early-outing at K<2 (a lone
+/// low-amplitude decoder is healthy, never retracted), the ON fit must stay finite and
+/// healthy — tracking the OFF baseline closely. (It is NOT bit-for-bit identical: the
+/// pre-existing #2022 refit-peel legitimately re-expresses the absolute decoder as a
+/// unit frame + `s` at the seeding refit, an image-frozen coordinate change that nudges
+/// the optimization trajectory by ~1e-5 without harming the fit — so this asserts
+/// crash-freedom and OFF-tracking, not equality.) Pre-fix the ON fit collapses
+/// (EV → 0); post-fix it is healthy.
+#[test]
+pub(crate) fn quotient_scale_on_does_not_crash_k1_2100() {
+    let n = 96usize;
+    let p = 16usize;
+    let m = 5usize;
+
+    let target = two_circle_whitened_target(n, p, 0.05);
+
+    let mut off = two_circle_kn_term(n, p, m, 1);
+    let mut rho_off = SaeManifoldRho::new(0.0, -6.0, vec![Array1::<f64>::zeros(1)]);
+    off.run_joint_fit_arrow_schur(target.view(), &mut rho_off, None, 60, 0.05, 1.0e-3, 1.0e-3)
+        .unwrap();
+    let ev_off = off
+        .dictionary_reconstruction_ev(target.view(), &rho_off)
+        .unwrap();
+    assert!(
+        ev_off.is_finite() && ev_off > 0.2,
+        "K=1 OFF baseline must be a healthy positive EV; got {ev_off:.4}"
+    );
+
+    let mut on = two_circle_kn_term(n, p, m, 1);
+    on.set_quotient_scale(true);
+    let mut rho_on = SaeManifoldRho::new(0.0, -6.0, vec![Array1::<f64>::zeros(1)]);
+    let loss = on
+        .run_joint_fit_arrow_schur(target.view(), &mut rho_on, None, 60, 0.05, 1.0e-3, 1.0e-3)
+        .unwrap();
+    assert!(loss.total().is_finite(), "K=1 ON: loss must stay finite");
+    let ev_on = on
+        .dictionary_reconstruction_ev(target.view(), &rho_on)
+        .unwrap();
+    let s = on.atoms[0].log_amplitude;
+
+    eprintln!("[#2100 repro] K=1 quotient_scale ON EV={ev_on:.6} (OFF={ev_off:.6}), s={s:.4}");
+    assert!(
+        ev_on.is_finite() && ev_on > 0.2,
+        "quotient_scale ON CRASHED a healthy K=1 fit: EV={ev_on:.4e} (expected finite > 0.2, \
+         the issue's collapse was EV → 0.0 with s → −43); s={s:.4}"
+    );
+    // The ON fit must track the OFF baseline — a healthy K=1 decoder is never
+    // retracted, so the only quotient effect is the image-frozen refit-peel.
+    assert!(
+        (ev_on - ev_off).abs() <= 1.0e-3 * (1.0 + ev_off.abs()),
+        "quotient_scale ON must track the OFF baseline at K=1: ON={ev_on:.6} vs OFF={ev_off:.6}"
+    );
+}

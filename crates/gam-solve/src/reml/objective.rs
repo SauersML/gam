@@ -639,7 +639,7 @@ impl<'a> RemlState<'a> {
                 Self::build_firth_dense_operator_for_link(
                     &jeffreys_link,
                     &x_projected,
-                    &pirls_result.final_eta,
+                    &pirls_result.final_eta.to_owned(),
                     self.weights,
                 )?,
             )));
@@ -654,7 +654,7 @@ impl<'a> RemlState<'a> {
             Self::build_firth_dense_operator_for_link(
                 &jeffreys_link,
                 &x_dense,
-                &pirls_result.final_eta,
+                &pirls_result.final_eta.to_owned(),
                 self.weights,
             )?,
         )))
@@ -753,7 +753,7 @@ impl<'a> RemlState<'a> {
         } else {
             crate::pirls::calculate_loglikelihood_omitting_constants(
                 self.y,
-                &pirls_result.finalmu,
+                &pirls_result.finalmu.to_owned(),
                 &pirls_result.likelihood,
                 self.weights,
             )
@@ -815,7 +815,7 @@ impl<'a> RemlState<'a> {
                     Self::build_firth_dense_operator_for_link(
                         &jeffreys_link,
                         x_dense.as_ref(),
-                        &pirls_result.final_eta,
+                        &pirls_result.final_eta.to_owned(),
                         self.weights,
                     )?,
                 ))
@@ -882,7 +882,7 @@ impl<'a> RemlState<'a> {
         } else {
             crate::pirls::calculate_loglikelihood_omitting_constants(
                 self.y,
-                &pirls_result.finalmu,
+                &pirls_result.finalmu.to_owned(),
                 &pirls_result.likelihood,
                 self.weights,
             )

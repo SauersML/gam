@@ -1182,9 +1182,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                                 // to the UNREDUCED design + Jeffreys, leaving a
                                 // quadratically-flat near-null direction in the
                                 // joint penalized Hessian — the inner solve could
-                                // not certify stationarity, so the outer wall-clock
-                                // deadline became load-bearing rather than a pure
-                                // backstop.
+                                // not certify stationarity, so the fit could not
+                                // converge and reported non-stationarity honestly.
                                 //
                                 // Instead, MEASURE before deciding. Assemble the
                                 // joint penalized Hessian M = JᵀHJ + S and the
@@ -1201,8 +1200,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                                 // (r > λ·step, e.g. a near-separating pull), or the
                                 // collapsed channel is the spatial TIME block, we
                                 // refuse to project and keep the conservative
-                                // unreduced + Jeffreys fallback (the deadline still
-                                // backstops). This is the gate that prevents the
+                                // unreduced + Jeffreys fallback (non-stationarity
+                                // is then reported honestly). This is the gate that prevents the
                                 // reward-hacking failure mode of silently deleting
                                 // a direction the model genuinely needs — exactly
                                 // the regression a naive nullspace-shrink caused on
@@ -1225,8 +1224,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                                 // time untouched. The joint penalised Hessian
                                 // M = JᵀHJ + S is then full-rank BY CONSTRUCTION — the
                                 // 2e14 marginal↔logslope phantom null is gone, the
-                                // inner joint-Newton certifies on its own, and the
-                                // wall-clock deadline is demoted to a pure backstop.
+                                // inner joint-Newton certifies on its own, so the
+                                // fit converges without any backstop.
                                 // Only the logslope confound is eligible here (the
                                 // spatial time block is protected by the gate below).
                                 if real == "logslope" {
@@ -1252,7 +1251,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                                                  PARTIAL reduced-logslope reparam (marginal/time pass \
                                                  through unchanged) so the joint penalised Hessian is \
                                                  full-rank by construction — phantom null removed, \
-                                                 deadline demoted to backstop",
+                                                 inner solve certifies on its own",
                                             );
                                             return Ok(Some((bd_map, (p_time, p_marg, wl), true)));
                                         }
@@ -1335,7 +1334,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                                              direction(s) are MEASURED phantoms (gradient residual \
                                              ≤ λ·step); engaging the channel-reduced quotient so \
                                              the phantom null direction is projected out — \
-                                             deadline demoted to backstop",
+                                             inner solve certifies on its own",
                                         );
                                         Ok(Some((map, (fw_time, fw_marg, fw_log), false)))
                                     }

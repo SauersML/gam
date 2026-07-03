@@ -187,17 +187,23 @@ impl IBPAssignmentPenalty {
 
             // sdd_k = ∂score_derivative_k/∂M_k, holding the explicit per-row z
             // fixed (the same partial `hessian_diag` takes for score/sd). With
-            // π_k = (M_k+a−1)/D clamped, ∂π_k/∂M_k = pi_jac (0 at the clamp):
-            //   ∂(direct_z_score_derivative)/∂M = pi_jac²·(1/π² − 1/(1−π)²),
-            //   ∂(pi_score_derivative)/∂M = pi_jac·[ 2/π² − 2(M+a−1)·pi_jac/π³
-            //                                        − 2/(1−π)² + 2(n−M)·pi_jac/(1−π)³ ].
+            // the posterior-mean plug-in π_k=(M_k+a)/D clamped, ∂π_k/∂M_k = pi_jac
+            // (=1/D, independent of the +a/−1 numerator shift; 0 at the clamp).
+            // score_derivative_k = direct_z_score_derivative + pi_score_derivative·pi_jac,
+            // so with pi_jac constant in M:
+            //   ∂(direct_z_score_derivative)/∂M = pi_jac²·(1/π² − 1/(1−π)²) = ddzd,
+            //   ∂(pi_score_derivative)/∂M       = pi_jac·dpisd,
+            //   sdd_k = ddzd + pi_jac·∂(pi_score_derivative)/∂M = ddzd + pi_jac²·dpisd.
+            // (The earlier `ddzd + pi_jac·dpisd` dropped one pi_jac factor on the
+            // implicit-π channel, so `cross_row_dd` disagreed with the FD of
+            // `cross_row_d` w.r.t. the logits.)
             let one_minus = 1.0 - pk;
             let ddzd = pi_jac * pi_jac * (1.0 / (pk * pk) - 1.0 / (one_minus * one_minus));
             let dpisd = 2.0 / (pk * pk)
                 - 2.0 * (mass + a - 1.0) * pi_jac / (pk * pk * pk)
                 - 2.0 / (one_minus * one_minus)
                 + 2.0 * (n as f64 - mass) * pi_jac / (one_minus * one_minus * one_minus);
-            score_second_derivative[k] = ddzd + dpisd * pi_jac;
+            score_second_derivative[k] = ddzd + dpisd * pi_jac * pi_jac;
         }
 
         let len = target.len();
@@ -244,23 +250,16 @@ impl IBPAssignmentPenalty {
             cross_row_d[k] = self.weight * score_derivative[k];
             // ∂d_k/∂M_k = w·∂s'_k/∂M_k = w·s''_k.
             cross_row_dd[k] = self.weight * score_second_derivative[k];
-            if self.learnable_alpha {
-                let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
-                let mass = active_mass[k];
-                let raw = (mass + a) / denom;
-                // Same interior gate / zero-π-Jacobian convention as
-                // `hessian_diag_log_alpha_derivative`; at the clamp the derivative is 0.
-                if raw > IBP_INTERIOR_TOL && raw < 1.0 - IBP_INTERIOR_TOL {
-                    let one_minus = 1.0 - pk;
-                    let dpi_da = (n as f64 + 1.0 - mass) / (denom * denom);
-                    let inv_p = 1.0 / pk;
-                    let inv_q = 1.0 / one_minus;
-                    let a_channel = inv_p + inv_q;
-                    let d_a_channel_da = dpi_da * (-inv_p * inv_p + inv_q * inv_q);
-                    let d_score_derivative_da =
-                        a_channel / (denom * denom) - d_a_channel_da / denom;
-                    cross_row_d_logalpha[k] = self.weight * a * d_score_derivative_da;
-                }
+        }
+        if self.learnable_alpha {
+            // `cross_row_d[k] = w·score_derivative_k`, so its ρ (=logα) derivative
+            // is `w·∂score_derivative_k/∂ρ`. Share the SAME total-ρ-derivative
+            // primitive as `hessian_diag_log_alpha_derivative` so the cross-row
+            // off-diagonal channel of the log-det α-gradient matches the diagonal
+            // exactly (one operator, one derivative).
+            let (_d_score, d_score_derivative) = self.learnable_alpha_score_rho_derivs(target, rho);
+            for k in 0..self.k_max {
+                cross_row_d_logalpha[k] = self.weight * d_score_derivative[k];
             }
         }
 
@@ -307,23 +306,111 @@ impl IBPAssignmentPenalty {
                 active_mass[k] += z[start + k];
             }
         }
-        let mut pi_jac = Array1::<f64>::zeros(self.k_max);
+        let n_f = n as f64;
+        // mixed[i·K+k] = ∂(grad_rho)/∂ℓ_ik = ∂²F/∂ρ∂ℓ_ik. With grad_rho's per-column
+        // summand G_k = pi_score_k·(a(N+1−M_k)/D²) + a·(−1/a − ln π_k) and ℓ_ik's only
+        // reach through M_k (∂M_k/∂ℓ_ik = J_ik), this is (∂G_k/∂M_k)·J_ik:
+        //   ∂G_k/∂M_k = (a/D²)·[ PSD_k·(N+1−M_k) − pi_score_k ] − a·pi_jac/π_k,
+        // where PSD_k = ∂pi_score_k/∂M_k. Must track grad_rho: the earlier
+        // `−w·a·pi_jac·J/π` matched only the old (stationary-mode) grad_rho.
+        let mut d_g_dm = Array1::<f64>::zeros(self.k_max);
         for k in 0..self.k_max {
-            let raw = (active_mass[k] + a) / denom;
-            if raw > IBP_INTERIOR_TOL && raw < 1.0 - IBP_INTERIOR_TOL {
-                pi_jac[k] = 1.0 / denom;
+            let mass = active_mass[k];
+            let raw = (mass + a) / denom;
+            if raw <= IBP_INTERIOR_TOL || raw >= 1.0 - IBP_INTERIOR_TOL {
+                continue;
             }
+            let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
+            let one_minus = 1.0 - pk;
+            let pj = 1.0 / denom;
+            let pi_score = -mass / pk + (n_f - mass) / one_minus - (a - 1.0) / pk;
+            let psd = -1.0 / pk + (mass + a - 1.0) * pj / (pk * pk) - 1.0 / one_minus
+                + (n_f - mass) * pj / (one_minus * one_minus);
+            d_g_dm[k] = (a / (denom * denom)) * (psd * (n_f + 1.0 - mass) - pi_score) - a * pj / pk;
         }
         for row in 0..n {
             let start = row * self.k_max;
             for k in 0..self.k_max {
                 let zk = z[start + k];
                 let z_jac = zk * (1.0 - zk) / tau;
-                let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
-                out[start + k] = -self.weight * a * pi_jac[k] * z_jac / pk;
+                out[start + k] = self.weight * d_g_dm[k] * z_jac;
             }
         }
         out
+    }
+
+    /// Total ρ (=logα) derivatives of the per-column score scalars `score_k` and
+    /// `score_derivative_k` that [`Self::hessian_diag`] assembles, for
+    /// learnable-α. Returns `(d_score, d_score_derivative)`, each length `K`,
+    /// zero outside the π interior.
+    ///
+    /// The plug-in `π_k=(M_k+a)/(N+a+1)` is the posterior MEAN, not the energy's
+    /// stationary point (the mode `(M_k+a−1)/(N+a−1)`), so π is a genuine
+    /// function of α whose implicit channel does not vanish by any envelope
+    /// argument. With `α(ρ)=α_base·e^ρ` we have `dα/dρ=α`, `a=α/K` so `da/dρ=a`,
+    /// `D=N+a+1` so `dD/dρ=a`, and hence
+    ///   `π'  = a·(N+1−M)/D²`   (=∂π/∂ρ),
+    ///   `π_jac' = −a/D²`       (=∂(1/D)/∂ρ).
+    /// Every term of `score`/`score_derivative` is differentiated through BOTH
+    /// the explicit `a` and the implicit `π(ρ)`. This is the single primitive
+    /// behind both [`Self::hessian_diag_log_alpha_derivative`] (diagonal) and the
+    /// `cross_row_d_logalpha` off-diagonal channel, so the two agree by
+    /// construction.
+    fn learnable_alpha_score_rho_derivs(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> (Array1<f64>, Array1<f64>) {
+        let mut d_score = Array1::<f64>::zeros(self.k_max);
+        let mut d_score_derivative = Array1::<f64>::zeros(self.k_max);
+        if !self.learnable_alpha {
+            return (d_score, d_score_derivative);
+        }
+        let alpha = self.resolved_alpha(rho);
+        let a = alpha / self.k_max as f64;
+        let z = self.concrete_logits(target);
+        let pi = self.pi_map(z.view(), alpha);
+        let n = z.len() / self.k_max;
+        let n_f = n as f64;
+        let denom = (n_f + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
+        let mut active_mass = Array1::<f64>::zeros(self.k_max);
+        for row in 0..n {
+            let start = row * self.k_max;
+            for k in 0..self.k_max {
+                active_mass[k] += z[start + k];
+            }
+        }
+        for k in 0..self.k_max {
+            let mass = active_mass[k];
+            let raw = (mass + a) / denom;
+            if raw <= IBP_INTERIOR_TOL || raw >= 1.0 - IBP_INTERIOR_TOL {
+                continue;
+            }
+            let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
+            let one_minus = 1.0 - pk;
+            let pj = 1.0 / denom;
+            let pi_p = a * (n_f + 1.0 - mass) / (denom * denom); // ∂π/∂ρ
+            let pj_p = -a / (denom * denom); // ∂(1/D)/∂ρ
+            // direct_z_score = ln((1−π)/π); pi_score = ∂F/∂π (BCE + Beta).
+            let pi_score = -mass / pk + (n_f - mass) / one_minus - (a - 1.0) / pk;
+            let pi_score_p = pi_p / (pk * pk) * (mass + a - 1.0)
+                + (n_f - mass) * pi_p / (one_minus * one_minus)
+                - a / pk;
+            // score = direct_z_score + pi_score·pi_jac.
+            d_score[k] = (-1.0 / pk - 1.0 / one_minus) * pi_p + pi_score_p * pj + pi_score * pj_p;
+            // score_derivative = pi_jac·(D1 + PSD), D1 = −1/π − 1/(1−π).
+            let d1 = -1.0 / pk - 1.0 / one_minus;
+            let d1_p = pi_p / (pk * pk) - pi_p / (one_minus * one_minus);
+            let psd = -1.0 / pk + (mass + a - 1.0) * pj / (pk * pk) - 1.0 / one_minus
+                + (n_f - mass) * pj / (one_minus * one_minus);
+            let psd_p = pi_p / (pk * pk) + a * pj / (pk * pk) + (mass + a - 1.0) * pj_p / (pk * pk)
+                - 2.0 * (mass + a - 1.0) * pj * pi_p / (pk * pk * pk)
+                - pi_p / (one_minus * one_minus)
+                + (n_f - mass) * pj_p / (one_minus * one_minus)
+                + 2.0 * (n_f - mass) * pj * pi_p / (one_minus * one_minus * one_minus);
+            d_score_derivative[k] = pj_p * (d1 + psd) + pj * (d1_p + psd_p);
+        }
+        (d_score, d_score_derivative)
     }
 
     /// `∂ hessian_diag / ∂ρ_alpha` for learnable-alpha IBP.
@@ -342,44 +429,12 @@ impl IBPAssignmentPenalty {
         if !self.learnable_alpha {
             return out;
         }
-        let alpha = self.resolved_alpha(rho);
-        let a = alpha / self.k_max as f64;
         let tau = self.concrete_temperature();
         let inv_tau = 1.0 / tau;
         let inv_tau2 = inv_tau * inv_tau;
         let z = self.concrete_logits(target);
-        let pi = self.pi_map(z.view(), alpha);
         let n = z.len() / self.k_max;
-        let denom = (n as f64 + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
-        let mut active_mass = Array1::<f64>::zeros(self.k_max);
-        for row in 0..n {
-            let start = row * self.k_max;
-            for k in 0..self.k_max {
-                active_mass[k] += z[start + k];
-            }
-        }
-        let mut d_score = Array1::<f64>::zeros(self.k_max);
-        let mut d_score_derivative = Array1::<f64>::zeros(self.k_max);
-        for k in 0..self.k_max {
-            let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
-            let mass = active_mass[k];
-            let raw = (mass + a) / denom;
-            if raw <= IBP_INTERIOR_TOL || raw >= 1.0 - IBP_INTERIOR_TOL {
-                continue;
-            }
-            let one_minus = 1.0 - pk;
-            let dpi_da = (n as f64 + 1.0 - mass) / (denom * denom);
-            let dpi_drho = a * dpi_da;
-            let d_score_dpi = -1.0 / pk - 1.0 / one_minus;
-            d_score[k] = d_score_dpi * dpi_drho;
-
-            let inv_p = 1.0 / pk;
-            let inv_q = 1.0 / one_minus;
-            let a_channel = inv_p + inv_q;
-            let d_a_channel_da = dpi_da * (-inv_p * inv_p + inv_q * inv_q);
-            let d_score_derivative_da = a_channel / (denom * denom) - d_a_channel_da / denom;
-            d_score_derivative[k] = a * d_score_derivative_da;
-        }
+        let (d_score, d_score_derivative) = self.learnable_alpha_score_rho_derivs(target, rho);
         for row in 0..n {
             let start = row * self.k_max;
             for k in 0..self.k_max {
@@ -673,17 +728,42 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
             return Array1::<f64>::zeros(0);
         }
         let alpha = self.resolved_alpha(rho);
+        let a = alpha / self.k_max as f64;
         let z = self.concrete_logits(target);
         let pi = self.pi_map(z.view(), alpha);
-        let mut sum_log_pi = 0.0;
-        for &pk in pi.iter() {
-            sum_log_pi += pk
-                .clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP)
-                .ln();
+        let n = z.len() / self.k_max;
+        let n_f = n as f64;
+        let denom = (n_f + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
+        let mut active_mass = Array1::<f64>::zeros(self.k_max);
+        for row in 0..n {
+            let start = row * self.k_max;
+            for k in 0..self.k_max {
+                active_mass[k] += z[start + k];
+            }
         }
-        Array1::from_vec(vec![
-            -self.weight * (alpha * sum_log_pi / self.k_max as f64 + self.k_max as f64),
-        ])
+        // ∂F/∂ρ, ρ = logα with α(ρ)=α_base·e^ρ so dα/dρ=α and da/dρ=a. The plug-in
+        // π_k=(M_k+a)/(N+a+1) is the posterior MEAN, so it is NOT stationary for
+        // the energy (the mode (M_k+a−1)/(N+a−1) is); the implicit-π channel does
+        // not vanish and must be carried alongside the explicit Beta(a,1) channel:
+        //   ∂F/∂ρ = Σ_k [ (∂F/∂π_k)·(∂π_k/∂ρ)  +  (∂F/∂a)·(da/dρ) ],
+        //   ∂F/∂π_k = pi_score_k,  ∂π_k/∂ρ = a·(N+1−M_k)/D² (0 at the clamp),
+        //   ∂F/∂a  = −1/a − ln π_k,  da/dρ = a.
+        // The previous closed form kept only the explicit channel (valid solely at
+        // the stationary mode), disagreeing with the FD of `value`.
+        let mut acc = 0.0;
+        for k in 0..self.k_max {
+            let mass = active_mass[k];
+            let raw = (mass + a) / denom;
+            let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
+            let dpi_drho = if raw > IBP_INTERIOR_TOL && raw < 1.0 - IBP_INTERIOR_TOL {
+                a * (n_f + 1.0 - mass) / (denom * denom)
+            } else {
+                0.0
+            };
+            let pi_score = -mass / pk + (n_f - mass) / (1.0 - pk) - (a - 1.0) / pk;
+            acc += pi_score * dpi_drho + (-1.0 / a - pk.ln()) * a;
+        }
+        Array1::from_vec(vec![self.weight * acc])
     }
 
     fn rho_count(&self) -> usize {

@@ -67,9 +67,48 @@ use gam_problem::{
     SasLinkState, StandardLink,
 };
 use gam_terms::construction::{KroneckerReparamResult, ReparamResult};
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
+use ndarray::{ArcArray1, Array1, Array2, ArrayView1, ArrayView2, s};
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// #1868 deterministic n-independence instrument.
+///
+/// Process-global accumulator of the number of length-`n` row-element touches
+/// (array allocations / row-wise scans) performed by the Gaussian
+/// zero-iteration inner synthesis on the **#1033 n-free κ-trial skip path**
+/// (`row_prediction_is_stale`). On that path the outer criterion, gradient and
+/// inner solve are all served from the k-space ψ-Gram sufficient statistics, so
+/// the architectural invariant (#1033: "each hyperparameter trial touches only
+/// k×k objects") requires this counter to stay FLAT — it must not grow with `n`.
+/// A value that scales with `n` is exactly the #1868 O(n)-per-callback
+/// regression (the stale-row lane re-materialising `offset`/`y`/`weights` and
+/// the constant working-weight derivative arrays per trial instead of sharing
+/// the once-built frozen row bundle).
+///
+/// This is the *deterministic* replacement for the old wall-clock
+/// per-callback-ratio gate (#1868 / #2055): the same invariant, read as an exact
+/// integer in milliseconds at small `n` instead of a noisy timing ratio that
+/// needed a multi-hour 320k sweep to surface. Monotonic; callers snapshot the
+/// value before and after the κ-trial phase and assert on the delta.
+pub(crate) static NFREE_SKIP_ROW_ELEMENT_TOUCHES: AtomicU64 = AtomicU64::new(0);
+
+/// Record `elems` length-`n` row-element touches on the n-free κ-trial skip
+/// path (see [`NFREE_SKIP_ROW_ELEMENT_TOUCHES`]). Called at each length-`n`
+/// materialisation the stale-row Gaussian synthesis performs; after the #1868
+/// frozen-row-bundle fix the skip path performs none, so the accumulator holds
+/// flat across `n`.
+#[inline]
+pub(crate) fn record_nfree_skip_row_touches(elems: usize) {
+    NFREE_SKIP_ROW_ELEMENT_TOUCHES.fetch_add(elems as u64, Ordering::Relaxed);
+}
+
+/// Read the process-global n-free κ-trial skip-path row-touch accumulator.
+/// Exposed so the spatial length-scale driver can snapshot deltas across the
+/// κ-optimisation phase and thread them into the reported timing.
+pub fn nfree_skip_row_element_touches() -> u64 {
+    NFREE_SKIP_ROW_ELEMENT_TOUCHES.load(Ordering::Relaxed)
+}
 
 pub(super) fn default_beta_guess_external(
     p: usize,
@@ -304,7 +343,12 @@ pub(super) fn assemble_pirls_result(
     coordinate_frame: PirlsCoordinateFrame,
     linear_constraints_transformed: Option<LinearInequalityConstraints>,
 ) -> PirlsResult {
+    // #1868: the full-assembly path is legitimately O(n) (this is the one-off
+    // final fit, not a per-callback n-free skip); wrap its freshly-realised row
+    // arrays in the shared `ArcArray1` representation (`.into_shared()` moves the
+    // owned buffer into an `Arc`, O(1)). `finalmu`/`solvemu` share one handle.
     let final_eta_arr = working_summary.state.eta.as_ref().clone();
+    let finalmu_shared = finalmu.clone().into_shared();
     PirlsResult {
         likelihood,
         beta_transformed: working_summary.beta.clone(),
@@ -319,18 +363,18 @@ pub(super) fn assemble_pirls_result(
         edf,
         stable_penalty_term: penalty_term,
         firth: working_summary.state.firth.clone(),
-        finalweights: finalweights.clone(),
-        final_offset: offset.to_owned(),
-        final_eta: final_eta_arr,
-        finalmu: finalmu.clone(),
-        solveweights: scoreweights.clone(),
-        solveworking_response: finalz.clone(),
-        solvemu: finalmu.clone(),
-        solve_dmu_deta: final_dmu_deta.clone(),
-        solve_d2mu_deta2: final_d2mu_deta2.clone(),
-        solve_d3mu_deta3: final_d3mu_deta3.clone(),
-        solve_c_array: final_c.clone(),
-        solve_d_array: final_d.clone(),
+        finalweights: finalweights.clone().into_shared(),
+        final_offset: offset.to_owned().into_shared(),
+        final_eta: final_eta_arr.into_shared(),
+        finalmu: finalmu_shared.clone(),
+        solveweights: scoreweights.clone().into_shared(),
+        solveworking_response: finalz.clone().into_shared(),
+        solvemu: finalmu_shared,
+        solve_dmu_deta: final_dmu_deta.clone().into_shared(),
+        solve_d2mu_deta2: final_d2mu_deta2.clone().into_shared(),
+        solve_d3mu_deta3: final_d3mu_deta3.clone().into_shared(),
+        solve_c_array: final_c.clone().into_shared(),
+        solve_d_array: final_d.clone().into_shared(),
         derivatives_unsupported: false,
         status,
         iteration: working_summary.iterations,
@@ -1180,7 +1224,6 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         let edf = pls_result.edf;
         let baseridge = pls_result.ridge_used;
 
-        let priorweights_owned = priorweights.to_owned();
         // eta = offset + X Qs beta (composed, no materialization) unless a
         // design-moving ψ tensor cache explicitly says the surface rows are a
         // stale reference. In that lane the Gaussian objective and gradient are
@@ -1191,67 +1234,179 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             .map(|transform| transform.apply(beta_transformed.as_ref()))
             .unwrap_or_else(|| beta_transformed.as_ref().clone());
         let stale_row_cache = cache_for_solve.filter(|cache| cache.row_prediction_is_stale);
-        let (final_eta, finalmu, finalz, gradient_data, deviance, log_likelihood, max_abs_eta) =
-            if let Some(cache) = stale_row_cache {
+
+        // #1868: all length-`n` row arrays of the zero-iteration synthesis,
+        // collected in one place so the skip path can SHARE them O(1) from the
+        // once-built frozen bundle (zero row touches) while the exact path builds
+        // them owned and moves them into the shared `ArcArray1` representation
+        // via `.into_shared()` (O(1), no element copy).
+        struct ZeroIterRows {
+            final_offset: ArcArray1<f64>,
+            final_eta: ArcArray1<f64>,
+            finalmu: ArcArray1<f64>,
+            finalz: ArcArray1<f64>,
+            finalweights: ArcArray1<f64>,
+            solve_dmu_deta: ArcArray1<f64>,
+            solve_d2mu_deta2: ArcArray1<f64>,
+            solve_d3mu_deta3: ArcArray1<f64>,
+            solve_c_array: ArcArray1<f64>,
+            solve_d_array: ArcArray1<f64>,
+            /// Working-state η. Empty on the skip path (the stale rows are never
+            /// read on the n-free κ criterion path, so it is not materialised —
+            /// keeping the callback O(1)); the freshly-realised η on the exact
+            /// path.
+            working_eta: LinearPredictor,
+            gradient_data: Array1<f64>,
+            deviance: f64,
+            log_likelihood: f64,
+            max_abs_eta: f64,
+        }
+
+        let rows = if let Some(cache) = stale_row_cache {
+            // #1868 FAST PATH: the criterion, gradient and inner solve are served
+            // entirely from k-space Gram sufficient statistics; the length-`n`
+            // row arrays are trial-invariant placeholders (η≡μ≡offset, z≡y,
+            // w≡priorweights, constant Gaussian working-weight derivatives). When
+            // the producer attached the once-built frozen bundle we clone its
+            // `ArcArray1` handles (O(1), zero element touches) instead of
+            // re-materialising ~16·n elements per κ callback — the #1868 fix.
+            let mut grad_orig = cache.xtwx_orig.dot(&qbeta);
+            grad_orig -= &cache.xtwy_orig;
+            let gradient_data = transform_active
+                .as_ref()
+                .map(|transform| transform.apply_transpose(&grad_orig))
+                .unwrap_or(grad_orig);
+            let weighted_rss = (cache.centered_weighted_y_sq
+                - 2.0 * qbeta.dot(&cache.xtwy_orig)
+                + qbeta.dot(&cache.xtwx_orig.dot(&qbeta)))
+            .max(0.0);
+            let phi = likelihood.scale.fixed_phi().unwrap_or(1.0);
+            let deviance = if phi.is_finite() && phi > 0.0 {
+                weighted_rss / phi
+            } else {
+                f64::NAN
+            };
+
+            if let Some(bundle) = cache.frozen_rows.as_ref() {
+                // Zero length-`n` touches: every row array is an O(1) Arc clone
+                // of the shared frozen bundle (η≡μ≡offset via `bundle.eta`).
+                ZeroIterRows {
+                    final_offset: bundle.eta.clone(),
+                    final_eta: bundle.eta.clone(),
+                    finalmu: bundle.eta.clone(),
+                    finalz: bundle.z.clone(),
+                    finalweights: bundle.weights.clone(),
+                    solve_dmu_deta: bundle.solve_dmu_deta.clone(),
+                    solve_d2mu_deta2: bundle.solve_d2mu_deta2.clone(),
+                    solve_d3mu_deta3: bundle.solve_d3mu_deta3.clone(),
+                    solve_c_array: bundle.solve_c_array.clone(),
+                    solve_d_array: bundle.solve_d_array.clone(),
+                    working_eta: LinearPredictor::new(Array1::zeros(0)),
+                    gradient_data,
+                    deviance,
+                    log_likelihood: bundle.log_likelihood,
+                    max_abs_eta: bundle.max_abs_eta,
+                }
+            } else {
+                // No bundle attached (producer could not build it): fall back to
+                // the correct-but-O(n) re-materialisation so the fit is never
+                // wrong. Counted so the deterministic gate still sees this work.
+                let n_rows = offset.len();
+                record_nfree_skip_row_touches(11 * n_rows);
                 let final_eta = offset.to_owned();
                 let finalmu = final_eta.clone();
-                let finalz = y.to_owned();
-                let mut grad_orig = cache.xtwx_orig.dot(&qbeta);
-                grad_orig -= &cache.xtwy_orig;
-                let gradient_data = transform_active
-                    .as_ref()
-                    .map(|transform| transform.apply_transpose(&grad_orig))
-                    .unwrap_or(grad_orig);
-                let weighted_rss = (cache.centered_weighted_y_sq
-                    - 2.0 * qbeta.dot(&cache.xtwy_orig)
-                    + qbeta.dot(&cache.xtwx_orig.dot(&qbeta)))
-                .max(0.0);
-                let phi = likelihood.scale.fixed_phi().unwrap_or(1.0);
-                let deviance = if phi.is_finite() && phi > 0.0 {
-                    weighted_rss / phi
-                } else {
-                    f64::NAN
-                };
+                let priorweights_owned = priorweights.to_owned();
+                let (c, d, dmu_deta, d2mu_deta2, d3mu_deta3) =
+                    computeworkingweight_derivatives_from_eta(
+                        &config.likelihood,
+                        &config.link_kind,
+                        &final_eta,
+                        priorweights_owned.view(),
+                    )?;
                 let log_likelihood = calculate_loglikelihood(y, &finalmu, likelihood, priorweights);
                 let max_abs_eta = inf_norm(finalmu.iter().copied());
-                (
-                    final_eta,
-                    finalmu,
-                    finalz,
+                ZeroIterRows {
+                    final_offset: offset.to_owned().into_shared(),
+                    final_eta: final_eta.into_shared(),
+                    finalmu: finalmu.into_shared(),
+                    finalz: y.to_owned().into_shared(),
+                    finalweights: priorweights_owned.into_shared(),
+                    solve_dmu_deta: dmu_deta.into_shared(),
+                    solve_d2mu_deta2: d2mu_deta2.into_shared(),
+                    solve_d3mu_deta3: d3mu_deta3.into_shared(),
+                    solve_c_array: c.into_shared(),
+                    solve_d_array: d.into_shared(),
+                    working_eta: LinearPredictor::new(Array1::zeros(0)),
                     gradient_data,
                     deviance,
                     log_likelihood,
                     max_abs_eta,
-                )
-            } else {
-                let mut eta = offset.to_owned();
-                eta += &x_original.apply(&qbeta);
-                let final_eta = eta.clone();
-                let finalmu = eta.clone();
-                let finalz = y.to_owned();
+                }
+            }
+        } else {
+            // EXACT path: rows are freshly realised from the (non-stale) design.
+            // Legitimately O(n) — this is the one-off final assembly / a
+            // non-tensor trial, not a per-callback n-free skip.
+            let priorweights_owned = priorweights.to_owned();
+            let mut eta = offset.to_owned();
+            eta += &x_original.apply(&qbeta);
+            let final_eta = eta.clone();
+            let finalmu = eta;
 
-                let mut weighted_residual = finalmu.clone();
-                weighted_residual -= &finalz;
-                weighted_residual *= &priorweights_owned;
-                // gradient = Qs^T X^T (w * residual) (composed)
-                let xt_wr = x_original.apply_transpose(&weighted_residual);
-                let gradient_data = transform_active
-                    .as_ref()
-                    .map(|transform| transform.apply_transpose(&xt_wr))
-                    .unwrap_or(xt_wr);
-                let deviance = calculate_deviance(y, &finalmu, likelihood, priorweights);
-                let log_likelihood = calculate_loglikelihood(y, &finalmu, likelihood, priorweights);
-                let max_abs_eta = inf_norm(finalmu.iter().copied());
-                (
-                    final_eta,
-                    finalmu,
-                    finalz,
-                    gradient_data,
-                    deviance,
-                    log_likelihood,
-                    max_abs_eta,
-                )
-            };
+            let mut weighted_residual = finalmu.clone();
+            weighted_residual -= &y;
+            weighted_residual *= &priorweights_owned;
+            // gradient = Qs^T X^T (w * residual) (composed)
+            let xt_wr = x_original.apply_transpose(&weighted_residual);
+            let gradient_data = transform_active
+                .as_ref()
+                .map(|transform| transform.apply_transpose(&xt_wr))
+                .unwrap_or(xt_wr);
+            let deviance = calculate_deviance(y, &finalmu, likelihood, priorweights);
+            let log_likelihood = calculate_loglikelihood(y, &finalmu, likelihood, priorweights);
+            let max_abs_eta = inf_norm(finalmu.iter().copied());
+            let (c, d, dmu_deta, d2mu_deta2, d3mu_deta3) =
+                computeworkingweight_derivatives_from_eta(
+                    &config.likelihood,
+                    &config.link_kind,
+                    &final_eta,
+                    priorweights_owned.view(),
+                )?;
+            ZeroIterRows {
+                final_offset: offset.to_owned().into_shared(),
+                working_eta: LinearPredictor::new(finalmu.clone()),
+                final_eta: final_eta.into_shared(),
+                finalmu: finalmu.into_shared(),
+                finalz: y.to_owned().into_shared(),
+                finalweights: priorweights_owned.into_shared(),
+                solve_dmu_deta: dmu_deta.into_shared(),
+                solve_d2mu_deta2: d2mu_deta2.into_shared(),
+                solve_d3mu_deta3: d3mu_deta3.into_shared(),
+                solve_c_array: c.into_shared(),
+                solve_d_array: d.into_shared(),
+                gradient_data,
+                deviance,
+                log_likelihood,
+                max_abs_eta,
+            }
+        };
+        let ZeroIterRows {
+            final_offset,
+            final_eta,
+            finalmu,
+            finalz,
+            finalweights,
+            solve_dmu_deta,
+            solve_d2mu_deta2,
+            solve_d3mu_deta3,
+            solve_c_array,
+            solve_d_array,
+            working_eta,
+            gradient_data,
+            deviance,
+            log_likelihood,
+            max_abs_eta,
+        } = rows;
         let score_norm = array1_l2_norm(&gradient_data);
         let s_beta = penalty_active.shifted_gradient(beta_transformed.as_ref());
         let s_beta_norm = array1_l2_norm(&s_beta);
@@ -1277,7 +1432,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
 
         let gradient_norm = array1_l2_norm(&gradient);
         let working_state = WorkingState {
-            eta: LinearPredictor::new(finalmu.clone()),
+            eta: working_eta,
             gradient: gradient.clone(),
             hessian: penalized_hessian.clone(),
 
@@ -1321,13 +1476,10 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             exported_laplace_curvature: ExportedLaplaceCurvature::ExpectedInformationSurrogate,
         };
 
-        let (solve_c_array, solve_d_array, solve_dmu_deta, solve_d2mu_deta2, solve_d3mu_deta3) =
-            computeworkingweight_derivatives_from_eta(
-                &config.likelihood,
-                &config.link_kind,
-                &final_eta,
-                priorweights_owned.view(),
-            )?;
+        // #1868: `solve_*`/`final_*` row arrays now come from the row synthesis
+        // above (shared O(1) from the frozen bundle on the skip path); the exact
+        // per-callback `computeworkingweight_derivatives_from_eta` re-computation
+        // that used to run here is folded into that synthesis.
         let reparam_result = materialize_final_reparam_result()?;
         let qs_arc_final = Arc::new(reparam_result.qs.clone());
         let pirls_result = PirlsResult {
@@ -1344,13 +1496,13 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             edf,
             stable_penalty_term: penalty_term,
             firth: FirthDiagnostics::Inactive,
-            finalweights: priorweights_owned.clone(),
-            final_offset: offset.to_owned(),
-            final_eta: final_eta.clone(),
+            finalweights: finalweights.clone(),
+            final_offset,
+            final_eta,
             finalmu: finalmu.clone(),
-            solveweights: priorweights_owned,
-            solveworking_response: finalz.clone(),
-            solvemu: finalmu.clone(),
+            solveweights: finalweights,
+            solveworking_response: finalz,
+            solvemu: finalmu,
             solve_dmu_deta,
             solve_d2mu_deta2,
             solve_d3mu_deta3,

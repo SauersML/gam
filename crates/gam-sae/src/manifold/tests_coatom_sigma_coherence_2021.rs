@@ -139,9 +139,8 @@ fn one_shot_angle<F: Fn(&Array1<f64>) -> Array1<f64>>(
     let mb1 = apply(&col1);
     let mx = apply(x);
     // G = Bᵀ M B (2×2), h = Bᵀ M x (2).
-    let dot = |u: &Array1<f64>, w: &Array1<f64>| -> f64 {
-        (0..p).map(|i| u[i] * w[i]).sum::<f64>()
-    };
+    let dot =
+        |u: &Array1<f64>, w: &Array1<f64>| -> f64 { (0..p).map(|i| u[i] * w[i]).sum::<f64>() };
     let mut g = Array2::<f64>::zeros((2, 2));
     g[[0, 0]] = dot(&col0, &mb0);
     g[[0, 1]] = dot(&col0, &mb1);

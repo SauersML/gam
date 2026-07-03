@@ -549,8 +549,9 @@ impl SaeManifoldTerm {
                 }
             }
         }
-        // #1939 wheel diagnostic (opt-in path only — this runs solely under the
-        // `cone_atom_recovery` flag). Emit the RAW UNROUNDED per-atom norms, the
+        // #1939 wheel diagnostic (opt-in path only — this runs under the
+        // `cone_atom_recovery` or `quotient_scale` (#2100) breach-gated boundary
+        // retraction). Emit the RAW UNROUNDED per-atom norms, the
         // breach/direction thresholds, and the fired / literal-zero counts, so the
         // near-zero-vs-literal-zero question is answered inside the A/B run: a
         // collapse at `1e-3` is retracted (`retracted>0`), a collapse at `1e-16` is
@@ -689,7 +690,11 @@ impl SaeManifoldTerm {
                 wdesign[kk] = whiten_row(designs[kk].row(row));
             }
             for j in 0..k {
-                rhs[j] += wtarget.iter().zip(wdesign[j].iter()).map(|(t, d)| t * d).sum::<f64>();
+                rhs[j] += wtarget
+                    .iter()
+                    .zip(wdesign[j].iter())
+                    .map(|(t, d)| t * d)
+                    .sum::<f64>();
                 for kk in j..k {
                     let g: f64 = wdesign[j]
                         .iter()
@@ -708,7 +713,10 @@ impl SaeManifoldTerm {
         // non-negativity clamp below — not this epsilon — is what bounds the
         // amplitude on a rank-deficient design, so the epsilon can stay at
         // machine scale and never biases a well-identified amplitude.
-        let scale = (0..k).map(|j| gram[[j, j]]).fold(0.0_f64, f64::max).max(1e-300);
+        let scale = (0..k)
+            .map(|j| gram[[j, j]])
+            .fold(0.0_f64, f64::max)
+            .max(1e-300);
         for j in 0..k {
             gram[[j, j]] += 1e-12 * scale;
         }

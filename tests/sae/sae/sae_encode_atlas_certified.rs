@@ -282,17 +282,10 @@ fn lipschitz_constant_shrinks_certified_radius_monotonically() {
     let x = circle_target(0.0);
     let start = Array1::from(vec![0.1_f64]);
 
-    let h_small = row_certificate(
-        &atom,
-        evaluator.as_ref(),
-        start.view(),
-        x.view(),
-        1.0,
-        10.0,
-    )
-    .unwrap()
-    .0
-    .h;
+    let h_small = row_certificate(&atom, evaluator.as_ref(), start.view(), x.view(), 1.0, 10.0)
+        .unwrap()
+        .0
+        .h;
     let h_large = row_certificate(
         &atom,
         evaluator.as_ref(),

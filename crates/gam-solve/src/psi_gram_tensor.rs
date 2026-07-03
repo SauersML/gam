@@ -987,6 +987,10 @@ impl PsiGramTensor {
             centered_weighted_y_sq: self.zt_w_z,
             row_prediction_is_stale: true,
             xtwx_sparse_orig: None,
+            // #1868: the caller (`install_psi_gram_statistics`) attaches the
+            // once-built ψ-invariant frozen row bundle after this returns; the
+            // tensor itself is n-free and holds no row vectors to build it from.
+            frozen_rows: None,
         }
     }
 }

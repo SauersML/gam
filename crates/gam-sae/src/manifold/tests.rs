@@ -6135,6 +6135,101 @@ pub(crate) fn sae_nuclear_norm_beta_block_routes_through_gb_and_shrinks_spectrum
     }
 }
 
+/// #2098 (SPEC-8): build a two-atom Euclidean-patch term whose atoms carry coord
+/// latent dims `d0` and `d1`, so `validate_heterogeneous_atom_compatibility` sees
+/// homogeneous vs heterogeneous coord blocks directly (no fit required).
+fn hetero_compat_term(d0: usize, d1: usize) -> SaeManifoldTerm {
+    let n = 4usize;
+    let p = 3usize;
+    let m = 2usize;
+    let make_atom = |name: &'static str, d: usize| {
+        SaeManifoldAtom::new(
+            name,
+            SaeAtomBasisKind::EuclideanPatch,
+            d,
+            Array2::<f64>::ones((n, m)),
+            Array3::<f64>::zeros((n, m, d)),
+            Array2::<f64>::zeros((m, p)),
+            Array2::<f64>::eye(m),
+        )
+        .unwrap()
+    };
+    let manifold = |d: usize| {
+        if d == 1 {
+            LatentManifold::Euclidean
+        } else {
+            LatentManifold::Product(vec![LatentManifold::Euclidean; d])
+        }
+    };
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        Array2::<f64>::zeros((n, 2)),
+        vec![Array2::<f64>::zeros((n, d0)), Array2::<f64>::zeros((n, d1))],
+        vec![manifold(d0), manifold(d1)],
+        AssignmentMode::softmax(1.0),
+    )
+    .unwrap();
+    SaeManifoldTerm::new(
+        vec![make_atom("atom0", d0), make_atom("atom1", d1)],
+        assignment,
+    )
+    .unwrap()
+}
+
+/// #2098 (SPEC-8) — the heterogeneous-`d_atom` + row-block-penalty guard, moved
+/// out of the Python facade into `SaeManifoldTerm::validate_heterogeneous_atom_compatibility`.
+/// It must refuse a heterogeneous dictionary when a conflicting row-block "t"-block
+/// penalty is present via EITHER source (a registry descriptor OR the native-ARD
+/// FFI flag), and admit every other case.
+#[test]
+pub(crate) fn validate_heterogeneous_atom_compatibility_covers_registry_and_native_ard() {
+    use gam_terms::analytic_penalties::IsometryPenalty;
+
+    // A registry holding a single row-block "t"-block penalty (Isometry). The
+    // slice/latent_dim only need to construct validly; detection keys off the
+    // penalty KIND (`sae_penalty_is_row_block_supported`), not its interior.
+    let mut row_block_registry = AnalyticPenaltyRegistry::new();
+    row_block_registry.push(AnalyticPenaltyKind::Isometry(Arc::new(
+        IsometryPenalty::new_euclidean(PsiSlice::full(4 * 2, Some(2)), 2),
+    )));
+    let empty_registry = AnalyticPenaltyRegistry::new();
+
+    // (a) heterogeneous coord dims + a row-block registry penalty ⇒ Err.
+    let hetero = hetero_compat_term(2, 1);
+    let err = hetero
+        .validate_heterogeneous_atom_compatibility(Some(&row_block_registry), false)
+        .expect_err("heterogeneous dims + a row-block registry penalty must be refused");
+    assert!(
+        err.contains("heterogeneous atom coordinate dims"),
+        "message must name the heterogeneous conflict: {err}"
+    );
+    assert!(
+        err.contains("uniform atom_dim"),
+        "message must name the uniform-dims resolution: {err}"
+    );
+
+    // (b) heterogeneous coord dims + native ARD (the FFI flag, NOT a registry
+    // descriptor) ⇒ Err even with no conflicting registry penalty.
+    hetero
+        .validate_heterogeneous_atom_compatibility(Some(&empty_registry), true)
+        .expect_err("heterogeneous dims + native ARD must be refused");
+    hetero
+        .validate_heterogeneous_atom_compatibility(None, true)
+        .expect_err("heterogeneous dims + native ARD (no registry) must be refused");
+
+    // (c) homogeneous coord dims ⇒ Ok even with the row-block penalty AND ARD.
+    let homo = hetero_compat_term(1, 1);
+    homo.validate_heterogeneous_atom_compatibility(Some(&row_block_registry), true)
+        .expect("homogeneous coord dims dispatch every row-block penalty cleanly");
+
+    // (d) heterogeneous coord dims but no conflicting penalty and no ARD ⇒ Ok.
+    hetero
+        .validate_heterogeneous_atom_compatibility(Some(&empty_registry), false)
+        .expect("heterogeneous dims with no row-block penalty and no ARD is admitted");
+    hetero
+        .validate_heterogeneous_atom_compatibility(None, false)
+        .expect("heterogeneous dims with no registry and no ARD is admitted");
+}
+
 #[derive(Debug)]
 pub(crate) struct TestPeriodicEvaluator;
 

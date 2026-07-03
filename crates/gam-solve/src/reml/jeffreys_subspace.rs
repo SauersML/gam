@@ -2270,8 +2270,8 @@ impl JeffreysHphiDriftBase {
         // Assemble it with two BLAS-3 GEMMs rather than the former O(p²·m²) scalar
         // triple loop: that loop's per-element ndarray index arithmetic was the
         // measured hot spot of the whole survival/competing-risks fit (#979 drift),
-        // dominating wall-clock and driving the bounded-time regressions to their
-        // deadlines. The GEMM form is the same arithmetic with a cache- and
+        // dominating runtime and driving the bounded-iteration regressions to
+        // non-convergence. The GEMM form is the same arithmetic with a cache- and
         // BLAS-friendly reduction order. Mathematically symmetric in (a, b); we still
         // mirror the upper triangle so the stored result is exactly symmetric (the
         // GEMM need not return a bit-symmetric product).

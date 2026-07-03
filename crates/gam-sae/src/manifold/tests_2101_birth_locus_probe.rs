@@ -20,9 +20,9 @@
 //! path; the printed trajectory remains available for the #2101 investigation.
 
 use crate::manifold::{
-    fit_stagewise, AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
-    SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, StagewiseConfig,
-    StagewiseProgress,
+    AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,
+    SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, StagewiseConfig, StagewiseProgress,
+    fit_stagewise,
 };
 use gam_terms::latent::LatentManifold;
 use ndarray::{Array1, Array2};
@@ -54,7 +54,11 @@ fn probe_2101_birth_locus_disjoint_6circle_ibp() {
         .collect();
     let mut s = 0x2101_D150_0000_0001u64;
     let theta: Vec<Vec<f64>> = (0..n)
-        .map(|_| (0..ncirc).map(|_| std::f64::consts::TAU * lcg(&mut s)).collect())
+        .map(|_| {
+            (0..ncirc)
+                .map(|_| std::f64::consts::TAU * lcg(&mut s))
+                .collect()
+        })
         .collect();
     let mut x = Array2::<f64>::zeros((n, p));
     for i in 0..n {
@@ -72,8 +76,7 @@ fn probe_2101_birth_locus_disjoint_6circle_ibp() {
     // and the leftover blends into the birth — fit-robustness's decomposition
     // finding; the real pipeline pca-seeds this alignment).
     let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
-    let coords =
-        Array2::<f64>::from_shape_fn((n, 1), |(r, _)| theta[r][0] / std::f64::consts::TAU);
+    let coords = Array2::<f64>::from_shape_fn((n, 1), |(r, _)| theta[r][0] / std::f64::consts::TAU);
     let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
     let mut decoder = Array2::<f64>::zeros((3, p));
     decoder[[1, 0]] = 1.0;
@@ -166,7 +169,8 @@ fn probe_2101_birth_locus_disjoint_6circle_ibp() {
                 let pr = if sumsq > 0.0 { tot * tot / sumsq } else { 0.0 };
                 ecol.sort_by(|a, b| b.total_cmp(a));
                 let top2 = if tot > 0.0 {
-                    (ecol.first().copied().unwrap_or(0.0) + ecol.get(1).copied().unwrap_or(0.0)) / tot
+                    (ecol.first().copied().unwrap_or(0.0) + ecol.get(1).copied().unwrap_or(0.0))
+                        / tot
                 } else {
                     0.0
                 };
@@ -196,7 +200,8 @@ fn probe_2101_birth_locus_disjoint_6circle_ibp() {
             .expect("stagewise disjoint-6-circle ibp fit");
         let k = res.term.k_atoms();
         let births = res.report.births_accepted;
-        log.borrow_mut().push(format!("FINAL: k={k} births={births}"));
+        log.borrow_mut()
+            .push(format!("FINAL: k={k} births={births}"));
         (k, births)
     };
     eprintln!("\n==== #2101 BIRTH LOCUS TRAJECTORY (disjoint 6-circle ibp) ====");
@@ -247,7 +252,9 @@ fn probe_2101_proper_circle_seed_survival() {
     let p = 16usize;
     let mut s = 0x2101_C15C_0000_0007u64;
     // Single circle on dims (0,1), amp 1, independent phase, noise 0.05.
-    let theta: Vec<f64> = (0..n).map(|_| std::f64::consts::TAU * lcg(&mut s)).collect();
+    let theta: Vec<f64> = (0..n)
+        .map(|_| std::f64::consts::TAU * lcg(&mut s))
+        .collect();
     let mut x = Array2::<f64>::zeros((n, p));
     for i in 0..n {
         x[[i, 0]] += theta[i].cos();
@@ -259,9 +266,7 @@ fn probe_2101_proper_circle_seed_survival() {
     // The PeriodicHarmonicEvaluator maps coord t∈[0,1) to angle 2πt; seed the
     // coordinate at the true phase so the circle is perfectly aligned.
     let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
-    let coords = Array2::<f64>::from_shape_fn((n, 1), |(r, _)| {
-        theta[r] / std::f64::consts::TAU
-    });
+    let coords = Array2::<f64>::from_shape_fn((n, 1), |(r, _)| theta[r] / std::f64::consts::TAU);
     let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
 
     let mut modes_checked = 0usize;
@@ -320,8 +325,14 @@ fn probe_2101_proper_circle_seed_survival() {
         let harm_after = (rows_after[1].powi(2) + rows_after[2].powi(2)).sqrt();
         eprintln!(
             "\n==== #2101 PROPER-CIRCLE-SEED SURVIVAL ({mode_name}, logit={logit}) ====\n  rows before = {:?}\n  rows after  = {:?}\n  harmonic ‖(cos,sin)‖: before={:.4} after={:.4}  (SURVIVES if after stays ~before; COLLAPSE if after≈0)",
-            rows_before.iter().map(|v| (v * 1000.0).round() / 1000.0).collect::<Vec<_>>(),
-            rows_after.iter().map(|v| (v * 1000.0).round() / 1000.0).collect::<Vec<_>>(),
+            rows_before
+                .iter()
+                .map(|v| (v * 1000.0).round() / 1000.0)
+                .collect::<Vec<_>>(),
+            rows_after
+                .iter()
+                .map(|v| (v * 1000.0).round() / 1000.0)
+                .collect::<Vec<_>>(),
             harm_before,
             harm_after,
         );
@@ -352,5 +363,8 @@ fn probe_2101_proper_circle_seed_survival() {
         modes_checked += 1;
     }
     eprintln!("==== END #2101 SURVIVAL PROBE ====\n");
-    assert_eq!(modes_checked, 4, "expected all four gate/logit modes to run");
+    assert_eq!(
+        modes_checked, 4,
+        "expected all four gate/logit modes to run"
+    );
 }

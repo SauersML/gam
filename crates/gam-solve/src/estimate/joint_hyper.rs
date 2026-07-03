@@ -198,6 +198,16 @@ pub struct ExternalJointHyperEvaluator<'a> {
     /// the n-row reconditioning lane was not re-entered. Pure observability; it
     /// never gates control flow.
     pub(crate) slow_path_reset_count: std::cell::Cell<u64>,
+    /// #1868 / #1033: the once-built, ψ-invariant frozen row bundle for the
+    /// Gaussian-identity n-free κ-trial skip path. Built lazily the first time a
+    /// stale ψ-Gram cache is installed (from the fit's frozen `offset`/`y`/
+    /// `weights` and fixed link) and attached by reference-counted handle to
+    /// every subsequent `GaussianFixedCache`, so the inner zero-iteration
+    /// synthesis shares its length-`n` placeholders O(1) instead of
+    /// re-materialising them per trial. `None` until the first install (or when
+    /// no tensor is armed for this fit).
+    pub(crate) psi_gram_frozen_rows:
+        Option<std::sync::Arc<crate::pirls::GaussianFrozenRows>>,
 }
 
 impl<'a> ExternalJointHyperEvaluator<'a> {
@@ -276,6 +286,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             pending_glm_first_step_gram: None,
             pending_glm_psi_gram_deriv: None,
             slow_path_reset_count: std::cell::Cell::new(0),
+            psi_gram_frozen_rows: None,
         })
     }
 
@@ -708,6 +719,29 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
                 cache.xtwy_orig += rhs_delta;
             }
         }
+        // #1868: attach the once-built ψ-invariant frozen row bundle so the
+        // inner Gaussian zero-iteration synthesis shares its length-`n`
+        // placeholders (η≡μ≡offset, z≡y, w, and the working-weight derivatives)
+        // O(1) per trial instead of re-materialising ~16·n elements each κ
+        // callback. Built lazily on first install from the fit's frozen
+        // (offset, y, weights) + fixed link; a build failure degrades gracefully
+        // to the (correct but O(n)) re-materialising path rather than aborting.
+        if self.psi_gram_frozen_rows.is_none() {
+            match crate::pirls::GaussianFrozenRows::build(
+                self.reml_state.offset.view(),
+                self.reml_state.y,
+                self.reml_state.weights,
+                &self.reml_state.config.likelihood,
+                &self.reml_state.config.link_kind,
+            ) {
+                Ok(rows) => self.psi_gram_frozen_rows = Some(Arc::new(rows)),
+                Err(e) => log::warn!(
+                    "[psi-gram-tensor] frozen-row bundle build failed ({e}); the n-free skip \
+                     path will fall back to re-materialising rows per trial (correct, but O(n))"
+                ),
+            }
+        }
+        cache.frozen_rows = self.psi_gram_frozen_rows.clone();
         if !self
             .reml_state
             .install_gaussian_fixed_cache(Arc::new(cache))
