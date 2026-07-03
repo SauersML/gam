@@ -561,11 +561,7 @@ pub(crate) fn survival_coerce_times<'py>(
     // explicit `+inf` asymptote, so neither the `exp(-hazard * t) > 1` value nor
     // a representation-dependent answer can arise. Only `NaN` is rejected: it
     // carries no order and no defined survival value.
-    if let Some((idx, value)) = values
-        .iter()
-        .enumerate()
-        .find(|(_, value)| value.is_nan())
-    {
+    if let Some((idx, value)) = values.iter().enumerate().find(|(_, value)| value.is_nan()) {
         return Err(py_value_error(format!(
             "survival prediction times must not be NaN (index {idx} = {value})"
         )));

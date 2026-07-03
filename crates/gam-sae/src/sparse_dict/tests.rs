@@ -1,6 +1,6 @@
 use super::codes::solve_row_codes;
 use super::scoring::{TileScorer, top_s_online};
-use super::{SparseDictConfig, fit_sparse_dictionary};
+use super::{SparseDictConfig, fit_sparse_dictionary, sparse_dictionary_transform_with_mode};
 use ndarray::{Array2, ArrayView2};
 
 /// Build an exact rank-1 mixture: `K` orthonormal planted atoms (rows of an
@@ -284,6 +284,84 @@ fn tile_scorer_dispatch_matches_cpu_below_device_floor() {
         .route_minibatch_dispatch(rows.view(), decoder.view())
         .expect("dispatch route");
     assert_eq!(dispatched, cpu);
+}
+
+#[test]
+fn tile_scorer_required_mode_refuses_subfloor_route() {
+    let p = 5;
+    let k = 37;
+    let rows = Array2::<f32>::from_shape_fn((3, p), |(r, c)| {
+        (((r * 11 + c * 7 + 3) % 13) as f32 - 6.0) / 6.0
+    });
+    let decoder = Array2::<f32>::from_shape_fn((k, p), |(atom, c)| {
+        (((atom * 3 + c * 5 + 1) % 7) as f32 - 3.0) / 3.0
+    });
+    let scorer = TileScorer::new(4, 7);
+
+    let err = scorer
+        .route_minibatch_with_mode(rows.view(), decoder.view(), gam_gpu::GpuMode::Required)
+        .expect_err("Required mode must fail closed below the device floor");
+    assert!(
+        err.contains("below the device launch break-even"),
+        "unexpected Required-mode error: {err}"
+    );
+}
+
+#[test]
+fn sparse_transform_with_explicit_mode_reports_cpu_route_stats() {
+    let p = 5;
+    let k = 11;
+    let rows = Array2::<f32>::from_shape_fn((7, p), |(r, c)| {
+        (((r * 17 + c * 5 + 2) % 19) as f32 - 9.0) / 9.0
+    });
+    let mut decoder = Array2::<f32>::from_shape_fn((k, p), |(atom, c)| {
+        (((atom * 13 + c * 3 + 1) % 23) as f32 - 11.0) / 11.0
+    });
+    for mut row in decoder.outer_iter_mut() {
+        let norm = row.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-12);
+        row.mapv_inplace(|v| v / norm);
+    }
+
+    let transform = sparse_dictionary_transform_with_mode(
+        rows.view(),
+        decoder.view(),
+        3,
+        4,
+        1.0e-6,
+        gam_gpu::GpuMode::Off,
+    )
+    .expect("explicit-mode transform");
+    assert_eq!(transform.indices.dim(), (rows.nrows(), 3));
+    assert_eq!(transform.codes.dim(), (rows.nrows(), 3));
+    assert_eq!(transform.score_route_stats.minibatches, 1);
+    assert_eq!(transform.score_route_stats.cpu_minibatches, 1);
+    assert_eq!(transform.score_route_stats.device_minibatches, 0);
+}
+
+#[test]
+fn sparse_fit_records_score_route_stats() {
+    let (k, p, n) = (8usize, 10usize, 64usize);
+    let (x, _atoms) = planted(k, p, n, 0.1);
+    let config = SparseDictConfig {
+        n_atoms: k,
+        active: 1,
+        minibatch: 16,
+        max_epochs: 1,
+        score_tile: 8,
+        code_ridge: 1.0e-6,
+        decoder_ridge: 1.0e-6,
+        tolerance: 0.0,
+        score_mode: gam_gpu::GpuMode::Off,
+    };
+    let fit = fit_sparse_dictionary(x.view(), &config).expect("fit");
+    assert_eq!(fit.score_route_stats.minibatches, 8);
+    assert_eq!(fit.score_route_stats.cpu_minibatches, 8);
+    assert_eq!(fit.score_route_stats.device_minibatches, 0);
+    assert_eq!(fit.score_route_stats.admitted_minibatches, 0);
+    assert_eq!(
+        fit.score_route_stats.score_elements,
+        8u128 * 16u128 * k as u128
+    );
 }
 
 #[test]
@@ -838,25 +916,13 @@ fn scales_to_large_k_without_dense_n_by_k() {
 }
 
 /// #1026 — a real large-K `fit_sparse_dictionary` whose minibatch × K route
-/// block clears the device break-even runs the route step on the GPU under the
-/// ambient (default `Auto`) residency mode, and is bit-for-bit reproducible.
-///
-/// We deliberately do NOT touch the process-wide `set_gpu_mode` (it is
-/// first-writer-wins, so a test that pinned it would poison every other test in
-/// the binary). The full-fit GPU-route == CPU-route equivalence is locked
-/// directly at the routing primitive by
-/// `scoring_gpu::tests::device_route_minibatch_matches_cpu_top_s_online`, which
-/// drives `GpuMode::Required`, asserts `ScoreBlockPath::Device`, and proves the
-/// routed top-`s` support is bit-identical to the CPU `top_s_online` oracle.
-/// Since the only mode-dependent step in the fit is where those bit-identical
-/// scores are computed, the whole alternating-minimisation trajectory is
-/// mode-invariant — which this test confirms by re-running the fit and asserting
-/// the dictionary, indices, and codes are identical to the bit.
+/// block clears the device break-even reports that admission honestly while this
+/// local test pins execution to CPU with the per-fit `score_mode`.
 #[test]
-fn large_k_fit_routes_on_gpu_above_breakeven_and_is_reproducible() {
+fn large_k_fit_reports_admitted_route_stats_and_is_reproducible() {
     // minibatch=512 × K=4096 = 2,097,152-element score block per minibatch,
-    // above DEVICE_SCORE_BLOCK_MIN_ELEMS (1<<20), so the GPU route engages on a
-    // CUDA host. p=48 is a representative residual-stream width.
+    // above DEVICE_SCORE_BLOCK_MIN_ELEMS (1<<20). p=48 is a representative
+    // residual-stream width. GpuMode::Off keeps this regression local-CPU only.
     let (planted_k, p, n) = (8usize, 48usize, 1536usize);
     let (x, _atoms) = planted(planted_k, p, n, 0.1);
     let k = 4096usize;
@@ -866,6 +932,7 @@ fn large_k_fit_routes_on_gpu_above_breakeven_and_is_reproducible() {
         minibatch: 512,
         max_epochs: 4,
         score_tile: 1024,
+        score_mode: gam_gpu::GpuMode::Off,
         ..SparseDictConfig::new(k)
     };
 
@@ -879,6 +946,13 @@ fn large_k_fit_routes_on_gpu_above_breakeven_and_is_reproducible() {
     );
     assert_eq!(fit.indices, fit2.indices);
     assert_eq!(fit.codes, fit2.codes);
+    assert_eq!(fit.score_route_stats, fit2.score_route_stats);
+    assert!(fit.score_route_stats.admitted_minibatches > 0);
+    assert_eq!(fit.score_route_stats.device_minibatches, 0);
+    assert_eq!(
+        fit.score_route_stats.cpu_minibatches,
+        fit.score_route_stats.minibatches
+    );
     assert!(
         fit.explained_variance > 0.9,
         "[#1026] large-K fit should explain the low-rank signal; got {}",

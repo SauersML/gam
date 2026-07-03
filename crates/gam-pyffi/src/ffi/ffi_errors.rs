@@ -646,14 +646,20 @@ impl From<PredictError> for String {
 /// closure, and maps a [`PredictError`] onto the *typed* Python exception —
 /// `SchemaMismatch` → `SchemaMismatchError`, everything else → `GamError`.
 /// Panics are still surfaced as the context-tagged panic error.
-pub(crate) fn detach_predict_result<T, F>(py: Python<'_>, context: &'static str, f: F) -> PyResult<T>
+pub(crate) fn detach_predict_result<T, F>(
+    py: Python<'_>,
+    context: &'static str,
+    f: F,
+) -> PyResult<T>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T, PredictError> + Send + 'static,
 {
     match py.detach(move || catch_unwind(AssertUnwindSafe(f))) {
         Ok(Ok(value)) => Ok(value),
-        Ok(Err(PredictError::SchemaMismatch(message))) => Err(SchemaMismatchError::new_err(message)),
+        Ok(Err(PredictError::SchemaMismatch(message))) => {
+            Err(SchemaMismatchError::new_err(message))
+        }
         Ok(Err(PredictError::Other(message))) => Err(py_value_error(message)),
         Err(payload) => Err(py_panic_error(context, payload)),
     }

@@ -111,10 +111,10 @@ pub(crate) use gam::geometry::sinkhorn_barycenter::{
 
 pub(crate) use gam::report::{CoefficientRow, EdfBlockRow, ReportInput, render_html};
 
+pub(crate) use gam::families::fit_orchestration::drivers::freeze_term_collection_from_design;
 pub(crate) use gam::terms::smooth::{
     TermCollectionDesign, TermCollectionSpec, smooth_term_feature_cols,
 };
-pub(crate) use gam::families::fit_orchestration::drivers::freeze_term_collection_from_design;
 // #1521: relocated DOWN into gam_terms::smooth (was families::...::drivers).
 pub(crate) use gam::terms::smooth::{
     build_term_collection_derivative_design, build_term_collection_design,
@@ -185,17 +185,16 @@ pub(crate) use gam::terms::decoders::skip_transcoder::{
 
 pub(crate) use gam::terms::smooth::BlockwisePenalty;
 
+pub(crate) use gam::terms::basis::matern_gradient::{
+    MaternBasisGradientTarget, StreamingMaternBasisGradientEvaluator,
+};
+pub(crate) use gam::terms::decoders::gated_decoder::GatedSAEDecoder;
 pub(crate) use gam::terms::{
     AnalyticPenalty as AnalyticPenaltyTrait, AnalyticPenaltyKind, AnalyticPenaltyRegistry,
-    EdgeRestriction as CoreEdgeRestriction,
-    IvaeRidgeMeanGauge as IvaeRidgeMeanGaugePenalty,
+    EdgeRestriction as CoreEdgeRestriction, IvaeRidgeMeanGauge as IvaeRidgeMeanGaugePenalty,
     MechanismSparsityPenalty as CoreMechanismSparsityPenalty, ParametricRowPrecisionPriorPenalty,
     PenaltyTier, PsiSlice, RowPrecisionPriorPenalty,
     SheafConsistencyPenalty as CoreSheafConsistencyPenalty,
-};
-pub(crate) use gam::terms::decoders::gated_decoder::GatedSAEDecoder;
-pub(crate) use gam::terms::basis::matern_gradient::{
-    MaternBasisGradientTarget, StreamingMaternBasisGradientEvaluator,
 };
 
 pub(crate) use gam::families::transformation_normal::TransformationNormalFitResult;
