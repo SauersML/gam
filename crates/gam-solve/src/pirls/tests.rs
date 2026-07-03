@@ -1993,7 +1993,7 @@ mod tests {
             .gamma_shape()
             .expect("gamma fit should expose fitted shape");
         let profiled_shape =
-            super::estimate_gamma_shape_from_eta(y.view(), &result.final_eta, w.view());
+            super::estimate_gamma_shape_from_eta(y.view(), &result.final_eta.to_owned(), w.view());
 
         assert!(fitted_shape > 1.0, "shape should not stay fixed at one");
         assert_relative_eq!(

@@ -95,11 +95,34 @@ pub(crate) const BLOCKWISE_OUTER_MAX_ITER: usize = 60;
 
 pub(crate) const BLOCKWISE_OUTER_TOL: f64 = 1e-5;
 
-/// Lower bound on the gradient tolerance handed to the reduced parametric-AFT
-/// direct MLE. The inner-solve tolerance can be configured arbitrarily small;
-/// flooring it here keeps the Newton stopping test above the noise of the
-/// log-likelihood gradient evaluation.
-pub(crate) const REDUCED_AFT_GRAD_TOL_FLOOR: f64 = 1e-8;
+/// Objective-suboptimality floor handed to the reduced parametric-AFT direct
+/// MLE as its Newton stopping tolerance. The inner-solve tolerance can be
+/// configured arbitrarily small; flooring it here keeps the stopping test — the
+/// half-Newton-decrement `½·gᵀH⁻¹g`, an estimate of the log-likelihood gap
+/// `ℓ(θ*) − ℓ(θ)` — above the round-off noise of the objective evaluation.
+///
+/// This is deliberately an OBJECTIVE tolerance, not a gradient tolerance: the
+/// log-likelihood gradient is a SUM over the `n` observations, so its attainable
+/// sup-norm floor grows like `n·ε`, and an absolute gradient tolerance therefore
+/// spuriously fails to converge on perfectly benign data as `n` grows (gam#2112).
+/// The Newton decrement `gᵀH⁻¹g` divides the n-scaled gradient by the n-scaled
+/// curvature and is affine-invariant, so a single fixed tolerance certifies
+/// stationarity uniformly across `n`. See `fit_parametric_aft_direct_mle`.
+pub(crate) const REDUCED_AFT_OBJ_TOL_FLOOR: f64 = 1e-8;
+
+/// Near-stationary acceptance tolerance for a stalled line search in the reduced
+/// parametric-AFT direct MLE. When the damped-Newton ascent direction admits no
+/// Armijo-sufficient step — i.e. `ℓ` can no longer be increased to numerical
+/// precision — AND the half-Newton-decrement `½·gᵀH⁻¹g` is below this bound, the
+/// iterate IS the numerical MLE and is accepted rather than reported as a
+/// convergence failure (gam#2112). A decrement above this bound at a stalled line
+/// search signals a genuinely wrong curvature model (not an MLE) and stays a hard
+/// error. The bound is generous relative to the primary objective tolerance
+/// (≈`1e-7`): a remaining gap of `1e-4` nats is a Mahalanobis distance of only
+/// `√(2·1e-4) ≈ 0.014` standard errors from the optimum, so it accepts a fully
+/// converged fit while still separating it from a real optimizer breakdown, whose
+/// decrement is orders of magnitude larger.
+pub(crate) const REDUCED_AFT_NEWTON_STALL_TOL: f64 = 1e-4;
 
 /// Relative ridge added to the normal-equations diagonal of the structural
 /// time-coefficient warm-start least squares (× the largest diagonal of XᵀX,
