@@ -9,6 +9,9 @@
 //! `build_factored_beta_penalty_curvature`, `add_factored_repulsion_curvature`)
 //! fold the analytic decoder penalties into that same arrow structure.
 use super::*;
+// cd0639e4a moved this assembly out of the construction module; the softmax-entropy
+// Gershgorin majorizer helpers it calls are include!'d into construction, so import them.
+use super::construction::{active_softmax_gershgorin_majorizer_entry, softmax_majorizer_log_mean};
 
 impl SaeManifoldTerm {
     /// Assemble the enlarged `(logits, t)` row-local Arrow-Schur system.

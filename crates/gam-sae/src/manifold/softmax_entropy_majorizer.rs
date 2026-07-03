@@ -31,7 +31,7 @@
 /// (`active_softmax_gershgorin_matches_dense_majorizer_1410`) pins this to the
 /// dense `psd_majorizer_abs_row_sums` so the two cannot drift.
 #[inline]
-fn softmax_majorizer_log_mean(a: &[f64]) -> f64 {
+pub(crate) fn softmax_majorizer_log_mean(a: &[f64]) -> f64 {
     let floor = gam_terms::analytic_penalties::ENTROPY_LOG_PROBABILITY_FLOOR;
     a.iter()
         .map(|&a_i| {
@@ -62,7 +62,7 @@ fn softmax_dense_entropy_hessian_entry(a: &[f64], kk: usize, jj: usize, m: f64, 
 /// `kk` the (global) atom index, `m` the precomputed `Σ_j a_j l_j`, and `scale`
 /// the `λ/τ²` penalty scale. `O(K)` time, zero allocation.
 #[inline]
-fn active_softmax_gershgorin_majorizer_entry(a: &[f64], kk: usize, m: f64, scale: f64) -> f64 {
+pub(crate) fn active_softmax_gershgorin_majorizer_entry(a: &[f64], kk: usize, m: f64, scale: f64) -> f64 {
     let floor = gam_terms::analytic_penalties::ENTROPY_LOG_PROBABILITY_FLOOR;
     let l_kk = a[kk].max(floor).ln() + 1.0;
     // Diagonal entry H_kk.
