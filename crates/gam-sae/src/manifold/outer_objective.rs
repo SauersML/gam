@@ -261,9 +261,10 @@ impl AmortizedWarmStartTelemetry {
 /// bounded number of criterion evals.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct OuterProbeTelemetry {
-    /// Full REML criterion evaluations that MUTATED `self.term` (accepted
-    /// gradient/value/EFS lanes, seed validation). Line-search value probes run
-    /// on a throwaway clone and are counted under `fd_probe_calls` instead.
+    /// Full REML criterion evaluations requested through the generic outer
+    /// lanes. Accepted gradient/EFS lanes commit their solved basin; value-only
+    /// comparison probes restore the incumbent state before returning. The
+    /// lighter FD-safeguard probes are counted under `fd_probe_calls`.
     pub criterion_calls: usize,
     /// Finite-difference / directional value probes issued by the
     /// value-consistent-gradient safeguard. Each runs on a clone of `self.term`
@@ -1724,6 +1725,27 @@ impl SaeManifoldOuterObjective {
         Ok((cost, beta_hat))
     }
 
+    /// Evaluate a value-only rho probe without committing the inner basin it
+    /// reaches. The generic line search may reject this point, so its solved
+    /// coordinates/decoder must not become the warm-start state for later
+    /// probes or for the accepted iterate.
+    fn evaluate_value_probe_with_refine_policy(
+        &mut self,
+        rho_flat: ArrayView1<'_, f64>,
+        fold_cotrain: bool,
+    ) -> Result<(f64, Array1<f64>), String> {
+        let saved_term = self.term.clone();
+        let saved_rho = self.current_rho.clone();
+        let saved_loss = self.last_loss.clone();
+        let saved_seeded_beta = self.seeded_beta.clone();
+        let result = self.evaluate_with_refine_policy(rho_flat, false, fold_cotrain);
+        self.term = saved_term;
+        self.current_rho = saved_rho;
+        self.last_loss = saved_loss;
+        self.seeded_beta = saved_seeded_beta;
+        result
+    }
+
     /// #1154 — add the amortized-encoder consistency fold to an already-computed
     /// REML criterion at the converged dictionary for `rho`. The fold has NO
     /// analytic gradient: under Design A the inner solve converges to the same
@@ -2035,7 +2057,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // is ever paired with this cost, so it is the correct place to carry the
         // derivative-free co-training fold `f+c` (`fold_cotrain = true`).
         self.probe_telemetry.criterion_calls += 1;
-        match self.evaluate_with_refine_policy(rho.view(), false, true) {
+        match self.evaluate_value_probe_with_refine_policy(rho.view(), true) {
             Ok((cost, _beta)) => Ok(cost),
             // #1782 — a recoverable infeasible-ρ refusal presents the SAME finite
             // collapse wall the EFS lane returns, not `+∞`. A finite (huge) wall is
@@ -2314,7 +2336,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 // can stall or wander. The fold is carried only by the value-only
                 // cross-seed ranking lane (`eval_cost`).
                 let (cost, _beta_hat) =
-                    match self.evaluate_with_refine_policy(rho.view(), false, false) {
+                    match self.evaluate_value_probe_with_refine_policy(rho.view(), false) {
                         Ok(evaluated) => evaluated,
                         // #2080 — the `Value` order is the BFGS / ARC line-search
                         // probe lane, where the bridge can distinguish an
