@@ -54,9 +54,13 @@ fn probe_2101_birth_locus_disjoint_6circle_ibp() {
         }
     }
 
-    // K=1 ibp seed: one circle atom on dims (0,1), coords ~ row fraction.
+    // K=1 ibp seed: one circle atom on dims (0,1), coordinate ALIGNED to circle-0's
+    // TRUE phase so the incumbent fully absorbs its own circle (else it under-fits
+    // and the leftover blends into the birth — fit-robustness's decomposition
+    // finding; the real pipeline pca-seeds this alignment).
     let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
-    let coords = Array2::<f64>::from_shape_fn((n, 1), |(r, _)| r as f64 / n as f64);
+    let coords =
+        Array2::<f64>::from_shape_fn((n, 1), |(r, _)| theta[r][0] / std::f64::consts::TAU);
     let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
     let mut decoder = Array2::<f64>::zeros((3, p));
     decoder[[1, 0]] = 1.0;
@@ -111,24 +115,49 @@ fn probe_2101_birth_locus_disjoint_6circle_ibp() {
     {
         let mut cb = |pg: StagewiseProgress<'_>| -> Result<(), String> {
             let k = pg.k_atoms;
-            let (born_norm, rows) = if k >= 1 {
+            let (born_norm, rows, top2, pr) = if k >= 1 {
                 let d = &pg.term.atoms[k - 1].decoder_coefficients;
                 let bn = d.iter().map(|v| v * v).sum::<f64>().sqrt();
                 let rn: Vec<f64> = (0..d.nrows())
                     .map(|r| d.row(r).iter().map(|v| v * v).sum::<f64>().sqrt())
                     .collect();
-                (bn, rn)
+                // Per-output-column HARMONIC energy e_j = cos_row_j² + sin_row_j².
+                // top2 = fraction of harmonic energy on the 2 strongest columns
+                // (~1.0 = clean 2-column circle; lower = blended). pr = participation
+                // ratio (Σe)²/Σe² ≈ effective column count (~2 clean, ~4+ blended).
+                let ncols = d.ncols();
+                let mut ecol: Vec<f64> = (0..ncols)
+                    .map(|j| {
+                        if d.nrows() >= 3 {
+                            d[[1, j]] * d[[1, j]] + d[[2, j]] * d[[2, j]]
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect();
+                let tot: f64 = ecol.iter().sum();
+                let sumsq: f64 = ecol.iter().map(|e| e * e).sum();
+                let pr = if sumsq > 0.0 { tot * tot / sumsq } else { 0.0 };
+                ecol.sort_by(|a, b| b.total_cmp(a));
+                let top2 = if tot > 0.0 {
+                    (ecol.first().copied().unwrap_or(0.0) + ecol.get(1).copied().unwrap_or(0.0)) / tot
+                } else {
+                    0.0
+                };
+                (bn, rn, top2, pr)
             } else {
-                (0.0, vec![])
+                (0.0, vec![], 0.0, 0.0)
             };
             log.borrow_mut().push(format!(
-                "{:?} round={} sweep={} k={} born|B|={:.3e} rows={:?} ev={:?} reml_after={:?}",
+                "{:?} round={} sweep={} k={} born|B|={:.3e} rows={:?} top2col={:.2} PR={:.2} ev={:?} reml_after={:?}",
                 pg.event,
                 pg.birth_round,
                 pg.backfit_sweep,
                 k,
                 born_norm,
                 rows.iter().map(|v| (v * 1000.0).round() / 1000.0).collect::<Vec<_>>(),
+                top2,
+                pr,
                 pg.ev.map(|e| (e * 10000.0).round() / 10000.0),
                 pg.joint_reml_after.map(|r| (r * 100.0).round() / 100.0),
             ));
@@ -238,4 +267,116 @@ fn probe_2101_proper_circle_seed_survival() {
         );
     }
     eprintln!("==== END #2101 SURVIVAL PROBE ====\n");
+}
+
+/// #2101/#8 PROTOTYPE (numerical, no production code) — is ring-ness a valid
+/// source-separation OBJECTIVE, and does a plane SEARCH (not eigenvector selection)
+/// recover a single circle? (1) ring-CV at the TRUE circle planes vs a blend (is the
+/// true plane the minimum, or does mixture pollution wash it out?); (2) a
+/// random-restart search recovers a real circle plane (overlap≈1 with ONE true
+/// circle). Plain vs TRIMMED (interquartile) ring index — trimmed guards the mixture
+/// pollution team-lead flagged. Run with --nocapture.
+#[test]
+fn probe_2101_ringness_plane_search() {
+    let n = 80usize;
+    let p = 16usize;
+    let ncirc = 6usize;
+    let amps: Vec<f64> = (0..ncirc)
+        .map(|c| 1.0 - 0.45 * (c as f64) / ((ncirc - 1) as f64))
+        .collect();
+    let mut s = 0x2101_5EA6_u64;
+    let mut x = Array2::<f64>::zeros((n, p));
+    for i in 0..n {
+        for c in 0..ncirc {
+            let th = std::f64::consts::TAU * lcg(&mut s);
+            x[[i, 2 * c]] += amps[c] * th.cos();
+            x[[i, 2 * c + 1]] += amps[c] * th.sin();
+        }
+        for j in 0..p {
+            x[[i, j]] += 0.05 * lcg_normal(&mut s);
+        }
+    }
+    let mean: Array1<f64> =
+        (0..p).map(|j| (0..n).map(|i| x[[i, j]]).sum::<f64>() / n as f64).collect();
+    let proj = |v: &Array1<f64>, i: usize| -> f64 {
+        (0..p).map(|j| (x[[i, j]] - mean[j]) * v[j]).sum()
+    };
+    // ring index: coefficient of variation of ρ_i²=proj_u²+proj_v². `trim` ⇒ over the
+    // interquartile band only (robust to off-circle points polluting a mixed plane).
+    let ring_cv = |u: &Array1<f64>, v: &Array1<f64>, trim: bool| -> f64 {
+        let mut rho2: Vec<f64> = (0..n)
+            .map(|i| {
+                let (a, b) = (proj(u, i), proj(v, i));
+                a * a + b * b
+            })
+            .collect();
+        if trim {
+            rho2.sort_by(|a, b| a.total_cmp(b));
+            rho2 = rho2[n / 4..n - n / 4].to_vec();
+        }
+        let m = rho2.iter().sum::<f64>() / rho2.len() as f64;
+        if !(m > 0.0) {
+            return f64::INFINITY;
+        }
+        let var = rho2.iter().map(|r| (r - m) * (r - m)).sum::<f64>() / rho2.len() as f64;
+        var.sqrt() / m
+    };
+    let axis = |k: usize| -> Array1<f64> {
+        let mut e = Array1::<f64>::zeros(p);
+        e[k] = 1.0;
+        e
+    };
+    let overlap = |u: &Array1<f64>, v: &Array1<f64>, c: usize| -> f64 {
+        (u[2 * c].powi(2) + u[2 * c + 1].powi(2) + v[2 * c].powi(2) + v[2 * c + 1].powi(2)) / 2.0
+    };
+
+    eprintln!("\n==== #2101/#8 RING-NESS PLANE SEARCH PROTOTYPE ====");
+    eprintln!(
+        "(1) OBJECTIVE VALIDITY (plain CV, want true≪blend): true c0={:.3}  true c1={:.3}  true c5={:.3}  blend(0,2)={:.3}  blend(2,4)={:.3}",
+        ring_cv(&axis(0), &axis(1), false),
+        ring_cv(&axis(2), &axis(3), false),
+        ring_cv(&axis(10), &axis(11), false),
+        ring_cv(&axis(0), &axis(2), false),
+        ring_cv(&axis(2), &axis(4), false),
+    );
+
+    let rand_plane = |st: &mut u64| -> (Array1<f64>, Array1<f64>) {
+        let mut u: Array1<f64> = (0..p).map(|_| lcg_normal(st)).collect();
+        let un = u.dot(&u).sqrt();
+        u.mapv_inplace(|z| z / un);
+        let mut v: Array1<f64> = (0..p).map(|_| lcg_normal(st)).collect();
+        let c = v.dot(&u);
+        v = &v - &(&u * c);
+        let vn = v.dot(&v).sqrt();
+        v.mapv_inplace(|z| z / vn);
+        (u, v)
+    };
+    let search = |st: &mut u64, trim: bool| -> (Array1<f64>, Array1<f64>, f64) {
+        let (mut bu, mut bv) = rand_plane(st);
+        let mut bc = ring_cv(&bu, &bv, trim);
+        for _ in 0..20000 {
+            let (u, v) = rand_plane(st);
+            let cv = ring_cv(&u, &v, trim);
+            if cv < bc {
+                bc = cv;
+                bu = u;
+                bv = v;
+            }
+        }
+        (bu, bv, bc)
+    };
+    let mut st = 0xB00B_1234u64;
+    let (u0, v0, cv0) = search(&mut st, false);
+    let (u0t, v0t, cv0t) = search(&mut st, true);
+    let round2 = |xs: Vec<f64>| xs.iter().map(|v| (v * 100.0).round() / 100.0).collect::<Vec<_>>();
+    eprintln!("(2) SEARCH (20k random 2-planes) — best plane's overlap with each true circle c=0..5 (want ONE ≈1):");
+    eprintln!(
+        "    plain CV={cv0:.3}: overlaps={:?}",
+        round2((0..ncirc).map(|c| overlap(&u0, &v0, c)).collect())
+    );
+    eprintln!(
+        "    trim  CV={cv0t:.3}: overlaps={:?}",
+        round2((0..ncirc).map(|c| overlap(&u0t, &v0t, c)).collect())
+    );
+    eprintln!("==== END PROTOTYPE ====\n");
 }

@@ -2051,6 +2051,133 @@ mod tests {
         );
     }
 
+    /// #2101 Q2 DIAGNOSTIC — does the K=2 JOINT BACKFIT disentangle a blended born
+    /// circle? Aligned K=1 circle-0 incumbent on a 3-circle target, seed a born
+    /// circle via residual_principal, form the K=2 term, run the joint backfit, and
+    /// measure the born decoder's participation ratio (effective output-col count:
+    /// ~2 = clean single-circle 2-plane, >3 = blended) before vs after. If PR→~2 the
+    /// backfit cleans the blend (sequential-peel recovery); if it stays >3 the seed
+    /// must isolate one circle at birth. Print-only probe (run with --nocapture).
+    #[test]
+    fn born_circle_backfit_disentangles_blend_2101() {
+        // Match the birth-locus probe fixture (6 circles) where residual_principal
+        // produces a BLENDED circle to backfit (a 3-circle residual is leftover-
+        // dominated → the degeneracy gate falls back to rank-1, no circle born).
+        let n = 80usize;
+        let p = 16usize;
+        let ncirc = 6usize;
+        let amps: Vec<f64> = (0..ncirc)
+            .map(|c| 1.0 - 0.45 * (c as f64) / ((ncirc - 1) as f64))
+            .collect();
+        let mut s = 0x2101_00BF_u64;
+        let mut rng = || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((s >> 11) as f64) / ((1u64 << 53) as f64)
+        };
+        let theta: Vec<Vec<f64>> = (0..n)
+            .map(|_| (0..ncirc).map(|_| std::f64::consts::TAU * rng()).collect())
+            .collect();
+        let mut x = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            for c in 0..ncirc {
+                x[[i, 2 * c]] += amps[c] * theta[i][c].cos();
+                x[[i, 2 * c + 1]] += amps[c] * theta[i][c].sin();
+            }
+        }
+        // Aligned K=1 incumbent on circle-0's TRUE phase (fully absorbs circle-0).
+        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
+        let coords =
+            Array2::<f64>::from_shape_fn((n, 1), |(r, _)| theta[r][0] / std::f64::consts::TAU);
+        let (atom0, cb0) = circle_atom("c0", &evaluator, &coords, 0, 1, p);
+        let (mut term, mut rho) = build_term(vec![atom0], vec![cb0], &vec![vec![true]; n]);
+        term.set_guards_enabled(false);
+        term.run_joint_fit_arrow_schur(x.view(), &mut rho, None, 60, 1.0, 1e-6, 1e-6)
+            .unwrap();
+        // Seed the born circle from the residual, form the K=2 term.
+        let resid = current_residual(&term, x.view()).unwrap();
+        let seed = residual_principal_birth_candidate(&term, resid.view())
+            .expect("born circle seed on the multi-circle residual");
+        let (mut k2, mut k2rho) = crate::structure_harvest::born_circle_atom(
+            &term,
+            &rho,
+            seed.decoder.clone(),
+            seed.circle_coords.clone().unwrap(),
+            seed.circle_present.clone().unwrap(),
+        )
+        .expect("K=2 born-circle term");
+        let pr = |t: &SaeManifoldTerm, idx: usize| -> f64 {
+            let d = &t.atoms[idx].decoder_coefficients;
+            let ec: Vec<f64> = (0..d.ncols())
+                .map(|j| d[[1, j]].powi(2) + d[[2, j]].powi(2))
+                .collect();
+            let tot: f64 = ec.iter().sum();
+            let sq: f64 = ec.iter().map(|e| e * e).sum();
+            if sq > 0.0 {
+                tot * tot / sq
+            } else {
+                0.0
+            }
+        };
+        let born_pr_before = pr(&k2, 1);
+        k2.set_guards_enabled(false);
+        k2.run_joint_fit_arrow_schur(x.view(), &mut k2rho, None, 80, 1.0, 1e-6, 1e-6)
+            .unwrap();
+        let born_pr_after = pr(&k2, 1);
+        let inc_pr_after = pr(&k2, 0);
+
+        // #8 VALIDATION — DEFLATE the birth residual against the incumbent decoder
+        // subspace (Gram-Schmidt the incumbent rows → project them out), then re-seed.
+        // If the deflated-seed born PR drops toward ~2 (clean), incumbent-subspace
+        // deflation isolates ONE circle at birth — the #8 recovery lever.
+        let inc_dec = &term.atoms[0].decoder_coefficients;
+        let mut basis: Vec<Array1<f64>> = Vec::new();
+        for r in 0..inc_dec.nrows() {
+            let mut v = inc_dec.row(r).to_owned();
+            for q in &basis {
+                let c = v.dot(q);
+                v = &v - &(q * c);
+            }
+            let nrm = v.dot(&v).sqrt();
+            if nrm > 1e-8 {
+                basis.push(v / nrm);
+            }
+        }
+        let mut resid_def = resid.clone();
+        for i in 0..n {
+            let ri = resid.row(i).to_owned();
+            let mut proj = Array1::<f64>::zeros(p);
+            for q in &basis {
+                proj = &proj + &(q * ri.dot(q));
+            }
+            let cleaned = &ri - &proj;
+            resid_def.row_mut(i).assign(&cleaned);
+        }
+        let born_pr_deflated = match residual_principal_birth_candidate(&term, resid_def.view()) {
+            Some(sd) if sd.circle_coords.is_some() => {
+                let (k2d, _) = crate::structure_harvest::born_circle_atom(
+                    &term,
+                    &rho,
+                    sd.decoder.clone(),
+                    sd.circle_coords.clone().unwrap(),
+                    sd.circle_present.clone().unwrap(),
+                )
+                .unwrap();
+                pr(&k2d, 1)
+            }
+            _ => -1.0, // fell back to rank-1 (no circle) on the deflated residual
+        };
+
+        eprintln!(
+            "\n==== #2101 Q2 BACKFIT DISENTANGLE + #8 DEFLATION (6-circle, aligned incumbent) ====\n  \
+             born PR before backfit    = {born_pr_before:.2}\n  \
+             born PR after  backfit    = {born_pr_after:.2}   (clean ~2 ⇒ backfit disentangles; >3 ⇒ stays blended)\n  \
+             incumbent PR after        = {inc_pr_after:.2}\n  \
+             born PR with #8 DEFLATION  = {born_pr_deflated:.2}   (clean ~2 ⇒ incumbent-subspace deflation isolates one circle; -1 ⇒ fell back)\n==== END Q2 ====\n"
+        );
+    }
+
     #[test]
     fn progress_callback_emits_pre_birth_checkpoints() {
         let n = 32usize;
