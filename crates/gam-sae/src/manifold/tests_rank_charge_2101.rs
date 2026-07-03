@@ -8,7 +8,18 @@ use crate::manifold::{
 };
 use gam_terms::latent::LatentManifold;
 use ndarray::{Array1, Array2};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+/// The two K=3 controls each run several joint fits; cargo runs tests in-binary
+/// on a thread pool, so left unguarded they can execute simultaneously and, under
+/// a loaded host, starve each other (observed as a spurious "hang"/kill, not a
+/// logic failure). Serialising them against each other caps peak concurrency to
+/// one heavy multi-atom fit at a time. Poison-tolerant: a panic in one test must
+/// surface as that test's failure, not poison-fail the sibling.
+static K3_SERIAL: Mutex<()> = Mutex::new(());
+fn k3_guard() -> std::sync::MutexGuard<'static, ()> {
+    K3_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn lcg(s: &mut u64) -> f64 {
     *s = s
@@ -154,6 +165,7 @@ fn rank_charge_flag_off_is_inert() {
 /// bit-identical.
 #[test]
 fn rank_charge_healthy_k3_control_well_conditioned() {
+    let _serial = k3_guard();
     let n = 96usize;
     let p = 18usize;
     let ncirc = 3usize;
@@ -298,6 +310,7 @@ fn fit_circle_subset(
 /// by design; the accept/reject OUTCOME must not.
 #[test]
 fn rank_charge_k3_decisions_preserved() {
+    let _serial = k3_guard();
     let n = 96usize;
     let p = 18usize;
     let ncirc = 3usize;
@@ -353,6 +366,89 @@ fn rank_charge_k3_decisions_preserved() {
     }
     // (c) spurious/noise atom rejected is covered structurally by the vanishing
     // test (rank→0 → charge 0 → ΔEV rejects); a real atom here is never spurious.
+}
+
+/// (vi) #9 DENSE-vs-STREAMING PARITY (the #9 correctness proof): the streaming
+/// criterion must price the rank charge IDENTICALLY to the dense path. The load-
+/// bearing invariant is that the streaming chunk-accumulated per-atom Grams +
+/// effective sample sizes equal the dense `accumulate_decoder_gram`/`Σa²` (so the
+/// shared `rank_dof_from_grams` returns the same d_eff), and the end-to-end
+/// criterion values agree to ε.
+#[test]
+fn rank_charge_dense_streaming_parity() {
+    let _serial = k3_guard();
+    let (mut term, rho) = fitted_circle_term(80, 16);
+    term.set_rank_charge_evidence(true);
+    let tgt = unit_target(&term);
+
+    // Dense per-atom Grams + N_eff (what per_atom_realised_rank_dof builds).
+    let mut dense_grams = term.empty_decoder_gram_accumulator();
+    term.accumulate_decoder_gram(&mut dense_grams);
+    let dense_n_eff: Vec<f64> = (0..term.k_atoms())
+        .map(|k| {
+            term.assignment
+                .assignments()
+                .column(k)
+                .iter()
+                .map(|&a| a * a)
+                .sum()
+        })
+        .collect();
+
+    // Streaming: pull the chunk-accumulated Grams + N_eff via the log-det pass.
+    let mut ri = super::construction::StreamingRankInputs::default();
+    let _ld = term
+        .streaming_exact_arrow_log_det(tgt.view(), &rho, None, Some(&mut ri))
+        .expect("streaming log-det with rank inputs");
+
+    assert_eq!(ri.grams.len(), dense_grams.len(), "atom count parity");
+    for k in 0..dense_grams.len() {
+        let (dg, sg) = (&dense_grams[k], &ri.grams[k]);
+        let max_abs = dg
+            .iter()
+            .zip(sg.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        eprintln!(
+            "[#9 parity] atom {k}: max|G_dense−G_stream|={max_abs:.3e}  N_eff dense={:.4} stream={:.4}",
+            dense_n_eff[k], ri.n_eff[k]
+        );
+        assert!(
+            max_abs < 1e-9,
+            "atom {k}: streaming Gram must match dense (chunk-additive ΦᵀWΦ); max|Δ|={max_abs:.3e}"
+        );
+        assert!(
+            (dense_n_eff[k] - ri.n_eff[k]).abs() < 1e-9,
+            "atom {k}: streaming N_eff must match dense Σa²"
+        );
+    }
+
+    // d_eff parity through the shared core (identical grams ⇒ identical count).
+    let disp = 0.003_f64; // fixed R so both price against the same floor
+    let d_dense = term.rank_dof_from_grams(&dense_grams, &dense_n_eff, &rho, disp).unwrap();
+    let d_stream = term.rank_dof_from_grams(&ri.grams, &ri.n_eff, &rho, disp).unwrap();
+    eprintln!("[#9 parity] d_eff dense={d_dense:?} stream={d_stream:?}");
+    for k in 0..d_dense.len() {
+        assert!(
+            (d_dense[k] - d_stream[k]).abs() < 1e-9,
+            "atom {k}: d_eff parity dense={} stream={}",
+            d_dense[k],
+            d_stream[k]
+        );
+    }
+
+    // End-to-end criterion parity (flag ON): dense vs streaming to ε.
+    let (v_dense, _, _) = term
+        .reml_criterion_with_cache(tgt.view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
+        .unwrap();
+    let (v_stream, _) = term
+        .reml_criterion_streaming_exact(tgt.view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
+        .unwrap();
+    eprintln!("[#9 parity] criterion dense={v_dense:.6} stream={v_stream:.6}");
+    assert!(
+        (v_dense - v_stream).abs() < 1e-5,
+        "dense vs streaming rank-charge criterion must agree: dense={v_dense} stream={v_stream}"
+    );
 }
 
 /// The reconstruction target the fitted circle was built against (re-derived from
