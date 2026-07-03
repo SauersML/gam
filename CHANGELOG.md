@@ -1,3 +1,126 @@
+## v0.3.146 — gam 0.3.146 / gamfit 0.1.248 (2026-07-03)
+
+Correctness and honesty release on top of 0.3.145, cut from a large batch of
+root-cause fixes. Two themes run through it. First, **honest reporting**: the
+solver now surfaces non-convergence, line-search stalls, and genuine
+rank-deficiency instead of papering over them, a NaN regression in the reported
+Gaussian log-likelihood/AIC is fixed, and a new SPEC rule forbids wall-clock
+time budgets and deadlines (all of which have been removed from the solver).
+Second, **no arbitrary knobs**: remaining grid scans and magic constants are
+replaced by principled searches — a golden-section search for the Tweedie
+variance power, a monotone-bisection ψ-band search, and error-driven
+order-doubling for cloglog GHQ quadrature. Alongside are new `loglog`/`cauchit`
+survival links, weight-aware analytic Gaussian observation intervals, several
+model-persistence and class-detection repairs on the Python surface, a
+differentiable-basis (Duchon) autodiff correctness fix, and a broad round of
+work on the experimental, default-off SAE manifold engine.
+
+### Solver honesty & policy
+- **No wall-clock time budgets or deadlines (#2055).** SPEC now forbids
+  wall-clock time budgets/deadlines, and every such budget/deadline has been
+  removed from the solver rather than left to paper over a slow path. Related
+  survival-path deadline guards were removed or scoped, dropping the last
+  banned underscore-let bindings introduced to silence them (#979).
+- **Report non-convergence honestly (#2062).** The flexible-link inner-KKT
+  envelope no longer masks a non-converged inner solve as converged; it reports
+  the failure. Custom-family exact-joint nonconvergence stays recoverable
+  (#2014) instead of aborting the fit.
+- **Multinomial line-search stalls are reported, not hidden (#2066).** A stalled
+  line search no longer returns `converged = true`.
+- **Identifiability audits tell the truth (#2070).** The audit reports genuine
+  rank-deficiency honestly; rank-restore keeps structural aliases dropped and
+  restores only numerical demotions, and structured-residual fit failures
+  propagate instead of being swallowed.
+
+### Families & links
+- **`loglog` and `cauchit` survival links.** Both links are implemented for the
+  survival family and covered across the `LinkFunction` scale/routing paths,
+  completing #1946; their GHQ routing replaces a banned `unreachable!()` with an
+  explicit branch.
+- **cloglog GHQ quadrature converges by construction (#2063, #1835).** cloglog
+  Gauss–Hermite quadrature now certifies convergence via error-driven
+  order-doubling around an adaptive mode-centred rule, instead of a fixed order
+  that could silently under-resolve.
+- **Automatic Tweedie power without a grid (#2064).** The bare-`family="tweedie"`
+  variance-power estimate (added in 0.3.145) now uses a golden-section search
+  over the open interval `(1, 2)` in place of the coarse power grid scan.
+- **SAS / beta-logistic link fixes (#1876, #2094).** The SAS ε sign convention is
+  corrected and value/cost consistency restored with regression tests (dropping
+  a banned `#[allow]`), and the SAS/beta-logistic link spec is now threaded
+  through the formula and Python fit paths.
+
+### Estimation & inference
+- **Gaussian log-likelihood/AIC NaN regression fixed (#2096).** The reported
+  `log_likelihood` (and the AIC derived from it) came out NaN for every Gaussian
+  fit because the profiled scale was passed through unresolved; the profiled
+  σ̂² is now resolved into the reporting spec while the persisted scale marker
+  stays `ProfiledGaussian`. Covered by a finiteness regression over the real
+  reporting assembler.
+- **Weight-aware analytic Gaussian observation intervals (#2077).** For a
+  weighted Gaussian fit, `predict(observation_interval=True)` now scales the
+  per-row band by `1/√wᵢ`, matching `sample_replicates` (the analytic sibling of
+  #2025) instead of broadcasting a single pooled σ̂².
+- **Multinomial Firth/Jeffreys separation solver (#1854, #1821).** A
+  self-contained fixed-λ Firth/Jeffreys solver handles separation; Firth stays
+  active in the LM line-search candidate and gate-motion is added to the
+  Jeffreys inner gradient.
+- **Location-scale reproducibility (#1607).** Cross-fit warm-start is gated on a
+  family opt-in so exact-replay parity holds; the binomial location-scale outer
+  gradient is aligned with finite differences.
+- **Identifiability ridges (#2068, #1802).** `double_penalty` linear terms get
+  exactly one identifiable ridge (no duplicate null-space ridge), and the
+  reparam null-leakage tolerance is derived from the eigensolver PSD floor
+  rather than a fixed constant.
+- **ψ-band search de-gridded (#2054).** The rank-stable ψ-band search uses
+  monotone bisection instead of a grid.
+- **Thin-plate spline basis recovery (#1966, #1074).** Fixes low-rank
+  under-recovery by seeding the length-scale from center spacing.
+- Tier-0 rho-posterior certificate is emitted on formula fits (#1810);
+  `partial_dependence` by-factor blocks no longer depend on input row order;
+  matrix-free tangent-projected logdet operator trace in REML (perf).
+
+### Python surface (gamfit)
+- **Multinomial-logit GAM persistence (#2078).** Multinomial-logit models now
+  round-trip through the public `save`/`load` API.
+- **`is_marginal_slope` for Bernoulli marginal-slope models.** The kebab-case
+  `marginal-slope` model_kind label is now recognized, so `is_marginal_slope`
+  returns `True` for Bernoulli marginal-slope fits.
+- **`GAMClassifier` non-{0,1} labels (#2075).** The response column is dropped at
+  inference for classifiers with non-`{0,1}` labels.
+- **`Model.model_class` precision.** Derived from the fine-grained predict class
+  rather than the coarse `model_kind` enum; `Model.evidence` /
+  `bayes_factor_vs` route through the `compare_models` ranking score (#2079).
+- Prior weights preserved in smooth-significance; stagewise progress callback
+  types exported.
+
+### Differentiable bases (torch)
+- **Duchon basis VJP correctness (#2097).** `_DuchonBasisFn.forward` now sources
+  its design from the same jet builder that backward differentiates, so the
+  analytic input gradient is the exact derivative of the returned forward
+  (max|analytic−fd| ~3e-11, down from ~0.7) and the width-mismatch case that
+  raised a broadcast `RuntimeError` no longer occurs. gradcheck/gradgradcheck
+  regressions added.
+
+### SAE manifold engine (experimental, default-off)
+- Stagewise births are unblocked on disjoint/near-block-diagonal residuals via a
+  Marchenko–Pastur-thresholded residual-principal fallback, with anchor-scored
+  birth-seed selection (#2080); topology-seed subsample/kNN/interp are derived
+  from budget and dimension (#2065); total co-collapse bails with a diagnostic
+  (#2089).
+- The certified encode path now reads the true (un-ridged) Hessian for the
+  Kantorovich certificate, with amplitude-aware routing and Duchon refusal.
+- New public surface: coordinate interchange and coordinate-fidelity APIs
+  (#2019, #2069), stagewise birth checkpoints exposed through the Python FFI, and
+  GPU dictionary scoring wired with route telemetry.
+- Router throughput: an O(1)-reject top-`s` fold and a shared-memory-tiled score
+  GEMM at the `K ≈ 32k` dictionary width (#1026, perf).
+
+### Build & CI
+- The `sparse_dict_router_topk` bench and the `sae` integration test are fixed to
+  the post-carve module path / signature so `cargo check --all-targets` links.
+- The `build.rs` author guard is robust to shallow clones; an on-demand
+  single-job "Validate One" workflow gives fast per-issue fixer feedback.
+
 ## v0.3.145 — gam 0.3.145 / gamfit 0.1.247 (2026-07-02)
 
 Correctness release on top of 0.3.144. The headline is a prior-weights
