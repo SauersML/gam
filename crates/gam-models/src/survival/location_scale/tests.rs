@@ -417,6 +417,8 @@ fn test_survival_fit(
         outer_converged: true,
         covariance_conditional: None,
         geometry: None,
+        penalty_block_trace: Vec::new(),
+        edf_by_block: Vec::new(),
     })
     .expect("valid survival test fit")
 }

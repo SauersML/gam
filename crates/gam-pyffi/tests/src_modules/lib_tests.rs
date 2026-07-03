@@ -285,6 +285,107 @@ fn shared_tangent_fit_is_output_rotation_equivariant() {
     );
 }
 
+/// Regression for issue #2103: a response-geometry (manifold) fit with a purely
+/// PARAMETRIC RHS (`y ~ 1`, `y ~ x`) must be fittable. Before the fix the
+/// shared-tangent Gaussian REML path errored with "requires at least one
+/// smoothing penalty" whenever the formula carried no smooth, so the
+/// intercept-only Fréchet-mean model — and any parametric tangent regression —
+/// was unreachable. The fix routes a penalty-free RHS to a direct (non-REML)
+/// least-squares solve on the shared tangent design at the base point.
+///
+/// This exercises the end-to-end response-geometry contract on an SPD problem:
+/// build genuine 2×2 SPD responses, take the base point to be their intrinsic
+/// Fréchet (Karcher) mean, log-map to the shared tangent, fit `r ~ 1`, and assert
+/// (a) the fit SUCCEEDS (it raised before the fix) and (b) the intercept-only
+/// prediction, mapped back by the exponential map, equals the intrinsic Fréchet
+/// mean — verified against a direct Karcher-mean computation. The math: an
+/// isotropic-tangent LSQ intercept at the Karcher mean solves
+/// `mean_i log_base(Y_i) = 0`, and `exp_base(0) = base`, so the constant
+/// prediction is exactly the Fréchet mean.
+#[test]
+fn response_geometry_parametric_only_rhs_fits_frechet_mean() {
+    use gam::geometry::response_geometry::{
+        ResponseManifold, response_exp_map, response_frechet_mean, response_log_map,
+    };
+
+    // A handful of genuine 2×2 SPD matrices, flattened row-major to 4 ambient
+    // columns (the layout SpdManifold uses).
+    let spd = ResponseManifold::Spd { n: 2 };
+    let mats = [
+        [1.5_f64, 0.2, 0.2, 0.9],
+        [2.0, -0.3, -0.3, 1.2],
+        [0.8, 0.1, 0.1, 1.7],
+        [1.1, 0.05, 0.05, 0.6],
+        [1.9, 0.4, 0.4, 2.3],
+    ];
+    let n = mats.len();
+    let mut values = Array2::<f64>::zeros((n, 4));
+    for (i, m) in mats.iter().enumerate() {
+        for (j, &v) in m.iter().enumerate() {
+            values[[i, j]] = v;
+        }
+    }
+
+    // Base point = intrinsic Fréchet (Karcher) mean, computed directly — the same
+    // default base point the response-geometry dispatch uses when none is given.
+    let base =
+        response_frechet_mean(spd, values.view(), None, 1.0e-12, 256).expect("SPD Fréchet mean");
+    // Shared tangent responses at the base point (what the Python response-geometry
+    // wrapper feeds the shared-tangent fit).
+    let tangent = response_log_map(spd, values.view(), base.view()).expect("SPD log map");
+
+    // Intercept-only RHS. `r` is a non-constant placeholder LHS the materializer
+    // needs to parse the formula; the impl discards it and uses the `tangent`
+    // matrix (a constant Gaussian LHS would be rejected up front, hence the
+    // varying placeholder).
+    let headers = vec!["r".to_string()];
+    let rows: Vec<Vec<String>> = (0..n).map(|i| vec![format!("{}", i as f64 + 1.0)]).collect();
+
+    // Before #2103 this returned Err("... requires at least one smoothing
+    // penalty ..."); it must now succeed via the direct non-REML LSQ path.
+    let fit = gaussian_reml_fit_formula_table_impl(
+        headers,
+        rows,
+        "r ~ 1".to_string(),
+        tangent.view(),
+        None,
+        None,
+    )
+    .expect("parametric-only (intercept) shared-tangent fit must succeed (#2103)");
+
+    // Intercept-only design: one basis column (the constant), D = 4 tangent
+    // outputs. No smoothing penalty ⇒ empty λ/edf vectors.
+    assert_eq!(fit.coefficients.dim(), (1, 4));
+    assert_eq!(fit.lambdas.len(), 0);
+    assert_eq!(fit.edf.len(), 0);
+    assert!(fit.sigma2.iter().all(|v| v.is_finite()));
+
+    // The intercept tangent prediction, mapped back through the exponential map,
+    // must equal the intrinsic Fréchet mean of the responses.
+    let intercept = fit.coefficients.row(0).to_owned();
+    let predicted = response_exp_map(spd, intercept.view().insert_axis(Axis(0)), base.view())
+        .expect("exp map of the intercept prediction");
+    let mean_err = predicted
+        .row(0)
+        .iter()
+        .zip(base.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        mean_err < 1.0e-8,
+        "intercept-only response-geometry prediction must equal the intrinsic \
+         Fréchet mean of the responses; max|pred - Karcher mean| = {mean_err:.3e}"
+    );
+
+    // The fitted tangent intercept is itself ~0 at the Karcher mean (the direct
+    // LSQ intercept is the tangent mean, and Σ_i log_base(Y_i) = 0 there).
+    let intercept_norm = intercept.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+    assert!(
+        intercept_norm < 1.0e-8,
+        "the tangent intercept at the Karcher mean must be ~0; max|β| = {intercept_norm:.3e}"
+    );
+}
+
 #[test]
 fn load_model_rejects_payload_version_mismatch() {
     let model = FittedModel::from_payload(FittedModelPayload::new(

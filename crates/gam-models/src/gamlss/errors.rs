@@ -285,6 +285,89 @@ pub(crate) fn dense_locscale_block_designs_fromspecs<'a>(
     Ok((primary, log_sigma))
 }
 
+/// Assemble the joint log-likelihood gradient `g = ∇_β log L` from a family's
+/// per-block IRLS working sets, in the flattened `β = [β_0; β_1; …]` block
+/// order sized from `specs`.
+///
+/// For a `Diagonal` block the exact coefficient-space score is
+/// `X_bᵀ (w ⊙ (z − η))`: by the IRLS pseudo-response identity
+/// `z_i = η_i + (∂ℓ/∂η_i)/w_i`, the row score is `w_i (z_i − η_i) = ∂ℓ/∂η_i`
+/// **exactly** — independent of whether `w` is the Fisher or the observed
+/// weight (the score/gradient is always the exact observed gradient; only the
+/// Hessian differs between Fisher scoring and observed curvature). An
+/// `ExactNewton` block carries its own analytic gradient. This is the same
+/// single source of truth the inner joint-Newton RHS uses
+/// (`exact_newton_joint_gradient_from_eval`), so a family whose `evaluate()`
+/// emits these working sets gets a joint gradient guaranteed consistent with
+/// its joint Hessian without a bespoke, possibly-disagreeing derivation.
+pub(crate) fn gamlss_joint_gradient_from_working_sets(
+    eval: &FamilyEvaluation,
+    specs: &[ParameterBlockSpec],
+    states: &[ParameterBlockState],
+) -> Result<ExactNewtonJointGradientEvaluation, String> {
+    if eval.blockworking_sets.len() != specs.len() || states.len() != specs.len() {
+        return Err(GamlssError::DimensionMismatch { reason: format!(
+            "gamlss joint gradient: block/spec/state count mismatch (working_sets={}, specs={}, states={})",
+            eval.blockworking_sets.len(),
+            specs.len(),
+            states.len()
+        ) }
+        .into());
+    }
+    let total: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
+    let mut gradient = Array1::<f64>::zeros(total);
+    let mut offset = 0usize;
+    for ((spec, work), state) in specs
+        .iter()
+        .zip(eval.blockworking_sets.iter())
+        .zip(states.iter())
+    {
+        let width = spec.design.ncols();
+        let block_grad = match work {
+            BlockWorkingSet::Diagonal {
+                working_response,
+                working_weights,
+            } => {
+                let n = working_response.len();
+                if working_weights.len() != n || state.eta.len() != n || spec.design.nrows() != n {
+                    return Err(GamlssError::DimensionMismatch { reason: format!(
+                        "gamlss joint gradient: diagonal working-set length mismatch (z={}, w={}, η={}, X_rows={})",
+                        n,
+                        working_weights.len(),
+                        state.eta.len(),
+                        spec.design.nrows()
+                    ) }
+                    .into());
+                }
+                let mut weighted = Array1::<f64>::zeros(n);
+                for i in 0..n {
+                    weighted[i] = working_weights[i] * (working_response[i] - state.eta[i]);
+                }
+                spec.design.transpose_vector_multiply(&weighted)
+            }
+            BlockWorkingSet::ExactNewton {
+                gradient: block_gradient,
+                ..
+            } => block_gradient.clone(),
+        };
+        if block_grad.len() != width {
+            return Err(GamlssError::DimensionMismatch { reason: format!(
+                "gamlss joint gradient: assembled block gradient length {} != design cols {width}",
+                block_grad.len()
+            ) }
+            .into());
+        }
+        gradient
+            .slice_mut(s![offset..offset + width])
+            .assign(&block_grad);
+        offset += width;
+    }
+    Ok(ExactNewtonJointGradientEvaluation {
+        log_likelihood: eval.log_likelihood,
+        gradient,
+    })
+}
+
 /// Materialize a single location-scale family's two cached block designs
 /// (`primary` = mu/threshold, plus `log_sigma`) into dense matrices, borrowing
 /// when the design is already dense and owning a policy-materialized copy

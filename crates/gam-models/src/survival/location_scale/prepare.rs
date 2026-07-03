@@ -952,6 +952,14 @@ pub(crate) fn finalize_survival_location_scale_fit(
         outer_converged: fit.outer_converged,
         covariance_conditional,
         geometry,
+        // Per-penalty trace / effective-d.f. from the inner blockwise fit,
+        // aligned 1:1 with `fit.lambdas` in block order
+        // `[time, threshold, log_sigma, wiggle]` — the same order the block
+        // lambdas are sliced above. Basis-invariant under the finalize gauge
+        // lift, so they apply directly to the raw block coefficient counts and
+        // yield the effective per-block/total EDF `tr(F)` (issue #2106).
+        penalty_block_trace: fit.penalty_block_trace().to_vec(),
+        edf_by_block: fit.edf_by_block().to_vec(),
     })
 }
 

@@ -256,6 +256,17 @@ pub struct SurvivalLocationScaleFitResultParts {
     pub outer_converged: bool,
     pub covariance_conditional: Option<Array2<f64>>,
     pub geometry: Option<FitGeometry>,
+    /// Raw per-penalty trace `tr_kk = λ_kk·tr(H⁻¹ S_kk)` at the converged fit,
+    /// aligned 1:1 with the concatenated block lambdas in block order
+    /// `[time, threshold, log_sigma, wiggle]`. Empty when the inner solver did
+    /// not record traces (e.g. the reduced parametric-AFT path with no
+    /// penalties). Used to assemble the effective per-block / total EDF
+    /// `tr(F) = p − Σ tr_kk` instead of the nominal coefficient count.
+    pub penalty_block_trace: Vec<f64>,
+    /// Per-penalty effective d.f. `rank_kk − tr_kk`, aligned 1:1 with the same
+    /// concatenated block lambdas. Carried through from the inner blockwise fit
+    /// (basis-invariant, so valid on the lifted raw fit) for `edf_by_block`.
+    pub edf_by_block: Vec<f64>,
 }
 
 #[derive(Clone, Copy)]
@@ -365,6 +376,8 @@ pub fn survival_fit_from_parts(
         outer_converged,
         covariance_conditional,
         geometry,
+        penalty_block_trace,
+        edf_by_block,
     } = parts;
 
     // Validation (preserved from the old impl).
@@ -537,20 +550,53 @@ pub fn survival_fit_from_parts(
         }
     }
 
-    let edf_time = beta_time.len() as f64;
-    let edf_threshold = beta_threshold.len() as f64;
-    let edf_log_sigma = beta_log_sigma.len() as f64;
-    let edf_link_wiggle = beta_link_wiggle.as_ref().map_or(0.0, |beta| beta.len() as f64);
+    // Effective degrees of freedom per block from the converged penalized
+    // information matrix (issue #2106). The inner blockwise solver already
+    // computes the mgcv-consistent per-penalty trace `tr_kk = λ_kk·tr(H⁻¹ S_kk)`
+    // (see `custom_family_blockwise_edf`); the finalize path threads those
+    // traces through `penalty_block_trace`, aligned 1:1 with the concatenated
+    // block lambdas in block order `[time, threshold, log_sigma, wiggle]`. The
+    // effective d.f. of a block is then `tr(F) = |coeff| − Σ tr_kk`, which
+    // strictly drops below the coefficient count when a positive-rank penalty is
+    // active and shrinks as λ grows. An unpenalized/parametric block (no λ,
+    // hence no trace) keeps its full column count. The traces are basis-invariant
+    // under the finalize gauge lift, so they apply directly to the raw block
+    // coefficient counts here; any raw column added by the lift is an unpenalized
+    // parametric direction that carries its full unit of d.f.
+    let n_time = lambdas_time.len();
+    let n_threshold = lambdas_threshold.len();
+    let n_log_sigma = lambdas_log_sigma.len();
+    let n_wiggle = lambdas_linkwiggle.as_ref().map_or(0, |l| l.len());
+    let total_penalties = n_time + n_threshold + n_log_sigma + n_wiggle;
+    // Only trust the plumbed traces when they align 1:1 with the block lambdas;
+    // otherwise (traces unavailable) fall back to the nominal column count.
+    let traces_available = penalty_block_trace.len() == total_penalties;
+    let block_trace_sum = |offset: usize, count: usize| -> f64 {
+        if traces_available && count > 0 {
+            penalty_block_trace[offset..offset + count].iter().sum()
+        } else {
+            0.0
+        }
+    };
+    let effective_edf = |ncoef: usize, trace_sum: f64| -> f64 {
+        (ncoef as f64 - trace_sum).clamp(0.0, ncoef as f64)
+    };
+    let edf_time = effective_edf(beta_time.len(), block_trace_sum(0, n_time));
+    let edf_threshold = effective_edf(
+        beta_threshold.len(),
+        block_trace_sum(n_time, n_threshold),
+    );
+    let edf_log_sigma = effective_edf(
+        beta_log_sigma.len(),
+        block_trace_sum(n_time + n_threshold, n_log_sigma),
+    );
+    let wiggle_len = beta_link_wiggle.as_ref().map_or(0, |beta| beta.len());
+    let edf_link_wiggle = effective_edf(
+        wiggle_len,
+        block_trace_sum(n_time + n_threshold + n_log_sigma, n_wiggle),
+    );
     let edf_total = edf_time + edf_threshold + edf_log_sigma + edf_link_wiggle;
 
-    // Build blocks for the unified representation. The location-scale solver
-    // reports the converged penalized Hessian/covariance but does not yet carry
-    // per-penalty trace components through its blockwise optimizer. Until those
-    // traces are available, expose the well-defined full-rank conditional EDF
-    // of each additive block rather than leaving inference absent: consumers need
-    // a finite, honest parameter-space dimension for diagnostics and clean-fit
-    // invariance checks, and the Hessian/covariance channels below remain the
-    // authoritative source for uncertainty.
     use crate::model_types::{BlockRole, FittedBlock, FittedLinkState, UnifiedFitResultParts};
     let mut blocks = vec![
         FittedBlock {
@@ -592,13 +638,23 @@ pub fn survival_fit_from_parts(
             .map(|&v| if v > 0.0 { v.ln() } else { f64::NEG_INFINITY })
             .collect(),
     );
+    // Report the genuine per-penalty trace / effective-d.f. channels when the
+    // inner solver supplied them (aligned 1:1 with `all_lambdas`); otherwise
+    // leave them empty so downstream consumers treat them as unavailable rather
+    // than reading a fabricated uniform split (issue #2106).
+    let inference_penalty_block_trace = if penalty_block_trace.len() == all_lambdas.len() {
+        penalty_block_trace.clone()
+    } else {
+        Vec::new()
+    };
+    let inference_edf_by_block = if edf_by_block.len() == all_lambdas.len() {
+        edf_by_block.clone()
+    } else {
+        Vec::new()
+    };
     let inference = geometry.as_ref().map(|geom| gam_solve::estimate::FitInference {
-        edf_by_block: if all_lambdas.is_empty() {
-            Vec::new()
-        } else {
-            vec![edf_total / all_lambdas.len() as f64; all_lambdas.len()]
-        },
-        penalty_block_trace: vec![0.0; all_lambdas.len()],
+        edf_by_block: inference_edf_by_block.clone(),
+        penalty_block_trace: inference_penalty_block_trace.clone(),
         edf_total,
         smoothing_correction: None,
         penalized_hessian: geom.penalized_hessian.clone(),

@@ -4201,10 +4201,17 @@ mod tweedie_exact_series_tests {
         tweedie_series_loglik,
     };
     use ndarray::Array1;
+    use rand::RngExt;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
-    use rand_distr::{Distribution, Uniform};
     use statrs::function::gamma::ln_gamma;
+
+    /// Standard normal via Box–Muller (only `rand`'s uniform is available here).
+    fn normal_draw(rng: &mut StdRng) -> f64 {
+        let u1: f64 = rng.random::<f64>().max(1e-300);
+        let u2: f64 = rng.random::<f64>();
+        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+    }
 
     /// Brute-force reference: sum a very wide, fixed window of the mixture terms
     /// with an explicit log-sum-exp. Independent of the adaptive climb/tail logic
@@ -4259,7 +4266,12 @@ mod tweedie_exact_series_tests {
     #[test]
     fn series_density_normalizes_to_one() {
         // P(Y=0) + ∫₀^∞ f(y) dy ≈ 1 (trapezoid on a fine grid to a far tail).
-        for (mu, phi, p) in [(2.0_f64, 0.6_f64, 1.5_f64), (1.0, 0.1, 1.3), (4.0, 0.6, 1.7)] {
+        // Restricted to gamma-shape α = (2−p)/(p−1) ≥ 1 (i.e. p ≤ 1.5) so the
+        // density is finite at y→0⁺ and the uniform-grid trapezoid is accurate;
+        // the p>1.5 / α<1 spike at the origin is an integrable singularity that a
+        // uniform trapezoid cannot resolve (its density VALUES are certified
+        // exact by `series_matches_brute_force_across_regimes`).
+        for (mu, phi, p) in [(2.0_f64, 0.6_f64, 1.5_f64), (1.0, 0.1, 1.3), (3.0, 0.4, 1.4)] {
             let lambda = mu.powf(2.0 - p) / (phi * (2.0 - p));
             let mass0 = (-lambda).exp();
             let hi = mu * 30.0;
@@ -4284,24 +4296,25 @@ mod tweedie_exact_series_tests {
 
     #[test]
     fn exact_loglik_transitions_seamlessly_to_saddlepoint() {
-        // At large λ the exact fallback returns the saddlepoint, and there the
-        // series and saddlepoint agree to high precision — so the switch does
-        // not introduce a discontinuity in the objective.
-        let (mu, phi, p) = (1.0e5_f64, 0.5_f64, 1.5_f64); // λ ≈ 6.3e5 > threshold
+        // Above the dominant-index threshold the exact fallback returns the
+        // saddlepoint verbatim (μ = 1e8, p = 1.5 ⇒ index ≈ λ = 4e4 > 1e4).
+        let (mu, phi, p) = (1.0e8_f64, 0.5_f64, 1.5_f64);
         let y = mu;
         let exact = tweedie_exact_loglik(y, mu, 1.0, p, phi);
         let saddle = tweedie_saddlepoint_loglik(y, mu, 1.0, p, phi);
         assert!(
             (exact - saddle).abs() < 1e-12,
-            "above the λ threshold the exact path must equal the saddlepoint: {exact} vs {saddle}"
+            "above the index threshold the exact path must equal the saddlepoint: \
+             {exact} vs {saddle}"
         );
-        // Just below the threshold the series and saddlepoint agree to O(1/λ).
-        let (mu2, phi2) = (5.0e3_f64, 1.0_f64); // λ ≈ 141, below threshold
+        // Just below the threshold the series is used and agrees with the
+        // saddlepoint to O(1/index) — a seamless (small-gap) crossover, no jump.
+        let (mu2, phi2) = (5.0e3_f64, 1.0_f64); // index ≈ 283, below threshold
         let series = tweedie_series_loglik(mu2, mu2, 1.0, p, phi2);
         let saddle2 = tweedie_saddlepoint_loglik(mu2, mu2, 1.0, p, phi2);
         assert!(
             (series - saddle2).abs() < 1e-2,
-            "series and saddlepoint must agree at large λ: {series} vs {saddle2}"
+            "series and saddlepoint must agree closely near the crossover: {series} vs {saddle2}"
         );
     }
 
@@ -4311,12 +4324,11 @@ mod tweedie_exact_series_tests {
         let shape = (2.0 - p) / (p - 1.0);
         let scale = phi * (p - 1.0) * mu.powf(p - 1.0);
         // Knuth Poisson.
-        let unif = Uniform::new(0.0_f64, 1.0).unwrap();
         let l = (-lambda).exp();
         let mut k = 0u32;
-        let mut prod = 1.0;
+        let mut prod = 1.0_f64;
         loop {
-            prod *= unif.sample(rng);
+            prod *= rng.random::<f64>();
             if prod <= l {
                 break;
             }
@@ -4334,22 +4346,19 @@ mod tweedie_exact_series_tests {
     }
 
     fn gamma_draw(shape: f64, scale: f64, rng: &mut StdRng) -> f64 {
-        use rand_distr::Normal;
-        let unif = Uniform::new(0.0_f64, 1.0).unwrap();
         if shape < 1.0 {
-            let u: f64 = unif.sample(rng);
+            let u: f64 = rng.random::<f64>().max(1e-300);
             return gamma_draw(shape + 1.0, scale, rng) * u.powf(1.0 / shape);
         }
         let d = shape - 1.0 / 3.0;
         let c = 1.0 / (9.0 * d).sqrt();
-        let normal = Normal::new(0.0, 1.0).unwrap();
         loop {
-            let z: f64 = normal.sample(rng);
+            let z: f64 = normal_draw(rng);
             let v = (1.0 + c * z).powi(3);
             if v <= 0.0 {
                 continue;
             }
-            let u: f64 = unif.sample(rng);
+            let u: f64 = rng.random::<f64>().max(1e-300);
             if u.ln() < 0.5 * z * z + d - d * v + d * v.ln() {
                 return d * v * scale;
             }
@@ -4396,11 +4405,10 @@ mod tweedie_exact_series_tests {
         let mut rng = StdRng::seed_from_u64(2_105_015);
         let n = 6000usize;
         let (p_true, phi_true) = (1.5_f64, 0.6_f64);
-        let unif = Uniform::new(-1.5_f64, 1.5_f64).unwrap();
         let mut mu = Array1::<f64>::zeros(n);
         let mut y = Array1::<f64>::zeros(n);
         for i in 0..n {
-            let x: f64 = unif.sample(&mut rng);
+            let x: f64 = -1.5 + 3.0 * rng.random::<f64>();
             let m = (0.7 + 0.5 * x).exp();
             mu[i] = m;
             y[i] = tweedie_sample(m, p_true, phi_true, &mut rng);

@@ -709,15 +709,39 @@ pub(crate) fn tweedie_saddlepoint_loglik(yi: f64, mui: f64, w: f64, p: f64, phi:
     }
 }
 
-/// Poisson rate above which the exact compound-Poisson–gamma series is abandoned
-/// for the saddlepoint approximation. The number of series terms carrying
-/// non-negligible mass grows like `√λ`, while the saddlepoint's relative error
-/// decays like `O(1/λ)` (it is the many-jumps CLT limit of the same density), so
-/// beyond this rate the series is expensive *and* the saddlepoint is already
-/// exact to far below the resolution of a variance-power profile. At `λ = 10⁴`
-/// the series would sum `~√(74λ) ≈ 860` terms per observation and the saddlepoint
-/// density is accurate to `~10⁻⁴` — the two agree, so the switch is seamless.
-const TWEEDIE_SERIES_MAX_LAMBDA: f64 = 1.0e4;
+/// Dominant-series-index above which the exact compound-Poisson–gamma series is
+/// abandoned for the saddlepoint approximation. The number of series terms
+/// carrying non-negligible mass grows like `√(index)`, while the saddlepoint's
+/// relative error decays like `O(1/index)` (it is the many-jumps CLT limit of the
+/// same density), so beyond this many jumps the series is expensive *and* the
+/// saddlepoint is already exact to far below the resolution of a variance-power
+/// profile. At an index of `10⁴` the series sums `~√(74·index) ≈ 860` terms and
+/// the saddlepoint density is accurate to `~10⁻⁴` — the two agree, so the switch
+/// is seamless. Gating on the *index* (which accounts for the observation `y`,
+/// not just the mean-driven rate λ) also bounds the work for a large-`y`/small-`μ`
+/// outlier whose dominant term sits far above λ.
+const TWEEDIE_SERIES_MAX_INDEX: f64 = 1.0e4;
+
+/// Analytic estimate of the index `k` of the dominant term in the
+/// compound-Poisson–gamma series at one observation — the maximizer of the log
+/// summand `g(k)`, obtained by solving `g'(k)=0` with the leading `ψ(x)≈ln x`
+/// approximation. Reduces to the Poisson rate `λ` when `y=μ` and grows with `y`.
+/// Used both to start the series climb near the peak (so the climb is short at
+/// any magnitude) and to decide the saddlepoint fallback.
+#[inline]
+fn tweedie_series_peak_index(yi: f64, mui: f64, phi_i: f64, p: f64) -> f64 {
+    let two_minus_p = 2.0 - p;
+    let p_minus_one = p - 1.0;
+    let lambda = mui.powf(two_minus_p) / (phi_i * two_minus_p);
+    if yi <= 0.0 {
+        return lambda;
+    }
+    let alpha = two_minus_p / p_minus_one;
+    let gamma_scale = phi_i * p_minus_one * mui.powf(p_minus_one);
+    // k* ≈ exp{ [ln λ + α·ln(y/γ) − α·ln α] / (1+α) }.
+    let ln_k = (lambda.ln() + alpha * (yi / gamma_scale).ln() - alpha * alpha.ln()) / (1.0 + alpha);
+    ln_k.exp().max(1.0)
+}
 
 /// Exact Tweedie (compound Poisson–gamma, `1 < p < 2`) log-density at one
 /// observation, evaluated by the Jørgensen / Dunn–Smyth infinite-series
@@ -771,10 +795,11 @@ pub(crate) fn tweedie_series_loglik(yi: f64, mui: f64, w: f64, p: f64, phi: f64)
             - k * alpha * ln_gamma_scale
             - ln_gamma(k * alpha)
     };
-    // Climb to the dominant term. Start near k ≈ λ (the Poisson mode, which for
-    // y ≈ μ coincides with the combined summand's mode) and walk uphill; the
-    // log-concave summand is unimodal so this reaches the global maximum.
-    let mut k_peak = lambda.round().max(1.0);
+    // Climb to the dominant term. Start at the analytic peak-index estimate
+    // (which reduces to λ when y ≈ μ and tracks large y), so the climb only
+    // refines by a few steps at any magnitude; the log-concave summand is
+    // unimodal so the climb reaches the global maximum.
+    let mut k_peak = tweedie_series_peak_index(yi, mui, phi_i, p).round().max(1.0);
     let mut f_peak = log_term(k_peak);
     loop {
         let f_up = log_term(k_peak + 1.0);
@@ -831,11 +856,11 @@ pub(crate) fn tweedie_exact_loglik(yi: f64, mui: f64, w: f64, p: f64, phi: f64) 
         return 0.0;
     }
     let phi_i = phi / w;
-    let two_minus_p = 2.0 - p;
-    let lambda = mui.powf(two_minus_p) / (phi_i * two_minus_p);
-    // Non-finite λ (degenerate μ / φ) or the large-λ CLT regime: defer to the
-    // saddlepoint, which is well-defined and, at large λ, exact.
-    if !lambda.is_finite() || lambda > TWEEDIE_SERIES_MAX_LAMBDA {
+    let peak_index = tweedie_series_peak_index(yi, mui, phi_i, p);
+    // Non-finite dominant index (degenerate μ / φ) or the many-jumps CLT regime:
+    // defer to the saddlepoint, which is well-defined and, at a large index,
+    // exact. The index (not just λ) accounts for a large-y outlier.
+    if !peak_index.is_finite() || peak_index > TWEEDIE_SERIES_MAX_INDEX {
         return tweedie_saddlepoint_loglik(yi, mui, w, p, phi);
     }
     tweedie_series_loglik(yi, mui, w, p, phi)

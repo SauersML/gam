@@ -823,6 +823,19 @@ impl CustomFamily for BinomialMeanWiggleFamily {
         })
     }
 
+    fn exact_newton_joint_gradient_evaluation(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
+        // Assemble the exact joint score from the per-block IRLS working sets
+        // (X_bᵀ(w⊙(z−η)) per block), the same source of truth the inner
+        // joint-Newton RHS uses — consistent with the family's explicit joint
+        // Hessian and matching FD of the log-likelihood.
+        let eval = self.evaluate(block_states)?;
+        gamlss_joint_gradient_from_working_sets(&eval, specs, block_states).map(Some)
+    }
+
     fn block_geometry(
         &self,
         block_states: &[ParameterBlockState],

@@ -222,8 +222,10 @@ jobs:
             ## Scope
 
             Be many times more ambitious than you think you should be.
-            Everything is in scope. Take large risks.
-
+            Everything is in scope. Take large risks. Don't stop without
+            editing and pushing massive projects to completion.
+            If the build is broken just fix it and continue.
+            
             Have fun. Take your time. Get it perfect.
 
       - name: Print Claude transcript

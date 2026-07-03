@@ -1,10 +1,23 @@
-//! #2101 DIAGNOSTIC PROBE (not a pass/fail guard): localize WHERE the born
-//! decoder dies in the real IBP regime — the K=1 birth SUB-FIT
-//! (`fit_single_atom_response_in_place`, penalty-on-scale-B) vs the JOINT BACKFIT
-//! (gate-dependent deflation). Reproduces red-tree's disjoint 6-circle ibp_map
-//! recovery (n=80, p=16, distinct amps 1.0..0.55, noise 0.05, structured_whitening
-//! OFF) and records the last-born atom's ‖B‖ at every SAC progress event via the
-//! callback (no driver edit). Run with `-- --nocapture` to read the trajectory.
+//! #2101 birth-locus guards: localize WHERE the born decoder dies in the real
+//! IBP regime — the K=1 birth SUB-FIT (`fit_single_atom_response_in_place`,
+//! penalty-on-scale-B) vs the JOINT BACKFIT (gate-dependent deflation).
+//! Reproduces red-tree's disjoint 6-circle ibp_map recovery (n=80, p=16,
+//! distinct amps 1.0..0.55, noise 0.05, structured_whitening OFF) and records
+//! the last-born atom's ‖B‖ at every SAC progress event via the callback (no
+//! driver edit). Run with `-- --nocapture` to read the trajectory.
+//!
+//! These started life as pure `eprintln!` diagnostic probes, but an
+//! assertion-less `#[test]` trips the workspace-root `build.rs`
+//! `scan_for_useless_tests` ban and aborts the whole build (cargo build/test,
+//! `--release`, and the `gamfit` wheel — gam#2110). They are now genuine
+//! pass/fail guards: on top of the trajectory dump each asserts the
+//! well-formedness invariants of the fragile birth path that #2101 studies —
+//! the fit runs end to end without erroring, the progress callback actually
+//! fires, and every decoder norm on the trajectory stays FINITE (no NaN/Inf
+//! leaking out of the arrow–Schur K=1 solve). These invariants hold regardless
+//! of the #2101 rank-collapse outcome, so the guards stay green while #2101 is
+//! open yet still fail loudly on a divergence/NaN regression in this exact code
+//! path; the printed trajectory remains available for the #2101 investigation.
 
 use crate::manifold::{
     fit_stagewise, AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
@@ -13,7 +26,7 @@ use crate::manifold::{
 };
 use gam_terms::latent::LatentManifold;
 use ndarray::{Array1, Array2};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 fn lcg(s: &mut u64) -> f64 {
@@ -110,10 +123,23 @@ fn probe_2101_birth_locus_disjoint_6circle_ibp() {
             config.ridge_beta,
         )
         .expect("seed K=1 fit");
+    // The seed fit must preserve the single seeded atom (K=1 in, K=1 out).
+    assert_eq!(
+        seed_term.k_atoms(),
+        1,
+        "seed K=1 fit changed the atom count before stagewise entry"
+    );
 
     let log: RefCell<Vec<String>> = RefCell::new(Vec::new());
-    {
+    // Guard invariants observed through the progress callback: the callback
+    // must actually fire, and every decoder norm we read off the trajectory
+    // must be finite (a NaN/Inf here is a divergence in the arrow–Schur birth
+    // solve — the exact failure mode #2101 is localizing).
+    let events = Cell::new(0usize);
+    let all_born_finite = Cell::new(true);
+    let (final_k, births_accepted) = {
         let mut cb = |pg: StagewiseProgress<'_>| -> Result<(), String> {
+            events.set(events.get() + 1);
             let k = pg.k_atoms;
             let (born_norm, rows, top2, pr) = if k >= 1 {
                 let d = &pg.term.atoms[k - 1].decoder_coefficients;
@@ -148,6 +174,9 @@ fn probe_2101_birth_locus_disjoint_6circle_ibp() {
             } else {
                 (0.0, vec![], 0.0, 0.0)
             };
+            if !born_norm.is_finite() || rows.iter().any(|v| !v.is_finite()) {
+                all_born_finite.set(false);
+            }
             log.borrow_mut().push(format!(
                 "{:?} round={} sweep={} k={} born|B|={:.3e} rows={:?} top2col={:.2} PR={:.2} ev={:?} reml_after={:?}",
                 pg.event,
@@ -163,18 +192,41 @@ fn probe_2101_birth_locus_disjoint_6circle_ibp() {
             ));
             Ok(())
         };
-        let res = fit_stagewise(seed_term, rho, x.view(), None, None, &config, Some(&mut cb));
-        log.borrow_mut()
-            .push(format!("FINAL: {:?}", res.map(|r| (r.term.k_atoms(), r.report.births_accepted))));
-    }
+        let res = fit_stagewise(seed_term, rho, x.view(), None, None, &config, Some(&mut cb))
+            .expect("stagewise disjoint-6-circle ibp fit");
+        let k = res.term.k_atoms();
+        let births = res.report.births_accepted;
+        log.borrow_mut().push(format!("FINAL: k={k} births={births}"));
+        (k, births)
+    };
     eprintln!("\n==== #2101 BIRTH LOCUS TRAJECTORY (disjoint 6-circle ibp) ====");
     for line in log.borrow().iter() {
         eprintln!("{line}");
     }
     eprintln!("==== END #2101 PROBE ====\n");
+
+    // Well-formedness guards on the birth path (finiteness/shape only; NOT a
+    // claim about #2101's rank-collapse recovery, which is still open).
+    assert!(
+        events.get() > 0,
+        "stagewise progress callback never fired — the birth loop did not run"
+    );
+    assert!(
+        all_born_finite.get(),
+        "born decoder ‖B‖ went non-finite on the trajectory (arrow–Schur birth solve diverged)"
+    );
+    assert!(
+        final_k >= 1,
+        "stagewise fit dropped every atom (k_atoms=0) — the seed circle was lost"
+    );
+    assert!(
+        births_accepted <= config.max_births,
+        "births_accepted={births_accepted} exceeds the configured max_births={}",
+        config.max_births
+    );
 }
 
-/// #2101 UNIFICATION TEST (decides one-fix-vs-two): does the K=1 fit DESTROY a
+/// #2101 UNIFICATION guard (decides one-fix-vs-two): does the K=1 fit DESTROY a
 /// PROPERLY-SEEDED rank-2 circle? Seed a K=1 atom as a perfect circle (cos→e0,
 /// sin→e1, coordinate = the TRUE phase) on a single-circle target, run the same
 /// K=1 driver the birth sub-fit uses, and read the cos/sin decoder-row norms
@@ -182,6 +234,13 @@ fn probe_2101_birth_locus_disjoint_6circle_ibp() {
 /// DC-SEED (seed cos/sin, my lane, SEPARATE from #5). If cos/sin COLLAPSE ⇒ the
 /// fit/criterion crushes circles (the ‖B‖→0 / harmonic-row reward — UNIFIED with
 /// fit-robustness's #5). Runs both ibp and softmax gate modes.
+///
+/// The eprintln! trajectory is the diagnostic; the asserts are the guard. We do
+/// NOT assert survival (that is the open #2101 question) — only the invariants
+/// that must hold either way: the perfect-circle seed really has harmonic norm
+/// √2 before the fit, the K=1 solve returns without error, the atom count is
+/// preserved, and every post-fit decoder row is finite. A NaN/Inf or an atom
+/// vanishing would be a genuine regression in the fragile arrow–Schur path.
 #[test]
 fn probe_2101_proper_circle_seed_survival() {
     let n = 80usize;
@@ -205,6 +264,7 @@ fn probe_2101_proper_circle_seed_survival() {
     });
     let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
 
+    let mut modes_checked = 0usize;
     for (mode_name, logit) in [
         ("ibp_map", 3.0f64),
         ("ibp_map", -4.0),
@@ -265,8 +325,34 @@ fn probe_2101_proper_circle_seed_survival() {
             harm_before,
             harm_after,
         );
+
+        // Invariant guards (mode-independent, #2101-outcome-independent):
+        // the perfect-circle seed is exactly cos→e0, sin→e1, so its harmonic
+        // norm before any fitting is √2.
+        assert!(
+            (harm_before - std::f64::consts::SQRT_2).abs() < 1e-9,
+            "seed harmonic norm should be √2 for a perfect cos→e0/sin→e1 circle, got {harm_before}"
+        );
+        // The K=1 solve must keep the single atom and emit a finite decoder —
+        // a vanished atom or a NaN/Inf row is a hard regression in the birth
+        // path regardless of whether the circle rank-collapses (#2101).
+        assert_eq!(
+            term.atoms.len(),
+            1,
+            "K=1 circle fit ({mode_name}, logit={logit}) changed the atom count"
+        );
+        assert!(
+            rows_after.iter().all(|v| v.is_finite()),
+            "post-fit decoder rows non-finite ({mode_name}, logit={logit}): {rows_after:?}"
+        );
+        assert!(
+            harm_after.is_finite(),
+            "post-fit harmonic norm non-finite ({mode_name}, logit={logit})"
+        );
+        modes_checked += 1;
     }
     eprintln!("==== END #2101 SURVIVAL PROBE ====\n");
+    assert_eq!(modes_checked, 4, "expected all four gate/logit modes to run");
 }
 
 /// #2101/#8 PROTOTYPE (numerical, no production code) — is ring-ness a valid

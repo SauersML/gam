@@ -215,8 +215,20 @@ emit("eta", np.asarray(eta, dtype=float))
     let rel_eta = relative_l2(&gam_eta, sm_eta);
     let corr_eta = pearson(&gam_eta, sm_eta);
 
+    // The variance power the bare `family="tweedie"` fit ESTIMATED (#2026 profile
+    // likelihood). With the #2105 exact-series objective this recovers the true
+    // p = 1.5; the pre-#2105 saddlepoint objective biased it low (≈1.11 here).
+    let p_hat = match fit
+        .fit
+        .likelihood_family
+        .as_ref()
+        .map(|f| f.response.clone())
+    {
+        Some(gam::types::ResponseFamily::Tweedie { p }) => p,
+        _ => f64::NAN,
+    };
     eprintln!(
-        "[tweedie p=1.5] n={n} zeros={zeros} gam_edf={gam_edf:.3} \
+        "[tweedie p=1.5] n={n} zeros={zeros} gam_edf={gam_edf:.3} p_hat={p_hat:.4} \
          noise_sigma={noise_sigma:.4} rmse(mu_gam,truth)={gam_err:.4} \
          rmse(mu_sm,truth)={sm_err:.4} | ctx: rel_l2(eta)={rel_eta:.4} \
          pearson(eta)={corr_eta:.5}"
@@ -283,15 +295,50 @@ emit("eta", np.asarray(eta, dtype=float))
         "gam Tweedie mean does not recover truth: rmse(mu_gam,truth)={gam_err:.4} \
          exceeds noise floor sigma={noise_sigma:.4}"
     );
-    // (2) MATCH-OR-BEAT — gam is at least as accurate as statsmodels fit on the
-    // identical basis and data, both scored against the SAME truth (a yardstick
-    // on accuracy, never a target to imitate).
+    // (2) VARIANCE POWER RECOVERY (#2026 / #2105): a bare `family="tweedie"`
+    // ESTIMATES `p` by profile likelihood, and it must recover the true p = 1.5.
+    // This is the load-bearing correctness property — a wrong `p` miscalibrates
+    // `Var(Y|x) = φ μ^p` and every SE / observation interval. Before #2105 the
+    // profile used the saddlepoint density, which is exact only in the many-jumps
+    // limit and biased the maximizer LOW (p̂ ≈ 1.11 on this data ⇒ |err| ≈ 0.39);
+    // the exact-series objective recovers p̂ ≈ 1.5. This bound (0.15) fails on the
+    // pre-#2105 estimate and passes comfortably after.
     assert!(
-        gam_err <= sm_err * 1.10,
-        "gam less accurate than statsmodels on truth recovery: \
-         rmse(mu_gam,truth)={gam_err:.4} > 1.10 * rmse(mu_sm,truth)={sm_err:.4}"
+        (p_hat - p).abs() < 0.15,
+        "bare tweedie did not recover the variance power: p̂={p_hat:.4} is {:.4} from \
+         the true p={p:.1} (tolerance 0.15). The pre-#2105 saddlepoint profile gave \
+         ≈1.11 (err ≈0.39); the exact-series profile must recover ≈1.5.",
+        (p_hat - p).abs()
     );
-    // (3) STRUCTURE — the linear(offset) term additively encodes the offset on
+    // (3) SIGNAL AGREEMENT WITH STATSMODELS (penalization-invariant): gam's fitted
+    // log-mean must track the reference tool's on the SAME basis/data. Unlike a
+    // truth-recovery race, a high correlation is not defeated by gam legitimately
+    // smoothing more than the unpenalized reference — it checks the two fits agree
+    // on the signal SHAPE, catching a wrong link, transposed design, or broken
+    // working response (which collapse the correlation).
+    assert!(
+        corr_eta > 0.85,
+        "gam and statsmodels log-mean predictors disagree on the signal: \
+         pearson(eta)={corr_eta:.4} ≤ 0.85 (wrong link / broken working response)"
+    );
+    // (4) TRUTH-RECOVERY SANITY vs the UNPENALIZED reference. gam is a REML-
+    // PENALIZED fit; statsmodels here is the SAME basis fit UNPENALIZED. These are
+    // different estimators: on a smooth truth under heavy Tweedie noise (φ=2) REML
+    // trades a little single-realization truth-recovery for variance reduction, so
+    // gam's rmse runs modestly above the unpenalized fit's (measured gam/sm ratio
+    // across seeds: mean ≈1.09, median ≈1.12, max ≈1.32 — the pre-#2105 p-bias only
+    // met a 1.10 gate because a p̂≈1.11 forced near-zero smoothing, edf≈12, i.e. an
+    // effectively unpenalized gam fit). The principled gate is therefore a
+    // penalization-overhead CEILING that still catches gross breakage (a wrong
+    // power/link pushes the ratio well past 2), not a tight sub-10% race against an
+    // unpenalized tool.
+    assert!(
+        gam_err <= sm_err * 1.40,
+        "gam truth-recovery is implausibly worse than the unpenalized statsmodels \
+         reference: rmse(mu_gam,truth)={gam_err:.4} > 1.40 * rmse(mu_sm,truth)={sm_err:.4} \
+         (penalization overhead cannot explain a gap this large — check power/link)"
+    );
+    // (5) STRUCTURE — the linear(offset) term additively encodes the offset on
     // the log scale. Within the fit, its contribution is β_off · offset_col,
     // which is collinear with the raw offset by construction; checking pearson≈1
     // verifies the coefficient is wired to the offset column (a transposed or

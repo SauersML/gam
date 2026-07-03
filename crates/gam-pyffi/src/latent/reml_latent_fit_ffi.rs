@@ -1629,11 +1629,14 @@ fn gaussian_reml_fit_formula_table_impl(
         s_list.push(gam::terms::smooth::BlockwisePenalty::new(shifted, kron));
     }
     if s_list.is_empty() {
-        return Err(
-            "shared-tangent Gaussian REML requires at least one smoothing penalty (a purely \
-             parametric RHS is fitted directly without REML)"
-                .to_string(),
-        );
+        // A purely parametric RHS (`y ~ 1`, `y ~ x`) carries NO smoothing
+        // penalty, so there is nothing for REML to select. Rather than erroring,
+        // fit it DIRECTLY: an ordinary (unpenalized) least-squares solve on the
+        // shared tangent design at the base point (#2103). For the intercept-only
+        // model this is the constant Fréchet-mean fit — at the intrinsic Fréchet
+        // (Karcher) mean base point `Σ_i log_base(Y_i) = 0`, so the fitted tangent
+        // intercept is `0` and `exp_base(0) = base` recovers the intrinsic mean.
+        return direct_parametric_shared_tangent_fit(&joint_x, joint_y.view(), &x, y, weights, k, d);
     }
 
     let offset_zero = Array1::<f64>::zeros(n * d);
@@ -1785,6 +1788,107 @@ fn gaussian_reml_fit_formula_table_impl(
         lambdas,
         edf,
         reml_score: fit.reml_score,
+    })
+}
+
+/// Direct, non-REML shared-tangent fit for a purely parametric RHS (`y ~ 1`,
+/// `y ~ x`): an ordinary (unpenalized) least-squares solve on the joint whitened
+/// tangent design, the path the shared-tangent orchestration promises when the
+/// formula has no smoothing penalty (#2103).
+///
+/// The per-row whitening (observation weights and any Fisher–Rao metric) is
+/// already folded into `joint_x`/`joint_y` by the caller, so the fit is an
+/// ordinary GLS/LSQ on the whitened system: solve the normal equations
+/// `(joint_xᵀ joint_x) β = joint_xᵀ joint_y`. `β` is unpacked into the same
+/// interleaved `(K, D)` grid the REML path uses, and predictions are the tangent
+/// values `X · β` at the base point. For the intercept-only case (`K = 1`, the
+/// constant column) `β` is the weighted tangent mean; at the intrinsic Fréchet
+/// (Karcher) mean base point `Σ_i log_base(Y_i) = 0`, so `β = 0` and
+/// `exp_base(0) = base` is exactly the intrinsic Fréchet mean.
+fn direct_parametric_shared_tangent_fit(
+    joint_x: &Array2<f64>,
+    joint_y: ArrayView1<'_, f64>,
+    x: &Array2<f64>,
+    y: ArrayView2<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    k: usize,
+    d: usize,
+) -> Result<TangentRemlMultiResult, String> {
+    use gam::linalg::matrix::FactorizedSystem;
+
+    let p_total = joint_x.ncols();
+    // Whitened normal equations for the unpenalized parametric least squares.
+    let xtx = fast_ata(joint_x);
+    let xty = gam::linalg::faer_ndarray::fast_atv(joint_x, &joint_y);
+    let factor = factorize_symmetricwith_fallback(
+        gam::linalg::faer_ndarray::FaerArrayView::new(&xtx).as_ref(),
+        Side::Lower,
+    )
+    .map_err(|err| {
+        format!(
+            "direct parametric shared-tangent normal-equations factorization failed \
+             (a rank-deficient parametric RHS has no unique unpenalized fit): {err}"
+        )
+    })?;
+    let beta = FactorizedSystem::solve(&factor, &xty)
+        .map_err(|err| format!("direct parametric shared-tangent LSQ solve failed: {err}"))?;
+    if beta.len() != p_total {
+        return Err(format!(
+            "direct parametric shared-tangent LSQ produced {} coefficients, expected {p_total}",
+            beta.len()
+        ));
+    }
+
+    // Unpack the interleaved coefficients into the `(K, D)` grid: output `o`,
+    // basis column `c` lives at joint index `c*D + o` (same layout as the REML
+    // path), then recover the unwhitened fitted tangent values `X · β`.
+    let mut coefficients = Array2::<f64>::zeros((k, d));
+    for col in 0..k {
+        for output in 0..d {
+            coefficients[[col, output]] = beta[col * d + output];
+        }
+    }
+    let fitted = x.dot(&coefficients);
+
+    // Pooled, isotropic residual variance. Every column is unpenalized, so the
+    // effective df is exactly `K·D` and the denominator is the same
+    // `D·W − edf_total` the penalized path uses (the multi-output analogue of the
+    // scalar Gaussian `n − edf`).
+    let weight_sum: f64 = weights.iter().copied().sum();
+    let edf_total = k as f64 * d as f64;
+    let denom = (d as f64 * weight_sum - edf_total).max(1.0);
+    let mut ss = 0.0;
+    for row in 0..y.nrows() {
+        for output in 0..d {
+            let resid = y[[row, output]] - fitted[[row, output]];
+            ss += weights[row] * resid * resid;
+        }
+    }
+    let sigma2_hat = ss / denom;
+
+    // REML criterion of the null-penalty model: the σ-profiled restricted
+    // Gaussian log-likelihood over the `n·D` whitened stacked rows. No smoothing
+    // parameter is selected — this is simply the parametric model's restricted
+    // marginal likelihood, kept finite so the FFI reports `status = "ok"`.
+    let n_rows = joint_x.nrows() as f64;
+    let logdet_xtx = factor.logdet();
+    let reml_score = if sigma2_hat > 0.0 && logdet_xtx.is_finite() {
+        let residual_rows = (n_rows - p_total as f64).max(0.0);
+        -0.5 * residual_rows * ((2.0 * std::f64::consts::PI * sigma2_hat).ln() + 1.0)
+            - 0.5 * logdet_xtx
+    } else {
+        0.0
+    };
+
+    Ok(TangentRemlMultiResult {
+        coefficients,
+        fitted,
+        sigma2: Array1::<f64>::from_elem(1, sigma2_hat),
+        // No smoothing penalty ⇒ no per-smooth λ/edf (length-0 vectors, matching
+        // the empty penalty list `M = 0`).
+        lambdas: Array1::<f64>::zeros(0),
+        edf: Array1::<f64>::zeros(0),
+        reml_score,
     })
 }
 
