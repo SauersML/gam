@@ -336,6 +336,11 @@ fn sparse_transform_with_explicit_mode_reports_cpu_route_stats() {
     assert_eq!(transform.score_route_stats.minibatches, 1);
     assert_eq!(transform.score_route_stats.cpu_minibatches, 1);
     assert_eq!(transform.score_route_stats.device_minibatches, 0);
+    assert_eq!(transform.score_route_stats.device_dtoh_bytes, 0);
+    assert_eq!(
+        transform.score_route_stats.unfused_score_dtoh_bytes_avoided,
+        0
+    );
 }
 
 #[test]
@@ -358,6 +363,8 @@ fn sparse_fit_records_score_route_stats() {
     assert_eq!(fit.score_route_stats.cpu_minibatches, 8);
     assert_eq!(fit.score_route_stats.device_minibatches, 0);
     assert_eq!(fit.score_route_stats.admitted_minibatches, 0);
+    assert_eq!(fit.score_route_stats.device_dtoh_bytes, 0);
+    assert_eq!(fit.score_route_stats.unfused_score_dtoh_bytes_avoided, 0);
     assert_eq!(
         fit.score_route_stats.score_elements,
         8u128 * 16u128 * k as u128

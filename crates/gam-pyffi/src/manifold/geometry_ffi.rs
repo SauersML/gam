@@ -4788,6 +4788,11 @@ fn score_route_stats_dict<'py>(
     out.set_item("score_elements", stats.score_elements.to_string())?;
     out.set_item("score_tiles", stats.score_tiles)?;
     out.set_item("peak_score_bytes", stats.peak_score_bytes)?;
+    out.set_item("device_dtoh_bytes", stats.device_dtoh_bytes.to_string())?;
+    out.set_item(
+        "unfused_score_dtoh_bytes_avoided",
+        stats.unfused_score_dtoh_bytes_avoided.to_string(),
+    )?;
     out.set_item(
         "dot_flops_lower_bound",
         stats.dot_flops_lower_bound.to_string(),

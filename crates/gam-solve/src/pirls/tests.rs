@@ -1906,12 +1906,7 @@ mod tests {
         let eta = x.dot(&result.beta) + &offset;
         let mu = eta.mapv(f64::exp);
         let full = calculate_loglikelihood(y.view(), &mu, &likelihood, w.view());
-        let omit = calculate_loglikelihood_omitting_constants(
-            y.view(),
-            &mu,
-            &likelihood,
-            w.view(),
-        );
+        let omit = calculate_loglikelihood_omitting_constants(y.view(), &mu, &likelihood, w.view());
         assert!(
             full <= 0.0,
             "Poisson reporting log-likelihood is a log-mass and must be <= 0, got {full}"

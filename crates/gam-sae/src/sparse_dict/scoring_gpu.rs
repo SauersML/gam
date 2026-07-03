@@ -10,17 +10,15 @@
 //!
 //! # What this offloads (and what it does NOT)
 //!
-//! This computes ONE atom-tile's `rows × tile` score block on the device,
-//! exactly the block the CPU [`super::scoring::score_row_tile`] folds into the
-//! per-row online top-`s` selectors. The selection logic itself
-//! ([`super::scoring::TopSSelector`]) stays single-sourced on the CPU: the
-//! device returns the score block, the host folds it into the SAME selectors,
-//! and discards it. The minibatch router [`route_minibatch_required`] walks the
-//! whole `K`-wide dictionary in atom-column tiles (each launch's block capped at
-//! `GPU_ROUTE_TILE_ELEMS`), so peak host/device score memory is `rows × tile`,
-//! **independent of `K`** — the lane's no-`N×K` memory discipline is preserved
-//! on the device exactly as on the CPU; the GPU just does the `O(rows·tile·P)`
-//! multiply-accumulate that dominates.
+//! This computes one atom-tile's `rows × tile` score block on the device, then
+//! folds that tile into per-row top-`s` state on the device before moving to the
+//! next tile. The minibatch router [`route_minibatch_required`] walks the whole
+//! `K`-wide dictionary in atom-column tiles (each launch's block capped at
+//! `GPU_ROUTE_TILE_ELEMS`), so peak device score memory is `rows × tile`,
+//! **independent of `K`**. The host downloads only the final `rows × s`
+//! `(atom, score)` shortlists instead of every score tile. The lane's no-`N×K`
+//! memory discipline is preserved exactly as on the CPU; the GPU does both the
+//! `O(rows·tile·P)` multiply-accumulate and the high-K top-`s` scan.
 //!
 //! # Bit-exact parity (the gate, not a tolerance)
 //!
@@ -34,9 +32,10 @@
 //! So the kernel forces SEPARATE rounding with `__fmul_rn` + `__fadd_rn`, in the
 //! SAME ascending-`c` order, giving a score block that is **bit-for-bit**
 //! identical to the CPU `score_row_tile` (every `f32` equal under `to_bits`).
-//! Because the scores are identical, the CPU selector fed device scores produces
-//! the IDENTICAL routed support — parity is exact by construction, not bounded
-//! by a tolerance.
+//! Because the scores are identical and the device fold uses the same
+//! `(|score| desc, atom asc)` ordering as [`super::scoring::TopSSelector`], the
+//! routed support is IDENTICAL to the CPU oracle — parity is exact by
+//! construction, not bounded by a tolerance.
 
 #![cfg(target_os = "linux")]
 
@@ -110,6 +109,208 @@ void sparse_dict_score_block(
       acc = __fadd_rn(acc, prod);
     }
     scores[(long long)r * n_atoms + a] = acc;
+  }
+}
+
+#define EMPTY_TOP_ATOM 0xffffffffu
+
+static __device__ __forceinline__
+float sparse_dict_abs_f32(float v) {
+  return (v < 0.0f) ? -v : v;
+}
+
+static __device__ __forceinline__
+int sparse_dict_better(float mag, unsigned int atom,
+                       float ref_mag, unsigned int ref_atom) {
+  return (mag > ref_mag) || (mag == ref_mag && atom < ref_atom);
+}
+
+static __device__ __forceinline__
+int sparse_dict_worse(float mag, unsigned int atom,
+                      float ref_mag, unsigned int ref_atom) {
+  return (mag < ref_mag) || (mag == ref_mag && atom > ref_atom);
+}
+
+static __device__ __forceinline__
+void sparse_dict_recompute_worst(const unsigned int* atoms,
+                                 const float* mags,
+                                 int count,
+                                 int* worst_idx) {
+  int worst = 0;
+  for (int j = 1; j < count; ++j) {
+    if (sparse_dict_worse(mags[j], atoms[j], mags[worst], atoms[worst])) {
+      worst = j;
+    }
+  }
+  *worst_idx = worst;
+}
+
+static __device__ __forceinline__
+void sparse_dict_offer_top_s(unsigned int* atoms,
+                             float* scores,
+                             float* mags,
+                             int active,
+                             unsigned int atom,
+                             float score,
+                             int* count,
+                             int* worst_idx) {
+  if (active <= 0) {
+    return;
+  }
+  const float mag = sparse_dict_abs_f32(score);
+  if (*count < active) {
+    const int slot = *count;
+    atoms[slot] = atom;
+    scores[slot] = score;
+    mags[slot] = mag;
+    *count = slot + 1;
+    if (*count == active) {
+      sparse_dict_recompute_worst(atoms, mags, *count, worst_idx);
+    }
+    return;
+  }
+  const int worst = *worst_idx;
+  if (sparse_dict_better(mag, atom, mags[worst], atoms[worst])) {
+    atoms[worst] = atom;
+    scores[worst] = score;
+    mags[worst] = mag;
+    sparse_dict_recompute_worst(atoms, mags, active, worst_idx);
+  }
+}
+
+static __device__ __forceinline__
+void sparse_dict_sort_top_s(unsigned int* atoms,
+                            float* scores,
+                            float* mags,
+                            int active,
+                            int count) {
+  for (int i = 1; i < count; ++i) {
+    const unsigned int atom = atoms[i];
+    const float score = scores[i];
+    const float mag = mags[i];
+    int j = i;
+    while (j > 0 && sparse_dict_better(mag, atom, mags[j - 1], atoms[j - 1])) {
+      atoms[j] = atoms[j - 1];
+      scores[j] = scores[j - 1];
+      mags[j] = mags[j - 1];
+      --j;
+    }
+    atoms[j] = atom;
+    scores[j] = score;
+    mags[j] = mag;
+  }
+  for (int j = count; j < active; ++j) {
+    atoms[j] = EMPTY_TOP_ATOM;
+    scores[j] = 0.0f;
+    mags[j] = -1.0f;
+  }
+}
+
+extern "C" __global__
+void sparse_dict_fold_top_s(
+    const float* __restrict__ scores,  // [n_rows * n_atoms] current tile
+    int n_rows,
+    int n_atoms,
+    unsigned int atom_offset,
+    int active,
+    unsigned int* __restrict__ top_atoms, // [n_rows * active]
+    float* __restrict__ top_scores,       // [n_rows * active]
+    float* __restrict__ top_mags)         // [n_rows * active]
+{
+  const int row = blockIdx.x;
+  if (row >= n_rows || active <= 0) {
+    return;
+  }
+  const int tid = threadIdx.x;
+  const int nthreads = blockDim.x;
+  const int candidate_slots = nthreads * active;
+
+  extern __shared__ unsigned char smem[];
+  unsigned int* cand_atoms = (unsigned int*)smem;
+  unsigned int* best_atoms = cand_atoms + candidate_slots;
+  float* cand_scores = (float*)(best_atoms + active);
+  float* best_scores = cand_scores + candidate_slots;
+  float* cand_mags = best_scores + active;
+  float* best_mags = cand_mags + candidate_slots;
+
+  const int local_base = tid * active;
+  for (int j = 0; j < active; ++j) {
+    cand_atoms[local_base + j] = EMPTY_TOP_ATOM;
+    cand_scores[local_base + j] = 0.0f;
+    cand_mags[local_base + j] = -1.0f;
+  }
+  if (tid == 0) {
+    for (int j = 0; j < active; ++j) {
+      best_atoms[j] = EMPTY_TOP_ATOM;
+      best_scores[j] = 0.0f;
+      best_mags[j] = -1.0f;
+    }
+  }
+  __syncthreads();
+
+  int local_count = 0;
+  int local_worst = 0;
+  unsigned int* local_atoms = cand_atoms + local_base;
+  float* local_scores = cand_scores + local_base;
+  float* local_mags = cand_mags + local_base;
+  const long long row_base = (long long)row * n_atoms;
+  for (int atom = tid; atom < n_atoms; atom += nthreads) {
+    const float score = scores[row_base + atom];
+    sparse_dict_offer_top_s(
+        local_atoms,
+        local_scores,
+        local_mags,
+        active,
+        atom_offset + (unsigned int)atom,
+        score,
+        &local_count,
+        &local_worst);
+  }
+  __syncthreads();
+
+  if (tid == 0) {
+    int best_count = 0;
+    int best_worst = 0;
+    const long long out_base = (long long)row * active;
+    if (atom_offset != 0u) {
+      for (int j = 0; j < active; ++j) {
+        const unsigned int atom = top_atoms[out_base + j];
+        if (atom != EMPTY_TOP_ATOM) {
+          sparse_dict_offer_top_s(
+              best_atoms,
+              best_scores,
+              best_mags,
+              active,
+              atom,
+              top_scores[out_base + j],
+              &best_count,
+              &best_worst);
+        }
+      }
+    }
+    for (int t = 0; t < nthreads; ++t) {
+      const int base = t * active;
+      for (int j = 0; j < active; ++j) {
+        const unsigned int atom = cand_atoms[base + j];
+        if (atom != EMPTY_TOP_ATOM) {
+          sparse_dict_offer_top_s(
+              best_atoms,
+              best_scores,
+              best_mags,
+              active,
+              atom,
+              cand_scores[base + j],
+              &best_count,
+              &best_worst);
+        }
+      }
+    }
+    sparse_dict_sort_top_s(best_atoms, best_scores, best_mags, active, best_count);
+    for (int j = 0; j < active; ++j) {
+      top_atoms[out_base + j] = best_atoms[j];
+      top_scores[out_base + j] = best_scores[j];
+      top_mags[out_base + j] = best_mags[j];
+    }
   }
 }
 "#;
@@ -238,7 +439,7 @@ pub fn score_block_required(
 /// Peak score elements per device launch for the tiled GPU router. The router
 /// NEVER materialises the whole `m × K` block: it walks `K` in atom-column tiles
 /// sized so each launch's `m × cols` block stays under this cap (~2M f32 ≈ 8 MB
-/// host + 8 MB device), then discards it after folding. This keeps peak score
+/// device score buffer), then discards it after folding. This keeps peak score
 /// memory bounded **independent of `K`** — the same discipline the CPU lane
 /// ([`super::scoring::top_s_online`]) keeps with its `rows × tile` column tiles —
 /// so a `K ≈ 32_000` fit does not balloon a `device alloc` linearly in `K`.
@@ -246,20 +447,19 @@ const GPU_ROUTE_TILE_ELEMS: usize = gam_gpu::DEFAULT_DICTIONARY_SCORE_TILE_ELEMS
 
 /// Route a whole minibatch of rows against the full decoder, returning each
 /// row's top-`s` `(atom, score)` selection — BIT-IDENTICAL to calling
-/// [`super::scoring::top_s_online`] per row, but with the score block computed on
-/// the device (in `K`-tiled launches) when admitted.
+/// [`super::scoring::top_s_online`] per row, but with score blocks and the
+/// online top-`s` fold computed on the device when admitted.
 ///
-/// The selection ([`super::scoring::TopSSelector`]) is single-sourced on the CPU
-/// and fed the device scores in ascending atom order. `TopSSelector` keeps the
-/// top-`s` by `(|score| desc, atom asc)` — a strict total order on the unique
-/// atom indices — so the selected set is independent of the order or the tiling
-/// in which candidates are offered. Combined with bit-identical scores (the
-/// kernel forbids FMA contraction), the routed support matches the CPU oracle
-/// **exactly**, whichever path and whatever GPU tile width computed the block.
+/// The device fold uses the same strict order as
+/// [`super::scoring::TopSSelector`]: `(|score| desc, atom asc)`. Combined with
+/// bit-identical score arithmetic (the score kernel forbids FMA contraction),
+/// the routed support matches the CPU oracle **exactly**, while the host only
+/// downloads the final `rows × active` shortlists.
 ///
 /// Memory: the `m × K` block is never formed whole — `K` is walked in tiles of
-/// at most `GPU_ROUTE_TILE_ELEMS / m` atom-columns, each launched, folded, and
-/// discarded, so peak score memory is `m × tile_cols`, independent of `K`.
+/// at most `GPU_ROUTE_TILE_ELEMS / m` atom-columns. Each tile's score block is
+/// folded into resident device top-`s` buffers and discarded, so peak score
+/// memory is `m × tile_cols`, independent of `K`.
 ///
 /// Falls back to the per-row CPU `top_s_online` under [`gam_gpu::GpuMode::Off`],
 /// below the device break-even, or on any device error under
@@ -275,11 +475,12 @@ pub fn route_minibatch_required(
     s: usize,
     tile: usize,
     mode: gam_gpu::GpuMode,
-) -> Result<(Vec<Vec<(u32, f32)>>, ScoreBlockPath), gam_gpu::GpuError> {
-    use super::scoring::{TopSSelector, top_s_online};
+) -> Result<(Vec<Vec<(u32, f32)>>, ScoreBlockPath, usize), gam_gpu::GpuError> {
+    use super::scoring::top_s_online;
 
     let m = rows.nrows();
     let k = decoder.nrows();
+    let active = s.max(1).min(k.max(1));
 
     // CPU per-row path (bit-identical oracle), used for Off / below break-even /
     // Auto device-error fallback.
@@ -290,7 +491,7 @@ pub fn route_minibatch_required(
     };
 
     if mode == gam_gpu::GpuMode::Off {
-        return Ok((cpu_route(), ScoreBlockPath::Cpu));
+        return Ok((cpu_route(), ScoreBlockPath::Cpu, 0));
     }
 
     // Engagement is decided on the TOTAL work `m × K` (that is what justifies the
@@ -312,41 +513,27 @@ pub fn route_minibatch_required(
                 m.saturating_mul(k)
             ));
         }
-        return Ok((cpu_route(), ScoreBlockPath::Cpu));
+        return Ok((cpu_route(), ScoreBlockPath::Cpu, 0));
     }
     if m == 0 || k == 0 {
-        return Ok((cpu_route(), ScoreBlockPath::Cpu));
+        return Ok((cpu_route(), ScoreBlockPath::Cpu, 0));
     }
 
     // Atom-columns per device launch: bound the per-launch block to
     // GPU_ROUTE_TILE_ELEMS, at least one column, never more than K.
     let tile_cols = plan.tile_items;
 
-    // Per-row online selectors; each device tile's scores are folded in ascending
-    // global atom order (offset + ascending local), and the selector's result is
-    // tile-order-invariant, so the support is bit-identical to top_s_online.
-    let mut selectors: Vec<TopSSelector> = (0..m).map(|_| TopSSelector::new(s)).collect();
-    match device::score_decoder_tiled_device(rows, decoder, tile_cols, |start, cols, block| {
-        for (r, sel) in selectors.iter_mut().enumerate() {
-            let base = r * cols;
-            for (local, score) in block[base..base + cols].iter().enumerate() {
-                sel.offer((start + local) as u32, *score);
-            }
-        }
-    }) {
-        Ok(()) => {}
+    match device::route_decoder_tiled_device(rows, decoder, active, tile_cols) {
+        Ok(out) => return Ok((out.selections, ScoreBlockPath::Device, out.device_dtoh_bytes)),
         Err(err) => {
             if mode == gam_gpu::GpuMode::Required {
                 return Err(err);
             }
             // Auto: the device faulted mid-route; discard partial selectors and
             // run the exact CPU oracle for the whole minibatch.
-            return Ok((cpu_route(), ScoreBlockPath::Cpu));
+            return Ok((cpu_route(), ScoreBlockPath::Cpu, 0));
         }
     }
-
-    let routed = selectors.into_iter().map(TopSSelector::finish).collect();
-    Ok((routed, ScoreBlockPath::Device))
 }
 
 mod device {
@@ -362,6 +549,7 @@ mod device {
         ctx: Arc<CudaContext>,
         stream: Arc<CudaStream>,
         modules: Mutex<HashMap<usize, Arc<CudaModule>>>,
+        max_shared_mem_per_block: usize,
     }
 
     fn backend() -> Result<&'static Backend, GpuError> {
@@ -373,6 +561,9 @@ mod device {
                     ctx: parts.ctx,
                     stream: parts.stream,
                     modules: Mutex::new(HashMap::new()),
+                    max_shared_mem_per_block: gam_gpu::GpuRuntime::global()
+                        .map(|runtime| runtime.selected_device().max_shared_mem_per_block)
+                        .unwrap_or(0),
                 })
             })
             .as_ref()
@@ -491,20 +682,51 @@ mod device {
         Ok(scores)
     }
 
-    /// Route-time score-block stream for a full decoder. The rows are uploaded
-    /// once and kept resident across every atom tile; only the atom tile and
-    /// score block rotate per launch. That preserves the existing bit-exact
-    /// `sparse_dict_score_block` arithmetic while removing the repeated `B × P`
-    /// H2D copy that `score_block_device(rows, atoms_tile)` paid once per K tile.
-    pub(super) fn score_decoder_tiled_device<F>(
+    const TOP_S_FOLD_THREADS: u32 = 32;
+
+    struct RouteDeviceOutput {
+        selections: Vec<Vec<(u32, f32)>>,
+        device_dtoh_bytes: usize,
+    }
+
+    fn fold_shared_bytes(
+        active: usize,
+        threads: u32,
+        max_shared_mem_per_block: usize,
+    ) -> Result<u32, GpuError> {
+        let slots = (threads as usize)
+            .checked_add(1)
+            .and_then(|v| v.checked_mul(active))
+            .ok_or_else(|| gam_gpu::gpu_err!("sparse_dict top-s fold shared-memory overflow"))?;
+        let bytes = slots
+            .checked_mul(
+                std::mem::size_of::<u32>()
+                    + std::mem::size_of::<f32>()
+                    + std::mem::size_of::<f32>(),
+            )
+            .ok_or_else(|| gam_gpu::gpu_err!("sparse_dict top-s fold shared-memory overflow"))?;
+        if max_shared_mem_per_block > 0 && bytes > max_shared_mem_per_block {
+            return Err(gam_gpu::gpu_err!(
+                "sparse_dict top-s fold requires {bytes} shared-memory bytes per row block \
+                 (active={active}, threads={threads}) but the selected device reports \
+                 max_shared_mem_per_block={max_shared_mem_per_block}"
+            ));
+        }
+        u32::try_from(bytes)
+            .map_err(|_| gam_gpu::gpu_err!("sparse_dict top-s fold shared-memory bytes overflow"))
+    }
+
+    /// Route-time score-block stream for a full decoder. Rows stay resident for
+    /// the whole minibatch; one reusable atom-tile buffer and one reusable score
+    /// buffer rotate across K. Each score tile is folded into resident per-row
+    /// top-`s` state by `sparse_dict_fold_top_s`, so the host downloads only the
+    /// final `(atom, score)` shortlists instead of every `rows × tile` score.
+    pub(super) fn route_decoder_tiled_device(
         rows: ArrayView2<'_, f32>,
         decoder: ArrayView2<'_, f32>,
+        active: usize,
         tile_cols: usize,
-        mut fold_tile: F,
-    ) -> Result<(), GpuError>
-    where
-        F: FnMut(usize, usize, &[f32]),
-    {
+    ) -> Result<RouteDeviceOutput, GpuError> {
         let n_rows = rows.nrows();
         let k = decoder.nrows();
         let p = rows.ncols();
@@ -515,55 +737,99 @@ mod device {
             ));
         }
         if n_rows == 0 || k == 0 || p == 0 {
-            return Ok(());
+            return Ok(RouteDeviceOutput {
+                selections: vec![Vec::new(); n_rows],
+                device_dtoh_bytes: 0,
+            });
+        }
+        let active = active.max(1).min(k);
+        if k > u32::MAX as usize {
+            return Err(gam_gpu::gpu_err!(
+                "sparse_dict tiled route K={k} exceeds u32 atom-index storage"
+            ));
         }
 
         let b = backend()?;
         let module = module_for(b, p)?;
-        let func = module
+        let score_func = module
             .load_function("sparse_dict_score_block")
             .gpu_ctx("sparse_dict tiled score load_function")?;
+        let fold_func = module
+            .load_function("sparse_dict_fold_top_s")
+            .gpu_ctx("sparse_dict top-s fold load_function")?;
         let stream = b.stream.clone();
 
-        let rows_host: Vec<f32> = rows.iter().copied().collect();
+        let rows_storage: Vec<f32>;
+        let rows_host: &[f32] = if let Some(slice) = rows.as_slice() {
+            slice
+        } else {
+            rows_storage = rows.iter().copied().collect();
+            rows_storage.as_slice()
+        };
         assert_eq!(
             rows_host.len(),
             n_rows * p,
             "tiled score rows flatten length"
         );
         let rows_dev = stream
-            .clone_htod(&rows_host)
+            .clone_htod(rows_host)
             .gpu_ctx("sparse_dict tiled score htod rows")?;
+
+        let decoder_storage: Vec<f32>;
+        let decoder_host: &[f32] = if let Some(slice) = decoder.as_slice() {
+            slice
+        } else {
+            decoder_storage = decoder.iter().copied().collect();
+            decoder_storage.as_slice()
+        };
+        assert_eq!(
+            decoder_host.len(),
+            k * p,
+            "tiled score decoder flatten length"
+        );
 
         let n_rows_i32 = i32::try_from(n_rows).map_err(|_| {
             gam_gpu::gpu_err!("sparse_dict tiled score n_rows={n_rows} overflows i32")
+        })?;
+        let active_i32 = i32::try_from(active).map_err(|_| {
+            gam_gpu::gpu_err!("sparse_dict tiled score active={active} overflows i32")
         })?;
         let tile_m = super::SCORE_BLOCK_TILE_M;
         let tile_n = super::SCORE_BLOCK_TILE_N;
         let tile_cols = tile_cols.max(1);
         let max_tile_cols = tile_cols.min(k);
+        let mut atoms_dev = stream
+            .alloc_zeros::<f32>(max_tile_cols * p)
+            .gpu_ctx("sparse_dict tiled score alloc atoms")?;
         let mut scores_dev = stream
             .alloc_zeros::<f32>(n_rows * max_tile_cols)
             .gpu_ctx("sparse_dict tiled score alloc scores")?;
-        let mut scores = vec![0.0f32; n_rows * max_tile_cols];
+        let mut top_atoms_dev = stream
+            .alloc_zeros::<u32>(n_rows * active)
+            .gpu_ctx("sparse_dict top-s alloc atoms")?;
+        let mut top_scores_dev = stream
+            .alloc_zeros::<f32>(n_rows * active)
+            .gpu_ctx("sparse_dict top-s alloc scores")?;
+        let mut top_mags_dev = stream
+            .alloc_zeros::<f32>(n_rows * active)
+            .gpu_ctx("sparse_dict top-s alloc mags")?;
+        let fold_shared = fold_shared_bytes(active, TOP_S_FOLD_THREADS, b.max_shared_mem_per_block)?;
 
         let mut start = 0usize;
         while start < k {
             let end = (start + tile_cols).min(k);
-            let atoms = decoder.slice(ndarray::s![start..end, ..]);
-            let n_atoms = atoms.nrows();
-            let atoms_host: Vec<f32> = atoms.iter().copied().collect();
-            assert_eq!(
-                atoms_host.len(),
-                n_atoms * p,
-                "tiled score atoms flatten length"
-            );
-            let atoms_dev = stream
-                .clone_htod(&atoms_host)
+            let n_atoms = end - start;
+            let atom_start = start * p;
+            let atom_end = end * p;
+            stream
+                .memcpy_htod(&decoder_host[atom_start..atom_end], &mut atoms_dev)
                 .gpu_ctx("sparse_dict tiled score htod atoms")?;
 
             let n_atoms_i32 = i32::try_from(n_atoms).map_err(|_| {
                 gam_gpu::gpu_err!("sparse_dict tiled score n_atoms={n_atoms} overflows i32")
+            })?;
+            let atom_offset = u32::try_from(start).map_err(|_| {
+                gam_gpu::gpu_err!("sparse_dict tiled score atom offset={start} overflows u32")
             })?;
             let grid_x: u32 = u32::try_from(n_atoms.div_ceil(tile_n as usize))
                 .map_err(|_| gam_gpu::gpu_err!("sparse_dict tiled score grid_x overflow"))?;
@@ -574,7 +840,7 @@ mod device {
                 block_dim: (tile_n, tile_m, 1),
                 shared_mem_bytes: 0,
             };
-            let mut builder = stream.launch_builder(&func);
+            let mut builder = stream.launch_builder(&score_func);
             builder
                 .arg(&rows_dev)
                 .arg(&atoms_dev)
@@ -586,17 +852,62 @@ mod device {
             // current atom tile and writes exactly `n_rows * n_atoms` scores.
             unsafe { builder.launch(cfg) }.gpu_ctx("sparse_dict tiled score launch")?;
 
-            let score_len = n_rows * n_atoms;
-            stream
-                .memcpy_dtoh(&scores_dev, &mut scores[..score_len])
-                .gpu_ctx("sparse_dict tiled score dtoh scores")?;
-            stream
-                .synchronize()
-                .gpu_ctx("sparse_dict tiled score synchronize")?;
-            fold_tile(start, n_atoms, &scores[..score_len]);
+            let fold_cfg = LaunchConfig {
+                grid_dim: (
+                    u32::try_from(n_rows)
+                        .map_err(|_| gam_gpu::gpu_err!("sparse_dict top-s fold grid overflow"))?,
+                    1,
+                    1,
+                ),
+                block_dim: (TOP_S_FOLD_THREADS, 1, 1),
+                shared_mem_bytes: fold_shared,
+            };
+            let mut fold = stream.launch_builder(&fold_func);
+            fold.arg(&scores_dev)
+                .arg(&n_rows_i32)
+                .arg(&n_atoms_i32)
+                .arg(&atom_offset)
+                .arg(&active_i32)
+                .arg(&mut top_atoms_dev)
+                .arg(&mut top_scores_dev)
+                .arg(&mut top_mags_dev);
+            // SAFETY: the fold kernel launches one block per row, reads the
+            // score tile just written by the previous launch on this stream, and
+            // updates exactly `n_rows * active` shortlist slots.
+            unsafe { fold.launch(fold_cfg) }.gpu_ctx("sparse_dict top-s fold launch")?;
             start = end;
         }
-        Ok(())
+
+        let mut top_atoms = vec![0u32; n_rows * active];
+        let mut top_scores = vec![0.0f32; n_rows * active];
+        stream
+            .memcpy_dtoh(&top_atoms_dev, &mut top_atoms)
+            .gpu_ctx("sparse_dict top-s dtoh atoms")?;
+        stream
+            .memcpy_dtoh(&top_scores_dev, &mut top_scores)
+            .gpu_ctx("sparse_dict top-s dtoh scores")?;
+        stream
+            .synchronize()
+            .gpu_ctx("sparse_dict tiled route synchronize")?;
+
+        let mut selections = Vec::with_capacity(n_rows);
+        for r in 0..n_rows {
+            let mut row = Vec::with_capacity(active);
+            let base = r * active;
+            for j in 0..active {
+                let atom = top_atoms[base + j];
+                if atom != u32::MAX {
+                    row.push((atom, top_scores[base + j]));
+                }
+            }
+            selections.push(row);
+        }
+        Ok(RouteDeviceOutput {
+            selections,
+            device_dtoh_bytes: n_rows
+                .saturating_mul(active)
+                .saturating_mul(std::mem::size_of::<u32>() + std::mem::size_of::<f32>()),
+        })
     }
 }
 
@@ -680,11 +991,16 @@ mod tests {
             tile,
             gam_gpu::GpuMode::Required,
         ) {
-            Ok((routed, path)) => {
+            Ok((routed, path, dtoh_bytes)) => {
                 assert_eq!(
                     path,
                     ScoreBlockPath::Device,
                     "Required succeeded but reported CPU — device did not engage"
+                );
+                assert_eq!(
+                    dtoh_bytes,
+                    m * s * (std::mem::size_of::<u32>() + std::mem::size_of::<f32>()),
+                    "device route must download only the final top-s shortlist"
                 );
                 assert_eq!(routed.len(), cpu.len());
                 for (r, (dev_sel, cpu_sel)) in routed.iter().zip(&cpu).enumerate() {
@@ -709,7 +1025,7 @@ mod tests {
                     "Required errored despite a live CUDA runtime: {err}"
                 );
                 // Device absent: Auto must reproduce the CPU oracle exactly.
-                let (routed, path) = route_minibatch_required(
+                let (routed, path, dtoh_bytes) = route_minibatch_required(
                     rows.view(),
                     atoms.view(),
                     s,
@@ -718,6 +1034,7 @@ mod tests {
                 )
                 .expect("Auto must not error on a device-absent host");
                 assert_eq!(path, ScoreBlockPath::Cpu);
+                assert_eq!(dtoh_bytes, 0);
                 assert_eq!(routed, cpu);
             }
         }
@@ -755,11 +1072,16 @@ mod tests {
             tile,
             gam_gpu::GpuMode::Required,
         ) {
-            Ok((routed, path)) => {
+            Ok((routed, path, dtoh_bytes)) => {
                 assert_eq!(
                     path,
                     ScoreBlockPath::Device,
                     "Required succeeded at K=32k but reported CPU — device did not engage"
+                );
+                assert_eq!(
+                    dtoh_bytes,
+                    m * s * (std::mem::size_of::<u32>() + std::mem::size_of::<f32>()),
+                    "K=32k device route must download only the final top-s shortlist"
                 );
                 assert_eq!(routed.len(), cpu.len());
                 for (r, (dev_sel, cpu_sel)) in routed.iter().zip(&cpu).enumerate() {
@@ -786,7 +1108,7 @@ mod tests {
                     gam_gpu::GpuRuntime::global().is_none(),
                     "Required errored at K=32k despite a live CUDA runtime: {err}"
                 );
-                let (routed, path) = route_minibatch_required(
+                let (routed, path, dtoh_bytes) = route_minibatch_required(
                     rows.view(),
                     atoms.view(),
                     s,
@@ -795,6 +1117,7 @@ mod tests {
                 )
                 .expect("Auto must not error on a device-absent host");
                 assert_eq!(path, ScoreBlockPath::Cpu);
+                assert_eq!(dtoh_bytes, 0);
                 assert_eq!(routed, cpu);
             }
         }

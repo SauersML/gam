@@ -103,9 +103,8 @@ mod linux_impl {
     use crate::gpu_kernels::pirls_row::{CurvatureMode, PirlsRowFamily};
     use crate::pirls::{
         ExportedLaplaceCurvature, FirthDiagnostics, HessianCurvatureKind, PirlsCoordinateFrame,
-        PirlsResult, PirlsStatus, WorkingModelPirlsResult, WorkingState,
-        calculate_loglikelihood_omitting_constants, compute_observed_hessian_curvature_arrays,
-        computeworkingweight_derivatives_from_eta,
+        PirlsResult, PirlsStatus, WorkingModelPirlsResult, WorkingState, calculate_loglikelihood,
+        compute_observed_hessian_curvature_arrays, computeworkingweight_derivatives_from_eta,
     };
     use gam_gpu::cuda_selected;
     use gam_gpu::device_runtime::GpuRuntime;
@@ -583,7 +582,7 @@ mod linux_impl {
             eta: LinearPredictor::new(final_eta.clone()),
             gradient: gradient_total.clone(),
             hessian: penalized_hessian_sym.clone(),
-            log_likelihood: calculate_loglikelihood_omitting_constants(
+            log_likelihood: calculate_loglikelihood(
                 input.y,
                 &final_mu,
                 input.likelihood,
@@ -764,7 +763,7 @@ mod linux_impl {
         input: GpuGaussianPlsInput<'_>,
     ) -> Result<(PirlsResult, WorkingModelPirlsResult), String> {
         use crate::pirls::{
-            array1_l2_norm, calculate_deviance, calculate_loglikelihood_omitting_constants,
+            array1_l2_norm, calculate_deviance, calculate_loglikelihood,
             computeworkingweight_derivatives_from_eta,
         };
         use gam_linalg::matrix::LinearOperator;
@@ -858,12 +857,8 @@ mod linux_impl {
         let max_abs_eta = inf_norm(finalmu.iter().copied());
 
         let deviance = calculate_deviance(input.y, &finalmu, input.likelihood, input.priorweights);
-        let log_likelihood = calculate_loglikelihood_omitting_constants(
-            input.y,
-            &finalmu,
-            input.likelihood,
-            input.priorweights,
-        );
+        let log_likelihood =
+            calculate_loglikelihood(input.y, &finalmu, input.likelihood, input.priorweights);
 
         // Stabilised Hessian = penalized_hessian + ridge_used·I.
         let mut stab = penalized_hessian.clone();

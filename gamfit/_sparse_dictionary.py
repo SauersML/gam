@@ -44,7 +44,12 @@ def _route_stats(payload: Any) -> dict[str, Any]:
     ):
         if key in stats:
             stats[key] = int(stats[key])
-    for key in ("score_elements", "dot_flops_lower_bound"):
+    for key in (
+        "score_elements",
+        "dot_flops_lower_bound",
+        "device_dtoh_bytes",
+        "unfused_score_dtoh_bytes_avoided",
+    ):
         if key in stats:
             stats[key] = int(stats[key])
     return stats

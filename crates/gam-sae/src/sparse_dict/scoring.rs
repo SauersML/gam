@@ -27,6 +27,13 @@ pub struct ScoreRouteResult {
     pub path: ScoreRoutePath,
     /// Shape, admission, and tile geometry for this score route.
     pub plan: gam_gpu::DictionaryScoreRoutePlan,
+    /// Bytes copied device→host by the route itself. The fused CUDA route copies
+    /// only `(atom, score)` shortlists (`rows × active × 8` bytes), never the
+    /// full `rows × K` score stream.
+    pub device_dtoh_bytes: usize,
+    /// Bytes an unfused/full-score CUDA route would have copied device→host for
+    /// this minibatch by returning every score tile (`rows × K × sizeof(f32)`).
+    pub unfused_score_dtoh_bytes: usize,
 }
 
 /// Aggregate score-route counters for a sparse-dictionary fit or stream.
@@ -48,11 +55,38 @@ pub struct ScoreRouteStats {
     pub peak_score_bytes: usize,
     /// Lower-bound dot-product arithmetic across all routed scores.
     pub dot_flops_lower_bound: u128,
+    /// Actual route bytes copied device→host. For the fused CUDA route this is
+    /// shortlist-sized (`rows × active × 8`) rather than score-matrix-sized.
+    pub device_dtoh_bytes: u128,
+    /// Device→host score bytes avoided by the fused CUDA route, relative to a
+    /// route that downloads every `rows × tile` score block.
+    pub unfused_score_dtoh_bytes_avoided: u128,
 }
 
 impl ScoreRouteStats {
     /// Fold one routed minibatch into the aggregate counters.
     pub fn record(&mut self, plan: gam_gpu::DictionaryScoreRoutePlan, path: ScoreRoutePath) {
+        self.record_with_device_transfer(plan, path, 0, 0);
+    }
+
+    /// Fold a full route result into the aggregate counters, including its
+    /// measured device→host transfer accounting.
+    pub fn record_result(&mut self, result: &ScoreRouteResult) {
+        self.record_with_device_transfer(
+            result.plan,
+            result.path,
+            result.device_dtoh_bytes,
+            result.unfused_score_dtoh_bytes,
+        );
+    }
+
+    fn record_with_device_transfer(
+        &mut self,
+        plan: gam_gpu::DictionaryScoreRoutePlan,
+        path: ScoreRoutePath,
+        device_dtoh_bytes: usize,
+        unfused_score_dtoh_bytes: usize,
+    ) {
         self.minibatches += 1;
         if plan.device_admitted {
             self.admitted_minibatches += 1;
@@ -69,6 +103,13 @@ impl ScoreRouteStats {
         self.dot_flops_lower_bound = self
             .dot_flops_lower_bound
             .saturating_add(plan.dot_flops_lower_bound);
+        self.device_dtoh_bytes = self
+            .device_dtoh_bytes
+            .saturating_add(device_dtoh_bytes as u128);
+        self.unfused_score_dtoh_bytes_avoided =
+            self.unfused_score_dtoh_bytes_avoided.saturating_add(
+                (unfused_score_dtoh_bytes as u128).saturating_sub(device_dtoh_bytes as u128),
+            );
     }
 
     /// Merge another aggregate into this one.
@@ -87,6 +128,12 @@ impl ScoreRouteStats {
         self.dot_flops_lower_bound = self
             .dot_flops_lower_bound
             .saturating_add(other.dot_flops_lower_bound);
+        self.device_dtoh_bytes = self
+            .device_dtoh_bytes
+            .saturating_add(other.device_dtoh_bytes);
+        self.unfused_score_dtoh_bytes_avoided = self
+            .unfused_score_dtoh_bytes_avoided
+            .saturating_add(other.unfused_score_dtoh_bytes_avoided);
     }
 }
 
@@ -319,6 +366,8 @@ impl TileScorer {
                 selections: self.route_minibatch(rows, decoder),
                 path: ScoreRoutePath::Cpu,
                 plan,
+                device_dtoh_bytes: 0,
+                unfused_score_dtoh_bytes: 0,
             });
         }
 
@@ -344,14 +393,19 @@ impl TileScorer {
                     self.tile,
                     mode,
                 ) {
-                    Ok((routed, super::scoring_gpu::ScoreBlockPath::Device)) => {
+                    Ok((routed, super::scoring_gpu::ScoreBlockPath::Device, dtoh_bytes)) => {
                         return Ok(ScoreRouteResult {
                             selections: routed,
                             path: ScoreRoutePath::Device,
                             plan,
+                            device_dtoh_bytes: dtoh_bytes,
+                            unfused_score_dtoh_bytes: plan
+                                .n_rows
+                                .saturating_mul(plan.n_items)
+                                .saturating_mul(std::mem::size_of::<f32>()),
                         });
                     }
-                    Ok((routed, super::scoring_gpu::ScoreBlockPath::Cpu)) => {
+                    Ok((routed, super::scoring_gpu::ScoreBlockPath::Cpu, _)) => {
                         if mode == gam_gpu::GpuMode::Required {
                             return Err(
                                 "sparse_dict route_minibatch Required mode returned CPU path"
@@ -362,6 +416,8 @@ impl TileScorer {
                             selections: routed,
                             path: ScoreRoutePath::Cpu,
                             plan,
+                            device_dtoh_bytes: 0,
+                            unfused_score_dtoh_bytes: 0,
                         });
                     }
                     Err(err) => {
@@ -388,6 +444,8 @@ impl TileScorer {
             selections: self.route_minibatch(rows, decoder),
             path: ScoreRoutePath::Cpu,
             plan,
+            device_dtoh_bytes: 0,
+            unfused_score_dtoh_bytes: 0,
         })
     }
 }

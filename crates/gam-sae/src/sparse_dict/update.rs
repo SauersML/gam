@@ -58,7 +58,7 @@ pub(super) fn route_and_code_all(
         let block = x.slice(ndarray::s![start..end, ..]);
         let routed = scorer.route_minibatch_with_mode(block, decoder, score_mode)?;
         if let Some(stats) = score_route_stats.as_deref_mut() {
-            stats.record(routed.plan, routed.path);
+            stats.record_result(&routed);
         }
         let active_lists = routed.selections;
         // Per-row code solves are independent; fan them out over the minibatch.

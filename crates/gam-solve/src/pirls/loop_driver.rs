@@ -40,7 +40,7 @@ use super::{
     // edf helpers
     calculate_edf_with_penalty,
     calculate_edfwithworkspace_with_penalty,
-    calculate_loglikelihood_omitting_constants,
+    calculate_loglikelihood,
     compute_constraint_kkt_diagnostics,
     computeworkingweight_derivatives_from_eta,
     inf_norm,
@@ -1212,12 +1212,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                 } else {
                     f64::NAN
                 };
-                let log_likelihood = calculate_loglikelihood_omitting_constants(
-                    y,
-                    &finalmu,
-                    likelihood,
-                    priorweights,
-                );
+                let log_likelihood = calculate_loglikelihood(y, &finalmu, likelihood, priorweights);
                 let max_abs_eta = inf_norm(finalmu.iter().copied());
                 (
                     final_eta,
@@ -1245,12 +1240,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                     .map(|transform| transform.apply_transpose(&xt_wr))
                     .unwrap_or(xt_wr);
                 let deviance = calculate_deviance(y, &finalmu, likelihood, priorweights);
-                let log_likelihood = calculate_loglikelihood_omitting_constants(
-                    y,
-                    &finalmu,
-                    likelihood,
-                    priorweights,
-                );
+                let log_likelihood = calculate_loglikelihood(y, &finalmu, likelihood, priorweights);
                 let max_abs_eta = inf_norm(finalmu.iter().copied());
                 (
                     final_eta,

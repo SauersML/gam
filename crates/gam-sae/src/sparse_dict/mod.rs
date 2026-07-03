@@ -235,7 +235,7 @@ pub fn sparse_dictionary_transform_with_mode(
     let scorer = TileScorer::new(s, score_tile.max(1));
     let routed = scorer.route_minibatch_with_mode(x, decoder, score_mode)?;
     let mut score_route_stats = ScoreRouteStats::default();
-    score_route_stats.record(routed.plan, routed.path);
+    score_route_stats.record_result(&routed);
     let m = x.nrows();
     let mut indices = Array2::<u32>::zeros((m, s));
     let mut codes = Array2::<f32>::zeros((m, s));

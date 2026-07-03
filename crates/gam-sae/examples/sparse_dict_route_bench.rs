@@ -46,7 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let elapsed = start.elapsed();
 
     let mut stats = ScoreRouteStats::default();
-    stats.record(routed.plan, routed.path);
+    stats.record_result(&routed);
     let checksum: u64 = routed
         .selections
         .iter()
@@ -59,7 +59,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::io::stdout(),
         "rows={n_rows} atoms={n_atoms} p={p} active={active} tile={tile} mode={mode} \
          path={:?} elapsed_ms={:.3} admitted={} tiles={} peak_score_mb={:.2} \
-         score_elems={} dot_flops_lower_bound={} checksum={checksum}",
+         score_elems={} dot_flops_lower_bound={} device_dtoh_kb={:.2} \
+         unfused_score_dtoh_avoided_mb={:.2} checksum={checksum}",
         routed.path,
         elapsed.as_secs_f64() * 1000.0,
         stats.admitted_minibatches,
@@ -67,6 +68,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         stats.peak_score_bytes as f64 / (1024.0 * 1024.0),
         stats.score_elements,
         stats.dot_flops_lower_bound,
+        stats.device_dtoh_bytes as f64 / 1024.0,
+        stats.unfused_score_dtoh_bytes_avoided as f64 / (1024.0 * 1024.0),
     )?;
     Ok(())
 }
