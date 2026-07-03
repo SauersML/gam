@@ -4800,6 +4800,20 @@ fn score_route_stats_dict<'py>(
     Ok(out)
 }
 
+fn parse_sparse_dict_score_mode(score_mode: &str) -> PyResult<gam::gpu::GpuMode> {
+    if score_mode.eq_ignore_ascii_case("auto") {
+        Ok(gam::gpu::GpuMode::Auto)
+    } else if score_mode.eq_ignore_ascii_case("required") {
+        Ok(gam::gpu::GpuMode::Required)
+    } else if score_mode.eq_ignore_ascii_case("off") {
+        Ok(gam::gpu::GpuMode::Off)
+    } else {
+        Err(py_value_error(format!(
+            "sparse dictionary score_mode must be 'auto', 'required', or 'off'; got {score_mode:?}"
+        )))
+    }
+}
+
 #[pyfunction(signature = (
     x,
     k,
@@ -4809,7 +4823,8 @@ fn score_route_stats_dict<'py>(
     score_tile = 4096,
     code_ridge = 1.0e-6,
     decoder_ridge = 1.0e-6,
-    tolerance = 1.0e-6
+    tolerance = 1.0e-6,
+    score_mode = "required"
 ))]
 fn sparse_dictionary_fit<'py>(
     py: Python<'py>,
@@ -4822,7 +4837,9 @@ fn sparse_dictionary_fit<'py>(
     code_ridge: f32,
     decoder_ridge: f32,
     tolerance: f64,
+    score_mode: &str,
 ) -> PyResult<Py<PyDict>> {
+    let score_mode = parse_sparse_dict_score_mode(score_mode)?;
     let x_values = x.as_array().to_owned();
     let config = SparseDictConfig {
         n_atoms: k,
@@ -4833,7 +4850,7 @@ fn sparse_dictionary_fit<'py>(
         code_ridge,
         decoder_ridge,
         tolerance,
-        score_mode: gam::gpu::GpuMode::Auto,
+        score_mode,
     };
     let fit = detach_py_result(py, "sparse_dictionary_fit", move || {
         fit_sparse_dictionary(x_values.view(), &config)
@@ -4858,7 +4875,14 @@ fn sparse_dictionary_fit<'py>(
 /// Out-of-sample encode: route held-out rows `x` (`M x P`, f32) through a fitted
 /// sparse dictionary `decoder` (`K x P`) via the Rust tiled router + active-set
 /// ridge solve, returning `(indices, codes)` each `M x active`.
-#[pyfunction(signature = (x, decoder, active, score_tile = 4096, code_ridge = 1.0e-6))]
+#[pyfunction(signature = (
+    x,
+    decoder,
+    active,
+    score_tile = 4096,
+    code_ridge = 1.0e-6,
+    score_mode = "required"
+))]
 fn sparse_dictionary_transform_ffi<'py>(
     py: Python<'py>,
     x: PyReadonlyArray2<'py, f32>,
@@ -4866,7 +4890,9 @@ fn sparse_dictionary_transform_ffi<'py>(
     active: usize,
     score_tile: usize,
     code_ridge: f32,
+    score_mode: &str,
 ) -> PyResult<Py<PyDict>> {
+    let score_mode = parse_sparse_dict_score_mode(score_mode)?;
     let x_values = x.as_array().to_owned();
     let decoder_values = decoder.as_array().to_owned();
     let transform = detach_py_result(py, "sparse_dictionary_transform", move || {
@@ -4876,7 +4902,7 @@ fn sparse_dictionary_transform_ffi<'py>(
             active,
             score_tile,
             code_ridge,
-            gam::gpu::GpuMode::Auto,
+            score_mode,
         )
     })?;
     let out = PyDict::new(py);
@@ -5015,7 +5041,8 @@ impl SparseDictStream {
         score_tile = 4096,
         code_ridge = 1.0e-6,
         decoder_ridge = 1.0e-6,
-        tolerance = 1.0e-6
+        tolerance = 1.0e-6,
+        score_mode = "required"
     ))]
     fn new(
         py: Python<'_>,
@@ -5028,7 +5055,9 @@ impl SparseDictStream {
         code_ridge: f32,
         decoder_ridge: f32,
         tolerance: f64,
+        score_mode: &str,
     ) -> PyResult<Self> {
+        let score_mode = parse_sparse_dict_score_mode(score_mode)?;
         let seed_values = seed.as_array().to_owned();
         let config = SparseDictConfig {
             n_atoms: k,
@@ -5039,7 +5068,7 @@ impl SparseDictStream {
             code_ridge,
             decoder_ridge,
             tolerance,
-            score_mode: gam::gpu::GpuMode::Auto,
+            score_mode,
         };
         let inner = py
             .detach(|| SparseDictStreamState::new(seed_values.view(), &config))
@@ -5062,6 +5091,10 @@ impl SparseDictStream {
         out.set_item("rows", stats.rows)?;
         out.set_item("rss", stats.rss)?;
         out.set_item("alive_atoms", stats.alive_atoms)?;
+        out.set_item(
+            "score_route_stats",
+            score_route_stats_dict(py, stats.score_route_stats)?,
+        )?;
         Ok(out.unbind())
     }
 
@@ -5091,6 +5124,10 @@ impl SparseDictStream {
         out.set_item("epochs", artifact.epochs)?;
         out.set_item("explained_variance", artifact.explained_variance)?;
         out.set_item("converged", artifact.converged)?;
+        out.set_item(
+            "score_route_stats",
+            score_route_stats_dict(py, artifact.score_route_stats)?,
+        )?;
         Ok(out.unbind())
     }
 
