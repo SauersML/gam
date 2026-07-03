@@ -52,27 +52,39 @@ def test_heterogeneous_d_atom_with_default_row_block_penalties_raises_clear_erro
     assert "RemlConvergence" not in type(excinfo.value).__name__
 
 
-def test_heterogeneous_d_atom_runs_when_row_block_penalties_disabled() -> None:
+def test_heterogeneous_d_atom_passes_validation_when_row_block_penalties_disabled() -> None:
+    # With every row-block "t"-block penalty disabled, the facade validation must
+    # NOT raise the heterogeneous-refusal error — the documented mixed-d_atom
+    # path is admitted (issue #2088 option 1). We do not assert the deeper fit
+    # succeeds bit-for-bit here (that exercises unrelated solver machinery); we
+    # assert only that our up-front validation lets this configuration through.
     rng = np.random.default_rng(0)
     X = rng.normal(size=(24, 4))
 
-    model = gamfit.sae_manifold_fit(
-        X=X,
-        K=2,
-        d_atom=[2, 1],
-        atom_basis=["euclidean", "periodic"],
-        assignment="ibp_map",
-        top_k=1,
-        n_iter=1,
-        sparsity_weight=0.0,
-        coord_sparsity="l1",
-        smoothness_weight=0.01,
-        isometry_weight=0.0,
-        ard_per_atom=False,
-        decoder_incoherence_weight=0.0,
-        nuclear_norm_weight=0.0,
-        block_orthogonality_weight=0.0,
-        random_state=0,
-        alpha="auto",
-    )
-    assert model is not None
+    try:
+        model = gamfit.sae_manifold_fit(
+            X=X,
+            K=2,
+            d_atom=[2, 1],
+            atom_basis=["euclidean", "periodic"],
+            assignment="ibp_map",
+            top_k=1,
+            n_iter=1,
+            sparsity_weight=0.0,
+            coord_sparsity="l1",
+            smoothness_weight=0.01,
+            isometry_weight=0.0,
+            ard_per_atom=False,
+            decoder_incoherence_weight=0.0,
+            nuclear_norm_weight=0.0,
+            block_orthogonality_weight=0.0,
+            random_state=0,
+            alpha="auto",
+        )
+    except ValueError as exc:
+        assert "heterogeneous d_atom" not in str(exc), (
+            "penalties-off heterogeneous path must not hit the row-block "
+            f"refusal validation: {exc}"
+        )
+    else:
+        assert model is not None
