@@ -555,6 +555,132 @@ fn top_factor_birth_decoder(
     })
 }
 
+/// Modified Gram–Schmidt orthonormalization of the two columns of a `(d, 2)` matrix in
+/// place. Returns `false` if the columns are numerically rank-deficient (so the caller
+/// abandons a degenerate seed rather than emitting a NaN plane).
+fn orthonormalize2(w: &mut Array2<f64>) -> bool {
+    let d = w.nrows();
+    let n0: f64 = (0..d).map(|i| w[[i, 0]] * w[[i, 0]]).sum::<f64>().sqrt();
+    if !(n0 > 1e-12) {
+        return false;
+    }
+    for i in 0..d {
+        w[[i, 0]] /= n0;
+    }
+    let dot: f64 = (0..d).map(|i| w[[i, 0]] * w[[i, 1]]).sum();
+    for i in 0..d {
+        w[[i, 1]] -= dot * w[[i, 0]];
+    }
+    let n1: f64 = (0..d).map(|i| w[[i, 1]] * w[[i, 1]]).sum::<f64>().sqrt();
+    if !(n1 > 1e-12) {
+        return false;
+    }
+    for i in 0..d {
+        w[[i, 1]] /= n1;
+    }
+    true
+}
+
+/// Normalized energy fourth moment `κ(W) = E[(‖Wᵀz‖²)²] / E[‖Wᵀz‖²]²` of the orthonormal
+/// 2-plane `w` (`d×2`) over whitened residual columns `z` (`d×n`). This is the producer
+/// contrast (#2111): on whitened data a clean dense circle projects to CONSTANT radius so
+/// `κ = 1` (the global minimum); a 45° two-circle sub-Gaussian blend sits at `κ = 1.25`
+/// and a Gaussian blend at `κ = 2`. Minimizing `κ` therefore isolates a clean circle where
+/// second-order eigenvector pairing returns a Davis–Kahan blend.
+fn plane_kappa(z: ArrayView2<'_, f64>, w: &Array2<f64>) -> f64 {
+    let d = z.nrows();
+    let n = z.ncols();
+    let (mut s2, mut s4) = (0.0_f64, 0.0_f64);
+    for i in 0..n {
+        let (mut y0, mut y1) = (0.0_f64, 0.0_f64);
+        for a in 0..d {
+            y0 += w[[a, 0]] * z[[a, i]];
+            y1 += w[[a, 1]] * z[[a, i]];
+        }
+        let r2 = y0 * y0 + y1 * y1;
+        s2 += r2;
+        s4 += r2 * r2;
+    }
+    let m2 = s2 / n as f64;
+    if !(m2 > 0.0) {
+        return f64::INFINITY;
+    }
+    (s4 / n as f64) / (m2 * m2)
+}
+
+/// Deflationary κ-contrast extraction (#2111): the orthonormal 2-plane `W` (`d×2`) that
+/// MINIMIZES `E[(‖Wᵀz‖²)²]` over whitened residual columns `z` (`d×n`), via random
+/// multistart + normalized Riemannian (Stiefel) gradient descent. One birth extracts one
+/// plane; the stagewise fit+subtract loop is the deflation. Deterministic in `seed`
+/// (an internal LCG + Box–Muller) so births are reproducible. Returns `(W, κ*)`.
+fn extract_min_kappa_plane(
+    z: ArrayView2<'_, f64>,
+    starts: usize,
+    steps: usize,
+    seed: u64,
+) -> Option<(Array2<f64>, f64)> {
+    let d = z.nrows();
+    let n = z.ncols();
+    if d < 2 || n < 2 {
+        return None;
+    }
+    let mut state = seed | 1;
+    let mut next_normal = || {
+        // Box–Muller from two LCG uniforms; guard the log against u1 == 0.
+        let mut u = [0.0_f64; 2];
+        for slot in u.iter_mut() {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *slot = ((state >> 11) as f64) / ((1u64 << 53) as f64);
+        }
+        let u1 = u[0].max(f64::MIN_POSITIVE);
+        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u[1]).cos()
+    };
+    let lr = 0.1_f64;
+    let mut best: Option<(f64, Array2<f64>)> = None;
+    for _ in 0..starts {
+        let mut w = Array2::<f64>::from_shape_fn((d, 2), |_| next_normal());
+        if !orthonormalize2(&mut w) {
+            continue;
+        }
+        for _ in 0..steps {
+            // Euclidean gradient of mean((‖Wᵀz‖²)²): g[:,c] = (4/n) Σ_i r²_i · y_ic · z_i.
+            let mut g = Array2::<f64>::zeros((d, 2));
+            for i in 0..n {
+                let (mut y0, mut y1) = (0.0_f64, 0.0_f64);
+                for a in 0..d {
+                    y0 += w[[a, 0]] * z[[a, i]];
+                    y1 += w[[a, 1]] * z[[a, i]];
+                }
+                let r2 = y0 * y0 + y1 * y1;
+                for a in 0..d {
+                    g[[a, 0]] += r2 * y0 * z[[a, i]];
+                    g[[a, 1]] += r2 * y1 * z[[a, i]];
+                }
+            }
+            g.mapv_inplace(|v| v * 4.0 / n as f64);
+            // Project to the Stiefel tangent: g ← g − W (Wᵀg); retract by orthonormalizing.
+            let wtg = w.t().dot(&g);
+            let gt = &g - &w.dot(&wtg);
+            let ng = gt.iter().map(|v| v * v).sum::<f64>().sqrt();
+            if !(ng > 1e-9) {
+                break;
+            }
+            let mut wn = &w - &(&gt * (lr / ng));
+            if !orthonormalize2(&mut wn) {
+                break;
+            }
+            w = wn;
+        }
+        let k = plane_kappa(z, &w);
+        if best.as_ref().map_or(true, |(bk, _)| k < *bk) {
+            best = Some((k, w));
+        }
+    }
+    best.map(|(k, w)| (w, k))
+}
+
 /// #2080 DISJOINT-extraction fallback birth candidate. [`StructuredResidualModel`]
 /// detects only SHARED low-rank (off-diagonal, correlated) residual structure. A
 /// dictionary of DISJOINT factors — orthogonal circles each in its own 2-plane with
@@ -668,83 +794,114 @@ fn residual_principal_birth_candidate(
     }
     let m = term.atoms[0].basis_size();
 
-    // #2101 CIRCLE SEED. A disjoint circle occupies a rank-2 PLANE (its cos/sin
-    // axes carry ~equal variance), so the residual's dominant structure is a
-    // 2-PLANE, not one direction. The historical seed put ONE direction on the
-    // CONSTANT (row-0) basis row, making the birth image `Φ·B` coordinate-
-    // independent — a stationary point at which the coordinate has no gradient and
-    // the cos/sin rows never populate (the born atom stays a constant, `chart
-    // survives / decoder is not a circle`). Instead, when a SECOND direction also
-    // clears the MP edge (a genuine 2-plane, not a sin row hallucinated from
-    // noise), seed the born atom directly ON a circle: the 2-plane on the harmonic
-    // (cos/sin) rows and a PHASE-ALIGNED coordinate. This is the birth analogue of
-    // the 7a93b1d06 cold-start chart deflation and breaks the stationary point
-    // (the coordinate gradient is nonzero at the seed). Everything is DERIVED from
-    // the residual SVD + the existing MP floor — no magic constant (SPEC-19).
+    // #2101 / #2111 CIRCLE SEED via κ-DEFLATION source separation. A disjoint circle
+    // occupies a rank-2 PLANE (its cos/sin axes carry ~equal variance), so the residual's
+    // dominant structure is a 2-PLANE, not one direction. The historical seed put ONE
+    // direction on the CONSTANT (row-0) basis row — a stationary point at which the cos/sin
+    // rows never populate. The intermediate fix paired NEAR-DEGENERATE EIGENVECTORS, but on
+    // a DENSE product-of-circles residual (density > 1) whitening exhausts second order:
+    // the K circle planes span an isotropic subspace, so eigenvectors are Davis–Kahan
+    // BLENDS across circles (top-2 plane overlaps ~0.5 with any true circle) — the K≥2
+    // co-collapse. The identifying signal blends cannot mimic is fourth-order INDEPENDENCE:
+    // a circle's cos/sin axes are sub-Gaussian (arcsine), a blend Gaussianizes by CLT. So
+    // whiten the above-floor signal subspace and extract the 2-plane MINIMIZING the
+    // normalized energy fourth moment κ (clean circle → 1, blend → ≥1.25); ONE clean circle
+    // per birth, the stagewise fit+subtract loop is the deflation. Everything is DERIVED
+    // from the residual SVD + the existing MP floor + analytic κ anchors — no magic constant.
     let template_is_circle =
         matches!(term.atoms[0].basis_kind, SaeAtomBasisKind::Periodic) && m >= 3;
-    if template_is_circle {
-        // The circle's OTHER axis is the above-floor direction whose eigenvalue is
-        // CLOSEST to `best`'s: a circle's cos/sin axes carry ~EQUAL variance, so its
-        // mate is the near-degenerate eigenvalue — not merely the next-strongest
-        // direction, which on a multi-structure residual could belong to a DIFFERENT
-        // factor (pairing two unrelated rank-1 signals into a fake circle).
-        let best2 = above
-            .iter()
-            .copied()
-            .filter(|&k| k != best)
-            .min_by(|&a, &b| {
-                (evals[a] - evals[best])
-                    .abs()
-                    .total_cmp(&(evals[b] - evals[best]).abs())
-            });
-        // Circle VALIDITY: a genuine circle's cos/sin axes are near-DEGENERATE
-        // (equal population variance), so require the two eigenvalues to agree within
-        // their sampling spread `√(2/n)·λ` — the asymptotic std. of a sample
-        // eigenvalue. Two UNEQUAL signal directions (independent factors that share no
-        // circle) fail this and fall through to the rank-1 row-0 seed, so the fallback
-        // never HALLUCINATES a circle by pairing unrelated structure. Derived from the
-        // eigenvalue sampling law — no magic constant (SPEC-19).
-        let degenerate = best2.is_some_and(|b2| {
-            let (l1, l2) = (evals[best].max(0.0), evals[b2].max(0.0));
-            (l1 - l2).abs() <= (l1 + l2) * (2.0 / n as f64).sqrt()
-        });
-        if let (Some(best2), true) = (best2, degenerate) {
-            let a1 = evals[best].max(0.0).sqrt();
-            let a2 = evals[best2].max(0.0).sqrt();
-            // Harmonic seed: cos row (1) = √λ1·u1, sin row (2) = √λ2·u2, DC row-0 = 0.
-            let mut decoder = Array2::<f64>::zeros((m, p));
-            for j in 0..p {
-                decoder[[1, j]] = a1 * evecs[[j, best]];
-                decoder[[2, j]] = a2 * evecs[[j, best2]];
-            }
-            // Phase-aligned coordinate t_i = atan2(⟨r_i,u2⟩, ⟨r_i,u1⟩)/2π ∈ [0,1)
-            // over the COLUMN-CENTERED residual (the plane the SVD found). The SAME
-            // (u1,u2) feed the decoder rows and the atan2, so the handedness is
-            // internally consistent.
-            // Per-row phase AND presence: a row's 2-plane energy ρ_i²=proj1²+proj2²
-            // clearing the noise floor `2·λ₊` (two noise directions at the derived MP
-            // edge) means the born circle actually contributes there — the gate seed.
-            let noise_2plane = 2.0 * mp_edge;
-            let mut coords = Array2::<f64>::zeros((n, 1));
-            let mut present = vec![false; n];
+    if template_is_circle && above.len() >= 2 {
+        let d = above.len();
+        // Whiten the above-floor signal subspace to unit variance per axis: the metric on
+        // which κ = 1 for a clean circle and second-order structure is exhausted.
+        let mut zt = Array2::<f64>::zeros((d, n)); // d×n whitened columns
+        for (a, &k) in above.iter().enumerate() {
+            let inv = 1.0 / evals[k].max(f64::MIN_POSITIVE).sqrt();
             for i in 0..n {
-                let (mut proj1, mut proj2) = (0.0_f64, 0.0_f64);
+                let mut proj = 0.0_f64;
                 for j in 0..p {
-                    let ri = residual[[i, j]] - mean[j];
-                    proj1 += ri * evecs[[j, best]];
-                    proj2 += ri * evecs[[j, best2]];
+                    proj += (residual[[i, j]] - mean[j]) * evecs[[j, k]];
                 }
-                coords[[i, 0]] =
-                    proj2.atan2(proj1).rem_euclid(std::f64::consts::TAU) / std::f64::consts::TAU;
-                present[i] = (proj1 * proj1 + proj2 * proj2) > noise_2plane;
+                zt[[a, i]] = proj * inv;
             }
-            return Some(BirthSeed {
-                decoder,
-                energy,
-                circle_coords: Some(coords),
-                circle_present: Some(present),
-            });
+        }
+        // Deflationary min-κ extraction. Multistart/steps are cost knobs (not thresholds);
+        // the seed is derived from n so births are reproducible. `48 × 200` proved ample in
+        // the prototype (6/6 @ overlap 0.999 incl the equal-amplitude worst case, #2111).
+        if let Some((w, _)) = extract_min_kappa_plane(zt.view(), 48, 200, 0x2101_CAFE ^ n as u64) {
+            // Un-whiten the plane to ambient (u_a/√λ_a · W) and re-orthonormalize.
+            let mut amb = Array2::<f64>::zeros((p, 2));
+            for (a, &k) in above.iter().enumerate() {
+                let inv = 1.0 / evals[k].max(f64::MIN_POSITIVE).sqrt();
+                for j in 0..p {
+                    amb[[j, 0]] += evecs[[j, k]] * inv * w[[a, 0]];
+                    amb[[j, 1]] += evecs[[j, k]] * inv * w[[a, 1]];
+                }
+            }
+            if orthonormalize2(&mut amb) {
+                // In-plane phase + presence (same contract as the historical seed), plus
+                // the raw-radius moments the κ certificate needs.
+                let noise_2plane = 2.0 * mp_edge;
+                let mut coords = Array2::<f64>::zeros((n, 1));
+                let mut present = vec![false; n];
+                let (mut a1sq, mut a2sq, mut r2_sum, mut r4_sum) = (0.0, 0.0, 0.0, 0.0);
+                for i in 0..n {
+                    let (mut p1, mut p2) = (0.0_f64, 0.0_f64);
+                    for j in 0..p {
+                        let ri = residual[[i, j]] - mean[j];
+                        p1 += ri * amb[[j, 0]];
+                        p2 += ri * amb[[j, 1]];
+                    }
+                    coords[[i, 0]] =
+                        p2.atan2(p1).rem_euclid(std::f64::consts::TAU) / std::f64::consts::TAU;
+                    let r2 = p1 * p1 + p2 * p2;
+                    present[i] = r2 > noise_2plane;
+                    a1sq += p1 * p1;
+                    a2sq += p2 * p2;
+                    r2_sum += r2;
+                    r4_sum += r2 * r2;
+                }
+                // κ-NULL CERTIFICATE (#2111). Two ANALYTIC anchors, no tuned ε: a clean
+                // circle of squared-radius `a²` under per-axis noise σ̂² has
+                // κ_clean = (a⁴ + 8a²σ̂² + 8σ̂⁴)/(a² + 2σ̂²)²  (≈ 1 + (2σ̂/a)²); a 45°
+                // two-circle sub-Gaussian blend has κ_blend = 5/4 exactly. Accept the plane
+                // as ONE clean circle iff its raw-radius κ sits below the midpoint of the two
+                // anchors — a likelihood split between derived populations. The min-κ argmin
+                // lands on a clean circle when one exists; when the residual carries only
+                // blends/saddles the least-bad plane fails the certificate and falls through
+                // to the rank-1 seed (no hallucinated circle birth).
+                // Noise scale for the certificate: read the noise floor off the BOTTOM of
+                // the spectrum (the median of the smallest quartile of eigenvalues), where
+                // white noise provably sits regardless of how many directions are signal.
+                // The global median (which sets the MP edge) lands in the SIGNAL bulk on a
+                // dense multi-circle residual — majority signal — and grossly overestimates
+                // σ̂², which would make κ_clean exceed the blend anchor and reject even a
+                // clean circle. The bottom quartile does not. `evals` is ascending.
+                let q = (evals.len() / 4).max(1);
+                let sigma2_cert = evals[(q - 1) / 2].max(0.0);
+                let m2 = (r2_sum / n as f64).max(f64::MIN_POSITIVE);
+                let kappa_obs = (r4_sum / n as f64) / (m2 * m2);
+                let a2t = (m2 - 2.0 * sigma2_cert).max(0.0);
+                let kappa_clean = (a2t * a2t + 8.0 * a2t * sigma2_cert + 8.0 * sigma2_cert * sigma2_cert)
+                    / (m2 * m2);
+                let kappa_blend = 1.25_f64;
+                let kappa_gate = 0.5 * (kappa_clean + kappa_blend);
+                if kappa_clean < kappa_blend && kappa_obs < kappa_gate {
+                    let a1 = (a1sq / n as f64).sqrt();
+                    let a2 = (a2sq / n as f64).sqrt();
+                    let mut decoder = Array2::<f64>::zeros((m, p));
+                    for j in 0..p {
+                        decoder[[1, j]] = a1 * amb[[j, 0]];
+                        decoder[[2, j]] = a2 * amb[[j, 1]];
+                    }
+                    return Some(BirthSeed {
+                        decoder,
+                        energy,
+                        circle_coords: Some(coords),
+                        circle_present: Some(present),
+                    });
+                }
+            }
         }
     }
 
@@ -2051,130 +2208,138 @@ mod tests {
         );
     }
 
-    /// #2101 Q2 DIAGNOSTIC — does the K=2 JOINT BACKFIT disentangle a blended born
-    /// circle? Aligned K=1 circle-0 incumbent on a 3-circle target, seed a born
-    /// circle via residual_principal, form the K=2 term, run the joint backfit, and
-    /// measure the born decoder's participation ratio (effective output-col count:
-    /// ~2 = clean single-circle 2-plane, >3 = blended) before vs after. If PR→~2 the
-    /// backfit cleans the blend (sequential-peel recovery); if it stays >3 the seed
-    /// must isolate one circle at birth. Print-only probe (run with --nocapture).
+    /// #2111 κ-NULL CERTIFICATE — the born-circle producer must REJECT a blended 2-plane.
+    /// Positive control: a clean single circle is seeded as a rank-2 circle (`circle_coords`
+    /// Some). Null: TWO independent circles superimposed on the SAME output 2-plane form a
+    /// genuine BLEND (`radius² = 2 + 2cos Δ` for independent angles ⇒ `κ = 3/2`, not a
+    /// constant-radius circle) — the κ-null certificate must refuse to seed it as a clean
+    /// circle and fall through to the rank-1 seed (`circle_coords` None). This is exactly the
+    /// case a flat κ cutoff would miss (a two-circle blend sits at `κ = 5/4`, far below the
+    /// CLT value 2) but the analytic-anchor midpoint gate catches.
     #[test]
-    fn born_circle_backfit_disentangles_blend_2101() {
-        // Match the birth-locus probe fixture (6 circles) where residual_principal
-        // produces a BLENDED circle to backfit (a 3-circle residual is leftover-
-        // dominated → the degeneracy gate falls back to rank-1, no circle born).
-        let n = 80usize;
+    fn certificate_rejects_two_circle_blend_2111() {
+        let n = 400usize;
+        let p = 8usize;
+        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
+        let coords = Array2::<f64>::from_shape_fn((n, 1), |(row, _)| row as f64 / n as f64);
+        let (atom0, cb0) = circle_atom("t0", &evaluator, &coords, 0, 1, p);
+        let (term, _rho) = build_term(vec![atom0], vec![cb0], &vec![vec![true]; n]);
+
+        let mut state = 0x2111_B1E4_u64;
+        let mut rng = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 11) as f64) / ((1u64 << 53) as f64)
+        };
+
+        // Positive control: a clean single circle on channels (2, 3) — must seed a circle.
+        let mut clean = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            let th = std::f64::consts::TAU * rng();
+            clean[[i, 2]] = th.cos();
+            clean[[i, 3]] = th.sin();
+            for j in 0..p {
+                clean[[i, j]] += 0.02 * (rng() - 0.5);
+            }
+        }
+        let clean_seed = residual_principal_birth_candidate(&term, clean.view())
+            .expect("clean circle must yield a birth candidate");
+        assert!(
+            clean_seed.circle_coords.is_some(),
+            "positive control: a clean single circle must be seeded as a rank-2 circle"
+        );
+
+        // Null: two INDEPENDENT circles on the SAME 2-plane (channels 0, 1). The plane's
+        // radius is not constant (κ ≈ 3/2), so no clean circle lives in it.
+        let mut blend = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            let a = std::f64::consts::TAU * rng();
+            let b = std::f64::consts::TAU * rng();
+            blend[[i, 0]] = a.cos() + b.cos();
+            blend[[i, 1]] = a.sin() + b.sin();
+            for j in 0..p {
+                blend[[i, j]] += 0.02 * (rng() - 0.5);
+            }
+        }
+        let blend_seed = residual_principal_birth_candidate(&term, blend.view())
+            .expect("blend residual still yields a (rank-1) birth candidate");
+        assert!(
+            blend_seed.circle_coords.is_none(),
+            "κ-null certificate must REJECT the two-circle blend (κ≈1.5 > analytic-anchor \
+             gate) and fall through to the rank-1 seed, not born it as a clean circle"
+        );
+    }
+
+    /// #2111 κ-DEFLATION extraction on the DENSE torus — the load-bearing case (d > 2). A
+    /// residual carrying ALL SIX circles (dense product-of-circles, the regime where
+    /// eigenvector pairing returns a Davis–Kahan blend) must yield ONE CLEAN circle: the
+    /// born 2-plane concentrates on a single true circle's channels (2c, 2c+1) — max
+    /// energy-fraction ≫ the second circle's. This is the Rust mirror of the prototype's
+    /// 6/6 @ overlap 0.999 at n ≥ 300 (#2111); n = 320 puts the 4th-order stats out of the
+    /// small-sample floor.
+    #[test]
+    fn kappa_deflation_extracts_clean_circle_from_dense_torus_2111() {
+        let n = 320usize;
         let p = 16usize;
         let ncirc = 6usize;
         let amps: Vec<f64> = (0..ncirc)
             .map(|c| 1.0 - 0.45 * (c as f64) / ((ncirc - 1) as f64))
             .collect();
-        let mut s = 0x2101_00BF_u64;
+        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
+        let coords = Array2::<f64>::from_shape_fn((n, 1), |(row, _)| row as f64 / n as f64);
+        let (atom0, cb0) = circle_atom("t0", &evaluator, &coords, 0, 1, p);
+        let (term, _rho) = build_term(vec![atom0], vec![cb0], &vec![vec![true]; n]);
+
+        let mut s = 0x2111_D0BE_u64;
         let mut rng = || {
             s = s
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
             ((s >> 11) as f64) / ((1u64 << 53) as f64)
         };
-        let theta: Vec<Vec<f64>> = (0..n)
-            .map(|_| (0..ncirc).map(|_| std::f64::consts::TAU * rng()).collect())
-            .collect();
-        let mut x = Array2::<f64>::zeros((n, p));
+        let mut residual = Array2::<f64>::zeros((n, p));
         for i in 0..n {
             for c in 0..ncirc {
-                x[[i, 2 * c]] += amps[c] * theta[i][c].cos();
-                x[[i, 2 * c + 1]] += amps[c] * theta[i][c].sin();
+                let th = std::f64::consts::TAU * rng();
+                residual[[i, 2 * c]] += amps[c] * th.cos();
+                residual[[i, 2 * c + 1]] += amps[c] * th.sin();
+            }
+            for j in 0..p {
+                residual[[i, j]] += 0.05 * (rng() - 0.5);
             }
         }
-        // Aligned K=1 incumbent on circle-0's TRUE phase (fully absorbs circle-0).
-        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
-        let coords =
-            Array2::<f64>::from_shape_fn((n, 1), |(r, _)| theta[r][0] / std::f64::consts::TAU);
-        let (atom0, cb0) = circle_atom("c0", &evaluator, &coords, 0, 1, p);
-        let (mut term, mut rho) = build_term(vec![atom0], vec![cb0], &vec![vec![true]; n]);
-        term.set_guards_enabled(false);
-        term.run_joint_fit_arrow_schur(x.view(), &mut rho, None, 60, 1.0, 1e-6, 1e-6)
-            .unwrap();
-        // Seed the born circle from the residual, form the K=2 term.
-        let resid = current_residual(&term, x.view()).unwrap();
-        let seed = residual_principal_birth_candidate(&term, resid.view())
-            .expect("born circle seed on the multi-circle residual");
-        let (mut k2, mut k2rho) = crate::structure_harvest::born_circle_atom(
-            &term,
-            &rho,
-            seed.decoder.clone(),
-            seed.circle_coords.clone().unwrap(),
-            seed.circle_present.clone().unwrap(),
-        )
-        .expect("K=2 born-circle term");
-        let pr = |t: &SaeManifoldTerm, idx: usize| -> f64 {
-            let d = &t.atoms[idx].decoder_coefficients;
-            let ec: Vec<f64> = (0..d.ncols())
-                .map(|j| d[[1, j]].powi(2) + d[[2, j]].powi(2))
-                .collect();
-            let tot: f64 = ec.iter().sum();
-            let sq: f64 = ec.iter().map(|e| e * e).sum();
-            if sq > 0.0 {
-                tot * tot / sq
-            } else {
-                0.0
-            }
-        };
-        let born_pr_before = pr(&k2, 1);
-        k2.set_guards_enabled(false);
-        k2.run_joint_fit_arrow_schur(x.view(), &mut k2rho, None, 80, 1.0, 1e-6, 1e-6)
-            .unwrap();
-        let born_pr_after = pr(&k2, 1);
-        let inc_pr_after = pr(&k2, 0);
 
-        // #8 VALIDATION — DEFLATE the birth residual against the incumbent decoder
-        // subspace (Gram-Schmidt the incumbent rows → project them out), then re-seed.
-        // If the deflated-seed born PR drops toward ~2 (clean), incumbent-subspace
-        // deflation isolates ONE circle at birth — the #8 recovery lever.
-        let inc_dec = &term.atoms[0].decoder_coefficients;
-        let mut basis: Vec<Array1<f64>> = Vec::new();
-        for r in 0..inc_dec.nrows() {
-            let mut v = inc_dec.row(r).to_owned();
-            for q in &basis {
-                let c = v.dot(q);
-                v = &v - &(q * c);
-            }
-            let nrm = v.dot(&v).sqrt();
-            if nrm > 1e-8 {
-                basis.push(v / nrm);
-            }
-        }
-        let mut resid_def = resid.clone();
-        for i in 0..n {
-            let ri = resid.row(i).to_owned();
-            let mut proj = Array1::<f64>::zeros(p);
-            for q in &basis {
-                proj = &proj + &(q * ri.dot(q));
-            }
-            let cleaned = &ri - &proj;
-            resid_def.row_mut(i).assign(&cleaned);
-        }
-        let born_pr_deflated = match residual_principal_birth_candidate(&term, resid_def.view()) {
-            Some(sd) if sd.circle_coords.is_some() => {
-                let (k2d, _) = crate::structure_harvest::born_circle_atom(
-                    &term,
-                    &rho,
-                    sd.decoder.clone(),
-                    sd.circle_coords.clone().unwrap(),
-                    sd.circle_present.clone().unwrap(),
-                )
-                .unwrap();
-                pr(&k2d, 1)
-            }
-            _ => -1.0, // fell back to rank-1 (no circle) on the deflated residual
-        };
+        let seed = residual_principal_birth_candidate(&term, residual.view())
+            .expect("dense torus must yield a birth candidate");
+        let dec = seed
+            .circle_coords
+            .as_ref()
+            .map(|_| &seed.decoder)
+            .expect("dense torus must be seeded as a CLEAN rank-2 circle (κ-deflation), not DC");
 
-        eprintln!(
-            "\n==== #2101 Q2 BACKFIT DISENTANGLE + #8 DEFLATION (6-circle, aligned incumbent) ====\n  \
-             born PR before backfit    = {born_pr_before:.2}\n  \
-             born PR after  backfit    = {born_pr_after:.2}   (clean ~2 ⇒ backfit disentangles; >3 ⇒ stays blended)\n  \
-             incumbent PR after        = {inc_pr_after:.2}\n  \
-             born PR with #8 DEFLATION  = {born_pr_deflated:.2}   (clean ~2 ⇒ incumbent-subspace deflation isolates one circle; -1 ⇒ fell back)\n==== END Q2 ====\n"
+        // Per-circle energy fraction of the born 2-plane (cos/sin rows on channels 2c,2c+1).
+        let total: f64 = (0..p)
+            .map(|j| dec[[1, j]].powi(2) + dec[[2, j]].powi(2))
+            .sum();
+        assert!(total > 0.0, "born plane must carry mass");
+        let mut fracs: Vec<f64> = (0..ncirc)
+            .map(|c| {
+                let e = dec[[1, 2 * c]].powi(2)
+                    + dec[[2, 2 * c]].powi(2)
+                    + dec[[1, 2 * c + 1]].powi(2)
+                    + dec[[2, 2 * c + 1]].powi(2);
+                e / total
+            })
+            .collect();
+        fracs.sort_by(|a, b| b.total_cmp(a));
+        assert!(
+            fracs[0] > 0.80 && fracs[1] < 0.20,
+            "κ-deflation must isolate ONE clean circle from the dense torus: top channel-pair \
+             energy fraction {:.3} (want > 0.80), second {:.3} (want < 0.20) — a blended plane \
+             would spread across circles",
+            fracs[0],
+            fracs[1]
         );
     }
 
