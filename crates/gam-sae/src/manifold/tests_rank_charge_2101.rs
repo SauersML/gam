@@ -8,7 +8,18 @@ use crate::manifold::{
 };
 use gam_terms::latent::LatentManifold;
 use ndarray::{Array1, Array2};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+/// The two K=3 controls each run several joint fits; cargo runs tests in-binary
+/// on a thread pool, so left unguarded they can execute simultaneously and, under
+/// a loaded host, starve each other (observed as a spurious "hang"/kill, not a
+/// logic failure). Serialising them against each other caps peak concurrency to
+/// one heavy multi-atom fit at a time. Poison-tolerant: a panic in one test must
+/// surface as that test's failure, not poison-fail the sibling.
+static K3_SERIAL: Mutex<()> = Mutex::new(());
+fn k3_guard() -> std::sync::MutexGuard<'static, ()> {
+    K3_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn lcg(s: &mut u64) -> f64 {
     *s = s
@@ -154,6 +165,7 @@ fn rank_charge_flag_off_is_inert() {
 /// bit-identical.
 #[test]
 fn rank_charge_healthy_k3_control_well_conditioned() {
+    let _serial = k3_guard();
     let n = 96usize;
     let p = 18usize;
     let ncirc = 3usize;
@@ -298,6 +310,7 @@ fn fit_circle_subset(
 /// by design; the accept/reject OUTCOME must not.
 #[test]
 fn rank_charge_k3_decisions_preserved() {
+    let _serial = k3_guard();
     let n = 96usize;
     let p = 18usize;
     let ncirc = 3usize;
