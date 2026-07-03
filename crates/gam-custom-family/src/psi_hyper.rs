@@ -1275,13 +1275,57 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
     let per_block = split_log_lambdas(rho_current, penalty_counts)?;
     let psi_safe_warm_start =
         warm_start_without_cached_inner_for_psi_derivatives(warm_start, psi_dim > 0);
+
+    // gam#1820: for a COUPLED family whose joint Hessian depends on β, the
+    // exact-Newton LAML outer GRADIENT `½tr(H⁻¹Ḣ)` — including its `D_βH[β_i]`
+    // mode-response coupling across blocks — and the inner KKT-residual
+    // correction are only mutually consistent at a JOINT-stationary β̂. The
+    // inner solve certifies joint stationarity only to `inner_tol` (default
+    // 1e-6 ⇒ ‖r‖≈3e-9; a deliberately loose 1e-3 ⇒ ‖r‖≈1.5e-4), and that
+    // residual desyncs the analytic trace-gradient from all three autodiff
+    // engines / the joint-stationarity requirement. The joint-Newton mode
+    // converges quadratically, so tightening the derivative-path inner solve to
+    // a stationarity floor costs ~one extra step while pinning β̂ at the true
+    // optimum where the trace-gradient's block-coupled `D_βH` term is exact.
+    // Value-only (line-search) evaluations keep the caller's tolerance; if the
+    // tightened solve fails to converge we fall back to the caller's tolerance
+    // so ill-conditioned large-scale fits are never regressed into a hard error.
+    // Restricted to the ρ-only joint path (`psi_dim == 0`): ψ-bearing
+    // evaluations already have their inner tolerance managed deliberately by
+    // `derivative_quality_options_and_warm_start` (which intentionally LOOSENS
+    // it for large-scale ψ fits), and must not be re-tightened here.
+    const JOINT_LAML_DERIV_INNER_TOL_FLOOR: f64 = 1e-11;
+    let tighten_inner_for_deriv = psi_dim == 0
+        && include_logdet_h
+        && eval_mode != EvalMode::ValueOnly
+        && family.has_explicit_joint_hessian()
+        && options.inner_tol > JOINT_LAML_DERIV_INNER_TOL_FLOOR;
+    let tightened_options = tighten_inner_for_deriv.then(|| {
+        let mut tightened = options.clone();
+        tightened.inner_tol = JOINT_LAML_DERIV_INNER_TOL_FLOOR;
+        tightened.inner_max_cycles = tightened.inner_max_cycles.max(200);
+        tightened
+    });
+    let inner_solve_options = tightened_options.as_ref().unwrap_or(options);
     let mut inner = inner_blockwise_fit(
         family,
         specs,
         &per_block,
-        options,
+        inner_solve_options,
         psi_safe_warm_start.as_ref().or(warm_start),
     )?;
+    if tightened_options.is_some() && !inner.converged {
+        // The stationarity-tight solve stalled (ill-conditioned joint mode).
+        // Recover the caller's original convergence behaviour rather than
+        // failing the whole outer evaluation.
+        inner = inner_blockwise_fit(
+            family,
+            specs,
+            &per_block,
+            options,
+            psi_safe_warm_start.as_ref().or(warm_start),
+        )?;
+    }
     if !inner.converged {
         let theta_dim = rho_dim + psi_dim;
         return Err(CustomFamilyError::UnsupportedConfiguration {
