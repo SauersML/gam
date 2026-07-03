@@ -191,7 +191,8 @@ pub mod terms {
         ArdSharing, AssignmentMode, CurvatureWalkReport, EuclideanPatchEvaluator,
         PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,
         SaeManifoldAtom, SaeManifoldLoss, SaeManifoldOuterObjective, SaeManifoldRho,
-        SaeManifoldTerm, SphereChartEvaluator, TorusHarmonicEvaluator,
+        SaeManifoldTerm, SphereChartEvaluator, StagewiseEventKind, StagewiseProgress,
+        StagewiseProgressCallback, TorusHarmonicEvaluator,
     };
     // `LatentManifold` lives in `gam_terms::latent` and is not surfaced at the
     // `gam_terms` root, so the `gam_terms::*` glob does not bring it to the flat

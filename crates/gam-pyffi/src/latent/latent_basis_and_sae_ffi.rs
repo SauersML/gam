@@ -2690,7 +2690,7 @@ fn sae_manifold_fit_stagewise<'py>(
     };
     let mut progress_callback = progress_callback.map(|callback| {
         move |event: gam::terms::sae::manifold::StagewiseProgress<'_>| -> Result<(), String> {
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 let payload = stagewise_progress_py(py, &event).map_err(|err| err.to_string())?;
                 callback
                     .call1(py, (payload,))
