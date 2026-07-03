@@ -110,7 +110,10 @@ fn workspace_root() -> PathBuf {
         let manifest = dir.join("Cargo.toml");
         if let Ok(text) = fs::read_to_string(&manifest) {
             // A line-anchored `[workspace]` table marks the root manifest.
-            if text.lines().any(|l| l.trim_start().starts_with("[workspace]")) {
+            if text
+                .lines()
+                .any(|l| l.trim_start().starts_with("[workspace]"))
+            {
                 return dir;
             }
         }

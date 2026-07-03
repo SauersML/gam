@@ -178,7 +178,10 @@ fn sphere_polar_latitude_band_profile_remains_even_for_both_engines() {
 
     for (label, pooled) in [("harmonic", &harmonic), ("wahba", &wahba)] {
         for (k, (band, _, _)) in BANDS.iter().enumerate() {
-            eprintln!("[sphere-band-profile] {label} {band}: pooled_rmse={:.4}", pooled[k]);
+            eprintln!(
+                "[sphere-band-profile] {label} {band}: pooled_rmse={:.4}",
+                pooled[k]
+            );
         }
         eprintln!(
             "[sphere-band-profile] {label} worst/equator={:.3}",

@@ -97,8 +97,8 @@ fn build(seed: u64) -> CrData {
     let horizon = 6.0_f64;
     for _ in 0..n {
         let xi = rng.unit(); // covariate on (0, 1)
-                             // Cause A: hazard rises with x. Cause B: hazard falls with x.
-                             // Exponential cause-specific event times via inverse-CDF.
+        // Cause A: hazard rises with x. Cause B: hazard falls with x.
+        // Exponential cause-specific event times via inverse-CDF.
         let rate_a = 0.18 * (0.9 * (xi - 0.5)).exp();
         let rate_b = 0.18 * (-0.9 * (xi - 0.5)).exp();
         let u_a = rng.unit();
@@ -224,14 +224,23 @@ fn fit_and_cause_cumulative_hazards(
         );
         let cov_beta = beta.slice(ndarray::s![time_base..]).to_owned();
         let eta = design.design.apply(&cov_beta);
-        assert_eq!(eta.len(), m, "cause {} covariate eta length mismatch", c + 1);
+        assert_eq!(
+            eta.len(),
+            m,
+            "cause {} covariate eta length mismatch",
+            c + 1
+        );
 
         // H_k(t | x_i) = (t / scale)^shape * exp(eta_i) on the shared grid.
         let mut h = Array2::<f64>::zeros((m, grid_t.len()));
         for i in 0..m {
             let mult = eta[i].exp();
             for (j, &t) in grid_t.iter().enumerate() {
-                let h0 = if t <= 0.0 { 0.0 } else { (t / scale).powf(shape) };
+                let h0 = if t <= 0.0 {
+                    0.0
+                } else {
+                    (t / scale).powf(shape)
+                };
                 h[[i, j]] = h0 * mult;
             }
         }

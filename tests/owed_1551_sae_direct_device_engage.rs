@@ -34,13 +34,13 @@
 //! Uses only the public crate API.
 
 use gam::gpu::GpuRuntime;
-use gam::solver::gpu_kernels::arrow_schur::solve_arrow_newton_step_dense_reference;
 use gam::gpu::policy::GpuDispatchPolicy;
 use gam::solver::arrow_schur::{
     ArrowSchurSystem, ArrowSolveOptions, ArrowSolverMode, BetaPenaltyOp, DeviceSaeFrameData,
     DeviceSaePcgData, DeviceSaeSmoothBlock, FactoredFrameGBlock,
     solve_arrow_newton_step_with_options,
 };
+use gam::solver::gpu_kernels::arrow_schur::solve_arrow_newton_step_dense_reference;
 use ndarray::Array2;
 
 /// Build a production-shaped framed SAE arrow system: few rows, wide factored

@@ -147,7 +147,10 @@ fn binomial_logit_reml_outer_work_bounded_1575() {
         .edf_total()
         .expect("inference EDF must be present for an inference fit");
     assert!(edf.is_finite() && edf > 0.0, "edf must be finite positive");
-    assert!(fit.beta.iter().all(|b| b.is_finite()), "beta must be finite");
+    assert!(
+        fit.beta.iter().all(|b| b.is_finite()),
+        "beta must be finite"
+    );
     assert_eq!(fit.lambdas.len(), 3, "expected three smoothing parameters");
 
     // EDF is bounded below by the unpenalized dimension (intercept + one
@@ -290,7 +293,10 @@ fn binomial_logit_reml_firth_on_outer_work_bounded_1575() {
 
     // Correctness: finite fit, converged, EDF in the structurally valid band.
     assert!(fit.reml_score.is_finite(), "reml_score must be finite");
-    assert!(fit.beta.iter().all(|b| b.is_finite()), "beta must be finite");
+    assert!(
+        fit.beta.iter().all(|b| b.is_finite()),
+        "beta must be finite"
+    );
     let edf = fit
         .edf_total()
         .expect("inference EDF must be present for an inference fit");

@@ -133,9 +133,7 @@ pub fn realize_coefficient_groups_for_custom_family(
     groups: &[CoefficientGroupSpec],
     base_prior: gam_problem::RhoPrior,
 ) -> Result<RealizedCoefficientGroupSpecs, String> {
-    use gam_terms::structure::coefficient_group_resolver::{
-        ResolvedGroup, ResolvedGroupHierarchy,
-    };
+    use gam_terms::structure::coefficient_group_resolver::{ResolvedGroup, ResolvedGroupHierarchy};
 
     validate_blockspecs(specs)?;
     // Carrier-specific validation. The prior and the custom-only

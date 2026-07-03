@@ -553,7 +553,10 @@ mod tests {
     fn try_to_dense_exact_err_for_nan_entry() {
         let m = SymmetricMatrix::Dense(array![[f64::NAN, 0.0], [0.0, 1.0]]);
         let err = m.try_to_dense_exact("nantest").unwrap_err();
-        assert!(err.contains("nantest"), "error should mention context: {err}");
+        assert!(
+            err.contains("nantest"),
+            "error should mention context: {err}"
+        );
     }
 
     // ── add ───────────────────────────────────────────────────────────────────

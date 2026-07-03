@@ -95,7 +95,7 @@ def test_stagewise_ev_monotone_and_zero_collapse() -> None:
     )
 
 
-def test_stagewise_birth_callback_receives_durable_checkpoints() -> None:
+def test_stagewise_progress_callback_receives_durable_checkpoints() -> None:
     x, _assign = _planted_two_circles(n=160, p=8, noise=0.01, seed=3)
     events: list[dict] = []
 
@@ -112,10 +112,10 @@ def test_stagewise_birth_callback_receives_durable_checkpoints() -> None:
         n_iter=12,
         seed_n_iter=12,
         random_state=3,
-        birth_callback=_callback,
+        progress_callback=_callback,
     )
 
-    assert events, "birth_callback must receive Rust stagewise progress events"
+    assert events, "progress_callback must receive Rust stagewise progress events"
     event_names = [str(event["event"]) for event in events]
     assert "seed_fit_completed" in event_names
     assert "candidate_started" in event_names

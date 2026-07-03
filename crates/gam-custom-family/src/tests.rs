@@ -176,11 +176,11 @@ pub(crate) fn batched_outer_gradient_override_rejected_when_jeffreys_curvature_i
     );
 }
 
-use gam_models::gamlss::{BinomialLocationScaleFamily, BinomialLocationScaleWiggleFamily};
-use gam_linalg::matrix::DesignMatrix;
-use gam_test_support::binomial_location_scale_base_fixture;
 use approx::assert_relative_eq;
 use faer::sparse::{SparseColMat, Triplet};
+use gam_linalg::matrix::DesignMatrix;
+use gam_models::gamlss::{BinomialLocationScaleFamily, BinomialLocationScaleWiggleFamily};
+use gam_test_support::binomial_location_scale_base_fixture;
 use ndarray::{Array1, Array2, array};
 
 pub(crate) fn assert_kronecker_factored_matches_dense(
@@ -386,9 +386,9 @@ pub(crate) fn joint_outer_gradient_uses_projected_trace_for_rank_deficient_penal
     let h = array![[4.0, 0.2, 7.0], [0.2, 9.0, -3.0], [7.0, -3.0, 30.0]];
     let spec = ParameterBlockSpec {
         name: "surface".to_string(),
-        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros((
-            1, 3,
-        )))),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros(
+            (1, 3),
+        ))),
         offset: Array1::zeros(1),
         penalties: vec![PenaltyMatrix::Dense(s_lambda.clone())],
         nullspace_dims: vec![1],
@@ -562,9 +562,9 @@ pub(crate) fn joint_outer_gradient_projected_trace_drops_joint_null() {
     let h = array![[4.0, 0.2, 0.0], [0.2, 9.0, 0.0], [0.0, 0.0, 0.0]];
     let spec = ParameterBlockSpec {
         name: "surface".to_string(),
-        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros((
-            1, 3,
-        )))),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros(
+            (1, 3),
+        ))),
         offset: Array1::zeros(1),
         penalties: vec![PenaltyMatrix::Dense(s_lambda.clone())],
         nullspace_dims: vec![1],
@@ -707,9 +707,9 @@ pub(crate) fn large_scale_rho_scan_joint_outer_evaluate_is_projection_invariant(
 
         let spec = ParameterBlockSpec {
             name: "surface".to_string(),
-            design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros((
-                1, 3,
-            )))),
+            design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 3)),
+            )),
             offset: Array1::zeros(1),
             penalties: vec![PenaltyMatrix::Dense(s_unit.clone())],
             nullspace_dims: vec![1],
@@ -1343,16 +1343,11 @@ pub(crate) fn binomial_location_scale_wiggle_outer_fixture()
 -> BinomialLocationScaleWiggleOuterFixture {
     let base = binomial_location_scale_base_fixture();
     let q_seed = Array1::linspace(-1.4, 1.4, base.n);
-    let knots = gam_terms::basis::initializewiggle_knots_from_seed(q_seed.view(), 3, 4)
-        .expect("knots");
-    let wiggle_block = gam_models::wiggle::buildwiggle_block_input_from_knots(
-        q_seed.view(),
-        &knots,
-        3,
-        2,
-        false,
-    )
-    .expect("wiggle block");
+    let knots =
+        gam_terms::basis::initializewiggle_knots_from_seed(q_seed.view(), 3, 4).expect("knots");
+    let wiggle_block =
+        gam_models::wiggle::buildwiggle_block_input_from_knots(q_seed.view(), &knots, 3, 2, false)
+            .expect("wiggle block");
     let wigglespec = ParameterBlockSpec {
         name: "wiggle".to_string(),
         design: wiggle_block.design.clone(),
@@ -1418,9 +1413,9 @@ pub(crate) fn joint_coupled_coefficient_hessian_cost_matches_n_times_p_total_squ
     // 2·200·(240+96+160) = 198_400 accounts for the difference.
     let mk_spec = |p: usize| ParameterBlockSpec {
         name: "test".to_string(),
-        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros((
-            200, p,
-        )))),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros(
+            (200, p),
+        ))),
         offset: Array1::zeros(200),
         penalties: Vec::new(),
         nullspace_dims: Vec::new(),
@@ -1453,9 +1448,9 @@ pub(crate) fn large_scale_exact_adaptive_hessian_order_stays_second_order() {
     let retained_rho_dim = 3usize;
     let spec = ParameterBlockSpec {
         name: "matern60".to_string(),
-        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros((
-            1, p,
-        )))),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros(
+            (1, p),
+        ))),
         offset: Array1::zeros(1),
         penalties: (0..retained_rho_dim)
             .map(|_| PenaltyMatrix::Dense(Array2::eye(p)))
@@ -1734,9 +1729,9 @@ pub(crate) fn default_coefficient_gradient_cost_is_half_of_hessian_cost() {
     // a per-family override.
     let mk_spec = |n: usize, p: usize| ParameterBlockSpec {
         name: "test".to_string(),
-        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros((
-            n, p,
-        )))),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros(
+            (n, p),
+        ))),
         offset: Array1::zeros(n),
         penalties: Vec::new(),
         nullspace_dims: Vec::new(),
@@ -1815,9 +1810,9 @@ pub(crate) fn screened_outer_warm_start_reuses_any_matching_rho_dimension() {
 pub(crate) fn cached_beta_warm_start_splits_blocks_and_validates_shape() {
     let mk_spec = |name: &str, p: usize| ParameterBlockSpec {
         name: name.to_string(),
-        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros((
-            3, p,
-        )))),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros(
+            (3, p),
+        ))),
         offset: Array1::zeros(3),
         penalties: Vec::new(),
         nullspace_dims: Vec::new(),
@@ -1852,9 +1847,9 @@ pub(crate) fn cached_beta_warm_start_splits_blocks_and_validates_shape() {
 pub(crate) fn cached_beta_warm_start_rejects_nonfinite_entries() {
     let spec = ParameterBlockSpec {
         name: "a".to_string(),
-        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros((
-            3, 2,
-        )))),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros(
+            (3, 2),
+        ))),
         offset: Array1::zeros(3),
         penalties: Vec::new(),
         nullspace_dims: Vec::new(),
@@ -1881,9 +1876,9 @@ pub(crate) fn cached_beta_warm_start_rejects_nonfinite_entries() {
 pub(crate) fn custom_outer_state_reset_preserves_seeded_cached_beta() {
     let spec = ParameterBlockSpec {
         name: "a".to_string(),
-        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros((
-            3, 2,
-        )))),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros(
+            (3, 2),
+        ))),
         offset: Array1::zeros(3),
         penalties: Vec::new(),
         nullspace_dims: Vec::new(),
@@ -1954,10 +1949,7 @@ pub(crate) fn psi_drift_deriv_workspace_preserves_block_local_operator() {
     struct ZeroFamily;
 
     impl CustomFamily for ZeroFamily {
-        fn evaluate(
-            &self,
-            _: &[ParameterBlockState],
-        ) -> Result<FamilyEvaluation, String> {
+        fn evaluate(&self, _: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
             Ok(FamilyEvaluation {
                 log_likelihood: 0.0,
                 blockworking_sets: vec![],
@@ -2973,17 +2965,18 @@ pub(crate) fn jeffreys_second_order_completion_pairwise_fallback_when_hook_absen
     )
     .expect("completion")
     .expect("completion present");
-    let direct = gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_second_order_completion(
-        h_joint.view(),
-        z_joint.view(),
-        |u: &Array1<f64>, v: &Array1<f64>| {
-            family.joint_jeffreys_information_second_directional_derivative_with_specs(
-                &states, &specs, u, v,
-            )
-        },
-    )
-    .expect("direct pairwise completion")
-    .expect("direct pairwise completion present");
+    let direct =
+        gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_second_order_completion(
+            h_joint.view(),
+            z_joint.view(),
+            |u: &Array1<f64>, v: &Array1<f64>| {
+                family.joint_jeffreys_information_second_directional_derivative_with_specs(
+                    &states, &specs, u, v,
+                )
+            },
+        )
+        .expect("direct pairwise completion")
+        .expect("direct pairwise completion present");
     assert_eq!(
         completion, direct,
         "fallback must be the exact pairwise completion"
@@ -3081,9 +3074,10 @@ impl CustomFamily for OneBlockIdentityFamily {
 pub(crate) fn fit_custom_family_rejects_invalid_blockspec_before_output_channel_probe() {
     let spec = ParameterBlockSpec {
         name: "bad_penalty".to_string(),
-        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
-            array![[1.0], [2.0],],
-        )),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
+            [1.0],
+            [2.0],
+        ])),
         offset: Array1::zeros(2),
         penalties: vec![PenaltyMatrix::Dense(Array2::<f64>::eye(2))],
         nullspace_dims: vec![0],
@@ -3942,10 +3936,9 @@ pub(crate) fn outergradient_matches_finite_difference_for_one_block() {
     let y = Array1::from_vec(vec![0.4, -0.2, 0.8, 1.0, -0.5, 0.3, 0.1, -0.7]);
     let spec = ParameterBlockSpec {
         name: "b0".to_string(),
-        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::from_elem(
-            (n, 1),
-            1.0,
-        ))),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+            Array2::from_elem((n, 1), 1.0),
+        )),
         offset: Array1::zeros(n),
         penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
         nullspace_dims: vec![],
@@ -4485,8 +4478,8 @@ pub(crate) fn ridge_stabilization_gap_produces_exact_rho_two_in_null_direction()
 /// the constrained path now routes feasibility through the projection.
 #[test]
 pub(crate) fn cone_projection_preserves_step_where_alpha_crush_collapses_it() {
-    use gam_solve::active_set::project_point_strictly_into_feasible_cone;
     use gam_problem::LinearInequalityConstraints;
+    use gam_solve::active_set::project_point_strictly_into_feasible_cone;
     // One monotonicity row `a·β ≥ 0` with a = [1, 0]; the current iterate
     // β = [0, 0] sits exactly on it (slack = 0). The Newton trial step wants to
     // move DOWN on the binding coordinate (δ_0 = −1, would violate) and freely on
@@ -4808,7 +4801,10 @@ pub(crate) fn joint_solver_ridge_stabilizes_dense_indefinite_coupled_hessian() {
 pub(crate) fn outergradient_uses_joint_surrogate_formultiblock_diagonal_family() {
     let spec0 = ParameterBlockSpec {
         name: "block0".to_string(),
-        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0], [1.0]])),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
+            [1.0],
+            [1.0]
+        ])),
         offset: array![0.0, 0.0],
         penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
         nullspace_dims: vec![],
@@ -4821,7 +4817,10 @@ pub(crate) fn outergradient_uses_joint_surrogate_formultiblock_diagonal_family()
     };
     let spec1 = ParameterBlockSpec {
         name: "block1".to_string(),
-        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0], [1.0]])),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
+            [1.0],
+            [1.0]
+        ])),
         offset: array![0.0, 0.0],
         penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
         nullspace_dims: vec![],
@@ -5249,10 +5248,9 @@ pub(crate) fn binomial_location_scale_outer_fixture(
     let weights = Array1::from_elem(n, 1.0);
     let thresholdspec = ParameterBlockSpec {
         name: "threshold".to_string(),
-        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::from_elem(
-            (n, 1),
-            1.0,
-        ))),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+            Array2::from_elem((n, 1), 1.0),
+        )),
         offset: Array1::zeros(n),
         penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
         nullspace_dims: vec![],
@@ -5265,10 +5263,9 @@ pub(crate) fn binomial_location_scale_outer_fixture(
     };
     let log_sigmaspec = ParameterBlockSpec {
         name: "log_sigma".to_string(),
-        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::from_elem(
-            (n, 1),
-            1.0,
-        ))),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+            Array2::from_elem((n, 1), 1.0),
+        )),
         offset: Array1::zeros(n),
         penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
         nullspace_dims: vec![],
@@ -6071,7 +6068,10 @@ pub(crate) fn outerobjective_failure_context_is_preserved() {
     // the real evaluation error instead of returning an opaque line-search failure.
     let spec = ParameterBlockSpec {
         name: "err_block".to_string(),
-        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0], [1.0]])),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
+            [1.0],
+            [1.0]
+        ])),
         offset: array![0.0, 0.0],
         penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
         nullspace_dims: vec![],
@@ -6102,7 +6102,10 @@ pub(crate) fn outerobjective_failure_context_is_preserved() {
 pub(crate) fn fit_fails_when_requested_covariance_cannot_be_computed() {
     let spec = ParameterBlockSpec {
         name: "cov_block".to_string(),
-        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0], [1.0]])),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
+            [1.0],
+            [1.0]
+        ])),
         offset: array![0.0, 0.0],
         penalties: vec![],
         nullspace_dims: vec![],
@@ -6209,10 +6212,9 @@ pub(crate) fn make_two_block_specs(n: usize) -> Vec<ParameterBlockSpec> {
     vec![
         ParameterBlockSpec {
             name: "mu".to_string(),
-            design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::from_elem(
-                (n, 1),
-                1.0,
-            ))),
+            design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+                Array2::from_elem((n, 1), 1.0),
+            )),
             offset: Array1::zeros(n),
             penalties: vec![],
             nullspace_dims: vec![],
@@ -6225,10 +6227,9 @@ pub(crate) fn make_two_block_specs(n: usize) -> Vec<ParameterBlockSpec> {
         },
         ParameterBlockSpec {
             name: "log_sigma".to_string(),
-            design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::from_elem(
-                (n, 2),
-                1.0,
-            ))),
+            design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+                Array2::from_elem((n, 2), 1.0),
+            )),
             offset: Array1::zeros(n),
             penalties: vec![],
             nullspace_dims: vec![],
@@ -6352,10 +6353,9 @@ pub(crate) fn exact_newton_dh_closure_rejects_non_finite_directional_derivative(
     let family = OneBlockNonFiniteJointDhFamily;
     let specs = vec![ParameterBlockSpec {
         name: "beta".to_string(),
-        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::from_elem(
-            (2, 1),
-            1.0,
-        ))),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+            Array2::from_elem((2, 1), 1.0),
+        )),
         offset: Array1::zeros(2),
         penalties: vec![],
         nullspace_dims: vec![],
@@ -6607,10 +6607,9 @@ pub(crate) fn make_heterogeneous_eta_specs(n: usize) -> Vec<ParameterBlockSpec> 
         ParameterBlockSpec {
             name: "big_block".to_string(),
             // 3n rows — mimics survival time block stacking
-            design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::from_elem(
-                (3 * n, p0),
-                1.0,
-            ))),
+            design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+                Array2::from_elem((3 * n, p0), 1.0),
+            )),
             offset: Array1::zeros(3 * n),
             penalties: vec![],
             nullspace_dims: vec![],
@@ -6624,10 +6623,9 @@ pub(crate) fn make_heterogeneous_eta_specs(n: usize) -> Vec<ParameterBlockSpec> 
         ParameterBlockSpec {
             name: "small_block".to_string(),
             // n rows — mimics threshold/log-sigma block
-            design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::from_elem(
-                (n, p1),
-                1.0,
-            ))),
+            design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+                Array2::from_elem((n, p1), 1.0),
+            )),
             offset: Array1::zeros(n),
             penalties: vec![],
             nullspace_dims: vec![],
@@ -6674,39 +6672,38 @@ pub(crate) fn uniform_eta_lengths_do_not_panic() {
         }
     }
     // Both blocks have n rows — no shape mismatch possible.
-    let specs =
-        vec![
-            ParameterBlockSpec {
-                name: "block_a".to_string(),
-                design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
-                    Array2::from_elem((n, 2), 1.0),
-                )),
-                offset: Array1::zeros(n),
-                penalties: vec![],
-                nullspace_dims: vec![],
-                initial_log_lambdas: Array1::zeros(0),
-                initial_beta: Some(Array1::from_elem(2, 1.0)),
-                gauge_priority: 100,
-                jacobian_callback: None,
-                stacked_design: None,
-                stacked_offset: None,
-            },
-            ParameterBlockSpec {
-                name: "block_b".to_string(),
-                design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
-                    Array2::from_elem((n, 2), 1.0),
-                )),
-                offset: Array1::zeros(n),
-                penalties: vec![],
-                nullspace_dims: vec![],
-                initial_log_lambdas: Array1::zeros(0),
-                initial_beta: Some(Array1::from_elem(2, 1.0)),
-                gauge_priority: 100,
-                jacobian_callback: None,
-                stacked_design: None,
-                stacked_offset: None,
-            },
-        ];
+    let specs = vec![
+        ParameterBlockSpec {
+            name: "block_a".to_string(),
+            design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+                Array2::from_elem((n, 2), 1.0),
+            )),
+            offset: Array1::zeros(n),
+            penalties: vec![],
+            nullspace_dims: vec![],
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: Some(Array1::from_elem(2, 1.0)),
+            gauge_priority: 100,
+            jacobian_callback: None,
+            stacked_design: None,
+            stacked_offset: None,
+        },
+        ParameterBlockSpec {
+            name: "block_b".to_string(),
+            design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+                Array2::from_elem((n, 2), 1.0),
+            )),
+            offset: Array1::zeros(n),
+            penalties: vec![],
+            nullspace_dims: vec![],
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: Some(Array1::from_elem(2, 1.0)),
+            gauge_priority: 100,
+            jacobian_callback: None,
+            stacked_design: None,
+            stacked_offset: None,
+        },
+    ];
     let per_block = vec![Array1::zeros(0), Array1::zeros(0)];
     let options = BlockwiseFitOptions {
         inner_max_cycles: 3,

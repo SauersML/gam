@@ -165,7 +165,10 @@ mod tests {
     fn invalid_range_mentions_start_and_end() {
         let err = BasisError::InvalidRange(2.5, 1.0);
         let msg = err.to_string();
-        assert!(msg.contains("2.5") || msg.contains("start"), "message: {msg}");
+        assert!(
+            msg.contains("2.5") || msg.contains("start"),
+            "message: {msg}"
+        );
     }
 
     #[test]
@@ -177,7 +180,10 @@ mod tests {
 
     #[test]
     fn invalid_penalty_order_mentions_order_and_num_basis() {
-        let err = BasisError::InvalidPenaltyOrder { order: 5, num_basis: 3 };
+        let err = BasisError::InvalidPenaltyOrder {
+            order: 5,
+            num_basis: 3,
+        };
         let msg = err.to_string();
         assert!(msg.contains("5") && msg.contains("3"), "message: {msg}");
     }
@@ -190,7 +196,10 @@ mod tests {
             provided: 5,
         };
         let msg = err.to_string();
-        assert!(msg.contains("3") && msg.contains("10") && msg.contains("5"), "message: {msg}");
+        assert!(
+            msg.contains("3") && msg.contains("10") && msg.contains("5"),
+            "message: {msg}"
+        );
     }
 
     #[test]

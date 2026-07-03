@@ -738,7 +738,6 @@ fn true_softmax_3(coef: &Array2<f64>, x1: f64, x2: f64) -> [f64; 3] {
     probs
 }
 
-
 /// Dense inverse via Gauss-Jordan with partial pivoting. Used to build the
 /// independent multinomial observed-information inverse the exactness pin below
 /// compares against — `D = P·M` is tiny here (6×6), so a textbook elimination is
@@ -823,7 +822,11 @@ fn multinomial_observed_information(beta: &Array2<f64>, xrows: &[[f64; 3]]) -> A
         }
         for a in 0..m {
             for b in 0..m {
-                let w = if a == b { pa[a] * (1.0 - pa[a]) } else { -pa[a] * pa[b] };
+                let w = if a == b {
+                    pa[a] * (1.0 - pa[a])
+                } else {
+                    -pa[a] * pa[b]
+                };
                 if w == 0.0 {
                     continue;
                 }
@@ -840,7 +843,12 @@ fn multinomial_observed_information(beta: &Array2<f64>, xrows: &[[f64; 3]]) -> A
 
 /// Draw one class label for covariate `(x1, x2)` under the known softmax DGP,
 /// using the supplied U[-2,2] generator for the inverse-CDF draw.
-fn draw_label(true_coef: &Array2<f64>, x1: f64, x2: f64, next_unif: &mut dyn FnMut() -> f64) -> usize {
+fn draw_label(
+    true_coef: &Array2<f64>,
+    x1: f64,
+    x2: f64,
+    next_unif: &mut dyn FnMut() -> f64,
+) -> usize {
     let probs = true_softmax_3(true_coef, x1, x2);
     let u01 = (next_unif() + 2.0) / 4.0;
     let mut cum = 0.0_f64;
@@ -936,11 +944,21 @@ fn multinomial_coefficient_covariance_equals_observed_information_inverse() {
     let p = model.p_per_class;
     let m = model.n_active_classes;
     let d = p * m;
-    assert_eq!((p, m), (3, 2), "expected P=3 (1,x1,x2) and M=2 active classes");
+    assert_eq!(
+        (p, m),
+        (3, 2),
+        "expected P=3 (1,x1,x2) and M=2 active classes"
+    );
 
     let beta = model.coefficients_active(); // (P, M)
-    let cov = model.coefficient_covariance().expect("stored joint covariance");
-    assert_eq!(cov.dim(), (d, d), "stored covariance must be the joint (P·M)² block");
+    let cov = model
+        .coefficient_covariance()
+        .expect("stored joint covariance");
+    assert_eq!(
+        cov.dim(),
+        (d, d),
+        "stored covariance must be the joint (P·M)² block"
+    );
 
     let info = multinomial_observed_information(&beta, &xrows);
     let cov_indep = invert_dense(&info).expect("observed information must be invertible");
@@ -1038,7 +1056,8 @@ fn multinomial_per_class_probability_se_intervals_are_calibrated_over_refits() {
             ]));
         }
         let rheaders = ["x1", "x2", "y"].into_iter().map(str::to_string).collect();
-        let rdata = encode_recordswith_inferred_schema(rheaders, rrows).expect("encode refit dataset");
+        let rdata =
+            encode_recordswith_inferred_schema(rheaders, rrows).expect("encode refit dataset");
         let rmodel = fit_penalized_multinomial_formula(
             &rdata,
             "y ~ x1 + x2",

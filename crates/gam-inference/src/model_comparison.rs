@@ -26,10 +26,10 @@
 //! Both channels are *corroboration*: they ride alongside the evidence headline
 //! a race already produces, never replacing it.
 
-use gam_solve::estimate::UnifiedFitResult;
 use crate::alo::AloDiagnostics;
-use gam_solve::psis::pareto_smooth_weights;
 use gam_problem::types::{GlmLikelihoodSpec, LikelihoodSpec};
+use gam_solve::estimate::UnifiedFitResult;
+use gam_solve::psis::pareto_smooth_weights;
 use ndarray::{Array1, ArrayView1, ArrayView2};
 
 /// ALO predictive-accuracy summary at zero refit cost.
@@ -434,7 +434,9 @@ fn reporting_scale(
     use gam_problem::types::{LikelihoodScaleMetadata, ResponseFamily};
     match spec.response {
         ResponseFamily::Gaussian => match scale.fixed_phi() {
-            Some(p) if p.is_finite() && p > 0.0 => LikelihoodScaleMetadata::FixedDispersion { phi: p },
+            Some(p) if p.is_finite() && p > 0.0 => {
+                LikelihoodScaleMetadata::FixedDispersion { phi: p }
+            }
             _ if phi.is_finite() && phi > 0.0 => LikelihoodScaleMetadata::FixedDispersion { phi },
             _ => scale.clone(),
         },
@@ -469,9 +471,7 @@ fn scale_parameter_count(
         ResponseFamily::NegativeBinomial { .. } => {
             matches!(scale, LikelihoodScaleMetadata::EstimatedNegBinTheta { .. })
         }
-        ResponseFamily::Poisson
-        | ResponseFamily::Binomial
-        | ResponseFamily::RoystonParmar => false,
+        ResponseFamily::Poisson | ResponseFamily::Binomial | ResponseFamily::RoystonParmar => false,
     };
     if estimated { 1.0 } else { 0.0 }
 }

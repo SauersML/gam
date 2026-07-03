@@ -85,12 +85,22 @@ fn main() {
         }
         let gd = build_term_collection_design(g.view(), &fit.resolvedspec).expect("grid");
         let gam_grid: Vec<f64> = gd.design.apply(&fit.fit.beta).to_vec();
-        let ls = fit.resolvedspec.smooth_terms.iter().find_map(|t| match &t.basis {
-            SmoothBasisSpec::Matern { spec, .. } => Some(spec.length_scale),
-            _ => None,
-        });
+        let ls = fit
+            .resolvedspec
+            .smooth_terms
+            .iter()
+            .find_map(|t| match &t.basis {
+                SmoothBasisSpec::Matern { spec, .. } => Some(spec.length_scale),
+                _ => None,
+            });
         let edf = fit.fit.edf_total().unwrap_or(f64::NAN);
-        Some((gam_grid, edf, ls, fit.fit.log_lambdas.to_vec(), fit.fit.reml_score))
+        Some((
+            gam_grid,
+            edf,
+            ls,
+            fit.fit.log_lambdas.to_vec(),
+            fit.fit.reml_score,
+        ))
     };
 
     let report = |tag: &str, r: &Option<(Vec<f64>, f64, Option<f64>, Vec<f64>, f64)>| {
@@ -103,7 +113,10 @@ fn main() {
             &[&gam_grid[..edge], &gam_grid[grid_n - edge..]].concat(),
             &[&truth_grid[..edge], &truth_grid[grid_n - edge..]].concat(),
         );
-        let r_int = rmse(&gam_grid[edge..grid_n - edge], &truth_grid[edge..grid_n - edge]);
+        let r_int = rmse(
+            &gam_grid[edge..grid_n - edge],
+            &truth_grid[edge..grid_n - edge],
+        );
         println!(
             "{tag:30} reml={reml:.3} rmse_all={r_all:.4} rmse_int={r_int:.4} rmse_edge={r_edge:.4} edf={edf:.2} ls={ls:?} ll={ll:?}"
         );

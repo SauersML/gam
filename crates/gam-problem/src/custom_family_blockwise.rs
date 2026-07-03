@@ -26,9 +26,7 @@ pub const CUSTOM_FAMILY_WEIGHT_FLOOR: f64 = crate::types::MIN_WEIGHT;
 /// log-determinant via the active `RidgePolicy`.
 pub const CUSTOM_FAMILY_RIDGE_FLOOR: f64 = 1e-12;
 
-pub fn validate_blockspec_consistency(
-    specs: &[ParameterBlockSpec],
-) -> Result<Vec<usize>, String> {
+pub fn validate_blockspec_consistency(specs: &[ParameterBlockSpec]) -> Result<Vec<usize>, String> {
     let mut seen_names = BTreeMap::<String, usize>::new();
     for (b, spec) in specs.iter().enumerate() {
         if let Some(prev) = seen_names.insert(spec.name.clone(), b) {

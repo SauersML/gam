@@ -541,7 +541,10 @@ mod tests {
         let result = faa_di_bruno(&[0], &derivs, |_| u_prime);
         // Chain rule: f'(u) * u'(x) = e^2 * 3
         let expected = e2 * u_prime;
-        assert!((result - expected).abs() < 1e-12, "m=1: {result} vs {expected}");
+        assert!(
+            (result - expected).abs() < 1e-12,
+            "m=1: {result} vs {expected}"
+        );
     }
 
     /// `faa_di_bruno` with m=2 (mixed second partial). For u = x*y (so
@@ -553,10 +556,10 @@ mod tests {
         // f = exp, f'(0)=1, f''(0)=1.
         let derivs = [1.0_f64, 1.0, 1.0, 1.0, 1.0]; // all f^(r)(0)=1
         let result = faa_di_bruno(&[0, 1], &derivs, |positions| match positions {
-            [] => 0.0,       // u(0,0) = 0 (unused by the formula for m=2)
-            [0] => 0.0,      // u_x = 0
-            [1] => 0.0,      // u_y = 0
-            [0, 1] => 1.0,   // u_xy = 1
+            [] => 0.0,     // u(0,0) = 0 (unused by the formula for m=2)
+            [0] => 0.0,    // u_x = 0
+            [1] => 0.0,    // u_y = 0
+            [0, 1] => 1.0, // u_xy = 1
             _ => panic!("unexpected positions"),
         });
         // d²/dx dy exp(x*y)|_(0,0) = exp(0)*u_xy + exp(0)*u_x*u_y = 1*1 + 1*0*0 = 1
@@ -576,10 +579,10 @@ mod tests {
     /// but with a=e^0=1 and derivative 1, b=0 and derivative 1: 1*0+1*1=1.
     #[test]
     fn leibniz_product_m_one_product_rule() {
-        let av = 2.0_f64;  // a(x0) = 2
-        let ad = 5.0_f64;  // a'(x0) = 5
-        let bv = 3.0_f64;  // b(x0) = 3
-        let bd = 7.0_f64;  // b'(x0) = 7
+        let av = 2.0_f64; // a(x0) = 2
+        let ad = 5.0_f64; // a'(x0) = 5
+        let bv = 3.0_f64; // b(x0) = 3
+        let bd = 7.0_f64; // b'(x0) = 7
         let result = leibniz_product(
             &[0],
             |pos| if pos.is_empty() { av } else { ad },
@@ -597,18 +600,18 @@ mod tests {
         // Simple concrete values for a and b derivatives.
         let a = |pos: &[usize]| -> f64 {
             match pos {
-                [] => 2.0,     // a(x0)
-                [0] => 3.0,    // a_{x0}
-                [1] => 5.0,    // a_{x1}
-                _ => 7.0,      // a_{x0,x1}
+                [] => 2.0,  // a(x0)
+                [0] => 3.0, // a_{x0}
+                [1] => 5.0, // a_{x1}
+                _ => 7.0,   // a_{x0,x1}
             }
         };
         let b = |pos: &[usize]| -> f64 {
             match pos {
-                [] => 11.0,    // b(x0)
-                [0] => 13.0,   // b_{x0}
-                [1] => 17.0,   // b_{x1}
-                _ => 19.0,     // b_{x0,x1}
+                [] => 11.0,  // b(x0)
+                [0] => 13.0, // b_{x0}
+                [1] => 17.0, // b_{x1}
+                _ => 19.0,   // b_{x0,x1}
             }
         };
         let result = leibniz_product(&[0, 1], a, b);

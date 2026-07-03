@@ -299,9 +299,8 @@ fn recon_loss(theta_true: &Array1<f64>, b: f64) -> f64 {
     }
     let mut sse = 0.0;
     for i in 0..n {
-        let pred = coeff[0]
-            + coeff[1] * (b * theta_true[i]).cos()
-            + coeff[2] * (b * theta_true[i]).sin();
+        let pred =
+            coeff[0] + coeff[1] * (b * theta_true[i]).cos() + coeff[2] * (b * theta_true[i]).sin();
         sse += (signal[i] - pred).powi(2);
     }
     sse / n as f64
@@ -369,7 +368,9 @@ fn data_fidelity_plus_production_penalty_selects_interior_bandwidth() {
     let ard_weight = 1.0e-3;
     let joint: Vec<f64> = grid_b
         .iter()
-        .map(|&b| recon_loss(&theta_true, b) + production_penalty_at_bandwidth(&theta_true, b, ard_weight))
+        .map(|&b| {
+            recon_loss(&theta_true, b) + production_penalty_at_bandwidth(&theta_true, b, ard_weight)
+        })
         .collect();
     let min_i = argmin(&joint);
     assert!(

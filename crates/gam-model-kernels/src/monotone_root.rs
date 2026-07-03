@@ -381,8 +381,8 @@ pub fn solve_monotone_root_detailed_with_bracket(
 #[cfg(test)]
 mod tests {
     use super::{
-        solve_monotone_root, solve_monotone_root_detailed,
-        solve_monotone_root_detailed_with_bracket, MonotoneRootError,
+        MonotoneRootError, solve_monotone_root, solve_monotone_root_detailed,
+        solve_monotone_root_detailed_with_bracket,
     };
     use std::cell::RefCell;
 
@@ -518,7 +518,7 @@ mod tests {
             0.0,
             "no_bracket",
             1e-12,
-            0,  // no bracket iterations allowed
+            0, // no bracket iterations allowed
             32,
         )
         .unwrap_err();

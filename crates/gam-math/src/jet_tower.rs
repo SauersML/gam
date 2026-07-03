@@ -749,8 +749,7 @@ impl<const K: usize> Tower2<K> {
         }
         for i in 0..K {
             for j in i..K {
-                let hij =
-                    a.v * b.h[i][j] + a.g[i] * b.g[j] + a.g[j] * b.g[i] + a.h[i][j] * b.v;
+                let hij = a.v * b.h[i][j] + a.g[i] * b.g[j] + a.g[j] * b.g[i] + a.h[i][j] * b.v;
                 out.h[i][j] = hij;
                 out.h[j][i] = hij;
             }
@@ -1983,12 +1982,18 @@ impl GuardVerdict {
     /// A scalar (1-lane) verdict: `pass == true` ⇒ no failure.
     #[inline]
     pub fn scalar(pass: bool) -> Self {
-        Self { lanes: 1, failed_mask: if pass { 0 } else { 1 } }
+        Self {
+            lanes: 1,
+            failed_mask: if pass { 0 } else { 1 },
+        }
     }
     /// A 4-lane verdict from a per-lane failure mask (bit `i` ⇒ lane `i` failed).
     #[inline]
     pub fn lanes4(failed_mask: u8) -> Self {
-        Self { lanes: 4, failed_mask: failed_mask & 0x0f }
+        Self {
+            lanes: 4,
+            failed_mask: failed_mask & 0x0f,
+        }
     }
     /// Number of active lanes inspected (1 scalar, 4 batch).
     #[inline]
@@ -2142,7 +2147,13 @@ pub trait RowJet<const K: usize>: Copy {
     fn sqrt(&self) -> Self {
         self.compose_unary_with(|u| {
             let s = u.sqrt();
-            [s, 0.5 / s, -0.25 / (u * s), 0.375 / (u * u * s), -0.9375 / (u * u * u * s)]
+            [
+                s,
+                0.5 / s,
+                -0.25 / (u * s),
+                0.375 / (u * u * s),
+                -0.9375 / (u * u * u * s),
+            ]
         })
     }
     /// `1/self`.
@@ -2218,7 +2229,9 @@ impl<const K: usize, S: crate::jet_scalar::JetScalar<K>> RowJet<K> for S {
     }
     #[inline]
     fn compose_unary_with<const N: usize>(&self, stack_fn: impl Fn(f64) -> [f64; N]) -> Self {
-        crate::jet_scalar::JetScalar::compose_unary_with(self, |u| resize_stack::<N, 5>(stack_fn(u)))
+        crate::jet_scalar::JetScalar::compose_unary_with(self, |u| {
+            resize_stack::<N, 5>(stack_fn(u))
+        })
     }
     #[inline]
     fn guard(&self, pred: impl Fn(f64) -> bool) -> GuardVerdict {
@@ -2308,7 +2321,12 @@ impl<const K: usize> RowJet<K> for Tower4Lane<wide::f64x4, K> {
     }
     #[inline]
     fn pack_rows(rows: &[usize], value_of: impl Fn(usize) -> f64) -> [f64; 4] {
-        [value_of(rows[0]), value_of(rows[1]), value_of(rows[2]), value_of(rows[3])]
+        [
+            value_of(rows[0]),
+            value_of(rows[1]),
+            value_of(rows[2]),
+            value_of(rows[3]),
+        ]
     }
 }
 
@@ -2379,7 +2397,12 @@ impl<const K: usize> RowJet<K> for Tower3Lane<wide::f64x4, K> {
     }
     #[inline]
     fn pack_rows(rows: &[usize], value_of: impl Fn(usize) -> f64) -> [f64; 4] {
-        [value_of(rows[0]), value_of(rows[1]), value_of(rows[2]), value_of(rows[3])]
+        [
+            value_of(rows[0]),
+            value_of(rows[1]),
+            value_of(rows[2]),
+            value_of(rows[3]),
+        ]
     }
 }
 
@@ -2659,7 +2682,13 @@ impl<L: Lane, const K: usize> Tower4Lane<L, K> {
     #[inline]
     pub fn zero() -> Self {
         let z = L::splat(0.0);
-        Self { v: z, g: [z; K], h: [[z; K]; K], t3: [[[z; K]; K]; K], t4: [[[[z; K]; K]; K]; K] }
+        Self {
+            v: z,
+            g: [z; K],
+            h: [[z; K]; K],
+            t3: [[[z; K]; K]; K],
+            t4: [[[[z; K]; K]; K]; K],
+        }
     }
     /// Constant `c` (per lane): value channel only.
     #[inline]
@@ -2874,7 +2903,12 @@ impl<L: Lane, const K: usize> Tower4Lane<L, K> {
                         acc = acc.add(d[3].mul(self.h[i][l]).mul(self.g[j]).mul(self.g[k]));
                         acc = acc.add(d[3].mul(self.g[i]).mul(self.h[j][l]).mul(self.g[k]));
                         acc = acc.add(d[3].mul(self.g[i]).mul(self.g[j]).mul(self.h[k][l]));
-                        acc = acc.add(d[4].mul(self.g[i]).mul(self.g[j]).mul(self.g[k]).mul(self.g[l]));
+                        acc = acc.add(
+                            d[4].mul(self.g[i])
+                                .mul(self.g[j])
+                                .mul(self.g[k])
+                                .mul(self.g[l]),
+                        );
                         out.t4[i][j][k][l] = acc;
                     }
                 }
@@ -3014,7 +3048,12 @@ impl<L: Lane, const K: usize> Tower3Lane<L, K> {
     #[inline]
     pub fn zero() -> Self {
         let z = L::splat(0.0);
-        Self { v: z, g: [z; K], h: [[z; K]; K], t3: [[[z; K]; K]; K] }
+        Self {
+            v: z,
+            g: [z; K],
+            h: [[z; K]; K],
+            t3: [[[z; K]; K]; K],
+        }
     }
     /// Constant `c` (per lane).
     #[inline]
@@ -3226,7 +3265,10 @@ mod batch_tests {
     struct Rng(u64);
     impl Rng {
         fn f(&mut self) -> f64 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((self.0 >> 11) as f64 / (1u64 << 53) as f64) * 4.0 - 2.0
         }
     }
@@ -3309,7 +3351,11 @@ mod batch_tests {
                 for k in 0..K {
                     assert_eq!(b.t3[i][j][k].to_bits(), s.t3[i][j][k].to_bits(), "t3 {ctx}");
                     for l in 0..K {
-                        assert_eq!(b.t4[i][j][k][l].to_bits(), s.t4[i][j][k][l].to_bits(), "t4 {ctx}");
+                        assert_eq!(
+                            b.t4[i][j][k][l].to_bits(),
+                            s.t4[i][j][k][l].to_bits(),
+                            "t4 {ctx}"
+                        );
                     }
                 }
             }
@@ -3356,9 +3402,8 @@ mod batch_tests {
             // batched f64x4
             let ab = pack4_t4(&a);
             let bb = pack4_t4(&b);
-            let db: [wide::f64x4; 5] = std::array::from_fn(|c| {
-                wide::f64x4::new([d[0][c], d[1][c], d[2][c], d[3][c]])
-            });
+            let db: [wide::f64x4; 5] =
+                std::array::from_fn(|c| wide::f64x4::new([d[0][c], d[1][c], d[2][c], d[3][c]]));
             let dirb: [wide::f64x4; K] = std::array::from_fn(|c| {
                 wide::f64x4::new([dir[0][c], dir[1][c], dir[2][c], dir[3][c]])
             });
@@ -3376,8 +3421,16 @@ mod batch_tests {
                 assert_t4_eq(&finalb.lane(rw), &scal[rw], "t4-chain");
                 for i in 0..K {
                     for j in 0..K {
-                        assert_eq!(thirdb[i][j].lane(rw).to_bits(), third[rw][i][j].to_bits(), "third");
-                        assert_eq!(fourthb[i][j].lane(rw).to_bits(), fourth[rw][i][j].to_bits(), "fourth");
+                        assert_eq!(
+                            thirdb[i][j].lane(rw).to_bits(),
+                            third[rw][i][j].to_bits(),
+                            "third"
+                        );
+                        assert_eq!(
+                            fourthb[i][j].lane(rw).to_bits(),
+                            fourth[rw][i][j].to_bits(),
+                            "fourth"
+                        );
                     }
                 }
                 rows_checked += 1;
@@ -3401,9 +3454,8 @@ mod batch_tests {
             });
             let ab = pack4_t3(&a);
             let bb = pack4_t3(&b);
-            let db: [wide::f64x4; 4] = std::array::from_fn(|c| {
-                wide::f64x4::new([d[0][c], d[1][c], d[2][c], d[3][c]])
-            });
+            let db: [wide::f64x4; 4] =
+                std::array::from_fn(|c| wide::f64x4::new([d[0][c], d[1][c], d[2][c], d[3][c]]));
             let prodb = ab.mul(&bb);
             let compb = prodb.compose_unary(db);
             let summedb = compb.add(&ab).sub(&bb).scale(s);
@@ -3464,7 +3516,13 @@ mod batch_tests {
     /// standing in for a family's hand-certified special-function stack. `stack4`
     /// is its order-≤3 truncation.
     fn seam_stack5(u: f64) -> [f64; 5] {
-        [u.sin(), u.cos(), (2.0 * u).sin(), (0.5 * u).cos(), u * u - 0.3]
+        [
+            u.sin(),
+            u.cos(),
+            (2.0 * u).sin(),
+            (0.5 * u).cos(),
+            u * u - 0.3,
+        ]
     }
     fn seam_stack4(u: f64) -> [f64; 4] {
         let s = seam_stack5(u);
@@ -3524,7 +3582,11 @@ mod batch_tests {
             }
             let batch_out = pack4_t4(&rows).compose_unary_with(seam_stack5);
             for (rw, row) in rows.iter().enumerate() {
-                assert_t4_eq(&batch_out.lane(rw), &row.compose_unary_with(seam_stack5), "lane t4 seam");
+                assert_t4_eq(
+                    &batch_out.lane(rw),
+                    &row.compose_unary_with(seam_stack5),
+                    "lane t4 seam",
+                );
                 verified += 1;
             }
         }
@@ -3540,7 +3602,11 @@ mod batch_tests {
             }
             let batch_out = pack4_t3(&rows).compose_unary_with(seam_stack4);
             for (rw, row) in rows.iter().enumerate() {
-                assert_t3_eq(&batch_out.lane(rw), &row.compose_unary_with(seam_stack4), "lane t3 seam");
+                assert_t3_eq(
+                    &batch_out.lane(rw),
+                    &row.compose_unary_with(seam_stack4),
+                    "lane t3 seam",
+                );
                 verified += 1;
             }
         }
@@ -4758,7 +4824,10 @@ mod rowjet_bridge_tests {
             Ok(self.primaries[row])
         }
         fn row_nll<R: RowJet<2>>(&self, rows: &[usize], p: &[R; 2]) -> Result<R, String> {
-            assert!(rows.len() == 1 || rows.len() == 4, "lane→row map is 1 or 4 wide");
+            assert!(
+                rows.len() == 1 || rows.len() == 4,
+                "lane→row map is 1 or 4 wide"
+            );
             Ok(self.body(rows, p))
         }
     }
@@ -4768,7 +4837,11 @@ mod rowjet_bridge_tests {
         for i in 0..2 {
             assert_eq!(a.g[i].to_bits(), b.g[i].to_bits(), "{ctx}: g[{i}]");
             for j in 0..2 {
-                assert_eq!(a.h[i][j].to_bits(), b.h[i][j].to_bits(), "{ctx}: h[{i}][{j}]");
+                assert_eq!(
+                    a.h[i][j].to_bits(),
+                    b.h[i][j].to_bits(),
+                    "{ctx}: h[{i}][{j}]"
+                );
                 for k in 0..2 {
                     assert_eq!(
                         a.t3[i][j][k].to_bits(),
@@ -4792,7 +4865,11 @@ mod rowjet_bridge_tests {
         for i in 0..2 {
             assert_eq!(a.g[i].to_bits(), b.g[i].to_bits(), "{ctx}: g[{i}]");
             for j in 0..2 {
-                assert_eq!(a.h[i][j].to_bits(), b.h[i][j].to_bits(), "{ctx}: h[{i}][{j}]");
+                assert_eq!(
+                    a.h[i][j].to_bits(),
+                    b.h[i][j].to_bits(),
+                    "{ctx}: h[{i}][{j}]"
+                );
                 for k in 0..2 {
                     assert_eq!(
                         a.t3[i][j][k].to_bits(),
@@ -4837,7 +4914,10 @@ mod rowjet_bridge_tests {
             let bases: [[f64; 2]; 4] = std::array::from_fn(|_| std::array::from_fn(|_| rng.val()));
             // per-lane-DISTINCT continuous aux (cov/z/wi), signed-zero injected.
             let aux: [[f64; 3]; 4] = std::array::from_fn(|_| std::array::from_fn(|_| rng.val()));
-            let prog = ToyProgram { primaries: bases.to_vec(), aux: aux.to_vec() };
+            let prog = ToyProgram {
+                primaries: bases.to_vec(),
+                aux: aux.to_vec(),
+            };
             let rows = [0usize, 1, 2, 3];
 
             // order-4 batch vs scalar Tower4 (instantiated through the same body).
@@ -4872,7 +4952,10 @@ mod rowjet_bridge_tests {
         for _ in 0..3000 {
             let base: [f64; 2] = std::array::from_fn(|_| rng.val());
             let aux0: [f64; 3] = std::array::from_fn(|_| rng.val());
-            let prog = ToyProgram { primaries: vec![base], aux: vec![aux0] };
+            let prog = ToyProgram {
+                primaries: vec![base],
+                aux: vec![aux0],
+            };
 
             // (a) RowJet-driven body == JetScalar-driven body, bit-for-bit. The
             // reference body uses `scale(f64)` where the RowJet body uses
@@ -4884,9 +4967,8 @@ mod rowjet_bridge_tests {
                 prog.row_nll(&[0], &vars).expect("rowjet")
             };
             let via_jetscalar: Tower4<2> = {
-                let vars: [Tower4<2>; 2] = std::array::from_fn(|a| {
-                    <Tower4<2> as JetScalar<2>>::variable(base[a], a)
-                });
+                let vars: [Tower4<2>; 2] =
+                    std::array::from_fn(|a| <Tower4<2> as JetScalar<2>>::variable(base[a], a));
                 let (cov, z, wi) = (aux0[0], aux0[1], aux0[2]);
                 // The body using JetScalar's own ops + scale(f64) directly.
                 let a = vars[0].mul(&vars[1]).scale(cov);
@@ -4919,7 +5001,12 @@ mod rowjet_bridge_tests {
             let (v, g, h) = rowjet_row_kernel(&prog, 0).expect("kernel");
             assert_eq!(v.to_bits(), via_rowjet.v.to_bits(), "kernel v");
             for i in 0..2 {
-                assert!(g[i] == via_rowjet.g[i], "kernel g[{i}]: {} vs {}", g[i], via_rowjet.g[i]);
+                assert!(
+                    g[i] == via_rowjet.g[i],
+                    "kernel g[{i}]: {} vs {}",
+                    g[i],
+                    via_rowjet.g[i]
+                );
                 for j in 0..2 {
                     assert!(
                         h[i][j] == via_rowjet.h[i][j],
@@ -5068,18 +5155,9 @@ mod rowjet_bridge_tests {
         for &x in &[0.5_f64, 1.0, 2.0, 5.0] {
             let full = ln_gamma_derivative_stack(x);
             let ord2 = ln_gamma_derivative_stack_order2(x);
-            assert_eq!(
-                ord2[0], full[0],
-                "order2[0] != full[0] at x={x}"
-            );
-            assert_eq!(
-                ord2[1], full[1],
-                "order2[1] != full[1] at x={x}"
-            );
-            assert_eq!(
-                ord2[2], full[2],
-                "order2[2] != full[2] at x={x}"
-            );
+            assert_eq!(ord2[0], full[0], "order2[0] != full[0] at x={x}");
+            assert_eq!(ord2[1], full[1], "order2[1] != full[1] at x={x}");
+            assert_eq!(ord2[2], full[2], "order2[2] != full[2] at x={x}");
         }
     }
 
@@ -5092,7 +5170,8 @@ mod rowjet_bridge_tests {
             let dg = digamma_derivative_stack(x);
             for i in 0..4 {
                 assert_eq!(
-                    lg[i + 1], dg[i],
+                    lg[i + 1],
+                    dg[i],
                     "ln_gamma_stack[{}] != digamma_stack[{}] at x={x}",
                     i + 1,
                     i
@@ -5109,7 +5188,8 @@ mod rowjet_bridge_tests {
             let tg = trigamma_derivative_stack(x);
             for i in 0..4 {
                 assert_eq!(
-                    dg[i + 1], tg[i],
+                    dg[i + 1],
+                    tg[i],
                     "digamma_stack[{}] != trigamma_stack[{}] at x={x}",
                     i + 1,
                     i
@@ -5195,15 +5275,42 @@ mod contraction_symmetry_tests {
 
     fn perms3(idx: [usize; 3]) -> [[usize; 3]; 6] {
         let [a, b, c] = idx;
-        [[a, b, c], [a, c, b], [b, a, c], [b, c, a], [c, a, b], [c, b, a]]
+        [
+            [a, b, c],
+            [a, c, b],
+            [b, a, c],
+            [b, c, a],
+            [c, a, b],
+            [c, b, a],
+        ]
     }
     fn perms4(idx: [usize; 4]) -> [[usize; 4]; 24] {
         let [a, b, c, d] = idx;
         [
-            [a, b, c, d], [a, b, d, c], [a, c, b, d], [a, c, d, b], [a, d, b, c], [a, d, c, b],
-            [b, a, c, d], [b, a, d, c], [b, c, a, d], [b, c, d, a], [b, d, a, c], [b, d, c, a],
-            [c, a, b, d], [c, a, d, b], [c, b, a, d], [c, b, d, a], [c, d, a, b], [c, d, b, a],
-            [d, a, b, c], [d, a, c, b], [d, b, a, c], [d, b, c, a], [d, c, a, b], [d, c, b, a],
+            [a, b, c, d],
+            [a, b, d, c],
+            [a, c, b, d],
+            [a, c, d, b],
+            [a, d, b, c],
+            [a, d, c, b],
+            [b, a, c, d],
+            [b, a, d, c],
+            [b, c, a, d],
+            [b, c, d, a],
+            [b, d, a, c],
+            [b, d, c, a],
+            [c, a, b, d],
+            [c, a, d, b],
+            [c, b, a, d],
+            [c, b, d, a],
+            [c, d, a, b],
+            [c, d, b, a],
+            [d, a, b, c],
+            [d, a, c, b],
+            [d, b, a, c],
+            [d, b, c, a],
+            [d, c, a, b],
+            [d, c, b, a],
         ]
     }
 

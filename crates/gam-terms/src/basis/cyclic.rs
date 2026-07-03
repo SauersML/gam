@@ -235,11 +235,15 @@ mod closure_tests {
         let start = 0.0_f64;
         let period = std::f64::consts::TAU;
         let h = period / num_basis as f64;
-        let thetas =
-            Array1::from_iter((0..40).map(|i| (i as f64 + 0.3) / 40.0 * period));
-        let (b0, _) =
-            create_cyclic_bspline_basis_dense(thetas.view(), start, start + period, degree, num_basis)
-                .unwrap();
+        let thetas = Array1::from_iter((0..40).map(|i| (i as f64 + 0.3) / 40.0 * period));
+        let (b0, _) = create_cyclic_bspline_basis_dense(
+            thetas.view(),
+            start,
+            start + period,
+            degree,
+            num_basis,
+        )
+        .unwrap();
         let (b1, _) = create_cyclic_bspline_basis_dense(
             thetas.view(),
             start + h,

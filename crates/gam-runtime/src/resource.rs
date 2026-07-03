@@ -645,11 +645,8 @@ mod resource_policy_tests {
 
     #[test]
     fn for_problem_large_p_is_strict() {
-        let p = ResourcePolicy::for_problem(
-            100,
-            STRICT_POLICY_P_THRESHOLD,
-            ProblemHints::default(),
-        );
+        let p =
+            ResourcePolicy::for_problem(100, STRICT_POLICY_P_THRESHOLD, ProblemHints::default());
         assert_eq!(
             p.derivative_storage_mode,
             DerivativeStorageMode::AnalyticOperatorRequired
@@ -691,7 +688,10 @@ mod resource_policy_tests {
     fn material_policy_propagates_byte_limits() {
         let policy = ResourcePolicy::default_library();
         let mp = policy.material_policy();
-        assert_eq!(mp.max_single_dense_bytes, policy.max_single_materialization_bytes);
+        assert_eq!(
+            mp.max_single_dense_bytes,
+            policy.max_single_materialization_bytes
+        );
         assert_eq!(mp.max_cached_dense_bytes, policy.max_operator_cache_bytes);
         assert_eq!(mp.row_chunk_target_bytes, policy.row_chunk_target_bytes);
     }

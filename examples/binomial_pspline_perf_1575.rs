@@ -186,7 +186,10 @@ fn build_and_fit(n: usize, k: usize, firth: bool) {
         fit.edf_total().unwrap_or(f64::NAN),
         fit.outer_gradient_norm,
         fit.outer_converged,
-        fit.lambdas.iter().map(|l| format!("{l:.3e}")).collect::<Vec<_>>(),
+        fit.lambdas
+            .iter()
+            .map(|l| format!("{l:.3e}"))
+            .collect::<Vec<_>>(),
     );
 }
 

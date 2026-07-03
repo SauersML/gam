@@ -261,7 +261,11 @@ fn gamma_dispersion_jet_tower_matches_independent_fd_oracle() {
         let tower: Tower4<2> = generic_full_tower(&program, row).expect("gamma jet tower");
 
         // Value.
-        close(tower.v, fd_partial(fixture, 0, 0), &format!("row {row} value"));
+        close(
+            tower.v,
+            fd_partial(fixture, 0, 0),
+            &format!("row {row} value"),
+        );
 
         // Gradient: g[i] = ∂_{p_i} ℓ.
         for i in 0..2 {
@@ -380,8 +384,7 @@ fn gamma_dispersion_packed_scalars_match_dense_tower_contractions() {
         // TwoSeed: contracted fourth Σ_{cd} ℓ_{abcd}·u_c·v_d vs the dense t4.
         for (ui, u) in third_dirs.iter().enumerate() {
             let v = third_dirs[(ui + 1) % third_dirs.len()];
-            let fourth =
-                generic_fourth_contracted(&program, row, u, &v).expect("TwoSeed fourth");
+            let fourth = generic_fourth_contracted(&program, row, u, &v).expect("TwoSeed fourth");
             let truth = tower.fourth_contracted(u, &v);
             for i in 0..2 {
                 for j in 0..2 {
@@ -429,7 +432,11 @@ impl crate::jet_tower::RowNllProgramGeneric<2> for AffineComposeRow {
             .scale(self.c0)
             .add(&p[1].scale(self.c1))
             .add(&S::constant(self.c2));
-        Ok(if self.digamma { x.digamma() } else { x.ln_gamma() })
+        Ok(if self.digamma {
+            x.digamma()
+        } else {
+            x.ln_gamma()
+        })
     }
 }
 

@@ -127,45 +127,37 @@ mod tests {
 
     #[test]
     fn new_ok_for_valid_geometric() {
-        assert!(GumbelTemperatureSchedule::new(
-            1.0,
-            0.1,
-            ScheduleKind::Geometric { rate: 0.9 }
-        )
-        .is_ok());
+        assert!(
+            GumbelTemperatureSchedule::new(1.0, 0.1, ScheduleKind::Geometric { rate: 0.9 }).is_ok()
+        );
     }
 
     #[test]
     fn new_err_for_non_positive_tau_start() {
         assert!(GumbelTemperatureSchedule::new(0.0, 0.1, ScheduleKind::ReciprocalIter).is_err());
-        assert!(GumbelTemperatureSchedule::new(f64::NAN, 0.1, ScheduleKind::ReciprocalIter)
-            .is_err());
+        assert!(
+            GumbelTemperatureSchedule::new(f64::NAN, 0.1, ScheduleKind::ReciprocalIter).is_err()
+        );
     }
 
     #[test]
     fn new_err_for_tau_min_exceeds_tau_start() {
-        assert!(GumbelTemperatureSchedule::new(
-            0.5,
-            1.0,
-            ScheduleKind::Geometric { rate: 0.9 }
-        )
-        .is_err());
+        assert!(
+            GumbelTemperatureSchedule::new(0.5, 1.0, ScheduleKind::Geometric { rate: 0.9 })
+                .is_err()
+        );
     }
 
     #[test]
     fn new_err_for_geometric_rate_out_of_range() {
-        assert!(GumbelTemperatureSchedule::new(
-            1.0,
-            0.1,
-            ScheduleKind::Geometric { rate: 1.0 }
-        )
-        .is_err());
-        assert!(GumbelTemperatureSchedule::new(
-            1.0,
-            0.1,
-            ScheduleKind::Geometric { rate: 0.0 }
-        )
-        .is_err());
+        assert!(
+            GumbelTemperatureSchedule::new(1.0, 0.1, ScheduleKind::Geometric { rate: 1.0 })
+                .is_err()
+        );
+        assert!(
+            GumbelTemperatureSchedule::new(1.0, 0.1, ScheduleKind::Geometric { rate: 0.0 })
+                .is_err()
+        );
     }
 
     #[test]
@@ -192,12 +184,8 @@ mod tests {
 
     #[test]
     fn geometric_clamps_at_tau_min() {
-        let s = GumbelTemperatureSchedule::new(
-            1.0,
-            0.5,
-            ScheduleKind::Geometric { rate: 0.1 },
-        )
-        .unwrap();
+        let s = GumbelTemperatureSchedule::new(1.0, 0.5, ScheduleKind::Geometric { rate: 0.1 })
+            .unwrap();
         // 1.0 * 0.1^5 = 1e-5 < tau_min=0.5 → clamped
         assert!((s.current_tau(5) - 0.5).abs() < 1e-14);
     }
@@ -206,13 +194,15 @@ mod tests {
 
     #[test]
     fn linear_iter_zero_returns_tau_start() {
-        let s = GumbelTemperatureSchedule::new(2.0, 0.5, ScheduleKind::Linear { steps: 10 }).unwrap();
+        let s =
+            GumbelTemperatureSchedule::new(2.0, 0.5, ScheduleKind::Linear { steps: 10 }).unwrap();
         assert!((s.current_tau(0) - 2.0).abs() < 1e-14);
     }
 
     #[test]
     fn linear_at_steps_returns_tau_min() {
-        let s = GumbelTemperatureSchedule::new(2.0, 0.5, ScheduleKind::Linear { steps: 10 }).unwrap();
+        let s =
+            GumbelTemperatureSchedule::new(2.0, 0.5, ScheduleKind::Linear { steps: 10 }).unwrap();
         assert!((s.current_tau(10) - 0.5).abs() < 1e-14);
     }
 
@@ -253,7 +243,9 @@ mod tests {
 
     #[test]
     fn exponential_sweep_is_not_fixed_and_returns_values() {
-        let s = SearchStrategy::ExponentialSweep { values: vec![1.0, 2.0, 3.0] };
+        let s = SearchStrategy::ExponentialSweep {
+            values: vec![1.0, 2.0, 3.0],
+        };
         assert!(!s.is_fixed());
         assert_eq!(s.sweep_values().unwrap(), &[1.0, 2.0, 3.0]);
     }

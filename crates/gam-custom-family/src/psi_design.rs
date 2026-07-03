@@ -191,10 +191,7 @@ impl CustomFamilyPsiDerivativeOperator for EmbeddedImplicitPsiDerivativeOperator
 }
 
 impl MaterializablePsiDerivativeOperator for EmbeddedImplicitPsiDerivativeOperator {
-    fn materialize_first(
-        &self,
-        axis: usize,
-    ) -> Result<Array2<f64>, gam_terms::basis::BasisError> {
+    fn materialize_first(&self, axis: usize) -> Result<Array2<f64>, gam_terms::basis::BasisError> {
         Ok(EmbeddedColumnBlock::new(
             &self.base.materialize_first(axis)?,
             self.global_range.clone(),
@@ -549,7 +546,10 @@ impl CustomFamilyPsiDerivativeOperator for EmbeddedDensePsiDerivativeOperator {
                 v.len()
             )));
         }
-        Ok(self.embed_vector(gam_linalg::faer_ndarray::fast_atv(&self.second_diag_local, v)))
+        Ok(self.embed_vector(gam_linalg::faer_ndarray::fast_atv(
+            &self.second_diag_local,
+            v,
+        )))
     }
 
     fn transpose_mul_second_cross(
@@ -662,10 +662,7 @@ impl CustomFamilyPsiDerivativeOperator for EmbeddedDensePsiDerivativeOperator {
 }
 
 impl MaterializablePsiDerivativeOperator for EmbeddedDensePsiDerivativeOperator {
-    fn materialize_first(
-        &self,
-        axis: usize,
-    ) -> Result<Array2<f64>, gam_terms::basis::BasisError> {
+    fn materialize_first(&self, axis: usize) -> Result<Array2<f64>, gam_terms::basis::BasisError> {
         self.validate_axis(axis, "embedded dense psi materialize_first")?;
         Ok(
             EmbeddedColumnBlock::new(&self.first_local, self.global_range.clone(), self.total_p)
@@ -958,10 +955,7 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
 }
 
 impl MaterializablePsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator {
-    fn materialize_first(
-        &self,
-        axis: usize,
-    ) -> Result<Array2<f64>, gam_terms::basis::BasisError> {
+    fn materialize_first(&self, axis: usize) -> Result<Array2<f64>, gam_terms::basis::BasisError> {
         let base_mat = self.base.as_materializable().ok_or_else(|| {
             gam_terms::basis::BasisError::Other(
                 "rowwise kronecker psi operator: base operator does not support materialization"

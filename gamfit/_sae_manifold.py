@@ -2896,7 +2896,7 @@ def sae_manifold_fit_stagewise(
     alpha: float | str | None = None,
     tau: float | None = None,
     random_state: int = 0,
-    birth_callback: Any = None,
+    progress_callback: Any = None,
 ) -> StagewiseSAE:
     """Grow a curved SAE dictionary by Sequential Atom Composition (SAC).
 
@@ -2960,7 +2960,7 @@ def sae_manifold_fit_stagewise(
         fit's values (K-aware IBP α; τ = 0.5).
     random_state
         Seed forwarded to the K=1 seed fit's initializer.
-    birth_callback
+    progress_callback
         Optional callable invoked from the Rust stagewise driver with progress
         dictionaries. Durable events carry ``checkpoint_available=True`` and a
         compact ``checkpoint`` payload containing the current atoms, logits, and
@@ -3080,7 +3080,7 @@ def sae_manifold_fit_stagewise(
         max_factor_rank=int(max_factor_rank),
         structured_whitening=bool(structured_whitening),
         row_loss_weights=weights_arr,
-        birth_callback=birth_callback,
+        progress_callback=progress_callback,
     )
     return _stagewise_from_payload(dict(payload), x, seed_fit)
 

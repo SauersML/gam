@@ -1262,7 +1262,8 @@ pub(crate) fn blockwise_logdet_terms_with_workspace<
                     _ => Ok(Array1::from_elem(total, f64::NAN)),
                 }
             };
-            if total >= gam_solve::estimate::reml::jeffreys_subspace::CHEAP_CONDITIONING_PRECHECK_MIN_DIM
+            if total
+                >= gam_solve::estimate::reml::jeffreys_subspace::CHEAP_CONDITIONING_PRECHECK_MIN_DIM
             {
                 // Wide joint system: bound the spectrum from a few matvecs (no dense
                 // H, no O(p³) eigh).
@@ -1295,7 +1296,9 @@ pub(crate) fn blockwise_logdet_terms_with_workspace<
                             h[[r, a]] = col[r];
                         }
                     }
-                    gam_solve::estimate::reml::jeffreys_subspace::jeffreys_term_skippable_dense(h.view())
+                    gam_solve::estimate::reml::jeffreys_subspace::jeffreys_term_skippable_dense(
+                        h.view(),
+                    )
                 })()
                 .unwrap_or(false)
             }

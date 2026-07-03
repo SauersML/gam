@@ -109,8 +109,8 @@ fn underscore_param_names(param_list: &str) -> Vec<String> {
 fn joint_trust_metric_block_floor_has_no_underscore_param() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let path = root.join("crates/gam-models/src/survival/location_scale/family_solver.rs");
-    let src = fs::read_to_string(&path)
-        .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+    let src =
+        fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
 
     let params = parameter_list(&src, "joint_trust_metric_block_floor");
     let banned = underscore_param_names(&params);

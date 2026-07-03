@@ -122,7 +122,14 @@ impl ClosureFamily {
     /// is a reassociation, so it is *not* bit-identical to the old form; the
     /// gate is accuracy-vs-truth, not bit reproduction.
     #[inline]
-    fn write_row_jet(&self, s: f64, gamma: f64, value: &mut [f64], dg: &mut [f64], dgg: &mut [f64]) {
+    fn write_row_jet(
+        &self,
+        s: f64,
+        gamma: f64,
+        value: &mut [f64],
+        dg: &mut [f64],
+        dgg: &mut [f64],
+    ) {
         value[0] = 1.0;
         if self.harmonics == 0 {
             return;
@@ -702,7 +709,10 @@ mod tests {
             Dd { hi, lo: 0.0 }
         }
         fn neg(self) -> Dd {
-            Dd { hi: -self.hi, lo: -self.lo }
+            Dd {
+                hi: -self.hi,
+                lo: -self.lo,
+            }
         }
         fn add(self, o: Dd) -> Dd {
             let (s, e) = two_sum(self.hi, o.hi);
@@ -845,7 +855,10 @@ mod tests {
                 max_new <= 1.1 * max_old,
                 "H={h}: recurrence abs-err {max_new:.3e} worse than per-harmonic libm {max_old:.3e}"
             );
-            assert!(max_new < 1e-12, "H={h}: recurrence abs-err {max_new:.3e} exceeds 1e-12");
+            assert!(
+                max_new < 1e-12,
+                "H={h}: recurrence abs-err {max_new:.3e} exceeds 1e-12"
+            );
         }
     }
 
@@ -868,9 +881,21 @@ mod tests {
                 let (v, dgr, ddr) = fam.row_jet(si, gamma);
                 for j in 0..fam.raw_dim() {
                     assert_eq!(phi[[i, j]].to_bits(), v[j].to_bits(), "design v ({i},{j})");
-                    assert_eq!(pj[[i, j]].to_bits(), v[j].to_bits(), "design_jet v ({i},{j})");
-                    assert_eq!(dj[[i, j]].to_bits(), dgr[j].to_bits(), "design_jet dγ ({i},{j})");
-                    assert_eq!(ddj[[i, j]].to_bits(), ddr[j].to_bits(), "design_jet d²γ ({i},{j})");
+                    assert_eq!(
+                        pj[[i, j]].to_bits(),
+                        v[j].to_bits(),
+                        "design_jet v ({i},{j})"
+                    );
+                    assert_eq!(
+                        dj[[i, j]].to_bits(),
+                        dgr[j].to_bits(),
+                        "design_jet dγ ({i},{j})"
+                    );
+                    assert_eq!(
+                        ddj[[i, j]].to_bits(),
+                        ddr[j].to_bits(),
+                        "design_jet d²γ ({i},{j})"
+                    );
                 }
             }
         }

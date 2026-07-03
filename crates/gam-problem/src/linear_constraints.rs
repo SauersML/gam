@@ -48,7 +48,7 @@ impl LinearInequalityConstraints {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{array, Array1, Array2};
+    use ndarray::{Array1, Array2, array};
 
     #[test]
     fn new_ok_when_rows_match_b_len() {

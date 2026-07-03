@@ -15,14 +15,14 @@ use gam::families::survival::predict::{
 use gam::families::transformation_normal::{
     TRANSFORMATION_MONOTONICITY_EPS, transformation_normal_pit_score,
 };
-use gam::probability::standard_normal_quantile;
 use gam::inference::model::{
     FittedModel, FittedModelError, PredictModelClass, append_deployment_extension_columns,
 };
 use gam::linalg::utils::inf_norm;
 use gam::matrix::DesignMatrix;
-use gam::terms::smooth::build_term_collection_design;
+use gam::probability::standard_normal_quantile;
 use gam::term_builder::resolve_role_col;
+use gam::terms::smooth::build_term_collection_design;
 
 /// Typed errors emitted while assembling a [`PredictInput`] from a saved model.
 ///
@@ -301,12 +301,13 @@ fn transformation_normal_quantile_grid(
         .map_err(|e| PredictInputError::DimensionMismatch {
             reason: format!("beta reshape failed: {e}"),
         })?;
-    let cov_mat = design
-        .design
-        .try_row_chunk(0..n)
-        .map_err(|e| PredictInputError::InvalidInput {
-            reason: e.to_string(),
-        })?;
+    let cov_mat =
+        design
+            .design
+            .try_row_chunk(0..n)
+            .map_err(|e| PredictInputError::InvalidInput {
+                reason: e.to_string(),
+            })?;
     let calibration = payload
         .transformation_score_calibration
         .as_ref()
@@ -513,9 +514,8 @@ fn transformation_normal_conditional_mean(
     });
     if mean.iter().any(|value| !value.is_finite()) {
         return Err(PredictInputError::InvalidInput {
-            reason:
-                "transformation-normal conditional mean E[Y|x] produced non-finite values"
-                    .to_string(),
+            reason: "transformation-normal conditional mean E[Y|x] produced non-finite values"
+                .to_string(),
         });
     }
     Ok(mean)
@@ -771,10 +771,8 @@ fn build_predict_input_for_model_inner(
             // Probability space keeps every node inside the finite I-spline
             // support (no normal-tail truncation) and needs no Gauss–Hermite
             // weights.
-            let (grid_y, h_grid) =
-                transformation_normal_quantile_grid(model, &design, n, offset)?;
-            let conditional_mean =
-                transformation_normal_conditional_mean(&grid_y, &h_grid)?;
+            let (grid_y, h_grid) = transformation_normal_quantile_grid(model, &design, n, offset)?;
+            let conditional_mean = transformation_normal_conditional_mean(&grid_y, &h_grid)?;
             // The predictor passes the offset through unchanged as `eta` and
             // `mean`, so storing E[Y|x] here yields a y-independent response-scale
             // prediction for both columns on a covariate-only frame.

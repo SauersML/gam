@@ -204,10 +204,7 @@ mod tests {
     #[test]
     fn functional_variant_calls_evaluator() {
         let meta = array![0.0_f64];
-        let m = CoefficientPriorMean::functional(
-            meta,
-            Arc::new(|_| array![7.0_f64, 8.0]),
-        );
+        let m = CoefficientPriorMean::functional(meta, Arc::new(|_| array![7.0_f64, 8.0]));
         let v = m.evaluate(2, "ctx").unwrap();
         assert_eq!(v[0], 7.0);
         assert_eq!(v[1], 8.0);
@@ -216,11 +213,7 @@ mod tests {
     #[test]
     fn kernel_basis_scales_kernel_output() {
         let covs = array![0.0_f64];
-        let m = CoefficientPriorMean::kernel_basis(
-            covs,
-            2.0,
-            Arc::new(|_| array![1.0_f64, 3.0]),
-        );
+        let m = CoefficientPriorMean::kernel_basis(covs, 2.0, Arc::new(|_| array![1.0_f64, 3.0]));
         let v = m.evaluate(2, "ctx").unwrap();
         assert!((v[0] - 2.0).abs() < 1e-14);
         assert!((v[1] - 6.0).abs() < 1e-14);
@@ -229,11 +222,7 @@ mod tests {
     #[test]
     fn kernel_basis_nan_amplitude_returns_error() {
         let covs = array![0.0_f64];
-        let m = CoefficientPriorMean::kernel_basis(
-            covs,
-            f64::NAN,
-            Arc::new(|_| array![1.0_f64]),
-        );
+        let m = CoefficientPriorMean::kernel_basis(covs, f64::NAN, Arc::new(|_| array![1.0_f64]));
         assert!(m.evaluate(1, "ctx").is_err());
     }
 

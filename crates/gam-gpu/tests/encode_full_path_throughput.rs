@@ -46,7 +46,7 @@ use std::time::Instant;
 use ndarray::{Array1, Array2};
 
 use gam_gpu::device_runtime::GpuRuntime;
-use gam_gpu::encode_throughput::{encode_quality_metrics, FullEncodeThroughput};
+use gam_gpu::encode_throughput::{FullEncodeThroughput, encode_quality_metrics};
 use gam_gpu::policy::EncodeDeploymentDecision;
 use gam_gpu::{GpuError, GpuMode};
 
@@ -93,8 +93,7 @@ fn build_fixture(
     // the installed evaluator at chart centers; this is just the atom's initial
     // dictionary state).
     let n_seed = 64usize;
-    let seed: Array2<f64> =
-        Array2::from_shape_fn((n_seed, 1), |(i, _)| i as f64 / n_seed as f64);
+    let seed: Array2<f64> = Array2::from_shape_fn((n_seed, 1), |(i, _)| i as f64 / n_seed as f64);
     let (seed_phi, seed_jet) = evaluator.evaluate(seed.view()).unwrap();
     let m = seed_phi.ncols(); // 5: [1, sin2πt, cos2πt, sin4πt, cos4πt]
 

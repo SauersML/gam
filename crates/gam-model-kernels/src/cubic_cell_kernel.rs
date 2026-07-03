@@ -1243,16 +1243,14 @@ impl TailCellMomentCache {
 
         if !leader {
             let state = slot.wait().clone()?;
-            self.hits
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(state);
         }
 
         let state = evaluate_cell_moments_uncached(cell, max_degree);
         if let Ok(state) = &state {
             self.moments.insert(key, state.clone());
-            self.hits
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         self.misses
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

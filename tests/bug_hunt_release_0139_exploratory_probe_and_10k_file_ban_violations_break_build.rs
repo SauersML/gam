@@ -107,10 +107,7 @@ fn head_carries_no_build_aborting_scaffolding_ban_violations() {
         for (idx, raw) in bytes.split(|&b| b == b'\n').enumerate() {
             let code = strip_line_comment(raw);
             if contains(code, b"println!(") || contains(code, b"eprintln!(") {
-                offenders.push(format!(
-                    "[println! in src/ probe] {PROBE}:{}",
-                    idx + 1
-                ));
+                offenders.push(format!("[println! in src/ probe] {PROBE}:{}", idx + 1));
             }
         }
     }
@@ -121,9 +118,7 @@ fn head_carries_no_build_aborting_scaffolding_ban_violations() {
         // build.rs counts lines the same way `str::lines` does.
         let n_lines = String::from_utf8_lossy(&bytes).lines().count();
         if n_lines > 10_000 {
-            offenders.push(format!(
-                "[>10k lines] {BIG}: {n_lines} lines (limit 10000)"
-            ));
+            offenders.push(format!("[>10k lines] {BIG}: {n_lines} lines (limit 10000)"));
         }
     }
 
@@ -132,7 +127,11 @@ fn head_carries_no_build_aborting_scaffolding_ban_violations() {
     if let Some(bytes) = read(SD) {
         for (idx, raw) in bytes.split(|&b| b == b'\n').enumerate() {
             let code = strip_line_comment(raw);
-            let trimmed: Vec<u8> = code.iter().copied().skip_while(|b| b.is_ascii_whitespace()).collect();
+            let trimmed: Vec<u8> = code
+                .iter()
+                .copied()
+                .skip_while(|b| b.is_ascii_whitespace())
+                .collect();
             if trimmed.starts_with(b"#[ignore") {
                 offenders.push(format!("[#[ignore] test] {SD}:{}", idx + 1));
             }

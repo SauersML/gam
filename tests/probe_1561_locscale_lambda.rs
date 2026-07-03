@@ -73,7 +73,8 @@ fn run_case(label: &str, mean_formula: &str, noise_formula: &str, n: usize) -> f
             return f64::NAN;
         }
     };
-    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult { fit, .. }) = result else {
+    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult { fit, .. }) = result
+    else {
         eprintln!("[{label}] not a location-scale fit");
         return f64::NAN;
     };
@@ -95,7 +96,8 @@ fn run_case(label: &str, mean_formula: &str, noise_formula: &str, n: usize) -> f
     for (i, &t) in x.iter().enumerate() {
         grid[[i, 0]] = t;
     }
-    let mean_design = build_term_collection_design(grid.view(), &fit.meanspec_resolved).expect("md");
+    let mean_design =
+        build_term_collection_design(grid.view(), &fit.meanspec_resolved).expect("md");
     let scale_design =
         build_term_collection_design(grid.view(), &fit.noisespec_resolved).expect("sd");
     let gam_mu = mean_design.design.apply(&beta_loc).to_vec();
@@ -112,19 +114,24 @@ fn run_case(label: &str, mean_formula: &str, noise_formula: &str, n: usize) -> f
     let corr = pearson(&gam_log_sigma, &true_log_sigma);
     let rmse_ls = rmse(&gam_log_sigma, &true_log_sigma);
 
-    let (lambdas, log_lambdas, edf_by_block, edf_total) = if let Some(inf) = fit.fit.inference.as_ref()
-    {
-        (
-            fit.fit.lambdas.to_vec(),
-            fit.fit.log_lambdas.to_vec(),
-            inf.edf_by_block.clone(),
-            inf.edf_total,
-        )
-    } else {
-        (vec![], vec![], vec![], f64::NAN)
-    };
+    let (lambdas, log_lambdas, edf_by_block, edf_total) =
+        if let Some(inf) = fit.fit.inference.as_ref() {
+            (
+                fit.fit.lambdas.to_vec(),
+                fit.fit.log_lambdas.to_vec(),
+                inf.edf_by_block.clone(),
+                inf.edf_total,
+            )
+        } else {
+            (vec![], vec![], vec![], f64::NAN)
+        };
 
-    let fmt_vec = |v: &[f64]| v.iter().map(|x| format!("{x:.4}")).collect::<Vec<_>>().join(",");
+    let fmt_vec = |v: &[f64]| {
+        v.iter()
+            .map(|x| format!("{x:.4}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
     let lambdas_s = fmt_vec(&lambdas);
     let log_lambdas_s = fmt_vec(&log_lambdas);
     let edf_s = fmt_vec(&edf_by_block);

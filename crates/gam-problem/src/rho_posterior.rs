@@ -227,19 +227,16 @@ mod tests {
 
     #[test]
     fn from_k_hat_above_point_seven_is_escalate() {
-        assert_eq!(
-            RhoCertificate::from_k_hat(0.701),
-            RhoCertificate::Escalate
-        );
-        assert_eq!(
-            RhoCertificate::from_k_hat(10.0),
-            RhoCertificate::Escalate
-        );
+        assert_eq!(RhoCertificate::from_k_hat(0.701), RhoCertificate::Escalate);
+        assert_eq!(RhoCertificate::from_k_hat(10.0), RhoCertificate::Escalate);
     }
 
     #[test]
     fn from_k_hat_nan_is_escalate() {
-        assert_eq!(RhoCertificate::from_k_hat(f64::NAN), RhoCertificate::Escalate);
+        assert_eq!(
+            RhoCertificate::from_k_hat(f64::NAN),
+            RhoCertificate::Escalate
+        );
     }
 
     #[test]

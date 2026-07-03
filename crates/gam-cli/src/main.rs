@@ -99,13 +99,13 @@ pub(crate) use gam::report;
 
 pub(crate) use gam::probability::{normal_cdf, standard_normal_quantile};
 
+pub(crate) use gam::families::fit_orchestration::drivers::{
+    fit_term_collection_forspec, freeze_term_collection_from_design,
+};
 pub(crate) use gam::smooth::{
     BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, SmoothBasisSpec,
     SmoothStructureAnalysis, SmoothTermSpec, SpatialLengthScaleOptimizationOptions,
     TermCollectionSpec, analyze_smooth_ownership, smooth_term_feature_cols,
-};
-pub(crate) use gam::families::fit_orchestration::drivers::{
-    fit_term_collection_forspec, freeze_term_collection_from_design,
 };
 // #1521: relocated DOWN into gam_terms::smooth (was families::...::drivers).
 pub(crate) use gam::terms::smooth::build_term_collection_design;
@@ -130,9 +130,8 @@ pub(crate) use gam::families::survival::{
     parse_survival_likelihood_mode, parse_survival_time_basis_config, positive_survival_time_seed,
     require_structural_survival_time_basis, resolve_survival_marginal_slope_time_anchor_value,
     resolve_survival_time_anchor_value, resolve_survival_transformation_time_anchor_value,
-    resolved_survival_time_basis_config_from_build,
-    survival_baseline_targetname, survival_derivative_guard_for_likelihood,
-    survival_likelihood_modename,
+    resolved_survival_time_basis_config_from_build, survival_baseline_targetname,
+    survival_derivative_guard_for_likelihood, survival_likelihood_modename,
 };
 
 pub(crate) use gam::families::survival::location_scale::{

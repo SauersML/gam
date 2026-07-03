@@ -23,11 +23,7 @@ fn run(n: usize) {
     let headers = ["x1", "x2", "y"].into_iter().map(String::from).collect();
     let rows: Vec<csv::StringRecord> = (0..n)
         .map(|i| {
-            csv::StringRecord::from(vec![
-                x1[i].to_string(),
-                x2[i].to_string(),
-                y[i].to_string(),
-            ])
+            csv::StringRecord::from(vec![x1[i].to_string(), x2[i].to_string(), y[i].to_string()])
         })
         .collect();
     let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode");

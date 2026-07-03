@@ -269,8 +269,7 @@ fn col_major_to_row_major_parallel(
             }
         });
 
-    Array2::from_shape_vec((rows, cols), out_flat)
-        .expect("row-major buffer has rows*cols elements")
+    Array2::from_shape_vec((rows, cols), out_flat).expect("row-major buffer has rows*cols elements")
 }
 
 /// RAII handle for a *cacheable* page-locked (pinned) host `f64` buffer.
@@ -295,8 +294,7 @@ impl PinnedF64 {
     /// Allocate `len` cacheable pinned `f64`s. Binds the context to the
     /// calling thread first (required before any driver allocation call).
     fn alloc(ctx: &Arc<CudaContext>, len: usize) -> Result<Self, GpuError> {
-        ctx.bind_to_thread()
-            .gpu_ctx("PinnedF64 bind_to_thread")?;
+        ctx.bind_to_thread().gpu_ctx("PinnedF64 bind_to_thread")?;
         let bytes = len
             .checked_mul(std::mem::size_of::<f64>())
             .ok_or_else(|| gam_gpu::gpu_err!("PinnedF64: len={len} byte size overflows usize"))?;

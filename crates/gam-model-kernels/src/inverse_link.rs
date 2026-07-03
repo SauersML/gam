@@ -164,8 +164,8 @@ pub fn apply_inverse_link_spec_vec(
     for &e in eta {
         let (mu, _d1) = gam_solve::mixture_link::inverse_link_mu_d1_for_inverse_link(link, e)
             .map_err(|err| {
-            format!("failed to evaluate parameterized inverse link at eta={e}: {err}")
-        })?;
+                format!("failed to evaluate parameterized inverse link at eta={e}: {err}")
+            })?;
         out.push(mu);
     }
     Ok(out)
@@ -174,10 +174,10 @@ pub fn apply_inverse_link_spec_vec(
 #[cfg(test)]
 mod tests {
     use super::{apply_inverse_link_spec_vec, apply_inverse_link_vec};
-    use gam_solve::mixture_link::inverse_link_mu_d1_for_inverse_link;
     use gam_problem::{
         InverseLink, LatentCLogLogState, LinkComponent, MixtureLinkSpec, StandardLink,
     };
+    use gam_solve::mixture_link::inverse_link_mu_d1_for_inverse_link;
 
     /// The public log inverse link is the EXACT `exp(η)`, never the solver's
     /// `η.clamp(−700, 700).exp()` conditioning transform. This pins the contract
@@ -398,7 +398,10 @@ mod tests {
         let etas = [-10.0_f64, -2.0, -0.5, 0.0, 0.5, 2.0, 10.0];
         let out = apply_inverse_link_vec(&etas, "logit").expect("logit");
         for (i, &v) in out.iter().enumerate() {
-            assert!(v > 0.0 && v < 1.0, "logit output {v} out of (0,1) at index {i}");
+            assert!(
+                v > 0.0 && v < 1.0,
+                "logit output {v} out of (0,1) at index {i}"
+            );
         }
         for w in out.windows(2) {
             assert!(w[1] > w[0], "logit not monotone: {} >= {}", w[0], w[1]);
@@ -417,7 +420,11 @@ mod tests {
         for &eta in &[0.5_f64, 1.0, 2.5, 5.0] {
             let pos = apply_inverse_link_vec(&[eta], "probit").expect("probit")[0];
             let neg = apply_inverse_link_vec(&[-eta], "probit").expect("probit")[0];
-            assert!((pos + neg - 1.0).abs() < 1e-14, "Φ({eta})+Φ(-{eta})={}", pos + neg);
+            assert!(
+                (pos + neg - 1.0).abs() < 1e-14,
+                "Φ({eta})+Φ(-{eta})={}",
+                pos + neg
+            );
         }
     }
 
@@ -425,7 +432,7 @@ mod tests {
     fn cloglog_at_zero_is_one_minus_exp_neg_one() {
         // μ = 1 − exp(−exp(0)) = 1 − exp(−1) ≈ 0.6321.
         let out = apply_inverse_link_vec(&[0.0], "cloglog").expect("cloglog");
-        let expected = 1.0 - (-1.0_f64).exp();  // 1 − e^{-1} ≈ 0.6321
+        let expected = 1.0 - (-1.0_f64).exp(); // 1 − e^{-1} ≈ 0.6321
         assert!((out[0] - expected).abs() < 1e-15, "cloglog(0) = {}", out[0]);
     }
 
@@ -436,10 +443,18 @@ mod tests {
         let eta = -50.0_f64;
         let out = apply_inverse_link_vec(&[eta], "cloglog").expect("cloglog");
         let approx = (-eta.exp()).exp_m1().abs(); // |expm1(-exp(-50))| ≈ exp(-50)
-        assert!(out[0] < 1e-20, "cloglog(-50) must be very small, got {}", out[0]);
+        assert!(
+            out[0] < 1e-20,
+            "cloglog(-50) must be very small, got {}",
+            out[0]
+        );
         // Must be in (0, 1) — not exactly 0 (which the clamp would have forced for
         // even deeper inputs).
-        assert!(out[0] > 0.0, "cloglog(-50) must be positive, got {}", out[0]);
+        assert!(
+            out[0] > 0.0,
+            "cloglog(-50) must be positive, got {}",
+            out[0]
+        );
         assert!(approx < 1e-20, "sanity: approx={approx}");
     }
 
@@ -450,15 +465,24 @@ mod tests {
         let eta = [-40.0_f64, -3.0, -1.0, 0.0, 1.0, 3.0, 40.0];
         let out = apply_inverse_link_vec(&eta, "loglog").expect("loglog");
         for (i, &e) in eta.iter().enumerate() {
-            let jet =
-                inverse_link_mu_d1_for_inverse_link(&InverseLink::Standard(StandardLink::LogLog), e)
-                    .expect("solver jet");
+            let jet = inverse_link_mu_d1_for_inverse_link(
+                &InverseLink::Standard(StandardLink::LogLog),
+                e,
+            )
+            .expect("solver jet");
             assert_eq!(out[i], jet.0, "loglog row {i} must equal the solver mean");
-            assert!(out[i] >= 0.0 && out[i] <= 1.0, "loglog mu out of [0,1]: {}", out[i]);
+            assert!(
+                out[i] >= 0.0 && out[i] <= 1.0,
+                "loglog mu out of [0,1]: {}",
+                out[i]
+            );
         }
         // η = 0 ⇒ μ = exp(−1) ≈ 0.3679; strictly increasing; correct tail limits.
         let at_zero = apply_inverse_link_vec(&[0.0], "loglog").expect("loglog")[0];
-        assert!((at_zero - (-1.0_f64).exp()).abs() < 1e-15, "loglog(0) = {at_zero}");
+        assert!(
+            (at_zero - (-1.0_f64).exp()).abs() < 1e-15,
+            "loglog(0) = {at_zero}"
+        );
         for w in out.windows(2) {
             assert!(w[1] > w[0], "loglog not monotone: {} >= {}", w[0], w[1]);
         }
@@ -471,23 +495,36 @@ mod tests {
         let eta = [-5.0_f64, -1.0, 0.0, 1.0, 5.0];
         let out = apply_inverse_link_vec(&eta, "cauchit").expect("cauchit");
         for (i, &e) in eta.iter().enumerate() {
-            let jet =
-                inverse_link_mu_d1_for_inverse_link(&InverseLink::Standard(StandardLink::Cauchit), e)
-                    .expect("solver jet");
+            let jet = inverse_link_mu_d1_for_inverse_link(
+                &InverseLink::Standard(StandardLink::Cauchit),
+                e,
+            )
+            .expect("solver jet");
             assert_eq!(out[i], jet.0, "cauchit row {i} must equal the solver mean");
-            assert!(out[i] > 0.0 && out[i] < 1.0, "cauchit mu out of (0,1): {}", out[i]);
+            assert!(
+                out[i] > 0.0 && out[i] < 1.0,
+                "cauchit mu out of (0,1): {}",
+                out[i]
+            );
         }
         assert!((out[2] - 0.5).abs() < 1e-15, "cauchit(0) = {}", out[2]);
         for &e in &[0.5_f64, 1.0, 3.0] {
             let pos = apply_inverse_link_vec(&[e], "cauchit").expect("cauchit")[0];
             let neg = apply_inverse_link_vec(&[-e], "cauchit").expect("cauchit")[0];
-            assert!((pos + neg - 1.0).abs() < 1e-14, "cauchit symmetry at {e}: {}", pos + neg);
+            assert!(
+                (pos + neg - 1.0).abs() < 1e-14,
+                "cauchit symmetry at {e}: {}",
+                pos + neg
+            );
         }
     }
 
     #[test]
     fn unknown_family_kind_returns_error() {
         let err = apply_inverse_link_vec(&[0.0], "gamma").unwrap_err();
-        assert!(err.contains("family_kind"), "error should mention family_kind: {err}");
+        assert!(
+            err.contains("family_kind"),
+            "error should mention family_kind: {err}"
+        );
     }
 }

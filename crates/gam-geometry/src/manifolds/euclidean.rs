@@ -166,7 +166,12 @@ mod tests {
         let q = m.exp_map(p.view(), v.view()).unwrap();
         let v2 = m.log_map(p.view(), q.view()).unwrap();
         for i in 0..3 {
-            assert!((v2[i] - v[i]).abs() < 1e-14, "dim {i}: {} vs {}", v2[i], v[i]);
+            assert!(
+                (v2[i] - v[i]).abs() < 1e-14,
+                "dim {i}: {} vs {}",
+                v2[i],
+                v[i]
+            );
         }
     }
 

@@ -1,5 +1,5 @@
-use crate::basis::analyze_penalty_block;
 use crate::EstimationError;
+use crate::basis::analyze_penalty_block;
 use crate::smooth::PenaltyStructureHint;
 use faer::linalg::matmul::matmul;
 use faer::{Accum, Mat, MatRef, Par, Side};
@@ -1013,9 +1013,7 @@ impl CanonicalPenalty {
     }
 
     /// Convert to a PenaltyCoordinate for the unified REML evaluator.
-    pub fn to_penalty_coordinate(
-        &self,
-    ) -> gam_problem::PenaltyCoordinate {
+    pub fn to_penalty_coordinate(&self) -> gam_problem::PenaltyCoordinate {
         use gam_problem::PenaltyCoordinate;
         if self.is_block_local() {
             PenaltyCoordinate::from_block_root_with_mean(
@@ -2908,8 +2906,8 @@ mod tests {
         classify_eigenvalues_strict, precompute_reparam_invariant_from_canonical,
         report_penalty_pair_redundancy, stable_reparameterizationwith_invariant,
     };
-    use crate::construction::kronecker_product;
     use crate::EstimationError;
+    use crate::construction::kronecker_product;
     use faer::Mat;
     use gam_linalg::faer_ndarray::FaerEigh;
     use gam_linalg::utils::inf_norm;

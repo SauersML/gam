@@ -102,15 +102,19 @@ pub fn init_parallelism() {
         // process-level registries so gam-solve's REML/custom-family paths can
         // call THROUGH them without a back-edge into the inference SCC. First
         // writer wins; ignore the boxed-value `Err` of a redundant re-init.
-        drop(gam_problem::laplace_sampler_contract::set_laplace_marginal_sampler(Box::new(
-            gam_inference::hmc_io::HmcIoLaplaceMarginalSampler,
-        )));
-        drop(gam_problem::laplace_sampler_contract::set_gaussian_mode_posterior_sampler(
-            Box::new(gam_inference::hmc_io::HmcIoGaussianModePosteriorSampler),
+        drop(
+            gam_problem::laplace_sampler_contract::set_laplace_marginal_sampler(Box::new(
+                gam_inference::hmc_io::HmcIoLaplaceMarginalSampler,
+            )),
+        );
+        drop(
+            gam_problem::laplace_sampler_contract::set_gaussian_mode_posterior_sampler(Box::new(
+                gam_inference::hmc_io::HmcIoGaussianModePosteriorSampler,
+            )),
+        );
+        drop(gam_problem::rho_posterior::set_rho_posterior_escalator(
+            Box::new(gam_inference::rho_posterior::HmcIoRhoPosteriorEscalator),
         ));
-        drop(gam_problem::rho_posterior::set_rho_posterior_escalator(Box::new(
-            gam_inference::rho_posterior::HmcIoRhoPosteriorEscalator,
-        )));
         // Ignore the error returned when the global pool was already built by
         // an earlier caller: we cannot resize an existing pool, and the only
         // path that strictly needs the wide stack (the CLI) reaches this first.
@@ -133,23 +137,23 @@ mod gpu_dispatch_registration_tests {
 }
 
 pub use gam_config as config_resolve;
-pub use gam_models as families;
 pub use gam_geometry as geometry;
 pub use gam_gpu as gpu;
 pub use gam_identifiability as identifiability;
 pub use gam_inference as inference;
 pub use gam_linalg as linalg;
+pub use gam_models as families;
 pub mod model_types;
 /// Lower-layer outer-iteration row-subsampling/chunking primitives (RowSet,
 /// ARROW_ROW_CHUNK). Hosted at the crate root so `families` can name them
 /// without importing up into `solver`.
 pub mod outer_subsample;
+pub use gam_report as report;
 /// Lower-layer Pareto-smoothed importance-sampling primitive. Self-contained
 /// (no solver/inference deps); descended into `gam-solve` (#1521) and
 /// re-exported here so existing `crate::psis` / `gam::psis` callers (including
 /// `inference::{rho_posterior, model_comparison}`) resolve it downward.
 pub use gam_solve::psis;
-pub use gam_report as report;
 /// Lower-layer ρ-uncertainty (PSIS-on-ρ) diagnostic. Depends only on the
 /// lower-layer `psis`; descended into `gam-solve` (#1521) and re-exported here
 /// so the public `gam::rho_uncertainty` path is preserved.
@@ -172,8 +176,8 @@ pub mod solver {
     }
 }
 pub mod terms {
-    pub use gam_terms::*;
     pub use gam_sae as sae;
+    pub use gam_terms::*;
     // #1521 carve compatibility: the SAE manifold public API used to live
     // flatly under `gam::terms` before the manifold engine was split into the
     // `gam-sae` crate. Roughly thirty integration tests (and downstream code)
@@ -312,8 +316,10 @@ pub mod smooth {
 
 pub use families::custom_family;
 pub use families::gamlss;
+pub use families::protocol::{
+    LatentScoreSemantics, MarginalSlopeCalibrationProtocol, SurvivalMarginalSlopeProtocol,
+};
 pub use families::transformation_normal;
-pub use gpu::GpuDeviceInfo;
 pub use gam_models::fit_orchestration::{
     BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest, CrossFitScoreCalibration,
     CtnStage1Recipe, DispersionLocationScaleFitRequest, DispersionLocationScaleFitResult,
@@ -328,6 +334,4 @@ pub use gam_models::fit_orchestration::{
     is_binary_response, materialize, prepare_survival_time_stack, residual_cascade_fast_path,
     resolve_family, resolve_offset_column, resolve_weight_column, spline_scan_fast_path,
 };
-pub use families::protocol::{
-    LatentScoreSemantics, MarginalSlopeCalibrationProtocol, SurvivalMarginalSlopeProtocol,
-};
+pub use gpu::GpuDeviceInfo;

@@ -5,11 +5,11 @@ pub mod linalg;
 pub mod posterior_bands;
 
 pub use conformal::*;
-pub use posterior_bands::*;
 pub use gam::inference::dispersion_cov::se_from_covariance;
 pub use gam::inference::predict_io::{
     BernoulliMarginalSlopePredictor, PredictInput, PredictResult,
 };
+pub use posterior_bands::*;
 
 use crate::binomial_location_scale::BinomialLocationScalePredictor;
 // Surface the per-family predictors at the crate root so callers (integration

@@ -198,7 +198,7 @@ use gam_linalg::faer_ndarray::FaerArrayView;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{array, Array1, Array2};
+    use ndarray::{Array1, Array2, array};
 
     // ── should_use_faer_matmul ────────────────────────────────────────────────
 

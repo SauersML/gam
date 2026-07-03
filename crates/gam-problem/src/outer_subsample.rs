@@ -371,9 +371,21 @@ mod tests {
     #[test]
     fn weighted_rows_sorts_and_deduplicates() {
         let rows = vec![
-            WeightedOuterRow { index: 3, weight: 2.0, stratum: 0 },
-            WeightedOuterRow { index: 1, weight: 1.0, stratum: 0 },
-            WeightedOuterRow { index: 3, weight: 2.0, stratum: 0 }, // duplicate
+            WeightedOuterRow {
+                index: 3,
+                weight: 2.0,
+                stratum: 0,
+            },
+            WeightedOuterRow {
+                index: 1,
+                weight: 1.0,
+                stratum: 0,
+            },
+            WeightedOuterRow {
+                index: 3,
+                weight: 2.0,
+                stratum: 0,
+            }, // duplicate
         ];
         let s = OuterScoreSubsample::from_weighted_rows(rows, 10, 42);
         assert_eq!(s.len(), 2);
@@ -384,8 +396,16 @@ mod tests {
     #[test]
     fn weighted_rows_weight_scale_is_average_weight() {
         let rows = vec![
-            WeightedOuterRow { index: 0, weight: 1.0, stratum: 0 },
-            WeightedOuterRow { index: 1, weight: 3.0, stratum: 0 },
+            WeightedOuterRow {
+                index: 0,
+                weight: 1.0,
+                stratum: 0,
+            },
+            WeightedOuterRow {
+                index: 1,
+                weight: 3.0,
+                stratum: 0,
+            },
         ];
         let s = OuterScoreSubsample::from_weighted_rows(rows, 10, 0);
         assert!((s.weight_scale - 2.0).abs() < 1e-14);
@@ -402,8 +422,16 @@ mod tests {
     #[test]
     fn has_variable_weights_true_for_mixed() {
         let rows = vec![
-            WeightedOuterRow { index: 0, weight: 1.0, stratum: 0 },
-            WeightedOuterRow { index: 1, weight: 2.0, stratum: 0 },
+            WeightedOuterRow {
+                index: 0,
+                weight: 1.0,
+                stratum: 0,
+            },
+            WeightedOuterRow {
+                index: 1,
+                weight: 2.0,
+                stratum: 0,
+            },
         ];
         let s = OuterScoreSubsample::from_weighted_rows(rows, 5, 0);
         assert!(s.has_variable_weights());
@@ -414,12 +442,8 @@ mod tests {
     #[test]
     fn row_set_all_sums_indices_zero_to_n() {
         let rs = RowSet::All;
-        let sum: f64 = rs.par_reduce_fold(
-            5,
-            || 0.0_f64,
-            |acc, i, w| acc + i as f64 * w,
-            |a, b| a + b,
-        );
+        let sum: f64 =
+            rs.par_reduce_fold(5, || 0.0_f64, |acc, i, w| acc + i as f64 * w, |a, b| a + b);
         // 1*0 + 1*1 + 1*2 + 1*3 + 1*4 = 10
         assert!((sum - 10.0).abs() < 1e-14);
     }
@@ -427,16 +451,20 @@ mod tests {
     #[test]
     fn row_set_subsample_applies_per_row_weight() {
         let rows = Arc::new(vec![
-            WeightedOuterRow { index: 2, weight: 3.0, stratum: 0 },
-            WeightedOuterRow { index: 5, weight: 2.0, stratum: 0 },
+            WeightedOuterRow {
+                index: 2,
+                weight: 3.0,
+                stratum: 0,
+            },
+            WeightedOuterRow {
+                index: 5,
+                weight: 2.0,
+                stratum: 0,
+            },
         ]);
         let rs = RowSet::Subsample { rows, n_full: 10 };
-        let sum: f64 = rs.par_reduce_fold(
-            10,
-            || 0.0_f64,
-            |acc, i, w| acc + w * i as f64,
-            |a, b| a + b,
-        );
+        let sum: f64 =
+            rs.par_reduce_fold(10, || 0.0_f64, |acc, i, w| acc + w * i as f64, |a, b| a + b);
         // 3.0 * 2 + 2.0 * 5 = 6 + 10 = 16
         assert!((sum - 16.0).abs() < 1e-14);
     }

@@ -807,12 +807,18 @@ mod tests {
 
     #[test]
     fn cost_gated_iter_passes_through_when_has_outer_hessian() {
-        assert_eq!(cost_gated_first_order_max_iter(100, 1_000_000_000, true), 100);
+        assert_eq!(
+            cost_gated_first_order_max_iter(100, 1_000_000_000, true),
+            100
+        );
     }
 
     #[test]
     fn cost_gated_iter_passes_through_at_one_iteration() {
-        assert_eq!(cost_gated_first_order_max_iter(1, 1_000_000_000_000, false), 1);
+        assert_eq!(
+            cost_gated_first_order_max_iter(1, 1_000_000_000_000, false),
+            1
+        );
     }
 
     #[test]

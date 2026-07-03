@@ -6,11 +6,12 @@
 //! the crate library rather than the in-crate unit-test harness.
 
 use gam_terms::basis::{
-    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, OneDimensionalBoundary,
+    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisMetadata,
+    OneDimensionalBoundary,
 };
 use gam_terms::smooth::{
-    build_term_collection_derivative_design, build_term_collection_design, ShapeConstraint,
-    SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec,
+    ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec,
+    build_term_collection_derivative_design, build_term_collection_design,
 };
 use ndarray::{Array2, ArrayView2};
 

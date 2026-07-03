@@ -166,7 +166,9 @@ fn cyclic_smooth_fit_is_invariant_to_period_origin_1593() {
     ];
 
     // A dense shared physical-angle grid spanning the whole circle.
-    let grid_angles: Vec<f64> = (0..120).map(|i| (i as f64 + 0.5) / 120.0 * TWO_PI).collect();
+    let grid_angles: Vec<f64> = (0..120)
+        .map(|i| (i as f64 + 0.5) / 120.0 * TWO_PI)
+        .collect();
 
     let mut worst_rel = 0.0_f64;
     let mut worst_seed = 0_u64;

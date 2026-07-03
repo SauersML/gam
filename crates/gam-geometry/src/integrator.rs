@@ -119,13 +119,20 @@ mod tests {
         let m = EuclideanManifold::new(3);
         let p = array![1.0_f64, 2.0]; // wrong length
         let v = array![0.0_f64, 0.0, 0.0];
-        assert!(integrator_default().integrate(&m, p.view(), v.view()).is_err());
+        assert!(
+            integrator_default()
+                .integrate(&m, p.view(), v.view())
+                .is_err()
+        );
     }
 
     #[test]
     fn single_step_integrator_still_recovers_euclidean_geodesic() {
         let m = EuclideanManifold::new(2);
-        let g = GeodesicIntegrator { steps: 1, step_size: 1.0 };
+        let g = GeodesicIntegrator {
+            steps: 1,
+            step_size: 1.0,
+        };
         let p = array![0.0_f64, 0.0];
         let v = array![2.0_f64, -3.0];
         let result = g.integrate(&m, p.view(), v.view()).unwrap();

@@ -130,8 +130,7 @@ fn pyffi_every_pyfunction_is_registered_once() {
 fn pyffi_include_fragments() -> Vec<String> {
     const SRC_DIR: &str = "crates/gam-pyffi/src";
     let lib_rs = format!("{SRC_DIR}/lib.rs");
-    let lib_src =
-        fs::read_to_string(&lib_rs).unwrap_or_else(|e| panic!("read {lib_rs}: {e}"));
+    let lib_src = fs::read_to_string(&lib_rs).unwrap_or_else(|e| panic!("read {lib_rs}: {e}"));
 
     let needle = "include!(\"";
     let mut fragments = Vec::new();

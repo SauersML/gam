@@ -360,7 +360,10 @@ mod tests {
     fn validate_simplex_array_non_finite_is_error() {
         let m = array![[0.5_f64, f64::NAN]];
         let err = validate_simplex_array(m.view()).unwrap_err();
-        assert!(err.contains("finite"), "error should mention finite, got: {err}");
+        assert!(
+            err.contains("finite"),
+            "error should mention finite, got: {err}"
+        );
     }
 
     // ── closure ───────────────────────────────────────────────────────────────
@@ -369,8 +372,16 @@ mod tests {
     fn closure_normalizes_rows_to_sum_one() {
         let m = array![[1.0_f64, 2.0, 3.0], [4.0, 4.0, 4.0]];
         let c = closure(m.view()).unwrap();
-        assert!((c.row(0).sum() - 1.0).abs() < 1e-14, "row 0 sum: {}", c.row(0).sum());
-        assert!((c.row(1).sum() - 1.0).abs() < 1e-14, "row 1 sum: {}", c.row(1).sum());
+        assert!(
+            (c.row(0).sum() - 1.0).abs() < 1e-14,
+            "row 0 sum: {}",
+            c.row(0).sum()
+        );
+        assert!(
+            (c.row(1).sum() - 1.0).abs() < 1e-14,
+            "row 1 sum: {}",
+            c.row(1).sum()
+        );
     }
 
     #[test]
@@ -391,7 +402,10 @@ mod tests {
     fn closure_zero_total_mass_is_error() {
         let m = array![[0.0_f64, 0.0]];
         let err = closure(m.view()).unwrap_err();
-        assert!(err.contains("total mass") || err.contains("positive"), "got: {err}");
+        assert!(
+            err.contains("total mass") || err.contains("positive"),
+            "got: {err}"
+        );
     }
 
     // ── resolve_reference ─────────────────────────────────────────────────────
@@ -429,7 +443,11 @@ mod tests {
         let m = array![[1.0_f64, 2.0, 3.0], [4.0, 1.0, 1.0]];
         let c = clr(m.view()).unwrap();
         for row in c.rows() {
-            assert!(row.sum().abs() < 1e-12, "clr row must sum to zero, got {}", row.sum());
+            assert!(
+                row.sum().abs() < 1e-12,
+                "clr row must sum to zero, got {}",
+                row.sum()
+            );
         }
     }
 

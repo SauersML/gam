@@ -2737,7 +2737,12 @@ mod tests {
 
     #[test]
     fn projected_headers_selects_by_index() {
-        let all = vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()];
+        let all = vec![
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "d".to_string(),
+        ];
         let selected = projected_headers(&all, &[1, 3]);
         assert_eq!(selected, vec!["b".to_string(), "d".to_string()]);
     }

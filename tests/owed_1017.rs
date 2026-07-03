@@ -34,13 +34,13 @@
 //! Uses only the public crate API.
 
 use gam::gpu::GpuRuntime;
-use gam::solver::gpu_kernels::arrow_schur::{
-    ResidentArrowFrameHandle, solve_arrow_newton_step_dense_reference,
-};
 use gam::gpu::policy::GpuDispatchPolicy;
 use gam::solver::arrow_schur::{
     ArrowSchurSystem, ArrowSolveOptions, solve_arrow_newton_step_core,
     solve_with_lm_escalation_inner,
+};
+use gam::solver::gpu_kernels::arrow_schur::{
+    ResidentArrowFrameHandle, solve_arrow_newton_step_dense_reference,
 };
 use ndarray::{Array1, Array2};
 

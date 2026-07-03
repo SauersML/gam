@@ -54,9 +54,9 @@ pub mod schedule;
 // traits so gam-solve can call up-tier work (NUTS sampling, topology verdicts)
 // without a back-edge into gam-inference/gam-sae; computation stays UP.
 pub mod laplace_sampler_contract;
-pub mod topology_certificates;
 mod seeding;
 pub mod solver_contract;
+pub mod topology_certificates;
 pub mod types;
 
 pub use riemannian_retraction::LatentRetractionRegistry;
@@ -100,7 +100,9 @@ pub use custom_family_blockwise::{
 };
 pub use custom_family_error::CustomFamilyError;
 pub use dispersion::Dispersion;
-pub use dispersion_cov::{DispersionExt, PhiScaledCovariance, UnscaledPrecision, se_from_covariance};
+pub use dispersion_cov::{
+    DispersionExt, PhiScaledCovariance, UnscaledPrecision, se_from_covariance,
+};
 pub use estimation_error::EstimationError;
 pub use execution_path::ExecutionPath;
 pub use family_options::{ExactNewtonOuterObjective, ExactOuterDerivativeOrder};
@@ -124,8 +126,9 @@ pub use penalty_coordinate::PenaltyCoordinate;
 pub use penalty_matrix::PenaltyMatrix;
 pub use pseudo_logdet::PseudoLogdetMode;
 pub use psi_design_contract::{
-    CustomFamilyBlockPsiDerivative, CustomFamilyPsiDerivativeOperator, JointHessianSourcePreference,
-    MaterializablePsiDerivativeOperator, MaterializationIntent, SharedDerivativeBlocks,
+    CustomFamilyBlockPsiDerivative, CustomFamilyPsiDerivativeOperator,
+    JointHessianSourcePreference, MaterializablePsiDerivativeOperator, MaterializationIntent,
+    SharedDerivativeBlocks,
 };
 pub use psi_terms::{
     ExactNewtonJointPsiSecondOrderContracted, ExactNewtonJointPsiSecondOrderTerms,

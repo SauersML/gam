@@ -14,8 +14,8 @@
 //! trips if the count-family outer loop blows up. It does NOT depend on
 //! R / mgcv.
 
-use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula};
 use csv::StringRecord;
+use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Gamma, Poisson, Uniform};
@@ -110,9 +110,9 @@ fn poisson_gamma_single_smooth_outer_work_1690() {
         // (|g|=0.2297 < bound≈0.330) but was mislabelled non-converged off a noisy
         // in-loop gradient readout. Asserting the reported gradient clears the
         // bound locks the fix to a real stationarity certificate, not a flag flip.
-        let grad_norm = fit
-            .outer_gradient_norm
-            .unwrap_or_else(|| panic!("{family}: converged fit must report an outer gradient norm"));
+        let grad_norm = fit.outer_gradient_norm.unwrap_or_else(|| {
+            panic!("{family}: converged fit must report an outer gradient norm")
+        });
         let score_relative_bound = (1.0e-3 * (1.0 + fit.reml_score.abs())).min(1.0);
         assert!(
             grad_norm.is_finite() && grad_norm <= score_relative_bound,

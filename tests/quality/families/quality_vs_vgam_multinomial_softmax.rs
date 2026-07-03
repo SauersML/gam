@@ -613,7 +613,11 @@ fn gam_multinomial_softmax_heterogeneous_smoothness_beats_fixed_df() {
     );
 
     let gam_probs = predict_multinomial_formula(&model, &ds).expect("gam predict probabilities");
-    assert_eq!(gam_probs.dim(), (N_HETERO, K), "gam probability matrix shape");
+    assert_eq!(
+        gam_probs.dim(),
+        (N_HETERO, K),
+        "gam probability matrix shape"
+    );
 
     // simplex closure
     let mut worst_row_sum_err = 0.0_f64;

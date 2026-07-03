@@ -29,11 +29,11 @@
 
 #![cfg(target_os = "linux")]
 
+use gam::solver::arrow_schur::ArrowSchurSystem;
 use gam::solver::gpu_kernels::arrow_schur::{
     ArrowSchurGpuFailure, solve_arrow_newton_step, solve_arrow_newton_step_dense_reference,
     solve_arrow_newton_step_fused_force,
 };
-use gam::solver::arrow_schur::ArrowSchurSystem;
 use ndarray::Array2;
 
 /// Skip the test body with a one-line message when no CUDA runtime is

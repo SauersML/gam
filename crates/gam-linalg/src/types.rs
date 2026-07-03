@@ -122,7 +122,13 @@ mod ridge_policy_tests {
     #[test]
     fn determinant_mode_variants_are_distinct() {
         assert_ne!(RidgeDeterminantMode::Auto, RidgeDeterminantMode::Full);
-        assert_ne!(RidgeDeterminantMode::Full, RidgeDeterminantMode::PositivePart);
-        assert_ne!(RidgeDeterminantMode::Auto, RidgeDeterminantMode::PositivePart);
+        assert_ne!(
+            RidgeDeterminantMode::Full,
+            RidgeDeterminantMode::PositivePart
+        );
+        assert_ne!(
+            RidgeDeterminantMode::Auto,
+            RidgeDeterminantMode::PositivePart
+        );
     }
 }

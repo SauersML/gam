@@ -185,9 +185,7 @@ fn survival_marginal_slope_converges_without_deadline_979() {
     let hard_cap = Duration::from_secs_f64(ceiling_secs + 240.0);
     match rx.recv_timeout(hard_cap) {
         Ok((ok, err, secs)) => {
-            eprintln!(
-                "[979-converge] survival fit returned in {secs:.1}s (ok={ok}, err={err:?})"
-            );
+            eprintln!("[979-converge] survival fit returned in {secs:.1}s (ok={ok}, err={err:?})");
             assert!(
                 ok,
                 "ill-posed survival marginal-slope fit did NOT genuinely converge to a usable \

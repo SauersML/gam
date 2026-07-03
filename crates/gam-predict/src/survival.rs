@@ -480,7 +480,12 @@ mod tests {
     #[test]
     fn survival_tail_probit_at_infinity_is_zero() {
         let link = InverseLink::Standard(gam::types::StandardLink::Probit);
-        let jet = InverseLinkJet { mu: 0.0, d1: 0.0, d2: 0.0, d3: 0.0 };
+        let jet = InverseLinkJet {
+            mu: 0.0,
+            d1: 0.0,
+            d2: 0.0,
+            d3: 0.0,
+        };
         let tail = survival_tail_value_from_failure_jet(&link, f64::INFINITY, &jet);
         assert_eq!(tail, 0.0);
     }
@@ -488,7 +493,12 @@ mod tests {
     #[test]
     fn survival_tail_probit_at_neg_infinity_is_one() {
         let link = InverseLink::Standard(gam::types::StandardLink::Probit);
-        let jet = InverseLinkJet { mu: 1.0, d1: 0.0, d2: 0.0, d3: 0.0 };
+        let jet = InverseLinkJet {
+            mu: 1.0,
+            d1: 0.0,
+            d2: 0.0,
+            d3: 0.0,
+        };
         let tail = survival_tail_value_from_failure_jet(&link, f64::NEG_INFINITY, &jet);
         assert_eq!(tail, 1.0);
     }
@@ -496,7 +506,12 @@ mod tests {
     #[test]
     fn survival_tail_logit_at_zero_is_half() {
         let link = InverseLink::Standard(gam::types::StandardLink::Logit);
-        let jet = InverseLinkJet { mu: 0.5, d1: 0.25, d2: 0.0, d3: 0.0 };
+        let jet = InverseLinkJet {
+            mu: 0.5,
+            d1: 0.25,
+            d2: 0.0,
+            d3: 0.0,
+        };
         let tail = survival_tail_value_from_failure_jet(&link, 0.0, &jet);
         // 1 / (1 + exp(0)) = 0.5
         assert!((tail - 0.5).abs() < 1e-15);
@@ -505,7 +520,12 @@ mod tests {
     #[test]
     fn survival_tail_cloglog_at_zero() {
         let link = InverseLink::Standard(gam::types::StandardLink::CLogLog);
-        let jet = InverseLinkJet { mu: 0.0, d1: 0.0, d2: 0.0, d3: 0.0 };
+        let jet = InverseLinkJet {
+            mu: 0.0,
+            d1: 0.0,
+            d2: 0.0,
+            d3: 0.0,
+        };
         // exp(-exp(0)) = exp(-1)
         let tail = survival_tail_value_from_failure_jet(&link, 0.0, &jet);
         assert!((tail - (-1.0_f64).exp()).abs() < 1e-15);

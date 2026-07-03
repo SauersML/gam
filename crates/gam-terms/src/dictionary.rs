@@ -948,8 +948,7 @@ mod tests {
 
         // Internal solver exposes the pre-reroute (coordinate-descent) EV so we can
         // assert the no-regression invariant directly.
-        let diag =
-            fit_multi_atom_dictionary(x.view(), &config).expect("multi-atom dictionary fit");
+        let diag = fit_multi_atom_dictionary(x.view(), &config).expect("multi-atom dictionary fit");
         assert!(
             diag.fit.explained_variance >= diag.pre_reroute_ev - 1.0e-12,
             "final reroute regressed EV: pre={}, returned={}",
@@ -998,11 +997,7 @@ mod tests {
             rank_one_centered_pca_ceiling(centered.view(), DEFAULT_CODE_RIDGE)
                 .expect("centered ceiling");
 
-        assert_abs_diff_eq!(
-            uncentered.explained_variance,
-            centered_ev,
-            epsilon = 1.0e-9
-        );
+        assert_abs_diff_eq!(uncentered.explained_variance, centered_ev, epsilon = 1.0e-9);
     }
 
     #[test]
@@ -1050,7 +1045,10 @@ mod tests {
         }
 
         let default_config = LinearDictionaryConfig::new(1);
-        assert!(!default_config.center_rank_one, "flag must default to false");
+        assert!(
+            !default_config.center_rank_one,
+            "flag must default to false"
+        );
         let uncentered = fit_linear_dictionary(x.view(), &default_config).expect("uncentered lane");
 
         let mut centered_config = LinearDictionaryConfig::new(1);

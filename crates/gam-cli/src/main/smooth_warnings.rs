@@ -223,8 +223,8 @@ pub(crate) fn emit_smooth_structure_warnings(stage: &str, warnings: &[String]) {
 pub(crate) fn build_anisotropic_scales_rows(
     spec: Option<&TermCollectionSpec>,
 ) -> Vec<report::AnisotropicScalesRow> {
-    use gam::terms::smooth::get_spatial_length_scale;
     use gam::smooth::get_spatial_aniso_log_scales;
+    use gam::terms::smooth::get_spatial_length_scale;
     let Some(spec) = spec else {
         return Vec::new();
     };
@@ -320,8 +320,8 @@ pub(crate) fn measure_jet_implied_order(per_scale: &[(f64, f64)]) -> Option<f64>
 
 /// Print learned per-axis spatial anisotropy for spatial terms to stdout.
 pub(crate) fn print_spatial_aniso_scales(spec: &TermCollectionSpec) {
-    use gam::terms::smooth::get_spatial_length_scale;
     use gam::smooth::get_spatial_aniso_log_scales;
+    use gam::terms::smooth::get_spatial_length_scale;
     for (term_idx, term) in spec.smooth_terms.iter().enumerate() {
         let Some(eta) = get_spatial_aniso_log_scales(spec, term_idx) else {
             continue;

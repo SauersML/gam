@@ -8,8 +8,10 @@
 //! These are diagnostic measurement guards (printing the #1575 cost counters
 //! surfaced on the fit) plus loose regression assertions on outer work.
 
-use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism};
 use csv::StringRecord;
+use gam::{
+    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Uniform};
@@ -41,7 +43,10 @@ fn binomial_three_smooth_records(n: usize, seed: u64) -> (Vec<String>, Vec<Strin
             ])
         })
         .collect();
-    let headers = ["y", "x1", "x2", "x3"].into_iter().map(String::from).collect();
+    let headers = ["y", "x1", "x2", "x3"]
+        .into_iter()
+        .map(String::from)
+        .collect();
     (headers, rows)
 }
 
@@ -77,7 +82,8 @@ fn binomial_three_smooth_outer_work_1575() {
     let cfg = binomial_cfg();
 
     let t0 = Instant::now();
-    let result = fit_from_formula("y ~ s(x1) + s(x2) + s(x3)", &ds, &cfg).expect("gam binomial fit");
+    let result =
+        fit_from_formula("y ~ s(x1) + s(x2) + s(x3)", &ds, &cfg).expect("gam binomial fit");
     let elapsed = t0.elapsed();
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for binomial s(x1)+s(x2)+s(x3)");
@@ -90,10 +96,15 @@ fn binomial_three_smooth_outer_work_1575() {
         fit.fit.outer_cost_evals,
         fit.fit.inner_pirls_solves,
         fit.fit.outer_converged,
-        fit.fit.outer_gradient_norm.map_or("none".to_string(), |g| format!("{g:.3e}")),
+        fit.fit
+            .outer_gradient_norm
+            .map_or("none".to_string(), |g| format!("{g:.3e}")),
         elapsed.as_secs_f64(),
     );
-    assert!(fit.fit.outer_converged, "#1575: 3-smooth binomial must converge");
+    assert!(
+        fit.fit.outer_converged,
+        "#1575: 3-smooth binomial must converge"
+    );
 }
 
 #[test]
@@ -117,7 +128,9 @@ fn binomial_separation_flat_valley_1762() {
         fit.fit.outer_cost_evals,
         fit.fit.inner_pirls_solves,
         fit.fit.outer_converged,
-        fit.fit.outer_gradient_norm.map_or("none".to_string(), |g| format!("{g:.3e}")),
+        fit.fit
+            .outer_gradient_norm
+            .map_or("none".to_string(), |g| format!("{g:.3e}")),
         elapsed.as_secs_f64(),
     );
 }

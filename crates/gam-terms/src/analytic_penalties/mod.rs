@@ -123,15 +123,15 @@ pub(crate) use std::sync::{Arc, RwLock};
 pub use self::manifest::PenaltyManifest;
 pub use self::op::{PenaltyOp, ScaledPenaltyOp};
 pub use self::sheaf::{EdgeRestriction, SheafConsistencyPenalty};
+pub(crate) use crate::basis::{
+    BasisError, DuchonNullspaceOrder, radial_basis_cartesian_derivative,
+};
+pub(crate) use crate::smooth::BlockwisePenalty;
 pub(crate) use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd};
 pub(crate) use gam_linalg::lanczos::{
     SymmetricLanczosOptions, symmetric_lanczos_eigenpairs, symmetric_lanczos_log_quadrature,
 };
-pub(crate) use crate::basis::{
-    BasisError, DuchonNullspaceOrder, radial_basis_cartesian_derivative,
-};
 pub(crate) use gam_problem::{GumbelTemperatureSchedule, ScheduleKind};
-pub(crate) use crate::smooth::BlockwisePenalty;
 
 #[macro_use]
 mod penalty_trait;

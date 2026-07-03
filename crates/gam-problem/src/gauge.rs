@@ -634,7 +634,8 @@ mod tests {
     fn rectangular_section_is_not_identity() {
         // A tall centring section is square-free and must never be mistaken
         // for the identity (it removes a direction).
-        let z = Array2::<f64>::from_shape_vec((3, 2), vec![1.0, 0.0, 0.0, 1.0, -1.0, -1.0]).unwrap();
+        let z =
+            Array2::<f64>::from_shape_vec((3, 2), vec![1.0, 0.0, 0.0, 1.0, -1.0, -1.0]).unwrap();
         let gauge = Gauge::sum_to_zero(z);
         assert!(!gauge.t_full_is_identity());
     }

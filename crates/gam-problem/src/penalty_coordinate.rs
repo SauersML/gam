@@ -704,7 +704,7 @@ impl PenaltyCoordinate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{array, Array1, Array2};
+    use ndarray::{Array1, Array2, array};
 
     fn identity_root(n: usize) -> Array2<f64> {
         Array2::<f64>::eye(n)

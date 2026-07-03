@@ -4307,10 +4307,7 @@ const OVERSIZED_PROBATION_FLOOR_LINES: usize = 7_000;
 /// tracked) are pruned. Emitted probation offenders are only those in the
 /// 7k..=10k band — files still over 10k are already reported by the primary
 /// `scan_for_oversized_tracked_files` gate, so we do not double-report them.
-fn scan_for_probation_oversized_files(
-    root: &Path,
-    offenders: &mut Vec<(PathBuf, usize, String)>,
-) {
+fn scan_for_probation_oversized_files(root: &Path, offenders: &mut Vec<(PathBuf, usize, String)>) {
     let ledger_path = root.join(OVERSIZED_PROBATION_LEDGER_FILENAME);
     let mut ledger = load_probation_ledger(&ledger_path);
 

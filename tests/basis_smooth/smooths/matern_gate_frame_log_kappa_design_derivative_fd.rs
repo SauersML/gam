@@ -85,8 +85,7 @@ fn frozen_frame_design_derivative_max_error(
     apply_input_standardization(&mut xs, &scales);
     let ls_eff = compensate_length_scale_for_standardization(length_scale, &scales);
     // The bootstrap κ₀ the geometry is frozen at (may differ from the eval κ).
-    let ls_freeze_eff =
-        compensate_length_scale_for_standardization((-freeze_rho).exp(), &scales);
+    let ls_freeze_eff = compensate_length_scale_for_standardization((-freeze_rho).exp(), &scales);
 
     // 2) Cold build with the production seed: Auto(FarthestPoint) centers so the
     //    rank reduction fires, nu/double_penalty as requested. Cold-build at the
@@ -116,7 +115,10 @@ fn frozen_frame_design_derivative_max_error(
             identifiability_transform.clone(),
             *nullspace_shrinkage_survived,
         ),
-        other => panic!("expected Matérn metadata, got {:?}", std::mem::discriminant(other)),
+        other => panic!(
+            "expected Matérn metadata, got {:?}",
+            std::mem::discriminant(other)
+        ),
     };
 
     // 3) Freeze EXACTLY as `freeze_geometry_from_metadata`: pin the reduced
@@ -190,13 +192,8 @@ fn matern_gate_frame_log_kappa_design_derivative_matches_fd() {
                 (0.0, -0.6),        // optimizer moved κ DOWN from κ₀
                 (-0.4, 0.8),        // larger stale gap
             ] {
-                let (err, reduced) = frozen_frame_design_derivative_max_error(
-                    data.view(),
-                    nu,
-                    dp,
-                    freeze_rho,
-                    rho,
-                );
+                let (err, reduced) =
+                    frozen_frame_design_derivative_max_error(data.view(), nu, dp, freeze_rho, rho);
                 eprintln!(
                     "[gate-frame X_psi FD] nu={nu:?} double_penalty={dp} freeze_rho={freeze_rho:+.2} eval_rho={rho:+.2} reduced_centers={reduced} max_abs_err={err:.3e}"
                 );

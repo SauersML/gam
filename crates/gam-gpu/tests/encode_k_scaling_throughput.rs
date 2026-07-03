@@ -32,9 +32,7 @@ use std::time::Instant;
 use ndarray::{Array1, Array2};
 
 use gam_sae::basis::{PeriodicHarmonicEvaluator, SaeBasisEvaluator};
-use gam_sae::candidate_index::{
-    IndexConfig, RandomProjectionFrameSketch, SaeCandidateIndex,
-};
+use gam_sae::candidate_index::{IndexConfig, RandomProjectionFrameSketch, SaeCandidateIndex};
 use gam_sae::encode::{AtlasConfig, EncodeAtlas};
 use gam_sae::manifold::{SaeAtomBasisKind, SaeManifoldAtom};
 
@@ -43,10 +41,14 @@ use gam_sae::manifold::{SaeAtomBasisKind, SaeManifoldAtom};
 /// the atoms distinguishable to the router. Pseudo-random but reproducible.
 fn atom_plane(k: usize, p: usize) -> (Array1<f64>, Array1<f64>) {
     let kf = k as f64;
-    let mut u = Array1::from_shape_fn(p, |j| ((0.7 * kf + 1.3 * j as f64 + 0.1).sin()) + 0.15 * ((kf * 0.031 + j as f64 * 0.017).cos()));
+    let mut u = Array1::from_shape_fn(p, |j| {
+        ((0.7 * kf + 1.3 * j as f64 + 0.1).sin()) + 0.15 * ((kf * 0.031 + j as f64 * 0.017).cos())
+    });
     let un = u.dot(&u).sqrt().max(1e-12);
     u.mapv_inplace(|x| x / un);
-    let mut v = Array1::from_shape_fn(p, |j| ((0.29 * kf + 0.91 * j as f64 + 0.4).cos()) + 0.11 * ((kf * 0.047 + j as f64 * 0.023).sin()));
+    let mut v = Array1::from_shape_fn(p, |j| {
+        ((0.29 * kf + 0.91 * j as f64 + 0.4).cos()) + 0.11 * ((kf * 0.047 + j as f64 * 0.023).sin())
+    });
     let proj = v.dot(&u);
     v = &v - &(&u * proj);
     let vn = v.dot(&v).sqrt().max(1e-12);
@@ -59,7 +61,12 @@ fn atom_plane(k: usize, p: usize) -> (Array1<f64>, Array1<f64>) {
 fn build_dictionary(
     k: usize,
     p: usize,
-) -> (Vec<SaeManifoldAtom>, EncodeAtlas, SaeCandidateIndex, RandomProjectionFrameSketch) {
+) -> (
+    Vec<SaeManifoldAtom>,
+    EncodeAtlas,
+    SaeCandidateIndex,
+    RandomProjectionFrameSketch,
+) {
     let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
     let n_seed = 16usize;
     let seed: Array2<f64> = Array2::from_shape_fn((n_seed, 1), |(i, _)| i as f64 / n_seed as f64);
@@ -149,7 +156,14 @@ fn massive_k_encode_is_sublinear_in_k() {
         // warm pass already routes a coordinate per target so the timed run
         // below measures steady-state throughput, not first-touch faults.
         let (warm_coords, _) = atlas
-            .amortized_encode_with_index_fast(&atoms, &index, &sketch, targets.view(), amps.view(), 1)
+            .amortized_encode_with_index_fast(
+                &atoms,
+                &index,
+                &sketch,
+                targets.view(),
+                amps.view(),
+                1,
+            )
             .expect("warm fast index-routed encode");
         assert_eq!(
             warm_coords.nrows(),
@@ -158,7 +172,14 @@ fn massive_k_encode_is_sublinear_in_k() {
         );
         let start = Instant::now();
         let (coords, valid) = atlas
-            .amortized_encode_with_index_fast(&atoms, &index, &sketch, targets.view(), amps.view(), 1)
+            .amortized_encode_with_index_fast(
+                &atoms,
+                &index,
+                &sketch,
+                targets.view(),
+                amps.view(),
+                1,
+            )
             .expect("timed fast index-routed encode");
         let elapsed = start.elapsed();
         let rows_per_sec = n as f64 / elapsed.as_secs_f64();
@@ -191,7 +212,10 @@ fn massive_k_encode_is_sublinear_in_k() {
     eprintln!(
         "[k-scaling] K {}→{} : throughput slowdown {:.2}× ⇒ scaling exponent α≈{:.3} \
          (O(N·K) router is α=1.0)",
-        ks[0], ks[ks.len() - 1], slowdown, alpha
+        ks[0],
+        ks[ks.len() - 1],
+        slowdown,
+        alpha
     );
     // Threshold 0.97 (noise-robust): measured α sits in ~0.83–0.93 across runs
     // (timing-noise + the fixed-N per-group amortization), decisively below the

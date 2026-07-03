@@ -258,13 +258,11 @@ impl ManifoldSpec {
         match self {
             Self::Euclidean(dim) => Ok(Box::new(crate::EuclideanManifold::new(*dim))),
             Self::Circle => Ok(Box::new(crate::CircleManifold::new())),
-            Self::Sphere { intrinsic_dim } => Ok(Box::new(crate::SphereManifold::new(
-                *intrinsic_dim,
-            ))),
-            Self::Torus { dim } => Ok(Box::new(crate::TorusManifold::new(*dim))),
-            Self::Grassmann { k, n } => {
-                Ok(Box::new(crate::GrassmannManifold::new(*k, *n)?))
+            Self::Sphere { intrinsic_dim } => {
+                Ok(Box::new(crate::SphereManifold::new(*intrinsic_dim)))
             }
+            Self::Torus { dim } => Ok(Box::new(crate::TorusManifold::new(*dim))),
+            Self::Grassmann { k, n } => Ok(Box::new(crate::GrassmannManifold::new(*k, *n)?)),
             Self::Stiefel { k, n } => Ok(Box::new(crate::StiefelManifold::new(*k, *n)?)),
             Self::Spd { n } => Ok(Box::new(crate::SpdManifold::new(*n))),
             Self::Product(parts) => {
@@ -1392,7 +1390,10 @@ mod matrix_log_tests {
         }
         for j in 0..2 {
             for i in 0..4 {
-                assert!((full[[i, j]] - cols[[i, j]]).abs() < 1e-14, "input column changed");
+                assert!(
+                    (full[[i, j]] - cols[[i, j]]).abs() < 1e-14,
+                    "input column changed"
+                );
             }
         }
         // Square input with det −1 must be returned verbatim (no flip).
@@ -1400,7 +1401,10 @@ mod matrix_log_tests {
         sq[[0, 0]] = 1.0;
         sq[[1, 1]] = -1.0; // det = −1
         let out = orthonormal_completion(&sq);
-        assert!((out[[1, 1]] + 1.0).abs() < 1e-14, "square input was modified");
+        assert!(
+            (out[[1, 1]] + 1.0).abs() < 1e-14,
+            "square input was modified"
+        );
     }
 }
 

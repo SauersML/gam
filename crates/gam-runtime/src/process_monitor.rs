@@ -738,9 +738,6 @@ mod format_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn parse_io_bytes_wrong_key_returns_none() {
-        assert_eq!(
-            parse_io_bytes("read_bytes: 65536", "write_bytes:"),
-            None
-        );
+        assert_eq!(parse_io_bytes("read_bytes: 65536", "write_bytes:"), None);
     }
 }

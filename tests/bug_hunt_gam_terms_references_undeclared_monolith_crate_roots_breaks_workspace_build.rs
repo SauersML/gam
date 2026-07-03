@@ -94,9 +94,7 @@ fn identifiers(src: &str) -> impl Iterator<Item = String> + '_ {
             let starts = b.is_ascii_alphabetic() || b == b'_';
             if starts {
                 let start = i;
-                while i < bytes.len()
-                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-                {
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                     i += 1;
                 }
                 return Some(src[start..i].to_string());
@@ -176,7 +174,8 @@ fn crate_root_refs(src: &str) -> Vec<String> {
     while let Some(rel) = src[from..].find(needle) {
         let at = from + rel;
         // Require a word boundary before `crate` so `my_crate::x` does not match.
-        let before_ok = at == 0 || !(bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_');
+        let before_ok =
+            at == 0 || !(bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_');
         let seg_start = at + needle.len();
         let mut j = seg_start;
         while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {

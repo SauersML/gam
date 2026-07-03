@@ -911,7 +911,10 @@ mod tests {
         let m = RowMetric::behavioral_fisher(u, 1, 2).unwrap();
         assert!(m.whitens_likelihood());
         assert!(m.drives_gauge());
-        assert_eq!(m.provenance(), MetricProvenance::BehavioralFisher { probes: 2 });
+        assert_eq!(
+            m.provenance(),
+            MetricProvenance::BehavioralFisher { probes: 2 }
+        );
         assert_eq!(m.metric_rank(), 2);
     }
 

@@ -137,7 +137,11 @@ impl MultiDirJet {
         // With that established once, every `a[sub]`/`b[mask ^ sub]` below is
         // provably in bounds (`sub, mask ^ sub ⊆ mask < count`), so the inner
         // submask walk can drop its per-load bounds checks.
-        assert_eq!(b.len(), count, "MultiDirJet::mul operands must share n_dirs");
+        assert_eq!(
+            b.len(),
+            count,
+            "MultiDirJet::mul operands must share n_dirs"
+        );
         let mut out = vec![0.0; count];
         for (mask, slot) in out.iter_mut().enumerate() {
             // Walk every submask of `mask` in ascending numeric order — the same
@@ -303,13 +307,33 @@ fn subset_conv_into(a: &[f64], b: &[f64], out: &mut [f64], min_pop: u32) {
         // bounds for `a`/`b` (each ≥ `out.len()` long).
         unsafe {
             loop {
-                dot2_step(&mut s0, &mut c0, *a.get_unchecked(sub), *b.get_unchecked(mask ^ sub));
+                dot2_step(
+                    &mut s0,
+                    &mut c0,
+                    *a.get_unchecked(sub),
+                    *b.get_unchecked(mask ^ sub),
+                );
                 sub = (sub - 1) & mask;
-                dot2_step(&mut s1, &mut c1, *a.get_unchecked(sub), *b.get_unchecked(mask ^ sub));
+                dot2_step(
+                    &mut s1,
+                    &mut c1,
+                    *a.get_unchecked(sub),
+                    *b.get_unchecked(mask ^ sub),
+                );
                 sub = (sub - 1) & mask;
-                dot2_step(&mut s2, &mut c2, *a.get_unchecked(sub), *b.get_unchecked(mask ^ sub));
+                dot2_step(
+                    &mut s2,
+                    &mut c2,
+                    *a.get_unchecked(sub),
+                    *b.get_unchecked(mask ^ sub),
+                );
                 sub = (sub - 1) & mask;
-                dot2_step(&mut s3, &mut c3, *a.get_unchecked(sub), *b.get_unchecked(mask ^ sub));
+                dot2_step(
+                    &mut s3,
+                    &mut c3,
+                    *a.get_unchecked(sub),
+                    *b.get_unchecked(mask ^ sub),
+                );
                 if sub == 0 {
                     break;
                 }
@@ -473,7 +497,9 @@ mod tests {
                 let m = tables.len();
                 tables.push(std::rc::Rc::new(build_partitions(m)));
             }
-            (0..=n_dirs).map(|m| std::rc::Rc::clone(&tables[m])).collect()
+            (0..=n_dirs)
+                .map(|m| std::rc::Rc::clone(&tables[m]))
+                .collect()
         })
     }
 
@@ -524,7 +550,13 @@ mod tests {
     /// recursion ("place each element into an existing block, else open a new one"),
     /// each block recorded as a compacted submask of `{0..m}`, flattened.
     fn build_partitions(m: usize) -> PartTable {
-        fn recurse(elem: usize, m: usize, blocks: &mut [u32; 8], n_blocks: usize, out: &mut PartTable) {
+        fn recurse(
+            elem: usize,
+            m: usize,
+            blocks: &mut [u32; 8],
+            n_blocks: usize,
+            out: &mut PartTable,
+        ) {
             // Partitions with `>= DERIVS` blocks are truncated (their `f^{(order)}`
             // is beyond the stack); the block count never decreases, so the whole
             // subtree contributes nothing and is pruned — matching the walker's
@@ -807,8 +839,11 @@ mod tests {
     fn compose_unary_matches_partition_reference_simple() {
         // exp-like stack on a 2-direction cross jet: every coeff agrees with the
         // direct set-partition reference to a tight tolerance.
-        let j = MultiDirJet::linear(2, 0.3, &[0.5, -0.4])
-            .mul(&MultiDirJet::linear(2, -0.2, &[0.1, 0.7]));
+        let j = MultiDirJet::linear(2, 0.3, &[0.5, -0.4]).mul(&MultiDirJet::linear(
+            2,
+            -0.2,
+            &[0.1, 0.7],
+        ));
         let d = [0.9_f64, 1.1, -0.7, 0.4, -0.25];
         let got = j.compose_unary(d);
         let want = compose_unary_partition_reference(&j.coeffs, d);

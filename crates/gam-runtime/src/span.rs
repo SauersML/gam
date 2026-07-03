@@ -101,6 +101,9 @@ mod tests {
     #[test]
     fn error_message_contains_label() {
         let err = span_index_for_breakpoints(&[0.0], 0.5, "my_var").unwrap_err();
-        assert!(err.contains("my_var"), "error should mention label, got: {err}");
+        assert!(
+            err.contains("my_var"),
+            "error should mention label, got: {err}"
+        );
     }
 }

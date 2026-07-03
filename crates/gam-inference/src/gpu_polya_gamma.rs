@@ -637,9 +637,9 @@ mod linux_cuda {
         PG1_MAX_B, PgSeed, PolyaGammaBatchInput, SADDLE_MAX_B, SADDLE_MIN_B, XorwowState,
         pg_convolution_cpu_oracle, pg_normal_cpu_oracle,
     };
+    use cudarc::driver::{CudaContext, CudaModule, CudaStream, LaunchConfig, PushKernelArg};
     use gam_gpu::gpu_error::{GpuError, GpuResultExt};
     use gam_gpu::solver::context_and_stream;
-    use cudarc::driver::{CudaContext, CudaModule, CudaStream, LaunchConfig, PushKernelArg};
     use ndarray::Array1;
     use std::sync::Arc;
 

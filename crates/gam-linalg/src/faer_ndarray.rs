@@ -2632,15 +2632,13 @@ mod tests {
         let gram = fast_xt_diag_x_with_parallelism(&a, &unit, faer::get_global_parallelism());
         let gram_rrqr =
             rrqr_from_gram_with_permutation(&gram, n, alpha).expect("Gram RRQR should succeed");
-        let ok = gram_rrqr.rank == 3
-            || gram_rrqr.verdict_margin < JOINT_GRAM_RRQR_TRUST_MARGIN_FOR_TEST;
+        let ok =
+            gram_rrqr.rank == 3 || gram_rrqr.verdict_margin < JOINT_GRAM_RRQR_TRUST_MARGIN_FOR_TEST;
         assert!(
             ok,
             "gam#933: Gram RRQR must either find correct rank=3 OR signal low margin \
              (< {:.0e}) to force the tall fallback; got rank={} margin={:.3e}",
-            JOINT_GRAM_RRQR_TRUST_MARGIN_FOR_TEST,
-            gram_rrqr.rank,
-            gram_rrqr.verdict_margin,
+            JOINT_GRAM_RRQR_TRUST_MARGIN_FOR_TEST, gram_rrqr.rank, gram_rrqr.verdict_margin,
         );
     }
 
@@ -2679,12 +2677,16 @@ mod tests {
 
     fn max_abs_diff(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
         assert_eq!(a.dim(), b.dim(), "shape mismatch in max_abs_diff");
-        a.iter().zip(b.iter()).fold(0.0_f64, |acc, (&x, &y)| acc.max((x - y).abs()))
+        a.iter()
+            .zip(b.iter())
+            .fold(0.0_f64, |acc, (&x, &y)| acc.max((x - y).abs()))
     }
 
     fn max_abs_diff_1d(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
         assert_eq!(a.len(), b.len(), "len mismatch in max_abs_diff_1d");
-        a.iter().zip(b.iter()).fold(0.0_f64, |acc, (&x, &y)| acc.max((x - y).abs()))
+        a.iter()
+            .zip(b.iter())
+            .fold(0.0_f64, |acc, (&x, &y)| acc.max((x - y).abs()))
     }
 
     /// `fast_ab(A, B)` matches `A.dot(&B)` for small (ndarray-path) matrices.
@@ -2713,8 +2715,12 @@ mod tests {
             *s ^= *s << 17;
             ((*s >> 11) as f64 / ((1u64 << 53) as f64)) - 0.5
         };
-        for v in a.iter_mut() { *v = next(&mut state); }
-        for v in b.iter_mut() { *v = next(&mut state); }
+        for v in a.iter_mut() {
+            *v = next(&mut state);
+        }
+        for v in b.iter_mut() {
+            *v = next(&mut state);
+        }
         let got = fast_ab(&a, &b);
         let want = a.dot(&b);
         assert!(max_abs_diff(&got, &want) < 1e-9, "fast_ab large mismatch");
@@ -2746,8 +2752,12 @@ mod tests {
             *s ^= *s << 17;
             ((*s >> 11) as f64 / ((1u64 << 53) as f64)) - 0.5
         };
-        for v in a.iter_mut() { *v = next(&mut state); }
-        for v in b.iter_mut() { *v = next(&mut state); }
+        for v in a.iter_mut() {
+            *v = next(&mut state);
+        }
+        for v in b.iter_mut() {
+            *v = next(&mut state);
+        }
         let got = fast_atb(&a, &b);
         let want = a.t().dot(&b);
         assert!(max_abs_diff(&got, &want) < 1e-9, "fast_atb large mismatch");
@@ -2771,7 +2781,10 @@ mod tests {
         let v = array![1.0, -1.0, 2.0];
         let got = fast_av(&a, &v);
         let want = a.dot(&v);
-        assert!(max_abs_diff_1d(&got, &want) < 1e-12, "fast_av small mismatch");
+        assert!(
+            max_abs_diff_1d(&got, &want) < 1e-12,
+            "fast_av small mismatch"
+        );
         // 1*1 + 2*(-1) + 3*2 = 1-2+6 = 5
         assert!((got[0] - 5.0).abs() < 1e-12, "fast_av[0] should be 5");
         // 4*1 + 5*(-1) + 6*2 = 4-5+12 = 11
@@ -2792,11 +2805,18 @@ mod tests {
             *s ^= *s << 17;
             ((*s >> 11) as f64 / ((1u64 << 53) as f64)) - 0.5
         };
-        for v in a.iter_mut() { *v = next(&mut state); }
-        for x in v.iter_mut() { *x = next(&mut state); }
+        for v in a.iter_mut() {
+            *v = next(&mut state);
+        }
+        for x in v.iter_mut() {
+            *x = next(&mut state);
+        }
         let got = fast_av(&a, &v);
         let want = a.dot(&v);
-        assert!(max_abs_diff_1d(&got, &want) < 1e-9, "fast_av large mismatch");
+        assert!(
+            max_abs_diff_1d(&got, &want) < 1e-9,
+            "fast_av large mismatch"
+        );
     }
 
     /// `fast_atv(A, v)` = A^T * v for small matrices (ndarray path).
@@ -2807,7 +2827,10 @@ mod tests {
         let got = fast_atv(&a, &v);
         let want = a.t().dot(&v);
         // A^T * v = [1*1+3*0+5*(-1), 2*1+4*0+6*(-1)] = [-4, -4]
-        assert!(max_abs_diff_1d(&got, &want) < 1e-12, "fast_atv small mismatch");
+        assert!(
+            max_abs_diff_1d(&got, &want) < 1e-12,
+            "fast_atv small mismatch"
+        );
         assert!((got[0] - (-4.0)).abs() < 1e-12, "fast_atv[0]");
         assert!((got[1] - (-4.0)).abs() < 1e-12, "fast_atv[1]");
     }
@@ -2826,11 +2849,18 @@ mod tests {
             *s ^= *s << 17;
             ((*s >> 11) as f64 / ((1u64 << 53) as f64)) - 0.5
         };
-        for x in a.iter_mut() { *x = next(&mut state); }
-        for x in v.iter_mut() { *x = next(&mut state); }
+        for x in a.iter_mut() {
+            *x = next(&mut state);
+        }
+        for x in v.iter_mut() {
+            *x = next(&mut state);
+        }
         let got = fast_atv(&a, &v);
         let want = a.t().dot(&v);
-        assert!(max_abs_diff_1d(&got, &want) < 1e-9, "fast_atv large mismatch");
+        assert!(
+            max_abs_diff_1d(&got, &want) < 1e-9,
+            "fast_atv large mismatch"
+        );
     }
 
     /// `fast_xt_diag_y(X, d, Y)` = X^T * diag(d) * Y, verified against
@@ -2852,7 +2882,10 @@ mod tests {
             dy
         };
         let want = x.t().dot(&diag_y);
-        assert!(max_abs_diff(&got, &want) < 1e-12, "fast_xt_diag_y small mismatch");
+        assert!(
+            max_abs_diff(&got, &want) < 1e-12,
+            "fast_xt_diag_y small mismatch"
+        );
         assert_eq!(got.dim(), (2, 3));
     }
 

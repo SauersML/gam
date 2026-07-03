@@ -41,8 +41,9 @@ fn nested_prefix_descriptor_is_dispatched_not_dropped() {
         }
     ]);
 
-    let registry = build_analytic_penalty_registry_from_descriptors(Some(&latents), Some(&penalties))
-        .expect("nested_prefix descriptor must build a registry");
+    let registry =
+        build_analytic_penalty_registry_from_descriptors(Some(&latents), Some(&penalties))
+            .expect("nested_prefix descriptor must build a registry");
 
     // The descriptor must produce exactly one penalty, tagged `nested_prefix`.
     // A silently-dropped kind would yield an empty registry (the #1254 symptom);

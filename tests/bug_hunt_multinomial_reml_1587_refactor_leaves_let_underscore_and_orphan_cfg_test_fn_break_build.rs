@@ -137,7 +137,11 @@ fn test_region_mask(content: &str) -> Vec<bool> {
                 }
                 break;
             }
-            if j < lines.len() && strip_line_comment(lines[j]).trim_start().starts_with("mod ") {
+            if j < lines.len()
+                && strip_line_comment(lines[j])
+                    .trim_start()
+                    .starts_with("mod ")
+            {
                 // Mask from the cfg(test) line until the matching closing brace.
                 let mut depth: i32 = 0;
                 let mut seen_open = false;

@@ -62,8 +62,8 @@
 //! a caller-supplied reference configuration via `½ μ ‖t − reference‖²` with a
 //! REML-selectable `μ`, fixing the gauge without an auxiliary signal `u`.
 
-use gam_problem::LatentRetractionRegistry;
 use crate::basis::{BasisError, RadialScalarKind};
+use gam_problem::LatentRetractionRegistry;
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3};
 use std::sync::atomic::{AtomicU64, Ordering};
 const SPHERE_NORMAL_PIN: f64 = 1.0;

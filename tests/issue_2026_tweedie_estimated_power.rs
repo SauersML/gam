@@ -22,10 +22,10 @@
 
 use csv::StringRecord;
 use gam::data::EncodedDataset;
+use gam::types::ResponseFamily;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use gam::types::ResponseFamily;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
@@ -142,8 +142,7 @@ fn estimated_bare_tweedie_power(p_true: f64, n: usize, seed: u64) -> f64 {
         family: Some("tweedie".to_string()),
         ..FitConfig::default()
     };
-    let FitResult::Standard(fit) =
-        fit_from_formula("y ~ x", &ds, &cfg).expect("bare tweedie fit")
+    let FitResult::Standard(fit) = fit_from_formula("y ~ x", &ds, &cfg).expect("bare tweedie fit")
     else {
         panic!("Tweedie(log) is a scalar GLM => expected FitResult::Standard");
     };

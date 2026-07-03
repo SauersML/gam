@@ -113,18 +113,14 @@ fn gen_data(n: usize, seed: u64) -> (gam::data::EncodedDataset, Vec<RowPoint>) {
 }
 
 /// Fit the 4-smooth additive Gaussian model and return predicted means at `pts`.
-fn fit_and_predict(
-    data: &gam::data::EncodedDataset,
-    pts: &[RowPoint],
-) -> Vec<f64> {
+fn fit_and_predict(data: &gam::data::EncodedDataset, pts: &[RowPoint]) -> Vec<f64> {
     let cfg = FitConfig::default();
     let FitResult::Standard(fit) = fit_from_formula(
         "y ~ smooth(x1)+smooth(x2)+smooth(x3)+smooth(x4)",
         data,
         &cfg,
     )
-    .expect("standard additive GAM fit")
-    else {
+    .expect("standard additive GAM fit") else {
         panic!("expected a standard Gaussian GAM fit");
     };
 
@@ -265,8 +261,8 @@ fn fit_and_predict_formula(
         grid[[r, i3]] = x3;
         grid[[r, i4]] = x4;
     }
-    let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
-        .expect("rebuild design");
+    let design =
+        build_term_collection_design(grid.view(), &fit.resolvedspec).expect("rebuild design");
     let dense = design.design.to_dense();
     let family = LikelihoodSpec::new(
         ResponseFamily::Gaussian,

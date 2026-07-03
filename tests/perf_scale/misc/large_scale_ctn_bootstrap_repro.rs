@@ -15,8 +15,8 @@ use gam::basis::{
     CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
     SpatialIdentifiability,
 };
-use gam::smooth::{ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec};
 use gam::smooth::build_term_collection_design;
+use gam::smooth::{ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec};
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;

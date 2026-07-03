@@ -78,7 +78,10 @@ fn isometry_grad_hvp_majorizer_are_decoder_scale_invariant() {
     // grad_target (∂P/∂t): invariant.
     let g0 = base.grad_target(t.view(), rho.view());
     let g1 = scaled.grad_target(t.view(), rho.view());
-    assert!(g0.iter().any(|x| x.abs() > 1e-9), "grad must be non-trivial");
+    assert!(
+        g0.iter().any(|x| x.abs() > 1e-9),
+        "grad must be non-trivial"
+    );
     for i in 0..n {
         assert_abs_diff_eq!(g0[i], g1[i], epsilon = 1e-9);
     }

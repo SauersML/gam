@@ -1,16 +1,16 @@
+use gam_inference::formula_dsl::parse_link_choice;
+use gam_inference::model::GroupMetadata;
+use gam_models::fit_orchestration::descriptors::build_analytic_penalty_registry_from_descriptors;
+use gam_models::fit_orchestration::{CtnStage1Recipe, FitConfig};
 use gam_models::survival::location_scale::residual_distribution_inverse_link;
 use gam_models::survival::lognormal_kernel::{FrailtySpec, HazardLoading};
 use gam_models::survival::parse_survival_distribution;
 use gam_models::survival::{SurvivalLikelihoodMode, parse_survival_likelihood_mode};
-use gam_inference::formula_dsl::parse_link_choice;
-use gam_inference::model::GroupMetadata;
-use gam_solve::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
-use gam_models::fit_orchestration::descriptors::build_analytic_penalty_registry_from_descriptors;
-use gam_models::fit_orchestration::{CtnStage1Recipe, FitConfig};
 use gam_models::transformation_normal::TransformationNormalConfig;
 use gam_problem::types::{
     InverseLink, LinkComponent, LinkFunction, MixtureLinkSpec, SasLinkSpec, StandardLink,
 };
+use gam_solve::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use ndarray::Array1;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -1288,19 +1288,28 @@ mod tests {
     fn parse_comma_f64_non_numeric_returns_error() {
         let err = parse_comma_f64("1.0, bad, 3.0", "--vals").unwrap_err();
         assert!(err.contains("--vals"), "error should name the label: {err}");
-        assert!(err.contains("bad"), "error should name the bad token: {err}");
+        assert!(
+            err.contains("bad"),
+            "error should name the bad token: {err}"
+        );
     }
 
     #[test]
     fn parse_comma_f64_infinity_returns_error() {
         let err = parse_comma_f64("inf", "--vals").unwrap_err();
-        assert!(err.contains("non-finite"), "error should say non-finite: {err}");
+        assert!(
+            err.contains("non-finite"),
+            "error should say non-finite: {err}"
+        );
     }
 
     #[test]
     fn parse_comma_f64_nan_returns_error() {
         let err = parse_comma_f64("nan", "--vals").unwrap_err();
-        assert!(err.contains("non-finite"), "error should say non-finite: {err}");
+        assert!(
+            err.contains("non-finite"),
+            "error should say non-finite: {err}"
+        );
     }
 
     // ── normalize_optional_family ─────────────────────────────────────────
@@ -1337,15 +1346,9 @@ mod tests {
             parse_survival_likelihood_cli("transformation").unwrap(),
             "transformation"
         );
-        assert_eq!(
-            parse_survival_likelihood_cli("weibull").unwrap(),
-            "weibull"
-        );
+        assert_eq!(parse_survival_likelihood_cli("weibull").unwrap(), "weibull");
         // case-insensitive
-        assert_eq!(
-            parse_survival_likelihood_cli("WEIBULL").unwrap(),
-            "weibull"
-        );
+        assert_eq!(parse_survival_likelihood_cli("WEIBULL").unwrap(), "weibull");
         assert_eq!(
             parse_survival_likelihood_cli("Transformation").unwrap(),
             "transformation"
@@ -1370,16 +1373,16 @@ mod tests {
             );
         }
         // trimmed and lowercased
-        assert_eq!(
-            parse_baseline_target_cli("  Weibull  ").unwrap(),
-            "weibull"
-        );
+        assert_eq!(parse_baseline_target_cli("  Weibull  ").unwrap(), "weibull");
     }
 
     #[test]
     fn parse_baseline_target_cli_invalid_returns_error() {
         let err = parse_baseline_target_cli("cox").unwrap_err();
-        assert!(err.contains("cox"), "error should name the bad value: {err}");
+        assert!(
+            err.contains("cox"),
+            "error should name the bad value: {err}"
+        );
     }
 
     // ── validate_survival_baseline_args ───────────────────────────────────
@@ -1387,65 +1390,37 @@ mod tests {
     #[test]
     fn validate_survival_baseline_args_linear_rejects_params() {
         let mode = parse_survival_likelihood_mode("transformation").unwrap();
-        assert!(validate_survival_baseline_args(
-            mode,
-            "linear",
-            Some(1.0),
-            None,
-            None,
-            None
-        )
-        .is_err());
+        assert!(
+            validate_survival_baseline_args(mode, "linear", Some(1.0), None, None, None).is_err()
+        );
     }
 
     #[test]
     fn validate_survival_baseline_args_linear_accepts_no_params() {
         let mode = parse_survival_likelihood_mode("transformation").unwrap();
-        assert!(validate_survival_baseline_args(
-            mode, "linear", None, None, None, None
-        )
-        .is_ok());
+        assert!(validate_survival_baseline_args(mode, "linear", None, None, None, None).is_ok());
     }
 
     #[test]
     fn validate_survival_baseline_args_weibull_likelihood_rejects_gompertz_target() {
         let mode = parse_survival_likelihood_mode("weibull").unwrap();
-        assert!(validate_survival_baseline_args(
-            mode,
-            "gompertz",
-            None,
-            None,
-            None,
-            None
-        )
-        .is_err());
+        assert!(validate_survival_baseline_args(mode, "gompertz", None, None, None, None).is_err());
     }
 
     #[test]
     fn validate_survival_baseline_args_gompertz_rejects_scale() {
         let mode = parse_survival_likelihood_mode("transformation").unwrap();
-        assert!(validate_survival_baseline_args(
-            mode,
-            "gompertz",
-            Some(2.0),
-            None,
-            None,
-            None
-        )
-        .is_err());
+        assert!(
+            validate_survival_baseline_args(mode, "gompertz", Some(2.0), None, None, None).is_err()
+        );
     }
 
     #[test]
     fn validate_survival_baseline_args_gompertz_makeham_rejects_scale() {
         let mode = parse_survival_likelihood_mode("transformation").unwrap();
-        assert!(validate_survival_baseline_args(
-            mode,
-            "gompertz-makeham",
-            Some(1.0),
-            None,
-            None,
-            None
-        )
-        .is_err());
+        assert!(
+            validate_survival_baseline_args(mode, "gompertz-makeham", Some(1.0), None, None, None)
+                .is_err()
+        );
     }
 }

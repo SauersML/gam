@@ -74,10 +74,7 @@ fn geometric_mean_scale(scales: &[f64]) -> f64 {
     log_mean.exp()
 }
 
-pub fn compensate_length_scale_for_standardization(
-    length_scale: f64,
-    scales: &[f64],
-) -> f64 {
+pub fn compensate_length_scale_for_standardization(length_scale: f64, scales: &[f64]) -> f64 {
     let sigma_geom = geometric_mean_scale(scales);
     if sigma_geom > 0.0 && sigma_geom.is_finite() {
         length_scale / sigma_geom

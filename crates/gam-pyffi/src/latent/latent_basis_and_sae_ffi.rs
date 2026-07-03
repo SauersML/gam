@@ -2548,7 +2548,7 @@ fn stagewise_progress_py<'py>(
     max_factor_rank = 4,
     structured_whitening = true,
     row_loss_weights = None,
-    birth_callback = None,
+    progress_callback = None,
 ))]
 fn sae_manifold_fit_stagewise<'py>(
     py: Python<'py>,
@@ -2578,7 +2578,7 @@ fn sae_manifold_fit_stagewise<'py>(
     max_factor_rank: usize,
     structured_whitening: bool,
     row_loss_weights: Option<PyReadonlyArray1<'py, f64>>,
-    birth_callback: Option<PyObject>,
+    progress_callback: Option<PyObject>,
 ) -> PyResult<Py<PyDict>> {
     let assignment_kind = canonicalize_assignment_kind(&assignment_kind).map_err(py_value_error)?;
     let z_view = z.as_array();
@@ -2688,7 +2688,7 @@ fn sae_manifold_fit_stagewise<'py>(
         max_factor_rank,
         structured_whitening,
     };
-    let mut progress_callback = birth_callback.map(|callback| {
+    let mut progress_callback = progress_callback.map(|callback| {
         move |event: gam::terms::sae::manifold::StagewiseProgress<'_>| -> Result<(), String> {
             Python::with_gil(|py| {
                 let payload = stagewise_progress_py(py, &event).map_err(|err| err.to_string())?;

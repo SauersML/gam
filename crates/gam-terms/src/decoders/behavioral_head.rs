@@ -53,8 +53,8 @@
 
 use crate::inference::smooth_test::{SmoothTestInput, SmoothTestScale, wood_smooth_test};
 use crate::inference::structure_evidence::{e_benjamini_hochberg, log_e_from_p_calibrator};
-use gam_problem::RowSubsampleMask;
 use gam_linalg::faer_ndarray::FaerSvd;
+use gam_problem::RowSubsampleMask;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 /// Outcome family for the behavioral head.

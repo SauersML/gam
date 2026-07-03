@@ -671,12 +671,13 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     // the inner solve and outer evaluator run in.
     let reduced_total: usize = specs.iter().map(|s| s.design.ncols()).sum();
     let joint_specs: Vec<gam_problem::JointPenaltySpec> = {
-        let raw_specs_joint = family
-            .joint_penalty_specs()
-            .map_err(|reason| CustomFamilyError::Optimization {
-                context: "fit_custom_family joint penalty specs",
-                reason,
-            })?;
+        let raw_specs_joint =
+            family
+                .joint_penalty_specs()
+                .map_err(|reason| CustomFamilyError::Optimization {
+                    context: "fit_custom_family joint penalty specs",
+                    reason,
+                })?;
         let t_full = &canonical.gauge.t_full;
         raw_specs_joint
             .into_iter()
@@ -710,8 +711,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             .collect::<Result<Vec<_>, CustomFamilyError>>()?
     };
 
-    let label_layout =
-        penalty_label_layout_with_joint(specs, penalty_counts.clone(), joint_specs)?;
+    let label_layout = penalty_label_layout_with_joint(specs, penalty_counts.clone(), joint_specs)?;
     let mut rho0 = label_layout.initial_rho.clone();
     let (persistent_warm_start_key, mut persistent_warm_start) =
         load_persistent_custom_family_warm_start::<F>(family, specs, options, rho0.len());
@@ -880,9 +880,9 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         );
     }
 
+    use gam_problem::OuterEval;
     use gam_solve::model_types::EstimationError;
     use gam_solve::rho_optimizer::{FallbackPolicy, OuterEvalOrder, OuterProblem};
-    use gam_problem::OuterEval;
 
     let screening_cap = Arc::new(AtomicUsize::new(0));
     let outer_inner_cap = options
@@ -1688,12 +1688,17 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     // the selected ρ*) so the exported geometry's penalized Hessian — and the
     // trace EDF derived from it — includes the full-width centered penalty,
     // matching the covariance path above and the inner-converged mode.
-    let geometry =
-        compute_joint_geometry(family, specs, &inner.block_states, &per_block, &final_options)
-            .map_err(|reason| CustomFamilyError::Optimization {
-                context: "fit_custom_family joint geometry",
-                reason,
-            })?;
+    let geometry = compute_joint_geometry(
+        family,
+        specs,
+        &inner.block_states,
+        &per_block,
+        &final_options,
+    )
+    .map_err(|reason| CustomFamilyError::Optimization {
+        context: "fit_custom_family joint geometry",
+        reason,
+    })?;
     let penalized_objective = inner_penalized_objective(
         &inner,
         include_exact_newton_logdet_h(family, options),
@@ -1756,10 +1761,8 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 let posterior_result =
                     gam_problem::laplace_sampler_contract::gaussian_mode_posterior_sampler().map(
                         |sampler| {
-                            sampler.sample_gaussian_mode_posterior(
-                                joint_mode.view(),
-                                precision.view(),
-                            )
+                            sampler
+                                .sample_gaussian_mode_posterior(joint_mode.view(), precision.view())
                         },
                     );
                 match posterior_result {
@@ -1903,9 +1906,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     )
 }
 
-pub fn fit_custom_family_fixed_log_lambdas<
-    F: CustomFamily + Clone + Send + Sync + 'static,
->(
+pub fn fit_custom_family_fixed_log_lambdas<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     raw_specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
@@ -1933,13 +1934,11 @@ pub fn fit_custom_family_fixed_log_lambdas<
     refresh_all_block_etas(family, specs, &mut inner.block_states)?;
     let covariance_conditional =
         compute_joint_covariance_required(family, specs, &inner.block_states, &per_block, options)?;
-    let geometry =
-        compute_joint_geometry(family, specs, &inner.block_states, &per_block, options).map_err(
-            |reason| CustomFamilyError::Optimization {
-                context: "fit_custom_family_fixed_log_lambdas joint geometry",
-                reason,
-            },
-        )?;
+    let geometry = compute_joint_geometry(family, specs, &inner.block_states, &per_block, options)
+        .map_err(|reason| CustomFamilyError::Optimization {
+            context: "fit_custom_family_fixed_log_lambdas joint geometry",
+            reason,
+        })?;
     let penalized_objective = inner_penalized_objective(
         &inner,
         include_exact_newton_logdet_h(family, options),

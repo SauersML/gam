@@ -71,7 +71,10 @@ mod tests {
         lp.tick(1, |_progress, _elapsed| {
             called.store(true, Ordering::Relaxed);
         });
-        assert!(called.load(Ordering::Relaxed), "emit should be called with zero interval");
+        assert!(
+            called.load(Ordering::Relaxed),
+            "emit should be called with zero interval"
+        );
     }
 
     #[test]
@@ -97,7 +100,10 @@ mod tests {
         });
         // The first tick starts with last=0; elapsed is a small positive number;
         // 3_600_000_000_000 ns >> any realistic elapsed, so emit is skipped.
-        assert!(!called.load(Ordering::Relaxed), "emit should not fire with 1-hour interval");
+        assert!(
+            !called.load(Ordering::Relaxed),
+            "emit should not fire with 1-hour interval"
+        );
     }
 
     #[test]

@@ -46,8 +46,9 @@ use std::sync::Arc;
 use ndarray::{Array1, Array2, Array3};
 
 use crate::audit::{
-    DroppedColumn, IdentifiabilityAudit, audit_identifiability, audit_identifiability_channel_aware,
-    block_structural_penalty_dense, priority_tiered_rank_from_gram, rank_of_gram,
+    DroppedColumn, IdentifiabilityAudit, audit_identifiability,
+    audit_identifiability_channel_aware, block_structural_penalty_dense,
+    priority_tiered_rank_from_gram, rank_of_gram,
 };
 use crate::families::compiler::{
     IdentityRowHessian, RowJacobianOperator, orthogonalize_design_blocks, symmetric_sqrt_into,
@@ -890,7 +891,9 @@ fn canonicalize_for_identifiability_inner(
     // penalty / monotonicity-constraint path.
     let owns_dynamic_zero_jacobian_geometry = |name: &str| -> bool {
         specs.iter().any(|spec| {
-            if spec.name != name || spec.stacked_design.is_some() || spec.jacobian_callback.is_none()
+            if spec.name != name
+                || spec.stacked_design.is_some()
+                || spec.jacobian_callback.is_none()
             {
                 return false;
             }
@@ -2348,9 +2351,9 @@ mod tests {
                      with a non-trailing redundant column (#1590); got: {reason}"
                 );
             }
-            Err(other) => panic!(
-                "competing-risks canonicalisation must succeed (#1590); got {other:?}"
-            ),
+            Err(other) => {
+                panic!("competing-risks canonicalisation must succeed (#1590); got {other:?}")
+            }
         }
     }
 
@@ -2402,11 +2405,7 @@ mod tests {
             .expect("dead-column callback block must canonicalise (#1590)");
         // The audit SEES the dead column (it is structurally rank-deficient)...
         assert!(
-            canon
-                .audit
-                .dropped_columns
-                .iter()
-                .any(|d| d.column == 0),
+            canon.audit.dropped_columns.iter().any(|d| d.column == 0),
             "audit should demote the dead column 0; got {:?}",
             canon.audit.dropped_columns,
         );

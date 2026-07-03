@@ -18,12 +18,12 @@
 //! REML-penalized thin-plate smooth shrinks the noise away and lands near the
 //! truth (RMSE well under σ); the #1074 defect did not.
 
+use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::Array2;
 use std::f64::consts::PI;
 

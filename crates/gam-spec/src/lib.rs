@@ -330,8 +330,7 @@ fn inverse_link_has_fisher_weight_jet(link: &InverseLink) -> bool {
                 | StandardLink::CLogLog
                 | StandardLink::LogLog
                 | StandardLink::Cauchit,
-        )
-            | InverseLink::LatentCLogLog(_)
+        ) | InverseLink::LatentCLogLog(_)
             | InverseLink::Sas(_)
             | InverseLink::BetaLogistic(_)
             | InverseLink::Mixture(_)
@@ -1353,10 +1352,10 @@ impl LikelihoodSpec {
             ResponseFamily::Binomial => match link {
                 InverseLink::Standard(
                     StandardLink::Logit
-                        | StandardLink::Probit
-                        | StandardLink::CLogLog
-                        | StandardLink::LogLog
-                        | StandardLink::Cauchit,
+                    | StandardLink::Probit
+                    | StandardLink::CLogLog
+                    | StandardLink::LogLog
+                    | StandardLink::Cauchit,
                 ) => true,
                 InverseLink::Standard(StandardLink::Identity | StandardLink::Log) => false,
                 InverseLink::LatentCLogLog(_)
@@ -2306,9 +2305,12 @@ mod tests {
     #[test]
     fn prior_normal_log_precision_infinite_mean_errors() {
         assert!(
-            CoefficientGroupPrior::NormalLogPrecision { mean: f64::INFINITY, sd: 1.0 }
-                .validate("ctx")
-                .is_err()
+            CoefficientGroupPrior::NormalLogPrecision {
+                mean: f64::INFINITY,
+                sd: 1.0
+            }
+            .validate("ctx")
+            .is_err()
         );
     }
 
@@ -2324,72 +2326,96 @@ mod tests {
     #[test]
     fn prior_normal_log_precision_negative_sd_errors() {
         assert!(
-            CoefficientGroupPrior::NormalLogPrecision { mean: 0.0, sd: -1.0 }
-                .validate("ctx")
-                .is_err()
+            CoefficientGroupPrior::NormalLogPrecision {
+                mean: 0.0,
+                sd: -1.0
+            }
+            .validate("ctx")
+            .is_err()
         );
     }
 
     #[test]
     fn prior_gamma_precision_valid() {
         assert!(
-            CoefficientGroupPrior::GammaPrecision { shape: 1.0, rate: 0.0 }
-                .validate("ctx")
-                .is_ok()
+            CoefficientGroupPrior::GammaPrecision {
+                shape: 1.0,
+                rate: 0.0
+            }
+            .validate("ctx")
+            .is_ok()
         );
     }
 
     #[test]
     fn prior_gamma_precision_zero_shape_errors() {
         assert!(
-            CoefficientGroupPrior::GammaPrecision { shape: 0.0, rate: 1.0 }
-                .validate("ctx")
-                .is_err()
+            CoefficientGroupPrior::GammaPrecision {
+                shape: 0.0,
+                rate: 1.0
+            }
+            .validate("ctx")
+            .is_err()
         );
     }
 
     #[test]
     fn prior_gamma_precision_negative_rate_errors() {
         assert!(
-            CoefficientGroupPrior::GammaPrecision { shape: 1.0, rate: -0.1 }
-                .validate("ctx")
-                .is_err()
+            CoefficientGroupPrior::GammaPrecision {
+                shape: 1.0,
+                rate: -0.1
+            }
+            .validate("ctx")
+            .is_err()
         );
     }
 
     #[test]
     fn prior_penalized_complexity_valid() {
         assert!(
-            CoefficientGroupPrior::PenalizedComplexity { upper: 1.0, tail_prob: 0.05 }
-                .validate("ctx")
-                .is_ok()
+            CoefficientGroupPrior::PenalizedComplexity {
+                upper: 1.0,
+                tail_prob: 0.05
+            }
+            .validate("ctx")
+            .is_ok()
         );
     }
 
     #[test]
     fn prior_penalized_complexity_zero_upper_errors() {
         assert!(
-            CoefficientGroupPrior::PenalizedComplexity { upper: 0.0, tail_prob: 0.05 }
-                .validate("ctx")
-                .is_err()
+            CoefficientGroupPrior::PenalizedComplexity {
+                upper: 0.0,
+                tail_prob: 0.05
+            }
+            .validate("ctx")
+            .is_err()
         );
     }
 
     #[test]
     fn prior_penalized_complexity_tail_prob_zero_errors() {
         assert!(
-            CoefficientGroupPrior::PenalizedComplexity { upper: 1.0, tail_prob: 0.0 }
-                .validate("ctx")
-                .is_err()
+            CoefficientGroupPrior::PenalizedComplexity {
+                upper: 1.0,
+                tail_prob: 0.0
+            }
+            .validate("ctx")
+            .is_err()
         );
     }
 
     #[test]
     fn prior_penalized_complexity_tail_prob_one_errors() {
         assert!(
-            CoefficientGroupPrior::PenalizedComplexity { upper: 1.0, tail_prob: 1.0 }
-                .validate("ctx")
-                .is_err()
+            CoefficientGroupPrior::PenalizedComplexity {
+                upper: 1.0,
+                tail_prob: 1.0
+            }
+            .validate("ctx")
+            .is_err()
         );
     }
 
@@ -2468,9 +2494,18 @@ mod tests {
     #[test]
     fn standard_link_roundtrip_to_link_function() {
         assert_eq!(StandardLink::Logit.as_link_function(), LinkFunction::Logit);
-        assert_eq!(StandardLink::Probit.as_link_function(), LinkFunction::Probit);
-        assert_eq!(StandardLink::CLogLog.as_link_function(), LinkFunction::CLogLog);
-        assert_eq!(StandardLink::Identity.as_link_function(), LinkFunction::Identity);
+        assert_eq!(
+            StandardLink::Probit.as_link_function(),
+            LinkFunction::Probit
+        );
+        assert_eq!(
+            StandardLink::CLogLog.as_link_function(),
+            LinkFunction::CLogLog
+        );
+        assert_eq!(
+            StandardLink::Identity.as_link_function(),
+            LinkFunction::Identity
+        );
         assert_eq!(StandardLink::Log.as_link_function(), LinkFunction::Log);
     }
 
@@ -2482,8 +2517,14 @@ mod tests {
 
     #[test]
     fn standard_link_from_link_function_standard_ok() {
-        assert_eq!(StandardLink::try_from(LinkFunction::Logit), Ok(StandardLink::Logit));
-        assert_eq!(StandardLink::try_from(LinkFunction::Log), Ok(StandardLink::Log));
+        assert_eq!(
+            StandardLink::try_from(LinkFunction::Logit),
+            Ok(StandardLink::Logit)
+        );
+        assert_eq!(
+            StandardLink::try_from(LinkFunction::Log),
+            Ok(StandardLink::Log)
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2492,65 +2533,87 @@ mod tests {
 
     #[test]
     fn legal_cells_accepted() {
-        assert!(LikelihoodSpec::try_new(
-            ResponseFamily::Gaussian,
-            InverseLink::Standard(StandardLink::Identity)
-        )
-        .is_ok());
-        assert!(LikelihoodSpec::try_new(
-            ResponseFamily::Poisson,
-            InverseLink::Standard(StandardLink::Log)
-        )
-        .is_ok());
-        assert!(LikelihoodSpec::try_new(
-            ResponseFamily::Gamma,
-            InverseLink::Standard(StandardLink::Log)
-        )
-        .is_ok());
-        assert!(LikelihoodSpec::try_new(
-            ResponseFamily::Beta { phi: 1.0 },
-            InverseLink::Standard(StandardLink::Logit)
-        )
-        .is_ok());
-        assert!(LikelihoodSpec::try_new(
-            ResponseFamily::Binomial,
-            InverseLink::Standard(StandardLink::Logit)
-        )
-        .is_ok());
-        assert!(LikelihoodSpec::try_new(
-            ResponseFamily::Binomial,
-            InverseLink::Standard(StandardLink::Probit)
-        )
-        .is_ok());
-        assert!(LikelihoodSpec::try_new(
-            ResponseFamily::Binomial,
-            InverseLink::Standard(StandardLink::CLogLog)
-        )
-        .is_ok());
+        assert!(
+            LikelihoodSpec::try_new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(StandardLink::Identity)
+            )
+            .is_ok()
+        );
+        assert!(
+            LikelihoodSpec::try_new(
+                ResponseFamily::Poisson,
+                InverseLink::Standard(StandardLink::Log)
+            )
+            .is_ok()
+        );
+        assert!(
+            LikelihoodSpec::try_new(
+                ResponseFamily::Gamma,
+                InverseLink::Standard(StandardLink::Log)
+            )
+            .is_ok()
+        );
+        assert!(
+            LikelihoodSpec::try_new(
+                ResponseFamily::Beta { phi: 1.0 },
+                InverseLink::Standard(StandardLink::Logit)
+            )
+            .is_ok()
+        );
+        assert!(
+            LikelihoodSpec::try_new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(StandardLink::Logit)
+            )
+            .is_ok()
+        );
+        assert!(
+            LikelihoodSpec::try_new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(StandardLink::Probit)
+            )
+            .is_ok()
+        );
+        assert!(
+            LikelihoodSpec::try_new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(StandardLink::CLogLog)
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn illegal_cells_rejected() {
-        assert!(LikelihoodSpec::try_new(
-            ResponseFamily::Poisson,
-            InverseLink::Standard(StandardLink::Identity)
-        )
-        .is_err());
-        assert!(LikelihoodSpec::try_new(
-            ResponseFamily::Gaussian,
-            InverseLink::Standard(StandardLink::Logit)
-        )
-        .is_err());
-        assert!(LikelihoodSpec::try_new(
-            ResponseFamily::Binomial,
-            InverseLink::Standard(StandardLink::Log)
-        )
-        .is_err());
-        assert!(LikelihoodSpec::try_new(
-            ResponseFamily::Binomial,
-            InverseLink::Standard(StandardLink::Identity)
-        )
-        .is_err());
+        assert!(
+            LikelihoodSpec::try_new(
+                ResponseFamily::Poisson,
+                InverseLink::Standard(StandardLink::Identity)
+            )
+            .is_err()
+        );
+        assert!(
+            LikelihoodSpec::try_new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(StandardLink::Logit)
+            )
+            .is_err()
+        );
+        assert!(
+            LikelihoodSpec::try_new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(StandardLink::Log)
+            )
+            .is_err()
+        );
+        assert!(
+            LikelihoodSpec::try_new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(StandardLink::Identity)
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2577,7 +2640,9 @@ mod tests {
         let y = arr1(&[0.0_f64, 1.0]);
         let result = ResponseFamily::infer_from_response(
             y.view(),
-            ResponseColumnKind::Categorical { levels: vec!["yes".to_string(), "no".to_string()] },
+            ResponseColumnKind::Categorical {
+                levels: vec!["yes".to_string(), "no".to_string()],
+            },
         );
         assert!(result.is_err());
     }
@@ -2585,32 +2650,28 @@ mod tests {
     #[test]
     fn infer_numeric_binary_values_gives_binomial() {
         let y = arr1(&[0.0_f64, 1.0, 0.0, 1.0, 0.0]);
-        let result =
-            ResponseFamily::infer_from_response(y.view(), ResponseColumnKind::Numeric);
+        let result = ResponseFamily::infer_from_response(y.view(), ResponseColumnKind::Numeric);
         assert!(matches!(result, Ok(ResponseFamily::Binomial)));
     }
 
     #[test]
     fn infer_numeric_count_values_gives_poisson() {
         let y = arr1(&[0.0_f64, 1.0, 2.0, 3.0, 5.0]);
-        let result =
-            ResponseFamily::infer_from_response(y.view(), ResponseColumnKind::Numeric);
+        let result = ResponseFamily::infer_from_response(y.view(), ResponseColumnKind::Numeric);
         assert!(matches!(result, Ok(ResponseFamily::Poisson)));
     }
 
     #[test]
     fn infer_numeric_fractional_gives_gaussian() {
         let y = arr1(&[1.5_f64, 2.3, 3.7]);
-        let result =
-            ResponseFamily::infer_from_response(y.view(), ResponseColumnKind::Numeric);
+        let result = ResponseFamily::infer_from_response(y.view(), ResponseColumnKind::Numeric);
         assert!(matches!(result, Ok(ResponseFamily::Gaussian)));
     }
 
     #[test]
     fn infer_numeric_negative_gives_gaussian() {
         let y = arr1(&[-1.0_f64, 0.0, 1.0]);
-        let result =
-            ResponseFamily::infer_from_response(y.view(), ResponseColumnKind::Numeric);
+        let result = ResponseFamily::infer_from_response(y.view(), ResponseColumnKind::Numeric);
         assert!(matches!(result, Ok(ResponseFamily::Gaussian)));
     }
 
@@ -2621,73 +2682,121 @@ mod tests {
     #[test]
     fn gaussian_support_accepts_any_finite() {
         let y = arr1(&[-100.0_f64, 0.0, 100.0]);
-        assert!(ResponseFamily::Gaussian.validate_response_support(y.view()).is_ok());
+        assert!(
+            ResponseFamily::Gaussian
+                .validate_response_support(y.view())
+                .is_ok()
+        );
     }
 
     #[test]
     fn gamma_support_rejects_zero() {
         let y = arr1(&[0.0_f64, 1.0, 2.0]);
-        assert!(ResponseFamily::Gamma.validate_response_support(y.view()).is_err());
+        assert!(
+            ResponseFamily::Gamma
+                .validate_response_support(y.view())
+                .is_err()
+        );
     }
 
     #[test]
     fn gamma_support_rejects_negative() {
         let y = arr1(&[-1.0_f64, 1.0]);
-        assert!(ResponseFamily::Gamma.validate_response_support(y.view()).is_err());
+        assert!(
+            ResponseFamily::Gamma
+                .validate_response_support(y.view())
+                .is_err()
+        );
     }
 
     #[test]
     fn gamma_support_accepts_positive() {
         let y = arr1(&[0.1_f64, 1.0, 100.0]);
-        assert!(ResponseFamily::Gamma.validate_response_support(y.view()).is_ok());
+        assert!(
+            ResponseFamily::Gamma
+                .validate_response_support(y.view())
+                .is_ok()
+        );
     }
 
     #[test]
     fn binomial_support_accepts_fractional_proportions() {
         let y = arr1(&[0.0_f64, 0.5, 1.0]);
-        assert!(ResponseFamily::Binomial.validate_response_support(y.view()).is_ok());
+        assert!(
+            ResponseFamily::Binomial
+                .validate_response_support(y.view())
+                .is_ok()
+        );
     }
 
     #[test]
     fn binomial_support_rejects_values_outside_unit_interval() {
         let y = arr1(&[0.0_f64, -0.1, 1.1]);
-        assert!(ResponseFamily::Binomial.validate_response_support(y.view()).is_err());
+        assert!(
+            ResponseFamily::Binomial
+                .validate_response_support(y.view())
+                .is_err()
+        );
     }
 
     #[test]
     fn binomial_support_accepts_binary() {
         let y = arr1(&[0.0_f64, 1.0, 0.0, 1.0]);
-        assert!(ResponseFamily::Binomial.validate_response_support(y.view()).is_ok());
+        assert!(
+            ResponseFamily::Binomial
+                .validate_response_support(y.view())
+                .is_ok()
+        );
     }
 
     #[test]
     fn poisson_support_rejects_negative() {
         let y = arr1(&[-1.0_f64, 0.0, 1.0]);
-        assert!(ResponseFamily::Poisson.validate_response_support(y.view()).is_err());
+        assert!(
+            ResponseFamily::Poisson
+                .validate_response_support(y.view())
+                .is_err()
+        );
     }
 
     #[test]
     fn poisson_support_accepts_nonneg() {
         let y = arr1(&[0.0_f64, 1.0, 2.0, 10.0]);
-        assert!(ResponseFamily::Poisson.validate_response_support(y.view()).is_ok());
+        assert!(
+            ResponseFamily::Poisson
+                .validate_response_support(y.view())
+                .is_ok()
+        );
     }
 
     #[test]
     fn beta_support_rejects_zero_boundary() {
         let y = arr1(&[0.0_f64, 0.5]);
-        assert!(ResponseFamily::Beta { phi: 1.0 }.validate_response_support(y.view()).is_err());
+        assert!(
+            ResponseFamily::Beta { phi: 1.0 }
+                .validate_response_support(y.view())
+                .is_err()
+        );
     }
 
     #[test]
     fn beta_support_rejects_one_boundary() {
         let y = arr1(&[0.5_f64, 1.0]);
-        assert!(ResponseFamily::Beta { phi: 1.0 }.validate_response_support(y.view()).is_err());
+        assert!(
+            ResponseFamily::Beta { phi: 1.0 }
+                .validate_response_support(y.view())
+                .is_err()
+        );
     }
 
     #[test]
     fn beta_support_accepts_open_interval() {
         let y = arr1(&[0.1_f64, 0.5, 0.9]);
-        assert!(ResponseFamily::Beta { phi: 1.0 }.validate_response_support(y.view()).is_ok());
+        assert!(
+            ResponseFamily::Beta { phi: 1.0 }
+                .validate_response_support(y.view())
+                .is_ok()
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2697,25 +2806,41 @@ mod tests {
     #[test]
     fn binomial_degeneracy_all_zeros_errors() {
         let y = arr1(&[0.0_f64, 0.0, 0.0]);
-        assert!(ResponseFamily::Binomial.validate_response_degeneracy(y.view()).is_err());
+        assert!(
+            ResponseFamily::Binomial
+                .validate_response_degeneracy(y.view())
+                .is_err()
+        );
     }
 
     #[test]
     fn binomial_degeneracy_all_ones_errors() {
         let y = arr1(&[1.0_f64, 1.0, 1.0]);
-        assert!(ResponseFamily::Binomial.validate_response_degeneracy(y.view()).is_err());
+        assert!(
+            ResponseFamily::Binomial
+                .validate_response_degeneracy(y.view())
+                .is_err()
+        );
     }
 
     #[test]
     fn binomial_degeneracy_mixed_ok() {
         let y = arr1(&[0.0_f64, 1.0, 0.0]);
-        assert!(ResponseFamily::Binomial.validate_response_degeneracy(y.view()).is_ok());
+        assert!(
+            ResponseFamily::Binomial
+                .validate_response_degeneracy(y.view())
+                .is_ok()
+        );
     }
 
     #[test]
     fn binomial_degeneracy_fractional_proportions_ok() {
         let y = arr1(&[0.0_f64, 0.5, 0.75]);
-        assert!(ResponseFamily::Binomial.validate_response_degeneracy(y.view()).is_ok());
+        assert!(
+            ResponseFamily::Binomial
+                .validate_response_degeneracy(y.view())
+                .is_ok()
+        );
     }
 
     #[test]
@@ -2728,9 +2853,11 @@ mod tests {
         // varies below the sd floor without being exactly constant keeps the
         // rejection (see `gaussian_degeneracy_near_constant_reproducer_errors`).
         let y = arr1(&[1.0_f64, 1.0, 1.0]);
-        assert!(ResponseFamily::Gaussian
-            .validate_response_degeneracy(y.view())
-            .is_ok());
+        assert!(
+            ResponseFamily::Gaussian
+                .validate_response_degeneracy(y.view())
+                .is_ok()
+        );
     }
 
     #[test]
@@ -2766,9 +2893,11 @@ mod tests {
     fn gaussian_degeneracy_well_conditioned_ok() {
         // A genuinely varying response (sd ~ O(1)) is never tripped.
         let y = arr1(&[-2.0_f64, 0.5, 1.7, 3.0, -1.1, 2.2]);
-        assert!(ResponseFamily::Gaussian
-            .validate_response_degeneracy(y.view())
-            .is_ok());
+        assert!(
+            ResponseFamily::Gaussian
+                .validate_response_degeneracy(y.view())
+                .is_ok()
+        );
     }
 
     #[test]
@@ -2777,9 +2906,11 @@ mod tests {
         // small-but-real signal (e.g. a finely-resolved measurement) must fit,
         // so the guard must not over-reject.
         let y = arr1(&[1.0_f64, 1.0 + 1.0e-6, 1.0 - 1.0e-6, 1.0 + 2.0e-6]);
-        assert!(ResponseFamily::Gaussian
-            .validate_response_degeneracy(y.view())
-            .is_ok());
+        assert!(
+            ResponseFamily::Gaussian
+                .validate_response_degeneracy(y.view())
+                .is_ok()
+        );
     }
 
     #[test]
@@ -2787,9 +2918,11 @@ mod tests {
         // Fewer than two observations carries no estimable scale degeneracy;
         // the sample-size gate handles too-small data separately.
         let y = arr1(&[42.0_f64]);
-        assert!(ResponseFamily::Gaussian
-            .validate_response_degeneracy(y.view())
-            .is_ok());
+        assert!(
+            ResponseFamily::Gaussian
+                .validate_response_degeneracy(y.view())
+                .is_ok()
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2798,7 +2931,10 @@ mod tests {
 
     #[test]
     fn mean_clamp_bounds_binomial_unit_interval() {
-        assert_eq!(ResponseFamily::Binomial.mean_clamp_bounds(), Some((0.0, 1.0)));
+        assert_eq!(
+            ResponseFamily::Binomial.mean_clamp_bounds(),
+            Some((0.0, 1.0))
+        );
     }
 
     #[test]
@@ -2821,7 +2957,10 @@ mod tests {
 
     #[test]
     fn response_support_bounds_binomial_unit_interval() {
-        assert_eq!(ResponseFamily::Binomial.response_support_bounds(), Some((0.0, 1.0)));
+        assert_eq!(
+            ResponseFamily::Binomial.response_support_bounds(),
+            Some((0.0, 1.0))
+        );
     }
 
     #[test]
@@ -2880,7 +3019,10 @@ mod tests {
             FamilySpecKind::NegativeBinomialLog { theta: 2.0 }.name(),
             "negative-binomial-log"
         );
-        assert_eq!(FamilySpecKind::BetaLogit { phi: 5.0 }.name(), "beta-regression-logit");
+        assert_eq!(
+            FamilySpecKind::BetaLogit { phi: 5.0 }.name(),
+            "beta-regression-logit"
+        );
         assert_eq!(FamilySpecKind::RoystonParmar.name(), "royston-parmar");
     }
 
@@ -2893,12 +3035,18 @@ mod tests {
 
     #[test]
     fn family_spec_kind_pretty_name_gaussian() {
-        assert_eq!(FamilySpecKind::GaussianIdentity.pretty_name(), "Gaussian Identity");
+        assert_eq!(
+            FamilySpecKind::GaussianIdentity.pretty_name(),
+            "Gaussian Identity"
+        );
     }
 
     #[test]
     fn family_spec_kind_pretty_name_binomial_logit() {
-        assert_eq!(FamilySpecKind::BinomialLogit.pretty_name(), "Binomial Logit");
+        assert_eq!(
+            FamilySpecKind::BinomialLogit.pretty_name(),
+            "Binomial Logit"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2969,7 +3117,10 @@ mod tests {
             // Must not panic; must land on the matching binomial kind.
             let kind = spec.kind();
             assert!(kind.is_binomial(), "kind {kind:?} must be binomial");
-            assert!(kind.supports_firth(), "binomial probability link supports Firth");
+            assert!(
+                kind.supports_firth(),
+                "binomial probability link supports Firth"
+            );
         }
         assert_eq!(
             LikelihoodSpec::try_new(

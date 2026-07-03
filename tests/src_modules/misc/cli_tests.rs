@@ -61,6 +61,7 @@ use gam::inference::model_payload_builders::{
     assemble_bernoulli_marginal_slope_payload,
 };
 use gam::matrix::{DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator};
+use gam::mixture_link::mixture_inverse_link_jet;
 use gam::probability::normal_cdf;
 use gam::smooth::{
     LinearCoefficientGeometry, LinearTermSpec, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec,
@@ -68,7 +69,6 @@ use gam::smooth::{
 use gam::term_builder::{
     heuristic_knots_for_column, parse_duchon_order, parse_duchon_power, unique_count_column,
 };
-use gam::mixture_link::mixture_inverse_link_jet;
 use gam::types::{
     InverseLink, LikelihoodScaleMetadata, LinkComponent, LinkFunction, LogLikelihoodNormalization,
     StandardLink, WigglePenaltyConfig,
@@ -1422,8 +1422,7 @@ fn cli_predict_noise_default_logit_base_link_fits_without_blend_spec() {
     .unwrap_or_else(|e| {
         panic!(
             "{} failed: {:?}",
-            "default-logit location-scale predict-noise fit should succeed without a blend spec",
-            e
+            "default-logit location-scale predict-noise fit should succeed without a blend spec", e
         )
     });
 
@@ -1441,7 +1440,10 @@ fn cli_predict_noise_default_logit_base_link_fits_without_blend_spec() {
         } => {
             assert_eq!(*likelihood, LikelihoodSpec::binomial_logit());
             assert!(
-                matches!(base_link.as_ref(), Some(InverseLink::Standard(StandardLink::Logit))),
+                matches!(
+                    base_link.as_ref(),
+                    Some(InverseLink::Standard(StandardLink::Logit))
+                ),
                 "expected logit base link, got {base_link:?}"
             );
         }
@@ -2067,8 +2069,7 @@ fn cli_binomial_sas_link_fit_survives_outer_inner_cap_guard() {
     let td = tempdir().unwrap_or_else(|e| panic!("{} failed: {:?}", "tempdir", e));
     let model_path = td.path().join("model.json");
 
-    let fit_args =
-        binomial_link_fit_args(fixture, model_path.clone(), "y ~ s(x) + link(type=sas)");
+    let fit_args = binomial_link_fit_args(fixture, model_path.clone(), "y ~ s(x) + link(type=sas)");
     let result = run_fit(fit_args);
     if let Err(e) = &result {
         let msg = format!("{e:?}");

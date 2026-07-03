@@ -100,15 +100,13 @@ pub fn report_power_law_full(
         return Some(fit);
     }
     eprintln!("{tag} budget: {:.1}", budget_y);
-    let valid_xs = points
-        .iter()
-        .filter_map(|(x, y)| {
-            if *x > 0.0 && x.is_finite() && *y > 0.0 && y.is_finite() {
-                Some(*x)
-            } else {
-                None
-            }
-        });
+    let valid_xs = points.iter().filter_map(|(x, y)| {
+        if *x > 0.0 && x.is_finite() && *y > 0.0 && y.is_finite() {
+            Some(*x)
+        } else {
+            None
+        }
+    });
     let (min_x, max_x) = valid_xs.fold((f64::INFINITY, 0.0_f64), |(min_x, max_x), x| {
         (min_x.min(x), max_x.max(x))
     });

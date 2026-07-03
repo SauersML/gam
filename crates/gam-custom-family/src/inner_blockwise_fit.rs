@@ -3,8 +3,8 @@
 //! `outer_objective.rs` by concern (#1145). Re-exported via
 //! `custom_family` so existing paths stay stable.
 
-use super::*;
 use super::blockwise_solve::BlockWorkingSetUpdaterExt;
+use super::*;
 use gam_solve::row_measure::RowSubsampleMaskExt;
 
 pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
@@ -218,8 +218,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         );
     }
     let ridge = effective_solverridge(options.ridge_floor);
-    let joint_bundle: Option<&gam_problem::JointPenaltyBundle> =
-        options.joint_penalties.as_deref();
+    let joint_bundle: Option<&gam_problem::JointPenaltyBundle> = options.joint_penalties.as_deref();
     if let Some(bundle) = joint_bundle {
         for (i, spec) in bundle.specs.iter().enumerate() {
             if spec.dim() != total_joint_p {
@@ -765,9 +764,8 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         // discipline (grow on flat, reset on recovery) is the shared
         // loop_guard::FlatStreak so it cannot drift from the other
         // stagnation detectors in the tree (#968).
-        let mut obj_flat_streak = gam_solve::loop_guard::FlatStreak::new(
-            gam_solve::loop_guard::PLATEAU_DEFAULT_WINDOW,
-        );
+        let mut obj_flat_streak =
+            gam_solve::loop_guard::FlatStreak::new(gam_solve::loop_guard::PLATEAU_DEFAULT_WINDOW);
         // Total descent budget across the joint-Newton loop, used by
         // the end-of-loop summary to report `descent_total`.
         let initial_joint_objective: f64 = lastobjective;
@@ -1768,7 +1766,8 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                                 // model preserves the linear-but-monotone endgame the
                                 // divided-difference solve already certifies.
                                 if custom_family_jeffreys_completion_preserves_psd(
-                                    hphi, &completion,
+                                    hphi,
+                                    &completion,
                                 ) {
                                     lhs_true += &completion;
                                 }
@@ -2715,10 +2714,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 // any further auto-install; if either contract is broken the
                 // id will diverge from `tr_row_measure_top` and we Err below.
                 let tr_row_measure_trial =
-                    gam_solve::row_measure::RowSubsampleMask::from_options(
-                        options,
-                        total_joint_n,
-                    );
+                    gam_solve::row_measure::RowSubsampleMask::from_options(options, total_joint_n);
                 // Hard invariant: the trust-region ratio numerator (objective
                 // at β minus trial at β+δ) and denominator (rhs·δ − ½δᵀH δ)
                 // MUST share a row measure with the Hessian/gradient build.
@@ -5228,14 +5224,13 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 let oldest = *residual_rate_history.front().unwrap();
                 // Single source of truth for the slow-geometric-rate projection
                 // (gam#979): deterministic cycle-count projection, no wall-clock.
-                let too_slow =
-                    gam_solve::loop_guard::slow_geometric_rate_exceeds_projection_cap(
-                        residual,
-                        oldest,
-                        LINEAR_RATE_WINDOW,
-                        residual_tol,
-                        LINEAR_RATE_PROJECTION_CAP,
-                    );
+                let too_slow = gam_solve::loop_guard::slow_geometric_rate_exceeds_projection_cap(
+                    residual,
+                    oldest,
+                    LINEAR_RATE_WINDOW,
+                    residual_tol,
+                    LINEAR_RATE_PROJECTION_CAP,
+                );
                 if too_slow {
                     log::warn!(
                         "[PIRLS/joint-Newton convergence] cycle {:>3} | slow-geometric-rate stall early-exit (gam#979): residual={:.3e} (tol={:.3e}) descending at ~{:.4}×/cycle over the last {} cycles — projected >{} more cycles to reach tol; the residual is converging but far too slowly to finish in a practical budget (the survival marginal-slope oversmoothed-ρ endgame), so returning unconverged with finite β instead of grinding to inner_max_cycles={}.",
@@ -5415,8 +5410,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             let ift_gradient = augmented_joint_gradient
                 .as_ref()
                 .or(cached_joint_gradient.as_ref());
-            let joint_penalty_score =
-                joint_penalty_stationarity_score(options, specs, &states);
+            let joint_penalty_score = joint_penalty_stationarity_score(options, specs, &states);
             let kkt_residual = exact_newton_joint_kkt_residual_for_ift_from_cached_gradient(
                 family,
                 specs,

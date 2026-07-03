@@ -3017,15 +3017,16 @@ mod tests {
         // Column value depends only on the row → both columns are identical.
         let a = Array2::from_shape_fn((n, 2), |(i, _)| ((i + 1) as f64 * 0.37).sin());
         // Block B: genuinely independent, so it survives at full width.
-        let b = Array2::from_shape_fn((n, 2), |(i, j)| ((i + 1) as f64 * (0.29 + j as f64 * 0.11)).cos());
+        let b = Array2::from_shape_fn((n, 2), |(i, j)| {
+            ((i + 1) as f64 * (0.29 + j as f64 * 0.11)).cos()
+        });
         let w = Array1::ones(n);
         let (gram_h, gram_struct, raw_ranges) = scalar_grams_two_block(&a, &b, &w);
         let ordering = [BlockOrder::Time, BlockOrder::Marginal];
 
         // Unprotected: the duplicate column is dropped → block 0 reduces to 1.
-        let unprotected =
-            compile_from_raw_grams(&gram_h, &gram_struct, &raw_ranges, &ordering)
-                .expect("unprotected compile");
+        let unprotected = compile_from_raw_grams(&gram_h, &gram_struct, &raw_ranges, &ordering)
+            .expect("unprotected compile");
         assert_eq!(
             unprotected.compiled_block_ranges[0].len(),
             1,
@@ -3034,9 +3035,14 @@ mod tests {
 
         // Protected: block 0 keeps both raw columns; T's block-0 diagonal is the
         // 2×2 identity (raw coords == compiled coords for the protected block).
-        let protected =
-            compile_from_raw_grams_protected(&gram_h, &gram_struct, &raw_ranges, &ordering, &[true, false])
-                .expect("protected compile");
+        let protected = compile_from_raw_grams_protected(
+            &gram_h,
+            &gram_struct,
+            &raw_ranges,
+            &ordering,
+            &[true, false],
+        )
+        .expect("protected compile");
         assert_eq!(
             protected.compiled_block_ranges[0].len(),
             2,

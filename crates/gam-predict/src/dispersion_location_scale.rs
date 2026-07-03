@@ -403,7 +403,10 @@ mod tests {
         let theta = 4.0_f64;
         let mu = 2.0_f64; // exp(ln 2) via log link
         let mut pred = make_pred(
-            ResponseFamily::NegativeBinomial { theta: 1.0, theta_fixed: false },
+            ResponseFamily::NegativeBinomial {
+                theta: 1.0,
+                theta_fixed: false,
+            },
             StandardLink::Log,
         );
         pred.beta_mu = array![mu.ln()];
@@ -441,10 +444,7 @@ mod tests {
     fn beta_noise_sd_uses_correct_mean_variance_law() {
         let phi = 7.0_f64;
         let mu = 0.5_f64; // logit⁻¹(0) = 0.5
-        let pred = make_pred(
-            ResponseFamily::Beta { phi: 1.0 },
-            StandardLink::Logit,
-        );
+        let pred = make_pred(ResponseFamily::Beta { phi: 1.0 }, StandardLink::Logit);
         let input = make_input(phi.ln());
         let sd = pred.noise_sd(&input).expect("Beta noise_sd");
         let expected = (mu * (1.0 - mu) / (1.0 + phi)).sqrt();
@@ -483,7 +483,9 @@ mod tests {
         let phi = 1.0 / precision;
         let pred = make_pred(ResponseFamily::Tweedie { p: 1.5 }, StandardLink::Log);
         let input = make_input(precision.ln());
-        let disp = pred.per_row_dispersion(&input).expect("Tweedie per_row_dispersion");
+        let disp = pred
+            .per_row_dispersion(&input)
+            .expect("Tweedie per_row_dispersion");
         assert!(
             (disp[0] - phi).abs() < 1e-12,
             "Tweedie dispersion: got {:.6e}, expected phi={:.6e}",
@@ -497,11 +499,16 @@ mod tests {
     fn nb_per_row_dispersion_is_precision() {
         let theta = 6.0_f64;
         let pred = make_pred(
-            ResponseFamily::NegativeBinomial { theta: 1.0, theta_fixed: false },
+            ResponseFamily::NegativeBinomial {
+                theta: 1.0,
+                theta_fixed: false,
+            },
             StandardLink::Log,
         );
         let input = make_input(theta.ln());
-        let disp = pred.per_row_dispersion(&input).expect("NB per_row_dispersion");
+        let disp = pred
+            .per_row_dispersion(&input)
+            .expect("NB per_row_dispersion");
         assert!(
             (disp[0] - theta).abs() < 1e-12,
             "NB dispersion: got {:.6e}, expected theta={:.6e}",

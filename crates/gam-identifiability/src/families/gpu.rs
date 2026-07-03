@@ -80,11 +80,11 @@ pub fn try_primary_state_gram_cuda(
 #[cfg(target_os = "linux")]
 mod cuda_impl {
     use super::{CHANNELS, GramBundle, PACKED_LEN, packed_index};
-    use gam_gpu::device_runtime::{GpuRuntime, cuda_context_for};
-    use gam_gpu::driver::{to_col_major, to_i32};
     use cudarc::cublas::sys::{cublasOperation_t, cublasSideMode_t, cublasStatus_t};
     use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
     use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
+    use gam_gpu::device_runtime::{GpuRuntime, cuda_context_for};
+    use gam_gpu::driver::{to_col_major, to_i32};
     use ndarray::Array2;
     use std::cell::RefCell;
     use std::ops::Range;

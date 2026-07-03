@@ -134,8 +134,9 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
         // exact geometry ALO path (saved Hessian, no refit). `likelihood_scale`
         // is threaded from the fit so any scale-carrying family (fixed-φ
         // Gaussian, Tweedie, Gamma, Beta) reproduces bit-for-bit.
-        let recomputed = geometry_alo_working_state(&family, unified, &eta, y.view(), weights.view())
-            .map_err(|e| format!("failed to recompute working state for geometry ALO: {e}"))?;
+        let recomputed =
+            geometry_alo_working_state(&family, unified, &eta, y.view(), weights.view())
+                .map_err(|e| format!("failed to recompute working state for geometry ALO: {e}"))?;
         let input = gam::alo::AloInput::from_geometry_with_working_state(
             geom,
             &alo_design_dense,

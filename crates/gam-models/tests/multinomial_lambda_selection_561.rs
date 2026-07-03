@@ -90,8 +90,14 @@ fn synth() -> (gam_data::EncodedDataset, Vec<[f64; K]>) {
         ]));
         truth.push(p);
     }
-    let headers: Vec<String> = ["x1", "x2", "x3", "y"].iter().map(|s| s.to_string()).collect();
-    (encode_recordswith_inferred_schema(headers, rows).expect("encode"), truth)
+    let headers: Vec<String> = ["x1", "x2", "x3", "y"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    (
+        encode_recordswith_inferred_schema(headers, rows).expect("encode"),
+        truth,
+    )
 }
 
 fn rmse_vs_truth(
@@ -164,7 +170,10 @@ fn multinomial_outer_reml_selects_per_term_lambda_and_recovers_truth() {
     let per_block = &model.lambdas_per_block;
     assert!(!per_block.is_empty(), "must report per-class λ block sizes");
     let n0 = per_block[0];
-    assert!(n0 >= 2, "class 0 must carry ≥2 penalty components, got {n0}");
+    assert!(
+        n0 >= 2,
+        "class 0 must carry ≥2 penalty components, got {n0}"
+    );
     let class0 = &model.lambdas[..n0];
     let lam_max = class0.iter().cloned().fold(f64::MIN, f64::max);
     let lam_min = class0.iter().cloned().fold(f64::MAX, f64::min);

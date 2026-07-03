@@ -148,9 +148,9 @@ pub fn build_term_collection_design_inner(
 
     // Block 1: linear terms.
     if let Some(lin_block) = linear_block {
-        blocks.push(DesignBlock::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
-            lin_block,
-        )));
+        blocks.push(DesignBlock::Dense(
+            gam_linalg::matrix::DenseDesignMatrix::from(lin_block),
+        ));
     }
 
     // Blocks: random-effect operators — O(n) implicit one-hot.
@@ -411,10 +411,9 @@ fn smooth_basis_has_one_sided_anchored_bspline(basis: &SmoothBasisSpec) -> bool 
         SmoothBasisSpec::BySmooth { smooth, .. } => {
             smooth_basis_has_one_sided_anchored_bspline(smooth)
         }
-        SmoothBasisSpec::TensorBSpline { spec, .. } => spec
-            .marginalspecs
-            .iter()
-            .any(|marginal| bspline_conditions_have_one_sided_anchor(&marginal.boundary_conditions)),
+        SmoothBasisSpec::TensorBSpline { spec, .. } => spec.marginalspecs.iter().any(|marginal| {
+            bspline_conditions_have_one_sided_anchor(&marginal.boundary_conditions)
+        }),
         SmoothBasisSpec::FactorSmooth { .. }
         | SmoothBasisSpec::ThinPlate { .. }
         | SmoothBasisSpec::Sphere { .. }
@@ -1168,7 +1167,8 @@ fn apply_global_smooth_identifiability(
                 match rebuilt_block {
                     Some(ridge_block) => {
                         let mut full = Array2::<f64>::zeros((q, q));
-                        full.slice_mut(s![*plo..*phi, *plo..*phi]).assign(&ridge_block);
+                        full.slice_mut(s![*plo..*phi, *plo..*phi])
+                            .assign(&ridge_block);
                         let (matrix, scale) = normalize_penalty_in_constrained_space(&full);
                         candidate.matrix = matrix;
                         candidate.normalization_scale = scale;
@@ -1498,9 +1498,9 @@ fn apply_smooth_transform_to_design(
                     "smooth identifiability transform failed for term '{termname}': {e}"
                 ))
             })?;
-            Ok(DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
-                Arc::new(op),
-            )))
+            Ok(DesignMatrix::Dense(
+                gam_linalg::matrix::DenseDesignMatrix::from(Arc::new(op)),
+            ))
         }
         DesignMatrix::Sparse(inner) => {
             let dense = inner
@@ -1508,9 +1508,9 @@ fn apply_smooth_transform_to_design(
                 .map_err(BasisError::InvalidInput)?
                 .as_ref()
                 .dot(transform);
-            Ok(DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
-                dense,
-            )))
+            Ok(DesignMatrix::Dense(
+                gam_linalg::matrix::DenseDesignMatrix::from(dense),
+            ))
         }
     }
 }
@@ -2024,4 +2024,3 @@ pub fn orthogonality_relative_residual_for_design(
     let denom = (b_norm * c_norm).max(1e-300);
     Ok(num / denom)
 }
-

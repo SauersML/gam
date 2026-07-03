@@ -223,7 +223,11 @@ fn dense_stats_of<F: Fn(f64) -> Result<Array2<f64>, String>>(
         *slot = w * zi;
         zt_w_z += w * zi * zi;
     }
-    (design.t().dot(&weighted_design), design.t().dot(&wz), zt_w_z)
+    (
+        design.t().dot(&weighted_design),
+        design.t().dot(&wz),
+        zt_w_z,
+    )
 }
 
 /// When the full-rank projector witness ACCEPTS a moving-ψ pair, the n-free skip
@@ -289,8 +293,12 @@ fn reduced_basis_skip_witness_serves_accurate_nfree_stats() {
         build_calls,
         "trial accessor re-entered the n-row design realizer"
     );
-    let (dense_gram, dense_rhs, _) =
-        dense_stats_of(&|psi| range_invariant_design(psi, n, k), psi_trial, &weights, &z);
+    let (dense_gram, dense_rhs, _) = dense_stats_of(
+        &|psi| range_invariant_design(psi, n, k),
+        psi_trial,
+        &weights,
+        &z,
+    );
     let dense_dev =
         ridge_profile_deviance(&dense_gram, &dense_rhs, cache.centered_weighted_y_sq, 0.7);
     let hoisted_dev = ridge_profile_deviance(

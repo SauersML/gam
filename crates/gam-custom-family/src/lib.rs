@@ -35,12 +35,12 @@
 pub(crate) use gam_problem::{bail_dim_custom, bail_invalid_estim};
 
 // --- crate-internal (gam-solve) imports ---------------------------------
-pub(crate) use gam_solve::active_set::{
-    project_stationarity_residual_on_constraint_cone, solve_quadratic_with_linear_constraints,
-};
 pub(crate) use crate::custom_family_persistent_warm_start::{
     capture_fit_artifact, consume_fit_artifact, load_persistent_custom_family_warm_start,
     store_persistent_custom_family_warm_start, update_custom_outer_inner_cap_from_warm_start,
+};
+pub(crate) use gam_solve::active_set::{
+    project_stationarity_residual_on_constraint_cone, solve_quadratic_with_linear_constraints,
 };
 pub(crate) use gam_solve::estimate::reml::penalty_logdet::PenaltyPseudologdet;
 pub(crate) use gam_solve::estimate::reml::reml_outer_engine::{
@@ -130,13 +130,13 @@ mod warm_start;
 
 // `pub use ...::*` preserves each item's own visibility (pub stays pub,
 // pub(crate) stays pub(crate)) so the prior flat-namespace API is unchanged.
-pub use assembly::*;
+pub(crate) use self::block_spec::custom_family_block_role;
+pub use self::block_spec::validate_blockspecs;
 pub use self::block_spec::{
     CoefficientBlockSelector, CoefficientGroupSpec, CoefficientLabel, RealizedCoefficientGroup,
     RealizedCoefficientGroupSpecs, coefficient_label,
 };
-pub(crate) use self::block_spec::custom_family_block_role;
-pub use self::block_spec::validate_blockspecs;
+pub use assembly::*;
 pub(crate) use blockwise_solve::*;
 pub use coefficient_groups::*;
 pub(crate) use covariance::*;

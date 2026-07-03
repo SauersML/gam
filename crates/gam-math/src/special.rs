@@ -145,7 +145,10 @@ mod tests {
 
     #[test]
     fn poly_exp_nonfinite_x_returns_zero() {
-        assert_eq!(stable_polynomial_times_exp_neg(f64::INFINITY, &[1.0, 2.0]), 0.0);
+        assert_eq!(
+            stable_polynomial_times_exp_neg(f64::INFINITY, &[1.0, 2.0]),
+            0.0
+        );
         assert_eq!(
             stable_polynomial_times_exp_neg(f64::NEG_INFINITY, &[1.0, 2.0]),
             0.0
@@ -166,7 +169,10 @@ mod tests {
         let x = 2.0;
         let got = stable_polynomial_times_exp_neg(x, &[3.0]);
         let expected = 3.0 * (-x).exp();
-        assert!((got - expected).abs() < 1e-14, "got={got} expected={expected}");
+        assert!(
+            (got - expected).abs() < 1e-14,
+            "got={got} expected={expected}"
+        );
     }
 
     #[test]
@@ -176,7 +182,10 @@ mod tests {
         let (a, b) = (2.0, 3.0);
         let got = stable_polynomial_times_exp_neg(x, &[a, b]);
         let expected = (a + b * x) * (-x).exp();
-        assert!((got - expected).abs() < 1e-14, "got={got} expected={expected}");
+        assert!(
+            (got - expected).abs() < 1e-14,
+            "got={got} expected={expected}"
+        );
     }
 
     #[test]

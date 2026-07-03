@@ -144,21 +144,20 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
             // `∂_ψ H_info|_β` (the explicit ψ-derivative of the Jeffreys information),
             // materialized once and reused for BOTH the VALUE gradient term `−∂_ψΦ`
             // (here) and the Hessian β-coupling term `−∂_β∂_ψΦ` (the score below).
-            let firth_pert_info: Option<Array2<f64>> = if jeffreys_hphi_ctx.is_some()
-                && jeffreys_info_depends_on_psi
-            {
-                if let Some(op) = psi_terms.hessian_psi_operator.as_ref() {
-                    Some(op.mul_mat(&ndarray::Array2::<f64>::eye(total)))
-                } else if psi_terms.hessian_psi.nrows() == total
-                    && psi_terms.hessian_psi.ncols() == total
-                {
-                    Some(psi_terms.hessian_psi.clone())
+            let firth_pert_info: Option<Array2<f64>> =
+                if jeffreys_hphi_ctx.is_some() && jeffreys_info_depends_on_psi {
+                    if let Some(op) = psi_terms.hessian_psi_operator.as_ref() {
+                        Some(op.mul_mat(&ndarray::Array2::<f64>::eye(total)))
+                    } else if psi_terms.hessian_psi.nrows() == total
+                        && psi_terms.hessian_psi.ncols() == total
+                    {
+                        Some(psi_terms.hessian_psi.clone())
+                    } else {
+                        None
+                    }
                 } else {
                     None
-                }
-            } else {
-                None
-            };
+                };
             if let (Some((z_j, h_joint)), Some(pert_info)) =
                 (jeffreys_hphi_ctx.as_ref(), firth_pert_info.as_ref())
             {
@@ -194,11 +193,12 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
                 for a_idx in 0..total {
                     let mut e_a = Array1::<f64>::zeros(total);
                     e_a[a_idx] = 1.0;
-                    let hdot_a = family.joint_jeffreys_information_directional_derivative_with_specs(
-                        synced_states,
-                        specs,
-                        &e_a,
-                    )?;
+                    let hdot_a = family
+                        .joint_jeffreys_information_directional_derivative_with_specs(
+                            synced_states,
+                            specs,
+                            &e_a,
+                        )?;
                     let psi_hdot_a = family.exact_newton_joint_psihessian_directional_derivative(
                         synced_states,
                         specs,
@@ -251,8 +251,9 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // returns zeros when the conditioning gate skips the term or the
                 // family lacks the exact directional derivatives, so a clean /
                 // well-conditioned fit is byte-unchanged.
-                if let Some((z_j, h_joint)) =
-                    jeffreys_hphi_ctx.as_ref().filter(|_| jeffreys_info_depends_on_psi)
+                if let Some((z_j, h_joint)) = jeffreys_hphi_ctx
+                    .as_ref()
+                    .filter(|_| jeffreys_info_depends_on_psi)
                 {
                     let explicit_hphi =
                         gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_hphi_explicit_param_derivative(
@@ -342,17 +343,19 @@ pub fn build_jeffreys_hphi_ctx<F: CustomFamily + Clone + Send + Sync + 'static>(
         && derivative_blocks.iter().any(|block| !block.is_empty())
     {
         let ranges = block_param_ranges(specs);
-        Ok(match (
-            build_joint_jeffreys_subspace(specs, &ranges)?,
-            family.joint_jeffreys_information_with_specs(synced_states, specs)?,
-        ) {
-            (Some(z), Some(h))
-                if z.nrows() == total && h.nrows() == total && h.ncols() == total =>
-            {
-                Some((z, h))
-            }
-            _ => None,
-        })
+        Ok(
+            match (
+                build_joint_jeffreys_subspace(specs, &ranges)?,
+                family.joint_jeffreys_information_with_specs(synced_states, specs)?,
+            ) {
+                (Some(z), Some(h))
+                    if z.nrows() == total && h.nrows() == total && h.ncols() == total =>
+                {
+                    Some((z, h))
+                }
+                _ => None,
+            },
+        )
     } else {
         Ok(None)
     }
@@ -781,12 +784,11 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                 if z_j.nrows() == total && h_joint.nrows() == total && h_joint.ncols() == total =>
             {
                 let psi_dim = psi_penalty_cache.len();
-                let batched_first: Option<Vec<ExactNewtonJointPsiTerms>> = match psi_workspace
-                    .as_ref()
-                {
-                    Some(ws) => ws.first_order_terms_all()?,
-                    None => None,
-                };
+                let batched_first: Option<Vec<ExactNewtonJointPsiTerms>> =
+                    match psi_workspace.as_ref() {
+                        Some(ws) => ws.first_order_terms_all()?,
+                        None => None,
+                    };
                 let mut pert_first: Vec<Array2<f64>> = Vec::with_capacity(psi_dim);
                 let mut ok = true;
                 for axis in 0..psi_dim {

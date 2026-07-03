@@ -873,10 +873,10 @@ pub fn try_inverse_link_array(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gam_solve::mixture_link::{state_from_sasspec, state_fromspec};
     use gam_problem::types::{
         InverseLink, LinkComponent, MixtureLinkSpec, ResponseFamily, SasLinkSpec, StandardLink,
     };
+    use gam_solve::mixture_link::{state_from_sasspec, state_fromspec};
     use ndarray::array;
 
     #[test]

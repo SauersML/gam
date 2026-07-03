@@ -20,11 +20,11 @@
 use std::process::ExitCode;
 use std::time::Instant;
 
+use gam::solver::arrow_schur::ArrowSchurSystem;
 use gam::solver::gpu_kernels::arrow_schur::{
     ArrowSchurGpuFailure, solve_arrow_newton_step, solve_arrow_newton_step_dense_reference,
     solve_arrow_newton_step_fused_force,
 };
-use gam::solver::arrow_schur::ArrowSchurSystem;
 use ndarray::Array2;
 
 /// Charter large-scale shape (math block 3 §16).

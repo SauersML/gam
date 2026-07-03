@@ -23,14 +23,12 @@
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
-use crate::manifolds::constant_curvature::ConstantCurvature;
 use crate::manifold::{
     GEOMETRY_EPS, RiemannianManifold, flatten, from_flat, jacobi_symmetric, spectral_map_symmetric,
     sym,
 };
-use crate::{
-    GeometryError, GeometryResult, GrassmannManifold, SpdManifold, StiefelManifold,
-};
+use crate::manifolds::constant_curvature::ConstantCurvature;
+use crate::{GeometryError, GeometryResult, GrassmannManifold, SpdManifold, StiefelManifold};
 
 /// Split a parenthesised `key=value, key=value` parameter list into trimmed,
 /// lower-cased `(key, value)` pairs. An empty list is valid (`spd()`).

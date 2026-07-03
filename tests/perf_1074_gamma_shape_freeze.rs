@@ -49,7 +49,9 @@ fn synthetic_gamma_records(n: usize, seed: u64) -> (Vec<String>, Vec<StringRecor
             let eta = 2.0 + (PI * xi).sin() * (PI * zi).cos();
             let mu = eta.exp();
             // Gamma(shape, scale = mu/shape) => E[y] = mu, Var = mu^2 / shape.
-            let draw: f64 = Gamma::new(SHAPE, mu / SHAPE).expect("gamma").sample(&mut rng);
+            let draw: f64 = Gamma::new(SHAPE, mu / SHAPE)
+                .expect("gamma")
+                .sample(&mut rng);
             StringRecord::from(vec![xi.to_string(), zi.to_string(), draw.to_string()])
         })
         .collect();

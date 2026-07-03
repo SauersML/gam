@@ -35,8 +35,9 @@
 //! (e.g. `duchon(..., operators=off)` and scale-block Duchon smooths per #1561).
 
 use gam_terms::basis::{
-    build_duchon_basis, duchon_design_build_count, BasisMetadata, CenterStrategy, DuchonBasisSpec,
-    DuchonNullspaceOrder, DuchonOperatorPenaltySpec, OneDimensionalBoundary, SpatialIdentifiability,
+    BasisMetadata, CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder,
+    DuchonOperatorPenaltySpec, OneDimensionalBoundary, SpatialIdentifiability, build_duchon_basis,
+    duchon_design_build_count,
 };
 use ndarray::Array2;
 use std::sync::Mutex;
@@ -159,7 +160,8 @@ fn duchon_fused_reparam_design_equals_unfused_rebuild() {
     };
     let mut replay_spec = reparam_branch_duchon_spec_2d();
     replay_spec.radial_reparam = Some(frozen_reparam);
-    let unfused = build_duchon_basis(data.view(), &replay_spec).expect("frozen unfused duchon build");
+    let unfused =
+        build_duchon_basis(data.view(), &replay_spec).expect("frozen unfused duchon build");
     let unfused_design = unfused.design.to_dense();
 
     assert_eq!(

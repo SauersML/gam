@@ -691,8 +691,8 @@ mod device {
     const TOP_S_FOLD_THREADS: u32 = 32;
 
     struct RouteDeviceOutput {
-        selections: Vec<Vec<(u32, f32)>>,
-        device_dtoh_bytes: usize,
+        pub(super) selections: Vec<Vec<(u32, f32)>>,
+        pub(super) device_dtoh_bytes: usize,
     }
 
     fn fold_shared_bytes(

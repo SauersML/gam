@@ -1986,12 +1986,13 @@ pub(crate) fn inverse_spdwith_retry(
     let mut sym = matrix.clone();
     symmetrize_dense_in_place(&mut sym);
 
-    let invert_via_chol = |chol: &gam_linalg::faer_ndarray::FaerCholeskyFactor, _: usize, _: f64| {
-        let mut ident = Array2::<f64>::eye(sym.nrows());
-        chol.solve_mat_in_place(&mut ident);
-        symmetrize_dense_in_place(&mut ident);
-        Some(ident)
-    };
+    let invert_via_chol =
+        |chol: &gam_linalg::faer_ndarray::FaerCholeskyFactor, _: usize, _: f64| {
+            let mut ident = Array2::<f64>::eye(sym.nrows());
+            chol.solve_mat_in_place(&mut ident);
+            symmetrize_dense_in_place(&mut ident);
+            Some(ident)
+        };
 
     // Attempt 0 in the original schedule uses ridge=0 (no diagonal addition).
     // Express this as a single-attempt call with initial_boost=0.

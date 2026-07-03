@@ -8,10 +8,10 @@ use gam::basis::{
     CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
     OneDimensionalBoundary, SpatialIdentifiability,
 };
+use gam::smooth::build_term_collection_design;
 use gam::smooth::{
     LinearTermSpec, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec,
 };
-use gam::smooth::build_term_collection_design;
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;

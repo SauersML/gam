@@ -171,7 +171,10 @@ fn build_and_fit(family: ResponseFamily, fam_label: &str, n: usize, k: usize) {
             x[[i, 1 + c]] = block[[i, c]];
         }
     }
-    let s_list = vec![BlockwisePenalty::new(1..(1 + k), second_difference_penalty(k))];
+    let s_list = vec![BlockwisePenalty::new(
+        1..(1 + k),
+        second_difference_penalty(k),
+    )];
 
     let mut y = Array1::<f64>::zeros(n);
     for i in 0..n {
@@ -209,7 +212,10 @@ fn build_and_fit(family: ResponseFamily, fam_label: &str, n: usize, k: usize) {
         fit.edf_total().unwrap_or(f64::NAN),
         fit.outer_gradient_norm,
         fit.outer_converged,
-        fit.lambdas.iter().map(|l| format!("{l:.3e}")).collect::<Vec<_>>(),
+        fit.lambdas
+            .iter()
+            .map(|l| format!("{l:.3e}"))
+            .collect::<Vec<_>>(),
     );
 }
 

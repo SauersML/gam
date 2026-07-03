@@ -333,7 +333,10 @@ mod tests {
     fn threshold_decreases_as_n_eff_increases() {
         let t_small = laplace_skewness_threshold(10.0);
         let t_large = laplace_skewness_threshold(1000.0);
-        assert!(t_large < t_small, "threshold should decrease with more data");
+        assert!(
+            t_large < t_small,
+            "threshold should decrease with more data"
+        );
     }
 
     // ── laplace_trustworthiness_from_skewness ─────────────────────────────────

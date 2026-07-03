@@ -23,24 +23,24 @@
 //! Large data (design matrix, response, etc.) is wrapped in `Arc` to allow
 //! sharing across chains without duplication when general-mcmc clones the target.
 
+use crate::gpu_polya_gamma::{PgSeed, PolyaGammaBatchInput};
 use faer::Side;
-use gam_terms::construction::CanonicalPenalty;
+use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh, fast_ata_into, fast_atv, fast_av_into};
+use gam_linalg::matrix::DesignMatrix;
+use gam_linalg::triangular::back_substitution_lower_transpose_guarded_into;
+use gam_models::wiggle::monotone_wiggle_basis_with_derivative_order;
+use gam_problem::types::{
+    InverseLink, LikelihoodSpec, ResponseFamily, RhoPrior, StandardLink, is_valid_tweedie_power,
+};
 use gam_solve::estimate::reml::FirthDenseOperator;
 use gam_solve::estimate::reml::penalty_logdet::PenaltyPseudologdet;
 use gam_solve::estimate::{
     EstimationError, UnifiedFitResult, validate_explicit_dense_hessian_for_whitening,
 };
-use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh, fast_ata_into, fast_atv, fast_av_into};
-use gam_models::wiggle::monotone_wiggle_basis_with_derivative_order;
-use crate::gpu_polya_gamma::{PgSeed, PolyaGammaBatchInput};
-use gam_linalg::triangular::back_substitution_lower_transpose_guarded_into;
-use gam_linalg::matrix::DesignMatrix;
 use gam_solve::mixture_link::{
     InverseLinkKernel, LinkParamPartials, inverse_link_jet_for_inverse_link, softmax_last_fixedzero,
 };
-use gam_problem::types::{
-    InverseLink, LikelihoodSpec, ResponseFamily, RhoPrior, StandardLink, is_valid_tweedie_power,
-};
+use gam_terms::construction::CanonicalPenalty;
 use general_mcmc::generic_hmc::HamiltonianTarget;
 pub use general_mcmc::generic_nuts::NUTSMassMatrixConfig;
 use general_mcmc::generic_nuts::{GenericNUTS, MassMatrixAdaptation};
@@ -1382,7 +1382,9 @@ fn probit_logp_and_grad_into(
 #[inline]
 fn cloglog_bernoulli_logp_and_residual(eta: f64, y: f64) -> Result<(f64, f64), EstimationError> {
     if !(eta.is_finite() && (-700.0..=700.0).contains(&eta)) {
-        gam_problem::bail_invalid_estim!("cloglog eta must be finite and within [-700, 700]; got {eta}");
+        gam_problem::bail_invalid_estim!(
+            "cloglog eta must be finite and within [-700, 700]; got {eta}"
+        );
     }
     let exp_eta = eta.exp();
     // log_mu = log(1 - exp(-exp_eta)); exp_eta > 0 on the guarded domain, so this is
@@ -1653,17 +1655,17 @@ mod tests {
         run_joint_beta_rho_sampling, run_logit_polya_gamma_gibbs,
         run_nuts_sampling_flattened_family,
     };
-    use gam_terms::construction::CanonicalPenalty;
-    use gam_solve::estimate::{
-        BlockRole, FitGeometry, FitInference, FittedBlock, FittedLinkState, UnifiedFitResult,
-        UnifiedFitResultParts,
-    };
-    use gam_models::survival::{PenaltyBlocks, SurvivalMonotonicityPenalty, SurvivalSpec};
     use gam_linalg::matrix::DesignMatrix;
+    use gam_models::survival::{PenaltyBlocks, SurvivalMonotonicityPenalty, SurvivalSpec};
     use gam_problem::types::{
         InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, LogLikelihoodNormalization,
         ResponseFamily, RhoPrior, StandardLink,
     };
+    use gam_solve::estimate::{
+        BlockRole, FitGeometry, FitInference, FittedBlock, FittedLinkState, UnifiedFitResult,
+        UnifiedFitResultParts,
+    };
+    use gam_terms::construction::CanonicalPenalty;
     use general_mcmc::generic_hmc::HamiltonianTarget;
     use ndarray::{Array1, Array2, array};
     use std::sync::Arc;
@@ -2892,11 +2894,12 @@ mod tests {
         let y = array![1.0, 0.0];
         let weights = array![1.0, 1.0];
         let eta = array![0.3, -0.2];
-        let sas_state = gam_solve::mixture_link::state_from_sasspec(gam_problem::types::SasLinkSpec {
-            initial_epsilon: 0.4,
-            initial_log_delta: -0.2,
-        })
-        .expect("sas state");
+        let sas_state =
+            gam_solve::mixture_link::state_from_sasspec(gam_problem::types::SasLinkSpec {
+                initial_epsilon: 0.4,
+                initial_log_delta: -0.2,
+            })
+            .expect("sas state");
         let data = SharedData {
             x: Arc::new(x),
             y: Arc::new(y),
@@ -3117,11 +3120,12 @@ mod tests {
 
         // SAS/BetaLogistic/Mixture must succeed with their real link state,
         // NOT be remapped to logit.
-        let sas_state = gam_solve::mixture_link::state_from_sasspec(gam_problem::types::SasLinkSpec {
-            initial_epsilon: 0.0,
-            initial_log_delta: 0.0,
-        })
-        .expect("sas state");
+        let sas_state =
+            gam_solve::mixture_link::state_from_sasspec(gam_problem::types::SasLinkSpec {
+                initial_epsilon: 0.0,
+                initial_log_delta: 0.0,
+            })
+            .expect("sas state");
         let adaptive = [
             LikelihoodSpec {
                 response: ResponseFamily::Binomial,
@@ -6901,11 +6905,13 @@ impl JointBetaRhoPosterior {
                         "Beta-Logistic link parameters must be finite with length 2".to_string()
                     );
                 }
-                Ok(InverseLink::BetaLogistic(gam_problem::types::SasLinkState {
-                    epsilon: link_params[0],
-                    log_delta: link_params[1],
-                    delta: link_params[1].exp(),
-                }))
+                Ok(InverseLink::BetaLogistic(
+                    gam_problem::types::SasLinkState {
+                        epsilon: link_params[0],
+                        log_delta: link_params[1],
+                        delta: link_params[1].exp(),
+                    },
+                ))
             }
             InverseLink::Mixture(state) => {
                 let rho = link_params.to_owned();

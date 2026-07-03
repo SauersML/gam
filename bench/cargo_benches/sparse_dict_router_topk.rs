@@ -31,7 +31,8 @@ fn fixtures() -> (Array2<f32>, Array2<f32>) {
     let rows = Array2::from_shape_fn((ROWS, P), |(i, c)| {
         (((i * 31 + c * 17) as f32) * 0.013).sin() * 0.9
     });
-    let mut atoms = Array2::from_shape_fn((K, P), |(a, c)| (((a * 7 + c * 5) as f32) * 0.011).cos());
+    let mut atoms =
+        Array2::from_shape_fn((K, P), |(a, c)| (((a * 7 + c * 5) as f32) * 0.011).cos());
     for mut atom in atoms.outer_iter_mut() {
         let norm = atom.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-12);
         atom.mapv_inplace(|v| v / norm);
@@ -70,7 +71,8 @@ fn fold_old(stream: &[f32], capacity: usize) -> usize {
         }
         let mut worst = 0usize;
         for k in 1..heap.len() {
-            if heap[k].2 < heap[worst].2 || (heap[k].2 == heap[worst].2 && heap[k].0 > heap[worst].0)
+            if heap[k].2 < heap[worst].2
+                || (heap[k].2 == heap[worst].2 && heap[k].0 > heap[worst].0)
             {
                 worst = k;
             }
@@ -91,7 +93,8 @@ fn fold_new(stream: &[f32], capacity: usize) -> usize {
     let recompute = |heap: &Vec<(u32, f32, f32)>| -> usize {
         let mut worst = 0usize;
         for k in 1..heap.len() {
-            if heap[k].2 < heap[worst].2 || (heap[k].2 == heap[worst].2 && heap[k].0 > heap[worst].0)
+            if heap[k].2 < heap[worst].2
+                || (heap[k].2 == heap[worst].2 && heap[k].0 > heap[worst].0)
             {
                 worst = k;
             }

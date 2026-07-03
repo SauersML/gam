@@ -234,44 +234,52 @@ mod tests {
 
     #[test]
     fn model_ill_conditioned_is_retreat() {
-        assert!(EstimationError::ModelIsIllConditioned { condition_number: 1e15 }
-            .is_inner_solve_retreat());
+        assert!(
+            EstimationError::ModelIsIllConditioned {
+                condition_number: 1e15
+            }
+            .is_inner_solve_retreat()
+        );
     }
 
     #[test]
     fn perfect_separation_is_retreat() {
-        assert!(EstimationError::PerfectSeparationDetected {
-            iteration: 3,
-            max_abs_eta: 50.0
-        }
-        .is_inner_solve_retreat());
+        assert!(
+            EstimationError::PerfectSeparationDetected {
+                iteration: 3,
+                max_abs_eta: 50.0
+            }
+            .is_inner_solve_retreat()
+        );
     }
 
     #[test]
     fn multinomial_separation_is_retreat() {
-        assert!(EstimationError::MultinomialSeparationDetected {
-            iteration: 1,
-            max_abs_eta: 100.0,
-            active_class_index: 2,
-            row_index: 7
-        }
-        .is_inner_solve_retreat());
+        assert!(
+            EstimationError::MultinomialSeparationDetected {
+                iteration: 1,
+                max_abs_eta: 100.0,
+                active_class_index: 2,
+                row_index: 7
+            }
+            .is_inner_solve_retreat()
+        );
     }
 
     #[test]
     fn pirls_did_not_converge_is_retreat() {
-        assert!(EstimationError::PirlsDidNotConverge {
-            max_iterations: 100,
-            last_change: 1e-3
-        }
-        .is_inner_solve_retreat());
+        assert!(
+            EstimationError::PirlsDidNotConverge {
+                max_iterations: 100,
+                last_change: 1e-3
+            }
+            .is_inner_solve_retreat()
+        );
     }
 
     #[test]
     fn invalid_input_is_not_retreat() {
-        assert!(
-            !EstimationError::InvalidInput("bad".to_string()).is_inner_solve_retreat()
-        );
+        assert!(!EstimationError::InvalidInput("bad".to_string()).is_inner_solve_retreat());
     }
 
     #[test]
@@ -311,7 +319,9 @@ mod tests {
 
     #[test]
     fn from_linalg_hessian_not_spd_maps_correctly() {
-        let linalg_err = LinalgError::HessianNotPositiveDefinite { min_eigenvalue: -1.0 };
+        let linalg_err = LinalgError::HessianNotPositiveDefinite {
+            min_eigenvalue: -1.0,
+        };
         let err = EstimationError::from(linalg_err);
         assert!(matches!(
             err,

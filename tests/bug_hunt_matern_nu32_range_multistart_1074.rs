@@ -80,7 +80,10 @@ fn matern_nu32_recovery(seed: u64) -> (f64, f64, f64) {
 
     let edge = grid_n / 10; // first/last 10%
     let all = rmse(&fitted, &truth_grid);
-    let interior = rmse(&fitted[edge..grid_n - edge], &truth_grid[edge..grid_n - edge]);
+    let interior = rmse(
+        &fitted[edge..grid_n - edge],
+        &truth_grid[edge..grid_n - edge],
+    );
     let edge_rmse = rmse(
         &[&fitted[..edge], &fitted[grid_n - edge..]].concat(),
         &[&truth_grid[..edge], &truth_grid[grid_n - edge..]].concat(),

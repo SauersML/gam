@@ -155,18 +155,18 @@ fn gaussian_closed_form_channels(
     // Symmetric third tensor by total order in s (index sum a+b+c).
     let t3 = |a: usize, b: usize, c: usize| -> f64 {
         match a + b + c {
-            0 => 0.0,           // ∂ηηη
-            1 => -2.0 * w,      // ∂ηηs
-            2 => -4.0 * w * r,  // ∂ηss
+            0 => 0.0,              // ∂ηηη
+            1 => -2.0 * w,         // ∂ηηs
+            2 => -4.0 * w * r,     // ∂ηss
             _ => -4.0 * w * r * r, // ∂sss
         }
     };
     // Symmetric fourth tensor by total order in s (index sum a+b+c+d).
     let t4 = |a: usize, b: usize, c: usize, d: usize| -> f64 {
         match a + b + c + d {
-            0 | 1 => 0.0,        // ∂ηηηη, ∂ηηηs
-            2 => 4.0 * w,        // ∂ηηss
-            3 => 8.0 * w * r,    // ∂ηsss
+            0 | 1 => 0.0,         // ∂ηηηη, ∂ηηηs
+            2 => 4.0 * w,         // ∂ηηss
+            3 => 8.0 * w * r,     // ∂ηsss
             _ => 8.0 * w * r * r, // ∂ssss
         }
     };
@@ -269,8 +269,7 @@ fn gaussian_loc_scale_jet_tower_matches_hand_derived_via_universal_oracle() {
         let tower: Tower4<2> = generic_full_tower(&program, row).expect("gaussian jet tower");
 
         // The INDEPENDENT hand-derived channels a hand kernel would claim.
-        let claims =
-            gaussian_closed_form_channels(fixture, &third_dirs, &fourth_pairs);
+        let claims = gaussian_closed_form_channels(fixture, &third_dirs, &fourth_pairs);
 
         verify_kernel_channels(&tower, &claims, REL_TOL).unwrap_or_else(|e| {
             panic!(
@@ -323,7 +322,11 @@ fn gaussian_loc_scale_packed_scalars_match_hand_derived_contractions() {
         let (v, g, h) = generic_row_kernel(&program, row).expect("Order2 channel");
         close(v, hand.value, &format!("row {row} Order2 value"));
         for i in 0..2 {
-            close(g[i], hand.gradient[i], &format!("row {row} Order2 grad[{i}]"));
+            close(
+                g[i],
+                hand.gradient[i],
+                &format!("row {row} Order2 grad[{i}]"),
+            );
             for j in 0..2 {
                 close(
                     h[i][j],
@@ -354,8 +357,7 @@ fn gaussian_loc_scale_packed_scalars_match_hand_derived_contractions() {
         // scalar, checked against the dense tower's own contraction of t4.
         for (ui, u) in third_dirs.iter().enumerate() {
             let v = third_dirs[(ui + 1) % third_dirs.len()];
-            let fourth =
-                generic_fourth_contracted(&program, row, u, &v).expect("TwoSeed fourth");
+            let fourth = generic_fourth_contracted(&program, row, u, &v).expect("TwoSeed fourth");
             let truth = tower.fourth_contracted(u, &v);
             for i in 0..2 {
                 for j in 0..2 {

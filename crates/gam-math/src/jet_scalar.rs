@@ -652,12 +652,11 @@ impl<L: Lane, const K: usize> Order2Lane<L, K> {
         for i in 0..K {
             for j in i..K {
                 // a.v*b.h + a.g[i]*b.g[j] + a.g[j]*b.g[i] + a.h*b.v
-                let hij = a
-                    .v
-                    .mul(b.h[i][j])
-                    .add(a.g[i].mul(b.g[j]))
-                    .add(a.g[j].mul(b.g[i]))
-                    .add(a.h[i][j].mul(b.v));
+                let hij =
+                    a.v.mul(b.h[i][j])
+                        .add(a.g[i].mul(b.g[j]))
+                        .add(a.g[j].mul(b.g[i]))
+                        .add(a.h[i][j].mul(b.v));
                 out.h[i][j] = hij;
                 out.h[j][i] = hij;
             }
@@ -1768,7 +1767,13 @@ mod tests {
         }
         // A base-value-dependent finite stack standing in for a family stack.
         fn stack(u: f64) -> [f64; 5] {
-            [u.sin(), u.cos(), (2.0 * u).sin(), (0.5 * u).cos(), u * u - 0.3]
+            [
+                u.sin(),
+                u.cos(),
+                (2.0 * u).sin(),
+                (0.5 * u).cos(),
+                u * u - 0.3,
+            ]
         }
         fn run<const K: usize>(state: &mut u64, n: usize) -> usize {
             for _ in 0..n {
@@ -1796,8 +1801,10 @@ mod tests {
             n
         }
         let mut st = 0x9e37_79b9_7f4a_7c15u64;
-        let total =
-            run::<2>(&mut st, 1100) + run::<3>(&mut st, 1100) + run::<4>(&mut st, 1100) + run::<9>(&mut st, 1100);
+        let total = run::<2>(&mut st, 1100)
+            + run::<3>(&mut st, 1100)
+            + run::<4>(&mut st, 1100)
+            + run::<9>(&mut st, 1100);
         assert_eq!(total, 4400);
     }
 
@@ -2070,8 +2077,7 @@ mod batch_tests {
 
             // Batched: 4 rows packed into f64x4 lanes, ONE vector pass.
             let pbatch: [Order2Batch<K>; K] = std::array::from_fn(|a| {
-                let packed =
-                    wide::f64x4::new([rows[0][a], rows[1][a], rows[2][a], rows[3][a]]);
+                let packed = wide::f64x4::new([rows[0][a], rows[1][a], rows[2][a], rows[3][a]]);
                 Order2Batch::variable(packed, a)
             });
             let batch = row_expr(&pbatch);
@@ -2506,7 +2512,10 @@ mod unit_tests {
         let lnp = JetScalar::ln(&p);
         assert!((lnp.value() - p0.ln()).abs() < 1e-15, "ln value");
         assert!((lnp.g()[0] - 1.0 / p0).abs() < 1e-15, "d/dp ln(p) = 1/p");
-        assert!((lnp.h()[0][0] - (-1.0 / (p0 * p0))).abs() < 1e-15, "d²/dp² ln(p) = -1/p²");
+        assert!(
+            (lnp.h()[0][0] - (-1.0 / (p0 * p0))).abs() < 1e-15,
+            "d²/dp² ln(p) = -1/p²"
+        );
     }
 
     /// `exp` and `ln` are mutual inverses: `ln(exp(p)).value() == p` at the scalar.
@@ -2579,7 +2588,10 @@ mod unit_tests {
         let q2 = Order2::<2>::variable(q0, 1);
         let expr2 = JetScalar::exp(&JetScalar::add(&JetScalar::mul(&p2, &q2), &p2));
 
-        assert!((expr1.value() - expr2.value()).abs() < 1e-14, "value mismatch");
+        assert!(
+            (expr1.value() - expr2.value()).abs() < 1e-14,
+            "value mismatch"
+        );
         for a in 0..2 {
             assert!(
                 (expr1.g()[a] - expr2.g()[a]).abs() < 1e-14,
@@ -2597,12 +2609,9 @@ mod unit_tests {
         let theta0 = 3.0_f64;
         let theta = Order2::<1>::variable(theta0, 0);
         // a0 = theta0, F_a = 1, inv_fa = 1; 2 iters suffice for Order2.
-        let a = filtered_implicit_solve_scalar::<1, Order2<1>>(
-            theta0,
-            1.0,
-            2,
-            |a_jet| JetScalar::sub(a_jet, &theta),
-        );
+        let a = filtered_implicit_solve_scalar::<1, Order2<1>>(theta0, 1.0, 2, |a_jet| {
+            JetScalar::sub(a_jet, &theta)
+        });
         assert!((a.value() - theta0).abs() < 1e-14, "value = theta0");
         // da/dtheta = 1 (identity)
         assert!((a.g()[0] - 1.0).abs() < 1e-14, "gradient = 1");
@@ -2626,8 +2635,14 @@ mod unit_tests {
         let tol = 1e-12;
         assert!((a.value() - a0).abs() < tol, "value = sqrt(theta0)");
         let expected_g = 0.5 / a0;
-        assert!((a.g()[0] - expected_g).abs() < tol, "da/dtheta = 1/(2*sqrt)");
+        assert!(
+            (a.g()[0] - expected_g).abs() < tol,
+            "da/dtheta = 1/(2*sqrt)"
+        );
         let expected_h = -0.25 / (theta0 * a0);
-        assert!((a.h()[0][0] - expected_h).abs() < tol, "d2a/dtheta2 = -1/(4*theta^1.5)");
+        assert!(
+            (a.h()[0][0] - expected_h).abs() < tol,
+            "d2a/dtheta2 = -1/(4*theta^1.5)"
+        );
     }
 }

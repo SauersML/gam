@@ -304,8 +304,8 @@ pub fn scalar_skovgaard_from_matrices(
     lr_statistic: f64,
     theta_null: f64,
 ) -> Option<ScalarSkovgaardResult> {
-    use gam_linalg::faer_ndarray::FaerCholesky;
     use faer::Side;
+    use gam_linalg::faer_ndarray::FaerCholesky;
 
     let p = beta.len();
     if p == 0

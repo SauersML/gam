@@ -39,6 +39,7 @@
 //! of comparison is the DEFECT CLASS — "does the second predictor's response SE
 //! degenerate to a recycled scalar?" — not a coefficient-for-coefficient match.
 
+use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::solver::estimate::BlockRole;
@@ -46,7 +47,6 @@ use gam::test_support::reference::{Column, r_package_available, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::Array2;
 
 /// Deterministic heteroscedastic Gaussian data: μ(x) = 2·sin(3x), and a log-scale
@@ -59,7 +59,9 @@ fn heteroscedastic_xy(n: usize) -> (Vec<f64>, Vec<f64>) {
     // Tiny deterministic LCG → uniforms → Box-Muller normals.
     let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
     let mut next_unit = || {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         // top 53 bits → (0,1)
         (((state >> 11) as f64) + 0.5) / ((1u64 << 53) as f64)
     };

@@ -22,11 +22,11 @@ use gam::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, build_bspline_basis_1d,
 };
 use gam::linalg::matrix::{DesignMatrix, LinearOperator};
+use gam::smooth::build_term_collection_design;
 use gam::smooth::{
     ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability,
     TensorBSplineSpec, TermCollectionSpec,
 };
-use gam::smooth::build_term_collection_design;
 use ndarray::{Array1, Array2};
 use rand::SeedableRng;
 use rand::rngs::StdRng;

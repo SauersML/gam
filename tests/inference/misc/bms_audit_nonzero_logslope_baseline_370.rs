@@ -43,14 +43,12 @@
 //!    (no >600s hang regression).
 
 use gam::ResourcePolicy;
-use gam::families::bms::{
-    BernoulliMarginalSlopeTermSpec, DeviationBlockConfig, LatentZPolicy,
-};
+use gam::families::bms::{BernoulliMarginalSlopeTermSpec, DeviationBlockConfig, LatentZPolicy};
+use gam::families::bms::{BmsLogslopeJacobian, BmsMarginalJacobian};
 use gam::families::custom_family::{
     BlockEffectiveJacobian, BlockwiseFitOptions, FamilyLinearizationState,
 };
 use gam::families::survival::lognormal_kernel::FrailtySpec;
-use gam::families::bms::{BmsLogslopeJacobian, BmsMarginalJacobian};
 use gam::terms::basis::{BSplineBasisSpec, BSplineKnotSpec};
 use gam::terms::smooth::{
     ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions,
@@ -196,10 +194,7 @@ fn run_fit(
     n: usize,
     flex: bool,
     logslope_offset_value: f64,
-) -> (
-    gam::families::bms::BernoulliMarginalSlopeFitResult,
-    f64,
-) {
+) -> (gam::families::bms::BernoulliMarginalSlopeFitResult, f64) {
     gam::init_parallelism();
     let (data, spec) = build_problem(n, flex, logslope_offset_value);
     let request = FitRequest::BernoulliMarginalSlope(BernoulliMarginalSlopeFitRequest {
@@ -226,7 +221,11 @@ fn run_fit(
     }
 }
 
-fn assert_full_fit(out: &gam::families::bms::BernoulliMarginalSlopeFitResult, elapsed: f64, flex: bool) {
+fn assert_full_fit(
+    out: &gam::families::bms::BernoulliMarginalSlopeFitResult,
+    elapsed: f64,
+    flex: bool,
+) {
     // (a) past the audit and through the solver: finite, nonempty coefficients.
     assert!(
         !out.fit.beta.is_empty(),

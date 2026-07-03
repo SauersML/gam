@@ -49,7 +49,11 @@ mod tests {
 
     #[test]
     fn message_uses_plural_blocks_when_expected_greater_than_one() {
-        let m = BlockCountMismatch { family: "FooFamily".to_string(), expected: 2, got: 0 };
+        let m = BlockCountMismatch {
+            family: "FooFamily".to_string(),
+            expected: 2,
+            got: 0,
+        };
         let msg = m.message();
         assert!(msg.contains("blocks"), "message: {msg}");
         assert!(msg.contains("FooFamily"), "message: {msg}");
@@ -58,15 +62,26 @@ mod tests {
 
     #[test]
     fn message_uses_singular_block_when_expected_is_one() {
-        let m = BlockCountMismatch { family: "BarFamily".to_string(), expected: 1, got: 3 };
+        let m = BlockCountMismatch {
+            family: "BarFamily".to_string(),
+            expected: 1,
+            got: 3,
+        };
         let msg = m.message();
-        assert!(msg.contains("block") && !msg.contains("blocks"), "message: {msg}");
+        assert!(
+            msg.contains("block") && !msg.contains("blocks"),
+            "message: {msg}"
+        );
         assert!(msg.contains("1") && msg.contains("3"), "message: {msg}");
     }
 
     #[test]
     fn from_block_count_mismatch_for_string_matches_message() {
-        let m = BlockCountMismatch { family: "Baz".to_string(), expected: 2, got: 1 };
+        let m = BlockCountMismatch {
+            family: "Baz".to_string(),
+            expected: 2,
+            got: 1,
+        };
         let expected_msg = m.message();
         let as_string = String::from(BlockCountMismatch {
             family: "Baz".to_string(),

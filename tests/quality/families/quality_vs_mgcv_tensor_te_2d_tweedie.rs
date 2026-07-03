@@ -175,7 +175,10 @@ fn gam_tensor_te_2d_tweedie_matches_mgcv() {
         fit.fit.dispersion_phi(),
     );
     eprintln!("[diag] gam tweedie lambdas={:?}", fit.fit.lambdas.to_vec());
-    eprintln!("[diag] gam tweedie likelihood_scale={:?}", fit.fit.likelihood_scale);
+    eprintln!(
+        "[diag] gam tweedie likelihood_scale={:?}",
+        fit.fit.likelihood_scale
+    );
 
     // Context only (NOT a pass criterion): closeness of the two fitted surfaces.
     let rel_to_mgcv = relative_l2(&gam_eta, mgcv_eta);

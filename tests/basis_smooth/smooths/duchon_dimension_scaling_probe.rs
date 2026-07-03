@@ -87,7 +87,10 @@ fn probe_one(basis: &str, d: usize, ds: &gam::data::EncodedDataset) {
     let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
         .unwrap_or_else(|e| panic!("rebuild '{formula}': {e}"));
     let build = t0.elapsed().as_secs_f64();
-    assert!(design.design.ncols() > 0, "rebuilt design must have columns");
+    assert!(
+        design.design.ncols() > 0,
+        "rebuilt design must have columns"
+    );
 
     println!(
         "[probe1050] {basis:11} d={d:3} total={total:7.2}s build={build:7.3}s \

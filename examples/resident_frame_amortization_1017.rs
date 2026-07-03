@@ -26,9 +26,9 @@
 //! cargo run --release --example resident_frame_amortization_1017
 //! ```
 
+use gam::solver::arrow_schur::ArrowSchurSystem;
 use gam::solver::gpu_kernels::arrow_schur::{ResidentArrowFrameHandle, solve_arrow_newton_step};
 use gam::solver::gpu_kernels::sae_resident::color_arm_fixture;
-use gam::solver::arrow_schur::ArrowSchurSystem;
 use std::time::{Duration, Instant};
 
 /// Extract the per-row + border gradient from a system in the layout

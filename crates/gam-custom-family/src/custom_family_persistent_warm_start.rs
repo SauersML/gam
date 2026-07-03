@@ -13,14 +13,14 @@
 //! unchanged.
 
 use crate::{CachedInnerMode, ConstrainedWarmStart, normalize_active_sets};
+use gam_linalg::matrix::DesignMatrix;
 use gam_model_api::families::custom_family::{BlockwiseFitOptions, CustomFamily};
 use gam_problem::{ParameterBlockSpec, PenaltyMatrix};
-use gam_linalg::matrix::DesignMatrix;
+use gam_runtime::warm_start::Fingerprinter;
 use gam_solve::persistent_warm_start::{
     PersistentBlockInnerSummary, PersistentBlockWarmStartRecord, load_block_record,
     store_block_record,
 };
-use gam_runtime::warm_start::Fingerprinter;
 use ndarray::{Array1, Array2};
 use std::any::type_name;
 use std::sync::atomic::Ordering;

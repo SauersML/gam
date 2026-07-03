@@ -640,8 +640,8 @@ pub fn penalty_diagnostics(
     penalties: &[gam_terms::smooth::BlockwisePenalty],
     lambdas: &[f64],
 ) -> Vec<PenaltyDiagnostics> {
-    use gam_linalg::faer_ndarray::FaerEigh;
     use faer::Side;
+    use gam_linalg::faer_ndarray::FaerEigh;
     penalties
         .iter()
         .enumerate()

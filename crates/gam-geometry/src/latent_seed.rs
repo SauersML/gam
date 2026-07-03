@@ -14,8 +14,8 @@
 //! Riemannian outer optimizer then converges to the global configuration instead
 //! of a random local one.
 
-use gam_linalg::faer_ndarray::FaerEigh;
 use faer::Side;
+use gam_linalg::faer_ndarray::FaerEigh;
 use ndarray::{Array1, Array2, ArrayView2};
 
 /// Laplacian-eigenmaps embedding of `features` (`n × q`) into `latent_dim`

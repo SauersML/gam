@@ -11,8 +11,8 @@
 //! `smooth.rs` are re-imported by the parent so every call site is unchanged.
 
 use super::{PenaltyBlockInfo, TermCollectionDesign};
-use crate::basis::BasisError;
 use crate::PenaltySpec;
+use crate::basis::BasisError;
 use gam_spec::CoefficientGroupPrior;
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};

@@ -192,7 +192,10 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(msg.contains("solver"), "message: {msg}");
-        assert!(msg.to_lowercase().contains("derivative") || msg.contains("zero"), "message: {msg}");
+        assert!(
+            msg.to_lowercase().contains("derivative") || msg.contains("zero"),
+            "message: {msg}"
+        );
     }
 
     #[test]
@@ -213,7 +216,10 @@ mod tests {
         let err = MonotoneRootError::analytic_bracket_invalid("myfunc", 0.5, 1.5);
         let msg = err.to_string();
         assert!(msg.contains("myfunc"), "message: {msg}");
-        assert!(msg.contains("invalid") || msg.contains("bracket"), "message: {msg}");
+        assert!(
+            msg.contains("invalid") || msg.contains("bracket"),
+            "message: {msg}"
+        );
     }
 
     #[test]
@@ -221,7 +227,10 @@ mod tests {
         let err = MonotoneRootError::analytic_bracket_no_straddle("myfunc", 0.1, 0.2);
         let msg = err.to_string();
         assert!(msg.contains("myfunc"), "message: {msg}");
-        assert!(msg.to_lowercase().contains("straddle") || msg.contains("f_lo"), "message: {msg}");
+        assert!(
+            msg.to_lowercase().contains("straddle") || msg.contains("f_lo"),
+            "message: {msg}"
+        );
     }
 
     #[test]
@@ -229,7 +238,10 @@ mod tests {
         let err = MonotoneRootError::search_exhausted("myfunc", 1.0, 0.0);
         let msg = err.to_string();
         assert!(msg.contains("myfunc"), "message: {msg}");
-        assert!(msg.to_lowercase().contains("bracket") || msg.contains("search"), "message: {msg}");
+        assert!(
+            msg.to_lowercase().contains("bracket") || msg.contains("search"),
+            "message: {msg}"
+        );
     }
 
     #[test]
@@ -249,7 +261,10 @@ mod tests {
         let err = MonotoneRootError::exact_root_degenerate("myroot", 0.75);
         let msg = err.to_string();
         assert!(msg.contains("myroot"), "message: {msg}");
-        assert!(msg.contains("0.75") || msg.contains("a=0"), "message: {msg}");
+        assert!(
+            msg.contains("0.75") || msg.contains("a=0"),
+            "message: {msg}"
+        );
     }
 
     #[test]

@@ -745,7 +745,9 @@ mod stiefel_tests {
         // Tiny deterministic LCG so the test is reproducible without `rand`.
         let mut state: u64 = 0x9e3779b97f4a7c15;
         let mut next = || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((state >> 11) as f64) / ((1u64 << 53) as f64) * 2.0 - 1.0 // ∈ (−1, 1)
         };
         for &(k, n) in &[(2usize, 3usize), (2, 4), (2, 5), (2, 6), (3, 5), (3, 7)] {
@@ -761,7 +763,10 @@ mod stiefel_tests {
                 // Normalize to the requested canonical magnitude.
                 let g = st.metric_tensor(y.view()).unwrap();
                 let gd = g.dot(&delta);
-                let nrm = (0..delta.len()).map(|i| delta[i] * gd[i]).sum::<f64>().sqrt();
+                let nrm = (0..delta.len())
+                    .map(|i| delta[i] * gd[i])
+                    .sum::<f64>()
+                    .sqrt();
                 if nrm > 1e-12 {
                     delta.mapv_inplace(|x| x * scale / nrm);
                 }
@@ -795,9 +800,7 @@ mod stiefel_tests {
     #[test]
     fn log_of_self_is_zero_k2() {
         let st = StiefelManifold::new(2, 5).unwrap();
-        let y = Array1::from(vec![
-            1.0_f64, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        ]);
+        let y = Array1::from(vec![1.0_f64, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
         let lg = st.log_map(y.view(), y.view()).unwrap();
         let worst = lg.iter().fold(0.0_f64, |a, &x| a.max(x.abs()));
         assert!(worst < 1e-12, "Log_Y(Y) != 0: max = {worst:.3e}");
@@ -820,7 +823,10 @@ mod stiefel_tests {
         for i in 0..recovered.len() {
             tan_err = tan_err.max((proj[i] - recovered[i]).abs());
         }
-        assert!(tan_err < 1e-9, "Log not tangent: max|P Δ̂ − Δ̂| = {tan_err:.3e}");
+        assert!(
+            tan_err < 1e-9,
+            "Log not tangent: max|P Δ̂ − Δ̂| = {tan_err:.3e}"
+        );
         // Isometry: ‖Log_Y(Exp_Y(Δ))‖ = ‖Δ‖ under the canonical metric.
         let g = st.metric_tensor(y.view()).unwrap();
         let canon_norm = |d: &Array1<f64>| -> f64 {
@@ -874,7 +880,12 @@ mod stiefel_tests {
         // and off-diagonal sum = 0.
         assert!(h[0].abs() < 1e-12, "YᵀH[0,0] = {}", h[0]);
         assert!(h[3].abs() < 1e-12, "YᵀH[1,1] = {}", h[3]);
-        assert!((h[1] + h[2]).abs() < 1e-12, "YᵀH not skew: h[1]={}, h[2]={}", h[1], h[2]);
+        assert!(
+            (h[1] + h[2]).abs() < 1e-12,
+            "YᵀH not skew: h[1]={}, h[2]={}",
+            h[1],
+            h[2]
+        );
     }
 
     #[test]
@@ -898,7 +909,11 @@ mod stiefel_tests {
         for i in 0..k {
             for j in 0..k {
                 let want = if i == j { 1.0 } else { 0.0 };
-                assert!((qtq[i][j] - want).abs() < 1e-12, "QᵀQ[{i},{j}] = {}", qtq[i][j]);
+                assert!(
+                    (qtq[i][j] - want).abs() < 1e-12,
+                    "QᵀQ[{i},{j}] = {}",
+                    qtq[i][j]
+                );
             }
         }
     }

@@ -356,9 +356,11 @@ fn fit_cell(
             // same constrained penalty blocks; we use the training rows to be
             // unambiguous).
             let penalties = match dp {
-                DoublePenalty::On => {
-                    Some(extract_constrained_penalties(data, &fit.resolvedspec, x_idx))
-                }
+                DoublePenalty::On => Some(extract_constrained_penalties(
+                    data,
+                    &fit.resolvedspec,
+                    x_idx,
+                )),
                 DoublePenalty::Off => None,
             };
             (edf_total, mean_on_grid, penalties)

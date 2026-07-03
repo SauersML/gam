@@ -33,7 +33,10 @@ impl Lcg {
     }
     fn next_u01(&mut self) -> f64 {
         // Numerical Recipes 64-bit LCG constants.
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         // Top 53 bits → [0,1).
         ((self.0 >> 11) as f64) / ((1u64 << 53) as f64)
     }
@@ -112,9 +115,8 @@ fn fit_predict_aligned(
     // the rank of name_map[c] among the sorted labels.
     let mut sorted = name_map;
     sorted.sort_unstable();
-    let col_of_class: [usize; 3] = std::array::from_fn(|c| {
-        sorted.iter().position(|&s| s == name_map[c]).unwrap()
-    });
+    let col_of_class: [usize; 3] =
+        std::array::from_fn(|c| sorted.iter().position(|&s| s == name_map[c]).unwrap());
     let n = grid.len();
     let mut aligned = ndarray::Array2::<f64>::zeros((n, 3));
     for r in 0..n {

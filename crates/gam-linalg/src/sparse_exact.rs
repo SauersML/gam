@@ -1124,7 +1124,7 @@ impl TakahashiInverse {
 mod tests {
     use super::*;
     use crate::faer_ndarray::FaerCholesky;
-    use ndarray::{array, Array1, Array2};
+    use ndarray::{Array1, Array2, array};
 
     fn approx_eq(a: f64, b: f64, tol: f64) {
         assert!(
@@ -1181,7 +1181,11 @@ mod tests {
         let m = array![[1.0, 0.05], [0.05, 2.0]];
         let s = dense_to_sparse(&m, tol).unwrap();
         // Only the two diagonal entries exceed tol.
-        assert_eq!(s.compute_nnz(), 2, "off-diagonal entries below tol must be dropped");
+        assert_eq!(
+            s.compute_nnz(),
+            2,
+            "off-diagonal entries below tol must be dropped"
+        );
     }
 
     // ── dense_to_sparse_symmetric_upper ───────────────────────────────────
@@ -1240,11 +1244,7 @@ mod tests {
 
     #[test]
     fn solve_sparse_spd_3x3_round_trip() {
-        let a: Array2<f64> = array![
-            [9.0, 3.0, 1.0],
-            [3.0, 8.0, 2.0],
-            [1.0, 2.0, 7.0]
-        ];
+        let a: Array2<f64> = array![[9.0, 3.0, 1.0], [3.0, 8.0, 2.0], [1.0, 2.0, 7.0]];
         let a_sparse = dense_to_sparse_symmetric_upper(&a, ZERO_TOL).unwrap();
         let factor = factorize_sparse_spd(&a_sparse).unwrap();
         for j in 0..3 {
@@ -1262,8 +1262,7 @@ mod tests {
     #[test]
     fn logdet_from_factor_matches_dense_logdet_diagonal() {
         // Diagonal matrix diag(4,9,16): log-det = log(4)+log(9)+log(16)
-        let a: Array2<f64> =
-            array![[4.0, 0.0, 0.0], [0.0, 9.0, 0.0], [0.0, 0.0, 16.0]];
+        let a: Array2<f64> = array![[4.0, 0.0, 0.0], [0.0, 9.0, 0.0], [0.0, 0.0, 16.0]];
         let a_sparse = dense_to_sparse_symmetric_upper(&a, ZERO_TOL).unwrap();
         let factor = factorize_sparse_spd(&a_sparse).unwrap();
         let logdet = logdet_from_factor(&factor).unwrap();
@@ -1459,8 +1458,8 @@ mod tests {
         let rhs = Array2::<f64>::eye(2);
         let inv = solve_sparse_spdmulti(&factor, &rhs).unwrap();
         approx_eq(inv[[0, 0]], 0.25, 1e-12);
-        approx_eq(inv[[0, 1]], 0.0,  1e-12);
-        approx_eq(inv[[1, 0]], 0.0,  1e-12);
+        approx_eq(inv[[0, 1]], 0.0, 1e-12);
+        approx_eq(inv[[1, 0]], 0.0, 1e-12);
         approx_eq(inv[[1, 1]], 1.0 / 9.0, 1e-12);
     }
 

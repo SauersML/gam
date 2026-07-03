@@ -74,8 +74,8 @@ fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
 /// `include!("mod.rs")`).
 fn root_module_text(src_dir: &Path) -> String {
     let lib = src_dir.join("lib.rs");
-    let mut text = fs::read_to_string(&lib)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", lib.display()));
+    let mut text =
+        fs::read_to_string(&lib).unwrap_or_else(|e| panic!("cannot read {}: {e}", lib.display()));
     // Naive `include!("rel/path.rs")` scan.
     let needle = "include!";
     let mut from = 0usize;
@@ -146,7 +146,10 @@ fn crate_module_roots(code: &str) -> Vec<String> {
             && seg
                 .chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-            && seg.chars().next().is_some_and(|c| c.is_ascii_lowercase() || c == '_');
+            && seg
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_lowercase() || c == '_');
         if prev_ok && followed_by_path && snake {
             out.push(seg.to_string());
         }
@@ -160,8 +163,9 @@ fn gam_solve_only_references_module_roots_it_provides() {
     let manifest = env!("CARGO_MANIFEST_DIR");
     let src_dir = Path::new(manifest).join("crates/gam-solve/src");
 
-    let provided: std::collections::BTreeSet<String> =
-        identifiers(&root_module_text(&src_dir)).into_iter().collect();
+    let provided: std::collections::BTreeSet<String> = identifiers(&root_module_text(&src_dir))
+        .into_iter()
+        .collect();
 
     let mut sources = Vec::new();
     rust_sources(&src_dir, &mut sources);

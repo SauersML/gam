@@ -34,12 +34,19 @@ pub(crate) fn build_custom_family_inner_assembly<'dp>(
     deriv_provider: Box<dyn HessianDerivativeProvider + 'dp>,
     ext_bundle: Option<ExtCoordBundle>,
     firth_value: Option<f64>,
-) -> Result<(gam_solve::estimate::reml::assembly::InnerAssembly<'dp>, usize, Vec<f64>), String> {
+) -> Result<
+    (
+        gam_solve::estimate::reml::assembly::InnerAssembly<'dp>,
+        usize,
+        Vec<f64>,
+    ),
+    String,
+> {
+    use gam_problem::PenaltyCoordinate;
     use gam_solve::estimate::reml::assembly::{
         InnerAssembly, PenaltyBlockDesc, penalty_coords_from_blocks,
     };
     use gam_solve::estimate::reml::reml_outer_engine::penalty_matrix_root;
-    use gam_problem::PenaltyCoordinate;
 
     // Collect dense penalty matrices so references stay valid for the assembler.
     let per_block_penalties_dense: Vec<Vec<Array2<f64>>> = {
@@ -985,8 +992,8 @@ pub(crate) fn joint_outer_evaluate(
     // inner-converged penalized Hessian (which DID include it). Precompute the
     // dense scaled joint penalty once (`total × total`); `None` for every family
     // without joint penalties keeps every operator path byte-identical.
-    let scaled_joint_penalty: Option<Array2<f64>> = options.joint_penalties.as_deref().and_then(
-        |bundle| {
+    let scaled_joint_penalty: Option<Array2<f64>> =
+        options.joint_penalties.as_deref().and_then(|bundle| {
             if bundle.is_empty() {
                 return None;
             }
@@ -996,8 +1003,7 @@ pub(crate) fn joint_outer_evaluate(
                 matrix.mapv_inplace(|value| rho_curvature_scale * value);
             }
             Some(matrix)
-        },
-    );
+        });
 
     // Reuse the assembled outer Hessian operator (and its lazily-built spectral
     // factorization) when an immediately-prior eval at the SAME ρ/β̂/curvature
@@ -1576,8 +1582,8 @@ pub(crate) fn joint_outer_evaluate_efs(
     // path above — otherwise the EFS step optimizes a criterion missing
     // `½log|H_pen|` (see `joint_penalty_subspace_trace_parts`). `None` for
     // every per-block-only family keeps this byte-identical.
-    let scaled_joint_penalty: Option<Array2<f64>> = options.joint_penalties.as_deref().and_then(
-        |bundle| {
+    let scaled_joint_penalty: Option<Array2<f64>> =
+        options.joint_penalties.as_deref().and_then(|bundle| {
             if bundle.is_empty() {
                 return None;
             }
@@ -1587,8 +1593,7 @@ pub(crate) fn joint_outer_evaluate_efs(
                 matrix.mapv_inplace(|value| rho_curvature_scale * value);
             }
             Some(matrix)
-        },
-    );
+        });
 
     let hessian_op: Arc<dyn HessianOperator> = if use_joint_matrix_free_path(
         total,

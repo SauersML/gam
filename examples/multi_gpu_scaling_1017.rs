@@ -50,7 +50,10 @@ fn main() {
     println!("MULTIGPU N={N} M={M} K={K}");
 
     // Warm up the driver / cuBLAS handles + autoderived size gate.
-    drop(gam::gpu::linalg_dispatch::try_fast_xt_diag_x(phis[0].view(), weights[0].view()));
+    drop(gam::gpu::linalg_dispatch::try_fast_xt_diag_x(
+        phis[0].view(),
+        weights[0].view(),
+    ));
 
     let reps = 10usize;
 

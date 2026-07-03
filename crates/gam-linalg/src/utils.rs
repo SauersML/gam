@@ -1503,7 +1503,10 @@ mod pure_fn_tests {
     fn softplus_positive_large_approximates_x() {
         let x = 100.0_f64;
         let got = stable_softplus(x);
-        assert!((got - x).abs() < 1e-10, "softplus({x}) = {got}, expected ~{x}");
+        assert!(
+            (got - x).abs() < 1e-10,
+            "softplus({x}) = {got}, expected ~{x}"
+        );
     }
 
     #[test]
@@ -1519,7 +1522,10 @@ mod pure_fn_tests {
         for x in [-5.0_f64, -1.0, 0.5, 1.0, 5.0] {
             let got = stable_softplus(x);
             let expected = (1.0 + x.exp()).ln();
-            assert!((got - expected).abs() < 1e-12, "x={x}: got={got} expected={expected}");
+            assert!(
+                (got - expected).abs() < 1e-12,
+                "x={x}: got={got} expected={expected}"
+            );
         }
     }
 
@@ -1550,7 +1556,10 @@ mod pure_fn_tests {
         for x in [0.5_f64, 1.0, 2.0, 5.0] {
             let pos = stable_logistic(x);
             let neg = stable_logistic(-x);
-            assert!((pos + neg - 1.0).abs() < 1e-15, "x={x}: pos={pos} neg={neg}");
+            assert!(
+                (pos + neg - 1.0).abs() < 1e-15,
+                "x={x}: pos={pos} neg={neg}"
+            );
         }
     }
 

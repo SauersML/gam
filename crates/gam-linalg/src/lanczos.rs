@@ -345,16 +345,11 @@ mod tests {
     #[test]
     fn eigenpairs_2x2_diagonal_recovers_both_eigenvalues() {
         let sq2_inv = 1.0_f64 / 2.0_f64.sqrt();
-        let ep = symmetric_lanczos_eigenpairs(
-            2,
-            &[sq2_inv, sq2_inv],
-            no_reortho(),
-            |q, w| {
-                w[0] = 1.0 * q[0];
-                w[1] = 4.0 * q[1];
-                Ok(())
-            },
-        )
+        let ep = symmetric_lanczos_eigenpairs(2, &[sq2_inv, sq2_inv], no_reortho(), |q, w| {
+            w[0] = 1.0 * q[0];
+            w[1] = 4.0 * q[1];
+            Ok(())
+        })
         .unwrap();
         assert_eq!(ep.eigenvalues.len(), 2);
         let mut evs = ep.eigenvalues.to_vec();

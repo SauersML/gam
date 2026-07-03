@@ -20,9 +20,12 @@ use super::hmc_io::{
     run_nuts_sampling_flattened_family, run_survival_nuts_sampling_flattened, validate_nuts_config,
 };
 pub use super::hmc_io::{NutsConfig, NutsResult};
-use gam_terms::basis::create_difference_penalty_matrix;
-use gam_solve::estimate::{BlockRole, UnifiedFitResult, validate_all_finite};
+use crate::formula_dsl::{LinkWiggleFormulaSpec, parse_formula};
+use crate::model::{
+    FittedModel as SavedModel, PredictModelClass, load_survival_time_basis_config_from_model,
+};
 use gam_linalg::faer_ndarray::FaerCholesky;
+use gam_linalg::triangular::back_substitution_lower_transpose_guarded_into;
 use gam_models::survival::construction::{
     SurvivalLikelihoodMode, add_survival_time_derivative_guard_offset, build_survival_time_basis,
     build_survival_time_offsets_for_likelihood, center_survival_time_designs_at_anchor,
@@ -42,15 +45,12 @@ use gam_models::wiggle::{
     append_selected_wiggle_penalty_orders, buildwiggle_block_input_from_knots,
     split_wiggle_penalty_orders,
 };
-use crate::formula_dsl::{LinkWiggleFormulaSpec, parse_formula};
-use crate::model::{
-    FittedModel as SavedModel, PredictModelClass, load_survival_time_basis_config_from_model,
-};
-use gam_linalg::triangular::back_substitution_lower_transpose_guarded_into;
+use gam_problem::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
+use gam_solve::estimate::{BlockRole, UnifiedFitResult, validate_all_finite};
+use gam_terms::basis::create_difference_penalty_matrix;
 use gam_terms::smooth::build_term_collection_design;
 use gam_terms::smooth::{LinearCoefficientGeometry, weighted_blockwise_penalty_sum};
 use gam_terms::term_builder::resolve_role_col;
-use gam_problem::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 
 /// Reconstruct the `LinkWiggleFormulaSpec` from a saved model's
 /// baseline-time-wiggle runtime, returning `None` when the model has no
@@ -534,21 +534,21 @@ fn sample_standard(
         // `intercept_range.end + j` of the model's coefficient vector. Bounds
         // are on the original (user/data) scale, which is also the scale the
         // saved beta and penalized Hessian live on.
-        let bounded_columns: Vec<gam_models::fit_orchestration::drivers::BoundedSampleColumn> = spec
-            .linear_terms
-            .iter()
-            .enumerate()
-            .filter_map(|(j, term)| match term.coefficient_geometry {
-                LinearCoefficientGeometry::Bounded { min, max, .. } => {
-                    Some(gam_models::fit_orchestration::drivers::BoundedSampleColumn {
-                        col_idx: design.intercept_range.end + j,
-                        min,
-                        max,
-                    })
-                }
-                LinearCoefficientGeometry::Unconstrained => None,
-            })
-            .collect();
+        let bounded_columns: Vec<gam_models::fit_orchestration::drivers::BoundedSampleColumn> =
+            spec.linear_terms
+                .iter()
+                .enumerate()
+                .filter_map(|(j, term)| match term.coefficient_geometry {
+                    LinearCoefficientGeometry::Bounded { min, max, .. } => Some(
+                        gam_models::fit_orchestration::drivers::BoundedSampleColumn {
+                            col_idx: design.intercept_range.end + j,
+                            min,
+                            max,
+                        },
+                    ),
+                    LinearCoefficientGeometry::Unconstrained => None,
+                })
+                .collect();
         return sample_standard_bounded(model, cfg, &bounded_columns);
     }
 

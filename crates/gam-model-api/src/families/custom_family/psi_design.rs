@@ -16,8 +16,9 @@ use std::sync::Arc;
 // `CustomFamily` evaluation carrier (`ExactNewtonJointHessianWorkspace`) stays
 // local below.
 pub use gam_problem::{
-    CustomFamilyBlockPsiDerivative, CustomFamilyPsiDerivativeOperator, JointHessianSourcePreference,
-    MaterializablePsiDerivativeOperator, MaterializationIntent, SharedDerivativeBlocks,
+    CustomFamilyBlockPsiDerivative, CustomFamilyPsiDerivativeOperator,
+    JointHessianSourcePreference, MaterializablePsiDerivativeOperator, MaterializationIntent,
+    SharedDerivativeBlocks,
 };
 pub use gam_problem::{
     ExactNewtonJointPsiSecondOrderContracted, ExactNewtonJointPsiSecondOrderTerms,
@@ -63,9 +64,9 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
         // mode-blind prime; mode-aware workspaces override this method to skip
         // caches the requested mode never reads.
         match eval_mode {
-            EvalMode::ValueOnly
-            | EvalMode::ValueAndGradient
-            | EvalMode::ValueGradientHessian => self.warm_up_outer_caches(),
+            EvalMode::ValueOnly | EvalMode::ValueAndGradient | EvalMode::ValueGradientHessian => {
+                self.warm_up_outer_caches()
+            }
         }
     }
 

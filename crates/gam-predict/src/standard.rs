@@ -519,7 +519,7 @@ impl PredictableModel for StandardPredictor {
 mod tests {
     use super::*;
     use gam::types::StandardLink;
-    use ndarray::{array, Array2};
+    use ndarray::{Array2, array};
 
     fn make_std(beta: Array1<f64>, family: LikelihoodSpec) -> StandardPredictor {
         StandardPredictor {
@@ -612,7 +612,8 @@ mod tests {
         let result = pred.predict_plugin_response(&input).expect("plugin");
         assert!(
             (result.mean[0] - 0.5).abs() < 1e-12,
-            "logit(0) → mean = 0.5, got {}", result.mean[0]
+            "logit(0) → mean = 0.5, got {}",
+            result.mean[0]
         );
     }
 

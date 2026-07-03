@@ -24,7 +24,6 @@ use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 // These helpers prevent diagnostic spam while ensuring important messages are seen.
 // Pattern: show first occurrence, then every Nth occurrence, with count indicator.
 
-
 /// Rate-limited diagnostic for Hessian minimum eigenvalue warnings
 pub static H_MIN_EIG_LOG_BUCKET: AtomicI32 = AtomicI32::new(i32::MIN);
 /// Count of `should_emit_h_min_eig_diag` invocations that have ever been

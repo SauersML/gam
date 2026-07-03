@@ -40,11 +40,11 @@
 //! succeeds and yields finite predictions — i.e. the periodic radial builder is
 //! reachable rather than a compile error. No further edits are needed.
 
+use csv::StringRecord;
 use gam::{
     FitConfig, FitResult, data::EncodedDataset, encode_recordswith_inferred_schema,
     fit_from_formula,
 };
-use csv::StringRecord;
 
 /// Deterministic SplitMix64 — no external RNG crate, reproducible across runs.
 struct SplitMix64 {
@@ -105,6 +105,9 @@ fn periodic_duchon_radial_smooth_is_fittable_and_finite() {
         fit.fit.beta.len()
     );
     for (i, b) in fit.fit.beta.iter().enumerate() {
-        assert!(b.is_finite(), "periodic Duchon coefficient {i} is non-finite: {b}");
+        assert!(
+            b.is_finite(),
+            "periodic Duchon coefficient {i} is non-finite: {b}"
+        );
     }
 }

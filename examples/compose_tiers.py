@@ -304,7 +304,7 @@ def compose_tiers(
             min_effect_ev=float(stagewise_min_effect_ev),
             n_iter=t2_n_iter,
             random_state=random_state,
-            birth_callback=_stagewise_callback,
+            progress_callback=_stagewise_callback,
         )
 
     def _fit_curved(residual: np.ndarray) -> Any:
@@ -764,7 +764,7 @@ def build_parser() -> argparse.ArgumentParser:
                             "(0.0 = null-recovering, evidence-only)")
     tiers.add_argument("--stagewise-checkpoint-prefix", default=None,
                        help="optional prefix for per-stagewise durable checkpoint "
-                            "JSON/NPZ files emitted from the Rust birth_callback")
+                            "JSON/NPZ files emitted from the Rust progress_callback")
 
     block = ap.add_argument_group("block tier (--t1-mode block)")
     block.add_argument("--n-blocks", type=int, default=8,

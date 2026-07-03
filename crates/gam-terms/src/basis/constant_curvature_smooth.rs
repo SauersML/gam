@@ -1699,7 +1699,9 @@ mod tests {
         // to the positive bound. (The substantive guarantee, sign recovery under
         // the proper L(κ) length, is the two checks above.) ---
         let (k_frozen_hyp, _) = argmin_sign(-2.0, true);
-        eprintln!("[κ-ident] frozen ℓ: hyperbolic truth κ⋆=−2 → κ̂={k_frozen_hyp:.2} (no longer rails)");
+        eprintln!(
+            "[κ-ident] frozen ℓ: hyperbolic truth κ⋆=−2 → κ̂={k_frozen_hyp:.2} (no longer rails)"
+        );
         assert!(
             k_frozen_hyp <= grid[grid.len() - 2],
             "frozen-ℓ criterion must NOT rail the hyperbolic truth to the +bound any more \

@@ -3,10 +3,7 @@
 use crate::EstimationError;
 use ndarray::Array1;
 
-pub fn ensure_finite_scalar_estimation(
-    name: &str,
-    value: f64,
-) -> Result<(), EstimationError> {
+pub fn ensure_finite_scalar_estimation(name: &str, value: f64) -> Result<(), EstimationError> {
     if value.is_finite() {
         Ok(())
     } else {
@@ -16,10 +13,7 @@ pub fn ensure_finite_scalar_estimation(
     }
 }
 
-pub fn validate_all_finite_estimation<I>(
-    label: &str,
-    values: I,
-) -> Result<(), EstimationError>
+pub fn validate_all_finite_estimation<I>(label: &str, values: I) -> Result<(), EstimationError>
 where
     I: IntoIterator<Item = f64>,
 {

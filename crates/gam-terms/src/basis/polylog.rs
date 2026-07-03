@@ -131,8 +131,7 @@ mod tests {
     #[test]
     fn dilog_unit_at_half_matches_reflection_identity() {
         // Li₂(1/2) = π²/12 − (ln 2)²/2  (reflection at z = 1/2)
-        let expected = std::f64::consts::PI.powi(2) / 12.0
-            - (2.0_f64).ln().powi(2) / 2.0;
+        let expected = std::f64::consts::PI.powi(2) / 12.0 - (2.0_f64).ln().powi(2) / 2.0;
         assert!((dilog_unit(0.5) - expected).abs() < 1e-14);
     }
 

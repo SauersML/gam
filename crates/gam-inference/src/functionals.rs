@@ -1,7 +1,7 @@
+use faer::Side;
 use gam_linalg::faer_ndarray::FaerCholesky;
 use gam_solve::model_types::EstimationError;
 use gam_solve::sensitivity::FitSensitivity;
-use faer::Side;
 use ndarray::{Array1, ArrayView1, ArrayView2};
 
 #[derive(Clone, Debug)]
@@ -100,7 +100,9 @@ pub fn average_derivative_gaussian_identity_with_sensitivity(
         || !se.is_finite()
         || !penalty_bias.is_finite()
     {
-        gam_problem::bail_invalid_estim!("average-derivative functional produced non-finite estimate");
+        gam_problem::bail_invalid_estim!(
+            "average-derivative functional produced non-finite estimate"
+        );
     }
 
     Ok(FunctionalEstimate {
@@ -119,7 +121,7 @@ pub fn penalty_times_beta(penalty: ArrayView2<'_, f64>, beta: ArrayView1<'_, f64
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{array, Array2};
+    use ndarray::{Array2, array};
 
     /// Intercept-only input: X = I_n (identity), derivative_design = I_n,
     /// penalty = 0, penalty_beta = 0.  For y == mu (perfect fit) the SE must
@@ -198,9 +200,21 @@ mod tests {
         // penalty_bias = riesz @ penalty_beta = riesz @ beta = 3 * (1/6) * 2 = 1
         // theta_plugin = a @ beta = 2.0
         // theta_onestep = 2.0 + 1.0 = 3.0
-        assert!((est.theta_plugin - 2.0).abs() < 1e-10, "plugin={}", est.theta_plugin);
-        assert!((est.penalty_bias - 1.0).abs() < 1e-10, "bias={}", est.penalty_bias);
-        assert!((est.theta_onestep - 3.0).abs() < 1e-10, "onestep={}", est.theta_onestep);
+        assert!(
+            (est.theta_plugin - 2.0).abs() < 1e-10,
+            "plugin={}",
+            est.theta_plugin
+        );
+        assert!(
+            (est.penalty_bias - 1.0).abs() < 1e-10,
+            "bias={}",
+            est.penalty_bias
+        );
+        assert!(
+            (est.theta_onestep - 3.0).abs() < 1e-10,
+            "onestep={}",
+            est.theta_onestep
+        );
     }
 
     /// Empty design returns an error.

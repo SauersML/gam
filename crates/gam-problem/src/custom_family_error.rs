@@ -84,18 +84,25 @@ mod tests {
             reason: "diverged".to_string(),
         };
         let msg = err.to_string();
-        assert!(msg.contains("outer_loop") && msg.contains("diverged"), "message: {msg}");
+        assert!(
+            msg.contains("outer_loop") && msg.contains("diverged"),
+            "message: {msg}"
+        );
     }
 
     #[test]
     fn dimension_mismatch_displays_reason() {
-        let err = CustomFamilyError::DimensionMismatch { reason: "3 vs 4".to_string() };
+        let err = CustomFamilyError::DimensionMismatch {
+            reason: "3 vs 4".to_string(),
+        };
         assert_eq!(err.to_string(), "3 vs 4");
     }
 
     #[test]
     fn numerical_failure_displays_reason() {
-        let err = CustomFamilyError::NumericalFailure { reason: "NaN detected".to_string() };
+        let err = CustomFamilyError::NumericalFailure {
+            reason: "NaN detected".to_string(),
+        };
         assert_eq!(err.to_string(), "NaN detected");
     }
 
@@ -108,7 +115,9 @@ mod tests {
 
     #[test]
     fn from_custom_family_error_for_string_uses_display() {
-        let err = CustomFamilyError::NumericalFailure { reason: "singular".to_string() };
+        let err = CustomFamilyError::NumericalFailure {
+            reason: "singular".to_string(),
+        };
         let s = String::from(err);
         assert_eq!(s, "singular");
     }

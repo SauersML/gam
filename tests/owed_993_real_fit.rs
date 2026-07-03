@@ -35,9 +35,9 @@ use std::sync::Arc;
 
 use ndarray::{Array1, Array2};
 
-use gam::terms::sae::structure_harvest::{HarvestParams, harvest_move_proposals};
 use gam::solver::structure_search::StructureMove;
 use gam::terms::latent::LatentManifold;
+use gam::terms::sae::structure_harvest::{HarvestParams, harvest_move_proposals};
 use gam::terms::{
     AssignmentMode, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldAtom,
     SaeManifoldRho, SaeManifoldTerm, TorusHarmonicEvaluator,

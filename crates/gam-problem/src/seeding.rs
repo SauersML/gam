@@ -63,10 +63,7 @@ impl SeedRiskProfile {
         // strictly lower REML, so this can never worsen a flexible fit.
         matches!(
             self,
-            Self::Gaussian
-                | Self::GaussianLocationScale
-                | Self::GeneralizedLinear
-                | Self::Survival
+            Self::Gaussian | Self::GaussianLocationScale | Self::GeneralizedLinear | Self::Survival
         )
     }
 
@@ -135,7 +132,10 @@ mod tests {
     #[test]
     fn anchor_rho_shift_gaussian_is_zero() {
         assert_eq!(SeedRiskProfile::Gaussian.anchor_rho_shift(), 0.0);
-        assert_eq!(SeedRiskProfile::GaussianLocationScale.anchor_rho_shift(), 0.0);
+        assert_eq!(
+            SeedRiskProfile::GaussianLocationScale.anchor_rho_shift(),
+            0.0
+        );
     }
 
     #[test]

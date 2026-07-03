@@ -68,9 +68,10 @@ pub(crate) fn build_joint_jeffreys_subspace(
         // reduced block coefficient space. The aggregate penalty only fixes the
         // block dimension; the span no longer depends on `ker(S)`.
         let aggregate = Array2::<f64>::zeros((p_block, p_block));
-        let subspace = gam_solve::estimate::reml::jeffreys_subspace::jeffreys_subspace_from_penalty(
-            aggregate.view(),
-        )?;
+        let subspace =
+            gam_solve::estimate::reml::jeffreys_subspace::jeffreys_subspace_from_penalty(
+                aggregate.view(),
+            )?;
         m_total += subspace.span_dim();
         per_block.push(subspace.columns);
     }

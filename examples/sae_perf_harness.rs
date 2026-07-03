@@ -3,13 +3,13 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
+use gam::solver::arrow_schur::ArrowSolveOptions;
+use gam::solver::estimate::EstimationError;
 use gam::solver::gpu_kernels::arrow_schur::solve_reduced_beta_pcg_with_diagnostics;
 use gam::solver::gpu_kernels::sae_resident::{
     DeviceResidentArrowError, DeviceResidentInnerOptions, qwen_non_gating_fixture,
     qwen_non_gating_fixture_seeded, run_resident_fits_multiplexed, run_resident_fits_sequential,
 };
-use gam::solver::arrow_schur::ArrowSolveOptions;
-use gam::solver::estimate::EstimationError;
 use gam::solver::rho_optimizer::{
     EfsEval, OuterCapability, OuterEval, OuterObjective, OuterProblem, SeedOutcome,
 };

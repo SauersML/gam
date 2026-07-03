@@ -100,9 +100,11 @@ fn assert_accepts_and_wraps(formula: &str, data: &gam::data::EncodedDataset, fea
     };
     let fidx = data.column_map()[feature];
     let column = data.values.column(fidx);
-    let (lo, hi) = column.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
-        (lo.min(v), hi.max(v))
-    });
+    let (lo, hi) = column
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
+            (lo.min(v), hi.max(v))
+        });
     let probe = [lo, hi];
     let mut design_pts = Array2::<f64>::zeros((probe.len(), data.headers.len()));
     for (i, &x) in probe.iter().enumerate() {

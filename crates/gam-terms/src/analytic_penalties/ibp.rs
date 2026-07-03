@@ -257,7 +257,8 @@ impl IBPAssignmentPenalty {
                     let inv_q = 1.0 / one_minus;
                     let a_channel = inv_p + inv_q;
                     let d_a_channel_da = dpi_da * (-inv_p * inv_p + inv_q * inv_q);
-                    let d_score_derivative_da = a_channel / (denom * denom) - d_a_channel_da / denom;
+                    let d_score_derivative_da =
+                        a_channel / (denom * denom) - d_a_channel_da / denom;
                     cross_row_d_logalpha[k] = self.weight * a * d_score_derivative_da;
                 }
             }

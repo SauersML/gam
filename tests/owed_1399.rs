@@ -21,11 +21,11 @@
 //! point `H z* = g₀`, so a future change that merely made both halves agree on a
 //! wrong value could not pass it.
 
+use gam::solver::arrow_schur::{ArrowSolveOptions, solve_arrow_newton_step_core};
 use gam::solver::gpu_kernels::sae_resident::{
     DeviceResidentArrowShape, DeviceResidentArrowSlabs, DeviceResidentArrowWorkspace,
     DeviceResidentInnerOptions,
 };
-use gam::solver::arrow_schur::{ArrowSolveOptions, solve_arrow_newton_step_core};
 
 /// Build a small, strongly diagonally-dominant resident frame whose dense
 /// reference factorisation is well-conditioned (the bordered quadratic minimiser

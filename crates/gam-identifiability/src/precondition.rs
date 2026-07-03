@@ -664,7 +664,11 @@ mod tests {
         let thr = Thresholds::default();
         let result = check_ivae(&summary, &thr);
         assert_eq!(result.status, TheoremStatus::Fail);
-        assert!(result.reason.contains("linear"), "reason: {}", result.reason);
+        assert!(
+            result.reason.contains("linear"),
+            "reason: {}",
+            result.reason
+        );
     }
 
     #[test]
@@ -680,7 +684,12 @@ mod tests {
     fn varying_aux_with_deep_encoder_passes_ivae() {
         let thr = Thresholds::default();
         let result = check_ivae(&passing_ivae_summary(), &thr);
-        assert_eq!(result.status, TheoremStatus::Pass, "reason: {}", result.reason);
+        assert_eq!(
+            result.status,
+            TheoremStatus::Pass,
+            "reason: {}",
+            result.reason
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -703,12 +712,7 @@ mod tests {
         let summary = FitSummary {
             n_supervised: Some(0),
             n_free: Some(1),
-            decoder: Some(vec![
-                vec![1.0],
-                vec![0.0],
-                vec![0.0],
-                vec![0.0],
-            ]),
+            decoder: Some(vec![vec![1.0], vec![0.0], vec![0.0], vec![0.0]]),
             mech_sparsity_weight: Some(1.0),
             aux: Some(vec![vec![1.0], vec![2.0], vec![3.0], vec![4.0]]),
             encoder_depth: Some(3),
@@ -718,7 +722,12 @@ mod tests {
         };
         let thr = Thresholds::default();
         let result = check_mechanism_sparsity(&summary, &thr);
-        assert_eq!(result.status, TheoremStatus::Pass, "reason: {}", result.reason);
+        assert_eq!(
+            result.status,
+            TheoremStatus::Pass,
+            "reason: {}",
+            result.reason
+        );
     }
 
     #[test]
@@ -737,7 +746,11 @@ mod tests {
         let thr = Thresholds::default();
         let result = check_mechanism_sparsity(&summary, &thr);
         assert_eq!(result.status, TheoremStatus::Fail);
-        assert!(result.reason.contains("not strictly positive"), "reason: {}", result.reason);
+        assert!(
+            result.reason.contains("not strictly positive"),
+            "reason: {}",
+            result.reason
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -747,37 +760,42 @@ mod tests {
     #[test]
     fn low_variance_activations_pass_random_projection() {
         let summary = FitSummary {
-            activations: Some(vec![
-                vec![0.1, 0.2],
-                vec![0.15, 0.25],
-                vec![0.12, 0.22],
-            ]),
+            activations: Some(vec![vec![0.1, 0.2], vec![0.15, 0.25], vec![0.12, 0.22]]),
             ..FitSummary::default()
         };
         let thr = Thresholds::default();
         let result = check_random_projection(&summary, &thr);
-        assert_eq!(result.status, TheoremStatus::Pass, "reason: {}", result.reason);
+        assert_eq!(
+            result.status,
+            TheoremStatus::Pass,
+            "reason: {}",
+            result.reason
+        );
     }
 
     #[test]
     fn very_high_variance_activations_fail_random_projection() {
         // variance ≈ (1e4)^2 > DEFAULT_RANDPROJ_VAR_CEILING = 1e6
         let summary = FitSummary {
-            activations: Some(vec![
-                vec![0.0],
-                vec![1_000_000.0],
-            ]),
+            activations: Some(vec![vec![0.0], vec![1_000_000.0]]),
             ..FitSummary::default()
         };
         let thr = Thresholds::default();
         let result = check_random_projection(&summary, &thr);
         assert_eq!(result.status, TheoremStatus::Fail);
-        assert!(result.reason.contains("unbounded"), "reason: {}", result.reason);
+        assert!(
+            result.reason.contains("unbounded"),
+            "reason: {}",
+            result.reason
+        );
     }
 
     #[test]
     fn missing_activations_warn_random_projection() {
-        let summary = FitSummary { activations: None, ..FitSummary::default() };
+        let summary = FitSummary {
+            activations: None,
+            ..FitSummary::default()
+        };
         let thr = Thresholds::default();
         let result = check_random_projection(&summary, &thr);
         assert_eq!(result.status, TheoremStatus::Warn);
@@ -841,7 +859,11 @@ mod tests {
         let m = array![[3.0_f64], [3.0], [3.0]];
         let std = column_std(m.view());
         assert_eq!(std.len(), 1);
-        assert!(std[0].abs() < 1e-14, "constant column std should be 0, got {}", std[0]);
+        assert!(
+            std[0].abs() < 1e-14,
+            "constant column std should be 0, got {}",
+            std[0]
+        );
     }
 
     #[test]
@@ -850,7 +872,11 @@ mod tests {
         // Column [0, 2]: mean=1, deviations [-1,1], pop var=1, std=1
         let m = array![[0.0_f64], [2.0]];
         let std = column_std(m.view());
-        assert!((std[0] - 1.0).abs() < 1e-14, "expected std=1.0, got {}", std[0]);
+        assert!(
+            (std[0] - 1.0).abs() < 1e-14,
+            "expected std=1.0, got {}",
+            std[0]
+        );
     }
 
     #[test]
@@ -861,7 +887,11 @@ mod tests {
         let var = column_var(m.view());
         assert_eq!(std.len(), var.len());
         for (s, v) in std.iter().zip(var.iter()) {
-            assert!((v - s * s).abs() < 1e-14, "var={v} should equal std²={}", s*s);
+            assert!(
+                (v - s * s).abs() < 1e-14,
+                "var={v} should equal std²={}",
+                s * s
+            );
         }
     }
 
