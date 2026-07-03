@@ -200,12 +200,21 @@ pub(crate) fn run_predict_unified(
         // Linear/identity link: plug-in `link⁻¹(η̂)` equals the posterior mean,
         // so the full-uncertainty (`TransformEta`) path reports the same point as
         // the default arm while adding the SE/band columns.
+        //
+        // `apply_bias_correction: false` is what makes that promise true: the
+        // point prediction is a property of the model + inputs, never of whether
+        // `--uncertainty` was requested (#398, #2115). Recentring η by
+        // `X·H⁻¹S(λ̂)β̂` here would silently shift the reported `eta`/`mean` the
+        // moment an interval is requested, diverging from the plain arm's
+        // `predict_plugin_response` and from the Python FFI parity arm
+        // (`geometry_ffi`, which pins the same `false`). Bias-aware coverage is
+        // already supplied by the smoothing-corrected covariance.
         let options = PredictUncertaintyOptions {
             confidence_level: args.level,
             covariance_mode: infer_covariance_mode(args.covariance_mode),
             mean_interval_method: MeanIntervalMethod::TransformEta,
             includeobservation_interval: false,
-            apply_bias_correction: !args.no_bias_correction,
+            apply_bias_correction: false,
             ..PredictUncertaintyOptions::default()
         };
         let pred = predictor

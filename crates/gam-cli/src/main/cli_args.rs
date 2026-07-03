@@ -229,10 +229,11 @@ pub(crate) struct PredictArgs {
     pub(crate) covariance_mode: CovarianceModeArg,
     #[arg(long = "mode", value_enum, default_value_t = PredictModeArg::PosteriorMean)]
     pub(crate) mode: PredictModeArg,
-    /// Disable the O(n⁻¹) frequentist bias correction at prediction time.
-    /// By default the corrected predictor η̂ + s_*^T H⁻¹ S(λ̂) β̂ is reported,
-    /// improving credible-interval coverage from O(1) to O(n⁻¹) without
-    /// changing the standard errors at first order.
+    /// Disable the O(n⁻¹) frequentist bias correction in the survival
+    /// uncertainty paths. The reported point prediction of `gam predict` is the
+    /// plain plug-in / posterior-mean estimate (`eta`/`mean`) with or without
+    /// `--uncertainty`; `--uncertainty` only appends the SE and credible-band
+    /// columns, so this flag never moves the standard point estimate.
     #[arg(long = "no-bias-correction", default_value_t = false)]
     pub(crate) no_bias_correction: bool,
 }
