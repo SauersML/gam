@@ -328,7 +328,7 @@ fn tangent_basis_orthogonal_to(axis: ArrayView1<'_, f64>) -> Result<Array2<f64>,
     let mut w = axis.to_owned();
     w.mapv_inplace(|value| -value);
     w[pivot] += 1.0;
-    let w_norm = w.dot(&w).sqrt();
+    let w_norm = f64::sqrt(w.dot(&w));
     if !(w_norm > 0.0) {
         // Only possible if axis == e_pivot exactly; then the tangent basis is
         // just the other coordinate axes, so use a zero reflector (H = I).
