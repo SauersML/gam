@@ -539,6 +539,27 @@ const GPU_ROUTE_TILE_ELEMS: usize = gam_gpu::DEFAULT_DICTIONARY_SCORE_TILE_ELEMS
 /// # Errors
 /// Returns [`gam_gpu::GpuError`] when [`gam_gpu::GpuMode::Required`] is set but
 /// the device path cannot run for this minibatch.
+/// One-shot stderr engagement report for the T1 score router (#1551 class:
+/// "GPU 0%" runs where the decline reason was swallowed by the Auto fallback).
+/// Python builds initialise no `log` backend, so `log::warn!` would vanish;
+/// stderr lands in slurm/job logs. Each category prints once per process — the
+/// route is per-minibatch and a faulting device would otherwise spam thousands
+/// of identical lines.
+fn note_route_engagement(engaged: bool, detail: &str) {
+    use std::sync::Once;
+    static ENGAGED_ONCE: Once = Once::new();
+    static DECLINED_ONCE: Once = Once::new();
+    let once = if engaged { &ENGAGED_ONCE } else { &DECLINED_ONCE };
+    once.call_once(|| {
+        let verdict = if engaged {
+            "device ENGAGED"
+        } else {
+            "device DECLINED - falling back to CPU"
+        };
+        eprintln!("[gam-sae sparse_dict score router] {verdict}: {detail}");
+    });
+}
+
 pub fn route_minibatch_required(
     rows: ArrayView2<'_, f32>,
     decoder: ArrayView2<'_, f32>,
@@ -583,6 +604,14 @@ pub fn route_minibatch_required(
                 m.saturating_mul(k)
             ));
         }
+        note_route_engagement(
+            false,
+            &format!(
+                "block {m}x{k} = {} elems below the device launch break-even \
+                 (DEVICE_SCORE_BLOCK_MIN_ELEMS={DEVICE_SCORE_BLOCK_MIN_ELEMS})",
+                m.saturating_mul(k)
+            ),
+        );
         return Ok((cpu_route(), ScoreBlockPath::Cpu, 0));
     }
     if m == 0 || k == 0 {
@@ -595,6 +624,10 @@ pub fn route_minibatch_required(
 
     match device::route_decoder_tiled_device(rows, decoder, active, tile_cols) {
         Ok(out) => {
+            note_route_engagement(
+                true,
+                &format!("block {m}x{k}, tile_cols={tile_cols}, active={active}"),
+            );
             return Ok((
                 out.selections,
                 ScoreBlockPath::Device,
@@ -602,6 +635,7 @@ pub fn route_minibatch_required(
             ));
         }
         Err(err) => {
+            note_route_engagement(false, &format!("device route fault: {err}"));
             if mode == gam_gpu::GpuMode::Required {
                 return Err(err);
             }
