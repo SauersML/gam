@@ -4406,6 +4406,10 @@ fn run_exact_joint_spatial_optimization(
     let kphase_log_kappa_dim = coord_dim;
     let kphase_slow_resets_start = ctx.evaluator.slow_path_reset_count();
     let kphase_design_revision_start = ctx.cache.design_revision();
+    // #1868: snapshot the deterministic n-free skip-path row-touch accumulator
+    // AFTER the one-time priming eval above, so the reported delta measures only
+    // the per-trial inner-synthesis row work across the κ-optimisation phase.
+    let kphase_nfree_skip_touches_start = gam_solve::pirls::nfree_skip_row_element_touches();
 
     // #1033: lift the ψ (log-κ) lower bound to the n-free rank-stable floor so the
     // optimizer never line-searches into the rank-deficient sliver where the
@@ -4679,8 +4683,10 @@ fn run_exact_joint_spatial_optimization(
         .cache
         .design_revision()
         .saturating_sub(kphase_design_revision_start);
+    let kphase_nfree_skip_touches = gam_solve::pirls::nfree_skip_row_element_touches()
+        .saturating_sub(kphase_nfree_skip_touches_start);
     log::info!(
-        "[KAPPA-PHASE-SUMMARY] n_rows={} log_kappa_dim={} n_cost={} cost_total_s={:.4} n_eval={} eval_total_s={:.4} n_efs={} efs_total_s={:.4} slow_path_resets={} design_revision_delta={} nfree_miss_shape={} nfree_miss_value={} nfree_miss_gradient={} nfree_miss_penalty={} nfree_miss_revision={} nfree_miss_second_order={} nfree_miss_other={} optim_total_s={:.4}",
+        "[KAPPA-PHASE-SUMMARY] n_rows={} log_kappa_dim={} n_cost={} cost_total_s={:.4} n_eval={} eval_total_s={:.4} n_efs={} efs_total_s={:.4} slow_path_resets={} design_revision_delta={} nfree_skip_row_touches={} nfree_miss_shape={} nfree_miss_value={} nfree_miss_gradient={} nfree_miss_penalty={} nfree_miss_revision={} nfree_miss_second_order={} nfree_miss_other={} optim_total_s={:.4}",
         data.nrows(),
         kphase_log_kappa_dim,
         kphase_cost_calls.get(),
@@ -4691,6 +4697,7 @@ fn run_exact_joint_spatial_optimization(
         kphase_efs_total_s.get(),
         kphase_slow_resets,
         kphase_design_revision_delta,
+        kphase_nfree_skip_touches,
         kphase_nfree_miss_shape.get(),
         kphase_nfree_miss_value.get(),
         kphase_nfree_miss_gradient.get(),
@@ -4710,6 +4717,7 @@ fn run_exact_joint_spatial_optimization(
         efs_total_s: kphase_efs_total_s.get(),
         slow_path_resets: kphase_slow_resets,
         design_revision_delta: kphase_design_revision_delta,
+        nfree_skip_row_touches: kphase_nfree_skip_touches,
         nfree_miss_shape: kphase_nfree_miss_shape.get(),
         nfree_miss_value: kphase_nfree_miss_value.get(),
         nfree_miss_gradient: kphase_nfree_miss_gradient.get(),
@@ -7639,6 +7647,7 @@ where
         efs_total_s: kphase_efs_total_s.get(),
         slow_path_resets: 0,
         design_revision_delta: 0,
+        nfree_skip_row_touches: 0,
         nfree_miss_shape: 0,
         nfree_miss_value: 0,
         nfree_miss_gradient: 0,

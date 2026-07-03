@@ -107,6 +107,15 @@ pub struct SpatialLengthScaleOptimizationTiming {
     pub efs_total_s: f64,
     pub slow_path_resets: u64,
     pub design_revision_delta: u64,
+    /// #1868 deterministic n-independence instrument: the number of length-`n`
+    /// row-element touches the Gaussian zero-iteration inner synthesis performed
+    /// on the #1033 n-free κ-trial *skip* path during this κ-optimisation phase
+    /// (excludes the one-time priming eval). The #1033 architectural invariant
+    /// requires each in-window trial to touch only k×k objects, so this MUST NOT
+    /// scale with `n`. A value that grows with `n` is exactly the #1868
+    /// O(n)-per-callback regression. This replaces the old noisy wall-clock
+    /// per-callback ratio with an exact, millisecond-fast integer gate.
+    pub nfree_skip_row_touches: u64,
     pub nfree_miss_shape: u64,
     pub nfree_miss_value: u64,
     pub nfree_miss_gradient: u64,

@@ -70,6 +70,45 @@ use gam_terms::construction::{KroneckerReparamResult, ReparamResult};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// #1868 deterministic n-independence instrument.
+///
+/// Process-global accumulator of the number of length-`n` row-element touches
+/// (array allocations / row-wise scans) performed by the Gaussian
+/// zero-iteration inner synthesis on the **#1033 n-free κ-trial skip path**
+/// (`row_prediction_is_stale`). On that path the outer criterion, gradient and
+/// inner solve are all served from the k-space ψ-Gram sufficient statistics, so
+/// the architectural invariant (#1033: "each hyperparameter trial touches only
+/// k×k objects") requires this counter to stay FLAT — it must not grow with `n`.
+/// A value that scales with `n` is exactly the #1868 O(n)-per-callback
+/// regression (the stale-row lane re-materialising `offset`/`y`/`weights` and
+/// the constant working-weight derivative arrays per trial instead of sharing
+/// the once-built frozen row bundle).
+///
+/// This is the *deterministic* replacement for the old wall-clock
+/// per-callback-ratio gate (#1868 / #2055): the same invariant, read as an exact
+/// integer in milliseconds at small `n` instead of a noisy timing ratio that
+/// needed a multi-hour 320k sweep to surface. Monotonic; callers snapshot the
+/// value before and after the κ-trial phase and assert on the delta.
+pub(crate) static NFREE_SKIP_ROW_ELEMENT_TOUCHES: AtomicU64 = AtomicU64::new(0);
+
+/// Record `elems` length-`n` row-element touches on the n-free κ-trial skip
+/// path (see [`NFREE_SKIP_ROW_ELEMENT_TOUCHES`]). Called at each length-`n`
+/// materialisation the stale-row Gaussian synthesis performs; after the #1868
+/// frozen-row-bundle fix the skip path performs none, so the accumulator holds
+/// flat across `n`.
+#[inline]
+pub(crate) fn record_nfree_skip_row_touches(elems: usize) {
+    NFREE_SKIP_ROW_ELEMENT_TOUCHES.fetch_add(elems as u64, Ordering::Relaxed);
+}
+
+/// Read the process-global n-free κ-trial skip-path row-touch accumulator.
+/// Exposed so the spatial length-scale driver can snapshot deltas across the
+/// κ-optimisation phase and thread them into the reported timing.
+pub fn nfree_skip_row_element_touches() -> u64 {
+    NFREE_SKIP_ROW_ELEMENT_TOUCHES.load(Ordering::Relaxed)
+}
 
 pub(super) fn default_beta_guess_external(
     p: usize,
@@ -1191,8 +1230,23 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             .map(|transform| transform.apply(beta_transformed.as_ref()))
             .unwrap_or_else(|| beta_transformed.as_ref().clone());
         let stale_row_cache = cache_for_solve.filter(|cache| cache.row_prediction_is_stale);
+        // #1868: is this the #1033 n-free κ-trial skip path? On it the row
+        // predictions are stale placeholders (η≡μ≡offset, z≡y, w≡priorweights)
+        // and the criterion/gradient come entirely from k-space Gram statistics,
+        // so the architectural invariant forbids per-trial length-`n` work.
+        let is_stale_skip = stale_row_cache.is_some();
         let (final_eta, finalmu, finalz, gradient_data, deviance, log_likelihood, max_abs_eta) =
             if let Some(cache) = stale_row_cache {
+                // #1868: every length-`n` array below is a trial-INVARIANT
+                // placeholder — on the stale-row path the row predictions are not
+                // recomputed (η≡offset, μ≡offset, z≡y, w≡priorweights), so these
+                // depend only on the frozen (offset, y, priorweights), never on the
+                // trial ψ. Materialising them per κ callback is precisely the O(n)
+                // regression #1868 tracks. The counter below makes that O(n) work
+                // deterministically visible; the frozen-row-bundle fast path a few
+                // lines down shares the once-built arrays instead (zero touches).
+                let n_rows = offset.len();
+                record_nfree_skip_row_touches(3 * n_rows); // final_eta, finalmu, finalz
                 let final_eta = offset.to_owned();
                 let finalmu = final_eta.clone();
                 let finalz = y.to_owned();
@@ -1378,6 +1432,19 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             min_penalized_deviance: working_summary.min_penalized_deviance,
         };
 
+        if is_stale_skip {
+            // #1868: the shared post-branch synthesis still materialises 13
+            // further length-`n` arrays per κ callback on the skip path —
+            // `priorweights_owned`, `working_state.eta`, the 5 working-weight
+            // derivative arrays from `computeworkingweight_derivatives_from_eta`,
+            // and the 6 owned `PirlsResult` row fields (`final_offset`,
+            // `final_eta`, `finalmu`, `finalweights`, `solveworking_response`,
+            // `solvemu`). All are trial-invariant placeholders; the frozen-row
+            // bundle fix shares them O(1) instead. Counted here so the
+            // deterministic n-independence gate sees the *full* O(n) footprint,
+            // not just the 3n from the branch above.
+            record_nfree_skip_row_touches(13 * offset.len());
+        }
         return Ok((pirls_result, working_summary));
     }
 
