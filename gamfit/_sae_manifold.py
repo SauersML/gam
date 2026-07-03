@@ -2897,7 +2897,8 @@ def sae_manifold_fit_stagewise(
     d_atom: int = 1,
     atom_topology: str = "circle",
     assignment: str = "ibp_map",
-    structured_whitening: bool = True,
+    structured_whitening: bool | None = None,
+    fisher_factors: Any = None,
     cone_atom_recovery: bool = False,
     rank_charge_evidence: bool = False,
     min_effect_ev: float = 0.0,
@@ -2943,7 +2944,20 @@ def sae_manifold_fit_stagewise(
     structured_whitening
         Install the Σ-whitened per-row metric on each birth so the K=1 candidate
         fits run under the structured residual covariance from atom one (Σ is
-        refit per birth internally). ``True`` by default.
+        refit per birth internally). ``None`` (default) resolves to ``True`` for
+        the ordinary path, but to ``False`` when ``fisher_factors`` carry a
+        likelihood-whitening ``"behavioral_fisher"`` provenance — that fixed
+        harvest metric and the per-birth Σ-refit are rival sources for the same
+        per-row inner product, so the GLS lane fits under the fixed metric alone.
+        Pass an explicit ``True``/``False`` to override the resolution.
+    fisher_factors
+        Optional harvest-emitted output-Fisher factor stack (a ``HarvestShard`` /
+        ``load_harvest_shard`` dict / raw ``(n, p, r)`` array), installed on the
+        seed term and carried across every birth / backfit clone. With
+        ``provenance="behavioral_fisher"`` this is the **Rung 1** metric: the
+        reconstruction residual is priced as ``½ eᵀ G_n e`` (nats, generalized
+        least squares) at every stage of the composition, not just the seed.
+        ``None`` (default) is the isotropic ``½‖e‖²`` path, bit-for-bit today's.
     min_effect_ev
         Explicit MINIMUM-EFFECT (salience) floor a birth's ΔEV must clear ON TOP
         of the evidence gate. ``0.0`` (default) recovers evidence-only, null-
@@ -3024,6 +3038,35 @@ def sae_manifold_fit_stagewise(
         if not np.all(np.isfinite(weights_arr)) or np.any(weights_arr <= 0.0):
             raise ValueError("sample_weights must be finite and strictly positive")
 
+    # ── Rung 1 (B4): normalize the optional harvest Fisher shard once. It rides
+    # into BOTH the K=1 seed fit and the stagewise FFI so the SAME GLS metric
+    # prices the seed and every born atom. ``_normalize_fisher_factors`` accepts a
+    # HarvestShard / dict / raw (n, p, r) and returns (U, mass_residual, provenance).
+    fisher_shard = _normalize_fisher_factors(fisher_factors, n_obs, p_out)
+    if fisher_shard is None:
+        fisher_u = None
+        fisher_prov = None
+        fisher_whitens = False
+    else:
+        fisher_u = np.ascontiguousarray(np.asarray(fisher_shard[0], dtype=np.float64))
+        fisher_prov = str(fisher_shard[2])
+        # Only ``behavioral_fisher`` whitens the likelihood; the gauge-only
+        # output-Fisher provenances do not (they would merely gauge the seed and
+        # be clobbered by the per-birth Σ-refit, so they are not a GLS lane here).
+        fisher_whitens = fisher_prov == "behavioral_fisher"
+    # Resolve the structured-whitening default against the shard: a fixed
+    # likelihood-whitening metric and the per-birth Σ-refit are mutually exclusive.
+    if structured_whitening is None:
+        structured_whitening_eff = not fisher_whitens
+    else:
+        structured_whitening_eff = bool(structured_whitening)
+    if structured_whitening_eff and fisher_whitens:
+        raise ValueError(
+            "sae_manifold_fit_stagewise: a likelihood-whitening 'behavioral_fisher' "
+            "fisher metric conflicts with structured_whitening=True (the per-birth Σ-refit "
+            "would clobber it); pass structured_whitening=False for the GLS lane"
+        )
+
     # ── Seed: the proven Rust K=1 fit (Rust-seeded coords/decoder, no Python
     # reimplementation of the topology-specific seeding). ─────────────────────
     seed_fit = sae_manifold_fit(
@@ -3040,6 +3083,7 @@ def sae_manifold_fit_stagewise(
         alpha=(_ALPHA_UNSET if alpha is None else alpha),
         tau=tau,
         weights=weights_arr,
+        fisher_factors=(None if fisher_shard is None else fisher_factors),
         _run_structure_search=False,
         _run_outer_rho_search=False,
     )
@@ -3113,11 +3157,17 @@ def sae_manifold_fit_stagewise(
         max_backfit_sweeps=int(max_backfit_sweeps),
         min_effect_ev=float(min_effect_ev),
         max_factor_rank=int(max_factor_rank),
-        structured_whitening=bool(structured_whitening),
+        structured_whitening=bool(structured_whitening_eff),
         cone_atom_recovery=bool(cone_atom_recovery),
         rank_charge_evidence=bool(rank_charge_evidence),
         row_loss_weights=weights_arr,
         progress_callback=progress_callback,
+        fisher_factors=(
+            None
+            if fisher_shard is None
+            else np.ascontiguousarray(fisher_u.reshape(n_obs, p_out, -1))
+        ),
+        fisher_provenance=(None if fisher_shard is None else fisher_prov),
     )
     return _stagewise_from_payload(dict(payload), x, seed_fit)
 
@@ -3435,10 +3485,15 @@ def _normalize_fisher_factors(
     else:
         u_src = fisher_factors
         mr_src = None
-    if provenance not in ("output_fisher", "output_fisher_downstream"):
+    if provenance not in (
+        "output_fisher",
+        "output_fisher_downstream",
+        "behavioral_fisher",
+    ):
         raise ValueError(
-            "fisher_factors provenance must be 'output_fisher' or "
-            f"'output_fisher_downstream'; got {provenance!r}"
+            "fisher_factors provenance must be 'output_fisher', "
+            "'output_fisher_downstream', or 'behavioral_fisher'; "
+            f"got {provenance!r}"
         )
     u = np.asarray(u_src, dtype=np.float64)
     if u.ndim != 3:

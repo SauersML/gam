@@ -503,6 +503,112 @@ impl BehaviorBlock {
         }
         Ok((b, c))
     }
+
+    /// A copy of this block re-weighted to a new `log(λ_y)`. Because the target
+    /// `Y` is stored **unscaled**, only the scalar weight changes — the chart and
+    /// the embedded behavior are untouched — so a two-block REML fit can sweep
+    /// `λ_y` without ever re-embedding. The new augmented target is recovered by
+    /// [`Self::augmented_target`] at the updated weight.
+    pub fn with_log_lambda_y(&self, log_lambda_y: f64) -> Result<Self, String> {
+        if !log_lambda_y.is_finite() {
+            return Err(format!(
+                "BehaviorBlock::with_log_lambda_y: log_lambda_y must be finite; got {log_lambda_y}"
+            ));
+        }
+        let mut next = self.clone();
+        next.log_lambda_y = log_lambda_y;
+        Ok(next)
+    }
+
+    /// The profiled two-block REML criterion's dependence on `log(λ_y)` beyond
+    /// what the single-block engine sees: the change-of-variables Jacobian
+    /// `−(n·p_y/2)·log λ_y` that the `√λ_y` target scaling introduces into the
+    /// Gaussian negative-log-marginal-likelihood.
+    ///
+    /// The engine's REML criterion is computed on the **scaled** augmented target
+    /// `[Z | √λ_y·Y]` and so treats all `p̃` output columns as one homoscedastic
+    /// block with a single dispersion `φ̂`. But the honest two-block model has
+    /// `φ_y = φ_x/λ_y`; writing the behavior likelihood in the scaled variable
+    /// `Ỹ = √λ_y·Y` contributes a Jacobian `∏_i (√λ_y)^{p_y} = λ_y^{n p_y/2}`,
+    /// whose negative log is this term. **Add it** to the engine criterion (a
+    /// quantity that is *minimised*) to obtain the two-block REML criterion whose
+    /// minimiser over `log λ_y` is the variance-ratio REML estimate. Without it
+    /// the criterion is monotone in `λ_y` — behavior residuals shrink for free in
+    /// scaled units — and `λ_y` is unidentifiable.
+    pub fn reml_log_lambda_jacobian(&self, n_obs: usize) -> f64 {
+        -0.5 * (n_obs as f64) * (self.behavior_dim() as f64) * self.log_lambda_y
+    }
+
+    /// One REML variance-ratio update of `log(λ_y)` from an augmented fit residual
+    /// `R̃ = fitted − target` (`n × p̃`), expressed in the **scaled** augmented
+    /// units the fit saw (columns `[0, p_x)` activation, `[p_x, p̃)` the
+    /// `√λ_y`-scaled behavior).
+    ///
+    /// The profiled two-block REML criterion (engine criterion `+`
+    /// [`Self::reml_log_lambda_jacobian`]) is stationary in `log λ_y` at
+    ///
+    /// ```text
+    ///   λ_y = (R_x / p_x) / (R_y / p_y),   R_x = ‖R̃_x‖²,  R_y = ‖R̃_y‖²/λ_y,
+    /// ```
+    ///
+    /// i.e. the ratio of the two blocks' per-output-channel residual variances —
+    /// the classical REML estimate of the variance-component ratio `φ_x/φ_y`
+    /// under the shared mean structure. (Derivation: with `φ̂ = (R_x + λ R_y)/(n
+    /// p̃)`, `d/d log λ [ (n p̃/2) log φ̂ − (n p_y/2) log λ ] = 0` gives
+    /// `λ R_y p_x = R_x p_y` — the profiled-likelihood stationary point, no grid
+    /// search, no magic constants.) `R̃_y` already carries a factor `√λ_y`, so
+    /// `‖R̃_y‖² = λ_y·R_y`; the update reads the current `λ_y` off `self` to undo
+    /// it. Returns the new `log(λ_y)`; the caller re-stacks the target at it (via
+    /// [`Self::with_log_lambda_y`]) and refits — a block-coordinate (EM-like)
+    /// descent on the joint criterion.
+    pub fn reml_updated_log_lambda_y(
+        &self,
+        augmented_residual: ArrayView2<'_, f64>,
+    ) -> Result<f64, String> {
+        let px = self.activation_dim;
+        let py = self.behavior_dim();
+        let (_n, p_tot) = augmented_residual.dim();
+        if p_tot != px + py {
+            return Err(format!(
+                "BehaviorBlock::reml_updated_log_lambda_y: residual has {p_tot} columns; expected \
+                 p_x + p_y = {px} + {py} = {}",
+                px + py
+            ));
+        }
+        let mut rss_x = 0.0_f64;
+        let mut rss_y_scaled = 0.0_f64;
+        for row in augmented_residual.rows() {
+            for j in 0..px {
+                let r = row[j];
+                rss_x += r * r;
+            }
+            for j in px..p_tot {
+                let r = row[j];
+                rss_y_scaled += r * r;
+            }
+        }
+        // Undo the √λ_y scaling to get the unscaled behavior RSS.
+        let lambda = self.lambda_y();
+        let rss_y = rss_y_scaled / lambda;
+        // Per-channel residual variances; the ratio is the REML variance ratio.
+        // A behavior block with no residual variance (perfectly reconstructed, or
+        // an all-constant behavior with a zero target) carries no information to
+        // set the ratio: surface it so the driver holds λ_y rather than diverging.
+        if !(rss_y > 0.0) {
+            return Err(format!(
+                "BehaviorBlock::reml_updated_log_lambda_y: behavior residual sum of squares is \
+                 {rss_y} (no behavioral residual variance); λ_y is not identifiable from this fit"
+            ));
+        }
+        let var_x = rss_x / px as f64;
+        let var_y = rss_y / py as f64;
+        if !(var_x > 0.0) {
+            return Err(format!(
+                "BehaviorBlock::reml_updated_log_lambda_y: activation residual variance is {var_x}"
+            ));
+        }
+        Ok((var_x / var_y).ln())
+    }
 }
 
 #[cfg(test)]

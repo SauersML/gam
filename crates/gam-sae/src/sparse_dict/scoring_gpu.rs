@@ -60,88 +60,55 @@ use ndarray::ArrayView2;
 /// output-tile dimensions; the host launch (`score_block_device`) must use a
 /// `(BN, BM)` block and a `ceil(n_atoms/BN) × ceil(n_rows/BM)` grid.
 pub const SCORE_BLOCK_KERNEL_SOURCE: &str = r#"
-#define BM 32
-#define BN 32
-#define PK 64
-extern "C" __global__
-void sparse_dict_score_block(
-    const float* __restrict__ rows,    // [n_rows * PP] row-major
-    const float* __restrict__ atoms,   // [n_atoms * PP] row-major (decoder tile)
-    int n_rows,
-    int n_atoms,
-    float* __restrict__ scores)        // [n_rows * n_atoms] row-major
-{
-  // Shared operand chunks: BM rows and BN atoms, each PK columns long. Chunking
-  // keeps shared memory fixed-size for high-P jobs while preserving ascending-c
-  // accumulation order.
-  __shared__ float sr[BM][PK];
-  __shared__ float sa[BN][PK];
-  const int row0  = blockIdx.y * BM;
-  const int atom0 = blockIdx.x * BN;
-  const int tx = threadIdx.x;   // 0..BN-1  atom within tile
-  const int ty = threadIdx.y;   // 0..BM-1  row within tile
-  const int lin = ty * BN + tx;
-  const int nthreads = BM * BN;
-  const int r = row0 + ty;
-  const int a = atom0 + tx;
-  float acc = 0.0f;
-  for (int c0 = 0; c0 < PP; c0 += PK) {
-    const int chunk = (PP - c0 < PK) ? (PP - c0) : PK;
-    // Cooperative, coalesced load of one P-chunk of row/atom operands
-    // (zero-padded past ragged row/atom/chunk tails).
-    for (int e = lin; e < BM * PK; e += nthreads) {
-      int rr = e / PK, kc = e - rr * PK;
-      int gr = row0 + rr;
-      int cc = c0 + kc;
-      sr[rr][kc] = (gr < n_rows && kc < chunk) ? rows[(long long)gr * PP + cc] : 0.0f;
-    }
-    for (int e = lin; e < BN * PK; e += nthreads) {
-      int aa = e / PK, kc = e - aa * PK;
-      int ga = atom0 + aa;
-      int cc = c0 + kc;
-      sa[aa][kc] = (ga < n_atoms && kc < chunk) ? atoms[(long long)ga * PP + cc] : 0.0f;
-    }
-    __syncthreads();
-    if (r < n_rows && a < n_atoms) {
-      // SEPARATE-rounding accumulation in ascending c — NO fused multiply-add, on
-      // exact copies of the operands, so this is bit-identical to the CPU
-      // `acc += x[c]*d[c]` reference order (and to the untiled kernel).
-      for (int kc = 0; kc < chunk; ++kc) {
-        float prod = __fmul_rn(sr[ty][kc], sa[tx][kc]);
-        acc = __fadd_rn(acc, prod);
-      }
-    }
-    __syncthreads();
-  }
-  if (r < n_rows && a < n_atoms) {
-    scores[(long long)r * n_atoms + a] = acc;
-  }
-}
+// Register-blocked score GEMM. A block computes a BM×BN output tile with a
+// TM×TN thread block, each thread owning an RM×RN micro-tile of outputs
+// (RM=BM/TM, RN=BN/TN). Every output still accumulates its own dot product in
+// strictly ascending c with SEPARATE-rounding f32 ops (__fmul_rn/__fadd_rn, no
+// FMA contraction), so each result is bit-identical to the CPU
+// `acc += x[c]*d[c]` reference and to the earlier one-output-per-thread kernel.
+// The micro-tile buys (a) RM*RN independent accumulator chains per thread to
+// hide the serial __fadd_rn latency the old kernel was bound by, and (b) operand
+// reuse — each staged row/atom column is consumed RN/RM times from registers
+// instead of re-read from shared per output.
+#define BM 64
+#define BN 64
+#define TM 16
+#define TN 16
+#define RM (BM / TM)
+#define RN (BN / TN)
+#define PK 32
 
-extern "C" __global__
-void sparse_dict_score_block_offset(
+static __device__ __forceinline__
+void sparse_dict_score_block_impl(
     const float* __restrict__ rows,    // [n_rows * PP] row-major
     const float* __restrict__ atoms,   // [total_atoms * PP] row-major decoder
     int n_rows,
     int n_atoms,
-    unsigned int atom_offset,
-    float* __restrict__ scores)        // [n_rows * n_atoms] row-major tile
+    unsigned int atom_offset,          // decoder slice base (0 for the tile form)
+    float* __restrict__ scores)        // [n_rows * n_atoms] row-major
 {
-  // Same arithmetic and launch geometry as sparse_dict_score_block, but the
-  // atom operand is a slice of a full decoder already resident on the device.
+  // Shared operand chunks: BM rows and BN atoms, each PK columns long. Chunking
+  // keeps shared memory fixed-size for high-P jobs while preserving ascending-c
+  // accumulation order (the acc registers persist across chunks).
   __shared__ float sr[BM][PK];
   __shared__ float sa[BN][PK];
   const int row0  = blockIdx.y * BM;
   const int atom0 = blockIdx.x * BN;
-  const int tx = threadIdx.x;
-  const int ty = threadIdx.y;
-  const int lin = ty * BN + tx;
-  const int nthreads = BM * BN;
-  const int r = row0 + ty;
-  const int a = atom0 + tx;
-  float acc = 0.0f;
+  const int tx = threadIdx.x;   // 0..TN-1
+  const int ty = threadIdx.y;   // 0..TM-1
+  const int lin = ty * TN + tx;
+  const int nthreads = TM * TN;
+  // This thread owns outputs rows [row0 + ty*RM, +RM) × atoms [atom0 + tx*RN, +RN).
+  float acc[RM][RN];
+  #pragma unroll
+  for (int i = 0; i < RM; ++i)
+    #pragma unroll
+    for (int j = 0; j < RN; ++j) acc[i][j] = 0.0f;
   for (int c0 = 0; c0 < PP; c0 += PK) {
     const int chunk = (PP - c0 < PK) ? (PP - c0) : PK;
+    // Cooperative, coalesced load of one P-chunk of row/atom operands
+    // (zero-padded past ragged row/atom/chunk tails; +0.0 is an exact no-op in
+    // the ascending-c accumulation so parity holds on padded lanes).
     for (int e = lin; e < BM * PK; e += nthreads) {
       int rr = e / PK, kc = e - rr * PK;
       int gr = row0 + rr;
@@ -156,17 +123,56 @@ void sparse_dict_score_block_offset(
       sa[aa][kc] = (ga < n_atoms && kc < chunk) ? atoms[(long long)global_atom * PP + cc] : 0.0f;
     }
     __syncthreads();
-    if (r < n_rows && a < n_atoms) {
-      for (int kc = 0; kc < chunk; ++kc) {
-        float prod = __fmul_rn(sr[ty][kc], sa[tx][kc]);
-        acc = __fadd_rn(acc, prod);
-      }
+    for (int kc = 0; kc < chunk; ++kc) {
+      // Stage this column's RM row-fragments and RN atom-fragments into
+      // registers, then cross them: RM*RN separate-rounding MACs reusing 8 loads.
+      float rf[RM];
+      float af[RN];
+      #pragma unroll
+      for (int i = 0; i < RM; ++i) rf[i] = sr[ty * RM + i][kc];
+      #pragma unroll
+      for (int j = 0; j < RN; ++j) af[j] = sa[tx * RN + j][kc];
+      #pragma unroll
+      for (int i = 0; i < RM; ++i)
+        #pragma unroll
+        for (int j = 0; j < RN; ++j)
+          acc[i][j] = __fadd_rn(acc[i][j], __fmul_rn(rf[i], af[j]));
     }
     __syncthreads();
   }
-  if (r < n_rows && a < n_atoms) {
-    scores[(long long)r * n_atoms + a] = acc;
+  #pragma unroll
+  for (int i = 0; i < RM; ++i) {
+    int r = row0 + ty * RM + i;
+    if (r >= n_rows) continue;
+    #pragma unroll
+    for (int j = 0; j < RN; ++j) {
+      int a = atom0 + tx * RN + j;
+      if (a < n_atoms) scores[(long long)r * n_atoms + a] = acc[i][j];
+    }
   }
+}
+
+extern "C" __global__
+void sparse_dict_score_block(
+    const float* __restrict__ rows,    // [n_rows * PP] row-major
+    const float* __restrict__ atoms,   // [n_atoms * PP] row-major (decoder tile)
+    int n_rows,
+    int n_atoms,
+    float* __restrict__ scores)        // [n_rows * n_atoms] row-major
+{
+  sparse_dict_score_block_impl(rows, atoms, n_rows, n_atoms, 0u, scores);
+}
+
+extern "C" __global__
+void sparse_dict_score_block_offset(
+    const float* __restrict__ rows,    // [n_rows * PP] row-major
+    const float* __restrict__ atoms,   // [total_atoms * PP] row-major decoder
+    int n_rows,
+    int n_atoms,
+    unsigned int atom_offset,
+    float* __restrict__ scores)        // [n_rows * n_atoms] row-major tile
+{
+  sparse_dict_score_block_impl(rows, atoms, n_rows, n_atoms, atom_offset, scores);
 }
 
 #define EMPTY_TOP_ATOM 0xffffffffu
@@ -373,10 +379,17 @@ void sparse_dict_fold_top_s(
 "#;
 
 /// Output-tile dimensions the [`SCORE_BLOCK_KERNEL_SOURCE`] kernel is written
-/// for; the host launch must match them. Kept in sync with the `#define`s at the
-/// top of the kernel string (a single source of truth for the launch geometry).
-pub const SCORE_BLOCK_TILE_M: u32 = 32;
-pub const SCORE_BLOCK_TILE_N: u32 = 32;
+/// for (`BM`/`BN`); the host grid uses them to tile the `n_rows × n_atoms`
+/// output. Kept in sync with the `#define`s at the top of the kernel string.
+pub const SCORE_BLOCK_TILE_M: u32 = 64;
+pub const SCORE_BLOCK_TILE_N: u32 = 64;
+
+/// Thread-block dimensions (`TM`/`TN`) for the register-blocked kernel: each
+/// thread owns an `(BM/TM) × (BN/TN)` micro-tile of outputs, so the launch uses
+/// a `TN × TM` thread block over the `BM × BN` output tile. Kept in sync with the
+/// `#define`s at the top of the kernel string.
+pub const SCORE_BLOCK_THREADS_M: u32 = 16;
+pub const SCORE_BLOCK_THREADS_N: u32 = 16;
 
 /// Prepend the `PP` shape macro so the NVRTC compile is a pure `compile_ptx`
 /// (mirrors `sae_rowjet::softmax_kernel_source` / `arrow_schur_nvrtc`).
@@ -709,9 +722,9 @@ mod device {
             gam_gpu::gpu_err!("sparse_dict score-block n_atoms={n_atoms} overflows i32")
         })?;
 
-        // `BM × BN` output tiles: a `(BN, BM)` thread block and a
-        // `ceil(n_atoms/BN) × ceil(n_rows/BM)` grid, matching the tiled kernel's
-        // `blockIdx.{x,y}` / `threadIdx.{x,y}` addressing.
+        // `BM × BN` output tiles with a register-blocked `TN × TM` thread block:
+        // grid `ceil(n_atoms/BN) × ceil(n_rows/BM)`, each thread emitting an
+        // `(BM/TM) × (BN/TN)` micro-tile via `blockIdx.{x,y}`/`threadIdx.{x,y}`.
         let tile_m = super::SCORE_BLOCK_TILE_M;
         let tile_n = super::SCORE_BLOCK_TILE_N;
         let grid_x: u32 = u32::try_from(n_atoms.div_ceil(tile_n as usize))
@@ -720,7 +733,7 @@ mod device {
             .map_err(|_| gam_gpu::gpu_err!("sparse_dict score-block grid_y overflow"))?;
         let cfg = LaunchConfig {
             grid_dim: (grid_x, grid_y, 1),
-            block_dim: (tile_n, tile_m, 1),
+            block_dim: (super::SCORE_BLOCK_THREADS_N, super::SCORE_BLOCK_THREADS_M, 1),
             shared_mem_bytes: 0,
         };
         let mut builder = stream.launch_builder(&func);
@@ -895,7 +908,7 @@ mod device {
                 .map_err(|_| gam_gpu::gpu_err!("sparse_dict tiled score grid_y overflow"))?;
             let cfg = LaunchConfig {
                 grid_dim: (grid_x, grid_y, 1),
-                block_dim: (tile_n, tile_m, 1),
+                block_dim: (super::SCORE_BLOCK_THREADS_N, super::SCORE_BLOCK_THREADS_M, 1),
                 shared_mem_bytes: 0,
             };
             let mut builder = stream.launch_builder(&score_func);
