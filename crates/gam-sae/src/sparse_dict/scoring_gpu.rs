@@ -690,7 +690,7 @@ mod device {
 
     const TOP_S_FOLD_THREADS: u32 = 32;
 
-    struct RouteDeviceOutput {
+    pub(super) struct RouteDeviceOutput {
         pub(super) selections: Vec<Vec<(u32, f32)>>,
         pub(super) device_dtoh_bytes: usize,
     }
