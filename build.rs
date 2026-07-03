@@ -1706,9 +1706,10 @@ fn scan_for_banned_substrings(
 
 /// Compute a per-line bitmap of "is this line in test scope?". A line is in
 /// test scope if either the file is a test/bench/example file (under
-/// `tests/`, `bench/`, `benches/`, `examples/`, or `crates/*/tests|benches/`),
-/// or the line is inside a brace block annotated with `#[cfg(test)]` /
-/// `#[cfg(all(test, ...))]` / `#[cfg(any(test, ...))]`.
+/// `tests/`, `bench/`, `benches/`, `examples/`, or
+/// `crates/*/tests|benches|examples/`),
+/// or the line is inside a brace block annotated with `#[test]`,
+/// `#[cfg(test)]`, `#[cfg(all(test, ...))]`, or `#[cfg(any(test, ...))]`.
 ///
 /// `examples/` is included because Cargo example binaries are user-facing
 /// demonstration entry points: their `fn main` reports results to stdout
@@ -1732,7 +1733,7 @@ fn compute_test_mask(content: &str, rel: &Path) -> Vec<bool> {
         || rel_str.starts_with("bench/")
         || rel_str.starts_with("benches/")
         || rel_str.starts_with("examples/")
-        || path_matches_crates_test(&rel_str)
+        || path_matches_crates_test_or_example(&rel_str)
         || file_stem_is_exempt_test_module(rel);
     if file_is_test {
         mask.fill(true);
@@ -1753,15 +1754,15 @@ fn compute_test_mask(content: &str, rel: &Path) -> Vec<bool> {
         }
     }
 
-    // Brace-tracked cfg(test) regions. We maintain a stack of entry brace
-    // depths: when a `#[cfg(test)]`-style attribute is seen, we wait for
-    // the next `{` to open the gated block, then pop when depth returns to
-    // the entry level.
+    // Brace-tracked test regions. We maintain a stack of entry brace
+    // depths: when a `#[test]` or `#[cfg(test)]`-style attribute is seen,
+    // we wait for the next `{` to open the gated block, then pop when depth
+    // returns to the entry level.
     let mut depth: i32 = 0;
     // Pending attribute: when Some, the very next `{` (which may be on the
     // same line as the attribute or several lines later) opens a gated
     // block.
-    let mut pending_attr = false;
+    let mut pending_test_scope_attr = false;
     // Stack of entry depths (depth at which the gate opens; we exit when
     // depth drops back to this value).
     let mut gate_stack: Vec<i32> = Vec::new();
@@ -1769,34 +1770,33 @@ fn compute_test_mask(content: &str, rel: &Path) -> Vec<bool> {
     for (idx, _raw) in lines.iter().enumerate() {
         let stripped = stripped_all.get(idx).cloned().unwrap_or_default();
 
-        // Detect cfg-test attribute on this line. Attribute syntax is
-        // `#[cfg(test)]`, `#[cfg(all(test, ...))]`, `#[cfg(any(test,
-        // ...))]`. We accept the attribute anywhere on the line.
-        if is_cfg_test_attr_line(&stripped) {
-            pending_attr = true;
+        // Detect a test-scope attribute on this line. Attribute syntax is
+        // `#[test]`, `#[cfg(test)]`, `#[cfg(all(test, ...))]`, and
+        // `#[cfg(any(test, ...))]`. We accept the attribute anywhere on the
+        // line.
+        if is_test_attr_line(&stripped) || is_cfg_test_attr_line(&stripped) {
+            pending_test_scope_attr = true;
         }
 
         // Walk braces on this line.
         let bytes = stripped.as_bytes();
         // The line counts as "in test" if the line's starting depth is
-        // already inside a gate. Compute before brace walk so the
-        // attribute line itself and the brace-open line are not marked
-        // (they belong to enclosing scope), and the brace-close line that
-        // exits the gate is also not marked. Lines strictly inside the
-        // gate ARE marked.
+        // already inside a gate or if this line is the attribute target
+        // that opens one. The latter matters for compact tests like
+        // `#[test] fn f() { println!("..."); }`.
         let inside_at_line_start = !gate_stack.is_empty();
-        mask[idx] = inside_at_line_start;
+        mask[idx] = inside_at_line_start || pending_test_scope_attr;
 
         for &b in bytes {
             if b == b'{' {
                 depth += 1;
-                if pending_attr {
+                if pending_test_scope_attr {
                     // The brace that just opened belongs to the cfg(test)
                     // attribute target. The gate's "entry depth" is the
                     // outer depth, i.e. depth - 1: we exit when depth
                     // drops back to that value.
                     gate_stack.push(depth - 1);
-                    pending_attr = false;
+                    pending_test_scope_attr = false;
                 }
             } else if b == b'}' {
                 if let Some(&entry) = gate_stack.last()
@@ -1857,8 +1857,36 @@ fn is_cfg_test_inner_attr_line(stripped: &str) -> bool {
     false
 }
 
-/// Match `crates/<name>/tests/...` or `crates/<name>/benches/...`.
-fn path_matches_crates_test(rel: &str) -> bool {
+/// Recognize `#[test]` on a stripped line. This is intentionally exact:
+/// attribute macros such as `#[test_case]` are not Rust's built-in test
+/// harness marker.
+fn is_test_attr_line(stripped: &str) -> bool {
+    let bytes = stripped.as_bytes();
+    let mut i = 0usize;
+    while i + 6 < bytes.len() {
+        if bytes[i] == b'#' && bytes[i + 1] == b'[' {
+            let mut j = i + 2;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j + 4 <= bytes.len() && &stripped[j..j + 4] == "test" {
+                let mut k = j + 4;
+                while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                if k < bytes.len() && bytes[k] == b']' {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Match `crates/<name>/tests/...`, `crates/<name>/benches/...`, or
+/// `crates/<name>/examples/...`.
+fn path_matches_crates_test_or_example(rel: &str) -> bool {
     let Some(rest) = rel.strip_prefix("crates/") else {
         return false;
     };
@@ -1867,7 +1895,7 @@ fn path_matches_crates_test(rel: &str) -> bool {
         return false;
     };
     let tail = &rest[slash + 1..];
-    tail.starts_with("tests/") || tail.starts_with("benches/")
+    tail.starts_with("tests/") || tail.starts_with("benches/") || tail.starts_with("examples/")
 }
 
 /// Recognize `#[cfg(test)]`, `#[cfg(all(test, ...))]`, `#[cfg(any(test,
@@ -8538,7 +8566,7 @@ fn scan_for_src_items_used_only_by_tests(
         let is_test = rel_str.starts_with("tests/")
             || rel_str.starts_with("bench/")
             || rel_str.starts_with("benches/")
-            || path_matches_crates_test(&rel_str);
+            || path_matches_crates_test_or_example(&rel_str);
         if is_test {
             test_contents.push((rel.to_path_buf(), content.to_string()));
             return;
