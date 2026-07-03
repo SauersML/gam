@@ -95,6 +95,51 @@ def test_stagewise_ev_monotone_and_zero_collapse() -> None:
     )
 
 
+def test_stagewise_birth_callback_receives_durable_checkpoints() -> None:
+    x, _assign = _planted_two_circles(n=160, p=8, noise=0.01, seed=3)
+    events: list[dict] = []
+
+    def _callback(event: dict) -> None:
+        events.append(dict(event))
+
+    gamfit.sae_manifold_fit_stagewise(
+        x,
+        d_atom=1,
+        atom_topology="circle",
+        assignment="ibp_map",
+        max_births=1,
+        max_backfit_sweeps=0,
+        n_iter=12,
+        seed_n_iter=12,
+        random_state=3,
+        birth_callback=_callback,
+    )
+
+    assert events, "birth_callback must receive Rust stagewise progress events"
+    event_names = [str(event["event"]) for event in events]
+    assert "seed_fit_completed" in event_names
+    assert "candidate_started" in event_names
+    assert "terminal_evidence_completed" in event_names
+
+    checkpoints = [event for event in events if event["checkpoint_available"]]
+    assert checkpoints, "durable events must carry checkpoint payloads"
+    for event in checkpoints:
+        checkpoint = event["checkpoint"]
+        assert checkpoint is not None, event
+        assert int(checkpoint["k_final"]) == int(event["k"])
+        assert np.asarray(checkpoint["logits"]).shape == (x.shape[0], int(event["k"]))
+        assert len(checkpoint["atoms"]) == int(event["k"])
+
+    first_round_candidates = [
+        event.get("candidate")
+        for event in events
+        if event["event"] == "candidate_started" and int(event["birth_round"]) == 0
+    ]
+    assert first_round_candidates == ["new_atom"], (
+        "the K=1 first birth must not run the duplicate chart-extension solve"
+    )
+
+
 def test_stagewise_separates_disjoint_circles() -> None:
     x, _assign = _planted_two_circles(seed=1)
     result = gamfit.sae_manifold_fit_stagewise(

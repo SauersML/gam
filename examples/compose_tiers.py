@@ -166,6 +166,7 @@ def compose_tiers(
     discriminator: bool = False,
     stagewise_max_births: int = 24,
     stagewise_min_effect_ev: float = 0.0,
+    stagewise_checkpoint_prefix: str | None = None,
     random_state: int = 0,
 ) -> TieredComposition:
     """Fit the two-tier composition and return the combined artifact.
@@ -196,6 +197,76 @@ def compose_tiers(
     engine = str(t2_engine).strip().lower()
     if engine not in ("joint", "stagewise"):
         raise ValueError(f"t2_engine must be 'joint' or 'stagewise'; got {t2_engine!r}")
+    checkpoint_prefix = (
+        None if stagewise_checkpoint_prefix is None else Path(stagewise_checkpoint_prefix)
+    )
+
+    def _write_stagewise_checkpoint(event: dict[str, Any]) -> None:
+        if checkpoint_prefix is None or not bool(event.get("checkpoint_available")):
+            return
+        checkpoint = event.get("checkpoint")
+        if checkpoint is None:
+            return
+        checkpoint_prefix.parent.mkdir(parents=True, exist_ok=True)
+        event_name = str(event["event"])
+        stem = checkpoint_prefix.parent / (
+            f"{checkpoint_prefix.name}.{event_name}."
+            f"r{int(event['birth_round']):03d}.k{int(event['k']):03d}"
+        )
+        arrays: dict[str, np.ndarray] = {
+            "logits": np.asarray(checkpoint["logits"], dtype=np.float64),
+            "log_lambda_smooth": np.asarray(checkpoint["log_lambda_smooth"], dtype=np.float64),
+        }
+        atom_meta: list[dict[str, Any]] = []
+        for atom_idx, atom in enumerate(checkpoint["atoms"]):
+            arrays[f"atom{atom_idx}_decoder"] = np.asarray(atom["decoder_B"], dtype=np.float64)
+            arrays[f"atom{atom_idx}_coords"] = np.asarray(
+                atom["on_atom_coords_t"], dtype=np.float64
+            )
+            arrays[f"atom{atom_idx}_assignments"] = np.asarray(
+                atom["assignments_z"], dtype=np.float64
+            )
+            atom_meta.append(
+                {
+                    "basis_kind": str(atom["basis_kind"]),
+                    "latent_dim": int(atom["latent_dim"]),
+                    "decoder": f"atom{atom_idx}_decoder",
+                    "coords": f"atom{atom_idx}_coords",
+                    "assignments": f"atom{atom_idx}_assignments",
+                }
+            )
+        for atom_idx, log_ard in enumerate(checkpoint["log_ard"]):
+            arrays[f"atom{atom_idx}_log_ard"] = np.asarray(log_ard, dtype=np.float64)
+        npz_path = stem.with_name(stem.name + ".npz")
+        json_path = stem.with_name(stem.name + ".json")
+        np.savez(str(npz_path), **arrays)
+        meta = {
+            key: value
+            for key, value in event.items()
+            if key not in {"checkpoint"}
+        }
+        meta["checkpoint"] = {
+            "k_final": int(checkpoint["k_final"]),
+            "log_lambda_sparse": float(checkpoint["log_lambda_sparse"]),
+            "atoms": atom_meta,
+            "npz": str(npz_path),
+        }
+        json_path.write_text(json.dumps(meta, indent=2))
+
+    def _stagewise_callback(event: dict[str, Any]) -> None:
+        ev = event.get("ev")
+        reml = event.get("joint_reml_after")
+        ev_s = "nan" if ev is None else f"{float(ev):.6f}"
+        reml_s = "nan" if reml is None else f"{float(reml):.6g}"
+        print(
+            "[compose_tiers] stagewise "
+            f"{event['event']} round={int(event['birth_round'])} "
+            f"sweep={int(event['backfit_sweep'])} k={int(event['k'])} "
+            f"candidate={event.get('candidate')} accepted={event.get('accepted')} "
+            f"ev={ev_s} reml={reml_s}",
+            flush=True,
+        )
+        _write_stagewise_checkpoint(event)
 
     # --- Tier 1: collapsed-linear sparse dictionary over the FULL corpus -----
     t1 = gamfit.sparse_dictionary_fit(
@@ -233,6 +304,7 @@ def compose_tiers(
             min_effect_ev=float(stagewise_min_effect_ev),
             n_iter=t2_n_iter,
             random_state=random_state,
+            birth_callback=_stagewise_callback,
         )
 
     def _fit_curved(residual: np.ndarray) -> Any:
@@ -690,6 +762,9 @@ def build_parser() -> argparse.ArgumentParser:
     tiers.add_argument("--stagewise-min-effect-ev", type=float, default=0.0,
                        help="SAC minimum-effect salience floor a birth's dEV must clear "
                             "(0.0 = null-recovering, evidence-only)")
+    tiers.add_argument("--stagewise-checkpoint-prefix", default=None,
+                       help="optional prefix for per-stagewise durable checkpoint "
+                            "JSON/NPZ files emitted from the Rust birth_callback")
 
     block = ap.add_argument_group("block tier (--t1-mode block)")
     block.add_argument("--n-blocks", type=int, default=8,
@@ -807,6 +882,7 @@ def main(argv: list[str] | None = None) -> Any:
         discriminator=args.discriminator,
         stagewise_max_births=args.stagewise_max_births,
         stagewise_min_effect_ev=args.stagewise_min_effect_ev,
+        stagewise_checkpoint_prefix=args.stagewise_checkpoint_prefix,
         random_state=args.random_state,
     )
 
