@@ -26,6 +26,7 @@ torch = pytest.importorskip("torch")
 
 from gamfit.torch.harvest import (  # noqa: E402
     HarvestShard,
+    harvest_behavioral_fisher_probes,
     harvest_downstream_output_fisher_factors,
     harvest_output_fisher_factors,
     load_harvest_shard,
@@ -132,6 +133,69 @@ def test_harvest_matches_closed_form_linear_head() -> None:
     assert max_factor_err < 1e-4, f"factor recon error {max_factor_err}"
     assert max_eig_err < 1e-4, f"eigenvalue error {max_eig_err}"
     assert max_residual_err < 1e-3, f"mass_residual error {max_residual_err}"
+
+
+def test_behavioral_fisher_probe_sketch_converges_to_pullback() -> None:
+    """Rung 1: the s-probe sketch ``M_n = U_n U_nᵀ`` is an unbiased estimate of
+    the *full* output-Fisher pullback ``G_n = Wᵀ F_n W`` (not a rank-r
+    truncation). On the linear head ``J_n = W`` is exact, so with many probes the
+    Monte-Carlo sketch converges to the closed-form ``G_n``.
+
+    This validates the emitter end-to-end: the ``N(0, F_n)`` probe construction,
+    the ``Jᵀ·`` VJP, and the ``1/√s`` scaling together reconstruct ``G_n``.
+    """
+    torch.manual_seed(0)
+    rng = np.random.default_rng(7)
+
+    C, p, n = 5, 4, 3  # classes, activation dim, tokens
+    s = 20000  # many probes: Monte-Carlo error ~ 1/√s
+
+    W_np = rng.standard_normal((C, p)).astype(np.float64)
+    X_np = rng.standard_normal((n, p)).astype(np.float64)
+    W = torch.from_numpy(W_np).to(torch.float64)
+    X = torch.from_numpy(X_np).to(torch.float64)
+    model = _LinearHead(W).to(torch.float64)
+
+    shard = harvest_behavioral_fisher_probes(model, model.feature, X, probes=s, seed=0)
+
+    assert isinstance(shard, HarvestShard)
+    assert shard.provenance == "behavioral_fisher"
+    assert shard.U.shape == (n, p, s)
+    assert shard.rank == s
+    # Full-rank unbiased sketch ⇒ no truncated tail.
+    np.testing.assert_array_equal(shard.mass_residual, np.zeros((n,), dtype=np.float32))
+
+    for i in range(n):
+        G = _closed_form_pullback(W_np, X_np[i])  # (p, p) analytic pullback
+        U_n = shard.U[i].astype(np.float64)  # (p, s)
+        M_n = U_n @ U_n.T  # Σ vᵢ vᵢᵀ ≈ G_n
+        # Relative Frobenius error of the Monte-Carlo sketch. With s=2e4 probes
+        # this sits well under 5%; the point is convergence to the FULL G_n.
+        rel = float(np.linalg.norm(M_n - G) / (np.linalg.norm(G) + 1e-12))
+        assert rel < 0.05, f"token {i}: sketch rel-error {rel} too large"
+
+
+def test_behavioral_fisher_shard_roundtrips_and_loads_as_behavioral(tmp_path) -> None:
+    """The behavioral-fisher shard round-trips through ``.npz`` carrying its
+    provenance, and ``load_harvest_shard`` accepts it — the gam boundary routes
+    ``behavioral_fisher`` to ``RowMetric::behavioral_fisher`` (the likelihood
+    weight), distinct from the gauge-only ``output_fisher``.
+    """
+    torch.manual_seed(3)
+    rng = np.random.default_rng(3)
+    C, p, n, s = 4, 3, 2, 8
+    W = torch.from_numpy(rng.standard_normal((C, p))).to(torch.float64)
+    X = torch.from_numpy(rng.standard_normal((n, p))).to(torch.float64)
+    model = _LinearHead(W).to(torch.float64)
+
+    shard = harvest_behavioral_fisher_probes(model, model.feature, X, probes=s, seed=1)
+    path = save_harvest_shard(shard, tmp_path / "bf_shard")
+    loaded = load_harvest_shard(path)
+
+    assert loaded["provenance"] == "behavioral_fisher"
+    assert loaded["rank"] == s
+    assert loaded["U"].shape == (n, p, s)
+    assert loaded["X"].dtype == np.float64
 
 
 def test_shard_roundtrip_schema(tmp_path) -> None:

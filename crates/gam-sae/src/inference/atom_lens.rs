@@ -154,6 +154,7 @@ fn metric_carries_behavior(p: MetricProvenance) -> bool {
         MetricProvenance::Euclidean => false,
         MetricProvenance::OutputFisher { .. }
         | MetricProvenance::OutputFisherDownstream { .. }
+        | MetricProvenance::BehavioralFisher { .. }
         | MetricProvenance::WhitenedStructured { .. } => true,
     }
 }

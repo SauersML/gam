@@ -49,6 +49,50 @@
 //! Any rank floor used to make a block invertible for an internal solve is
 //! **solver-only** (mirroring `RidgePolicy::solver_only`, #747): it never enters
 //! the residual the objective sums, so `δ` cannot bias the criterion.
+//!
+//! # Rung 1 — the behavioral metric *in the reconstruction loss* (nats currency)
+//!
+//! [`MetricProvenance::OutputFisher`] installs the output-Fisher inner product
+//! as a **gauge** metric only: it whitens *nothing* (`whitens_likelihood()` is
+//! `false`), by deliberate #980 contract, so reconstruction stays the isotropic
+//! `½‖r‖²`. That answers "what coordinate is canonical", not "what does a
+//! reconstruction error *cost*".
+//!
+//! [`MetricProvenance::BehavioralFisher`] is the opposite deliberate choice:
+//! the **same** low-rank output-Fisher factors, but installed as the
+//! reconstruction *likelihood weight*. Plain MSE prices a reconstruction error
+//! `e = x − x̂` by its Euclidean size; the model, however, reads the activation
+//! only through the rest of the network, so the behavioral cost of `e` is the
+//! KL between the clean and corrupted next-token distributions,
+//! `KL ≈ ½ eᵀ G(x) e` with `G = JᵀFJ` the network-Jacobian pullback of the
+//! output Fisher `F` (units: **nats**). Minimizing `(x−x̂)ᵀ G (x−x̂)` instead of
+//! `‖x−x̂‖²` is **generalized least squares**: for a *fixed* per-row `G` it is
+//! still a linear Gaussian model in the coefficients, so the entire
+//! REML/evidence/EDF/certificate stack survives verbatim — this is why the
+//! metric rides the identical `whitens_likelihood()` plumbing the
+//! [`MetricProvenance::WhitenedStructured`] noise model uses, and why the G=I
+//! limit reproduces the plain-MSE fit bit-for-bit (see the module tests).
+//!
+//! This is the principled form of Braun's end-to-end **KL + MSE** objective.
+//! Anchoring to the activation keeps it *reconstruction* (it does not collapse
+//! to "match the logits by any means" — the decoder still has to reproduce `x`),
+//! while pricing the residual in nats through `G`. The payoff is automatic
+//! selection for *mattering*: `G`'s null directions — activation structure the
+//! rest of the network cannot read — are penalized nothing, because
+//! `eᵀ G e = 0` there. MSE in a behaviorally-inert direction goes free, which is
+//! the correct behavior, not a bug: nothing downstream changes, so nothing
+//! should be paid.
+//!
+//! **The d×d `G` is never materialized.** `G` is sketched by `s` random probes,
+//! `vᵢ = Jᵀ F^{1/2} uᵢ` (`uᵢ` iid, `s ≈ 4…16`), computed by `s` backward passes
+//! per token at *harvest* time (the model-interaction boundary) and stored as
+//! the columns of the per-row factor `U_n = [v₁ … v_s] ∈ ℝ^{p×s}`. Then
+//! `G ≈ Σᵢ vᵢ vᵢᵀ = U_n U_nᵀ` and the criterion-facing
+//! `eᵀ G e ≈ Σᵢ (vᵢᵀ e)² = ‖U_nᵀ e‖²` is exactly what
+//! [`RowMetric::quad_form`] / [`RowMetric::whiten_residual_row`] already
+//! compute — zero train-time model cost, `O(p·s)` per row. See
+//! [`RowMetric::behavioral_fisher`] and the probe-packing helper
+//! [`pack_probe_factors`].
 
 use ndarray::{Array2, Array3, ArrayView1};
 use std::sync::Arc;
@@ -166,6 +210,25 @@ pub enum MetricProvenance {
     /// driving far-future tokens now registers behavioral coupling that the
     /// same-position metric reported as ≈ 0).
     OutputFisherDownstream { rank: usize },
+    /// **Rung 1** — the output-Fisher metric installed as the reconstruction
+    /// **likelihood weight** (generalized least squares in nats), not merely as
+    /// a gauge. `M_n = U_n U_nᵀ ≈ G_n = J_nᵀ F_n J_n` is the `s`-probe sketch of
+    /// the pulled-back output Fisher, with `U_n = [v₁ … v_s]`,
+    /// `vᵢ = J_nᵀ F_n^{1/2} uᵢ`, and `probes = s` the number of random probes
+    /// (the factor rank).
+    ///
+    /// This is the *only* [`RowMetric::is_output_fisher_like`]-adjacent
+    /// provenance for which [`RowMetric::whitens_likelihood`] is `true`: the
+    /// data-fit sums `½ eᵀ G_n e = ½ ‖U_nᵀ e‖²` (nats) instead of `½‖e‖²`. It is
+    /// distinct from [`Self::OutputFisher`] precisely because the choice to let
+    /// the metric enter the *loss* (rather than only the gauge) is deliberate and
+    /// must not be silently inherited by the #980 gauge / two-tier-harvest
+    /// contract — that contract relies on [`Self::OutputFisher`] whitening
+    /// nothing. Because `G_n` is a *fixed* per-row metric, the whitened problem
+    /// is again linear-Gaussian in the coefficients, so REML/evidence/EDF are
+    /// unchanged (the GLS-preserves-REML property, verified in the module tests
+    /// against the `G=I` plain-MSE limit).
+    BehavioralFisher { probes: usize },
     /// Structured-residual whitening: `M_n = Σ_n^{-1}` from the **estimated**
     /// factor-analytic residual covariance `Σ_n = Λ c(z_n) Λᵀ + D` (#974), with
     /// `factor_rank` the selected factor count. Produced by
@@ -264,6 +327,28 @@ impl RowMetric {
             u,
             p,
             rank,
+            0.0,
+        )
+    }
+
+    /// **Rung 1** — the output-Fisher metric as a reconstruction *likelihood
+    /// weight* (GLS in nats): per-row `s`-probe factors `U_n ∈ ℝ^{p × probes}`
+    /// supplied as a `(n_rows, p * probes)` row-major matrix
+    /// (`U_n[i, k] = u[n, i * probes + k]`), so that column `k` is the probe
+    /// vector `v_k = J_nᵀ F_n^{1/2} u_k` and `M_n = U_n U_nᵀ ≈ G_n`. Unlike
+    /// [`Self::output_fisher`], the resulting metric returns
+    /// `whitens_likelihood() == true`: the data-fit prices reconstruction error
+    /// as `½ eᵀ G_n e`. Validated through [`normalize_fisher_rao_blocks`] like
+    /// every factored metric; no solver floor (`δ = 0`).
+    ///
+    /// See [`pack_probe_factors`] to build `u` from a natural `(n, p, s)` probe
+    /// stack emitted at harvest time.
+    pub fn behavioral_fisher(u: Arc<Array2<f64>>, p: usize, probes: usize) -> Result<Self, String> {
+        Self::from_factors(
+            MetricProvenance::BehavioralFisher { probes },
+            u,
+            p,
+            probes,
             0.0,
         )
     }
@@ -378,17 +463,31 @@ impl RowMetric {
     /// the isotropic reconstruction data-fit `½ rᵀr` with the whitened
     /// `½ rᵀ M_n r`).
     ///
-    /// This is TRUE **only** for [`MetricProvenance::WhitenedStructured`] — a
-    /// genuinely *estimated noise model* (a factor-analytic residual covariance,
-    /// #974), for which whitening the likelihood is the statistically correct
-    /// thing to do. For [`MetricProvenance::Euclidean`] there is nothing to
-    /// whiten by, and for [`MetricProvenance::OutputFisher`] the inner product is
-    /// an **output-geometry gauge**, not an estimated noise model — whitening the
-    /// likelihood by it would silently replace the reconstruction loss with a
-    /// Fisher pullback (the #980 failure mode). So both leave the likelihood
-    /// untouched and only the gauge sees the metric (see [`Self::drives_gauge`]).
+    /// This is TRUE for two provenances, for two distinct reasons:
+    ///
+    /// * [`MetricProvenance::WhitenedStructured`] — a genuinely *estimated noise
+    ///   model* (a factor-analytic residual covariance, #974), for which
+    ///   whitening the likelihood is the statistically correct thing to do; and
+    /// * [`MetricProvenance::BehavioralFisher`] — the **Rung 1** deliberate
+    ///   choice to price reconstruction error in nats: the output-Fisher metric
+    ///   `G_n` installed *as the loss weight* (`½ eᵀ G_n e`), a generalized
+    ///   least-squares reconstruction. Because `G_n` is a fixed per-row metric
+    ///   the problem stays linear-Gaussian, so REML/evidence/EDF are preserved.
+    ///
+    /// It is FALSE for [`MetricProvenance::Euclidean`] (nothing to whiten by) and
+    /// for the *gauge-only* [`MetricProvenance::OutputFisher`] /
+    /// [`MetricProvenance::OutputFisherDownstream`]: there the output-Fisher
+    /// inner product is an **output-geometry gauge**, and whitening the
+    /// likelihood by it *implicitly* (without the caller electing GLS) would
+    /// silently replace the reconstruction loss with a Fisher pullback — the #980
+    /// failure mode, and the reason the two-tier harvest can withhold factors
+    /// from a row without changing its loss. `BehavioralFisher` is the *explicit*
+    /// election of that same arithmetic as the intended objective.
     pub fn whitens_likelihood(&self) -> bool {
-        matches!(self.provenance, MetricProvenance::WhitenedStructured { .. })
+        matches!(
+            self.provenance,
+            MetricProvenance::WhitenedStructured { .. } | MetricProvenance::BehavioralFisher { .. }
+        )
     }
 
     /// Whether this metric **drives the gauge** — i.e. the isometry-penalty
@@ -666,6 +765,39 @@ impl RowMetric {
     }
 }
 
+/// Pack a harvest-emitted probe stack into the row-major factor layout
+/// [`RowMetric::behavioral_fisher`] expects.
+///
+/// The harvest boundary (the model-interaction side) emits, per token, `s`
+/// probe vectors `vₖ = J_nᵀ F_n^{1/2} uₖ ∈ ℝ^p` — the natural shape is
+/// `probes[n, i, k] = (vₖ)ᵢ`, an `(n_rows, p, probes)` stack. This assembles the
+/// `(n_rows, p · probes)` row-major matrix `u[n, i·probes + k] = probes[n, i, k]`
+/// that the constructor consumes so that column `k` of the per-row factor `U_n`
+/// is exactly probe `vₖ` and `M_n = U_n U_nᵀ = Σₖ vₖ vₖᵀ ≈ G_n`.
+///
+/// This is a pure repack of the standard C-order flattening; it exists so the
+/// harvest → metric seam is a single named, validated Rust surface rather than
+/// an ad-hoc reshape at each call site. Errors on non-finite entries so the
+/// failure is caught here rather than deep in [`normalize_fisher_rao_blocks`].
+pub fn pack_probe_factors(probes: ndarray::ArrayView3<'_, f64>) -> Result<Array2<f64>, String> {
+    let (n_rows, p, s) = probes.dim();
+    if s == 0 {
+        return Err("pack_probe_factors: need at least one probe (s == 0)".to_string());
+    }
+    if !probes.iter().all(|v| v.is_finite()) {
+        return Err("pack_probe_factors: probe entries must be finite".to_string());
+    }
+    let mut u = Array2::<f64>::zeros((n_rows, p * s));
+    for n in 0..n_rows {
+        for i in 0..p {
+            for k in 0..s {
+                u[[n, i * s + k]] = probes[[n, i, k]];
+            }
+        }
+    }
+    Ok(u)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -769,6 +901,75 @@ mod tests {
         assert!(m.whitens_likelihood());
         assert!(m.drives_gauge());
         assert!(!m.is_output_fisher_like());
+    }
+
+    #[test]
+    fn behavioral_fisher_whitens_likelihood_and_drives_gauge() {
+        // The Rung-1 deliberate GLS metric: unlike the gauge-only OutputFisher,
+        // it whitens the reconstruction likelihood.
+        let u = Arc::new(array![[1.0_f64, 0.5]]); // p=1, probes=2
+        let m = RowMetric::behavioral_fisher(u, 1, 2).unwrap();
+        assert!(m.whitens_likelihood());
+        assert!(m.drives_gauge());
+        assert_eq!(m.provenance(), MetricProvenance::BehavioralFisher { probes: 2 });
+        assert_eq!(m.metric_rank(), 2);
+    }
+
+    #[test]
+    fn behavioral_fisher_quad_form_is_probe_sum() {
+        // p=2, s=2 probes v1=(1,0), v2=(0,2) → G = diag(1,4);
+        // e=(3,1) → eᵀGe = 9·1 + 1·4 = 13 = Σ (vᵢᵀe)² = 3² + 2² = 13.
+        // Column-major-within-row layout U[i,k]=u[i*probes+k]:
+        //   U[0,0]=1 U[0,1]=0  U[1,0]=0 U[1,1]=2
+        let u = Arc::new(array![[1.0_f64, 0.0, 0.0, 2.0]]);
+        let m = RowMetric::behavioral_fisher(u, 2, 2).unwrap();
+        let e = array![3.0_f64, 1.0];
+        assert!((m.quad_form(0, e.view()) - 13.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn behavioral_fisher_g_identity_reproduces_euclidean_quad_form() {
+        // GLS with G=I must reduce to plain MSE. Identity probes (s=p, U=I_p)
+        // ⇒ M_n = I ⇒ quad_form == ‖e‖², matching Euclidean bit-for-bit, and
+        // metric_rank == p so the whitened residual-dof accounting is unchanged.
+        let p = 3;
+        let mut u = Array2::<f64>::zeros((1, p * p));
+        for i in 0..p {
+            u[[0, i * p + i]] = 1.0;
+        }
+        let bf = RowMetric::behavioral_fisher(Arc::new(u), p, p).unwrap();
+        let euc = RowMetric::euclidean(1, p).unwrap();
+        let e = array![1.5_f64, -2.0, 0.25];
+        assert_eq!(bf.metric_rank(), euc.metric_rank());
+        assert!((bf.quad_form(0, e.view()) - euc.quad_form(0, e.view())).abs() < 1e-14);
+        // and whitened residual is the residual itself (identity whitening)
+        assert_eq!(bf.whiten_residual_row(0, e.view()), vec![1.5, -2.0, 0.25]);
+    }
+
+    #[test]
+    fn pack_probe_factors_matches_manual_layout() {
+        use ndarray::Array3;
+        // n=1, p=2, s=2: probes[0,i,k] = v_k[i]; v0=(1,3), v1=(2,4)
+        let mut probes = Array3::<f64>::zeros((1, 2, 2));
+        probes[[0, 0, 0]] = 1.0; // v0[0]
+        probes[[0, 1, 0]] = 3.0; // v0[1]
+        probes[[0, 0, 1]] = 2.0; // v1[0]
+        probes[[0, 1, 1]] = 4.0; // v1[1]
+        let u = pack_probe_factors(probes.view()).unwrap();
+        // Layout U[i,k] = u[i*s + k]: [v0[0],v1[0], v0[1],v1[1]] = [1,2,3,4]
+        assert_eq!(u.as_slice().unwrap(), &[1.0, 2.0, 3.0, 4.0]);
+        // Round-trips into a valid metric whose G = v0 v0ᵀ + v1 v1ᵀ.
+        let m = RowMetric::behavioral_fisher(Arc::new(u), 2, 2).unwrap();
+        // e=(1,0): eᵀGe = v0[0]²+v1[0]² = 1+4 = 5.
+        let e = array![1.0_f64, 0.0];
+        assert!((m.quad_form(0, e.view()) - 5.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn pack_probe_factors_rejects_zero_probes() {
+        use ndarray::Array3;
+        let probes = Array3::<f64>::zeros((2, 3, 0));
+        assert!(pack_probe_factors(probes.view()).is_err());
     }
 
     #[test]

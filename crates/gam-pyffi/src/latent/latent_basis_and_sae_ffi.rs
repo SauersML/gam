@@ -2126,9 +2126,15 @@ fn row_metric_from_fisher_provenance(
         "output_fisher_downstream" => {
             gam::inference::row_metric::RowMetric::output_fisher_downstream(u, p_out, rank)
         }
+        // Rung 1: the same output-Fisher factors, but installed as the
+        // reconstruction *likelihood weight* (GLS in nats) rather than a
+        // gauge-only metric. `rank` is the probe count `s` of the sketch.
+        "behavioral_fisher" => {
+            gam::inference::row_metric::RowMetric::behavioral_fisher(u, p_out, rank)
+        }
         other => Err(format!(
-            "fisher_provenance must be 'output_fisher' or 'output_fisher_downstream'; \
-             got {other:?}"
+            "fisher_provenance must be 'output_fisher', 'output_fisher_downstream', or \
+             'behavioral_fisher'; got {other:?}"
         )),
     }
     .map_err(py_value_error)
@@ -2145,6 +2151,7 @@ fn metric_provenance_label(
         MetricProvenance::Euclidean => "Euclidean",
         MetricProvenance::OutputFisher { .. } => "OutputFisher",
         MetricProvenance::OutputFisherDownstream { .. } => "OutputFisherDownstream",
+        MetricProvenance::BehavioralFisher { .. } => "BehavioralFisher",
         MetricProvenance::WhitenedStructured { .. } => "WhitenedStructured",
     }
 }
@@ -4574,6 +4581,16 @@ fn sae_coordinate_fidelity_dict<'py>(
          `arclength_defect` is the speed coefficient-of-variation of the decoded curve on \
          a uniform latent grid (0 => arc-length / unit-speed chart; positive => the \
          parameterization squishes arc length, which reconstruction EV cannot see). \
+         `verdict` is the certified reading rule: `arclength_honest` (read the raw \
+         `on_atom_coords_t`), `recoverable_via_arclength` (read `coords_u_arc` instead — \
+         the raw chart squishes arc length but the honest coordinate is recoverable), or \
+         `degenerate` (the chart collapses; refuse — no faithful coordinate exists). \
+         `certified` is `verdict != degenerate`. `coords_u_arc` is the honest arc-length \
+         coordinate s(t_i)/L in [0,1) for every fitted row (a pure read, computed \
+         regardless of whether the decoder-mutating canonicalization committed); \
+         `raw_arclength_defect_{rms,max}` is the (circular) raw-vs-`u_arc` distance at the \
+         data rows after best O(2) gauge alignment; `min_speed_over_mean` / \
+         `max_speed_over_mean` / `log_speed_rms` summarize the decoder-speed profile. \
          Entries with null `topology` carry no d=1 chart.",
     )?;
     let atoms = PyList::empty(py);
@@ -4587,6 +4604,17 @@ fn sae_coordinate_fidelity_dict<'py>(
                 a.set_item("uniformity_p_value", fid.uniformity_p_value)?;
                 a.set_item("arclength_defect", fid.arclength_defect)?;
                 a.set_item("n_coords", fid.n_coords)?;
+                a.set_item("verdict", fid.verdict.label())?;
+                a.set_item("certified", fid.verdict.certified())?;
+                match &fid.coords_u_arc {
+                    Some(u) => a.set_item("coords_u_arc", u.clone().into_pyarray(py))?,
+                    None => a.set_item("coords_u_arc", py.None())?,
+                }
+                a.set_item("raw_arclength_defect_rms", fid.raw_arclength_defect_rms)?;
+                a.set_item("raw_arclength_defect_max", fid.raw_arclength_defect_max)?;
+                a.set_item("min_speed_over_mean", fid.min_speed_over_mean)?;
+                a.set_item("max_speed_over_mean", fid.max_speed_over_mean)?;
+                a.set_item("log_speed_rms", fid.log_speed_rms)?;
             }
             None => {
                 a.set_item("topology", py.None())?;

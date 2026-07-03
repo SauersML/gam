@@ -24,6 +24,17 @@ JVP (``J_n v``), a Fisher-apply (``F u = p ⊙ u − p (pᵀu)``), and one VJP
 is a matrix-free Hutchinson estimate using the same matvec. No ``C × p`` or
 ``p × p`` object is ever allocated in the harvest loop.
 
+**Rung 1 — the sketch that enters the reconstruction loss.**
+:func:`harvest_behavioral_fisher_probes` emits the *same* pullback
+``G_n = J_nᵀ F_n J_n`` in a cheaper, likelihood-weighting form: ``s`` random
+probes ``vᵢ = J_nᵀ F_n^{1/2} uᵢ`` whose outer-product sum ``Σᵢ vᵢ vᵢᵀ`` is an
+**unbiased sketch** of ``G_n`` — one VJP per probe, no JVP and no eigensolve, so
+``s`` backward passes per token. Its shard carries ``provenance="behavioral_fisher"``
+and routes to ``RowMetric::behavioral_fisher``, which prices the reconstruction
+residual as ``½ eᵀ G_n e`` (nats, generalized least squares) — the only Fisher
+provenance that whitens the likelihood. The eigenfactor harvests above stay
+gauge-only (they never touch the loss).
+
 Policy note: heavy gam math stays in the Rust core, but *harvesting from a torch
 model* is the sanctioned torch-interop path — these are torch autograd ops on a
 user-supplied model, not a reimplementation of any gam primitive. The shard is
@@ -33,6 +44,7 @@ the gam boundary (``load_harvest_shard`` returns f64 arrays).
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -44,16 +56,24 @@ __all__ = [
     "HarvestShard",
     "harvest_output_fisher_factors",
     "harvest_downstream_output_fisher_factors",
+    "harvest_behavioral_fisher_probes",
     "save_harvest_shard",
     "load_harvest_shard",
 ]
 
-# The provenance tags a harvest shard may carry — the same-position output-Fisher
-# pullback and the #980 forward-looking (downstream KV-path) aggregate. These map
-# one-to-one onto the gam-side `RowMetric` constructors
-# (`output_fisher` / `output_fisher_downstream`); both are gauge-only (they never
-# whiten the likelihood) and feed the lens/gauge/enrichment unchanged.
-_HARVEST_PROVENANCES = frozenset({"output_fisher", "output_fisher_downstream"})
+# The provenance tags a harvest shard may carry:
+#   * ``output_fisher`` / ``output_fisher_downstream`` — the gauge-only #980
+#     metrics (top-r eigenfactor form; never whiten the likelihood); and
+#   * ``behavioral_fisher`` — the **Rung 1** s-probe sketch of the same
+#     output-Fisher ``G_n = J_nᵀ F_n J_n``, installed as the reconstruction
+#     *likelihood weight* (GLS in nats). Its factor columns are the raw random
+#     probes ``vᵢ = J_nᵀ F_n^{1/2} uᵢ`` (not eigenvectors); it maps onto the
+#     gam-side ``RowMetric::behavioral_fisher``, the only Fisher provenance that
+#     whitens the likelihood.
+# Each maps one-to-one onto a gam-side ``RowMetric`` constructor.
+_HARVEST_PROVENANCES = frozenset(
+    {"output_fisher", "output_fisher_downstream", "behavioral_fisher"}
+)
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +153,34 @@ def _softmax_fisher_apply(probs: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
     weighted = probs * u
     inner = (probs * u).sum(dim=-1, keepdim=True)
     return weighted - probs * inner
+
+
+def _sample_output_fisher_probes(
+    probs: torch.Tensor,
+    s: int,
+    *,
+    generator: torch.Generator,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Draw ``s`` iid samples ``u ~ N(0, F)`` of the softmax output Fisher.
+
+    ``F = diag(p) − p pᵀ`` is the categorical Fisher. A sample is realized
+    matrix-free from ``g ~ N(0, I_C)`` via ``u = √p ⊙ g − (√p · g) p``: with
+    ``a = √p`` (unit vector, ``Σ p = 1``) and ``D = diag(√p)`` this is
+    ``u = D(g − (aᵀg)a)``, whose covariance is
+    ``D(I − aaᵀ)Dᵀ = diag(p) − p pᵀ = F`` exactly. So ``E[u uᵀ] = F`` and the
+    probe carries the Fisher's directionality without any ``C × C`` matrix or a
+    matrix square root. Returns a ``(C, s)`` block, one probe per column.
+
+    ``g`` is sampled on the generator's CPU device then moved, so a fixed seed
+    yields identical probes on CPU and GPU.
+    """
+    c = probs.shape[-1]
+    g = torch.randn(c, s, generator=generator, dtype=dtype).to(device)  # (C, s)
+    sqrt_p = probs.clamp_min(0.0).sqrt().to(dtype)  # (C,)
+    dots = (sqrt_p.unsqueeze(1) * g).sum(dim=0)  # (s,) = √pᵀ g per probe
+    return sqrt_p.unsqueeze(1) * g - probs.to(dtype).unsqueeze(1) * dots.unsqueeze(0)
 
 
 def _pullback_matvec(
@@ -481,6 +529,104 @@ def harvest_output_fisher_factors(
         U[row] = scaled.detach().to(torch.float32).cpu().numpy()
 
     return HarvestShard(X=X, U=U, mass_residual=mass_residual, rank=rank)
+
+
+def harvest_behavioral_fisher_probes(
+    model: torch.nn.Module,
+    hook_module: torch.nn.Module,
+    inputs: Any,
+    *,
+    probes: int,
+    seed: int = 0,
+) -> HarvestShard:
+    """Harvest the **Rung 1** s-probe output-Fisher sketch at ``hook_module``.
+
+    This is the cheap, likelihood-weighting cousin of
+    :func:`harvest_output_fisher_factors`. Instead of the top-r eigenfactors of
+    ``G_n = J_nᵀ F_n J_n`` (a JVP+VJP subspace iteration plus an eig per row), it
+    emits ``s = probes`` **raw random probes** ``vᵢ = J_nᵀ F_n^{1/2} uᵢ`` whose
+    outer-product sum is an unbiased sketch of ``G_n``:
+
+        ``Σᵢ vᵢ vᵢᵀ = J_nᵀ F_n^{1/2} (Σᵢ uᵢ uᵢᵀ) F_n^{1/2} J_n ≈ J_nᵀ F_n J_n``
+
+    because ``uᵢ ~ N(0, I)`` gives ``E[Σ uᵢ uᵢᵀ] = s·I`` — with the ``1/√s``
+    column scaling below, ``E[Σᵢ vᵢ vᵢᵀ] = G_n``. The probe
+    ``F_n^{1/2} uᵢ`` is realized directly as a draw from ``N(0, F_n)`` (see
+    :func:`_sample_output_fisher_probes`), so each probe costs exactly **one VJP**
+    (``J_nᵀ ·``) and **no JVP and no eigensolve**: ``s`` backward passes per token,
+    the harvest-time cost the Rung 1 spec promises.
+
+    The columns of ``U_n = [v₁/√s … v_s/√s] ∈ ℝ^{p × s}`` are consumed verbatim
+    by ``RowMetric::behavioral_fisher``: it forms ``M_n = U_n U_nᵀ ≈ G_n`` and
+    prices the reconstruction residual as ``½ eᵀ M_n e`` (nats), the generalized
+    least-squares data-fit. Unlike the eigenfactor form there is no rank-r
+    truncation — every direction is retained stochastically — so ``mass_residual``
+    is identically ``0`` (the sketch is a full-rank unbiased estimator, not a
+    truncation), carried only to satisfy the shared shard layout.
+
+    Parameters
+    ----------
+    model, hook_module, inputs
+        As in :func:`harvest_output_fisher_factors`.
+    probes
+        ``s``, the number of random Fisher probes per row (the factor rank of the
+        emitted metric). ``4…16`` suffices for the reconstruction weighting.
+    seed
+        Fixed RNG seed; per-row streams are ``seed + row`` — fully deterministic.
+    """
+    if probes < 1:
+        raise ValueError(f"probes must be >= 1; got {probes}")
+
+    act_flat, logits_from_act = _capture_activations(model, hook_module, inputs)
+    n, p = int(act_flat.shape[0]), int(act_flat.shape[1])
+    device = act_flat.device
+    work_dtype = (
+        act_flat.dtype
+        if act_flat.dtype in (torch.float32, torch.float64)
+        else torch.float32
+    )
+    inv_sqrt_s = 1.0 / math.sqrt(float(probes))
+
+    U = np.empty((n, p, probes), dtype=np.float32)
+    X = act_flat.to(torch.float32).cpu().numpy().astype(np.float32, copy=False)
+    # Full-rank unbiased sketch ⇒ no truncated tail; mass_residual is identically 0.
+    mass_residual = np.zeros((n,), dtype=np.float32)
+
+    for row in range(n):
+        x_row = act_flat[row].to(work_dtype).detach().requires_grad_(False)
+
+        def f_row(x: torch.Tensor, _row: int = row) -> torch.Tensor:
+            return logits_from_act(x, _row).to(work_dtype)
+
+        # One forward builds the VJP closure; its primal output IS the logits,
+        # so the softmax probs come for free (no extra forward pass).
+        logits_row, vjp_raw = torch.func.vjp(f_row, x_row)
+        with torch.no_grad():
+            probs_row = torch.softmax(logits_row, dim=-1)  # (C,)
+
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(seed + row)
+        # (C, s): each column uᵢ ~ N(0, F_n) = F_n^{1/2} · (iid normal).
+        u_block = _sample_output_fisher_probes(
+            probs_row, probes, generator=gen, dtype=work_dtype, device=device
+        )
+
+        # vᵢ = J_nᵀ uᵢ — one VJP per probe (s backward passes), no JVP formed.
+        cols = []
+        for j in range(probes):
+            (gx,) = vjp_raw(u_block[:, j].contiguous())  # (p,)
+            cols.append(gx)
+        v = torch.stack(cols, dim=1) * inv_sqrt_s  # (p, s), M_n = v vᵀ ≈ G_n
+
+        U[row] = v.detach().to(torch.float32).cpu().numpy()
+
+    return HarvestShard(
+        X=X,
+        U=U,
+        mass_residual=mass_residual,
+        rank=probes,
+        provenance="behavioral_fisher",
+    )
 
 
 def _downstream_pullback_matvec(
