@@ -18,6 +18,10 @@ pub struct TopSSelector {
     /// `(atom_index, score, |score|)`, length ≤ `s`, kept unsorted.
     heap: Vec<(u32, f32, f32)>,
     capacity: usize,
+    /// Index of the current weakest slot (smallest `|score|`, ties → larger
+    /// atom index). Meaningful only once `heap.len() == capacity`; maintained
+    /// incrementally so the common *reject* path is O(1) instead of O(capacity).
+    worst_idx: usize,
 }
 
 impl TopSSelector {
@@ -25,18 +29,16 @@ impl TopSSelector {
         Self {
             heap: Vec::with_capacity(capacity.max(1)),
             capacity: capacity.max(1),
+            worst_idx: 0,
         }
     }
 
-    /// Offer one `(atom, score)` candidate.
+    /// Rescan the full heap for the weakest slot (smallest `|score|`, ties
+    /// broken by *larger* atom index — the slot the next stronger candidate
+    /// should evict). Called only when the heap first fills and after each
+    /// accepted replacement, never on the (dominant) reject path.
     #[inline]
-    pub fn offer(&mut self, atom: u32, score: f32) {
-        let mag = score.abs();
-        if self.heap.len() < self.capacity {
-            self.heap.push((atom, score, mag));
-            return;
-        }
-        // Find the current weakest slot.
+    fn recompute_worst(&mut self) {
         let mut worst = 0usize;
         for k in 1..self.heap.len() {
             if self.heap[k].2 < self.heap[worst].2
@@ -45,9 +47,32 @@ impl TopSSelector {
                 worst = k;
             }
         }
-        let (w_atom, _, w_mag) = self.heap[worst];
+        self.worst_idx = worst;
+    }
+
+    /// Offer one `(atom, score)` candidate.
+    ///
+    /// Once the heap is full this is O(1) for the overwhelmingly common case of
+    /// a candidate that cannot displace the cached weakest slot (at `K ≈ 32_000`
+    /// atoms and `s` survivors, all but ~`s` offers are such rejects). Only an
+    /// accepted replacement pays the O(capacity) rescan to refresh the cached
+    /// weakest. The selection is bit-identical to a fresh full rescan per offer:
+    /// the accept test and the weakest-slot definition are unchanged.
+    #[inline]
+    pub fn offer(&mut self, atom: u32, score: f32) {
+        let mag = score.abs();
+        if self.heap.len() < self.capacity {
+            self.heap.push((atom, score, mag));
+            if self.heap.len() == self.capacity {
+                self.recompute_worst();
+            }
+            return;
+        }
+        // Full: O(1) reject against the cached weakest slot.
+        let (w_atom, _, w_mag) = self.heap[self.worst_idx];
         if mag > w_mag || (mag == w_mag && atom < w_atom) {
-            self.heap[worst] = (atom, score, mag);
+            self.heap[self.worst_idx] = (atom, score, mag);
+            self.recompute_worst();
         }
     }
 
