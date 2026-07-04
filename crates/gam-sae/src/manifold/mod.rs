@@ -170,6 +170,9 @@ mod wbic_audit;
 mod tests;
 
 #[cfg(test)]
+mod tests_factored_htbeta;
+
+#[cfg(test)]
 mod tests_bessel_normaliser_1113;
 
 #[cfg(test)]
