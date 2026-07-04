@@ -445,17 +445,17 @@ mod tests {
         );
 
         // (b) Planted block: atoms {0,1,2,3} co-fire together far above the
-        // mechanical rate. On the even rows the block is forced on together and the
-        // rest of k is filled from the NON-block atoms; the odd rows draw all k
-        // from the non-block atoms only. So the block atoms fire exactly on the even
-        // rows and always together — a genuine above-margin coupling the
-        // fixed-margin null cannot reproduce (it can, and on average does, separate
-        // two columns of equal margin), while the non-block atoms are top-k noise.
+        // mechanical rate. The block fires — always together — on a SPARSE subset
+        // of rows (every fifth), and the block atoms fire NOWHERE else, so each has
+        // a low margin (≈ n/5). Two low-margin columns are easily separated by the
+        // fixed-margin null (expected joint ≈ m²/n ≪ m), so the observed all-together
+        // joint sits far in the null's upper tail. The remaining k on block rows and
+        // all k on the other rows are drawn from the NON-block atoms (top-k noise).
         let mut planted = SparseAtomCodes::empty(n, g);
         let block = [0usize, 1, 2, 3];
         let mut non_block: Vec<usize> = (block.len()..g).collect();
         for row in 0..n {
-            if row % 2 == 0 {
+            if row % 5 == 0 {
                 for &a in &block {
                     planted.row_mut(row).assign(a, 1.0);
                 }
