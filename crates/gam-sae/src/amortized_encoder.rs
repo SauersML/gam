@@ -86,6 +86,21 @@ pub struct AmortizationErrorStats {
     pub amplitude_rmse: f64,
 }
 
+/// The exact per-row test-time optimizer's solution on the held-out rows, the
+/// oracle input to [`crate::manifold`]'s `amortization_gap`: the exact
+/// reconstruction plus the exact code (gate logits, per-atom coordinate blocks,
+/// amplitudes) against which the one-matmul amortized encode is scored.
+pub struct ExactRowSolution<'a> {
+    /// Exact reconstruction of the held-out rows (the oracle line's EV numerator).
+    pub recon: ArrayView2<'a, f64>,
+    /// Exact per-(row, atom) gate logits.
+    pub logits: ArrayView2<'a, f64>,
+    /// Exact per-atom coordinate blocks (one `(rows × axes)` matrix per atom).
+    pub coords: &'a [Array2<f64>],
+    /// Exact per-(row, atom) amplitudes.
+    pub amplitudes: ArrayView2<'a, f64>,
+}
+
 /// The full amortization-gap artifact (reviewer condition #2): the deployed
 /// distilled encoder's cost, side by side with the exact-solve oracle. The gap
 /// between `ev_exact` and `ev_amortized` IS the held-out reconstruction quality

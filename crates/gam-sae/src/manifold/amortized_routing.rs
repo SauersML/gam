@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::amortized_encoder::{
-    AmortizationGap, AmortizedCode, LearnedAmortizedEncoder,
+    AmortizationGap, AmortizedCode, ExactRowSolution, LearnedAmortizedEncoder,
 };
 use crate::encode::joint_encode_fallback_fraction;
 use super::outer_objective::reconstruction_explained_variance;
@@ -109,19 +109,15 @@ impl SaeManifoldTerm {
     /// gate / amplitude error, and the joint multi-start-fallback fraction on the
     /// exact solution (the encode-tax cost multiplier). `amplitude_floor` is the
     /// mass above which an atom counts as co-active for the joint diagnostic.
-    #[allow(clippy::too_many_arguments)]
     pub fn amortization_gap(
         &self,
         encoder: &LearnedAmortizedEncoder,
         x_new: ArrayView2<'_, f64>,
-        exact_recon: ArrayView2<'_, f64>,
-        exact_logits: ArrayView2<'_, f64>,
-        exact_coords: &[Array2<f64>],
-        exact_amplitudes: ArrayView2<'_, f64>,
+        exact: ExactRowSolution<'_>,
         amplitude_floor: f64,
     ) -> Result<AmortizationGap, String> {
         let (code, amortized_recon) = self.amortized_encode(encoder, x_new)?;
-        let ev_exact = reconstruction_explained_variance(x_new, exact_recon);
+        let ev_exact = reconstruction_explained_variance(x_new, exact.recon);
         let ev_amortized = reconstruction_explained_variance(x_new, amortized_recon.view());
         let ev_gap = match (ev_exact, ev_amortized) {
             (Some(a), Some(b)) => Some(a - b),
@@ -129,14 +125,14 @@ impl SaeManifoldTerm {
         };
         let errors = LearnedAmortizedEncoder::error_stats(
             &code,
-            exact_logits,
-            exact_coords,
-            exact_amplitudes,
+            exact.logits,
+            exact.coords,
+            exact.amplitudes,
         )?;
         let joint_multistart_fraction = joint_encode_fallback_fraction(
             &self.atoms,
-            exact_coords,
-            exact_amplitudes,
+            exact.coords,
+            exact.amplitudes,
             amplitude_floor,
         )?;
         Ok(AmortizationGap {
@@ -278,23 +274,29 @@ mod amortized_encoder_glue_tests {
         [0.0, 0.2, -0.3, 0.1, -0.1, 0.2],
     ];
 
-    /// Build a SELF-CONSISTENT two-atom flat (degree-1) term: the ambient target
-    /// is `x = Σ_k z_k (b0_k + t_k·b1_k)` where `z_k` are the term's OWN
-    /// assignment masses (softmax of the stored logits), so decoding the term's
-    /// exact code reproduces `x` to machine precision (EV ≈ 1). Returns the term,
-    /// the ambient target, rho, and the exact code (logits, coords, amplitudes).
-    #[allow(clippy::type_complexity)]
-    fn planted_two_atom_term(
-        n: usize,
-        seed: u64,
-    ) -> (
-        SaeManifoldTerm,
-        Array2<f64>,
-        SaeManifoldRho,
-        Array2<f64>,
-        Vec<Array2<f64>>,
-        Array2<f64>,
-    ) {
+    /// A planted two-atom flat term with its faithful ambient target and the exact
+    /// code it was generated from — the fixture the amortization-gap tests fit and
+    /// score against.
+    struct PlantedTwoAtomTerm {
+        /// The two-atom flat (degree-1) SAE term.
+        term: SaeManifoldTerm,
+        /// The ambient target `x = Σ_k z_k (b0_k + t_k·b1_k)`, faithful to the term.
+        target: Array2<f64>,
+        /// The term's ρ hyperparameters.
+        rho: SaeManifoldRho,
+        /// Planted exact per-(row, atom) gate logits.
+        logits: Array2<f64>,
+        /// Planted exact per-atom coordinate blocks.
+        coords: Vec<Array2<f64>>,
+        /// Planted exact per-(row, atom) amplitudes.
+        amps: Array2<f64>,
+    }
+
+    /// Build a SELF-CONSISTENT [`PlantedTwoAtomTerm`]: the ambient target is
+    /// `x = Σ_k z_k (b0_k + t_k·b1_k)` where `z_k` are the term's OWN assignment
+    /// masses (softmax of the stored logits), so decoding the term's exact code
+    /// reproduces `x` to machine precision (EV ≈ 1).
+    fn planted_two_atom_term(n: usize, seed: u64) -> PlantedTwoAtomTerm {
         let p = 6usize;
         let k = 2usize;
         let mut rng = Lcg(seed);
@@ -357,7 +359,14 @@ mod amortized_encoder_glue_tests {
                 }
             }
         }
-        (term, x, rho, logits, coords_blocks, amps)
+        PlantedTwoAtomTerm {
+            term,
+            target: x,
+            rho,
+            logits,
+            coords: coords_blocks,
+            amps,
+        }
     }
 
     /// The distilled encoder, fit to the term's exact code, reproduces the
@@ -365,14 +374,26 @@ mod amortized_encoder_glue_tests {
     /// amortization gap is small — and the artifact fields are all well-formed.
     #[test]
     fn amortized_encode_reaches_high_fraction_of_exact_ev() {
-        let (term, x_tr, rho, _lg_tr, _co_tr, _am_tr) = planted_two_atom_term(400, 7);
+        let PlantedTwoAtomTerm {
+            term,
+            target: x_tr,
+            rho,
+            ..
+        } = planted_two_atom_term(400, 7);
         // Fit the encoder on the term's own exact code (logits/coords/masses).
         let encoder = term
             .fit_amortized_encoder(x_tr.view(), &rho)
             .expect("fit encoder");
 
         // Held-out rows from the SAME dictionary (identical atoms, fresh coords).
-        let (term_te, x_te, _rho_te, lg_te, co_te, am_te) = planted_two_atom_term(200, 99);
+        let PlantedTwoAtomTerm {
+            term: term_te,
+            target: x_te,
+            logits: lg_te,
+            coords: co_te,
+            amps: am_te,
+            ..
+        } = planted_two_atom_term(200, 99);
         // The oracle line: the exact code decoded through the (identical) frozen
         // dictionary reconstructs the held-out target to machine precision.
         let exact_recon_te = {
@@ -388,10 +409,12 @@ mod amortized_encoder_glue_tests {
             .amortization_gap(
                 &encoder,
                 x_te.view(),
-                exact_recon_te.view(),
-                lg_te.view(),
-                &co_te,
-                am_te.view(),
+                ExactRowSolution {
+                    recon: exact_recon_te.view(),
+                    logits: lg_te.view(),
+                    coords: &co_te,
+                    amplitudes: am_te.view(),
+                },
                 1.0e-9,
             )
             .expect("gap");
