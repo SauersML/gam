@@ -486,6 +486,18 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
     if fit_config.scale_dimensions {
         enable_scale_dimensions(&mut spec);
     }
+    // #2116: apply the SAME Duchon operator-penalty gating the Python/materialize
+    // standard path applies (`materialize_standard` → `terms.rs`
+    // `gate_duchon_operator_penalties_for_family`). Both front-ends are one shared
+    // engine (#1191/#1196), so a Duchon smooth under a non-Gaussian-identity
+    // family MUST arrive at the solver with the same penalty structure regardless
+    // of entry point. Previously only the formula/Python path dropped the
+    // collocation-Gram mass/tension operator blocks for the fixed-φ GLM arm; the
+    // CLI's hand-built request left them in, so the two front-ends fit a
+    // different penalty on identical Duchon data — a single-engine-contract
+    // violation. Runs after `enable_scale_dimensions` so the gate sees the fully
+    // resolved basis, exactly as the materialize path does.
+    gate_duchon_operator_penalties_for_family(&mut spec, &family);
     let kappa_options = {
         let mut opts = SpatialLengthScaleOptimizationOptions::default();
         opts.pilot_subsample_threshold = args.pilot_subsample_threshold;

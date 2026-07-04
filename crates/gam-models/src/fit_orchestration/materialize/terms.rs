@@ -61,7 +61,7 @@ pub(crate) fn build_termspec_with_geometry_and_overrides(
 /// is untouched: it keeps the full Hilbert scale and correctly deselects the
 /// lower orders via profiled REML (and the cyclic-duchon / tps Gaussian fits
 /// stay bit-identical). No new knob, REML/LAML stays always-on, no FD.
-pub(crate) fn gate_duchon_operator_penalties_for_family(
+pub fn gate_duchon_operator_penalties_for_family(
     spec: &mut TermCollectionSpec,
     family: &gam_spec::LikelihoodSpec,
 ) {
