@@ -25,7 +25,7 @@ use std::sync::Arc;
 use gam_sae::manifold::{
     AssignmentMode, BehaviorBlock, LatentManifold, PeriodicHarmonicEvaluator, SaeAssignment,
     SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
-    SphereTangentEmbedding,
+    SphereTangentEmbedding, TwoBlockRemlControls,
 };
 
 fn read_csv_matrix(path: &str) -> Result<Array2<f64>, String> {
@@ -138,7 +138,11 @@ fn main() -> Result<(), String> {
             probs.nrows()
         ));
     }
-    let _ = writeln!(std::io::stdout(),"n = {n} tokens, p_x = {p_x} activation dims, V = {vocab} restricted tokens");
+    writeln!(
+        std::io::stdout(),
+        "n = {n} tokens, p_x = {p_x} activation dims, V = {vocab} restricted tokens"
+    )
+    .map_err(|e| e.to_string())?;
 
     // Seed the circle coordinate by phase of the two leading activation PCs
     // (cheap deterministic seed; the fit refines it jointly).
@@ -166,20 +170,33 @@ fn main() -> Result<(), String> {
     let (mut term, mut rho) = circle_term(&evaluator, &coords, p_tot)?;
     term.set_behavior_block(block)?;
     term.set_guards_enabled(false);
-    let report =
-        term.run_two_block_reml_fit(z.view(), &mut rho, None, 30, 60, 1.0, 1e-6, 1e-6, 1e-3)?;
+    let report = term.run_two_block_reml_fit(
+        z.view(),
+        &mut rho,
+        None,
+        TwoBlockRemlControls {
+            max_sweeps: 30,
+            inner_max_iter: 60,
+            step_size: 1.0,
+            ridge_ext_coord: 1e-6,
+            ridge_beta: 1e-6,
+            log_lambda_tol: 1e-3,
+        },
+    )?;
     let block = term
         .behavior_block()
         .expect("installed above")
         .clone();
-    let _ = writeln!(std::io::stdout(),
+    writeln!(
+        std::io::stdout(),
         "REML-selected log λ_y = {:.4} (λ_y = {:.4}); sweeps = {}, converged = {}, identifiable = {}",
         report.log_lambda_y,
         report.log_lambda_y.exp(),
         report.sweeps,
         report.converged,
         report.lambda_identifiable
-    );
+    )
+    .map_err(|e| e.to_string())?;
 
     let augmented = block.augmented_target(z.view())?;
     let fitted = term.try_fitted_for_rho(&rho)?;
@@ -187,11 +204,13 @@ fn main() -> Result<(), String> {
     let act_f = fitted.slice(ndarray::s![.., ..p_x]).to_owned();
     let beh_t = augmented.slice(ndarray::s![.., p_x..]).to_owned();
     let beh_f = fitted.slice(ndarray::s![.., p_x..]).to_owned();
-    let _ = writeln!(std::io::stdout(),
+    writeln!(
+        std::io::stdout(),
         "two-block fit: activation EV = {:.4}, behavior EV = {:.4}",
         explained_variance(&act_t, &act_f),
         explained_variance(&beh_t, &beh_f)
-    );
+    )
+    .map_err(|e| e.to_string())?;
 
     // --- Behavioral speed profile: nats per unit Δt around the fitted circle.
     // Decode the behavior block of the fitted curve at a fine grid of t and
@@ -218,10 +237,18 @@ fn main() -> Result<(), String> {
         total_nats += kl;
         speeds.push((tg[[g, 0]], flat, kl));
     }
-    let _ = writeln!(std::io::stdout(),"behavioral circumference of the fitted weekday circle: {total_nats:.4} nats");
-    let _ = writeln!(std::io::stdout(),"t, predicted_nats(chord), exact_kl (per 1/{grid} step):");
+    writeln!(
+        std::io::stdout(),
+        "behavioral circumference of the fitted weekday circle: {total_nats:.4} nats"
+    )
+    .map_err(|e| e.to_string())?;
+    writeln!(
+        std::io::stdout(),
+        "t, predicted_nats(chord), exact_kl (per 1/{grid} step):"
+    )
+    .map_err(|e| e.to_string())?;
     for (t, flat, kl) in &speeds {
-        let _ = writeln!(std::io::stdout(),"{t:.4}, {flat:.6}, {kl:.6}");
+        writeln!(std::io::stdout(), "{t:.4}, {flat:.6}, {kl:.6}").map_err(|e| e.to_string())?;
     }
 
     // --- Activation-only baseline for the side-by-side. ---
@@ -229,9 +256,11 @@ fn main() -> Result<(), String> {
     term_a.set_guards_enabled(false);
     term_a.run_joint_fit_arrow_schur(z.view(), &mut rho_a, None, 60, 1.0, 1e-6, 1e-6)?;
     let fitted_a = term_a.try_fitted_for_rho(&rho_a)?;
-    let _ = writeln!(std::io::stdout(),
+    writeln!(
+        std::io::stdout(),
         "activation-only baseline: activation EV = {:.4} (no behavioral units available)",
         explained_variance(&z, &fitted_a)
-    );
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
