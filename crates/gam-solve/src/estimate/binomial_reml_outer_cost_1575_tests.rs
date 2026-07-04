@@ -97,37 +97,45 @@ fn second_difference_penalty(k: usize) -> Array2<f64> {
 }
 
 fn build_fixture() -> (Array2<f64>, Array1<f64>, Vec<BlockwisePenalty>) {
-    let p = 1 + N_SMOOTH * K;
-    let mut rng = Lcg::new(100 + N as u64);
+    build_fixture_n(N, K)
+}
 
-    let mut cov = vec![vec![0.0f64; N]; N_SMOOTH];
+/// Parameterised version of [`build_fixture`] so the outer-cost scaling harness
+/// can measure the SAME 3-smooth logistic problem at several `n` in one process
+/// (the outer-eval count is claimed n-independent in #1575; the harness checks
+/// it empirically). `build_fixture()` is exactly `build_fixture_n(N, K)`.
+fn build_fixture_n(n: usize, k: usize) -> (Array2<f64>, Array1<f64>, Vec<BlockwisePenalty>) {
+    let p = 1 + N_SMOOTH * k;
+    let mut rng = Lcg::new(100 + n as u64);
+
+    let mut cov = vec![vec![0.0f64; n]; N_SMOOTH];
     for row in cov.iter_mut() {
         for v in row.iter_mut() {
             *v = rng.unit();
         }
     }
 
-    let mut x = Array2::<f64>::zeros((N, p));
-    for i in 0..N {
+    let mut x = Array2::<f64>::zeros((n, p));
+    for i in 0..n {
         x[[i, 0]] = 1.0;
     }
     let mut s_list = Vec::with_capacity(N_SMOOTH);
     for j in 0..N_SMOOTH {
-        let block = cubic_bspline_design(&cov[j], K);
-        for i in 0..N {
-            for c in 0..K {
-                x[[i, 1 + j * K + c]] = block[[i, c]];
+        let block = cubic_bspline_design(&cov[j], k);
+        for i in 0..n {
+            for c in 0..k {
+                x[[i, 1 + j * k + c]] = block[[i, c]];
             }
         }
-        let start = 1 + j * K;
+        let start = 1 + j * k;
         s_list.push(BlockwisePenalty::new(
-            start..(start + K),
-            second_difference_penalty(K),
+            start..(start + k),
+            second_difference_penalty(k),
         ));
     }
 
-    let mut y = Array1::<f64>::zeros(N);
-    for i in 0..N {
+    let mut y = Array1::<f64>::zeros(n);
+    for i in 0..n {
         let (x1, x2, x3) = (cov[0][i], cov[1][i], cov[2][i]);
         let f = (2.0 * std::f64::consts::PI * x1).sin() * 1.5 + (x2 - 0.5).powi(2) * 6.0 - 1.0
             + (3.0 * std::f64::consts::PI * x3).cos();
@@ -201,4 +209,66 @@ fn binomial_logit_reml_outer_cost_is_bounded_1575() {
          ~150-eval grind (#1575)",
         fit.outer_cost_evals
     );
+    // The genuinely expensive work is the count of cache-missing full-n inner
+    // P-IRLS solves (`outer_cost_evals` counts outer *requests*, cache hits
+    // included, and under-counts the real solve budget). The seed-grid prepass
+    // dominates this count; memoizing its criterion-ranked coordinate-descent
+    // probes (which re-draw the same ρ across sweeps) removed the redundant
+    // re-solves bit-identically, taking this fixture from ~74 to ~65. Pin a
+    // guard above the observed value so a regression that reintroduces the
+    // duplicate grid probes (or a wider unbounded outer loop) fails loudly,
+    // while leaving headroom for benign scheduling variation.
+    assert!(
+        fit.inner_pirls_solves <= 90,
+        "cache-missing inner P-IRLS solves = {} — expected the deduplicated \
+         seed-grid + outer loop, not redundant re-solves of identical ρ (#1575)",
+        fit.inner_pirls_solves
+    );
+}
+
+/// Measurement harness (run with `--ignored --nocapture`): report outer-eval,
+/// inner-solve and wall-clock scaling of the binomial/logit REML fit across a
+/// range of `n`. Not a gate — it produces the table used to reason about the
+/// #1575 gap against mgcv and to confirm the outer-eval count is n-independent.
+#[test]
+#[ignore]
+fn binomial_logit_reml_outer_cost_scaling_1575() {
+    eprintln!(
+        "{:>7} {:>4} {:>4} {:>8} {:>8} {:>10} {:>10} {:>9}",
+        "n", "k", "p", "outer", "inner", "time_s", "time/inner", "conv"
+    );
+    for &n in &[1000usize, 2000, 4000, 8000, 16000] {
+        let k = K;
+        let (x, y, s_list) = build_fixture_n(n, k);
+        let weights = Array1::<f64>::ones(n);
+        let offset = Array1::<f64>::zeros(n);
+        let mut opts = logit_options();
+        opts.nullspace_dims = vec![2; N_SMOOTH];
+        let t0 = std::time::Instant::now();
+        let fit = fit_gam(
+            x,
+            y.view(),
+            weights.view(),
+            offset.view(),
+            &s_list,
+            LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(StandardLink::Logit),
+            ),
+            &opts,
+        )
+        .expect("binomial/logit REML fit should succeed");
+        let dt = t0.elapsed().as_secs_f64();
+        eprintln!(
+            "{:>7} {:>4} {:>4} {:>8} {:>8} {:>10.3} {:>10.4} {:>9}",
+            n,
+            k,
+            1 + N_SMOOTH * k,
+            fit.outer_cost_evals,
+            fit.inner_pirls_solves,
+            dt,
+            dt / (fit.inner_pirls_solves.max(1) as f64),
+            fit.outer_converged,
+        );
+    }
 }
