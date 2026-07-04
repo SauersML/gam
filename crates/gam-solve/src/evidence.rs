@@ -1586,8 +1586,10 @@ pub struct RankedRow {
     /// declared winner (issue #1465). `score` still carries the raw REML/LAML
     /// evidence so it stays consistent with `Model.evidence`.
     pub delta: f64,
-    /// Bayes factor of the winner over this row on the ranking scale,
-    /// `exp(delta) >= 1` (issue #1465).
+    /// Akaike evidence ratio of the winner over this row on the ranking scale.
+    /// `delta` is a conditional-AIC gap (a −2·log / deviance-scale quantity), so
+    /// the evidence ratio is `exp(½·delta) >= 1` (Burnham & Anderson), NOT
+    /// `exp(delta)` — the latter squares the intended ratio (issues #1465, #2124).
     pub bayes_factor: f64,
     pub edf: Option<f64>,
 }
@@ -1705,7 +1707,13 @@ pub fn compare_reml_fits(mut candidates: Vec<RemlCandidate>) -> Result<RemlCompa
     let mut score_table = Vec::with_capacity(candidates.len());
     for row in &candidates {
         let delta = log_bayes_factor(best_ranking_score, row.ranking_score());
-        let bayes_factor = delta.exp();
+        // `ranking_score` is the conditional AIC (`−2·loglik + 2·edf`), a −2·log /
+        // deviance-scale cost, so `delta` is a full ΔAIC gap. The Akaike evidence
+        // ratio for an AIC gap Δ is `exp(−½Δ)` (Burnham & Anderson evidence ratio),
+        // hence the winner-over-row Bayes factor is `exp(½·delta)`. Reporting
+        // `delta.exp()` squared the intended ratio (issue #2124). `delta` itself is
+        // left on the AIC scale on purpose — only its exp() conversion is halved.
+        let bayes_factor = (0.5 * delta).exp();
         let delta_reml = log_bayes_factor(best_raw_score, row.score);
         ranking.push(RankedRow {
             name: row.name.clone(),
@@ -1728,10 +1736,14 @@ pub fn compare_reml_fits(mut candidates: Vec<RemlCandidate>) -> Result<RemlCompa
     // decision margin so the headline never contradicts the chosen winner.
     let evidence_summary = if let Some(runner_up) = candidates.get(1) {
         let margin = runner_up.ranking_score() - candidates[0].ranking_score();
+        // `margin` is a conditional-AIC gap (−2·log scale), so the Akaike evidence
+        // ratio is `exp(−½·margin)`; `format_bayes_factor` formats `exp()` of its
+        // argument, so pass the halved margin to headline `exp(½·margin)` rather
+        // than the squared `exp(margin)` (issue #2124).
         format!(
             "{} wins by Bayes factor {} over {}",
             winner,
-            format_bayes_factor(margin),
+            format_bayes_factor(0.5 * margin),
             runner_up.name
         )
     } else {
@@ -4010,6 +4022,63 @@ mod tests {
             .expect("big row");
         assert!((small_row.reml_score - 180.526).abs() < 1e-9);
         assert!((big_row.reml_score - 177.404).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ranking_bayes_factor_is_akaike_evidence_ratio_not_its_square() {
+        // Issue #2124: `ranking_score` is the conditional AIC (`−2ℓ + 2·edf`), a
+        // −2·log / deviance-scale cost. For an AIC gap Δ the Akaike evidence ratio
+        // (Burnham & Anderson) is `exp(−½Δ)`, so the winner-over-loser
+        // `bayes_factor` must be `exp(½Δ)` — NOT `exp(Δ)`, which squares it.
+        //
+        // Winner: AIC 0 (loglik 0, edf 0). Loser: AIC = 27.68 (loglik −13.84,
+        // edf 0), matching the ΔAIC in the issue repro. Raw REML scores are set
+        // distinct (100 vs 110) to lock the scoping: the raw score_table path
+        // must stay `exp(Δreml)` with NO halving.
+        let delta_aic = 27.68_f64;
+        let winner = cand("winner", 100.0, 0.0, 0.0);
+        let loser = cand("loser", 110.0, 0.0, -delta_aic / 2.0);
+
+        let cmp = compare_reml_fits(vec![winner, loser]).expect("compare");
+        assert_eq!(cmp.winner, "winner");
+
+        let loser_row = cmp
+            .ranking
+            .iter()
+            .find(|r| r.name == "loser")
+            .expect("loser ranking row");
+
+        // The AIC gap FIELD stays on the AIC scale, unchanged (issue #2124).
+        assert!((loser_row.delta - delta_aic).abs() < 1e-9);
+
+        // The Bayes factor is the Akaike evidence ratio exp(½·ΔAIC) = exp(13.84)
+        // ≈ 1.03e6 — NOT the squared exp(27.68) ≈ 1.05e12 the bug reported.
+        let expected = (0.5 * delta_aic).exp();
+        assert!(
+            (loser_row.bayes_factor / expected - 1.0).abs() < 1e-9,
+            "ranking bayes_factor {} should be exp(½ΔAIC)={}, not exp(ΔAIC)={}",
+            loser_row.bayes_factor,
+            expected,
+            delta_aic.exp()
+        );
+        // Explicit anti-regression: it must not be the squared ratio.
+        assert!(loser_row.bayes_factor < delta_aic.exp() * 0.5);
+
+        // Scoping lock (issue #2124): the RAW-REML score_table path is untouched —
+        // its best-over-model Bayes factor is `exp(Δreml)` with NO halving. Raw
+        // scores 100 (winner) vs 110 (loser) give Δreml = 10, so the loser's raw
+        // Bayes factor is exp(10), not exp(5).
+        let loser_score_row = cmp
+            .score_table
+            .iter()
+            .find(|r| r.name == "loser")
+            .expect("loser score row");
+        let expected_reml_bf = 10.0_f64.exp();
+        assert!(
+            (loser_score_row.bayes_factor_best_over_model / expected_reml_bf - 1.0).abs() < 1e-9,
+            "raw-REML bayes_factor_best_over_model must stay exp(Δreml)=exp(10), got {}",
+            loser_score_row.bayes_factor_best_over_model
+        );
     }
 
     #[test]

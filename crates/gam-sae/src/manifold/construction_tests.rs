@@ -1062,6 +1062,87 @@ mod lever_wiring_2072_tests {
         );
     }
 
+    /// #2072 — `cone_atom_recovery` DRIVER (the
+    /// `if (self.cone_atom_recovery || self.quotient_scale)
+    ///     && self.retract_collapsed_decoders_in_loop() > 0` boundary arm at the
+    /// accepted OUTER-iterate seam, fit_drivers.rs). With a CO-VANISHED atom in the
+    /// dictionary the lever RECOVERS it: the collapsed decoder is retracted onto the
+    /// unit-Frobenius sphere (its magnitude folded into `log_amplitude`) and the
+    /// amplitudes re-solved. OFF short-circuits the `&&` (both flags false), so the
+    /// retraction helper is never even called and the collapsed decoder stays
+    /// collapsed. This runs the EXACT driver gate both ways on one collapsed fixture
+    /// and asserts the recovery fires in the intended direction ONLY when the lever
+    /// is ON — a driver that ignored the flag (or a clone that dropped it) fails.
+    #[test]
+    fn cone_atom_recovery_driver_recovers_covanished_decoder() {
+        // Shared 2-atom periodic fixture, then artificially CO-VANISH atom 0's
+        // decoder to ~1e-6 of its healthy peer: below the breach floor
+        // (SAE_ATOM_DECODER_NORM_COLLAPSE_RATIO = 1e-3 · max‖B‖) yet far above the
+        // 1e-12 · max direction floor, so it is a RETRACTABLE collapse (not an
+        // unretractable literal zero).
+        fn make_collapsed() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
+            let (mut term, target, rho) = small_two_atom_periodic_term();
+            let collapsed = &term.atoms[0].decoder_coefficients * 1.0e-6;
+            term.atoms[0].decoder_coefficients.assign(&collapsed);
+            (term, target, rho)
+        }
+
+        // Healthy peer norm sets the breach floor the driver measures collapse
+        // against (the MAX survivor, gauge.rs).
+        let peer_norm = {
+            let (term, _t, _r) = make_collapsed();
+            frob(&term.atoms[1].decoder_coefficients)
+        };
+        let breach_floor = 1.0e-3 * peer_norm;
+
+        // OFF (default): the gate `(false || false) && …` short-circuits — the
+        // retraction helper is NEVER invoked, so atom 0 stays co-vanished.
+        let (mut off, off_target, off_rho) = make_collapsed();
+        assert!(
+            !off.cone_atom_recovery() && !off.quotient_scale(),
+            "both scale-gauge levers must default OFF"
+        );
+        if (off.cone_atom_recovery() || off.quotient_scale())
+            && off.retract_collapsed_decoders_in_loop() > 0
+        {
+            off.optimize_log_amplitudes_closed_form(off_target.view(), &off_rho)
+                .expect("amplitude solve (off path is unreachable, but must type-check)");
+        }
+        let off_norm = frob(&off.atoms[0].decoder_coefficients);
+        assert!(
+            off_norm < breach_floor,
+            "OFF: the co-vanished decoder must stay collapsed (‖B_0‖ = {off_norm:e} \
+             < breach floor {breach_floor:e})"
+        );
+
+        // ON: engage the lever — the SAME gate now retracts the co-vanished atom
+        // onto the unit-Frobenius sphere and re-solves the amplitudes.
+        let (mut on, on_target, on_rho) = make_collapsed();
+        on.set_cone_atom_recovery(true);
+        let recovered = (on.cone_atom_recovery() || on.quotient_scale())
+            && on.retract_collapsed_decoders_in_loop() > 0;
+        assert!(
+            recovered,
+            "ON: the co-vanished atom must be flagged as collapsed and retracted"
+        );
+        on.optimize_log_amplitudes_closed_form(on_target.view(), &on_rho)
+            .expect("amplitude solve (on)");
+        let on_norm = frob(&on.atoms[0].decoder_coefficients);
+        assert!(
+            (on_norm - 1.0).abs() <= 1e-9,
+            "ON: the recovered decoder must sit on the unit-Frobenius sphere; \
+             got ‖B_0‖ = {on_norm}"
+        );
+
+        // The lever produced a genuinely different, recovered decoder state — the
+        // collapsed norm was lifted by many orders of magnitude, not left inert.
+        assert!(
+            on_norm > off_norm * 1.0e3,
+            "ON must lift the co-vanished decoder far above the OFF (collapsed) \
+             norm; on = {on_norm:e}, off = {off_norm:e}"
+        );
+    }
+
     /// `s_k = ln‖B_abs,k‖` — a PURE GAUGE move: the reconstruction
     /// `a·exp(s)·Φ·B_unit == a·Φ·B_abs` is preserved to machine precision.
     #[test]

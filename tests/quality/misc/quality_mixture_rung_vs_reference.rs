@@ -163,6 +163,34 @@ fn plant_clusters(n: usize, k: usize, separation: f64, sigma: f64, seed: u64) ->
 // gaps a discrete mixture cannot reach.
 // ---------------------------------------------------------------------------
 
+/// Solve the 3×3 system `m · x = v` by Cramer's rule. Returns `None` when the
+/// coefficient matrix is (numerically) singular so the caller can fall back.
+fn solve3x3(m: &[[f64; 3]; 3], v: &[f64; 3]) -> Option<[f64; 3]> {
+    let det3 = |a: &[[f64; 3]; 3]| -> f64 {
+        a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1])
+            - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
+            + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0])
+    };
+    let det = det3(m);
+    let scale = m
+        .iter()
+        .flat_map(|row| row.iter())
+        .fold(0.0_f64, |acc, &e| acc + e * e)
+        .sqrt();
+    if det.abs() <= 1e-12 * (1.0 + scale) {
+        return None;
+    }
+    let mut out = [0.0_f64; 3];
+    for (col, slot) in out.iter_mut().enumerate() {
+        let mut mc = *m;
+        for row in 0..3 {
+            mc[row][col] = v[row];
+        }
+        *slot = det3(&mc) / det;
+    }
+    Some(out)
+}
+
 struct CircleRingDensity {
     cx: f64,
     cy: f64,
@@ -176,8 +204,45 @@ impl CircleRingDensity {
         if n < 2 {
             return Err("circle ring fit needs >= 2 rows".to_string());
         }
-        let cx = rows.column(0).iter().sum::<f64>() / n as f64;
-        let cy = rows.column(1).iter().sum::<f64>() / n as f64;
+        let nf = n as f64;
+        // Estimate the centre by an algebraic (Kåsa) least-squares circle fit, NOT
+        // the raw point centroid. For a full ring the centroid is a badly biased
+        // circle-centre estimator — its sampling error is O(radius/√n), which for
+        // this fixture displaces the centre by ~0.2 and inflates the fitted radial
+        // spread from the true 0.18 to 0.25, crippling the ring's held-out
+        // density. The algebraic fit minimises Σ(x²+y² − 2·cx·x − 2·cy·y − w)²
+        // over (cx, cy, w) — linear normal equations — and recovers the true
+        // centre/radius, so the continuous ring predicts the interpolated gaps as
+        // well as the geometry allows. It degrades gracefully: on (near-)collinear
+        // rows the 3×3 system is singular and we fall back to the centroid.
+        let (mut sx, mut sy, mut sxx, mut syy, mut sxy) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        let (mut sb, mut sxb, mut syb) = (0.0, 0.0, 0.0);
+        for i in 0..n {
+            let x = rows[[i, 0]];
+            let y = rows[[i, 1]];
+            let b = x * x + y * y;
+            sx += x;
+            sy += y;
+            sxx += x * x;
+            syy += y * y;
+            sxy += x * y;
+            sb += b;
+            sxb += x * b;
+            syb += y * b;
+        }
+        // M·[cx, cy, w] = v for the design columns [2x, 2y, 1] against target b:
+        //   M = [[4Σx², 4Σxy, 2Σx], [4Σxy, 4Σy², 2Σy], [2Σx, 2Σy, n]],
+        //   v = [2Σxb, 2Σyb, Σb].
+        let m = [
+            [4.0 * sxx, 4.0 * sxy, 2.0 * sx],
+            [4.0 * sxy, 4.0 * syy, 2.0 * sy],
+            [2.0 * sx, 2.0 * sy, nf],
+        ];
+        let v = [2.0 * sxb, 2.0 * syb, sb];
+        let (cx, cy) = match solve3x3(&m, &v) {
+            Some([cx, cy, w]) if (w + cx * cx + cy * cy) > 0.0 => (cx, cy),
+            _ => (sx / nf, sy / nf),
+        };
         let radii: Vec<f64> = (0..n)
             .map(|i| {
                 let dx = rows[[i, 0]] - cx;
@@ -185,8 +250,8 @@ impl CircleRingDensity {
                 (dx * dx + dy * dy).sqrt()
             })
             .collect();
-        let radius = radii.iter().sum::<f64>() / n as f64;
-        let var = radii.iter().map(|r| (r - radius).powi(2)).sum::<f64>() / n as f64;
+        let radius = radii.iter().sum::<f64>() / nf;
+        let var = radii.iter().map(|r| (r - radius).powi(2)).sum::<f64>() / nf;
         // Floor the radial std away from zero for numerical safety (matches the
         // mixture's covariance floor in spirit; fixed, not tuned).
         let sigma_r = var.sqrt().max(1e-3);

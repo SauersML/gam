@@ -1700,6 +1700,56 @@ mod tests {
         assert_relative_eq!(dev, expected, epsilon = 1e-12, max_relative = 1e-12);
     }
 
+    /// Regression for issue #2126: `calculate_deviance` for a Gamma family must
+    /// report the conventional **unscaled** deviance `D = 2·Σ wᵢ·d(yᵢ, μᵢ)` —
+    /// exactly like Poisson/Binomial/NB/Beta and R/mgcv/statsmodels — and must
+    /// NOT multiply the unit deviance by the fitted shape (≈ 1/φ̂), which would
+    /// report the scaled deviance `D/φ̂` instead. The bug only manifests when the
+    /// shape differs from 1, so this pins a likelihood with an explicit
+    /// `FixedGammaShape { shape = 4.0 }`: the reported deviance must equal the
+    /// shape-free value and must be strictly different from `shape · D`.
+    #[test]
+    pub(crate) fn gamma_deviance_is_unscaled_ignoring_shape() {
+        let y = array![2.0, 5.0, 1.5];
+        let mu = array![1.0, 4.0, 2.0];
+        let w = array![1.5, 0.75, 1.0];
+        let shape = 4.0_f64;
+        let likelihood = GlmLikelihoodSpec {
+            spec: LikelihoodSpec::new(
+                ResponseFamily::Gamma,
+                InverseLink::Standard(StandardLink::Log),
+            ),
+            scale: gam_problem::LikelihoodScaleMetadata::FixedGammaShape { shape },
+        };
+        // Sanity: the likelihood really does carry a non-unit shape, so the old
+        // scaled-deviance code path (× shape) would have been exercised.
+        assert_eq!(likelihood.gamma_shape(), Some(shape));
+
+        let dev = calculate_deviance(y.view(), &mu, &likelihood, w.view());
+
+        let sum_unit: f64 = w
+            .iter()
+            .zip(y.iter())
+            .zip(mu.iter())
+            .map(|((&wi, &yi), &mui)| {
+                let ratio = yi / mui;
+                wi * (ratio - 1.0 - ratio.ln())
+            })
+            .sum();
+        let unscaled = 2.0 * sum_unit;
+
+        // The reported deviance is the unscaled 2·Σ w·d(y, μ) ...
+        assert_relative_eq!(dev, unscaled, epsilon = 1e-12, max_relative = 1e-9);
+        // ... and is NOT the shape-scaled deviance (this is the #2126 assertion:
+        // the old code returned `shape * unscaled`, which for shape = 4 differs).
+        assert!(
+            (dev - shape * unscaled).abs() > 1e-6,
+            "Gamma deviance must be unscaled, not scaled by shape={shape}: \
+             dev={dev}, unscaled={unscaled}, scaled={}",
+            shape * unscaled
+        );
+    }
+
     #[test]
     pub(crate) fn gamma_log_observed_curvature_matches_shape_one_closed_form() {
         let eta = array![0.2, -0.4];

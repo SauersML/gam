@@ -549,6 +549,31 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         const RESIDUAL_STALL_MIN_CYCLES: usize = 40;
         const RESIDUAL_STALL_IMPROVEMENT_FACTOR: f64 = 0.9;
         const RESIDUAL_STALL_BLOCK_GRADIENT_FACTOR: f64 = 50.0;
+        // Upper bound on how long a still-descending Φ-merit may VETO the
+        // flat-residual stall exit (gam#979 survival marginal-slope hang). The
+        // merit-descent veto below (`merit_still_descending_over_window`) was
+        // added to protect the gam#1607 transient wiggle — a few cycles where
+        // the line search drives the objective down while the KKT residual
+        // re-anchors through a gauge null before catching up. That is a
+        // TRANSIENT: a healthy or wiggling solve reaches KKT tolerance in a
+        // handful of cycles. On the survival marginal-slope monotone-cone DGP,
+        // by contrast, the joint block carries a free warp/gauge direction
+        // (the #892 flexible-regime family) along which the penalized objective
+        // drifts DOWN by O(1) every cycle indefinitely while the KKT residual
+        // sits orders of magnitude above tol and never trends toward it. The
+        // veto then reads that unbounded drift as "still making progress" and
+        // suppresses the flat-residual exit for the ENTIRE cycle budget — the
+        // loop grinds to `inner_loop_hard_ceiling` on every one of the ~60
+        // outer ρ-evaluations (the ~900s #979 hang), then hands the outer
+        // optimizer a non-converged result anyway. Once the residual has been
+        // flat (no ≥10% drop) for this many cycles — a large multiple of the
+        // stall window, far beyond any legitimate wiggle transient or healthy
+        // convergence — the drifting merit is no longer credible evidence of
+        // reachable convergence and the veto yields to the honest non-converged
+        // exit. This changes nothing for solves that actually converge or
+        // wiggle briefly (they exit long before the counter climbs this high);
+        // it only rejects a provably-non-stationary ρ sooner.
+        const RESIDUAL_STALL_MERIT_VETO_MAX_CYCLES: usize = 4 * RESIDUAL_STALL_NO_IMPROVE_CYCLES;
         let mut best_residual_seen: f64 = f64::INFINITY;
         // Smallest *certified* stationarity residual the solve actually computed,
         // tracked independently of `best_residual_seen` (whose updates are bound
@@ -5187,10 +5212,11 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 && residual > residual_tol
                 && cycle + 1 >= RESIDUAL_STALL_MIN_CYCLES
                 && cycles_since_residual_improved >= RESIDUAL_STALL_NO_IMPROVE_CYCLES
-                && !merit_still_descending_over_window()
+                && (!merit_still_descending_over_window()
+                    || cycles_since_residual_improved >= RESIDUAL_STALL_MERIT_VETO_MAX_CYCLES)
             {
                 log::warn!(
-                    "[PIRLS/joint-Newton convergence] cycle {:>3} | flat-residual stall early-exit (gam#1040): residual={:.3e} (tol={:.3e}) best_seen={:.3e} stalled {} cycles with steps inside the trust region (tr_clamped={}) and no acceptance certificate satisfied; the residual is neither trending toward KKT nor stationary on the identifiable subspace, so returning unconverged with finite β instead of grinding to inner_max_cycles={}.",
+                    "[PIRLS/joint-Newton convergence] cycle {:>3} | flat-residual stall early-exit (gam#1040/#979): residual={:.3e} (tol={:.3e}) best_seen={:.3e} stalled {} cycles with steps inside the trust region (tr_clamped={}) and no acceptance certificate satisfied; the residual is neither trending toward KKT nor stationary on the identifiable subspace, so returning unconverged with finite β instead of grinding to inner_max_cycles={}.",
                     cycle,
                     residual,
                     residual_tol,
@@ -5229,7 +5255,8 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 && residual > residual_tol
                 && cycle + 1 >= RESIDUAL_STALL_MIN_CYCLES
                 && residual_rate_history.len() > LINEAR_RATE_WINDOW
-                && !merit_still_descending_over_window()
+                && (!merit_still_descending_over_window()
+                    || cycle + 1 >= RESIDUAL_STALL_MERIT_VETO_MAX_CYCLES)
             {
                 let oldest = *residual_rate_history.front().unwrap();
                 // Single source of truth for the slow-geometric-rate projection

@@ -1,6 +1,6 @@
 [package]
 name = "gam-gpu"
-version = "0.3.146"
+version = "0.3.147"
 edition = "2024"
 description = "GPU (CUDA/NVRTC) dispatch, device runtime, and BLAS kernels for the gam penalized-likelihood engine"
 license = "AGPL-3.0-or-later"
@@ -11,8 +11,8 @@ warnings = "deny"
 
 [dependencies]
 faer = "0.24.0"
-gam-linalg = { path = "../gam-linalg", version = "=0.3.146" }
-gam-runtime = { path = "../gam-runtime", version = "=0.3.146" }
+gam-linalg = { path = "../gam-linalg", version = "=0.3.147" }
+gam-runtime = { path = "../gam-runtime", version = "=0.3.147" }
 libloading = "0.8.9"
 libm = "0.2.16"
 log = "0.4.29"

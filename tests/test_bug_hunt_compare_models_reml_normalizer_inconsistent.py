@@ -133,11 +133,13 @@ def test_bayes_factor_vs_agrees_with_compare_models_magnitude() -> None:
     comparison = gamfit.compare_models([m_smooth, m_poly], names=["smooth", "poly"])
     ranking = {row[0]: row for row in comparison["ranking"]}
 
-    # The ranking ``delta`` is each model's ranking score minus the winner's, so
-    # the log Bayes factor of poly over smooth implied by compare_models is
-    # (delta_smooth - delta_poly) -- the winner term cancels. bayes_factor_vs is
+    # The ranking ``delta`` is each model's conditional-AIC gap from the winner
+    # (a -2*log / deviance-scale quantity), so the log Bayes factor of poly over
+    # smooth implied by compare_models is HALF the delta gap: the Akaike evidence
+    # ratio for an AIC gap D is exp(-D/2) (Burnham & Anderson), not exp(-D)
+    # (issue #2124). The winner term cancels in the difference. bayes_factor_vs is
     # a minimized cost (lower = better), matching that direction.
-    log_bf_poly_over_smooth_compare = ranking["smooth"][2] - ranking["poly"][2]
+    log_bf_poly_over_smooth_compare = 0.5 * (ranking["smooth"][2] - ranking["poly"][2])
     log_bf_poly_over_smooth_pairwise = math.log(m_poly.bayes_factor_vs(m_smooth))
 
     assert log_bf_poly_over_smooth_pairwise == pytest.approx(

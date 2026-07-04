@@ -6478,19 +6478,30 @@ fn rg_resolve_simplex_coord_label(kind: &str, coordinates: Option<&str>) -> Stri
 /// coordinate label. This owns the geometry-kind routing, coordinate
 /// resolution, and base-point selection that previously lived in the Python
 /// wrapper.
+///
+/// `weights` are the per-observation prior weights used ONLY to choose the
+/// intrinsic base point when `base` is `None`. A weighted response-geometry fit
+/// linearizes every response in the tangent space at the base point and runs a
+/// weighted tangent regression there; if the base point ignored the weights the
+/// chart would be expanded around where the *unweighted* data balances rather
+/// than where the weighted mass lives — a biased linearization whenever the
+/// weighted and unweighted intrinsic means differ (#2125). Threading the same
+/// weights the tangent regression uses into the Fréchet mean puts the chart
+/// origin at the weighted mean. `None` recovers the uniform intrinsic mean.
 fn rg_log_map_dispatch(
     values: ArrayView2<'_, f64>,
     geometry: &str,
     base: Option<ArrayView1<'_, f64>>,
     coordinates: Option<&str>,
     reference: isize,
+    weights: Option<ArrayView1<'_, f64>>,
 ) -> Result<(Array2<f64>, Array1<f64>, String), String> {
     let kind = geometry.to_ascii_lowercase();
     match kind.as_str() {
         "spherical" | "sphere" => {
             let base_point = match base {
                 None => Array1::from(gam::geometry::sphere::sphere_frechet_mean(
-                    values, None, 1.0e-12, 256,
+                    values, weights, 1.0e-12, 256,
                 )?),
                 Some(b) => rg_normalize_sphere_base(b)?,
             };
@@ -6502,7 +6513,7 @@ fn rg_log_map_dispatch(
             let coord_label = rg_resolve_simplex_coord_label(&kind, coordinates);
             let coord = gam::geometry::simplex::parse_simplex_coord(&coord_label)?;
             let base_point = match base {
-                None => Array1::from(simplex_frechet_mean(values, None)?),
+                None => Array1::from(simplex_frechet_mean(values, weights)?),
                 Some(b) => {
                     let b2 = Array2::from_shape_fn((1, b.len()), |(_, j)| b[j]);
                     simplex_closure(b2.view())?.row(0).to_owned()
@@ -6519,7 +6530,7 @@ fn rg_log_map_dispatch(
         // Curved matrix / hyperbolic response geometries (#1061): the math is in
         // `gam::geometry` and the label-parsing + intrinsic-mean + batched-map
         // routing lives in `response_geometry`. `reference` does not apply.
-        _ => gam::geometry::response_geometry::dispatch_log_map(values, &kind, base),
+        _ => gam::geometry::response_geometry::dispatch_log_map(values, &kind, base, weights),
     }
 }
 

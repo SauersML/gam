@@ -421,7 +421,7 @@ fn response_geometry_sphere_normalize_base<'py>(
 /// coordinate resolution, and base-point selection (intrinsic Fréchet mean when
 /// `base` is `None`) so the Python wrapper marshals arrays only. Returns
 /// `(tangent, base_point, resolved_coordinate_label)`.
-#[pyfunction(signature = (values, geometry, base=None, coordinates=None, reference=-1))]
+#[pyfunction(signature = (values, geometry, base=None, coordinates=None, reference=-1, weights=None))]
 fn response_geometry_log_map<'py>(
     py: Python<'py>,
     values: PyReadonlyArray2<'py, f64>,
@@ -429,9 +429,11 @@ fn response_geometry_log_map<'py>(
     base: Option<PyReadonlyArray1<'py, f64>>,
     coordinates: Option<String>,
     reference: isize,
+    weights: Option<PyReadonlyArray1<'py, f64>>,
 ) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray1<f64>>, String)> {
     let arr = values.as_array().to_owned();
     let base_owned = base.as_ref().map(|b| b.as_array().to_owned());
+    let weights_owned = weights.as_ref().map(|w| w.as_array().to_owned());
     let (tangent, base_point, coord_label) =
         detach_py_result(py, "response_geometry_log_map", move || {
             rg_log_map_dispatch(
@@ -440,6 +442,7 @@ fn response_geometry_log_map<'py>(
                 base_owned.as_ref().map(|b| b.view()),
                 coordinates.as_deref(),
                 reference,
+                weights_owned.as_ref().map(|w| w.view()),
             )
         })?;
     Ok((

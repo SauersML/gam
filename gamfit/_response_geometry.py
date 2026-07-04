@@ -194,15 +194,26 @@ def geometry_log_map(
     base: Any | None = None,
     coordinates: str | None = None,
     reference: int = -1,
+    weights: Any | None = None,
 ) -> tuple[Any, Any, str]:
     """Map response observations to tangent coordinates at an intrinsic base.
 
     Geometry-kind routing, simplex-coordinate resolution, and base-point
     selection (intrinsic Fréchet mean when ``base`` is ``None``) all live in
     Rust (``response_geometry_log_map``); this only marshals arrays.
+
+    ``weights`` are the per-observation prior weights used ONLY to pick the
+    intrinsic base point (ignored when an explicit ``base`` is supplied). A
+    weighted response-geometry fit linearizes every response in the tangent
+    space at the base point and runs a *weighted* tangent regression there, so
+    the chart origin must be the **weighted** Fréchet mean — where the weighted
+    mass lives — not the unweighted one (#2125).
     """
     np = _np()
     base_arr = None if base is None else np.asarray(base, dtype=float).reshape(-1)
+    weights_arr = (
+        None if weights is None else np.asarray(weights, dtype=float).reshape(-1)
+    )
     tangent, base_point, coord = _ffi(
         "response_geometry_log_map",
         np.asarray(values, dtype=float),
@@ -210,6 +221,7 @@ def geometry_log_map(
         base_arr,
         None if coordinates is None else str(coordinates),
         int(reference),
+        weights_arr,
     )
     return tangent, base_point, coord
 
@@ -527,11 +539,26 @@ def fit_response_geometry(
         # the response column count exactly as the estimand inferred it).
         geometry_for_maps = f"constant_curvature(dim={int(y.shape[1])},kappa={kappa_hat!r})"
 
+    # Observation weights reach BOTH the tangent regression and the base point.
+    # ``weights`` is the name of a prior-weight column; resolve it to the raw
+    # per-row vector so the intrinsic base point is the *weighted* Fréchet mean
+    # — the linearization point of a weighted fit must sit where the weighted
+    # mass lives, not at the unweighted mean (#2125). The tangent GAM below is
+    # handed the same column name, so both use identical weights.
+    np = _np()
+    base_weights = None
+    if weights is not None:
+        if weights not in columns:
+            raise ValueError(
+                f"response geometry weights column missing from data: {weights!r}"
+            )
+        base_weights = np.asarray(columns[weights], dtype=float)
     tangent, base, resolved_coordinates = geometry_log_map(
         y,
         geometry=geometry_for_maps,
         coordinates=coordinates,
         reference=reference,
+        weights=base_weights,
     )
     rhs = _formula_rhs(formula)
     kwargs = {

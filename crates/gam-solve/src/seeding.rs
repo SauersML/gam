@@ -1,5 +1,5 @@
 use ndarray::Array1;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub use gam_problem::{SeedConfig, SeedRiskProfile};
 use gam_problem::{clamp_seed_rho_to_bounds, normalize_seed_bounds};
@@ -527,6 +527,35 @@ where
         out
     };
 
+    // Memoize the criterion-ranked probes. The grid is a coordinate-descent
+    // basin search: its isotropic sweep, per-axis refinement, saturation
+    // corners, and re-anchored sweeps all draw candidates from ONE bounded,
+    // exactly-reconstructed set (base ± fixed shifts, clamped to `bnds`), so the
+    // SAME ρ recurs across sweeps and anchors — e.g. once the per-axis anchor
+    // stabilises, every subsequent sweep re-probes the identical per-axis
+    // targets. Each probe is a full-n `eval_cost` (an inner P-IRLS solve); the
+    // outer-eval LRU does not span a sweep and the value-only prepass never even
+    // populates it, so those repeats were paid in full. `eval_cost` is a pure
+    // function of ρ, so caching its result keyed on the exact ρ bit-pattern is
+    // BIT-IDENTICAL to re-evaluating — the adopted seed (and hence the fit) is
+    // byte-for-byte unchanged; only the redundant re-solves are elided. This was
+    // ~9 of ~32 prepass solves on the #1575 binomial/logit repro.
+    let mut memo: HashMap<Vec<u64>, Option<f64>> = HashMap::new();
+    let mut eval_cost = |rho: &Array1<f64>| -> Option<f64> {
+        // Canonicalise ±0.0 to a single key (they score identically) so the
+        // clamp's occasional signed zero cannot split an entry.
+        let key: Vec<u64> = rho
+            .iter()
+            .map(|v| if *v == 0.0 { 0.0_f64.to_bits() } else { v.to_bits() })
+            .collect();
+        if let Some(cached) = memo.get(&key) {
+            return *cached;
+        }
+        let value = eval_cost(rho);
+        memo.insert(key, value);
+        value
+    };
+
     let baseline_seed = clamp_vec(rho_seed);
     let baseline_cost = eval_cost(&baseline_seed);
     log::info!(
@@ -806,6 +835,48 @@ mod tests {
             vec![9.0, 0.0],
             "repeat-sweep coordinate descent must reach the multi-step \
              asymmetric interior optimum [9, 0]; a single pass stalls at [6, 0]",
+        );
+    }
+
+    #[test]
+    fn objective_grid_memoizes_repeated_probes_bit_identical_1575() {
+        // #1575: the coordinate-descent grid re-draws its candidates from ONE
+        // bounded, exactly-reconstructed set (base ± fixed shifts clamped to the
+        // bounds), so the SAME ρ recurs across sweeps and re-anchors — each a
+        // full-n inner P-IRLS solve when it hits `eval_cost`. The grid memoizes
+        // on the exact ρ bit-pattern, so every distinct ρ is scored at most once
+        // and the result is byte-identical to re-evaluating (deterministic cost).
+        //
+        // Reuse the #1266 repeat-sweep scenario — precisely where the duplicate
+        // probes arise (the anchor stabilises and later sweeps re-probe the same
+        // per-axis targets) — and assert BOTH invariants: the adopted optimum is
+        // unchanged AND no ρ is ever handed to `eval_cost` twice. If the memo is
+        // removed, `duplicate_hits` climbs above zero and this fails loudly.
+        let base = Array1::zeros(2);
+        let mut seen: Vec<Vec<u64>> = Vec::new();
+        let mut duplicate_hits = 0usize;
+        let selected =
+            select_objective_seed_on_log_lambda_grid(&base, (-12.0, 12.0), 2, &[], |rho| {
+                let key: Vec<u64> = rho
+                    .iter()
+                    .map(|v| if *v == 0.0 { 0.0_f64.to_bits() } else { v.to_bits() })
+                    .collect();
+                if seen.contains(&key) {
+                    duplicate_hits += 1;
+                }
+                seen.push(key);
+                Some((rho[0] - 9.0).powi(2) + rho[1].powi(2))
+            });
+        assert_eq!(
+            selected.to_vec(),
+            vec![9.0, 0.0],
+            "memoized grid must reach the SAME #1266 optimum [9, 0] as the \
+             un-memoized coordinate descent (bit-identical seed selection)",
+        );
+        assert_eq!(
+            duplicate_hits, 0,
+            "the grid must never re-evaluate an already-scored ρ; saw \
+             {duplicate_hits} redundant full-cost probe(s) — the memo regressed (#1575)",
         );
     }
 

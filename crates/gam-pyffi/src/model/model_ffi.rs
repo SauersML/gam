@@ -1263,7 +1263,15 @@ fn bayes_factor_log_diff(model_a_bytes: Vec<u8>, model_b_bytes: Vec<u8>) -> PyRe
     // through the shared convention so this agrees with `compare_reml_fits`
     // (issue #575: the raw subtraction was inverted, reporting overwhelming
     // evidence for the worse-fitting model).
-    Ok(log_bayes_factor(score_a, score_b))
+    //
+    // The ranking score is the conditional AIC (`−2·loglik + 2·edf`), a −2·log /
+    // deviance-scale cost, so its gap is a ΔAIC. The Akaike evidence ratio for an
+    // AIC gap Δ is `exp(−½Δ)` (Burnham & Anderson), so the LOG Bayes factor is
+    // HALF the raw score gap. `Model.bayes_factor_vs` exponentiates this value
+    // directly; returning the un-halved gap made it report `exp(ΔAIC)`, the SQUARE
+    // of the intended ratio (issue #2124). Halve here, at the AIC-scale site, so
+    // no raw-REML consumer is affected.
+    Ok(0.5 * log_bayes_factor(score_a, score_b))
 }
 
 #[pyfunction]

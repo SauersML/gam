@@ -436,18 +436,25 @@ mod jumprelu_hard_gate_tests {
         }
     }
 
-    /// GATE (ii) — LOAD-BEARING value/grad parity. Assembles the SAME JumpReLU
-    /// term two ways: dense full-band (`Some(None)`) and the compact hard-gate
-    /// layout (`Some(Some(layout))`). The compact per-row gradient `gt`, expanded
-    /// back to full-q, must equal the dense gradient to tight tolerance — the
-    /// retained atoms (hard-gated AND the near-threshold gated-off atom, whose
-    /// separable sparsity-prior diagonal `assignment_grad` is the load-bearing
-    /// term) reproduce it EXACTLY, and the dropped deep-band atoms differ only by
-    /// their own (negligible, sub-cutoff) separable contribution. The compact
-    /// block is strictly smaller, and the DEFAULT assembly path (`None`, which
-    /// runs the production `from_jumprelu` wiring in construction.rs) yields the
-    /// same compact dimensions. The objective VALUE is layout-independent by
+    /// GATE (ii) — LOAD-BEARING value/grad parity of the `from_jumprelu`
+    /// separable-gradient layout. Assembles the SAME JumpReLU term two ways: dense
+    /// full-band (`Some(None)`) and the compact `from_jumprelu` layout
+    /// (`Some(Some(layout))`) built from the separable prior gradient. The compact
+    /// per-row gradient `gt`, expanded back to full-q, must equal the dense
+    /// gradient to tight tolerance — the retained atoms (hard-gated AND the
+    /// near-threshold gated-off atom, whose separable sparsity-prior diagonal
+    /// `assignment_grad` is the load-bearing term) reproduce it EXACTLY, and the
+    /// dropped deep-band atoms differ only by their own (negligible, sub-cutoff)
+    /// separable contribution. The objective VALUE is layout-independent by
     /// construction (the loss sums the full band), so value parity is structural.
+    ///
+    /// #1801 — the production DEFAULT path (`None`) is DISTINCT from this
+    /// separable-gradient layout: it sizes the joint block by the HARD FORWARD
+    /// GATE only (data-fit coupling `a_k`, hard-zero for gated-off atoms), so it
+    /// keeps only the hard-gated atoms — strictly SMALLER than the near-threshold-
+    /// retaining `from_jumprelu` block. The per-token cost therefore tracks
+    /// `k_active`, independent of K
+    /// (`sae_streaming_arrow_schur_contract::per_token_block_dim_is_independent_of_k_at_fixed_active`).
     #[test]
     fn jumprelu_compact_gradient_matches_dense_full_band() {
         let n = 3usize;
@@ -541,11 +548,23 @@ mod jumprelu_hard_gate_tests {
                 Some(Some(layout.clone())),
             )
             .unwrap();
-        // DEFAULT path: no override → construction.rs runs the real `from_jumprelu`
-        // wiring. Its compact row dims must match the hand-built layout.
+        // DEFAULT path: no override → construction.rs runs the real production
+        // `ThresholdGate` wiring. #1801 — that wiring sizes the joint block by the
+        // HARD FORWARD GATE only (it scores membership by the data-fit coupling gate
+        // mass `a_k`, hard-zero for every gated-off atom), so the production block
+        // keeps ONLY the hard-gated atoms {0,1} — dropping the near-threshold gated-
+        // off atom 2 that the separable-gradient `from_jumprelu` layout above
+        // retains, and every deep atom. The production per-token cost therefore
+        // tracks `k_active` (the hard-gate count), independent of K.
         let default = term
             .assemble_arrow_schur_inner(target.view(), &rho, None, 1.0, probe, None)
             .unwrap();
+        // Hard-gate reference layout {0,1} (the production block dim).
+        let hard_gate = SaeRowLayout::from_active_atoms(
+            (0..n).map(|_| vec![0usize, 1usize]).collect(),
+            vec![1usize; k],
+            term.assignment.coord_offsets(),
+        );
 
         let q = term.assignment.row_block_dim();
         assert_eq!(dense.rows.len(), n);
@@ -564,11 +583,22 @@ mod jumprelu_hard_gate_tests {
                 dgt.len()
             );
             saw_drop = true;
-            // The production default path reproduces the compact dimensions.
+            // #1801 — the production default path is sized by the HARD FORWARD GATE
+            // {0,1}, strictly SMALLER than the separable-gradient `from_jumprelu`
+            // compact layout {0,1,2}: the near-threshold gated-off atom 2 (a
+            // diagonal-only atom that never data-fit-couples) is dropped from the
+            // joint block.
             assert_eq!(
                 default.rows[row].gt.len(),
-                compact.rows[row].gt.len(),
-                "row {row}: default (production) path must match the compact layout"
+                hard_gate.row_q_active(row),
+                "row {row}: default (production) path must be sized by the hard forward gate"
+            );
+            assert!(
+                default.rows[row].gt.len() < compact.rows[row].gt.len(),
+                "row {row}: production hard-gate block ({}) must be smaller than the \
+                 near-threshold-retaining from_jumprelu block ({})",
+                default.rows[row].gt.len(),
+                compact.rows[row].gt.len()
             );
             // Expand the compact gradient to full-q and compare to dense.
             let compact_gt: Vec<f64> = compact.rows[row].gt.iter().copied().collect();

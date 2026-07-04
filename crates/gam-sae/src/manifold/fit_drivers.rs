@@ -4867,6 +4867,17 @@ impl SaeManifoldTerm {
         // assembled at the schedule's current temperature, which the caller
         // already baked into `self.assignment.mode` before materializing.
         term.temperature_schedule = self.temperature_schedule.clone();
+        // #1801 — when a streaming fit has frozen the collapse-prevention gates
+        // GLOBALLY (from the full resident routing), carry them onto the chunk and
+        // mark it so its assembly SKIPS the per-chunk gate refresh. This is the
+        // gate analogue of the decoder-frame carry above: the gates' per-pair
+        // strength `μ_jk` inverts near-singular small-minibatch design Grams, so a
+        // per-chunk refresh would make the fit `chunk_size`-dependent.
+        if self.streaming_gates_frozen {
+            term.decoder_repulsion_gate = self.decoder_repulsion_gate.clone();
+            term.barrier_coactivation_gate = self.barrier_coactivation_gate.clone();
+            term.streaming_gates_frozen = true;
+        }
         Ok(term)
     }
 
@@ -4979,6 +4990,18 @@ impl SaeManifoldTerm {
         };
         for _ in 0..max_iter {
             self.advance_temperature_schedule()?;
+            // #1801 — FREEZE the collapse-prevention gates ONCE per outer iteration
+            // from the FULL resident routing + current decoder, then arm the carry
+            // flag so every chunk materialized this iteration (assembly pass, line
+            // search, loss) inherits the SAME global gate instead of recomputing it
+            // from its own minibatch. A per-chunk refresh inverts the near-singular
+            // small-chunk coactivation-weighted design Grams, blowing up the barrier
+            // strength `μ_jk = γ/(1−γ)` and making the fit `chunk_size`-dependent.
+            // Frozen at the same (post-temperature) point the dense assembly would,
+            // so the streaming gate matches the full-batch gate. Reset after the loop.
+            self.refresh_decoder_repulsion_gate();
+            self.refresh_barrier_coactivation_gate();
+            self.streaming_gates_frozen = true;
             // ── Pass 1: accumulate the global reduced Schur over β online. ──
             let options = ArrowSolveOptions::automatic(border_dim)
                 .with_schur_pd_floor(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR);
@@ -5132,6 +5155,9 @@ impl SaeManifoldTerm {
                 }
             }
         }
+        // #1801 — disarm the streaming gate-freeze so any later assembly of `self`
+        // (e.g. a post-fit dense pass) refreshes its gates normally.
+        self.streaming_gates_frozen = false;
         Ok(last_loss)
     }
 
