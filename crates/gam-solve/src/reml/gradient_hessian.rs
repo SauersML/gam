@@ -8354,11 +8354,13 @@ mod firth_hessian_direction_reuse_tests {
         for _ in 0..reps {
             for idx in 0..k {
                 let eta_total = x_vks[idx].mapv(|value| -value);
-                let _ = RemlState::tk_direct_gradient_from_cd_and_design(
-                    &x_dense, &z, &c_array, &d_array, &e_array, &eta_total, None, &shared,
-                    &mut gram, true,
-                )
-                .expect("per-direction direct");
+                std::hint::black_box(
+                    RemlState::tk_direct_gradient_from_cd_and_design(
+                        &x_dense, &z, &c_array, &d_array, &e_array, &eta_total, None, &shared,
+                        &mut gram, true,
+                    )
+                    .expect("per-direction direct"),
+                );
             }
         }
         let dt_ref = t_ref.elapsed().as_secs_f64();
@@ -8366,10 +8368,12 @@ mod firth_hessian_direction_reuse_tests {
         // Time the batched (#1575) path.
         let t_bat = std::time::Instant::now();
         for _ in 0..reps {
-            let _ = RemlState::tk_direct_gradient_canonical_batched(
-                &x_dense, &z, &c_array, &d_array, &e_array, &x_vks, k, &shared, &mut gram,
-            )
-            .expect("batched direct");
+            std::hint::black_box(
+                RemlState::tk_direct_gradient_canonical_batched(
+                    &x_dense, &z, &c_array, &d_array, &e_array, &x_vks, k, &shared, &mut gram,
+                )
+                .expect("batched direct"),
+            );
         }
         let dt_bat = t_bat.elapsed().as_secs_f64();
 
