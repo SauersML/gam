@@ -4169,6 +4169,106 @@ pub(crate) fn joint_newton_budget_exhaustion_refuses_coupled_exact_inner() {
     );
 }
 
+/// gam#1794 regression. The original report described a fit-level *wall-clock*
+/// deadline that bounded a non-converging marginal-slope inner solve, claiming
+/// it was armed only on the survival marginal-slope entry point and not on the
+/// bernoulli/flex (BMS) marginal-slope path, so a stalled BMS/flex inner
+/// joint-Newton spun unbounded until the harness killed it (TIMEOUT).
+///
+/// Since then, gam#2055 removed EVERY wall-clock time budget from the solver
+/// (a wall clock is non-deterministic and machine-dependent, so it violates
+/// the reproducibility SPEC). Both marginal-slope families now route their
+/// coupled exact-joint inner solve through the SAME `inner_blockwise_fit`
+/// loop, which is bounded DETERMINISTICALLY by the inner cycle budget
+/// (`inner_loop_hard_ceiling = inner_max_cycles.max(200)`) plus the
+/// deterministic stall early-exit guards (gam#979 / #1040 / #1088). There is
+/// no per-family wall-clock arming site left to be asymmetric about
+/// (`grep -rn "OUTER_WALL_CLOCK_DEADLINE\|budget_secs\|unwrap_or(300"
+/// crates/` returns no hits; `outer_wall_clock_deadline_exceeded()` is an
+/// inert `false` shim).
+///
+/// This test pins the invariant that actually protects against #1794's
+/// unbounded-spin symptom on the BMS/flex-shaped path: a coupled exact-joint
+/// inner solve whose gradient never reaches KKT — the never-converging
+/// marginal-slope stall — is bounded by the FULL PRODUCTION cycle ceiling
+/// (`DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES`, the scale of the reported
+/// overrun) and RETURNS a finite, catchable, non-converged mode for outer-ρ
+/// rejection instead of spinning to a harness kill. The large budget proves
+/// the bound does not depend on a small `inner_max_cycles`; if the deterministic
+/// ceiling were removed this test would hang instead of returning.
+#[test]
+pub(crate) fn bms_flex_marginal_slope_coupled_exact_inner_stall_is_deterministically_bounded_gam1794()
+{
+    let spec0 = ParameterBlockSpec {
+        name: "block0".to_string(),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        offset: array![0.0],
+        penalties: vec![],
+        nullspace_dims: vec![],
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: Some(array![0.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let spec1 = ParameterBlockSpec {
+        name: "block1".to_string(),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        offset: array![0.0],
+        penalties: vec![],
+        nullspace_dims: vec![],
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: Some(array![0.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    // The PRODUCTION ceiling — the scale of the reported #1794 overrun. The
+    // deterministic bound must hold here regardless of how large the budget is;
+    // a wall-clock arming asymmetry (the stale premise) or a removed ceiling
+    // would let this stall spin without returning.
+    let options = BlockwiseFitOptions {
+        inner_max_cycles: DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES,
+        inner_tol: 1e-12,
+        ridge_floor: CUSTOM_FAMILY_RIDGE_FLOOR,
+        ..BlockwiseFitOptions::default()
+    };
+    let per_block = vec![Array1::zeros(0), Array1::zeros(0)];
+
+    // The same coupled exact-joint stall as the neighbouring one-cycle test,
+    // but driven at the production ceiling. It MUST return (not hang) with a
+    // bounded, non-converged mode so the outer optimizer can reject this ρ.
+    let result = inner_blockwise_fit(
+        &TwoBlockPersistentGradientFamily,
+        &[spec0, spec1],
+        &per_block,
+        &options,
+        None,
+    )
+    .expect(
+        "a stalled coupled-exact marginal-slope inner solve must return a non-converged \
+         mode, not spin to a harness kill",
+    );
+    assert!(
+        !result.converged,
+        "a never-KKT coupled-exact inner stall must be reported non-converged so the \
+         outer optimizer rejects this ρ"
+    );
+    assert!(
+        result.cycles >= 1 && result.cycles <= DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES,
+        "the inner solve must be bounded by the deterministic cycle ceiling \
+         (gam#1794/#2055): observed cycles={} must lie in 1..={}",
+        result.cycles,
+        DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES,
+    );
+    assert!(
+        result.kkt_residual.is_none(),
+        "a non-converged inner mode carries no KKT certificate for the outer IFT correction"
+    );
+}
+
 /// gam#1088 regression. A `NaN` in the joint Hessian curvature makes
 /// `H_pen = H + S(λ)` and its spectrum degenerate, so the KKT certificate
 /// can never be issued. Without the non-finite-curvature guard the coupled
