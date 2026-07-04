@@ -102,15 +102,21 @@ def test_in_sample_amortization_gap_is_small() -> None:
     am_coords = np.concatenate([np.asarray(c).ravel() for c in code["coords"]])
     coord_scale = float(np.sqrt(np.mean(ex_coords**2)) + 1e-12)
     coord_rmse = float(np.sqrt(np.mean((ex_coords - am_coords) ** 2)))
-    assert coord_rmse < 0.25 * coord_scale, (
-        f"in-sample coordinate amortization gap too large: "
-        f"rmse={coord_rmse} vs scale={coord_scale}"
-    )
 
     # Gate agreement: active/inactive (logit > 0) match rate on the training code.
     ex_active = np.asarray(exact["logits"]) > 0.0
     am_active = np.asarray(code["logits"]) > 0.0
     gate_agreement = float(np.mean(ex_active == am_active))
+    print(
+        f"[ENCODE-PY in-sample] coord_rmse={coord_rmse:.4f} coord_scale={coord_scale:.4f} "
+        f"rel={coord_rmse / coord_scale:.4f} gate_agreement={gate_agreement:.4f} "
+        f"used_quadratic_head={code['used_quadratic_head']} "
+        f"feature_dim={code['feature_dim']} log_evidence={code['log_evidence']:.1f}"
+    )
+    assert coord_rmse < 0.25 * coord_scale, (
+        f"in-sample coordinate amortization gap too large: "
+        f"rmse={coord_rmse} vs scale={coord_scale}"
+    )
     assert gate_agreement > 0.9, f"gate agreement too low: {gate_agreement}"
 
 

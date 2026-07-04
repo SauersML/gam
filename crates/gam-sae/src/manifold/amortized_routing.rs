@@ -426,6 +426,20 @@ mod amortized_encoder_glue_tests {
 
         let ev_exact = gap.ev_exact.expect("exact EV defined");
         let ev_amortized = gap.ev_amortized.expect("amortized EV defined");
+        eprintln!(
+            "[ENCODE-GAP] EV_exact={:.4} EV_amortized={:.4} EV_gap={:.4} \
+             coord_rmse={:.4} gate_agreement={:.4} amp_rmse={:.4} \
+             joint_multistart_frac={:.4} used_quadratic_head={} log_evidence={:.1}",
+            ev_exact,
+            ev_amortized,
+            gap.ev_gap.unwrap_or(f64::NAN),
+            gap.errors.coord_rmse,
+            gap.errors.gate_agreement,
+            gap.errors.amplitude_rmse,
+            gap.joint_multistart_fraction,
+            gap.used_quadratic_head,
+            gap.encoder_log_evidence,
+        );
         // The exact reconstruction is faithful by construction (self-consistent).
         assert!(
             ev_exact > 0.99,
