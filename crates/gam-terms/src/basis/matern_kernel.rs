@@ -1,5 +1,18 @@
 use super::*;
 
+/// Raise a requested center count to the canonical-TPS feasibility floor.
+///
+/// Canonical thin-plate needs `num_centers >= M(d) = poly_cols`: the
+/// polynomial-nullspace constraint `T_c^T α = 0` (with `T_c` the `k×M`
+/// polynomial evaluated at the `k` centers) leaves a well-posed RKHS solution
+/// space only when there are at least `M` centers. That is a FLOOR, so the
+/// correct guarantee is `max(k, M)` — NOT `k + M`. Adding `M` unconditionally
+/// inflated every request past what the user asked for (violating the
+/// documented "num_centers is the exact number of centers" contract on
+/// [`CenterStrategy`]) and, in high dimension where `M(d)` explodes (M(16) =
+/// 735_471), ballooned the request far past the sample size. A request that
+/// already meets the floor (`k >= M`) is returned unchanged, so the selected
+/// center set is exactly the `k` the caller asked for.
 fn thin_plate_augmented_center_strategy(
     strategy: &CenterStrategy,
     poly_cols: usize,
@@ -9,21 +22,21 @@ fn thin_plate_augmented_center_strategy(
             thin_plate_augmented_center_strategy(inner.as_ref(), poly_cols),
         )),
         CenterStrategy::EqualMass { num_centers } => CenterStrategy::EqualMass {
-            num_centers: num_centers.saturating_add(poly_cols),
+            num_centers: (*num_centers).max(poly_cols),
         },
         CenterStrategy::EqualMassCovarRepresentative { num_centers } => {
             CenterStrategy::EqualMassCovarRepresentative {
-                num_centers: num_centers.saturating_add(poly_cols),
+                num_centers: (*num_centers).max(poly_cols),
             }
         }
         CenterStrategy::FarthestPoint { num_centers } => CenterStrategy::FarthestPoint {
-            num_centers: num_centers.saturating_add(poly_cols),
+            num_centers: (*num_centers).max(poly_cols),
         },
         CenterStrategy::KMeans {
             num_centers,
             max_iter,
         } => CenterStrategy::KMeans {
-            num_centers: num_centers.saturating_add(poly_cols),
+            num_centers: (*num_centers).max(poly_cols),
             max_iter: *max_iter,
         },
         CenterStrategy::UniformGrid { points_per_dim } => CenterStrategy::UniformGrid {
@@ -48,18 +61,20 @@ pub fn build_thin_plate_basiswithworkspace(
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
     let poly_cols = thin_plate_polynomial_basis_dimension(data.ncols());
-    // Canonical TPS reserves `poly_cols = M(d)` extra centers for the
-    // polynomial nullspace on top of the requested knot count (see
-    // `thin_plate_augmented_center_strategy`). In high dimension M(d) explodes
-    // (M(16) = 735_471) and the augmented request dwarfs the sample size, so
-    // asking `select_centers_by_strategy` for `k + M(d)` centers hard-errors
-    // ("requested N centers but data has n rows") and used to fail the whole
-    // fit before the hybrid-Duchon fallback below could engage. Decide up front
-    // whether the augmented canonical request even fits in the data: if it does,
-    // augment and build canonical TPS; if not, canonical TPS is infeasible here,
-    // so select the UN-augmented knots (the fit stays at the user's requested
-    // resolution rather than ballooning to `n` centers) and let the
-    // infeasibility gate below delegate to the hybrid Duchon generalization.
+    // Canonical TPS needs at least `poly_cols = M(d)` centers for the
+    // polynomial-nullspace constraint to stay well-posed. `thin_plate_augmented_
+    // center_strategy` raises the request to that FLOOR (`max(k, M(d))`), so a
+    // caller who already asked for `k >= M(d)` centers gets exactly `k` — the
+    // count the metadata is contracted to report. In high dimension M(d)
+    // explodes (M(16) = 735_471) and the floor alone dwarfs the sample size, so
+    // asking `select_centers_by_strategy` for that many centers hard-errors
+    // ("requested N centers but data has n rows") and would fail the whole fit
+    // before the hybrid-Duchon fallback below could engage. Decide up front
+    // whether the floored canonical request even fits in the data: if it does,
+    // build canonical TPS at that resolution; if not, canonical TPS is
+    // infeasible here, so select the UN-floored knots (the fit stays at the
+    // user's requested resolution rather than ballooning to `n` centers) and let
+    // the infeasibility gate below delegate to the hybrid Duchon generalization.
     let augmented_strategy = thin_plate_augmented_center_strategy(&spec.center_strategy, poly_cols);
     let augmented_fits_in_data = center_strategy_num_centers(&augmented_strategy)
         .map(|augmented_count| augmented_count <= data.nrows())
