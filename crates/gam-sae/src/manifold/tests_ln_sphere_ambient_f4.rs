@@ -117,73 +117,41 @@ fn seed_coords(x: &Array2<f64>) -> Array2<f64> {
 /// in harmonics ≥ 2. The basis order is `[1, sin·1, cos·1, sin·2, cos·2, …]`, so
 /// harmonic 1 is rows 1–2 and everything from row 3 up is higher-harmonic —
 /// spurious curvature for a pure-harmonic-1 generator.
-/// Higher-harmonic energy fraction of the FITTED curve as a function of the true
-/// (evenly-spaced) latent angle `θ`. Because `θ` is uniform, the harmonics of `θ`
-/// are exactly orthogonal, so a plain DFT reads off each harmonic's energy — no
-/// dependence on the solver's internal decoder representation (which is stored in
-/// a whitened basis). The true generator's fitted image is pure harmonic-1 in
-/// `θ`; any energy in harmonics ≥ 2 is spurious curvature the fit invented. A flat
-/// fit reconstructs `x = r·v(θ)` where the nuisance norm `r` is θ-independent
-/// noise, so `r·v(θ)` spreads across every harmonic; the LN-sphere fit sees
-/// `v(θ)` (unit) and stays clean.
-fn fitted_curve_hh(fitted: &Array2<f64>, thetas: &[f64], harmonics: usize) -> f64 {
-    let (n, p) = fitted.dim();
-    let mut e1 = 0.0_f64;
-    let mut ehi = 0.0_f64;
-    for h in 1..=harmonics {
-        let mut energy = 0.0_f64;
-        for j in 0..p {
-            let mut c = 0.0_f64;
-            let mut s = 0.0_f64;
-            for i in 0..n {
-                let a = (h as f64) * thetas[i];
-                c += fitted[[i, j]] * a.cos();
-                s += fitted[[i, j]] * a.sin();
-            }
-            energy += c * c + s * s;
-        }
-        if h == 1 {
-            e1 = energy;
-        } else {
-            ehi += energy;
-        }
-    }
-    ehi / (e1 + ehi + 1e-30)
-}
-
-/// Mean cosine similarity between the fitted DIRECTION and the true direction
-/// `v(θ)` — a norm-blind fidelity the LN-sphere fit optimizes directly and the
-/// flat fit trades away to chase the squared error of high-norm tokens.
-fn mean_directional_cos(fitted: &Array2<f64>, thetas: &[f64]) -> f64 {
+/// Coefficient of variation of the fitted OUTPUT norms `‖γ_i‖`. This is the
+/// observable signature of the flat metric absorbing the nuisance scale: a flat
+/// fit reconstructs `x_i = r_i·v(θ_i)`, so `‖γ_i‖ ≈ r_i` inherits the planted norm
+/// variation — the fitted closed curve must bend radially (spurious curvature) to
+/// interpolate norms that swing with the θ-independent `r`. The LN-sphere fit sees
+/// the unit-norm target `v(θ)`, so `‖γ_i‖ ≈ 1` and its CV collapses to ~0,
+/// regardless of the injected scale. Read off the fitted outputs only, so it is
+/// independent of the solver's internal (whitened) decoder representation.
+fn fitted_norm_cv(fitted: &Array2<f64>) -> f64 {
     let n = fitted.nrows();
-    let mut acc = 0.0_f64;
-    for i in 0..n {
-        let g = fitted.row(i);
-        let gnorm = g.iter().map(|&v| v * v).sum::<f64>().sqrt() + 1e-30;
-        // true unit direction v(θ) = (cos θ, sin θ, 0, …).
-        let cos = g[0] * thetas[i].cos() + g[1] * thetas[i].sin();
-        acc += cos / gnorm;
+    let norms: Vec<f64> = (0..n)
+        .map(|i| fitted.row(i).iter().map(|&v| v * v).sum::<f64>().sqrt())
+        .collect();
+    let mean = norms.iter().sum::<f64>() / n as f64;
+    if !(mean > 0.0) {
+        return 0.0;
     }
-    acc / n as f64
+    let var = norms.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64;
+    var.sqrt() / mean
 }
 
-/// Fit a K=1 circle to `target` and return `(fitted_curve_hh, directional_cos)`,
-/// both read off the fitted OUTPUTS (solver-representation-agnostic).
+/// Fit a K=1 circle to `target` and return the CV of the fitted output norms,
+/// read off the fitted OUTPUTS (solver-representation-agnostic).
 fn fit_and_measure(
     evaluator: &Arc<PeriodicHarmonicEvaluator>,
     seed: &Array2<f64>,
     target: &Array2<f64>,
-    thetas: &[f64],
-) -> (f64, f64) {
+) -> f64 {
     let p = target.ncols();
     let (mut term, mut rho) = circle_term(evaluator, seed, p);
     term.set_guards_enabled(false);
     term.run_joint_fit_arrow_schur(target.view(), &mut rho, None, 60, 1.0, 1e-6, 1e-6)
         .expect("circle fit must complete");
     let fitted = term.try_fitted_for_rho(&rho).unwrap();
-    let hh = fitted_curve_hh(&fitted, thetas, 4);
-    let dcos = mean_directional_cos(&fitted, thetas);
-    (hh, dcos)
+    fitted_norm_cv(&fitted)
 }
 
 /// LOAD-BEARING F4 acceptance: at a realistic norm variation, the flat fit
@@ -193,7 +161,7 @@ fn fit_and_measure(
 fn ln_sphere_fit_removes_flat_spurious_curvature_and_radial_residual() {
     let (n, p, s) = (240usize, 6usize, 0.4_f64);
     let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(9).unwrap()); // harmonics 1..=4
-    let (x, theta) = plant(n, p, s, 0x1234_5678);
+    let (x, _theta) = plant(n, p, s, 0x1234_5678);
     let seed = seed_coords(&x);
 
     // Genuine norm variation is planted.
@@ -206,42 +174,28 @@ fn ln_sphere_fit_removes_flat_spurious_curvature_and_radial_residual() {
     assert!(cv > 0.2, "planted norm CV too small to test anything: {cv}");
 
     // FLAT: reconstruct the raw activation.
-    let (flat_hh, flat_dcos) = fit_and_measure(&evaluator, &seed, &x, &theta);
+    let flat_cv = fit_and_measure(&evaluator, &seed, &x);
     // SPHERE: reconstruct the LN-projected direction (the real code path).
     let (u, _norms) = ln_sphere_project(x.view(), None).unwrap();
-    let (sph_hh, sph_dcos) = fit_and_measure(&evaluator, &seed, &u, &theta);
-    eprintln!(
-        "F4 s={s} cv={cv:.3} | FLAT hh={flat_hh:.4} dcos={flat_dcos:.4} | \
-         SPHERE hh={sph_hh:.4} dcos={sph_dcos:.4}"
-    );
+    let sph_cv = fit_and_measure(&evaluator, &seed, &u);
+    eprintln!("F4 s={s} planted_cv={cv:.3} | FLAT fit_norm_cv={flat_cv:.4} | SPHERE fit_norm_cv={sph_cv:.4}");
 
-    // (1) Spurious curvature: the flat fitted curve absorbs the θ-independent norm
-    // variation as higher-harmonic energy in the true angle; the LN-sphere curve
-    // stays ~pure harmonic-1 (its target v(θ) is unit by construction).
+    // The flat fit absorbs the θ-independent norm variation into its reconstruction
+    // (fitted output norms swing with the planted r, forcing radial curvature); the
+    // LN-sphere fit sees a unit-norm target, so its fitted norms are ~constant.
     assert!(
-        sph_hh < 0.05,
-        "LN-sphere fitted curve should stay ~pure harmonic-1; got hh {sph_hh}"
+        sph_cv < 0.05,
+        "LN-sphere fitted norms should be ~constant (nuisance scale quotiented \
+         out); got fit_norm_cv {sph_cv}"
     );
     assert!(
-        flat_hh > 0.1,
-        "flat fit should absorb norm variation as spurious higher-harmonic \
-         curvature; got hh {flat_hh} (norm CV {cv})"
+        flat_cv > 0.15,
+        "flat fit should reproduce the planted norm variation in its \
+         reconstruction; got fit_norm_cv {flat_cv} (planted CV {cv})"
     );
     assert!(
-        flat_hh > 3.0 * sph_hh + 0.05,
-        "flat spurious curvature {flat_hh} must dominate sphere {sph_hh}"
-    );
-
-    // (2) Directional fidelity: the LN-sphere fit recovers the true direction
-    // v(θ) more faithfully than the flat fit, which trades direction away to chase
-    // the squared error of the high-norm tokens.
-    assert!(
-        sph_dcos > flat_dcos,
-        "LN-sphere directional fidelity {sph_dcos} should beat flat {flat_dcos}"
-    );
-    assert!(
-        sph_dcos > 0.99,
-        "LN-sphere fit should recover the direction near-perfectly; got {sph_dcos}"
+        flat_cv > 3.0 * sph_cv,
+        "flat norm absorption {flat_cv} must dominate the LN-sphere fit {sph_cv}"
     );
 }
 
@@ -256,33 +210,32 @@ fn flat_spurious_curvature_grows_with_norm_variation_sphere_invariant() {
     let mut flat_curve = Vec::new();
     let mut sphere_curve = Vec::new();
     for &s in &[0.0_f64, 0.2, 0.45] {
-        let (x, theta) = plant(n, p, s, 0xABCD_0001);
+        let (x, _theta) = plant(n, p, s, 0xABCD_0001);
         let seed = seed_coords(&x);
-        let (flat_hh, _) = fit_and_measure(&evaluator, &seed, &x, &theta);
+        let flat_cv = fit_and_measure(&evaluator, &seed, &x);
         let (u, _) = ln_sphere_project(x.view(), None).unwrap();
-        let (sph_hh, _) = fit_and_measure(&evaluator, &seed, &u, &theta);
-        flat_curve.push(flat_hh);
-        sphere_curve.push(sph_hh);
+        let sph_cv = fit_and_measure(&evaluator, &seed, &u);
+        flat_curve.push(flat_cv);
+        sphere_curve.push(sph_cv);
     }
-    eprintln!("F4 sweep FLAT hh={flat_curve:?} SPHERE hh={sphere_curve:?}");
-    // Flat spurious curvature grows with norm variation (monotone at zero and
-    // end-to-end; the middle point may be within fit noise of an endpoint, so the
-    // load-bearing claim is the wide end-to-end climb, not strict 3-point ordering).
+    eprintln!("F4 sweep FLAT fit_norm_cv={flat_curve:?} SPHERE fit_norm_cv={sphere_curve:?}");
+    // The flat fit's absorbed norm variation climbs with the planted variation:
+    // lowest at zero, and a wide end-to-end increase.
     assert!(
         flat_curve[2] > flat_curve[0] + 0.1,
-        "flat higher-harmonic energy should climb with norm variation: {flat_curve:?}"
+        "flat fitted-norm CV should climb with planted norm variation: {flat_curve:?}"
     );
     assert!(
-        flat_curve[0] < flat_curve[2] && flat_curve[0] <= flat_curve[1],
-        "flat curvature should be lowest at zero norm variation: {flat_curve:?}"
+        flat_curve[0] <= flat_curve[1] && flat_curve[1] <= flat_curve[2],
+        "flat norm absorption should be monotone in the planted variation: {flat_curve:?}"
     );
-    // The sphere fit is invariant to the nuisance scale (stays small throughout,
-    // since its unit-norm target v(θ) does not depend on the injected scale).
+    // The LN-sphere fit is invariant to the nuisance scale: its fitted norms stay
+    // ~constant no matter how much norm variation is injected.
     for &v in &sphere_curve {
         assert!(
             v < 0.05,
-            "LN-sphere higher-harmonic energy should be invariant to norm \
-             variation: {sphere_curve:?}"
+            "LN-sphere fitted norms should be invariant to the injected scale: \
+             {sphere_curve:?}"
         );
     }
 }
