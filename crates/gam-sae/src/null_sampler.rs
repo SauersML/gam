@@ -445,23 +445,27 @@ mod tests {
         );
 
         // (b) Planted block: atoms {0,1,2,3} co-fire together far above the
-        // mechanical rate. On half the rows the block is forced on together and the
-        // rest of k is filled randomly; the other half is pure noise.
+        // mechanical rate. On the even rows the block is forced on together and the
+        // rest of k is filled from the NON-block atoms; the odd rows draw all k
+        // from the non-block atoms only. So the block atoms fire exactly on the even
+        // rows and always together — a genuine above-margin coupling the
+        // fixed-margin null cannot reproduce (it can, and on average does, separate
+        // two columns of equal margin), while the non-block atoms are top-k noise.
         let mut planted = SparseAtomCodes::empty(n, g);
         let block = [0usize, 1, 2, 3];
+        let mut non_block: Vec<usize> = (block.len()..g).collect();
         for row in 0..n {
             if row % 2 == 0 {
                 for &a in &block {
                     planted.row_mut(row).assign(a, 1.0);
                 }
-                let mut rest: Vec<usize> = (4..g).collect();
-                rest.shuffle(&mut rng);
-                for &a in &rest[..(k - block.len())] {
+                non_block.shuffle(&mut rng);
+                for &a in &non_block[..(k - block.len())] {
                     planted.row_mut(row).assign(a, 1.0);
                 }
             } else {
-                atoms.shuffle(&mut rng);
-                for &a in &atoms[..k] {
+                non_block.shuffle(&mut rng);
+                for &a in &non_block[..k] {
                     planted.row_mut(row).assign(a, 1.0);
                 }
             }
