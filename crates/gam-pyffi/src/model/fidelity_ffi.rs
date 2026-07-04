@@ -1,11 +1,11 @@
-//! FFI shims for the model-currency fidelity metric core (scorecard axis 1).
-//!
-//! Thin `#[pyfunction]` wrappers over `gam_math::fidelity_metrics` (the single
-//! source of truth) — no math lives here. Matrices arrive row-major flat with
-//! explicit shapes, exactly as `gamfit/_fidelity_metrics.py` sends them; that
-//! Python module auto-detects `fidelity_loss_recovered` and switches its numpy
-//! fallback to these kernels, and `tests/metrics/test_fidelity_metrics_parity.py`
-//! then pins the two paths to double precision.
+// FFI shims for the model-currency fidelity metric core (scorecard axis 1).
+//
+// Thin `#[pyfunction]` wrappers over `gam_math::fidelity_metrics` (the single
+// source of truth) — no math lives here. Matrices arrive row-major flat with
+// explicit shapes, exactly as `gamfit/_fidelity_metrics.py` sends them; that
+// Python module auto-detects `fidelity_loss_recovered` and switches its numpy
+// fallback to these kernels, and `tests/metrics/test_fidelity_metrics_parity.py`
+// then pins the two paths to double precision.
 
 use gam_math::fidelity_metrics;
 
