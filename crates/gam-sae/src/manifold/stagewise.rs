@@ -3131,13 +3131,23 @@ mod tests {
             "disjoint birth B must fit IDENTICALLY against R0 (batched) and R1 (serial); \
              decoder L1 diff {decoder_diff}"
         );
-        // The evidence charge is likewise identical (same fit, same support).
+        // The per-birth EVIDENCE CHARGE is B's MARGINAL joint-evidence delta over
+        // the state it is born into — batched charges `evidence(seed+B) −
+        // evidence(seed)`, serial charges `evidence(seed+A+B) − evidence(seed+A)`.
+        // For disjoint A,B the joint Hessian is block-diagonal, so B's marginal is
+        // invariant to whether A is already present: the two charges must match.
+        let mut seed_m = seed.clone();
+        let (reml_seed, _) =
+            frozen_joint_evidence(&mut seed_m, target.view(), &rho, None, &config).unwrap();
+        let mut term_a_m = term_a.clone();
+        let (reml_term_a, _) =
+            frozen_joint_evidence(&mut term_a_m, target.view(), &rho_a, None, &config).unwrap();
+        let charge_batched = b_batched.reml - reml_seed;
+        let charge_serial = b_serial.reml - reml_term_a;
         assert!(
-            (b_batched.reml - b_serial.reml).abs() < 1e-6,
-            "disjoint birth B joint-evidence charge must match batched vs serial; \
-             {} vs {}",
-            b_batched.reml,
-            b_serial.reml
+            (charge_batched - charge_serial).abs() < 1e-4,
+            "disjoint birth B marginal evidence charge must match batched vs serial; \
+             {charge_batched} vs {charge_serial}"
         );
     }
 
@@ -3156,26 +3166,35 @@ mod tests {
         let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
         let coords = Array2::<f64>::from_shape_fn((n, 1), |(r, _)| r as f64 / n as f64);
 
-        // Target: quarter c is a clean circle in ambient plane (2c, 2c+1).
-        let mut target = Array2::<f64>::zeros((n, p));
+        // Truth: q circle atoms, each active on its own disjoint row-quarter, in
+        // disjoint ambient planes — built through the proven `build_term` path so
+        // `target = truth.fitted()` is a genuine multi-atom circle image the
+        // birth detector certifies (mirrors `stagewise_recovers_planted_two_circles`).
+        let mut atoms = Vec::new();
+        let mut cbs = Vec::new();
         for c in 0..q {
-            for pos in 0..per {
-                let r = c * per + pos;
-                let th = std::f64::consts::TAU * (pos as f64) / (per as f64);
-                target[[r, 2 * c]] = th.cos();
-                target[[r, 2 * c + 1]] = th.sin();
-            }
+            let (atom, cb) = circle_atom(&format!("t{c}"), &evaluator, &coords, 2 * c, 2 * c + 1, p);
+            atoms.push(atom);
+            cbs.push(cb);
         }
+        let active_truth: Vec<Vec<bool>> = (0..n)
+            .map(|r| (0..q).map(|c| r / per == c).collect())
+            .collect();
+        let (truth, _truth_rho) = build_term(atoms.clone(), cbs.clone(), &active_truth);
+        let target = truth.fitted();
 
         let mode = AssignmentMode::threshold_gate(1.0, -3.0);
         let mut config = test_config();
         config.max_births = 8;
         config.max_backfit_sweeps = 1;
 
+        // Seed: a single circle atom active on EVERY row (the residual then carries
+        // all q quarter-circles), under a ThresholdGate so disjoint supports gate
+        // exactly off — the batch-greedy precondition.
         let build_seed = || {
             let (atom0, cb0) = circle_atom("seed", &evaluator, &coords, 0, 1, p);
-            let active: Vec<Vec<bool>> = (0..n).map(|r| vec![r < per]).collect();
-            let (mut seed, mut rho) = build_term_gate(vec![atom0], vec![cb0], &active, mode);
+            let (mut seed, mut rho) =
+                build_term_gate(vec![atom0], vec![cb0], &vec![vec![true]; n], mode);
             seed.set_guards_enabled(false);
             seed.run_joint_fit_arrow_schur(
                 target.view(),
@@ -3193,6 +3212,12 @@ mod tests {
         let (seed_s, rho_s) = build_seed();
         let serial = fit_stagewise(seed_s, rho_s, target.view(), None, None, &config, None)
             .expect("serial driver");
+        assert!(
+            serial.report.births_accepted >= 2,
+            "serial driver must grow K on the planted {q}-circle image for the parity \
+             comparison to be meaningful; births_accepted={}",
+            serial.report.births_accepted
+        );
 
         let (seed_b, rho_b) = build_seed();
         let batch_config = BatchedStagewiseConfig {
