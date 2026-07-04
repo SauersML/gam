@@ -201,6 +201,39 @@ pub struct BlockSparseStreamState {
     converged: bool,
     last_util: Vec<f32>,
     last_stable: Vec<f32>,
+    // Last CLOSED epoch's accumulators, stashed by `end_epoch` before
+    // `reset_epoch` zeroes the live ones — the certification read surface
+    // (`block_rank_charges`) prices blocks from a COMPLETE epoch, never a
+    // partially-filled one.
+    last_second: Vec<Array2<f64>>,
+    last_usage: Vec<usize>,
+    last_rss: f64,
+    last_rows: usize,
+}
+
+/// Per-block honest-charge ledger over the last closed epoch, as parallel
+/// vectors (one entry per block, in block order). The BLOCK is the linear
+/// lane's certification unit: its `b` atoms share one jointly-fitted
+/// orthonormal frame and one code Gram, so they are priced — and live or
+/// die — together. `margin = delta_deviance − charge` in nats;
+/// `kept = margin > 0` is the same evidence boundary the hybrid split uses
+/// (`Δ(½RSS)/φ̂  vs  ½·d_eff·ln n`, #2124 deviance units).
+pub struct BlockRankCharges {
+    /// Block index `g` (atom ids are `g*b .. (g+1)*b`).
+    pub block: Vec<usize>,
+    /// Rows routed to the block over the last closed epoch (`n_eff`).
+    pub n_eff: Vec<f64>,
+    /// Realised rank-charge DOF of the block's frame under its code Gram.
+    pub d_eff: Vec<f64>,
+    /// `½·tr(C_g)/φ̂` — the deviance reduction the block's codes claim.
+    pub delta_deviance: Vec<f64>,
+    /// `½·d_eff·ln n_obs` — the evidence price.
+    pub charge: Vec<f64>,
+    /// `delta_deviance − charge` (also the Laplace log-evidence-ratio the
+    /// e-BH certificate can consume as a `log_e_value`).
+    pub margin: Vec<f64>,
+    /// `margin > 0`.
+    pub kept: Vec<bool>,
 }
 
 impl BlockSparseStreamState {
@@ -262,6 +295,10 @@ impl BlockSparseStreamState {
             converged: false,
             last_util: vec![0.0; g],
             last_stable: vec![0.0; g],
+            last_second: (0..g).map(|_| Array2::<f64>::zeros((b, b))).collect(),
+            last_usage: vec![0; g],
+            last_rss: 0.0,
+            last_rows: 0,
         })
     }
 
@@ -490,6 +527,13 @@ impl BlockSparseStreamState {
         self.epochs_run += 1;
         let epoch = self.epochs_run;
 
+        // Stash this (complete) epoch's accumulators for the certification
+        // read surface (`block_rank_charges`) before the reset zeroes them.
+        self.last_second.clone_from(&self.second);
+        self.last_usage.clone_from(&self.usage);
+        self.last_rss = self.rss;
+        self.last_rows = self.row_count;
+
         self.reset_epoch();
 
         Ok(BlockEpochStats {
@@ -590,6 +634,73 @@ impl BlockSparseStreamState {
             explained_variance: self.last_ev,
             converged: self.converged,
         }
+    }
+
+    /// Per-block honest-charge ledger from the LAST CLOSED epoch (#23
+    /// certification surface). For each block `g`: `d_eff` is the realised
+    /// rank-charge DOF of its orthonormal frame `D_g` under the epoch's code
+    /// Gram `C_g` (the SAME `realised_rank_charge_dof` currency the joint
+    /// PROMOTE/DEMOTE gates charge); `delta_deviance = ½·tr(C_g)/φ̂` is the
+    /// deviance reduction the block's codes claim (frames are block-
+    /// orthonormal, so `tr(C_g)` is the energy the block reconstructs);
+    /// `charge = ½·d_eff·ln(n_obs)`; `kept = margin > 0`. The dispersion
+    /// `φ̂ = rss/(rows·p)` comes from the same closed epoch; a non-finite or
+    /// non-positive `φ̂` falls back to the historical unit-dispersion reading
+    /// (mirrors the hybrid-split #2124 guard). Errors if no epoch has closed.
+    pub fn block_rank_charges(&self, n_obs: usize) -> Result<BlockRankCharges, String> {
+        if self.last_rows == 0 {
+            return Err(
+                "block_rank_charges: no closed epoch to certify; call end_epoch first"
+                    .to_string(),
+            );
+        }
+        let phi_raw = self.last_rss / (self.last_rows as f64 * self.p as f64);
+        let phi = if phi_raw.is_finite() && phi_raw > 0.0 {
+            phi_raw
+        } else {
+            1.0
+        };
+        let ln_n = (n_obs.max(2) as f64).ln();
+        let mut out = BlockRankCharges {
+            block: Vec::with_capacity(self.g),
+            n_eff: Vec::with_capacity(self.g),
+            d_eff: Vec::with_capacity(self.g),
+            delta_deviance: Vec::with_capacity(self.g),
+            charge: Vec::with_capacity(self.g),
+            margin: Vec::with_capacity(self.g),
+            kept: Vec::with_capacity(self.g),
+        };
+        for gg in 0..self.g {
+            let n_eff = self.last_usage[gg] as f64;
+            let frame = self
+                .decoder
+                .slice(ndarray::s![gg * self.b..(gg + 1) * self.b, ..])
+                .mapv(f64::from);
+            let d_eff = crate::manifold::realised_rank_charge_dof(
+                &self.last_second[gg],
+                &frame,
+                n_eff,
+                self.p as f64,
+                phi,
+                0.0,
+                None,
+            )?;
+            let mut tr = 0.0_f64;
+            for i in 0..self.b {
+                tr += self.last_second[gg][[i, i]];
+            }
+            let delta_deviance = 0.5 * tr / phi;
+            let charge = 0.5 * d_eff * ln_n;
+            let margin = delta_deviance - charge;
+            out.block.push(gg);
+            out.n_eff.push(n_eff);
+            out.d_eff.push(d_eff);
+            out.delta_deviance.push(delta_deviance);
+            out.charge.push(charge);
+            out.margin.push(margin);
+            out.kept.push(margin > 0.0);
+        }
+        Ok(out)
     }
 
     /// Read-only view of the current warm-started frames (`K×P`, block-orthonormal).

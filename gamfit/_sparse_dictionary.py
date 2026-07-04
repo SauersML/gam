@@ -928,6 +928,26 @@ class BlockSparseDictStream:
         Returns ``{explained_variance, revived, dead, gamma, converged, epoch}``."""
         return dict(self._handle.end_epoch())
 
+    def block_rank_charges(self, n_obs: int) -> dict[str, Any]:
+        """Per-BLOCK honest-charge ledger from the last CLOSED epoch (the
+        certification surface for width-capacity fits).
+
+        For each block ``g``: ``d_eff`` is the realised rank-charge DOF of its
+        orthonormal frame under the epoch's code Gram (the SAME
+        ``realised_rank_charge_dof`` currency the joint PROMOTE/DEMOTE gates
+        charge); ``delta_deviance`` is the deviance reduction the block's codes
+        claim; ``charge = 0.5 * d_eff * ln(n_obs)``; ``kept = margin > 0``. The
+        block is the certification unit — its ``b`` atoms share one jointly
+        fitted frame and one Gram, so atom ids for block ``g`` are
+        ``g*b .. (g+1)*b`` and inherit the block's verdict. ``margin`` doubles
+        as a ``log_e_value`` for :func:`e_bh_dictionary_certificate`. Call
+        after at least one :meth:`end_epoch`.
+
+        Returns parallel lists
+        ``{block, n_eff, d_eff, delta_deviance, charge, margin, kept}``.
+        """
+        return dict(self._handle.block_rank_charges(int(n_obs)))
+
     def finalize(self) -> BlockSparseStreamArtifact:
         """Hand back the trained block frames + γ + per-block report as a
         :class:`BlockSparseStreamArtifact`."""

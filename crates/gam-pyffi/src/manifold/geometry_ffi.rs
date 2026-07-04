@@ -5295,6 +5295,30 @@ impl BlockSparseDictStream {
     fn epochs_run(&self) -> usize {
         self.inner.epochs_run()
     }
+
+    /// Per-BLOCK honest-charge ledger from the last CLOSED epoch (#23
+    /// certification surface): the same `realised_rank_charge_dof` currency the
+    /// joint PROMOTE/DEMOTE gates charge, priced in deviance units against
+    /// `½·d_eff·ln(n_obs)`. The block is the certification unit (its `b` atoms
+    /// share one jointly-fitted frame and one code Gram — atom ids for block
+    /// `g` are `g*b .. (g+1)*b`). Returns parallel lists
+    /// `{block, n_eff, d_eff, delta_deviance, charge, margin, kept}`; `margin`
+    /// doubles as the `log_e_value` an e-BH certificate can consume. Errors if
+    /// no epoch has closed yet.
+    fn block_rank_charges(&self, py: Python<'_>, n_obs: usize) -> PyResult<Py<PyDict>> {
+        let charges = py
+            .detach(|| self.inner.block_rank_charges(n_obs))
+            .map_err(py_value_error)?;
+        let out = PyDict::new(py);
+        out.set_item("block", charges.block)?;
+        out.set_item("n_eff", charges.n_eff)?;
+        out.set_item("d_eff", charges.d_eff)?;
+        out.set_item("delta_deviance", charges.delta_deviance)?;
+        out.set_item("charge", charges.charge)?;
+        out.set_item("margin", charges.margin)?;
+        out.set_item("kept", charges.kept)?;
+        Ok(out.unbind())
+    }
 }
 
 fn inject_scalar_fisher_rao_weight(
