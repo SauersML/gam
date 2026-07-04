@@ -152,8 +152,10 @@ impl Drop for FaerSequentialScope {
 /// Rayon pool.
 #[inline]
 pub fn with_faer_sequential<T>(body: impl FnOnce() -> T) -> T {
-    let _scope = FaerSequentialScope::enter();
-    body()
+    let faer_seq_guard = FaerSequentialScope::enter();
+    let out = body();
+    drop(faer_seq_guard);
+    out
 }
 
 #[derive(Debug, Error)]
@@ -3191,7 +3193,7 @@ mod tests {
         );
 
         {
-            let _scope = FaerSequentialScope::enter();
+            let faer_seq_guard = FaerSequentialScope::enter();
             assert_eq!(
                 faer::get_global_parallelism(),
                 Par::Seq,
@@ -3200,18 +3202,20 @@ mod tests {
 
             // Nested guard: still Seq, and the inner drop must NOT restore early.
             {
-                let _inner = FaerSequentialScope::enter();
+                let faer_seq_inner_guard = FaerSequentialScope::enter();
                 assert_eq!(
                     faer::get_global_parallelism(),
                     Par::Seq,
                     "nested scope stays Par::Seq",
                 );
+                drop(faer_seq_inner_guard);
             }
             assert_eq!(
                 faer::get_global_parallelism(),
                 Par::Seq,
                 "inner drop must not restore while outer scope is still live",
             );
+            drop(faer_seq_guard);
         }
 
         assert_eq!(

@@ -145,10 +145,11 @@ import inspect, json, os, sys, numpy as np, gamfit
 # so a long fit emits progress (no silent hang; the run always ends with a signal).
 # Guarded: optional if harness_util or the kwarg isn't present (local/mini runs).
 pcb = None
-for _d in (os.environ.get("GAM_HARNESS_UTIL"),
-           "/projects/standard/hsiehph/sauer354/scratch/compose32k/scripts"):
-    if _d and os.path.isfile(os.path.join(_d, "harness_util.py")):
-        sys.path.insert(0, _d); break
+# harness_util.py location is supplied by the harness via GAM_HARNESS_UTIL;
+# no cluster-local absolute paths are baked into the repo (build.rs infra-leak ban).
+_d = os.environ.get("GAM_HARNESS_UTIL")
+if _d and os.path.isfile(os.path.join(_d, "harness_util.py")):
+    sys.path.insert(0, _d)
 try:
     import harness_util
     pcb = harness_util.progress_heartbeat()
