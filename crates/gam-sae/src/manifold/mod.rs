@@ -218,6 +218,9 @@ mod tests_coatom_sigma_coherence_2021;
 mod tests_2101_birth_locus_probe;
 
 #[cfg(test)]
+mod tests_2111_dense_torus_acceptance;
+
+#[cfg(test)]
 mod tests_rank_charge_2101;
 
 #[cfg(test)]

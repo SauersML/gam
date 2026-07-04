@@ -3523,9 +3523,42 @@ fn sae_manifold_fit_inner<'py>(
         // loses its dwell; at most one birth per pass, and only when a later pass
         // remains to refit the born atom, so K grows ≤ structured_passes and no
         // born atom is left unrefit inside the alternation.
-        const PROMOTION_ALIGN_MIN: f64 = 0.9;
+        // #2071 — the three promotion gates, each derived or priced (not a silent
+        // literal). A lineage is promoted to a born atom only when its residual-
+        // factor direction is (i) energetic enough, (ii) persists in ORIENTATION
+        // across passes, and (iii) has dwelt long enough to be more than a
+        // one-pass fluke.
+        //
+        // PROMOTION_ENERGY_FLOOR_MULT — DERIVED (identity). The energy gate is
+        // "above the idiosyncratic-noise floor"; the floor is already the
+        // data-estimated detection threshold, so the canonical multiplier is 1.0.
+        // Any value ≠ 1 arbitrarily rescales a derived floor (>1 rejects real
+        // structure sitting just above the noise; <1 promotes noise-floor
+        // directions). Kept as a named identity so the "no inflation" choice is
+        // explicit rather than buried.
         const PROMOTION_ENERGY_FLOOR_MULT: f64 = 1.0;
+        // PROMOTION_NURSERY_MIN_PASSES — DERIVED (minimal persistence). A single
+        // pass carries no persistence evidence; two is the smallest dwell at which
+        // a direction has been re-observed across a refit, i.e. the minimal count
+        // that distinguishes a repeated structural signal from a one-pass artifact.
+        // Larger only delays true structure by whole passes (K grows ≤
+        // structured_passes, so a 3-pass budget with min-dwell 3 could never
+        // promote); 2 is the floor of the concept.
         const PROMOTION_NURSERY_MIN_PASSES: usize = 2;
+        // PROMOTION_ALIGN_MIN — PRICED. The |cos| a lineage's Λ direction must
+        // hold with the previous pass's to count as the SAME structure. No
+        // first-principles value exists (it trades false-merge vs false-split of
+        // lineages), so it is priced against the null: two independent unit
+        // directions in the r-dim residual signal subspace align at
+        // E|cos| ≈ sqrt(2/(π·r)) — roughly 0.3–0.4 for the few-dim SAE residual —
+        // so 0.9 sits well above chance (near-collinear). What breaks at 10×
+        // either way: toward the ~0.35 null floor, noise-aligned directions merge
+        // into spurious lineages and promote junk; toward 1.0, only numerically
+        // identical directions survive and genuine structure that rotates slightly
+        // between passes never matures. 0.9 keeps a wide margin over the null while
+        // tolerating the small inter-pass rotation a real direction undergoes as
+        // the metric anneals.
+        const PROMOTION_ALIGN_MIN: f64 = 0.9;
         // `promote_from_residual` is the typed pyfunction kwarg (default false);
         // opt-in, default-off ⇒ whitening runs without growth unless set.
         let mut nursery: Vec<(Array1<f64>, usize)> = Vec::new();

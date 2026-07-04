@@ -12,6 +12,16 @@ use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2};
 /// candidate directions enter [`surplus_phase_plane`] unit-normalized, the
 /// post-orthogonalization residual norm equals the sine of the angle between
 /// them, so this is an absolute "how far from collinear" threshold in `[0, 1]`.
+///
+/// PRICED (#2071): `sin θ = 1e-6` ⟺ `θ ≈ 1e-6 rad` (~6e-5°). A second axis within
+/// a microradian of the first spans no genuine plane, and the 2-plane it forms
+/// has conditioning `~ 1/sin θ ≈ 1e6`. The scale is bounded on both sides: the
+/// residual can only be resolved above the f64 rounding of the unit-vector dot
+/// product (`~1e-16`), so `1e-6` sits ~10 orders above that numerical-noise floor;
+/// and it is ~6 orders below unity, so it rejects only planes that are collinear
+/// for all practical purposes. What breaks at 10×: at `1e-5` genuinely-tight but
+/// real 2-planes (θ ≈ 0.6°) start being discarded to the 1-D fallback; at `1e-7`
+/// planes conditioned at `~1e7` enter the phase solve and degrade its accuracy.
 const SURPLUS_DIR_FLOOR: f64 = 1.0e-6;
 
 /// Golden-ratio conjugate `φ⁻¹`. Additive step of a low-discrepancy (mod 1)

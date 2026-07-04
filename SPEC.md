@@ -17,3 +17,4 @@
 - Grid search is never allowed.
 - Wall-clock time budgets and deadlines are never allowed. In general, do not paper over solver issues.
 - Hard-coded knobs and magic constants, especially if arbitrary, should be avoided when possible.
+- Parallelizing a greedy/sequential fit must not change its result. A batched acceptance of several candidates from one snapshot is permitted ONLY when the candidates are provably independent (e.g. block-orthogonal designs — disjoint gate supports under an independent gate — so the batch equals the serial greedy sequence up to order); overlapping/dependent candidates must yield to the best and be requeued against the updated state. The independence criterion must be derived (a support/orthogonality test), never a tuned coherence threshold; per-round fan-out is a safety bound, not a knob. A serial-vs-batched parity test is the license for any such parallelism.

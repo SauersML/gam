@@ -3515,14 +3515,20 @@ pub(crate) fn chart_nominal_radius(atom: &SaeManifoldAtom, resolution: usize) ->
     use crate::manifold::SaeAtomBasisKind::*;
     match &atom.basis_kind {
         Periodic | Torus => 0.5 / (capped_per_axis(atom.latent_dim, resolution) as f64),
-        // Must use the SAME capped per-axis count `min(resolution, 22)` that
-        // `sphere_latlon_grid` lays the centers on: the coarsest tiling step is
-        // the longitude half-spacing `π/r` with `r = min(resolution, 22)`. Deriving
-        // the radius from the RAW resolution makes it smaller than the grid spacing
-        // once `resolution > 22`, leaving gaps between charts so rows in the gaps
-        // spuriously route to the exact fallback (the exact hazard `capped_per_axis`
-        // documents for the regular grid).
-        Sphere => std::f64::consts::PI / (resolution.max(2).min(22) as f64),
+        // Must use the SAME capped per-axis count `sphere_latlon_grid` lays the
+        // centers on: the coarsest tiling step is the longitude half-spacing `π/r`
+        // with `r` the grid's per-axis count. Deriving the radius from the RAW
+        // resolution makes it smaller than the grid spacing once the grid caps,
+        // leaving gaps between charts so rows in the gaps spuriously route to the
+        // exact fallback (the hazard `capped_per_axis` documents for the regular
+        // grid). The cap is DERIVED, not a literal (#2071): `sphere_latlon_grid`
+        // uses `SHAPE_BAND_MAX_POINTS.isqrt()` — the largest `r` with `r² ≤`
+        // the band-point budget — so the two stay in lockstep if the budget moves
+        // (a hardcoded `22` here silently desyncs the moment the budget changes).
+        Sphere => {
+            let r_cap = SHAPE_BAND_MAX_POINTS.isqrt();
+            std::f64::consts::PI / (resolution.max(2).min(r_cap) as f64)
+        }
         // Cylinder charts tile two heterogeneous axes (a `[0,1)` periodic step
         // and a unit-box line step); the chart radius is a single scalar, so we
         // take the tighter (periodic) step `0.5/res` to keep every chart valid
@@ -3932,19 +3938,23 @@ mod encode_fix_tests {
     }
 
     /// BUG (sphere chart tiling): `chart_nominal_radius` for the sphere must use
-    /// the SAME capped per-axis count `min(resolution, 22)` as `sphere_latlon_grid`,
-    /// so the radius covers the (capped) longitude half-spacing π/22 and the charts
-    /// tile without gaps for resolution > 22 (raw π/40 would leave gaps).
+    /// the SAME capped per-axis count `SHAPE_BAND_MAX_POINTS.isqrt()` as
+    /// `sphere_latlon_grid`, so the radius covers the (capped) longitude
+    /// half-spacing `π/r_cap` and the charts tile without gaps for
+    /// `resolution > r_cap` (raw π/40 would leave gaps). `r_cap` is derived from
+    /// the band-point budget (#2071), so this test tracks it rather than pinning 22.
     #[test]
     fn chart_nominal_radius_sphere_covers_capped_grid_spacing() {
         let atom = tiny_atom(SaeAtomBasisKind::Sphere, 2);
-        let lon_half_spacing = std::f64::consts::PI / 22.0; // r capped at 22
-        let r = chart_nominal_radius(&atom, 40);
+        let r_cap = SHAPE_BAND_MAX_POINTS.isqrt(); // 22 at the current 512-point budget
+        let resolution = r_cap * 2; // any resolution past the cap exercises the gap hazard
+        let lon_half_spacing = std::f64::consts::PI / r_cap as f64;
+        let r = chart_nominal_radius(&atom, resolution);
         assert!(
             r >= lon_half_spacing - 1e-12,
             "sphere radius {r} must cover the capped lon half-spacing {lon_half_spacing} \
-             (no gaps for resolution>22); raw π/40={} would gap",
-            std::f64::consts::PI / 40.0
+             (no gaps for resolution>r_cap); raw π/{resolution}={} would gap",
+            std::f64::consts::PI / resolution as f64
         );
     }
 
