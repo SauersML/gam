@@ -348,6 +348,19 @@ def run(root: Path, out: Path, *, frac: float, seed: int,
         per_atom_report.append({**{k: a.get(k) for k in LEDGER_FIELDS},
                                 "heldout_loo_drop": round(ev_full - ev_wo, 6)})
 
+    # --- #29 HELD-OUT-VALIDATED certified-K (THE headline) ---
+    # An atom counts toward the HEADLINE certified-K only if its held-out LOO contribution is
+    # POSITIVE — the backstop against the two anti-conservative biases in train-side margins:
+    # (a) token autocorrelation inflates train Δdeviance ∝n while the charge grows ∝log n, and
+    # (b) the blocks are POST-SELECTION objects (T1 chose them on the same train data). The
+    # train-margin count is kept as secondary.
+    def _is_curved(row):
+        return str(row.get("kind", "")).startswith("curved")
+    val_lin = sum(1 for r in per_atom_report
+                  if not _is_curved(r) and (r.get("heldout_loo_drop") or 0.0) > 0.0)
+    val_curved = sum(1 for r in per_atom_report
+                     if _is_curved(r) and (r.get("heldout_loo_drop") or 0.0) > 0.0)
+
     # --- κ-null Θ certificates for curved survivors ---
     null = kappa_null_theta(charts_prefix, chart_topology=chart_topology,
                             chart_d_atom=chart_d_atom, chart_n_iter=chart_n_iter,
@@ -375,10 +388,18 @@ def run(root: Path, out: Path, *, frac: float, seed: int,
                   "n_held_rollouts": int(len(held_rolls)),
                   "n_held_rows": int(held_mask.sum())},
         "tier0": {"conditioning": "per-rollout demean"},
-        "certified_K": {"linear": len(kept_lin), "curved": len(composed_curved),
-                        "total": len(kept_lin) + len(composed_curved),
-                        "curved_certified_in_step2": len(kept_curved),
-                        "charts_failed_to_compose": charts_failed},
+        # #29 caveat fields — MANDATORY, so the number is never read out of scope:
+        "scope": "within-block curvature only (Mode-A blind spot: cross-block charts invisible)",
+        "conditioning": "per-rollout μ (per-instance); slow features excluded (#21)",
+        "certified_K": {
+            # THE headline: held-out-validated (train-certified AND held-out LOO > 0).
+            "headline": {"linear": val_lin, "curved": val_curved, "total": val_lin + val_curved,
+                         "definition": "held-out-validated: train-certified AND held-out LOO contribution > 0"},
+            # secondary — train-side margin count (anti-conservatively biased; see #29).
+            "train_margin": {"linear": len(kept_lin), "curved": len(composed_curved),
+                             "total": len(kept_lin) + len(composed_curved)},
+            "curved_certified_in_step2": len(kept_curved),
+            "charts_failed_to_compose": charts_failed},
         "heldout_ev": {"tier0_only": round(ev_t0, 6),
                        "tier0_tier1": round(ev_t0_t1, 6),
                        "full_composed": round(ev_full, 6),
@@ -401,9 +422,12 @@ def run(root: Path, out: Path, *, frac: float, seed: int,
 
 
 def _print_summary(r: dict) -> None:
-    ck = r["certified_K"]; ev = r["heldout_ev"]
+    ck = r["certified_K"]; ev = r["heldout_ev"]; hd = ck["headline"]; tm = ck["train_margin"]
     print("\n================ COMPOSE 32k — STEP 3 REPORT ================", flush=True)
-    print(f"  CERTIFIED K:  linear={ck['linear']}  curved={ck['curved']}  total={ck['total']}", flush=True)
+    print(f"  CERTIFIED K (held-out-validated):  linear={hd['linear']}  curved={hd['curved']}  "
+          f"total={hd['total']}", flush=True)
+    print(f"    (train-margin, secondary: linear={tm['linear']} curved={tm['curved']} total={tm['total']}; "
+          f"charts_failed={len(ck['charts_failed_to_compose'])})", flush=True)
     print(f"  held-out EV:  T0={ev['tier0_only']:.4f}  ->  T0+T1={ev['tier0_tier1']:.4f}  "
           f"->  composed={ev['full_composed']:.4f}", flush=True)
     print(f"  split: {r['split']['n_train_rollouts']} train / {r['split']['n_held_rollouts']} "
