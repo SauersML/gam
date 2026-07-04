@@ -173,6 +173,9 @@ mod tests;
 mod tests_chart_evaluator_jets;
 
 #[cfg(test)]
+mod tests_collapse_prevention;
+
+#[cfg(test)]
 mod tests_factored_htbeta;
 
 #[cfg(test)]
