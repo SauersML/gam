@@ -269,6 +269,28 @@ pub use construction_padded_blocks::*;
 // #16/#2023 — the shared rank-charge DOF core, exposed so the hybrid-split DEMOTE
 // gate prices linear/curved candidates in the SAME currency as the joint REML fit.
 pub(crate) use construction::realised_rank_charge_dof;
+
+/// Public single-currency surface for the realised rank-charge DOF: the SAME
+/// `realised_rank_charge_dof` the joint REML PROMOTE gate, the hybrid-split
+/// DEMOTE gate, and the streaming block ledger all charge, exposed so external
+/// drivers (the Mode-A per-block chart pass, the compose/certify report) price
+/// candidates with the EXACT criterion instead of re-deriving the formula —
+/// re-derivations drift (a ½-factor mismatch was caught in the first
+/// re-implementation attempt, which is precisely why this wrapper exists).
+/// `gram` is the candidate's weighted design Gram over its `M` basis columns,
+/// `decoder` its `M×p` decoder block, `n_eff` the effective sample mass,
+/// `p_out` the output dimension, `dispersion` the reconstruction φ̂ feeding the
+/// MP floor. No smoothing-penalty term (matches both gate call sites).
+pub fn rank_charge_dof(
+    gram: &ndarray::Array2<f64>,
+    decoder: &ndarray::Array2<f64>,
+    n_eff: f64,
+    p_out: f64,
+    dispersion: f64,
+) -> Result<f64, String> {
+    construction::realised_rank_charge_dof(gram, decoder, n_eff, p_out, dispersion, 0.0, None)
+}
+
 pub use coordinate_fidelity::*;
 pub use gauge::*;
 pub use isa_seed::*;

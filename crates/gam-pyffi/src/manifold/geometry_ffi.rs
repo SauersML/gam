@@ -4362,6 +4362,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         block_sparse_dictionary_transform_ffi,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(rank_charge_dof, module)?)?;
     module.add_class::<SparseDictStream>()?;
     module.add_class::<BlockSparseDictStream>()?;
     module.add_function(wrap_pyfunction!(
@@ -5319,6 +5320,37 @@ impl BlockSparseDictStream {
         out.set_item("kept", charges.kept)?;
         Ok(out.unbind())
     }
+}
+
+/// Exact realised rank-charge DOF — the single evidence currency (PROMOTE /
+/// DEMOTE / streaming block ledger), exposed so Python drivers price candidates
+/// with the criterion itself instead of re-deriving it (re-derivations drift; a
+/// ½-factor mismatch was caught in the first attempt). `gram` is the
+/// candidate's `M×M` weighted design Gram, `decoder` its `M×p` decoder block,
+/// `n_eff` the effective sample mass, `p_out` the output dimension,
+/// `dispersion` the reconstruction φ̂ (MP floor).
+#[pyfunction]
+#[pyo3(signature = (gram, decoder, n_eff, p_out, dispersion))]
+fn rank_charge_dof(
+    py: Python<'_>,
+    gram: PyReadonlyArray2<'_, f64>,
+    decoder: PyReadonlyArray2<'_, f64>,
+    n_eff: f64,
+    p_out: f64,
+    dispersion: f64,
+) -> PyResult<f64> {
+    let gram_values = gram.as_array().to_owned();
+    let decoder_values = decoder.as_array().to_owned();
+    py.detach(|| {
+        gam::terms::sae::manifold::rank_charge_dof(
+            &gram_values,
+            &decoder_values,
+            n_eff,
+            p_out,
+            dispersion,
+        )
+    })
+    .map_err(py_value_error)
 }
 
 fn inject_scalar_fisher_rao_weight(

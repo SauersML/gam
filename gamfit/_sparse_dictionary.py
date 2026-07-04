@@ -1112,6 +1112,39 @@ def sparse_dictionary_fit(
     )
 
 
+def rank_charge_dof(
+    gram: Any,
+    decoder: Any,
+    n_eff: float,
+    p_out: float,
+    dispersion: float,
+) -> float:
+    """Exact realised rank-charge DOF — the single evidence currency.
+
+    Calls the SAME native ``realised_rank_charge_dof`` the joint REML PROMOTE
+    gate, the hybrid-split DEMOTE gate, and the streaming block ledger charge,
+    so external drivers (the Mode-A per-block chart pass, compose/certify
+    reports) price candidates with the criterion itself instead of re-deriving
+    the formula — re-derivations drift. ``gram`` is the candidate's ``M x M``
+    weighted design Gram, ``decoder`` its ``M x p`` decoder block, ``n_eff``
+    the effective sample mass, ``p_out`` the output dimension, ``dispersion``
+    the reconstruction dispersion (MP floor input). The evidence price is then
+    ``0.5 * d_eff * ln(n)`` against the deviance-priced loss reduction.
+    """
+    gram_arr = np.ascontiguousarray(gram, dtype=np.float64)
+    decoder_arr = np.ascontiguousarray(decoder, dtype=np.float64)
+    if gram_arr.ndim != 2 or decoder_arr.ndim != 2:
+        raise ValueError(
+            "rank_charge_dof: gram and decoder must be 2-D arrays; got shapes "
+            f"{gram_arr.shape} and {decoder_arr.shape}"
+        )
+    return float(
+        rust_module().rank_charge_dof(
+            gram_arr, decoder_arr, float(n_eff), float(p_out), float(dispersion)
+        )
+    )
+
+
 __all__ = [
     "BlockSparseDictStream",
     "BlockSparseDictionaryFit",
@@ -1122,6 +1155,7 @@ __all__ = [
     "SparseDictionaryTransform",
     "block_sparse_dictionary_fit",
     "block_sparse_dictionary_fit_begin",
+    "rank_charge_dof",
     "sparse_dictionary_fit",
     "sparse_dictionary_fit_begin",
 ]
