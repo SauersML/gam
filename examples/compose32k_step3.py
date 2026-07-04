@@ -19,6 +19,10 @@ CONTRACT v1
     ROLLOUT ids — whole-rollout, leak-free. Copied here with provenance so gam carries
     no dependency on the Manifold-SAE/experiments prototype tree.
   - per-rollout demean: Tier-0 conditioning (declared; part of the model, not discarded).
+  - CHART FAILURE = SKIP, never a linear lift: a chart that fails/times out at compose
+    contributes a ZERO recon (no curved atom); T1's frame already owns the block's linear
+    structure, so a linear lift would double-count. Failures are counted in
+    certified_K.charts_failed_to_compose; certified_K.curved counts only CONVERGED charts.
   - atom ledger JSONL schema (one object per line):
         {atom_id, block_g, kind, d_eff, delta_deviance, charge, margin, kept}
     kind ∈ {"linear", "curved(d=<N>)"}.
@@ -199,6 +203,7 @@ def curved_recon_per_block(prefix: str, *, chart_topology: str, chart_d_atom: in
     manifest, bases, coords = ct.load_seed_manifest(prefix)
     n_blocks = int(manifest["n_blocks"])
     p = int(manifest["ambient_p"])
+    n_rows = int(next(iter(coords.values())).shape[0]) if coords else 0
     per_block_recon: list[np.ndarray] = []
     per_block_report: list[dict] = []
     for g in range(n_blocks):
@@ -212,10 +217,15 @@ def curved_recon_per_block(prefix: str, *, chart_topology: str, chart_d_atom: in
             rec["chart_status"] = "CONVERGED"
             rec["fitted_turning"] = theta
             per_block_recon.append(np.asarray(z_hat, dtype=np.float64) @ q.T)
-        else:  # timed out / failed -> linear-lift fallback (never hangs)
-            rec["chart_status"] = "FALLBACK_LINEAR_LIFT"
+        else:
+            # SKIP on failure — contribute NOTHING (a ZERO recon), do NOT lift z@Qᵀ.
+            # T1's frame ALREADY reconstructs this block's LINEAR structure; a linear
+            # lift here would DOUBLE-COUNT the block's energy (inflating composed EV +
+            # corrupting per-atom LOO). Honest semantics: a failed chart = no curved
+            # atom for that block; T1 alone owns it (counted in report.charts_failed).
+            rec["chart_status"] = "SKIPPED_NO_CURVED"
             rec["fitted_turning"] = None
-            per_block_recon.append(z @ q.T)
+            per_block_recon.append(np.zeros((n_rows, p), dtype=np.float64))
         per_block_report.append(rec)
     return per_block_recon, {"n_blocks": n_blocks, "ambient_p": p,
                              "per_block": per_block_report}
@@ -291,9 +301,16 @@ def run(root: Path, out: Path, *, frac: float, seed: int,
     curved_per_block, curved_report = curved_recon_per_block(
         charts_prefix, chart_topology=chart_topology, chart_d_atom=chart_d_atom,
         chart_n_iter=chart_n_iter, random_state=seed, wall_s=chart_wall_s)
-    # keep only certified-survivor blocks
+    # keep only certified-survivor blocks whose chart ACTUALLY composed (CONVERGED).
+    # A kept survivor whose chart failed/timed out at compose contributes NO curved atom
+    # (skipped, T1 owns the block) and is counted in charts_failed — never linear-lifted.
+    conv_blocks = {g for g, rec in enumerate(curved_report["per_block"])
+                   if rec.get("chart_status") == "CONVERGED"}
     kept_curved_blocks = {int(a["block_g"]) for a in kept_curved}
-    curved_per_atom = [(g, r) for g, r in enumerate(curved_per_block) if g in kept_curved_blocks]
+    composed_blocks = kept_curved_blocks & conv_blocks
+    charts_failed = sorted(kept_curved_blocks - conv_blocks)
+    composed_curved = [a for a in kept_curved if int(a["block_g"]) in composed_blocks]
+    curved_per_atom = [(g, r) for g, r in enumerate(curved_per_block) if g in composed_blocks]
     curved_total = np.sum([r for _, r in curved_per_atom], axis=0) if curved_per_atom else np.zeros((n, p))
 
     full_recon = mu + lin_total + curved_total
@@ -310,7 +327,7 @@ def run(root: Path, out: Path, *, frac: float, seed: int,
         ev_wo = explained_variance_train_mean(Z[held_mask], (full_recon - contrib)[held_mask], train_mean)
         per_atom_report.append({**{k: a.get(k) for k in LEDGER_FIELDS},
                                 "heldout_loo_drop": round(ev_full - ev_wo, 6)})
-    for (g, contrib), a in zip(curved_per_atom, kept_curved):
+    for (g, contrib), a in zip(curved_per_atom, composed_curved):
         ev_wo = explained_variance_train_mean(Z[held_mask], (full_recon - contrib)[held_mask], train_mean)
         per_atom_report.append({**{k: a.get(k) for k in LEDGER_FIELDS},
                                 "heldout_loo_drop": round(ev_full - ev_wo, 6)})
@@ -321,15 +338,15 @@ def run(root: Path, out: Path, *, frac: float, seed: int,
                             seed=seed, wall_s=chart_wall_s)
     theta_accept = null.get("theta_accept")
     curved_certs = []
-    for rec, a in zip([r for g, r in enumerate(curved_report["per_block"])
-                       if g in kept_curved_blocks], kept_curved):
+    for a in composed_curved:
+        rec = curved_report["per_block"][int(a["block_g"])]
         theta = rec.get("fitted_turning")
         passes = (theta is not None and theta_accept is not None and theta > theta_accept)
         curved_certs.append({"atom_id": a.get("atom_id"), "block_g": a.get("block_g"),
                              "fitted_turning": theta, "theta_accept": theta_accept,
                              "kappa_null_pass": bool(passes)})
 
-    margins = [a.get("margin") for a in (kept_lin + kept_curved) if a.get("margin") is not None]
+    margins = [a.get("margin") for a in (kept_lin + composed_curved) if a.get("margin") is not None]
 
     report = {
         "schema": "compose32k_step3.v1",
@@ -342,8 +359,10 @@ def run(root: Path, out: Path, *, frac: float, seed: int,
                   "n_held_rollouts": int(len(held_rolls)),
                   "n_held_rows": int(held_mask.sum())},
         "tier0": {"conditioning": "per-rollout demean"},
-        "certified_K": {"linear": len(kept_lin), "curved": len(kept_curved),
-                        "total": len(kept_lin) + len(kept_curved)},
+        "certified_K": {"linear": len(kept_lin), "curved": len(composed_curved),
+                        "total": len(kept_lin) + len(composed_curved),
+                        "curved_certified_in_step2": len(kept_curved),
+                        "charts_failed_to_compose": charts_failed},
         "heldout_ev": {"tier0_only": round(ev_t0, 6),
                        "tier0_tier1": round(ev_t0_t1, 6),
                        "full_composed": round(ev_full, 6),
@@ -465,7 +484,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--root", type=str, default=None,
                     help="artifact root (activations.npz + t1/ + charts/)")
     ap.add_argument("--out", type=str, default=None, help="output report JSON")
-    ap.add_argument("--frac", type=float, default=0.7, help="train fraction of rollouts")
+    ap.add_argument("--frac", type=float, default=0.8,
+                    help="train fraction of rollouts (Contract v1 canon = 0.8; all 4 steps split identically)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--chart-topology", type=str, default="circle")
     ap.add_argument("--chart-d-atom", type=int, default=2)
