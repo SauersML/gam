@@ -111,6 +111,7 @@ fn build_cache(
         centered_weighted_y_sq,
         row_prediction_is_stale: false,
         xtwx_sparse_orig: None,
+        frozen_rows: None,
     }
 }
 
