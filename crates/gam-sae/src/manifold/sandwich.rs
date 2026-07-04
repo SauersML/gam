@@ -115,6 +115,39 @@ impl RobustCovarianceMode {
     }
 }
 
+/// The model-selection information charge, reported under BOTH the model-based
+/// and the composite-likelihood (CLIC) accounting so a caller can price a
+/// structure move honestly and see how far the two diverge.
+///
+/// `model_based_dof = tr(F A⁻¹)` is the classical effective parameter count (the
+/// smoother/hat trace), correct when the working likelihood is well specified.
+/// `clic_dof = tr(J A⁻¹)` is the Takeuchi / composite-likelihood effective dof,
+/// which replaces the expected information `F` by the empirical score meat `J`.
+/// They coincide under the information-matrix equality and otherwise differ by
+/// the degree of misspecification; `clic_dof` is the honest charge to use in an
+/// AIC-style penalty when the residuals are not iid Gaussian.
+#[derive(Debug, Clone, Copy)]
+pub struct CompositeLikelihoodCharge {
+    /// `tr(F A⁻¹)` — model-based effective degrees of freedom.
+    pub model_based_dof: f64,
+    /// `tr(J A⁻¹)` — composite-likelihood (CLIC / Takeuchi) effective dof.
+    pub clic_dof: f64,
+}
+
+impl CompositeLikelihoodCharge {
+    /// The over/under-dispersion ratio `clic_dof / model_based_dof` — `1` under
+    /// a correctly specified likelihood, `>1` when the residuals carry more
+    /// score variability than the working model admits (the usual direction for
+    /// heteroskedastic / correlated reconstruction residuals).
+    pub fn misspecification_ratio(&self) -> f64 {
+        if self.model_based_dof.abs() > f64::MIN_POSITIVE {
+            self.clic_dof / self.model_based_dof
+        } else {
+            f64::NAN
+        }
+    }
+}
+
 /// The Godambe sandwich covariance `A⁻¹ J A⁻¹` from a model-based covariance
 /// block `bread = A⁻¹` and a score-meat block `meat = J`.
 ///
@@ -235,6 +268,48 @@ pub(crate) fn gaussian_within_channel_meat(
         }
     }
     Ok(blocks)
+}
+
+/// Within-channel EXPECTED information blocks `F_cc = (1/φ) Σ_i g_i g_iᵀ`, one
+/// `(M × M)` matrix per output channel `c` — the model-based counterpart of
+/// [`gaussian_within_channel_meat`] with the empirical residual energy `r_{ic}²`
+/// replaced by its correctly-specified expectation `φ`.
+///
+/// Pairing it with the same bread gives the MODEL-BASED effective dof
+/// `tr(F A⁻¹)` (the classical hat-trace), so `tr(F A⁻¹)` and the CLIC
+/// `tr(J A⁻¹)` are reported on identical footing and coincide exactly under the
+/// information-matrix equality (`r_{ic}² → φ` in expectation).
+///
+/// The expected information is channel-independent (the design is shared across
+/// output channels), so a single `(M × M)` block is returned and reused for
+/// every channel.
+pub(crate) fn gaussian_within_channel_expected_meat(
+    design: ArrayView2<'_, f64>,
+    dispersion: f64,
+) -> Result<Array2<f64>, String> {
+    let (n, m) = design.dim();
+    if !(dispersion.is_finite() && dispersion > 0.0) {
+        return Err(format!(
+            "gaussian_within_channel_expected_meat: dispersion must be finite and positive, \
+             got {dispersion}"
+        ));
+    }
+    let inv_phi = 1.0 / dispersion;
+    let mut gram = Array2::<f64>::zeros((m, m));
+    for i in 0..n {
+        let g = design.row(i);
+        for a in 0..m {
+            let ga = g[a];
+            if ga == 0.0 {
+                continue;
+            }
+            for b in 0..m {
+                gram[[a, b]] += ga * g[b];
+            }
+        }
+    }
+    gram.mapv_inplace(|v| v * inv_phi);
+    Ok(gram)
 }
 
 /// Robust per-channel band variance `Var_c(t) = φ(t)ᵀ (A_c⁻¹ J_cc A_c⁻¹) φ(t)`
@@ -407,6 +482,74 @@ mod tests {
                 c
             );
         }
+    }
+
+    #[test]
+    fn clic_and_model_based_dof_coincide_under_homoskedastic_residuals() {
+        // With homoskedastic residuals (r_ic² ≈ φ), the empirical meat J and the
+        // expected information F coincide, so tr(J A⁻¹) ≈ tr(F A⁻¹): the CLIC and
+        // model-based effective dof agree. This is the charge's calibration point.
+        let n = 4000;
+        let m = 3;
+        let mut rng = StdRng::seed_from_u64(123);
+        // shared design g_i, one output channel
+        let mut design = Array2::<f64>::zeros((n, m));
+        for v in design.iter_mut() {
+            *v = rng.random_range(-1.0..1.0);
+        }
+        let phi = 0.7_f64;
+        let sd = phi.sqrt();
+        let mut residuals = Array2::<f64>::zeros((n, 1));
+        for i in 0..n {
+            // homoskedastic mean-zero residual with variance φ (uniform scaled to var φ)
+            let u = rng.random_range(-1.0..1.0); // var 1/3
+            residuals[[i, 0]] = u * sd * (3.0_f64).sqrt();
+        }
+        // bread = (F)⁻¹ so that tr(F A⁻¹) = tr(I) = m exactly (model-based dof = m).
+        let f = gaussian_within_channel_expected_meat(design.view(), phi).unwrap();
+        let a_inv = invert(&f);
+        let model_dof = clic_effective_dof(a_inv.view(), f.view()).unwrap();
+        assert!(
+            (model_dof - m as f64).abs() < 1e-8,
+            "model-based dof tr(F A⁻¹) must equal m={m}, got {model_dof}"
+        );
+        let meat = gaussian_within_channel_meat(design.view(), residuals.view(), phi).unwrap();
+        let clic = clic_effective_dof(a_inv.view(), meat[0].view()).unwrap();
+        // Empirical meat concentrates on F, so clic ≈ m within Monte-Carlo error.
+        assert!(
+            (clic - m as f64).abs() < 0.3,
+            "CLIC dof should be ≈ m={m} under homoskedastic residuals, got {clic}"
+        );
+    }
+
+    #[test]
+    fn clic_dof_exceeds_model_based_under_overdispersion() {
+        // Inflate every residual by a factor s: J scales by s², so tr(J A⁻¹)
+        // ≈ s²·tr(F A⁻¹). The CLIC dof must exceed the model-based dof, the
+        // honest signal that the composite likelihood spent more effective
+        // parameters than the working model admits.
+        let n = 3000;
+        let m = 3;
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut design = Array2::<f64>::zeros((n, m));
+        for v in design.iter_mut() {
+            *v = rng.random_range(-1.0..1.0);
+        }
+        let phi = 1.0_f64;
+        let s = 2.5_f64;
+        let mut residuals = Array2::<f64>::zeros((n, 1));
+        for i in 0..n {
+            residuals[[i, 0]] = s * rng.random_range(-1.0..1.0) * (3.0_f64).sqrt();
+        }
+        let f = gaussian_within_channel_expected_meat(design.view(), phi).unwrap();
+        let a_inv = invert(&f);
+        let model_dof = clic_effective_dof(a_inv.view(), f.view()).unwrap();
+        let meat = gaussian_within_channel_meat(design.view(), residuals.view(), phi).unwrap();
+        let clic = clic_effective_dof(a_inv.view(), meat[0].view()).unwrap();
+        assert!(
+            clic > model_dof * 1.5,
+            "CLIC dof {clic} must clearly exceed model-based dof {model_dof} under s={s} overdispersion"
+        );
     }
 
     #[test]

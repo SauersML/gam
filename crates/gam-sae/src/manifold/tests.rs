@@ -1676,6 +1676,7 @@ pub(crate) fn invalidate_bands_for_recompute_clears_every_seed_band() {
             band_coords: array![[0.0_f64], [0.5], [1.0]],
             band_mean: Array2::<f64>::from_elem((3, 2), 0.25),
             band_sd: Array2::<f64>::from_elem((3, 2), 0.10),
+            band_sd_robust: None,
         }
     }
     let mut shape = SaeShapeUncertainty {

@@ -558,3 +558,122 @@ pub fn atom_topology_persistence(
     }
     topology_persistence_verdict(points.view(), &atom.basis_kind, atom.latent_dim)
 }
+
+/// The topology read off a typed-free local-chart atlas by its NERVE (reviewer
+/// F3, atlas-first inversion).
+///
+/// The default pipeline *assumes-then-races* — it picks a topology up front and
+/// fits it. The inversion *measures-then-imposes*: cover the atom's points with
+/// overlapping local charts (Duchon patches glued by the in-tree
+/// [`crate::chart_transfer`] pulled-back operators in production; here the
+/// overlap is read geometrically from the point cloud), then read the topology
+/// from the nerve of the cover — the graph whose vertices are charts and whose
+/// edges join charts that overlap. A cyclic nerve is a circle; a path nerve is
+/// an arc. The nerve's first Betti number `b₁ = E − V + C` is the loop count,
+/// so `b₁ = 1, C = 1` recovers `S¹` and `b₁ = 0, C = 1` an arc — a topology that
+/// was *measured*, not latched, and can then be imposed as the typed refit.
+#[derive(Clone, Debug)]
+pub struct AtlasNerveReport {
+    /// Number of local charts (landmark cover elements).
+    pub n_charts: usize,
+    /// Number of nerve edges (overlapping chart pairs).
+    pub n_edges: usize,
+    /// Connected components of the nerve.
+    pub n_components: usize,
+    /// First Betti number `b₁ = E − V + C` (the graph cycle rank): the number
+    /// of independent loops in the recovered manifold.
+    pub b1: i64,
+}
+
+impl AtlasNerveReport {
+    /// Whether the nerve recovers a single circle `S¹` (one component, one loop).
+    pub fn is_circle(&self) -> bool {
+        self.n_components == 1 && self.b1 == 1
+    }
+    /// Whether the nerve recovers a single arc / path (one component, no loop).
+    pub fn is_arc(&self) -> bool {
+        self.n_components == 1 && self.b1 == 0
+    }
+}
+
+fn nerve_find(parent: &mut [usize], x: usize) -> usize {
+    let mut root = x;
+    while parent[root] != root {
+        root = parent[root];
+    }
+    let mut cur = x;
+    while parent[cur] != root {
+        let next = parent[cur];
+        parent[cur] = root;
+        cur = next;
+    }
+    root
+}
+
+/// Build the nerve of a landmark-chart atlas over a point cloud and read its
+/// topology. The chart count is data-derived (`⌈√n⌉` landmarks, floored at 3 —
+/// the nerve is invariant to it above the covering number); charts are
+/// farthest-point landmarks. The nerve edges are the **witness-complex**
+/// 1-skeleton: each point witnesses an edge between its two nearest landmark
+/// charts (the two charts whose regions overlap where it sits). This is exactly
+/// the Voronoi adjacency of the atlas — adjacent charts only, no radius, no
+/// magic constant.
+pub fn atlas_nerve(points: ArrayView2<'_, f64>) -> AtlasNerveReport {
+    let n = points.nrows();
+    if n == 0 {
+        return AtlasNerveReport {
+            n_charts: 0,
+            n_edges: 0,
+            n_components: 0,
+            b1: 0,
+        };
+    }
+    let n_charts = ((n as f64).sqrt().ceil() as usize).max(3).min(n);
+    let landmarks = farthest_point_subsample(points, n_charts);
+    let v = landmarks.len();
+    let mut adj = vec![vec![false; v]; v];
+    for i in 0..n {
+        let mut best = (f64::INFINITY, 0usize);
+        let mut second = (f64::INFINITY, 0usize);
+        for (ci, &l) in landmarks.iter().enumerate() {
+            let d = point_distance(points, i, l);
+            if d < best.0 {
+                second = best;
+                best = (d, ci);
+            } else if d < second.0 {
+                second = (d, ci);
+            }
+        }
+        if second.0.is_finite() && best.1 != second.1 {
+            adj[best.1][second.1] = true;
+            adj[second.1][best.1] = true;
+        }
+    }
+    let mut n_edges = 0usize;
+    let mut parent: Vec<usize> = (0..v).collect();
+    for a in 0..v {
+        for b in (a + 1)..v {
+            if adj[a][b] {
+                n_edges += 1;
+                let ra = nerve_find(&mut parent, a);
+                let rb = nerve_find(&mut parent, b);
+                if ra != rb {
+                    parent[ra] = rb;
+                }
+            }
+        }
+    }
+    let mut roots = std::collections::HashSet::new();
+    for x in 0..v {
+        let r = nerve_find(&mut parent, x);
+        roots.insert(r);
+    }
+    let n_components = roots.len();
+    let b1 = n_edges as i64 - v as i64 + n_components as i64;
+    AtlasNerveReport {
+        n_charts: v,
+        n_edges,
+        n_components,
+        b1,
+    }
+}

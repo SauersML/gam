@@ -41,7 +41,23 @@ pub struct SaeAtomShapeUncertainty {
     /// coordinate, `sqrt(Var_c(t))` with
     /// `Var_c(t) = Σ_{b1,b2} Φ[b1] Φ[b2] Cov(β_k)[(b1,c),(b2,c)]`, shape
     /// `(G, p)`.
+    ///
+    /// This is the MODEL-BASED band (`Cov = φ̂ H⁻¹`), correct only when the
+    /// working reconstruction likelihood is correctly specified. See
+    /// [`Self::band_sd_robust`] for the misspecification-robust companion.
     pub band_sd: Array2<f64>,
+    /// Sandwich (Godambe / robust) posterior standard deviation of each ambient
+    /// channel, same shape as [`Self::band_sd`], computed from the within-channel
+    /// sandwich covariance `A_c⁻¹ J_cc A_c⁻¹` (see [`super::sandwich`]). Reported
+    /// ALONGSIDE the model-based band, never in place of it; the two coincide
+    /// when the information-matrix equality holds and diverge exactly to the
+    /// degree the residuals violate the working likelihood (heteroskedastic
+    /// tokens, LayerNorm structure, cross-channel template correlation).
+    ///
+    /// `None` when the robust band was not requested for this atom or could not
+    /// be formed (e.g. the huge-`p` factored path where the dense within-channel
+    /// meat is not materialized) — an honest gap, not a fabricated band.
+    pub band_sd_robust: Option<Array2<f64>>,
 }
 
 /// Posterior shape uncertainty for a whole SAE-manifold fit: one band per atom
@@ -83,6 +99,7 @@ impl SaeShapeUncertainty {
         for atom in &mut self.atoms {
             atom.decoder_covariance = None;
             atom.band_sd.fill(f64::NAN);
+            atom.band_sd_robust = None;
         }
     }
 }

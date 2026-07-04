@@ -73,6 +73,7 @@ pub mod object_store;
 pub mod residual_stratify;
 pub mod rho_cascade;
 pub mod shard_reader;
+pub mod torus_merge_audit;
 pub mod warm_state;
 
 // ---------------------------------------------------------------------------
@@ -98,6 +99,11 @@ pub use residual_stratify::{
     RowResidualEnergy, SpanResidualEnergy, Stratum, StratumDesign, StratifiedCorpusTarget,
     collect_stratified_target, design_stratified_subsample,
 };
+
+/// ISA post-fit torus-merge audit: flag pairs of accepted atoms that are really
+/// one curved structure, by the fourth-moment `(κ − 2)²` contrast on their
+/// co-assigned rows.
+pub use torus_merge_audit::{MergeCandidate, audit_torus_merges};
 
 /// Designed corpus target collection (#991): stream → designed sample +
 /// honesty weights, the row set the term actually fits.

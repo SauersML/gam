@@ -299,6 +299,79 @@ impl SphereTangentEmbedding {
     }
 }
 
+/// Project activation rows onto the LayerNorm sphere: map each row `x_i` to the
+/// unit direction `u_i = x_i / ‖x_i‖₂`, optionally rescaled to a fixed `radius`
+/// (the RMSNorm convention `√p`, so the projected rows sit on the same sphere the
+/// downstream LayerNorm reads). Returns the projected rows (`n × p`) and the
+/// per-row Euclidean norms (`n`) — the quotiented-out radial scale, kept for
+/// diagnostics.
+///
+/// # Why fit here instead of in flat ℝᵖ
+///
+/// Post-LayerNorm the residual-stream geometry is a sphere × scale product: the
+/// model reads only the *direction* `u_i`, and the per-token norm `‖x_i‖` is a
+/// nuisance the LayerNorm discards. A curved atom fitted to reconstruct the flat
+/// activation `x_i = ‖x_i‖·u_i` under the Euclidean metric cannot tell the
+/// behaviorally-relevant direction from the nuisance radius: the squared-error
+/// objective weights each token by `‖x_i‖²`, so high-norm tokens dominate and the
+/// fitted closed curve *bends* toward them, absorbing norm variation into the
+/// decoder as spurious higher-harmonic curvature — and leaving a residual whose
+/// dominant component is the radial (norm-direction) term, which *rotates* with
+/// the latent and so violates the additive-isotropic-Gaussian residual the
+/// reconstruction certificate is conditional on. Fitting the projected `u_i`
+/// (an atom as a submanifold of the LN sphere) is invariant to `‖x_i‖` by
+/// construction: the spurious curvature and the radial residual both vanish.
+///
+/// A row of exact zero norm carries no direction and is a caller error, surfaced
+/// rather than silently imputed.
+pub fn ln_sphere_project(
+    rows: ArrayView2<'_, f64>,
+    radius: Option<f64>,
+) -> Result<(Array2<f64>, Array1<f64>), String> {
+    let (n, p) = rows.dim();
+    if n == 0 || p == 0 {
+        return Err(format!(
+            "ln_sphere_project: need a non-empty (n × p) matrix; got ({n}, {p})"
+        ));
+    }
+    let scale = match radius {
+        Some(r) if r.is_finite() && r > 0.0 => r,
+        Some(r) => {
+            return Err(format!(
+                "ln_sphere_project: radius must be finite and positive; got {r}"
+            ));
+        }
+        None => 1.0,
+    };
+    let mut projected = Array2::<f64>::zeros((n, p));
+    let mut norms = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let row = rows.row(i);
+        let mut sq = 0.0_f64;
+        for &value in row.iter() {
+            if !value.is_finite() {
+                return Err(format!(
+                    "ln_sphere_project: row {i} has a non-finite entry ({value})"
+                ));
+            }
+            sq += value * value;
+        }
+        let norm = sq.sqrt();
+        if !(norm > 0.0) {
+            return Err(format!(
+                "ln_sphere_project: row {i} has zero norm; a direction is undefined"
+            ));
+        }
+        norms[i] = norm;
+        let inv = scale / norm;
+        let mut out = projected.row_mut(i);
+        for j in 0..p {
+            out[j] = rows[[i, j]] * inv;
+        }
+    }
+    Ok((projected, norms))
+}
+
 /// Build an orthonormal basis `E` (`V × (V-1)`) of the hyperplane orthogonal to
 /// the unit vector `axis`, via a single Householder reflector that maps a pivot
 /// standard basis vector onto `axis`.

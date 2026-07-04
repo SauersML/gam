@@ -138,6 +138,37 @@ fn line_is_clean_against_a_line_and_contested_against_a_circle() {
     );
 }
 
+/// `n` points on a half-circle arc (embedded in the plane).
+fn arc_points(n: usize, r: f64) -> Array2<f64> {
+    let mut pts = Array2::<f64>::zeros((n, 2));
+    for i in 0..n {
+        let theta = std::f64::consts::PI * (i as f64) / ((n - 1) as f64);
+        pts[[i, 0]] = r * theta.cos();
+        pts[[i, 1]] = r * theta.sin();
+    }
+    pts
+}
+
+#[test]
+fn atlas_nerve_recovers_circle_and_arc() {
+    // Atlas-first inversion: read topology from the NERVE of a chart cover,
+    // never assuming it. A circle's nerve is a cycle (S¹); an arc's is a path.
+    let circle = atlas_nerve(circle_points(60, 2.0).view());
+    assert!(
+        circle.is_circle(),
+        "the nerve of a circle cover must recover S¹ (b₁=1, one component): {circle:?}"
+    );
+    let arc = atlas_nerve(arc_points(60, 2.0).view());
+    assert!(
+        arc.is_arc(),
+        "the nerve of an arc cover must recover a path (b₁=0, one component): {arc:?}"
+    );
+    assert!(
+        !arc.is_circle(),
+        "an arc must not be mistaken for a circle: {arc:?}"
+    );
+}
+
 #[test]
 fn precomputed_kind_has_no_prediction_to_contest() {
     let pts = circle_points(20, 1.0);

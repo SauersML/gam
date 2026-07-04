@@ -181,17 +181,22 @@ fn criterion_bits_reconcile_no_parallel_accounting() {
 ///     lowers its selection cost, which SHRINKS a richer chart's reported MDL gap
 ///     over it — the direction the math says (the overpay was inflating the win).
 fn tiling_codes(n: usize, g: usize, run: usize, seed: u64) -> SparseAtomCodes {
-    // Deterministic sliding contiguous run [start, start+run) with wraparound; the
-    // run position walks so adjacent atoms co-fire and the support process is a
-    // low-order (near-Markov) chain the tree model captures.
+    // A tiling dictionary of `g/run` disjoint tiles, each a contiguous block of
+    // `run` adjacent atoms that fires as a UNIT; every token activates exactly one
+    // tile (chosen deterministically). Within a tile the atoms are perfectly
+    // co-firing, so the pairwise (Chow–Liu tree) model captures the support
+    // structure almost exactly — the predictable adjacent-atom co-firing the
+    // reviewer's correction is about — while the uniform combinatorial price still
+    // charges `log₂ C(G, run)` as if every `run`-subset were possible.
+    let n_tiles = g / run;
     let mut codes = SparseAtomCodes::empty(n, g);
     let mut state = seed | 1;
     for row in 0..n {
-        // A cheap LCG step just to spread the run starts deterministically.
+        // A cheap LCG step just to spread the tile choices deterministically.
         state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        let start = (state >> 33) as usize % g;
+        let tile = (state >> 33) as usize % n_tiles;
         for off in 0..run {
-            codes.row_mut(row).assign((start + off) % g, 1.0);
+            codes.row_mut(row).assign(tile * run + off, 1.0);
         }
     }
     codes

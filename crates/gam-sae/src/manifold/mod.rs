@@ -152,6 +152,7 @@ mod isa_seed;
 mod kronecker;
 mod loss;
 mod outer_objective;
+mod pair_kappa;
 mod pca_seed;
 mod penalties;
 mod persistence;
@@ -163,6 +164,7 @@ mod shape_uncertainty;
 mod stagewise;
 mod streaming_plan;
 mod term;
+mod wbic_audit;
 
 #[cfg(test)]
 mod tests;
@@ -267,6 +269,9 @@ mod lambda_smooth_1556_tests;
 mod tests_behavior_twoblock_rung2;
 
 #[cfg(test)]
+mod tests_ln_sphere_ambient_f4;
+
+#[cfg(test)]
 mod tests_inframe_curved_2130;
 
 #[cfg(test)]
@@ -313,6 +318,7 @@ pub use isa_seed::*;
 pub(crate) use kronecker::*;
 pub use loss::*;
 pub use outer_objective::*;
+pub use pair_kappa::*;
 pub use pca_seed::*;
 pub use penalties::*;
 pub use persistence::*;
@@ -324,3 +330,4 @@ pub use shape_uncertainty::*;
 pub use stagewise::*;
 pub use streaming_plan::*;
 pub use term::*;
+pub use wbic_audit::*;

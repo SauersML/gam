@@ -42,7 +42,7 @@
 //! `structure_harvest` purity contract): same codes → same seed → same stream →
 //! same exceedances → same proposals.
 
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
@@ -248,13 +248,16 @@ impl CoactivationExceedance {
     }
 }
 
-/// Standard-deviation floor below which a pair's null joint count is treated as
-/// deterministic under the fixed margins. When the null spread collapses to
-/// (numerically) zero, the fixed margins pin the joint count, so the observed
-/// value cannot differ from the null mean by more than rounding — the exceedance
-/// is zero, not infinite. `1` count of spread is the smallest resolvable unit of a
-/// count statistic, so anything below it is noise, not signal.
-const NULL_SD_FLOOR: f64 = 1.0;
+/// Numerical floor guarding the exceedance division when a pair's null joint
+/// count has (essentially) zero spread. A pair the fixed margins PIN (no
+/// swappable configuration ever moves it — e.g. two columns locked together with
+/// no mixing room) has every replicate equal to the observed value, so its null
+/// mean equals the observation and the numerator is ~0: the ratio is a
+/// well-defined ~0 exceedance, not a spurious spike. The floor only prevents a
+/// literal divide-by-zero; it is deliberately tiny so a genuinely extreme pair
+/// (observed at the boundary of the fixed-margin polytope, tiny but non-zero
+/// spread) still reports a large exceedance rather than being clamped to noise.
+const NULL_SD_FLOOR: f64 = 1e-9;
 
 /// Estimate the per-pair co-activation exceedance of `codes` over the fixed-margin
 /// null, using `replicates` curveball replicates. The curveball mixing length is

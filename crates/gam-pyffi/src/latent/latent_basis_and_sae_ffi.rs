@@ -8128,6 +8128,103 @@ impl PySaeEncodeAtlas {
     }
 }
 
+/// The DISTILLED / AMORTIZED encoder, exposed to Python (reviewer condition #2).
+///
+/// Our held-out reconstruction comes from a per-row test-time optimization; a
+/// sparse-autoencoder's comes from one matmul. This encoder is the one-matmul
+/// distilled map: fit against a fit's EXACT per-row code (gate logits, per-atom
+/// coords, amplitudes) by closed-form evidence maximization, it predicts that
+/// code for fresh rows in a single matmul. `encode_amortized(X)` is the PRIMARY
+/// deployable out-of-sample encode; the exact `sae_manifold_predict_oos` solve is
+/// the ORACLE line, and the difference is the amortization gap.
+#[pyclass(name = "SaeAmortizedEncoder", unsendable)]
+pub struct PySaeAmortizedEncoder {
+    encoder: gam::terms::sae::amortized_encoder::LearnedAmortizedEncoder,
+}
+
+#[pymethods]
+impl PySaeAmortizedEncoder {
+    /// Fit the encoder against a fit's exact per-row code. `train_x` is the
+    /// `(n, p)` training corpus; `train_logits` and `train_amplitudes` are
+    /// `(n, K)`; `train_coords` is one `(n, d_k)` block per atom (the exact
+    /// solver's converged coordinates). The evidence chooses the encoder's
+    /// capacity (linear vs a diagonal-quadratic head).
+    #[new]
+    #[pyo3(signature = (train_x, train_logits, train_coords, train_amplitudes))]
+    fn new<'py>(
+        train_x: PyReadonlyArray2<'py, f64>,
+        train_logits: PyReadonlyArray2<'py, f64>,
+        train_coords: Vec<PyReadonlyArray2<'py, f64>>,
+        train_amplitudes: PyReadonlyArray2<'py, f64>,
+    ) -> PyResult<Self> {
+        let coords: Vec<Array2<f64>> = train_coords
+            .iter()
+            .map(|c| c.as_array().to_owned())
+            .collect();
+        let encoder = gam::terms::sae::amortized_encoder::LearnedAmortizedEncoder::fit(
+            train_x.as_array(),
+            train_logits.as_array(),
+            &coords,
+            train_amplitudes.as_array(),
+        )
+        .map_err(py_value_error)?;
+        Ok(Self { encoder })
+    }
+
+    /// Pooled log marginal likelihood of the trained encoder (the evidence).
+    #[getter]
+    fn log_evidence(&self) -> f64 {
+        self.encoder.log_evidence
+    }
+
+    /// Whether the evidence admitted the diagonal-quadratic head over the linear
+    /// null (capacity justified by evidence, not a knob).
+    #[getter]
+    fn used_quadratic_head(&self) -> bool {
+        self.encoder.used_quadratic_head
+    }
+
+    /// Number of features in the winning design.
+    #[getter]
+    fn feature_dim(&self) -> usize {
+        self.encoder.feature_dim
+    }
+
+    /// Effective degrees of freedom per target of the trained encoder.
+    #[getter]
+    fn effective_dof(&self) -> f64 {
+        self.encoder.effective_dof
+    }
+
+    /// Number of atoms the encoder predicts a code for.
+    #[getter]
+    fn k_atoms(&self) -> usize {
+        self.encoder.k_atoms()
+    }
+
+    /// One-matmul encode of fresh rows `x` `(m, p)`. Returns `{logits (m, K),
+    /// coords: list of (m, d_k), amplitudes (m, K)}` — the distilled per-row code
+    /// in the exact solver's layout. Amplitudes are clamped at zero (masses are
+    /// non-negative).
+    #[pyo3(signature = (x))]
+    fn encode_amortized<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'py, f64>,
+    ) -> PyResult<Py<PyDict>> {
+        let code = self.encoder.predict(x.as_array()).map_err(py_value_error)?;
+        let out = PyDict::new(py);
+        out.set_item("logits", code.logits.into_pyarray(py))?;
+        let coords_py = PyList::empty(py);
+        for c in code.coords {
+            coords_py.append(c.into_pyarray(py))?;
+        }
+        out.set_item("coords", coords_py)?;
+        out.set_item("amplitudes", code.amplitudes.into_pyarray(py))?;
+        Ok(out.unbind())
+    }
+}
+
 /// (#1010) Build a Kantorovich-certified [`PySaeEncodeAtlas`] over a fitted SAE
 /// dictionary. `decoder_blocks[k]` is atom `k`'s frozen `(M_k, p)` decoder;
 /// `amplitude_bounds[k]` bounds `|z_k|` and `target_norm_bound` bounds `‖x‖` over

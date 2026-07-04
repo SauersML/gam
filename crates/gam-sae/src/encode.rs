@@ -714,6 +714,88 @@ impl EncodeResult {
     }
 }
 
+/// The honest cost breakdown of the encode tax (reviewer condition #3). Every
+/// (row, atom) encode lands in exactly one of three tiers, in ascending cost:
+///
+///   1. **amortized-certified** — the one-mat-vec distilled predictor's start
+///      already satisfies the Kantorovich `h ≤ ½` certificate. Cheapest.
+///   2. **Newton-rescued** — the amortized start is uncertified, but the
+///      certified IFT-warm-start Newton encode lands a certified root. Middling.
+///   3. **multi-start fallback** — neither certifies, so the row rides the exact
+///      multi-start solve. This is the true cost MULTIPLIER at scale, and its
+///      fraction GROWS with atom similarity / co-activation interference (the
+///      per-row joint `(t, a)` landscape multiplies basins that no per-atom
+///      certificate covers). Reporting it is what keeps the encode-tax story
+///      honest — an SAE's one-matmul encode has no analogue of this tail.
+///
+/// The tiers partition the (row, atom) grid: `amortized_certified +
+/// newton_rescued + multistart_fallback == n_rows · n_atoms`.
+#[derive(Debug, Clone, Default)]
+pub struct FallbackTelemetry {
+    pub n_rows: usize,
+    pub n_atoms: usize,
+    /// (row, atom) encodes certified by the cheap amortized predictor.
+    pub amortized_certified: usize,
+    /// (row, atom) encodes the amortized predictor missed but the certified
+    /// Newton warm-start rescued.
+    pub newton_rescued: usize,
+    /// (row, atom) encodes neither tier certified — routed to the exact
+    /// multi-start solve.
+    pub multistart_fallback: usize,
+}
+
+impl FallbackTelemetry {
+    /// Total (row, atom) encodes accounted for.
+    #[must_use]
+    pub fn total(&self) -> usize {
+        self.n_rows * self.n_atoms
+    }
+
+    /// Fraction of encodes the cheap amortized predictor certified outright.
+    #[must_use]
+    pub fn amortized_fraction(&self) -> f64 {
+        let t = self.total();
+        if t == 0 {
+            0.0
+        } else {
+            self.amortized_certified as f64 / t as f64
+        }
+    }
+
+    /// Fraction of encodes rescued by the certified Newton warm-start.
+    #[must_use]
+    pub fn newton_fraction(&self) -> f64 {
+        let t = self.total();
+        if t == 0 {
+            0.0
+        } else {
+            self.newton_rescued as f64 / t as f64
+        }
+    }
+
+    /// Fraction of encodes that fell through to the exact multi-start solve —
+    /// the encode-tax cost multiplier.
+    #[must_use]
+    pub fn multistart_fraction(&self) -> f64 {
+        let t = self.total();
+        if t == 0 {
+            0.0
+        } else {
+            self.multistart_fallback as f64 / t as f64
+        }
+    }
+
+    /// Fold another atom's tallies into this one (n_rows is shared; n_atoms and
+    /// the tier counts accumulate).
+    fn accumulate(&mut self, other: &FallbackTelemetry) {
+        self.n_rows = other.n_rows;
+        self.n_atoms += other.n_atoms;
+        self.amortized_certified += other.amortized_certified;
+        self.newton_rescued += other.newton_rescued;
+        self.multistart_fallback += other.multistart_fallback;
+    }
+}
+
 /// Per-row Kantorovich certificate at a start `t₀` for one atom encode.
 #[derive(Debug, Clone, Copy)]
 pub struct RowCertificate {
@@ -2045,6 +2127,65 @@ impl EncodeAtlas {
             certified.push(cert);
         }
         Ok(EncodeResult::from_rows(coords, certified))
+    }
+
+    /// Encode one atom's rows through the full three-tier fallback cascade and
+    /// report the cost breakdown ([`FallbackTelemetry`], reviewer condition #3).
+    ///
+    /// Each row is tried cheapest-first: the amortized one-mat-vec predictor,
+    /// then (if uncertified) the certified IFT-warm-start Newton encode, then (if
+    /// still uncertified) it is counted for the exact multi-start solve. The
+    /// returned coords carry the best CERTIFIED encode reached; a multi-start row
+    /// keeps the Newton iterate as its (uncertified) coordinate so the caller can
+    /// still decode it, exactly as [`super::SaeManifoldTerm::amortized_encode_target`]
+    /// does — the honesty flag rides `certified`.
+    ///
+    /// This is the instrumented analogue of [`Self::amortized_encode_batch`] +
+    /// the per-row Newton rescue: it does the SAME work, and additionally counts
+    /// which tier certified each encode so the multi-start-fallback fraction (the
+    /// encode-tax multiplier) is measurable.
+    pub fn encode_atom_with_fallback_telemetry(
+        &self,
+        atom: &SaeManifoldAtom,
+        atom_index: usize,
+        targets: ArrayView2<'_, f64>,
+        amplitudes: ArrayView1<'_, f64>,
+    ) -> Result<(EncodeResult, FallbackTelemetry), String> {
+        let n = targets.nrows();
+        if amplitudes.len() != n {
+            return Err(format!(
+                "encode_atom_with_fallback_telemetry: amplitudes len {} != rows {n}",
+                amplitudes.len()
+            ));
+        }
+        let amortized = self.amortized_encode_batch(atom, atom_index, targets, amplitudes)?;
+        let mut coords = amortized.coords;
+        let mut certified = amortized.certified;
+        let mut telemetry = FallbackTelemetry {
+            n_rows: n,
+            n_atoms: 1,
+            ..FallbackTelemetry::default()
+        };
+        for row in 0..n {
+            if certified[row] {
+                telemetry.amortized_certified += 1;
+                continue;
+            }
+            // The amortized predictor missed: try the certified Newton warm-start.
+            let (t, cert) =
+                self.certified_encode_row(atom, atom_index, targets.row(row), amplitudes[row])?;
+            // Keep the Newton iterate regardless (it is a better start than the
+            // amortized one even when uncertified, and a multi-start row still
+            // needs a decodable coordinate).
+            coords.row_mut(row).assign(&t);
+            if cert.certified() {
+                certified[row] = true;
+                telemetry.newton_rescued += 1;
+            } else {
+                telemetry.multistart_fallback += 1;
+            }
+        }
+        Ok((EncodeResult::from_rows(coords, certified), telemetry))
     }
 
     /// Batched certified encode over many rows against one atom (the #988
@@ -3416,6 +3557,173 @@ pub(crate) fn chart_region(
     }
 }
 
+/// Per-atom ambient tangents at the given coords: for atom `k` and row `i`, the
+/// `d_k × p` matrix whose axis-`a` row is `∂m_k/∂t_a = (∂Φ/∂t_a)·B_k`, the image
+/// tangent the joint Hessian couples through. `None` for an atom with no basis
+/// evaluator (its coordinate is not differentiable, so it carries no coupling).
+fn atom_row_tangents(
+    atom: &SaeManifoldAtom,
+    coords: ArrayView2<'_, f64>,
+) -> Result<Option<Vec<Array2<f64>>>, String> {
+    let Some(evaluator) = atom.basis_evaluator.as_ref() else {
+        return Ok(None);
+    };
+    let n = coords.nrows();
+    let d = atom.latent_dim;
+    let p = atom.output_dim();
+    let (_phi, jet) = evaluator.evaluate(coords)?; // jet: (n, M, d)
+    let m = jet.shape()[1];
+    let b = &atom.decoder_coefficients; // (M, p)
+    let mut out = Vec::with_capacity(n);
+    for row in 0..n {
+        let mut tan = Array2::<f64>::zeros((d, p));
+        for axis in 0..d {
+            for out_col in 0..p {
+                let mut acc = 0.0;
+                for basis_col in 0..m {
+                    acc += jet[[row, basis_col, axis]] * b[[basis_col, out_col]];
+                }
+                tan[[axis, out_col]] = acc;
+            }
+        }
+        out.push(tan);
+    }
+    Ok(Some(out))
+}
+
+/// Smallest eigenvalue of the symmetric `d × d` Gauss–Newton curvature block
+/// `z² · T Tᵀ` (`T` is `d × p`). `d = 1` is the scalar fast path; general `d`
+/// uses a symmetric eigensolve.
+fn min_curvature_eigenvalue(tan: &Array2<f64>, z: f64) -> Result<f64, String> {
+    let d = tan.nrows();
+    if d == 0 {
+        return Ok(0.0);
+    }
+    let z2 = z * z;
+    if d == 1 {
+        let row = tan.row(0);
+        return Ok(z2 * row.dot(&row));
+    }
+    let mut gram = Array2::<f64>::zeros((d, d));
+    for a in 0..d {
+        for bx in 0..d {
+            gram[[a, bx]] = z2 * tan.row(a).dot(&tan.row(bx));
+        }
+    }
+    let (evals, _vecs) = gram
+        .eigh(faer::Side::Lower)
+        .map_err(|e| format!("min_curvature_eigenvalue: eigh failed: {e:?}"))?;
+    Ok(evals.iter().copied().fold(f64::INFINITY, f64::min))
+}
+
+/// Frobenius norm of the cross-coupling block `z_k z_j · T_k T_jᵀ`
+/// (`T_k` is `d_k × p`, `T_j` is `d_j × p`). Frobenius upper-bounds the operator
+/// norm, so a dominance decision made against it is SOUND.
+fn cross_block_frobenius(tan_k: &Array2<f64>, tan_j: &Array2<f64>, zk: f64, zj: f64) -> f64 {
+    let mut acc = 0.0;
+    for a in 0..tan_k.nrows() {
+        for bx in 0..tan_j.nrows() {
+            let dot = tan_k.row(a).dot(&tan_j.row(bx));
+            acc += dot * dot;
+        }
+    }
+    (zk * zj).abs() * acc.sqrt()
+}
+
+/// The JOINT (multi-atom) encode-fallback fraction: the share of rows whose
+/// per-row joint reconstruction problem across CO-ACTIVE atoms is NOT covered by
+/// the composition of the per-atom certificates, so the row genuinely needs the
+/// exact multi-start solve (reviewer condition #3 — the honest encode-tax cost
+/// multiplier at scale).
+///
+/// The per-atom Kantorovich certificate certifies each atom's coordinate encode
+/// IN ISOLATION — a block-diagonal view of the joint Hessian. The joint problem
+/// couples co-active atoms through the off-diagonal blocks
+/// `H_kj = z_k z_j J_k(t_k)ᵀ J_j(t_j)` (tangent-image inner products). When an
+/// atom's own curvature block fails to dominate its coupling to the rest —
+/// Gershgorin: `λ_min(H_kk) ≤ Σ_{j≠k} ‖H_kj‖` — the block-diagonal certificate
+/// no longer implies a joint root, a second basin can open, and the row must go
+/// to multi-start. This fraction GROWS with atom-image similarity and
+/// co-activation: no per-atom certificate covers the joint problem.
+///
+/// The curvature block uses the Gauss–Newton form `z_k² J_kᵀ J_k` (exact for
+/// flat/linear atoms, where the residual-curvature term vanishes identically);
+/// the off-diagonal is measured in Frobenius norm, which upper-bounds the
+/// operator norm, so a row DECLARED dominant is genuinely dominant and the
+/// fraction never under-reports the multi-start need. Rows with fewer than two
+/// co-active atoms have no cross blocks and are never counted as fallbacks.
+///
+/// `amplitude_floor` is the mass above which an atom counts as co-active; pass a
+/// small positive value (a domain threshold on the assignment mass, not a solver
+/// knob).
+pub fn joint_encode_fallback_fraction(
+    atoms: &[SaeManifoldAtom],
+    coords: &[Array2<f64>],
+    amplitudes: ArrayView2<'_, f64>,
+    amplitude_floor: f64,
+) -> Result<f64, String> {
+    let k_atoms = atoms.len();
+    let (n, amp_k) = amplitudes.dim();
+    if amp_k != k_atoms {
+        return Err(format!(
+            "joint_encode_fallback_fraction: amplitudes have {amp_k} cols but {k_atoms} atoms"
+        ));
+    }
+    if coords.len() != k_atoms {
+        return Err(format!(
+            "joint_encode_fallback_fraction: {} coord blocks but {k_atoms} atoms",
+            coords.len()
+        ));
+    }
+    if n == 0 || k_atoms == 0 {
+        return Ok(0.0);
+    }
+    // Per-atom row tangents (None ⇒ evaluator-less atom, no coupling).
+    let mut tangents: Vec<Option<Vec<Array2<f64>>>> = Vec::with_capacity(k_atoms);
+    for (atom_idx, atom) in atoms.iter().enumerate() {
+        if coords[atom_idx].nrows() != n {
+            return Err(format!(
+                "joint_encode_fallback_fraction: coord block {atom_idx} has {} rows, expected {n}",
+                coords[atom_idx].nrows()
+            ));
+        }
+        tangents.push(atom_row_tangents(atom, coords[atom_idx].view())?);
+    }
+    let mut fallback_rows = 0usize;
+    for row in 0..n {
+        // Gather this row's co-active, differentiable atoms.
+        let active: Vec<usize> = (0..k_atoms)
+            .filter(|&k| amplitudes[[row, k]] > amplitude_floor && tangents[k].is_some())
+            .collect();
+        if active.len() < 2 {
+            continue; // no cross blocks: the per-atom certificate composes trivially
+        }
+        let mut row_needs_multistart = false;
+        for &k in &active {
+            let tan_k = &tangents[k].as_ref().unwrap()[row];
+            let zk = amplitudes[[row, k]];
+            let lam_min = min_curvature_eigenvalue(tan_k, zk)?;
+            let mut coupling = 0.0;
+            for &j in &active {
+                if j == k {
+                    continue;
+                }
+                let tan_j = &tangents[j].as_ref().unwrap()[row];
+                let zj = amplitudes[[row, j]];
+                coupling += cross_block_frobenius(tan_k, tan_j, zk, zj);
+            }
+            if lam_min <= coupling {
+                row_needs_multistart = true;
+                break;
+            }
+        }
+        if row_needs_multistart {
+            fallback_rows += 1;
+        }
+    }
+    Ok(fallback_rows as f64 / n as f64)
+}
+
 #[cfg(test)]
 mod encode_fix_tests {
     //! Unit tests for the two `certify_with_basin_warmup` fixes:
@@ -3841,5 +4149,142 @@ mod encode_fix_tests {
         assert!(!warmup_should_reject(true, 0.1, 0.9));
         // A genuinely-contracting uncertified step is accepted (no regression).
         assert!(!warmup_should_reject(false, 0.4, 0.9));
+    }
+}
+
+#[cfg(test)]
+mod joint_fallback_tests {
+    //! Reviewer condition #3 — the multi-start-fallback fraction is an honest
+    //! encode-tax number that GROWS with atom-image similarity / co-activation
+    //! interference. These tests drive `joint_encode_fallback_fraction` over a
+    //! similarity sweep on flat (linear) atoms, where the Gauss–Newton curvature
+    //! block is EXACT (no residual-curvature term), so the Gershgorin dominance
+    //! decision is the true joint certificate and the curve is analytic.
+    use super::*;
+    use crate::manifold::SaeAtomBasisKind;
+    use ndarray::Array2;
+    use std::sync::Arc;
+
+    /// Deterministic LCG (no `rand` dependency) for reproducible amplitudes.
+    struct Lcg(u64);
+    impl Lcg {
+        fn unit(&mut self) -> f64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((self.0 >> 11) as f64) / ((1u64 << 53) as f64)
+        }
+    }
+
+    /// Build `k` degree-1 (flat) atoms in `R^p` whose image TANGENT directions
+    /// have common pairwise cosine `rho`: `dir_k = √rho · e0 + √(1−rho) · e_{k+1}`
+    /// with `{e0, e1, …}` orthonormal. Requires `p ≥ k + 1`. Each atom's decoder
+    /// puts the tangent on the degree-1 monomial row, so `∂m/∂t = dir_k` exactly.
+    fn similar_linear_atoms(k: usize, p: usize, rho: f64) -> Vec<SaeManifoldAtom> {
+        assert!(p >= k + 1, "need p >= k+1 orthonormal directions");
+        let evaluator = Arc::new(EuclideanPatchEvaluator::new(1, 1).expect("degree-1 patch"));
+        // A single coordinate row is enough to pin the (constant) tangent; the
+        // diagnostic re-evaluates the jet at whatever coords it is given.
+        let coord = Array2::<f64>::zeros((1, 1));
+        let (phi, jet) = evaluator.evaluate(coord.view()).expect("evaluate");
+        let m = phi.ncols();
+        (0..k)
+            .map(|atom_idx| {
+                let mut dec = Array2::<f64>::zeros((m, p));
+                // Row 1 is the degree-1 monomial (`∂φ/∂t = 1` there); place the
+                // unit tangent direction on it.
+                dec[[1, 0]] = rho.sqrt();
+                dec[[1, atom_idx + 1]] = (1.0 - rho).sqrt();
+                SaeManifoldAtom::new(
+                    "lin",
+                    SaeAtomBasisKind::EuclideanPatch,
+                    1,
+                    phi.clone(),
+                    jet.clone(),
+                    dec,
+                    Array2::<f64>::eye(m),
+                )
+                .expect("atom builds")
+                .with_basis_second_jet(evaluator.clone())
+            })
+            .collect()
+    }
+
+    /// The joint multi-start-fallback fraction is MONOTONE NON-DECREASING in
+    /// atom-image similarity, is exactly zero when the atoms are orthogonal, and
+    /// is strictly positive once the images are strongly aligned — the honest
+    /// encode-tax cost multiplier the reviewer asks for.
+    #[test]
+    fn joint_fallback_fraction_rises_with_atom_similarity() {
+        let k = 4usize;
+        let p = 8usize;
+        let n = 400usize;
+        // Per-row amplitudes: a spread of masses so that at intermediate
+        // similarity SOME rows (those with an atom whose mass is dominated by its
+        // co-active neighbours) tip out of Gershgorin dominance while others stay
+        // in — a smooth curve rather than a step.
+        let mut rng = Lcg(42);
+        let amplitudes = Array2::from_shape_fn((n, k), |_| 0.2 + 1.3 * rng.unit());
+        // Coordinates are irrelevant for flat atoms (constant tangent), but the
+        // diagnostic still evaluates the jet at them.
+        let coords: Vec<Array2<f64>> =
+            (0..k).map(|_| Array2::<f64>::zeros((n, 1))).collect();
+        let floor = 1.0e-9;
+
+        let sweep = [0.0_f64, 0.2, 0.4, 0.6, 0.8, 0.95];
+        let mut fractions = Vec::new();
+        for &rho in &sweep {
+            let atoms = similar_linear_atoms(k, p, rho);
+            let frac = joint_encode_fallback_fraction(&atoms, &coords, amplitudes.view(), floor)
+                .expect("joint fallback fraction computes");
+            assert!(
+                (0.0..=1.0).contains(&frac),
+                "fallback fraction must be a probability, got {frac} at rho={rho}"
+            );
+            fractions.push(frac);
+        }
+        // Orthogonal atoms: the block-diagonal per-atom certificates compose, no
+        // row needs multi-start.
+        assert!(
+            fractions[0] == 0.0,
+            "orthogonal atoms must need no multi-start fallback, got {}",
+            fractions[0]
+        );
+        // Monotone non-decreasing across the similarity sweep.
+        for w in fractions.windows(2) {
+            assert!(
+                w[1] >= w[0] - 1.0e-12,
+                "fallback fraction must not DECREASE as similarity rises: {:?}",
+                fractions
+            );
+        }
+        // Strongly-aligned images force a materially higher fallback fraction —
+        // the effect is real, not a rounding wobble.
+        assert!(
+            *fractions.last().unwrap() > 0.25,
+            "strong atom similarity must drive a substantial multi-start tail; curve={fractions:?}"
+        );
+    }
+
+    /// A single co-active atom per row has no cross blocks, so the joint fallback
+    /// fraction is zero regardless of how curved or ill-conditioned the atom is —
+    /// the joint tax is purely a CO-ACTIVATION phenomenon.
+    #[test]
+    fn joint_fallback_zero_without_coactivation() {
+        let k = 3usize;
+        let p = 8usize;
+        let n = 50usize;
+        let atoms = similar_linear_atoms(k, p, 0.9); // highly similar, but…
+        // …only ONE atom active per row (block-diagonal one-hot amplitudes).
+        let mut amplitudes = Array2::<f64>::zeros((n, k));
+        for row in 0..n {
+            amplitudes[[row, row % k]] = 1.0;
+        }
+        let coords: Vec<Array2<f64>> =
+            (0..k).map(|_| Array2::<f64>::zeros((n, 1))).collect();
+        let frac = joint_encode_fallback_fraction(&atoms, &coords, amplitudes.view(), 1.0e-9)
+            .expect("computes");
+        assert!(
+            frac == 0.0,
+            "no co-activation ⇒ no joint fallback, got {frac}"
+        );
     }
 }

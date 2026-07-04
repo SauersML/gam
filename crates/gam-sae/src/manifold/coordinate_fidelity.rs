@@ -1590,13 +1590,17 @@ mod coordinate_fidelity_tests {
         // A single concentrated arc (unimodal, spread) is neither uniform nor a
         // finite anchor set: the single wrapped Gaussian must win, so the
         // occupancy law is Continuous.
-        let n = 400;
+        let n = 1200;
         let base = vdc(n);
-        // Map a uniform draw through a smooth unimodal bump centered at 0.5 with
-        // moderate spread (a triangular-ish concentration), staying continuous.
-        let u: Vec<f64> = base
-            .iter()
-            .map(|&x| (0.5 + 0.12 * (x - 0.5)).rem_euclid(1.0))
+        // A Bates(3) draw (mean of three low-discrepancy uniforms) is a genuinely
+        // bell-shaped, single-moded density centered at 0.5 — a concentrated arc,
+        // not a finite anchor set. Scale toward the center so it stays a spread
+        // (not sub-resolution) continuous bump.
+        let u: Vec<f64> = (0..n / 3)
+            .map(|i| {
+                let m = (base[3 * i] + base[3 * i + 1] + base[3 * i + 2]) / 3.0;
+                (0.5 + 0.6 * (m - 0.5)).rem_euclid(1.0)
+            })
             .collect();
         let law = classify_occupancy(&u);
         assert_eq!(law, OccupancyLaw::Continuous, "{law:?}");

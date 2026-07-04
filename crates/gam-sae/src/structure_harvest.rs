@@ -44,6 +44,7 @@ use std::sync::Arc;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::atom_codes::SparseAtomCodes;
+use crate::null_sampler::{NULL_REPLICATES, coactivation_exceedance};
 use crate::basis::{
     CylinderHarmonicEvaluator, EuclideanPatchEvaluator, PeriodicHarmonicEvaluator,
     SaeBasisSecondJet, SphereChartEvaluator, TorusHarmonicEvaluator,
@@ -94,6 +95,28 @@ const ARD_DIVERGENCE_LOG_PRECISION: f64 = 12.0;
 /// candidate. The e-gate, not this threshold, decides acceptance — this only
 /// keeps the proposal stream from carrying every independent pair.
 const FUSION_DEPENDENCE_FLOOR: f64 = 0.6;
+
+/// Conventional one-sided screening level for the fixed-margin-null exceedance
+/// gate on co-activation triggers (#976 top-`k` correction) — the SAME 0.05
+/// screening convention as [`WITHIN_ATOM_CARVE_ALPHA`], deliberately not a
+/// certificate level: the exceedance gate is a PROPOSAL filter (does this pair
+/// co-fire ABOVE what the top-`k` margins mechanically force?), and the held-out
+/// e-gate still owns final acceptance. See [`null_exceedance_z_floor`].
+const NULL_EXCEEDANCE_ALPHA: f64 = 0.05;
+
+/// The standardized-excess floor a pair's fixed-margin-null exceedance must clear
+/// to be proposed, derived (never hand-set) from [`NULL_EXCEEDANCE_ALPHA`] as the
+/// one-sided standard-normal deviate `z_{1−α}`. Charging the raw co-activation
+/// coupling instead would inherit the top-`k` mechanical (anti)correlation the
+/// null absorbs; requiring `z ≥ z_{1−α}` keeps only genuine above-margin
+/// co-firing.
+fn null_exceedance_z_floor() -> f64 {
+    use statrs::distribution::{ContinuousCDF, Normal};
+    // Standard normal inverse-CDF at 1 − α (α the conventional screening level).
+    Normal::new(0.0, 1.0)
+        .expect("standard normal is well-defined")
+        .inverse_cdf(1.0 - NULL_EXCEEDANCE_ALPHA)
+}
 
 /// Minimum conditional asymmetry for a pair to be proposed for a FISSION audit
 /// (the A⇒B absorption signature: one conditional near 1 without the converse).
@@ -341,44 +364,79 @@ pub fn harvest_move_proposals(
         }
     }
 
-    // --- Fusions: top co-activation dependence -----------------------------
+    // --- Fixed-margin (curveball) null for the co-activation triggers ------
+    // Top-`k` selection stamps mechanical (anti)correlation into the co-activation
+    // masks (each token's fixed support size induces a negative indicator
+    // covariance between every pair; a hard top-`k` puts zero mass off the
+    // `k`-shell). A raw coupling trigger reads that artifact as structure. So the
+    // fusion/fission triggers below are gated on the EXCEEDANCE of each pair's
+    // joint activation over a null that preserves both the row margins (the
+    // top-`k` constraint) and the column margins (per-atom totals): only
+    // above-margin co-firing survives. Computed once and shared by both triggers;
+    // skipped entirely when neither trigger is enabled (the null is not free).
     let codes = sparse_codes_from_term(term);
+    let want_coactivation = params.max_fusions > 0 || params.max_fissions > 0;
+    let exceedance =
+        want_coactivation.then(|| coactivation_exceedance(&codes, NULL_REPLICATES));
+    let z_floor = null_exceedance_z_floor();
+
+    // --- Fusions: top co-activation dependence, gated by the null ----------
+    // The trigger REPORTED is the null exceedance `z` (above-margin co-firing),
+    // not the raw dependence: the raw floor only pre-selects genuinely co-firing
+    // pairs, and the fixed-margin null strips the mechanical top-`k` coupling.
     let mut fusion_pairs: Vec<(usize, usize, f64)> = Vec::new();
     for a in 0..k {
         for b in (a + 1)..k {
             let stats = codes.coactivation(a, b);
             let dep = stats.dependence();
-            if dep >= FUSION_DEPENDENCE_FLOOR {
-                fusion_pairs.push((a, b, dep));
+            if dep < FUSION_DEPENDENCE_FLOOR {
+                continue;
+            }
+            let z = exceedance
+                .as_ref()
+                .map_or(0.0, |ex| ex.excess_z(a, b));
+            if z >= z_floor {
+                fusion_pairs.push((a, b, z));
             }
         }
     }
     fusion_pairs.sort_by(|x, y| y.2.total_cmp(&x.2).then(x.0.cmp(&y.0)).then(x.1.cmp(&y.1)));
-    for &(a, b, dep) in fusion_pairs.iter().take(params.max_fusions) {
-        proposals.push(proposal(term, StructureMove::Fusion { a, b }, dep));
+    for &(a, b, z) in fusion_pairs.iter().take(params.max_fusions) {
+        proposals.push(proposal(term, StructureMove::Fusion { a, b }, z));
     }
 
-    // --- Fission audits: absorption-suspect asymmetry ----------------------
+    // --- Fission audits: absorption-suspect asymmetry, gated by the null ---
     let mut fission_atoms: Vec<(usize, f64)> = Vec::new();
     for a in 0..k {
         for b in (a + 1)..k {
             let stats = codes.coactivation(a, b);
             let asym = stats.absorption_asymmetry();
-            if asym >= ABSORPTION_ASYMMETRY_FLOOR {
-                // The parent (the conditioned-on atom whose support nests the
-                // child) is the one whose `P(parent|child) ≈ 1`. Audit the
-                // parent for the absorbed substructure.
-                let parent = if stats.p_a_given_b >= stats.p_b_given_a {
-                    a
-                } else {
-                    b
-                };
-                // Fission trigger is audit significance ASCENDING; map a high
-                // asymmetry to a low significance proxy `1 − asym` so the most
-                // asymmetric (most suspect) pair sorts first.
-                let significance = (1.0 - asym).max(0.0);
-                fission_atoms.push((parent, significance));
+            if asym < ABSORPTION_ASYMMETRY_FLOOR {
+                continue;
             }
+            // A nested (absorbed) pair co-fires ABOVE its fixed margins; a pair
+            // whose asymmetry is only the top-`k` mechanical artifact does not.
+            // Require the joint activation to exceed the fixed-margin null before
+            // auditing, so mechanical asymmetry is not read as absorption.
+            let z = exceedance
+                .as_ref()
+                .map_or(0.0, |ex| ex.excess_z(a, b));
+            if z < z_floor {
+                continue;
+            }
+            // The parent (the conditioned-on atom whose support nests the
+            // child) is the one whose `P(parent|child) ≈ 1`. Audit the
+            // parent for the absorbed substructure.
+            let parent = if stats.p_a_given_b >= stats.p_b_given_a {
+                a
+            } else {
+                b
+            };
+            // Fission trigger is audit significance ASCENDING; map a high
+            // asymmetry to a low significance proxy `1 − asym` so the most
+            // asymmetric (most suspect) pair sorts first.
+            let significance = (1.0 - asym).max(0.0);
+            fission_atoms.push((parent, significance));
         }
     }
     // Keep the most-suspect (lowest significance) audit per parent atom.

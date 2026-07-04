@@ -1,3 +1,4 @@
+pub mod amortized_encoder;
 pub mod assignment;
 pub mod atom_codes;
 pub mod basis;

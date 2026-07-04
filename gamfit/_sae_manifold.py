@@ -2429,13 +2429,16 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         raise ValueError(
             f"d_atom must be >= 1 for every atom; got {dims}"
         )
-    # #2098 (SPEC-8) — the heterogeneous-`d_atom` + row-block-penalty
-    # incompatibility (isometry / native ARD / SCAD-MCP coord sparsity /
-    # block-orthogonality on a mixed per-atom "t" block) is now validated inside
-    # the Rust engine (`SaeManifoldTerm::validate_heterogeneous_atom_compatibility`,
-    # called in `sae_manifold_fit_inner`), which self-protects and raises a direct
-    # `ValueError` up front. The facade stays thin and simply surfaces that engine
-    # error rather than duplicating the check here.
+    # #2098 (SPEC-8) / F6 — the heterogeneous-`d_atom` + row-block-penalty
+    # compatibility rule is validated inside the Rust engine
+    # (`SaeManifoldTerm::validate_heterogeneous_atom_compatibility`, called in
+    # `sae_manifold_fit_inner`). The DIM-ADAPTIVE row-block penalties (native ARD,
+    # SCAD-MCP coord sparsity, sparsity, isometry gauge) compose per atom over a
+    # mixed "t" block and are ADMITTED; only the FIXED-`d` structural penalties
+    # (block-orthogonality, TopK/JumpReLU, row-precision) require a uniform
+    # atom_dim and are refused with a direct `ValueError` up front. The facade
+    # stays thin and simply surfaces that engine decision rather than duplicating
+    # the check here.
     # Eager sparsity_weight validation (issue #184). The signature
     # advertises `sparsity_weight: float = 1.0`; `0.0` is the canonical
     # "no sparsity" baseline and must be accepted. Reject only negative,
