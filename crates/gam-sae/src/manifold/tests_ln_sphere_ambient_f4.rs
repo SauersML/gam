@@ -117,48 +117,73 @@ fn seed_coords(x: &Array2<f64>) -> Array2<f64> {
 /// in harmonics ≥ 2. The basis order is `[1, sin·1, cos·1, sin·2, cos·2, …]`, so
 /// harmonic 1 is rows 1–2 and everything from row 3 up is higher-harmonic —
 /// spurious curvature for a pure-harmonic-1 generator.
-fn higher_harmonic_fraction(decoder: &Array2<f64>) -> f64 {
-    let m = decoder.nrows();
-    let row_energy = |row: usize| -> f64 { decoder.row(row).iter().map(|&v| v * v).sum::<f64>() };
-    let h1 = row_energy(1) + row_energy(2);
-    let mut hi = 0.0_f64;
-    for row in 3..m {
-        hi += row_energy(row);
+/// Higher-harmonic energy fraction of the FITTED curve as a function of the true
+/// (evenly-spaced) latent angle `θ`. Because `θ` is uniform, the harmonics of `θ`
+/// are exactly orthogonal, so a plain DFT reads off each harmonic's energy — no
+/// dependence on the solver's internal decoder representation (which is stored in
+/// a whitened basis). The true generator's fitted image is pure harmonic-1 in
+/// `θ`; any energy in harmonics ≥ 2 is spurious curvature the fit invented. A flat
+/// fit reconstructs `x = r·v(θ)` where the nuisance norm `r` is θ-independent
+/// noise, so `r·v(θ)` spreads across every harmonic; the LN-sphere fit sees
+/// `v(θ)` (unit) and stays clean.
+fn fitted_curve_hh(fitted: &Array2<f64>, thetas: &[f64], harmonics: usize) -> f64 {
+    let (n, p) = fitted.dim();
+    let mut e1 = 0.0_f64;
+    let mut ehi = 0.0_f64;
+    for h in 1..=harmonics {
+        let mut energy = 0.0_f64;
+        for j in 0..p {
+            let mut c = 0.0_f64;
+            let mut s = 0.0_f64;
+            for i in 0..n {
+                let a = (h as f64) * thetas[i];
+                c += fitted[[i, j]] * a.cos();
+                s += fitted[[i, j]] * a.sin();
+            }
+            energy += c * c + s * s;
+        }
+        if h == 1 {
+            e1 = energy;
+        } else {
+            ehi += energy;
+        }
     }
-    hi / (h1 + hi + 1e-30)
+    ehi / (e1 + ehi + 1e-30)
 }
 
-/// Fit a K=1 circle to `target` and return `(higher_harmonic_fraction, radial
-/// residual RMS, total residual RMS)`. The radial residual is the component of
-/// `target − fitted` along the fitted curve's radial direction `γ/‖γ‖` — the
-/// norm-direction term the flat metric leaves structured.
+/// Mean cosine similarity between the fitted DIRECTION and the true direction
+/// `v(θ)` — a norm-blind fidelity the LN-sphere fit optimizes directly and the
+/// flat fit trades away to chase the squared error of high-norm tokens.
+fn mean_directional_cos(fitted: &Array2<f64>, thetas: &[f64]) -> f64 {
+    let n = fitted.nrows();
+    let mut acc = 0.0_f64;
+    for i in 0..n {
+        let g = fitted.row(i);
+        let gnorm = g.iter().map(|&v| v * v).sum::<f64>().sqrt() + 1e-30;
+        // true unit direction v(θ) = (cos θ, sin θ, 0, …).
+        let cos = g[0] * thetas[i].cos() + g[1] * thetas[i].sin();
+        acc += cos / gnorm;
+    }
+    acc / n as f64
+}
+
+/// Fit a K=1 circle to `target` and return `(fitted_curve_hh, directional_cos)`,
+/// both read off the fitted OUTPUTS (solver-representation-agnostic).
 fn fit_and_measure(
     evaluator: &Arc<PeriodicHarmonicEvaluator>,
     seed: &Array2<f64>,
     target: &Array2<f64>,
-) -> (f64, f64, f64) {
+    thetas: &[f64],
+) -> (f64, f64) {
     let p = target.ncols();
     let (mut term, mut rho) = circle_term(evaluator, seed, p);
     term.set_guards_enabled(false);
     term.run_joint_fit_arrow_schur(target.view(), &mut rho, None, 60, 1.0, 1e-6, 1e-6)
         .expect("circle fit must complete");
-    let hh = higher_harmonic_fraction(&term.atoms[0].decoder_coefficients);
     let fitted = term.try_fitted_for_rho(&rho).unwrap();
-    let n = target.nrows();
-    let mut rad_sq = 0.0_f64;
-    let mut tot_sq = 0.0_f64;
-    for i in 0..n {
-        let g = fitted.row(i);
-        let gnorm = g.iter().map(|&v| v * v).sum::<f64>().sqrt() + 1e-30;
-        let mut along = 0.0_f64;
-        for j in 0..p {
-            let resid = target[[i, j]] - fitted[[i, j]];
-            along += resid * g[j] / gnorm;
-            tot_sq += resid * resid;
-        }
-        rad_sq += along * along;
-    }
-    (hh, (rad_sq / n as f64).sqrt(), (tot_sq / n as f64).sqrt())
+    let hh = fitted_curve_hh(&fitted, thetas, 4);
+    let dcos = mean_directional_cos(&fitted, thetas);
+    (hh, dcos)
 }
 
 /// LOAD-BEARING F4 acceptance: at a realistic norm variation, the flat fit

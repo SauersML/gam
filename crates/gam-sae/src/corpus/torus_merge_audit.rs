@@ -270,7 +270,9 @@ mod tests {
     #[test]
     fn two_independent_gaussian_atoms_are_not_flagged() {
         // Independent Gaussian coordinates ⇒ s ~ scaled χ²₂ ⇒ κ = 2 ⇒ no flag.
-        let n = 4000usize;
+        // Large n so the fourth-moment estimator concentrates tightly at 2 (the
+        // ratio estimator is right-skewed in small samples).
+        let n = 20000usize;
         let mut latent = Array2::<f64>::zeros((n, 2));
         let mut ctr = 99u64;
         for i in 0..n {

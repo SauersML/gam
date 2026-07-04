@@ -696,14 +696,16 @@ mod tests {
 
     #[test]
     fn stratification_surfaces_rare_structure_uniform_does_not() {
-        // ~1.3e-3-frequency rare structure among a dominant bulk. Uniform at
-        // this budget expects ~a couple of rare rows; stratification censuses
-        // the high-residual tail and surfaces essentially all of them.
-        let n = 60_000usize;
+        // ~1e-4-frequency rare structure among a dominant bulk (the reviewer's
+        // regime: a rare curved structure drowned in dominant ones). At this
+        // budget the uniform design expects ≈ f·rare = 0.02·30 ≈ 0.6 rare rows —
+        // essentially never presented to the birth producer — while the
+        // residual-energy census takes the whole high-residual tail (π = 1).
+        let n = 300_000usize;
         let p = 8usize;
         let k_dom = 4usize;
-        let rare_rows = 80usize; // frequency ≈ 1.3e-3
-        let budget = 3_000usize; // uniform rate f ≈ 0.05
+        let rare_rows = 30usize; // frequency = 1e-4
+        let budget = 6_000usize; // uniform rate f = 0.02
 
         let (rows, rare_idx) = planted_corpus(n, p, k_dom, rare_rows);
         let dir = temp_shard_dir("surface", &rows, n / 2);
