@@ -46,46 +46,26 @@ fn encode(rows: &[[f64; 3]]) -> gam::data::EncodedDataset {
     encode_recordswith_inferred_schema(headers, records).expect("encode")
 }
 
-fn fit_te(data: &gam::data::EncodedDataset) -> (f64, f64, bool) {
-    let cfg = FitConfig::default();
-    let FitResult::Standard(fit) = fit_from_formula("y ~ te(x, z)", data, &cfg).expect("fit") else {
-        panic!("std");
-    };
-    let edf = fit.fit.edf_total().expect("edf");
-    (edf, fit.fit.deviance, fit.fit.outer_converged)
-}
-
-fn perm_stride(rows: &[[f64; 3]], mult: usize) -> Vec<[f64; 3]> {
-    let n = rows.len();
-    let mut p = vec![[0.0f64; 3]; n];
-    for (i, r) in rows.iter().enumerate() {
-        p[(i * mult) % n] = *r;
-    }
-    p
-}
-
 #[test]
 fn probe() {
     let n = 300usize;
-    let mut nonconv = 0;
-    let mut orderdep = 0;
-    for noise in [0.15f64, 0.2, 0.25] {
-        for seed in 1u64..12 {
-            let original = build_rows(seed, n, noise);
-            let (e0, d0, c0) = fit_te(&encode(&original));
-            let (e1, _d1, c1) = fit_te(&encode(&perm_stride(&original, 157)));
-            let (e2, _d2, c2) = fit_te(&encode(&perm_stride(&original, 91)));
-            let emin = e0.min(e1).min(e2);
-            let emax = e0.max(e1).max(e2);
-            if !c0 || !c1 || !c2 {
-                nonconv += 1;
-            }
-            if emax - emin > 1.0 {
-                orderdep += 1;
-                eprintln!("ORDERDEP noise={noise} seed={seed}: edf {e0:.2}/{e1:.2}/{e2:.2} conv {c0}/{c1}/{c2}");
-            }
-            eprintln!("noise={noise} seed={seed}: edf {e0:.2}/{e1:.2}/{e2:.2} conv {c0}/{c1}/{c2} dev0={d0:.3}");
-        }
-    }
-    eprintln!("SUMMARY nonconv={nonconv} orderdep={orderdep}");
+    // seed 2 noise 0.15 is a reliable non-convergence repro (edf=52, conv=false).
+    let data = encode(&build_rows(2, n, 0.15));
+    let cfg = FitConfig::default();
+    let FitResult::Standard(fit) = fit_from_formula("y ~ te(x, z)", &data, &cfg).expect("fit")
+    else {
+        panic!("std");
+    };
+    let f = &fit.fit;
+    eprintln!(
+        "RESULT edf={:.3} conv={} iters={} gradnorm={:?} lambdas={:?} edf_by_block={:?} reml={:.4} dev={:.4}",
+        f.edf_total().unwrap(),
+        f.outer_converged,
+        f.outer_iterations,
+        f.outer_gradient_norm,
+        f.lambdas.to_vec(),
+        f.edf_by_block(),
+        f.reml_score,
+        f.deviance,
+    );
 }
