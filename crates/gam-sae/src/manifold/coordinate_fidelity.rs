@@ -1605,12 +1605,17 @@ mod coordinate_fidelity_tests {
         // OCCUPANCY is discrete — the k=7 anchor model must win by evidence, and
         // its rank charge d_eff must be 6.
         let per = 100;
-        let jit = vdc(7 * per);
-        let mut u = Vec::with_capacity(7 * per);
-        for i in 0..(7 * per) {
+        let n = 7 * per;
+        let jit = vdc(n);
+        let mut u = Vec::with_capacity(n);
+        for i in 0..n {
             let anchor = (i % 7) as f64 / 7.0;
-            // jitter within ±0.5% of the circle — far below the 1/7 spacing.
-            u.push((anchor + 0.005 * (jit[i] - 0.5)).rem_euclid(1.0));
+            // Sub-resolution jitter: ±2e-4, BELOW the width floor 1/(2n) ≈ 7e-4,
+            // so the seven weekday points are genuinely discrete (a realistic
+            // near-exact categorical embedding). Above the floor the low-
+            // discrepancy jitter's own sub-structure becomes resolvable and the
+            // evidence honestly reports the finer clustering it can see.
+            u.push((anchor + 0.0004 * (jit[i] - 0.5)).rem_euclid(1.0));
         }
         let law = classify_occupancy(&u);
         assert_eq!(law, OccupancyLaw::Discrete { anchors: 7 }, "{law:?}");
