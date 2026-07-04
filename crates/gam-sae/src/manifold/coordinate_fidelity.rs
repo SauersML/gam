@@ -910,15 +910,33 @@ pub fn prefer_candidate_basin(
 }
 
 impl SaeManifoldTerm {
-    /// #2081 — aggregate coordinate-uniformity score over the fit's `d = 1`
-    /// atoms: the MEAN Watson `U²` uniformity statistic across atoms that carry a
-    /// `d = 1` circle/interval chart (LOWER ⟺ more uniform coordinates). `None`
-    /// when no atom carries such a chart, which makes the seed-selection
+    /// #2081 — aggregate chart-honesty score over the fit's `d = 1` atoms: the
+    /// MEAN arc-length (unit-speed) DEFECT
+    /// ([`crate::chart_canonicalization::chart_unit_speed_defect`]) across atoms
+    /// that carry a `d = 1` circle/interval chart (LOWER ⟺ more arc-length-uniform
+    /// parameterization). `None` when no atom yields a finite defect (no `d = 1`
+    /// chart, or every such chart degenerate), which makes the seed-selection
     /// tie-break ([`prefer_candidate_basin`]) inert.
     ///
-    /// Reads only the fitted coordinates + each atom's fixed topology — no basis
-    /// evaluation — so it is cheap enough to call at every incumbent-comparison
-    /// boundary in the fit loop.
+    /// It prices the arc-length defect — a PURE parameterization property measured
+    /// on a uniform latent grid — rather than the raw-coordinate Watson `U²`
+    /// occupancy statistic ([`coordinate_uniformity`]). The two are NOT
+    /// interchangeable for seed selection (the F2 split): Watson `U²` conflates
+    /// data occupancy with chart honesty, so a WARPED chart that spreads a
+    /// genuinely clustered coordinate into a uniform-looking raw distribution reads
+    /// a LOWER `U²` than the honest chart it should lose to — i.e. occupancy
+    /// uniformity can prefer the dishonest chart at equal EV, the exact #2081
+    /// failure. The arc-length defect isolates the pathology EV cannot see (a chart
+    /// that squishes arc length at high reconstruction EV) independent of where the
+    /// data falls, so it is the correct quantity for the tie-break to price. Lower
+    /// is better for BOTH statistics, so the [`prefer_candidate_basin`] ordering
+    /// (candidate `<` incumbent wins the tie) is unchanged.
+    ///
+    /// Evaluates each `d = 1` atom's basis on the arc-length quadrature grid, so it
+    /// is heavier than the coordinate-only occupancy read; it is still called only
+    /// at accepted-iterate incumbent-comparison boundaries (never inside a line
+    /// search), where one band-limited grid evaluation per atom is negligible
+    /// against the joint Newton assembly.
     pub(crate) fn coordinate_uniformity_aggregate(&self) -> Option<f64> {
         let mut sum = 0.0_f64;
         let mut count = 0usize;
@@ -930,9 +948,20 @@ impl SaeManifoldTerm {
             if coords.ncols() != 1 {
                 continue;
             }
-            if let Some(uniformity) = coordinate_uniformity(coords.column(0), &topology) {
-                if uniformity.statistic.is_finite() {
-                    sum += uniformity.statistic;
+            let atom = &self.atoms[atom_idx];
+            let defect = atom.basis_evaluator.as_ref().and_then(|evaluator| {
+                crate::chart_canonicalization::chart_unit_speed_defect(
+                    evaluator.as_ref(),
+                    atom.decoder_coefficients.view(),
+                    coords.column(0),
+                    &topology,
+                )
+                .ok()
+                .flatten()
+            });
+            if let Some(d) = defect {
+                if d.is_finite() {
+                    sum += d;
                     count += 1;
                 }
             }
