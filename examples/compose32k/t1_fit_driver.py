@@ -40,9 +40,14 @@ import numpy as np
 
 # Canonical shared modules live beside this driver (tier2's l17_data) and in the
 # gam examples/ (compose_tiers.emit_block_seed_manifest). Add both to the path.
+# The cluster scratch location is operator-supplied via $COMPOSE32K_ROOT so no
+# absolute compute-node path is baked into the repo.
 _HERE = os.path.dirname(os.path.abspath(__file__))
-for _p in (_HERE, "/projects/standard/hsiehph/sauer354/scratch",
-           "/projects/standard/hsiehph/sauer354/scratch/compose32k/scripts"):
+_search = [_HERE]
+_root = os.environ.get("COMPOSE32K_ROOT")
+if _root:
+    _search += [_root, os.path.join(_root, "compose32k", "scripts")]
+for _p in _search:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
@@ -135,8 +140,10 @@ def _synthetic(n_blocks: int, block_size: int, seed: int):
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--shards", "--shard-dir", dest="shards",
-                    default="/projects/standard/hsiehph/sauer354/scratch/qwen_stageb/shards")
-    ap.add_argument("--out-dir", default="/projects/standard/hsiehph/sauer354/scratch/compose32k/t1")
+                    default=os.environ.get("COMPOSE32K_SHARDS"),
+                    help="L17 shard directory (or set $COMPOSE32K_SHARDS)")
+    ap.add_argument("--out-dir", default=os.environ.get("COMPOSE32K_OUT", "compose32k_t1"),
+                    help="artifact output directory (or set $COMPOSE32K_OUT)")
     ap.add_argument("--ckpt", default=None, help="artifact path prefix (Step-4 resume sentinel)")
     ap.add_argument("--n-blocks", type=int, default=16384)
     ap.add_argument("--block-size", type=int, default=2)
@@ -157,6 +164,9 @@ def main(argv: list[str] | None = None) -> None:
     if args.smoke:
         x = _synthetic(args.n_blocks, args.block_size, args.seed)
     else:
+        if not args.shards:
+            raise SystemExit(
+                "no shard directory: pass --shards or set $COMPOSE32K_SHARDS")
         import l17_data  # tier2's canonical module (Contract v1)
         acts, rids, _metas = l17_data.load_l17(args.shards)
         train = l17_data.rollout_split(rids, seed=args.seed)
