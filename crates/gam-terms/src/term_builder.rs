@@ -2851,12 +2851,25 @@ pub fn build_smooth_basis(
                 policy,
             )
             .map_err(|e| e.to_string())?;
+            // #1867: spline-equivalent floor so a 1-D radial basis is not
+            // dimensioned coarser than the competing `s(x)` on identical data.
+            let univariate_floor = if cols.len() == 1 {
+                heuristic_knots_for_column(ds.values.column(cols[0]))
+                    .saturating_add(DEFAULT_BSPLINE_DEGREE + 1)
+            } else {
+                0
+            };
             let centers = parse_countwith_basis_alias(
                 options,
                 "centers",
                 cap_default_spatial_centers(
                     options,
-                    default_matern_center_count(ds.values.nrows(), cols.len(), plan.centers),
+                    default_matern_center_count(
+                        ds.values.nrows(),
+                        cols.len(),
+                        plan.centers,
+                        univariate_floor,
+                    ),
                 ),
             )?;
             let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
@@ -3051,11 +3064,20 @@ pub fn build_smooth_basis(
                     crate::basis::duchon_nullspace_dimension(cols.len(), degree)
                 }
             };
+            // #1867: spline-equivalent floor so a 1-D radial basis is not
+            // dimensioned coarser than the competing `s(x)` on identical data.
+            let univariate_floor = if cols.len() == 1 {
+                heuristic_knots_for_column(ds.values.column(cols[0]))
+                    .saturating_add(DEFAULT_BSPLINE_DEGREE + 1)
+            } else {
+                0
+            };
             let default_centers = default_duchon_center_count(
                 ds.values.nrows(),
                 cols.len(),
                 plan.centers,
                 polynomial_cols,
+                univariate_floor,
             );
             let requested_centers = parse_countwith_basis_alias(
                 options,
@@ -4413,7 +4435,12 @@ pub(crate) fn cap_default_spatial_centers(
     }
 }
 
-fn default_matern_center_count(n: usize, d: usize, planned_count: usize) -> usize {
+fn default_matern_center_count(
+    n: usize,
+    d: usize,
+    planned_count: usize,
+    univariate_floor: usize,
+) -> usize {
     // #1074: the mgcv-sized basis cap (`k = 10·3^(d-1)`) was DELETED here too — it
     // masked the same over-sizing/under-penalization defect by shrinking the basis
     // rather than fixing the optimizer. The default now uses the generic n-scaling
@@ -4421,7 +4448,20 @@ fn default_matern_center_count(n: usize, d: usize, planned_count: usize) -> usiz
     // is a legitimate degenerate guard and is kept. Explicit `k`/`centers` still
     // take full effect upstream.
     let low_n_floor = (d + 4).min(n);
-    planned_count.max(low_n_floor).max(1)
+    // #1867: at small n the generic conditioning cap (`n / COND_N_DIVISOR`) in
+    // `default_num_centers` starves a 1-D radial basis BELOW the resolution the
+    // univariate B-spline `s(x)` is handed on the SAME data (e.g. 7 vs 11 basis
+    // functions at n=30), so `matern(x)`/`duchon(x)` over-smooth sparse
+    // oscillations that `s(x)` recovers cleanly. Smoothness is set by the REML
+    // penalty λ, not by the raw center count (see `default_num_centers`), so a
+    // radial smooth competing with `s(x)` must not be dimensioned coarser than
+    // it. `univariate_floor` carries that spline-equivalent resolution for a 1-D
+    // smooth (0 for d>1, where there is no direct univariate analogue) and is
+    // bounded by n. Explicit `k`/`centers` still override upstream.
+    planned_count
+        .max(low_n_floor)
+        .max(univariate_floor.min(n))
+        .max(1)
 }
 
 fn default_duchon_center_count(
@@ -4429,6 +4469,7 @@ fn default_duchon_center_count(
     d: usize,
     planned_count: usize,
     polynomial_cols: usize,
+    univariate_floor: usize,
 ) -> usize {
     // Duchon fits pay a larger setup cost than Matérn/TPS because the
     // constrained radial block is rotated through its center Gram and several
@@ -4442,7 +4483,17 @@ fn default_duchon_center_count(
     // high-order bases are raised to the smallest admissible count.
     let mgcv_default = 10usize.saturating_mul(3usize.saturating_pow(d.saturating_sub(1) as u32));
     let low_n_floor = (polynomial_cols + 1).min(n).max(1);
-    planned_count.min(mgcv_default).max(low_n_floor)
+    // #1867: at small n the generic conditioning cap (`n / COND_N_DIVISOR`) in
+    // `default_num_centers` starves `planned_count` below the univariate spline
+    // resolution the competing `s(x)` gets on the SAME data, so `duchon(x)`
+    // over-smooths sparse oscillations. `univariate_floor` (0 for d>1) carries
+    // that spline-equivalent basis dimension and floors the 1-D default,
+    // bounded by n; smoothness is set by the REML penalty, not the raw count.
+    // Explicit `k`/`centers` still override upstream.
+    planned_count
+        .min(mgcv_default)
+        .max(low_n_floor)
+        .max(univariate_floor.min(n))
 }
 
 pub fn parse_countwith_basis_alias(
@@ -4734,8 +4785,54 @@ mod tests {
     use crate::basis::OperatorPenaltySpec;
     use crate::inference::formula_dsl::parse_formula;
     use gam_data::{DataSchema, SchemaColumn};
-    use ndarray::Array2;
+    use ndarray::{Array1, Array2};
     use std::collections::BTreeMap;
+
+    /// #1867 regression: on sparse 1-D data the generic conditioning cap in
+    /// [`default_num_centers`] (`n / COND_N_DIVISOR`) starves a radial
+    /// (matérn/duchon) basis BELOW the resolution the univariate B-spline
+    /// `s(x)` is handed on the SAME data — 7 vs 11 basis functions at n=30 —
+    /// so `matern(x)`/`duchon(x)` over-smooth oscillations that `s(x)`
+    /// recovers. The spline-equivalent floor threaded into the radial default
+    /// count must restore that resolution. Without the floor (the `0` argument,
+    /// i.e. the pre-fix behaviour) the radial default stays starved.
+    #[test]
+    fn radial_1d_default_not_starved_below_univariate_spline_resolution_1867() {
+        let n = 30usize;
+        let d = 1usize;
+        // Raw radial default, starved by the n/COND_N_DIVISOR conditioning cap.
+        let planned = default_num_centers(n, d);
+        assert!(
+            planned < 11,
+            "precondition: conditioning cap starves the raw radial default (got {planned})"
+        );
+        // A well-resolved 1-D column of `n` distinct values asks for the
+        // univariate spline basis dimension the competing `s(x)` gets.
+        let col: Array1<f64> = Array1::from_iter((0..n).map(|i| i as f64 / (n as f64 - 1.0)));
+        let univariate_floor =
+            heuristic_knots_for_column(col.view()).saturating_add(DEFAULT_BSPLINE_DEGREE + 1);
+        assert_eq!(univariate_floor, 11, "univariate spline resolution at n=30");
+
+        // BEFORE (no floor): radial defaults inherit the starved count.
+        assert_eq!(default_matern_center_count(n, d, planned, 0), planned);
+        assert!(default_duchon_center_count(n, d, planned, 2, 0) <= planned);
+
+        // AFTER (spline-equivalent floor): radial defaults are lifted to at
+        // least the univariate spline resolution, so they are not dimensioned
+        // coarser than `s(x)` on identical data.
+        assert!(
+            default_matern_center_count(n, d, planned, univariate_floor) >= univariate_floor,
+            "matern 1-D default must not be starved below the spline resolution"
+        );
+        assert!(
+            default_duchon_center_count(n, d, planned, 2, univariate_floor) >= univariate_floor,
+            "duchon 1-D default must not be starved below the spline resolution"
+        );
+
+        // The floor is scoped to 1-D: a multivariate smooth passes 0 and keeps
+        // the generic n-scaling plan unchanged.
+        assert_eq!(default_matern_center_count(200, 2, 40, 0), 40);
+    }
 
     fn continuous_dataset(headers: &[&str], rows: Vec<Vec<f64>>) -> Dataset {
         let nrows = rows.len();
