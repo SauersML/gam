@@ -1047,6 +1047,26 @@ pub(crate) fn run_predict_survival(
         age_exit[i] = t1;
     }
     let saved_likelihood_mode = require_saved_survival_likelihood_mode(model)?;
+    // Single-cause Weibull without a learned baseline timewiggle carries its
+    // ENTIRE log-cumulative-hazard baseline in the fitted `[1, log t]` linear
+    // time-basis coefficients, NOT in a parametric offset. The fit centers that
+    // basis at the survival time anchor (which zeroes the constant column so
+    // `beta[0]` is unidentified) and carries a Linear (zero) parametric offset,
+    // so the fitted baseline is exactly `beta[1] * (log t - log anchor)`. The
+    // saved model still records a `Weibull` baseline target (recovered
+    // scale/shape) for CIF/reporting, but re-entering it here as a parametric
+    // offset AND predicting against the un-centered basis double-counts the
+    // baseline (offset + beta): the fitted log-cumulative-hazard slope comes
+    // back ~2·k and the default posterior-mean survival collapses to a flat 0.5
+    // because the unidentified constant column's enormous posterior variance
+    // propagates through predict (issue #2129; same double-count the library
+    // predict path already avoids for #897). Mirror the fit — and the library
+    // predict path — by centering the basis at the anchor and forcing a zero
+    // baseline offset. Weibull-WITH-timewiggle is a different regime (the
+    // parametric offset IS the baseline and beta carries only the wiggle
+    // deviation), so it is excluded.
+    let weibull_baseline_in_beta = saved_likelihood_mode == SurvivalLikelihoodMode::Weibull
+        && !baseline_timewiggle_is_present(model);
     let time_cfg = load_survival_time_basis_config_from_model(model)?;
     let mut time_build = build_survival_time_basis(&age_entry, &age_exit, time_cfg.clone(), None)?;
     let resolved_time_cfg = resolved_survival_time_basis_config_from_build(
@@ -1062,7 +1082,8 @@ pub(crate) fn run_predict_survival(
             | SurvivalLikelihoodMode::MarginalSlope
             | SurvivalLikelihoodMode::Latent
             | SurvivalLikelihoodMode::LatentBinary
-    ) {
+    ) || weibull_baseline_in_beta
+    {
         let time_anchor = model
             .survival_time_anchor
             .ok_or_else(|| "saved survival model missing survival_time_anchor".to_string())?;
@@ -1078,7 +1099,19 @@ pub(crate) fn run_predict_survival(
     {
         require_structural_survival_time_basis(&time_build.basisname, "saved survival sampling")?;
     }
-    let baseline_cfg = saved_survival_runtime_baseline_config(model)?;
+    let baseline_cfg = if weibull_baseline_in_beta {
+        // Zero parametric offset: the baseline lives entirely in the
+        // anchor-centered linear time-basis coefficients (see the note above).
+        SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::Linear,
+            scale: None,
+            shape: None,
+            rate: None,
+            makeham: None,
+        }
+    } else {
+        saved_survival_runtime_baseline_config(model)?
+    };
     if matches!(
         saved_likelihood_mode,
         SurvivalLikelihoodMode::Latent | SurvivalLikelihoodMode::LatentBinary
