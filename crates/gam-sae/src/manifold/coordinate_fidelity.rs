@@ -415,9 +415,9 @@ pub fn classify_occupancy(u: &[f64]) -> OccupancyLaw {
 
 /// BIC of a `k`-anchor wrapped-Gaussian mixture fitted to sorted circle
 /// coordinates `pts ∈ [0, 1)` by deterministic circular `k`-means (evenly spaced
-/// init) plus a per-cluster wrapped-Gaussian width. Returns `None` when the fit
-/// is degenerate. `BIC = −2·loglik + p·ln n`, `p = 3k − 1` (`k` means, `k`
-/// widths, `k − 1` weights); lower is better.
+/// init) plus a SHARED (pooled) wrapped-Gaussian width. Returns `None` when the
+/// fit is degenerate. `BIC = −2·loglik + p·ln n`, `p = 2k` (`k` means, `k − 1`
+/// weights, `1` shared width); lower is better.
 fn wrapped_gaussian_mixture_bic(
     pts: &[f64],
     k: usize,
@@ -473,28 +473,31 @@ fn wrapped_gaussian_mixture_bic(
         }
     }
 
-    // Per-cluster weight + wrapped-Gaussian width (circular std about the mean),
-    // width floored at the resolution limit.
+    // Per-cluster weight + a SHARED (pooled) wrapped-Gaussian width. A shared
+    // width is essential: with a free PER-cluster variance, adding anchors beyond
+    // the true count cheats — a spurious extra center splits a real cluster and
+    // drives that sub-cluster's variance toward zero, buying unbounded likelihood
+    // that the parameter penalty cannot claw back, so over-clustered `k` always
+    // wins. Pooling the variance over ALL points means an extra anchor only
+    // shaves the shared width slightly, so BIC stops at the `k` where genuine
+    // gaps (not jitter) separate the anchors. Width floored at the resolution.
     let mut weights = vec![0.0_f64; k];
-    let mut sigmas = vec![sigma_floor; k];
-    for j in 0..k {
-        let mut cnt = 0usize;
-        let mut ss = 0.0_f64;
-        for (i, &p) in pts.iter().enumerate() {
-            if assign[i] == j {
-                let d = {
-                    let raw = (p - means[j]).rem_euclid(1.0);
-                    if raw > 0.5 { raw - 1.0 } else { raw }
-                };
-                ss += d * d;
-                cnt += 1;
-            }
-        }
-        weights[j] = cnt as f64 / n as f64;
-        if cnt > 0 {
-            sigmas[j] = (ss / cnt as f64).sqrt().max(sigma_floor);
-        }
+    let mut counts = vec![0usize; k];
+    let mut total_ss = 0.0_f64;
+    for (i, &p) in pts.iter().enumerate() {
+        let j = assign[i];
+        counts[j] += 1;
+        let d = {
+            let raw = (p - means[j]).rem_euclid(1.0);
+            if raw > 0.5 { raw - 1.0 } else { raw }
+        };
+        total_ss += d * d;
     }
+    for j in 0..k {
+        weights[j] = counts[j] as f64 / n as f64;
+    }
+    let shared_sigma = (total_ss / n as f64).sqrt().max(sigma_floor);
+    let sigmas = vec![shared_sigma; k];
 
     // Mixture loglik with a wrapped Gaussian per component (±1 wrap images are
     // ample for σ well below 0.5). Density is per unit circumference so it is
@@ -523,7 +526,8 @@ fn wrapped_gaussian_mixture_bic(
     if !loglik.is_finite() {
         return None;
     }
-    let p_free = (3 * k).saturating_sub(1) as f64;
+    // Free parameters: k means + (k−1) mixture weights + 1 shared variance = 2k.
+    let p_free = (2 * k) as f64;
     Some(-2.0 * loglik + p_free * ln_n)
 }
 

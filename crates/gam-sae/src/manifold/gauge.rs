@@ -1016,7 +1016,9 @@ fn beta_loglik_avg(alpha: f64, beta: f64, s_ln: f64, s_ln1m: f64) -> f64 {
 /// standard asymptotic (Bernoulli) series. Hand-derived closed form.
 fn digamma(mut x: f64) -> f64 {
     let mut result = 0.0_f64;
-    while x < 6.0 {
+    // Recurse up to x ≥ 10 so the truncated Bernoulli tail is ~1e-11 (the x ≥ 6
+    // cutoff leaves ~1e-6, too coarse for the Beta Newton and its own test).
+    while x < 10.0 {
         result -= 1.0 / x;
         x += 1.0;
     }
@@ -1030,7 +1032,8 @@ fn digamma(mut x: f64) -> f64 {
 /// the asymptotic series `1/x + 1/(2x²) + Σ B₂ₖ/x^{2k+1}`.
 fn trigamma(mut x: f64) -> f64 {
     let mut result = 0.0_f64;
-    while x < 6.0 {
+    // Same x ≥ 10 recurrence cutoff as `digamma` for ~1e-11 accuracy.
+    while x < 10.0 {
         result += 1.0 / (x * x);
         x += 1.0;
     }
