@@ -358,17 +358,39 @@ impl OccupancyLaw {
 /// a `k ≥ 2` anchor model ⟹ [`OccupancyLaw::Discrete`], a single wrapped Gaussian
 /// ⟹ [`OccupancyLaw::Continuous`], the uniform density ⟹ [`OccupancyLaw::Uniform`].
 pub fn classify_occupancy(u: &[f64]) -> OccupancyLaw {
+    classify_occupancy_impl(u, true)
+}
+
+/// Occupancy law for an INTERVAL (non-wrapping) coordinate `u ∈ [0, 1]`: the same
+/// evidence race, but on the LINE rather than the circle, so the extreme values
+/// `0` and `1` are NOT cyclically adjacent. Use this for interval-topology
+/// coordinates (a birth PCA seed, a bounded latent) where a circular fold would
+/// wrongly merge a linear finite set's first and last anchors and misread a
+/// range-filling uniform coordinate as non-uniform. `classify_occupancy` is the
+/// circular counterpart for genuinely cyclic (circle-chart) coordinates.
+pub fn classify_occupancy_interval(u: &[f64]) -> OccupancyLaw {
+    classify_occupancy_impl(u, false)
+}
+
+/// Shared occupancy adjudicator. `circular` selects the geometry: `true` folds
+/// onto the unit circle (wrapped distances, ±1 Gaussian images), `false` treats
+/// `[0, 1]` as a line (linear distances, no wrap). The model race and BIC are
+/// identical; only the metric differs.
+fn classify_occupancy_impl(u: &[f64], circular: bool) -> OccupancyLaw {
     let n = u.len();
     if n < 4 {
         return OccupancyLaw::Indeterminate;
     }
-    // Fold into [0, 1) defensively (callers already normalize, but a raw circle
-    // coordinate may arrive un-wrapped).
+    // On the circle, fold into [0, 1) defensively; on the line, clamp into [0, 1].
     let mut pts: Vec<f64> = u
         .iter()
         .map(|&x| {
-            let f = x - x.floor();
-            if f >= 1.0 { 0.0 } else { f }
+            if circular {
+                let f = x - x.floor();
+                if f >= 1.0 { 0.0 } else { f }
+            } else {
+                x.clamp(0.0, 1.0)
+            }
         })
         .collect();
     if pts.iter().any(|p| !p.is_finite()) {
@@ -378,18 +400,17 @@ pub fn classify_occupancy(u: &[f64]) -> OccupancyLaw {
     let nf = n as f64;
     let ln_n = nf.ln();
 
-    // Uniform density on the unit circle is `1`, so its per-point log-density is
-    // `0` and its total loglik is `0`; it has no free location parameters.
+    // Uniform density on the unit interval / circle is `1`, so its per-point
+    // log-density is `0` and its total loglik is `0`; no free location parameters.
     let bic_uniform = -2.0 * 0.0 + 0.0 * ln_n;
 
-    // Resolution floor: with `n` points on the unit circle you cannot resolve a
-    // cluster tighter than the mean spacing `1/n`, so a wrapped-Gaussian width is
-    // floored at half that (a Nyquist-like, data-derived floor — not a knob).
+    // Resolution floor: with `n` points you cannot resolve a cluster tighter than
+    // the mean spacing `1/n`, so the Gaussian width is floored at half that (a
+    // Nyquist-like, data-derived floor — not a knob).
     let sigma_floor = 1.0 / (2.0 * nf);
 
-    // Single wrapped Gaussian: the continuous unimodal (von-Mises-like)
-    // alternative. Two free parameters (mean, width).
-    let single = wrapped_gaussian_mixture_bic(&pts, 1, sigma_floor, ln_n);
+    // Single Gaussian: the continuous unimodal alternative. Two free params.
+    let single = wrapped_gaussian_mixture_bic(&pts, 1, sigma_floor, ln_n, circular);
 
     let mut best_law = OccupancyLaw::Uniform;
     let mut best_bic = bic_uniform;
@@ -403,7 +424,7 @@ pub fn classify_occupancy(u: &[f64]) -> OccupancyLaw {
         if k >= n {
             break;
         }
-        if let Some(bic) = wrapped_gaussian_mixture_bic(&pts, k, sigma_floor, ln_n) {
+        if let Some(bic) = wrapped_gaussian_mixture_bic(&pts, k, sigma_floor, ln_n, circular) {
             if bic < best_bic {
                 best_bic = bic;
                 best_law = OccupancyLaw::Discrete { anchors: k };
@@ -423,16 +444,21 @@ fn wrapped_gaussian_mixture_bic(
     k: usize,
     sigma_floor: f64,
     ln_n: f64,
+    circular: bool,
 ) -> Option<f64> {
     let n = pts.len();
     if k == 0 || k > n {
         return None;
     }
-    // Deterministic circular k-means. Angles are the coordinates themselves on
-    // the unit-circumference circle (period 1); circular distance wraps.
+    // Deterministic k-means. On the circle the distance wraps modulo 1; on the
+    // line it is the ordinary absolute difference.
     let circ_dist = |a: f64, b: f64| -> f64 {
-        let d = (a - b).rem_euclid(1.0);
-        d.min(1.0 - d)
+        if circular {
+            let d = (a - b).rem_euclid(1.0);
+            d.min(1.0 - d)
+        } else {
+            (a - b).abs()
+        }
     };
     // QUANTILE init: seed the centers on actual data (the `j/k` quantiles of the
     // sorted coordinates), NOT at evenly-spaced angles `(j+0.5)/k`. Evenly-spaced
@@ -463,19 +489,33 @@ fn wrapped_gaussian_mixture_bic(
                 changed = true;
             }
         }
-        // Circular-mean update of each occupied cluster (resultant-vector angle).
+        // Cluster-mean update: circular resultant-vector angle on the circle, or
+        // the ordinary arithmetic mean on the line.
         for (j, m) in means.iter_mut().enumerate() {
-            let (mut sx, mut sy, mut cnt) = (0.0_f64, 0.0_f64, 0usize);
-            for (i, &p) in pts.iter().enumerate() {
-                if assign[i] == j {
-                    let ang = std::f64::consts::TAU * p;
-                    sx += ang.cos();
-                    sy += ang.sin();
-                    cnt += 1;
+            if circular {
+                let (mut sx, mut sy, mut cnt) = (0.0_f64, 0.0_f64, 0usize);
+                for (i, &p) in pts.iter().enumerate() {
+                    if assign[i] == j {
+                        let ang = std::f64::consts::TAU * p;
+                        sx += ang.cos();
+                        sy += ang.sin();
+                        cnt += 1;
+                    }
                 }
-            }
-            if cnt > 0 && (sx * sx + sy * sy) > 0.0 {
-                *m = (sy.atan2(sx) / std::f64::consts::TAU).rem_euclid(1.0);
+                if cnt > 0 && (sx * sx + sy * sy) > 0.0 {
+                    *m = (sy.atan2(sx) / std::f64::consts::TAU).rem_euclid(1.0);
+                }
+            } else {
+                let (mut sum, mut cnt) = (0.0_f64, 0usize);
+                for (i, &p) in pts.iter().enumerate() {
+                    if assign[i] == j {
+                        sum += p;
+                        cnt += 1;
+                    }
+                }
+                if cnt > 0 {
+                    *m = sum / cnt as f64;
+                }
             }
         }
         if !changed {
@@ -497,9 +537,11 @@ fn wrapped_gaussian_mixture_bic(
     for (i, &p) in pts.iter().enumerate() {
         let j = assign[i];
         counts[j] += 1;
-        let d = {
+        let d = if circular {
             let raw = (p - means[j]).rem_euclid(1.0);
             if raw > 0.5 { raw - 1.0 } else { raw }
+        } else {
+            p - means[j]
         };
         total_ss += d * d;
     }
@@ -522,7 +564,10 @@ fn wrapped_gaussian_mixture_bic(
             }
             let s = sigmas[j];
             let mut g = 0.0_f64;
-            for m in -1..=1 {
+            // On the circle, sum the ±1 wrap images so the density is periodic; on
+            // the line, only the central image.
+            let (lo_img, hi_img) = if circular { (-1_i32, 1_i32) } else { (0, 0) };
+            for m in lo_img..=hi_img {
                 let d = p - means[j] + m as f64;
                 g += (-0.5 * (d / s) * (d / s)).exp();
             }

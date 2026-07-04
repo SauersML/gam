@@ -51,7 +51,7 @@ use crate::basis::{
 };
 use crate::manifold::{
     AssignmentMode, OccupancyLaw, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho,
-    SaeManifoldTerm, amplitude_concentration_certificate, classify_occupancy,
+    SaeManifoldTerm, amplitude_concentration_certificate, classify_occupancy_interval,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use gam_runtime::warm_start::Fingerprinter;
@@ -1395,23 +1395,22 @@ pub fn finite_set_candidate_for_birth(coords: ArrayView2<'_, f64>) -> Option<(us
     if !(span > 0.0) {
         return None;
     }
-    // Range-normalize the single coordinate column to [0, 1] (the anchor-index
-    // space). A birth coordinate is INTERVAL-topology (linear, from the PCA
-    // seed) — its ends are NOT cyclically adjacent — but `classify_occupancy`
-    // folds onto a circle, which would wrap the extreme values `0` and `1` onto
-    // the SAME point and merge a linear set's first and last anchors (7 weekday
-    // points → 6). So classify on a HALF-CIRCLE embedding `[0, 0.5]`: the unused
-    // half is a wrap gap wider than any within-set spacing, so the linear
-    // endpoints stay distinct and the true anchor count survives the fold.
+    // Range-normalize the single coordinate column to [0, 1] and classify on the
+    // INTERVAL (non-wrapping) occupancy law: a birth coordinate is
+    // interval-topology (linear, from the PCA seed), so its extreme values must
+    // NOT wrap onto each other — the circular classifier would fold `0` and `1`
+    // together and merge a linear set's first and last anchors (7 weekday points
+    // → 6), and its full-circle uniform model would misread a range-filling
+    // uniform coordinate as non-uniform. The interval classifier keeps linear
+    // ends distinct and range-uniform data uniform.
     let r: Vec<f64> = col.iter().map(|&t| ((t - lo) / span).clamp(0.0, 1.0)).collect();
-    let embedded: Vec<f64> = r.iter().map(|&x| 0.5 * x).collect();
-    match classify_occupancy(&embedded) {
+    match classify_occupancy_interval(&r) {
         OccupancyLaw::Discrete { anchors } if anchors >= 2 => {
-            // Assign each row to its nearest anchor bin from the FULL-range
-            // normalization `r ∈ [0, 1]` (not the half-circle embedding): the
-            // `anchors` evenly spaced bins give the categorical index the
-            // indicator basis reads. A fitted-anchor-position assignment is the
-            // cross-crate refinement (it needs the classifier's centers exposed).
+            // Assign each row to its nearest anchor bin from the normalization
+            // `r ∈ [0, 1]`: the `anchors` evenly spaced bins give the categorical
+            // index the indicator basis reads. A fitted-anchor-position
+            // assignment is the cross-crate refinement (it needs the classifier's
+            // centers exposed).
             let mut idx = Array2::<f64>::zeros((n, 1));
             for i in 0..n {
                 let bin = (r[i] * anchors as f64).floor();
