@@ -508,6 +508,47 @@ fn rank_charge_shared_primitive_parity() {
     );
 }
 
+/// (viii) #5 VETO — the blend-null null-license fix (recov matrix 12484591). A
+/// zero-realised-rank atom (rank_eff==0 ⟺ d_eff==0) reconstructs nothing; under
+/// the flag its Laplace evidence is INVALID (the β-Schur log-det → −∞ was letting
+/// zero-‖B‖ atoms get born on a featureless residual), so the criterion must reject
+/// it categorically (v → +∞) — not merely neutralise its charge. A real circle is
+/// untouched (rank_eff=2), and flag-OFF is the historical finite path.
+#[test]
+fn rank_charge_vetoes_zero_realised_rank_atom() {
+    let (mut term, rho) = fitted_circle_term(80, 16);
+    let tgt = unit_target(&term);
+    let saved = term.atoms[0].decoder_coefficients.clone();
+
+    // (a) flag ON, REAL circle (rank_eff=2, d_eff≈5.5) → finite (NOT vetoed).
+    term.set_rank_charge_evidence(true);
+    let (v_real, _, _) = term
+        .reml_criterion_with_cache(tgt.view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
+        .unwrap();
+    eprintln!("[#5 veto] real circle v={v_real:.4} (finite, accepted)");
+    assert!(v_real.is_finite(), "real rank-2 circle must NOT be vetoed: {v_real}");
+
+    // (b) flag ON, VANISHING decoder (×1e-6 → rank_eff=0, d_eff=0) → VETOED (v=+∞).
+    term.atoms[0].decoder_coefficients.assign(&(&saved * 1e-6));
+    let (v_vanish, _, _) = term
+        .reml_criterion_with_cache(tgt.view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
+        .unwrap();
+    eprintln!("[#5 veto] vanishing atom v={v_vanish} (must be +∞)");
+    assert!(
+        v_vanish.is_infinite() && v_vanish > 0.0,
+        "a zero-realised-rank (vanishing) atom must be VETOED to +∞ under the flag; got {v_vanish}"
+    );
+
+    // (c) flag OFF, same vanishing atom → historical finite path (no veto).
+    term.set_rank_charge_evidence(false);
+    let (v_off, _, _) = term
+        .reml_criterion_with_cache(tgt.view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
+        .unwrap();
+    eprintln!("[#5 veto] flag-off vanishing v={v_off:.4} (finite, historical)");
+    assert!(v_off.is_finite(), "flag-off must not veto (byte-identical historical): {v_off}");
+    term.atoms[0].decoder_coefficients.assign(&saved);
+}
+
 /// The reconstruction target the fitted circle was built against (re-derived from
 /// the same seed so the reml pass scores the real data).
 fn unit_target(term: &SaeManifoldTerm) -> Array2<f64> {

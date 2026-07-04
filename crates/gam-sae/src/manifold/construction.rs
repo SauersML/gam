@@ -4723,22 +4723,41 @@ impl SaeManifoldTerm {
                 }
             };
             let d_eff = self.per_atom_realised_rank_dof(rho, disp)?;
-            let rank_charge: f64 = d_eff.iter().map(|&de| 0.5 * de * n_obs.ln()).sum();
-            // htt_half = the coordinate-block part of ½log|H| = Σ_i Σ_j ln diag(L_i)
-            // (= ½·Σ_i log|H_tt^(i)|; `arrow_log_det_from_cache` doubles this into
-            // `log_det`). Subtracting it removes the per-row coordinate log-det.
-            let mut htt_half = 0.0_f64;
-            for row in 0..cache.undamped_factor_count() {
-                let l = cache.undamped_factor(row);
-                for i in 0..l.nrows() {
-                    let d = l[[i, i]];
-                    if d > 0.0 {
-                        htt_half += d.ln();
+            // #5 VETO — categorical Laplace-VALIDITY condition (blend-null null-license
+            // fix, recov matrix 12484591): an atom with rank_eff==0 (⟺ d_eff==0)
+            // reconstructs NOTHING. Its Laplace evidence is not "small" — it is INVALID:
+            // the vanishing decoder makes the β-mode degenerate, and the β-Schur log-det
+            // → −∞ is the approximation BREAKING DOWN, not a real reward (which is why a
+            // zero-‖B‖ atom got "born" on a featureless blend-null residual while the
+            // rank charge only neutralised — charge 0 — its coordinate block). Such an
+            // atom is unbirthable: reject CATEGORICALLY (v → +∞) rather than pricing a
+            // degenerate Laplace term. No tuned constant — a validity condition, not a
+            // penalty. rank_eff is an integer MP count so ==0 is crisp; a real rank-2
+            // circle (rank_eff=2) is untouched. This is #10's "make the degenerate class
+            // unbirthable" at the birth gate. TRAILHEAD: the deeper fix is a floor on the
+            // β-Schur decoder-curvature block (assemble_arrow_schur) so a vanishing β
+            // doesn't drive its Schur log-det → −∞; deferred (touches the shipped Schur
+            // path); the birth-gate veto here is the guard.
+            if d_eff.iter().any(|&de| de == 0.0) {
+                f64::INFINITY
+            } else {
+                let rank_charge: f64 = d_eff.iter().map(|&de| 0.5 * de * n_obs.ln()).sum();
+                // htt_half = the coordinate-block part of ½log|H| = Σ_i Σ_j ln diag(L_i)
+                // (= ½·Σ_i log|H_tt^(i)|; `arrow_log_det_from_cache` doubles this into
+                // `log_det`). Subtracting it removes the per-row coordinate log-det.
+                let mut htt_half = 0.0_f64;
+                for row in 0..cache.undamped_factor_count() {
+                    let l = cache.undamped_factor(row);
+                    for i in 0..l.nrows() {
+                        let d = l[[i, i]];
+                        if d > 0.0 {
+                            htt_half += d.ln();
+                        }
                     }
                 }
+                loss.total() + extra_penalty_energy + (0.5 * log_det - htt_half + rank_charge)
+                    - occam
             }
-            loss.total() + extra_penalty_energy + (0.5 * log_det - htt_half + rank_charge)
-                - occam
         } else {
             loss.total() + extra_penalty_energy + 0.5 * log_det - occam
         };
@@ -5814,9 +5833,19 @@ impl SaeManifoldTerm {
                 }
             };
             let d_eff = self.rank_dof_from_grams(&ri.grams, &ri.n_eff, rho, disp)?;
-            let rank_charge: f64 = d_eff.iter().map(|&de| 0.5 * de * n_obs.ln()).sum();
-            let htt_half = 0.5 * ri.log_det_tt;
-            loss.total() + extra_penalty_energy + (0.5 * log_det - htt_half + rank_charge) - occam
+            // #5 VETO (streaming): categorical Laplace-validity condition — a
+            // rank_eff==0 (d_eff==0) atom reconstructs nothing, so its evidence is
+            // INVALID (degenerate β-mode / β-Schur log-det → −∞), not payable. Reject
+            // categorically (v → +∞). Same guard as the dense path; see the dense
+            // reml_criterion for the full rationale + β-Schur-floor trailhead.
+            if d_eff.iter().any(|&de| de == 0.0) {
+                f64::INFINITY
+            } else {
+                let rank_charge: f64 = d_eff.iter().map(|&de| 0.5 * de * n_obs.ln()).sum();
+                let htt_half = 0.5 * ri.log_det_tt;
+                loss.total() + extra_penalty_energy + (0.5 * log_det - htt_half + rank_charge)
+                    - occam
+            }
         } else {
             loss.total() + extra_penalty_energy + 0.5 * log_det - occam
         };
@@ -6076,7 +6105,8 @@ impl SaeManifoldTerm {
         // it the streaming criterion would silently drop the entire cross-row
         // coupling and disagree with the dense path by exactly `log|C|`.
         if let (Some(m0), Some(w), Some(d)) = (wood_m0, wood_w, wood_d) {
-            let correction = streaming_cross_row_woodbury_log_det(&schur_acc, &m0, &w, &d)
+            let correction =
+                streaming_cross_row_woodbury_log_det(&schur_acc, &m0, &w, &d, options.schur_pd_floor)
                 .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}"))?
                 .ok_or_else(|| {
                     "SaeManifoldTerm::reml_criterion: cross-row IBP joint Hessian is non-PD at \

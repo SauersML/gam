@@ -75,6 +75,87 @@ pub fn effective_global_parallelism() -> Par {
     }
 }
 
+/// Process-global depth counter + saved parallelism for [`FaerSequentialScope`].
+///
+/// The `effective_global_parallelism` / [`NestedParallelGuard`] pair only pins
+/// the codebase's OWN `matmul` calls to `Par::Seq`; it CANNOT reach faer's
+/// high-level factorization/solve entry points (`Llt::new`, `Solve::solve`, SVD,
+/// col-pivoted QR), which read `faer::get_global_parallelism()` internally and
+/// have no per-call parallelism argument. When such a solver runs from inside a
+/// Rayon worker (e.g. the topology race fans candidate fits into per-candidate
+/// pools via `run_topology_race_parallel`), faer's default `Par::rayon(0)`
+/// dispatches the factorization through its `spindle` barrier pool, which
+/// `rayon::scope`-spawns as many tasks as the pool has threads and waits for all
+/// of them at a barrier. Under thread oversubscription those worker slots are
+/// already occupied by the outer fan-out, so the barrier never completes and the
+/// fit parks at 0% CPU — the #2074 K=1 `sae_manifold_fit` deadlock.
+///
+/// [`FaerSequentialScope`] closes that hole by pinning faer's PROCESS-GLOBAL
+/// parallelism to `Par::Seq` around the nested solve, so every faer solver it
+/// reaches stays single-threaded and never spawns a nested barrier pool. The
+/// codebase engineers its faer reductions to be parallelism-invariant
+/// (`tests_parallelism_invariance_1557` asserts byte-identical `Par::Seq` vs
+/// `Par::rayon` output), so collapsing to sequential is bit-for-bit neutral.
+static FAER_SEQ_STATE: std::sync::Mutex<FaerSeqState> =
+    std::sync::Mutex::new(FaerSeqState { depth: 0, saved: None });
+
+struct FaerSeqState {
+    depth: usize,
+    saved: Option<Par>,
+}
+
+/// RAII guard that pins faer's process-global parallelism to [`Par::Seq`] for its
+/// lifetime and restores the previous setting when the LAST live guard drops.
+///
+/// The guard is depth-counted across threads: overlapping guards (e.g. several
+/// topology-race candidates fitting concurrently) all observe `Par::Seq`, and the
+/// prior policy is restored exactly once, when the outermost guard exits. Setting
+/// and restoring happen under the state mutex so the `depth == 0` transition is
+/// atomic with the `set_global_parallelism` call.
+#[must_use = "the sequential scope only holds while the guard is alive"]
+pub struct FaerSequentialScope {
+    _private: (),
+}
+
+impl FaerSequentialScope {
+    /// Enter the scope, forcing faer to `Par::Seq` on the `0 -> 1` transition.
+    pub fn enter() -> Self {
+        let mut state = FAER_SEQ_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.depth == 0 {
+            state.saved = Some(get_global_parallelism());
+            faer::set_global_parallelism(Par::Seq);
+        }
+        state.depth += 1;
+        Self { _private: () }
+    }
+}
+
+impl Drop for FaerSequentialScope {
+    fn drop(&mut self) {
+        let mut state = FAER_SEQ_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.depth -= 1;
+        if state.depth == 0 {
+            if let Some(par) = state.saved.take() {
+                faer::set_global_parallelism(par);
+            }
+        }
+    }
+}
+
+/// Run `body` with faer pinned to `Par::Seq` (see [`FaerSequentialScope`]). Use
+/// this to wrap a fit/solve that runs inside a Rayon worker so faer's high-level
+/// solvers never fan a nested `spindle` barrier pool into an already-saturated
+/// Rayon pool.
+#[inline]
+pub fn with_faer_sequential<T>(body: impl FnOnce() -> T) -> T {
+    let _scope = FaerSequentialScope::enter();
+    body()
+}
+
 #[derive(Debug, Error)]
 pub enum FaerLinalgError {
     #[error("Factorization failed in {context}")]
@@ -3084,5 +3165,71 @@ mod tests {
             max_abs_diff_1d(&got, &want) < 1e-11,
             "strided fast_av mismatch (fallback path)",
         );
+    }
+
+    // ── FaerSequentialScope (#2074) ───────────────────────────────────────────
+    //
+    // The guard pins faer's process-global parallelism to `Par::Seq` for its
+    // lifetime and restores the prior policy when the outermost guard drops.
+    // This is the primitive that closes the K=1 `sae_manifold_fit` deadlock: a
+    // faer high-level solver reached from inside a topology-race Rayon worker
+    // would otherwise fan a nested `spindle` barrier pool and park at 0% CPU.
+    //
+    // These tests mutate the process-global faer setting, so they save/restore a
+    // known baseline and run serially under one `#[test]` to avoid racing the
+    // other global-parallelism tests in this binary.
+    #[test]
+    fn faer_sequential_scope_sets_seq_inside_and_restores_after() {
+        let baseline = faer::get_global_parallelism();
+        // Establish a definitely-parallel baseline so the "restores" assertion is
+        // meaningful (not vacuously Seq already).
+        faer::set_global_parallelism(Par::rayon(4));
+        assert_eq!(
+            faer::get_global_parallelism(),
+            Par::rayon(4),
+            "baseline must be the parallel policy we just set",
+        );
+
+        {
+            let _scope = FaerSequentialScope::enter();
+            assert_eq!(
+                faer::get_global_parallelism(),
+                Par::Seq,
+                "faer must be pinned to Par::Seq inside the scope",
+            );
+
+            // Nested guard: still Seq, and the inner drop must NOT restore early.
+            {
+                let _inner = FaerSequentialScope::enter();
+                assert_eq!(
+                    faer::get_global_parallelism(),
+                    Par::Seq,
+                    "nested scope stays Par::Seq",
+                );
+            }
+            assert_eq!(
+                faer::get_global_parallelism(),
+                Par::Seq,
+                "inner drop must not restore while outer scope is still live",
+            );
+        }
+
+        assert_eq!(
+            faer::get_global_parallelism(),
+            Par::rayon(4),
+            "outermost drop must restore the pre-scope parallelism policy",
+        );
+
+        // The convenience wrapper behaves identically and returns the body value.
+        let observed = with_faer_sequential(|| faer::get_global_parallelism());
+        assert_eq!(observed, Par::Seq, "with_faer_sequential runs body under Seq");
+        assert_eq!(
+            faer::get_global_parallelism(),
+            Par::rayon(4),
+            "with_faer_sequential restores after the body returns",
+        );
+
+        // Restore the binary-wide baseline.
+        faer::set_global_parallelism(baseline);
     }
 }

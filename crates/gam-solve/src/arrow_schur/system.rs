@@ -2788,15 +2788,27 @@ impl SmallLu {
 /// `Ok(None)` when the capacitance is non-PD / singular — the recoverable
 /// "cross-row IBP joint Hessian is non-PD at this ρ" infeasible-probe refusal,
 /// NOT a silent wrong value.
+///
+/// `schur_pd_floor` is the #1038 spectral floor (`options.schur_pd_floor`). The
+/// GLOBAL reduced Schur `S` inverted here to project `M0 → M` is the SAME dense
+/// reduced Schur that every other SAE-path factorization honors the floor on
+/// (`factor_dense_reduced_schur`): in the overcomplete / dead-atom regime its
+/// collapsed decoder subspace can make `S` slightly indefinite. This site used
+/// a bare `cholesky_lower(&schur)` and so aborted with a raw non-PD pivot even
+/// when the caller had opted into the floor — the last plumbing gap #1795 calls
+/// out. Threading the floor through `factor_dense_reduced_schur` (unit-deflating
+/// the null decoder directions, the evidence/log-det convention) keeps this
+/// cross-row IBP arrow-Schur solve consistent with the direct path and
+/// byte-identical on well-conditioned `S`.
 pub fn streaming_cross_row_woodbury_log_det(
     schur: &Array2<f64>,
     m0: &Array2<f64>,
     w: &Array2<f64>,
     d: &Array1<f64>,
+    schur_pd_floor: Option<f64>,
 ) -> Result<Option<f64>, ArrowSchurError> {
     let r = d.len();
-    let factor =
-        cholesky_lower(schur).map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
+    let (factor, _) = factor_dense_reduced_schur(schur, schur_pd_floor, true)?;
     // M = M0 + Wᵀ S⁻¹ W. With S⁻¹ symmetric, `(Wᵀ S⁻¹ W)[a, b] = (S⁻¹ w_a)·w_b`.
     let mut m = m0.clone();
     for a in 0..r {
