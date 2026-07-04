@@ -2429,6 +2429,54 @@ pub(crate) fn ibp_cross_row_woodbury_logdet_matches_dense() {
     );
 }
 
+/// #1795 — the streaming cross-row IBP Woodbury log-det must honor the #1038
+/// spectral PD-floor on the reduced Schur it inverts, exactly like every other
+/// SAE-path factorization. In the overcomplete / dead-atom regime the GLOBAL
+/// reduced Schur `S` (projecting `M0 → M`) can be slightly indefinite; the site
+/// used a bare `cholesky_lower(&schur)` and so aborted with a raw non-PD pivot
+/// even when the caller had opted into the floor (`options.schur_pd_floor`),
+/// which is the last plumbing gap the issue calls out.
+///
+/// This constructs a cross-row IBP arrow-Schur case whose reduced Schur is
+/// indefinite (eigenvalues `+3, −1`): WITHOUT the floor the solve aborts with
+/// `SchurFactorFailed`; WITH the floor the null decoder direction is
+/// unit-deflated, `S` factors PD, and the capacitance log-det comes back finite.
+#[test]
+pub(crate) fn streaming_cross_row_woodbury_log_det_honors_pd_floor_1795() {
+    // Reduced Schur with eigenvalues {+3, −1} — indefinite, so a raw Cholesky
+    // rejects it. `R = 1` atom (`d.len()`); `k = 2` reduced (border) dim.
+    let schur = array![[1.0_f64, 2.0], [2.0, 1.0]];
+    let m0 = array![[0.0_f64]];
+    let w = array![[0.6_f64], [-0.4]];
+    let d = array![0.15_f64];
+
+    // Without the floor the bare factorization aborts on the non-PD reduced
+    // Schur — the pre-fix behavior.
+    let unfloored = streaming_cross_row_woodbury_log_det(&schur, &m0, &w, &d, None);
+    assert!(
+        matches!(unfloored, Err(ArrowSchurError::SchurFactorFailed { .. })),
+        "un-floored streaming cross-row Woodbury must abort on the non-PD reduced \
+         Schur, got {unfloored:?}"
+    );
+
+    // With the #1038 floor the collapsed decoder direction is unit-deflated, the
+    // reduced Schur factors PD, and the capacitance `C = I + D·M` log-det is a
+    // finite, real evidence correction (positive here: `M ≥ 0`, `d > 0`).
+    let floored = streaming_cross_row_woodbury_log_det(
+        &schur,
+        &m0,
+        &w,
+        &d,
+        Some(SPECTRAL_DEFLATION_REL_FLOOR),
+    )
+    .expect("floored streaming cross-row Woodbury must not abort");
+    let correction = floored.expect("capacitance is PD, so the log-det exists");
+    assert!(
+        correction.is_finite() && correction > 0.0,
+        "floored cross-row Woodbury log-det must be finite and positive, got {correction}"
+    );
+}
+
 #[test]
 pub(crate) fn ibp_cross_row_woodbury_full_inverse_and_newton_match_dense() {
     let (mut sys, source, zprime) = build_ibp_woodbury_fixture();
