@@ -3399,10 +3399,10 @@ fn sae_manifold_fit_inner<'py>(
     // `d_atom` + row-block-penalty incompatibility up front, so it surfaces as a
     // direct `ValueError` here (covering BOTH `sae_manifold_fit` and
     // `sae_manifold_fit_minimal`, which share this inner) rather than as a deep
-    // `RemlConvergenceError` mid-REML. Native ARD rides `native_ard_enabled` (not
-    // a registry descriptor), so both penalty sources are threaded through.
+    // `RemlConvergenceError` mid-REML. Native ARD composes over heterogeneous
+    // coord dims, so only a non-composing registry penalty can refuse here.
     base_term
-        .validate_heterogeneous_atom_compatibility(Some(&registry), native_ard_enabled)
+        .validate_heterogeneous_atom_compatibility(Some(&registry))
         .map_err(py_value_error)?;
     // Route every problem size through the full-batch objective on the owned
     // `target`: the inner Arrow-Schur fit materializes the `(N × M_total)`
