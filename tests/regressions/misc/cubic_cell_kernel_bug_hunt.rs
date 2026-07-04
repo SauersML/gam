@@ -186,10 +186,19 @@ fn bug_cubic_cell_boundary_value_is_discontinuous_between_neighbors() {
     // both neighboring cells must agree in value there. Evaluate each cell AT
     // the boundary (not at boundary ± eps, which would inject a spurious
     // O(eps · slope) gap unrelated to continuity and defeat any tight bound).
+    //
+    // #2073: the tolerance was previously relaxed to 1e-12 on a vague appeal to
+    // the local→global round-trip. But this hand-made pair is well conditioned
+    // (boundary = 0.5, O(1) coefficients, only +/-/* — no transcendentals and no
+    // FMA contraction under default Rust codegen), so `global_cubic_from_local`
+    // reconstructs the boundary value to a *deterministic* 2.78e-17 gap (~0.5 ULP
+    // of ~0.23). 1e-14 keeps ~300x margin over that measured worst case while
+    // being 2 orders tighter — and any real mis-composed global cubic would open
+    // an O(0.1) gap, so this stays trivially discriminating.
     let l = left.eta(boundary);
     let r = right.eta(boundary);
     assert!(
-        (l - r).abs() < 1e-12,
+        (l - r).abs() < 1e-14,
         "Expected cubic-cell evaluation to be continuous at shared boundary from both neighboring cells: left={l}, right={r}, gap={}",
         (l - r).abs()
     );
