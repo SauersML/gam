@@ -183,6 +183,15 @@ pub fn calculate_deviance(
         }
         ResponseFamily::Tweedie { p } => {
             let p = *p;
+            // Report the *unscaled* Tweedie deviance D = 2·Σ wᵢ·d(yᵢ, μᵢ),
+            // matching every other family here (Poisson/Binomial/NB/Beta and
+            // Gamma post-#2126 all accumulate the bare `priorweights·unit_deviance`
+            // with φ ≡ 1) and matching R/mgcv/statsmodels' reported deviance.
+            // Dividing the unit deviance by the fitted dispersion φ̂ would report
+            // the *scaled* deviance D/φ̂ instead — the #2126 defect. The
+            // dispersion is reported separately; the deviance itself must stay
+            // scale-free so `deviance_explained = 1 − D_resid/D_null` is a pure
+            // ratio of like-scaled deviances.
             let phi = fixed_glm_dispersion(likelihood);
             if !is_valid_tweedie_power(p) || !(phi.is_finite() && phi > 0.0) {
                 return f64::NAN;
@@ -196,7 +205,7 @@ pub fn calculate_deviance(
                 .map(|i| {
                     let yi = y[i];
                     let mui_c = mu[i].max(MU_FLOOR);
-                    priorweights[i] * tweedie_unit_deviance(yi, mui_c, p) / phi
+                    priorweights[i] * tweedie_unit_deviance(yi, mui_c, p)
                 })
                 .sum();
             2.0 * total
