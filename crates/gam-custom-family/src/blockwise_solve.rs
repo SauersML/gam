@@ -512,19 +512,34 @@ fn stabilizing_shift_core(
     // `H + δI` PD. A full eigendecomposition (the previous implementation) reads
     // the exact `λ_min` but costs `O(p³)` for ALL eigenpairs EVERY inner cycle;
     // for a coupled K-block family the shift fires almost every cycle, so that
-    // dominated the inner solve (gam#729/#826). A Cholesky-escalation search is
-    // even worse on a hard-near-singular block (many `O(p³)` Cholesky retries).
+    // dominated the inner solve (gam#729/#826).
     //
-    // Use the Gershgorin lower bound on `λ_min` instead — a single `O(p²)` pass,
-    // no iteration: every eigenvalue lies in some disc
-    // `[H_ii − R_i, H_ii + R_i]` with `R_i = Σ_{j≠i} |H_ij|`, so
-    // `λ_min ≥ min_i (H_ii − R_i) =: g`. Shifting by `δ = floor − g` (when `g`
-    // is at/below the floor) guarantees `λ_min(H + δI) = λ_min + δ ≥ floor > 0`,
-    // i.e. `H + δI` is PD. The bound is conservative (δ may be larger than the
-    // exact eigh shift), but it is self-vanishing in the well-conditioned regime
-    // (handled by the Cholesky fast path above) and the downstream solve only
-    // requires PD, not the tightest possible shift — and the trust region governs
-    // step size regardless. `O(p²)` per cycle instead of `O(p³)`.
+    // The Gershgorin lower bound on `λ_min` — a single `O(p²)` pass, every
+    // eigenvalue lies in some disc `[H_ii − R_i, H_ii + R_i]` with
+    // `R_i = Σ_{j≠i} |H_ij|`, so `λ_min ≥ min_i (H_ii − R_i) =: g` — gives a
+    // *guaranteed-PD* shift `floor − g` in one pass. But on a dense, coupled data
+    // Hessian (e.g. the survival marginal/logslope aliasing of gam#979, where the
+    // marginal and logslope smooths share covariates and every row is full) the
+    // disc radius `R_i` is enormous relative to the true spectrum, so `g` sits
+    // *far* below the actual `λ_min` and `floor − g` over-shifts by an order of
+    // magnitude. That inflated ridge does NOT just guarantee positive-definiteness
+    // — it damps the Newton step `(H_pen + δI)⁻¹ g` in exactly the low-curvature
+    // coupled directions that carry the residual, collapsing the joint-Newton
+    // contraction to a slow linear crawl (persistent gain-ratio > 1 with interior,
+    // never-trust-clamped steps: the ridge, not the trust region, is throttling the
+    // step). The stabilizer's only job is PD-ness; step-size control belongs to the
+    // trust region, so the ridge must be the *minimal* one that restores PD.
+    //
+    // Recover a near-minimal shift without an `O(p³)`-per-eigenpair eigh: use the
+    // Gershgorin shift only as a guaranteed-PD upper bracket and bisect the PD
+    // frontier with Cholesky. `cholesky(H + δI)` succeeds iff `δ > −λ_min(H)`, a
+    // monotone step in `δ`, so a handful of bisections between the known-indefinite
+    // `δ = 0` (the fast-path Cholesky above already failed) and the known-PD
+    // Gershgorin bracket squeeze `δ` to within `2⁻ⁿ` of the minimal PD shift. Each
+    // step is one `O(p³/3)` Cholesky; the iteration count is capped and only runs
+    // on the indefinite cycles the fast path did not already clear, so the cost is
+    // bounded and self-vanishing. The final `+ floor` restores the `≥ floor`
+    // positive-definiteness margin the downstream solve relies on.
     let p = gershgorin_src.nrows();
     let mut gershgorin_min = f64::INFINITY;
     for i in 0..p {
@@ -548,7 +563,38 @@ fn stabilizing_shift_core(
         // (round-off on a barely-PD matrix): a floor-sized shift suffices.
         return Some(floor);
     }
-    Some(floor - gershgorin_min)
+    // Guaranteed-PD upper bracket: `λ_min(cholesky_test + (floor − g)·I) ≥ floor`.
+    let bracket = floor - gershgorin_min;
+    let cholesky_pd_at = |delta: f64| -> bool {
+        let mut shifted = cholesky_test.clone();
+        for d in 0..shifted.nrows() {
+            shifted[[d, d]] += delta;
+        }
+        shifted.cholesky(Side::Lower).is_ok()
+    };
+    // Bisect the minimal PD shift `δ*` (where Cholesky just succeeds) in
+    // `(0, bracket]`. `δ = 0` is known-indefinite (fast path failed above); the
+    // bracket is known-PD. Cap iterations (relative squeeze to ~2⁻¹² of the
+    // bracket) so the extra Choleskys stay bounded even when the shift fires on
+    // every cycle of a coupled K-block fit.
+    const MAX_BISECT: usize = 12;
+    let mut lo = 0.0_f64; // indefinite
+    let mut hi = bracket; // PD
+    for _ in 0..MAX_BISECT {
+        let mid = 0.5 * (lo + hi);
+        if mid <= lo || mid >= hi {
+            break;
+        }
+        if cholesky_pd_at(mid) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    // `hi` is the tightest bracket known PD (λ_min(cholesky_test + hi·I) ≈ 0⁺).
+    // Add `floor` to restore the strict `≥ floor` margin, clamped to the original
+    // guaranteed-PD Gershgorin shift so we never exceed the conservative bound.
+    Some((hi + floor).min(bracket))
 }
 
 /// Per-block exact-Newton analogue of [`stabilized_joint_solver_diagonal_ridge`]
