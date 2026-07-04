@@ -2824,22 +2824,181 @@ class StagewiseSAE:
             recons.append(atom.assignments[:, None] * curve)
         return recons
 
-    def reconstruct(self, X: Any = None) -> np.ndarray:
+    def _in_sample_reconstruction(self) -> np.ndarray:
         """Composed reconstruction ``Σ_k a_k · (Φ_k B_k)`` of the training target.
 
-        ``X`` is accepted for API symmetry with :meth:`ManifoldSAE.reconstruct`
-        but ignored: the composed dictionary reconstructs the target it was fit
-        on (the atoms carry their converged coordinates/gates). Returns ``(N, p)``.
+        The atoms carry their converged coordinates/gates, so this is the exact
+        in-sample reconstruction the SAC fit produced. Returns ``(N, p)``.
         """
-        del X
         if not self.atoms:
             return np.zeros_like(self.training_data, dtype=np.float64)
         return np.sum(self._atom_reconstructions(), axis=0)
 
+    @property
+    def fitted(self) -> np.ndarray:
+        """In-sample composed reconstruction ``(N, p)`` (mirrors
+        :attr:`ManifoldSAE.fitted`)."""
+        return self._in_sample_reconstruction()
+
+    def to_manifold_sae(self) -> "ManifoldSAE":
+        """Lift the SAC-composed frozen dictionary into a :class:`ManifoldSAE`.
+
+        The composed atoms (frozen decoders + their circle/sphere analytic bases)
+        are packed into the SAME per-atom layout
+        :meth:`ManifoldSAE._oos_payload` / the Rust ``sae_manifold_predict_oos``
+        FFI already consume, so the returned object exposes the existing
+        out-of-sample surface — ``reconstruct(X_new)`` / ``encode`` /
+        ``project`` — with NO new numerical path: the frozen-decoder OOS chart
+        routing/encode lives in Rust and is reused verbatim, this is pure array
+        marshalling (SPEC thin-wrapper rule).
+
+        Scalar fit controls (``alpha`` / ``tau`` / ``assignment`` / learning
+        rate / ...) are inherited from the K=1 :attr:`seed`, so the held-out
+        solve runs under the same gate family the dictionary was grown with. The
+        lifted object's ``training_data``/``fitted`` are the SAC target and its
+        composed in-sample reconstruction, so scoring the exact training matrix
+        returns the SAC reconstruction bit-for-bit while any fresh ``X`` takes the
+        Rust OOS solve.
+        """
+        seed = self.seed
+        if not self.atoms:
+            # Empty dictionary: nothing composed to route out of sample; the K=1
+            # seed IS the model (it already exposes the OOS surface).
+            return seed
+        training = np.ascontiguousarray(np.asarray(self.training_data, dtype=np.float64))
+        fitted = np.ascontiguousarray(self._in_sample_reconstruction())
+        basis_kinds = [
+            _TOPOLOGY_TO_BASIS.get(_canon_name(a.topology), _canon_name(a.topology))
+            for a in self.atoms
+        ]
+        decoder_blocks = [
+            np.ascontiguousarray(np.asarray(a.decoder, dtype=np.float64)) for a in self.atoms
+        ]
+        atom_dims = [int(a.latent_dim) for a in self.atoms]
+        basis_sizes = [int(b.shape[0]) for b in decoder_blocks]
+        # Periodic harmonics recovered DIRECTLY from the decoder width (M = 2H + 1):
+        # ``(M - 1) // 2`` with no floor, so a DC-only born atom (M = 1 → H = 0)
+        # keeps its constant basis instead of being inflated to a 3-column periodic
+        # design the frozen decoder no longer matches. Sphere / non-periodic pass
+        # through as 0 (their basis size is fixed, not harmonic-derived).
+        n_harmonics = [
+            ((size - 1) // 2 if kind in ("periodic", "periodic_spline") else 0)
+            for kind, size in zip(basis_kinds, basis_sizes)
+        ]
+        centers: list[np.ndarray | None] = [None] * len(self.atoms)
+        coords = [np.ascontiguousarray(np.asarray(a.coords, dtype=np.float64)) for a in self.atoms]
+        assignments = np.ascontiguousarray(
+            np.column_stack(
+                [np.asarray(a.assignments, dtype=np.float64).reshape(-1) for a in self.atoms]
+            )
+        )
+        assignment = _canonical_assignment(self.assignment, "assignment")
+        fit_atoms = [
+            SaeManifoldAtomFit(
+                basis=basis_kinds[k],
+                decoder_coefficients=decoder_blocks[k],
+                assignments=np.ascontiguousarray(assignments[:, k].copy()),
+                coords=coords[k],
+                evidence=None,
+                active_dim=int(atom_dims[k]),
+            )
+            for k in range(len(self.atoms))
+        ]
+        k_atoms = len(self.atoms)
+        low = SaeManifoldFitResult(
+            fit_atoms,
+            k_atoms,
+            {k_atoms: float("nan")},
+            {"winner": f"K={k_atoms}"},
+            fitted,
+            assignments,
+            [c.copy() for c in coords],
+            float("nan"),
+        )
+        return ManifoldSAE(
+            atoms=fit_atoms,
+            atom_topology=_topology_for_bases(basis_kinds),
+            atom_topologies=_topologies_for_bases(basis_kinds),
+            assignment=assignment,
+            assignment_label=str(self.assignment),
+            primitive_names=["sae_manifold_fit_stagewise"],
+            fitted=fitted,
+            assignments=assignments,
+            coords=[c.copy() for c in coords],
+            decoder_blocks=decoder_blocks,
+            basis_specs=list(basis_kinds),
+            penalized_loss_score=None,
+            reconstruction_r2=self.reconstruction_ev(),
+            training_mean=training.mean(axis=0),
+            training_data=training,
+            low_level=low,
+            low_level_logits=np.ascontiguousarray(np.asarray(self.logits, dtype=np.float64)),
+            diagnostics={},
+            _basis_kinds=list(basis_kinds),
+            _atom_dims=atom_dims,
+            _basis_sizes=basis_sizes,
+            _n_harmonics=list(n_harmonics),
+            _duchon_centers=centers,
+            _oos_projection_top1=False,
+            alpha=float(seed.alpha),
+            learnable_alpha=bool(seed.learnable_alpha),
+            tau=float(seed.tau),
+            sparsity_strength=float(seed.sparsity_strength),
+            smoothness=float(seed.smoothness),
+            learning_rate=float(seed.learning_rate),
+            max_iter=int(seed.max_iter),
+            random_state=int(seed.random_state),
+            top_k=None,
+            jumprelu_threshold=float(seed.jumprelu_threshold),
+        )
+
+    def reconstruct(
+        self, X: Any = None, *, t_init: Any = None, a_init: Any = None
+    ) -> np.ndarray:
+        """Reconstruct ``X`` through the composed dictionary, ``(N, p)``.
+
+        ``X=None`` (or the exact training target) returns the in-sample composed
+        reconstruction ``Σ_k a_k · (Φ_k B_k)``. Any OTHER ``X`` is scored
+        OUT OF SAMPLE: the frozen decoders route each held-out row through the
+        existing Rust fixed-decoder OOS solve (via :meth:`to_manifold_sae`), so
+        passing fresh rows no longer silently returns the training reconstruction.
+        ``t_init`` / ``a_init`` warm-start the OOS refinement (#357).
+        """
+        if X is None:
+            return self._in_sample_reconstruction()
+        return self.to_manifold_sae().reconstruct(X, t_init=t_init, a_init=a_init)
+
+    def transform(
+        self, X: Any, *, t_init: Any = None, a_init: Any = None
+    ) -> np.ndarray:
+        """Out-of-sample composed reconstruction of ``X`` (honors ``X``).
+
+        Thin alias for :meth:`reconstruct` that always routes through the Rust
+        OOS path, giving the composed dictionary the held-out ``transform``
+        surface the joint :class:`ManifoldSAE` already exposes.
+        """
+        return self.to_manifold_sae().reconstruct(X, t_init=t_init, a_init=a_init)
+
+    def predict(self, X: Any) -> np.ndarray:
+        """Alias for :meth:`transform` (out-of-sample reconstruction of ``X``)."""
+        return self.to_manifold_sae().reconstruct(X)
+
+    def encode(
+        self, X: Any, **kwargs: Any
+    ) -> "np.ndarray | tuple[np.ndarray, dict[str, Any]]":
+        """Out-of-sample per-token assignments ``a*`` ``(N, K)`` for ``X``.
+
+        Delegates to :meth:`ManifoldSAE.encode` on the lifted dictionary, so the
+        frozen-decoder encode runs through the same Rust OOS solve the joint model
+        uses. Keyword arguments (``t_init`` / ``a_init`` / ``encoder`` /
+        ``return_stats``) are forwarded unchanged.
+        """
+        return self.to_manifold_sae().encode(X, **kwargs)
+
     def reconstruction_ev(self) -> float:
-        """Centered explained variance of :meth:`reconstruct` against the target."""
+        """Centered explained variance of the in-sample reconstruction."""
         x = np.asarray(self.training_data, dtype=np.float64)
-        recon = self.reconstruct()
+        recon = self._in_sample_reconstruction()
         rss = float(np.sum((x - recon) ** 2))
         tss = float(np.sum((x - x.mean(axis=0, keepdims=True)) ** 2))
         return 1.0 - rss / tss if tss > 0.0 else 0.0
@@ -2870,12 +3029,23 @@ def _basis_with_jet_for_atom(
         raise ValueError(f"stagewise atom coords must be 2D (N, d); got shape {t.shape}")
     if canon == "circle":
         # A periodic atom's basis width is M = 2H + 1; recover H from the trained
-        # decoder width (mirrors ``_canonical_n_harmonics``) so the rebuilt Φ has
-        # exactly the atom's columns even for a born/degenerate-width atom.
-        n_harmonics = max(1, (int(basis_size) - 1) // 2)
-        phi, jet, penalty = rust_module().basis_with_jet(
-            "periodic", t[:, :1], {"n_harmonics": int(n_harmonics)}
-        )
+        # decoder width so the rebuilt Φ has exactly the atom's columns. A born
+        # atom can degenerate to the DC-only width M = 1 (H = 0) — the SAC driver
+        # emits these — so H is ``(M - 1) // 2`` with NO ``max(1, …)`` floor: a
+        # spurious floor would rebuild a 3-column Φ against a 1-row decoder and the
+        # ``Φ @ B`` reconstruct would raise a shape mismatch. For H = 0 the basis is
+        # just the constant column, evaluated here directly (the Rust harmonic
+        # evaluator agrees: ``PeriodicHarmonicEvaluator::new(1)`` → Φ ≡ 1).
+        n_harmonics = (int(basis_size) - 1) // 2
+        if n_harmonics <= 0:
+            n_rows = int(t.shape[0])
+            phi = np.ones((n_rows, 1), dtype=np.float64)
+            jet = np.zeros((n_rows, 1, 1), dtype=np.float64)
+            penalty = np.zeros((1, 1), dtype=np.float64)
+        else:
+            phi, jet, penalty = rust_module().basis_with_jet(
+                "periodic", t[:, :1], {"n_harmonics": int(n_harmonics)}
+            )
     elif canon == "sphere":
         phi, jet, penalty = rust_module().basis_with_jet("sphere", t[:, : max(1, latent_dim)], {})
     else:

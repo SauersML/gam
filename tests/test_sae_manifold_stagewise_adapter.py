@@ -216,6 +216,85 @@ def test_stagewise_behavioral_fisher_runs_and_auto_disables_structured_whitening
     assert _is_non_decreasing(result.ev_trace), list(result.ev_trace)
 
 
+def _centered_ev(x: np.ndarray, recon: np.ndarray) -> float:
+    """Centered explained variance of ``recon`` against target ``x``."""
+    x = np.asarray(x, dtype=float)
+    recon = np.asarray(recon, dtype=float)
+    rss = float(np.sum((x - recon) ** 2))
+    tss = float(np.sum((x - x.mean(axis=0, keepdims=True)) ** 2))
+    return 1.0 - rss / tss if tss > 0.0 else 0.0
+
+
+def test_stagewise_out_of_sample_transform_honors_x() -> None:
+    # #2118 — a SAC-composed dictionary must be scorable on HELD-OUT data. Before
+    # the fix ``StagewiseSAE.reconstruct(X)`` ignored ``X`` and returned the
+    # training reconstruction; now ``reconstruct``/``transform`` route the frozen
+    # decoders through the existing Rust fixed-decoder OOS solve (via the lifted
+    # ``to_manifold_sae()``), so passing fresh rows tracks THOSE rows.
+    x_train, _assign = _planted_two_circles(n=300, p=16, noise=0.02, seed=11)
+    fit = gamfit.sae_manifold_fit_stagewise(
+        x_train,
+        d_atom=1,
+        atom_topology="circle",
+        assignment="ibp_map",
+        max_births=4,
+        max_backfit_sweeps=1,
+        n_iter=30,
+        random_state=11,
+    )
+    assert fit.k >= 2, f"expected >= 2 atoms for two planted circles; got K={fit.k}"
+
+    # The lift exposes the joint model's OOS surface.
+    lifted = fit.to_manifold_sae()
+    assert isinstance(lifted, gamfit.ManifoldSAE)
+    assert len(lifted.atoms) == fit.k
+
+    # --- Held-out rows with a DIFFERENT row count: the OLD code could not even
+    # return an object of this shape (it returned the (n_train, p) training
+    # reconstruction), so a matching-shape, high-EV result proves X is honored.
+    x_hold, _ = _planted_two_circles(n=150, p=16, noise=0.02, seed=99)
+    recon_oos = fit.transform(x_hold)
+    assert recon_oos.shape == x_hold.shape, (
+        f"OOS reconstruction must track X_new shape; got {recon_oos.shape} "
+        f"for X_new {x_hold.shape}"
+    )
+    ev_hold = _centered_ev(x_hold, recon_oos)
+    # Near the #2118 reference (top-1 = 0.9948 / greedy = 0.9952) with a modest
+    # tolerance band; the noise floor (0.02) caps the achievable held-out EV.
+    assert ev_hold > 0.95, f"held-out EV must be high; got {ev_hold:.4f}"
+
+    # reconstruct(X_new) is the same OOS path (transform is the explicit alias).
+    recon_via_reconstruct = fit.reconstruct(x_hold)
+    assert np.allclose(recon_via_reconstruct, recon_oos)
+
+    # --- Same-row-count held-out set: a VALUE-based proof the training
+    # reconstruction is no longer returned. The OOS recon must (a) differ from the
+    # cached training reconstruction and (b) explain the held-out rows far better
+    # than blindly returning the training reconstruction ever could.
+    x_hold2, _ = _planted_two_circles(n=300, p=16, noise=0.02, seed=99)
+    recon2 = fit.transform(x_hold2)
+    train_recon = fit.fitted  # in-sample composed reconstruction (the OLD output)
+    assert not np.allclose(recon2, train_recon), (
+        "reconstruct(X_new) still returns the training reconstruction (bug #2118)"
+    )
+    ev_oos = _centered_ev(x_hold2, recon2)
+    ev_stale = _centered_ev(x_hold2, train_recon)
+    assert ev_oos > 0.95, f"held-out EV must be high; got {ev_oos:.4f}"
+    assert ev_oos > ev_stale + 0.5, (
+        f"OOS recon must track X_new far better than the stale training "
+        f"reconstruction; ev_oos={ev_oos:.4f} vs ev_stale={ev_stale:.4f}"
+    )
+
+    # In-sample surface is unchanged: reconstruct(None) is still the SAC sum.
+    in_sample = fit.reconstruct()
+    assert in_sample.shape == x_train.shape
+    assert np.allclose(in_sample, fit.fitted)
+
+    # encode(X_new) routes through the same OOS solve and is (N, K) shaped.
+    codes = fit.encode(x_hold)
+    assert codes.shape == (x_hold.shape[0], fit.k)
+
+
 def test_stagewise_behavioral_fisher_conflicts_with_structured_whitening() -> None:
     # The fixed likelihood-whitening metric and the per-birth Σ-refit are two rival
     # sources for the SAME per-row inner product; the wrapper refuses the ambiguous
