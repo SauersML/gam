@@ -298,52 +298,34 @@ impl SaeManifoldTerm {
                     threshold,
                     temperature,
                 } => {
-                    // Size the JumpReLU joint block by the HARD forward gate plus
-                    // the gated-off atoms still carrying a NON-NEGLIGIBLE
-                    // column-separable (diagonal-only) prior gradient, mirroring
-                    // the softmax / IBP `from_dense_weights` truncation instead of
-                    // dragging the whole −36 optimization band (≈ every atom) into
-                    // the joint solve. `contribution[row, k]` is the exact
-                    // magnitude of atom k's separable diagonal gradient sub-vector
-                    // — the sparsity-prior logit gradient (`assignment_grad`, the
-                    // same values the row block writes at the active-atom slots
-                    // below) plus the ARD coordinate gradient — i.e. precisely the
-                    // slice of `gt` that leaves the block when k is dropped. Deep
-                    // gated-off atoms (`(logit−θ)/τ` very negative) have
-                    // `slope = σ(1−σ) → 0` and drop out, collapsing the block from
-                    // `K·(1+d)` to `k_active·(1+d)`; near-threshold and gated-on
-                    // atoms keep their exact diagonal, so the assembled gradient is
-                    // preserved to the relative cutoff. The OBJECTIVE VALUE is
-                    // layout-independent (the loss's `assignment_prior_value` /
-                    // `ard_value` sum the full band), hence bit-identical.
+                    // #1801 — size the JumpReLU joint block by the HARD FORWARD GATE.
+                    // The joint (cross-coupling) row block only ever needs the atoms
+                    // that actually DATA-FIT COUPLE: a gated-off atom (`logit ≤ θ`,
+                    // `a_k = 0`) has a hard-zero reconstruction contribution and a
+                    // hard-zero data-fit logit JVP, so it never couples with the
+                    // decoder or any on atom. Its ONLY footprint is a column-
+                    // SEPARABLE diagonal prior (its own sparsity-logit + ARD-coord
+                    // gradient/curvature), which a diagonal-only atom carries without
+                    // a joint-block slot; profiling it out leaves the reduced β /
+                    // decoder Schur system and its Δβ Newton step unchanged, and the
+                    // OBJECTIVE VALUE is layout-independent (the loss sums the full
+                    // −36 optimization band regardless of this layout).
+                    //
+                    // `contribution[row, k]` is therefore the atom's DATA-FIT
+                    // coupling magnitude — the gate mass `a_{n,k}` — NOT its separable
+                    // prior gradient. `a_{n,k}` is EXACTLY zero for every gated-off
+                    // atom (the JumpReLU hard gate) and positive only above the
+                    // threshold, so `from_jumprelu`'s relative cutoff drops all
+                    // gated-off atoms and the block collapses from `K·(1+d)` to the
+                    // hard-gate `k_active·(1+d)`, independent of K. (The prior layout
+                    // scored membership by the SEPARABLE prior gradient, which is O(1)
+                    // for gated-off logits sitting near the threshold, so essentially
+                    // all K atoms were retained and the per-token block ballooned to
+                    // `K·(1+d)` — the bug pinned by
+                    // `sae_streaming_arrow_schur_contract::per_token_block_dim_is_independent_of_k_at_fixed_active`.)
                     const JUMPRELU_RELATIVE_CUTOFF: f64 = 1.0e-3;
-                    let mut contribution = Array2::<f64>::zeros((n, k_atoms));
-                    for k in 0..k_atoms {
-                        let coord = &self.assignment.coords[k];
-                        let d = coord.latent_dim();
-                        let has_ard = d > 0 && k < rho.log_ard.len() && rho.log_ard[k].len() == d;
-                        let periods = if has_ard {
-                            coord.effective_axis_periods()
-                        } else {
-                            Vec::new()
-                        };
-                        for row in 0..n {
-                            // Sparsity-prior separable diagonal gradient on the logit.
-                            let mut c = assignment_grad[row * k_atoms + k].abs();
-                            // ARD separable diagonal gradient on each coord axis.
-                            if has_ard {
-                                let row_t = coord.row(row);
-                                for axis in 0..d {
-                                    let alpha =
-                                        SaeManifoldRho::stable_exp_strength(rho.log_ard[k][axis]);
-                                    c += ArdAxisPrior::eval(alpha, row_t[axis], periods[axis])
-                                        .grad
-                                        .abs();
-                                }
-                            }
-                            contribution[[row, k]] = c;
-                        }
-                    }
+                    let gates = self.assignment.assignments();
+                    let contribution = gates.mapv(f64::abs);
                     Some(SaeRowLayout::from_jumprelu(JumpReluLayoutParams {
                         n,
                         k_atoms,
