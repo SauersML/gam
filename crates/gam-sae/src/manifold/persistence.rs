@@ -443,9 +443,7 @@ fn components_and_scale(finite_h0: &[PersistenceBar]) -> (usize, f64) {
 pub fn topology_persistence_verdict(
     points: ArrayView2<'_, f64>,
     raced_kind: &SaeAtomBasisKind,
-    latent_dim: usize,
 ) -> Option<AtomTopologyPersistence> {
-    let _ = latent_dim;
     let expected_loop = kind_expects_loop(raced_kind)?;
     let full = points.nrows();
     if full < 4 {
@@ -556,7 +554,7 @@ pub fn atom_topology_persistence(
             points[[i, col]] = image[col];
         }
     }
-    topology_persistence_verdict(points.view(), &atom.basis_kind, atom.latent_dim)
+    topology_persistence_verdict(points.view(), &atom.basis_kind)
 }
 
 /// The topology read off a typed-free local-chart atlas by its NERVE (reviewer

@@ -82,7 +82,7 @@ fn vietoris_rips_finds_the_circle_loop() {
 #[test]
 fn circle_cloud_agrees_with_a_raced_circle() {
     let pts = circle_points(40, 2.0);
-    let verdict = topology_persistence_verdict(pts.view(), &SaeAtomBasisKind::Periodic, 1)
+    let verdict = topology_persistence_verdict(pts.view(), &SaeAtomBasisKind::Periodic)
         .expect("periodic atom has a topology prediction");
     assert_eq!(verdict.n_components, 1, "circle is connected");
     assert!(verdict.has_loop, "circle must show a loop");
@@ -98,7 +98,7 @@ fn circle_cloud_agrees_with_a_raced_circle() {
 fn seven_cluster_ring_forced_through_circle_is_contested() {
     // Seven tight blobs on a ring, but the atom was raced `Periodic` (a circle).
     let pts = cluster_ring_points(7, 6, 3.0, 0.01);
-    let verdict = topology_persistence_verdict(pts.view(), &SaeAtomBasisKind::Periodic, 1)
+    let verdict = topology_persistence_verdict(pts.view(), &SaeAtomBasisKind::Periodic)
         .expect("periodic atom has a topology prediction");
     assert_eq!(
         verdict.n_components, 7,
@@ -116,7 +116,7 @@ fn seven_cluster_ring_forced_through_circle_is_contested() {
 fn line_is_clean_against_a_line_and_contested_against_a_circle() {
     let pts = line_points(40, 5.0);
     // Raced as the (loop-free) linear patch: clean.
-    let as_line = topology_persistence_verdict(pts.view(), &SaeAtomBasisKind::Linear, 1)
+    let as_line = topology_persistence_verdict(pts.view(), &SaeAtomBasisKind::Linear)
         .expect("linear atom has a topology prediction");
     assert_eq!(as_line.n_components, 1, "a line is one component");
     assert!(!as_line.has_loop, "a line has no loop");
@@ -127,7 +127,7 @@ fn line_is_clean_against_a_line_and_contested_against_a_circle() {
     );
 
     // The SAME line raced as a circle: the predicted loop is absent → contested.
-    let as_circle = topology_persistence_verdict(pts.view(), &SaeAtomBasisKind::Periodic, 1)
+    let as_circle = topology_persistence_verdict(pts.view(), &SaeAtomBasisKind::Periodic)
         .expect("periodic atom has a topology prediction");
     assert!(as_circle.expected_loop, "periodic predicts a loop");
     assert!(!as_circle.has_loop, "the line has no loop to find");
@@ -173,7 +173,7 @@ fn atlas_nerve_recovers_circle_and_arc() {
 fn precomputed_kind_has_no_prediction_to_contest() {
     let pts = circle_points(20, 1.0);
     let verdict =
-        topology_persistence_verdict(pts.view(), &SaeAtomBasisKind::Precomputed("x".into()), 1);
+        topology_persistence_verdict(pts.view(), &SaeAtomBasisKind::Precomputed("x".into()));
     assert!(
         verdict.is_none(),
         "a caller-supplied basis carries no library topology to audit"
