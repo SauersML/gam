@@ -1477,6 +1477,500 @@ pub fn fit_stagewise(
     })
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  Batched birth-racing (THRPT) — PARALLEL candidate generation + acceptance
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// # Why this exists
+//
+// [`fit_stagewise`] discovers curved atoms SERIALLY: fit → harvest residual →
+// race ONE seed → accept/reject → refit residual → repeat. Each birth is minutes
+// on ~2 cores while ~30 cores idle, so the composed dictionary tops out at tens
+// of curved atoms. The in-frame path made each curved fit a tiny INDEPENDENT
+// problem (r ≈ 8–32 in-frame coords, per-region rows), so births in DIFFERENT
+// residual regions are statistically independent given the current dictionary —
+// nothing forces them through one serial loop.
+//
+// [`fit_stagewise_batched`] exploits that: from ONE residual snapshot it
+// harvests MANY candidate seeds (the [`isa_deflationary_producer`] extracts every
+// certifiable circle 2-plane in one deflationary pass — exactly the seed sequence
+// the serial loop would mine one-per-round), RACES their K=1 fits concurrently
+// across cores (rayon), and accepts a DISJOINT batch in one round.
+//
+// # The statistical care — batch-greedy / matching-pursuit orthogonality
+//
+// Accepting many births from ONE residual snapshot risks double-booking the same
+// variance twice (two candidates explaining overlapping structure). The clean,
+// provable criterion is the batch-OMP block-orthogonality condition:
+//
+//   In greedy matching pursuit, selecting a BATCH of atoms in one iteration
+//   equals selecting them SEQUENTIALLY iff the selected atoms' design blocks are
+//   mutually orthogonal — the off-diagonal Gram block is zero — so the residual
+//   update from accepting one leaves the others' fit and selection score
+//   unchanged (Tropp 2004; Pati–Rezaiifar–Krishnaprasad OMP; the block/group
+//   generalization is standard batch-greedy theory).
+//
+// We realize the sufficient orthogonality condition through DISJOINT GATE ROW
+// SUPPORT under an INDEPENDENT gate (IBP / ThresholdGate): a born atom's gate is
+// exactly `0` on rows below its threshold, so its weighted K=1 objective and
+// gradient read ONLY its support rows. If two accepted atoms have disjoint
+// support, neither's fit sees the other's rows, so
+//
+//   fit_of(cand_j against the ORIGINAL residual R₀)
+//     == fit_of(cand_j against R₁ = R₀ − Σ_{i<j} contribution_i)
+//
+// EXACTLY (not up to tolerance — the off-support rows drop out of the sum
+// entirely), and the joint evidence decomposes additively:
+//
+//   reml(K + a + b) − reml(K) = [reml(K+a) − reml(K)] + [reml(K+b) − reml(K)].
+//
+// Each bracket is precisely what the serial loop charges that birth. So the
+// batched loop's accepted SET, per-birth CHARGES, and terminal evidence equal the
+// serial loop's, up to acceptance ORDER. This is the parity license (see
+// `tests_batched_parity_*`): batched must equal serial statistically, or the
+// speed is fake.
+//
+// Overlapping candidates (intersecting support) VIOLATE the orthogonality
+// condition, so we accept only the BEST of an overlapping group (lowest joint
+// REML — the same keep-lowest tiebreak as the serial A-vs-B race) and REQUEUE the
+// rest: they are dropped this round and re-mined next round against the UPDATED
+// residual, recovering pure greedy on the conflicting part. No magic constant —
+// the criterion is support-set disjointness, and the per-round fan-out is a
+// safety BOUND (`max_candidates_per_round`), not a tuning knob.
+
+/// Cost BOUND on the parallel candidate fan-out per batched birth round: the
+/// deflationary producer harvests at most this many certified planes from one
+/// residual snapshot, and they are raced concurrently. A safety bound (like
+/// [`StagewiseConfig::max_births`]), NOT a tuning knob — a larger value only
+/// exposes more of the residual's already-present structure to one parallel pass.
+#[derive(Clone, Copy, Debug)]
+pub struct BatchedStagewiseConfig {
+    /// The shared inner-fit + SAC dials (identical semantics to the serial path).
+    pub base: StagewiseConfig,
+    /// Upper bound on candidates harvested + raced per round.
+    pub max_candidates_per_round: usize,
+}
+
+impl Default for BatchedStagewiseConfig {
+    fn default() -> Self {
+        Self {
+            base: StagewiseConfig::default(),
+            // Mirrors the serial `max_births` safety cap: a round never fans out
+            // wider than the whole dictionary is allowed to grow.
+            max_candidates_per_round: StagewiseConfig::default().max_births,
+        }
+    }
+}
+
+/// Per-round bookkeeping for the batched driver's honesty surface: how many
+/// candidates one residual snapshot produced, how many cleared the birth gate,
+/// how many were co-accepted (a disjoint batch), and how many passing candidates
+/// were requeued because they conflicted with a better one this round.
+#[derive(Clone, Copy, Debug)]
+pub struct BatchRoundRecord {
+    pub candidates_generated: usize,
+    pub candidates_passing_gate: usize,
+    pub co_accepted: usize,
+    pub requeued_overlap: usize,
+}
+
+/// The batched SAC result: the composed dictionary, its ρ, the standard
+/// [`StagewiseReport`], and the per-round batch ledger (for the births/round
+/// multiplier).
+#[derive(Clone, Debug)]
+pub struct BatchedStagewiseResult {
+    pub term: SaeManifoldTerm,
+    pub rho: SaeManifoldRho,
+    pub report: StagewiseReport,
+    pub batch_records: Vec<BatchRoundRecord>,
+}
+
+/// A candidate that has been RACED: its born atom fully fit as a K=1 sub-problem,
+/// its frozen joint evidence + EV measured as a `K+1` term, and its gate row
+/// support recorded (the rows the batch-greedy disjointness test reads).
+struct RacedCandidate {
+    born_atom: SaeManifoldAtom,
+    born_coord: LatentCoordValues,
+    born_logit_col: Vec<f64>,
+    born_ard: Array1<f64>,
+    born_log_lambda_smooth: f64,
+    /// Seed-gate support rows (finite gate ⇒ the atom can be active there). For a
+    /// global shared-factor DC seed this is ALL rows, so it never co-accepts and
+    /// the round reduces to exactly one serial birth.
+    support: Vec<usize>,
+    reml: f64,
+    ev: f64,
+    energy: f64,
+}
+
+/// Lift one ISA-certified circle plane to a [`BirthSeed`] (harmonic decoder on the
+/// cos/sin rows + phase-aligned chart + own-presence gate) — the same seed the
+/// serial `residual_principal_birth_candidate` circle path builds, so a raced
+/// plane is byte-identical to the serial per-round pick.
+fn plane_to_birth_seed(term: &SaeManifoldTerm, cand: &IsaPlaneCandidate) -> BirthSeed {
+    let m = term.atoms[0].basis_size();
+    let p = term.output_dim();
+    let mut decoder = Array2::<f64>::zeros((m, p));
+    for j in 0..p {
+        decoder[[1, j]] = cand.amplitudes[0] * cand.basis[[j, 0]];
+        decoder[[2, j]] = cand.amplitudes[1] * cand.basis[[j, 1]];
+    }
+    let energy = cand.amplitudes[0].powi(2) + cand.amplitudes[1].powi(2);
+    BirthSeed {
+        decoder,
+        energy,
+        circle_coords: Some(cand.phases_turns.clone()),
+        circle_gate: Some(cand.gate_logits.clone()),
+    }
+}
+
+/// Race ONE birth seed: build the born atom (circle-direct for a rank-2 plane
+/// seed, else the topology-race `Birth`), fit it as a K=1 sub-problem against the
+/// residual, and measure its frozen joint evidence + EV as a `K+1` term — exactly
+/// the serial candidate-A construction, refactored so a batch of seeds can be
+/// raced in parallel. Pure over `(term, rho, residual, target)`: it clones the
+/// term internally and mutates nothing shared, so it is safe under `par_iter`.
+fn race_birth_seed(
+    term: &SaeManifoldTerm,
+    rho: &SaeManifoldRho,
+    seed: &BirthSeed,
+    residual: ArrayView2<'_, f64>,
+    target: ArrayView2<'_, f64>,
+    registry: Option<&AnalyticPenaltyRegistry>,
+    config: &StagewiseConfig,
+) -> Result<RacedCandidate, String> {
+    let k = term.k_atoms();
+    let n = term.assignment.logits.nrows();
+    let born_move = match &seed.circle_coords {
+        Some(coords) => crate::structure_harvest::born_circle_atom(
+            term,
+            rho,
+            seed.decoder.clone(),
+            coords.clone(),
+            seed.circle_gate.clone().unwrap_or_else(|| vec![0.0; n]),
+        ),
+        None => apply_structure_move(
+            term,
+            rho,
+            &StructureMove::Birth { candidate: 0 },
+            std::slice::from_ref(&seed.decoder),
+        ),
+    };
+    let (mut cand_term, mut cand_rho) = born_move?;
+    cand_term.set_guards_enabled(false);
+    fit_single_atom_response_in_place(&mut cand_term, &mut cand_rho, k, residual, registry, config)?;
+    let (reml, _) = frozen_joint_evidence(&mut cand_term, target, &cand_rho, registry, config)?;
+    let ev = ev_of(&cand_term, target);
+    // Support: a circle seed's own-presence gate marks the rows it can fire on
+    // (finite gate); a shared-factor DC seed is global (all rows), which forces a
+    // singleton accept (batched round == serial round on non-circle residuals).
+    let support: Vec<usize> = match &seed.circle_gate {
+        Some(g) => (0..n).filter(|&i| g[i].is_finite()).collect(),
+        None => (0..n).collect(),
+    };
+    let born_logit_col: Vec<f64> = (0..n).map(|r| cand_term.assignment.logits[[r, k]]).collect();
+    Ok(RacedCandidate {
+        born_atom: cand_term.atoms[k].clone(),
+        born_coord: cand_term.assignment.coords[k].clone(),
+        born_logit_col,
+        born_ard: cand_rho.log_ard[k].clone(),
+        born_log_lambda_smooth: cand_rho.log_lambda_smooth[k],
+        support,
+        reml,
+        ev,
+        energy: seed.energy,
+    })
+}
+
+/// Append an ALREADY-FITTED born atom (its decoder/coords/logit column produced
+/// by [`race_birth_seed`]) to `term` WITHOUT refitting — the batch-assembly
+/// primitive. Mirrors the logit / coord / ρ growth `born_atom` performs, so an
+/// atom raced against the `K`-atom term joins the running `K+1`-atom term
+/// identically; under an independent gate (the batch-greedy precondition) the
+/// pre-fit gate column stays exact because the gate does not renormalize across
+/// atoms.
+fn append_fitted_atom(
+    term: &SaeManifoldTerm,
+    rho: &SaeManifoldRho,
+    atom: SaeManifoldAtom,
+    coord: LatentCoordValues,
+    logit_col: &[f64],
+    ard: Array1<f64>,
+    log_lambda_smooth: f64,
+) -> Result<(SaeManifoldTerm, SaeManifoldRho), String> {
+    let k = term.k_atoms();
+    let n = term.assignment.logits.nrows();
+    if logit_col.len() != n {
+        return Err(format!(
+            "append_fitted_atom: logit column length {} != n_obs {n}",
+            logit_col.len()
+        ));
+    }
+    let mut atoms = term.atoms.clone();
+    atoms.push(atom);
+    let mut logits = Array2::<f64>::zeros((n, k + 1));
+    for row in 0..n {
+        for col in 0..k {
+            logits[[row, col]] = term.assignment.logits[[row, col]];
+        }
+        logits[[row, k]] = logit_col[row];
+    }
+    let mut coords = term.assignment.coords.clone();
+    coords.push(coord);
+    let assignment = SaeAssignment::with_mode(logits, coords, term.assignment.mode)?;
+    let child = SaeManifoldTerm::new(atoms, assignment)?;
+    let mut child_rho = rho.clone();
+    child_rho.log_ard.push(ard);
+    child_rho.log_lambda_smooth.push(log_lambda_smooth);
+    Ok((child, child_rho))
+}
+
+/// Batched forward-birth SAC: the parallel-racing counterpart of [`fit_stagewise`]
+/// Phase 1. Each round harvests MANY candidate seeds from one residual snapshot
+/// (the [`isa_deflationary_producer`] deflation sequence, i.e. the seeds the
+/// serial loop would mine one-per-round), RACES their K=1 fits concurrently, and
+/// accepts a maximal DISJOINT-support batch (the batch-OMP orthogonality
+/// criterion documented above). Overlapping passing candidates are requeued to
+/// the next round's residual. Phases 2 (backfitting) and 3 (terminal evidence)
+/// are then run identically to the serial driver, so the returned artifact is the
+/// same shape.
+///
+/// PARITY: on planted multi-structure data whose atoms occupy disjoint gate
+/// supports under an independent gate, the accepted atom set, per-birth charges,
+/// and terminal joint evidence equal [`fit_stagewise`]'s up to order. When no
+/// plane certifies (a non-circle residual), the round harvests a single
+/// shared-factor / principal seed with GLOBAL support, so it accepts at most one
+/// atom — the batched driver then reduces to the serial loop exactly.
+pub fn fit_stagewise_batched(
+    seed: SaeManifoldTerm,
+    mut rho: SaeManifoldRho,
+    target: ArrayView2<'_, f64>,
+    registry: Option<&AnalyticPenaltyRegistry>,
+    sample_weights: Option<&[f64]>,
+    config: &BatchedStagewiseConfig,
+) -> Result<BatchedStagewiseResult, String> {
+    use rayon::prelude::*;
+
+    let n = target.nrows();
+    if seed.k_atoms() != 1 {
+        return Err(format!(
+            "fit_stagewise_batched: seed must be a single-atom (K=1) term; got K={}",
+            seed.k_atoms()
+        ));
+    }
+    if seed.n_obs() != n {
+        return Err(format!(
+            "fit_stagewise_batched: seed n_obs {} != target rows {n}",
+            seed.n_obs()
+        ));
+    }
+    let base = &config.base;
+    let mut term = seed;
+    term.set_guards_enabled(false);
+    if let Some(w) = sample_weights {
+        if w.len() != n {
+            return Err(format!(
+                "fit_stagewise_batched: sample_weights length {} != target rows {n}",
+                w.len()
+            ));
+        }
+        term.set_row_loss_weights(w.to_vec())?;
+    }
+
+    let mut ev_trace = vec![ev_of(&term, target)];
+    let mut birth_records: Vec<BirthRecord> = Vec::new();
+    let mut batch_records: Vec<BatchRoundRecord> = Vec::new();
+    let mut births_accepted = 0usize;
+    let mut births_rejected = 0usize;
+    let mut consecutive_reject_rounds = 0usize;
+
+    // ── Phase 1 — batched forward births ───────────────────────────────────────
+    let stopped_reason = 'rounds: loop {
+        if births_accepted >= base.max_births {
+            break StagewiseStop::MaxBirths;
+        }
+        if consecutive_reject_rounds >= 2 {
+            break StagewiseStop::TwoConsecutiveRejections;
+        }
+        let Some((residual, model)) = fit_residual_covariance(&term, target, base)? else {
+            break StagewiseStop::NoResidualStructure;
+        };
+        if base.structured_whitening {
+            term.set_row_metric(model.row_metric(n)?)?;
+        }
+
+        // Batched candidate GENERATION from one residual snapshot: harvest every
+        // certifiable circle 2-plane (the serial per-round seed sequence, all at
+        // once). When nothing certifies, fall back to a single shared-factor /
+        // principal seed with global support (a serial-equivalent singleton round).
+        let harvest = isa_deflationary_producer(
+            residual.view(),
+            config.max_candidates_per_round,
+            &IsaSeedConfig::default(),
+        )?;
+        let mut seeds: Vec<BirthSeed> = harvest
+            .planes
+            .iter()
+            .map(|c| plane_to_birth_seed(&term, c))
+            .collect();
+        if seeds.is_empty() {
+            let Some(fallback) = top_factor_birth_decoder(&term, &model, residual.view())
+                .or_else(|| residual_principal_birth_candidate(&term, residual.view()))
+            else {
+                break StagewiseStop::NoResidualStructure;
+            };
+            seeds.push(fallback);
+        }
+        let candidates_generated = seeds.len();
+
+        // Current joint evidence + EV (the birth gate's reference), computed once
+        // before the parallel race so the closures borrow `term` immutably.
+        let (cur_reml, _) = frozen_joint_evidence(&mut term, target, &rho, registry, base)?;
+        let cur_ev = ev_of(&term, target);
+
+        // ── PARALLEL racing: fit every candidate's K=1 sub-problem concurrently ──
+        // Each `race_birth_seed` clones `term` internally and mutates nothing
+        // shared; a candidate whose fit errors is dropped (mirrors the serial
+        // `.ok()`), never aborting the round.
+        let raced: Vec<RacedCandidate> = seeds
+            .par_iter()
+            .filter_map(|s| race_birth_seed(&term, &rho, s, residual.view(), target, registry, base).ok())
+            .collect();
+
+        // Birth gate: strictly-improved joint evidence AND ΔEV ≥ the minimum-effect
+        // floor — identical to the serial `passes` predicate.
+        let passes = |c: &RacedCandidate| -> bool {
+            c.reml.is_finite()
+                && c.reml < cur_reml
+                && c.ev.is_finite()
+                && (c.ev - cur_ev) >= base.min_effect_ev
+        };
+        let mut order: Vec<usize> = (0..raced.len()).filter(|&i| passes(&raced[i])).collect();
+        let candidates_passing_gate = order.len();
+        // Best (lowest joint REML) first — the same keep-lowest tiebreak the serial
+        // A-vs-B race uses; ties fall to the earlier (higher-energy) harvest index.
+        order.sort_by(|&a, &b| {
+            raced[a]
+                .reml
+                .partial_cmp(&raced[b].reml)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.cmp(&b))
+        });
+
+        // ── DISJOINT batch-greedy acceptance ───────────────────────────────────
+        // Accept in best-first order, skipping any candidate whose support
+        // intersects an already-accepted candidate's support this round. The
+        // accepted set is pairwise support-disjoint ⇒ block-orthogonal ⇒ the batch
+        // equals the serial greedy sequence up to order (see the module note).
+        let mut claimed = vec![false; n];
+        let mut co_accepted = 0usize;
+        let mut requeued_overlap = 0usize;
+        for &idx in &order {
+            if births_accepted >= base.max_births {
+                requeued_overlap += 1;
+                continue;
+            }
+            let c = &raced[idx];
+            let conflict = c.support.iter().any(|&i| claimed[i]);
+            if conflict {
+                requeued_overlap += 1;
+                continue;
+            }
+            for &i in &c.support {
+                claimed[i] = true;
+            }
+            let (next_term, next_rho) = append_fitted_atom(
+                &term,
+                &rho,
+                c.born_atom.clone(),
+                c.born_coord.clone(),
+                &c.born_logit_col,
+                c.born_ard.clone(),
+                c.born_log_lambda_smooth,
+            )?;
+            term = next_term;
+            rho = next_rho;
+            births_accepted += 1;
+            co_accepted += 1;
+            let running_ev = ev_of(&term, target);
+            birth_records.push(BirthRecord {
+                kind: BirthKind::NewAtom,
+                // Charge this birth exactly what the serial loop would: its own
+                // K+1 joint-evidence delta over the round's reference (additive
+                // across the disjoint batch).
+                delta_ev: c.ev - cur_ev,
+                factor_energy: c.energy,
+                joint_reml_before: cur_reml,
+                joint_reml_after: c.reml,
+                accepted: true,
+            });
+            ev_trace.push(running_ev);
+        }
+
+        batch_records.push(BatchRoundRecord {
+            candidates_generated,
+            candidates_passing_gate,
+            co_accepted,
+            requeued_overlap,
+        });
+
+        if co_accepted == 0 {
+            births_rejected += 1;
+            consecutive_reject_rounds += 1;
+            birth_records.push(BirthRecord {
+                kind: BirthKind::NewAtom,
+                delta_ev: 0.0,
+                factor_energy: raced.first().map(|c| c.energy).unwrap_or(0.0),
+                joint_reml_before: cur_reml,
+                joint_reml_after: cur_reml,
+                accepted: false,
+            });
+        } else {
+            consecutive_reject_rounds = 0;
+        }
+        if births_accepted >= base.max_births {
+            break StagewiseStop::MaxBirths;
+        }
+    };
+
+    // ── Phase 2 — backfitting sweeps (keep-best, monotone by construction) ──────
+    let mut prev_ev = *ev_trace.last().unwrap_or(&f64::NEG_INFINITY);
+    for _sweep in 0..base.max_backfit_sweeps {
+        let term_snapshot = term.clone();
+        let rho_snapshot = rho.clone();
+        backfit_sweep(&mut term, &mut rho, target, registry, base)?;
+        let ev = ev_of(&term, target);
+        if ev > prev_ev {
+            prev_ev = ev;
+        } else {
+            term = term_snapshot;
+            rho = rho_snapshot;
+            break;
+        }
+    }
+
+    // ── Phase 3 — terminal frozen joint evidence of the composed tier ───────────
+    let (terminal_joint_reml, terminal_joint_loss) =
+        frozen_joint_evidence(&mut term, target, &rho, registry, base)?;
+    term.set_guards_enabled(true);
+
+    Ok(BatchedStagewiseResult {
+        term,
+        rho,
+        report: StagewiseReport {
+            births_accepted,
+            births_rejected,
+            birth_records,
+            ev_trace,
+            backfit_ev_trace: Vec::new(),
+            stopped_reason,
+            terminal_joint_reml,
+            terminal_joint_loss,
+        },
+        batch_records,
+    })
+}
+
 /// Phase 3 — terminal joint assembly. Merge a Tier-1 bulk term (`primary`) with
 /// the SAC-composed curved tier (`secondary`) via [`SaeManifoldTerm::merge_tiers`]
 /// and run a SINGLE frozen (evaluate-don't-optimize, `inner_max_iter == 0`)
