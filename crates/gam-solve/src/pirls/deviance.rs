@@ -227,14 +227,21 @@ pub fn calculate_deviance(
             2.0 * total
         }
         ResponseFamily::Gamma => {
-            let shape = likelihood.gamma_shape().unwrap_or(1.0);
+            // Report the *unscaled* Gamma deviance D = 2·Σ wᵢ·d(yᵢ, μᵢ), matching
+            // every other family here (Poisson/Binomial/NB/Beta all accumulate the
+            // bare `priorweights·unit_deviance` with φ ≡ 1) and matching R/mgcv/
+            // statsmodels' `summary.deviance`. Multiplying the unit deviance by the
+            // fitted shape (≈ 1/φ̂) would report the *scaled* deviance D/φ̂ instead
+            // — the #2126 defect. The dispersion is reported separately; the
+            // deviance itself must stay scale-free so `deviance_explained =
+            // 1 − D_resid/D_null` is a pure ratio of like-scaled deviances.
             use rayon::iter::{IntoParallelIterator, ParallelIterator};
             let total: f64 = (0..y.len())
                 .into_par_iter()
                 .map(|i| {
                     let yi_c = y[i].max(EPS);
                     let mui_c = mu[i].max(MU_FLOOR);
-                    priorweights[i] * shape * gamma_unit_deviance(yi_c, mui_c)
+                    priorweights[i] * gamma_unit_deviance(yi_c, mui_c)
                 })
                 .sum();
             2.0 * total
