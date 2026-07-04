@@ -310,11 +310,16 @@ mod amortized_encoder_glue_tests {
             coords_blocks.push(c);
         }
         // Build atoms with decoder rows [offset; dir] on the degree-1 monomials.
-        let probe = Array2::<f64>::zeros((1, 1));
-        let (phi, jet) = evaluator.evaluate(probe.view()).expect("eval");
-        let m = phi.ncols();
+        // Each atom's basis_values / jet must be evaluated at THAT atom's own
+        // per-row coordinates (n rows), so the term's per-atom design matches the
+        // assignment's `n_obs` (a 1-row probe would make `SaeManifoldTerm::new`
+        // reject the shape).
         let mut atoms = Vec::new();
         for atom_idx in 0..k {
+            let (phi_k, jet_k) = evaluator
+                .evaluate(coords_blocks[atom_idx].view())
+                .expect("eval");
+            let m = phi_k.ncols();
             let mut dec = Array2::<f64>::zeros((m, p));
             for col in 0..p {
                 dec[[0, col]] = OFFSETS[atom_idx][col];
@@ -324,8 +329,8 @@ mod amortized_encoder_glue_tests {
                 "lin",
                 SaeAtomBasisKind::EuclideanPatch,
                 1,
-                phi.clone(),
-                jet.clone(),
+                phi_k,
+                jet_k,
                 dec,
                 Array2::<f64>::eye(m),
             )

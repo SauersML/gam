@@ -314,6 +314,15 @@ fn fit_evidence_ridge(
     let mut alpha = 1.0_f64;
     let mut beta = 1.0_f64;
     let n_t = (n * t_dim) as f64;
+    // A machine-precision noise floor RELATIVE to the total target energy. When
+    // the design can interpolate the targets the residual sum-of-squares → 0 and
+    // an unfloored `β = (n−γ)/RSS` overflows to `+∞` (the divergence guard then
+    // aborts a perfectly-fittable problem). Flooring RSS at `ε·‖Y‖²` caps the
+    // fitted noise precision at f64 resolution — we cannot claim a noise level
+    // below the data's own rounding — keeping `β` finite without a magic knob.
+    // The same floor on `Σ‖w‖²` caps `α` when the fit shrinks to the null.
+    let total_energy: f64 = y_energy.iter().sum();
+    let energy_floor = (total_energy * f64::EPSILON).max(f64::MIN_POSITIVE);
     let mut effective_dof = 0.0_f64;
     let mut last_log_lambda = f64::NAN;
     for _ in 0..EVIDENCE_MAX_ITERS {
@@ -345,9 +354,9 @@ fn fit_evidence_ridge(
         effective_dof = gamma;
         // MacKay updates with strictly-positive floors (a perfectly-fit or
         // perfectly-shrunk direction must not divide by zero).
-        alpha = (gamma * t_dim as f64) / w_sq_sum.max(f64::MIN_POSITIVE);
+        alpha = (gamma * t_dim as f64) / w_sq_sum.max(energy_floor);
         let well_determined = (n_t - gamma * t_dim as f64).max(f64::MIN_POSITIVE);
-        beta = well_determined / rss_sum.max(f64::MIN_POSITIVE);
+        beta = well_determined / rss_sum.max(energy_floor);
         if !(alpha.is_finite() && beta.is_finite()) {
             return Err("fit_evidence_ridge: variance components diverged".to_string());
         }
