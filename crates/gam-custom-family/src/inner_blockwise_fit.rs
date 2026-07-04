@@ -5255,7 +5255,8 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 && residual > residual_tol
                 && cycle + 1 >= RESIDUAL_STALL_MIN_CYCLES
                 && residual_rate_history.len() > LINEAR_RATE_WINDOW
-                && !merit_still_descending_over_window()
+                && (!merit_still_descending_over_window()
+                    || cycle + 1 >= RESIDUAL_STALL_MERIT_VETO_MAX_CYCLES)
             {
                 let oldest = *residual_rate_history.front().unwrap();
                 // Single source of truth for the slow-geometric-rate projection
