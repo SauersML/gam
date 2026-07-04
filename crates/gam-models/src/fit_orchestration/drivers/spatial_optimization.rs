@@ -2911,18 +2911,69 @@ fn try_exact_joint_spatial_length_scale_optimization(
                 final_value,
                 final_grad_norm.map_or_else(|| "n/a".to_string(), |g| format!("{g:.3e}")),
             );
-            return Ok(Some(fit_frozen_baseline_geometry(
+            let baseline = fit_frozen_baseline_geometry(
                 data,
                 y,
                 weights,
                 offset,
                 resolvedspec,
                 best,
-                family,
+                family.clone(),
                 options,
                 baseline_score,
                 Some(kappa_timing),
-            )?));
+            )?;
+            // #2122: a stalled joint solve must NEVER silently ship a mean-only
+            // surface. The frozen baseline keeps the SPEC-DEFAULT range; when that
+            // range is far longer than this frame's own distance scale the Matérn
+            // kernel columns go nearly collinear with their polynomial nullspace
+            // and REML shrinks the whole smooth onto its intercept — the fit
+            // reports success but predicts the response mean (thinplate/duchon,
+            // which carry no enrolled kernel-range hyperparameter and so never
+            // stall, recover the identical signal on the same frame). Detect that
+            // collapse on the REALIZED baseline (EDF below the null floor) and
+            // only then retreat to a DATA-ADAPTIVE geometry whose kernel range is
+            // re-centered on the data's pairwise-distance scale (the geometric
+            // mean of the admissible kernel-range window — the same data-scaled
+            // length scale a robust GP prior centers on, and the geometry
+            // thinplate effectively uses), refitting λ from scratch there. Adopt
+            // it only when it recovers materially more effective DOF, so a
+            // non-degenerate stalled fit (e.g. the #1126 tight-tolerance stall) is
+            // byte-identical to before.
+            let baseline_edf = baseline.fit.inference.as_ref().map(|inf| inf.edf_total);
+            if let Some(base_edf) = baseline_edf
+                && base_edf < SPATIAL_COLLAPSE_EDF_FLOOR
+                && let Some(adaptive) = fit_data_adaptive_geometry(
+                    data,
+                    y,
+                    weights,
+                    offset,
+                    resolvedspec,
+                    spatial_terms,
+                    &dims_per_term,
+                    &theta0,
+                    &lower,
+                    &upper,
+                    rho_dim,
+                    family,
+                    options,
+                    baseline_score,
+                    Some(kappa_timing),
+                )?
+            {
+                let adaptive_edf = adaptive.fit.inference.as_ref().map(|inf| inf.edf_total);
+                if let Some(adapt_edf) = adaptive_edf
+                    && adapt_edf >= base_edf + SPATIAL_COLLAPSE_EDF_MARGIN
+                {
+                    log::info!(
+                        "[spatial-kappa] #2122 stalled joint solve collapsed the frozen \
+                         baseline (edf={base_edf:.3}); data-adaptive geometry recovers \
+                         edf={adapt_edf:.3} — shipping the data-adaptive fit"
+                    );
+                    return Ok(Some(adaptive));
+                }
+            }
+            return Ok(Some(baseline));
         }
     };
 
@@ -3152,6 +3203,99 @@ fn fit_frozen_baseline_geometry(
         adaptive_diagnostics: baseline.adaptive_diagnostics,
         kappa_timing,
     })
+}
+
+/// #2122: data-adaptive retreat geometry for a STALLED joint spatial solve.
+///
+/// This is the safety net that stops a non-converged joint κ/range solve from
+/// silently shipping a mean-only surface. The frozen baseline
+/// (`fit_frozen_baseline_geometry`) keeps the SPEC-DEFAULT length scale; on a
+/// frame whose distance scale is far shorter than that default, the Matérn
+/// kernel columns collapse into their polynomial nullspace and REML shrinks the
+/// smooth onto its intercept (the fit succeeds but predicts the response mean).
+///
+/// This builds a geometry whose every plain spatial length-scale term (Matérn /
+/// hybrid; NOT constant-curvature κ, NOT measure-jet dials) is re-centered at
+/// the MIDPOINT of its data-derived ψ window `[ψ_lo, ψ_hi]` — i.e. the geometric
+/// mean `√(r_min·r_max / (min_frac·max_mult))` of the admissible kernel-range
+/// interval, the same data-scaled length scale a robust GP length-scale prior
+/// centers on and the informative range thinplate/duchon effectively use.
+/// Constant-curvature and measure-jet ψ coordinates carry non-log-scale
+/// semantics (signed κ / geometry dials) and are left at their seed values, so
+/// `apply_tospec` writes them back unchanged. λ is re-derived from scratch at the
+/// new geometry (`best`'s λ belong to the spec-default range and would
+/// mis-warm-start it).
+///
+/// The ψ window bounds are read back from the flat outer-optimizer seed/bound
+/// vectors the joint solve already computed, so no distance pass is repeated.
+/// Returns `Ok(None)` when no term is eligible for a length-scale override, so
+/// the caller keeps the frozen baseline unchanged.
+fn fit_data_adaptive_geometry(
+    data: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    resolvedspec: &TermCollectionSpec,
+    spatial_terms: &[usize],
+    dims_per_term: &[usize],
+    theta_seed: &Array1<f64>,
+    theta_lower: &Array1<f64>,
+    theta_upper: &Array1<f64>,
+    rho_dim: usize,
+    family: LikelihoodSpec,
+    options: &FitOptions,
+    baseline_score: f64,
+    kappa_timing: Option<SpatialLengthScaleOptimizationTiming>,
+) -> Result<Option<FittedTermCollectionWithSpec>, EstimationError> {
+    let dims = dims_per_term.to_vec();
+    let seed = SpatialLogKappaCoords::from_theta_tail_with_dims(theta_seed, rho_dim, dims.clone());
+    let lower = SpatialLogKappaCoords::from_theta_tail_with_dims(theta_lower, rho_dim, dims.clone());
+    let upper = SpatialLogKappaCoords::from_theta_tail_with_dims(theta_upper, rho_dim, dims.clone());
+
+    let mut values = seed.as_array().clone();
+    let mut cursor = 0usize;
+    let mut any_override = false;
+    for (slot, &term_idx) in spatial_terms.iter().enumerate() {
+        let d = dims[slot];
+        // Only plain spatial length-scale terms get a data-centered range.
+        // Constant-curvature κ (sign-basin logic) and measure-jet dials carry
+        // non-log-scale ψ coordinates and are left at their seed values.
+        let is_length_scale_term = constant_curvature_term_spec(resolvedspec, term_idx).is_none()
+            && measure_jet_term_spec(resolvedspec, term_idx).is_none();
+        if is_length_scale_term {
+            for off in 0..d {
+                let lo = lower.as_array()[cursor + off];
+                let hi = upper.as_array()[cursor + off];
+                if lo.is_finite() && hi.is_finite() && lo < hi {
+                    values[cursor + off] = 0.5 * (lo + hi);
+                    any_override = true;
+                }
+            }
+        }
+        cursor += d;
+    }
+    if !any_override {
+        return Ok(None);
+    }
+    let coords = SpatialLogKappaCoords::new_with_dims(values, dims);
+    let adaptive_spec = coords.apply_tospec(resolvedspec, spatial_terms)?;
+    let adaptive =
+        fit_term_collection_forspec(data, y, weights, offset, &adaptive_spec, family, options)?;
+    // Stamp the certified baseline REML score, exactly as the frozen-baseline
+    // path does: this fit is the graceful-degradation target chosen because the
+    // joint solve stalled, so the outer `require_successful_spatial_optimization_result`
+    // gate (which compares against `fit_score(&best.fit)` = `baseline_score`) must
+    // not read a same-geometry-class re-derivation drift as "the optimizer made
+    // the score worse" and abort an otherwise-valid recovered fit.
+    let mut fit = adaptive.fit;
+    fit.reml_score = baseline_score;
+    Ok(Some(FittedTermCollectionWithSpec {
+        fit,
+        design: adaptive.design,
+        resolvedspec: adaptive_spec,
+        adaptive_diagnostics: adaptive.adaptive_diagnostics,
+        kappa_timing,
+    }))
 }
 
 /// Coordinate kind for the exact joint spatial hyperparameter optimizer.
