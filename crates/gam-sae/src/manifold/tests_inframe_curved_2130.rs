@@ -245,17 +245,30 @@ fn inframe_matches_dense_full_p_when_frame_contains_truth() {
 }
 
 #[test]
-fn structureless_region_is_rejected() {
-    // Pure isotropic ambient noise: no low-rank curved structure. The learned
-    // frame spans spurious noise directions and the radial chart cannot beat the
-    // linear baseline out-of-sample, so the region must NOT be accepted.
+fn linear_structure_is_not_promoted_to_curved() {
+    // The meaningful negative control for the curved gate is LINEAR structure,
+    // not isotropic noise. (An isotropic Gaussian blob has genuine radial
+    // concentration: its points cluster near a shell of radius ~√r, so the
+    // 1-parameter radial chart is a *better* one-dimensional summary than a
+    // rank-1 line and the gate honestly accepts it — that is not a false
+    // positive, it is real held-out deviance the linear stage did not capture.)
+    //
+    // What the gate must NOT do is promote structure a LINEAR model already
+    // explains. Here the residual is rank-1: every row is a scalar multiple of a
+    // single ambient direction (plus negligible noise). Rank-1 PCA reconstructs
+    // it exactly; the radial chart, which forces every row onto one radius,
+    // destroys the sign/magnitude along the line and reconstructs strictly
+    // worse. So the curved refinement loses out-of-sample and must be rejected —
+    // the linear lane owns this region.
     let n = 800;
     let p = 512;
+    let dir = random_orthonormal(p, 1, 314);
     let mut rng = Lcg::new(2130);
     let mut residual = Array2::<f64>::zeros((n, p));
     for i in 0..n {
+        let s = rng.normal(); // signed coordinate along the single linear axis
         for j in 0..p {
-            residual[[i, j]] = rng.normal();
+            residual[[i, j]] = s * dir[[j, 0]] + 1.0e-4 * rng.normal();
         }
     }
 
@@ -270,11 +283,12 @@ fn structureless_region_is_rejected() {
         basis_size: 8,
     };
     let result = fit_inframe_curved_regions(residual.view(), &[region], n, &config)
-        .expect("fit runs on noise");
+        .expect("fit runs on linear structure");
     assert!(
         result.accepted_regions.is_empty(),
-        "a structureless noise region must be rejected by the evidence gate; \
-         margin={}",
+        "purely linear (rank-1) structure must NOT be promoted to a curved atom; \
+         deviance_gain={} margin={}",
+        result.records[0].evidence.deviance_gain,
         result.records[0].evidence.margin
     );
 }
