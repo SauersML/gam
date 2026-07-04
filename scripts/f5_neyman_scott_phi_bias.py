@@ -137,6 +137,87 @@ def phi_hat_per_row_laplace(y: np.ndarray, a: float, alpha: float) -> dict:
     return {"phi": phi, "coord_edf": coord_edf, "rss": rss}
 
 
+def _enumerate_basins(sq_row: np.ndarray):
+    """Local minima of the per-row deviance on the circular grid → basin indices.
+
+    A grid point is a basin mode if its squared-distance is ≤ both circular
+    neighbours (strict on one side to avoid plateaus double-counting). Returns
+    the grid indices of every basin, which the certified-Newton multi-start
+    encode enumerates the same way (each retained start is a basin mode).
+    """
+    left = np.roll(sq_row, 1)
+    right = np.roll(sq_row, -1)
+    is_min = (sq_row <= left) & (sq_row < right)
+    return np.flatnonzero(is_min)
+
+
+def phi_hat_basin_marginal(y: np.ndarray, a: float, alpha: float) -> dict:
+    """φ̂ with the MIXTURE-OF-LAPLACE generalized coord dof (the F5 fix).
+
+    Keeps the MAP residual (`rss = Σ_n min_θ‖y−f(θ)‖²`, exactly `2·loss.data_fit`)
+    and corrects ONLY `coord_edf` to credit the basin-SELECTION degrees of freedom
+    the single-basin Laplace misses. Per row, enumerate the basins b (local
+    deviance minima — what the certified-Newton multi-start already finds), each
+    with:
+      * mode θ_b, prediction f_b = f(θ_b), residual deviance D_b = ‖y−f_b‖²/φ;
+      * Gauss–Newton curvature H_b = f'(θ_b)ᵀf'(θ_b)/φ, within-basin shrink dof
+        edf_b = H_b/(H_b+α);
+      * Laplace evidence  log Z_b = −½D_b − ½·log(H_b+α) + ½·log α  (the per-basin
+        marginal likelihood with the ARD prior), posterior weight w_b ∝ Z_b.
+    The generalized dof of the basin-SELECTING MAP estimator (Efron covariance
+    penalty `edf = φ⁻¹ Σ Cov(ŷ,y)`) splits, by the law of total covariance, into
+    the within-basin term and a between-basin SELECTION term:
+
+        edf_n = Σ_b w_b·edf_b  +  φ⁻¹ Σ_b w_b ‖f_b − f̄‖²,   f̄ = Σ_b w_b f_b.
+
+    The second term is the coordinate's basin-selection cost: it is 0 when one
+    basin dominates (w_b→1, EXACT reduction to the single-basin path) AND 0 at a
+    perfect 2-to-1 degeneracy (all f_b coincide ⇒ selecting does not change ŷ),
+    and it is largest when live basins have DISTINCT predictions carrying
+    comparable weight — exactly the ambiguous regime the single-basin Laplace
+    under-charges, biasing φ̂ low.
+    """
+    n = y.shape[0]
+    sq = _row_sqdist(y, a)
+    idx_map = np.argmin(sq, axis=1)
+    rss = float(sq[np.arange(n), idx_map].sum())
+    fg = f_map(_GRID, a)                          # (G, p)
+    gg = f_prime(_GRID, a)
+    grad_sq_grid = np.einsum("gp,gp->g", gg, gg)  # f'ᵀf' on the grid
+
+    # Per-row basin lists (indices into the grid), precomputed once.
+    basins = [_enumerate_basins(sq[r]) for r in range(n)]
+
+    phi = rss / (n * _P)
+    coord_edf = 0.0
+    for _ in range(200):
+        total = 0.0
+        for r in range(n):
+            bi = basins[r]
+            d = sq[r, bi]                          # ‖y−f_b‖² per basin
+            gsq = grad_sq_grid[bi]                 # f'ᵀf' per basin
+            h = gsq / max(phi, 1e-300)             # H_b
+            edf_b = h / (h + alpha)                # within-basin shrink dof
+            # Laplace log-evidence per basin (shared additive consts cancel in w).
+            logz = -0.5 * d / max(phi, 1e-300) - 0.5 * np.log(h + alpha)
+            logz -= logz.max()
+            w = np.exp(logz)
+            w /= w.sum()
+            fb = fg[bi]                            # (B, p) basin predictions
+            fbar = (w[:, None] * fb).sum(axis=0)   # weighted mean prediction
+            between = float((w * np.einsum("bp,bp->b", fb - fbar, fb - fbar)).sum())
+            edf_n = float((w * edf_b).sum()) + between / max(phi, 1e-300)
+            total += min(edf_n, 1.0 + len(bi))     # generous per-row cap (safety)
+        coord_edf = total
+        resid_dof = max(n * _P - coord_edf, 1.0)
+        new = rss / resid_dof
+        if abs(new - phi) < 1e-12 * max(1.0, phi):
+            phi = new
+            break
+        phi = new
+    return {"phi": phi, "coord_edf": coord_edf, "rss": rss}
+
+
 def phi_hat_marginal(y: np.ndarray, a: float, alpha: float) -> dict:
     """φ̂ via the marginal (soft-posterior / EM) coordinate treatment.
 
@@ -207,29 +288,31 @@ def run(ns, a_sweep, phi_true, alpha, reps, seed):
         "  knob a  : symmetry-breaking amplitude (a→0 ⇒ the two circular basins "
         "merge ⇒ maximally bimodal row posteriors)\n"
     )
-    header = f"{'N':>6} {'a':>6} | {'φ̂_Laplace/φ':>13} {'φ̂_marg/φ':>11} {'oracle/φ':>9} {'coord_edf_L':>11}"
+    header = (
+        f"{'N':>6} {'a':>6} | {'φ̂_Laplace/φ':>13} {'φ̂_basin/φ':>11} "
+        f"{'φ̂_marg/φ':>10} {'oracle/φ':>9}"
+    )
     rows = []
     for n in ns:
         print(header)
         print("  " + "-" * (len(header) + 2))
         for a in a_sweep:
-            lap, mar, ora, edf = [], [], [], []
+            lap, bas, mar, ora = [], [], [], []
             for r in range(reps):
                 rng = np.random.default_rng(seed + 1000 * r + n)
                 theta_true, y = simulate(n, a, phi_true, rng)
-                L = phi_hat_per_row_laplace(y, a, alpha)
-                M = phi_hat_marginal(y, a, alpha)
-                lap.append(L["phi"])
-                mar.append(M["phi"])
-                edf.append(L["coord_edf"])
+                lap.append(phi_hat_per_row_laplace(y, a, alpha)["phi"])
+                bas.append(phi_hat_basin_marginal(y, a, alpha)["phi"])
+                mar.append(phi_hat_marginal(y, a, alpha)["phi"])
                 ora.append(oracle_phi(theta_true, y, a))
             lr = np.mean(lap) / phi_true
+            br = np.mean(bas) / phi_true
             mr = np.mean(mar) / phi_true
             orr = np.mean(ora) / phi_true
             print(
-                f"{n:>6} {a:>6.2f} | {lr:>13.3f} {mr:>11.3f} {orr:>9.3f} {np.mean(edf):>11.1f}"
+                f"{n:>6} {a:>6.2f} | {lr:>13.3f} {br:>11.3f} {mr:>10.3f} {orr:>9.3f}"
             )
-            rows.append((n, a, lr, mr, orr, np.mean(edf)))
+            rows.append((n, a, lr, br, mr, orr))
         print()
     _verdict(rows, ns)
     return rows

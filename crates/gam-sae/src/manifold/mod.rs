@@ -289,6 +289,9 @@ mod tests_topology_persistence_f3;
 #[cfg(test)]
 mod tests_chart_angle_fidelity_2081;
 
+#[cfg(test)]
+mod tests_joint_vs_cascade_2131;
+
 pub use arrow_solver::*;
 pub use atom::*;
 pub use behavior::*;
