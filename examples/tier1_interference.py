@@ -8,16 +8,17 @@ mirroring the Rust `gam_sae::tiered` module so both agree numerically:
   * ``interference_subspace`` -- Tier-1's active subspace ``Q`` (what the linear
                                 dictionary explains), its orthogonal complement
                                 ``Q_perp``, and the per-direction ``scale``.
-  * ``behavioral_fisher_factors`` -- the ready-to-pass GLS weight square-root the
-                                curved tier hands to ``sae_manifold_fit`` as
-                                ``fisher_factors`` with
-                                ``fisher_provenance="behavioral_fisher"`` and
-                                ``structured_whitening=False``.
+                                DIAGNOSTIC ONLY (span reporting).
 
-The #2021 coupling: the curved tier's GLS weight ``G = U U^T = I - Q Q^T`` (U spans
-``Q_perp``) DOWN-WEIGHTS the directions Tier-1 already explains, so curved atoms
-pursue only residual structure. Penalizing ``Q`` itself (the sign error) would make
-the curved tier re-chase linear structure -- the whole point is the complement.
+RETRACTED (audit 2026-07-03): using ``Q_perp`` as a GLS weight ``G = I - Q Q^T`` on
+the Tier-2 residual is a PROVEN DESIGN ERROR. A curve's chords span the curve's OWN
+plane, so the post-linear curvature signal (chord-sag) lives INSIDE ``span(Q)`` --
+measured counterexample: 95.4% of the residual energy inside Q, and the Q_perp
+weight crushed the in-plane signal RMS 0.176 -> 0.0001. Curvature is a constraint
+AMONG the directions Tier-1 spans, not a missed direction. DOCTRINE: Tier-2 fits the
+RAW residual; anti-rechasing is priced by the evidence criterion (never a projector);
+the only sanctioned reweighting is a soft Sigma_hat estimated from the actual
+(anisotropic) residual. ``demonstrate_qperp_blindness`` below pins the failure.
 
 Two Tier-1 sources are supported:
   * an atom-lane fit (``gamfit.sparse_dictionary_fit`` -> decoder K x P + sparse
@@ -128,29 +129,26 @@ def interference_subspace_from_blocks(t1, rank: int | None = None) -> Interferen
     return _split_gram(gram, rank)
 
 
-def behavioral_fisher_factors(
-    sub: InterferenceSubspace, *, soft_epsilon: float = 0.0, n_rows: int | None = None
-) -> np.ndarray:
-    """The GLS weight square-root U to pass as ``fisher_factors``.
+def demonstrate_qperp_blindness(
+    sub: InterferenceSubspace, residual: np.ndarray
+) -> tuple[float, float]:
+    """RETRACTED-WEIGHT GUARDRAIL: shows why ``G = I - Q Q^T`` must NOT be used.
 
-    ``G = U U^T`` is the per-row GLS weight the curved tier fits under. To make the
-    linear dictionary the interference model we DOWN-WEIGHT ``Q`` (penalize the
-    complement): the hard form is ``U = Q_perp`` (weight 0 on ``Q``, 1 on
-    ``Q_perp`` -> ``G = I - Q Q^T``). ``soft_epsilon > 0`` keeps a small weight on
-    ``Q`` for conditioning: ``U = [Q_perp | sqrt(eps) Q]`` -> ``G = I - (1-eps) Q Q^T``.
-
-    Returns U as (P, r_U). If ``n_rows`` is given, broadcast to the (N, P, r_U)
-    stack the FFI expects (shared across rows; per-row activity scaling is a
-    later refinement owned by the curved tier).
+    Applies the (retracted) hard ``Q_perp`` GLS weight to ``residual`` and returns
+    ``(rms_before, rms_after)``. When the residual is in-plane curvature (lives in
+    ``span(Q)`` -- which it does, because chords span the curve's own plane), the
+    weight crushes it to ~0: it is BLIND to exactly what the curved tier exists to
+    model. Kept only to pin the failure; do NOT install this as a metric. Tier-2
+    fits the RAW residual; anti-rechasing is the criterion's job, not a projector.
     """
-    if soft_epsilon <= 0.0:
-        u = sub.q_perp
+    r = np.asarray(residual, dtype=np.float64)
+    rms_before = float(np.sqrt(np.mean(r * r)))
+    if r.ndim == 2:
+        kept = (sub.q_perp @ (sub.q_perp.T @ r.T)).T  # keep only the complement
     else:
-        u = np.concatenate([sub.q_perp, np.sqrt(soft_epsilon) * sub.q], axis=1)
-    u = np.ascontiguousarray(u, dtype=np.float64)
-    if n_rows is None:
-        return u
-    return np.broadcast_to(u[None, :, :], (int(n_rows), u.shape[0], u.shape[1])).copy()
+        kept = sub.q_perp @ (sub.q_perp.T @ r)
+    rms_after = float(np.sqrt(np.mean(kept * kept)))
+    return rms_before, rms_after
 
 
 def _selftest() -> None:
@@ -175,23 +173,26 @@ def _selftest() -> None:
         sub.q_perp.T @ sub.q_perp, np.eye(p - sub.rank), atol=1e-9
     ), "q_perp not orthonormal"
     assert np.allclose(sub.q.T @ sub.q_perp, 0.0, atol=1e-9), "q not perp q_perp"
-    # The complement must include e3, e4 (unexplained).
+    # The complement must include e3, e4 (unexplained) -- span diagnostic only.
     q_perp_span = sub.q_perp @ sub.q_perp.T
     for j in (3, 4):
         proj = q_perp_span[j, j]
         assert proj > 0.99, f"e{j} should live in Q_perp; got projection {proj:.3f}"
-    # Behavioral-fisher weight down-weights Q, not Q_perp.
-    u = behavioral_fisher_factors(sub, soft_epsilon=0.0)
-    g = u @ u.T  # (P,P) = I - Q Q^T
-    # Weight on an explained direction (e0) ~ 0; on unexplained (e4) ~ 1.
-    assert g[0, 0] < 0.05, f"explained dir e0 should be down-weighted; got {g[0,0]:.3f}"
-    assert g[4, 4] > 0.95, f"unexplained dir e4 should keep weight; got {g[4,4]:.3f}"
+    # BLINDNESS DEMO (retraction guardrail): an in-plane curvature signal lives in
+    # span(Q); the retracted Q_perp weight crushes it to ~noise -- proving it is
+    # blind to exactly what the curved tier must model.
+    in_plane = np.zeros(p)
+    in_plane[0], in_plane[1] = 0.6, -0.8  # unit vector inside span(Q) = {e0, e1}
+    rms_before, rms_after = demonstrate_qperp_blindness(sub, in_plane)
+    assert rms_before > 0.1, f"planted in-plane signal should be nonzero; got {rms_before}"
+    assert rms_after < 1e-6, f"Q_perp weight must crush the in-plane signal; got {rms_after}"
     # Tier-0 roundtrip.
     mu = tier0_mean(x + 7.0)
     assert np.allclose(mu, x.mean(0) + 7.0, atol=1e-9)
     print(
-        f"[tier1_interference] selftest OK: rank(Q)={sub.rank}, scale={np.round(sub.scale,3)}, "
-        f"G[e0,e0]={g[0,0]:.3f} (down-weighted), G[e4,e4]={g[4,4]:.3f} (kept)"
+        f"[tier1_interference] selftest OK: rank(Q)={sub.rank}, scale={np.round(sub.scale,3)}; "
+        f"Q_perp blindness: in-plane RMS {rms_before:.3f} -> {rms_after:.2e} (crushed) "
+        f"=> DO NOT use Q_perp as a weight; fit the raw residual"
     )
 
 

@@ -1,8 +1,27 @@
-//! #2023 tiered SAE spine: the orchestration container that composes a shared
-//! mean (Tier-0), a large linear sparse-dictionary bulk (Tier-1), and an
-//! evidence-K curved tier (Tier-2) fit on the whitened Tier-1 residual.
+//! #2023 tiered SAE spine.
 //!
-//! This module owns the **spine-level** types every tier hangs off:
+//! **The "tiers" are an OPTIMIZER SCHEDULE, not a model structure.** There is ONE
+//! model: an intercept `μ` (the fixed effect — [`Tier0Mean`]) plus a sparse
+//! dictionary of complexity-priced 1-D atoms, where a *linear* atom is just the
+//! rank-1 / `b₂=0` special case of the curved (trig) atom and the rank-charge
+//! criterion (`Δloss > ½·d_eff·log n`, MP floor) selects each atom's complexity.
+//! The dictionary width `K` is engineered CAPACITY; the number of *certified*
+//! atoms is an evidence **output** of that criterion, never a hand-set width
+//! target (no PCA-energy cutoff sets it). "Migration" between linear and curved
+//! is therefore not a statistical border — it is per-atom rank re-selection under
+//! the same criterion.
+//!
+//! This module owns the coordinate-descent machinery + fixed effect for fitting
+//! that one model at large `K`:
+//! - [`Tier0Mean`] — the shared intercept `μ` (schedule stage "Tier-0").
+//! - a linear sparse-dictionary bulk (schedule stage "Tier-1") whose atoms are
+//!   the criterion-selected rank-1 special case.
+//! - an evidence-selected curved refinement (schedule stage "Tier-2") fit on the
+//!   RAW Tier-1 residual — higher per-atom complexity where the criterion pays
+//!   for it. (No projector weight: curvature lives INSIDE the linear span, so a
+//!   `Q⊥` whitener would blind the fit; anti-rechasing is the criterion's job.)
+//!
+//! This module owns the **spine-level** types every schedule stage hangs off:
 //!   * [`Tier0Mean`] — the single shared mean μ. Moving the DC out of every atom
 //!     into ONE Tier-0 mean is the structural kill of the co-collapse-to-mean
 //!     class (issue #10 / #1893): on the de-meaned data the all-atoms-equal-to-
@@ -201,15 +220,24 @@ impl TieredConfig {
     }
 }
 
-/// Tier-1's interference subspace: the directions the linear dictionary already
+/// Tier-1's active subspace: the directions the linear dictionary already
 /// explains (`q`), its orthogonal complement (`q_perp`), and the per-direction
 /// energy scale (`scale`, the singular values of the usage-weighted decoder).
 ///
 /// `q` is `P×r` with orthonormal columns; `q_perp` is `P×(P−r)` with orthonormal
 /// columns; together they are a full orthonormal basis of `ℝ^P` (`q ⟂ q_perp`).
-/// Tier-2's GLS weight `G = q_perp q_perpᵀ = I − q qᵀ` down-weights `q` — so the
-/// curved fit pursues only what Tier-1 misses. `scale` (length `r`) lets Tier-2
-/// set the `Σ = Λ c Λᵀ + D` factor magnitude without refitting.
+///
+/// DIAGNOSTIC ONLY — span reporting. **Do NOT use `q_perp` as a GLS weight on the
+/// Tier-2 residual.** A `G = q_perp q_perpᵀ = I − q qᵀ` weight is a proven design
+/// error (audit 2026-07-03): a curve's chords span the curve's OWN plane, so the
+/// post-linear curvature signal (chord-sag) lives INSIDE `span(q)` — the measured
+/// counterexample put 95.4% of the residual energy inside `q` and a Q⊥ weight
+/// crushed the in-plane signal to noise. Curvature is a constraint AMONG the
+/// directions Tier-1 spans, not a direction it missed, so Tier-2 fits the RAW
+/// residual; anti-rechasing is priced by the evidence criterion (the ledger),
+/// never by a projector, and the only sanctioned reweighting is a soft `Σ̂`
+/// estimated from the actual (anisotropic) residual. See the
+/// `qperp_weight_is_blind_to_in_plane_curvature` regression test.
 #[derive(Clone, Debug)]
 pub struct InterferenceSubspace {
     /// Active subspace, `P×r`, orthonormal columns (what Tier-1 explains).
@@ -221,6 +249,10 @@ pub struct InterferenceSubspace {
 }
 
 /// Compute Tier-1's [`InterferenceSubspace`] from a fitted sparse dictionary.
+///
+/// DIAGNOSTIC span report — how much of `ℝ^P` the linear dictionary already
+/// spans. It must NOT weight or gate the Tier-2 fit (see [`InterferenceSubspace`]
+/// for why `q_perp`-weighting is blind to curvature).
 ///
 /// Forms the usage-weighted decoder Gram `G = Σ_k w_k d_k d_kᵀ` (`P×P`), where
 /// `d_k` is atom `k`'s decoder row and `w_k = Σ_i codes[i,k]²` is its total fired
@@ -286,6 +318,9 @@ pub fn interference_subspace(
         Some(r) => r.min(p).max(1),
         None => {
             // Smallest r whose top-r eigen-energy reaches 99% of the total.
+            // 0.99 is a REPORTING tolerance for this span DIAGNOSTIC only (how
+            // many directions to list); it gates/weights no fit and prices no
+            // atom — decisions stay with the rank-charge evidence criterion.
             let mut acc = 0.0f64;
             let mut chosen = 1usize;
             for (taken, &e) in evals.iter().rev().enumerate() {
@@ -317,15 +352,20 @@ pub fn interference_subspace(
     Ok(InterferenceSubspace { q, q_perp, scale })
 }
 
-/// Mode-B hand-off: the whitened *shared* residual and Tier-1's interference
-/// model, handed to the Tier-2 curved fit (`tier2-curved` / #17). Tier-2 fits its
-/// curved atoms on `residual`, installing a held GLS metric built from
-/// `interference` (down-weighting `q`, i.e. what Tier-1 explains).
+/// Mode-B hand-off: the RAW post-Tier-1 shared residual handed to the Tier-2
+/// curved fit (`tier2-curved` / #17). Tier-2 fits its curved atoms on `residual`
+/// DIRECTLY — no projector weight. Anti-rechasing (a curved atom duplicating
+/// linear work) is priced by the evidence criterion, NOT enforced by a metric;
+/// the only sanctioned reweighting is a soft `Σ̂` estimated from this actual
+/// (anisotropic) residual. `interference` rides along as a span DIAGNOSTIC only —
+/// it must NOT gate or weight the fit (`q_perp`-weighting is blind to curvature;
+/// see [`InterferenceSubspace`]).
 #[derive(Clone, Debug)]
 pub struct WhitenedResidualHandoff {
-    /// Post-Tier-1 residual `R = (z − μ) − T1.reconstruct()`, `N×P`, f64.
+    /// Post-Tier-1 residual `R = (z − μ) − T1.reconstruct()`, `N×P`, f64. Tier-2
+    /// fits this RAW residual directly.
     pub residual: Array2<f64>,
-    /// Tier-1's interference subspace (`q`, `q_perp`, `scale`).
+    /// Tier-1's active subspace (`q`, `q_perp`, `scale`) — DIAGNOSTIC only.
     pub interference: InterferenceSubspace,
     /// The frozen Tier-1 decoder, `K×P` (for out-of-sample residual recompute).
     pub tier1_decoder: Array2<f32>,
@@ -446,5 +486,50 @@ mod tests {
         for (a, b) in back.iter().zip(z.iter()) {
             assert!((a - b).abs() < 1e-12);
         }
+    }
+
+    #[test]
+    fn qperp_weight_is_blind_to_in_plane_curvature() {
+        // The RETRACTED Q⊥ GLS weight (`G = I − QQᵀ`) is self-defeating: a curve's
+        // chords span the curve's OWN plane, so the post-linear curvature signal
+        // lives INSIDE `span(Q)` and `Q⊥`-weighting annihilates exactly what Tier-2
+        // exists to model. This pins that so the idea can't be re-derived.
+        //
+        // Tier-1 linear atoms span the e0–e1 plane — the plane a circle would live
+        // in; a fitted circle's chords span the same plane.
+        let decoder = array![[1.0f32, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]];
+        let indices = array![[0u32, 1u32], [0u32, 1u32], [0u32, 1u32]];
+        let codes = array![[3.0f32, 2.0], [3.0, 2.0], [3.0, 2.0]];
+        let fit = SparseDictFit {
+            decoder,
+            indices,
+            codes,
+            explained_variance: 0.0,
+            epochs: 0,
+            converged: true,
+            active: 2,
+            score_route_stats: Default::default(),
+        };
+        let sub = interference_subspace(&fit, Some(2)).expect("subspace");
+        // The circle's plane (e0, e1) lives ENTIRELY inside Q: ‖Qᵀ e_j‖ ≈ 1.
+        for j in 0..2 {
+            let mut ej = Array1::<f64>::zeros(4);
+            ej[j] = 1.0;
+            let qte = sub.q.t().dot(&ej);
+            let proj_norm = qte.dot(&qte).sqrt();
+            assert!((proj_norm - 1.0).abs() < 1e-9, "e{j} not fully in Q: {proj_norm}");
+        }
+        // A residual that IS the in-plane curvature signal (chord-sag), unit norm.
+        let curvature = array![0.6f64, -0.8, 0.0, 0.0];
+        let sig_rms = curvature.dot(&curvature).sqrt();
+        assert!(sig_rms > 0.99, "planted signal should be ~unit; got {sig_rms}");
+        // What the Q⊥ GLS weight would keep: `q_perpᵀ · residual`.
+        let qperp_component = sub.q_perp.t().dot(&curvature);
+        let qperp_rms = qperp_component.dot(&qperp_component).sqrt();
+        assert!(
+            qperp_rms < 1e-9,
+            "Q⊥ weight crushes the in-plane curvature to noise ({qperp_rms}) — it is BLIND \
+             to what Tier-2 must model; fit the raw residual instead"
+        );
     }
 }
