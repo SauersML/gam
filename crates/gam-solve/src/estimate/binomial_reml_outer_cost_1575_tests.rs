@@ -226,18 +226,21 @@ fn binomial_logit_reml_outer_cost_is_bounded_1575() {
     );
 }
 
-/// Measurement harness (run with `--ignored --nocapture`): report outer-eval,
-/// inner-solve and wall-clock scaling of the binomial/logit REML fit across a
-/// range of `n`. Not a gate — it produces the table used to reason about the
-/// #1575 gap against mgcv and to confirm the outer-eval count is n-independent.
+/// n-independence gate for the binomial/logit REML outer loop (#1575's central
+/// claim). Fits the SAME 3-smooth logistic problem at two sizes and reports the
+/// outer-eval / inner-solve / wall-clock table, then asserts the outer cost-eval
+/// count does NOT scale with `n` — each fit stays within the same bounded outer
+/// budget the single-`n` sibling pins. The outer overhead is fully visible at
+/// small `n`, so the sweep is capped there to keep the gate cheap; a data-scaling
+/// regression (the ~150-eval grind #1575 reported) would blow the bound loudly.
 #[test]
-#[ignore]
-fn binomial_logit_reml_outer_cost_scaling_1575() {
+fn binomial_logit_reml_outer_cost_is_n_independent_1575() {
     eprintln!(
         "{:>7} {:>4} {:>4} {:>8} {:>8} {:>10} {:>10} {:>9}",
         "n", "k", "p", "outer", "inner", "time_s", "time/inner", "conv"
     );
-    for &n in &[1000usize, 2000, 4000, 8000, 16000] {
+    let mut outer_by_n: Vec<(usize, usize)> = Vec::new();
+    for &n in &[1000usize, 2000] {
         let k = K;
         let (x, y, s_list) = build_fixture_n(n, k);
         let weights = Array1::<f64>::ones(n);
@@ -270,5 +273,28 @@ fn binomial_logit_reml_outer_cost_scaling_1575() {
             dt / (fit.inner_pirls_solves.max(1) as f64),
             fit.outer_converged,
         );
+        assert!(
+            fit.outer_converged,
+            "n={n}: outer REML must certify convergence, not grind to the iter cap"
+        );
+        // Same bounded outer budget the single-`n` sibling gate pins: the count
+        // must stay bounded as `n` grows (that IS n-independence). mgcv's Newton
+        // does this in ~15; the #1575 grind was ~150.
+        assert!(
+            fit.outer_cost_evals <= 60,
+            "n={n}: outer REML cost evals = {} — expected the bounded, \
+             n-independent outer loop, not the ~150-eval grind (#1575)",
+            fit.outer_cost_evals
+        );
+        outer_by_n.push((n, fit.outer_cost_evals));
     }
+    // Direct n-independence check: doubling `n` must not materially grow the
+    // outer cost-eval count (a data-scaling regression would roughly track `n`).
+    let (n_small, outer_small) = outer_by_n[0];
+    let (n_large, outer_large) = outer_by_n[1];
+    assert!(
+        outer_large <= outer_small + 15,
+        "outer cost-eval count scaled with n (#1575): n={n_small}→{outer_small}, \
+         n={n_large}→{outer_large}; the outer loop must be n-independent"
+    );
 }
