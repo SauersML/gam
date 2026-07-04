@@ -58,6 +58,7 @@ from ._api import (
     cuda_diagnostics,
     duchon_basis,
     duchon_function_norm_penalty,
+    matern_basis,
     explain_error,
     fit,
     format_cuda_diagnostics,
@@ -89,6 +90,7 @@ from ._api import (
     periodic_spline_curve_basis,
     smoothness_penalty,
     sphere_basis,
+    sphere_basis_jet,
     validate_formula,
 )
 from ._binding import RustExtensionUnavailableError

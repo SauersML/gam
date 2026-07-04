@@ -263,12 +263,22 @@ topical guides for narrative explanations.
       show_root_heading: true
       heading_level: 3
 
+::: gamfit.matern_basis
+    options:
+      show_root_heading: true
+      heading_level: 3
+
 ::: gamfit.periodic_spline_curve_basis
     options:
       show_root_heading: true
       heading_level: 3
 
 ::: gamfit.sphere_basis
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.sphere_basis_jet
     options:
       show_root_heading: true
       heading_level: 3
