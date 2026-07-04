@@ -186,6 +186,13 @@ def fit_layer_circle(
             atom_topology="circle",
             assignment="ibp_map",
             random_state=seed,
+            # DOSE's proven-good K=1 kwargs on MSI (r2=0.997): the default
+            # isometry_weight=1.0 / n_iter=50 path can live-lock on K=1 (STATE
+            # #9); isometry_weight=0.0 with a bounded iteration count fits
+            # cleanly. The circle's shape is carried by the topology prior, not
+            # the isometry penalty, so zeroing it does not distort the chart.
+            isometry_weight=0.0,
+            n_iter=30,
         )
     # Certificate-gated honest angle (#2081): raises on a degenerate chart
     # rather than returning an arbitrary coordinate.
