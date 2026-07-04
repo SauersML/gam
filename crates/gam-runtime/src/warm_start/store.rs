@@ -72,6 +72,32 @@ struct OnDiskMeta {
     /// entries behind never-hit writes when a tight budget forces a choice.
     #[serde(default)]
     accessed: bool,
+    /// Last-access timestamp (unix seconds + nanos). Distinct from the
+    /// immutable `written_*` creation stamp: a lookup that reuses this entry
+    /// bumps the access stamp (refreshing its TTL so hot entries survive)
+    /// WITHOUT touching `written_*`. Keeping the two separate is required for
+    /// correctness — `lookup_latest`/`entry_newer` order by the immutable
+    /// creation stamp, so if a read moved `written_*` forward the merely
+    /// *read* entry would masquerade as the most-recently-*written* one. Zero
+    /// (the serde default for entries written before this field existed, and
+    /// for never-reused entries) means "no access newer than creation": TTL
+    /// then falls back to `written_*`.
+    #[serde(default)]
+    accessed_unix_secs: u64,
+    #[serde(default)]
+    accessed_nanos: u32,
+}
+
+/// Effective activity timestamp (nanoseconds since the unix epoch): the more
+/// recent of the immutable creation stamp and the last-access stamp. TTL
+/// expiry is measured from this so a reused entry stays alive, while ordering
+/// (`entry_newer`) keys on `written_*` alone.
+fn meta_activity_nanos(meta: &OnDiskMeta) -> u128 {
+    let written =
+        (meta.written_unix_secs as u128) * 1_000_000_000u128 + meta.written_nanos as u128;
+    let accessed =
+        (meta.accessed_unix_secs as u128) * 1_000_000_000u128 + meta.accessed_nanos as u128;
+    written.max(accessed)
 }
 
 #[derive(Debug, Clone)]
@@ -289,14 +315,14 @@ impl WarmStartStore {
         };
         let (meta, entry) = self.touch_lookup_meta(&meta_path, meta, entry)?;
         // Record (meta_path, mtime) → entry so subsequent identical lookups
-        // short-circuit until the meta file's mtime changes. The full
-        // nanosecond write timestamp is cached alongside so the fast path
-        // can re-apply the TTL cutoff without re-reading the JSON.
+        // short-circuit until the meta file's mtime changes. The effective
+        // activity stamp (post-touch, so it reflects this very access) is
+        // cached alongside so the fast path can re-apply the TTL cutoff without
+        // re-reading the JSON.
         if let Ok(md) = fs::metadata(&meta_path)
             && let Ok(mtime) = md.modified()
         {
-            let write_nanos =
-                (meta.written_unix_secs as u128) * 1_000_000_000u128 + meta.written_nanos as u128;
+            let write_nanos = meta_activity_nanos(&meta);
             lookup_cache_insert(
                 cache_key,
                 CachedLookup {
@@ -400,6 +426,8 @@ impl WarmStartStore {
                 checksum_hex: checksum.clone(),
                 payload_bytes: payload.len() as u64,
                 accessed: false,
+                accessed_unix_secs: 0,
+                accessed_nanos: 0,
             };
             Ok(serde_json::to_vec_pretty(&meta)?)
         };
@@ -458,10 +486,24 @@ impl WarmStartStore {
         // counter is best-effort: it can drift relative to disk truth
         // because other processes may write/evict, but every triggered
         // sweep resyncs it to ground truth.
+        //
+        // The counter throttle alone does NOT bound the store: a burst of up
+        // to `EVICT_EVERY_N_SAVES - 1` saves between two counter-triggered
+        // sweeps can push the footprint arbitrarily far past the budget (e.g.
+        // 31 payloads under a budget that fits a handful). Bound it by also
+        // sweeping whenever the approximate byte total already exceeds the
+        // budget — a single cheap atomic load, so the common under-budget path
+        // still walks the directory only every Nth save, while an over-budget
+        // total forces the very next save to reclaim it. The eviction resyncs
+        // `byte_total` to ground truth, so this fires once per crossing rather
+        // than on every subsequent save.
         let approx_added = payload.len() as u64 + APPROX_META_BYTES;
-        self.byte_total.fetch_add(approx_added, Ordering::Relaxed);
+        let new_total = self.byte_total.fetch_add(approx_added, Ordering::Relaxed) + approx_added;
         let n = self.save_counter.fetch_add(1, Ordering::Relaxed);
-        if n == 0 || n.is_multiple_of(EVICT_EVERY_N_SAVES) {
+        if n == 0
+            || n.is_multiple_of(EVICT_EVERY_N_SAVES)
+            || new_total > self.opts.size_budget_bytes
+        {
             self.evict_overflow().ok();
         }
         Ok(())
@@ -764,13 +806,15 @@ impl ScannedEntry {
 /// than `ttl` relative to `now_nanos`. Mirrors the cutoff in
 /// [`WarmStartStore::evict_overflow`] so `lookup_with` cannot return an entry
 /// that the eviction sweep would have dropped.
-const fn meta_expired(secs: u64, nanos: u32, ttl: Duration, now_nanos: u128) -> bool {
+/// TTL expiry test. `activity_nanos` is the entry's effective activity stamp
+/// (`meta_activity_nanos`: the more recent of creation and last access), so a
+/// reused entry's TTL restarts from its last lookup rather than its creation.
+const fn meta_expired(activity_nanos: u128, ttl: Duration, now_nanos: u128) -> bool {
     let ttl_nanos = ttl.as_nanos();
     if ttl_nanos == 0 {
         return false;
     }
-    let write_nanos = (secs as u128) * 1_000_000_000u128 + nanos as u128;
-    now_nanos.saturating_sub(write_nanos) >= ttl_nanos
+    now_nanos.saturating_sub(activity_nanos) >= ttl_nanos
 }
 
 /// Process-wide in-memory cache for [`WarmStartStore::lookup_with`]. Hot poll
@@ -918,15 +962,19 @@ impl WarmStartStore {
         &self,
         meta_path: &Path,
         mut meta: OnDiskMeta,
-        mut entry: WarmStartEntry,
+        entry: WarmStartEntry,
     ) -> Result<(OnDiskMeta, WarmStartEntry), StoreError> {
         let now = self.nanos_now();
-        let old = (meta.written_unix_secs as u128) * 1_000_000_000u128 + meta.written_nanos as u128;
-        let touched = now.max(old.saturating_add(1));
-        let secs = (touched / 1_000_000_000u128) as u64;
-        let nanos = (touched % 1_000_000_000u128) as u32;
-        meta.written_unix_secs = secs;
-        meta.written_nanos = nanos;
+        // Refresh the ACCESS stamp (TTL clock), never the creation stamp: the
+        // creation stamp is the ordering key for `lookup_latest`, so bumping it
+        // on a read would make a merely-read entry win "latest" over a strictly
+        // newer write. Advance strictly past the previous access stamp so a
+        // second touch inside the same nanosecond still moves forward.
+        let old_access =
+            (meta.accessed_unix_secs as u128) * 1_000_000_000u128 + meta.accessed_nanos as u128;
+        let touched = now.max(old_access.saturating_add(1));
+        meta.accessed_unix_secs = (touched / 1_000_000_000u128) as u64;
+        meta.accessed_nanos = (touched % 1_000_000_000u128) as u32;
         meta.accessed = true;
         let json = serde_json::to_vec_pretty(&meta)?;
         let tmp = meta_path.with_extension(format!(
@@ -946,7 +994,8 @@ impl WarmStartStore {
             d.sync_all().ok();
         }
         self.metadata_index_remove(meta_path);
-        entry.written_unix_secs = secs;
+        // `entry.written_unix_secs` intentionally keeps the immutable creation
+        // stamp — the touch above only advanced the access clock.
         Ok((meta, entry))
     }
 
@@ -1076,25 +1125,15 @@ impl WarmStartStore {
             // expired we return the cached listing untouched (the fast path);
             // otherwise the removals bump the dir mtime, so we drop the stale
             // cache and re-cache the survivors keyed by the post-removal mtime.
-            let any_expired = cached.iter().any(|e| {
-                meta_expired(
-                    e.meta.written_unix_secs,
-                    e.meta.written_nanos,
-                    self.opts.ttl,
-                    now_nanos,
-                )
-            });
+            let any_expired = cached
+                .iter()
+                .any(|e| meta_expired(meta_activity_nanos(&e.meta), self.opts.ttl, now_nanos));
             if !any_expired {
                 return cached;
             }
             let mut survivors = Vec::with_capacity(cached.len());
             for entry in cached {
-                if meta_expired(
-                    entry.meta.written_unix_secs,
-                    entry.meta.written_nanos,
-                    self.opts.ttl,
-                    now_nanos,
-                ) {
+                if meta_expired(meta_activity_nanos(&entry.meta), self.opts.ttl, now_nanos) {
                     fs::remove_file(&entry.meta_path).ok();
                     fs::remove_file(&entry.bin_path).ok();
                     self.metadata_index_remove(&entry.meta_path);
@@ -1165,12 +1204,7 @@ impl WarmStartStore {
                 mutated = true;
                 continue;
             }
-            if meta_expired(
-                meta.written_unix_secs,
-                meta.written_nanos,
-                self.opts.ttl,
-                now_nanos,
-            ) {
+            if meta_expired(meta_activity_nanos(&meta), self.opts.ttl, now_nanos) {
                 fs::remove_file(&path).ok();
                 fs::remove_file(&bin).ok();
                 self.metadata_index_remove(&path);
