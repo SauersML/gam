@@ -2055,13 +2055,14 @@ impl SaeManifoldTerm {
     ///
     /// Homogeneous coord dims (including `K == 1`) always pass, as does a
     /// heterogeneous dictionary that carries only composing penalties.
-    /// Native ARD is intentionally not a parameter here: post-F6 it composes over
-    /// heterogeneous coord dims (`ard_value` is a per-atom sum over `d_k`), so it is
-    /// admitted whether or not it is enabled and cannot gate this check — only a
-    /// NON-composing registry penalty refuses.
     pub fn validate_heterogeneous_atom_compatibility(
         &self,
         registry: Option<&AnalyticPenaltyRegistry>,
+        // Retained for FFI signature stability and self-documentation. Post-F6 it
+        // no longer gates: native ARD composes over heterogeneous coord dims
+        // (`ard_value` is a per-atom sum over `d_k`), so it is admitted whether or
+        // not it is enabled — only a NON-composing registry penalty refuses.
+        _native_ard_enabled: bool,
     ) -> Result<(), String> {
         // Per-atom coord latent dims via the same accessor the registry
         // validator uses, so the two cannot disagree on "heterogeneous".

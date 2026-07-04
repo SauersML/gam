@@ -260,6 +260,12 @@ fn linear_structure_is_not_promoted_to_curved() {
     // destroys the sign/magnitude along the line and reconstructs strictly
     // worse. So the curved refinement loses out-of-sample and must be rejected —
     // the linear lane owns this region.
+    // Exactly rank-1 (no ambient noise): with even tiny noise the fine spectral
+    // cutoff would count the noise directions and the whitening floor would
+    // amplify them into a spurious isotropic blob. An exact rank-1 residual keeps
+    // every extra frame direction at zero projection, so the radial chart can
+    // only collapse the single real axis onto ±one radius — strictly worse than
+    // the exact rank-1 linear reconstruction.
     let n = 800;
     let p = 512;
     let dir = random_orthonormal(p, 1, 314);
@@ -268,7 +274,7 @@ fn linear_structure_is_not_promoted_to_curved() {
     for i in 0..n {
         let s = rng.normal(); // signed coordinate along the single linear axis
         for j in 0..p {
-            residual[[i, j]] = s * dir[[j, 0]] + 1.0e-4 * rng.normal();
+            residual[[i, j]] = s * dir[[j, 0]];
         }
     }
 
