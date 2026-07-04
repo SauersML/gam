@@ -2514,7 +2514,11 @@ mod tests {
         let per = 100;
         let mut rows = Vec::new();
         for i in 0..(7 * per) {
-            rows.push((i % 7) as f64 + 0.01 * ((i as f64).sin()));
+            // Sub-resolution embedding noise (±1e-3 over a span of 6 ⇒ ~1.7e-4
+            // normalized, below the width floor) so the seven weekdays are a
+            // genuine finite point set, not seven fuzzy blobs whose structured
+            // noise the evidence could honestly resolve into more clusters.
+            rows.push((i % 7) as f64 + 0.001 * ((i as f64).sin()));
         }
         let coords = Array2::from_shape_vec((7 * per, 1), rows).unwrap();
         let (anchors, idx) =
