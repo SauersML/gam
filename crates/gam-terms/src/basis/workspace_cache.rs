@@ -843,6 +843,37 @@ pub(crate) fn weighted_coefficient_sum_to_zero_transform(
     Ok(z)
 }
 
+/// Select spherical-spline basis centers by **geodesic** farthest-point sampling
+/// of the data cloud, returning a well-spread subset of the actual data rows.
+///
+/// This is the rotation-EQUIVARIANT center rule Wahba's reproducing-kernel smooth
+/// needs. The kernel is a function of the geodesic angle alone (`k(cos γ)`,
+/// `cos γ = uᵢ·u_c` for unit vectors `u`), so the continuous estimator is exactly
+/// SO(3)-invariant; the finite-center discretization inherits that invariance
+/// **iff** the centers rotate rigidly with the data. Every ingredient of this
+/// selection is a dot product of data unit vectors — the mean-direction seed key
+/// `uᵢ·Σⱼuⱼ`, the maximin nearest-center dot `max_c uᵢ·u_c`, and the sorted
+/// dot-profile tie-break — and a dot product is invariant under any rotation `R`
+/// (`(Ruᵢ)·(Ru_c) = uᵢ·u_c`). So under ANY rotation of the data the SAME physical
+/// rows are selected, the returned centers are exactly those rows rotated, every
+/// kernel entry `k(uᵢ·u_c)` is preserved, and the fit and every prediction are
+/// invariant to the arbitrary choice of frame (a longitude origin, a tilt, any
+/// element of SO(3)) — matching the rotation-invariant `harmonic` control (#2127).
+///
+/// The previous implementation ignored `data` and laid down a fixed golden-angle
+/// (Fibonacci) lattice pinned in the (lat, lon) frame: a rigid rotation moved the
+/// data relative to the STATIONARY centers, changed every data-to-center geodesic
+/// angle, and reshaped the fitted surface. Anchoring only the lattice's longitude
+/// origin to the data (a first pass at #2127) fixed rotations about the pole but
+/// left the frame-pinned latitudes exposed to a tilt.
+///
+/// The selection mirrors the Euclidean thin-plate knot picker
+/// ([`select_thin_plate_knots`]) — centroid-nearest seed, maximin recursion,
+/// invariant tie-breaks — but with geodesic (great-circle) distance in place of
+/// Euclidean distance, which is the correct SO(3) invariant on S². Coincident
+/// data directions are not selected twice (a duplicate center makes the Wahba
+/// Gram singular), so the returned count is `min(num_centers, #distinct data
+/// directions)`.
 pub fn select_spherical_farthest_point_centers(
     data: ArrayView2<'_, f64>,
     num_centers: usize,
@@ -852,57 +883,153 @@ pub fn select_spherical_farthest_point_centers(
     if num_centers == 0 {
         crate::bail_invalid_basis!("spherical farthest-point center count must be positive");
     }
+    let n = data.nrows();
+    if n < 2 {
+        return Err(BasisError::InsufficientColumnsForConstraint { found: n });
+    }
 
-    let to_units = if radians {
-        1.0
-    } else {
-        180.0 / std::f64::consts::PI
-    };
     let to_rad = if radians {
         1.0
     } else {
         std::f64::consts::PI / 180.0
     };
-    // Anchor the golden-angle spiral's longitude ORIGIN to the data's circular
-    // mean longitude so the center set is EQUIVARIANT under a rotation about the
-    // pole (a rigid longitude shift). The bare spiral fixes each center's
-    // longitude at `i·golden_angle`, i.e. a frame-anchored lattice with the
-    // longitude origin baked in; a common longitude shift applied to the data
-    // then moves the data relative to the STATIONARY centers and changes every
-    // data-to-center geodesic angle, so the fitted surface rotates — even though
-    // Wahba's reproducing kernel is a function of cos(geodesic angle) alone and
-    // is therefore intrinsically rotation invariant (#2127). The circular mean
-    // obeys `mean(lon + Δ) = mean(lon) + Δ`, so offsetting every lattice
-    // longitude by it makes the whole center cloud rotate WITH the data: under a
-    // longitude shift the centers shift by the same amount, the cos-γ arguments
-    // the kernel sees are unchanged, and predictions are invariant to the choice
-    // of longitude origin — matching the rotation-invariant `harmonic` control.
-    // A uniform rotation of a Fibonacci lattice is still a Fibonacci lattice, so
-    // sphere coverage/conditioning is unchanged.
-    let mut sum_sin = 0.0_f64;
-    let mut sum_cos = 0.0_f64;
-    for row in data.outer_iter() {
-        let lon = row[1] * to_rad;
-        sum_sin += lon.sin();
-        sum_cos += lon.cos();
+    // Unit vectors on S² for each data row. The geodesic distance between rows is
+    // a monotone-DECREASING function of the dot product `uᵢ·uⱼ = cos γ`, so every
+    // "distance" comparison below is phrased directly in dot products — each of
+    // which is exactly rotation invariant.
+    let units: Vec<[f64; 3]> = (0..n)
+        .map(|i| {
+            let lat = data[[i, 0]] * to_rad;
+            let lon = data[[i, 1]] * to_rad;
+            let cos_lat = lat.cos();
+            [cos_lat * lon.cos(), cos_lat * lon.sin(), lat.sin()]
+        })
+        .collect();
+    let dot = |a: &[f64; 3], b: &[f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+
+    // Mean-direction seed key `dot_to_sum[i] = uᵢ·Σⱼuⱼ`. `Σⱼuⱼ` is
+    // rotation-EQUIVARIANT (it rotates rigidly with the data), so `argmax` is the
+    // SAME physical row in every frame. Using the UNNORMALIZED resultant avoids
+    // the fp blow-up of normalizing a near-zero mean direction on a well-covered
+    // sphere (`dot_to_sum` is a homogeneous linear function of the resultant, so
+    // its relative accuracy — and hence the argmax — is stable regardless of the
+    // resultant's magnitude). Each component sum is taken in value-sorted order so
+    // the key is also invariant to a pure row permutation (matching
+    // `select_thin_plate_knots`).
+    let mut sum = [0.0_f64; 3];
+    for (c, sum_c) in sum.iter_mut().enumerate() {
+        let mut col: Vec<f64> = units.iter().map(|u| u[c]).collect();
+        col.sort_by(|a, b| a.total_cmp(b));
+        *sum_c = col.iter().sum();
     }
-    // atan2(0, 0) = 0; a degenerate (empty circular mean) data cloud falls back
-    // to the historical origin, and any real longitude spread makes the anchor
-    // well-defined and equivariant.
-    let mean_lon = if sum_sin == 0.0 && sum_cos == 0.0 {
-        0.0
-    } else {
-        sum_sin.atan2(sum_cos)
+    let dot_to_sum: Vec<f64> = units.iter().map(|u| dot(u, &sum)).collect();
+
+    // Rotation- and permutation-invariant tie-break: the sorted multiset of dots
+    // `{uᵢ·uₗ : l}` is a pure function of the unordered spherical geometry, so it
+    // survives both a rigid rotation and a row permutation. Only genuinely
+    // interchangeable (coincident) rows fall through to the row index.
+    let dot_profile_less = |i: usize, j: usize| -> bool {
+        let mut pi: Vec<f64> = units.iter().map(|u| dot(&units[i], u)).collect();
+        let mut pj: Vec<f64> = units.iter().map(|u| dot(&units[j], u)).collect();
+        pi.sort_by(|a, b| a.total_cmp(b));
+        pj.sort_by(|a, b| a.total_cmp(b));
+        for (a, b) in pi.iter().zip(pj.iter()) {
+            match a.total_cmp(b) {
+                std::cmp::Ordering::Less => return true,
+                std::cmp::Ordering::Greater => return false,
+                std::cmp::Ordering::Equal => {}
+            }
+        }
+        i < j
     };
-    let golden_angle = std::f64::consts::PI * (3.0 - 5.0_f64.sqrt());
-    let mut centers = Array2::<f64>::zeros((num_centers, 2));
-    for i in 0..num_centers {
-        let z = (2.0 * i as f64 + 1.0) / num_centers as f64 - 1.0;
-        let lon = ((i as f64) * golden_angle + mean_lon + std::f64::consts::PI)
-            .rem_euclid(std::f64::consts::TAU)
-            - std::f64::consts::PI;
-        centers[[i, 0]] = z.asin() * to_units;
-        centers[[i, 1]] = lon * to_units;
+
+    // Seed = the row nearest the mean direction (largest `dot_to_sum`); invariant
+    // ties resolved by the dot-profile, then row index.
+    let mut seed = 0usize;
+    for i in 1..n {
+        let take = dot_to_sum[i] > dot_to_sum[seed]
+            || (dot_to_sum[i] == dot_to_sum[seed] && dot_profile_less(i, seed));
+        if take {
+            seed = i;
+        }
+    }
+
+    let target = num_centers.min(n);
+    let mut selected = Vec::with_capacity(target);
+    let mut chosen = vec![false; n];
+    // `max_dot[i]` = `max` over chosen centers `c` of `uᵢ·u_c` = `cos` of the
+    // geodesic distance to the NEAREST chosen center. The maximin step picks the
+    // unchosen row MINIMIZING it (farthest from all chosen).
+    let mut max_dot = vec![f64::NEG_INFINITY; n];
+    selected.push(seed);
+    chosen[seed] = true;
+    for i in 0..n {
+        max_dot[i] = dot(&units[i], &units[seed]);
+    }
+
+    // A dot `≥ 1 − COINCIDENT_TOL` is a geodesic angle `≲ 1.4e-6` rad: the
+    // candidate coincides with an already-chosen center, so selecting it would add
+    // a duplicate kernel column and a singular Wahba Gram. Stopping here caps the
+    // center set at the number of DISTINCT data directions.
+    const COINCIDENT_TOL: f64 = 1e-12;
+    while selected.len() < target {
+        let mut best: Option<usize> = None;
+        for i in 0..n {
+            if chosen[i] {
+                continue;
+            }
+            match best {
+                None => best = Some(i),
+                Some(b) => {
+                    // Maximin: prefer the larger geodesic distance to the chosen
+                    // set (the SMALLER `max_dot`). Exact `max_dot` ties — common on
+                    // symmetric clouds and in float arithmetic — break first toward
+                    // the MORE PERIPHERAL row (smaller `dot_to_sum`, which spreads
+                    // centers outward and is rotation invariant), then by the
+                    // invariant dot-profile, then row index. This keeps the
+                    // selected set invariant under both rotation and permutation.
+                    let take = max_dot[i] < max_dot[b]
+                        || (max_dot[i] == max_dot[b]
+                            && (dot_to_sum[i] < dot_to_sum[b]
+                                || (dot_to_sum[i] == dot_to_sum[b] && dot_profile_less(i, b))));
+                    if take {
+                        best = Some(i);
+                    }
+                }
+            }
+        }
+        let next = match best {
+            Some(i) => i,
+            None => break,
+        };
+        if max_dot[next] >= 1.0 - COINCIDENT_TOL {
+            break;
+        }
+        selected.push(next);
+        chosen[next] = true;
+        for i in 0..n {
+            if chosen[i] {
+                continue;
+            }
+            let d = dot(&units[i], &units[next]);
+            if d > max_dot[i] {
+                max_dot[i] = d;
+            }
+        }
+    }
+
+    if selected.len() < 2 {
+        return Err(BasisError::InsufficientColumnsForConstraint {
+            found: selected.len(),
+        });
+    }
+
+    // Return the selected rows VERBATIM (in the data's own lat/lon units), so the
+    // centers ARE data points and carry the rotation exactly.
+    let mut centers = Array2::<f64>::zeros((selected.len(), 2));
+    for (r, &idx) in selected.iter().enumerate() {
+        centers[[r, 0]] = data[[idx, 0]];
+        centers[[r, 1]] = data[[idx, 1]];
     }
     Ok(centers)
 }
