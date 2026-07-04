@@ -5115,6 +5115,28 @@ impl SaeManifoldTerm {
                 for j in 0..border_dim {
                     gb_acc[j] += sys.gb[j];
                 }
+                if n_total <= 40 {
+                    let rep = chunk
+                        .decoder_repulsion_gate
+                        .as_ref()
+                        .map(|g| g.len())
+                        .unwrap_or(0);
+                    let bar = chunk
+                        .barrier_coactivation_gate
+                        .as_ref()
+                        .map(|g| g.len())
+                        .unwrap_or(0);
+                    let gbnorm: f64 = sys.gb.iter().map(|v| v * v).sum::<f64>().sqrt();
+                    let smooth_is_raw = chunk.atoms.iter().all(|a| {
+                        a.smooth_penalty
+                            .iter()
+                            .zip(a.smooth_penalty_raw.iter())
+                            .all(|(x, y)| (x - y).abs() < 1e-15)
+                    });
+                    eprintln!(
+                        "[DIAG cs={chunk_size} range=({start},{end})] rep_gate={rep} bar_gate={bar} gbnorm={gbnorm:.6e} smooth_raw={smooth_is_raw}"
+                    );
+                }
                 Self::accumulate_chunk_reduced_schur(
                     &sys,
                     ridge_ext_coord,
@@ -5140,6 +5162,14 @@ impl SaeManifoldTerm {
                 solve_streaming_reduced_beta(&s_acc, &rhs_acc, &options).map_err(|err| {
                     format!("SaeManifoldTerm::run_joint_fit_arrow_schur_streaming: {err}")
                 })?;
+            if n_total <= 40 {
+                let strace: f64 = (0..border_dim).map(|j| s_acc[[j, j]]).sum();
+                let rhsn: f64 = rhs_acc.iter().map(|v| v * v).sum::<f64>().sqrt();
+                let dbn: f64 = delta_beta.iter().map(|v| v * v).sum::<f64>().sqrt();
+                eprintln!(
+                    "[DIAG-ITER cs={chunk_size}] s_trace={strace:.8e} rhs_norm={rhsn:.8e} delta_beta_norm={dbn:.8e}"
+                );
+            }
             // ── Streaming Armijo line search on Δβ. ──
             // The directional decrease uses the *reduced* β gradient
             // `g_reduced = −rhs_acc`, the true gradient of the β-marginal

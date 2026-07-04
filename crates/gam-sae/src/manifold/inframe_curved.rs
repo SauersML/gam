@@ -339,7 +339,6 @@ fn fit_one_region(
     if n_g < config.min_rows || n_g < 2 * config.crossfit_folds.max(2) {
         return Ok(None);
     }
-    let p = residual.ncols();
     let r_g = take_rows(residual, &region.rows);
 
     let frame = match learn_frame(&r_g, config)? {
