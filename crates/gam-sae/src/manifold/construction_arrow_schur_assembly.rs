@@ -148,14 +148,26 @@ impl SaeManifoldTerm {
         // assembly chokepoint as the smoothness Gram, so the repulsion's
         // gradient/curvature (assembled below) and its value (read by the
         // line-search `penalized_objective_total`) share one frozen gate.
-        self.refresh_decoder_repulsion_gate();
-        // #1625 — freeze the SEPARATION barrier's normalized-coactivation `q_jk`
-        // at the same chokepoint. The barrier weights its decoder-shape repulsion
-        // by the routing coactivation, but its gradient treats that weight as a
-        // constant; recomputing it from the trial logits in the line-search value
-        // desyncs value vs gradient in the logit block and stalls the inner solve
-        // (#1625). Freezing it here makes value/gradient/curvature consistent.
-        self.refresh_barrier_coactivation_gate();
+        //
+        // #1801 — EXCEPT under a streaming fit, which freezes both collapse-
+        // prevention gates ONCE per outer iteration from the FULL resident routing
+        // and carries them onto every chunk (`streaming_gates_frozen`). The gates'
+        // per-pair strength `μ_jk` inverts the coactivation-weighted design Grams
+        // `G_j`, which are near-singular on a single small chunk, so a per-chunk
+        // refresh makes `μ_jk = γ/(1−γ)` blow up as `γ→1` and the reduced β-Newton
+        // step depend on `chunk_size`. Skipping the per-chunk refresh here keeps the
+        // carried global gate, so the streaming fit is chunk-size invariant (pinned
+        // by `sae_streaming_arrow_schur_contract::streaming_full_fit_is_chunk_size_invariant`).
+        if !self.streaming_gates_frozen {
+            self.refresh_decoder_repulsion_gate();
+            // #1625 — freeze the SEPARATION barrier's normalized-coactivation `q_jk`
+            // at the same chokepoint. The barrier weights its decoder-shape repulsion
+            // by the routing coactivation, but its gradient treats that weight as a
+            // constant; recomputing it from the trial logits in the line-search value
+            // desyncs value vs gradient in the logit block and stalls the inner solve
+            // (#1625). Freezing it here makes value/gradient/curvature consistent.
+            self.refresh_barrier_coactivation_gate();
+        }
         let n = self.n_obs();
         let p = self.output_dim();
         let k_atoms = self.k_atoms();

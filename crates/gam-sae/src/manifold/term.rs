@@ -580,6 +580,20 @@ pub struct SaeManifoldTerm {
     /// basis + routing), so freezing them here keeps the barrier value, gradient,
     /// and curvature reading the SAME weights across an inner line search.
     pub(crate) barrier_coactivation_gate: Option<Vec<(usize, usize, f64, f64)>>,
+    /// #1801 — STREAMING gate-freeze flag. The collapse-prevention gates
+    /// ([`Self::decoder_repulsion_gate`], [`Self::barrier_coactivation_gate`]) are
+    /// GLOBAL dictionary properties: their per-pair strength `μ_jk` inverts the
+    /// coactivation-weighted design Grams `G_j` (`M_j × M_j`), which are
+    /// near-singular on a small minibatch, so recomputing them per streaming chunk
+    /// makes `μ_jk = γ/(1−γ)` blow up as `γ→1` and the fit depend on `chunk_size`.
+    /// The streaming fit driver instead FREEZES these gates ONCE per outer
+    /// iteration from the full resident routing (exactly like the decoder frames)
+    /// and carries them onto every materialized chunk. When this flag is `true` the
+    /// per-chunk assembly SKIPS its own gate refresh and uses the carried global
+    /// gate, so the reduced β-Newton step and line-search objective are
+    /// chunk-size invariant. Default `false` (the dense/full-batch path refreshes
+    /// per assembly, bit-for-bit unchanged). Transient (Clone starts `false`).
+    pub(crate) streaming_gates_frozen: bool,
     /// #1026: the load-bearing curved-vs-linear hybrid-split verdict, computed
     /// once in [`Self::canonicalize_charts_post_fit`] after the joint fit
     /// converges. Each eligible `d = 1` atom's fitted curved image is adjudicated
@@ -748,6 +762,10 @@ impl Clone for SaeManifoldTerm {
             // #1625 — transient per-assembly frozen barrier coactivation; rebuilt
             // at the next assembly, exactly like the repulsion gate above.
             barrier_coactivation_gate: None,
+            // #1801 — transient streaming gate-freeze flag; a fresh clone refreshes
+            // its gates per assembly like the dense path until a streaming fit
+            // re-arms it.
+            streaming_gates_frozen: false,
             hybrid_split_report: self.hybrid_split_report.clone(),
             atom_inner_fits: self.atom_inner_fits.clone(),
             oos_linear_images: self.oos_linear_images.clone(),

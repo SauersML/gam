@@ -170,6 +170,10 @@ impl SaeManifoldTerm {
             best_cocollapse_incumbent: None,
             decoder_repulsion_gate: None,
             barrier_coactivation_gate: None,
+            // #1801 — default false: the dense/full-batch assembly refreshes the
+            // collapse-prevention gates per assembly (bit-for-bit historical). The
+            // streaming fit driver re-arms this to freeze them once globally.
+            streaming_gates_frozen: false,
             hybrid_split_report: None,
             atom_inner_fits: None,
             oos_linear_images: None,
