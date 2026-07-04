@@ -768,9 +768,24 @@ fn build_atom_candidates(
             // Φ absent or row-count mismatch → param-count fallback (same as flag-off).
             _ => curved_num_params as f64,
         };
+        // DEVIANCE, not raw SSE (#2124 units fix): the rank charge `½·d_eff·ln n`
+        // is dimensionless, so trading it against the bare `½·RSS` makes the
+        // linear↔curved decision depend on the response scale (exactly the
+        // sensitivity `reduced_laplace_nle`'s SCALE CAVEAT documents). Divide the
+        // residual objective by the term's reconstruction dispersion φ̂
+        // (`dispersion_r`) so the boundary is `Δ(½RSS)/φ̂ vs ½·Δd_eff·ln n` —
+        // scale-invariant, the BIC large-n limit of the Laplace evidence in
+        // proper units. A non-finite or non-positive φ̂ falls back to the
+        // historical unit-dispersion reading rather than fabricating an infinite
+        // deviance.
+        let inv_dispersion = if dispersion_r.is_finite() && dispersion_r > 0.0 {
+            dispersion_r.recip()
+        } else {
+            1.0
+        };
         (
-            reduced_laplace_nle(linear_residual_objective, d_lin * n_obs_ln),
-            reduced_laplace_nle(curved_residual_objective, d_curved * n_obs_ln),
+            reduced_laplace_nle(linear_residual_objective * inv_dispersion, d_lin * n_obs_ln),
+            reduced_laplace_nle(curved_residual_objective * inv_dispersion, d_curved * n_obs_ln),
         )
     } else {
         (
