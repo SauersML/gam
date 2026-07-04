@@ -170,6 +170,9 @@ mod wbic_audit;
 mod tests;
 
 #[cfg(test)]
+mod tests_chart_evaluator_jets;
+
+#[cfg(test)]
 mod tests_factored_htbeta;
 
 #[cfg(test)]
