@@ -1051,6 +1051,13 @@ impl<'a> RemlState<'a> {
             .par_for_each(|o, xp_row, x_row| *o = xp_row.dot(&x_row));
 
         let mut gradient = Array1::<f64>::zeros(total_k);
+        // The dominant `O(n²·p)` direct term for all `k` canonical directions
+        // shares one gram assembly (the row-pair block is direction-independent):
+        // fill each block once and reuse it, cutting the per-eval cost from
+        // `O(k·n²·p)` to `O(n²·p)` bit-identically (#1575).
+        let canonical_direct = Self::tk_direct_gradient_canonical_batched(
+            x_dense, z, c_array, d_array, e_array, x_vks, k, shared, gram,
+        )?;
         for idx in 0..k {
             let cp = &tk_penalties[idx];
             let r = &cp.col_range;
@@ -1064,10 +1071,7 @@ impl<'a> RemlState<'a> {
                 Self::tk_active_weighted_trace(&shared.active_blocks, &x_vks[idx], &lev_p);
             let firth_trace =
                 Self::tk_firth_beta_hessian_trace(firth_op, &beta_dirs[idx], &p_total)?;
-            let eta_total = x_vks[idx].mapv(|value| -value);
-            let direct = Self::tk_direct_gradient_from_cd_and_design(
-                x_dense, z, c_array, d_array, e_array, &eta_total, None, shared, gram, true,
-            )?;
+            let direct = canonical_direct[idx];
             gradient[idx] = trace_ak_p - correction_trace + firth_trace + direct;
         }
         let ext_values = (0..ext_drifts.len())
@@ -1199,6 +1203,141 @@ impl<'a> RemlState<'a> {
     ///   q' = Xᵀ(c'⊙h + c⊙h') + X'ᵀ(c⊙h).
     /// The remaining `H`-drift part of dV_TK/dθ is assembled by
     /// `tk_gradient_from_shared`.
+    /// Batched direct TK ρ-gradient for the `k` canonical smoothing directions,
+    /// sharing the dominant `O(n²·p)` gram assembly.
+    ///
+    /// The per-direction [`tk_direct_gradient_from_cd_and_design`] refills the
+    /// row-pair gram block `Gᵢⱼ = xᵢᵀH⁻¹xⱼ` (`tk_fill_gram_block`) for EVERY
+    /// canonical direction, yet that block depends only on `(x_dense, z)` — it is
+    /// identical across directions (only the per-row `c/c'` weights differ). For
+    /// the default-ON binomial/logit Firth path this gram assembly is the
+    /// dominant `O(n²·p)` cost of every outer gradient evaluation, so refilling
+    /// it `k` times is a `k×` waste (#1575). Here each gram block is filled ONCE
+    /// and consumed by all `k` directions, cutting the dominant term from
+    /// `O(k·n²·p)` to `O(n²·p) + O(k·n²)` with no accuracy change.
+    ///
+    /// The result is BIT-IDENTICAL to calling
+    /// `tk_direct_gradient_from_cd_and_design` per direction (canonical case:
+    /// `x_fixed = None`, dense kernels): each direction accumulates `c_term`
+    /// over the SAME `(j_block outer, i_block ≤ j_block)` order and the SAME
+    /// entry order, reading the identical `tk_fill_gram_block` values. The active
+    /// block set is the UNION over directions (a row participates if `c_array` OR
+    /// any direction's `c'` is nonzero); a row absent from a given direction's
+    /// own active set has `c = c' = 0` there and contributes exactly `0.0` to its
+    /// `c_term`, and `+= sym·0.0` at the union's extra block-pairs leaves the
+    /// per-direction running sum unchanged — so `direct[idx]` equals the
+    /// per-direction value byte-for-byte. Locked by
+    /// `tk_direct_gradient_canonical_batched_matches_per_direction_bit_identical_1575`.
+    pub(crate) fn tk_direct_gradient_canonical_batched(
+        x_dense: &Array2<f64>,
+        z: &Array2<f64>,
+        c_array: &Array1<f64>,
+        d_array: &Array1<f64>,
+        e_array: &Array1<f64>,
+        x_vks: &[Array1<f64>],
+        k: usize,
+        shared: &TkSharedIntermediates,
+        gram: &mut Array2<f64>,
+    ) -> Result<Vec<f64>, EstimationError> {
+        let n = x_dense.nrows();
+
+        // Per-direction working weights and the cheap (non-gram) gradient terms.
+        // These replicate the canonical-path arithmetic of
+        // `tk_direct_gradient_from_cd_and_design` (x_fixed = None ⇒ h' = 0, so
+        // the `-0.25·Σ d·h·h'` term and the `X'ᵀ(c⊙h)` / `c⊙h'` contributions
+        // vanish identically) term-for-term, in the identical association
+        // `d_term + c_term + q_term`.
+        let mut c_primes: Vec<Array1<f64>> = Vec::with_capacity(k);
+        let mut d_terms = vec![0.0_f64; k];
+        let mut q_terms = vec![0.0_f64; k];
+        for idx in 0..k {
+            let eta_total = x_vks[idx].mapv(|value| -value);
+            let mut c_prime = Array1::<f64>::zeros(n);
+            let mut d_prime = Array1::<f64>::zeros(n);
+            ndarray::Zip::from(&mut c_prime)
+                .and(d_array)
+                .and(&eta_total)
+                .par_for_each(|out, &d, &eta| *out = d * eta);
+            ndarray::Zip::from(&mut d_prime)
+                .and(e_array)
+                .and(&eta_total)
+                .par_for_each(|out, &e, &eta| *out = e * eta);
+            // q' = Xᵀ(c'⊙h)  (h' = 0 for canonical penalties).
+            let q_weight_prime = &c_prime * &shared.h_diag;
+            let q_prime = gam_linalg::faer_ndarray::fast_atv(x_dense, &q_weight_prime);
+            q_terms[idx] = 0.25 * q_prime.dot(&shared.y);
+            d_terms[idx] = -0.125
+                * d_prime
+                    .iter()
+                    .zip(shared.h_diag.iter())
+                    .map(|(&dp, &h)| dp * h * h)
+                    .sum::<f64>();
+            c_primes.push(c_prime);
+        }
+
+        // Union active-block structure over all directions (see doc comment):
+        // filling each gram block once and letting every direction sum over the
+        // union is bit-identical to per-direction blocks.
+        let mut blocks: Vec<TkActiveBlock> = Vec::with_capacity(n.div_ceil(TK_BLOCK_SIZE));
+        for start in (0..n).step_by(TK_BLOCK_SIZE) {
+            let end = (start + TK_BLOCK_SIZE).min(n);
+            let mut entries: Vec<(usize, f64)> = Vec::new();
+            for offset in 0..(end - start) {
+                let row = start + offset;
+                let active = c_array[row] != 0.0 || c_primes.iter().any(|cp| cp[row] != 0.0);
+                if active {
+                    entries.push((offset, 0.0));
+                }
+            }
+            if !entries.is_empty() {
+                blocks.push(TkActiveBlock { start, end, entries });
+            }
+        }
+
+        let mut c_terms = vec![0.0_f64; k];
+        for (j_block_idx, j_block) in blocks.iter().enumerate() {
+            let j0 = j_block.start;
+            let j1 = j_block.end;
+            for i_block in &blocks[..=j_block_idx] {
+                let i0 = i_block.start;
+                let i1 = i_block.end;
+                // Fill the gram block ONCE; consume it for every direction.
+                Self::tk_fill_gram_block(x_dense, z, i0, i1, j0, j1, gram);
+                let sym_factor = if i0 == j0 { 1.0 } else { 2.0 };
+                for idx in 0..k {
+                    let cp = &c_primes[idx];
+                    let mut block_sum = 0.0_f64;
+                    for &(bi, _) in &i_block.entries {
+                        let ii = i0 + bi;
+                        let ci = c_array[ii];
+                        let cpi = cp[ii];
+                        for &(bj, _) in &j_block.entries {
+                            let jj = j0 + bj;
+                            let cj = c_array[jj];
+                            let gij = gram[[bi, bj]];
+                            let cpj = cp[jj];
+                            let c_direct = (cpi * cj + ci * cpj) * gij * gij * gij / 12.0;
+                            block_sum += c_direct;
+                        }
+                    }
+                    c_terms[idx] += sym_factor * block_sum;
+                }
+            }
+        }
+
+        let mut out = Vec::with_capacity(k);
+        for idx in 0..k {
+            let value = d_terms[idx] + c_terms[idx] + q_terms[idx];
+            if !value.is_finite() {
+                crate::bail_invalid_estim!(
+                    "Tierney-Kadane direct c/d derivative produced non-finite value: {value}"
+                );
+            }
+            out.push(value);
+        }
+        Ok(out)
+    }
+
     pub(crate) fn tk_direct_gradient_from_cd_and_design(
         x_dense: &Array2<f64>,
         z: &Array2<f64>,
@@ -8051,5 +8190,216 @@ mod firth_hessian_direction_reuse_tests {
             (0..k).any(|i| (0..k).any(|j| i != j && first[[i, j]].abs() > 0.0)),
             "k=4 Firth outer Hessian should have non-zero mixed second derivatives"
         );
+    }
+
+    // #1575: the batched canonical direct TK ρ-gradient shares one `O(n²·p)` gram
+    // assembly across all `k` directions. This locks the invariant that makes the
+    // substitution a pure perf win: `tk_direct_gradient_canonical_batched[idx]` is
+    // BIT-IDENTICAL to the per-direction `tk_direct_gradient_from_cd_and_design`
+    // it replaces. Uses n > TK_BLOCK_SIZE (multiple blocks incl. an off-diagonal
+    // sym-factor-2 pair) and a scattered `c = 0` set (with one direction's `c'`
+    // also vanishing there) so the union active-block path is exercised where a
+    // direction's OWN active set is strictly smaller than the union.
+    #[test]
+    fn tk_direct_gradient_canonical_batched_matches_per_direction_bit_identical_1575() {
+        let n = 200usize;
+        let p = 4usize;
+        let k = 3usize;
+        let mut x_dense = Array2::<f64>::zeros((n, p));
+        let mut z = Array2::<f64>::zeros((p, n));
+        let mut c_array = Array1::<f64>::zeros(n);
+        let mut d_array = Array1::<f64>::zeros(n);
+        let mut e_array = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let t = (i as f64) / (n as f64);
+            for j in 0..p {
+                x_dense[[i, j]] = (0.3 + j as f64 * 0.11) * ((t * (j as f64 + 1.3)).sin() + 0.5);
+                z[[j, i]] = 0.2 * ((t * (j as f64 + 0.7)).cos() - 0.1 * j as f64);
+            }
+            // Scattered c = 0 rows so a direction whose c' also vanishes there is
+            // absent from that direction's own active blocks (union ≠ per-dir).
+            c_array[i] = if i % 17 == 0 {
+                0.0
+            } else {
+                0.15 * (t - 0.4).sin() + 0.2
+            };
+            d_array[i] = 0.1 * (t * 2.1).cos() - 0.05;
+            e_array[i] = 0.07 * (t * 1.3).sin() + 0.03;
+        }
+        let mut x_vks: Vec<Array1<f64>> = Vec::with_capacity(k);
+        for idx in 0..k {
+            let mut v = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let t = (i as f64) / (n as f64);
+                v[i] = if idx == 0 && i % 17 == 0 {
+                    0.0
+                } else {
+                    0.4 * ((t * (idx as f64 + 1.1)).sin() + 0.2 * idx as f64)
+                };
+            }
+            x_vks.push(v);
+        }
+
+        let solve =
+            |rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> { Ok(rhs.clone()) };
+        let shared = RemlState::tk_shared_intermediates(
+            &x_dense,
+            &z,
+            &c_array,
+            "batched-bit-identity test",
+            &solve,
+        )
+        .expect("shared TK intermediates");
+
+        // Per-direction reference (the pre-#1575 path).
+        let mut gram_ref = Array2::<f64>::zeros((TK_BLOCK_SIZE, TK_BLOCK_SIZE));
+        let mut reference = Vec::with_capacity(k);
+        for idx in 0..k {
+            let eta_total = x_vks[idx].mapv(|value| -value);
+            let direct = RemlState::tk_direct_gradient_from_cd_and_design(
+                &x_dense,
+                &z,
+                &c_array,
+                &d_array,
+                &e_array,
+                &eta_total,
+                None,
+                &shared,
+                &mut gram_ref,
+                true,
+            )
+            .expect("per-direction direct gradient");
+            reference.push(direct);
+        }
+
+        // Batched (the #1575 shared-gram fast path).
+        let mut gram_batched = Array2::<f64>::zeros((TK_BLOCK_SIZE, TK_BLOCK_SIZE));
+        let batched = RemlState::tk_direct_gradient_canonical_batched(
+            &x_dense,
+            &z,
+            &c_array,
+            &d_array,
+            &e_array,
+            &x_vks,
+            k,
+            &shared,
+            &mut gram_batched,
+        )
+        .expect("batched direct gradient");
+
+        assert_eq!(batched.len(), k, "batched must return one value per direction");
+        for idx in 0..k {
+            assert!(
+                reference[idx].is_finite() && reference[idx].abs() > 0.0,
+                "reference direct[{idx}] should be a non-trivial finite value: {}",
+                reference[idx]
+            );
+            assert_eq!(
+                batched[idx].to_bits(),
+                reference[idx].to_bits(),
+                "batched direct[{idx}] ({}) is not bit-identical to the per-direction \
+                 value ({})",
+                batched[idx],
+                reference[idx]
+            );
+        }
+    }
+
+    // #1575 measurement: at the `n` where the default-ON binomial/logit Firth path
+    // pays its dominant `O(n²·p)` direct-gradient cost, the shared-gram batched
+    // path is materially faster than refilling the gram `k` times — while staying
+    // bit-identical. Reports a same-build, same-box before/after ratio (wall time
+    // on a shared CI box is noisy, so the ASSERTION is bit-identity, not a time
+    // bound; the printed ratio is the measurement).
+    #[test]
+    fn tk_direct_gradient_batched_faster_than_per_direction_bit_identical_1575() {
+        let n = 2000usize;
+        let p = 4usize;
+        let k = 3usize;
+        let mut x_dense = Array2::<f64>::zeros((n, p));
+        let mut z = Array2::<f64>::zeros((p, n));
+        let mut c_array = Array1::<f64>::zeros(n);
+        let mut d_array = Array1::<f64>::zeros(n);
+        let mut e_array = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let t = (i as f64) / (n as f64);
+            for j in 0..p {
+                x_dense[[i, j]] = (0.3 + j as f64 * 0.11) * ((t * (j as f64 + 1.3)).sin() + 0.5);
+                z[[j, i]] = 0.2 * ((t * (j as f64 + 0.7)).cos() - 0.1 * j as f64);
+            }
+            c_array[i] = 0.15 * (t - 0.4).sin() + 0.2;
+            d_array[i] = 0.1 * (t * 2.1).cos() - 0.05;
+            e_array[i] = 0.07 * (t * 1.3).sin() + 0.03;
+        }
+        let x_vks: Vec<Array1<f64>> = (0..k)
+            .map(|idx| {
+                Array1::from_shape_fn(n, |i| {
+                    let t = (i as f64) / (n as f64);
+                    0.4 * ((t * (idx as f64 + 1.1)).sin() + 0.2 * idx as f64)
+                })
+            })
+            .collect();
+
+        let solve =
+            |rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> { Ok(rhs.clone()) };
+        let shared =
+            RemlState::tk_shared_intermediates(&x_dense, &z, &c_array, "perf test", &solve)
+                .expect("shared TK intermediates");
+
+        let reps = 20usize;
+        let mut gram = Array2::<f64>::zeros((TK_BLOCK_SIZE, TK_BLOCK_SIZE));
+
+        // Time the per-direction (pre-#1575) path.
+        let t_ref = std::time::Instant::now();
+        for _ in 0..reps {
+            for idx in 0..k {
+                let eta_total = x_vks[idx].mapv(|value| -value);
+                let _ = RemlState::tk_direct_gradient_from_cd_and_design(
+                    &x_dense, &z, &c_array, &d_array, &e_array, &eta_total, None, &shared,
+                    &mut gram, true,
+                )
+                .expect("per-direction direct");
+            }
+        }
+        let dt_ref = t_ref.elapsed().as_secs_f64();
+
+        // Time the batched (#1575) path.
+        let t_bat = std::time::Instant::now();
+        for _ in 0..reps {
+            let _ = RemlState::tk_direct_gradient_canonical_batched(
+                &x_dense, &z, &c_array, &d_array, &e_array, &x_vks, k, &shared, &mut gram,
+            )
+            .expect("batched direct");
+        }
+        let dt_bat = t_bat.elapsed().as_secs_f64();
+
+        eprintln!(
+            "#1575 tk_direct_gradient n={n} p={p} k={k} reps={reps}: \
+             per_direction={dt_ref:.4}s  batched={dt_bat:.4}s  speedup={:.2}x",
+            dt_ref / dt_bat.max(1e-12)
+        );
+
+        // Final values for the bit-identity assertion.
+        let mut ref_last = vec![0.0_f64; k];
+        for idx in 0..k {
+            let eta_total = x_vks[idx].mapv(|value| -value);
+            ref_last[idx] = RemlState::tk_direct_gradient_from_cd_and_design(
+                &x_dense, &z, &c_array, &d_array, &e_array, &eta_total, None, &shared, &mut gram,
+                true,
+            )
+            .expect("per-direction direct");
+        }
+        let batched_last = RemlState::tk_direct_gradient_canonical_batched(
+            &x_dense, &z, &c_array, &d_array, &e_array, &x_vks, k, &shared, &mut gram,
+        )
+        .expect("batched direct");
+
+        for idx in 0..k {
+            assert_eq!(
+                batched_last[idx].to_bits(),
+                ref_last[idx].to_bits(),
+                "batched direct[{idx}] not bit-identical to per-direction at n={n}"
+            );
+        }
     }
 }
