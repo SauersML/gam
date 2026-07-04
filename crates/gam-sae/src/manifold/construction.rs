@@ -1585,6 +1585,7 @@ impl SaeManifoldTerm {
                     | SaeAtomBasisKind::Duchon
                     | SaeAtomBasisKind::EuclideanPatch
                     | SaeAtomBasisKind::Poincare
+                    | SaeAtomBasisKind::FiniteSet
                     | SaeAtomBasisKind::Precomputed(_),
                     _,
                 ) => AtomTopology::EuclideanPatch { latent_dim: d },

@@ -105,7 +105,7 @@ pub(crate) fn co_collapse_ev_arm_is_disarmed_at_iteration_zero_s1() {
         .collect();
 
     // ── iteration 0: the EV arm is DISARMED — no reseed, no event, state frozen ──
-    term.enforce_decoder_norm_guard(target.view(), 0, &rho)
+    term.enforce_decoder_norm_guard(target.view(), 0, &rho, None)
         .expect("guard must not error at iteration 0");
     assert!(
         term.collapse_events().is_empty(),
@@ -121,7 +121,7 @@ pub(crate) fn co_collapse_ev_arm_is_disarmed_at_iteration_zero_s1() {
     }
 
     // ── iteration 1: the SAME state now reseeds (a post-entry stall is genuine) ──
-    term.enforce_decoder_norm_guard(target.view(), 1, &rho)
+    term.enforce_decoder_norm_guard(target.view(), 1, &rho, None)
         .expect("guard must recover at iteration 1");
     for atom in 0..2 {
         let reseeded = term

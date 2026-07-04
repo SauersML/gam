@@ -1742,7 +1742,7 @@ pub(crate) fn decoder_norm_guard_reseeds_collapsed_atom_to_distinct_nonzero() {
     };
     assert!(norm(&term.atoms[1]) < 1e-12, "atom 1 starts collapsed");
 
-    term.enforce_decoder_norm_guard(target.view(), 0, &rho)
+    term.enforce_decoder_norm_guard(target.view(), 0, &rho, None)
         .expect("decoder-norm guard must not error on a recoverable collapse");
 
     // The guard recorded a Reseeded collapse event for the collapsed atom.
@@ -1887,7 +1887,7 @@ pub(crate) fn decoder_norm_guard_reseeds_all_atoms_on_total_co_collapse_k3() {
     );
 
     // S1: the EV co-collapse arm is armed only at iteration > 0 (iteration 0 = cold seed).
-    term.enforce_decoder_norm_guard(target.view(), 1, &rho)
+    term.enforce_decoder_norm_guard(target.view(), 1, &rho, None)
         .expect("co-collapse guard must recover, not error");
 
     // EVERY atom — including the one the old code preserved as anchor — must be
@@ -2031,7 +2031,7 @@ pub(crate) fn co_collapse_multistart_restores_best_basin_not_last_reseed() {
         if ev_at_entry < 0.28_f64 {
             best_seen = best_seen.max(ev_at_entry);
         }
-        term.enforce_decoder_norm_guard(target.view(), iteration, &rho)
+        term.enforce_decoder_norm_guard(target.view(), iteration, &rho, None)
             .expect("co-collapse guard must recover, not error");
     }
 
@@ -3030,7 +3030,7 @@ pub(crate) fn decoder_norm_guard_is_noop_for_k1() {
     let target = Array2::<f64>::zeros((n, p));
     let rho = SaeManifoldRho::new(0.0, 0.0, vec![array![0.0_f64]]);
     let before = term.atoms[0].decoder_coefficients.clone();
-    term.enforce_decoder_norm_guard(target.view(), 0, &rho)
+    term.enforce_decoder_norm_guard(target.view(), 0, &rho, None)
         .expect("K=1 decoder-norm guard must be a no-op, never error");
     assert!(
         term.collapse_events().is_empty(),
