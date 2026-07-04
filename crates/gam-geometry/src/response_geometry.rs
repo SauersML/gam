@@ -639,15 +639,23 @@ pub fn response_projection_residual(
 /// the canonical resolved label. This is the curved-manifold analogue of the
 /// sphere/simplex dispatch and the single entry the FFI calls for these
 /// geometries.
+///
+/// `weights` are the per-observation prior weights used ONLY to pick the intrinsic
+/// base point (they are ignored when an explicit `base` is supplied). When the
+/// caller supplies observation weights they must reach the linearization point so
+/// the tangent chart is expanded around the *weighted* Fréchet mean — where the
+/// weighted mass lives — matching the weighted tangent regression run there
+/// (#2125). `None` recovers the uniform intrinsic mean.
 pub fn dispatch_log_map(
     values: ArrayView2<'_, f64>,
     label: &str,
     base: Option<ArrayView1<'_, f64>>,
+    weights: Option<ArrayView1<'_, f64>>,
 ) -> Result<(Array2<f64>, Array1<f64>, String), String> {
     let manifold = ResponseManifold::parse(label, values.ncols())?;
     let base_point = match base {
         Some(b) => b.to_owned(),
-        None => response_frechet_mean(manifold, values, None, 1.0e-12, 256)?,
+        None => response_frechet_mean(manifold, values, weights, 1.0e-12, 256)?,
     };
     let tangent = response_log_map(manifold, values, base_point.view())?;
     Ok((tangent, base_point, manifold.canonical_label()))
@@ -1475,7 +1483,7 @@ mod tests {
         ];
         for (label, values) in cases {
             let (tangent, base, canonical) =
-                dispatch_log_map(values.view(), label, None).expect("dispatch log");
+                dispatch_log_map(values.view(), label, None, None).expect("dispatch log");
             assert!(canonical.starts_with(label.split('(').next().unwrap()));
             let back = dispatch_exp_map(tangent.view(), label, base.view()).expect("dispatch exp");
             for row in 0..values.nrows() {
@@ -1503,6 +1511,79 @@ mod tests {
             }
             .ambient_dim(),
             4
+        );
+    }
+
+    /// #2125: a weighted response-geometry fit must linearize around the
+    /// *weighted* Fréchet mean. `dispatch_log_map` picks the tangent base point;
+    /// before the fix it hard-passed `None` for the weights, so the chart origin
+    /// was the unweighted intrinsic mean even when the tangent regression was
+    /// weighted — a biased linearization. Here Stiefel(k=1,n=3) is the sphere S²:
+    /// two clusters of unit vectors 90° apart, with weights concentrated on the
+    /// first cluster, must move the base point toward that cluster.
+    #[test]
+    fn dispatch_log_map_uses_weighted_frechet_mean() {
+        let a = 0.15_f64;
+        // Two clusters on the great circle z = 0: cluster A about [1,0,0]
+        // (rows 0,1) and cluster B about [0,1,0] (rows 2,3). Every row is an
+        // exact unit vector (cos²+sin²=1), so Stiefel(k=1) accepts them.
+        let values = array![
+            [a.cos(), a.sin(), 0.0],
+            [(-a).cos(), (-a).sin(), 0.0],
+            [(std::f64::consts::FRAC_PI_2 - a).cos(), (std::f64::consts::FRAC_PI_2 - a).sin(), 0.0],
+            [(std::f64::consts::FRAC_PI_2 + a).cos(), (std::f64::consts::FRAC_PI_2 + a).sin(), 0.0],
+        ];
+        // Heavily weight cluster A: the weighted mean must sit near [1,0,0],
+        // whereas the unweighted mean sits near the 45° bisector.
+        let weights = array![50.0_f64, 50.0, 1.0, 1.0];
+        let manifold = ResponseManifold::Stiefel { k: 1, n: 3 };
+
+        let geodesic = |u: ArrayView1<'_, f64>, v: ArrayView1<'_, f64>| -> f64 {
+            u.dot(&v).clamp(-1.0, 1.0).acos()
+        };
+
+        let unweighted_ref =
+            response_frechet_mean(manifold, values.view(), None, 1e-12, 256).expect("unweighted");
+        let weighted_ref =
+            response_frechet_mean(manifold, values.view(), Some(weights.view()), 1e-12, 256)
+                .expect("weighted");
+        // Sanity: the two intrinsic means genuinely differ, so this design can
+        // distinguish a weighted from an unweighted base point.
+        assert!(
+            geodesic(unweighted_ref.view(), weighted_ref.view()) > 0.3,
+            "test design degenerate: weighted and unweighted means nearly coincide"
+        );
+
+        let (_t_uw, base_uw, _c) =
+            dispatch_log_map(values.view(), "stiefel(k=1)", None, None).expect("unweighted chart");
+        let (_t_w, base_w, _c) =
+            dispatch_log_map(values.view(), "stiefel(k=1)", None, Some(weights.view()))
+                .expect("weighted chart");
+
+        // (a) Supplying weights must change the base point (before the fix the
+        // weighted chart origin was byte-identical to the unweighted one).
+        let moved = base_w
+            .iter()
+            .zip(base_uw.iter())
+            .any(|(w, u)| (w - u).abs() > 1e-9);
+        assert!(
+            moved,
+            "weighted base point is identical to the unweighted one: weights ignored"
+        );
+
+        // (b) The weighted base point must be closer to the WEIGHTED Fréchet
+        // mean than to the unweighted one.
+        let d_to_weighted = geodesic(base_w.view(), weighted_ref.view());
+        let d_to_unweighted = geodesic(base_w.view(), unweighted_ref.view());
+        assert!(
+            d_to_weighted < d_to_unweighted,
+            "weighted base point is nearer the unweighted mean ({d_to_unweighted}) \
+             than the weighted mean ({d_to_weighted})"
+        );
+        // And it should essentially coincide with the weighted mean.
+        assert!(
+            d_to_weighted < 1e-6,
+            "weighted base point is {d_to_weighted} from the weighted Fréchet mean"
         );
     }
 
