@@ -423,6 +423,60 @@ pub(crate) fn selected_regression_r2(
     }
 }
 
+/// Cross-fitted reconstruction explained variance — the honest, optimism-free
+/// companion to the in-sample reconstruction EV the SAE headline reports.
+///
+/// Discovers the top-`q` linear reconstruction subspace on each fold-complement
+/// and scores its EV on the held-out fold, aggregating across folds (see
+/// [`cross_fit_scalar`]). The returned [`CrossFitReport`] carries the naive
+/// (all-rows discover + score) EV, the cross-fit aggregate, and their difference
+/// — the post-selection optimism. This is the reconstruction analog of a linear
+/// dictionary; a curved/gated SAE plugs into [`cross_fit_scalar`] the same way by
+/// supplying its own discover/score closures.
+pub fn cross_fit_reconstruction_ev(
+    data: ArrayView2<'_, f64>,
+    config: CrossFitConfig,
+    q: usize,
+) -> Result<CrossFitReport, String> {
+    let n = data.nrows();
+    cross_fit_scalar(
+        n,
+        config,
+        |train| fit_subspace(data, train, q),
+        |(mean, basis), test| subspace_reconstruction_ev(data, test, mean.view(), basis.view()),
+    )
+}
+
+/// Cross-fitted `R²` of a selected-feature linear forecast — the honest
+/// companion to the in-sample forecast fit (the dose-forecast headline's
+/// analog), which is exposed to post-SELECTION optimism because the predictor
+/// columns are themselves chosen from the data.
+///
+/// Selects and fits on each fold-complement, scores held-out `R²`, aggregates.
+/// The naive/cross-fit/optimism split in the returned [`CrossFitReport`] is the
+/// direct, reportable measure of how much the naive in-sample forecast overstates
+/// generalization.
+pub fn cross_fit_selected_forecast_r2(
+    x: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    config: CrossFitConfig,
+    q: usize,
+) -> Result<CrossFitReport, String> {
+    let n = x.nrows();
+    if y.len() != n {
+        return Err(format!(
+            "cross_fit_selected_forecast_r2: x has {n} rows but y has {}",
+            y.len()
+        ));
+    }
+    cross_fit_scalar(
+        n,
+        config,
+        |train| fit_selected_regression(x, y, train, q),
+        |fit, test| selected_regression_r2(x, y, test, fit),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
