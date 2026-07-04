@@ -1656,6 +1656,24 @@ impl SaeManifoldOuterObjective {
             // turns atoms on (or ships best-so-far) rather than aborting the whole fit
             // with "no candidate seeds passed outer startup validation".
             || err.contains("gated off at every row (all-zero gated design)")
+            // #2089 — a ρ whose smoothing / sparsity penalty is strong enough to
+            // crush the WHOLE dictionary to the signal-free null floor (every
+            // decoder co-vanishes and the bounded co-collapse reseed multi-start
+            // cannot re-anchor `K` distinct charts) is a GENUINE INFEASIBILITY OF
+            // THAT ρ — the same class as the non-PD Hessian / all-zero gated-design
+            // probes above. A neighbouring, weaker-penalty ρ admits a non-degenerate
+            // fit, so the outer optimizer must read this as the finite collapse wall
+            // (+∞) and steer ρ back toward the feasible region — or ship best-so-far —
+            // NOT abort the entire alpha="auto" search the first time a line search
+            // overshoots into a co-collapsing ρ. Aborting there fails fits that have a
+            // perfectly good feasible ρ the search had not yet reached; and letting
+            // the reseed multi-start GRIND at every such probe (the pre-guard
+            // behaviour) is exactly what thrashed the host to an OOM / watchdog
+            // SIGKILL (exit 137). `run_joint_fit_arrow_schur` emits this DISTINCT
+            // "did not escape total co-collapse" marker only after the reseed budget
+            // is spent AND the fit is still at/below the null floor, so a healthy or
+            // merely-uncompetitive fit never trips it.
+            || err.contains("did not escape total co-collapse")
     }
 
     /// Shared cost path: evaluate the REML criterion at `rho_flat`, updating

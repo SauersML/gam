@@ -2494,6 +2494,58 @@ impl SaeManifoldTerm {
             // descent starts from, without breaking the reseed-improves-EV contract.
             self.anchor_logits_to_residual_ownership(target)?;
             self.refit_decoder_sequential_deflation(target, rho)?;
+            // #2089 — enforce the #1026 keep-best contract on the STATE between
+            // reseeds, not only at budget exhaustion. A reseed refit at the
+            // near-singular co-collapsed Gram can return a huge-norm decoder
+            // least-squares solution whose reconstruction EV plunges catastrophically
+            // below the incumbent (observed −0.0004 → −2.33 → −625 across successive
+            // reseeds on a tiny circle fit over featureless input). If that blown-up
+            // state is allowed to PERSIST it becomes the base the NEXT multi-start
+            // reseed computes its residual from, so `residual = target − (huge fit)`
+            // grows geometrically and the "residual ≈ target" invariant every reseed
+            // relies on (see the reseed rationale above) is violated — the bounded
+            // multi-start degenerates into a runaway whose blown-up decoders also
+            // corrupt the outer REML evidence, and the host process is SIGKILLed
+            // (OOM / watchdog, exit 137) before any model or error is returned.
+            //
+            // A reseed is therefore RETAINED only when it is the new best basin under
+            // the SAME EV-then-uniformity ordering used to bank the incumbent
+            // ([`prefer_candidate_basin`]); otherwise restore the incumbent so the
+            // next distinct-subspace retry (a fresh `pc_pair_offset`) reads the clean
+            // degenerate residual rather than a spiralling one. This never blocks a
+            // genuine basin break — an improving reseed clears the guard and is kept,
+            // exactly as the #2027 disjoint-signal fixtures require — and it is inert
+            // on any fit that never co-collapses (this whole arm is gated on
+            // `ev_degenerate`). The reseed budget is still consumed on every attempt,
+            // so the multi-start terminates as designed; the numerics simply can no
+            // longer spiral into a non-finite / catastrophic-negative EV.
+            let revert_to_incumbent = if let Some((incumbent_ev, incumbent_uniformity, _)) =
+                self.best_cocollapse_incumbent.as_ref()
+            {
+                let incumbent_ev = *incumbent_ev;
+                let incumbent_uniformity = *incumbent_uniformity;
+                let reseeded_ev = self.dictionary_reconstruction_ev(target, rho)?;
+                let reseeded_uniformity = self.coordinate_uniformity_aggregate();
+                !prefer_candidate_basin(
+                    reseeded_ev,
+                    reseeded_uniformity,
+                    incumbent_ev,
+                    incumbent_uniformity,
+                    SAE_FINAL_EV_DEGRADATION_TOL,
+                )
+            } else {
+                false
+            };
+            if revert_to_incumbent {
+                // `take` releases the shared borrow of `best_cocollapse_incumbent` so
+                // the mutable restore can run, then the incumbent is banked again for
+                // the budget-exhaustion arm and any later reseed.
+                let incumbent = self.best_cocollapse_incumbent.take();
+                if let Some((_, _, ref state)) = incumbent {
+                    self.restore_mutable_state(state);
+                }
+                self.best_cocollapse_incumbent = incumbent;
+            }
             return Ok(());
         }
         // Decide which breached atoms still have reseed budget (recording a
@@ -5063,6 +5115,28 @@ impl SaeManifoldTerm {
                 for j in 0..border_dim {
                     gb_acc[j] += sys.gb[j];
                 }
+                if n_total <= 40 {
+                    let rep = chunk
+                        .decoder_repulsion_gate
+                        .as_ref()
+                        .map(|g| g.len())
+                        .unwrap_or(0);
+                    let bar = chunk
+                        .barrier_coactivation_gate
+                        .as_ref()
+                        .map(|g| g.len())
+                        .unwrap_or(0);
+                    let gbnorm: f64 = sys.gb.iter().map(|v| v * v).sum::<f64>().sqrt();
+                    let smooth_is_raw = chunk.atoms.iter().all(|a| {
+                        a.smooth_penalty
+                            .iter()
+                            .zip(a.smooth_penalty_raw.iter())
+                            .all(|(x, y)| (x - y).abs() < 1e-15)
+                    });
+                    eprintln!(
+                        "[DIAG cs={chunk_size} range=({start},{end})] rep_gate={rep} bar_gate={bar} gbnorm={gbnorm:.6e} smooth_raw={smooth_is_raw}"
+                    );
+                }
                 Self::accumulate_chunk_reduced_schur(
                     &sys,
                     ridge_ext_coord,
@@ -5088,6 +5162,14 @@ impl SaeManifoldTerm {
                 solve_streaming_reduced_beta(&s_acc, &rhs_acc, &options).map_err(|err| {
                     format!("SaeManifoldTerm::run_joint_fit_arrow_schur_streaming: {err}")
                 })?;
+            if n_total <= 40 {
+                let strace: f64 = (0..border_dim).map(|j| s_acc[[j, j]]).sum();
+                let rhsn: f64 = rhs_acc.iter().map(|v| v * v).sum::<f64>().sqrt();
+                let dbn: f64 = delta_beta.iter().map(|v| v * v).sum::<f64>().sqrt();
+                eprintln!(
+                    "[DIAG-ITER cs={chunk_size}] s_trace={strace:.8e} rhs_norm={rhsn:.8e} delta_beta_norm={dbn:.8e}"
+                );
+            }
             // ── Streaming Armijo line search on Δβ. ──
             // The directional decrease uses the *reduced* β gradient
             // `g_reduced = −rhs_acc`, the true gradient of the β-marginal
