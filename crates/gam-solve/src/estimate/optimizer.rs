@@ -2,6 +2,85 @@ use super::*;
 use gam_problem::dispersion_cov::se_from_covariance;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Max-abs entry of `H·H⁻¹ − I` — a scale-free trustworthiness probe for a
+/// computed inverse. It is `≈ κ(H)·ε` for a faithful inverse but blows up to
+/// `O(δ/σ_min)` when [`matrix_inversewith_regularization`] had to add a large
+/// stabilization ridge `δ` (an ill-conditioned Hessian, e.g. a smoothing
+/// parameter saturated at the ρ rail). That ridge is a `NumericalPerturbation`
+/// the covariance callers treat as absent, yet it uniformly inflates `H` and so
+/// shrinks EVERY posterior variance — collapsing the reported standard errors
+/// (#2123: a `te(x,z)` fit that lands on the ρ₁ rail read ΣSE≈0.16 vs the
+/// correct ≈13). This probe detects that regime so the covariance can fall back
+/// to a ridge-free spectral inverse.
+fn inverse_identity_defect(h: &Array2<f64>, h_inv: &Array2<f64>) -> f64 {
+    let p = h.nrows();
+    let prod = h.dot(h_inv);
+    let mut worst = 0.0_f64;
+    for i in 0..p {
+        for j in 0..p {
+            let target = if i == j { 1.0 } else { 0.0 };
+            worst = worst.max((prod[[i, j]] - target).abs());
+        }
+    }
+    worst
+}
+
+/// Ridge-free symmetric (pseudo-)inverse from the eigendecomposition:
+/// `H⁻¹ = Σ_i (1/σ_i) u_i u_iᵀ`, inverting only eigenvalues above a relative
+/// floor `σ_max·rel_floor` (numerical nulls contribute nothing). Unlike an
+/// additive-ridge inverse this leaves the well-determined directions' variances
+/// intact while heavily-penalized directions collapse to ~0 variance on their
+/// own — the correct posterior covariance at any conditioning. Returns `None`
+/// if the eigendecomposition fails or the spectrum is degenerate.
+fn spectral_symmetric_inverse(h: &Array2<f64>) -> Option<Array2<f64>> {
+    let (evals, evecs) = h.eigh(Side::Lower).ok()?;
+    let p = h.nrows();
+    let max_ev = evals.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
+    if !(max_ev > 0.0) {
+        return None;
+    }
+    // Only genuine numerical nulls (≈0 relative to the top eigenvalue) are
+    // dropped; the smallest data-supported eigenvalue of a penalized Hessian is
+    // O(n)≫floor, so its variance is retained exactly.
+    let floor = max_ev * 1e-14;
+    let mut scaled = evecs.clone();
+    for j in 0..p {
+        let inv_ev = if evals[j] > floor { 1.0 / evals[j] } else { 0.0 };
+        for i in 0..p {
+            scaled[[i, j]] *= inv_ev;
+        }
+    }
+    let inv = scaled.dot(&evecs.t());
+    inv.iter().all(|v| v.is_finite()).then_some(inv)
+}
+
+/// Posterior covariance inverse `H⁻¹` that stays faithful when `H` is
+/// ill-conditioned. Uses the fast regularized-Cholesky inverse whenever it is
+/// trustworthy (the common well-conditioned case — bit-identical to before),
+/// and falls back to the ridge-free [`spectral_symmetric_inverse`] only when the
+/// stabilization ridge materially perturbed the result, which is exactly when it
+/// would otherwise collapse the SEs (#2123 ρ-rail).
+fn posterior_covariance_inverse(h: &Array2<f64>, label: &str) -> Option<Array2<f64>> {
+    let regularized = matrix_inversewith_regularization(h, label);
+    if let Some(ref inv) = regularized
+        && inverse_identity_defect(h, inv) <= 1e-6
+    {
+        return regularized;
+    }
+    // The regularized inverse was materially perturbed by its ridge (or failed);
+    // recompute a spectral inverse that does not ridge the well-determined block.
+    match spectral_symmetric_inverse(h) {
+        Some(spectral) => {
+            log::debug!(
+                "[cov#2123] posterior covariance: regularized inverse untrustworthy \
+                 (ill-conditioned Hessian, likely a saturated ρ); using ridge-free spectral inverse"
+            );
+            Some(spectral)
+        }
+        None => regularized,
+    }
+}
+
 /// Optimize smoothing parameters for an external design using the same REML/LAML machinery.
 pub fn optimize_external_design<X>(
     y: ArrayView1<'_, f64>,
@@ -2859,7 +2938,7 @@ where
 
         // Attempt the full inverse when the model is small enough.
         let beta_covariance_unscaled: Option<Array2<f64>> = if p_cov <= COV_FULL_INVERSE_MAX_P {
-            match matrix_inversewith_regularization(&penalized_hessian, "posterior covariance") {
+            match posterior_covariance_inverse(&penalized_hessian, "posterior covariance") {
                 Some(h_inv) => Some(h_inv),
                 None => {
                     log::warn!(
