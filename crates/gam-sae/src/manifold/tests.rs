@@ -1074,8 +1074,10 @@ pub(crate) fn scad_no_origin_pinning_occupancy_on_circle() {
         with_scad - without
     };
 
-    // Occupancy-wise opposite configurations.
-    let spread = array![[0.05_f64], [0.25], [0.5], [0.75], [0.95]];
+    // Occupancy-wise opposite configurations. `spread` is 5 EVENLY spaced
+    // angles (0.1..0.9 by 0.2 ⇒ 72° apart), so its mean-resultant length is ≈0
+    // (near-uniform occupancy); `collapsed` piles every row at the origin (R≈1).
+    let spread = array![[0.1_f64], [0.3], [0.5], [0.7], [0.9]];
     let collapsed = array![[0.0_f64], [0.001], [0.0], [0.002], [0.001]];
     assert!(
         resultant_length(&spread) < 0.1,

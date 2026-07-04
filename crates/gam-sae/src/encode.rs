@@ -904,6 +904,16 @@ pub(crate) fn family_jet_sups(
                 "EncodeAtlas: precomputed basis '{name}' has no closed-form jet sup; route to exact encode"
             ));
         }
+        // A finite-set (indicator) atom is piecewise constant — it has no
+        // continuous jet to bound, so there is no Kantorovich chart; route to the
+        // exact encode like any other non-differentiable basis.
+        FiniteSet => {
+            return Err(
+                "EncodeAtlas: finite-set (indicator) basis has no closed-form jet sup; \
+                 route to exact encode"
+                    .to_string(),
+            );
+        }
     };
     Ok(sups)
 }
@@ -3390,10 +3400,11 @@ pub(crate) fn chart_center_grid(atom: &SaeManifoldAtom, resolution: usize) -> Ar
         Cylinder if d == 2 => cylinder_chart_center_grid(resolution),
         Cylinder => regular_product_grid(d, resolution, -0.5, 0.5, true),
         Sphere if d == 2 => sphere_latlon_grid(resolution),
-        Linear | Sphere | Duchon | EuclideanPatch | Poincare | Precomputed(_) => {
-            // Unbounded / non-compact latents: a strided cover of a unit box
-            // about the origin per axis. The certified radius refines each chart;
-            // out-of-cover starts route to the exact fallback honestly.
+        Linear | Sphere | Duchon | EuclideanPatch | Poincare | Precomputed(_) | FiniteSet => {
+            // Unbounded / non-compact latents (and the finite-set index axis): a
+            // strided cover of a unit box about the origin per axis. The certified
+            // radius refines each chart; out-of-cover starts route to the exact
+            // fallback honestly.
             regular_product_grid(d, resolution, -0.5, 0.5, true)
         }
     }

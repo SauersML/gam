@@ -44,7 +44,36 @@ pub enum SaeAtomBasisKind {
     /// feature density grows toward the ball boundary (exponential-volume /
     /// tree-leaf hierarchy) the regime where it differs from the flat patch.
     Poincare,
+    /// A FINITE-SET (discrete anchor) atom (F2): the latent `t` is CATEGORICAL —
+    /// each sample is assigned to one of a finite set of anchors — and the basis
+    /// is the indicator/one-hot design over those anchors
+    /// ([`crate::basis::AnchorIndicatorEvaluator`]). Unlike every other kind here,
+    /// which is a continuous manifold, this is a discrete measure: the honest
+    /// model for cluster-like structure (weekdays as 7 points with cyclic
+    /// adjacency, not an occupied circle). Its rank charge is `anchors − 1` (the
+    /// categorical `t` has `anchors − 1` independent contrasts, one anchor being
+    /// the reference) — see [`finite_set_rank_charge`]. The anchor count is carried
+    /// by the evaluator (as harmonics/degree are for the periodic/patch kinds), so
+    /// this stays a unit variant.
+    ///
+    /// PLANNED COMPLETION / OPT-IN: the topology race does NOT enrol this candidate
+    /// by default (see [`crate::structure_harvest::finite_set_race_enrolled`]); the
+    /// enum arm + evaluator land as inert scaffolding so unenrolled code cannot
+    /// affect any birth, and the enrolment flag flips only after full-suite +
+    /// real-data (weekday) verification. First-class integration into the
+    /// continuous-latent optimizer is the remaining follow-up.
+    FiniteSet,
     Precomputed(String),
+}
+
+/// The rank charge (effective latent dimension) of a finite-set atom with
+/// `anchors` anchors: `anchors − 1`. A categorical coordinate over `k` anchors has
+/// `k − 1` independent contrasts (one anchor is the reference level), so that — not
+/// `k`, and not a continuous manifold's intrinsic `d` — is what the race must
+/// charge the finite-set alternative. Returns `0` for the degenerate `anchors ≤ 1`
+/// (a single anchor is the constant, no contrasts).
+pub fn finite_set_rank_charge(anchors: usize) -> usize {
+    anchors.saturating_sub(1)
 }
 
 impl SaeAtomBasisKind {
@@ -115,10 +144,15 @@ impl SaeAtomBasisKind {
             // ball origin, optimised in the unconstrained tangent chart (the
             // hyperbolic geometry enters through the penalty, not a constrained
             // retraction), so it shares the Euclidean latent manifold.
+            // A finite-set atom's categorical assignment is carried as a flat
+            // (Euclidean) coordinate: the anchor index. The discreteness lives in
+            // the indicator basis, not the latent manifold, so the retraction is
+            // the trivial Euclidean one.
             Self::Linear
             | Self::Duchon
             | Self::EuclideanPatch
             | Self::Poincare
+            | Self::FiniteSet
             | Self::Precomputed(_) => LatentManifold::Euclidean,
         }
     }
@@ -147,10 +181,14 @@ impl SaeAtomBasisKind {
             // The tangent latent of a Poincaré patch lies in the convex hull of
             // its PCA seed exactly like the Euclidean patch, so no compact
             // projection grid is needed.
+            // A finite-set atom has no compact continuous latent to sweep for
+            // fixed-decoder projection — its assignment is categorical, recovered
+            // by nearest-anchor, not a projection grid.
             Self::Linear
             | Self::Duchon
             | Self::EuclideanPatch
             | Self::Poincare
+            | Self::FiniteSet
             | Self::Precomputed(_) => None,
         }
     }

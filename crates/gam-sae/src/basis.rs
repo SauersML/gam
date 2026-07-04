@@ -2166,3 +2166,84 @@ impl SaeBasisSecondJet for SubspaceReducedEvaluator {
             .map_err(|err| format!("SubspaceReducedEvaluator: second jet dim: {err}"))
     }
 }
+
+/// F2 finite-set (discrete anchor) basis: the INDICATOR / one-hot design over a
+/// fixed set of `anchors` anchors. The latent coordinate `t` (a single flat axis)
+/// is read as a categorical assignment — `t` is snapped to its nearest anchor
+/// index `round(t)` clamped to `[0, anchors)` — and the design row is the one-hot
+/// vector selecting that anchor. This is the honest model for cluster-like
+/// structure (weekdays as a finite point set, not an occupied circle): unlike
+/// every continuous evaluator here, the decoded map is piecewise CONSTANT in `t`,
+/// so its first, second, and third jets are identically zero (the derivative of a
+/// step is zero a.e.; the anchor assignment moves by re-labelling, not by a
+/// tangent step). The design width equals `anchors`; the rank charge the race
+/// prices is `anchors − 1` ([`crate::manifold::finite_set_rank_charge`]), one
+/// anchor being the reference contrast.
+#[derive(Debug, Clone)]
+pub struct AnchorIndicatorEvaluator {
+    pub anchors: usize,
+}
+
+impl AnchorIndicatorEvaluator {
+    pub fn new(anchors: usize) -> Result<Self, String> {
+        if anchors < 2 {
+            return Err(format!(
+                "AnchorIndicatorEvaluator requires anchors >= 2 (a finite set of at \
+                 least two points); got {anchors}"
+            ));
+        }
+        Ok(Self { anchors })
+    }
+}
+
+impl SaeBasisEvaluator for AnchorIndicatorEvaluator {
+    fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
+        Some(<Self as SaeBasisSecondJet>::second_jet(self, coords))
+    }
+
+    fn third_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array5<f64>, String>> {
+        // The indicator design is piecewise constant, so every jet order is zero.
+        let n = coords.nrows();
+        Some(Ok(Array5::<f64>::zeros((n, self.anchors, 1, 1, 1))))
+    }
+
+    fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String> {
+        let n = coords.nrows();
+        let d = coords.ncols();
+        if d != 1 {
+            return Err(format!(
+                "AnchorIndicatorEvaluator: expected latent_dim == 1 (a single \
+                 categorical axis), got {d}"
+            ));
+        }
+        let m = self.anchors;
+        let mut phi = Array2::<f64>::zeros((n, m));
+        // The jet is identically zero: a one-hot indicator is constant between
+        // anchors, so ∂Φ/∂t = 0 a.e.
+        let jet = Array3::<f64>::zeros((n, m, 1));
+        for row in 0..n {
+            let t = coords[[row, 0]];
+            if !t.is_finite() {
+                return Err("AnchorIndicatorEvaluator: non-finite coordinate".to_string());
+            }
+            // Snap to the nearest anchor index, clamped into range.
+            let idx = t.round().clamp(0.0, (m - 1) as f64) as usize;
+            phi[[row, idx]] = 1.0;
+        }
+        Ok((phi, jet))
+    }
+}
+
+impl SaeBasisSecondJet for AnchorIndicatorEvaluator {
+    fn second_jet(&self, coords: ArrayView2<'_, f64>) -> Result<Array4<f64>, String> {
+        let n = coords.nrows();
+        Ok(Array4::<f64>::zeros((n, self.anchors, 1, 1)))
+    }
+}
+
+impl SaeBasisThirdJet for AnchorIndicatorEvaluator {
+    fn third_jet(&self, coords: ArrayView2<'_, f64>) -> Result<Array5<f64>, String> {
+        let n = coords.nrows();
+        Ok(Array5::<f64>::zeros((n, self.anchors, 1, 1, 1)))
+    }
+}
