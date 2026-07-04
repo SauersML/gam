@@ -6105,7 +6105,8 @@ impl SaeManifoldTerm {
         // it the streaming criterion would silently drop the entire cross-row
         // coupling and disagree with the dense path by exactly `log|C|`.
         if let (Some(m0), Some(w), Some(d)) = (wood_m0, wood_w, wood_d) {
-            let correction = streaming_cross_row_woodbury_log_det(&schur_acc, &m0, &w, &d)
+            let correction =
+                streaming_cross_row_woodbury_log_det(&schur_acc, &m0, &w, &d, options.schur_pd_floor)
                 .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}"))?
                 .ok_or_else(|| {
                     "SaeManifoldTerm::reml_criterion: cross-row IBP joint Hessian is non-PD at \
