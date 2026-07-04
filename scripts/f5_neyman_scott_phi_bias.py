@@ -103,31 +103,46 @@ def _row_sqdist(y: np.ndarray, a: float) -> np.ndarray:
     return np.einsum("ngp,ngp->ng", diff, diff)
 
 
+# The ARD coordinate prior the engine actually applies on a Circle axis is the
+# von-Mises energy V(θ) = (α/κ²)(1 − cos κθ), κ = 2π/period (ard_value in
+# construction.rs). With the latent period = 2π on our grid, κ = 1 ⇒ V = α(1−cosθ).
+# The MAP must be PENALIZED by this (the joint Newton objective includes it), or
+# the coordinate over-fits and edf = H/(H+α) is inconsistent with the estimate.
+_VPRIOR = None  # α(1−cosθ) on the grid, filled per-α (cheap, α is fixed per run)
+
+
+def _vprior(alpha: float) -> np.ndarray:
+    return alpha * (1.0 - np.cos(_GRID))
+
+
+def _penalized_objective(sq: np.ndarray, phi: float, alpha: float) -> np.ndarray:
+    """J(θ) = ‖y−f(θ)‖²/(2φ) + V(θ) on the grid, shape (n, G). The MAP/basins are
+    the minima of THIS penalized objective, matching the engine's Newton solve."""
+    return sq / (2.0 * max(phi, 1e-300)) + _vprior(alpha)[None, :]
+
+
 def phi_hat_per_row_laplace(y: np.ndarray, a: float, alpha: float) -> dict:
-    """φ̂ via MAP coordinate + single-basin per-row Laplace `coord_edf`.
+    """φ̂ via PENALIZED MAP coordinate + single-basin per-row Laplace `coord_edf`.
 
     Mirrors reconstruction_dispersion for a known decoder (beta_edf = 0):
-      * MAP θ̂_n = argmin_θ ‖y_n − f(θ)‖²  (collapses to one basin);
-      * per-row Laplace curvature  H_n = f'(θ̂_n)ᵀf'(θ̂_n) / φ  (single well);
-      * ARD-shrunk dof  edf_n = 1 − α·Var_n = 1 − α/(H_n + α) = H_n/(H_n+α),
-        Var_n = (H_n + α)⁻¹ the `ard_inverse_traces` posterior variance;
-      * φ̂ = RSS_MAP / (N·p − Σ edf_n),  solved as the fixed point in φ (the
-        Fisher curvature scales like 1/φ, exactly as `H_tt` does in the engine).
+      * penalized MAP θ̂_n = argmin_θ [‖y_n−f(θ)‖²/(2φ) + V(θ)]  (one basin);
+      * Laplace curvature  H_n = f'(θ̂_n)ᵀf'(θ̂_n)/φ  (Gauss–Newton, single well);
+      * ARD-shrunk dof  edf_n = H_n/(H_n+α) = 1 − α·Var_n, Var_n=(H_n+α)⁻¹ the
+        `ard_inverse_traces` posterior variance;
+      * RSS = Σ_n ‖y_n−f(θ̂_n)‖²  (= 2·loss.data_fit, DATA-fit only);
+      * φ̂ = RSS/(N·p − Σ edf_n), fixed point in φ (H and θ̂ both depend on φ).
     """
     n = y.shape[0]
-    sq = _row_sqdist(y, a)                    # (n, G)
-    idx = np.argmin(sq, axis=1)               # MAP basin per row
-    theta_hat = _GRID[idx]
-    rss = float(sq[np.arange(n), idx].sum())
-    g = f_prime(theta_hat, a)                 # (n, p)
-    grad_sq = np.einsum("np,np->n", g, g)     # f'ᵀf' per row (= φ·H_n)
-
-    phi = rss / (n * _P)
-    coord_edf = 0.0
+    sq = _row_sqdist(y, a)                     # (n, G)
+    phi = float(sq.min(axis=1).mean()) / _P + 1e-9
+    coord_edf, rss = 0.0, 0.0
     for _ in range(200):
-        h = grad_sq / max(phi, 1e-300)        # H_n = f'ᵀf' / φ
-        var = 1.0 / (h + alpha)               # ard_inverse_trace per row
-        coord_edf = float((1.0 - alpha * var).clip(0.0, 1.0).sum())
+        idx = np.argmin(_penalized_objective(sq, phi, alpha), axis=1)
+        rss = float(sq[np.arange(n), idx].sum())
+        g = f_prime(_GRID[idx], a)
+        grad_sq = np.einsum("np,np->n", g, g)
+        h = grad_sq / max(phi, 1e-300)
+        coord_edf = float((h / (h + alpha)).sum())
         resid_dof = max(n * _P - coord_edf, 1.0)
         new = rss / resid_dof
         if abs(new - phi) < 1e-12 * max(1.0, phi):
@@ -179,35 +194,34 @@ def phi_hat_basin_marginal(y: np.ndarray, a: float, alpha: float) -> dict:
     """
     n = y.shape[0]
     sq = _row_sqdist(y, a)
-    idx_map = np.argmin(sq, axis=1)
-    rss = float(sq[np.arange(n), idx_map].sum())
     fg = f_map(_GRID, a)                          # (G, p)
     gg = f_prime(_GRID, a)
     grad_sq_grid = np.einsum("gp,gp->g", gg, gg)  # f'ᵀf' on the grid
+    vprior = _vprior(alpha)                       # V(θ) on the grid
 
-    # Per-row basin lists (indices into the grid), precomputed once.
-    basins = [_enumerate_basins(sq[r]) for r in range(n)]
-
-    phi = rss / (n * _P)
-    coord_edf = 0.0
+    phi = float(sq.min(axis=1).mean()) / _P + 1e-9
+    coord_edf, rss = 0.0, 0.0
     for _ in range(200):
+        # PENALIZED objective drives MAP, basins, and evidence weights.
+        obj = sq / (2.0 * max(phi, 1e-300)) + vprior[None, :]
+        idx_map = np.argmin(obj, axis=1)
+        rss = float(sq[np.arange(n), idx_map].sum())
         total = 0.0
         for r in range(n):
-            bi = basins[r]
-            d = sq[r, bi]                          # ‖y−f_b‖² per basin
-            gsq = grad_sq_grid[bi]                 # f'ᵀf' per basin
+            bi = _enumerate_basins(obj[r])         # minima of the PENALIZED obj
+            gsq = grad_sq_grid[bi]
             h = gsq / max(phi, 1e-300)             # H_b
             edf_b = h / (h + alpha)                # within-basin shrink dof
-            # Laplace log-evidence per basin (shared additive consts cancel in w).
-            logz = -0.5 * d / max(phi, 1e-300) - 0.5 * np.log(h + alpha)
+            # Per-basin Laplace log-evidence = −J(θ_b) − ½·log(H_b+α) (the penalty
+            # V is already inside J = obj); shared consts cancel in the softmax.
+            logz = -obj[r, bi] - 0.5 * np.log(h + alpha)
             logz -= logz.max()
             w = np.exp(logz)
             w /= w.sum()
             fb = fg[bi]                            # (B, p) basin predictions
-            fbar = (w[:, None] * fb).sum(axis=0)   # weighted mean prediction
+            fbar = (w[:, None] * fb).sum(axis=0)
             between = float((w * np.einsum("bp,bp->b", fb - fbar, fb - fbar)).sum())
-            edf_n = float((w * edf_b).sum()) + between / max(phi, 1e-300)
-            total += min(edf_n, 1.0 + len(bi))     # generous per-row cap (safety)
+            total += float((w * edf_b).sum()) + between / max(phi, 1e-300)
         coord_edf = total
         resid_dof = max(n * _P - coord_edf, 1.0)
         new = rss / resid_dof
