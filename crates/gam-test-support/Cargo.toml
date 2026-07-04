@@ -1,6 +1,6 @@
 [package]
 name = "gam-test-support"
-version = "0.3.146"
+version = "0.3.147"
 edition = "2024"
 rust-version = "1.93"
 description = "Shared test-support helpers (FD harness, fixtures, reference-tool + CLI harnesses) for the gam workspace"
@@ -11,10 +11,10 @@ repository = "https://github.com/SauersML/gam"
 path = "src/lib.rs"
 
 [dependencies]
-gam-linalg = { path = "../gam-linalg", version = "=0.3.146" }
-gam-models = { path = "../gam-models", version = "=0.3.146" }
-gam-problem = { path = "../gam-problem", version = "=0.3.146" }
-gam-terms = { path = "../gam-terms", version = "=0.3.146" }
+gam-linalg = { path = "../gam-linalg", version = "=0.3.147" }
+gam-models = { path = "../gam-models", version = "=0.3.147" }
+gam-problem = { path = "../gam-problem", version = "=0.3.147" }
+gam-terms = { path = "../gam-terms", version = "=0.3.147" }
 csv = "1.4.0"
 faer = "0.24.0"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }

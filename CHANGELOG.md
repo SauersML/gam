@@ -1,3 +1,109 @@
+## v0.3.147 — gam 0.3.147 / gamfit 0.1.249 (2026-07-04)
+
+A broad correctness release cut from ~130 root-cause fixes on top of 0.3.146.
+The user-facing themes: **honest predictions and intervals** (`gam predict
+--uncertainty` no longer moves the point estimate; partial-dependence and
+survival/GAMLSS standard errors are sourced from the smoothing-corrected
+covariance and honest per-block EDF), **stricter, more truthful encoding**
+(unseen levels of a fixed categorical factor now raise instead of being silently
+averaged; `loglog`/`cauchit` are accepted as binomial links), **scale- and
+gauge-invariant convergence** across the REML/PIRLS and custom-family/AFT
+solvers, and **better basis behaviour** (measure-jet gap extrapolation, radial /
+thin-plate center-count floors, a new closed-form fidelity-metrics surface). A
+large batch of work also landed on the experimental, default-off SAE
+latent-manifold engine.
+
+### Predictions, intervals & inference
+- **`gam predict --uncertainty` never shifts the point (#2115).** The
+  linear/identity uncertainty arm passed `apply_bias_correction: true`,
+  recentring η by `X·H⁻¹S(λ̂)β̂` — so requesting an interval silently moved the
+  reported `mean`/`linear_predictor` (~2.5%) relative to plain `gam predict` and
+  the Python FFI. The arm is now pinned to the plain plug-in point; `--uncertainty`
+  only appends the SE/band columns. Guarded by a new identity-link regression test
+  (companion to the curved-link #1787 guard), the `--no-bias-correction` help text
+  is corrected, and the flag still gates the survival uncertainty paths.
+- **`partial_dependence` SE uses the smoothing-corrected covariance (#2113).**
+  The band now propagates smoothing-parameter uncertainty (the mgcv
+  `predict(se.fit=TRUE)` analog) instead of the raw plug-in covariance.
+- **Unseen fixed-factor levels raise instead of averaging (#2102).** A bare
+  categorical main effect (`+ g`) is auto-promoted to a penalized random block
+  internally, but is a FIXED parametric factor: an out-of-vocabulary level now
+  hits the strict schema encode and raises `SchemaMismatchError` (and is reported
+  by `Model.check`) rather than being mapped to the factor's centering point.
+  Explicit random effects (`group(g)`/`re(g)`/`s(g, bs="re")`) stay lenient
+  (held-out group → population mean). A serde-defaulted `lenient_unseen` flag
+  keeps old saved models loadable.
+- **`loglog` and `cauchit` accepted as binomial links (#2104).** Both now pass
+  `link_legal_for_family` for the binomial family.
+- **Survival location-scale EDF is honest (#2106).** The summary reported the
+  nominal coefficient count as `edf_total`; it now threads the inner blockwise
+  solver's real per-penalty traces so `edf = ncoef − Σ tr(H⁻¹S)` per block.
+
+### Solvers: scale- and gauge-invariant convergence
+- **Scale-aware reduced parametric-AFT convergence (#2112).** The MLE Newton
+  loop replaced an absolute tolerance on the O(n) summed gradient with the
+  affine-invariant Newton decrement `½·gᵀH⁻¹g`, so convergence no longer depends
+  on sample size or weight scale; a principled stalled-line-search acceptance
+  still errors on genuine curvature failure.
+- **Coupled custom-family joint gradients (#2108, #1820).** `GaussianLocationScaleFamily`
+  gets an exact joint gradient from the same score that feeds its Hessian (with
+  the block-Hessian finiteness guard preserved), and the coupled custom-family
+  LAML gradient is pinned at joint stationarity.
+- **REML gauge-invariant KKT gate (#752/#901)** and a **near-minimal PD
+  stabilizing shift** for the coupled Newton step (so it stops over-damping),
+  plus **n-independent κ outer-loop cost probes (#1868)** and a memoized
+  seed-grid basin search (#1575).
+- **`response-geometry` parametric-only RHS (#2103)** is fit via a direct
+  shared-tangent least-squares path instead of forcing REML, and
+  **`ResponseGeometryModel` round-trips through save/load (#2114)**.
+
+### Bases & terms
+- **Measure-jet gap extrapolation (#1845).** An unpenalized ambient-affine head
+  is appended to the measure-jet design so the fit carries the flank-attested
+  trend across an unsupported training gap instead of collapsing to the training
+  mean. (Interval-coverage calibration of this experimental `mjs()` basis on
+  sharply kinked truths remains a known rough edge.)
+- **Center-count floors.** 1-D radial default centers are floored at the
+  univariate spline resolution (#1867); thin-plate center counts are floored at
+  `M(d)` (not inflated by `k+M(d)`) and never inflated past the row count in high
+  dimension; the `circle_regime` ring fit is unbiased (Kåsa) so S¹ wins on
+  continuous data (#1849).
+- **Public basis exports:** `matern_basis` and `sphere_basis_jet` are reachable
+  from the public API / `gamfit` namespace (#2120).
+- **CLI Duchon operator-penalty gating (#2116)** is applied on the standard-fit
+  path, and the **GPU arrow-border DenseDirect policy** is gated on full rank
+  (compares k³ Cholesky, not assembly, against the CG solve).
+
+### Python (`gamfit`)
+- **Fidelity metrics.** A new closed-form metrics core (loss-recovered / R² /
+  categorical KL / distortion-floor R²) lands in `gam-math` with a Rust+numpy
+  parity surface exposed through `gamfit`.
+- **`ResponseGeometryModel` save/load** and a **real out-of-sample
+  `transform`/`encode` for `StagewiseSAE` (#2118)** that lifts frozen composed
+  decoders into the OOS-capable manifold path.
+- **`layer_transport`** gains `chart_transfer_operator` / `certify_chart_transfer`.
+
+### SAE latent-manifold engine (experimental, default-off)
+- Honest, currency-based birth/demote gates: a rank-charge evidence criterion
+  (realised-rank BIC, default-off) ported to the streaming K≈32k path with a
+  derived Marchenko–Pastur rank floor (#5/#9/#11/#16); zero-realised-rank births
+  are vetoed; the hybrid split prices deviance, not raw SSE (#2124).
+- A tiered spine (shared Tier-0 mean + Tier-1 interference emitter, #2023),
+  block-coordinate manifold charts, behavioral-Fisher whitened-GLS encode
+  (#2021), cone-atom boundary retraction (#1939), and born-circle birth gating
+  (#2109/#2111). The 10k-line `construction.rs` was split out into a dedicated
+  arrow-Schur assembly module (#780).
+
+### Build & hygiene
+- The `println!` ban is scoped to production code (test / example / build
+  harnesses may use it), cluster paths are driven from env vars so the
+  infra-leak gate stops failing the build, assertion-less probe tests are
+  converted into genuine guards (#2101/#2110), and the #1575 outer-cost scaling
+  harness is a real n-independence gate.
+
+Verified with `cargo check --workspace --all-targets` (exit 0) and the core
+crate lib tests.
+
 ## v0.3.146 — gam 0.3.146 / gamfit 0.1.248 (2026-07-03)
 
 Correctness and honesty release on top of 0.3.145, cut from a large batch of
