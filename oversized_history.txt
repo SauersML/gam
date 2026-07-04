@@ -5,4 +5,3 @@
 # split, not a thin tag-along satellite) before it is auto-pruned here.
 # Concurrent branches produce additive line-level diffs that union-merge;
 # the next build re-validates and prunes redeemed entries.
-crates/gam-sae/src/manifold/tests.rs

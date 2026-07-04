@@ -2063,7 +2063,7 @@ impl SaeManifoldTerm {
         // no longer gates: native ARD composes over heterogeneous coord dims
         // (`ard_value` is a per-atom sum over `d_k`), so it is admitted whether or
         // not it is enabled — only a NON-composing registry penalty refuses.
-        _native_ard_enabled: bool,
+        native_ard_enabled: bool,
     ) -> Result<(), String> {
         // Per-atom coord latent dims via the same accessor the registry
         // validator uses, so the two cannot disagree on "heterogeneous".
@@ -2099,8 +2099,9 @@ impl SaeManifoldTerm {
              coordinate dims cannot be dispatched (they would silently truncate or pad axes). \
              Either configure a uniform atom_dim for all atoms, or drop this penalty. The \
              dim-adaptive row-block penalties — SCAD-MCP, sparsity, native ARD, isometry — \
-             compose on a mixed dictionary and are admitted.",
-            offender.name()
+             compose on a mixed dictionary and are admitted (native ARD enabled here: {}).",
+            offender.name(),
+            native_ard_enabled
         ))
     }
 

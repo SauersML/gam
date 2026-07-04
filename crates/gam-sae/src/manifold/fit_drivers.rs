@@ -2719,6 +2719,9 @@ impl SaeManifoldTerm {
     /// a present-decoder fit that simply reconstructs poorly (the optimizer's job).
     /// Returns `0.0` for a constant (zero-variance) target, where the notion is
     /// vacuous. Column means use the same running update as `dictionary_reconstruction_ev`.
+    // Test-only convenience over the `_maybe` form below; gated so the lib
+    // build carries no dead code while the S1 guard tests keep their caller.
+    #[cfg(test)]
     pub(crate) fn dictionary_reconstruction_output_energy_ratio(
         &self,
         target: ArrayView2<'_, f64>,
