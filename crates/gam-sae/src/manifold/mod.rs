@@ -277,6 +277,9 @@ mod tests_inframe_curved_2130;
 #[cfg(test)]
 mod tests_topology_persistence_f3;
 
+#[cfg(test)]
+mod tests_intrinsic_affine_penalty;
+
 pub use arrow_solver::*;
 pub use atom::*;
 pub use behavior::*;
