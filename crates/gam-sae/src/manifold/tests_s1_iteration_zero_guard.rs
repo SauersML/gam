@@ -84,7 +84,7 @@ pub(crate) fn co_collapse_ev_arm_is_disarmed_at_iteration_zero_s1() {
         .dictionary_reconstruction_ev(target.view(), &rho)
         .expect("EV evaluates");
     let out_ratio = term
-        .dictionary_reconstruction_output_energy_ratio(target.view(), &rho)
+        .dictionary_reconstruction_output_energy_ratio_maybe(target.view(), &rho, None)
         .expect("output-energy ratio evaluates");
     let q = crate::manifold::outer_objective::reachable_dictionary_rank(
         &term.atoms,

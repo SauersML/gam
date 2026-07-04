@@ -12,7 +12,7 @@ const SAE_MANIFOLD_ROW_RIDGE_MAX_ATTEMPTS: usize = 12;
 /// total centered sum-of-squares are invariants of the whole joint fit. The
 /// guard formerly re-derived them from the full `n × p` target on EVERY accepted
 /// outer iteration ([`SaeManifoldTerm::dictionary_reconstruction_ev`] +
-/// [`SaeManifoldTerm::dictionary_reconstruction_output_energy_ratio`] each ran an
+/// [`SaeManifoldTerm::dictionary_reconstruction_output_energy_ratio_maybe`] each ran an
 /// `O(n·p)` column-major reduction), which the single-threaded inner-loop profile
 /// showed dominating the fit. Computing them ONCE per joint fit and handing them
 /// to each iteration's guard call removes that per-iteration cost.
@@ -2719,19 +2719,12 @@ impl SaeManifoldTerm {
     /// a present-decoder fit that simply reconstructs poorly (the optimizer's job).
     /// Returns `0.0` for a constant (zero-variance) target, where the notion is
     /// vacuous. Column means use the same running update as `dictionary_reconstruction_ev`.
-    // Test-only convenience over the `_maybe` form below; gated so the lib
-    // build carries no dead code while the S1 guard tests keep their caller.
-    #[cfg(test)]
-    pub(crate) fn dictionary_reconstruction_output_energy_ratio(
-        &self,
-        target: ArrayView2<'_, f64>,
-        rho: &SaeManifoldRho,
-    ) -> Result<f64, String> {
-        self.dictionary_reconstruction_output_energy_ratio_maybe(target, rho, None)
-    }
-
-    /// [`Self::dictionary_reconstruction_output_energy_ratio`] with an optional
-    /// PRECOMPUTED target variance. `precomputed = Some(stats)` reuses the
+    ///
+    /// Pass `precomputed = None` for the standalone reduction (the historical
+    /// inline form the S1 guard tests exercise) or `Some(stats)` inside the fit
+    /// loop to reuse the once-per-fit target statistics.
+    ///
+    /// `precomputed = Some(stats)` reuses the
     /// once-per-fit per-column means and centered total-sum-of-squares (`None`
     /// reproduces the historical inline reduction bit-for-bit). Only the OUTPUT
     /// energy `Σ (fitted − mean)²` — which depends on the CURRENT dictionary — is
