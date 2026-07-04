@@ -622,7 +622,18 @@ fn run_one_topology_race_candidate<Candidate, FitResult, FitOne>(
     };
 
     let started = Instant::now();
-    let result = pool.install(|| fit_one(candidate));
+    // #2074 — each candidate fit runs inside its own nested Rayon pool. faer's
+    // high-level solvers (arrow-Schur Cholesky/solve, SVD, QR) read the global
+    // parallelism policy and, under the default `Par::rayon(0)`, dispatch through
+    // faer's `spindle` barrier pool. From inside this already-nested Rayon worker
+    // that barrier waits for pool slots the outer fan-out holds, deadlocking the
+    // fit at 0% CPU. Pin faer to `Par::Seq` for the whole nested fit so it never
+    // spawns a nested barrier pool; the per-candidate parallelism is the race
+    // itself, and faer reductions are parallelism-invariant so the result is
+    // bit-identical to the sequential path.
+    let result = pool.install(|| {
+        gam_linalg::faer_ndarray::with_faer_sequential(|| fit_one(candidate))
+    });
     let wall_time = started.elapsed();
     *slot.lock().expect("topology race result mutex poisoned") =
         Some(TopologyRaceParallelCandidate {
