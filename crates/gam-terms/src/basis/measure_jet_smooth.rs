@@ -1223,6 +1223,97 @@ pub fn measure_jet_design_matrix(
     Ok(out)
 }
 
+/// Rank-revealing ambient-linear head lift `T` (d × head_rank) for the
+/// extrapolation null space (#1845).
+///
+/// The measure-jet energy annihilates ambient-affine functions EXACTLY (the
+/// no-mass contract), so the affine functions are the penalty's null space —
+/// the directions the fit is free to extend across a training gap. But the
+/// Gaussian representer design cannot REPRESENT a global affine function off
+/// its support: a finite sum of decaying bumps reverts to the parametric
+/// backbone away from the centers, so in a gap the fit collapses toward the
+/// training mean instead of carrying the flank-attested trend. Completing the
+/// smoothing-spline structure, the builder appends this ambient-linear null
+/// space to the design as an UNPENALIZED head (the `{x_1..x_d}` head the frame
+/// notes §1 pin as the property the representer basis lacked).
+///
+/// The head is data-derived and magic-free. Ambient coordinates of data on a
+/// low intrinsic-dimension stratum are rank-deficient as linear trends, so the
+/// coordinate columns are orthonormalized on the centers and the
+/// numerically-degenerate directions dropped. Working in the mean-CENTERED
+/// coordinate columns (the mass-weighted mean is the intercept's, not the
+/// head's) makes the rank test measure the genuine spread of the centers along
+/// each direction rather than its offset; the relative floor
+/// [`MEASURE_JET_PSEUDOINVERSE_RTOL`] is the module's own numerical rank
+/// tolerance (the same one the local Gram pseudo-inverses use). The returned
+/// `T` satisfies `head(points) = points · T` (the mean-centering only informs
+/// the keep/drop decision; the constant component of `points · T` is removed
+/// downstream by the global parametric orthogonalization). `T` is a
+/// deterministic function of the frozen centers + masses, so the frozen replay
+/// path reconstructs the identical head with no persisted state.
+fn measure_jet_affine_head_transform(
+    centers: ArrayView2<'_, f64>,
+    masses: ArrayView1<'_, f64>,
+) -> Array2<f64> {
+    let m = centers.nrows();
+    let d = centers.ncols();
+    let total_mass = masses.sum();
+    // Mass inner product on center values.
+    let mdot = |u: &Array1<f64>, v: &Array1<f64>| -> f64 {
+        let mut acc = 0.0;
+        for i in 0..m {
+            acc += masses[i] * u[i] * v[i];
+        }
+        acc
+    };
+    // Mean-centered coordinate columns: the mass-weighted mean is removed so the
+    // residual mass-norm is the genuine spread of the centers along a direction,
+    // not dominated by the coordinate's offset (which the intercept owns).
+    let cols: Vec<Array1<f64>> = (0..d)
+        .map(|k| {
+            let col = centers.column(k).to_owned();
+            let mean = if total_mass > 0.0 {
+                mdot(&col, &Array1::ones(m)) / total_mass
+            } else {
+                0.0
+            };
+            col.mapv(|x| x - mean)
+        })
+        .collect();
+    // Relative numerical rank floor from the centered coordinate-column scale.
+    let max_norm = cols.iter().fold(0.0_f64, |acc, c| acc.max(mdot(c, c).sqrt()));
+    let drop_below =
+        (MEASURE_JET_PSEUDOINVERSE_RTOL * (d.max(1) as f64) * max_norm).max(f64::MIN_POSITIVE);
+    // Mass-weighted modified Gram–Schmidt on the centered columns; `t`
+    // accumulates the lift in the ORIGINAL coordinate basis, so every kept head
+    // column is `points · t_r` (up to the intercept-owned constant).
+    let mut q_cols: Vec<Array1<f64>> = Vec::new();
+    let mut t_cols: Vec<Array1<f64>> = Vec::new();
+    for k in 0..d {
+        let mut v = cols[k].clone();
+        let mut t = Array1::<f64>::zeros(d);
+        t[k] = 1.0;
+        for (q, tq) in q_cols.iter().zip(t_cols.iter()) {
+            let proj = mdot(q, &v);
+            v.scaled_add(-proj, q);
+            t.scaled_add(-proj, tq);
+        }
+        let norm = mdot(&v, &v).sqrt();
+        if norm > drop_below {
+            v.mapv_inplace(|x| x / norm);
+            t.mapv_inplace(|x| x / norm);
+            q_cols.push(v);
+            t_cols.push(t);
+        }
+    }
+    let head_rank = t_cols.len();
+    let mut t_mat = Array2::<f64>::zeros((d, head_rank));
+    for (r, t) in t_cols.into_iter().enumerate() {
+        t_mat.column_mut(r).assign(&t);
+    }
+    t_mat
+}
+
 /// Resolve the realized representer range ℓ. An explicit positive
 /// `spec_length_scale` is used verbatim; the `0.0` sentinel auto-initializes
 /// from the median nearest-center spacing (one spacing width: neighbors
@@ -1263,6 +1354,12 @@ pub(crate) struct RealizedMeasureJetGeometry {
     pub(crate) z: Array2<f64>,
     pub(crate) coefficient_gauge: gam_problem::Gauge,
     pub(crate) kz: Array2<f64>,
+    /// Ambient-linear head lift `T` (d × head_rank): the extrapolation
+    /// null-space basis appended to the representer design (#1845). The head
+    /// columns evaluate as `points · T`; empty (`d × 0`) when the geometry
+    /// resolves no supported linear direction. Deterministic in the frozen
+    /// centers + masses, so predict-time replay rebuilds it verbatim.
+    pub(crate) head_transform: Array2<f64>,
 }
 
 pub(crate) fn realize_measure_jet_geometry(
@@ -1320,15 +1417,36 @@ pub(crate) fn realize_measure_jet_geometry(
         }
     };
     let length_scale = realized_measure_jet_length_scale(centers.view(), spec.length_scale)?;
-    // Realized-design constraint transform: uniform coefficient sum-to-zero
-    // at fit time; the frozen composed `z · z_parametric` at predict time
-    // (#532 pattern — see MeasureJetIdentifiability).
+    // Ambient-linear extrapolation head (#1845): the raw center space becomes
+    // `[ m Gaussian representers | head_rank ambient-linear columns ]`. The head
+    // carries the penalty's affine null space explicitly so the fit no longer
+    // reverts to the parametric backbone (the training mean) across an
+    // unsupported gap.
+    // The extrapolation head is the single-scale (fused) gap-bridge path. In
+    // multiscale mode the per-scale spectral penalties carry their own
+    // structure and the design stays the pure representer basis (the per-level
+    // replay + width contracts pin `m − 1` columns), so the head is added only
+    // when the term is single-scale.
+    let head_transform = if spec.multiscale {
+        Array2::<f64>::zeros((centers.ncols(), 0))
+    } else {
+        measure_jet_affine_head_transform(centers.view(), masses.view())
+    };
+    let head_rank = head_transform.ncols();
+    let m_aug = m + head_rank;
+    // Realized-design constraint transform: block sum-to-zero on the
+    // representer coefficients composed with an identity pass-through on the
+    // head at fit time; the frozen composed `z · z_parametric` at predict time
+    // (#532 pattern — see MeasureJetIdentifiability). The head rides the SAME
+    // global parametric orthogonalization, so its constant component cannot
+    // collide with the intercept.
     let (z, coefficient_gauge) = match &spec.identifiability {
         MeasureJetIdentifiability::FrozenTransform { transform } => {
-            if transform.nrows() != m {
+            if transform.nrows() != m_aug {
                 crate::bail_dim_basis!(
-                    "frozen measure-jet identifiability transform mismatch: {} centers but transform has {} rows",
+                    "frozen measure-jet identifiability transform mismatch: {} representers + {} head columns but transform has {} rows",
                     m,
+                    head_rank,
                     transform.nrows()
                 );
             }
@@ -1338,16 +1456,34 @@ pub(crate) fn realize_measure_jet_geometry(
             )
         }
         MeasureJetIdentifiability::CenterSumToZero => {
-            // Householder sum-to-zero basis: same constrained space as the
-            // generic RRQR nullspace. The active projection is owned by Gauge;
-            // the dense z is persisted for frozen replay metadata.
+            // Householder sum-to-zero on the representers, block-composed with
+            // the identity on the head columns. The active projection is owned
+            // by Gauge; the dense z is persisted for frozen replay metadata.
             let u = householder_sum_to_zero_u(m);
-            let z = householder_sum_to_zero_z(&u);
-            (z.clone(), gam_problem::Gauge::sum_to_zero(z))
+            let z_rbf = householder_sum_to_zero_z(&u);
+            let mut z_block = Array2::<f64>::zeros((m_aug, (m - 1) + head_rank));
+            z_block.slice_mut(ndarray::s![..m, ..m - 1]).assign(&z_rbf);
+            for r in 0..head_rank {
+                z_block[(m + r, (m - 1) + r)] = 1.0;
+            }
+            (
+                z_block.clone(),
+                gam_problem::Gauge::from_block_transforms(&[z_block]),
+            )
         }
     };
+    // Augmented raw center matrix `[K(centers, centers) | centers · T]`, so the
+    // restricted `kz` maps constrained coefficients to center nodal values for
+    // BOTH the representers and the head; the energy annihilates the head block
+    // (affine) to machine precision, so it stays the unpenalized null space.
     let k_cc = measure_jet_design_matrix(centers.view(), centers.view(), length_scale)?;
-    let kz = coefficient_gauge.restrict_design(&k_cc);
+    let mut k_aug = Array2::<f64>::zeros((m, m_aug));
+    k_aug.slice_mut(ndarray::s![.., ..m]).assign(&k_cc);
+    if head_rank > 0 {
+        let head_cc = centers.dot(&head_transform);
+        k_aug.slice_mut(ndarray::s![.., m..]).assign(&head_cc);
+    }
+    let kz = coefficient_gauge.restrict_design(&k_aug);
     Ok(RealizedMeasureJetGeometry {
         centers,
         masses,
@@ -1363,6 +1499,7 @@ pub(crate) fn realize_measure_jet_geometry(
         z,
         coefficient_gauge,
         kz,
+        head_transform,
     })
 }
 
@@ -1397,12 +1534,30 @@ pub fn build_measure_jet_basis(
         z,
         coefficient_gauge,
         kz,
+        head_transform,
     } = realize_measure_jet_geometry(data, spec)?;
     let band = MeasureJetBand {
         eps: eps_band.clone(),
         log_step,
     };
-    let raw_design = measure_jet_design_matrix(data, centers.view(), length_scale)?;
+    let m = centers.nrows();
+    let head_rank = head_transform.ncols();
+    let m_aug = m + head_rank;
+    // Augmented raw design `[K(data, centers) | data · T]` (#1845): the head
+    // columns are the ambient-linear extrapolation basis. The gauge restricts
+    // BOTH blocks together, so the frozen composed transform replays the head
+    // verbatim at predict time.
+    let kernel_design = measure_jet_design_matrix(data, centers.view(), length_scale)?;
+    let mut raw_design = Array2::<f64>::zeros((data.nrows(), m_aug));
+    raw_design
+        .slice_mut(ndarray::s![.., ..m])
+        .assign(&kernel_design);
+    if head_rank > 0 {
+        let head_design = data.dot(&head_transform);
+        raw_design
+            .slice_mut(ndarray::s![.., m..])
+            .assign(&head_design);
+    }
     let constrained_design = coefficient_gauge.restrict_design(&raw_design);
     let design = gam_linalg::matrix::DesignMatrix::Dense(
         gam_linalg::matrix::DenseDesignMatrix::from(constrained_design),
@@ -1481,7 +1636,28 @@ pub fn build_measure_jet_basis(
         // ridge as a genuine learned candidate (its per-scale spectrum IS the
         // estimand).
         if spec.double_penalty {
-            let ridge = affine_preserving_coefficient_ridge(&kz, centers.view(), masses.view())?;
+            // With the ambient-linear head carrying the affine null space
+            // explicitly (#1845), the representer's own affine-reproducing
+            // directions become redundant with the (unpenalized) head: leaving
+            // them unpenalized would split the flank trend arbitrarily between a
+            // decaying representer combination and the head, and only the head
+            // survives across the gap. A plain identity floor on the representer
+            // coefficients (`blockdiag(I_m, 0_head)` restricted through the same
+            // gauge) breaks that tie deterministically toward the free head —
+            // any affine mass placed on the representer now pays a strictly
+            // positive toll, so the penalized-least-squares optimum drives it
+            // into the head — while still flooring the energy's smooth
+            // near-nullspace exactly as the affine-preserving ridge did. Without
+            // a head the geometry keeps the original affine-preserving ridge.
+            let ridge = if head_rank > 0 {
+                let mut r_raw = Array2::<f64>::zeros((m_aug, m_aug));
+                for i in 0..m {
+                    r_raw[(i, i)] = 1.0;
+                }
+                coefficient_gauge.restrict_penalty(&r_raw)
+            } else {
+                affine_preserving_coefficient_ridge(&kz, centers.view(), masses.view())?
+            };
             let primary_fro = trace_of_product(&penalty, &penalty).sqrt();
             let ridge_fro = trace_of_product(&ridge, &ridge).sqrt();
             if primary_fro.is_finite()
@@ -1692,9 +1868,18 @@ pub fn build_measure_jet_basis_psi_derivatives(
             *dk_v = kij * a;
             *d2k_v = kij * (a * a - 2.0 * a);
         }
-        // Apply the SAME Gauge-owned coefficient section the design uses.
-        let dx_du = geom.coefficient_gauge.restrict_design(&dk);
-        let d2x_du2 = geom.coefficient_gauge.restrict_design(&d2k);
+        // The ambient-linear head (#1845) is ℓ-independent, so its derivative
+        // columns are exactly zero: pad the representer derivatives to the
+        // augmented raw width before restricting through the SAME Gauge-owned
+        // coefficient section the design uses.
+        let m = geom.centers.nrows();
+        let m_aug = m + geom.head_transform.ncols();
+        let mut dk_aug = Array2::<f64>::zeros((data.nrows(), m_aug));
+        let mut d2k_aug = Array2::<f64>::zeros((data.nrows(), m_aug));
+        dk_aug.slice_mut(ndarray::s![.., ..m]).assign(&dk);
+        d2k_aug.slice_mut(ndarray::s![.., ..m]).assign(&d2k);
+        let dx_du = geom.coefficient_gauge.restrict_design(&dk_aug);
+        let d2x_du2 = geom.coefficient_gauge.restrict_design(&d2k_aug);
         Some((dx_du, d2x_du2))
     } else {
         None
