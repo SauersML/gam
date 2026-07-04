@@ -858,11 +858,47 @@ pub fn select_spherical_farthest_point_centers(
     } else {
         180.0 / std::f64::consts::PI
     };
+    let to_rad = if radians {
+        1.0
+    } else {
+        std::f64::consts::PI / 180.0
+    };
+    // Anchor the golden-angle spiral's longitude ORIGIN to the data's circular
+    // mean longitude so the center set is EQUIVARIANT under a rotation about the
+    // pole (a rigid longitude shift). The bare spiral fixes each center's
+    // longitude at `i·golden_angle`, i.e. a frame-anchored lattice with the
+    // longitude origin baked in; a common longitude shift applied to the data
+    // then moves the data relative to the STATIONARY centers and changes every
+    // data-to-center geodesic angle, so the fitted surface rotates — even though
+    // Wahba's reproducing kernel is a function of cos(geodesic angle) alone and
+    // is therefore intrinsically rotation invariant (#2127). The circular mean
+    // obeys `mean(lon + Δ) = mean(lon) + Δ`, so offsetting every lattice
+    // longitude by it makes the whole center cloud rotate WITH the data: under a
+    // longitude shift the centers shift by the same amount, the cos-γ arguments
+    // the kernel sees are unchanged, and predictions are invariant to the choice
+    // of longitude origin — matching the rotation-invariant `harmonic` control.
+    // A uniform rotation of a Fibonacci lattice is still a Fibonacci lattice, so
+    // sphere coverage/conditioning is unchanged.
+    let mut sum_sin = 0.0_f64;
+    let mut sum_cos = 0.0_f64;
+    for row in data.outer_iter() {
+        let lon = row[1] * to_rad;
+        sum_sin += lon.sin();
+        sum_cos += lon.cos();
+    }
+    // atan2(0, 0) = 0; a degenerate (empty circular mean) data cloud falls back
+    // to the historical origin, and any real longitude spread makes the anchor
+    // well-defined and equivariant.
+    let mean_lon = if sum_sin == 0.0 && sum_cos == 0.0 {
+        0.0
+    } else {
+        sum_sin.atan2(sum_cos)
+    };
     let golden_angle = std::f64::consts::PI * (3.0 - 5.0_f64.sqrt());
     let mut centers = Array2::<f64>::zeros((num_centers, 2));
     for i in 0..num_centers {
         let z = (2.0 * i as f64 + 1.0) / num_centers as f64 - 1.0;
-        let lon = ((i as f64) * golden_angle + std::f64::consts::PI)
+        let lon = ((i as f64) * golden_angle + mean_lon + std::f64::consts::PI)
             .rem_euclid(std::f64::consts::TAU)
             - std::f64::consts::PI;
         centers[[i, 0]] = z.asin() * to_units;
