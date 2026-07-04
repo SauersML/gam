@@ -378,9 +378,12 @@ pub struct ArrowBorderSolvePlan {
     pub dense_direct_flops: u128,
     /// `≈ cg_iters · n·(4·d·k + d²)` — matrix-free PCG matvecs.
     pub reduced_iterative_flops: u128,
-    /// The recommended strategy: `ReducedIterative` iff the dense factorization
-    /// path costs strictly more arithmetic than the iterative path at
-    /// `cg_iters`.
+    /// The recommended strategy. `DenseDirect` is chosen only for a full-rank
+    /// border (`n·d ≥ k`, so the `k × k` reduced Schur is non-singular and its
+    /// Cholesky exists) whose `k³/3` border factorization is no costlier than
+    /// the matrix-free CG solve at `cg_iters`; otherwise `ReducedIterative`. A
+    /// rank-deficient border is always `ReducedIterative` — a dense Cholesky of
+    /// a singular border does not exist.
     pub recommended: ArrowBorderStrategy,
     /// Whether running the *recommended* strategy on the device is expected to
     /// pay off. For `ReducedIterative` this is `reduced_schur_matvec_should_offload`;
@@ -462,11 +465,27 @@ impl GpuDispatchPolicy {
         let data_fit_rank = (n.saturating_mul(d)).min(k);
         let dense_border_rank_deficient = n.saturating_mul(d) < k;
 
-        let recommended = if dense_direct_flops > reduced_iterative_flops {
-            ArrowBorderStrategy::ReducedIterative
-        } else {
-            ArrowBorderStrategy::DenseDirect
-        };
+        // Recommend the exact dense factorization only when it is both VALID and
+        // not the bottleneck:
+        //   * Validity — a rank-deficient border (`n·d < k`) has a singular
+        //     `k × k` reduced Schur, so its Cholesky does not exist. DenseDirect
+        //     is inadmissible there and we must solve matrix-free. (The pure
+        //     assembly+Cholesky-vs-iterative flop rule this replaced ignored
+        //     rank and could recommend factorizing a provably-singular border
+        //     whenever the small-`k` dense flops happened to be the cheaper
+        //     count — e.g. `n=1, d=1, k=2`.)
+        //   * Cost — the reduced-Schur reduction is an embarrassingly-parallel
+        //     batched GEMM whichever path runs; the term that scales badly with
+        //     border width is the `k³/3` Cholesky. Prefer the exact,
+        //     RHS-reusable, convergence-free dense solve while that Cholesky is
+        //     no costlier than the full matrix-free CG solve, and fall to
+        //     ReducedIterative once the `k³` factorization overtakes it.
+        let recommended =
+            if !dense_border_rank_deficient && border_chol <= reduced_iterative_flops {
+                ArrowBorderStrategy::DenseDirect
+            } else {
+                ArrowBorderStrategy::ReducedIterative
+            };
 
         let device_favorable = match recommended {
             ArrowBorderStrategy::ReducedIterative => {
